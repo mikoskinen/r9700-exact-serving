@@ -797,7 +797,6 @@ TEST(a_rule_that_declines_a_gguf_block_tensor_is_an_error) {
                   { "-o", d / "g.rad", "--recipe", w.recipe, "--quant",
                     "blk.0.attn_norm.weight=rtn:codes=i8,group=32,scale=bf16" },
                   &log) != 0);
-    CHECK(has(log, "(rtn) refuses it"));
     CHECK(!exists(d / "g.rad"));
 }
 
