@@ -32,6 +32,11 @@ int Ctx::init(const CtxDesc& d) {
     kv_        = d.kv;
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;
+    tape_dump_ = d.tape_dump;
+    /* A host gather's rows on the mapped tier are read ahead unless --row-prefetch off
+     * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
+    row_prefetch_on_ = d.row_prefetch;
+    rowpf_.reserve(4096);
 
     /* The rank owns one device. Set it here so allocation lands on the right card, and again from
      * the rank thread in bind_thread() because the backend's current device is thread-local. */
@@ -57,6 +62,8 @@ int Ctx::init(const CtxDesc& d) {
 void Ctx::shutdown() {
     oracle_close();
     xp_close();
+    row_prefetch_done();
+    rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
      * destination of unwaited copies (spec §5.5) and the arena holds every kernel's operands. */
     if (stream_) rad_stream_sync(stream_);
@@ -339,6 +346,7 @@ int Ctx::bind_ops() {
         }
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
+        p.row_gather = row_gather_op(oi.op);
         p.collective = p.billed;
         p.lora_site  = oi.lora_site;
         p.order      = oi.anchor > 0 && (size_t)oi.anchor < P.ops.size() ? P.ops[(size_t)oi.anchor].index
@@ -878,6 +886,11 @@ void Ctx::dump_profile() const {
         waited += wait;
     }
     fprintf(stderr, "  %10s %12.3f   (waited %.3f ms besides)\n\n", "total", total, waited);
+    if (rowpf_calls_)
+        fprintf(stderr, "  row read-ahead: %lld host gather(s) from the mapped tier asked for %lld "
+                        "page(s) ahead of their kernel, %lld of them beside it "
+                        "(runtime/rowprefetch.h; --row-prefetch off turns it off)\n\n",
+                (long long)rowpf_calls_, (long long)rowpf_pages_, (long long)rowpf_beside_calls_);
 }
 
 /* ================================================================== the step driver */
@@ -1033,7 +1046,18 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     out->touch_pending[1] = host_touch_pending_[1];
     out->scratch_open[0] = scratch_open_[0];
     out->scratch_open[1] = scratch_open_[1];
-    if (haz_mark(*out) < 0) {
+    {
+        /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches
+         * (TAPEDUMP lines on stderr, every rank): a diagnostic for issue-order work. */
+        const int db = b->draft_pass + 8;
+        haz_dump_ = tape_dump_ && db >= 0 && db < 64 && !(tape_told_ & (1ull << db));
+        if (haz_dump_)
+            fprintf(stderr, "TAPEDUMP r%d begin draft %d tok %lld\n", rank_, b->draft_pass,
+                    (long long)b->n_tok);
+    }
+    const int hm = haz_mark(*out);
+    haz_dump_ = false;
+    if (hm < 0) {
         tape_destroy(t);
         out->dev = nullptr;
         return 0;
@@ -1100,18 +1124,50 @@ int Ctx::haz_mark(PassTape& t) {
         if (!q) { qs.push_back(Q{}); q = &qs.back(); q->id = qid; }
         /* An event packet: the next dispatch is ordered, since nothing after a wait may start
          * before its event completes. */
-        if (kind != 0) { q->infl.clear(); q->opaque = true; q->run = 0; continue; }
+        if (kind != 0) {
+            if (haz_dump_) fprintf(stderr, "TAPEDUMP r%d %d q%u event\n", rank_, i, qid);
+            q->infl.clear(); q->opaque = true; q->run = 0; continue;
+        }
         ++t.dispatches;
 
         const int32_t op = first_of[(size_t)i];
         bool ok = op >= 0 && !q->opaque && !haz_ops_[(size_t)op].opaque && q->run < kTapeOverlapRun;
+        int32_t clash = -1;
         if (ok) {
             const HazOp& h = haz_ops_[(size_t)op];
             for (int32_t x : q->infl) {
                 const HazOp& f = haz_ops_[(size_t)x];
                 if (overlaps(h.rd, h.n_rd, f.wr, f.n_wr) || overlaps(h.wr, h.n_wr, f.rd, f.n_rd) ||
-                    overlaps(h.wr, h.n_wr, f.wr, f.n_wr)) { ok = false; break; }
+                    overlaps(h.wr, h.n_wr, f.wr, f.n_wr)) { ok = false; clash = x; break; }
             }
+        }
+        if (haz_dump_) {
+            const int32_t own = part_of[(size_t)i];
+            const HazOp* h = own >= 0 ? &haz_ops_[(size_t)own] : nullptr;
+            const OpPlan* pl = h ? &plans_[h->op] : nullptr;
+            const char* why = ok                                 ? "U"
+                              : own < 0                          ? "O noop"
+                              : op < 0                           ? "O cont"
+                              : h->opaque                        ? "O opaque"
+                              : q->opaque                        ? "O after-opaque"
+                              : q->run >= kTapeOverlapRun        ? "O run-cap"
+                                                                 : "O clash";
+            std::string rr;
+            if (h && op >= 0 && !h->opaque) {
+                rr = " rd";
+                for (uint32_t k = 0; k < h->n_rd; ++k)
+                    rr += fmt(" %llx+%llx", (unsigned long long)haz_rng_[h->rd + k].first,
+                              (unsigned long long)(haz_rng_[h->rd + k].second - haz_rng_[h->rd + k].first));
+                rr += " wr";
+                for (uint32_t k = 0; k < h->n_wr; ++k)
+                    rr += fmt(" %llx+%llx", (unsigned long long)haz_rng_[h->wr + k].first,
+                              (unsigned long long)(haz_rng_[h->wr + k].second - haz_rng_[h->wr + k].first));
+            }
+            fprintf(stderr, "TAPEDUMP r%d %d q%u hop%d op%d decl%d %s %s %s%s%s\n", rank_, i, qid, own,
+                    h ? (int)h->op : -1, pl && pl->info ? pl->info->index : -1,
+                    pl && pl->info ? pl->info->op.c_str() : "-",
+                    h && h->row && h->row->info && h->row->info->name ? h->row->info->name : "-", why,
+                    clash >= 0 ? fmt(" with hop%d", clash).c_str() : "", rr.c_str());
         }
         if (ok) {
             const int sc = tape_set_overlap(t.dev, i, true);
@@ -1209,10 +1265,15 @@ int Ctx::play_pass(PassTape& t) {
         case kTapeHost: {
             TapeHost& th = t.host[(size_t)st.a];
             lane_ = st.lane;
+            /* What the recorded join waited on (TapeHost::touch): the stretches played before this
+             * step re-recorded those events. */
+            for (int l = 0; l < 2; ++l) host_touch_pending_[l] = host_touch_pending_[l] || th.touch[l];
             rc = host_join_wait(th.drain);
             if (rc >= 0) {
                 th.args.t = th.t;
+                if (th.rp.n) row_prefetch_run(th.rp, th.t, th.n);
                 rc = th.launch(&th.args, cur_stream());
+                row_prefetch_done();
                 rad_dev_host_wrote();
             }
             lane_ = l0;

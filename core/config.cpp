@@ -39,7 +39,7 @@ static const std::string g_draft_window_help =
     std::string("fixed | adaptive: how many drafts each sequence carries. fixed drafts\n"
                 "                                    --num-speculative-tokens every step; adaptive makes that\n"
                 "                                    the ceiling and follows each sequence's acceptance and the\n"
-                "                                    measured step cost (a serial draft head only). Default ") +
+                "                                    measured step cost (a draft head, or prompt lookup alone). Default ") +
     draft_window_name(kDraftWindowDefault);
 
 static const Flag g_flags[] = {
@@ -114,6 +114,16 @@ static const Flag g_flags[] = {
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },
+    { "--row-prefetch",       "MODE",   "on (default) | off -- a host gather from a table read through\n"
+    "                                    the container's mapping (--ngram-placement disk) asks for the\n"
+    "                                    pages its rows cover before its kernel runs, or beside it when\n"
+    "                                    they are already resident; off leaves every row to the\n"
+    "                                    kernel's own page faults. The output is the same either way" },
+    { "--mapped-rewarm",      "MODE",   "on (default) | off -- at startup, ask the page cache again for\n"
+    "                                    the pages of a table read through the container's mapping\n"
+    "                                    that an earlier run left cached and the load's own\n"
+    "                                    allocations pushed out, at most half of the available memory,\n"
+    "                                    so the first requests do not read them from the drive" },
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
@@ -178,6 +188,15 @@ static const Flag g_flags[] = {
     { "--num-speculative-tokens", "N",  "speculative window; 0 disables. Default `auto`: the drafter's\n"
     "                                    own operating point, which the plugin states. A container\n"
     "                                    with no draft head is unaffected -- auto resolves to 0." },
+    { "--spec-ngram",         "K",      "speculate by prompt lookup alone: up to K drafts a step\n"
+    "                                    copied from what followed the latest earlier occurrence of\n"
+    "                                    the sequence's last n tokens (no weights, no draft pass).\n"
+    "                                    Sets the window to K; a draft head the container carries is\n"
+    "                                    not loaded. A proposal is verified only when its record\n"
+    "                                    says it pays at the measured step cost. 0 (default) off" },
+    { "--spec-ngram-min",     "N",      "shortest pattern prompt lookup matches (default 2)" },
+    { "--spec-ngram-max",     "N",      "longest pattern prompt lookup matches, tried first\n"
+                                        "(default 4, at most 15)" },
     { "--draft-window",       "MODE",   g_draft_window_help.c_str() },
     { "--draft-short-from",   "N",      "a block drafter that also serves a shorter block runs it\n"
                                         "from N decoding sequences on (0 never, the default): the\n"
@@ -294,6 +313,13 @@ static const Flag g_flags[] = {
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
     { "--debug-placement",    nullptr,  "print the placement plan" },
+    { "--debug-tape-dump",    nullptr,  "list the dispatches of the first recorded pass of each kind\n"
+    "                                    on stderr (TAPEDUMP lines, every rank) and which of them\n"
+    "                                    start unordered behind the one before" },
+    { "--debug-draft-oracle", "FILE",   "a verify-path test, not a drafter: with --spec-ngram, prompt\n"
+    "                                    lookup proposes from the token ids in FILE (a plain greedy\n"
+    "                                    run's continuation of the one prompt the test sends), 30% of\n"
+    "                                    the drafts corrupted; the text must stay the plain run's" },
     { "--debug-accept-reference-kernels", nullptr,
       "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
       "                              implementation is an oracle and a last resort, and falling back\n"
@@ -603,6 +629,24 @@ int config_parse(int argc, char** argv, Config* c) {
             c->tower_placement = p;
         }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
+        else if (S("--row-prefetch")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->row_prefetch = true;
+            else if (!std::strcmp(v, "off")) c->row_prefetch = false;
+            else {
+                RAD_ERR("--row-prefetch takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--mapped-rewarm")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))  c->mapped_rewarm = true;
+            else if (!std::strcmp(v, "off")) c->mapped_rewarm = false;
+            else {
+                RAD_ERR("--mapped-rewarm takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
         else if (S("--lora")) {
@@ -718,6 +762,9 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             c->n_spec = (int)n;
         }
+        else if (S("--spec-ngram"))            { if (!num(0, 64, &c->spec_ngram)) return RAD_E_INVAL; }
+        else if (S("--spec-ngram-min"))        { if (!num(1, 15, &c->spec_ngram_min)) return RAD_E_INVAL; }
+        else if (S("--spec-ngram-max"))        { if (!num(1, 15, &c->spec_ngram_max)) return RAD_E_INVAL; }
         else if (S("--draft-window")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "fixed"))    c->draft_window = DraftWindow::Fixed;
@@ -937,6 +984,8 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
         else if (S("--debug-selection"))       c->debug_selection = true;
         else if (S("--debug-placement"))       c->debug_placement = true;
+        else if (S("--debug-tape-dump"))       c->debug_tape_dump = true;
+        else if (S("--debug-draft-oracle"))    { if (!(v = need(i))) return RAD_E_INVAL; c->debug_draft_oracle = v; }
         else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
         else if (S("--profile-ops"))           c->profile_ops = true;
         else if (S("--expert-stats"))          { if (!(v = need(i))) return RAD_E_INVAL; c->expert_stats = v; }
@@ -994,6 +1043,22 @@ int config_parse(int argc, char** argv, Config* c) {
     if (c->model.empty()) {
         RAD_ERR("--model is required");
         return RAD_E_INVAL;
+    }
+
+    /* Prompt lookup alone: the window is its K, stated once. */
+    if (c->spec_ngram_min > c->spec_ngram_max) {
+        RAD_ERR("--spec-ngram-min %d is longer than --spec-ngram-max %d", c->spec_ngram_min,
+                c->spec_ngram_max);
+        return RAD_E_INVAL;
+    }
+    if (c->spec_ngram > 0) {
+        if (c->given.count("--num-speculative-tokens") && c->n_spec != c->spec_ngram) {
+            RAD_ERR("--spec-ngram %d sets the speculative window to %d, and "
+                    "--num-speculative-tokens asks for %s; give one", c->spec_ngram,
+                    c->spec_ngram, c->n_spec < 0 ? "auto" : std::to_string(c->n_spec).c_str());
+            return RAD_E_INVAL;
+        }
+        c->n_spec = c->spec_ngram;
     }
 
     /* KL mode: exactly one direction, each with the inputs it reads. */
@@ -1169,6 +1234,8 @@ const ShowRow kShow[] = {
     { "--ngram-placement",    [](const Config& c) { return std::string(table_placement_name(c.ngram_placement)); } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
+    { "--row-prefetch",       [](const Config& c) { return onoff(c.row_prefetch); } },
+    { "--mapped-rewarm",      [](const Config& c) { return onoff(c.mapped_rewarm); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
@@ -1200,6 +1267,10 @@ const ShowRow kShow[] = {
           return std::string(c.prefix_exact ? "exact" : "nearest"); } },
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
+    { "--spec-ngram",         [](const Config& c) {
+          return c.spec_ngram > 0 ? num(c.spec_ngram) : std::string("0 (off)"); } },
+    { "--spec-ngram-min",     [](const Config& c) { return num(c.spec_ngram_min); } },
+    { "--spec-ngram-max",     [](const Config& c) { return num(c.spec_ngram_max); } },
     { "--draft-window",       [](const Config& c) { return std::string(draft_window_name(c.draft_window)); } },
     { "--draft-short-from",   [](const Config& c) {
           return c.draft_short_from > 0 ? num(c.draft_short_from) : std::string("0 (never)"); } },
@@ -1281,6 +1352,8 @@ const ShowRow kShow[] = {
     { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },
+    { "--debug-tape-dump",    [](const Config& c) { return onoff(c.debug_tape_dump); } },
+    { "--debug-draft-oracle", [](const Config& c) { return or_none(c.debug_draft_oracle, "none"); } },
     { "--debug-accept-reference-kernels", [](const Config& c) { return onoff(c.accept_reference_kernels); } },
     { "--profile-ops",        [](const Config& c) { return onoff(c.profile_ops); } },
     { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
