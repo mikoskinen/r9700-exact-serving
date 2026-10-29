@@ -63,7 +63,7 @@ WORKDIR /tmp
 # muxer. No protocols: media.cpp and mp4.cpp read and write memory through their own I/O
 # contexts.
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
-    curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o ffmpeg.tar.xz \
+    curl --http1.1 -fsSL --retry 8 --retry-all-errors --retry-delay 3 --connect-timeout 30 "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o ffmpeg.tar.xz \
  && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
  && tar -xJf ffmpeg.tar.xz && cd "ffmpeg-${FFMPEG_VERSION}" \
  && ./configure --prefix=/opt/ffmpeg --enable-shared --disable-static --disable-debug \

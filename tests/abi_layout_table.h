@@ -114,6 +114,7 @@
 { "RadBuildCtx", "state_dtype", 140, 4 },
 { "RadBuildCtx", "draft_coupling", 144, 4 },
 { "RadBuildCtx", "weight_prefetch_off", 148, 4 },
+{ "RadBuildCtx", "draft_head_off", 152, 4 },
 { "RadAudioGenBatch", "", 0, 344 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },
