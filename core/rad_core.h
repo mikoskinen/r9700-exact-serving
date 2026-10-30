@@ -59,8 +59,8 @@ struct KernelRow {
     bool                 reference = false;
     /* rad_kernel_chain: its launches can wait in the kernel instead of behind the barrier bit. */
     bool                 chain = false;
-    /* rad_kernel_fetches_rows: it reads a mapped table's rows itself, so the engine does not read
-     * them ahead through the page cache (runtime/rowprefetch.h). */
+    /* rad_kernel_fetches_rows: a row-gathering kernel reads the container's rows itself (its own
+     * row cache), so the page cache is not asked to prefetch them. False when unsaid. */
     bool                 fetches_rows = false;
 };
 
@@ -250,6 +250,7 @@ inline bool weight_file_direct(const WeightInfo& w, int world_size) {
            (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
 }
 
+
 struct BufferInfo {
     std::string name;
     RadBufDecl  decl{};
@@ -380,6 +381,9 @@ public:
     /* The step's pooled vectors (rad_declare_pooled): set only by an embedding program, which has
      * no logits buffer. */
     rad_buf pooled_buf = 0;
+    /* The most words one request hands the plugin (rad_declare_plugin_words,
+     * RadBatch::plugin_words); 0 when the plugin reads none. */
+    int64_t plugin_words = 0;
 
     /* Runtime LoRA (core/lora/), empty unless the engine was started with adapters enabled. */
     std::vector<LoraIssueSite> lora_sites;
@@ -552,9 +556,7 @@ inline const RadKernelInfo* weight_layout_kernel(const Program& prog, const Weig
 
 /* Whether the file tier can serve `w` by relayouting it on every read, as the loader does once
  * for a resident weight: whole planes (no shard at a world above one, so each plane is one range
- * of the container), not widened, and a kernel that relayouts. The selected planes are read from
- * the container and the kernel's relayout writes the stored form into the pinned stage the copy
- * to the card reads. The mapped tier cannot do this: it hands kernels the container's bytes. */
+ * of the container), not widened, and a kernel that relayouts. */
 inline bool weight_file_relaid(const Program& prog, const WeightInfo& w, int world_size) {
     if (w.identity || w.widen) return false;
     if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
@@ -785,6 +787,12 @@ struct Request {
      * The request still samples the one token max_tokens allows; the caller discards it. */
     std::shared_ptr<TokenScores> token_scores;
 
+    /* Words the plugin reads on the step that samples the prompt's first token
+     * (RadBatch::plugin_words): word 0 is the engine's, the rest the caller's. At most
+     * Program::plugin_words of them, which the server checks before submission; clef's are laid
+     * out by abi/rad_clef.h. Empty for every other request. */
+    std::vector<int32_t> plugin_words;
+
     /* An embedding request: the whole prompt in one step, never split (a bidirectional encoder
      * cannot take half its input), finished at that step with its pooled vector in the sink
      * (Sink::embedding). Nothing is generated. Only an embedding program (rad_declare_pooled)
@@ -824,6 +832,15 @@ struct Config {
      * collectives (RadBuildCtx::weight_prefetch_off), for an engine that shares its cards with
      * another server, where the second lane's read costs a queue switch every decode step. */
     bool  weight_prefetch = true;
+    /* --mapped-rewarm: re-touch the container's pages an earlier run left resident after the
+     * mapped load, through the page cache (RadFile::rewarm); a no-op on the file tier. */
+    bool  mapped_rewarm = false;
+    /* --row-prefetch: read a host gather's table rows on the mapped tier ahead of or beside its
+     * kernel (runtime/rowprefetch.h); CtxDesc::row_prefetch. */
+    bool  row_prefetch = true;
+    /* --debug-tape-dump: list each draft pass kind's first recording's dispatches on stderr
+     * (TAPEDUMP lines); CtxDesc::tape_dump. */
+    bool  debug_tape_dump = false;
     /* Smallest all-reduce message, in KiB, that the lossy wire compresses; smaller ones are sent
      * exact. Compression pays only when the transfer is bandwidth-bound: a decode step's handful
      * of residual rows costs more to rotate than it saves, while a prefill chunk is far larger.
@@ -893,14 +910,6 @@ struct Config {
      * exact prefetch, a routed expert a routed layer at a time). Off by default because disk
      * paces the step, so an accidental spill makes the server orders of magnitude slower. */
     bool    weights_disk_tier = false;
-    /* --row-prefetch on|off: a host gather's rows on the mapped tier (a table on disk, read
-     * through the container's mapping) are asked for ahead of its kernel (runtime/rowprefetch.h,
-     * CtxDesc::row_prefetch). Output-neutral; on is the default. */
-    bool    row_prefetch = true;
-    /* --mapped-rewarm on|off: at startup, the mapped tier's pages an earlier run left in the page
-     * cache and the load's allocations reclaimed are asked for again, at most half of
-     * MemAvailable (RadFile::rewarm). Output-neutral; on is the default. */
-    bool    mapped_rewarm = true;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     /* --embedding-placement and --ngram-placement as given (see TablePlacement), and their
@@ -1002,8 +1011,8 @@ struct Config {
     int     n_spec = -1;                /* --num-speculative-tokens; -1 = auto, 0 = off */
     /* --spec-ngram K: speculate by prompt lookup alone, K drafts a step (core/sched/ngram.h), each
      * proposal verified only when it pays for its verify rows (core/sched/lookup.h).
-     * Sets the window to K and tells the plugin to declare no draft head
-     * (RadBuildCtx::draft_head_off), so a head the container carries costs no memory. 0 (the
+     * Sets the window to K; a container that declares a draft head is refused at startup, since
+     * the head would draft in lookup's place. 0 (the
      * default) is off: a deployment that speculates still uses prompt lookup for any sequence its
      * head declines, and a container without a head speculates by prompt lookup at
      * --num-speculative-tokens N. */
@@ -1037,6 +1046,17 @@ struct Config {
     std::string kld_lora;               /* --kld-lora NAME: score through this --lora adapter */
     std::string kld_lora_sources;       /* --kld-lora-sources PREFIX: only documents whose source starts so */
     std::string kld_corpus;             /* --kld-corpus FILE, read by --kld-record only */
+    int         kld_top = 0;            /* --kld-top N: record the N most likely tokens and the tail; 0 the whole vocabulary */
+
+    /* ---------------- CALIBRATION (GPTQ Hessians) ----------------
+     * `--calib-corpus FILE` replaces the server like the KL mode: every document of a JSONL corpus
+     * goes through prefill once, nothing is scored, and a plugin that keeps calibration statistics
+     * records them into --calib-dir (RadBuildCtx::calib_dir) for --calib-layers. */
+    std::string calib_corpus;           /* --calib-corpus FILE */
+    std::string calib_dir;              /* --calib-dir DIR */
+    int32_t     calib_layer_lo = 0;     /* --calib-layers LO:HI, HI exclusive; 0:0 every layer */
+    int32_t     calib_layer_hi = 0;
+    bool calib() const { return !calib_corpus.empty(); }
     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
 
@@ -1045,6 +1065,11 @@ struct Config {
      * when the container carries a vision tower and 0 when it does not. 0 serves text only and
      * keeps a tower the container carries off the card. */
     int64_t mm_max_patches = -1;
+    /* An image generator's bounds (RadBuildCtx::gen_max_pixels, gen_max_refs): the largest image it
+     * makes, in pixels, and the reference pictures a request. 0: the model's own. A smaller image
+     * shrinks the buffers the generator sizes for it, the activation arena with them. */
+    int64_t image_gen_max_pixels = 0;
+    int64_t image_gen_max_refs = 0;
     /* The audio encoder's pass in frames, resolved at bring-up from the plugin's probe when the
      * container carries an audio encoder; --mm-max-patches 0 (text only) turns it off too. */
     int64_t mm_audio_frames = -1;
@@ -1146,9 +1171,6 @@ struct Config {
     bool    debug_graph = false;
     bool    debug_selection = false;
     bool    debug_placement = false;
-    /* --debug-tape-dump: each rank lists the dispatches of the first recorded pass of each kind
-     * (CtxDesc::tape_dump). */
-    bool    debug_tape_dump = false;
     /* --debug-draft-oracle FILE: prompt lookup proposes from these token ids, 30% of its drafts
      * corrupted -- the verify path's test harness (Scheduler::draft_ngram). Empty is off. */
     std::string debug_draft_oracle;
@@ -1178,6 +1200,11 @@ struct Config {
      * of magnitude slower with no visible sign. It is refused unless this debug flag is set
      * (startup.h, rad_gate_reference_kernels). */
     bool    accept_reference_kernels = false;
+
+    /* A machine setting known to break radiance (compute wave save/restore off where cards serve)
+     * stops startup with what to change (core/diag/checks.cpp, incompatible()). This starts anyway:
+     * unsupported, with a banner at the top of the log and of the startup report. */
+    bool    proceed_incompatible = false;
 
     /* Where each operator-set option came from, keyed by the option table's spelling: "command
      * line" or the supplying environment variable. Absent means default or resolved at startup;

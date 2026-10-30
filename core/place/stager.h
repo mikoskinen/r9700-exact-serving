@@ -83,11 +83,11 @@
  */
 #pragma once
 #include "../runtime/stager.h"
+#include <functional>
 #include "mover.h"
 #include "planner.h"
 
 #include <deque>
-#include <functional>
 #include <map>
 #include <vector>
 
