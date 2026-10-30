@@ -308,6 +308,17 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     /* An embedding input runs in one step or not at all (Request::embed); one longer than a step
      * could never be admitted. */
     if (r->embed && (int64_t)r->prompt.size() > cfg_.max_tok) return RAD_E_INVAL;
+    /* Every prompt id, tokenised or client-supplied, names a real vocabulary row: an id past the
+     * embedding table is refused at admission, never staged into a pass. Raw id arrays reach here
+     * straight from the request body, and an op failing mid-step is a device fault (spec §17) —
+     * the whole engine would die for one bad number. Same bound as the scored-prompt check below.
+     */
+    for (int32_t t : r->prompt)
+        if (t < 0 || t >= prog_->meta.n_vocab) {
+            RAD_WARN("request %llu refused: prompt token id %d is outside the vocabulary [0, %lld)",
+                     (unsigned long long)r->id, t, (long long)prog_->meta.n_vocab);
+            return RAD_E_INVAL;
+        }
     /* Nor could a prompt the KV pool cannot hold even alone: admission takes only what the pool
      * holds, so it would wait at the head of the queue, and everything behind it, forever. The
      * prompt is the least a request needs: its first token comes from the prefill's last row.
@@ -1952,11 +1963,11 @@ const RadBatch* Scheduler::step() {
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
-            /* A sequence the context cannot hold never runs: its prompt alone reaches the last
-             * addressable position, so prefilling it would write positions the block and rotary
-             * tables lack. The server refuses such prompts; this is the scheduler's own bound.
-             * close_request removes it from waiting_, so `at` now names the next request. */
-            if (ctx_limit_ > 0 && s.seq_len() >= ctx_limit_) {
+            /* Generation reserves one position after the prompt. An embedding consumes just
+             * the prompt, so its exact context boundary fits without a generation slot.
+             * close_request removes a refused input from waiting_, so `at` names the next one. */
+            if (ctx_limit_ > 0 &&
+                (s.seq_len() > ctx_limit_ || (!s.req->embed && s.seq_len() == ctx_limit_))) {
                 RAD_WARN("request %llu failed: %lld tokens leave no room in a %lld-token context",
                          (unsigned long long)s.req->id, (long long)s.seq_len(),
                          (long long)ctx_limit_);
@@ -2325,6 +2336,12 @@ const RadBatch* Scheduler::step_next_locked() {
          * that cannot rewind decides at commit whether the next step may speculate; one that can,
          * or no grammar, keeps its answer. */
         if (!e.produces_token || !r.speculation_fixed) return nullptr;
+        /* A SCORED row (Request::token_scores, a /v1/systemone question) that the step in flight
+         * brings to max_tokens gets no step issued ahead: it would run a whole forward pass for a
+         * request that finishes at the commit, and max_tokens=1 pays a decode step after its
+         * prefill. Scored rows only -- every other decode keeps the step of overlap it had. */
+        if (r.token_scores && r.max_tokens > 0 &&
+            (int64_t)r.output.size() + 1 >= r.max_tokens) return nullptr;
 
         /* The furthest context the row can reach: every position this step verifies committed,
          * counted from the last commit rather than this step's own bound (which would add a

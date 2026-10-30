@@ -1198,6 +1198,8 @@ int Engine::save_checkpoints() {
  * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id. */
 int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
     score_rows_.clear();
+    score_only_ = false;
+    score_ids_.clear();
     if (embedding_) return RAD_OK;
     for (size_t i = 0; i < plan.e.size(); ++i) {
         const Request* r = plan.e[i].req;
@@ -1206,16 +1208,35 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
     }
     if (score_rows_.empty()) return RAD_OK;
     const int64_t n = (int64_t)score_rows_.size();
+
+    /* A scored step reads back the hidden rows and the candidates' table rows instead of whole
+     * logits rows (BatchBuilder set the flag on the same facts). */
+    const RadBatch* b0 = sched_.batch_for(0);
+    score_only_ = b0 && b0->score_only;
+    if (score_only_) {
+        const Program& p = ranks_[0]->program;
+        score_embd_ = p.buffers[p.score_hidden].decl.shape[1];
+        for (const auto& sr : score_rows_)
+            for (int32_t t : sr.second->tokens) score_ids_.push_back(t);
+        std::sort(score_ids_.begin(), score_ids_.end());
+        score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
+    }
     for (auto& rk : ranks_) {
-        if (n <= rk->score_rows_cap) continue;
+        const int64_t width = rk->sampler.config().n_vocab_local;
+        /* In floats: n logits rows, or the bf16 hidden and table rows of a scored step. */
+        int64_t rows = n;
+        if (score_only_) {
+            const int64_t need = ((n + (int64_t)score_ids_.size()) * score_embd_ + 1) / 2;
+            rows = std::max(rows, (need + width - 1) / width);
+        }
+        if (rows <= rk->score_rows_cap) continue;
         if (ranks_.size() > 1) RAD_TRY(rad_dev_set(rk->device));
         if (rk->score_host) rad_dev_free(rk->score_host, RAD_MEM_HOST_PINNED);
-        const int64_t width = rk->sampler.config().n_vocab_local;
         rk->score_host = static_cast<float*>(
-            rad_dev_alloc(n * width * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
-        rk->score_rows_cap = rk->score_host ? n : 0;
+            rad_dev_alloc(rows * width * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
+        rk->score_rows_cap = rk->score_host ? rows : 0;
         if (!rk->score_host) {
-            RAD_ERR("scored rows: no pinned memory for %lld logits rows", (long long)n);
+            RAD_ERR("scored rows: no pinned memory for %lld logits rows", (long long)rows);
             return RAD_E_NOMEM;
         }
     }
@@ -1225,13 +1246,44 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
 
 int Engine::issue_scored_rows(Rank& r) {
     const int64_t width = r.sampler.config().n_vocab_local;
-    const char* logits = static_cast<const char*>(r.ctx.buf_ptr(r.program.logits_buf));
+    char* const logits = static_cast<char*>(r.ctx.buf_ptr(r.program.logits_buf));
     if (!logits || !r.score_host) return RAD_E_STATE;
+    if (score_only_) {
+        /* The plugin left the hidden rows and ran no lm_head: read back each scored row's hidden
+         * state and the table rows its candidates name, then zero the logits rows the sampler is
+         * about to read, so the token it draws (and the caller discards) is drawn from defined
+         * values. One rank (BatchBuilder). */
+        const int64_t rb = score_embd_ * (int64_t)sizeof(uint16_t);
+        const char* hid = static_cast<const char*>(r.ctx.buf_ptr(r.program.score_hidden));
+        const char* tab = static_cast<const char*>(r.ctx.weight_ptr(r.program.score_table));
+        if (!hid || !tab) return RAD_E_STATE;
+        char* host = reinterpret_cast<char*>(r.score_host);
+        const int64_t n = (int64_t)score_rows_.size();
+        for (int64_t k = 0; k < n; ++k)
+            RAD_TRY(rad_memcpy_async(host + k * rb, hid + (int64_t)score_rows_[(size_t)k].first * rb,
+                                     rb, r.ctx.stream()));
+        for (size_t j = 0; j < score_ids_.size(); ++j)
+            RAD_TRY(rad_memcpy_async(host + (n + (int64_t)j) * rb, tab + (int64_t)score_ids_[j] * rb,
+                                     rb, r.ctx.stream()));
+        return rad_memset_async(logits, 0, n * width * (int64_t)sizeof(float), r.ctx.stream());
+    }
     for (size_t k = 0; k < score_rows_.size(); ++k)
         RAD_TRY(rad_memcpy_async(r.score_host + (int64_t)k * width,
                                  logits + (int64_t)score_rows_[k].first * width * 4,
                                  width * 4, r.ctx.stream()));
     return RAD_OK;
+}
+
+/* A scored step's logits: the dot product of a row's hidden state with each candidate's table row,
+ * bf16 operands widened exactly and summed in f64, then rounded once to f32. */
+static float score_dot(const uint16_t* h, const uint16_t* w, int64_t n) {
+    double acc = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        const float a = __builtin_bit_cast(float, (uint32_t)h[i] << 16);
+        const float b = __builtin_bit_cast(float, (uint32_t)w[i] << 16);
+        acc += (double)a * (double)b;
+    }
+    return (float)acc;
 }
 
 int Engine::collect_scored_rows() {
@@ -1242,6 +1294,23 @@ int Engine::collect_scored_rows() {
         RAD_TRY(rad_stream_sync(ranks_[i]->ctx.stream()));
     }
     if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    if (score_only_) {
+        const uint16_t* host = reinterpret_cast<const uint16_t*>(ranks_[0]->score_host);
+        const int64_t n = (int64_t)score_rows_.size();
+        for (int64_t k = 0; k < n; ++k) {
+            TokenScores& ts = *score_rows_[(size_t)k].second;
+            ts.logits.assign(ts.tokens.size(), 0.0f);
+            for (size_t j = 0; j < ts.tokens.size(); ++j) {
+                const auto it = std::lower_bound(score_ids_.begin(), score_ids_.end(), ts.tokens[j]);
+                const int64_t c = it - score_ids_.begin();
+                ts.logits[j] = score_dot(host + k * score_embd_, host + (n + c) * score_embd_,
+                                         score_embd_);
+            }
+        }
+        score_rows_.clear();
+        score_only_ = false;
+        return RAD_OK;
+    }
     for (size_t k = 0; k < score_rows_.size(); ++k) {
         TokenScores& ts = *score_rows_[k].second;
         ts.logits.assign(ts.tokens.size(), 0.0f);
@@ -2320,8 +2389,8 @@ int Engine::run_server() {
                 s.experts.n_experts = n_expert;
                 s.experts.tier.assign((size_t)n_layer * (size_t)n_expert, (uint8_t)Tier::VRAM);
                 /* The live tier when the heat engine runs, else the plan's (where a unit started).
-                 * HeatEngine::tier is a plain vector written by the dispatch thread at step
-                 * boundaries, so a racing read sees either side of a single store. */
+                 * tier_published is the HTTP-readable mirror HeatEngine::set_tier keeps; reading
+                 * the dispatch thread's own tier_ here would be a data race. */
                 const HeatEngine& heat = ranks_[0]->heat;
                 const bool live_tier = heat.enabled();
                 s.experts.heat_enabled = live_tier;
@@ -2330,7 +2399,7 @@ int Engine::run_server() {
                 for (size_t u = 0; u < p.units.size(); ++u) {
                     const MoveUnit& mu = p.units[u];
                     if (mu.expert < 0 || mu.layer < 0) continue;
-                    const Tier t = live_tier ? heat.tier((int32_t)u) : mu.tier;
+                    const Tier t = live_tier ? heat.tier_published((int32_t)u) : mu.tier;
                     s.experts.tier[(size_t)mu.layer * (size_t)n_expert + (size_t)mu.expert]
                         = (uint8_t)t;
                     /* Count residency over units, not plane cells: the plane is a rectangle a
@@ -2460,11 +2529,19 @@ int Engine::run_server() {
             return v ? std::string(v) : std::string();
         }
         server::IChatTemplate* message_template() const override { return tpl; }
+        const RadModelMeta* metadata() const override { return meta; }
     } embed_info;
     embed_info.d = pooled_dim_;
     embed_info.n = cfg_.max_tok;
     embed_info.meta = &meta_;
     if (embedding_) d.embed = &embed_info;
+    std::string embed_why;
+    const int embed_rc = server::check_embedding_template(
+        d.embed, !cfg_.override_chat_template.empty(), &embed_why);
+    if (embed_rc < 0) {
+        RAD_ERR("%s", embed_why.c_str());
+        return embed_rc;
+    }
 
     /* The template loader warns on its own about a missing or broken template; this only decides
      * whether the chat endpoint exists. The reply format is the architecture plugin's when it

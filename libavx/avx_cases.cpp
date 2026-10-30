@@ -107,6 +107,19 @@ std::vector<Case> build_cases() {
         add("scale_rows",  { HI("M", 6), HI("n", 640), HS("act", "none"), HS("dtype", dt) },
                            EB(6, 640, w, 2));
     }
+    for (const char* dt : {"f32", "bf16"})
+        add("position_scale",
+            {HI("M", 7), HI("n", 259), HI("original", 16384), HF("beta", 0.1), HS("dtype", dt)});
+    for (const char* dt : {"f32", "bf16"})
+        add("pixtral_rope",
+            {HI("M", 7), HI("head_dim", 64), HI("n_head", 2), HF("theta", 10000), HS("dtype", dt)});
+    for (const char* dt : {"f32", "bf16"})
+        add("ministral_rope", {HI("M", 7), HI("head_dim", 128), HI("n_head", 4), HI("n_head_kv", 1),
+                               HF("theta", 1e6), HF("yarn_factor", 16), HF("yarn_low", 8),
+                               HF("yarn_high", 24), HF("yarn_magnitude", 1), HS("dtype", dt)});
+    for (const char* dt : {"f32", "bf16"})
+        add("embed_attn", {HI("M", 7), HI("head_dim", 64), HI("n_head", 4), HI("gqa", 2),
+                           HI("causal", 0), HI("n_seq", 2), HS("dtype", dt)});
     /* Every dtype pair: `cast` carries the narrowing conventions and is checked at 1e-6, i.e.
      * exactly. */
     for (const char* from : { "f32", "bf16", "f16", "fp8_e4m3", "fp8_e5m2", "i8" })
@@ -1223,10 +1236,10 @@ std::vector<Case> build_cases() {
                   HF("route_scale", 1.5), HS("score", score), HS("dtype", dt) });
         for (const char* mode : { "gptj", "neox" })
             for (int inv : { 0, 1 })
-                add("rope_rows", { HI("M", 5), HI("n_head", 3), HI("head_dim", 96), HI("rot", 32),
+                add("ds41_rope_rows", { HI("M", 5), HI("n_head", 3), HI("head_dim", 96), HI("rot", 32),
                                    HI("off", 64), HS("mode", mode), HI("inverse", inv),
                                    HS("dtype", dt) });
-        add("rope_rows", { HI("M", 4), HI("n_head", 2), HI("head_dim", 64), HI("rot", 64),
+        add("ds41_rope_rows", { HI("M", 4), HI("n_head", 2), HI("head_dim", 64), HI("rot", 64),
                            HI("off", 0), HS("mode", "gptj"), HI("inverse", 0), HS("dtype", dt) });
         add("quant_roundtrip", { HI("M", 5), HI("n", 448), HI("block", 64), HS("format", "fp8_e4m3"),
                                  HS("scale", "ue8m0"), HS("dtype", dt) });

@@ -566,7 +566,7 @@ static rad_op rmsnorm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w,
 }
 static rad_op rope_rows(RadBuilder* b, const Model& m, int64_t rows, int64_t heads, int64_t hd,
                         int inverse, rad_buf x, rad_buf cs) {
-    return op(b, "rope_rows",
+    return op(b, "ds41_rope_rows",
               { RAD_RANGE("M", 1, rows), RAD_INT("n_head", heads), RAD_INT("head_dim", hd),
                 RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope), RAD_STR("mode", "gptj"),
                 RAD_INT("inverse", inverse), RAD_STR("dtype", "bf16") },

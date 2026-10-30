@@ -190,6 +190,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | op | params | operands |
 |---|---|---|
 | `rmsnorm` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w? → `y` (no gain operand: a gain of one) |
+| `rmsnorm_rows` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w? → `y` (the same norm; at n <= 256 with 1024+ rows a wave a row, byte-identical) |
 | `rmsnorm_p` | `M`(range) `n` `eps`:f64 `dtype` | `x` → `y` |
 | `rmsnorm_add` | `M`(range) `n` `eps`:f64 `dtype` `wadd`:f64/opt | `x`, `residual`, `w`w → `y`, `residual_out` |
 | `hc_enter` | `M`(range) `n` `hc` `dtype` | `x` → `h` |
@@ -221,6 +222,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `clamp` | `M`(range) `n` `dtype` | `x`, `lo`w, `hi`w → `y` |
 | `conv2d` | `M`(range) `width` `cin` `cout` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `dtype` `t_last`/opt `act`/opt | `x`, `w`w, `cu_seqlens`, `valid`? → `y`; `b`w? |
 | `conv2d_unfold` | `M`(range) `width` `cin` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `t_last`/opt `dtype` | `x`, `cu_seqlens`, `valid`? → `y` |
+| `pixtral_merge` | `M`(range) `n` `merge` `dtype` | `x`, `coord` → `y` |
 | `conv1d_dw` | `M`(range) `n` `k` `cu_div`/opt `dtype` | `x`, `w`w, `cu_seqlens` → `y`; `b`w? |
 | `rel_sinusoid` | `M`(range) `n` `max_timescale`:f64/opt `dtype` | → `y` |
 | `gelu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gelu·up, tanh approx) |
@@ -629,6 +631,7 @@ and is optional.
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `swiglu_clamped_quant_fp8` | `M`(range) `n` `limit`:f64 `group` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+| `gemm_nt_q_gated_wide` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? (the same fold at every M: the narrow tile to 64 rows, past them the gated prefill tile) |
 | `gemm_nt_q_gated_mx` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w, `b_ref`w → `q`, `scale`, `out_bf16`? |
 
 `quant_cols_fp8` is the same E4M3 quantiser with one scale per column over all `M` rows,
@@ -742,6 +745,7 @@ may not have arrived.
 | `gemm_nt_f32` | `M`(range) `N` `K` `dtype` | `a`, `b`w → `y` |
 | `gemm_nt_bias` | `M`(range) `N` `K` `dtype` `act`/opt | `a`, `b`w, `bias`w, `res`? → `y` |
 | `gemm_nt_q` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? |
+| `gemm_nt_q_short` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? (the narrow fp8 row with the short-prompt split rule: N <= 512, K <= 5120 and 41..64 rows run unsplit) |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 | `gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y` |
 
@@ -906,6 +910,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
 | `kv_store_streamed` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout, `res`, `host`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
+| `rope_rows` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` (the same rotation; at 64+ rows and 4+ heads one angle a (token, pair), byte-identical) |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
 | `rope_rows` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `dtype` | `x`:inout, `cos_sin`, `positions` |
 | `quant_roundtrip` | `M`(range) `n` `block` `format`:str `scale`:str `dtype` | `x`:inout |
@@ -919,6 +924,10 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `entry_store` | `M`(range) `n` `block_size` `dtype` | `x`, `page`, `cache`:inout |
 | `token_map` | `M`(range) `n_vocab` | `ids`, `table`w → `mapped` |
 | `stream_gate_add` | `M`(range) `n` `hc` `eps`:f64 `gate_eps`:f64 `dtype` | `h`, `k`, `v`, `w`w → `out` |
+| `position_scale` | `M`(range) `n` `original` `beta`:f64 `dtype` | `x`:inout, `positions` |
+| `embed_attn` | `M`(range) `head_dim` `gqa` `causal` `max_seqlen`/opt `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
+| `ministral_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt | `qkv`:inout, `pos` |
+| `pixtral_rope` | `M`(range) `head_dim` `n_head` `theta`:f64 `dtype` | `qkv`:inout, `coord` |
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
 | `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `v_norm`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
 | `qkv_norm_rope_kv_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` `v_norm`/opt `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w, `slot_mapping`, `kv_cache`:inout |
@@ -1043,6 +1052,42 @@ prefix of the full-width table: at `head_dim 512, rotary_dim 128`, frequency `i 
 `theta^(-1 / 256)`, not `theta^(-1 / 64)`. Only the base ladder moves (`axial` keeps its per-section
 ladders), and the head past `rotary_dim` is untouched either way. `rope_table` takes `head_dim` for
 the same reason: its angles must stay `rope`'s exactly.
+
+**`position_scale`** multiplies query row `r` by
+`1 + beta * log(1 + floor(positions[r] / original))`, rounding the multiplier to the input's
+dtype before multiplying. It takes a pitched `[M, n]` query view and nonnegative i32 positions;
+columns outside that view (keys and values in a fused QKV buffer) are unchanged. `original` must
+be positive and `beta` finite and nonnegative. It currently has host rows for bf16 and f32 only.
+It implements Ministral 3's query scaling after RoPE; it is independent of YaRN's cos/sin
+magnitude and does not change existing `rope` behavior.
+
+**`embed_attn`** serves complete noncausal segments of at most 32768 rows. QK dot products
+are rounded to the activation dtype, multiplied by `scale` (default `1/sqrt(head_dim)`) and
+rounded again. Softmax is float32; its probabilities are rounded to the activation dtype before
+the value product. This reproduces the eager BF16 materialization boundaries used by the
+Nemotron reference. `causal` must be zero. Existing `attn_dense` semantics are unchanged.
+
+**`ministral_rope`** rotates the Q and K heads of fused QKV rows with NeoX pairing and the
+resolved YaRN frequency ladder. Cosine/sine are rounded to the activation dtype, as are each
+of the two products before addition/subtraction, matching Ministral's BF16 rotary expression.
+V heads are unchanged. Active rows come from the issued tensor views; `M` is the capacity band.
+This separate operation preserves every existing `rope` implementation and schema.
+
+**`pixtral_rope`** rotates Q and K of `[M, 3 * n_head * head_dim]` fused QKV rows, leaving V
+unchanged. `coord` is `[2, M]` nonnegative i32 `(height, width)` patch coordinates. The head
+dimension must be divisible by four. NeoX pairs `(i, i + head_dim/2)` use the height ladder
+`theta^(-4j/head_dim)` for `i = j < head_dim/4`, then the width ladder
+`theta^(-(4j+2)/head_dim)` for `i = j + head_dim/4`. In BF16, cos/sin and each product are
+rounded before the addition, as in Transformers. Host rows support BF16 and f32. This is a
+separate contract from `rope`'s existing axial mode, whose two ladders are identical.
+
+**`pixtral_merge`** packs `[M, n]` raster patch rows into `[M / merge^2, n * merge^2]` rows.
+`coord` is `[4, M]` i32 `(row, column, height, width)` patch coordinates; it must describe whole
+raster grids, each side divisible by `merge`. Images may have different widths. One output row
+is a merged spatial cell with columns `(channel, dy, dx)`, matching PyTorch `unfold`; values
+are copied exactly. The complete coordinates are validated before writing, so invalid grids
+leave the output unchanged. Host rows support BF16 and f32. Automatic random shape fixtures
+cannot supply this coupled coordinate grid; callers must provide a valid grid fixture.
 
 **`qk_norm_rope`** RMS-norms each q and k head of a fused `[q | k | v]` row against its gain (plus
 `wadd`), rounds, and rotates in place. `positions` is read as `rope` reads it, integer or f32.

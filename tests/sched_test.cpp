@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -98,7 +99,9 @@ struct Fixture {
         g_gdn_row = KernelRow{ &g_gdn_ki, "fake", 0, 0 };
 
         prog.meta.n_ctx_train = 4096;
-        prog.meta.n_vocab = 512;
+        /* Above the 1000 + i the requests below spell: admission refuses ids past the
+         * vocabulary, and these prompts must be admissible. */
+        prog.meta.n_vocab = 65536;
 
         /* index 0 is the sentinel every handle table in Program carries */
         prog.ops.emplace_back();
@@ -1281,6 +1284,30 @@ TEST(a_scored_request_names_real_vocabulary_rows) {
     CHECK(!kept->may_speculate);
 }
 
+/* The prompt itself names real vocabulary rows too: raw id arrays arrive verbatim from the
+ * request body, and an id past the embedding table must die at admission, never staged into a
+ * pass — the embedding gather would fail the step, a failed step is a device fault, and a
+ * device fault stops the engine (spec §17). One bad number must not be a server kill. */
+TEST(a_prompt_names_real_vocabulary_rows) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int32_t n_vocab = (int32_t)f.prog.meta.n_vocab;
+    std::unique_ptr<Request> rs[5];
+    const std::vector<std::vector<int32_t>> ids = { { 1, 2, n_vocab - 1 }, { n_vocab }, { -1 },
+                                                    { 7, INT32_MAX }, { 0, 1, 2, n_vocab + 9 } };
+    int rc[5] = { -1, -1, -1, -1, -1 };
+    for (int i = 0; i < 5; ++i) {
+        rs[i] = std::make_unique<Request>();
+        rs[i]->id = f.next_id++;
+        rs[i]->max_tokens = 1;
+        rs[i]->prompt = ids[(size_t)i];
+    }
+    f.sch.add_all(rs, 5, rc);
+    CHECK_EQ(rc[0], RAD_OK);
+    for (int i = 1; i < 5; ++i) CHECK_EQ(rc[i], RAD_E_INVAL);
+}
+
 TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     Fixture f;
     f.build();
@@ -1850,6 +1877,48 @@ TEST(a_preempted_prefill_does_not_reset_a_higher_priority_prefill) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
 }
 
+/* Every program carries a sentinel KV group at index 0: decl.kind 0 (RAD_KV_FULL), block size 1, no
+ * layers, and the manager's plan for it pages nothing, so it holds no blocks. The gate must not ask
+ * that group for the prompt's blocks: it has none to give, and the preempted request would wait
+ * for ever (engine_e2e_test's preemption case hung on it, with nothing left running). Here the
+ * group is appended, not at index 0, so the fixture's bindings stay where they are. */
+TEST(a_preempted_prefill_ignores_a_kv_group_that_holds_no_blocks) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    KVGroupInfo none;                        /* as the sentinel: kind 0, no block size, no layers */
+    none.name = "none";
+    f.prog.kv_groups.push_back(none);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 26, 64);
+    const size_t ng = f.prog.kv_groups.size() - 1;
+    f.kv.geom.g[ng].paged = false;           /* the manager pages nothing there ... */
+    f.kv.total[ng] = 0;                      /* ... and owns no block of it */
+    f.kv.freelist[ng].clear();
+    f.kv.refcnt[ng].clear();
+    for (int k = 63; k >= 0; --k) f.kv.state_free[ng].push_back(k);
+    f.cfg.preempt_wait_ms = 60000;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 2);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);                /* B's next block: B is preempted */
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+
+    for (int i = 0; i < 80 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+
+    /* A's blocks are back and nothing runs: B prefills its whole prompt again. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    f.commit_plain();
+}
+
 /* The gate's wait is bounded: after --preempt-wait-ms an overdue preempted prefill gets room by
 
  * preempting the lowest-priority running request before the step is planned, so it cannot queue
@@ -1897,6 +1966,8 @@ TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
     CHECK(f.sch.step() != nullptr);
     f.commit_plain();
 
+    /* Fill until the pool refuses someone. Then the overdue path must not leave every preempted
+     * request waiting while a runner keeps the blocks. */
     for (int i = 0; i < 8; ++i) {
         if (!f.sch.step()) break;
         f.commit_plain();
@@ -6314,6 +6385,33 @@ TEST(an_embedding_input_longer_than_the_checkpoint_interval_is_admitted_whole) {
     CHECK(whole);
 }
 
+/* The shared context check serves every embedding architecture. Exact-limit inputs need no
+ * following generation slot, while generation keeps that slot and both refuse an overflow. */
+TEST(the_context_boundary_distinguishes_embeddings_from_generation) {
+    for (bool embed : {false, true}) {
+        for (int length : {169, 170, 171}) {
+            Fixture f;
+            f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/170,
+                    /*windowed=*/false, /*linear=*/false);
+            REQUIRE_EQ(f.start(), RAD_OK);
+            auto r = f.request(length, 1);
+            r->embed = embed;
+            const uint64_t id = f.add(std::move(r));
+            REQUIRE(id != 0);
+            const RadBatch* batch = f.sch.step();
+            const bool fits = length < 170 || (embed && length == 170);
+            if (fits) {
+                REQUIRE(batch != nullptr);
+                CHECK_EQ(batch->n_tok, length);
+                CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Running);
+            } else {
+                CHECK(batch == nullptr);
+                CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
+            }
+        }
+    }
+}
+
 /* ================================================================== speculation gates */
 /* A request that may not speculate (a constraining grammar that cannot snapshot) gets no draft
  * from either drafter: set_draft takes nothing and prompt lookup proposes nothing, though its
@@ -6418,6 +6516,49 @@ TEST(a_request_finishing_under_a_step_issued_ahead_keeps_its_blocks_for_that_ste
     f.commit_plain();
     CHECK_EQ(f.kv.free_blocks(0), before);
     CHECK_EQ((int)f.sch.find(a)->output.size(), 2);   /* the step ahead emitted nothing */
+}
+
+/* A SCORED row (Request::token_scores) the step in flight brings to max_tokens gets no step issued
+ * ahead: it would be a forward pass for a request that finishes at the commit. The step after the
+ * commit is planned as usual. */
+TEST(no_step_is_issued_ahead_for_a_scored_request_the_step_in_flight_finishes) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int64_t before = f.kv.free_blocks(0);
+    auto r = f.request(40, /*max_tokens=*/2);
+    r->speculation_fixed = true;
+    r->token_scores = std::make_shared<TokenScores>();
+    r->token_scores->tokens = { 1, 2 };
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.step_next() == nullptr);
+    f.commit_plain();                              /* the second token: finished */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.kv.free_blocks(0), before);
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 2);
+    CHECK(f.sch.step() == nullptr);
+}
+
+/* A row without token_scores whose step in flight leaves a token to decode is an ordinary decode:
+ * the step ahead is issued. (A request any step in flight finishes gets none, scored or not.) */
+TEST(a_non_scored_row_keeps_the_step_issued_ahead) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    auto r = f.request(40, /*max_tokens=*/3);
+    r->speculation_fixed = true;
+    const uint64_t a = f.add(std::move(r));
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK(f.sch.step_next() != nullptr);
+    f.commit_plain();
+    f.sch.promote_next();
+    f.commit_plain();                              /* the step ahead: the third token */
+    CHECK_EQ((int)f.sch.find(a)->output.size(), 3);
 }
 
 /* ================================================================== terminal paths */

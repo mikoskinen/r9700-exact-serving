@@ -304,6 +304,7 @@ and runs.
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `nomicbert` | nomic-embed-text-v2-moe, an embedding model (§5.6) |
+| `nemotron35_embed` | Nemotron 3.5 Embed 1B and 8B, BF16 text/image embeddings at TP1 (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
 | `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
 | `anima` | Anima Base, Aesthetic and Turbo, an anime and illustration image model from text (§5.6) |
@@ -2128,7 +2129,7 @@ by 0.002-0.003 nats.
 |---|---|---|
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
-| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6) |
+| `--api-key KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6); the key must be non-empty |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the loaded one serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels, 14x14 on GLM-5.3). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card. A pass is not one tower invocation: inside it the tower batches at most 8 tiles per weight read, and the pass size may reduce that (4 tiles at the 64-pixel grid with the default 16384 patches); a picture contributes a separate pass per grid. See the concurrency notes for Unlimited-OCR (§5.17) |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the container's. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
@@ -2411,7 +2412,7 @@ token ids mixed, with its `add_special` and `parse_special` and their defaults);
 returns `tokens` as llama-server does, as `{id, piece}` objects with `with_pieces`. `/detokenize`
 returns the text as both `prompt` (vLLM) and `content` (llama-server).
 
-**An embedding model** (EmbeddingGemma 2, nomic-embed-text-v2-moe) serves `/v1/embeddings` only;
+**An embedding model** (EmbeddingGemma 2, nomic-embed-text-v2-moe, Nemotron 3.5 Embed) serves `/v1/embeddings` only;
 completions and chat answer 501. One input is one vector and must fit one step
 (`--max-num-batched-tokens`); a longer one is refused with `context_length_exceeded`.
 
@@ -2420,6 +2421,34 @@ nomic-embed-text-v2-moe converts from its f32 checkpoint with `rad-convert <chec
 the directory must contain `tokenizer.json`. The engine adds neither the `search_query: ` nor the
 `search_document: ` prefix: the client sends it, or names the checkpoint's prompt with
 `prompt_name`. The checkpoint's shared `experts.bias` tensors are not applied.
+
+Nemotron 3.5 Embed 1B and 8B load directly from their native BF16 safetensors snapshots, including
+the tokenizer, processor and retrieval-prompt files; no conversion is needed. Use the normal
+HIP/FFmpeg build for R9700 (`-DRAD_WITH_HIP=ON -DRAD_GPU_TARGETS=gfx1201 -DRAD_WITH_FFMPEG=ON`):
+
+```sh
+RADIANCE_HOME="$PWD/build/radiance_home" build/bin/radiance \
+  --model /models/Nemotron-3.5-Embed-1B-BF16 --kernels libr4d,libavx --tp 1 \
+  --max-model-len 32768 --max-num-batched-tokens 32768 --max-num-seqs 4 \
+  --mm-max-patches 6400
+```
+
+Use the 8B checkpoint path for 8B, or a CPU build and `--kernels libavx` on x86-64. Named prompts
+are `query` (`query: `) and `document` (`passage: `). Typed text/image inputs and one user message
+with an optional leading system prefix follow the checkpoint's retrieval template: escaped user
+text, images before text, exact spacing and no implicit BOS/EOS. Images use data URLs. Raw token
+arrays are already formatted and receive no named prefix. Custom `--override-chat-template`
+files are rejected; use a named prompt or system prefix instead.
+
+The 32768-token maximum counts prefixes, image placeholders and separators. `--max-model-len`
+may lower it. Four full inputs need `--max-num-batched-tokens 131072 --max-num-seqs 4` to share
+one step; requests arriving during an active forward wait for the next step. Configured budgets
+size the arenas, so raising a budget reserves more memory even for smaller requests. The BF16
+GEMMs use bounded row launches and rebased pointers for tall combined batches, preserving whole
+attention sequences and existing arithmetic; unsupported multi-launch chains are refused.
+`--mm-max-patches 6400` covers the default 1120-square image in one encoder pass. See
+[ARCHITECTURES.md](ARCHITECTURES.md#nemotron35_embed-embedding-models) for geometry, numerical
+contracts and validation limits.
 
 ```sh
 # text, a batch of texts, or token ids
@@ -3656,11 +3685,16 @@ With a key, every request must carry `Authorization: Bearer KEY` (or Anthropic's
 or it is answered 401, `/tokenize` and `/server_info` included. Exempt are `/health`, `/v1/health` and
 `/ping`, because load balancers cannot send a bearer token, and the dashboard page (`/`,
 `/dashboard`), which holds no data: on a 401 it asks for the key, keeps it in the browser's storage
-and sends it on every data fetch.
+and sends it on every data fetch. The exemption follows those paths' methods -- reads, plus the
+`POST /ping` of the health-check convention -- so it cannot follow a method no route answers.
+An empty `--api-key` value is a startup error: it would guard nothing.
 
 Without a key, `/diagnostics` answers only loopback clients (others get 403), because it describes
 the host: kernel, boot parameters, PCI layout, memory limits. Read it on the machine, or start the
-server with `--api-key`.
+server with `--api-key`. The same loopback-only rule covers the control-vector default and runtime
+LoRA loads, and a browser page on another origin does not qualify as a loopback client even when
+its own machine serves the port: that is how a hostile web page would reach these routes through a
+victim's browser, and a request that says `Origin: http://evil` is refused the way a remote one is.
 
 The key is not encrypted in transit. On a network you do not control, bind to localhost behind a
 TLS-terminating reverse proxy:
