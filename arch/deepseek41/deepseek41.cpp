@@ -367,6 +367,14 @@ struct Dsp {
     std::vector<Layer> st;
 };
 
+/* A dense linear's int8 activation pair, keyed by the GEMM op a linear() declared: the quantiser
+ * writes the pair and the GEMM reads it. One pair for the model's widest activation keeps a
+ * quantised trunk's arena small; a GEMM's own columns are sliced at issue. */
+struct IqrQOp {
+    rad_op  op = 0;
+    int64_t K  = 0;
+};
+
 struct Model {
     Names nm{};
     Geom g{};
@@ -400,6 +408,14 @@ struct Model {
     std::map<int64_t, rad_kvgroup> comp, index, tail;
     /* The GGUF type of each linear weight the model ships in llama.cpp's blocks (lw()). */
     std::map<rad_weight, const char*> wty;
+    /* IQR dense weights: lw()'s code view is `w`, its scale view `wsc`; `wdt` is the GEMM's dtype
+     * (`i8a8h`, or an asymmetric rotated form) and `wrb` a trellis's rows per int8 scale. */
+    std::map<rad_weight, rad_weight>   wsc;
+    std::map<rad_weight, const char*>  wdt;
+    std::map<rad_weight, int64_t>      wrb;
+    /* The quantiser each dense GEMM waits for (linear()): the op and the K its pair was declared at. */
+    std::map<rad_op, IqrQOp>           qops;
+    rad_buf iqr_q8 = 0, iqr_s8 = 0;   /* [max_tok, widest K] i8; [max_tok, widest K / 128] f32 */
     int64_t win_bs = 0;
     /* model-wide weights and ops */
     rad_weight token = 0, head = 0, final_gain = 0, tmap = 0, ple_table = 0;
@@ -522,21 +538,83 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
     if (!mapped && map_copy(b, name, ckpt_name(name)) != RAD_OK) return 0;
     RadEncoding e{};
     int64_t blk = 0;
-    const char* ty = weight_enc(b, name, &e) ? ggml_type_of(e, &blk) : nullptr;
+    const bool known = weight_enc(b, name, &e);
+    const char* ty = known ? ggml_type_of(e, &blk) : nullptr;
     const bool split = m.g.world > 1 && shard != RAD_SHARD_NONE;
-    if (ty && (k % blk || (split && shard == RAD_SHARD_COL && (lo % blk || hi % blk)))) {
+    const W8hForm form = known ? linear_w8h_form(e) : W8hForm::None;
+    const bool w8 = known && linear_is_w8(e);
+    const bool wnh = known && linear_is_wnh(e);
+    /* A rotated or int8 narrow weight: lw()'s codes are a view of the stored planes, its scale
+     * plane a second view; the GEMM decodes them where it reads them (libr4d's IQR rows). */
+    if (form != W8hForm::None || w8 || wnh) {
+        const bool trellis = form == W8hForm::Trellis;
+        const RadEncPlane* tpl = trellis ? rad_enc_plane(&e, "trellis") : nullptr;
+        const int64_t wb = trellis && tpl ? tpl->block[1] : 0;
+        if ((n % 16) || (k % (trellis ? 256 : 128))) {
+            fprintf(stderr, "radiance: deepseek41: %s is an IQR weight; a dense IQR GEMM takes rows in "
+                            "16s and K in whole 256s, this rank reads %lldx%lld\n",
+                    name, (long long)n, (long long)k);
+            return 0;
+        }
+        if (split && shard == RAD_SHARD_COL && (lo % 128 || hi % 128)) {
+            fprintf(stderr, "radiance: deepseek41: %s is an IQR weight, and this rank's column slice "
+                            "[%lld, %lld) cuts a 128-column scale group\n",
+                    name, (long long)lo, (long long)hi);
+            return 0;
+        }
+        const char* cv = form == W8hForm::Zero    ? "codes,zero"
+                       : form == W8hForm::Table ? "codes,table"
+                       : form == W8hForm::Grid  ? "codes,grid"
+                       : form == W8hForm::Trellis
+                             ? (linear_w8h_mad(e) ? "codes,trellis,trellis.mad" : "codes,trellis")
+                       : wnh                    ? "codes,zero"
+                                                : "codes";
+        std::string base(name);
+        const bool suffix = base.size() > 6 && base.compare(base.size() - 6, 6, ".weight") == 0;
+        if (suffix) base.resize(base.size() - 6);
+        const char* sn = m.nm.f("%s.scale", base.c_str());
+        const bool rowf = form != W8hForm::None && linear_w8h_rowf(e);
+        const bool two = form != W8hForm::None && linear_w8h_scale2(e);
+        const char* sv = wnh ? "scale,zero" : rowf ? "scale,scale.col" : two ? "scale,scale.1" : "scale";
+        const uint32_t sdt = wnh ? (uint32_t)RAD_F16 : rowf ? (uint32_t)RAD_F32
+                           : two ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
+        const bool logical = wnh || rowf || two;
+        const rad_weight w = decl_view(b, name, nullptr, cv, e.plane[0].dtype, { n, k }, access,
+                                       split ? shard : RAD_SHARD_NONE, grp);
+        const rad_weight ws = decl_view(b, sn, name, sv, sdt,
+                                        { n, logical ? k : k / RAD_FP8_BLOCK }, access,
+                                        split ? shard : RAD_SHARD_NONE, grp);
+        if (!w || !ws) {
+            fprintf(stderr, "radiance: deepseek41: IQR weight %s refused\n", name);
+            return 0;
+        }
+        if (split && (rad_weight_shard_span(b, w, lo, hi) != RAD_OK ||
+                      rad_weight_shard_span(b, ws, logical || shard == RAD_SHARD_ROW ? lo : lo / RAD_FP8_BLOCK,
+                                            logical || shard == RAD_SHARD_ROW ? hi : hi / RAD_FP8_BLOCK) != RAD_OK)) {
+            fprintf(stderr, "radiance: deepseek41: %s's IQR span [%lld, %lld) refused\n",
+                    name, (long long)lo, (long long)hi);
+            return 0;
+        }
+        m.wsc[w] = ws;
+        m.wdt[w] = wnh ? (e.plane[0].dtype == RAD_U5 ? "w5a8i8" : "w4a8i8_asym")
+                       : form != W8hForm::None ? "i8a8h" : "i8a8";
+        m.wrb[w] = wb;
+        return w;
+    }
+    const bool split_ggml = split;
+    if (ty && (k % blk || (split_ggml && shard == RAD_SHARD_COL && (lo % blk || hi % blk)))) {
         fprintf(stderr, "radiance: deepseek41: %s is GGUF %s, whose blocks cover %lld of K; this rank "
                         "reads %lld columns%s\n", name, ty, (long long)blk, (long long)k,
-                split && shard == RAD_SHARD_COL ? " of a slice" : "");
+                split_ggml && shard == RAD_SHARD_COL ? " of a slice" : "");
         return 0;
     }
     const rad_weight w = decl_w(b, name, ty ? ggml_codes_dtype(e) : (uint32_t)RAD_BF16, { n, k },
-                                access, split ? shard : RAD_SHARD_NONE, grp);
+                                access, split_ggml ? shard : RAD_SHARD_NONE, grp);
     if (!w) {
         fprintf(stderr, "radiance: deepseek41: weight %s refused\n", name);
         return 0;
     }
-    if (split && rad_weight_shard_span(b, w, lo, hi) != RAD_OK) {
+    if (split_ggml && rad_weight_shard_span(b, w, lo, hi) != RAD_OK) {
         fprintf(stderr, "radiance: deepseek41: %s's span [%lld, %lld) refused\n", name, (long long)lo,
                 (long long)hi);
         return 0;
@@ -544,9 +622,27 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
     if (ty) m.wty[w] = ty;
     return w;
 }
-/* y = x . w^T over lw()'s weight: gemm_nt_ggml for a GGUF block weight, gemm_nt for bf16. */
-static rad_op linear(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
+/* y = x . w^T over lw()'s weight: for a GGUF block it is gemm_nt_ggml, for an IQR view gemm_nt_q
+ * at the weight's code dtype over a rotated int8 activation pair, otherwise gemm_nt at bf16. */
+static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_t n,
                      int64_t k, rad_buf x, rad_buf y) {
+    const auto s = m.wsc.find(w);
+    if (s != m.wsc.end()) {
+        const char* qdt = m.wdt.at(w);
+        const bool rot = std::strcmp(qdt, "i8a8") != 0;
+        const rad_op qop = op(b, rot ? "had_quant_act_i8g" : "quant_act_i8g",
+                              { RAD_RANGE("M", 1, rows), RAD_INT("n", k), RAD_INT("group", RAD_FP8_BLOCK),
+                                RAD_STR("dtype", "bf16") },
+                              {}, { x }, { m.iqr_q8, m.iqr_s8 });
+        std::vector<RadParam> ps = { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k),
+                                     RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", qdt) };
+        const int64_t wrb = m.wrb.at(w);
+        if (wrb > 1) ps.push_back(RAD_INT("w_rb", wrb));
+        std::vector<rad_weight> wts = { w, s->second };
+        const rad_op h = op(b, "gemm_nt_q", ps, wts, { m.iqr_q8, m.iqr_s8 }, { y });
+        if (qop && h) m.qops[h] = IqrQOp{ qop, k };
+        return h;
+    }
     const auto t = m.wty.find(w);
     if (t != m.wty.end())
         return op(b, "gemm_nt_ggml",
@@ -557,6 +653,19 @@ static rad_op linear(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, 
               { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("dtype", m.g.dtype) },
               { w }, { x }, { y });
 }
+/* Issue a dense linear: its quantiser first when lw() found an IQR weight, then its GEMM. The pair
+ * is one buffer for the whole model, so the quantiser and GEMM read the same columns of it. */
+static void lin_issue(RadCtx* x, Model& m, rad_op h, int64_t rows, RadOperand a, rad_weight w,
+                      RadOperand y) {
+    const auto q = m.qops.find(h);
+    if (q != m.qops.end()) {
+        const int64_t K = q->second.K;
+        RAD_ISSUE_N(x, q->second.op, rows, a, bcol(m.iqr_q8, 0, K, rows),
+                    bcol(m.iqr_s8, 0, K / RAD_FP8_BLOCK, rows));
+    }
+    RAD_ISSUE_N(x, h, rows, a, RAD_W(w), y);
+}
+
 static rad_op rmsnorm(RadBuilder* b, const Model& m, int64_t rows, rad_weight w, int64_t n,
                       rad_buf x, rad_buf y) {
     return op(b, "rmsnorm",
@@ -818,6 +927,11 @@ static int buffers(RadBuilder* b, Model& m) {
     /* bf16 linears: each ActFP8 carries only its activation (`x`); the plugin norms the FFN input
      * itself (MoeFP8's external-input form) and the block leaves its delta in `act.x`. */
     m.act.x = bf("ffn_normed", { T, D });
+    /* A quantised dense trunk reads this pair: the widest dense input (Engram's included) and one
+     * f32 scale a 128 columns. Slices are taken at issue, so every dense IQR GEMM shares it. */
+    const int64_t QK = std::max<int64_t>(D, c.ple_heads * c.ple_dim);
+    m.iqr_q8 = decl_b(b, nm.f("iqr_q8"), RAD_I8, { T, QK });
+    m.iqr_s8 = decl_b(b, nm.f("iqr_s8"), RAD_F32, { T, fp8_blocks(QK) });
     auto& mw = m.mw;
     mw.x = m.xcol;
     mw.h = m.act;
@@ -1921,10 +2035,10 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
     }
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
-    RAD_ISSUE_N(x, d.c_fc, T, brows(d.src, T), RAD_W(d.fc), brows(d.c, T));
+    lin_issue(x, m, d.c_fc, T, brows(d.src, T), d.fc, brows(d.c, T));
     RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
     for (const auto& L : d.st) {
-        RAD_ISSUE_N(x, L.d_kv, T, brows(d.cn, T), RAD_W(L.wkv), brows(d.ckv, T));
+        lin_issue(x, m, L.d_kv, T, brows(d.cn, T), L.wkv, brows(d.ckv, T));
         RAD_ISSUE_N(x, L.d_kvn, T, brows(d.ckv, T), RAD_W(L.kv_norm), brows(d.ckvn, T));
         RAD_ISSUE_N(x, L.d_kvrope, T, brows(d.ckvn, T), brows(m.cs_a, g.max_ctx), pos);
         if (L.d_kvq) RAD_ISSUE_N(x, L.d_kvq, T, brows(d.ckvn, T));
@@ -1970,11 +2084,11 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
         } else {
             RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
-            RAD_ISSUE_N(x, L.q_a, T, brows(d.xn, T), RAD_W(L.wq_a), brows(d.qr, T));
+            lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
             RAD_ISSUE_N(x, L.q_an, T, brows(d.qr, T), RAD_W(L.q_norm), brows(d.qrn, T));
-            RAD_ISSUE_N(x, L.q_b, T, brows(d.qrn, T), RAD_W(L.wq_b), brows(d.q, T));
+            lin_issue(x, m, L.q_b, T, brows(d.qrn, T), L.wq_b, brows(d.q, T));
             RAD_ISSUE_N(x, L.q_rope, T, brows(d.q, T), brows(m.cs_a, g.max_ctx), pos);
-            RAD_ISSUE_N(x, L.kv_g, T, brows(d.xn, T), RAD_W(L.wkv), brows(d.kv_, T));
+            lin_issue(x, m, L.kv_g, T, brows(d.xn, T), L.wkv, brows(d.kv_, T));
             RAD_ISSUE_N(x, L.kv_n, T, brows(d.kv_, T), RAD_W(L.kv_norm), brows(d.kvn, T));
             RAD_ISSUE_N(x, L.kv_rope, T, brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos);
             if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(d.kvn, T));
@@ -1988,9 +2102,9 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(d.o, T));
             const int64_t gd = HD / m.gr;
             for (int j = 0; j < m.gr; ++j)
-                RAD_ISSUE_N(x, L.o_a[(size_t)j], T, bcol(d.o, j * gd, gd, T), RAD_W(L.wo_a[(size_t)j]),
-                            bcol(d.oa, j * c.o_rank, c.o_rank, T));
-            RAD_ISSUE_N(x, L.o_b, T, brows(d.oa, T), RAD_W(L.wo_b), brows(d.attn_out, T));
+                lin_issue(x, m, L.o_a[(size_t)j], T, bcol(d.o, j * gd, gd, T), L.wo_a[(size_t)j],
+                          bcol(d.oa, j * c.o_rank, c.o_rank, T));
+            lin_issue(x, m, L.o_b, T, brows(d.oa, T), L.wo_b, brows(d.attn_out, T));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
         RAD_ISSUE_N(x, L.post_a, T, brows(d.attn_out, T), brows(d.h0, T), brows(d.post, T), brows(d.comb, T),
@@ -2121,7 +2235,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
             else
                 RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
             RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
-            RAD_ISSUE_N(x, L.e_gemm, T, brows(m.embd, T), RAD_W(L.e_kv), brows(m.ekv, T));
+            lin_issue(x, m, L.e_gemm, T, brows(m.embd, T), L.e_kv, brows(m.ekv, T));
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
@@ -2191,11 +2305,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
              * is in the other chain, so a recorded pass can leave it unordered behind it (the
              * tape's hazard check) and the two chains' dispatches overlap; one after the other,
              * every op but kv_g waits for the one before. Same kernels on the same operands. */
-            const auto q_a = [&] { RAD_ISSUE_N(x, L.q_a, T, brows(m.xn, T), RAD_W(L.wq_a), brows(m.qr, T)); };
+            const auto q_a = [&] { lin_issue(x, m, L.q_a, T, brows(m.xn, T), L.wq_a, brows(m.qr, T)); };
             const auto q_an = [&] { RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T)); };
-            const auto q_b = [&] { RAD_ISSUE_N(x, L.q_b, T, brows(m.qrn, T), RAD_W(L.wq_b), brows(m.q, T)); };
+            const auto q_b = [&] { lin_issue(x, m, L.q_b, T, brows(m.qrn, T), L.wq_b, brows(m.q, T)); };
             const auto q_rope = [&] { RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos); };
-            const auto kv_g = [&] { RAD_ISSUE_N(x, L.kv_g, T, brows(m.xn, T), RAD_W(L.wkv), brows(m.kv, T)); };
+            const auto kv_g = [&] { lin_issue(x, m, L.kv_g, T, brows(m.xn, T), L.wkv, brows(m.kv, T)); };
             /* The window key's norm, rope and round trip: one op (kv_f) where declared, else
              * kv_n here and kv_rope / kv_q at the next two points. */
             const auto kv_n = [&] {
@@ -2242,7 +2356,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 if (L.src) RAD_ISSUE_N(x, L.c_tab, rows, bpos, brows(m.cs_b, g.max_ctx));
             };
             const auto k_gemm = [&] {
-                if (L.src) RAD_ISSUE_N(x, L.k_gemm, rows, brows(m.lat, rows), RAD_W(L.ik_w), brows(m.ik, rows));
+                if (L.src) lin_issue(x, m, L.k_gemm, rows, brows(m.lat, rows), L.ik_w, brows(m.ik, rows));
             };
             /* The index key's norm, rope and round trip (k_f where declared); the latent's rope and
              * round trip (l_f where declared); the index query's (i_f where declared). Each part
@@ -2283,7 +2397,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                 praw2(tb->state_index, RAD_I32, S, tpitch));
             };
             const auto i_q = [&] {
-                if (L.i_score) RAD_ISSUE_N(x, L.i_q, T, brows(m.qrn, T), RAD_W(L.iq_w), brows(m.iq, T));
+                if (L.i_score) lin_issue(x, m, L.i_q, T, brows(m.qrn, T), L.iq_w, brows(m.iq, T));
             };
             const auto i_rope = [&] {
                 if (!L.i_score) return;
@@ -2296,7 +2410,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 if (L.i_score && L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
             };
             const auto i_w = [&] {
-                if (L.i_score) RAD_ISSUE_N(x, L.i_w, T, brows(m.xn, T), RAD_W(L.iproj), brows(m.iw, T));
+                if (L.i_score) lin_issue(x, m, L.i_w, T, brows(m.xn, T), L.iproj, brows(m.iw, T));
             };
             const auto i_score = [&] {   /* the scores, the candidates and the selection */
                 if (!L.i_score) return;
@@ -2363,10 +2477,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
             }
             const int64_t gd = HD / m.gr;
             for (int j = 0; j < m.gr; ++j)
-                RAD_ISSUE_N(x, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), RAD_W(L.wo_a[(size_t)j]),
-                            bcol(m.oa, j * c.o_rank, c.o_rank, T));
+                lin_issue(x, m, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), L.wo_a[(size_t)j],
+                          bcol(m.oa, j * c.o_rank, c.o_rank, T));
             if (late) mix_a();
-            RAD_ISSUE_N(x, L.o_b, T, brows(m.oa, T), RAD_W(L.wo_b), brows(m.attn_out, T));
+            lin_issue(x, m, L.o_b, T, brows(m.oa, T), L.wo_b, brows(m.attn_out, T));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
         if (L.pcn_f)   /* post_a, col_f and norm_f in one */
