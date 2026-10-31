@@ -927,9 +927,12 @@ static int buffers(RadBuilder* b, Model& m) {
     /* bf16 linears: each ActFP8 carries only its activation (`x`); the plugin norms the FFN input
      * itself (MoeFP8's external-input form) and the block leaves its delta in `act.x`. */
     m.act.x = bf("ffn_normed", { T, D });
-    /* A quantised dense trunk reads this pair: the widest dense input (Engram's included) and one
-     * f32 scale a 128 columns. Slices are taken at issue, so every dense IQR GEMM shares it. */
-    const int64_t QK = std::max<int64_t>(D, c.ple_heads * c.ple_dim);
+    /* A quantised dense trunk reads this pair, one f32 scale a 128 columns, shared by every dense
+     * IQR GEMM. The activation quantiser (had_quant_act_i8g) checks the code and scale planes
+     * against the linear's own K, and a row slice does not narrow the column, so the pair is the
+     * hidden width -- the width every dense linear but the Engram gather reads. An Engram linear
+     * wider than that declares its own pair. */
+    const int64_t QK = D;
     m.iqr_q8 = decl_b(b, nm.f("iqr_q8"), RAD_I8, { T, QK });
     m.iqr_s8 = decl_b(b, nm.f("iqr_s8"), RAD_F32, { T, fp8_blocks(QK) });
     /* The shared expert's input is the same normed activation; its own quantiser writes the pair. */
