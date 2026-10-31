@@ -1205,6 +1205,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     const bool known = weight_enc(b, sw, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
+    /* A quantised linear inside a model that also holds bf16 linears (DeepSeek's mixed trunk)
+     * takes its own form; only an unquantised weight is read at bf16. */
+    const bool quant = known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
 
     /* ---- A GGUF weight, imported as its type's planes: `gemm_nt_ggml` over `a.x`, the planes
      * relayouted into llama.cpp's native blocks at load (docs/OPS.md). Ahead of the bf16 branch,
@@ -1248,7 +1251,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * container keeps at checkpoint precision (e.g. the QSA indexer's projection, whose top-k is a
      * hard choice; 20 MB to keep exact). Row parts and uneven slices apply without block
      * constraints. */
-    bf16 = g.w_bf16 || plain;
+    bf16 = plain || (g.w_bf16 && !quant);
     if (bf16) {
         if (stored) {
             fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "

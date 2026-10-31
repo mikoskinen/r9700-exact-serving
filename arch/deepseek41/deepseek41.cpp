@@ -932,6 +932,9 @@ static int buffers(RadBuilder* b, Model& m) {
     const int64_t QK = std::max<int64_t>(D, c.ple_heads * c.ple_dim);
     m.iqr_q8 = decl_b(b, nm.f("iqr_q8"), RAD_I8, { T, QK });
     m.iqr_s8 = decl_b(b, nm.f("iqr_s8"), RAD_F32, { T, fp8_blocks(QK) });
+    /* The shared expert's input is the same normed activation; its own quantiser writes the pair. */
+    m.act.q8 = m.iqr_q8;
+    m.act.s8 = m.iqr_s8;
     auto& mw = m.mw;
     mw.x = m.xcol;
     mw.h = m.act;
