@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <chrono>
 #include <thread>
@@ -55,6 +56,27 @@ Server::Server(const Deps& d, const ServerOptions& o)
     queue_depth_ = opt_.queue_depth > 0 ? opt_.queue_depth : opt_.max_seqs * 8;
     started_at_ = unix_now();
     register_routes();
+}
+
+bool Server::local_operator(const HttpRequest& req) const {
+    if (!req.peer_is_loopback() || req.is_cross_origin()) return false;
+    if (req.host_is_loopback()) return true;
+    const std::string host = req.host_authority();
+    if (host.empty()) return false;   /* a socket always carries a Host; the in-process case
+                                         passed host_is_loopback on its empty peer */
+    for (const std::string& a : opt_.local_hosts) {
+        std::string want = a;
+        for (char& ch : want) ch = (char)std::tolower((unsigned char)ch);
+        if (want == host) return true;
+    }
+    /* Bound to one concrete address, the box answers to that name on itself. */
+    std::string bind = opt_.host;
+    for (char& ch : bind) ch = (char)std::tolower((unsigned char)ch);
+    if (!bind.empty() && bind.front() == '[' && bind.back() == ']')
+        bind = bind.substr(1, bind.size() - 2);
+    if (!bind.empty() && bind != "0.0.0.0" && bind != "::" && bind != "*")
+        return bind == host;
+    return false;
 }
 
 Server::~Server() { stop(); }
@@ -112,6 +134,10 @@ void Server::register_routes() {
                  [this](const HttpRequest& q) { return handle_video_delete(q); });
     router_.get ("/v1/videos/:id/content",
                  [this](const HttpRequest& q) { return handle_video_content(q); });
+    /* Hunyuan3D-2's API server: a shape from a picture. */
+    router_.post("/generate",        [this](const HttpRequest& q) { return handle_shape_generate(q); });
+    router_.post("/send",            [this](const HttpRequest& q) { return handle_shape_send(q); });
+    router_.get ("/status/:uid",     [this](const HttpRequest& q) { return handle_shape_status(q); });
     router_.post("/v1/audio/transcriptions",
                  [this](const HttpRequest& q) { return handle_transcription(q); });
     /* The same, live over a WebSocket (OpenAI's realtime transcription session). A plain GET
@@ -254,6 +280,8 @@ int Server::run() {
     t.write_timeout_s = opt_.write_timeout_s;
     t.keep_alive_timeout_s = opt_.keep_alive_timeout_s;
     t.max_body_bytes = opt_.max_body_bytes;
+    t.max_inflight_body_bytes = opt_.max_inflight_body_bytes;
+    t.trusted_proxies = opt_.trusted_proxies;
     return transport_.serve(router_, t);
 }
 
@@ -350,6 +378,7 @@ void Server::stop() {
     stopping_.store(true);
     transport_.stop();
     stop_videos();
+    stop_shapes();
     drain_graveyard(2000);
 }
 
@@ -1365,6 +1394,8 @@ std::optional<HttpResponse> Server::refuse_text(const std::string& peer, ApiShap
                                      "generates no text"
         : opt_.video_model         ? "this is a video model: it serves /v1/videos and generates "
                                      "no text"
+        : opt_.shape_model         ? "this is a 3-D shape model: it serves /generate and generates "
+                                     "no text"
                                    : nullptr;
     if (!why) return std::nullopt;
     return error_response(err_not_implemented(why), peer, shape);
@@ -1651,6 +1682,7 @@ HttpResponse Server::serve_pooled(const HttpRequest& req, bool rerank) {
             opt_.image_model ? "/v1/embeddings requires an embedding model; this one makes images"
             : opt_.audio_model ? "/v1/embeddings requires an embedding model; this one makes audio"
             : opt_.video_model ? "/v1/embeddings requires an embedding model; this one makes video"
+            : opt_.shape_model ? "/v1/embeddings requires an embedding model; this one makes shapes"
                                : "/v1/embeddings requires an embedding model; this one generates "
                                  "text"), req.peer);
 
@@ -2207,7 +2239,11 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     c.id = opt_.model_id;
     c.created = started_at_;
     c.max_model_len = opt_.max_ctx;
-    c.root = opt_.model_path;
+    /* `root` is a path on this machine -- the one field of the card that describes the server's
+     * filesystem, and /v1/models is the first route a keyless scanner reaches. Keyless, it
+     * belongs to the operator alone, the rule /diagnostics and the LoRA admin follow; with a
+     * key, everyone who can pay the key already owns this model's card. */
+    if (!opt_.api_key.empty() || local_operator(req)) c.root = opt_.model_path;
     c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     std::vector<ModelCard> cards{ c };
@@ -2251,12 +2287,15 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     if (!opt_.lora_load || !opt_.lora_unload)
         return fail(404, "not_found_error", "this server was started without runtime LoRA (--lora or "
                                             "--max-loras)");
-    if (opt_.api_key.empty() && (!req.peer_is_loopback() || req.is_cross_origin()))
+    if (opt_.api_key.empty() && !local_operator(req))
         /* A cross-origin browser counts as neither loopback nor local: the victim's own browser
-         * is loopback to this port, and that is exactly how a hostile page would reach here. */
+         * is loopback to this port, and that is exactly how a hostile page would reach here —
+         * under DNS rebinding it even arrives with a matching Host unless the Host names the
+         * loopback, and through a localhost proxy every remote client does. Reading a path on
+         * this machine is a local operator's act. */
         return fail(403, "permission_error", "loading an adapter reads a path on this machine, and a "
                                              "server started without --api-key takes it only from a "
-                                             "loopback client");
+                                             "loopback client naming this machine");
     /* Bounded like a generation body: this parses client text the same way, and a deep bracket
      * nest would overflow this worker's stack when the tree is torn down. */
     bool over = false, deep = false;

@@ -17,6 +17,11 @@
 
 namespace rad {
 
+/* The widest conventional op is gdn_conv_prep at sixteen operands (docs/OPS.md). Thirty-two leaves
+ * room for an architecture plugin's private ops without a variable-length array on the hot path.
+ * The plugin loader refuses a schema with more, so no issue carries more. */
+constexpr int MAX_OPERANDS = 32;
+
 namespace mm { struct Item; struct PromptMedia; }
 
 class Registry;
@@ -458,9 +463,15 @@ public:
         std::vector<int64_t>     decoder_max_area;
     } vgen_str;
     bool is_video_generator() const { return video_gen.max_lanes != 0; }
+    /* The declared shape generator (rad_declare_shape_generator); `max_lanes` 0 when none. Its
+     * name points at `sgen_name`. */
+    RadShapeGenDecl shape_gen{};
+    std::string     sgen_name;
+    bool is_shape_generator() const { return shape_gen.max_lanes != 0; }
     /* Driven by passes, not token steps: any generator. */
     bool is_pass_driven() const {
-        return is_generator() || is_audio_generator() || is_video_generator();
+        return is_generator() || is_audio_generator() || is_video_generator() ||
+               is_shape_generator();
     }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan
@@ -816,6 +827,8 @@ struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
     LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
+    std::string model_revision;        /* --model-revision: the hub revision a repo id fetches;
+                                          empty = the repo's moving default branch */
     std::string radiance_home;
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
 
@@ -1087,6 +1100,16 @@ struct Config {
     /* --api-key: the bearer key every request but the probes and the dashboard page must carry.
      * Empty serves without one. */
     std::string api_key;
+    /* --api-key-env: the environment variable api_key was read from, recorded so the config
+     * report can say where the key came from. Empty when the key came from the command line. */
+    std::string api_key_env;
+    /* --allow-host, repeatable: Host names the keyless loopback-only routes accept beside the
+     * loopback names themselves, for operators who reach the box by another name. */
+    std::vector<std::string> allow_hosts;
+    /* --trusted-proxy, repeatable: CIDRs whose sockets may vouch for the caller behind them
+     * through X-Forwarded-For. The vouched address names who the log and audit talk about --
+     * it grants nothing: loopback, the Host name and the key stay the guards' whole world. */
+    std::vector<std::string> trusted_proxies;
     /* --served-model-name: the id /v1/models lists, a response names when its request named none,
      * and the metrics carry. Empty takes the container's own name. A request may still name any
      * model: one model is loaded and every request is served by it. */

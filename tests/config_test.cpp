@@ -91,6 +91,58 @@ TEST(a_retired_flag_is_refused) {
     CHECK_EQ(parse({ "--kv-host-cache-mib", "4096" }, &c), RAD_E_INVAL);
 }
 
+/* An empty key is no key: --api-key "" -- or --api-key "$UNSET_VAR" in a unit file whose variable
+ * was typo'd -- must not start a server that looks guarded on its command line and answers every
+ * route keyless. The shipped compose files fail closed on ${RADIANCE_API_KEY:?}; this is the
+ * refusal for every other way the binary meets an empty value. */
+TEST(an_empty_api_key_is_refused) {
+    CHECK_EQ(parse_fresh({ "--api-key", "" }), RAD_E_INVAL);
+    Config c;
+    CHECK_EQ(parse({ "--api-key", "k" }, &c), 0);
+    CHECK(c.api_key == "k");
+}
+
+/* --api-key-env reads the key where `ps` cannot: the empty-value refusal's sibling is the
+ * never-set one -- a compose environment: or unit Environment= line with a typo'd name must
+ * refuse at startup, not serve keyless under a guarded-looking command line. */
+TEST(an_api_key_env_that_is_unset_is_refused_and_one_that_is_set_is_the_key) {
+    unsetenv("RAD_TEST_KEY_ENV");
+    CHECK_EQ(parse_fresh({ "--api-key-env", "RAD_TEST_KEY_ENV" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--api-key-env", "" }), RAD_E_INVAL);
+    setenv("RAD_TEST_KEY_ENV", "s3cret", 1);
+    Config c;
+    CHECK_EQ(parse({ "--api-key-env", "RAD_TEST_KEY_ENV" }, &c), 0);
+    CHECK(c.api_key == "s3cret");
+    CHECK(c.api_key_env == "RAD_TEST_KEY_ENV");
+    unsetenv("RAD_TEST_KEY_ENV");
+}
+
+/* --allow-host repeats: the loopback-only routes take the set of names, and an empty one is
+ * a hole cut by a typo, so it is refused like the empty key. */
+TEST(allow_host_repeats_and_refuses_the_empty_name) {
+    CHECK_EQ(parse_fresh({ "--allow-host", "" }), RAD_E_INVAL);
+    Config c;
+    CHECK_EQ(parse({ "--allow-host", "box", "--allow-host", "box.example" }, &c), 0);
+    CHECK(c.allow_hosts.size() == 2);
+    CHECK(c.allow_hosts[0] == "box" && c.allow_hosts[1] == "box.example");
+}
+
+/* --trusted-proxy repeats: the sockets inside these networks may name the client behind them
+ * for the log. Anything but a numeric network with a prefix is refused at startup, because a
+ * typo there silently unvouches a proxy -- the server would keep answering through it and log
+ * the proxy on every line, with nothing to show for the flag. */
+TEST(trusted_proxy_repeats_and_refuses_anything_but_a_cidr) {
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "127.0.0.1" }), RAD_E_INVAL);        /* no prefix */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "127.0.0.0/33" }), RAD_E_INVAL);     /* out of family */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "::1/129" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "proxy.internal/32" }), RAD_E_INVAL);/* not numeric */
+    CHECK_EQ(parse_fresh({ "--trusted-proxy", "[::1]/128" }), RAD_E_INVAL);        /* URL form, not CIDR */
+    Config c;
+    CHECK_EQ(parse({ "--trusted-proxy", "127.0.0.0/8", "--trusted-proxy", "::1/128" }, &c), 0);
+    CHECK(c.trusted_proxies.size() == 2);
+    CHECK(c.trusted_proxies[0] == "127.0.0.0/8" && c.trusted_proxies[1] == "::1/128");
+}
+
 /* A flag written last with no argument is refused rather than reading past argv. */
 TEST(a_flag_missing_its_argument_is_refused_rather_than_read_past) {
     Config c;
@@ -446,6 +498,7 @@ std::vector<std::pair<std::string, std::string>> usage_options() {
 const std::map<std::string, std::vector<std::string>>& legal_values() {
     static const std::map<std::string, std::vector<std::string>> v = {
         { "--model", { "/m/y.rad" } }, { "--download-dir", { "/d" } },
+        { "--model-revision", { "v1.2" } },
         { "--radiance-home", { "/h1:/h2" } }, { "--kernels", { "libref" } },
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
@@ -471,6 +524,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
         { "--draft-coupling", { "on" } },
         { "--host", { "127.0.0.1" } }, { "--port", { "8001" } }, { "--api-key", { "k" } },
+        { "--api-key-env", { "RAD_KEY_ENV_INVENTORY" } },
+        { "--allow-host", { "box" } },
+        { "--trusted-proxy", { "127.0.0.0/8" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
         { "--control-vector", { "off" } },
         { "--generation-config", { "/g.json" } }, { "--override-chat-template", { "/t.jinja" } },
@@ -527,6 +583,9 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
  * setting. */
 TEST(every_listed_option_parses_and_is_reported_as_given) {
     LogGuard lg;
+    /* --api-key-env resolves at parse time and fails closed on an unset name, so the inventory
+     * needs the variable it names to exist. */
+    setenv("RAD_KEY_ENV_INVENTORY", "inventory-key", 1);
     const auto opts = usage_options();
     CHECK(opts.size() > 90);
     const std::vector<std::string> names = diag::config_option_names();

@@ -8,6 +8,7 @@
 #include "format/rope_override.h"
 #include "sample/host_ref.h"
 #include "server/oai.h"
+#include "server/http.h"
 #include "diag/diag.h"
 #include "util/kernel_list.h"
 #include "place/planner.h"
@@ -49,6 +50,8 @@ static const Flag g_flags[] = {
                                         "Hugging Face repo id (owner/name), fetched before startup" },
     { "--download-dir",       "DIR",    "where a repo id is fetched to; default\n"
                                         "$XDG_CACHE_HOME/radiance/hf, else ~/.cache/radiance/hf" },
+    { "--model-revision",     "REV",    "the hub revision -- a branch, tag, full commit sha or refs/pr/N --\n"
+                                        "a repo id is fetched at; default the repo's moving main branch" },
     { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
                                         "homes separated by ':' are searched in order, the first winning" },
     { "--kernels",            "LIST",   "the kernel libraries to use, separated by ',' or ':', first wins; unnamed ones are not loaded. Default: every library found" },
@@ -213,6 +216,14 @@ static const Flag g_flags[] = {
     { "--port",               "N",      "listen port" },
     { "--api-key",            "KEY",    "require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but /health,\n"
     "                                    /v1/health, /ping and the dashboard page" },
+    { "--api-key-env",        "NAME",   "read the API key from the named environment variable; keeps it off the\n"
+    "                                    command line, where every process on the machine can read it" },
+    { "--allow-host",         "NAME",   "a Host name the keyless loopback-only routes (/diagnostics,\n"
+    "                                    /admin/control-vector, the LoRA and session admin) accept besides\n"
+    "                                    localhost; repeatable" },
+    { "--trusted-proxy",      "CIDR",   "a network whose sockets may name the client behind them via\n"
+    "                                    X-Forwarded-For, for the log; vouching changes attribution,\n"
+    "                                    never access; repeatable" },
     { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
                                         "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
@@ -520,6 +531,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("-vv"))                     log_set_level(Log::Trace);
         else if (S("--model"))                 { if (!(v = need(i))) return RAD_E_INVAL; c->model = v; }
         else if (S("--download-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->download_dir = v; }
+        else if (S("--model-revision"))        { if (!(v = need(i))) return RAD_E_INVAL; c->model_revision = v; }
         else if (S("--radiance-home"))         { if (!(v = need(i))) return RAD_E_INVAL; c->radiance_home = v; }
         else if (S("--kernels"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kernel_hierarchy = rad_split_kernel_list(v); }
         else if (S("--tp"))                    { if (!num(1, INT32_MAX, &c->tp)) return RAD_E_INVAL; }
@@ -819,6 +831,37 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!*v) { RAD_ERR("--api-key takes a non-empty key; an empty value guards nothing");
                        return RAD_E_INVAL; }
             c->api_key = v;
+        }
+        else if (S("--api-key-env")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!*v) { RAD_ERR("--api-key-env takes the name of an environment variable");
+                       return RAD_E_INVAL; }
+            const char* k = std::getenv(v);
+            /* The empty --api-key refusal's sibling: a unit or compose file whose variable was
+             * never set must not start a server that looks guarded and answers everything
+             * keyless. The name is recorded so the config report can say where the key came
+             * from without showing it. */
+            if (!k || !*k) {
+                RAD_ERR("--api-key-env: %s is unset or empty; refusing to serve keyless under a "
+                        "guarded-looking command line", v);
+                return RAD_E_INVAL;
+            }
+            c->api_key = k;
+            c->api_key_env = v;
+        }
+        else if (S("--allow-host")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!*v) { RAD_ERR("--allow-host takes a non-empty name"); return RAD_E_INVAL; }
+            c->allow_hosts.emplace_back(v);
+        }
+        else if (S("--trusted-proxy")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!server::cidr_valid(v)) {
+                RAD_ERR("--trusted-proxy takes a numeric network with a prefix length, like "
+                        "127.0.0.0/8 or ::1/128 (no brackets, no bare address), got '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->trusted_proxies.emplace_back(v);
         }
         else if (S("--served-model-name")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1261,6 +1304,7 @@ struct ShowRow { const char* flag; Show show; };
 const ShowRow kShow[] = {
     { "--model",              [](const Config& c) { return c.model; } },
     { "--download-dir",       [](const Config& c) { return or_none(c.download_dir, "the XDG cache (~/.cache/radiance/hf)"); } },
+    { "--model-revision",     [](const Config& c) { return or_none(c.model_revision, "the repo's main branch"); } },
     { "--radiance-home",      [](const Config& c) { return c.radiance_home; } },
     { "--kernels",            [](const Config& c) {
           std::string s;
@@ -1344,6 +1388,15 @@ const ShowRow kShow[] = {
     { "--port",               [](const Config& c) { return num(c.port); } },
     /* Never print the secret, only whether it is set. */
     { "--api-key",            [](const Config& c) { return std::string(c.api_key.empty() ? "not set" : "set"); } },
+    { "--api-key-env",        [](const Config& c) { return or_none(c.api_key_env, "not used"); } },
+    { "--allow-host",         [](const Config& c) {
+          std::string o;
+          for (const std::string& h : c.allow_hosts) o += (o.empty() ? "" : ",") + h;
+          return o.empty() ? std::string("the loopback names only") : o; } },
+    { "--trusted-proxy",      [](const Config& c) {
+          std::string o;
+          for (const std::string& p : c.trusted_proxies) o += (o.empty() ? "" : ",") + p;
+          return o.empty() ? std::string("no socket vouches for a caller") : o; } },
     { "--served-model-name",  [](const Config& c) { return or_none(c.served_model_name, "the container's name"); } },
     { "--mm-max-patches",     [](const Config& c) { return c.mm_max_patches < 0 ? std::string("auto") : num(c.mm_max_patches); } },
     { "--image-gen-max-pixels", [](const Config& c) { return c.image_gen_max_pixels > 0 ? num(c.image_gen_max_pixels) : std::string("the model's"); } },

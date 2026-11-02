@@ -410,11 +410,13 @@ endif()
 #
 # libhalo serves gfx1151 behind libr4d's exact interface (libhalo/halo_parity.cpp): the same op
 # schemas and rows, so every model plugin runs on either. Host-only (the tables, no device calls);
-# present when one build produces both plugins.
+# present when one build produces both plugins. Labelled `parity`: it fails while libr4d has ops
+# libhalo has not ported yet (every one printed as "only in libr4d"), which the image's test stage
+# leaves out; a schema both declare must still agree, or the loader refuses the second library.
 if(TARGET halo_parity)
   add_test(NAME halo_parity
            COMMAND halo_parity ${RAD_PLUGIN_OUT}/kernels/libr4d.so ${RAD_PLUGIN_OUT}/kernels/libhalo.so)
-  set_tests_properties(halo_parity PROPERTIES LABELS "fast" TIMEOUT 60)
+  set_tests_properties(halo_parity PROPERTIES LABELS "fast;parity" TIMEOUT 60)
 endif()
 
 # ================================================================== the device layer without SVM
@@ -937,3 +939,12 @@ if(TARGET r4d_bf16_capacity_test)
       ENVIRONMENT "RADIANCE_HOME=${RAD_PLUGIN_OUT};RAD_TEST_CPU_BUDGET=0" TIMEOUT 300)
   endif()
 endif()
+
+# The vendor record, verified: every file under vendor/ -- the lifts, the patch series, the record
+# itself -- hashed against vendor/SHA256SUMS. A changed file the record does not carry, or one that
+# arrived unrecorded, is an unrecorded change to a lifted dependency, which is the thing UPSTREAM
+# exists to prevent and nothing else notices. It reads the source tree only: no build inputs, no
+# machine state, so it runs wherever the suite runs.
+add_test(NAME vendor_sums
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/vendor_sums.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(vendor_sums PROPERTIES LABELS "fast;unit" TIMEOUT 120)

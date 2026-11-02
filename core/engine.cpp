@@ -6,6 +6,7 @@
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
 #include "gen/video_driver.h"
+#include "gen/shape_driver.h"
 #include "kld.h"
 #include "mm/processor.h"
 #include "mm/media.h"
@@ -634,7 +635,7 @@ int Engine::step_loop() {
             so.reqs.push_back(const_cast<Request*>(e.req));
         }
         so.n_rows = logit_row;
-        if (const int ss = stage_scored_rows(plan, so); ss < 0) return fail_loop(ss);
+        if (const int ss = stage_scored_rows(plan, so, cancel); ss < 0) return fail_loop(ss);
 
         /* The sampler's host work, run while the ranks enqueue (see build_mu_ in engine.h). It
          * touches only request state and host grammar automata; Sampler::run issues the uploads
@@ -683,7 +684,9 @@ int Engine::step_loop() {
         return RAD_OK;
         };
 
-        cancel.clear();
+        /* No clear here: `cancel` is empty when the step's staging begins (applied and cleared at
+         * the join below), and stage_scored_rows may already have filled it — a scored request
+         * whose pinned rows could not be allocated rides the same deferred path. */
         int bst = RAD_OK;
 
         /* RADIANCE_LOG_STEPS: one line per step with its phase and each sequence's slot, query
@@ -1198,16 +1201,25 @@ int Engine::save_checkpoints() {
  * to the host before the sampler can rewrite it in place. stage_scored_rows picks the rows while
  * every rank is parked; issue_scored_rows copies one row per rank stream ahead of its sampler;
  * collect_scored_rows reads each request's ids after the step's wait, before the commit. A whole
- * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id. */
-int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
+ * row is copied (512 KB at a 128K vocabulary), which is cheaper than one copy per id.
+ *
+ * The pinned host buffer is grow-only and its growth is the one part of staging that can fail
+ * on resources rather than on a broken program: then the scored requests are the ones cancelled
+ * (into `cancel`, applied the way the sampler's cancellations are), not the engine — a request
+ * whose scores the box cannot hold is that request's failure, and every other row on this step
+ * and every other connection on the server keeps running. */
+int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
+                              std::vector<uint64_t>& cancel) {
     score_rows_.clear();
     score_only_ = false;
     score_ids_.clear();
     if (embedding_) return RAD_OK;
+    std::vector<uint64_t> scored;
     for (size_t i = 0; i < plan.e.size(); ++i) {
         const Request* r = plan.e[i].req;
         if (so.first_row[i] < 0 || !r || !r->token_scores || !r->output.empty()) continue;
         score_rows_.push_back({ so.first_row[i], r->token_scores.get() });
+        scored.push_back(r->id);
     }
     if (score_rows_.empty()) return RAD_OK;
     const int64_t n = (int64_t)score_rows_.size();
@@ -1224,6 +1236,8 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
         std::sort(score_ids_.begin(), score_ids_.end());
         score_ids_.erase(std::unique(score_ids_.begin(), score_ids_.end()), score_ids_.end());
     }
+    bool host_failed = false;
+    int64_t failed_rows = 0;
     for (auto& rk : ranks_) {
         const int64_t width = rk->sampler.config().n_vocab_local;
         /* In floats: n logits rows, or the bf16 hidden and table rows of a scored step. */
@@ -1238,12 +1252,17 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so) {
         rk->score_host = static_cast<float*>(
             rad_dev_alloc(rows * width * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
         rk->score_rows_cap = rk->score_host ? rows : 0;
-        if (!rk->score_host) {
-            RAD_ERR("scored rows: no pinned memory for %lld logits rows", (long long)rows);
-            return RAD_E_NOMEM;
-        }
+        if (!rk->score_host) { host_failed = true; failed_rows = rows; break; }
     }
     if (ranks_.size() > 1) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    if (host_failed) {
+        RAD_ERR("scored rows: no pinned memory for %lld logits rows; cancelling the scored "
+                "requests, not the engine", (long long)failed_rows);
+        cancel.insert(cancel.end(), scored.begin(), scored.end());
+        score_rows_.clear();
+        score_only_ = false;
+        score_ids_.clear();
+    }
     return RAD_OK;
 }
 
@@ -1791,17 +1810,20 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
     const bool audio_gen = ranks_[0]->program.is_audio_generator();
     const bool video_gen = ranks_[0]->program.is_video_generator();
+    const bool shape_gen = ranks_[0]->program.is_shape_generator();
     const bool generator = ranks_[0]->program.is_pass_driven();
     if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
                 "(rad_declare_pooled) and no generator (rad_declare_generator, "
-                "rad_declare_audio_generator, rad_declare_video_generator), so a step produces "
+                "rad_declare_audio_generator, rad_declare_video_generator, "
+                "rad_declare_shape_generator), so a step produces "
                 "nothing anyone can read. An encoder-only plugin cannot serve.",
                 plugins_.arch_plugin.c_str());
         return RAD_E_UNSUPPORTED;
     }
     if (generator) {
-        const char* const what = audio_gen ? "audio" : video_gen ? "video" : "images";
+        const char* const what = audio_gen ? "audio" : video_gen ? "video"
+                               : shape_gen ? "shapes" : "images";
         if (cfg_.kld() || cfg_.n_spec > 0) {
             RAD_ERR("the '%s' plugin makes %s: --kld and speculative decoding have no tokens to "
                     "work on", plugins_.arch_plugin.c_str(), what);
@@ -1810,6 +1832,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         for (size_t i = 1; i < ranks_.size(); ++i)
             if (ranks_[i]->program.is_audio_generator() != audio_gen ||
                 ranks_[i]->program.is_video_generator() != video_gen ||
+                ranks_[i]->program.is_shape_generator() != shape_gen ||
                 !ranks_[i]->program.is_pass_driven()) {
                 RAD_ERR("rank %zu declared a different generator from rank 0's", i);
                 return RAD_E_STATE;
@@ -1820,6 +1843,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
               "after them"
             : video_gen
             ? "a video generator: a prompt is read by its own request's steps and keeps no KV"
+            : shape_gen
+            ? "a shape generator: a picture is read by its own request's steps and keeps no KV"
             : "an image generator: a conditioning is read by its own request's images and by "
               "nothing after them";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
@@ -1976,7 +2001,16 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program, rk->pools.kv().base(),
                         rank_stream_views_[r].data() });
     }
-    if (video_gen) {
+    if (shape_gen) {
+        /* As for the image generator below. */
+        std::vector<gen::ShapeDriver::RankIO> gio;
+        for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
+        auto d = std::make_unique<gen::ShapeDriver>();
+        RAD_TRY(d->init(ranks_[0]->program, gio));
+        shp_gen_ = d.get();
+        gen_ = std::move(d);
+        RAD_TRY(rad_dev_set(ranks_[0]->device));
+    } else if (video_gen) {
         /* As for the image generator below; the plugin lays out each request's rows. */
         std::vector<gen::VideoDriver::RankIO> gio;
         for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
@@ -2578,6 +2612,7 @@ int Engine::run_server() {
     o.image_model = img_gen_ != nullptr;
     o.audio_model = aud_gen_ != nullptr;
     o.video_model = vid_gen_ != nullptr;
+    o.shape_model = shp_gen_ != nullptr;
     o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
     /* clef's learned scalars, which the server applies to what the head returns (server/clef.h);
      * rad-convert writes them beside decision.type. */
@@ -2620,6 +2655,8 @@ int Engine::run_server() {
     o.host     = cfg_.host;
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;
+    o.local_hosts = cfg_.allow_hosts;
+    o.trusted_proxies = cfg_.trusted_proxies;
     o.max_seqs = cfg_.max_seqs;
     /* `n` fans one request out over the batch, so the default scales with --max-num-seqs; the
      * floor of 8 keeps a small batch from refusing what it would queue. */
@@ -3139,6 +3176,29 @@ int Engine::run_server() {
 
     /* A video generator's endpoints: the driver's queue and the declared prompt, sizes and
      * lengths. */
+    struct ShapeBridge final : server::IShapeGen {
+        gen::ShapeDriver* drv = nullptr;
+        const gen::ShapeGenInfo& info() const override { return drv->info(); }
+        int submit(std::unique_ptr<gen::ShapeRequest> r, std::string* why) override {
+            return drv->submit(std::move(r), why);
+        }
+        int64_t queued() const override { return drv->queued(); }
+        int64_t running() const override { return drv->running(); }
+    } shape_bridge;
+    if (shp_gen_) {
+        shape_bridge.drv = shp_gen_;
+        d.shapes = &shape_bridge;
+        const gen::ShapeGenInfo& in = shp_gen_->info();
+        if (cfg_.served_model_name.empty() && !in.name.empty()) {
+            o.model_id = in.name;
+            decide("--served-model-name", o.model_id, "a shape generator: its own name");
+        }
+        RAD_INFO("shape: '%s', a %lldx%lld picture to a field sampled at %lld cells a side by "
+                 "default (%lld..%lld), %lld steps by default at guidance %g",
+                 in.name.c_str(), (long long)in.canvas, (long long)in.canvas,
+                 (long long)in.default_resolution, (long long)in.min_resolution,
+                 (long long)in.max_resolution, (long long)in.default_steps, in.default_guidance);
+    }
     struct VideoBridge final : server::IVideoGen {
         gen::VideoDriver*    drv = nullptr;
         server::VideoGenInfo inf;
@@ -3288,6 +3348,9 @@ int Engine::run_server() {
     else if (vid_gen_)
         RAD_INFO("serving on http://%s:%d  (/v1/videos; completions and chat are 501%s)",
                  o.host.c_str(), o.port, keyed);
+    else if (shp_gen_)
+        RAD_INFO("serving on http://%s:%d  (/generate, /send and /status/{uid}; completions and "
+                 "chat are 501%s)", o.host.c_str(), o.port, keyed);
     else if (gen_)
         RAD_INFO("serving on http://%s:%d  (/v1/images/generations%s; completions and chat are "
                  "501%s)", o.host.c_str(), o.port,

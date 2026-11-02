@@ -186,6 +186,14 @@ ApiError err_unsupported(const std::string& param, const std::string& why) {
     return e;
 }
 
+ApiError err_forbidden(const std::string& why) {
+    ApiError e;
+    e.status = 403;
+    e.type = "permission_error";
+    e.message = why;
+    return e;
+}
+
 ApiError err_not_implemented(const std::string& what) {
     ApiError e;
     e.status = 501;
@@ -3371,11 +3379,16 @@ int anthropic_image(const json& block, const std::string& at, json* out, ApiErro
  * continuation sends only the tail of the conversation), so a field outside these lists is
  * refused by name rather than ignored. The refusal says "Extra inputs are not permitted", as
  * Anthropic's does; Claude Code matches those words to retry without a beta field it can
- * drop. */
+ * drop.
+ *
+ * The last row is not Anthropic's: the chat path's history penalties and min-p, under the chat
+ * path's names, ranges and meaning, for clients that speak only this format to a model whose
+ * card asks for them (Qwen's presence_penalty). */
 const char* kAnthropicFields[] = {
     "model", "messages", "system", "max_tokens", "temperature", "top_p", "top_k", "stream",
     "stop_sequences", "tools", "tool_choice", "thinking", "metadata", "output_config",
     "output_format", "context_management", "thread",
+    "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty", "repeat_last_n",
 };
 
 /* Accepted and not acted on: none of them can change the answer here. Capacity and placement
@@ -3909,8 +3922,11 @@ int anthropic_to_chat(const std::string& body, const OaiLimits& lim, std::string
         if (one) o["parallel_tool_calls"] = false;
     }
 
-    /* `model` included, since the reply names it back as Anthropic's does. */
-    for (const char* k : { "model", "max_tokens", "temperature", "top_p", "top_k", "stream" })
+    /* `model` included, since the reply names it back as Anthropic's does. The penalties and
+     * min-p are the chat path's own fields, checked there. */
+    for (const char* k : { "model", "max_tokens", "temperature", "top_p", "top_k", "stream",
+                           "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty",
+                           "repeat_last_n" })
         if (b.contains(k)) o[k] = b.at(k);
     if (b.contains("stop_sequences")) o["stop"] = b.at("stop_sequences");
 
@@ -3989,8 +4005,15 @@ std::string anthropic_message_body(const OaiRequest& r, const ChoiceOut& c, cons
     if (!r.continued.empty() && text.rfind(r.continued, 0) == 0) text.erase(0, r.continued.size());
     if (!text.empty()) blocks.push_back(json{ { "type", "text" }, { "text", text } });
     for (const ToolCall& tc : c.msg.tool_calls) {
-        json in = json::parse(tc.arguments, nullptr, false);
-        if (in.is_discarded() || !in.is_object()) in = json::object();
+        /* The same bound the streaming path applies: `arguments` is model output, and
+         * json_complete's depth-capped scan must run before nlohmann's recursion and its
+         * teardown, neither of which bounds depth on its own. Too deep or incomplete reads as
+         * an empty input, as a discarded parse did. */
+        json in = json::object();
+        if (json_complete(tc.arguments)) {
+            json v = json::parse(tc.arguments, nullptr, false);
+            if (!v.is_discarded() && v.is_object()) in = std::move(v);
+        }
         blocks.push_back(json{ { "type", "tool_use" }, { "id", tc.id }, { "name", tc.name },
                                { "input", in } });
     }
