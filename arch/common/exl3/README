@@ -1,0 +1,8 @@
+Vendored, unmodified apart from one include path, from the radiance-exl3 extension (Apache-2.0,
+Copyright 2026 Dylan Johnston; branch ds41-exl3 in ~/gpu/ds41/exl3/radiance-exl3):
+  exl3_abi.h       include/exl3_abi.h      (op schemas, operand positions, interface version)
+  exl3_encoding.h  include/exl3_encoding.h (the canonical exl3 encoding; "../common/" dropped)
+  exl3_decode.h    common/exl3_decode.h    (declarations; the block uses the inline helpers only)
+rad_block_moe_fp8.h reads a layer's EXL3 encoding and issues the extension's whole-expert ops
+(moe_exl3_gate_up, moe_exl3_down) by their positions here. Re-copy them when the extension's
+interface version moves (EXL3_IFACE_VERSION).
