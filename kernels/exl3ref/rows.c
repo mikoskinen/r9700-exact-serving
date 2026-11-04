@@ -247,6 +247,8 @@ static const RadPluginInfo k_info = {
 };
 
 uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
+#include "rad_abi_layout.h"
+RAD_PLUGIN_ABI_LAYOUT_EXPORT   /* ABI 32: the layout fingerprint the loader checks */
 const RadPluginInfo* rad_plugin_info(void) { return &k_info; }
 int                  rad_plugin_reference(void) { return 1; }
 

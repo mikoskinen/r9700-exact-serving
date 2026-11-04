@@ -22,7 +22,9 @@ get_filename_component(_exl3_prefix "${RADIANCE_INCLUDE_DIR}/../.." ABSOLUTE)
 if(NOT QWEN4EXP_EXL3_E2E_HOME)
   set(QWEN4EXP_EXL3_E2E_HOME "${RAD_PLUGIN_OUT}")
 endif()
-add_subdirectory(arch)
+if(EXL3_WITH_QWEN_ARCH)
+  add_subdirectory(arch)
+endif()
 
 # ---- pytest files. A file that imports numpy, run by a python3 without it, or a python3 without pytest: SKIPPED.
 # A file whose every test skipped (pytest exits 0 for that): SKIPPED. Nothing is written into the source tree.

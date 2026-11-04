@@ -23,7 +23,7 @@ find_package(radiance REQUIRED)
 # ---------------------------------------------------------------- the pin (PLAN.md D11, D14)
 # THE ABI: a plugin is loaded by this number; another one is another contract. find_package's own
 # version IS the ABI number (17.0.0), so it cannot tell two releases apart -- hence the second check.
-set(EXL3_RADIANCE_ABI 17)
+set(EXL3_RADIANCE_ABI 32)
 if(NOT RADIANCE_ABI_VERSION EQUAL EXL3_RADIANCE_ABI)
   message(FATAL_ERROR
     "radiance at CMAKE_PREFIX_PATH has ABI ${RADIANCE_ABI_VERSION}; these plugins are written "
@@ -77,8 +77,14 @@ message(STATUS "radiance-exl3: device rows ${RAD_HIP_FOUND}, GPU targets '${RAD_
                "installs into ${RAD_PLUGIN_INSTALL_HOME}")
 
 enable_testing()
-foreach(_exl3_dir common quantizers/exl3 kernels/exl3ref kernels/exl3r4d
-                  architectures/qwen4exp_exl3 tools tests)
+# ds41-exl3 branch: the Qwen architecture is a copy of radiance 1.7.0's model code (ABI 17) and is not
+# ported to the PR #266 base; the DeepSeek wiring lives in radiance's own deepseek41 plugin instead.
+option(EXL3_WITH_QWEN_ARCH "build architectures/qwen4exp_exl3 (radiance 1.7.0 only)" OFF)
+set(_exl3_dirs common quantizers/exl3 kernels/exl3ref kernels/exl3r4d tools tests)
+if(EXL3_WITH_QWEN_ARCH)
+  list(INSERT _exl3_dirs 4 architectures/qwen4exp_exl3)
+endif()
+foreach(_exl3_dir ${_exl3_dirs})
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_exl3_dir}/CMakeLists.txt")
     add_subdirectory(${_exl3_dir})
   endif()
