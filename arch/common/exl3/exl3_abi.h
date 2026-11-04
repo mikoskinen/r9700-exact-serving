@@ -212,7 +212,8 @@ extern "C" {
  *             down:    N = hidden, K = width
  *   n_expert  the length of expert_offset minus one (the sort's expert count)
  *   top_k     slots per token
- *   dtype     "exl3k2" .. "exl3k8": the codes' K, bits per weight (exl3_gemm_dtype)
+ *   dtype     "exl3k2" .. "exl3k8": the codes' K, bits per weight (exl3_gemm_dtype); "exl3k1h" .. "exl3k3h" the
+ *             half-integer K 1.5 .. 3.5 (exllamav3 1.6, codebook mul1 only; codes the u(2KA+1) [1x2] pair plane)
  *   codebook  "mul1" | "mcg" | "3inst": the trellis codebook (the encoding's transform names it;
  *             the architecture passes it so the geometry says what is decoded -- a host row has no
  *             layout hook through which to see the encoding)
@@ -731,6 +732,7 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op_in, int two
     g->bits     = exl3_gemm_bits(dt);
     g->codebook = prep ? -1 : exl3_codebook_from_name(cb);
     if (g->bits < 0 || (!prep && g->codebook < 0)) return RAD_E_DTYPE;
+    if (exl3_bits_half(g->bits) && !prep && g->codebook != EXL3_CB_MUL1) return RAD_E_DTYPE;   /* 1.6: mul1 only */
     if ((g->h_rot != 0 && g->h_rot != 1) || (g->a_rot != 0 && g->a_rot != 1)) return RAD_E_INVAL;
     g->limit = op == EXL3_GATE_UP ? rad_param_getf(p, n_p, "limit", 0.0) : 0.0;
     if (!(g->limit >= 0.0) || g->limit > 65504.0) return RAD_E_INVAL;   /* NaN, negative or past f16 */

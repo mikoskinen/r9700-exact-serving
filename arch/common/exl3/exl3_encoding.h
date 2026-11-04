@@ -11,6 +11,9 @@
  *                                               block 128) on BOTH sides of the weight
  *   plane 0    codes  uK  TILED [1x1]           element (i, j) = the K-bit trellis symbol of W_hat at
  *                                               (k = j, n = i), position-major (common/exl3_decode.h)
+ *              half-integer K = KA + 0.5:       u(2KA+1) TILED [1x2]: element (i, m) = the PAIR symbol of
+ *                                               columns 2m (KA bits, low) and 2m + 1 (KA + 1 bits, high) --
+ *                                               the same bits as reading column j at off(j) = floor(j K2 / 2)
  *   plane 1    suh    f16 TILED [0x1]           input scales, one a column (k); cut with the columns
  *   plane 2    svh    f16 TILED [1x0]           output scales, one a row (n); cut with the rows
  *   plane 3    suh.1  f16 TILED [0x1]           STACKED gate_up only: the up half's input scales;
@@ -34,31 +37,49 @@
 extern "C" {
 #endif
 
-/* Bumped on any change to the encoding or a declaration below. */
-#define EXL3_ENCODING_VERSION 1
+/* Bumped on any change to the encoding or a declaration below. 2: half-integer K (the [1x2] pair plane). */
+#define EXL3_ENCODING_VERSION 2
 
 #define EXL3_SCHEME   "exl3"
 #define EXL3_ROTATION "h128"   /* the second half of the transform string */
 
 enum { EXL3_PLANE_CODES = 0, EXL3_PLANE_SUH = 1, EXL3_PLANE_SVH = 2, EXL3_PLANE_SUH1 = 3 };
 
-/* The K a GEMM dtype string exists for: "exl3k2" .. "exl3k8". The DECODER reads K 1..8
- * (EXL3_BITS_MIN..MAX); K=1 has no dtype string, so no kernel can be named for it and the quantiser
- * refuses it. */
+/* The K a GEMM dtype string exists for: "exl3k2" .. "exl3k8", and the half-integer "exl3k1h" (1.5), "exl3k2h"
+ * (2.5), "exl3k3h" (3.5). The DECODER reads K 1..8 and the three half-integer K (exl3_decode.h: a TAGGED `bits`);
+ * K=1 has no dtype string, so no kernel can be named for it and the quantiser refuses it. The loops below walk
+ * EXL3_GEMM_BITS_MIN..MAX, the integer K; the half-integer K are listed apart. */
 enum { EXL3_GEMM_BITS_MIN = 2, EXL3_GEMM_BITS_MAX = 8 };
 
-/* The core dtype of a K-bit codes plane: RAD_U1..RAD_U8; RAD_DT_INVALID outside 1..8. */
+/* The core dtype of a codes plane: RAD_U1..RAD_U8 for integer K (one symbol an element); for half-integer K the
+ * pair symbol's 2 KA + 1 bits (RAD_U3 / RAD_U5 / RAD_U7, block [1x2]); RAD_DT_INVALID otherwise. */
 static inline uint32_t exl3_codes_dtype(int bits) {
     static const uint32_t dt[9] = { RAD_DT_INVALID, RAD_U1, RAD_U2, RAD_U3, RAD_U4,
                                     RAD_U5, RAD_U6, RAD_U7, RAD_U8 };
+    if (exl3_bits_half(bits)) return dt[exl3_k2(bits)];
     return bits >= EXL3_BITS_MIN && bits <= EXL3_BITS_MAX ? dt[bits] : (uint32_t)RAD_DT_INVALID;
 }
 
-/* The inverse: K of a codes dtype, or -1. */
+/* Columns of the codes plane's element grid over a weight of `cols` columns: cols, or cols / 2 pairs. */
+static inline int64_t exl3_codes_plane_cols(int64_t cols, int bits) {
+    return exl3_bits_half(bits) ? cols / 2 : cols;
+}
+
+/* The inverse of exl3_codes_dtype for a [1x1] codes plane (integer K): K, or -1. */
 static inline int exl3_bits_of_dtype(uint32_t dtype) {
     int k;
     for (k = EXL3_BITS_MIN; k <= EXL3_BITS_MAX; ++k)
         if (exl3_codes_dtype(k) == dtype) return k;
+    return -1;
+}
+
+/* The (tagged) K of a codes plane by its dtype AND block: [1x1] integer K, [1x2] half-integer K; -1 otherwise. */
+static inline int exl3_bits_of_plane(uint32_t dtype, int64_t block_cols) {
+    int ka;
+    if (block_cols == 1) return exl3_bits_of_dtype(dtype);
+    if (block_cols != 2) return -1;
+    for (ka = 1; ka <= 3; ++ka)
+        if (exl3_codes_dtype(EXL3_HALF(ka)) == dtype) return EXL3_HALF(ka);
     return -1;
 }
 
@@ -68,29 +89,35 @@ static inline int exl3_bits_of_dtype(uint32_t dtype) {
 static inline const char* exl3_gemm_dtype(int bits) {
     static const char* const s[9] = { 0, 0, "exl3k2", "exl3k3", "exl3k4",
                                       "exl3k5", "exl3k6", "exl3k7", "exl3k8" };
+    static const char* const h[4] = { 0, "exl3k1h", "exl3k2h", "exl3k3h" };
+    if (exl3_bits_half(bits)) return h[exl3_k2(bits) / 2];
     return bits >= EXL3_GEMM_BITS_MIN && bits <= EXL3_GEMM_BITS_MAX ? s[bits] : 0;
 }
 
-/* K of a GEMM dtype string, or -1. */
+/* K of a GEMM dtype string (tagged for half-integer K), or -1. */
 static inline int exl3_gemm_bits(const char* dtype) {
     int k;
     for (k = EXL3_GEMM_BITS_MIN; k <= EXL3_GEMM_BITS_MAX && dtype; ++k)
         if (strcmp(dtype, exl3_gemm_dtype(k)) == 0) return k;
+    for (k = 1; k <= 3 && dtype; ++k)
+        if (strcmp(dtype, exl3_gemm_dtype(EXL3_HALF(k))) == 0) return EXL3_HALF(k);
     return -1;
 }
 
 /* The encoding of a K-bit weight in `codebook`; `stacked` nonzero for a gate_up (adds suh.1).
- * RAD_OK, or RAD_E_INVAL for K outside 1..8 or an unknown codebook. */
+ * RAD_OK, or RAD_E_INVAL for K outside 1..8 and the half-integer three, an unknown codebook, or a
+ * half-integer K in another codebook than mul1. */
 static inline int exl3_encoding_make(int bits, int codebook, int stacked, RadEncoding* out) {
     char t[RAD_ENC_STR];
     const char* cb = exl3_codebook_name(codebook);
     const uint32_t dt = exl3_codes_dtype(bits);
     if (!out || !cb || dt == RAD_DT_INVALID) return RAD_E_INVAL;
+    if (exl3_bits_half(bits) && codebook != EXL3_CB_MUL1) return RAD_E_INVAL;
     rad_enc_clear(out);
     rad_enc_copy_str(out->scheme, EXL3_SCHEME);
     snprintf(t, sizeof t, "%s/%s", cb, EXL3_ROTATION);
     rad_enc_copy_str(out->transform, t);
-    rad_enc_add_plane(out, "codes", dt, 1, 1);
+    rad_enc_add_plane(out, "codes", dt, 1, exl3_bits_half(bits) ? 2 : 1);
     rad_enc_add_plane(out, "suh", RAD_F16, 0, 1);
     rad_enc_add_plane(out, "svh", RAD_F16, 1, 0);
     if (stacked) rad_enc_add_plane(out, "suh.1", RAD_F16, 0, 1);
@@ -114,7 +141,7 @@ static inline int exl3_encoding_read(const RadEncoding* e, int* bits, int* codeb
     n = (size_t)(slash - e->transform);
     memcpy(cb, e->transform, n);
     cb[n] = 0;
-    k = exl3_bits_of_dtype(e->plane[EXL3_PLANE_CODES].dtype);
+    k = exl3_bits_of_plane(e->plane[EXL3_PLANE_CODES].dtype, e->plane[EXL3_PLANE_CODES].block[1]);
     c = exl3_codebook_from_name(cb);
     s = e->n_planes == 4;
     if (k < 0 || c < 0 || exl3_encoding_make(k, c, s, &want) != RAD_OK || !rad_enc_equal(e, &want))
