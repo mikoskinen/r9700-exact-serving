@@ -15,7 +15,7 @@
  *   a source tensor of another K than bits=            RAD_E_DTYPE
  *   a codebook marker other than codebook= (mcg, none) RAD_E_DTYPE
  *   a marker scalar with the wrong value, or two       RAD_E_FORMAT
- *   half-integer K (trellis last dim 16K+8, 1.5.2)     RAD_E_UNSUPPORTED
+ *   half-integer K the recipe does not name (bits=2.5) RAD_E_DTYPE (as any other K mismatch)
  *   a .bias                                            RAD_E_UNSUPPORTED
  *   a missing tensor / a layer the source lacks        RAD_E_NOTFOUND
  *   a source that is not EXL3, a shape that disagrees  RAD_E_FORMAT / RAD_E_SHAPE
@@ -47,8 +47,9 @@ const RadQuantOption kOptions[] = {
     {"src", RAD_P_STR, nullptr,
      "directory of the EXL3 checkpoint the expert planes are imported from (exllamav3's layout, e.g. "
      "turboderp's conversion): config.json with quantization_config.quant_method exl3, and safetensors"},
-    {"bits", RAD_P_INT, nullptr,
-     "K, bits a weight, 2..8; every imported trellis must be K (its last dimension 16*K)"},
+    {"bits", RAD_P_F64, nullptr,
+     "K, bits a weight: 2..8, or the half-integer 1.5 / 2.5 / 3.5 (exllamav3 1.6, mul1 only); every imported trellis "
+     "must be K (its last dimension 16*K, 40 at 2.5)"},
     {"codebook", RAD_P_STR, "mul1",
      "mul1 | mcg | 3inst; every imported projection's marker must name it (.mul1 / .mcg / none)"},
 };
@@ -68,7 +69,14 @@ bool read_opts(const RadParam* o, int n, Opts* out, std::string* why) {
     for (int i = 0; i < n; ++i) {
         const char* k = o[i].key;
         if (!std::strcmp(k, "src") && o[i].kind == RAD_P_STR && o[i].sval) out->src = o[i].sval;
-        else if (!std::strcmp(k, "bits") && o[i].kind == RAD_P_INT) out->bits = (int)o[i].ival;
+        else if (!std::strcmp(k, "bits") && (o[i].kind == RAD_P_INT || o[i].kind == RAD_P_F64)) {
+            /* K, TAGGED for half-integer K (common/exl3_decode.h): 2.5 -> EXL3_HALF(2) */
+            const double x = o[i].kind == RAD_P_INT ? (double)o[i].ival : o[i].dval;
+            const int ka = (int)x;
+            if (x == (double)ka) out->bits = ka;
+            else if (x - ka == 0.5 && ka >= 1 && ka <= 3) out->bits = EXL3_HALF(ka);
+            else { *why = "bits=" + std::to_string(x) + " is neither a whole K nor 1.5 / 2.5 / 3.5"; return false; }
+        }
         else if (!std::strcmp(k, "codebook") && o[i].kind == RAD_P_STR && o[i].sval) {
             out->codebook = exl3_codebook_from_name(o[i].sval);
             if (out->codebook < 0) {
@@ -81,10 +89,14 @@ bool read_opts(const RadParam* o, int n, Opts* out, std::string* why) {
         }
     }
     if (out->src.empty()) { *why = "src=DIR (the EXL3 checkpoint) is required"; return false; }
-    if (out->bits < EXL3_GEMM_BITS_MIN || out->bits > EXL3_GEMM_BITS_MAX) {
+    if (!exl3_bits_half(out->bits) && (out->bits < EXL3_GEMM_BITS_MIN || out->bits > EXL3_GEMM_BITS_MAX)) {
         *why = out->bits < 0 ? "bits=K is required"
                              : "bits=" + std::to_string(out->bits) +
-                                   ": EXL3 expert dtypes exist for K 2..8 (exl3k2..exl3k8)";
+                                   ": EXL3 expert dtypes exist for K 2..8 and 1.5 / 2.5 / 3.5 (exl3k2..exl3k8, exl3k1h..exl3k3h)";
+        return false;
+    }
+    if (exl3_bits_half(out->bits) && out->codebook != EXL3_CB_MUL1) {
+        *why = "a half-integer bits= exists for codebook=mul1 only (exllamav3 1.6)";
         return false;
     }
     return true;
@@ -218,18 +230,16 @@ int import_part(exl3::Source* s, const std::string& prefix, const Part& p, const
                "; exllamav3 writes I16 [k/16, n/16, 16*K]";
         return RAD_E_FORMAT;
     }
-    if (t.shape[2] % 16 == 8) {
-        *why = base + ".trellis has a last dimension of " + std::to_string(t.shape[2]) + ": half-integer K = " +
-               std::to_string(t.shape[2] / 16) + ".5 (exllamav3 1.5.2), which nothing here decodes";
-        return RAD_E_UNSUPPORTED;
-    }
-    if (t.shape[2] % 16 != 0) {
+    /* 16 K uint16 a tile = 8 K2: integer K at % 16 == 0, half-integer K at % 16 == 8 (exllamav3 1.6: 2.5 -> 40) */
+    if (t.shape[2] % 8 != 0) {
         *why = base + ".trellis has a last dimension of " + std::to_string(t.shape[2]) + ", not 16*K";
         return RAD_E_FORMAT;
     }
-    if (t.shape[2] / 16 != op.bits) {
-        *why = base + " is K=" + std::to_string(t.shape[2] / 16) + " (trellis last dimension " +
-               std::to_string(t.shape[2]) + "); the recipe says bits=" + std::to_string(op.bits);
+    if (t.shape[2] != 8 * exl3_k2(op.bits)) {
+        const int64_t k2 = t.shape[2] / 8;
+        *why = base + " is K=" + std::to_string(k2 / 2) + (k2 % 2 ? ".5" : "") + " (trellis last dimension " +
+               std::to_string(t.shape[2]) + "); the recipe says bits=" + std::to_string(exl3_k2(op.bits) / 2) +
+               (exl3_k2(op.bits) % 2 ? ".5" : "");
         return RAD_E_DTYPE;
     }
     if (t.shape[0] * 16 != k || t.shape[1] * 16 != n) {

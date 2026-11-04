@@ -19,8 +19,8 @@ static uint8_t* random_plane(int64_t rows, int64_t cols, int bits, int64_t* rb) 
     p = (uint8_t*)malloc((size_t)(rows * *rb));
     for (i = 0; i < rows * *rb; ++i) p[i] = (uint8_t)exl3_rng();
     /* bits past the last element of a row are not part of the plane: keep them zero, as a writer does */
-    if ((cols * bits) % 8)
-        for (i = 0; i < rows; ++i) p[i * *rb + *rb - 1] &= (uint8_t)((1u << ((cols * bits) % 8)) - 1);
+    if (exl3_sym_off(bits, cols) % 8)
+        for (i = 0; i < rows; ++i) p[i * *rb + *rb - 1] &= (uint8_t)((1u << (exl3_sym_off(bits, cols) % 8)) - 1);
     return p;
 }
 
@@ -30,8 +30,8 @@ static int64_t tiles_differ(const uint16_t* whole, int64_t whole_nt, const uint1
     int64_t tk, tn, bad = 0;
     for (tk = 0; tk < kt; ++tk)
         for (tn = 0; tn < nt; ++tn)
-            bad += memcmp(whole + ((tk0 + tk) * whole_nt + tn0 + tn) * 16 * bits,
-                          slice + (tk * nt + tn) * 16 * bits, (size_t)(32 * bits)) != 0;
+            bad += memcmp(whole + ((tk0 + tk) * whole_nt + tn0 + tn) * 8 * exl3_k2(bits),
+                          slice + (tk * nt + tn) * 8 * exl3_k2(bits), (size_t)(16 * exl3_k2(bits))) != 0;
     return bad;
 }
 
@@ -72,20 +72,20 @@ static void round_trip_and_slices(int64_t rows, int64_t cols, int bits, int rows
         int s;
         for (s = 0; s < 2; ++s) {
             const int64_t n = hi[s] - lo[s];
-            CHECK((lo[s] * bits) % 8 == 0);
-            CHECK(exl3_codes_to_record(plane + lo[s] * bits / 8, rb, rows, n, bits, part) == EXL3_OK);
+            CHECK(exl3_sym_off(bits, lo[s]) % 8 == 0);
+            CHECK(exl3_codes_to_record(plane + exl3_sym_off(bits, lo[s]) / 8, rb, rows, n, bits, part) == EXL3_OK);
             bad = tiles_differ(rec, rows / 16, part, lo[s] / 16, n / 16, 0, rows / 16, bits);
             CHECK_EQ_U(bad, 0);
             /* and back into a scratch copy: the slice's bits land, nothing outside it moves */
             memcpy(back, plane, (size_t)(rows * rb));
             for (i = 0; i < exl3_record_elems(rows, n, bits); ++i) part[i] = (uint16_t)~part[i];
-            exl3_record_to_codes(part, rows, n, bits, back + lo[s] * bits / 8, rb);
+            exl3_record_to_codes(part, rows, n, bits, back + exl3_sym_off(bits, lo[s]) / 8, rb);
             for (i = 0, bad = 0; i < rows * cols; ++i) {
                 const int64_t r = i / cols, c = i % cols;
                 const uint32_t a = exl3_codes_get(plane, rb, bits, r, c),
                                b = exl3_codes_get(back, rb, bits, r, c);
                 const int inside = c >= lo[s] && c < hi[s];
-                bad += inside ? a != (~b & ((1u << bits) - 1)) : a != b;
+                bad += inside ? a != (~b & ((1u << exl3_sym_width(bits, c)) - 1)) : a != b;
             }
             CHECK_EQ_U(bad, 0);
         }
@@ -94,10 +94,14 @@ static void round_trip_and_slices(int64_t rows, int64_t cols, int bits, int rows
 }
 
 TEST(layout_round_trips_and_slices_keep_tiles_whole_at_every_k) {
-    int bits;
+    int bits, ka;
     for (bits = 1; bits <= 8; ++bits) {
         round_trip_and_slices(2 * WIDTH, HIDDEN, bits, 1, 0);   /* gate_up, stacked */
         round_trip_and_slices(HIDDEN, WIDTH, bits, 0, 1);       /* down */
+    }
+    for (ka = 1; ka <= 3; ++ka) {                               /* half-integer K: 1.5, 2.5, 3.5 */
+        round_trip_and_slices(2 * WIDTH, HIDDEN, EXL3_HALF(ka), 1, 0);
+        round_trip_and_slices(HIDDEN, WIDTH, EXL3_HALF(ka), 0, 1);
     }
 }
 

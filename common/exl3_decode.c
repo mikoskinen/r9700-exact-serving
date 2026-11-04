@@ -87,31 +87,53 @@ static uint32_t stream_bit(const uint16_t* tile, int b) {
     return (w >> (31 - (b & 31))) & 1u;
 }
 
+/* Symbol p is stream bits [off(p), off(p) + width(p)): p*K .. at integer K, the half-integer ring otherwise
+ * (exl3_decode.h, "half-integer K"). */
 void exl3_tile_symbols(const uint16_t* tile, int bits, uint8_t sym[EXL3_TILE_POS]) {
     int p, i;
     for (p = 0; p < EXL3_TILE_POS; ++p) {
+        const int b0 = (int)exl3_sym_off(bits, p), w = exl3_sym_width(bits, p);
         uint32_t v = 0;
-        for (i = 0; i < bits; ++i) v = (v << 1) | stream_bit(tile, p * bits + i);
+        for (i = 0; i < w; ++i) v = (v << 1) | stream_bit(tile, b0 + i);
         sym[p] = (uint8_t)v;
     }
 }
 
 void exl3_tile_pack(const uint8_t sym[EXL3_TILE_POS], int bits, uint16_t* tile) {
     int p, i;
-    memset(tile, 0, (size_t)(16 * bits) * sizeof *tile);
-    for (p = 0; p < EXL3_TILE_POS; ++p)
-        for (i = 0; i < bits; ++i) {
-            const int b = p * bits + i, shift = 31 - (b & 31);
-            if (!((sym[p] >> (bits - 1 - i)) & 1)) continue;
+    memset(tile, 0, (size_t)(8 * exl3_k2(bits)) * sizeof *tile);
+    for (p = 0; p < EXL3_TILE_POS; ++p) {
+        const int b0 = (int)exl3_sym_off(bits, p), w = exl3_sym_width(bits, p);
+        for (i = 0; i < w; ++i) {
+            const int b = b0 + i, shift = 31 - (b & 31);
+            if (!((sym[p] >> (w - 1 - i)) & 1)) continue;
             if (shift >= 16) tile[2 * (b >> 5) + 1] |= (uint16_t)(1u << (shift - 16));
             else tile[2 * (b >> 5)] |= (uint16_t)(1u << shift);
         }
+    }
+}
+
+/* Half-integer K: the state is the ring's 16-bit window ending at S(p) = off(p + 1) (exllamav3 frac.cu
+ * frac_window), read off the packed ring itself -- a second form, not the integer loop below generalised, so the
+ * two cannot share a mistake at integer K (where the loop stays the oracle). */
+static void tile_states_half(const uint8_t sym[EXL3_TILE_POS], int bits, uint16_t state[EXL3_TILE_POS]) {
+    uint16_t ring[8 * 7];                              /* 3.5: 8 * K2 = 56 uint16, the largest */
+    const int R = 128 * exl3_k2(bits);                 /* ring bits */
+    int p, i;
+    exl3_tile_pack(sym, bits, ring);
+    for (p = 0; p < EXL3_TILE_POS; ++p) {
+        const int e = (int)exl3_sym_off(bits, p + 1);  /* S(p), exclusive end */
+        uint32_t v = 0;
+        for (i = 16; i > 0; --i) v = (v << 1) | stream_bit(ring, ((e - i) % R + R) % R);
+        state[p] = (uint16_t)v;
+    }
 }
 
 void exl3_tile_states(const uint8_t sym[EXL3_TILE_POS], int bits, uint16_t state[EXL3_TILE_POS]) {
     const int back = (16 + bits - 1) / bits;          /* symbols a 16-bit window reaches into */
     const uint32_t mask = (1u << bits) - 1u;
     int p, i;
+    if (exl3_bits_half(bits)) { tile_states_half(sym, bits, state); return; }
     for (p = 0; p < EXL3_TILE_POS; ++p) {
         uint32_t acc = 0;                             /* at most 16 + bits - 1 <= 23 bits */
         for (i = back - 1; i >= 0; --i)
@@ -120,8 +142,10 @@ void exl3_tile_states(const uint8_t sym[EXL3_TILE_POS], int bits, uint16_t state
     }
 }
 
+/* Half-integer K exists for mul1 only (exllamav3 quantize.py: "fractional bitrates require the mul1 codebook"). */
 static int args_ok(int bits, int codebook) {
-    return bits >= EXL3_BITS_MIN && bits <= EXL3_BITS_MAX && exl3_codebook_name(codebook) != 0;
+    return exl3_bits_valid(bits) && exl3_codebook_name(codebook) != 0 &&
+           (!exl3_bits_half(bits) || codebook == EXL3_CB_MUL1);
 }
 
 int exl3_trellis_decode(const uint16_t* trellis, int64_t kt, int64_t nt, int bits, int codebook,
@@ -133,7 +157,7 @@ int exl3_trellis_decode(const uint16_t* trellis, int64_t kt, int64_t nt, int bit
     if (!trellis || !w_hat || kt < 0 || nt < 0 || !args_ok(bits, codebook)) return EXL3_E_ARG;
     for (tk = 0; tk < kt; ++tk)
         for (tn = 0; tn < nt; ++tn) {
-            exl3_tile_symbols(trellis + (tk * nt + tn) * 16 * bits, bits, sym);
+            exl3_tile_symbols(trellis + (tk * nt + tn) * 8 * exl3_k2(bits), bits, sym);
             exl3_tile_states(sym, bits, st);
             for (p = 0; p < EXL3_TILE_POS; ++p) {
                 exl3_pos_to_tile(p, &r, &c);
@@ -145,23 +169,25 @@ int exl3_trellis_decode(const uint16_t* trellis, int64_t kt, int64_t nt, int bit
 
 /* ------------------------------------------------------------------ the codes plane */
 
-int64_t exl3_codes_row_bytes(int64_t cols, int bits) { return (cols * bits + 7) / 8; }
+int64_t exl3_codes_row_bytes(int64_t cols, int bits) { return (exl3_sym_off(bits, cols) + 7) / 8; }
 
 uint32_t exl3_codes_get(const uint8_t* codes, int64_t row_bytes, int bits, int64_t i, int64_t j) {
     const uint8_t* row = codes + i * row_bytes;
-    int64_t b = j * bits;
+    int64_t b = exl3_sym_off(bits, j);
+    const int w = exl3_sym_width(bits, j);
     uint32_t v = 0;
     int k;
-    for (k = 0; k < bits; ++k, ++b) v |= (uint32_t)((row[b >> 3] >> (b & 7)) & 1u) << k;
+    for (k = 0; k < w; ++k, ++b) v |= (uint32_t)((row[b >> 3] >> (b & 7)) & 1u) << k;
     return v;
 }
 
 void exl3_codes_set(uint8_t* codes, int64_t row_bytes, int bits, int64_t i, int64_t j,
                     uint32_t value) {
     uint8_t* row = codes + i * row_bytes;
-    int64_t b = j * bits;
+    int64_t b = exl3_sym_off(bits, j);
+    const int w = exl3_sym_width(bits, j);
     int k;
-    for (k = 0; k < bits; ++k, ++b) {
+    for (k = 0; k < w; ++k, ++b) {
         const uint8_t m = (uint8_t)(1u << (b & 7));
         row[b >> 3] = (uint8_t)(((value >> k) & 1u) ? (row[b >> 3] | m) : (row[b >> 3] & ~m));
     }

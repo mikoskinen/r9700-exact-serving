@@ -84,8 +84,12 @@ void exl3r4d_kx_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows,
                           uint32_t* record) {
     int tr[256], tc[256];
     tile_order(tr, tc);
-    const int64_t nt = rows / 16, kt = cols / 16, seg = 2 * bits;   /* a row's 16 symbols: 2K bytes */
-    const uint32_t mask = (1u << bits) - 1u;
+    /* a row's 16 symbols: 2K bytes = K2 bytes (half-integer K too: 8 pairs of 2 KA + 1 bits); symbol r of the
+     * segment at bit off(r) = floor(r K2 / 2), width(r) = off(r + 1) - off(r) (K, or KA / KA + 1 by r's parity) */
+    const int k2 = exl3_k2(bits);
+    const int64_t nt = rows / 16, kt = cols / 16, seg = k2;
+    int off[17];
+    for (int r = 0; r <= 16; ++r) off[r] = (int)exl3_sym_off(bits, r);
     for (int64_t tk = 0; tk < kt; ++tk)
         for (int64_t tn = 0; tn < nt; ++tn) {
             uint8_t sym[16][16];   /* [c][r]: row n = 16 tn + c, column k = 16 tk + r */
@@ -93,16 +97,18 @@ void exl3r4d_kx_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows,
                 uint8_t b[18] = { 0 };
                 memcpy(b, codes + (tn * 16 + c) * row_bytes + tk * seg, (size_t)seg);
                 for (int r = 0; r < 16; ++r) {
-                    const int o = r * bits;
-                    sym[c][r] = (uint8_t)(((uint32_t)b[o >> 3] | (uint32_t)b[(o >> 3) + 1] << 8) >> (o & 7) & mask);
+                    const int o = off[r], w = off[r + 1] - o;
+                    sym[c][r] = (uint8_t)(((uint32_t)b[o >> 3] | (uint32_t)b[(o >> 3) + 1] << 8) >> (o & 7) &
+                                          ((1u << w) - 1u));
                 }
             }
-            uint32_t* w = record + (tk * nt + tn) * 8 * bits;
+            uint32_t* w = record + (tk * nt + tn) * 4 * k2;   /* 8 K u32 a tile */
             uint64_t acc = 0;
             int nb = 0;
             for (int p = 0; p < 256; ++p) {
-                acc = acc << bits | sym[tc[p]][tr[p]];
-                nb += bits;
+                const int wp = off[(p & 15) + 1] - off[p & 15];   /* stream width: p's parity, as the row's */
+                acc = acc << wp | sym[tc[p]][tr[p]];
+                nb += wp;
                 if (nb >= 32) {
                     nb -= 32;
                     *w++ = (uint32_t)(acc >> nb);
@@ -116,27 +122,30 @@ void exl3r4d_kx_from_record(const uint32_t* record, int64_t rows, int64_t cols, 
                             int64_t row_bytes) {
     int tr[256], tc[256];
     tile_order(tr, tc);
-    const int64_t nt = rows / 16, kt = cols / 16, seg = 2 * bits;
-    const uint32_t mask = (1u << bits) - 1u;
+    const int k2 = exl3_k2(bits);
+    const int64_t nt = rows / 16, kt = cols / 16, seg = k2;
+    int off[17];
+    for (int r = 0; r <= 16; ++r) off[r] = (int)exl3_sym_off(bits, r);
     for (int64_t tk = 0; tk < kt; ++tk)
         for (int64_t tn = 0; tn < nt; ++tn) {
             uint8_t sym[16][16];
-            const uint32_t* w = record + (tk * nt + tn) * 8 * bits;
+            const uint32_t* w = record + (tk * nt + tn) * 4 * k2;
             uint64_t acc = 0;
             int nb = 0;
             for (int p = 0; p < 256; ++p) {
-                if (nb < bits) {
+                const int wp = off[(p & 15) + 1] - off[p & 15];
+                if (nb < wp) {
                     acc = acc << 32 | *w++;
                     nb += 32;
                 }
-                nb -= bits;
-                sym[tc[p]][tr[p]] = (uint8_t)(acc >> nb & mask);
+                nb -= wp;
+                sym[tc[p]][tr[p]] = (uint8_t)(acc >> nb & ((1u << wp) - 1u));
                 acc &= (1ull << nb) - 1ull;
             }
             for (int c = 0; c < 16; ++c) {
                 uint8_t b[18] = { 0 };
                 for (int r = 0; r < 16; ++r) {
-                    const int o = r * bits;
+                    const int o = off[r];
                     const uint32_t v = (uint32_t)sym[c][r] << (o & 7);
                     b[o >> 3] |= (uint8_t)v;
                     b[(o >> 3) + 1] |= (uint8_t)(v >> 8);
@@ -206,6 +215,7 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
         strcmp(enc->plane[sel[0]].role, k_plane_name[q]) != 0)
         return RAD_E_SHAPE;
     exl3_plane_extents(g.rows[c], g.cols[c], q, &er, &ec);
+    if (q == EXL3_P_CODES) ec = exl3_codes_plane_cols(ec, bits);
     if (planes[0].rank != 2) return RAD_E_SHAPE;
     /* codes: exactly the class's [rows, cols]; a scale vector by its element count (include/exl3_abi.h, THE PLANES:
      * the declared shape is what an issue carries, any rank whose extents multiply to C or R) */
@@ -214,7 +224,7 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
         return RAD_E_SHAPE;
     if (q != EXL3_P_CODES && planes[0].dtype != RAD_F16) return RAD_E_DTYPE;
     /* the codes plane handed is the encoding's K (R23: a uK plane of another K than the encoding names is refused,
-     * not read as the encoding's K) */
+     * not read as the encoding's K); a half-integer K's plane is cols / 2 pair symbols a row */
     if (q == EXL3_P_CODES && planes[0].dtype != exl3_codes_dtype(bits)) return RAD_E_DTYPE;
     /* the op's dtype names the same K as the weight's encoding (a K-bit op handed another K's weight) */
     if (g.bits != bits) return RAD_E_DTYPE;
@@ -225,10 +235,11 @@ static int check(int gate_up, const RadParam* p, int n_p, int operand, const Rad
     return RAD_OK;
 }
 
-static int64_t record_bytes(int64_t rows, int64_t cols, int bits) { return rows * cols * bits / 8; }
-static const char* const k_tag[EXL3R4D_BITS_MAX + 1] = { 0, 0, "exl3r4d.trellis.k2", "exl3r4d.trellis.k3",
-                                                         "exl3r4d.trellis.k4", "exl3r4d.trellis.k5",
-                                                         "exl3r4d.trellis.k6" };
+static int64_t record_bytes(int64_t rows, int64_t cols, int bits) { return rows * cols * exl3_k2(bits) / 16; }
+static const char* const k_tag_int[EXL3R4D_BITS_MAX + 1] = { 0, 0, "exl3r4d.trellis.k2", "exl3r4d.trellis.k3",
+                                                             "exl3r4d.trellis.k4", "exl3r4d.trellis.k5",
+                                                             "exl3r4d.trellis.k6" };
+static const char* k_tag(int bits) { return bits == EXL3R4D_BITS_H25 ? "exl3r4d.trellis.k2h" : k_tag_int[bits]; }
 static int64_t vec_bytes(const RadTensor* t) { return t->shape[0] * t->shape[1] * 2; }   /* a scale plane, f16 */
 
 /* ------------------------------------------------------------------ the hooks */
@@ -289,12 +300,12 @@ int exl3r4d_layout(int gate_up, const RadParam* p, int n_p, int operand, const R
         out->bytes = vec_bytes(&planes[0]);
         return RAD_OK;
     }
-    out->tag = k_tag[bits];
+    out->tag = k_tag(bits);
     out->dtype = EXL3R4D_DT_TRELLIS;
     out->rank = 2;
     out->shape[0] = rows;
     out->shape[1] = cols;
-    out->align = 256;   /* the .rad sub-plane alignment; every tile (32 K bytes) starts on 16 B */
+    out->align = 256;   /* the .rad sub-plane alignment; every tile (32 K bytes: 80 at 2.5) starts on 16 B */
     out->bytes = record_bytes(rows, cols, bits);
     return RAD_OK;
 }

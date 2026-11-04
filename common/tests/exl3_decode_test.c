@@ -225,6 +225,125 @@ TEST(w_hat_from_the_plane_equals_w_hat_from_the_trellis) {
         }
 }
 
+/* ------------------------------------------------------------------ half-integer K (exllamav3 1.6) */
+
+/* Widths alternate KA (even p) and KA + 1 (odd p): 2.5 -> 2,3,2,3,...; a tile is 640 bits = 40 int16. Built by hand:
+ * symbols 0 = 0b10, 1 = 0b011, 2 = 0b11 make the stream 10 011 11 = 0b1001111 from bit 0, i.e. int16[1] = 0x9E00. */
+TEST(half_k_symbols_alternate_ka_and_ka_plus_one_bits) {
+    uint8_t sym[256] = { 0 }, back[256];
+    uint16_t tile[8 * 7];
+    int ka, p, ok = 1;
+    CHECK_EQ_U(exl3_k2(EXL3_HALF(2)), 5);
+    CHECK_EQ_U(exl3_sym_width(EXL3_HALF(2), 0), 2);
+    CHECK_EQ_U(exl3_sym_width(EXL3_HALF(2), 1), 3);
+    CHECK_EQ_U(exl3_sym_off(EXL3_HALF(2), 256), 640);
+    CHECK_EQ_U(exl3_sym_off(4, 7), 28);                       /* integer K: p K, as before */
+    sym[0] = 0x2; sym[1] = 0x3; sym[2] = 0x3;
+    exl3_tile_pack(sym, EXL3_HALF(2), tile);
+    CHECK_EQ_U(tile[1], 0x9E00);                              /* bits 0..6 = 1001111, MSB-first in word 0 */
+    CHECK_EQ_U(tile[0], 0x0000);
+    for (ka = 1; ka <= 3; ++ka) {
+        const int bits = EXL3_HALF(ka);
+        for (p = 0; p < 256; ++p) sym[p] = (uint8_t)(exl3_rng() & ((1u << exl3_sym_width(bits, p)) - 1));
+        exl3_tile_pack(sym, bits, tile);
+        exl3_tile_symbols(tile, bits, back);
+        ok &= memcmp(sym, back, 256) == 0;
+    }
+    CHECK(ok);
+}
+
+/* The state at p is the 16-bit window ending at S(p) = off(p + 1), circular: checked against the integer oracle's
+ * own method (concatenate symbols backwards until 16 bits, keep the low 16) -- a different algorithm from the
+ * ring read the library uses for half-integer K. */
+TEST(half_k_states_are_the_window_ending_at_each_symbol) {
+    uint8_t sym[256];
+    uint16_t st[256];
+    int ka, p, bad = 0;
+    for (ka = 1; ka <= 3; ++ka) {
+        const int bits = EXL3_HALF(ka);
+        for (p = 0; p < 256; ++p) sym[p] = (uint8_t)(exl3_rng() & ((1u << exl3_sym_width(bits, p)) - 1));
+        exl3_tile_states(sym, bits, st);
+        for (p = 0; p < 256; ++p) {
+            uint64_t acc = 0;
+            int nb = 0, q = p;
+            while (nb < 16) {                                 /* symbol q, then q - 1, ... (circular) */
+                const int w = exl3_sym_width(bits, q);
+                acc |= (uint64_t)sym[q] << nb;
+                nb += w;
+                q = (q + 255) % 256;
+            }
+            bad += st[p] != (uint16_t)(acc & 0xFFFF);
+        }
+    }
+    CHECK_EQ_U(bad, 0);
+    /* by hand at 2.5, p = 3 (odd): window = bits [S(3) - 16, S(3)) = [-6, 10): the ring's last 6 bits, then p 0..3 */
+    for (p = 0; p < 256; ++p) sym[p] = 0;
+    sym[0] = 0x1; sym[1] = 0x5; sym[2] = 0x2; sym[3] = 0x6;   /* 01 101 10 110 */
+    sym[254] = 0x3; sym[255] = 0x4;                          /* ... 11 100 at the ring's end: last 6 bits = 011100 */
+    exl3_tile_states(sym, EXL3_HALF(2), st);
+    CHECK_EQ_U(st[3], 0x71B6);                               /* 011100 01 101 10 110 = 0111 0001 1011 0110 */
+}
+
+/* The [1x2] pair plane: element m of a row (5 bits LSB-first from bit 5m, as radiance stores a u5 plane) is
+ * column 2m in its low KA bits and column 2m + 1 above -- the same bits exl3_codes_get reads at off(j). */
+TEST(half_k_codes_plane_is_the_pair_plane) {
+    uint8_t row[16] = { 0 };
+    int64_t m;
+    int bad = 0;
+    for (m = 0; m < 16; ++m) {
+        exl3_codes_set(row, 16, EXL3_HALF(2), 0, 2 * m, (uint32_t)(m & 3));
+        exl3_codes_set(row, 16, EXL3_HALF(2), 0, 2 * m + 1, (uint32_t)((m * 3 + 1) & 7));
+    }
+    for (m = 0; m < 16; ++m) {
+        uint32_t v = 0;
+        int k;
+        for (k = 0; k < 5; ++k) v |= (uint32_t)((row[(5 * m + k) >> 3] >> ((5 * m + k) & 7)) & 1u) << k;
+        bad += v != ((uint32_t)(m & 3) | (uint32_t)((m * 3 + 1) & 7) << 2);
+    }
+    CHECK_EQ_U(bad, 0);
+    CHECK_EQ_U(exl3_codes_row_bytes(32, EXL3_HALF(2)), 10);
+    CHECK_EQ_U(exl3_codes_row_bytes(5120, EXL3_HALF(2)), 1600);
+    CHECK_EQ_U(exl3_codes_row_bytes(2304, EXL3_HALF(1)), 432);
+}
+
+/* W_hat from the pair plane == W_hat from the trellis (mul1, the only half-integer codebook); other codebooks refused. */
+TEST(half_k_w_hat_from_the_plane_equals_w_hat_from_the_trellis) {
+    enum { N = 64, K = 48 };
+    int ka;
+    for (ka = 1; ka <= 3; ++ka) {
+        const int bits = EXL3_HALF(ka);
+        const int64_t rb = exl3_codes_row_bytes(K, bits);
+        uint16_t* tr = (uint16_t*)malloc((size_t)exl3_record_elems(N, K, bits) * 2);
+        uint8_t* codes = (uint8_t*)calloc((size_t)(N * rb), 1);
+        uint16_t wh[K * N];
+        float out[N * K];
+        Exl3View v;
+        int64_t i, j, bad = 0;
+        CHECK_EQ_U(exl3_record_elems(N, K, bits), (N / 16) * (K / 16) * 8 * (2 * ka + 1));
+        for (i = 0; i < exl3_record_elems(N, K, bits); ++i) tr[i] = (uint16_t)exl3_rng();
+        CHECK(exl3_trellis_decode(tr, K / 16, N / 16, bits, EXL3_CB_MUL1, wh) == EXL3_OK);
+        CHECK(exl3_trellis_decode(tr, K / 16, N / 16, bits, EXL3_CB_MCG, wh) == EXL3_E_ARG);
+        CHECK(exl3_trellis_decode(tr, K / 16, N / 16, bits, EXL3_CB_MUL1, wh) == EXL3_OK);
+        exl3_record_to_codes(tr, N, K, bits, codes, rb);
+        memset(&v, 0, sizeof v);
+        v.rows = N; v.cols = K; v.bits = bits; v.codebook = EXL3_CB_MUL1; v.codes = codes;
+        CHECK(exl3_decode_what_rows(&v, 0, N, out) == EXL3_OK);
+        for (i = 0; i < N; ++i)
+            for (j = 0; j < K; ++j)
+                bad += exl3_half_from_double(out[i * K + j]) != wh[j * N + i];
+        CHECK_EQ_U(bad, 0);
+        /* negative control: read as the integer K below, the same bytes decode to something else */
+        v.bits = ka;
+        CHECK(exl3_decode_what_rows(&v, 0, N, out) == EXL3_OK);
+        for (i = 0, bad = 0; i < N; ++i)
+            for (j = 0; j < K; ++j)
+                bad += exl3_half_from_double(out[i * K + j]) != wh[j * N + i];
+        CHECK(bad > 0);
+        free(tr);
+        free(codes);
+    }
+}
+
 TEST(decode_refuses_what_it_cannot_decode) {
     uint8_t codes[256 * 128];
     uint16_t s[256];
@@ -237,6 +356,10 @@ TEST(decode_refuses_what_it_cannot_decode) {
     memset(codes, 0, sizeof codes);
     CHECK(exl3_decode_rows(&v, 0, 128, out) == EXL3_OK);
     v.bits = 9;            CHECK(exl3_decode_rows(&v, 0, 128, out) == EXL3_E_ARG);
+    v.bits = EXL3_HALF(4); CHECK(exl3_decode_rows(&v, 0, 128, out) == EXL3_E_ARG);   /* 4.5: not exllamav3's */
+    v.bits = EXL3_HALF(2); v.codebook = EXL3_CB_3INST;
+    CHECK(exl3_decode_rows(&v, 0, 128, out) == EXL3_E_ARG);                         /* half-integer K: mul1 only */
+    v.codebook = EXL3_CB_MUL1;
     v.bits = 0;            CHECK(exl3_decode_rows(&v, 0, 128, out) == EXL3_E_ARG);
     v.bits = 4; v.codebook = 3; CHECK(exl3_decode_rows(&v, 0, 128, out) == EXL3_E_ARG);
     v.codebook = EXL3_CB_MUL1;
@@ -260,6 +383,10 @@ int main(void) {
     RUN(had128_is_the_normalised_sylvester_hadamard);
     RUN(codes_plane_elements_are_lsb_first_along_the_row);
     RUN(w_hat_from_the_plane_equals_w_hat_from_the_trellis);
+    RUN(half_k_symbols_alternate_ka_and_ka_plus_one_bits);
+    RUN(half_k_states_are_the_window_ending_at_each_symbol);
+    RUN(half_k_codes_plane_is_the_pair_plane);
+    RUN(half_k_w_hat_from_the_plane_equals_w_hat_from_the_trellis);
     RUN(decode_refuses_what_it_cannot_decode);
     return exl3_check_done();
 }

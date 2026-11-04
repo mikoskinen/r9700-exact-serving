@@ -8,8 +8,8 @@
 #if EXL3_IFACE_VERSION != 7
 #error "exl3ref is written against EXL3_IFACE_VERSION 7 (include/exl3_abi.h)"
 #endif
-#if EXL3_DECODE_API_VERSION != 1
-#error "exl3ref is written against EXL3_DECODE_API_VERSION 1 (common/exl3_decode.h)"
+#if EXL3_DECODE_API_VERSION != 2
+#error "exl3ref is written against EXL3_DECODE_API_VERSION 2 (common/exl3_decode.h: half-integer K)"
 #endif
 
 /* ref.c: the launch of any op (EXL3_DOWN, EXL3_GATE_UP, EXL3_PREP_GU, EXL3_GU_DN, and their _mod4 forms). */

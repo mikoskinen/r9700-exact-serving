@@ -1246,6 +1246,7 @@ static const void* pf_pair_fn(int bits) {
     case 4: return (const void*)exl3r4d_pf_pair_kernel<4>;
     case 5: return (const void*)exl3r4d_pf_pair_kernel<5>;
     case 6: return (const void*)exl3r4d_pf_pair_kernel<6>;
+    case EXL3R4D_K25: return (const void*)exl3r4d_pf_pair_kernel<EXL3R4D_K25>;   // half-integer K = 2.5
     default: return nullptr;
   }
 }
@@ -1731,6 +1732,7 @@ static int pf_grp_launch(int bits, const Exl3r4dPrefill* a, void** args, hipStre
     case 4: return pf_grp_launch_k<4>(a, args, st);
     case 5: return pf_grp_launch_k<5>(a, args, st);
     case 6: return pf_grp_launch_k<6>(a, args, st);
+    case EXL3R4D_K25: return pf_grp_launch_k<EXL3R4D_K25>(a, args, st);
     default: return RAD_E_DTYPE;
   }
 }
@@ -1996,6 +1998,7 @@ static const void* pf_gemm_select(int bits, int gate_up, int run, int am, bool y
     case 4: return pf_gemm_fn_k<4>(gate_up, run, am, ys);
     case 5: return pf_gemm_fn_k<5>(gate_up, run, am, ys);
     case 6: return pf_gemm_fn_k<6>(gate_up, run, am, ys);
+    case EXL3R4D_K25: return pf_gemm_fn_k<EXL3R4D_K25>(gate_up, run, am, ys);
     default: return nullptr;
   }
 }
@@ -2017,6 +2020,7 @@ static const void* pf_fused_split(int bits, int h) {
     case 4: return pf_fused_split_k<4>(h);
     case 5: return pf_fused_split_k<5>(h);
     case 6: return pf_fused_split_k<6>(h);
+    case EXL3R4D_K25: return pf_fused_split_k<EXL3R4D_K25>(h);
     default: return nullptr;
   }
 }
@@ -2041,7 +2045,7 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   const bool ys = a->ystream != 0;
   if (ys && (gate_up || run || am != 0)) return RAD_E_INVAL;   // the streamed y: down's map form only
   const void* fn = am == 5 ? (const void*)exl3r4d_pf_map_kernel : pf_gemm_select(bits, gate_up, run, am, ys);
-  if (!fn) return bits < 2 || bits > 6 ? RAD_E_DTYPE : RAD_E_UNSUPPORTED;
+  if (!fn) return (bits < 2 || bits > 6) && bits != EXL3R4D_K25 ? RAD_E_DTYPE : RAD_E_UNSUPPORTED;
   int64_t smem = pf_lds(mats, mtx, am);
   if (!gate_up && EXL3R4D_PF_EPI_DN2 && smem < 2 * 8 * 256 * 4) smem = 2 * 8 * 256 * 4;   // two epilogue regions
   if (gate_up && a->g.h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;   // v3 EPI 1's staged h block

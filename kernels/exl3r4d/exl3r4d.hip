@@ -3337,6 +3337,7 @@ extern "C" int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot) {
     case 4: fn = gemm_fn<4, 2>(npw, false); break;
     case 5: fn = kx_fn<5>(true, false); break;
     case 6: fn = kx_fn<6>(true, false); break;
+    case EXL3R4D_K25: fn = kx_fn<EXL3R4D_K25>(true, false); break;   // half-integer K = 2.5
     default: return 0;
   }
   int64_t smem = exl3r4d_gemm_lds(1, npw, sk, 0, 0);
@@ -3355,7 +3356,7 @@ extern "C" int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot) {
 #endif
 
 extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream) {
-  if (bits < 2 || bits > 6) return RAD_E_DTYPE;  // R23: exl3k2 .. exl3k6; refused by name upstream too
+  if ((bits < 2 || bits > 6) && bits != EXL3R4D_K25) return RAD_E_DTYPE;  // R23: exl3k2 .. exl3k6, exl3k2h (2.5)
   const int mats = gate_up ? 2 : 1, wv = 8 * mats / npw;
   const bool aprep = a->xr == nullptr;
   const int64_t cols_max = EXL3R4D_CLS_MAX(*a, cols);
@@ -3403,6 +3404,7 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
                    : bits == 3 ? (const void*)exl3r4d_gemm_kernel<3, 2, 1, false, false, 0, true>
                    : bits == 4 ? (const void*)exl3r4d_gemm_kernel<4, 2, 1, false, false, 0, true>
                    : bits == 5 ? (const void*)exl3r4d_gemm_kernel<5, 2, 1, false, false, 0, true>
+                   : bits == EXL3R4D_K25 ? (const void*)exl3r4d_gemm_kernel<EXL3R4D_K25, 2, 1, false, false, 0, true>
                                : (const void*)exl3r4d_gemm_kernel<6, 2, 1, false, false, 0, true>;
     const size_t dsm = (size_t)(kDnwB * smem);
     if (dsm > EXL3R4D_LDS_MAX) return RAD_E_SHAPE;
@@ -3432,7 +3434,8 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     const int dngk = gate_up ? 1 : EXL3R4D_DNG;
     const dim3 gk((unsigned)((a->y_cols / 128 + dngk - 1) / dngk), (unsigned)a->nslot, 1);
     const void* kf = bits == 2 ? kx_fn<2>(gate_up, gscr) : bits == 3 ? kx_fn<3>(gate_up, gscr)
-                   : bits == 5 ? kx_fn<5>(gate_up, gscr) : kx_fn<6>(gate_up, gscr);
+                   : bits == 5 ? kx_fn<5>(gate_up, gscr) : bits == EXL3R4D_K25 ? kx_fn<EXL3R4D_K25>(gate_up, gscr)
+                   : kx_fn<6>(gate_up, gscr);
     if (hipLaunchKernel(kf, gk, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
       return RAD_E_DEVICE;
     return RAD_OK;

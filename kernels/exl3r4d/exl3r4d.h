@@ -9,8 +9,8 @@
 #if EXL3_IFACE_VERSION != 7
 #error "exl3r4d is written against EXL3_IFACE_VERSION 7 (include/exl3_abi.h, PLAN.md D15; v3 h_rot, v4 a_rot + prep_gu, v5 gate_up_down, v6 the _mod4 forms, v7 gate_up_down_mod4)"
 #endif
-#if EXL3_DECODE_API_VERSION != 1 || EXL3_LAYOUT_API_VERSION != 1
-#error "exl3r4d is written against EXL3_DECODE_API_VERSION 1 and EXL3_LAYOUT_API_VERSION 1 (common/)"
+#if EXL3_DECODE_API_VERSION != 2 || EXL3_LAYOUT_API_VERSION != 2
+#error "exl3r4d is written against EXL3_DECODE_API_VERSION 2 and EXL3_LAYOUT_API_VERSION 2 (common/: half-integer K)"
 #endif
 
 #ifdef __cplusplus
@@ -22,10 +22,12 @@ extern "C" {
  * layout hook); the logical [rows, cols] stays the shape. */
 enum { EXL3R4D_DT_TRELLIS = RAD_DT_PLUGIN_BASE + 0 };
 
-/* The K the decode-band device code is built for (R23: exl3k2 .. exl3k6, codebook mul1). Every other is refused by
- * name (R12). The M > 16 band (P5) is K = 4 only for now: exl3r4d_fill refuses another K for it. */
-enum { EXL3R4D_BITS_MIN = 2, EXL3R4D_BITS_MAX = 6 };
-static inline int exl3r4d_bits_ok(int bits) { return bits >= EXL3R4D_BITS_MIN && bits <= EXL3R4D_BITS_MAX; }
+/* The K the device code is built for (R23: exl3k2 .. exl3k6, codebook mul1; and the half-integer exl3k2h = 2.5,
+ * a TAGGED bits EXL3_HALF(2) = 21, common/exl3_decode.h). Every other is refused by name (R12). */
+enum { EXL3R4D_BITS_MIN = 2, EXL3R4D_BITS_MAX = 6, EXL3R4D_BITS_H25 = EXL3_HALF(2) };
+static inline int exl3r4d_bits_ok(int bits) {
+    return (bits >= EXL3R4D_BITS_MIN && bits <= EXL3R4D_BITS_MAX) || bits == EXL3R4D_BITS_H25;
+}
 
 /* layout.c: the hooks of both rows (gate_up 1 / down 0 is the row's own op). */
 int exl3r4d_layout(int gate_up, const RadParam* p, int n_p, int operand, const RadEncoding* enc,

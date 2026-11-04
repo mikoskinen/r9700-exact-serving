@@ -26,13 +26,13 @@
 extern "C" {
 #endif
 
-#define EXL3_LAYOUT_API_VERSION 1
+#define EXL3_LAYOUT_API_VERSION 2   /* 2: half-integer K (a tagged `bits`, exl3_decode.h) */
 
-/* uint16 values in the record of a rows x cols rectangle: (rows/16)*(cols/16)*16*K. */
+/* uint16 values in the record of a rows x cols rectangle: (rows/16)*(cols/16)*16*K (8*K2 a tile, so 40 at 2.5). */
 int64_t exl3_record_elems(int64_t rows, int64_t cols, int bits);
 
 /* Canonical plane -> record. `codes` points at the rectangle's (0, 0) element's byte, rows
- * `row_bytes` apart. EXL3_E_ARG for bits outside 1..8, EXL3_E_SHAPE unless rows, cols % 16 == 0. */
+ * `row_bytes` apart. EXL3_E_ARG for a `bits` that is neither 1..8 nor a tagged half-integer K, EXL3_E_SHAPE unless rows, cols % 16 == 0. */
 int exl3_codes_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows, int64_t cols,
                          int bits, uint16_t* record);
 

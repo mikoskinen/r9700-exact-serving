@@ -65,13 +65,13 @@ static void kx_vs_oracle(int bits, int64_t rows, int64_t cols, int64_t plane_col
     uint32_t* got = malloc((size_t)rec_n * 2);
     uint8_t* back = malloc((size_t)(rows * rb));
     fill(plane, (size_t)(rows * rb));
-    const int64_t jb = j0 * bits / 8;   /* whole: j0 % 16 == 0 */
+    const int64_t jb = exl3_sym_off(bits, j0) / 8;   /* whole: j0 % 16 == 0 (half-integer K too) */
     CHECK(exl3_codes_to_record(plane + jb, rb, rows, cols, bits, want) == EXL3_OK, "K=%d oracle to_record", bits);
     exl3r4d_kx_to_record(plane + jb, rb, rows, cols, bits, got);
     CHECK(memcmp(want, got, (size_t)rec_n * 2) == 0, "K=%d kx to_record == oracle, %lldx%lld at col %lld of %lld",
           bits, (long long)rows, (long long)cols, (long long)j0, (long long)plane_cols);
     memcpy(back, plane, (size_t)(rows * rb));
-    for (int64_t i = 0; i < rows; ++i) memset(back + i * rb + jb, 0x5A, (size_t)(cols * bits / 8));
+    for (int64_t i = 0; i < rows; ++i) memset(back + i * rb + jb, 0x5A, (size_t)(exl3_sym_off(bits, cols) / 8));
     exl3r4d_kx_from_record(got, rows, cols, bits, back + jb, rb);
     CHECK(memcmp(back, plane, (size_t)(rows * rb)) == 0, "K=%d kx from_record inverts (and writes only the rectangle)",
           bits);
@@ -267,6 +267,73 @@ static void hooks(void) {
         CHECK(rc == RAD_E_INVAL, "K=%d %s relayout into a short buffer refused (rc %d)", K, op ? "gate_up" : "down", rc);
         free(src); free(back); free(st1); free(st2); free(want);
     }
+
+    /* half-integer K = 2.5 (exl3k2h): the [1x2] pair plane (rows x cols/2 u5) claimed as exl3r4d.trellis.k2h, 40 int16
+     * a tile; relayout -> unrelayout byte for byte on DeepSeek V4.1's expert shapes (EP: whole experts, one class) */
+    for (int op = 0; op < 2; ++op) {
+        const int K = EXL3R4D_BITS_H25;
+        RadEncoding ek;
+        CHECK(exl3_encoding_make(K, EXL3_CB_MUL1, op, &ek) == RAD_OK && ek.plane[0].dtype == RAD_U5 &&
+              ek.plane[0].block[1] == 2, "K=2.5 encoding: u5 [1x2] pair plane");
+        const int64_t R = op ? 4608 : 5120, C = op ? 5120 : 2304;
+        nP = 0;
+        P[nP++] = RAD_INT("M", 16);
+        P[nP++] = RAD_INT("N", R);
+        P[nP++] = RAD_INT("K", C);
+        P[nP++] = RAD_INT("n_expert", 96);
+        P[nP++] = RAD_INT("top_k", 6);
+        P[nP++] = RAD_STR("dtype", "exl3k2h");
+        P[nP++] = RAD_STR("codebook", "mul1");
+        P[nP++] = RAD_INT("h_rot", 0);
+        P[nP++] = RAD_INT("a_rot", 0);
+        const Exl3Positions* po = exl3_positions(op);
+        const int opd = po->plane[0][EXL3_P_CODES];
+        const int64_t rbk = exl3_codes_row_bytes(C, K);
+        const size_t pb = (size_t)(R * rbk), rec = (size_t)(R * C * 5 / 16);
+        CHECK(pb == rec, "K=2.5: the pair plane and the record are the same bytes (%zu, %zu)", pb, rec);
+        uint8_t* src = malloc(pb);
+        uint8_t* back = malloc(pb);
+        uint8_t* st1 = malloc(pb);
+        fill(src, pb);
+        RadTensor t = plane_t(RAD_U5, R, C / 2, src);
+        rc = exl3r4d_layout(op, P, nP, opd, &ek, &sel, &t, 1, &L);
+        CHECK(rc == RAD_OK && strcmp(L.tag, "exl3r4d.trellis.k2h") == 0 && L.bytes == (int64_t)rec &&
+              L.shape[0] == R && L.shape[1] == C, "K=2.5 %s codes claimed as exl3r4d.trellis.k2h (rc %d)",
+              op ? "gate_up" : "down", rc);
+        RadTensor wide = plane_t(RAD_U5, R, C, src);
+        CHECK(exl3r4d_layout(op, P, nP, opd, &ek, &sel, &wide, 1, &L) == RAD_E_SHAPE,
+              "K=2.5 codes handed as [rows, cols] u5 (not pairs): RAD_E_SHAPE");
+        RadTensor u4 = plane_t(RAD_U4, R, C / 2, src);
+        CHECK(exl3r4d_layout(op, P, nP, opd, &ek, &sel, &u4, 1, &L) == RAD_E_DTYPE, "K=2.5 handed a u4 plane: RAD_E_DTYPE");
+        rc = exl3r4d_relayout(op, P, nP, opd, &ek, &sel, &t, 1, st1, (int64_t)pb);
+        CHECK(rc == RAD_OK, "K=2.5 %s relayout (rc %d)", op ? "gate_up" : "down", rc);
+        const int64_t half = op ? R / 2 : R;
+        uint16_t* want = malloc((size_t)exl3_record_elems(half, C, K) * 2);
+        int ok = 1;
+        for (int m = 0; m < (op ? 2 : 1); ++m) {
+            exl3_codes_to_record(src + m * half * rbk, rbk, half, C, K, want);
+            ok &= memcmp(want, st1 + m * half * rbk, (size_t)(half * rbk)) == 0;
+        }
+        CHECK(ok, "K=2.5 %s stored form = the oracle's record%s", op ? "gate_up" : "down", op ? "s, gate then up" : "");
+        RadTensor b = plane_t(RAD_U5, R, C / 2, back);
+        memset(back, 0xEE, pb);
+        rc = exl3r4d_unrelayout(op, P, nP, opd, &ek, &sel, st1, (int64_t)pb, &b, 1);
+        CHECK(rc == RAD_OK && memcmp(back, src, pb) == 0, "K=2.5 %s unrelayout inverts (rc %d)", op ? "gate_up" : "down",
+              rc);
+        free(src); free(back); free(st1); free(want);
+    }
+    {   /* the dtype the op names and the weight's K must agree: an exl3k2 op handed a 2.5 weight, and the reverse */
+        RadEncoding e25, e2;
+        exl3_encoding_make(EXL3R4D_BITS_H25, EXL3_CB_MUL1, 0, &e25);
+        exl3_encoding_make(2, EXL3_CB_MUL1, 0, &e2);
+        params(16, 5120, 2304, 0, 0, "exl3k2", "mul1");
+        RadTensor t25 = plane_t(RAD_U5, 5120, 1152, 0), t2 = plane_t(RAD_U2, 5120, 2304, 0);
+        CHECK(exl3r4d_layout(0, P, nP, pd->plane[0][EXL3_P_CODES], &e25, &sel, &t25, 1, &L) == RAD_E_DTYPE,
+              "an exl3k2 op handed a K=2.5 weight: RAD_E_DTYPE");
+        params(16, 5120, 2304, 0, 0, "exl3k2h", "mul1");
+        CHECK(exl3r4d_layout(0, P, nP, pd->plane[0][EXL3_P_CODES], &e2, &sel, &t2, 1, &L) == RAD_E_DTYPE,
+              "an exl3k2h op handed a K=2 weight: RAD_E_DTYPE");
+    }
 }
 
 /* 4. relayout rate on the real gate_up shape */
@@ -301,6 +368,22 @@ static void rate(void) {
                (double)kb * (double)kn / t / 1e6, K);
         free(ks); free(kd);
     }
+    {   /* half-integer K = 2.5 on DeepSeek V4.1's gate_up half [2304, 5120] */
+        const int K = EXL3R4D_BITS_H25;
+        const int64_t R2 = 2304, C2 = 5120;
+        const size_t kb = (size_t)(R2 * C2 * 5 / 16);
+        uint8_t* ks = malloc(kb);
+        uint8_t* kd = malloc(kb);
+        fill(ks, kb);
+        const int64_t kn = 4;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        for (int64_t i = 0; i < kn; ++i) exl3r4d_kx_to_record(ks, exl3_codes_row_bytes(C2, K), R2, C2, K, (uint32_t*)kd);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        const double t = (double)(b.tv_sec - a.tv_sec) + 1e-9 * (double)(b.tv_nsec - a.tv_nsec);
+        printf("relayout rate: %.0f MB/s of codes, one thread (kx form, K=2.5, DeepSeek gate half 2304x5120)\n",
+               (double)kb * (double)kn / t / 1e6);
+        free(ks); free(kd);
+    }
 }
 
 int main(void) {
@@ -314,6 +397,15 @@ int main(void) {
         kx_vs_oracle(k, 640, 2560, 2560, 0);
         kx_vs_oracle(k, 2560, 256, 640, 384);
         kx_vs_oracle(k, 128, 128, 512, 256);
+    }
+    {   /* half-integer K = 2.5 (exllamav3 1.6): DeepSeek V4.1's expert shapes too */
+        const int k = EXL3R4D_BITS_H25;
+        kx_vs_oracle(k, 16, 16, 16, 0);
+        kx_vs_oracle(k, 640, 2560, 2560, 0);
+        kx_vs_oracle(k, 2560, 256, 640, 384);
+        kx_vs_oracle(k, 128, 128, 512, 256);
+        kx_vs_oracle(k, 2304, 5120, 5120, 0);   /* a DeepSeek gate (or up) half */
+        kx_vs_oracle(k, 5120, 2304, 2304, 0);   /* its down */
     }
     hooks();
     rate();

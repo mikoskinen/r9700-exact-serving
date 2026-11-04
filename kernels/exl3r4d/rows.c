@@ -10,7 +10,8 @@
  *   at declare, by the layout hook: an encoding that is not exl3 at K=4 mul1 (RAD_E_DTYPE), a selection or extent
  *     that is not the class's plane (RAD_E_SHAPE);
  *   at launch, by the adapter (launch.c): the same again plus every operand fact a constraint cannot express.
- * Half-integer K has no dtype string (exl3_encoding.h), so it never reaches a row; bias has no plane, likewise. */
+ * Half-integer K = 2.5 is exl3k2h (exl3_encoding.h; K = 1.5 and 3.5 have strings but no rows here, so they never reach
+ * this library); bias has no plane, likewise. */
 #include "exl3r4d.h"
 #include "exl3r4d_prefill.h"   /* P5: the M > 16 rows' hooks */
 
@@ -57,10 +58,12 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
             }
             int64_t r, cl;
             exl3_plane_extents(g.rows[c], g.cols[c], pl, &r, &cl);
-            const int64_t ext[3] = { exl3_class_entries(&g, c), r, cl };
+            const int64_t ext[3] = { exl3_class_entries(&g, c), r,
+                                     pl == EXL3_P_CODES ? exl3_codes_plane_cols(cl, g.bits) : cl };
             if (pl == EXL3_P_CODES) {
+                /* one symbol an element, or at half-integer K a pair symbol of 2 KA + 1 bits (exl3_encoding.h) */
                 desc(&v[k], exl3_codes_dtype(g.bits), 3, ext, RAD_FILL_INDEX);
-                v[k].idx_max = (int64_t)1 << g.bits;
+                v[k].idx_max = (int64_t)1 << (exl3_bits_half(g.bits) ? exl3_k2(g.bits) : g.bits);
             } else {
                 desc(&v[k], RAD_F16, 3, ext, RAD_FILL_NORMAL);
             }
@@ -247,7 +250,7 @@ EXL3R4D_HOOKS4(dn4, EXL3_DOWN4)
 /* R23: both bands and prep_gu at every K the device code is built for, codebook mul1 (the M > 16 rows' kernels are
  * templated on K: exl3r4d_prefill.hip). EXL3R4D_PREFILL_DTYPES "exl3k4" with launch.c's EXL3R4D_PF_ANY_K 0 puts the
  * M > 16 band back to K = 4 alone -- one switch each, so neither band is selected for a K its kernels refuse. */
-#define EXL3R4D_DECODE_DTYPES "exl3k2 exl3k3 exl3k4 exl3k5 exl3k6"
+#define EXL3R4D_DECODE_DTYPES "exl3k2 exl3k3 exl3k4 exl3k5 exl3k6 exl3k2h"   /* exl3k2h: K = 2.5 (exllamav3 1.6) */
 #ifndef EXL3R4D_PREFILL_DTYPES
 #define EXL3R4D_PREFILL_DTYPES EXL3R4D_DECODE_DTYPES
 #endif

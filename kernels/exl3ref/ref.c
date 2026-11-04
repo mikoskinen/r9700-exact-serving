@@ -65,6 +65,7 @@ static int check_table(const RadTensor* t, int p, int bits, int64_t rows, int64_
                        int64_t need) {
     int64_t pr, pc, numel = 1, acc = 1;
     exl3_plane_extents(rows, cols, p, &pr, &pc);
+    if (p == EXL3_P_CODES) pc = exl3_codes_plane_cols(pc, bits);   /* half-integer K: cols / 2 pair symbols */
     if (t->dtype != (p == EXL3_P_CODES ? exl3_codes_dtype(bits) : (uint32_t)RAD_F16))
         return RAD_E_DTYPE;
     if (t->rank < 2 || t->shape[0] < need) return RAD_E_SHAPE;
@@ -177,7 +178,7 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
     const Exl3View v = {
         .rows = R, .cols = C, .bits = g->bits, .codebook = g->codebook,
         .codes = entry(io->tab[c][EXL3_P_CODES], j),
-        .codes_row_bytes = rad_enc_row_bytes(exl3_codes_dtype(g->bits), C),
+        .codes_row_bytes = rad_enc_row_bytes(exl3_codes_dtype(g->bits), exl3_codes_plane_cols(C, g->bits)),
         .suh = suh, .suh1 = suh1, .svh = svh,
     };
     if (exl3_decode_what_rows(&v, 0, R, wk->what) != EXL3_OK) return RAD_E_SHAPE;

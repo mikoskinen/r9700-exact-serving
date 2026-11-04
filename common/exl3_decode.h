@@ -53,16 +53,52 @@
 extern "C" {
 #endif
 
-/* Bumped on any change to a declaration below; consumers check it at compile time. */
-#define EXL3_DECODE_API_VERSION 1
+/* Bumped on any change to a declaration below; consumers check it at compile time.
+ * 2: half-integer K (exllamav3 >= 1.6), carried as a TAGGED `bits` (below). */
+#define EXL3_DECODE_API_VERSION 2
 
 enum {
     EXL3_TILE     = 16,    /* a tile is 16 x 16 weights */
     EXL3_TILE_POS = 256,   /* positions a tile */
     EXL3_HAD      = 128,   /* rotation block; both feature counts are multiples of it */
-    EXL3_BITS_MIN = 1,     /* K, bits a weight, that the DECODER reads (exllamav3 1.4.4: 1..8) */
+    EXL3_BITS_MIN = 1,     /* integer K, bits a weight, that the DECODER reads (exllamav3 1.4.4: 1..8) */
     EXL3_BITS_MAX = 8
 };
+
+/* ------------------------------------------------------------------ half-integer K (exllamav3 >= 1.6)
+ *
+ * exllamav3 1.6 adds K = KA + 0.5 (1.5, 2.5, 3.5; mul1 codebook only): the tile's positions alternate KA and KA + 1
+ * bits, the ODD positions carrying the extra bit (exl3_lib/quantize.py frac_k: mask 0xAAAA), so a tile is a ring of
+ * 128 * (2 KA + 1) bits = 16 * K uint16 (40 at K = 2.5). Position p's symbol is stream bits [S(p - 1), S(p)) and its
+ * state the 16-bit window ending at S(p), circular in the ring, with S(p) = floor((p + 1) * K2 / 2) and K2 = 2 K --
+ * which is (p + 1) * K at integer K, so ONE formula covers both (exllamav3 frac.cu frac_s / frac_window).
+ *
+ * Everything here that takes `int bits` takes K TAGGED: an integer K is itself (1..8), a half-integer K is
+ * EXL3_HALF(KA) = 16 + 2 KA + 1 (1.5 -> 19, 2.5 -> 21, 3.5 -> 23). exl3_k2(bits) is 2 K either way.
+ *
+ * The canonical codes plane keeps the same rule along a row: element j (k = j) is bits [off(j), off(j + 1)) with
+ * off(j) = floor(j * K2 / 2), LSB-first. Positions 2m and 2m + 1 of a tile are adjacent k (tile rows r, r + 1, r even)
+ * in one n column, so in radiance's [n, k] view the even column holds KA bits and the odd column KA + 1: a row is
+ * cols / 2 PAIR symbols of 2 KA + 1 bits (value = even | odd << KA), which is exactly a TILED u(2KA+1) plane of block
+ * [1 x 2] (include/exl3_encoding.h). At integer K it is the uK [1 x 1] plane, bit for bit as before. */
+enum { EXL3_HALF_TAG = 16 };
+#define EXL3_HALF(ka) (EXL3_HALF_TAG + 2 * (ka) + 1)
+
+static inline int exl3_bits_half(int bits) {
+    return bits == EXL3_HALF(1) || bits == EXL3_HALF(2) || bits == EXL3_HALF(3);
+}
+static inline int exl3_bits_valid(int bits) {
+    return (bits >= EXL3_BITS_MIN && bits <= EXL3_BITS_MAX) || exl3_bits_half(bits);
+}
+/* 2 K: half-bit units (K = 2.5 -> 5). 0 for a `bits` that is not valid. */
+static inline int exl3_k2(int bits) {
+    return exl3_bits_half(bits) ? bits - EXL3_HALF_TAG : exl3_bits_valid(bits) ? 2 * bits : 0;
+}
+/* Bit offset of symbol j along a tile stream or a canonical row, and its width (K, or KA / KA + 1 by parity). */
+static inline int64_t exl3_sym_off(int bits, int64_t j) { return j * exl3_k2(bits) / 2; }
+static inline int exl3_sym_width(int bits, int64_t j) {
+    return (int)(exl3_sym_off(bits, j + 1) - exl3_sym_off(bits, j));
+}
 
 /* Codebooks, numbered as exllamav3 numbers them (cb template argument, codebook.cuh). */
 enum { EXL3_CB_3INST = 0, EXL3_CB_MCG = 1, EXL3_CB_MUL1 = 2 };
@@ -110,7 +146,7 @@ void exl3_pos_to_tile(int p, int* r, int* c);
 int  exl3_tile_to_pos(int r, int c);
 
 /* One tile's stream (16*K uint16, i.e. 8*K little-endian u32 words, MSB-first) -> its 256 symbols,
- * symbol p being stream bits [p*K, (p+1)*K) read MSB first. */
+ * symbol p being stream bits [off(p), off(p+1)) read MSB first (p*K .. (p+1)*K at integer K). */
 void exl3_tile_symbols(const uint16_t* tile, int bits, uint8_t sym[EXL3_TILE_POS]);
 /* The inverse: 256 symbols (low K bits used) -> the tile stream. Any symbols are a valid trellis. */
 void exl3_tile_pack(const uint8_t sym[EXL3_TILE_POS], int bits, uint16_t* tile);
@@ -118,18 +154,19 @@ void exl3_tile_pack(const uint8_t sym[EXL3_TILE_POS], int bits, uint16_t* tile);
  * bit, circular within the tile (tail-biting). */
 void exl3_tile_states(const uint8_t sym[EXL3_TILE_POS], int bits, uint16_t state[EXL3_TILE_POS]);
 
-/* A whole trellis tensor as exllamav3 stores it -- int16 [kt][nt][16*K], tile (tk, tn) at
+/* A whole trellis tensor as exllamav3 stores it -- int16 [kt][nt][16*K] (K2 = 2K: 8*K2), tile (tk, tn) at
  * (tk*nt + tn)*16*K -- to W_hat [16*kt][16*nt] as fp16 bits (exllamav3's [k, n] order: the golden's).
  * EXL3_E_ARG for bits or codebook out of range. */
 int exl3_trellis_decode(const uint16_t* trellis, int64_t kt, int64_t nt, int bits, int codebook,
                         uint16_t* w_hat);
 
 /* ------------------------------------------------------------------ the codes plane */
-/* Element (i, j) of a uK plane, rows `row_bytes` apart, LSB-first along the row. */
+/* Element (i, j) of a codes plane, rows `row_bytes` apart, LSB-first along the row: the K-bit symbol of column j
+ * (half-integer K: bits [off(j), off(j+1)), KA or KA + 1 wide by j's parity). */
 uint32_t exl3_codes_get(const uint8_t* codes, int64_t row_bytes, int bits, int64_t i, int64_t j);
 void     exl3_codes_set(uint8_t* codes, int64_t row_bytes, int bits, int64_t i, int64_t j,
                         uint32_t value);
-/* Bytes of one dense row of `cols` K-bit elements: ceil(cols*K/8). */
+/* Bytes of one dense row of `cols` symbols: ceil(off(cols)/8) = ceil(cols*K/8). */
 int64_t  exl3_codes_row_bytes(int64_t cols, int bits);
 
 /* ------------------------------------------------------------------ the rotation */

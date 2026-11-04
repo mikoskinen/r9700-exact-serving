@@ -51,6 +51,14 @@ struct Opts {
         p.push_back(r);
         return *this;
     }
+    Opts& f(const char* k, double v) {   /* bits is RAD_P_F64 since half-integer K (rad-convert types it so) */
+        RadParam r{};
+        r.key = k;
+        r.kind = RAD_P_F64;
+        r.dval = v;
+        p.push_back(r);
+        return *this;
+    }
     const RadParam* data() {   /* string pointers are fixed up last: `keep` may have reallocated */
         size_t j = 0;
         for (auto& r : p)
@@ -168,7 +176,7 @@ TEST(plugin_names_itself_and_its_options) {
     CHECK(Q->n_options == 3);
     CHECK(Q->decode != nullptr && Q->encoding && Q->quantize && Q->row_block);
     CHECK(std::strcmp(Q->options[0].key, "src") == 0 && Q->options[0].type == RAD_P_STR && !Q->options[0].deflt);
-    CHECK(std::strcmp(Q->options[1].key, "bits") == 0 && Q->options[1].type == RAD_P_INT && !Q->options[1].deflt);
+    CHECK(std::strcmp(Q->options[1].key, "bits") == 0 && Q->options[1].type == RAD_P_F64 && !Q->options[1].deflt);
     CHECK(std::strcmp(Q->options[2].key, "codebook") == 0 && Q->options[2].deflt &&
           std::strcmp(Q->options[2].deflt, "mul1") == 0);
 }
@@ -356,9 +364,55 @@ TEST(refuses_another_codebook_by_its_marker) {
     CHECK(both.status == RAD_E_FORMAT && has(both.said, "both the mul1 and the mcg marker"));
 }
 
-TEST(refuses_half_integer_k) {
+/* The fixture's half-integer defect is a trellis of last dimension 16 K + 8 at K = 4 (4.5, which exllamav3 does not
+ * make): read as the K it is and refused as any K the recipe does not name. */
+TEST(refuses_a_half_integer_k_the_recipe_does_not_name) {
     Result r = quantise(std_opts(defects_dir()), gu_name(0, 4), 2 * W, H);
-    CHECK(r.status == RAD_E_UNSUPPORTED && has(r.said, "half-integer K = 4.5"));
+    CHECK(r.status == RAD_E_DTYPE && has(r.said, "is K=4.5") && has(r.said, "bits=4"));
+}
+
+/* bits=2.5 (exllamav3 1.6's half-integer K): the [1x2] pair plane of 5-bit symbols, read back as K = 2.5; another
+ * half or a fraction that is not one, and a half-integer K in another codebook than mul1, are refused by name. */
+TEST(encoding_takes_a_half_integer_k) {
+    for (int ka = 1; ka <= 3; ++ka) {
+        Opts o;
+        o.s("src", exl3_dir()).f("bits", ka + 0.5).s("codebook", "mul1");
+        RadQuantWeight w = weight(gu_name(0, 0), 2 * W, H);
+        RadEncoding e{};
+        CHECK(Q->encoding(o.data(), o.n(), &w, &e) == RAD_OK);
+        CHECK(e.plane[0].dtype == exl3_codes_dtype(EXL3_HALF(ka)) && e.plane[0].block[0] == 1 &&
+              e.plane[0].block[1] == 2);
+        int bits = 0, cb = 0, st = 0;
+        CHECK(exl3_encoding_read(&e, &bits, &cb, &st) == RAD_OK && bits == EXL3_HALF(ka) && cb == EXL3_CB_MUL1 &&
+              st == 1);
+        CHECK(rad_enc_plane_bytes(&e.plane[0], 2 * W, H) == 2 * W * (H / 2) * (2 * ka + 1) / 8);
+    }
+    {
+        Opts o;
+        o.s("src", exl3_dir()).f("bits", 4.5).s("codebook", "mul1");
+        RadQuantWeight w = weight(gu_name(0, 0), 2 * W, H);
+        RadEncoding e{};
+        int st = 0;
+        const std::string said = captured([&] { st = Q->encoding(o.data(), o.n(), &w, &e); });
+        CHECK(st == RAD_E_INVAL && has(said, "neither a whole K"));
+    }
+    {
+        Opts o;
+        o.s("src", exl3_dir()).f("bits", 2.5).s("codebook", "mcg");
+        RadQuantWeight w = weight(gu_name(0, 0), 2 * W, H);
+        RadEncoding e{};
+        int st = 0;
+        const std::string said = captured([&] { st = Q->encoding(o.data(), o.n(), &w, &e); });
+        CHECK(st == RAD_E_INVAL && has(said, "mul1 only"));
+    }
+    {   /* integer K as F64 is the same encoding as RAD_P_INT gave */
+        Opts o;
+        o.s("src", exl3_dir()).f("bits", 4.0).s("codebook", "mul1");
+        RadQuantWeight w = weight(gu_name(0, 0), 2 * W, H);
+        RadEncoding a{}, b{};
+        CHECK(Q->encoding(o.data(), o.n(), &w, &a) == RAD_OK);
+        CHECK(exl3_encoding_make(4, EXL3_CB_MUL1, 1, &b) == RAD_OK && rad_enc_equal(&a, &b));
+    }
 }
 
 TEST(refuses_a_bias) {
@@ -470,7 +524,8 @@ int main(int argc, char** argv) {
     RUN(refuses_a_k_other_than_the_recipes);
     RUN(refuses_a_wrong_marker_value);
     RUN(refuses_another_codebook_by_its_marker);
-    RUN(refuses_half_integer_k);
+    RUN(refuses_a_half_integer_k_the_recipe_does_not_name);
+    RUN(encoding_takes_a_half_integer_k);
     RUN(refuses_a_bias);
     RUN(refuses_what_the_source_does_not_have);
     RUN(refuses_a_shape_that_disagrees_with_the_source);

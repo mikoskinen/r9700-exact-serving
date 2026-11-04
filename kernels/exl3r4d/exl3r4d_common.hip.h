@@ -300,10 +300,23 @@ static __device__ __forceinline__ unsigned codebook_pair(unsigned s0, unsigned s
   return __builtin_bit_cast(unsigned, r);
 }
 
+// Half-integer K (exllamav3 >= 1.6, common/exl3_decode.h): BITS is TAGGED -- an integer K is itself, K = KA + 0.5 is
+// EXL3_HALF(KA) = 16 + 2 KA + 1 (2.5 -> 21). Positions alternate KA and KA + 1 bits (odd positions the extra one), so
+// with K2 = 2 K every formula below is the integer one rewritten in half-bit units: a tile is 8 K = 4 K2 words, a run of
+// four positions from an even q0 ends at bit (q0 / 2 + 2) K2 = S(q0 + 3), and state q0 + i ends 2 K2 - floor((i + 1)
+// K2 / 2) bits below it -- 3K, 2K, K, 0 at integer K; 3KA + 2, 2KA + 1, KA + 1, 0 at half-integer K (exllamav3
+// exl3_dq.cuh dq8_half: w2 = w3 >> (KA + 1), w1 = w2 >> KA, w0 = w1 >> (KA + 1)).
+#define EXL3R4D_K25 21   // EXL3_HALF(2): the half-integer K this library is built for (exl3r4d.h EXL3R4D_BITS_H25)
+__host__ __device__ constexpr int exl3r4d_k2(int bits) { return bits > 16 ? bits - 16 : 2 * bits; }
+__host__ __device__ constexpr int exl3r4d_run_off(int bits, int i) {   // state q0 + i's end, bits below the run's end
+  return 2 * exl3r4d_k2(bits) - (i + 1) * exl3r4d_k2(bits) / 2;
+}
+
 template <int BITS>
 struct Plan {
-  static constexpr int WORDS = 8 * BITS;       // u32 per tile
-  static constexpr int NW = BITS == 7 ? 3 : 2;  // words a run of four positions touches
+  static constexpr int K2 = exl3r4d_k2(BITS);
+  static constexpr int WORDS = 4 * K2;         // u32 per tile (8 K)
+  static constexpr int NW = BITS == 7 ? 3 : 2;  // words a run of four positions touches (half-integer K: <= 27 bits, 2)
   int woff[2][NW];                             // word index in the tile, per run
   unsigned shift[2];                           // funnel shift that ends the run's bits at bit 0
 
@@ -312,7 +325,7 @@ struct Plan {
     const int base = 32 * (n & 7) + 4 * (n >> 3) + 16 * h;
 #pragma unroll
     for (int r = 0; r < 2; r++) {
-      const int e3 = (base + 8 * r + 4) * BITS;  // end bit of the run's last state
+      const int e3 = ((base + 8 * r) / 2 + 2) * K2;  // end bit of the run's last state: (q0 + 4) K at integer K
       const int de = (e3 - 1) >> 5;              // word holding that bit
       shift[r] = (unsigned)(32 * (de + 1) - e3);
 #pragma unroll
@@ -381,14 +394,14 @@ static __device__ __forceinline__ void decode_run(const unsigned (&w)[NW], unsig
     return;
   }
   unsigned mid = 0;
-  if constexpr (3 * BITS + 16 > 32) {
+  if constexpr (exl3r4d_run_off(BITS, 0) + 16 > 32) {  // 3 K + 16 > 32: integer K >= 6 (half-integer K never)
     const unsigned hi = NW == 3 ? __builtin_amdgcn_alignbit(w[0], w[1], s) : (w[0] >> s);
     mid = __builtin_amdgcn_alignbit(hi, lo, 16);  // bits 16..47 above e3 - 48
   }
   unsigned st[4];
 #pragma unroll
   for (int i = 0; i < 4; i++) {
-    const int off = (3 - i) * BITS;  // state i ends off bits below e3
+    const int off = exl3r4d_run_off(BITS, i);  // state i ends off bits below e3: (3 - i) K at integer K
     st[i] = off + 16 <= 32 ? __builtin_amdgcn_ubfe(lo, off, 16) : __builtin_amdgcn_ubfe(mid, off - 16, 16);
   }
   if constexpr (EXL3_HASH == 2 && EXL3R4D_KX_PAIR) {

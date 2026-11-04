@@ -12,7 +12,7 @@ static int shape_ok(int64_t rows, int64_t cols) {
 }
 
 int64_t exl3_record_elems(int64_t rows, int64_t cols, int bits) {
-    return (rows / EXL3_TILE) * (cols / EXL3_TILE) * 16 * bits;
+    return (rows / EXL3_TILE) * (cols / EXL3_TILE) * 8 * exl3_k2(bits);   /* 16 K uint16 a tile */
 }
 
 int exl3_codes_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows, int64_t cols,
@@ -22,7 +22,7 @@ int exl3_codes_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows, 
     const int64_t nt = rows / EXL3_TILE, kt = cols / EXL3_TILE;
     int64_t tk, tn;
     int p;
-    if (!codes || !record || bits < EXL3_BITS_MIN || bits > EXL3_BITS_MAX) return EXL3_E_ARG;
+    if (!codes || !record || !exl3_bits_valid(bits)) return EXL3_E_ARG;
     if (!shape_ok(rows, cols) || row_bytes < exl3_codes_row_bytes(cols, bits)) return EXL3_E_SHAPE;
     for (p = 0; p < EXL3_TILE_POS; ++p) exl3_pos_to_tile(p, &tr[p], &tc[p]);
     for (tk = 0; tk < kt; ++tk)
@@ -30,7 +30,7 @@ int exl3_codes_to_record(const uint8_t* codes, int64_t row_bytes, int64_t rows, 
             for (p = 0; p < EXL3_TILE_POS; ++p)
                 sym[p] = (uint8_t)exl3_codes_get(codes, row_bytes, bits, tn * EXL3_TILE + tc[p],
                                                  tk * EXL3_TILE + tr[p]);
-            exl3_tile_pack(sym, bits, record + (tk * nt + tn) * 16 * bits);
+            exl3_tile_pack(sym, bits, record + (tk * nt + tn) * 8 * exl3_k2(bits));
         }
     return EXL3_OK;
 }
@@ -42,12 +42,12 @@ int exl3_record_to_codes(const uint16_t* record, int64_t rows, int64_t cols, int
     const int64_t nt = rows / EXL3_TILE, kt = cols / EXL3_TILE;
     int64_t tk, tn;
     int p;
-    if (!codes || !record || bits < EXL3_BITS_MIN || bits > EXL3_BITS_MAX) return EXL3_E_ARG;
+    if (!codes || !record || !exl3_bits_valid(bits)) return EXL3_E_ARG;
     if (!shape_ok(rows, cols) || row_bytes < exl3_codes_row_bytes(cols, bits)) return EXL3_E_SHAPE;
     for (p = 0; p < EXL3_TILE_POS; ++p) exl3_pos_to_tile(p, &tr[p], &tc[p]);
     for (tk = 0; tk < kt; ++tk)
         for (tn = 0; tn < nt; ++tn) {
-            exl3_tile_symbols(record + (tk * nt + tn) * 16 * bits, bits, sym);
+            exl3_tile_symbols(record + (tk * nt + tn) * 8 * exl3_k2(bits), bits, sym);
             for (p = 0; p < EXL3_TILE_POS; ++p)
                 exl3_codes_set(codes, row_bytes, bits, tn * EXL3_TILE + tc[p],
                                tk * EXL3_TILE + tr[p], sym[p]);

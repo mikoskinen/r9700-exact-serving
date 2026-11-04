@@ -56,10 +56,12 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
             }
             int64_t r, cl;
             exl3_plane_extents(g.rows[c], g.cols[c], pl, &r, &cl);
-            const int64_t ext[3] = { exl3_class_entries(&g, c), r, cl };
+            const int64_t ext[3] = { exl3_class_entries(&g, c), r,
+                                     pl == EXL3_P_CODES ? exl3_codes_plane_cols(cl, g.bits) : cl };
             if (pl == EXL3_P_CODES) {
+                /* an element is one symbol (integer K) or a pair symbol of 2 KA + 1 bits (half-integer K) */
                 desc(&v[k], exl3_codes_dtype(g.bits), 3, ext, RAD_FILL_INDEX);
-                v[k].idx_max = (int64_t)1 << g.bits;
+                v[k].idx_max = (int64_t)1 << (exl3_bits_half(g.bits) ? exl3_k2(g.bits) : g.bits);
             } else {
                 desc(&v[k], RAD_F16, 3, ext, RAD_FILL_NORMAL);
             }
