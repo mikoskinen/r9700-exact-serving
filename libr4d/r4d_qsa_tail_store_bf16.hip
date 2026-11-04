@@ -64,16 +64,16 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
     const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
     uint16_t* __restrict__ state,
-    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
-    qsa_tail_store_kernel_body(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld);
+    int T, int n, int ring, int seqs, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    qsa_tail_store_kernel_body(k, pos, cu, sidx, state, T, n, ring, seqs, k_ld, s_slot, s_row, sidx_ld);
 }
 __global__ __launch_bounds__(kThreads) void r4dchain_qsa_tail_store(
     const uint16_t* __restrict__ k, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
     uint16_t* __restrict__ state,
-    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    int T, int n, int ring, int seqs, int k_ld, int s_slot, int s_row, int sidx_ld) {
     r4d_chain_wait();
-    qsa_tail_store_kernel_body(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld);
+    qsa_tail_store_kernel_body(k, pos, cu, sidx, state, T, n, ring, seqs, k_ld, s_slot, s_row, sidx_ld);
     r4d_chain_done();
 }
 
