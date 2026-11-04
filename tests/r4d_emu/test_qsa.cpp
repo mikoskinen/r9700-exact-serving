@@ -267,8 +267,12 @@ int run(Fix& f, Form form) {
                        : "qsa_select_kernel";
     const char* fn = kFormName[form];
     if (rc != RAD_OK) { std::printf("FAIL %-48s %-6s launch returned %d\n", f.name.c_str(), fn, rc); return 1; }
-    /* The launch site names the template, `kernel<Signed>`: the name is what precedes it. */
-    const std::string ran(emu_last_kernel, std::strcspn(emu_last_kernel, "<"));
+    /* The launch site names the template, `kernel<Signed>`: the name is what precedes it. A site
+     * that picks its plain or chained form (`g_r4d_chain_arg ? &r4dchain_x<S> : &x<S>`, PR #396)
+     * names the plain form after the colon; the emulator never sets the chain argument. */
+    const char* nm = emu_last_kernel;
+    if (const char* c = std::strrchr(nm, ':')) { nm = c + 1; while (*nm == ' ' || *nm == '&') ++nm; }
+    const std::string ran(nm, std::strcspn(nm, "<"));
     if (ran != expect || grids != (split ? 2 : 1)) {
         std::printf("FAIL %-48s %-6s ran %s in %d grid(s), expected %s in %d\n", f.name.c_str(), fn,
                     emu_last_kernel, grids, expect, split ? 2 : 1);
