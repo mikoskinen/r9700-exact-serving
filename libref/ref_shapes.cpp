@@ -797,6 +797,24 @@ int ref_router_sigmoid_topk_shape(const RadParam* p, int n_p, int operand, RadOp
     o.t(D, { M, k });
     return o.finish("router_sigmoid_topk", operand, out);
 }
+int ref_swiglu_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_silu_mul_shape(p, n_p, operand, out);
+}
+int ref_router_sigmoid_group_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), ne = gi(p, n_p, "n_expert", 0),
+                  k = gi(p, n_p, "top_k", 0), ng = gi(p, n_p, "n_group", 0),
+                  kg = gi(p, n_p, "topk_group", 0);
+    if (M < 1 || ne < 1 || ne > 512 || k < 1 || ng < 1 || ne % ng || ne / ng < 2 || kg < 1 ||
+        kg > ng || k > kg * (ne / ng))
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, ne });
+    o.t(RAD_F32, { ne });
+    o.t_idx({ M, k }, ne, -1, 0);
+    o.t(D, { M, k });
+    return o.finish("router_sigmoid_group_topk", operand, out);
+}
 int ref_router_scored_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), ne = gi(p, n_p, "n_expert", 0),
                   k = gi(p, n_p, "top_k", 0);
@@ -875,6 +893,28 @@ int ref_mla_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t_idx({ M }, 0, B * bs, 0);
     o.t(dtype, { M, H, D });
     return o.finish("mla_attn", operand, out);
+}
+/* One sequence whose context is its query (a prefill chunk), as attn_paged describes itself; a
+ * harness passes `ctx` for a deeper history. */
+int ref_mla_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), L = gi(p, n_p, "latent_dim", 0),
+                  R = gi(p, n_p, "rope_dim", 0), H = gi(p, n_p, "heads", 0),
+                  bs = gi(p, n_p, "block_size", 0);
+    if (M < 1 || L < 1 || L > 2048 || R < 1 || H < 1 || bs < 1) return RAD_E_UNSUPPORTED;
+    int64_t ctx = gi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const uint32_t dtype = act_dt(p, n_p);
+    Opd o;
+    o.t(dtype, { M, H, L });                          /* q */
+    o.t(dtype, { M, H, R });                          /* q_rope */
+    o.t(dtype, { blocks, 1, bs, L + R });             /* kv */
+    o.t_idx({ 1, blocks }, blocks, -1, 0);            /* block_table */
+    o.t_idx({ 1 }, 0, ctx, 0);                        /* seqused */
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU); /* cu_seqlens: [0, M], one sequence */
+    o.skip();                                         /* gate */
+    o.t(dtype, { M, H, L });                          /* out */
+    return o.finish("mla_attn_paged", operand, out);
 }
 int ref_silu_mul_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
@@ -1400,7 +1440,8 @@ int ref_lora_expand_mm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
  * The block count and context length are this description's choice; any cache large enough for
  * the indices will do. */
 
-int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+static int ref_attn_paged_shape_impl(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
+                                     const char* op_name) {
     /* `q_len` is the ranged parameter, a query length (one row at decode, thousands in a prefill
      * chunk; different kernels, docs/OPS.md). */
     const int64_t M   = gi(p, n_p, "q_len", 0);
@@ -1439,7 +1480,15 @@ int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
      * would have to agree with a tool's `M` rather than this description's. */
     o.skip();                                        /* cu_seqlens */
     o.t(Q,  { S * M, nh, hd });                      /* out */
-    return o.finish("attn_paged", operand, out);
+    return o.finish(op_name, operand, out);
+}
+
+int ref_attn_paged_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_attn_paged_shape_impl(p, n_p, operand, out, "attn_paged");
+}
+
+int ref_attn_paged_anchor_window_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_attn_paged_shape_impl(p, n_p, operand, out, "attn_paged_anchor_window");
 }
 
 /* attn_paged's operands and its tree's parents, each row an ordinary causal one (-2): a drawn
@@ -2430,6 +2479,36 @@ int ref_dflash_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     o.t((uint32_t)RAD_BF16, { nv, R });                      /* succ */
     o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);  /* tokens */
     return o.finish("dflash_select", operand, out);
+}
+
+/* The full-vocabulary DSpark Markov walk. Its tile planes hold one exact local max per 64 ids. */
+static int ref_markov_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
+                            uint32_t logits_dtype, const char* op) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    const int64_t steps = gi(p, n_p, "steps", 0);
+    const int64_t R = gi(p, n_p, "rank", 0);
+    const int64_t nv = gi(p, n_p, "n_vocab", 0);
+    const int64_t astr = gi(p, n_p, "anchor_stride", 1);
+    if (M <= 0 || steps <= 0 || R <= 0 || nv <= 0 || astr <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t rows = M * steps;
+    const int64_t tiles = (nv + 63) / 64;
+    Opd o;
+    o.t(logits_dtype, { rows, nv });                                 /* logits */
+    o.t_idx_dt((uint32_t)RAD_I32, { M * astr }, nv, -1, 0);        /* anchor */
+    o.t((uint32_t)RAD_BF16, { nv, R });                            /* pred */
+    o.t((uint32_t)RAD_BF16, { nv, R });                            /* succ */
+    o.t((uint32_t)RAD_F32, { M, tiles });                           /* tile_scores */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, tiles }, nv, -1, 0);        /* tile_tokens */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);        /* tokens */
+    return o.finish(op, operand, out);
+}
+
+int ref_dflash_markov_greedy_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_markov_shape(p, n_p, operand, out, RAD_BF16, "dflash_markov_greedy");
+}
+int ref_dflash_markov_greedy_f32_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return ref_markov_shape(p, n_p, operand, out, RAD_F32, "dflash_markov_greedy_f32");
 }
 
 /* dflash_select's operands, then `nodes` tokens and parents a sequence. */

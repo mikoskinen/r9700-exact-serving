@@ -173,6 +173,10 @@ static const RadParamSpec pMlaAttn[] = { P_INT("M"), P_INT("latent_dim"), P_INT(
 static const RadParamSpec pMlaProject[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
     P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
 static const RadOperandSpec oMlaAttn[] = { OPD("q"), OPD("kv"), OPD("bt"), OPD("length"), OUT("out") };
+static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+    P_INT("rope_dim"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oMlaAttnPaged[] = { OPD("q"), OPD_O("q_rope"), OPD("kv"),
+    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), OPD_O("gate"), OUT("out") };
 static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
     P_INT("blocks"), P_INT("seqs"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
@@ -184,6 +188,8 @@ static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_
 static const RadOperandSpec oRouterSigmoid[] = { OPD("logits"), WGT("bias"), OUT("ids"), OUT("weights") };
 static const RadParamSpec pRouterScored[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
     P_INT("norm"), P_F64("route_scale"), P_STR("score"), P_STR("dtype") };
+static const RadParamSpec pRouterSigmoidGroup[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("n_group"), P_INT("topk_group"), P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
 static const RadParamSpec pMnD[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `div` divides the rounded sum, rounded again (default 1, the plain sum): a mean of branches
  * summed pairwise, as a vocoder averages its residual blocks. */
@@ -297,9 +303,15 @@ static const RadOperandSpec oGemmQGated[] = { OPD("a"), OPD("a_scale"), WGT("b")
 static const RadParamSpec pDflashSelect[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                               P_INT("rank"), P_INT("n_vocab"),
                                               P_INTO("anchor_stride"), P_STR("dtype") };
+static const RadParamSpec pDflashMarkov[] = { P_INT("M"), P_INT("steps"), P_INT("rank"),
+                                              P_INT("n_vocab"), P_INTO("anchor_stride"),
+                                              P_STR("dtype") };
 static const RadOperandSpec oDflashSelect[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                                 OPD("anchor"), WGT("pred"), WGT("succ"),
                                                 OUT("tokens") };
+static const RadOperandSpec oDflashMarkov[] = { OPD("logits"), OPD("anchor"), WGT("pred"),
+                                                WGT("succ"), OUT("tile_scores"),
+                                                OUT("tile_tokens"), OUT("tokens") };
 static const RadParamSpec pDflashTree[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                             P_INT("rank"), P_INT("n_vocab"),
                                             P_INTO("anchor_stride"), P_INT("nodes"),
@@ -1302,6 +1314,10 @@ static const RadOpSchema kSchemas[] = {
   "rounding." },
 { "mla_attn", ARR(pMlaAttn), ARR(oMlaAttn),
   "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths." },
+{ "mla_attn_paged", ARR(pMlaAttnPaged), ARR(oMlaAttnPaged),
+  "Dense causal latent attention over a paged cache whose token row is the latent then the rotated "
+  "key part: score = scale * (q . latent + q_rope . rope), value = the latent; sequences as in "
+  "attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))." },
 { "mla_project", ARR(pMlaProject), ARR(oGemm),
   "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
 { "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
@@ -1310,6 +1326,8 @@ static const RadOpSchema kSchemas[] = {
   "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
 { "dsa_pool", ARR(pDsaPool), ARR(oDsaPool),
   "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8." },
+{ "swiglu_step", ARR(pSwigluClamped), ARR(oGateUp),
+  "min(silu(gate),limit)*clamp(up,-limit,limit); gate is the first half." },
 { "swiglu_clamped", ARR(pSwigluClamped), ARR(oGateUp),
   "silu(min(gate,limit))*clamp(up,-limit,limit); gate is the first half." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
@@ -1426,6 +1444,12 @@ static const RadOpSchema kSchemas[] = {
   "previous pick. `hp` absent is a plane of ones, which drops the form to a plain low-rank "
   "bigram. Serial in l by construction -- the predecessor is not known until the previous step "
   "has been decided." },
+{ "dflash_markov_greedy", ARR(pDflashMarkov), ARR(oDflashMarkov),
+  "The DSpark reference walk: score all vocabulary ids at each position as draft_logit[token] + "
+  "sum_r pred[previous_token][r] * succ[token][r], select the greatest score (lower id breaks "
+  "ties), then use that token as the next predecessor." },
+{ "dflash_markov_greedy_f32", ARR(pDflashMarkov), ARR(oDflashMarkov),
+  "Full-vocabulary greedy Markov walk with F32 base logits and BF16 codebooks." },
 { "dflash_tree", ARR(pDflashTree), ARR(oDflashTree),
   "dflash_select's lattice and edge scores grown best-first into a tree of `nodes` nodes: node 0 "
   "is the anchor, each selected node's children are the valid candidates at the next position "
@@ -1517,6 +1541,11 @@ static const RadOpSchema kSchemas[] = {
   "one kernel serves decode, speculative verify and prefill. seqused is the TOTAL key count "
   "including this step's query rows. k_descale / v_descale are optional and apply to an fp8 "
   "cache. `scale` is not in docs/OPS.md and defaults to 1/sqrt(head_dim)." },
+{ "attn_paged_anchor_window", ARR(pAttnPaged), ARR(oAttnPaged),
+  "Paged attention with one shared window anchor at the first query position in each sequence. "
+  "Every row uses anchor - key < window as its lower-bound predicate; causal attention also masks "
+  "keys after the anchor. This operation has a distinct name because ordinary attn_paged measures "
+  "visibility from each query row." },
 { "attn_paged_tree", ARR(pAttnPaged), ARR(oAttnPagedTree),
   "attn_paged over a tree verify (rad_drafter_tree): spec_parent[row] is -2 for an ordinary "
   "causal row, else the row's parent's index within its sequence's rows (-1 for the block's "
@@ -1687,6 +1716,9 @@ static const RadOpSchema kSchemas[] = {
   "when rows == n. `act` is \"sigmoid\" or \"none\", and it applies to the SCALAR. With `add` "
   "present the form is y = bf16(x * act(s)) + add -- the product NARROWED before the sum, which "
   "is what makes the fused form bit-identical to the pair it replaces." },
+{ "router_sigmoid_group_topk", ARR(pRouterSigmoidGroup), ARR(oRouterSigmoid),
+  "Group-limited sigmoid routing: groups rank by the sum of their two best p + bias, selection "
+  "runs over the topk_group best groups; correction bias selects, original scores weight." },
 { "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
   "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
 { "router_scored_topk", ARR(pRouterScored), ARR(oRouterSigmoid),
@@ -2429,6 +2461,10 @@ SIMPLE("ref_dsa_query", "dsa_query", "attn", "normalized FP8 index queries", DT_
        ref_dsa_query),
 SIMPLE("ref_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FLOAT,
        ref_gemm_nt_f32),
+SIMPLE("ref_mla_attn_paged", "mla_attn_paged", "attn", "dense paged latent attention with a rotary part",
+       DT_FLOAT, ref_mla_attn_paged),
+SIMPLE("ref_swiglu_step", "swiglu_step", "elem", "SwiGLU clipped after the SiLU", DT_FLOAT,
+       ref_swiglu_step),
 SIMPLE("ref_mla_project", "mla_project", "attn", "absorbed MLA projections", DT_FLOAT,
        ref_mla_project),
 SIMPLE("ref_swiglu_clamped", "swiglu_clamped", "elem", "asymmetrically clipped SwiGLU", DT_FLOAT,
@@ -2521,6 +2557,14 @@ SIMPLE("ref_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
 SIMPLE("ref_dflash_select", "dflash_select", "draft",
        "DFlash2's greedy walk over the candidate lattice",
        "i32 candidates, bf16 codebooks, i32 tokens out", ref_dflash_select),
+SIMPLE("ref_dflash_markov_greedy", "dflash_markov_greedy", "draft",
+       "DSpark's full-vocabulary greedy Markov walk",
+       "bf16 logits and codebooks, f32/i32 tile winners, i32 tokens out",
+       ref_dflash_markov_greedy),
+SIMPLE("ref_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
+       "Full-vocabulary greedy Markov walk with F32 base logits",
+       "f32 logits, bf16 codebooks, f32/i32 tile winners, i32 tokens out",
+       ref_dflash_markov_greedy_f32),
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),
@@ -2581,6 +2625,11 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_attn_paged, nullptr),
+ROW("ref_attn_paged_anchor_window", "attn_paged_anchor_window", "attn",
+    "paged attention with an exact shared anchor-aligned sliding window",
+    "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
+    nullptr, nullptr, ref_attn_paged_anchor_window, nullptr),
 ROW("ref_attn_paged_tree", "attn_paged_tree", "attn",
     "paged causal / sliding-window attention with a tree verify block (spec_parent)",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; i32 parents",
@@ -2613,6 +2662,8 @@ SIMPLE("ref_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary
 
 SIMPLE("ref_scale_rows", "scale_rows", "elem", "one scalar per row, broadcast across the row",
        DT_FLOAT, ref_scale_rows),
+SIMPLE("ref_router_sigmoid_group_topk", "router_sigmoid_group_topk", "moe",
+       "group-limited sigmoid correction-bias routing", DT_FLOAT, ref_router_sigmoid_group_topk),
 SIMPLE("ref_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
        ref_router_sigmoid_topk),
 SIMPLE("ref_router_scored_topk", "router_scored_topk", "moe", "correction-bias routing over named scores", DT_FLOAT,

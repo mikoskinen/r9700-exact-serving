@@ -74,7 +74,9 @@ int         avx_par_force(int threads);
     X(layernorm)            X(mhc_pre)              X(mhc_post)             X(mhc_contract)       \
     X(kda_update)           X(mhc_pre_partial)      X(mhc_pre_finish)                             \
     X(swiglu_clamped)                                                                             \
+    X(swiglu_step)                                                                                \
     X(router_sigmoid_topk)                                                                        \
+    X(router_sigmoid_group_topk)                                                                  \
     X(dsa_pool)                                                                                   \
     X(dsa_query)                                                                                  \
     X(gemm_nt_f32)                                                                                \
@@ -92,6 +94,7 @@ int         avx_par_force(int threads);
     X(gemm_nt_ggml)                                                                               \
     X(moe_gemm_ggml)                                                                              \
     X(logits_gemm_ggml)     X(embed_lookup_ggml)                                          \
+    X(mla_attn_paged)                                                                             \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \

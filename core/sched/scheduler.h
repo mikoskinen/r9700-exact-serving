@@ -19,6 +19,9 @@
 #include "ngram.h"
 
 #include <chrono>
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+#include <functional>
+#endif
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -42,6 +45,9 @@ struct SchedReq {
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
     int64_t  first_tok_us = 0;   /* 0 until the first output token: this request's TTFT */
+    int64_t  admitted_us = 0;    /* 0 until the first admission: where the queue ends, so a
+                                  * prefill rate can divide by the prefill alone. ttft covers
+                                  * the wait for admission (GUIDE); this excludes it. */
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
 
@@ -274,6 +280,7 @@ public:
         int32_t  slot = -1;
         double   age_s = 0;
         double   ttft_s = -1;          /* negative until the first token */
+        double   prefill_s = -1;       /* first token minus admission; negative until both */
         double   decode_tps = 0;       /* this request's own, since its first token */
     };
     /* Oldest first, since the oldest is the one most likely stuck. Returns how many were
@@ -491,6 +498,13 @@ public:
     int64_t chunk_end(const Request& r, int64_t n_target) const;
 
 private:
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    friend class Engine;
+    /* Test-build-only observer at the concrete rollback operation. */
+    void set_kv_rollback_test_hook(std::function<void(uint64_t, int, int, int64_t, bool)> hook) {
+        kv_rollback_test_hook_ = std::move(hook);
+    }
+#endif
     Program*      prog_ = nullptr;
     Config        cfg_{};
     ChunkGeometry geo_{};
@@ -508,6 +522,9 @@ private:
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
     IKVManager*   kv_ = nullptr;
+#ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
+    std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;
+#endif
     IPrefixCache* pc_ = nullptr;
 
     /* Does a prefix-cache hit leave a hole in a block drafter's own KV? Only if some paged group

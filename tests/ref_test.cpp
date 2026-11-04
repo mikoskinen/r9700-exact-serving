@@ -1572,6 +1572,88 @@ TEST(swiglu_clamping_is_asymmetric_and_precedes_the_activation) {
     CHECK_EQ(run("swiglu_clamped", bad), RAD_E_SHAPE);
 }
 
+TEST(swiglu_step_clips_the_activation_not_the_gate) {
+    T gu(RAD_F32, { 1, 8 }), y(RAD_F32, { 1, 4 });
+    gu.f({ -20, 2, 4.02f, 20, 9, 9, 9, -9 });
+    A a;
+    a.t(gu).t(y).i("M", 9).i("n", 4).d("limit", 4).s("dtype", "f32");
+    REQUIRE_EQ(run("swiglu_step", a), RAD_OK);
+    auto silu = [](float g) { return g / (1 + std::exp(-g)); };
+    CHECK_NEAR(y.at(0), silu(-20) * 4, 1e-6);   // a negative activation is not clipped
+    CHECK_NEAR(y.at(1), silu(2) * 4, 1e-5);
+    CHECK_NEAR(y.at(2), silu(4.02f) * 4, 1e-5); // silu(4.02) is under 4: unclipped
+    CHECK_EQ(y.at(3), -16.0f);                  // silu(20) clips to exactly 4, up to -4
+    T gc(RAD_F32, { 1, 4 });
+    A c;
+    c.t(gu).t(gc).i("M", 9).i("n", 4).d("limit", 4).s("dtype", "f32");
+    REQUIRE_EQ(run("swiglu_clamped", c), RAD_OK);
+    CHECK(gc.at(3) > y.at(3));                  // the gate-first form stops at silu(4) * -4
+}
+
+TEST(group_router_selects_only_inside_the_best_groups) {
+    T lg(RAD_F32, { 1, 8 }), bias(RAD_F32, { 8 }), ids(RAD_I32, { 1, 2 }), w(RAD_F32, { 1, 2 });
+    auto logit = [](float p) { return std::log(p / (1 - p)); };
+    // Group sums of the top two: 1.0, 1.5, 0.86, 1.2 -> groups 1 and 3 are kept, so the single
+    // best experts (0 at 0.9, 4 at 0.85) are out and 2 and 3 are chosen.
+    lg.f({ logit(0.9f), logit(0.1f), logit(0.8f), logit(0.7f), logit(0.85f), logit(0.01f),
+           logit(0.6f), logit(0.6f) });
+    bias.f({ 0, 0, 0, 0, 0, 0, 0, 0 });
+    A a;
+    a.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", 8).i("top_k", 2).i("n_group", 4)
+        .i("topk_group", 2).i("norm", 1).d("route_scale", 2.5).s("dtype", "f32");
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK_EQ(ids.at(0), 2);
+    CHECK_EQ(ids.at(1), 3);
+    CHECK_NEAR(w.at(0), 2.5 * 0.8 / 1.5, 1e-5);
+    CHECK_NEAR(w.at(1), 2.5 * 0.7 / 1.5, 1e-5);
+    // The bias ranks groups and experts and never weights them.
+    bias.f({ 0, 0, 0, 0, 0, 0, 1, 0 });
+    REQUIRE_EQ(run("router_sigmoid_group_topk", a), RAD_OK);
+    CHECK_EQ(ids.at(0), 6);
+    CHECK_EQ(ids.at(1), 2);
+    CHECK_NEAR(w.at(0), 2.5 * 0.6 / 1.4, 1e-5);
+    A bad;
+    bad.t(lg).t(bias).t(ids).t(w).i("M", 1).i("n_expert", 8).i("top_k", 2).i("n_group", 3)
+        .i("topk_group", 2).i("norm", 1).d("route_scale", 2.5).s("dtype", "f32");
+    CHECK_EQ(run("router_sigmoid_group_topk", bad), RAD_E_SHAPE);
+}
+
+TEST(paged_latent_attention_is_causal_adds_the_rotary_part_and_gates_per_head) {
+    // One sequence of three tokens, the last two queried (positions 1 and 2). Token 0 and 1 sit
+    // in page 1, token 2 in page 0; a row is the latent (2) then the rotary part (2).
+    T q(RAD_F32, { 2, 1, 2 }), qr(RAD_F32, { 2, 1, 2 }), kv(RAD_F32, { 2, 1, 2, 4 });
+    T bt(RAD_I32, { 1, 2 }), su(RAD_I32, { 1 }), cu(RAD_I32, { 2 }), out(RAD_F32, { 2, 1, 2 });
+    q.f({ 0, 0, 0, 0 });
+    qr.f({ 0, 0, 0, 0 });
+    kv.f({ 5, 6, 0, 0, 77, 77, 77, 77, 1, 2, 1, 0, 3, 4, 0, 0 });
+    bt.n({ 1, 0 });
+    su.n({ 3 });
+    cu.n({ 0, 2 });
+    A a;
+    a.t(q).t(qr).t(kv).t(bt).t(su).t(cu).tnull().t(out).i("M", 9).i("heads", 1)
+        .i("latent_dim", 2).i("rope_dim", 2).i("block_size", 2).d("scale", 1).s("dtype", "f32");
+    REQUIRE_EQ(run("mla_attn_paged", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 2, 1e-6);   // position 1 sees tokens 0 and 1
+    CHECK_NEAR(out.at(1), 3, 1e-6);
+    CHECK_NEAR(out.at(2), 3, 1e-6);   // position 2 sees all three
+    CHECK_NEAR(out.at(3), 4, 1e-6);
+    // The rotary part alone scores token 0 at ln 3 and token 1 at 0: weights 3/4 and 1/4.
+    qr.f({ std::log(3.0f), 0, 0, 0 });
+    REQUIRE_EQ(run("mla_attn_paged", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 1.5, 1e-6);
+    CHECK_NEAR(out.at(1), 2.5, 1e-6);
+    // A gate logit of 0 halves the head.
+    T gate(RAD_F32, { 2, 1 });
+    gate.f({ 0, 0 });
+    A g;
+    g.t(q).t(qr).t(kv).t(bt).t(su).t(cu).t(gate).t(out).i("M", 9).i("heads", 1)
+        .i("latent_dim", 2).i("rope_dim", 2).i("block_size", 2).d("scale", 1).s("dtype", "f32");
+    REQUIRE_EQ(run("mla_attn_paged", g), RAD_OK);
+    CHECK_NEAR(out.at(0), 0.75, 1e-6);
+    CHECK_NEAR(out.at(1), 1.25, 1e-6);
+    CHECK_NEAR(out.at(2), 1.5, 1e-6);
+}
+
 TEST(sigmoid_router_uses_correction_only_for_selection_and_stable_ties) {
     T lg(RAD_F32, { 1, 4 }), bias(RAD_F32, { 4 }), ids(RAD_I32, { 1, 2 }), w(RAD_F32, { 1, 2 });
     lg.f({ -std::log(3.0f), std::log(3.0f), 0, 0 });
@@ -1707,6 +1789,8 @@ TEST(op_vocabulary) {
         "mtp_enter",
         "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract",
         "mhc_mix", "mhc_collapse", "swiglu_clamped", "router_sigmoid_topk", "router_scored_topk", "rope_rows", "quant_roundtrip", "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk", "entry_store", "token_map", "stream_gate_add", "gemm_nt_ggml", "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml", "embed_lookup_planes", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "swiglu_step", "router_sigmoid_group_topk", "mla_attn_paged",
         "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "seg_softmax_pool",
@@ -1726,8 +1810,9 @@ TEST(op_vocabulary) {
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
         "rmsnorm_quant_fp8", "gated_quant_fp8", "gemm_nt_q_gated", "dflash_select",
+        "dflash_markov_greedy", "dflash_markov_greedy_f32",
         /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
-        "dflash_tree", "attn_paged_tree",
+        "dflash_tree", "attn_paged_tree", "attn_paged_anchor_window",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
         "dequant",
@@ -1823,7 +1908,7 @@ TEST(op_vocabulary) {
     CHECK_EQ(kern("gdn_chunk_scan")->n_constraints, 0);
     int constrained = 0;
     for (int i = 0; i < api().kernel_count(); ++i) constrained += api().kernel_at(i)->n_constraints > 0;
-    CHECK_EQ(constrained, 3);
+    CHECK_EQ(constrained, 4);
 }
 
 /* ================================================================== the numerics
@@ -3895,6 +3980,43 @@ TEST(op_attn_paged_ragged) {
  * right after a one-token prompt is (core/sched/advance_impl.h ADV_HIST ends the context at the
  * last committed position). Rows sit at seqused - q_len + j = -2, -1, 0, 1: the first two see no
  * key and are zero, not NaN, and the last two are as if the run were two rows. */
+TEST(op_attn_paged_anchor_window_is_exact_at_512_history_and_shared_across_rows) {
+    constexpr int qlen = 7, ctx = 520, bs = 16, seqs = 2, window = 513;
+    const int blocks = (ctx + bs - 1) / bs;
+    T q(RAD_F32, {seqs * qlen, 1, 1});
+    T kv(RAD_F32, {seqs * blocks, 1, bs, 2});
+    for (int s = 0; s < seqs; ++s) {
+        const int slot_base = s * blocks * bs;
+        const float before = s == 0 ? 500.0f : 700.0f;  /* anchor - 513: masked */
+        const float edge = s == 0 ? 10.0f : 20.0f;       /* anchor - 512: visible */
+        const float future = s == 0 ? 1000.0f : 2000.0f;
+        st_dt(RAD_F32, kv.t.data, (int64_t)(slot_base + 0) * 2 + 1, before);
+        st_dt(RAD_F32, kv.t.data, (int64_t)(slot_base + 1) * 2 + 1, edge);
+        st_dt(RAD_F32, kv.t.data, (int64_t)(slot_base + ctx - 1) * 2 + 1, future);
+    }
+    T bt(RAD_I32, {seqs, blocks});
+    std::vector<int64_t> block_ids(seqs * blocks);
+    for (int s = 0; s < seqs; ++s)
+        for (int b = 0; b < blocks; ++b) block_ids[s * blocks + b] = s * blocks + b;
+    bt.n(block_ids);
+    T su(RAD_I32, {seqs}); su.n({ctx, ctx});
+    T cu(RAD_I32, {seqs + 1}); cu.n({0, qlen, 2 * qlen});
+    T out(RAD_F32, {seqs * qlen, 1, 1});
+    for (int causal : {0, 1}) {
+        A a; a.t(q).t(kv).t(bt).t(su).tnull().tnull().t(cu).t(out)
+              .i("q_len", qlen).i("head_dim", 1).i("gqa", 1).i("block_size", bs)
+              .i("causal", causal).i("window", window).s("q_dtype", "f32").s("kv_dtype", "f32");
+        CHECK_OK(run("attn_paged_anchor_window", a));
+        const float denom = causal ? 513.0f : 519.0f;
+        const float expected0 = causal ? 10.0f / denom : 1010.0f / denom;
+        const float expected1 = causal ? 20.0f / denom : 2020.0f / denom;
+        for (int i = 0; i < qlen; ++i) {
+            CHECK_NEAR(out.at(i), expected0, 1e-6);
+            CHECK_NEAR(out.at(qlen + i), expected1, 1e-6);
+        }
+    }
+}
+
 TEST(op_attn_paged_rows_before_the_context) {
     const float sc = 1.0f / 1.41421356f;
     T q(RAD_F32, {4, 1, 2});
@@ -10059,6 +10181,225 @@ TEST(dflash_select_walks_from_its_own_previous_pick) {
     CHECK_EQ(tok.iat(1), 0LL);
 }
 
+/* The DSpark reference scores all vocabulary entries after applying the Markov bias. Both
+ * sequences choose tokens outside their base-logit top 16; step 1 conditions on the prior greedy
+ * choice, and the step-0 tie across tile boundaries resolves to the lower token id. */
+TEST(dflash_markov_greedy_scans_full_vocab_and_keeps_sequences_independent) {
+    constexpr int V = 130, R = 32, M = 2, steps = 2, tiles = 3;
+    std::vector<float> logits_values(M * steps * V, 0.0f);
+    for (int r = 0; r < M * steps; r += 2)
+        for (int v = 0; v < 16; ++v) logits_values[r * V + v] = 100 - v;
+    T logits(RAD_BF16, {M * steps, V}); logits.f(logits_values);
+    T anchor(RAD_I32, {M, 2}); anchor.n({1, -1, 2, -1});
+    std::vector<float> pred_values(V * R, 0.0f), succ_values(V * R, 0.0f);
+    pred_values[1 * R + 0] = 1;       /* sequence 0, step 0 predecessor */
+    succ_values[127 * R + 0] = 200;   /* outside the base top 16 */
+    succ_values[129 * R + 0] = 200;   /* equal biased score in a later tile */
+    pred_values[127 * R + 1] = 1;     /* sequence 0 step 1 depends on token 127 */
+    succ_values[100 * R + 1] = 100;
+    pred_values[2 * R + 2] = 1;       /* sequence 1 has a separate anchor/codebook walk */
+    succ_values[80 * R + 2] = 200;
+    pred_values[80 * R + 3] = 1;
+    succ_values[101 * R + 3] = 90;
+    T pred(RAD_BF16, {V, R}); pred.f(pred_values);
+    T succ(RAD_BF16, {V, R}); succ.f(succ_values);
+    T tile_scores(RAD_F32, {M, tiles});
+    T tile_tokens(RAD_I32, {M, tiles});
+    T out(RAD_I32, {M, steps});
+    A a; a.t(logits).t(anchor).t(pred).t(succ).t(tile_scores).t(tile_tokens).t(out)
+          .i("M", M).i("steps", steps).i("rank", R).i("n_vocab", V)
+          .i("anchor_stride", 2).s("dtype", "bf16");
+    CHECK_OK(run("dflash_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 127LL);
+    CHECK_EQ(out.iat(1), 100LL);
+    CHECK_EQ(out.iat(2), 80LL);
+    CHECK_EQ(out.iat(3), 101LL);
+    CHECK_EQ(tile_tokens.iat(0), 0LL);
+    CHECK_EQ(tile_tokens.iat(1), 100LL);
+    CHECK_EQ(tile_tokens.iat(2), 128LL);
+    CHECK_EQ(tile_scores.at(0), 0.0f);
+    CHECK_EQ(tile_scores.at(1), 100.0f);
+    CHECK_EQ(tile_scores.at(2), 0.0f);
+}
+
+TEST(dflash_markov_f32_preserves_a_near_tie_and_refuses_bf16) {
+    T logits(RAD_F32, {1, 2}); logits.f({1.001f, 1.002f});
+    T anchor(RAD_I32, {1}); anchor.n({0});
+    T pred(RAD_BF16, {2, 32}), succ(RAD_BF16, {2, 32});
+    T score(RAD_F32, {1, 1}), token(RAD_I32, {1, 1}), out(RAD_I32, {1, 1});
+    A a; a.t(logits).t(anchor).t(pred).t(succ).t(score).t(token).t(out)
+        .i("M", 1).i("steps", 1).i("rank", 32).i("n_vocab", 2).s("dtype", "bf16");
+    CHECK_OK(run("dflash_markov_greedy_f32", a));
+    CHECK_EQ(out.iat(0), 1);
+    T bad_anchor(RAD_F32, {1}); bad_anchor.f({0});
+    a.ts[1] = bad_anchor.t;
+    CHECK_EQ(run("dflash_markov_greedy_f32", a), RAD_E_SHAPE);
+    a.ts[1] = anchor.t;
+    CHECK(run("dflash_markov_greedy", a) != RAD_OK);
+    T bf_logits(RAD_BF16, {1, 2}); bf_logits.f({1.001f, 1.002f});
+    a.ts[0] = bf_logits.t;
+    CHECK(run("dflash_markov_greedy_f32", a) != RAD_OK);
+    CHECK_OK(run("dflash_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 0);
+}
+
+/* Independent pitches in the two scratch arrays are part of the tensor contract. Guard cells
+ * distinguish correct row addressing from treating both outputs as tightly packed. */
+TEST(dflash_markov_greedy_padded_scratch_rows) {
+    constexpr int V=130, R=32, M=2, tiles=3;
+    T logits(RAD_BF16, {M, V}), anchor(RAD_I32, {M}); anchor.n({1, 2});
+    T pred(RAD_BF16, {V, R}), succ(RAD_BF16, {V, R});
+    st_dt(RAD_BF16, pred.t.data, R, 1); st_dt(RAD_BF16, pred.t.data, 2*R+1, 1);
+    st_dt(RAD_BF16, succ.t.data, 129*R, 4); st_dt(RAD_BF16, succ.t.data, 80*R+1, 8);
+    T scores(RAD_F32, {M, 5}); scores.f(std::vector<float>(10, -777));
+    T tokens(RAD_I32, {M, 7}); tokens.n(std::vector<int64_t>(14, -777));
+    scores.t.shape[1]=tiles; tokens.t.shape[1]=tiles;
+    T out(RAD_I32, {M, 1});
+    A a; a.t(logits).t(anchor).t(pred).t(succ).t(scores).t(tokens).t(out)
+        .i("M", M).i("steps", 1).i("rank", R).i("n_vocab", V).s("dtype", "bf16");
+    CHECK_OK(run("dflash_markov_greedy", a));
+    CHECK_EQ(out.iat(0), 129); CHECK_EQ(out.iat(1), 80);
+    CHECK_EQ(tokens.iat(2), 129); CHECK_EQ(tokens.iat(7+1), 80);
+    CHECK_EQ(scores.at(2), 4); CHECK_EQ(scores.at(5+1), 8);
+    for (int i : {3,4,8,9}) CHECK_EQ(scores.at(i), -777);
+    for (int i : {3,4,5,6,10,11,12,13}) CHECK_EQ(tokens.iat(i), -777);
+}
+
+/* A one-row, one-layer DSpark oracle assembled from libref's ordinary ops. The literals check the
+ * architecture-specific chain rather than only each primitive: each tap has its own RMS gain,
+ * the normalized taps feed fc/h_norm then context K/V projections, context and draft K/V land in
+ * the paged cache, and a gated attention residual plus the exact-GELU MLP gives the layer output. */
+TEST(dspark_taps_context_kv_and_layer_output_match_hand_oracle) {
+    T tap0_src(RAD_F32, {1, 2}); tap0_src.f({1, 1});
+    T tap0_gain(RAD_BF16, {2}); tap0_gain.f({1, 2});
+    T tap0(RAD_BF16, {1, 2});
+    A tap0a; tap0a.t(tap0_src).t(tap0_gain).t(tap0)
+                 .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", tap0a));
+    CHECK_EQ(tap0.at(0), 1.0f); CHECK_EQ(tap0.at(1), 2.0f);
+
+    T tap1_src(RAD_F32, {1, 2}); tap1_src.f({2, 2});
+    T tap1_gain(RAD_BF16, {2}); tap1_gain.f({2, 1});
+    T tap1(RAD_BF16, {1, 2});
+    A tap1a; tap1a.t(tap1_src).t(tap1_gain).t(tap1)
+                 .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", tap1a));
+    CHECK_EQ(tap1.at(0), 2.0f); CHECK_EQ(tap1.at(1), 1.0f);
+
+    T taps(RAD_BF16, {1, 4}); taps.f({tap0.at(0), tap0.at(1), tap1.at(0), tap1.at(1)});
+    T fc_w(RAD_BF16, {2, 4}); fc_w.f({1, 0, 0, 0,  0, 0, 0, 1});
+    T context(RAD_BF16, {1, 2});
+    A fca; fca.t(taps).t(fc_w).t(context).i("M", 1).i("N", 2).i("K", 4).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", fca));
+    CHECK_EQ(context.at(0), 1.0f); CHECK_EQ(context.at(1), 1.0f);
+
+    T context_gain(RAD_BF16, {2}); context_gain.f({1, 1});
+    T context_norm(RAD_BF16, {1, 2});
+    A cna; cna.t(context).t(context_gain).t(context_norm)
+            .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", cna));
+    CHECK_EQ(context_norm.at(0), 1.0f); CHECK_EQ(context_norm.at(1), 1.0f);
+
+    T wq(RAD_BF16, {2, 2}); wq.f({0, 0, 0, 0});
+    T wk(RAD_BF16, {2, 2}); wk.f({0, 0, 0, 0});
+    T wv(RAD_BF16, {2, 2}); wv.f({0, 0, 1, 1});
+    T q_proj(RAD_BF16, {1, 2}), k_ctx(RAD_BF16, {1, 2}), v_ctx(RAD_BF16, {1, 2});
+    A qa; qa.t(context_norm).t(wq).t(q_proj).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    A ka; ka.t(context_norm).t(wk).t(k_ctx).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    A va; va.t(context_norm).t(wv).t(v_ctx).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", qa)); CHECK_OK(run("gemm_nt", ka)); CHECK_OK(run("gemm_nt", va));
+    CHECK_EQ(k_ctx.at(0), 0.0f); CHECK_EQ(k_ctx.at(1), 0.0f);
+    CHECK_EQ(v_ctx.at(0), 0.0f); CHECK_EQ(v_ctx.at(1), 2.0f);
+
+    /* The query projection is from the draft row, but has the same simple normalized input. */
+    T query_src(RAD_F32, {1, 2}); query_src.f({1, 1});
+    T query_norm(RAD_BF16, {1, 2});
+    A qna; qna.t(query_src).t(context_gain).t(query_norm)
+            .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", qna));
+    T k_query(RAD_BF16, {1, 2}), v_query(RAD_BF16, {1, 2});
+    A kqa; kqa.t(query_norm).t(wk).t(k_query).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    A vqa; vqa.t(query_norm).t(wv).t(v_query).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", kqa)); CHECK_OK(run("gemm_nt", vqa));
+
+    T keys(RAD_BF16, {2, 1, 2}); keys.f({k_ctx.at(0), k_ctx.at(1), k_query.at(0), k_query.at(1)});
+    T values(RAD_BF16, {2, 1, 2}); values.f({v_ctx.at(0), v_ctx.at(1), v_query.at(0), v_query.at(1)});
+    T slots(RAD_I32, {2}); slots.n({0, 1});
+    T cache(RAD_BF16, {1, 1, 2, 4});
+    A store; store.t(keys).t(values).t(slots).t(cache)
+              .i("M", 2).i("head_dim", 2).i("n_head_kv", 1).i("block_size", 2).s("kv_dtype", "bf16");
+    CHECK_OK(run("kv_store", store));
+    for (int slot = 0; slot < 2; ++slot) {
+        CHECK_EQ(cache.at(slot * 4 + 0), 0.0f); CHECK_EQ(cache.at(slot * 4 + 1), 0.0f);
+        CHECK_EQ(cache.at(slot * 4 + 2), 0.0f); CHECK_EQ(cache.at(slot * 4 + 3), 2.0f);
+    }
+
+    T q(RAD_BF16, {1, 1, 2}); q.f({q_proj.at(0), q_proj.at(1)});
+    T bt(RAD_I32, {1, 1}); bt.n({0});
+    T used(RAD_I32, {1}); used.n({2});
+    T attended(RAD_BF16, {1, 1, 2});
+    A attn; attn.t(q).t(cache).t(bt).t(used).tnull().tnull().tnull().t(attended)
+               .i("q_len", 1).i("head_dim", 2).i("gqa", 1).i("block_size", 2)
+               .i("causal", 0).i("window", 513).i("n_head", 1)
+               .s("q_dtype", "bf16").s("kv_dtype", "bf16");
+    CHECK_OK(run("attn_paged_anchor_window", attn));
+    CHECK_EQ(attended.at(0), 0.0f); CHECK_EQ(attended.at(1), 2.0f);
+
+    T gate_w(RAD_BF16, {1, 2}); gate_w.f({0, 0});
+    T gate_logit(RAD_BF16, {1, 1}), gate(RAD_BF16, {1, 1});
+    A ga; ga.t(query_norm).t(gate_w).t(gate_logit)
+           .i("M", 1).i("N", 1).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", ga));
+    A sig; sig.t(gate_logit).t(gate).i("M", 1).i("n", 1).s("dtype", "bf16");
+    CHECK_OK(run("sigmoid", sig));
+    CHECK_EQ(gate.at(0), 0.5f);
+    T gated(RAD_BF16, {1, 2});
+    A scale; scale.t(attended).t(gate).tnull().t(gated)
+              .i("M", 1).i("n", 2).s("act", "none").s("dtype", "bf16");
+    CHECK_OK(run("scale_rows", scale));
+    CHECK_EQ(gated.at(0), 0.0f); CHECK_EQ(gated.at(1), 1.0f);
+
+    T wo(RAD_BF16, {2, 2}); wo.f({1, 0, 0, 1});
+    T delta(RAD_BF16, {1, 2});
+    A oa; oa.t(gated).t(wo).t(delta).i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", oa));
+    CHECK_EQ(delta.at(0), 0.0f); CHECK_EQ(delta.at(1), 1.0f);
+    T residual(RAD_F32, {1, 2}); residual.f({1, 1});
+    T after_attn(RAD_F32, {1, 2});
+    A adda; adda.t(residual).t(delta).t(after_attn).i("M", 1).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("add", adda));
+    CHECK_EQ(after_attn.at(0), 1.0f); CHECK_EQ(after_attn.at(1), 2.0f);
+
+    T ff_norm(RAD_BF16, {1, 2});
+    A fna; fna.t(after_attn).t(context_gain).t(ff_norm)
+            .i("M", 1).i("n", 2).d("eps", 0).s("dtype", "bf16");
+    CHECK_OK(run("rmsnorm", fna));
+    T ff_w(RAD_BF16, {2, 2}); ff_w.f({1, 0, 1, 0});
+    T gate_up(RAD_BF16, {1, 2});
+    A fua; fua.t(ff_norm).t(ff_w).t(gate_up)
+             .i("M", 1).i("N", 2).i("K", 2).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", fua));
+    T ff(RAD_BF16, {1, 1});
+    A act; act.t(gate_up).t(gate_up).t(ff)
+             .i("M", 1).i("n", 1).s("act", "gelu").s("dtype", "bf16");
+    CHECK_OK(run("act_mul", act));
+    T down_w(RAD_BF16, {2, 1}); down_w.f({1, 0});
+    T down(RAD_BF16, {1, 2});
+    A da; da.t(ff).t(down_w).t(down).i("M", 1).i("N", 2).i("K", 1).s("dtype", "bf16");
+    CHECK_OK(run("gemm_nt", da));
+    const float normalized = bf16_to_f32((uint16_t)f32_to_bf16(1.0f / std::sqrt(2.5f)));
+    const float gelu = 0.5f * normalized * (1.0f + std::erf(normalized / std::sqrt(2.0f)));
+    const float rounded_gelu = bf16_to_f32((uint16_t)f32_to_bf16(gelu));
+    const float expected_ff = bf16_to_f32((uint16_t)f32_to_bf16(rounded_gelu * normalized));
+    CHECK_NEAR(ff.at(0), expected_ff, 1e-6);
+    CHECK_EQ(down.at(0), expected_ff); CHECK_EQ(down.at(1), 0.0f);
+    T layer_out(RAD_F32, {1, 2});
+    A outa; outa.t(after_attn).t(down).t(layer_out).i("M", 1).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("add", outa));
+    CHECK_NEAR(layer_out.at(0), 1.0f + expected_ff, 1e-6);
+    CHECK_EQ(layer_out.at(1), 2.0f);
+}
+
 TEST(gemm_nt_q_bias_adds_a_bias_per_column) {
     T a_(RAD_I8, {1, 2}); a_.n({1, 2});
     T as(RAD_F32, {1}); as.f({0.5f});
@@ -10475,6 +10816,12 @@ std::vector<Geo> geometries() {
                                      .s("dtype", "fp8a8").s("act", "silu")),
         G("dflash_select", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                    .i("n_vocab", 30).s("dtype", "bf16")),
+        G("dflash_markov_greedy", "M", 2, a.i("M", R).i("steps", 3).i("rank", 32)
+                                             .i("n_vocab", 130).i("anchor_stride", 1)
+                                             .s("dtype", "bf16")),
+        G("dflash_markov_greedy_f32", "M", 2, a.i("M", R).i("steps", 3).i("rank", 32)
+                                                 .i("n_vocab", 130).i("anchor_stride", 1)
+                                                 .s("dtype", "bf16")),
         G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                  .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
@@ -10489,6 +10836,9 @@ std::vector<Geo> geometries() {
         G("attn_paged", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4)
                                     .i("causal", 1).i("window", 0).s("q_dtype", "f32")
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
+        G("attn_paged_anchor_window", "q_len", 3,
+          a.i("q_len", R).i("head_dim", 8).i("gqa", 2).i("block_size", 4).i("causal", 1)
+           .i("window", 4).s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
         G("attn_paged_tree", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
                                          .i("block_size", 4).i("causal", 1).i("window", 0)
                                          .s("q_dtype", "f32").s("kv_dtype", "f32").i("n_head", 4)
@@ -10663,12 +11013,19 @@ std::vector<Geo> geometries() {
                               .i("block_size", 4).d("scale", 0.125).s("dtype", "f32")),
         G("mla_project", "M", 3, a.i("M", R).i("heads", 2).i("head_dim", 4).i("latent_dim", 6)
                                  .s("mode", "absorb").s("dtype", "bf16")),
+        G("mla_attn_paged", "M", 3, a.i("M", R).i("heads", 2).i("latent_dim", 8).i("rope_dim", 4)
+                                    .i("block_size", 4).d("scale", 0.25).i("ctx", 6)
+                                    .s("dtype", "f32")),
         G("dsa_score", "M", 4, a.i("M", R).i("n", 8).i("heads", 2).i("blocks", 3).i("seqs", 2)
                                .s("dtype", "fp8_e4m3")),
         G("dsa_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 4).s("dtype", "bf16")),
         G("dsa_query", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("gemm_nt_f32", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "bf16")),
         G("swiglu_clamped", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
+        G("swiglu_step", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
+        G("router_sigmoid_group_topk", "M", 3, a.i("M", R).i("n_expert", 8).i("top_k", 2)
+                                               .i("n_group", 4).i("topk_group", 2).i("norm", 1)
+                                               .d("route_scale", 2.5).s("dtype", "f32")),
         G("router_sigmoid_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
                                          .d("route_scale", 2.5).s("dtype", "f32")),
         G("router_scored_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)

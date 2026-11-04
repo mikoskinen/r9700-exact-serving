@@ -185,8 +185,19 @@ struct MoeFP8 {
         /* Block-fp8 experts whose scale plane is f32 (format 9, dtype fp8a8f32). */
         int     expert_f32_scale = 0;
         double  route_scale = 1.0;
+        /* With `sigmoid_router`: group-limited selection over `n_group` groups, `topk_group` kept
+         * (router_sigmoid_group_topk; Ling-3.0). 1 is GLM's single group. The fused selection and
+         * sort is single-group, so a grouped router runs the separate pair. */
+        int64_t n_group = 1, topk_group = 1;
         /* Clamp of the SwiGLU product (swiglu_clamped); 0 is none. */
         double  swiglu_limit = 0.0;
+        /* The shared arm's clamp where it differs from the routed one (Ling-3.0 clamps its shared
+         * expert at 5 or 7 and its routed ones at 4, in different layers); negative: the routed
+         * arm's. */
+        double  shared_swiglu_limit = -1.0;
+        /* Clip after the SiLU (`swiglu_step`) rather than before it (`swiglu_clamped`), for both
+         * arms. */
+        int     swiglu_step = 0;
         /* With `swiglu_limit`: the clamped product and its quantiser as one launch
          * (GateQuantFP8::fuse_clamped), for the routed and the shared arm. */
         int     swiglu_quant = 0;
@@ -651,6 +662,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                            int ar_in, bool ar_out_) {
     g = geom; c = src.cfg; w = wire; layer = l;
     ar_out = ar_out_;
+    if (c.n_group > 1) c.router_fuse = 0;
+    const double sh_limit = c.shared_swiglu_limit < 0 ? c.swiglu_limit : c.shared_swiglu_limit;
     /* 0 means not expert-parallel: this rank owns every expert. */
     if (c.n_expert_all <= 0) c.n_expert_all = c.n_expert;
     if (c.n_expert <= 0 || c.top_k <= 0 || c.top_k > c.n_expert_all || c.n_ff_exp <= 0)
@@ -816,7 +829,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rc.norm = c.norm_topk;
         rc.route_scale = c.route_scale;
         rc.score = c.router_score;
-        const GlmRouter::Wire wire{ w.h.x, w.logits, w.ids, w.ew };
+        rc.groups = c.n_group;
+        rc.topk_groups = c.topk_group;        const GlmRouter::Wire wire{ w.h.x, w.logits, w.ids, w.ew };
         const GlmRouter::Src rs{ src.router, src.router_bias };
         RAD_ARCH_TRY(glm_router.declare(b, nm, g, l, nm.f("blk.%d.glm_router", l), rc, wire, rs));
         w_router = glm_router.projection;
@@ -1084,9 +1098,13 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         Geom gx = g;
         gx.w_bf16 = true;
         RAD_ARCH_TRY(gq_exp.declare(b, gx, w.egu, w.eff, c.n_ff_exp, "silu", c.rows * c.top_k,
-                                    true, false, c.swiglu_limit));
-        op_dn = rw(b, grouped(1, g.n_embd, c.n_ff_exp, "sorted", w_dn.data()),
-                   {w.eff.x, w.sorted, w.eoff}, {w.edn});
+                                    true, false, c.swiglu_limit, c.swiglu_step != 0));
+        op_dn = rw(b, rad_decl_op(b, "moe_gemm",
+                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
+                                     RAD_INT("K", c.n_ff_exp), RAD_INT("n_expert", ne),
+                                     RAD_INT("top_k", c.top_k), RAD_STR("a_order", "sorted"),
+                                     RAD_STR("dtype", "bf16")),
+                          w_dn.data(), (int)ne),                   {w.eff.x, w.sorted, w.eoff}, {w.edn});
         if (!op_gu || !op_dn) return RAD_E_INVAL;
     } else {
     /* ---- the runs (eight, or sixteen at four classes), declared as views class by class. */
@@ -1213,7 +1231,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
     RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, w.eff, c.n_ff_exp, "silu", c.rows * c.top_k,
-                                false, rot, c.swiglu_limit));
+                                false, rot, c.swiglu_limit, c.swiglu_step != 0));
     {
         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
         rad_op h = ncls == 4
@@ -1316,7 +1334,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         Geom gx = g;
         gx.w_bf16 = true;
         RAD_ARCH_TRY(gq_prot.declare(b, gx, b_pgu, pff, wp, "silu", c.rows * c.top_k, true,
-                                     false, c.swiglu_limit));
+                                     false, c.swiglu_limit, c.swiglu_step != 0));
         op_pdn = rw(b, rad_decl_op(b, "moe_gemm",
                            RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
                                       RAD_INT("K", wp), RAD_INT("n_expert", np),
@@ -1456,7 +1474,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.q8));
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.s8));
         }
-        if (!w.sff.q || c.swiglu_limit>0 || (sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8)))
+        if (!w.sff.q || sh_limit>0 || (sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8)))
             RAD_ARCH_TRY(rad_buf_concurrent(b, w.sff.x));
         RAD_ARCH_TRY(rad_buf_concurrent(b, w.sout));
         RAD_ARCH_TRY(rad_buf_concurrent(b, w.sgate));
@@ -1473,7 +1491,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         gq_sh.fuse_clamped = c.swiglu_quant != 0;
         RAD_ARCH_TRY(gq_sh.declare(b, g, w.sgu, w.sff, c.n_ff_shared, "silu", c.rows,
                                    sh_down.reads_x && !(w.sff.q8_fed && sh_down.probed_i8), false,
-                                   c.swiglu_limit));
+                                   sh_limit, c.swiglu_step != 0));
         RAD_ARCH_TRY(sh_down.declare(b, nm, g, down_base,
                                      g.n_embd, c.n_ff_shared, RAD_SHARD_COL, grp_layer(l),
                                      { shared_down },

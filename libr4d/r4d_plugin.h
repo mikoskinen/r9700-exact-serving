@@ -188,6 +188,17 @@ int     r4d_rad_attn_window_h512_gqa8_fp8 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_window_h128_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*);
 int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*);
+#define R4D_ATTN_ANCHOR_DECL(HD, G)                                                              \
+    int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_bf16kv(const RadArgs*, RadStream);            \
+    int r4d_rad_attn_anchor_window_h##HD##_gqa##G##_fp8kv(const RadArgs*, RadStream);
+R4D_ATTN_ANCHOR_DECL(128, 1)
+R4D_ATTN_ANCHOR_DECL(256, 1) R4D_ATTN_ANCHOR_DECL(256, 2) R4D_ATTN_ANCHOR_DECL(256, 4)
+R4D_ATTN_ANCHOR_DECL(256, 8)
+R4D_ATTN_ANCHOR_DECL(512, 1) R4D_ATTN_ANCHOR_DECL(512, 2) R4D_ATTN_ANCHOR_DECL(512, 4)
+R4D_ATTN_ANCHOR_DECL(512, 8)
+#undef R4D_ATTN_ANCHOR_DECL
+int     r4d_rad_dflash_markov_greedy(const RadArgs*, RadStream);
+int     r4d_rad_dflash_markov_greedy_f32(const RadArgs*, RadStream);
 /* attn_paged_qrow_tree (docs/OPS.md): the h256/gqa2 split-KV decode and the windowed kernels with a
  * tree verify's mask from operand 8, `spec_parent`. */
 int     r4d_rad_attn_qrow_tree_decode_h256_gqa2_fp8 (const RadArgs*, RadStream);
@@ -814,6 +825,7 @@ int r4d_rad_logit_softcap   (const RadArgs*, RadStream);
 int r4d_rad_scale           (const RadArgs*, RadStream);
 int r4d_rad_silu_mul        (const RadArgs*, RadStream);
 int r4d_rad_swiglu_clamped(const RadArgs*, RadStream);
+int r4d_rad_swiglu_step(const RadArgs*, RadStream);
 int r4d_rad_swiglu_clamped_quant_fp8(const RadArgs*, RadStream);
 int r4d_rad_dsa_pool(const RadArgs*, RadStream);
 int r4d_shape_dsa_pool(const RadParam*, int, int, RadOpdDesc*);
@@ -830,12 +842,17 @@ int r4d_shape_mla_project(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_dsa_score(const RadArgs*, RadStream);
 int r4d_shape_dsa_score(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_mla_attn(const RadArgs*, RadStream);
+int r4d_rad_mla_attn_paged(const RadArgs*, RadStream);
+int r4d_shape_mla_attn_paged(const RadParam*, int, int, RadOpdDesc*);
 int64_t r4d_rad_mla_attn_scratch(const RadArgs*);
+int64_t r4d_rad_mla_attn_paged_scratch(const RadArgs*);
 int r4d_rad_mla_attn_matrix(const RadArgs*, RadStream);
 int64_t r4d_rad_mla_attn_matrix_scratch(const RadArgs*);
 int r4d_rad_mla_attn_rows(const RadArgs*, RadStream);
 int r4d_shape_mla_attn(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk(const RadArgs*, RadStream);
+int r4d_rad_router_sigmoid_group_topk(const RadArgs*, RadStream);
+int r4d_shape_router_sigmoid_group_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_sigmoid_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_rad_router_sigmoid_topk_scatter(const RadArgs*, RadStream);
 int r4d_rad_moe_scatter_inv(const RadArgs*, RadStream);
@@ -997,6 +1014,8 @@ int r4d_shape_qsa_work           (const RadParam*, int, int operand, RadOpdDesc*
 
 int r4d_shape_dflash_conv    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_dflash_select  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dflash_markov  (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_dflash_markov_f32(const RadParam*, int, int operand, RadOpdDesc*);
 
 /* -- declared fusions (r4d_fuse.cpp, pure host) --
  *
