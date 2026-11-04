@@ -39,7 +39,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
@@ -367,15 +366,10 @@ struct MoverStats {
     uint64_t ssd_layers = 0, ssd_units = 0, ssd_read_bytes = 0, ssd_preads = 0;
     uint64_t ssd_read_ns = 0, ssd_wait_ns = 0;
     /* Routing-aware reads: units of experts whose routing count was zero at the layer's
-     * trigger, not read (their weights are re-published to the layer buffer as a dummy
-     * address for the pass, and nulled again with the staged units). */
+     * trigger, not read (their weights are published at the zero region for the pass, and
+     * nulled again with the staged units). Counted per read: a later slice of the layer's rows
+     * that reads some of them counts the rest again. */
     uint64_t ssd_skipped_units = 0, ssd_skipped_bytes = 0;
-    /* DS41 branch: the file stager's reads and the routed-only aliases, plus the file-tier
-     * weights relaid on the read (Mover::set_file_relayout). */
-    uint64_t file_layers = 0, file_units = 0, file_bytes = 0, file_preads = 0;
-    uint64_t file_read_ns = 0, file_wait_ns = 0;
-    uint64_t file_aliased = 0;
-    uint64_t file_relaid = 0, file_relaid_bytes = 0, file_relayout_ns = 0;
 };
 
 /* MoverStats as the mover counts it on its rank thread, readable from the HTTP thread (Relaxed,
@@ -388,9 +382,6 @@ struct MoverCounters {
                       ssd_promotions, ssd_promoted_bytes, ssd_deposits, ssd_deposit_bytes,
                       pool_evictions, ssd_layers, ssd_units, ssd_read_bytes, ssd_preads,
                       ssd_read_ns, ssd_wait_ns, ssd_skipped_units, ssd_skipped_bytes;
-    /* DS41 branch counters (the MoverStats fields above). */
-    Relaxed<uint64_t> file_layers, file_units, file_bytes, file_preads, file_read_ns,
-                      file_wait_ns, file_aliased, file_relaid, file_relaid_bytes, file_relayout_ns;
 
     MoverStats snapshot() const {
         MoverStats s;
@@ -430,16 +421,6 @@ struct MoverCounters {
         s.ssd_wait_ns        = ssd_wait_ns;
         s.ssd_skipped_units  = ssd_skipped_units;
         s.ssd_skipped_bytes  = ssd_skipped_bytes;
-        s.file_layers    = file_layers;
-        s.file_units     = file_units;
-        s.file_bytes     = file_bytes;
-        s.file_preads    = file_preads;
-        s.file_read_ns   = file_read_ns;
-        s.file_wait_ns   = file_wait_ns;
-        s.file_aliased   = file_aliased;
-        s.file_relaid    = file_relaid;
-        s.file_relaid_bytes = file_relaid_bytes;
-        s.file_relayout_ns  = file_relayout_ns;
         return s;
     }
 };
@@ -624,38 +605,58 @@ public:
      * and published there; afterwards unstage_units publishes them as null again. The plan
      * charges the two buffers to the weights pool (Plan::file_stage_vram).
      *
-     * stage_file_units  reads every file-tier unit of `units` into `dst`, packed at RAD_ALIGN_UNIT
-     *                   in the order given, through the pinned read windows: container-order
-     *                   runs, each window draining to `dst` on the mover's stream while the next
-     *                   fills, behind `after` (if set), with `done` recorded last. Published
-     *                   settled. RAD_E_SCRATCH if the units exceed `cap`. The reads block this
-     *                   thread.
+     * stage_file_units  reads the file-tier units of `units` into `dst`, packed at RAD_ALIGN_UNIT
+     *                   in the order given from `rd->used` on, through the pinned read windows:
+     *                   container-order runs, each window drained to its destinations by one
+     *                   copy list on the mover's stream while the next fills, behind `after` (if
+     *                   set), with `done` recorded last. Published settled, so the compute
+     *                   stream must wait on `done` before an op reads any of them; `rd->copied`
+     *                   says whether there is anything to wait for (a hot-cache admission or a
+     *                   pool deposit is a copy like a staged unit's). RAD_E_SCRATCH if the units
+     *                   exceed `cap`. The reads block this thread. Appends to `rd`, so a second
+     *                   call for another slice of the layer's rows adds what the first left out.
      *
-     * Routing-aware reads: with `ecnt` (host, `n_expert` entries, the layer's per-expert
-     * routing counts for the current pass), a unit whose expert is counted zero is not read:
-     * it goes to `skipped`, its weights are published at `dst` (a dummy address inside the
-     * layer buffer, valid memory a no-run expert never reads through), and the caller nulls
-     * it again with the staged units. Null `ecnt` reads the whole layer.
+     * Routing-aware reads: with `ecnt` (host, `n_expert` entries, the layer's per-expert routing
+     * counts for the rows about to run), a unit whose expert is counted zero is not read: it goes
+     * to `rd->skipped`, its weights are published at the zero region (valid memory a no-run
+     * expert never reads through), and the caller nulls it again with the staged units. Null
+     * `ecnt` reads every file-tier unit given.
+     *
+     * A read that finds the pool full relabels its coldest unit back to the file tier (see the
+     * definition). Units of the `protect` layers (plan layer numbers; the one being read and any
+     * whose ops are about to be issued) are never taken, whatever their counts.
+     *
      * file_buffer       buffer 0 or 1 of the plan's two, or null when the plan has none. */
+    struct FileRead {
+        std::vector<int32_t> staged;     /* read into the layer buffer; nulled at release */
+        std::vector<int32_t> skipped;    /* counted zero; published at the zero region */
+        std::vector<int32_t> promoted;   /* read into hot-cache slots; they keep that address */
+        int64_t used = 0;                /* bytes of the buffer the staged units take */
+        bool    copied = false;          /* `done` is behind copies an op will read */
+        void clear() {
+            staged.clear(); skipped.clear(); promoted.clear();
+            used = 0;
+            copied = false;
+        }
+    };
     int   stage_file_units(const std::vector<int32_t>& units, char* dst, int64_t cap,
-                           RadEvent after, RadEvent done, std::vector<int32_t>* staged,
-                           std::vector<int32_t>* skipped = nullptr,
+                           RadEvent after, RadEvent done, FileRead* rd,
                            const int32_t* ecnt = nullptr, int32_t n_expert = 0,
-                           std::vector<int32_t>* promoted = nullptr);
-    /* alias_file_units: publish every file-tier weight of `units` at `base` without reading it,
-     * for experts a pass does not route to. Appends them to `staged`; unstage_units takes them
-     * back like read ones. */
-    void  alias_file_units(const std::vector<int32_t>& units, char* base,
-                           std::vector<int32_t>* staged);
-    /* set_file_relayout: the function that makes a file-tier weight's stored form from its
-     * container planes when the two differ (weight_file_relaid). Pure and thread-safe. */
-    using FileRelayout = std::function<int(const WeightInfo& w, const RadTensor* planes,
-                                           void* dst, int64_t dst_bytes)>;
-    void  set_file_relayout(FileRelayout fn) { relayout_ = std::move(fn); }
+                           const int32_t* protect = nullptr, int n_protect = 0);
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }
     int64_t file_buffer_bytes() const { return file_vram_ ? file_buf_bytes_ : 0; }
+    /* Whether any of `units` is on the file tier now (no slab slot, no pool slot): a layer with
+     * none has nothing to read, and its trigger skips the read and the drain it would cost. */
+    bool  on_file_tier(const std::vector<int32_t>& units) const;
+    /* Whether `ecnt` (as stage_file_units takes it) routes any of `units`. */
+    bool  routes_any(const std::vector<int32_t>& units, const int32_t* ecnt, int32_t n_expert) const;
+    /* The units the file stager reads back when they are on the file tier: every routed unit the
+     * plan put there, plus `more` (pooled and resident ones it also covers). Only a covered unit
+     * may be relabelled back to the file tier to make room for a deposit, since nothing else
+     * would ever read it again. Called once, at the stager's bring-up. */
+    void  cover_file_units(const std::vector<int32_t>& more);
 
     /* A snapshot by value: the counters are atomics read while the rank thread writes them. */
     MoverStats stats() const { return stats_.snapshot(); }
@@ -801,22 +802,6 @@ private:
 
     /* The file stager's two VRAM buffers, one allocation, and the pinned windows it reads
      * through, each with the event behind the copies out of it. */
-    /* DS41 file-tier relayout: one host input per thread for the selected planes, and the read
-     * windows' relaid jobs. */
-    struct RelayIn {
-        uint8_t* p = nullptr;
-        int64_t  cap = 0;
-        RelayIn() = default;
-        RelayIn(RelayIn&& o) noexcept : p(o.p), cap(o.cap) { o.p = nullptr; o.cap = 0; }
-        RelayIn(const RelayIn&) = delete;
-        ~RelayIn() { std::free(p); }
-    };
-    struct Relaid { const WeightInfo* w; char* dst; };
-    FileRelayout         relayout_;
-    std::vector<RelayIn> relay_in_;
-    int                  relay_threads_ = 1;
-    int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
-    int  stage_relaid(const std::vector<Relaid>& rl);
     char*    file_vram_ = nullptr;
     int64_t  file_buf_bytes_ = 0;
     char*    windows_ = nullptr;
@@ -825,6 +810,34 @@ private:
     int      win_next_ = 0;
     std::vector<RadEvent> win_ev_;
     std::vector<uint8_t>  win_rec_;
+    /* stage_file_units' working lists, kept so a read allocates nothing once warm. A FileExt is
+     * one weight's bytes: where they are in the container and where they go -- the layer
+     * buffer, a hot-cache slot (`hot`, counted as ssd_promoted_bytes) or a pool slot
+     * (`deposit`, counted as ssd_deposit_bytes). */
+    struct FileExt {
+        int64_t foff = 0, bytes = 0;
+        char*   dst = nullptr;
+        bool    hot = false;
+        bool    deposit = false;
+    };
+    std::vector<FileExt>    fext_;
+    std::vector<int64_t>    fat_;          /* the staged units' buffer offsets */
+    std::vector<char*>      fbase_;        /* the hot-cache units' slot bases */
+    std::vector<int32_t>    frec_;         /* move records whose copies this read issues */
+    /* The file tier's cache cycle. `file_ok_`: by unit, the file stager reads it back when it is
+     * on the file tier (cover_file_units). `layer_file_`: by plan layer, the bytes of its units
+     * that are on the file tier or in the hot VRAM cache (which hands them back to the file tier
+     * when evicted), at the stager's packing; a relabel keeps it within `file_cap_`, the stager's
+     * buffer, so any read of a layer fits. */
+    std::vector<uint8_t>    file_ok_;
+    std::vector<int64_t>    layer_file_;
+    int64_t                 file_cap_ = 0;
+    /* A full pool's relabel candidates per class, ranked once per dispatch like donors_: every
+     * covered pooled unit, hottest first, so the coldest is at the back. Heat does not change
+     * within a dispatch, so this picks what a scan of every unit at each read would. */
+    struct VictimRank { int at = -1; std::vector<std::pair<float, int32_t>> by_heat; };
+    std::vector<VictimRank> victims_;
+    int32_t pick_victim(int32_t klass, const int32_t* protect, int n_protect, float below);
 
     /* The lead gate's ring: one event a dispatch, and a host wait on the one from
      * max_lead_dispatches ago. */

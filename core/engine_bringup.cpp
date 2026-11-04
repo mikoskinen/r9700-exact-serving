@@ -57,7 +57,6 @@
 #include <memory>
 #include <mutex>
 #include <chrono>
-#include <cstdio>
 
 namespace rad {
 
@@ -483,6 +482,35 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
     return RAD_OK;
 }
 
+/* --ngram-placement disk=DIR: the container's [src, src + n) at file offset `foff` read from its own
+ * file, DIR/ngram-<id>.bin (the table's bytes and nothing else, the id table_share_id's: the
+ * container's path, size and mtime and the table's place in it). The first start fills it from the
+ * container through a temporary name and renames it, so a file under the real name is complete; a
+ * later start checks samples of it against the container. Mapped read-only in place of the
+ * container's range, which is all the disk gather needs: it finds the file behind the mapping and
+ * reads it directly (libavx avx_ngram.cpp, table_file). */
+int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out,
+                           std::string* why) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string id = table_share_id(file_->path(), foff, n);
+    if (id.empty()) {
+        *why = fmt("the container %s cannot be stat'ed, which names the table's file", file_->path());
+        return RAD_E_IO;
+    }
+    const std::string& dir = cfg_.ngram_disk_dir;
+    const std::string path = dir + (dir.back() == '/' ? "" : "/") + "ngram-" + id + ".bin";
+    TableCopy c;
+    bool filled = false;
+    const int rc = table_file_open(*file_, src, n, foff, path, &c, &filled, why);
+    if (rc != RAD_OK) return rc;
+    table_files_.push_back(c);
+    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s)", path.c_str(), humanb(n).c_str(),
+             filled ? ", filled from the container" : "",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    *out = c.base;
+    return RAD_OK;
+}
+
 /* When --ngram-placement auto chose a pinned copy for a card and it could not be made, move the
  * gather to the host. Every rank's n-gram weights take the host site, in both the WeightInfo
  * Ctx::init reads and the plan, so the gather and its scale move together; a copy already
@@ -803,9 +831,6 @@ int Engine::read_metadata() {
     if (!is_container(cfg_.model)) return read_checkpoint_metadata();
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
-    /* What an earlier run left cached of the container, recorded before anything here allocates,
-     * for the mapped tier's rewarm after the load (RadFile::rewarm). */
-    if (cfg_.mapped_rewarm) file_->snapshot_resident();
 
     const RadFileHeader& h = file_->header();
     meta_ = RadModelMeta{};
@@ -1002,7 +1027,6 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.gen_max_refs   = cfg_.image_gen_max_refs;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
-    bc.draft_head_off = cfg_.spec_ngram > 0 ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
@@ -1524,41 +1548,6 @@ int Engine::declare() {
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
-    /* Every rank declared its own drafter, and the engine drives one from rank 0's: they must
-     * agree in everything but the proposal's handle, which indexes each rank's own program (a
-     * plugin may declare different buffers per rank) and is resolved per rank (advance_all). */
-    for (size_t i = 1; i < ranks_.size(); ++i) {
-        const Program& pr = ranks_[i]->program;
-        const RadDrafterDecl& d = pr.drafter;
-        bool same = d.kind == drafter_.kind && d.depth == drafter_.depth && d.block == drafter_.block &&
-                    d.proposal_pitch == drafter_.proposal_pitch && d.mask_token == drafter_.mask_token &&
-                    d.window == drafter_.window && !d.proposal == !drafter_.proposal;
-        if (same && d.proposal) {
-            const RadBufDecl& a = p0.buffers[(size_t)drafter_.proposal].decl;
-            const RadBufDecl& b = pr.buffers[(size_t)d.proposal].decl;
-            same = a.dtype == b.dtype && a.rank == b.rank &&
-                   std::equal(a.shape, a.shape + a.rank, b.shape);
-        }
-        if (!same) {
-            RAD_ERR("rank %zu declared drafter '%s' (kind %d, depth %d, block %lld, proposal %s) unlike "
-                    "rank 0's '%s' (kind %d, depth %d, block %lld, proposal %s); every rank runs the "
-                    "same passes", i, pr.drafter_name.c_str(), d.kind, d.depth, (long long)d.block,
-                    d.proposal ? pr.buffers[(size_t)d.proposal].name.c_str() : "none",
-                    drafter_name_.c_str(), drafter_.kind, drafter_.depth, (long long)drafter_.block,
-                    drafter_.proposal ? p0.buffers[(size_t)drafter_.proposal].name.c_str() : "none");
-            return RAD_E_STATE;
-        }
-    }
-    /* --spec-ngram asked the plugin to leave its head out (RadBuildCtx::draft_head_off). One that
-     * declared it anyway would hold its weights and passes for nothing, so startup stops. */
-    if (cfg_.spec_ngram > 0 && drafter_.kind != RAD_DRAFT_NONE) {
-        RAD_ERR("--spec-ngram %d: the '%s' plugin declared its draft head '%s' although the "
-                "deployment drafts by prompt lookup alone (it does not read "
-                "RadBuildCtx::draft_head_off). Use --num-speculative-tokens N instead: the head "
-                "drafts and prompt lookup fills in for any sequence it declines",
-                cfg_.spec_ngram, plugins_.arch_plugin.c_str(), drafter_name_.c_str());
-        return RAD_E_UNSUPPORTED;
-    }
     if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
@@ -1612,18 +1601,8 @@ int Engine::declare() {
                  : fmt("'%s' drafts %d token(s) a step in %d serial pass(es); prompt lookup fills "
                        "in for any sequence it declines",
                        drafter_.name, drafter_.depth, drafter_.depth).c_str());
-    } else if (cfg_.spec_ngram > 0) {
-        RAD_INFO("speculation: prompt lookup only (--spec-ngram %d) -- up to %d draft(s) a step "
-                 "from the latest earlier occurrence of the sequence's last %d..%d tokens; no "
-                 "draft head is declared", cfg_.spec_ngram, cfg_.n_spec, cfg_.spec_ngram_max,
-                 cfg_.spec_ngram_min);
-        decide("--spec-ngram", std::to_string(cfg_.spec_ngram),
-               fmt("prompt lookup alone, patterns of %d..%d tokens, longest first; the "
-                   "container's draft head (if any) is not declared",
-                   cfg_.spec_ngram_max, cfg_.spec_ngram_min));
     } else if (cfg_.n_spec > 0) {
-        RAD_INFO("speculation: prompt lookup only -- this container declares no draft head "
-                 "(patterns of %d..%d tokens)", cfg_.spec_ngram_max, cfg_.spec_ngram_min);
+        RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
     }
     probe_arena_levels();
     return RAD_OK;
@@ -2140,7 +2119,6 @@ int Engine::plan() {
         }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
-        in.file_relayout = true;    /* the mover relays on the read (Mover::set_file_relayout) */
         Planner planner(in);
         s = planner.plan(&r->plan);
         if (cfg_.debug_placement || s < 0)
@@ -2643,8 +2621,7 @@ private:
  * card. */
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
-                           int64_t* read_out,
-                           const std::vector<std::pair<int64_t, int64_t>>& keep_cached) {
+                           int64_t* read_out) {
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
@@ -2876,27 +2853,9 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         return RAD_OK;
     }();
 
-    /* Release the page cache of weights never read from the file again, leaving the mapped tier's
-     * (e.g. a mapped n-gram table, read from its mapping for the process lifetime): what an earlier
-     * run brought in stays, so its gathers do not start cold after a restart. */
-    file->drop_blob_cache(keep_cached);
-    /* ... and what the load's allocations reclaimed of it comes back (RadFile::rewarm), at most half
-     * of what the kernel calls available, so the re-read cannot itself push the host into reclaim. */
-    if (!keep_cached.empty()) {
-        int64_t avail = 0;
-        if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
-            char line[256];
-            while (std::fgets(line, sizeof line, mi))
-                if (std::sscanf(line, "MemAvailable: %lld kB", (long long*)&avail) == 1) { avail *= 1024; break; }
-            std::fclose(mi);
-        }
-        const auto w0 = std::chrono::steady_clock::now();
-        const int64_t asked = file->rewarm(keep_cached, avail / 2);
-        if (asked > 0)
-            RAD_INFO("mapped tier: asked the page cache again for %s an earlier run had cached (%.0f ms; "
-                     "--mapped-rewarm off turns it off)", humanb(asked).c_str(),
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count());
-    }
+    /* Release the page cache of weights never read from the file again, leaving it to the mapped
+     * tier (e.g. a mapped n-gram table, read from its mapping for the process lifetime). */
+    file->drop_blob_cache();
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
     for (int b = 0; b < kWin; ++b) pool->drain(b);
     for (int b = 0; b < kWin; ++b) if (buf[b]) rad_dev_free(buf[b], RAD_MEM_HOST_PINNED);
@@ -2959,7 +2918,6 @@ int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
-    std::vector<std::pair<int64_t, int64_t>> mapped_ranges;   /* kept cached by the sweep's drop */
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
@@ -2980,20 +2938,6 @@ int Engine::load_weights() {
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
-        /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
-         * relayout, as the relayout pool does once for a resident one. */
-        {
-            const Program* prog = &r->program;
-            r->mover.set_file_relayout([prog](const WeightInfo& w, const RadTensor* planes,
-                                              void* dst, int64_t dst_bytes) {
-                const RadKernelInfo* ki = weight_layout_kernel(*prog, w);
-                if (!ki || !ki->relayout) return (int)RAD_E_STATE;
-                const Resolved& rs =
-                    prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
-                return ki->relayout(rs.geom.params(), rs.geom.n_params(), w.lay_operand, &w.enc,
-                                    w.sel, planes, w.n_sel, dst, dst_bytes);
-            });
-        }
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -3074,26 +3018,8 @@ int Engine::load_weights() {
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
             w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
-            for (int k = 0; k < w.n_sel && e; ++k)
-                w.file_plane_offset[k] = file_->plane(*e, w.sel[k]).offset;
             const bool direct = weight_file_direct(w, cfg_.tp);
-            /* The file tier also serves a weight it relays on every read (weight_file_relaid):
-             * each selected plane whole in the container, as many bytes as the plane holds. */
-            const bool relaid = w.tier == Tier::SSD && e && weight_file_relaid(r->program, w, cfg_.tp);
-            if (relaid)
-                for (int k = 0; k < w.n_sel; ++k) {
-                    const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
-                    const int64_t want = w.sel_rows[k] *
-                        rad_dtype_bytes(file_->encoding(*e).plane[w.sel[k]].dtype, w.sel_cols[k]);
-                    if ((int64_t)pk.bytes != want) {
-                        RAD_ERR("rank %d: '%s' is relaid from the file tier, and its '%s' plane "
-                                "holds %lld bytes where the whole plane is %lld", r->index,
-                                w.name.c_str(), file_->encoding(*e).plane[w.sel[k]].role,
-                                (long long)pk.bytes, (long long)want);
-                        return RAD_E_FORMAT;
-                    }
-                }
-            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e) && !relaid) {
+            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e)) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
                         w.name.c_str(), tier_name(w.tier),
@@ -3159,13 +3085,32 @@ int Engine::load_weights() {
                                "rows are read from the container%s", into, why.c_str(),
                                card ? " by the host gather" : ""));
                 }
+                /* --ngram-placement disk=DIR: the table's own file instead of the container. */
+                if (cfg_.ngram_resolved == TablePlacement::Disk && !cfg_.ngram_disk_dir.empty() &&
+                    is_ngram_table(r->program, (rad_weight)i) && n >= kTableShareMin) {
+                    void* m = nullptr;
+                    for (size_t k = 0; k < table_files_.size() && !m; ++k)
+                        if (table_file_src_[k] == w.host_ptr) m = table_files_[k].base;
+                    std::string why;
+                    if (!m) {
+                        const int fs = table_file_map((const uint8_t*)w.ptr, n, (int64_t)p0.offset,
+                                                      &m, &why);
+                        if (fs != RAD_OK) {
+                            RAD_ERR("--ngram-placement disk=%s: '%s': %s",
+                                    cfg_.ngram_disk_dir.c_str(), w.name.c_str(), why.c_str());
+                            return fs;
+                        }
+                        table_file_src_.push_back(w.host_ptr);
+                    }
+                    w.ptr = m;
+                    w.host_ptr = m;
+                }
                 /* No readahead on a mapped weight: a host kernel gathers a few rows from a table
                  * too large to be resident, so the default 128 KiB readahead would read 32 pages
                  * for a row of a few hundred bytes. MADV_RANDOM is per range, so the rest of the
                  * container keeps sequential readahead. The effect shows only with a cold cache. */
                 posix_madvise(w.ptr, (size_t)n, POSIX_MADV_RANDOM);
                 r->mover.publish_mapped((rad_weight)i, w.ptr);
-                mapped_ranges.emplace_back((int64_t)((const uint8_t*)w.ptr - file_->base()), n);
                 ++n_mapped;
                 mapped_bytes += n;
                 continue;
@@ -3317,7 +3262,7 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, mapped_ranges);
+        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -3973,8 +3918,6 @@ int Engine::start() {
         d.arch_step   = arch_step_;
         d.arch_pass_key = arch_pass_key_;
         d.profile_ops = cfg_.profile_ops;
-        d.row_prefetch = cfg_.row_prefetch;
-        d.tape_dump   = cfg_.debug_tape_dump;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
         RAD_TRY(r->ctx.init(d));
@@ -4013,19 +3956,21 @@ int Engine::start() {
         /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
          * such a unit has no other address). Routing-aware reads take this
          * rank's routing reports: the trigger runs after the layer's router on the same stream. */
-        Ctx* const rctx = &r->ctx;
         RAD_TRY(r->fstager.init(r->program, r->plan, &r->mover,
-                                [rctx](int32_t layer, int64_t* ne, int64_t* top_k) {
-                                    return rctx->route_counts_live(layer, ne, top_k);
-                                }));
+                                [](void* ud, int32_t layer, int64_t* n) -> const int32_t* {
+                                    return ((Ctx*)ud)->route_counts_device(layer, n);
+                                },
+                                &r->ctx));
         if (r->fstager.enabled() && r->index == 0)
-            RAD_INFO("file stager: %zu routed layers hold experts read from the container; each "
-                     "pass reads a layer's (up to %s) into one of two VRAM buffers before its "
-                     "first expert op, so every step is paced by the drive%s",
+            RAD_INFO("file stager: it covers %zu routed layers (a pool-cached unit of one may "
+                     "be read from the container); each pass reads a layer's (up to %s) into one "
+                     "of two VRAM buffers before its first expert op, so every step is paced by the drive%s",
                      r->fstager.n_layers(), humanb(r->plan.file_layer_max).c_str(),
-                     r->fstager.routed_reads() ? "; a pass of at most 64 tokens reads only the "
-                                                 "experts it routes to"
-                                               : "");
+                     r->fstager.whole_rows() > 0
+                         ? fmt("; a pass of %lld tokens or more reads its layers whole, each "
+                               "while the card computes the one before",
+                               (long long)r->fstager.whole_rows()).c_str()
+                         : "");
         if (r->stager.enabled() && r->fstager.enabled()) {
             r->stagers.set(&r->stager, &r->fstager);
             r->ctx.set_stager(&r->stagers);

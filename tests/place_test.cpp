@@ -27,7 +27,6 @@
 #include <cstring>
 #include <string>
 #include <thread>
-#include <atomic>
 #include <vector>
 
 using namespace rad;
@@ -1462,203 +1461,10 @@ TEST(the_file_stager_reads_each_routed_layer_from_the_container) {
 }
 
 namespace {
-/* A relayout a test can predict, standing in for a kernel's (RadRelayoutFn): the first plane's
- * bytes reversed and xored, then the second plane as it is. Refuses a size that is not the two
- * planes', so a weight handed the wrong geometry fails loudly. */
-int reversing_relayout(const RadParam*, int, int, const RadEncoding*, const int*,
-                       const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes) {
-    if (n_planes != 2) return RAD_E_SHAPE;
-    const int64_t n0 = planes[0].shape[0] * planes[0].shape[1];
-    const int64_t n1 = planes[1].shape[0] * planes[1].shape[1];
-    if (n0 + n1 != dst_bytes || !planes[0].data || !planes[1].data) return RAD_E_SHAPE;
-    const uint8_t* a = (const uint8_t*)planes[0].data;
-    uint8_t* d = (uint8_t*)dst;
-    for (int64_t i = 0; i < n0; ++i) d[i] = (uint8_t)(a[n0 - 1 - i] ^ 0x5a);
-    std::memcpy(d + n0, planes[1].data, (size_t)n1);
-    return RAD_OK;
-}
-}  /* namespace */
-
-/* A weight whose kernel stores a relayout of the container's planes goes to the file tier too
- * (weight_file_relaid, PlannerInput::file_relayout) and is relaid on every read, by the kernel's
- * own relayout, into the read windows the copy to the card reads. Three routed layers of four
- * experts, two planes per weight: the second starts 256 bytes past the first's end, so not on an
- * O_DIRECT block, and a layer's relaid bytes span two read windows. Experts 0 and 2 stay resident.
- * Refused without the planner's flag, and by a mover with no relayout. */
-TEST(the_file_tier_relays_a_weight_its_kernel_relayouts_on_every_read) {
-    Fixture f;
-    const int64_t tail = 600;                         /* the second plane */
-    const int64_t gu = 20 * MiB + 1000 + tail, dn = 1 * MiB + 24 + tail;
-    const int L = 3;    /* with two, the two layer buffers cost what the file-tier experts would */
-    build_moe_layers(f, L, 4, gu, dn);
-    RadKernelInfo info = g_dev_info;
-    info.relayout = reversing_relayout;
-    KernelRow row;
-    row.info = &info;
-    for (OpInfo& o : f.prog.ops)
-        if (o.op == "moe_gemm") o.bands[0].dom[RAD_DOMAIN_DEVICE].row = &row;
-
-    int64_t off = 4 * (int64_t)RAD_ALIGN_UNIT;
-    std::vector<rad_weight> relaid;
-    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
-        WeightInfo& wi = f.prog.weights[w];
-        wi.stored_bytes = wi.logical_bytes;
-        wi.file_offset = (uint64_t)off;
-        if (wi.decl.group.expert < 0) {
-            off = align_up(off + wi.stored_bytes, RAD_ALIGN_UNIT);
-            continue;
-        }
-        const int64_t n0 = wi.logical_bytes - tail;
-        wi.identity = false;
-        wi.layout_tag = "test.reversed";
-        wi.lay_op = wi.first_use_op;
-        wi.lay_band = 0;
-        wi.lay_dom = RAD_DOMAIN_DEVICE;
-        wi.lay_operand = 0;
-        wi.enc.n_planes = 2;
-        wi.enc.plane[0].dtype = RAD_U8;
-        wi.enc.plane[1].dtype = RAD_U8;
-        wi.n_sel = 2;
-        wi.sel[0] = 0;
-        wi.sel[1] = 1;
-        wi.sel_rows[0] = 1; wi.sel_cols[0] = n0;
-        wi.sel_rows[1] = 1; wi.sel_cols[1] = tail;
-        wi.file_plane_offset[0] = (uint64_t)off;
-        wi.file_plane_offset[1] = (uint64_t)align_up(off + n0, 256);
-        off = align_up((int64_t)wi.file_plane_offset[1] + tail, RAD_ALIGN_UNIT);
-        relaid.push_back(w);
-    }
-    std::vector<uint8_t> img((size_t)off);
-    for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
-    const std::string path = "place_test_file_relay.rad";
-    {
-        FILE* fp = std::fopen(path.c_str(), "wb");
-        CHECK(fp != nullptr);
-        if (!fp) return;
-        CHECK_EQ(std::fwrite(img.data(), 1, img.size(), fp), img.size());
-        std::fclose(fp);
-    }
-    {
-        DirectFile probe;
-        if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
-            std::printf("  SKIP the working directory has no O_DIRECT\n");
-            std::remove(path.c_str());
-            return;
-        }
-    }
-    /* What the relayout makes of weight w's planes. */
-    auto expect = [&](rad_weight w) {
-        const WeightInfo& wi = f.prog.weights[w];
-        const int64_t n0 = wi.sel_cols[0];
-        std::vector<uint8_t> e((size_t)wi.stored_bytes);
-        for (int64_t i = 0; i < n0; ++i)
-            e[(size_t)i] = (uint8_t)(img[(size_t)(wi.file_plane_offset[0] + n0 - 1 - i)] ^ 0x5a);
-        std::memcpy(e.data() + n0, img.data() + wi.file_plane_offset[1], (size_t)tail);
-        return e;
-    };
-
-    std::vector<RadFileProfile> prof;
-    for (int l = 0; l < L; ++l)
-        for (int e = 0; e < 4; ++e)
-            prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f : 0.01f, 0.0f});
-    Config c = base_config();
-    c.placement = "expert_tiered";
-    c.deterministic = true;
-    c.vram_weights_mib = 222;
-    c.host_pool_mib = (4 * 22 * MiB + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
-    c.weights_disk_tier = true;
-    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
-    {
-        /* Without the flag a relaid unit fits in no tier, as before. */
-        Plan refused;
-        CHECK(Planner(in).plan(&refused) < 0);
-    }
-    in.file_relayout = true;
-    Plan p;
-    CHECK_OK(Planner(in).plan(&p));
-    std::vector<std::vector<rad_weight>> file_w((size_t)L);
-    for (const MoveUnit& mu : p.units) {
-        if (mu.expert < 0) continue;
-        CHECK(mu.tier == ((mu.expert & 1) ? Tier::SSD : Tier::VRAM));
-        if (mu.tier == Tier::SSD)
-            for (rad_weight w : mu.weights) file_w[(size_t)mu.layer].push_back(w);
-    }
-
-    MoverConfig mc;
-    mc.container_path = path;
-    {
-        /* A mover with no relayout refuses the plan rather than copy the planes as they lie. */
-        Mover bare;
-        CHECK(bare.init(f.prog, p, mc) < 0);
-    }
-    Mover m;
-    std::atomic<int> calls{ 0 };
-    m.set_file_relayout([&](const WeightInfo& w, const RadTensor* planes, void* dst, int64_t n) {
-        ++calls;
-        const RadKernelInfo* ki = weight_layout_kernel(f.prog, w);
-        if (!ki || !ki->relayout) return (int)RAD_E_STATE;
-        return ki->relayout(nullptr, 0, w.lay_operand, &w.enc, w.sel, planes, w.n_sel, dst, n);
-    });
-    CHECK_OK(m.init(f.prog, p, mc));
-    RadStream s = nullptr;
-    CHECK_OK(rad_stream_create(&s, 0));
-    CHECK_OK(m.bind_compute_stream(s));
-    FileStager fs;
-    CHECK_OK(fs.init(f.prog, p, &m));
-    CHECK(fs.enabled());
-
-    /* Every file-tier weight of layer l is published holding its relayout. */
-    auto relaid_ok = [&](int l) {
-        int ok = 0;
-        for (rad_weight w : file_w[(size_t)l]) {
-            const WeightSlot* slot = m.residency()->lookup(w);
-            if (!slot || !slot->ptr) continue;
-            const WeightInfo& wi = f.prog.weights[w];
-            std::vector<uint8_t> got((size_t)wi.stored_bytes);
-            rad_stream_sync(m.transfer_stream());
-            if (rad_memcpy_async(got.data(), slot->ptr, wi.stored_bytes, s) < 0) continue;
-            rad_stream_sync(s);
-            if (got == expect(w)) ++ok;
-        }
-        return ok == (int)file_w[(size_t)l].size() && ok > 0;
-    };
-    for (int pass = 0; pass < 2; ++pass) {
-        RadBatch b{};
-        CHECK(fs.begin_pass(&b));
-        bool resync = false;
-        CHECK_OK(fs.before_op(0, s, &resync));          /* layer 0 */
-        CHECK(relaid_ok(0));
-        CHECK_OK(fs.before_op(1, s, &resync));          /* layer 1 read ahead */
-        CHECK(relaid_ok(1));
-        CHECK_OK(fs.before_op(2, s, &resync));
-        CHECK_OK(fs.before_op(3, s, &resync));          /* layer 2 read ahead */
-        CHECK(relaid_ok(1) && relaid_ok(2));
-        CHECK_OK(fs.before_op(4, s, &resync));
-        CHECK_OK(fs.before_op(5, s, &resync));
-        CHECK(relaid_ok(2));
-        CHECK_OK(fs.before_op(6, s, &resync));
-        CHECK_OK(fs.end_pass(s));
-    }
-    /* Two passes over three layers of two file-tier experts of two weights, every one relaid. */
-    CHECK_EQ(m.stats().file_relaid, (uint64_t)(2 * L * 2 * 2));
-    CHECK_EQ((uint64_t)calls.load(), m.stats().file_relaid);
-    CHECK_EQ(m.stats().file_units, (uint64_t)(2 * L * 2));
-    rad_stream_sync(m.transfer_stream());
-    rad_stream_destroy(s);
-    std::remove(path.c_str());
-}
-
-TEST(the_file_stager_reads_only_the_experts_a_small_pass_routes_to) {
-    /* The fixture above: three routed layers of four experts, 1 and 3 of each on the file tier.
-     * A one-token pass at top_k 2 routes, per layer, to the counts below. Layer 0 routes to
-     * expert 1 and is then sliced (its first op issued again), so the whole layer is read
-     * behind it; layer 1 routes to 3; layer 2's counts do not add up to the pass, so it is read
-     * whole. */
-    Fixture f;
-    const int64_t gu = 14 * MiB + 1000, dn = 6 * MiB + 24;
-    const int L = 3;
-    build_moe_layers(f, L, 4, gu, dn);
-
+/* Every weight of `f` in a container image, each on RAD_ALIGN_UNIT in declared order with a 2 MiB
+ * hole between layers, written to `path` with each byte container_byte(offset). Empty when the
+ * working directory has no O_DIRECT (the caller skips). */
+std::vector<uint8_t> write_container(Fixture& f, const std::string& path) {
     int64_t off = 4 * (int64_t)RAD_ALIGN_UNIT;
     int32_t prev = -1;
     for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
@@ -1671,42 +1477,111 @@ TEST(the_file_stager_reads_only_the_experts_a_small_pass_routes_to) {
     }
     std::vector<uint8_t> img((size_t)off);
     for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
-    const std::string path = "place_test_file_routed.rad";
-    {
-        FILE* fp = std::fopen(path.c_str(), "wb");
-        CHECK(fp != nullptr);
-        if (!fp) return;
-        CHECK_EQ(std::fwrite(img.data(), 1, img.size(), fp), img.size());
-        std::fclose(fp);
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) return {};
+    const bool wrote = std::fwrite(img.data(), 1, img.size(), fp) == img.size();
+    std::fclose(fp);
+    DirectFile probe;
+    if (!wrote || probe.open(path.c_str(), RAD_DIO_READ) < 0) {
+        std::remove(path.c_str());
+        return {};
     }
-    {
-        DirectFile probe;
-        if (probe.open(path.c_str(), RAD_DIO_READ) < 0) {
-            std::printf("  SKIP the working directory has no O_DIRECT\n");
-            std::remove(path.c_str());
-            return;
-        }
-    }
+    return img;
+}
 
+/* A routing-count source like Ctx::route_counts_device over a MoE block declared once: one counts
+ * buffer that every routed layer's router rewrites (glm5next shares its counts this way), so a
+ * read that took the counts before its own layer's router ran would see another layer's. A layer
+ * in `missing` has not reported yet. `asked` counts the stager's questions. */
+struct SharedCounts {
+    int32_t* dev = nullptr;
+    int64_t  n = 0;
+    std::vector<int32_t> missing;
+    int      asked = 0;
+    explicit SharedCounts(int64_t n_expert) : n(n_expert) {
+        dev = (int32_t*)rad_dev_alloc(n_expert * (int64_t)sizeof(int32_t), RAD_MEM_DEVICE);
+    }
+    ~SharedCounts() { if (dev) rad_dev_free(dev, RAD_MEM_DEVICE); }
+    /* The router of the rows about to run, on the host backend's shared memory. */
+    void route(std::initializer_list<int32_t> c) {
+        int64_t i = 0;
+        for (int32_t v : c) dev[i++] = v;
+    }
+    static const int32_t* get(void* ud, int32_t layer, int64_t* n_expert) {
+        SharedCounts& s = *(SharedCounts*)ud;
+        ++s.asked;
+        *n_expert = 0;
+        if (std::find(s.missing.begin(), s.missing.end(), layer) != s.missing.end()) return nullptr;
+        *n_expert = s.n;
+        return s.dev;
+    }
+};
+
+/* What one routed unit's weights are published as right now: the container's bytes, the zero
+ * region (a skipped expert), or nothing. */
+enum class Pub { Bytes, Zeros, Null, Other };
+Pub published(Mover& m, const Plan& p, const Program& prog, int32_t unit,
+              const std::vector<uint8_t>& img, RadStream s) {
+    Pub got = Pub::Bytes;
+    for (rad_weight w : p.units[(size_t)unit].weights) {
+        const WeightSlot* slot = m.residency()->lookup(w);
+        if (!slot || !slot->ptr) return Pub::Null;
+        if (published_matches(m, prog, w, img, s)) continue;
+        std::vector<uint8_t> head(256);
+        rad_stream_sync(m.transfer_stream());
+        if (rad_memcpy_async(head.data(), slot->ptr, (int64_t)head.size(), s) < 0) return Pub::Other;
+        rad_stream_sync(s);
+        bool zero = true;
+        for (uint8_t v : head) zero = zero && v == 0;
+        got = zero ? Pub::Zeros : Pub::Other;
+    }
+    return got;
+}
+
+int32_t unit_at(const Plan& p, int32_t layer, int32_t expert) {
+    for (int32_t i = 0; i < (int32_t)p.units.size(); ++i)
+        if (p.units[(size_t)i].layer == layer && p.units[(size_t)i].expert == expert) return i;
+    return -1;
+}
+}  /* namespace */
+
+/* A layer is read with the counts its own router wrote, at its own trigger. Three routed layers
+ * of four 3 MiB experts, 1 and 3 on the file tier, every router writing one shared counts buffer.
+ * A read taken before a layer's router ran -- at the pass's first op, or ahead at the previous
+ * layer's trigger -- would filter the layer by another layer's counts and leave a routed expert
+ * to be computed from the zero region. A second slice of a layer's rows routes again, and what it
+ * routes that the first did not is read then. */
+TEST(the_file_stager_reads_a_layer_with_the_counts_its_own_router_wrote) {
+    Fixture f;
+    const int L = 3;
+    build_moe_layers(f, L, 4, 2 * MiB + 1000, MiB + 24);
+    f.prog.meta.n_expert = 4;
+    const std::string path = "place_test_counts.rad";
+    const std::vector<uint8_t> img = write_container(f, path);
+    if (img.empty()) {
+        std::printf("  SKIP the working directory has no O_DIRECT\n");
+        return;
+    }
     std::vector<RadFileProfile> prof;
     for (int l = 0; l < L; ++l)
         for (int e = 0; e < 4; ++e)
             prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f : 0.01f, 0.0f});
+    /* Six residents, the two file buffers and the embedding fill the card; the host pool is the
+     * file tier's staging and nothing more. */
+    const int64_t stride = align_up(align_up(2 * MiB + 1000, RAD_ALIGN_UNIT) + MiB + 24,
+                                    RAD_ALIGN_UNIT);
     Config c = base_config();
     c.placement = "expert_tiered";
     c.deterministic = true;
-    c.vram_weights_mib = 210;
-    c.host_pool_mib = (4 * 21 * MiB + RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+    c.vram_weights_mib = 32;
+    c.host_pool_mib = (RAD_PLACE_FILE_STAGE_SLOTS * stride +
+                       RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
     c.weights_disk_tier = true;
     PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
     Plan p;
     CHECK_OK(Planner(in).plan(&p));
-    /* file_w[l][e]: the file-tier weights of expert e of layer l. */
-    std::vector<std::vector<std::vector<rad_weight>>> file_w(
-        (size_t)L, std::vector<std::vector<rad_weight>>(4));
     for (const MoveUnit& mu : p.units)
-        if (mu.expert >= 0 && mu.tier == Tier::SSD)
-            for (rad_weight w : mu.weights) file_w[(size_t)mu.layer][(size_t)mu.expert].push_back(w);
+        if (mu.expert >= 0) CHECK(mu.tier == ((mu.expert & 1) ? Tier::SSD : Tier::VRAM));
 
     Mover m;
     MoverConfig mc;
@@ -1715,85 +1590,401 @@ TEST(the_file_stager_reads_only_the_experts_a_small_pass_routes_to) {
     RadStream s = nullptr;
     CHECK_OK(rad_stream_create(&s, 0));
     CHECK_OK(m.bind_compute_stream(s));
-
-    int32_t counts[L][4] = { { 1, 1, 0, 0 }, { 0, 0, 1, 1 }, { 1, 0, 0, 0 } };
+    SharedCounts counts(4);
+    /* What the last pass's last router left: both file-tier experts of every layer routed. */
+    counts.route({0, 1, 0, 1});
     FileStager fs;
-    CHECK_OK(fs.init(f.prog, p, &m, [&](int32_t layer, int64_t* ne, int64_t* top_k) {
-        *ne = 4;
-        *top_k = 2;
-        return (layer >= 0 && layer < L) ? (const int32_t*)counts[layer] : nullptr;
-    }));
-    CHECK(fs.enabled());
-    CHECK(fs.routed_reads());
+    CHECK_OK(fs.init(f.prog, p, &m, &SharedCounts::get, &counts));
+    REQUIRE_EQ(fs.n_layers(), (size_t)L);
+    auto pub = [&](int l, int e) { return published(m, p, f.prog, unit_at(p, l, e), img, s); };
+    auto none = [&](int l) { return pub(l, 1) == Pub::Null && pub(l, 3) == Pub::Null; };
 
-    /* 0: no address; 1: its container bytes; 2: an alias into the layer's file buffer. */
-    auto state = [&](int l, int e) {
-        int got = -1;
-        for (rad_weight w : file_w[(size_t)l][(size_t)e]) {
-            const WeightSlot* slot = m.residency()->lookup(w);
-            int st = 0;
-            if (slot && slot->ptr) {
-                if (published_matches(m, f.prog, w, img, s)) st = 1;
-                else if (slot->ptr == m.file_buffer(l & 1)) st = 2;
-                else st = 3;
-            }
-            if (got >= 0 && st != got) return 4;          /* the unit's weights disagree */
-            got = st;
-        }
-        return got;
-    };
-
+    /* Op 0 is the embedding; layer l's expert ops are 2l+1 and 2l+2. */
     RadBatch b{};
-    b.n_tok = 1;
     CHECK(fs.begin_pass(&b));
     bool resync = false;
-    CHECK_OK(fs.before_op(0, s, &resync));     /* no read before layer 0's router has run */
+    CHECK_OK(fs.before_op(0, s, &resync));
+    /* Nothing yet: no counts for layer 0 exist before its router has run. */
     CHECK(!resync);
-    CHECK_EQ(state(0, 1), 0);
-    CHECK_OK(fs.before_op(1, s, &resync));     /* layer 0: expert 1 read, 3 aliased, no read-ahead */
+    for (int l = 0; l < L; ++l) CHECK(none(l));
+
+    counts.route({0, 2, 0, 0});                       /* layer 0's router: expert 1 only */
+    CHECK_OK(fs.before_op(1, s, &resync));
     CHECK(resync);
-    CHECK_EQ(state(0, 1), 1);
-    CHECK_EQ(state(0, 3), 2);
-    CHECK_EQ(state(1, 1), 0);
+    CHECK(pub(0, 1) == Pub::Bytes);
+    CHECK(pub(0, 3) == Pub::Zeros);                   /* not routed: the zero region, not read */
+    CHECK(none(1));                                   /* layer 1's router has not run */
+    CHECK(none(2));
     CHECK_OK(fs.after_op(1, s));
-    CHECK_OK(fs.before_op(1, s, &resync));     /* a second slice: the whole layer */
-    CHECK(resync);
-    CHECK_EQ(state(0, 1), 1);
-    CHECK_EQ(state(0, 3), 1);
+    /* A second slice of layer 0's rows that routes nothing new reads and publishes nothing. */
+    const int64_t waits0 = fs.waits();
+    counts.route({0, 5, 0, 0});
+    CHECK_OK(fs.before_op(1, s, &resync));
+    CHECK(!resync);
+    CHECK_EQ(fs.waits(), waits0);
+    CHECK(pub(0, 1) == Pub::Bytes && pub(0, 3) == Pub::Zeros);
+    CHECK_OK(fs.after_op(1, s));
     CHECK_OK(fs.before_op(2, s, &resync));
-    CHECK_OK(fs.before_op(3, s, &resync));     /* layer 1: 0 released, expert 3 read, 1 aliased */
-    CHECK_EQ(state(0, 1), 0);
-    CHECK_EQ(state(0, 3), 0);
-    CHECK_EQ(state(1, 3), 1);
-    CHECK_EQ(state(1, 1), 2);
+
+    counts.route({0, 0, 0, 5});                       /* layer 1's router: expert 3 only */
+    CHECK_OK(fs.before_op(3, s, &resync));
+    CHECK(none(0));                                   /* released */
+    CHECK(pub(1, 3) == Pub::Bytes);
+    CHECK(pub(1, 1) == Pub::Zeros);
+    CHECK(none(2));
+    /* A second slice of layer 1's rows routes expert 1 as well: read now, and waited on. */
+    const int64_t waits = fs.waits();
+    counts.route({0, 7, 0, 0});
+    CHECK_OK(fs.before_op(3, s, &resync));
+    CHECK(resync);
+    CHECK_EQ(fs.waits(), waits + 1);
+    CHECK(pub(1, 1) == Pub::Bytes);
+    CHECK(pub(1, 3) == Pub::Bytes);
+    /* A third routes nothing new: no read, no wait. */
+    counts.route({0, 0, 0, 1});
+    CHECK_OK(fs.before_op(3, s, &resync));
+    CHECK(!resync);
+    CHECK_EQ(fs.waits(), waits + 1);
     CHECK_OK(fs.before_op(4, s, &resync));
-    CHECK_OK(fs.before_op(5, s, &resync));     /* layer 2: counts sum to 1, not 2: read whole */
-    CHECK_EQ(state(1, 1), 0);
-    CHECK_EQ(state(2, 1), 1);
-    CHECK_EQ(state(2, 3), 1);
+
+    counts.route({0, 1, 0, 1});
+    CHECK_OK(fs.before_op(5, s, &resync));
+    CHECK(none(0) && none(1));
+    CHECK(pub(2, 1) == Pub::Bytes && pub(2, 3) == Pub::Bytes);
     CHECK_OK(fs.before_op(6, s, &resync));
     CHECK_OK(fs.end_pass(s));
-    for (int l = 0; l < L; ++l) {
-        CHECK_EQ(state(l, 1), 0);
-        CHECK_EQ(state(l, 3), 0);
-    }
-    /* Units read: 1 + 2 (layer 0, routed then whole) + 1 + 2; aliased: one each in layers 0, 1. */
-    CHECK_EQ(m.stats().file_units, (uint64_t)6);
-    CHECK_EQ(m.stats().file_aliased, (uint64_t)2);
+    for (int l = 0; l < L; ++l) CHECK(none(l));
+    /* Two experts skipped at a trigger (layer 0's 3, layer 1's 1), one of them read by the
+     * second slice; five units read, each once. */
+    CHECK_EQ(m.stats().ssd_skipped_units, (uint64_t)2);
+    CHECK_EQ(m.stats().ssd_units, (uint64_t)5);
 
-    /* A prefill-sized pass keeps the whole-layer read and its read-ahead. */
-    RadBatch big{};
-    big.n_tok = FileStager::kRoutedRows + 1;
-    CHECK(fs.begin_pass(&big));
+    /* A layer the source has no counts for (it has not reported) is read whole, so it can be read
+     * ahead as before: layer 1 at layer 0's trigger. A counted one is not. */
+    counts.missing = {1};
+    CHECK(fs.begin_pass(&b));
+    CHECK_OK(fs.before_op(0, s, &resync));
+    counts.route({0, 0, 0, 3});
+    CHECK_OK(fs.before_op(1, s, &resync));
+    CHECK(pub(0, 3) == Pub::Bytes && pub(0, 1) == Pub::Zeros);
+    CHECK(pub(1, 1) == Pub::Bytes && pub(1, 3) == Pub::Bytes);
+    CHECK(none(2));
+    CHECK_OK(fs.before_op(2, s, &resync));
+    CHECK_OK(fs.before_op(3, s, &resync));
+    CHECK(pub(1, 1) == Pub::Bytes && pub(1, 3) == Pub::Bytes);
+    CHECK(none(2));
+    CHECK_OK(fs.before_op(4, s, &resync));
+    counts.route({0, 4, 0, 0});
+    CHECK_OK(fs.before_op(5, s, &resync));
+    CHECK(pub(2, 1) == Pub::Bytes && pub(2, 3) == Pub::Zeros);
+    CHECK_OK(fs.before_op(6, s, &resync));
+    CHECK_OK(fs.end_pass(s));
+    for (int l = 0; l < L; ++l) CHECK(none(l));
+
+    /* With no layer counted, the first one is read at the pass's first op, as before. */
+    counts.missing = {0, 1, 2};
+    CHECK(fs.begin_pass(&b));
     CHECK_OK(fs.before_op(0, s, &resync));
     CHECK(resync);
-    CHECK_EQ(state(0, 1), 1);
-    CHECK_EQ(state(0, 3), 1);
-    CHECK_OK(fs.before_op(1, s, &resync));
-    CHECK_EQ(state(1, 1), 1);
+    CHECK(pub(0, 1) == Pub::Bytes && pub(0, 3) == Pub::Bytes);
+    CHECK(none(1));
     CHECK_OK(fs.end_pass(s));
+    for (int l = 0; l < L; ++l) CHECK(none(l));
+
+    /* A pass whose rows route nearly every expert -- 64 rows an expert on average, here four
+     * experts at top-1, so 256 rows -- is read whole and ahead like a layer without counts: the
+     * counts are never asked for, so no trigger drains the stream, though they are there. One
+     * row fewer is read exactly. */
+    f.prog.meta.n_expert_used = 1;
+    counts.missing.clear();
+    FileStager wf;
+    CHECK_OK(wf.init(f.prog, p, &m, &SharedCounts::get, &counts));
+    CHECK_EQ(wf.whole_rows(), (int64_t)256);
+    CHECK_EQ(fs.whole_rows(), (int64_t)0);            /* top-k unknown: always exact */
+    counts.route({0, 0, 0, 0});                       /* routes nothing, were it asked */
+    const int asked = counts.asked;
+    RadBatch big{};
+    big.n_tok = 256;
+    CHECK(wf.begin_pass(&big));
+    CHECK_OK(wf.before_op(0, s, &resync));
+    CHECK(resync);
+    CHECK(pub(0, 1) == Pub::Bytes && pub(0, 3) == Pub::Bytes);
+    CHECK(none(1));
+    CHECK_OK(wf.before_op(1, s, &resync));
+    CHECK(pub(0, 1) == Pub::Bytes && pub(0, 3) == Pub::Bytes);
+    CHECK(pub(1, 1) == Pub::Bytes && pub(1, 3) == Pub::Bytes);   /* ahead, at layer 0's trigger */
+    CHECK_OK(wf.before_op(1, s, &resync));             /* another slice: nothing left to read */
+    CHECK(!resync);
+    CHECK_OK(wf.before_op(2, s, &resync));
+    CHECK_OK(wf.before_op(3, s, &resync));
+    CHECK(none(0));
+    CHECK(pub(2, 1) == Pub::Bytes && pub(2, 3) == Pub::Bytes);
+    for (rad_op op = 4; op <= 6; ++op) CHECK_OK(wf.before_op(op, s, &resync));
+    CHECK_OK(wf.end_pass(s));
+    CHECK_EQ(counts.asked, asked);
+    for (int l = 0; l < L; ++l) CHECK(none(l));
+
+    big.n_tok = 255;
+    CHECK(wf.begin_pass(&big));
+    CHECK_OK(wf.before_op(0, s, &resync));
+    CHECK(none(0));
+    counts.route({0, 2, 0, 0});
+    CHECK_OK(wf.before_op(1, s, &resync));
+    CHECK(pub(0, 1) == Pub::Bytes && pub(0, 3) == Pub::Zeros);
+    CHECK(none(1));
+    CHECK(counts.asked > asked);
+    CHECK_OK(wf.end_pass(s));
 
     rad_stream_sync(m.transfer_stream());
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
+/* The pool is a cache of the file tier under a dynamic plan. A read that finds it full gives its
+ * coldest pooled unit back to the file tier when that unit is colder than the one read, never one
+ * of the layer being read or of one whose ops are about to run; the unit given back -- here one
+ * the plan put in the pool, in a layer with nothing on the file tier -- is read back by its own
+ * layer's trigger; and a read whose only copy is a deposit is waited on before the layer's ops. */
+TEST(a_full_pool_gives_back_its_coldest_unit_and_the_stager_reads_it_again) {
+    Fixture f;
+    const int L = 3;
+    build_moe_layers(f, L, 4, MiB + 1000, MiB / 2 + 24);
+    f.prog.meta.n_expert = 4;
+    const std::string path = "place_test_cache.rad";
+    const std::vector<uint8_t> img = write_container(f, path);
+    if (img.empty()) {
+        std::printf("  SKIP the working directory has no O_DIRECT\n");
+        return;
+    }
+    /* Rank order: layer 0's experts, then layer 1's, then layer 2's. Layer 0's four fill the
+     * pool and the rest go to the file tier, so layer 0 has nothing there. The card holds the
+     * embedding and the two file buffers; a resident would also need a hot-cache shadow slot,
+     * and the plan has no room for the pair. */
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < 4; ++e)
+            prof.push_back(RadFileProfile{l, e, 0.9f - 0.3f * (float)l - 0.05f * (float)e, 0.0f});
+    const int64_t stride = align_up(align_up(MiB + 1000, RAD_ALIGN_UNIT) + MiB / 2 + 24,
+                                    RAD_ALIGN_UNIT);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 15;
+    const int64_t reserve = RAD_PLACE_FILE_STAGE_SLOTS * stride +
+                            RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES;
+    c.host_pool_mib = (reserve + 4 * stride) / MiB + 1;
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    REQUIRE(p.dynamic);
+    auto tier_of = [&](int l, int e) { return p.units[(size_t)unit_at(p, l, e)].tier; };
+    for (int e = 0; e < 4; ++e) {
+        REQUIRE(tier_of(0, e) == Tier::HostPinned);
+        REQUIRE(tier_of(1, e) == Tier::SSD);
+        REQUIRE(tier_of(2, e) == Tier::SSD);
+    }
+
+    Mover m;
+    MoverConfig mc;
+    mc.container_path = path;
+    CHECK_OK(m.init(f.prog, p, mc));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    CHECK_OK(m.bind_compute_stream(s));
+    HeatEngine h;
+    CHECK_OK(h.init(p, HeatParams{}));
+    REQUIRE(h.enabled());
+    SharedCounts counts(4);
+    FileStager fs;
+    CHECK_OK(fs.init(f.prog, p, &m, &SharedCounts::get, &counts));
+    /* Layer 0 is covered though the plan put none of it on the file tier: a deposit may give its
+     * pooled units back to the file tier. */
+    REQUIRE_EQ(fs.n_layers(), (size_t)L);
+    auto pub = [&](int l, int e) { return published(m, p, f.prog, unit_at(p, l, e), img, s); };
+
+    /* Where the pooled units are published: their pool slots, which this test never fills (the
+     * load phase does), so they are compared by address. */
+    auto addr = [&](int l, int e) {
+        return m.residency()->lookup(p.units[(size_t)unit_at(p, l, e)].weights.front())->ptr;
+    };
+    void* const pooled[3] = { addr(0, 1), addr(0, 2), addr(0, 3) };
+    for (void* q : pooled) CHECK(q != nullptr);
+
+    /* Layer 2's expert 0 has routed before; nothing else has. */
+    const int32_t hist[4] = {3, 0, 0, 0};
+    h.observe(2, hist, 4);
+    CHECK_OK(m.begin_dispatch(1, &h));
+
+    RadBatch b{};
+    bool resync = false;
+    CHECK(fs.begin_pass(&b));
+    CHECK_OK(fs.before_op(0, s, &resync));
+    counts.route({1, 0, 0, 0});
+    CHECK_OK(fs.before_op(1, s, &resync));            /* layer 0: nothing on the file tier */
+    CHECK(!resync);
+    CHECK_OK(fs.before_op(2, s, &resync));
+    /* Layer 1's expert 2 is as cold as every pooled unit: not worth a slot, read into the
+     * buffer. */
+    counts.route({0, 0, 2, 0});
+    CHECK_OK(fs.before_op(3, s, &resync));
+    CHECK(pub(1, 2) == Pub::Bytes);
+    CHECK_EQ(m.stats().pool_evictions, (uint64_t)0);
+    CHECK_OK(fs.before_op(4, s, &resync));
+    /* Layer 2's expert 0 is warmer: the coldest pooled unit outside layer 2 goes back to the file
+     * tier, the lowest of the equally cold ones -- layer 0's expert 0 -- and its weights point at
+     * the zero region until its own layer reads it. */
+    counts.route({3, 0, 0, 0});
+    CHECK_OK(fs.before_op(5, s, &resync));
+    CHECK(pub(2, 0) == Pub::Bytes);
+    CHECK_EQ(m.stats().pool_evictions, (uint64_t)1);
+    CHECK(pub(0, 0) == Pub::Zeros);
+    CHECK(m.on_file_tier({unit_at(p, 0, 0)}));
+    CHECK(addr(0, 1) == pooled[0] && addr(0, 2) == pooled[1] && addr(0, 3) == pooled[2]);
+    CHECK_OK(fs.before_op(6, s, &resync));
+    CHECK_OK(fs.end_pass(s));
+
+    /* The pool slot it gave up comes back after its quarantine. */
+    for (int d = 2; d < 5; ++d) {
+        CHECK_OK(rad_stream_sync(s));
+        CHECK_OK(m.begin_dispatch(d, &h));
+    }
+
+    /* Layer 0's trigger routes the unit back: it is read into the free pool slot -- a read
+     * whose only copy is that deposit, which the stream waits on all the same. */
+    CHECK(fs.begin_pass(&b));
+    CHECK_OK(fs.before_op(0, s, &resync));
+    counts.route({1, 0, 0, 0});
+    const int64_t waits = fs.waits();
+    CHECK_OK(fs.before_op(1, s, &resync));
+    CHECK(resync);
+    CHECK_EQ(m.stats().ssd_deposits, (uint64_t)1);
+    CHECK_EQ(fs.waits(), waits + 1);
+    CHECK(pub(0, 0) == Pub::Bytes);
+    CHECK(!m.on_file_tier({unit_at(p, 0, 0)}));
+    counts.route({0, 0, 0, 0});
+    for (rad_op op = 2; op <= 6; ++op) CHECK_OK(fs.before_op(op, s, &resync));
+    CHECK_OK(fs.end_pass(s));
+    /* A deposit outlives the pass: the unit stays in its pool slot. */
+    CHECK(pub(0, 0) == Pub::Bytes);
+
+    rad_stream_sync(m.transfer_stream());
+    rad_stream_sync(s);
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
+/* A layer with nothing on the file tier is held by neither buffer, yet its ops are about to be
+ * issued: a read-ahead of the next layer that finds the pool full must not give one of its pooled
+ * units back (the weights would point at the zero region for an op still to come), while the same
+ * pass's read-ahead from the next layer on is free to take it. */
+TEST(a_read_ahead_never_takes_a_pooled_unit_of_the_layer_about_to_run) {
+    Fixture f;
+    const int L = 3;
+    build_moe_layers(f, L, 4, MiB + 1000, MiB / 2 + 24);
+    f.prog.meta.n_expert = 4;
+    const std::string path = "place_test_cache2.rad";
+    const std::vector<uint8_t> img = write_container(f, path);
+    if (img.empty()) {
+        SKIP("the working directory has no O_DIRECT");
+    }
+    /* Rank order: layer 0's experts, then layer 1's, then layer 2's. Layer 0's four fill the
+     * pool and the rest go to the file tier, so layer 0 has nothing there. The card holds the
+     * embedding and the two file buffers; a resident would also need a hot-cache shadow slot,
+     * and the plan has no room for the pair. */
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < 4; ++e)
+            prof.push_back(RadFileProfile{l, e, 0.9f - 0.3f * (float)l - 0.05f * (float)e, 0.0f});
+    const int64_t stride = align_up(align_up(MiB + 1000, RAD_ALIGN_UNIT) + MiB / 2 + 24,
+                                    RAD_ALIGN_UNIT);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.vram_weights_mib = 15;
+    const int64_t reserve = RAD_PLACE_FILE_STAGE_SLOTS * stride +
+                            RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES;
+    c.host_pool_mib = (reserve + 4 * stride) / MiB + 1;
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    CHECK_OK(Planner(in).plan(&p));
+    REQUIRE(p.dynamic);
+    auto tier_of = [&](int l, int e) { return p.units[(size_t)unit_at(p, l, e)].tier; };
+    for (int e = 0; e < 4; ++e) {
+        REQUIRE(tier_of(0, e) == Tier::HostPinned);
+        REQUIRE(tier_of(1, e) == Tier::SSD);
+        REQUIRE(tier_of(2, e) == Tier::SSD);
+    }
+
+    Mover m;
+    MoverConfig mc;
+    mc.container_path = path;
+    CHECK_OK(m.init(f.prog, p, mc));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    CHECK_OK(m.bind_compute_stream(s));
+    HeatEngine h;
+    CHECK_OK(h.init(p, HeatParams{}));
+    REQUIRE(h.enabled());
+    SharedCounts counts(4);
+    FileStager fs;
+    CHECK_OK(fs.init(f.prog, p, &m, &SharedCounts::get, &counts));
+    /* Layer 0 is covered though the plan put none of it on the file tier: a deposit may give its
+     * pooled units back to the file tier. */
+    REQUIRE_EQ(fs.n_layers(), (size_t)L);
+    auto pub = [&](int l, int e) { return published(m, p, f.prog, unit_at(p, l, e), img, s); };
+
+    /* Where the pooled units are published: their pool slots, which this test never fills (the
+     * load phase does), so they are compared by address. */
+    auto addr = [&](int l, int e) {
+        return m.residency()->lookup(p.units[(size_t)unit_at(p, l, e)].weights.front())->ptr;
+    };
+    void* const pooled[3] = { addr(0, 1), addr(0, 2), addr(0, 3) };
+    for (void* q : pooled) CHECK(q != nullptr);
+
+    void* const pooled0 = addr(0, 0);
+    /* Layers 1 and 2 are read whole, ahead (no counts for them); each has one warm expert. */
+    counts.missing = {1, 2};
+    const int32_t hist1[4] = {0, 0, 5, 0}, hist2[4] = {3, 0, 0, 0};
+    h.observe(1, hist1, 4);
+    h.observe(2, hist2, 4);
+    CHECK_OK(m.begin_dispatch(1, &h));
+
+    RadBatch b{};
+    bool resync = false;
+    CHECK(fs.begin_pass(&b));
+    CHECK_OK(fs.before_op(0, s, &resync));
+    counts.route({1, 0, 0, 0});
+    CHECK_OK(fs.before_op(1, s, &resync));            /* layer 0 starts; layer 1 read ahead */
+    CHECK_EQ(m.stats().pool_evictions, (uint64_t)0);
+    CHECK(addr(0, 0) == pooled0);
+    CHECK(addr(0, 1) == pooled[0] && addr(0, 2) == pooled[1] && addr(0, 3) == pooled[2]);
+    CHECK(pub(1, 2) == Pub::Bytes);
+    CHECK_OK(fs.before_op(2, s, &resync));
+    CHECK_OK(fs.before_op(3, s, &resync));            /* layer 1 starts; layer 2 read ahead */
+    CHECK_EQ(m.stats().pool_evictions, (uint64_t)1);
+    CHECK(pub(2, 0) == Pub::Bytes);
+    CHECK_OK(fs.before_op(4, s, &resync));
+    CHECK_OK(fs.before_op(5, s, &resync));
+    CHECK_OK(fs.before_op(6, s, &resync));
+    CHECK_OK(fs.end_pass(s));
+
+    /* A read-ahead the pass never reaches still copied (a deposit into the pool, say), and the
+     * stream is ordered behind it when the pass ends. Once the slot layer 0 gave up is back, layer
+     * 1 is read ahead at layer 0's trigger and the pass stops there. */
+    for (int d = 2; d < 5; ++d) {
+        CHECK_OK(rad_stream_sync(s));
+        CHECK_OK(m.begin_dispatch(d, &h));
+    }
+    CHECK(fs.begin_pass(&b));
+    CHECK_OK(fs.before_op(0, s, &resync));
+    counts.route({1, 0, 0, 0});
+    CHECK_OK(fs.before_op(1, s, &resync));
+    const int64_t waits = fs.waits();
+    CHECK_OK(fs.end_pass(s));
+    CHECK_EQ(fs.waits(), waits + 1);
+
+    rad_stream_sync(m.transfer_stream());
+    rad_stream_sync(s);
     rad_stream_destroy(s);
     std::remove(path.c_str());
 }

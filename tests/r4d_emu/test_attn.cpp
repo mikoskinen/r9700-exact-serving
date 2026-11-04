@@ -37,12 +37,20 @@ struct Case {
     int64_t scratch = 0;                 /* 0: no scratch */
     int qpitch_extra = 0;                /* q as a column slice of a wider buffer */
     int expect_wmma = -1;                /* 1: must take the WMMA kernel, 0: must not, -1: either */
+    bool ahead = false;                  /* non-causal, the window bounds the keys behind only */
 };
 
 using Fn = int (*)(const RadArgs*, RadStream);
-static Fn pick(int hd, int gqa, bool fp8) {
+static Fn pick(int hd, int gqa, bool fp8, bool ahead) {
+    if (ahead) {
+#define A(G) if (hd == 256 && gqa == G) return fp8 ? r4d_rad_attn_window_ahead_h256_gqa##G##_fp8 : r4d_rad_attn_window_ahead_h256_gqa##G##_bf16;
+        A(1) A(2) A(4) A(8)
+#undef A
+        return nullptr;
+    }
 #define P(H, G) if (hd == H && gqa == G) return fp8 ? r4d_rad_attn_window_h##H##_gqa##G##_fp8 : r4d_rad_attn_window_h##H##_gqa##G##_bf16;
     P(128, 1) P(256, 1) P(256, 2) P(256, 4) P(256, 8) P(512, 1) P(512, 2) P(512, 4) P(512, 8)
+    P(512, 16)
 #undef P
     return nullptr;
 }
@@ -108,14 +116,14 @@ static int run(const Case& c) {
     auto ps = [&](const char* k, const char* v) { RadParam x{}; x.key = k; x.kind = RAD_P_STR; x.sval = v; p.push_back(x); };
     auto pf = [&](const char* k, double v) { RadParam x{}; x.key = k; x.kind = RAD_P_F64; x.dval = v; p.push_back(x); };
     pi("q_len", qmax + 3);  /* the band bound, above the step's max */
-    pi("head_dim", HD); pi("gqa", c.gqa); pi("block_size", 16); pi("causal", c.causal); pi("window", c.window);
+    pi("head_dim", HD); pi("gqa", c.gqa); pi("block_size", 16); pi("causal", c.causal && !c.ahead); pi("window", c.window);
     ps("q_dtype", "bf16"); ps("kv_dtype", c.fp8 ? "fp8_e4m3" : "bf16");
     const double scale = 1.0 / std::sqrt((double)HD) * 1.3;   /* not the default: the param must be read */
     pf("scale", scale); pi("n_head", qh); pi("max_seqs", n_seq);
     if (c.max_ctx) pi("max_ctx", c.max_ctx);
     RadArgs a{}; a.t = t; a.n_t = 8; a.p = p.data(); a.n_p = (int)p.size();
     a.scratch = c.scratch ? sp : nullptr; a.scratch_bytes = c.scratch;
-    Fn fn = pick(HD, c.gqa, c.fp8);
+    Fn fn = pick(HD, c.gqa, c.fp8, c.ahead);
     const int g0 = emu_grids;
     const int rc = fn(&a, nullptr);
     const int launches = emu_grids - g0;
@@ -127,7 +135,7 @@ static int run(const Case& c) {
         const int tok = cu[s] + i, kh = h / c.gqa, pos = c.ctx[s] - c.qlen[s] + i;
         auto visible = [&](int j) {
             if (c.causal ? j > pos : j >= c.ctx[s]) return false;
-            if (c.window > 0) { const int d = pos - j; if (c.causal ? d >= c.window : (d >= c.window || d <= -c.window)) return false; }
+            if (c.window > 0) { const int d = pos - j; if (c.causal ? d >= c.window : (d >= c.window || (!c.ahead && d <= -c.window))) return false; }
             return bt[s * maxb + j / 16] >= 0;
         };
         std::vector<double> sc(c.ctx[s], -INFINITY); double mx = -INFINITY;
@@ -197,6 +205,13 @@ int main(int argc, char** argv) {
         {"h512 gqa4 full decode, 64 splits, short ctx", 512, 4, 1, false, true, false, false, 0, {4}, {37}, -1, 262144, s512},
         {"h256 gqa2 swa w1024 verify, ragged, splits", 256, 2, 2, true, true, true, true, 1024, {3, 5}, {20, 900}, -1, 262144, s256},
         {"h512 gqa2 full ragged", 512, 2, 2, false, true, true, false, 0, {3, 1, 9}, {50, 64, 9}},
+        /* Gemma 4 12B full at TP1: 16 q heads over its one kv head, one position a tile; the
+         * assistant's full layer is the same geometry at one row a sequence */
+        {"h512 gqa16 full ragged bf16", 512, 16, 1, false, true, true, false, 0, {3, 1, 9}, {50, 64, 9}},
+        {"h512 gqa16 full decode split fp8", 512, 16, 1, true, true, false, true, 0, {1}, {700}, -1, 4096, s512},
+        {"h512 gqa16 full verify16 split", 512, 16, 1, false, true, false, false, 0, {16}, {300}, -1, 1024, s512},
+        {"h512 gqa16 full decode, 3 seqs, 64 splits", 512, 16, 1, false, true, true, false, 0, {1, 1, 1}, {40, 90, 300}, -1, 262144, s512},
+        {"h512 gqa16 kvh2 noncausal missing-block", 512, 16, 2, false, false, true, false, 0, {4, 2}, {37, 20}, 1},
         /* the coverage the rows claim beyond Gemma: non-causal, two-sided window, a missing block */
         {"h256 gqa4 noncausal w20 missing-block", 256, 4, 1, false, false, true, false, 20, {6, 2}, {70, 30}, 2},
         {"h512 gqa1 noncausal full", 512, 1, 1, false, false, false, false, 0, {4}, {37}},
@@ -208,11 +223,27 @@ int main(int argc, char** argv) {
         {"wmma h512 gqa8 prefill fp8+descale", 512, 8, 1, true, true, false, true, 0, {130}, {130}, -1, 0, 0, 0, 1},
         {"wmma h512 gqa2 kvh2 ragged + decode rows", 512, 2, 2, false, true, true, false, 0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1},
         {"wmma h512 gqa1 noncausal", 512, 1, 1, false, false, false, false, 0, {64}, {100}, -1, 0, 0, 0, 1},
+        {"wmma h512 gqa16 prefill 200 of 900", 512, 16, 1, false, true, false, false, 0, {200}, {900}, -1, 262144, s512, 0, 1},
+        {"wmma h512 gqa16 ragged + decode rows fp8+descale", 512, 16, 1, true, true, true, true, 0, {150, 1, 70}, {300, 50, 70}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa2 swa w1024 prefill 300 of 1500", 256, 2, 2, false, true, false, false, 1024, {300}, {1500}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa2 swa w64 ragged fp8+descale", 256, 2, 2, true, true, true, true, 64, {100, 90}, {250, 90}, -1, 0, 0, 0, 1},
         {"wmma h256 gqa4 noncausal w20 missing-block", 256, 4, 1, false, false, true, false, 20, {80, 70}, {200, 70}, 3, 0, 0, 0, 1},
         {"wmma h256 gqa8 causal q-pitch slice", 256, 8, 1, false, true, false, false, 0, {64}, {64}, -1, 0, 0, 512, 1},
         {"wmma h256 gqa1 causal w5 fp8", 256, 1, 1, true, true, false, false, 5, {96}, {150}, -1, 0, 0, 0, 1},
+        /* Gemma 4's picture runs, read again non-causally up to the run's end: 280 rows after a short
+         * prefix, after one the window cuts, q at the fused plane's pitch, a run's tail after a prefix hit */
+        {"wmma h256 gqa2 picture 280 of 300", 256, 2, 2, false, false, false, false, 1024, {280}, {300}, -1, 0, 0, 0, 1},
+        {"wmma h256 gqa2 picture 280 of 1500 fp8", 256, 2, 2, true, false, false, true, 1024, {280}, {1500}, -1, 0, 0, 0, 1},
+        {"wmma h256 gqa2 picture q-pitch slice", 256, 2, 2, false, false, false, false, 1024, {96}, {120}, -1, 0, 0, 512, 1},
+        {"h256 gqa2 picture tail split", 256, 2, 2, false, false, false, false, 1024, {10}, {1300}, -1, 0, s256, 0, 0},
+        /* a picture longer than the window, whose rows read every later key (attn_paged_ahead): the
+         * window is 20 here, the rows 70 to 100, and the scalar, split and WMMA kernels all take it */
+        {"h256 gqa2 ahead w20 verify-like", 256, 2, 2, false, false, false, false, 20, {6}, {70}, -1, 0, 0, 0, 0, true},
+        {"h256 gqa2 ahead w20 ragged fp8", 256, 2, 2, true, false, true, true, 20, {3, 1, 9}, {50, 64, 40}, -1, 0, 0, 0, 0, true},
+        {"h256 gqa1 ahead w5 missing-block", 256, 1, 1, false, false, true, false, 5, {4, 2}, {37, 20}, 1, 0, 0, 0, 0, true},
+        {"h256 gqa4 ahead w20 split", 256, 4, 1, false, false, false, false, 20, {5}, {300}, -1, 4096, s256, 0, 0, true},
+        {"wmma h256 gqa2 ahead w20 picture 100 of 100", 256, 2, 2, false, false, false, false, 20, {100}, {100}, -1, 0, 0, 0, 1, true},
+        {"wmma h256 gqa2 ahead w20 picture 90 of 300 fp8", 256, 2, 2, true, false, false, true, 20, {90}, {300}, -1, 0, 0, 0, 1, true},
         /* and what must stay scalar: a verify batch, many sequences, a few rows each */
         {"scalar: 8 x verify16, ragged", 512, 4, 1, false, true, true, false, 0, {16, 16, 16, 16, 16, 16, 16, 16},
          {40, 50, 60, 70, 80, 90, 100, 110}, -1, 262144, s512, 0, 0},

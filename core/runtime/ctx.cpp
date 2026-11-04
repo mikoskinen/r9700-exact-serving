@@ -790,13 +790,30 @@ const int32_t* Ctx::route_counts_device(int layer, int64_t* n_expert) const {
     if (n_expert) *n_expert = 0;
     if (layer < 0 || (size_t)layer >= route_.size()) return nullptr;
     const RouteSlot& s = route_[(size_t)layer];
-    /* No step gate: route_report lands at the END of the block's passes (heat consumes it a
-     * step later), but the reported buffer is the block's own ecnt, whose CONTENT the router
-     * kernel rewrote this pass -- and the file stager's trigger runs after that router on the
-     * same stream, so a stream-ordered copy reads this pass's counts. The counts are indexed
-     * by the rank's local expert slot (the kernel subtracts expert_base), which is also what
-     * the mover's units carry. */
+    /* No step gate: route_report lands at the END of the block's passes, so at the file stager's
+     * trigger (the layer's first expert op) the pointer is the one the last pass reported. That
+     * is right only for a buffer whose address is the same in this pass: the block's own counts
+     * buffer, which its router rewrites every pass -- and the trigger runs after that router on
+     * the same stream, so a stream-ordered copy reads the counts of the rows about to run. The
+     * counts are indexed by the rank's local expert slot (the kernel subtracts expert_base),
+     * which is also what the mover's units carry. */
     if (!s.routing.expert_count || s.reported < 0) return nullptr;
+    /* A transient buffer is at another offset at another arena level, and liveness lets a
+     * later buffer share its bytes, since no declared op reads the counts (the report is a
+     * handoff, not an op): the bytes under the last pass's pointer may be anything. A whole read
+     * is slow but right; counts read there could name a routed expert zero and leave it
+     * unread. Every architecture here declares the counts RAD_BUF_PERSIST. */
+    const char* p = (const char*)s.routing.expert_count;
+    const char* base = (const char*)arena_.base();
+    if (base && program_ && p >= base + program_->arena_fixed_bytes && p < base + arena_.bytes()) {
+        if (!route_transient_noted_) {
+            route_transient_noted_ = true;
+            RAD_WARN("rank %d: layer %d reports its routing counts in a transient buffer, so the "
+                     "file stager reads its routed experts whole; declare the counts "
+                     "RAD_BUF_PERSIST", rank_, layer);
+        }
+        return nullptr;
+    }
     if (n_expert) *n_expert = s.routing.n_expert ? s.routing.n_expert : route_n_expert_;
     return s.routing.expert_count;
 }
@@ -964,21 +981,21 @@ int Ctx::lane_join(int from, int to) {
  * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
  * never recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 432,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 472,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
 
 uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
-     * issue the scatter only when they have some. */
-    if (b->enc || b->n_mm_rows > 0) return 0;
-    /* Legacy architecture plugins have no pass-key callback. Only refuse them when the resolved
-     * program contains a launcher explicitly marked as using live prefill splits, and this batch
-     * can issue a prefill, mixed, speculative-verify or draft query through it. */
-    if (!arch_pass_key_ &&
-        (b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED || b->draft_pass != 0 ||
-         b->n_spec > 0)) {
+     * issue the scatter only when they have some (and the second attention over a run read both
+     * ways, n_bidi, only on such a pass). */
+    if (b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
+    /* A plugin with no pass-key callback cannot key a launch that splits its KV by the live
+     * context, so a prefill or mixed pass of a program holding such a launcher is not recorded.
+     * Its decode, verify and draft passes are: their launches get the keyed context bound in
+     * place of the live maximum (Ctx::issue_body). */
+    if (!arch_pass_key_ && (b->phase == RAD_PHASE_PREFILL || b->phase == RAD_PHASE_MIXED)) {
         for (const IssuePlan& ip : issue_table_)
             if (ip.row && ip.row->info &&
                 (ip.row->info->capabilities & RAD_KERNEL_CAP_DYNAMIC_PREFILL_SPLIT))

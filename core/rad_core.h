@@ -711,6 +711,10 @@ struct SamplingParams {
      * duplicates ignored. Empty (the default) is off: the ban is then bit-identical to the
      * no-whitelist form. */
     std::vector<int32_t> ngram_whitelist;
+    /* Token ids this request never samples (generation_config.json's suppress_tokens: Gemma 4's
+     * end-of-image and end-of-audio markers). Global ids, duplicates ignored; empty is off. The
+     * sampler takes them out of the row as it does a grammar's mask. */
+    std::vector<int32_t> suppress_tokens;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers
@@ -939,6 +943,10 @@ struct Config {
     /* --ngram-placement ram=DIR: the pinned n-gram copy is the file DIR/ngram-<id>.tab (a tmpfs),
      * mapped shared, so engines on separate cards hold one table. Empty: a private copy. */
     std::string    ngram_share_dir;
+    /* --ngram-placement disk=DIR: the table is read from its own file, DIR/ngram-<id>.bin, filled
+     * from the container at the first start, instead of from the container (a faster drive than
+     * the model's). Empty: from the container. */
+    std::string    ngram_disk_dir;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
     /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to
