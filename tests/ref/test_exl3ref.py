@@ -133,7 +133,7 @@ class Case:
             self.x = (rng.standard_normal((self.T, self.x_cols)) * 0.5).astype(np.float32)
         self.x = self.narrow_x(self.x)
         self.params = {"M": M, "N": self.geom[0][0], "K": self.geom[0][1], "n_expert": n_expert, "top_k": top_k,
-                       "dtype": f"exl3k{bits}", "codebook": codebook}
+                       "dtype": X.dtype_name(bits), "codebook": codebook}
         if classes:
             for q in (1, 2, 3):
                 self.params.update({f"N_{q}": self.geom[q][0], f"K_{q}": self.geom[q][1]})
@@ -208,7 +208,7 @@ class Case:
                 if p == 0:
                     ents = [X.pack_codes(e.sym, self.bits).tobytes() for e in ex]
 
-                    dt, ent = f"u{self.bits}", [R, C]
+                    dt, ent = X.plane_dtype(self.bits), [R, X.plane_cols(C, self.bits)]
                 else:
                     if p == 4 and any(e.dn_suh is None for e in ex):
                         # No down experts paired with these: dn_suh from a private generator, so no shared
@@ -1100,6 +1100,17 @@ def suite_cases(args, work):
                          cols=128, bits=bits, codebook=cb))
         more.append(Case(f"down K={bits} {cb}", "moe_exl3_down", rng, M=3, top_k=2, n_expert=4, rows=128,
                          cols=128, bits=bits, codebook=cb))
+    # Half-integer K (exllamav3 1.6, mul1 only): the [1x2] pair plane, two classes and the whole-expert (EP) form
+    # DeepSeek V4.1 serves (no odd class), each a stacked gate_up and a down.
+    for bits in (1.5, 2.5, 3.5):
+        more.append(Case(f"gate_up K={bits} mul1", "moe_exl3_gate_up", rng, M=3, top_k=2, n_expert=4, rows=256,
+                         cols=128, bits=bits, codebook="mul1"))
+        more.append(Case(f"down K={bits} mul1", "moe_exl3_down", rng, M=3, top_k=2, n_expert=4, rows=128,
+                         cols=128, bits=bits, codebook="mul1"))
+    more.append(Case("gate_up K=2.5 whole experts (EP)", "moe_exl3_gate_up", rng, M=4, top_k=6, n_expert=8,
+                     rows=512, cols=256, two=False, bits=2.5, drop=0.1))
+    more.append(Case("down K=2.5 whole experts (EP)", "moe_exl3_down", rng, M=4, top_k=6, n_expert=8, rows=256,
+                     cols=256, two=False, bits=2.5, drop=0.1))
     # The real model's per-rank geometry (Qwen3.8-Flash-Next: hidden 2560, expert 640, top-10): tp1 and the
     # 384/256 parity split of tp2 (PLAN.md D7).
     more += [

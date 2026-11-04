@@ -68,6 +68,41 @@ def codebook_values(state, codebook):
     return (lo + hi).astype(np.float16)
 
 
+# ----------------------------------------------------------------------------------------------- half-integer K
+# exllamav3 1.6's K = KA + 0.5 (1.5 / 2.5 / 3.5, mul1 only): positions alternate KA and KA + 1 bits, the odd ones
+# carrying the extra bit (frac.cu, mask 0xAAAA). Here `bits` is a Python number, 2.5 for 2.5; k2(bits) = 2K, symbol p
+# sits at bits [off(p), off(p + 1)) of a tile stream or a canonical row, off(p) = floor(p * k2 / 2).
+def k2(bits):
+    return int(round(2 * bits))
+
+
+def is_half(bits):
+    return k2(bits) % 2 == 1
+
+
+def sym_off(bits, n):
+    return (np.asarray(n) * k2(bits)) // 2
+
+
+def sym_widths(bits, n):
+    """Widths of symbols 0 .. n-1 (K at integer K; KA, KA + 1, KA, ... at half-integer K)."""
+    return np.diff(sym_off(bits, np.arange(n + 1)))
+
+
+def dtype_name(bits):
+    """The GEMM dtype string: exl3k4, or exl3k2h for 2.5 (include/exl3_encoding.h)."""
+    return f"exl3k{k2(bits) // 2}h" if is_half(bits) else f"exl3k{int(bits)}"
+
+
+def plane_dtype(bits):
+    """The codes plane's core dtype: uK, or the pair symbol's u(2KA+1) at half-integer K (block [1x2])."""
+    return f"u{k2(bits)}" if is_half(bits) else f"u{int(bits)}"
+
+
+def plane_cols(cols, bits):
+    return cols // 2 if is_half(bits) else cols
+
+
 def tile_states(sym, bits):
     """[..., 256] K-bit symbols -> [..., 256] 16-bit states: the window of the MSB-first symbol stream ending at
     symbol p's last bit, circular within the tile (tail-biting). Read as an integer that window is symbol p in the
@@ -75,17 +110,37 @@ def tile_states(sym, bits):
     shifted together."""
     s = sym.astype(np.uint64)
     state = np.zeros_like(s)
+    if is_half(bits):   # concatenate backwards with each symbol's own width until 16 bits are covered
+        w = sym_widths(bits, 256).astype(np.uint64)
+        shift = np.zeros(256, np.uint64)
+        for j in range(16):
+            if shift.min() >= 16:
+                break
+            q = (np.arange(256) - j) % 256
+            state |= np.where(shift < 16, s[..., q] << np.minimum(shift, 16), 0)
+            shift = shift + w[q]
+        return state & 0xFFFF
     for j in range(-(-16 // bits)):
         state |= np.roll(s, j, axis=-1) << np.uint64(j * bits)
     return state & 0xFFFF
 
 
+def _stream_of(sym, bits):
+    """[..., 256] symbols -> [..., ring] bits, MSB-first, each symbol its own width."""
+    w = sym_widths(bits, 256)
+    W = int(w.max())
+    shifts = np.arange(W - 1, -1, -1, dtype=np.uint64)                 # MSB first within a W-wide slot
+    slot = (sym.astype(np.uint64)[..., None] >> shifts) & 1               # [..., 256, W]
+    keep = np.arange(W)[None, :] >= (W - w)[:, None]                      # the low w bits of each slot
+    return slot[..., keep]                                                # [..., ring], positions in order
+
+
 def tile_states_by_window(sym, bits):
     """The same states read off the bit stream literally (the definition); `selfcheck_decode` holds the two equal."""
-    shifts = np.arange(bits - 1, -1, -1, dtype=np.uint64)
-    stream = ((sym.astype(np.uint64)[..., None] >> shifts) & 1).reshape(*sym.shape[:-1], 256 * bits)
-    end = (np.arange(256) + 1) * bits
-    index = (end[:, None] - 16 + np.arange(16)) % (256 * bits)  # [256, 16], MSB first
+    ring = int(sym_off(bits, 256))
+    stream = _stream_of(sym, bits).reshape(*sym.shape[:-1], ring)
+    end = sym_off(bits, np.arange(256) + 1)
+    index = (end[:, None] - 16 + np.arange(16)) % ring  # [256, 16], MSB first
     window = stream[..., index]  # [..., 256, 16]
     return (window << np.arange(15, -1, -1, dtype=np.uint64)).sum(-1)
 
@@ -95,27 +150,54 @@ def symbols_from_stream(tile_words, bits):
     stream, symbol p = bits [p*K, (p+1)*K)."""
     words = np.ascontiguousarray(tile_words).view(np.uint32).astype(np.uint64)
     stream = ((words[..., None] >> np.arange(31, -1, -1, dtype=np.uint64)) & 1).reshape(*words.shape[:-1], -1)
+    if is_half(bits):   # symbol p = bits [off(p), off(p + 1)), MSB first
+        off, w = sym_off(bits, np.arange(256)), sym_widths(bits, 256)
+        W = int(w.max())
+        idx = np.minimum(off[:, None] + np.arange(W), stream.shape[-1] - 1)
+        b = stream[..., idx]                                              # [..., 256, W]
+        live = np.arange(W)[None, :] < w[:, None]
+        sh = (w[:, None] - 1 - np.arange(W)).clip(0).astype(np.uint64)
+        return (np.where(live, b, 0) << sh).sum(-1)
     stream = stream.reshape(*stream.shape[:-1], 256, bits)
     return (stream << np.arange(bits - 1, -1, -1, dtype=np.uint64)).sum(-1)
 
 
 # ----------------------------------------------------------------------------------------------- the codes plane
 def codes_row_bytes(cols, bits):
-    return (cols * bits + 7) // 8
+    return (int(sym_off(bits, cols)) + 7) // 8
 
 
 def pack_codes(sym_plane, bits):
-    """[rows, cols] K-bit values -> the uK plane bytes, rows dense, LSB-first along each row."""
+    """[rows, cols] K-bit values -> the uK plane bytes, rows dense, LSB-first along each row. At half-integer K the
+    columns alternate KA and KA + 1 bits: the u(2KA+1) [1x2] pair plane, bit for bit."""
     rows, cols = sym_plane.shape
-    b = ((sym_plane.astype(np.uint32)[..., None] >> np.arange(bits, dtype=np.uint32)) & 1).astype(np.uint8)
-    flat = b.reshape(rows, cols * bits)
-    pad = codes_row_bytes(cols, bits) * 8 - cols * bits
+    if is_half(bits):
+        w = sym_widths(bits, cols)
+        W = int(w.max())
+        b = ((sym_plane.astype(np.uint32)[..., None] >> np.arange(W, dtype=np.uint32)) & 1).astype(np.uint8)
+        flat = b[:, np.arange(W)[None, :] < w[:, None]]                   # each column's own low bits, in order
+        flat = flat.reshape(rows, int(sym_off(bits, cols)))
+        nbits = int(sym_off(bits, cols))
+    else:
+        b = ((sym_plane.astype(np.uint32)[..., None] >> np.arange(bits, dtype=np.uint32)) & 1).astype(np.uint8)
+        flat = b.reshape(rows, cols * bits)
+        nbits = cols * bits
+    pad = codes_row_bytes(cols, bits) * 8 - nbits
     if pad:
         flat = np.concatenate([flat, np.zeros((rows, pad), np.uint8)], 1)
     return np.packbits(flat, axis=1, bitorder="little")
 
 
 def unpack_codes(plane_bytes, rows, cols, bits):
+    if is_half(bits):
+        nbits = int(sym_off(bits, cols))
+        bitsarr = np.unpackbits(plane_bytes.reshape(rows, -1), axis=1, bitorder="little")[:, :nbits]
+        off, w = sym_off(bits, np.arange(cols)), sym_widths(bits, cols)
+        W = int(w.max())
+        idx = np.minimum(off[:, None] + np.arange(W), nbits - 1)
+        b = bitsarr[:, idx].astype(np.uint32)                             # [rows, cols, W]
+        live = (np.arange(W)[None, :] < w[:, None]).astype(np.uint32)
+        return ((b * live) << np.arange(W, dtype=np.uint32)).sum(-1)
     bitsarr = np.unpackbits(plane_bytes.reshape(rows, -1), axis=1, bitorder="little")[:, : cols * bits]
     b = bitsarr.reshape(rows, cols, bits).astype(np.uint32)
     return (b << np.arange(bits, dtype=np.uint32)).sum(-1)
@@ -158,6 +240,9 @@ def selfcheck_decode(golden_path):
     rng = np.random.default_rng(7)
     for bits in range(1, 9):
         sym = rng.integers(0, 1 << bits, size=(3, 256))
+        out.append((f"states_k{bits}", np.array_equal(tile_states(sym, bits), tile_states_by_window(sym, bits))))
+    for bits in (1.5, 2.5, 3.5):   # half-integer K: the backward concatenation against the literal ring read
+        sym = rng.integers(0, 1 << 8, size=(3, 256)) & ((1 << sym_widths(bits, 256)) - 1)
         out.append((f"states_k{bits}", np.array_equal(tile_states(sym, bits), tile_states_by_window(sym, bits))))
     return out
 
@@ -208,7 +293,11 @@ class Expert:
 def random_expert(rng, rows, cols, bits, codebook, stacked):
     """Uniform random symbols (every sequence is a valid trellis), suh/svh random signs times scales near the
     magnitudes real checkpoints carry (trellis.py random_tensor)."""
-    sym = rng.integers(0, 1 << bits, size=(rows, cols), dtype=np.uint32)
+    if is_half(bits):   # each column its own width: KA bits at even k, KA + 1 at odd k
+        sym = rng.integers(0, 1 << 8, size=(rows, cols), dtype=np.uint32) & ((1 << sym_widths(bits, cols)) - 1)
+        sym = sym.astype(np.uint32)
+    else:
+        sym = rng.integers(0, 1 << bits, size=(rows, cols), dtype=np.uint32)
     sign = lambda m: rng.integers(0, 2, size=m) * 2 - 1  # noqa: E731
     scale = lambda m: 0.5 + rng.random(m)  # noqa: E731
     suh = (sign(cols) * scale(cols) * 0.01).astype(np.float16)

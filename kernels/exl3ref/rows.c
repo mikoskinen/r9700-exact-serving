@@ -147,7 +147,8 @@ static int gu_dn4_launch(const RadArgs* a, RadStream s)   { (void)s; return exl3
 /* ------------------------------------------------------------------ the rows */
 
 /* Every form, both flags (matched on the decimal, core/util/rad_util.cpp:249-258): the reference serves all. */
-#define EXL3REF_DTYPES RAD_CIN("dtype", "exl3k2 exl3k3 exl3k4 exl3k5 exl3k6 exl3k7 exl3k8")
+/* exl3k1h / exl3k2h / exl3k3h: half-integer K = 1.5 / 2.5 / 3.5 (exllamav3 1.6, mul1 only: the decode refuses another) */
+#define EXL3REF_DTYPES RAD_CIN("dtype", "exl3k2 exl3k3 exl3k4 exl3k5 exl3k6 exl3k7 exl3k8 exl3k1h exl3k2h exl3k3h")
 static const RadConstraint c_gate_up[] = {
     EXL3REF_DTYPES, RAD_CIN("codebook", "mul1 mcg 3inst"), RAD_CIN("h_rot", "0 1"), RAD_CIN("a_rot", "0 1"),
 };
@@ -163,7 +164,7 @@ static const RadKernelInfo k_rows[] = {
         .name = "exl3ref_moe_gate_up", .op = EXL3_OP_GATE_UP, .family = "moe",
         .computes = "EXL3 routed experts, gate and up, f16 out: the reference (docs/OPS-exl3.md)",
         .shape = "any M; K % 128, N % 256 (each class)",
-        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; a f16 or bf16 (a_rot = 1: prep_gu's xr, f16)",
+        .dtypes = "exl3k2..exl3k8 (mul1, mcg, 3inst), exl3k1h..exl3k3h (mul1); a f16 or bf16 (a_rot = 1: prep_gu's xr, f16)",
         .domain = RAD_DOMAIN_HOST, .priority = 0,
         .constraints = c_gate_up, .n_constraints = N_OF(c_gate_up),
         .launch = gate_up_launch, .opd_shape = gate_up_shape,
@@ -172,7 +173,7 @@ static const RadKernelInfo k_rows[] = {
         .name = "exl3ref_moe_down", .op = EXL3_OP_DOWN, .family = "moe",
         .computes = "EXL3 routed experts, down, bf16 out: the reference (docs/OPS-exl3.md)",
         .shape = "any M; K % 128, N % 128 (each class)",
-        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; h f16",
+        .dtypes = "exl3k2..exl3k8 (mul1, mcg, 3inst), exl3k1h..exl3k3h (mul1); h f16",
         .domain = RAD_DOMAIN_HOST, .priority = 0,
         .constraints = c_down, .n_constraints = N_OF(c_down),
         .launch = down_launch, .opd_shape = down_shape,
@@ -191,7 +192,7 @@ static const RadKernelInfo k_rows[] = {
         .computes = "EXL3 routed experts, the decode chain as one op (gate_up a_rot 0 h_rot 1, then down h_rot 1): "
                     "the reference (docs/OPS-exl3.md)",
         .shape = "any M; K % 128, N % 256 (each class)",
-        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; a f16 or bf16; y bf16",
+        .dtypes = "exl3k2..exl3k8 (mul1, mcg, 3inst), exl3k1h..exl3k3h (mul1); a f16 or bf16; y bf16",
         .domain = RAD_DOMAIN_HOST, .priority = 0,
         .constraints = c_gu_dn, .n_constraints = N_OF(c_gu_dn),
         .launch = gu_dn_launch, .opd_shape = gu_dn_shape,
@@ -202,7 +203,7 @@ static const RadKernelInfo k_rows[] = {
         .computes = "EXL3 routed experts, gate and up, f16 out, four classes by number mod 4: the reference "
                     "(docs/OPS-exl3.md)",
         .shape = "any M; K % 128, N % 256 (each class)",
-        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; a f16 or bf16 (a_rot = 1: prep_gu's xr, f16)",
+        .dtypes = "exl3k2..exl3k8 (mul1, mcg, 3inst), exl3k1h..exl3k3h (mul1); a f16 or bf16 (a_rot = 1: prep_gu's xr, f16)",
         .domain = RAD_DOMAIN_HOST, .priority = 0,
         .constraints = c_gate_up, .n_constraints = N_OF(c_gate_up),
         .launch = gate_up4_launch, .opd_shape = gate_up4_shape,
@@ -212,7 +213,7 @@ static const RadKernelInfo k_rows[] = {
         .computes = "EXL3 routed experts, down, bf16 out, four classes by number mod 4: the reference "
                     "(docs/OPS-exl3.md)",
         .shape = "any M; K % 128, N % 128 (each class)",
-        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; h f16",
+        .dtypes = "exl3k2..exl3k8 (mul1, mcg, 3inst), exl3k1h..exl3k3h (mul1); h f16",
         .domain = RAD_DOMAIN_HOST, .priority = 0,
         .constraints = c_down, .n_constraints = N_OF(c_down),
         .launch = down4_launch, .opd_shape = down4_shape,
@@ -233,7 +234,7 @@ static const RadKernelInfo k_rows[] = {
         .computes = "EXL3 routed experts, the decode chain as one op, four classes by number mod 4 (gate_up_mod4 a_rot "
                     "0 h_rot 1, then down_mod4 h_rot 1): the reference (docs/OPS-exl3.md)",
         .shape = "any M; K % 128, N % 256 (each class)",
-        .dtypes = "exl3k2..exl3k8; mul1, mcg, 3inst; a f16 or bf16; y bf16",
+        .dtypes = "exl3k2..exl3k8 (mul1, mcg, 3inst), exl3k1h..exl3k3h (mul1); a f16 or bf16; y bf16",
         .domain = RAD_DOMAIN_HOST, .priority = 0,
         .constraints = c_gu_dn, .n_constraints = N_OF(c_gu_dn),
         .launch = gu_dn4_launch, .opd_shape = gu_dn4_shape,

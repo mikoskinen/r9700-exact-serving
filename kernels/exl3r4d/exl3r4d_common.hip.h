@@ -325,7 +325,11 @@ struct Plan {
     const int base = 32 * (n & 7) + 4 * (n >> 3) + 16 * h;
 #pragma unroll
     for (int r = 0; r < 2; r++) {
-      const int e3 = ((base + 8 * r) / 2 + 2) * K2;  // end bit of the run's last state: (q0 + 4) K at integer K
+      // end bit of the run's last state: (q0 + 4) K; at half-integer K (q0 / 2 + 2) K2. The integer form is kept
+      // as it was so the integer kernels' code is unchanged (the compiler cannot see base is even).
+      int e3;
+      if constexpr (K2 % 2 == 0) e3 = (base + 8 * r + 4) * BITS;
+      else e3 = (((base + 8 * r) >> 1) + 2) * K2;
       const int de = (e3 - 1) >> 5;              // word holding that bit
       shift[r] = (unsigned)(32 * (de + 1) - e3);
 #pragma unroll

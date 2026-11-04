@@ -21,6 +21,8 @@ suite device:
   - runs longer than one pass (a malformed but legal run table): several passes a run;
   - replay: the same case three times in three processes, byte-identical (R8);
   - refusals (R12): K != 4, mcg, 3inst at the layout hook (RAD_E_DTYPE), and what the launch refuses by name;
+  - ds41-exl3: half-integer K = 2.5 (exl3k2h) through bits_band, and DeepSeek V4.1's whole-expert (expert-parallel)
+    geometry at K = 2 and 2.5 in both bands (deepseek_ep);
   - v5 moe_exl3_gate_up_down at the real per-rank geometry, M = 1 .. 16 (tp2 and tp1), a long run, K 3 and 5, and
     a three-run replay: against the transcription and, TO THE BIT, against gate_up(a_rot 0, h_rot 1) then
     down(h_rot 1) through the same library (P2's chain_gd, with its controls). A build without a counter pool for
@@ -125,7 +127,7 @@ def bits_band(args, rng, work):
     ops at two classes 3:2 with controls, the real tp2 geometry at M = 1 and 16, the h_rot pair and prep_gu ->
     gate_up(a_rot 1) chains (bit-identity claims), and a three-run replay."""
     ok = True
-    for K in (2, 3, 5, 6):
+    for K in (2, 3, 5, 6, 2.5):   # 2.5: exllamav3 1.6's half-integer K (exl3k2h, the [1x2] pair plane)
         for c in (R.Case(f"K={K} gate_up two classes 3:2", GU, rng, M=9, top_k=4, n_expert=6, rows=768, cols=256,
                          rows_odd=512, drop=0.1, n_protect=2, bits=K),
                   R.Case(f"K={K} down two classes 3:2", DN, rng, M=9, top_k=4, n_expert=6, rows=256, cols=384,
@@ -148,6 +150,25 @@ def bits_band(args, rng, work):
     outs = [R.run(args, c, work / label(f"{c.name} run{i}"))[1] for i in range(3)]
     ok &= verdict(all(o is not None for o in outs) and all(np.array_equal(outs[0], o) for o in outs[1:]),
                   f"{c.name}: three runs byte-identical")
+    return ok
+
+
+def deepseek_ep(args, rng, work):
+    """DeepSeek V4.1 Flash's routed experts as the ds41-exl3 branch serves them: expert-parallel, so each rank's ops see
+    WHOLE experts and one class (no odd tables), hidden 5120, expert width 2304 (gate_up [4608, 5120], down [5120,
+    2304]), top-6; turboderp's 2.25bpw mixes K = 2 (layers 6-34) and K = 2.5 (0-5, 35-39). Both bands (M = 1, 16 and
+    M = 64 for the M > 16 rows), against the transcription; the h_rot / prep_gu chains at the same widths."""
+    ok = True
+    for K in (2, 2.5):
+        for M in (1, 16, 64):
+            for op, rows, cols in ((GU, 4608, 5120), (DN, 5120, 2304)):
+                c = R.Case(f"ds41 K={K} {op[9:]} whole experts M={M}", op, rng, M=M, top_k=4, n_expert=6, rows=rows,
+                           cols=cols, two=False, drop=0.02 if M > 1 else 0.0, bits=K)
+                ok &= R.check_case(args, c, work / label(c.name))[0]
+        gu, dn = R.chain_case(rng, f"ds41 K={K} chain", M=5, top_k=4, n_expert=4, hidden=5120, width=2304, bits=K,
+                              two=False)
+        ok &= R.chain(args, gu, dn, work / label(f"ds41_K{K}_chain"), f"ds41 K={K}")
+        ok &= R.chain_prep(args, gu, work / label(f"ds41_K{K}_prep"), f"ds41 K={K}")
     return ok
 
 
@@ -381,6 +402,7 @@ def suite_device(args, work):
     ok &= long_runs(args, rng, work)
     ok &= replay(args, rng, work)
     ok &= bits_band(args, rng, work)
+    ok &= deepseek_ep(args, rng, work)
     ok &= refusals(args, rng, work)
     ok &= fused_band(args, work)
     return ok
