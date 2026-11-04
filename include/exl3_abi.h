@@ -70,7 +70,7 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 7
+#define EXL3_IFACE_VERSION 8
 
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
  * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
@@ -384,6 +384,9 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
     static const RadParamSpec p_gu[] = {
         EXL3_GEMM_PARAMS,
         { "a_rot",    RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
+        /* v8: the SwiGLU clamp (DeepSeek's swiglu_limit): gate = min(gate, limit), up = clamp(up, -limit, limit)
+         * before silu(gate) * up; absent or 0 is none */
+        { "limit",    RAD_P_F64, RAD_OPTIONAL, RAD_PROLE_NONE },
     };
     static const RadParamSpec p_dn[] = { EXL3_GEMM_PARAMS };
 #undef EXL3_GEMM_PARAMS
@@ -678,6 +681,7 @@ typedef struct Exl3Geom {
     int     n_class;        /* 2 with the odd tables, 1 without; 4 for a _mod4 op */
     int     h_rot;          /* 1: h crosses rotated (gate_up writes, down reads, down's step 1) */
     int     a_rot;          /* gate_up: 1 when `a` is prep_gu's xr */
+    double  limit;          /* v8, moe_exl3_gate_up only: the SwiGLU clamp, 0 none (gate <= limit, |up| <= limit) */
     int64_t rows[EXL3_MAX_CLS], cols[EXL3_MAX_CLS];   /* class c's weight [rows, cols], c < n_class (prep_gu: rows 0,
                                                        * it has no N); past n_class, class 0's */
     int64_t x_cols;         /* max(cols): the token input's width (gate_up a_rot = 1: xr is 2 * x_cols) */
@@ -728,6 +732,8 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op_in, int two
     g->codebook = prep ? -1 : exl3_codebook_from_name(cb);
     if (g->bits < 0 || (!prep && g->codebook < 0)) return RAD_E_DTYPE;
     if ((g->h_rot != 0 && g->h_rot != 1) || (g->a_rot != 0 && g->a_rot != 1)) return RAD_E_INVAL;
+    g->limit = op == EXL3_GATE_UP ? rad_param_getf(p, n_p, "limit", 0.0) : 0.0;
+    if (!(g->limit >= 0.0) || g->limit > 65504.0) return RAD_E_INVAL;   /* NaN, negative or past f16 */
     if (g->M < 1 || g->n_expert < 1 || g->top_k < 1) return RAD_E_SHAPE;
     if (!mod4 && !two_classes && ((!prep && No != N) || Ko != K)) return RAD_E_SHAPE;
     g->n_class = mod4 ? 4 : two_classes ? 2 : 1;

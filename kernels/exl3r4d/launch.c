@@ -225,6 +225,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->n_class = g->n_class;
     d->h_rot = g->h_rot;
     d->a_rot = g->a_rot;
+    d->limit = (float)g->limit;
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;

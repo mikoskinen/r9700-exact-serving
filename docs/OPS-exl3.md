@@ -19,7 +19,7 @@ read rather than to be fast.
 
 | op | params | operands |
 |---|---|---|
-| `moe_exl3_gate_up` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` `a_rot` | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt?, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `suh1_odd`wt?, `svh_odd`wt?, `dn_suh_odd`wt? → `h` |
+| `moe_exl3_gate_up` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` `a_rot` `limit`/opt | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt?, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `suh1_odd`wt?, `svh_odd`wt?, `dn_suh_odd`wt? → `h` |
 | `moe_exl3_down` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt `h_rot` | `h`, `codes`wt, `suh`wt, `svh`wt, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `svh_odd`wt? → `y` |
 | `moe_exl3_prep_gu` | `M`(range) `K` `n_expert` `top_k` `dtype` `K_odd`/opt | `a`, `suh`wt, `suh1`wt, `sorted_tok`, `expert_offset`, `suh_odd`wt?, `suh1_odd`wt? → `xr` |
 | `moe_exl3_gate_up_down` | `M`(range) `N` `K` `n_expert` `top_k` `dtype` `codebook` `N_odd`/opt `K_odd`/opt | `a`, `codes`wt, `suh`wt, `suh1`wt, `svh`wt, `dn_suh`wt, `dn_codes`wt, `dn_svh`wt, `sorted_tok`, `expert_offset`, `codes_odd`wt?, `suh_odd`wt?, `suh1_odd`wt?, `svh_odd`wt?, `dn_suh_odd`wt?, `dn_codes_odd`wt?, `dn_svh_odd`wt? → `y` |
@@ -53,6 +53,7 @@ version 7 adds gate_up_down's, `moe_exl3_gate_up_down_mod4` (below).
 | N_odd, K_odd | class 1's `[rows, cols]`; optional, default `N`, `K` |
 | N_q, K_q | the `_mod4` forms only, q = 1, 2, 3, in place of `N_odd`, `K_odd`: class q's `[rows, cols]`; optional, default `N`, `K` (prep_gu_mod4: `K_q` alone) |
 | a_rot | gate_up only, 0 or 1, REQUIRED (for the reason `h_rot` is): 1 when gate_up's `a` is the `xr` `moe_exl3_prep_gu` wrote — sorted rows, already rotated — instead of the token rows. A row that does not implement it constrains `RAD_CEQ("a_rot", 0)`. Any other value is `RAD_E_INVAL`. |
+| limit | gate_up only, optional f64 (interface version 8): DeepSeek's SwiGLU clamp. With `limit > 0`, step 4 reads `silu(min(o_0[n], limit)) * clamp(o_1[n], -limit, limit)` (libref's `swiglu_clamped` order: the clamp in f32 before the activation). Absent or 0: no clamp. Negative, NaN or past the f16 range: `RAD_E_INVAL`. `moe_exl3_gate_up_down` and the `_mod4` forms carry no limit (they never clamp). |
 | h_rot | gate_up and down (gate_up_down has no flags: it is defined at `a_rot = 0`, `h_rot = 1`), 0 or 1, REQUIRED: 1 when `h` crosses between the two ops already rotated ("EPI 1", below). Required rather than optional because a constraint on an absent key never holds (`core/util/rad_util.cpp:264-265`): a row that does not implement `h_rot = 1` constrains `RAD_CEQ("h_rot", 0)` and is refused by name at selection. Any other value is `RAD_E_INVAL`. |
 
 Extents the format cannot hold are refused (`RAD_E_SHAPE`): every `K` a multiple of 128 (the input

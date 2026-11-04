@@ -42,6 +42,15 @@ static void gemv(const float* xr, const float* what, int64_t rows, int64_t cols,
 }
 
 static float silu(float g) { return g * (1.0f / (1.0f + expf(-g))); }
+/* v8: silu(gate) * up with DeepSeek's SwiGLU clamp (gate <= limit, |up| <= limit) when limit > 0, as libref's
+ * swiglu_clamped does it (f32, the clamp before the activation). */
+static float swiglu(float g, float u, float limit) {
+    if (limit > 0.0f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    return silu(g) * u;
+}
 
 /* ------------------------------------------------------------------ the operands */
 
@@ -201,12 +210,12 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
             }
             uint16_t* h = (uint16_t*)io->y->data + i * io->y_pitch;
             if (!g->h_rot) {
-                for (int64_t n = 0; n < W; ++n) h[n] = f2h(silu(wk->acc[n]) * wk->acc[W + n]);
+                for (int64_t n = 0; n < W; ++n) h[n] = f2h(swiglu(wk->acc[n], wk->acc[W + n], (float)g->limit));
                 continue;
             }
             /* h_rot = 1: h, then down's first step with down's suh of this expert -- the same
              * prologue down would run, so the pair's bits do not depend on which op runs it. */
-            for (int64_t n = 0; n < W; ++n) wk->x[n] = h2f(f2h(silu(wk->acc[n]) * wk->acc[W + n]));
+            for (int64_t n = 0; n < W; ++n) wk->x[n] = h2f(f2h(swiglu(wk->acc[n], wk->acc[W + n], (float)g->limit)));
             const int rc = prologue(wk->x, entry(io->tab[c][EXL3_P_DN_SUH], j), W, wk->xr);
             if (rc != RAD_OK) return rc;
             for (int64_t n = 0; n < W; ++n) h[n] = f2h(wk->xr[n]);
