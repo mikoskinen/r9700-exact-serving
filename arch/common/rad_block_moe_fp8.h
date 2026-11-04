@@ -50,6 +50,7 @@
 #include "rad_fp8.h"
 #include "rad_block_glm_router.h"
 #include "rad_device.h"
+#include "exl3/exl3_abi.h"   /* EXL3 experts (radiance-exl3): the encoding, op schemas, operand positions */
 
 #include <atomic>
 #include <cstdio>
@@ -273,6 +274,13 @@ struct MoeFP8 {
          * (Geom::w_bf16). Not sliced by parity: each expert is served whole on its rank, which
          * also keeps it one container run for the file tier. */
         int     expert_bf16  = 0;
+        /* EXL3 trellis experts (the radiance-exl3 extension's canonical `exl3` encoding, imported from
+         * an exllamav3 checkpoint): whole experts like bf16, read by moe_exl3_gate_up / moe_exl3_down
+         * (exl3/exl3_abi.h), which take the bf16 activation and do the rotations and silu(gate) * up
+         * (with swiglu_limit) themselves. K and the codebook are each layer's and projection's own.
+         * (fn4-x3: format 12 as on the DS line, whose 10 / 11 are GGUF blocks and IQR trellis; neither
+         * is served on this base.) */
+        int     expert_exl3  = 0;
         /* The layer and global expert whose gate_up probe() read the format from (and so mapped);
          * declare() maps the rest. Layer -1: none. */
         int64_t probed_layer = -1;
@@ -486,9 +494,26 @@ struct MoeFP8 {
      * rotated w4nl codebook, 5 and 6 that codebook at E4M3 scales per 64 and 32 of K, 7 its
      * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales; RAD_E_DTYPE otherwise. */
     static int format_of(const RadEncoding& e);
-    /* format_of's numbers as the grouped GEMMs' dtype strings. */
-    static constexpr const char* kServed[10] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
-                                                "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32" };
+    /* format_of's numbers as the grouped GEMMs' dtype strings; 10 and 11 (the DS line's GGUF blocks and
+     * IQR trellis) are not served on this base, so format_of never returns them. */
+    static constexpr const char* kServed[13] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
+                                                "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32",
+                                                "ggml", "i8a8", "exl3" };
+    /* Per projection (gate_up, down) under expert_exl3: the op's dtype ("exl3k2" ...), codebook ("mul1"),
+     * K and the codes plane's columns per element (1, or 2 for a half-bit pair plane), and the runs: one
+     * run a plane, each the even experts then the odd ones, declared in that order so a (plane, parity)
+     * table is RAD_WTAB(first, ne / 2). */
+    const char* x3_dtype[2] = { nullptr, nullptr };
+    const char* x3_cb[2]    = { nullptr, nullptr };
+    int         x3_bits[2]  = { 0, 0 };
+    int64_t     x3_cpe[2]   = { 1, 1 };
+    uint32_t    x3_cdt[2]   = { 0, 0 };
+    std::vector<rad_weight> x3_gu[4], x3_dn[3];
+    rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
+    int declare_exl3(RadBuilder* b, Names& nm, int l);
+    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
+    /* bf16 and EXL3 experts both read the bf16 activation, whole on their rank. */
+    bool act_bf16() const { return c.expert_bf16 || c.expert_exl3; }
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
@@ -518,6 +543,7 @@ struct MoeFP8 {
 };
 
 inline int MoeFP8::format_of(const RadEncoding& e) {
+    if (rad_enc_is(&e, EXL3_SCHEME)) return 12;
     if (linear_is_mxfp4(e)) return 8;
     if (rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16) return 3;
     if (!rad_enc_is(&e, "affine")) return RAD_E_DTYPE;
@@ -639,7 +665,7 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
                             "/fwht128; or u4 codes into a 16-entry f32 table, /fwht128) or plain "
                             "bf16; or the codebook at E4M3 scales a 64 or 32 of K under a fixed "
                             "f32, or its 32-entry five-bit form at a 64, or OCP MXFP4 "
-                            "(fp4_e2m1*e8m0[1x32]). "
+                            "(fp4_e2m1*e8m0[1x32]), or EXL3 trellis codes. "
                             "Convert it with a recipe that makes one of them.\n", guw, en);
             return RAD_E_DTYPE;
         }
@@ -653,6 +679,7 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
     cfg->expert_bf16 = f == 3 ? 1 : 0;
     cfg->expert_mx   = f == 8 ? 1 : 0;
     cfg->expert_f32_scale = f == 9 ? 1 : 0;
+    cfg->expert_exl3 = f == 12 ? 1 : 0;
     return RAD_OK;
 }
 
@@ -731,7 +758,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
     prot.clear();
     {
-        const int want = c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3 : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
+        const int want = c.expert_exl3 ? 12 : c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3 : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
                        : c.expert_g64 ? 5 : c.expert_nl ? 4
                        : c.expert_w4 ? (c.expert_rot ? 2 : 1) : 0;
         auto fmt_of = [&](int64_t e, RadEncoding (&enc)[2], int (&fe)[2], const char* (&nmv)[2]) {
@@ -765,6 +792,38 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             int fe[2];
             const char* names[2];
             fmt_of(e, enc, fe, names);
+            if (fe[0] == 12 && fe[1] == 12 && want == 12) {
+                /* One K and codebook per projection across the layer's experts (a table of experts
+                 * takes one encoding); gate_up stacked (suh.1), down not. */
+                for (int i = 0; i < 2; ++i) {
+                    int bits = 0, cb = 0, st = 0;
+                    const char* dt = nullptr;
+                    if (exl3_encoding_read(&enc[i], &bits, &cb, &st) != RAD_OK || st != (i == 0) ||
+                        !(dt = exl3_gemm_dtype(bits)) || !exl3_codebook_name(cb)) {
+                        char en[256];
+                        rad_enc_format(&enc[i], en, sizeof en);
+                        fprintf(stderr, "radiance: '%s' is %s, which the EXL3 expert ops do not read (a %s "
+                                        "projection, K the ops name, a known codebook)\n", names[i], en,
+                                i ? "plain down" : "stacked gate_up");
+                        return RAD_E_DTYPE;
+                    }
+                    if (!x3_dtype[i]) {
+                        x3_dtype[i] = dt;
+                        x3_cb[i] = exl3_codebook_name(cb);
+                        x3_bits[i] = bits;
+                        x3_cdt[i] = enc[i].plane[EXL3_PLANE_CODES].dtype;
+                        x3_cpe[i] = enc[i].plane[EXL3_PLANE_CODES].block[1] > 0
+                                        ? enc[i].plane[EXL3_PLANE_CODES].block[1] : 1;
+                    } else if (std::strcmp(dt, x3_dtype[i]) != 0 ||
+                               std::strcmp(exl3_codebook_name(cb), x3_cb[i]) != 0) {
+                        fprintf(stderr, "radiance: '%s' is %s/%s and the layer's first expert %s/%s; one "
+                                        "table of experts takes one encoding\n", names[i], dt,
+                                exl3_codebook_name(cb), x3_dtype[i], x3_cb[i]);
+                        return RAD_E_DTYPE;
+                    }
+                }
+                continue;
+            }
             if (fe[0] == fmt[0] && fe[1] == fmt[1]) continue;
             if (want != 3 && fe[0] == 3 && fe[1] == 3) { prot.push_back(e); continue; }
             const int i = fe[0] != fmt[0] ? 0 : 1;
@@ -1030,7 +1089,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         return rad_weight_shard_span(b, h, qlo[q] / unit, qhi[q] / unit);
     };
     const bool rot = c.expert_rot != 0;
-    if (c.expert_bf16) {
+    if (c.expert_exl3) {
+        RAD_ARCH_TRY(declare_exl3(b, nm, l));
+    } else if (c.expert_bf16) {
         /* ---- Plain bf16 experts: one table per projection of whole experts in expert order
          * (`moe_gemm`, expert e at entry e), so the two loops must not be merged. Each expert is
          * its own movement unit, and its container bytes are what the kernel reads, so the file
@@ -1335,7 +1396,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
         /* Both K must be multiples of 128 (as `expert_rot` also requires). gram_accum needs only a
          * multiple of four, but 128 keeps each 64-wide output tile inside one scale group. */
-        if (!c.expert_bf16 && ((g.n_embd % RAD_FP8_BLOCK) || (c.n_ff_exp % RAD_FP8_BLOCK)))
+        if (!act_bf16() && ((g.n_embd % RAD_FP8_BLOCK) || (c.n_ff_exp % RAD_FP8_BLOCK)))
             return RAD_E_SHAPE;
         gram_gu_stem = nm.f("blk.%d.ffn_gate_up_exps", l);
         gram_dn_stem = nm.f("blk.%d.ffn_down_exps", l);
@@ -1346,7 +1407,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* bf16 experts read the model's activation and the tap sums that; quantised ones read
          * codes, rotated when the plane is; the files record which. */
         gram_domain = rot ? (uint32_t)RAD_FP8_BLOCK : 0u;
-        if (c.expert_bf16) {
+        if (act_bf16()) {
             op_gram_gu = rw(b, RAD_OP(b, "gram_accum",
                                RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
                                           RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
@@ -1378,7 +1439,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
          * Transient: it is copied to the host before the next op is issued. */
         b_gram_dne = decl_b(b, nm.f("blk.%d.gram_dn_experts", l), RAD_F32,
                             {c.n_expert * c.n_ff_exp, c.n_ff_exp});
-        if (c.expert_bf16)
+        if (act_bf16())
             op_gram_dne = rw(b, RAD_OP(b, "gram_accum",
                                 RAD_PARAMS(RAD_RANGE("M", 1, c.rows * c.top_k),
                                            RAD_INT("n", c.n_ff_exp),
@@ -1662,7 +1723,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                     {w.x, w.h.x}, {w.x});
 
     /* The layer as the prefetch sees it, indexed by model expert number (what the router ranks). */
-    if (!c.sigmoid_router && !c.expert_bf16 && c.n_expert_all > 0 && n_reg > 0) {
+    if (!c.sigmoid_router && !act_bf16() && c.n_expert_all > 0 && n_reg > 0) {
         const int64_t na = c.n_expert_all;
         xp_parts.assign((size_t)(na * 4), 0);
         xp_count_at.assign((size_t)na, -1);
@@ -1684,6 +1745,125 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         xp.count_at = xp_count_at.data();
     }
     return RAD_OK;
+}
+
+/* ---- EXL3 experts (expert_exl3): the radiance-exl3 extension's whole-expert ops over this rank's experts.
+ *
+ * Every expert is whole on its rank (expert parallel, or one rank), so the ops run at their "tp1" geometry:
+ * gate_up [2 n_ff, n_embd] and down [n_embd, n_ff] for every expert, in two parity tables (expert e at entry
+ * e / 2 of class e % 2), as the extension's own architecture issues them at one rank. One run a plane --
+ * gate_up's codes, suh, suh.1, svh; down's codes, suh, svh -- each declared as the even experts then the odd
+ * ones, so a (plane, class) table is RAD_WTAB(run[q * ne / 2], ne / 2). gate_up reads the bf16 normed input
+ * (one row per token), writes f16 h already rotated for down (h_rot 1, with down's suh run as its dn_suh
+ * table), applies silu(gate) * up with the model's swiglu_limit (interface v8 `limit`); down reads h in the
+ * scatter's order and writes the bf16 `edn` rows the gather sums. The prefill stager keys a layer on its first
+ * declared expert op: gate_up, declared first. */
+inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
+    const int64_t ne = c.n_expert;
+    const bool ep = c.n_expert != c.n_expert_all;
+    if (c.ff_hi[0] > 0 || c.ff_hi4[0] > 0 || (!ep && g.world > 1)) {
+        fprintf(stderr, "radiance: layer %d's EXL3 experts are served whole on their rank (expert parallel, or "
+                        "one rank); this configuration slices every expert\n", l);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (!prot.empty() || c.calib || c.expert_rot || c.expert_w4) {
+        fprintf(stderr, "radiance: layer %d: EXL3 experts take no protected bf16 experts, calibration tap or "
+                        "rotated/four-bit form\n", l);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (ne < 2 || ne % 2) {
+        fprintf(stderr, "radiance: layer %d holds %lld EXL3 experts on this rank; the ops take two equal "
+                        "parity tables\n", l, (long long)ne);
+        return RAD_E_INVAL;
+    }
+    if (!x3_dtype[0] || !x3_dtype[1] || std::strcmp(x3_cb[0], x3_cb[1]) != 0) {
+        fprintf(stderr, "radiance: layer %d's EXL3 experts: encodings unknown (no model behind the builder) or "
+                        "gate_up and down in different codebooks\n", l);
+        return RAD_E_DTYPE;
+    }
+    if (g.n_embd % EXL3_HAD || c.n_ff_exp % EXL3_HAD || (2 * c.n_ff_exp) % 256) return RAD_E_SHAPE;
+    const int64_t half = ne / 2, D = g.n_embd, F = c.n_ff_exp;
+    static const char* const gu_role[4] = { "codes", "suh", "suh.1", "svh" };
+    static const char* const dn_role[3] = { "codes", "suh", "svh" };
+    for (int proj = 0; proj < 2; ++proj) {
+        const int np = proj == 0 ? 4 : 3;
+        const char* stem = proj == 0 ? "ffn_gate_up_exps" : "ffn_down_exps";
+        const int64_t R = proj == 0 ? 2 * F : D, C = proj == 0 ? D : F;
+        for (int p = 0; p < np; ++p) {
+            const char* role = proj == 0 ? gu_role[p] : dn_role[p];
+            const bool codes = p == 0, per_row = std::strcmp(role, "svh") == 0, per_col = !codes && !per_row;
+            const int64_t rows = per_col ? 1 : R;
+            const int64_t cols = per_row ? 1 : codes ? C / x3_cpe[proj] : C;
+            std::vector<rad_weight>& run = proj == 0 ? x3_gu[p] : x3_dn[p];
+            run.clear();
+            run.reserve((size_t)ne);
+            for (int q = 0; q < 2; ++q)
+                for (int64_t e = q; e < ne; e += 2) {
+                    const long long ge = (long long)(c.expert_base + e);
+                    const char* weight = nm.f("blk.%d.%s.%lld.weight", l, stem, ge);
+                    const rad_weight h =
+                        decl_view(b, codes ? weight : nm.f("blk.%d.%s.%lld.%s", l, stem, ge, role),
+                                  codes ? nullptr : weight, role, codes ? x3_cdt[proj] : (uint32_t)RAD_F16,
+                                  {rows, cols}, RAD_ACCESS_CONDITIONAL, RAD_SHARD_NONE,
+                                  grp_expert_slot(l, (int)e, proj));
+                    if (!h) return RAD_E_INVAL;
+                    run.push_back(h);
+                }
+        }
+    }
+    b_x3h = decl_b(b, nm.f("blk.%d.moe_exl3_h", l), RAD_F16, {c.rows * c.top_k, F});
+    /* the weights in each op's table-operand order: class 0's tables, then class 1's */
+    std::vector<rad_weight> tab;
+    const auto tables = [&](bool gate_up) {
+        tab.clear();
+        for (int q = 0; q < 2; ++q)
+            for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
+                const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
+                for (int64_t i = 0; i < half; ++i) tab.push_back(run[(size_t)(q * half + i)]);
+            }
+    };
+    tables(true);
+    std::vector<RadParam> gp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * F), RAD_INT("K", D),
+                                 RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
+                                 RAD_STR("dtype", x3_dtype[0]), RAD_STR("codebook", x3_cb[0]),
+                                 RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D), RAD_INT("h_rot", 1),
+                                 RAD_INT("a_rot", 0) };
+    if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
+    op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
+               {w.h.x, w.sorted, w.eoff}, {b_x3h});
+    tables(false);
+    std::vector<RadParam> dp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", D), RAD_INT("K", F),
+                                 RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
+                                 RAD_STR("dtype", x3_dtype[1]), RAD_STR("codebook", x3_cb[1]),
+                                 RAD_INT("N_odd", D), RAD_INT("K_odd", F), RAD_INT("h_rot", 1) };
+    op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
+               {b_x3h, w.sorted, w.eoff}, {w.edn});
+    if (!op_gu || !op_dn) return RAD_E_INVAL;
+    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank, swiglu limit %g", l,
+             x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, c.swiglu_limit);
+    return RAD_OK;
+}
+
+/* One EXL3 op over this rank's tables, each operand where exl3_positions() puts it. */
+inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in,
+                               RadOperand out) const {
+    const Exl3Positions& at = *exl3_positions(op);
+    static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
+    static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
+    const bool gate_up = op == EXL3_GATE_UP;
+    const int64_t ne = c.n_expert, half = ne / 2, k = c.top_k;
+    RadOperand opd[16];
+    for (RadOperand& o : opd) o = RAD_NONE;
+    opd[at.x] = in;
+    opd[at.sorted] = brows(w.sorted, rows * k);
+    opd[at.offset] = brows(w.eoff, ne + 1);
+    opd[at.y] = out;
+    for (int q = 0; q < 2; ++q)
+        for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
+            const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
+            opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] = RAD_WTAB(run[(size_t)(q * half)], half);
+        }
+    rad_issue(c_, op_h, opd, at.n_opd, rows);
 }
 
 /* The shared arm's first stage: its one-column gate and its gate_up over the normed input. Its
@@ -1805,7 +1985,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
-    if (c.expert_bf16)
+    if (c.expert_exl3)
+        issue_exl3(c_, op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                   brows(b_x3h, rows * k));
+    else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
@@ -1829,9 +2012,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.egu, rows * k));
     if (shared) shared_up(c_, T, r0, rows,
                           (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
-    gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
+    if (!c.expert_exl3)   /* EXL3: inside gate_up */
+        gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
-    if (c.expert_bf16)
+    if (c.expert_exl3)
+        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
+    else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
     else if (ncls == 4)
@@ -1876,7 +2062,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             rad_memset_async(rad_buf_ptr(c_, b_gram_dn), 0,
                              c.n_ff_exp * c.n_ff_exp * 4, rad_stream(c_));
         }
-        if (c.expert_bf16) {
+        if (act_bf16()) {
             RAD_ISSUE_N(c_, op_gram_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE,
                         brows(b_gram_gu, g.n_embd));
             RAD_ISSUE_N(c_, op_gram_dn, rows * k, brows(w.eff.x, rows * k), RAD_NONE,
@@ -1972,7 +2158,7 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
     for (int64_t e = 0; e < ne; ++e) {
         const int64_t r0 = off[(size_t)e], n = off[(size_t)e + 1] - r0;
         if (n <= 0) continue;
-        if (c.expert_bf16)
+        if (act_bf16())
             RAD_ISSUE_N(c_, op_gram_dne, n, brow_slice(w.eff.x, r0, n, K), RAD_NONE,
                         brow_slice(b_gram_dne, e * K, K, K));
         else
