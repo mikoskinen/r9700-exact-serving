@@ -43,6 +43,11 @@ target_compile_options(exl3ref PRIVATE $<$<COMPILE_LANGUAGE:C>:-ffp-contract=off
 find_library(EXL3REF_LIBM m)
 if(EXL3REF_LIBM)
   target_link_libraries(exl3ref PRIVATE ${EXL3REF_LIBM})
+  # the experts of one issue in parallel (ref.c); optional, the bits do not depend on it
+  find_package(OpenMP COMPONENTS C)
+  if(OpenMP_C_FOUND)
+    target_link_libraries(exl3ref PRIVATE OpenMP::OpenMP_C)
+  endif()
 endif()
 
 # ------------------------------------------------------------------ tests (tests/ref)

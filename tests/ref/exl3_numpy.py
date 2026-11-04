@@ -392,7 +392,7 @@ def prep_gu(a, experts, sorted_tok, off, n_expert, top_k, x_cols, swap_suh=False
     return xr
 
 
-def gate_up(a, experts, sorted_tok, off, n_expert, top_k, y_cols, swap_suh=False, h_rot=0, a_rot=0):
+def gate_up(a, experts, sorted_tok, off, n_expert, top_k, y_cols, swap_suh=False, h_rot=0, a_rot=0, limit=0.0):
     """moe_exl3_gate_up: h f16 [T, y_cols]. experts[e] is expert e's stacked Expert (offsets index order).
     `swap_suh` is a deliberate error (the up half's scales on the gate), for the comparison's negative control.
     h_rot = 1: h is then rotated for down -- down's own first step, with down's suh (the expert's `dn_suh`).
@@ -410,7 +410,11 @@ def gate_up(a, experts, sorted_tok, off, n_expert, top_k, y_cols, swap_suh=False
             xr = a32[rows, p * K : (p + 1) * K] if a_rot else _prologue(x, su)
             acc = _gemm_rows(xr, ex.what[p * width : (p + 1) * width])
             halves.append((had128(acc) * ex.svh[p * width : (p + 1) * width].astype(np.float32)).astype(np.float32))
-        hv = to_f16(silu(halves[0]) * halves[1])
+        g_, u_ = halves
+        if limit and limit > 0:  # v8 SwiGLU clamp, libref swiglu_clamped's order (f32, before the activation)
+            g_ = np.minimum(g_, np.float32(limit)).astype(np.float32)
+            u_ = np.clip(u_, -np.float32(limit), np.float32(limit)).astype(np.float32)
+        hv = to_f16(silu(g_) * u_)
         h[rows, :width] = to_f16(_prologue(hv.astype(np.float32), ex.dn_suh)) if h_rot else hv
     return h
 

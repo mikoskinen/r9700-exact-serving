@@ -67,6 +67,10 @@ POS = {GU: dict(x=0, sorted=6, offset=7, y=13, n=14, planes={0: [1, 2, 3, 4, 5],
                                                               3: [24, 25, 26, 27, 28, 29, 30]})}
 
 
+def ptype(v):
+    return 'str' if isinstance(v, str) else 'f64' if isinstance(v, float) else 'int'
+
+
 def base(op):
     """The two-class op a form is of (what it computes)."""
     return BASE.get(op, op)
@@ -94,7 +98,7 @@ class Case:
 
     def __init__(self, name, op, rng, *, M, top_k, n_expert, rows, cols, rows_odd=None, cols_odd=None, two=True,
                  bits=4, codebook="mul1", drop=0.0, n_protect=0, a_dtype="f16", experts=None, x=None, h_rot=0,
-                 a_rot=0, classes=None):
+                 a_rot=0, classes=None, limit=None):
         """For prep_gu, `rows` is still the stacked experts' 2 * width (they carry suh.1); the op reads only `cols`.
         `classes`: four (rows, cols), one a class by number mod 4 -- the _mod4 form of `op` (`rows`, `cols` unused)."""
         if classes:
@@ -142,6 +146,8 @@ class Case:
         self.params["h_rot"] = h_rot
         if self.gate_up:
             self.params["a_rot"] = a_rot
+            if limit is not None:  # v8: the SwiGLU clamp (DeepSeek swiglu_limit)
+                self.params["limit"] = float(limit)
         if self.prep:  # prep_gu's own parameters: no N, no codebook, no flags
             self.params = {k: v for k, v in self.params.items() if k in PREP_KEYS}
         # gate_up's dn_suh tables: present with h_rot = 1 (None = that rule); `dn_nan` fills them with NaN, the
@@ -179,7 +185,8 @@ class Case:
                              swap_suh=swap_suh)
         if self.gate_up:
             return X.gate_up(self.x, ex, self.sorted, self.off, self.n_expert, self.top_k, self.y_cols,
-                             swap_suh=swap_suh, h_rot=hr, a_rot=self.a_rot).view(np.uint16)
+                             swap_suh=swap_suh, h_rot=hr, a_rot=self.a_rot,
+                             limit=self.params.get("limit", 0.0)).view(np.uint16)
         return X.down(self.x, ex, self.sorted, self.off, self.n_expert, self.y_cols, h_rot=hr)
 
     def zero_rows(self):
@@ -241,7 +248,7 @@ class Case:
         out = "xr" if self.prep else "h" if self.gate_up else "y"
         lines = [f"op {self.op}"]
         for k, v in self.params.items():
-            lines.append(f"param {k} {'str' if isinstance(v, str) else 'int'} {v}")
+            lines.append(f"param {k} {ptype(v)} {v!r}" if isinstance(v, float) else f"param {k} {ptype(v)} {v}")
         slots = [None] * pos["n"]
         xbits = X.to_bf16_bits(self.x) if self.a_dtype == "bf16" else X.to_f16(self.x).view(np.uint16)
         xbits.tofile(d / "x.bin")
@@ -695,7 +702,8 @@ class GdCase:
     def write(self, d, sorted_tok=None, override=None, dn_override=None):
         d.mkdir(parents=True, exist_ok=True)
         g, pos = self.gu, POS[self.op]
-        lines = [f"op {self.op}"] + [f"param {k} {'str' if isinstance(v, str) else 'int'} {v}" for k, v in self.params.items()]
+        lines = [f"op {self.op}"] + [f"param {k} {ptype(v)} {v!r}" if isinstance(v, float) else f"param {k} {ptype(v)} {v}"
+                                     for k, v in self.params.items()]
         slots = [None] * pos["n"]
         xbits = X.to_bf16_bits(g.x) if g.a_dtype == "bf16" else X.to_f16(g.x).view(np.uint16)
         xbits.tofile(d / "x.bin")
@@ -1100,6 +1108,19 @@ def suite_cases(args, work):
                          cols=128, bits=bits, codebook=cb))
         more.append(Case(f"down K={bits} {cb}", "moe_exl3_down", rng, M=3, top_k=2, n_expert=4, rows=128,
                          cols=128, bits=bits, codebook=cb))
+    # v8: DeepSeek-V4.1's SwiGLU clamp (swiglu_limit). A small limit so random weights actually clip both halves, at
+    # h_rot 0 and 1, bf16 input; then the real per-rank geometry (expert parallel: whole 2304-wide experts, top-6)
+    # at the model's limit 10, two parity classes, K = 2.
+    more += [
+        Case("gate_up limit 0.05 (clamps)", "moe_exl3_gate_up", rng, M=5, top_k=3, n_expert=6, rows=512, cols=256,
+             a_dtype="bf16", limit=0.05),
+        Case("gate_up limit 0.05 h_rot 1", "moe_exl3_gate_up", rng, M=5, top_k=3, n_expert=6, rows=512, cols=256,
+             a_dtype="bf16", h_rot=1, limit=0.05),
+        Case("gate_up DeepSeek EP geometry K=2 limit 10", "moe_exl3_gate_up", rng, M=2, top_k=2, n_expert=4,
+             rows=4608, cols=5120, a_dtype="bf16", bits=2, limit=10.0),
+        Case("down DeepSeek EP geometry K=2", "moe_exl3_down", rng, M=2, top_k=2, n_expert=4, rows=5120, cols=2304,
+             bits=2),
+    ]
     # Half-integer K (exllamav3 1.6, mul1 only): the [1x2] pair plane, two classes and the whole-expert (EP) form
     # DeepSeek V4.1 serves (no odd class), each a stacked gate_up and a down.
     for bits in (1.5, 2.5, 3.5):
@@ -1111,6 +1132,10 @@ def suite_cases(args, work):
                      rows=512, cols=256, two=False, bits=2.5, drop=0.1))
     more.append(Case("down K=2.5 whole experts (EP)", "moe_exl3_down", rng, M=4, top_k=6, n_expert=8, rows=256,
                      cols=256, two=False, bits=2.5, drop=0.1))
+    # half-integer K with the SwiGLU clamp (v8), bf16 input, as DeepSeek's layers 0-5 / 35-39 issue it; a small limit
+    # so the clamp bites on random weights (the negative control below holds it to that)
+    more.append(Case("gate_up K=2.5 whole experts limit 0.05", "moe_exl3_gate_up", rng, M=4, top_k=6, n_expert=8,
+                     rows=512, cols=256, two=False, bits=2.5, a_dtype="bf16", limit=0.05))
     # The real model's per-rank geometry (Qwen3.8-Flash-Next: hidden 2560, expert 640, top-10): tp1 and the
     # 384/256 parity split of tp2 (PLAN.md D7).
     more += [
@@ -1130,6 +1155,14 @@ def suite_cases(args, work):
                           f"rc={rep['shapes'][2]['rc']}")
             continue
         ok &= check_case(args, c, work / c.name.replace(" ", "_").replace("/", "_"))[0]
+    # v8 negative control: the small-limit cases must clip, or their match above proves nothing.
+    for c in more:
+        if c.gate_up and c.params.get("limit", 0.0) and c.params["limit"] < 1.0:
+            lim = c.params.pop("limit")
+            unclamped = c.expected()
+            c.params["limit"] = lim
+            ok &= verdict(bool(np.any(unclamped != c.expected())), f"{c.name}: the limit changes the output "
+                          "(the clamp is exercised)")
     # EPI 1 (h_rot, interface v3): the h_rot 1 gate_up through every control, then the chains.
     gu, dn = chain_case(rng, "gate_up h_rot 1, two classes 3:2", M=9, top_k=4, n_expert=6, hidden=256, width=384,
                         width_odd=256, drop=0.1, n_protect=2)

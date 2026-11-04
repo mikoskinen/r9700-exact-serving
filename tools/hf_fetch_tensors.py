@@ -40,7 +40,7 @@ from pathlib import Path
 HF = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 BLOCK = 8 << 20
 TIMEOUT_S = 60
-ITEMSIZE = {"BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1, "U16": 2, "I16": 2,
+ITEMSIZE = {"BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1, "U16": 2, "I16": 2,
             "F16": 2, "BF16": 2, "U32": 4, "I32": 4, "F32": 4, "U64": 8, "I64": 8, "F64": 8}
 
 

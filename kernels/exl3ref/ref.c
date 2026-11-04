@@ -42,6 +42,15 @@ static void gemv(const float* xr, const float* what, int64_t rows, int64_t cols,
 }
 
 static float silu(float g) { return g * (1.0f / (1.0f + expf(-g))); }
+/* v8: silu(gate) * up with DeepSeek's SwiGLU clamp (gate <= limit, |up| <= limit) when limit > 0, as libref's
+ * swiglu_clamped does it (f32, the clamp before the activation). */
+static float swiglu(float g, float u, float limit) {
+    if (limit > 0.0f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    return silu(g) * u;
+}
 
 /* ------------------------------------------------------------------ the operands */
 
@@ -202,12 +211,12 @@ static int expert_rows(const Exl3Geom* g, const Io* io, int64_t e, Work* wk) {
             }
             uint16_t* h = (uint16_t*)io->y->data + i * io->y_pitch;
             if (!g->h_rot) {
-                for (int64_t n = 0; n < W; ++n) h[n] = f2h(silu(wk->acc[n]) * wk->acc[W + n]);
+                for (int64_t n = 0; n < W; ++n) h[n] = f2h(swiglu(wk->acc[n], wk->acc[W + n], (float)g->limit));
                 continue;
             }
             /* h_rot = 1: h, then down's first step with down's suh of this expert -- the same
              * prologue down would run, so the pair's bits do not depend on which op runs it. */
-            for (int64_t n = 0; n < W; ++n) wk->x[n] = h2f(f2h(silu(wk->acc[n]) * wk->acc[W + n]));
+            for (int64_t n = 0; n < W; ++n) wk->x[n] = h2f(f2h(swiglu(wk->acc[n], wk->acc[W + n], (float)g->limit)));
             const int rc = prologue(wk->x, entry(io->tab[c][EXL3_P_DN_SUH], j), W, wk->xr);
             if (rc != RAD_OK) return rc;
             for (int64_t n = 0; n < W; ++n) h[n] = f2h(wk->xr[n]);
@@ -318,15 +327,33 @@ int exl3ref_launch(const RadArgs* a, int op) {
     }
     /* x and xr hold an input row (x_cols) and, with h_rot, gate_up's h row (widest / 2). */
     const int64_t row = g.x_cols > widest ? g.x_cols : widest;
-    Work wk = { malloc((size_t)(most + 1) * sizeof(float)), malloc((size_t)row * sizeof(float)),
-                malloc((size_t)row * sizeof(float)), malloc((size_t)(widest + 1) * sizeof(float)) };
-    rc = wk.what && wk.x && wk.xr && wk.acc ? RAD_OK : RAD_E_NOMEM;
-    for (int64_t e = 0; e < g.n_expert && rc == RAD_OK; ++e) {
-        int live = 0;
-        for (int64_t i = io.eoff[e]; i < io.eoff[e + 1] && !live; ++i) live = io.tok[i] >= 0;
-        if (live || (g.op == EXL3_PREP_GU && io.eoff[e + 1] > io.eoff[e]))
-            rc = g.op == EXL3_PREP_GU ? prep_rows(&g, &io, e, &wk) : expert_rows(&g, &io, e, &wk);
+    /* Experts in parallel (OpenMP when built with it): each writes only its own run's rows, so the bits do not
+     * depend on the thread count; one scratch a thread. */
+    int rc_all = RAD_OK;
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        Work wk = { malloc((size_t)(most + 1) * sizeof(float)), malloc((size_t)row * sizeof(float)),
+                    malloc((size_t)row * sizeof(float)), malloc((size_t)(widest + 1) * sizeof(float)) };
+        int rc_t = wk.what && wk.x && wk.xr && wk.acc ? RAD_OK : RAD_E_NOMEM;
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t e = 0; e < g.n_expert; ++e) {
+            int live = 0;
+            if (rc_t != RAD_OK) continue;
+            for (int64_t i = io.eoff[e]; i < io.eoff[e + 1] && !live; ++i) live = io.tok[i] >= 0;
+            if (live || (g.op == EXL3_PREP_GU && io.eoff[e + 1] > io.eoff[e]))
+                rc_t = g.op == EXL3_PREP_GU ? prep_rows(&g, &io, e, &wk) : expert_rows(&g, &io, e, &wk);
+        }
+        if (rc_t != RAD_OK) {
+#ifdef _OPENMP
+#pragma omp critical(exl3ref_rc)
+#endif
+            if (rc_all == RAD_OK) rc_all = rc_t;
+        }
+        free(wk.what); free(wk.x); free(wk.xr); free(wk.acc);
     }
-    free(wk.what); free(wk.x); free(wk.xr); free(wk.acc);
-    return rc;
+    return rc_all;
 }

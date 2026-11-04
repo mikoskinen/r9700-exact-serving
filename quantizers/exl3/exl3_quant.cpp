@@ -281,20 +281,26 @@ int quantize(const RadParam* o, int n_o, const RadQuantWeight* w, float* /* igno
     if (!s) { say(w->name, why); return RAD_E_FORMAT; }
 
     char prefix[160];
+    const bool ds = s->deepseek();
+    /* DeepSeek-V4.1: the drafter's stages are mtp.0 .. mtp.2, declared at layers n_layers .. n_layers + 2 */
+    const int n_mtp = ds ? 3 : 1;
     if (nm.layer < s->n_layers())
-        std::snprintf(prefix, sizeof prefix, "model.language_model.layers.%d.mlp.experts.%lld", nm.layer,
-                      nm.expert);
-    else if (nm.layer == s->n_layers())
-        std::snprintf(prefix, sizeof prefix, "mtp.layers.0.mlp.experts.%lld", nm.expert);
+        std::snprintf(prefix, sizeof prefix,
+                      ds ? "layers.%d.ffn.experts.%lld" : "model.language_model.layers.%d.mlp.experts.%lld",
+                      nm.layer, nm.expert);
+    else if (nm.layer < s->n_layers() + n_mtp)
+        std::snprintf(prefix, sizeof prefix, ds ? "mtp.%d.ffn.experts.%lld" : "mtp.layers.%d.mlp.experts.%lld",
+                      (int)(nm.layer - s->n_layers()), nm.expert);
     else {
         say(w->name, "layer " + std::to_string(nm.layer) + " is past the source's " +
                      std::to_string(s->n_layers()) + " layers and its MTP head (layer " +
                      std::to_string(s->n_layers()) + ")");
         return RAD_E_NOTFOUND;
     }
-    const Part gate_up[2] = {{"gate_proj", 0, rows / 2, EXL3_PLANE_SUH},
-                             {"up_proj", rows / 2, rows / 2, EXL3_PLANE_SUH1}};
-    const Part down[1] = {{"down_proj", 0, rows, EXL3_PLANE_SUH}};
+    /* DeepSeek's release names the projections w1 (gate), w3 (up) and w2 (down) */
+    const Part gate_up[2] = {{ds ? "w1" : "gate_proj", 0, rows / 2, EXL3_PLANE_SUH},
+                             {ds ? "w3" : "up_proj", rows / 2, rows / 2, EXL3_PLANE_SUH1}};
+    const Part down[1] = {{ds ? "w2" : "down_proj", 0, rows, EXL3_PLANE_SUH}};
     const Part* parts = nm.stacked ? gate_up : down;
     for (int i = 0; i < (nm.stacked ? 2 : 1); ++i) {
         const int st = import_part(s, prefix, parts[i], op, w, planes, &why);

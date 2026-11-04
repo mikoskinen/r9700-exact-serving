@@ -220,6 +220,12 @@ Source* Source::open(const std::string& dir, std::string* why) {
         return nullptr;
     }
     const Json* tc = cfg.get("text_config");
+    {
+        const Json* mt = cfg.get("model_type");
+        const Json* tmt = tc ? tc->get("model_type") : nullptr;
+        const auto is_ds = [](const Json* j) { return j && j->kind == Json::Str && j->str.rfind("deepseek_v4", 0) == 0; };
+        s->deepseek_ = is_ds(mt) || is_ds(tmt);
+    }
     if (!as_int((tc ? tc : &cfg)->get("num_hidden_layers"), &s->n_layers_) || s->n_layers_ < 1) {
         if (why) *why = "src=" + dir + ": config.json has no text_config.num_hidden_layers";
         return nullptr;

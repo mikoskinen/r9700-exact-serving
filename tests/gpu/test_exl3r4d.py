@@ -160,10 +160,14 @@ def deepseek_ep(args, rng, work):
     M = 64 for the M > 16 rows), against the transcription; the h_rot / prep_gu chains at the same widths."""
     ok = True
     for K in (2, 2.5):
+        c = R.Case(f"ds41 K={K} gate_up limit 0.05 clamps", GU, rng, M=4, top_k=4, n_expert=6, rows=4608, cols=5120,
+                   two=False, bits=K, a_dtype="bf16", limit=0.05)
+        ok &= R.check_case(args, c, work / label(c.name))[0]
         for M in (1, 16, 64):
             for op, rows, cols in ((GU, 4608, 5120), (DN, 5120, 2304)):
+                gu_kw = dict(a_dtype="bf16", limit=10.0) if op == GU else {}   # DeepSeek's bf16 rows, swiglu_limit 10
                 c = R.Case(f"ds41 K={K} {op[9:]} whole experts M={M}", op, rng, M=M, top_k=4, n_expert=6, rows=rows,
-                           cols=cols, two=False, drop=0.02 if M > 1 else 0.0, bits=K)
+                           cols=cols, two=False, drop=0.02 if M > 1 else 0.0, bits=K, **gu_kw)
                 ok &= R.check_case(args, c, work / label(c.name))[0]
         gu, dn = R.chain_case(rng, f"ds41 K={K} chain", M=5, top_k=4, n_expert=4, hidden=5120, width=2304, bits=K,
                               two=False)

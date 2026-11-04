@@ -48,6 +48,9 @@ public:
     static Source* open(const std::string& dir, std::string* why);
 
     int64_t n_layers() const { return n_layers_; }   /* text_config.num_hidden_layers */
+    /* DeepSeek-V4 naming (config.json model_type deepseek_v4*): experts are layers.L.ffn.experts.E.{w1,w3,w2}
+     * (gate, up, down) and the drafter's mtp.S.ffn.experts.E; otherwise Qwen's model.language_model.layers... */
+    bool deepseek() const { return deepseek_; }
 
     /* Look a tensor up: 1 found, 0 absent, -1 error (`why`). */
     int find(const std::string& name, Tensor* out, std::string* why);
@@ -59,6 +62,7 @@ private:
 
     std::string dir_;
     int64_t n_layers_ = -1;
+    bool deepseek_ = false;
     std::mutex mu_;
     std::unordered_map<std::string, std::string> where_;   /* tensor name -> shard file */
     std::unordered_map<std::string, std::unordered_map<std::string, Tensor>> shards_;

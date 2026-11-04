@@ -3020,7 +3020,9 @@ __global__ void __launch_bounds__(256) exl3r4d_epi_kernel(Exl3r4dGemm p) {
       union { _Float16 hv[4]; v2u u; } o;
 #pragma unroll
       for (int q = 0; q < 4; q++) {
-        const float gq = (g[q] * RS) * sv[q], uq = (u[q] * RS) * su[q];
+        const float gq0 = (g[q] * RS) * sv[q], uq0 = (u[q] * RS) * su[q];
+        const float gq = p.limit > 0.f ? fminf(gq0, p.limit) : gq0;   // v8 SwiGLU clamp
+        const float uq = p.limit > 0.f ? fminf(fmaxf(uq0, -p.limit), p.limit) : uq0;
         o.hv[q] = t >= 0 ? (_Float16)((gq * (1.0f / (1.0f + expf(-gq)))) * uq) : (_Float16)0.f;
       }
       *(v2u*)((_Float16*)p.y + (size_t)r * p.y_pitch + c0) = o.u;

@@ -11,7 +11,7 @@
 //
 // The case file (written by test_exl3ref.py; paths relative to it):
 //   op <name>
-//   param <key> int <value> | param <key> str <value>
+//   param <key> int <value> | param <key> str <value> | param <key> f64 <value>
 //   opd <name> absent
 //   opd <name> <in|out|wtab> <dtype> <rank> <dims...> <file|-> [table|stacked] [pitch=<elements>]
 // An `in`/`wtab` file holds the operand dense (a table: its entries back to back); `pitch` stores a
@@ -244,6 +244,7 @@ int main(int argc, char** argv) {
     for (auto& kv : raw) {
         keys.push_back(kv.first);
         if (kv.second.compare(0, 3, "int") == 0) params.push_back(RAD_INT(nullptr, std::stoll(kv.second.substr(4))));
+        else if (kv.second.compare(0, 3, "f64") == 0) params.push_back(RAD_F64(nullptr, std::stod(kv.second.substr(4))));
         else { svals.push_back(kv.second.substr(4)); params.push_back(RAD_STR(nullptr, nullptr)); }
     }
     for (size_t i = 0, s = 0; i < params.size(); ++i) {

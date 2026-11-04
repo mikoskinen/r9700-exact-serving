@@ -1134,7 +1134,9 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
         union { _Float16 hv[8]; v4u u; } out;
 #pragma unroll
         for (int e = 0; e < 8; e++) {
-          const float gv = (g[e] * RS) * sg[e], uv = (u[e] * RS) * su[e];
+          const float gv0 = (g[e] * RS) * sg[e], uv0 = (u[e] * RS) * su[e];
+          const float gv = p.limit > 0.f ? fminf(gv0, p.limit) : gv0;
+          const float uv = p.limit > 0.f ? fminf(fmaxf(uv0, -p.limit), p.limit) : uv0;
           out.hv[e] = live ? (_Float16)((gv * (1.0f / (1.0f + expf(-gv)))) * uv) : (_Float16)0.f;
         }
         if (p.h_rot)  // v3 EPI 1: staged, rotated below with down's suh before it is stored
