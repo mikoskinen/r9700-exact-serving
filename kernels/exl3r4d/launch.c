@@ -124,7 +124,13 @@ static int table(const RadTensor* t, int plane, int64_t entries, int64_t rows, i
          * record bytes]). Canonical codes (uK) are not read here: they go through the layout hook first. */
         const int64_t bytes = rows * cols * exl3_k2(bits) / 16;   /* 16 K uint16 a tile (K = 2.5: 40) */
         if (t->dtype == EXL3R4D_DT_TRELLIS) {   /* the engine's pointer table, or records back to back */
-            if (per != rows * cols || (t->stride[0] != 0 && t->stride[0] != per)) return RAD_E_SHAPE;
+            /* ds41-exl3 fix: the engine describes a re-laid weight with the STORED dtype and the DECLARED shape
+             * (core/runtime/ctx.cpp bind_weights), and a half-integer K's codes view is declared at its pair plane's
+             * extents [rows, cols / 2] (exl3_codes_plane_cols; deepseek41's x3_cpe) -- so a K = 2.5 table arrives as
+             * [rows, cols / 2] and was refused here (RAD_E_SHAPE) at every launch. Either extent names the same record
+             * (record_bytes from the geometry's rows and cols); at integer K the two are one. */
+            const int64_t pc = rows * exl3_codes_plane_cols(cols, bits);
+            if ((per != rows * cols && per != pc) || (t->stride[0] != 0 && t->stride[0] != per)) return RAD_E_SHAPE;
             *s0 = t->stride[0] != 0 ? bytes : 0;
         } else if (t->dtype == RAD_U8) {
             if (per != bytes || (t->stride[0] != 0 && t->stride[0] % 256)) return RAD_E_SHAPE;
