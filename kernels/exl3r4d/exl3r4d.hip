@@ -1752,15 +1752,17 @@ static __device__ __forceinline__ _Float16* suhc_vec(const Exl3r4dGemm& p, int e
   return (_Float16*)p.suhc + ((size_t)e * 2 + m) * (size_t)cols;
 }
 // the wave's loaded slice into the copy, then its bit (after the stores are visible)
+// (`mark` false: a round of a wider row before its last -- the stores without the bit)
 template <int NBW, int WPM>
 static __device__ __forceinline__ void suhc_fill(const Exl3r4dGemm& p, int e, int m, int kw, int blocks, int cols,
-                                                 int wave, int lane, const v2u (&bs)[NBW]) {
+                                                 int wave, int lane, const v2u (&bs)[NBW], bool mark = true) {
   _Float16* dst = suhc_vec(p, e, m, cols);
 #pragma unroll
   for (int b = 0; b < NBW; b++) {
     const int k = kw + b * WPM;
     if (k < blocks) *(v2u*)(dst + k * 128 + 4 * lane) = bs[b];
   }
+  if (!mark) return;
   __threadfence();
   if (lane == 0) atomicOr(p.suhc_ok + e, 1u << wave);
 }
@@ -1770,7 +1772,7 @@ static __device__ __forceinline__ void suhc_fill(const Exl3r4dGemm& p, int e, in
 template <int MATS>
 static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int wave, int lane) {
   typedef const __attribute__((address_space(1))) v2u* gv2;
-  constexpr int WPM = 8 / MATS, NBW = 8;   // waves a matrix; a wave's 128-blocks at most (cols <= 128 * NBW * WPM)
+  constexpr int WPM = 8 / MATS, NBW = 8;   // waves a matrix; a wave's 128-blocks a round (128 * NBW * WPM columns)
   const int n = p.n_expert, m = wave / WPM, kw = wave - m * WPM;
   const int t = __builtin_amdgcn_readfirstlane(p.sorted[r]);
   int cnt = 0;
@@ -1795,22 +1797,29 @@ static __device__ __forceinline__ bool prep_row(const Exl3r4dGemm& p, int r, int
   const gu8 sb = (gu8)(const unsigned char*)(m ? w.suh1 : w.suh);
 #endif
   const size_t xrow = (size_t)(t < 0 ? 0 : MATS == 2 ? min(t / p.top_k, p.n_tok - 1) : r);
-  v2u bx[NBW], bs[NBW];
+  // ds41-exl3 fix: ROUNDS of NBW * WPM blocks until every block of the row is stored. One round holds K <= 128 * NBW *
+  // WPM (gate_up 4096, down 8192): the shipped single round left gate_up's blocks 32..39 at DeepSeek V4.1's hidden 5120
+  // unwritten -- 1024 of 5120 input features a matrix read from stale scratch by the GEMM at every decode launch of 3+
+  // tokens (EXL3R4D_PREP_ROW_MIN). K <= 4096 (Qwen3.8's 2560) takes one round, the same loads and stores as before.
+  for (int k0 = 0; k0 < blocks; k0 += NBW * WPM) {   // uniform
+    v2u bx[NBW], bs[NBW];
 #pragma unroll
-  for (int b = 0; b < NBW; b++) {   // unconditional: past the last block, the last block again
-    const int k = min(kw + b * WPM, blocks - 1);
-    bx[b] = *(gv2)(xb + (xrow * p.x_pitch + k * 128 + 4 * lane) * 2);
-    bs[b] = *(gv2)(sb + (size_t)(k * 128 + 4 * lane) * 2);
-  }
+    for (int b = 0; b < NBW; b++) {   // unconditional: past the last block, the last block again
+      const int k = min(k0 + kw + b * WPM, blocks - 1);
+      bx[b] = *(gv2)(xb + (xrow * p.x_pitch + k * 128 + 4 * lane) * 2);
+      bs[b] = *(gv2)(sb + (size_t)(k * 128 + 4 * lane) * 2);
+    }
 #if EXL3R4D_SUHC
-  if (p.suhc && !hit) suhc_fill<NBW, WPM>(p, e, m, kw, blocks, w.cols, wave, lane, bs);   // wave-uniform
+    if (p.suhc && !hit)   // wave-uniform; the wave's bit only after its last round
+      suhc_fill<NBW, WPM>(p, e, m, k0 + kw, blocks, w.cols, wave, lane, bs, k0 + NBW * WPM >= blocks);
 #endif
 #pragma unroll
-  for (int b = 0; b < NBW; b++) {
-    const int k = kw + b * WPM;
-    if (k < blocks) {   // wave-uniform
-      const v2u o = t >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
-      st_row<kStXr>((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + k * 128 + 4 * lane, o);
+    for (int b = 0; b < NBW; b++) {
+      const int k = k0 + kw + b * WPM;
+      if (k < blocks) {   // wave-uniform
+        const v2u o = t >= 0 ? rotate128_math(bx[b], bs[b], p.x_bf16 == 0, lane) : (v2u)(0u);
+        st_row<kStXr>((_Float16*)p.xr + (size_t)r * p.xr_pitch + (size_t)m * w.cols + k * 128 + 4 * lane, o);
+      }
     }
   }
   return true;
@@ -2215,7 +2224,9 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
         prow = true;
       }
 #else
-      if (EXL3R4D_FU_COLS_EQ(g0) && nw == 8) {   // uniform
+      // ds41-exl3 fix: a slice stores 8 of its matrix's 128-blocks (sl % 4, + 4, ... + 28), so rows wider than 4096
+      // (DeepSeek V4.1's 5120) take the ticket form below, which rotates every (row, matrix, block) task.
+      if (EXL3R4D_FU_COLS_EQ(g0) && nw == 8 && g0.cls[0].cols <= 128 * 8 * 4) {   // uniform
         typedef const __attribute__((address_space(1))) v2u* gv2;
         const int blocks = g0.cls[0].cols / 128, per_row = 2 * blocks, nrows = ntasks / per_row;
         // A WAVE A TICKET, never a row a workgroup by blockIdx (the v1.0.0-v1.1.0 form, `q = blockIdx.x; q +=
