@@ -1815,7 +1815,11 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
     uint32_t M, FzRope r, int block, int fmt, int sc) {
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
+    uint16_t* const fz_row = (uint16_t*)emu_dyn_lds();
+#else
     extern __shared__ uint16_t fz_row[];
+#endif
     __shared__ float lds[THR / kFzWave];
     const uint32_t m = blockIdx.x;
     if (m >= M) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)
