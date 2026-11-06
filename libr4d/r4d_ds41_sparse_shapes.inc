@@ -39,12 +39,18 @@ extern "C" int r4d_shape_index_score(const RadParam* p, int n_p, int operand, Ra
     if (M <= 0 || H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || C < 1) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
     const int64_t ncb = C + 1;
+    /* key_format mxfp4: an entry is (Dm/2 + Dm/32) bytes rounded up to 16, in bf16 slots */
+    const char* kf = r4d_pgets(p, n_p, "key_format");
+    const bool kmx = kf && !std::strcmp(kf, "mxfp4");
+    if (kf && !kmx && std::strcmp(kf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t kslots = kmx ? (Dm / 2 + Dm / 32 + 15) / 16 * 16 / 2 : Dm;
+    if (kslots % ratio) return RAD_E_UNSUPPORTED;
     /* A run (row_part p) scores rows [p M, p M + M) of a step that holds them. */
     const int64_t part = pi(p, n_p, "row_part"), Mq = part > 0 ? (part + 1) * M : M;
     const RadOpdDesc l[] = {
         opd(D, Mq, H * Dm),                                 /* q */
         opd(D, Mq, H),                                      /* head weights */
-        opd(D, ncb, 1, ratio, Dm / ratio),                  /* index cache: an entry a block */
+        opd(D, ncb, 1, ratio, kslots / ratio),              /* index cache: an entry a block */
         opd_idx(1, ncb, ncb),                               /* block table */
         opd_idx(Mq, 0, Mq),                                 /* positions */
         opd_idx(2, 0, Mq, -1, (uint32_t)RAD_OPD_F_IDX_CU),  /* cu_seqlens */

@@ -34,6 +34,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 /* The ops' dynamic LDS. tests/r4d_emu runs these sources on the host, which has no extern
  * __shared__: there it is the launch's dynamic LDS, read at each use. */
@@ -138,8 +139,48 @@ struct DsScoreArgs {
     const int* keep;
     long qr, wr, wc, btr, btc, nblk, ps, cs, sr, scs, row0, kr, kcs;
     int nbt, S, M, Mv, C, H, ratio, cbs, slot, block, bshift;
+    int kmx;                                         /* key_format mxfp4: the cache holds packed keys */
     float wscale;
 };
+
+/* ---- MXFP4 index keys (index_score key_format mxfp4, entry_store format mxfp4): an n-value key as
+ * n/2 bytes of e2m1 codes (value 2i in byte i's low nibble, 2i+1 in its high nibble; bit 3 the
+ * sign), then n/32 ue8m0 scale bytes (a block of 32 values each, scale 2^(e-127)), then zeros to a
+ * multiple of 16 bytes: 80 bytes (40 bf16 slots) for the 128-value key. The scale is quant_roundtrip's
+ * (fp4_e2m1, ue8m0, block 32): the power of two at or above max(amax, 6 x 2^-126) x f32(1/6). For
+ * values that rule already produced (every index key deepseek41 stores) the codes are exact and the
+ * unpacked bf16 is the stored bf16, bit for bit: such a block is c_i 2^k with c_i e2m1 codes, and
+ * the rule on it picks 2^k / 2^j with c_max 2^j in (3, 6], where every |c_i| <= c_max times 2^j is
+ * again a code (docs/OPS.md). */
+__host__ __device__ constexpr int ds_mx4_bytes(int n) { return (n / 2 + n / 32 + 15) / 16 * 16; }
+constexpr int kDsMx4Bytes = ds_mx4_bytes(128);       /* 80 */
+
+/* bf16 bits of e2m1 code c (bit 3 the sign) times 2^(e-127), e >= 1 (the scale floor): exponent
+ * e + (m >> 1) - 1 for magnitude code m = 1..7 (0.5, 1, 1.5, 2, 3, 4, 6), mantissa 0x40 at m = 3, 5,
+ * 7; 0.5 x 2^-126 is bf16's denormal 0x0040. */
+__host__ __device__ __forceinline__ uint32_t ds_mx4_bf16(uint32_t c, uint32_t e) {
+    const uint32_t m = c & 7u, s = (c & 8u) << 12;
+    if (m == 0u) return s;
+    const uint32_t E = e + (m >> 1) - 1u;
+    if (E == 0u) return s | 0x40u;
+    return s | (E << 7) | ((m & 1u) && m > 1u ? 0x40u : 0u);
+}
+/* Eight codes (a word, value i at bits 4i) at scale byte e -> four bf16 pairs (value 2t low). */
+__device__ __forceinline__ uint4 ds_mx4_unpack8(uint32_t w, uint32_t e) {
+    uint32_t o[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+        o[t] = ds_mx4_bf16((w >> (8 * t)) & 15u, e) | (ds_mx4_bf16((w >> (8 * t + 4)) & 15u, e) << 16);
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
+/* e2m1's code of v (quant_roundtrip's e2m1_code): nearest magnitude, ties to the even code, past 6
+ * the largest; NaN 0. */
+__host__ __device__ __forceinline__ uint32_t ds_e2m1_code(float v) {
+    if (v != v) return 0u;
+    const float a = v < 0.0f ? -v : v;
+    const uint32_t m = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) + (a >= 3.5f) + (a > 5.0f);
+    return (__builtin_bit_cast(uint32_t, v) >> 28 & 8u) | m;
+}
 
 /* keep's block of position j. */
 __device__ __forceinline__ long ds_keep_block(const DsScoreArgs& a, long j) {
@@ -173,9 +214,12 @@ __device__ __forceinline__ float ds_score_entry(const DsScoreArgs& a, long m, co
     float acc = 0.0f;
     if (kp) {
         float k[DM];
+        /* mxfp4: 64 code bytes then 4 scale bytes, unpacked to the bf16 the rule stored (same floats) */
+        [[maybe_unused]] const uint32_t sc4 = a.kmx ? *(const uint32_t*)((const unsigned char*)kp + DM / 2) : 0u;
 #pragma unroll
         for (int c = 0; c < DM / 8; ++c) {
-            const uint4 v = *(const uint4*)(kp + c * 8);
+            const uint4 v = a.kmx ? ds_mx4_unpack8(((const uint32_t*)kp)[c], (sc4 >> (8 * (c / 4))) & 0xffu)
+                                  : *(const uint4*)(kp + c * 8);
             k[c * 8 + 0] = bf16w_lo(v.x); k[c * 8 + 1] = bf16w_hi(v.x);
             k[c * 8 + 2] = bf16w_lo(v.y); k[c * 8 + 3] = bf16w_hi(v.y);
             k[c * 8 + 4] = bf16w_lo(v.z); k[c * 8 + 5] = bf16w_hi(v.z);
@@ -1771,10 +1815,19 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
                 if (blk >= 0 && blk < a.nblk) kp = a.kc + (blk * a.cbs + (j * a.ratio) % a.cbs) * (long)a.slot;
             }
         }
-        const uint16_t* pk = (kp ? kp : kDsZeroKey) + 64 * hf;
         uint4 kb[8];
+        if (a.kmx) {   /* this lane's half: code bytes [32 hf, 32 hf + 32), scale bytes 2 hf, 2 hf + 1 */
+            const unsigned char* pb = (const unsigned char*)(kp ? kp : kDsZeroKey);
+            const uint4 c0 = *(const uint4*)(pb + 32 * hf), c1 = *(const uint4*)(pb + 32 * hf + 16);
+            const uint32_t e0 = pb[64 + 2 * hf], e1 = pb[64 + 2 * hf + 1];
+            const uint32_t cw[8] = { c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w };
 #pragma unroll
-        for (int i = 0; i < 8; ++i) kb[i] = *(const uint4*)(pk + 8 * i);
+            for (int i = 0; i < 8; ++i) kb[i] = ds_mx4_unpack8(cw[i], i < 4 ? e0 : e1);
+        } else {
+            const uint16_t* pk = (kp ? kp : kDsZeroKey) + 64 * hf;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) kb[i] = *(const uint4*)(pk + 8 * i);
+        }
         ds_v8f d[HT];
 #pragma unroll
         for (int t = 0; t < HT; ++t) {
@@ -1797,6 +1850,40 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
             }
         }
         if (hf == 1 && j < jend) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+    }
+}
+
+/* ================================================================== entry_store, mxfp4 */
+/* entry_store's format mxfp4: one thread a value, a wave a 32-value block, a workgroup a row (n / 32
+ * waves): the block's ue8m0 scale by quant_roundtrip's rule from its amax, the e2m1 codes of v /
+ * scale (exact for a power of two), two a byte, then the scale bytes and the zero pad (layout above
+ * ds_mx4_bytes). */
+__global__ __launch_bounds__(1024) void ds41_entry_store_mx4_kernel(const uint16_t* x, long xp, const int32_t* page,
+                                                                    long pgs, unsigned char* cache, long blocks,
+                                                                    int n, long W) {
+    const int lane = threadIdx.x & 31, b = threadIdx.x >> 5;
+    const int bytes = ds_mx4_bytes(n);
+    for (long w = blockIdx.x; w < W; w += gridDim.x) {
+        const long pg = page[w * pgs];
+        if (pg < 0 || pg >= blocks) continue;        /* block-uniform */
+        const float v = ds_bf(x[w * xp + (long)b * 32 + lane]);
+        float am = v < 0.0f ? -v : v;
+        am = am == am ? am : 0.0f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float t = __shfl_xor(am, o);
+            am = t > am ? t : am;
+        }
+        am = am > 6.0f * 0x1p-126f ? am : 6.0f * 0x1p-126f;
+        const uint32_t u = __builtin_bit_cast(uint32_t, am * (1.0f / 6.0f));
+        const int k = (int)((u >> 23) & 0xffu) - 127 + ((u & 0x7fffffu) ? 1 : 0);
+        const float scale = __builtin_bit_cast(float, (uint32_t)(k + 127) << 23);
+        const uint32_t c = ds_e2m1_code(v / scale);
+        const uint32_t co = (uint32_t)__shfl_xor((int)c, 1);
+        unsigned char* e = cache + pg * (long)bytes;
+        if (!(lane & 1)) e[b * 16 + lane / 2] = (unsigned char)(c | (co << 4));
+        if (lane == 0) e[n / 2 + b] = (unsigned char)(k + 127);
+        if (b == 0 && n / 2 + n / 32 + lane < bytes) e[n / 2 + n / 32 + lane] = 0;
     }
 }
 
@@ -1838,9 +1925,15 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     for (int i = 0; i < 7; ++i)
         if (!a->t[i].data) return R4D_NO(RAD_E_INVAL);
     const RadTensor* keep = a->n_t > 7 && a->t[7].data ? &a->t[7] : nullptr;
+    /* key_format: bf16 (Dm values an entry) or mxfp4 (ds_mx4_bytes(Dm) bytes an entry, unpacked to the
+     * same bf16); an entry is `ratio` slots of the cache's last extent either way. */
+    const char* kf = r4d_gets(a, "key_format");
+    const bool kmx = kf && !std::strcmp(kf, "mxfp4");
+    if (kf && !kmx && std::strcmp(kf, "bf16")) return R4D_NO(RAD_E_UNSUPPORTED);
+    const long kslots = kmx ? (long)ds_mx4_bytes((int)Dm) / 2 : (long)Dm;
     if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
-        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
+        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != kslots ||
         kc.shape[2] % ratio || bt.rank != 2 || r4d_numel(&pos) != q.shape[0] || r4d_numel(&cu) < 2 ||
         sc.rank != 2 || sc.shape[0] < 1 || (part < 0 && sc.shape[0] != q.shape[0]) || sc.shape[1] < 1)
         return R4D_NO(RAD_E_SHAPE);
@@ -1895,7 +1988,8 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.H = (int)H;
     s.ratio = (int)ratio;
     s.cbs = (int)kc.shape[2];
-    s.slot = (int)(Dm / ratio);
+    s.slot = (int)kc.shape[3];
+    s.kmx = kmx ? 1 : 0;
     s.wscale = wscale;
     s.keep = keep ? (const int*)keep->data : nullptr;
     s.kr = keep ? (long)keep->stride[0] : 0;
@@ -2209,6 +2303,27 @@ int attn_body(const RadArgs* a, RadStream stream) {
 }
 
 }  // namespace
+
+/* entry_store's format mxfp4 (r4d_ds41_elem.hip's entry_store_body hands it over): x [W, n] bf16, n a
+ * multiple of 32 up to 1024, into block page[w] of a cache [blocks, heads, block_size, slot] whose
+ * heads x block_size x slot bf16 slots hold ds_mx4_bytes(n) bytes. */
+extern "C" int r4d_ds41_entry_store_mx4(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
+    const long n = (long)r4d_geti_or(a, "n", 0), bs = (long)r4d_geti_or(a, "block_size", 0);
+    if (n < 32 || n > 1024 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
+        r4d_numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs ||
+        cache.shape[1] * cache.shape[2] * cache.shape[3] * 2 != ds_mx4_bytes((int)n) || x.stride[1] != 1 ||
+        !aligned(cache.data, 16))
+        return R4D_NO(RAD_E_SHAPE);
+    if (x.dtype != RAD_BF16 || page.dtype != RAD_I32 || cache.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    const long W = x.shape[0], pgs = lin_stride(page);
+    if (pgs < 0) return R4D_NO(RAD_E_SHAPE);
+    const unsigned g = (unsigned)(W < 65535 ? W : 65535);
+    return R4D_EMIT(stream, ds41_entry_store_mx4_kernel, dim3(g), dim3((unsigned)n), 0u, (const uint16_t*)x.data,
+                    (long)x.stride[0], (const int32_t*)page.data, pgs, (unsigned char*)cache.data,
+                    (long)cache.shape[0], (int)n, W);
+}
 
 extern "C" int r4d_rad_ds41_index_score(const RadArgs* a, RadStream stream) {
     return index_score_body(a, stream);

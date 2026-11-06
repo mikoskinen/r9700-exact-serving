@@ -502,7 +502,7 @@ static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"),
     WGT("sinks"), OUT("out") };
 static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
     P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
-    P_INTO("block") };
+    P_INTO("block"), P_STRO("key_format") };
 static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
     OPD("positions"), OPD("cu_seqlens"), OUT("score"), OPD_O("keep") };
 static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
@@ -526,7 +526,8 @@ static const RadOperandSpec oLogitsGgml[] = { OPD("x"), WGT("lm_head"), OUT("log
 static const RadParamSpec pEmbedGgml[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"), P_STR("type"),
     P_STR("dtype"), P_INTO("vocab_offset"), P_F64O("mult") };
 static const RadOperandSpec oEmbedGgml[] = { OPD("tokens"), WGT("wte"), OUT("x") };
-static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
+static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype"),
+    P_STRO("format") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
 static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
     P_INTO("block") };

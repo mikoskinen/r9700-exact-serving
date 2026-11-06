@@ -81,7 +81,7 @@ static const RadConstraint cDs41SoftmaxPool[] = {
 };
 
 static const RadParamSpec pDs41EntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"),
-                                                P_STR("dtype") };
+                                                P_STR("dtype"), P_STRO("format") };
 static const RadOperandSpec oDs41EntryStore[] = {
     { "x", RAD_OPD_IN, 0 }, { "page", RAD_OPD_IN, 0 }, { "cache", RAD_OPD_INOUT, 0 },
 };
@@ -211,7 +211,10 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
     SCHEMA("entry_store", pDs41EntryStore, oDs41EntryStore,
            "x[w] (n values) into the whole of block page[w] of a paged cache [blocks, heads, block_size, "
            "slot], heads*block_size*slot == n, rounded once to the cache dtype; a negative page writes "
-           "nothing. Declared right after its group, its block_size sets the group's."),
+           "nothing. Declared right after its group, its block_size sets the group's. format mxfp4 (n a "
+           "multiple of 32): each block of 32 as quant_roundtrip(fp4_e2m1, ue8m0) scales it, packed -- n/2 "
+           "bytes of e2m1 codes (value 2i low nibble of byte i), n/32 scale bytes, zeros to 16 -- into "
+           "heads*block_size*slot bf16 slots of that many bytes; exact for values that rule produced."),
     SCHEMA("router_scored_topk", pDs41RouterScored, oDs41RouterScored,
            "router_sigmoid_topk with the score function a required name: sigmoid, sqrtsoftplus "
            "(sqrt(softplus(logit)), softplus linear above 20) or softmax over all n_expert logits."),

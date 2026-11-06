@@ -35,6 +35,7 @@
 extern "C" int r4d_rad_ds41_index_score(const RadArgs*, RadStream);
 extern "C" int r4d_rad_ds41_index_topk(const RadArgs*, RadStream);
 extern "C" int64_t r4d_rad_ds41_index_topk_scratch(const RadArgs*);
+extern "C" int r4d_ds41_entry_store_mx4(const RadArgs*, RadStream);
 
 namespace {
 
@@ -61,7 +62,7 @@ int64_t keep_words(int64_t width, int64_t block) { return ((width + block - 1) /
 
 /* libref's launch for `op`, through the plugin's own exports, or null. */
 struct Ref {
-    RadLaunchFn score = nullptr, cand = nullptr, topk = nullptr;
+    RadLaunchFn score = nullptr, cand = nullptr, topk = nullptr, store = nullptr;
 };
 Ref load_libref() {
     Ref r;
@@ -81,6 +82,7 @@ Ref load_libref() {
         if (!std::strcmp(k->op, "index_score")) r.score = k->launch;
         if (!std::strcmp(k->op, "index_candidates")) r.cand = k->launch;
         if (!std::strcmp(k->op, "index_topk")) r.topk = k->launch;
+        if (!std::strcmp(k->op, "entry_store")) r.store = k->launch;
     }
     return r;
 }
@@ -148,12 +150,14 @@ Fix make(uint32_t seed, int H, int ratio, const std::vector<std::pair<int, int64
 
 /* index_score of plane rows from step row `part * plane` (part < 0: the whole step), optionally
  * restricted to `keep` ([krows, KW] for the plane's rows). */
+constexpr int kMx4Slots = 40;   /* a packed 128-value key: 80 bytes */
 int score(RadLaunchFn fn, const Fix& f, bool second, int64_t plane, int part, const int32_t* keep,
-          int64_t krows, int block, float* out) {
+          int64_t krows, int block, float* out, const uint16_t* packed = nullptr) {
     RadTensor t[8] = {
         tens(second ? f.q2.data() : f.q.data(), RAD_BF16, { f.M, (int64_t)f.H * kDim }),
         tens(second ? f.w2.data() : f.w.data(), RAD_BF16, { f.M, f.H }),
-        tens(f.kc.data(), RAD_BF16, { f.nblk, 1, f.ratio, kDim / f.ratio }),
+        packed ? tens(packed, RAD_BF16, { f.nblk, 1, f.ratio, kMx4Slots / f.ratio })
+               : tens(f.kc.data(), RAD_BF16, { f.nblk, 1, f.ratio, kDim / f.ratio }),
         tens(f.bt.data(), RAD_I32, { f.S, f.nbt }),
         tens(f.pos.data(), RAD_I32, { f.M }),
         tens(f.cu.data(), RAD_I32, { f.S + 1 }),
@@ -165,6 +169,7 @@ int score(RadLaunchFn fn, const Fix& f, bool second, int64_t plane, int part, co
                                 pf64("wscale", 1.0 / std::sqrt((double)kDim * f.H)), pstr("dtype", "bf16") };
     if (part >= 0) p.push_back(pint("row_part", part));
     if (keep) p.push_back(pint("block", block));
+    if (packed) p.push_back(pstr("key_format", "mxfp4"));
     RadArgs a{};
     a.t = t;
     a.n_t = 8;
@@ -422,6 +427,110 @@ void deal(const char* name, const Fix& f, int64_t irows, int block, int kb, int 
     }
 }
 
+/* (c) MXFP4 index keys. The fixture's keys made quant_roundtrip(fp4_e2m1, ue8m0, 32) values (a host
+ * port of libref's rule), packed by entry_store format mxfp4 (the kernel; libref's when loadable),
+ * every packed key decoded on the host back to the stored bf16 bits, then every form of index_score
+ * (decode band, the kept kernel, WMMA) over the packed cache against the bf16 cache: bit for bit. */
+uint16_t host_mx4_bf16(unsigned c, unsigned e) {   /* the kernel's ds_mx4_bf16 */
+    const unsigned m = c & 7u, sg = (c & 8u) << 12;
+    if (!m) return (uint16_t)sg;
+    const unsigned E = e + (m >> 1) - 1u;
+    if (!E) return (uint16_t)(sg | 0x40u);
+    return (uint16_t)(sg | (E << 7) | ((m & 1u) && m > 1u ? 0x40u : 0u));
+}
+void fp4_roundtrip_keys(Fix& f) {
+    static const float kMag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    for (int64_t blk = 0; blk < f.nblk; ++blk)
+        for (int b = 0; b < kDim / 32; ++b) {
+            uint16_t* v = &f.kc[(size_t)(blk * kDim + b * 32)];
+            float amax = 0.0f;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(rad_bf16_to_f32(v[i])));
+            amax = std::max(amax, 6.0f * 0x1p-126f);
+            uint32_t u;
+            const float t = amax * (1.0f / 6.0f);
+            std::memcpy(&u, &t, 4);
+            const int k = (int)((u >> 23) & 0xffu) - 127 + ((u & 0x7fffffu) ? 1 : 0);
+            const float scale = std::ldexp(1.0f, k);
+            for (int i = 0; i < 32; ++i) {
+                const float x = std::clamp(rad_bf16_to_f32(v[i]) / scale, -6.0f, 6.0f);
+                unsigned best = 0;
+                for (unsigned c = 1; c < 8; ++c) {
+                    const float d = std::fabs(kMag[c] - std::fabs(x)), db = std::fabs(kMag[best] - std::fabs(x));
+                    if (d < db || (d == db && (c & 1u) == 0u)) best = c;
+                }
+                v[i] = rad_f32_to_bf16((std::signbit(x) ? -1.0f : 1.0f) * kMag[best] * scale);
+            }
+        }
+}
+int store_mx4(RadLaunchFn fn, const Fix& f, uint16_t* packed) {
+    std::vector<int32_t> page((size_t)f.nblk);
+    for (int64_t i = 0; i < f.nblk; ++i) page[(size_t)i] = (int32_t)i;
+    RadTensor t[3] = { tens(f.kc.data(), RAD_BF16, { f.nblk, kDim }), tens(page.data(), RAD_I32, { f.nblk }),
+                       tens(packed, RAD_BF16, { f.nblk, 1, f.ratio, kMx4Slots / f.ratio }) };
+    RadParam p[5] = { pint("M", f.nblk), pint("n", kDim), pint("block_size", f.ratio), pstr("dtype", "bf16"),
+                      pstr("format", "mxfp4") };
+    RadArgs a{};
+    a.t = t;
+    a.n_t = 3;
+    a.p = p;
+    a.n_p = 5;
+    return fn(&a, nullptr);
+}
+void packed_keys(const char* name, Fix f, int block, int kb, const Ref& ref) {
+    fp4_roundtrip_keys(f);
+    const int64_t M = f.M, C = f.C, KW = keep_words(C, block);
+    std::vector<uint16_t> pk((size_t)(f.nblk * kMx4Slots), 0x7777), pr((size_t)(f.nblk * kMx4Slots), 0x6666);
+    expect(store_mx4(r4d_ds41_entry_store_mx4, f, pk.data()) == RAD_OK, name, "entry_store mxfp4");
+    int64_t dec = 0;
+    for (int64_t blk = 0; blk < f.nblk; ++blk) {
+        const uint8_t* e = (const uint8_t*)&pk[(size_t)(blk * kMx4Slots)];
+        for (int d = 0; d < kDim; ++d)
+            dec += host_mx4_bf16((e[d / 2] >> (4 * (d & 1))) & 15u, e[kDim / 2 + d / 32]) != f.kc[(size_t)(blk * kDim + d)];
+        for (int z = kDim / 2 + kDim / 32; z < 2 * kMx4Slots; ++z) dec += e[z] != 0;
+    }
+    expect(dec == 0, name, "a packed key does not decode to the stored bf16 bits", dec, f.nblk * kDim);
+    if (ref.store) {
+        expect(store_mx4(ref.store, f, pr.data()) == RAD_OK, name, "libref entry_store mxfp4");
+        int64_t d = 0;
+        for (size_t i = 0; i < pk.size(); ++i) d += pk[i] != pr[i];
+        expect(d == 0, name, "libref's packed cache differs from the kernel's", d, (long long)pk.size());
+    }
+    std::vector<float> sc20((size_t)(M * C)), a1((size_t)(M * C)), a2((size_t)(M * C)), b1((size_t)(M * C)),
+        b2((size_t)(M * C));
+    std::vector<int32_t> keep((size_t)(M * KW), 0);
+    expect(score(r4d_rad_ds41_index_score, f, true, M, -1, nullptr, 0, block, sc20.data()) == RAD_OK, name, "cand score");
+    host_candidates(f, sc20.data(), M, f.pos.data(), block, kb, keep.data());
+    expect(score(r4d_rad_ds41_index_score, f, false, M, -1, nullptr, 0, block, a1.data()) == RAD_OK, name, "bf16");
+    expect(score(r4d_rad_ds41_index_score, f, false, M, -1, nullptr, 0, block, a2.data(), pk.data()) == RAD_OK, name,
+           "mxfp4");
+    expect(score(r4d_rad_ds41_index_score, f, false, M, -1, keep.data(), M, block, b1.data()) == RAD_OK, name,
+           "bf16 kept");
+    expect(score(r4d_rad_ds41_index_score, f, false, M, -1, keep.data(), M, block, b2.data(), pk.data()) == RAD_OK,
+           name, "mxfp4 kept");
+    int64_t da = 0, db = 0, live = 0;
+    for (size_t i = 0; i < a1.size(); ++i) {
+        da += bits(a1[i]) != bits(a2[i]);
+        db += bits(b1[i]) != bits(b2[i]);
+        live += a1[i] > -INFINITY;
+    }
+    expect(da == 0, name, "mxfp4 keys score differently from bf16 keys", da, (long long)a1.size());
+    expect(db == 0, name, "mxfp4 keys score differently from bf16 keys (kept)", db, (long long)b1.size());
+    int64_t dr = -1;
+    if (ref.score) {
+        std::vector<float> r1((size_t)(M * C)), r2((size_t)(M * C));
+        expect(score(ref.score, f, false, M, -1, nullptr, 0, block, r1.data()) == RAD_OK, name, "libref bf16");
+        expect(score(ref.score, f, false, M, -1, nullptr, 0, block, r2.data(), pk.data()) == RAD_OK, name,
+               "libref mxfp4");
+        dr = 0;
+        for (size_t i = 0; i < r1.size(); ++i) dr += bits(r1[i]) != bits(r2[i]);
+        expect(dr == 0, name, "libref: mxfp4 keys score differently from bf16 keys", dr, (long long)r1.size());
+    }
+    std::printf("%-48s rows %lld width %lld heads %d ratio %d: %lld keys packed (80 B each), %lld live scores; "
+                "differ from bf16 keys: %lld (unrestricted), %lld (kept), libref %lld (%s form)\n",
+                name, (long long)M, (long long)C, f.H, f.ratio, (long long)f.nblk, (long long)live, (long long)da,
+                (long long)db, (long long)dr, M > 48 ? "WMMA" : "scalar");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -460,6 +569,13 @@ int main(int argc, char** argv) {
         restriction("kept walk, 4500 of 5000 blocks", f, 8, 4500, 256, ref);
         restriction("kept walk, block 2, all kept", f, 2, 20000, 128, ref);
         restriction("kept walk, block 1, 30000 kept", f, 1, 30000, 128, ref);
+    }
+    {
+        /* (c): packed keys, both forms, ratio 1 and 2 */
+        packed_keys("mxfp4 keys, scalar, decode rows", make(21, 32, 1, { { 1, 4800 }, { 3, 4999 } }), 8, 64, ref);
+        packed_keys("mxfp4 keys, WMMA, 66 rows", make(22, 32, 1, { { 2, 3100 }, { 64, 4999 } }), 8, 64, ref);
+        packed_keys("mxfp4 keys, WMMA, 20 heads, ratio 2", make(23, 20, 2, { { 52, 2499 * 2 + 1 } }), 8, 40, ref);
+        packed_keys("mxfp4 keys, scalar, ratio 2", make(24, 32, 2, { { 3, 4001 } }), 8, 40, ref);
     }
     {
         /* (b): 200 prefill rows in runs of <= 64 (4 runs of 50, WMMA); and 130 rows in runs of

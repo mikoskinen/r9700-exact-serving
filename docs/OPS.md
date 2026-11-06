@@ -979,10 +979,10 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
 | `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
-| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
+| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
 | `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
 | `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
-| `entry_store` | `M`(range) `n` `block_size` `dtype` | `x`, `page`, `cache`:inout |
+| `entry_store` | `M`(range) `n` `block_size` `dtype` `format`/opt | `x`, `page`, `cache`:inout |
 | `token_map` | `M`(range) `n_vocab` | `ids`, `table`w → `mapped` |
 | `stream_gate_add` | `M`(range) `n` `hc` `eps`:f64 `gate_eps`:f64 `dtype` | `h`, `k`, `v`, `w`w → `out` |
 | `position_scale` | `M`(range) `n` `original` `beta`:f64 `dtype` | `x`:inout, `positions` |
@@ -1034,6 +1034,18 @@ holds, at most score's), only the kept blocks' positions are scored and every ot
 `index_topk` through the same keep selects exactly what it selects from the unrestricted score: a
 layer past the candidate layer then scores at most `topk_blocks * block` positions a row instead of
 the whole context.
+
+**MXFP4 index keys.** `entry_store` `format` `mxfp4` stores each block of 32 of an entry's `n` values
+(`n` a multiple of 32) the way `quant_roundtrip` (`fp4_e2m1`, `ue8m0`, block 32) quantises it, packed:
+`n/2` bytes of e2m1 codes (value `2i` in byte `i`'s low nibble, `2i+1` in its high nibble, bit 3 the
+sign), then `n/32` ue8m0 scale bytes (scale `2^(e-127)`: the power of two at or above
+`max(amax, 6 * 2^-126) * f32(1/6)`), then zeros to a multiple of 16 bytes -- 80 bytes for 128 values,
+in the cache's bf16 slots (`heads * block_size * slot` of them, 40). `index_score` `key_format`
+`mxfp4` reads such a cache (an entry `ratio` slots of `slot`) and unpacks each value to the bf16 it
+encodes. For values `quant_roundtrip` already produced -- a block `c_i * 2^k`, `c_i` e2m1 codes, as
+DeepSeek-V4's index keys are -- the packing is exact: the rule picks `2^k / 2^j` with `c_max * 2^j` in
+(3, 6], and every `|c_i| <= c_max` times `2^j` is again a code; so every score is the bf16 cache's,
+bit for bit, at 80 bytes an entry instead of 256. `bf16` (or the parameter absent) is the plain form.
 
 **`attn_dense`** serves vision towers and encoders: nothing paged, `cu_seqlens` bounding one image
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a

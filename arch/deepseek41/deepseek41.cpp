@@ -405,6 +405,10 @@ struct Model {
      * exact either way: index_topk reads the kept blocks only, and the split's gather lays every
      * run where the unsplit step does. */
     int64_t keep_min_live = 0, split_min_live = kDs41SplitMinLive;
+    /* RADIANCE_DS41_IDXKEY=mxfp4: the index caches hold each key packed (index_slots(): 80 bytes for 128
+     * values instead of 256; entry_store format / index_score key_format mxfp4). Lossless: the keys are
+     * quant_roundtrip(fp4_e2m1, ue8m0, 32) values, and every score is the bf16 cache's bit for bit. */
+    bool ikmx = false;
     rad_buf sel_part = 0;
     rad_op sel_gather = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
@@ -710,12 +714,13 @@ static rad_op roundtrip(RadBuilder* b, int64_t rows, int64_t n, int64_t block, c
                 RAD_STR("format", fmt), RAD_STR("scale", scale), RAD_STR("dtype", "bf16") },
               {}, { x }, { x });
 }
+/* format: null (bf16 entries) or "mxfp4" (the packed index-key form, docs/OPS.md entry_store) */
 static rad_op entry_store(RadBuilder* b, int64_t rows, int64_t n, int64_t bs, rad_buf x,
-                          rad_buf page) {
-    return op(b, "entry_store",
-              { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block_size", bs),
-                RAD_STR("dtype", "bf16") },
-              {}, { x, page }, {});
+                          rad_buf page, const char* format = nullptr) {
+    std::vector<RadParam> ps = { RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_INT("block_size", bs),
+                                 RAD_STR("dtype", "bf16") };
+    if (format) ps.push_back(RAD_STR("format", format));
+    return op(b, "entry_store", ps, {}, { x, page }, {});
 }
 
 /* ---- fused chains (docs/OPS.md rmsnorm_rope_roundtrip, rope_rows_roundtrip,
@@ -911,6 +916,13 @@ static void index_mode(Model& m) {
     };
     m.keep_min_live = envi("RADIANCE_DS41_KEEP_MIN_LIVE", 2 * m.c.cand_blocks * std::max<int64_t>(1, m.c.cand_block));
     m.split_min_live = envi("RADIANCE_DS41_SPLIT_MIN_LIVE", kDs41SplitMinLive);
+    const char* kx = std::getenv("RADIANCE_DS41_IDXKEY");
+    m.ikmx = kx && !std::strcmp(kx, "mxfp4") && m.c.idim % 32 == 0;
+}
+
+/* An index cache entry's bf16 slots: the key's idim values, or its packed bytes / 2 (mxfp4). */
+static int64_t index_slots(const Model& m) {
+    return m.ikmx ? (m.c.idim / 2 + m.c.idim / 32 + 15) / 16 * 16 / 2 : m.c.idim;
 }
 
 static int buffers(RadBuilder* b, Model& m) {
@@ -1220,8 +1232,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                  * copy of the ring is small and never written. */
                 DS_TRY(rad_bind_layer_kv(b, l, m.tail[r]));
             }
-            if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", c.idim, r))) return RAD_E_INVAL;
-            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page);
+            if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", index_slots(m), r))) return RAD_E_INVAL;
+            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ikmx ? "mxfp4" : nullptr);
             if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
             DS_TRY(rad_kv_group_zero(b, m.index[r]));
@@ -1318,8 +1330,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
                 L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn);
             }
-            if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", c.idim, r))) return RAD_E_INVAL;
-            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page);
+            if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", index_slots(m), r))) return RAD_E_INVAL;
+            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ikmx ? "mxfp4" : nullptr);
             if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
             L.l_f = rope_rt(b, m, rows, 1, hd, 0, 16, "fp4_e2m1", "e4m3", m.lat, m.cs_b);
@@ -1363,6 +1375,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                              RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
                                              RAD_STR("dtype", "bf16"), RAD_INT("row_part", p) };
                 if (kept) sp.push_back(RAD_INT("block", c.cand_block));
+                if (m.ikmx) sp.push_back(RAD_STR("key_format", "mxfp4"));
                 const rad_op h = op(b, "index_score", sp, {},
                                     kept ? std::initializer_list<rad_buf>{ m.iq, m.iw, m.keep }
                                          : std::initializer_list<rad_buf>{ m.iq, m.iw },
@@ -2102,16 +2115,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
              c.idx_src.size(), (long long)c.n_expert, (long long)c.top_k, c.ple.size());
     rad_note(b, "deepseek41 indexer: candidate restriction %s from %lld positions, row split %s from %lld (runs of "
-                "%lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, _SPLIT_MIN_LIVE)",
+                "%lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, _SPLIT_MIN_LIVE), keys %s "
+                "(%lld bytes an entry; RADIANCE_DS41_IDXKEY)",
              m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
-             (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax);
+             (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
+             (long long)(2 * index_slots(m)));
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
                         "from %lld (runs of %lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, "
-                        "_SPLIT_MIN_LIVE)\n",
+                        "_SPLIT_MIN_LIVE), keys %s (%lld bytes an entry; RADIANCE_DS41_IDXKEY)\n",
                 m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
-                (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax);
+                (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
+                (long long)(2 * index_slots(m)));
     return RAD_OK;
 }
 

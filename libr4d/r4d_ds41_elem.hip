@@ -1250,8 +1250,15 @@ __global__ __launch_bounds__(256) void entry_store_kernel(const uint16_t* x, lon
     }
 }
 
+extern "C" int r4d_ds41_entry_store_mx4(const RadArgs* a, RadStream stream);   /* r4d_ds41_sparse.hip */
+
 int entry_store_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
+    /* format mxfp4: the packed index-key form (r4d_ds41_sparse.hip); bf16 or absent: as stored below */
+    if (const char* f = r4d_gets(a, "format")) {
+        if (!std::strcmp(f, "mxfp4")) return r4d_ds41_entry_store_mx4(a, stream);
+        if (std::strcmp(f, "bf16")) return R4D_NO(RAD_E_UNSUPPORTED);
+    }
     const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
     const long n = (long)r4d_geti_or(a, "n", 0), bs = (long)r4d_geti_or(a, "block_size", 0);
     if (n < 1 || n > INT_MAX || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||

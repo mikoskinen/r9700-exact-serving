@@ -19,6 +19,7 @@
 #include "avx_common.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 using namespace avx;
@@ -313,6 +314,9 @@ AVX_KERNEL(attn_sparse_sink) {
  * a key read, as in libref. */
 AVX_KERNEL(index_score) {
     if (!rad_args_have(a, 7)) return RAD_E_INVAL;
+    /* key_format mxfp4 (packed keys) is libr4d's and libref's; this host row reads bf16 keys only */
+    if (const char* kf = rad_args_gets(a, "key_format"))
+        if (std::strcmp(kf, "bf16")) return RAD_E_UNSUPPORTED;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
     const RadTensor* keep = a->n_t > 7 && a->t[7].data ? &a->t[7] : nullptr;
@@ -507,6 +511,9 @@ AVX_KERNEL(index_topk) {
  * entry is written, where libref writes the entries before a bad one; the code is libref's. */
 AVX_KERNEL(entry_store) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    /* format mxfp4 (the packed index-key form) is libr4d's and libref's */
+    if (const char* f = rad_args_gets(a, "format"))
+        if (std::strcmp(f, "bf16")) return RAD_E_UNSUPPORTED;
     const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
     const int64_t n = p_int(a, "n", 0), bs = p_int(a, "block_size", 0);
     if (n < 1 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||

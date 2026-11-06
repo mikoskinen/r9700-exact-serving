@@ -14,7 +14,7 @@ static const RadOperandSpec oDs41AttnSparseSink[] = {
 };
 static const RadParamSpec pDs41IndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
     P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
-    P_INTO("block") };
+    P_INTO("block"), P_STRO("key_format") };
 static const RadOperandSpec oDs41IndexScore[] = {
     { "q", RAD_OPD_IN, 0 },  { "w", RAD_OPD_IN, 0 },         { "index_cache", RAD_OPD_IN, 0 },
     { "bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
@@ -70,7 +70,10 @@ SCHEMA("index_score", pDs41IndexScore, oDs41IndexScore,
        "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]. With row_part "
        "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf). With "
        "keep (index_candidates' bits over blocks of `block`, keep row i for score row i) only the kept "
-       "blocks are scored, the rest -inf unread; a kept score is the unkept op's, bit for bit."),
+       "blocks are scored, the rest -inf unread; a kept score is the unkept op's, bit for bit. "
+       "key_format mxfp4: the cache holds each entry packed (entry_store format mxfp4: e2m1 codes, a ue8m0 "
+       "scale a block of 32, 80 bytes for 128 values) and every score is the bf16 cache's, bit for bit, "
+       "where the keys are quant_roundtrip(fp4_e2m1, ue8m0, 32) values."),
 SCHEMA("index_candidates", pDs41IndexCand, oDs41IndexCand,
        "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
        "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is a bit a "

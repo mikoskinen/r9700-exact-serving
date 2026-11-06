@@ -54,6 +54,17 @@ float roundtrip(float v, float scale, QFmt f) {
         return fp8e4m3_lut(f32_to_fp8e4m3(std::clamp(v / scale, -448.0f, 448.0f))) * scale;
     return mxfp4_elem_to_f32((uint8_t)e2m1_code(std::clamp(v / scale, -6.0f, 6.0f))) * scale;
 }
+
+/* The packed index-key form (entry_store format mxfp4, index_score key_format mxfp4): n/2 bytes of
+ * e2m1 codes (value 2i in byte i's low nibble), n/32 ue8m0 scale bytes, zeros to a multiple of 16. */
+int64_t mx4_bytes(int64_t n) { return (n / 2 + n / 32 + 15) / 16 * 16; }
+
+/* Value d of a packed entry `e` of n values: its code times its block's scale, as f32 (a code times
+ * a power of two at or above 2^-126 is exact in f32, and in bf16). */
+float mx4_value(const uint8_t* e, int64_t n, int64_t d) {
+    const unsigned c = (e[d / 2] >> (4 * (d & 1))) & 15u;
+    return mxfp4_elem_to_f32((uint8_t)c) * pow2_bits((int)e[n / 2 + d / 32] - 127);
+}
 }  // namespace
 
 /* x[m, b*block .. (b+1)*block) quantised to `format` with one `scale`-format scale a block, then
@@ -263,9 +274,16 @@ int ref_index_score(const RadArgs* a, RadStream) {
     const int64_t part = p_int(a, "row_part", -1);
     const int64_t block = p_int(a, "block", 0);
     const float wscale = p_f32(a, "wscale", 0.0f);
+    /* key_format mxfp4: each entry packed (mx4_bytes(Dm) bytes in bf16 slots), its values decoded */
+    const char* kf = p_str(a, "key_format", "bf16");
+    const bool kmx = !std::strcmp(kf, "mxfp4");
+    if (!kmx && std::strcmp(kf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t kslots = kmx ? mx4_bytes(Dm) / 2 : Dm;
+    if (kmx && (kc.dtype != RAD_BF16 || Dm % 32 || !(kc.stride[3] == 1 && kc.stride[2] == kc.shape[3])))
+        return RAD_E_SHAPE;
     if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
-        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
+        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != kslots ||
         kc.shape[2] % ratio || bt.rank != 2 || numel(&pos) != q.shape[0] || numel(&cu) < 2 ||
         sc.rank != 2 || sc.shape[0] < 1 || (part < 0 && sc.shape[0] != q.shape[0]) ||
         sc.shape[1] < 1 || sc.dtype != RAD_F32)
@@ -304,12 +322,13 @@ int ref_index_score(const RadArgs* a, RadStream) {
             if (kept && j < reach && col < bt.shape[1]) {
                 const int64_t blk = ld_int(bt.dtype, bt.data, rowoff(&bt, s, bt.shape[1]) + col * laststride(&bt));
                 if (blk >= 0 && blk < kc.shape[0]) {
-                    const int64_t ko = (blk * cbs + (j * ratio) % cbs) * (Dm / ratio);
+                    const int64_t ko = (blk * cbs + (j * ratio) % cbs) * (kslots / ratio);
+                    const uint8_t* ke = kmx ? (const uint8_t*)kc.data + 2 * ko : nullptr;
                     float acc = 0;
                     for (int64_t h = 0; h < H; ++h) {
                         float dot = 0;
                         for (int64_t d = 0; d < Dm; ++d)
-                            dot += ldt(&q, qb + (h * Dm + d) * qs) * ldt(&kc, ko + d);
+                            dot += ldt(&q, qb + (h * Dm + d) * qs) * (ke ? mx4_value(ke, Dm, d) : ldt(&kc, ko + d));
                         dot = round_dt(dt, dot);
                         const float wh =
                             round_dt(dt, ldt(&w, rowoff(&w, m, H) + h * laststride(&w)) * wscale);
@@ -426,6 +445,35 @@ int ref_entry_store(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
     const int64_t n = p_int(a, "n", 0), bs = p_int(a, "block_size", 0);
+    const char* fmt = p_str(a, "format", "bf16");
+    if (!std::strcmp(fmt, "mxfp4")) {
+        /* each block of 32 quantised as quant_roundtrip(fp4_e2m1, ue8m0) does, packed (mx4_bytes) */
+        const int64_t bytes = mx4_bytes(n);
+        if (n < 32 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
+            numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs || cache.dtype != RAD_BF16 ||
+            cache.shape[1] * cache.shape[2] * cache.shape[3] * 2 != bytes || !rad_tensor_is_contiguous(&cache))
+            return RAD_E_SHAPE;
+        for (int64_t w = 0; w < x.shape[0]; ++w) {
+            const int64_t pg = ld_int(page.dtype, page.data, offlin(&page, w));
+            if (pg < 0) continue;
+            if (pg >= cache.shape[0]) return RAD_E_INVAL;
+            const int64_t xb = rowoff(&x, w, n), xs = laststride(&x);
+            uint8_t* e = (uint8_t*)cache.data + pg * bytes;
+            std::memset(e, 0, (size_t)bytes);
+            for (int64_t b = 0; b < n / 32; ++b) {
+                float amax = 0.0f;
+                for (int64_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(ldt(&x, xb + (b * 32 + i) * xs)));
+                const float scale = block_scale(amax, QFmt::Fp4E2m1, QScale::Ue8m0);
+                for (int64_t i = 0; i < 32; ++i) {
+                    const unsigned c = e2m1_code(std::clamp(ldt(&x, xb + (b * 32 + i) * xs) / scale, -6.0f, 6.0f));
+                    e[(b * 32 + i) / 2] |= (uint8_t)(c << (4 * (i & 1)));
+                }
+                e[n / 2 + b] = (uint8_t)(ceil_log2_bits(scale) + 127);
+            }
+        }
+        return RAD_OK;
+    }
+    if (std::strcmp(fmt, "bf16")) return RAD_E_UNSUPPORTED;
     if (n < 1 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
         numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs ||
         cache.shape[1] * cache.shape[2] * cache.shape[3] != n)
