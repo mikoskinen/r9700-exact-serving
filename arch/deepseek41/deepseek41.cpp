@@ -409,6 +409,9 @@ struct Model {
      * values instead of 256; entry_store format / index_score key_format mxfp4). Lossless: the keys are
      * quant_roundtrip(fp4_e2m1, ue8m0, 32) values, and every score is the bf16 cache's bit for bit. */
     bool ikmx = false;
+    /* RADIANCE_DS41_CTAIL=full: the compressor tail's chain over the whole work plane every step (before
+     * 6.11.); unset: over the step's bound. */
+    bool ctail_full = false;
     /* RADIANCE_DS41_LATENT=nvfp4: the compressed latent caches hold each 512-value entry packed (288
      * bytes instead of 1024: e2m1 codes, an e4m3 scale a block of 16; entry_store format /
      * attn_sparse_sink latent_format nvfp4). Lossless: the latent is quant_roundtrip(fp4_e2m1, e4m3, 16)
@@ -921,6 +924,8 @@ static void index_mode(Model& m) {
     };
     m.keep_min_live = envi("RADIANCE_DS41_KEEP_MIN_LIVE", 2 * m.c.cand_blocks * std::max<int64_t>(1, m.c.cand_block));
     m.split_min_live = envi("RADIANCE_DS41_SPLIT_MIN_LIVE", kDs41SplitMinLive);
+    const char* ct = std::getenv("RADIANCE_DS41_CTAIL");
+    m.ctail_full = ct && !std::strcmp(ct, "full");
     const char* kx = std::getenv("RADIANCE_DS41_IDXKEY");
     m.ikmx = kx && !std::strcmp(kx, "mxfp4") && m.c.idim % 32 == 0;
     const char* lx = std::getenv("RADIANCE_DS41_LATENT");
@@ -2420,7 +2425,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         return;
                     }
                     tpitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
-                    rows = m.work;
+                    /* The step's completed blocks are at most ceil(T / r) + S (one a `r` tokens plus one
+                     * straddling block a sequence; r4d_qsa_work_bf16.hip's host bound), and qsa_work needs
+                     * one item a declared sequence for its counts: so the compressor chain runs over that
+                     * many rows, not the work plane's m.work (8200 at a decode step's one token).
+                     * RADIANCE_DS41_CTAIL=full keeps m.work (ctail_mode()). Items past the real count are
+                     * page -1 either way. */
+                    rows = m.ctail_full ? m.work
+                                        : std::min<int64_t>(m.work, std::max<int64_t>((T + r - 1) / r + S, g.max_seqs));
                     page = brows(m.page, rows);
                     bpos = brows(m.bpos, rows);
                 }
