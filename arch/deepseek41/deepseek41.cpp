@@ -884,13 +884,13 @@ static void index_runs(Model& m) {
 }
 
 /* RADIANCE_DS41_INDEX: a list of `keep` (the candidate restriction) and `split` (the row split
- * over the ranks), or `off`; unset is `keep,split`. Both are exact -- every selection is the one
+ * over the ranks), or `off`; unset or empty is `keep,split`. Both are exact -- every selection is the one
  * the unrestricted, unsplit indexer makes (docs/OPS.md index_score; ds41_index_split.h) -- so the
  * switch is for an A/B in one image. The split needs every rank to attend (no attention-zero rank,
  * whose step skips the indexer and could not join the gather) and a step of two runs or more. */
 static void index_mode(Model& m) {
     const char* e = std::getenv("RADIANCE_DS41_INDEX");
-    const std::string v = e ? e : "keep,split";
+    const std::string v = e && *e ? e : "keep,split";   /* set but empty (a compose pass-through) = unset */
     const bool off = v == "off" || v == "0" || v == "none";
     m.ikeep = !off && v.find("keep") != std::string::npos && m.kwords > 0;
     m.isplit = !off && v.find("split") != std::string::npos && m.g.world > 1 && m.aw == m.g.world &&
