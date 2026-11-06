@@ -316,6 +316,10 @@ struct Layer {
     /* ar_attn + pcn_f as one four-rank collective (ar_mhc_post_collapse_rmsnorm, RADIANCE_DS41_AR_PCN=1), issued
      * instead of the pair for a step ar_wide_write_exact takes; 0 = the pair. */
     rad_op ar_pcn_f = 0;
+    /* The previous layer's MoE all-reduce + pcn_a as one collective (RADIANCE_DS41_AR_PCN=2), issued in place of
+     * that block's all-reduce and pcn_a for a step ar_wide_write_exact takes; the block leaves the all-reduce to it
+     * (its ar_out, kArOutExact, set when this is declared). 0 = the pair. */
+    rad_op ar_pcn_a = 0;
     rad_weight ffn_norm = 0;
     rad_op mix_f = 0, col_f = 0, norm_f = 0, post_f = 0;
     MoeFP8 moe{};
@@ -464,6 +468,8 @@ struct Model {
     rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0, embed_ar = 0;
     rad_op cn_fin = 0;   /* contract + fnorm fused (fused()), or 0 */
     rad_op pcn_fin = 0;  /* the last post_f + contract + fnorm fused, or 0 */
+    /* The last layer's MoE all-reduce + pcn_fin as one collective (RADIANCE_DS41_AR_PCN=2), or 0. */
+    rad_op ar_pcn_fin = 0;
     Dsp dsp{};
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
@@ -949,13 +955,20 @@ static void index_mode(Model& m) {
     m.lnv = lx && !std::strcmp(lx, "nvfp4") && m.c.window % 32 == 0;
 }
 
-/* RADIANCE_DS41_AR_PCN=1 (default off until its TP4 A/B): at four ranks with the exact wire, a decode or verify step's
- * attention all-reduce and the mhc_post_collapse_rmsnorm after it as one collective (ar_mhc_post_collapse_rmsnorm,
- * byte-identical to the pair); unset or "0" = the pair. */
-static int ds41_ar_pcn() {
-    static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_AR_PCN"); return e && e[0] == '1' && !e[1]; }();
-    return on;
+/* RADIANCE_DS41_AR_PCN (default off until its TP4 A/B): at four ranks with the exact wire, a decode or verify step's
+ * all-reduce and the mhc_post_collapse_rmsnorm after it as one collective (ar_mhc_post_collapse_rmsnorm, byte-identical
+ * to the pair). "1" = at the attention's all-reduce (its post + the ffn collapse + norm); "2" = there and at the MoE's
+ * (its post + the next layer's attention collapse + norm, or the last layer's + the final norm: the block leaves its
+ * all-reduce to it, MoeFP8::ar_out / kArOutExact); unset or "0" = the pairs. */
+static int ds41_ar_pcn_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("RADIANCE_DS41_AR_PCN");
+        return !e || !e[0] || e[1] ? 0 : e[0] == '1' ? 1 : e[0] == '2' ? 2 : 0;
+    }();
+    return m;
 }
+static int ds41_ar_pcn() { return ds41_ar_pcn_mode() >= 1; }
+static int ds41_ar_pcn_moe() { return ds41_ar_pcn_mode() == 2; }
 
 /* RADIANCE_DS41_ROUTER_FUSE: unset or anything but "0" = the selection and the sort as one launch
  * (router_scored_topk_scatter, where a loaded library declares it and the pass fits the sort's one
@@ -1128,6 +1141,28 @@ static void moe_names(Model& m, int l, MoeFP8::Src* s) {
 }
 
 /* ------------------------------------------------------------------ one layer */
+/* RADIANCE_DS41_AR_PCN=2: the MoE all-reduce of layer `P` and the mhc_post_collapse_rmsnorm after it (the next
+ * layer's pcn_a with gain `gw` into `y`, or pcn_fin into the final hidden) as one four-rank collective, declared up to
+ * ar_wide_write_rows (decode and verify steps). Where it resolves, `P`'s MoE block leaves its all-reduce to the caller
+ * at the T ar_exact_write_takes (= ar_wide_write_exact at four ranks), the same T at which the issue takes `*out`. */
+static int ar_pcn_moe_declare(RadBuilder* b, Model& m, Layer& P, int64_t T, rad_weight gw, rad_buf y, rad_op* out) {
+    const auto& g = m.g;
+    const auto& c = m.c;
+    *out = 0;
+    if (!ds41_ar_pcn_moe() || g.world != 4 || !P.moe.op_ar || P.moe.ar_out) return RAD_OK;
+    const int64_t rr = std::min<int64_t>(T, ar_wide_write_rows(g));
+    if (rr < 1) return RAD_OK;
+    *out = fused(b, "ar_mhc_post_collapse_rmsnorm",
+                 { RAD_RANGE("M", 1, rr), RAD_INT("n", c.n_embd), RAD_INT("hc", c.hc), RAD_F64("eps", c.eps),
+                   RAD_INT("world_size", g.world), RAD_STR("dtype", "bf16"), RAD_INT("wire", 0) },
+                 { gw }, { m.act.x, m.h1, m.post, m.comb, m.pre_f }, { m.act.x, m.h0, m.xcol, y });
+    if (*out) {
+        P.moe.ar_out = true;
+        P.moe.ar_out_take = kArOutExact;
+    }
+    return RAD_OK;
+}
+
 static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     auto& g = m.g;
     auto& nm = m.nm;
@@ -1260,6 +1295,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         if (!L.pcn_a) L.cn_a = collapse_norm(b, m, T, L.attn_norm, m.h0, m.pre_f, m.xcol, m.xn);
     }
     if (!L.cn_a && !L.pcn_a) L.col_a = op(b, "mhc_collapse", hcp, {}, { m.h0, m.pre_f }, { m.xcol });
+    if (L.pcn_a && l > 0) DS_TRY(ar_pcn_moe_declare(b, m, m.layers[(size_t)l - 1], T, L.attn_norm, m.xn, &L.ar_pcn_a));
     if (m.zero) {
         /* Attention-zero (Geom::attn_world): no heads on this rank. Its caches are declared and
          * bound as on an attention rank, the weightless stores that fix their block sizes declared
@@ -2171,6 +2207,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
     m.pcn_fin = post_collapse_norm(b, m, T, m.final_gain, m.act.x, m.h1, m.h0, m.pre_f, m.xcol,
                                    m.final_hidden);
+    if (m.pcn_fin && c.n_layer > 0)
+        DS_TRY(ar_pcn_moe_declare(b, m, m.layers[(size_t)c.n_layer - 1], T, m.final_gain, m.final_hidden,
+                                  &m.ar_pcn_fin));
     if (!m.pcn_fin)
         m.cn_fin = collapse_norm(b, m, T, m.final_gain, m.h0, m.pre_f, m.xcol, m.final_hidden);
     if (!m.pcn_fin && !m.cn_fin) {
@@ -2200,18 +2239,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
              c.idx_src.size(), (long long)c.n_expert, (long long)c.top_k, c.ple.size());
-    int n_arpcn = 0;
-    for (const Layer& Lx : m.layers) n_arpcn += Lx.ar_pcn_f ? 1 : 0;
+    int n_arpcn = 0, n_arpcn_moe = m.ar_pcn_fin ? 1 : 0;
+    for (const Layer& Lx : m.layers) {
+        n_arpcn += Lx.ar_pcn_f ? 1 : 0;
+        n_arpcn_moe += Lx.ar_pcn_a ? 1 : 0;
+    }
     rad_note(b, "deepseek41 indexer: candidate restriction %s from %lld positions, row split %s from %lld (runs of "
                 "%lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, _SPLIT_MIN_LIVE), keys %s "
                 "(%lld bytes an entry; RADIANCE_DS41_IDXKEY), latent %s (%lld bytes an entry; RADIANCE_DS41_LATENT), "
                 "compressor tail %s (RADIANCE_DS41_CTAIL), router selection+sort %s (RADIANCE_DS41_ROUTER_FUSE), "
-                "attention all-reduce + post-collapse-norm %s at %d layers (RADIANCE_DS41_AR_PCN)",
+                "attention all-reduce + post-collapse-norm %s at %d layers, MoE all-reduce + next collapse-norm "
+                "%s at %d layers (RADIANCE_DS41_AR_PCN)",
              m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
              (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
              (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)),
              m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate", n_arpcn ? "fused" : "separate",
-             n_arpcn);
+             n_arpcn, n_arpcn_moe ? "fused" : "separate", n_arpcn_moe);
     if (ctx->rank == 0 && !ctx->shape_probe && g.world == 4 && gather_ar_rows() > 0)
         fprintf(stderr, "radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to %lld "
                         "tokens a step (RADIANCE_DS41_ARGATHER)\n", (long long)gather_ar_rows());
@@ -2221,13 +2264,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "from %lld (runs of %lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, "
                         "_SPLIT_MIN_LIVE), keys %s (%lld bytes an entry; RADIANCE_DS41_IDXKEY), latent %s (%lld bytes an "
                         "entry; RADIANCE_DS41_LATENT), compressor tail %s (RADIANCE_DS41_CTAIL), router selection+sort %s "
-                        "(RADIANCE_DS41_ROUTER_FUSE), attention all-reduce + post-collapse-norm %s at %d layers "
-                        "(RADIANCE_DS41_AR_PCN)\n",
+                        "(RADIANCE_DS41_ROUTER_FUSE), attention all-reduce + post-collapse-norm %s at %d layers, "
+                        "MoE all-reduce + next collapse-norm %s at %d layers (RADIANCE_DS41_AR_PCN)\n",
                 m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
                 (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
                 (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)),
                 m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate", n_arpcn ? "fused" : "separate",
-                n_arpcn);
+                n_arpcn, n_arpcn_moe ? "fused" : "separate", n_arpcn_moe);
     return RAD_OK;
 }
 
@@ -2745,9 +2788,19 @@ static void step(RadCtx* x, const RadBatch* batch) {
         bs.fn = mix_f_beside;
         bs.arg = &mb;
         L.moe.step(x, batch, bs);
-        /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). */
+        /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin); under
+         * RADIANCE_DS41_AR_PCN=2 with the block's all-reduce in front (the block left it to us: ar_out). */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
-        if (nx && nx->pcn_a)
+        const bool arw = ar_wide_write_exact(m.g, T);
+        if (nx && nx->ar_pcn_a && arw)
+            RAD_ISSUE_N(x, nx->ar_pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                        RAD_W(nx->attn_norm), brows(m.xn, T));
+        else if (!nx && m.ar_pcn_fin && arw)
+            RAD_ISSUE_N(x, m.ar_pcn_fin, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                        RAD_W(m.final_gain), brows(m.final_hidden, T));
+        else if (nx && nx->pcn_a)
             RAD_ISSUE_N(x, nx->pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
                         RAD_W(nx->attn_norm), brows(m.xn, T));
