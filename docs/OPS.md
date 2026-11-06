@@ -2610,6 +2610,7 @@ device code.
 | `ar_rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+| `ar_mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `world_size` `dtype` `wire`/opt | `x`:inout, `h`, `post`, `comb`, `out`:out, `pre`, `xc`:out, `w`w, `y`:out |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
@@ -2634,6 +2635,12 @@ until a junction or reduction writes it whole again.
 The norm-carrying forms are two-rank only, except `ar_rmsnorm_quant_i8`, which also has an
 exact-wire four-rank form (below), as `ar_hc_write` and `ar_gather_hc_write` do. At other widths
 the arch blocks issue the plain ops.
+
+`ar_mhc_post_collapse_rmsnorm` (device-only, four ranks, exact wire) is `all_reduce` of `x` followed by
+`mhc_post_collapse_rmsnorm` over the reduced `x`: `x` as the four-rank exact all-reduce leaves it, then `out`, `xc`
+and `y` as that op writes them, byte for byte. It is the wide one-shot (same handshake, slots and block partition as
+the plain all-reduce, so they share an instance) with the post/collapse of each 16-byte word as its epilogue; the
+block that completes a row runs the norm over the stored `xc` in the norm's own summation order. `M` up to 8192.
 
 `ar_hc_write` is `all_reduce` of `y` followed by `hc_write` of the reduced `y`, for a block whose
 output feeds a gated residual rather than a norm; `y` is inout as `x` is above. It serves both

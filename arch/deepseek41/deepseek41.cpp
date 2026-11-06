@@ -313,6 +313,9 @@ struct Layer {
      * col_f + norm_f, issued for post_a; pcn_a = the previous layer's post_f + this layer's col_a +
      * norm_a, issued for that post_f (so before this layer's Engram-free tap and mix_a). */
     rad_op pcn_f = 0, pcn_a = 0;
+    /* ar_attn + pcn_f as one four-rank collective (ar_mhc_post_collapse_rmsnorm, RADIANCE_DS41_AR_PCN=1), issued
+     * instead of the pair for a step ar_wide_write_exact takes; 0 = the pair. */
+    rad_op ar_pcn_f = 0;
     rad_weight ffn_norm = 0;
     rad_op mix_f = 0, col_f = 0, norm_f = 0, post_f = 0;
     MoeFP8 moe{};
@@ -932,6 +935,14 @@ static void index_mode(Model& m) {
     m.lnv = lx && !std::strcmp(lx, "nvfp4") && m.c.window % 32 == 0;
 }
 
+/* RADIANCE_DS41_AR_PCN=1 (default off until its TP4 A/B): at four ranks with the exact wire, a decode or verify step's
+ * attention all-reduce and the mhc_post_collapse_rmsnorm after it as one collective (ar_mhc_post_collapse_rmsnorm,
+ * byte-identical to the pair); unset or "0" = the pair. */
+static int ds41_ar_pcn() {
+    static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_AR_PCN"); return e && e[0] == '1' && !e[1]; }();
+    return on;
+}
+
 /* RADIANCE_DS41_ROUTER_FUSE: unset or anything but "0" = the selection and the sort as one launch
  * (router_scored_topk_scatter, where a loaded library declares it and the pass fits the sort's one
  * workgroup; byte-identical to router_scored_topk + moe_scatter); "0" = the two launches. */
@@ -1506,6 +1517,17 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     if (!L.pcn_f && !L.cn_f) {
         L.col_f = op(b, "mhc_collapse", hcp, {}, { m.h1, m.pre_a }, { m.xcol });
         L.norm_f = rmsnorm(b, m, T, L.ffn_norm, D, m.xcol, m.act.x);
+    }
+    /* The all-reduce + pcn_f as one collective where both exist (ds41_ar_pcn); the pair stays declared for the
+     * steps it does not take. */
+    if (L.ar_attn && L.pcn_f && ds41_ar_pcn() && g.world == 4) {
+        const int64_t rr = std::min<int64_t>(T, ar_wide_write_rows(g));
+        if (rr >= 1)
+            L.ar_pcn_f = fused(b, "ar_mhc_post_collapse_rmsnorm",
+                               { RAD_RANGE("M", 1, rr), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_F64("eps", c.eps),
+                                 RAD_INT("world_size", g.world), RAD_STR("dtype", "bf16"), RAD_INT("wire", 0) },
+                               { L.ffn_norm }, { m.attn_out, m.h0, m.post, m.comb, m.pre_a },
+                               { m.attn_out, m.h1, m.xcol, m.act.x });
     }
     MoeFP8::Src s;
     s.norm = nullptr;
@@ -2142,25 +2164,31 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
              c.idx_src.size(), (long long)c.n_expert, (long long)c.top_k, c.ple.size());
+    int n_arpcn = 0;
+    for (const Layer& Lx : m.layers) n_arpcn += Lx.ar_pcn_f ? 1 : 0;
     rad_note(b, "deepseek41 indexer: candidate restriction %s from %lld positions, row split %s from %lld (runs of "
                 "%lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, _SPLIT_MIN_LIVE), keys %s "
                 "(%lld bytes an entry; RADIANCE_DS41_IDXKEY), latent %s (%lld bytes an entry; RADIANCE_DS41_LATENT), "
-                "compressor tail %s (RADIANCE_DS41_CTAIL), router selection+sort %s (RADIANCE_DS41_ROUTER_FUSE)",
+                "compressor tail %s (RADIANCE_DS41_CTAIL), router selection+sort %s (RADIANCE_DS41_ROUTER_FUSE), "
+                "attention all-reduce + post-collapse-norm %s at %d layers (RADIANCE_DS41_AR_PCN)",
              m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
              (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
              (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)),
-             m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate");
+             m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate", n_arpcn ? "fused" : "separate",
+             n_arpcn);
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
                         "from %lld (runs of %lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, "
                         "_SPLIT_MIN_LIVE), keys %s (%lld bytes an entry; RADIANCE_DS41_IDXKEY), latent %s (%lld bytes an "
                         "entry; RADIANCE_DS41_LATENT), compressor tail %s (RADIANCE_DS41_CTAIL), router selection+sort %s "
-                        "(RADIANCE_DS41_ROUTER_FUSE)\n",
+                        "(RADIANCE_DS41_ROUTER_FUSE), attention all-reduce + post-collapse-norm %s at %d layers "
+                        "(RADIANCE_DS41_AR_PCN)\n",
                 m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
                 (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
                 (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)),
-                m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate");
+                m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate", n_arpcn ? "fused" : "separate",
+                n_arpcn);
     return RAD_OK;
 }
 
@@ -2643,6 +2671,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (late) mix_a();
             lin_issue(x, m, L.o_b, T, brows(m.oa, T), L.wo_b, brows(m.attn_out, T));
         }
+        if (L.ar_pcn_f && ar_wide_write_exact(m.g, T))   /* the all-reduce, post_a, col_f and norm_f in one */
+            RAD_ISSUE_N(x, L.ar_pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
+                        RAD_W(L.ffn_norm), brows(m.act.x, T));
+        else {
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
         if (L.pcn_f)   /* post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
@@ -2651,6 +2684,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         else
             RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h1, T));
+        }
 
         /* The ffn connection's mix is likewise needed first by the next mhc_post, so the MoE block
          * issues it (MoeFP8::Beside) behind its routed and shared gate_up, where a recorded pass

@@ -511,6 +511,11 @@ extern "C" int r4d_shape_hc_project(const RadParam* p, int n_p, int operand, Rad
 extern "C" int r4d_shape_ar_hc_write(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return r4d_shape_hc_write(p, n_p, operand, out);
 }
+/* ar_mhc_post_collapse_rmsnorm: mhc_post_collapse_rmsnorm's operands (r4d_ds41_elem_shapes.inc), x the message. */
+extern "C" int r4d_shape_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+extern "C" int r4d_shape_ar_mhc_pcn(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    return r4d_shape_mhc_post_collapse_rmsnorm(p, n_p, operand, out);
+}
 
 /* moe_gather's five and ar_hc_write's three, in that order; the gather's `y` and the reduction's are
  * one operand. */

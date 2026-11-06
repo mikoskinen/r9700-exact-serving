@@ -630,6 +630,16 @@ static const RadParamSpec pArHcWrite[] = {
 static const RadOperandSpec oArHcWrite[] = {
     { "y", RAD_OPD_INOUT, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
 };
+/* The four-rank exact all-reduce of x, then DeepSeek-V4.1's mhc_post_collapse_rmsnorm over the reduced x
+ * (r4d_ds41_elem.inc's operands, x the message and inout). */
+static const RadParamSpec pArMhcPcn[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"), P_INT("world_size"), P_STR("dtype"), P_INTO("wire"),
+};
+static const RadOperandSpec oArMhcPcn[] = {
+    { "x", RAD_OPD_INOUT, 0 }, { "h", RAD_OPD_IN, 0 },   { "post", RAD_OPD_IN, 0 },
+    { "comb", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 }, { "pre", RAD_OPD_IN, 0 },
+    { "xc", RAD_OPD_OUT, 0 },  { "w", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
 /* moe_gather's parameters and operands, then ar_hc_write's. The gather's output is the
  * reduction's message, one operand written by the gather and reduced in place. */
 static const RadParamSpec pArGatherHcWrite[] = {
@@ -3847,6 +3857,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_rmsnorm_had_quant_i8g", pArRmsNormQuantFp8, oArRmsNormQuantFp8,
            "the two-rank all-reduce of x and rmsnorm_had_quant_i8g after it, in one kernel; "
            "either wire, as ar_rmsnorm_quant_fp8."),
+    SCHEMA("ar_mhc_post_collapse_rmsnorm", pArMhcPcn, oArMhcPcn,
+           "the all-reduce of x and mhc_post_collapse_rmsnorm over the reduced x, in one kernel: x as the "
+           "all-reduce leaves it, then out, xc and y as mhc_post_collapse_rmsnorm writes them. The exact wire at "
+           "four ranks."),
     SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
            "the all-reduce and the gated residual's write that follows it, in one kernel. Both "
            "wires at two ranks, the exact one at four."),
@@ -5272,6 +5286,13 @@ static const RadConstraint cArHcWrite[] = {
 static const RadConstraint cArHcWrite4[] = {
     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
     C_EQ("world_size", 4), C_EQ("wire", 0),
+    C_P2P,
+};
+/* ar_mhc_post_collapse_rmsnorm: the wide one-shot at four ranks, exact wire (as cArHcWrite4); M to the 8192 row
+ * counters a split_ctr block holds, n a multiple of 8 up to the norm's 16384. */
+static const RadConstraint cArMhcPcn4[] = {
+    C_GE("M", 1), C_LE("M", 8192), C_DIV("n", 8), C_LE("n", 16384), C_GE("hc", 2), C_LE("hc", 8),
+    C_IN("dtype", "bf16"), C_EQ("world_size", 4), C_EQ("wire", 0),
     C_P2P,
 };
 /* ar_hc_write's bounds and the gather's: top_k up to the 64 slots a row's table holds in LDS. */
@@ -9740,6 +9761,20 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_hc_write_4rank, nullptr, nullptr, nullptr,
   r4d_shape_ar_hc_write },
 
+{ "ar_mhc_post_collapse_rmsnorm_4rank", "ar_mhc_post_collapse_rmsnorm", "norm",
+  "the four-rank exact all-reduce and DeepSeek-V4.1's mhc_post -> mhc_collapse -> rmsnorm that follows it, in one "
+  "kernel: the one-shot's words, then each word's out and xc, the row's last arriving block the norm",
+  "exactly 4 ranks, all peer-accessible; exact wire only; n a multiple of 8, x unpitched (the message); M up to "
+  "8192 (one split_ctr block of row counters); the wide one-shot's handshake, slots and block partition, so it "
+  "shares a stream and an instance with the plain all-reduce; cudagraph-safe",
+  "bf16 throughout; the sum as the four-rank exact all-reduce stores it, then out, xc and y in "
+  "mhc_post_collapse_rmsnorm_bf16's arithmetic and its norm's summation order (r4d_ds41_pcn.h) -- byte-identical "
+  "to the pair it replaces",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cArMhcPcn4), ROW(tAr), nullptr,
+  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_ar_mhc_pcn_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_ar_mhc_pcn },
+
 { "ar_gather_hc_write", "ar_gather_hc_write", "norm",
   "moe_gather folded in front of ar_hc_write: each block sums its words' tokens back from the "
   "routed experts' rows, keeps the result as its message, and then reduces and writes exactly as "
@@ -11032,7 +11067,7 @@ extern "C" int rad_kernel_collective(int i) {
         r4d_rad_ar_hc_write, r4d_rad_ar_gather_hc_write,
         r4d_rad_ar_oneshot_4rank_exact, r4d_rad_ar_twoshot_4rank_exact,
         r4d_rad_ar_twoshot_4rank_ti8, r4d_rad_ar_gather_4rank,
-        r4d_rad_ar_hc_write_4rank, r4d_rad_ar_gather_hc_write_4rank,
+        r4d_rad_ar_hc_write_4rank, r4d_rad_ar_gather_hc_write_4rank, r4d_rad_ar_mhc_pcn_4rank,
         r4d_rad_ar_rmsnorm_quant_i8_4rank,
     };
     for (RadLaunchFn f : kReleasing)
