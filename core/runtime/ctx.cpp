@@ -32,6 +32,10 @@ int Ctx::init(const CtxDesc& d) {
     kv_        = d.kv;
     arch_step_ = d.arch_step;
     profiling_ = d.profile_ops;
+    {   /* ds41-prof-sync */
+        const char* ps = std::getenv("RADIANCE_PROFILE_SYNC");
+        prof_sync_ = profiling_ && ps && *ps && *ps != '0';
+    }
     tape_dump_ = d.tape_dump;
     /* A host gather's rows on the mapped tier are read ahead unless --row-prefetch off
      * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
@@ -842,7 +846,7 @@ void Ctx::profile_collect() {
     for (size_t i = 0; i < prof_n_; ++i) {
         ProfSlot& s = prof_ring_[i];
         float ms = 0.0f;
-        if (rad_event_elapsed_ms(s.a, s.b, &ms) < 0) continue;
+        if (rad_event_elapsed_ms(s.a, s.b, &ms) < 0) { ++prof_unread_; continue; }
         prof_ms_[(size_t)s.op]    += (double)ms;
         prof_calls_[(size_t)s.op] += 1;
         const ProfSlot*& p = prev[s.lane & 1];
@@ -864,13 +868,16 @@ void Ctx::dump_profile() const {
     if (!program_)   { RAD_WARN("per-op timing: the context has already been shut down"); return; }
 
     fprintf(stderr,
-            "\nper-op timing, rank %d. Not comparable with an unprofiled run:\n"
+            "\nper-op timing, rank %d (step %d %s n_tok %lld, %lld steps profiled, %lld event pairs unread%s). Not comparable with an unprofiled run:\n"
             "enabling this restores synchronisations that change the mover's slot supply.\n"
             "A row marked `host` was timed on the host clock around a host-site launch and\n"
             "includes everything that call waited on -- page faults, link reads. The rest are\n"
             "device event pairs around a kernel. `wait us` is how long, a call, the op's lane\n"
             "sat idle before it started -- stream waits and issue delays, in no op's time.\n\n"
-            "  %10s %12s %10s %5s %10s %10s  %s\n", rank_, "calls", "total ms", "us/call", "site",
+            "  %10s %12s %10s %5s %10s %10s  %s\n", rank_, prof_last_step_,
+            prof_last_phase_ == RAD_PHASE_DECODE ? "decode" : prof_last_phase_ == RAD_PHASE_PREFILL ? "prefill" : "other",
+            (long long)prof_last_ntok_, (long long)prof_steps_, (long long)prof_unread_total_,
+            prof_sync_ ? ", RADIANCE_PROFILE_SYNC: host clock between lane syncs" : "", "calls", "total ms", "us/call", "site",
             "join us", "wait us", "op / geometry");
 
     /* Slowest first. */
@@ -1460,7 +1467,11 @@ int Ctx::run_step(const RadBatch* b) {
         if (rf < 0 && step_status_ >= 0) step_status_ = rf;
     }
 
-    if (profiling_) profile_collect();
+    if (profiling_) {
+        profile_collect();
+        prof_unread_total_ += prof_unread_; prof_unread_ = 0;
+        prof_last_step_ = b->step; prof_last_phase_ = b->phase; prof_last_ntok_ = b->n_tok; ++prof_steps_;
+    }
     flush_issued();
     return step_status_;
 }
