@@ -333,8 +333,9 @@ constexpr int kStreamP = EXL3R4D_STREAM_P;
 
 static __host__ __device__ constexpr int stream_slot_bytes(int npw) { return npw * kStreamP * 128; }
 
-/* The 12-byte tile load of a half-integer K (EXL3R4D_HALF_B96): lane L's two runs need the words (d0 - 1, d0) and
- * (d1 - 1, d1), d1 = d0 or d0 + 1 (run 1 ends 20 half-bits later), mod WORDS: three consecutive words from
+/* The 12-byte tile load of a half-integer K (EXL3R4D_HALF_B96; K = 3 with EXL3R4D_B96_K3, K = 2 with EXL3R4D_B96_K2):
+ * lane L's two runs need the words (d0 - 1, d0) and (d1 - 1, d1), d1 = d0 or d0 + 1 (run 1 ends 8 K bits later: 20 at
+ * K = 2.5, 24 at K = 3; b96_exact checks it lane by lane), mod WORDS: three consecutive words from
  * d0 - 1, except at the tile's start (d0 = 0), where the first is the tile's LAST word. A lane loads words [d0 - 1,
  * d0 + 2) (from 0 where d0 = 0) and the wrapped lanes take the last word from the lane whose load holds it, by one
  * readlane: b96_holder() is that lane * 4 + the word's place in its load. A load may read one word past the tile (the
@@ -351,6 +352,50 @@ static __host__ __device__ constexpr int b96_holder() {
   }
   return -1;
 }
+
+/* The 12-byte load's selection, lane by lane, against Plan's words (the four 4-byte loads' form): each lane loads tile
+ * words [st, st + 3) (st = d0 - 1, or 0 at d0 = 0), the wrapped lanes take the last word from b96_holder's lane, and
+ * EXL3_COMPUTE's x0/x1/x2 and run pairs must be exactly woff[r][0..1]. A K this fails for (K >= 6: run 1 two words on)
+ * never takes the load. */
+template <int BITS>
+static __host__ __device__ constexpr bool b96_exact() {
+  constexpr int K2 = exl3r4d_k2(BITS), WORDS = 4 * K2;
+  constexpr int H = b96_holder<BITS>();
+  if (H < 0 || (H & 3) == 0) return false;
+  int st[32] = {}, wo[32][2][2] = {};
+  for (int lane = 0; lane < 32; ++lane) {
+    const int n = lane & 15, h = lane >> 4, base = 32 * (n & 7) + 4 * (n >> 3) + 16 * h;
+    for (int r = 0; r < 2; ++r) {
+      const int e3 = K2 % 2 == 0 ? (base + 8 * r + 4) * BITS : (((base + 8 * r) >> 1) + 2) * K2;
+      const int de = (e3 - 1) >> 5;
+      for (int x = 0; x < 2; ++x) wo[lane][r][x] = (de - 1 + x + WORDS) % WORDS;
+    }
+    st[lane] = wo[lane][0][1] == 0 ? 0 : wo[lane][0][0];
+  }
+  for (int lane = 0; lane < 32; ++lane) {
+    const bool w = wo[lane][0][1] == 0, p = wo[lane][1][1] != wo[lane][0][1];
+    const int l = st[H >> 2] + (H & 3), v0 = st[lane], v1 = st[lane] + 1, v2 = st[lane] + 2;
+    const int x0 = w ? l : v0, x1 = w ? v0 : v1, x2 = w ? v1 : v2;
+    if (x0 != wo[lane][0][0] || x1 != wo[lane][0][1] || (p ? x1 : x0) != wo[lane][1][0] ||
+        (p ? x2 : x1) != wo[lane][1][1])
+      return false;
+  }
+  return true;
+}
+#ifndef EXL3R4D_B96_K3  // K = 3 takes the 12-byte tile load too (where EXL3R4D_HALF_B96 puts it): its gate_up K loop had
+#define EXL3R4D_B96_K3 1  // the same 40 loads, 328 VALU and six s_wait_loadcnt 0 an iteration as K = 2.5's (device ISA)
+#endif
+#ifndef EXL3R4D_B96_K2  // K = 2 too (0: its K loop holds no 0-wait at four 4-byte loads a tile; an A/B arm only)
+#define EXL3R4D_B96_K2 0
+#endif
+// which K take the 12-byte tile load (where EXL3R4D_HALF_B96 puts it)
+template <int BITS>
+static __host__ __device__ constexpr bool b96_k() {
+  constexpr int K2 = exl3r4d_k2(BITS);
+  return BITS != 4 && (K2 % 2 == 1 || (BITS == 3 && EXL3R4D_B96_K3) || (BITS == 2 && EXL3R4D_B96_K2)) &&
+         b96_exact<BITS>();
+}
+static_assert(b96_exact<EXL3R4D_K25>() && b96_exact<2>() && b96_exact<3>(), "b96: a lane's selection is not its words");
 
 template <int BITS, int NPW>
 static __device__ __forceinline__ void kloop_stream(gu8 wt0, unsigned kbytes, gu8 abase, unsigned avo, int kps,
@@ -617,6 +662,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // 133 us vs 81.7 at K = 2, M = 1, 2.9 live experts, 6.11. runs/splitk-micro). PF 3 keeps every wait partial
   // (114 us on the card, 57-gu25-micro). With the 12-byte tile load (EXL3R4D_HALF_B96, 3 words a tile in flight, 24 at PF 4)
   // PF 4 holds no 0-wait either (device ISA, 180 VGPRs), so EXL3_PF_GU_HALF is 4 there.
+  // K = 3 had the same loop (40 loads, 328 VALU, six 0-waits, 178 VGPRs): with the 12-byte load (EXL3R4D_B96_K3) it
+  // keeps PF 4 (EXL3_PF_GU); without it, EXL3_PF_GU as before.
   constexpr int PF = PFO > 0 ? PFO : MATS == 2 ? (exl3r4d_k2(BITS) % 2 ? EXL3_PF_GU_HALF : EXL3_PF_GU) : EXL3_PF;
   [[maybe_unused]] unsigned ew[PF > 1 ? PF - 1 : 1][NPW][2][NW];
   if constexpr (APREP && EXL3R4D_EW) {
@@ -786,10 +833,11 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // VALU (the global form spends ~5 a tile on 64-bit v_add_co pairs, R1). At K = 4 a lane's two runs touch three
   // words: woff[1][x] = woff[0][x] + 1 (run 1 ends 32 bits later), so W[0] = {w-1, w0}, W[1] = {w0, w+1}.
   // Descriptor word 3: gfx11/12 raw buffer (0x31004000: OOB_SELECT raw, no stride, no swizzle).
-  // EXL3R4D_HALF_B96 (a half-integer K, buffer form): one 12-byte load a tile (b96_holder above), so the resource's
-  // extent is this matrix's codes exactly -- a load one word past its last tile reads zero, not the next allocation.
+  // EXL3R4D_HALF_B96 (a half-integer K; K = 3 with EXL3R4D_B96_K3; buffer form): one 12-byte load a tile (b96_holder,
+  // b96_k above), so the resource's extent is this matrix's codes exactly -- a load one word past its last tile reads
+  // zero, not the next allocation.
   constexpr bool kB96 = (EXL3R4D_HALF_B96 == 2 || (EXL3R4D_HALF_B96 == 1 && MATS == 2)) && EXL3R4D_BUF &&
-                        EXL3R4D_KX_BUF && NW == 2 && BITS != 4 && exl3r4d_k2(BITS) % 2 == 1 && !STAGED;
+                        EXL3R4D_KX_BUF && NW == 2 && b96_k<BITS>() && !STAGED;
   [[maybe_unused]] const __amdgpu_buffer_rsrc_t wrs = __builtin_amdgcn_make_buffer_rsrc(
       (void*)wexp, (short)0, kB96 ? (int)((size_t)ksteps * ntiles * WORDS * 4) : 0x7fffffff, 0x31004000);
   [[maybe_unused]] const __amdgpu_buffer_rsrc_t ars =
