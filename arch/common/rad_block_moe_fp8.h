@@ -207,6 +207,11 @@ struct MoeFP8 {
         /* At TP1 the caller may fill the ungated arm's ones plane once for the whole step,
          * rather than each layer/pass filling the same plane again. */
         int     shared_one_external = 0;
+        /* At four ranks, exact: the gather and the block's all-reduce as one kernel
+         * (moe_gather_all_reduce) for a single-pass step of at most this many tokens; 0 is the two
+         * kernels. Its transport is the one-shot, so keep it to decode heights (the unfused
+         * all-reduce goes two-shot from ts_min, 32768 elements). Byte-identical either way. */
+        int64_t gather_ar_rows = 0;
         /* Add the already-rounded routed and shared BF16 outputs in FP32, then round to BF16.
          * At TP1 the ungated gather preserves both roundings; TP>1 reduces each arm separately
          * before combining, so its gather cannot fold the shared output. */
@@ -403,6 +408,9 @@ struct MoeFP8 {
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
     rad_op op_gu = 0, op_dn = 0, op_gather = 0;
+    /* Config::gather_ar_rows: moe_gather_all_reduce over at most `gar_rows` tokens, or 0. */
+    rad_op op_gar = 0;
+    int64_t gar_rows = 0;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -1852,6 +1860,26 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             op_ar = all_reduce(g.dtype, w.h.x);
         }
     }
+    /* The gather and the all-reduce as one kernel (Config::gather_ar_rows), where its op is
+     * declared at all (an older kernel set keeps the two) and resolves (an unresolved handle is 0:
+     * the block keeps both). The plain gather form only: its slot table is built from `sorted`. */
+    if (g.world == 4 && g.wire_exact && op_ar && !separate_fp32_combine && !gather_inv &&
+        c.gather_ar_rows > 0 && rad_op_declared(b, "moe_gather_all_reduce")) {
+        const int64_t mf = std::min<int64_t>(c.gather_ar_rows, c.rows);
+        const rad_buf grd[6] = { w.edn, w.ew, w.sorted, w.h.x, w.sout, w.sgate };
+        const rad_buf gwr[1] = { w.h.x };
+        op_gar = RAD_OP(b, "moe_gather_all_reduce",
+                        RAD_PARAMS(RAD_RANGE("M", 1, mf), RAD_INT("n", g.n_embd),
+                                   RAD_INT("top_k", c.top_k), RAD_INT("world_size", g.world),
+                                   RAD_STR("dtype", g.dtype),
+                                   RAD_STR("act", gfold && !c.shared_ungated ? "sigmoid" : "none")),
+                        RAD_NOWEIGHTS);
+        if (op_gar) {
+            RAD_ARCH_TRY(rad_op_reads (b, op_gar, grd, gfold ? 6 : 4));
+            RAD_ARCH_TRY(rad_op_writes(b, op_gar, gwr, 1));
+            gar_rows = mf;
+        }
+    }
     /* The same collective for a caller that runs it beside other work (issue_ar, a pipelined
      * prefill): at `overlap` 1 it gets the rows that hold fewer CUs while waiting on the link. */
     if (g.world > 1 && ar_overlap > 0)
@@ -2259,8 +2287,17 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     }
 
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes
-     * the block's delta into `h.x`. */
-    if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
+     * the block's delta into `h.x`. With Config::gather_ar_rows a single-pass step this short
+     * gathers and reduces in one kernel, byte for byte the two it replaces. */
+    const bool gar = op_gar && own_ar && r0 == 0 && rows == T && T <= gar_rows && !op_combine &&
+                     issues_ar(T, rows) && !gather_taken(g, T, gather_out_rows, gather_out_rows6);
+    if (gar)
+        RAD_ISSUE_N(c_, op_gar, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k),
+                    gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
+                    gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    brow_slice(w.h.x, r0, rows, g.n_embd));
+    else if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
         RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
                     brows(gather_inv ? w.inv : w.sorted, rows * k),
                     gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
@@ -2279,7 +2316,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
 
     /* A write that takes the all-reduce does it once for the whole step, deciding on T, so this
      * pass must ask with T, not its own rows. */
-    if (own_ar && issues_ar(T, rows)) issue_ar(c_, r0, rows, false);
+    if (own_ar && issues_ar(T, rows) && !gar) issue_ar(c_, r0, rows, false);
     if (op_add)
         RAD_ISSUE_N(c_, op_add, rows, brow_slice(w.x, r0, rows, g.n_embd),
                     brow_slice(w.h.x, r0, rows, g.n_embd),

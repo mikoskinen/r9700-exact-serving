@@ -890,6 +890,42 @@ extern "C" int r4d_fuse_ar_gather_hc_write(const RadParam* p, int n_p, uint64_t 
 }
 
 /* ==========================================================================================
+ * moe_gather_all_reduce -- moe_gather, then the four-rank exact all-reduce of its output.
+ * (kernel: libr4d/r4d_ar_oneshot_Nrank_exact.hip, r4d_ar_gather_hc_write_wide_kernel at hc 0;
+ *  shim: r4d_ar_entry.hip, r4d_rad_moe_gather_ar_4rank)
+ *
+ * Operands: [0] y_expert  [1] expert_w  [2] sorted_tok  [3] shared?  [4] shared_gate?  [5] y (inout)
+ *
+ * ar_gather_hc_write's chain without its third step: the gather writes `y`, which is reduced in
+ * place. `numel` is M * n and `exact` 1, selecting the exact all_reduce rows; at M * n under the
+ * four-rank one-shot's ts_min both the fused kernel and the chain take the one-shot transport, and
+ * above it the two-shot's fold is the one-shot's element for element, so the bytes agree either way.
+ */
+extern "C" int r4d_fuse_moe_gather_ar(const RadParam* p, int n_p, uint64_t present, int step,
+                                      RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), k = pi(p, n_p, "top_k");
+    if (M <= 0 || n <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "moe_gather");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "top_k")
+         .mirror(p, n_p, "dtype").mirror_opt(p, n_p, "act");
+        return s.wire({ 0, 1, 2, 3, 4, 5 });   /* y_expert, expert_w, sorted_tok, shared, gate, y */
+    }
+    case 1: {
+        Step s(out, "all_reduce");
+        s.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+         .mirror(p, n_p, "dtype").pint("exact", 1);
+        return s.wire({ 5, RAD_FUSE_NONE });   /* x = y (inout), y */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * ar_rmsnorm_quant_fp8 -- the two-rank all-reduce with the norm and the quantiser folded on.
  * (kernel: libr4d/r4d_fused_quant_fp8.hip, ar_rmsnorm_quant_fp8_kernel; shim: r4d_ar_entry.hip)
  *

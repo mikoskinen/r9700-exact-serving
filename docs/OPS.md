@@ -2579,6 +2579,7 @@ device code.
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
+| `moe_gather_all_reduce` | `M`(range) `n` `top_k` `world_size` `dtype` `act`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
 
@@ -2613,6 +2614,12 @@ and a constraint on an absent key does not hold.
 so the gather half writes `y` before it is reduced in place, and the five gather operands and `act`
 mean what they mean on `moe_gather`. `wire` is `ar_hc_write`'s. On either wire it is byte-identical
 to the three kernels it replaces.
+
+`moe_gather_all_reduce` is `moe_gather` followed by the exact `all_reduce` of its output, for a
+MoE block whose reduced output feeds neither a norm junction nor a gated residual write (DeepSeek
+V4.1's hyper-connection post): `ar_gather_hc_write` without the write, four ranks, exact wire. Its
+transport is the one-shot, so a caller keeps it to decode-sized `M`; byte-identical to the two
+kernels it replaces at any `M`.
 
 `ar_rmsnorm_quant_i8` is the exact `all_reduce` of `x` followed by `rmsnorm_quant_i8`'s junction
 over the reduced sum, at two ranks and at four. At four it is the exact one-shot's transport with

@@ -779,6 +779,20 @@ static rad_op post_collapse_norm(RadBuilder* b, const Model& m, int64_t rows, ra
  * and the all-reduce sums the partials (MoeFP8::Config::shared_lo). */
 static constexpr int64_t kSharedBlock = 256;
 
+/* RADIANCE_DS41_ARGATHER: the MoE gather and its all-reduce as one kernel (moe_gather_all_reduce,
+ * MoeFP8::Config::gather_ar_rows) for a step of at most this many tokens at four ranks; unset, empty,
+ * 0 or off is the two kernels, on is 4 (a decode step of up to four sequences, where the unfused
+ * all-reduce is the one-shot too). Byte-identical either way. */
+static int64_t gather_ar_rows() {
+    const char* e = std::getenv("RADIANCE_DS41_ARGATHER");
+    if (!e || !*e) return 0;
+    const std::string v(e);
+    if (v == "off" || v == "0" || v == "none") return 0;
+    if (v == "on") return 4;
+    const long n = std::strtol(e, nullptr, 10);
+    return n > 0 ? std::min<long>(n, 64) : 0;
+}
+
 static void shared_slice(int64_t n_ff, int world, int rank, int64_t* lo, int64_t* hi) {
     *lo = *hi = 0;
     if (world <= 1 || n_ff % kSharedBlock) return;
@@ -1472,6 +1486,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
+    s.cfg.gather_ar_rows = gather_ar_rows();
     s.cfg.calib = (m.calib_hi > m.calib_lo && l >= m.calib_lo && l < m.calib_hi) ? 1 : 0;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
@@ -1684,6 +1699,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
+    s.cfg.gather_ar_rows = gather_ar_rows();
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
@@ -2090,6 +2106,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 "a rank at most; RADIANCE_DS41_INDEX)",
              m.ikeep ? "on" : "off", m.isplit && m.sel_gather ? "on" : "off", (long long)m.irows,
              (long long)m.qmax);
+    if (ctx->rank == 0 && !ctx->shape_probe && g.world == 4 && gather_ar_rows() > 0)
+        fprintf(stderr, "radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to %lld "
+                        "tokens a step (RADIANCE_DS41_ARGATHER)\n", (long long)gather_ar_rows());
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s, row split %s (runs of %lld rows, "

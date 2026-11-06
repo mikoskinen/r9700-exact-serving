@@ -1758,6 +1758,74 @@ extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
+/* moe_gather + the four-rank exact all-reduce (moe_gather_all_reduce): ar_gather_hc_write_4rank's
+ * launch at hc 0, which writes no stream -- the kernel's write loop runs over no stream and never
+ * reads `inj` or `h`. Operands as ar_gather_hc_write's first six; the same instance, block rule and
+ * release (RAD_LINK_ENDED over P2P). */
+extern "C" int r4d_rad_moe_gather_ar_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 4) return RAD_E_SHAPE;
+    if (in->dtype != 0) return RAD_E_DTYPE;
+    const RadTensor* ye = r4d_opt(a, AG_YE);
+    const RadTensor* ew = r4d_opt(a, AG_EW);
+    const RadTensor* so = r4d_opt(a, AG_SORTED);
+    const RadTensor* sh = r4d_opt(a, AG_SH);
+    const RadTensor* sg = r4d_opt(a, AG_SG);
+    const RadTensor* y  = r4d_opt(a, AG_Y);
+    if (!ye || !ew || !so || !y) return RAD_E_INVAL;
+    if ((sh != nullptr) != (sg != nullptr)) return RAD_E_INVAL;
+    if (y->rank != 2) return RAD_E_SHAPE;
+    const long long M = y->shape[0], n = y->shape[1];
+    const long long top_k = r4d_geti_or(a, "top_k", 0);
+    if (M < 1 || n < 1 || top_k < 1 || top_k > 64) return RAD_E_SHAPE;
+    if (M * n > in->max_numel) return RAD_E_SHAPE;
+    if (n % 8) return RAD_E_SHAPE;
+    if (!r4d_contig(y)) return RAD_E_STRIDE;
+    if (!r4d_aligned(y->data, 16)) return RAD_E_ALIGN;
+    const long long T = M * top_k;
+    long long Te = 0, Mw = 0;
+    const long long ye_ld = r4d_rows_pitch(ye, n, &Te);
+    const long long ew_ld = r4d_rows_pitch(ew, top_k, &Mw);
+    if (ye_ld < 0 || ew_ld < 0 || Te < T || Mw < M) return RAD_E_STRIDE;
+    if (so->dtype != RAD_I32 || !r4d_contig(so) || r4d_numel(so) < T) return RAD_E_SHAPE;
+    if (ye->dtype != RAD_BF16 || ew->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (ye_ld % 8 || !r4d_aligned(ye->data, 16)) return RAD_E_ALIGN;
+    long long sh_ld = 0, sg_ld = 0, shrows = 0, sgrows = 0;
+    int sig = 0;
+    if (sh) {
+        if (sh->dtype != RAD_BF16 || sg->dtype != RAD_BF16) return RAD_E_DTYPE;
+        sh_ld = r4d_rows_pitch(sh, n, &shrows);
+        sg_ld = r4d_rows_pitch(sg, 1, &sgrows);
+        if (sh_ld < 0 || sg_ld < 0 || shrows < M || sgrows < M) return RAD_E_STRIDE;
+        const char* const act = r4d_gets(a, "act");
+        if (act && !std::strcmp(act, "sigmoid"))  sig = 1;
+        else if (act && std::strcmp(act, "none")) return RAD_E_UNSUPPORTED;
+    }
+    const bool has_inv = a->scratch && a->scratch_bytes >= T * (long long)sizeof(int);
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    const long words16 = (long)(M * n * 2 / 16);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
+
+    R4D_TRY("moe_gather_ar_4rank",
+        r4d_ar_gather_hc_write_4rank(
+            in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+            in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+            in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+            r4d_addr(y), 0L, 0L, (long)M, (long)n, 0L, 0L, 0L,
+            r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
+            sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld,
+            (long)ew_ld, (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig,
+            (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq,
+            cfgv.pub, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
+            early ? in->gate_ctr : 0L));
+    return early ? RAD_LINK_ENDED : RAD_OK;
+}
+
 /* Inverse slot table for the exact wire's prefill form: one int per (token, slot) at the band's M.
  * The rotated wire keeps its table in LDS. */
 extern "C" int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs* a) {
