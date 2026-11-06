@@ -409,6 +409,11 @@ struct Model {
      * values instead of 256; entry_store format / index_score key_format mxfp4). Lossless: the keys are
      * quant_roundtrip(fp4_e2m1, ue8m0, 32) values, and every score is the bf16 cache's bit for bit. */
     bool ikmx = false;
+    /* RADIANCE_DS41_LATENT=nvfp4: the compressed latent caches hold each 512-value entry packed (288
+     * bytes instead of 1024: e2m1 codes, an e4m3 scale a block of 16; entry_store format /
+     * attn_sparse_sink latent_format nvfp4). Lossless: the latent is quant_roundtrip(fp4_e2m1, e4m3, 16)
+     * output, which the packing reproduces bit for bit (docs/OPS.md "Packed compressed latent"). */
+    bool lnv = false;
     rad_buf sel_part = 0;
     rad_op sel_gather = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
@@ -918,6 +923,13 @@ static void index_mode(Model& m) {
     m.split_min_live = envi("RADIANCE_DS41_SPLIT_MIN_LIVE", kDs41SplitMinLive);
     const char* kx = std::getenv("RADIANCE_DS41_IDXKEY");
     m.ikmx = kx && !std::strcmp(kx, "mxfp4") && m.c.idim % 32 == 0;
+    const char* lx = std::getenv("RADIANCE_DS41_LATENT");
+    m.lnv = lx && !std::strcmp(lx, "nvfp4") && m.c.window % 32 == 0;
+}
+
+/* A compressed latent entry's bf16 slots: its hd values, or its packed bytes / 2 (nvfp4). */
+static int64_t latent_slots(const Model& m, int64_t hd) {
+    return m.lnv ? (hd / 2 + hd / 16 + 15) / 16 * 16 / 2 : hd;
 }
 
 /* An index cache entry's bf16 slots: the key's idim values, or its packed bytes / 2 (mxfp4). */
@@ -1237,8 +1249,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
             DS_TRY(rad_kv_group_zero(b, m.index[r]));
-            if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", hd, r))) return RAD_E_INVAL;
-            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page);
+            if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", latent_slots(m, hd), r))) return RAD_E_INVAL;
+            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lnv ? "nvfp4" : nullptr);
             if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
             DS_TRY(rad_kv_group_zero(b, m.comp[r]));
@@ -1339,8 +1351,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 L.l_rope = rope_rows(b, m, rows, 1, hd, 0, m.lat, m.cs_b);
                 L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat);
             }
-            if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", hd, r))) return RAD_E_INVAL;
-            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page);
+            if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", latent_slots(m, hd), r))) return RAD_E_INVAL;
+            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lnv ? "nvfp4" : nullptr);
             if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
             if (r > 1)
@@ -1428,11 +1440,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         /* ---- the sparse attention and the output projection */
         L.sinks = wts(b, g, nm.f("blk.%d.attn_sinks.weight", l), RAD_F32, { g.n_head }, grp, RAD_SHARD_ROW,
                       m.ar * g.n_head, (m.ar + 1) * g.n_head);
-        L.attn = op(b, "attn_sparse_sink",
-                    { RAD_RANGE("M", 1, T), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
-                      RAD_INT("window", c.window), RAD_INT("ratio", r),
-                      RAD_INT("topk", r > 0 ? c.itopk : 0),
-                      RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") },
+        std::vector<RadParam> ap = { RAD_RANGE("M", 1, T), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
+                                     RAD_INT("window", c.window), RAD_INT("ratio", r),
+                                     RAD_INT("topk", r > 0 ? c.itopk : 0),
+                                     RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
+        if (m.lnv && r > 0) ap.push_back(RAD_STR("latent_format", "nvfp4"));
+        L.attn = op(b, "attn_sparse_sink", ap,
                     { L.sinks },
                     r > 0 ? std::initializer_list<rad_buf>{ m.q, m.sel }
                           : std::initializer_list<rad_buf>{ m.q },
@@ -2116,18 +2129,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              c.idx_src.size(), (long long)c.n_expert, (long long)c.top_k, c.ple.size());
     rad_note(b, "deepseek41 indexer: candidate restriction %s from %lld positions, row split %s from %lld (runs of "
                 "%lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, _SPLIT_MIN_LIVE), keys %s "
-                "(%lld bytes an entry; RADIANCE_DS41_IDXKEY)",
+                "(%lld bytes an entry; RADIANCE_DS41_IDXKEY), latent %s (%lld bytes an entry; RADIANCE_DS41_LATENT)",
              m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
              (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
-             (long long)(2 * index_slots(m)));
+             (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)));
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
                         "from %lld (runs of %lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, "
-                        "_SPLIT_MIN_LIVE), keys %s (%lld bytes an entry; RADIANCE_DS41_IDXKEY)\n",
+                        "_SPLIT_MIN_LIVE), keys %s (%lld bytes an entry; RADIANCE_DS41_IDXKEY), latent %s (%lld bytes an "
+                        "entry; RADIANCE_DS41_LATENT)\n",
                 m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
                 (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
-                (long long)(2 * index_slots(m)));
+                (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)));
     return RAD_OK;
 }
 

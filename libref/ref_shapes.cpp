@@ -1792,6 +1792,12 @@ int ref_attn_sparse_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     if (M <= 0 || H < 1 || Dm < 2 || win < 1 || ratio < 0 || (ratio > 0 && (topk < 1 || Dm % ratio)))
         return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
+    /* latent_format nvfp4: a compressed entry packed, (Dm/2 + Dm/16) bytes rounded up to 16 */
+    const char* lf = gs(p, n_p, "latent_format");
+    const bool nv = ratio > 0 && lf && !std::strcmp(lf, "nvfp4");
+    if (lf && std::strcmp(lf, "nvfp4") && std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t cslots = nv ? (Dm / 2 + Dm / 16 + 15) / 16 * 16 / 2 : Dm;
+    if (ratio > 0 && cslots % ratio) return RAD_E_UNSUPPORTED;
     /* One sequence; window blocks of 4 slots covering every position a row may hold. */
     const int64_t bs = 4, nb = (M + bs - 1) / bs + 1, ncb = M + 1;
     Opd o;
@@ -1800,7 +1806,7 @@ int ref_attn_sparse_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     o.t_idx({ 1, nb }, nb, -1, 0);                      /* window block table */
     o.t_idx({ 1 }, M + 1, -1, 0);                       /* window tokens held from the table's start */
     if (ratio > 0) {
-        o.t(D, { ncb, 1, ratio, Dm / ratio });          /* compressed cache: an entry a block */
+        o.t(D, { ncb, 1, ratio, cslots / ratio });      /* compressed cache: an entry a block */
         o.t_idx({ 1, ncb }, ncb, -1, 0);                /* compressed block table */
         o.t_idx({ M, topk }, ncb, -1, 0);               /* selected compressed positions */
     } else {
@@ -1819,12 +1825,18 @@ int ref_index_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     if (M <= 0 || H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || C < 1) return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
     const int64_t ncb = C + 1;
+    /* key_format mxfp4: an entry packed, (Dm/2 + Dm/32) bytes rounded up to 16 */
+    const char* kf = gs(p, n_p, "key_format");
+    const bool kmx = kf && !std::strcmp(kf, "mxfp4");
+    if (kf && !kmx && std::strcmp(kf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t kslots = kmx ? (Dm / 2 + Dm / 32 + 15) / 16 * 16 / 2 : Dm;
+    if (kslots % ratio) return RAD_E_UNSUPPORTED;
     /* A run (row_part p) scores rows [p M, p M + M) of a step that holds them. */
     const int64_t part = gi(p, n_p, "row_part", 0), Mq = part > 0 ? (part + 1) * M : M;
     Opd o;
     o.t(D, { Mq, H * Dm });                             /* q */
     o.t(D, { Mq, H });                                  /* head weights */
-    o.t(D, { ncb, 1, ratio, Dm / ratio });              /* index cache: an entry a block */
+    o.t(D, { ncb, 1, ratio, kslots / ratio });          /* index cache: an entry a block */
     o.t_idx({ 1, ncb }, ncb, -1, 0);                    /* block table */
     o.t_idx({ Mq }, Mq, -1, 0);                         /* positions */
     o.t_idx({ 2 }, Mq, -1, (uint32_t)RAD_OPD_F_IDX_CU); /* cu_seqlens */
@@ -1862,12 +1874,17 @@ int ref_index_topk_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
 
 int ref_entry_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), bs = gi(p, n_p, "block_size", 0);
-    if (M <= 0 || n < 1 || bs < 1 || n % bs) return RAD_E_UNSUPPORTED;
+    /* format mxfp4 / nvfp4: a block holds the packed entry, (n/2 + n/32 or n/16) bytes rounded up to 16 */
+    const char* f = gs(p, n_p, "format");
+    const bool mx = f && !std::strcmp(f, "mxfp4"), nv = f && !std::strcmp(f, "nvfp4");
+    if (f && !mx && !nv && std::strcmp(f, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t slots = mx ? (n / 2 + n / 32 + 15) / 16 * 16 / 2 : nv ? (n / 2 + n / 16 + 15) / 16 * 16 / 2 : n;
+    if (M <= 0 || n < 1 || bs < 1 || slots % bs || ((mx || nv) && n % 32)) return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
     Opd o;
     o.t(D, { M, n });                                   /* x */
     o.t_idx({ M }, M, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE); /* page: distinct blocks */
-    o.t(D, { M, 1, bs, n / bs });                       /* cache */
+    o.t(D, { M, 1, bs, slots / bs });                   /* cache */
     return o.finish("entry_store", operand, out);
 }
 

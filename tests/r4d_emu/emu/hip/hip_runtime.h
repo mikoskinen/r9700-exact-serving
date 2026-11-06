@@ -192,7 +192,7 @@ inline float emu_fdot2(V a, V b, float c, bool) {
 #define HALO_KLAUNCH(kernel, grid, block, stream, ...) emu_launch(&kernel, grid, block, __VA_ARGS__)
 #define HALO_EMIT(stream, kernel, grid, block, lds, ...) \
     emu_emit(#kernel, (kernel), (grid), (block), (size_t)(lds), __VA_ARGS__)
-/* global_load_tr_b128: not emulated; reported when reached */
+/* global_load_tr_b128: emulated by exchanges (emu.cpp) */
 emu_v8s emu_load_tr_b128(const void* p);
 #define __builtin_amdgcn_global_load_tr_b128_v8i16(p) emu_load_tr_b128((const void*)(p))
 /* v_cvt_pk_fp8_f32 (gfx12, OCP E4M3): converts a and b into the low half of `old` (hi false) or

@@ -59,6 +59,50 @@ float roundtrip(float v, float scale, QFmt f) {
  * e2m1 codes (value 2i in byte i's low nibble), n/32 ue8m0 scale bytes, zeros to a multiple of 16. */
 int64_t mx4_bytes(int64_t n) { return (n / 2 + n / 32 + 15) / 16 * 16; }
 
+/* The packed latent (entry_store format nvfp4, attn_sparse_sink latent_format nvfp4): n/2 bytes of
+ * e2m1 codes, n/16 e4m3 scale bytes, zeros to a multiple of 16. A value is code x scale in f32; its
+ * bf16 is the product's high half (exact for every value quant_roundtrip(fp4_e2m1, e4m3, 16) stored). */
+int64_t nv4_bytes(int64_t n) { return (n / 2 + n / 16 + 15) / 16 * 16; }
+uint16_t nv4_bf16(unsigned c, float sc) {
+    const float v = std::fabs(mxfp4_elem_to_f32((uint8_t)(c & 7u))) * sc;
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return (uint16_t)((u >> 16) | ((c & 8u) << 12));
+}
+float nv4_value(const uint8_t* e, int64_t n, int64_t d) {
+    const unsigned c = (e[d / 2] >> (4 * (d & 1))) & 15u;
+    uint32_t u = (uint32_t)nv4_bf16(c, fp8e4m3_lut(e[n / 2 + d / 16])) << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+/* One block of 16 bf16 values `x` packed: its scale searched among amax / c, c = 6, 4, 3, 2, 1.5, 1,
+ * 0.5, for an e4m3 value that gives every value back bit for bit; none -> quant_roundtrip's e4m3 rule
+ * (lossy). The scale byte, and the codes into `codes` (16 nibbles). */
+uint8_t nv4_pack16(const uint16_t* x, unsigned* codes) {
+    static const float kCand[7] = { 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f };
+    float v[16], am = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t u = (uint32_t)x[i] << 16;
+        std::memcpy(&v[i], &u, 4);
+        const float a = std::fabs(v[i]);
+        if (a > am) am = a;
+    }
+    uint8_t sb = f32_to_fp8e4m3((am > 6.0f * 0x1p-9f ? am : 6.0f * 0x1p-9f) / 6.0f);
+    bool found = am == 0.0f;
+    for (int c = 0; c < 7 && !found; ++c) {
+        const float sc = am / kCand[c];
+        const uint8_t b8 = f32_to_fp8e4m3(sc);
+        if (!(am > 0.0f && fp8e4m3_lut(b8) == sc)) continue;
+        bool ok = true;
+        for (int i = 0; i < 16 && ok; ++i) ok = nv4_bf16(e2m1_code(v[i] / sc), sc) == x[i];
+        if (ok) { found = true; sb = b8; }
+    }
+    const float scale = fp8e4m3_lut(sb);
+    for (int i = 0; i < 16; ++i) codes[i] = e2m1_code(std::clamp(v[i] / scale, -6.0f, 6.0f));
+    return sb;
+}
+
 /* Value d of a packed entry `e` of n values: its code times its block's scale, as f32 (a code times
  * a power of two at or above 2^-126 is exact in f32, and in bf16). */
 float mx4_value(const uint8_t* e, int64_t n, int64_t d) {
@@ -175,6 +219,11 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
     const int64_t ratio = p_int(a, "ratio", 0), topk = p_int(a, "topk", 0);
     const float scale = p_f32(a, "scale", 0.0f);
     const bool comp = ratio > 0;
+    /* latent_format nvfp4: the compressed entries packed (nv4_bytes(D) bytes in bf16 slots) */
+    const char* lf = p_str(a, "latent_format", "bf16");
+    const bool cnv = comp && !std::strcmp(lf, "nvfp4");
+    if (std::strcmp(lf, "nvfp4") && std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t cslots = cnv ? nv4_bytes(D) / 2 : D;
     if (H < 1 || D < 2 || D > 4096 || win < 1 || ratio < 0 || topk < 0 || !std::isfinite(scale) ||
         scale <= 0 || (comp && (!cc || !cbt || !sel || topk < 1 || D % ratio)))
         return RAD_E_SHAPE;
@@ -185,10 +234,11 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
         sink.dtype != RAD_F32 || numel(&cu) < 2 || numel(&wused) < numel(&cu) - 1)
         return RAD_E_SHAPE;
     const int64_t cbs = comp ? cc->shape[2] : 0;
-    if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != D || cbs % ratio ||
+    if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != cslots || cbs % ratio ||
                  cbt->rank != 2 || sel->rank != 2 || sel->shape[0] != q.shape[0] ||
                  sel->shape[1] != topk || cbt->shape[0] != wbt.shape[0]))
         return RAD_E_SHAPE;
+    if (cnv && (cc->dtype != RAD_BF16 || !rad_tensor_is_contiguous(cc))) return RAD_E_SHAPE;
     const int64_t M = q.shape[0], S = numel(&cu) - 1, bs = wc.shape[2];
     const int64_t nkeys = win + (comp ? topk : 0);
 #pragma omp parallel for schedule(dynamic)
@@ -216,8 +266,13 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
                                                                   ((c * ratio) / cbs) * laststride(cbt));
             if (blk < 0 || blk >= cc->shape[0]) continue;
             kt[(size_t)(win + t)] = cc;
-            ko[(size_t)(win + t)] = (blk * cbs + (c * ratio) % cbs) * (D / ratio);
+            ko[(size_t)(win + t)] = (blk * cbs + (c * ratio) % cbs) * (cslots / ratio);
         }
+        /* a key's value d: the bf16 caches' element, or (packed) the entry's decoded value */
+        auto kval = [&](int64_t k, int64_t d) {
+            return cnv && k >= win ? nv4_value((const uint8_t*)cc->data + 2 * ko[(size_t)k], D, d)
+                                   : ldt(kt[(size_t)k], ko[(size_t)k] + d);
+        };
         std::vector<float> sc((size_t)nkeys), acc((size_t)D);
         for (int64_t h = 0; h < H; ++h) {
             const int64_t qb = rowoff(&q, m, H * D) + h * D * laststride(&q);
@@ -226,7 +281,7 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
                 if (!kt[(size_t)k]) continue;
                 float dot = 0;
                 for (int64_t d = 0; d < D; ++d)
-                    dot += ldt(&q, qb + d * laststride(&q)) * ldt(kt[(size_t)k], ko[(size_t)k] + d);
+                    dot += ldt(&q, qb + d * laststride(&q)) * kval(k, d);
                 sc[(size_t)k] = dot * scale;
                 mx = std::max(mx, sc[(size_t)k]);
             }
@@ -236,7 +291,7 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
                 if (!kt[(size_t)k]) continue;
                 const float pk = std::exp(sc[(size_t)k] - mx);
                 den += pk;
-                for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * ldt(kt[(size_t)k], ko[(size_t)k] + d);
+                for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * kval(k, d);
             }
             den += std::exp(ldt(&sink, h * laststride(&sink)) - mx);
             const int64_t ob = rowoff(&out, m, H * D) + h * D * laststride(&out);
@@ -469,6 +524,30 @@ int ref_entry_store(const RadArgs* a, RadStream) {
                     e[(b * 32 + i) / 2] |= (uint8_t)(c << (4 * (i & 1)));
                 }
                 e[n / 2 + b] = (uint8_t)(ceil_log2_bits(scale) + 127);
+            }
+        }
+        return RAD_OK;
+    }
+    if (!std::strcmp(fmt, "nvfp4")) {
+        /* each block of 16 packed by nv4_pack16 (the kernel's search, bit for bit) */
+        const int64_t bytes = nv4_bytes(n);
+        if (n < 32 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n || x.dtype != RAD_BF16 ||
+            numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs || cache.dtype != RAD_BF16 ||
+            cache.shape[1] * cache.shape[2] * cache.shape[3] * 2 != bytes || !rad_tensor_is_contiguous(&cache))
+            return RAD_E_SHAPE;
+        for (int64_t w = 0; w < x.shape[0]; ++w) {
+            const int64_t pg = ld_int(page.dtype, page.data, offlin(&page, w));
+            if (pg < 0) continue;
+            if (pg >= cache.shape[0]) return RAD_E_INVAL;
+            const int64_t xb = rowoff(&x, w, n), xs = laststride(&x);
+            uint8_t* e = (uint8_t*)cache.data + pg * bytes;
+            std::memset(e, 0, (size_t)bytes);
+            for (int64_t b = 0; b < n / 16; ++b) {
+                uint16_t v[16];
+                unsigned c[16];
+                for (int i = 0; i < 16; ++i) v[i] = ((const uint16_t*)x.data)[xb + (b * 16 + i) * xs];
+                e[n / 2 + b] = nv4_pack16(v, c);
+                for (int i = 0; i < 16; ++i) e[(b * 16 + i) / 2] |= (uint8_t)(c[i] << (4 * (i & 1)));
             }
         }
         return RAD_OK;

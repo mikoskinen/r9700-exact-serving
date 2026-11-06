@@ -978,7 +978,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `rope_rows_roundtrip` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` | `x`:inout, `cos_sin`, `positions` (device-only: rope_rows then quant_roundtrip over n_head * head_dim columns) |
 | `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
-| `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
+| `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
 | `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
 | `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
 | `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
@@ -1046,6 +1046,18 @@ encodes. For values `quant_roundtrip` already produced -- a block `c_i * 2^k`, `
 DeepSeek-V4's index keys are -- the packing is exact: the rule picks `2^k / 2^j` with `c_max * 2^j` in
 (3, 6], and every `|c_i| <= c_max` times `2^j` is again a code; so every score is the bf16 cache's,
 bit for bit, at 80 bytes an entry instead of 256. `bf16` (or the parameter absent) is the plain form.
+
+**Packed compressed latent.** `entry_store` `format` `nvfp4` stores each block of 16 of an entry's `n`
+values (`n` a multiple of 32) as e2m1 codes with one OCP e4m3 scale: `n/2` code bytes (value `2i` in byte
+`i`'s low nibble), then `n/16` scale bytes, then zeros to a multiple of 16 -- 288 bytes (144 bf16 slots)
+for DeepSeek-V4's 512-value latent. The latent is `quant_roundtrip` (`fp4_e2m1`, `e4m3`, block 16)
+output, every value `c_i * s` exactly; re-deriving `s` by the rule is not always exact (with a subnormal
+e4m3 scale the block's largest code can be 4), so the scale is searched among `amax / c` for `c` = 6, 4,
+3, 2, 1.5, 1, 0.5 -- the first that is an e4m3 value and turns every value back into itself (the block's
+own scale is among them) -- and only a block no candidate reproduces takes the rule's scale, lossy.
+`attn_sparse_sink` `latent_format` `nvfp4` reads such a compressed cache (`window` a multiple of 32; the
+window cache stays bf16): a value is code times scale in f32, whose bf16 is the stored one, so every
+output is the bf16 cache's, bit for bit, at 288 bytes an entry instead of 1024.
 
 **`attn_dense`** serves vision towers and encoders: nothing paged, `cu_seqlens` bounding one image
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a

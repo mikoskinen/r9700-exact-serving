@@ -5,7 +5,7 @@
 
 /* libref's schemas (libref/ref_registry.cpp), field for field. */
 static const RadParamSpec pDs41AttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype") };
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format") };
 static const RadOperandSpec oDs41AttnSparseSink[] = {
     { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
     { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
@@ -62,7 +62,11 @@ SCHEMA("attn_sparse_sink", pDs41AttnSparseSink, oDs41AttnSparseSink,
        "window_used[s]: block wbt[s][(j-first)/bs], cache [blocks,1,bs,dim]) and, with ratio > 0, "
        "the selected compressed entries c (tokens [c ratio, (c+1) ratio), block cbt[s][c ratio/cbs], "
        "cache [blocks,1,cbs,dim/ratio]). f32 scores q.k*scale, max floored at -1e30, "
-       "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero."),
+       "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero. "
+       "latent_format nvfp4: the compressed cache holds each entry packed (entry_store format nvfp4: "
+       "e2m1 codes, an e4m3 scale a block of 16, 288 bytes for 512 values), the window a multiple of "
+       "32; every output is the bf16 cache's, bit for bit, where the entries are "
+       "quant_roundtrip(fp4_e2m1, e4m3, 16) values."),
 SCHEMA("index_score", pDs41IndexScore, oDs41IndexScore,
        "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
        "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "

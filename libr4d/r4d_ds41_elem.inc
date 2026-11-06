@@ -214,7 +214,10 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
            "nothing. Declared right after its group, its block_size sets the group's. format mxfp4 (n a "
            "multiple of 32): each block of 32 as quant_roundtrip(fp4_e2m1, ue8m0) scales it, packed -- n/2 "
            "bytes of e2m1 codes (value 2i low nibble of byte i), n/32 scale bytes, zeros to 16 -- into "
-           "heads*block_size*slot bf16 slots of that many bytes; exact for values that rule produced."),
+           "heads*block_size*slot bf16 slots of that many bytes; exact for values that rule produced. format "
+           "nvfp4 (n a multiple of 32): blocks of 16 with an e4m3 scale (n/2 code bytes, n/16 scale bytes, "
+           "zeros to 16), the scale searched among amax/c (c = 6, 4, 3, 2, 1.5, 1, 0.5) for one that gives "
+           "every value back exactly, else quant_roundtrip(fp4_e2m1, e4m3)'s."),
     SCHEMA("router_scored_topk", pDs41RouterScored, oDs41RouterScored,
            "router_sigmoid_topk with the score function a required name: sigmoid, sqrtsoftplus "
            "(sqrt(softplus(logit)), softplus linear above 20) or softmax over all n_expert logits."),

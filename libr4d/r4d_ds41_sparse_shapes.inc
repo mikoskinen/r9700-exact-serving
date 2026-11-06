@@ -17,12 +17,18 @@ extern "C" int r4d_shape_attn_sparse_sink(const RadParam* p, int n_p, int operan
     const uint32_t D = dt_act(p, n_p, "dtype");
     const int64_t bs = 4, nb = (M + bs - 1) / bs + 1, ncb = M + 1;
     const bool comp = ratio > 0;
+    /* latent_format nvfp4: a compressed entry is (Dm/2 + Dm/16) bytes rounded up to 16, in bf16 slots */
+    const char* lf = r4d_pgets(p, n_p, "latent_format");
+    const bool nv = comp && lf && !std::strcmp(lf, "nvfp4");
+    if (lf && std::strcmp(lf, "nvfp4") && std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t cslots = nv ? (Dm / 2 + Dm / 16 + 15) / 16 * 16 / 2 : Dm;
+    if (comp && cslots % ratio) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd(D, M, H * Dm),                                  /* q */
         opd(D, nb, 1, bs, Dm),                              /* window cache */
         opd_idx(1, nb, nb),                                 /* window block table */
         opd_idx(1, 0, M + 1),                               /* window tokens held from the table's start */
-        comp ? opd(D, ncb, 1, ratio, Dm / ratio) : opd_none(),  /* compressed cache: an entry a block */
+        comp ? opd(D, ncb, 1, ratio, cslots / ratio) : opd_none(),  /* compressed cache: an entry a block */
         comp ? opd_idx(1, ncb, ncb) : opd_none(),           /* compressed block table */
         comp ? opd_idx(M, topk, ncb) : opd_none(),          /* selected compressed positions */
         opd_idx(M, 0, M),                                   /* positions */

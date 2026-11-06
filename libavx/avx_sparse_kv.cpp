@@ -217,6 +217,9 @@ void widen_flat(const RadTensor& t, int64_t off, int64_t n, float* dst) {
  * scores are vector dots, p = exp(s - max) as libref (expf), and the output a vector sum of p k. */
 AVX_KERNEL(attn_sparse_sink) {
     if (!a || a->n_t < 11 || !a->t) return RAD_E_INVAL;
+    /* latent_format nvfp4 (packed compressed entries) is libr4d's and libref's */
+    if (const char* lf = rad_args_gets(a, "latent_format"))
+        if (std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
     const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2], &wused = a->t[3];
     const RadTensor *cc = a->t[4].data ? &a->t[4] : nullptr, *cbt = a->t[5].data ? &a->t[5] : nullptr;
     const RadTensor* sel = a->t[6].data ? &a->t[6] : nullptr;
