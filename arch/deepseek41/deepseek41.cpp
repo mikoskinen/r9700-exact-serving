@@ -26,6 +26,8 @@
 #include <arch/rad_block_moe_fp8.h>
 #include <arch/rad_deepseek41_chat.h>
 
+#include "ds41_index_split.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -297,8 +299,10 @@ struct Layer {
     rad_op k_gemm = 0, k_norm = 0, k_rope = 0, k_q = 0, k_st = 0;
     rad_op l_rope = 0, l_q = 0, l_st = 0, c_tail = 0;
     rad_op i_q = 0, i_rope = 0, i_qq = 0, i_w = 0, i_score = 0, i_cand = 0, i_topk = 0;
-    /* index_score over run p of a step's rows (row_part p); i_runs[0] is i_score. */
+    /* index_score over run p of a step's rows (row_part p); i_runs[0] is i_score. i_keep: these
+     * runs take the candidate layer's keep (Model::ikeep). */
     std::vector<rad_op> i_runs;
+    bool i_keep = false;
     rad_op attn = 0, o_rope = 0, o_q = 0, o_b = 0, post_a = 0, attn_fill = 0, ar_attn = 0;
     std::vector<rad_op> o_a;
     /* The fused chains (fused()), each 0 where its chain above is declared instead: kv_n + kv_rope
@@ -387,6 +391,15 @@ struct Model {
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
     int64_t irows = 0, iparts = 0, kwords = 0;
+    /* The indexer's two exact restrictions (index_mode(), RADIANCE_DS41_INDEX at declare):
+     * `ikeep` scores a layer past the candidate layer at the candidate layer's kept blocks only
+     * (index_score's keep: the same selection, docs/OPS.md); `isplit` deals a step's runs over the
+     * attention ranks (ds41_index_split.h), each rank scoring and selecting its own runs into
+     * `sel_part` (`qmax` runs of `irows` rows at most), and `sel_gather` joins the parts into `sel`. */
+    bool ikeep = false, isplit = false;
+    int64_t qmax = 0;
+    rad_buf sel_part = 0;
+    rad_op sel_gather = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
      * its `gr` output groups; `zero` for an attention-zero rank. */
     int aw = 1, ar = 0;
@@ -870,6 +883,21 @@ static void index_runs(Model& m) {
         m.kwords = keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block);
 }
 
+/* RADIANCE_DS41_INDEX: a list of `keep` (the candidate restriction) and `split` (the row split
+ * over the ranks), or `off`; unset is `keep,split`. Both are exact -- every selection is the one
+ * the unrestricted, unsplit indexer makes (docs/OPS.md index_score; ds41_index_split.h) -- so the
+ * switch is for an A/B in one image. The split needs every rank to attend (no attention-zero rank,
+ * whose step skips the indexer and could not join the gather) and a step of two runs or more. */
+static void index_mode(Model& m) {
+    const char* e = std::getenv("RADIANCE_DS41_INDEX");
+    const std::string v = e ? e : "keep,split";
+    const bool off = v == "off" || v == "0" || v == "none";
+    m.ikeep = !off && v.find("keep") != std::string::npos && m.kwords > 0;
+    m.isplit = !off && v.find("split") != std::string::npos && m.g.world > 1 && m.aw == m.g.world &&
+               m.iparts >= 2;
+    m.qmax = m.isplit ? (m.iparts + m.aw - 1) / m.aw : 0;
+}
+
 static int buffers(RadBuilder* b, Model& m) {
     auto& g = m.g;
     auto& nm = m.nm;
@@ -910,7 +938,10 @@ static int buffers(RadBuilder* b, Model& m) {
     m.iw = bf("index_w", { T, c.ih });
     m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.irows, m.cmax });
     if (m.kwords > 0) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
-    m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { T, c.itopk });
+    /* Split: the gather lays aw parts of qmax runs of at most irows rows, rank r's at r qmax R. */
+    const int64_t sel_rows = m.isplit ? std::max(T, (int64_t)m.aw * m.qmax * m.irows) : T;
+    m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { sel_rows, c.itopk });
+    if (m.isplit) m.sel_part = decl_b(b, nm.f("index_sel_part"), RAD_I32, { m.qmax * m.irows, c.itopk });
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     m.cs_b = decl_b(b, nm.f("rope_compressed"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     if (!c.ple.empty()) {
@@ -1305,19 +1336,39 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             }
             L.i_w = linear(b, m, T, L.iproj, c.ih, D, m.xn, m.iw);
             const int64_t width = g.max_ctx / r + 1, IR = m.irows;
+            /* A layer past the candidate layer scores only its kept blocks (m.ikeep): index_topk
+             * reads no other position of the plane, so the selection is the same set. */
+            const bool kept = m.ikeep && c.cand >= 0 && c.cand < l && m.keep && c.ratio[(size_t)c.cand] == r;
+            L.i_keep = kept;
             /* One index_score a run of rows (index_runs()): run p scores step rows [p R, p R + R)
              * into the score plane's first R rows. */
             for (int64_t p = 0; p < m.iparts; ++p) {
-                const rad_op h = op(b, "index_score",
-                                    { RAD_RANGE("M", 1, IR), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
-                                      RAD_INT("ratio", r), RAD_INT("width", width),
-                                      RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
-                                      RAD_STR("dtype", "bf16"), RAD_INT("row_part", p) },
-                                    {}, { m.iq, m.iw }, { m.score });
+                std::vector<RadParam> sp = { RAD_RANGE("M", 1, IR), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
+                                             RAD_INT("ratio", r), RAD_INT("width", width),
+                                             RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
+                                             RAD_STR("dtype", "bf16"), RAD_INT("row_part", p) };
+                if (kept) sp.push_back(RAD_INT("block", c.cand_block));
+                const rad_op h = op(b, "index_score", sp, {},
+                                    kept ? std::initializer_list<rad_buf>{ m.iq, m.iw, m.keep }
+                                         : std::initializer_list<rad_buf>{ m.iq, m.iw },
+                                    { m.score });
                 if (!h) return RAD_E_INVAL;
                 L.i_runs.push_back(h);
             }
             L.i_score = L.i_runs[0];
+            /* The split's join, declared at the first indexer (before any attention reads sel). A
+             * gather no library serves (no peer access, say) leaves the indexer unsplit. */
+            if (m.isplit && !m.sel_gather) {
+                m.sel_gather = op(b, "all_gather",
+                                  { RAD_INT("world_size", g.world), RAD_INT("numel", m.qmax * IR * c.itopk),
+                                    RAD_STR("dtype", "f32") },
+                                  {}, { m.sel_part }, { m.sel });
+                if (!m.sel_gather) {
+                    m.isplit = false;
+                    rad_note(b, "deepseek41: the indexer's row split is off: no all_gather of its selections "
+                                "resolves at %d ranks", g.world);
+                }
+            }
             if (l == c.cand) {
                 if (!m.keep) return RAD_E_INVAL;
                 L.i_cand = op(b, "index_candidates",
@@ -1336,10 +1387,13 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             std::vector<RadParam> tp = { RAD_RANGE("M", 1, IR), RAD_INT("width", width),
                                          RAD_INT("topk", c.itopk), RAD_INT("ratio", r) };
             if (uses) tp.push_back(RAD_INT("block", c.cand_block));
+            /* Split, a rank's selections go to its part, which the gather joins into sel. */
+            const rad_buf sel_out = m.isplit ? m.sel_part : m.sel;
             L.i_topk = op(b, "index_topk", tp, {},
                           uses ? std::initializer_list<rad_buf>{ m.score, m.keep }
                                : std::initializer_list<rad_buf>{ m.score },
-                          { m.sel });
+                          { sel_out });
+            if (L.i_topk && m.isplit && rw(b, L.i_topk, {}, { m.sel }) == 0) return RAD_E_INVAL;
             if (!L.i_topk) return RAD_E_INVAL;
         }
 
@@ -1882,6 +1936,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.work = g.max_tok + g.max_seqs;
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
     index_runs(m);
+    index_mode(m);
     DS_TRY(buffers(b, m));
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */
     if (m.dsp.on && !m.zero &&
@@ -2031,6 +2086,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
              c.idx_src.size(), (long long)c.n_expert, (long long)c.top_k, c.ple.size());
+    rad_note(b, "deepseek41 indexer: candidate restriction %s, row split %s (runs of %lld rows, %lld "
+                "a rank at most; RADIANCE_DS41_INDEX)",
+             m.ikeep ? "on" : "off", m.isplit && m.sel_gather ? "on" : "off", (long long)m.irows,
+             (long long)m.qmax);
     return RAD_OK;
 }
 
@@ -2435,22 +2494,30 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 const bool uses = c.cand >= 0 && c.cand < l;
                 /* Run by run (index_runs()): score R rows into the plane, then select from them
                  * before the next run overwrites it. Rows are independent, so each row's score,
-                 * candidates and selection are the whole step's. */
-                const int64_t n = (T + m.irows - 1) / m.irows, R = (T + n - 1) / n;
-                for (int64_t p = 0; p * R < T; ++p) {
-                    const int64_t r0 = p * R, rows = std::min(R, T - r0);
+                 * candidates and selection are the whole step's. Split (m.isplit, a step of two
+                 * runs or more at a long enough context), this rank takes runs [p0, p1) into its
+                 * part and the gather joins every rank's part into sel (ds41_index_split.h). A
+                 * layer past the candidate layer scores its kept blocks only (L.i_keep). */
+                const Ds41IdxRuns ru = ds41_idx_runs(T, m.irows, live, m.aw, m.ar, m.isplit && m.sel_gather);
+                for (int64_t p = ru.p0; p < ru.p1; ++p) {
+                    const int64_t r0 = p * ru.R, rows = std::min(ru.R, T - r0);
                     const RadOperand prow = praw(batch->positions + r0, RAD_I32, rows);
-                    RAD_ISSUE_N(x, L.i_runs[(size_t)p], R, brows(m.iq, T), brows(m.iw, T),
+                    RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, brows(m.iq, T), brows(m.iw, T),
                                 kv_cache(m.index[r], src),
                                 praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
-                                bcol(m.score, 0, live, R));
+                                bcol(m.score, 0, live, ru.R),
+                                L.i_keep ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE);
                     if (L.i_cand)
                         RAD_ISSUE_N(x, L.i_cand, rows, bcol(m.score, 0, live, rows), prow,
                                     bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
                     RAD_ISSUE_N(x, L.i_topk, rows, bcol(m.score, 0, live, rows),
                                 uses ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE, prow,
-                                brow_slice(m.sel, r0, rows, c.itopk));
+                                ru.split ? brow_slice(m.sel_part, (p - ru.p0) * ru.R, rows, c.itopk)
+                                         : brow_slice(m.sel, r0, rows, c.itopk));
                 }
+                if (ru.split)
+                    RAD_ISSUE(x, m.sel_gather, brows(m.sel_part, ru.q * ru.R),
+                              brows(m.sel, (int64_t)m.aw * ru.q * ru.R));
             };
 
             c_gemm();

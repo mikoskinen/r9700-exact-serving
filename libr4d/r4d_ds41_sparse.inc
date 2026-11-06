@@ -13,11 +13,12 @@ static const RadOperandSpec oDs41AttnSparseSink[] = {
     { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pDs41IndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part") };
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
+    P_INTO("block") };
 static const RadOperandSpec oDs41IndexScore[] = {
     { "q", RAD_OPD_IN, 0 },  { "w", RAD_OPD_IN, 0 },         { "index_cache", RAD_OPD_IN, 0 },
     { "bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
-    { "score", RAD_OPD_OUT, 0 },
+    { "score", RAD_OPD_OUT, 0 }, { "keep", RAD_OPD_IN, 1 },
 };
 static const RadParamSpec pDs41IndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
@@ -67,7 +68,9 @@ SCHEMA("index_score", pDs41IndexScore, oDs41IndexScore,
        "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
        "rounded once to dtype. "
        "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]. With row_part "
-       "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf)."),
+       "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf). With "
+       "keep (index_candidates' bits over blocks of `block`, keep row i for score row i) only the kept "
+       "blocks are scored, the rest -inf unread; a kept score is the unkept op's, bit for bit."),
 SCHEMA("index_candidates", pDs41IndexCand, oDs41IndexCand,
        "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
        "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is a bit a "
@@ -95,7 +98,7 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   "(> 48 rows: the dot on WMMA, its summation order the only change)",
   "dim 128, any heads, ratio 1..16, row_part; a thread an entry (1, 2, 4 or 8 waves an entry "
   "group by grid size), -inf past (pos+1)/ratio without reading keys; > 48 rows and <= 32 heads a "
-  "wave a row over 128 entries",
+  "wave a row over 128 entries (with keep: over 1024 entries, its unkept 16-entry tiles skipped)",
   "bf16 q, w and cache; i32 tables and positions; f32 score",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_score, nullptr, nullptr, nullptr,

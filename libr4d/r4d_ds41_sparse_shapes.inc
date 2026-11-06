@@ -35,7 +35,7 @@ extern "C" int r4d_shape_attn_sparse_sink(const RadParam* p, int n_p, int operan
 
 extern "C" int r4d_shape_index_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), Dm = pi(p, n_p, "dim");
-    const int64_t ratio = pi(p, n_p, "ratio"), C = pi(p, n_p, "width");
+    const int64_t ratio = pi(p, n_p, "ratio"), C = pi(p, n_p, "width"), block = pi(p, n_p, "block");
     if (M <= 0 || H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || C < 1) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
     const int64_t ncb = C + 1;
@@ -49,6 +49,8 @@ extern "C" int r4d_shape_index_score(const RadParam* p, int n_p, int operand, Ra
         opd_idx(Mq, 0, Mq),                                 /* positions */
         opd_idx(2, 0, Mq, -1, (uint32_t)RAD_OPD_F_IDX_CU),  /* cu_seqlens */
         opd((uint32_t)RAD_F32, M, C),                       /* score */
+        /* keep, optional: with `block`, index_candidates' bits (any word is a valid mask) */
+        block > 0 ? opd_idx(M, keep_words(C, block), 0x7fffffff) : opd_none(),
     };
     R4D_PICK(l);
 }

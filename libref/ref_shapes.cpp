@@ -1829,6 +1829,9 @@ int ref_index_score_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     o.t_idx({ Mq }, Mq, -1, 0);                         /* positions */
     o.t_idx({ 2 }, Mq, -1, (uint32_t)RAD_OPD_F_IDX_CU); /* cu_seqlens */
     o.t((uint32_t)RAD_F32, { M, C });                   /* score */
+    /* keep, optional: with `block`, index_candidates' bits (any word is a valid mask) */
+    if (gi(p, n_p, "block", 0) > 0) o.t_idx({ M, ref_keep_words(C, gi(p, n_p, "block", 0)) }, 0x7fffffff, -1, 0);
+    else o.skip();
     return o.finish("index_score", operand, out);
 }
 

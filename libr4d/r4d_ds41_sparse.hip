@@ -4,7 +4,9 @@
 //   index_score       one thread an entry (or HS waves an entry group, each a slice of the heads,
 //                     the head sum then closed in head order from LDS): the dot in d order,
 //                     rounded to bf16, relu x the rounded head weight, rounded, the head sum in head
-//                     order, rounded.
+//                     order, rounded. With `keep` (index_candidates' bits, the candidate restriction)
+//                     an entry outside the kept blocks scores -inf without a key read, and every
+//                     kept entry is computed by the same instructions as without keep (same bits).
 //   index_candidates  one 1024-thread block a row: block maxima, the newest block pinned, an
 //   index_topk        exact radix select of the k largest (value desc, position asc: libref's
 //                     partial_sort order), then an ordered compaction. index_topk at decode
@@ -33,7 +35,13 @@
 #include <cmath>
 #include <cstdint>
 
+/* The ops' dynamic LDS. tests/r4d_emu runs these sources on the host, which has no extern
+ * __shared__: there it is the launch's dynamic LDS, read at each use. */
+#ifdef R4D_EMU_HOST
+#define r4d_ds41_sparse_dyn ((unsigned char*)emu_dyn_lds())
+#else
 extern __shared__ __align__(16) unsigned char r4d_ds41_sparse_dyn[];
+#endif
 
 namespace {
 
@@ -125,10 +133,36 @@ struct DsScoreArgs {
     const int* pos;
     const int* cu;
     float* sc;
-    long qr, wr, wc, btr, btc, nblk, ps, cs, sr, scs, row0;
-    int nbt, S, M, Mv, C, H, ratio, cbs, slot;
+    /* keep (optional): index_candidates' bits, row m for score row m, a bit a block of `block`
+     * positions (bshift = log2(block) for a power of two, else -1); null scores every entry. */
+    const int* keep;
+    long qr, wr, wc, btr, btc, nblk, ps, cs, sr, scs, row0, kr, kcs;
+    int nbt, S, M, Mv, C, H, ratio, cbs, slot, block, bshift;
     float wscale;
 };
+
+/* keep's block of position j. */
+__device__ __forceinline__ long ds_keep_block(const DsScoreArgs& a, long j) {
+    return a.bshift >= 0 ? (j >> a.bshift) : j / a.block;
+}
+/* Is position j kept: bit b % 32 of word b / 32 of the row, b = j's block. */
+__device__ __forceinline__ bool ds_kept(const DsScoreArgs& a, const int* krow, long j) {
+    const long b = ds_keep_block(a, j);
+    return (((unsigned)krow[(b >> 5) * a.kcs] >> (b & 31)) & 1u) != 0u;
+}
+/* Is any position of [j0, j1) kept (j0 < j1): the row's words over the blocks the span touches,
+ * masked to those blocks. The arguments are uniform where the callers use it, so the loads are
+ * scalar and the answer is uniform. */
+__device__ __forceinline__ bool ds_keep_any(const DsScoreArgs& a, const int* krow, long j0, long j1) {
+    const long b0 = ds_keep_block(a, j0), b1 = ds_keep_block(a, j1 - 1);
+    for (long w = b0 >> 5; w <= (b1 >> 5); ++w) {
+        unsigned bits = (unsigned)krow[w * a.kcs];
+        const long lo = b0 > (w << 5) ? b0 - (w << 5) : 0, hi = b1 < (w << 5) + 31 ? b1 - (w << 5) : 31;
+        bits &= (hi >= 31 ? ~0u : ((2u << hi) - 1u)) & (~0u << lo);
+        if (bits) return true;
+    }
+    return false;
+}
 
 /* One thread an entry; HS waves of a block share 32 entries, each wave a slice of the heads (its
  * q then uniform, read through scalar loads). A thread holds its key as 128 floats. */
@@ -150,9 +184,16 @@ __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
             if (sub == 0 && j < a.C) srow[j * a.scs] = -kDsInf;
             continue;
         }
+        /* keep: m < Mv here (reach > 0). A block of entries none of which is kept scores -inf
+         * without a key read (block-uniform: jb, reach and the row's words are). */
+        const int* krow = a.keep ? a.keep + m * a.kr : nullptr;
+        if (krow && !ds_keep_any(a, krow, jb, min(min(jb + (long)EPB, reach), (long)a.C))) {
+            if (sub == 0 && j < a.C) srow[j * a.scs] = -kDsInf;
+            continue;
+        }
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
         const uint16_t* kp = nullptr;
-        if (j < a.C && j < reach) {
+        if (j < a.C && j < reach && (!krow || ds_kept(a, krow, j))) {
             const long col = (j * a.ratio) / a.cbs;
             if (col < a.nbt) {
                 const long blk = a.bt[(long)s * a.btr + col * a.btc];
@@ -826,6 +867,11 @@ __device__ __forceinline__ float ds_expf_tab(float x, const unsigned long long* 
 template <int HS>
 __device__ __forceinline__ int ds_dec_step(const float (&acc)[HS], uint32_t (&w)[4]) {
     int z;
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: no ISA on the host; the offset is 0 there too */
+    (void)acc;
+    (void)w;
+    z = 0;
+#else
     if constexpr (HS == 1)
         asm volatile("v_mov_b32 %0, 0" : "=v"(z), "+v"(w[0]), "+v"(w[1]), "+v"(w[2]), "+v"(w[3]) : "v"(acc[0]));
     else if constexpr (HS == 2)
@@ -834,6 +880,7 @@ __device__ __forceinline__ int ds_dec_step(const float (&acc)[HS], uint32_t (&w)
     else
         asm volatile("v_mov_b32 %0, 0" : "=v"(z), "+v"(w[0]), "+v"(w[1]), "+v"(w[2]), "+v"(w[3])
                      : "v"(acc[0]), "v"(acc[1]), "v"(acc[2]), "v"(acc[3]));
+#endif
     return z;
 }
 
@@ -1427,23 +1474,48 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(DsAttnArg
  * 16 dims, q held in registers), D lane L = entry L%16, heads 8(L/16)+e. Then libref's roundings:
  * the dot to bf16, relu x the rounded head weight, rounded, summed in head order (the running sum
  * hops lanes L <-> L^16 between 8-head runs), rounded. Only the dot's summation order differs
- * from libref, so a score moves only where the f32 dot sat at a bf16 rounding boundary. */
+ * from libref, so a score moves only where the f32 dot sat at a bf16 rounding boundary.
+ *
+ * KEEP (the candidate restriction): a workgroup's 8 waves walk kIwKeepEB entries each instead, and
+ * a 16-entry tile none of whose entries is kept is skipped (-inf written, no key read, no WMMA).
+ * A kept tile runs exactly the instructions of the KEEP = false form on the same operands, an
+ * unkept entry in it reading the zero key (a WMMA column is its own entry's), and an unkept entry
+ * scores -inf: so every kept entry has the KEEP = false form's bits. The wave's keep words over
+ * its span sit one a lane: a 1024-entry span aligned to 1024 touches at most 32 words at any
+ * block (exactly 32 at block 1, at most 18 at block >= 2). */
 constexpr int kIwEB = 128;                           /* entries a workgroup */
+constexpr int kIwKeepEB = 1024;                      /* ... with keep */
+static_assert(kIwKeepEB == 1024, "the keep words of a span, one a lane, assume 1024-entry spans");
 
-template <int HT>
+template <int HT, bool KEEP>
 __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a) {
-    constexpr int DM = 128;
+    constexpr int DM = 128, EB = KEEP ? kIwKeepEB : kIwEB;
     const int lane = threadIdx.x & 31, hf = lane >> 4;
     const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
     const long m = (long)blockIdx.y * 8 + wave;
     if (m >= a.M) return;
-    const long jb = (long)blockIdx.x * kIwEB;
-    const long jend = jb + kIwEB < (long)a.C ? jb + kIwEB : (long)a.C;
+    const long jb = (long)blockIdx.x * EB;
+    const long jend = jb + EB < (long)a.C ? jb + EB : (long)a.C;
     float* srow = a.sc + m * a.sr;
     const long reach = m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
     if (jb >= reach) {
         for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
         return;
+    }
+    /* KEEP: lane i holds the row's keep word kw0 + i of the words over [jb, min(jend, reach)), 0
+     * past them; none set is a span with no kept entry, -inf without a key read (wave-uniform). */
+    [[maybe_unused]] unsigned kword = 0u;
+    [[maybe_unused]] long kw0 = 0;
+    if constexpr (KEEP) {
+        const int* krow = a.keep + m * a.kr;
+        const long jl = (jend < reach ? jend : reach) - 1;
+        kw0 = ds_keep_block(a, jb) >> 5;
+        const long nw = (ds_keep_block(a, jl) >> 5) - kw0 + 1;
+        kword = lane < nw ? (unsigned)krow[(kw0 + lane) * a.kcs] : 0u;
+        if (__builtin_amdgcn_ballot_w32(kword != 0u) == 0u) {
+            for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
+            return;
+        }
     }
     const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
     uint4 qf[HT][8];
@@ -1469,8 +1541,21 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
             break;
         }
         const long j = j0 + (lane & 15);
+        bool live = j < jend && j < reach;
+        if constexpr (KEEP) {
+            /* This entry's bit from the lane holding its word; a tile with none kept is skipped
+             * (wave-uniform: lanes L and L^16 hold the same entry). */
+            long wi = live ? (ds_keep_block(a, j) >> 5) - kw0 : 0;
+            wi = wi < 0 ? 0 : (wi > 31 ? 31 : wi);
+            const unsigned wd = (unsigned)__builtin_amdgcn_ds_bpermute((int)wi << 2, (int)kword);
+            live = live && ((wd >> (ds_keep_block(a, j) & 31)) & 1u) != 0u;
+            if (__builtin_amdgcn_ballot_w32(live) == 0u) {
+                if (hf == 1 && j < jend) srow[j * a.scs] = -kDsInf;
+                continue;
+            }
+        }
         const uint16_t* kp = nullptr;
-        if (j < jend && j < reach) {
+        if (live) {
             const long col = (j * a.ratio) / a.cbs;
             if (col < a.nbt) {
                 const long blk = a.bt[(long)s * a.btr + col * a.btc];
@@ -1538,9 +1623,11 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     const long long H = r4d_geti_or(a, "heads", 0), Dm = r4d_geti_or(a, "dim", 0);
     const long long ratio = r4d_geti_or(a, "ratio", 0);
     const long long part = r4d_geti_or(a, "row_part", -1);
+    const long long block = r4d_geti_or(a, "block", 0);
     const float wscale = (float)r4d_getf(a, "wscale", 0.0);
     for (int i = 0; i < 7; ++i)
         if (!a->t[i].data) return R4D_NO(RAD_E_INVAL);
+    const RadTensor* keep = a->n_t > 7 && a->t[7].data ? &a->t[7] : nullptr;
     if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
         w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
@@ -1566,6 +1653,11 @@ int index_score_body(const RadArgs* a, RadStream stream) {
                                                                        : (long)sc.shape[0])
                         : 0;
     const long r0 = Mv > 0 ? row0 : 0;               /* no pointer past the operands */
+    /* keep: a row for each row the run holds (at most the score's), keep_words over its width. */
+    if (keep && (block < 1 || block > INT_MAX || keep->rank != 2 || keep->dtype != RAD_I32 ||
+                 keep->shape[0] < Mv || keep->shape[0] > sc.shape[0] ||
+                 keep->shape[1] != keep_words(sc.shape[1], block) || keep->stride[1] < 1))
+        return R4D_NO(RAD_E_SHAPE);
     DsScoreArgs s{};
     s.q = (const uint16_t*)q.data + r0 * (long)q.stride[0];
     s.w = (const uint16_t*)w.data + r0 * (long)w.stride[0];
@@ -1595,13 +1687,26 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.cbs = (int)kc.shape[2];
     s.slot = (int)(Dm / ratio);
     s.wscale = wscale;
+    s.keep = keep ? (const int*)keep->data : nullptr;
+    s.kr = keep ? (long)keep->stride[0] : 0;
+    s.kcs = keep ? (long)keep->stride[1] : 0;
+    s.block = keep ? (int)block : 1;
+    s.bshift = -1;
+    for (int sh = 0; sh < 31; ++sh)
+        if ((1LL << sh) == (long long)s.block) s.bshift = sh;
     /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band on the scalar
-     * kernel below (libref's bits). */
+     * kernel below (libref's bits). The form is picked by the pass height alone, with or without
+     * keep, so a kept entry's score is the unrestricted op's. */
     if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
         (s.M + 7) / 8 <= 65535) {
+        if (keep) {
+            const dim3 grid((unsigned)((s.C + kIwKeepEB - 1) / kIwKeepEB), (unsigned)((s.M + 7) / 8));
+            if (H > 16) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, true>), grid, dim3(256), 0u, s);
+            return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, true>), grid, dim3(256), 0u, s);
+        }
         const dim3 grid((unsigned)((s.C + kIwEB - 1) / kIwEB), (unsigned)((s.M + 7) / 8));
-        if (H > 16) return R4D_EMIT(stream, ds41_index_score_wm_kernel<2>, grid, dim3(256), 0u, s);
-        return R4D_EMIT(stream, ds41_index_score_wm_kernel<1>, grid, dim3(256), 0u, s);
+        if (H > 16) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, false>), grid, dim3(256), 0u, s);
+        return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, false>), grid, dim3(256), 0u, s);
     }
     /* Head split: more workgroups while the grid is short of the card. The head sum is closed in
      * head order either way, so every split gives the same bits. */

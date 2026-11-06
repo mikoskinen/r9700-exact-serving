@@ -246,13 +246,22 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
  * With `row_part` p, score holds one run of R rows of the step: score row i is query row p R + i
  * of q, w and positions (the whole step's), found in cu_seqlens as that row; a row past the
  * step's rows scores -inf. Each row is the unsplit op's row, so a step scored run by run into one
- * R-row plane is the unsplit score, bit for bit. */
+ * R-row plane is the unsplit score, bit for bit.
+ *
+ * With `keep` (optional, last; index_candidates' bits over blocks of `block`, row i of keep for
+ * score row i: at least the rows the run holds, at most score's), only the kept blocks' positions
+ * are scored and every other position scores -inf without a key read. A kept position's score is
+ * the op's without keep, bit for bit, so index_topk through the same keep selects exactly what it
+ * would from the whole score: the candidate restriction of a layer that reads the candidate
+ * layer's blocks (DeepSeek-V4.1's layers past `candidate_source_layer_id`). */
 int ref_index_score(const RadArgs* a, RadStream) {
     if (!have(a, 7)) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
+    const RadTensor* keep = a->n_t > 7 && a->t[7].data ? &a->t[7] : nullptr;
     const int64_t H = p_int(a, "heads", 0), Dm = p_int(a, "dim", 0), ratio = p_int(a, "ratio", 0);
     const int64_t part = p_int(a, "row_part", -1);
+    const int64_t block = p_int(a, "block", 0);
     const float wscale = p_f32(a, "wscale", 0.0f);
     if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
@@ -263,6 +272,14 @@ int ref_index_score(const RadArgs* a, RadStream) {
         return RAD_E_SHAPE;
     const int64_t Mq = q.shape[0], M = sc.shape[0], C = sc.shape[1], S = numel(&cu) - 1, cbs = kc.shape[2];
     const int64_t row0 = part > 0 ? part * M : 0;
+    /* keep: rows for the rows this run holds (at least min(M, Mq - row0), at most M), one word a
+     * 32 blocks of `block` over score's width. */
+    const int64_t held = row0 < Mq ? std::min(M, Mq - row0) : 0;
+    if (keep && (block < 1 || keep->rank != 2 || keep->shape[0] < held || keep->shape[0] > M ||
+                 keep->shape[1] != ref_keep_words(C, block)))
+        return RAD_E_SHAPE;
+    if (keep && keep->dtype != RAD_I32) return RAD_E_DTYPE;
+    const int64_t KW = keep ? keep->shape[1] : 0;
     const uint32_t dt = q.dtype;
 #pragma omp parallel for schedule(dynamic)
     for (int64_t i = 0; i < M; ++i) {
@@ -277,7 +294,14 @@ int ref_index_score(const RadArgs* a, RadStream) {
         for (int64_t j = 0; j < C; ++j) {
             float v = -INFINITY;
             const int64_t col = (j * ratio) / cbs;
-            if (j < reach && col < bt.shape[1]) {
+            bool kept = true;
+            if (keep && j < reach) {
+                const int64_t b = j / block;
+                const uint32_t wd = (uint32_t)ld_int(keep->dtype, keep->data,
+                                                     rowoff(keep, i, KW) + (b / 32) * laststride(keep));
+                kept = ((wd >> (b % 32)) & 1u) != 0;
+            }
+            if (kept && j < reach && col < bt.shape[1]) {
                 const int64_t blk = ld_int(bt.dtype, bt.data, rowoff(&bt, s, bt.shape[1]) + col * laststride(&bt));
                 if (blk >= 0 && blk < kc.shape[0]) {
                     const int64_t ko = (blk * cbs + (j * ratio) % cbs) * (Dm / ratio);

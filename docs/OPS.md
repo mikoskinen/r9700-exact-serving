@@ -979,7 +979,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
 | `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
-| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score` |
+| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
 | `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
 | `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
 | `entry_store` | `M`(range) `n` `block_size` `dtype` | `x`, `page`, `cache`:inout |
@@ -1027,7 +1027,13 @@ row, and a row past the step scores `-inf` everywhere. Every row is the unsplit 
 equal height score the step bit for bit. `keep` lives from the candidate layer to the last layer that
 reads it, for every row of the step, so it is one bit a block: i32 `[M, ceil(ceil(width / block) /
 32)]`, bit `b % 32` of word `b / 32` set when block `b` is kept and the bits past the last block 0.
-`index_topk` reads it with the same `block`.
+`index_topk` reads it with the same `block`. `index_score` may read it too (the candidate
+restriction): with `keep` and `block`, keep row `i` for score row `i` (at least the rows the run
+holds, at most score's), only the kept blocks' positions are scored and every other position scores
+`-inf` without a key read. A kept position's score is the unrestricted op's, bit for bit, so
+`index_topk` through the same keep selects exactly what it selects from the unrestricted score: a
+layer past the candidate layer then scores at most `topk_blocks * block` positions a row instead of
+the whole context.
 
 **`attn_dense`** serves vision towers and encoders: nothing paged, `cu_seqlens` bounding one image
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a

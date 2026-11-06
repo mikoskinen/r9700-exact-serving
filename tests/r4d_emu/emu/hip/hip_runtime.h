@@ -11,6 +11,9 @@
 #include <tuple>
 #include <vector>
 
+/* a unit that names its dynamic LDS at file scope (extern __shared__, which the host lacks) reads
+ * the launch's instead when this is defined (r4d_ds41_sparse.hip) */
+#define R4D_EMU_HOST 1
 #define __global__
 #define __device__
 #define __host__
@@ -338,6 +341,13 @@ inline uchar4 make_uchar4(unsigned char a, unsigned char b, unsigned char c, uns
 typedef float emu_v2f __attribute__((ext_vector_type(2)));
 emu_v2f emu_cvt_pk_f32_fp8(int w, bool hi);
 #define __builtin_amdgcn_cvt_pk_f32_fp8(w, hi) emu_cvt_pk_f32_fp8((w), (hi))
+/* the double <-> 64-bit reinterpretations (r4d_ds41_sparse.hip's expf) */
+inline long long __double_as_longlong(double d) { long long u; std::memcpy(&u, &d, 8); return u; }
+inline double __longlong_as_double(long long u) { double d; std::memcpy(&d, &u, 8); return d; }
+/* s_barrier's wave-scope form, after a wavefront fence: here a cross-lane op, so a wave barrier */
+#define __builtin_amdgcn_wave_barrier() ((void)emu_ballot(true))
+/* v_exp_f32: 2^x within an ulp on the card; exp2 here (no test compares it with a host value) */
+#define __builtin_amdgcn_exp2f(x) std::exp2((float)(x))
 /* a system-scope fence orders nothing more between fibers on one thread */
 inline void __threadfence_system() {}
 /* every copy completes before it returns, as every launch does */

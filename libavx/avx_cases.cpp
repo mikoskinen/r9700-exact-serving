@@ -1293,6 +1293,12 @@ std::vector<Case> build_cases() {
         add("index_score", { HI("M", 4), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
                              HI("width", 13), HF("wscale", 0.25), HS("dtype", dt),
                              HI("row_part", 2) });
+        /* The candidate restriction (keep over blocks of 2 / 3 positions), alone and in a run. */
+        add("index_score", { HI("M", 9), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                             HI("width", 13), HF("wscale", 0.25), HS("dtype", dt), HI("block", 2) });
+        add("index_score", { HI("M", 4), HI("heads", 4), HI("dim", 64), HI("ratio", 4),
+                             HI("width", 13), HF("wscale", 0.25), HS("dtype", dt),
+                             HI("row_part", 2), HI("block", 3) });
         add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
         add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
                                  HF("gate_eps", 1e-6), HS("dtype", dt) });

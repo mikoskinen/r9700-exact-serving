@@ -308,13 +308,17 @@ AVX_KERNEL(attn_sparse_sink) {
  * sum in f32 rounded. The row's queries and head weights are read once; each live position's key
  * is widened once and dotted with every head. With `row_part` p, score holds one run of R rows:
  * score row i is step row p R + i of q, w, positions and cu_seqlens, and a row past the step
- * scores -inf, as in libref. */
+ * scores -inf, as in libref. With `keep` (index_candidates' bits over blocks of `block`, keep row
+ * i for score row i), only the kept blocks' positions are scored and the rest score -inf without
+ * a key read, as in libref. */
 AVX_KERNEL(index_score) {
     if (!rad_args_have(a, 7)) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
+    const RadTensor* keep = a->n_t > 7 && a->t[7].data ? &a->t[7] : nullptr;
     const int64_t H = p_int(a, "heads", 0), Dm = p_int(a, "dim", 0), ratio = p_int(a, "ratio", 0);
     const int64_t part = p_int(a, "row_part", -1);
+    const int64_t block = p_int(a, "block", 0);
     const float wscale = p_f32(a, "wscale", 0.0f);
     if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
@@ -325,6 +329,12 @@ AVX_KERNEL(index_score) {
         return RAD_E_SHAPE;
     const int64_t Mq = q.shape[0], M = sc.shape[0], C = sc.shape[1], S = numel(&cu) - 1;
     const int64_t cbs = kc.shape[2], row0 = part > 0 ? part * M : 0;
+    const int64_t held = row0 < Mq ? std::min(M, Mq - row0) : 0;
+    if (keep && (block < 1 || keep->rank != 2 || keep->shape[0] < held || keep->shape[0] > M ||
+                 keep->shape[1] != (((C + block - 1) / block + 31) / 32)))
+        return RAD_E_SHAPE;
+    if (keep && keep->dtype != RAD_I32) return RAD_E_DTYPE;
+    const int64_t KW = keep ? keep->shape[1] : 0;
     const uint32_t dt = q.dtype;
     const bool exact = dt == RAD_F32;
     AVX_PARALLEL_FOR_IF(M * C * H * Dm >= AVX_PAR_MIN)
@@ -350,7 +360,13 @@ AVX_KERNEL(index_score) {
         for (int64_t j = 0; j < C; ++j) {
             float v = -INFINITY;
             const int64_t col = (j * ratio) / cbs;
-            if (j < reach && col < bt.shape[1]) {
+            bool kept = true;
+            if (keep && j < reach) {
+                const int64_t b = j / block;
+                const uint32_t wd = (uint32_t)ldi(keep, rowoff(keep, i, KW) + (b / 32) * laststride(keep));
+                kept = ((wd >> (b % 32)) & 1u) != 0;
+            }
+            if (kept && j < reach && col < bt.shape[1]) {
                 const int64_t blk = ldi(&bt, rowoff(&bt, s, bt.shape[1]) + col * laststride(&bt));
                 if (blk >= 0 && blk < kc.shape[0]) {
                     widen_flat(kc, (blk * cbs + (j * ratio) % cbs) * (Dm / ratio), Dm, kv);

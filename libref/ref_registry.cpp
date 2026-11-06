@@ -501,9 +501,10 @@ static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"),
     OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
     WGT("sinks"), OUT("out") };
 static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part") };
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
+    P_INTO("block") };
 static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
-    OPD("positions"), OPD("cu_seqlens"), OUT("score") };
+    OPD("positions"), OPD("cu_seqlens"), OUT("score"), OPD_O("keep") };
 static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
 static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
@@ -1602,7 +1603,9 @@ static const RadOpSchema kSchemas[] = {
   "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
   "rounded once to dtype. "
   "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]. With row_part "
-  "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf)." },
+  "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf). With "
+  "keep (index_candidates' bits over blocks of `block`, keep row i for score row i) only the kept "
+  "blocks are scored, the rest -inf unread; a kept score is the unkept op's, bit for bit." },
 { "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
   "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
   "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is a bit a "
