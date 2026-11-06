@@ -313,7 +313,7 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
     const int layer = nx.layer;
     if (rows <= 0 || rows > kXpMaxRows || nx.top_k <= 0 || nx.top_k > kXpMaxK || nx.n_expert <= 0 ||
         nx.n_expert > kXpMaxNe || nx.n_parts <= 0 || nx.n_parts > kXpParts || !nx.parts || n_embd % 256 ||
-        n_embd > 4096 || layer < 0 || layer >= (int)x.layers.size())
+        n_embd > kXpMaxEmbd || layer < 0 || layer >= (int)x.layers.size())
         return RAD_OK;
     XpLayer& L = x.layers[(size_t)layer];
     if (!L.bound) {

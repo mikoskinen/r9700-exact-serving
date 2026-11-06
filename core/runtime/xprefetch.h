@@ -35,6 +35,7 @@ constexpr int kXpMaxK     = 16;
 constexpr int kXpMaxNe    = 512;
 constexpr int kXpMaxPools = 4;
 constexpr int kXpParts    = 4;    /* the weights one expert's unit is made of */
+constexpr int64_t kXpMaxEmbd = 4096; /* the widest router input xp_logits takes; wider, no prediction ever runs */
 
 /* One copied unit: its table entries, what they held and what they hold while patched, and where the
  * layer's routing counts say whether the step used it. */

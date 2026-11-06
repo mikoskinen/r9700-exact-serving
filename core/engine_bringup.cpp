@@ -1779,7 +1779,8 @@ int Engine::plan() {
              * pool, not --deterministic, and a spare DMA engine (asked before the free reading
              * below, so its queue is already counted there). */
             if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic &&
-                (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device)) {
+                (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device) &&
+                meta_.n_embd <= kXpMaxEmbd) {
                 /* Routed layers counted as Ctx::bind_routing does, including a head past the trunk. */
                 int64_t nl = r->program.meta.n_layers;
                 for (const WeightInfo& w : r->program.weights)
@@ -4045,7 +4046,13 @@ int Engine::start() {
     /* The next-layer expert prefetch, wherever experts sit in a pinned pool for routed GEMMs to
      * read over the link (core/runtime/xprefetch.h). Its stream and ring are in the VRAM budget
      * (xp_device_bytes, Engine::plan). Off under --deterministic. */
-    if (!cfg_.deterministic)
+    /* A model wider than the predictor takes (kXpMaxEmbd) never predicts (Ctx::xp_predict_run), so its
+     * ring, stream, DMA queue and thread would sit idle; an idle fourth stream costs decode time on
+     * RDNA4 (Mover::stream). Not opened there, and not counted in the VRAM budget (Engine::plan). */
+    if (!cfg_.deterministic && meta_.n_embd > kXpMaxEmbd)
+        RAD_INFO("expert prefetch off: n_embd %lld is wider than its predictor takes (%lld), so no ring, "
+                 "stream or DMA queue is opened for it", (long long)meta_.n_embd, (long long)kXpMaxEmbd);
+    if (!cfg_.deterministic && meta_.n_embd <= kXpMaxEmbd)
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];
