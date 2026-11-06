@@ -150,25 +150,88 @@ __device__ __forceinline__ bool ds_kept(const DsScoreArgs& a, const int* krow, l
     const long b = ds_keep_block(a, j);
     return (((unsigned)krow[(b >> 5) * a.kcs] >> (b & 31)) & 1u) != 0u;
 }
-/* Is any position of [j0, j1) kept (j0 < j1): the row's words over the blocks the span touches,
- * masked to those blocks. The arguments are uniform where the callers use it, so the loads are
- * scalar and the answer is uniform. */
-__device__ __forceinline__ bool ds_keep_any(const DsScoreArgs& a, const int* krow, long j0, long j1) {
-    const long b0 = ds_keep_block(a, j0), b1 = ds_keep_block(a, j1 - 1);
-    for (long w = b0 >> 5; w <= (b1 >> 5); ++w) {
-        unsigned bits = (unsigned)krow[w * a.kcs];
-        const long lo = b0 > (w << 5) ? b0 - (w << 5) : 0, hi = b1 < (w << 5) + 31 ? b1 - (w << 5) : 31;
-        bits &= (hi >= 31 ? ~0u : ((2u << hi) - 1u)) & (~0u << lo);
-        if (bits) return true;
+/* Position j's index key in row m's sequence s, or null (past the row's reach or C, an unmapped or
+ * out-of-range block). */
+__device__ __forceinline__ const uint16_t* ds_entry_key(const DsScoreArgs& a, int s, long j, long reach) {
+    if (j >= a.C || j >= reach) return nullptr;
+    const long col = (j * a.ratio) / a.cbs;
+    if (col >= a.nbt) return nullptr;
+    const long blk = a.bt[(long)s * a.btr + col * a.btc];
+    if (blk < 0 || blk >= a.nblk) return nullptr;
+    return a.kc + (blk * a.cbs + (j * a.ratio) % a.cbs) * (long)a.slot;
+}
+
+/* One entry's score from its key kp (null: none): the dot in d order rounded to bf16, relu x the
+ * rounded head weight, rounded, summed in head order -- this wave's heads [h0, h1); with HS > 1 the
+ * waves' slices meet in `part` ([H][EPB]) and wave sub 0 closes the sum in head order. Called
+ * block-uniformly (HS > 1 holds two barriers). Sub 0's result is the entry's f32 sum (before the
+ * final rounding). */
+template <int HS>
+__device__ __forceinline__ float ds_score_entry(const DsScoreArgs& a, long m, const uint16_t* kp, float* part,
+                                                int e, int sub, int h0, int h1) {
+    constexpr int DM = 128, EPB = 256 / HS;
+    float acc = 0.0f;
+    if (kp) {
+        float k[DM];
+#pragma unroll
+        for (int c = 0; c < DM / 8; ++c) {
+            const uint4 v = *(const uint4*)(kp + c * 8);
+            k[c * 8 + 0] = bf16w_lo(v.x); k[c * 8 + 1] = bf16w_hi(v.x);
+            k[c * 8 + 2] = bf16w_lo(v.y); k[c * 8 + 3] = bf16w_hi(v.y);
+            k[c * 8 + 4] = bf16w_lo(v.z); k[c * 8 + 5] = bf16w_hi(v.z);
+            k[c * 8 + 6] = bf16w_lo(v.w); k[c * 8 + 7] = bf16w_hi(v.w);
+        }
+        const uint32_t* qrow = (const uint32_t*)(a.q + m * a.qr);
+        const uint16_t* wrow = a.w + m * a.wr;
+        for (int h = h0; h < h1; h += 4) {
+            const int nh = min(4, h1 - h);
+            const uint32_t* q0 = qrow + (long)h * (DM / 2);
+            const uint32_t* q1 = qrow + (long)(nh > 1 ? h + 1 : h) * (DM / 2);
+            const uint32_t* q2 = qrow + (long)(nh > 2 ? h + 2 : h) * (DM / 2);
+            const uint32_t* q3 = qrow + (long)(nh > 3 ? h + 3 : h) * (DM / 2);
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#pragma unroll
+            for (int i = 0; i < DM / 2; ++i) {
+                const uint32_t w0 = q0[i], w1 = q1[i], w2 = q2[i], w3 = q3[i];
+                d0 = __builtin_fmaf(bf16w_lo(w0), k[2 * i], d0);
+                d1 = __builtin_fmaf(bf16w_lo(w1), k[2 * i], d1);
+                d2 = __builtin_fmaf(bf16w_lo(w2), k[2 * i], d2);
+                d3 = __builtin_fmaf(bf16w_lo(w3), k[2 * i], d3);
+                d0 = __builtin_fmaf(bf16w_hi(w0), k[2 * i + 1], d0);
+                d1 = __builtin_fmaf(bf16w_hi(w1), k[2 * i + 1], d1);
+                d2 = __builtin_fmaf(bf16w_hi(w2), k[2 * i + 1], d2);
+                d3 = __builtin_fmaf(bf16w_hi(w3), k[2 * i + 1], d3);
+            }
+            const float dd[4] = { d0, d1, d2, d3 };
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                if (u >= nh) break;
+                const int hh = h + u;
+                const float dot = ds_round_bf16(dd[u]);
+                const float wh = ds_round_bf16(ds_bf(wrow[(long)hh * a.wc]) * a.wscale);
+                const float c = ds_round_bf16((dot < 0.0f ? 0.0f : dot) * wh);
+                if (HS == 1) acc = acc + c;
+                else part[hh * EPB + e] = c;
+            }
+        }
     }
-    return false;
+    if (HS > 1) {
+        __syncthreads();
+        if (sub == 0 && kp) {
+            acc = 0.0f;
+            for (int hh = 0; hh < a.H; ++hh) acc = acc + part[hh * EPB + e];
+        }
+        __syncthreads();
+    }
+    return acc;
 }
 
 /* One thread an entry; HS waves of a block share 32 entries, each wave a slice of the heads (its
- * q then uniform, read through scalar loads). A thread holds its key as 128 floats. */
+ * q then uniform, read through scalar loads). A thread holds its key as 128 floats. Without keep
+ * (the candidate restriction takes ds41_index_score_kept_kernel below). */
 template <int HS>
 __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
-    constexpr int DM = 128, EPB = 256 / HS;
+    constexpr int EPB = 256 / HS;
     float* part = (float*)r4d_ds41_sparse_dyn;       /* [H][EPB], HS > 1 */
     /* The wave index through readfirstlane, so a wave's head slice (and its q) is provably uniform
      * and q stays in scalar loads. */
@@ -184,77 +247,142 @@ __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
             if (sub == 0 && j < a.C) srow[j * a.scs] = -kDsInf;
             continue;
         }
-        /* keep: m < Mv here (reach > 0). A block of entries none of which is kept scores -inf
-         * without a key read (block-uniform: jb, reach and the row's words are). */
-        const int* krow = a.keep ? a.keep + m * a.kr : nullptr;
-        if (krow && !ds_keep_any(a, krow, jb, min(min(jb + (long)EPB, reach), (long)a.C))) {
-            if (sub == 0 && j < a.C) srow[j * a.scs] = -kDsInf;
-            continue;
-        }
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
-        const uint16_t* kp = nullptr;
-        if (j < a.C && j < reach && (!krow || ds_kept(a, krow, j))) {
-            const long col = (j * a.ratio) / a.cbs;
-            if (col < a.nbt) {
-                const long blk = a.bt[(long)s * a.btr + col * a.btc];
-                if (blk >= 0 && blk < a.nblk)
-                    kp = a.kc + (blk * a.cbs + (j * a.ratio) % a.cbs) * (long)a.slot;
-            }
-        }
-        float acc = 0.0f;
-        if (kp) {
-            float k[DM];
-#pragma unroll
-            for (int c = 0; c < DM / 8; ++c) {
-                const uint4 v = *(const uint4*)(kp + c * 8);
-                k[c * 8 + 0] = bf16w_lo(v.x); k[c * 8 + 1] = bf16w_hi(v.x);
-                k[c * 8 + 2] = bf16w_lo(v.y); k[c * 8 + 3] = bf16w_hi(v.y);
-                k[c * 8 + 4] = bf16w_lo(v.z); k[c * 8 + 5] = bf16w_hi(v.z);
-                k[c * 8 + 6] = bf16w_lo(v.w); k[c * 8 + 7] = bf16w_hi(v.w);
-            }
-            const uint32_t* qrow = (const uint32_t*)(a.q + m * a.qr);
-            const uint16_t* wrow = a.w + m * a.wr;
-            for (int h = h0; h < h1; h += 4) {
-                const int nh = min(4, h1 - h);
-                const uint32_t* q0 = qrow + (long)h * (DM / 2);
-                const uint32_t* q1 = qrow + (long)(nh > 1 ? h + 1 : h) * (DM / 2);
-                const uint32_t* q2 = qrow + (long)(nh > 2 ? h + 2 : h) * (DM / 2);
-                const uint32_t* q3 = qrow + (long)(nh > 3 ? h + 3 : h) * (DM / 2);
-                float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-#pragma unroll
-                for (int i = 0; i < DM / 2; ++i) {
-                    const uint32_t w0 = q0[i], w1 = q1[i], w2 = q2[i], w3 = q3[i];
-                    d0 = __builtin_fmaf(bf16w_lo(w0), k[2 * i], d0);
-                    d1 = __builtin_fmaf(bf16w_lo(w1), k[2 * i], d1);
-                    d2 = __builtin_fmaf(bf16w_lo(w2), k[2 * i], d2);
-                    d3 = __builtin_fmaf(bf16w_lo(w3), k[2 * i], d3);
-                    d0 = __builtin_fmaf(bf16w_hi(w0), k[2 * i + 1], d0);
-                    d1 = __builtin_fmaf(bf16w_hi(w1), k[2 * i + 1], d1);
-                    d2 = __builtin_fmaf(bf16w_hi(w2), k[2 * i + 1], d2);
-                    d3 = __builtin_fmaf(bf16w_hi(w3), k[2 * i + 1], d3);
-                }
-                const float dd[4] = { d0, d1, d2, d3 };
-#pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    if (u >= nh) break;
-                    const int hh = h + u;
-                    const float dot = ds_round_bf16(dd[u]);
-                    const float wh = ds_round_bf16(ds_bf(wrow[(long)hh * a.wc]) * a.wscale);
-                    const float c = ds_round_bf16((dot < 0.0f ? 0.0f : dot) * wh);
-                    if (HS == 1) acc = acc + c;
-                    else part[hh * EPB + e] = c;
-                }
-            }
-        }
-        if (HS > 1) {
-            __syncthreads();
-            if (sub == 0 && kp) {
-                acc = 0.0f;
-                for (int hh = 0; hh < a.H; ++hh) acc = acc + part[hh * EPB + e];
-            }
-            __syncthreads();
-        }
+        const uint16_t* kp = ds_entry_key(a, s, j, reach);
+        const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
         if (sub == 0 && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+    }
+}
+
+/* ---- the candidate restriction over the kept blocks only (index_score's decode band and
+ * index_topk): a row's keep words below its reach, their kept blocks ranked in block order. */
+
+/* Word w of a row's keep, masked to its blocks below nb. */
+__device__ __forceinline__ uint32_t ds_keep_word(const int* krow, long kcs, long w, long nb) {
+    uint32_t bits = (uint32_t)krow[w * kcs];
+    const long lo = w << 5;
+    if (lo + 32 > nb) bits &= nb - lo >= 32 ? ~0u : ((1u << (uint32_t)(nb - lo)) - 1u);
+    return bits;
+}
+
+/* A block-wide exclusive scan of NT threads (NT a multiple of 32, at most 1024); *total is the
+ * sum. ws holds 33 words. Ends on a barrier. */
+template <int NT>
+__device__ __forceinline__ uint32_t ds_excl_scan(uint32_t v, uint32_t* ws, uint32_t* total) {
+    constexpr int NW = NT / 32;
+    static_assert(NT % 32 == 0 && NW <= 32, "a block of 32 waves at most");
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const uint32_t inc = r4d_wave_prefix_u32(v, lane);
+    if (lane == 31) ws[wave] = inc;
+    __syncthreads();
+    if (wave == 0) {
+        const uint32_t w = lane < NW ? ws[lane] : 0u;
+        const uint32_t wi = r4d_wave_prefix_u32(w, lane);
+        if (lane < NW) ws[lane] = wi - w;
+        if (lane == 31) ws[32] = wi;
+    }
+    __syncthreads();
+    const uint32_t r = ws[wave] + inc - v;
+    *total = ws[32];
+    __syncthreads();
+    return r;
+}
+
+/* Thread t's share of a row's keep words below nb blocks: words [t W, t W + W), W = ceil(nw / NT). */
+template <int NT>
+struct DsKeptScan {
+    long w0, w1;                                     /* this thread's words */
+    uint32_t off;                                    /* kept blocks before them (block order) */
+    uint32_t total;                                  /* the row's kept blocks below nb */
+};
+
+template <int NT>
+__device__ __forceinline__ DsKeptScan<NT> ds_kept_scan(const int* krow, long kcs, long nb, uint32_t* ws) {
+    DsKeptScan<NT> k;
+    const long nw = (nb + 31) >> 5, per = (nw + NT - 1) / NT;
+    k.w0 = (long)threadIdx.x * per;
+    k.w1 = k.w0 + per < nw ? k.w0 + per : nw;
+    uint32_t c = 0;
+    for (long w = k.w0; w < k.w1; ++w) c += (uint32_t)__builtin_popcount(ds_keep_word(krow, kcs, w, nb));
+    k.off = ds_excl_scan<NT>(c, ws, &k.total);
+    return k;
+}
+
+/* The kept blocks of rank [r0, r0 + n) to list[rank - r0], in block order. The caller's barrier
+ * publishes the list. */
+template <int NT>
+__device__ __forceinline__ void ds_kept_list(const DsKeptScan<NT>& k, const int* krow, long kcs, long nb,
+                                             uint32_t r0, uint32_t n, uint32_t* list) {
+    uint32_t r = k.off;
+    for (long w = k.w0; w < k.w1 && r < r0 + n; ++w) {
+        uint32_t bits = ds_keep_word(krow, kcs, w, nb);
+        const uint32_t c = (uint32_t)__builtin_popcount(bits);
+        if (r + c <= r0) { r += c; continue; }       /* the whole word is before the range */
+        while (bits) {
+            const uint32_t b = (uint32_t)__builtin_ctz(bits);
+            bits &= bits - 1u;
+            if (r >= r0 && r < r0 + n) list[r - r0] = (uint32_t)(w << 5) + b;
+            ++r;
+        }
+    }
+}
+
+/* kDsKeptEst: kept positions a row is expected to hold (DeepSeek-V4.1: 2048 blocks of 8), which
+ * sizes the kept kernel's grid and head split -- any grid gives the same bits. kDsKeptSpan: the
+ * kept blocks a workgroup's entries can touch, EPB / block + 2 at block >= 1. */
+constexpr long kDsKeptEst = 16384;
+constexpr int kDsKeptSpan = 258;
+
+/* index_score with keep on the scalar kernel's arithmetic (the decode band, and any pass the WMMA
+ * form does not take): a row's kept positions below its reach are compacted (block order, then
+ * position order) and dealt EPB to a workgroup over a grid-stride loop, so the work is the kept
+ * count's, not the context's. A kept entry runs ds_score_entry exactly as the unrestricted kernel
+ * does (same bits); every other position of the row, to C, is written -inf by a sweep the grid
+ * shares. */
+template <int HS>
+__global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs a) {
+    constexpr int EPB = 256 / HS;
+    float* part = (float*)r4d_ds41_sparse_dyn;       /* [H][EPB], HS > 1 */
+    __shared__ uint32_t ws[33];
+    __shared__ uint32_t list[kDsKeptSpan];
+    const int lane = threadIdx.x & 31, wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
+    const int grp = wave / HS, sub = wave % HS;
+    const int e = grp * 32 + lane;
+    const int hp = (a.H + HS - 1) / HS, h0 = sub * hp, h1 = min(a.H, h0 + hp);
+    const long block = a.block;
+    for (long m = blockIdx.y; m < a.M; m += gridDim.y) {
+        float* srow = a.sc + m * a.sr;
+        const long reach = m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
+        const int* krow = reach > 0 ? a.keep + m * a.kr : nullptr;
+        /* the sweep: positions [x C / G, (x + 1) C / G) of this workgroup, -inf unless kept below reach */
+        {
+            const long g = gridDim.x, x = blockIdx.x;
+            const long p0 = (long)a.C * x / g, p1 = (long)a.C * (x + 1) / g;
+            for (long j = p0 + threadIdx.x; j < p1; j += 256)
+                if (j >= reach || !ds_kept(a, krow, j)) srow[j * a.scs] = -kDsInf;
+        }
+        if (reach <= 0) continue;                    /* block-uniform */
+        const long nbr = (reach < a.C ? reach : (long)a.C) + block - 1;
+        const long nb = nbr / block;                 /* blocks holding a passed position */
+        const DsKeptScan<256> ks = ds_kept_scan<256>(krow, a.kcs, nb, ws);
+        const long nk = (long)ks.total * block;      /* compacted entries (some past reach) */
+        const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
+        for (long x0 = (long)blockIdx.x * EPB; x0 < nk; x0 += (long)gridDim.x * EPB) {
+            const long r0 = x0 / block, r1 = (x0 + EPB - 1) / block + 1;   /* ranks [r0, r1) */
+            const long rn = (r1 < (long)ks.total ? r1 : (long)ks.total) - r0;
+            ds_kept_list<256>(ks, krow, a.kcs, nb, (uint32_t)r0, (uint32_t)rn, list);
+            __syncthreads();
+            const long x = x0 + e;
+            long j = -1;
+            if (x < nk) {
+                const long r = x / block;
+                j = (long)list[r - r0] * block + (x - r * block);
+            }
+            const uint16_t* kp = j >= 0 ? ds_entry_key(a, s, j, reach) : nullptr;
+            const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
+            if (sub == 0 && j >= 0 && j < reach && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+            __syncthreads();                         /* the list is rewritten next round */
+        }
     }
 }
 
@@ -402,14 +530,14 @@ __device__ void ds_emit(const Get& get, uint32_t n, const uint32_t* cache, DsSel
 
 /* ------------------------------------------------------------------ index_topk */
 /* keep: index_candidates' bits, a bit a block of `block` positions (bshift = log2(block) when
- * block is a power of two, else -1). */
+ * block is a power of two, else -1). kept: walk only the kept blocks (keep given, block <= 2^16). */
 struct DsTopkArgs {
     const float* sc;
     const int* keep;
     const int* pos;
     int* sel;
     long sr, scs, kr, kcs, ps, selr, selc;
-    int M, C, K, ratio, block, bshift;
+    int M, C, K, ratio, block, bshift, kept;
 };
 
 __device__ __forceinline__ long ds_topk_reach(const DsTopkArgs& a, long m) {
@@ -424,6 +552,7 @@ struct DsTopkKey {
     const int* krow;
     long scs, kcs, j0;
     int block, bshift;
+    __device__ __forceinline__ long pos(uint32_t i) const { return j0 + (long)i; }
     __device__ __forceinline__ uint32_t operator()(uint32_t i) const {
         const long j = j0 + (long)i;
         if (krow) {
@@ -435,50 +564,128 @@ struct DsTopkKey {
     }
 };
 
+/* The same keys over the kept blocks only: entry i is offset i % block of the (i / block)-th
+ * listed block (list: kept blocks in block order). Positions keep their order, so (key desc, index
+ * asc) over these entries is (key desc, position asc) over the row's candidates -- the selection
+ * DsTopkKey makes over [0, reach), whose other positions are not candidates. Past reach (in the
+ * last kept block) an entry is not a candidate either. */
+struct DsKeptKey {
+    const float* row;
+    const uint32_t* list;
+    long scs, reach;
+    int block, bshift;
+    __device__ __forceinline__ long pos(uint32_t i) const {
+        const uint32_t r = bshift >= 0 ? i >> bshift : i / (uint32_t)block;
+        return (long)list[r] * block + (long)(i - r * (uint32_t)block);
+    }
+    __device__ __forceinline__ uint32_t operator()(uint32_t i) const {
+        const long j = pos(i);
+        if (j >= reach) return 0u;
+        const float v = row[j * scs];
+        return v > -kDsInf ? ds_key(v) : 0u;
+    }
+};
+
+/* kDsKeptMax: kept blocks of a row index_topk lists in LDS (a row with more walks its positions). */
+constexpr int kDsKeptMax = 4096;
+
+/* One row's top-K into srow: the selection over n keys of `get`, positions in order, -1 after. */
+template <class Get>
+__device__ __forceinline__ void ds_topk_row(const Get& get, uint32_t n, uint32_t* cache, DsSelShared* s,
+                                            int* srow, long selc, int K) {
+    uint32_t* c = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
+    ds_select(get, n, (uint32_t)K, c, s);
+    ds_emit(get, n, c, s,
+            [&](uint32_t i, bool take, uint32_t out) { if (take) srow[(long)out * selc] = (int)get.pos(i); },
+            [&](uint32_t tot) {
+                for (long t = (long)tot + threadIdx.x; t < K; t += kDsSelThreads) srow[t * selc] = -1;
+            });
+    __syncthreads();
+}
+
 __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_kernel(DsTopkArgs a) {
     __shared__ DsSelShared s;
     __shared__ uint32_t cache[kDsCache];
+    __shared__ uint32_t list[kDsKeptMax];
     for (long m = blockIdx.x; m < a.M; m += gridDim.x) {
         const uint32_t n = (uint32_t)ds_topk_reach(a, m);
-        const DsTopkKey get{ a.sc + m * a.sr, a.keep ? a.keep + m * a.kr : nullptr, a.scs, a.kcs, 0,
-                             a.block, a.bshift };
-        uint32_t* c = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
-        ds_select(get, n, (uint32_t)a.K, c, &s);
+        const int* krow = a.keep ? a.keep + m * a.kr : nullptr;
         int* srow = a.sel + m * a.selr;
-        const long selc = a.selc;
-        const int K = a.K;
-        ds_emit(get, n, c, &s,
-                [&](uint32_t i, bool take, uint32_t out) { if (take) srow[(long)out * selc] = (int)i; },
-                [&](uint32_t tot) {
-                    for (long t = (long)tot + threadIdx.x; t < K; t += kDsSelThreads) srow[t * selc] = -1;
-                });
-        __syncthreads();
+        if (krow && a.kept) {                        /* the kept blocks only, when they fit the list */
+            const long nb = ((long)n + a.block - 1) / a.block;
+            const DsKeptScan<kDsSelThreads> ks = ds_kept_scan<kDsSelThreads>(krow, a.kcs, nb, s.ws);
+            if (ks.total <= (uint32_t)kDsKeptMax) {  /* block-uniform */
+                ds_kept_list<kDsSelThreads>(ks, krow, a.kcs, nb, 0u, ks.total, list);
+                __syncthreads();
+                const DsKeptKey get{ a.sc + m * a.sr, list, a.scs, (long)n, a.block, a.bshift };
+                ds_topk_row(get, ks.total * (uint32_t)a.block, cache, &s, srow, a.selc, a.K);
+                continue;
+            }
+        }
+        const DsTopkKey get{ a.sc + m * a.sr, krow, a.scs, a.kcs, 0, a.block, a.bshift };
+        ds_topk_row(get, n, cache, &s, srow, a.selc, a.K);
     }
 }
 
 /* The decode form over long rows. Stage 1: each (chunk, row) keeps its chunk's exact top-K as
  * (key << 32 | position), in position order, and its count. A row's winner is among its chunk's
- * K best, so stage 2's top-K over the chunks in order (position order again) is the row's. */
+ * K best, so stage 2's top-K over the chunks in order (position order again) is the row's.
+ * With kept (keep, every chunk's list fitting, see index_topk_body): the chunks deal the row's kept
+ * blocks instead of its positions -- `used[m]` chunks of ceil(kept / used) blocks each, used the
+ * fewest that keeps a chunk within kDsKeptChunk entries (at most nch) -- and stage 2 merges only
+ * the used chunks. Without kept, used[m] = nch. */
+constexpr int kDsKeptChunk = 2048;
+
 struct DsSplitArgs {
     DsTopkArgs t;
     unsigned long long* cand;
     int* cnt;
+    int* used;
     int nch, chunk;
 };
 
 __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_split1_kernel(DsSplitArgs a) {
     __shared__ DsSelShared s;
     __shared__ uint32_t cache[kDsCache];
+    __shared__ uint32_t list[kDsKeptMax];
     const int c = blockIdx.x;
     const long m = blockIdx.y;
-    const long j0 = (long)c * a.chunk;
-    long n = ds_topk_reach(a.t, m) - j0;
-    n = n < 0 ? 0 : (n > a.chunk ? a.chunk : n);
-    const DsTopkKey get{ a.t.sc + m * a.t.sr, a.t.keep ? a.t.keep + m * a.t.kr : nullptr, a.t.scs,
-                         a.t.kcs, j0, a.t.block, a.t.bshift };
-    ds_select(get, (uint32_t)n, (uint32_t)a.t.K, cache, &s);
+    const long reach = ds_topk_reach(a.t, m);
     unsigned long long* out = a.cand + (m * a.nch + c) * (long)a.t.K;
     int* cnt = a.cnt + m * a.nch + c;
+    const int* krow = a.t.keep ? a.t.keep + m * a.t.kr : nullptr;
+    if (krow && a.t.kept) {
+        const long block = a.t.block, nb = (reach + block - 1) / block;
+        const DsKeptScan<kDsSelThreads> ks = ds_kept_scan<kDsSelThreads>(krow, a.t.kcs, nb, s.ws);
+        const long nk = ks.total;
+        long used = (nk * block + kDsKeptChunk - 1) / kDsKeptChunk;
+        used = used < a.nch ? used : a.nch;
+        const long per = used > 0 ? (nk + used - 1) / used : 0;   /* blocks a chunk */
+        const long r0 = (long)c * per, rn = c < used ? (nk - r0 < per ? nk - r0 : per) : 0;
+        if (c == 0 && threadIdx.x == 0) a.used[m] = (int)used;
+        if (rn <= 0) {                               /* block-uniform */
+            if (threadIdx.x == 0) *cnt = 0;
+            return;
+        }
+        ds_kept_list<kDsSelThreads>(ks, krow, a.t.kcs, nb, (uint32_t)r0, (uint32_t)rn, list);
+        __syncthreads();
+        const DsKeptKey get{ a.t.sc + m * a.t.sr, list, a.t.scs, reach, a.t.block, a.t.bshift };
+        const uint32_t n = (uint32_t)(rn * block);
+        uint32_t* cc = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
+        ds_select(get, n, (uint32_t)a.t.K, cc, &s);
+        ds_emit(get, n, cc, &s,
+                [&](uint32_t i, bool take, uint32_t o) {
+                    if (take) out[o] = ((unsigned long long)get(i) << 32) | (unsigned long long)(uint32_t)get.pos(i);
+                },
+                [&](uint32_t tot) { if (threadIdx.x == 0) *cnt = (int)tot; });
+        return;
+    }
+    if (c == 0 && threadIdx.x == 0) a.used[m] = a.nch;
+    const long j0 = (long)c * a.chunk;
+    long n = reach - j0;
+    n = n < 0 ? 0 : (n > a.chunk ? a.chunk : n);
+    const DsTopkKey get{ a.t.sc + m * a.t.sr, krow, a.t.scs, a.t.kcs, j0, a.t.block, a.t.bshift };
+    ds_select(get, (uint32_t)n, (uint32_t)a.t.K, cache, &s);
     ds_emit(get, (uint32_t)n, cache, &s,
             [&](uint32_t i, bool take, uint32_t o) {
                 if (take)
@@ -502,7 +709,9 @@ __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_split2_kernel(D
     __shared__ uint32_t cache[kDsCache];
     for (long m = blockIdx.x; m < a.t.M; m += gridDim.x) {
         const unsigned long long* cr = a.cand + m * a.nch * (long)a.t.K;
-        const uint32_t n = (uint32_t)a.nch * (uint32_t)a.t.K;
+        int used = a.used[m];
+        used = used < 0 ? 0 : (used > a.nch ? a.nch : used);
+        const uint32_t n = (uint32_t)used * (uint32_t)a.t.K;
         const DsCandKey get{ cr, a.cnt + m * a.nch, (uint32_t)a.t.K };
         uint32_t* c = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
         ds_select(get, n, (uint32_t)a.t.K, c, &s);
@@ -1610,10 +1819,11 @@ long long keep_words(long long width, long long block) {
     return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
 }
 
+/* The split's scratch: candidates [rows][nch][K] u64, counts [rows][nch] i32, used chunks [rows] i32. */
 int64_t topk_split_bytes(long rows, long C, long K) {
     const long nch = (C + kDsChunk - 1) / kDsChunk;
     if (rows < 1 || nch < kDsSplitMinChunks || K < 1 || K > kDsSplitMaxK) return 0;
-    return (int64_t)rows * nch * K * 8 + (int64_t)rows * nch * 4 + 16;
+    return (int64_t)rows * nch * K * 8 + (int64_t)rows * nch * 4 + (int64_t)rows * 4 + 16;
 }
 
 int index_score_body(const RadArgs* a, RadStream stream) {
@@ -1709,15 +1919,22 @@ int index_score_body(const RadArgs* a, RadStream stream) {
         return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, false>), grid, dim3(256), 0u, s);
     }
     /* Head split: more workgroups while the grid is short of the card. The head sum is closed in
-     * head order either way, so every split gives the same bits. */
+     * head order either way, so every split gives the same bits. With keep the work is a row's kept
+     * positions (kDsKeptEst expected), not its width. */
+    const long cw = keep ? (s.C < kDsKeptEst ? (long)s.C : kDsKeptEst) : (long)s.C;
     int HS = 1;
-    while (HS < 8 && HS * 2 <= H && ((long)s.C * HS * 2 + 255) / 256 * s.M <= 1024 &&
+    while (HS < (keep ? 4 : 8) && HS * 2 <= H && (cw * HS * 2 + 255) / 256 * s.M <= 1024 &&
            (long)H * (256 / (HS * 2)) * 4 <= 32768)
         HS *= 2;
     const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
     const int epb = 256 / HS;
-    const dim3 grid((unsigned)((s.C + epb - 1) / epb), gy);
+    const dim3 grid((unsigned)((cw + epb - 1) / epb), gy);
     const uint32_t lds = HS > 1 ? (uint32_t)(H * epb * 4) : 0u;
+    if (keep) switch (HS) {
+        case 1: return R4D_EMIT(stream, ds41_index_score_kept_kernel<1>, grid, dim3(256), lds, s);
+        case 2: return R4D_EMIT(stream, ds41_index_score_kept_kernel<2>, grid, dim3(256), lds, s);
+        default: return R4D_EMIT(stream, ds41_index_score_kept_kernel<4>, grid, dim3(256), lds, s);
+    }
     switch (HS) {
         case 1: return R4D_EMIT(stream, ds41_index_score_kernel<1>, grid, dim3(256), lds, s);
         case 2: return R4D_EMIT(stream, ds41_index_score_kernel<2>, grid, dim3(256), lds, s);
@@ -1804,6 +2021,8 @@ int index_topk_body(const RadArgs* a, RadStream stream) {
     t.bshift = -1;
     for (int sh = 0; sh < 31; ++sh)
         if ((1LL << sh) == (long long)t.block) t.bshift = sh;
+    /* With keep, walk the kept blocks only (the same selection: DsKeptKey). */
+    t.kept = keep && block <= 65536 ? 1 : 0;
     /* Few rows over a long row: chunks in parallel, then one merge a row. The same selection, so
      * the same bits, as the one-block-a-row kernel. */
     const int64_t need = t.M <= kDsSplitRows ? topk_split_bytes(t.M, t.C, t.K) : 0;
@@ -1812,8 +2031,12 @@ int index_topk_body(const RadArgs* a, RadStream stream) {
         sp.t = t;
         sp.chunk = kDsChunk;
         sp.nch = (t.C + kDsChunk - 1) / kDsChunk;
+        /* the kept chunks' lists: at most ceil(blocks / nch) blocks a chunk (every block kept) */
+        const long nbw = ((long)t.C + t.block - 1) / t.block;
+        if ((nbw + sp.nch - 1) / sp.nch > kDsKeptMax) sp.t.kept = 0;
         sp.cand = (unsigned long long*)a->scratch;
         sp.cnt = (int*)((unsigned char*)a->scratch + (int64_t)t.M * sp.nch * t.K * 8);
+        sp.used = sp.cnt + (int64_t)t.M * sp.nch;
         const int rc = R4D_EMIT(stream, ds41_index_topk_split1_kernel,
                                 dim3((unsigned)sp.nch, (unsigned)t.M), dim3(kDsSelThreads), 0, sp);
         if (rc != RAD_OK) return rc;

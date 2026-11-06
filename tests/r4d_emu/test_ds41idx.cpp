@@ -237,6 +237,31 @@ int topk(RadLaunchFn fn, const Fix& f, const float* sc, int64_t rows, const int3
     return fn(&a, nullptr);
 }
 
+/* The selection index_topk must make, on the host: a row's candidates are its positions below
+ * reach in a kept block with a score above -inf (a NaN is none), the k best by (score desc,
+ * position asc), written in position order, -1 after. */
+void host_topk(const Fix& f, const float* sc, int64_t rows, const int32_t* keep, const int32_t* pos, int block,
+               int k, int32_t* sel) {
+    const int64_t C = f.C, KW = keep_words(C, block);
+    for (int64_t m = 0; m < rows; ++m) {
+        const int64_t reach = std::max<int64_t>(0, std::min<int64_t>(C, ((int64_t)pos[m] + 1) / f.ratio));
+        std::vector<int64_t> c;
+        for (int64_t j = 0; j < reach; ++j) {
+            const int64_t b = j / block;
+            if (keep && !(((uint32_t)keep[m * KW + b / 32] >> (b % 32)) & 1u)) continue;
+            const float v = sc[m * C + j];
+            if (v > -INFINITY) c.push_back(j);
+        }
+        const int64_t n = std::min<int64_t>(k, (int64_t)c.size());
+        std::partial_sort(c.begin(), c.begin() + n, c.end(), [&](int64_t x, int64_t y) {
+            const float a = sc[m * C + x] + 0.0f, b = sc[m * C + y] + 0.0f;
+            return a > b || (a == b && x < y);
+        });
+        std::sort(c.begin(), c.begin() + n);
+        for (int64_t i = 0; i < k; ++i) sel[m * k + i] = i < n ? (int32_t)c[(size_t)i] : -1;
+    }
+}
+
 int g_fail = 0, g_check = 0;
 void expect(bool ok, const char* name, const char* what, long long a = 0, long long b = 0) {
     ++g_check;
@@ -270,6 +295,14 @@ void restriction(const char* name, const Fix& f, int block, int kb, int k, const
         nsel += selB[(size_t)i] >= 0;
     }
     expect(diff == 0, name, "selection differs from the unrestricted score's", diff, M * k);
+    /* and both are the host's selection over the unrestricted score (kept blocks only) */
+    {
+        std::vector<int32_t> selH((size_t)(M * k), 0x44444444);
+        host_topk(f, scA.data(), M, keep.data(), f.pos.data(), block, k, selH.data());
+        int64_t dh = 0;
+        for (int64_t i = 0; i < M * k; ++i) dh += selH[(size_t)i] != selB[(size_t)i];
+        expect(dh == 0, name, "index_topk differs from the host's selection", dh, M * k);
+    }
     /* the scores: kept and passed = the unrestricted bits, else -inf */
     int64_t kept = 0, bad = 0, passed = 0;
     for (int64_t m = 0; m < M; ++m) {
@@ -417,6 +450,16 @@ int main(int argc, char** argv) {
         /* rows past 2^18: decode rows of two sequences, DeepSeek's block 8 / 2048 blocks / top 512 */
         const Fix f = make(14, 32, 1, { { 1, 262144 + 1000 }, { 2, 299999 } });
         restriction("scalar, 300k context", f, 8, 2048, 512, ref);
+    }
+    {
+        /* index_topk over the kept blocks only: more kept blocks a row than the one-block-a-row
+         * kernel lists (4500 > 4096: it walks the positions), the split form dealing them over
+         * its chunks; and block 2 / block 1 with every block kept (the split's lists fit at block
+         * 2, not at block 1: it walks the positions) */
+        const Fix f = make(18, 16, 1, { { 3, 39999 } });
+        restriction("kept walk, 4500 of 5000 blocks", f, 8, 4500, 256, ref);
+        restriction("kept walk, block 2, all kept", f, 2, 20000, 128, ref);
+        restriction("kept walk, block 1, 30000 kept", f, 1, 30000, 128, ref);
     }
     {
         /* (b): 200 prefill rows in runs of <= 64 (4 runs of 50, WMMA); and 130 rows in runs of
