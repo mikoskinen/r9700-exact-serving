@@ -1308,7 +1308,11 @@ struct PlayRun {
                 chain_record(s, slot, true);
             }
         }
-        const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
+        int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
+        /* RADIANCE_AQL_ACQ=none (EXPERIMENT ONLY, unsafe in general): a played packet's agent-scope acquire
+         * becomes none -- no cache invalidation before it starts; system acquires stay. Unset = as before. */
+        static const bool acq_none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
+        if (acq_none && acq == HSA_FENCE_SCOPE_AGENT) acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (rel < rel_min) rel = rel_min;
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
