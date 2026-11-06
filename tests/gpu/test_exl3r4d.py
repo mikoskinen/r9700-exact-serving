@@ -22,7 +22,8 @@ suite device:
   - replay: the same case three times in three processes, byte-identical (R8);
   - refusals (R12): K != 4, mcg, 3inst at the layout hook (RAD_E_DTYPE), and what the launch refuses by name;
   - ds41-exl3: half-integer K = 2.5 (exl3k2h) through bits_band, and DeepSeek V4.1's whole-expert (expert-parallel)
-    geometry at K = 2 and 2.5 in both bands (deepseek_ep);
+    geometry at K = 2 and 2.5 in both bands (deepseek_ep); the same chains with `ep_ranks` 4 (interface v9: the EP
+    split-K rules E1 / E2 of kernels/exl3r4d/exl3r4d_sk.h) at 1-3 tokens (deepseek_ep_splitk);
   - v5 moe_exl3_gate_up_down at the real per-rank geometry, M = 1 .. 16 (tp2 and tp1), a long run, K 3 and 5, and
     a three-run replay: against the transcription and, TO THE BIT, against gate_up(a_rot 0, h_rot 1) then
     down(h_rot 1) through the same library (P2's chain_gd, with its controls). A build without a counter pool for
@@ -39,6 +40,7 @@ suite real: a real turboderp 4.05 tensor (layer 15's 4-bit indexer.index_qk_proj
 Exit 0 all passed, 1 any failure, 77 nothing could run.
 """
 import argparse
+import copy
 import sys
 from pathlib import Path
 
@@ -173,6 +175,50 @@ def deepseek_ep(args, rng, work):
                               two=False)
         ok &= R.chain(args, gu, dn, work / label(f"ds41_K{K}_chain"), f"ds41 K={K}")
         ok &= R.chain_prep(args, gu, work / label(f"ds41_K{K}_prep"), f"ds41 K={K}")
+    return ok
+
+
+def deepseek_ep_splitk(args, work):
+    """ds41 exl3-splitk (EXL3 interface v9, kernels/exl3r4d/exl3r4d_sk.h): the same DeepSeek chains with `ep_ranks` 4,
+    the EP split-K rules' launches -- gate_up split-K 2 at one token (E2), down split-K 4 at one token and 2 at two
+    (E1, h_rot 1) on a 32-WGP card -- each against the transcription at the suite's tolerance, beside the same case
+    without ep_ranks. Expert-parallel routing: top-6 of 12 experts a token, half the slots dropped (another rank's),
+    so a token has about 3 live rows here, as on DeepSeek's TP4. Control: from three tokens no rule moves, so the two
+    are the same bits. Its own generator (the cases above draw what they drew before)."""
+    rng = np.random.default_rng(20261106)
+    ok = True
+    for K in (2, 2.5):
+        for M in (1, 2, 3):
+            gu, dn_ex = R.chain_case(rng, f"ds41 EP K={K} M={M}", M=M, top_k=6, n_expert=12, hidden=5120, width=2304,
+                                     bits=K, two=False, drop=0.5)
+            gu.params["h_rot"] = 1
+            outs = {}
+            for ep in (None, 4):
+                tag = "ep_ranks 4" if ep else "no ep_ranks"
+                g = copy.copy(gu)
+                g.params = dict(gu.params)
+                if ep:
+                    g.params["ep_ranks"] = ep
+                g.name = f"ds41 EP K={K} M={M} gate_up h_rot 1, {tag}"
+                good, h = R.check_case(args, g, work / label(g.name))
+                ok &= good
+                if h is None:
+                    break
+                d = R.down_of(g, dn_ex, h, 1, f"ds41 EP K={K} M={M} down h_rot 1, {tag}")
+                if ep:
+                    d.params["ep_ranks"] = ep
+                good, y = R.check_case(args, d, work / label(d.name))
+                ok &= good
+                outs[ep] = (h, y)
+            if len(outs) == 2 and all(v[1] is not None for v in outs.values()):
+                same_h = np.array_equal(outs[None][0], outs[4][0])
+                same_y = np.array_equal(outs[None][1], outs[4][1])
+                if M >= 3:   # no EP rule moves at three tokens: the same launches, the same bits
+                    ok &= verdict(same_h and same_y, f"ds41 EP K={K} M={M}: ep_ranks moves nothing from three tokens",
+                                  f"gate_up identical={same_h} down identical={same_y}")
+                else:        # a split-K launch: another summation order (reported, not a criterion)
+                    print(f"INFO ds41 EP K={K} M={M}: with ep_ranks 4 gate_up bytes identical={same_h}, "
+                          f"down identical={same_y} (split-K moves the fp32 sums' order)")
     return ok
 
 
@@ -407,6 +453,7 @@ def suite_device(args, work):
     ok &= replay(args, rng, work)
     ok &= bits_band(args, rng, work)
     ok &= deepseek_ep(args, rng, work)
+    ok &= deepseek_ep_splitk(args, work)
     ok &= refusals(args, rng, work)
     ok &= fused_band(args, work)
     return ok

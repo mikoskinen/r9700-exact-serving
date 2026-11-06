@@ -1,6 +1,7 @@
 # tests/gpu -- exl3r4d's checks (added by kernels/exl3r4d/CMakeLists.txt).
 #
 #   exl3r4d_layout       host  the stored codes form against common/exl3_layout, the hooks' claims and refusals
+#   exl3r4d_sk_rule      host  the decode split-K rule (exl3r4d_sk.h): the old rule without ep_ranks, E1 / E2 with it
 #   exl3r4d_rows_static  host  the built plugin's row table: a row with a layout hook registers relayout and
 #                              unrelayout; rows of one op register the same hooks
 #   exl3r4d_kernarg      host  every kernel's argument segment fits radiance's 768-B kernarg slot
@@ -24,6 +25,16 @@ find_library(EXL3R4D_LIBM m)   # absent (and not needed) where libm is part of l
 target_link_libraries(exl3r4d_layout_test PRIVATE radiance::abi $<$<BOOL:${EXL3R4D_LIBM}>:${EXL3R4D_LIBM}>)
 add_test(NAME exl3r4d_layout COMMAND exl3r4d_layout_test)
 set_tests_properties(exl3r4d_layout PROPERTIES LABELS host)
+
+# the decode split-K rule (kernels/exl3r4d/exl3r4d_sk.h): f2f3c3f7's inline rule without ep_ranks, the EP rules' (E1 /
+# E2) DeepSeek table, and a model of the split-K summation order (ds41 exl3-splitk)
+add_executable(exl3r4d_sk_rule_test sk_rule_test.c)
+set_target_properties(exl3r4d_sk_rule_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+target_compile_options(exl3r4d_sk_rule_test PRIVATE -ffp-contract=off -Wall -Wextra -O2)
+target_include_directories(exl3r4d_sk_rule_test PRIVATE ${EXL3R4D_DIR})
+target_link_libraries(exl3r4d_sk_rule_test PRIVATE $<$<BOOL:${EXL3R4D_LIBM}>:${EXL3R4D_LIBM}>)
+add_test(NAME exl3r4d_sk_rule COMMAND exl3r4d_sk_rule_test)
+set_tests_properties(exl3r4d_sk_rule PROPERTIES LABELS host)
 
 if(EXL3R4D_HIP)
   # run_gpu.sh's proof of which card a session ran on (host API only)

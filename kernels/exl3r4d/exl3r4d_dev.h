@@ -102,6 +102,10 @@ int64_t exl3r4d_gemm_lds(int gate_up, int npw, int sk, int fused_rows, int64_t c
 /* Workgroups of the decode gate_up GEMM (K = bits, npw, split-K sk, h_rot's staged block) resident at once on the
  * current device, or 0 when unknown (EXL3R4D_SK_FIT, launch.c). Cached a device after the first call. */
 int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot);
+/* ...and the decode DOWN GEMM's, as exl3r4d_launch_gemm launches it with its input already rotated (h_rot: the plain
+ * K loop, no prep, no P1c scratch rows): K = bits, npw, split-K sk. 0 when unknown, or for h_rot 0 (down's P1c form
+ * there sizes its LDS by the launch's rows). exl3r4d_sk.h E1 (launch.c). */
+int exl3r4d_dn_resident(int bits, int npw, int sk, int h_rot);
 /* The current device's WGPs, cached; 1 when unknown (P10-TP4S L1: the four-class gate_up's K slices). */
 int exl3r4d_wgps(void);
 

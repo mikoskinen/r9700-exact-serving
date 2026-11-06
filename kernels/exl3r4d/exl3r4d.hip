@@ -3366,6 +3366,35 @@ extern "C" int exl3r4d_gu_resident(int bits, int npw, int sk, int h_rot) {
   }
   return nwgp_dev[dev] > 0 ? wq_capacity(fn, 8 * 2 / npw * sk * WAVE32, (size_t)smem, nwgp_dev[dev]) : 0;
 }
+// E1 (ds41 exl3-splitk, exl3r4d_sk.h): workgroups of the decode DOWN GEMM resident at once on the current device -- the
+// kernel exl3r4d_launch_gemm takes for down with its input already rotated (h_rot: hrot_dn, so no prep, no P1c rows,
+// no DNW; EXL3R4D_DNG 1): K = 4's gemm_fn<4, 1>(npw, false), another K's kx_fn<B>(false, false); its LDS
+// exl3r4d_gemm_lds(0, npw, sk, 0, 0) (down stages no h block); 8 / npw waves a split. 0 when unknown or for h_rot 0.
+extern "C" int exl3r4d_dn_resident(int bits, int npw, int sk, int h_rot) {
+  if (!h_rot || EXL3R4D_DNW > 1 || EXL3R4D_DNG != 1) return 0;   // another down form: not this model
+  const void* fn = nullptr;
+  switch (bits) {
+    case 2: fn = kx_fn<2>(false, false); break;
+    case 3: fn = kx_fn<3>(false, false); break;
+    case 4: fn = gemm_fn<4, 1>(npw, false); break;
+    case 5: fn = kx_fn<5>(false, false); break;
+    case 6: fn = kx_fn<6>(false, false); break;
+    case EXL3R4D_K25: fn = kx_fn<EXL3R4D_K25>(false, false); break;   // half-integer K = 2.5
+    default: return 0;
+  }
+  if (bits != 4 && npw != 2) return 0;   // R23: another K's kernels are NPW 2 only (exl3r4d_launch_gemm refuses)
+  const int64_t smem = exl3r4d_gemm_lds(0, npw, sk, 0, 0);
+  if (!fn || smem < 0) return 0;
+  static int nwgp_dev[16];
+  int dev = 0;
+  if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return 0;
+  if (nwgp_dev[dev] <= 0) {
+    int n = 0;
+    (void)hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev);
+    nwgp_dev[dev] = n;
+  }
+  return nwgp_dev[dev] > 0 ? wq_capacity(fn, 8 / npw * sk * WAVE32, (size_t)smem, nwgp_dev[dev]) : 0;
+}
 #endif
 
 extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, int npw, void* stream) {

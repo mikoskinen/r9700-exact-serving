@@ -8,6 +8,15 @@
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P] [--pfstamps FILE]
 //           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump)]
 //           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
+//           [--ep N [--ep-rank r|-1] [--ep-param]]
+//
+// --ep N (ds41 exl3-splitk): EXPERT PARALLELISM over N ranks, as DeepSeek V4.1's TP4 serves its whole experts -- every
+// token's top_k is drawn over E x N experts and this rank keeps experts [r E, r E + E) (--experts E is the rank's
+// count, e.g. 96 of 384); the other ranks' slots are DROPPED (sorted_tok -1 past off[E], the sort's EP form). --ep-rank
+// r picks the rank (default 0); -1 takes, a layer, the rank with the most live experts (the slowest card, which the
+// all-reduce after the MoE waits for). --ep-param also hands both exl3r4d ops `ep_ranks` N (EXL3 interface v9), so
+// the launch's EP split-K rules (kernels/exl3r4d/exl3r4d_sk.h, E1 down / E2 gate_up) apply: the same .so and routing
+// with and without it is the A/B. --bits 2.5 is the half-integer K (exl3k2h).
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
 // v1.1.x (ranks 0 and 1 three of every even/odd pair's 5+5 blocks, ranks 2 and 3 two), or with --mod4 by number mod 4
@@ -175,6 +184,9 @@ struct Opts {
     bool chain = false;
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
     int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
+    int bits2 = 8;            // 2 K: --bits 2.5 is 5 (exl3k2h, the half-integer K); codes bytes R C bits2 / 16
+    int ep = 1, ep_rank = 0;  // --ep N [--ep-rank r]: expert parallelism over N ranks (see the header)
+    bool ep_param = false;    // --ep-param: the exl3r4d ops take `ep_ranks` N (interface v9: the EP split-K rules)
     int a_rot = 0;            // --a-rot 1 (with --chain; or --op gate_up: the GEMM alone over xr): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
                               // gated_had_quant_fp8 -> down (the served baseline block's three launches)           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
@@ -218,6 +230,34 @@ Route draw(int64_t M, int64_t E, int64_t topk) {
         r.off[(size_t)e + 1] = r.off[(size_t)e] + (int32_t)r.rows[(size_t)e];
         r.sorted.insert(r.sorted.end(), by[(size_t)e].begin(), by[(size_t)e].end());
     }
+    return r;
+}
+
+// --ep N: a draw over E x N experts, this rank's E kept (renumbered 0..E-1), the other ranks' slots dropped -- sorted_tok
+// -1 from off[E] on, as the EP sort leaves them. rank -1: the rank with the most live experts (then the most rows).
+Route draw_ep(int64_t M, int64_t E, int64_t topk, int ep, int rank) {
+    const Route full = draw(M, E * ep, topk);
+    if (rank < 0) {
+        int64_t best_live = -1, best_rows = -1;
+        for (int r = 0; r < ep; ++r) {
+            int64_t live = 0, rows = 0;
+            for (int64_t e = 0; e < E; ++e) {
+                live += full.rows[(size_t)(r * E + e)] > 0;
+                rows += full.rows[(size_t)(r * E + e)];
+            }
+            if (live > best_live || (live == best_live && rows > best_rows)) { best_live = live; best_rows = rows; rank = r; }
+        }
+    }
+    Route r;
+    r.off.assign((size_t)E + 1, 0);
+    r.rows.assign((size_t)E, 0);
+    for (int64_t e = 0; e < E; ++e) {
+        const int64_t g = rank * E + e;
+        r.rows[(size_t)e] = full.rows[(size_t)g];
+        r.off[(size_t)e + 1] = r.off[(size_t)e] + (int32_t)r.rows[(size_t)e];
+        r.sorted.insert(r.sorted.end(), full.sorted.begin() + full.off[(size_t)g], full.sorted.begin() + full.off[(size_t)g + 1]);
+    }
+    r.sorted.resize((size_t)(M * topk), -1);   // the dropped slots
     return r;
 }
 
@@ -337,7 +377,14 @@ int main(int argc, char** argv) {
         else if (a == "--skew") o.skew = std::atof(nx());
         else if (a == "--group") g_group = std::atoll(nx());
         else if (a == "--group-mix") g_group_mix = std::atof(nx());
-        else if (a == "--bits") o.bits = std::atoi(nx());
+        else if (a == "--bits") {
+            const double b = std::atof(nx());
+            o.bits2 = (int)std::lround(2 * b);
+            o.bits = o.bits2 / 2;
+        }
+        else if (a == "--ep") o.ep = std::atoi(nx());
+        else if (a == "--ep-rank") o.ep_rank = std::atoi(nx());
+        else if (a == "--ep-param") o.ep_param = true;
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
         else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
         else if (a == "--experts") o.E = std::atoll(nx());
@@ -355,10 +402,14 @@ int main(int argc, char** argv) {
     if (o.tp != 1 && o.tp != 2 && o.tp != 4) die("--tp is 1, 2 or 4");
     if (o.rank < 0 || o.rank >= o.tp) die("--rank is below --tp");
     if (o.mod4 && o.tp != 4) die("--mod4 is the four-rank split (--tp 4)");
-    if (o.bits < 2 || o.bits > 6) die("--bits is 2..6");
+    if (!((o.bits2 % 2 == 0 && o.bits2 >= 4 && o.bits2 <= 12) || o.bits2 == 5)) die("--bits is 2..6 or 2.5");
+    if (o.ep < 1 || o.ep > 64 || o.ep_rank < -1 || o.ep_rank >= o.ep) die("--ep is 1..64, --ep-rank below it (or -1)");
+    if (o.ep > 1 && (o.tp != 1 || o.mod4)) die("--ep splits whole experts: --tp 1 (the rank's widths are whole)");
+    if (o.ep_param && o.ep < 2) die("--ep-param needs --ep N > 1");
     if (g_group < 1 || g_group_mix < 0 || g_group_mix > 1) die("--group is >= 1, --group-mix 0..1");
     char kdt[16];
-    std::snprintf(kdt, sizeof kdt, "exl3k%d", o.bits);
+    if (o.bits2 % 2) std::snprintf(kdt, sizeof kdt, "exl3k%dh", o.bits2 / 2);   // 2.5: exl3k2h
+    else std::snprintf(kdt, sizeof kdt, "exl3k%d", o.bits);
     const bool gu = o.op == "gate_up";
     // This rank's widths a class -- the architecture's split (qwen4exp_exl3.cpp): the expert's 128-blocks cut over the
     // ranks, the rank taking an extra block rotating with the class. tp1 every expert whole; tp2 rank 0 holds 3 of 5
@@ -410,7 +461,7 @@ int main(int argc, char** argv) {
                 o.layers, o.pools, o.iters, o.reps);
 
     if (o.skew >= 0) {
-        g_logp.resize((size_t)o.E);
+        g_logp.resize((size_t)(o.E * o.ep));
         for (auto& v : g_logp) v = o.skew * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
     }
     std::vector<Route> route;
@@ -432,7 +483,7 @@ int main(int argc, char** argv) {
                     (long long)(o.M * o.topk));
     }
     for (int l = 0; l < o.layers; ++l) {
-        if (recs.empty()) route.push_back(draw(o.M, o.E, o.topk));
+        if (recs.empty()) route.push_back(o.ep > 1 ? draw_ep(o.M, o.E, o.topk, o.ep, o.ep_rank) : draw(o.M, o.E, o.topk));
         else {
             const std::vector<int32_t>& rc = recs[(size_t)l % recs.size()];
             const int32_t Tr = (int32_t)(o.M * o.topk);
@@ -511,7 +562,7 @@ int main(int argc, char** argv) {
             for (int c = 0; c < nc; ++c)
                 for (int64_t e = c; e < o.E; e += nc)
                     if (route[(size_t)l].rows[(size_t)e])
-                        b += exl3 ? (double)(R_[c] * C_[c] * o.bits / 8) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
+                        b += exl3 ? (double)(R_[c] * C_[c] * o.bits2 / 16) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
                                   : (double)(R_[c] * C_[c] / 2 + R_[c] * 2 * C_[c] / 128);
             return b;
         };
@@ -527,6 +578,7 @@ int main(int argc, char** argv) {
             cls_params(G.p, Rg, Cg);
             G.p.push_back(PI("h_rot", o.h_rot));
             G.p.push_back(PI("a_rot", o.a_rot));
+            if (o.ep_param) G.p.push_back(PI("ep_ranks", o.ep));   // v9: the EP split-K rules
             Lib P{ "exl3r4d prep_gu", o.a_rot ? row_of(o.exl3.c_str(), pn.c_str()) : nullptr, {}, {}, {} };
             P.p = { PI("M", o.M), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk), PS("dtype", kdt) };
             prep_params(P.p, Cg);
@@ -535,6 +587,7 @@ int main(int argc, char** argv) {
                     PS("dtype", kdt), PS("codebook", "mul1") };
             cls_params(D.p, Rd, Cd);
             D.p.push_back(PI("h_rot", o.h_rot));
+            if (o.ep_param) D.p.push_back(PI("ep_ranks", o.ep));
             const Exl3Positions* gpos = exl3_positions(o.mod4 ? EXL3_GATE_UP4 : EXL3_GATE_UP);
             const Exl3Positions* dpos = exl3_positions(o.mod4 ? EXL3_DOWN4 : EXL3_DOWN);
             const Exl3Positions* ppos = exl3_positions(o.mod4 ? EXL3_PREP_GU4 : EXL3_PREP_GU);
@@ -568,7 +621,7 @@ int main(int argc, char** argv) {
                 };
                 for (int c = 0; c < nc; ++c) {
                     for (auto& v : nb) v = nullptr;
-                    const size_t cbg = (size_t)(Rg[c] * Cg[c] * o.bits / 8), cbd = (size_t)(Rd[c] * Cd[c] * o.bits / 8);
+                    const size_t cbg = (size_t)(Rg[c] * Cg[c] * o.bits2 / 16), cbd = (size_t)(Rd[c] * Cd[c] * o.bits2 / 16);
                     auto rb = [](size_t b) { return [b](int64_t n) { return random_buf(b * (size_t)n); }; };
                     auto ft = [&](int64_t w, float v, int kind) { return [&f16t, w, v, kind](int64_t n) { return f16t((size_t)(w * n), v, kind); }; };
                     pg[(size_t)q][c][0] = TAB(tab(c, 0, cbg, rb(cbg)), kDtTrellis, { nec[c], Rg[c], Cg[c] });
@@ -720,6 +773,7 @@ int main(int argc, char** argv) {
         // without the prep kernel in front -- the decode band's gate_up dispatch as the arch issues it
         const bool arot = gu && o.a_rot;
         if (gu) L.p.push_back(PI("a_rot", arot ? 1 : 0));
+        if (o.ep_param) L.p.push_back(PI("ep_ranks", o.ep));   // v9: the EP split-K rules
         const Exl3Positions* spos = exl3_positions(sop);
         const int64_t xrows = arot ? Tr : Ma, xw = arot ? 2 * xcols : xcols;
         void* x = o.rand_data ? f16_rand((size_t)(xrows * xw), 1.0f, 0) : f16_buf((size_t)(xrows * xw), 0.5f);
@@ -728,7 +782,7 @@ int main(int argc, char** argv) {
         std::vector<std::array<std::array<RadTensor, 5>, EXL3_MAX_CLS>> pool((size_t)o.pools);
         for (auto& pc : pool)
             for (int c = 0; c < nc; ++c) {
-                const size_t cb = (size_t)(R[c] * C[c] * o.bits / 8);
+                const size_t cb = (size_t)(R[c] * C[c] * o.bits2 / 16);
                 void* codes = random_buf(cb * (size_t)nec[c]);
                 void* suh = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
                 void* suh1 = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
@@ -753,7 +807,7 @@ int main(int argc, char** argv) {
             double bytes = 0;
             for (int c = 0; c < nc; ++c)
                 for (int64_t e = c; e < o.E; e += nc)
-                    if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] * o.bits / 8) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
+                    if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] * o.bits2 / 16) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
             L.bytes.push_back(bytes);
             std::vector<RadTensor> t((size_t)spos->n_opd);   // the op's schema order (include/exl3_abi.h)
             t[(size_t)spos->x] = T(x, RAD_F16, { xrows, xw });

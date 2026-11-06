@@ -20,73 +20,13 @@
 #include "exl3r4d_dev.h"
 #include "exl3r4d_prefill.h"
 
-/* Decode defaults, from Dylan's measured choice (exl3-moe hip.py:594-601 and FACTS-exl3 §2.4): two column tiles
- * a wave, LDS split-K 2 ("measured best at M 1..5, 384 and 256 wide"). Re-taken on this card (runs/shape2, prep
- * path): within 4% of the best of NPW {2,4} x SK {1,2,4,8} at M=1 for both ops; NPW 4 / SK 1 is 5.7% faster at
- * gate_up M=16 and NPW 2 / SK 1 5.2% at down M=16 -- tunables for rad-tune (PLAN P7), not a hand-picked change. */
+#include "exl3r4d_sk.h"   /* the decode split-K rule and its knobs (NPW, SK, SK_SMALL_M, SK_FIT, ..., E1 / E2) */
+
 #ifndef EXL3R4D_PF_ANY_K
 #define EXL3R4D_PF_ANY_K 1   /* R23: the M > 16 band's kernels read every K the decode band does (P5) */
 #endif
-#ifndef EXL3R4D_NPW
-#define EXL3R4D_NPW 2
-#endif
-#ifndef EXL3R4D_SK
-#define EXL3R4D_SK 1  /* adopted (round 2, OCC-gu): gate_up split-K 1 -- tp2 M=4 -6.8%, M=1 +3.9% */
-#endif
-/* Per op (round 2, D.8 retune): down's own column tiles a wave and split-K; default the shared ones. */
 #ifndef EXL3R4D_CTR_LAZY   /* TEST builds: a lazily allocated counter pool for tools that skip init (never shipped) */
 #define EXL3R4D_CTR_LAZY 0
-#endif
-#ifndef EXL3R4D_NPW_DN
-#define EXL3R4D_NPW_DN EXL3R4D_NPW
-#endif
-/* gate_up's LDS split-K at FEW tokens (D16, deterministic: the two halves combined in a fixed order through LDS;
- * approved 2026-10-12): a launch of at most EXL3R4D_SK_SMALL_M tokens takes split-K 2 (round 2's OCC-gu: split-K 1 is
- * +3.9% at tp2 M=1). Tokens = sorted rows / top_k, so the engine's band-top M parameter does not matter. 0: off; 2
- * by default (engine v14). The
- * bits of those launches move (within the tolerance suites); the fused gate_up_down launch is split-K 1 only. */
-#ifndef EXL3R4D_SK_SMALL_M
-#define EXL3R4D_SK_SMALL_M 2
-#endif
-#ifndef EXL3R4D_SK_SMALL_V   /* the split-K those launches take */
-#define EXL3R4D_SK_SMALL_V 2
-#endif
-/* L7 (EXL3R4D_SK_FIT): ...but only when every unit the grid can hold -- its column blocks times min(T, n_expert) live
- * experts -- is resident at once at split-K 2 (exl3r4d_gu_resident: the device's WGPs times the workgroups a WGP holds).
- * Split-K 2 doubles a workgroup's waves, so a WGP holds half as many (174 VGPRs: 2 sixteen-wave workgroups a WGP, 64
- * on a 32-WGP card), and a grid past that runs a second round of latency-bound workgroups. Reading (P9-L7 sB-1,
- * 0000:03:00.0, gate_up GEMM alone): tp1 M=2 = 5 blocks x 20 rows -> 100 > 64 -> split-K 2 66.3 us, split-K 1 59.8
- * (libr4d 62.6); tp2 M=2 (3 x 20 = 60) and M=1 at tp1 / tp2 (50 / 30) fit and keep split-K 2 (tp2 M=1 is +7 % at
- * split-K 1). Deterministic in the device, the geometry and the token count, never the routing. Measured (sD-1, ABAB
- * x3): chain tp1 M=2 104.8 -> 98.6 us (libr4d 103.2), MTP-like 2-token runs 93.0 -> 86.5 (libr4d 90.9); every other
- * shape within 0.07 us and its y byte-identical (tp1 M=1/3/4, tp2 M=1..4). NUMERICS (accepted by the orchestrator,
- * 2026-10-14, as a change of summation order only): a launch that leaves split-K 2 -- tp1 M=2 here -- sums each output
- * over all of K in one chain (split-K 1's fp32 order, the M >= 3 form) instead of two halves combined through LDS; the
- * quantised weights, the activation format and the rotation are untouched; the suites pass at their tolerances
- * (sG-1: device 946/0, real 32/0, tp 360/0, P2 cases 457/0, band tops 80/0). tp2 bits never move. 0: the token rule. */
-#ifndef EXL3R4D_SK_FIT
-#define EXL3R4D_SK_FIT 1
-#endif
-/* P10 L4 (EXL3R4D_SK4_M, reading; the four-class launches only, so tp4 alone): gate_up launches of at most this many
- * tokens take split-K 4 -- 32 waves a workgroup, one workgroup a WGP -- when every unit is resident at once. At tp4's
- * widths (128 / 256 a class) M=1 is 11-22 units on 32 WGPs, each a latency-bound 16-wave stream. 0: off.
- * REFUTED (P10 R8, 0000:13:00.0, ABAB x3, tp4 rank 0 split chain): M=1 36.00 -> 36.64 us (gate_up traced 18.20 ->
- * 18.68 at 1024 threads); the rule kept every other shape at its split-K. Twice the waves do not shorten a unit. */
-#ifndef EXL3R4D_SK4_M
-#define EXL3R4D_SK4_M 0
-#endif
-#ifndef EXL3R4D_SK_ONE_V     /* reading arm: another split-K for 1-token launches only (0: as above) */
-#define EXL3R4D_SK_ONE_V 0
-#endif
-/* ...and down's, likewise (D16; round 2's D.8 chose down split-K 1 from M = 1 / 4 / 16 -- M = 2 never measured).
- * P9-L7 sM-1 (split-K 2 at every decode M; tp2's 24-k-step units are latency chains, two rounds): SLOWER everywhere --
- * down tp2 M=1..6 +1.2/+3.6/+3.9/+3.5/+3.4/+3.9 us, MTP-verify M=4 +2.4, tp1 M=1..4 +1.2..+3.9; chain tp2 M=1/2/3
- * +1.3/+4.0/+4.9. Halving each wave's chain does not pay for half the resident units. Off. */
-#ifndef EXL3R4D_SK_DN_SMALL_M
-#define EXL3R4D_SK_DN_SMALL_M 0
-#endif
-#ifndef EXL3R4D_SK_DN   /* adopted (round 2, D.8): down at split-K 1 -- tp2 M=1 -4.9%, M=4 -8.6%, M=16 -11.2% */
-#define EXL3R4D_SK_DN 1
 #endif
 /* The most rows a fused-prep pass may take (<= 16 and what LDS holds); above it the prep kernel runs. 0: the prep
  * kernel at every M -- MEASURED FASTER at decode on gfx1201 (lever L3, lab notes in exl3r4d.hip: gate_up M=1 -15%,
@@ -147,6 +87,18 @@ static int table(const RadTensor* t, int plane, int64_t entries, int64_t rows, i
     if (t->stride[0] != 0 && !rad_ptr_aligned(t->data, 256)) return RAD_E_ALIGN;
     *base = t->data;
     return RAD_OK;
+}
+
+/* exl3r4d_sk_choose's device side: the decode GEMM's resident workgroups at split-K sk (exl3r4d.hip). */
+typedef struct SkRes { int bits, h_rot; } SkRes;
+static int sk_resident(void* ctx, int gate_up, int sk) {
+    const SkRes* r = (const SkRes*)ctx;
+    return gate_up ? exl3r4d_gu_resident(r->bits, EXL3R4D_NPW, sk, r->h_rot)
+                   : exl3r4d_dn_resident(r->bits, EXL3R4D_NPW_DN, sk, r->h_rot);
+}
+static int64_t sk_gcd(int64_t a, int64_t b) {
+    while (b) { const int64_t t = a % b; a = b; b = t; }
+    return a;
 }
 
 /* Everything but the scratch decision: operands checked and the argument block filled. */
@@ -234,22 +186,22 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->limit = (float)g->limit;
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
-    d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
-    if (gate_up && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = EXL3R4D_SK_SMALL_V;
-    if (gate_up && EXL3R4D_SK_ONE_V > 0 && (T + g->top_k - 1) / g->top_k <= 1) d->sk = EXL3R4D_SK_ONE_V;
-    if (gate_up && EXL3R4D_SK_FIT && d->sk > 1) {
-        const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
-        const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, d->sk, g->h_rot);
-        if (fit > 0 && units > fit) d->sk = 1;
+    /* The split-K: exl3r4d_sk.h's rule (the knobs above it moved there unchanged; E1 / E2 under v9 ep_ranks). */
+    {
+        Exl3r4dSkIn si;
+        memset(&si, 0, sizeof si);
+        si.gate_up = gate_up;
+        si.n_class = g->n_class;
+        si.h_rot = g->h_rot;
+        si.ep_ranks = g->ep_ranks;
+        si.T = T;
+        si.top_k = g->top_k;
+        si.n_expert = g->n_expert;
+        si.y_cols = g->y_cols;
+        for (int c = 0; c < g->n_class; ++c) si.ksteps_gcd = sk_gcd(si.ksteps_gcd, g->cols[c] / 16);
+        SkRes sr = { g->bits, g->h_rot };
+        d->sk = exl3r4d_sk_choose(&si, sk_resident, &sr);
     }
-#if EXL3R4D_SK4_M > 0   /* (a preprocessor branch: off, fill compiles as it did) */
-    if (gate_up && g->n_class == 4 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
-        const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
-        const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, 4, g->h_rot);
-        if (fit > 0 && units <= fit) d->sk = 4;
-    }
-#endif
-    if (!gate_up && EXL3R4D_SK_DN_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_DN_SMALL_M) d->sk = 2;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
     d->nslot = (int32_t)((T < g->n_expert ? T : g->n_expert) + 1);
     return RAD_OK;
