@@ -355,6 +355,13 @@ struct DeviceBackend {
 
     /* ---- see dev_stuck_ms. Null on a backend that cannot tell. */
     int64_t (*stuck_ms)(void);
+
+    /* ---- `tape_set_noacq`, a second edit a closed tape accepts (last, so the backends' positional
+     * initializers leave it null): dispatch `i` may be played without its agent-scope acquire (no
+     * cache invalidation before it starts) under RADIANCE_AQL_ACQ=rule | rule-w. The caller sets it
+     * only where no line the dispatch reads can be stale; see Ctx::haz_mark. A system-scope
+     * acquire is never dropped. Null on a backend without tapes. */
+    int     (*tape_set_noacq)(RadTape t, int i, int on);
 };
 
 
@@ -372,6 +379,7 @@ int     tape_diff(RadTape a, RadTape b, std::string* why);
 void    tape_destroy(RadTape t);
 int     tape_record(RadTape t, int i, int* kind, uint32_t* queue);
 int     tape_set_overlap(RadTape t, int i, bool on);
+int     tape_set_noacq(RadTape t, int i, bool on);
 
 /* The current backend's DeviceBackend::peer_access. */
 int     dev_peer_access(int self, int peer);

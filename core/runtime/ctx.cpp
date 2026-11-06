@@ -15,6 +15,55 @@
 
 namespace rad {
 
+namespace {
+/* The acquire rule's line sets (haz_mark): sorted, disjoint [first, second) intervals of cache lines. */
+using LineSet = std::vector<std::pair<uintptr_t, uintptr_t>>;
+constexpr uintptr_t kAcqLine = 128;   /* gfx12's L2 line; wider than L0's, so conservative */
+LineSet ls_merge(LineSet v) {
+    std::sort(v.begin(), v.end());
+    LineSet o;
+    for (const auto& x : v) {
+        if (!o.empty() && x.first <= o.back().second) o.back().second = std::max(o.back().second, x.second);
+        else o.push_back(x);
+    }
+    return o;
+}
+LineSet ls_unite(const LineSet& a, const LineSet& b) {
+    LineSet v(a);
+    v.insert(v.end(), b.begin(), b.end());
+    return ls_merge(std::move(v));
+}
+LineSet ls_inter(const LineSet& a, const LineSet& b) {
+    LineSet o;
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        const uintptr_t lo = std::max(a[i].first, b[j].first), hi = std::min(a[i].second, b[j].second);
+        if (lo < hi) o.push_back({ lo, hi });
+        if (a[i].second < b[j].second) ++i; else ++j;
+    }
+    return o;
+}
+bool ls_meet(const LineSet& a, const LineSet& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (std::max(a[i].first, b[j].first) < std::min(a[i].second, b[j].second)) return true;
+        if (a[i].second < b[j].second) ++i; else ++j;
+    }
+    return false;
+}
+/* RADIANCE_AQL_ACQ=rule | rule-w: haz_mark marks the dispatches that may play without their agent
+ * acquire. 0 off, 1 rule (a store leaves no stale line behind on its own CU), 2 rule-w (it may:
+ * every line written in the window is risky). */
+int acq_rule_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("RADIANCE_AQL_ACQ");
+        return !e ? 0 : !std::strcmp(e, "rule") ? 1 : !std::strcmp(e, "rule-w") ? 2 : 0;
+    }();
+    return m;
+}
+bool acq_rule_on() { return acq_rule_mode() != 0; }
+}  // namespace
+
 /* ================================================================== lifecycle */
 
 Ctx::Ctx() = default;
@@ -1134,6 +1183,11 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
                  (size_t)std::count_if(out->steps.begin(), out->steps.end(),
                                        [](const TapeStep& st) { return st.kind == kTapeTable; }),
                  out->route.size());
+        if (acq_rule_on())
+            RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- the acquire rule plays %d of the %d "
+                     "dispatches (%d of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=%s)",
+                     b->draft_pass, (long long)b->n_tok, out->noacq, out->dispatches, out->noacq_ordered,
+                     acq_rule_mode() == 2 ? "rule-w" : "rule");
     }
     return 1;
 }
@@ -1149,7 +1203,23 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
  *
  * Host work between played stretches needs nothing here: a host op joins its dependencies, and
  * anything host work puts on a queue (table patch, mover wait) makes the backend order the next
- * played packet on that queue. */
+ * played packet on that queue..
+ *
+ * RADIANCE_AQL_ACQ=rule adds the acquire rule (tape_set_noacq). A packet's agent-scope acquire
+ * invalidates every CU's caches; between two acquires (a window, one a queue) a CU can only read a
+ * stale line if that line was cached in the window and written again from elsewhere in the window.
+ * So a dispatch may play without its acquire iff none of the lines it reads is in the window's
+ * risky set: under `rule` the lines both read and written since the window began (an op's reads x
+ * an earlier op's writes, its writes x earlier reads, and its own reads x writes: tools/acqrule.py's
+ * count), which holds if a store leaves no line behind in its own CU's caches; under `rule-w` every
+ * line written in the window as well (a CU may serve a line it stored after another rewrote it:
+ * queue-r2 82-cohbench2's ww arms decide which). A dispatch
+ * that keeps its acquire starts a new window with its own lines and, when it starts unordered,
+ * those of the ops still in flight beside it. Unknown, so the next dispatch keeps its acquire:
+ * the pass's first, after an event on its queue, at every played stretch's start (host work,
+ * table patches and copies come between stretches), after a dispatch no op owns or an opaque op
+ * (collectives, unbounded operands). Weights are not in the sets: nothing writes them in a pass.
+ * Lines are widened to 128 bytes. */
 int Ctx::haz_mark(PassTape& t) {
     const int n = tape_len(t.dev);
     if (n < 0) return n;
@@ -1175,6 +1245,26 @@ int Ctx::haz_mark(PassTape& t) {
         int  run = 0;
     };
     std::vector<Q> qs;
+    /* The acquire rule's window a queue (RADIANCE_AQL_ACQ=rule). */
+    struct AW {
+        uint32_t id = 0;
+        LineSet  r, w, risky;
+        bool     unknown = true;
+    };
+    const bool acq_rule = acq_rule_on(), acq_w = acq_rule_mode() == 2;
+    std::vector<AW> aws;
+    std::vector<uint8_t> stretch0((size_t)n + 1, 0);
+    for (const TapeStep& st : t.steps)
+        if (st.kind == kTapePlay && st.a >= 0 && st.a <= n) stretch0[(size_t)st.a] = 1;
+    auto lines_of = [&](uint32_t at, uint32_t cnt) {
+        LineSet v;
+        for (uint32_t k = 0; k < cnt; ++k) {
+            const auto& x = haz_rng_[at + k];
+            if (x.second > x.first) v.push_back({ x.first / kAcqLine, (x.second - 1) / kAcqLine + 1 });
+        }
+        return ls_merge(std::move(v));
+    };
+    t.noacq = t.noacq_ordered = 0;
     for (int i = 0; i < n; ++i) {
         int kind = 0;
         uint32_t qid = 0;
@@ -1183,11 +1273,19 @@ int Ctx::haz_mark(PassTape& t) {
         Q* q = nullptr;
         for (Q& x : qs) if (x.id == qid) { q = &x; break; }
         if (!q) { qs.push_back(Q{}); q = &qs.back(); q->id = qid; }
+        AW* aw = nullptr;
+        if (acq_rule) {
+            if (stretch0[(size_t)i]) for (AW& x : aws) x.unknown = true;
+            for (AW& x : aws) if (x.id == qid) { aw = &x; break; }
+            if (!aw) { aws.push_back(AW{}); aw = &aws.back(); aw->id = qid; }
+        }
         /* An event packet: the next dispatch is ordered, since nothing after a wait may start
          * before its event completes. */
         if (kind != 0) {
             if (haz_dump_) fprintf(stderr, "TAPEDUMP r%d %d q%u event\n", rank_, i, qid);
-            q->infl.clear(); q->opaque = true; q->run = 0; continue;
+            q->infl.clear(); q->opaque = true; q->run = 0;
+            if (aw) aw->unknown = true;
+            continue;
         }
         ++t.dispatches;
 
@@ -1229,6 +1327,38 @@ int Ctx::haz_mark(PassTape& t) {
                     pl && pl->info ? pl->info->op.c_str() : "-",
                     h && h->row && h->row->info && h->row->info->name ? h->row->info->name : "-", why,
                     clash >= 0 ? fmt(" with hop%d", clash).c_str() : "", rr.c_str());
+        }
+        if (aw) {
+            const int32_t own = part_of[(size_t)i];
+            if (own < 0 || haz_ops_[(size_t)own].opaque) {
+                aw->unknown = true;
+            } else {
+                const HazOp& h = haz_ops_[(size_t)own];
+                const LineSet rd = lines_of(h.rd, h.n_rd), wr = lines_of(h.wr, h.n_wr);
+                if (aw->unknown || ls_meet(rd, aw->risky)) {
+                    /* Keeps its acquire: a new window. Started unordered, the ops in flight beside
+                     * it touch lines after the invalidation too. */
+                    aw->r = rd;
+                    aw->w = wr;
+                    if (ok)
+                        for (int32_t x : q->infl) {
+                            const HazOp& f = haz_ops_[(size_t)x];
+                            aw->r = ls_unite(aw->r, lines_of(f.rd, f.n_rd));
+                            aw->w = ls_unite(aw->w, lines_of(f.wr, f.n_wr));
+                        }
+                    aw->risky = acq_w ? aw->w : ls_inter(aw->r, aw->w);
+                    aw->unknown = false;
+                } else {
+                    const int sc = tape_set_noacq(t.dev, i, true);
+                    if (sc < 0) return sc;
+                    ++t.noacq;
+                    if (!ok) ++t.noacq_ordered;
+                    aw->risky = ls_unite(aw->risky, ls_unite(ls_inter(rd, aw->w), ls_inter(wr, aw->r)));
+                    aw->risky = ls_unite(aw->risky, acq_w ? wr : ls_inter(rd, wr));
+                    aw->r = ls_unite(aw->r, rd);
+                    aw->w = ls_unite(aw->w, wr);
+                }
+            }
         }
         if (ok) {
             const int sc = tape_set_overlap(t.dev, i, true);
