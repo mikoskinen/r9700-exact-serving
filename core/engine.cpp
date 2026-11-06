@@ -482,6 +482,17 @@ void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
     xs->note_dropped(r.ctx.route_dropped());
 }
 
+/* How much of a step a trunk histogram of step `step` counts as (HeatParams::prefill_share): its
+ * decode rows in full and its prefill rows at the share, over its rows. 1 where the share is 1, for
+ * a draft head's layers (past the model's layers; xstats files them the same way), and for a step
+ * the ring no longer holds. */
+float Engine::heat_share(const Rank& r, int layer, int step) const {
+    const float p = heat_prefill_share_;
+    if (!(p < 1.0f) || step < 0 || layer >= (int)meta_.n_layers || r.heat_steps.empty()) return 1.0f;
+    const Rank::HeatStepRows& s = r.heat_steps[(size_t)(step % Rank::kHeatStepRing)];
+    return s.step == step ? heat_step_share(p, s.n_tok, s.n_tok_decode) : 1.0f;
+}
+
 void Engine::tiering_dispatch(Rank& r, int step) {
     XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
     if (!r.heat.enabled()) {
@@ -504,7 +515,8 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         /* A bank can hold several passes (a draft head reports once per pass into one bank), so
          * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
-        r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
+        r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f,
+                       heat_share(r, hr.layer, r.ctx.last_histogram_step(hr.layer, hr.bank)));
         /* The row is in cache now. */
         if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
@@ -661,6 +673,15 @@ void Engine::rank_loop(int index) {
              * more later. An encoder pass is not a step of the token stream. */
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
+            /* The heat engine's prefill share reads each trunk step's rows at its drain. */
+            if (heat_prefill_share_ < 1.0f && what != kIssueSampler && b->enc == 0 &&
+                b->draft_pass == 0 && b->step >= 0) {
+                if (r.heat_steps.empty()) r.heat_steps.resize(Rank::kHeatStepRing);
+                Rank::HeatStepRows& hs = r.heat_steps[(size_t)(b->step % Rank::kHeatStepRing)];
+                hs.step = b->step;
+                hs.n_tok = b->n_tok;
+                hs.n_tok_decode = b->n_tok_decode;
+            }
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());

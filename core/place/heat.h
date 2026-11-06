@@ -78,6 +78,22 @@ struct HeatParams {
      * 1024, 79.0% at 512 or 256. */
     float credit_cap = 512.0f;
 
+    /* How much of a step a histogram from a step with prefill rows counts as, 0..1: its decay and
+     * its credit are both scaled to that share (observe's `share`), so 0 leaves the heat exactly
+     * as the decode steps around the prompt left it and 1 is the step every histogram counted as
+     * before (bit for bit). The engine gives a step of `n` rows, `d` of them decode rows, the share
+     * (d + prefill_share * (n - d)) / n; a draft head's layers keep 1.
+     *
+     * Why: the cap bounds one chunk, not a prompt. Under expert parallelism a rank sees about
+     * 8192 x top-k / world selections of a chunk, always over the cap, and a decode step about
+     * top-k / world, so each chunk credits several hundred decode steps' worth and decays the
+     * decode heat once more. DeepSeek-V4.1-Flash EXL3 at TP4 (6.11.): after a 243k-token cold
+     * prefill (30 chunks) the routed experts ran 8.3 ms a step instead of 5.0 and the MoE
+     * all-reduce waited 10.7 ms instead of 5.0, recovering over ~200 decode steps as the moves
+     * put the decode set back. Placement never changes an output (the same kernel reads the same
+     * bytes from whichever tier holds them), so the share is exact. RADIANCE_HEAT_PREFILL. */
+    float prefill_share = 1.0f;
+
     /* Dispatches to watch before moving anything. 0, because min_gain already requires
      * `hot >= cold*hysteresis + 1.5`, which against a zero-heat victim is two tokens agreeing in
      * one dispatch; a warmup only delays convergence. */
@@ -92,6 +108,17 @@ struct HeatParams {
      * container is ground truth), so the cost of an admission mistake is one future re-read. */
     float admit_heat = 8.0f;
 };
+
+/* The share of a step (HeatParams::prefill_share) a histogram of a step with `n_tok` rows,
+ * `n_tok_decode` of them decode rows, is credited at: the decode rows in full, the prefill rows at
+ * `prefill_share`, over the rows. 1 for a pure decode step, `prefill_share` for a pure prefill one,
+ * and 1 whenever the share is 1 or the rows are unknown. */
+inline float heat_step_share(float prefill_share, int64_t n_tok, int64_t n_tok_decode) {
+    if (!(prefill_share < 1.0f) || n_tok <= 0 || n_tok_decode >= n_tok) return 1.0f;
+    const double d = n_tok_decode > 0 ? (double)n_tok_decode : 0.0, n = (double)n_tok;
+    const double p = prefill_share > 0.0f ? (double)prefill_share : 0.0;
+    return (float)((d + p * (n - d)) / n);
+}
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
  * together: a promotion without its demotion would grow the resident set past the slab. */
@@ -211,8 +238,14 @@ public:
      *
      * `weight` is how many of the layer's routing passes this histogram stands for (see
      * Ctx::last_histogram_reports): 1 for a non-speculative step, n_spec for a draft head. It
-     * scales the credit, not the decay, because every layer still decays exactly once a step. */
-    void observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight = 1.0f);
+     * scales the credit, not the decay, because every layer still decays exactly once a step.
+     *
+     * `share` is how much of a step the histogram's step counts as (HeatParams::prefill_share):
+     * the decay is decay^share and the credit is scaled by share. 1 is the plain step, exactly as
+     * without the parameter; 0 or less leaves every heat as it was and only prices the routing
+     * (hit rate, streamed bytes), so the counters still see every step. */
+    void observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight = 1.0f,
+                 float share = 1.0f);
     /* The same, sparse: distinct expert ids and their counts. `counts` may be null for one each. */
     void observe_ids(int32_t layer, const int32_t* experts, const int32_t* counts, int32_t n);
     /* Starts fetching a histogram observe() will read. A row the card copied into host memory

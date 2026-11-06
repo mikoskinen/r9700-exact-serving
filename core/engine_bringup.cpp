@@ -2914,6 +2914,31 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
+/* The heat engine's parameters: the shipped HeatParams, with two policy knobs from the environment
+ * for A/B runs (docs/GUIDE.md section 8). RADIANCE_HEAT_PREFILL is HeatParams::prefill_share,
+ * clamped to 0..1; RADIANCE_HEAT_CREDIT_CAP is HeatParams::credit_cap, taken when above 0. Unset,
+ * empty or not a number: the default, the latter with a warning. Placement never changes an
+ * output, so neither changes what a request returns, only where its experts are read from. */
+static HeatParams heat_params_from_env() {
+    HeatParams hp;
+    const auto num = [](const char* k, float* out) {
+        const char* e = getenv(k);
+        if (!e || !*e) return false;
+        char* end = nullptr;
+        const float v = std::strtof(e, &end);
+        if (end == e || *end || !(v == v) || v > 3.0e38f || v < -3.0e38f) {
+            RAD_WARN("%s=%s is not a number; the heat engine keeps its default", k, e);
+            return false;
+        }
+        *out = v;
+        return true;
+    };
+    float v = 0.0f;
+    if (num("RADIANCE_HEAT_PREFILL", &v)) hp.prefill_share = std::min(1.0f, std::max(0.0f, v));
+    if (num("RADIANCE_HEAT_CREDIT_CAP", &v) && v > 0.0f) hp.credit_cap = v;
+    return hp;
+}
+
 int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
@@ -2949,7 +2974,9 @@ int Engine::load_weights() {
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+        const HeatParams hp = heat_params_from_env();
+        heat_prefill_share_ = hp.prefill_share;
+        RAD_TRY(r->heat.init(r->plan, hp));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes

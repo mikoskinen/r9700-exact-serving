@@ -4127,6 +4127,8 @@ TranslateGemma 18.3 ms a step, against 19.8-20.5.
 | `RADIANCE_G4_CALIB_LAYERS` | `lo:hi`: the same for `arch/gemma4`'s tap, which takes the Gemma 4 31B's Grams from its bf16 checkpoint (docs/GEMMA4-31B-GPTQ.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_AQL_STAMP`, `RADIANCE_AQL_STAMP_OUT` | `N`: time every dispatch of one recorded pass in N on card 0, each with a completion signal of its own, without changing its barriers or chains (`--profile-ops` plays no recorded pass). One CSV line a dispatch (pass, record, queue, kernel, ordered, chained, start and end in ns) goes to `RADIANCE_AQL_STAMP_OUT` (default `/tmp/radiance-stamps-<pid>.csv`); `scripts/stampgaps.py` summarises it per kind of pass. AQL backend only |
+| `RADIANCE_HEAT_PREFILL` | `0`..`1`: how much of a step the heat engine credits a step with prefill rows at -- its decode rows in full, its prefill rows at this share -- scaling both that step's credit and its decay (default 1, every step a whole step). `0` keeps a prompt's routing from turning the resident set towards the prompt's experts: under expert parallelism each 8192-token chunk credits several hundred decode steps' worth even under the credit cap, and the decode after a long cold prompt then reads its experts across the link until the moves put the decode set back. Placement does not change outputs |
+| `RADIANCE_HEAT_CREDIT_CAP` | the most selections one histogram credits (`HeatParams::credit_cap`, default 512); above 0 |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue

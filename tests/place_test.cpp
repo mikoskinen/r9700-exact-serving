@@ -725,6 +725,50 @@ TEST(heat_caps_what_one_histogram_credits) {
     CHECK(std::fabs(h.heat(a) - 400.0f * hp.decay) < 1e-3f);
 }
 
+/* A step with prefill rows counts as a share of a step (HeatParams::prefill_share): its decay is
+ * decay^share and its credit is scaled by the share. Share 0 leaves every heat where the decode
+ * steps left it and still prices the routing; share 1 is the plain step, bit for bit. */
+TEST(heat_credits_a_prefill_step_at_its_share) {
+    HeatFixture hf;
+    HeatEngine h, plain;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    CHECK_OK(plain.init(hf.plan, hp));
+    const int32_t a = hf.unit_of_expert(4), b = hf.unit_of_expert(5);
+
+    int32_t dec[8] = {0, 0, 0, 0, 10, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f);
+    plain.observe(0, dec, 8);
+    CHECK_EQ(h.heat(a), plain.heat(a));
+    CHECK_EQ(h.heat(a), 10.0f);
+
+    /* A prefill chunk at share 0: nothing decays, nothing is credited, the routing is counted. */
+    const uint64_t routed = h.stats().routed;
+    int32_t pf[8] = {0, 0, 0, 0, 0, 300, 0, 0};
+    h.observe(0, pf, 8, 1.0f, 0.0f);
+    CHECK_EQ(h.heat(a), 10.0f);
+    CHECK_EQ(h.heat(b), 0.0f);
+    CHECK_EQ(h.stats().routed, routed + 1);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    for (const Swap& s : sw) CHECK(s.promote != b);
+    for (const Swap& s : sw) h.abandon(s);
+
+    /* Share 0.5, under the cap: half the credit and half a step's decay. */
+    int32_t half[8] = {0, 0, 0, 0, 0, 8, 0, 0};
+    h.observe(0, half, 8, 1.0f, 0.5f);
+    CHECK(std::fabs(h.heat(a) - 10.0f * std::pow(hp.decay, 0.5f)) < 1e-4f);
+    CHECK(std::fabs(h.heat(b) - 4.0f) < 1e-5f);
+
+    /* The engine's share of a step's rows. */
+    CHECK_EQ(heat_step_share(1.0f, 8192, 0), 1.0f);
+    CHECK_EQ(heat_step_share(0.0f, 8192, 0), 0.0f);
+    CHECK_EQ(heat_step_share(0.0f, 4, 4), 1.0f);
+    CHECK_EQ(heat_step_share(0.0f, 0, 0), 1.0f);
+    CHECK(std::fabs(heat_step_share(0.0f, 8192, 3) - 3.0f / 8192.0f) < 1e-7f);
+    CHECK(std::fabs(heat_step_share(0.25f, 100, 20) - 0.4f) < 1e-6f);
+}
+
 TEST(heat_respects_the_move_budget) {
     HeatFixture hf;
     HeatEngine h;

@@ -159,6 +159,8 @@ private:
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */
     std::unique_ptr<ExpertStats> xstats_;
+    /* HeatParams::prefill_share as bring-up read it (RADIANCE_HEAT_PREFILL); 1 records nothing. */
+    float heat_prefill_share_ = 1.0f;
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
@@ -680,6 +682,9 @@ private:
      * what the heat engine proposes. A member because Rank is private; a no-op on a static plan.
      * The definition explains why a step is the unit. */
     void tiering_dispatch(Rank& r, int step);
+    /* The share of a step a trunk histogram of `step` is credited at (HeatParams::prefill_share,
+     * RADIANCE_HEAT_PREFILL); 1 unless the share is below one and the step had prefill rows. */
+    float heat_share(const Rank& r, int layer, int step) const;
     /* The routing histograms landed since the last drain (tiering_dispatch), and the drain alone
      * for --expert-stats where the heat engine is off. */
     void find_histograms(Rank& r, int before_step);

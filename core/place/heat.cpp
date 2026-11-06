@@ -153,6 +153,9 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
              params_.moves_per_step == 1 ? "" : "s",
              (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
              (double)params_.credit_cap, (double)params_.admit_heat);
+    if (params_.prefill_share != 1.0f)
+        RAD_INFO("heat engine: a step with prefill rows counts as its decode share plus %.3f of its "
+                 "prefill share (RADIANCE_HEAT_PREFILL)", (double)params_.prefill_share);
     return RAD_OK;
 }
 
@@ -188,7 +191,8 @@ void HeatEngine::observe_ids(int32_t layer, const int32_t* experts, const int32_
  * usually a crowd (every resident unit not routed to lately sits at zero). When the last is
  * credited the layer is rebuilt from its positions. Ties created by decay are not counted, which
  * can only cause an unneeded rebuild. */
-void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight) {
+void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight,
+                         float share) {
     if (!enabled_ || layer < 0 || layer >= n_layer_ || !counts) return;
     if (!(weight > 0.0f)) weight = 1.0f;
     /* Routing passes this histogram stands for (see heat.h: observe); at least one. */
@@ -198,19 +202,41 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     const int32_t lo = slot_lo_[l], len = slot_lo_[l + 1] - lo;
     /* Positions past the histogram's or the layer's last expert get no credit. */
     const int32_t n = std::max(0, std::min(n_expert, n_ex_[l]));
-    const float d = params_.decay;
 
     /* The histogram arrives by DMA and is not in cache. Prefetching every line at once overlaps
      * the misses with each other and with the decay; a caller sweeping layers may prefetch
      * earlier still. */
     prefetch(counts, n);
 
+    /* A step that counts for nothing (HeatParams::prefill_share 0 on a prefill step): priced as
+     * any histogram, so hit rate and streamed bytes still cover it, and no heat or end moves. */
+    if (!(share > 0.0f)) {
+        int32_t routed = 0, resident = 0;
+        int64_t miss = 0;
+        for (int32_t j = 0; j < n; ++j) {
+            if (counts[j] <= 0) continue;
+            const size_t q = (size_t)(lo + j);
+            routed += routed_as_[q] != 0;
+            resident += routed_as_[q] == 2;
+            miss += miss_bytes_[q];
+        }
+        stats_.routed += (uint64_t)routed * passes;
+        stats_.routed_resident += (uint64_t)resident * passes;
+        stats_.stream_bytes += (uint64_t)miss * passes;
+        ++stats_.dispatches;
+        return;
+    }
+    /* A part of a step decays by decay^share, so shares adding to one step decay as that step.
+     * share 1 takes the plain constant (no pow), the same bits as before the parameter. */
+    const float d = share < 1.0f ? std::pow(params_.decay, share) : params_.decay;
+
     /* The credit cap (HeatParams::credit_cap) scales the whole histogram, preserving order.
      * Pricing ignores the cap. */
     int64_t total = 0;
     for (int32_t j = 0; j < n; ++j) total += counts[j] > 0 ? counts[j] : 0;
     const float cap = params_.credit_cap;
-    const float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
+    float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
+    if (share < 1.0f) w *= share;
 
     float* __restrict h = heat_.data() + lo;
     for (int32_t j = 0; j < len; ++j) h[j] *= d;
