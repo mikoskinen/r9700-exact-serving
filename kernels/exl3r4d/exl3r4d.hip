@@ -56,8 +56,8 @@
 #ifndef EXL3_PF_GU  // gate_up's (round 2, L1b on buffer loads: PF 4 is -5.2% at tp2 M=1, -1.9% at M=4; down loses)
 #define EXL3_PF_GU 4
 #endif
-#ifndef EXL3_PF_GU_HALF  // gate_up's at a half-integer K (2.5): see moe_pass's PF
-#define EXL3_PF_GU_HALF 3
+#ifndef EXL3_PF_GU_HALF  // gate_up's at a half-integer K (2.5): see moe_pass's PF (4 with the 12-byte tile load)
+#define EXL3_PF_GU_HALF (EXL3R4D_HALF_B96 ? 4 : 3)
 #endif
 #ifndef EXL3_PF
 #define EXL3_PF 2  // k steps of weights / activations in flight per wave (2 = double buffering); down's
@@ -333,6 +333,25 @@ constexpr int kStreamP = EXL3R4D_STREAM_P;
 
 static __host__ __device__ constexpr int stream_slot_bytes(int npw) { return npw * kStreamP * 128; }
 
+/* The 12-byte tile load of a half-integer K (EXL3R4D_HALF_B96): lane L's two runs need the words (d0 - 1, d0) and
+ * (d1 - 1, d1), d1 = d0 or d0 + 1 (run 1 ends 20 half-bits later), mod WORDS: three consecutive words from
+ * d0 - 1, except at the tile's start (d0 = 0), where the first is the tile's LAST word. A lane loads words [d0 - 1,
+ * d0 + 2) (from 0 where d0 = 0) and the wrapped lanes take the last word from the lane whose load holds it, by one
+ * readlane: b96_holder() is that lane * 4 + the word's place in its load. A load may read one word past the tile (the
+ * last word's lanes, d1 = d0 there): the next tile's, or zero past the matrix (the resource's extent). */
+template <int BITS>
+static __host__ __device__ constexpr int b96_holder() {
+  constexpr int K2 = exl3r4d_k2(BITS), WORDS = 4 * K2;
+  for (int lane = 0; lane < 32; ++lane) {
+    const int n = lane & 15, h = lane >> 4, base = 32 * (n & 7) + 4 * (n >> 3) + 16 * h;
+    const int e3 = ((base >> 1) + 2) * K2, d0 = (e3 - 1) >> 5;
+    if (d0 == 0) continue;
+    const int st = d0 - 1;
+    if (st <= WORDS - 1 && WORDS - 1 <= st + 2) return lane * 4 + (WORDS - 1 - st);
+  }
+  return -1;
+}
+
 template <int BITS, int NPW>
 static __device__ __forceinline__ void kloop_stream(gu8 wt0, unsigned kbytes, gu8 abase, unsigned avo, int kps,
                                                     int lane, unsigned char* slot, const unsigned (&wvo)[2][Plan<BITS>::NW],
@@ -471,6 +490,9 @@ static __device__ EXL3R4D_ROT_INLINE void rotate_rows(const Exl3r4dGemm& p, cons
 #ifndef EXL3R4D_KX_BUF
 #define EXL3R4D_KX_BUF 1
 #endif
+#ifndef EXL3R4D_HALF_B96  // a half-integer K's decode K loop: a lane's tile words as one 12-byte load (see moe_pass):
+#define EXL3R4D_HALF_B96 1  // 1 gate_up only (its PF 4 comes back), 2 gate_up and down, 0 off (four 4-byte loads a tile)
+#endif
 #ifndef EXL3R4D_EPIC  // down: both output tiles of a wave from one pass over the staged tiles (epilogue_block)
 #define EXL3R4D_EPIC 1  // ADOPTED (runs/epic): down -0.12/+0.04/-0.74/-0.09/-1.00 us at tp2 M=1/2/4/8/16; bits move
 #endif                  // inside the tolerance (paired across-tile sum)
@@ -592,7 +614,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // 4 K2 = 20 words and a lane's two runs touch 4 of them (2 at K = 2, whose runs share their words, 3 at K = 4), so PF 4
   // holds 32 weight VGPRs in flight against K = 2's 16; at 178 VGPRs the allocator then copied loop-carried load results
   // and the K loop waited s_wait_loadcnt 0 six times an iteration (every load drained each 4 k-steps: gate_up 2.5 bit
-  // 133 us vs 81.7 at K = 2, M = 1, 2.9 live experts, 6.11. runs/splitk-micro). PF 3 keeps every wait partial.
+  // 133 us vs 81.7 at K = 2, M = 1, 2.9 live experts, 6.11. runs/splitk-micro). PF 3 keeps every wait partial
+  // (114 us on the card, 57-gu25-micro). With the 12-byte tile load (EXL3R4D_HALF_B96, 3 words a tile in flight, 24 at PF 4)
+  // PF 4 holds no 0-wait either (device ISA, 180 VGPRs), so EXL3_PF_GU_HALF is 4 there.
   constexpr int PF = PFO > 0 ? PFO : MATS == 2 ? (exl3r4d_k2(BITS) % 2 ? EXL3_PF_GU_HALF : EXL3_PF_GU) : EXL3_PF;
   [[maybe_unused]] unsigned ew[PF > 1 ? PF - 1 : 1][NPW][2][NW];
   if constexpr (APREP && EXL3R4D_EW) {
@@ -762,12 +786,22 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // VALU (the global form spends ~5 a tile on 64-bit v_add_co pairs, R1). At K = 4 a lane's two runs touch three
   // words: woff[1][x] = woff[0][x] + 1 (run 1 ends 32 bits later), so W[0] = {w-1, w0}, W[1] = {w0, w+1}.
   // Descriptor word 3: gfx11/12 raw buffer (0x31004000: OOB_SELECT raw, no stride, no swizzle).
-  [[maybe_unused]] const __amdgpu_buffer_rsrc_t wrs =
-      __builtin_amdgcn_make_buffer_rsrc((void*)wexp, (short)0, 0x7fffffff, 0x31004000);
+  // EXL3R4D_HALF_B96 (a half-integer K, buffer form): one 12-byte load a tile (b96_holder above), so the resource's
+  // extent is this matrix's codes exactly -- a load one word past its last tile reads zero, not the next allocation.
+  constexpr bool kB96 = (EXL3R4D_HALF_B96 == 2 || (EXL3R4D_HALF_B96 == 1 && MATS == 2)) && EXL3R4D_BUF &&
+                        EXL3R4D_KX_BUF && NW == 2 && BITS != 4 && exl3r4d_k2(BITS) % 2 == 1 && !STAGED;
+  [[maybe_unused]] const __amdgpu_buffer_rsrc_t wrs = __builtin_amdgcn_make_buffer_rsrc(
+      (void*)wexp, (short)0, kB96 ? (int)((size_t)ksteps * ntiles * WORDS * 4) : 0x7fffffff, 0x31004000);
   [[maybe_unused]] const __amdgpu_buffer_rsrc_t ars =
       __builtin_amdgcn_make_buffer_rsrc((void*)abase, (short)0, 0x7fffffff, 0x31004000);
   [[maybe_unused]] const unsigned bso = (unsigned)(tile0 * WORDS * 4);
   [[maybe_unused]] const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
+  // the 12-byte load's start (words d0 - 1 .. d0 + 1, from 0 at the tile's start), the wrapped lanes, the lanes whose run
+  // 1 is one word on (d1 = d0 + 1), and where the tile's last word is held
+  [[maybe_unused]] const bool b96w = plan.woff[0][1] == 0, b96p = plan.woff[1][1] != plan.woff[0][1];
+  [[maybe_unused]] const unsigned b96o = b96w ? 0u : wvo[0][0];
+  [[maybe_unused]] constexpr int kB96H = kB96 ? b96_holder<BITS>() : 0;
+  static_assert(!kB96 || (kB96H >= 0 && (kB96H & 3) >= 1), "b96_holder: no lane holds the tile's last word");
   // R23: the three-word buffer form is K = 4's (a lane's two runs share their middle word only there); every other K
   // takes the global form
   // R23 (EXL3R4D_KX_BUF): another K takes the buffer form too, four words a tile (each run's two), addresses still
@@ -794,6 +828,9 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
             q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux); \
           }                                                                          \
           W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;   \
+        } else if constexpr (kB96) {                                                 \
+          const auto t_ = __builtin_amdgcn_raw_buffer_load_b96(wrs, b96o + j * WORDS * 4, so_, kAux); \
+          W_[j][0][0] = t_[0]; W_[j][0][1] = t_[1]; W_[j][1][0] = t_[2];            \
         } else {                                                                     \
           _Pragma("unroll") for (int r = 0; r < 2; r++)                              \
             _Pragma("unroll") for (int x = 0; x < NW; x++)                           \
@@ -832,7 +869,17 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 #define EXL3_COMPUTE(W_, A_)                                                         \
   do {                                                                               \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                \
-      const v8h wf = decode_frag<BITS, NW>(W_[j], plan.shift);                       \
+      v8h wf;                                                                        \
+      if constexpr (kB96) { /* words d0-1, d0, d0+1 (wrapped lanes: last, 0, 1) -> the runs' pairs */ \
+        const unsigned v0_ = W_[j][0][0], v1_ = W_[j][0][1], v2_ = W_[j][1][0];     \
+        const unsigned l_ = (unsigned)__builtin_amdgcn_readlane(                     \
+            (int)((kB96H & 3) == 1 ? v1_ : v2_), kB96H >> 2);                        \
+        const unsigned x0_ = b96w ? l_ : v0_, x1_ = b96w ? v0_ : v1_, x2_ = b96w ? v1_ : v2_; \
+        const unsigned w2_[2][NW] = { { x0_, x1_ }, { b96p ? x1_ : x0_, b96p ? x2_ : x1_ } }; \
+        wf = decode_frag<BITS, NW>(w2_, plan.shift);                                 \
+      } else {                                                                       \
+        wf = decode_frag<BITS, NW>(W_[j], plan.shift);                               \
+      }                                                                              \
       acc[j] = mma(wf, A_, acc[j]);                                                  \
     }                                                                                \
     if constexpr (EXL3R4D_SGB || PIN) { /* pin: the step's loads, its decode, its WMMAs (libr4d's OPT 2048) */ \
