@@ -56,6 +56,9 @@
 #ifndef EXL3_PF_GU  // gate_up's (round 2, L1b on buffer loads: PF 4 is -5.2% at tp2 M=1, -1.9% at M=4; down loses)
 #define EXL3_PF_GU 4
 #endif
+#ifndef EXL3_PF_GU_HALF  // gate_up's at a half-integer K (2.5): see moe_pass's PF
+#define EXL3_PF_GU_HALF 3
+#endif
 #ifndef EXL3_PF
 #define EXL3_PF 2  // k steps of weights / activations in flight per wave (2 = double buffering); down's
 #endif
@@ -585,7 +588,12 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // with the fused prep, the first EXL3_PF - 1 k-steps' weight words are issued BEFORE the rows are rotated, and the
   // barrier after the rotation orders LDS only, so they stay in flight across it; the gather loop's prologue takes
   // them instead of loading.
-  constexpr int PF = PFO > 0 ? PFO : MATS == 2 ? EXL3_PF_GU : EXL3_PF;  // per op (L1b); PFO: the caller's (FU_PF_DN)
+  // Per op (L1b); PFO: the caller's (FU_PF_DN). A half-integer K's gate_up takes EXL3_PF_GU_HALF (3): its tile is
+  // 4 K2 = 20 words and a lane's two runs touch 4 of them (2 at K = 2, whose runs share their words, 3 at K = 4), so PF 4
+  // holds 32 weight VGPRs in flight against K = 2's 16; at 178 VGPRs the allocator then copied loop-carried load results
+  // and the K loop waited s_wait_loadcnt 0 six times an iteration (every load drained each 4 k-steps: gate_up 2.5 bit
+  // 133 us vs 81.7 at K = 2, M = 1, 2.9 live experts, 6.11. runs/splitk-micro). PF 3 keeps every wait partial.
+  constexpr int PF = PFO > 0 ? PFO : MATS == 2 ? (exl3r4d_k2(BITS) % 2 ? EXL3_PF_GU_HALF : EXL3_PF_GU) : EXL3_PF;
   [[maybe_unused]] unsigned ew[PF > 1 ? PF - 1 : 1][NPW][2][NW];
   if constexpr (APREP && EXL3R4D_EW) {
 #pragma unroll
