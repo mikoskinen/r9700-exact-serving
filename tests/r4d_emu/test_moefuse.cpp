@@ -814,6 +814,74 @@ void mix_fuse_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* mhc_post_collapse_rmsnorm as the all-reduce's word-partitioned epilogue (r4d_ds41_pcn_words, fusion 2's single-card
+ * step) against the norm kernel itself: out, xc and y byte for byte at decode heights, every block count from one to
+ * more blocks than words, the counters reset (run twice), f32 and bf16 gains. */
+extern "C" int r4d_ds41_pcn_words(const RadArgs* a, RadStream s, int nb, unsigned* ctr);
+void pcn_words_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct Sh { int M, n, hc; bool wf32; };
+    const Sh shapes[] = { { 1, 5120, 4, true }, { 2, 5120, 4, true }, { 6, 5120, 4, true }, { 8, 5120, 4, false },
+                          { 3, 1024, 4, true }, { 33, 1024, 4, true }, { 5, 2048, 8, false } };
+    const int nbs[] = { 1, 3, 64, 257, 4096 };
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    auto bf = [](float x) { uint32_t u; std::memcpy(&u, &x, 4); return (uint16_t)(u >> 16); };
+    for (const Sh& sh : shapes) {
+        const int M = sh.M, n = sh.n, hc = sh.hc;
+        std::vector<uint16_t> xin((size_t)M * n), h((size_t)M * hc * n), wb((size_t)n);
+        std::vector<float> post((size_t)M * hc), comb((size_t)M * hc * hc), pre((size_t)M * hc), wf((size_t)n);
+        for (auto& v : xin) v = bf(ud(rng));
+        for (auto& v : h) v = bf(ud(rng));
+        for (auto& v : post) v = ud(rng);
+        for (auto& v : comb) v = ud(rng) * 0.5f;
+        for (auto& v : pre) v = ud(rng);
+        for (int i = 0; i < n; ++i) { wf[(size_t)i] = 1.0f + ud(rng) * 0.1f; wb[(size_t)i] = bf(wf[(size_t)i]); }
+        auto run = [&](int nb, std::vector<uint16_t>& out, std::vector<uint16_t>& x, std::vector<uint16_t>& y,
+                       std::vector<unsigned>* ctr) {
+            out.assign((size_t)M * hc * n, 0x7e57); x.assign((size_t)M * n, 0x7e57); y.assign((size_t)M * n, 0x7e57);
+            RadTensor t[9]{};
+            auto mat = [](RadTensor& q, void* d, uint32_t dt, long r, long c) {
+                q.data = d; q.dtype = dt; q.rank = 2; q.shape[0] = r; q.shape[1] = c; q.stride[0] = c; q.stride[1] = 1;
+            };
+            mat(t[0], xin.data(), RAD_BF16, M, n);
+            mat(t[1], h.data(), RAD_BF16, M, (long)hc * n);
+            mat(t[2], post.data(), RAD_F32, M, hc);
+            mat(t[3], comb.data(), RAD_F32, M, (long)hc * hc);
+            mat(t[4], out.data(), RAD_BF16, M, (long)hc * n);
+            mat(t[5], pre.data(), RAD_F32, M, hc);
+            mat(t[6], x.data(), RAD_BF16, M, n);
+            t[7].data = sh.wf32 ? (void*)wf.data() : (void*)wb.data(); t[7].dtype = sh.wf32 ? RAD_F32 : RAD_BF16;
+            t[7].rank = 1; t[7].shape[0] = n; t[7].stride[0] = 1;
+            mat(t[8], y.data(), RAD_BF16, M, n);
+            std::vector<RadParam> p(3);
+            p[0] = { "n", RAD_P_INT, n }; p[1] = { "hc", RAD_P_INT, hc };
+            p[2].key = "eps"; p[2].kind = RAD_P_F64; p[2].dval = 1e-6;
+            RadArgs a{};
+            a.t = t; a.n_t = 9; a.p = p.data(); a.n_p = 3;
+            return ctr ? r4d_ds41_pcn_words(&a, nullptr, nb, ctr->data()) : r4d_rad_mhc_post_collapse_rmsnorm(&a, nullptr);
+        };
+        std::vector<uint16_t> o0, x0, y0;
+        const int r0 = run(0, o0, x0, y0, nullptr);
+        std::vector<unsigned> ctr((size_t)M, 0u);
+        for (int nb : nbs) {
+            for (int rep = 0; rep < 2; ++rep) {
+                std::vector<uint16_t> o1, x1, y1;
+                ++cases;
+                const int r1 = run(nb, o1, x1, y1, &ctr);
+                bool zero = true;
+                for (unsigned c : ctr) zero = zero && c == 0;
+                if (r0 || r1 || o0 != o1 || x0 != x1 || y0 != y1 || !zero) {
+                    int dy = 0;
+                    for (size_t i = 0; i < y0.size(); ++i) dy += y0[i] != y1[i];
+                    std::printf("FAIL pcn_words M=%d n=%d hc=%d nb=%d rep %d (rc %d %d; out %d xc %d y %d (%d differ) "
+                                "counters %s)\n", M, n, hc, nb, rep, r0, r1, o0 == o1, x0 == x1, y0 == y1, dy,
+                                zero ? "zero" : "LEFT");
+                    ++fails;
+                }
+            }
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -822,6 +890,7 @@ int main() {
     router_scatter_cases(rng, cases, fails);
     scored_scatter_cases(rng, cases, fails);
     mix_fuse_cases(rng, cases, fails);
+    pcn_words_cases(rng, cases, fails);
     swiglu_quant_cases(rng, cases, fails);
     gather_inverse_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
