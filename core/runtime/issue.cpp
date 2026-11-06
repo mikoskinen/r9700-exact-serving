@@ -1093,6 +1093,19 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
             std::chrono::duration<double, std::milli>(t1 - t0).count();
         prof_calls_[(size_t)h] += 1;
         if ((size_t)h < prof_host_.size()) prof_host_[(size_t)h] = 1;
+    } else if (profiling_ && prof_sync_) {
+        /* ds41-prof-sync: both lanes drained before and after the launch, the op timed on the host
+         * clock. Slow (two syncs an op) and meant for prefill-sized ops, where an event pair on
+         * cur_stream() was seen to miss the work; includes launch overhead and sync latency. */
+        (void)rad_stream_sync(stream_);
+        if (lane1_) (void)rad_stream_sync(lane1_);
+        const auto t0 = std::chrono::steady_clock::now();
+        s = ip.launch(la, cur_stream());
+        (void)rad_stream_sync(stream_);
+        if (lane1_) (void)rad_stream_sync(lane1_);
+        prof_ms_[(size_t)h] += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t0).count();
+        prof_calls_[(size_t)h] += 1;
     } else if (profiling_) {
         /* Spec §16 per-op timing: events around the launch, read by a sync at the end of the
          * step (which is why profiled runs are not comparable). */

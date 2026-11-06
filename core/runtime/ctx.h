@@ -869,6 +869,13 @@ private:
      * waits (staged copies, the other lane, a host op) and late host issue land here, accounting
      * for wall time the ops' own times do not cover. */
     std::vector<double>   prof_wait_ms_;
+    /* ds41-prof-sync: RADIANCE_PROFILE_SYNC=1 times every device op on the host clock between two
+     * syncs of both lanes (catches work an event pair misses: prefill-chunk ops were absent from the
+     * dumps on 3.11.); event pairs whose elapsed time could not be read; the last step's identity. */
+    bool                  prof_sync_ = false;
+    int64_t               prof_unread_ = 0, prof_unread_total_ = 0;
+    int                   prof_last_step_ = -1, prof_last_phase_ = -1;
+    int64_t               prof_last_ntok_ = 0, prof_steps_ = 0;
 
     int         step_status_ = RAD_OK;
     std::string step_fail_;
