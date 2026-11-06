@@ -2277,6 +2277,134 @@ int collapse_norm_body(const RadArgs* a, RadStream stream) {
 
 /* x [M, n], h [M, hc*n], post [M, hc], comb [M, hc*hc] f32 -> out [M, hc*n] (mhc_post_bf16's
  * checks: n <= 16384, out not h); pre, xc, w, y as mhc_collapse_rmsnorm. */
+/* ---- the all-reduce epilogue form of mhc_post_collapse_rmsnorm (fusion 2's single-card step, 6.11.2026).
+ * The one-shot all-reduce splits a pass's M * n / 8 sixteen-byte words over its nb workgroups (w = ceil(words / nb) a
+ * block, never row-aligned). As its epilogue: each block forms its words' out[k] and xc exactly as
+ * post_collapse_norm_kernel forms a column (from zero, comb[j][k] * h[j] in j order, + post[k] * x, f32_to_bf16; then
+ * pre[k] * out[k] in k order, ds_bf16) and stores them; per row a counter (zeroed by the row's last arriver) takes the
+ * block's words in it, and the block that completes a row runs the norm over the stored xc in the norm kernel's own
+ * order: virtual thread v of THR = r4d_act_threads(M, n) adds columns v, v + THR, .. from zero, each wave of 32 virtual
+ * threads closes with r4d_wave_sum (run on real lanes), the wave sums are added from zero in order, then rsqrtf and
+ * y = f32_to_bf16(xv * s * (g + wadd) * mult). Same values in the same order: post_collapse_norm_kernel's bytes, at any
+ * nb and block width. Here without the collective (x is the reduced input); tests/r4d_emu holds it to the norm kernel. */
+template <bool WF32, int HCM>
+__global__ __launch_bounds__(256) void pcn_words_kernel(
+    const uint16_t* __restrict__ xin, long xp, const uint16_t* __restrict__ h, long hp,
+    const float* __restrict__ post, long ptp, const float* __restrict__ comb, long cbp,
+    uint16_t* __restrict__ out, long op, const float* __restrict__ pre, long pp, long pst,
+    uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w, uint16_t* __restrict__ y,
+    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M, unsigned* ctr,
+    int thr_v) {
+    __shared__ float vss[1024];          // the virtual threads' partial sums (THR <= 1024)
+    __shared__ float wsum[32];
+    __shared__ unsigned s_done;
+    const uint32_t wpr = n / 8, words = M * wpr, nb = gridDim.x, b = blockIdx.x, nt = 256;
+    const uint32_t wd = (words + nb - 1) / nb, w0 = b * wd, w1 = min(words, w0 + wd);
+    for (uint32_t k = w0 + threadIdx.x; k < w1; k += nt) {
+        const uint32_t m = k / wpr, i0 = (k - m * wpr) * 8;
+        const float* pr = pre + (long)m * pp;
+        float pj[HCM], pk[HCM], cb[HCM][HCM];
+#pragma unroll
+        for (int q = 0; q < HCM; ++q) {
+            const int kk = q < hc ? q : hc - 1;
+            pj[q] = pr[(long)kk * pst];
+            pk[q] = post[(long)m * ptp + kk];
+#pragma unroll
+            for (int j = 0; j < HCM; ++j) cb[j][q] = comb[(long)m * cbp + (j < hc ? j : hc - 1) * hc + kk];
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const uint32_t i = i0 + (uint32_t)e;
+            const uint16_t xi = xin[(long)m * xp + i];
+            uint16_t hv[HCM];
+#pragma unroll
+            for (int j = 0; j < HCM; ++j) hv[j] = h[(long)m * hp + (long)(j < hc ? j : hc - 1) * n + i];
+            float v = 0;
+#pragma unroll
+            for (int q = 0; q < HCM; ++q) {
+                if (q >= hc) continue;
+                float u = 0;
+#pragma unroll
+                for (int j = 0; j < HCM; ++j)
+                    if (j < hc) u += cb[j][q] * bf16_to_f32(hv[j]);
+                u += pk[q] * bf16_to_f32(xi);
+                const uint16_t o = f32_to_bf16(u);
+                out[(long)m * op + (long)q * n + i] = o;
+                v += pj[q] * ds_bf(o);
+            }
+            x[(size_t)m * x_ld + i] = ds_bf16(v);
+        }
+    }
+    if (w0 >= w1) return;
+    __threadfence();   // this block's xc and out, device-wide, before its arrivals
+    __syncthreads();
+    const uint32_t m0 = w0 / wpr, m1 = (w1 - 1) / wpr;
+    for (uint32_t m = m0; m <= m1; ++m) {
+        const uint32_t a0 = max(w0, m * wpr), a1 = min(w1, (m + 1) * wpr), mine = a1 - a0;
+        if (threadIdx.x == 0) {
+            const unsigned old = __hip_atomic_fetch_add(&ctr[m], mine, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            s_done = old + mine == wpr ? 1u : 0u;
+            if (s_done) __hip_atomic_store(&ctr[m], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        __syncthreads();
+        if (s_done) {
+            __threadfence();   // the other blocks' xc words of this row
+            const uint16_t* xr = x + (size_t)m * x_ld;
+            for (int v = (int)threadIdx.x; v < thr_v; v += (int)nt) {
+                float ss = 0.0f;
+                for (uint32_t i = (uint32_t)v; i < n; i += (uint32_t)thr_v) {
+                    const float xv = bf16_to_f32(xr[i]);
+                    ss += xv * xv;
+                }
+                vss[v] = ss;
+            }
+            __syncthreads();
+            const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, nwv = thr_v / 32;
+            for (int vw = wave; vw < nwv; vw += (int)(nt / 32)) {
+                const float t = r4d_wave_sum(vss[vw * 32 + lane]);
+                if (lane == 0) wsum[vw] = t;
+            }
+            __syncthreads();
+            float sum = 0.0f;
+            for (int q = 0; q < nwv; ++q) sum += wsum[q];
+            const float sc = rsqrtf(sum / (float)n + eps);
+            uint16_t* yr = y + (size_t)m * y_ld;
+            for (uint32_t i = threadIdx.x; i < n; i += nt) {
+                const float g = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
+                yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * sc * (g + wadd) * mult);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+/* tests: post_collapse_norm_body's operands, the epilogue form over `nb` blocks of 256 (ctr: M zeroed words) */
+int pcn_words_body(const RadArgs* a, RadStream stream, int nb, unsigned* ctr) {
+    if (!a || a->n_t < 9 || nb < 1 || !ctr) return RAD_E_INVAL;
+    const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
+    if (n <= 0 || n > 16384 || n % 8 || hc < 2 || hc > 8) return RAD_E_SHAPE;
+    const RadTensor &xi = a->t[0], &h = a->t[1], &po = a->t[2], &cb = a->t[3], &o = a->t[4];
+    const RadTensor &pre = a->t[5], &x = a->t[6], &w = a->t[7], &y = a->t[8];
+    const long rows = xi.shape[0];
+    long long My = 0;
+    const long long y_ld = r4d_rows_pitch(&y, n, &My);
+    const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const float mult = (float)r4d_getf(a, "mult", 1.0);
+    const int thr = r4d_act_threads((int)rows, (int)n);
+#define PCNW(WF, HM)                                                                                \
+    return R4D_EMIT(stream, (pcn_words_kernel<WF, HM>), dim3((unsigned)nb), dim3(256), 0,           \
+                    (const uint16_t*)xi.data, (long)xi.stride[0], (const uint16_t*)h.data,          \
+                    (long)h.stride[0], (const float*)po.data, (long)po.stride[0],                   \
+                    (const float*)cb.data, (long)cb.stride[0], (uint16_t*)o.data, (long)o.stride[0], \
+                    (const float*)pre.data, (long)pre.stride[0], (long)pre.stride[1], (uint16_t*)x.data, \
+                    (uint32_t)x.stride[0], (const void*)w.data, (uint16_t*)y.data, (uint32_t)y_ld,  \
+                    (uint32_t)n, (int)hc, eps, wadd, mult, (uint32_t)rows, ctr, thr)
+    if (w.dtype == RAD_F32) { if (hc <= 4) PCNW(true, 4); PCNW(true, 8); }
+    if (hc <= 4) PCNW(false, 4);
+    PCNW(false, 8);
+#undef PCNW
+}
+
 int post_collapse_norm_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 9) return RAD_E_INVAL;
     const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
@@ -2368,4 +2496,8 @@ extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream s) {
     return post_collapse_norm_body(a, s);
+}
+/* tests only (tests/r4d_emu): mhc_post_collapse_rmsnorm as the all-reduce's word-partitioned epilogue, nb blocks */
+extern "C" int r4d_ds41_pcn_words(const RadArgs* a, RadStream s, int nb, unsigned* ctr) {
+    return pcn_words_body(a, s, nb, ctr);
 }
