@@ -3045,6 +3045,12 @@ static __device__ __forceinline__ Run uni_run(Run r) {
   return r;
 }
 
+// fz1: at K != 4 the single launch's K loop takes the sched_group_barrier pin (EXL3R4D_SGB's, this kernel only).
+// Unpinned it drained every iteration (device ISA: waits ..0x1 0x0 x4 against the grid kernel's 0x6..0xf at K = 3,
+// 174 VGPRs) -- D18's "slower" (R18); pinned 0x8..0xd, no 0-wait. The same instructions in another order: same bits.
+#ifndef EXL3R4D_FZ1_PIN
+#define EXL3R4D_FZ1_PIN 1
+#endif
 template <int BITS, int NPW, int MATS>
 __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p) {
   EXL3R4D_KARG_PREFETCH();
@@ -3078,7 +3084,7 @@ __global__ void __launch_bounds__(1024) exl3r4d_gemm_fused_kernel(Exl3r4dGemm p)
         __syncthreads();
         __atomic_thread_fence(__ATOMIC_ACQUIRE);  // every wave: no stale line of the rotated rows
         for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
-          moe_pass<BITS, NPW, MATS, false, false, 0>(p, w, rc, run.r1, lds, 0, cb);
+          moe_pass<BITS, NPW, MATS, false, false, 0, BITS != 4 && EXL3R4D_FZ1_PIN>(p, w, rc, run.r1, lds, 0, cb);
       }
     }
   }
@@ -3532,8 +3538,8 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
   // D18: gate_up's prep and GEMM as one launch when the instance gave this launch a counter block
   const bool fuse1 = EXL3R4D_FUSE1 && gate_up && !hrot_dn && a->ctr && !aprep && !a->raw && !staged && !gscr && !rot &&
                      !EXL3R4D_STREAM;
-  if (bits != 4 && (aprep || a->raw || staged || rot || fuse1 || EXL3R4D_STREAM || EXL3R4D_ABLATE_PREPK || npw != 2))
-    return RAD_E_UNSUPPORTED;  // R23: another K has the shipped configuration's kernels only (kx_fn)
+  if (bits != 4 && (aprep || a->raw || staged || rot || EXL3R4D_STREAM || EXL3R4D_ABLATE_PREPK || npw != 2))
+    return RAD_E_UNSUPPORTED;  // R23: another K has the shipped configuration's kernels only (kx_fn); D18 too (fz1)
   if (!aprep && !rot && !gscr && !hrot_dn && !fuse1 && !EXL3R4D_ABLATE_PREPK) {  // ABLATE_PREPK (timing only, wrong output): the prep kernel's cost
     const int rc = exl3r4d_launch_prep(a, gate_up, stream);
     if (rc != RAD_OK) return rc;
@@ -3576,6 +3582,17 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     return RAD_OK;
   }
   if (bits != 4) {
+    if (fuse1) {   // fz1: D18's single launch at K = 2, 2.5, 3, 5, 6 -- moe_pass as kx_fn's gate_up kernel calls it
+      const void* ff = bits == 2 ? (const void*)exl3r4d_gemm_fused_kernel<2, 2, 2>
+                     : bits == 3 ? (const void*)exl3r4d_gemm_fused_kernel<3, 2, 2>
+                     : bits == 5 ? (const void*)exl3r4d_gemm_fused_kernel<5, 2, 2>
+                     : bits == EXL3R4D_K25 ? (const void*)exl3r4d_gemm_fused_kernel<EXL3R4D_K25, 2, 2>
+                                           : (const void*)exl3r4d_gemm_fused_kernel<6, 2, 2>;
+      const unsigned wgs = (unsigned)a->nslot + (unsigned)(a->y_cols / 128) * (unsigned)a->nslot;
+      if (hipLaunchKernel(ff, dim3(wgs), dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
+        return RAD_E_DEVICE;
+      return RAD_OK;
+    }
     const int dngk = gate_up ? 1 : EXL3R4D_DNG;
     const dim3 gk((unsigned)((a->y_cols / 128 + dngk - 1) / dngk), (unsigned)a->nslot, 1);
     const void* kf = bits == 2 ? kx_fn<2>(gate_up, gscr) : bits == 3 ? kx_fn<3>(gate_up, gscr)

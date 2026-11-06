@@ -480,6 +480,14 @@ int exl3r4d_ctr_init_gu4(const RadParam* p, int n_p, void** out) {
     return RAD_OK;
 }
 
+/* fz1: RADIANCE_EXL3_FUSE1=0 keeps gate_up's two dispatches (prep kernel, then the GEMM) in a FUSE1 build; unset or
+ * anything else, the single launch wherever the row's pool gives a counter block. The same bits either way. */
+static int fuse1_on(void) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RADIANCE_EXL3_FUSE1"); on = !(e && e[0] == '0' && !e[1]); }
+    return on;
+}
+
 /* `op`: EXL3_GATE_UP or EXL3_DOWN, or its _mod4 form (v6). */
 int exl3r4d_launch(const RadArgs* a, RadStream s, int op) {
     Exl3Geom g;
@@ -492,7 +500,7 @@ int exl3r4d_launch(const RadArgs* a, RadStream s, int op) {
 #if EXL3R4D_ROUTEDUMP   /* reading only: this gate_up launch's run offsets (exl3r4d.hip) */
     if (gate_up) (void)exl3r4d_routedump(d.off, (int)g.n_expert, d.T, s);
 #endif
-    if (gate_up && EXL3R4D_FUSE1) d.ctr = ctr_block(a->instance, s, d.y, d.nslot);
+    if (gate_up && EXL3R4D_FUSE1 && fuse1_on()) d.ctr = ctr_block(a->instance, s, d.y, d.nslot);
     if (!gate_up && EXL3R4D_PDN) d.ctr = ctr_block(a->instance, s, d.y, 0);   /* PDN's ticket block, or the grid */
 #if EXL3R4D_WGQ
     if (gate_up) {   /* WGQ: this (stream, output)'s counter block and the instance's WGP map */
