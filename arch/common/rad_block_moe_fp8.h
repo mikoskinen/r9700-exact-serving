@@ -1896,6 +1896,16 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     return RAD_OK;
 }
 
+/* RADIANCE_EXL3_SPLITK=1 (or "on"): declare the EXL3 ops with `ep_ranks` under expert parallelism (declare_exl3).
+ * Read once; unset, empty, "0" or anything else is off. */
+inline bool exl3_splitk_on() {
+    static const bool on = [] {
+        const char* s = std::getenv("RADIANCE_EXL3_SPLITK");
+        return s && (std::strcmp(s, "1") == 0 || std::strcmp(s, "on") == 0);
+    }();
+    return on;
+}
+
 /* ---- EXL3 experts (expert_exl3): the radiance-exl3 extension's whole-expert ops over this rank's experts.
  *
  * Every expert is whole on its rank (expert parallel, or one rank), so the ops run at their "tp1" geometry:
@@ -1978,6 +1988,13 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
                                  RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D), RAD_INT("h_rot", 1),
                                  RAD_INT("a_rot", 0) };
     if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
+    /* ds41 exl3-splitk (EXL3 interface v9): `ep_ranks` tells the launch the experts are whole and spread over that
+     * many ranks, which lets exl3r4d's EP split-K rules (launch.c E1 down split-K at few tokens, E2 gate_up's
+     * resident fit from this rank's share of the rows) apply. Off unless RADIANCE_EXL3_SPLITK is 1/on: absent, both
+     * ops are declared exactly as before (and an exl3 library older than v9 would refuse the key). The split-K
+     * changes the summation order of 1-2 token launches, not the weights or the activation format. */
+    const bool x3sk = ep && g.world > 1 && exl3_splitk_on();
+    if (x3sk) gp.push_back(RAD_INT("ep_ranks", g.world));
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
                {w.h.x, w.sorted, w.eoff}, {b_x3h});
     tables(false);
@@ -1985,11 +2002,13 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
                                  RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                  RAD_STR("dtype", x3_dtype[1]), RAD_STR("codebook", x3_cb[1]),
                                  RAD_INT("N_odd", D), RAD_INT("K_odd", F), RAD_INT("h_rot", 1) };
+    if (x3sk) dp.push_back(RAD_INT("ep_ranks", g.world));
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
                {b_x3h, w.sorted, w.eoff}, {w.edn});
     if (!op_gu || !op_dn) return RAD_E_INVAL;
-    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank, swiglu limit %g", l,
-             x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, c.swiglu_limit);
+    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank, swiglu limit %g%s", l,
+             x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, c.swiglu_limit,
+             x3sk ? ", EP split-K rules on (RADIANCE_EXL3_SPLITK, ep_ranks)" : "");
     return RAD_OK;
 }
 
