@@ -58,6 +58,13 @@
  * moe_exl3_gate_up_mod4(a_rot = 0, h_rot = 1) on the same operands, to the bit. Version 6's reason against it was the
  * slot: a fused kernel that reads no implicit argument has no hidden block, so the explicit 704 bytes fit the 768
  * (exl3r4d's exl3r4d_gd_mod4.hip). The seven earlier ops are unchanged, to the schema; it is schema 7, after them.
+ *
+ * VERSION 9 (2026-11-06, ds41 exl3-splitk): moe_exl3_gate_up and moe_exl3_down (the two-class forms) take an OPTIONAL
+ * int `ep_ranks`: present and > 1, the experts are WHOLE and spread over that many ranks (expert parallelism: this
+ * rank's sort holds n_expert of them and drops the rest), so a launch may size its split-K for this rank's share of
+ * the sorted rows (exl3r4d launch.c, E1 / E2). Absent or 1: today's rules exactly. It names a placement fact, never
+ * an output: every split-K form is the same op, its sums in another order (the tolerance suites' class of change).
+ * No other op takes it; every earlier schema is unchanged otherwise.
  */
 #ifndef EXL3_ABI_H
 #define EXL3_ABI_H
@@ -70,7 +77,7 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 8
+#define EXL3_IFACE_VERSION 9
 
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
  * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
@@ -226,6 +233,9 @@ extern "C" {
  *   a_rot     gate_up only, 0 or 1, REQUIRED (for the reason h_rot is): 1 when gate_up's `a` is the
  *             xr moe_exl3_prep_gu wrote -- sorted rows, already rotated -- rather than the token rows.
  *             A row that does not implement it says RAD_CEQ("a_rot", 0). Any other value RAD_E_INVAL.
+ *   ep_ranks  (v9) gate_up and down only, OPTIONAL int: the ranks the whole experts are spread over (expert
+ *             parallelism); absent or 1 none. 1..4096, else RAD_E_INVAL. A launch-sizing fact: no output depends on
+ *             it beyond the summation order of a split-K launch.
  *
  * moe_exl3_gate_up_down takes gate_up's parameters without the flags (h_rot = 1 and a_rot = 0 are what it is):
  * M, N, K, n_expert, top_k, dtype, codebook, N_odd?, K_odd?. Down's geometry follows: [K, N / 2] (and
@@ -388,8 +398,13 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         /* v8: the SwiGLU clamp (DeepSeek's swiglu_limit): gate = min(gate, limit), up = clamp(up, -limit, limit)
          * before silu(gate) * up; absent or 0 is none */
         { "limit",    RAD_P_F64, RAD_OPTIONAL, RAD_PROLE_NONE },
+        /* v9: the ranks the whole experts are spread over (expert parallelism); absent or 1 is none */
+        { "ep_ranks", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
     };
-    static const RadParamSpec p_dn[] = { EXL3_GEMM_PARAMS };
+    static const RadParamSpec p_dn[] = {
+        EXL3_GEMM_PARAMS,
+        { "ep_ranks", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },   /* v9, as gate_up's */
+    };
 #undef EXL3_GEMM_PARAMS
     static const RadParamSpec p_pg[] = {
         { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
@@ -687,6 +702,7 @@ typedef struct Exl3Geom {
                                                        * it has no N); past n_class, class 0's */
     int64_t x_cols;         /* max(cols): the token input's width (gate_up a_rot = 1: xr is 2 * x_cols) */
     int64_t y_cols;         /* the output's width: max(rows)/2 gate_up, max(rows) down, 2 * x_cols prep_gu */
+    int     ep_ranks;       /* v9, gate_up / down: the ranks whole experts are spread over, 1 when absent */
 } Exl3Geom;
 
 /* Does this geometry name an odd class? -- N_odd or K_odd given. What a shape description of the
@@ -736,6 +752,11 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op_in, int two
     if ((g->h_rot != 0 && g->h_rot != 1) || (g->a_rot != 0 && g->a_rot != 1)) return RAD_E_INVAL;
     g->limit = op == EXL3_GATE_UP ? rad_param_getf(p, n_p, "limit", 0.0) : 0.0;
     if (!(g->limit >= 0.0) || g->limit > 65504.0) return RAD_E_INVAL;   /* NaN, negative or past f16 */
+    {   /* v9: ep_ranks, the two-class gate_up / down only (another op's schema has no such key) */
+        const int64_t ep = !mod4 && (op == EXL3_GATE_UP || op == EXL3_DOWN) ? rad_param_geti(p, n_p, "ep_ranks", 1) : 1;
+        if (ep < 1 || ep > 4096) return RAD_E_INVAL;
+        g->ep_ranks = (int)ep;
+    }
     if (g->M < 1 || g->n_expert < 1 || g->top_k < 1) return RAD_E_SHAPE;
     if (!mod4 && !two_classes && ((!prep && No != N) || Ko != K)) return RAD_E_SHAPE;
     g->n_class = mod4 ? 4 : two_classes ? 2 : 1;
