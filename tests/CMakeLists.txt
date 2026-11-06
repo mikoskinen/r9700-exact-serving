@@ -627,7 +627,8 @@ if(R4D_EMU_BUILT)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
-  set_tests_properties(r4d_emu_ds41idx PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT}
+  # ~2 min alone on the emulator (the 300k decode-form case), longer beside a parallel suite.
+  set_tests_properties(r4d_emu_ds41idx PROPERTIES LABELS "r4d_emu" TIMEOUT 900
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
