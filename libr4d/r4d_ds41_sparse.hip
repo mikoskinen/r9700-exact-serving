@@ -34,6 +34,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -279,10 +280,23 @@ __device__ __forceinline__ const uint16_t* ds_entry_key(const DsScoreArgs& a, in
  * rounded head weight, rounded, summed in head order -- this wave's heads [h0, h1); with HS > 1 the
  * waves' slices meet in `part` ([H][EPB]) and wave sub 0 closes the sum in head order. Called
  * block-uniformly (HS > 1 holds two barriers). Sub 0's result is the entry's f32 sum (before the
- * final rounding). */
-template <int HS>
+ * final rounding).
+ * QL (ds_stage_q below): row m's q is in LDS as f32 (qs, [H][128], the bf16 values exactly), read by
+ * same-address (broadcast) LDS loads instead of scalar loads -- the scalar form keeps a 4-head group's
+ * 256 q words live in SGPRs and spilled 213-296 SGPRs a kernel (device ISA, 6.11.). Same products in
+ * the same order: same bits. */
+#ifndef DS41_QL_CH
+#define DS41_QL_CH 2  /* 2: 192-208 VGPRs, no spill, 1-2 zero LDS waits a 4-head group; 4: 232-248; 8 spills */
+#endif
+constexpr int kDsQlCh = DS41_QL_CH;                 /* q pairs (4 floats a head at 2) a chunk */
+#ifdef R4D_EMU_HOST                                 /* tests/r4d_emu: no device registers to tie */
+#define DS_QL_FENCE(a, b, c, d) ((void)0)
+#else
+#define DS_QL_FENCE(a, b, c, d) __asm__ volatile("" : "+v"(a), "+v"(b), "+v"(c), "+v"(d) : : "memory")
+#endif
+template <int HS, bool QL>
 __device__ __forceinline__ float ds_score_entry(const DsScoreArgs& a, long m, const uint16_t* kp, float* part,
-                                                int e, int sub, int h0, int h1) {
+                                                int e, int sub, int h0, int h1, const float* qs) {
     constexpr int DM = 128, EPB = 256 / HS;
     float acc = 0.0f;
     if (kp) {
@@ -302,22 +316,63 @@ __device__ __forceinline__ float ds_score_entry(const DsScoreArgs& a, long m, co
         const uint16_t* wrow = a.w + m * a.wr;
         for (int h = h0; h < h1; h += 4) {
             const int nh = min(4, h1 - h);
-            const uint32_t* q0 = qrow + (long)h * (DM / 2);
-            const uint32_t* q1 = qrow + (long)(nh > 1 ? h + 1 : h) * (DM / 2);
-            const uint32_t* q2 = qrow + (long)(nh > 2 ? h + 2 : h) * (DM / 2);
-            const uint32_t* q3 = qrow + (long)(nh > 3 ? h + 3 : h) * (DM / 2);
+            const int ha = h, hb = nh > 1 ? h + 1 : h, hc = nh > 2 ? h + 2 : h, hd = nh > 3 ? h + 3 : h;
             float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            if constexpr (QL) {
+                /* chunks of kDsQlCh pairs: the next chunk's q is loaded (double buffer), then a fence
+                 * the four sums pass through, then this chunk's products -- so the loads cannot sink
+                 * below the products nor the products rise above them, and the products wait only for
+                 * the previous chunk's loads. Without the fence all 128 LDS loads of the group are
+                 * issued first and spill VGPRs (device ISA; sched_barrier does not stop it, a bare
+                 * memory clobber lets the FMAs sink). The products and their order per sum are the
+                 * scalar form's. */
+                constexpr int CH = kDsQlCh, NCH = DM / 2 / CH;
+                const float* fq[4] = { qs + ha * DM, qs + hb * DM, qs + hc * DM, qs + hd * DM };
+                float qv[2][4][2 * CH];
 #pragma unroll
-            for (int i = 0; i < DM / 2; ++i) {
-                const uint32_t w0 = q0[i], w1 = q1[i], w2 = q2[i], w3 = q3[i];
-                d0 = __builtin_fmaf(bf16w_lo(w0), k[2 * i], d0);
-                d1 = __builtin_fmaf(bf16w_lo(w1), k[2 * i], d1);
-                d2 = __builtin_fmaf(bf16w_lo(w2), k[2 * i], d2);
-                d3 = __builtin_fmaf(bf16w_lo(w3), k[2 * i], d3);
-                d0 = __builtin_fmaf(bf16w_hi(w0), k[2 * i + 1], d0);
-                d1 = __builtin_fmaf(bf16w_hi(w1), k[2 * i + 1], d1);
-                d2 = __builtin_fmaf(bf16w_hi(w2), k[2 * i + 1], d2);
-                d3 = __builtin_fmaf(bf16w_hi(w3), k[2 * i + 1], d3);
+                for (int u = 0; u < 4; ++u)
+#pragma unroll
+                    for (int t = 0; t < 2 * CH; ++t) qv[0][u][t] = fq[u][t];
+#pragma unroll
+                for (int c = 0; c < NCH; ++c) {
+                    if (c + 1 < NCH) {
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+#pragma unroll
+                            for (int t = 0; t < 2 * CH; ++t) qv[(c + 1) & 1][u][t] = fq[u][(c + 1) * 2 * CH + t];
+                    }
+                    DS_QL_FENCE(d0, d1, d2, d3);
+                    const float(&qc)[4][2 * CH] = qv[c & 1];
+#pragma unroll
+                    for (int ii = 0; ii < CH; ++ii) {
+                        const int i = c * CH + ii;
+                        d0 = __builtin_fmaf(qc[0][2 * ii], k[2 * i], d0);
+                        d1 = __builtin_fmaf(qc[1][2 * ii], k[2 * i], d1);
+                        d2 = __builtin_fmaf(qc[2][2 * ii], k[2 * i], d2);
+                        d3 = __builtin_fmaf(qc[3][2 * ii], k[2 * i], d3);
+                        d0 = __builtin_fmaf(qc[0][2 * ii + 1], k[2 * i + 1], d0);
+                        d1 = __builtin_fmaf(qc[1][2 * ii + 1], k[2 * i + 1], d1);
+                        d2 = __builtin_fmaf(qc[2][2 * ii + 1], k[2 * i + 1], d2);
+                        d3 = __builtin_fmaf(qc[3][2 * ii + 1], k[2 * i + 1], d3);
+                    }
+                }
+            } else {
+                const uint32_t* q0 = qrow + (long)ha * (DM / 2);
+                const uint32_t* q1 = qrow + (long)hb * (DM / 2);
+                const uint32_t* q2 = qrow + (long)hc * (DM / 2);
+                const uint32_t* q3 = qrow + (long)hd * (DM / 2);
+#pragma unroll
+                for (int i = 0; i < DM / 2; ++i) {
+                    const uint32_t w0 = q0[i], w1 = q1[i], w2 = q2[i], w3 = q3[i];
+                    d0 = __builtin_fmaf(bf16w_lo(w0), k[2 * i], d0);
+                    d1 = __builtin_fmaf(bf16w_lo(w1), k[2 * i], d1);
+                    d2 = __builtin_fmaf(bf16w_lo(w2), k[2 * i], d2);
+                    d3 = __builtin_fmaf(bf16w_lo(w3), k[2 * i], d3);
+                    d0 = __builtin_fmaf(bf16w_hi(w0), k[2 * i + 1], d0);
+                    d1 = __builtin_fmaf(bf16w_hi(w1), k[2 * i + 1], d1);
+                    d2 = __builtin_fmaf(bf16w_hi(w2), k[2 * i + 1], d2);
+                    d3 = __builtin_fmaf(bf16w_hi(w3), k[2 * i + 1], d3);
+                }
             }
             const float dd[4] = { d0, d1, d2, d3 };
 #pragma unroll
@@ -343,13 +398,29 @@ __device__ __forceinline__ float ds_score_entry(const DsScoreArgs& a, long m, co
     return acc;
 }
 
+/* QL: row m's q ([H][128] bf16) into qs as f32 by the block's 256 threads, between two barriers
+ * (the first keeps the previous row's readers ahead of the writes). Called block-uniformly. */
+__device__ __forceinline__ void ds_stage_q(const DsScoreArgs& a, long m, float* qs) {
+    const uint32_t* qrow = (const uint32_t*)(a.q + m * a.qr);
+    const int nw = a.H * 64;
+    __syncthreads();
+    for (int t = threadIdx.x; t < nw; t += 256) {
+        const uint32_t w = qrow[t];
+        qs[2 * t] = bf16w_lo(w);
+        qs[2 * t + 1] = bf16w_hi(w);
+    }
+    __syncthreads();
+}
+
 /* One thread an entry; HS waves of a block share 32 entries, each wave a slice of the heads (its
- * q then uniform, read through scalar loads). A thread holds its key as 128 floats. Without keep
- * (the candidate restriction takes ds41_index_score_kept_kernel below). */
-template <int HS>
+ * q then uniform, read through scalar loads, or with QL from LDS). A thread holds its key as 128
+ * floats. Without keep (the candidate restriction takes ds41_index_score_kept_kernel below).
+ * Dynamic LDS: part [H][EPB] (HS > 1), then qs [H][128] f32 (QL). */
+template <int HS, bool QL>
 __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
     constexpr int EPB = 256 / HS;
     float* part = (float*)r4d_ds41_sparse_dyn;       /* [H][EPB], HS > 1 */
+    float* qs = (float*)r4d_ds41_sparse_dyn + (HS > 1 ? a.H * EPB : 0);
     /* The wave index through readfirstlane, so a wave's head slice (and its q) is provably uniform
      * and q stays in scalar loads. */
     const int lane = threadIdx.x & 31, wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
@@ -364,9 +435,10 @@ __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
             if (sub == 0 && j < a.C) srow[j * a.scs] = -kDsInf;
             continue;
         }
+        if constexpr (QL) ds_stage_q(a, m, qs);
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
         const uint16_t* kp = ds_entry_key(a, s, j, reach);
-        const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
+        const float acc = ds_score_entry<HS, QL>(a, m, kp, part, e, sub, h0, h1, qs);
         if (sub == 0 && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
     }
 }
@@ -456,10 +528,11 @@ constexpr int kDsKeptSpan = 258;
  * count's, not the context's. A kept entry runs ds_score_entry exactly as the unrestricted kernel
  * does (same bits); every other position of the row, to C, is written -inf by a sweep the grid
  * shares. */
-template <int HS>
+template <int HS, bool QL>
 __global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs a) {
     constexpr int EPB = 256 / HS;
     float* part = (float*)r4d_ds41_sparse_dyn;       /* [H][EPB], HS > 1 */
+    float* qs = (float*)r4d_ds41_sparse_dyn + (HS > 1 ? a.H * EPB : 0);   /* [H][128] f32, QL */
     __shared__ uint32_t ws[33];
     __shared__ uint32_t list[kDsKeptSpan];
     const int lane = threadIdx.x & 31, wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
@@ -484,6 +557,7 @@ __global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs 
         const DsKeptScan<256> ks = ds_kept_scan<256>(krow, a.kcs, nb, ws);
         const long nk = (long)ks.total * block;      /* compacted entries (some past reach) */
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
+        if constexpr (QL) if ((long)blockIdx.x * EPB < nk) ds_stage_q(a, m, qs);   /* block-uniform */
         for (long x0 = (long)blockIdx.x * EPB; x0 < nk; x0 += (long)gridDim.x * EPB) {
             const long r0 = x0 / block, r1 = (x0 + EPB - 1) / block + 1;   /* ranks [r0, r1) */
             const long rn = (r1 < (long)ks.total ? r1 : (long)ks.total) - r0;
@@ -496,7 +570,7 @@ __global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs 
                 j = (long)list[r - r0] * block + (x - r * block);
             }
             const uint16_t* kp = j >= 0 ? ds_entry_key(a, s, j, reach) : nullptr;
-            const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
+            const float acc = ds_score_entry<HS, QL>(a, m, kp, part, e, sub, h0, h1, qs);
             if (sub == 0 && j >= 0 && j < reach && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
             __syncthreads();                         /* the list is rewritten next round */
         }
@@ -1722,6 +1796,12 @@ typedef short ds_v8s __attribute__((ext_vector_type(8)));
 typedef __attribute__((address_space(1))) ds_v8s ds_gv8s;
 
 constexpr int kWmRows = 48;                          /* passes up to this many rows stay scalar */
+constexpr long kDsQlMaxLds = 49152;                  /* index_score's dynamic LDS with q staged (part + qs) */
+/* R4D_DS41_QLDS: unset or anything but "0" = the decode index_score reads q from LDS (f32). */
+static bool ds_qlds_on() {
+    static const bool on = [] { const char* e = std::getenv("R4D_DS41_QLDS"); return !(e && e[0] == '0' && !e[1]); }();
+    return on;
+}
 constexpr int kWmWaves = 4;
 constexpr int kWmCols = kDsAttnD / kWmWaves;         /* latent columns a wave */
 constexpr int kWmSbufBytes = 2 * kWmWaves * 32 * 8 * 4;
@@ -2301,18 +2381,26 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
     const int epb = 256 / HS;
     const dim3 grid((unsigned)((cw + epb - 1) / epb), gy);
-    const uint32_t lds = HS > 1 ? (uint32_t)(H * epb * 4) : 0u;
+    const uint32_t lpart = HS > 1 ? (uint32_t)(H * epb * 4) : 0u;
+    /* q in LDS as f32 (ds_stage_q) when it fits beside part; R4D_DS41_QLDS=0 keeps the scalar-load
+     * form (same bits either way). */
+    const bool ql = ds_qlds_on() && (long)lpart + H * 128 * 4 <= kDsQlMaxLds;
+    const uint32_t lds = lpart + (ql ? (uint32_t)(H * 128 * 4) : 0u);
+#define DS_SCORE_EMIT(K, HSV)                                                                      \
+    return ql ? R4D_EMIT(stream, (K<HSV, true>), grid, dim3(256), lds, s)                         \
+              : R4D_EMIT(stream, (K<HSV, false>), grid, dim3(256), lds, s)
     if (keep) switch (HS) {
-        case 1: return R4D_EMIT(stream, ds41_index_score_kept_kernel<1>, grid, dim3(256), lds, s);
-        case 2: return R4D_EMIT(stream, ds41_index_score_kept_kernel<2>, grid, dim3(256), lds, s);
-        default: return R4D_EMIT(stream, ds41_index_score_kept_kernel<4>, grid, dim3(256), lds, s);
+        case 1: DS_SCORE_EMIT(ds41_index_score_kept_kernel, 1);
+        case 2: DS_SCORE_EMIT(ds41_index_score_kept_kernel, 2);
+        default: DS_SCORE_EMIT(ds41_index_score_kept_kernel, 4);
     }
     switch (HS) {
-        case 1: return R4D_EMIT(stream, ds41_index_score_kernel<1>, grid, dim3(256), lds, s);
-        case 2: return R4D_EMIT(stream, ds41_index_score_kernel<2>, grid, dim3(256), lds, s);
-        case 4: return R4D_EMIT(stream, ds41_index_score_kernel<4>, grid, dim3(256), lds, s);
-        default: return R4D_EMIT(stream, ds41_index_score_kernel<8>, grid, dim3(256), lds, s);
+        case 1: DS_SCORE_EMIT(ds41_index_score_kernel, 1);
+        case 2: DS_SCORE_EMIT(ds41_index_score_kernel, 2);
+        case 4: DS_SCORE_EMIT(ds41_index_score_kernel, 4);
+        default: DS_SCORE_EMIT(ds41_index_score_kernel, 8);
     }
+#undef DS_SCORE_EMIT
 }
 
 int index_candidates_body(const RadArgs* a, RadStream stream) {
