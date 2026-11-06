@@ -220,3 +220,22 @@ IQ4R-L-V4 is 24% below the official FP8 checkpoint's KL (8.766 bpw, 0.00389) at 
 IQ2R-L-V4, at 2.8 bpw, is below the AWQ-tuned MXFP4 checkpoint (4.994 bpw, 0.03824). The design, the
 kernels and the measurements are in the IQR-V4 technical report
 (radiance.stilldeadco.de/whitepapers/iqr-v4.pdf).
+
+## `moe_gemm_iqr` (routed experts over IQR weights)
+
+The grouped MoE GEMM over trellis experts (`libr4d/r4d_moe_iqr.hip`), the same grouping as
+`moe_gemm_q`: `sorted_tok`, `expert_offset` and `a_order` ("token" gathers `sorted_tok[i]/top_k`,
+"sorted" reads i). Weights and scales are WEIGHT TABLES of IQR planes: rank-3 stacked planes
+whose leading stride is one expert's arranged bytes (0 marks a pointer array); the stored dtype
+is `R4D_DT_IQR_W | word`, the scales `R4D_DT_IQR_S | word` (the lrun bits come from the trellis
+table's block[0]). Planes selected per entry: codes, `trellis`, `trellis.mad`-where-computed, and
+scale, `scale.col` for kRowF32. Activation is had_quant_act_i8g's int8 codes with an f32 scale per
+(row, 128 K); output is bf16 row-major in sorted order.
+
+Two kernels: the decode GEMV (any run length, MT 8 tokens, register-bound) and the prefill tile
+(128 weight rows x 64 sorted rows per expert, weight units decoded once per tile through the
+fragment order, no K split; taken from 64 sorted rows when K is a multiple of 256). All `R4D_IQR_FORMS`
+forms are instantiations. Verified in `r4d_selftest` against the int8 dot at M=2/M=9 (GEMV),
+M=64/N=256/K=256, M=40 ragged, M=32/K=512 reload (tile). The architecture wiring (`arch/common/
+rad_block_moe_fp8.h`, `arch/deepseek41`) is phase 3: the table must be declared in expert order
+(one run, not parity classes), with the `i8a8` dtype param, and the kernel takes seven operands.

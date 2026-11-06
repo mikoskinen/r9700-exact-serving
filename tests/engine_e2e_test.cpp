@@ -2300,6 +2300,9 @@ TEST(preemption_by_recompute_continues_each_stream_exactly) {
     }
     std::vector<std::string> args = kPlain;
     for (const std::string& a : small_pool_args()) args.push_back(a);
+    /* This case exists to exercise preemption-by-recompute itself, so the fresh-room gate (which
+     * deliberately admits a whole prompt and avoids that preemption) is off here. */
+    args.push_back("--prefill-room-gate"); args.push_back("off");
     auto pool_at = [&](int mib) -> int64_t {
         Server probe;
         probe.quiet = true;

@@ -1018,4 +1018,28 @@ TEST(chat_template_flag_bakes_the_template) {
                                "--chat-template", d / "absent.jinja" }, &bad), 1);
 }
 
+/* A convert stopped after one large weight keeps its journal and a resume finishes the rest
+ * without rewriting it; the resumed container is byte-identical to an uninterrupted one. */
+TEST(a_checkpointed_write_resumes_and_keeps_its_finished_weights) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_r");
+    const std::string part = d / "r.rad";
+    std::string log;
+    const std::vector<std::string> lg = { "RAD_CONVERT_LARGE_F32_BYTES=1" };
+    REQUIRE_EQ(convert(w.ckpt, { "-o", part, "--recipe", w.recipe, "--checkpoint-at", "1" },
+                        &log, lg), 3);
+    CHECK(exists(part + ".journal"));
+    std::string rlog;
+    REQUIRE_EQ(convert(w.ckpt, { "-o", part, "--recipe", w.recipe, "--resume" }, &rlog, lg), 0);
+    CHECK(rlog.find("resume") != std::string::npos);
+    CHECK(!exists(part + ".journal"));
+    RadFile a, b;
+    REQUIRE_EQ(a.open(w.base.c_str()), RAD_OK);
+    REQUIRE_EQ(b.open(part.c_str()), RAD_OK);
+    const std::vector<std::string> diff = differing_weights(a, b);
+    CHECK(diff.empty());
+    if (!diff.empty()) fprintf(stderr, "    resumed differs at %s\n", diff[0].c_str());
+}
+
 RAD_TEST_MAIN()

@@ -1226,38 +1226,53 @@ void Scheduler::set_stage_rows(int64_t rows) {
  * floor, the interval is split into two chunks at or above the floor instead. */
 int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget,
                             int64_t reserve, bool shared, bool rows_only) const {
+    if (budget <= 0) return 0;
     const int64_t mode = cfg_.busy_prefill_chunk;
-    if (mode == 0 || budget <= 0) return budget;
+    int64_t cap = budget;
     /* Auto holds a chunk back only for work that would otherwise get nothing this step: rows
      * behind it, or a request waiting to start. Rows planned ahead of it are in the step anyway.
      * An explicit N trades prefill speed for every other row's latency, so it applies whenever
      * the chunk shares the step. */
-    if (reserve <= 0 && !(mode > 0 && shared)) return budget;
-    reserve = std::max<int64_t>(reserve, 0);
-    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
-
-    int64_t cap = budget - reserve;
-    if (mode > 0) {
-        /* The operator's number, with no floor; set_stage_rows warns when it is under the
-         * stager's step. */
-        cap = std::min(cap, mode);
-    } else {
-        const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
-        cap = std::max(cap, floor);
-        const int64_t remaining = n_target - n_computed;
-        int64_t span = remaining;                       /* where this run of chunks must end */
-        if (geo_.checkpoints() && !geo_.window_ckpt) {
-            const int64_t I = geo_.checkpoint_interval;
-            span = std::min(span, ((n_computed / I) + 1) * I - n_computed);
+    if (mode != 0 && !(reserve <= 0 && !(mode > 0 && shared))) {
+        reserve = std::max<int64_t>(reserve, 0);
+        const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+        cap = budget - reserve;
+        if (mode > 0) {
+            /* The operator's number, with no floor; set_stage_rows warns when it is under the
+             * stager's step. */
+            cap = std::min(cap, mode);
+        } else {
+            const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
+            cap = std::max(cap, floor);
+            const int64_t remaining = n_target - n_computed;
+            int64_t span = remaining;                       /* where this run of chunks must end */
+            if (geo_.checkpoints() && !geo_.window_ckpt) {
+                const int64_t I = geo_.checkpoint_interval;
+                span = std::min(span, ((n_computed / I) + 1) * I - n_computed);
+            }
+            /* ...but not for decode rows alone: their reserve is a few tokens, so the chunk ends a
+             * quantum short and the next step finishes the interval, a step pair a prefill already
+             * runs when decode rows are ahead of it. Halving would hold a long prompt to
+             * half-interval chunks while anything decodes behind it, which costs more. The split is
+             * for a share (a waiting request, another prefill), which lasts a step or two. */
+            if (!rows_only && cap < span && span - cap < floor && span - floor >= floor)
+                cap = span - floor;
         }
-        /* ...but not for decode rows alone: their reserve is a few tokens, so the chunk ends a
-         * quantum short and the next step finishes the interval, a step pair a prefill already
-         * runs when decode rows are ahead of it. Halving would hold a long prompt to
-         * half-interval chunks while anything decodes behind it, which costs more. The split is
-         * for a share (a waiting request, another prefill), which lasts a step or two. */
-        if (!rows_only && cap < span && span - cap < floor && span - floor >= floor)
-            cap = span - floor;
     }
+
+    /* Long-prefill fair share (vLLM's long_prefill_token_threshold): when another request is
+     * eligible and this one would take a big chunk, hold it to N, floored by the fair share of
+     * the token budget. A lone prefill still gets the whole budget, so TTFT does not suffer when
+     * there is nobody to starve. */
+    const int64_t long_thr = cfg_.long_prefill_token_threshold;
+    const int64_t eligible = (int64_t)running_.size() + (int64_t)waiting_.size();
+    if (long_thr > 0 && eligible > 1 && n_target - n_computed > long_thr) {
+        const int64_t fair = budget / eligible;
+        const int64_t limit = std::max(long_thr, fair);
+        if (cap > limit) cap = limit;
+    }
+
+    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
     return std::min(std::max(cap, Q), budget);
 }
 
@@ -1500,6 +1515,25 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         s.hit_attn = h.n_attn_tokens;
     }
 
+    /* A fresh prefill is admitted only when its WHOLE prompt plus one decode position fits
+     * beside the whole prompt of every runner and their next-token headroom. The generic
+     * admission below only reserves this chunk; without this gate a long prompt can reach 100%
+     * and then be preempted at the first decode step, wasting the entire prefill. */
+    if (cfg_.prefill_room_gate && r.state != ReqState::Preempted && (int64_t)r.n_computed < (int64_t)r.prompt.size()) {
+        int rounds = 0;
+        while (!fresh_prefill_can_fit(s) && rounds < kEvictRounds &&
+               cfg_.prefix_cache && pc_ && pc_->evict(kEvictBlocks) > 0)
+            ++rounds;
+        if (!fresh_prefill_can_fit(s)) {
+            /* A prompt the empty pool cannot hold must not starve the queue: it fails below
+             * (spec §17) like the preempted path, rather than waiting forever. */
+            if (!kv_->can_ever_fit(s.seq_len() + 1))
+                ;   /* fall through: ensure_from() reports the shortfall */
+            else
+                return kAdmitWait;
+        }
+    }
+
     int64_t target = s.seq_len();
     int64_t ckpt = -1;
     int64_t want;
@@ -1602,13 +1636,14 @@ void Scheduler::undo_hit(SchedReq& s) {
  * which is the loop. */
 bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     const Request& r = *s.req;
-    const int64_t target = s.seq_len();
+    const int64_t target = s.seq_len() + 1;   /* the whole recompute and its first decode position */
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
         const KVGeom::G& gg = kvgeom_.g[g];
-        /* A group the manager gives no blocks (the sentinel at index 0) asks nothing. Counting it
-         * wanted the whole prompt from a pool of none and kept a preempted request out for good. */
-        if (!gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+        /* FULL groups grow with the prompt. WINDOW/RING recycle past their window, so counting
+         * ceil(prompt / block) against them keeps every long QSA (DS41) prompt out for good.
+         * A group the manager gives no blocks (the sentinel at index 0) asks nothing. */
+        if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
         int64_t need = (target + gg.block_size - 1) / gg.block_size -
                        (int64_t)kv_->block_table(r.id, (int32_t)g).size();
         if (need < 0) need = 0;
@@ -1630,6 +1665,47 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     /* Stateful groups: the recompute needs its state slots back, and every running sequence must
      * keep the slot it already holds. A sequence the manager does not know is not a refusal:
      * admit_one adds it, and can_grow on a missing id is false forever. */
+    if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
+    for (int32_t slot : running_) {
+        const SchedReq& rs = *reqs_[(size_t)slot];
+        if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
+    }
+    return true;
+}
+
+/* Whether a FRESH prefill may start: the whole prompt plus one decode position has to fit in
+ * every FULL paged group, with one block past that for every running sequence. WINDOW/RING
+ * recycle; counting the whole prompt against them livelocks long DS41 chats in Waiting.
+ * The old admission only checked the first chunk; the pool could then refuse at 100% and
+ * preempt_back() would hand back the entire prefill's KV, forcing the request to start again
+ * at zero. */
+bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
+    const Request& r = *s.req;
+    const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */
+
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const KVGeom::G& gg = kvgeom_.g[g];
+        if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+        int64_t need = (target + gg.block_size - 1) / gg.block_size -
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+        if (need < 0) need = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& rs = *reqs_[(size_t)slot];
+            if (!rs.req) continue;
+            const Request& rr = *rs.req;
+            int64_t goal = rr.n_computed + 1;
+            if (rr.n_computed < (int64_t)rr.prompt.size())
+                goal = std::max(goal, (int64_t)rr.prompt.size());
+            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
+            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+            if (rows > held) need += rows - held;
+            need += 1;                       /* one block past that for the running sequence */
+        }
+        if (need > kv_->available_blocks((int32_t)g)) return false;
+    }
+
+    /* Stateful groups: the fresh prefill needs slots for its whole prompt plus the decode
+     * position, and every running sequence must keep the slot it already holds. */
     if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
     for (int32_t slot : running_) {
         const SchedReq& rs = *reqs_[(size_t)slot];

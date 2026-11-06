@@ -829,6 +829,12 @@ private:
      * preempted request: after --preempt-wait-ms the scheduler reclaims cache blocks and preempts
      * a decoding runner until one of them can prefill. A runner still prefilling is not a victim. */
     bool preempted_can_prefill(const SchedReq& s) const;
+    /* A fresh prefill's counterpart: the WHOLE prompt plus one decode position in every FULL
+     * paged group, plus one block of headroom for every sequence already running. WINDOW/RING
+     * recycle and are not counted (a 62k DS41 prompt vs a ~window pool would wait forever).
+     * Admitting only the first chunk leaves the pool short when the prompt reaches 100%, and
+     * preempt_back() then throws away the whole prefill. */
+    bool fresh_prefill_can_fit(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();

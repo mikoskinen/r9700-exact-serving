@@ -923,6 +923,158 @@ struct Tool {
     bool has_props = false;
     bool has_required = false;
 };
+
+/* DeepSeek-V4.1's unconstrained output has been seen to write DSML tags with the typed argument
+ * tags but without the `invoke` prefix on the first call (`<skill_view">`), or with a bare
+ * `<invoke name="...">` instead of the format's `name_prefix`. The grammar only opens a call at
+ * `name_prefix`, so such a reply otherwise becomes plain content: no `tool_calls`, finish reason
+ * `stop`. This fallback reads the tags after the reply is complete, when the normal parser found
+ * no call at all. It accepts the format's DSML marker on any tag, whitespace around it, a bare
+ * `<tool_name">` opener, and both `string="true"`/`string="false"` argument tags. It is a reply
+ * parser concern, not a per-model special case: any format declaring tools and typed tags can
+ * reach it, and it only runs when the request sent tools and the normal read found no calls. */
+static constexpr std::string_view kDsml = "\xEF\xBD\x9C" "DSML" "\xEF\xBD\x9C";
+
+static bool tool_declared(const std::vector<Tool>& tools, std::string_view name) {
+    for (const Tool& t : tools)
+        if (t.name == name) return true;
+    return false;
+}
+
+/* At `at` a call opener: `<... invoke name="NAME">`, or the observed bare `<NAME">`. `body` is
+ * just after the tag's `>`. */
+static bool loose_call_open(std::string_view s, size_t at, const std::vector<Tool>& tools,
+                            std::string& name, size_t& body) {
+    if (at >= s.size() || s[at] != '<') return false;
+    size_t p = at + 1;
+    if (s.compare(p, kDsml.size(), kDsml) == 0) {
+        p += kDsml.size();
+        while (p < s.size() && is_ws((unsigned char)s[p])) ++p;
+    }
+    if (p + 7 <= s.size() && s.compare(p, 7, "invoke ") == 0) {
+        const size_t q = s.find("name=\"", p);
+        if (q == std::string_view::npos || q + 6 >= s.size()) return false;
+        const size_t e = s.find('"', q + 6);
+        if (e == std::string_view::npos) return false;
+        name.assign(s.substr(q + 6, e - (q + 6)));
+        if (!tool_declared(tools, name)) return false;
+        body = s.find('>', e);
+        return body != std::string_view::npos && ++body != 0;
+    }
+    size_t q = p;
+    while (q < s.size() && (isalnum((unsigned char)s[q]) || s[q] == '_' || s[q] == '.' ||
+                            s[q] == ':' || s[q] == '-')) ++q;
+    if (q == p) return false;
+    name.assign(s.substr(p, q - p));
+    if (!tool_declared(tools, name)) return false;
+    while (q < s.size() && is_ws((unsigned char)s[q])) ++q;
+    if (q >= s.size() || (s[q] != '>' && s[q] != '"')) return false;
+    body = s.find('>', q);
+    return body != std::string_view::npos && ++body != 0;
+}
+
+/* The argument tag after `at`: `<... parameter name="ARG" string="true|false">value</parameter>`.
+ * The value is returned with its tag removed; `is_text` follows the tag's `string` attribute. */
+static bool loose_argument(std::string_view s, size_t at, size_t end, std::string& name,
+                           std::string& value, bool& is_text) {
+    const size_t p = s.find("parameter", at);
+    if (p == std::string_view::npos || p >= end) return false;
+    const size_t q = s.find("name=\"", p);
+    if (q == std::string_view::npos || q + 6 >= end) return false;
+    const size_t e = s.find('"', q + 6);
+    if (e == std::string_view::npos || e >= end) return false;
+    name.assign(s.substr(q + 6, e - (q + 6)));
+    const size_t close = s.find('>', e);
+    if (close == std::string_view::npos || close >= end) return false;
+    size_t tail = s.find("</parameter", close + 1);
+    if (tail == std::string_view::npos)
+        tail = s.find("</" + std::string(kDsml) + " parameter", close + 1);
+    if (tail == std::string_view::npos || tail > end) return false;
+    is_text = true;
+    const size_t type = s.find("string=\"", e);
+    if (type != std::string_view::npos && type < close) {
+        const size_t type_end = s.find('"', type + 8);
+        if (type_end != std::string_view::npos && type_end < close)
+            is_text = s.compare(type + 8, type_end - (type + 8), "false") != 0;
+    }
+    value.assign(s.substr(close + 1, tail - (close + 1)));
+    return true;
+}
+
+/* Read a DSML reply the normal parser missed. Returns true and fills `msg.calls`/`msg.content`
+ * when a declared tool call was found. */
+static bool parse_loose_dsml(ReplyMessage& msg, const std::vector<Tool>& tools) {
+    const std::string_view s(msg.content);
+    size_t first = std::string_view::npos;
+    for (size_t at = s.find('<'); at != std::string_view::npos; at = s.find('<', at + 1)) {
+        std::string name;
+        size_t body = 0;
+        if (loose_call_open(s, at, tools, name, body)) { first = at; break; }
+    }
+    if (first == std::string_view::npos) return false;
+    const size_t section_end = s.find("</calls", first);
+    const size_t last_end = s.find("</invoke", first);
+    if (section_end == std::string_view::npos && last_end == std::string_view::npos) return false;
+
+    std::vector<ReplyCall> calls;
+    size_t p = first;
+    while (p != std::string_view::npos && p < s.size()) {
+        std::string name;
+        size_t body = 0;
+        if (!loose_call_open(s, p, tools, name, body)) break;
+        const size_t call_end = s.find("</invoke", body);
+        if (call_end == std::string_view::npos || (section_end != std::string_view::npos && call_end > section_end)) break;
+        std::string args = "{";
+        bool first_arg = true;
+        size_t arg = body;
+        while (true) {
+            std::string aname, avalue;
+            bool is_text = true;
+            if (!loose_argument(s, arg, call_end, aname, avalue, is_text)) break;
+            if (!first_arg) args += ',';
+            args += json_quote(aname);
+            args += ':';
+            if (is_text) {
+                args += json_quote(avalue);
+            } else {
+                if (nlohmann::json::accept(avalue)) args += avalue;
+                else args += json_quote(avalue);
+            }
+            first_arg = false;
+            const size_t gt = s.find('>', s.find("</parameter", arg) == std::string_view::npos
+                                            ? s.find("</" + std::string(kDsml) + " parameter", arg)
+                                            : s.find("</parameter", arg));
+            if (gt == std::string_view::npos) break;
+            arg = gt + 1;
+        }
+        args += '}';
+        ReplyCall c;
+        c.name = name;
+        c.arguments = std::move(args);
+        c.closed = true;
+        calls.push_back(std::move(c));
+        const size_t next_call = s.find('<', call_end + 8);
+        if (next_call == std::string_view::npos || (section_end != std::string_view::npos && next_call > section_end)) break;
+        p = next_call;
+    }
+    if (calls.empty()) return false;
+    if (section_end != std::string_view::npos) {
+        size_t end = s.find('>', section_end);
+        if (end == std::string_view::npos) end = s.size();
+        else ++end;
+        msg.content = std::string(s.substr(0, first)) + std::string(s.substr(end));
+    } else {
+        const size_t last_call_end = s.find("</invoke", first);
+        if (last_call_end == std::string_view::npos) return false;
+        msg.content = std::string(s.substr(0, first)) + std::string(s.substr(last_call_end + 9));
+    }
+    size_t b = 0, e2 = msg.content.size();
+    while (b < e2 && is_ws((unsigned char)msg.content[b])) ++b;
+    while (e2 > b && is_ws((unsigned char)msg.content[e2 - 1])) --e2;
+    msg.content = msg.content.substr(b, e2 - b);
+    msg.calls = std::move(calls);
+    return true;
+}
 }  /* namespace */
 
 struct ReplyParser::Impl {
@@ -2937,6 +3089,10 @@ struct ReplyStream::Impl {
         ds = 0;
         if (!think_text) think_pend.clear();
         content.finish(msg.content);
+        /* The grammar opens a call only at name_prefix; an unconstrained DeepSeek reply can write
+         * the typed tags without it. Recover that reply here, after content has been read, so a
+         * finished message carries structured calls rather than markup. */
+        if (P.calls && msg.calls.empty()) parse_loose_dsml(msg, P.tools);
         if (cur >= 0) publish(cur, true);
         publish(0, true);
         publish(1, true);

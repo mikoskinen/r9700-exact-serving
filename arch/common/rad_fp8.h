@@ -616,14 +616,16 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         return op ? RAD_OK : RAD_E_INVAL;
     }
     if (!gate_up || !a.x || !a.cq() || !a.cs() || n <= 0) return RAD_E_INVAL;
-    /* Rotated codes feed a four-bit expert, which reads E4M3 only. */
-    if (rot && a.q8_fed) return RAD_E_INVAL;
+    /* Rotated codes feed a four-bit expert, which reads E4M3 only -- unless they are the rotated
+     * int8 pair (ActFP8::q8_rot), which gated_had_quant_i8g itself produces. */
+    if (rot && a.q8_fed && !a.q8_rot) return RAD_E_INVAL;
     /* Rotated int8 codes (ActFP8::q8_rot) feed a down projection stored at i8a8h:
      * gated_had_quant_i8g, which the model checked is declared before feeding. */
     const bool hi8 = a.q8_fed && a.q8_rot;
     const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
     const char* gq = hi8 ? "gated_had_quant_i8g" : rot ? "gated_had_quant_fp8" : "gated_quant_fp8";
-    if (!rot || rad_op_declared(b, "gated_had_quant_fp8"))
+    if (hi8 && !rad_op_declared(b, "gated_had_quant_i8g")) return RAD_E_INVAL;
+    if (!rot || hi8 || rad_op_declared(b, "gated_had_quant_fp8"))
         op = RAD_OP(b, gq,
                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
                                RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype),

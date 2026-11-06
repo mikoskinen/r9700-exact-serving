@@ -1069,6 +1069,22 @@ static const RadOperandSpec oMoeGemm[] = {
     { "expert_offset", RAD_OPD_IN,   0 },
     { "y",             RAD_OPD_OUT,  0 },
 };
+/* IQR trellis experts (r4d_iqr.h): the same grouping as moe_gemm_q, one weight and one scale
+ * table in EXPERT order, the codes decoded where they are read. `w`/`w_scale` are WEIGHT TABLES
+ * whose entry stride is one expert's arranged bytes; the dtype words carry each form. */
+static const RadParamSpec pMoeGemmIqr[] = {
+    P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"), P_INT("top_k"), P_INT("group"),
+    P_STR("a_order"), P_STR("dtype"), P_INTO("parts"),
+};
+static const RadOperandSpec oMoeGemmIqr[] = {
+    { "a",             RAD_OPD_IN,   0 },
+    { "a_scale",       RAD_OPD_IN,   1 },
+    { "w",             RAD_OPD_WTAB, 0 },
+    { "w_scale",       RAD_OPD_WTAB, 0 },
+    { "sorted_tok",    RAD_OPD_IN,   0 },
+    { "expert_offset", RAD_OPD_IN,   0 },
+    { "y",             RAD_OPD_OUT,  0 },
+};
 /* The experts are two tables by parity: `w`/`w_scale` hold the even experts, `w_odd`/`w_odd_scale`
  * the odd ones, expert e at entry e / 2 of its class. A table's entries share one geometry, and a
  * rank holding an uneven slice of every expert's width (a five-block expert split across two ranks
@@ -3595,6 +3611,12 @@ static const RadOpSchema kSchemas[] = {
            "[N, K] and `w_odd`/`w_odd_scale` the odd ones at [N_odd, K_odd], expert e at entry "
            "e/2. The output is max(N, N_odd) wide in `parts` stacked parts, and a class narrower "
            "than that fills each part's leading columns and zeros the rest."),
+    SCHEMA("moe_gemm_iqr", pMoeGemmIqr, oMoeGemmIqr,
+           "moe_gemm_q's grouping over IQR trellis experts (r4d_iqr.h): y[i] = a[row(i)] @ w[e]^T "
+           "in SORTED order, e from the offset range, `a_order` token gathers sorted_tok[i]/top_k "
+           "and sorted reads i. `w`/`w_scale` are WEIGHT TABLES (RAD_OPD_WTAB) in expert order, "
+           "each entry one expert's arranged IQR planes; the dtype words carry the codes, table, "
+           "mad and scale form. `parts` is 1 in phase 1."),
     SCHEMA("moe_gemm_q_mod4", pMoeGemmQMod4, oMoeGemmQMod4,
            "moe_gemm_q over FOUR weight-table classes by the expert's number mod 4: `w`/`w_scale` "
            "hold class 0 at [N, K] and `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry "
@@ -5134,6 +5156,14 @@ static const RadConstraint cGemmNtQGatedIqr[] = {
 };
 static const RadConstraint cGemmNtIqrTiled[] = {
     C_DIV("K", 256), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"),
+};
+/* The routed MoE over IQR experts (r4d_moe_iqr.hip): the grouped decode GEMV of moe_gemm_q's
+ * grouping. N a multiple of 16, K of 128; a trellis weight's run must also divide N (read off
+ * the stored form at launch). */
+static const RadConstraint cMoeGemmIqr[] = {
+    C_GE("M", 1), C_DIV("N", 16), C_DIV("K", 128), C_GE("n_expert", 1),
+    C_LE("n_expert", 65536), C_GE("top_k", 1), C_EQ("group", 128),
     C_IN("dtype", "i8a8 i8a8h"),
 };
 /* libr4d's `K DIV 4`, renamed to docs/OPS.md's `n` as in every quantiser row here. */
@@ -8614,6 +8644,20 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_gemm_iqr_tiled, r4d_rad_gemm_iqr_tiled_scratch,
   r4d_rad_layout_iqr, r4d_rad_relayout_iqr,
   nullptr, r4d_rad_unrelayout_iqr },
+
+{ "moe_gemm_iqr", "moe_gemm_iqr", "moe",
+  "grouped GEMV over IQR experts decoded from their codes where they are read (r4d_iqr.h): the "
+  "routed rows in scatter order, each run's 16-row weight tile decoded a K block ahead, a lane's "
+  "decoded values one sudot4 against a token's int8 activation, folded per (row, 128 K) weight "
+  "scale x activation scale",
+  "M * top_k sorted rows, one table; N a multiple of 16 and a trellis's run, K a multiple of 128; "
+  "the decode GEMV (phase 1: a run processed in groups of eight tokens; the prefill tile is phase 2)",
+  "int8 A with an f32 scale per (row, 128 K), W an IQR form's codes (dtype R4D_DT_IQR_W | word) "
+  "and a scale table at the same word, bf16 C in sorted order",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGemmIqr), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gemm_iqr, r4d_rad_moe_gemm_iqr_scratch,
+  r4d_rad_layout_iqr, r4d_rad_relayout_iqr, nullptr, r4d_rad_unrelayout_iqr },
 
 /* Band read off the entry point's own rejection tests, not a kernel-side row. */
 { "gemm_w8a8_nt_m64", "gemm_nt_q", "gemm",

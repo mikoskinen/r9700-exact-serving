@@ -639,6 +639,10 @@ int r4d_rad_gemm_iqr_gated(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_gated_scratch(const RadArgs*);
 int r4d_rad_gemm_iqr_tiled(const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_iqr_tiled_scratch(const RadArgs*);
+/* The routed mixture of experts over IQR weights (r4d_moe_iqr.hip): the grouped decode GEMV,
+ * moe_gemm_q's grouping over r4d_iqr.h's forms. */
+int     r4d_rad_moe_gemm_iqr(const RadArgs*, RadStream);
+int64_t r4d_rad_moe_gemm_iqr_scratch(const RadArgs*);
 int r4d_rad_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_had_quant_act_i8g(const RadArgs*, RadStream);
 int r4d_rad_quant_act_fp8   (const RadArgs*, RadStream);

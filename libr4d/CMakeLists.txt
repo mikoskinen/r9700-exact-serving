@@ -207,6 +207,7 @@ set(R4D_UNITS
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
+  "r4d_moe_iqr|"
   # DeepSeek-V4.1-Flash: the elementwise and small ops, the sparse attention and its indexer, and
   # the GEMMs over llama.cpp's native blocks (GGUF imports), MXFP4's in a unit of their own.
   "r4d_ds41_elem|"

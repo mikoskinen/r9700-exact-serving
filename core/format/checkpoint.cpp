@@ -1179,7 +1179,17 @@ void Checkpoint::detect_import() {
         return false;
     };
     const std::string qm = qc("quant_method");
-    if (qm == "auto-round") {
+    if (qm == "fp8") {
+        /* DeepSeek-V4's release: block-FP8 linears under `X.scale` e8m0 planes, and routed
+         * experts packed two e2m1 codes a byte under an e8m0 scale per 32 of K. */
+        if (qc("scale_fmt") == "ue8m0" && qc("expert_dtype") == "fp4" && fp8_br_ == 32 &&
+            fp8_bc_ == 32)
+            import_ = Import::Fp8Mx;
+        else
+            import_why_ = "fp8 here is neither ue8m0 block scales in 32x32 blocks with packed "
+                          "FP4 experts, which is the DeepSeek-V4 release form, nor a stock FP8 "
+                          "checkpoint";
+    } else if (qm == "auto-round") {
         /* AutoRound's GPTQ-compatible export; its own `auto_round` packing is not read. */
         const std::string pf = qc("packing_format");
         if (pf == "auto_round:auto_gptq") import_ = Import::Gptq;
@@ -1411,6 +1421,57 @@ int Checkpoint::import_piece(const std::string& name, const SrcTensor** codes,
     if (auto hit = imported_.find(name); hit != imported_.end()) {
         *codes = hit->second.first;
         *scale = hit->second.second;
+        return RAD_OK;
+    }
+
+    if (import_ == Import::Fp8Mx) {
+        /* DeepSeek-V4 release form: every `X.weight` has its scale plane at `X.scale`.
+         * Block-FP8 codes (E4M3 [N, K]) read stock with that e8m0 block plane; routed
+         * experts are I8 [N, K/2], two e2m1 codes a byte (element 2j in the low nibble),
+         * and their `.scale` is e8m0 [N, K/32] -- the logical width is twice the packed
+         * one, `fp4_e2m1*e8m0[1x32]`. A tensor without a `.scale` (norms, biases, tables)
+         * is not this form. */
+        std::string base;
+        if (!weight_base(name, &base)) return RAD_E_NOTFOUND;
+        const SrcTensor* w = find(base + ".weight");
+        const SrcTensor* e = find(base + ".scale");
+        if (!w || !e) return RAD_E_NOTFOUND;
+        if (e->rad_dtype != RAD_E8M0 || e->shape.size() != 2)
+            return refuse(RAD_E_FORMAT, "'" + e->name + "' is not the e8m0 scale plane of '" +
+                                        w->name + "'");
+        if (w->rad_dtype == RAD_F8E4M3) {
+            /* Block-FP8 linears state [N/32, K/32]; the Engram table states one scale a
+             * row ([N, K/32]), which is a [1, 32] block. */
+            const bool blk = e->shape[0] == (w->shape[0] + 31) / 32 &&
+                             e->shape[1] == (w->shape[1] + 31) / 32;
+            const bool rowblk = e->shape[0] == w->shape[0] &&
+                                e->shape[1] == (w->shape[1] + 31) / 32;
+            if (w->shape.size() != 2 || !(blk || rowblk))
+                return refuse(RAD_E_SHAPE, "'" + e->name + "' is not the e8m0 " 
+                                          "block plane or per-row 32-wide scale plane of '" +
+                                          w->name + "'");
+            *codes = w;
+            *scale = e;
+            imported_[name] = { w, e };
+            return RAD_OK;
+        }
+        if (w->rad_dtype != RAD_I8 || w->shape.size() != 2 || w->shape[1] <= 0)
+            return RAD_E_NOTFOUND;  /* a bf16/f32 tensor beside the imported ones reads stock */
+        const int64_t N = w->shape[0], K = w->shape[1] * 2;
+        if (e->shape[0] != N || e->shape[1] * 32 != K)
+            return refuse(RAD_E_SHAPE, "'" + e->name + "' is not the [" + std::to_string(N) +
+                                       ", " + std::to_string(K / 32) + "] e8m0 exponent plane of '" +
+                                       w->name + "'");
+        SrcTensor c = *w;
+        c.rad_dtype = RAD_FP4E2M1;
+        c.shape = { N, K };
+        SrcTensor x = *e;
+        x.rad_dtype = RAD_E8M0;
+        sliced_.push_back(std::move(c));
+        *codes = &sliced_.back();
+        sliced_.push_back(std::move(x));
+        *scale = &sliced_.back();
+        imported_[name] = { *codes, *scale };
         return RAD_OK;
     }
 
@@ -2393,13 +2454,15 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
     }
     const RadNameMap& m = *maps.front();
     const bool ema = m.mode == RAD_MAP_EMA;
+    const bool mul = m.mode == RAD_MAP_MUL;
     const SrcTensor* a = ck.find(m.src[0]);
-    const SrcTensor* u = ema ? ck.find(m.src[1]) : nullptr;
-    if (!a || (ema && !u)) {
+    const SrcTensor* u = ema ? ck.find(m.src[1]) : mul ? ck.find(m.src[1]) : nullptr;
+    if (!a || ((ema || mul) && !u)) {
         if (optional && !a && !u) return refuse(RAD_E_NOTFOUND, "none of its tensors is there");
         return refuse(RAD_E_NOTFOUND, std::string("it needs checkpoint tensor") +
                                       (ema ? "s '" + std::string(m.src[0]) + "' and '" +
-                                                 m.src[1] + "'" : " '" + std::string(m.src[0]) +
+                                                 m.src[1] + "'" : mul ? "s '" + std::string(m.src[0]) +
+                                                 "' and '" + m.src[1] + "'" : " '" + std::string(m.src[0]) +
                                                                   "'") +
                                       ", not all in " + ck.path());
     }
@@ -2427,7 +2490,24 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
         return refuse(RAD_E_FORMAT, "'" + a->name + "' cannot be read as f32");
     out->rank = (uint32_t)rank;
     for (size_t i = 0; i < rank; ++i) out->shape[i] = a->shape[i];
-    if (m.mode == RAD_MAP_COLS) {
+    if (m.mode == RAD_MAP_MUL) {
+        /* A gain shipped as two equal factors: one elementwise product, flattened to the
+         * logical vector every model declares it as. */
+        if (a->shape.size() != u->shape.size() || a->shape != u->shape)
+            return refuse(RAD_E_SHAPE, "'" + a->name + "' and '" + u->name +
+                                       "' are not the same shape to multiply");
+        int64_t n = 1;
+        for (int64_t x : a->shape) n *= x;
+        std::vector<float> b((size_t)n);
+        if (piece_f32(*a, 0, n, src.data()) < 0 || piece_f32(*u, 0, n, b.data()) < 0)
+            return refuse(RAD_E_FORMAT, "a gain factor of '" + out->name + "' cannot be read as f32");
+        for (int64_t i = 0; i < n; ++i) src[(size_t)i] *= b[(size_t)i];
+        out->rank = 1;
+        out->shape[0] = n;
+        out->derived = std::move(src);
+        out->why = "it is the product of '" + a->name + "' and '" + u->name +
+                   "', at convert -- a recipe rule stores it";
+    } else if (m.mode == RAD_MAP_COLS) {
         const int64_t cb = a->shape[rank - 1], c0 = m.src_index[0], nc = m.src_rows[0];
         if (c0 < 0 || nc <= 0 || c0 + nc > cb)
             return refuse(RAD_E_SHAPE, "columns [" + std::to_string(c0) + ", " +
@@ -2520,7 +2600,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (maps.front()->mode == RAD_MAP_WNORM)
         return resolve_wnorm(ck, *maps.front(), optional, out, why);
     if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA ||
-        maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS)
+        maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS ||
+        maps.front()->mode == RAD_MAP_MUL)
         return resolve_derived(ck, maps, optional, out, why);
     struct Src1 { const char* name; int index; int64_t rows; };
     std::vector<Src1> srcs;
@@ -2564,7 +2645,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             std::string iw;
             const int ir = ck.import_piece(s1.name, &ic, &is, &iw);
             if (ir == RAD_OK) {
-                if (s1.index >= 0)
+                if (s1.index >= 0 && !row_pieces)
                     return refuse(RAD_E_UNSUPPORTED, "it is a slice of '" + std::string(s1.name) +
                                                      "', which the checkpoint ships quantised; an "
                                                      "imported tensor is read whole");
@@ -2574,12 +2655,38 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                 return refuse(ir, iw);
             }
         }
-        /* A row piece (RAD_MAP_ROWS) of a plain tensor; a scale plane has no rows to match. */
+        /* A row piece (RAD_MAP_ROWS): rows [first, first + rows) of the codes, and of the
+         * scale plane they cover. A block plane's rows are [K/br]-wide blocks, so a cut of
+         * the codes must fall on a block boundary there. */
         if (st && row_pieces) {
-            if (sc)
-                return refuse(RAD_E_UNSUPPORTED, "it takes rows of '" + std::string(s1.name) +
-                                                 "', which the checkpoint ships block-scaled");
-            st = ck.rows(*st, s1.index, s1.rows, name.c_str());
+            const SrcTensor* whole = st;
+            const int64_t r0 = s1.index, nrows = s1.rows;
+            if (sc) {
+                const int64_t whole_rows = [&] {
+                    int64_t wh = 0, wc = 0;
+                    rad_enc_view((uint32_t)whole->shape.size(), whole->shape.data(), &wh, &wc);
+                    return wh;
+                }();
+                const int64_t br = ck.fp8_block_rows();
+                const int64_t srows = sc->shape.empty() ? 1 : sc->shape[0];
+                const int64_t blocks = br > 0 ? (whole_rows + br - 1) / br : 0;
+                if (srows == blocks && blocks != whole_rows) {
+                    if (r0 % br || nrows % br)
+                        return refuse(RAD_E_SHAPE, "rows [" + std::to_string(r0) + ", " +
+                                                   std::to_string(r0 + nrows) + ") of '" +
+                                                   std::string(s1.name) + "' do not fall on "
+                                                   + std::to_string(br) + "-row scale blocks");
+                    sc = ck.rows(*sc, r0 / br, nrows / br, name.c_str());
+                } else if (srows == whole_rows) {
+                    sc = ck.rows(*sc, r0, nrows, name.c_str());
+                } else {
+                    return refuse(RAD_E_SHAPE, "'" + sc->name + "' has " + std::to_string(srows) +
+                                               " rows for the " + std::to_string(whole_rows) +
+                                               " of '" + std::string(s1.name) + "'");
+                }
+                if (!sc) return refuse(RAD_E_SHAPE, "its scale rows are not there");
+            }
+            st = ck.rows(*whole, r0, nrows, name.c_str());
             if (!st) return refuse(RAD_E_SHAPE, "the rows it names are not there");
         }
         /* A sub-tensor index is always applied (ignoring it would give every expert the whole
@@ -2793,7 +2900,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
          * refuses them with `why`. */
         const int64_t br = ck.fp8_block_rows(), bc = ck.fp8_block_cols();
         const uint32_t sdt = out->scales[0]->rad_dtype;
-        int n_row = 0, n_blk = 0, n_one = 0;
+        int n_row = 0, n_blk = 0, n_one = 0, n_rowblk = 0;
         bool bad = false;
         for (size_t k = 0; k < out->pieces.size() && !bad; ++k) {
             const SrcTensor& pk = *out->pieces[k];
@@ -2809,6 +2916,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             const bool row1 = sk.shape.size() == 1 && sk.shape[0] == r;
             const bool blk = sk.shape.size() >= 2 && sr == want_r && scl == want_c;
             const bool row2 = sk.shape.size() >= 2 && sr == r && scl == 1;
+            const bool rowblk = sk.shape.size() >= 2 && sr == r && scl == want_c && !row2;
             if (sk.rad_dtype != sdt) {
                 bad = true;
                 out->why = "its FP8 pieces' scale planes differ in dtype";
@@ -2817,13 +2925,15 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                 ++n_one;
             } else if (row1) {
                 ++n_row;
+            } else if (row2) {
+                ++n_row;
             } else if (blk) {
                 ++n_blk;
                 if (out->why.empty() && k + 1 < out->pieces.size() && r % br)
                     out->why = "'" + pk.name + "' ends inside a scale block, so the next piece's "
                                "scales cannot follow it";
-            } else if (row2) {
-                ++n_row;
+            } else if (rowblk) {
+                ++n_rowblk;
             } else {
                 bad = true;
                 out->why = "'" + sk.name + "' is neither the [" + std::to_string(want_r) + ", " +
@@ -2832,7 +2942,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
                            "scale per row";
             }
         }
-        if (!bad && n_row && n_blk) {
+        const int n_kind = (n_row ? 1 : 0) + (n_blk ? 1 : 0) + (n_rowblk ? 1 : 0);
+        if (!bad && n_kind > 1) {
             bad = true;
             out->why = "its FP8 pieces disagree: some scale per row, some per " +
                        std::to_string(br) + "x" + std::to_string(bc) + " block";
@@ -2866,6 +2977,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
             rad_enc_copy_str(out->enc.scheme, "affine");
             rad_enc_add_plane(&out->enc, "codes", dt, 1, 1);
             if (n_row) rad_enc_add_plane(&out->enc, "scale", sdt, 1, 0);
+            else if (n_rowblk) rad_enc_add_plane(&out->enc, "scale", sdt, 1, bc);
             else rad_enc_add_plane(&out->enc, "scale", sdt, br, bc);
         }
     } else if (p0.ct_group) {

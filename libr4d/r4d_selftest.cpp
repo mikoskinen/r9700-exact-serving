@@ -6866,6 +6866,199 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
     dfree_all();
 }
 
+/* The routed MoE over IQR experts (moe_gemm_iqr), phase 1's decode GEMV, against the int8 dot
+ * over the same decoded values: two experts of the same computed trellis (tcq_code=mad, one scale
+ * a row), the sorted rows of moe_gemm_q's grouping, and the int8 rows on their values. The
+ * weight and scale are the row's own arrangements per expert, stacked: a zero leading stride
+ * marking the pointer array path is on the dense row; here the entry pitch is the arrangement its
+ * bytes. */
+static void moe_iqr_case(const Plugin& pl, int B, int L, int64_t M, int64_t N, int64_t K) {
+    if (!sel("moe_gemm_iqr") && !sel("gemm_iqr")) return;
+    const int64_t nkb = K / 128, ne = 2, tk = 2, NROW = M * tk;
+    const RadKernelInfo* r = find(pl, "moe_gemm_iqr");
+    if (!r || !r->layout || !r->relayout || !r->unrelayout) {
+        ok("moe_gemm_iqr", false, "row or hooks absent");
+        return;
+    }
+    char nm[200];
+    std::snprintf(nm, sizeof nm, "moe_gemm_iqr trellis-mad row-f32 B=%d L=%d M=%lld N=%lld K=%lld",
+                  B, L, (long long)M, (long long)N, (long long)K);
+    for (int64_t x : { M, N, K, ne, tk }) { (void)x; }
+    uint64_t z = 0x9E3779B97F4A7C15ull * (uint64_t)(B * 131 + L * 17 + M * 29);
+    auto rnd = [&]() {
+        z += 0x9E3779B97F4A7C15ull;
+        uint64_t x = z;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    };
+    static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6 };
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PI("n_expert", ne),
+                                 PI("top_k", tk), PS("dtype", "i8a8") };
+    struct Part {
+        Planes p;
+        int ic, ia, im, is, icf;
+        std::vector<uint8_t> wq, wsc;
+        RadLayout lw, ls;
+        std::vector<float> rsv, cfv;
+    };
+    std::vector<Part> parts((size_t)ne);
+    for (int64_t e = 0; e < ne; ++e) {
+        Part& q = parts[(size_t)e];
+        rad_enc_clear(&q.p.enc);
+        rad_enc_copy_str(q.p.enc.scheme, "trellis");
+        rad_enc_add_plane(&q.p.enc, "codes", kU[B], 1, 1);
+        rad_enc_add_plane(&q.p.enc, "scale", RAD_F32, 1, 0);
+        const int t = rad_enc_add_table(&q.p.enc, "trellis", RAD_I8, (int64_t)1 << L, 1);
+        q.p.enc.plane[t].block[0] = 256;
+        q.p.enc.plane[t].block[1] = 0;
+        rad_enc_add_table(&q.p.enc, "trellis.mad", RAD_U32, 2, 1);
+        rad_enc_add_plane(&q.p.enc, "scale.col", RAD_F32, 0, 128);
+        q.p.size(N, K);
+        q.ic = q.p.find("codes");
+        q.ia = q.p.find("trellis");
+        q.im = q.p.find("trellis.mad");
+        q.is = q.p.find("scale");
+        q.icf = q.p.find("scale.col");
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t c = 0; c < K; ++c)
+                rad_store_bits(q.p.data[(size_t)q.ic].data() + n * q.p.row_bytes(q.ic), B, c,
+                               (uint32_t)(rnd() & ((1ull << B) - 1)));
+        const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+        uint32_t* ab = (uint32_t*)q.p.data[(size_t)q.im].data();
+        ab[0] = A;
+        ab[1] = Bc;
+        for (uint32_t st = 0; st < (1u << L); ++st) {
+            const uint32_t h = ((st & 0xFFFFFFu) * A + Bc) & 0x3F3F3F3Fu;
+            q.p.data[(size_t)q.ia][st] = (uint8_t)(int8_t)((int)((h & 0xFFu) + ((h >> 8) & 0xFFu) +
+                                                                 ((h >> 16) & 0xFFu) + (h >> 24)) - 126);
+        }
+        q.rsv.assign((size_t)N, 0.0f);
+        q.cfv.assign((size_t)nkb, 0.0f);
+        for (int64_t n = 0; n < N; ++n)
+            q.rsv[(size_t)n] = std::ldexp(1.0f + (float)(rnd() % 64) / 64.0f, -9 - (int)(rnd() % 4));
+        for (int64_t g = 0; g < nkb; ++g) q.cfv[(size_t)g] = std::ldexp(1.0f, (int)(rnd() % 4) - 1);
+        for (int64_t n = 0; n < N; ++n) ((float*)q.p.data[(size_t)q.is].data())[n] = q.rsv[(size_t)n];
+        float* cfp = (float*)q.p.data[(size_t)q.icf].data();
+        for (int64_t g = 0; g < nkb; ++g) cfp[g] = q.cfv[(size_t)g];
+        if (stored(r, lp, 2, q.p, { "codes", "trellis", "trellis.mad" }, &q.wq, &q.lw) != RAD_OK ||
+            stored(r, lp, 3, q.p, { "scale", "scale.col" }, &q.wsc, &q.ls) != RAD_OK) {
+            ok(nm, false, "relayout rc");
+            return;
+        }
+    }
+    std::vector<uint8_t> sw, ss;
+    for (const Part& q : parts) {
+        sw.insert(sw.end(), q.wq.begin(), q.wq.end());
+        ss.insert(ss.end(), q.wsc.begin(), q.wsc.end());
+    }
+    /* Decoded value (expert e, row n, column k) as the int8 table entry its state reads. */
+    auto code = [&](const Part& q, int64_t n, int64_t c) {
+        return rad_load_bits(q.p.data[(size_t)q.ic].data() + n * q.p.row_bytes(q.ic), B, c);
+    };
+    const int C = (L + B - 1) / B;
+    auto val = [&](const Part& q, int64_t n, int64_t k) {
+        uint32_t st = 0;
+        for (int t = C - 1; t >= 0; --t) {
+            const int64_t rr = n / 256 * 256 + (n % 256 - t + 256) % 256;
+            st = ((st << B) | (uint32_t)code(q, rr, k)) & ((1u << L) - 1u);
+        }
+        return (int)(int8_t)q.p.data[(size_t)q.ia][st];
+    };
+    std::vector<int8_t> ha((size_t)(M * K));
+    std::vector<float> has((size_t)(M * nkb));
+    for (auto& v : ha) v = (int8_t)((int)(rnd() % 255) - 127);
+    for (auto& v : has) v = std::ldexp(1.0f + (float)(rnd() % 256) / 256.0f, -7);
+    std::vector<int32_t> sorted((size_t)NROW), off = { 0, (int32_t)M, (int32_t)NROW };
+    for (int64_t i = 0; i < NROW; ++i) sorted[(size_t)i] = (int32_t)((i % M) * tk + i / M);
+    std::vector<float> ref((size_t)(NROW * N));
+    for (int64_t i = 0; i < NROW; ++i) {
+        const int64_t e = i / M, tok = sorted[(size_t)i] / tk;
+        const Part& q = parts[(size_t)e];
+        for (int64_t n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int64_t g = 0; g < nkb; ++g) {
+                double d = 0.0;
+                for (int64_t k = g * 128; k < g * 128 + 128; ++k)
+                    d += (double)ha[(size_t)(tok * K + k)] * (double)val(q, n, k);
+                acc += d * (double)((double)q.cfv[(size_t)g] * (double)has[(size_t)(tok * nkb + g)]);
+            }
+            ref[(size_t)(i * N + n)] = (float)(acc * (double)q.rsv[(size_t)n]);
+        }
+    }
+    std::vector<RadTensor> ts = {
+        T(nullptr, RAD_I8, { M, K }), T(nullptr, RAD_F32, { M, nkb }),
+        T(nullptr, parts[0].lw.dtype, { ne, N, K }),
+        T(nullptr, parts[0].ls.dtype, { ne, N, nkb }), T(nullptr, RAD_I32, { NROW }),
+        T(nullptr, RAD_I32, { 3 }), T(nullptr, RAD_BF16, { NROW, N }),
+    };
+    ts[2].stride[0] = (int64_t)parts[0].lw.bytes;
+    ts[3].stride[0] = (int64_t)parts[0].ls.bytes;
+    void* d_a = dalloc(ha.size());
+    void* d_as = dalloc(has.size() * 4);
+    void* d_w = dalloc(sw.size());
+    void* d_s = dalloc(ss.size());
+    void* d_sorted = dalloc(sorted.size() * 4);
+    void* d_off = dalloc(off.size() * 4);
+    void* d_y = dalloc((size_t)(NROW * N) * 2);
+    if (!d_a || !d_as || !d_w || !d_s || !d_sorted || !d_off || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_a, ha.data(), ha.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_as, has.data(), has.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_w, sw.data(), sw.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_s, ss.data(), ss.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_sorted, sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_off, off.data(), off.size() * 4, hipMemcpyHostToDevice);
+    ts[0].data = (uint8_t*)d_a;
+    ts[1].data = (uint8_t*)d_as;
+    ts[2].data = (uint8_t*)d_w;
+    ts[3].data = (uint8_t*)d_s;
+    ts[4].data = (uint8_t*)d_sorted;
+    ts[5].data = (uint8_t*)d_off;
+    ts[6].data = (uint8_t*)d_y;
+    for (RadTensor& x : ts) rad_tensor_pack(&x);
+    ts[2].stride[0] = (int64_t)parts[0].lw.bytes;
+    ts[3].stride[0] = (int64_t)parts[0].ls.bytes;
+    std::vector<RadParam> gp = { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                                 PI("n_expert", ne), PI("top_k", tk), PS("dtype", "i8a8"),
+                                 PS("a_order", "token") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = gp.data(); a.n_p = (int)gp.size();
+    a.world_size = 1;
+    const int rc = r->launch(&a, (RadStream) nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+        ok(nm, false, "rc " + std::to_string(rc));
+        dfree_all();
+        return;
+    }
+    std::vector<uint16_t> y((size_t)(NROW * N));
+    st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
+    double r2 = 0.0;
+    for (size_t i = 0; i < y.size(); ++i) {
+        const float b = h_bf16((uint16_t)y[i]);
+        r2 += (double)b * (double)b;
+    }
+    const float rms = (float)std::sqrt(r2 / (double)y.size());
+    int64_t bad = 0, first = -1;
+    double e2 = 0.0;
+    float bfirst = 0.0f;
+    for (size_t i = 0; i < y.size(); ++i) {
+        const uint16_t want = h_to_bf16(ref[i]);
+        const float aa = h_bf16((uint16_t)y[i]), bb = h_bf16(want);
+        e2 += (double)(aa - bb) * (double)(aa - bb);
+        const bool off = !(std::fabs(aa - bb) <= std::ldexp(std::fabs(bb), -7) + std::ldexp(rms, -8));
+        if (off) { if (first < 0) { first = (int64_t)i; bfirst = bb; } ++bad; }
+    }
+    const double rel = std::sqrt(e2 / (r2 > 0 ? r2 : 1.0));
+    ok(nm, bad == 0, bad ? std::to_string(bad) + " of " + std::to_string(y.size()) +
+                               " outputs differ from the int8 dot, first [" + std::to_string(first / N) +
+                               "][" + std::to_string(first % N) + "] " + std::to_string(h_bf16((uint16_t)y[(size_t)first])) +
+                               " vs " + std::to_string(bfirst) + ", rms " + std::to_string(rms)
+                         : "the int8 dot's to a rounding, rel_l2 " + std::to_string(rel));
+    dfree_all();
+}
+
 /* The rotated int8 trunk against the f32 product it approximates. i8a8_numeric's reference uses
  * the quantiser's own codes, so it would pass with the weight and activation rotated by different
  * transforms; this one measures meaning. The weight is quantised on the host as libquant writes
@@ -32220,6 +32413,17 @@ static void device_phase(const Plugin& pl) {
                 iqr_gemm_case(pl, f, 300, 512, 1024);
             }
         }
+        /* The routed MoE over IQR experts: the decode GEMV on two experts of one computed
+         * trellis, a run of one token per expert and one of nine, the second crossing the
+         * eight-token group of its loop. */
+        moe_iqr_case(pl, 2, 16, 2, 256, 128);
+        moe_iqr_case(pl, 2, 16, 9, 256, 128);
+        /* The prefill tile (phase 2), two full runs of 64 sorted rows per expert. */
+        moe_iqr_case(pl, 2, 16, 64, 256, 256);
+        /* The tile ragged in a run (40 rows, two thirds of its 64) and reloading its prefetched K
+         * chunk (K 512 over the tile's 256). */
+        moe_iqr_case(pl, 2, 16, 40, 256, 256);
+        moe_iqr_case(pl, 2, 16, 32, 256, 512);
         /* The bias GEMM: three shapes on the 128 x 128 kernel (ragged N with an unaligned pitch;
          * an aligned ragged N with a K tail; K below one tile) and one on the 64 x 64 kernel. */
         bias_gemm_numeric(pl, 1100, 1001, 200, 1, true, false);

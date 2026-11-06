@@ -29,6 +29,8 @@
 #include <nlohmann/json.hpp>
 
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -44,6 +46,8 @@
 #include <deque>
 #include <fstream>
 #include <map>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -53,6 +57,79 @@ using namespace rad;
 namespace {
 
 bool file_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
+
+/* ---- resumable writes: a journal of finished large weights beside the output ---------------
+ * A kill used to throw away every finished expert because begin() truncates. The journal names
+ * each large weight after its planes are written, so the next run can keep those and re-quantise
+ * only the unfinished remainder. It is deleted when finish() succeeds. */
+std::mutex g_journal_mu;
+
+std::string journal_path(const std::string& out) { return out + ".journal"; }
+
+bool journal_write(const std::string& path, const std::string& text) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    const char* p = text.data();
+    int64_t left = (int64_t)text.size();
+    while (left > 0) {
+        const ssize_t n = ::write(fd, p, (size_t)left);
+        if (n < 0) { if (errno == EINTR) continue; ::close(fd); return false; }
+        p += n; left -= n;
+    }
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+
+bool journal_reset(const std::string& path, const std::string& header) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    const bool ok = ::write(fd, header.data(), header.size()) == (ssize_t)header.size() &&
+                    ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+
+/* FNV-1a over the plan, so a journal from another recipe or checkpoint is refused rather than
+ * silently resumed against planes it does not describe. */
+uint64_t journal_fnv(const std::string& s, uint64_t h) {
+    for (unsigned char c : s) { h ^= (uint64_t)c; h *= 1099511628211ull; }
+    return h;
+}
+
+std::string journal_fingerprint(const std::string& in, const std::string& out,
+                                const std::string& recipe_text, const std::vector<std::string>& names,
+                                const std::vector<int64_t>& bytes,
+                                const std::vector<std::string>& encs) {
+    uint64_t h = 1469598103934665603ull;
+    h = journal_fnv(in, h);
+    h = journal_fnv(out, h);
+    h = journal_fnv(recipe_text, h);
+    for (size_t i = 0; i < names.size(); ++i) {
+        h = journal_fnv(names[i], h);
+        h = journal_fnv(std::to_string(bytes[i]), h);
+        h = journal_fnv(encs[i], h);
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h);
+    return buf;
+}
+
+bool journal_read(const std::string& path, std::string* fp, std::set<std::string>* done) {
+    std::ifstream f(path);
+    std::string line;
+    if (!std::getline(f, line)) return false;
+    std::istringstream h(line);
+    std::string magic, tag, out;
+    if (!(h >> magic >> tag >> *fp >> out) || magic != "RADJOURNAL" || tag != "1") return false;
+    while (std::getline(f, line)) {
+        std::istringstream l(line);
+        std::string what, name;
+        if (!(l >> what >> name) || what != "DONE") continue;
+        done->insert(name);
+    }
+    return true;
+}
 
 /* clef (decision.type=clef): the head's geometry from joint_head_config.json beside the
  * checkpoint, and its three learned scalars from the head's own tensors (joint_head.safetensors,
@@ -379,9 +456,10 @@ void usage() {
         "                       change or a new weight is an expert. <file>.pre-append keeps the\n"
         "                       old header and length\n"
         "      --gpus LIST      the cards (HIP device numbers, comma separated) the quantisers\n"
-        "                       may run on, and large weights then run two at a time. A\n"
+        "                       may run on, and large weights then run one per card. A\n"
         "                       quantiser writes the same bytes on a card as on the host; with\n"
         "                       no quantiser plugin that has a device path, refused\n"
+        "      --cpu            force every quantiser's host path, even when --gpus is given\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
         "                       before writing anything\n"
         "      --sources FILE   one JSON line a planned weight: its logical shape, the encoding\n"
@@ -392,6 +470,10 @@ void usage() {
         "                       little-endian), to check a checkpoint's decoding against another\n"
         "                       converter's\n"
         "      --report N       the worst N quantisation errors to print (default 20)\n"
+        "      --resume         continue a killed write from its journal (<out>.journal): finished\n"
+        "                       large weights are kept, unfinished ones re-quantised. Default: resume\n"
+        "                       when the journal is there\n"
+        "      --no-resume      ignore a journal and truncate the output, a fresh write\n"
         "  -v, --verbose\n"
         "  -h, --help\n");
 }
@@ -431,6 +513,8 @@ int main(int argc, char** argv) {
     bool     max_spec_given = false;
     int      report_n = 20;
     bool     verbose = false, plan_only = false, list_quant = false;
+    int      resume_mode = 0;        /* --resume / --no-resume; 0 = by the journal's presence */
+    int64_t  checkpoint_at = -1;     /* --checkpoint-at N: keep the files after N large weights */
     std::string reuse_path, changed_path, sources_path, dump_spec, dump_out;
     std::vector<std::string> reuse_more;   /* --reuse given again: more containers to copy from */
     std::vector<std::string> lora_paths;
@@ -440,6 +524,7 @@ int main(int argc, char** argv) {
     int         kv_dtype = RAD_DT_INVALID;
     std::vector<std::pair<std::string, std::string>> set_kv;
     std::vector<int> gpus;           /* --gpus: the cards the quantisers may run on */
+    bool        force_cpu = false;   /* --cpu: the host path, even with --gpus */
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -480,6 +565,9 @@ int main(int argc, char** argv) {
                                        max_spec_given = true; }
         else if (a == "--draft-model") draft_dir = next("--draft-model");
         else if (a == "--plan-only") plan_only = true;
+        else if (a == "--resume")    resume_mode = 1;
+        else if (a == "--no-resume") resume_mode = -1;
+        else if (a == "--checkpoint-at") checkpoint_at = num("--checkpoint-at", 1, INT64_MAX);
         else if (a == "--sources")   sources_path = next("--sources");
         else if (a == "--dump-f32") {
             const std::string v = next("--dump-f32");
@@ -511,6 +599,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--lora-map")  lora_map = next("--lora-map");
         else if (a == "--in-place")  in_place = true;
+        else if (a == "--cpu")       force_cpu = true;
         else if (a == "--gpus") {
             for (const std::string& d : rad_split_list(next("--gpus")))
                 gpus.push_back((int)rad_flag_int("rad-convert", "--gpus", d.c_str(), 0, 1023));
@@ -756,6 +845,20 @@ int main(int argc, char** argv) {
     if (!ck.import_refusal().empty())
         RAD_ERR("quantisation '%s' cannot be imported: %s", meta.quant.c_str(),
                 ck.import_refusal().c_str());
+    /* --cpu is a plugin-side switch: lq_grid's grid_of reads it and clears the per-rule gpu. */
+    if (force_cpu) {
+        gpus.clear();
+#ifdef _WIN32
+        _putenv_s("RAD_CONVERT_FORCE_CPU", "1");
+#else
+        setenv("RAD_CONVERT_FORCE_CPU", "1", 1);
+#endif
+        RAD_INFO("--cpu: quantisers run on the host; cards ignored");
+    } else {
+#ifndef _WIN32
+        unsetenv("RAD_CONVERT_FORCE_CPU");
+#endif
+    }
     if (rad_tools_load_plugins(home, hierarchy, meta.arch, meta.quant, &plugins, imported) < 0) {
         RAD_ERR("rad-convert runs the architecture plugin's declare: its name map says which "
                 "checkpoint tensors make each weight, and the kernels it resolves are what the "
@@ -1194,8 +1297,20 @@ int main(int argc, char** argv) {
     }
 
     /* ---------------------------------------------------------------- write */
+    /* Resume when a journal is beside the output. A journal with a killed write means begin() must
+     * not truncate the planes it already holds; --no-resume opts out, --resume demands it. */
+    const std::string jpath = journal_path(out);
+    const bool jfile = file_exists(jpath);
+    bool resuming = !in_place && resume_mode != -1 && jfile;
+    if (resume_mode == 1 && !jfile && !in_place) {
+        RAD_ERR("--resume: no journal at %s; the write is not resumable", jpath.c_str());
+        return 1;
+    }
+    std::string jfp;
+    std::set<std::string> jdone;
     RadWriter w;
-    RAD_TRY(in_place ? w.begin_append(out.c_str(), reuse) : w.begin(out.c_str()));
+    RAD_TRY(in_place ? w.begin_append(out.c_str(), reuse)
+                     : resuming ? w.begin_resume(out.c_str()) : w.begin(out.c_str()));
 
     w.set_arch(meta.arch);
     /* An extended container keeps its name; this run's checkpoint need not be its original. */
@@ -1254,7 +1369,13 @@ int main(int argc, char** argv) {
     omp_set_max_active_levels(1);
 #endif
     constexpr int64_t kChunk = kQuantBandBytes;     /* copies and joins move this much at once */
-    constexpr int64_t kSmall = (int64_t)32 << 20;   /* f32 bytes one thread quantises alone */
+    int64_t kSmall = (int64_t)32 << 20;             /* f32 bytes one thread quantises alone; an MoE
+                                                     * tensor is much wider than this, a test may
+                                                     * lower it so every weight is a large one */
+    if (const char* e = std::getenv("RAD_CONVERT_LARGE_F32_BYTES")) {
+        const long long v = std::strtoll(e, nullptr, 10);
+        if (v > 0) kSmall = v;
+    }
 
     struct Job {
         Logical*            L = nullptr;
@@ -1341,6 +1462,34 @@ int main(int argc, char** argv) {
         const int64_t idx = w.add_weight(ww);
         if (idx < 0) { w.abort(); return 1; }
         jobs.push_back(Job{ Lp, idx, re, rf, plane_total });
+    }
+    /* The journal describes the plan: a missing or mismatched one is refused, not resumed over
+     * planes from another recipe. A fresh write creates it before the first band. */
+    if (!in_place) {
+        std::vector<std::string> jnames, jencs;
+        std::vector<int64_t> jbytes;
+        for (const Job& j : jobs) {
+            jnames.push_back(j.L->src.name);
+            jbytes.push_back(j.bytes);
+            jencs.push_back(enc_name(j.L->enc));
+        }
+        jfp = journal_fingerprint(in, out, recipe.text(), jnames, jbytes, jencs);
+        if (resuming) {
+            std::string fp;
+            if (!journal_read(jpath, &fp, &jdone) || fp != jfp) {
+                RAD_ERR("%s: the journal does not describe this plan (fingerprint %s, wanted %s); "
+                        "use --no-resume to write it from the start", jpath.c_str(), fp.c_str(),
+                        jfp.c_str());
+                w.abort();
+                return 1;
+            }
+            RAD_INFO("resume   %zu large weight(s) kept from the journal, the rest written",
+                     jdone.size());
+        } else {
+            if (!journal_reset(jpath, "RADJOURNAL 1 " + jfp + " " + out + "\n"))
+                RAD_WARN("resume   cannot write %s; a kill will restart from the beginning",
+                         jpath.c_str());
+        }
     }
     /* A --changed name no weight reads is a typo or an unconverted tensor; refuse it. */
     if (!changed.empty()) {
@@ -1622,6 +1771,34 @@ int main(int argc, char** argv) {
         const bool big = !jobs[i].re && L.rule && L.src.rows * L.src.cols * 4 > kSmall;
         (big ? large : small).push_back(i);
     }
+    /* A journaled weight's planes are already at their offsets; mark them so finish()'s
+     * completeness check counts them, and skip the trellis for them below. */
+    for (size_t i : large)
+        if (jdone.count(jobs[i].L->src.name)) {
+            if (w.mark_weight_done(jobs[i].idx) != RAD_OK) {
+                RAD_ERR("resume: cannot mark '%s' done", jobs[i].L->src.name.c_str());
+                w.abort();
+                return 1;
+            }
+            written += jobs[i].bytes;
+        }
+    std::atomic<int64_t> done_large{0}, skipped_large{0};
+    std::atomic<bool> beat_stop{false};
+    const auto beat_t0 = std::chrono::steady_clock::now();
+    std::thread beat([&] {
+        int tick = 0;
+        while (!beat_stop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (++tick < 30) continue;
+            tick = 0;
+            const auto sec = (long long)std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - beat_t0).count();
+            std::fprintf(stderr, "rad-convert: progress %lld/%zu large weights complete, %lld "
+                                 "resumed, %llds\n", (long long)done_large.load(), large.size(),
+                                 (long long)skipped_large.load(), sec);
+            std::fflush(stderr);
+        }
+    });
     std::atomic<int> failed{RAD_OK};
     const auto t0 = std::chrono::steady_clock::now();
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1634,27 +1811,54 @@ int main(int argc, char** argv) {
         }
     }
     {
-        /* With the quantisers on cards (--gpus), large weights run two at a time, so one's host
-         * work (its rows read, its Hessian factored, its error measured) overlaps the other's on
-         * the card. Each runs on a thread of its own, whose OpenMP regions get a full team. */
+        /* With the quantisers on cards (--gpus), large weights run one per card. A Hessian
+         * chunk is one row window of a card's free VRAM, so it is split across cards; each
+         * worker pulls a whole weight, the journal keeps the finished ones across a kill. */
         std::atomic<size_t> next{0};
+        std::atomic<bool> paused{false};
         auto worker = [&] {
-            for (size_t i; failed.load() == RAD_OK && (i = next.fetch_add(1)) < large.size();) {
-                const int st = run_job(jobs[large[i]]);
+            for (size_t i; failed.load() == RAD_OK && !paused.load() &&
+                          (i = next.fetch_add(1)) < large.size();) {
+                const Job& j = jobs[large[i]];
+                if (jdone.count(j.L->src.name)) { ++done_large; ++skipped_large; continue; }
+                const int st = run_job(j);
                 if (st < 0) {
                     int ok = RAD_OK;
                     failed.compare_exchange_strong(ok, st);
+                    continue;
                 }
+                ++done_large;
+                if (!jpath.empty() && !journal_write(jpath, "DONE " + j.L->src.name + "\n")) {
+                    static std::mutex mw;
+                    std::lock_guard<std::mutex> lm(mw);
+                    std::fprintf(stderr, "rad-convert: the journal at %s cannot be written; a kill "
+                                         "will restart from the beginning\n", jpath.c_str());
+                    std::fflush(stderr);
+                }
+                if (checkpoint_at >= 0 && done_large.load() >= checkpoint_at) paused.store(true);
             }
         };
         if (gpus.empty()) {
             worker();
         } else {
-            std::thread side(worker);
+            const unsigned n = std::max(1u, (unsigned)gpus.size());
+            std::vector<std::thread> side;
+            side.reserve(n > 0 ? n - 1 : 0);
+            for (unsigned i = 1; i < n; ++i) side.emplace_back(worker);
             worker();
-            side.join();
+            for (std::thread& t : side) t.join();
+        }
+        if (paused.load()) {
+            beat_stop.store(true);
+            beat.join();
+            w.abort_keep();
+            RAD_INFO("checkpoint  %lld large weight(s) written; resume with the journal at %s",
+                     (long long)done_large.load(), jpath.c_str());
+            return 3;
         }
     }
+    beat_stop.store(true);
+    beat.join();
     if (failed.load() != RAD_OK) { w.abort(); return 1; }
     RAD_INFO("weights  %zu written in %.0f s: %zu a thread each, %zu across every thread",
              jobs.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
@@ -1662,6 +1866,7 @@ int main(int argc, char** argv) {
 
     const auto tf = std::chrono::steady_clock::now();
     if (w.finish() < 0) return 1;
+    if (!jpath.empty()) ::unlink(jpath.c_str());   /* the container is sealed: no resume is needed */
     RAD_INFO("finish   %.0f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - tf)
                                     .count());
 

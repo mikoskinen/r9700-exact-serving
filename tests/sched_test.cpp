@@ -170,6 +170,7 @@ struct Fixture {
         cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
+        cfg.prefill_room_gate = false;
         /* The fixture runs --prefix-resume nearest (a tail snapshot at the last quantum
          * boundary, a hit at any snapshot or block); the exact-resume tests set prefix_exact
          * (--prefix-resume exact, the engine's default) themselves. */
@@ -1773,6 +1774,97 @@ TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
     CHECK_EQ(f.sch.find(b)->n_computed, 0);
     CHECK_EQ(f.sch.metrics().preemptions, 1);
     f.commit_plain();
+}
+
+/* A FRESH PREFILL's room gate: it starts only when its whole prompt plus one decode position
+ * fits beside the runners' whole prompts and their next-token headroom. The old admission
+ * reserved the first chunk alone, so a long prefill could reach 100% and then be preempted at
+ * the first decode step -- the full prefill thrown away. */
+TEST(a_fresh_prefill_waits_for_its_whole_prompt_and_running_headroom) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);   /* 20 x 16 = 320 tokens; prompts of 160 = 10 blocks each */
+    f.cfg.max_seqs = 2;
+    f.cfg.prefill_room_gate = true;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(160, /*max_tokens=*/64, /*priority=*/5);
+    const uint64_t b = f.submit(160, /*max_tokens=*/64, /*priority=*/0);
+
+    /* A holds 10 blocks; B needs 10 for its prompt, plus one block for B's decode position and
+     * one for A's next position: 12 > the 10 free, so B waits instead of starting a prefill it
+     * would have to throw away. */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 1);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+    f.commit_plain();
+
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* DS41 QSA: a WINDOW group holds ~window tokens, not the whole prompt. Counting ceil(prompt /
+ * block) against it keeps every long chat in Waiting while can_ever_fit (which caps at the
+ * window) still says yes. Shrink the SWA pool so the unfixed gate would wait; the request must
+ * still start. */
+TEST(a_fresh_prefill_is_not_held_for_a_windowed_groups_full_prompt) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096, /*windowed=*/true);
+    f.cfg.max_seqs = 2;
+    f.cfg.prefill_room_gate = true;
+    int32_t win = -1;
+    for (size_t i = 0; i < f.prog.kv_groups.size(); ++i)
+        if (f.prog.kv_groups[i].decl.kind == RAD_KV_WINDOW) win = (int32_t)i;
+    REQUIRE(win >= 0);
+    f.kv.total[(size_t)win] = 8;
+    f.kv.refcnt[(size_t)win].assign(8, 0);
+    f.kv.freelist[(size_t)win].clear();
+    for (int32_t b = 7; b >= 0; --b) f.kv.freelist[(size_t)win].push_back(b);
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(400, /*max_tokens=*/64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* A long prefill gets a capped chunk when other requests are eligible: 4 eligible requests and a
+ * 4096-token budget floor the cap at 1024 tokens, so the long prompt cannot take every token. */
+TEST(a_long_prefill_chunk_is_capped_to_a_fair_share_when_others_exist) {
+    Fixture f;
+    f.build(/*blocks=*/512, /*states=*/64, /*max_tok=*/4096, /*max_ctx=*/4096);
+    f.cfg.max_seqs = 4;
+    f.cfg.long_prefill_token_threshold = 1024;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(3000, /*max_tokens=*/64, /*priority=*/5);
+    for (int i = 0; i < 3; ++i) f.submit(300, /*max_tokens=*/64, /*priority=*/0);
+
+    REQUIRE(f.sch.step() != nullptr);
+    int64_t a_tokens = -1;
+    for (const StepEntry& e : f.sch.plan().e)
+        if (e.req && e.req->id == a) a_tokens = e.n_tokens;
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK(a_tokens > 0 && a_tokens <= 1024);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* The same threshold does not throttle a lone prefill: nobody is waiting behind it. */
+TEST(a_lone_long_prefill_is_not_capped_by_the_long_prefill_threshold) {
+    Fixture f;
+    f.build(/*blocks=*/512, /*states=*/64, /*max_tok=*/4096, /*max_ctx=*/4096);
+    f.cfg.max_seqs = 4;
+    f.cfg.checkpoint_interval = 4096;       /* one chunk, not a 256-token interval */
+    f.cfg.long_prefill_token_threshold = 1024;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(3000, /*max_tokens=*/64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e.size(), 1);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK(f.sch.plan().e[0].n_tokens > 1024);
 }
 
 /* The whole-recompute predicate counts blocks the cache can lend back, not entries it already

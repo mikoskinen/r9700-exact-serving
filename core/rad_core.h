@@ -877,10 +877,19 @@ struct Config {
      * prefill stager arms for. 0 = off: the chunk takes every token the step has left. N > 0: cap
      * the chunk at N tokens on such a step. See Scheduler::step, docs/GUIDE.md. */
     int64_t busy_prefill_chunk = -1;
+    /* --long-prefill-token-threshold: cap a long prefill's chunk at N tokens while other
+     * requests exist. The effective cap is max(N, token budget / eligible requests), so a lone
+     * prefill still gets the whole budget. 0 (default) is off; this is the vLLM-style throttle
+     * that stops one long prompt from taking every token in a mixed step. */
+    int64_t long_prefill_token_threshold = 0;
     int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */
+    /* --prefill-room-gate: a fresh prefill starts only when its whole prompt plus one decode
+     * position, beside every runner's remaining prompt and next-token headroom, fits the pool.
+     * Off admits the first chunk alone (the old behaviour); on is the default. */
+    bool  prefill_room_gate = true;
     int64_t preempt_wait_ms = 5000;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */

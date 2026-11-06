@@ -381,6 +381,8 @@ struct Model {
     Cfg c{};
     std::vector<Layer> layers;
     int64_t work = 0, cmax = 0;
+    /* --calib-layers, hi exclusive. Both 0: the tap is off. */
+    int calib_lo = 0, calib_hi = 0;
     /* The indexer scores a step's rows in runs of at most `irows` rows into one [irows, cmax] score
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
@@ -1416,6 +1418,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
+    s.cfg.calib = (m.calib_hi > m.calib_lo && l >= m.calib_lo && l < m.calib_hi) ? 1 : 0;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
@@ -1992,6 +1995,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                        { m.tmap }, {}, { m.ctok });
     }
     m.layers.resize((size_t)c.n_layer);
+    if (ctx->calib_dir && ctx->calib_dir[0]) {
+        m.calib_lo = ctx->calib_layer_lo;
+        m.calib_hi = ctx->calib_layer_hi > ctx->calib_layer_lo ? ctx->calib_layer_hi : (int)c.n_layer;
+    }
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
     m.pcn_fin = post_collapse_norm(b, m, T, m.final_gain, m.act.x, m.h1, m.h0, m.pre_f, m.xcol,
                                    m.final_hidden);

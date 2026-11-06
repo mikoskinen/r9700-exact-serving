@@ -1003,7 +1003,15 @@ bool KVManager::can_grow(uint64_t id, int64_t n_tokens) const {
         const auto& p = plans_[g];
         if (p.paged()) {
             const int64_t first = s->first_block_pos[g] / p.block_size;
-            const int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            int64_t want  = ceil_div(n_tokens, p.block_size) - first;
+            /* A window recycles; ensure() and make_room cap the table at the window. Counting
+             * the whole prompt here refuses every long QSA chat (DS41 window pool is ~4800
+             * tokens) while can_ever_fit, which caps, still says yes — the admission gate then
+             * waits forever. */
+            if (p.kind == RAD_KV_WINDOW) {
+                if (s->win[g].set) want = window_table_len(p, s->win[g], n_tokens) - first;
+                else               want = std::min(want, window_seq_cap(p));
+            }
             int64_t need = want - (int64_t)s->blocks[g].size();
             if (need < 0) need = 0;
             /* ensure() takes one copy-on-write block for a partially filled block; include it
