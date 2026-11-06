@@ -23,11 +23,21 @@
 #include "r4d_moe_sort.h"
 #include "r4d_plugin.h"
 
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <type_traits>
+#include <utility>
+
+#ifndef R4D_EMU_HOST
+/* split_ctr's counter blocks (r4d_gemm_fp8a8.hip), for mhc_mix's one-launch form */
+unsigned int* r4d_8a8_split_ctr(RadStream s, const void* out);
+#endif
 
 namespace {
 
@@ -883,10 +893,20 @@ __device__ __forceinline__ void mix_finish(const float (&d)[(HC * (HC + 2) + 32)
 // rows over its waves had it at decode heights, was ~1 us a step: 34 us of a 36 us call).
 constexpr int kMixSteps = 8;
 
-template <int HC, int R, int WV, int TS>
+template <int HC>
+__device__ __forceinline__ void mix_finish_row(const float* part, int chunks, const MixOut& o, long row,
+                                               int lane);
+
+/* FIN (mhc_mix's one-launch form): after a workgroup's partials for its row group are written, it
+ * adds one to the group's counter (ctr, a split_ctr block of this (stream, output): zero, and zeroed
+ * again by the last arriver); the workgroup that brings it to `chunks` finishes the group's rows,
+ * a wave a row, with mix_finish_kernel's row (mix_finish_row): the same partials summed in the same
+ * chunk order, so the finish kernel's bits, one ordered dispatch fewer. */
+template <int HC, int R, int WV, int TS, bool FIN = false>
 __global__ __launch_bounds__(32 * WV) void mix_split_kernel(const uint16_t* h, long hp,
                                                             const float* fn, long fp, float* part,
-                                                            int width, int chunks, long rows) {
+                                                            int width, int chunks, long rows,
+                                                            unsigned* ctr = nullptr, MixOut fo = {}) {
     constexpr int MIX = HC * (HC + 2), S = MIX + 1, JW = (MIX + WV - 1) / WV;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, chunk = blockIdx.x;
     const int c0 = chunk * kMixCols;
@@ -958,16 +978,30 @@ __global__ __launch_bounds__(32 * WV) void mix_split_kernel(const uint16_t* h, l
                 if (!lane && r < nr) part[((r0 + r) * S + j) * chunks + chunk] = s;
             }
         }
+        if constexpr (FIN) {
+            __shared__ unsigned s_last;
+            __threadfence();   // this workgroup's partials, device-wide, before its arrival
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                const unsigned old =
+                    __hip_atomic_fetch_add(&ctr[g], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+                s_last = old + 1u == (unsigned)chunks ? 1u : 0u;
+                if (s_last) __hip_atomic_store(&ctr[g], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            }
+            __syncthreads();
+            if (s_last) {
+                __threadfence();   // every other workgroup's partials: no stale line
+                for (int r = wave; r < nr; r += WV) mix_finish_row<HC>(part, chunks, fo, r0 + r, lane);
+            }
+            __syncthreads();   // s_last is rewritten for the next row group
+        }
     }
 }
 
 template <int HC>
-__global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int chunks, MixOut o,
-                                                         long rows) {
+__device__ __forceinline__ void mix_finish_row(const float* part, int chunks, const MixOut& o, long row,
+                                               int lane) {
     constexpr int MIX = HC * (HC + 2), Q = (MIX + 32) / 32, CU = 32;
-    const int lane = threadIdx.x & 31;
-    const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
-    if (row >= rows) return;
     const MixPre<HC> pr = mix_pre<HC>(lane, o);
     const bool vec = (chunks & 3) == 0 && ((uintptr_t)part & 15) == 0;
     float d[Q];
@@ -1005,6 +1039,15 @@ __global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int 
     mix_finish<HC>(d, lane, row, o, pr);
 }
 
+template <int HC>
+__global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int chunks, MixOut o,
+                                                         long rows) {
+    const int lane = threadIdx.x & 31;
+    const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (row >= rows) return;
+    mix_finish_row<HC>(part, chunks, o, row, lane);
+}
+
 // Without scratch: one wave a row, the chunks in order, the same partials and the same sums.
 template <int HC>
 __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long hp, const float* fn,
@@ -1036,6 +1079,31 @@ __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long 
 
 long mix_chunks(long width) { return (width + kMixCols - 1) / kMixCols; }
 
+/* mhc_mix's one-launch form (mix_split_kernel FIN). R4D_DS41_MIX_FUSE: unset or anything but "0" =
+ * on; "0" = the split and finish kernels (the same bits). r4d_ds41_mix_fuse_force pins it for tests
+ * (-1 = the environment's). */
+constexpr long kDsMixCtr = 8192;   // split_ctr's counters a block (r4d_gemm_fp8a8.hip kMaxCtr)
+std::atomic<int> g_mix_fuse_force{-1};
+bool ds_mix_fuse_on() {
+    const int f = g_mix_fuse_force.load(std::memory_order_relaxed);
+    if (f >= 0) return f != 0;
+    static const bool on = [] { const char* e = std::getenv("R4D_DS41_MIX_FUSE"); return !(e && e[0] == '0' && !e[1]); }();
+    return on;
+}
+#ifdef R4D_EMU_HOST
+/* tests/r4d_emu: device memory is host memory; a zeroed block a (stream, output), as split_ctr */
+unsigned* ds_mix_ctr(RadStream s, const void* out) {
+    static std::mutex m;
+    static std::map<std::pair<RadStream, const void*>, unsigned*> blocks;
+    std::lock_guard<std::mutex> lk(m);
+    unsigned*& b = blocks[std::make_pair(s, out)];
+    if (!b) b = (unsigned*)std::calloc((size_t)kDsMixCtr, sizeof(unsigned));
+    return b;
+}
+#else
+unsigned* ds_mix_ctr(RadStream s, const void* out) { return r4d_8a8_split_ctr(s, out); }
+#endif
+
 
 template <int HC>
 int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const MixOut& o, long rows,
@@ -1049,16 +1117,26 @@ int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const Mi
         // Rows a wave keeps (its sums' registers), and the fastest split measured per height on
         // gfx1201 (n 5120, hc 4): one row up to 8, four rows 4 steps up to 24, then eight.
         constexpr int RB = HC <= 4 ? 8 : HC <= 6 ? 4 : 2, RM = RB < 4 ? RB : 4;
+        // FIN: the finish in the split launch's last workgroup of each row group (its counters a
+        // split_ctr block of this stream and `pre`; a grid past their count, or no block, takes the
+        // finish kernel -- the same bits)
+        const long RSel = rows <= 8 ? 1 : rows <= 24 ? RM : RB;
+        const long groups = (rows + RSel - 1) / RSel, gy = grid_rows(groups);
+        unsigned* const ctr = ds_mix_fuse_on() && gy <= (long)kDsMixCtr ? ds_mix_ctr(stream, o.pre) : nullptr;
 #define MIX_SPLIT(RS, TS)                                                                          \
-    R4D_EMIT(stream, (mix_split_kernel<HC, RS, 8, TS>),                                            \
-             dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,            \
-             (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,                    \
-             (long)fn.stride[0], part, o.width, (int)chunks, rows)
+    (ctr ? R4D_EMIT(stream, (mix_split_kernel<HC, RS, 8, TS, true>),                               \
+                    dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,     \
+                    (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,             \
+                    (long)fn.stride[0], part, o.width, (int)chunks, rows, ctr, o)                  \
+         : R4D_EMIT(stream, (mix_split_kernel<HC, RS, 8, TS>),                                     \
+                    dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,     \
+                    (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,             \
+                    (long)fn.stride[0], part, o.width, (int)chunks, rows, (unsigned*)nullptr, o))
         const int rc = rows <= 8 ? MIX_SPLIT(1, kMixSteps)
                        : rows <= 24 ? MIX_SPLIT(RM, 4)
                                     : MIX_SPLIT(RB, 4);
 #undef MIX_SPLIT
-        if (rc < 0) return rc;
+        if (rc < 0 || ctr) return rc;
         return R4D_EMIT(stream, mix_finish_kernel<HC>, dim3(fin), dim3(128), 0, (const float*)part,
                         (int)chunks, o, rows);
     }
@@ -2251,6 +2329,7 @@ extern "C" int r4d_rad_stream_gate_add(const RadArgs* a, RadStream s) {
 extern "C" int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream s) { return rope_rows_body(a, s); }
 extern "C" int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream s) { return quant_rt_body(a, s); }
 extern "C" int r4d_rad_mhc_mix(const RadArgs* a, RadStream s) { return mhc_mix_body(a, s); }
+extern "C" void r4d_ds41_mix_fuse_force(int on) { g_mix_fuse_force.store(on, std::memory_order_relaxed); }
 /* Partials of every chunk of every row of the band, so the projection spreads over workgroups. */
 extern "C" int64_t r4d_rad_mhc_mix_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), n = r4d_geti_or(a, "n", 0);

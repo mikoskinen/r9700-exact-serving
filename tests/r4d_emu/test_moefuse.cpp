@@ -747,6 +747,73 @@ void scored_scatter_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* mhc_mix (r4d_ds41_elem.hip) three ways -- no scratch (one wave a row walks the chunks), scratch with the
+ * split and finish kernels, and scratch with the one-launch form (the last workgroup of a row group
+ * finishes it, mix_split_kernel FIN) -- pre, post and comb byte for byte, the one-launch form twice in a
+ * row (its counters reset themselves), at hc 4 over the row heights each split form serves. */
+void mix_fuse_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct Shape { long rows, n; };
+    const Shape shapes[] = { { 1, 1280 }, { 3, 1024 }, { 8, 1024 }, { 9, 768 }, { 24, 512 }, { 25, 512 }, { 1, 5120 } };
+    const int hc = 4, mix = hc * (hc + 2), iters = 20;
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    for (const Shape& sh : shapes) {
+        const long rows = sh.rows, n = sh.n, width = hc * n;
+        std::vector<uint16_t> h((size_t)(rows * width));
+        for (auto& v : h) { const float x = ud(rng); uint32_t u; std::memcpy(&u, &x, 4); v = (uint16_t)(u >> 16); }
+        std::vector<float> fn((size_t)(mix * width)), scale = { 0.75f, 0.5f, 1.25f }, base((size_t)mix);
+        for (auto& v : fn) v = ud(rng) * 0.02f;
+        for (auto& v : base) v = ud(rng) * 0.1f;
+        auto run = [&](int form, std::vector<float>& pre, std::vector<float>& post, std::vector<float>& comb) {
+            pre.assign((size_t)(rows * hc), -7.f); post.assign((size_t)(rows * hc), -7.f);
+            comb.assign((size_t)(rows * hc * hc), -7.f);
+            RadTensor t[7]{};
+            auto mat = [](RadTensor& x, void* d, uint32_t dt, long r, long c) {
+                x.data = d; x.dtype = dt; x.rank = 2; x.shape[0] = r; x.shape[1] = c; x.stride[0] = c; x.stride[1] = 1;
+            };
+            mat(t[0], h.data(), RAD_BF16, rows, width);
+            mat(t[1], fn.data(), RAD_F32, mix, width);
+            t[2].data = scale.data(); t[2].dtype = RAD_F32; t[2].rank = 1; t[2].shape[0] = 3; t[2].stride[0] = 1;
+            t[3].data = base.data(); t[3].dtype = RAD_F32; t[3].rank = 1; t[3].shape[0] = mix; t[3].stride[0] = 1;
+            mat(t[4], pre.data(), RAD_F32, rows, hc);
+            mat(t[5], post.data(), RAD_F32, rows, hc);
+            mat(t[6], comb.data(), RAD_F32, rows, hc * hc);
+            std::vector<RadParam> p(6);
+            p[0] = { "M", RAD_P_INT, rows }; p[1] = { "n", RAD_P_INT, n }; p[2] = { "hc", RAD_P_INT, hc };
+            p[3] = { "iterations", RAD_P_INT, iters };
+            p[4].key = "eps"; p[4].kind = RAD_P_F64; p[4].dval = 1e-6;
+            p[5].key = "hc_eps"; p[5].kind = RAD_P_F64; p[5].dval = 1e-6;
+            RadArgs a{};
+            a.t = t; a.n_t = 7; a.p = p.data(); a.n_p = 6;
+            std::vector<float> scr;
+            if (form > 0) {
+                const int64_t need = r4d_rad_mhc_mix_scratch(&a);
+                scr.assign((size_t)(need / 4 + 64), 0.f);
+                a.scratch = scr.data(); a.scratch_bytes = (int64_t)scr.size() * 4;
+            }
+            r4d_ds41_mix_fuse_force(form == 2 ? 1 : 0);
+            const int rc = r4d_rad_mhc_mix(&a, nullptr);
+            r4d_ds41_mix_fuse_force(-1);
+            return rc;
+        };
+        std::vector<float> p0, q0, c0, p1, q1, c1, p2, q2, c2, p3, q3, c3;
+        ++cases;
+        const int r0 = run(0, p0, q0, c0), r1 = run(1, p1, q1, c1), r2 = run(2, p2, q2, c2), r3 = run(2, p3, q3, c3);
+        auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+        };
+        const bool ok = !r0 && !r1 && !r2 && !r3 && same(p0, p1) && same(q0, q1) && same(c0, c1) &&
+                        same(p1, p2) && same(q1, q2) && same(c1, c2) && same(p2, p3) && same(q2, q3) &&
+                        same(c2, c3) && p2[0] != -7.f;
+        if (!ok) {
+            std::printf("FAIL mhc_mix one-launch form at rows %ld n %ld (rc %d %d %d %d; nosplit=split %d, "
+                        "split=fused %d, fused twice %d)\n", rows, n, r0, r1, r2, r3,
+                        same(p0, p1) && same(q0, q1) && same(c0, c1), same(p1, p2) && same(q1, q2) && same(c1, c2),
+                        same(p2, p3) && same(q2, q3) && same(c2, c3));
+            ++fails;
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -754,6 +821,7 @@ int main() {
     int fails = 0, cases = 0;
     router_scatter_cases(rng, cases, fails);
     scored_scatter_cases(rng, cases, fails);
+    mix_fuse_cases(rng, cases, fails);
     swiglu_quant_cases(rng, cases, fails);
     gather_inverse_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
