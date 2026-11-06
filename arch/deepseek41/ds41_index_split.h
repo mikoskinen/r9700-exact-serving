@@ -33,14 +33,16 @@ struct Ds41IdxRuns {
 static constexpr int64_t kDs41SplitMinLive = 4096;
 
 /* T rows, planes of irows rows, `live` positions at this layer, the attention world and this
- * rank's index in it; world 1 (or a split not asked for) is the unsplit deal. */
+ * rank's index in it; world 1 (or a split not asked for) is the unsplit deal. min_live: the split's
+ * threshold (deepseek41 passes RADIANCE_DS41_SPLIT_MIN_LIVE when set). Every rank reads the same
+ * value, so every rank makes the same decision. */
 inline Ds41IdxRuns ds41_idx_runs(int64_t T, int64_t irows, int64_t live, int world, int rank,
-                                 bool want_split) {
+                                 bool want_split, int64_t min_live = kDs41SplitMinLive) {
     Ds41IdxRuns r;
     if (T < 1 || irows < 1) return r;
     r.n = (T + irows - 1) / irows;
     r.R = (T + r.n - 1) / r.n;
-    r.split = want_split && world > 1 && r.n >= 2 && live >= kDs41SplitMinLive;
+    r.split = want_split && world > 1 && r.n >= 2 && live >= min_live;
     if (r.split) {
         r.q = (r.n + world - 1) / world;
         r.p0 = (int64_t)rank * r.q < r.n ? (int64_t)rank * r.q : r.n;

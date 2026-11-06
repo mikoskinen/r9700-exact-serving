@@ -398,6 +398,13 @@ struct Model {
      * `sel_part` (`qmax` runs of `irows` rows at most), and `sel_gather` joins the parts into `sel`. */
     bool ikeep = false, isplit = false;
     int64_t qmax = 0;
+    /* The thresholds of the two (index_mode()): a layer past the candidate layer restricts its
+     * index_score to the kept blocks only from `keep_min_live` positions on (below, the kept share
+     * is more than half the row and the restricted WMMA form costs about what the unrestricted one
+     * does: 6.11. card, 92 % kept -> 105 %); the split deals runs from `split_min_live` on. Both
+     * exact either way: index_topk reads the kept blocks only, and the split's gather lays every
+     * run where the unsplit step does. */
+    int64_t keep_min_live = 0, split_min_live = kDs41SplitMinLive;
     rad_buf sel_part = 0;
     rad_op sel_gather = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
@@ -896,6 +903,14 @@ static void index_mode(Model& m) {
     m.isplit = !off && v.find("split") != std::string::npos && m.g.world > 1 && m.aw == m.g.world &&
                m.iparts >= 2;
     m.qmax = m.isplit ? (m.iparts + m.aw - 1) / m.aw : 0;
+    /* RADIANCE_DS41_KEEP_MIN_LIVE / RADIANCE_DS41_SPLIT_MIN_LIVE (positions; unset or empty: twice
+     * the candidate positions, 2 x topk_blocks x block = 32768 at DeepSeek-V4.1, and 4096). */
+    auto envi = [](const char* n, int64_t d) {
+        const char* v = std::getenv(n);
+        return v && *v ? std::max<int64_t>(0, std::atoll(v)) : d;
+    };
+    m.keep_min_live = envi("RADIANCE_DS41_KEEP_MIN_LIVE", 2 * m.c.cand_blocks * std::max<int64_t>(1, m.c.cand_block));
+    m.split_min_live = envi("RADIANCE_DS41_SPLIT_MIN_LIVE", kDs41SplitMinLive);
 }
 
 static int buffers(RadBuilder* b, Model& m) {
@@ -2086,16 +2101,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
              c.idx_src.size(), (long long)c.n_expert, (long long)c.top_k, c.ple.size());
-    rad_note(b, "deepseek41 indexer: candidate restriction %s, row split %s (runs of %lld rows, %lld "
-                "a rank at most; RADIANCE_DS41_INDEX)",
-             m.ikeep ? "on" : "off", m.isplit && m.sel_gather ? "on" : "off", (long long)m.irows,
-             (long long)m.qmax);
+    rad_note(b, "deepseek41 indexer: candidate restriction %s from %lld positions, row split %s from %lld (runs of "
+                "%lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, _SPLIT_MIN_LIVE)",
+             m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
+             (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax);
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
-        fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s, row split %s (runs of %lld rows, "
-                        "%lld a rank at most; RADIANCE_DS41_INDEX)\n",
-                m.ikeep ? "on" : "off", m.isplit && m.sel_gather ? "on" : "off", (long long)m.irows,
-                (long long)m.qmax);
+        fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
+                        "from %lld (runs of %lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, "
+                        "_SPLIT_MIN_LIVE)\n",
+                m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
+                (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax);
     return RAD_OK;
 }
 
@@ -2504,7 +2520,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                  * runs or more at a long enough context), this rank takes runs [p0, p1) into its
                  * part and the gather joins every rank's part into sel (ds41_index_split.h). A
                  * layer past the candidate layer scores its kept blocks only (L.i_keep). */
-                const Ds41IdxRuns ru = ds41_idx_runs(T, m.irows, live, m.aw, m.ar, m.isplit && m.sel_gather);
+                const Ds41IdxRuns ru = ds41_idx_runs(T, m.irows, live, m.aw, m.ar, m.isplit && m.sel_gather,
+                                                     m.split_min_live);
+                /* the restriction below its threshold is the unrestricted op (the optional keep left out) */
+                const bool rkeep = L.i_keep && live >= m.keep_min_live;
                 for (int64_t p = ru.p0; p < ru.p1; ++p) {
                     const int64_t r0 = p * ru.R, rows = std::min(ru.R, T - r0);
                     const RadOperand prow = praw(batch->positions + r0, RAD_I32, rows);
@@ -2512,7 +2531,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                 kv_cache(m.index[r], src),
                                 praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
                                 bcol(m.score, 0, live, ru.R),
-                                L.i_keep ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE);
+                                rkeep ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE);
                     if (L.i_cand)
                         RAD_ISSUE_N(x, L.i_cand, rows, bcol(m.score, 0, live, rows), prow,
                                     bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
