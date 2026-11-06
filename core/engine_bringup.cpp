@@ -2914,11 +2914,13 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
-/* The heat engine's parameters: the shipped HeatParams, with two policy knobs from the environment
+/* The heat engine's parameters: the shipped HeatParams, with policy knobs from the environment
  * for A/B runs (docs/GUIDE.md section 8). RADIANCE_HEAT_PREFILL is HeatParams::prefill_share,
- * clamped to 0..1; RADIANCE_HEAT_CREDIT_CAP is HeatParams::credit_cap, taken when above 0. Unset,
- * empty or not a number: the default, the latter with a warning. Placement never changes an
- * output, so neither changes what a request returns, only where its experts are read from. */
+ * clamped to 0..1; RADIANCE_HEAT_CREDIT_CAP is HeatParams::credit_cap, taken when above 0;
+ * RADIANCE_HEAT_MOVES is HeatParams::moves_per_step, 1..1024 (the mover's turnover slots follow
+ * it, mover_turnover_from_env). Unset, empty or not a number: the default, the latter with a
+ * warning. Placement never changes an output, so none of them changes what a request returns,
+ * only where its experts are read from. */
 static HeatParams heat_params_from_env() {
     HeatParams hp;
     const auto num = [](const char* k, float* out) {
@@ -2936,7 +2938,26 @@ static HeatParams heat_params_from_env() {
     float v = 0.0f;
     if (num("RADIANCE_HEAT_PREFILL", &v)) hp.prefill_share = std::min(1.0f, std::max(0.0f, v));
     if (num("RADIANCE_HEAT_CREDIT_CAP", &v) && v > 0.0f) hp.credit_cap = v;
+    if (num("RADIANCE_HEAT_MOVES", &v) && v >= 1.0f) hp.moves_per_step = (int)std::min(v, 1024.0f);
     return hp;
+}
+
+/* The lent slots a slab class keeps free for swaps (MoverConfig::turnover_slots), from the move
+ * budget as planner.h derives RAD_PLACE_TURNOVER_SLOTS: a swap holds a slot about three steps, so
+ * 3 x moves, less the shadow slots the planner already gives. RADIANCE_PLACE_TURNOVER (>= 0) sets
+ * it outright. The mover caps it at the shipped count scaled to the class's shadow slots, so it
+ * only ever shrinks: a smaller budget hands those slots back to the loan's experts. */
+static int mover_turnover_from_env(const HeatParams& hp) {
+    int t = hp.moves_per_step == RAD_PLACE_MOVES_PER_STEP
+                ? RAD_PLACE_TURNOVER_SLOTS
+                : std::max(0, 3 * hp.moves_per_step - RAD_PLACE_SHADOW_SLOTS);
+    if (const char* e = getenv("RADIANCE_PLACE_TURNOVER"); e && *e) {
+        char* end = nullptr;
+        const long n = std::strtol(e, &end, 10);
+        if (end != e && !*end && n >= 0 && n <= 1 << 20) t = (int)n;
+        else RAD_WARN("RADIANCE_PLACE_TURNOVER=%s is not a count; the mover keeps %d", e, t);
+    }
+    return t;
 }
 
 int Engine::load_weights() {
@@ -2961,8 +2982,10 @@ int Engine::load_weights() {
         /* The container is the file tier (--weights-disk-tier places units on Tier::SSD), so the
          * mover needs its path. It reads the container with O_DIRECT: weights are RAD_ALIGN_UNIT-
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
+        const HeatParams hp = heat_params_from_env();
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        mc.turnover_slots = mover_turnover_from_env(hp);
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -2974,7 +2997,6 @@ int Engine::load_weights() {
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
-        const HeatParams hp = heat_params_from_env();
         heat_prefill_share_ = hp.prefill_share;
         RAD_TRY(r->heat.init(r->plan, hp));
 
