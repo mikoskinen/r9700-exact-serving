@@ -533,6 +533,22 @@ extern "C" int r4d_shape_ar_gather_hc_write(const RadParam* p, int n_p, int oper
     R4D_PICK(l);
 }
 
+/* moe_gather's five and the message: the gather's `y` is the all-reduce's, reduced in place. */
+extern "C" int r4d_shape_moe_gather_ar(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), k = pi(p, n_p, "top_k");
+    if (M <= 0 || n <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M * k, n),
+        opd(D, M, k),
+        opd_idx(M * k, 0, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE),
+        opd(D, M, n),
+        opd(D, M),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_hc_read(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
     const int64_t lr = pi(p, n_p, "lowrank");
