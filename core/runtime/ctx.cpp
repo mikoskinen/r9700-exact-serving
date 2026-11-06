@@ -33,7 +33,9 @@ int Ctx::init(const CtxDesc& d) {
     arch_step_ = d.arch_step;
     arch_pass_key_ = d.arch_pass_key;
     profiling_ = d.profile_ops;
-    tape_dump_ = d.tape_dump;
+    /* RADIANCE_DEBUG_TAPE_DUMP=1: haz_mark lists each recorded pass's dispatches with their read and write
+     * ranges once a key (TAPEDUMP lines on stderr), as CtxDesc::tape_dump, which nothing else sets. */
+    tape_dump_ = d.tape_dump || [] { const char* e = std::getenv("RADIANCE_DEBUG_TAPE_DUMP"); return e && *e && *e != '0'; }();
     /* A host gather's rows on the mapped tier are read ahead unless --row-prefetch off
      * (runtime/rowprefetch.h). The scratch is sized once, off the step path. */
     row_prefetch_on_ = d.row_prefetch;
