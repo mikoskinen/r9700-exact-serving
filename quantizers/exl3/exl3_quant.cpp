@@ -351,7 +351,7 @@ const RadPluginInfo kInfo = {
 
 extern "C" uint32_t rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 #include "rad_abi_layout.h"
-RAD_PLUGIN_ABI_LAYOUT_EXPORT   /* ABI 32: the layout fingerprint the loader checks */
+RAD_PLUGIN_ABI_LAYOUT_EXPORT   /* ABI 32+: the layout fingerprint the loader checks */
 extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 extern "C" int rad_quant_count(void) { return 1; }
 extern "C" const RadQuantizerInfo* rad_quant_at(int i) { return i == 0 ? &kQuant[0] : nullptr; }
