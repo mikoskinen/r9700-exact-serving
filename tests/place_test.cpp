@@ -809,6 +809,38 @@ TEST(heat_dual_keeps_the_decode_heat_through_a_prompt) {
     CHECK(std::fabs(h.heat(b) - before_b * 0.5f) < 1e-3f);
 }
 
+/* HeatParams::decode_pin: under dual heat the decode-hottest residents are no promotion's victim, so
+ * a prompt takes only the rest of the resident set. Fixture: experts 0-3 resident, 4-7 pooled. */
+TEST(heat_decode_pin_keeps_the_decode_core_through_a_prompt) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.prefill_decay = 0.7f;
+    hp.decode_pin = 0.5f;
+    CHECK_OK(h.init(hf.plan, hp));
+    std::vector<Swap> sw;
+    /* Decode heat on residents 0 and 1 (hot) and 2 (warm); 3 stays cold. */
+    int32_t dec[8] = {4, 3, 1, 0, 0, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f, 0.0f);
+    CHECK_OK(h.step(&sw));                     /* takes the thresholds: the top half of 4 = 0 and 1 */
+    for (const Swap& s : sw) h.abandon(s);
+    /* A prompt routes heavily to all four pooled experts. */
+    int32_t pf[8] = {0, 0, 0, 0, 60, 50, 40, 30};
+    h.observe(0, pf, 8, 1.0f, 0.0f, 1.0f);
+    CHECK_OK(h.step(&sw));
+    const int32_t e0 = hf.unit_of_expert(0), e1 = hf.unit_of_expert(1);
+    const int32_t e2 = hf.unit_of_expert(2), e3 = hf.unit_of_expert(3);
+    bool demoted0 = false, demoted1 = false, demoted2 = false, demoted3 = false;
+    for (const Swap& s : sw) {
+        demoted0 = demoted0 || s.demote == e0; demoted1 = demoted1 || s.demote == e1;
+        demoted2 = demoted2 || s.demote == e2; demoted3 = demoted3 || s.demote == e3;
+        h.abandon(s);
+    }
+    CHECK(!demoted0 && !demoted1);             /* the decode core stays */
+    CHECK(demoted2 && demoted3);               /* the rest goes to the prompt */
+    CHECK_EQ(sw.size(), (size_t)2);
+}
+
 TEST(heat_respects_the_move_budget) {
     HeatFixture hf;
     HeatEngine h;

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 
 namespace rad {
 
@@ -12,6 +13,8 @@ namespace {
 constexpr int32_t kLanes = 16;
 /* What the movable units with no layer are padded to. */
 constexpr int32_t kBlock = 64;
+/* HeatParams::decode_pin: what a protected resident adds to its ranking heat, above any heat. */
+constexpr float kPinBonus = 1.0e9f;
 }  /* namespace */
 
 int HeatEngine::init(const Plan& plan, const HeatParams& params) {
@@ -115,6 +118,7 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     heat_.assign(np, 0.0f);
     heat_d_.assign(dual() ? np : 0, 0.0f);
     heat_p_.assign(dual() ? np : 0, 0.0f);
+    pin_thr_.assign((size_t)n_cls_, INFINITY);
     rank_as_.assign(np, 0u);
     routed_as_.assign(np, 0u);
     miss_bytes_.assign(np, 0);
@@ -160,7 +164,10 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
                  "heat (x%.2f) that decays %.3f a step; placement ranks their sum "
                  "(RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN)", (double)params_.prefill_gain,
                  (double)params_.prefill_decay);
-    else if (params_.prefill_share != 1.0f)
+    if (dual() && params_.decode_pin > 0.0f)
+        RAD_INFO("heat engine: the decode-hottest %.0f%% of each class's resident units are no "
+                 "promotion's victim (RADIANCE_HEAT_DECODE_PIN)", 100.0 * (double)params_.decode_pin);
+    if (!dual() && params_.prefill_share != 1.0f)
         RAD_INFO("heat engine: a step with prefill rows counts as its decode share plus %.3f of its "
                  "prefill share (RADIANCE_HEAT_PREFILL)", (double)params_.prefill_share);
     return RAD_OK;
@@ -384,6 +391,18 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
         hq[j] *= dp;
         h[j] = hd[j] + hq[j];
     }
+    /* HeatParams::decode_pin: a protected resident ranks far above any heat, so it is never the
+     * cold end. Only residents (rank_as_ 2) and only for the ranking: the heats stay apart. */
+    const bool pin = params_.decode_pin > 0.0f;
+    const auto pinned_bonus = [&](int32_t j) -> float {
+        const size_t q = (size_t)(lo + j);
+        if (!pin || rank_as_[q] != 2) return 0.0f;
+        const int32_t u = unit_at_[q];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        return c >= 0 && hd[j] >= pin_thr_[(size_t)c] ? kPinBonus : 0.0f;
+    };
+    if (pin)
+        for (int32_t j = 0; j < len; ++j) h[j] += pinned_bonus(j);
     int32_t routed = 0, resident = 0;
     int64_t miss = 0;
     for (int32_t j = 0; j < n; ++j) {
@@ -392,7 +411,7 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
         const size_t q = (size_t)(lo + j);
         hd[j] += (float)c * wd;
         hq[j] += (float)c * wp;
-        h[j] = hd[j] + hq[j];
+        h[j] = hd[j] + hq[j] + pinned_bonus(j);
         routed += routed_as_[q] != 0;
         resident += routed_as_[q] == 2;
         miss += miss_bytes_[q];
@@ -402,6 +421,27 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
     stats_.routed_resident += (uint64_t)resident * passes;
     stats_.stream_bytes += (uint64_t)miss * passes;
     ++stats_.dispatches;
+}
+
+/* HeatParams::decode_pin's thresholds: per class, the decode heat of the k-th decode-hottest resident
+ * unit, k = decode_pin x the class's resident candidates. Never at or below zero, so a unit with no
+ * decode heat is never protected; +inf where k is 0. */
+void HeatEngine::update_pin() {
+    pin_tmp_.resize((size_t)n_cls_);
+    for (auto& v : pin_tmp_) v.clear();
+    for (size_t p = 0; p < heat_d_.size(); ++p) {
+        if (rank_as_[p] != 2) continue;
+        const int32_t u = unit_at_[p];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        if (c >= 0) pin_tmp_[(size_t)c].push_back(heat_d_[p]);
+    }
+    for (size_t c = 0; c < pin_tmp_.size(); ++c) {
+        std::vector<float>& v = pin_tmp_[c];
+        const size_t k = (size_t)((double)params_.decode_pin * (double)v.size());
+        if (k == 0) { pin_thr_[c] = INFINITY; continue; }
+        std::nth_element(v.begin(), v.begin() + (std::ptrdiff_t)(k - 1), v.end(), std::greater<float>());
+        pin_thr_[c] = std::max(v[k - 1], 1e-6f);
+    }
 }
 
 void HeatEngine::end_rebuild(size_t slot) {
@@ -525,6 +565,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
     if (!enabled_) return RAD_OK;
     const int k = params_.moves_per_step;
     if (k <= 0) return RAD_OK;
+    /* The next step's protection (HeatParams::decode_pin), from this step's decode heats. */
+    if (dual() && params_.decode_pin > 0.0f) update_pin();
 
     /* Test the best pair from the layers' ends first. If it fails the guard, every pair does,
      * and the dispatch proposes nothing after one entry per layer. The ends' counts also give the

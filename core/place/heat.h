@@ -108,6 +108,16 @@ struct HeatParams {
     float prefill_decay = 0.0f;
     float prefill_gain = 1.0f;
 
+    /* Dual heat only: the fraction of a slab class's resident units, the hottest by DECODE heat,
+     * that no promotion may demote (0 = none). A prompt then fills the rest of the resident set
+     * and the decode core stays on the card through it, where unprotected it is evicted wholesale
+     * and comes back only as fast as its units' decode heat clears min_gain (at TP4 one token
+     * credits ~1.5 selections a rank, so most of a decode set sits below 1.5: 6.11., 26.8 ms/step
+     * decoding after a 266k prompt against 23.5 with no prompt credit). Thresholds are taken once
+     * a step (step()), so a unit's protection is one step stale. A unit with no decode heat is never
+     * protected. RADIANCE_HEAT_DECODE_PIN. */
+    float decode_pin = 0.0f;
+
     /* Dispatches to watch before moving anything. 0, because min_gain already requires
      * `hot >= cold*hysteresis + 1.5`, which against a zero-heat victim is two tokens agreeing in
      * one dispatch; a warmup only delays convergence. */
@@ -357,6 +367,11 @@ private:
     /* Dual heat only (HeatParams::prefill_decay): the decode and prefill heats by position; heat_
      * is their sum, which every ranking reads. Empty otherwise. */
     std::vector<float>   heat_d_, heat_p_;
+    /* HeatParams::decode_pin: per slab class, the decode heat from which a resident unit is no
+     * victim (+inf: none), and step()'s scratch for finding it. */
+    std::vector<float>   pin_thr_;
+    std::vector<std::vector<float>> pin_tmp_;
+    void update_pin();
     void observe_dual(int32_t layer, const int32_t* counts, int32_t n, float w, uint64_t passes,
                       float share, float pshare);
     std::vector<int32_t> pos_;                /* unit -> position */
