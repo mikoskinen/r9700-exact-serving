@@ -19,12 +19,12 @@ namespace {
 
 const char* const kNames[kSwitches] = { "no_route", "gather_inv", "hc_fusedown", "hc_normwave",
                                          "draft_adaptive", "hc_writevec", "hc_readv", "ar_lanethreads",
-                                         "hc_upmix", "ar_laneblocks" };
+                                         "hc_upmix", "ar_laneblocks", "aql_acq" };
 const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_GATHER_INV",
                                          "RADIANCE_FN4_HC_FUSEDOWN", "RADIANCE_FN4_HC_NORMWAVE",
                                          nullptr, "RADIANCE_FN4_HC_WRITEVEC", "RADIANCE_FN4_HC_READV",
                                          "RADIANCE_FN4_AR_LANE_THREADS", "RADIANCE_FN4_HC_UPMIX",
-                                         "RADIANCE_FN4_AR_LANE_BLOCKS" };
+                                         "RADIANCE_FN4_AR_LANE_BLOCKS", nullptr };
 
 /* the value a switch starts with: unset / empty / 0 -> 0, a number > 1 as given (hc_fusedown's form,
  * hc_normwave's row floor), anything else 1 -- as the plugins read the same variables */
@@ -49,7 +49,7 @@ struct State {
     std::vector<int (*)(const char*, int)> hooks;
     State() {
         for (int i = 0; i < kSwitches; ++i) {
-            val[i].store(i == kDraftAdaptive ? -1 : env_val(kEnv[i]), std::memory_order_relaxed);
+            val[i].store(i == kDraftAdaptive || i == kAqlAcq ? -1 : env_val(kEnv[i]), std::memory_order_relaxed);
             want[i] = 0;
             pend[i] = false;
         }
@@ -107,6 +107,19 @@ int value(int i) { return i >= 0 && i < kSwitches ? st().val[i].load(std::memory
 bool no_route() { return st().val[kNoRoute].load(std::memory_order_relaxed) == 1; }
 uint64_t epoch() { return st().epoch.load(std::memory_order_acquire); }
 
+int aql_acq_rule() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_AQL_ACQ");
+        return !e ? 0 : !std::strcmp(e, "rule") ? 1 : !std::strcmp(e, "rule-w") ? 2 : 0;
+    }();
+    const int v = st().val[kAqlAcq].load(std::memory_order_acquire);
+    return v >= 0 ? v : env;
+}
+bool aql_acq_none() {
+    static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
+    return none;
+}
+
 bool request(const std::string& name, int v, std::string* err) {
     if (name == "epoch_bump") {
         State& s = st();
@@ -123,7 +136,8 @@ bool request(const std::string& name, int v, std::string* err) {
      * the rest 0 / 1 */
     const int lo = i == kDraftAdaptive ? -1 : 0;
     const int hi = i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096
-                 : i == kHcReadV ? 63 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24 : 1;
+                 : i == kHcReadV ? 63 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24
+                 : i == kAqlAcq ? 2 : 1;
     if (v < lo || v > hi) {
         if (err) *err = std::string(kNames[i]) + " takes " + std::to_string(lo) + ".." + std::to_string(hi);
         return false;

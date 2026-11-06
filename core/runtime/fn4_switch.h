@@ -27,6 +27,9 @@
  *                   -- value & 7 PF2's form (0 stock, 1-4), + 8 the 64-row decode tile pipelined
  *   ar_laneblocks   libr4d (rad_fn4_switch): the prefill all-reduce lane's blocks   RADIANCE_FN4_AR_LANE_BLOCKS
  *                   -- 0 the resolved tunable (4), 4..24 in steps of 4
+ *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule, 0 off, 1 rule,
+ *                   2 rule-w (cohbench2 7.11.: a CU can serve a line it stored after another CU rewrote it, so
+ *                   rule-w is the safe one); -1 until set = RADIANCE_AQL_ACQ=rule | rule-w at start
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -46,13 +49,18 @@ namespace rad {
 namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
-              kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kSwitches };
+              kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
 int  value(int i);                            /* the applied value */
 bool no_route();
 uint64_t epoch();                             /* applied changes so far */
+/* The AQL acquire rule (core-acq 68cfbee3, ported 10.11.): 0 off, 1 rule, 2 rule-w -- the aql_acq switch once set,
+ * else RADIANCE_AQL_ACQ (rule | rule-w) at start. A change re-records every pass (the epoch), since haz_mark marks
+ * the records at recording. aql_acq_none: RADIANCE_AQL_ACQ=none (the unsafe experiment; start-time only). */
+int  aql_acq_rule();
+bool aql_acq_none();
 
 /* Server thread: queue a value; false (with the reason) for an unknown switch or a bad value. */
 bool request(const std::string& name, int value, std::string* err);
