@@ -393,6 +393,29 @@ extern "C" int r4d_fuse_router_sigmoid_topk_scatter(const RadParam* p, int n_p, 
 }
 
 /* ==========================================================================================
+ * router_scored_topk_scatter -- DeepSeek-V4.1's selection (a named score), the sort over its ids and
+ * the shared gate's fill. (kernel: libr4d/r4d_ds41_elem.hip, router_scored_scatter_kernel)
+ *
+ * Operands: router_sigmoid_topk_scatter's: [0] logits  [1] bias  [2] ids  [3] weights
+ *           [4] sorted_tok  [5] expert_offset  [6] expert_count  [7] gate?  [8] inverse?
+ */
+extern "C" int r4d_fuse_router_scored_topk_scatter(const RadParam* p, int n_p, uint64_t present,
+                                                   int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (step == 0) {
+        const int64_t ne = pi(p, n_p, "n_expert"), nl = pi(p, n_p, "n_local", ne);
+        if (ne <= 0 || nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;
+        Step s(out, "router_scored_topk");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n_expert").mirror(p, n_p, "top_k")
+         .mirror(p, n_p, "norm").mirror(p, n_p, "route_scale").mirror(p, n_p, "score")
+         .mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3 });              /* logits, bias, ids, weights */
+    }
+    /* the sort and the fill are router_sigmoid_topk_scatter's steps 1 and 2 */
+    return r4d_fuse_router_sigmoid_topk_scatter(p, n_p, present, step, out);
+}
+
+/* ==========================================================================================
  * gate_quant_fp8 -- the same epilogue with the gate in its own operand.
  * (kernel: libr4d/r4d_fused_quant_fp8.hip, gate_quant_fp8_kernel)
  *

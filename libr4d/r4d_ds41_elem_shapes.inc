@@ -115,6 +115,12 @@ extern "C" int r4d_shape_router_scored_topk(const RadParam* p, int n_p, int oper
     R4D_PICK(l);
 }
 
+/* router_sigmoid_topk_scatter's operands (r4d_shapes.cpp), the score aside. */
+extern "C" int r4d_shape_router_scored_topk_scatter(const RadParam* p, int n_p, int operand,
+                                                    RadOpdDesc* out) {
+    return r4d_shape_router_sigmoid_topk_scatter(p, n_p, operand, out);
+}
+
 /* The planes as a host tool draws them: i8 codes (no table), a scale per `group` of a row. */
 extern "C" int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int operand,
                                              RadOpdDesc* out) {

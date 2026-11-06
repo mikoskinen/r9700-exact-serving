@@ -20,6 +20,7 @@
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_moe_sort.h"
 #include "r4d_plugin.h"
 
 #include <climits>
@@ -1308,15 +1309,14 @@ __device__ __forceinline__ unsigned long long ds_wave_max_u64(unsigned long long
     return b;
 }
 
+/* One row of router_scored_topk by one wave: writes the row's ids and weights and returns the
+ * expert lane j < k wrote (the expert 0 of an empty slot, as `ids` holds it). Shared with
+ * router_scored_topk_scatter, so the fused selection is this function's bits. */
 template <int OWN, int SCORE>
-__global__ __launch_bounds__(128) void router_scored_kernel(const float* logits, long lp,
-                                                            const float* bias, long bp, int32_t* ids,
-                                                            long ip, float* weights, long wp,
-                                                            long m, int ne, int k, int norm,
-                                                            float factor) {
-    const int lane = threadIdx.x & 31;
-    const long r = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
-    if (r >= m) return;
+__device__ __forceinline__ int router_scored_row(const float* logits, long lp, const float* bias,
+                                                 long bp, int32_t* ids, long ip, float* weights,
+                                                 long wp, long r, int ne, int k, int norm,
+                                                 float factor, int lane) {
     float p[OWN], bv[OWN];  // every load first (a clamped index past ne, its value dropped)
 #pragma unroll
     for (int i = 0; i < OWN; ++i) {
@@ -1390,6 +1390,50 @@ __global__ __launch_bounds__(128) void router_scored_kernel(const float* logits,
         ids[r * ip + lane] = e;
         weights[r * wp + lane] = chosen * mult;
     }
+    return e;
+}
+
+template <int OWN, int SCORE>
+__global__ __launch_bounds__(128) void router_scored_kernel(const float* logits, long lp,
+                                                            const float* bias, long bp, int32_t* ids,
+                                                            long ip, float* weights, long wp,
+                                                            long m, int ne, int k, int norm,
+                                                            float factor) {
+    const int lane = threadIdx.x & 31;
+    const long r = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (r >= m) return;
+    (void)router_scored_row<OWN, SCORE>(logits, lp, bias, bp, ids, ip, weights, wp, r, ne, k, norm,
+                                        factor, lane);
+}
+
+/* router_scored_topk, then moe_scatter over its ids, then the `fill` of an ungated shared arm's
+ * gate with 1, in one workgroup (router_sigmoid_topk_scatter's form, r4d_glm.hip, with the score
+ * named). Rows wrap over the NW waves; each row is router_scored_row's, and its slots go to the
+ * sort's LDS list instead of being read back from `ids`. A slot carries the expert its row wrote,
+ * including the expert 0 of an empty slot, so every output equals the separate launches'. INV also
+ * writes the inverse, as moe_scatter_inv does. */
+template <int OWN, int SCORE, uint32_t NW, bool INV>
+__global__ void __launch_bounds__(NW * 32)
+    router_scored_scatter_kernel(const float* logits, long lp, const float* bias, long bp,
+                                 int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
+                                 int32_t* off, int32_t* cnt, uint16_t* gate, long gp, int32_t* inv,
+                                 int m, int ne, int n_local, int k, int norm, float factor, int base,
+                                 r4d_moesort::Protect prot) {
+    __shared__ r4d_moesort::ScatterLds<NW> sl;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
+    for (int r = wave; r < m; r += (int)NW) {
+        const int e = router_scored_row<OWN, SCORE>(logits, lp, bias, bp, ids, ip, weights, wp, r,
+                                                    ne, k, norm, factor, lane) -
+                      base;
+        if (lane < k)
+            sl.e[r * k + lane] =
+                e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
+        if (gate && !lane) gate[(long)r * gp] = f32_to_bf16(1.0f);
+    }
+    lds_barrier();
+    r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k),
+                                              (uint32_t)n_local, sl, inv);
 }
 
 template <int SCORE>
@@ -1439,6 +1483,102 @@ int router_scored_body(const RadArgs* a, RadStream stream) {
                                               factor);
         default:
             return router_emit<kSoftmax>(stream, lg, bias, ids, w, (int)ne, (int)k, norm, factor);
+    }
+}
+
+/* router_scored_topk_scatter: router_scored_topk's four operands, moe_scatter's three outputs, then
+ * the optional gate and the optional inverse (router_sigmoid_topk_scatter's operands, with the
+ * score named). The sort is the single-workgroup form, so M * top_k must fit it; a larger pass is
+ * refused rather than served at another cost. */
+template <int SCORE>
+int router_scored_scatter_emit(RadStream stream, const RadTensor& lg, const RadTensor& bias,
+                               const RadTensor& ids, const RadTensor& w, const RadTensor* sorted,
+                               const RadTensor* off, const RadTensor* cnt, const RadTensor* gate,
+                               long long gp, const RadTensor* inv, int m, int ne, int nl, int k,
+                               int norm, float factor, int base, const r4d_moesort::Protect& prot) {
+    const int nw = m <= 8 ? 8 : m <= 16 ? 16 : 32;
+#define R4D_RSC_I(OWN, NW, INV)                                                                    \
+    return R4D_EMIT(stream, (router_scored_scatter_kernel<OWN, SCORE, NW, INV>), dim3(1),         \
+                    dim3((NW) * 32), 0, (const float*)lg.data, (long)lg.stride[0],                 \
+                    (const float*)bias.data, (long)bias.stride[0], (int32_t*)ids.data,             \
+                    (long)ids.stride[0], (float*)w.data, (long)w.stride[0],                        \
+                    (int32_t*)sorted->data, (int32_t*)off->data, (int32_t*)cnt->data,              \
+                    gate ? (uint16_t*)gate->data : (uint16_t*)nullptr, (long)gp,                   \
+                    inv ? (int32_t*)inv->data : (int32_t*)nullptr, m, ne, nl, k, norm, factor,     \
+                    base, prot)
+#define R4D_RSC(OWN, NW)                                                                           \
+    do {                                                                                           \
+        if (inv) R4D_RSC_I(OWN, NW, true);                                                         \
+        R4D_RSC_I(OWN, NW, false);                                                                 \
+    } while (0)
+    if (ne <= 384) {
+        if (nw == 8) R4D_RSC(12, 8u);
+        if (nw == 16) R4D_RSC(12, 16u);
+        R4D_RSC(12, 32u);
+    }
+    if (nw == 8) R4D_RSC(16, 8u);
+    if (nw == 16) R4D_RSC(16, 16u);
+    R4D_RSC(16, 32u);
+#undef R4D_RSC
+#undef R4D_RSC_I
+}
+
+int router_scored_scatter_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 7) return RAD_E_INVAL;
+    const char* sc = r4d_gets(a, "score");
+    if (!sc) return R4D_NO(RAD_E_UNSUPPORTED);
+    int score;
+    if (!std::strcmp(sc, "sigmoid")) score = kSigmoid;
+    else if (!std::strcmp(sc, "sqrtsoftplus")) score = kSqrtSoftplus;
+    else if (!std::strcmp(sc, "softmax")) score = kSoftmax;
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+    const RadTensor &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];
+    const RadTensor *sorted = &a->t[4], *off = &a->t[5], *cnt = &a->t[6];
+    const RadTensor* gate = a->n_t > 7 ? r4d_opt(a, 7) : nullptr;
+    const RadTensor* inv = a->n_t > 8 ? r4d_opt(a, 8) : nullptr;
+    const long ne = (long)r4d_geti_or(a, "n_expert", 0), k = (long)r4d_geti_or(a, "top_k", 0);
+    const long nl = (long)r4d_geti_or(a, "n_local", ne), base = (long)r4d_geti_or(a, "expert_base", 0);
+    const float factor = (float)r4d_getf(a, "route_scale", 0);
+    const int norm = r4d_geti_or(a, "norm", 0) != 0 ? 1 : 0;
+    if (lg.dtype != RAD_F32 || bias.dtype != RAD_F32 || ids.dtype != RAD_I32 ||
+        w.dtype != RAD_F32 || sorted->dtype != RAD_I32 || off->dtype != RAD_I32 ||
+        cnt->dtype != RAD_I32 || (gate && gate->dtype != RAD_BF16) ||
+        (inv && inv->dtype != RAD_I32))
+        return R4D_NO(RAD_E_DTYPE);
+    if (ne < 1 || ne > 512 || k < 1 || k > 32 || k > ne || !std::isfinite(factor) || factor <= 0 ||
+        !lg.data || !bias.data || !ids.data || !w.data || !sorted->data || !off->data ||
+        !cnt->data || lg.rank != 2 || lg.shape[0] < 1 || lg.shape[1] != ne || bias.rank != 1 ||
+        bias.shape[0] != ne || ids.rank != 2 || w.rank != 2 || ids.shape[0] != lg.shape[0] ||
+        w.shape[0] != lg.shape[0] || ids.shape[1] != k || w.shape[1] != k || lg.stride[1] != 1 ||
+        ids.stride[1] != 1 || w.stride[1] != 1 || lg.stride[0] < ne || ids.stride[0] < k ||
+        w.stride[0] < k || bias.stride[0] < 1)
+        return R4D_NO(RAD_E_SHAPE);
+    const long m = lg.shape[0], T = m * k;
+    if (T > (long)r4d_moesort::kScatterSmall || nl < 1 || nl > ne || base < 0 || base + nl > ne ||
+        !r4d_contig(sorted) || !r4d_contig(off) || !r4d_contig(cnt) || r4d_numel(sorted) < T ||
+        r4d_numel(off) < nl + 1 || r4d_numel(cnt) < nl ||
+        (inv && (!r4d_contig(inv) || r4d_numel(inv) < T)))
+        return R4D_NO(RAD_E_SHAPE);
+    long long grows = 0;
+    const long long gp = gate ? r4d_rows_pitch(gate, 1, &grows) : 0;
+    if (gate && (gp < 1 || grows < m)) return R4D_NO(RAD_E_SHAPE);
+    r4d_moesort::Protect prot;
+    const int prc = r4d_moesort::protect_of(a, nl, &prot);
+    if (prc != RAD_OK) return prc;
+    switch (score) {
+        case kSigmoid:
+            return router_scored_scatter_emit<kSigmoid>(stream, lg, bias, ids, w, sorted, off, cnt,
+                                                        gate, gp, inv, (int)m, (int)ne, (int)nl,
+                                                        (int)k, norm, factor, (int)base, prot);
+        case kSqrtSoftplus:
+            return router_scored_scatter_emit<kSqrtSoftplus>(stream, lg, bias, ids, w, sorted, off,
+                                                             cnt, gate, gp, inv, (int)m, (int)ne,
+                                                             (int)nl, (int)k, norm, factor,
+                                                             (int)base, prot);
+        default:
+            return router_scored_scatter_emit<kSoftmax>(stream, lg, bias, ids, w, sorted, off, cnt,
+                                                        gate, gp, inv, (int)m, (int)ne, (int)nl,
+                                                        (int)k, norm, factor, (int)base, prot);
     }
 }
 
@@ -2127,6 +2267,9 @@ extern "C" int r4d_rad_softmax_pool(const RadArgs* a, RadStream s) {
 extern "C" int r4d_rad_entry_store(const RadArgs* a, RadStream s) { return entry_store_body(a, s); }
 extern "C" int r4d_rad_router_scored_topk(const RadArgs* a, RadStream s) {
     return router_scored_body(a, s);
+}
+extern "C" int r4d_rad_router_scored_topk_scatter(const RadArgs* a, RadStream s) {
+    return router_scored_scatter_body(a, s);
 }
 extern "C" int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream s) {
     return embed_planes_body(a, s);

@@ -932,6 +932,14 @@ static void index_mode(Model& m) {
     m.lnv = lx && !std::strcmp(lx, "nvfp4") && m.c.window % 32 == 0;
 }
 
+/* RADIANCE_DS41_ROUTER_FUSE: unset or anything but "0" = the selection and the sort as one launch
+ * (router_scored_topk_scatter, where a loaded library declares it and the pass fits the sort's one
+ * workgroup; byte-identical to router_scored_topk + moe_scatter); "0" = the two launches. */
+static int ds41_router_fuse() {
+    static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_ROUTER_FUSE"); return !(e && e[0] == '0' && !e[1]); }();
+    return on ? 1 : 0;
+}
+
 /* A compressed latent entry's bf16 slots: its hd values, or its packed bytes / 2 (nvfp4). */
 static int64_t latent_slots(const Model& m, int64_t hd) {
     return m.lnv ? (hd / 2 + hd / 16 + 15) / 16 * 16 / 2 : hd;
@@ -1515,6 +1523,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
     s.cfg.router_score = "sqrtsoftplus";
+    s.cfg.router_fuse = ds41_router_fuse();
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
@@ -1727,6 +1736,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
     s.cfg.router_score = "sqrtsoftplus";
+    s.cfg.router_fuse = ds41_router_fuse();
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
@@ -2135,21 +2145,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     rad_note(b, "deepseek41 indexer: candidate restriction %s from %lld positions, row split %s from %lld (runs of "
                 "%lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, _SPLIT_MIN_LIVE), keys %s "
                 "(%lld bytes an entry; RADIANCE_DS41_IDXKEY), latent %s (%lld bytes an entry; RADIANCE_DS41_LATENT), "
-                "compressor tail %s (RADIANCE_DS41_CTAIL)",
+                "compressor tail %s (RADIANCE_DS41_CTAIL), router selection+sort %s (RADIANCE_DS41_ROUTER_FUSE)",
              m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
              (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
              (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)),
-             m.ctail_full ? "full" : "bound");
+             m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate");
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
                         "from %lld (runs of %lld rows, %lld a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, "
                         "_SPLIT_MIN_LIVE), keys %s (%lld bytes an entry; RADIANCE_DS41_IDXKEY), latent %s (%lld bytes an "
-                        "entry; RADIANCE_DS41_LATENT), compressor tail %s (RADIANCE_DS41_CTAIL)\n",
+                        "entry; RADIANCE_DS41_LATENT), compressor tail %s (RADIANCE_DS41_CTAIL), router selection+sort %s "
+                        "(RADIANCE_DS41_ROUTER_FUSE)\n",
                 m.ikeep ? "on" : "off", (long long)m.keep_min_live, m.isplit && m.sel_gather ? "on" : "off",
                 (long long)m.split_min_live, (long long)m.irows, (long long)m.qmax, m.ikmx ? "mxfp4" : "bf16",
                 (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)),
-                m.ctail_full ? "full" : "bound");
+                m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate");
     return RAD_OK;
 }
 
