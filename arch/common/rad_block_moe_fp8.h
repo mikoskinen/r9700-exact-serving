@@ -1802,11 +1802,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * declared index, which is safe only with `sgate` out of the sharing pool. Its other outputs
      * and its input are also declared by the ops it replaces, so their planned lifetimes cover it.
      * Undeclared or unresolved, the separate ops serve. */
+    /* A named score (DeepSeek-V4.1's sqrtsoftplus) takes router_scored_topk_scatter, the same op with
+     * `score`; the sigmoid keeps router_sigmoid_topk_scatter. */
+    const char* const fused_sel = c.router_score ? "router_scored_topk_scatter" : "router_sigmoid_topk_scatter";
     if (c.sigmoid_router && c.router_fuse) {
-        if (!rad_op_declared(b, "router_sigmoid_topk_scatter")) {
+        if (!rad_op_declared(b, fused_sel)) {
             static bool told = false;
-            if (!told) rad_note(b, "no loaded library declares router_sigmoid_topk_scatter; the "
-                                   "selection and the sort stay separate launches");
+            if (!told) rad_note(b, "no loaded library declares %s; the selection and the sort stay "
+                                   "separate launches", fused_sel);
             told = true;
         } else {
             sigmoid_scatter_rows = (int64_t)c.rows * c.top_k <= kMoeSortRows
@@ -1823,11 +1826,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                 RAD_INT("n_local", c.n_expert), RAD_INT("top_k", c.top_k),
                 RAD_INT("norm", c.norm_topk), RAD_F64("route_scale", c.route_scale),
                 RAD_STR("dtype", "f32"), RAD_INT("expert_base", c.expert_base),
+                RAD_STR("score", c.router_score ? c.router_score : "sigmoid"),
                 RAD_STR("protect", prot_list),
             };
-            const int n_sp = (int)(sizeof(sp) / sizeof(sp[0])) - (prot_list ? 0 : 1);
-            op_sigmoid_scatter = rad_decl_op(b, "router_sigmoid_topk_scatter", sp, n_sp,
-                                             &glm_router.correction, 1);
+            /* `score` only for the scored op; `protect` last, cut off without a list */
+            RadParam spv[10];
+            int n_sp = 0;
+            for (const RadParam& q : sp) {
+                if (!c.router_score && !std::strcmp(q.key, "score")) continue;
+                if (!prot_list && !std::strcmp(q.key, "protect")) continue;
+                spv[n_sp++] = q;
+            }
+            op_sigmoid_scatter = rad_decl_op(b, fused_sel, spv, n_sp, &glm_router.correction, 1);
             if (op_sigmoid_scatter) {
                 const rad_buf rd[1] = { w.logits };
                 rad_buf wr[7] = { w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
