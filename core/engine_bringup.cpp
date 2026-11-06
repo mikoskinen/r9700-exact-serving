@@ -2918,7 +2918,8 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
  * for A/B runs (docs/GUIDE.md section 8). RADIANCE_HEAT_PREFILL is HeatParams::prefill_share,
  * clamped to 0..1; RADIANCE_HEAT_CREDIT_CAP is HeatParams::credit_cap, taken when above 0;
  * RADIANCE_HEAT_MOVES is HeatParams::moves_per_step, 1..1024 (the mover's turnover slots follow
- * it, mover_turnover_from_env). Unset, empty or not a number: the default, the latter with a
+ * it, mover_turnover_from_env); RADIANCE_HEAT_PREFILL_DECAY (0..1, exclusive) turns on the dual
+ * heat with that prefill decay, RADIANCE_HEAT_PREFILL_GAIN (> 0) scales its credit. Unset, empty or not a number: the default, the latter with a
  * warning. Placement never changes an output, so none of them changes what a request returns,
  * only where its experts are read from. */
 static HeatParams heat_params_from_env() {
@@ -2939,6 +2940,8 @@ static HeatParams heat_params_from_env() {
     if (num("RADIANCE_HEAT_PREFILL", &v)) hp.prefill_share = std::min(1.0f, std::max(0.0f, v));
     if (num("RADIANCE_HEAT_CREDIT_CAP", &v) && v > 0.0f) hp.credit_cap = v;
     if (num("RADIANCE_HEAT_MOVES", &v) && v >= 1.0f) hp.moves_per_step = (int)std::min(v, 1024.0f);
+    if (num("RADIANCE_HEAT_PREFILL_DECAY", &v) && v > 0.0f && v < 1.0f) hp.prefill_decay = v;
+    if (num("RADIANCE_HEAT_PREFILL_GAIN", &v) && v > 0.0f) hp.prefill_gain = v;
     return hp;
 }
 
@@ -2998,6 +3001,7 @@ int Engine::load_weights() {
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
         heat_prefill_share_ = hp.prefill_share;
+        heat_dual_ = hp.prefill_decay > 0.0f && hp.prefill_decay < 1.0f;
         RAD_TRY(r->heat.init(r->plan, hp));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory

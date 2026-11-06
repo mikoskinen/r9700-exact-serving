@@ -769,6 +769,46 @@ TEST(heat_credits_a_prefill_step_at_its_share) {
     CHECK(std::fabs(heat_step_share(0.25f, 100, 20) - 0.4f) < 1e-6f);
 }
 
+/* Dual heat (HeatParams::prefill_decay): decode rows credit the decode heat, prefill rows a prefill
+ * heat that decays by prefill_decay at every credited step; the ranking reads their sum. A prompt
+ * leaves the decode heat as it found it, and its own heat is gone a few steps after it. */
+TEST(heat_dual_keeps_the_decode_heat_through_a_prompt) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.prefill_decay = 0.5f;
+    CHECK_OK(h.init(hf.plan, hp));
+    CHECK(h.dual());
+    const int32_t a = hf.unit_of_expert(4), b = hf.unit_of_expert(5);
+
+    int32_t dec[8] = {0, 0, 0, 0, 10, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f, 0.0f);                 /* a decode step */
+    CHECK_EQ(h.heat(a), 10.0f);
+
+    int32_t pf[8] = {0, 0, 0, 0, 0, 100, 0, 0};
+    h.observe(0, pf, 8, 1.0f, 0.0f, 1.0f);                  /* a prefill step: decode heat untouched */
+    CHECK_EQ(h.heat(a), 10.0f);
+    CHECK_EQ(h.heat(b), 100.0f);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    bool b_in = false;
+    for (const Swap& s : sw) { b_in = b_in || s.promote == b; h.abandon(s); }
+    CHECK(b_in);                                             /* the prompt's expert comes in */
+
+    int32_t other[8] = {0, 0, 0, 0, 0, 0, 1, 0};
+    for (int k = 0; k < 3; ++k) h.observe(0, other, 8, 1.0f, 1.0f, 0.0f);
+    CHECK(std::fabs(h.heat(b) - 100.0f * 0.125f) < 1e-3f);   /* 0.5^3 */
+    CHECK(std::fabs(h.heat(a) - 10.0f * hp.decay * hp.decay * hp.decay) < 1e-4f);
+
+    /* A mixed step: a quarter decode rows. */
+    int32_t mix[8] = {0, 0, 0, 0, 8, 0, 0, 0};
+    const float before_a = h.heat(a), before_b = h.heat(b);
+    h.observe(0, mix, 8, 1.0f, 0.25f, 0.75f);
+    const float hd = (before_a) * std::pow(hp.decay, 0.25f) + 8.0f * 0.25f;   /* expert 4: decode part */
+    CHECK(std::fabs(h.heat(a) - (hd + 8.0f * 0.75f)) < 1e-3f);
+    CHECK(std::fabs(h.heat(b) - before_b * 0.5f) < 1e-3f);
+}
+
 TEST(heat_respects_the_move_budget) {
     HeatFixture hf;
     HeatEngine h;

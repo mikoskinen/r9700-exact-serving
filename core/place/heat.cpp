@@ -113,6 +113,8 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
 
     const size_t np = unit_at_.size();
     heat_.assign(np, 0.0f);
+    heat_d_.assign(dual() ? np : 0, 0.0f);
+    heat_p_.assign(dual() ? np : 0, 0.0f);
     rank_as_.assign(np, 0u);
     routed_as_.assign(np, 0u);
     miss_bytes_.assign(np, 0);
@@ -153,7 +155,12 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
              params_.moves_per_step == 1 ? "" : "s",
              (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
              (double)params_.credit_cap, (double)params_.admit_heat);
-    if (params_.prefill_share != 1.0f)
+    if (dual())
+        RAD_INFO("heat engine: dual heat -- decode rows credit a decode heat, prefill rows a prefill "
+                 "heat (x%.2f) that decays %.3f a step; placement ranks their sum "
+                 "(RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN)", (double)params_.prefill_gain,
+                 (double)params_.prefill_decay);
+    else if (params_.prefill_share != 1.0f)
         RAD_INFO("heat engine: a step with prefill rows counts as its decode share plus %.3f of its "
                  "prefill share (RADIANCE_HEAT_PREFILL)", (double)params_.prefill_share);
     return RAD_OK;
@@ -192,7 +199,7 @@ void HeatEngine::observe_ids(int32_t layer, const int32_t* experts, const int32_
  * credited the layer is rebuilt from its positions. Ties created by decay are not counted, which
  * can only cause an unneeded rebuild. */
 void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight,
-                         float share) {
+                         float share, float pshare) {
     if (!enabled_ || layer < 0 || layer >= n_layer_ || !counts) return;
     if (!(weight > 0.0f)) weight = 1.0f;
     /* Routing passes this histogram stands for (see heat.h: observe); at least one. */
@@ -207,6 +214,15 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
      * the misses with each other and with the decay; a caller sweeping layers may prefetch
      * earlier still. */
     prefetch(counts, n);
+
+    if (dual()) {
+        int64_t total = 0;
+        for (int32_t j = 0; j < n; ++j) total += counts[j] > 0 ? counts[j] : 0;
+        const float cap = params_.credit_cap;
+        const float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
+        observe_dual(layer, counts, n, w, passes, share, pshare);
+        return;
+    }
 
     /* A step that counts for nothing (HeatParams::prefill_share 0 on a prefill step): priced as
      * any histogram, so hit rate and streamed bytes still cover it, and no heat or end moves. */
@@ -342,6 +358,50 @@ void HeatEngine::set_place(int32_t unit) {
         : vram ? 2u : 1u;
     routed_as_[p] = vram ? 2u : 1u;
     miss_bytes_[p] = vram ? 0 : bytes_[u];
+}
+
+/* Dual heat (HeatParams::prefill_decay): the decode heat decays by decay^share and takes the
+ * histogram's credit times `share` (the step's decode rows); the prefill heat decays by
+ * prefill_decay and takes it times `pshare` x prefill_gain (its prefill rows). A layer is credited
+ * once a step, so every step decays the prefill heat once. heat_ is their sum. Two heats decayed
+ * by different factors can change places by decay alone, so the layer's ends are rebuilt rather
+ * than updated (one pass over the layer's positions, which the decay makes anyway). Pricing as in
+ * observe(). */
+void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, float w,
+                              uint64_t passes, float share, float pshare) {
+    const size_t l = (size_t)layer;
+    const int32_t lo = slot_lo_[l], len = slot_lo_[l + 1] - lo;
+    const float sd = share > 1.0f ? 1.0f : (share > 0.0f ? share : 0.0f);
+    const float sp = pshare > 1.0f ? 1.0f : (pshare > 0.0f ? pshare : 0.0f);
+    const float dd = sd >= 1.0f ? params_.decay : (sd > 0.0f ? std::pow(params_.decay, sd) : 1.0f);
+    const float dp = params_.prefill_decay;
+    const float wd = w * sd, wp = w * sp * params_.prefill_gain;
+    float* __restrict hd = heat_d_.data() + lo;
+    float* __restrict hq = heat_p_.data() + lo;
+    float* __restrict h = heat_.data() + lo;
+    for (int32_t j = 0; j < len; ++j) {
+        hd[j] *= dd;
+        hq[j] *= dp;
+        h[j] = hd[j] + hq[j];
+    }
+    int32_t routed = 0, resident = 0;
+    int64_t miss = 0;
+    for (int32_t j = 0; j < n; ++j) {
+        const int32_t c = counts[j];
+        if (c <= 0) continue;
+        const size_t q = (size_t)(lo + j);
+        hd[j] += (float)c * wd;
+        hq[j] += (float)c * wp;
+        h[j] = hd[j] + hq[j];
+        routed += routed_as_[q] != 0;
+        resident += routed_as_[q] == 2;
+        miss += miss_bytes_[q];
+    }
+    end_rebuild(l);
+    stats_.routed += (uint64_t)routed * passes;
+    stats_.routed_resident += (uint64_t)resident * passes;
+    stats_.stream_bytes += (uint64_t)miss * passes;
+    ++stats_.dispatches;
 }
 
 void HeatEngine::end_rebuild(size_t slot) {

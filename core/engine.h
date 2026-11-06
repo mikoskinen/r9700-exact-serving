@@ -161,6 +161,8 @@ private:
     std::unique_ptr<ExpertStats> xstats_;
     /* HeatParams::prefill_share as bring-up read it (RADIANCE_HEAT_PREFILL); 1 records nothing. */
     float heat_prefill_share_ = 1.0f;
+    /* HeatParams::prefill_decay in (0, 1): dual heat, which also records each step's rows. */
+    bool heat_dual_ = false;
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
@@ -684,7 +686,7 @@ private:
     void tiering_dispatch(Rank& r, int step);
     /* The share of a step a trunk histogram of `step` is credited at (HeatParams::prefill_share,
      * RADIANCE_HEAT_PREFILL); 1 unless the share is below one and the step had prefill rows. */
-    float heat_share(const Rank& r, int layer, int step) const;
+    float heat_share(const Rank& r, int layer, int step, float* pshare) const;
     /* The routing histograms landed since the last drain (tiering_dispatch), and the drain alone
      * for --expert-stats where the heat engine is off. */
     void find_histograms(Rank& r, int before_step);
