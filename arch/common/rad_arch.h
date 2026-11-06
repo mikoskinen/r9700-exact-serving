@@ -118,7 +118,19 @@ inline void dbg_resid(RadCtx* c, int layer, const char* site, int64_t n_embd,
  * covers only its own experts' tokens. `gate_up` input is the full token set on every rank, so
  * the sum scales H by `world`; GPTQ is invariant to a positive scale (damping is a fraction of
  * the trace and the update uses ratios). */
+/* A plugin that runs under the core's calibration mode (--calib-dir, --calib-corpus) states the
+ * directory and the corpus's token count from RadBuildCtx here (calib_from_ctx), and the taps
+ * below take those over the environment: a --calib-corpus run then writes once the whole corpus
+ * is through, not at RADIANCE_CALIB_TOKENS' default. */
+inline std::string& calib_dir_ctx() { static std::string d; return d; }
+inline long long& calib_tokens_ctx() { static long long n = 0; return n; }
+inline void calib_from_ctx(const char* dir, long long tokens) {
+    calib_dir_ctx() = dir && *dir ? dir : "";
+    calib_tokens_ctx() = tokens > 0 ? tokens : 0;
+}
+
 inline const char* calib_dir() {
+    if (!calib_dir_ctx().empty()) return calib_dir_ctx().c_str();
     static const char* d = std::getenv("RADIANCE_CALIB_DIR");
     return d && *d ? d : nullptr;
 }
@@ -126,6 +138,7 @@ inline const char* calib_dir() {
 /* Token count at which the tap dumps and switches itself off (RADIANCE_CALIB_TOKENS, default
  * 65536). Whether the tap runs at all is calib_dir()'s decision. */
 inline long long calib_target() {
+    if (calib_tokens_ctx() > 0) return calib_tokens_ctx();
     static const long long n = [] {
         const char* s = std::getenv("RADIANCE_CALIB_TOKENS");
         const long long v = s ? std::atoll(s) : 0;
@@ -151,7 +164,7 @@ inline long long calib_target() {
  * rows. `domain` is what the tap summed; a reader quantising in another domain converts the file
  * itself (libquant's calib_sum). */
 inline bool calib_write_host(const float* h, int64_t k, long long rows, const char* what,
-                             uint32_t domain, int rank) {
+                             uint32_t domain, int rank, bool packed = false) {
     const char* dir = calib_dir();
     if (!dir || !h || k <= 0) return false;
     char path[512];
@@ -169,7 +182,11 @@ inline bool calib_write_host(const float* h, int64_t k, long long rows, const ch
     std::memcpy(hdr + 12, &rk, 4);
     std::memcpy(hdr + 16, &nr, 8);
     std::memcpy(hdr + 24, &domain, 4);
-    const size_t n = (size_t)(k * k);
+    /* The word after `domain`: 0 square, 1 the upper triangle packed row by row (`packed`; h then
+     * holds k*(k+1)/2 f32), which libquant's reader unpacks. */
+    const uint32_t layout = packed ? 1u : 0u;
+    std::memcpy(hdr + 28, &layout, 4);
+    const size_t n = packed ? (size_t)(k * (k + 1) / 2) : (size_t)(k * k);
     const bool okw = std::fwrite(hdr, 1, sizeof hdr, f) == sizeof hdr &&
                      std::fwrite(h, 4, n, f) == n;
     std::fclose(f);
@@ -263,15 +280,25 @@ struct CalibExperts {
 
     /* One file per expert, `<stem>.<global expert>`, where stem is the packed weight's name minus
      * `.weight`; libquant looks for it before the pooled `<stem>`. A never-routed expert's file
-     * has `rows` 0. */
+     * has `rows` 0. Written as the packed upper triangle the host holds (RADGRAM2 layout 1): half a
+     * square's bytes, which over DeepSeek-V4.1's 15,360 experts is 163 GB instead of 326 GB.
+     * RADIANCE_CALIB_SQUARE=1 writes squares, for a reader older than layout 1. */
     bool write(const char* stem, int64_t expert_base, uint32_t domain, int rank) const {
-        std::vector<float> h((size_t)(k * k));
+        const char* sq = std::getenv("RADIANCE_CALIB_SQUARE");
+        const bool square = sq && *sq && std::strcmp(sq, "0") != 0;
+        std::vector<float> h(square ? (size_t)(k * k) : 0);
+        const int64_t tri = k * (k + 1) / 2;
         bool ok = true;
         for (int64_t e = 0; e < ne; ++e) {
-            unpack(e, h.data());
             char what[256];
             std::snprintf(what, sizeof what, "%s.%lld", stem, (long long)(expert_base + e));
-            ok = calib_write_host(h.data(), k, rows[(size_t)e], what, domain, rank) && ok;
+            if (square) {
+                unpack(e, h.data());
+                ok = calib_write_host(h.data(), k, rows[(size_t)e], what, domain, rank) && ok;
+            } else {
+                ok = calib_write_host(acc.data() + (size_t)(e * tri), k, rows[(size_t)e], what,
+                                      domain, rank, true) && ok;
+            }
         }
         return ok;
     }

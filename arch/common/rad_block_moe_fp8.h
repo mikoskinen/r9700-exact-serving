@@ -1193,11 +1193,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const bool ep = c.n_expert != c.n_expert_all;
         if (split) {
             fprintf(stderr, "radiance: IQR experts sliced by width land in phase 3b (N aligned to "
-                            "the trellis run); use expert parallelism or TP1\\n");
+                            "the trellis run); use expert parallelism or TP1\n");
             return RAD_E_UNSUPPORTED;
         }
         if (rot || c.expert_w4 || c.expert_mx || !c.expert_iqr) {
-            fprintf(stderr, "radiance: IQR experts are plane codes, not w4/mx rotations\\n");
+            fprintf(stderr, "radiance: IQR experts are plane codes, not w4/mx rotations\n");
             return RAD_E_UNSUPPORTED;
         }
         const long long g0 = (long long)c.expert_base;
@@ -1235,8 +1235,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         iqr_d.q8_rot = true;
         const int ldd = iqr_d.declare_qs(b, nm, ga, nm.f("blk.%d.moe_iqr_d", l), c.n_ff_exp,
                                          c.rows * c.top_k, true, false);
+        /* With swiglu_limit (DeepSeek-V4.1: 10) the product is clamped as every other expert
+         * format clamps it -- swiglu_clamped into the bf16 plane, then had_quant_act_i8g into the
+         * rotated int8 pair the down GEMM reads -- instead of the unclamped fused
+         * gated_had_quant_i8g. */
         const int lgg = gq_iqr.declare(b, ga, w.egu, iqr_d, c.n_ff_exp, "silu",
-                                       c.rows * c.top_k, true, true);
+                                       c.rows * c.top_k, true, true, c.swiglu_limit,
+                                       c.swiglu_step != 0);
+        if (laq != RAD_OK || ldd != RAD_OK || lgg != RAD_OK || !op_aq) {
+            fprintf(stderr, "radiance: layer %d's IQR expert activations did not declare (input pair "
+                            "%d, gate product pair %d, gate %d)\n", l, laq, ldd, lgg);
+            return laq != RAD_OK ? laq : ldd != RAD_OK ? ldd : lgg != RAD_OK ? lgg : RAD_E_INVAL;
+        }
         const char* const ecodes = "codes,trellis,trellis.mad";
         const char* const escale = "scale,scale.col";
         const int   sh = ep ? RAD_SHARD_NONE : RAD_SHARD_COL;

@@ -12780,3 +12780,223 @@ TEST(krea2_rebalance_scales_each_tap_and_is_off_without_the_option) {
             }
         }
 }
+
+/* The routed down projection's per-expert Grams (rad_arch.h, CalibExperts) are written as the
+ * packed upper triangle the host accumulates (RADGRAM2 layout 1), half a square's bytes, and
+ * RADIANCE_CALIB_SQUARE=1 writes the square: the packed file's triangle is the square file's,
+ * value for value, and the headers differ only in the layout word. libquant's reader of both is
+ * quant_test's a_packed_per_expert_gram_is_its_square. */
+TEST(calib_experts_write_packed_triangles_or_squares) {
+    using rad::arch::CalibExperts;
+    const int64_t ne = 3, k = 5;
+    CalibExperts ce;
+    ce.init(ne, k);
+    std::vector<float> full((size_t)(ne * k * k));
+    for (int64_t e = 0; e < ne; ++e)
+        for (int64_t i = 0; i < k; ++i)
+            for (int64_t j = 0; j < k; ++j)
+                full[(size_t)(e * k * k + i * k + j)] = (float)(100 * e + 10 * std::min(i, j) + std::max(i, j)) + 0.25f;
+    ce.add(full.data());
+    ce.add(full.data());
+    for (int64_t e = 0; e < ne; ++e) ce.rows[(size_t)e] = 7 + e;
+    std::string pk = radtest::tmp_path("calib_pk_XXXXXX"), sq = radtest::tmp_path("calib_sq_XXXXXX");
+    REQUIRE(mkdtemp(pk.data()) != nullptr);
+    REQUIRE(mkdtemp(sq.data()) != nullptr);
+    rad::arch::calib_from_ctx(pk.c_str(), 0);
+    unsetenv("RADIANCE_CALIB_SQUARE");
+    CHECK(ce.write("blk.2.ffn_down_exps", 10, 0, 1));
+    rad::arch::calib_from_ctx(sq.c_str(), 0);
+    setenv("RADIANCE_CALIB_SQUARE", "1", 1);
+    CHECK(ce.write("blk.2.ffn_down_exps", 10, 0, 1));
+    unsetenv("RADIANCE_CALIB_SQUARE");
+    rad::arch::calib_from_ctx(nullptr, 0);
+    auto slurp = [](const std::string& p) {
+        std::vector<char> b;
+        FILE* f = std::fopen(p.c_str(), "rb");
+        if (!f) return b;
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) b.insert(b.end(), buf, buf + n);
+        std::fclose(f);
+        return b;
+    };
+    for (int64_t e = 0; e < ne; ++e) {
+        const std::string leaf = "/gram.r1.blk.2.ffn_down_exps." + std::to_string(10 + e) + ".bin";
+        const std::vector<char> p = slurp(pk + leaf), s = slurp(sq + leaf);
+        REQUIRE_EQ((long long)p.size(), (long long)(32 + 4 * k * (k + 1) / 2));
+        REQUIRE_EQ((long long)s.size(), (long long)(32 + 4 * k * k));
+        uint32_t lp = 9, ls = 9;
+        uint64_t rp = 0;
+        std::memcpy(&lp, p.data() + 28, 4);
+        std::memcpy(&ls, s.data() + 28, 4);
+        std::memcpy(&rp, p.data() + 16, 8);
+        CHECK_EQ((int)lp, 1);
+        CHECK_EQ((int)ls, 0);
+        CHECK_EQ((long long)rp, (long long)(7 + e));
+        CHECK(std::memcmp(p.data(), s.data(), 28) == 0);
+        const float* t = (const float*)(p.data() + 32);
+        const float* q = (const float*)(s.data() + 32);
+        int bad = 0;
+        for (int64_t i = 0; i < k; ++i)
+            for (int64_t j = i; j < k; ++j, ++t) {
+                const float want = 2.0f * full[(size_t)(e * k * k + i * k + j)];
+                bad += *t != want || q[i * k + j] != want || q[j * k + i] != want;
+            }
+        CHECK_EQ(bad, 0);
+    }
+}
+
+/* DeepSeek-V4.1's routed experts as IQR trellis planes (format 11, moe_gemm_iqr) at its geometry and
+ * expert parallelism: 384 experts over four ranks (96 whole experts each), gate_up [4608, 5120] at
+ * IQ2R-V4's 2-bit form (u2, 2^15 states, 512-row runs) and down [5120, 2304] at the 3-bit one (u3,
+ * 2^16, 256-row runs), both with one f32 scale a row and a factor a 128-column block (tcq_colf=1,
+ * the kRowF32 form the kernel is built for). Each rank declares its experts' weight and scale
+ * tables as one run each in expert order (weights, then scales: the kernel's seven operands).
+ * With swiglu_limit (10, the model's) the gate product is clamped -- swiglu_clamped into the bf16
+ * plane, then had_quant_act_i8g into the rotated int8 pair down reads -- as every other expert format
+ * clamps it; without a limit it stays the fused gated_had_quant_i8g. */
+TEST(deepseek41_iqr_experts_declare_expert_ordered_tables_and_clamp_the_gate) {
+    using namespace rad::arch;
+    auto trellis = [](uint32_t codes, int L, int64_t rows) {
+        RadEncoding e = rad_enc_affine(codes, RAD_F32, 1, 0);
+        rad_enc_copy_str(e.scheme, "trellis");
+        const int i = rad_enc_add_table(&e, "trellis", RAD_I8, (int64_t)1 << L, 1);
+        e.plane[i].block[0] = rows;
+        e.plane[i].block[1] = 1;
+        rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+        rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+        rad_enc_copy_str(e.transform, "fwht128");
+        return e;
+    };
+    const RadEncoding gu = trellis(RAD_U2, 15, 512), dn = trellis(RAD_U3, 16, 256);
+    REQUIRE(rad_enc_valid(&gu) && rad_enc_valid(&dn));
+    CHECK_EQ(MoeFP8::format_of(gu), 11);
+    CHECK_EQ(MoeFP8::format_of(dn), 11);
+    const int64_t D = 5120, F = 2304, NE = 384, K6 = 6, T = 32;
+    for (double limit : { 10.0, 0.0 })
+        for (int rank : { 0, 3 }) {
+            const int world = 4;
+            const int64_t ne = NE / world;
+            RadBuilder b;
+            b.encs = { { "ffn_gate_up_exps", gu }, { "ffn_down_exps", dn } };
+            Names nm("");
+            Geom g{};
+            g.n_embd = D;
+            g.max_tok = T;
+            g.world = world;
+            g.rank = rank;
+            MoeFP8::Src src{};
+            src.router = "layers.3.ffn.gate.weight";
+            src.router_bias = "layers.3.ffn.gate.bias";
+            src.experts = "layers.3.ffn.experts";
+            src.expert_gate = "w1";
+            src.expert_up = "w3";
+            src.expert_down = "w2";
+            src.cfg.n_expert_all = NE;
+            src.cfg.n_expert = ne;
+            src.cfg.expert_base = rank * ne;
+            src.cfg.probed_expert = rank * ne;
+            src.cfg.top_k = K6;
+            src.cfg.n_ff_exp = F;
+            src.cfg.rows = T;
+            src.cfg.norm_topk = 1;
+            src.cfg.sigmoid_router = 1;
+            src.cfg.router_score = "sqrtsoftplus";
+            src.cfg.route_scale = 1.5;
+            src.cfg.swiglu_limit = limit;
+            REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
+            CHECK_EQ(src.cfg.expert_iqr, 1);
+            CHECK_EQ(src.cfg.expert_mx + src.cfg.expert_w4 + src.cfg.expert_rot, 0);
+            MoeFP8::Wire w{};
+            auto buf = [&](const char* name, uint32_t dt, int64_t rows, int64_t cols) {
+                return decl_b(&b, name, dt, { rows, cols });
+            };
+            w.h.x = buf("h", RAD_BF16, T, D);
+            REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", D), RAD_OK);
+            w.logits = buf("logits", RAD_F32, T, NE);
+            w.ids = buf("ids", RAD_I32, T, K6);
+            w.ew = buf("ew", RAD_F32, T, K6);
+            w.eoff = decl_b(&b, "offset", RAD_I32, { NE + 1 });
+            w.ecnt = decl_b(&b, "count", RAD_I32, { NE });
+            w.sorted = decl_b(&b, "sorted", RAD_I32, { T * K6 });
+            w.egu = buf("gate_up", RAD_BF16, T * K6, 2 * F);
+            w.eff.x = buf("ff", RAD_BF16, T * K6, F);
+            REQUIRE_EQ(w.eff.declare_qs(&b, nm, g, "ff", F, T * K6), RAD_OK);
+            w.edn = buf("down", RAD_BF16, T * K6, D);
+            MoeFP8 moe;
+            REQUIRE_EQ(moe.declare(&b, nm, g, 3, w, src, false, false), RAD_OK);
+            /* the tables: 96 handles in expert order, scales after weights */
+            for (int64_t e = 0; e < ne; ++e) {
+                CHECK_EQ(moe.w_gu[(size_t)e], moe.w_gu[0] + (rad_weight)e);
+                CHECK_EQ(moe.w_gus[(size_t)e], moe.w_gus[0] + (rad_weight)e);
+                CHECK_EQ(moe.w_dn[(size_t)e], moe.w_dn[0] + (rad_weight)e);
+                CHECK_EQ(moe.w_dns[(size_t)e], moe.w_dns[0] + (rad_weight)e);
+                const auto& wg = b.weights[moe.w_gu[(size_t)e] - 1];
+                const auto& wd = b.weights[moe.w_dn[(size_t)e] - 1];
+                CHECK_EQ(wg.name, "blk.3.ffn_gate_up_exps." + std::to_string(rank * ne + e) + ".weight");
+                CHECK_EQ(wg.d.dtype, RAD_U2);
+                CHECK_EQ(wd.d.dtype, RAD_U3);
+                CHECK_EQ(wg.d.shape[0], 2 * F);
+                CHECK_EQ(wg.d.shape[1], D);
+                CHECK_EQ(wd.d.shape[0], D);
+                CHECK_EQ(wd.d.shape[1], F);
+                CHECK_EQ(b.weights[moe.w_gus[(size_t)e] - 1].d.dtype, RAD_F32);
+            }
+            CHECK_EQ(moe.w_gus[0], moe.w_gu[(size_t)ne - 1] + 1);
+            CHECK_EQ(moe.w_dns[0], moe.w_dn[(size_t)ne - 1] + 1);
+            auto param = [](const RecOp* op, const char* key) {
+                for (const auto& p : op->p) if (p.key == key) return p;
+                return RecParam{};
+            };
+            const RecOp* ogu = b.op_of(moe.op_gu);
+            const RecOp* odn = b.op_of(moe.op_dn);
+            REQUIRE(ogu != nullptr && odn != nullptr);
+            CHECK_EQ(ogu->op, std::string("moe_gemm_iqr"));
+            CHECK_EQ(odn->op, std::string("moe_gemm_iqr"));
+            CHECK_EQ(param(ogu, "N").ival, 2 * F);
+            CHECK_EQ(param(ogu, "K").ival, D);
+            CHECK_EQ(param(ogu, "n_expert").ival, ne);
+            CHECK_EQ(param(ogu, "a_order").sval, std::string("token"));
+            CHECK_EQ(param(odn, "N").ival, D);
+            CHECK_EQ(param(odn, "K").ival, F);
+            CHECK_EQ(param(odn, "a_order").sval, std::string("sorted"));
+            CHECK_EQ(param(odn, "dtype").sval, std::string("i8a8h"));
+            CHECK_EQ(ogu->w.size(), (size_t)(2 * ne));
+            CHECK_EQ(odn->w.size(), (size_t)(2 * ne));
+            const RecOp* gop = b.op_of(moe.gq_iqr.op);
+            REQUIRE(gop != nullptr);
+            if (limit > 0) {
+                CHECK_EQ(gop->op, std::string("swiglu_clamped"));
+                CHECK_EQ(param(gop, "limit").dval, limit);
+                const RecOp* qop = b.op_of(moe.gq_iqr.op_quant);
+                REQUIRE(qop != nullptr);
+                CHECK_EQ(qop->op, std::string("had_quant_act_i8g"));
+                CHECK_EQ(param(qop, "n").ival, F);
+            } else {
+                CHECK_EQ(gop->op, std::string("gated_had_quant_i8g"));
+                CHECK_EQ(moe.gq_iqr.op_quant, 0u);
+            }
+            RadCtx ctx;
+            ctx.b = &b;
+            ctx.rank = rank;
+            ctx.world = world;
+            moe.pass(&ctx, 8, 0, 8);
+            const auto ops = issued_ops(b, ctx);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "moe_gemm_iqr"), 2);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "swiglu_clamped"), limit > 0 ? 1 : 0);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "gated_had_quant_i8g"), limit > 0 ? 0 : 1);
+            CHECK_EQ(std::count(ops.begin(), ops.end(), "had_quant_act_i8g"), limit > 0 ? 2 : 1);
+            /* the clamp comes after gate_up and its quantiser before down */
+            const auto at = [&](const char* o, int nth) {
+                int k = 0;
+                for (size_t i = 0; i < ops.size(); ++i)
+                    if (ops[i] == o && k++ == nth) return (long)i;
+                return -1L;
+            };
+            if (limit > 0) {
+                CHECK(at("moe_gemm_iqr", 0) < at("swiglu_clamped", 0));
+                CHECK(at("swiglu_clamped", 0) < at("had_quant_act_i8g", 1));
+                CHECK(at("had_quant_act_i8g", 1) < at("moe_gemm_iqr", 1));
+            }
+        }
+}

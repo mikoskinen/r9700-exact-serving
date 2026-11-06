@@ -2094,6 +2094,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (ctx->calib_dir && ctx->calib_dir[0]) {
         m.calib_lo = ctx->calib_layer_lo;
         m.calib_hi = ctx->calib_layer_hi > ctx->calib_layer_lo ? ctx->calib_layer_hi : (int)c.n_layer;
+        /* The routed experts' tap (rad_block_moe_fp8.h) writes RADGRAM2 files into --calib-dir once
+         * the corpus is through (RadBuildCtx::calib_tokens), not into RADIANCE_CALIB_DIR at
+         * RADIANCE_CALIB_TOKENS' 65536. */
+        calib_from_ctx(ctx->calib_dir, (long long)ctx->calib_tokens);
+        rad_note(b, "calibration: routed-expert Grams of layers %d..%d into %s after %lld tokens",
+                 m.calib_lo, m.calib_hi - 1, ctx->calib_dir, (long long)calib_target());
     }
     for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
     m.pcn_fin = post_collapse_norm(b, m, T, m.final_gain, m.act.x, m.h1, m.h0, m.pre_f, m.xcol,

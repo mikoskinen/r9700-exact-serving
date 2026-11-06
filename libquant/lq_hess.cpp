@@ -14,8 +14,10 @@ namespace lq {
 
 namespace {
 
-/* "RADGRAM2", k, rank, rows, domain, a pad word, then k*k f32 row-major: the file the engine's
- * calibration tap writes (arch/common/rad_arch.h, calib_write). The header is 32 bytes. */
+/* "RADGRAM2", k, rank, rows, domain, a layout word, then k*k f32 row-major: the file the engine's
+ * calibration tap writes (arch/common/rad_arch.h, calib_write). The header is 32 bytes. Layout 1
+ * is the upper triangle packed row by row instead, k*(k+1)/2 f32 (row i's entries i .. k-1 after
+ * row i-1's): the per-expert files of a routed `down` (rad_arch.h, CalibExperts), half the disk. */
 constexpr int kHdr = 32;
 
 /* One file per rank, ranks 0 .. kMaxRanks - 1. */
@@ -68,9 +70,16 @@ bool read_gram(const std::string& path, int64_t k, int64_t domain, std::vector<d
         std::fclose(f);
         return false;
     }
-    uint32_t kk = 0, dom = 0;
+    uint32_t kk = 0, dom = 0, lay = 0;
     std::memcpy(&kk, hdr + 8, 4);
     std::memcpy(&dom, hdr + 24, 4);
+    std::memcpy(&lay, hdr + 28, 4);
+    if (lay > 1) {
+        std::fprintf(stderr, "libquant: %s has layout %u; 0 (square) and 1 (packed upper) are read\n",
+                     path.c_str(), lay);
+        std::fclose(f);
+        return false;
+    }
     if ((int64_t)kk != k) {
         std::fprintf(stderr, "libquant: %s holds a %u-wide Hessian and this weight's K is %lld\n",
                      path.c_str(), kk, (long long)k);
@@ -89,7 +98,20 @@ bool read_gram(const std::string& path, int64_t k, int64_t domain, std::vector<d
         return false;
     }
     std::vector<float> buf((size_t)(k * k));
-    const bool okr = std::fread(buf.data(), 4, buf.size(), f) == buf.size();
+    bool okr;
+    if (lay == 1) {
+        /* Packed upper triangle: unpack into the square, both halves, as the tap's square held it. */
+        std::vector<float> tri((size_t)(k * (k + 1) / 2));
+        okr = std::fread(tri.data(), 4, tri.size(), f) == tri.size();
+        const float* t = tri.data();
+        for (int64_t i = 0; okr && i < k; ++i)
+            for (int64_t j = i; j < k; ++j, ++t) {
+                buf[(size_t)(i * k + j)] = *t;
+                buf[(size_t)(j * k + i)] = *t;
+            }
+    } else {
+        okr = std::fread(buf.data(), 4, buf.size(), f) == buf.size();
+    }
     std::fclose(f);
     if (!okr) {
         std::fprintf(stderr, "libquant: %s is short\n", path.c_str());

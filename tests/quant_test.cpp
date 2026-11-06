@@ -282,6 +282,89 @@ TEST(gptq_with_a_hessian_lowers_the_output_error) {
     CHECK(gc.planes[1] == g.planes[1]);
 }
 
+/* A routed down projection's per-expert Gram as the tap now writes it (RADGRAM2 layout 1, the upper
+ * triangle packed row by row; arch/common/rad_arch.h CalibExperts) is the same Hessian as its
+ * square: GPTQ against either writes the same planes, also when the expert's rows come from two
+ * ranks' files, one of each layout. A layout the reader does not know is refused, so the weight
+ * is quantised uncalibrated, which is rtn's planes byte for byte. */
+TEST(a_packed_per_expert_gram_is_its_square) {
+    NEED_LIBQUANT();
+    const int64_t R = 32, C = 128, T = 1024;
+    const std::vector<float> w = draw(R * C, 31, 10.0f);
+    const std::vector<float> z = draw(T * C, 32);
+    std::vector<float> h((size_t)(C * C), 0.0f), h1((size_t)(C * C), 0.0f);
+    for (int64_t t = 0; t < T; ++t)
+        for (int64_t i = 0; i < C; ++i)
+            for (int64_t j = 0; j < C; ++j) {
+                const float x = z[(size_t)(t * C + i)] * (1.0f + (float)(i % 7)) *
+                                (z[(size_t)(t * C + j)] + 0.3f * z[(size_t)(t * C + (j + 1) % C)]);
+                h[(size_t)(i * C + j)] += x;
+                if (t < T / 2) h1[(size_t)(i * C + j)] += x;
+            }
+    /* symmetric, as a Gram is */
+    for (int64_t i = 0; i < C; ++i)
+        for (int64_t j = 0; j < i; ++j) {
+            h[(size_t)(i * C + j)] = h[(size_t)(j * C + i)];
+            h1[(size_t)(i * C + j)] = h1[(size_t)(j * C + i)];
+        }
+    std::vector<float> h2(h.size());
+    for (size_t i = 0; i < h.size(); ++i) h2[i] = h[i] - h1[i];
+    auto packed = [&](const std::string& path, const std::vector<float>& m, int64_t rows,
+                      uint32_t layout) {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) return false;
+        char hdr[32] = { 'R', 'A', 'D', 'G', 'R', 'A', 'M', '2' };
+        const uint32_t kk = (uint32_t)C, rank = 0, domain = 0;
+        const uint64_t rr = (uint64_t)rows;
+        std::memcpy(hdr + 8, &kk, 4);
+        std::memcpy(hdr + 12, &rank, 4);
+        std::memcpy(hdr + 16, &rr, 8);
+        std::memcpy(hdr + 24, &domain, 4);
+        std::memcpy(hdr + 28, &layout, 4);
+        bool ok = std::fwrite(hdr, 1, 32, f) == 32;
+        for (int64_t i = 0; i < C && ok; ++i)
+            ok = std::fwrite(&m[(size_t)(i * C + i)], 4, (size_t)(C - i), f) == (size_t)(C - i);
+        return std::fclose(f) == 0 && ok;
+    };
+    const TempDir sq("rad_quant_sq"), pk("rad_quant_pk"), mx("rad_quant_mx"), bad("rad_quant_bad");
+    REQUIRE(!sq.path.empty() && !pk.path.empty() && !mx.path.empty() && !bad.path.empty());
+    const std::string stem = "/gram.r0.blk.5.ffn_down_exps.3.bin";
+    /* rows well past libquant's 4 x K for an expert's own file */
+    REQUIRE(write_gram(sq.path + stem, C, 8 * C, h));
+    REQUIRE(packed(pk.path + stem, h, 8 * C, 1));
+    REQUIRE(packed(mx.path + stem, h1, 4 * C, 1));
+    REQUIRE(write_gram(mx.path + "/gram.r1.blk.5.ffn_down_exps.3.bin", C, 4 * C, h2));
+    REQUIRE(packed(bad.path + stem, h, 8 * C, 2));
+    const char* name = "blk.5.ffn_down_exps.3.weight";
+    auto run = [&](const char* q, const std::string& dir) {
+        Opts o;
+        o.s("codes", "i4").i("group", 32).s("scale", "f32");
+        if (!dir.empty()) o.s("calib", dir.c_str());
+        return quantise(quantizer(q), o, name, R, C, w);
+    };
+    const Quantised a = run("gptq", sq.path), b = run("gptq", pk.path), c = run("gptq", mx.path);
+    const Quantised d = run("gptq", bad.path), r = run("rtn", "");
+    REQUIRE_EQ(a.status, RAD_OK);
+    REQUIRE_EQ(b.status, RAD_OK);
+    REQUIRE_EQ(c.status, RAD_OK);
+    REQUIRE_EQ(d.status, RAD_OK);
+    REQUIRE_EQ(r.status, RAD_OK);
+    bool calibrated = false;
+    for (int i = 0; i < a.enc.n_planes; ++i) {
+        CHECK(a.planes[(size_t)i] == b.planes[(size_t)i]);
+        if (a.planes[(size_t)i] != r.planes[(size_t)i]) calibrated = true;
+        CHECK(d.planes[(size_t)i] == r.planes[(size_t)i]);
+    }
+    CHECK(calibrated);
+    /* two ranks' halves sum in f64 before the factor, so the split Gram is the same matrix up to
+     * one f32 rounding of each half: the planes agree but for a handful of codes */
+    int64_t diff = 0, n = 0;
+    for (size_t j = 0; j < a.planes[0].size(); ++j, ++n) diff += a.planes[0][j] != c.planes[0][j];
+    std::fprintf(stderr, "    split packed + square vs one square: %lld of %lld code bytes differ\n",
+                 (long long)diff, (long long)n);
+    CHECK(diff * 5 < n);
+}
+
 /* ------------------------------------------------------------------ recipes, compiled
  *
  * A rule's options are typed by its quantiser's own table before declare runs, so a misspelt key or
