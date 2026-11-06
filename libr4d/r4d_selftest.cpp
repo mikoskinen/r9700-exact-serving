@@ -6872,8 +6872,16 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
  * weight and scale are the row's own arrangements per expert, stacked: a zero leading stride
  * marking the pointer array path is on the dense row; here the entry pitch is the arrangement its
  * bytes. */
-static void moe_iqr_case(const Plugin& pl, int B, int L, int64_t M, int64_t N, int64_t K) {
-    if (!sel("moe_gemm_iqr") && !sel("gemm_iqr")) return;
+/* `run` is the trellis's rows a tail-biting run (tcq_rows); `ds41` marks DeepSeek-V4.1's shapes, run
+ * only under --case moe_gemm_iqr_ds41 (their host reference takes seconds a case). */
+static void moe_iqr_case(const Plugin& pl, int B, int L, int64_t M, int64_t N, int64_t K,
+                         int64_t run = 256, bool ds41 = false) {
+    if (ds41) {
+        if (!g_case || std::strcmp(g_case, "moe_gemm_iqr_ds41") != 0) return;
+        g_matched = true;
+    } else if (!sel("moe_gemm_iqr") && !sel("gemm_iqr")) {
+        return;
+    }
     const int64_t nkb = K / 128, ne = 2, tk = 2, NROW = M * tk;
     const RadKernelInfo* r = find(pl, "moe_gemm_iqr");
     if (!r || !r->layout || !r->relayout || !r->unrelayout) {
@@ -6881,8 +6889,8 @@ static void moe_iqr_case(const Plugin& pl, int B, int L, int64_t M, int64_t N, i
         return;
     }
     char nm[200];
-    std::snprintf(nm, sizeof nm, "moe_gemm_iqr trellis-mad row-f32 B=%d L=%d M=%lld N=%lld K=%lld",
-                  B, L, (long long)M, (long long)N, (long long)K);
+    std::snprintf(nm, sizeof nm, "moe_gemm_iqr trellis-mad row-f32 B=%d L=%d run=%lld M=%lld N=%lld K=%lld",
+                  B, L, (long long)run, (long long)M, (long long)N, (long long)K);
     for (int64_t x : { M, N, K, ne, tk }) { (void)x; }
     uint64_t z = 0x9E3779B97F4A7C15ull * (uint64_t)(B * 131 + L * 17 + M * 29);
     auto rnd = [&]() {
@@ -6910,7 +6918,7 @@ static void moe_iqr_case(const Plugin& pl, int B, int L, int64_t M, int64_t N, i
         rad_enc_add_plane(&q.p.enc, "codes", kU[B], 1, 1);
         rad_enc_add_plane(&q.p.enc, "scale", RAD_F32, 1, 0);
         const int t = rad_enc_add_table(&q.p.enc, "trellis", RAD_I8, (int64_t)1 << L, 1);
-        q.p.enc.plane[t].block[0] = 256;
+        q.p.enc.plane[t].block[0] = run;
         q.p.enc.plane[t].block[1] = 0;
         rad_enc_add_table(&q.p.enc, "trellis.mad", RAD_U32, 2, 1);
         rad_enc_add_plane(&q.p.enc, "scale.col", RAD_F32, 0, 128);
@@ -6957,13 +6965,24 @@ static void moe_iqr_case(const Plugin& pl, int B, int L, int64_t M, int64_t N, i
         return rad_load_bits(q.p.data[(size_t)q.ic].data() + n * q.p.row_bytes(q.ic), B, c);
     };
     const int C = (L + B - 1) / B;
-    auto val = [&](const Part& q, int64_t n, int64_t k) {
+    auto val_of = [&](const Part& q, int64_t n, int64_t k) {
         uint32_t st = 0;
         for (int t = C - 1; t >= 0; --t) {
-            const int64_t rr = n / 256 * 256 + (n % 256 - t + 256) % 256;
+            const int64_t rr = n / run * run + (n % run - t + run) % run;
             st = ((st << B) | (uint32_t)code(q, rr, k)) & ((1u << L) - 1u);
         }
         return (int)(int8_t)q.p.data[(size_t)q.ia][st];
+    };
+    /* Each expert's decoded values once (the reference reads each NROW times). */
+    std::vector<std::vector<int8_t>> dec((size_t)ne);
+    for (int64_t e = 0; e < ne; ++e) {
+        dec[(size_t)e].resize((size_t)(N * K));
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t k = 0; k < K; ++k)
+                dec[(size_t)e][(size_t)(n * K + k)] = (int8_t)val_of(parts[(size_t)e], n, k);
+    }
+    auto val = [&](const Part& q, int64_t n, int64_t k) {
+        return (int)dec[(size_t)(&q - parts.data())][(size_t)(n * K + k)];
     };
     std::vector<int8_t> ha((size_t)(M * K));
     std::vector<float> has((size_t)(M * nkb));
@@ -32424,6 +32443,17 @@ static void device_phase(const Plugin& pl) {
          * chunk (K 512 over the tile's 256). */
         moe_iqr_case(pl, 2, 16, 40, 256, 256);
         moe_iqr_case(pl, 2, 16, 32, 256, 512);
+        /* DeepSeek-V4.1's experts (opt-in, --case moe_gemm_iqr_ds41): gate_up [4608, 5120] at
+         * the 2-bit form (2^15 states, 512-row runs) and the 3-bit one (2^16, 512), down
+         * [5120, 2304] at 2/3 bits on 256-row runs and 4 bits on 1024 -- a token, a run crossing
+         * the GEMV's eight-token group, and the prefill tile (K 2304 = 9 x 256). */
+        for (int64_t m : { 1, 9, 64 }) {
+            moe_iqr_case(pl, 2, 15, m, 4608, 5120, 512, true);
+            moe_iqr_case(pl, 3, 16, m, 4608, 5120, 512, true);
+            moe_iqr_case(pl, 2, 15, m, 5120, 2304, 256, true);
+            moe_iqr_case(pl, 3, 16, m, 5120, 2304, 256, true);
+            moe_iqr_case(pl, 4, 16, m, 5120, 2304, 1024, true);
+        }
         /* The bias GEMM: three shapes on the 128 x 128 kernel (ragged N with an unaligned pitch;
          * an aligned ragged N with a K tail; K below one tile) and one on the 64 x 64 kernel. */
         bias_gemm_numeric(pl, 1100, 1001, 200, 1, true, false);
