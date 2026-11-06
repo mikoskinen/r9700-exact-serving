@@ -132,8 +132,8 @@ int exl3r4d_fused_rows(int gate_up, int64_t cols_max);
  * 1 = a block a workgroup. */
 /* D18 (PLAN, 2026-10-11): gate_up's prep and GEMM in ONE launch, ordered by a counter block a (stream, output)
  * taken from a pool the row instance's init allocates and zeroes (never the launch path). 0 = two dispatches. */
-#ifndef EXL3R4D_FUSE1
-#define EXL3R4D_FUSE1 0
+#ifndef EXL3R4D_FUSE1   /* fz1 (6.11.2026): 1, every K, with RADIANCE_EXL3_FUSE1=0 at run time giving the two dispatches */
+#define EXL3R4D_FUSE1 1
 #endif
 #define EXL3R4D_CTR_ROUND 64    /* a counter block's words rounded up to this (256 B): no two blocks share a line */
 #define EXL3R4D_CTR_BLOCKS 64   /* counter blocks an instance: distinct (stream, output) pairs it serves fused */
