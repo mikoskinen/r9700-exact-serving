@@ -13000,3 +13000,111 @@ TEST(deepseek41_iqr_experts_declare_expert_ordered_tables_and_clamp_the_gate) {
             }
         }
 }
+
+/* DeepSeek-V4.1 serving the official release's MXFP4 experts (format 8) under its bf16 trunk
+ * (Geom::w_bf16; the block is handed only the bf16 input, MoeFP8's external-input form): the E4M3
+ * pairs moe_gemm_q's mxfp4a8 reads are the block's own -- quant_act_fp8 of the input into
+ * `mx_a`, the gated quantiser's codes into `mx_d` (clamped at swiglu_limit: swiglu_clamped, then
+ * quant_act_fp8) -- and with the calibration tap on (the reference's --calib-dir run) its fp8a8
+ * Grams read those same pairs: the pooled gate_up and down Grams and the per-expert down Grams.
+ * Before, the GEMMs and the tap were declared over the wire's absent E4M3 buffers (0). */
+TEST(deepseek41_mxfp4_experts_under_a_bf16_trunk_quantise_their_own_inputs) {
+    using namespace rad::arch;
+    const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
+    REQUIRE(rad_enc_valid(&mx));
+    const int64_t D = 5120, F = 2304, NE = 384, K6 = 6, T = 32;
+    const char* dir = "/nonexistent-calib";
+    for (int calib : { 0, 1 }) {
+        const int world = 4, rank = 1;
+        const int64_t ne = NE / world;
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", mx }, { "ffn_down_exps", mx } };
+        Names nm("");
+        Geom g{};
+        g.n_embd = D;
+        g.max_tok = T;
+        g.world = world;
+        g.rank = rank;
+        g.w_bf16 = true;
+        MoeFP8::Src src{};
+        src.router = "layers.3.ffn.gate.weight";
+        src.router_bias = "layers.3.ffn.gate.bias";
+        src.experts = "layers.3.ffn.experts";
+        src.expert_gate = "w1";
+        src.expert_up = "w3";
+        src.expert_down = "w2";
+        src.cfg.n_expert_all = NE;
+        src.cfg.n_expert = ne;
+        src.cfg.expert_base = rank * ne;
+        src.cfg.probed_expert = rank * ne;
+        src.cfg.top_k = K6;
+        src.cfg.n_ff_exp = F;
+        src.cfg.rows = T;
+        src.cfg.norm_topk = 1;
+        src.cfg.sigmoid_router = 1;
+        src.cfg.router_score = "sqrtsoftplus";
+        src.cfg.route_scale = 1.5;
+        src.cfg.swiglu_limit = 10.0;
+        src.cfg.calib = calib;
+        if (calib) calib_from_ctx(dir, 1000);
+        REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
+        CHECK_EQ(src.cfg.expert_mx, 1);
+        MoeFP8::Wire w{};
+        auto buf = [&](const char* name, uint32_t dt, int64_t rows, int64_t cols) {
+            return decl_b(&b, name, dt, { rows, cols });
+        };
+        w.h.x = buf("h", RAD_BF16, T, D);
+        REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", D), RAD_OK);   /* bf16 trunk: no codes */
+        CHECK_EQ(w.h.q, 0u);
+        w.logits = buf("logits", RAD_F32, T, NE);
+        w.ids = buf("ids", RAD_I32, T, K6);
+        w.ew = buf("ew", RAD_F32, T, K6);
+        w.eoff = decl_b(&b, "offset", RAD_I32, { NE + 1 });
+        w.ecnt = decl_b(&b, "count", RAD_I32, { NE });
+        w.sorted = decl_b(&b, "sorted", RAD_I32, { T * K6 });
+        w.egu = buf("gate_up", RAD_BF16, T * K6, 2 * F);
+        w.eff.x = buf("ff", RAD_BF16, T * K6, F);
+        w.edn = buf("down", RAD_BF16, T * K6, D);
+        MoeFP8 moe;
+        REQUIRE_EQ(moe.declare(&b, nm, g, 3, w, src, false, false), RAD_OK);
+        if (calib) calib_from_ctx(nullptr, 0);
+        CHECK(moe.mx_own);
+        REQUIRE(moe.mx_a.q != 0 && moe.mx_a.s != 0 && moe.mx_d.q != 0 && moe.mx_d.s != 0);
+        CHECK_EQ(b.bufs[moe.mx_a.q - 1].d.dtype, RAD_F8E4M3);
+        CHECK_EQ(b.bufs[moe.mx_d.q - 1].d.dtype, RAD_F8E4M3);
+        const RecOp* q = b.op_of(moe.op_mxq);
+        REQUIRE(q != nullptr);
+        CHECK_EQ(q->op, std::string("quant_act_fp8"));
+        auto reads = [&](rad_op h, rad_buf x) {
+            const RecOp* o = b.op_of(h);
+            return o && std::find(o->reads.begin(), o->reads.end(), x) != o->reads.end();
+        };
+        CHECK(reads(moe.op_gu, moe.mx_a.q) && reads(moe.op_gu, moe.mx_a.s));
+        CHECK(reads(moe.op_dn, moe.mx_d.q) && reads(moe.op_dn, moe.mx_d.s));
+        CHECK_EQ(b.op_of(moe.op_gu)->op, std::string("moe_gemm_q"));
+        CHECK_EQ(b.op_of(moe.gq_exp.op)->op, std::string("swiglu_clamped"));
+        REQUIRE(moe.gq_exp.op_quant != 0u);
+        CHECK_EQ(b.op_of(moe.gq_exp.op_quant)->op, std::string("quant_act_fp8"));
+        if (calib) {
+            REQUIRE(moe.op_gram_gu != 0u && moe.op_gram_dn != 0u && moe.op_gram_dne != 0u);
+            CHECK(reads(moe.op_gram_gu, moe.mx_a.q));
+            CHECK(reads(moe.op_gram_dn, moe.mx_d.q));
+            CHECK(reads(moe.op_gram_dne, moe.mx_d.q));
+        }
+        if (calib) continue;   /* the tap's pass copies device scratch, which the fake has none of */
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.rank = rank;
+        ctx.world = world;
+        moe.pass(&ctx, 8, 0, 8);
+        const auto ops = issued_ops(b, ctx);
+        long iq = -1, igu = -1;
+        for (size_t i = 0; i < ops.size(); ++i) {
+            if (ops[i] == "quant_act_fp8" && iq < 0) iq = (long)i;
+            if (ops[i] == "moe_gemm_q" && igu < 0) igu = (long)i;
+        }
+        CHECK(iq >= 0 && igu > iq);
+        CHECK_EQ(std::count(ops.begin(), ops.end(), "quant_act_fp8"), 2);
+        CHECK_EQ(std::count(ops.begin(), ops.end(), "moe_gemm_q"), 2);
+    }
+}
