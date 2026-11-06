@@ -29738,6 +29738,185 @@ static void ar_hc_write_case(const Plugin& pl, const std::vector<int>& devs, con
     }
 }
 
+/* ------------------------------------------------------------------ ar_mhc_post_collapse_rmsnorm (fusion 2, 6.11.2026)
+ * The four-rank exact all-reduce of x with DeepSeek-V4.1's mhc_post_collapse_rmsnorm as its epilogue, against the pair it
+ * replaces: x folded in ascending rank order and rounded once (ar_vsum), then the single-card mhc_post_collapse_rmsnorm
+ * row over that x on the first card. Every rank's x, out, xc and y must be those bytes; each rank launches twice (the
+ * row counters reset themselves; the instance's seq advances). The streams, post / comb / pre and the gain are the same
+ * on every rank, as in the engine (the hyper-connection state is replicated); x is each rank's own partial. */
+struct ArPcn {
+    const RadKernelInfo* row = nullptr;
+    int rank = 0, dev = 0, world = 4;
+    int64_t M = 0, n = 0, hc = 4;
+    double eps = 1e-6;
+    void* inst = nullptr;
+    int rc_init = RAD_E_STATE, rc_launch = RAD_OK, rc_launch2 = RAD_OK;
+    std::vector<uint16_t> x_in, h0;
+    std::vector<float> post, comb, pre, w;
+    std::vector<uint16_t> x_out, o_out, xc_out, y_out, x_out2, o_out2, xc_out2, y_out2;
+};
+static void ar_pcn_worker(ArPcn* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+    std::vector<RadParam> ps = { PI("world_size", t->world), PI("M", t->M), PI("n", t->n), PI("hc", t->hc),
+                                 PF("eps", t->eps), PS("dtype", "bf16"), PI("wire", 0) };
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, t->world, &t->inst);
+    if (t->rc_init != RAD_OK) return;
+    const int64_t M = t->M, n = t->n, hc = t->hc;
+    const size_t xb = (size_t)(M * n * 2), hb = (size_t)(M * hc * n * 2);
+    void *x = nullptr, *h = nullptr, *po = nullptr, *cb = nullptr, *o = nullptr, *pre = nullptr, *xc = nullptr,
+         *w = nullptr, *y = nullptr;
+    bool mem = hipMalloc(&x, xb) == hipSuccess && hipMalloc(&h, hb) == hipSuccess &&
+               hipMalloc(&po, (size_t)(M * hc * 4)) == hipSuccess && hipMalloc(&cb, (size_t)(M * hc * hc * 4)) == hipSuccess &&
+               hipMalloc(&o, hb) == hipSuccess && hipMalloc(&pre, (size_t)(M * hc * 4)) == hipSuccess &&
+               hipMalloc(&xc, xb) == hipSuccess && hipMalloc(&w, (size_t)(n * 4)) == hipSuccess &&
+               hipMalloc(&y, xb) == hipSuccess;
+    if (!mem) { t->rc_launch = RAD_E_NOMEM; }
+    else {
+        st_memcpy(h, t->h0.data(), hb, hipMemcpyHostToDevice);
+        st_memcpy(po, t->post.data(), (size_t)(M * hc * 4), hipMemcpyHostToDevice);
+        st_memcpy(cb, t->comb.data(), (size_t)(M * hc * hc * 4), hipMemcpyHostToDevice);
+        st_memcpy(pre, t->pre.data(), (size_t)(M * hc * 4), hipMemcpyHostToDevice);
+        st_memcpy(w, t->w.data(), (size_t)(n * 4), hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = { T(x, RAD_BF16, { M, n }), T(h, RAD_BF16, { M, hc * n }), T(po, RAD_F32, { M, hc }),
+                                      T(cb, RAD_F32, { M, hc * hc }), T(o, RAD_BF16, { M, hc * n }),
+                                      T(pre, RAD_F32, { M, hc }), T(xc, RAD_BF16, { M, n }), T(w, RAD_F32, { n }),
+                                      T(y, RAD_BF16, { M, n }) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        a.instance = t->inst; a.rank = t->rank; a.world_size = t->world;
+        for (int rep = 0; rep < 2; ++rep) {
+            st_memcpy(x, t->x_in.data(), xb, hipMemcpyHostToDevice);
+            st_memset(o, 0, hb); st_memset(xc, 0, xb); st_memset(y, 0, xb);
+            st_stream_sync(nullptr);
+            int rc = t->row->launch(&a, nullptr);
+            if (rc == RAD_LINK_ENDED) rc = RAD_OK;   /* the release the engine's link gate takes */
+            st_stream_sync(nullptr);
+            (rep ? t->rc_launch2 : t->rc_launch) = rc;
+            std::vector<uint16_t>& xo = rep ? t->x_out2 : t->x_out;
+            std::vector<uint16_t>& oo = rep ? t->o_out2 : t->o_out;
+            std::vector<uint16_t>& co = rep ? t->xc_out2 : t->xc_out;
+            std::vector<uint16_t>& yo = rep ? t->y_out2 : t->y_out;
+            xo.resize((size_t)(M * n)); oo.resize((size_t)(M * hc * n)); co.resize((size_t)(M * n)); yo.resize((size_t)(M * n));
+            st_memcpy(xo.data(), x, xb, hipMemcpyDeviceToHost);
+            st_memcpy(oo.data(), o, hb, hipMemcpyDeviceToHost);
+            st_memcpy(co.data(), xc, xb, hipMemcpyDeviceToHost);
+            st_memcpy(yo.data(), y, xb, hipMemcpyDeviceToHost);
+        }
+    }
+    for (void* q : { x, h, po, cb, o, pre, xc, w, y }) if (q) st_free(q);
+}
+static void ar_mhc_pcn_case(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    const RadKernelInfo* ref = find(pl, "mhc_post_collapse_rmsnorm_bf16");
+    if (!row || !ref) { ok(name, false, row ? "mhc_post_collapse_rmsnorm_bf16 absent" : "row absent"); return; }
+    const int world = 4;
+    if ((int)devs.size() < world) { skip(name, "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, world)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
+    struct Shape { int64_t M, n, hc; double eps; };
+    const Shape shapes[] = { { 1, 5120, 4, 1e-20 }, { 6, 5120, 4, 1e-20 }, { 8, 5120, 4, 1e-6 }, { 33, 1024, 4, 1e-6 },
+                             { 5, 2048, 8, 1e-6 } };
+    const std::string nm(name);
+    for (const Shape& sh : shapes) {
+        const int64_t M = sh.M, n = sh.n, hc = sh.hc;
+        const std::string at = " M=" + std::to_string(M) + " n=" + std::to_string(n) + " hc=" + std::to_string(hc);
+        uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull) ^ ((uint64_t)n * 2654435761ull);
+        auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+        auto uf = [&](double lo, double hi) { return (float)(lo + (hi - lo) * (double)(rnd() % 1000001) / 1000000.0); };
+        std::vector<uint16_t> h0((size_t)(M * hc * n));
+        std::vector<float> post((size_t)(M * hc)), comb((size_t)(M * hc * hc)), pre((size_t)(M * hc)), w((size_t)n);
+        for (auto& v : h0) v = h_to_bf16(uf(-2.0, 2.0));
+        for (auto& v : post) v = uf(-1.0, 1.0);
+        for (auto& v : comb) v = uf(-0.5, 0.5);
+        for (auto& v : pre) v = uf(0.0, 1.0);
+        for (auto& v : w) v = uf(0.9, 1.1);
+        std::vector<ArPcn> t((size_t)world);
+        std::vector<std::thread> th;
+        for (int r = 0; r < world; ++r) {
+            ArPcn& x = t[(size_t)r];
+            x.row = row; x.rank = r; x.dev = devs[(size_t)r]; x.world = world; x.M = M; x.n = n; x.hc = hc;
+            x.eps = sh.eps; x.h0 = h0; x.post = post; x.comb = comb; x.pre = pre; x.w = w;
+            x.x_in.resize((size_t)(M * n));
+            for (int64_t i = 0; i < M * n; ++i) x.x_in[(size_t)i] = h_to_bf16(ar_pattern_value(r, i));
+            th.emplace_back(ar_pcn_worker, &x);
+        }
+        for (std::thread& x : th) x.join();
+        bool up = true, ran = true;
+        std::string rcs;
+        for (const ArPcn& x : t) {
+            up = up && x.rc_init == RAD_OK; ran = ran && x.rc_launch == RAD_OK && x.rc_launch2 == RAD_OK;
+            rcs += std::to_string(x.rc_init) + "/" + std::to_string(x.rc_launch) + "/" + std::to_string(x.rc_launch2) + " ";
+        }
+        ok((nm + at + " init (peer rendezvous)").c_str(), up, "init/launch/launch2 rc " + rcs);
+        if (!up) return;
+        ok((nm + at + " launch twice").c_str(), ran, "init/launch/launch2 rc " + rcs);
+        if (!ran) { if (row->fini) for (ArPcn& x : t) if (x.inst) row->fini(x.inst); continue; }
+        /* the fold, ascending rank, rounded once -- ar_vsum */
+        std::vector<uint16_t> xf((size_t)(M * n));
+        for (int64_t i = 0; i < M * n; ++i) {
+            float acc = 0.0f;
+            for (int r = 0; r < world; ++r) acc += h_bf16(t[(size_t)r].x_in[(size_t)i]);
+            xf[(size_t)i] = h_to_bf16(acc);
+        }
+        /* the single-card row over the folded x on the first card */
+        std::vector<uint16_t> o_ref((size_t)(M * hc * n)), xc_ref((size_t)(M * n)), y_ref((size_t)(M * n));
+        int rc_ref = RAD_E_STATE;
+        {
+            (void)st_set_device(devs[0]);
+            const size_t xb = (size_t)(M * n * 2), hb = (size_t)(M * hc * n * 2);
+            void *x = nullptr, *h = nullptr, *po = nullptr, *cb = nullptr, *o = nullptr, *pr = nullptr, *xc = nullptr,
+                 *wv = nullptr, *y = nullptr;
+            const bool mem = hipMalloc(&x, xb) == hipSuccess && hipMalloc(&h, hb) == hipSuccess &&
+                             hipMalloc(&po, (size_t)(M * hc * 4)) == hipSuccess &&
+                             hipMalloc(&cb, (size_t)(M * hc * hc * 4)) == hipSuccess && hipMalloc(&o, hb) == hipSuccess &&
+                             hipMalloc(&pr, (size_t)(M * hc * 4)) == hipSuccess && hipMalloc(&xc, xb) == hipSuccess &&
+                             hipMalloc(&wv, (size_t)(n * 4)) == hipSuccess && hipMalloc(&y, xb) == hipSuccess;
+            if (mem) {
+                st_memcpy(x, xf.data(), xb, hipMemcpyHostToDevice);
+                st_memcpy(h, h0.data(), hb, hipMemcpyHostToDevice);
+                st_memcpy(po, post.data(), (size_t)(M * hc * 4), hipMemcpyHostToDevice);
+                st_memcpy(cb, comb.data(), (size_t)(M * hc * hc * 4), hipMemcpyHostToDevice);
+                st_memcpy(pr, pre.data(), (size_t)(M * hc * 4), hipMemcpyHostToDevice);
+                st_memcpy(wv, w.data(), (size_t)(n * 4), hipMemcpyHostToDevice);
+                std::vector<RadTensor> ts = { T(x, RAD_BF16, { M, n }), T(h, RAD_BF16, { M, hc * n }),
+                                              T(po, RAD_F32, { M, hc }), T(cb, RAD_F32, { M, hc * hc }),
+                                              T(o, RAD_BF16, { M, hc * n }), T(pr, RAD_F32, { M, hc }),
+                                              T(xc, RAD_BF16, { M, n }), T(wv, RAD_F32, { n }), T(y, RAD_BF16, { M, n }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("hc", hc), PF("eps", sh.eps), PS("dtype", "bf16") };
+                RadArgs a;
+                std::memset(&a, 0, sizeof(a));
+                a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+                rc_ref = ref->launch(&a, nullptr);
+                st_stream_sync(nullptr);
+                st_memcpy(o_ref.data(), o, hb, hipMemcpyDeviceToHost);
+                st_memcpy(xc_ref.data(), xc, xb, hipMemcpyDeviceToHost);
+                st_memcpy(y_ref.data(), y, xb, hipMemcpyDeviceToHost);
+            }
+            for (void* q : { x, h, po, cb, o, pr, xc, wv, y }) if (q) st_free(q);
+        }
+        ok((nm + at + " reference (mhc_post_collapse_rmsnorm_bf16 on the first card)").c_str(), rc_ref == RAD_OK,
+           "rc " + std::to_string(rc_ref));
+        int64_t bx = 0, bo = 0, bc = 0, by = 0, rep2 = 0;
+        for (const ArPcn& x : t) {
+            for (int64_t i = 0; i < M * n; ++i) {
+                bx += x.x_out[(size_t)i] != xf[(size_t)i];
+                bc += x.xc_out[(size_t)i] != xc_ref[(size_t)i];
+                by += x.y_out[(size_t)i] != y_ref[(size_t)i];
+            }
+            for (int64_t i = 0; i < M * hc * n; ++i) bo += x.o_out[(size_t)i] != o_ref[(size_t)i];
+            rep2 += x.x_out2 != x.x_out || x.o_out2 != x.o_out || x.xc_out2 != x.xc_out || x.y_out2 != x.y_out;
+        }
+        char d[200];
+        std::snprintf(d, sizeof d, "x %lld, out %lld, xc %lld, y %lld elements differ over 4 ranks; %lld ranks' second "
+                      "launch differs from their first", (long long)bx, (long long)bo, (long long)bc, (long long)by,
+                      (long long)rep2);
+        ok((nm + at + ": every rank holds the folded x and the unfused mhc_post_collapse_rmsnorm's out, xc and y, "
+                   "byte for byte, twice").c_str(),
+           bx == 0 && bo == 0 && bc == 0 && by == 0 && rep2 == 0, d);
+        if (row->fini) for (ArPcn& x : t) if (x.inst) row->fini(x.inst);
+    }
+}
+
 /* ------------------------------------------------------------------ the fused junction (ar_rmsnorm_quant_i8) */
 /* The all-reduce with the sandwich-norm junction as its epilogue, at two ranks
  * (ar_rmsnorm_quant_i8) and at four (ar_rmsnorm_quant_i8_4rank), against the chain it replaces:
@@ -33846,6 +34025,12 @@ static void device_phase(const Plugin& pl) {
             ar_hc_write_case(pl, devs, n.c_str(), std::strstr(base, "4rank") ? 4 : 2,
                              std::strstr(base, "gather") != nullptr);
         }
+    }
+    /* DeepSeek-V4.1's fused all-reduce + mhc_post_collapse_rmsnorm (four ranks, exact wire). */
+    if (sel("ar_mhc_post_collapse_rmsnorm_4rank")) {
+        if (!g_case) std::printf("\ncross-rank, fused with mhc_post_collapse_rmsnorm\n");
+        std::printf("  ar_mhc_post_collapse_rmsnorm_4rank\n");
+        ar_mhc_pcn_case(pl, devs, "ar_mhc_post_collapse_rmsnorm_4rank");
     }
     /* The wide rows at every width are dispatched above and skip themselves, naming the width
      * they need, on a box with fewer cards. */

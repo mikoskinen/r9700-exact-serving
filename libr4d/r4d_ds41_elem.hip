@@ -20,6 +20,7 @@
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_ds41_pcn.h"
 #include "r4d_moe_sort.h"
 #include "r4d_plugin.h"
 
@@ -2287,95 +2288,22 @@ int collapse_norm_body(const RadArgs* a, RadStream stream) {
  * threads closes with r4d_wave_sum (run on real lanes), the wave sums are added from zero in order, then rsqrtf and
  * y = f32_to_bf16(xv * s * (g + wadd) * mult). Same values in the same order: post_collapse_norm_kernel's bytes, at any
  * nb and block width. Here without the collective (x is the reduced input); tests/r4d_emu holds it to the norm kernel. */
-template <bool WF32, int HCM>
-__global__ __launch_bounds__(256) void pcn_words_kernel(
-    const uint16_t* __restrict__ xin, long xp, const uint16_t* __restrict__ h, long hp,
-    const float* __restrict__ post, long ptp, const float* __restrict__ comb, long cbp,
-    uint16_t* __restrict__ out, long op, const float* __restrict__ pre, long pp, long pst,
-    uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w, uint16_t* __restrict__ y,
-    uint32_t y_ld, uint32_t n, int hc, float eps, float wadd, float mult, uint32_t M, unsigned* ctr,
-    int thr_v) {
+template <int HCM>
+__global__ __launch_bounds__(256) void pcn_words_kernel(const uint16_t* __restrict__ xin, long xp,
+                                                        r4d_ds41pcn::PcnArgs A) {
     __shared__ float vss[1024];          // the virtual threads' partial sums (THR <= 1024)
     __shared__ float wsum[32];
     __shared__ unsigned s_done;
-    const uint32_t wpr = n / 8, words = M * wpr, nb = gridDim.x, b = blockIdx.x, nt = 256;
+    const uint32_t wpr = A.n / 8, words = A.M * wpr, nb = gridDim.x, b = blockIdx.x, nt = 256;
     const uint32_t wd = (words + nb - 1) / nb, w0 = b * wd, w1 = min(words, w0 + wd);
     for (uint32_t k = w0 + threadIdx.x; k < w1; k += nt) {
         const uint32_t m = k / wpr, i0 = (k - m * wpr) * 8;
-        const float* pr = pre + (long)m * pp;
-        float pj[HCM], pk[HCM], cb[HCM][HCM];
+        uint16_t xw[8];
 #pragma unroll
-        for (int q = 0; q < HCM; ++q) {
-            const int kk = q < hc ? q : hc - 1;
-            pj[q] = pr[(long)kk * pst];
-            pk[q] = post[(long)m * ptp + kk];
-#pragma unroll
-            for (int j = 0; j < HCM; ++j) cb[j][q] = comb[(long)m * cbp + (j < hc ? j : hc - 1) * hc + kk];
-        }
-#pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const uint32_t i = i0 + (uint32_t)e;
-            const uint16_t xi = xin[(long)m * xp + i];
-            uint16_t hv[HCM];
-#pragma unroll
-            for (int j = 0; j < HCM; ++j) hv[j] = h[(long)m * hp + (long)(j < hc ? j : hc - 1) * n + i];
-            float v = 0;
-#pragma unroll
-            for (int q = 0; q < HCM; ++q) {
-                if (q >= hc) continue;
-                float u = 0;
-#pragma unroll
-                for (int j = 0; j < HCM; ++j)
-                    if (j < hc) u += cb[j][q] * bf16_to_f32(hv[j]);
-                u += pk[q] * bf16_to_f32(xi);
-                const uint16_t o = f32_to_bf16(u);
-                out[(long)m * op + (long)q * n + i] = o;
-                v += pj[q] * ds_bf(o);
-            }
-            x[(size_t)m * x_ld + i] = ds_bf16(v);
-        }
+        for (int e = 0; e < 8; ++e) xw[e] = xin[(long)m * xp + i0 + (uint32_t)e];
+        r4d_ds41pcn::pcn_word<HCM>(A, m, i0, xw);
     }
-    if (w0 >= w1) return;
-    __threadfence();   // this block's xc and out, device-wide, before its arrivals
-    __syncthreads();
-    const uint32_t m0 = w0 / wpr, m1 = (w1 - 1) / wpr;
-    for (uint32_t m = m0; m <= m1; ++m) {
-        const uint32_t a0 = max(w0, m * wpr), a1 = min(w1, (m + 1) * wpr), mine = a1 - a0;
-        if (threadIdx.x == 0) {
-            const unsigned old = __hip_atomic_fetch_add(&ctr[m], mine, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
-            s_done = old + mine == wpr ? 1u : 0u;
-            if (s_done) __hip_atomic_store(&ctr[m], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-        }
-        __syncthreads();
-        if (s_done) {
-            __threadfence();   // the other blocks' xc words of this row
-            const uint16_t* xr = x + (size_t)m * x_ld;
-            for (int v = (int)threadIdx.x; v < thr_v; v += (int)nt) {
-                float ss = 0.0f;
-                for (uint32_t i = (uint32_t)v; i < n; i += (uint32_t)thr_v) {
-                    const float xv = bf16_to_f32(xr[i]);
-                    ss += xv * xv;
-                }
-                vss[v] = ss;
-            }
-            __syncthreads();
-            const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, nwv = thr_v / 32;
-            for (int vw = wave; vw < nwv; vw += (int)(nt / 32)) {
-                const float t = r4d_wave_sum(vss[vw * 32 + lane]);
-                if (lane == 0) wsum[vw] = t;
-            }
-            __syncthreads();
-            float sum = 0.0f;
-            for (int q = 0; q < nwv; ++q) sum += wsum[q];
-            const float sc = rsqrtf(sum / (float)n + eps);
-            uint16_t* yr = y + (size_t)m * y_ld;
-            for (uint32_t i = threadIdx.x; i < n; i += nt) {
-                const float g = WF32 ? ((const float*)w)[i] : bf16_to_f32(((const uint16_t*)w)[i]);
-                yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * sc * (g + wadd) * mult);
-            }
-        }
-        __syncthreads();
-    }
+    r4d_ds41pcn::pcn_arrive(A, w0, w1, nt, vss, wsum, &s_done);
 }
 
 /* tests: post_collapse_norm_body's operands, the epilogue form over `nb` blocks of 256 (ctr: M zeroed words) */
@@ -2390,19 +2318,22 @@ int pcn_words_body(const RadArgs* a, RadStream stream, int nb, unsigned* ctr) {
     const long long y_ld = r4d_rows_pitch(&y, n, &My);
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
     const float mult = (float)r4d_getf(a, "mult", 1.0);
-    const int thr = r4d_act_threads((int)rows, (int)n);
-#define PCNW(WF, HM)                                                                                \
-    return R4D_EMIT(stream, (pcn_words_kernel<WF, HM>), dim3((unsigned)nb), dim3(256), 0,           \
-                    (const uint16_t*)xi.data, (long)xi.stride[0], (const uint16_t*)h.data,          \
-                    (long)h.stride[0], (const float*)po.data, (long)po.stride[0],                   \
-                    (const float*)cb.data, (long)cb.stride[0], (uint16_t*)o.data, (long)o.stride[0], \
-                    (const float*)pre.data, (long)pre.stride[0], (long)pre.stride[1], (uint16_t*)x.data, \
-                    (uint32_t)x.stride[0], (const void*)w.data, (uint16_t*)y.data, (uint32_t)y_ld,  \
-                    (uint32_t)n, (int)hc, eps, wadd, mult, (uint32_t)rows, ctr, thr)
-    if (w.dtype == RAD_F32) { if (hc <= 4) PCNW(true, 4); PCNW(true, 8); }
-    if (hc <= 4) PCNW(false, 4);
-    PCNW(false, 8);
-#undef PCNW
+    r4d_ds41pcn::PcnArgs A{};
+    A.h = (const uint16_t*)h.data; A.hp = (long)h.stride[0];
+    A.post = (const float*)po.data; A.ptp = (long)po.stride[0];
+    A.comb = (const float*)cb.data; A.cbp = (long)cb.stride[0];
+    A.out = (uint16_t*)o.data; A.op = (long)o.stride[0];
+    A.pre = (const float*)pre.data; A.pp = (long)pre.stride[0]; A.pst = (long)pre.stride[1];
+    A.xc = (uint16_t*)x.data; A.x_ld = (uint32_t)x.stride[0];
+    A.w = w.data; A.wf32 = w.dtype == RAD_F32 ? 1 : 0;
+    A.y = (uint16_t*)y.data; A.y_ld = (uint32_t)y_ld;
+    A.n = (uint32_t)n; A.M = (uint32_t)rows; A.hc = (int)hc; A.thr_v = r4d_act_threads((int)rows, (int)n);
+    A.eps = eps; A.wadd = wadd; A.mult = mult; A.ctr = ctr;
+    if (hc <= 4)
+        return R4D_EMIT(stream, (pcn_words_kernel<4>), dim3((unsigned)nb), dim3(256), 0, (const uint16_t*)xi.data,
+                        (long)xi.stride[0], A);
+    return R4D_EMIT(stream, (pcn_words_kernel<8>), dim3((unsigned)nb), dim3(256), 0, (const uint16_t*)xi.data,
+                    (long)xi.stride[0], A);
 }
 
 int post_collapse_norm_body(const RadArgs* a, RadStream stream) {

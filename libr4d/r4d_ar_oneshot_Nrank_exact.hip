@@ -17,6 +17,7 @@
 #include <cstring>
 #include "r4d_ar_wide.h"
 #include "r4d_ar_hc.h"      // the gather and hc write words, shared with the two-rank fused forms
+#include "r4d_ds41_pcn.h"   // DeepSeek-V4.1's mhc_post_collapse_rmsnorm as an epilogue (ar_mhc_post_collapse_rmsnorm)
 #include <stdexcept>
 #include <string>
 
@@ -183,6 +184,78 @@ __global__ void r4d_ar_hc_write_wide_kernel(
     r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
                          reinterpret_cast<const unsigned short*>(&v));
   }
+}
+
+// The same one-shot with DeepSeek-V4.1's mhc_post -> mhc_collapse -> rmsnorm as its epilogue (ar_mhc_post_collapse_rmsnorm),
+// bf16 only. Up to and including the reduce it is r4d_ar_hc_write_wide_kernel step for step (seq take, push, handshake
+// 2*s, link_landed, the (parity, source) slots, the block partition, ar_vsum stored in place), so it shares an instance
+// and a stream with the plain all-reduce. Then each word's out and xc as post_collapse_norm_kernel forms them, and the
+// row's last arriving block runs the norm (r4d_ds41_pcn.h): the separate pair's bytes. The epilogue waits for nothing
+// (atomic counters, never polled); the only wait is the one-shot's own handshake, bounded by R4D_AR_SPIN_MAX.
+template <int WS, int HCM>
+__global__ void r4d_ar_mhc_pcn_wide_kernel(
+    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs, r4d_ds41pcn::PcnArgs A, int n16,
+    int slot_stride16, int rank, int drain, int acq, int pub, long long* gate, unsigned int* gate_ctr) {
+  constexpr int NPEERS = WS - 1;
+
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ unsigned int s_seq, s_slot, s_done;
+  __shared__ float vss[1024];
+  __shared__ float wsum[32];
+  const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);  // device-resident, replay-safe
+  const unsigned int s = s_seq;
+  const int parity = (int)s_slot;
+
+  const int w = (n16 + nb - 1) / nb;
+  const int start = b * w;
+  int end = start + w; if (end > n16) end = n16;
+
+  int4* ps[NPEERS];
+#pragma unroll
+  for (int p = 0; p < NPEERS; ++p)
+    ps[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride16;
+
+  {
+    int k = start + tid;
+    for (; k + 3 * nt < end; k += 4 * nt) {
+      const int4 v0 = y4[k], v1 = y4[k + nt], v2 = y4[k + 2 * nt], v3 = y4[k + 3 * nt];
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) {
+        ps[p][k] = v0; ps[p][k + nt] = v1; ps[p][k + 2 * nt] = v2; ps[p][k + 3 * nt] = v3;
+      }
+    }
+    for (; k < end; k += nt) {
+      const int4 v = y4[k];
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) ps[p][k] = v;
+    }
+  }
+
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+  // As ar_hc_write's: the reduce and the epilogue are local VRAM traffic, so the hold ends here.
+  r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
+
+  const int4* src[WS];
+#pragma unroll
+  for (int r = 0; r < WS; ++r)
+    src[r] = (r == rank) ? (const int4*)y4
+                         : (my_base + ((size_t)parity * WS + r) * (size_t)slot_stride16);
+
+  const int wpr = (int)(A.n >> 3);       // 16B words a row
+  for (int k = start + tid; k < end; k += nt) {
+    const int4 v = ar_vsum<__hip_bfloat16, 8, WS>(src, k);
+    y4[k] = v;
+    const int row = k / wpr, i0 = (k - row * wpr) * 8;
+    const unsigned short* ve = reinterpret_cast<const unsigned short*>(&v);
+    uint16_t xw[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) xw[e] = ve[e];
+    r4d_ds41pcn::pcn_word<HCM>(A, (uint32_t)row, (uint32_t)i0, xw);
+  }
+  r4d_ds41pcn::pcn_arrive(A, start < end ? (uint32_t)start : 0u, start < end ? (uint32_t)end : 0u,
+                          (uint32_t)nt, vss, wsum, &s_done);
 }
 
 // The same write with the MoE gather as its prologue, bf16 only; the four-rank form of the two-rank
@@ -466,6 +539,69 @@ void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scr
   ar_hc_write_wide_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, y, inj, h,
                              M, n, hc, irow, hrow, rank, stream, nblocks, nthreads, drain, acq,
                              pub, gate, gate_ctr);
+}
+
+// ar_hc_write_wide_launch's checks for ar_mhc_post_collapse_rmsnorm (four ranks, exact wire). `y` is the message, reduced
+// in place; h, post, comb, out, pre, xc, w, y_norm are post_collapse_norm_kernel's operands; ctr M zeroed row counters.
+void r4d_ar_mhc_pcn_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                          long peer_flags0, long peer_flags1, long peer_flags2,
+                          long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                          long y, long M, long n, long hc, long h, long hrow, long post, long ptp, long comb,
+                          long cbp, long out, long orow, long pre, long pp, long pst, long xc, long xrow,
+                          long wgt, long wf32, long ynorm, long yrow, double eps, long ctr, long rank,
+                          long stream_i, long nblocks, long nthreads, long drain, long acq, long pub,
+                          long gate, long gate_ctr) {
+  constexpr int WS = 4, NPEERS = 3;
+  if (rank < 0 || rank >= WS) throw std::runtime_error("ar_mhc_pcn: rank out of range for four ranks");
+  if (M <= 0 || n <= 0 || n % 8 || n > 16384) throw std::runtime_error("ar_mhc_pcn: n must be a positive multiple of 8");
+  if (hc < 2 || hc > 8) throw std::runtime_error("ar_mhc_pcn: hc 2..8");
+  if (!ctr) throw std::runtime_error("ar_mhc_pcn: no row counters");
+  const long n16l = M * n / 8;
+  if (n16l > (long)slot_stride16)
+    throw std::runtime_error("ar_mhc_pcn: message (" + std::to_string(n16l) +
+                             " 16B words) exceeds the per-source slot stride (" + std::to_string(slot_stride16) + ")");
+  const int n16 = (int)n16l;
+  int nb = (int)nblocks;
+  if (nb < 1) nb = R4D_AR_NB_DESIGN;
+  if (nb > n16) nb = n16;
+  if (nb > R4D_AR_WIDE_MAX_BLOCKS) nb = R4D_AR_WIDE_MAX_BLOCKS;
+  int nt = (int)nthreads;
+  if (nt < 64) nt = 64;
+  if (nt > 1024) nt = 1024;
+  nt = nt / 32 * 32;
+  const long ps_[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const long pf_[3] = {peer_flags0, peer_flags1, peer_flags2};
+  R4DArWidePeers<int4, NPEERS> peers{};
+  for (int i = 0; i < NPEERS; ++i) {
+    if (!ps_[i] || !pf_[i]) throw std::runtime_error("ar_mhc_pcn: null peer scratch/flag pointer");
+    peers.scratch[i] = (int4*)ps_[i];
+    peers.flags[i] = (unsigned int*)pf_[i];
+    peers.rank[i] = (i < (int)rank) ? i : i + 1;
+  }
+  const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
+  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
+  r4d_ar_check_extent(my_scratch, slot_bytes, "ar_mhc_pcn", "my_scratch");
+  r4d_ar_check_extent(my_flags, flag_bytes, "ar_mhc_pcn", "my_flags");
+  r4d_ar_check_extent(seq_ctrs, 2L * R4D_AR_WIDE_MAX_BLOCKS * (long)sizeof(unsigned int), "ar_mhc_pcn", "seq_ctrs");
+  for (int i = 0; i < NPEERS; ++i) {
+    r4d_ar_check_extent(ps_[i], slot_bytes, "ar_mhc_pcn", "peer scratch");
+    r4d_ar_check_extent(pf_[i], flag_bytes, "ar_mhc_pcn", "peer flags");
+  }
+  r4d_ds41pcn::PcnArgs A{};
+  A.h = (const uint16_t*)h; A.hp = hrow; A.post = (const float*)post; A.ptp = ptp;
+  A.comb = (const float*)comb; A.cbp = cbp; A.out = (uint16_t*)out; A.op = orow;
+  A.pre = (const float*)pre; A.pp = pp; A.pst = pst; A.xc = (uint16_t*)xc; A.x_ld = (uint32_t)xrow;
+  A.w = (const void*)wgt; A.wf32 = (int)wf32; A.y = (uint16_t*)ynorm; A.y_ld = (uint32_t)yrow;
+  A.n = (uint32_t)n; A.M = (uint32_t)M; A.hc = (int)hc; A.thr_v = r4d_act_threads((int)M, (int)n);
+  A.eps = (float)eps; A.wadd = 0.0f; A.mult = 1.0f; A.ctr = (unsigned*)ctr;
+  hipStream_t st = (hipStream_t)stream_i;
+#define R4D_AR_PCN(HM)                                                                                       \
+  r4d_ar_mhc_pcn_wide_kernel<WS, HM><<<nb, nt, 0, st>>>(                                                     \
+      (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs, A, n16,    \
+      (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, (long long*)gate, (unsigned int*)gate_ctr)
+  if (hc <= 4) R4D_AR_PCN(4);
+  else R4D_AR_PCN(8);
+#undef R4D_AR_PCN
 }
 
 // ar_hc_write_wide_launch's checks plus the gather's, and the two-rank gather's grid rule: enough

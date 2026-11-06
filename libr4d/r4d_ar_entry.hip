@@ -1919,6 +1919,62 @@ extern "C" int r4d_rad_ar_hc_write(const RadArgs* a, RadStream s) {
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
+/* ---- ar_mhc_post_collapse_rmsnorm: the four-rank exact all-reduce of x, then DeepSeek-V4.1's mhc_post_collapse_rmsnorm
+ * over the reduced x, in one kernel (r4d_ar_oneshot_Nrank_exact.hip r4d_ar_mhc_pcn_wide_kernel; r4d_ds41_pcn.h).
+ * Operands: mhc_post_collapse_rmsnorm's, with x the message (inout): [0] x [1] h [2] post [3] comb [4] out [5] pre
+ * [6] xc [7] w [8] y. The block count is the plain one-shot's rule, so the two share an instance. The row counters
+ * are a split_ctr block of this stream and xc (zero, kept zero by each row's last arriver). */
+enum { AP_X = 0, AP_H, AP_POST, AP_COMB, AP_OUT, AP_PRE, AP_XC, AP_W, AP_Y };
+unsigned int* r4d_8a8_split_ctr(RadStream s, const void* out);
+extern "C" int r4d_rad_ar_mhc_pcn_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 4) return RAD_E_SHAPE;
+    if (in->dtype != 0) return RAD_E_DTYPE;
+    if ((int)r4d_geti_or(a, "wire", 0) != 0) return RAD_E_UNSUPPORTED;
+    const RadTensor *x = r4d_opt(a, AP_X), *h = r4d_opt(a, AP_H), *po = r4d_opt(a, AP_POST),
+                    *cb = r4d_opt(a, AP_COMB), *o = r4d_opt(a, AP_OUT), *pre = r4d_opt(a, AP_PRE),
+                    *xc = r4d_opt(a, AP_XC), *w = r4d_opt(a, AP_W), *y = r4d_opt(a, AP_Y);
+    if (!x || !h || !po || !cb || !o || !pre || !xc || !w || !y) return RAD_E_INVAL;
+    if (x->rank != 2) return RAD_E_SHAPE;
+    const long long M = x->shape[0], n = x->shape[1], hc = r4d_geti_or(a, "hc", 0);
+    if (M < 1 || M > 65535 || n < 8 || n % 8 || n > 16384 || hc < 2 || hc > 8) return RAD_E_SHAPE;
+    if (M * n > in->max_numel) return RAD_E_SHAPE;
+    if (x->dtype != RAD_BF16 || h->dtype != RAD_BF16 || o->dtype != RAD_BF16 || xc->dtype != RAD_BF16 ||
+        y->dtype != RAD_BF16 || po->dtype != RAD_F32 || cb->dtype != RAD_F32 || pre->dtype != RAD_F32 ||
+        (w->dtype != RAD_F32 && w->dtype != RAD_BF16))
+        return RAD_E_DTYPE;
+    if (!r4d_contig(x) || !r4d_aligned(x->data, 16)) return RAD_E_STRIDE;
+    if (h->rank != 2 || h->shape[0] < M || h->shape[1] != hc * n || o->rank != 2 || o->shape[0] < M ||
+        o->shape[1] != hc * n || o->data == h->data || po->shape[0] < M || cb->shape[0] < M ||
+        pre->rank != 2 || pre->shape[0] < M || xc->rank != 2 || xc->shape[0] < M || xc->shape[1] != n ||
+        y->shape[0] < M || r4d_numel(w) < n || !r4d_contig(w))
+        return RAD_E_SHAPE;
+    const long long hrow = r4d_row_pitch(h), orow = r4d_row_pitch(o), prow = r4d_row_pitch(po),
+                    crow = r4d_row_pitch(cb), xrow = r4d_row_pitch(xc), yrow = r4d_row_pitch(y);
+    if (hrow < 0 || orow < 0 || prow < 0 || crow < 0 || xrow < 0 || yrow < 0) return RAD_E_STRIDE;
+    unsigned int* ctr = r4d_8a8_split_ctr(s, xc->data);
+    if (!ctr || M > 8192) return RAD_E_STATE;   /* no counter block (or past its 8192 rows): the pair serves */
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    const long words16 = (long)(M * n * 2 / 16);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
+    R4D_TRY("ar_mhc_pcn_4rank",
+        r4d_ar_mhc_pcn_4rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                             in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                             r4d_addr(x), (long)M, (long)n, (long)hc, r4d_addr(h), (long)hrow, r4d_addr(po),
+                             (long)prow, r4d_addr(cb), (long)crow, r4d_addr(o), (long)orow, r4d_addr(pre),
+                             (long)pre->stride[0], (long)pre->stride[1], r4d_addr(xc), (long)xrow, r4d_addr(w),
+                             w->dtype == RAD_F32 ? 1L : 0L, r4d_addr(y), (long)yrow,
+                             r4d_getf(a, "eps", 1e-6), (long)(uintptr_t)ctr, (long)in->rank,
+                             (long)(uintptr_t)s, nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq, cfgv.pub,
+                             early, early ? in->gate_ctr : 0L));
+    return early ? RAD_LINK_ENDED : RAD_OK;
+}
+
 /* Four ranks, exact wire only: the wide one-shot with the write as its epilogue. The four-rank
  * lossy wire (the ti8 two-shot) has no fused form, so `wire` 6 is refused. Any message up to the
  * instance's bound is correct here as a one-shot; the architecture issues it on decode and verify
