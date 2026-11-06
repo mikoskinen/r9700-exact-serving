@@ -512,6 +512,9 @@ int     tape_record(RadTape t, int i, int* kind, uint32_t* queue) {
 int     tape_set_overlap(RadTape t, int i, bool on) {
     return dev()->tape_set_overlap ? dev()->tape_set_overlap(t, i, on ? 1 : 0) : RAD_E_UNSUPPORTED;
 }
+int     tape_set_noacq(RadTape t, int i, bool on) {
+    return dev()->tape_set_noacq ? dev()->tape_set_noacq(t, i, on ? 1 : 0) : RAD_E_UNSUPPORTED;
+}
 bool    dev_integrated(int device) { return dev()->integrated && dev()->integrated(device) > 0; }
 /* These getters answer "" on failure and restore the error slot, so the next
  * rad_dev_last_error reader does not see an unrelated error. `get` fills a buffer of `n` bytes. */
