@@ -2090,6 +2090,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 "a rank at most; RADIANCE_DS41_INDEX)",
              m.ikeep ? "on" : "off", m.isplit && m.sel_gather ? "on" : "off", (long long)m.irows,
              (long long)m.qmax);
+    /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
+    if (ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s, row split %s (runs of %lld rows, "
+                        "%lld a rank at most; RADIANCE_DS41_INDEX)\n",
+                m.ikeep ? "on" : "off", m.isplit && m.sel_gather ? "on" : "off", (long long)m.irows,
+                (long long)m.qmax);
     return RAD_OK;
 }
 

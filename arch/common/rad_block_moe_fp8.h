@@ -1995,6 +1995,13 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
      * changes the summation order of 1-2 token launches, not the weights or the activation format. */
     const bool x3sk = ep && g.world > 1 && exl3_splitk_on();
     if (x3sk) gp.push_back(RAD_INT("ep_ranks", g.world));
+    if (x3sk) {   /* once a process on stderr, so a serve log says the rules were asked for */
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "radiance: EXL3 experts: EP split-K rules on (RADIANCE_EXL3_SPLITK, ep_ranks %d)\n", g.world);
+        }
+    }
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
                {w.h.x, w.sorted, w.eoff}, {b_x3h});
     tables(false);
