@@ -240,7 +240,7 @@ __global__ void r4d_ar_gather_hc_write_wide_kernel(
       }
     }
     for (int x = tid; x < nrow * K; x += nt)
-      s_w[x] = bf2f(G.ew[(long)(row_lo + x / K) * G.ew_ld + x % K]);
+      s_w[x] = r4d_ar_gather_w(G, (long)(row_lo + x / K) * G.ew_ld + x % K);
     if (G.sh)
       for (int r = tid; r < nrow; r += nt) {
         const float v0 = bf2f(G.sg[(long)(row_lo + r) * G.sg_ld]);
@@ -555,7 +555,9 @@ static void ar_gather_hc_write_wide_launch(
   G.sh = (const unsigned short*)sh;
   G.sg = (const unsigned short*)sg;
   G.ye_ld = ye_ld; G.ew_ld = ew_ld; G.sh_ld = sh_ld; G.sg_ld = sg_ld;
-  G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)sig;
+  /* `sig` bit 0: the shared gate's sigmoid; bit 1: f32 slot weights (moe_gather_all_reduce over
+   * moe_gather's F32 form). ar_gather_hc_write passes 0 or 1. */
+  G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)(sig & 1); G.ew_f32 = (int)((sig >> 1) & 1);
 
   hipStream_t st = (hipStream_t)stream_i;
   if (by_inv) {
