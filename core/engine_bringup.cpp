@@ -1644,7 +1644,15 @@ void Engine::probe_arena_levels() {
     while (lo < rows_min) lo <<= 1;
     lo = std::max<int64_t>(lo, 256);
     std::vector<int64_t> want;
-    for (int64_t R = lo; R < cfg_.max_tok; R *= 4) want.push_back(R);
+    /* RADIANCE_ARENA_LEVEL_MAX (rows; unset or 0: every rung): the ladder stops at that many rows,
+     * the span's shared level apart. A rung just under the chunk (4096 at --max-num-batched-tokens
+     * 4160) lends almost nothing more than the full plan, but its steps find the prefill stager's
+     * ring lent (stager.h: the stager arms only above every smaller level), so the commonest lone
+     * prefill chunk runs unstaged; without the rung such a step takes the full plan and is staged. */
+    int64_t lv_max = 0;
+    if (const char* e = getenv("RADIANCE_ARENA_LEVEL_MAX"); e && *e) lv_max = std::max<int64_t>(0, std::atoll(e));
+    for (int64_t R = lo; R < cfg_.max_tok; R *= 4)
+        if (lv_max <= 0 || R <= lv_max) want.push_back(R);
     arena_span_rows_ = 0;
     const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
     if (span_rows >= lo && span_rows < cfg_.max_tok &&
