@@ -26,7 +26,13 @@ struct R4dArGather {
   const unsigned short* sg;   // [M, sg_ld] its gate, or null
   long ye_ld, ew_ld, sh_ld, sg_ld;
   int top_k, T, sig;
+  int ew_f32;                 // ew holds f32 weights (moe_gather's F32 form), else bf16
 };
+
+// A slot weight as moe_gather reads it: f32 as stored, or bf16 widened.
+__device__ __forceinline__ float r4d_ar_gather_w(const R4dArGather& G, long i) {
+  return G.ew_f32 ? reinterpret_cast<const float*>(G.ew)[i] : bf2f(G.ew[i]);
+}
 
 // One word of the gather: y[row][i0 .. i0+8) = sum over the row's slots, ascending, of
 // w[row][j] * y_expert[slot][i0 ..], rounded to bf16, with the shared arm folded in as moe_gather
@@ -59,10 +65,16 @@ __device__ __forceinline__ int4 r4d_ar_gather_word(const R4dArGather& G,
 #pragma unroll
     for (int u = 0; u < kU; ++u) {
       if (ii[u] < 0) continue;
-      const float wj = INV ? bf2f(G.ew[(long)row * G.ew_ld + j0 + u]) : s_w[r * K + j0 + u];
+      const float wj = INV ? r4d_ar_gather_w(G, (long)row * G.ew_ld + j0 + u) : s_w[r * K + j0 + u];
       const unsigned short* ve = reinterpret_cast<const unsigned short*>(&v[u]);
+      /* moe_gather's two forms: f32 weights fused (fmaf), bf16 weights multiplied then added. */
+      if (G.ew_f32) {
 #pragma unroll
-      for (int e = 0; e < 8; ++e) acc[e] += wj * bf2f(ve[e]);
+        for (int e = 0; e < 8; ++e) acc[e] = fmaf(wj, bf2f(ve[e]), acc[e]);
+      } else {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] += wj * bf2f(ve[e]);
+      }
     }
   }
   int4 out;

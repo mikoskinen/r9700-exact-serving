@@ -1789,7 +1789,10 @@ extern "C" int r4d_rad_moe_gather_ar_4rank(const RadArgs* a, RadStream s) {
     const long long ew_ld = r4d_rows_pitch(ew, top_k, &Mw);
     if (ye_ld < 0 || ew_ld < 0 || Te < T || Mw < M) return RAD_E_STRIDE;
     if (so->dtype != RAD_I32 || !r4d_contig(so) || r4d_numel(so) < T) return RAD_E_SHAPE;
-    if (ye->dtype != RAD_BF16 || ew->dtype != RAD_BF16) return RAD_E_DTYPE;
+    /* The slot weights as moe_gather takes them: bf16, or f32 (DeepSeek-V4.1's router writes f32;
+     * moe_gather then reads them as stored and fuses each product, gather_kernel<_, true>). */
+    if (ye->dtype != RAD_BF16 || (ew->dtype != RAD_BF16 && ew->dtype != RAD_F32)) return RAD_E_DTYPE;
+    const long ewf = ew->dtype == RAD_F32 ? 2L : 0L;   /* the launcher's `sig` bit 1 */
     if (ye_ld % 8 || !r4d_aligned(ye->data, 16)) return RAD_E_ALIGN;
     long long sh_ld = 0, sg_ld = 0, shrows = 0, sgrows = 0;
     int sig = 0;
@@ -1819,7 +1822,7 @@ extern "C" int r4d_rad_moe_gather_ar_4rank(const RadArgs* a, RadStream s) {
             r4d_addr(y), 0L, 0L, (long)M, (long)n, 0L, 0L, 0L,
             r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
             sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld,
-            (long)ew_ld, (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig,
+            (long)ew_ld, (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig | ewf,
             (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq,
             cfgv.pub, has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
             early ? in->gate_ctr : 0L));
