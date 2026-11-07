@@ -3998,8 +3998,15 @@ int Engine::start() {
              * guard, wherever that is below the region at the top (stager.h). */
             int64_t top_level = 0;
             r->arena_low_off = -1;
+            /* RADIANCE_STAGE_SPAN=0: no place at the span's shared level, so that level lends the ring's
+             * room to the expert slab too and its steps (every mixed step at --prefill-span) are not
+             * staged; only full-plan steps are. 79 (7.11.): with mixed steps unstaged (RADIANCE_STAGE_MIXED
+             * =0) the reserved room alone left them 2.6-4.2 % slower than without levels. Unset: as before. */
+            const char* sse = getenv("RADIANCE_STAGE_SPAN");
+            const bool span_place = !(sse && (!std::strcmp(sse, "0") || !std::strcmp(sse, "off")));
             for (const ArenaLevel& lv : r->arena_levels) {
                 if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
+                if (!span_place) continue;
                 const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
                                     RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
                 r->arena_low_off = std::min(off, r->program.arena_stage_off);
