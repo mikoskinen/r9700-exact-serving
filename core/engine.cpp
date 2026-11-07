@@ -1835,8 +1835,9 @@ void Engine::loan_tick(bool idle) {
  * prefill pass is armed by the size rule alone, stager.h).
  *   unset / 1  any pass the size rule admits
  *   0          none: a mixed step's routed GEMMs read the pool in place, as without the stager
- *   2          only one whose prefill chunk leaves more of its prompt for a later step (a long
- *              prompt beside decoding sequences), not a prompt's last or only chunk
+ *   2          only one whose prefill chunk leaves at least the stager's smallest pass of its prompt
+ *              for a later step (a long prompt beside decoding sequences), not a prompt's last or only
+ *              chunk
  * On DeepSeek-V4.1 EXL3 at four ranks (79, 7.11.) a lone chunk staged ran 42 % faster at 2.9 bpw,
  * a one-chunk prompt beside four decoders 8-12 % slower at both widths (the whole pooled set, 9-21
  * GB a rank, crosses the link by DMA for a ~1-2k-row step whose compute cannot hide it), and the
@@ -1849,6 +1850,14 @@ static int stage_mixed_mode() {
         if (!std::strcmp(e, "2") || !std::strcmp(e, "continues")) return 2;
         return 1;
     }();
+    /* Said once, at the first step that asks, so a serve log shows which rule ran. */
+    static const bool said = [] {
+        if (mode != 1)
+            RAD_INFO("prefill staging: a pass with decode rows is %s (RADIANCE_STAGE_MIXED=%d)",
+                     mode == 0 ? "never staged" : "staged only while its prompt continues", mode);
+        return true;
+    }();
+    (void)said;
     return mode;
 }
 
