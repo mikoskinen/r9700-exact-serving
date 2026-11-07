@@ -1963,7 +1963,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "values the model writes); run with --kv-cache-dtype bf16\n");
         return RAD_E_UNSUPPORTED;
     }
-    auto& slot = models[ctx->rank];
+    /* A sizing declare (RadBuildCtx::shape_probe, the core's arena levels) writes scratch: the
+     * step reads models[], filled by the real declare at the real max_tok, and the probes run on
+     * parallel threads. probe() offers them only where levels_ok(). */
+    static thread_local std::unique_ptr<Model> probe_model;
+    if (ctx->shape_probe && !models[ctx->rank]) return RAD_E_INVAL;   /* no real declare to size against */
+    auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];
     slot = std::make_unique<Model>();
     auto& m = *slot;
     m.nm = Names(ctx->scope);
@@ -1983,6 +1988,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.cmax = g.max_ctx / std::max<int64_t>(rmin, 1) + 1;
     index_runs(m);
     index_mode(m);
+    if (ctx->shape_probe) {
+        /* A level shrinks only what the step indexes by its own rows T. Everything the step
+         * addresses by a capacity of the real declare keeps the real size: the work plane m.work
+         * (comp_stage is written rows x r > T at a small step: at r 128 and 8 sequences a decode
+         * step's 9 blocks are 1152 stage rows), the score runs (irows), the split's parts
+         * (iparts, qmax: rank r's selections land at r x qmax x irows), the keep words. */
+        const Model& full = *models[ctx->rank];
+        m.work = full.work;
+        m.irows = full.irows;
+        m.iparts = full.iparts;
+        m.kwords = full.kwords;
+        m.ikeep = full.ikeep;
+        m.isplit = full.isplit;
+        m.qmax = full.qmax;
+    }
     DS_TRY(buffers(b, m));
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */
     if (m.dsp.on && !m.zero &&
@@ -2691,8 +2711,21 @@ static void step(RadCtx* x, const RadBatch* batch) {
     }
 }
 
+/* RADIANCE_DS41_LEVELS=1: offer the core's arena levels (RadArchProbe::shape_probe_ok), which lend
+ * the activation arena's idle top to the expert slab at small steps and arm the prefill stager
+ * (core/place/stager.h) -- placement only, so exact, provided no step writes past what a level
+ * keeps. Unset (today) or RADIANCE_DS41_CTAIL=full: refused, since the full compressor tail runs
+ * every step over the work plane's capacity rather than the step's rows. */
+static bool levels_ok() {
+    const char* e = std::getenv("RADIANCE_DS41_LEVELS");
+    if (!(e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")))) return false;
+    const char* ct = std::getenv("RADIANCE_DS41_CTAIL");
+    return !(ct && !std::strcmp(ct, "full"));
+}
+
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    if (levels_ok()) out->shape_probe_ok = 1;   /* declare() writes scratch under shape_probe */
     /* A DSpark drafter proposes the block it was trained at, every row predicting (block = depth). */
     const int64_t ns = gi(meta, "nextn_predict_layers", 0), blk = gi(meta, "dspark.block_size", 0);
     if (ns > 0 && blk > 0) {
