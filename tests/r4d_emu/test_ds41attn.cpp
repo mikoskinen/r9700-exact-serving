@@ -6,7 +6,7 @@
  * nvfp4 packs it (the kernel; libref's when loadable, byte for byte the kernel's), every packed entry
  * must unpack to the stored bf16 bits, and attn_sparse_sink with latent_format nvfp4 over the packed
  * cache must give the bf16 cache's output bit for bit in every form the op takes: the decode band's
- * kernels (one row: the direct-PV form; 40 rows: the tiled-PV form), the scalar kernel (a pass whose
+ * kernels (1-32 rows: the direct-PV forms, head groups 1-8; 40 rows: the tiled-PV form), the scalar kernel (a pass whose
  * q rows the WMMA form refuses) and the WMMA prefill form (64 rows); and libref the same. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -107,12 +107,13 @@ struct Fix {
     std::vector<float> sink;
 };
 
-Fix make(uint32_t seed, int H, int ratio, const std::vector<std::pair<int, int>>& seqs) {
+Fix make(uint32_t seed, int H, int ratio, const std::vector<std::pair<int, int>>& seqs, int topk = 64) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::uniform_int_distribution<int> pct(0, 99);
     Fix f;
     f.H = H;
+    f.topk = topk;
     f.ratio = ratio;
     f.S = (int)seqs.size();
     f.cu.push_back(0);
@@ -283,6 +284,13 @@ int main() {
     if (!ref.attn || !ref.store) std::printf("note: libref not loadable (set RADIANCE_HOME): its checks are skipped\n");
     /* decode band: one row (8 heads: the direct-PV form) */
     run_case("decode, 1 row, direct PV", make(31, 8, 1, { { 1, 3000 } }), 0, ref);
+    /* decode band, the other direct-PV forms (8 heads: 64, 128 and 256 row-heads -> head groups of
+     * 2, 4 and 8; the packed PV ring in 16-key slots and its fences, 7.11.), and one row at the
+     * model's 512 selections (16 packed blocks) */
+    run_case("decode, 8 rows, direct PV, head group 2", make(36, 8, 1, { { 8, 3001 } }), 0, ref);
+    run_case("decode, 16 rows, direct PV, head group 4, ratio 2", make(37, 8, 2, { { 4, 2000 }, { 12, 3500 } }), 0, ref);
+    run_case("decode, 32 rows, direct PV, head group 8", make(38, 8, 1, { { 32, 3999 } }), 0, ref);
+    run_case("decode, 1 row, direct PV, 512 selections", make(39, 8, 4, { { 1, 6000 } }, 512), 0, ref);
     /* decode band: 40 rows of two sequences, 8 heads (320 row-heads: the tiled-PV form), ratio 2 */
     run_case("decode, 40 rows, tiled PV, ratio 2", make(32, 8, 2, { { 8, 2600 }, { 32, 3999 } }), 0, ref);
     /* the scalar kernel: 50 rows whose q pitch (H D + 2) the WMMA form refuses */

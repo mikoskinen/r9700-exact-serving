@@ -1340,6 +1340,51 @@ __device__ __forceinline__ void ds_dec_dot_s(float (&acc)[HS], const uint4 (&r)[
     }
 }
 
+/* ds_dec_dot (QS false) or ds_dec_dot_s (QS) over a packed key's 64 columns, the raw code words and
+ * scale bytes of ds_nv4_ld64: each 8-column word is unpacked right before its fmas, behind the fence
+ * of the previous word's sums (ds_dec_step), so one word's bf16 is live at a time. Unpacking all 64
+ * columns ahead (ds_nv4_unpack64) held 32 more VGPRs beside the raw words and the hoisted q, and the
+ * 1024-thread forms spilled (7.11.). The same fmas in the same order: the same bits. */
+template <int HS, bool QS>
+__device__ __forceinline__ void ds_dec_dot_nv(float (&acc)[HS], const DsNv4Raw& r, const float* qp,
+                                              const uint32_t* qw, const int (&ho)[HS]) {
+    const uint32_t w8[8] = { r.c0.x, r.c0.y, r.c0.z, r.c0.w, r.c1.x, r.c1.y, r.c1.z, r.c1.w };
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t f[4] = { w8[i], (r.sc >> (8 * (i / 2))) & 0xffu, 0u, 0u };
+        const int z = ds_dec_step<HS>(acc, f);
+        const uint4 kv = ds_nv4_unpack8(f[0], ds_e4m3_f32(f[1]));
+        const uint32_t wk[4] = { kv.x, kv.y, kv.z, kv.w };
+        if constexpr (QS) {
+            const uint32_t* qi = qw + __builtin_amdgcn_readfirstlane(z) + i * 4;
+#pragma unroll
+            for (int h = 0; h < HS; ++h) {
+                const uint32_t* qh = qi + ho[h];
+                const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    acc[h] = __builtin_fmaf(bf16w_lo(qq[e]), bf16w_lo(wk[e]), acc[h]);
+                    acc[h] = __builtin_fmaf(bf16w_hi(qq[e]), bf16w_hi(wk[e]), acc[h]);
+                }
+            }
+        } else {
+            /* one head: q not behind the fence (64 hoisted floats, as ds_dec_dot); more: behind it */
+            const float* qi = qp + (HS == 1 ? 0 : z) + i * 8;
+#pragma unroll
+            for (int h = 0; h < HS; ++h) {
+                const float4 qa = *(const float4*)(qi + h * kDsAttnD);
+                const float4 qb = *(const float4*)(qi + h * kDsAttnD + 4);
+                const float qv[8] = { qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w };
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    acc[h] = __builtin_fmaf(qv[2 * e], bf16w_lo(wk[e]), acc[h]);
+                    acc[h] = __builtin_fmaf(qv[2 * e + 1], bf16w_hi(wk[e]), acc[h]);
+                }
+            }
+        }
+    }
+}
+
 /* Four keys (their DPT columns in kw) into the HPT heads' sums p k, and sum p in the den wave,
  * each chain in key order (libref's mul, then add). */
 template <int HPT, int DPT>
@@ -1387,30 +1432,54 @@ __device__ __forceinline__ void ds_dec_pvld(uint32_t (&kv)[32], const uint16_t* 
 }
 
 /* ds_dec_pvld for packed keys (DPT 2: dcol even, the pair in one code byte): the code byte and the
- * scale byte of each of the 32 keys. */
-__device__ __forceinline__ void ds_dec_pvld_nv(uint32_t (&kv)[32], const uint16_t* lp, int dcol) {
+ * scale byte of N of the 32 keys, those whose pointers lanes b0 .. b0 + N - 1 hold (b0 wave-uniform). The two bytes of a
+ * key sit in two registers until they land, so a packed ring holds half the plain ring's keys (N 16)
+ * for the same 32 loads in flight: a 32-key packed ring (64 registers in flight + 32 unpacking)
+ * spilled 280-400 VGPRs to scratch in every 1024-thread form (7.11.: 1 row 30.3 ms/step vs 20.6). */
+template <int N>
+__device__ __forceinline__ void ds_dec_pvld_nv(uint32_t (&kv)[N], const uint16_t* lp, int dcol, int b0) {
     const unsigned long long v = (unsigned long long)lp;
     const int lo = (int)(uint32_t)v, hi = (int)(uint32_t)(v >> 32);
 #pragma unroll
-    for (int u = 0; u < 32; ++u) {
-        const unsigned long long pu = ((unsigned long long)(uint32_t)__builtin_amdgcn_readlane(hi, u) << 32) |
-                                      (uint32_t)__builtin_amdgcn_readlane(lo, u);
+    for (int u = 0; u < N; ++u) {
+        const unsigned long long pu = ((unsigned long long)(uint32_t)__builtin_amdgcn_readlane(hi, b0 + u) << 32) |
+                                      (uint32_t)__builtin_amdgcn_readlane(lo, b0 + u);
         const __attribute__((address_space(1))) const unsigned char* b =
             (const __attribute__((address_space(1))) unsigned char*)pu;
         kv[u] = (uint32_t)b[dcol / 2] | ((uint32_t)b[kDsAttnD / 2 + dcol / 16] << 8);
     }
 }
+/* p through an empty asm that reads the PV sums: the packed PV ring's next loads cannot be hoisted
+ * above the previous slot's fmas (the scheduler otherwise issued a whole block's loads at once, two
+ * registers a key, and spilled). */
+template <int HPT, int DPT>
+__device__ __forceinline__ const uint16_t* ds_dec_pfence(const uint16_t* p, const float (&acc)[HPT][DPT]) {
+#ifdef R4D_EMU_HOST
+    (void)acc;
+    return p;
+#else
+    static_assert(HPT * DPT <= 4, "the fence reads at most four sums");
+    unsigned long long v = (unsigned long long)p;
+    uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
+    const float* f = &acc[0][0];
+    if constexpr (HPT * DPT == 1) asm volatile("" : "+v"(lo), "+v"(hi) : "v"(f[0]));
+    else if constexpr (HPT * DPT == 2) asm volatile("" : "+v"(lo), "+v"(hi) : "v"(f[0]), "v"(f[1]));
+    else asm volatile("" : "+v"(lo), "+v"(hi) : "v"(f[0]), "v"(f[1]), "v"(f[2]), "v"(f[3]));
+    return (const uint16_t*)(((unsigned long long)hi << 32) | lo);
+#endif
+}
 /* ...unpacked in place to the bf16 pairs ds_dec_pvld reads from a plain entry. */
-__device__ __forceinline__ void ds_dec_pvun(uint32_t (&kv)[32]) {
+template <int N>
+__device__ __forceinline__ void ds_dec_pvun(uint32_t (&kv)[N]) {
 #pragma unroll
-    for (int u = 0; u < 32; ++u) kv[u] = ds_nv4_pair(kv[u] & 0xffu, kv[u] >> 8);
+    for (int u = 0; u < N; ++u) kv[u] = ds_nv4_pair(kv[u] & 0xffu, kv[u] >> 8);
 }
 
-template <int HPT, int DPT>
-__device__ __forceinline__ void ds_dec_pvsum(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[32],
+template <int HPT, int DPT, int N = 32>
+__device__ __forceinline__ void ds_dec_pvsum(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[N],
                                              const float* ph, int nkq, int k0, bool dw) {
 #pragma unroll
-    for (int u0 = 0; u0 < 32; u0 += 4) {
+    for (int u0 = 0; u0 < N; u0 += 4) {
         const uint32_t kw[4] = { kv[u0], kv[u0 + 1], kv[u0 + 2], kv[u0 + 3] };
         ds_dec_pv4<HPT, DPT>(acc, den, kw, ph, nkq, k0 + u0, dw);
     }
@@ -1504,7 +1573,7 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
         int ho[HS];
 #pragma unroll
         for (int h = 0; h < HS; ++h) ho[h] = (g * HS + h < hmax ? g * HS + h : 0) * (D / 2);
-        uint4 ra[8], rb[8];
+        [[maybe_unused]] uint4 ra[8], rb[8];
         [[maybe_unused]] DsNv4Raw pa, pb;
         if constexpr (PK) pa = ds_nv4_ld64(kk, 0);
         else {
@@ -1516,24 +1585,23 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
 #pragma unroll 1
         for (int c = 0; c < D / 8; c += 16) {
             if constexpr (PK) {
+                /* packed: each word unpacked right before its fmas (ds_dec_dot_nv) */
+                const int cn = c + 16 < D / 8 ? c + 16 : c;
                 pb = ds_nv4_ld64(kk, c + 8);
-                ds_nv4_unpack64(pa, ra);
+                ds_dec_dot_nv<HS, QS>(acc, pa, qg + c * 8, qw + c * 4, ho);
+                pa = ds_nv4_ld64(kk, cn);
+                ds_dec_dot_nv<HS, QS>(acc, pb, qg + (c + 8) * 8, qw + (c + 8) * 4, ho);
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) rb[i] = ds_ldg16(kk, c + 8 + i);
-            }
-            if constexpr (QS) ds_dec_dot_s<HS>(acc, ra, qw + c * 4, ho);
-            else ds_dec_dot<HS>(acc, ra, qg + c * 8);
-            const int cn = c + 16 < D / 8 ? c + 16 : c;
-            if constexpr (PK) {
-                pa = ds_nv4_ld64(kk, cn);
-                ds_nv4_unpack64(pb, rb);
-            } else {
+                if constexpr (QS) ds_dec_dot_s<HS>(acc, ra, qw + c * 4, ho);
+                else ds_dec_dot<HS>(acc, ra, qg + c * 8);
+                const int cn = c + 16 < D / 8 ? c + 16 : c;
 #pragma unroll
                 for (int i = 0; i < 8; ++i) ra[i] = ds_ldg16(kk, cn + i);
+                if constexpr (QS) ds_dec_dot_s<HS>(acc, rb, qw + (c + 8) * 4, ho);
+                else ds_dec_dot<HS>(acc, rb, qg + (c + 8) * 8);
             }
-            if constexpr (QS) ds_dec_dot_s<HS>(acc, rb, qw + (c + 8) * 4, ho);
-            else ds_dec_dot<HS>(acc, rb, qg + (c + 8) * 8);
         }
 #pragma unroll
         for (int h = 0; h < HS; ++h) {
@@ -1616,29 +1684,50 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
         /* Straight from global: a wave walks 32-key blocks, lane L holding block key L's pointer
          * (handed to the whole wave by readlane), one block's loads in flight while the previous
          * block is summed. Past the last block the loads read the zero row. The plain blocks
-         * [0, nwb), then the packed ones (a.cnv), each walk the same way. */
+         * [0, nwb) walk so; the packed ones (a.cnv) after them in 16-key slots (below). */
         if (pvt) {
-            auto walk = [&](int kb0, int kb1, auto packed) {
-                constexpr bool PK = decltype(packed)::value;
+            auto walk = [&](int kb0, int kb1) {
                 if (kb0 >= kb1) return;
                 uint32_t kv[2][32];
                 const uint16_t* lp = kp[kb0 * 32 + lane];
-                if constexpr (PK) ds_dec_pvld_nv(kv[0], lp, dcol);
-                else ds_dec_pvld<DPT>(kv[0], lp, dcol);
+                ds_dec_pvld<DPT>(kv[0], lp, dcol);
 #pragma unroll 1
                 for (int kb = kb0; kb < kb1; kb += 2) {
                     lp = kb + 1 < kb1 ? kp[(kb + 1) * 32 + lane] : zero;
-                    if constexpr (PK) { ds_dec_pvld_nv(kv[1], lp, dcol); ds_dec_pvun(kv[0]); }
-                    else ds_dec_pvld<DPT>(kv[1], lp, dcol);
+                    ds_dec_pvld<DPT>(kv[1], lp, dcol);
                     ds_dec_pvsum<HPT, DPT>(acc, den, kv[0], ph, nkq, kb * 32, dw);
                     lp = kb + 2 < kb1 ? kp[(kb + 2) * 32 + lane] : zero;
-                    if constexpr (PK) { ds_dec_pvld_nv(kv[0], lp, dcol); ds_dec_pvun(kv[1]); }
-                    else ds_dec_pvld<DPT>(kv[0], lp, dcol);
+                    ds_dec_pvld<DPT>(kv[0], lp, dcol);
                     if (kb + 1 < kb1) ds_dec_pvsum<HPT, DPT>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw);
                 }
             };
-            walk(0, nwb, std::false_type{});
-            if constexpr (NV) walk(nwb, nkb, std::true_type{});
+            walk(0, nwb);
+            /* The packed blocks [nwb, nkb), half a block (16 keys) a ring slot: this block's second
+             * half and the next block's first half go out while the slot before them is summed, in
+             * key order; past the last block the loads read the zero row (no load under a branch). */
+            if constexpr (NV) {
+                if (nwb < nkb) {
+                    constexpr int N = 16, NS = 32 / N;   /* keys a slot, slots a block */
+                    uint32_t kv[2][N];
+                    const uint16_t* lp = kp[nwb * 32 + lane];
+                    ds_dec_pvld_nv<N>(kv[0], lp, dcol, 0);
+#pragma unroll 1
+                    for (int kb = nwb; kb < nkb; ++kb) {
+#pragma unroll
+                        for (int j = 0; j < NS; ++j) {
+                            /* slot j + 1 (the next block's first after the last; past the end the
+                             * zero row), its loads behind the fence of slot j - 1's sums */
+                            const uint16_t* np = lp;
+                            if (j + 1 == NS) np = kb + 1 < nkb ? kp[(kb + 1) * 32 + lane] : zero;
+                            np = ds_dec_pfence<HPT, DPT>(np, acc);
+                            ds_dec_pvld_nv<N>(kv[(j + 1) & 1], np, dcol, j + 1 < NS ? (j + 1) * N : 0);
+                            ds_dec_pvun<N>(kv[j & 1]);
+                            ds_dec_pvsum<HPT, DPT, N>(acc, den, kv[j & 1], ph, nkq, kb * 32 + j * N, dw);
+                            if (j + 1 == NS) lp = np;
+                        }
+                    }
+                }
+            }
         }
     } else {
         *(uint4*)(tiles + lk * (D * 2) + lc * 16) = piece(0, 0);
