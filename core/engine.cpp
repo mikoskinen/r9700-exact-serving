@@ -1831,6 +1831,20 @@ void Engine::loan_tick(bool idle) {
  * in those slots revert to their host copies (an address change, not a copy) and both streams
  * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
  * does not regrow until steps have been small for a while (arena_tick). */
+/* RADIANCE_STAGE_MIXED=0: the prefill stager arms only for a pass that carries no decode rows (a lone
+ * prefill chunk); a mixed step's routed GEMMs read the pool in place, as without the stager. Unset:
+ * any pass the size rule admits (stager.h). On DeepSeek-V4.1 EXL3 2.9 bpw at four ranks (79, 7.11.)
+ * a lone chunk staged 42 % faster but a chunk sharing its step with four decoders 6-12 % slower:
+ * the whole pooled set (21 GB a rank) crosses the link by DMA for a ~1-2k-row step whose compute
+ * cannot hide it, where the in-place reads of the unstaged step run at the link's rate. */
+static bool stage_mixed_steps() {
+    static const bool on = [] {
+        const char* e = getenv("RADIANCE_STAGE_MIXED");
+        return !(e && (!std::strcmp(e, "0") || !std::strcmp(e, "off")));
+    }();
+    return on;
+}
+
 int Engine::arena_step(const RadBatch* b) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
@@ -1845,6 +1859,9 @@ int Engine::arena_step(const RadBatch* b) {
      * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
      * hold). */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
+    /* A mixed step (decode rows [0, n_tok_decode)) is staged only where RADIANCE_STAGE_MIXED allows. */
+    const bool mixed_ok = stage_mixed_steps() || b->phase == RAD_PHASE_PREFILL ||
+                          (b->phase != RAD_PHASE_DECODE && b->n_tok_decode == 0);
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
@@ -1861,7 +1878,8 @@ int Engine::arena_step(const RadBatch* b) {
         /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
          * span's shared level keeps a place of its own for it (stager.h); every other level
          * lends both. */
-        char* const ring = level == 0 ? r->stager.ring_full()
+        char* const ring = !mixed_ok ? nullptr
+                         : level == 0 ? r->stager.ring_full()
                          : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
                                ? r->stager.ring_low() : nullptr;
         r->stager.set_ring(ring);
