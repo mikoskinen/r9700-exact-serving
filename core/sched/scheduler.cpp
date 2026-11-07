@@ -2357,6 +2357,17 @@ bool Scheduler::prefill_continues() const {
     return false;
 }
 
+bool Scheduler::prefill_has_more() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!step_open_) return false;
+    for (const StepEntry& e : plan_.e) {
+        if (!e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
+            continue;
+        if (reqs_[(size_t)e.slot]->seq_len() - ((int64_t)e.ctx_len + e.n_tokens) > 0) return true;
+    }
+    return false;
+}
+
 bool Scheduler::media_ready(SchedReq& s) {
     bool ready = true;
     for (mm::Placed& p : s.req->media->items) {

@@ -1831,18 +1831,25 @@ void Engine::loan_tick(bool idle) {
  * in those slots revert to their host copies (an address change, not a copy) and both streams
  * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
  * does not regrow until steps have been small for a while (arena_tick). */
-/* RADIANCE_STAGE_MIXED=0: the prefill stager arms only for a pass that carries no decode rows (a lone
- * prefill chunk); a mixed step's routed GEMMs read the pool in place, as without the stager. Unset:
- * any pass the size rule admits (stager.h). On DeepSeek-V4.1 EXL3 2.9 bpw at four ranks (79, 7.11.)
- * a lone chunk staged 42 % faster but a chunk sharing its step with four decoders 6-12 % slower:
- * the whole pooled set (21 GB a rank) crosses the link by DMA for a ~1-2k-row step whose compute
- * cannot hide it, where the in-place reads of the unstaged step run at the link's rate. */
-static bool stage_mixed_steps() {
-    static const bool on = [] {
+/* RADIANCE_STAGE_MIXED: which passes that carry decode rows the prefill stager may arm for (a lone
+ * prefill pass is armed by the size rule alone, stager.h).
+ *   unset / 1  any pass the size rule admits
+ *   0          none: a mixed step's routed GEMMs read the pool in place, as without the stager
+ *   2          only one whose prefill chunk leaves more of its prompt for a later step (a long
+ *              prompt beside decoding sequences), not a prompt's last or only chunk
+ * On DeepSeek-V4.1 EXL3 at four ranks (79, 7.11.) a lone chunk staged ran 42 % faster at 2.9 bpw,
+ * a one-chunk prompt beside four decoders 8-12 % slower at both widths (the whole pooled set, 9-21
+ * GB a rank, crosses the link by DMA for a ~1-2k-row step whose compute cannot hide it), and the
+ * chunks of a 31k prompt beside four decoders 3.8 % faster at 2.25 bpw, 5.8 % slower at 2.9. */
+static int stage_mixed_mode() {
+    static const int mode = [] {
         const char* e = getenv("RADIANCE_STAGE_MIXED");
-        return !(e && (!std::strcmp(e, "0") || !std::strcmp(e, "off")));
+        if (!e || !*e) return 1;
+        if (!std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "2") || !std::strcmp(e, "continues")) return 2;
+        return 1;
     }();
-    return on;
+    return mode;
 }
 
 int Engine::arena_step(const RadBatch* b) {
@@ -1859,9 +1866,12 @@ int Engine::arena_step(const RadBatch* b) {
      * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
      * hold). */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
-    /* A mixed step (decode rows [0, n_tok_decode)) is staged only where RADIANCE_STAGE_MIXED allows. */
-    const bool mixed_ok = stage_mixed_steps() || b->phase == RAD_PHASE_PREFILL ||
-                          (b->phase != RAD_PHASE_DECODE && b->n_tok_decode == 0);
+    /* A mixed step (decode rows [0, n_tok_decode)) is staged only where RADIANCE_STAGE_MIXED allows
+     * (stage_mixed_mode). */
+    const int smode = stage_mixed_mode();
+    const bool lone = b->phase == RAD_PHASE_PREFILL || (b->phase != RAD_PHASE_DECODE && b->n_tok_decode == 0);
+    const bool mixed_ok = smode == 1 || lone ||
+                          (smode == 2 && b->phase != RAD_PHASE_DECODE && sched_.prefill_has_more());
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||

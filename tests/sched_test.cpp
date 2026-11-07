@@ -3165,6 +3165,7 @@ TEST(an_explicit_busy_prefill_chunk_holds_the_chunk_to_it) {
 struct Interleaved {
     std::string shape;
     std::string staged;
+    std::string more;      /* prefill_has_more() after each step (RADIANCE_STAGE_MIXED=2) */
     int64_t steps_held = 0;
 };
 
@@ -3187,6 +3188,7 @@ static Interleaved interleave_run(int64_t n, bool decoder, int steps) {
         for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
         out.shape += chunk ? 'C' : 'D';
         out.staged += f.sch.prefill_continues() ? '+' : '-';
+        out.more += f.sch.prefill_has_more() ? '+' : '-';
         f.commit_plain(12);
     }
     out.steps_held = f.sch.metrics().steps_held;
@@ -3224,6 +3226,23 @@ TEST(interleave_runs_n_decode_only_steps_after_each_chunk) {
     CHECK_EQ(r.shape, std::string("CDDCDDCDDC"));
     CHECK_EQ(r.staged, std::string("----------"));
     CHECK_EQ(r.steps_held, 6);
+}
+
+/* prefill_has_more() answers for the step's own chunk whatever the next step is held to: '+' on
+ * every chunk but the prompt's last, '-' on a step that carries none. */
+TEST(prefill_has_more_ignores_the_interleave_hold) {
+    const Interleaved r = interleave_run(2, /*decoder=*/true, 24);
+    int chunks = 0;
+    for (char c : r.shape) chunks += c == 'C';
+    CHECK_EQ(chunks, 8);                                 /* 2000 tokens in 256-token chunks */
+    int seen = 0;
+    for (size_t k = 0; k < r.shape.size(); ++k) {
+        const bool chunk = r.shape[k] == 'C';
+        if (chunk) ++seen;
+        CHECK_EQ(r.more[k], chunk && seen < chunks ? '+' : '-');
+    }
+    const Interleaved off = interleave_run(0, /*decoder=*/true, 8);
+    CHECK_EQ(off.more, off.staged);                      /* no hold: the same as prefill_continues */
 }
 
 /* Nothing decodes beside a lone prefill, so nothing is held. */
