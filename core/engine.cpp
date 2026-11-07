@@ -1898,10 +1898,21 @@ int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_
 /* The arena loan grows only after large steps stop. A prefill is chunks with decode steps between,
  * and lending after every chunk would refill and recall the slab each time. So the floor (the
  * largest step seen) holds for two seconds after it was last reached, then falls to the latest
- * step's size. */
+ * step's size. RADIANCE_ARENA_HOLD_MS sets the hold (unset: 2000): longer recalls the slab less
+ * often under steady prefill traffic (each recall drains both streams), at the price of decode steps
+ * that run without the loan for that long after a prompt. */
+static uint64_t arena_hold_ns() {
+    static const uint64_t ns = [] {
+        const char* e = getenv("RADIANCE_ARENA_HOLD_MS");
+        const long long ms = e && *e ? std::atoll(e) : 2000;
+        return (uint64_t)(ms > 0 ? ms : 2000) * 1000000ull;
+    }();
+    return ns;
+}
+
 void Engine::arena_tick(uint64_t now_ns) {
     if (arena_rows_.size() <= 1) return;
-    if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
+    if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > arena_hold_ns()) {
         arena_floor_ = arena_last_;
         arena_floor_ns_ = now_ns;
     }
