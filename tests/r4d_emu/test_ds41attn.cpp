@@ -291,6 +291,16 @@ int main() {
     run_case("decode, 16 rows, direct PV, head group 4, ratio 2", make(37, 8, 2, { { 4, 2000 }, { 12, 3500 } }), 0, ref);
     run_case("decode, 32 rows, direct PV, head group 8", make(38, 8, 1, { { 32, 3999 } }), 0, ref);
     run_case("decode, 1 row, direct PV, 512 selections", make(39, 8, 4, { { 1, 6000 } }, 512), 0, ref);
+    /* 8.11. (v3): the packed direct PV a 32-key block a step (one register a key) and its LDS decode tables (one head a
+     * PV thread: head groups 1, 2 and 4 at 1024 threads; 8 keeps the register decode), at 1024 and 2048 selections --
+     * odd and even block counts, the head group 4 form at 2048 near the LDS bound */
+    run_case("decode, 1 row, direct PV, 1024 selections, ratio 2", make(40, 8, 2, { { 1, 9000 } }, 1024), 0, ref);
+    run_case("decode, 1 row, direct PV, 2048 selections", make(41, 8, 1, { { 1, 9000 } }, 2048), 0, ref);
+    run_case("decode, 2 rows, 16 heads, direct PV, 2048 selections, ratio 2", make(42, 16, 2, { { 2, 12000 } }, 2048), 0, ref);
+    run_case("decode, 8 rows, head group 2, 1024 selections", make(43, 8, 1, { { 8, 6000 } }, 1024), 0, ref);
+    run_case("decode, 16 rows, head group 4, 2048 selections, ratio 2", make(44, 8, 2, { { 16, 9000 } }, 2048), 0, ref);
+    run_case("decode, 32 rows, head group 8, 1024 selections", make(45, 8, 1, { { 32, 6000 } }, 1024), 0, ref);
+    run_case("decode, 1 row, direct PV, 480 selections (15 packed blocks + window)", make(46, 8, 1, { { 1, 5000 } }, 480), 0, ref);
     /* decode band: 40 rows of two sequences, 8 heads (320 row-heads: the tiled-PV form), ratio 2 */
     run_case("decode, 40 rows, tiled PV, ratio 2", make(32, 8, 2, { { 8, 2600 }, { 32, 3999 } }), 0, ref);
     /* the scalar kernel: 50 rows whose q pitch (H D + 2) the WMMA form refuses */

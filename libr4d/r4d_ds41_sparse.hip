@@ -32,6 +32,7 @@
 #include "r4d_plugin.h"
 
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -252,14 +253,16 @@ __device__ __forceinline__ uint4 ds_nv4_unpack8(uint32_t w, float s) {
  * the high half, the stored bit -- with the code's sign bit or-ed in as ds_nv4_bf16 does. All 256 scale bytes x 16 codes
  * give ds_nv4_bf16's bits (NaN scales: NaN). ds_e4m3_f32's subnormal loop and ds_nv4_bf16's selects compiled to some 180
  * branches and 27 instructions a value in the decode kernels' unrolled loops: 240 us a call against bf16's 15 at one row. */
+/* 8.11. (v3): the magnitude bits of b at bit 20 are an f32 whose value is e4m3's times 2^-120 -- normal and subnormal
+ * alike, since the f32 subnormal field lines up with e4m3's (exponent 0: m 2^-3 2^-126 = m 2^-9 2^-120) -- so one exact
+ * multiply by 2^119 gives s / 2 (f32 subnormals are kept: denorm mode 3). The same bits as the select form it replaces
+ * for all 256 bytes (NaN 0x7f / 0xff -> 0x7fc00000 | sign), in about seven instructions instead of fifteen; the decode
+ * kernels run it once a scale byte (16 values in the scores, 2 in the direct PV). */
 __device__ __forceinline__ float ds_e4m3_half(uint32_t b) {
-    const uint32_t sg = (b & 0x80u) << 24, e = (b >> 3) & 15u, m = b & 7u;
-    const uint32_t nb = ((e + 119u) << 23) | (m << 20);
-    const uint32_t sb = __builtin_bit_cast(uint32_t, (float)m * 0x1p-10f);   /* m 2^-9 / 2 */
-    const uint32_t msk = 0u - (uint32_t)(e != 0u);                   /* both computed: no branch */
-    uint32_t u = (nb & msk) | (sb & ~msk);
-    u = (e == 15u && m == 7u) ? 0x7fc00000u : u;
-    return __builtin_bit_cast(float, u | sg);
+    const uint32_t mg = (b << 20) & 0x07f00000u;
+    uint32_t u = __builtin_bit_cast(uint32_t, __builtin_bit_cast(float, mg) * 0x1p119f);
+    u = mg == 0x07f00000u ? 0x7fc00000u : u;
+    return __builtin_bit_cast(float, u | ((b & 0x80u) << 24));
 }
 /* The f32 of code c (its low four bits; bit 3 the sign) at half scale sh. */
 __device__ __forceinline__ float ds_nv4_val(uint32_t c, float sh) {
@@ -1223,13 +1226,17 @@ __device__ __forceinline__ void ds_nv4_unpack64(const DsNv4Raw& r, uint4 (&o)[8]
 }
 
 struct DsDecLds {
-    long kp, sp, smx, sden, tab, u, sq, bmax, total;
+    long kp, sp, smx, sden, tab, u, sq, bmax, nvt, total;
 };
+/* The packed direct PV's decode tables (8.11., v3), past everything else: 256 code-byte entries of
+ * two words -- the bits of (float) 2|e2m1| of the low and the high nibble, each with its code's sign
+ * bit -- then 256 floats ds_e4m3_half(b). */
+constexpr long kDsNvTabBytes = 256 * 8 + 256 * 4;
 /* nkq: keys rounded up to 32. kp [nkq] pointers, sp [HG][nkq] scores then p, smx / sden [HG] (sden
  * holds the sinks until the den), tab the 32 doubles of the expf table; then, in one region,
  * sq [HG][512] q and bmax [HG][nkq/32] block maxima (scores) or the two key tiles of a tiled PV
- * (2 x nt x 16 bytes; nt = 0 for the direct PV). */
-__host__ __device__ constexpr DsDecLds ds_dec_lds(int nkq, int hg, int nt) {
+ * (2 x nt x 16 bytes; nt = 0 for the direct PV); nvt the packed direct PV's tables (nvt true). */
+__host__ __device__ constexpr DsDecLds ds_dec_lds(int nkq, int hg, int nt, bool nvt = false) {
     DsDecLds l{};
     l.kp = 0;
     l.sp = (long)nkq * 8;
@@ -1241,6 +1248,8 @@ __host__ __device__ constexpr DsDecLds ds_dec_lds(int nkq, int hg, int nt) {
     l.bmax = l.sq + (long)hg * kDsAttnD * 4;
     const long sc = l.bmax + (long)hg * (nkq / 32) * 4, pv = l.u + 2L * nt * 16;
     l.total = sc > pv ? sc : pv;
+    l.nvt = (l.total + 15) / 16 * 16;
+    if (nvt) l.total = l.nvt + kDsNvTabBytes;
     return l;
 }
 
@@ -1477,8 +1486,14 @@ __device__ __forceinline__ void ds_dec_pvld(uint32_t (&kv)[32], const uint16_t* 
  * key sit in two registers until they land, so a packed ring holds half the plain ring's keys (N 16)
  * for the same 32 loads in flight: a 32-key packed ring (64 registers in flight + 32 unpacking)
  * spilled 280-400 VGPRs to scratch in every 1024-thread form (7.11.: 1 row 30.3 ms/step vs 20.6). */
+/* 8.11. (v3): both bytes of a key land in one register -- the code byte in the low half, the scale byte in the high
+ * (kv = code | scale << 16) -- as two 16-bit halves of a vector (d16 loads). A 32-key slot then holds what a 16-key
+ * slot held, so the direct PV walks the packed blocks a block a step, two blocks of loads in flight, as the plain walk
+ * does (the 16-key ring took twice the steps, each behind the previous slot's sums). (Buffer loads from the same base,
+ * tried for their SGPR addressing, land the bytes in two registers and spilled.) */
+typedef unsigned short ds_u16x2 __attribute__((ext_vector_type(2)));
 template <int N>
-__device__ __forceinline__ void ds_dec_pvld_nv(uint32_t (&kv)[N], const uint16_t* lp, int dcol, int b0) {
+__device__ __forceinline__ void ds_dec_pvld_nv(uint32_t (&kv)[N], const uint16_t* lp, uint32_t cb, uint32_t sb, int b0) {
     const unsigned long long v = (unsigned long long)lp;
     const int lo = (int)(uint32_t)v, hi = (int)(uint32_t)(v >> 32);
 #pragma unroll
@@ -1487,7 +1502,10 @@ __device__ __forceinline__ void ds_dec_pvld_nv(uint32_t (&kv)[N], const uint16_t
                                       (uint32_t)__builtin_amdgcn_readlane(lo, b0 + u);
         const __attribute__((address_space(1))) const unsigned char* b =
             (const __attribute__((address_space(1))) unsigned char*)pu;
-        kv[u] = (uint32_t)b[dcol / 2] | ((uint32_t)b[kDsAttnD / 2 + dcol / 16] << 8);
+        ds_u16x2 h;
+        h.x = (unsigned short)b[cb];
+        h.y = (unsigned short)b[sb];
+        kv[u] = __builtin_bit_cast(uint32_t, h);
     }
 }
 /* p through an empty asm that reads the PV sums: the packed PV ring's next loads cannot be hoisted
@@ -1510,8 +1528,9 @@ __device__ __forceinline__ const uint16_t* ds_dec_pfence(const uint16_t* p, cons
 #endif
 }
 
-/* ds_dec_pv4 over four packed keys (kv: code byte | scale byte << 8, DPT 2: the column pair of one code byte), the
- * values as f32 by ds_nv4_val -- the same products and sums in the same order as over their bf16. */
+/* ds_dec_pv4 over four packed keys (kv: code byte | scale byte << 16, DPT 2: the column pair of one code byte), the
+ * values as f32 by ds_nv4_at -- the same products and sums in the same order as over their bf16. The forms with two
+ * heads a PV thread (HPT 2) decode in registers, shared by the heads (the LDS tables below spilled them). */
 template <int HPT, int DPT>
 __device__ __forceinline__ void ds_dec_pv4_nv(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kw)[4],
                                               const float* ph, int nkq, int k0, bool dw) {
@@ -1519,7 +1538,7 @@ __device__ __forceinline__ void ds_dec_pv4_nv(float (&acc)[HPT][DPT], float (&de
     float kf[4][DPT];
 #pragma unroll
     for (int u = 0; u < 4; ++u) {
-        const float sh = ds_e4m3_half(kw[u] >> 8);
+        const float sh = ds_e4m3_half(kw[u] >> 16);
         kf[u][0] = ds_nv4_at<0>(kw[u], sh);
         kf[u][1] = ds_nv4_at<4>(kw[u], sh);
     }
@@ -1550,6 +1569,67 @@ __device__ __forceinline__ void ds_dec_pvsum_nv(float (&acc)[HPT][DPT], float (&
         ds_dec_pv4_nv<HPT, DPT>(acc, den, kw, ph, nkq, k0 + u0, dw);
     }
 }
+/* Does a decode form decode the packed PV by the LDS tables: the direct PV with one head a PV thread (the kernel's
+ * NHP = min(NT / (512 / DPT), HG), HPT = HG / NHP). The host sizes the LDS by it. */
+__host__ __device__ constexpr bool ds_dec_nvt(int hg, int nt, int dpt, bool pvd, bool nv) {
+    const int ncg = kDsAttnD / dpt, nhp = (nt / ncg) < hg ? (nt / ncg) : hg;
+    return nv && pvd && hg / nhp == 1;
+}
+/* ds_dec_pv4 over four packed keys (kv: code byte | scale byte << 16, DPT 2: the column pair of one code byte) by
+ * the LDS tables (tc: a code byte's two nibbles as the bits of (float) 2|e2m1| with the sign bit,
+ * ts: ds_e4m3_half of a scale byte): the value is |t| x sh with t's sign bit or-ed in -- ds_nv4_at's float, its product
+ * and its sign, the same bits -- in two loads, two multiplies and two ors a key instead of some twenty instructions. */
+template <int HPT, int DPT>
+__device__ __forceinline__ void ds_dec_pv4_nvt(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kw)[4],
+                                               const float* ph, int nkq, int k0, bool dw, const uint2* tc,
+                                               const float* ts) {
+    static_assert(DPT == 2, "a code byte is a column pair");
+    float kf[4][DPT];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const float sh = ts[kw[u] >> 16];
+        const uint2 t = tc[kw[u] & 0xffu];
+        kf[u][0] = __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, __builtin_fabsf(__builtin_bit_cast(float, t.x)) * sh) |
+                                                 (t.x & 0x80000000u));
+        kf[u][1] = __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, __builtin_fabsf(__builtin_bit_cast(float, t.y)) * sh) |
+                                                 (t.y & 0x80000000u));
+    }
+#pragma unroll
+    for (int j = 0; j < HPT; ++j) {
+        const float4 pv = *(const float4*)(ph + (long)j * nkq + k0);
+        const float pk[4] = { pv.x, pv.y, pv.z, pv.w };
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+#pragma unroll
+            for (int d = 0; d < DPT; ++d) {
+                const float prod = pk[u] * kf[u][d];
+                acc[j][d] = acc[j][d] + prod;
+            }
+        }
+        if (dw) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) den[j] = den[j] + pk[u];
+        }
+    }
+}
+template <int HPT, int DPT, int N>
+__device__ __forceinline__ void ds_dec_pvsum_nvt(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[N],
+                                                 const float* ph, int nkq, int k0, bool dw, const uint2* tc,
+                                                 const float* ts) {
+#pragma unroll
+    for (int u0 = 0; u0 < N; u0 += 4) {
+        const uint32_t kw[4] = { kv[u0], kv[u0 + 1], kv[u0 + 2], kv[u0 + 3] };
+        ds_dec_pv4_nvt<HPT, DPT>(acc, den, kw, ph, nkq, k0 + u0, dw, tc, ts);
+    }
+}
+/* The table entries: code byte c's two values' (float) 2|e2m1| bits with the sign bit (ds_nv4_at<0>, <4>), and
+ * ds_e4m3_half(c). */
+__device__ __forceinline__ uint2 ds_nv4_tab(uint32_t c) {
+    const uint32_t lo = __builtin_bit_cast(uint32_t, (float)((0xC8643210u >> ((c & 7u) << 2)) & 15u)) | ((c & 8u) << 28);
+    const uint32_t hi = __builtin_bit_cast(uint32_t, (float)((0xC8643210u >> (((c >> 4) & 7u) << 2)) & 15u)) |
+                        ((c & 0x80u) << 24);
+    return make_uint2(lo, hi);
+}
 
 template <int HPT, int DPT, int N = 32>
 __device__ __forceinline__ void ds_dec_pvsum(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[N],
@@ -1574,7 +1654,8 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
     static_assert(NT % 64 == 0 && 32 % TK == 0 && TK % 4 == 0 && NT >= NCG && HG % NHP == 0 &&
                   (DPT == 1 || DPT == 2) && P >= 1, "layout");
     const int nkq = (a.nk + 31) / 32 * 32, nkb = nkq / 32, ntl = nkq / TK;
-    const DsDecLds L = ds_dec_lds(nkq, HG, PVD ? 0 : NT);
+    constexpr bool NVT = ds_dec_nvt(HG, NT, DPT, PVD, NV);   /* the packed PV by LDS tables */
+    const DsDecLds L = ds_dec_lds(nkq, HG, PVD ? 0 : NT, NVT);
     const uint16_t** kp = (const uint16_t**)(r4d_ds41_sparse_dyn + L.kp);
     float* sp = (float*)(r4d_ds41_sparse_dyn + L.sp);
     float* sq = (float*)(r4d_ds41_sparse_dyn + L.sq);
@@ -1624,6 +1705,12 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
         }
         if (tid < 32) tab[tid] = kDsExp2fTab[tid];
         if (tid < hmax) sden[tid] = a.sink[(long)(hg0 + tid) * a.sks];   /* the sinks, until the den */
+        if constexpr (NVT) {   /* the packed direct PV's decode tables */
+            for (int c = tid; c < 256; c += NT) {
+                ((uint2*)(r4d_ds41_sparse_dyn + L.nvt))[c] = ds_nv4_tab((uint32_t)c);
+                ((float*)(r4d_ds41_sparse_dyn + L.nvt + 256 * 8))[c] = ds_e4m3_half((uint32_t)c);
+            }
+        }
     }
     lds_barrier();
 
@@ -1778,27 +1865,31 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
                 }
             };
             walk(0, nwb);
-            /* The packed blocks [nwb, nkb), half a block (16 keys) a ring slot: this block's second
-             * half and the next block's first half go out while the slot before them is summed, in
-             * key order; past the last block the loads read the zero row (no load under a branch). */
+            /* The packed blocks [nwb, nkb), a block (32 keys, one register a key: ds_dec_pvld_nv) a
+             * step: the next block's loads go out while this one is summed, in key order, as the
+             * plain walk above; past the last block the loads read the zero row (no load under a
+             * branch). The next loads sit behind the fence of the previous block's sums. */
             if constexpr (NV) {
                 if (nwb < nkb) {
-                    constexpr int N = 16, NS = 32 / N;   /* keys a slot, slots a block */
-                    uint32_t kv[2][N];
+                    const uint32_t cb = (uint32_t)dcol / 2u, sb = (uint32_t)(kDsAttnD / 2 + dcol / 16);
+                    [[maybe_unused]] const uint2* tc = (const uint2*)(r4d_ds41_sparse_dyn + L.nvt);
+                    [[maybe_unused]] const float* ts = (const float*)(r4d_ds41_sparse_dyn + L.nvt + 256 * 8);
+                    uint32_t kv[2][32];
                     const uint16_t* lp = kp[nwb * 32 + lane];
-                    ds_dec_pvld_nv<N>(kv[0], lp, dcol, 0);
+                    ds_dec_pvld_nv<32>(kv[0], lp, cb, sb, 0);
 #pragma unroll 1
-                    for (int kb = nwb; kb < nkb; ++kb) {
-#pragma unroll
-                        for (int j = 0; j < NS; ++j) {
-                            /* slot j + 1 (the next block's first after the last; past the end the
-                             * zero row), its loads behind the fence of slot j - 1's sums */
-                            const uint16_t* np = lp;
-                            if (j + 1 == NS) np = kb + 1 < nkb ? kp[(kb + 1) * 32 + lane] : zero;
-                            np = ds_dec_pfence<HPT, DPT>(np, acc);
-                            ds_dec_pvld_nv<N>(kv[(j + 1) & 1], np, dcol, j + 1 < NS ? (j + 1) * N : 0);
-                            ds_dec_pvsum_nv<HPT, DPT, N>(acc, den, kv[j & 1], ph, nkq, kb * 32 + j * N, dw);
-                            if (j + 1 == NS) lp = np;
+                    for (int kb = nwb; kb < nkb; kb += 2) {
+                        lp = kb + 1 < nkb ? kp[(kb + 1) * 32 + lane] : zero;
+                        lp = ds_dec_pfence<HPT, DPT>(lp, acc);
+                        ds_dec_pvld_nv<32>(kv[1], lp, cb, sb, 0);
+                        if constexpr (NVT) ds_dec_pvsum_nvt<HPT, DPT, 32>(acc, den, kv[0], ph, nkq, kb * 32, dw, tc, ts);
+                        else ds_dec_pvsum_nv<HPT, DPT, 32>(acc, den, kv[0], ph, nkq, kb * 32, dw);
+                        lp = kb + 2 < nkb ? kp[(kb + 2) * 32 + lane] : zero;
+                        lp = ds_dec_pfence<HPT, DPT>(lp, acc);
+                        ds_dec_pvld_nv<32>(kv[0], lp, cb, sb, 0);
+                        if (kb + 1 < nkb) {
+                            if constexpr (NVT) ds_dec_pvsum_nvt<HPT, DPT, 32>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw, tc, ts);
+                            else ds_dec_pvsum_nv<HPT, DPT, 32>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw);
                         }
                     }
                 }
@@ -2594,7 +2685,7 @@ template <int HG, int NT, int DPT, bool PVD>
 int attn_dec_go(RadStream stream, const DsAttnArgs& s) {
     constexpr int P = 4;                                /* key tiles in flight in PV */
     const int nkq = (s.nk + 31) / 32 * 32;
-    const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT).total;
+    const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT, s.cnv && ds_dec_nvt(HG, NT, DPT, PVD, true)).total;
     if (lds > 65536) return RAD_E_UNSUPPORTED;
     const dim3 grid((unsigned)((s.H + HG - 1) / HG), (unsigned)s.M);
     if (s.cnv) return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, true>), grid, dim3(NT), (uint32_t)lds, s);
@@ -2605,9 +2696,49 @@ int attn_dec_go(RadStream stream, const DsAttnArgs& s) {
  * the same bits (measured on R9700, 32 heads x 640 keys: one row 17 us, 2 rows 27, 3-4 rows 44,
  * 5-8 rows 73, 48 rows 367; the scalar kernel 129-582). On an LDS refusal (long rows), the next
  * smaller form; the one-head form takes every row this op accepts. */
+/* Packed-latent forms only the A/B knob reaches (no plain twin is instantiated). */
+template <int HG, int NT, int DPT, bool PVD>
+int attn_dec_go_nv(RadStream stream, const DsAttnArgs& s) {
+    constexpr int P = 4;
+    const int nkq = (s.nk + 31) / 32 * 32;
+    const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT, ds_dec_nvt(HG, NT, DPT, PVD, true)).total;
+    if (lds > 65536 || !s.cnv) return RAD_E_UNSUPPORTED;
+    const dim3 grid((unsigned)((s.H + HG - 1) / HG), (unsigned)s.M);
+    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, true>), grid, dim3(NT), (uint32_t)lds, s);
+}
+
+/* RADIANCE_DS41_NVFORM=N (8.11., an A/B knob for the latency bench; unset: the rule below): the packed latent's decode
+ * band in form N -- 0-6 as attn_dec_emit's switch, 7 one head tiled (512 threads), 8 four heads direct at 512 threads
+ * (two heads a PV thread), 9 two heads direct at 512 threads. Every form sums each output in the same order: the same
+ * bits. A form the LDS refuses falls back to the rule. */
+int ds_nvform() {
+    static const int f = [] {
+        const char* e = std::getenv("RADIANCE_DS41_NVFORM");
+        return e && *e ? std::atoi(e) : -1;
+    }();
+    return f;
+}
+
 int attn_dec_emit(RadStream stream, const DsAttnArgs& s) {
     if (s.M > 65535 || (s.H + 0L) > 65535L * 8) return RAD_E_UNSUPPORTED;
     const long hr = (long)s.M * s.H;
+    if (s.cnv && ds_nvform() >= 0) {
+        int rc = RAD_E_UNSUPPORTED;
+        switch (ds_nvform()) {
+            case 0: rc = attn_dec_go<1, 1024, 2, true>(stream, s); break;
+            case 1: rc = attn_dec_go<2, 1024, 2, true>(stream, s); break;
+            case 2: rc = attn_dec_go<4, 1024, 2, true>(stream, s); break;
+            case 3: rc = attn_dec_go<8, 1024, 2, true>(stream, s); break;
+            case 4: rc = attn_dec_go<8, 512, 2, false>(stream, s); break;
+            case 5: rc = attn_dec_go<4, 512, 2, false>(stream, s); break;
+            case 6: rc = attn_dec_go<2, 512, 2, false>(stream, s); break;
+            case 7: rc = attn_dec_go_nv<1, 512, 2, false>(stream, s); break;
+            case 8: rc = attn_dec_go_nv<4, 512, 2, true>(stream, s); break;
+            case 9: rc = attn_dec_go_nv<2, 512, 2, true>(stream, s); break;
+            default: break;
+        }
+        if (rc != RAD_E_UNSUPPORTED) return rc;
+    }
     int c = hr <= 32 ? 0 : (hr <= 64 ? 1 : (hr <= 128 ? 2 : (hr <= 256 ? 3 : 4)));
     static const int next[7] = { -1, 0, 1, 2, 5, 6, 1 };
     while (c >= 0) {
