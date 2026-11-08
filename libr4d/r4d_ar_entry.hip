@@ -19,6 +19,7 @@
  */
 
 #include "r4d_chain.h"
+#include "r4d_ar_wide_chain.h"
 #include "r4d_args.h"
 #include "r4d.h"
 #include "r4d_ar_shards.h"
@@ -1735,7 +1736,7 @@ extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
     const long gate = link_gate(a), early = in->host ? 0L : gate;
 
     R4D_TRY("ar_gather_hc_write_4rank",
-        r4d_ar_gather_hc_write_4rank(
+        r4d_ar_gather_hc_write_4rank_c(
             in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
             in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
             in->my_scratch, in->my_flags, in->my_seq, in->slot16,
@@ -1745,7 +1746,8 @@ extern "C" int r4d_rad_ar_gather_hc_write_4rank(const RadArgs* a, RadStream s) {
             (long)g.ew_ld, (long)g.sh_ld, (long)g.sg_ld, (long)g.top_k, (long)g.sig,
             (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads, cfgv.drain, cfgv.acq,
             cfgv.pub, g.has_inv ? (long)(uintptr_t)a->scratch : 0L, early,
-            early ? in->gate_ctr : 0L));
+            early ? in->gate_ctr : 0L,
+            r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(g.M) ? 1L : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
@@ -1869,13 +1871,14 @@ extern "C" int r4d_rad_ar_hc_write_4rank(const RadArgs* a, RadStream s) {
     const long gate = link_gate(a), early = in->host ? 0L : gate;
 
     R4D_TRY("ar_hc_write_4rank",
-        r4d_ar_hc_write_4rank(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+        r4d_ar_hc_write_4rank_c(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                               in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
                               in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                               r4d_addr(w.y), r4d_addr(w.inj), r4d_addr(w.h),
                               (long)w.M, (long)w.n, (long)w.hc, (long)w.irow, (long)w.hrow,
                               (long)in->rank, (long)(uintptr_t)s, nblocks, cfgv.nthreads,
                               cfgv.drain, cfgv.acq, cfgv.pub, early,
-                              early ? in->gate_ctr : 0L));
+                              early ? in->gate_ctr : 0L,
+                              r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(w.M) ? 1L : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
