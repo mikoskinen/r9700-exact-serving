@@ -510,7 +510,7 @@ struct MoeFP8 {
     uint32_t    x3_cdt[2]   = { 0, 0 };
     std::vector<rad_weight> x3_gu[4], x3_dn[3];
     rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
-    int declare_exl3(RadBuilder* b, Names& nm, int l);
+    int declare_exl3(RadBuilder* b, Names& nm, int l, const std::vector<int64_t>& reg);
     void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
     /* bf16 and EXL3 experts both read the bf16 activation, whole on their rank. */
     bool act_bf16() const { return c.expert_bf16 || c.expert_exl3; }
@@ -1090,7 +1090,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     };
     const bool rot = c.expert_rot != 0;
     if (c.expert_exl3) {
-        RAD_ARCH_TRY(declare_exl3(b, nm, l));
+        RAD_ARCH_TRY(declare_exl3(b, nm, l, reg));
     } else if (c.expert_bf16) {
         /* ---- Plain bf16 experts: one table per projection of whole experts in expert order
          * (`moe_gemm`, expert e at entry e), so the two loops must not be merged. Each expert is
@@ -1758,17 +1758,19 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
  * table), applies silu(gate) * up with the model's swiglu_limit (interface v8 `limit`); down reads h in the
  * scatter's order and writes the bf16 `edn` rows the gather sums. The prefill stager keys a layer on its first
  * declared expert op: gate_up, declared first. */
-inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
-    const int64_t ne = c.n_expert;
+inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l, const std::vector<int64_t>& reg) {
+    /* The EXL3 tables hold the layer's EXL3 experts by place in the sort (`reg`): with experts kept plain bf16
+     * (`prot`, sorted last), those take the protected GEMM pair below declare() as for any other format, over the
+     * trailing offsets, and the EXL3 ops see n_reg experts. */
+    const int64_t ne = (int64_t)reg.size();
     const bool ep = c.n_expert != c.n_expert_all;
     if (c.ff_hi[0] > 0 || c.ff_hi4[0] > 0 || (!ep && g.world > 1)) {
         fprintf(stderr, "radiance: layer %d's EXL3 experts are served whole on their rank (expert parallel, or "
                         "one rank); this configuration slices every expert\n", l);
         return RAD_E_UNSUPPORTED;
     }
-    if (!prot.empty() || c.calib || c.expert_rot || c.expert_w4) {
-        fprintf(stderr, "radiance: layer %d: EXL3 experts take no protected bf16 experts, calibration tap or "
-                        "rotated/four-bit form\n", l);
+    if (c.calib || c.expert_rot || c.expert_w4) {
+        fprintf(stderr, "radiance: layer %d: EXL3 experts take no calibration tap or rotated/four-bit form\n", l);
         return RAD_E_UNSUPPORTED;
     }
     if (ne < 2 || ne % 2) {
@@ -1798,14 +1800,15 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
             run.clear();
             run.reserve((size_t)ne);
             for (int q = 0; q < 2; ++q)
-                for (int64_t e = q; e < ne; e += 2) {
+                for (int64_t i = q; i < ne; i += 2) {
+                    const int64_t e = reg[(size_t)i];   /* place i in the sort; its unit is the place's slot */
                     const long long ge = (long long)(c.expert_base + e);
                     const char* weight = nm.f("blk.%d.%s.%lld.weight", l, stem, ge);
                     const rad_weight h =
                         decl_view(b, codes ? weight : nm.f("blk.%d.%s.%lld.%s", l, stem, ge, role),
                                   codes ? nullptr : weight, role, codes ? x3_cdt[proj] : (uint32_t)RAD_F16,
                                   {rows, cols}, RAD_ACCESS_CONDITIONAL, RAD_SHARD_NONE,
-                                  grp_expert_slot(l, (int)e, proj));
+                                  grp_expert_slot(l, (int)i, proj));
                     if (!h) return RAD_E_INVAL;
                     run.push_back(h);
                 }
@@ -1839,8 +1842,8 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
                {b_x3h, w.sorted, w.eoff}, {w.edn});
     if (!op_gu || !op_dn) return RAD_E_INVAL;
-    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank, swiglu limit %g", l,
-             x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, c.swiglu_limit);
+    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank (%zu more kept plain bf16), swiglu "
+                "limit %g", l, x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, prot.size(), c.swiglu_limit);
     return RAD_OK;
 }
 
@@ -1851,7 +1854,7 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
     static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
     static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
     const bool gate_up = op == EXL3_GATE_UP;
-    const int64_t ne = c.n_expert, half = ne / 2, k = c.top_k;
+    const int64_t ne = n_reg, half = ne / 2, k = c.top_k;   /* the EXL3 experts (protected ones after them) */
     RadOperand opd[16];
     for (RadOperand& o : opd) o = RAD_NONE;
     opd[at.x] = in;
