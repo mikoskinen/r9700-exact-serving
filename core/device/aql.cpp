@@ -2028,8 +2028,14 @@ int a_tape_set_overlap(RadTape rt, int i, int on) {
  *
  * Nothing waits for the card: a later play on card 0 reads the signals that reached 0, in issue
  * order, and appends a line per dispatch to RADIANCE_AQL_STAMP_OUT (default
- * /tmp/radiance-stamps-<pid>.csv); exit waits briefly for the rest. */
+ * /tmp/radiance-stamps-<pid>.csv); exit waits briefly for the rest.
+ *
+ * RADIANCE_AQL_STAMP_CARDS=all stamps every card the same way, each with its own state, pass count
+ * and signal pool: card 0 into RADIANCE_AQL_STAMP_OUT as above, card k into that path + ".c<k>".
+ * Cards play the same passes in lockstep, so the same pass numbers are stamped on all of them, and
+ * the times are all in the host's timestamp domain. Unset, only card 0 is stamped, as before. */
 constexpr size_t kStampSignals = 8192;
+constexpr int    kStampCards = 16;
 
 struct StampRow {
     hsa_signal_t h{};
@@ -2046,6 +2052,7 @@ struct StampRow {
 
 struct Stamps {
     std::mutex   mu;
+    int          ord = 0;            /* the card these stamps are of */
     int          every = 0;
     std::string  path;
     FILE*        out = nullptr;
@@ -2062,21 +2069,40 @@ struct Stamps {
 
 void stamps_at_exit();
 
-Stamps& stamps() {
-    static Stamps* st = [] {
-        Stamps* x = new Stamps();
-        const char* n = std::getenv("RADIANCE_AQL_STAMP");
-        x->every = n ? std::max(0, std::atoi(n)) : 0;
-        const char* o = std::getenv("RADIANCE_AQL_STAMP_OUT");
-        x->path = o && *o ? std::string(o) : fmt("/tmp/radiance-stamps-%d.csv", (int)getpid());
-        if (x->every) {
-            RAD_WARN("device: RADIANCE_AQL_STAMP times every dispatch of one pass in %d on card 0, "
-                     "into %s", x->every, x->path.c_str());
-            std::atexit(stamps_at_exit);
-        }
-        return x;
+bool stamps_all_cards() {
+    static const bool all = [] {
+        const char* c = std::getenv("RADIANCE_AQL_STAMP_CARDS");
+        return c && std::strcmp(c, "all") == 0;
     }();
-    return *st;
+    return all;
+}
+
+std::atomic<Stamps*> g_stamps[kStampCards];
+
+/* The stamps of card `ord` (card 0 unless RADIANCE_AQL_STAMP_CARDS=all), made on first use. */
+Stamps& stamps(int ord = 0) {
+    if (ord < 0 || ord >= kStampCards) ord = 0;
+    Stamps* cur = g_stamps[ord].load(std::memory_order_acquire);
+    if (cur) return *cur;
+    static std::mutex make_mu;
+    std::lock_guard<std::mutex> lk(make_mu);
+    cur = g_stamps[ord].load(std::memory_order_relaxed);
+    if (cur) return *cur;
+    Stamps* x = new Stamps();
+    x->ord = ord;
+    const char* n = std::getenv("RADIANCE_AQL_STAMP");
+    x->every = n ? std::max(0, std::atoi(n)) : 0;
+    const char* o = std::getenv("RADIANCE_AQL_STAMP_OUT");
+    x->path = o && *o ? std::string(o) : fmt("/tmp/radiance-stamps-%d.csv", (int)getpid());
+    if (ord > 0) x->path += fmt(".c%d", ord);
+    if (x->every) {
+        RAD_WARN("device: RADIANCE_AQL_STAMP times every dispatch of one pass in %d on card %d, "
+                 "into %s", x->every, ord, x->path.c_str());
+        static std::once_flag once;
+        std::call_once(once, [] { std::atexit(stamps_at_exit); });
+    }
+    g_stamps[ord].store(x, std::memory_order_release);
+    return *x;
 }
 
 bool stamps_file(Stamps& st) {
@@ -2131,7 +2157,7 @@ void stamps_read(Stamps& st, bool wait) {
                                        HSA_WAIT_STATE_ACTIVE) != 0))
             break;
         hsa_amd_profiling_dispatch_time_t t{};
-        const bool timed = hsa_amd_profiling_get_dispatch_time(G().dev[0].agent, w.h, &t) ==
+        const bool timed = hsa_amd_profiling_get_dispatch_time(G().dev[(size_t)st.ord].agent, w.h, &t) ==
                            HSA_STATUS_SUCCESS;
         if (w.own) st.free.push_back(w.h);
         else stamp_hold(w.h, false);
@@ -2148,18 +2174,23 @@ void stamps_read(Stamps& st, bool wait) {
 }
 
 void stamps_at_exit() {
-    Stamps& st = stamps();
-    std::lock_guard<std::mutex> lk(st.mu);
-    stamps_read(st, true);
-    if (st.out) std::fclose(st.out);
-    st.out = nullptr;
-    st.out_failed = true;
+    for (int k = 0; k < kStampCards; ++k) {
+        Stamps* p = g_stamps[k].load(std::memory_order_acquire);
+        if (!p) continue;
+        Stamps& st = *p;
+        std::lock_guard<std::mutex> lk(st.mu);
+        stamps_read(st, true);
+        if (st.out) std::fclose(st.out);
+        st.out = nullptr;
+        st.out_failed = true;
+    }
 }
 
 /* The stamping of one play: a signal for each of its dispatches, taken up front so the play
  * takes the lock twice rather than once a dispatch. */
 struct StampRun {
     bool     on = false;
+    int      ord = 0;
     uint64_t pass = 0;
     uint32_t play = 0;
     uint32_t records = 0;
@@ -2168,8 +2199,13 @@ struct StampRun {
     std::vector<StampRow> rows;
 
     void begin(const Tape* t, int from, int to) {
-        Stamps& st = stamps();
-        if (!st.every || from >= to || t->rec[(size_t)from].s->ord != 0) return;
+        if (from >= to) return;
+        const int o = t->rec[(size_t)from].s->ord;
+        if (o != 0 && !stamps_all_cards()) return;
+        if (o < 0 || o >= kStampCards || o >= (int)G().dev.size()) return;
+        Stamps& st = stamps(o);
+        if (!st.every) return;
+        ord = o;
         std::lock_guard<std::mutex> lk(st.mu);
         stamps_read(st, false);
         if (from == 0) {
@@ -2231,7 +2267,7 @@ struct StampRun {
     }
     void end() {
         if (sig.empty()) return;
-        Stamps& st = stamps();
+        Stamps& st = stamps(ord);
         std::lock_guard<std::mutex> lk(st.mu);
         st.free.insert(st.free.end(), sig.begin() + (std::ptrdiff_t)used, sig.end());
         st.rows.insert(st.rows.end(), rows.begin(), rows.end());
