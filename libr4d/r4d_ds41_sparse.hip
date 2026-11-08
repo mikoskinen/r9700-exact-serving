@@ -246,6 +246,45 @@ __device__ __forceinline__ uint4 ds_nv4_unpack8(uint32_t w, float s) {
     return make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+/* ---- the decode kernels' unpack (8.11.): branch-free, about six instructions a value. A value is e2m1(c) x s,
+ * exact in f32; it is computed as (2 |e2m1(c)|) x (s / 2): 2 |e2m1| is an integer 0..12 from a nibble table (0xC8643210:
+ * 0 1 2 3 4 6 8 12), s / 2 is exact (ds_e4m3_half), so the product is the f32 the reference's mag x s is -- and its bf16,
+ * the high half, the stored bit -- with the code's sign bit or-ed in as ds_nv4_bf16 does. All 256 scale bytes x 16 codes
+ * give ds_nv4_bf16's bits (NaN scales: NaN). ds_e4m3_f32's subnormal loop and ds_nv4_bf16's selects compiled to some 180
+ * branches and 27 instructions a value in the decode kernels' unrolled loops: 240 us a call against bf16's 15 at one row. */
+__device__ __forceinline__ float ds_e4m3_half(uint32_t b) {
+    const uint32_t sg = (b & 0x80u) << 24, e = (b >> 3) & 15u, m = b & 7u;
+    const uint32_t nb = ((e + 119u) << 23) | (m << 20);
+    const uint32_t sb = __builtin_bit_cast(uint32_t, (float)m * 0x1p-10f);   /* m 2^-9 / 2 */
+    const uint32_t msk = 0u - (uint32_t)(e != 0u);                   /* both computed: no branch */
+    uint32_t u = (nb & msk) | (sb & ~msk);
+    u = (e == 15u && m == 7u) ? 0x7fc00000u : u;
+    return __builtin_bit_cast(float, u | sg);
+}
+/* The f32 of code c (its low four bits; bit 3 the sign) at half scale sh. */
+__device__ __forceinline__ float ds_nv4_val(uint32_t c, float sh) {
+    const float v = (float)((0xC8643210u >> ((c & 7u) << 2)) & 15u) * sh;
+    return __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, v) | ((c & 8u) << 28));
+}
+/* The same for the code at bits [T, T + 4) of w (T a constant): a bit-field extract, the table's field, a convert, a
+ * multiply and the sign -- eight instructions. */
+template <int T>
+__device__ __forceinline__ float ds_nv4_at(uint32_t w, float sh) {
+    const uint32_t m4 = ((w >> T) & 7u) << 2;
+    const float v = (float)((0xC8643210u >> m4) & 15u) * sh;
+    const uint32_t sg = T + 3 <= 31 ? (w >> (T + 3)) << 31 : 0u;
+    return __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, v) | sg);
+}
+/* ds_nv4_unpack8 by ds_nv4_val: eight codes (a word) at half scale sh -> four bf16 pairs, the same bits. */
+__device__ __forceinline__ uint4 ds_nv4_unpack8_fast(uint32_t w, float sh) {
+    uint32_t o[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+        o[t] = (__builtin_bit_cast(uint32_t, ds_nv4_val(w >> (8 * t), sh)) >> 16) |
+               (__builtin_bit_cast(uint32_t, ds_nv4_val(w >> (8 * t + 4), sh)) & 0xffff0000u);
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
+
 /* e2m1's code of v (quant_roundtrip's e2m1_code): nearest magnitude, ties to the even code, past 6
  * the largest; NaN 0. */
 __host__ __device__ __forceinline__ uint32_t ds_e2m1_code(float v) {
@@ -1353,8 +1392,10 @@ __device__ __forceinline__ void ds_dec_dot_nv(float (&acc)[HS], const DsNv4Raw& 
     for (int i = 0; i < 8; ++i) {
         uint32_t f[4] = { w8[i], (r.sc >> (8 * (i / 2))) & 0xffu, 0u, 0u };
         const int z = ds_dec_step<HS>(acc, f);
-        const uint4 kv = ds_nv4_unpack8(f[0], ds_e4m3_f32(f[1]));
-        const uint32_t wk[4] = { kv.x, kv.y, kv.z, kv.w };
+        const float sh = ds_e4m3_half(f[1]);
+        const float kf[8] = {                            /* the 8 values as f32: the bf16's own value */
+            ds_nv4_at<0>(f[0], sh), ds_nv4_at<4>(f[0], sh), ds_nv4_at<8>(f[0], sh), ds_nv4_at<12>(f[0], sh),
+            ds_nv4_at<16>(f[0], sh), ds_nv4_at<20>(f[0], sh), ds_nv4_at<24>(f[0], sh), ds_nv4_at<28>(f[0], sh) };
         if constexpr (QS) {
             const uint32_t* qi = qw + __builtin_amdgcn_readfirstlane(z) + i * 4;
 #pragma unroll
@@ -1363,8 +1404,8 @@ __device__ __forceinline__ void ds_dec_dot_nv(float (&acc)[HS], const DsNv4Raw& 
                 const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    acc[h] = __builtin_fmaf(bf16w_lo(qq[e]), bf16w_lo(wk[e]), acc[h]);
-                    acc[h] = __builtin_fmaf(bf16w_hi(qq[e]), bf16w_hi(wk[e]), acc[h]);
+                    acc[h] = __builtin_fmaf(bf16w_lo(qq[e]), kf[2 * e], acc[h]);
+                    acc[h] = __builtin_fmaf(bf16w_hi(qq[e]), kf[2 * e + 1], acc[h]);
                 }
             }
         } else {
@@ -1377,8 +1418,8 @@ __device__ __forceinline__ void ds_dec_dot_nv(float (&acc)[HS], const DsNv4Raw& 
                 const float qv[8] = { qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w };
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    acc[h] = __builtin_fmaf(qv[2 * e], bf16w_lo(wk[e]), acc[h]);
-                    acc[h] = __builtin_fmaf(qv[2 * e + 1], bf16w_hi(wk[e]), acc[h]);
+                    acc[h] = __builtin_fmaf(qv[2 * e], kf[2 * e], acc[h]);
+                    acc[h] = __builtin_fmaf(qv[2 * e + 1], kf[2 * e + 1], acc[h]);
                 }
             }
         }
@@ -1468,11 +1509,46 @@ __device__ __forceinline__ const uint16_t* ds_dec_pfence(const uint16_t* p, cons
     return (const uint16_t*)(((unsigned long long)hi << 32) | lo);
 #endif
 }
-/* ...unpacked in place to the bf16 pairs ds_dec_pvld reads from a plain entry. */
-template <int N>
-__device__ __forceinline__ void ds_dec_pvun(uint32_t (&kv)[N]) {
+
+/* ds_dec_pv4 over four packed keys (kv: code byte | scale byte << 8, DPT 2: the column pair of one code byte), the
+ * values as f32 by ds_nv4_val -- the same products and sums in the same order as over their bf16. */
+template <int HPT, int DPT>
+__device__ __forceinline__ void ds_dec_pv4_nv(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kw)[4],
+                                              const float* ph, int nkq, int k0, bool dw) {
+    static_assert(DPT == 2, "a code byte is a column pair");
+    float kf[4][DPT];
 #pragma unroll
-    for (int u = 0; u < N; ++u) kv[u] = ds_nv4_pair(kv[u] & 0xffu, kv[u] >> 8);
+    for (int u = 0; u < 4; ++u) {
+        const float sh = ds_e4m3_half(kw[u] >> 8);
+        kf[u][0] = ds_nv4_at<0>(kw[u], sh);
+        kf[u][1] = ds_nv4_at<4>(kw[u], sh);
+    }
+#pragma unroll
+    for (int j = 0; j < HPT; ++j) {
+        const float4 pv = *(const float4*)(ph + (long)j * nkq + k0);
+        const float pk[4] = { pv.x, pv.y, pv.z, pv.w };
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+#pragma unroll
+            for (int d = 0; d < DPT; ++d) {
+                const float prod = pk[u] * kf[u][d];
+                acc[j][d] = acc[j][d] + prod;
+            }
+        }
+        if (dw) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) den[j] = den[j] + pk[u];
+        }
+    }
+}
+template <int HPT, int DPT, int N>
+__device__ __forceinline__ void ds_dec_pvsum_nv(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[N],
+                                                const float* ph, int nkq, int k0, bool dw) {
+#pragma unroll
+    for (int u0 = 0; u0 < N; u0 += 4) {
+        const uint32_t kw[4] = { kv[u0], kv[u0 + 1], kv[u0 + 2], kv[u0 + 3] };
+        ds_dec_pv4_nv<HPT, DPT>(acc, den, kw, ph, nkq, k0 + u0, dw);
+    }
 }
 
 template <int HPT, int DPT, int N = 32>
@@ -1643,7 +1719,7 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
         }
     };
     auto piece = [&](int s, int tt) -> uint4 {              /* ring slot s (tile tt) as 16 bf16 bytes */
-        if constexpr (NV) return tt >= ptl ? ds_nv4_unpack8(rw[s], ds_e4m3_f32(rs[s])) : rg[s];
+        if constexpr (NV) return tt >= ptl ? ds_nv4_unpack8_fast(rw[s], ds_e4m3_half(rs[s])) : rg[s];
         else { (void)tt; return rg[s]; }
     };
     if constexpr (!PVD) {
@@ -1721,8 +1797,7 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
                             if (j + 1 == NS) np = kb + 1 < nkb ? kp[(kb + 1) * 32 + lane] : zero;
                             np = ds_dec_pfence<HPT, DPT>(np, acc);
                             ds_dec_pvld_nv<N>(kv[(j + 1) & 1], np, dcol, j + 1 < NS ? (j + 1) * N : 0);
-                            ds_dec_pvun<N>(kv[j & 1]);
-                            ds_dec_pvsum<HPT, DPT, N>(acc, den, kv[j & 1], ph, nkq, kb * 32 + j * N, dw);
+                            ds_dec_pvsum_nv<HPT, DPT, N>(acc, den, kv[j & 1], ph, nkq, kb * 32 + j * N, dw);
                             if (j + 1 == NS) lp = np;
                         }
                     }
