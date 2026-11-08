@@ -529,8 +529,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         mc.n_expert_all = mc.n_expert;
         /* bf16 experts are also split whole per rank: a slice of a bf16 expert is two row ranges
          * and a column range, which the file tier cannot read as one run, and a bf16 model is
-         * served to calibrate and compare, not for decode speed. */
-        if (g.world > 1 && (mc.calib || mc.expert_bf16)) {
+         * served to calibrate and compare, not for decode speed. EXL3 experts likewise
+         * (MoeFP8::declare_exl3): the radiance-exl3 ops run an expert whole, at their one-rank
+         * geometry, so at two or more ranks each rank serves its own experts (expert parallel)
+         * and the block's all-reduce sums the ranks' outputs -- with the routing imbalance the
+         * note above prices (about a millisecond a step at one sequence). */
+        if (g.world > 1 && (mc.calib || mc.expert_bf16 || mc.expert_exl3)) {
             int s;
             int64_t per = 0;
             if ((s = divide_or_fail(mc.n_expert_all, g.world, "expert_count", &per)) < 0) return s;
@@ -539,7 +543,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             mc.expert_base = (int64_t)g.rank * per;
             rad_note(b, "%s: rank %d owns experts [%lld, %lld) of %lld whole.",
                      mc.calib ? "calibration (each expert's Hessian is over its whole width)"
-                              : "bf16 experts", g.rank,
+                              : mc.expert_exl3 ? "EXL3 experts (expert parallel)" : "bf16 experts", g.rank,
                      (long long)mc.expert_base, (long long)(mc.expert_base + mc.n_expert),
                      (long long)mc.n_expert_all);
         } else if (g.world > 1) {
