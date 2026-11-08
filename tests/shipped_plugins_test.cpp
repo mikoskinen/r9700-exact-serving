@@ -100,7 +100,7 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "llama", "fp8_e4m3" }, { "nomicbert", "" }, { "qwen35", "" },
         { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" }, { "qwen35moe", "fp8_e4m3" },
         { "qwen3asr", "" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
-        { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" },
+        { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwen4exp", "exl3" }, { "qwenimage21", "" },
         { "spark25", "" }, { "spark25", "w8a8_fwht128" }, { "sdxl", "" },
         { "unlimitedocr", "" } };
     std::set<std::pair<std::string, std::string>> got;
