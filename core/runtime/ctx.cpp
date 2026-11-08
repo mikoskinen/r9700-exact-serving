@@ -1084,9 +1084,23 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
  * Host work between played stretches needs nothing here: a host op joins its dependencies, and
  * anything host work puts on a queue (table patch, mover wait) makes the backend order the next
  * played packet on that queue. */
+/* RADIANCE_AQL_NO_OVERLAP=1 (a diagnostic, fn4 8.11.2026): the overlap analysis marks nothing, so every played dispatch
+ * keeps its barrier bit and no two dispatches of a queue run at once. Same kernels, same arguments, same order; only the
+ * packet processor's freedom to start an independent dispatch early goes. Unset or 0: as before. */
+static bool haz_no_overlap() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_AQL_NO_OVERLAP");
+        const bool v = e && *e && std::atoi(e) != 0;
+        if (v) RAD_WARN("RADIANCE_AQL_NO_OVERLAP: every played dispatch keeps its barrier bit (no overlap)");
+        return v;
+    }();
+    return on;
+}
+
 int Ctx::haz_mark(PassTape& t) {
     const int n = tape_len(t.dev);
     if (n < 0) return n;
+    const bool no_overlap = haz_no_overlap();
     std::vector<int32_t> first_of((size_t)n, -1), part_of((size_t)n, -1);
     for (size_t k = 0; k < haz_ops_.size(); ++k) {
         const HazOp& o = haz_ops_[k];
@@ -1123,7 +1137,7 @@ int Ctx::haz_mark(PassTape& t) {
         ++t.dispatches;
 
         const int32_t op = first_of[(size_t)i];
-        bool ok = op >= 0 && !q->opaque && !haz_ops_[(size_t)op].opaque && q->run < kTapeOverlapRun;
+        bool ok = !no_overlap && op >= 0 && !q->opaque && !haz_ops_[(size_t)op].opaque && q->run < kTapeOverlapRun;
         if (ok) {
             const HazOp& h = haz_ops_[(size_t)op];
             for (int32_t x : q->infl) {
