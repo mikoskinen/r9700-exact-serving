@@ -12,9 +12,11 @@
 // r4d_ar_gather_hc_write_4rank (that plus moe_gather as prologue), exact wire only.
 //
 // The IPC helpers live in r4d_ar_oneshot_2rank_exact.hip; this unit links beside it.
+#include "r4d_chain.h"
 #include "r4d.h"
 #include <cstring>
 #include "r4d_ar_wide.h"
+#include "r4d_ar_wide_chain.h"
 #include "r4d_ar_hc.h"      // the gather and hc write words, shared with the two-rank fused forms
 #include <stdexcept>
 #include <string>
@@ -123,7 +125,7 @@ __global__ void r4d_ar_oneshot_wide_exact_kernel(
 // word before the handshake, and no peer reads this rank's `y`. A word never straddles a row
 // (n is a multiple of eight), so the thread that reduces it owns every stream element behind it.
 template <int WS>
-__global__ void r4d_ar_hc_write_wide_kernel(
+__device__ __forceinline__ void r4d_ar_hc_write_wide_body(
     int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
     unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
     const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
@@ -184,6 +186,29 @@ __global__ void r4d_ar_hc_write_wide_kernel(
   }
 }
 
+/* The plain and chained forms (r4d_chain.h; fn4 9.11.2026, the two-rank pattern of PR #396 at width): every block leaves
+ * through the wrapper; the body has no early return. */
+template <int WS>
+__global__ void r4d_ar_hc_write_wide_kernel(
+    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
+    int hc, long irow, long hrow, int slot_stride16, int rank, int drain, int acq, int pub,
+    long long* gate, unsigned int* gate_ctr) {
+  r4d_ar_hc_write_wide_body<WS>(y4, peers, my_base, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, rank, drain, acq, pub, gate, gate_ctr);
+}
+template <int WS>
+__global__ void r4dchain_ar_hc_write_wide(
+    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
+    int hc, long irow, long hrow, int slot_stride16, int rank, int drain, int acq, int pub,
+    long long* gate, unsigned int* gate_ctr) {
+  r4d_chain_wait();
+  r4d_ar_hc_write_wide_body<WS>(y4, peers, my_base, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, rank, drain, acq, pub, gate, gate_ctr);
+  r4d_chain_done();
+}
+
 // The same write with the MoE gather as its prologue, bf16 only; the four-rank form of the two-rank
 // r4d_ar_gather_hc_write_kernel. `y` is produced, not read: r4d_ar_gather_word sums each word back
 // to token order from the routed experts' rows, stores it as this rank's message and pushes it to
@@ -195,7 +220,7 @@ __global__ void r4d_ar_hc_write_wide_kernel(
 // launcher sizes the grid for it) find their slots once, in LDS, in one pass over the sorted list;
 // with INV they read the inverse table r4d_ar_gather_inv built beforehand.
 template <int WS, bool INV>
-__global__ void r4d_ar_gather_hc_write_wide_kernel(
+__device__ __forceinline__ void r4d_ar_gather_hc_write_wide_body(
     int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
     unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
     const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
@@ -275,6 +300,28 @@ __global__ void r4d_ar_gather_hc_write_wide_kernel(
     r4d_ar_hc_write_word(inj, h, row, i0, n, hc, irow, hrow,
                          reinterpret_cast<const unsigned short*>(&v));
   }
+}
+
+/* The plain and chained forms of the gather write, as above. */
+template <int WS, bool INV>
+__global__ void r4d_ar_gather_hc_write_wide_kernel(
+    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
+    int hc, long irow, long hrow, int slot_stride16, int rank, int drain, int acq, int pub,
+    R4dArGather G, const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr) {
+  r4d_ar_gather_hc_write_wide_body<WS, INV>(y4, peers, my_base, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, rank, drain, acq, pub, G, inv, gate, gate_ctr);
+}
+template <int WS, bool INV>
+__global__ void r4dchain_ar_gather_hc_write_wide(
+    int4* __restrict__ y4, R4DArWidePeers<int4, WS - 1> peers, const int4* __restrict__ my_base,
+    unsigned int* __restrict__ my_flags, unsigned int* __restrict__ seq_ctrs,
+    const unsigned short* __restrict__ inj, unsigned short* __restrict__ h, int n16, int n,
+    int hc, long irow, long hrow, int slot_stride16, int rank, int drain, int acq, int pub,
+    R4dArGather G, const int* __restrict__ inv, long long* gate, unsigned int* gate_ctr) {
+  r4d_chain_wait();
+  r4d_ar_gather_hc_write_wide_body<WS, INV>(y4, peers, my_base, my_flags, seq_ctrs, inj, h, n16, n, hc, irow, hrow, slot_stride16, rank, drain, acq, pub, G, inv, gate, gate_ctr);
+  r4d_chain_done();
 }
 
 // --- host side ---
@@ -397,7 +444,7 @@ static void ar_hc_write_wide_launch(const long* peer_scratch, const long* peer_f
                                     long slot_stride16, long y, long inj, long h, long M, long n,
                                     long hc, long irow, long hrow, long rank, long stream_i,
                                     long nblocks, long nthreads, long drain, long acq, long pub,
-                                    long gate, long gate_ctr) {
+                                    long gate, long gate_ctr, long chain = 0) {
   constexpr int NPEERS = WS - 1;
   static_assert(NPEERS <= R4D_AR_WIDE_MAX_PEERS, "npeers exceeds the peer bundle bound");
 
@@ -447,7 +494,7 @@ static void ar_hc_write_wide_launch(const long* peer_scratch, const long* peer_f
   }
 
   hipStream_t st = (hipStream_t)stream_i;
-  r4d_ar_hc_write_wide_kernel<WS><<<nb, nt, 0, st>>>(
+  (chain ? r4dchain_ar_hc_write_wide<WS> : r4d_ar_hc_write_wide_kernel<WS>)<<<nb, nt, 0, st>>>(
       (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs,
       (const unsigned short*)inj, (unsigned short*)h, n16, (int)n, (int)hc, irow, hrow,
       (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, (long long*)gate,
@@ -478,7 +525,7 @@ static void ar_gather_hc_write_wide_launch(
     long irow, long hrow, long ye, long ew, long sorted, long sh, long sg, long ye_ld,
     long ew_ld, long sh_ld, long sg_ld, long top_k, long sig, long rank, long stream_i,
     long nblocks, long nthreads, long drain, long acq, long pub, long inv, long gate,
-    long gate_ctr) {
+    long gate_ctr, long chain = 0) {
   constexpr int NPEERS = WS - 1;
   static_assert(NPEERS <= R4D_AR_WIDE_MAX_PEERS, "npeers exceeds the peer bundle bound");
 
@@ -560,13 +607,13 @@ static void ar_gather_hc_write_wide_launch(
     if (irc != 0)
       throw std::runtime_error("ar_gather_hc_write: the inverse table's launch failed (" +
                                std::to_string(irc) + ")");
-    r4d_ar_gather_hc_write_wide_kernel<WS, true><<<nb, nt, 0, st>>>(
+    (chain ? r4dchain_ar_gather_hc_write_wide<WS, true> : r4d_ar_gather_hc_write_wide_kernel<WS, true>)<<<nb, nt, 0, st>>>(
         (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags,
         (unsigned int*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, n16, (int)n,
         (int)hc, irow, hrow, (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, G,
         (const int*)inv, (long long*)gate, (unsigned int*)gate_ctr);
   } else {
-    r4d_ar_gather_hc_write_wide_kernel<WS, false><<<nb, nt, 0, st>>>(
+    (chain ? r4dchain_ar_gather_hc_write_wide<WS, false> : r4d_ar_gather_hc_write_wide_kernel<WS, false>)<<<nb, nt, 0, st>>>(
         (int4*)y, peers, (const int4*)my_scratch, (unsigned int*)my_flags,
         (unsigned int*)seq_ctrs, (const unsigned short*)inj, (unsigned short*)h, n16, (int)n,
         (int)hc, irow, hrow, (int)slot_stride16, (int)rank, (int)drain, (int)acq, (int)pub, G,
@@ -589,6 +636,37 @@ void r4d_ar_gather_hc_write_4rank(long peer_scratch0, long peer_scratch1, long p
                                     inj, h, M, n, hc, irow, hrow, ye, ew, sorted, sh, sg, ye_ld,
                                     ew_ld, sh_ld, sg_ld, top_k, sig, rank, stream, nblocks,
                                     nthreads, drain, acq, pub, inv, gate, gate_ctr);
+}
+
+// The chained-capable four-rank entries (r4d_ar_wide_chain.h): the plain ones above with `chain` passed through.
+void r4d_ar_hc_write_4rank_c(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                             long peer_flags0, long peer_flags1, long peer_flags2,
+                             long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                             long y, long inj, long h, long M, long n, long hc, long irow,
+                             long hrow, long rank, long stream, long nblocks, long nthreads,
+                             long drain, long acq, long pub, long gate, long gate_ctr, long chain) {
+  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+  ar_hc_write_wide_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, y, inj, h,
+                             M, n, hc, irow, hrow, rank, stream, nblocks, nthreads, drain, acq,
+                             pub, gate, gate_ctr, chain);
+}
+
+void r4d_ar_gather_hc_write_4rank_c(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                    long peer_flags0, long peer_flags1, long peer_flags2,
+                                    long my_scratch, long my_flags, long seq_ctrs,
+                                    long slot_stride16, long y, long inj, long h, long M, long n,
+                                    long hc, long irow, long hrow, long ye, long ew, long sorted,
+                                    long sh, long sg, long ye_ld, long ew_ld, long sh_ld,
+                                    long sg_ld, long top_k, long sig, long rank, long stream,
+                                    long nblocks, long nthreads, long drain, long acq, long pub,
+                                    long inv, long gate, long gate_ctr, long chain) {
+  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+  ar_gather_hc_write_wide_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, y,
+                                    inj, h, M, n, hc, irow, hrow, ye, ew, sorted, sh, sg, ye_ld,
+                                    ew_ld, sh_ld, sg_ld, top_k, sig, rank, stream, nblocks,
+                                    nthreads, drain, acq, pub, inv, gate, gate_ctr, chain);
 }
 
 void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers) {
