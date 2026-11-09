@@ -3229,6 +3229,24 @@ static bool hc_fuse_down() {
     return v == 1;
 }
 
+/* fn4 F1n: the decode tiles' norm scales from hc_pf2_prep_kernel's scale blocks (one wave per
+ * (row, stream), 16-byte loads, five chunks in flight; the same sums in the same order as
+ * hc_norm_scale_kernel, which PF2 already relies on) instead of hc_norm_scale_kernel, whose ten
+ * dependent 2-byte loads a thread measured 18.0 us at 33-64 rows against 2.0 us at <= 32 (115,
+ * c16 stamps). RADIANCE_FN4_HC_NORMWAVE set and not 0; r4d_hc_read_norm_wave pins it. */
+static std::atomic<int> g_hc_norm_wave{-1};
+static bool hc_norm_wave() {
+    int v = g_hc_norm_wave.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_HC_NORMWAVE");
+        const int on = (e && *e && *e != '0') ? 1 : 0;
+        int want = -1;
+        g_hc_norm_wave.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_hc_norm_wave.load(std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
  * hc_down_tiled_kernel at RT 128 has three costs at a 2048-row chunk: a sixth 64-column tile
@@ -5768,7 +5786,19 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
             return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
         }
 
-        /* The per-s norm scales: one workgroup per (row, s). */
+        /* The per-s norm scales: one workgroup per (row, s). fn4 F1n (off by default): one wave per
+         * (row, s) through hc_pf2_prep_kernel's scale blocks alone -- a grid of exactly nnb blocks,
+         * so no block reaches its plane loop -- where its 16-byte loads fit (n a multiple of 256,
+         * rows 8-aligned) and nothing is chained. Through r4d_emit, so r4d_record_dispatches sees it. */
+        if (hc_norm_wave() && !g_r4d_chain_arg && (n % kThreads) == 0 && (hrow % 8) == 0
+            && (((uintptr_t)h->data & 15u) == 0u)) {
+            const long nnb = ((long)rows * hc + kWaves - 1) / kWaves;
+            (void)R4D_EMIT(s, &hc_pf2_prep_kernel, dim3((unsigned)nnb), dim3(kThreads), 0,
+                           (const unsigned short*)h->data, scale, (long)rows, (long)n, (int)hc,
+                           (long)hrow, eps, nnb, (const void*)nullptr, 0L, false,
+                           (const unsigned short*)nullptr, (const unsigned char*)nullptr, 0L,
+                           (uint4*)nullptr, (unsigned short*)nullptr, (long)lr, ncol, 0L);
+        } else
         hipLaunchKernelGGL((g_r4d_chain_arg ? &r4dchain_hc_norm_scale : &hc_norm_scale_kernel),
                            dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0, (hipStream_t)s,
                            (const unsigned short*)h->data, scale,
@@ -6032,3 +6062,4 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
 extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on ? 1 : 0, std::memory_order_relaxed); }
+extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on ? 1 : 0, std::memory_order_relaxed); }

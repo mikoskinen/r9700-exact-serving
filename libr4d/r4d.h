@@ -727,6 +727,10 @@ void r4d_hc_read_pin_decode(int form);
 // Test hook (fn4 F1a): 1 folds the split-K down product's reduce into its launch, 0 keeps the pair,
 // overriding RADIANCE_FN4_HC_FUSEDOWN. Bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_fuse_down(int on);
+// Test hook (fn4 F1n): 1 computes the decode tiles' norm scales with hc_pf2_prep_kernel's scale
+// blocks (one wave per (row, stream)), 0 with hc_norm_scale_kernel, overriding
+// RADIANCE_FN4_HC_NORMWAVE. Bit-identical; r4d_selftest compares their bytes.
+void r4d_hc_read_norm_wave(int on);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
 // Bit-identical; r4d_selftest compares them and --perfmla times both.

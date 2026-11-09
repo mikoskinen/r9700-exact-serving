@@ -147,6 +147,7 @@ struct Plugin {
     void (*pin_hc)(int) = nullptr;
     void (*pin_hc_dec)(int) = nullptr;
     void (*fuse_hc_down)(int) = nullptr;   /* optional (fn4 F1a): absent from a stock libr4d */
+    void (*norm_hc_wave)(int) = nullptr;   /* optional (fn4 F1n) */
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -221,6 +222,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
     pl->fuse_hc_down = (void (*)(int))dlsym(pl->h, "r4d_hc_read_fuse_down");
+    pl->norm_hc_wave = (void (*)(int))dlsym(pl->h, "r4d_hc_read_norm_wave");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -20592,12 +20594,14 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
  * run records one launch more -- and elsewhere the same count, so an ignored switch cannot pass. */
 static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) {
     const bool fused_here = (M > 16 && M <= 64) || pf_pin == 1;
+    const bool wave_here  = M > 16;     /* the tiled path's norm launch (fn4 F1n) */
     const std::string nm = fmt("hc_read_e4m3 at M=%lld, %s codes%s: the folded down reduce "
-                               "(fn4 F1a) byte-identical to the pair", (long long)M,
-                               i8 ? "int8" : "E4M3", pf_pin ? ", prefill pin 1" : "");
+                               "(fn4 F1a) and the wave norm scales (F1n) byte-identical to the "
+                               "pair", (long long)M, i8 ? "int8" : "E4M3",
+                               pf_pin ? ", prefill pin 1" : "");
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r) { skip(nm.c_str(), "row absent"); return; }
-    if (!pl.fuse_hc_down || !pl.record || (pf_pin && !pl.pin_hc)) {
+    if (!pl.fuse_hc_down || !pl.norm_hc_wave || !pl.record || (pf_pin && !pl.pin_hc)) {
         skip(nm.c_str(), "no r4d_hc_read_fuse_down");
         return;
     }
@@ -20671,10 +20675,11 @@ static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) 
         if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
     }
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; };
-    Out out[3];                         /* the pair, then the folded form twice */
+    Out out[5];   /* the pair; the folded form twice; the wave norm alone; both */
     if (pf_pin) pl.pin_hc(pf_pin);
-    for (int run = 0; run < 3; ++run) {
-        pl.fuse_hc_down(run > 0 ? 1 : 0);
+    for (int run = 0; run < 5; ++run) {
+        pl.fuse_hc_down(run == 1 || run == 2 || run == 4 ? 1 : 0);
+        pl.norm_hc_wave(run >= 3 ? 1 : 0);
         st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
         st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
         if (a.scratch) st_memset(a.scratch, 0xa5, (size_t)a.scratch_bytes);
@@ -20685,6 +20690,7 @@ static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) 
         if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
             ok(nm.c_str(), false, fmt("run %d rc=%d", run, rc));
             pl.fuse_hc_down(0);
+            pl.norm_hc_wave(0);
             if (pf_pin) pl.pin_hc(0);
             (void)hipStreamDestroy(hs);
             return;
@@ -20697,11 +20703,14 @@ static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) 
         if (a.scratch && (size_t)a.scratch_bytes >= db) get(out[run].d, a.scratch, db);
     }
     pl.fuse_hc_down(0);
+    pl.norm_hc_wave(0);
     if (pf_pin) pl.pin_hc(0);
     (void)hipStreamDestroy(hs);
     std::string bad;
-    for (int run = 1; run < 3; ++run) {
-        const char* at = run == 1 ? " (first)" : " (second)";
+    static const char* const kRun[5] = { "", " (folded)", " (folded again)", " (wave norm)",
+                                         " (folded + wave norm)" };
+    for (int run = 1; run < 5; ++run) {
+        const char* at = kRun[run];
         if (out[0].x != out[run].x)     bad += std::string(" x") + at;
         if (out[0].inj != out[run].inj) bad += std::string(" inj") + at;
         if (out[0].q != out[run].q)     bad += std::string(" q") + at;
@@ -20711,13 +20720,17 @@ static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) 
         if (out[0].d != out[run].d)     bad += std::string(" d") + at;
     }
     const int want = fused_here ? out[0].nd + 1 : out[0].nd;
-    const bool count_ok = out[1].nd == want && out[2].nd == want;
+    const int wantn = wave_here ? out[0].nd + 1 : out[0].nd;
+    const int wantb = want + (wantn - out[0].nd);
+    const bool count_ok = out[1].nd == want && out[2].nd == want && out[3].nd == wantn
+                          && out[4].nd == wantb;
     int64_t nz = 0;
     for (uint8_t v : out[0].q) nz += v != 0xa5;
     ok(nm.c_str(), bad.empty() && count_ok && nz > (int64_t)qb / 2,
        !bad.empty() ? "differs in" + bad
-       : !count_ok  ? fmt("%d launches unfolded, %d and %d folded (want %d)", out[0].nd,
-                          out[1].nd, out[2].nd, want)
+       : !count_ok  ? fmt("%d launches unfolded, %d and %d folded (want %d), %d wave norm "
+                          "(want %d), %d both (want %d)", out[0].nd, out[1].nd, out[2].nd, want,
+                          out[3].nd, wantn, out[4].nd, wantb)
                     : fmt("%d and %d launches", out[0].nd, out[1].nd));
 }
 
