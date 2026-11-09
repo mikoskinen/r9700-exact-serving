@@ -611,7 +611,23 @@ int Ctx::route_flush() {
     return RAD_OK;
 }
 
+/* fn4 F2b, RADIANCE_FN4_NO_ROUTE=1: no routing report at all -- no histogram copy (one ordered
+ * aql_copy16 dispatch a routed layer, ~4 us of the card idling before it at decode) and no host
+ * step between played stretches. For a placement whose experts never move (--placement all_vram):
+ * the reports feed only the heat engine, the mover and the file stager's trigger. Unset: as before. */
+static bool fn4_no_route() {
+    static const bool on = [] {
+        const char* v = std::getenv("RADIANCE_FN4_NO_ROUTE");
+        const bool o = v && *v && *v != '0';
+        if (o) RAD_INFO("RADIANCE_FN4_NO_ROUTE: no routing reports (the heat engine, mover and file stager "
+                        "get no histograms; for --placement all_vram)");
+        return o;
+    }();
+    return on;
+}
+
 int Ctx::route_report(int layer, const RadRouting* r) {
+    if (fn4_no_route()) return RAD_OK;
     if (rec_ && r) {
         tape_cut();
         TapeStep st;
