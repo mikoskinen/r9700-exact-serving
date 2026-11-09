@@ -843,8 +843,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             return RAD_E_INVAL;
         }
         /* The quantised GEMM takes two equal tables by parity; with four classes
-         * (Config::ff_lo4), four tables with the first n_reg % 4 one longer, so any count works. */
-        if (!(c.ff_hi[0] > 0 && c.ff_hi4[0] > 0) && n_reg % 2) {
+         * (Config::ff_lo4), four tables with the first n_reg % 4 one longer, so any count works.
+         * EXL3's ops take any count too: class c holds ceil((n - c) / 2) entries
+         * (exl3_class_entries), and declare_exl3 splits its tables so -- an odd count is what a
+         * rank gets at expert parallel four when one of its 128 experts is kept plain bf16. */
+        if (!c.expert_exl3 && !(c.ff_hi[0] > 0 && c.ff_hi4[0] > 0) && n_reg % 2) {
             fprintf(stderr, "radiance: layer %d keeps %zu experts plain bf16 on this rank, which "
                             "leaves %lld quantised; they come in pairs on a rank so the rest split "
                             "into two equal tables by parity\n", l, prot.size(), (long long)n_reg);
@@ -1753,7 +1756,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
  * gate_up [2 n_ff, n_embd] and down [n_embd, n_ff] for every expert, in two parity tables (expert e at entry
  * e / 2 of class e % 2), as the extension's own architecture issues them at one rank. One run a plane --
  * gate_up's codes, suh, suh.1, svh; down's codes, suh, svh -- each declared as the even experts then the odd
- * ones, so a (plane, class) table is RAD_WTAB(run[q * ne / 2], ne / 2). gate_up reads the bf16 normed input
+ * ones, so a (plane, class) table is RAD_WTAB(run[0], (ne + 1) / 2) for class 0 and RAD_WTAB(run[(ne + 1) / 2], ne / 2)
+ * for class 1 (an odd count -- expert parallel four with one expert kept bf16 -- makes class 0 the longer). gate_up reads the bf16 normed input
  * (one row per token), writes f16 h already rotated for down (h_rot 1, with down's suh run as its dn_suh
  * table), applies silu(gate) * up with the model's swiglu_limit (interface v8 `limit`); down reads h in the
  * scatter's order and writes the bf16 `edn` rows the gather sums. The prefill stager keys a layer on its first
@@ -1773,9 +1777,11 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l, const std::vect
         fprintf(stderr, "radiance: layer %d: EXL3 experts take no calibration tap or rotated/four-bit form\n", l);
         return RAD_E_UNSUPPORTED;
     }
-    if (ne < 2 || ne % 2) {
-        fprintf(stderr, "radiance: layer %d holds %lld EXL3 experts on this rank; the ops take two equal "
-                        "parity tables\n", l, (long long)ne);
+    /* Two parity tables, class 0 (even places) the longer by one when the count is odd: the
+     * extension sizes class c at ceil((ne - c) / 2) entries (exl3_class_entries) and reads expert e
+     * at entry e / 2 of class e % 2. `run` holds the even places, then the odd ones. */
+    if (ne < 1) {
+        fprintf(stderr, "radiance: layer %d holds no EXL3 expert on this rank\n", l);
         return RAD_E_INVAL;
     }
     if (!x3_dtype[0] || !x3_dtype[1] || std::strcmp(x3_cb[0], x3_cb[1]) != 0) {
@@ -1784,7 +1790,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l, const std::vect
         return RAD_E_DTYPE;
     }
     if (g.n_embd % EXL3_HAD || c.n_ff_exp % EXL3_HAD || (2 * c.n_ff_exp) % 256) return RAD_E_SHAPE;
-    const int64_t half = ne / 2, D = g.n_embd, F = c.n_ff_exp;
+    const int64_t n0 = (ne + 1) / 2, D = g.n_embd, F = c.n_ff_exp;   /* class 0's entries; class 1 has ne / 2 */
     static const char* const gu_role[4] = { "codes", "suh", "suh.1", "svh" };
     static const char* const dn_role[3] = { "codes", "suh", "svh" };
     for (int proj = 0; proj < 2; ++proj) {
@@ -1822,7 +1828,8 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l, const std::vect
         for (int q = 0; q < 2; ++q)
             for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
                 const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
-                for (int64_t i = 0; i < half; ++i) tab.push_back(run[(size_t)(q * half + i)]);
+                for (int64_t i = 0, b0 = q ? n0 : 0, n = q ? ne / 2 : n0; i < n; ++i)
+                    tab.push_back(run[(size_t)(b0 + i)]);
             }
     };
     tables(true);
@@ -1854,7 +1861,7 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
     static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
     static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
     const bool gate_up = op == EXL3_GATE_UP;
-    const int64_t ne = n_reg, half = ne / 2, k = c.top_k;   /* the EXL3 experts (protected ones after them) */
+    const int64_t ne = n_reg, n0 = (ne + 1) / 2, k = c.top_k;   /* the EXL3 experts (protected ones after them) */
     RadOperand opd[16];
     for (RadOperand& o : opd) o = RAD_NONE;
     opd[at.x] = in;
@@ -1864,7 +1871,9 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
     for (int q = 0; q < 2; ++q)
         for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
             const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
-            opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] = RAD_WTAB(run[(size_t)(q * half)], half);
+            /* class 0: the even places (n0 entries), class 1: the odd ones after them (ne / 2) */
+            opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] =
+                RAD_WTAB(run[(size_t)(q ? n0 : 0)], q ? ne / 2 : n0);
         }
     rad_issue(c_, op_h, opd, at.n_opd, rows);
 }
