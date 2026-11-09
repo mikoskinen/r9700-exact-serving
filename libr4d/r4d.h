@@ -724,6 +724,9 @@ void r4d_hc_read_pin_prefill(int form);
 // the tiled up-mix's passes unpipelined). Bit-identical; r4d_selftest compares their bytes
 // and --perfhc times both.
 void r4d_hc_read_pin_decode(int form);
+// Test hook (fn4 F1a): 1 folds the split-K down product's reduce into its launch, 0 keeps the pair,
+// overriding RADIANCE_FN4_HC_FUSEDOWN. Bit-identical; r4d_selftest compares their bytes.
+void r4d_hc_read_fuse_down(int on);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
 // Bit-identical; r4d_selftest compares them and --perfmla times both.

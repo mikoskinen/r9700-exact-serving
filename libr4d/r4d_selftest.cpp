@@ -146,6 +146,7 @@ struct Plugin {
     void (*pin_ddec)(int) = nullptr;
     void (*pin_hc)(int) = nullptr;
     void (*pin_hc_dec)(int) = nullptr;
+    void (*fuse_hc_down)(int) = nullptr;   /* optional (fn4 F1a): absent from a stock libr4d */
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -219,6 +220,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_moe_gemm_pin_down_dec", &pl->pin_ddec);
     okall &= sym(pl->h, "r4d_hc_read_pin_prefill", &pl->pin_hc);
     okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
+    pl->fuse_hc_down = (void (*)(int))dlsym(pl->h, "r4d_hc_read_fuse_down");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -3277,8 +3279,12 @@ static void topk_scatter_at(const RadKernelInfo* rf, const RadKernelInfo* rt,
  * self-resetting counter, owned by the instance the row's init creates, which all launches here
  * share while the grid changes between them. A launch with no instance is refused. */
 static void router_gemm_fused_case(const Plugin& pl) {
-    if (!sel("router_gemm_topk_scatter_bf16")) return;
+    if (!sel("router_gemm_topk_scatter_bf16") && !sel("router_gemm_topk_scatter_inv_bf16")) return;
     const RadKernelInfo* rg  = find(pl, "router_gemm_topk_scatter_bf16");
+    /* fn4 F2a, optional: the same op writing the inverse slot table as well. Each shape's two
+     * launches are followed by two of it, every output against the unfused launches and the
+     * inverse against the table built from their `sorted_tok` (as moefuse_gather checks it). */
+    const RadKernelInfo* rgi = find(pl, "router_gemm_topk_scatter_inv_bf16");
     const RadKernelInfo* m16 = find(pl, "gemm_bf16_nt_m16");
     const RadKernelInfo* m64 = find(pl, "gemm_bf16_nt_m64");
     const RadKernelInfo* rf  = find(pl, "router_topk_scatter_bf16");
@@ -3315,7 +3321,9 @@ static void router_gemm_fused_case(const Plugin& pl) {
     void* d_so[2] = { dalloc((size_t)maxNS * 4), dalloc((size_t)maxNS * 4) };
     void* d_of[2] = { dalloc((size_t)(maxNe + 1) * 4), dalloc((size_t)(maxNe + 1) * 4) };
     void* d_cn[2] = { dalloc((size_t)maxNe * 4), dalloc((size_t)maxNe * 4) };
-    if (!d_a || !d_w || !d_wg || !d_lg[0] || !d_lg[1] || !d_g[0] || !d_g[1] || !d_id[0] ||
+    void* d_inv = dalloc((size_t)(maxNS + 16) * 4);
+    if (!d_inv ||
+        !d_a || !d_w || !d_wg || !d_lg[0] || !d_lg[1] || !d_g[0] || !d_g[1] || !d_id[0] ||
         !d_id[1] || !d_ew[0] || !d_ew[1] || !d_so[0] || !d_so[1] || !d_of[0] || !d_of[1] ||
         !d_cn[0] || !d_cn[1]) {
         ok("router_gemm_topk_scatter", false, "hipMalloc failed");
@@ -3439,6 +3447,68 @@ static void router_gemm_fused_case(const Plugin& pl) {
                 same("sorted_tok", d_so[0], d_so[1], (size_t)NS * 4);
                 same("expert_offset", d_of[0], d_of[1], (size_t)(c.nl + 1) * 4);
                 same("expert_count", d_cn[0], d_cn[1], (size_t)c.nl * 4);
+            }
+
+            /* ---- fn4 F2a: the _inv op, twice, on the same instance */
+            for (int rep = 0; rep < 2 && rgi; ++rep) {
+                st_memset(d_lg[1], 0xFF, (size_t)maxM * maxNe * 2);
+                st_memset(d_g[1], 0xFF, (size_t)maxM * 2);
+                st_memset(d_id[1], 0xFF, (size_t)maxNS * 4);
+                st_memset(d_ew[1], 0, (size_t)maxNS * 2);
+                st_memset(d_so[1], 0xFF, (size_t)maxNS * 4);
+                st_memset(d_of[1], 0xFF, (size_t)(maxNe + 1) * 4);
+                st_memset(d_cn[1], 0xFF, (size_t)maxNe * 4);
+                st_memset(d_inv, 0xa5, (size_t)(maxNS + 16) * 4);
+                std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { M, c.K }),
+                                              T(d_w, RAD_BF16, { c.ne, c.K }),
+                                              T(d_wg, RAD_BF16, { 1, c.K }),
+                                              T(d_lg[1], RAD_BF16, { M, c.ne }),
+                                              T(d_id[1], RAD_I32, { M, c.k }),
+                                              T(d_ew[1], RAD_BF16, { M, c.k }),
+                                              T(d_so[1], RAD_I32, { NS }),
+                                              T(d_of[1], RAD_I32, { c.nl + 1 }),
+                                              T(d_cn[1], RAD_I32, { c.nl }),
+                                              T(d_g[1], RAD_BF16, { M, 1 }),
+                                              T(d_inv, RAD_I32, { NS }) };
+                if (!c.gate) { absent(ts[2]); absent(ts[9]); }
+                std::vector<RadParam> ps = { PI("M", M), PI("K", c.K), PI("n_expert", c.ne),
+                                             PI("n_local", c.nl), PI("top_k", c.k), PI("norm", 1),
+                                             PS("dtype", "bf16"), PI("expert_base", c.base) };
+                if (c.prot) ps.push_back(PS("protect", c.prot));
+                run_case(rgi, ts, ps, RAD_OK, inst);
+
+                const std::string tag = at + (rep ? ", second launch" : "");
+                auto same = [&](const char* what, void* a, void* b, size_t bytes) {
+                    std::vector<uint8_t> x(bytes), y(bytes);
+                    st_memcpy(x.data(), a, bytes, hipMemcpyDeviceToHost);
+                    st_memcpy(y.data(), b, bytes, hipMemcpyDeviceToHost);
+                    int64_t n_off = 0;
+                    for (size_t i = 0; i < bytes; ++i) n_off += x[i] != y[i];
+                    ok((std::string("router_gemm_topk_scatter_inv ") + what +
+                        " is byte-identical to the unfused launches" + tag).c_str(),
+                       n_off == 0, n_off ? fmt("%lld byte(s) differ", (long long)n_off) : std::string());
+                };
+                same("logits", d_lg[0], d_lg[1], (size_t)M * c.ne * 2);
+                if (c.gate) same("shared gate", d_g[0], d_g[1], (size_t)M * 2);
+                same("expert_ids", d_id[0], d_id[1], (size_t)NS * 4);
+                same("expert_w", d_ew[0], d_ew[1], (size_t)NS * 2);
+                same("sorted_tok", d_so[0], d_so[1], (size_t)NS * 4);
+                same("expert_offset", d_of[0], d_of[1], (size_t)(c.nl + 1) * 4);
+                same("expert_count", d_cn[0], d_cn[1], (size_t)c.nl * 4);
+                std::vector<int32_t> srt((size_t)NS), inv((size_t)NS + 16), want((size_t)NS, -1);
+                st_memcpy(srt.data(), d_so[0], (size_t)NS * 4, hipMemcpyDeviceToHost);
+                st_memcpy(inv.data(), d_inv, ((size_t)NS + 16) * 4, hipMemcpyDeviceToHost);
+                for (int64_t p = 0; p < NS; ++p)
+                    if (srt[(size_t)p] >= 0) want[(size_t)srt[(size_t)p]] = (int32_t)p;
+                bool tail = true;
+                for (int i = 0; i < 16; ++i) tail = tail && inv[(size_t)NS + (size_t)i] == (int32_t)0xa5a5a5a5;
+                int64_t n_bad = 0;
+                for (int64_t i = 0; i < NS; ++i) n_bad += inv[(size_t)i] != want[(size_t)i];
+                ok(("router_gemm_topk_scatter_inv inverse is the table built from sorted_tok" + tag).c_str(),
+                   n_bad == 0 && tail,
+                   !tail ? std::string("wrote past the table")
+                         : n_bad ? fmt("%lld of %lld entries differ", (long long)n_bad, (long long)NS)
+                                 : std::string());
             }
         }
     }
@@ -20512,6 +20582,145 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
                           out[0].fns.size(), out[1].fns.size()));
 }
 
+/* fn4 F1a: the split-K down product with its reduce folded in (r4d_hc_read_fuse_down(1)) against
+ * the pair, at Flash-Next's shape (n 2560, four streams, lowrank 320, inject gains, the fp8 twin
+ * and its rotated twin) on a real stream. Every output -- x, the inject gains, both code planes and
+ * their scales, and d in the scratch -- byte for byte, the folded form launched twice (its tile
+ * counters reset themselves). Where the tiled split runs (17 to 64 rows, and the decode tiles at
+ * 128 rows under prefill pin 1) the folded kernel must show in r4d_record_dispatches -- it goes
+ * through r4d_emit, the pair through hipLaunchKernelGGL, which the log does not see, so the folded
+ * run records one launch more -- and elsewhere the same count, so an ignored switch cannot pass. */
+static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) {
+    const bool fused_here = (M > 16 && M <= 64) || pf_pin == 1;
+    const std::string nm = fmt("hc_read_e4m3 at M=%lld, %s codes%s: the folded down reduce "
+                               "(fn4 F1a) byte-identical to the pair", (long long)M,
+                               i8 ? "int8" : "E4M3", pf_pin ? ", prefill pin 1" : "");
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.fuse_hc_down || !pl.record || (pf_pin && !pl.pin_hc)) {
+        skip(nm.c_str(), "no r4d_hc_read_fuse_down");
+        return;
+    }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4), db = (size_t)(M * lr * 2);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; };
+    Out out[3];                         /* the pair, then the folded form twice */
+    if (pf_pin) pl.pin_hc(pf_pin);
+    for (int run = 0; run < 3; ++run) {
+        pl.fuse_hc_down(run > 0 ? 1 : 0);
+        st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
+        st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
+        if (a.scratch) st_memset(a.scratch, 0xa5, (size_t)a.scratch_bytes);
+        const void* fns[32] = {};
+        pl.record(fns, 32);
+        const int rc = r->launch(&a, (RadStream)hs);
+        out[run].nd = pl.record(nullptr, 0);
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("run %d rc=%d", run, rc));
+            pl.fuse_hc_down(0);
+            if (pf_pin) pl.pin_hc(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) {
+            v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost);
+        };
+        get(out[run].x, d_x, xb); get(out[run].inj, d_inj, ib); get(out[run].q, d_q, qb);
+        get(out[run].qs, d_qs, sb); get(out[run].rq, d_rq, qb); get(out[run].rs, d_rs, sb);
+        if (a.scratch && (size_t)a.scratch_bytes >= db) get(out[run].d, a.scratch, db);
+    }
+    pl.fuse_hc_down(0);
+    if (pf_pin) pl.pin_hc(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    for (int run = 1; run < 3; ++run) {
+        const char* at = run == 1 ? " (first)" : " (second)";
+        if (out[0].x != out[run].x)     bad += std::string(" x") + at;
+        if (out[0].inj != out[run].inj) bad += std::string(" inj") + at;
+        if (out[0].q != out[run].q)     bad += std::string(" q") + at;
+        if (out[0].qs != out[run].qs)   bad += std::string(" qs") + at;
+        if (out[0].rq != out[run].rq)   bad += std::string(" rq") + at;
+        if (out[0].rs != out[run].rs)   bad += std::string(" rs") + at;
+        if (out[0].d != out[run].d)     bad += std::string(" d") + at;
+    }
+    const int want = fused_here ? out[0].nd + 1 : out[0].nd;
+    const bool count_ok = out[1].nd == want && out[2].nd == want;
+    int64_t nz = 0;
+    for (uint8_t v : out[0].q) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && count_ok && nz > (int64_t)qb / 2,
+       !bad.empty() ? "differs in" + bad
+       : !count_ok  ? fmt("%d launches unfolded, %d and %d folded (want %d)", out[0].nd,
+                          out[1].nd, out[2].nd, want)
+                    : fmt("%d and %d launches", out[0].nd, out[1].nd));
+}
+
 /* The gated residual's read at a prefill chunk: hc_read_e4m3 at Qwen3.8-Flash-Next's shape (n
  * 2560, four streams, lowrank 320, inject gains, the fp8 twin and its rotated twin). Several
  * launches at prefill, so also a harness for libr4d/isa/trace.sh. Random codes, small positive
@@ -33764,6 +33973,11 @@ static void device_phase(const Plugin& pl) {
          * form S at 12 and 16 rows, and the tiled up-mix at both of its row tiles. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 32, 33, 64 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
+        /* fn4 F1a: the folded down reduce against the pair, at the tiled split's row tiles and
+         * either side of them, and at the decode tiles' 128 rows under prefill pin 1. */
+        for (int64_t m : { 16, 17, 24, 32, 33, 48, 64, 65 })
+            for (bool i8 : { false, true }) hc_fuse_down_case(pl, m, i8, 0);
+        hc_fuse_down_case(pl, 300, true, 1);
     }
     if (sel("hc_read_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's read over bf16 mixing matrices at the "

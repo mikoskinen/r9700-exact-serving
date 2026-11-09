@@ -3102,6 +3102,106 @@ void r4dchain_hc_down_reduce(const float* __restrict__ part, unsigned short* __r
     r4d_chain_done();
 }
 
+/* fn4 F1a (RADIANCE_FN4_HC_FUSEDOWN=1): the split-K down product with its reduce in one launch.
+ * Every workgroup writes its partial as hc_down_tiled does; the last of a tile's gridDim.z
+ * workgroups to arrive (a self-resetting counter per (x, y) tile, hc_down_ctr) sums the tile's
+ * partials in ascending z from 0.0f -- the adds hc_down_reduce makes, in its order -- and applies
+ * its epilogue. Same bytes; one launch and one ordered dependency fewer. A thread reduces kFrG
+ * outputs together, so a tile's 2048 outputs over 26 partials are four rounds of 64 loads, not 32
+ * dependent ones. */
+constexpr int kFrG = 8;
+template <int RT, int NT>
+__device__ __forceinline__ void hc_down_fold_reduce_tail(const float* part, unsigned short* dout,
+                                                         unsigned short* inj, unsigned int* ctr,
+                                                         long rows, long lr, long ncol, long irow,
+                                                         float inv_hc) {
+    const long r0 = (long)blockIdx.y * RT, c0 = (long)blockIdx.x * NT;
+    if (r0 >= rows || c0 >= ncol) return;        /* the body wrote nothing; its tile does not exist */
+    const int ks = (int)gridDim.z;
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned int s_arrived;
+    const unsigned slot = blockIdx.y * gridDim.x + blockIdx.x;
+    if (threadIdx.x == 0)
+        s_arrived = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL,
+                                           __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    if (s_arrived + 1u != (unsigned)ks) return;
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    /* No other workgroup of this launch touches the slot again; the next launch is stream-ordered. */
+    if (threadIdx.x == 0) __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+    const long tot  = rows * ncol;
+    const long nr   = (rows - r0 < RT) ? rows - r0 : RT;
+    const long nc   = (ncol - c0 < NT) ? ncol - c0 : NT;
+    const long nout = nr * nc;
+    for (long o0 = threadIdx.x; o0 < nout; o0 += (long)kFrG * kThreads) {
+        long  idx[kFrG];
+        float s[kFrG];
+#pragma unroll
+        for (int g = 0; g < kFrG; ++g) {
+            const long o = o0 + (long)g * kThreads;
+            const long rr = o / nc, cc = o - rr * nc;
+            idx[g] = (o < nout) ? (r0 + rr) * ncol + c0 + cc : -1;
+            s[g]   = 0.0f;
+        }
+        int z = 0;
+        for (; z + 8 <= ks; z += 8) {
+            float v[kFrG][8];
+#pragma unroll
+            for (int g = 0; g < kFrG; ++g)
+#pragma unroll
+                for (int t = 0; t < 8; ++t)
+                    v[g][t] = idx[g] >= 0 ? part[(long)(z + t) * tot + idx[g]] : 0.0f;
+#pragma unroll
+            for (int g = 0; g < kFrG; ++g)
+#pragma unroll
+                for (int t = 0; t < 8; ++t) s[g] += v[g][t];
+        }
+        for (; z < ks; ++z)
+#pragma unroll
+            for (int g = 0; g < kFrG; ++g)
+                if (idx[g] >= 0) s[g] += part[(long)z * tot + idx[g]];
+#pragma unroll
+        for (int g = 0; g < kFrG; ++g) {
+            if (idx[g] < 0) continue;
+            const long r = idx[g] / ncol, col = idx[g] - r * ncol;
+            if (col < lr) dout[r * lr + col] = f2bf(siluf_(s[g] * inv_hc));
+            else          inj[r * irow + (col - lr)] = f2bf(2.0f * sigmoidf_(s[g] * inv_hc));
+        }
+    }
+}
+
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <int RT, int NT, bool F8>
+__global__ __launch_bounds__(kThreads)
+void hc_down_tiled_fr_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                             const void* __restrict__ downv, long dld,
+                             const float* __restrict__ scalein,
+                             const unsigned short* __restrict__ injw,
+                             unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                             float* __restrict__ part,
+                             long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
+                             long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) {
+    hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
+    hc_down_fold_reduce_tail<RT, NT>(part, dout, inj, ctr, rows, lr, ncol, irow, inv_hc);
+}
+template <int RT, int NT, bool F8>
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_down_tiled_fr(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                               const void* __restrict__ downv, long dld,
+                               const float* __restrict__ scalein,
+                               const unsigned short* __restrict__ injw,
+                               unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                               float* __restrict__ part,
+                               long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
+                               long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) {
+    r4d_chain_wait();
+    hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
+    hc_down_fold_reduce_tail<RT, NT>(part, dout, inj, ctr, rows, lr, ncol, irow, inv_hc);
+    r4d_chain_done();
+}
+
 /* The prefill tile: rows, down-product columns per workgroup and up-product channels per
  * workgroup. 112 columns is three tiles over 320 + 4, the fewest that fit the 128-row A tile and
  * the B tile in LDS twice per CU; faster than 64 and 128 at 129 to 4096 rows. */
@@ -3112,6 +3212,22 @@ constexpr int kWideRT = 128, kWideNT = 112, kWideCH = 16;
  * shapes they are not built for), 3 the PF2 form (hc_pf2_launch; refused likewise, and below
  * kPf2MinRows, where `u` is not sized for its weight planes). */
 static int g_hc_prefill_form = 0;
+
+/* fn4 F1a: the split-K down product reduces in its own launch (hc_down_tiled_fr_kernel) when
+ * RADIANCE_FN4_HC_FUSEDOWN is set and not 0; r4d_hc_read_fuse_down pins it for r4d_selftest.
+ * -1 until the environment is read. */
+static std::atomic<int> g_hc_fuse_down{-1};
+static bool hc_fuse_down() {
+    int v = g_hc_fuse_down.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_HC_FUSEDOWN");
+        const int on = (e && *e && *e != '0') ? 1 : 0;
+        int want = -1;
+        g_hc_fuse_down.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_hc_fuse_down.load(std::memory_order_relaxed);
+    }
+    return v == 1;
+}
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
@@ -4114,6 +4230,41 @@ unsigned int* hc_mix_ctr(RadStream s) {
     return (unsigned int*)p;
 }
 
+/* fn4 F1a's arrival counters, one per (column tile, row tile) of the down product: a block per
+ * stream of its own, allocated as hc_mix_ctr's and sound for the same reason (one stream never
+ * overlaps two launches of the kernel). Allocation failure is not an error; the caller launches
+ * the unfused pair. */
+constexpr unsigned kMaxDownCtr = 1024;
+
+static unsigned int* hc_down_ctr(RadStream s) {
+    static std::mutex m[16];
+    struct Slot { std::atomic<RadStream> key{nullptr}; std::atomic<unsigned int*> ctr{nullptr}; };
+    static Slot slot[16][4];
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return nullptr;
+    for (int i = 0; i < 4; ++i)
+        if (slot[dev][i].key.load(std::memory_order_acquire) == s)
+            return slot[dev][i].ctr.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lk(m[dev]);
+    for (int i = 0; i < 4; ++i)
+        if (slot[dev][i].key.load(std::memory_order_relaxed) == s)
+            return slot[dev][i].ctr.load(std::memory_order_relaxed);
+    int fi = -1;
+    for (int i = 0; i < 4; ++i)
+        if (slot[dev][i].ctr.load(std::memory_order_relaxed) == nullptr) { fi = i; break; }
+    if (fi < 0) return nullptr;
+    void* p = nullptr;
+    if (hipMalloc(&p, (size_t)kMaxDownCtr * sizeof(unsigned int)) != hipSuccess) return nullptr;
+    if (hipMemset(p, 0, (size_t)kMaxDownCtr * sizeof(unsigned int)) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess) {
+        (void)hipFree(p);
+        return nullptr;
+    }
+    slot[dev][fi].ctr.store((unsigned int*)p, std::memory_order_relaxed);
+    slot[dev][fi].key.store(s, std::memory_order_release);
+    return (unsigned int*)p;
+}
+
 static inline void hc_up_mix_tiled_launch(int rt, bool f8, bool i8, const void* up, long uld,
                                           const unsigned short* dbuf, const unsigned short* h,
                                           const float* w, const float* scale, unsigned short* x,
@@ -5033,6 +5184,33 @@ static inline void hc_down_tiled_launch(int rt, bool f8, const unsigned short* h
 #undef HC_DOWN_CASE
 }
 
+/* fn4 F1a: hc_down_tiled_launch's grid with the reduce folded in (hc_down_tiled_fr_kernel); `part`
+ * non-null and a split of at least two, `ctr` gridDim.x * gridDim.y zeroed counters. */
+static inline void hc_down_tiled_fr_launch(int rt, bool f8, const unsigned short* h, const float* w,
+                                           const void* down, long dld, const float* scale,
+                                           const unsigned short* injw,
+                                           unsigned short* dbuf, unsigned short* inj, float* part,
+                                           long rows, long n, int hc, long lr, long ncol, long hrow,
+                                           long irow, long kc, float wadd, unsigned int* ctr,
+                                           float inv_hc, RadStream s) {
+    const long HN = (long)hc * n;
+    const dim3 gd((unsigned)((ncol + kTNT - 1) / kTNT), (unsigned)((rows + rt - 1) / rt),
+                  (unsigned)((HN + kc - 1) / kc));
+    /* Through r4d_emit, so r4d_record_dispatches sees the folded form (the pair launches through
+     * hipLaunchKernelGGL, which it does not record). */
+#define HC_DOWN_FR_CASE(RT_, F8_)                                                                \
+    (void)R4D_EMIT(s, (g_r4d_chain_arg ? &r4dchain_hc_down_tiled_fr<RT_, kTNT, F8_>              \
+                                       : &hc_down_tiled_fr_kernel<RT_, kTNT, F8_>), gd, dim3(kThreads), 0, \
+                   h, w, down, dld, scale, injw, dbuf, inj, part, rows, n,                       \
+                   hc, lr, ncol, hrow, irow, kc, wadd, ctr, inv_hc)
+    switch (rt) {
+        case 32:  if (f8) HC_DOWN_FR_CASE(32, true);  else HC_DOWN_FR_CASE(32, false);  break;
+        case 64:  if (f8) HC_DOWN_FR_CASE(64, true);  else HC_DOWN_FR_CASE(64, false);  break;
+        default:  if (f8) HC_DOWN_FR_CASE(128, true); else HC_DOWN_FR_CASE(128, false); break;
+    }
+#undef HC_DOWN_FR_CASE
+}
+
 static inline void hc_down_wide_launch(bool f8, const unsigned short* h, const float* w,
                                        const void* down, long dld, const float* scale,
                                        const unsigned short* injw,
@@ -5597,6 +5775,11 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (long)rows, (long)n, (long)hrow, eps);
         if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
 
+        /* fn4 F1a: the reduce folded into the down product's launch (off by default). */
+        unsigned int* dctr = nullptr;
+        if (ks > 1 && !wdown && hc_fuse_down()
+            && ((ncol + kTNT - 1) / kTNT) * nrt <= (long)kMaxDownCtr)
+            dctr = hc_down_ctr(s);
         if (wdown)
             hc_down_wide_launch(f8, (const unsigned short*)h->data, (const float*)w->data,
                                 down->data, (long)dld, scale,
@@ -5604,6 +5787,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                 dbuf, fold ? (unsigned short*)inj->data : nullptr, part,
                                 (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow,
                                 (long)irow, kc, wadd, s);
+        else if (dctr)
+            hc_down_tiled_fr_launch(rt, f8, (const unsigned short*)h->data, (const float*)w->data,
+                                    down->data, (long)dld, scale,
+                                    fold ? (const unsigned short*)injw->data : nullptr,
+                                    dbuf, fold ? (unsigned short*)inj->data : nullptr, part,
+                                    (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow,
+                                    (long)irow, kc, wadd, dctr, 1.0f / (float)hc, s);
         else
             hc_down_tiled_launch(rt, f8, (const unsigned short*)h->data, (const float*)w->data,
                                  down->data, (long)dld, scale,
@@ -5613,7 +5803,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                  (long)irow, kc, wadd, s);
         if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
 
-        if (ks > 1) {
+        if (ks > 1 && !dctr) {
             const long tot = (long)rows * ncol;
             hipLaunchKernelGGL((g_r4d_chain_arg ? &r4dchain_hc_down_reduce : &hc_down_reduce_kernel),
                                dim3((unsigned)((tot + kThreads - 1) / kThreads)), dim3(kThreads),
@@ -5841,3 +6031,4 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
 extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
+extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on ? 1 : 0, std::memory_order_relaxed); }
