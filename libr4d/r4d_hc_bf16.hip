@@ -4807,9 +4807,9 @@ static inline void hc_up_mix_tiled_launch(int rt, bool f8, bool i8, const void* 
     const dim3 gm((unsigned)(n / (kTNT / hc)), (unsigned)((rows + rt - 1) / rt));
     /* fn4 hc_upmix bit 3: the 64-row tile pipelined (E4M3, unchained, the launcher's decode form). */
     if (p64 && f8 && rt == 64 && !g_r4d_chain_arg && g_hc_decode_form == 0) {
-        if (i8) (void)R4D_EMIT(s, &hc_up_mix_tiled_p64_kernel<64, kTNT, true, true>, gm, dim3(kThreads), 0, up, uld, dbuf, h, w,
+        if (i8) (void)R4D_EMIT(s, (&hc_up_mix_tiled_p64_kernel<64, kTNT, true, true>), gm, dim3(kThreads), 0, up, uld, dbuf, h, w,
                                scale, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd);
-        else    (void)R4D_EMIT(s, &hc_up_mix_tiled_p64_kernel<64, kTNT, true, false>, gm, dim3(kThreads), 0, up, uld, dbuf, h, w,
+        else    (void)R4D_EMIT(s, (&hc_up_mix_tiled_p64_kernel<64, kTNT, true, false>), gm, dim3(kThreads), 0, up, uld, dbuf, h, w,
                                scale, x, q, qs, rq, rqs, ctr, rows, n, hc, lr, hrow, xrow, qrow, srow, rqrow, rsrow, wadd);
         return;
     }
@@ -5881,7 +5881,7 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
     if ((stg & 8) && umv) {
         const unsigned gy256 = (unsigned)((rows + 255) / 256), gy128 = (unsigned)((rows + 127) / 128);
 #define HC_PF3(RT_, CH_, PRE_)                                                                     \
-        (void)R4D_EMIT(s, &hc_up_mix_pf3_kernel<RT_, CH_, PRE_>, dim3((unsigned)(n / CH_),          \
+        (void)R4D_EMIT(s, (&hc_up_mix_pf3_kernel<RT_, CH_, PRE_>), dim3((unsigned)(n / CH_),          \
                        RT_ == 256 ? gy256 : gy128), dim3(kThreads), 0, ubf, lr,                    \
                        (const unsigned short*)dbuf, h, w, (const float*)scale, x, rows, n, lr,    \
                        hrow, xrow, wadd)
