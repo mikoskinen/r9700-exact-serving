@@ -152,6 +152,7 @@ struct Plugin {
     void (*readv_hc)(int) = nullptr;       /* optional (fn4 hc_readv) */
     void (*pf2_stages_hc)(int) = nullptr;  /* optional (fn4 hc_readv timing) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
+    void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -231,6 +232,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->readv_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_readv");
     pl->pf2_stages_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_pf2_stages");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
+    pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -20742,6 +20744,9 @@ static void hc_readv_case(const Plugin& pl, int64_t M, bool i8) {
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r) { skip(nm.c_str(), "row absent"); return; }
     if (!pl.readv_hc || !pl.norm_hc_wave || !pl.record) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    /* hc_mix_ctr's four slots a device run out over the cases' streams; without them the fused
+     * up-mix and decode forms G / S never run here (both arms would take the unfused pair). */
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
     const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
     const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
     const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
@@ -20986,6 +20991,9 @@ static void hc_upmix_case(const Plugin& pl, int64_t M, bool i8) {
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r) { skip(nm.c_str(), "row absent"); return; }
     if (!pl.upmix_hc || !pl.readv_hc || !pl.norm_hc_wave || !pl.record) { skip(nm.c_str(), "no r4d_hc_upmix"); return; }
+    /* hc_mix_ctr's four slots a device run out over the cases' streams; without them the fused
+     * up-mix and decode forms G / S never run here (both arms would take the unfused pair). */
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
     const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
     const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
     const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));

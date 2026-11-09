@@ -4725,13 +4725,17 @@ void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* _
  * stream guarantees. Allocation failure is not an error; the caller runs the unfused pair. */
 constexpr unsigned kMaxMixCtr = 2048;
 
+/* The slots, at file scope so r4d_hc_mix_ctr_release (a test hook) can free them. */
+struct HcMixSlot { std::atomic<RadStream> key{nullptr}; std::atomic<unsigned int*> ctr{nullptr}; };
+static std::mutex g_hc_mix_m[16];
+static HcMixSlot g_hc_mix_slot[16][4];
+
 unsigned int* hc_mix_ctr(RadStream s) {
     /* A lock a device: zeroing a block waits for the card, and under tensor parallelism the card
      * can be inside an all-reduce whose other half the peer rank has yet to issue, so a peer's
      * first call must not wait behind this card's (see split_ctr). */
-    static std::mutex m[16];
-    struct Slot { std::atomic<RadStream> key{nullptr}; std::atomic<unsigned int*> ctr{nullptr}; };
-    static Slot slot[16][4];
+    std::mutex (&m)[16] = g_hc_mix_m;
+    HcMixSlot (&slot)[16][4] = g_hc_mix_slot;
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return nullptr;
     for (int i = 0; i < 4; ++i)
@@ -6670,6 +6674,23 @@ extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_write_vec(int on) { g_hc_write_vec.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 3), std::memory_order_relaxed); }
+/* Test hook (r4d_selftest, fn4): frees this device's mix-counter slots. hc_mix_ctr keeps four
+ * streams a device and never frees a slot, so a test that makes a stream a case runs out after four
+ * and every later case takes the unfused up product (and no decode form G / S) -- the stock and the
+ * fn4 forms alike, so their bytes still compare but the forms meant to be compared do not run. Only
+ * between cases, with the device idle. */
+extern "C" void r4d_hc_mix_ctr_release() {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return;
+    std::lock_guard<std::mutex> lk(g_hc_mix_m[dev]);
+    (void)hipDeviceSynchronize();
+    for (int i = 0; i < 4; ++i) {
+        unsigned int* p = g_hc_mix_slot[dev][i].ctr.load(std::memory_order_relaxed);
+        g_hc_mix_slot[dev][i].key.store(nullptr, std::memory_order_relaxed);
+        g_hc_mix_slot[dev][i].ctr.store(nullptr, std::memory_order_relaxed);
+        if (p) (void)hipFree(p);
+    }
+}
 extern "C" void r4d_hc_upmix(int v) { g_hc_upmix.store((v < 0 || v > 15 || (v & 7) > 4) ? 0 : v, std::memory_order_relaxed); }
 extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (m & 31), std::memory_order_relaxed); }
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread

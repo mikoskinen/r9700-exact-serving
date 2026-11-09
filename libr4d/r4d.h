@@ -746,6 +746,9 @@ void r4d_hc_pf2_stages(int mask);
 // hc_up_mix_pf3_kernel variants), bit 3 the 33-64-row decode up-mix at the 64-row tile pipelined (with
 // hc_readv bit 0); overrides RADIANCE_FN4_HC_UPMIX. r4d_selftest compares their bytes.
 void r4d_hc_upmix(int v);
+// Test hook (fn4): frees this device's hc mix-counter slots (four streams a device, never freed
+// otherwise), so a test making a stream a case still runs the fused forms. Device idle only.
+void r4d_hc_mix_ctr_release(void);
 // fn4 ar_lanethreads: the threads a block of the four-rank tiered-int8 two-shot at `overlap` 1 (the
 // pipelined prefill's all-reduce lane) launches with -- 0 the resolved tunable, else 256 / 512 /
 // 1024 (RADIANCE_FN4_AR_LANE_THREADS at start). The sums do not depend on it. 1 applied, -1 refused.
