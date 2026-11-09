@@ -157,6 +157,7 @@ struct Model {
 
     /* the routed feed-forward's */
     rad_buf b_rlogits = 0, b_eids = 0, b_ew = 0, b_sorted = 0, b_eoff = 0, b_ecnt = 0;
+    rad_buf b_einv = 0;   /* fn4 F2a: the sort's inverse slot table (RADIANCE_FN4_GATHER_INV) */
     rad_buf b_egu = 0, b_edn = 0, b_emoe = 0, b_sgu = 0, b_sout = 0, b_sgate = 0;
     ActFP8  a_eff{}, a_sff{};
     /* The rotated codes of the block input, for the routed arm only: `q` and `s` are used and `x`
@@ -883,6 +884,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_ecnt    = decl_b(b, nm.f("moe_ecnt"),   RAD_I32,     {m.moecfg.n_expert},
                          RAD_BUF_PERSIST);
     m.b_sorted  = decl_b(b, nm.f("moe_sorted"), RAD_I32,     {ER});
+    /* fn4 F2a, RADIANCE_FN4_GATHER_INV=1: the sort's inverse slot table, so the routed gather is
+     * moe_gather_inv's one launch instead of moe_gather's three (MoeFP8: router_gemm_topk_scatter_inv
+     * writes it at decode, moe_scatter_inv above the fused router's rows). Unset: not declared. */
+    if (const char* fv = std::getenv("RADIANCE_FN4_GATHER_INV"); fv && *fv && *fv != '0')
+        m.b_einv = decl_b(b, nm.f("moe_inverse"), RAD_I32, {ER});
     m.b_egu     = decl_b(b, nm.f("moe_egu"),    g.act_dtype, {ER, 2 * m.moecfg.n_ff_exp});
     m.a_eff.x   = decl_b(b, nm.f("moe_eff"),    g.act_dtype, {ER, m.moecfg.n_ff_exp});
     /* ER rows, not max_tok: an expert plane has one row per (token, slot). declare_qs's default
@@ -993,7 +999,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     MoeFP8::Wire mw{};
     mw.x = m.b_h; mw.h = m.a_x; mw.hr = m.a_hr;
     mw.logits = m.b_rlogits; mw.ids = m.b_eids; mw.ew = m.b_ew;
-    mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt;
+    mw.sorted = m.b_sorted;  mw.eoff = m.b_eoff; mw.ecnt = m.b_ecnt; mw.inv = m.b_einv;
     mw.egu = m.b_egu; mw.eff = m.a_eff; mw.edn = m.b_edn; mw.moe = m.b_emoe;
     mw.sgu = m.b_sgu; mw.sff = m.a_sff; mw.sout = m.b_sout; mw.sgate = m.b_sgate;
 

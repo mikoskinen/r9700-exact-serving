@@ -378,6 +378,7 @@ struct MoeFP8 {
      * `router_fused_rows` tokens, plus the shared expert's gate (`op_sgate`) when
      * `router_fused_gate`. Otherwise, or for larger passes, the separate ops run. */
     rad_op  op_router_fused = 0;
+    bool    router_fused_inv = false;   /* fn4 F2a: op_router_fused is router_gemm_topk_scatter_inv */
     int64_t router_fused_rows = 0;
     bool    router_fused_gate = false;
     /* `router_sigmoid_topk_scatter` (Config::router_fuse), up to `sigmoid_scatter_rows` tokens,
@@ -861,7 +862,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * depend on it. The sigmoid router selects in its own op and takes no fused pair. */
     topk_scatter_rows = (int64_t)c.rows * c.top_k <= kMoeSortRows ? c.rows
                                                                    : kMoeSortRows / c.top_k;
-    if (c.sigmoid_router || scatter_inv) topk_scatter_rows = 0;
+    /* fn4 F2a: with the inverse, the fused router can still serve -- router_gemm_topk_scatter_inv
+     * writes it -- so the rows stay (the plain topk + scatter pair is then not issued, below). */
+    const bool inv_router = scatter_inv && !c.sigmoid_router &&
+                            rad_op_declared(b, "router_gemm_topk_scatter_inv");
+    if (c.sigmoid_router || (scatter_inv && !inv_router)) topk_scatter_rows = 0;
     /* Asked for only where a loaded library declares it: a CPU-only engine would refuse the
      * declare, and the two separate ops serve without it. */
     if (topk_scatter_rows > 0 && rad_op_declared(b, "router_topk_scatter")) {
@@ -1491,7 +1496,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      *
      * The parameter list, weights and write set are conditional, so each is an array cut to
      * length. */
-    if (op_topk_scatter && !c.shared_ungated && rad_op_declared(b, "router_gemm_topk_scatter")) {
+    if (op_topk_scatter && !c.shared_ungated &&
+        rad_op_declared(b, inv_router ? "router_gemm_topk_scatter_inv" : "router_gemm_topk_scatter")) {
         router_fused_rows = topk_scatter_rows < kMoeRouterFusedRows ? topk_scatter_rows
                                                                     : kMoeRouterFusedRows;
         const bool gate = op_sgate != 0;
@@ -1510,13 +1516,19 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         };
         const int n_fp = (int)(sizeof(fp) / sizeof(fp[0])) - (prot_list ? 0 : 1);
         const rad_weight fw[2] = { w_router, w_sgate };
-        op_router_fused = rad_decl_op(b, "router_gemm_topk_scatter", fp, n_fp, fw, gate ? 2 : 1);
+        op_router_fused = rad_decl_op(b, inv_router ? "router_gemm_topk_scatter_inv"
+                                                    : "router_gemm_topk_scatter",
+                                      fp, n_fp, fw, gate ? 2 : 1);
         if (op_router_fused) {
             const rad_buf rd[1] = { w.h.x };
-            const rad_buf wr[7] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt, w.sgate };
+            rad_buf wr[8] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
+            int n_wr = 6;
+            if (gate) wr[n_wr++] = w.sgate;
+            if (inv_router) wr[n_wr++] = w.inv;
             rad_op_reads (b, op_router_fused, rd, 1);
-            rad_op_writes(b, op_router_fused, wr, gate ? 7 : 6);
+            rad_op_writes(b, op_router_fused, wr, n_wr);
         }
+        router_fused_inv = op_router_fused && inv_router;
         router_fused_gate = op_router_fused && gate;
     }
 
@@ -1691,7 +1703,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
     } else if (c.sigmoid_router) {
         glm_router.step(c_, r0, rows, r0);
-    } else if (rfused)
+    } else if (rfused && router_fused_inv)
+        RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                    RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
+                    brow_slice(w.logits, r0, rows, ne_all),
+                    brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
+                    router_fused_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    brows(w.inv, rows * k));
+    else if (rfused)
         RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
                     brow_slice(w.logits, r0, rows, ne_all),
@@ -1704,7 +1724,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* topk + scatter fused, or the pair. In the fused op `w.ids` is an output. */
     if (rfused || sfused) {
         /* the fused router wrote all five */
-    } else if (op_topk_scatter && rows <= topk_scatter_rows) {
+    } else if (op_topk_scatter && rows <= topk_scatter_rows && !scatter_inv) {   /* fn4: it writes no inverse */
         RAD_ISSUE_N(c_, op_topk_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);

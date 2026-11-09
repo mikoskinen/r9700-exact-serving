@@ -1613,6 +1613,18 @@ extern "C" int r4d_shape_router_gemm_topk_scatter(const RadParam* p, int n_p, in
     };
     R4D_PICK(l);
 }
+/* router_gemm_topk_scatter_inv (fn4): router_gemm_topk_scatter's eleven, `inverse` last. */
+extern "C" int r4d_shape_router_gemm_topk_scatter_inv(const RadParam* p, int n_p, int operand,
+                                                      RadOpdDesc* out) {
+    if (operand == 10) {
+        const int64_t M = pi(p, n_p, "M"), k = pi(p, n_p, "top_k");
+        if (M <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+        const RadOpdDesc l[] = { opd((uint32_t)RAD_I32, M * k) };
+        operand = 0;
+        R4D_PICK(l);
+    }
+    return r4d_shape_router_gemm_topk_scatter(p, n_p, operand, out);
+}
 extern "C" int r4d_shape_moe_scatter(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = pi(p, n_p, "M");
     const int64_t ne = pi(p, n_p, "n_expert");

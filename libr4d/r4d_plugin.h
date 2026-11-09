@@ -574,6 +574,7 @@ int     r4d_rad_router_topk_scatter(const RadArgs*, RadStream);
 int  r4d_rad_router_gemm_topk_scatter_init(const RadParam*, int, int rank, int world, void** out);
 void r4d_rad_router_gemm_topk_scatter_fini(void*);
 int     r4d_rad_router_gemm_topk_scatter(const RadArgs*, RadStream);
+int     r4d_rad_router_gemm_topk_scatter_inv(const RadArgs*, RadStream);   /* fn4 */
 int64_t r4d_rad_moe_scatter_scratch(const RadArgs*);
 int     r4d_rad_moe_gemm_q         (const RadArgs*, RadStream);
 /* Scratch for the run map that aligns the prefill form. Zero in the decode band and for a shape
@@ -1024,6 +1025,7 @@ int r4d_shape_row_topk       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_gemm_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_router_gemm_topk_scatter_inv(const RadParam*, int, int, RadOpdDesc*);   /* fn4 */
 int r4d_shape_moe_scatter    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q_mod4(const RadParam*, int, int operand, RadOpdDesc*);

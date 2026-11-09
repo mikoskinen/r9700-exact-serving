@@ -2104,6 +2104,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `moe_scatter` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `logits` → `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count` |
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
+| `router_gemm_topk_scatter_inv` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse` |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_group_topk` | `M`(range) `n_expert` `top_k` `n_group` `topk_group` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
@@ -2264,6 +2265,10 @@ separate launches write, including a row with fewer than `top_k` non-NaN ranks (
 whose empty slots carry expert 0 into the sort as `ids` does (`r4d_selftest`). Bounded like
 `router_topk_scatter` (`M * top_k <= 1024`, one workgroup) and refused past it. With `inverse` the
 sort is `moe_scatter_inv`'s.
+
+**`router_gemm_topk_scatter_inv`** (device-only) is `router_gemm_topk_scatter` whose sort also
+writes `inverse`, every slot's row in `sorted_tok` (-1 for a dropped slot), as `moe_scatter_inv`
+does, so a fused router can feed `moe_gather_inv`. An op of its own for the same reason.
 
 **`moe_scatter_inv`** and **`moe_gather_inv`** (device-only) are `moe_scatter` and `moe_gather`
 with the gather's slot table passed between them. `inverse` `[M * top_k]` holds, for slot

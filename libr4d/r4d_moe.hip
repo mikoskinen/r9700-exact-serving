@@ -3461,13 +3461,13 @@ struct RgGeom {
 };
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
-template <uint32_t MAXOWN, uint32_t NW>
+template <uint32_t MAXOWN, uint32_t NW, bool INV = false>
 __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
     int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
     int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
-    RgGeom g, Protect prot) {
+    RgGeom g, Protect prot, int32_t* __restrict__ inv = nullptr) {
     /* The GEMM's partial tiles, then (last block only, after two barriers) the sort's LDS; the
      * shim sizes it for the larger. */
     extern __shared__ __align__(16) unsigned char rg_smem[];
@@ -3527,7 +3527,9 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     for (uint32_t m = wave; m < g.M; m += NW)
         router_topk_row<MAXOWN>(lg, ids, w, m, g.n_expert, g.top_k, g.lg_ld, g.norm, lane, snk);
     lds_barrier();
-    scatter_small_place(sorted, off, cnt, g.M * g.top_k, g.n_local, sl);
+    /* INV (router_gemm_topk_scatter_inv): the same sort also writes every slot's row, as
+     * moe_scatter_inv does (scatter_small_place<INV>). */
+    scatter_small_place<NW, INV>(sorted, off, cnt, g.M * g.top_k, g.n_local, sl, inv);
 }
 
 /* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
@@ -3549,6 +3551,27 @@ __global__ __launch_bounds__(NW * kWave) void r4dchain_router_gemm_topk_scatter(
     RgGeom g, Protect prot) {
     r4d_chain_wait();
     router_gemm_topk_scatter_kernel_body<MAXOWN, NW>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
+    r4d_chain_done();
+}
+/* router_gemm_topk_scatter_inv (fn4): the same launch also writing the inverse slot table. */
+template <uint32_t MAXOWN, uint32_t NW>
+__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_inv_kernel(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot, int32_t* __restrict__ inv) {
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW, true>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot, inv);
+}
+template <uint32_t MAXOWN, uint32_t NW>
+__global__ __launch_bounds__(NW * kWave) void r4dchain_router_gemm_topk_scatter_inv(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot, int32_t* __restrict__ inv) {
+    r4d_chain_wait();
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW, true>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot, inv);
     r4d_chain_done();
 }
 
@@ -3633,7 +3656,7 @@ extern "C" void r4d_rad_router_gemm_topk_scatter_fini(void* inst) {
 /* Operands: a, b (the router), gate_b? -> logits, expert_ids, expert_w, sorted_tok,
  * expert_offset, expert_count, gate?. The two optional ones come together or not at all. The
  * replaced shims' checks are all made here, plus the row bound. */
-extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stream) {
+static int router_gemm_topk_scatter_body(const RadArgs* a, RadStream stream, const RadTensor* inv) {
     int emit_rc = RAD_OK;
     const RadTensor* x      = r4d_opt(a, 0);
     const RadTensor* wr     = r4d_opt(a, 1);
@@ -3687,6 +3710,8 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
     if (r4d_numel(ids) < T || r4d_numel(w) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(sorted) < T) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(off) < n_local + 1 || r4d_numel(cnt) < n_local) return R4D_NO(RAD_E_SHAPE);
+    if (inv && (inv->dtype != RAD_I32 || !r4d_contig(inv) || r4d_numel(inv) < T))
+        return R4D_NO(RAD_E_SHAPE);
 
     /* The unfused launches' splits: gemm_bf16_nt_m16/_m64 ask cfg_for with ceil(N/16) tiles, so
      * the router asks with its width and the gate with one tile. */
@@ -3729,14 +3754,23 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
     const bool ch = r4d_geti_or(a, "chain", 0) != 0 && r4d_chain_rows_ok(M);
 
 #define R4D_RG_L(OWN, NWV)                                                                      \
-    emit_rc = R4D_EMIT(stream, (ch ? &r4dchain_router_gemm_topk_scatter<OWN, NWV>               \
-                                   : &router_gemm_topk_scatter_kernel<OWN, NWV>), grid,         \
-                       dim3((NWV) * kWave), lds,                                                \
-                       (const uint16_t*)x->data, (const uint16_t*)wr->data,                     \
-                       wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,               \
-                       (uint16_t*)lg->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,  \
-                       (int32_t*)ids->data, (uint16_t*)w->data, (int32_t*)sorted->data,         \
-                       (int32_t*)off->data, (int32_t*)cnt->data, ctr, g, prot)
+    emit_rc = inv                                                                               \
+        ? R4D_EMIT(stream, (ch ? &r4dchain_router_gemm_topk_scatter_inv<OWN, NWV>               \
+                               : &router_gemm_topk_scatter_inv_kernel<OWN, NWV>), grid,         \
+                   dim3((NWV) * kWave), lds,                                                    \
+                   (const uint16_t*)x->data, (const uint16_t*)wr->data,                         \
+                   wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,                   \
+                   (uint16_t*)lg->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,      \
+                   (int32_t*)ids->data, (uint16_t*)w->data, (int32_t*)sorted->data,             \
+                   (int32_t*)off->data, (int32_t*)cnt->data, ctr, g, prot, (int32_t*)inv->data) \
+        : R4D_EMIT(stream, (ch ? &r4dchain_router_gemm_topk_scatter<OWN, NWV>                   \
+                               : &router_gemm_topk_scatter_kernel<OWN, NWV>), grid,             \
+                   dim3((NWV) * kWave), lds,                                                    \
+                   (const uint16_t*)x->data, (const uint16_t*)wr->data,                         \
+                   wg ? (const uint16_t*)wg->data : (const uint16_t*)nullptr,                   \
+                   (uint16_t*)lg->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,      \
+                   (int32_t*)ids->data, (uint16_t*)w->data, (int32_t*)sorted->data,             \
+                   (int32_t*)off->data, (int32_t*)cnt->data, ctr, g, prot)
     if (n_expert <= (long long)(8 * kWave)) {
         if      (nw == 8)  R4D_RG_L(8, 8);
         else if (nw == 16) R4D_RG_L(8, 16);
@@ -3750,4 +3784,18 @@ extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stre
     if (emit_rc != RAD_OK) return emit_rc;
     R4D_MOE_CHK();
     return RAD_OK;
+}
+
+extern "C" int r4d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream stream) {
+    return router_gemm_topk_scatter_body(a, stream, nullptr);
+}
+
+/* router_gemm_topk_scatter_inv (fn4): router_gemm_topk_scatter's operands and `inverse` after
+ * them (operand 10) -- every slot's row in `sorted_tok`, -1 when dropped, the table
+ * moe_scatter_inv writes and moe_gather_inv reads. The same launch, the same bytes in every other
+ * output. */
+extern "C" int r4d_rad_router_gemm_topk_scatter_inv(const RadArgs* a, RadStream stream) {
+    const RadTensor* inv = r4d_opt(a, 10);
+    if (!inv) return R4D_NO(RAD_E_INVAL);
+    return router_gemm_topk_scatter_body(a, stream, inv);
 }
