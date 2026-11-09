@@ -500,6 +500,14 @@ int Engine::prepare_release(const RadBatch* b) {
 int Engine::issue_ahead(const RadBatch** out) {
     *out = nullptr;
     if (!pipelining_) return RAD_OK;
+    if (pmin_ > 0.f && serial_rows_ > 0 && serial_done_ > 0) {
+        /* fn4 RADIANCE_DRAFT_PMIN: the cut needs the drafter's values, so the next step waits for
+         * its last round here instead of being issued behind it. */
+        RAD_TRY(pmin_compute(/*wait=*/true));
+        for (int i = 0; i < serial_rows_; ++i)
+            sched_.expect_draft(serial_row_[(size_t)i].seq,
+                                std::min(serial_done_, (int)pmin_keep_[(size_t)i]));
+    } else
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     for (int i = 0; i < block_rows_; ++i)

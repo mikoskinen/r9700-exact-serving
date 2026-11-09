@@ -13,6 +13,7 @@
 #include "device/device.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -112,6 +113,64 @@ int Engine::step_state_init() {
                      drafter_.depth);
     }
 
+    /* fn4 RADIANCE_DRAFT_PMIN (engine.h): off unless the variable holds a probability in (0, 1].
+     * Everything below and every pmin_ branch on the step path is skipped while it is off. */
+    if (const char* pv = std::getenv("RADIANCE_DRAFT_PMIN"); pv && *pv) {
+        const float p = std::strtof(pv, nullptr);
+        if (!(p > 0.f && p <= 1.f)) {
+            RAD_WARN("RADIANCE_DRAFT_PMIN='%s' is not a probability in (0, 1]; p_min is off", pv);
+        } else if (!serial_drafting()) {
+            RAD_WARN("RADIANCE_DRAFT_PMIN=%.3f: no serial draft head drafts here; p_min is off", p);
+        } else if (mtp_couple_) {
+            RAD_WARN("RADIANCE_DRAFT_PMIN=%.3f: --draft-coupling samples each draft from its top-R; "
+                     "p_min is off", p);
+        } else {
+            const Program& prog = ranks_[0]->program;
+            for (size_t i = 0; i < prog.buffers.size(); ++i) {
+                const std::string& name = prog.buffers[i].name;
+                const char* suf = "mtp_dval";
+                const size_t ns = std::strlen(suf);
+                if (name.size() >= ns && name.compare(name.size() - ns, ns, suf) == 0)
+                    pmin_dval_buf_ = (rad_buf)i;
+            }
+            const RadBufDecl* vd = pmin_dval_buf_ ? &prog.buffers[pmin_dval_buf_].decl : nullptr;
+            if (!vd || vd->rank != 2 || vd->dtype != RAD_F32 || vd->shape[1] < 1 ||
+                vd->shape[0] < (int64_t)n_slot) {
+                RAD_WARN("RADIANCE_DRAFT_PMIN=%.3f: the draft head declares no [rows, R] f32 "
+                         "'mtp_dval' plane (a 2-bit head's reranked top-R values); p_min is off", p);
+                pmin_dval_buf_ = 0;
+            } else {
+                pmin_r_ = vd->shape[1];
+                pmin_didx_buf_ = drafter_.proposal;
+                const RadBufDecl* id = pmin_didx_buf_ ? &prog.buffers[pmin_didx_buf_].decl : nullptr;
+                if (!id || id->rank != 2 || id->shape[1] != pmin_r_ || drafter_.proposal_pitch != pmin_r_)
+                    pmin_didx_buf_ = 0;   /* values alone: every slot counts */
+                pmin_host_ = static_cast<float*>(rad_dev_alloc(
+                    (int64_t)drafter_.depth * n_slot * pmin_r_ * (int64_t)sizeof(float),
+                    RAD_MEM_HOST_PINNED));
+                if (!pmin_host_) return RAD_E_NOMEM;
+                if (pmin_didx_buf_) {
+                    pmin_idx_host_ = static_cast<int32_t*>(rad_dev_alloc(
+                        (int64_t)drafter_.depth * n_slot * pmin_r_ * (int64_t)sizeof(int32_t),
+                        RAD_MEM_HOST_PINNED));
+                    if (!pmin_idx_host_) return RAD_E_NOMEM;
+                }
+                pmin_ = p;
+                if (const char* bv = std::getenv("RADIANCE_DRAFT_PMIN_BUCKET"); bv && *bv) {
+                    const long b = std::strtol(bv, nullptr, 10);
+                    pmin_bucket_ = b >= 1 && b <= 64 ? (int)b : 8;
+                }
+                pmin_keep_.assign((size_t)n_slot, 0);
+                pmin_cum_.assign((size_t)n_slot, 1.0);
+                RAD_INFO("draft p_min LIVE: %.3f -- a draft chain stops at the first round whose "
+                         "proposal has less than that share of the head's reranked top-%lld; the "
+                         "verified drafts' total is rounded up to a multiple of %d with the next "
+                         "most probable; the step issued ahead waits for the drafter's last round",
+                         p, (long long)pmin_r_, pmin_bucket_);
+            }
+        }
+    }
+
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
@@ -131,6 +190,10 @@ void Engine::step_state_fini() {
     if (couple_readback_) rad_dev_free(couple_readback_, RAD_MEM_HOST_PINNED);
     couple_draw_stage_ = nullptr;
     couple_readback_ = nullptr;
+    if (pmin_host_) rad_dev_free(pmin_host_, RAD_MEM_HOST_PINNED);
+    pmin_host_ = nullptr;
+    if (pmin_idx_host_) rad_dev_free(pmin_idx_host_, RAD_MEM_HOST_PINNED);
+    pmin_idx_host_ = nullptr;
     if (step_end_) rad_event_destroy(step_end_);
     step_end_ = nullptr;
     if (tok_end_) rad_event_destroy(tok_end_);
@@ -248,6 +311,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
+    pmin_ready_    = false;
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -330,6 +394,25 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         }
         if (rd > 0) serial_done_ = rd;
         else if (drafted > 0) serial_done_ = 1;
+        /* fn4 RADIANCE_DRAFT_PMIN: this round's top-R values of the drafting rows (row i is
+         * serial_row_[i], as ADV_ROUND and ADV_TAKE read the proposal), behind the pass. */
+        if (pmin_ > 0.f && n > 0 && (rd > 0 || drafted > 0)) {
+            Rank& r0 = *ranks_[0];
+            const void* val = r0.ctx.buf_ptr(pmin_dval_buf_);
+            if (!val) return RAD_E_STATE;
+            const int round = rd == 0 ? 1 : rd;
+            const size_t at = (size_t)(round - 1) * (size_t)cfg_.max_seqs * (size_t)pmin_r_;
+            RAD_TRY(rad_memcpy_async(pmin_host_ + at, val,
+                                     (int64_t)n * pmin_r_ * (int64_t)sizeof(float),
+                                     r0.ctx.stream()));
+            if (pmin_idx_host_) {
+                const void* idx = r0.ctx.buf_ptr(pmin_didx_buf_);
+                if (!idx) return RAD_E_STATE;
+                RAD_TRY(rad_memcpy_async(pmin_idx_host_ + at, idx,
+                                         (int64_t)n * pmin_r_ * (int64_t)sizeof(int32_t),
+                                         r0.ctx.stream()));
+            }
+        }
     }
     if (serial_done_ <= 0 || n <= 0) return RAD_OK;
 
@@ -383,15 +466,112 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         for (int rd = 1; rd <= done; ++rd)
             draft_out_[(size_t)i * (size_t)rounds + (size_t)(rd - 1)] = S.tok[rd];
     }
+    /* fn4 RADIANCE_DRAFT_PMIN: the same cut issue_ahead planned (computed there, or here when no
+     * step was issued ahead); the passes have run, so this does not wait. */
+    if (pmin_ > 0.f) RAD_TRY(pmin_compute(/*wait=*/false));
     for (int i = 0; i < serial_rows_; ++i) {
         /* No draft for a request the sampler will not speculate on (a constraining grammar that
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
-        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        const int nk = pmin_ > 0.f ? std::min(done, (int)pmin_keep_[(size_t)i]) : done;
+        const int rc = pmin_ > 0.f
+            ? sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], nk, nullptr,
+                               /*hold_lookup=*/true)
+            : sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
     }
+    return RAD_OK;
+}
+
+/* fn4 RADIANCE_DRAFT_PMIN: round `round`'s proposal (column 0) as a share of a softmax over the
+ * head's final reranked top-R exact logits for drafting row `row`. Slots a shard could not fill
+ * (id -1) and non-finite values are left out. The share is over the R candidates only, an upper
+ * bound of the full-vocabulary probability (llama.cpp's --draft-p-min reads its draft sampler's
+ * top-k the same way). */
+float Engine::pmin_prob(int round, int row) const {
+    const size_t at = ((size_t)(round - 1) * (size_t)cfg_.max_seqs + (size_t)row) * (size_t)pmin_r_;
+    const float*   v  = pmin_host_ + at;
+    const int32_t* id = pmin_idx_host_ ? pmin_idx_host_ + at : nullptr;
+    auto ok = [&](int64_t j) { return std::isfinite(v[j]) && (!id || id[j] >= 0); };
+    if (!ok(0)) return 0.f;
+    float m = v[0];
+    for (int64_t j = 1; j < pmin_r_; ++j) if (ok(j) && v[j] > m) m = v[j];
+    double s = 0;
+    for (int64_t j = 0; j < pmin_r_; ++j) if (ok(j)) s += std::exp((double)v[j] - (double)m);
+    return s > 0 ? (float)(std::exp((double)v[0] - (double)m) / s) : 0.f;
+}
+
+/* fn4 RADIANCE_DRAFT_PMIN: each drafting row's kept drafts for this step, once (pmin_keep_). A
+ * chain stops at its first round below p_min; then, while the step's kept total is short of the
+ * next multiple of pmin_bucket_, the draft with the highest chance of being reached and accepted
+ * (the product of its chain's probabilities) is added back, so the verify pass sees few distinct
+ * shapes (Ctx keeps 24 recorded passes). `wait`: the drafter's passes may still run on rank 0's
+ * stream (issue_ahead, before the next step is issued behind them); the readbacks ride on it. */
+int Engine::pmin_compute(bool wait) {
+    if (pmin_ready_) return RAD_OK;
+    const int n = serial_rows_, done = serial_done_;
+    if (n <= 0 || done <= 0 || (size_t)n > pmin_keep_.size()) { pmin_ready_ = true; return RAD_OK; }
+    if (wait) {
+        const auto t0 = std::chrono::steady_clock::now();
+        RAD_TRY(rad_stream_sync(ranks_[0]->ctx.stream()));
+        pmin_wait_us_ += std::chrono::duration<double, std::micro>(
+                             std::chrono::steady_clock::now() - t0).count();
+    }
+    int64_t kept = 0, refilled = 0, none = 0;
+    std::vector<double>& cum = pmin_cum_;   /* sized max_seqs at start: no allocation here */
+    for (int i = 0; i < n; ++i) {
+        int k = 0;
+        double c = 1.0;
+        while (k < done) {
+            const float p = pmin_prob(k + 1, i);
+            if (p < pmin_) break;
+            c *= (double)p;
+            ++k;
+        }
+        pmin_keep_[(size_t)i] = k;
+        cum[(size_t)i] = c;
+        kept += k;
+    }
+    const int64_t cap = (int64_t)n * done;
+    if (pmin_bucket_ > 1 && kept % pmin_bucket_ != 0) {
+        int64_t target = (kept / pmin_bucket_ + 1) * pmin_bucket_;
+        if (target > cap) target = cap;
+        while (kept < target) {
+            int best = -1;
+            double bs = -1.0, bp = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const int k = pmin_keep_[(size_t)i];
+                if (k >= done) continue;
+                const double p = (double)pmin_prob(k + 1, i);
+                if (cum[(size_t)i] * p > bs) { bs = cum[(size_t)i] * p; bp = p; best = i; }
+            }
+            if (best < 0) break;
+            ++pmin_keep_[(size_t)best];
+            cum[(size_t)best] *= bp;
+            ++kept;
+            ++refilled;
+        }
+    }
+    for (int i = 0; i < n; ++i) none += pmin_keep_[(size_t)i] == 0;
+    ++pmin_steps_;
+    pmin_rows_     += n;
+    pmin_drafted_  += cap;
+    pmin_kept_     += kept;
+    pmin_refilled_ += refilled;
+    pmin_none_     += none;
+    if (pmin_steps_ == 1 || pmin_steps_ % 2048 == 0)
+        RAD_INFO("draft p_min %.3f: %lld drafting steps, %lld drafting rows, %lld drafts proposed, "
+                 "%lld verified (%.1f%%, of which %lld refilled to a multiple of %d), %.3f verified "
+                 "a drafting row, %lld row(s) cut to none, %.1f us waited a step for the drafter",
+                 pmin_, (long long)pmin_steps_, (long long)pmin_rows_, (long long)pmin_drafted_,
+                 (long long)pmin_kept_,
+                 pmin_drafted_ ? 100.0 * (double)pmin_kept_ / (double)pmin_drafted_ : 0.0,
+                 (long long)pmin_refilled_, pmin_bucket_,
+                 pmin_rows_ ? (double)pmin_kept_ / (double)pmin_rows_ : 0.0,
+                 (long long)pmin_none_, pmin_wait_us_ / (double)pmin_steps_);
+    pmin_ready_ = true;
     return RAD_OK;
 }
 

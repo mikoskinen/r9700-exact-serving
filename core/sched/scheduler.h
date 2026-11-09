@@ -85,6 +85,7 @@ struct SchedReq {
     DraftAdapt adapt;
     /* The proposal the step being planned carries came from prompt lookup (StepEntry::ngram). */
     bool       draft_ngram = false;
+    bool       pmin_hold = false;   /* fn4: set_draft(..., hold_lookup) cut this proposal to 0 */
     /* Prompt lookup's index over prompt ++ output (ngram.h), built at the sequence's first lookup
      * and extended by each later one. It depends on the tokens alone, so preemption keeps it; it
      * is keyed by request id, so a recycled slot starts over, and a closed request frees it. */
@@ -283,7 +284,10 @@ public:
     /* The drafter's proposal for a request's next step. n is clamped to the sequence's window
      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
     /* `parents`: a tree drafter's (rad_drafter_tree), node j + 1's parent node, null for a chain. */
-    int      set_draft(uint64_t id, const int32_t* tokens, int n, const int32_t* parents = nullptr);
+    /* hold_lookup (fn4 RADIANCE_DRAFT_PMIN): a proposal the engine cut to nothing gets no
+     * prompt-lookup fallback in the next step() either. */
+    int      set_draft(uint64_t id, const int32_t* tokens, int n, const int32_t* parents = nullptr,
+                       bool hold_lookup = false);
 
     /* ---------------------------------------------------------- media the encoder owes
      * A request carrying media is admitted only once every item is encoded; until then it keeps

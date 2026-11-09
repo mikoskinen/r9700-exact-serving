@@ -459,6 +459,31 @@ private:
      * asked for, and the rounds that ran. */
     std::vector<Scheduler::SerialRow> serial_row_;
     int  serial_rounds_ = 0, serial_rows_ = 0, serial_done_ = 0;
+    /* RADIANCE_DRAFT_PMIN (fn4 patch, off unless set): stop a sequence's draft chain at the first
+     * round whose proposal has probability below p_min, so the step issued ahead verifies only the
+     * drafts before it. The probability is column 0's share of a softmax over the head's final
+     * reranked top-R exact logits (`mtp_dval`, R = kDraftTopR), read back each round; the step
+     * issued ahead then waits for the drafter's last round (pmin_compute) instead of being
+     * issued behind it. The verified drafts' total is rounded up to RADIANCE_DRAFT_PMIN_BUCKET
+     * (default 8) with the next most probable drafts, so the verify pass keeps few recorded
+     * shapes. A sequence cut to no draft gets no prompt-lookup fallback either. Linear serial heads
+     * with a top-R value plane only; off under --draft-coupling. Greedy text is unchanged: only
+     * which drafts are verified changes. */
+    float                pmin_ = 0.f;
+    int                  pmin_bucket_ = 8;
+    rad_buf              pmin_dval_buf_ = 0;
+    int64_t              pmin_r_ = 0;              /* the value plane's columns */
+    float*               pmin_host_ = nullptr;     /* pinned [depth][max_seqs][pmin_r_] */
+    int32_t*             pmin_idx_host_ = nullptr; /* the same rows' ids; -1 = an unfilled slot */
+    rad_buf              pmin_didx_buf_ = 0;
+    std::vector<int32_t> pmin_keep_;               /* drafts each drafting row keeps this step */
+    std::vector<double>  pmin_cum_;                /* each row's kept chain's probability */
+    bool                 pmin_ready_ = false;      /* pmin_keep_ is this step's */
+    int64_t              pmin_steps_ = 0, pmin_rows_ = 0, pmin_drafted_ = 0, pmin_kept_ = 0,
+                         pmin_refilled_ = 0, pmin_none_ = 0;
+    double               pmin_wait_us_ = 0;
+    int                  pmin_compute(bool wait);
+    float                pmin_prob(int round, int row) const;
     /* The StepSlots and end-of-generation ids on every rank, and the pinned host copy of rank 0's
      * slots the step reads back (sched/advance.h). */
     int  step_state_init();

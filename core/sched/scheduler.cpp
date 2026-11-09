@@ -439,12 +439,14 @@ bool Scheduler::committed_seq(uint64_t seq, uint64_t* n_out, bool* live) const {
     return false;
 }
 
-int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_t* parents) {
+int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_t* parents,
+                         bool hold_lookup) {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = by_id_.find(id);
     if (it == by_id_.end()) return RAD_E_NOTFOUND;
     SchedReq& s = *reqs_[(size_t)it->second];
     if (n < 0) return RAD_E_INVAL;
+    s.pmin_hold = false;
     /* A tree's parents travel with its tokens; a prefix of a tree is a tree (every parent
      * precedes its child), so the caps below keep them valid. */
     s.draft_tree = parents != nullptr;
@@ -470,6 +472,9 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
         s.req->draft = n ? s.draft : nullptr;
         return RAD_OK;
     }
+    /* fn4 RADIANCE_DRAFT_PMIN: the next step() is built from this proposal, and a cut to nothing
+     * gets no prompt-lookup fallback there (the step issued ahead above runs none anyway). */
+    s.pmin_hold = hold_lookup && n == 0;
 
     /* An ineligible request gets no proposal rather than a refusal, so it decodes one token a step
      * as without a drafter. See Request::may_speculate, and step() for the gate that also catches
@@ -1844,7 +1849,7 @@ const RadBatch* Scheduler::step() {
             const int cap = draft_.adaptive() ? draft_cap(s) : depth;
             bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
-            else if (s.n_draft == 0) {
+            else if (s.n_draft == 0 && !s.pmin_hold) {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
                 int match = -1;
@@ -1871,6 +1876,7 @@ const RadBatch* Scheduler::step() {
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
+            s.pmin_hold = false;
             /* No verified position at or past the context end: nothing past ctx_limit_ - 1 has a
              * rotary row or block-table column. commit() finishes a sequence before it reaches
              * the limit, so the one token itself always fits. */
