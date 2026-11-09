@@ -154,6 +154,14 @@ __device__ __forceinline__ void bf16x8(const uint4& v, float* f) {
     }
 }
 
+/* e4m3x8_bf16 on codes already in registers. */
+__device__ __forceinline__ uint4 e4m3x8_bf16v(uint2 c, float sc) {
+    float f[8];
+    e4m3x8(c.x, c.y, f);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) f[e] *= sc;
+    return f2bf8(f);
+}
 /* Eight codes of an E4M3 row, decoded and scaled into the bf16 a tiled kernel stages. */
 __device__ __forceinline__ uint4 e4m3x8_bf16(const unsigned char* __restrict__ codes, float sc) {
     const uint2 c = *(const uint2*)codes;
@@ -3745,14 +3753,6 @@ void hc_down_wide_kernel(const unsigned short* __restrict__ h, const float* __re
 /* Eight elements of row j of W_up at k as staged bf16: the stored bf16, or eight E4M3 codes decoded
  * with their group's scale. A group is a multiple of sixteen codes, so eight aligned codes never
  * straddle two groups. */
-/* e4m3x8_bf16 on codes already in registers. */
-__device__ __forceinline__ uint4 e4m3x8_bf16v(uint2 c, float sc) {
-    float f[8];
-    e4m3x8(c.x, c.y, f);
-#pragma unroll
-    for (int e = 0; e < 8; ++e) f[e] *= sc;
-    return f2bf8(f);
-}
 
 template <bool F8>
 __device__ __forceinline__ uint4 hc_up_stage(const void* __restrict__ upv, long uld, long j, long k,
