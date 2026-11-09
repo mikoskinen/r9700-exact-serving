@@ -211,12 +211,10 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
     /* Order matters only for diagnostics: the two big pools go first so a failure names the one
      * that could not be served. */
     if ((s = weights_.init("vram_weights", w,  RAD_MEM_DEVICE, device)) < 0) st = s;
-    /* The KV pool is always elastic. Its budget still caps what the cache may address; elasticity
-     * only decides whether the unused part has VRAM behind it. What the cache releases, the
-     * expert plane can promote into, so the split follows actual demand. There is no fixed-pool
-     * option: it would hold every block whether used or not while experts stream over the link.
-     * Without virtual memory management init_elastic() allocates the range whole. */
-    if ((s = kv_.init_elastic("vram_kv", kv, RAD_MEM_DEVICE, device)) < 0) st = s;
+    /* KV is a fixed device allocation. Elastic vmem (2 MiB granules) is refused
+     * by this ROCm after the weights pool is up (HSA_STATUS_ERROR, card still
+     * has free pages). A whole allocation of the same budget is what boots. */
+    if ((s = kv_.init("vram_kv", kv, RAD_MEM_DEVICE, device)) < 0) st = s;
     /* Mapped, not merely pinned. The host pool holds the mover's staging buffers and O_DIRECT
      * landing zone, and the zero-copy execution site (spec §5.1), where kernels read weights over
      * the link and so need a kernel-addressable base: with hipHostMallocDefault,

@@ -2276,6 +2276,13 @@ static const RadOperandSpec oEmbed[] = {
     { "wte",    RAD_OPD_WEIGHT, 0 },
     { "x",      RAD_OPD_OUT,    0 },
 };
+static const RadOperandSpec oEmbedIqr[] = {
+    { "tokens", RAD_OPD_IN,     0 },
+    { "wte",    RAD_OPD_WEIGHT, 0 },
+    { "scale",  RAD_OPD_WEIGHT, 1 },
+    { "x",      RAD_OPD_OUT,    0 },
+};
+/* The IQR embedding gather's own: codes and their scale, no `ahead` (a table read in place). */
 /* The quantised gather's, libref's list (ref_registry.cpp): a one-element `scale`, absent for a
  * plain table, and `ahead`, the next prompt's ids for a host reader fetching rows from a file. */
 static const RadOperandSpec oEmbedQ[] = {
@@ -2375,6 +2382,12 @@ static const RadParamSpec pLogits[] = {
 static const RadOperandSpec oLogits[] = {
     { "x",       RAD_OPD_IN,     0 },
     { "lm_head", RAD_OPD_WEIGHT, 0 },
+    { "logits",  RAD_OPD_OUT,    0 },
+};
+static const RadOperandSpec oLogitsIqr[] = {
+    { "x",       RAD_OPD_IN,     0 },
+    { "lm_head", RAD_OPD_WEIGHT, 0 },
+    { "scale",   RAD_OPD_WEIGHT, 1 },
     { "logits",  RAD_OPD_OUT,    0 },
 };
 
@@ -3273,8 +3286,12 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("embed_lookup_q", pEmbed, oEmbedQ,
            "the same gather from a table quantised with ONE scale for all of it: x[m] = "
            "wte[id] * scale[0], an absent scale being one. Padding and bounds behave exactly as "
-           "embed_lookup's. `ahead` is the next prompt's ids, for a reader that fetches rows ahead "
+           "`embed_lookup's. `ahead` is the next prompt's ids, for a reader that fetches rows ahead "
            "of the step; a kernel that reads its table in place ignores it."),
+    SCHEMA("embed_lookup_iqr", pEmbed, oEmbedIqr,
+           "the embedding gather over an IQR table kept at its codes' width: codes and their "
+           "per-128 scale, decoded as the widened table would hold them, the fwht128 rotation "
+           "undone. Padding and bounds behave exactly as `embed_lookup's."),
     SCHEMA("ple_gate", pPleGate, oPleGate,
            "PLE's gate. K = grouped_rmsnorm(k) * (w_key + wadd) and Q likewise over `q`, one rsqrt "
            "per n-wide stream and one gain across all hc*n; s[c] = sum_d K[c][d]*Q[c][d] / sqrt(n); "
@@ -3321,6 +3338,13 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("logits_gemm", pLogits, oLogits,
            "the lm_head projection. gemm_nt's arithmetic under the vocabulary edge's parameter "
            "spelling; M is one row per SAMPLED position, `gather_rows` having run first."),
+    SCHEMA("logits_gemm_iqr", pLogits, oLogitsIqr,
+           "logits_gemm_i8 over an IQR head kept at its codes' width: the head's codes and their "
+           "per-row per-128 scale, decoded as the widened head would hold them. M is one row per "
+           "SAMPLED position, `gather_rows` having run first."),
+    SCHEMA("logits_gemm_fp8", pLogits, oLogitsIqr,
+           "logits_gemm_fp8's own spelling of the same parameters and operands: the fp8 head's "
+           "codes and their per-row per-128 scale, the head read as its stored row."),
     SCHEMA("sample_penalties", pPenal, oPenalties,
            "repetition, frequency and presence penalties over the row's history, llama.cpp's "
            "order. The repetition penalty is multiplicative and sign-dependent: dividing a "

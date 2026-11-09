@@ -1060,6 +1060,7 @@ int main(int argc, char** argv) {
         ctx.kv_dtype = widths[k];
         if (rad_tools_declare(plugins, meta.m, ctx, &trial, {}, nullptr, provide,
                               /*instances=*/false) < 0) {
+            for (const auto& mm : trial.misses) RAD_ERR("    miss %s", mm.line().c_str());
             if (planning_errors())
                 RAD_ERR("the weights above could not be planned, and declare saw each of them as "
                         "the plain dtype it was declared at -- fix those first");

@@ -764,21 +764,34 @@ int Planner::assign_expert_tiered(Plan* p) {
             if (mu.site == Site::DeviceStaged && mu.access != RAD_ACCESS_CONDITIONAL)
                 ++staged[(size_t)mu.slab_class];
         }
-        /* The hot VRAM cache's budget: with file-tier units in a class, the shadow slots
-         * may be filled with hot experts — read a routed expert into a shadow slab slot
-         * permanently, instead of the stager's per-pass buffer, when heat says the expert
-         * keeps routing. Eviction is bookkeeping (the container is ground truth). The
-         * budget is the full shadow cap rather than the swap formula's resident/4 share.
-         * Bounded by the class's residents so the two-pass fill converges — a later pass
-         * with fewer residents reserves fewer — and charged to the weights budget through
-         * k.spare like any shadow slot. */
+        /* The hot VRAM cache's budget. RAD_PLACE_SHADOW_SLOTS (32) is the in-flight swap
+         * depth: enough to move host-pool experts onto the card, not enough to hold a
+         * file-tier decode's working set (each miss is a pread plus a relayout, and it
+         * repeats every token until the expert stays resident). On a real weights budget
+         * (>= 1 GiB of conditional room) half that room, split across classes that have
+         * file-tier units, becomes shadow slots the stager can admit into. The count is
+         * fixed from the budget, not from this pass's resident count, so the two-pass
+         * fill's spare is an upper bound and does not grow as residents step down. The
+         * other half stays the profile's static warm start. A fixture-sized budget keeps
+         * the 32-slot cap. */
+        int n_disk_cls = 0;
+        for (size_t c = 0; c < p->classes.size(); ++c)
+            if (on_disk[c] > 0) ++n_disk_cls;
+        const int64_t cond_room = (p->vram_budget > fixed) ? p->vram_budget - fixed : 0;
+        const bool wide = cond_room >= (int64_t)1024 * 1024 * 1024;
+        const int64_t hot_share = (wide && n_disk_cls > 0) ? (cond_room / 2) / n_disk_cls : 0;
         for (size_t c = 0; c < p->classes.size(); ++c) {
             const int64_t ring = std::min<int64_t>(RAD_PLACE_STAGE_RING, staged[c]);
             const int64_t shadow = (p->dynamic && resident[c] > 0)
                 ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, std::max<int64_t>(1, resident[c] / 4))
                 : 0;
-            const int64_t hot = (p->dynamic && on_disk[c] > 0 && resident[c] > 0)
-                ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, resident[c]) : 0;
+            const int64_t stride = p->classes[c].stride;
+            const int64_t by_bytes = (stride > 0 && hot_share > 0) ? hot_share / stride : 0;
+            const int64_t hot = (p->dynamic && on_disk[c] > 0)
+                ? std::min(on_disk[c], std::max(by_bytes,
+                      resident[c] > 0 ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, resident[c])
+                                      : (int64_t)0))
+                : 0;
             p->classes[c].n_shadow = std::max(shadow, hot);
             if (p->classes[c].n_shadow + ring <= 0) continue;
             /* Plus the slab's tail pad: a kernel assembling a packed code window from a wide read
@@ -929,8 +942,15 @@ void Planner::finish(const Program& prog, Plan* p) {
         /* The staging ring, capped at the number of staged units in the class. */
         p->classes[c].n_stage = std::min<int64_t>(RAD_PLACE_STAGE_RING, staged[c]);
         /* n_shadow comes from the assignment pass, which reserved it out of the budget; do not
-         * recompute it here, or the mover and the budget would see different numbers. */
-        if (!p->classes[c].movable) p->classes[c].n_shadow = 0;
+         * recompute it here, or the mover and the budget would see different numbers. A class
+         * with no movable resident still keeps its shadow slots when file-tier units can be
+         * admitted into them (pin-top marks the warm start unmovable; the cache is the rest). */
+        if (!p->classes[c].movable && p->classes[c].n_shadow > 0) {
+            bool any_ssd = false;
+            for (const MoveUnit& mu : p->units)
+                if (mu.slab_class == (int32_t)c && mu.tier == Tier::SSD) { any_ssd = true; break; }
+            if (!any_ssd) p->classes[c].n_shadow = 0;
+        }
         const int64_t slots = p->classes[c].n_slots + p->classes[c].n_shadow +
                               p->classes[c].n_stage;
         p->slab_overhead += (p->classes[c].n_shadow + p->classes[c].n_stage) * p->classes[c].stride;

@@ -128,7 +128,7 @@ template <class F, uint32_t MT, uint32_t KW, bool GATED = false>
 __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
                      uint16_t* __restrict__ Y, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
-                     GatedOut go) {
+                     uint32_t y_ld, GatedOut go) {
     using D = Dec<F, true>;
     constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
     __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
@@ -296,7 +296,7 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
             for (uint32_t w = 0; w < KW; ++w) v += s_red[w][tid];
             /* each row's own scale, after its blocks' sums */
             v *= row_scale<F>(c, rt * 16u + q);
-            Y[(size_t)m * N + rt * 16u + q] = f32_to_bf16(v);
+            Y[(size_t)m * y_ld + rt * 16u + q] = f32_to_bf16(v);
         }
     }
 }
@@ -319,7 +319,7 @@ template <class F, uint32_t KW, bool GATED = false>
 __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
                     uint16_t* __restrict__ Y, uint32_t N, uint32_t M, uint32_t x_ld, uint32_t xs_ld,
-                    GatedOut go) {
+                    uint32_t y_ld, GatedOut go) {
     using D = Dec<F>;
     constexpr bool BIAS = F::SC == kRowF32;
     constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
@@ -443,7 +443,7 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
             v[t] = a * row_scale<F>(c, r0 + t);
         }
         if (col < M)
-            *(uint4*)(Y + (size_t)col * N + r0) = make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
+            *(uint4*)(Y + (size_t)col * y_ld + r0) = make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
                                                               bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
     }
 }
@@ -460,7 +460,7 @@ __global__ __launch_bounds__(MW * kWave) R4D_WAVES(MW >= 8u ? 4u : 6u)
 void iqr_m64_kernel(Ctx c0, const uint8_t* __restrict__ Bp, const float* __restrict__ Sb,
                     void* __restrict__ Y, uint16_t* __restrict__ C, unsigned int* __restrict__ Ctr,
                     uint32_t rows, uint32_t cols, uint32_t nb, uint32_t b_ld, uint32_t sb_ld,
-                    uint32_t ck) {
+                    uint32_t ck, uint32_t c_ld) {
     using D = Dec<F>;
     constexpr uint32_t FK = kFK, FN = NT * 16, FM = MW * 16, kU = FK / kBlock;
     __shared__ uint8_t s_b[FN * lds_pitch<FK>()];
@@ -618,6 +618,7 @@ void iqr_m64_kernel(Ctx c0, const uint8_t* __restrict__ Bp, const float* __restr
 #pragma unroll
             for (uint32_t t = 0; t < 8; ++t) ov[t] *= row_scale<F>(c, r0 + t);
         const size_t o = (size_t)col * rows + r0;
+        const size_t oc = (size_t)col * c_ld + r0;
         if (ck) {
             __attribute__((aligned(16))) float pv[8];
 #pragma unroll
@@ -625,7 +626,7 @@ void iqr_m64_kernel(Ctx c0, const uint8_t* __restrict__ Bp, const float* __restr
             *(uint4*)(part + o) = *(const uint4*)pv;
             *(uint4*)(part + o + 4) = *(const uint4*)(pv + 4);
         } else {
-            *(uint4*)(C + o) = make_uint4(bf16x2_rne(ov[0], ov[1]), bf16x2_rne(ov[2], ov[3]),
+            *(uint4*)(C + oc) = make_uint4(bf16x2_rne(ov[0], ov[1]), bf16x2_rne(ov[2], ov[3]),
                                           bf16x2_rne(ov[4], ov[5]), bf16x2_rne(ov[6], ov[7]));
         }
     }
@@ -651,7 +652,7 @@ void iqr_m64_kernel(Ctx c0, const uint8_t* __restrict__ Bp, const float* __restr
                 const size_t o = (size_t)col * rows + r;
                 float acc = 0.0f;
                 for (uint32_t z = 0; z < gridDim.z; ++z) acc += w0[(size_t)z * rows * nb + o];
-                C[o] = f32_to_bf16(acc);
+                C[(size_t)col * c_ld + r] = f32_to_bf16(acc);
             }
         }
     }
@@ -659,12 +660,13 @@ void iqr_m64_kernel(Ctx c0, const uint8_t* __restrict__ Bp, const float* __restr
 
 /* The split's separate reduce, for a split with no counter block (r4d_gemm_fp8a8.hip's). */
 __global__ void iqr_splitk_reduce(const float* __restrict__ ws, uint16_t* __restrict__ y,
-                                  uint32_t n_out, uint32_t ksplit) {
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_out) return;
+                                  uint32_t M, uint32_t N, uint32_t y_ld, uint32_t ksplit) {
+    const uint32_t i = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M * N) return;
+    const uint32_t m = i / N, n = i - m * N;
     float acc = 0.0f;
-    for (uint32_t z = 0; z < ksplit; ++z) acc += ws[(size_t)z * n_out + i];
-    y[i] = f32_to_bf16(acc);
+    for (uint32_t z = 0; z < ksplit; ++z) acc += ws[(size_t)z * M * N + i];
+    y[(size_t)m * y_ld + n] = f32_to_bf16(acc);
 }
 
 /* ---- the prefill: 64 < M ---------------------------------------------------------------------
@@ -772,15 +774,16 @@ __global__ __launch_bounds__(kPWaves * kWave) R4D_WAVES(6)
 void iqr_prefill_kernel(IqrPre<F> pre, const uint8_t* __restrict__ A, const float* __restrict__ Sa,
                         const uint8_t* __restrict__ W, const uint16_t* __restrict__ Sw,
                         uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N, uint32_t a_ld,
-                        uint32_t sa_ld, uint32_t sw_ld) {
+                        uint32_t sa_ld, uint32_t sw_ld, uint32_t c_ld) {
     if constexpr (F::SC == kRowF32) {
         constexpr Form f{ F::KIND, F::B, F::LV, F::L, F::LRB, F::SC, 0 };
         const uint8_t* const sb = pre.c.S;
         gemm_8a8_prefill_body<true, 32, IqrPre<F>, true>(
             A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, pre, (const float*)sb,
-            (const float*)(sb + cf_off(f, N, K)));
+            (const float*)(sb + cf_off(f, N, K)), c_ld);
     } else {
-        gemm_8a8_prefill_body<true, RB>(A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, pre);
+        gemm_8a8_prefill_body<true, RB>(A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, pre,
+                                        nullptr, nullptr, c_ld);
     }
 }
 
@@ -790,7 +793,7 @@ void iqr_prefill_kernel(IqrPre<F> pre, const uint8_t* __restrict__ A, const floa
 
 struct Operands {
     const RadTensor *a, *as, *b, *bs, *y;
-    long long M, N, K, nkb, a_ld, sa_ld;
+    long long M, N, K, nkb, a_ld, sa_ld, y_ld;
     uint32_t word;
 };
 
@@ -818,7 +821,11 @@ int operands(const RadArgs* a, Operands* g) {
     if (g->as->shape[0] != g->M || g->as->shape[1] != g->nkb) return R4D_NO(RAD_E_SHAPE);
     g->a_ld = r4d_row_pitch(g->a);
     g->sa_ld = r4d_row_pitch(g->as);
-    if (g->a_ld < 0 || g->sa_ld < 0 || r4d_row_pitch(g->y) != g->N) return R4D_NO(RAD_E_STRIDE);
+    g->y_ld = r4d_row_pitch(g->y);
+    /* A column slice keeps the parent row pitch (issue.cpp narrow_cols). The stores take that
+     * pitch; a packed output has y_ld == N. The vector stores write 8 bf16s, so the pitch must
+     * keep that address 16-byte aligned for every row. */
+    if (g->a_ld < 0 || g->sa_ld < 0 || g->y_ld < g->N || (g->y_ld & 7)) return R4D_NO(RAD_E_STRIDE);
     if (!r4d_aligned(g->a->data, 16) || !r4d_aligned(g->b->data, 256)) return R4D_NO(RAD_E_ALIGN);
     const Form f = form(g->word);
     if (is_trellis(f.kind) && g->N % ((long long)1 << f.lrun)) return R4D_NO(RAD_E_SHAPE);
@@ -853,10 +860,10 @@ int gemv_launch(const Operands& g, RadStream stream, const GatedOut* go = nullpt
 #define R4D_IQR_GV(mt_, kw_)                                                                     \
     rc = go ? R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_, true>), dim3(N / 32u),              \
                        dim3(2u * kw_ * kWave), 0, c, (const int8_t*)g.a->data,                    \
-                       (const float*)g.as->data, y, N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)   \
+                       (const float*)g.as->data, y, N, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, (uint32_t)g.y_ld, gz)   \
             : R4D_EMIT(stream, (iqr_gemv_kernel<F, mt_, kw_>), dim3(N / 16u), dim3(kw_ * kWave), \
                        0, c, (const int8_t*)g.a->data, (const float*)g.as->data, y, N,           \
-                       (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+                       (uint32_t)g.a_ld, (uint32_t)g.sa_ld, (uint32_t)g.y_ld, gz)
 #define R4D_IQR_GVK(mt_) do { if (kw == 4u) R4D_IQR_GV(mt_, 4u); else R4D_IQR_GV(mt_, 8u); } while (0)
     switch (M) {
         case 1u: R4D_IQR_GVK(1u); break;
@@ -885,10 +892,10 @@ int m16_launch(const Operands& g, RadStream stream, const GatedOut* go = nullptr
 #define R4D_IQR_M16(kw_)                                                                         \
     rc = go ? R4D_EMIT(stream, (iqr_m16_kernel<F, kw_, true>), dim3(N / 32u),                    \
                        dim3(2u * kw_ * kWave), 0, c, (const int8_t*)g.a->data,                    \
-                       (const float*)g.as->data, y, N, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz) \
+                       (const float*)g.as->data, y, N, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, (uint32_t)g.y_ld, gz) \
             : R4D_EMIT(stream, (iqr_m16_kernel<F, kw_>), dim3(N / 16u), dim3(kw_ * kWave), 0, c,  \
                        (const int8_t*)g.a->data, (const float*)g.as->data, y, N, M,               \
-                       (uint32_t)g.a_ld, (uint32_t)g.sa_ld, gz)
+                       (uint32_t)g.a_ld, (uint32_t)g.sa_ld, (uint32_t)g.y_ld, gz)
     if (N >= 4096u) R4D_IQR_M16(4u);
     else R4D_IQR_M16(8u);
 #undef R4D_IQR_M16
@@ -931,7 +938,7 @@ int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int sp
 #define R4D_IQR_M64(mw_, nt_)                                                                    \
     rc = R4D_EMIT(stream, (iqr_m64_kernel<F, nt_, mw_>), grid, dim3(mw_ * kWave), 0, c,          \
                   (const uint8_t*)g.a->data, (const float*)g.as->data, dst, (uint16_t*)g.y->data, \
-                  ctr, N, K, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, ck)
+                  ctr, N, K, M, (uint32_t)g.a_ld, (uint32_t)g.sa_ld, ck, (uint32_t)g.y_ld)
 #define R4D_IQR_M64_NT(mw_)                                                                      \
     do { if (nt == 4u) R4D_IQR_M64(mw_, 4u); else if (nt == 3u) R4D_IQR_M64(mw_, 3u);           \
          else if (nt == 2u) R4D_IQR_M64(mw_, 2u); else R4D_IQR_M64(mw_, 1u); } while (0)
@@ -944,7 +951,7 @@ int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int sp
     if (ksplit > 1 && !ctr) {
         const uint32_t n = M * N;
         if (R4D_EMIT(stream, iqr_splitk_reduce, dim3((n + 255) / 256), dim3(256), 0,
-                     (const float*)scratch, (uint16_t*)g.y->data, n, ksplit) != RAD_OK)
+                     (const float*)scratch, (uint16_t*)g.y->data, M, N, (uint32_t)g.y_ld, ksplit) != RAD_OK)
             return R4D_NO(RAD_E_DEVICE);
     }
     return RAD_OK;
@@ -979,7 +986,7 @@ int tiled_launch(const Operands& g, void* scratch, long long scratch_bytes, RadS
     rc = R4D_EMIT(stream, (iqr_prefill_kernel<F, rb_>), grid, dim3(kPWaves * kWave), 0, pre,     \
                   (const uint8_t*)g.a->data, (const float*)g.as->data, (const uint8_t*)pre.fragp, \
                   ws, (uint16_t*)g.y->data, (uint32_t)g.M, (uint32_t)g.K, (uint32_t)g.N,          \
-                  (uint32_t)g.a_ld, (uint32_t)g.sa_ld, (uint32_t)g.nkb)
+                  (uint32_t)g.a_ld, (uint32_t)g.sa_ld, (uint32_t)g.nkb, (uint32_t)g.y_ld)
     if (f.lrb >= 5) R4D_IQR_PF(32);
     else if (f.lrb >= 3) R4D_IQR_PF(8);
     else R4D_IQR_PF(0);

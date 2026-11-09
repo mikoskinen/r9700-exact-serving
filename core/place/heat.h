@@ -86,11 +86,11 @@ struct HeatParams {
     /* The hot VRAM cache's admission bar: the heat at which the file stager
      * may read a routed expert into a slab slot permanently instead of its per-pass buffer.
      * Absolute, not relative to a victim: admission happens when the unit is read anyway, and the
-     * shadow slots are the budget. A value near min_gain (1.5) admits anything routed twice
-     * lately and churns; 8 is roughly two consistently-routed steps of the verify union at
-     * MTP-d3, well above an occasional expert's credit of one or two. Eviction is free (the
-     * container is ground truth), so the cost of an admission mistake is one future re-read. */
-    float admit_heat = 8.0f;
+     * shadow slots are the budget. A file-tier miss is a pread plus a relayout every token until
+     * the expert stays, so anything routed in the last few steps is worth a slot: 0.5 survives
+     * one decay of a single credit. Eviction is free (the container is ground truth), so a
+     * mistake costs one future re-read, and the slot count — not this bar — bounds the cache. */
+    float admit_heat = 0.5f;
 };
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided

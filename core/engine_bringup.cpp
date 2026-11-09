@@ -6,6 +6,12 @@
  */
 #include "engine_priv.h"
 #include "rad_internal.h"
+#include "rad_plugin.h"
+/* The IQR stored form written on the card (r4d_iqr_relayout.hip), resolved from the loaded
+ * kernel plugin. A missing symbol falls back to the host walk. */
+using IqrGpuRelayout = int (*)(const void*, void*, int64_t, int64_t, uint32_t, uint32_t, uint32_t,
+                               const void*, const void*, int64_t, void*);
+#include <dlfcn.h>
 #include "engine_hostmem.h"
 #include "kld.h"
 #include "gen/driver.h"
@@ -2119,6 +2125,7 @@ int Engine::plan() {
         }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
+        in.file_relayout = true;    /* the mover relays on the read (Mover::set_file_relayout) */
         Planner planner(in);
         s = planner.plan(&r->plan);
         if (cfg_.debug_placement || s < 0)
@@ -2938,6 +2945,65 @@ int Engine::load_weights() {
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
+         * relayout, as the relayout pool does once for a resident one. */
+        {
+            const Program* prog = &r->program;
+            Mover* mv = &r->mover;
+            r->mover.set_file_relayout([prog, mv](const WeightInfo& w, const RadTensor* planes,
+                                              void* dst, int64_t dst_bytes) {
+                const RadKernelInfo* ki = weight_layout_kernel(*prog, w);
+                if (!ki || !ki->relayout) return (int)RAD_E_STATE;
+                const Resolved& rs =
+                    prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
+                /* The trellis forms are the routed experts and the file-tier hot path: write the
+                 * stored form on the card, not on the host. The host walk stays for the rest. */
+                const RadEncPlane* tp = rad_enc_plane(&w.enc, "trellis");
+                if (tp && tp->kind == RAD_PLANE_TABLE) {
+                    uint32_t bits = 0;
+                    const uint8_t* codes = nullptr;
+                    const uint8_t* table = nullptr;
+                    const uint32_t* mad = nullptr;
+                    for (int i = 0; i < w.n_sel; ++i) {
+                        const RadEncPlane& pk = w.enc.plane[w.sel[i]];
+                        if (!std::strcmp(pk.role, "codes")) {
+                            codes = (const uint8_t*)planes[i].data;
+                            bits = pk.dtype == RAD_U2 ? 2u : pk.dtype == RAD_U3 ? 3u : 0u;
+                        } else if (!std::strcmp(pk.role, "trellis")) {
+                            table = (const uint8_t*)planes[i].data;
+                        } else if (!std::strcmp(pk.role, "trellis.mad")) {
+                            mad = (const uint32_t*)planes[i].data;
+                        }
+                    }
+                    uint32_t L = 0;
+                    for (int64_t e = tp->extent[0]; e > 1; e >>= 1) ++L;
+                    const int64_t N = w.stored_shape[0] ? w.stored_shape[0] : w.sel_rows[0];
+                    const int64_t K = w.stored_shape[1] ? w.stored_shape[1] : w.sel_cols[0];
+                    const int64_t entries = tp->extent[0];
+                    void* plug = nullptr;
+                    if (const char* home = std::getenv("RADIANCE_HOME")) {
+                        const std::string so = std::string(home) + "/kernels/libr4d.so";
+                        plug = dlopen(so.c_str(), RTLD_NOW | RTLD_NOLOAD);
+                        if (!plug) plug = dlopen(so.c_str(), RTLD_NOW);
+                    }
+                    auto* gpu = plug ? (IqrGpuRelayout)dlsym(plug, "r4d_iqr_relayout_gpu") : nullptr;
+                    static int once = 0;
+                    if (!once && !gpu) {
+                        once = 1;
+                        fprintf(stderr, "I iqr file relayout: gpu symbol missing (%s)\n",
+                                plug ? "dlsym" : "dlopen");
+                    }
+                    if (bits && codes && table && gpu && gpu(codes, dst, N, K, bits, L,
+                                                             (uint32_t)entries, table, mad, dst_bytes,
+                                                             (void*)mv->transfer_stream()) == RAD_OK) {
+                        if (!once) { once = 1; fprintf(stderr, "I iqr file relayout: gpu\n"); }
+                        return (int)RAD_OK;
+                    }
+                }
+                return ki->relayout(rs.geom.params(), rs.geom.n_params(), w.lay_operand, &w.enc,
+                                    w.sel, planes, w.n_sel, dst, dst_bytes);
+            });
+        }
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
@@ -3018,8 +3084,27 @@ int Engine::load_weights() {
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
             w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
+            for (int k = 0; k < w.n_sel && e; ++k)
+                w.file_plane_offset[k] = file_->plane(*e, w.sel[k]).offset;
             const bool direct = weight_file_direct(w, cfg_.tp);
-            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e)) {
+            /* The file tier also serves a weight it relays on every read (weight_file_relaid):
+             * each selected plane whole in the container, as many bytes as the plane holds. */
+            const bool relaid = w.tier == Tier::SSD && e &&
+                                weight_file_relaid(r->program, w, cfg_.tp);
+            if (relaid)
+                for (int k = 0; k < w.n_sel; ++k) {
+                    const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
+                    const int64_t want = w.sel_rows[k] *
+                        rad_dtype_bytes(file_->encoding(*e).plane[w.sel[k]].dtype, w.sel_cols[k]);
+                    if ((int64_t)pk.bytes != want) {
+                        RAD_ERR("rank %d: '%s' is relaid from the file tier, and its '%s' plane "
+                                "holds %lld bytes where the whole plane is %lld", r->index,
+                                w.name.c_str(), file_->encoding(*e).plane[w.sel[k]].role,
+                                (long long)pk.bytes, (long long)want);
+                        return RAD_E_FORMAT;
+                    }
+                }
+            if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e) && !relaid) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
                         w.name.c_str(), tier_name(w.tier),

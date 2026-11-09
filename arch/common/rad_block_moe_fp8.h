@@ -531,7 +531,14 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
     /* An IQR trellis (r4d_iqr.h): codes at their width, an f32 row scale (kRowF32) with its
      * block factors, a trellis table (a computed one adds its mad plane). The kernel's word
      * carries the form; here only the planes are checked. */
-    if (rad_enc_is(&e, "trellis")) {
+    if (rad_enc_is(&e, "trellis") || rad_enc_is(&e, "stored")) {
+        if (rad_enc_is(&e, "stored")) {
+            const RadEncPlane* lane = rad_enc_plane(&e, "lane");
+            const RadEncPlane* fp = rad_enc_plane(&e, "form");
+            const RadEncPlane* scs = rad_enc_plane(&e, "scale");
+            if (!lane || lane->kind != RAD_PLANE_TABLE || !fp || !scs) return RAD_E_DTYPE;
+            return 11;
+        }
         const RadEncPlane* cp = rad_enc_plane(&e, "codes");
         const RadEncPlane* sc = rad_enc_plane(&e, "scale");
         const RadEncPlane* cf = rad_enc_plane(&e, "scale.col");
@@ -1151,6 +1158,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const char* nmv = down ? nm.f("blk.%d.ffn_down_exps.%lld.weight", l, g0)
                                    : nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, g0);
             if (!weight_enc(b, nmv, &e)) return 0;
+            if (rad_enc_is(&e, "stored")) return rad_enc_plane(&e, "lane") ? RAD_U8 : 0;
             const RadEncPlane* cp = rad_enc_plane(&e, "codes");
             if (!cp || !rad_enc_plane(&e, "trellis.mad")) return 0;
             return cp->dtype;
@@ -1182,8 +1190,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                          c.rows * c.top_k, true, false);
         const int lgg = gq_iqr.declare(b, ga, w.egu, iqr_d, c.n_ff_exp, "silu",
                                        c.rows * c.top_k, true, true);
-        const char* const ecodes = "codes,trellis,trellis.mad";
-        const char* const escale = "scale,scale.col";
+        const bool stored_ex = [&]() {
+            RadEncoding e{};
+            return weight_enc(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, g0), &e) &&
+                   rad_enc_is(&e, "stored");
+        }();
+        const char* const ecodes = stored_ex ? "lane,codes" : "codes,trellis,trellis.mad";
+        const char* const escale = stored_ex ? "scale,codes" : "scale,scale.col";
+        const uint32_t sdt = stored_ex ? RAD_U8 : RAD_F32;
         const int   sh = ep ? RAD_SHARD_NONE : RAD_SHARD_COL;
         const int   shg = ep ? RAD_SHARD_NONE : RAD_SHARD_ROW;
         /* Declared in separate loops, never grouped per expert: a table is a run of consecutive
@@ -1202,7 +1216,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const int64_t ge = (long long)(c.expert_base + e);
             w_gus[(size_t)e] = decl_view(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.scale", l, ge),
                                          nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge),
-                                         escale, RAD_F32, {2 * c.n_ff_exp, g.n_embd},
+                                         escale, sdt, {2 * c.n_ff_exp, g.n_embd},
                                          RAD_ACCESS_CONDITIONAL, shg, grp_expert_slot(l, (int)e, 0),
                                          nullptr, 0);
             if (!w_gus[(size_t)e]) { fprintf(stderr, "iqr decl l=%d e=%lld: gate_up scale view failed\n", l, (long long)e); return RAD_E_INVAL; }
@@ -1219,7 +1233,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             const int64_t ge = (long long)(c.expert_base + e);
             w_dns[(size_t)e] = decl_view(b, nm.f("blk.%d.ffn_down_exps.%lld.scale", l, ge),
                                          nm.f("blk.%d.ffn_down_exps.%lld.weight", l, ge),
-                                         escale, RAD_F32, {g.n_embd, c.n_ff_exp},
+                                         escale, sdt, {g.n_embd, c.n_ff_exp},
                                          RAD_ACCESS_CONDITIONAL, sh, grp_expert_slot(l, (int)e, 1),
                                          nullptr, 0);
             if (!w_dns[(size_t)e]) { fprintf(stderr, "iqr decl l=%d e=%lld: down scale view failed\n", l, (long long)e); return RAD_E_INVAL; }
@@ -1627,6 +1641,17 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                     ? src.shared_mlp_up
                                     : nm.ckpt("%s.up_proj.weight", src.shared);
         RAD_ARCH_TRY(sh_down.probe(b, nm, g, down_base, { shared_down }));
+        /* An IQR down weight quantises its own input. A bf16 trunk never asked for that
+         * pair (declare_qs drops it when Geom::w_bf16), and the probe is the first point
+         * that knows the weight is int8. Declare the pair here; the linear writes it. */
+        if (sh_down.probed_i8 && !w.sff.q8) {
+            if (!w.sff.x) return RAD_E_DTYPE;
+            const int64_t n = c.n_ff_shared;
+            const int64_t m = c.rows > 0 ? c.rows : g.max_tok;
+            w.sff.q8 = decl_b(b, nm.f("blk.%d.shared_ff.q8", l), RAD_I8, { m, n });
+            w.sff.s8 = decl_b(b, nm.f("blk.%d.shared_ff.s8", l), RAD_F32, { m, fp8_blocks(n) });
+            if (!w.sff.q8 || !w.sff.s8) return RAD_E_INVAL;
+        }
         /* The code pair the gate writes, E4M3 or int8 (ActFP8::q8_fed); an int8 down projection
          * that quantises for itself also writes the int8 pair on this lane. */
         if (w.sff.cq()) {
@@ -1644,6 +1669,18 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         sgate_concurrent = true;
         /* gate/up rows and down columns of this rank's slice (even, or Config's uneven split); the
          * gate/up row parts stay, as a property of the stacked checkpoint tensor. */
+        RAD_ARCH_TRY(sh_gate_up.probe(b, nm, g, nm.f("blk.%d.ffn_gate_up_shexp", l),
+                                      { shared_gate, shared_up }));
+        /* Same gap as the down projection: a bf16 trunk's hidden state has no int8 pair until a
+         * weight asks for one. The main trunk aliases its pair; a drafter stage does not. */
+        if (sh_gate_up.probed_i8 && !w.h.q8) {
+            if (!w.h.x) return RAD_E_DTYPE;
+            const int64_t hn = g.n_embd;
+            const int64_t hm = c.rows > 0 ? c.rows : g.max_tok;
+            w.h.q8 = decl_b(b, nm.f("blk.%d.shared_h.q8", l), RAD_I8, { hm, hn });
+            w.h.s8 = decl_b(b, nm.f("blk.%d.shared_h.s8", l), RAD_F32, { hm, fp8_blocks(hn) });
+            if (!w.h.q8 || !w.h.s8) return RAD_E_INVAL;
+        }
         RAD_ARCH_TRY(sh_gate_up.declare(b, nm, g, nm.f("blk.%d.ffn_gate_up_shexp", l),
                                         2 * c.n_ff_shared, g.n_embd, RAD_SHARD_ROW, grp_layer(l),
                                         { shared_gate, shared_up },
@@ -1935,6 +1972,14 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
                         brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
     }
+
+    /* The file stager reads this layer at the first expert-weight issue, below. It uses the
+     * pointer the last route_report named. That report used to run after every pass, so the
+     * first visit of each layer had no pointer and read every expert. Report now, after the
+     * router and scatter are issued and before those weights are issued. The stager's copy is
+     * ordered behind the router on this stream, so it reads this pass. The report at the end of
+     * the step still samples the last pass for the heat engine. */
+    if (r0 == 0) route_report(c_);
 
     /* The rotated quantisation of the input, when the experts are rotated and the caller did not
      * write it. Unrotated, the GEMM reads `h`'s pair. */

@@ -708,6 +708,11 @@ int r4d_rad_layout_iqr_embed(const RadParam*, int, int, const RadEncoding*, cons
                              const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_iqr_embed(const RadParam*, int, int, const RadEncoding*, const int*,
                                const RadTensor*, int, void*, int64_t);
+/* The IQR stored form written on the card from a container's planes (r4d_iqr_relayout.hip):
+ * trellis forms only, the routed experts. The host relayout stays the fallback. */
+int r4d_iqr_relayout_gpu(const void* codes, void* dst, int64_t N, int64_t K, uint32_t bits,
+                        uint32_t L, uint32_t entries, const void* table, const void* mad,
+                        int64_t dst_bytes, void* stream);
 int r4d_rad_embed_lookup_iqr(const RadArgs*, RadStream);
 int r4d_rad_layout_embed_q(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, RadLayout*);

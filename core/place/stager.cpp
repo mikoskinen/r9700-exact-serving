@@ -586,14 +586,18 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
     *resync = false;
     if ((int32_t)h > last_issued_) last_issued_ = (int32_t)h;
 
-    /* Read the pass's first routed layer at its first op of any kind, when it is read whole. */
+    /* Read the pass's first routed layer at its first op of any kind, when it is read whole.
+     * A layer with a routing source is not read here: its router has not run, so the read would
+     * take every expert. It is read at its own trigger, below, with the counts. */
     if (first_op_) {
         first_op_ = false;
-        const auto it = std::lower_bound(layers_.begin(), layers_.end(), (int32_t)h,
-                                         [](const Layer& L, int32_t op) { return L.first_op < op; });
-        if (it != layers_.end()) {
-            const int32_t li = (int32_t)(it - layers_.begin());
-            if (will_issue(li) && !counted(li)) RAD_TRY(start(li, s, resync));
+        if (!routes_) {
+            const auto it = std::lower_bound(layers_.begin(), layers_.end(), (int32_t)h,
+                                             [](const Layer& L, int32_t op) { return L.first_op < op; });
+            if (it != layers_.end()) {
+                const int32_t li = (int32_t)(it - layers_.begin());
+                if (will_issue(li) && !counted(li)) RAD_TRY(start(li, s, resync));
+            }
         }
     }
 
@@ -612,7 +616,9 @@ int FileStager::before_op(rad_op h, RadStream s, bool* resync) {
     cur_ = li;
 
     const int32_t next = li + 1;
-    if ((size_t)next < layers_.size() && will_issue(next) && !counted(next))
+    /* Same rule: do not read the next layer ahead when its router has not run. That read is the
+     * whole expert set, and it is what a short prompt was paying for. */
+    if (!routes_ && (size_t)next < layers_.size() && will_issue(next) && !counted(next))
         RAD_TRY(start(next, s, resync));
     return RAD_OK;
 }

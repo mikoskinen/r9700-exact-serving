@@ -99,7 +99,8 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
     const uint8_t* __restrict__ A, const float* __restrict__ Sa, const uint8_t* __restrict__ W,
     const uint16_t* __restrict__ Sw, uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N,
     uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld, const Pre& pre,
-    const float* __restrict__ Rs = nullptr, const float* __restrict__ Cf = nullptr) {
+    const float* __restrict__ Rs = nullptr, const float* __restrict__ Cf = nullptr,
+    uint32_t c_ld = 0) {
     static_assert(!ROWF || RB == 32, "a row's scale and a block's factor fold as RB 32's one scale");
     constexpr uint32_t P = lds_pitch<kPFK>();
     static_assert(kPBM * 2u == kPWaves * kWave, "two threads stage an activation row");
@@ -289,8 +290,9 @@ __device__ __forceinline__ void gemm_8a8_prefill_body(
                 if constexpr (ROWF)
 #pragma unroll
                     for (uint32_t t = 0; t < 8; ++t) v[t] *= Rs[n + t];
+                const uint32_t ld = c_ld ? c_ld : N;
                 /* Packed in whole registers (bf16x2_rne, f32_to_bf16's bits). */
-                *(uint4*)(C + (size_t)m * N + n) =
+                *(uint4*)(C + (size_t)m * ld + n) =
                     make_uint4(bf16x2_rne(v[0], v[1]), bf16x2_rne(v[2], v[3]),
                                bf16x2_rne(v[4], v[5]), bf16x2_rne(v[6], v[7]));
             }

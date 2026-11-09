@@ -643,6 +643,15 @@ public:
                            RadEvent after, RadEvent done, FileRead* rd,
                            const int32_t* ecnt = nullptr, int32_t n_expert = 0,
                            const int32_t* protect = nullptr, int n_protect = 0);
+
+    /* A file-tier weight whose stored form is not the container's (weight_file_relaid) is
+     * converted on every read by the kernel's own relayout, as the loader does once for a
+     * resident weight. The function writes the stored form to `dst` from the container planes
+     * (`planes[k].data` points into the read). Set before init; a plan that places such a weight
+     * on the file tier with no function is refused there. */
+    using FileRelayout = std::function<int(const WeightInfo& w, const RadTensor* planes,
+                                           void* dst, int64_t dst_bytes)>;
+    void  set_file_relayout(FileRelayout fn) { relayout_ = std::move(fn); }
     char* file_buffer(int i) const {
         return (file_vram_ && (i == 0 || i == 1)) ? file_vram_ + i * file_buf_bytes_ : nullptr;
     }
@@ -700,6 +709,7 @@ private:
         Site    site = Site::Device;
         int64_t slab_slot = -1;      /* index into class slab, or -1 */
         int64_t pool_slot = -1;      /* index into class host pool, or -1 */
+        int64_t park_slot = -1;      /* index into the class relaid-form park, or -1 */
         int64_t static_off = -1;     /* byte offset into the static VRAM region, or -1 */
         int32_t klass = -1;
         int64_t bytes = 0;
@@ -718,9 +728,13 @@ private:
         void*    slab_base = nullptr;
         void*    pool_base = nullptr;
         void*    pool_dev = nullptr;   /* the pinned pool as the device addresses it */
+        void*    park_base = nullptr;  /* pinned copy of the relaid form, not the placement pool */
+        SlotPool park;
         int64_t  stride = 0;
         int64_t  n_fixed = 0;          /* slots in the budgeted range; the flex ones start here */
         int64_t  n_work = 0;           /* shadow + staging: free slots the mover needs to move at all */
+        int64_t  n_hot_lo = 0;         /* slots at and above this, below n_fixed, are the file-tier
+                                        * hot cache. Heat promotions must not take them. */
         int64_t  n_turn = 0;           /* lent slots kept free past those: the fill stops short
                                         * of them and balance() drops lent units to rebuild them
                                         * (MoverConfig::turnover_slots) */
@@ -747,6 +761,19 @@ private:
     MoverConfig    cfg_;
     Residency      res_;
     MoverCounters  stats_;
+    /* The file tier's on-read relayout (set_file_relayout): one host input per thread, which
+     * holds a weight's container planes for the relayout to read. */
+    struct RelayIn {
+        uint8_t* p = nullptr;
+        int64_t  cap = 0;
+        RelayIn() = default;
+        RelayIn(RelayIn&& o) noexcept : p(o.p), cap(o.cap) { o.p = nullptr; o.cap = 0; }
+        RelayIn(const RelayIn&) = delete;
+        ~RelayIn() { std::free(p); }
+    };
+    FileRelayout         relayout_;
+    std::vector<RelayIn> relay_in_;
+    int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
     /* The heat engine of the dispatch in flight, bound by begin_dispatch: the file stager's
      * admission test (which units read into the hot cache) runs between dispatches on this
      * same thread. Null when heat is off — no hot cache, no evictable victims. */
@@ -819,11 +846,16 @@ private:
         char*   dst = nullptr;
         bool    hot = false;
         bool    deposit = false;
+        const WeightInfo* relay = nullptr;   /* non-null: convert on the read, do not copy */
+        int32_t unit = -1;                    /* owner, so a relay can keep the stored form */
+        int64_t park_off = 0;                 /* byte offset of this weight in the unit */
     };
     std::vector<FileExt>    fext_;
     std::vector<int64_t>    fat_;          /* the staged units' buffer offsets */
     std::vector<char*>      fbase_;        /* the hot-cache units' slot bases */
     std::vector<int32_t>    frec_;         /* move records whose copies this read issues */
+    struct ParkCopy { char* dst = nullptr; const char* src = nullptr; int64_t bytes = 0; };
+    std::vector<ParkCopy>   park_cp_;      /* relaid-form copies this read issues, no pread */
     /* The file tier's cache cycle. `file_ok_`: by unit, the file stager reads it back when it is
      * on the file tier (cover_file_units). `layer_file_`: by plan layer, the bytes of its units
      * that are on the file tier or in the hot VRAM cache (which hands them back to the file tier
@@ -870,6 +902,13 @@ private:
     /* The pool slot a demotion copies `unit` into: one its layer's units started out in, else a
      * same-layer donor's, else any free one, else any donor's; -1 when there is none. */
     int64_t pool_slot_for(int32_t unit, HeatEngine* heat);
+    /* Copy a hot-cache unit's already-relaid bytes into the class park before the caller
+     * frees the slab. The next file-tier read copies from the park instead of the drive.
+     * False when the park has no slot colder than this unit; the caller still drops to
+     * the file. Does not change tier or the slab: the caller does that. */
+    bool park_hot(int32_t unit, HeatEngine* heat);
+    bool ensure_park(int32_t klass);
+    int64_t park_left_ = -1;
     /* A pool slot for a budgeted victim when none is free: the host copy of a unit in a KV-lent
      * slot, which stays in VRAM without it. From a unit of `layer`, or of any layer when
      * negative; -1 when no unit may give one. Rationale at the definition. */

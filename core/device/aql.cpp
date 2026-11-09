@@ -3599,9 +3599,10 @@ int a_vmem_commit(void* addr, int64_t bytes) {
     const Dev& d = G().dev[(size_t)dev];
     if (!card_has_room(dev, bytes, "vmem commit")) return RAD_E_NOMEM;
     hsa_amd_vmem_alloc_handle_t h{};
-    if (hsa_amd_vmem_handle_create(d.vram, (size_t)bytes, MEMORY_TYPE_NONE, 0, &h) !=
-        HSA_STATUS_SUCCESS) {
-        device_set_error("vmem: %lld bytes could not be backed on device %d", (long long)bytes, dev);
+    const hsa_status_t hs = hsa_amd_vmem_handle_create(d.vram, (size_t)bytes, MEMORY_TYPE_NONE, 0, &h);
+    if (hs != HSA_STATUS_SUCCESS) {
+        device_set_error("vmem: %lld bytes could not be backed on device %d (hsa %d, card_avail %lld)",
+                         (long long)bytes, dev, (int)hs, (long long)card_available(dev));
         return RAD_E_NOMEM;
     }
     if (hsa_amd_vmem_map(addr, (size_t)bytes, 0, h, 0) != HSA_STATUS_SUCCESS) {

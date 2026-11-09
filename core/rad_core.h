@@ -247,12 +247,27 @@ inline void weight_planes(const WeightInfo& w, RadTensor* t) {
     }
 }
 
+/* The selected plane's on-disk bytes are already the kernel buffer (a stored lane or
+ * scale table). The layout hook still names a dtype tag, so identity is false, but a
+ * file read of that one plane is the relayout. */
+inline bool weight_plane_is_stored(const WeightInfo& w) {
+    if (w.widen || w.narrow || w.n_sel < 1 || w.stored_bytes <= 0 || !w.enc_known) return false;
+    if (w.decl.shard != RAD_SHARD_NONE) return false;
+    const RadEncPlane& p = w.enc.plane[w.sel[0]];
+    int64_t rows = 1, cols = 1;
+    if (w.decl.rank >= 1) rows = w.decl.shape[0] > 0 ? w.decl.shape[0] : 1;
+    if (w.decl.rank >= 2) cols = w.decl.shape[1] > 0 ? w.decl.shape[1] : 1;
+    return rad_enc_plane_bytes(&p, rows, cols) == w.stored_bytes;
+}
+
 /* Whether the bytes can be read where they lie in the container (the file tier's O_DIRECT stage,
  * the mapped tier's pointer): only when they are the selected plane unchanged and this rank holds
- * all of it. A relayout is not in the file, and a column shard is not one contiguous range. */
+ * all of it. A relayout is not in the file, and a column shard is not one contiguous range.
+ * A stored plane whose byte count is the kernel buffer is that unchanged plane. */
 inline bool weight_file_direct(const WeightInfo& w, int world_size) {
-    return w.identity && !w.widen && !w.narrow &&
-           (w.decl.shard == RAD_SHARD_NONE || world_size <= 1);
+    if (w.widen || w.narrow) return false;
+    if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
+    return w.identity || weight_plane_is_stored(w);
 }
 
 
@@ -569,7 +584,7 @@ inline const RadKernelInfo* weight_layout_kernel(const Program& prog, const Weig
  * for a resident weight: whole planes (no shard at a world above one, so each plane is one range
  * of the container), not widened, and a kernel that relayouts. */
 inline bool weight_file_relaid(const Program& prog, const WeightInfo& w, int world_size) {
-    if (w.identity || w.widen) return false;
+    if (w.identity || w.widen || weight_plane_is_stored(w)) return false;
     if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
     const RadKernelInfo* ki = weight_layout_kernel(prog, w);
     return ki && ki->relayout;

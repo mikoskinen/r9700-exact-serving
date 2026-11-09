@@ -83,6 +83,8 @@ Mover::~Mover() {
     for (RadEvent e : lead_) if (e) rad_event_destroy(e);
     for (RadEvent e : win_ev_) if (e) rad_event_destroy(e);
     if (gate_) rad_event_destroy(gate_);
+    for (ClassPools& c : pools_)
+        if (c.park_base) rad_dev_free(c.park_base, RAD_MEM_HOST_PINNED);
     /* Only what this object allocated; a Pool reservation belongs to the Pool. */
     if (owns_memory_) {
         for (ClassPools& c : pools_) {
@@ -172,6 +174,10 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         /* Flex slots are added later by lend_from(), once the lender's memory is carved. */
         cp.n_fixed = slab_slots;
         cp.n_work = shadow + sc.n_stage;
+        /* The first RAD_PLACE_SHADOW_SLOTS of the shadow range are the swap budget heat
+         * promotes into. The rest is the file-tier hot cache; a heat promotion that takes
+         * one of those keeps it, and the cache never fills. */
+        cp.n_hot_lo = n_slab[c] + std::min<int64_t>(shadow, RAD_PLACE_SHADOW_SLOTS);
         cp.n_turn = std::min<int64_t>(std::max(cfg.turnover_slots, 0),
                                       shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
         total_turn += cp.n_turn;
@@ -262,6 +268,15 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_INVAL;
         }
         RAD_TRY(file_.open(cfg_.container_path));
+        for (const MoveUnit& mu : plan.units) {
+            if (mu.tier != Tier::SSD) continue;
+            for (int32_t wi : mu.weights)
+                if (weight_file_relaid(prog, prog.weights[wi], prog.ctx.world_size) && !relayout_) {
+                    RAD_ERR("mover: '%s' is on the file tier and its kernel relayouts it, but no "
+                            "relayout function was set", prog.weights[wi].name.c_str());
+                    return RAD_E_STATE;
+                }
+        }
         /* Staging slots are sized by the widest unit actually on the file tier, not the widest
          * class. The widest class is usually the embedding table (gigabytes, and never on the
          * file tier), and sizing on it would reserve pinned memory for a weight that never
@@ -498,7 +513,7 @@ int Mover::prefetch_to_op(int32_t op_index) {
      * a read outside [first_use_op, last_use_op]. */
     for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
         const UnitState& us = unit_[(size_t)u];
-        if (us.site != Site::DeviceStaged || us.slab_slot < 0) continue;
+        if (us.site != Site::DeviceStaged || us.slab_slot < 0 || us.hot) continue;
         if (unit_in_flight(u)) continue;   /* its copy has not landed; the slot is not ours yet */
         const MoveUnit& mu = plan_->units[(size_t)u];
         if (mu.last_use_op >= 0 && mu.last_use_op < op_index) release_slot(u);
@@ -792,6 +807,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     fat_.clear();
     fbase_.clear();
     frec_.clear();
+    park_cp_.clear();
     const size_t staged0 = rd->staged.size(), skipped0 = rd->skipped.size(),
                  promoted0 = rd->promoted.size();
     const int64_t used0 = rd->used;
@@ -809,18 +825,77 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             rd->skipped.push_back(u);
             continue;
         }
+        /* Already-relaid bytes in the host park: copy them, do not read the container.
+         * A hot-cache slot keeps the copy; otherwise it lands in this layer's buffer. */
+        if (us.park_slot >= 0) {
+            ClassPools& cp = pools_[(size_t)us.klass];
+            const char* src = (const char*)cp.park_base + us.park_slot * cp.stride;
+            bool admitted = false;
+            if (plan_->dynamic && heat_ && heat_->admit_hot(u) && !unit_in_flight(u)) {
+                const int rec = free_move_record();
+                int64_t slot = -1;
+                if (rec >= 0) slot = cp.slab.take_where([&](int64_t s) {
+                    return s >= cp.n_hot_lo && s < cp.n_fixed;
+                });
+                if (slot >= 0 && record_gate() < 0) { cp.slab.add_free(slot); slot = -1; }
+                if (slot >= 0) {
+                    char* base = cp.slot_ptr(slot);
+                    Move& m = moves_[(size_t)rec];
+                    m.state = Move::State::Copying;
+                    m.kind = Move::Kind::Admit;
+                    m.unit = u;
+                    m.slab_slot = slot;
+                    m.pool_slot = -1;
+                    ++copying_[(size_t)u];
+                    us.slab_slot = slot;
+                    us.hot = true;
+                    us.site = Site::Device;
+                    heat_->set_busy(u, true);
+                    ++stats_.ssd_promotions;
+                    park_cp_.push_back(ParkCopy{ base, src, us.bytes });
+                    rd->promoted.push_back(u);
+                    fbase_.push_back(base);
+                    frec_.push_back((int32_t)rec);
+                    hot_bytes += us.bytes;
+                    admitted = true;
+                }
+            }
+            if (!admitted) {
+                const int64_t need = align_up(us.bytes, RAD_ALIGN_UNIT);
+                if (off + need > cap) {
+                    RAD_ERR("file stager: a routed layer's file-tier units need more than the %s buffer "
+                            "the plan sized for the largest one", humanb(cap).c_str());
+                    return RAD_E_SCRATCH;
+                }
+                park_cp_.push_back(ParkCopy{ dst + off, src, us.bytes });
+                rd->staged.push_back(u);
+                fat_.push_back(off);
+                off += need;
+            }
+            continue;
+        }
+        /* A deposit copies the container's bytes into a pool slot the GEMM zero-copies as the
+         * stored form, so a relaid weight cannot take it. The hot cache can: the read relays
+         * into the slot (FileExt.relay) and the slot keeps the stored form. No free slot, and a
+         * relaid weight still takes the buffer path below, which relays and discards. */
+        const bool relaid = std::any_of(mu.weights.begin(), mu.weights.end(), [&](int32_t wi) {
+            return weight_file_relaid(*prog_, prog_->weights[wi], prog_->ctx.world_size);
+        });
         /* The hot VRAM cache: heat past the admission bar and a free
          * budgeted slot, and this pass's read lands in the slot and stays there. The read is
          * one the stager makes anyway; the slot is the whole cost, and eviction is
          * bookkeeping (the container is ground truth), so a mistake costs one future
          * re-read. No free slot, no heat, or no move record: the buffer path below, as
-         * before. */
+         * before. A relaid weight sets FileExt.relay so the copy is the stored form, not the
+         * container's bytes. */
         if (plan_->dynamic && heat_ && heat_->admit_hot(u) && !unit_in_flight(u)) {
             ClassPools& cp = pools_[(size_t)us.klass];
             const int rec = free_move_record();
             int64_t slot = -1;
             if (rec < 0) ++stats_.no_record;
-            else slot = cp.slab.take_where([&](int64_t s) { return s < cp.n_fixed; });
+            else slot = cp.slab.take_where([&](int64_t s) {
+                return s >= cp.n_hot_lo && s < cp.n_fixed;
+            });
             if (slot >= 0 && record_gate() < 0) { cp.slab.add_free(slot); slot = -1; }
             if (slot >= 0) {
                 char* const base = cp.slot_ptr(slot);
@@ -833,19 +908,68 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 ++copying_[(size_t)u];
                 us.slab_slot = slot;
                 us.hot = true;
+                us.site = Site::Device;   /* not a staging slot: prefetch must not release it at last_use_op */
                 heat_->set_busy(u, true);
+                /* Not evictable. Heat's step swaps up to 64 VRAM victims a step; marking the
+                 * cache evictable hands it that budget and the working set never settles.
+                 * Admission and the full-cache eviction below own these slots. */
                 ++stats_.ssd_promotions;
                 for (size_t k = 0; k < mu.weights.size(); ++k) {
                     const WeightInfo& w = prog_->weights[mu.weights[k]];
                     if (w.stored_bytes <= 0) continue;  /* nothing to read, nothing to place */
+                    const bool rw = weight_file_relaid(*prog_, w, prog_->ctx.world_size);
                     fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                             base + mu.offset[k], true, false });
+                                             base + mu.offset[k], true, false, rw ? &w : nullptr });
                 }
                 rd->promoted.push_back(u);
                 fbase_.push_back(base);
                 frec_.push_back((int32_t)rec);
                 hot_bytes += us.bytes;
                 continue;
+            }
+            /* The cache is full. A routed expert that lost the race still takes the buffer
+             * this step, but a colder hot-cache unit gives its slot up: the slot returns
+             * after quarantine, so the next token admits instead of re-reading. A unit in a
+             * protected layer may still be named by a kernel, so it is not a victim. */
+            if (rec >= 0 && record_gate() >= 0) {
+                int32_t victim = -1;
+                float cold = 0;
+                const float mine = heat_->heat(u);
+                for (int32_t v = 0; v < (int32_t)unit_.size(); ++v) {
+                    const UnitState& vs = unit_[(size_t)v];
+                    if (!vs.hot || vs.klass != us.klass || vs.slab_slot < 0) continue;
+                    if (copying_[(size_t)v] || heat_->busy(v)) continue;
+                    const int32_t layer = plan_->units[(size_t)v].layer;
+                    bool held = false;
+                    for (int p = 0; p < n_protect && !held; ++p)
+                        held = protect && protect[p] >= 0 && protect[p] == layer;
+                    if (held) continue;
+                    const float h = heat_->heat(v);
+                    /* 4x colder, not merely colder: decay 0.95, so an expert routed a few
+                     * steps ago still beats a one-token newcomer. Otherwise a full cache
+                     * rotates its working set every step. */
+                    if (h * 4.0f >= mine) continue;
+                    if (victim < 0 || h < cold) { victim = v; cold = h; }
+                }
+                if (victim >= 0) {
+                    (void)park_hot(victim, heat_);
+                    UnitState& vs = unit_[(size_t)victim];
+                    Move& m2 = moves_[(size_t)rec];
+                    m2.state = Move::State::Published;
+                    m2.kind = Move::Kind::Evict;
+                    m2.unit = victim;
+                    m2.slab_slot = vs.slab_slot;
+                    m2.pool_slot = -1;
+                    vs.slab_slot = -1;
+                    vs.tier = Tier::SSD;
+                    vs.site = Site::DeviceStaged;
+                    vs.hot = false;
+                    republish(victim);
+                    ++stats_.demotions;
+                    heat_->set_tier(victim, Tier::SSD);
+                    heat_->set_busy(victim, true);
+                    heat_->set_evictable(victim, false);
+                }
             }
         }
         /* A free pool slot and this read deposits the unit into the pool: its window's copy list
@@ -855,7 +979,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
          * relabelled back to the file tier, copyless (the container holds every unit's bytes),
          * provided it is colder than this one (pick_victim). The slot it gives up feeds a later
          * deposit after the quarantine; this read takes the buffer path. */
-        if (plan_->dynamic && heat_ && !unit_in_flight(u)) {
+        if (!relaid && plan_->dynamic && heat_ && !unit_in_flight(u)) {
             ClassPools& cp = pools_[(size_t)us.klass];
             const int rec = free_move_record();
             int64_t g = -1;
@@ -929,8 +1053,12 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         for (size_t k = 0; k < mu.weights.size(); ++k) {
             const WeightInfo& w = prog_->weights[mu.weights[k]];
             if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
-            fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                     dst + off + mu.offset[k], false, false });
+            const bool rw = weight_file_relaid(*prog_, w, prog_->ctx.world_size);
+            FileExt fe{ (int64_t)w.file_offset, w.stored_bytes,
+                        dst + off + mu.offset[k], false, false, rw ? &w : nullptr };
+            fe.unit = u;
+            fe.park_off = mu.offset[k];
+            fext_.push_back(fe);
         }
         rd->staged.push_back(u);
         fat_.push_back(off);
@@ -967,7 +1095,18 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             res_.publish(mu.weights[j], fbase_[k - promoted0] + mu.offset[j]);
         stats_.ssd_read_bytes += (uint64_t)unit_[(size_t)u].bytes;
     }
-    if (fext_.empty()) return RAD_OK;
+    if (fext_.empty()) {
+        if (!park_cp_.empty()) {
+            if (after) RAD_TRY(rad_event_wait(mover_, after));
+            for (const ParkCopy& c : park_cp_)
+                RAD_TRY(rad_memcpy_async(c.dst, c.src, c.bytes, mover_));
+            park_cp_.clear();
+            for (int32_t rec : frec_) RAD_TRY(rad_event_record(moves_[(size_t)rec].ev, mover_));
+            RAD_TRY(rad_event_record(done, mover_));
+            rd->copied = true;
+        }
+        return RAD_OK;
+    }
     /* Container order, so a window is one long run of the drive rather than a seek per weight. */
     std::stable_sort(fext_.begin(), fext_.end(),
                      [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
@@ -989,9 +1128,79 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     }
 
     if (after) RAD_TRY(rad_event_wait(mover_, after));
+    for (const ParkCopy& c : park_cp_)
+        RAD_TRY(rad_memcpy_async(c.dst, c.src, c.bytes, mover_));
+    park_cp_.clear();
 
     const int64_t A = DirectFile::alignment();
     const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
+    /* A relaid weight is converted on the host into a pinned window, then copied to the card.
+     * The relayout is host code; it must not write the card buffer. */
+    {
+        std::vector<FileExt> relaid;
+        for (const FileExt& e : fext_) if (e.relay) relaid.push_back(e);
+        if (!relaid.empty()) {
+            if (!relayout_) {
+                RAD_ERR("file tier: a weight is placed to be relaid on the read and no relayout "
+                        "was set");
+                return RAD_E_STATE;
+            }
+            if (relay_in_.empty()) relay_in_.resize(1);
+            fext_.erase(std::remove_if(fext_.begin(), fext_.end(),
+                                       [](const FileExt& e) { return e.relay != nullptr; }),
+                        fext_.end());
+            for (const FileExt& e : relaid) {
+                if (e.bytes > W) {
+                    RAD_ERR("file tier: '%s' relays to %s, more than a %s read window",
+                            e.relay->name.c_str(), humanb(e.bytes).c_str(), humanb(W).c_str());
+                    return RAD_E_SCRATCH;
+                }
+                const int w = win_next_;
+                win_next_ = (win_next_ + 1) % n_windows_;
+                char* win = windows_ + (int64_t)w * W;
+                if (win_rec_[(size_t)w]) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    RAD_TRY(rad_event_sync(win_ev_[(size_t)w]));
+                    stats_.ssd_wait_ns += (uint64_t)std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                    win_rec_[(size_t)w] = 0;
+                }
+                RAD_TRY(read_relaid(*e.relay, win, W, &relay_in_[0]));
+                if (e.unit >= 0) {
+                    UnitState& us = unit_[(size_t)e.unit];
+                    if (us.klass >= 0 && ensure_park(us.klass)) {
+                        ClassPools& cp = pools_[(size_t)us.klass];
+                        if (us.park_slot < 0) {
+                            int64_t g = cp.park.take();
+                            if (g < 0 && heat_) {
+                                int32_t who = -1;
+                                float cold = heat_->heat(e.unit);
+                                for (int32_t v = 0; v < (int32_t)unit_.size(); ++v) {
+                                    const UnitState& vs = unit_[(size_t)v];
+                                    if (vs.klass != us.klass || vs.park_slot < 0 || vs.hot) continue;
+                                    const float h = heat_->heat(v);
+                                    if (h >= cold) continue;
+                                    who = v;
+                                    cold = h;
+                                }
+                                if (who >= 0) {
+                                    g = unit_[(size_t)who].park_slot;
+                                    unit_[(size_t)who].park_slot = -1;
+                                }
+                            }
+                            if (g >= 0) us.park_slot = g;
+                        }
+                        if (us.park_slot >= 0)
+                            std::memcpy((char*)cp.park_base + us.park_slot * cp.stride + e.park_off,
+                                        win, (size_t)e.bytes);
+                    }
+                }
+                RAD_TRY(rad_memcpy_async(e.dst, win, e.bytes, mover_));
+                RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
+                win_rec_[(size_t)w] = 1;
+            }
+        }
+    }
     struct Seg { int64_t fs = 0, fe = 0, ws = 0; };     /* file [fs, fe) read to window offset ws */
     struct Cp  { int64_t wo = 0, bytes = 0; char* dst = nullptr; };
     std::vector<Seg> segs;
@@ -1013,7 +1222,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
 
         /* Pack the window: extend the current run while the next weight starts within the
          * read-through gap of its end, start another run otherwise, and split a weight the window
-         * cannot finish across this window and the next. */
+         * cannot finish across this window and the next. Relaid weights were converted above. */
         segs.clear();
         cps.clear();
         while (i < fext_.size()) {
@@ -1064,6 +1273,42 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     return RAD_OK;
 }
 
+/* One weight relaid on the read: its selected planes' span, aligned out to the O_DIRECT block,
+ * read into this thread's host input in one pread (the aligned path, which touches no shared
+ * bounce, so threads read at once), then the relayout writes the stored form to `dst`. Each plane
+ * is whole (weight_file_relaid), so it is one range of the container. */
+int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in) {
+    if (!relayout_ || !in || w.n_sel <= 0) return RAD_E_STATE;
+    if (w.stored_bytes > dst_cap) {
+        RAD_ERR("file tier: '%s' relays to %s and the pinned space for it is %s", w.name.c_str(),
+                humanb(w.stored_bytes).c_str(), humanb(dst_cap).c_str());
+        return RAD_E_SCRATCH;
+    }
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int k = 0; k < w.n_sel; ++k) {
+        const int64_t len = pt[k].shape[0] * rad_dtype_bytes(pt[k].dtype, pt[k].shape[1]);
+        lo = std::min(lo, (int64_t)w.file_plane_offset[k]);
+        hi = std::max(hi, (int64_t)w.file_plane_offset[k] + len);
+    }
+    const int64_t A = DirectFile::alignment();
+    const int64_t a0 = lo / A * A, n = align_up(hi - a0, A);
+    if (in->cap < n) {
+        std::free(in->p);
+        in->p = (uint8_t*)std::aligned_alloc((size_t)A, (size_t)n);
+        in->cap = in->p ? n : 0;
+        if (!in->p) return RAD_E_NOMEM;
+    }
+    RAD_TRY(file_.read((uint64_t)a0, hi - a0, in->p, in->cap));   /* reads n, needs hi - a0 */
+    for (int k = 0; k < w.n_sel; ++k) pt[k].data = in->p + ((int64_t)w.file_plane_offset[k] - a0);
+    const int st = relayout_(w, pt, dst, w.stored_bytes);
+    if (st < 0)
+        RAD_ERR("file tier: relaying '%s' (%s) on the read failed: %s", w.name.c_str(),
+                w.layout_tag.c_str(), rad_strerror(st));
+    return st;
+}
+
 void Mover::release_slot(int32_t unit) {
     const int rec = free_move_record();
     if (rec < 0) { ++stats_.no_record; return; }
@@ -1097,6 +1342,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
          * The quarantine below is the same as any demotion's: kernels issued in earlier
          * layers may still name the slot. */
         if (!promote && us.hot && us.slab_slot >= 0) {
+            (void)park_hot(unit, heat);
             const int rec = free_move_record();
             if (rec < 0) { ++stats_.no_record; return false; }
             if (record_gate() < 0) return false;
@@ -1121,7 +1367,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         }
 
         if (promote) {
-            const int64_t slot = cp.slab.take();
+            const int64_t slot = cp.slab.take_where([&](int64_t s) { return s < cp.n_hot_lo; });
             if (slot < 0) { ++stats_.starved_slab; return false; }
             if (promote_to(unit, slot) < 0) { cp.slab.add_free(slot); return false; }
             return true;
@@ -1419,6 +1665,69 @@ int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
  * prompt. Prefer a slot the unit's own layer started in, then a same-layer donor, then any free
  * slot, then any donor. At TP1 (26K-token prompts, 256 decoded tokens between) this takes a
  * layer's staging from 162 copies to 112. */
+/* The hot cache holds the relaid form. A copyless drop back to the file throws that work
+ * away and the next route pays the relayout again. Copy the bytes into a pinned park the
+ * placement pool does not own (that pool is full, and it stores the container form). The
+ * caller still frees the slab. The next file-tier read copies from the park. */
+bool Mover::ensure_park(int32_t klass) {
+    ClassPools& cp = pools_[(size_t)klass];
+    if (cp.park_base) return true;
+    if (park_left_ < 0) {
+        const char* e = std::getenv("RAD_PARK_MIB");
+        park_left_ = ((e && *e) ? std::atoll(e) : 1280) << 20;
+    }
+    if (cp.stride <= 0 || park_left_ < cp.stride) return false;
+    const int64_t share = std::min(park_left_, ((int64_t)1280 << 20) / 2);
+    int64_t n = share / cp.stride;
+    if (n > 1024) n = 1024;
+    if (n < 1) return false;
+    void* p = rad_dev_alloc(n * cp.stride, RAD_MEM_HOST_PINNED);
+    if (!p) return false;
+    cp.park_base = p;
+    cp.park.init(n, cp.stride);
+    for (int64_t s = 0; s < n; ++s) cp.park.add_free(s);
+    park_left_ -= n * cp.stride;
+    RAD_WARN("mover: parked %lld relaid slots of %s (%s left)",
+             (long long)n, humanb(cp.stride).c_str(), humanb(park_left_).c_str());
+    return true;
+}
+
+bool Mover::park_hot(int32_t unit, HeatEngine* heat) {
+    UnitState& us = unit_[(size_t)unit];
+    if (!us.hot || us.slab_slot < 0 || us.klass < 0) return false;
+    if (us.park_slot >= 0) return true;
+    ClassPools& cp = pools_[(size_t)us.klass];
+    if (!ensure_park(us.klass)) return false;
+    int64_t g = cp.park.take();
+    if (g < 0 && heat) {
+        int32_t who = -1;
+        float cold = heat->heat(unit);
+        for (int32_t v = 0; v < (int32_t)unit_.size(); ++v) {
+            const UnitState& vs = unit_[(size_t)v];
+            if (vs.klass != us.klass || vs.park_slot < 0 || vs.hot) continue;
+            if (copying_[(size_t)v]) continue;
+            const float h = heat->heat(v);
+            if (h >= cold) continue;
+            who = v;
+            cold = h;
+        }
+        if (who >= 0) {
+            g = unit_[(size_t)who].park_slot;
+            unit_[(size_t)who].park_slot = -1;
+        }
+    }
+    if (g < 0) return false;
+    char* dst = (char*)cp.park_base + g * cp.stride;
+    if (rad_memcpy_async(dst, cp.slot_ptr(us.slab_slot), us.bytes, mover_) < 0 ||
+        rad_stream_sync(mover_) < 0) {
+        cp.park.add_free(g);
+        return false;
+    }
+    us.park_slot = g;
+    stats_.d2h_bytes += (uint64_t)us.bytes;
+    return true;
+}
+
 int64_t Mover::pool_slot_for(int32_t unit, HeatEngine* heat) {
     const UnitState& us = unit_[(size_t)unit];
     ClassPools& cp = pools_[(size_t)us.klass];

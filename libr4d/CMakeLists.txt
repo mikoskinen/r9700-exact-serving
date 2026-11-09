@@ -208,6 +208,7 @@ set(R4D_UNITS
   # the other three only feed the GEMM.
   "r4d_moe|"
   "r4d_moe_iqr|"
+  "r4d_iqr_relayout|"
   # DeepSeek-V4.1-Flash: the elementwise and small ops, the sparse attention and its indexer, and
   # the GEMMs over llama.cpp's native blocks (GGUF imports), MXFP4's in a unit of their own.
   "r4d_ds41_elem|"
@@ -273,6 +274,14 @@ set_target_properties(r4d_selftest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_B
 #   r4d_selftest /opt/radiance/share/radiance/kernels/libr4d.so [--case <row>]
 # The collective cases need every card of the box in the container.
 install(TARGETS r4d_selftest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# iqr_permute: rewrite a sealed IQR container in the GEMM's lane order, so a file read is a copy
+# and the host pool can hold it. Links libr4d for the CPU walk; the new container carries the
+# stored form as a "stored" encoding the loader reads directly.
+add_executable(iqr_permute ${CMAKE_CURRENT_SOURCE_DIR}/iqr_permute.cpp ${CMAKE_SOURCE_DIR}/core/format/radfile.cpp ${CMAKE_SOURCE_DIR}/core/util/rad_util.cpp)
+target_link_libraries(iqr_permute PRIVATE radiance::abi ${CMAKE_DL_LIBS})
+target_include_directories(iqr_permute PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/abi ${CMAKE_SOURCE_DIR}/core/format)
+set_target_properties(iqr_permute PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # C++17: at C++20 clang tightens the address-space check on
 # __builtin_amdgcn_global_load_tr_b128_v8i16 in r4d_common.h. Kernel cost figures are for C++17.

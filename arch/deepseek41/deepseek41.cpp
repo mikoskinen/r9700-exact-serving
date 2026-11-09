@@ -414,6 +414,7 @@ struct Model {
      * (`i8a8h`, or an asymmetric rotated form) and `wrb` a trellis's rows per int8 scale. */
     std::map<rad_weight, rad_weight>   wsc;
     std::map<rad_weight, const char*>  wdt;
+    std::map<rad_weight, uint32_t>     wcod;   /* codes' dtype: RAD_I8/RAD_U5 for IQR, F8E4M3 for fp8 */
     std::map<rad_weight, int64_t>      wrb;
     /* The quantiser each dense GEMM waits for (linear()): the op and the K its pair was declared at. */
     std::map<rad_op, IqrQOp>           qops;
@@ -502,6 +503,7 @@ static rad_op op(RadBuilder* b, const char* name, std::vector<RadParam> ps,
                  std::initializer_list<rad_buf> wr) {
     const rad_op h = rad_decl_op(b, name, ps.data(), (int)ps.size(),
                                  ws.empty() ? nullptr : ws.data(), (int)ws.size());
+    if (!h) std::fprintf(stderr, "radiance: deepseek41: op %s refused\n", name);
     return rw(b, h, rd, wr);
 }
 static rad_weight wt(RadBuilder* b, const char* name, uint32_t dt,
@@ -543,12 +545,39 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
     const bool known = weight_enc(b, name, &e);
     const char* ty = known ? ggml_type_of(e, &blk) : nullptr;
     const bool split = m.g.world > 1 && shard != RAD_SHARD_NONE;
+    /* A container written in lane order: its bytes are already the GEMM's stored form. */
+    if (known && rad_enc_is(&e, "stored")) {
+        std::string base(name);
+        const bool suffix = base.size() > 6 && base.compare(base.size() - 6, 6, ".weight") == 0;
+        if (suffix) base.resize(base.size() - 6);
+        const char* sn = m.nm.f("%s.scale", base.c_str());
+        const rad_weight w = decl_view(b, name, nullptr, "codes", RAD_U8, { n, k }, access,
+                                       split ? shard : RAD_SHARD_NONE, grp);
+        const rad_weight ws = decl_view(b, sn, name, "scale", RAD_U8, { n, k / 128 }, access,
+                                        split ? shard : RAD_SHARD_NONE, grp);
+        if (!w || !ws) {
+            fprintf(stderr, "radiance: deepseek41: stored IQR weight %s refused\n", name);
+            return 0;
+        }
+        m.wsc[w] = ws;
+        m.wcod[w] = RAD_U8;
+        m.wdt[w] = "i8a8h";
+        m.wrb[w] = 0;
+        return w;
+    }
     const W8hForm form = known ? linear_w8h_form(e) : W8hForm::None;
     const bool w8 = known && linear_is_w8(e);
+    const bool w8h = known && linear_is_w8h(e);
     const bool wnh = known && linear_is_wnh(e);
+    /* A code plane narrower than bf16 in an affine/trellis encoding is an IQR view even when
+     * linear_w8h_form() does not name its layout (e.g. an unsigned table with a zero point).
+     * A named GGML block (q6_K and the rest) is not that view: its scale is the block's own
+     * planes, and gemm_nt_ggml / embed_lookup_ggml read them. */
+    const bool narrow = !ty && known && (rad_enc_is(&e, "affine") || rad_enc_is(&e, "trellis")) &&
+                        e.n_planes >= 2 && e.plane[0].dtype != RAD_BF16 && e.plane[0].dtype != RAD_F32;
     /* A rotated or int8 narrow weight: lw()'s codes are a view of the stored planes, its scale
      * plane a second view; the GEMM decodes them where it reads them (libr4d's IQR rows). */
-    if (form != W8hForm::None || w8 || wnh) {
+    if (!ty && (form != W8hForm::None || w8 || w8h || wnh || narrow)) {
         const bool trellis = form == W8hForm::Trellis;
         const RadEncPlane* tpl = trellis ? rad_enc_plane(&e, "trellis") : nullptr;
         const int64_t wb = trellis && tpl ? tpl->block[1] : 0;
@@ -598,6 +627,7 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
             return 0;
         }
         m.wsc[w] = ws;
+        m.wcod[w] = (uint32_t)e.plane[0].dtype;
         m.wdt[w] = wnh ? (e.plane[0].dtype == RAD_U5 ? "w5a8i8" : "w4a8i8_asym")
                        : form != W8hForm::None ? "i8a8h" : "i8a8";
         m.wrb[w] = wb;
@@ -656,14 +686,21 @@ static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_
               { w }, { x }, { y });
 }
 /* Issue a dense linear: its quantiser first when lw() found an IQR weight, then its GEMM. The pair
- * is one buffer for the whole model, so the quantiser and GEMM read the same columns of it. */
+ * is one buffer for the whole model, so the quantiser and GEMM read the same columns of it.
+ * gemm_nt_q's schema is a, a_scale, b, b_scale, y, then optional a_sum and b_ref (7 slots, 5
+ * required). Issuing the bf16 list (activation, weight, y) is a step-0 schema refusal. i8a8 and
+ * i8a8h do not read the trailing pair; pass them as nulls so a later grid fails closed. */
 static void lin_issue(RadCtx* x, Model& m, rad_op h, int64_t rows, RadOperand a, rad_weight w,
                       RadOperand y) {
     const auto q = m.qops.find(h);
     if (q != m.qops.end()) {
         const int64_t K = q->second.K;
-        RAD_ISSUE_N(x, q->second.op, rows, a, bcol(m.iqr_q8, 0, K, rows),
-                    bcol(m.iqr_s8, 0, K / RAD_FP8_BLOCK, rows));
+        const RadOperand q8 = bcol(m.iqr_q8, 0, K, rows);
+        const RadOperand s8 = bcol(m.iqr_s8, 0, K / RAD_FP8_BLOCK, rows);
+        RAD_ISSUE_N(x, q->second.op, rows, a, q8, s8);
+        const auto sc = m.wsc.find(w);
+        RAD_ISSUE_N(x, h, rows, q8, s8, RAD_W(w), RAD_W(sc->second), y, RAD_NONE, RAD_NONE);
+        return;
     }
     RAD_ISSUE_N(x, h, rows, a, RAD_W(w), y);
 }
@@ -947,7 +984,7 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.ids = decl_b(b, nm.f("expert_ids"), RAD_I32, { T, c.top_k });
     mw.ew = decl_b(b, nm.f("expert_weights"), RAD_F32, { T, c.top_k });
     mw.eoff = decl_b(b, nm.f("expert_offsets"), RAD_I32, { c.n_expert + 1 });
-    mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { c.n_expert });
+    mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { c.n_expert }, RAD_BUF_PERSIST);
     mw.sorted = decl_b(b, nm.f("expert_sorted"), RAD_I32, { T * c.top_k });
     mw.egu = bf("expert_gate_up", { T * c.top_k, 2 * c.n_ff });
     mw.eff.x = bf("expert_ff", { T * c.top_k, c.n_ff });
@@ -1678,7 +1715,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     mw.ids = decl_b(b, nm.f("dspark_expert_ids"), RAD_I32, { Q, d.top_k });
     mw.ew = decl_b(b, nm.f("dspark_expert_weights"), RAD_F32, { Q, d.top_k });
     mw.eoff = decl_b(b, nm.f("dspark_expert_offsets"), RAD_I32, { d.n_expert + 1 });
-    mw.ecnt = decl_b(b, nm.f("dspark_expert_counts"), RAD_I32, { d.n_expert });
+    mw.ecnt = decl_b(b, nm.f("dspark_expert_counts"), RAD_I32, { d.n_expert }, RAD_BUF_PERSIST);
     mw.sorted = decl_b(b, nm.f("dspark_expert_sorted"), RAD_I32, { Q * d.top_k });
     mw.egu = bf("dspark_expert_gate_up", { Q * d.top_k, 2 * c.n_ff });
     mw.eff.x = bf("dspark_expert_ff", { Q * d.top_k, c.n_ff });
@@ -1757,7 +1794,20 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
 
     /* ---- the query pass: [anchor, noise ...] embedded by the trunk's table into hc copies */
     const auto tt = m.wty.find(m.token);
-    if (tt != m.wty.end())
+    const auto ts2 = m.wsc.find(m.token);
+    const auto tc2 = m.wcod.find(m.token);
+    if (ts2 != m.wsc.end() && tc2 != m.wcod.end() && tc2->second != RAD_F8E4M3)
+        d.embed = op(b, "embed_lookup_iqr",
+                     { RAD_RANGE("M", 1, Q), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
+                     { m.token, ts2->second }, {}, { d.x });
+    else if (ts2 != m.wsc.end() && tc2 != m.wcod.end() && tc2->second == RAD_F8E4M3)
+        d.embed = op(b, "embed_lookup_q",
+                     { RAD_RANGE("M", 1, Q), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off),
+                       RAD_F64("wscale", 1.0) },
+                     { m.token, ts2->second }, {}, { d.x });
+    else if (tt != m.wty.end())
         d.embed = op(b, "embed_lookup_ggml",
                      { RAD_RANGE("M", 1, Q), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
                        RAD_STR("type", tt->second), RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
@@ -1798,7 +1848,19 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     d.gather = op(b, "gather_rows", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
                   { d.fin }, { d.rows });
     const auto ht = m.wty.find(m.head);
-    if (ht != m.wty.end())
+    const auto hs2 = m.wsc.find(m.head);
+    const auto hc2 = m.wcod.find(m.head);
+    if (hs2 != m.wsc.end() && hc2 != m.wcod.end() && hc2->second == RAD_I8)
+        d.head = op(b, "logits_gemm_iqr",
+                    { RAD_RANGE("M", 1, Q), RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", D),
+                      RAD_STR("dtype", "bf16") },
+                    { m.head, hs2->second }, { d.rows }, { d.logits });
+    else if (hs2 != m.wsc.end() && hc2 != m.wcod.end())
+        d.head = op(b, "logits_gemm",
+                    { RAD_RANGE("M", 1, Q), RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", D),
+                      RAD_STR("dtype", "bf16") },
+                    { m.head }, { d.rows }, { d.logits });
+    else if (ht != m.wty.end())
         d.head = op(b, "logits_gemm_ggml",
                     { RAD_RANGE("M", 1, Q), RAD_INT("n_vocab", g.n_vocab), RAD_INT("n_embd", D),
                       RAD_STR("type", ht->second), RAD_STR("dtype", "bf16") },
@@ -1900,7 +1962,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.final_gain = wt(b, nm.f("output_norm.weight"), RAD_F32, { D }, grp_model());
     /* A GGUF's table in llama.cpp's blocks is gathered from them (embed_lookup_ggml). */
     const auto tt = m.wty.find(m.token);
-    if (tt != m.wty.end())
+    const auto ts = m.wsc.find(m.token);
+    const auto tc = m.wcod.find(m.token);
+    if (ts != m.wsc.end() && tc != m.wcod.end() && tc->second != RAD_F8E4M3)
+        m.embed = op(b, "embed_lookup_iqr",
+                     { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
+                     { m.token, ts->second }, {}, { m.xcol });
+    else if (ts != m.wsc.end() && tc != m.wcod.end() && tc->second == RAD_F8E4M3)
+        m.embed = op(b, "embed_lookup_q",
+                     { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off),
+                       RAD_F64("wscale", 1.0) },
+                     { m.token, ts->second }, {}, { m.xcol });
+    else if (tt != m.wty.end())
         m.embed = op(b, "embed_lookup_ggml",
                      { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
                        RAD_STR("type", tt->second), RAD_STR("dtype", "bf16"),
@@ -2014,7 +2089,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                   { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
                   {}, { m.final_hidden }, { m.logit_input });
     const auto ht = m.wty.find(m.head);
-    if (ht != m.wty.end())
+    const auto hs = m.wsc.find(m.head);
+    const auto hc = m.wcod.find(m.head);
+    if (hs != m.wsc.end() && hc != m.wcod.end() && hc->second == RAD_I8)
+        m.head_op = op(b, "logits_gemm_iqr",
+                       { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                         RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
+                       { m.head, hs->second }, { m.logit_input }, { m.logits });
+    else if (hs != m.wsc.end() && hc != m.wcod.end())
+        m.head_op = op(b, "logits_gemm",
+                       { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                         RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
+                       { m.head }, { m.logit_input }, { m.logits });
+    else if (ht != m.wty.end())
         m.head_op = op(b, "logits_gemm_ggml",
                        { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
                          RAD_INT("n_embd", D), RAD_STR("type", ht->second), RAD_STR("dtype", "bf16") },

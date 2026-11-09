@@ -626,8 +626,8 @@ int KVManager::carve_into(Pool& kv_pool) {
         const int64_t used = pool_->used();
         const int rc = pool_->commit(0, used);
         if (rc < 0) {
-            RAD_ERR("KV pool: the carve reserved %s of address space and the card would not back "
-                    "it", humanb(used).c_str());
+            RAD_ERR("KV pool: the carve reserved %s of address space and the card would not back it: %s",
+                    humanb(used).c_str(), rad_dev_last_error());
             return rc;
         }
     }

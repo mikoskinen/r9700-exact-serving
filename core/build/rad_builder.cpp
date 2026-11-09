@@ -130,6 +130,7 @@ uint32_t Builder::err(int code, const char* f, ...) {
     /* First class wins; later errors are usually consequences, and the list keeps them all. */
     if (status_ == RAD_OK) status_ = code;
     RAD_ERR("declare: %s", msg);
+    std::fprintf(stderr, "radiance: builder: %s\n", msg);
     return RAD_NULL_HANDLE;
 }
 
@@ -516,6 +517,8 @@ static Geometry display_geometry(const OpInfo& oi, const Band& b) {
 }
 
 void Builder::resolve_bands(OpInfo& oi) {
+    std::fprintf(stderr, "radiance: dbg resolve_bands op=%s key=%s lo=%lld hi=%lld\n",
+                 oi.op.c_str(), oi.ranged_key.c_str(), (long long)oi.range_lo, (long long)oi.range_hi);
     /* The bucket table comes from core/plugin/: boundaries are the union of candidate kernels'
      * constraint values on the ranged parameter, clamped to the declared range, and both domains
      * resolve at each band's upper bound (the worst case, the only safe value to select and size
@@ -544,6 +547,7 @@ void Builder::resolve_bands(OpInfo& oi) {
     };
     oi.bands = reg_.build_bands(oi.op, oi.ranged_key, oi.range_lo, oi.range_hi, oi.base,
                                 oi.weights.empty() ? nullptr : &accept);
+    std::fprintf(stderr, "radiance: dbg bands=%zu\n", oi.bands.size());
 
     if (oi.bands.empty()) {
         /* No rows for this op at all; add one band so the miss report names it. */
@@ -825,6 +829,20 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     bool resolved = true;
     for (const Band& b : oi.bands)
         if (!b.dom[RAD_DOMAIN_DEVICE] && !b.dom[RAD_DOMAIN_HOST]) resolved = false;
+
+    if (!resolved) {
+        fprintf(stderr, "radiance: unresolved op '%s' (%zu band(s), %zu weight(s)):\n", opname,
+                oi.bands.size(), oi.weights.size());
+        for (const Band& bd : oi.bands)
+            for (int d = 0; d < RAD_N_DOMAINS; ++d)
+                if (!bd.dom[d])
+                    fprintf(stderr, "  band hi=%lld dom%d: %s\n", (long long)bd.hi, d,
+                            bd.miss[d].empty() ? "(no kernel matched)" : bd.miss[d].c_str());
+        for (int i = 0; i < n_w; ++i)
+            if (w[i] > 0 && w[i] < prog_.weights.size())
+                fprintf(stderr, "  weight %d dtype=%u name=%s\n", i,
+                        prog_.weights[w[i]].decl.dtype, prog_.weights[w[i]].name.c_str());
+    }
 
     prog_.ops.push_back(std::move(oi));
     op_bufs_.emplace_back();
