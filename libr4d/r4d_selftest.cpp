@@ -151,6 +151,7 @@ struct Plugin {
     void (*write_hc_vec)(int) = nullptr;   /* optional (fn4 hcw) */
     void (*readv_hc)(int) = nullptr;       /* optional (fn4 hc_readv) */
     void (*pf2_stages_hc)(int) = nullptr;  /* optional (fn4 hc_readv timing) */
+    void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -229,6 +230,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->write_hc_vec = (void (*)(int))dlsym(pl->h, "r4d_hc_write_vec");
     pl->readv_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_readv");
     pl->pf2_stages_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_pf2_stages");
+    pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -20976,6 +20978,239 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     ok(nm.c_str(), true);
 }
 
+/* fn4 hc_upmix: the up-mix's other tiles against the stock one, byte for byte on every output (hc_readv 3
+ * and F1n in both): PF2's forms 1-4 from 512 rows, the 64-row decode tile (8) at 33-64 rows. */
+static void hc_upmix_case(const Plugin& pl, int64_t M, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 at M=%lld, %s codes: the hc_upmix forms (fn4) byte-identical "
+                               "to the stock up-mix", (long long)M, i8 ? "int8" : "E4M3");
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.upmix_hc || !pl.readv_hc || !pl.norm_hc_wave || !pl.record) { skip(nm.c_str(), "no r4d_hc_upmix"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4), db = (size_t)(M * lr * 2);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; std::vector<const void*> fns; };
+    std::vector<int> vals = { 0 };
+    if (M >= 512) { for (int v : { 1, 2, 3, 4 }) vals.push_back(v); }
+    else if (M > 32 && M <= 64) vals.push_back(8);
+    else vals.push_back(8);   /* not served here: must change nothing */
+    const bool here = M > 32;
+    std::vector<Out> out(vals.size());
+    pl.readv_hc(3);
+    pl.norm_hc_wave(1);
+    for (size_t run = 0; run < vals.size(); ++run) {
+        pl.upmix_hc(vals[run]);
+        st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
+        st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
+        if (a.scratch) st_memset(a.scratch, 0xa5, (size_t)a.scratch_bytes);
+        const void* fns[32] = {};
+        pl.record(fns, 32);
+        const int rc = r->launch(&a, (RadStream)hs);
+        out[run].nd = pl.record(nullptr, 0);
+        out[run].fns.assign(fns, fns + (out[run].nd < 32 ? out[run].nd : 32));
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_upmix %d rc=%d", vals[run], rc));
+            pl.upmix_hc(0); pl.readv_hc(0); pl.norm_hc_wave(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) {
+            v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost);
+        };
+        get(out[run].x, d_x, xb); get(out[run].inj, d_inj, ib); get(out[run].q, d_q, qb);
+        get(out[run].qs, d_qs, sb); get(out[run].rq, d_rq, qb); get(out[run].rs, d_rs, sb);
+        if (a.scratch && (size_t)a.scratch_bytes >= db) get(out[run].d, a.scratch, db);
+    }
+    pl.upmix_hc(0); pl.readv_hc(0); pl.norm_hc_wave(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    for (size_t run = 1; run < vals.size(); ++run) {
+        const std::string at = fmt(" (hc_upmix %d)", vals[run]);
+        if (out[0].x != out[run].x)     bad += " x" + at;
+        if (out[0].inj != out[run].inj) bad += " inj" + at;
+        if (out[0].q != out[run].q)     bad += " q" + at;
+        if (out[0].qs != out[run].qs)   bad += " qs" + at;
+        if (out[0].rq != out[run].rq)   bad += " rq" + at;
+        if (out[0].rs != out[run].rs)   bad += " rs" + at;
+        if (out[0].d != out[run].d)     bad += " d" + at;
+        const bool sw = out[run].fns != out[0].fns;
+        if (sw != here) bad += fmt(" [hc_upmix %d: kernels %s]", vals[run], sw ? "changed" : "unchanged");
+    }
+    int64_t nz = 0;
+    for (uint8_t v : out[0].x) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && nz > (int64_t)xb / 2, !bad.empty() ? "differs:" + bad : "");
+}
+
+/* --perfhcu M [iters]: hc_read_e4m3 at M rows (F1n, hc_readv 3) with every hc_upmix form that serves M,
+ * one op each (cold under --cold), and from 512 rows the up-mix stage alone (PF2 masks 15 - 7). */
+static void hc_upmix_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 hc_upmix timing at M=%lld", (long long)M);
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r || !pl.upmix_hc || !pl.readv_hc || !pl.norm_hc_wave) { skip(nm.c_str(), "row absent or no r4d_hc_upmix"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(M * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    const size_t xb = (size_t)(M * n * 2), ib = (size_t)(M * hc * 2), qb = (size_t)(M * n),
+                 sb = (size_t)(M * nkb * 4), db = (size_t)(M * lr * 2);
+    void* d_h = dalloc(hh.size() * 2);
+    void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());
+    void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2);
+    void* d_x = dalloc(xb);
+    void* d_inj = dalloc(ib);
+    void* d_q = dalloc(qb);
+    void* d_qs = dalloc(sb);
+    void* d_rq = dalloc(qb);
+    void* d_rs = dalloc(sb);
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q || !d_qs || !d_rq || !d_rs) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    std::vector<RadTensor> ts = {
+        T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+        T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+        T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+        T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+        T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+        T(d_rs, RAD_F32,    { M, nkb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+        PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+        PI("rotate", 1), PS("mix", "e4m3"),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+    }
+    pl.norm_hc_wave(1);
+    pl.readv_hc(3);
+    std::vector<int> vals = { 0 };
+    if (M >= 512) { for (int v : { 1, 2, 3, 4 }) vals.push_back(v); } else vals.push_back(8);
+    std::printf("hc_upmix M=%lld %s%s (F1n, hc_readv 3):", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm");
+    for (int v : vals) {
+        pl.upmix_hc(v);
+        if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            std::printf(" v%d failed", v); continue;
+        }
+        const double t = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+        double up = -1.0;
+        if (M >= 512 && pl.pf2_stages_hc) {
+            pl.pf2_stages_hc(7);
+            const double t7 = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+            pl.pf2_stages_hc(15);
+            const double t15 = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+            pl.pf2_stages_hc(31);
+            up = t15 - t7;
+        }
+        if (up >= 0) std::printf(" v%d %.2f us (up-mix %.2f)", v, t, up);
+        else         std::printf(" v%d %.2f us", v, t);
+    }
+    std::printf("\n");
+    pl.upmix_hc(0); pl.readv_hc(0); pl.norm_hc_wave(0);
+    (void)hipStreamDestroy(hs);
+    ok(nm.c_str(), true);
+}
+
 static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) {
     const bool fused_here = (M > 16 && M <= 64) || pf_pin == 1;
     const bool wave_here  = M > 16;     /* the tiled path's norm launch (fn4 F1n) */
@@ -34388,6 +34623,9 @@ static void device_phase(const Plugin& pl) {
          * at PF2's rows. */
         for (int64_t m : { 16, 17, 24, 32, 33, 40, 48, 64, 65, 512, 700, 2048 })
             for (bool i8 : { false, true }) hc_readv_case(pl, m, i8);
+        /* fn4 hc_upmix: the up-mix's other tiles against the stock one. */
+        for (int64_t m : { 24, 33, 48, 64, 512, 700, 2048 })
+            for (bool i8 : { false, true }) hc_upmix_case(pl, m, i8);
     }
     if (sel("hc_write_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's write: the eight-wide form (fn4 hcw) against "
@@ -34906,6 +35144,8 @@ static void usage(void) {
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
                 "             rows -- at one shape, each with its TFLOP/s.\n"
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
+                "  --perfhcu M [iters]:  hc_read_e4m3 at M rows (F1n, hc_readv 3) with every hc_upmix form\n"
+                "             that serves M (fn4), and from 512 rows the up-mix stage alone.\n"
                 "  --perfhcv M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows with F1n,\n"
                 "             the stock forms against hc_readv 1 / 2 / 3 (fn4), and PF2's stages from 512.\n"
                 "  --perfhcw M [iters]:  hc_write at Qwen3.8-Flash-Next's shape and M rows, the plain\n"
@@ -35041,6 +35281,8 @@ int main(int argc, char** argv) {
     int hcw_it = 50;
     long long hcv_m = 0;
     int hcv_it = 50;
+    long long hcu_m = 0;
+    int hcu_it = 50;
     int hc_it = 20;
     long long moe_m = 0, moe_e = 512, moe_k = 10, hy_m = 0;
     int hy_it = 100;
@@ -35310,6 +35552,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             lg_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcu")) {
+            /* hc_read's up-mix forms (fn4 hc_upmix) at M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcu_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcu_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhcv")) {
             /* hc_read's faster forms (fn4 hc_readv) against the stock ones at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -35416,6 +35663,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("video sparse attention timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcu_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_upmix_perf(pl, hcu_m, hcu_it, true);
+        dfree_all();
+#else
+        skip("gated residual read timing (hc_upmix)", "built without HIP");
 #endif
         return 0;
     }

@@ -20,6 +20,8 @@
  *                   -- 1 the decode tiles (17-64 rows), 2 PF2's down product (prefill), 3 both
  *   ar_lanethreads  libr4d (rad_fn4_switch): the prefill all-reduce lane's block    RADIANCE_FN4_AR_LANE_THREADS
  *                   width -- 0 the resolved tunable, 256 / 512 / 1024
+ *   hc_upmix        libr4d (rad_fn4_switch): hc_read's up-mix tile                  RADIANCE_FN4_HC_UPMIX
+ *                   -- value & 7 PF2's form (0 stock, 1-4), + 8 the 64-row decode tile pipelined
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair
  * re-records exactly as an A/B pair does.
@@ -36,7 +38,7 @@ namespace rad {
 namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
-              kHcReadV, kArLaneThreads, kSwitches };
+              kHcReadV, kArLaneThreads, kHcUpMix, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
