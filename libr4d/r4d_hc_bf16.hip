@@ -4696,7 +4696,7 @@ void hc_up_mix_pf3_kernel(const unsigned short* __restrict__ ub, long lr_,
  * instead of 43.5, so two or three workgroups share a CU and one's epilogue overlaps another's WMMA (133: the stock
  * form at one workgroup a CU, 59.7 TFLOP/s, 268 GB/s). Bit-identical: each accumulator runs the same k-steps in
  * ascending order over the same fragment values; the mix sums c ascending in the same `a += u * N` form. */
-template <int RT>
+template <int RT, int LR>
 __global__ __launch_bounds__(kThreads)
 void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
                           const unsigned short* __restrict__ dbuf,
@@ -4706,28 +4706,27 @@ void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
                           long rows, long n, long lr, long hrow, long xrow, float wadd) {
     constexpr int HC = 4, CH = 16, NT = HC * CH;
     constexpr int MW = RT / 16 / kWaves, KST = kTKT / 16;
-    static_assert(MW >= 1 && MW * 16 * kWaves == RT, "the waves cover the rows");
+    constexpr int NSL = LR / kTKT, NST = LR / 16, PD = 2;   /* slices, k-steps, A prefetch distance (k-steps) */
+    static_assert(MW >= 1 && MW * 16 * kWaves == RT && LR % kTKT == 0, "the waves cover the rows; whole slices");
     __shared__ unsigned short sB[2 * NT * kTAP];
-    (void)lr_;
+    (void)lr_; (void)lr;
     const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
     const long r0 = (long)blockIdx.y * RT;
     const long i0 = (long)blockIdx.x * CH;
     if (r0 >= rows) return;
-    const long nsl = lr / kTKT;
 
     /* B staging: tile row tt = tid / 8 + 32 i is sub-stream tt / CH of channel i0 + tt % CH, 8 k a thread. */
     constexpr int kKV = kTKT / 8, kRS = kThreads / kKV, kBV = NT / kRS;
     const int k8b = (tid % kKV) * 8, tb = tid / kKV;
-    const unsigned short* bp[kBV];
+    long boff[kBV];
 #pragma unroll
     for (int i = 0; i < kBV; ++i) {
         const int  tt = tb + i * kRS;
-        const long j  = (long)(tt / CH) * n + i0 + tt % CH;
-        bp[i] = ub + j * lr + k8b;
+        boff[i] = ((long)(tt / CH) * n + i0 + tt % CH) * LR + k8b;
     }
     uint4 pb[kBV];
 #pragma unroll
-    for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(bp[i]);
+    for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(ub + boff[i]);
 
     /* N for this lane's accumulator slots: rows (wave * MW + mi) * 16 + e0 + e, channel i0 + nn, every stream. */
     const int e0 = 8 * (lane >> 4), nn = lane & 15;
@@ -4751,56 +4750,53 @@ void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
     unsigned aoff[MW];
 #pragma unroll
     for (int mi = 0; mi < MW; ++mi)
-        aoff[mi] = rowGo((unsigned)lr, (int)(r0 + (wave * MW + mi) * 16), (int)(rows - 1), lane);
+        aoff[mi] = rowGo((unsigned)LR, (int)(r0 + (wave * MW + mi) * 16), (int)(rows - 1), lane);
 
     v8f acc[MW * HC];
 #pragma unroll
     for (int c = 0; c < MW * HC; ++c) acc[c] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-    v8bf af[KST][MW];
+    /* A fragments PD k-steps ahead in a ring the full unroll makes static. */
+    v8bf ring[PD + 1][MW];
 #pragma unroll
-    for (int ks = 0; ks < KST; ++ks)
+    for (int st = 0; st < PD; ++st)
 #pragma unroll
-        for (int mi = 0; mi < MW; ++mi) af[ks][mi] = fragGo(dbuf, aoff[mi] + (unsigned)(ks * 16));
+        for (int mi = 0; mi < MW; ++mi) ring[st][mi] = fragGo(dbuf, aoff[mi] + (unsigned)(st * 16));
 #pragma unroll
     for (int i = 0; i < kBV; ++i) *(uint4*)(sB + (tb + i * kRS) * kTAP + k8b) = pb[i];
-    {   /* the second slice's B into registers */
-        const long k1 = nsl > 1 ? kTKT : 0;
+    if constexpr (NSL > 1) {
 #pragma unroll
-        for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(bp[i] + k1);
+        for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(ub + boff[i] + kTKT);
     }
     hc_lds_barrier();
-    for (long t = 0; t < nsl; ++t) {
-        const long tn = (t + 1 < nsl) ? t + 1 : t;
-        v8bf an[KST][MW];
 #pragma unroll
-        for (int ks = 0; ks < KST; ++ks)
+    for (int st = 0; st < NST; ++st) {
+        const int t = st / KST, ks = st % KST;
+        if (st + PD < NST) {
 #pragma unroll
             for (int mi = 0; mi < MW; ++mi)
-                an[ks][mi] = fragGo(dbuf, aoff[mi] + (unsigned)(tn * kTKT + ks * 16));
+                ring[(st + PD) % (PD + 1)][mi] = fragGo(dbuf, aoff[mi] + (unsigned)((st + PD) * 16));
+        }
         const unsigned short* const cur = sB + (t & 1) * (NT * kTAP);
 #pragma unroll
-        for (int ks = 0; ks < KST; ++ks)
+        for (int c = 0; c < HC; ++c) {
+            const v8bf bf = frag(cur, kTAP, c * 16, ks * 16, lane);
 #pragma unroll
-            for (int c = 0; c < HC; ++c) {
-                const v8bf bf = frag(cur, kTAP, c * 16, ks * 16, lane);
+            for (int mi = 0; mi < MW; ++mi)
+                acc[mi * HC + c] = mma(ring[st % (PD + 1)][mi], bf, acc[mi * HC + c]);
+        }
+        if (ks == KST - 1 && t + 1 < NSL) {
+            /* slice t + 1's B into the other tile (its last reads were slice t - 1's, before the last barrier),
+             * then slice t + 2's into registers */
+            unsigned short* const nxt = sB + ((t + 1) & 1) * (NT * kTAP);
 #pragma unroll
-                for (int mi = 0; mi < MW; ++mi)
-                    acc[mi * HC + c] = mma(af[ks][mi], bf, acc[mi * HC + c]);
+            for (int i = 0; i < kBV; ++i) *(uint4*)(nxt + (tb + i * kRS) * kTAP + k8b) = pb[i];
+            if (t + 2 < NSL) {
+#pragma unroll
+                for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(ub + boff[i] + (t + 2) * kTKT);
             }
-        /* slice t + 1's B into the other tile (its reads were slice t - 1's, before the last barrier), then
-         * slice t + 2's into registers (the last slices re-read the last, in bounds). */
-        unsigned short* const nxt = sB + ((t + 1) & 1) * (NT * kTAP);
-#pragma unroll
-        for (int i = 0; i < kBV; ++i) *(uint4*)(nxt + (tb + i * kRS) * kTAP + k8b) = pb[i];
-        const long t2 = (t + 2 < nsl) ? t + 2 : (nsl - 1);
-#pragma unroll
-        for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(bp[i] + t2 * kTKT);
-        hc_lds_barrier();
-#pragma unroll
-        for (int ks = 0; ks < KST; ++ks)
-#pragma unroll
-            for (int mi = 0; mi < MW; ++mi) af[ks][mi] = an[ks][mi];
+            hc_lds_barrier();
+        }
     }
 
     const float inv_hc = 1.0f / (float)HC;
@@ -6025,9 +6021,17 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
                        hrow, xrow, wadd)
         switch (umv) {
             case 5:
-                (void)R4D_EMIT(s, (&hc_up_mix_pf5_kernel<256>), dim3((unsigned)(n / 16), gy256), dim3(kThreads), 0,
-                               ubf, lr, (const unsigned short*)dbuf, h, w, (const float*)scale, x, rows, n, lr, hrow,
-                               xrow, wadd);
+                if (lr == 320) {
+                    (void)R4D_EMIT(s, (&hc_up_mix_pf5_kernel<256, 320>), dim3((unsigned)(n / 16), gy256), dim3(kThreads), 0,
+                                   ubf, lr, (const unsigned short*)dbuf, h, w, (const float*)scale, x, rows, n, lr, hrow,
+                                   xrow, wadd);
+                } else {
+                    hipLaunchKernelGGL((hc_up_mix_wide_kernel<4, false, kPf2UpRT>),
+                                       dim3((unsigned)(n / kWideCH), (unsigned)((rows + kPf2UpRT - 1) / kPf2UpRT)),
+                                       dim3(kThreads), 0, (hipStream_t)s, (const void*)ubf, lr,
+                                       (const unsigned short*)dbuf, h, w, (const float*)scale, x, rows, n, lr, hrow,
+                                       xrow, wadd);
+                }
                 break;
             case 1:  HC_PF3(256, 16, false); break;
             case 2:  HC_PF3(128, 32, true);  break;
