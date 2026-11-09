@@ -4718,34 +4718,17 @@ void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
     /* B staging: tile row tt = tid / 8 + 32 i is sub-stream tt / CH of channel i0 + tt % CH, 8 k a thread. */
     constexpr int kKV = kTKT / 8, kRS = kThreads / kKV, kBV = NT / kRS;
     const int k8b = (tid % kKV) * 8, tb = tid / kKV;
-    long boff[kBV];
+    unsigned boff[kBV];
 #pragma unroll
     for (int i = 0; i < kBV; ++i) {
         const int  tt = tb + i * kRS;
-        boff[i] = ((long)(tt / CH) * n + i0 + tt % CH) * LR + k8b;
+        boff[i] = (unsigned)(((long)(tt / CH) * n + i0 + tt % CH) * LR + k8b);
     }
     uint4 pb[kBV];
 #pragma unroll
     for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(ub + boff[i]);
 
-    /* N for this lane's accumulator slots: rows (wave * MW + mi) * 16 + e0 + e, channel i0 + nn, every stream. */
     const int e0 = 8 * (lane >> 4), nn = lane & 15;
-    unsigned nbf[MW][HC][4];
-#pragma unroll
-    for (int mi = 0; mi < MW; ++mi)
-#pragma unroll
-        for (int c = 0; c < HC; ++c) {
-            const long  j  = (long)c * n + i0 + nn;
-            const float wj = w[j] + wadd;
-            float v[8];
-#pragma unroll
-            for (int e = 0; e < 8; ++e) {
-                const long r = r0 + (wave * MW + mi) * 16 + e0 + e;
-                v[e] = r < rows ? bf2f(h[r * hrow + j]) * scalein[r * kHcMax + c] * wj : 0.0f;
-            }
-#pragma unroll
-            for (int q = 0; q < 4; ++q) nbf[mi][c][q] = f2bf2(v[2 * q], v[2 * q + 1]);
-        }
 
     unsigned aoff[MW];
 #pragma unroll
@@ -4799,21 +4782,35 @@ void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
         }
     }
 
+    /* N for this lane's slots, after the K loop: rows (wave * MW + mi) * 16 + e0 + e, channel i0 + nn, every stream,
+     * (h * scale) * (w + wadd) narrowed to bf16 as the stock sN holds it. Loaded here, not held across the loop: the
+     * loop's registers are dead by now, and the CU's other workgroups cover the latency. */
     const float inv_hc = 1.0f / (float)HC;
+    float wj[HC];
 #pragma unroll
-    for (int mi = 0; mi < MW; ++mi)
+    for (int c = 0; c < HC; ++c) wj[c] = w[(long)c * n + i0 + nn] + wadd;
+#pragma unroll
+    for (int mi = 0; mi < MW; ++mi) {
+        float hv[HC][8];
+#pragma unroll
+        for (int c = 0; c < HC; ++c)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                long r = r0 + (wave * MW + mi) * 16 + e0 + e; if (r >= rows) r = rows - 1;
+                hv[c][e] = bf2f(h[r * hrow + (long)c * n + i0 + nn]) * scalein[r * kHcMax + c];
+            }
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const long r = r0 + (wave * MW + mi) * 16 + e0 + e;
             float a = 0.0f;
 #pragma unroll
             for (int c = 0; c < HC; ++c) {
-                const unsigned pk = nbf[mi][c][e >> 1];
-                const float nv = (e & 1) ? bf16w_hi(pk) : bf16w_lo(pk);
+                const float nv = bf2f(f2bf(hv[c][e] * wj[c]));
                 a += bf2f(f2bf(sigmoidf_(acc[mi * HC + c][e]))) * nv;
             }
             if (r < rows) x[r * xrow + i0 + nn] = f2bf(a * inv_hc);
         }
+    }
 }
 
 /* fp8 codes of `x` at the prefill tile, plus the rotated codes: one wave per (row, 128-channel
