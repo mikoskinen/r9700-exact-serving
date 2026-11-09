@@ -1223,6 +1223,28 @@ extern "C" int r4d_ar_lane_threads_set(int threads) {
     g_ar_lane_threads.store(threads, std::memory_order_relaxed);
     return 1;
 }
+/* fn4 ar_laneblocks (r4d_ar_lane_blocks_set): the same lane's block count (4 by default, the tunable's
+ * axis offers 4 / 8 / 16 / 24) -- 0 the resolved tunable, else 4..24 in steps of 4, still under the flag
+ * array's capacity. Every rank switches at the same step release, so block b still pairs with block b;
+ * the shards and each element's rank fold do not depend on the count. -1 until read. */
+static std::atomic<int> g_ar_lane_blocks{-1};
+static int ar_lane_blocks() {
+    int v = g_ar_lane_blocks.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_LANE_BLOCKS");
+        int b = (e && *e) ? std::atoi(e) : 0;
+        if (b < 0 || b > 24 || (b % 4)) b = 0;
+        int want = -1;
+        g_ar_lane_blocks.compare_exchange_strong(want, b, std::memory_order_relaxed);
+        v = g_ar_lane_blocks.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_ar_lane_blocks_set(int blocks) {
+    if (blocks < 0 || blocks > 24 || (blocks % 4)) return -1;
+    g_ar_lane_blocks.store(blocks, std::memory_order_relaxed);
+    return 1;
+}
 
 extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     ArCall c;
@@ -1243,6 +1265,8 @@ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     if (r4d_geti_or(a, "overlap", 0) == 1) {
         const int lt = ar_lane_threads();
         if (lt > 0) c.nthreads = lt;
+        const int lb = ar_lane_blocks();
+        if (lb > 0) c.nblocks = lb < c.in->max_blocks ? lb : c.in->max_blocks;
     }
     if (c.nthreads % 32) return RAD_E_INVAL;
 

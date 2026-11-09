@@ -750,6 +750,9 @@ void r4d_hc_upmix(int v);
 // pipelined prefill's all-reduce lane) launches with -- 0 the resolved tunable, else 256 / 512 /
 // 1024 (RADIANCE_FN4_AR_LANE_THREADS at start). The sums do not depend on it. 1 applied, -1 refused.
 int r4d_ar_lane_threads_set(int threads);
+// fn4 ar_laneblocks: that lane's block count -- 0 the resolved tunable (4), else 4..24 in steps of 4
+// (RADIANCE_FN4_AR_LANE_BLOCKS at start). The sums do not depend on it. 1 applied, -1 refused.
+int r4d_ar_lane_blocks_set(int blocks);
 // fn4 runtime switch hook (core runtime/fn4_switch.h): "hc_fusedown" / "hc_normwave" / "hc_writevec" /
 // "hc_readv" / "ar_lanethreads" -> 1 applied, -1 refused, anything else 0.
 int rad_fn4_switch(const char* name, int value);

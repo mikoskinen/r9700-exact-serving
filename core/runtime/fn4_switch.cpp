@@ -19,11 +19,12 @@ namespace {
 
 const char* const kNames[kSwitches] = { "no_route", "gather_inv", "hc_fusedown", "hc_normwave",
                                          "draft_adaptive", "hc_writevec", "hc_readv", "ar_lanethreads",
-                                         "hc_upmix" };
+                                         "hc_upmix", "ar_laneblocks" };
 const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_GATHER_INV",
                                          "RADIANCE_FN4_HC_FUSEDOWN", "RADIANCE_FN4_HC_NORMWAVE",
                                          nullptr, "RADIANCE_FN4_HC_WRITEVEC", "RADIANCE_FN4_HC_READV",
-                                         "RADIANCE_FN4_AR_LANE_THREADS", "RADIANCE_FN4_HC_UPMIX" };
+                                         "RADIANCE_FN4_AR_LANE_THREADS", "RADIANCE_FN4_HC_UPMIX",
+                                         "RADIANCE_FN4_AR_LANE_BLOCKS" };
 
 /* the value a switch starts with: unset / empty / 0 -> 0, a number > 1 as given (hc_fusedown's form,
  * hc_normwave's row floor), anything else 1 -- as the plugins read the same variables */
@@ -122,7 +123,7 @@ bool request(const std::string& name, int v, std::string* err) {
      * the rest 0 / 1 */
     const int lo = i == kDraftAdaptive ? -1 : 0;
     const int hi = i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096
-                 : i == kHcReadV ? 3 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : 1;
+                 : i == kHcReadV ? 3 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24 : 1;
     if (v < lo || v > hi) {
         if (err) *err = std::string(kNames[i]) + " takes " + std::to_string(lo) + ".." + std::to_string(hi);
         return false;
@@ -150,7 +151,7 @@ bool apply_pending(int step, int* draft_adaptive) {
         if (s.val[i].load(std::memory_order_relaxed) == v) continue;
         int handled = 1;
         if (i == kGatherInv || i == kHcFuseDown || i == kHcNormWave || i == kHcWriteVec ||
-            i == kHcReadV || i == kArLaneThreads || i == kHcUpMix) {
+            i == kHcReadV || i == kArLaneThreads || i == kHcUpMix || i == kArLaneBlocks) {
             find_hooks(s);
             handled = 0;
             bool refused = false;
