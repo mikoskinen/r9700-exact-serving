@@ -1788,7 +1788,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * previous one on the card instead of behind a queue barrier (libr4d/r4d_chain.h). On 2x R9700,
      * sampled at temperature 1 with a 25k prompt, MTP depth 3, with the chained hc_read forms:
      * 1/2/4/8/16 streams 174/291/458/657/851 -> 207/339/493/647/843 tok/s. */
-    out->chain_pays = 1;
+    out->chain_pays = 0;   /* fn4 9.11.: off -- with the MTP drafter chained launches cost draft acceptance under
+                            * concurrent multi-turn load (113: cc_sim u16 0.259 against 0.351) and gain <= 1 % */
     return RAD_OK;
 }
 
