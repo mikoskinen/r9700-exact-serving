@@ -735,8 +735,19 @@ void r4d_hc_read_norm_wave(int on);
 // access is aligned, N >= 2 from N rows, 0 the plain form, overriding RADIANCE_FN4_HC_WRITEVEC. Bit-identical;
 // r4d_selftest compares their bytes.
 void r4d_hc_write_vec(int on);
-// fn4 runtime switch hook (core runtime/fn4_switch.h): "hc_fusedown" / "hc_normwave" / "hc_writevec" -> 1 applied,
-// anything else 0.
+// Test hook (fn4 hc_readv): faster hc_read forms with the same bytes, a mask -- 1 the decode tiles
+// (pipelined down product; the 32-row tile from 33 rows, split-K unchanged), 2 PF2's down product at
+// 32 rows a workgroup -- overriding RADIANCE_FN4_HC_READV. r4d_selftest compares their bytes.
+void r4d_hc_readv(int v);
+// Measurement hook: the PF2 launches that run (1 prologue, 2 down, 4 reduce, 8 up-mix, 16 codes);
+// anything but 31 leaves the outputs incomplete. r4d_selftest --perfhcv times cumulative masks.
+void r4d_hc_pf2_stages(int mask);
+// fn4 ar_lanethreads: the threads a block of the four-rank tiered-int8 two-shot at `overlap` 1 (the
+// pipelined prefill's all-reduce lane) launches with -- 0 the resolved tunable, else 256 / 512 /
+// 1024 (RADIANCE_FN4_AR_LANE_THREADS at start). The sums do not depend on it. 1 applied, -1 refused.
+int r4d_ar_lane_threads_set(int threads);
+// fn4 runtime switch hook (core runtime/fn4_switch.h): "hc_fusedown" / "hc_normwave" / "hc_writevec" /
+// "hc_readv" / "ar_lanethreads" -> 1 applied, -1 refused, anything else 0.
 int rad_fn4_switch(const char* name, int value);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.

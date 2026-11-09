@@ -16,6 +16,10 @@
  *   draft_adaptive  scheduler: --draft-window adaptive (1) or fixed (0); -1 = the configured window
  *   hc_writevec     libr4d (rad_fn4_switch): hc_write eight elements a thread      RADIANCE_FN4_HC_WRITEVEC
  *                   -- 1 at every row count, N >= 2 from N rows
+ *   hc_readv        libr4d (rad_fn4_switch): hc_read's faster forms, a mask         RADIANCE_FN4_HC_READV
+ *                   -- 1 the decode tiles (17-64 rows), 2 PF2's down product (prefill), 3 both
+ *   ar_lanethreads  libr4d (rad_fn4_switch): the prefill all-reduce lane's block    RADIANCE_FN4_AR_LANE_THREADS
+ *                   width -- 0 the resolved tunable, 256 / 512 / 1024
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair
  * re-records exactly as an A/B pair does.
@@ -32,7 +36,7 @@ namespace rad {
 namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
-              kSwitches };
+              kHcReadV, kArLaneThreads, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

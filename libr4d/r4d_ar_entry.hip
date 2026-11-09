@@ -24,6 +24,7 @@
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -1200,6 +1201,29 @@ extern "C" int r4d_rad_ar_twoshot_3rank_ti8(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
+/* fn4 ar_lanethreads (r4d_ar_lane_threads_set): the block width of the four-rank tiered-int8 two-shot
+ * at `overlap` 1 -- the pipelined prefill's all-reduce, beside the compute lane -- in place of the
+ * resolved tunable (4 x 1024 by default). The grid and the shards are unchanged, so every rank still
+ * pairs block b with block b, and each element's fold over the ranks is the same. -1 until read. */
+static std::atomic<int> g_ar_lane_threads{-1};
+static int ar_lane_threads() {
+    int v = g_ar_lane_threads.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_LANE_THREADS");
+        int t = (e && *e) ? std::atoi(e) : 0;
+        if (t != 256 && t != 512 && t != 1024) t = 0;
+        int want = -1;
+        g_ar_lane_threads.compare_exchange_strong(want, t, std::memory_order_relaxed);
+        v = g_ar_lane_threads.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_ar_lane_threads_set(int threads) {
+    if (threads != 0 && threads != 256 && threads != 512 && threads != 1024) return -1;
+    g_ar_lane_threads.store(threads, std::memory_order_relaxed);
+    return 1;
+}
+
 extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 1);
@@ -1216,6 +1240,10 @@ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     /* The slot holds two wire images of one shard, each 16-byte aligned. */
     const long wire = ((c.numel / c.in->world / group) * group_bytes + 15) / 16 * 16;
     if (2 * wire > c.in->slot_bytes) return RAD_E_SCRATCH;
+    if (r4d_geti_or(a, "overlap", 0) == 1) {
+        const int lt = ar_lane_threads();
+        if (lt > 0) c.nthreads = lt;
+    }
     if (c.nthreads % 32) return RAD_E_INVAL;
 
     const ArInst* in = c.in;
