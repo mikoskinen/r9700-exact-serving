@@ -148,6 +148,7 @@ struct Plugin {
     void (*pin_hc_dec)(int) = nullptr;
     void (*fuse_hc_down)(int) = nullptr;   /* optional (fn4 F1a): absent from a stock libr4d */
     void (*norm_hc_wave)(int) = nullptr;   /* optional (fn4 F1n) */
+    void (*write_hc_vec)(int) = nullptr;   /* optional (fn4 hcw) */
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
     void (*mla_stats)(unsigned long long*) = nullptr;
@@ -223,6 +224,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_hc_read_pin_decode", &pl->pin_hc_dec);
     pl->fuse_hc_down = (void (*)(int))dlsym(pl->h, "r4d_hc_read_fuse_down");
     pl->norm_hc_wave = (void (*)(int))dlsym(pl->h, "r4d_hc_read_norm_wave");
+    pl->write_hc_vec = (void (*)(int))dlsym(pl->h, "r4d_hc_write_vec");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
     okall &= sym(pl->h, "r4d_mla_matrix_stats", &pl->mla_stats);
@@ -20592,6 +20594,85 @@ static void hc_decode_forms(const Plugin& pl, int64_t M, bool i8) {
  * 128 rows under prefill pin 1) the folded kernel must show in r4d_record_dispatches -- it goes
  * through r4d_emit, the pair through hipLaunchKernelGGL, which the log does not see, so the folded
  * run records one launch more -- and elsewhere the same count, so an ignored switch cannot pass. */
+/* fn4 hcw: hc_write's eight-wide form (hc_write_vec_kernel) against the plain one, byte for byte on
+ * every stream, with the dispatched kernel checked: the eight-wide form where n, the pitches and the
+ * bases are 16-byte aligned and the switch (or its row floor) takes the step, the plain one where
+ * not. `hoff` shifts h's base by that many elements (1 = misaligned, the plain form must run). */
+static void hc_write_vec_case(const Plugin& pl, int64_t M, int64_t n, int64_t hoff) {
+    const int64_t hc = 4, HN = hc * n;
+    const bool aligned = (n % 8) == 0 && hoff % 8 == 0;
+    const std::string nm = fmt("hc_write at M=%lld, n=%lld%s: the eight-wide form (fn4 hcw) "
+                               "byte-identical to the plain form", (long long)M, (long long)n,
+                               hoff ? ", h misaligned" : "");
+    const RadKernelInfo* r = find(pl, "hc_write_bf16");
+    if (!r) { skip(nm.c_str(), "row absent"); return; }
+    if (!pl.write_hc_vec || !pl.record) { skip(nm.c_str(), "no r4d_hc_write_vec"); return; }
+    uint64_t rs = 0xD1B54A32D192ED03ull ^ (uint64_t)(M * 131 + n);
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> h0((size_t)(M * HN)), y((size_t)(M * n)), inj((size_t)(M * hc));
+    for (auto& v : h0) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 997.0f);
+    for (auto& v : y) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 3001.0f);
+    for (auto& v : inj) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 313.0f);
+    const size_t hb = h0.size() * 2;
+    void* d_hall = dalloc(hb + 64);
+    void* d_y = dalloc(y.size() * 2);
+    void* d_i = dalloc(inj.size() * 2);
+    if (!d_hall || !d_y || !d_i) { ok(nm.c_str(), false, "hipMalloc failed"); return; }
+    void* d_h = (void*)((char*)d_hall + hoff * 2);
+    st_memcpy(d_y, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_i, inj.data(), inj.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok(nm.c_str(), false, "stream"); return; }
+    std::vector<RadTensor> ts = { T(d_y, RAD_BF16, { M, n }), T(d_i, RAD_BF16, { M, hc }),
+                                  T(d_h, RAD_BF16, { M, HN }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("hc", hc), PS("dtype", "bf16") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    /* plain; eight-wide twice; from M rows (taken); from M + 1 rows (not taken) */
+    constexpr int kRuns = 5;
+    static const char* const kRun[kRuns] = { "plain", "eight-wide", "eight-wide again",
+                                             "floor M", "floor M+1" };
+    const int vset[kRuns] = { 0, 1, 1, (int)(M >= 2 ? M : 1), (int)(M + 1 >= 2 ? M + 1 : 2) };
+    const bool vec_want[kRuns] = { false, aligned, aligned, aligned, false };
+    std::vector<uint8_t> out[kRuns];
+    const void* first[kRuns] = {};
+    int nd[kRuns] = {};
+    for (int run = 0; run < kRuns; ++run) {
+        pl.write_hc_vec(vset[run]);
+        st_memcpy(d_h, h0.data(), hb, hipMemcpyHostToDevice);
+        const void* fns[8] = {};
+        pl.record(fns, 8);
+        const int rc = r->launch(&a, (RadStream)hs);
+        nd[run] = pl.record(nullptr, 0);
+        first[run] = fns[0];
+        if (rc != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("run %s rc=%d", kRun[run], rc));
+            pl.write_hc_vec(0);
+            (void)hipStreamDestroy(hs);
+            return;
+        }
+        out[run].resize(hb);
+        st_memcpy(out[run].data(), d_h, hb, hipMemcpyDeviceToHost);
+    }
+    pl.write_hc_vec(0);
+    (void)hipStreamDestroy(hs);
+    std::string bad;
+    for (int run = 1; run < kRuns; ++run) {
+        if (out[0] != out[run]) bad += std::string(" ") + kRun[run];
+        const bool is_vec = first[run] != first[0];
+        if (nd[run] != 1 || is_vec != vec_want[run])
+            bad += fmt(" [%s: %d launch(es), %s form]", kRun[run], nd[run], is_vec ? "other" : "plain");
+    }
+    int64_t changed = 0;
+    for (size_t i = 0; i < hb; ++i) changed += out[0][i] != ((const uint8_t*)h0.data())[i];
+    ok(nm.c_str(), bad.empty() && nd[0] == 1 && changed > (int64_t)hb / 4,
+       !bad.empty() ? "differs or wrong form:" + bad
+                    : fmt("%lld of %zu bytes written, %s", (long long)changed, hb,
+                          aligned ? "eight-wide form taken" : "plain form kept"));
+}
+
 static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) {
     const bool fused_here = (M > 16 && M <= 64) || pf_pin == 1;
     const bool wave_here  = M > 16;     /* the tiled path's norm launch (fn4 F1n) */
@@ -34000,6 +34081,13 @@ static void device_phase(const Plugin& pl) {
         for (int64_t m : { 16, 17, 24, 32, 33, 48, 64, 65 })
             for (bool i8 : { false, true }) hc_fuse_down_case(pl, m, i8, 0);
         hc_fuse_down_case(pl, 300, true, 1);
+    }
+    if (sel("hc_write_bf16")) {
+        if (!g_case) std::printf("\nthe gated residual's write: the eight-wide form (fn4 hcw) against "
+                                 "the plain form\n");
+        for (int64_t m : { 1, 7, 16, 64, 300, 2048 }) hc_write_vec_case(pl, m, 2560, 0);
+        hc_write_vec_case(pl, 37, 1004, 0);
+        hc_write_vec_case(pl, 16, 2560, 1);
     }
     if (sel("hc_read_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's read over bf16 mixing matrices at the "

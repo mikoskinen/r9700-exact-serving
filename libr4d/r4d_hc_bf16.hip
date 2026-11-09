@@ -471,6 +471,38 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
     }
 }
 
+/* The same write, eight elements a thread (fn4 hcw, rebased 9.11.2026 from the 1.15.1 line's b9ebe5f):
+ * 16-byte loads and stores of `y` and every stream of `h` where the plain form moves 2 bytes a thread
+ * (127, mpB prefill profile: 204 us a call at a 2048-row piece against ~147 us of traffic at 640 GB/s).
+ * The same arithmetic on every element in the same expression, f2bf(bf2f(h) + g[c] * bf2f(y)) --
+ * f2bf2 packs with f2bf's rounding and bf16w_lo / _hi are bf2f -- so the bytes equal the plain
+ * form's. One work item = (row, 8-element word); a row's gains are read per stream from `inj`
+ * (8 bytes, cached), not staged: rows of one workgroup differ. Taken under hc_write_vec() when n,
+ * both row pitches and both bases are 16-byte multiples. */
+__global__ __launch_bounds__(kThreads)
+void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                         unsigned short* __restrict__ h,
+                         long rows, long n, int hc, long yrow, long irow, long hrow) {
+    const long wpr  = n >> 3;                                  /* 8-element words a row */
+    const long item = (long)blockIdx.x * kThreads + threadIdx.x;
+    if (item >= rows * wpr) return;
+    const long r = item / wpr, i0 = (item - r * wpr) * 8;
+    const uint4 yw = *(const uint4*)(y + r * yrow + i0);
+    float yv[8];
+    bf8_f(yw, yv);
+    unsigned short* hp = h + r * hrow + i0;
+    for (int c = 0; c < hc; ++c) {
+        const float g = bf2f(inj[r * irow + c]);
+        uint4* p = (uint4*)(hp + (long)c * n);
+        float hv[8];
+        bf8_f(*p, hv);
+        float o[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) o[k] = hv[k] + g * yv[k];
+        *p = f2bf8(o);
+    }
+}
+
 /* ============================================================== hc_project
  *
  * The control vector (core/cvec.h): h[s] -= scale * (h[s] . v) * v for each of the hc streams of a
@@ -3344,6 +3376,24 @@ static bool hc_norm_wave(long rows) {
     return v == 1 || (v >= 2 && rows >= v);
 }
 
+/* fn4 hcw: hc_write eight elements a thread (hc_write_vec_kernel, same bytes) when
+ * RADIANCE_FN4_HC_WRITEVEC is set and not 0 -- 1 at every row count, N >= 2 from N rows (a decode
+ * step's 16 rows make 20 workgroups of the eight-wide form against 160 of the plain one);
+ * r4d_hc_write_vec pins it, rad_fn4_switch("hc_writevec") changes it between steps. -1 until the
+ * environment is read. */
+static std::atomic<int> g_hc_write_vec{-1};
+static bool hc_write_vec(long rows) {
+    int v = g_hc_write_vec.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_HC_WRITEVEC");
+        const int on = (e && *e && *e != '0') ? (std::atoi(e) > 1 ? std::atoi(e) : 1) : 0;
+        int want = -1;
+        g_hc_write_vec.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_hc_write_vec.load(std::memory_order_relaxed);
+    }
+    return v == 1 || (v >= 2 && rows >= v);
+}
+
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
  * hc_down_tiled_kernel at RT 128 has three costs at a 2048-row chunk: a sixth 64-column tile
@@ -5486,6 +5536,17 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
     const long long irow = r4d_rows_pitch(inj, hc, &irows);
     if (yrow < 0 || irow < 0 || yrows < rows || irows < rows) return R4D_NO(RAD_E_STRIDE);
 
+    /* fn4 hcw: the eight-wide form where every 16-byte access is aligned (same bytes). Through
+     * r4d_emit, so r4d_record_dispatches sees which form ran. */
+    if (hc_write_vec((long)rows) && (n % 8) == 0 && (yrow % 8) == 0 && (hrow % 8) == 0 &&
+        ((uintptr_t)y->data % 16) == 0 && ((uintptr_t)h->data % 16) == 0) {
+        const long items = (long)rows * (long)(n / 8);
+        const unsigned vblocks = (unsigned)((items + kThreads - 1) / kThreads);
+        return R4D_EMIT(stream, hc_write_vec_kernel, dim3(vblocks), dim3(kThreads), 0,
+                        (const unsigned short*)y->data,
+                        (const unsigned short*)inj->data, (unsigned short*)h->data,
+                        (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+    }
     const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
     return R4D_EMIT(stream, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
                     (const unsigned short*)y->data,
@@ -6165,11 +6226,13 @@ extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
 extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
+extern "C" void r4d_hc_write_vec(int on) { g_hc_write_vec.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
- * parked): hc_read's two forms. 1 = applied, 0 = not a libr4d switch. */
+ * parked): hc_read's two forms and hc_write's eight-wide form. 1 = applied, 0 = not a libr4d switch. */
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "hc_fusedown")) { g_hc_fuse_down.store(value < 0 ? 0 : (value > 2 ? 2 : value), std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     return 0;
 }

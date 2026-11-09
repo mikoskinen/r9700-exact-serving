@@ -18,10 +18,10 @@ namespace fn4 {
 namespace {
 
 const char* const kNames[kSwitches] = { "no_route", "gather_inv", "hc_fusedown", "hc_normwave",
-                                         "draft_adaptive" };
+                                         "draft_adaptive", "hc_writevec" };
 const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_GATHER_INV",
                                          "RADIANCE_FN4_HC_FUSEDOWN", "RADIANCE_FN4_HC_NORMWAVE",
-                                         nullptr };
+                                         nullptr, "RADIANCE_FN4_HC_WRITEVEC" };
 
 /* the value a switch starts with: unset / empty / 0 -> 0, a number > 1 as given (hc_fusedown's form,
  * hc_normwave's row floor), anything else 1 -- as the plugins read the same variables */
@@ -116,9 +116,10 @@ bool request(const std::string& name, int v, std::string* err) {
         if (err) *err = "unknown switch '" + name + "'";
         return false;
     }
-    /* hc_fusedown 0 / 1 / 2 (the tail form), hc_normwave 0 / 1 / N >= 2 (from N rows), the rest 0 / 1 */
+    /* hc_fusedown 0 / 1 / 2 (the tail form), hc_normwave and hc_writevec 0 / 1 / N >= 2 (from N rows),
+     * the rest 0 / 1 */
     const int lo = i == kDraftAdaptive ? -1 : 0;
-    const int hi = i == kHcFuseDown ? 2 : i == kHcNormWave ? 4096 : 1;
+    const int hi = i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096 : 1;
     if (v < lo || v > hi) {
         if (err) *err = std::string(kNames[i]) + " takes " + std::to_string(lo) + ".." + std::to_string(hi);
         return false;
@@ -145,7 +146,7 @@ bool apply_pending(int step, int* draft_adaptive) {
         const int v = s.want[i];
         if (s.val[i].load(std::memory_order_relaxed) == v) continue;
         int handled = 1;
-        if (i == kGatherInv || i == kHcFuseDown || i == kHcNormWave) {
+        if (i == kGatherInv || i == kHcFuseDown || i == kHcNormWave || i == kHcWriteVec) {
             find_hooks(s);
             handled = 0;
             bool refused = false;

@@ -14,6 +14,8 @@
  *   hc_normwave     libr4d (rad_fn4_switch): hc_read's wave norm scales            RADIANCE_FN4_HC_NORMWAVE
  *                   -- 1 at every row count, N >= 2 from N rows
  *   draft_adaptive  scheduler: --draft-window adaptive (1) or fixed (0); -1 = the configured window
+ *   hc_writevec     libr4d (rad_fn4_switch): hc_write eight elements a thread      RADIANCE_FN4_HC_WRITEVEC
+ *                   -- 1 at every row count, N >= 2 from N rows
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair
  * re-records exactly as an A/B pair does.
@@ -29,7 +31,8 @@
 namespace rad {
 namespace fn4 {
 
-enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kSwitches };
+enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
+              kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

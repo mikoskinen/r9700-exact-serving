@@ -731,7 +731,11 @@ void r4d_hc_read_fuse_down(int on);
 // blocks (one wave per (row, stream)), 0 with hc_norm_scale_kernel, overriding
 // RADIANCE_FN4_HC_NORMWAVE. Bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_norm_wave(int on);
-// fn4 runtime switch hook (core runtime/fn4_switch.h): "hc_fusedown" / "hc_normwave" -> 1 applied,
+// Test hook (fn4 hcw): 1 takes hc_write's eight-wide form (hc_write_vec_kernel) where every 16-byte
+// access is aligned, N >= 2 from N rows, 0 the plain form, overriding RADIANCE_FN4_HC_WRITEVEC. Bit-identical;
+// r4d_selftest compares their bytes.
+void r4d_hc_write_vec(int on);
+// fn4 runtime switch hook (core runtime/fn4_switch.h): "hc_fusedown" / "hc_normwave" / "hc_writevec" -> 1 applied,
 // anything else 0.
 int rad_fn4_switch(const char* name, int value);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
