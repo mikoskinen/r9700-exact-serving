@@ -426,6 +426,36 @@ void hc_write_kernel(const unsigned short* __restrict__ y, const unsigned short*
     }
 }
 
+/* The same write, eight elements a thread (fn4, 9.11.2026): 16-byte loads and stores of `y` and every stream of `h` where
+ * the plain form moves 2 bytes a thread, which leaves a 2048-row prefill write at ~46 % of the memory rate (162 us a call
+ * against ~70 us of traffic at Flash-Next's shape). The same arithmetic on every element in the same expression,
+ * f2bf(bf2f(h) + g[c] * bf2f(y)) -- f2bf2 packs with f2bf's rounding and bf16w_lo / _hi are bf2f -- so the bytes equal the
+ * plain form's. One work item = (row, 8-element word); a row's gains are read per stream from `inj` (8 bytes, cached),
+ * not staged: rows of one workgroup differ. Taken when n, both row pitches and both bases are 16-byte multiples. */
+__global__ __launch_bounds__(kThreads)
+void hc_write_vec_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                         unsigned short* __restrict__ h,
+                         long rows, long n, int hc, long yrow, long irow, long hrow) {
+    const long wpr  = n >> 3;                                  /* 8-element words a row */
+    const long item = (long)blockIdx.x * kThreads + threadIdx.x;
+    if (item >= rows * wpr) return;
+    const long r = item / wpr, i0 = (item - r * wpr) * 8;
+    const uint4 yw = *(const uint4*)(y + r * yrow + i0);
+    float yv[8];
+    bf8_f(yw, yv);
+    unsigned short* hp = h + r * hrow + i0;
+    for (int c = 0; c < hc; ++c) {
+        const float g = bf2f(inj[r * irow + c]);
+        uint4* p = (uint4*)(hp + (long)c * n);
+        float hv[8];
+        bf8_f(*p, hv);
+        float o[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) o[k] = hv[k] + g * yv[k];
+        *p = f2bf8(o);
+    }
+}
+
 /* ============================================================== hc_project
  *
  * The control vector (core/cvec.h): h[s] -= scale * (h[s] . v) * v for each of the hc streams of a
@@ -4309,6 +4339,17 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
     const long long irow = r4d_rows_pitch(inj, hc, &irows);
     if (yrow < 0 || irow < 0 || yrows < rows || irows < rows) return R4D_NO(RAD_E_STRIDE);
 
+    /* The eight-wide form where every 16-byte access is aligned (hc_write_vec_kernel: same bytes). */
+    const bool vec = (n % 8) == 0 && (yrow % 8) == 0 && (hrow % 8) == 0 &&
+                     ((uintptr_t)y->data % 16) == 0 && ((uintptr_t)h->data % 16) == 0;
+    if (vec) {
+        const long items = (long)rows * (n / 8);
+        const unsigned vblocks = (unsigned)((items + kThreads - 1) / kThreads);
+        return R4D_EMIT(stream, hc_write_vec_kernel, dim3(vblocks), dim3(kThreads), 0,
+                        (const unsigned short*)y->data,
+                        (const unsigned short*)inj->data, (unsigned short*)h->data,
+                        (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+    }
     const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
     return R4D_EMIT(stream, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
                     (const unsigned short*)y->data,
