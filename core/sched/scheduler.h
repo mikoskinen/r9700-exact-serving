@@ -504,6 +504,12 @@ public:
      * multi-token chunk past the floor would overwrite keys its own earlier rows still read, while
      * one token a step attends as its decode step did. Otherwise `n_target`. */
     int64_t chunk_end(const Request& r, int64_t n_target) const;
+    /* --prefill-interleave: the decode-only steps that follow a chunk run beside decoding
+     * sequences. N as configured; under auto, from the measured step costs (see the definition).
+     * Visible for tests, as is note_step_cost, which feeds auto a step's wall time as
+     * step_finished does: `chunk` for a step that carried a prefill chunk, else a decode step. */
+    int64_t interleave_steps() const;
+    void    note_step_cost(bool chunk, double seconds);
 
 private:
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -525,6 +531,7 @@ private:
     int64_t       span_min_ = 0;
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
+    bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
@@ -773,6 +780,13 @@ private:
      * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
     int64_t interleave_left_ = 0;
     int64_t held_prefill_ = 0;
+    /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by
+     * the running means of a step that carried a chunk and of a decode step, in seconds, fed by
+     * step_finished. */
+    static constexpr double  kInterleaveEma = 0.25;
+    static constexpr int64_t kInterleaveAutoMax = 64;
+    double  ema_chunk_s_ = 0.0, ema_decode_s_ = 0.0;
+    void    step_cost_locked(bool chunk, double seconds);
     /* The throughput window (step_finished): each kind's tokens and the wall time the steps
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
@@ -821,7 +835,8 @@ private:
     const Request* serial_req(const SerialSeq& m) const;
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
-    void preempt_back();
+    bool preempt_back();                                      /* true: the victim published its prefix */
+    bool publish_prefix(SchedReq& s);
     /* A preempted request waits until the pool can hold its WHOLE remaining recompute, the rest
      * of every running prefill, and one block of headroom per runner. Admitting it against only
      * the next token steals the blocks a running prefill still needs and preempt_back() resets

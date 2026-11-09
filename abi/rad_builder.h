@@ -297,7 +297,12 @@ typedef struct RadBuildCtx {
     int64_t  gen_max_pixels;
     int64_t  gen_max_refs;
 
-    /* ---- appended after ABI 32 (DS41 prompt-lookup head-off; no field of ABI 32 moves) */
+    /* ---- appended in ABI 37 (where a routed expert may live) */
+    /* --weights-disk-tier: nonzero when weights may stay in the container. An expert read from the
+     * drive has to be stored whole, so a plugin that can lay its routed experts out either way
+     * keeps them whole for this; 0 leaves it free to split them across the ranks by width. */
+    int      expert_file_tier;
+    /* ---- appended after ABI 37 (DS41 prompt-lookup head-off; no field above moves) */
     /* Nonzero from --spec-ngram: the deployment drafts by prompt lookup only, in the core, and
      * verifies up to `max_spec` drafts a step. The plugin declares no draft head, so a head the
      * container carries stays off the card, but sizes every verify buffer, state ring and kernel
@@ -305,7 +310,7 @@ typedef struct RadBuildCtx {
      * The engine refuses to start when a head is declared anyway, rather than load one it was
      * told to leave out.
      *
-     * Trailing and zero-defaulted, so every plugin built against an ABI-32 layout is unchanged. */
+     * Trailing and zero-defaulted, so every plugin built against an ABI-37 layout is unchanged. */
     int      draft_head_off;
 } RadBuildCtx;
 

@@ -1034,6 +1034,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
+    bc.expert_file_tier = cfg_.weights_disk_tier ? 1 : 0;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
     bc.max_audio_frames = cfg_.mm_audio_frames > 0 ? cfg_.mm_audio_frames : 0;
@@ -1353,6 +1354,27 @@ int Engine::declare() {
                : tower ? "the checkpoint has a vision tower but this container was converted "
                          "without its weights"
                        : "the model carries no vision tower");
+    }
+
+    /* --prefill-interleave not given: auto:1, decode-only steps for as long as a chunk step took,
+     * so decoders keep about half their rate while prompts prefill (measured on Flash-Next: 8
+     * decoders beside a 64K prefill, 12 -> 41 tokens/s each). Not where the schedule must not
+     * follow timing (--deterministic) or nothing decodes beside a prefill (a generator's passes,
+     * KL mode's scoring); an explicit N or auto[:SHARE] is kept as given. */
+    if (!cfg_.prefill_interleave_set) {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        const char* none = pb.gen_rows > 0 ? "a generator: its passes carry no decode rows"
+                         : cfg_.kld() ? "KL mode scores documents and decodes nothing" : nullptr;
+        if (none || cfg_.deterministic) {
+            decide("--prefill-interleave", "0", none ? none : "--deterministic keeps a "
+                   "timing-independent schedule (--prefill-interleave N or auto overrides it)");
+        } else {
+            cfg_.prefill_interleave = -1;
+            cfg_.prefill_interleave_share = 1.0;
+            decide("--prefill-interleave", "auto:1", "decode-only steps for as long as a chunk "
+                   "step took while prompts prefill beside decoding sequences");
+        }
     }
 
     /* Control vectors are resolved before any rank declares, because the plugin reads the

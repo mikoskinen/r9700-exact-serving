@@ -897,7 +897,13 @@ struct Config {
      * prefill still gets the whole budget. 0 (default) is off; this is the vLLM-style throttle
      * that stops one long prompt from taking every token in a mixed step. */
     int64_t long_prefill_token_threshold = 0;
-    int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks */
+    double  prefill_interleave_share = 0.25;   /* --prefill-interleave auto[:SHARE] */
+    /* Whether --prefill-interleave was given. Not given, engine bring-up serves auto:1 (decode-only
+     * steps for as long as a chunk step took) except under --deterministic, in KL mode and for a
+     * generator; the Config default 0 is what a Scheduler built directly (tests) gets. */
+    bool    prefill_interleave_set = false;
+    int64_t prefill_interleave = 0;    /* --prefill-interleave: decode-only steps between chunks;
+                                        * -1 auto (Scheduler::interleave_steps) */
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */

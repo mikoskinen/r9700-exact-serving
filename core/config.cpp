@@ -76,8 +76,10 @@ static const Flag g_flags[] = {
                                         "(default) leaves decode rows and new requests their room,\n"
                                         "off takes the whole step, N holds the chunk to N tokens" },
     { "--prefill-interleave", "N",      "decode-only steps after each prefill chunk while other\n"
-                                        "sequences decode, at most 64; 0 (default) lets every step\n"
-                                        "carry a chunk" },
+                                        "sequences decode, at most 64; auto fits them in a quarter\n"
+                                        "of the chunk step's time, auto:SHARE in SHARE of it (0-4];\n"
+                                        "0 lets every step carry a chunk; served default auto:1\n"
+                                        "(0 under --deterministic, KL mode, generators)" },
     { "--long-prefill-token-threshold", "N", "cap a long prefill's chunk at N tokens when other\n"
                                         "requests exist; adaptive floor budget/eligible; 0 (default) off" },
     { "--prefill-room-gate",  "MODE",   "a fresh prefill starts only when its whole prompt plus one\n                                        decode position fits beside every runner (on, the default);\n                                        off admits the first chunk alone, as before the gate" },
@@ -575,7 +577,22 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!parse_int(a.c_str(), v, 1, INT64_MAX, &c->busy_prefill_chunk)) return RAD_E_INVAL;
         }
         else if (S("--long-prefill-token-threshold")) { if (!num(0, INT64_MAX, &c->long_prefill_token_threshold)) return RAD_E_INVAL; }
-        else if (S("--prefill-interleave"))    { if (!num(0, 64, &c->prefill_interleave)) return RAD_E_INVAL; }
+        else if (S("--prefill-interleave"))    {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            c->prefill_interleave_set = true;
+            if (!std::strcmp(v, "auto")) { c->prefill_interleave = -1; c->prefill_interleave_share = 0.25; }
+            else if (!std::strncmp(v, "auto:", 5)) {
+                /* auto:SHARE -- decode-only steps for up to SHARE x a chunk step's time, 0 < SHARE <= 4 */
+                char* e = nullptr;
+                const double sh = std::strtod(v + 5, &e);
+                if (e == v + 5 || *e || !(sh > 0.0 && sh <= 4.0)) {
+                    RAD_ERR("--prefill-interleave %s: auto:SHARE takes a share in (0, 4]", v);
+                    return RAD_E_INVAL;
+                }
+                c->prefill_interleave = -1; c->prefill_interleave_share = sh;
+            }
+            else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
+        }
         else if (S("--prefill-room-gate")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "on"))   c->prefill_room_gate = true;
@@ -1356,7 +1373,9 @@ const ShowRow kShow[] = {
           return c.busy_prefill_chunk < 0 ? std::string("auto")
                : c.busy_prefill_chunk == 0 ? std::string("off") : num(c.busy_prefill_chunk); } },
     { "--prefill-interleave", [](const Config& c) {
-          return c.prefill_interleave > 0 ? num(c.prefill_interleave) : std::string("off"); } },
+          return c.prefill_interleave > 0 ? num(c.prefill_interleave)
+               : c.prefill_interleave < 0 ? "auto:" + std::to_string(c.prefill_interleave_share)
+                                          : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--long-prefill-token-threshold", [](const Config& c) {
           return c.long_prefill_token_threshold > 0 ? num(c.long_prefill_token_threshold)

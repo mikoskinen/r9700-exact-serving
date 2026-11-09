@@ -138,7 +138,14 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                  "prompt unfinished while other sequences decode, the next %lld steps carry "
                  "decode rows only and admit nothing", (long long)cfg.prefill_interleave,
                  (long long)cfg.prefill_interleave);
+    else if (cfg.prefill_interleave < 0)
+        RAD_INFO("scheduler: --prefill-interleave auto: after a prefill chunk that leaves its "
+                 "prompt unfinished while other sequences decode, decode-only steps follow for up "
+                 "to %.2f of the chunk step's measured time (at most %lld steps)",
+                 cfg.prefill_interleave_share, (long long)kInterleaveAutoMax);
     interleave_left_ = 0;
+    ema_chunk_s_ = 0.0;
+    ema_decode_s_ = 0.0;
     held_prefill_ = 0;
     draft_refill_ = 0;
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
@@ -589,14 +596,11 @@ void Scheduler::trim_prefix_cache() {
     if (short_by > 0) (void)pc_->trim(short_by);
 }
 
-void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
-                              bool publish, int status, const char* why) {
-    ++step_finished_;
-    /* Publish before freeing: this is the only moment the whole prefix is both computed and still
-     * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
-     * and failed requests are published too; their prompts were computed, and a client that hangs
-     * up mid-answer is likely to ask for that prefix again. */
-    if (publish && cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
+/* What a request computed, into the prefix cache, while it still owns the blocks: at its close,
+ * and at a preemption, whose recompute then adopts its prompt instead of computing it again.
+ * True when published. */
+bool Scheduler::publish_prefix(SchedReq& s) {
+    if (cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
         s.req->n_computed > 0 && !kv_->has_runtime_window(s.req->id)) {
         /* R-SWA: a sequence with a runtime window is not published (KVManager::set_window). Its
          * table is a reference plus a ring rather than a prefix from position 0, and the window
@@ -618,8 +622,20 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));
             trim_prefix_cache();
+            return rc >= 0;
         }
     }
+    return false;
+}
+
+void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
+                              bool publish, int status, const char* why) {
+    ++step_finished_;
+    /* Publish before freeing: this is the only moment the whole prefix is both computed and still
+     * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
+     * and failed requests are published too; their prompts were computed, and a client that hangs
+     * up mid-answer is likely to ask for that prefix again. */
+    if (publish) (void)publish_prefix(s);
 
     if (cfg_.prefix_cache && pc_) pc_->release(*s.req);
     /* Prompt lookup's index is this text's alone. */
@@ -1276,14 +1292,44 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
     return std::min(std::max(cap, Q), budget);
 }
 
+/* ------------------------------------------------------------------ decode-only steps */
+/* How many decode-only steps follow a chunk that ran beside decoding sequences
+ * (--prefill-interleave). N as given; under auto, as many as fit in Config::prefill_interleave_share of a chunk
+ * step's measured time at a decode step's, so the prefill gives up at most a fifth of its rate
+ * (a quarter of a chunk step) however many sequences decode, and the decoders get the steps that
+ * share buys: several where decode steps are cheap beside the chunk, none where one costs more
+ * than a quarter of it (they still ride every chunk). One until both costs are measured, which
+ * takes the first decode-only step. Both are wall times read off step_finished, so under auto
+ * which steps carry a chunk follows the device's timing and differs from run to run; a number
+ * schedules the same steps every time. */
+void Scheduler::step_cost_locked(bool chunk, double seconds) {
+    double& ema = chunk ? ema_chunk_s_ : ema_decode_s_;
+    ema = ema > 0.0 ? ema + kInterleaveEma * (seconds - ema) : seconds;
+}
+
+void Scheduler::note_step_cost(bool chunk, double seconds) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (seconds > 0) step_cost_locked(chunk, seconds);
+}
+
+int64_t Scheduler::interleave_steps() const {
+    if (cfg_.prefill_interleave >= 0) return cfg_.prefill_interleave;
+    if (ema_chunk_s_ <= 0.0 || ema_decode_s_ <= 0.0) return 1;
+    const double n = cfg_.prefill_interleave_share * ema_chunk_s_ / ema_decode_s_;
+    return n >= (double)kInterleaveAutoMax ? kInterleaveAutoMax : (int64_t)n;
+}
+
 /* ------------------------------------------------------------------ preemption */
-void Scheduler::preempt_back() {
+bool Scheduler::preempt_back() {
     int32_t slot = running_.back();
     SchedReq& s = *reqs_[(size_t)slot];
     Request& r = *s.req;
 
     /* Preemption by recompute: the blocks go back and the request restarts from zero. Its output
-     * is the tail of its token sequence, so it simply re-prefills prompt ++ output. */
+     * is the tail of its token sequence, so it simply re-prefills prompt ++ output. What it computed
+     * is published first: the recompute adopts it from the cache, and under pressure the cache gives
+     * the blocks back (the newest entries last). */
+    const bool published = publish_prefix(s);
     kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;
@@ -1303,6 +1349,7 @@ void Scheduler::preempt_back() {
     running_.pop_back();
     queue_insert(waiting_, slot);   /* original arrival -> the front of its priority class */
     ++m_.preemptions;
+    return published;
 }
 
 /* ------------------------------------------------------------------ admission */
@@ -1380,6 +1427,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
         const RestoreResult rr = pc_->restore(r, whole_only);
         if (rr == RestoreResult::Declined) {
             s.restore_waited = true;
+            admit_next_step_ = true;
             RAD_DEBUG("admit %llu: the restore waits a step for %d deferred release(s)",
                       (unsigned long long)r.id, n_deferred_);
             return RAD_E_FULL;
@@ -1636,7 +1684,10 @@ void Scheduler::undo_hit(SchedReq& s) {
  * which is the loop. */
 bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     const Request& r = *s.req;
-    const int64_t target = s.seq_len() + 1;   /* the whole recompute and its first decode position */
+    const int64_t target = s.seq_len();
+    /* What the recompute adopts from the cache (its own prefix, published at the preemption) needs
+     * no new block. */
+    const int64_t hit = (cfg_.prefix_cache && pc_) ? pc_->lookup(r, nullptr, nullptr).n_attn_tokens : 0;
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
         const KVGeom::G& gg = kvgeom_.g[g];
@@ -1645,7 +1696,7 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
          * A group the manager gives no blocks (the sentinel at index 0) asks nothing. */
         if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
         int64_t need = (target + gg.block_size - 1) / gg.block_size -
-                       (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size() - hit / gg.block_size;
         if (need < 0) need = 0;
         for (int32_t slot : running_) {
             const SchedReq& rs = *reqs_[(size_t)slot];
@@ -1819,7 +1870,7 @@ const RadBatch* Scheduler::step() {
                 running_.erase(std::find(running_.begin(), running_.end(), victim));
                 running_.push_back(victim);
             }
-            preempt_back();
+            if (preempt_back()) evict_rounds = 0;   /* its blocks stay in the cache: evict them first */
         }
     }
 
@@ -1831,7 +1882,7 @@ const RadBatch* Scheduler::step() {
     bool any_decoding = false;
     bool hold_prefill = false;
     held_prefill_ = 0;
-    if (cfg_.prefill_interleave > 0) {
+    if (cfg_.prefill_interleave != 0) {
         for (int32_t slot : running_) {
             const SchedReq& s = *reqs_[(size_t)slot];
             if (!s.req || !s.running) continue;
@@ -2040,7 +2091,9 @@ const RadBatch* Scheduler::step() {
             /* The back of the running set gives its blocks up. When that is this request, the
              * requests ahead of it hold the pool: it is preempted by recompute and waits for
              * them, rather than failed. */
-            preempt_back();
+            /* A victim that published keeps its blocks in the cache: eviction gets its rounds
+             * back, so they are reclaimed before anyone else is preempted. */
+            if (preempt_back()) evict_rounds = 0;
             preempted_here = true;
             if (last) { yielded = true; break; }
         }
@@ -2131,13 +2184,28 @@ const RadBatch* Scheduler::step() {
                 (int64_t)plan_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
                     ? share_tok : 0;
             admit_full_ = 0;
+            admit_next_step_ = false;
             const int as = admit_one(s, budget, areserve);
-            if (as == kAdmitWait) { ++at; continue; }
+            /* A preempted request waiting for its whole-recompute gate lets the next one be asked;
+             * an overdue one does not. The room the overdue path made this step is for it, and a
+             * request queued behind it would take that room back: a victim just forced off for it,
+             * its prompt published, needs almost nothing to come back, and under KV pressure the
+             * same victim was forced off and re-admitted 26 times in 16 s while the overdue request
+             * waited. */
+            if (as == kAdmitWait) {
+                if (s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) break;
+                ++at;
+                continue;
+            }
             /* An overdue preempted prefill on an idle engine that still cannot be admitted will
              * not become admissible by waiting: nothing is running to finish and free the pool.
-             * Fail it (spec §17) and ask the next request, instead of parking the step loop. */
-            if (as < 0 && running_.empty() && s.req && s.req->state == ReqState::Preempted &&
-                preempt_wait_overdue(s)) {
+             * Fail it (spec §17) and ask the next request, instead of parking the step loop. Not
+             * when this step admitted someone ahead of it (the budget or a card went to them) or
+             * the refusal is a restore waiting a step for deferred releases: both clear by the
+             * next step, and failing them lost two of ten preempted requests under KV pressure
+             * once their prompts were published at the preemption (1. 11. 2026). */
+            if (as < 0 && running_.empty() && plan_.e.empty() && !admit_next_step_ && s.req &&
+                s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) {
                 RAD_WARN("request %llu failed: overdue preempted prefill could not be admitted "
                          "with nothing running (%s)",
                          (unsigned long long)s.req->id, rad_strerror(as));
@@ -2265,13 +2333,13 @@ const RadBatch* Scheduler::step() {
         case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
         default:                ++m_.steps_decode;  break;
     }
-    if (cfg_.prefill_interleave > 0) {
+    if (cfg_.prefill_interleave != 0) {
         /* Armed only while a prompt continues past this step: after a last chunk nothing is left
          * to interleave, and holding would only keep the next request out. */
         bool continues = false;
         for (const StepEntry& e : plan_.e)
             if (e.is_prefill && !e.produces_token) continues = true;
-        if (any_pf) interleave_left_ = any_decoding && continues ? cfg_.prefill_interleave : 0;
+        if (any_pf) interleave_left_ = any_decoding && continues ? interleave_steps() : 0;
         else if (interleave_left_ > 0) --interleave_left_;
         if (held_prefill_ > 0) ++m_.steps_held;
     }
@@ -2873,6 +2941,9 @@ void Scheduler::step_finished() {
     /* The window ages by all elapsed time, idle included; only the busy part is added as time the
      * tokens took. */
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
+    /* --prefill-interleave auto's two step costs (interleave_steps). */
+    if (wall > 0 && cfg_.prefill_interleave < 0)
+        step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall);
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
         const double f = std::exp(-aged / kWindowS);

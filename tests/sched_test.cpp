@@ -2034,6 +2034,29 @@ TEST(a_preempted_prefill_ignores_a_kv_group_that_holds_no_blocks) {
     f.commit_plain();
 }
 
+/* A preempted request publishes what it computed, as a finished one does: its prompt stays in the
+ * cache, and the recompute adopts it instead of computing it again (a 96.6k-token prompt took about
+ * 25 s of a pair of cards). The blocks stay reclaimable: the cache gives them back under pressure. */
+TEST(a_preempted_request_publishes_its_prefix) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 60000;
+    CHECK_OK(f.start());
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    const size_t before = f.pc.published.size();
+    CHECK(f.sch.step() != nullptr);
+    REQUIRE_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    bool found = false;
+    for (size_t i = before; i < f.pc.published.size(); ++i)
+        if (f.pc.published[i].seq == b && f.pc.published[i].n_tokens >= 128) found = true;
+    CHECK(found);
+    f.commit_plain();
+    (void)a;
+}
+
 /* The gate's wait is bounded: after --preempt-wait-ms an overdue preempted prefill gets room by
 
  * preempting the lowest-priority running request before the step is planned, so it cannot queue
@@ -2065,6 +2088,49 @@ TEST(a_preempted_prefill_falls_back_to_a_running_victim_after_the_wait) {
     f.commit_plain();
 }
 
+/* An overdue preempted prefill the pool still refuses keeps its place: nothing queued behind it is
+ * admitted in that step, since the room the overdue path makes is for it. Asking the next request
+ * instead let a request just forced off for it come straight back (its prompt published, so its
+ * recompute needed almost nothing) and take that room again: under KV pressure the same victim was
+ * forced off and re-admitted 26 times in 16 s while the overdue request waited. */
+TEST(an_overdue_preempted_prefill_keeps_its_place_ahead_of_the_queue) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 0;               /* overdue from the next step */
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, 64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);
+    REQUIRE_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    f.commit_plain();
+
+    /* B is overdue and does not fit beside A. C, queued behind it, would fit; it must wait. */
+    uint64_t c = f.submit(16, 4, /*priority=*/0);
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+        CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+        f.commit_plain();
+    }
+    /* Once A finishes, B goes in first. */
+    for (int i = 0; i < 80 && f.sch.find(a) && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    bool b_first = false;
+    for (int i = 0; i < 4; ++i) {
+        if (!f.sch.step()) continue;
+        const ReqState bs = f.sch.find(b)->state, cs = f.sch.find(c)->state;
+        if (bs == ReqState::Running) { b_first = true; f.commit_plain(); break; }
+        CHECK(cs != ReqState::Running);
+        f.commit_plain();
+    }
+    CHECK(b_first);
+}
+
 /* A lower-priority overdue prefill may stay queued while a higher-priority runner keeps its
  * blocks. Forcing that runner off just swaps who is at zero. The priority-5 request must not be
  * the one left in Preempted while someone else still runs. */
@@ -2092,6 +2158,58 @@ TEST(overdue_preempted_prefills_keep_forcing_until_one_fits) {
     CHECK(ra->state != ReqState::Preempted || f.sch.metrics().running == 0);
     CHECK(f.sch.metrics().running + f.sch.metrics().preempted_waiting > 0);
     (void)b; (void)c;
+}
+
+/* The overdue path fails a preempted prefill only when waiting cannot help. A restore that waits a
+ * step for a deferred release is a wait: failing it on an idle engine lost two of ten preempted
+ * requests under KV pressure once their prompts were published at the preemption (1. 11. 2026). */
+TEST(an_overdue_preempted_prefill_whose_restore_waits_a_step_is_not_failed) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.preempt_wait_ms = 0;
+    f.cfg.n_spec = 7;
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(287, /*max_tokens=*/64, /*priority=*/5);
+    uint64_t b = f.submit(128, 64, /*priority=*/0);
+    /* B's growth meets A's blocks: B is preempted while A runs. */
+    for (int i = 0; i < 8; ++i) {
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        if (f.sch.find(b)->state == ReqState::Preempted) break;
+    }
+    REQUIRE_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+
+    /* A is cancelled while a drafter pass names its blocks: they come back only at the next
+     * commit, and nothing runs. */
+    Scheduler::BlockRow rows[4];
+    REQUIRE_EQ(f.sch.block_begin(/*block=*/8, /*depth=*/7, /*window=*/0, /*mask=*/99, rows, 4), 1);
+    REQUIRE(f.sch.block_context(1) != nullptr);
+    CHECK_OK(f.sch.cancel(a));
+    f.sch.block_end();
+    REQUIRE(f.sch.has_deferred());
+    REQUIRE_EQ(f.sch.metrics().running, 0);
+
+    /* B's restore waits a step for that release; B must still be there after it. The cache
+     * gives back what it holds when asked. */
+    f.pc.decline_whole = true;
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 1 << 20;
+    if (!f.sch.step() && f.sch.has_deferred()) f.sch.release_deferred();
+    CHECK(f.sch.find(b)->state != ReqState::Failed);
+    /* As the engine does when a step plans nothing: it drains, then releases what was deferred. */
+    bool ran = false;
+    for (int i = 0; i < 4 && !ran; ++i) {
+        if (!f.sch.step()) {
+            if (f.sch.has_deferred()) f.sch.release_deferred();
+            continue;
+        }
+        ran = f.sch.find(b)->state == ReqState::Running;
+        f.commit_plain();
+    }
+    CHECK(ran);
+    CHECK(f.sch.find(b)->state != ReqState::Failed);
 }
 
 TEST(a_mixed_step_has_the_right_boundaries_and_slot_mapping) {
@@ -3168,12 +3286,17 @@ struct Interleaved {
     int64_t steps_held = 0;
 };
 
-static Interleaved interleave_run(int64_t n, bool decoder, int steps) {
+/* `chunk_s` / `decode_s`: step costs fed to --prefill-interleave auto before the run (none when
+ * 0), standing in for step_finished's wall times. */
+static Interleaved interleave_run(int64_t n, bool decoder, int steps, double chunk_s = 0,
+                                  double decode_s = 0) {
     Fixture f;
     f.build();
     f.cfg.prefill_interleave = n;
     CHECK_OK(f.start());
     f.sch.set_stage_rows(64);
+    if (chunk_s > 0) f.sch.note_step_cost(true, chunk_s);
+    if (decode_s > 0) f.sch.note_step_cost(false, decode_s);
     if (decoder) {
         f.submit(100, 512);
         CHECK(f.sch.step() != nullptr);
@@ -3231,6 +3354,70 @@ TEST(interleave_leaves_a_lone_prefill_alone) {
     const Interleaved r = interleave_run(2, /*decoder=*/false, 8);
     CHECK_EQ(r.shape, std::string("CCCCCCCC"));
     CHECK_EQ(r.steps_held, 0);
+}
+
+/* auto: as many decode-only steps as fit in a quarter of a chunk step's measured time at a decode
+ * step's (rounded down, at most 16), one until both are measured, none where a decode step costs
+ * more than that quarter. */
+TEST(interleave_auto_fits_decode_steps_in_a_quarter_of_a_chunk_step) {
+    auto steps = [](double chunk_s, double decode_s) {
+        Fixture f;
+        f.build();
+        f.cfg.prefill_interleave = -1;
+        CHECK_OK(f.start());
+        if (chunk_s > 0) f.sch.note_step_cost(true, chunk_s);
+        if (decode_s > 0) f.sch.note_step_cost(false, decode_s);
+        return f.sch.interleave_steps();
+    };
+    CHECK_EQ(steps(0, 0), 1);
+    CHECK_EQ(steps(0.4, 0), 1);
+    CHECK_EQ(steps(0, 0.03), 1);
+    CHECK_EQ(steps(0.4, 0.03), 3);         /* 0.1 s of 0.03 s steps */
+    CHECK_EQ(steps(0.4, 0.05), 2);
+    CHECK_EQ(steps(0.4, 0.2), 0);          /* a decode step dearer than the quarter */
+    CHECK_EQ(steps(1.0, 0.001), 64);       /* capped at kInterleaveAutoMax */
+    /* auto:SHARE: SHARE of the chunk step's time instead of a quarter. */
+    Fixture k;
+    k.build();
+    k.cfg.prefill_interleave = -1;
+    k.cfg.prefill_interleave_share = 1.0;
+    CHECK_OK(k.start());
+    k.sch.note_step_cost(true, 0.4);
+    k.sch.note_step_cost(false, 0.04);
+    CHECK_EQ(k.sch.interleave_steps(), 10);  /* 0.4 s of 0.04 s steps */
+    /* A number is used as given, whatever was measured. */
+    Fixture g;
+    g.build();
+    g.cfg.prefill_interleave = 5;
+    CHECK_OK(g.start());
+    g.sch.note_step_cost(true, 1.0);
+    g.sch.note_step_cost(false, 0.001);
+    CHECK_EQ(g.sch.interleave_steps(), 5);
+    /* The costs are running means: a chunk step of 0.4 s, then one of 0.8 s, reads 0.5 s. */
+    Fixture h;
+    h.build();
+    h.cfg.prefill_interleave = -1;
+    CHECK_OK(h.start());
+    h.sch.note_step_cost(true, 0.4);
+    h.sch.note_step_cost(true, 0.8);
+    h.sch.note_step_cost(false, 0.05);
+    CHECK_EQ(h.sch.interleave_steps(), 2);  /* 0.125 / 0.05 */
+}
+
+/* auto schedules the measured count after every chunk beside a decoder, holds nothing for a lone
+ * prefill, and with decode steps too dear for the quarter puts a chunk in every step. */
+TEST(interleave_auto_holds_each_chunk_for_the_steps_its_costs_allow) {
+    const Interleaved r = interleave_run(-1, /*decoder=*/true, 10, 0.4, 0.05);
+    CHECK_EQ(r.shape, std::string("CDDCDDCDDC"));
+    CHECK_EQ(r.steps_held, 6);
+    const Interleaved first = interleave_run(-1, /*decoder=*/true, 6);   /* nothing measured */
+    CHECK_EQ(first.shape, std::string("CDCDCD"));
+    const Interleaved dear = interleave_run(-1, /*decoder=*/true, 8, 0.4, 0.2);
+    CHECK_EQ(dear.shape, std::string("CCCCCCCC"));
+    CHECK_EQ(dear.steps_held, 0);
+    const Interleaved lone = interleave_run(-1, /*decoder=*/false, 8, 0.4, 0.01);
+    CHECK_EQ(lone.shape, std::string("CCCCCCCC"));
+    CHECK_EQ(lone.steps_held, 0);
 }
 
 /* After a prompt's last chunk there is nothing to interleave: the next request is admitted in the
@@ -7650,4 +7837,164 @@ TEST(a_recycled_slot_does_not_carry_the_previous_request_s_admission) {
         }
     }
     CHECK(!"the second request never reached its first token");
+}
+
+/* ================================================================== a burst of long prompts, timed
+ *
+ * Not a check: a measurement harness for scheduling policy, run on request only:
+ *
+ *   RAD_SCHED_SIM=1 [SIM_N=32 SIM_LEN=131072 SIM_OUT=512 SIM_MAXTOK=2048 SIM_INTERVAL=2048
+ *                    SIM_BUSY=-1 SIM_IL=0 SIM_SHARE=0.25 SIM_SEQS=32 SIM_DECODERS=0
+ *                    SIM_TRACE=1] sched_test sim_burst
+ *
+ * SIM_DECODERS sequences of 64-token prompts are decoding (SIM_DEC_OUT tokens each, default
+ * 4096) before the burst arrives. The summary counts the steps that carried a chunk per
+ * checkpoint interval prefilled.
+ *
+ * SIM_N prompts of SIM_LEN tokens arrive at once, each then decodes SIM_OUT tokens with three
+ * drafts a step (a uniform 0..3 accepted), the stager arming at 1025 rows, under
+ * --prefix-resume exact. SIM_BUSY and SIM_IL are --busy-prefill-chunk and --prefill-interleave
+ * (-1 for auto, at SIM_SHARE of a chunk step's time: SIM_IL=-1 SIM_SHARE=1 is auto:1). Each step's
+ * time is a cost model in seconds: SIM_DEC0 + SIM_DECR per decode row when it has one, plus
+ * SIM_PF0 + SIM_PFB per row when it carries a chunk. The defaults are fitted to Qwen3.8-Flash-Next
+ * at TP2 (a lone prefill at ~5.4K tokens/s on 2048-token chunks; one sequence decoding ~145
+ * tokens/s, sixteen ~650 with MTP), not measured per step shape: the schedule is the scheduler's
+ * own, the times are an estimate. Prints the aggregate prefill rate,
+ * the time-to-first-token spread and the decode rate of sequences decoding while some prompt still
+ * waits for its first token. */
+static double sim_env(const char* k, double d) {
+    const char* v = std::getenv(k);
+    return v ? std::atof(v) : d;
+}
+
+TEST(sim_burst_of_long_prompts) {
+    if (!std::getenv("RAD_SCHED_SIM")) return;
+    const int     N   = (int)sim_env("SIM_N", 32);
+    const int64_t L   = (int64_t)sim_env("SIM_LEN", 131072);
+    const int     OUT = (int)sim_env("SIM_OUT", 512);
+    const int64_t MT  = (int64_t)sim_env("SIM_MAXTOK", 2048);
+    const double  dec0 = sim_env("SIM_DEC0", 0.014), decr = sim_env("SIM_DECR", 0.003);
+    const double  pf0 = sim_env("SIM_PF0", 0.075), pfb = sim_env("SIM_PFB", 0.147e-3);
+    Fixture f;
+    const int64_t ctx = L + OUT + 4096;
+    f.build(/*blocks=*/(int64_t)N * (ctx / 16 + 8) + 1024, /*states=*/2 * N + 8, MT, ctx);
+    f.cfg.checkpoint_interval = (int64_t)sim_env("SIM_INTERVAL", 2048);
+    f.cfg.busy_prefill_chunk = (int64_t)sim_env("SIM_BUSY", -1);
+    f.cfg.prefill_interleave = (int64_t)sim_env("SIM_IL", 0);
+    f.cfg.prefill_interleave_share = sim_env("SIM_SHARE", 0.25);
+    f.cfg.max_seqs = (int64_t)sim_env("SIM_SEQS", 32);
+    f.cfg.prefix_exact = true;
+    f.cfg.n_spec = 3;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025);
+    uint32_t rng = 12345;
+    int32_t draft[3] = { 7, 7, 7 };
+    /* The decoders, decoding before the burst arrives. */
+    std::vector<uint64_t> decs;
+    const int ND = (int)sim_env("SIM_DECODERS", 0);
+    const int DOUT = (int)sim_env("SIM_DEC_OUT", 4096);
+    for (int i = 0; i < ND; ++i) decs.push_back(f.submit(64, DOUT, 0, /*ignore_eos=*/true));
+    auto draft_all = [&](const std::vector<uint64_t>& v) {
+        for (uint64_t id : v) {
+            const Request* r = f.sch.find(id);
+            if (r && r->state == ReqState::Running && r->n_computed >= (int64_t)r->prompt.size())
+                (void)f.sch.set_draft(id, draft, 3);
+        }
+    };
+    for (int k = 0; k < 16 && ND > 0; ++k) {
+        draft_all(decs);
+        if (!f.sch.step()) break;
+        CHECK_OK(f.commit(7, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
+    }
+    std::vector<uint64_t> ids;
+    for (int i = 0; i < N; ++i) {
+        auto r = f.request((int)L, OUT);
+        for (size_t k = 0; k < r->prompt.size(); ++k)
+            r->prompt[k] = 1000 + (int32_t)(((int64_t)k * 7 + i * 13) % 60000);
+        r->ignore_eos = true;
+        ids.push_back(f.add(std::move(r)));
+    }
+    std::vector<double> ttft(ids.size(), -1), done(ids.size(), -1);
+    double t = 0, t_pf = 0, dec_s = 0;
+    int64_t pf_tok = 0, steps = 0, mixed = 0, small = 0, dec_tok = 0, chunk_steps = 0;
+    auto idx = [&](uint64_t id) { return (size_t)(id - ids[0]); };
+    while (steps < 200000) {
+        draft_all(ids);
+        draft_all(decs);
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        int64_t P = 0, D = 0, nd = 0;
+        for (const StepEntry& e : p.e) {
+            if (e.is_prefill) P += e.n_tokens;
+            else { D += e.n_tokens; ++nd; }
+        }
+        const double dt = (nd ? dec0 + decr * (double)nd : 0.0) +
+                          (P ? pf0 + pfb * (double)(P + D) : 0.0);
+        if (std::getenv("SIM_TRACE") && (steps < 12 || steps % 97 == 0)) {
+            std::printf("step %lld t=%.1f:", (long long)steps, t);
+            for (const StepEntry& e : p.e)
+                std::printf(" %llu:%s%d@%d", (unsigned long long)e.seq, e.is_prefill ? "P" : "d",
+                            e.n_tokens, e.ctx_len);
+            std::printf("\n");
+        }
+        ++steps;
+        chunk_steps += P > 0;
+        mixed += P && nd;
+        small += P && P < 1025;
+        pf_tok += P;
+        if (P) t_pf += dt;
+        bool waiting = false;
+        int64_t decoders = 0;
+        for (size_t k = 0; k < ids.size(); ++k) {
+            if (done[k] >= 0) continue;
+            if (ttft[k] >= 0) ++decoders; else waiting = true;
+        }
+        for (uint64_t id : decs) decoders += f.sch.find(id) != nullptr;
+        std::vector<std::pair<uint64_t, size_t>> before;
+        for (const StepEntry& e : p.e) before.push_back({ e.seq, e.req->output.size() });
+        CHECK_OK(f.commit(7, 0, [&](const StepEntry& e) { return random_accept(rng, e); }));
+        f.sch.note_step_cost(P > 0, dt);
+        t += dt;
+        if (waiting) dec_s += dt * (double)decoders;
+        for (const auto& b : before) {
+            const Request* r = f.sch.find(b.first);
+            if (!r) continue;
+            const bool burst = b.first >= ids[0];
+            if (burst && b.second == 0 && !r->output.empty() && ttft[idx(b.first)] < 0)
+                ttft[idx(b.first)] = t;
+            else if (waiting && b.second > 0) dec_tok += (int64_t)(r->output.size() - b.second);
+        }
+        std::vector<uint64_t> c;
+        f.sch.take_completed(&c);
+        for (uint64_t id : c) {
+            if (id >= ids[0]) done[idx(id)] = t;
+            (void)f.sch.reap(id);
+        }
+        /* The decoders outlive the burst; the run ends with its last prompt. */
+        bool left = false;
+        for (double d : done) left = left || d < 0;
+        if (!left) break;
+    }
+    std::vector<double> tt;
+    for (double x : ttft) if (x >= 0) tt.push_back(x);
+    std::sort(tt.begin(), tt.end());
+    if (tt.empty()) return;
+    auto pct = [&](double q) { return tt[std::min(tt.size() - 1, (size_t)(q * (double)tt.size()))]; };
+    const double intervals = (double)pf_tok / (double)std::max<int64_t>(f.cfg.checkpoint_interval, 1);
+    char il[32];
+    if (f.cfg.prefill_interleave < 0)
+        std::snprintf(il, sizeof il, "auto:%g", f.cfg.prefill_interleave_share);
+    else
+        std::snprintf(il, sizeof il, "%lld", (long long)f.cfg.prefill_interleave);
+    std::printf("sim: %d x %lld tokens beside %d decoders, max_tok %lld, busy %lld, "
+                "interleave %s: %lld steps (%lld mixed, %lld with a chunk under 1025, %.2f with a "
+                "chunk per interval); prefill %.0f tokens/s over the steps with a "
+                "chunk, %.0f to the last first token; TTFT p50 %.0f p95 %.0f max %.0f s; decode "
+                "while prompts wait %.1f tokens/s a sequence; all done at %.0f s\n",
+                N, (long long)L, ND, (long long)MT, (long long)f.cfg.busy_prefill_chunk,
+                il, (long long)steps, (long long)mixed,
+                (long long)small, (double)chunk_steps / std::max(intervals, 1e-9),
+                (double)pf_tok / std::max(t_pf, 1e-9),
+                (double)N * (double)L / tt.back(), pct(0.5), pct(0.95), tt.back(),
+                dec_s > 0 ? (double)dec_tok / dec_s : 0.0, t);
 }

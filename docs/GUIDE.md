@@ -886,6 +886,12 @@ gives its coldest expert back to the drive for a warmer one. It is meant for run
 as shipped, to calibrate or compare against. The bf16 Qwen3.8-Flash-Next (335 GiB) runs on two
 cards at about 28 s a 32K-token step, so use large prefill steps:
 
+GLM-5.3-Flash lays its routed experts out by what the deployment needs. At four and eight cards each
+MXFP4 expert is split by width across every card, the shape its kernels are tuned for, and every expert
+must then fit in VRAM and the host pool. A container with any expert in another format stays whole. `--weights-disk-tier` keeps them whole on one card each, so they
+can stay on the drive, at about a third of the prefill speed and two thirds of the decode speed on 4 x
+R9700. Two cards always keep them whole.
+
 ```sh
 rad-convert /srv/models/Qwen/Qwen3.8-Flash-Next -o flashnext-bf16.rad --max-ctx 4096   # no recipe: bf16
 radiance --model flashnext-bf16.rad --tp 2 --placement expert_tiered --weights-disk-tier \
@@ -929,8 +935,9 @@ takes the model's training context.
 `--kv-cache-dtype fp8` is an E4M3 cache with per-(sequence, head) descales. It halves what a token of
 context costs, which at a production context is most of the pool. It is a real quantisation that
 changes the output slightly, so it is only ever set explicitly. Every architecture serves both
-widths except GLM-5.3-Flash (`glm5next`), whose latent-attention cache is bf16 only and which refuses
-`fp8` at startup. The flag sets every attention cache of the deployment, a drafter's (DSpark,
+widths. On GLM-5.3-Flash (`glm5next`) `fp8` narrows the latent-attention cache alone, to E4M3 at a
+descale of 1 (half its bf16 size); the DSA index, its key tail and the KDA caches keep their own
+widths. The flag sets every attention cache of the deployment, a drafter's (DSpark,
 DFlash2) included. The delta-net state and the QSA indexer's key tail are recurrent state and keep their own
 widths.
 
@@ -1145,8 +1152,27 @@ chunk's time, and every sequence decoding beside it waits that long for its next
 `--prefill-interleave 2`, after a step that carried a chunk while other sequences were decoding,
 the next two steps carry decode rows only and admit nothing, then the next chunk is scheduled. The prompt's time to first token grows by those steps and the
 decoders keep their cadence. A lone prefill is not held, nor is the step after a prompt's last
-chunk. `0` (the default) schedules as before. `/stats` counts the decode-only steps the hold
-inserted as `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
+chunk. `0` schedules as before. `/stats` counts the decode-only steps the hold inserted as
+`steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
+
+Served default: `--prefill-interleave auto:1` (below), so decoding sessions keep about half their
+rate while prompts prefill; `--deterministic`, KL mode and generators keep 0, and an explicit `N`
+or `auto[:SHARE]` is kept as given. Measured on Qwen3.8-Flash-Next (fp8, TP2, MTP 3, 8 sessions
+decoding beside 64K prompts): 12.3 -> 40.9 decode tokens/s a session, aggregate prefill 3.7K ->
+1.8K tokens/s, time to first token 17 -> 36 s. `--prefill-interleave 0` restores the old schedule.
+
+`--prefill-interleave auto` sizes the hold from measured step times instead: after each such chunk,
+as many decode-only steps as fit in a quarter of a chunk step's time at a decode step's (running
+means of both, at most 64 steps; one until a decode step has been timed). `auto:SHARE` uses SHARE
+of the chunk step's time instead of a quarter (0 < SHARE <= 4; `auto:1` gives decode as much time
+as prefill). With the quarter the prefill gives up at most a fifth of its rate however many
+sequences decode, and the decoders get several steps where a decode step is cheap beside a chunk,
+none where one costs more than that quarter (they still ride every chunk). In the scheduler's host simulation of 32 prompts of 128K tokens sent at once, each
+then decoding 512 tokens (2048-token chunks, MTP 3, step costs fitted to a lone prefill and to
+decode alone), auto raised the decode rate of the sequences decoding while prompts still waited
+from 6.5 to 31 tokens/s each and delayed the last first token by 6 %. Because the hold follows the
+device's timing, which steps carry a chunk differs from run to run; a number schedules the same
+steps every time.
 
 **A prefill alone in its step can carry several intervals** (`--prefill-span N`, default 1). A
 chunk ends on every checkpoint interval, so a prompt is otherwise prefilled one interval a step.
@@ -2063,8 +2089,8 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--max-num-batched-tokens N` | 2048 | largest token count one step may carry |
-| `--prefill-interleave N` | 0 (off) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64 |
-| `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step |
+| `--prefill-interleave N` | auto:1 (0 under `--deterministic`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
+| `--preempt-wait-ms N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `--busy-prefill-chunk MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `--max-num-seqs N` | 256 | largest number of sequences one step may carry |
 | `--max-model-len N` | 0 | context bound; 0 takes the model's training context |

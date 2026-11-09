@@ -137,6 +137,19 @@ static const RadOperandSpec oAttnPagedTree[] = {
     { "spec_parent", RAD_OPD_IN,  0 },
 };
 
+/* attn_paged with a sink logit a query head, its own name so no kernel ignorant of it is chosen. */
+static const RadOperandSpec oAttnPagedSink[] = {
+    { "q",           RAD_OPD_IN,     0 },
+    { "kv_cache",    RAD_OPD_IN,     0 },
+    { "block_table", RAD_OPD_IN,     0 },
+    { "seqused",     RAD_OPD_IN,     0 },
+    { "k_descale",   RAD_OPD_IN,     1 },
+    { "v_descale",   RAD_OPD_IN,     1 },
+    { "cu_seqlens",  RAD_OPD_IN,     1 },
+    { "sinks",       RAD_OPD_WEIGHT, 0 },   /* [n_head] f32 */
+    { "out",         RAD_OPD_OUT,    0 },
+};
+
 /* attn_paged with gate_quant_fp8 folded into its merge: attn_paged's parameters plus the two of
  * gate_quant_fp8's that are not implied (its `n` is `head_dim`, its rows attn_paged's (token,
  * head) pairs), then attn_paged's operands, the gate, the codes and the scales. `out` holds the
@@ -615,6 +628,17 @@ static const RadOperandSpec oKdaUpdate[] = {
     {"q", RAD_OPD_IN, 0}, {"k", RAD_OPD_IN, 0}, {"v", RAD_OPD_IN, 0},
     {"a", RAD_OPD_IN, 0}, {"b", RAD_OPD_IN, 0}, {"A_log", RAD_OPD_WEIGHT, 0},
     {"dt_bias", RAD_OPD_WEIGHT, 0}, {"state", RAD_OPD_INOUT, 0}, {"state_idx", RAD_OPD_IN, 0},
+    {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
+    {"o", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pSsdUpdate[] = {
+    P_INT("M"), P_INT("heads"), P_INT("head_dim"), P_INT("d_state"), P_INT("groups"),
+    P_STR("mode"), P_STR("dtype"), P_STRO("state_form"),
+};
+static const RadOperandSpec oSsdUpdate[] = {
+    {"x", RAD_OPD_IN, 0}, {"B", RAD_OPD_IN, 0}, {"C", RAD_OPD_IN, 0},
+    {"dt", RAD_OPD_IN, 0}, {"A_log", RAD_OPD_WEIGHT, 0}, {"dt_bias", RAD_OPD_WEIGHT, 0},
+    {"D", RAD_OPD_WEIGHT, 0}, {"state", RAD_OPD_INOUT, 0}, {"state_idx", RAD_OPD_IN, 0},
     {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
     {"o", RAD_OPD_OUT, 0},
 };
@@ -1924,9 +1948,10 @@ static const RadParamSpec pSwigluClampedQuant[] = { P_INT("M"), P_INT("n"), P_F6
                                                     P_INT("group"), P_STR("dtype") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"),
                                          P_INTO("block_size") };
+/* `kv_dtype` is the latent cache's: absent or bf16, or fp8_e4m3 (kv_store_fp8 at descale 1). */
 static const RadParamSpec pMlaAttn[] = { P_INT("M"),      P_INT("latent_dim"), P_INT("heads"),
                                          P_INT("blocks"), P_INT("block_size"), P_F64("scale"),
-                                         P_STR("dtype") };
+                                         P_STR("dtype"),  P_STRO("kv_dtype") };
 static const RadParamSpec pMlaProject[] = { P_INT("M"),          P_INT("heads"), P_INT("head_dim"),
                                             P_INT("latent_dim"), P_STR("mode"),  P_STR("dtype") };
 static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
@@ -2195,6 +2220,16 @@ static const RadOperandSpec oGridEmbed[] = {
     { "table", RAD_OPD_WEIGHT, 0 },
     { "coord", RAD_OPD_IN,     0 },
 };
+static const RadParamSpec pGridEmbedCpe[] = {
+    P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+    { "n_prefix", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oGridEmbedCpe[] = {
+    { "x",      RAD_OPD_INOUT,  0 },
+    { "table",  RAD_OPD_WEIGHT, 0 },
+    { "coord",  RAD_OPD_IN,     0 },
+    { "prefix", RAD_OPD_WEIGHT, 1 },
+};
 static const RadParamSpec pGemmBias[] = {
     P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
     { "act", RAD_P_STR, RAD_OPTIONAL },
@@ -2330,6 +2365,19 @@ static const RadOperandSpec oPleConv[] = {
     { "cache_idx",    RAD_OPD_IN,     1 },
     { "has_init",     RAD_OPD_IN,     1 },
     { "num_accepted", RAD_OPD_IN,     1 },
+    { "y",            RAD_OPD_OUT,    0 },
+};
+/* ple_conv's operands with `b`, a per-channel bias inside the silu, before `y`. */
+static const RadOperandSpec oPleConvBias[] = {
+    { "x",            RAD_OPD_IN,     0 },
+    { "w",            RAD_OPD_WEIGHT, 0 },
+    { "conv_state",   RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "resid",        RAD_OPD_IN,     1 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "b",            RAD_OPD_WEIGHT, 0 },
     { "y",            RAD_OPD_OUT,    0 },
 };
 /* ple_conv's operands without `resid`, its parameters without `dilation`. */
@@ -2506,7 +2554,7 @@ static const RadParamSpec pLogprobs[] = {
 };
 static const RadOperandSpec oLogprobs[] = {
     { "logits", RAD_OPD_IN,  0 },
-    { "params", RAD_OPD_IN,  0 },
+    { "params", RAD_OPD_IN,  1 },   /* absent: every row */
     { "stats",  RAD_OPD_OUT, 0 },
 };
 static const RadOperandSpec oNarrow[] = {
@@ -2542,6 +2590,38 @@ static const RadOperandSpec oPairArgmax[] = {
     { "pairs", RAD_OPD_IN,  0 },
     { "idx",   RAD_OPD_OUT, 0 },
     { "val",   RAD_OPD_OUT, 1 },
+};
+/* LiLiCorr's correlator (r4d_lili.hip; libref/ref_lili.cpp has the contracts). */
+static const RadParamSpec pLiliCand[] = {
+    P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"), P_INT("n"), P_STR("dtype"),
+    P_F64O("eps"), P_INTO("row_k"),
+};
+static const RadOperandSpec oLiliCand[] = {
+    { "stats", RAD_OPD_IN, 0 },     { "pas", RAD_OPD_IN, 0 },
+    { "ln_w", RAD_OPD_WEIGHT, 0 },  { "ln_b", RAD_OPD_WEIGHT, 0 },
+    { "up_w", RAD_OPD_WEIGHT, 0 },  { "up_b", RAD_OPD_WEIGHT, 0 },
+    { "slot", RAD_OPD_WEIGHT, 0 },  { "rank", RAD_OPD_WEIGHT, 0 },
+    { "cand", RAD_OPD_OUT, 0 },     { "feat", RAD_OPD_OUT, 0 },     { "base", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLiliAttn[] = {
+    P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n_head"), P_INT("head_dim"), P_STR("dtype"),
+    P_F64O("scale"),
+};
+static const RadOperandSpec oLiliAttn[] = {
+    { "qkv", RAD_OPD_IN, 0 }, { "rel", RAD_OPD_WEIGHT, 0 }, { "same", RAD_OPD_WEIGHT, 0 },
+    { "out", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLiliFactor[] = { P_INT("M"), P_INT("L"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oLiliFactor[] = {
+    { "h", RAD_OPD_IN, 0 }, { "a", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLiliWalk[] = {
+    P_INT("M"), P_INT("steps"), P_INT("k"), P_INT("n"), P_STR("dtype"), P_F64O("eps"),
+    P_F64O("scale"),
+};
+static const RadOperandSpec oLiliWalk[] = {
+    { "edges", RAD_OPD_IN, 0 }, { "aout", RAD_OPD_IN, 0 }, { "cand", RAD_OPD_IN, 0 },
+    { "tokens", RAD_OPD_OUT, 0 }, { "scores", RAD_OPD_OUT, 1 },
 };
 static const RadParamSpec pNormJoin[] = {
     P_INT("M"),
@@ -3159,9 +3239,9 @@ static const RadOpSchema kSchemas[] = {
            "op, not gelu, because gated feed-forwards are trained with the tanh form and the "
            "unary gelu is the exact erf one."),
     SCHEMA("act_mul", pActMul, oBinary,
-           "y = act(a) * b, the activation (silu, gelu, gelu_tanh, sigmoid or quick_gelu) rounded "
-           "to y's dtype before "
-           "the product: silu_mul with its two halves in two operands."),
+           "y = act(a) * b, the activation (silu, gelu, gelu_tanh, sigmoid, quick_gelu or relu) "
+           "rounded to y's dtype before the product: silu_mul with its two halves in two "
+           "operands."),
     SCHEMA("seg_mean", pSegMean, oSegMean,
            "Row s of y is the mean of x's rows [cu_seqlens[s], cu_seqlens[s+1]), summed in f64 "
            "and rounded once; an empty segment is zeros."),
@@ -3265,6 +3345,12 @@ static const RadOpSchema kSchemas[] = {
            "position embedding: per axis a triangle filter on half-pixel centres, widened by the "
            "scale when shrinking, its in-table taps normalised. Separable, f32, rounded once "
            "before the add; coordinates clamp into their grid."),
+    SCHEMA("grid_embed_cpe", pGridEmbedCpe, oGridEmbedCpe,
+           "x += the side x side table resampled as torch's F.interpolate(bilinear, "
+           "align_corners=False) -- no antialias -- onto a square of side max(grid height, grid "
+           "width), of which the grid keeps the top-left part: RADIO's cropped position embedding. "
+           "Two taps an axis, the row blended first; f32, rounded once before the add. A row "
+           "whose row coordinate is negative gets the learned prefix row its column names."),
     SCHEMA("gemm_nt_bias", pGemmBias, oGemmBias,
            "y = res + act(a @ b^T + bias), rounded to bf16 after the biased product, after the "
            "activation and after the residual -- the unfused chain's three tensors."),
@@ -3312,6 +3398,11 @@ static const RadOpSchema kSchemas[] = {
            "Absent, every token commits: the read is at offset zero and the last "
            "(width-1)*dilation inputs land at offset zero, which is the prefill chunk. "
            "`resid` absent drops the add and leaves the plain convolution."),
+    SCHEMA("ple_conv_bias", pPleConv, oPleConvBias,
+           "ple_conv with `b`, a per-channel bias added inside the silu: y[t] = resid[t] + "
+           "silu(b[c] + sum_j w[c][j] * x[t - (width-1-j)*dilation]). At dilation one with no "
+           "`resid` it is Mamba-2's conv1d. The window, `has_init`, `cache_idx` and "
+           "`num_accepted` are ple_conv's."),
     SCHEMA("causal_conv1d", pCausalConv, oCausalConv,
            "y[t] = sum_j w[c][j] * x[t - (width-1-j)], ple_conv at dilation one with no "
            "activation and no residual: LFM2's short convolution, whose gates the caller applies. "
@@ -3399,6 +3490,9 @@ static const RadOpSchema kSchemas[] = {
      * attn_paged kernels read q dense and refuse a slice (RAD_E_STRIDE). Under this name the op
      * resolves to a kernel that takes the slice or to nothing, and in the latter case the
      * architecture lifts q into a dense block for attn_paged. */
+    SCHEMA("attn_paged_sink", pAttnPaged, oAttnPagedSink,
+           "attn_paged with `sinks` [n_head] f32: one logit a query head in the scaled-score "
+           "domain, in the softmax's maximum and denominator, with no value."),
     SCHEMA("attn_paged_qrow", pAttnPaged, oAttnPaged,
            "attn_paged, parameter for parameter and value for value, with q read at its own row "
            "pitch: a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read "
@@ -3497,6 +3591,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("kda_update", pKdaUpdate, oKdaUpdate,
            "Bounded per-channel KDA recurrence. verify stores candidate states; prefill commits final state. "
            "Absolute cu offsets, accepted-prefix read slot, optional cold initialization, no output norm."),
+    SCHEMA("ssd_update", pSsdUpdate, oSsdUpdate,
+           "Mamba-2 selective state update: dt' = softplus(dt + dt_bias) (no clamp), state decays by "
+           "exp(-exp(A_log) dt') and gains dt' x B^T; o = state C + D x. verify stores candidate "
+           "states; prefill commits the final state. Absolute cu offsets, accepted-prefix read slot, "
+           "optional cold initialization, per_candidate only."),
     SCHEMA("hc_read", pHcRead, oHcRead,
            "the read half of a gated residual: a grouped rmsnorm, a low-rank sigmoid gate, and "
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
@@ -3879,6 +3978,16 @@ static const RadOpSchema kSchemas[] = {
            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
            "and the gated residual's write follows the reduction. Both wires at two ranks, the "
            "exact one at four."),
+    SCHEMA("lili_cand", pLiliCand, oLiliCand,
+           "LiLiCorr's candidates from the ranks' sample_logprobs rows, their rank features through "
+           "layernorm, the up projection and silu, and the lattice rows' additive part."),
+    SCHEMA("lili_attn", pLiliAttn, oLiliAttn,
+           "attention over each sequence's candidate lattice with a learned bias on slot distance "
+           "and the same slot."),
+    SCHEMA("lili_factor", pLiliFactor, oLiliFactor,
+           "[h | a | h * a] a lattice row, a its sequence's anchor."),
+    SCHEMA("lili_walk", pLiliWalk, oLiliWalk,
+           "LiLiCorr's normalised edge scores and their greedy walk."),
     SCHEMA("pair_argmax", pPairArgmax, oPairArgmax,
            "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in "
            "the first f32 slot and its value in the second (row_topk's `pairs`, all-gathered): ties "
@@ -4364,6 +4473,8 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
         C_GE("window", WMIN), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                       \
     };
 R4D_WIN_C(cWinH128G1Bf16, 128, 1, "bf16", 0) R4D_WIN_C(cWinH128G1Fp8, 128, 1, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH128G8Bf16, 128, 8, "bf16", 0) R4D_WIN_C(cWinH128G8Fp8, 128, 8, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH128G16Bf16, 128, 16, "bf16", 0) R4D_WIN_C(cWinH128G16Fp8, 128, 16, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G1Bf16, 256, 1, "bf16", 0) R4D_WIN_C(cWinH256G1Fp8, 256, 1, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G2Bf16, 256, 2, "bf16", 0) R4D_WIN_C(cWinH256G2Fp8, 256, 2, "fp8_e4m3", 0)
 R4D_WIN_C(cWinH256G4Bf16, 256, 4, "bf16", 1) R4D_WIN_C(cWinH256G4Fp8, 256, 4, "fp8_e4m3", 1)
@@ -4581,6 +4692,24 @@ static const RadConstraint cAttnDecodeH128G2Bf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 2), C_EQ("block_size", 16),
     C_GE("causal", 0), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
+/* Sixteen queries per KV head at head_dim 128 (Nemotron-H's 32 over 2): q_len <= 8 at decode, eight
+ * waves, so a verify of LiLiCorr's 7 drafts runs the decode kernel a plain decode runs. */
+static const RadConstraint cAttnPrefillH128G16Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 16), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnPrefillH128G16Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 16), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
+static const RadConstraint cAttnDecodeH128G16Fp8[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 16), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 8), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const RadConstraint cAttnDecodeH128G16Bf16[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 128), C_EQ("gqa", 16), C_EQ("block_size", 16),
+    C_GE("causal", 0), C_LE("q_len", 8), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
+};
 /* Key rename: libr4d writes C_IN("q_dtype","bf16") and C_IN("kv_dtype","bf16"); docs/OPS.md's
  * `attn_dense` has one `dtype`. The predicate is unchanged.
  *
@@ -4629,6 +4758,10 @@ static const RadConstraint cCastNarrow[] = {
  * predicate -- "bf16, and nothing else" -- is unchanged. */
 static const RadConstraint cAttnDenseH64[] = {
     C_EQ("head_dim", 64), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
+};
+/* head_dim 80 without GQA: C-RADIO's ViT heads (Nemotron-3.5-Bolt's vision tower), bidirectional. */
+static const RadConstraint cAttnDenseH80[] = {
+    C_EQ("head_dim", 80), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
 };
 /* head_dim 256 without GQA, sequences past the small kernel's. */
 static const RadConstraint cAttnDenseH256G1[] = {
@@ -4829,6 +4962,14 @@ static const RadConstraint cNormJoinRoute[] = {
 static const RadConstraint cPairArgmax[] = {
     C_GE("n", 1), C_IN("dtype", "f32 fp32"),
 };
+static const RadConstraint cLiliCand[] = {
+    C_GE("k", 2), C_LE("k", 64), C_GE("world", 1), C_LE("world", 16), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cLiliAttn[] = {
+    C_GE("head_dim", 1), C_LE("head_dim", 128), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cLiliFactor[] = { C_IN("dtype", "bf16") };
+static const RadConstraint cLiliWalk[] = { C_GE("k", 1), C_LE("k", 64), C_IN("dtype", "bf16") };
 static const RadConstraint cExpertScale[] = {
     C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1), C_IN("dtype", "bf16"),
 };
@@ -4906,6 +5047,13 @@ static const RadConstraint cKdaUpdate[] = {
     C_EQ("head_k", 128),   C_EQ("head_v", 128), C_IN("mode", "prefill verify"),
     C_IN("dtype", "bf16"),
 };
+/* Mamba-2 at a 128-wide state (four registers a lane) and heads in rows of 16 (four waves of four
+ * rows): Nemotron-H's 64. */
+static const RadConstraint cSsdUpdate[] = {
+    C_GE("M", 1),           C_GE("heads", 1),     C_LE("heads", 65535),
+    C_EQ("d_state", 128),   C_GE("head_dim", 16), C_LE("head_dim", 256),
+    C_DIV("head_dim", 16),  C_IN("mode", "prefill verify"), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cMhcPre[] = {
     C_GE("M", 1),          C_LE("M", 65535),      C_GE("n", 1),
     C_LE("n", 16384),      C_GE("hc", 2),         C_LE("hc", 8),
@@ -4967,6 +5115,29 @@ static const RadConstraint cMlaRows[] = { C_GE("M", 1),         C_LE("M", 65535)
                                           C_EQ("latent_dim", 512), C_EQ("heads", 64),
                                           C_GE("blocks", 1),       C_EQ("block_size", 4),
                                           C_IN("dtype", "bf16") };
+/* The three rows over an E4M3 latent cache: each bf16 row's constraints and kv_dtype fp8_e4m3,
+ * ranked above all three bf16 rows (which state no kv_dtype and would otherwise also match), in
+ * the bf16 rows' order among themselves. The kernels are the bf16 rows' with the key load
+ * decoding E4M3 (r4d_mla.hip). */
+static const RadConstraint cMlaAttnFp8[] = {
+    C_GE("M", 1),      C_LE("M", 65535),  C_EQ("latent_dim", 512), C_GE("heads", 1),
+    C_LE("heads", 64), C_GE("blocks", 1), C_EQ("block_size", 4),   C_IN("dtype", "bf16"),
+    C_IN("kv_dtype", "fp8_e4m3")
+};
+static const RadConstraint cMlaMatrixFp8[] = { C_GE("M", 1),
+                                               C_LE("M", 65535),
+                                               C_EQ("latent_dim", 512),
+                                               C_GE("heads", 8),
+                                               C_LE("heads", 64),
+                                               C_DIV("heads", 8),
+                                               C_GE("blocks", 1),
+                                               C_EQ("block_size", 4),
+                                               C_IN("dtype", "bf16"),
+                                               C_IN("kv_dtype", "fp8_e4m3") };
+static const RadConstraint cMlaRowsFp8[] = { C_GE("M", 1),         C_LE("M", 65535),
+                                             C_EQ("latent_dim", 512), C_EQ("heads", 64),
+                                             C_GE("blocks", 1),       C_EQ("block_size", 4),
+                                             C_IN("dtype", "bf16"),   C_IN("kv_dtype", "fp8_e4m3") };
 /* `n` is bounded by LDS: nh (hc*n) and ne (n) are both bf16 and live through the second phase;
  * 28672 elements is that budget at hc 4. */
 static const RadConstraint cMtpEnter[] = {
@@ -6055,6 +6226,14 @@ static const RadKernelInfo kKernels[] = {
   ROW(cPleConv), NOTUNE,
   nullptr, nullptr, r4d_rad_ple_conv },
 
+{ "ple_conv_bias_bf16", "ple_conv_bias", "norm",
+  "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d); one thread a channel",
+  "width up to 5 and dilation up to 4 -- (width-1)*dilation is a register window",
+  "bf16 activations, weights, bias and conv state; i32 cu, slots, has_init and num_accepted",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cPleConv), NOTUNE,
+  nullptr, nullptr, r4d_rad_ple_conv_bias },
+
 { "causal_conv1d_bf16", "causal_conv1d", "conv",
   "depthwise causal conv with no activation (ple_conv's kernel); one thread a channel",
   "width 2 to 8, undilated",
@@ -6384,6 +6563,15 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_grid_embed_aa, nullptr, nullptr, nullptr,
   r4d_shape_grid_embed },
 
+{ "grid_embed_cpe_bf16", "grid_embed_cpe", "elem",
+  "a learned position grid resampled half-pixel bilinear onto a square and cropped (RADIO's CPE)",
+  "any n and side; coord [4, M] dense; one workgroup a row",
+  "bf16 x, bf16 or f32 table, i32 coord, f32 taps",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGridEmbed), NOTUNE,
+  nullptr, nullptr, r4d_rad_grid_embed_cpe, nullptr, nullptr, nullptr,
+  r4d_shape_grid_embed_cpe },
+
 { "gemm_bf16_nt_bias_tiled", "gemm_nt_bias", "gemm",
   "biased GEMM C = res + act(A @ W^T + bias) over 64-deep K tiles, the K tail staged as zeros, "
   "the activation and residual in the store: from 32 blocks of 128x128 the weight read straight "
@@ -6534,6 +6722,27 @@ static const RadKernelInfo kKernels[] = {
   "latent_dim=512, heads<=64, block_size=4", "bf16 Q/cache/output, f32 softmax and partials",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttn), NOTUNE,
   nullptr, nullptr, r4d_rad_mla_attn, r4d_rad_mla_attn_scratch, nullptr, nullptr,
+  r4d_shape_mla_attn },
+{ "mla_attn_rows_fp8kv", "mla_attn", "attn",
+  "mla_attn_rows_bf16 over an E4M3 latent cache, each key decoded exactly to bf16 at the load",
+  "latent_dim=512, heads=64, block_size=4",
+  "bf16 Q/output, fp8-e4m3 cache at descale 1; FP32 probabilities via high/low BF16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 5, ROW(cMlaRowsFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_rows_fp8kv, r4d_rad_mla_attn_matrix_scratch, nullptr,
+  nullptr, r4d_shape_mla_attn },
+{ "mla_attn_matrix_fp8kv", "mla_attn", "attn",
+  "mla_attn_matrix_bf16 over an E4M3 latent cache, each key decoded exactly to bf16 at the load",
+  "latent_dim=512, heads a multiple of 8 (heads%16==8 pairs two requests a tile), block_size=4",
+  "bf16 Q/output, fp8-e4m3 cache at descale 1; FP32 probabilities via high/low BF16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 4, ROW(cMlaMatrixFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_matrix_fp8kv, r4d_rad_mla_attn_matrix_scratch, nullptr,
+  nullptr, r4d_shape_mla_attn },
+{ "mla_attn_fp8kv", "mla_attn", "attn",
+  "mla_attn_bf16 over an E4M3 latent cache, each key decoded exactly at the load",
+  "latent_dim=512, heads<=64, block_size=4",
+  "bf16 Q/output, fp8-e4m3 cache at descale 1, f32 softmax and partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 3, ROW(cMlaAttnFp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_fp8kv, r4d_rad_mla_attn_scratch, nullptr, nullptr,
   r4d_shape_mla_attn },
 { "gemm_fp8a8_f32scale", "gemm_nt_q", "gemm", "FP8 WMMA with canonical F32 block scales",
   "N and K multiples of 128; pitched activations and row-major weights", "E4M3 codes, F32 scales, BF16 output",
@@ -7455,6 +7664,24 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 R4D_WIN_PAIR(512, 16)
 #undef R4D_WIN_PAIR
 #undef R4D_WIN_ROW
+/* attn_paged_sink: the windowed kernels with the sink folded in (LiLiCorr's drafter, h128 at gqa 16
+ * to TP 2, gqa 8 at TP 4). */
+#define R4D_WINSINK_ROW(HD, G, KVN, KVS, C, KVDOC)                                                \
+{ "attn_window_sink_h" #HD "_gqa" #G "_" #KVN, "attn_paged_sink", "attn",                         \
+  "paged attention with a sink logit a head, any window, causal or not; split-KV with a merge",   \
+  "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",              \
+  "bf16 query, " KVDOC " kv cache, f32 sinks, bf16 out, f32 partials",                             \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,                                                                \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_window_sink_h##HD##_gqa##G##_##KVS,                              \
+  r4d_rad_attn_window_h##HD##_scratch,                                                             \
+  nullptr, nullptr,                                                                                \
+  r4d_shape_attn_paged_sink },
+R4D_WINSINK_ROW(128, 8, bf16kv, bf16, cWinH128G8Bf16, "bf16")
+R4D_WINSINK_ROW(128, 8, fp8kv, fp8, cWinH128G8Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+R4D_WINSINK_ROW(128, 16, bf16kv, bf16, cWinH128G16Bf16, "bf16")
+R4D_WINSINK_ROW(128, 16, fp8kv, fp8, cWinH128G16Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+#undef R4D_WINSINK_ROW
 
 /* DSpark's shared-anchor mask is intentionally a distinct op/kernel family, not an accepted
  * `window` variation of attn_paged's per-query visibility. Its base/upper key bounds are tied to
@@ -7860,6 +8087,44 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr,
   r4d_shape_attn_paged },
 
+{ "attn_prefill_h128_gqa16_fp8kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 128, 16 queries per kv head, paged block 16, varlen",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH128G16Fp8), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h128_gqa16_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_prefill_h128_gqa16_bf16kv", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 128, 16 queries per kv head, paged block 16, varlen",
+  "bf16 query, bf16 kv cache, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillH128G16Bf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h128_gqa16_bf16, nullptr, nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h128_gqa16_fp8kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify)",
+  "head_dim 128, 16 queries per kv head, paged block 16, q_len*gqa <= 128, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH128G16Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h128_gqa16_fp8, r4d_rad_attn_decode_h128_gqa16_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+{ "attn_decode_h128_gqa16_bf16kv", "attn_paged", "attn",
+  "paged attention, causal or not, split-KV (decode / speculative verify)",
+  "head_dim 128, 16 queries per kv head, paged block 16, q_len*gqa <= 128, no window",
+  "bf16 query, bf16 kv cache, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH128G16Bf16), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h128_gqa16_bf16, r4d_rad_attn_decode_h128_gqa16_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
 { "attn_vit_h72_bf16", "attn_dense", "attn",
   "dense non-causal vision-encoder attention, varlen over images / windows",
   "head_dim 72 native (no padding to 128), multi-head (no GQA), contiguous q/k/v/o, "
@@ -7887,6 +8152,16 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "bf16 query / key / value / out, f16 operands, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnDenseH64), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense },
+
+{ "attn_dense_h80_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window or "
+  "blocks, or causal with an optional window behind",
+  "head_dim 80, multi-head (no GQA), q/k/v/o at their own token pitches (column slices of a "
+  "fused projection allowed)",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH80), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense },
 
 { "attn_dense_h256_bf16", "attn_dense", "attn",
@@ -8032,6 +8307,12 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cKdaUpdate), NOTUNE,
   nullptr, nullptr, r4d_rad_kda_update, nullptr, nullptr, nullptr,
   r4d_shape_kda_update },
+{ "ssd_update_n128_bf16", "ssd_update", "gdn", "Mamba-2 recurrence and candidate states",
+  "heads 1..65535, d_state 128, head_dim a multiple of 16 up to 256, prefill and verify",
+  "bf16 activations, f32 A_log, dt_bias, D and state",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cSsdUpdate), NOTUNE,
+  nullptr, nullptr, r4d_rad_ssd_update, nullptr, nullptr, nullptr,
+  r4d_shape_ssd_update },
 { "mhc_pre_bf16", "mhc_pre", "norm", "manifold residual gates and Sinkhorn mixing",
   "M 1..65535, n 1..16384, hc 2..8, iterations 1..256", "bf16 activation, f32 weights and coefficients",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPre), NOTUNE,
@@ -9973,6 +10254,41 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 /* pair_argmax, the sandwich-norm joins and expert_scale. The joins and expert_scale have no
  * opd_shape: libref has no row for them, and tests/r4d_emu holds their source to the replaced chain
  * bit for bit on the host. pair_argmax is described as libref describes it. */
+/* LiLiCorr's correlator: a few microseconds of a draft step each (r4d_lili.hip). */
+{ "lili_cand_bf16", "lili_cand", "draft",
+  "LiLiCorr candidates: the ranks' logprob rows merged, five rank features through layernorm, "
+  "the up projection and silu, and the lattice rows' additive part",
+  "k <= 64, world <= 16; one workgroup a draft position",
+  "f32 stats, layernorm and up projection; bf16 activations, slot and rank tables; i32 cand",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLiliCand), NOTUNE,
+  nullptr, nullptr, r4d_rad_lili_cand, nullptr, nullptr, nullptr,
+  r4d_shape_lili_cand },
+{ "lili_attn_bf16", "lili_attn", "draft",
+  "LiLiCorr lattice attention with learned slot biases, no mask",
+  "steps * k <= 64, head_dim <= 128; one workgroup a (sequence, head)",
+  "bf16 qkv and out, f32 biases",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLiliAttn), NOTUNE,
+  nullptr, nullptr, r4d_rad_lili_attn, nullptr, nullptr, nullptr,
+  r4d_shape_lili_attn },
+{ "lili_factor_bf16", "lili_factor", "draft",
+  "LiLiCorr factor input [h | a | h * a]",
+  "any M and n; one workgroup a row",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLiliFactor), NOTUNE,
+  nullptr, nullptr, r4d_rad_lili_factor, nullptr, nullptr, nullptr,
+  r4d_shape_lili_factor },
+{ "lili_walk_bf16", "lili_walk", "draft",
+  "LiLiCorr normalised edge scores and their greedy walk",
+  "k <= 64, steps * k * k <= 512; one workgroup a sequence",
+  "bf16 edges and anchor, i32 cand and tokens, f32 scores",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLiliWalk), NOTUNE,
+  nullptr, nullptr, r4d_rad_lili_walk, nullptr, nullptr, nullptr,
+  r4d_shape_lili_walk },
+
 { "pair_argmax_f32", "pair_argmax", "select",
   "the top-1 of a row of (id, value) pairs, ties to the lower id, negative ids skipped",
   "any M and n; one wave a row; the outputs one element a row at their own pitch",
@@ -11025,6 +11341,21 @@ extern "C" int rad_kernel_chain(int i) {
         "dflash_select_bf16", "dflash_tree_bf16",
         /* the weight read beside a collective (its blocks add before reading, r4d_prefetch.hip) */
         "prefetch",
+        /* Flash-Next at decode heights: the MoE block */
+        "router_gemm_topk_scatter_bf16", "moe_gemm_fp8a8", "moe_gemm_fp8a8_mod4", "gated_quant_fp8",
+        /* ...and the rest of a delta-net layer */
+        "hc_read_bf16", "hc_read_e4m3", "gdn_recurrent_update_k128_v128_bf16_fp32state",
+        "gdn_conv_recurrent_update_k128_v128_bf16", "ar_hc_write", "ar_gather_hc_write",
+        /* the four-bit routed experts and their rotated quantiser */
+        "moe_gemm_w4a8", "moe_gemm_w4a8_mod4", "gated_had_quant_fp8", "gated_had_quant_i8g",
+        /* ...and an attention layer: the indexer, the norm/rope/gate, the quantiser before o_proj
+         * and the gqa6 decode rows (their split-KV decode and merge already have chained forms) */
+        "qk_norm_rope_gate", "qsa_work_bf16", "qsa_block_key_bf16", "qsa_tail_store_bf16",
+        "qsa_score_bf16", "qsa_select_i32", "gate_quant_fp8",
+        "attn_decode_h256_gqa6_fp8kv", "attn_decode_h256_gqa6_fp8v4", "attn_decode_h256_gqa6_k6v4",
+        "attn_decode_h256_gqa6_bf16kv", "attn_decode_h256_gqa6_bs4_fp8kv",
+        "attn_decode_h256_gqa6_bs4_bf16kv", "attn_decode_gq_h256_gqa6_bs4_fp8kv",
+        "attn_decode_gq_h256_gqa6_bs4_bf16kv",
     };
     for (const char* p : kChained)
         if (std::strcmp(k->name, p) == 0) return 1;

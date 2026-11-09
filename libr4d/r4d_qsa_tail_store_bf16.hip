@@ -22,6 +22,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 
 #include <hip/hip_runtime.h>
 #include <cstdint>
@@ -32,7 +33,7 @@ constexpr int kThreads = 256;
 
 /* A store that moves element bits: E is uint16_t for bf16, uint32_t for f32. */
 template <typename E>
-__global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
+__device__ __forceinline__ void qsa_tail_store_kernel_body(
     const E* __restrict__ k, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
     E* __restrict__ state,
@@ -61,6 +62,26 @@ __global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
     for (int d = (int)threadIdx.x; d < n; d += kThreads) state[dst + d] = k[src + d];
 }
 
+/* The plain and chained forms (r4d_chain.h): every block leaves through the wrapper. */
+template <typename E>
+__global__ __launch_bounds__(kThreads) void qsa_tail_store_kernel(
+    const E* __restrict__ k, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
+    E* __restrict__ state,
+    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    qsa_tail_store_kernel_body<E>(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld);
+}
+template <typename E>
+__global__ __launch_bounds__(kThreads) void r4dchain_qsa_tail_store(
+    const E* __restrict__ k, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, const int32_t* __restrict__ sidx,
+    E* __restrict__ state,
+    int T, int n, int ring, int seqs, int slots, int k_ld, int s_slot, int s_row, int sidx_ld) {
+    r4d_chain_wait();
+    qsa_tail_store_kernel_body<E>(k, pos, cu, sidx, state, T, n, ring, seqs, slots, k_ld, s_slot, s_row, sidx_ld);
+    r4d_chain_done();
+}
+
 }  // namespace
 
 //   k      [T][n]                bf16, `k_ld` elements a row (0 = n)
@@ -78,11 +99,13 @@ static int r4d_qsa_tail_store_bf16_emit(long k, long pos, long cu, long sidx, lo
     if (!s_row) s_row = n;
     if (!sidx_ld) sidx_ld = 1;
     if (wide)
-        return R4D_EMIT(stream, qsa_tail_store_kernel<uint32_t>, dim3((unsigned)T), dim3(kThreads),
+        return R4D_EMIT(stream, g_r4d_chain_arg ? &r4dchain_qsa_tail_store<uint32_t> : &qsa_tail_store_kernel<uint32_t>,
+                        dim3((unsigned)T), dim3(kThreads),
                         0, (const uint32_t*)k, (const int32_t*)pos, (const int32_t*)cu,
                         (const int32_t*)sidx, (uint32_t*)state, T, n, ring, seqs, slots, k_ld,
                         s_slot, s_row, sidx_ld);
-    return R4D_EMIT(stream, qsa_tail_store_kernel<uint16_t>, dim3((unsigned)T), dim3(kThreads), 0,
+    return R4D_EMIT(stream, g_r4d_chain_arg ? &r4dchain_qsa_tail_store<uint16_t> : &qsa_tail_store_kernel<uint16_t>,
+                    dim3((unsigned)T), dim3(kThreads), 0,
                     (const uint16_t*)k, (const int32_t*)pos, (const int32_t*)cu,
                     (const int32_t*)sidx, (uint16_t*)state, T, n, ring, seqs, slots, k_ld, s_slot,
                     s_row, sidx_ld);
@@ -121,6 +144,7 @@ extern "C" int r4d_rad_qsa_tail_store(const RadArgs* a, RadStream stream) {
     if (kp < 0) return R4D_NO(RAD_E_STRIDE);
     if ((k->dtype != RAD_BF16 && k->dtype != RAD_F32) || st->dtype != k->dtype)
         return R4D_NO(RAD_E_DTYPE);
+    const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0);
     return r4d_qsa_tail_store_bf16_emit(r4d_addr(k), r4d_addr(po), r4d_addr(cu), r4d_addr(sx),
                                         r4d_addr(st), (int)T, (int)n, (int)ring, (int)seqs,
                                         (int)st->shape[0], (int)kp, (int)st->stride[0],

@@ -19,6 +19,7 @@ plugin claims.
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert, or Qwen's FP8 release as it ships |
 | `arch/glm5next` | `glm5next` | *(empty)* | GLM-5.3-Flash from AMD's Quark MXFP4 export: four mHC residual streams over 34 KDA and 11 sparse latent-attention (MLA) layers with a DSA indexer, 288 MXFP4 experts at top-8 under sigmoid routing, block-FP8 attention and dense layers at f32 scales, each weight served as stored; its MTP layer is a serial drafter. Pictures through its vision tower (`arch/common/rad_block_glm_vision.h`); bf16 KV |
 | `arch/bailing_hybrid` | `bailinghybrid` | *(empty)* | Ling-3.0-flash and its fine-tunes (Ling-3.0-flash-Sante) from the bf16 checkpoint: 35 KDA and 7 dense latent-attention (MLA) layers with a rotary part and a head-wise gate, 512 experts at top-8 under group-limited sigmoid routing with an ungated shared expert, the routed experts as the recipe stores them (`data/recipes/ling3-w4a8-rtn.recipe`); its MTP layer is a serial drafter; bf16 KV |
+| `arch/nemotronh` | `nemotronh` | *(empty)* | Nemotron-3.5-Bolt-74B-A9B (`nemotron_h_omni` around `nemotron_h_puzzle`), its language model from the bf16 checkpoint: 40 Mamba-2, 40 latent-MoE and 8 NoPE attention blocks in the order `layers_block_type` gives, 240 to 496 ungated relu^2 experts a layer in a 1024-wide latent with a relu^2 shared expert; linears and experts as the recipe stores them (`data/recipes/nemotron74-fp8.recipe`, `nemotron74-w4nl64-gptq.recipe`); pictures and video through its C-RADIO tower (`arch/nemotronh/radio.h`); bf16 KV |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/spark25_bf16` | `spark25` | *(empty)* | Spark X2.6, bf16 checkpoint, mixed sliding/full attention, TP1 or TP with exact collectives ([geometry](#spark25-spark-x26)). Optional DSpark drafter when the container already holds `draft.*` tensors, TP1 only. |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
@@ -754,12 +755,14 @@ Traps:
 - **MTP concatenates the normalized embedding first,** the normalized previous hidden second.
 - **No RoPE anywhere** (`qk_rope_head_dim` 0); the indexer's only rotation is the Hadamard.
 
-**KV groups.** Five, all bf16 or wider; a `--kv-cache-dtype` other than bf16 is refused at
-declare.
+**KV groups.** Five. `--kv-cache-dtype fp8` narrows `kv_latent` alone to E4M3, stored at
+`kv_store`'s default descale of 1 and read by the `mla_attn` fp8kv rows (docs/OPS.md); the other
+four keep the dtypes below whatever the flag, and a cache dtype other than bf16 or fp8 is refused
+at declare.
 
 | group | kind | per layer | layers |
 |---|---|---|---|
-| `kv_latent` | `RAD_KV_FULL`, bf16, 1 head of 256, block 4 | the 512-wide normed latent, its two halves in the K and V slots | 11 MLA + MTP |
+| `kv_latent` | `RAD_KV_FULL`, bf16 (E4M3 under fp8), 1 head of 256, block 4 | the 512-wide normed latent, its two halves in the K and V slots | 11 MLA + MTP |
 | `kv_dsa_index` | `RAD_KV_FULL`, u8, block 4 | one page a pooled key: 128 E4M3 codes and their f32 scale (`dsa_pool`'s cache form) | 11 MLA + MTP |
 | `kv_index_tail` | `RAD_KV_LINEAR`, bf16, `[4 + spec, 256]` | the key and gate rows not yet pooled; the ring is wider by the draft depth so a rejected draft rolls back | 11 MLA + MTP |
 | `kv_kda` | `RAD_KV_LINEAR`, f32, 128 x 128 a head | the recurrent state, 64 / tp heads a rank | 34 KDA |
@@ -769,7 +772,7 @@ The latent and the index are replicated: every rank keeps the whole latent cache
 declares both so (`rad_kv_group_replicated`), which lets the host tier (`--prefix-cache-mib`) hold
 each once a slot: 49.59 KiB a 4-token block at any rank count (`kv_latent` 48.00 KiB over its 12
 layers, `kv_dsa_index` 1.59 KiB), 12.4 KiB a token, where a copy per rank would make a slot
-396.75 KiB at eight. The model is a hybrid, so a prefix-cache hit is usable only from a state
+396.75 KiB at eight. Under fp8 `kv_latent` is 24.00 KiB a block, 6.4 KiB a token in all. The model is a hybrid, so a prefix-cache hit is usable only from a state
 checkpoint at or below it, and `--checkpoint-interval` decides how much of a shared system prompt
 is reused.
 
@@ -2066,6 +2069,79 @@ the one clip where they differed by 5%, the reference itself was 5.3% from a flo
 same model and this engine 0.8%. The transcripts match word for word.
 
 ---
+
+# `nemotronh`: Nemotron-3.5-Bolt-74B-A9B
+
+`arch/nemotronh` serves the language model of Nemotron-3.5-Bolt-74B-A9B (`model_type:
+nemotron_h_omni`, NemotronH_Omni_Reasoning_V3; the text model is `llm_config`, `nemotron_h_puzzle`)
+from the bf16 checkpoint. The reference is vLLM's `nemotron_h.py` and `mamba_mixer2.py`; NVIDIA's HF
+`modeling_nemotron_h.py` agrees except for the CPU scan (below). The plugin reuses `MoeFP8` for the
+routed arm and `AttnFP8` for attention; its Mamba-2 block and the latent feed-forward around
+`MoeFP8` are in the plugin file.
+
+```
+88 blocks, hidden 4096, vocab 131072 (embedding and lm_head separate), RMS eps 1e-5; each block one
+  mixer behind its own norm and a residual add, the type from `layers_block_type`
+40 Mamba-2: 128 heads of 64 in 8 groups, state 128
+  in_proj 4096 -> z 8192 | x 8192 | B 1024 | C 1024 | dt 128, no bias
+  x|B|C through a causal depthwise conv of width 4 with bias, then SiLU
+  dt' = softplus(dt + dt_bias), unclamped; A = -exp(A_log); a D skip per head
+  y = scan(x, B, C, dt'); RMSNormGated: norm over groups of 1024 of y * silu(z), times 8192 gains
+  out_proj 8192 -> 4096
+40 latent MoE: router on the normed hidden state (sigmoid, a correction bias for the selection
+  only, one group, top-9, normalized, x5)
+  fc1_latent_proj 4096 -> 1024; routed experts in the latent, ungated: down(relu(up(x))^2);
+  per layer (`block_configs`) 240 to 496 experts of 1536 to 2560; fc2_latent_proj 1024 -> 4096
+  one shared expert on the hidden state, 4096 -> 5376 -> 4096, relu^2
+8 attention: 32 query heads, 2 KV heads of 128, no position encoding
+```
+
+Traps:
+
+- **The layer count is not stated.** `llm_config` has no `num_hidden_layers`; HF derives it from
+  `block_configs`. The checkpoint reader counts `layers_block_type` when the key is absent, and
+  flattens the array of objects `block_configs` into `block_configs.<l>.<field>`, from which the
+  plugin reads each routed layer's experts, width and top-k.
+- **dt is not clamped.** `time_step_limit` is (0, inf), and vLLM passes exactly that to its scan.
+  HF's CPU path `torch_forward` clamps dt' below at `time_step_min` (0.001), which in the first
+  layers moves 13 % of the (token, head) steps, and it is also wrong past its first 128-token chunk
+  (the state handoff between chunks): HF on the CPU is no reference beyond 128 tokens.
+- **The gated norm normalises the product, per group.** `norm(y * silu(z)) * w` with the RMS over
+  1024 channels (8 groups of the 8192), not `norm(y) * w * silu(z)` (the delta net's
+  `gdn_gated_rmsnorm`). Served as `act_mul` (silu), a gainless `rmsnorm` over rows of 1024 and
+  `mul_weight`; a rank's heads are whole groups.
+- **The router reads the hidden state, the experts the latent.** `MoeFP8` runs at the latent width
+  (`Config::router_k` sizes the router, `Wire::route` feeds it); fc2 is linear and has no bias, so
+  each rank applies it to its partial latent sum and one all-reduce over the hidden width sums the
+  routed and shared arms (`Config::no_reduce`).
+- **relu^2 is `act_mul`'s relu over one operand twice:** relu(x) * x, rounded once, which is
+  torch's `relu(x) ** 2` in bf16 bit for bit.
+- **The bf16 checkpoint has no BOS in its template.** Its chat template sets none, as llama.cpp
+  does for the MoE form.
+
+**KV groups.**
+
+| group | kind | per layer | layers |
+|---|---|---|---|
+| `kv_attn` | `RAD_KV_FULL`, bf16, 2 / tp heads of 128 (1 at four ranks, replicated over a pair), block 16 | keys and values | 8 attention |
+| `kv_ssm` | `RAD_KV_LINEAR`, f32, 64 x 128 a head | the recurrent state, 128 / tp heads a rank | 40 Mamba-2 |
+| `kv_ssm_conv` | `RAD_KV_CONV`, bf16, width 4 | the convolution history, (8192 + 2048) / tp channels a rank | 40 Mamba-2 |
+| `kv_draft` | `RAD_KV_WINDOW` (1024), bf16, 2 / tp heads of 128 (1 at four ranks, replicated over a pair), block 16 | the LiLiCorr drafter's keys and values | its 5 layers, past the trunk |
+
+**Speculation.** With drafts the scan keeps `ssd_update`'s anchor form (the committed state and a
+scratch of per-token records: decay, `dt' x`, B), at most 31 drafts a step. NVIDIA's LiLiCorr block
+drafter proposes 7: 32 query heads over 2 KV heads of 128, which four ranks replicate as the trunk's
+attention does (`drafter_geom`'s `kv_repl_ok`: each rank reads its head's k and v rows at `kv_off`,
+and `attn_paged_sink` runs at gqa 8 instead of 16). A verify's 8 query rows run the trunk's
+attention in the split-KV decode kernel a plain decode runs, at gqa 16 (one and two ranks) in eight
+waves as at gqa 8 (four) in four, so each row is the single-row decode at its position bit for bit
+while each of the split law's segments holds one 16-key tile (a context up to 2048 tokens: 256
+segments at a decode, 128 at a verify). Past that the partition differs and a near-tie can flip
+greedy text, as `ident.sh` allows ([TOOLS](TOOLS.md)).
+
+**Vision.** `arch/nemotronh/radio.h` serves the C-RADIO (v4-H) tower and its `mlp1` projector when
+the container holds them (`vision_config.model_type` `radio`): pictures, and video in tubelets of
+two frames, through `core/mm`'s `Radio` family.
 
 # `minimaxmusic3`: MiniMax-Music3, songs
 

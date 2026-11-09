@@ -209,6 +209,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
 | `grid_embed_aa` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
+| `grid_embed_cpe` | `M`(range) `n` `side` `dtype` `n_prefix`/opt | `x`:inout, `table`w, `coord`, `prefix`w? |
 | `add` | `M`(range) `n` `dtype` `div`:f64/opt | `a`, `b` → `y` |
 | `mul` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `silu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gate·up) |
@@ -305,9 +306,10 @@ weight.
 **`act_mul`** is `silu_mul` with its halves in two operands, so the multiplier can be any tensor:
 two column slices of a fused `gate_up`, or a gate and a separate per-layer input (EmbeddingGemma 2's
 per-layer-embedding block multiplies `gelu_tanh(gate(x))` by one). `act` is `silu`, `gelu` (exact
-erf), `gelu_tanh`, `sigmoid` (a GLU: `a` the gate half, `b` the value half) or `quick_gelu`
-(`sigmoid` of the bf16-rounded `1.702 a`, the CLIP tower's fused form). The activation is
-rounded to `y`'s dtype before the product, as the unfused pair stores it.
+erf), `gelu_tanh`, `sigmoid` (a GLU: `a` the gate half, `b` the value half), `quick_gelu`
+(`sigmoid` of the bf16-rounded `1.702 a`, the CLIP tower's fused form) or `relu`, which over one
+tensor in both operands is `relu(x)²` (Nemotron-H's ungated experts). The activation is rounded
+to `y`'s dtype before the product, as the unfused pair stores it.
 
 **`seg_mean`** is mean pooling over a ragged batch: row `s` of `y` is the mean of `x`'s rows
 `[cu[s], cu[s+1])`, summed in double and rounded once. `M` is the step's token count and bands the
@@ -352,6 +354,14 @@ dtype before the add.
 half-pixel centres, widened by the scale when the grid is smaller than the table, its in-table taps
 normalised to sum to one; separable, f32, rounded once. A different function from `grid_embed`'s,
 so a different op rather than a mode a library could ignore.
+
+**`grid_embed_cpe`** is RADIO's cropped position embedding: the table resampled with
+`F.interpolate(mode="bilinear", align_corners=False)` and no antialias onto a square whose side is
+the grid's larger one, of which the grid keeps the top-left `h x w`. Per axis two taps at
+`(i + 0.5) * side / d - 0.5`, clamped at 0 and into the table, blended along the row first as torch's
+kernel does; f32, rounded once before the add. A row whose row coordinate is negative is one of
+`n_prefix` learned rows a segment carries ahead of its patches (RADIO's class and register tokens),
+the column naming which: it gets `prefix[k]` instead.
 
 ### Hyper-connections
 
@@ -963,6 +973,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 |---|---|---|
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
 | `attn_paged_anchor_window` | same parameters as `attn_paged` | same operands as `attn_paged` → `out` |
+| `attn_paged_sink` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `prefill_fp8`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`?, `sinks`w → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
@@ -992,6 +1003,12 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
 | `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `v_norm`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
 | `qkv_norm_rope_kv_store` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` `v_norm`/opt `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w, `slot_mapping`, `kv_cache`:inout |
+
+**`attn_paged_sink`** is `attn_paged` with a learned logit a query head beside the keys: `sinks`
+`[n_head]` f32, in the scaled-score domain, joins each row's softmax maximum and denominator and
+carries no value, so `out = Σ_j p_j v_j` with `p_j = exp(s_j) / (Σ_k exp(s_k) + exp(sink))`. A row
+with no visible key stays zero. It has its own name so that no `attn_paged` kernel which does not
+know the operand can be chosen for it (LiLiCorr's drafter, and gpt-oss's sinks have the same form).
 
 **`attn_paged`**'s band is `q_len`, not `M`: one query row at decode, `1 + n_spec` at a speculative
 verify, thousands in a prefill chunk, and libr4d has a different kernel for each band.
@@ -2401,6 +2418,7 @@ wrong.
 | op | params | operands |
 |---|---|---|
 | `kda_update` | `M`(range) `heads` `head_k` `head_v` `lower_bound`:f64 `scale`:f64 `l2_eps`:f64 `mode` `dtype` `state_form`/opt | `q`, `k`, `v`, `a`, `b`, `A_log`w, `dt_bias`w, `state`:inout, `state_idx`, `cu`, `num_accepted`?, `has_init`? → `o` |
+| `ssd_update` | `M`(range) `heads` `head_dim` `d_state` `groups` `mode` `dtype` `state_form`/opt | `x`, `B`, `C`, `dt`, `A_log`w, `dt_bias`w, `D`w, `state`:inout, `state_idx`, `cu`, `num_accepted`?, `has_init`? → `o` |
 | `gdn_conv_prep` | `M`(range) `head_k` `head_v` `chunk`/der `conv_width` `l2_eps`:f64/opt `softplus_thr`:f64/opt | `x`, `w`w, `b`w?, `A_log`w, `dt_bias`w, `conv_state`:inout, `cu`, `a`?, `b_gate`?, `cache_idx`?, `has_init`? → `q`,`k`,`v`,`g`,`beta` |
 | `gdn_conv_update` | `q_len`(range) `head_k` `head_v` `conv_width` `max_query_len`/opt | `x`, `w`w, `b`w?, `conv_state`:inout, `state_idx`, `num_accepted`, `cu` → `q`,`k`,`v` |
 | `gdn_kkt_solve` | `M`(range) `head_k` `chunk`/der | `k`, `beta`, `g`, `cu` → `A` |
@@ -2442,6 +2460,26 @@ sequence's tokens in order (held to libref by `r4d_selftest` and `tests/r4d_emu/
 Under `anchor`, `verify` replays the accepted prefix in a separate dispatch before the window, so
 no value row overwrites factors another is still reading. A sequence whose window or slots are
 out of bounds is skipped on the device, not refused.
+
+**`ssd_update` is Mamba-2's selective state update** (the SSD recurrence, token by token). Per token
+and head `h`, with `g = h / (heads / groups)` the head's B/C group:
+
+    dt' = softplus(dt[h] + dt_bias[h])        A = -exp(A_log[h])
+    S   = e^{dt' A} S + dt' x[h] B[g]^T        o[h] = S C[g] + D[h] x[h]
+
+It is a delta-net head without the delta: one scalar decay per head and token, no beta and no l2
+norm on B or C, and the skip term `D`, so the gdn ops cannot run it. dt is not clamped: the
+checkpoints carry `time_step_limit = (0, inf)`, which mamba_ssm's kernels and vLLM pass, while
+transformers' CPU fallback clamps at `time_step_min`, which on a real prompt binds for about one
+(token, head) pair in eight. softplus is the identity above 20, as in torch and mamba_ssm.
+`state` is f32 `[slots, heads, head_dim, d_state]`; `x` and `o` may be `[M, heads, head_dim]` or
+flat, `B` and `C` `[M, groups, d_state]` or flat, `dt` one value per (token, head). Heads read their
+group in blocks (heads `0 .. heads/groups - 1` read group 0), the mamba_ssm convention, not
+round-robin. `o` excludes the model's gated norm. The rollback contract is `kda_update`'s, in both
+forms. Under `anchor` the scratch holds, per head, the replay count and one record per window token:
+the decay `e^{dt' A}`, `u = dt' x` (`head_dim`) and `B` (`d_state`), as many as the
+`[head_dim, d_state]` block holds and at most 32 (a 64 x 128 head holds 42). The replay applies a
+record with the window's own update, so the committed state is the per-candidate one bit for bit.
 
 **Speculative rollback is part of the schema** (`spec.md` §10). The recurrent state and the conv
 window have already absorbed rejected tokens, so the state cache is a rolling window of
@@ -2639,6 +2677,7 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
 | `ple_conv` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
+| `ple_conv_bias` | `M`(range) `n` `width` `dilation` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `resid`?, `cache_idx`?, `has_init`?, `num_accepted`?, `b`w → `y` |
 | `causal_conv1d` | `M`(range) `n` `width` `dtype` | `x`, `w`w, `conv_state`:inout, `cu`, `cache_idx`?, `has_init`?, `num_accepted`? → `y` |
 
 `logits_gemm` is separate from `gemm_nt` because `lm_head` is its own access class
@@ -2870,6 +2909,15 @@ prefill's question and `num_accepted` decode's.
 The residual add is folded in because the reference is `gv + silu(conv(gvn))` and both tensors are
 `[M, hc*n]`. `resid` absent leaves the plain convolution.
 
+### `ple_conv_bias`
+
+    y[t] = resid[t] + silu( b[c] + sum_j w[c][j] * x[t - (width-1-j)*dilation] )
+
+`ple_conv` with `b`, a per-channel bias inside the activation, before `y`. At dilation one with no
+`resid` it is Mamba-2's `conv1d` over its `[x | B | C]` channels, so the Mamba block keeps the
+window and rollback contract above. It is an op of its own, as `attn_paged_sink` is beside
+`attn_paged`, so the architectures that issue `ple_conv` keep their operand list.
+
 ### `causal_conv1d`
 
     y[t] = sum_j w[c][j] * x[t - (width-1-j)]
@@ -2903,7 +2951,7 @@ resolutions of one op. The one exception is `sample_chain` (below).
 | `sample_pick` | `M`(range) `n_cand` | `cand_idx`, `cand_val`, `params` → `token` |
 | `sample_argmax` | `M`(range) `n_vocab` | `logits`, `params` → `token` |
 | `sample_merge_topk` | `M`(range) `n_cand` | `gathered`, `params` → `cand_idx`, `cand_val` |
-| `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params` → `stats` |
+| `sample_logprobs` | `M`(range) `n_vocab` `k` `vocab_off`/opt | `logits`, `params`? → `stats` |
 | `mtp_couple_propose` | `M`(range) `n_vocab` `round` `max_rounds` | `idx`:inout, `val`, `seq_ids`, `draw` → `state`:inout |
 | `mtp_couple_verify` | `M`(range) `n_cand` `n_vocab` | `cand_idx`, `cand_val`, `params`, `state` → `token`:inout |
 | `dflash_couple_propose` | `M`(range) `steps` `top_k` `rank` `n_vocab` `anchor_stride` `max_rounds` `q_temp`:f64/opt | `cand`, `unary`, `hp`?, `anchor`, `pred`w, `succ`w, `seq_ids`, `draw`, `tokens`:inout → `state`:inout |
@@ -2961,7 +3009,8 @@ llama.cpp's: 0 turns the stage off for the row, and a negative value takes the w
 
 `sample_logprobs` serves an OpenAI `logprobs` field or llama-server's `n_probs`. It runs on the raw
 logits, before any stage has touched them, and only for a row whose flags carry `RAD_SP_LOGPROBS`;
-other rows are not written. `stats` is `[M, 2 + 2k]` f32: the row's maximum, the sum of
+other rows are not written. Without `params` every row is written (a drafter's candidate logprobs,
+`lili_cand`). `stats` is `[M, 2 + 2k]` f32: the row's maximum, the sum of
 `exp(l - max)` over it, and its `k` largest as (id, logit) pairs, descending, ties to the lower id,
 the id written as a float (exact below 2^24) and global under a split vocabulary (`vocab_off`
 added). A slot past the vocabulary is id -1, logit -infinity. `k` is geometry, the one width every
@@ -3032,7 +3081,7 @@ order, not a slow one.
 | `dsa_pool` | `M`(range) `n` `ratio` `dtype` `block_size`/opt | `kg`, `ape`w → `q`, `scale`; `page`?, `cache`:inout? |
 | `dsa_query` | `M`(range) `n` `dtype` | `x` → `q`, `scale` |
 | `dsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` `row_part`/opt | `q`, `q_scale`, `gate`, `k`, `k_scale`?, `bt`, `cu`, `nc` → `score`, `cu_part`? |
-| `mla_attn` | `M`(range) `latent_dim` `heads` `blocks` `block_size` `scale`:f64 `dtype` | `q`, `kv`, `bt`, `length` → `out` |
+| `mla_attn` | `M`(range) `latent_dim` `heads` `blocks` `block_size` `scale`:f64 `dtype` `kv_dtype`/opt | `q`, `kv`, `bt`, `length` → `out` |
 | `mla_attn_paged` | `M`(range) `heads` `latent_dim` `rope_dim` `block_size` `scale`:f64 `dtype` | `q`, `q_rope`?, `kv`, `block_table`, `seqused`, `cu_seqlens`, `gate`? → `out` |
 | `mla_project` | `M`(range) `heads` `head_dim` `latent_dim` `mode` `dtype` | `a`, `b`w → `y` |
 | `qsa_score` | `M`(range) `n` `heads` `blocks` `seqs` `dtype` | `q`, `bk`, `bt`, `cu`, `nc` → `score` |
@@ -3358,7 +3407,9 @@ fold only after each head's ReLU.
 the tail) and is the causal bound: no slot at or past it is read. A missing or out-of-range page
 contributes nothing, and a row with no visible key outputs zero. The softmax is f32 and `out` is
 rounded once. `scale` is positive and finite and comes from the original query/key head width,
-not the latent width (GLM: `1/sqrt(256)` against a latent of 512).
+not the latent width (GLM: `1/sqrt(256)` against a latent of 512). `kv_dtype`, when given, is the
+cache's dtype and may differ from `dtype`: `fp8_e4m3` is a cache `kv_store` wrote at its default
+descale of 1, so each code is read as the value itself.
 
 libr4d has three `mla_attn` rows, all at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
 matrix row, `mla_attn_matrix_bf16`, ranks above the wave row and takes heads in multiples of 8: the
@@ -3385,6 +3436,11 @@ runs the matrix row's kernel instead. It also takes multiples of 32 heads (two g
 workgroup), which no constraint routes to it. GLM-5.3 splits a prefill's MLA by rows under tensor
 parallelism, so each rank holds all 64 heads of its rows (ARCHITECTURES.md, `glm5next`).
 
+Each of the three has an E4M3-cache twin (`mla_attn_fp8kv`, `mla_attn_matrix_fp8kv`,
+`mla_attn_rows_fp8kv`) on the same constraints plus `kv_dtype` `fp8_e4m3`, ranked above all three
+bf16 rows and in their order. The kernels are the bf16 rows' with the key load decoding E4M3:
+every E4M3 value is a bf16, so the decoded tile is exact and the rest of the arithmetic is the bf16
+instance's. The bf16 rows state no `kv_dtype` and their launchers refuse an E4M3 cache.
 `mla_attn_paged` is the dense, causal form for a model whose MLA keeps a rotary part beside the
 latent (Ling-3.0: latent 512, rotary 64, every key visible). A token's cache row is the normed
 latent followed by the rotated key part, `latent_dim + rope_dim` wide; it is stored as one KV head
@@ -3503,6 +3559,42 @@ the draft logits, decoded greedily, with the predecessor read after the previous
 inside one workgroup. Written literally it is `steps` full-vocabulary `[rank, n_vocab]` matrix
 products; through this operand it is a codebook gather. The only approximation is the top-K
 candidate set, which can cost acceptance and nothing else.
+
+### LiLiCorr
+
+| op | params | operands |
+|---|---|---|
+| `lili_cand` | `M`(range) `k` `world` `steps` `n` `dtype` `eps`:f64/opt `row_k`/opt | `stats`, `pas`, `ln_w`w, `ln_b`w, `up_w`w, `up_b`w, `slot`w, `rank`w → `cand`, `feat`, `base` |
+| `lili_attn` | `M`(range) `steps` `k` `n_head` `head_dim` `dtype` `scale`:f64/opt | `qkv`, `rel`w, `same`w → `out` |
+| `lili_factor` | `M`(range) `L` `n` `dtype` | `h`, `a` → `y` |
+| `lili_walk` | `M`(range) `steps` `k` `n` `dtype` `eps`:f64/opt `scale`:f64/opt | `edges`, `aout`, `cand` → `tokens`, `scores`? |
+
+LiLiCorr (Nemotron-3.5-Bolt's drafter) is a DFlash2 backbone whose head is a candidate correlator:
+each draft position keeps the target head's top-k, and a small transformer over all positions'
+candidates scores the edges between consecutive positions. A sequence's lattice is `steps` positions
+of `k` candidates, row `s * k + j`, the sequences one after another.
+
+**`lili_cand`** reads `stats` `[M, world * (2 + 2 row_k)]` f32, each rank's `sample_logprobs` row
+row-interleaved (`row_k` >= `k` pairs, by default `k`: a caller widens a rank's row to whole 16-byte
+words for the all-gather, 9 pairs where it keeps 8), and merges them as one row would be read: the log-normaliser from the maxima and
+the rescaled sums, the `k` largest pairs by value, ties to the lower id. `cand` `[M, k]` i32 holds
+those ids. With `lp_j = logit_j - lse`, row `m * k + j` of `feat` is
+`silu(up_w · layernorm([lp_j, exp lp_j, lp_j - lp_0, j/(k-1), j == 0]; ln_w, ln_b, eps) + up_b)`
+and of `base` `pas[m] + slot[m % steps] + rank[j]`: the lattice row's additive part, to which the
+token and feature projections are added by their GEMMs' residual operand.
+
+**`lili_attn`** is attention within each lattice, every row seeing every row: `qkv` is
+`[M, 3 * n_head * head_dim]` as q | k | v, and the score is
+`q_i · k_j * scale + rel[h][s_i - s_j + steps] + (s_i == s_j ? same[h] : 0)` with `s_i = i / k`.
+
+**`lili_factor`** writes `[h_i | a_s | h_i * a_s]`, `s = i / L`: a lattice row beside its sequence's
+anchor and their product, the input of the factor projection `W [x, a, x * a] + b`.
+
+**`lili_walk`** normalises each candidate's outgoing and incoming vector (`edges`, `[out | in]`) and
+the anchor's outgoing one (`aout`) as `v / max(|v|, eps)`, scores `start[j] = scale * aout · in[0][j]`
+and `pair[s][i][j] = scale * out[s][i] · in[s + 1][j]`, and walks greedily from the start, the first
+index winning a tie: `tokens[m][s] = cand[m * steps + s][p_s]`. `scores` `[M, steps, k, k]` is the
+score tensor vLLM builds (row 0 the start for every `i`), for checking.
 
 ### `mtp_enter`
 
