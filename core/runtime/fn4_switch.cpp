@@ -23,9 +23,13 @@ const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_G
                                          "RADIANCE_FN4_HC_FUSEDOWN", "RADIANCE_FN4_HC_NORMWAVE",
                                          nullptr };
 
-int env_on(const char* k) {
+/* the value a switch starts with: unset / empty / 0 -> 0, a number > 1 as given (hc_fusedown's form,
+ * hc_normwave's row floor), anything else 1 -- as the plugins read the same variables */
+int env_val(const char* k) {
     const char* v = k ? std::getenv(k) : nullptr;
-    return (v && *v && *v != '0') ? 1 : 0;
+    if (!(v && *v && *v != '0')) return 0;
+    const int n = std::atoi(v);
+    return n > 1 ? n : 1;
 }
 
 struct State {
@@ -42,7 +46,7 @@ struct State {
     std::vector<int (*)(const char*, int)> hooks;
     State() {
         for (int i = 0; i < kSwitches; ++i) {
-            val[i].store(i == kDraftAdaptive ? -1 : env_on(kEnv[i]), std::memory_order_relaxed);
+            val[i].store(i == kDraftAdaptive ? -1 : env_val(kEnv[i]), std::memory_order_relaxed);
             want[i] = 0;
             pend[i] = false;
         }
@@ -112,8 +116,11 @@ bool request(const std::string& name, int v, std::string* err) {
         if (err) *err = "unknown switch '" + name + "'";
         return false;
     }
-    if (v < (i == kDraftAdaptive ? -1 : 0) || v > 1) {
-        if (err) *err = std::string(kNames[i]) + " takes 0 or 1" + (i == kDraftAdaptive ? " (or -1)" : "");
+    /* hc_fusedown 0 / 1 / 2 (the tail form), hc_normwave 0 / 1 / N >= 2 (from N rows), the rest 0 / 1 */
+    const int lo = i == kDraftAdaptive ? -1 : 0;
+    const int hi = i == kHcFuseDown ? 2 : i == kHcNormWave ? 4096 : 1;
+    if (v < lo || v > hi) {
+        if (err) *err = std::string(kNames[i]) + " takes " + std::to_string(lo) + ".." + std::to_string(hi);
         return false;
     }
     State& s = st();

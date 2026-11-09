@@ -10,7 +10,9 @@
  *   gather_inv      architecture plugin (rad_fn4_switch): the fused gather inverse RADIANCE_FN4_GATHER_INV
  *                   -- runtime changes need RADIANCE_FN4_SWITCHABLE=1 at start (both paths declared)
  *   hc_fusedown     libr4d (rad_fn4_switch): hc_read's folded down reduce          RADIANCE_FN4_HC_FUSEDOWN
+ *                   -- 1 the first tail, 2 the low-register tail (v2)
  *   hc_normwave     libr4d (rad_fn4_switch): hc_read's wave norm scales            RADIANCE_FN4_HC_NORMWAVE
+ *                   -- 1 at every row count, N >= 2 from N rows
  *   draft_adaptive  scheduler: --draft-window adaptive (1) or fixed (0); -1 = the configured window
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair

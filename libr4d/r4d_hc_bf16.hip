@@ -3203,6 +3203,97 @@ void r4dchain_hc_down_tiled_fr(const unsigned short* __restrict__ h, const float
     r4d_chain_done();
 }
 
+/* fn4 F1a v2: the same reduce with few registers, so the kernel keeps the plain down product's
+ * occupancy (the first tail's 64 scalar loads in flight took the kernel to 226 VGPRs, 6 waves a SIMD
+ * against 16). A thread owns quads of four consecutive columns (16-byte loads; the caller checks
+ * ncol % 4 == 0 and a 16-byte-aligned plane) and reads four partials of each at a time. Every output
+ * still adds z ascending from 0.0f, one add per partial -- hc_down_reduce's sequence -- so the bytes
+ * are the pair's. */
+template <int RT, int NT>
+__device__ __forceinline__ void hc_down_fold_reduce_tail_v2(const float* part, unsigned short* dout,
+                                                            unsigned short* inj, unsigned int* ctr,
+                                                            long rows, long lr, long ncol, long irow,
+                                                            float inv_hc) {
+    const long r0 = (long)blockIdx.y * RT, c0 = (long)blockIdx.x * NT;
+    if (r0 >= rows || c0 >= ncol) return;
+    const int ks = (int)gridDim.z;
+    __threadfence();
+    __syncthreads();
+    __shared__ unsigned int s_arrived2;
+    const unsigned slot = blockIdx.y * gridDim.x + blockIdx.x;
+    if (threadIdx.x == 0)
+        s_arrived2 = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL,
+                                            __HIP_MEMORY_SCOPE_AGENT);
+    __syncthreads();
+    if (s_arrived2 + 1u != (unsigned)ks) return;
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    if (threadIdx.x == 0) __hip_atomic_store(&ctr[slot], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+    const long nr = (rows - r0 < RT) ? rows - r0 : RT;
+    const long nc = (ncol - c0 < NT) ? ncol - c0 : NT;        /* a multiple of four */
+    const int  nq = (int)(nc / 4);
+    const long nquads = nr * nq;
+    const unsigned tot4 = (unsigned)(rows * ncol / 4);          /* one partial plane, in quads */
+    const float4* P = (const float4*)part;
+    for (long q = threadIdx.x; q < nquads; q += kThreads) {
+        const long rr = q / nq, cq = q - rr * nq;
+        const long r = r0 + rr, col = c0 + 4 * cq;
+        const unsigned at = (unsigned)((r * ncol + col) / 4);
+        float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        int z = 0;
+        for (; z + 4 <= ks; z += 4) {
+            const float4 a = P[at + (unsigned)(z + 0) * tot4];
+            const float4 b = P[at + (unsigned)(z + 1) * tot4];
+            const float4 c = P[at + (unsigned)(z + 2) * tot4];
+            const float4 d = P[at + (unsigned)(z + 3) * tot4];
+            s.x += a.x; s.x += b.x; s.x += c.x; s.x += d.x;
+            s.y += a.y; s.y += b.y; s.y += c.y; s.y += d.y;
+            s.z += a.z; s.z += b.z; s.z += c.z; s.z += d.z;
+            s.w += a.w; s.w += b.w; s.w += c.w; s.w += d.w;
+        }
+        for (; z < ks; ++z) {
+            const float4 a = P[at + (unsigned)z * tot4];
+            s.x += a.x; s.y += a.y; s.z += a.z; s.w += a.w;
+        }
+        const float sv[4] = { s.x, s.y, s.z, s.w };
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const long cc = col + e;
+            if (cc < lr) dout[r * lr + cc] = f2bf(siluf_(sv[e] * inv_hc));
+            else         inj[r * irow + (cc - lr)] = f2bf(2.0f * sigmoidf_(sv[e] * inv_hc));
+        }
+    }
+}
+
+template <int RT, int NT, bool F8>
+__global__ __launch_bounds__(kThreads)
+void hc_down_tiled_fr2_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                              const void* __restrict__ downv, long dld,
+                              const float* __restrict__ scalein,
+                              const unsigned short* __restrict__ injw,
+                              unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                              float* __restrict__ part,
+                              long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
+                              long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) {
+    hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
+    hc_down_fold_reduce_tail_v2<RT, NT>(part, dout, inj, ctr, rows, lr, ncol, irow, inv_hc);
+}
+template <int RT, int NT, bool F8>
+__global__ __launch_bounds__(kThreads)
+void r4dchain_hc_down_tiled_fr2(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                                const void* __restrict__ downv, long dld,
+                                const float* __restrict__ scalein,
+                                const unsigned short* __restrict__ injw,
+                                unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                                float* __restrict__ part,
+                                long rows, long n, int hc, long lr, long ncol, long hrow, long irow,
+                                long kc, float wadd, unsigned int* __restrict__ ctr, float inv_hc) {
+    r4d_chain_wait();
+    hc_down_tiled_kernel_body<RT, NT, F8>(h, w, downv, dld, scalein, injw, dout, inj, part, rows, n, hc, lr, ncol, hrow, irow, kc, wadd);
+    hc_down_fold_reduce_tail_v2<RT, NT>(part, dout, inj, ctr, rows, lr, ncol, irow, inv_hc);
+    r4d_chain_done();
+}
+
 /* The prefill tile: rows, down-product columns per workgroup and up-product channels per
  * workgroup. 112 columns is three tiles over 320 + 4, the fewest that fit the 128-row A tile and
  * the B tile in LDS twice per CU; faster than 64 and 128 at 129 to 4096 rows. */
@@ -3218,16 +3309,19 @@ static int g_hc_prefill_form = 0;
  * RADIANCE_FN4_HC_FUSEDOWN is set and not 0; r4d_hc_read_fuse_down pins it for r4d_selftest.
  * -1 until the environment is read. */
 static std::atomic<int> g_hc_fuse_down{-1};
-static bool hc_fuse_down() {
+/* 0 off, 1 the first tail (hc_down_fold_reduce_tail, 226 VGPRs: 6 waves a SIMD), 2 the low-register
+ * tail (hc_down_fold_reduce_tail_v2, 16-byte loads of four columns, four partials at a time). The
+ * environment names the form (a bare "1" is the first). */
+static int hc_fuse_down() {
     int v = g_hc_fuse_down.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_FUSEDOWN");
-        const int on = (e && *e && *e != '0') ? 1 : 0;
+        const int on = (e && *e && *e != '0') ? (std::atoi(e) == 2 ? 2 : 1) : 0;
         int want = -1;
         g_hc_fuse_down.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_fuse_down.load(std::memory_order_relaxed);
     }
-    return v == 1;
+    return v;
 }
 
 /* fn4 F1n: the decode tiles' norm scales from hc_pf2_prep_kernel's scale blocks (one wave per
@@ -3236,16 +3330,18 @@ static bool hc_fuse_down() {
  * dependent 2-byte loads a thread measured 18.0 us at 33-64 rows against 2.0 us at <= 32 (115,
  * c16 stamps). RADIANCE_FN4_HC_NORMWAVE set and not 0; r4d_hc_read_norm_wave pins it. */
 static std::atomic<int> g_hc_norm_wave{-1};
-static bool hc_norm_wave() {
+/* 0 off, 1 at every row count, N >= 2 from N rows (the stock kernel below: 2.0 us at <= 32 rows,
+ * nothing to win there). The environment takes the same number. */
+static bool hc_norm_wave(long rows) {
     int v = g_hc_norm_wave.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_NORMWAVE");
-        const int on = (e && *e && *e != '0') ? 1 : 0;
+        const int on = (e && *e && *e != '0') ? (std::atoi(e) > 1 ? std::atoi(e) : 1) : 0;
         int want = -1;
         g_hc_norm_wave.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_norm_wave.load(std::memory_order_relaxed);
     }
-    return v == 1;
+    return v == 1 || (v >= 2 && rows >= v);
 }
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
@@ -5211,15 +5307,17 @@ static inline void hc_down_tiled_fr_launch(int rt, bool f8, const unsigned short
                                            unsigned short* dbuf, unsigned short* inj, float* part,
                                            long rows, long n, int hc, long lr, long ncol, long hrow,
                                            long irow, long kc, float wadd, unsigned int* ctr,
-                                           float inv_hc, RadStream s) {
+                                           float inv_hc, bool v2, RadStream s) {
     const long HN = (long)hc * n;
     const dim3 gd((unsigned)((ncol + kTNT - 1) / kTNT), (unsigned)((rows + rt - 1) / rt),
                   (unsigned)((HN + kc - 1) / kc));
     /* Through r4d_emit, so r4d_record_dispatches sees the folded form (the pair launches through
      * hipLaunchKernelGGL, which it does not record). */
 #define HC_DOWN_FR_CASE(RT_, F8_)                                                                \
-    (void)R4D_EMIT(s, (g_r4d_chain_arg ? &r4dchain_hc_down_tiled_fr<RT_, kTNT, F8_>              \
-                                       : &hc_down_tiled_fr_kernel<RT_, kTNT, F8_>), gd, dim3(kThreads), 0, \
+    (void)R4D_EMIT(s, (v2 ? (g_r4d_chain_arg ? &r4dchain_hc_down_tiled_fr2<RT_, kTNT, F8_>        \
+                                             : &hc_down_tiled_fr2_kernel<RT_, kTNT, F8_>)         \
+                          : (g_r4d_chain_arg ? &r4dchain_hc_down_tiled_fr<RT_, kTNT, F8_>         \
+                                             : &hc_down_tiled_fr_kernel<RT_, kTNT, F8_>)), gd, dim3(kThreads), 0, \
                    h, w, down, dld, scale, injw, dbuf, inj, part, rows, n,                       \
                    hc, lr, ncol, hrow, irow, kc, wadd, ctr, inv_hc)
     switch (rt) {
@@ -5791,7 +5889,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
          * (row, s) through hc_pf2_prep_kernel's scale blocks alone -- a grid of exactly nnb blocks,
          * so no block reaches its plane loop -- where its 16-byte loads fit (n a multiple of 256,
          * rows 8-aligned) and nothing is chained. Through r4d_emit, so r4d_record_dispatches sees it. */
-        if (hc_norm_wave() && !g_r4d_chain_arg && (n % kThreads) == 0 && (hrow % 8) == 0
+        if (hc_norm_wave((long)rows) && !g_r4d_chain_arg && (n % kThreads) == 0 && (hrow % 8) == 0
             && (((uintptr_t)h->data & 15u) == 0u)) {
             const long nnb = ((long)rows * hc + kWaves - 1) / kWaves;
             (void)R4D_EMIT(s, &hc_pf2_prep_kernel, dim3((unsigned)nnb), dim3(kThreads), 0,
@@ -5808,7 +5906,10 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 
         /* fn4 F1a: the reduce folded into the down product's launch (off by default). */
         unsigned int* dctr = nullptr;
-        if (ks > 1 && !wdown && hc_fuse_down()
+        const int fd_form = hc_fuse_down();
+        /* the v2 tail's 16-byte loads need 4-column rows and a 16-byte-aligned partial plane */
+        const bool fd_v2 = fd_form == 2 && (ncol % 4) == 0 && part && (((uintptr_t)part & 15u) == 0u);
+        if (ks > 1 && !wdown && (fd_form == 1 || fd_v2)
             && ((ncol + kTNT - 1) / kTNT) * nrt <= (long)kMaxDownCtr)
             dctr = hc_down_ctr(s);
         if (wdown)
@@ -5824,7 +5925,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                     fold ? (const unsigned short*)injw->data : nullptr,
                                     dbuf, fold ? (unsigned short*)inj->data : nullptr, part,
                                     (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow,
-                                    (long)irow, kc, wadd, dctr, 1.0f / (float)hc, s);
+                                    (long)irow, kc, wadd, dctr, 1.0f / (float)hc, fd_v2, s);
         else
             hc_down_tiled_launch(rt, f8, (const unsigned short*)h->data, (const float*)w->data,
                                  down->data, (long)dld, scale,
@@ -6062,13 +6163,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
 extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
-extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on ? 1 : 0, std::memory_order_relaxed); }
-extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on ? 1 : 0, std::memory_order_relaxed); }
+extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
+extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
  * parked): hc_read's two forms. 1 = applied, 0 = not a libr4d switch. */
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!name) return 0;
-    if (!std::strcmp(name, "hc_fusedown")) { g_hc_fuse_down.store(value ? 1 : 0, std::memory_order_relaxed); return 1; }
-    if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value ? 1 : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "hc_fusedown")) { g_hc_fuse_down.store(value < 0 ? 0 : (value > 2 ? 2 : value), std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     return 0;
 }

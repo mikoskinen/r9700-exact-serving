@@ -20675,11 +20675,16 @@ static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) 
         if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
     }
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; };
-    Out out[5];   /* the pair; the folded form twice; the wave norm alone; both */
+    /* the pair; the folded form twice; the wave norm alone; both; the low-register tail (v2) twice;
+     * the wave norm from 33 rows */
+    constexpr int kRuns = 8;
+    Out out[kRuns];
+    static const int kFuse[kRuns] = { 0, 1, 1, 0, 1, 2, 2, 0 };
+    static const int kWave[kRuns] = { 0, 0, 0, 1, 1, 0, 0, 33 };
     if (pf_pin) pl.pin_hc(pf_pin);
-    for (int run = 0; run < 5; ++run) {
-        pl.fuse_hc_down(run == 1 || run == 2 || run == 4 ? 1 : 0);
-        pl.norm_hc_wave(run >= 3 ? 1 : 0);
+    for (int run = 0; run < kRuns; ++run) {
+        pl.fuse_hc_down(kFuse[run]);
+        pl.norm_hc_wave(kWave[run]);
         st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
         st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
         if (a.scratch) st_memset(a.scratch, 0xa5, (size_t)a.scratch_bytes);
@@ -20707,9 +20712,10 @@ static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) 
     if (pf_pin) pl.pin_hc(0);
     (void)hipStreamDestroy(hs);
     std::string bad;
-    static const char* const kRun[5] = { "", " (folded)", " (folded again)", " (wave norm)",
-                                         " (folded + wave norm)" };
-    for (int run = 1; run < 5; ++run) {
+    static const char* const kRun[kRuns] = { "", " (folded)", " (folded again)", " (wave norm)",
+                                             " (folded + wave norm)", " (folded v2)",
+                                             " (folded v2 again)", " (wave norm from 33 rows)" };
+    for (int run = 1; run < kRuns; ++run) {
         const char* at = kRun[run];
         if (out[0].x != out[run].x)     bad += std::string(" x") + at;
         if (out[0].inj != out[run].inj) bad += std::string(" inj") + at;
@@ -20722,15 +20728,18 @@ static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) 
     const int want = fused_here ? out[0].nd + 1 : out[0].nd;
     const int wantn = wave_here ? out[0].nd + 1 : out[0].nd;
     const int wantb = want + (wantn - out[0].nd);
+    const int wantg = (wave_here && (M >= 33 || pf_pin == 1)) ? out[0].nd + 1 : out[0].nd;
     const bool count_ok = out[1].nd == want && out[2].nd == want && out[3].nd == wantn
-                          && out[4].nd == wantb;
+                          && out[4].nd == wantb && out[5].nd == want && out[6].nd == want
+                          && out[7].nd == wantg;
     int64_t nz = 0;
     for (uint8_t v : out[0].q) nz += v != 0xa5;
     ok(nm.c_str(), bad.empty() && count_ok && nz > (int64_t)qb / 2,
        !bad.empty() ? "differs in" + bad
        : !count_ok  ? fmt("%d launches unfolded, %d and %d folded (want %d), %d wave norm "
-                          "(want %d), %d both (want %d)", out[0].nd, out[1].nd, out[2].nd, want,
-                          out[3].nd, wantn, out[4].nd, wantb)
+                          "(want %d), %d both (want %d), %d / %d folded v2, %d gated wave (want %d)",
+                          out[0].nd, out[1].nd, out[2].nd, want, out[3].nd, wantn, out[4].nd, wantb,
+                          out[5].nd, out[6].nd, out[7].nd, wantg)
                     : fmt("%d and %d launches", out[0].nd, out[1].nd));
 }
 
