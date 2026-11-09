@@ -20673,6 +20673,58 @@ static void hc_write_vec_case(const Plugin& pl, int64_t M, int64_t n, int64_t ho
                           aligned ? "eight-wide form taken" : "plain form kept"));
 }
 
+/* --perfhcw M [iters]: hc_write at Qwen3.8-Flash-Next's shape (n 2560, hc 4) and M rows, the plain form
+ * and the eight-wide one (fn4 hcw), each timed as one op (warm, or cold under --cold), with the bytes
+ * it moves (y read, every stream of h read and written) as GB/s; the forms' bytes compared. */
+static void hc_write_perf(const Plugin& pl, int64_t M, int iters) {
+    const RadKernelInfo* r = find(pl, "hc_write_bf16");
+    if (!r || !pl.write_hc_vec) { skip("hc_write timing", !r ? "row absent" : "no r4d_hc_write_vec"); return; }
+    const int64_t n = 2560, hc = 4, HN = hc * n;
+    uint64_t rs = 0x2545F4914F6CDD1Dull ^ (uint64_t)M;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> h0((size_t)(M * HN)), y((size_t)(M * n)), inj((size_t)(M * hc));
+    for (auto& v : h0) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 997.0f);
+    for (auto& v : y) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 3001.0f);
+    for (auto& v : inj) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 313000.0f);
+    const size_t hb = h0.size() * 2;
+    void* d_h = dalloc(hb);
+    void* d_y = dalloc(y.size() * 2);
+    void* d_i = dalloc(inj.size() * 2);
+    if (!d_h || !d_y || !d_i) { ok("hc_write timing", false, "hipMalloc failed"); return; }
+    st_memcpy(d_y, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_i, inj.data(), inj.size() * 2, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok("hc_write timing", false, "stream"); return; }
+    std::vector<RadTensor> ts = { T(d_y, RAD_BF16, { M, n }), T(d_i, RAD_BF16, { M, hc }),
+                                  T(d_h, RAD_BF16, { M, HN }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("hc", hc), PS("dtype", "bf16") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    const double bytes = (double)M * (double)(n * 2 + 2 * HN * 2);
+    std::vector<uint8_t> once[2];
+    double us[2] = { 0.0, 0.0 };
+    for (int form = 0; form < 2; ++form) {
+        pl.write_hc_vec(form);
+        st_memcpy(d_h, h0.data(), hb, hipMemcpyHostToDevice);
+        if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) {
+            ok("hc_write timing", false, fmt("form %d launch failed", form));
+            pl.write_hc_vec(0); (void)hipStreamDestroy(hs); return;
+        }
+        once[form].resize(hb);
+        st_memcpy(once[form].data(), d_h, hb, hipMemcpyDeviceToHost);
+        us[form] = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+    }
+    pl.write_hc_vec(0);
+    (void)hipStreamDestroy(hs);
+    std::printf("hc_write n=2560 hc=4 M=%lld (%.2f MB a call)%s: plain %.2f us (%.0f GB/s), eight-wide %.2f us "
+                "(%.0f GB/s), %.3fx\n", (long long)M, bytes * 1e-6, g_cold > 0 ? " cold" : " warm",
+                us[0], bytes / us[0] * 1e-3, us[1], bytes / us[1] * 1e-3, us[0] / us[1]);
+    ok(fmt("hc_write at M=%lld: the eight-wide form's bytes equal the plain form's (one call)", (long long)M).c_str(),
+       once[0] == once[1]);
+}
+
 static void hc_fuse_down_case(const Plugin& pl, int64_t M, bool i8, int pf_pin) {
     const bool fused_here = (M > 16 && M <= 64) || pf_pin == 1;
     const bool wave_here  = M > 16;     /* the tiled path's norm launch (fn4 F1n) */
@@ -34599,6 +34651,8 @@ static void usage(void) {
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
                 "             rows -- at one shape, each with its TFLOP/s.\n"
                 "  --perfw2 N K M [iters]:  the int2 DFlash2 draft head at every variant it has.\n"
+                "  --perfhcw M [iters]:  hc_write at Qwen3.8-Flash-Next's shape and M rows, the plain\n"
+                "             and the eight-wide form (fn4 hcw) timed as one op each, GB/s, bytes compared.\n"
                 "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
                 "             prefill-tile form that serves M (the wide kernels at the wide tile,\n"
                 "             PF2 from M=512) compared byte for byte and timed as one op each,\n"
@@ -34726,6 +34780,8 @@ int main(int argc, char** argv) {
     const char* mla_fill = "prefill";
     int qsa_it = 200;
     long long hc_m = 0;
+    long long hcw_m = 0;
+    int hcw_it = 50;
     int hc_it = 20;
     long long moe_m = 0, moe_e = 512, moe_k = 10, hy_m = 0;
     int hy_it = 100;
@@ -34995,6 +35051,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             lg_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) lg_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcw")) {
+            /* The gated residual's write at M rows, both forms (fn4 hcw). */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcw_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcw_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhc")) {
             /* The gated residual's read at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -35091,6 +35152,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("video sparse attention timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcw_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_write_perf(pl, hcw_m, hcw_it);
+        dfree_all();
+#else
+        skip("gated residual write timing", "built without HIP");
 #endif
         return 0;
     }
