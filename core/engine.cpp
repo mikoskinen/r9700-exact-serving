@@ -454,8 +454,9 @@ static std::string fn4_rank_cpus(int index) {
 }
 static void fn4_place_thread(const char* name, const std::string& cpus) {
     const char* nv = std::getenv("RADIANCE_THREAD_NAMES");
-    const bool any = (nv && *nv && *nv != '0') || std::getenv("RADIANCE_RANK_CPUS") ||
-                     std::getenv("RADIANCE_STEP_CPUS");
+    const char* rv = std::getenv("RADIANCE_RANK_CPUS");
+    const char* sv = std::getenv("RADIANCE_STEP_CPUS");
+    const bool any = (nv && *nv && *nv != '0') || (rv && *rv) || (sv && *sv);   /* empty = unset */
     if (!any) return;
     (void)pthread_setname_np(pthread_self(), name);
     if (cpus.empty()) {
