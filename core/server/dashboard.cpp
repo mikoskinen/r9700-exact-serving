@@ -13,6 +13,7 @@
  * collapsing while the pooled acceptance rate stays plausible.
  */
 #include "server.h"
+#include "../runtime/fn4_switch.h"
 #include "oai.h"
 
 #include "rad_internal.h"
@@ -86,6 +87,40 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
     metrics_.observe_http(200);
     return HttpResponse::json_body(
         200, deps_.control_vector.json ? deps_.control_vector.json() : std::string("{}"));
+}
+
+/* ------------------------------------------------------------------ /admin/fn4
+ *
+ * fn4 (9.11.2026, test builds): GET reports the runtime switches (runtime/fn4_switch.h); POST takes
+ * {"<switch>": 0|1, ...} (draft_adaptive also -1), queues them for the next step release and answers
+ * with the state, the queued values under "pending". Loopback only without --api-key, as the
+ * control vector. */
+HttpResponse Server::handle_fn4(const HttpRequest& req) {
+    if (opt_.api_key.empty() && !local_operator(req)) {
+        ApiError e;
+        e.status  = 403;
+        e.type    = "permission_error";
+        e.message = "without --api-key the fn4 switches are changed only from a loopback client";
+        return error_response(e, req.peer);
+    }
+    if (req.method == "POST") {
+        bool over = false, deep = false;
+        json body = parse_json_bounded(req.body.empty() ? "{}" : req.body, 0, &over, &deep);
+        if (body.is_discarded() || !body.is_object() || over || deep)
+            return error_response(err_bad("body", "expected {\"<switch>\": 0|1, ...}"), req.peer);
+        for (auto it = body.begin(); it != body.end(); ++it) {
+            int v = 0;
+            if (it->is_boolean())               v = it->get<bool>() ? 1 : 0;
+            else if (it->is_number_integer())   v = it->get<int>();
+            else return error_response(err_bad(it.key(), "0, 1 or a boolean"), req.peer);
+            std::string why;
+            if (!fn4::request(it.key(), v, &why)) return error_response(err_bad(it.key(), why), req.peer);
+        }
+        RAD_INFO("fn4: switches %s queued by an admin request%s", body.dump().c_str(),
+                 req.peer.empty() ? "" : (" from " + req.peer).c_str());
+    }
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, fn4::state_json());
 }
 
 /* ------------------------------------------------------------------ /sessions

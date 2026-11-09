@@ -1,0 +1,49 @@
+/* fn4_switch.h -- runtime switches for in-process A/B blocks (fn4, 9.11.2026; test builds only).
+ *
+ * A switch is set from the environment at start (RADIANCE_FN4_*), and may be changed while the server
+ * runs through POST /admin/fn4. A change is queued by the server thread and applied by the scheduler
+ * thread at the next step release (Engine::prepare_release), while every rank thread is parked, so all
+ * ranks issue each step under one setting. Every applied change advances an epoch that Ctx::pass_key
+ * mixes in, so no recorded pass from before the change is played after it.
+ *
+ *   no_route        core (Ctx::route_report): no routing reports                  RADIANCE_FN4_NO_ROUTE
+ *   gather_inv      architecture plugin (rad_fn4_switch): the fused gather inverse RADIANCE_FN4_GATHER_INV
+ *                   -- runtime changes need RADIANCE_FN4_SWITCHABLE=1 at start (both paths declared)
+ *   hc_fusedown     libr4d (rad_fn4_switch): hc_read's folded down reduce          RADIANCE_FN4_HC_FUSEDOWN
+ *   hc_normwave     libr4d (rad_fn4_switch): hc_read's wave norm scales            RADIANCE_FN4_HC_NORMWAVE
+ *   draft_adaptive  scheduler: --draft-window adaptive (1) or fixed (0); -1 = the configured window
+ *
+ * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair
+ * re-records exactly as an A/B pair does.
+ *
+ * A plugin takes part by exporting  extern "C" int rad_fn4_switch(const char* name, int value):
+ * 1 = applied, 0 = not its switch, < 0 = refused. */
+#ifndef RAD_RUNTIME_FN4_SWITCH_H
+#define RAD_RUNTIME_FN4_SWITCH_H
+
+#include <cstdint>
+#include <string>
+
+namespace rad {
+namespace fn4 {
+
+enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kSwitches };
+
+const char* switch_name(int i);
+int  switch_index(const std::string& name);   /* -1 when unknown */
+int  value(int i);                            /* the applied value */
+bool no_route();
+uint64_t epoch();                             /* applied changes so far */
+
+/* Server thread: queue a value; false (with the reason) for an unknown switch or a bad value. */
+bool request(const std::string& name, int value, std::string* err);
+/* Scheduler thread, every rank thread parked: apply what is queued. Returns true when anything
+ * changed; *draft_adaptive is the draft window to set (-1 when it did not change). */
+bool apply_pending(int step, int* draft_adaptive);
+/* {"switches": {...}, "pending": {...}, "epoch": n, "applied_step": n, "plugins": n} */
+std::string state_json();
+
+}  // namespace fn4
+}  // namespace rad
+
+#endif

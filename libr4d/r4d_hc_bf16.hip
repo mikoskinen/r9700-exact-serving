@@ -59,6 +59,7 @@
 #include <atomic>
 #include <type_traits>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include "r4d.h"
 #include "r4d_emit.h"
@@ -6063,3 +6064,11 @@ extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
 extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on ? 1 : 0, std::memory_order_relaxed); }
+/* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
+ * parked): hc_read's two forms. 1 = applied, 0 = not a libr4d switch. */
+extern "C" int rad_fn4_switch(const char* name, int value) {
+    if (!name) return 0;
+    if (!std::strcmp(name, "hc_fusedown")) { g_hc_fuse_down.store(value ? 1 : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value ? 1 : 0, std::memory_order_relaxed); return 1; }
+    return 0;
+}

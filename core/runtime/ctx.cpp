@@ -7,6 +7,7 @@
 #include "kvstream/stage.h"
 #include "xp_state.h"
 #include "../device/device.h"
+#include "fn4_switch.h"
 
 #include <algorithm>
 #include <cstring>
@@ -615,19 +616,8 @@ int Ctx::route_flush() {
  * aql_copy16 dispatch a routed layer, ~4 us of the card idling before it at decode) and no host
  * step between played stretches. For a placement whose experts never move (--placement all_vram):
  * the reports feed only the heat engine, the mover and the file stager's trigger. Unset: as before. */
-static bool fn4_no_route() {
-    static const bool on = [] {
-        const char* v = std::getenv("RADIANCE_FN4_NO_ROUTE");
-        const bool o = v && *v && *v != '0';
-        if (o) RAD_INFO("RADIANCE_FN4_NO_ROUTE: no routing reports (the heat engine, mover and file stager "
-                        "get no histograms; for --placement all_vram)");
-        return o;
-    }();
-    return on;
-}
-
 int Ctx::route_report(int layer, const RadRouting* r) {
-    if (fn4_no_route()) return RAD_OK;
+    if (fn4::no_route()) return RAD_OK;   /* fn4 F2b (fn4_switch.h) */
     if (rec_ && r) {
         tape_cut();
         TapeStep st;
@@ -1048,6 +1038,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix(geometry);
     }
     mix((uint64_t)level_);
+    mix(fn4::epoch());   /* fn4: a runtime switch change records new passes (fn4_switch.h) */
     mix(dense_epoch_);
     mix(domain_epoch_.load(std::memory_order_relaxed));
     ptr(arena_.base());

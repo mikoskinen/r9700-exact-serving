@@ -50,6 +50,13 @@ void Scheduler::queue_erase(std::vector<int32_t>& q, int32_t slot) {
 }
 
 /* ------------------------------------------------------------------ init */
+/* fn4 (runtime/fn4_switch.h). */
+void Scheduler::set_draft_adaptive(bool on) {
+    if (!draft_.set_adaptive(on))
+        RAD_WARN("fn4: draft_adaptive=%d refused: this deployment's drafter cannot run the adaptive "
+                 "window", (int)on);
+}
+
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
                     const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo) {
     if (!kv || !pc) return RAD_E_INVAL;
@@ -168,6 +175,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
+    /* fn4: a serial or block head can run the adaptive window, asked for at start or not (the
+     * runtime switch, Scheduler::set_draft_adaptive). */
+    dp.adapt_capable = cfg.n_spec > 0 && (prog.drafter.kind == RAD_DRAFT_SERIAL ||
+                                          prog.drafter.kind == RAD_DRAFT_BLOCK) && prog.drafter.depth > 0;
     /* The adaptive window (draft.h) prices a draft by the measured cost of the step it adds to.
      * A block drafter proposes its block in one pass, but each verified draft is still a verify
      * row, which is not free on a MoE that reads each row's routed experts. So it takes the same

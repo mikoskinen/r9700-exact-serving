@@ -297,6 +297,8 @@ public:
      * its queue position and later requests are admitted around it. The engine takes the items
      * (take_encodes) and encodes them between steps, which keeps the encoder off the step path. */
     bool     encodes_pending() const;
+    /* fn4 (runtime/fn4_switch.h): the draft window between steps, from the scheduler thread. */
+    void     set_draft_adaptive(bool on);
     void     take_encodes(std::vector<std::shared_ptr<mm::Item>>* out);
     /* An encoder pass over whole segments; see BatchBuilder::build_encoder. */
     const RadBatch* build_encoder(const std::vector<BatchBuilder::EncoderPart>& parts, int step,

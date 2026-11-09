@@ -731,6 +731,9 @@ void r4d_hc_read_fuse_down(int on);
 // blocks (one wave per (row, stream)), 0 with hc_norm_scale_kernel, overriding
 // RADIANCE_FN4_HC_NORMWAVE. Bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_norm_wave(int on);
+// fn4 runtime switch hook (core runtime/fn4_switch.h): "hc_fusedown" / "hc_normwave" -> 1 applied,
+// anything else 0.
+int rad_fn4_switch(const char* name, int value);
 // Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
 // wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
 // Bit-identical; r4d_selftest compares them and --perfmla times both.

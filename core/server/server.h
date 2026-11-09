@@ -397,6 +397,7 @@ private:
      * like every other route but the health probes and the page; without a key, POST answers
      * loopback clients only. */
     HttpResponse handle_control_vector(const HttpRequest& req);
+    HttpResponse handle_fn4(const HttpRequest& req);   /* fn4: runtime switches (runtime/fn4_switch.h) */
     HttpResponse handle_session_release(const HttpRequest& req);
 
     HttpResponse error_response(const ApiError& e, const std::string& peer,

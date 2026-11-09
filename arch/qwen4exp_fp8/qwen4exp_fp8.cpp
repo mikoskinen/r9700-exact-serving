@@ -100,6 +100,12 @@
 
 namespace qwen4exp_fp8 {
 
+/* fn4 (9.11.2026): an environment switch set and not 0. */
+static bool fn4_env_on(const char* k) {
+    const char* v = std::getenv(k);
+    return v && *v && *v != '0';
+}
+
 using namespace rad::arch;
 
 struct Layer {
@@ -887,7 +893,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* fn4 F2a, RADIANCE_FN4_GATHER_INV=1: the sort's inverse slot table, so the routed gather is
      * moe_gather_inv's one launch instead of moe_gather's three (MoeFP8: router_gemm_topk_scatter_inv
      * writes it at decode, moe_scatter_inv above the fused router's rows). Unset: not declared. */
-    if (const char* fv = std::getenv("RADIANCE_FN4_GATHER_INV"); fv && *fv && *fv != '0')
+    /* RADIANCE_FN4_SWITCHABLE=1 declares it too, with both paths (MoeFP8::inv_switchable), so the
+     * runtime switch (rad_fn4_switch "gather_inv") changes nothing in the buffer plan. */
+    if (fn4_env_on("RADIANCE_FN4_GATHER_INV") || fn4_env_on("RADIANCE_FN4_SWITCHABLE"))
         m.b_einv = decl_b(b, nm.f("moe_inverse"), RAD_I32, {ER});
     m.b_egu     = decl_b(b, nm.f("moe_egu"),    g.act_dtype, {ER, 2 * m.moecfg.n_ff_exp});
     m.a_eff.x   = decl_b(b, nm.f("moe_eff"),    g.act_dtype, {ER, m.moecfg.n_ff_exp});
@@ -1179,6 +1187,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         lay.mlp.ar_out_take = lay.hc_ffn.ar_take();
         lay.mlp.hr_in = fcfg.rotate != 0;
+        lay.mlp.inv_switchable = m.b_einv && fn4_env_on("RADIANCE_FN4_SWITCHABLE");   /* fn4 F2a */
+        if (lay.mlp.inv_switchable)   /* the path the switch starts on: RADIANCE_FN4_GATHER_INV */
+            fn4_gather_inv_flag().store(fn4_env_on("RADIANCE_FN4_GATHER_INV") ? 1 : 0,
+                                        std::memory_order_relaxed);
         RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, false, false, kArNone,
                                      lay.hc_ffn.op_ar_write != 0));
         /* The write behind the block takes its gather where it can, declared after the block so
@@ -1807,6 +1819,15 @@ RAD_ARCH_PLUGIN(qwen4exp_fp8, "qwen4exp", "", "0.1.0",
                 "Qwen4-Exp (Qwen3.8-Flash-Next): hybrid Gated DeltaNet / gated attention, a gated "
                 "residual four streams wide and 512 routed experts, from a dense bf16 checkpoint "
                 "quantised ahead of time by a recipe")
+/* fn4 runtime switch (the core's runtime/fn4_switch.h, between steps, every rank parked): "gather_inv"
+ * picks MoeFP8's inverse twins when the blocks were declared switchable (RADIANCE_FN4_SWITCHABLE=1 at
+ * start); refused (-1) otherwise. */
+extern "C" int rad_fn4_switch(const char* name, int value) {
+    if (!name || std::strcmp(name, "gather_inv") != 0) return 0;
+    if (!qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SWITCHABLE")) return -1;
+    rad::arch::fn4_gather_inv_flag().store(value ? 1 : 0, std::memory_order_relaxed);
+    return 1;
+}
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch,
                                       const int32_t* used_max_h) {
     return qwen4exp_fp8::pass_key(c, batch, used_max_h);
