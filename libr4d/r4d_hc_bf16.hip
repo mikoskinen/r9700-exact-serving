@@ -3579,7 +3579,8 @@ static int hc_readv() {
 /* fn4 hc_upmix: other tiles for hc_read's up-mix, same bytes (RADIANCE_FN4_HC_UPMIX, r4d_hc_upmix,
  * rad_fn4_switch("hc_upmix")): value & 7 picks PF2's (prefill) form -- 0 stock (hc_up_mix_wide_kernel<4,
  * false, 256>), 1 RT 256 CH 16 with `h` loaded after the K loop, 2 RT 128 CH 32, 3 RT 128 CH 32 `h` after,
- * 4 RT 128 CH 16 (hc_up_mix_pf3_kernel) -- and bit 3 (8) runs the decode tiles' 33-64-row up-mix at the
+ * 4 RT 128 CH 16 (hc_up_mix_pf3_kernel), 5 the stock tile with A from L2 and N in registers (hc_up_mix_pf5_kernel)
+ * -- and bit 3 (8) runs the decode tiles' 33-64-row up-mix at the
  * 64-row tile pipelined (with hc_readv bit 0; else the 32-row tile it takes). -1 until read. */
 static std::atomic<int> g_hc_upmix{-1};
 static int hc_upmix() {
@@ -3587,7 +3588,7 @@ static int hc_upmix() {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_UPMIX");
         int on = (e && *e) ? std::atoi(e) : 0;
-        if (on < 0 || on > 15 || (on & 7) > 4) on = 0;
+        if (on < 0 || on > 15 || (on & 7) > 5) on = 0;
         int want = -1;
         g_hc_upmix.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_upmix.load(std::memory_order_relaxed);
@@ -4684,6 +4685,139 @@ void hc_up_mix_pf3_kernel(const unsigned short* __restrict__ ub, long lr_,
                     a += bf2f(f2bf(sigmoidf_(acc[mi * NTT + c * PPC + pp][e]))) * bf2f(sN[(rl * HC + c) * CH + ch]);
                 if (r < rows) x[r * xrow + i0 + ch] = f2bf(a * inv_hc);
             }
+}
+
+/* fn4 hc_upmix 5 (prefill): PF2's up product and mix with the stock tile (RT 256 rows, 16 channels of every
+ * sub-stream, two m-tiles a wave) but the CU freed: the A operand (d, 1.3 MB at 2048 rows, L2-resident) is read as
+ * WMMA fragments straight from global memory (fragGo: the same row / k layout frag() reads from LDS, rows past
+ * `rows` clamped as the stock staging clamps them), a slice ahead; only B (mix_up, 64 rows x 64 k a slice) goes
+ * through LDS, double-buffered, one barrier a slice; and N is computed per lane in registers before the K loop
+ * (each lane's 2 x 4 x 8 values, (h * scale) * (w + wadd) narrowed to bf16 as the stock sN holds them). LDS 17 KB
+ * instead of 43.5, so two or three workgroups share a CU and one's epilogue overlaps another's WMMA (133: the stock
+ * form at one workgroup a CU, 59.7 TFLOP/s, 268 GB/s). Bit-identical: each accumulator runs the same k-steps in
+ * ascending order over the same fragment values; the mix sums c ascending in the same `a += u * N` form. */
+template <int RT>
+__global__ __launch_bounds__(kThreads)
+void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
+                          const unsigned short* __restrict__ dbuf,
+                          const unsigned short* __restrict__ h, const float* __restrict__ w,
+                          const float* __restrict__ scalein,
+                          unsigned short* __restrict__ x,
+                          long rows, long n, long lr, long hrow, long xrow, float wadd) {
+    constexpr int HC = 4, CH = 16, NT = HC * CH;
+    constexpr int MW = RT / 16 / kWaves, KST = kTKT / 16;
+    static_assert(MW >= 1 && MW * 16 * kWaves == RT, "the waves cover the rows");
+    __shared__ unsigned short sB[2 * NT * kTAP];
+    (void)lr_;
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long r0 = (long)blockIdx.y * RT;
+    const long i0 = (long)blockIdx.x * CH;
+    if (r0 >= rows) return;
+    const long nsl = lr / kTKT;
+
+    /* B staging: tile row tt = tid / 8 + 32 i is sub-stream tt / CH of channel i0 + tt % CH, 8 k a thread. */
+    constexpr int kKV = kTKT / 8, kRS = kThreads / kKV, kBV = NT / kRS;
+    const int k8b = (tid % kKV) * 8, tb = tid / kKV;
+    const unsigned short* bp[kBV];
+#pragma unroll
+    for (int i = 0; i < kBV; ++i) {
+        const int  tt = tb + i * kRS;
+        const long j  = (long)(tt / CH) * n + i0 + tt % CH;
+        bp[i] = ub + j * lr + k8b;
+    }
+    uint4 pb[kBV];
+#pragma unroll
+    for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(bp[i]);
+
+    /* N for this lane's accumulator slots: rows (wave * MW + mi) * 16 + e0 + e, channel i0 + nn, every stream. */
+    const int e0 = 8 * (lane >> 4), nn = lane & 15;
+    unsigned nbf[MW][HC][4];
+#pragma unroll
+    for (int mi = 0; mi < MW; ++mi)
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            const long  j  = (long)c * n + i0 + nn;
+            const float wj = w[j] + wadd;
+            float v[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const long r = r0 + (wave * MW + mi) * 16 + e0 + e;
+                v[e] = r < rows ? bf2f(h[r * hrow + j]) * scalein[r * kHcMax + c] * wj : 0.0f;
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q) nbf[mi][c][q] = f2bf2(v[2 * q], v[2 * q + 1]);
+        }
+
+    unsigned aoff[MW];
+#pragma unroll
+    for (int mi = 0; mi < MW; ++mi)
+        aoff[mi] = rowGo((unsigned)lr, (int)(r0 + (wave * MW + mi) * 16), (int)(rows - 1), lane);
+
+    v8f acc[MW * HC];
+#pragma unroll
+    for (int c = 0; c < MW * HC; ++c) acc[c] = (v8f){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    v8bf af[KST][MW];
+#pragma unroll
+    for (int ks = 0; ks < KST; ++ks)
+#pragma unroll
+        for (int mi = 0; mi < MW; ++mi) af[ks][mi] = fragGo(dbuf, aoff[mi] + (unsigned)(ks * 16));
+#pragma unroll
+    for (int i = 0; i < kBV; ++i) *(uint4*)(sB + (tb + i * kRS) * kTAP + k8b) = pb[i];
+    {   /* the second slice's B into registers */
+        const long k1 = nsl > 1 ? kTKT : 0;
+#pragma unroll
+        for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(bp[i] + k1);
+    }
+    hc_lds_barrier();
+    for (long t = 0; t < nsl; ++t) {
+        const long tn = (t + 1 < nsl) ? t + 1 : t;
+        v8bf an[KST][MW];
+#pragma unroll
+        for (int ks = 0; ks < KST; ++ks)
+#pragma unroll
+            for (int mi = 0; mi < MW; ++mi)
+                an[ks][mi] = fragGo(dbuf, aoff[mi] + (unsigned)(tn * kTKT + ks * 16));
+        const unsigned short* const cur = sB + (t & 1) * (NT * kTAP);
+#pragma unroll
+        for (int ks = 0; ks < KST; ++ks)
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                const v8bf bf = frag(cur, kTAP, c * 16, ks * 16, lane);
+#pragma unroll
+                for (int mi = 0; mi < MW; ++mi)
+                    acc[mi * HC + c] = mma(af[ks][mi], bf, acc[mi * HC + c]);
+            }
+        /* slice t + 1's B into the other tile (its reads were slice t - 1's, before the last barrier), then
+         * slice t + 2's into registers (the last slices re-read the last, in bounds). */
+        unsigned short* const nxt = sB + ((t + 1) & 1) * (NT * kTAP);
+#pragma unroll
+        for (int i = 0; i < kBV; ++i) *(uint4*)(nxt + (tb + i * kRS) * kTAP + k8b) = pb[i];
+        const long t2 = (t + 2 < nsl) ? t + 2 : (nsl - 1);
+#pragma unroll
+        for (int i = 0; i < kBV; ++i) pb[i] = *(const uint4*)(bp[i] + t2 * kTKT);
+        hc_lds_barrier();
+#pragma unroll
+        for (int ks = 0; ks < KST; ++ks)
+#pragma unroll
+            for (int mi = 0; mi < MW; ++mi) af[ks][mi] = an[ks][mi];
+    }
+
+    const float inv_hc = 1.0f / (float)HC;
+#pragma unroll
+    for (int mi = 0; mi < MW; ++mi)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const long r = r0 + (wave * MW + mi) * 16 + e0 + e;
+            float a = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                const unsigned pk = nbf[mi][c][e >> 1];
+                const float nv = (e & 1) ? bf16w_hi(pk) : bf16w_lo(pk);
+                a += bf2f(f2bf(sigmoidf_(acc[mi * HC + c][e]))) * nv;
+            }
+            if (r < rows) x[r * xrow + i0 + nn] = f2bf(a * inv_hc);
+        }
 }
 
 /* fp8 codes of `x` at the prefill tile, plus the rotated codes: one wave per (row, 128-channel
@@ -5890,6 +6024,11 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
                        (const unsigned short*)dbuf, h, w, (const float*)scale, x, rows, n, lr,    \
                        hrow, xrow, wadd)
         switch (umv) {
+            case 5:
+                (void)R4D_EMIT(s, (&hc_up_mix_pf5_kernel<256>), dim3((unsigned)(n / 16), gy256), dim3(kThreads), 0,
+                               ubf, lr, (const unsigned short*)dbuf, h, w, (const float*)scale, x, rows, n, lr, hrow,
+                               xrow, wadd);
+                break;
             case 1:  HC_PF3(256, 16, false); break;
             case 2:  HC_PF3(128, 32, true);  break;
             case 3:  HC_PF3(128, 32, false); break;
@@ -6691,7 +6830,7 @@ extern "C" void r4d_hc_mix_ctr_release() {
         if (p) (void)hipFree(p);
     }
 }
-extern "C" void r4d_hc_upmix(int v) { g_hc_upmix.store((v < 0 || v > 15 || (v & 7) > 4) ? 0 : v, std::memory_order_relaxed); }
+extern "C" void r4d_hc_upmix(int v) { g_hc_upmix.store((v < 0 || v > 15 || (v & 7) > 5) ? 0 : v, std::memory_order_relaxed); }
 extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (m & 31), std::memory_order_relaxed); }
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
  * parked): hc_read's two forms, hc_write's eight-wide form, hc_read's faster forms (hc_readv) and the
@@ -6709,7 +6848,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ar_lanethreads")) return r4d_ar_lane_threads_set(value);
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
     if (!std::strcmp(name, "hc_upmix")) {
-        if (value < 0 || value > 15 || (value & 7) > 4) return -1;
+        if (value < 0 || value > 15 || (value & 7) > 5) return -1;
         g_hc_upmix.store(value, std::memory_order_relaxed);
         return 1;
     }

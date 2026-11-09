@@ -21065,7 +21065,7 @@ static void hc_upmix_case(const Plugin& pl, int64_t M, bool i8) {
     }
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; std::vector<const void*> fns; };
     std::vector<int> vals = { 0 };
-    if (M >= 512) { for (int v : { 1, 2, 3, 4 }) vals.push_back(v); }
+    if (M >= 512) { for (int v : { 1, 2, 3, 4, 5 }) vals.push_back(v); }
     else if (M > 32 && M <= 64) vals.push_back(8);
     else vals.push_back(8);   /* not served here: must change nothing */
     const bool here = M > 32;
@@ -21193,7 +21193,7 @@ static void hc_upmix_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     pl.norm_hc_wave(1);
     pl.readv_hc(3);
     std::vector<int> vals = { 0 };
-    if (M >= 512) { for (int v : { 1, 2, 3, 4 }) vals.push_back(v); } else vals.push_back(8);
+    if (M >= 512) { for (int v : { 1, 2, 3, 4, 5 }) vals.push_back(v); } else vals.push_back(8);
     std::printf("hc_upmix M=%lld %s%s (F1n, hc_readv 3):", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm");
     for (int v : vals) {
         pl.upmix_hc(v);
