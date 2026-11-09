@@ -28,6 +28,8 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <pthread.h>
+#include <sched.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -412,8 +414,71 @@ void Engine::xstats_close() {
     (void)xstats_->write(true);
 }
 
+/* ------------------------------------------------------------------ host thread placement (fn4)
+ *
+ * RADIANCE_RANK_CPUS="LIST0;LIST1;..." pins rank i's thread (the one that issues its card's passes)
+ * to LIST i, a CPU list as taskset reads it ("4-5,20-21"); an empty or missing entry leaves that
+ * rank unpinned. RADIANCE_STEP_CPUS="LIST" pins the step loop's thread. With either set, or with
+ * RADIANCE_THREAD_NAMES=1, the threads are named rad-rank<i> / rad-step, so a reader of
+ * /proc/<pid>/task/<tid>/comm can tell them apart. Unset: nothing is named or pinned (as before). */
+static bool fn4_parse_cpus(const std::string& list, cpu_set_t* set) {
+    CPU_ZERO(set);
+    int n = 0;
+    size_t i = 0;
+    while (i < list.size()) {
+        size_t j = list.find(',', i);
+        if (j == std::string::npos) j = list.size();
+        const std::string part = list.substr(i, j - i);
+        i = j + 1;
+        if (part.empty()) continue;
+        char* e = nullptr;
+        const long a = std::strtol(part.c_str(), &e, 10);
+        long b = a;
+        if (e && *e == '-') b = std::strtol(e + 1, &e, 10);
+        if (!e || *e || a < 0 || b < a || b >= CPU_SETSIZE) return false;
+        for (long c = a; c <= b; ++c) { CPU_SET((int)c, set); ++n; }
+    }
+    return n > 0;
+}
+static std::string fn4_rank_cpus(int index) {
+    const char* v = std::getenv("RADIANCE_RANK_CPUS");
+    if (!v || !*v) return {};
+    std::string all(v);
+    for (int k = 0; k < index; ++k) {
+        const size_t p = all.find(';');
+        if (p == std::string::npos) return {};
+        all = all.substr(p + 1);
+    }
+    const size_t p = all.find(';');
+    return p == std::string::npos ? all : all.substr(0, p);
+}
+static void fn4_place_thread(const char* name, const std::string& cpus) {
+    const char* nv = std::getenv("RADIANCE_THREAD_NAMES");
+    const bool any = (nv && *nv && *nv != '0') || std::getenv("RADIANCE_RANK_CPUS") ||
+                     std::getenv("RADIANCE_STEP_CPUS");
+    if (!any) return;
+    (void)pthread_setname_np(pthread_self(), name);
+    if (cpus.empty()) {
+        RAD_INFO("thread placement: %s unpinned (on CPU %d)", name, sched_getcpu());
+        return;
+    }
+    cpu_set_t set;
+    if (!fn4_parse_cpus(cpus, &set)) {
+        RAD_WARN("thread placement: %s: '%s' is not a CPU list; left unpinned", name, cpus.c_str());
+        return;
+    }
+    const int rc = pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    if (rc != 0) RAD_WARN("thread placement: %s: pinning to %s failed (%s)", name, cpus.c_str(), std::strerror(rc));
+    else RAD_INFO("thread placement: %s pinned to CPUs %s (now on CPU %d)", name, cpus.c_str(), sched_getcpu());
+}
+
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
+    {
+        char nm[16];
+        std::snprintf(nm, sizeof nm, "rad-rank%d", index);
+        fn4_place_thread(nm, fn4_rank_cpus(index));
+    }
     Rank& r = *ranks_[(size_t)index];
     if (r.ctx.bind_thread() < 0) {
         RAD_ERR("rank %d: could not bind its device", index);
@@ -2056,7 +2121,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
-    std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
+    std::thread stepper([this] {
+        const char* sc = std::getenv("RADIANCE_STEP_CPUS");
+        fn4_place_thread("rad-step", sc ? std::string(sc) : std::string());
+        if (gen_) gen_loop(); else step_loop();
+    });
 
     if (cfg_.kld() || cfg_.calib()) {
         print_startup_report(RAD_OK);
