@@ -1082,6 +1082,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     return bc;
 }
 
+static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& levels,
+                              const Config& cfg);   /* lever VA's RADIANCE_DEBUG_VRAM, below */
+
 int Engine::declare() {
     /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
      * the flag is turned off here, with the decision named, before anything is planned for it. */
@@ -1690,7 +1693,70 @@ int Engine::declare() {
         RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
     }
     probe_arena_levels();
+    if (!ranks_.empty()) debug_vram_report(ranks_[0]->program, ranks_[0]->arena_levels, cfg_);
     return RAD_OK;
+}
+
+/* RADIANCE_DEBUG_VRAM=1: rank 0's VRAM terms the VA levers move, in bytes, at the end of declare -- so a
+ * host start (--debug-graph, no card) shows them: the activation arena's full plan and levels with
+ * their largest transients ("arena"), the router and compressor projections' stored bytes ("bf16"),
+ * the token table the embedding placement can move ("emb"), the expert floor's spare slab and the
+ * shadow count it was sized with ("shadow"), and the expert prefetch's ring and buffers ("xpoff").
+ * Nothing here is used by the engine. */
+static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& levels, const Config& cfg) {
+    const char* d = getenv("RADIANCE_DEBUG_VRAM");
+    if (!(d && *d && std::strcmp(d, "0") != 0)) return;
+    auto top = [&](const ArenaLevel* lv) {
+        std::vector<std::pair<int64_t, size_t>> b;
+        for (size_t i = 1; i < P.buffers.size(); ++i) {
+            const BufferInfo& bi = P.buffers[i];
+            if (bi.decl.kind != RAD_BUF_TRANSIENT || bi.decl.domain == RAD_DOMAIN_HOST) continue;
+            b.emplace_back(lv ? buffer_bytes(lv->decl[i]) : bi.bytes, i);
+        }
+        std::sort(b.begin(), b.end(), [](const std::pair<int64_t, size_t>& x, const std::pair<int64_t, size_t>& y) {
+            return x.first != y.first ? x.first > y.first : x.second < y.second;
+        });
+        int64_t sum = 0;
+        for (const auto& e : b) sum += e.first;
+        std::string o = fmt("%zu transients, %lld B unshared; largest:", b.size(), (long long)sum);
+        for (size_t k = 0; k < b.size() && k < 8; ++k)
+            o += fmt(" %s %lld", P.buffers[b[k].second].name.c_str(), (long long)b[k].first);
+        return o;
+    };
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) arena: full plan %lld rows, end %lld B, fixed %lld B; %s",
+             (long long)cfg.max_tok, (long long)P.arena_bytes, (long long)P.arena_fixed_bytes, top(nullptr).c_str());
+    for (const ArenaLevel& lv : levels)
+        RAD_INFO("vram (RADIANCE_DEBUG_VRAM) arena: level %lld rows, end %lld B (%lld B below the full plan's end); %s",
+                 (long long)lv.rows, (long long)lv.end, (long long)(P.arena_bytes - lv.end), top(&lv).c_str());
+    int64_t router = 0, comp = 0, emb = 0;
+    int n_router = 0, n_comp = 0, n_emb = 0;
+    std::string emb_names;
+    for (size_t w = 1; w < P.weights.size(); ++w) {
+        const WeightInfo& wi = P.weights[w];
+        if (wi.name.find(".glm_router.weight") != std::string::npos) { router += wi.stored_bytes; ++n_router; }
+        if (wi.name.find("attn_compressor_kvg") != std::string::npos) { comp += wi.stored_bytes; ++n_comp; }
+        if (is_embedding_table(P, (rad_weight)w)) {
+            emb += wi.stored_bytes;
+            ++n_emb;
+            emb_names += (emb_names.empty() ? "" : ",") + wi.name;
+        }
+    }
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) bf16: %d router projections %lld B, %d compressor kv|gate projections %lld B",
+             n_router, (long long)router, n_comp, (long long)comp);
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) emb: %d token embedding table(s) the placement flag moves, %lld B (%s)",
+             n_emb, (long long)emb, emb_names.empty() ? "none" : emb_names.c_str());
+    WeightFootprint wf;
+    weight_footprint(P, &wf, TablePlacement::Vram, TablePlacement::Disk, false, true);
+    int64_t nl = P.meta.n_layers;
+    for (const WeightInfo& w : P.weights)
+        if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
+    const int64_t xp = wf.routed && wf.expert_unit_max > 0 && !xprefetch_env_off() ? xp_device_bytes(wf.expert_unit_max, nl) : 0;
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) shadow: %d shadow slots a class at most, the expert floor's spare slab %lld B; "
+             "statics %lld B, experts %lld B, the largest expert unit %lld B",
+             place_shadow_slots(), (long long)wf.expert_spare, (long long)wf.statics, (long long)wf.experts,
+             (long long)wf.expert_unit_max);
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) xpoff: the expert prefetch's ring and buffers %lld B over %lld routed layers%s",
+             (long long)xp, (long long)nl, xprefetch_env_off() ? " (RADIANCE_XPREFETCH off: none, and no DMA queue)" : "");
 }
 
 /* The mebibyte between a level's highest buffer and the memory above it, which is lent or holds
