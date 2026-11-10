@@ -2105,6 +2105,11 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
              d.n_stage, d.base, d.base + d.n_stage - 1, (long long)d.n_expert, (long long)d.top_k, d.taps.size(),
              (long long)d.noise, (long long)(d.block - 1), (long long)d.block, (long long)c.window,
              (long long)d.rank, (long long)R);
+    /* The same on stderr once (rank 0's real declare), so a serve log says which walk ran. */
+    if (ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: DSpark drafter: %d stages, %lld experts top-%lld, block %lld; Markov rank %lld "
+                        "walked over the head's top %lld (RADIANCE_DS41_DSPARK_CAND)\n",
+                d.n_stage, (long long)d.n_expert, (long long)d.top_k, (long long)d.block, (long long)d.rank, (long long)R);
     return RAD_OK;
 }
 
