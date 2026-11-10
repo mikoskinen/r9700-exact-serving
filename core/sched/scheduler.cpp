@@ -281,6 +281,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
+    /* A tree drafter's node layout (rad_drafter_tree_layout): the policy prices its branches. */
+    if (tree_ && prog.drafter_tree_k > 0) {
+        dp.tree_k    = (int)prog.drafter_tree_k;
+        dp.tree_bmax = (int)prog.drafter_tree_bmax;
+        dp.tree_lmax = (int)prog.drafter_tree_lmax;
+    }
     /* fn4: a serial or block head can run the adaptive window, asked for at start or not (the
      * runtime switch, Scheduler::set_draft_adaptive). */
     dp.adapt_capable = cfg.n_spec > 0 && (prog.drafter.kind == RAD_DRAFT_SERIAL ||
@@ -322,6 +328,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                         "declines) is replaced by the harness's"
                       : "prompt lookup proposes",
                  debug_oracle_.size(), f, 100.0 * kDebugMiss);
+        if (tree_ && prog.drafter_tree_k > 0)
+            RAD_WARN("--debug-draft-oracle over a tree (RADIANCE_DEBUG_ORACLE_TREE=1): every proposal is an "
+                     "oracle tree on the head's layout -- the main chain the harness's ids, and where its "
+                     "first draft is a miss one branch at position 1 the true id and the ids below it");
     }
     if (cfg.draft_window == DraftWindow::Adaptive) {
         const RadDrafterDecl& dd = prog.drafter;
@@ -346,7 +356,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * fn4 switches. Test-build switches, not flags. */
     draft_head_ = cfg.n_spec > 0 && (prog.drafter.kind == RAD_DRAFT_SERIAL ||
                                      prog.drafter.kind == RAD_DRAFT_BLOCK) &&
-                  prog.drafter.depth > 0 && !tree_;
+                  prog.drafter.depth > 0 && (!tree_ || prog.drafter_tree_k > 0);
     {
         const auto env_int = [](const char* name, int lo, int hi, int dflt) {
             const char* e = std::getenv(name);
@@ -382,6 +392,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         hybrid_lookup_ = hybrid_head_ = hybrid_unahead_ = 0;
     }
     RAD_TRY(draft_.configure(dp));
+    /* The tree's live branches, depth and force (the plugin's fn4 switches): their start values
+     * now, then every draft cycle (tree_cycle). */
+    if (draft_.tree_layout()) {
+        fn4::tree_prime();
+        tree_cycle();
+    }
     /* fn4 (runtime/fn4_switch.h): /admin/fn4 reports this scheduler's window and refuses an
      * adaptive one its drafter cannot run. */
     fn4::draft_register(draft_.can_adapt(), draft_.adaptive());
@@ -650,7 +666,9 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
      * sequence and expect_draft() cut this one's count to its window, so a longer proposal is cut
      * to the planned count (the window may have moved at the commit since). */
     if (next_open_ && s.entry_next >= 0) {
-        if (draft_.adaptive() && n > s.draft_next) n = s.draft_next;
+        /* A tree layout cuts the drafter's pitch to the live tree's node count (expect_draft) under
+         * either window. */
+        if ((draft_.adaptive() || draft_.tree_layout()) && n > s.draft_next) n = s.draft_next;
         if (n != s.draft_next) {
             RAD_ERR("request %llu: %d draft(s) published for a step planned to verify %d",
                     (unsigned long long)id, n, s.draft_next);
@@ -683,6 +701,10 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
      * ahead under the harness, so this path, not the one above, publishes every proposal. */
     if (!debug_oracle_.empty() && !parents && n > 0)
         (void)debug_oracle_ids((int64_t)s.req->output.size(), n, s.draft);
+    /* RADIANCE_DEBUG_ORACLE_TREE=1 (Engine::declare kept the tree): an oracle tree on the head's
+     * layout, its parents the head's. */
+    else if (!debug_oracle_.empty() && parents && n > 0 && draft_.tree_layout())
+        (void)debug_oracle_tree((int64_t)s.req->output.size(), n, s.draft_par, s.draft);
     s.n_draft = n;
     s.req->n_draft = n;
     s.req->draft = s.draft;
@@ -1182,6 +1204,79 @@ int Scheduler::debug_oracle_ids(int64_t n, int depth, int32_t* out) const {
         out[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
     }
     return d;
+}
+
+int Scheduler::debug_oracle_tree(int64_t n, int count, const int32_t* par, int32_t* out) const {
+    if (count <= 0 || !par || !out) return 0;
+    if (count > RAD_SCHED_MAX_SPEC) count = RAD_SCHED_MAX_SPEC;
+    const int32_t V = (int32_t)prog_->meta.n_vocab;
+    const int64_t have = (int64_t)debug_oracle_.size();
+    /* Each node's depth and the first node of its branch (its ancestor at depth 1). */
+    int32_t dep[RAD_SCHED_MAX_SPEC + 1], br[RAD_SCHED_MAX_SPEC + 1];
+    dep[0] = 0;
+    br[0] = 0;
+    int32_t alts[RAD_SCHED_MAX_SPEC];
+    int n_alt = 0, deepest = 0;
+    for (int j = 1; j <= count; ++j) {
+        int32_t p = par[j - 1];
+        if (p < 0 || p >= j) p = j - 1;   /* as the builder and ADV_TRUNK read it */
+        dep[j] = dep[p] + 1;
+        br[j] = p == 0 ? j : br[p];
+        if (p == 0 && j != 1) alts[n_alt++] = j;
+        if (dep[j] > deepest) deepest = dep[j];
+    }
+    /* The main chain's ids, by depth: debug_oracle_ids' exactly, so its nodes are the chain
+     * harness's. */
+    int32_t main_ids[RAD_SCHED_MAX_SPEC];
+    const int got = debug_oracle_ids(n, deepest, main_ids);
+    const bool miss1 = got >= 1 && n < have && main_ids[0] != debug_oracle_[(size_t)n];
+    auto mix = [](uint64_t h) {
+        h *= 0x9E3779B97F4A7C15ull;
+        h ^= h >> 31;
+        h *= 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 29;
+        return h;
+    };
+    const int32_t win = miss1 && n_alt > 0 ? alts[mix((uint64_t)n * 7919u + 17u) % (uint64_t)n_alt] : -1;
+    int wrote = 0;
+    for (int j = 1; j <= count; ++j) {
+        const int k = dep[j];
+        if (n + k - 1 >= have) continue;   /* past the file: the head's token stays */
+        const int32_t t = debug_oracle_[(size_t)(n + k - 1)];
+        int32_t v;
+        if (br[j] == 1) {
+            if (k > got) continue;
+            v = main_ids[k - 1];
+        } else if (br[j] == win) {
+            const uint64_t h = mix((uint64_t)(n * RAD_SCHED_MAX_SPEC + k + 1) ^ 0x7265655Full);
+            const bool miss = k > 1 && (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
+            v = miss ? (int32_t)((t + 1) % V) : t;
+        } else {
+            /* Never the true id: a branch's index among the alternatives, 2 or more past it. */
+            int a = 0;
+            while (a < n_alt && alts[a] != br[j]) ++a;
+            v = (int32_t)((t + 2 + a % (V > 3 ? V - 2 : 1)) % V);
+            if (v == t) v = (int32_t)((t + 1) % V);
+        }
+        out[j - 1] = v;
+        ++wrote;
+    }
+    return wrote;
+}
+
+int Scheduler::test_oracle_tree(const std::vector<int32_t>& ids, int64_t n_vocab, int64_t n, int count,
+                                const int32_t* par, int32_t* out) {
+    static Program fake;
+    fake.meta.n_vocab = n_vocab;
+    Program* keep = prog_;
+    std::vector<int32_t> was;
+    was.swap(debug_oracle_);
+    debug_oracle_ = ids;
+    prog_ = &fake;
+    const int r = debug_oracle_tree(n, count, par, out);
+    prog_ = keep;
+    debug_oracle_.swap(was);
+    return r;
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -2236,8 +2331,9 @@ const RadBatch* Scheduler::step() {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
                 int match = -1;
-                s.n_draft = (int32_t)draft_ngram(s, lookup_adapt_ ? cap : draft_.step_window(),
-                                                 &match);
+                /* Under a tree layout a lookup is a chain: the main chain's length at most. */
+                const int lw = lookup_adapt_ ? cap : draft_.step_window();
+                s.n_draft = (int32_t)draft_ngram(s, std::min(lw, draft_.chain_depth()), &match);
                 ngram = s.n_draft > 0;
                 /* The verify gate (lookup.h). Every proposal is offered, so a held one is still
                  * scored against the text; the --debug-draft-oracle harness (match < 0) is a
@@ -2261,7 +2357,8 @@ const RadBatch* Scheduler::step() {
                  * window instead, the whole of it. */
                 int32_t look[RAD_SCHED_MAX_SPEC];
                 int match = 0;
-                const int k = lookup_into(s, draft_.next_depth(), look, &match, hybrid_match_);
+                const int k = lookup_into(s, std::min(draft_.next_depth(), draft_.chain_depth()), look,
+                                          &match, hybrid_match_);
                 if (k > 0 && match >= hybrid_match_) {
                     for (int j = 0; j < k; ++j) s.draft[j] = look[j];
                     s.n_draft = k;
@@ -2542,6 +2639,35 @@ const RadBatch* Scheduler::step() {
      * GEMM. */
     bool any_pf = false; int64_t n_dec = 0;
     for (const StepEntry& e : plan_.e) { if (e.is_prefill) any_pf = true; else ++n_dec; }
+    /* A tree layout's step that carries a prefill chunk verifies each tree proposal's main chain
+     * alone, as a chain: its first K nodes (rad_drafter_tree_layout). Such a step's attention runs
+     * every row through the prefill forms, which take no tree, and a chunk's rows are no verify's
+     * anyway. Exact either way: only which drafts are verified changes. */
+    if (any_pf && plan_.spec_is_tree && draft_.tree_layout()) {
+        plan_.spec_is_tree = false;
+        plan_.n_spec = 0;
+        const int32_t K = (int32_t)draft_.chain_depth();
+        bool any_tree = false;
+        for (StepEntry& e : plan_.e) {
+            if (e.is_prefill) continue;
+            any_tree = any_tree || e.draft_parent;
+            SchedReq* sp = e.slot >= 0 && (size_t)e.slot < reqs_.size() ? reqs_[(size_t)e.slot].get() : nullptr;
+            if (e.draft_parent && e.n_spec > K) {
+                const int32_t cut = e.n_spec - K;
+                e.n_spec -= cut;
+                e.n_tokens -= cut;
+                plan_.n_tok -= cut;
+                if (sp) sp->sched_tokens = e.n_tokens;
+            }
+            e.draft_parent = nullptr;
+            if (sp && sp->req) {
+                sp->req->n_draft = e.n_spec;
+                sp->req->draft_parent = nullptr;
+            }
+            if (e.n_spec > plan_.n_spec) plan_.n_spec = e.n_spec;
+        }
+        if (any_tree) ++tree_chain_steps_;
+    }
     plan_.phase = any_pf && n_dec ? RAD_PHASE_MIXED
                 : any_pf         ? RAD_PHASE_PREFILL
                                  : RAD_PHASE_DECODE;
@@ -2686,7 +2812,26 @@ void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
 }
 
 /* ------------------------------------------------------------------ the step's head depth */
+void Scheduler::tree_cycle() {
+    if (!draft_.tree_layout()) return;
+    const int b = tree_test_b_ >= 0 ? tree_test_b_ : fn4::tree_live(fn4::kDsparkTree);
+    const int l = tree_test_l_ >= 0 ? tree_test_l_ : fn4::tree_live(fn4::kDsparkTreeDepth);
+    const int f = tree_test_f_ >= 0 ? tree_test_f_ : fn4::tree_live(fn4::kDsparkTreeForce);
+    /* A switch nothing serves reads -1: no branches, the layout's depth, priced. */
+    draft_.set_tree(b < 0 ? 0 : b, l < 0 ? draft_.params().tree_lmax : l, f > 0);
+}
+
+void Scheduler::set_tree_live(int branches, int depth, int force) {
+    std::lock_guard<std::mutex> lk(mu_);
+    tree_test_b_ = branches;
+    tree_test_l_ = depth;
+    tree_test_f_ = force;
+    tree_cycle();
+}
+
 void Scheduler::draft_cycle() {
+    /* The tree's live shape first: a fixed window caps by it as well. */
+    tree_cycle();
     if (!draft_.adaptive()) return;
     /* The rows the opening step will decode: every running sequence past its prompt. Those that
      * may speculate choose D through their estimates; the rest emit one token each, which still
@@ -2722,7 +2867,9 @@ void Scheduler::expect_draft(uint64_t id, int n) {
     /* Under the adaptive window the rounds ran for the deepest sequence; this one verifies the
      * first of them up to its own window. That is the cap serial_begin used: nothing commits
      * between the two, and D is the cycle's (draft_cycle). */
-    if (draft_.adaptive() && n > 0) {
+    if ((draft_.adaptive() || draft_.tree_layout()) && n > 0) {
+        /* A tree layout's node count is the live tree's (DraftController::node_cap), not the
+         * drafter's pitch, under either window. */
         const int cap = draft_cap(s);
         if (n > cap) n = cap;
     }
@@ -2790,7 +2937,8 @@ const RadBatch* Scheduler::step_next_locked() {
             if (!s.req || !s.req->may_speculate) continue;
             int32_t look[RAD_SCHED_MAX_SPEC];
             int match = 0;
-            if (lookup_into(s, draft_.next_depth(), look, &match, hybrid_match_) > 0 &&
+            if (lookup_into(s, std::min(draft_.next_depth(), draft_.chain_depth()), look, &match,
+                            hybrid_match_) > 0 &&
                 match >= hybrid_match_) {
                 ++hybrid_unahead_;
                 return nullptr;
@@ -3083,7 +3231,12 @@ int Scheduler::commit(StepResult& res) {
                  * rule. A move takes effect at the next draft; this step's drafter already ran. */
                 if (draft_.adaptive() && (!e.ngram || lookup_adapt_)) {
                     const int was = s.adapt.depth;
-                    const int now = draft_.adapt_observe(s.adapt, e.n_spec, a);
+                    /* A tree layout's verify: the main chain and the branches it evaluated, from the
+                     * accepted path's first node (DraftController::adapt_observe_tree). A chain
+                     * verify of one (a step carrying a prefill chunk) is a chain of the main chain. */
+                    const int now = path && draft_.tree_layout() && !e.ngram
+                                        ? draft_.adapt_observe_tree(s.adapt, e.n_spec, a, a > 0 ? path[0] : 0)
+                                        : draft_.adapt_observe(s.adapt, e.n_spec, a);
                     if (now != was && was > 0 && (int)log_level() >= (int)Log::Debug) {
                         char est[8 * RAD_SCHED_MAX_SPEC];
                         int o = 0;

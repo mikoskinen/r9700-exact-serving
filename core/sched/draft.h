@@ -72,6 +72,8 @@ namespace rad {
 /* libr4d's decode kernel serves up to 64 query rows, the verify-step band (spec §10), so 64 is
  * the largest window any batch can carry. */
 enum { RAD_SCHED_MAX_SPEC = 64 };
+/* The most alternative branches a tree layout (rad_drafter_tree_layout) may declare. */
+enum { RAD_SCHED_TREE_MAX_BRANCHES = 8 };
 
 /* One sequence's half of the adaptive policy: the drafter's record on this sequence's text and the
  * resulting stop. Stored in the scheduler's per-request state; the controller does the arithmetic.
@@ -83,6 +85,11 @@ struct DraftAdapt {
     int32_t  held  = 0;                       /* verifies since `depth` last moved */
     float    a[RAD_SCHED_MAX_SPEC] = {};      /* conditional acceptance at each draft position */
     uint16_t n[RAD_SCHED_MAX_SPEC] = {};      /* verifies that evaluated each one, saturating */
+    /* A tree layout's alternative branches (DraftController tree): q[b] the chance that branch b's
+     * first node is the target's token given the main chain's first draft and every branch before
+     * b were not; qn[b] the verifies that evaluated it. Started at kTreePrior with the estimate. */
+    float    q[RAD_SCHED_TREE_MAX_BRANCHES] = {};
+    uint16_t qn[RAD_SCHED_TREE_MAX_BRANCHES] = {};
 };
 
 class DraftController {
@@ -107,6 +114,12 @@ public:
         int  lend = 0;
         /* The lent ratio borrowed by a class with none of its own (kBorrowMin, kBorrowDamp). */
         bool borrow = false;
+        /* A tree drafter's node layout (rad_drafter_tree_layout): a main chain of tree_k nodes,
+         * then up to tree_bmax alternative branches at position 1 of up to tree_lmax nodes,
+         * depth-major. 0: no layout (a chain, or a tree the policy does not see into). */
+        int  tree_k = 0;
+        int  tree_bmax = 0;
+        int  tree_lmax = 0;
     };
 
     /* ---------------------------------------------------------- the policy's constants
@@ -213,8 +226,49 @@ public:
     const Params& params() const { return p_; }
 
     /* The draft depth for the next step; 0 means do not speculate. Constant: under the adaptive
-     * policy it is the ceiling, and window_for() is the window. */
-    int  next_depth() const { return p_.max_depth; }
+     * policy it is the ceiling, and window_for() is the window. Under a tree layout the ceiling is
+     * the live tree's node count (node_cap()). */
+    int  next_depth() const { return ceil_depth(); }
+
+    /* ---------------------------------------------------------- a tree layout
+     * A tree drafter with a node layout (Params::tree_k): its proposal is a main chain of K nodes
+     * and B alternative branches at position 1 of up to L nodes each, depth-major (node
+     * K + (k - 1) B + b + 1 is branch b's node at depth k), so a verify of the first d nodes is a
+     * tree whatever d is. B, L and `force` are live (the plugin's fn4 switches dspark_tree,
+     * dspark_tree_depth, dspark_tree_force, read by the scheduler every cycle), clamped to the
+     * layout; B = 0 is a chain of K exactly as a chain drafter of depth K.
+     *
+     * Pricing: the main chain is the chain policy over its K positions (stop_of, a[]). Its
+     * alternative nodes count only past a full main chain: a sequence whose stop reaches K may
+     * verify up to K + B L nodes, and each alternative node is worth its chance of being on the
+     * accepted path, (1 - a_1) prod_{b'<b} (1 - q_b') q_b prod_{j=2..k} a_j for branch b at depth k
+     * (a branch's continuation priced at the main chain's conditional acceptance). D, the step's
+     * node count, is then chosen as for a chain, sum_i E_i(min(D, stop_i)) / T(D, n): T keyed by
+     * node count and measured per row class. Under load each extra verify row reads its own routed
+     * experts, so T grows with D about as fast as the alternatives add tokens and D settles at or
+     * below K -- the tree reduces itself, by the same step-cost model that sizes the chain. `force`
+     * (a measurement switch) instead verifies all K + B L nodes of every drafting sequence at every
+     * drafting step, whatever its stop and D: only depth 0 (draft_depth0) still decides whether a
+     * step drafts at all, weighing the whole tree's yield at its node count's measured cost. */
+    bool tree_layout() const { return p_.tree_k > 0; }
+    void set_tree(int branches, int depth, bool force);
+    int  tree_b() const { return tree_b_; }
+    int  tree_l() const { return tree_l_; }
+    bool tree_force() const { return tree_force_; }
+    /* The main chain's positions: K under a layout, else the deployment's window. */
+    int  chain_depth() const { return p_.tree_k > 0 ? p_.tree_k : p_.max_depth; }
+    /* The live tree's nodes, K + B L; the deployment's window without a layout. */
+    int  node_cap() const { return p_.tree_k > 0 ? p_.tree_k + tree_b_ * tree_l_ : p_.max_depth; }
+    /* One verify of a tree sequence: `drafted` nodes, the accepted path `accepted` deep, its first
+     * node `first` (1 the main chain, K + 1 + b branch b; 0 when nothing was accepted). Updates the
+     * main chain as a chain verify of min(drafted, K) and the branches' q where they were
+     * evaluated. Returns the stop. */
+    int  adapt_observe_tree(DraftAdapt& s, int drafted, int accepted, int first) const;
+    /* The chance that node `n` (1-based, under the live layout) is on the accepted path. */
+    double node_chance(const DraftAdapt& s, int n) const;
+    /* A branch's first node, before any verify: optimistic as kPrior is, so a sequence whose
+     * main chain fails often tries its branches and learns them. */
+    static constexpr double kTreePrior = 0.25;
 
     /* ---------------------------------------------------------- the adaptive policy */
     bool adaptive() const { return adapt_; }
@@ -288,6 +342,9 @@ public:
     int  window_for(DraftAdapt& s) const;
     /* As window_for() but never starts an estimate; 0 if not started. For reporting. */
     int  window_of(const DraftAdapt& s) const;
+    /* A sequence's stop in nodes: its chain stop, extended to node_cap() when it reaches a tree
+     * layout's whole main chain. */
+    int  stop_nodes(const DraftAdapt& s) const;
     /* One verify of this sequence: `drafted` proposed, a prefix of `accepted` taken. Updates the
      * estimate, and the stop once past the hold. Returns the stop. */
     int  adapt_observe(DraftAdapt& s, int drafted, int accepted) const;
@@ -317,7 +374,9 @@ public:
      * the head (prompt lookup) are held to it, so they add no deeper pass shape. */
     int  step_window() const {
         if (zero_now()) return 0;
-        return adapt_ && step_w_ > 0 ? step_w_ : p_.max_depth;
+        const int w = adapt_ && step_w_ > 0 ? step_w_ : ceil_depth();
+        /* force: every drafting step verifies the whole tree. */
+        return tree_force_ && p_.tree_k > 0 && w > 0 ? node_cap() : w;
     }
 
     /* T(depth, n): a decode step with deepest window `depth` and `n_rows` decode rows took `ms`
@@ -412,6 +471,19 @@ private:
     int64_t n_borrow_ = 0;
     /* The ratio class `c` borrows (kBorrowMin, kBorrowDamp), or 0 when no neighbour has one. */
     double  borrowed_ratio(int c) const;
+    /* The live tree (set_tree), clamped to the layout. */
+    int32_t tree_b_ = 0, tree_l_ = 0;
+    bool    tree_force_ = false;
+    /* The step-cost key of a step at depth d: under `force` every drafting step verifies the
+     * whole tree, so it is that many nodes' step; d otherwise. */
+    int     tree_key(int d) const {
+        return tree_force_ && p_.tree_k > 0 && d > 0 ? node_cap() : d;
+    }
+    /* The ceiling: node_cap() under a tree layout, the deployment's window otherwise. */
+    int     ceil_depth() const { return node_cap(); }
+    /* The main chain's update shared by adapt_observe and adapt_observe_tree, without the stop. */
+    void    observe_chain(DraftAdapt& s, int drafted, int accepted) const;
+    int     restop(DraftAdapt& s) const;
     bool    zero_now() const {
         return adapt_ && depth0_ && (probe_left_ > 0 ? probe_d_ == 0 : zero_);
     }

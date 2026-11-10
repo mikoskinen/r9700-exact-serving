@@ -48,7 +48,18 @@ int DraftController::configure(const Params& p) {
                 p.max_depth, RAD_SCHED_MAX_SPEC, RAD_SCHED_MAX_SPEC);
         return RAD_E_INVAL;
     }
+    if (p.tree_k < 0 || p.tree_bmax < 0 || p.tree_bmax > RAD_SCHED_TREE_MAX_BRANCHES ||
+        p.tree_lmax < 0 || (p.tree_k == 0 && p.tree_bmax > 0) ||
+        (p.tree_k > 0 && (p.tree_k > p.max_depth || (p.tree_bmax > 0 && p.tree_lmax < 1) ||
+                          p.tree_k + p.tree_bmax * p.tree_lmax > p.max_depth))) {
+        RAD_ERR("draft tree layout: main chain %d, %d branch(es) of %d, past the window of %d",
+                p.tree_k, p.tree_bmax, p.tree_lmax, p.max_depth);
+        return RAD_E_INVAL;
+    }
     p_ = p;
+    tree_b_ = 0;
+    tree_l_ = p.tree_bmax > 0 ? p.tree_lmax : 0;
+    tree_force_ = false;
     tot_drafted_ = tot_accepted_ = 0;
     for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) { reach_[j] = 0; hit_[j] = 0; }
     seen_ = 0;
@@ -98,6 +109,12 @@ int DraftController::configure(const Params& p) {
                  "measured, emits %.0f%% more tokens a millisecond than the window; at 0, %d "
                  "cycles of the drafting depth every %d keep its estimates measured",
                  100.0 * kHyst, kProbeSteps, probe_every_);
+    if (p_.tree_k > 0)
+        RAD_INFO("draft tree layout: a main chain of %d node(s), then up to %d branch(es) at position 1 of up "
+                 "to %d node(s), depth-major; the branches' nodes are %s (dspark_tree / dspark_tree_depth / "
+                 "dspark_tree_force)", p_.tree_k, p_.tree_bmax, p_.tree_lmax,
+                 adapt_ ? "priced by the window's step-cost model past a full main chain"
+                        : "all verified (a fixed window)");
     if (adapt_ && depth0_ && backoff_max_ > 0)
         RAD_INFO("draft probe back-off: each probe that leaves depth 0 in place doubles the interval to "
                  "the next, up to %d cycles; a move between 0 and drafting starts it over",
@@ -239,7 +256,8 @@ double DraftController::step_cost(int depth, int n_rows) const {
 int DraftController::stop_of(const float* a) const {
     double p = 1.0;
     int d = 0;
-    while (d < p_.max_depth) {
+    const int K = chain_depth();
+    while (d < K) {
         p *= (double)a[d];
         if (p < kDraftMinChance) break;
         ++d;
@@ -254,9 +272,13 @@ double DraftController::prior_at(int j) const {
 
 void DraftController::start(DraftAdapt& s) const {
     /* From finished sequences once there are enough (adapt_retire), else the fixed kPrior. */
-    for (int j = 0; j < p_.max_depth; ++j) {
+    for (int j = 0; j < chain_depth(); ++j) {
         s.a[j] = (float)prior_at(j);
         s.n[j] = 0;
+    }
+    for (int b = 0; b < RAD_SCHED_TREE_MAX_BRANCHES; ++b) {
+        s.q[b] = (float)kTreePrior;
+        s.qn[b] = 0;
     }
     s.depth = stop_of(s.a);
     s.held  = 0;
@@ -265,38 +287,106 @@ void DraftController::start(DraftAdapt& s) const {
 void DraftController::adapt_retire(const DraftAdapt& s) {
     if (!adapt_ || s.depth <= 0 || (double)s.n[0] < kHalfLife) return;
     const double w = settle_weight(kPriorHalfLifeSeqs, prior_n_);
-    for (int j = 0; j < p_.max_depth; ++j)
+    for (int j = 0; j < chain_depth(); ++j)
         prior_[j] = prior_n_ ? (float)((double)prior_[j] + w * ((double)s.a[j] - (double)prior_[j]))
                              : s.a[j];
     ++prior_n_;
 }
 
 double DraftController::yield(const DraftAdapt& s, int d) const {
-    if (d > p_.max_depth) d = p_.max_depth;
+    if (d > ceil_depth()) d = ceil_depth();
+    const int K = chain_depth();
     double e = 1.0, run = 1.0;
-    for (int k = 1; k <= d; ++k) { run *= (double)s.a[k - 1]; e += run; }
+    for (int k = 1; k <= d && k <= K; ++k) { run *= (double)s.a[k - 1]; e += run; }
+    /* A tree layout's alternative nodes past the main chain: each its chance of being on the
+     * accepted path (draft.h). */
+    for (int n = K + 1; n <= d; ++n) e += node_chance(s, n);
     return e;
 }
 
+double DraftController::node_chance(const DraftAdapt& s, int n) const {
+    const int K = chain_depth();
+    if (n < 1) return 0.0;
+    if (n <= K) {
+        double p = 1.0;
+        for (int j = 0; j < n; ++j) p *= (double)s.a[j];
+        return p;
+    }
+    if (p_.tree_k <= 0 || tree_b_ <= 0) return 0.0;
+    const int x = n - K - 1, k = x / tree_b_ + 1, b = x % tree_b_;
+    if (k > tree_l_) return 0.0;
+    double p = 1.0 - (double)s.a[0];
+    for (int c = 0; c < b; ++c) p *= 1.0 - (double)s.q[c];
+    p *= (double)s.q[b];
+    for (int j = 2; j <= k && j <= K; ++j) p *= (double)s.a[j - 1];
+    return p;
+}
+
+void DraftController::set_tree(int branches, int depth, bool force) {
+    if (p_.tree_k <= 0) return;
+    tree_b_ = branches < 0 ? 0 : branches > p_.tree_bmax ? p_.tree_bmax : branches;
+    tree_l_ = p_.tree_bmax <= 0 ? 0 : depth < 1 ? 1 : depth > p_.tree_lmax ? p_.tree_lmax : depth;
+    tree_force_ = force && tree_b_ > 0;
+}
+
+int DraftController::stop_nodes(const DraftAdapt& s) const {
+    if (p_.tree_k > 0 && tree_b_ > 0 && tree_l_ > 0 && s.depth >= p_.tree_k) return node_cap();
+    return s.depth;
+}
+
 int DraftController::window_of(const DraftAdapt& s) const {
-    if (!adapt_) return p_.max_depth;
+    if (!adapt_) return ceil_depth();
     if (s.depth <= 0 || zero_now()) return 0;
     const int d = step_depth();
-    const int D = d > 0 ? d : p_.max_depth;
-    return s.depth < D ? s.depth : D;
+    const int D = d > 0 ? d : ceil_depth();
+    /* force: every drafting step verifies the whole tree, whatever the sequence's stop and D. */
+    if (tree_force_ && p_.tree_k > 0) return node_cap();
+    const int stop = stop_nodes(s);
+    return stop < D ? stop : D;
 }
 
 int DraftController::window_for(DraftAdapt& s) const {
-    if (!adapt_) return p_.max_depth;
+    if (!adapt_) return ceil_depth();
     if (s.depth <= 0) start(s);
     return window_of(s);
 }
 
 int DraftController::adapt_observe(DraftAdapt& s, int drafted, int accepted) const {
-    if (!adapt_) return p_.max_depth;
+    if (!adapt_) return ceil_depth();
     if (s.depth <= 0) start(s);
     if (drafted <= 0) return s.depth;
-    const int D = p_.max_depth;
+    observe_chain(s, drafted, accepted);
+    return restop(s);
+}
+
+int DraftController::adapt_observe_tree(DraftAdapt& s, int drafted, int accepted, int first) const {
+    if (!adapt_) return ceil_depth();
+    if (s.depth <= 0) start(s);
+    if (drafted <= 0) return s.depth;
+    const int K = chain_depth();
+    const int dm = drafted < K ? drafted : K;
+    /* The main chain, as a chain verify of its first min(drafted, K) nodes: accepted as deep as the
+     * path when the path is the main chain's, else rejected at its first position. */
+    const bool via_main = accepted > 0 && first >= 1 && first <= K;
+    observe_chain(s, dm, via_main ? (accepted < dm ? accepted : dm) : 0);
+    /* The branches' first nodes were evaluated only where the main chain's first draft was not
+     * the target's, and each only behind every lower branch (the acceptance takes the first child
+     * that matches, and siblings are different tokens). */
+    if (p_.tree_k > 0 && !(accepted > 0 && first == 1) && tree_b_ > 0 && drafted > K) {
+        const int nb = tree_b_ < drafted - K ? tree_b_ : drafted - K;
+        for (int b = 0; b < nb; ++b) {
+            const bool hit = accepted > 0 && first == K + 1 + b;
+            const double w = std::fmax(alpha_, 1.0 / ((double)s.qn[b] + kPriorWeight + 1.0));
+            s.q[b] = (float)((double)s.q[b] + w * ((hit ? 1.0 : 0.0) - (double)s.q[b]));
+            if (s.qn[b] < UINT16_MAX) ++s.qn[b];
+            if (hit) break;
+        }
+    }
+    return restop(s);
+}
+
+void DraftController::observe_chain(DraftAdapt& s, int drafted, int accepted) const {
+    const int D = chain_depth();
     if (drafted > D) drafted = D;
     if (accepted < 0) accepted = 0;
     if (accepted > drafted) accepted = drafted;
@@ -317,7 +407,9 @@ int DraftController::adapt_observe(DraftAdapt& s, int drafted, int accepted) con
     const double edge = (double)s.a[drafted - 1];
     for (int j = drafted; j < D; ++j)
         s.a[j] = (float)((double)s.a[j] + alpha_ * (edge - (double)s.a[j]));
+}
 
+int DraftController::restop(DraftAdapt& s) const {
     /* The stop moves only past the hold: it is this sequence's share of the step's shape. */
     if (s.held < INT32_MAX) ++s.held;
     if (s.held < kHold) return s.depth;
@@ -333,29 +425,43 @@ int DraftController::adapt_observe(DraftAdapt& s, int drafted, int accepted) con
 int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
     if (!adapt_ || n_seq <= 0) return step_d_;
     if (n_rows < n_seq) n_rows = n_seq;
-    const int M = p_.max_depth;
+    const int M = ceil_depth();
 
     /* Expected tokens at each head depth: sum_i E_i(min(D, stop_i)), plus one per non-drafting
-     * row. Candidates end at the deepest stop, since a deeper D changes nothing. */
+     * row. Candidates end at the deepest stop, since a deeper D changes nothing. Under a tree
+     * layout D counts nodes and a stop that reaches the main chain's end reaches node_cap()
+     * (stop_nodes); under `force` every drafting sequence verifies the whole tree whatever D, so
+     * every candidate is that step (tree_key) and only depth 0's decision reads it. */
     double tok[RAD_SCHED_MAX_SPEC + 1] = {};
     int top = kMinDepth;
+    const bool force = tree_force_ && p_.tree_k > 0;
     for (int i = 0; i < n_seq; ++i) {
         DraftAdapt& s = *seq[i];
         if (s.depth <= 0) start(s);
-        if (s.depth > top) top = s.depth;
-        double e = 1.0, run = 1.0;
+        if (p_.tree_k <= 0) {
+            if (s.depth > top) top = s.depth;
+            double e = 1.0, run = 1.0;
+            for (int d = 1; d <= M; ++d) {
+                if (d <= s.depth) { run *= (double)s.a[d - 1]; e += run; }
+                tok[d] += e;
+            }
+            continue;
+        }
+        const int st = force ? s.depth : stop_nodes(s);
+        if (st > top) top = st;
         for (int d = 1; d <= M; ++d) {
-            if (d <= s.depth) { run *= (double)s.a[d - 1]; e += run; }
-            tok[d] += e;
+            const int w = d < st ? d : st;
+            tok[d] += yield(s, force ? node_cap() : w);
         }
     }
     const double plain = (double)(n_rows - n_seq);
     if (top > M) top = M;
+    if (force && top > p_.tree_k) top = p_.tree_k;
 
     int best = kMinDepth;
     double best_g = -1.0;
     for (int d = kMinDepth; d <= top; ++d) {
-        const double g = (tok[d] + plain) / step_cost(d, n_rows);
+        const double g = (tok[d] + plain) / step_cost(tree_key(d), n_rows);
         if (g > best_g) { best_g = g; best = d; }
     }
 
@@ -367,7 +473,7 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
     } else {
         if (step_held_ < INT32_MAX) ++step_held_;
         const int cur = step_d_ < top ? step_d_ : top;
-        const double cur_g = (tok[cur] + plain) / step_cost(cur, n_rows);
+        const double cur_g = (tok[cur] + plain) / step_cost(tree_key(cur), n_rows);
         if (best != cur && step_held_ >= kHold && best_g > cur_g * (1.0 + kHyst)) {
             RAD_DEBUG("draft window: head depth %d -> %d over %d drafting of %d rows (%.3f -> "
                       "%.3f tokens per unit of step cost)", step_d_, best, n_seq, n_rows, cur_g,
@@ -416,7 +522,7 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
          * corrects itself, since at 0 every plain step is a sample and every probe a drafting
          * one; erring toward drafting does not, since while drafting only plain probes sample
          * the plain step. */
-        double g_d = (tok[dd] + plain) / step_cost(dd, n_rows);
+        double g_d = (tok[dd] + plain) / step_cost(tree_key(dd), n_rows);
         if (dn_[c] >= kCostClipAfter && dms_[c] > 0.0) g_d = std::fmin(g_d, dtok_[c] / dms_[c]);
         bool borrowed = false;
         const double g_0 = (double)n_rows / plain_ms(n_rows, &borrowed);
@@ -456,7 +562,7 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
      * cycles: a probe whose steps all carried a prefill chunk measured nothing, and must not be
      * followed by another at once. */
     const bool stale = !measured || cycles_ - plain_at_[c] > (int64_t)kPlainStale * probe_every_;
-    if (stale && cost_n_[dd][c] >= kCostClipAfter && cycles_ - plain_probe_at_ >= probe_every_) {
+    if (stale && cost_n_[tree_key(dd)][c] >= kCostClipAfter && cycles_ - plain_probe_at_ >= probe_every_) {
         plain_probe_at_ = cycles_;
         probe_d_ = 0;
         probe_left_ = 1 + kPlainWarm + (measured ? 1 : 3);

@@ -138,6 +138,8 @@ public:
                            int64_t from_hi, int64_t to_lo);
     int         drafter_short_block(int64_t block);
     int         drafter_tree(rad_buf parents);
+    int         drafter_tree_layout(int64_t main_depth, int64_t max_branches, int64_t max_branch_depth);
+    int         kv_group_tree_self(rad_kvgroup h);
     int         declare_encoder(const RadEncoderDecl* d);
     int         declare_generator(const RadGeneratorDecl* d);
     int         declare_audio_generator(const RadAudioGenDecl* d);

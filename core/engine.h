@@ -521,6 +521,9 @@ private:
     /* RadBuildCtx::draft_tree for every declare: decided once in declare() from the plugin's probe
      * (RadArchProbe::tree_pays). */
     bool draft_tree_ = false;
+    /* RADIANCE_DEBUG_ORACLE_TREE=1 beside --debug-draft-oracle: the tree stays asked, its proposals
+     * replaced by an oracle tree and verified on host-built steps (a layout drafter's only). */
+    bool oracle_tree_ = false;
     int  block_pass(const RadBatch* db, const char* what, int step);
     /* A program's block drafter rides its window in the window snapshot: it stores its context
      * in the context pass right behind the trunk step, and the snapshot is saved after that. Only
@@ -539,6 +542,9 @@ private:
      * the context pass by that path. */
     bool    tree_ = false;
     rad_buf tree_parents_ = 0;
+    /* Its node layout (rad_drafter_tree_layout): the main chain's length, 0 for a tree without one.
+     * Every row of such a drafter's block predicts, so its head reads all of them. */
+    int     tree_k_ = 0;
     int     tree_compact(int rows);
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);

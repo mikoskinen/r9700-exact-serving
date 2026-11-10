@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <random>
 #include <string>
 
 #include <unistd.h>
@@ -4923,6 +4924,373 @@ TEST(the_hybrid_takes_a_long_lookup_match_over_the_heads_proposal) {
     n.prog.drafter.depth = 0;
     CHECK_OK(n.start());
     CHECK_EQ(n.sch.set_draft_hybrid(1), 0);
+}
+
+/* ------------------------------------------------------------------ a tree layout (T1)
+ * A tree drafter with a node layout (rad_drafter_tree_layout): a main chain of K nodes, then B
+ * branches at position 1 of up to L nodes, depth-major. DraftController prices the branches' nodes
+ * past a full main chain with the same step-cost model as the chain (draft.h). */
+DraftController tree_controller(bool adapt, int b, int l, bool force = false) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth = 20;
+    p.adapt = adapt;
+    p.tree_k = 5;
+    p.tree_bmax = 3;
+    p.tree_lmax = 5;
+    CHECK_OK(c.configure(p));
+    c.set_tree(b, l, force);
+    return c;
+}
+
+/* An estimate as tree tests state it: `a0` at the main chain's first position, `rest` after it,
+ * `q` for every branch, started, its stop the chain stop over the main chain. */
+DraftAdapt tree_estimate(const DraftController& c, double a0, double rest, double q) {
+    DraftAdapt s;
+    s.a[0] = (float)a0;
+    for (int j = 1; j < RAD_SCHED_MAX_SPEC; ++j) s.a[j] = (float)rest;
+    for (int b = 0; b < RAD_SCHED_TREE_MAX_BRANCHES; ++b) s.q[b] = (float)q;
+    double p = 1.0;
+    int d = 0;
+    while (d < c.chain_depth()) {
+        p *= (double)s.a[d];
+        if (p < DraftController::kDraftMinChance) break;
+        ++d;
+    }
+    s.depth = d < DraftController::kMinDepth ? DraftController::kMinDepth : d;
+    return s;
+}
+
+/* B = 0 is the chain of K, decision for decision and bit for bit: the A arm of an in-process A/B
+ * is today's chain whatever the start's --num-speculative-tokens covers for the branches. */
+TEST(a_tree_layout_with_no_branches_is_the_chain_of_its_main_chain) {
+    DraftController chain = adaptive_controller(5);
+    DraftController tree = tree_controller(true, 0, 5);
+    CHECK(tree.tree_layout());
+    CHECK_EQ(tree.node_cap(), 5);
+    CHECK_EQ(tree.next_depth(), 5);
+    CHECK_EQ(tree.chain_depth(), 5);
+    CHECK_EQ(tree.step_window(), 5);
+    std::mt19937 rng(11);
+    DraftAdapt sc, st;
+    for (int t = 0; t < 3000; ++t) {
+        const int dc = chain.window_for(sc), dt = tree.window_for(st);
+        REQUIRE(dc == dt);
+        /* acceptance that drifts between prose-like and code-like stretches */
+        const double pa = (t / 300) % 2 ? 0.85 : 0.35;
+        int acc = 0;
+        while (acc < dc && std::uniform_real_distribution<double>(0, 1)(rng) < pa) ++acc;
+        CHECK_EQ(chain.adapt_observe(sc, dc, acc), tree.adapt_observe_tree(st, dt, acc, acc > 0 ? 1 : 0));
+        const double ms = 10.0 + 1.3 * dc + std::uniform_real_distribution<double>(0, 0.5)(rng);
+        chain.step_time(dc, 1, ms);
+        tree.step_time(dt, 1, ms);
+        DraftAdapt* a1[1] = { &sc };
+        DraftAdapt* a2[1] = { &st };
+        REQUIRE(chain.plan_step(a1, 1, 1) == tree.plan_step(a2, 1, 1));
+        CHECK_EQ(sc.depth, st.depth);
+        for (int j = 0; j < 5; ++j) CHECK(sc.a[j] == st.a[j]);
+        for (int d = 0; d <= 5; ++d) CHECK(chain.yield(sc, d) == tree.yield(st, d));
+    }
+    /* A fixed window: the main chain. */
+    DraftController fixed = tree_controller(false, 0, 5);
+    DraftAdapt w;
+    CHECK_EQ(fixed.window_for(w), 5);
+    CHECK_EQ(fixed.next_depth(), 5);
+}
+
+/* A branch node's worth is its chance of being on the accepted path; the nodes are depth-major. */
+TEST(a_tree_layouts_branch_nodes_are_worth_their_chance_of_the_accepted_path) {
+    DraftController c = tree_controller(true, 2, 2);
+    CHECK_EQ(c.node_cap(), 9);
+    DraftAdapt s = tree_estimate(c, 0.4, 0.8, 0.5);
+    s.q[1] = 0.25f;
+    const double a0 = (double)s.a[0], a1 = (double)s.a[1], q0 = (double)s.q[0], q1 = (double)s.q[1];
+    CHECK_NEAR(c.node_chance(s, 1), a0, 1e-12);
+    CHECK_NEAR(c.node_chance(s, 2), a0 * a1, 1e-12);
+    CHECK_NEAR(c.node_chance(s, 6), (1 - a0) * q0, 1e-12);                 /* branch 0, depth 1 */
+    CHECK_NEAR(c.node_chance(s, 7), (1 - a0) * (1 - q0) * q1, 1e-12);      /* branch 1, depth 1 */
+    CHECK_NEAR(c.node_chance(s, 8), (1 - a0) * q0 * a1, 1e-12);            /* branch 0, depth 2 */
+    CHECK_NEAR(c.node_chance(s, 9), (1 - a0) * (1 - q0) * q1 * a1, 1e-12); /* branch 1, depth 2 */
+    CHECK_NEAR(c.node_chance(s, 10), 0.0, 1e-12);                          /* past the live tree */
+    double e = c.yield(s, 5);
+    for (int n = 6; n <= 9; ++n) {
+        e += c.node_chance(s, n);
+        CHECK_NEAR(c.yield(s, n), e, 1e-12);
+    }
+    CHECK_NEAR(c.yield(s, 12), e, 1e-12);                                  /* capped at the tree */
+    /* The live shape is clamped to the layout. */
+    c.set_tree(7, 9, false);
+    CHECK_EQ(c.tree_b(), 3);
+    CHECK_EQ(c.tree_l(), 5);
+    CHECK_EQ(c.node_cap(), 20);
+    c.set_tree(-1, 0, true);
+    CHECK_EQ(c.tree_b(), 0);
+    CHECK_EQ(c.tree_l(), 1);
+    CHECK(!c.tree_force());                                                /* no branches, no force */
+    CHECK_EQ(c.node_cap(), 5);
+    /* A layout the window cannot hold is refused. */
+    DraftController bad;
+    DraftController::Params p;
+    p.max_depth = 12;
+    p.adapt = true;
+    p.tree_k = 5;
+    p.tree_bmax = 3;
+    p.tree_lmax = 5;
+    CHECK(bad.configure(p) != RAD_OK);
+}
+
+/* The step's node count is the chain's choice extended: a sequence whose stop reaches the main
+ * chain's end may verify branch nodes, each priced by the measured step cost at that node count.
+ * Cheap rows (one sequence, weight-bound) take the whole tree; dear rows (a MoE reading each row's
+ * experts, as under load) keep the main chain -- the tree reduces itself. */
+TEST(a_tree_layouts_branches_are_verified_where_the_step_cost_pays_for_them) {
+    {
+        DraftController c = tree_controller(true, 3, 1);
+        CHECK_EQ(c.node_cap(), 8);
+        for (int d = 1; d <= 8; ++d) c.step_time(d, 1, d <= 5 ? 10.0 : 10.1);
+        DraftAdapt s = tree_estimate(c, 0.4, 0.95, 0.5);
+        CHECK_EQ(s.depth, 5);
+        CHECK_EQ(c.stop_nodes(s), 8);
+        DraftAdapt* one[1] = { &s };
+        CHECK_EQ(c.plan_step(one, 1, 1), 8);
+        CHECK_EQ(c.window_for(s), 8);
+        /* A sequence whose own chain stops short verifies no branch whatever the step's depth. */
+        DraftAdapt shallow = tree_estimate(c, 0.3, 0.3, 0.9);
+        CHECK_EQ(shallow.depth, 1);
+        CHECK_EQ(c.stop_nodes(shallow), 1);
+        CHECK_EQ(c.window_for(shallow), 1);
+    }
+    {
+        DraftController c = tree_controller(true, 3, 1);
+        for (int d = 1; d <= 8; ++d) c.step_time(d, 1, d <= 5 ? 10.0 : 14.0);
+        DraftAdapt s = tree_estimate(c, 0.4, 0.95, 0.5);
+        DraftAdapt* one[1] = { &s };
+        CHECK_EQ(c.plan_step(one, 1, 1), 5);
+        CHECK_EQ(c.window_for(s), 5);
+    }
+    {
+        /* Under load: eight sequences, each branch node a row of each. */
+        DraftController c = tree_controller(true, 3, 1);
+        for (int d = 1; d <= 8; ++d) c.step_time(d, 8, 30.0 + 2.5 * 8 * d);
+        std::vector<DraftAdapt> ss(8, tree_estimate(c, 0.4, 0.95, 0.5));
+        std::vector<DraftAdapt*> ps;
+        for (DraftAdapt& x : ss) ps.push_back(&x);
+        CHECK(c.plan_step(ps.data(), 8, 8) <= 5);
+    }
+}
+
+/* force (a measurement switch): every drafting step verifies the whole tree for every drafting
+ * sequence, whatever its stop; depth 0 alone still decides whether a step drafts (its decision is
+ * the chain's, reading the whole tree's yield at the whole tree's step cost). */
+TEST(a_forced_tree_verifies_the_whole_tree_at_every_drafting_step) {
+    DraftController c = tree_controller(true, 3, 2, true);
+    CHECK(c.tree_force());
+    CHECK_EQ(c.node_cap(), 11);
+    DraftAdapt s = tree_estimate(c, 0.9, 0.9, 0.3);
+    DraftAdapt shallow = tree_estimate(c, 0.3, 0.3, 0.9);
+    CHECK_EQ(shallow.depth, 1);
+    DraftAdapt* two[2] = { &s, &shallow };
+    CHECK(c.plan_step(two, 2, 2) >= 1);
+    CHECK_EQ(c.window_for(s), 11);
+    CHECK_EQ(c.window_for(shallow), 11);
+    CHECK_EQ(c.step_window(), 11);
+    /* Off again: the priced window. */
+    c.set_tree(3, 2, false);
+    CHECK_EQ(c.window_for(shallow), 1);
+    /* A fixed window verifies the live tree too. */
+    DraftController fixed = tree_controller(false, 2, 3);
+    DraftAdapt w;
+    CHECK_EQ(fixed.window_for(w), 11);
+    CHECK_EQ(fixed.next_depth(), 11);
+}
+
+/* A tree verify's outcome: the main chain is a chain verify of its nodes, accepted as deep as the
+ * path when the path is its own; a branch's first node is evaluated only where the main chain's
+ * first draft and every lower branch were not the target's. */
+TEST(a_tree_verify_updates_the_main_chain_and_the_branches_it_evaluated) {
+    DraftController c = tree_controller(true, 3, 2);
+    DraftController chain = adaptive_controller(5);
+    const float prior = (float)DraftController::kTreePrior;
+    {   /* through branch 1 (node K + 2): the main chain missed at 1, branch 0 missed, branch 1 hit */
+        DraftAdapt s, ref;
+        c.adapt_observe_tree(s, 11, 2, 7);
+        chain.adapt_observe(ref, 5, 0);
+        for (int j = 0; j < 5; ++j) CHECK(s.a[j] == ref.a[j]);
+        CHECK(s.q[0] < prior);
+        CHECK(s.q[1] > prior);
+        CHECK(s.q[2] == prior);
+        CHECK_EQ((int)s.qn[0], 1);
+        CHECK_EQ((int)s.qn[1], 1);
+        CHECK_EQ((int)s.qn[2], 0);
+    }
+    {   /* through the main chain, three deep: a chain verify of 5 accepting 3; no branch evaluated */
+        DraftAdapt s, ref;
+        c.adapt_observe_tree(s, 11, 3, 1);
+        chain.adapt_observe(ref, 5, 3);
+        for (int j = 0; j < 5; ++j) CHECK(s.a[j] == ref.a[j]);
+        for (int b = 0; b < 3; ++b) CHECK(s.q[b] == prior);
+    }
+    {   /* nothing accepted: every verified branch first node missed */
+        DraftAdapt s;
+        c.adapt_observe_tree(s, 8, 0, 0);
+        CHECK(s.q[0] < prior);
+        CHECK(s.q[1] < prior);
+        CHECK(s.q[2] < prior);
+    }
+    {   /* only the main chain verified (a window short of the branches): no branch evaluated */
+        DraftAdapt s;
+        c.adapt_observe_tree(s, 5, 0, 0);
+        for (int b = 0; b < 3; ++b) CHECK(s.q[b] == prior);
+        DraftAdapt t;
+        c.adapt_observe_tree(t, 6, 0, 0);                 /* one branch node verified */
+        CHECK(t.q[0] < prior);
+        CHECK(t.q[1] == prior);
+    }
+}
+
+/* The verify-path harness over a tree: the main chain is the chain harness's ids; where its first
+ * draft is a miss, exactly one branch takes the true id at depth 1 and the harness's ids below;
+ * no other branch node is ever the true id at its depth. */
+TEST(the_harness_builds_an_oracle_tree_on_the_heads_layout) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    std::vector<int32_t> ids;
+    for (int i = 0; i < 400; ++i) ids.push_back(1000 + (i * 37) % 900);
+    const int K = 5, B = 3, L = 2, n_nodes = K + B * L;
+    int32_t par[RAD_SCHED_MAX_SPEC];
+    for (int j = 1; j <= K; ++j) par[j - 1] = j - 1;
+    for (int k = 1; k <= L; ++k)
+        for (int b = 0; b < B; ++b) {
+            const int n = K + (k - 1) * B + b + 1;
+            par[n - 1] = k == 1 ? 0 : n - B;
+        }
+    int misses = 0, wins = 0;
+    for (int64_t n = 0; n < 300; ++n) {
+        int32_t out[RAD_SCHED_MAX_SPEC];
+        for (int j = 0; j < n_nodes; ++j) out[j] = -7;
+        CHECK_EQ(f.sch.test_oracle_tree(ids, 65536, n, n_nodes, par, out), n_nodes);
+        for (int j = 1; j <= K; ++j) {
+            const int32_t t = ids[(size_t)(n + j - 1)];
+            CHECK(out[j - 1] == t || out[j - 1] == (t + 1) % 65536);
+        }
+        const bool miss1 = out[0] != ids[(size_t)n];
+        misses += miss1;
+        int winners = 0;
+        for (int b = 0; b < B; ++b) {
+            const int n1 = K + b + 1;
+            const int32_t t1 = ids[(size_t)n];
+            if (out[n1 - 1] == t1) {
+                ++winners;
+                const int n2 = n1 + B;
+                const int32_t t2 = ids[(size_t)(n + 1)];
+                CHECK(out[n2 - 1] == t2 || out[n2 - 1] == (t2 + 1) % 65536);
+            } else {
+                for (int k = 1; k <= L; ++k) CHECK(out[K + (k - 1) * B + b] != ids[(size_t)(n + k - 1)]);
+            }
+        }
+        CHECK_EQ(winners, miss1 ? 1 : 0);
+        wins += winners;
+    }
+    CHECK(misses > 30);
+    CHECK_EQ(wins, misses);
+    /* Past the file the head's tokens stay. */
+    int32_t out[RAD_SCHED_MAX_SPEC];
+    for (int j = 0; j < n_nodes; ++j) out[j] = -7;
+    CHECK(f.sch.test_oracle_tree(ids, 65536, 399, n_nodes, par, out) < n_nodes);
+    CHECK_EQ(out[1], -7);
+}
+
+/* At the scheduler: the live tree caps every verify at K + B L, B = 0 at the main chain; a step
+ * carrying a prefill chunk verifies the main chain alone, as a chain; the hybrid is allowed. */
+TEST(a_tree_layouts_verify_count_follows_the_live_tree_and_a_prefill_step_takes_the_chain) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512);
+    f.cfg.n_spec = 20;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 20;
+    f.prog.drafter.block = 5;
+    f.prog.drafter_tree = true;
+    f.prog.drafter_tree_k = 5;
+    f.prog.drafter_tree_bmax = 3;
+    f.prog.drafter_tree_lmax = 5;
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.set_draft_hybrid(1), 1);            /* a layout's main chain is a chain head */
+    CHECK_EQ(f.sch.set_draft_hybrid(0), 0);
+    f.sch.set_tree_live(2, 2, 0);
+    CHECK_EQ(f.sch.draft_controller().node_cap(), 9);
+
+    const uint64_t a = f.submit(40, 400);
+    auto commit_plain = [&]() {
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> acc(p.e.size(), 0), tok(p.e.size(), 3000);
+        std::vector<uint8_t> eos(p.e.size(), 0);
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = acc.data();
+        res.token = tok.data();
+        res.eos = eos.data();
+        CHECK_OK(f.sch.commit(res));
+    };
+    for (int t = 0; t < 6 && f.sch.find(a)->output.empty(); ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        commit_plain();
+    }
+    REQUIRE(!f.sch.find(a)->output.empty());
+    int32_t tok[20], par[20];
+    for (int j = 0; j < 20; ++j) tok[j] = 4000 + j;
+    for (int j = 1; j <= 5; ++j) par[j - 1] = j - 1;
+    for (int k = 1; k <= 5; ++k)
+        for (int b = 0; b < 3; ++b) {
+            const int n = 5 + (k - 1) * 3 + b + 1;
+            par[n - 1] = k == 1 ? 0 : n - 3;
+        }
+    auto entry = [&](uint64_t id) -> const StepEntry* {
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == id) return &e;
+        return nullptr;
+    };
+    /* Decode only: the tree, 5 + 2 x 2 nodes. */
+    CHECK_OK(f.sch.set_draft(a, tok, 20, par));
+    REQUIRE(f.sch.step() != nullptr);
+    {
+        const StepEntry* e = entry(a);
+        REQUIRE(e != nullptr);
+        CHECK(f.sch.plan().spec_is_tree);
+        CHECK_EQ(e->n_spec, 9);
+        CHECK(e->draft_parent != nullptr);
+        CHECK_EQ(e->n_tokens, 10);
+    }
+    commit_plain();
+    /* B = 0: the main chain, staged as the chain-shaped tree. */
+    f.sch.set_tree_live(0, 5, 0);
+    CHECK_OK(f.sch.set_draft(a, tok, 20, par));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(entry(a)->n_spec, 5);
+    commit_plain();
+    /* A prefill beside it: the main chain alone, as a chain. */
+    f.sch.set_tree_live(3, 5, 0);
+    CHECK_OK(f.sch.set_draft(a, tok, 20, par));
+    const uint64_t b = f.submit(64, 10);
+    REQUIRE(f.sch.step() != nullptr);
+    {
+        const StepEntry* e = entry(a);
+        const StepEntry* eb = entry(b);
+        REQUIRE(e != nullptr);
+        REQUIRE(eb != nullptr);
+        CHECK(eb->is_prefill);
+        CHECK(!f.sch.plan().spec_is_tree);
+        CHECK_EQ(e->n_spec, 5);
+        CHECK_EQ(e->n_tokens, 6);
+        CHECK(e->draft_parent == nullptr);
+        CHECK_EQ(f.sch.find(a)->n_draft, 5);
+        CHECK(f.sch.find(a)->draft_parent == nullptr);
+        CHECK_EQ(f.sch.tree_chain_steps(), (int64_t)1);
+        int64_t rows = 0;
+        for (const StepEntry& x : f.sch.plan().e) rows += x.n_tokens;
+        CHECK_EQ(f.sch.plan().n_tok, rows);
+    }
+    commit_plain();
 }
 
 TEST(prompt_lookup_alone_follows_its_own_acceptance) {

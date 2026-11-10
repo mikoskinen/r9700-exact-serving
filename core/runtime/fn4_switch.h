@@ -84,6 +84,17 @@
  *                   step (MoeFP8 shared_one_external), 0 by every MoE layer as before. RADIANCE_DS41_ONEFILL=1
  *                   declares the step's fill (starts at 1); unset: 1 refused. Exact: the gathers read the same ones.
  *
+ *   dspark_tree     deepseek41 (lever T1, RADIANCE_DS41_DSPARK_TREE=1 declares the tree): the DSpark tree's
+ *                   alternative branches at position 1, 0 .. 3 (0: the main chain alone, today's proposal), each a
+ *                   chain of the walk from the next-best first draft. The scheduler reads the applied value every
+ *                   draft cycle (tree_live) and prices the branches' nodes (sched/draft.h); unset: refused, no
+ *                   plugin serves it. Exact: a tree is verified, every emitted token is the target's.
+ *   dspark_tree_depth  deepseek41: the branches' depth, 1 .. 5 (the verify's node prefix: depth-major nodes).
+ *   dspark_tree_force  deepseek41: 1 every drafting step verifies the whole tree for every drafting sequence
+ *                   (main chain + dspark_tree branches of dspark_tree_depth), whatever its adaptive stop (depth 0
+ *                   still drafts nothing); 0 the adaptive window prices each alternative node with the step-cost
+ *                   model. A measurement switch.
+ *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
  *
@@ -105,7 +116,7 @@ namespace fn4 {
 
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
-              kDraftLend, kDraftLendBorrow, kSwitches };
+              kDraftLend, kDraftLendBorrow, kDsparkTree, kDsparkTreeDepth, kDsparkTreeForce, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -145,6 +156,13 @@ void note_lend_sched(int64_t lent_cycles, int64_t plain_steps, int64_t plain_ms,
  * the drafter's slab in MiB. */
 void note_lend_engine(int64_t state, int64_t lends, int64_t reclaims, int64_t lent_units, int64_t draft_resident,
                       int64_t draft_units, int64_t slab_mib);
+
+/* The tree switches (dspark_tree, dspark_tree_depth, dspark_tree_force) as last applied, read without a lock by
+ * the scheduler every draft cycle: -1 until tree_prime() read the serving plugin's start value, or where no
+ * plugin serves the switch. tree_prime takes the registry's lock and asks the plugins; the scheduler calls it
+ * once at its init (the plugins are loaded by then), apply_pending keeps the value after every change. */
+int  tree_live(int i);
+void tree_prime();
 
 /* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. */
 bool check(const std::string& name, int value, std::string* err);
