@@ -21101,6 +21101,7 @@ static void ds_mr_check(const Plugin& pl, const char* tlist) {
                            { 4, 1, 8, 0, 0 }, { 4, 2, 0, 0, 0 }, { 4, 2, 3, 0, 0 }, { 4, 1, 0, 0, 1 }, { 4, 2, 0, 0, 1 },
                            { 2, 2, 0, 0, 1 }, { 1, 1, 0, 2, 1 }, { -1, 0, 0, 0, 0 } };
     long long launches = 0, diffs = 0, diffs64 = 0, info_rows = 0, info_same = 0;
+    int planned = 0, done = 0;   /* (type, shape) pairs; a pair that could not run makes the verdict INCOMPLETE */
     std::printf("lever D2 byte check: the multi-row form vs the stock decode band, M = 1..48, %d forms each\n",
                 (int)(sizeof(pins) / sizeof(pins[0])));
     for (const MrTy& ty : kMrTypes) {
@@ -21108,6 +21109,7 @@ static void ds_mr_check(const Plugin& pl, const char* tlist) {
         for (const MrShape& sh : kMrShapes) {
             if (sh.logits && std::strcmp(ty.name, "q6_K")) continue;   /* the head is q6_K; f32 logits only there */
             if (sh.K % ty.qk) continue;
+            ++planned;
             dfree_all();
             std::vector<uint8_t> hw;
             mr_weights(hw, ty, sh.N, sh.K, 0x9E3779B97F4A7C15ull ^ (uint64_t)(sh.N * 131 + sh.K));
@@ -21141,7 +21143,12 @@ static void ds_mr_check(const Plugin& pl, const char* tlist) {
                 h.pin(0, 0, 0, 0);
                 st_memset(d_y, 0xff, mb);
                 int rc = L.run(d_x, d_w, d_y);
-                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  FAIL %s %s M=%lld stock rc %d\n", ty.name, sh.name, (long long)M, rc); ++g_fail; continue; }
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+                    std::printf("  FAIL %s %s M=%lld stock rc %d\n", ty.name, sh.name, (long long)M, rc);
+                    fails += fmt(" M=%lld stock rc %d;", (long long)M, rc);
+                    ++bad_m;
+                    continue;
+                }
                 st_memcpy(ref.data(), d_y, mb, hipMemcpyDeviceToHost);
                 bool same_alone = true;
                 for (int64_t m = 0; m < M; ++m)
@@ -21172,6 +21179,7 @@ static void ds_mr_check(const Plugin& pl, const char* tlist) {
                 bad_m += mbad ? 1 : 0;
             }
             g_fail += bad_m ? 1 : 0;
+            ++done;
             std::printf("MRCHECK %s %s %lldx%lld%s M=1..48: %s (%d of 48 M with a difference)%s; MRINFO stock row alone == row in the M call at %d of 48 M\n",
                         ty.name, sh.name, (long long)sh.N, (long long)sh.K, sh.logits ? " f32" : "",
                         bad_m ? "DIFFERS" : "identical in every form", bad_m, fails.c_str(), info_m);
@@ -21179,9 +21187,11 @@ static void ds_mr_check(const Plugin& pl, const char* tlist) {
         }
     }
     dfree_all();
-    std::printf("MRVERDICT check: %lld form launches; wave32 forms %lld differ, wave64 forms %lld differ -> %s; stock row alone == in-call row at %lld of %lld (type, shape, M)\n",
-                launches, diffs, diffs64,
-                diffs ? "FAIL" : (diffs64 ? "PASS for the wave32 forms (byte-identical), FAIL for wave64" : "PASS (byte-identical, every form)"),
+    const bool complete = done == planned && planned > 0 && launches > 0;
+    if (!complete) ++g_fail;
+    std::printf("MRVERDICT check: %d of %d (type, shape) pairs ran, %lld form launches; wave32 forms %lld differ, wave64 forms %lld differ -> %s; stock row alone == in-call row at %lld of %lld (type, shape, M)\n",
+                done, planned, launches, diffs, diffs64,
+                !complete ? "INCOMPLETE" : diffs ? "FAIL" : (diffs64 ? "PASS for the wave32 forms (byte-identical), FAIL for wave64" : "PASS (byte-identical, every form)"),
                 info_same, info_rows);
 }
 
@@ -21296,9 +21306,10 @@ static void ds_mr_perf(const Plugin& pl, const char* mlist, int iters, const cha
         }
     }
     dfree_all();
+    if (nsum == 0) ++g_fail;
     std::printf("MRVERDICT %s: %d (type, shape, M); mr best vs stock rule geomean x%.2f, vs stock best x%.2f; faster than stock best at %d; bytes %s\n",
                 mode, nsum, nsum ? std::exp(lsum_vs_rule / nsum) : 0.0, nsum ? std::exp(lsum_vs_best / nsum) : 0.0, nwin,
-                ndiff ? fmt("DIFFER at %d", ndiff).c_str() : "identical everywhere");
+                nsum == 0 ? "NO DATA" : ndiff ? fmt("DIFFER at %d", ndiff).c_str() : "identical everywhere");
 }
 
 /* The gated residual's read at int8 codes. The same inputs run with the codes plane as E4M3 and
