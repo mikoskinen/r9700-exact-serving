@@ -4795,6 +4795,92 @@ TEST(a_recomputed_shared_prefix_keeps_its_original_host_copy_and_snapshot) {
     x.t.report(restore, false);                  /* leave the unstarted restore in host memory */
 }
 
+TEST(a_head_a_short_prompt_published_first_takes_the_bytes_a_longer_prompts_snapshot_rests_on) {
+    /* The reverse of the test above (R1, 10.11.2026). Every chat prompt starts with the same
+     * entry, and a short request (a warm-up question, one chunk) publishes it first, with no
+     * snapshot past it. A long prompt then recomputes that entry inside its own first chunk,
+     * which can round it differently, and writes its snapshots from ITS bytes. If the cache kept
+     * the short request's copy, a hit of the long chain would restore bytes its snapshot was
+     * never computed from, and answer differently from the cold run. The long request's copy
+     * takes the entry over, and from then on a snapshot rests on it: a later short request
+     * cannot take it back. */
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    const auto prompt = tok_run(7600, 336);
+    const auto keys = chain_of(prompt);
+
+    /* The short request: the head (entries 0 and 1) and its own tail, no snapshot. */
+    std::vector<int32_t> short_prompt(prompt.begin(), prompt.begin() + 32);
+    const auto tail = tok_run(9600, 32);
+    short_prompt.insert(short_prompt.end(), tail.begin(), tail.end());
+    publish(x.f, 1, short_prompt, 64);
+    const std::vector<int32_t> first = x.f.kv.block_table(1, G_FULL);
+    x.f.kv.free_sequence(1);
+    REQUIRE_EQ(copy_now(x.t).size(), 4u);           /* clean: the old head has a host copy */
+    CHECK_EQ(x.f.pc.lookup(prompt, {}).n_linear_tokens, 0);   /* nothing to resume from */
+
+    /* The long request recomputes the whole prompt in its own blocks, commits its snapshot at
+     * 320 mid-request (as the engine does, before the publish), then publishes. */
+    CHECK_OK(x.f.kv.add_sequence(2));
+    CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+    const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+    REQUIRE(mine[0] != first[0] && mine[1] != first[1]);
+    ckpt_at(x.f, 2, keys, 320);
+    CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+    CHECK_EQ(x.f.pc.stats().republished, 2ll);
+
+    /* A hit of the long chain now reads the long request's own head, the bytes under its
+     * snapshot, and the short request's copy is gone from VRAM and from host memory. */
+    std::vector<std::vector<int32_t>> hit;
+    const CacheHit h = x.f.pc.lookup(prompt, {}, &hit);
+    CHECK_EQ(h.n_linear_tokens, 320);
+    REQUIRE(hit.size() == 1u && hit[0].size() >= 20u);
+    for (int i = 0; i < 20; ++i) CHECK_EQ(hit[0][(size_t)i], mine[(size_t)i]);
+    CHECK_EQ(x.f.kv.block_refcount(G_FULL, first[0]), 0);
+    CHECK_EQ(x.f.kv.block_refcount(G_FULL, first[1]), 0);
+    CHECK(!x.t.droppable(keys[0]));                 /* the old host copy went with the old bytes */
+    CHECK(x.t.writeback_waiting());                 /* and the new head is queued for its own */
+    x.f.kv.free_sequence(2);
+
+    /* A later short request recomputing the head keeps nothing of its own there: a snapshot
+     * rests on the long request's copy now, and the short one has no snapshot past it. */
+    publish(x.f, 3, short_prompt, 64);
+    x.f.kv.free_sequence(3);
+    std::vector<std::vector<int32_t>> again;
+    x.f.pc.lookup(prompt, {}, &again);
+    REQUIRE(again.size() == 1u && again[0].size() >= 2u);
+    CHECK_EQ(again[0][0], mine[0]);
+    CHECK_EQ(again[0][1], mine[1]);
+    CHECK_EQ(x.f.pc.stats().republished, 2ll);
+}
+
+TEST(a_head_a_live_sequence_adopted_keeps_its_bytes_for_that_sequence) {
+    /* The old copy goes only when nothing else reads it: a running sequence that adopted the
+     * short request's head may have snapshots of its own resting on it. */
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    const auto prompt = tok_run(7600, 336);
+    const auto keys = chain_of(prompt);
+    std::vector<int32_t> short_prompt(prompt.begin(), prompt.begin() + 32);
+    const auto tail = tok_run(9600, 32);
+    short_prompt.insert(short_prompt.end(), tail.begin(), tail.end());
+    publish(x.f, 1, short_prompt, 64);              /* sequence 1 stays live on the head */
+    const std::vector<int32_t> first = x.f.kv.block_table(1, G_FULL);
+
+    CHECK_OK(x.f.kv.add_sequence(2));
+    CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+    const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+    ckpt_at(x.f, 2, keys, 320);
+    CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+    CHECK_EQ(x.f.pc.stats().republished, 0ll);
+    std::vector<std::vector<int32_t>> hit;
+    x.f.pc.lookup(prompt, {}, &hit);
+    REQUIRE(hit.size() == 1u && hit[0].size() >= 2u);
+    CHECK_EQ(hit[0][0], first[0]);                  /* kept: sequence 1 still reads it */
+    x.f.kv.free_sequence(1);
+    x.f.kv.free_sequence(2);
+}
+
 TEST(an_entry_a_running_sequence_reads_is_dropped_once_the_sequence_lets_go) {
     /* Dropping a block a sequence also holds would free nothing while the entry read off-device,
      * so the next lookup would restore a second copy beside it. */
