@@ -40,6 +40,8 @@
 #include "r4d_emit.h"
 #include "r4d_plugin.h"
 #include "r4d_ds41_ggml_mr.h"
+#include "r4d_ds41_mxfp4_mr.h"
+#include "r4d_gemm_bf16_nt_pf.h"
 
 #include <atomic>
 #include <cmath>
@@ -4094,14 +4096,20 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
  * rad_fn4_switch applies, called between steps with every rank thread parked: 1 = applied, 0 = not a libr4d switch,
  * < 0 = refused (a value this libr4d does not know). rad_fn4_accepts says the same without applying (the server
  * checks a request with it before queueing), rad_fn4_value what is applied (what /admin/fn4 reports). */
+/* The drafter's kernels (ds41-drk): "drafter_mx" 0 / 1, moe_gemm_ggml type=mxfp4 in the multi-row forms
+ * (r4d_ds41_mxfp4_mr.hip, RADIANCE_DS41_DRAFTER_MX at load); "drafter_bf" 0 / 1, gemm_nt bf16's decode band in the
+ * prefetching form (r4d_gemm_bf16_nt_pf.hip, RADIANCE_DS41_DRAFTER_BF). Both keep the stock kernels' bits. */
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
+    if (!std::strcmp(name, "drafter_mx") || !std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
+    if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
+    if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
     g_gg_gemv.store(value, std::memory_order_relaxed);
     r4d_gg_mr_set(value == 2);   /* lever D2's form runs ahead of gg_gemm's stock launch while on */
     return 1;
@@ -4112,6 +4120,8 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         *applied = g_gg_gemv.load(std::memory_order_relaxed);
         return 1;
     }
+    if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
+    if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
     return 0;
 }
 

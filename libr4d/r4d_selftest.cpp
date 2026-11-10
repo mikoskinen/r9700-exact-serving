@@ -65,6 +65,7 @@
 #include <random>
 #include <string>
 #include <condition_variable>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -21851,6 +21852,477 @@ static void ds_mr_perf(const Plugin& pl, const char* mlist, int iters, const cha
                 nsum == 0 ? "NO DATA" : ndiff ? fmt("DIFFER at %d", ndiff).c_str() : "identical everywhere");
 }
 
+/* ---- ds41-drk (10.11.2026): the DSpark drafter's kernels at DeepSeek-V4.1-Flash's TP4 layout, through the rows the
+ * engine runs, against the stock path with the switches' pins cleared.
+ *   drafter_mx: moe_gemm_ggml type=mxfp4 (128 experts, 32 a rank, top 3; gate_up 4608 x 5120 by token rows, down
+ *     5120 x 2304 by sorted rows), the multi-row forms (r4d_mx_mr_pin) vs mx_moe's gemv band / tiled kernel.
+ *   drafter_bf: gemm_nt bf16 (gemm_bf16_nt_m64, the M <= 16 row forwards to it) at the drafter's linears, the
+ *     prefetching form (r4d_bf_pf_pin) vs the stock skinny WMMA kernel. */
+struct DrkHooks {
+    void (*mx_pin)(int, int, int, int, int, int) = nullptr;
+    const char* (*mx_last)() = nullptr;
+    void (*bf_pin)(int, int, int, int) = nullptr;
+    const char* (*bf_last)() = nullptr;
+};
+static DrkHooks drk_hooks(const Plugin& pl) {
+    DrkHooks h;
+    h.mx_pin = (void (*)(int, int, int, int, int, int))dlsym(pl.h, "r4d_mx_mr_pin");
+    h.mx_last = (const char* (*)())dlsym(pl.h, "r4d_mx_mr_last");
+    h.bf_pin = (void (*)(int, int, int, int))dlsym(pl.h, "r4d_bf_pf_pin");
+    h.bf_last = (const char* (*)())dlsym(pl.h, "r4d_bf_pf_last");
+    return h;
+}
+
+/* A step's routing as the drafter makes it: `seqs` sequences of 5 rows (a token count that is not a multiple of 5
+ * makes the last sequence short), each row top 3 of 128 experts, a sequence's rows drawn mostly (7 in 10) from a
+ * pool of 6 experts of its own, so an expert sees several rows of one sequence as the drafter's similar rows do.
+ * This rank's 32 experts' slots, grouped by expert in slot order, then (tail = true) the step's other slots as
+ * dropped (-1) up to tokens x 3. */
+struct MxRoute { std::vector<int32_t> sorted, off; int64_t live = 0, experts = 0, rmax = 0; };
+static MxRoute mx_route(int64_t tokens, int rank, bool tail, uint64_t seed) {
+    const int64_t EG = 128, E = 32, top_k = 3;
+    uint64_t rs = seed;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<std::vector<int32_t>> by((size_t)EG);
+    std::vector<int32_t> pool(6);
+    for (int64_t t = 0; t < tokens; ++t) {
+        if (t % 5 == 0)
+            for (auto& p : pool) p = (int32_t)(rnd() % EG);
+        int32_t pick[3] = { -1, -1, -1 };
+        for (int j = 0; j < top_k; ++j) {
+            int32_t e;
+            int guard = 0;
+            do {
+                e = (rnd() % 10 < 7) ? pool[(size_t)(rnd() % pool.size())] : (int32_t)(rnd() % EG);
+            } while ((e == pick[0] || e == pick[1] || e == pick[2]) && ++guard < 64);
+            pick[j] = e;
+            by[(size_t)e].push_back((int32_t)(t * top_k + j));
+        }
+    }
+    MxRoute r;
+    r.off.assign((size_t)(E + 1), 0);
+    for (int64_t e = 0; e < E; ++e) {
+        const auto& v = by[(size_t)(rank * E + e)];
+        r.off[(size_t)(e + 1)] = r.off[(size_t)e] + (int32_t)v.size();
+        r.sorted.insert(r.sorted.end(), v.begin(), v.end());
+        r.experts += !v.empty();
+        r.rmax = std::max<int64_t>(r.rmax, (int64_t)v.size());
+    }
+    r.live = (int64_t)r.sorted.size();
+    if (tail) r.sorted.resize((size_t)(tokens * top_k), -1);
+    return r;
+}
+
+/* Random MXFP4 blocks (17 bytes: e8m0 then 16 code bytes) with exponents near 127, so products stay finite. */
+static void mx_blocks(std::vector<uint8_t>& w, int64_t rows, int64_t K, uint64_t seed) {
+    uint64_t rs = seed;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    const int64_t nb = K / 32;
+    w.resize((size_t)(rows * nb * 17));
+    for (int64_t b = 0; b < rows * nb; ++b) {
+        uint8_t* p = w.data() + b * 17;
+        p[0] = (uint8_t)(118 + rnd() % 14);
+        for (int i = 1; i < 17; ++i) p[i] = (uint8_t)rnd();
+    }
+}
+
+struct MxCase { const char* name; int64_t N, K; bool sorted_rows; };
+static const MxCase kMxCases[] = { { "gate_up", 4608, 5120, false }, { "down", 5120, 2304, true } };
+
+/* One moe_gemm_ggml type=mxfp4 launch (the gemv row or the tiled row) over E experts (stacked, or a table). */
+struct MxLaunch {
+    const RadKernelInfo* row = nullptr;
+    std::vector<RadTensor> ts;
+    std::vector<RadParam> ps;
+    RadArgs a{};
+};
+static bool mx_setup(MxLaunch& L, const Plugin& pl, bool gemv, const MxCase& c, int64_t tokens, int64_t AR, int64_t TR,
+                     void* d_x, void* d_w, bool table, void* d_so, void* d_of, void* d_y) {
+    L.row = find(pl, gemv ? "moe_gemm_ggml_mxfp4_gemv" : "moe_gemm_ggml_mxfp4_tiled");
+    if (!L.row) return false;
+    const int64_t E = 32, rb = c.K / 32 * 17;
+    L.ts = { T(d_x, RAD_BF16, { AR, c.K }), T(d_w, RAD_U8, { E, c.N, rb }), T(d_so, RAD_I32, { TR }),
+             T(d_of, RAD_I32, { E + 1 }), T(d_y, RAD_BF16, { TR, c.N }) };
+    if (table) L.ts[1].stride[0] = 0;
+    L.ps = { PI("M", tokens), PI("N", c.N), PI("K", c.K), PI("n_expert", E), PI("top_k", 3),
+             PS("a_order", c.sorted_rows ? "sorted" : "token"), PS("type", "mxfp4"), PS("dtype", "bf16") };
+    std::memset(&L.a, 0, sizeof(L.a));
+    L.a.t = L.ts.data(); L.a.n_t = (int)L.ts.size(); L.a.p = L.ps.data(); L.a.n_p = (int)L.ps.size(); L.a.world_size = 1;
+    return true;
+}
+
+/* --mxcheck: drafter_mx's forms vs the stock grouped GEMM, byte for byte: gate_up and down, tokens 1..48 (the gemv
+ * band to 16, the tiled kernel past it, and the tiled row also below 16), routings with and without the dropped
+ * tail, stacked experts and a pointer table, every form. One MXCHECK line a (projection, tokens); MXVERDICT. */
+static void ds_mx_check(const Plugin& pl) {
+    const DrkHooks h = drk_hooks(pl);
+    if (!h.mx_pin) { std::printf("--mxcheck: r4d_mx_mr_pin absent (a plugin without drafter_mx)\n"); return; }
+    struct P { int on, h, r, mt, wn, grid; };
+    const P pins[] = { { -1, 0, 0, 0, 0, 0 }, { 1, 4, 1, 2, 0, 0 }, { 1, 4, 1, 4, 0, 0 }, { 1, 4, 1, 8, 0, 0 }, { 1, 4, 1, 16, 0, 0 },
+                       { 1, 4, 2, 4, 0, 0 }, { 1, 4, 2, 8, 4, 0 }, { 1, 2, 1, 4, 0, 0 }, { 1, 2, 1, 8, 2, 7 }, { 1, 4, 1, 4, 1, 3 } };
+    const P spins[] = { { -1, 0, 0, 0, 0, 0 }, { 1, 0, 1, 2, 0, 0 }, { 1, 0, 1, 4, 0, 0 }, { 1, 0, 1, 8, 0, 0 }, { 1, 0, 2, 2, 0, 0 },
+                        { 1, 0, 2, 4, 8, 0 }, { 1, 0, 2, 8, 0, 0 }, { 1, 0, 1, 4, 1, 5 } };
+    const int64_t toks[] = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 17, 20, 24, 25, 30, 32, 40, 45, 48 };
+    long long launches = 0, diffs = 0, cases = 0;
+    std::printf("drafter_mx byte check: moe_gemm_ggml type=mxfp4, the multi-row forms vs the stock kernels\n");
+    for (const MxCase& c : kMxCases) {
+        dfree_all();
+        const int64_t E = 32, rb = c.K / 32 * 17, ebytes = c.N * rb;
+        std::vector<uint8_t> hw;
+        mx_blocks(hw, E * c.N, c.K, 0xC0FFEEull ^ (uint64_t)c.N);
+        void* d_w = dalloc(hw.size());
+        if (!d_w) { std::printf("  FAIL %s: alloc\n", c.name); ++g_fail; continue; }
+        st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
+        std::vector<void*> ptrs((size_t)E);
+        for (int64_t e = 0; e < E; ++e) ptrs[(size_t)e] = (uint8_t*)d_w + e * ebytes;
+        void* d_tab = dalloc(E * sizeof(void*));
+        st_memcpy(d_tab, ptrs.data(), E * sizeof(void*), hipMemcpyHostToDevice);
+        for (int64_t tk : toks)
+            for (int variant = 0; variant < 4; ++variant) {
+                const bool tail = variant & 1, table = variant & 2;
+                const MxRoute rt = mx_route(tk, (int)(tk % 4), tail, 0x51CEull * (uint64_t)(tk + 1) + (uint64_t)variant);
+                const int64_t T = (int64_t)rt.sorted.size();
+                if (T == 0) continue;
+                const int64_t AR = c.sorted_rows ? T : tk;
+                std::vector<uint16_t> hx((size_t)(AR * c.K));
+                uint64_t rs = 0x1234ull + (uint64_t)tk;
+                for (auto& v : hx) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; v = h_to_bf16((float)((int)(rs % 2001) - 1000) / 250.0f); }
+                void* d_x = dalloc(hx.size() * 2);
+                void* d_so = dalloc((size_t)T * 4);
+                void* d_of = dalloc((size_t)(E + 1) * 4);
+                void* d_y = dalloc((size_t)(T * c.N) * 2);
+                st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(d_so, rt.sorted.data(), (size_t)T * 4, hipMemcpyHostToDevice);
+                st_memcpy(d_of, rt.off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+                for (int gv = 0; gv < 2; ++gv) {
+                    const bool gemv = gv == 0;
+                    if (gemv && tk > 16) continue;   /* the engine's gemv row serves up to 16 tokens */
+                    MxLaunch L;
+                    if (!mx_setup(L, pl, gemv, c, tk, AR, T, d_x, table ? d_tab : d_w, table, d_so, d_of, d_y)) {
+                        std::printf("  %s: row absent\n", gemv ? "gemv" : "tiled"); continue;
+                    }
+                    const size_t yb = (size_t)(T * c.N) * 2;
+                    std::vector<uint8_t> ref(yb), got(yb);
+                    h.mx_pin(0, 0, 0, 0, 0, 0);
+                    st_memset(d_y, 0xff, yb);
+                    int rc = L.row->launch(&L.a, nullptr);
+                    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  FAIL %s tokens %lld stock rc %d\n", c.name, (long long)tk, rc); ++g_fail; continue; }
+                    st_memcpy(ref.data(), d_y, yb, hipMemcpyDeviceToHost);
+                    int bad = 0;
+                    const bool stock_gemv = gemv && tk <= 16;
+                    const P* plist = stock_gemv ? pins : spins;
+                    const size_t np = stock_gemv ? sizeof(pins) / sizeof(pins[0]) : sizeof(spins) / sizeof(spins[0]);
+                    for (size_t pi = 0; pi < np; ++pi) {
+                        const P& p = plist[pi];
+                        h.mx_pin(p.on, p.h, p.r, p.mt, p.wn, p.grid);
+                        st_memset(d_y, 0xff, yb);
+                        rc = L.row->launch(&L.a, nullptr);
+                        ++launches;
+                        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  FAIL %s tokens %lld pin %d/%d/%d/%d rc %d\n", c.name, (long long)tk, p.h, p.r, p.mt, p.wn, rc); ++bad; continue; }
+                        st_memcpy(got.data(), d_y, yb, hipMemcpyDeviceToHost);
+                        if (got != ref) {
+                            size_t nb = 0, first = 0;
+                            for (size_t e = 0; e < yb; e += 2)
+                                if (std::memcmp(&got[e], &ref[e], 2)) { if (!nb) first = e / 2; ++nb; }
+                            std::printf("  FAIL %s tokens %lld %s%s%s form %d/%d/%d/%d (%s): %zu of %zu outputs differ, first row %zu col %zu\n", c.name,
+                                        (long long)tk, gemv ? "gemv row" : "tiled row", tail ? " tail" : "", table ? " table" : "",
+                                        p.h, p.r, p.mt, p.wn, h.mx_last ? h.mx_last() : "?", nb, yb / 2, first / (size_t)c.N, first % (size_t)c.N);
+                            ++bad;
+                        }
+                    }
+                    h.mx_pin(0, 0, 0, 0, 0, 0);
+                    ++cases;
+                    diffs += bad;
+                    if (bad) ++g_fail;
+                    std::printf("MXCHECK %s %lldx%lld tokens %lld %s%s%s: %lld live slots over %lld experts (a run up to %lld): %s\n", c.name,
+                                (long long)c.N, (long long)c.K, (long long)tk, gemv ? "gemv row" : "tiled row", tail ? ", dropped tail" : "",
+                                table ? ", expert table" : "", (long long)rt.live, (long long)rt.experts, (long long)rt.rmax,
+                                bad ? "DIFFERS" : "identical in every form");
+                }
+                std::fflush(stdout);
+            }
+    }
+    dfree_all();
+    if (cases == 0) ++g_fail;
+    std::printf("MXVERDICT check: %lld cases, %lld form launches, %lld differ -> %s\n", cases, launches, diffs,
+                cases == 0 ? "INCOMPLETE" : diffs ? "FAIL" : "PASS (byte-identical, every form)");
+}
+
+/* --perfmx [tokens] [iters]: us a call of the stock grouped GEMM and drafter_mx's rule and pinned forms at the
+ * drafter's steps (5 rows a sequence: 1, 2, 4, 6, 8 users), gate_up and down, the experts streaming from DRAM (two
+ * rotated copies of the rank's 32, or --cold). MXPERF a (projection, tokens) with every form; MXSUM; MXVERDICT. */
+static void ds_mx_perf(const Plugin& pl, const char* tlist, int iters) {
+    if (iters <= 0) iters = 100;
+    const DrkHooks h = drk_hooks(pl);
+    if (!h.mx_pin) { std::printf("--perfmx: r4d_mx_mr_pin absent\n"); return; }
+    std::vector<int64_t> toks;
+    { std::string m = tlist && *tlist ? tlist : "5,10,20,30,40"; size_t p = 0;
+      while (p < m.size()) { size_t q = m.find(',', p); if (q == std::string::npos) q = m.size(); toks.push_back(std::strtoll(m.substr(p, q - p).c_str(), nullptr, 10)); p = q + 1; } }
+    const char* mode = g_cold > 0 ? "cold" : "rot";
+    struct P { int on, h, r, mt, wn; const char* nm; };
+    const P gp[] = { { -1, 0, 0, 0, 0, "rule" }, { 1, 4, 1, 2, 0, "g4r1m2" }, { 1, 4, 1, 4, 0, "g4r1m4" }, { 1, 4, 1, 8, 0, "g4r1m8" },
+                     { 1, 4, 2, 4, 0, "g4r2m4" }, { 1, 4, 1, 4, 4, "g4r1m4w4" }, { 1, 2, 1, 4, 0, "g2r1m4" } };
+    const P sp[] = { { -1, 0, 0, 0, 0, "rule" }, { 1, 0, 1, 2, 0, "s1m2" }, { 1, 0, 1, 4, 0, "s1m4" }, { 1, 0, 1, 8, 0, "s1m8" },
+                     { 1, 0, 2, 4, 0, "s2m4" }, { 1, 0, 1, 4, 8, "s1m4w8" }, { 1, 0, 1, 4, 2, "s1m4w2" } };
+    std::printf("drafter_mx timing (%s, %d launches): moe_gemm_ggml type=mxfp4 at the drafter's steps, stock vs the multi-row forms\n",
+                g_cold > 0 ? fmt("cold, %lld MiB read before each, median", (long long)(g_cold >> 20)).c_str() : "two rotated expert copies, mean", iters);
+    double lsum = 0; int n = 0, ndiff = 0;
+    for (const MxCase& c : kMxCases) {
+        dfree_all();
+        const int64_t E = 32, rb = c.K / 32 * 17, ebytes = c.N * rb;
+        std::vector<uint8_t> hw;
+        mx_blocks(hw, E * c.N, c.K, 0xFEEDull ^ (uint64_t)c.N);
+        void* d_w[2] = { dalloc(hw.size()), dalloc(hw.size()) };
+        if (!d_w[0] || !d_w[1]) { std::printf("  %s: alloc failed\n", c.name); continue; }
+        void* d_tab[2];
+        for (int k = 0; k < 2; ++k) {
+            st_memcpy(d_w[k], hw.data(), hw.size(), hipMemcpyHostToDevice);
+            std::vector<void*> ptrs((size_t)E);
+            for (int64_t e = 0; e < E; ++e) ptrs[(size_t)e] = (uint8_t*)d_w[k] + e * ebytes;
+            d_tab[k] = dalloc(E * sizeof(void*));
+            st_memcpy(d_tab[k], ptrs.data(), E * sizeof(void*), hipMemcpyHostToDevice);
+        }
+        for (int64_t tk : toks) {
+            if (tk < 1 || tk > 48) continue;
+            const MxRoute rt = mx_route(tk, 0, true, 0xD5A2Cull + (uint64_t)tk);
+            const int64_t T = (int64_t)rt.sorted.size(), AR = c.sorted_rows ? T : tk;
+            std::vector<uint16_t> hx((size_t)(AR * c.K));
+            uint64_t rs = 0x777ull + (uint64_t)tk;
+            for (auto& v : hx) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; v = h_to_bf16((float)((int)(rs % 2001) - 1000) / 250.0f); }
+            void* d_x = dalloc(hx.size() * 2);
+            void* d_so = dalloc((size_t)T * 4);
+            void* d_of = dalloc((size_t)(E + 1) * 4);
+            void* d_y = dalloc((size_t)(T * c.N) * 2);
+            st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_so, rt.sorted.data(), (size_t)T * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_of, rt.off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+            const bool gemv = tk <= 16;
+            MxLaunch L;
+            if (!mx_setup(L, pl, gemv, c, tk, AR, T, d_x, d_tab[0], true, d_so, d_of, d_y)) continue;
+            const size_t yb = (size_t)(T * c.N) * 2;
+            std::vector<uint8_t> ref;
+            auto timeit = [&](const char* nm, bool& same, std::string& form) -> double {
+                st_memset(d_y, 0xff, yb);
+                L.ts[1].data = d_tab[0];
+                const int rc = L.row->launch(&L.a, nullptr);
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { same = false; return -1.0; }
+                std::vector<uint8_t> got(yb);
+                st_memcpy(got.data(), d_y, yb, hipMemcpyDeviceToHost);
+                if (ref.empty()) ref = got;
+                same = got == ref;
+                form = std::strcmp(nm, "stock") && h.mx_last ? h.mx_last() : "";
+                for (int i = 0; i < 10; ++i) { L.ts[1].data = d_tab[i & 1]; L.row->launch(&L.a, nullptr); }
+                return st_time_us([&](int i) { L.ts[1].data = d_tab[i & 1]; L.row->launch(&L.a, nullptr); }, iters, nullptr);
+            };
+            h.mx_pin(0, 0, 0, 0, 0, 0);
+            bool s0 = true; std::string f0;
+            const double st = timeit("stock", s0, f0);
+            std::string line = fmt("MXPERF %s %lldx%lld tokens %lld (%lld slots on the rank, %lld experts, a run up to %lld) %s: stock %.1f;",
+                                   c.name, (long long)c.N, (long long)c.K, (long long)tk, (long long)rt.live, (long long)rt.experts,
+                                   (long long)rt.rmax, mode, st);
+            double best = -1, rule = -1; std::string bestn, bestf; bool alls = true;
+            const P* plist = gemv ? gp : sp;
+            const size_t np = gemv ? sizeof(gp) / sizeof(gp[0]) : sizeof(sp) / sizeof(sp[0]);
+            for (size_t pi = 0; pi < np; ++pi) {
+                const P& p = plist[pi];
+                h.mx_pin(p.on, p.h, p.r, p.mt, p.wn, 0);
+                bool same = true; std::string form;
+                const double us = timeit(p.nm, same, form);
+                alls = alls && same;
+                line += fmt(" %s %.1f [%s]%s;", p.nm, us, form.c_str(), same ? "" : " OUTPUT DIFFERS");
+                if (p.on < 0) rule = us;
+                if (us > 0 && same && (best < 0 || us < best)) { best = us; bestn = p.nm; bestf = form; }
+            }
+            h.mx_pin(0, 0, 0, 0, 0, 0);
+            std::printf("%s\n", line.c_str());
+            if (!alls) { ++ndiff; ++g_fail; }
+            if (st > 0 && best > 0) {
+                const double mb = (double)rt.experts * (double)ebytes / 1048576.0;
+                std::printf("MXSUM %s tokens %lld %s: stock %.1f us | rule %.1f | best %s %.1f [%s] | x%.2f vs stock | %.0f MiB of live experts, %.0f GB/s | bytes %s\n",
+                            c.name, (long long)tk, mode, st, rule, bestn.c_str(), best, bestf.c_str(), st / best, mb,
+                            mb * 1.048576e6 / (best * 1e3), alls ? "identical" : "DIFFER");
+                lsum += std::log(st / best); ++n;
+            }
+            std::fflush(stdout);
+        }
+    }
+    dfree_all();
+    if (n == 0) ++g_fail;
+    std::printf("MXVERDICT %s: %d (projection, tokens); best form vs stock geomean x%.2f; bytes %s\n", mode, n,
+                n ? std::exp(lsum / n) : 0.0, n == 0 ? "NO DATA" : ndiff ? fmt("DIFFER at %d", ndiff).c_str() : "identical everywhere");
+}
+
+/* The drafter's bf16 linears at TP4 (rank 0's width; the shared expert also at ranks 1-3's): attention q_a, q_b,
+ * kv, o_a (a group), o_b; the shared expert's gate_up and down; main_proj (dspark.fc, replicated). */
+struct BfShape { const char* name; int64_t N, K; };
+static const BfShape kBfShapes[] = { { "q_a", 1280, 5120 }, { "q_b", 8192, 1280 }, { "kv", 512, 5120 }, { "o_a", 1024, 4096 },
+                                      { "o_b", 5120, 2048 }, { "shexp_gate_up", 1536, 5120 }, { "shexp_down", 5120, 768 },
+                                      { "shexp_gate_up_w512", 1024, 5120 }, { "shexp_down_w512", 5120, 512 },
+                                      { "main_proj", 5120, 15360 } };
+static bool bf_setup(MrLaunch& L, const Plugin& pl, const BfShape& sh, int64_t M) {
+    L.row = find(pl, "gemm_bf16_nt_m64");
+    if (!L.row) return false;
+    L.ts = { T(nullptr, RAD_BF16, { M, sh.K }), T(nullptr, RAD_BF16, { sh.N, sh.K }), T(nullptr, RAD_BF16, { M, sh.N }) };
+    L.ps = { PI("M", M), PI("N", sh.N), PI("K", sh.K), PS("dtype", "bf16") };
+    std::memset(&L.a, 0, sizeof(L.a));
+    L.a.t = L.ts.data(); L.a.n_t = (int)L.ts.size(); L.a.p = L.ps.data(); L.a.n_p = (int)L.ps.size(); L.a.world_size = 1;
+    return true;
+}
+static void bf_fill(std::vector<uint16_t>& v, size_t n, uint64_t seed, float scale) {
+    v.resize(n);
+    uint64_t rs = seed;
+    for (auto& x : v) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; x = h_to_bf16((float)((int)(rs % 2001) - 1000) * scale); }
+}
+
+/* --bfcheck: drafter_bf's prefetching form vs the stock skinny bf16 GEMM, byte for byte, at the drafter's linears,
+ * M = 1..48, every form (CT 1 / 2 / 4 column tiles a wave, KU 4 / 8, WV). BFCHECK a shape; BFVERDICT. */
+static void ds_bf_check(const Plugin& pl) {
+    const DrkHooks h = drk_hooks(pl);
+    if (!h.bf_pin) { std::printf("--bfcheck: r4d_bf_pf_pin absent (a plugin without drafter_bf)\n"); return; }
+    struct P { int on, ct, ku, wv; };
+    const P pins[] = { { -1, 0, 0, 0 }, { 1, 1, 4, 0 }, { 1, 1, 8, 0 }, { 1, 2, 4, 0 }, { 1, 2, 8, 0 }, { 1, 4, 4, 0 }, { 1, 2, 8, 1 }, { 1, 1, 8, 4 } };
+    long long launches = 0, diffs = 0; int done = 0;
+    for (const BfShape& sh : kBfShapes) {
+        dfree_all();
+        std::vector<uint16_t> hw, hx;
+        bf_fill(hw, (size_t)(sh.N * sh.K), 0xBEEFull ^ (uint64_t)sh.N, 1.0f / 8000.0f);
+        bf_fill(hx, (size_t)(48 * sh.K), 0xF00Dull ^ (uint64_t)sh.K, 1.0f / 250.0f);
+        hx[5] = 0x7f80; hx[(size_t)(17 * sh.K + 3)] = 0x7e80;   /* an inf, a huge value */
+        void* d_w = dalloc(hw.size() * 2);
+        void* d_x = dalloc(hx.size() * 2);
+        void* d_y = dalloc((size_t)(48 * sh.N) * 2);
+        if (!d_w || !d_x || !d_y) { std::printf("  FAIL %s: alloc\n", sh.name); ++g_fail; continue; }
+        st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+        int badm = 0;
+        for (int64_t M = 1; M <= 48; ++M) {
+            MrLaunch L;
+            if (!bf_setup(L, pl, sh, M)) { std::printf("  gemm_bf16_nt_m64 row absent\n"); break; }
+            const size_t yb = (size_t)(M * sh.N) * 2;
+            std::vector<uint8_t> ref(yb), got(yb);
+            h.bf_pin(0, 0, 0, 0);
+            st_memset(d_y, 0xff, yb);
+            int rc = L.run(d_x, d_w, d_y);
+            if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  FAIL %s M=%lld stock rc %d\n", sh.name, (long long)M, rc); ++badm; continue; }
+            st_memcpy(ref.data(), d_y, yb, hipMemcpyDeviceToHost);
+            bool mbad = false;
+            for (const P& p : pins) {
+                h.bf_pin(p.on, p.ct, p.ku, p.wv);
+                st_memset(d_y, 0xff, yb);
+                rc = L.run(d_x, d_w, d_y);
+                ++launches;
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  FAIL %s M=%lld pin %d/%d/%d rc %d\n", sh.name, (long long)M, p.ct, p.ku, p.wv, rc); mbad = true; ++diffs; continue; }
+                st_memcpy(got.data(), d_y, yb, hipMemcpyDeviceToHost);
+                if (got != ref) {
+                    size_t nb = 0, first = 0;
+                    for (size_t e = 0; e < yb; e += 2)
+                        if (std::memcmp(&got[e], &ref[e], 2)) { if (!nb) first = e / 2; ++nb; }
+                    std::printf("  FAIL %s M=%lld form %d/%d/%d (%s): %zu of %zu outputs differ, first m=%zu n=%zu\n", sh.name, (long long)M,
+                                p.ct, p.ku, p.wv, h.bf_last ? h.bf_last() : "?", nb, yb / 2, first / (size_t)sh.N, first % (size_t)sh.N);
+                    mbad = true; ++diffs;
+                }
+            }
+            h.bf_pin(0, 0, 0, 0);
+            badm += mbad ? 1 : 0;
+        }
+        ++done;
+        if (badm) ++g_fail;
+        std::printf("BFCHECK %s %lldx%lld M=1..48: %s (%d of 48 M with a difference)\n", sh.name, (long long)sh.N, (long long)sh.K,
+                    badm ? "DIFFERS" : "identical in every form", badm);
+        std::fflush(stdout);
+    }
+    dfree_all();
+    const int planned = (int)(sizeof(kBfShapes) / sizeof(kBfShapes[0]));
+    if (done != planned) ++g_fail;
+    std::printf("BFVERDICT check: %d of %d shapes ran, %lld form launches, %lld differ -> %s\n", done, planned, launches, diffs,
+                done != planned ? "INCOMPLETE" : diffs ? "FAIL" : "PASS (byte-identical, every form)");
+}
+
+/* --perfbf [Ms] [iters]: us a call of the stock skinny bf16 GEMM and drafter_bf's rule and pinned forms at the
+ * drafter's linears, the weight streaming from DRAM (rotated copies past 256 MiB, or --cold). BFPERF / BFSUM a
+ * (shape, M); BFVERDICT with the summed us of a stage's linears (q_a q_b kv 2 x o_a o_b gate_up down) at each M. */
+static void ds_bf_perf(const Plugin& pl, const char* mlist, int iters) {
+    if (iters <= 0) iters = 100;
+    const DrkHooks h = drk_hooks(pl);
+    if (!h.bf_pin) { std::printf("--perfbf: r4d_bf_pf_pin absent\n"); return; }
+    std::vector<int64_t> Ms;
+    { std::string m = mlist && *mlist ? mlist : "5,6,10,20,24,40,48"; size_t p = 0;
+      while (p < m.size()) { size_t q = m.find(',', p); if (q == std::string::npos) q = m.size(); Ms.push_back(std::strtoll(m.substr(p, q - p).c_str(), nullptr, 10)); p = q + 1; } }
+    const char* mode = g_cold > 0 ? "cold" : "rot";
+    struct P { int on, ct, ku, wv; const char* nm; };
+    const P pins[] = { { -1, 0, 0, 0, "rule" }, { 1, 1, 4, 0, "c1k4" }, { 1, 1, 8, 0, "c1k8" }, { 1, 2, 4, 0, "c2k4" }, { 1, 2, 8, 0, "c2k8" },
+                       { 1, 4, 4, 0, "c4k4" }, { 1, 1, 8, 1, "c1k8w1" }, { 1, 2, 8, 2, "c2k8w2" } };
+    std::map<int64_t, std::pair<double, double>> stage;   /* M -> (stock, best) summed over a stage's linears */
+    double lsum = 0; int n = 0, ndiff = 0;
+    for (const BfShape& sh : kBfShapes) {
+        const int64_t wbytes = sh.N * sh.K * 2;
+        const int copies = (int)std::max<int64_t>(2, (256ll << 20) / wbytes + 1);
+        std::vector<uint16_t> hw;
+        bf_fill(hw, (size_t)(sh.N * sh.K), 0xABCull ^ (uint64_t)sh.N, 1.0f / 8000.0f);
+        for (int64_t M : Ms) {
+            if (M < 1 || M > 64) continue;
+            dfree_all();
+            std::vector<uint16_t> hx;
+            bf_fill(hx, (size_t)(M * sh.K), 0x99ull + (uint64_t)M, 1.0f / 250.0f);
+            void* d_x = dalloc(hx.size() * 2);
+            void* d_w = dalloc((size_t)wbytes * (size_t)copies);
+            void* d_y = dalloc((size_t)(M * sh.N) * 2);
+            if (!d_x || !d_w || !d_y) { std::printf("  %s M=%lld: alloc failed\n", sh.name, (long long)M); continue; }
+            st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            for (int c = 0; c < copies; ++c) st_memcpy((uint8_t*)d_w + (size_t)c * (size_t)wbytes, hw.data(), (size_t)wbytes, hipMemcpyHostToDevice);
+            MrLaunch L;
+            if (!bf_setup(L, pl, sh, M)) continue;
+            const size_t yb = (size_t)(M * sh.N) * 2;
+            std::vector<uint8_t> ref;
+            auto timeit = [&](bool stock, bool& same, std::string& form) -> double {
+                st_memset(d_y, 0xff, yb);
+                const int rc = L.run(d_x, d_w, d_y);
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { same = false; return -1.0; }
+                std::vector<uint8_t> got(yb);
+                st_memcpy(got.data(), d_y, yb, hipMemcpyDeviceToHost);
+                if (ref.empty()) ref = got;
+                same = got == ref;
+                form = !stock && h.bf_last ? h.bf_last() : "";
+                for (int i = 0; i < 20; ++i) L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y);
+                return st_time_us([&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); }, iters, nullptr);
+            };
+            h.bf_pin(0, 0, 0, 0);
+            bool s0 = true; std::string f0;
+            const double st = timeit(true, s0, f0);
+            std::string line = fmt("BFPERF %s %lldx%lld M=%lld (%.2f MiB) %s: stock %.1f;", sh.name, (long long)sh.N, (long long)sh.K, (long long)M,
+                                   wbytes / 1048576.0, mode, st);
+            double best = -1, rule = -1; std::string bestn, bestf; bool alls = true;
+            for (const P& p : pins) {
+                h.bf_pin(p.on, p.ct, p.ku, p.wv);
+                bool same = true; std::string form;
+                const double us = timeit(false, same, form);
+                alls = alls && same;
+                line += fmt(" %s %.1f [%s]%s;", p.nm, us, form.c_str(), same ? "" : " OUTPUT DIFFERS");
+                if (p.on < 0) rule = us;
+                if (us > 0 && same && (best < 0 || us < best)) { best = us; bestn = p.nm; bestf = form; }
+            }
+            h.bf_pin(0, 0, 0, 0);
+            std::printf("%s\n", line.c_str());
+            if (!alls) { ++ndiff; ++g_fail; }
+            if (st > 0 && best > 0) {
+                std::printf("BFSUM %s %lldx%lld M=%lld %s: stock %.1f us (%.0f GB/s) | rule %.1f | best %s %.1f [%s] (%.0f GB/s) | x%.2f vs stock | bytes %s\n",
+                            sh.name, (long long)sh.N, (long long)sh.K, (long long)M, mode, st, wbytes / (st * 1e3), rule, bestn.c_str(), best,
+                            bestf.c_str(), wbytes / (best * 1e3), st / best, alls ? "identical" : "DIFFER");
+                lsum += std::log(st / best); ++n;
+                const int mult = !std::strcmp(sh.name, "o_a") ? 2 : (std::strstr(sh.name, "w512") || !std::strcmp(sh.name, "main_proj")) ? 0 : 1;
+                if (mult) { stage[M].first += mult * st; stage[M].second += mult * (rule > 0 ? rule : best); }
+            }
+            std::fflush(stdout);
+        }
+    }
+    dfree_all();
+    if (n == 0) ++g_fail;
+    std::string st_line;
+    for (const auto& kv : stage) st_line += fmt(" M=%lld %.1f -> %.1f us;", (long long)kv.first, kv.second.first, kv.second.second);
+    std::printf("BFVERDICT %s: %d (shape, M); best form vs stock geomean x%.2f; a stage's linears (stock -> rule):%s bytes %s\n", mode, n,
+                n ? std::exp(lsum / n) : 0.0, st_line.c_str(), n == 0 ? "NO DATA" : ndiff ? fmt("DIFFER at %d", ndiff).c_str() : "identical everywhere");
+}
+
 /* The gated residual's read at int8 codes. The same inputs run with the codes plane as E4M3 and
  * as I8: the bf16 block input and the rotated E4M3 twin must be byte-identical, and the int8 codes
  * must equal quant_act_i8g's over the bf16 input (per (row, 128) at amax / 127). Row counts reach
@@ -36384,6 +36856,9 @@ static void usage(void) {
                 "             PF2 from M=512) compared byte for byte and timed as one op each,\n"
                 "             then the two-grid decode form against the launcher's rule;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
+                "  --mxcheck / --bfcheck:  ds41-drk: the drafter's MXFP4 grouped GEMM (drafter_mx) / bf16\n"
+                "             skinny GEMM (drafter_bf) forms vs the stock kernels, byte for byte.\n"
+                "  --perfmx [tokens] [iters] / --perfbf [Ms] [iters]:  their timing at the drafter's shapes.\n"
                 "  --mrcheck [types]:  lever D2: gemm_nt_ggml / logits_gemm_ggml's decode band in the\n"
                 "             multi-row form vs the stock path, byte for byte, DeepSeek-V4.1's dense TP4\n"
                 "             shapes, M 1..48, every form; MRINFO: a row alone vs inside an M-row call.\n"
@@ -36546,6 +37021,7 @@ int main(int argc, char** argv) {
     long long dsm_m = 0; int dsm_it = 0; const char* dsm_fmts = nullptr;   /* --perfdsmoe */
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
+    bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
     const char* mx_skew = nullptr;
     int mx_tp = 8;
     bool mx_f8 = false;
@@ -36776,6 +37252,14 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_e = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_k = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_skew = argv[++i];
+        } else if (!std::strcmp(argv[i], "--mxcheck")) {
+            mxc = true;   /* drafter_mx's forms vs the stock MXFP4 grouped GEMM (ds_mx_check) */
+        } else if (!std::strcmp(argv[i], "--bfcheck")) {
+            bfc = true;   /* drafter_bf's form vs the stock skinny bf16 GEMM (ds_bf_check) */
+        } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfbf")) {
+            (argv[i][6] == 'm' ? mxp : bfp) = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) drk_l = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) drk_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--mrcheck")) {
             /* lever D2: the multi-row decode-band form vs the stock path, byte for byte (ds_mr_check). */
             mrc = true;
@@ -37017,6 +37501,19 @@ int main(int argc, char** argv) {
         skip("bf16 head timing", "built without HIP");
 #endif
         return 0;
+    }
+    if (mxc || mxp || bfc || bfp) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        if (mxc) ds_mx_check(pl);
+        if (mxp) ds_mx_perf(pl, drk_l, drk_it);
+        if (bfc) ds_bf_check(pl);
+        if (bfp) ds_bf_perf(pl, drk_l, drk_it);
+        dfree_all();
+#else
+        skip("ds41-drk drafter kernels", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (mrc || mrp) {
         if (!load(&pl, path)) return 1;

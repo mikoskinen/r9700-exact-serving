@@ -21,6 +21,7 @@
 #include "r4d_bf16_gemm_rows.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_chain.h"
+#include "r4d_gemm_bf16_nt_pf.h"
 #include <hip/hip_bf16.h>
 #include <cstdint>
 #include <stdexcept>
@@ -56,7 +57,11 @@ __device__ __forceinline__ void r4d_gemm_bf16_nt_m64_body(
     const unsigned short* __restrict__ A, const unsigned short* __restrict__ W,
     __hip_bfloat16* __restrict__ C, int M, int K, int N, int WV, int SK, int LDA, int LDC) {
   if (CHAIN) r4d_chain_wait();
+#ifdef R4D_EMU_HOST   // tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host)
+  float* const red = (float*)emu_dyn_lds();
+#else
   extern __shared__ float red[];              // WV*SK*256 floats: one 16x16 tile per (column, split)
+#endif
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
   const int nt = blockIdx.x * WV + col_local;
@@ -226,6 +231,13 @@ extern "C" int r4d_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
     const bool chain = r4d_geti_or(a, "chain", 0) != 0;
     if (chain && r4d_bf16_gemm_chunk_rows(g.M, g.N, g.K, c.mb * 16, c.wv * 16) < g.M)
       return R4D_NO(RAD_E_UNSUPPORTED);
+    /* drafter_bf (r4d_gemm_bf16_nt_pf.hip): the prefetching decode form when switched on, at this launch's split;
+     * the same chains and reduction, so the same bits. It declines what it does not take (the stock launch below). */
+    if (!chain && c.mb == 1 && g.M <= 64 && r4d_bf_pf_on()) {
+      const R4dBfPfCall pc{ (const void*)(uintptr_t)r4d_addr(g.a), (const void*)(uintptr_t)r4d_addr(g.b), (void*)(uintptr_t)r4d_addr(g.y), (int)g.M, (int)g.K, (int)g.N, c.sk, g.lda, g.ldc };
+      const int pr = r4d_bf_pf_gemm(s, pc);
+      if (pr != R4D_BF_PF_DECLINE) return pr;
+    }
     R4D_TRY("gemm_bf16_nt_m64",
         gemm_bf16_m64_launch(r4d_addr(g.a), r4d_addr(g.b), r4d_addr(g.y),
                              (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb,
