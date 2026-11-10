@@ -304,6 +304,9 @@ struct Layer {
     std::vector<rad_op> i_runs;
     bool i_keep = false;
     rad_op attn = 0, o_rope = 0, o_q = 0, o_b = 0, post_a = 0, attn_fill = 0, ar_attn = 0;
+    /* ar_attn declared a second time at `overlap` 1 (the narrow launch beside compute), for the
+     * pipelined prefill's pieces (RADIANCE_DS41_PIPE, Model::pipe); 0 otherwise. */
+    rad_op ar_attn_ov = 0;
     std::vector<rad_op> o_a;
     /* The fused chains (fused()), each 0 where its chain above is declared instead: kv_n + kv_rope
      * + kv_q, k_norm + k_rope + k_q, o_rope + o_q, l_rope + l_q, i_rope + i_qq, col_a + norm_a,
@@ -476,6 +479,14 @@ struct Model {
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
     bool release = false;
     int n_stage = 0;
+    /* RADIANCE_DS41_PIPE=1 (pipe_mode()): a lone prefill step wider than `pipe_min` tokens (the
+     * span's shared budget, RadBuildCtx::max_mixed_tok) runs pipelined (step_pipe_cut()): the
+     * attention's output projection, its all-reduce, the ffn connection's write, the MoE and its
+     * all-reduce in two pieces, every collective of the step on the second lane. Off (unset):
+     * none of it is declared or taken. `pipe_noted`: rank 0 said so once. */
+    bool pipe = false;
+    int64_t pipe_min = 0;
+    bool pipe_noted = false;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -1014,6 +1025,23 @@ static int ds41_ar_pcn_moe() { return ds41_ar_pcn_mode() == 2; }
 static int ds41_router_fuse() {
     static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_ROUTER_FUSE"); return e && e[0] == '1' && !e[1]; }();
     return on ? 1 : 0;
+}
+
+/* The pipelined step's cut: at a multiple of kPipeAlign rows (every row-tiled kernel's tile then
+ * starts where the whole step's does), both pieces at least kPipeMinRows. kPipeMinRows sits above
+ * every row-count choice of the ops a piece issues, so each piece takes the kernel and form the
+ * whole step takes: gemm_nt_ggml's decode kernel (M <= 48), the act-path workgroup width
+ * (r4d_act_threads: 1024 / 512 / 256 threads at M <= 32 / 120 / above, which partitions the norm's
+ * sum), the router's split (GlmTp::kSplitRows 256), its fused select+sort (<= kMoeSortRows / top_k
+ * rows), and exl3r4d's run form (2 T <= 3 n_expert). */
+static constexpr int64_t kPipeAlign = 256, kPipeMinRows = 256;
+
+/* RADIANCE_DS41_PIPE: "1" (or "on") = the pipelined prefill (Model::pipe; the section "A prefill
+ * step wider than the shared budget" above step()); unset, empty or anything else = off, which
+ * declares nothing new and issues exactly the serial step. Read at declare. */
+static bool pipe_mode() {
+    const char* e = std::getenv("RADIANCE_DS41_PIPE");
+    return e && (!std::strcmp(e, "1") || !std::strcmp(e, "on"));
 }
 
 /* A compressed latent entry's bf16 slots: its hd values, or its packed bytes / 2 (nvfp4). */
@@ -1590,6 +1618,14 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                          RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
                          RAD_INT("min_bytes", g.wire_min_bytes) },
                        {}, { m.attn_out }, { m.attn_out });
+    /* The same collective at `overlap` 1 for the pipelined step's pieces, which run it beside the
+     * other piece's work: libr4d's narrow launch of the same fold (ar_twoshot_4rank_exact_lane). */
+    if (g.world > 1 && m.pipe)
+        L.ar_attn_ov = op(b, "all_reduce",
+                          { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
+                            RAD_STR("dtype", "bf16"), RAD_INT("exact", g.wire_exact),
+                            RAD_INT("min_bytes", g.wire_min_bytes), RAD_INT("overlap", 1) },
+                          {}, { m.attn_out }, { m.attn_out });
     L.post_a = op(b, "mhc_post", hcp, {}, { m.attn_out, m.h0, m.post, m.comb }, { m.h1 });
 
     /* ---- the ffn connection and the MoE */
@@ -1640,6 +1676,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.gather_ar_rows = gather_ar_rows();
     s.cfg.calib = (m.calib_hi > m.calib_lo && l >= m.calib_lo && l < m.calib_hi) ? 1 : 0;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
+    /* The pipelined step's MoE all-reduce runs beside the other piece's work: declared a second
+     * time at `overlap` 1 (MoeFP8::issue_ar). */
+    L.moe.ar_overlap = m.pipe ? 1 : 0;
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
     return RAD_OK;
@@ -2161,8 +2200,42 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.ikeep = full.ikeep;
         m.isplit = full.isplit;
         m.qmax = full.qmax;
+        /* and the same ops and concurrent buffers as the real declare (its max_tok decides) */
+        m.pipe = full.pipe;
+        m.pipe_min = full.pipe_min;
+    } else if (pipe_mode()) {
+        /* Only where a step wider than the shared budget exists and is one prefill (--prefill-span:
+         * RadBuildCtx::max_mixed_tok) and the ranks reduce: every all-reduce of this plugin is on
+         * the exact wire (geometry()), whose fold is the same per element at any message size. */
+        const bool span = ctx->max_mixed_tok > 0 && ctx->max_mixed_tok < g.max_tok;
+        const char* why = g.world < 2 ? "one rank, no all-reduce to overlap"
+                        : !g.wire_exact ? "the all-reduce wire is not exact"
+                        : !span ? "no step is wider than the shared budget (needs --prefill-span 2 or more)"
+                        : g.max_tok < 2 * kPipeMinRows ? "--max-num-batched-tokens holds no two pieces"
+                                                       : nullptr;
+        m.pipe = why == nullptr;
+        m.pipe_min = std::max<int64_t>(ctx->max_mixed_tok, 2 * kPipeMinRows - 1);
+        if (ctx->rank == 0) {
+            if (m.pipe)
+                fprintf(stderr, "radiance: deepseek41: pipelined prefill on (RADIANCE_DS41_PIPE): a lone prefill "
+                                "step wider than %lld tokens runs in two pieces (cut at a multiple of %lld, each at "
+                                "least %lld rows), the attention's output projection, its all-reduce, the ffn "
+                                "connection's write and the MoE a piece at a time, every collective of the step "
+                                "on the second lane beside the other piece's work; byte-identical to the serial "
+                                "step\n",
+                        (long long)m.pipe_min, (long long)kPipeAlign, (long long)kPipeMinRows);
+            else
+                fprintf(stderr, "radiance: deepseek41: pipelined prefill off (RADIANCE_DS41_PIPE): %s\n", why);
+        }
     }
     DS_TRY(buffers(b, m));
+    /* The pipelined step's all-reduces run on the second lane, in place over the attention's
+     * output and the MoE's (Ctx::lane1_ rule 3); its other collectives (the embedding's, the
+     * indexer's gather, the router's) run there alone, lane 0 waiting on each at once. */
+    if (m.pipe) {
+        DS_TRY(rad_buf_concurrent(b, m.attn_out));
+        DS_TRY(rad_buf_concurrent(b, m.act.x));
+    }
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */
     if (m.dsp.on && !m.zero &&
         !(m.dsp.src = decl_b(b, nm.f("dspark_src"), RAD_BF16, { g.max_tok, (int64_t)m.dsp.taps.size() * c.n_embd })))
@@ -2503,6 +2576,73 @@ static void mix_f_beside(RadCtx* x, void* a) {
                 RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
 }
 
+/* ============================== A prefill step wider than the shared budget ==============================
+ *
+ * Each layer of a prefill step makes two all-reduces over every row, the attention's output and the
+ * MoE's, each in a hard chain with nothing beside it on one stream: output projection -> all-reduce ->
+ * post + collapse + norm -> MoE -> all-reduce -> post + the next collapse + norm. At four ranks they are
+ * about a quarter of a 4160-token step (rank 0's profile: 305 of 1206 ms).
+ *
+ * Under --prefill-span a prefill alone in its step takes up to the whole budget, wider than any step
+ * that shares (RadBuildCtx::max_mixed_tok). RADIANCE_DS41_PIPE=1 cuts such a step's rows in two pieces
+ * (step_pipe_cut) and runs a piece at a time everything after the attention core that is per row, with
+ * every collective on the second lane beside the other piece's work (qwen4exp_fp8's step_pipelined is
+ * the template):
+ *
+ *   lane 0                                              lane 1
+ *   attention core over the step (as serial)            the indexer's gather, waited at once
+ *   out projection, piece 0                        ->   attention all-reduce, piece 0
+ *   the attention mix (whole), out projection, 1
+ *   wait; post + collapse + norm, 0; router part, 0 ->  router gather, 0 (waited at once)
+ *                                                  ->   attention all-reduce, piece 1
+ *   MoE pass 0 (selection, sort, experts, shared, gather)
+ *   wait; post + collapse + norm, 1; the ffn mix (whole); router part, 1
+ *                                                  ->   router gather, 1 (waited at once)
+ *                                                  ->   MoE all-reduce, piece 0
+ *   MoE pass 1
+ *   wait                                           ->   MoE all-reduce, piece 1
+ *   post + next collapse + norm, piece 0
+ *   wait; the same, piece 1
+ *
+ * EXACT: byte-identical to the serial step of the same rows (today's span-2 step), not merely to a
+ * span of 1. The attention core (window and compressor chain, indexer, attn_sparse_sink, the output's
+ * inverse rope) and both hc mixes run over the whole step exactly as the serial step issues them. A
+ * piece issues the serial step's own ops over a row range of the same operands, and every one of them
+ * computes a row from that row alone, by a form chosen at a row count no piece is below
+ * (kPipeMinRows): gemm_nt_ggml's 128-row WMMA tiles over the whole K (no split-K; the decode kernel only
+ * at M <= 48), mhc_post / mhc_post_collapse_rmsnorm / mhc_collapse_rmsnorm / rmsnorm one workgroup a
+ * row at r4d_act_threads' width (256 from 121 rows), the f32 router GEMM (every form the same fold),
+ * router_scored_topk per row, moe_gather summing a token's slots in slot order, swiglu per element,
+ * and exl3r4d's map form (from 2 T > 3 n_expert; one workgroup a run of one expert's sorted rows,
+ * each slot's product over the whole K, the map's entries, chunks and order only scheduling). The
+ * MoE's routing is per token, so a piece's sort holds the same (token, expert) slots as the whole
+ * step's, at other places. The all-reduces are the exact wire's: every element the fp32 fold of the
+ * four ranks' values in ascending rank order whoever owns its shard (r4d_ar_twoshot_Nrank_exact.hip),
+ * the overlap form (ar_twoshot_4rank_exact_lane, its pushes coded losslessly) the same fold, so a
+ * piece's message reduces each element as the whole step's does; the router's all_gather moves bytes.
+ *
+ * The second lane's rules (Ctx::lane1_): every collective of the step is on it (the embedding's, the
+ * indexer's and the router's gathers too, each waited at once, so they run alone); the two buffers it
+ * reduces beside lane 0's work, attn_out and the MoE's act.x, are rad_buf_concurrent (declare); the
+ * all-reduce and all_gather kernels carry their sequence per launch on the device in issue order, and
+ * one lane issues them in one order on every rank. */
+static int64_t step_pipe_cut(const Model& m, const RadBatch* batch) {
+    if (!m.pipe) return 0;
+    const int64_t T = batch->n_tok;
+    if (T <= m.pipe_min || batch->n_seq != 1 || batch->phase != RAD_PHASE_PREFILL) return 0;
+    const int64_t cut = (T / 2 + kPipeAlign - 1) / kPipeAlign * kPipeAlign;
+    if (cut < kPipeMinRows || T - cut < kPipeMinRows) return 0;
+    for (const Layer& L : m.layers) {
+        /* a block that reduces inside its pass (the separate fp32 combine) would put a collective
+         * on lane 0 */
+        if (!L.ar_attn || L.moe.c.calib || L.moe.op_moe_ar || L.moe.op_shared_ar) return 0;
+        /* a fused all-reduce form is declared only for decode and verify steps */
+        if (L.ar_pcn_f && ar_wide_write_exact(m.g, T)) return 0;
+        if (!L.moe.issues_ar(T, cut) || !L.moe.issues_ar(T, T - cut)) return 0;
+    }
+    return cut;
+}
+
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
     /* A drafter pass: the sign gives the kind (rad_runtime.h); zero is a trunk step. */
@@ -2531,9 +2671,36 @@ static void step(RadCtx* x, const RadBatch* batch) {
     /* The window group's table is rebased at the sequence's first held block; its seqused counts
      * from there, and attn_sparse_sink recovers the base from it (docs/OPS.md). */
     const RadOperand wused = praw(wb->seqused, RAD_I32, S);
+    /* RADIANCE_DS41_PIPE: a pipelined prefill step (step_pipe_cut, the section above), 0 = serial. */
+    const int64_t cut = step_pipe_cut(m, batch);
+    const bool pipe = cut > 0;
+    /* A collective on the second lane, ordered behind lane 0 where it reads what lane 0 just wrote
+     * (a join to a lane not yet built is a no-op, and Ctx::lane_init starts it behind lane 0); and
+     * lane 0 waiting for everything issued there so far. */
+    const auto on1 = [&](bool behind0, auto&& issue) {
+        rad_lane(x, 1);
+        if (behind0) rad_lane_join(x, 0, 1);
+        issue();
+        rad_lane(x, 0);
+    };
+    const auto wait1 = [&] { rad_lane_join(x, 1, 0); };
+    if (pipe && !m.pipe_noted) {
+        m.pipe_noted = true;
+        if (g.rank == 0)
+            fprintf(stderr, "radiance: deepseek41: prefill steps wider than %lld tokens are pipelined: %lld rows in "
+                            "pieces of %lld + %lld, all-reduces on the second lane (RADIANCE_DS41_PIPE)\n",
+                    (long long)m.pipe_min, (long long)T, (long long)cut, (long long)(T - cut));
+    }
 
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
-    if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
+    if (m.embed_ar) {
+        if (pipe) {   /* every collective of a pipelined step on the second lane; this one alone */
+            on1(true, [&] { RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE); });
+            wait1();
+        } else {
+            RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
+        }
+    }
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
@@ -2806,9 +2973,18 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                 ru.split ? brow_slice(m.sel_part, (p - ru.p0) * ru.R, rows, c.itopk)
                                          : brow_slice(m.sel, r0, rows, c.itopk));
                 }
-                if (ru.split)
-                    RAD_ISSUE(x, m.sel_gather, brows(m.sel_part, ru.q * ru.R),
-                              brows(m.sel, (int64_t)m.aw * ru.q * ru.R));
+                if (ru.split) {
+                    const auto gather = [&] {
+                        RAD_ISSUE(x, m.sel_gather, brows(m.sel_part, ru.q * ru.R),
+                                  brows(m.sel, (int64_t)m.aw * ru.q * ru.R));
+                    };
+                    if (pipe) {   /* a pipelined step's collective: on the second lane, alone */
+                        on1(true, gather);
+                        wait1();
+                    } else {
+                        gather();
+                    }
+                }
             };
 
             c_gemm();
@@ -2846,12 +3022,100 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
                 if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
             }
-            const int64_t gd = HD / m.gr;
-            for (int j = 0; j < m.gr; ++j)
-                lin_issue(x, m, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), L.wo_a[(size_t)j],
-                          bcol(m.oa, j * c.o_rank, c.o_rank, T));
-            if (late) mix_a();
-            lin_issue(x, m, L.o_b, T, brows(m.oa, T), L.wo_b, brows(m.attn_out, T));
+            if (!pipe) {   /* pipelined: a piece at a time, below */
+                const int64_t gd = HD / m.gr;
+                for (int j = 0; j < m.gr; ++j)
+                    lin_issue(x, m, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), L.wo_a[(size_t)j],
+                              bcol(m.oa, j * c.o_rank, c.o_rank, T));
+                if (late) mix_a();
+                lin_issue(x, m, L.o_b, T, brows(m.oa, T), L.wo_b, brows(m.attn_out, T));
+            }
+        }
+        if (pipe) {
+            /* The pipelined tail (the section above step()): pieces [0, cut) and [cut, T), each op
+             * the serial step's over its rows; the two mixes over the whole step. */
+            const int64_t HN = c.hc * D, OK = m.gr * c.o_rank, hc = c.hc;
+            const auto r0 = [&](int p) { return p ? cut : (int64_t)0; };
+            const auto rn = [&](int p) { return p ? T - cut : cut; };
+            const auto sl = [&](rad_buf bf, int p, int64_t pitch) { return brow_slice(bf, r0(p), rn(p), pitch); };
+            const auto oproj = [&](int p) {   /* the output projection; mix_a behind the first piece's groups */
+                if (m.zero) return;
+                const int64_t gd = HD / m.gr;
+                for (int j = 0; j < m.gr; ++j)
+                    lin_issue(x, m, L.o_a[(size_t)j], rn(p), bcol_at(m.o, r0(p), HD, j * gd, gd, rn(p)),
+                              L.wo_a[(size_t)j], bcol_at(m.oa, r0(p), OK, j * c.o_rank, c.o_rank, rn(p)));
+                if (p == 0 && late) mix_a();
+                lin_issue(x, m, L.o_b, rn(p), sl(m.oa, p, OK), L.wo_b, sl(m.attn_out, p, D));
+            };
+            const auto ar_a = [&](int p) {
+                RAD_ISSUE_N(x, L.ar_attn_ov ? L.ar_attn_ov : L.ar_attn, rn(p) * D, sl(m.attn_out, p, D),
+                            RAD_NONE);
+            };
+            const auto write_f = [&](int p) {   /* post_a, col_f and norm_f */
+                if (L.pcn_f) {
+                    RAD_ISSUE_N(x, L.pcn_f, rn(p), sl(m.attn_out, p, D), sl(m.h0, p, HN), sl(m.post, p, hc),
+                                sl(m.comb, p, hc * hc), sl(m.h1, p, HN), sl(m.pre_a, p, hc), sl(m.xcol, p, D),
+                                RAD_W(L.ffn_norm), sl(m.act.x, p, D));
+                    return;
+                }
+                RAD_ISSUE_N(x, L.post_a, rn(p), sl(m.attn_out, p, D), sl(m.h0, p, HN), sl(m.post, p, hc),
+                            sl(m.comb, p, hc * hc), sl(m.h1, p, HN));
+                if (L.cn_f) {
+                    RAD_ISSUE_N(x, L.cn_f, rn(p), sl(m.h1, p, HN), sl(m.pre_a, p, hc), sl(m.xcol, p, D),
+                                RAD_W(L.ffn_norm), sl(m.act.x, p, D));
+                } else {
+                    RAD_ISSUE_N(x, L.col_f, rn(p), sl(m.h1, p, HN), sl(m.pre_a, p, hc), sl(m.xcol, p, D));
+                    RAD_ISSUE_N(x, L.norm_f, rn(p), sl(m.xcol, p, D), RAD_W(L.ffn_norm), sl(m.act.x, p, D));
+                }
+            };
+            /* The router's projection of a piece ahead of its pass, its gather (a collective) on the
+             * second lane, waited at once; false where the projection does not split (the pass then
+             * projects, with no collective). */
+            const auto route = [&](int p) {
+                if (!L.moe.route_splits(rn(p))) return false;
+                L.moe.route_part(x, r0(p), rn(p));
+                on1(true, [&] { L.moe.route_gather(x, r0(p), rn(p)); });
+                wait1();
+                return true;
+            };
+            const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
+            const auto write_a = [&](int p) {   /* post_f, with the next collapse + norm where fused */
+                if (nx && nx->pcn_a)
+                    RAD_ISSUE_N(x, nx->pcn_a, rn(p), sl(m.act.x, p, D), sl(m.h1, p, HN), sl(m.post, p, hc),
+                                sl(m.comb, p, hc * hc), sl(m.h0, p, HN), sl(m.pre_f, p, hc), sl(m.xcol, p, D),
+                                RAD_W(nx->attn_norm), sl(m.xn, p, D));
+                else if (!nx && m.pcn_fin)
+                    RAD_ISSUE_N(x, m.pcn_fin, rn(p), sl(m.act.x, p, D), sl(m.h1, p, HN), sl(m.post, p, hc),
+                                sl(m.comb, p, hc * hc), sl(m.h0, p, HN), sl(m.pre_f, p, hc), sl(m.xcol, p, D),
+                                RAD_W(m.final_gain), sl(m.final_hidden, p, D));
+                else
+                    RAD_ISSUE_N(x, L.post_f, rn(p), sl(m.act.x, p, D), sl(m.h1, p, HN), sl(m.post, p, hc),
+                                sl(m.comb, p, hc * hc), sl(m.h0, p, HN));
+            };
+            oproj(0);
+            on1(true, [&] { ar_a(0); });          /* beside mix_a and piece 1's projection */
+            oproj(1);
+            wait1();
+            write_f(0);
+            const bool pr0 = route(0);
+            on1(!pr0, [&] { ar_a(1); });          /* behind oproj(1); beside MoE pass 0 */
+            L.moe.pass(x, T, r0(0), rn(0), false, nullptr, pr0);
+            wait1();
+            write_f(1);
+            /* the ffn mix, over the whole step once both pieces' streams are written (it reads h1
+             * and rewrites the gates post_a read) */
+            MixBeside mb{ &L, &m, T };
+            mix_f_beside(x, &mb);
+            const bool pr1 = route(1);
+            on1(!pr1, [&] { L.moe.issue_ar(x, r0(0), rn(0)); });   /* behind pass 0; beside pass 1 */
+            L.moe.pass(x, T, r0(1), rn(1), false, nullptr, pr1);
+            wait1();
+            on1(true, [&] { L.moe.issue_ar(x, r0(1), rn(1)); });   /* beside piece 0's write */
+            L.moe.route_report(x);
+            write_a(0);
+            wait1();
+            write_a(1);
+            continue;
         }
         if (L.ar_pcn_f && ar_wide_write_exact(m.g, T))   /* the all-reduce, post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.ar_pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),

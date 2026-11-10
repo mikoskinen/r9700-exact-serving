@@ -99,9 +99,21 @@ struct GlmRouter {
     }
     void step(RadCtx* ctx, int64_t first, int64_t rows, int64_t output_first = 0) const {
         project(ctx, first, rows, output_first);
+        select(ctx, rows, output_first);
+    }
+    /* The selection over logits a caller projected itself (project(), or the split's halves). */
+    void select(RadCtx* ctx, int64_t rows, int64_t output_first = 0) const {
         RAD_ISSUE_N(ctx, op_select, rows, brow_slice(w.logits, output_first, rows, c.experts),
                     RAD_W(correction), brow_slice(w.ids, output_first, rows, c.top_k),
                     brow_slice(w.weights, output_first, rows, c.top_k));
+    }
+    /* project()'s split form in its two halves (SplitF32Proj::step_part / step_gather), where
+     * split.takes(rows): this rank's columns, then the all_gather into the logits. */
+    void project_part(RadCtx* ctx, int64_t first, int64_t rows) const {
+        split.step_part(ctx, rows, brow_slice(w.input, first, rows, g.n_embd), projection);
+    }
+    void project_gather(RadCtx* ctx, int64_t rows, int64_t output_first = 0) const {
+        split.step_gather(ctx, rows, brow_slice(w.logits, output_first, rows, c.experts));
     }
 };
 }

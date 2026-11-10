@@ -548,9 +548,25 @@ struct MoeFP8 {
      * batch (the MTP head's history pass reads its output only at drafting rows). */
     void step_rows(RadCtx* c, int64_t T, const Beside* beside = nullptr) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
-     * all-reduce itself (issue_ar), as GdnFP8::step describes. */
+     * all-reduce itself (issue_ar), as GdnFP8::step describes. `projected` true: the caller
+     * already issued the sigmoid router's projection of these rows into the logits
+     * (route_part + route_gather, below), so the pass starts at the selection. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
-              const Beside* beside = nullptr) const;
+              const Beside* beside = nullptr, bool projected = false) const;
+    /* Whether the sigmoid router's projection of a `rows`-token pass splits over the ranks
+     * (SplitF32Proj: this rank's columns, then an all_gather). A caller that keeps every
+     * collective on one lane (deepseek41's pipelined prefill) issues the two halves itself --
+     * route_part on its compute lane, route_gather on the collective lane -- and then
+     * pass(..., projected = true); the same ops on the same operands as pass() issues. */
+    bool route_splits(int64_t rows) const {
+        return c.sigmoid_router && glm_router.split.takes(rows);
+    }
+    void route_part(RadCtx* c_, int64_t r0, int64_t rows) const {
+        glm_router.project_part(c_, r0, rows);
+    }
+    void route_gather(RadCtx* c_, int64_t r0, int64_t rows) const {
+        glm_router.project_gather(c_, rows, r0);
+    }
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -2149,7 +2165,7 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
 inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
-                          const Beside* beside) const {
+                          const Beside* beside, bool projected) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -2181,7 +2197,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool rfused = op_router_fused && rows <= router_fused_rows;
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
     if (sfused) {
-        glm_router.project(c_, r0, rows, r0);
+        if (!projected) glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
                     brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
@@ -2189,7 +2205,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     sigmoid_scatter_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
                     scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
     } else if (c.sigmoid_router) {
-        glm_router.step(c_, r0, rows, r0);
+        if (projected) glm_router.select(c_, rows, r0);
+        else           glm_router.step(c_, r0, rows, r0);
     } else if (rfused)
         RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
