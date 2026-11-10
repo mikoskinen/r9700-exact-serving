@@ -21410,13 +21410,13 @@ struct MxLaunch {
     std::vector<RadParam> ps;
     RadArgs a{};
 };
-static bool mx_setup(MxLaunch& L, const Plugin& pl, bool gemv, const MxCase& c, int64_t tokens, int64_t AR, int64_t T,
+static bool mx_setup(MxLaunch& L, const Plugin& pl, bool gemv, const MxCase& c, int64_t tokens, int64_t AR, int64_t TR,
                      void* d_x, void* d_w, bool table, void* d_so, void* d_of, void* d_y) {
     L.row = find(pl, gemv ? "moe_gemm_ggml_mxfp4_gemv" : "moe_gemm_ggml_mxfp4_tiled");
     if (!L.row) return false;
     const int64_t E = 32, rb = c.K / 32 * 17;
-    L.ts = { T(d_x, RAD_BF16, { AR, c.K }), T(d_w, RAD_U8, { E, c.N, rb }), T(d_so, RAD_I32, { T }),
-             T(d_of, RAD_I32, { E + 1 }), T(d_y, RAD_BF16, { T, c.N }) };
+    L.ts = { T(d_x, RAD_BF16, { AR, c.K }), T(d_w, RAD_U8, { E, c.N, rb }), T(d_so, RAD_I32, { TR }),
+             T(d_of, RAD_I32, { E + 1 }), T(d_y, RAD_BF16, { TR, c.N }) };
     if (table) L.ts[1].stride[0] = 0;
     L.ps = { PI("M", tokens), PI("N", c.N), PI("K", c.K), PI("n_expert", E), PI("top_k", 3),
              PS("a_order", c.sorted_rows ? "sorted" : "token"), PS("type", "mxfp4"), PS("dtype", "bf16") };
