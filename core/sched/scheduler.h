@@ -492,6 +492,11 @@ public:
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
      * to prefill, so the next step most likely carries a chunk the stager arms for. */
     bool    prefill_continues() const;
+    /* Whether a prefill chunk of the step just planned leaves at least the stager's smallest pass of
+     * its prompt for a later step, whatever the next step is held to (unlike prefill_continues,
+     * which --prefill-interleave turns off while decode rows wait): RADIANCE_STAGE_MIXED=2's test
+     * for a mixed pass. */
+    bool    prefill_has_more() const;
     /* Visible for tests: the most a prefill chunk at `n_computed` of a `n_target`-token sequence
      * may take of `budget` when `reserve` tokens of other work are still to be planned in the step
      * and `shared` says rows are already planned ahead of it. Returns `budget` when

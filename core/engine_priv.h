@@ -55,6 +55,13 @@ struct Engine::Rank {
      * because its bank holds an already-credited step (the layer did not route). Counting these
      * apart keeps a placement engine starved of evidence from looking like idle layers. */
     uint64_t heat_credited = 0, heat_idle = 0;
+    /* The rows of each trunk step this rank issued, by step number modulo the ring, for the share
+     * a histogram of that step is credited at (HeatParams::prefill_share). Written at issue and
+     * read by the drain a step or more later, both on this rank's thread. Larger than the route
+     * ring's banks, so a landed histogram's step is still here. */
+    struct HeatStepRows { int step = -1; int64_t n_tok = 0, n_tok_decode = 0; };
+    static constexpr int kHeatStepRing = 256;
+    std::vector<HeatStepRows> heat_steps;
     /* Trunk steps in a row whose pass the prefill stager did not arm (Engine::tiering_dispatch). */
     int unstaged_steps = 0;
     KVManager kv;

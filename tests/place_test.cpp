@@ -725,6 +725,122 @@ TEST(heat_caps_what_one_histogram_credits) {
     CHECK(std::fabs(h.heat(a) - 400.0f * hp.decay) < 1e-3f);
 }
 
+/* A step with prefill rows counts as a share of a step (HeatParams::prefill_share): its decay is
+ * decay^share and its credit is scaled by the share. Share 0 leaves every heat where the decode
+ * steps left it and still prices the routing; share 1 is the plain step, bit for bit. */
+TEST(heat_credits_a_prefill_step_at_its_share) {
+    HeatFixture hf;
+    HeatEngine h, plain;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    CHECK_OK(plain.init(hf.plan, hp));
+    const int32_t a = hf.unit_of_expert(4), b = hf.unit_of_expert(5);
+
+    int32_t dec[8] = {0, 0, 0, 0, 10, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f);
+    plain.observe(0, dec, 8);
+    CHECK_EQ(h.heat(a), plain.heat(a));
+    CHECK_EQ(h.heat(a), 10.0f);
+
+    /* A prefill chunk at share 0: nothing decays, nothing is credited, the routing is counted. */
+    const uint64_t routed = h.stats().routed;
+    int32_t pf[8] = {0, 0, 0, 0, 0, 300, 0, 0};
+    h.observe(0, pf, 8, 1.0f, 0.0f);
+    CHECK_EQ(h.heat(a), 10.0f);
+    CHECK_EQ(h.heat(b), 0.0f);
+    CHECK_EQ(h.stats().routed, routed + 1);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    for (const Swap& s : sw) CHECK(s.promote != b);
+    for (const Swap& s : sw) h.abandon(s);
+
+    /* Share 0.5, under the cap: half the credit and half a step's decay. */
+    int32_t half[8] = {0, 0, 0, 0, 0, 8, 0, 0};
+    h.observe(0, half, 8, 1.0f, 0.5f);
+    CHECK(std::fabs(h.heat(a) - 10.0f * std::pow(hp.decay, 0.5f)) < 1e-4f);
+    CHECK(std::fabs(h.heat(b) - 4.0f) < 1e-5f);
+
+    /* The engine's share of a step's rows. */
+    CHECK_EQ(heat_step_share(1.0f, 8192, 0), 1.0f);
+    CHECK_EQ(heat_step_share(0.0f, 8192, 0), 0.0f);
+    CHECK_EQ(heat_step_share(0.0f, 4, 4), 1.0f);
+    CHECK_EQ(heat_step_share(0.0f, 0, 0), 1.0f);
+    CHECK(std::fabs(heat_step_share(0.0f, 8192, 3) - 3.0f / 8192.0f) < 1e-7f);
+    CHECK(std::fabs(heat_step_share(0.25f, 100, 20) - 0.4f) < 1e-6f);
+}
+
+/* Dual heat (HeatParams::prefill_decay): decode rows credit the decode heat, prefill rows a prefill
+ * heat that decays by prefill_decay at every credited step; the ranking reads their sum. A prompt
+ * leaves the decode heat as it found it, and its own heat is gone a few steps after it. */
+TEST(heat_dual_keeps_the_decode_heat_through_a_prompt) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.prefill_decay = 0.5f;
+    CHECK_OK(h.init(hf.plan, hp));
+    CHECK(h.dual());
+    const int32_t a = hf.unit_of_expert(4), b = hf.unit_of_expert(5);
+
+    int32_t dec[8] = {0, 0, 0, 0, 10, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f, 0.0f);                 /* a decode step */
+    CHECK_EQ(h.heat(a), 10.0f);
+
+    int32_t pf[8] = {0, 0, 0, 0, 0, 100, 0, 0};
+    h.observe(0, pf, 8, 1.0f, 0.0f, 1.0f);                  /* a prefill step: decode heat untouched */
+    CHECK_EQ(h.heat(a), 10.0f);
+    CHECK_EQ(h.heat(b), 100.0f);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    bool b_in = false;
+    for (const Swap& s : sw) { b_in = b_in || s.promote == b; h.abandon(s); }
+    CHECK(b_in);                                             /* the prompt's expert comes in */
+
+    int32_t other[8] = {0, 0, 0, 0, 0, 0, 1, 0};
+    for (int k = 0; k < 3; ++k) h.observe(0, other, 8, 1.0f, 1.0f, 0.0f);
+    CHECK(std::fabs(h.heat(b) - 100.0f * 0.125f) < 1e-3f);   /* 0.5^3 */
+    CHECK(std::fabs(h.heat(a) - 10.0f * hp.decay * hp.decay * hp.decay) < 1e-4f);
+
+    /* A mixed step: a quarter decode rows. */
+    int32_t mix[8] = {0, 0, 0, 0, 8, 0, 0, 0};
+    const float before_a = h.heat(a), before_b = h.heat(b);
+    h.observe(0, mix, 8, 1.0f, 0.25f, 0.75f);
+    const float hd = (before_a) * std::pow(hp.decay, 0.25f) + 8.0f * 0.25f;   /* expert 4: decode part */
+    CHECK(std::fabs(h.heat(a) - (hd + 8.0f * 0.75f)) < 1e-3f);
+    CHECK(std::fabs(h.heat(b) - before_b * 0.5f) < 1e-3f);
+}
+
+/* HeatParams::decode_pin: under dual heat the decode-hottest residents are no promotion's victim, so
+ * a prompt takes only the rest of the resident set. Fixture: experts 0-3 resident, 4-7 pooled. */
+TEST(heat_decode_pin_keeps_the_decode_core_through_a_prompt) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.prefill_decay = 0.7f;
+    hp.decode_pin = 0.5f;
+    CHECK_OK(h.init(hf.plan, hp));
+    std::vector<Swap> sw;
+    /* Decode heat on residents 0 and 1 (hot) and 2 (warm); 3 stays cold. */
+    int32_t dec[8] = {4, 3, 1, 0, 0, 0, 0, 0};
+    h.observe(0, dec, 8, 1.0f, 1.0f, 0.0f);
+    CHECK_OK(h.step(&sw));                     /* takes the thresholds: the top half of 4 = 0 and 1 */
+    for (const Swap& s : sw) h.abandon(s);
+    /* A prompt routes heavily to all four pooled experts. */
+    int32_t pf[8] = {0, 0, 0, 0, 60, 50, 40, 30};
+    h.observe(0, pf, 8, 1.0f, 0.0f, 1.0f);
+    CHECK_OK(h.step(&sw));
+    const int32_t e0 = hf.unit_of_expert(0), e1 = hf.unit_of_expert(1);
+    const int32_t e2 = hf.unit_of_expert(2), e3 = hf.unit_of_expert(3);
+    bool demoted0 = false, demoted1 = false, demoted2 = false, demoted3 = false;
+    for (const Swap& s : sw) {
+        demoted0 = demoted0 || s.demote == e0; demoted1 = demoted1 || s.demote == e1;
+        demoted2 = demoted2 || s.demote == e2; demoted3 = demoted3 || s.demote == e3;
+        h.abandon(s);
+    }
+    CHECK(!demoted0 && !demoted1);             /* the decode core stays */
+    CHECK(demoted2 && demoted3);               /* the rest goes to the prompt */
+    CHECK_EQ(sw.size(), (size_t)2);
+}
+
 TEST(heat_respects_the_move_budget) {
     HeatFixture hf;
     HeatEngine h;

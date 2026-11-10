@@ -1672,7 +1672,15 @@ void Engine::probe_arena_levels() {
     while (lo < rows_min) lo <<= 1;
     lo = std::max<int64_t>(lo, 256);
     std::vector<int64_t> want;
-    for (int64_t R = lo; R < cfg_.max_tok; R *= 4) want.push_back(R);
+    /* RADIANCE_ARENA_LEVEL_MAX (rows; unset or 0: every rung): the ladder stops at that many rows,
+     * the span's shared level apart. A rung just under the chunk (4096 at --max-num-batched-tokens
+     * 4160) lends almost nothing more than the full plan, but its steps find the prefill stager's
+     * ring lent (stager.h: the stager arms only above every smaller level), so the commonest lone
+     * prefill chunk runs unstaged; without the rung such a step takes the full plan and is staged. */
+    int64_t lv_max = 0;
+    if (const char* e = getenv("RADIANCE_ARENA_LEVEL_MAX"); e && *e) lv_max = std::max<int64_t>(0, std::atoll(e));
+    for (int64_t R = lo; R < cfg_.max_tok; R *= 4)
+        if (lv_max <= 0 || R <= lv_max) want.push_back(R);
     arena_span_rows_ = 0;
     const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
     if (span_rows >= lo && span_rows < cfg_.max_tok &&
@@ -2943,6 +2951,57 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
+/* The heat engine's parameters: the shipped HeatParams, with policy knobs from the environment
+ * for A/B runs (docs/GUIDE.md section 8). RADIANCE_HEAT_PREFILL is HeatParams::prefill_share,
+ * clamped to 0..1; RADIANCE_HEAT_CREDIT_CAP is HeatParams::credit_cap, taken when above 0;
+ * RADIANCE_HEAT_MOVES is HeatParams::moves_per_step, 1..1024 (the mover's turnover slots follow
+ * it, mover_turnover_from_env); RADIANCE_HEAT_PREFILL_DECAY (0..1, exclusive) turns on the dual
+ * heat with that prefill decay, RADIANCE_HEAT_PREFILL_GAIN (> 0) scales its credit,
+ * RADIANCE_HEAT_DECODE_PIN (0..0.99) protects that fraction of the resident set by decode heat. Unset, empty or not a number: the default, the latter with a
+ * warning. Placement never changes an output, so none of them changes what a request returns,
+ * only where its experts are read from. */
+static HeatParams heat_params_from_env() {
+    HeatParams hp;
+    const auto num = [](const char* k, float* out) {
+        const char* e = getenv(k);
+        if (!e || !*e) return false;
+        char* end = nullptr;
+        const float v = std::strtof(e, &end);
+        if (end == e || *end || !(v == v) || v > 3.0e38f || v < -3.0e38f) {
+            RAD_WARN("%s=%s is not a number; the heat engine keeps its default", k, e);
+            return false;
+        }
+        *out = v;
+        return true;
+    };
+    float v = 0.0f;
+    if (num("RADIANCE_HEAT_PREFILL", &v)) hp.prefill_share = std::min(1.0f, std::max(0.0f, v));
+    if (num("RADIANCE_HEAT_CREDIT_CAP", &v) && v > 0.0f) hp.credit_cap = v;
+    if (num("RADIANCE_HEAT_MOVES", &v) && v >= 1.0f) hp.moves_per_step = (int)std::min(v, 1024.0f);
+    if (num("RADIANCE_HEAT_PREFILL_DECAY", &v) && v > 0.0f && v < 1.0f) hp.prefill_decay = v;
+    if (num("RADIANCE_HEAT_PREFILL_GAIN", &v) && v > 0.0f) hp.prefill_gain = v;
+    if (num("RADIANCE_HEAT_DECODE_PIN", &v) && v > 0.0f) hp.decode_pin = std::min(v, 0.99f);
+    return hp;
+}
+
+/* The lent slots a slab class keeps free for swaps (MoverConfig::turnover_slots), from the move
+ * budget as planner.h derives RAD_PLACE_TURNOVER_SLOTS: a swap holds a slot about three steps, so
+ * 3 x moves, less the shadow slots the planner already gives. RADIANCE_PLACE_TURNOVER (>= 0) sets
+ * it outright. The mover caps it at the shipped count scaled to the class's shadow slots, so it
+ * only ever shrinks: a smaller budget hands those slots back to the loan's experts. */
+static int mover_turnover_from_env(const HeatParams& hp) {
+    int t = hp.moves_per_step == RAD_PLACE_MOVES_PER_STEP
+                ? RAD_PLACE_TURNOVER_SLOTS
+                : std::max(0, 3 * hp.moves_per_step - RAD_PLACE_SHADOW_SLOTS);
+    if (const char* e = getenv("RADIANCE_PLACE_TURNOVER"); e && *e) {
+        char* end = nullptr;
+        const long n = std::strtol(e, &end, 10);
+        if (end != e && !*end && n >= 0 && n <= 1 << 20) t = (int)n;
+        else RAD_WARN("RADIANCE_PLACE_TURNOVER=%s is not a count; the mover keeps %d", e, t);
+    }
+    return t;
+}
+
 int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
@@ -2965,8 +3024,10 @@ int Engine::load_weights() {
         /* The container is the file tier (--weights-disk-tier places units on Tier::SSD), so the
          * mover needs its path. It reads the container with O_DIRECT: weights are RAD_ALIGN_UNIT-
          * aligned (rad_format.h), DirectFile's alignment, so stages take the no-bounce path. */
+        const HeatParams hp = heat_params_from_env();
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
+        mc.turnover_slots = mover_turnover_from_env(hp);
         /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
          * relayout, as the relayout pool does once for a resident one. */
         {
@@ -3037,7 +3098,9 @@ int Engine::load_weights() {
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+        heat_prefill_share_ = hp.prefill_share;
+        heat_dual_ = hp.prefill_decay > 0.0f && hp.prefill_decay < 1.0f;
+        RAD_TRY(r->heat.init(r->plan, hp));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes
@@ -4042,8 +4105,15 @@ int Engine::start() {
              * guard, wherever that is below the region at the top (stager.h). */
             int64_t top_level = 0;
             r->arena_low_off = -1;
+            /* RADIANCE_STAGE_SPAN=0: no place at the span's shared level, so that level lends the ring's
+             * room to the expert slab too and its steps (every mixed step at --prefill-span) are not
+             * staged; only full-plan steps are. 79 (7.11.): with mixed steps unstaged (RADIANCE_STAGE_MIXED
+             * =0) the reserved room alone left them 2.6-4.2 % slower than without levels. Unset: as before. */
+            const char* sse = getenv("RADIANCE_STAGE_SPAN");
+            const bool span_place = !(sse && (!std::strcmp(sse, "0") || !std::strcmp(sse, "off")));
             for (const ArenaLevel& lv : r->arena_levels) {
                 if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
+                if (!span_place) continue;
                 const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
                                     RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
                 r->arena_low_off = std::min(off, r->program.arena_stage_off);

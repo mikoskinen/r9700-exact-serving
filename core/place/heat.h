@@ -78,6 +78,46 @@ struct HeatParams {
      * 1024, 79.0% at 512 or 256. */
     float credit_cap = 512.0f;
 
+    /* How much of a step a histogram from a step with prefill rows counts as, 0..1: its decay and
+     * its credit are both scaled to that share (observe's `share`), so 0 leaves the heat exactly
+     * as the decode steps around the prompt left it and 1 is the step every histogram counted as
+     * before (bit for bit). The engine gives a step of `n` rows, `d` of them decode rows, the share
+     * (d + prefill_share * (n - d)) / n; a draft head's layers keep 1.
+     *
+     * Why: the cap bounds one chunk, not a prompt. Under expert parallelism a rank sees about
+     * 8192 x top-k / world selections of a chunk, always over the cap, and a decode step about
+     * top-k / world, so each chunk credits several hundred decode steps' worth and decays the
+     * decode heat once more. DeepSeek-V4.1-Flash EXL3 at TP4 (6.11.): after a 243k-token cold
+     * prefill (30 chunks) the routed experts ran 8.3 ms a step instead of 5.0 and the MoE
+     * all-reduce waited 10.7 ms instead of 5.0, recovering over ~200 decode steps as the moves
+     * put the decode set back. Placement never changes an output (the same kernel reads the same
+     * bytes from whichever tier holds them), so the share is exact. RADIANCE_HEAT_PREFILL. */
+    float prefill_share = 1.0f;
+
+    /* Dual heat (on when 0 < prefill_decay < 1): a decode heat and a prefill heat per unit, ranked
+     * by their sum. A step's decode rows credit the decode heat, which decays with them as one heat
+     * does (decay^decode share, so a prefill step leaves it as it was); its prefill rows credit the
+     * prefill heat (times prefill_gain), and the prefill heat decays by prefill_decay at every
+     * credited step, prefill or decode. During a prompt its chunks keep the prefill heat high and
+     * the ranking follows the prompt (its experts come in, as with one heat: 6.11. EXL3 TP4 at 47
+     * flags, prefill share 0 cost 31 % of a 266k prompt's prefill rate); after it, the prefill heat
+     * is gone within tens of steps (0.7^12 = 1.4 %) and the ranking is the decode heat the prompt
+     * left untouched, not one the prompt's chunks decayed under their own credit (one heat at
+     * share 1: 28.6 ms/step decoding right after that prompt against 23.5 at share 0).
+     * prefill_share is not read in this mode. RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN. */
+    float prefill_decay = 0.0f;
+    float prefill_gain = 1.0f;
+
+    /* Dual heat only: the fraction of a slab class's resident units, the hottest by DECODE heat,
+     * that no promotion may demote (0 = none). A prompt then fills the rest of the resident set
+     * and the decode core stays on the card through it, where unprotected it is evicted wholesale
+     * and comes back only as fast as its units' decode heat clears min_gain (at TP4 one token
+     * credits ~1.5 selections a rank, so most of a decode set sits below 1.5: 6.11., 26.8 ms/step
+     * decoding after a 266k prompt against 23.5 with no prompt credit). Thresholds are taken once
+     * a step (step()), so a unit's protection is one step stale. A unit with no decode heat is never
+     * protected. RADIANCE_HEAT_DECODE_PIN. */
+    float decode_pin = 0.0f;
+
     /* Dispatches to watch before moving anything. 0, because min_gain already requires
      * `hot >= cold*hysteresis + 1.5`, which against a zero-heat victim is two tokens agreeing in
      * one dispatch; a warmup only delays convergence. */
@@ -92,6 +132,17 @@ struct HeatParams {
      * mistake costs one future re-read, and the slot count — not this bar — bounds the cache. */
     float admit_heat = 0.5f;
 };
+
+/* The share of a step (HeatParams::prefill_share) a histogram of a step with `n_tok` rows,
+ * `n_tok_decode` of them decode rows, is credited at: the decode rows in full, the prefill rows at
+ * `prefill_share`, over the rows. 1 for a pure decode step, `prefill_share` for a pure prefill one,
+ * and 1 whenever the share is 1 or the rows are unknown. */
+inline float heat_step_share(float prefill_share, int64_t n_tok, int64_t n_tok_decode) {
+    if (!(prefill_share < 1.0f) || n_tok <= 0 || n_tok_decode >= n_tok) return 1.0f;
+    const double d = n_tok_decode > 0 ? (double)n_tok_decode : 0.0, n = (double)n_tok;
+    const double p = prefill_share > 0.0f ? (double)prefill_share : 0.0;
+    return (float)((d + p * (n - d)) / n);
+}
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
  * together: a promotion without its demotion would grow the resident set past the slab. */
@@ -211,8 +262,18 @@ public:
      *
      * `weight` is how many of the layer's routing passes this histogram stands for (see
      * Ctx::last_histogram_reports): 1 for a non-speculative step, n_spec for a draft head. It
-     * scales the credit, not the decay, because every layer still decays exactly once a step. */
-    void observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight = 1.0f);
+     * scales the credit, not the decay, because every layer still decays exactly once a step.
+     *
+     * `share` is how much of a step the histogram's step counts as (HeatParams::prefill_share):
+     * the decay is decay^share and the credit is scaled by share. 1 is the plain step, exactly as
+     * without the parameter; 0 or less leaves every heat as it was and only prices the routing
+     * (hit rate, streamed bytes), so the counters still see every step. `pshare` is read only in
+     * dual-heat mode (HeatParams::prefill_decay): the step's prefill share. */
+    void observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight = 1.0f,
+                 float share = 1.0f, float pshare = 0.0f);
+    /* Dual heat (HeatParams::prefill_decay): `share` is the step's decode share and `pshare` its
+     * prefill share; see observe_dual. */
+    bool dual() const { return params_.prefill_decay > 0.0f && params_.prefill_decay < 1.0f; }
     /* The same, sparse: distinct expert ids and their counts. `counts` may be null for one each. */
     void observe_ids(int32_t layer, const int32_t* experts, const int32_t* counts, int32_t n);
     /* Starts fetching a histogram observe() will read. A row the card copied into host memory
@@ -303,6 +364,16 @@ private:
      * translate (-1 for a hole); everything outside the position arrays is indexed by MoveUnit
      * index, as in the plan. */
     std::vector<float>   heat_;               /* by position */
+    /* Dual heat only (HeatParams::prefill_decay): the decode and prefill heats by position; heat_
+     * is their sum, which every ranking reads. Empty otherwise. */
+    std::vector<float>   heat_d_, heat_p_;
+    /* HeatParams::decode_pin: per slab class, the decode heat from which a resident unit is no
+     * victim (+inf: none), and step()'s scratch for finding it. */
+    std::vector<float>   pin_thr_;
+    std::vector<std::vector<float>> pin_tmp_;
+    void update_pin();
+    void observe_dual(int32_t layer, const int32_t* counts, int32_t n, float w, uint64_t passes,
+                      float share, float pshare);
     std::vector<int32_t> pos_;                /* unit -> position */
     std::vector<int32_t> unit_at_;            /* position -> unit, -1 for a hole */
     /* Per position, what step() ranks it as: 0 not a candidate (fixed, in flight, or a hole), 1 a

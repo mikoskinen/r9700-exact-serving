@@ -482,6 +482,22 @@ void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
     xs->note_dropped(r.ctx.route_dropped());
 }
 
+/* How much of a step a trunk histogram of step `step` counts as (HeatParams::prefill_share): its
+ * decode rows in full and its prefill rows at the share, over its rows. 1 where the share is 1, for
+ * a draft head's layers (past the model's layers; xstats files them the same way), and for a step
+ * the ring no longer holds. Under dual heat (HeatParams::prefill_decay) the decode share is the
+ * decode rows' fraction and *pshare the prefill rows'; elsewhere *pshare is 0. */
+float Engine::heat_share(const Rank& r, int layer, int step, float* pshare) const {
+    if (pshare) *pshare = 0.0f;
+    const float p = heat_dual_ ? 0.0f : heat_prefill_share_;
+    if (!(p < 1.0f) || step < 0 || layer >= (int)meta_.n_layers || r.heat_steps.empty()) return 1.0f;
+    const Rank::HeatStepRows& s = r.heat_steps[(size_t)(step % Rank::kHeatStepRing)];
+    if (s.step != step) return 1.0f;
+    const float sd = heat_step_share(p, s.n_tok, s.n_tok_decode);
+    if (heat_dual_ && pshare) *pshare = 1.0f - sd;
+    return sd;
+}
+
 void Engine::tiering_dispatch(Rank& r, int step) {
     XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
     if (!r.heat.enabled()) {
@@ -504,7 +520,9 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         /* A bank can hold several passes (a draft head reports once per pass into one bank), so
          * weight it by the report count, or the layer's experts are underpriced and drained. */
         const int reps = r.ctx.last_histogram_reports(hr.layer, hr.bank);
-        r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f);
+        float pshare = 0.0f;
+        const float share = heat_share(r, hr.layer, r.ctx.last_histogram_step(hr.layer, hr.bank), &pshare);
+        r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f, share, pshare);
         /* The row is in cache now. */
         if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
@@ -661,6 +679,15 @@ void Engine::rank_loop(int index) {
              * more later. An encoder pass is not a step of the token stream. */
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
+            /* The heat engine's prefill share reads each trunk step's rows at its drain. */
+            if ((heat_prefill_share_ < 1.0f || heat_dual_) && what != kIssueSampler && b->enc == 0 &&
+                b->draft_pass == 0 && b->step >= 0) {
+                if (r.heat_steps.empty()) r.heat_steps.resize(Rank::kHeatStepRing);
+                Rank::HeatStepRows& hs = r.heat_steps[(size_t)(b->step % Rank::kHeatStepRing)];
+                hs.step = b->step;
+                hs.n_tok = b->n_tok;
+                hs.n_tok_decode = b->n_tok_decode;
+            }
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
@@ -1804,6 +1831,36 @@ void Engine::loan_tick(bool idle) {
  * in those slots revert to their host copies (an address change, not a copy) and both streams
  * that can read a slot are drained. A prefill pays this on its first chunk only, since the loan
  * does not regrow until steps have been small for a while (arena_tick). */
+/* RADIANCE_STAGE_MIXED: which passes that carry decode rows the prefill stager may arm for (a lone
+ * prefill pass is armed by the size rule alone, stager.h).
+ *   unset / 1  any pass the size rule admits
+ *   0          none: a mixed step's routed GEMMs read the pool in place, as without the stager
+ *   2          only one whose prefill chunk leaves at least the stager's smallest pass of its prompt
+ *              for a later step (a long prompt beside decoding sequences), not a prompt's last or only
+ *              chunk
+ * On DeepSeek-V4.1 EXL3 at four ranks (79, 7.11.) a lone chunk staged ran 42 % faster at 2.9 bpw,
+ * a one-chunk prompt beside four decoders 8-12 % slower at both widths (the whole pooled set, 9-21
+ * GB a rank, crosses the link by DMA for a ~1-2k-row step whose compute cannot hide it), and the
+ * chunks of a 31k prompt beside four decoders 3.8 % faster at 2.25 bpw, 5.8 % slower at 2.9. */
+static int stage_mixed_mode() {
+    static const int mode = [] {
+        const char* e = getenv("RADIANCE_STAGE_MIXED");
+        if (!e || !*e) return 1;
+        if (!std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "2") || !std::strcmp(e, "continues")) return 2;
+        return 1;
+    }();
+    /* Said once, at the first step that asks, so a serve log shows which rule ran. */
+    static const bool said = [] {
+        if (mode != 1)
+            RAD_INFO("prefill staging: a pass with decode rows is %s (RADIANCE_STAGE_MIXED=%d)",
+                     mode == 0 ? "never staged" : "staged only while its prompt continues", mode);
+        return true;
+    }();
+    (void)said;
+    return mode;
+}
+
 int Engine::arena_step(const RadBatch* b) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
@@ -1818,6 +1875,12 @@ int Engine::arena_step(const RadBatch* b) {
      * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
      * hold). */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
+    /* A mixed step (decode rows [0, n_tok_decode)) is staged only where RADIANCE_STAGE_MIXED allows
+     * (stage_mixed_mode). */
+    const int smode = stage_mixed_mode();
+    const bool lone = b->phase == RAD_PHASE_PREFILL || (b->phase != RAD_PHASE_DECODE && b->n_tok_decode == 0);
+    const bool mixed_ok = smode == 1 || lone ||
+                          (smode == 2 && b->phase != RAD_PHASE_DECODE && sched_.prefill_has_more());
     for (auto& r : ranks_) {
         const int64_t allow = r->arena_lent[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
@@ -1834,7 +1897,8 @@ int Engine::arena_step(const RadBatch* b) {
         /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
          * span's shared level keeps a place of its own for it (stager.h); every other level
          * lends both. */
-        char* const ring = level == 0 ? r->stager.ring_full()
+        char* const ring = !mixed_ok ? nullptr
+                         : level == 0 ? r->stager.ring_full()
                          : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
                                ? r->stager.ring_low() : nullptr;
         r->stager.set_ring(ring);
@@ -1853,10 +1917,21 @@ int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_
 /* The arena loan grows only after large steps stop. A prefill is chunks with decode steps between,
  * and lending after every chunk would refill and recall the slab each time. So the floor (the
  * largest step seen) holds for two seconds after it was last reached, then falls to the latest
- * step's size. */
+ * step's size. RADIANCE_ARENA_HOLD_MS sets the hold (unset: 2000): longer recalls the slab less
+ * often under steady prefill traffic (each recall drains both streams), at the price of decode steps
+ * that run without the loan for that long after a prompt. */
+static uint64_t arena_hold_ns() {
+    static const uint64_t ns = [] {
+        const char* e = getenv("RADIANCE_ARENA_HOLD_MS");
+        const long long ms = e && *e ? std::atoll(e) : 2000;
+        return (uint64_t)(ms > 0 ? ms : 2000) * 1000000ull;
+    }();
+    return ns;
+}
+
 void Engine::arena_tick(uint64_t now_ns) {
     if (arena_rows_.size() <= 1) return;
-    if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > 2000000000ull) {
+    if (arena_last_ < arena_floor_ && now_ns - arena_floor_ns_ > arena_hold_ns()) {
         arena_floor_ = arena_last_;
         arena_floor_ns_ = now_ns;
     }

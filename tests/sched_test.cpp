@@ -3283,6 +3283,8 @@ TEST(an_explicit_busy_prefill_chunk_holds_the_chunk_to_it) {
 struct Interleaved {
     std::string shape;
     std::string staged;
+    std::string more;      /* prefill_has_more() after each step (RADIANCE_STAGE_MIXED=2) */
+    std::string want;      /* '+' where the step's chunk of the prompt leaves >= 64 rows of it */
     int64_t steps_held = 0;
 };
 
@@ -3306,10 +3308,16 @@ static Interleaved interleave_run(int64_t n, bool decoder, int steps, double chu
     Interleaved out;
     for (int k = 0; k < steps; ++k) {
         if (!f.sch.step()) break;
-        bool chunk = false;
-        for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
+        bool chunk = false, left = false;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == p && e.is_prefill) {
+                chunk = true;
+                left = 2000 - ((int64_t)e.ctx_len + e.n_tokens) >= 64;
+            }
         out.shape += chunk ? 'C' : 'D';
+        out.want += left ? '+' : '-';
         out.staged += f.sch.prefill_continues() ? '+' : '-';
+        out.more += f.sch.prefill_has_more() ? '+' : '-';
         f.commit_plain(12);
     }
     out.steps_held = f.sch.metrics().steps_held;
@@ -3347,6 +3355,18 @@ TEST(interleave_runs_n_decode_only_steps_after_each_chunk) {
     CHECK_EQ(r.shape, std::string("CDDCDDCDDC"));
     CHECK_EQ(r.staged, std::string("----------"));
     CHECK_EQ(r.steps_held, 6);
+}
+
+/* prefill_has_more() answers for the step's own chunk whatever the next step is held to: '+' on a
+ * chunk that leaves at least the stager's smallest pass (64 here) of the prompt, '-' otherwise and
+ * on a step that carries none. */
+TEST(prefill_has_more_ignores_the_interleave_hold) {
+    const Interleaved r = interleave_run(2, /*decoder=*/true, 24);
+    CHECK_EQ(r.more, r.want);                            /* '+' on chunks that leave >= 64 rows */
+    CHECK(r.more.find('+') != std::string::npos);
+    CHECK_EQ(r.staged, std::string(r.staged.size(), '-'));   /* the hold: prefill_continues says no */
+    const Interleaved off = interleave_run(0, /*decoder=*/true, 8);
+    CHECK_EQ(off.more, off.staged);                      /* no hold: the same as prefill_continues */
 }
 
 /* Nothing decodes beside a lone prefill, so nothing is held. */

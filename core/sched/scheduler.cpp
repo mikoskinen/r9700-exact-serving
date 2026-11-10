@@ -2425,6 +2425,20 @@ bool Scheduler::prefill_continues() const {
     return false;
 }
 
+bool Scheduler::prefill_has_more() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (stage_rows_ <= 0 || !step_open_) return false;
+    /* As prefill_continues, without the interleave test: the chunk leaves at least the stager's
+     * smallest pass of its prompt for a later step (a tail of a few rows is not a continuation). */
+    for (const StepEntry& e : plan_.e) {
+        if (!e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
+            continue;
+        const int64_t left = reqs_[(size_t)e.slot]->seq_len() - ((int64_t)e.ctx_len + e.n_tokens);
+        if (left >= stage_rows_) return true;
+    }
+    return false;
+}
+
 bool Scheduler::media_ready(SchedReq& s) {
     bool ready = true;
     for (mm::Placed& p : s.req->media->items) {
