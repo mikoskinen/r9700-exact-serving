@@ -23,12 +23,13 @@
  *                   registered. A request takes 1 / 0 / -1 (= back to --draft-window); 1 is refused when the
  *                   deployment's drafter cannot run the adaptive window ("draft_capable": 0).
  *   gg_gemv         libr4d (rad_fn4_*): gemm_nt_ggml's decode band (up to 48 rows), 0 the stock rows-a-wave / grid
- *                   rule, 1 the measured per-(type, N, K, M) form table (r4d_ds41_gg_forms.h); the forms differ only in
- *                   which wave and block compute an output, never in its arithmetic, so the bytes are the same either
- *                   way. The value is the one libr4d applied (it reads RADIANCE_DS41_GG_GEMV at load and takes only
- *                   the forms it knows; another value there is the stock rule, named on stderr); -1 when no loaded
- *                   object serves the switch. A request for a value the serving plugin does not know is refused (2
- *                   is free for a later form).
+ *                   rule, 1 the measured per-(type, N, K, M) form table (r4d_ds41_gg_forms.h), 2 lever D2's
+ *                   multi-row form (r4d_ds41_ggml_mr.hip, gemm_nt_ggml and logits_gemm_ggml; what it declines runs
+ *                   the stock rule); every form has the stock kernel's per-output arithmetic, so the bytes are the
+ *                   same whichever runs. The value is the one libr4d applied (it reads RADIANCE_DS41_GG_GEMV at load
+ *                   and takes only the forms it knows; another value there is the stock rule, named on stderr); -1
+ *                   when no loaded object serves the switch. A request for a value the serving plugin does not know
+ *                   is refused.
  *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule in force, 0 off, 1 rule,
  *                   2 rule-w -- the switch once set, else RADIANCE_AQL_ACQ=rule | rule-w at start (ds41-ar-acq
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),

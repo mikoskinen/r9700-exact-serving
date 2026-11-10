@@ -2187,7 +2187,7 @@ TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text)
  * recorded passes are keyed by, so the passes before it are not played after it; the text stays
  * the same across the changes. GET reports what is applied, from its owner: a server with no draft
  * head reports the fixed window and refuses an adaptive one in the response; gg_gemv is libr4d's
- * (-1 where no loaded object serves it), and a value it does not know is refused. */
+ * (-1 where no loaded object serves it), and a value it does not know (3) is refused. */
 TEST(the_runtime_switches_apply_at_a_step_release_and_keep_the_text) {
     REQUIRE(world().ok);
     Server s;
@@ -2217,7 +2217,7 @@ TEST(the_runtime_switches_apply_at_a_step_release_and_keep_the_text) {
     }
     CHECK_EQ(st, 400);
     CHECK(has(body, "cannot run the adaptive window"));
-    (void)post(s.port, "/admin/fn4", json{ { "gg_gemv", 2 } }, &st);
+    (void)post(s.port, "/admin/fn4", json{ { "gg_gemv", 3 } }, &st);
     CHECK_EQ(st, 400);
     json on = { { "epoch_bump", 1 }, { "aql_acq", 1 } };
     if (gg) on["gg_gemv"] = 1;
