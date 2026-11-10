@@ -264,6 +264,10 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
                   policy_->name());
     report_ += split;
     report_ += skipped;
+    if (has_linear_)
+        report_ += "  later publisher's bytes win where no snapshot rests on the first copy: a cached "
+                   "entry is replaced by a publisher whose own snapshots rest on its copy, so a hit "
+                   "restores what its snapshot was computed from\n";
     if (!demotable_) {
         /* Stated whether or not a host tier is configured. */
         report_ += "  a streamed group is cached, so no entry can be demoted to the host tier: a "
@@ -446,14 +450,33 @@ int PrefixCache::insert(uint64_t session,
 
     std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
     const uint64_t now = rad_mono_ns();
+    /* Entries the deepest committed snapshot on this chain rests on: this request's own (its
+     * checkpoints commit mid-request, before this publish) or the one it resumed from. */
+    int64_t under = 0;
+    if (has_linear_) {
+        const auto d = deepest_ckpt(hs, n_full * block_size_);
+        if (d != ck_by_prefix_.end()) under = d->second.pos / block_size_;
+    }
+    int64_t taken = 0;
     for (int64_t b = 0; b < n_full; ++b) {
         const BlockHash& h = hs[(size_t)b];
         auto it = map_.find(h);
         /* With snapshots (recurrent state or a sliding window) an existing entry keeps the bytes
-         * it was published with, wherever it is held: a snapshot deeper in the chain was computed
-         * from them, and a recompute in another step shape can round the KV differently. The
-         * recomputed blocks go with the request's sequence; a later hit restores the tier copy. */
-        if (it != map_.end() && (it->second.in_lru || has_linear_)) continue;   /* touched below */
+         * it was published with, wherever it is held, once a snapshot rests on them (pinned): a
+         * snapshot deeper in the chain was computed from them, and a recompute in another step
+         * shape can round the KV differently. The recomputed blocks go with the request's
+         * sequence; a later hit restores the tier copy.
+         *
+         * The reverse holds too: this request's snapshots below `under` were computed from ITS
+         * bytes. Where the cache's copy came from a prefill no snapshot rests on -- every chat
+         * prompt shares its first entry, and a short prompt's one chunk rounds it differently from
+         * a long prompt's first full chunk -- keeping that copy would resume this chain from
+         * bytes its snapshots never saw. Such an entry takes this request's bytes (republish). */
+        if (it != map_.end() && (it->second.in_lru || has_linear_)) {
+            if (b < under && !it->second.pinned && republish(h, it->second, blocks, b, now))
+                ++taken;
+            continue;                                                      /* touched below */
+        }
         if (it != map_.end()) {
             /* Without snapshots, an off-device entry this request recomputed (a restore that did
              * not fit, or a chain cut short): its blocks become the entry's device copy and the
@@ -488,6 +511,20 @@ int PrefixCache::insert(uint64_t session,
     }
     /* Deepest first, as in lookup: the first block ends most recent. */
     for (int64_t b = n_full - 1; b >= 0; --b) touch(hs[(size_t)b], now);
+    /* The snapshot rests on what the cache now holds wherever that is this request's own copy
+     * (published, adopted or taken over above); those bytes stay from here on. */
+    for (int64_t b = 0; b < under; ++b) {
+        auto it = map_.find(hs[(size_t)b]);
+        if (it == map_.end() || it->second.pinned || !it->second.in_lru) continue;
+        if (holds_own(it->second, blocks, b)) it->second.pinned = true;
+    }
+    if (taken > 0) {
+        stats_.republished += taken;
+        RAD_INFO("prefix cache: session %llu: %lld cached entries (%lld tokens) take a later "
+                 "publisher's bytes, this request's, which its snapshots rest on; no snapshot "
+                 "rested on the copy they replace", (unsigned long long)session, (long long)taken,
+                 (long long)(taken * block_size_));
+    }
 
     /* The tiers learn the chain only here: insert() is the one call that knows a chain was
      * completed, and the only place every entry's block ids are in hand.
@@ -624,6 +661,48 @@ int PrefixCache::rebind(const BlockHash& key, const std::vector<int32_t>& blocks
         e.in_lru = true;
     }
     return RAD_OK;
+}
+
+bool PrefixCache::holds_own(const Entry& e, const std::vector<std::vector<int32_t>>& bt,
+                            int64_t b) const {
+    if (e.blocks.size() != entry_groups_.size()) return false;
+    for (size_t k = 0, g = 0; g < groups_.size(); ++g)
+        for (int32_t j = 0; j < per_[g]; ++j, ++k) {
+            const size_t at = (size_t)(b * per_[g] + j);
+            if (at >= bt[g].size() || e.blocks[k] != bt[g][at]) return false;
+        }
+    return true;
+}
+
+bool PrefixCache::republish(const BlockHash& h, Entry& e,
+                            const std::vector<std::vector<int32_t>>& bt, int64_t b,
+                            uint64_t now_ns) {
+    if (e.in_lru) {
+        /* Adopted: the publisher already reads the cache's copy. */
+        if (holds_own(e, bt, b)) return false;
+        /* A live sequence adopted the old copy and its snapshots may rest on it. */
+        if (shared_with_live(e)) return false;
+        /* A copy out is reading the old blocks; they cannot go back to the pool yet. */
+        if (tiers_ && tiers_->moving(h)) return false;
+    } else if (!tiers_ || !tiers_->resident_off_device(h)) {
+        /* Off the card with a promotion out, or nowhere the tiers know. */
+        return false;
+    }
+    std::vector<int32_t> mine;
+    if (!retain_entry(bt, b, &mine)) return false;
+    if (e.in_lru) {
+        release_blocks(e);
+    } else {
+        /* The host copy goes with the old bytes (rebound below); these blocks are the entry. */
+        lru_.push_back(h);
+        e.lru = std::prev(lru_.end());
+        e.in_lru = true;
+    }
+    e.blocks = std::move(mine);
+    e.used_ns = now_ns;
+    /* A host copy of the old bytes is dropped and the new blocks are queued for their own. */
+    if (tiers_ && demotable_) tiers_->rebound(h, e.blocks, now_ns, b);
+    return true;
 }
 
 bool PrefixCache::shared_with_live(const Entry& e) const {
