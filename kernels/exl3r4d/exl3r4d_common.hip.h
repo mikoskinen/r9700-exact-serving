@@ -696,15 +696,34 @@ static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, in
 
 // A spare workgroup (no expert): its share of the rows no run covers -- [0, off[0]) and [off[n_expert], T) --
 // zeroed in its column block. Spares split them round-robin by row.
+// fn4 DZ (EXL3R4D_DZ 1, 10.11.2026, from 161's stage reading): the direct form -- a spare visits only its own rows
+// d = spare + j nspare instead of scanning all dead x 16 units and skipping the others' (d % nspare != spare). The grid
+// holds min(T, n_expert) + 1 runs, but at EP4 a rank's live runs are ~1/4 of that: at T = 160 (M 16, top-10) ~104
+// spares a column block each scanned ~120 x 16 units with an integer modulo -- 161 (gpu02, one card, EP4 rank -1, down)
+// stage 2 - stage 1 = +9.84 us a dispatch at M 16 (M 4 +0.75, M 1 +0.47). The same rows, columns and zero bytes are
+// stored: bit-identical.
+#ifndef EXL3R4D_DZ
+#define EXL3R4D_DZ 0
+#endif
 static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspare, int cb) {
   const int lo = clamp_row(p.off[0], p.T), hi = clamp_row(p.off[p.n_expert], p.T);
   const int dead = lo + (p.T - hi);
+#if EXL3R4D_DZ
+  if (spare >= dead) return;
+  const int mine = (dead - 1 - spare) / nspare + 1;   // rows spare, spare + nspare, ... below dead
+  for (int u = threadIdx.x; u < mine * 16; u += EXL3R4D_BDIM) {
+    const int d = spare + (int)(u / 16) * nspare;
+    const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
+    *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
+  }
+#else
   for (int u = threadIdx.x; u < dead * 16; u += EXL3R4D_BDIM) {
     const int d = u / 16;
     if (d % nspare != spare) continue;
     const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
     *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
   }
+#endif
 }
 
 // One expert's planes, resolved once per workgroup (uniform: scalar registers).
