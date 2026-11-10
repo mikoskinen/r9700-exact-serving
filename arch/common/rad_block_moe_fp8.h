@@ -569,6 +569,12 @@ struct MoeFP8 {
     }
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
+    /* The routing histogram of rows [r0, r0 + rows) into the block's own counts (w.ecnt), the sort's
+     * other outputs as scratch: for a caller that ran a step in several passes and wants
+     * route_report to hand on the counts one pass of all those rows writes (deepseek41's pipelined
+     * prefill, so its heat engine sees what the serial step's does). Rows at most a pass; a no-op
+     * without a separate sort op (the fused router forms). */
+    void count_rows(RadCtx* c, int64_t r0, int64_t rows) const;
     bool issues_ar(int64_t T, int64_t rows) const {
         return op_ar && !ar_taken(g, ar_out_take != kArOutNorm ? T : rows, ar_out, ar_out_take);
     }
@@ -2492,6 +2498,17 @@ inline void MoeFP8::step_rows(RadCtx* c_, int64_t T, const Beside* beside) const
         pass(c_, T, r0, n, true, beside);
     }
     route_report(c_);
+}
+
+inline void MoeFP8::count_rows(RadCtx* c_, int64_t r0, int64_t rows) const {
+    if (!op_scatter || rows < 1 || rows > c.rows) return;
+    const int64_t ne = c.n_expert, k = c.top_k;
+    if (scatter_inv)
+        RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k), brows(w.sorted, rows * k),
+                    brows(w.eoff, ne + 1), brows(w.ecnt, ne), brows(w.inv, rows * k));
+    else
+        RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k), brows(w.sorted, rows * k),
+                    brows(w.eoff, ne + 1), brows(w.ecnt, ne));
 }
 
 inline void MoeFP8::route_report(RadCtx* c_) const {

@@ -2601,7 +2601,8 @@ static void mix_f_beside(RadCtx* x, void* a) {
  *                                                  ->   MoE all-reduce, piece 0
  *   MoE pass 1
  *   wait                                           ->   MoE all-reduce, piece 1
- *   post + next collapse + norm, piece 0
+ *   the routing histogram over the whole step (one moe_scatter, for the heat engine: what the
+ *   serial step reports); post + next collapse + norm, piece 0
  *   wait; the same, piece 1
  *
  * EXACT: byte-identical to the serial step of the same rows (today's span-2 step), not merely to a
@@ -3111,6 +3112,9 @@ static void step(RadCtx* x, const RadBatch* batch) {
             L.moe.pass(x, T, r0(1), rn(1), false, nullptr, pr1);
             wait1();
             on1(true, [&] { L.moe.issue_ar(x, r0(1), rn(1)); });   /* beside piece 0's write */
+            /* The heat engine gets the whole step's routing histogram, as the serial step's one
+             * pass writes it (one sort over every row's selections), not the last piece's. */
+            L.moe.count_rows(x, 0, T);
             L.moe.route_report(x);
             write_a(0);
             wait1();
