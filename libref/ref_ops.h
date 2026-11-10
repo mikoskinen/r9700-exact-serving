@@ -147,6 +147,17 @@ int ref_dflash_markov_greedy_f32(const RadArgs*, RadStream);
 int ref_dflash_tree        (const RadArgs*, RadStream);
 int ref_dspark_conf       (const RadArgs*, RadStream);
 int ref_dspark_alt        (const RadArgs*, RadStream);
+/* A tree verify for DeepSeek-V4.1's DSpark (ref_tree.cpp; the tree variants in ref_sparse_kv.cpp,
+ * ref_qsa.cpp, ref_ngram.cpp): the rows' tree table, the tree-aware attention, indexer, compressor
+ * gather and n-gram ids, the context pass's commits and the drafter's tree proposal. */
+int ref_tree_rows          (const RadArgs*, RadStream);
+int ref_attn_sparse_sink_tree(const RadArgs*, RadStream);
+int ref_index_score_tree   (const RadArgs*, RadStream);
+int ref_qsa_work_tree      (const RadArgs*, RadStream);
+int ref_ngram_ids_tree     (const RadArgs*, RadStream);
+int ref_tree_commit_entries(const RadArgs*, RadStream);
+int ref_tree_commit_rows   (const RadArgs*, RadStream);
+int ref_dspark_tree_assemble(const RadArgs*, RadStream);
 int ref_gram_accum         (const RadArgs*, RadStream);
 int ref_rmsnorm_had_quant_i8(const RadArgs*, RadStream);
 int ref_gated_had_quant_i8 (const RadArgs*, RadStream);
@@ -467,6 +478,14 @@ REF_SHAPE_FN(ref_dflash_markov_greedy_f32);
 REF_SHAPE_FN(ref_dflash_tree);
 REF_SHAPE_FN(ref_dspark_conf);
 REF_SHAPE_FN(ref_dspark_alt);
+REF_SHAPE_FN(ref_tree_rows);
+REF_SHAPE_FN(ref_attn_sparse_sink_tree);
+REF_SHAPE_FN(ref_index_score_tree);
+REF_SHAPE_FN(ref_qsa_work_tree);
+REF_SHAPE_FN(ref_ngram_ids_tree);
+REF_SHAPE_FN(ref_tree_commit_entries);
+REF_SHAPE_FN(ref_tree_commit_rows);
+REF_SHAPE_FN(ref_dspark_tree_assemble);
 REF_SHAPE_FN(ref_gram_accum);
 REF_SHAPE_FN(ref_rmsnorm_had_quant_i8);
 REF_SHAPE_FN(ref_gated_had_quant_i8);

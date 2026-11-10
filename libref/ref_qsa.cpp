@@ -13,6 +13,7 @@
 #include "ref_common.h"
 #include "ref_gemm.h"   /* row_stride */
 #include "ref_ops.h"
+#include "ref_tree.h"
 
 #include <algorithm>
 #include <cmath>
@@ -305,6 +306,143 @@ int ref_qsa_work(const RadArgs* a, RadStream) {
             const int64_t db = (w * ratio + i) * stg->stride[0];
             for (int64_t d = 0; d < n; ++d)
                 stt(stg, db + d * stg->stride[1], ldt(src, sb + d * sc));
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ qsa_work_tree */
+/* qsa_work over a tree verify (operands 11 `tree`, 12 `mpage`, 13 `tpage` after qsa_work's eleven;
+ * `rope` must be absent). A tree sequence -- its first row a root of the row table (ref_tree.h) --
+ * completes one block per row m whose position does ((positions[m] + 1) % ratio == 0), in row order:
+ * block b = (positions[m] + 1) / ratio - 1, key q of [b ratio, b ratio + ratio) from the step row of
+ * m's ancestor at depth q - A when q >= A (A the anchor; no such ancestor stages zeros), else from
+ * tail row q % ring. page = bt[s][b] (-1 without a tail slot), mpage = page for a depth-0 row and
+ * -1 past it, tpage = m for a row of depth >= 1 with page >= 0 (-1 otherwise), bpos = b ratio,
+ * nc[s] = (largest position + 1) / ratio. Any other sequence is qsa_work's, mpage = page, tpage = -1.
+ * Items past the count: page, mpage and tpage -1, bpos 0. */
+int ref_qsa_work_tree(const RadArgs* a, RadStream) {
+    if (a->n_t < 14) return RAD_E_INVAL;
+    const RadTensor *k = t_in(a, 0), *po = t_in(a, 1), *cu = t_in(a, 2), *tl = t_in(a, 3);
+    const RadTensor *sx = t_in(a, 4), *bt = t_in(a, 5), *rp = t_in(a, 6), *stg = t_in(a, 7);
+    const RadTensor *pg = t_in(a, 8), *bp = t_in(a, 9), *nc = t_in(a, 10), *tt = t_in(a, 11);
+    const RadTensor *mp = t_in(a, 12), *tp = t_in(a, 13);
+    if (!k || !po || !cu || !tl || !sx || !bt || !stg || !pg || !bp || !nc || !tt || !mp || !tp)
+        return RAD_E_INVAL;
+    if (rp) return RAD_E_UNSUPPORTED;
+    const int64_t n = p_int(a, "n", 0), ratio = p_int(a, "ratio", 0), ring = p_int(a, "ring", 0);
+    if (n <= 0 || ratio <= 0 || ring < ratio) return RAD_E_INVAL;
+    if (k->rank != 2 || bt->rank != 2 || stg->rank != 2) return RAD_E_SHAPE;
+    if (tl->rank != 4 || tl->shape[1] != 1 || tl->shape[2] < ring || tl->shape[3] != n)
+        return RAD_E_SHAPE;
+    const int64_t T = k->shape[0], n_seq = numel(cu) - 1, slots = tl->shape[0];
+    if (T <= 0 || n_seq <= 0 || numel(po) < T || k->shape[1] != n || stg->shape[1] != n)
+        return RAD_E_SHAPE;
+    if (bt->shape[0] < n_seq || (sx->rank >= 2 ? sx->shape[0] : numel(sx)) < n_seq)
+        return RAD_E_SHAPE;
+    const int64_t mw = numel(pg);
+    if (mw < n_seq || stg->shape[0] < mw * ratio || numel(nc) < n_seq || numel(bp) < mw ||
+        numel(mp) < mw || numel(tp) < mw || tt->dtype != RAD_I32)
+        return RAD_E_SHAPE;
+    for (int64_t t = 0; t < T; ++t)
+        if (ldi(po, offlin(po, t)) < 0) return RAD_E_INVAL;
+    const RefTree tr(tt, po);
+    if (tr.W < 3) return RAD_E_SHAPE;
+
+    /* The work list: (sequence, block, completing row or -1 for qsa_work's item). */
+    struct Item { int64_t s, b, m; };
+    std::vector<Item> items;
+    std::vector<int64_t> ncv((size_t)n_seq, 0);
+    for (int64_t s = 0; s < n_seq; ++s) {
+        const int64_t t0 = cu_at(cu, s), t1 = cu_at(cu, s + 1);
+        if (t1 <= t0) continue;
+        if (t0 < 0 || t1 > T) return RAD_E_SHAPE;
+        const int64_t si = ldi(sx, col0(sx, s));
+        if (si >= slots) return RAD_E_INVAL;
+        int64_t d0 = -1, r00 = -1;
+        const bool tree = tr.row(t0, &d0, &r00) && d0 == 0;
+        if (tree) {
+            int64_t mx = 0;
+            for (int64_t m = t0; m < t1; ++m) {
+                const int64_t pm = ldi(po, offlin(po, m));
+                mx = std::max(mx, pm);
+                int64_t dm = -1, rm = -1;
+                if ((pm + 1) % ratio || !tr.row(m, &dm, &rm)) continue;
+                const int64_t b = (pm + 1) / ratio - 1;
+                if (b >= bt->shape[1]) return RAD_E_SHAPE;
+                if ((int64_t)items.size() < mw) items.push_back({ s, b, m });
+            }
+            ncv[(size_t)s] = (mx + 1) / ratio;
+            continue;
+        }
+        const int64_t p0 = ldi(po, offlin(po, t0)), p1 = ldi(po, offlin(po, t1 - 1));
+        ncv[(size_t)s] = (p1 + 1) / ratio;
+        for (int64_t b = p0 / ratio; b <= (p1 + 1) / ratio - 1; ++b) {
+            if ((int64_t)items.size() >= mw) break;
+            if (b >= bt->shape[1]) return RAD_E_SHAPE;
+            for (int64_t i = 0; si >= 0 && i < ratio; ++i) {
+                const int64_t q = b * ratio + i;
+                if (q >= p0 && t0 + (q - p0) >= T) return RAD_E_SHAPE;
+            }
+            items.push_back({ s, b, -1 });
+        }
+    }
+
+    for (int64_t s = 0; s < n_seq; ++s) st_int(nc->dtype, nc->data, offlin(nc, s), ncv[(size_t)s]);
+    for (int64_t w = 0; w < mw; ++w) {
+        if (w >= (int64_t)items.size()) {
+            st_int(pg->dtype, pg->data, offlin(pg, w), -1);
+            st_int(mp->dtype, mp->data, offlin(mp, w), -1);
+            st_int(tp->dtype, tp->data, offlin(tp, w), -1);
+            st_int(bp->dtype, bp->data, offlin(bp, w), 0);
+            continue;
+        }
+        const Item& it = items[(size_t)w];
+        const int64_t s = it.s, b = it.b, m = it.m;
+        const int64_t t0 = cu_at(cu, s);
+        const int64_t si = ldi(sx, col0(sx, s));
+        const int64_t page = si < 0 ? -1 : ldi(bt, s * bt->stride[0] + b * bt->stride[1]);
+        int64_t dm = 0, rm = -1;
+        if (!(m >= 0 && tr.row(m, &dm, &rm))) dm = 0;
+        st_int(pg->dtype, pg->data, offlin(pg, w), page);
+        st_int(mp->dtype, mp->data, offlin(mp, w), dm >= 1 ? -1 : page);
+        st_int(tp->dtype, tp->data, offlin(tp, w), dm >= 1 && page >= 0 ? m : -1);
+        st_int(bp->dtype, bp->data, offlin(bp, w), b * ratio);
+        if (si < 0) continue;
+        const int64_t f = b * ratio;
+        if (m < 0) {   /* qsa_work's item */
+            const int64_t p0 = ldi(po, offlin(po, t0));
+            for (int64_t i = 0; i < ratio; ++i) {
+                const int64_t q = f + i;
+                const RadTensor* src = q >= p0 ? k : tl;
+                const int64_t sb = q >= p0 ? (t0 + q - p0) * k->stride[0]
+                                           : si * tl->stride[0] + (q % ring) * tl->stride[2];
+                const int64_t sc = q >= p0 ? k->stride[1] : tl->stride[3];
+                const int64_t db = (w * ratio + i) * stg->stride[0];
+                for (int64_t d = 0; d < n; ++d) stt(stg, db + d * stg->stride[1], ldt(src, sb + d * sc));
+            }
+            continue;
+        }
+        /* a tree item (m a tree row): in-step keys through m's ancestors */
+        int64_t td = 0, tr0 = m;
+        (void)tr.row(m, &td, &tr0);
+        const int64_t A = tr.at(tr0);
+        for (int64_t i = 0; i < ratio; ++i) {
+            const int64_t q = f + i;
+            const int64_t db = (w * ratio + i) * stg->stride[0];
+            if (q >= A) {
+                const int64_t an = tr.anc(m, td, q - A);
+                if (an < 0 || an >= T) {
+                    for (int64_t d = 0; d < n; ++d) stt(stg, db + d * stg->stride[1], 0.0f);
+                    continue;
+                }
+                for (int64_t d = 0; d < n; ++d)
+                    stt(stg, db + d * stg->stride[1], ldt(k, an * k->stride[0] + d * k->stride[1]));
+            } else {
+                const int64_t sb = si * tl->stride[0] + (q % ring) * tl->stride[2];
+                for (int64_t d = 0; d < n; ++d)
+                    stt(stg, db + d * stg->stride[1], ldt(tl, sb + d * tl->stride[3]));
+            }
         }
     }
     return RAD_OK;

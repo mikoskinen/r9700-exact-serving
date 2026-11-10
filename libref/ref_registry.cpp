@@ -98,6 +98,11 @@ static const RadOperandSpec oNgramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"
                                            OPD_O("cache_idx"), OPD_O("has_init"),
                                            OPD_O("num_accepted"), OUT("ids"),
                                            OUT_O("ahead_ids") };
+static const RadOperandSpec oNgramIdsTree[] = { OPD("tok"), INOUT("state"), OPD("cu"), WGT("mult"),
+                                               WGT("vocab_sizes"), WGT("offsets"),
+                                               OPD_O("cache_idx"), OPD_O("has_init"),
+                                               OPD_O("num_accepted"), OUT("ids"),
+                                               OUT_O("ahead_ids"), OPD("tree") };
 /* PLE's gate. `k` and `q` arrive un-normed; the op owns all three norms, since the third is over
  * bytes the op itself wrote. */
 static const RadParamSpec pPleGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
@@ -362,6 +367,21 @@ static const RadParamSpec pDsparkAlt[] = { P_INT("M"), P_INT("steps"), P_INT("to
                                            P_INT("n_alt"), P_STR("dtype") };
 static const RadOperandSpec oDsparkAlt[] = { OPD("cand"), OPD("unary"), OPD("anchor"), OPD("tokens"),
                                              WGT("pred"), WGT("succ"), OUT("alt") };
+/* A tree verify for DeepSeek-V4.1's DSpark (ref_tree.cpp): the rows' tree table, the tree variants
+ * of attn_sparse_sink / index_score / qsa_work / ngram_ids (their operands, then the table and the
+ * in-tree entries or the split pages), the context pass's commits and the drafter's tree proposal. */
+static const RadParamSpec pTreeRows[] = { P_INT("M"), P_INT("width") };
+static const RadOperandSpec oTreeRows[] = { OPD("spec_parent"), OPD("cu_seqlens"), OPD("positions"),
+                                            OUT("tree"), OUT("spos"), OUT("tmark") };
+static const RadParamSpec pTreeCommitEntries[] = { P_INT("M"), P_INT("ratio") };
+static const RadOperandSpec oTreeCommitEntries[] = { OPD("tmark"), OPD("positions"), OPD("slot_mapping"),
+                                                     OPD("scratch"), INOUT("cache") };
+static const RadParamSpec pTreeCommitRows[] = { P_INT("M"), P_INT("n"), P_INT("ring"), P_INTO("off") };
+static const RadOperandSpec oTreeCommitRows[] = { OPD("tmark"), OPD("positions"), OPD("cu_seqlens"),
+                                                  OPD("slot_mapping"), OPD("sidx"), INOUT("state") };
+static const RadParamSpec pDsparkTreeAsm[] = { P_INT("M"), P_INT("K"), P_INT("B"), P_INT("pitch"),
+                                               P_INT("n_alt") };
+static const RadOperandSpec oDsparkTreeAsm[] = { OPD("tokens"), OPD("alt"), OUT("prop"), OUT("par") };
 
 static const RadParamSpec pRmsHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                              P_STR("dtype"), P_F64O("wadd") };
@@ -550,11 +570,16 @@ static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_IN
 static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
     OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
     WGT("sinks"), OUT("out") };
+static const RadOperandSpec oAttnSparseSinkTree[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
+    OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
+    WGT("sinks"), OUT("out"), OPD("tree"), OPD_O("tree_cache") };
 static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
     P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
     P_INTO("block"), P_STRO("key_format") };
 static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
     OPD("positions"), OPD("cu_seqlens"), OUT("score"), OPD_O("keep") };
+static const RadOperandSpec oIndexScoreTree[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
+    OPD("positions"), OPD("cu_seqlens"), OUT("score"), OPD_O("keep"), OPD("tree"), OPD_O("tree_cache") };
 static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
 static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
@@ -616,6 +641,10 @@ static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
                                            OUT("page"), OUT("bpos"), OUT("nc") };
+static const RadOperandSpec oQsaWorkTree[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
+                                               OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
+                                               OUT("page"), OUT("bpos"), OUT("nc"), OPD("tree"),
+                                               OUT("mpage"), OUT("tpage") };
 /* The residency map of a streamed group (ref_kvstream.cpp says why it takes no `block_size`). */
 static const RadParamSpec pKvResolve[] = { P_INT("M"), P_INT("blocks"), P_INT("slots"),
                                            P_INT("sel_pitch"), P_INT("block_bytes") };
@@ -1560,6 +1589,49 @@ static const RadOpSchema kSchemas[] = {
   "scores them, the best whose id is valid and not tokens[s, 0] (ties to the lower index), each "
   "continued greedily over rows 1..steps-1 as dflash_select walks; alt[s, a*steps + l], -1 for a "
   "branch with no candidate." },
+{ "tree_rows", ARR(pTreeRows), ARR(oTreeRows),
+  "A tree verify's row table from RadBatch::spec_parent (-1 a root, p >= 0 the parent row cu[s] + p, "
+  "which must precede the row in its sequence and be a tree row; anything else an ordinary row): "
+  "tree[m] = [depth (-1 ordinary; at most width - 3), the root's row, the ancestors' rows at depth "
+  "0 .. depth (the row itself last), -1 ...]; spos[m] = positions[root] + (m - root) for a tree row, "
+  "positions[m] otherwise; tmark[m] = 1 for a tree row of depth >= 1." },
+{ "attn_sparse_sink_tree", ARR(pAttnSparseSink), ARR(oAttnSparseSinkTree),
+  "attn_sparse_sink over a tree verify: a tree row (tree_rows' table) of sequence s, anchor A = "
+  "positions[root], reads its window table from first = A + rows(s) - window_used[s] and a window "
+  "position j >= A at the slot position A + (its ancestor at depth j - A) - root; at depth >= 1 a "
+  "compressed entry c completing on its path is, at ratio 1 (c >= A + 1), the entry at its "
+  "ancestor's slot position, at ratio > 1 ((c + 1) ratio - 1 >= A + 1) block `ancestor` of "
+  "tree_cache ([rows, 1, ratio, slots / ratio], the comp cache's format). Every other key and row "
+  "is attn_sparse_sink's, bit for bit (the chain the row's path is)." },
+{ "index_score_tree", ARR(pIndexScore), ARR(oIndexScoreTree),
+  "index_score over a tree verify: a tree row's entry j completing on its path reads its key as "
+  "attn_sparse_sink_tree reads that entry (ratio 1: at its ancestor's slot position; ratio > 1: "
+  "block `ancestor` of tree_cache, the index cache's format); everything else is index_score's." },
+{ "qsa_work_tree", ARR(pQsaWork), ARR(oQsaWorkTree),
+  "qsa_work over a tree verify (rope absent): a sequence whose first row is a root completes one "
+  "block a tree row whose position does, in row order, its keys from the row's ancestors (q >= A) "
+  "or the tail (q % ring); page as qsa_work, mpage = page at depth 0 and -1 past it, tpage = the "
+  "row at depth >= 1 (page >= 0), nc from the largest position. Other sequences are qsa_work's "
+  "(mpage = page, tpage = -1)." },
+{ "ngram_ids_tree", ARR(pNgramIds), ARR(oNgramIdsTree),
+  "ngram_ids over a tree verify: a tree row of depth d hashes its path's tokens (shift k: its "
+  "ancestor at depth d - k while d - k >= 0, else the committed id prev[ctx + d - k]); the state's "
+  "write-back is ngram_ids' (every row in order)." },
+{ "tree_commit_entries", ARR(pTreeCommitEntries), ARR(oTreeCommitEntries),
+  "The context pass after a tree verify: row m < min(M, rows(tmark), rows(scratch)) with tmark 1, "
+  "slot_mapping >= 0 and (positions[m] + 1) % ratio == 0 copies scratch block m to cache block "
+  "slot / ratio (bytes, the entry's own format)." },
+{ "tree_commit_rows", ARR(pTreeCommitRows), ARR(oTreeCommitRows),
+  "The context pass after a tree verify: per sequence (root r0 = cu[s], slot sidx[s] col 0), the "
+  "rows m after r0 in order with tmark 1 and slot_mapping >= 0, depth t = positions[m] - "
+  "positions[r0], j = m - r0: state row src -> dst of n 4-byte words, ring mode (ring > 0) "
+  "src = (positions[r0] + j) % ring, dst = (positions[r0] + t) % ring, linear mode src = off + j, "
+  "dst = off + t." },
+{ "dspark_tree_assemble", ARR(pDsparkTreeAsm), ARR(oDsparkTreeAsm),
+  "DSpark's tree proposal: nodes 1..K the walk (parent n - 1), then B branches at position 1 "
+  "depth-major (node K + (k-1) B + b + 1 is alt[s, b K + k - 1], parent 0 at k = 1, n - B after; "
+  "an alternative below 0 or b >= n_alt is the walk's token at depth k), nodes past K + B K the "
+  "walk's last token (parent n - 1). par[n - 1] is node n's parent." },
 { "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
   "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
   "rscale) for each of `parts` rotated copies, T the [128, 128] f16 matrix a (part, 128-column "
@@ -2700,6 +2772,22 @@ SIMPLE("ref_dspark_conf", "dspark_conf", "draft",
 SIMPLE("ref_dspark_alt", "dspark_alt", "draft",
        "the DSpark walk's next-best first proposals, each walked on",
        "i32 candidates and ids, f32 unary, bf16 codebooks", ref_dspark_alt),
+SIMPLE("ref_tree_rows", "tree_rows", "draft",
+       "a tree verify's row table, slot positions and marks", "i32", ref_tree_rows),
+SIMPLE("ref_attn_sparse_sink_tree", "attn_sparse_sink_tree", "attn",
+       "attn_sparse_sink over a tree verify's rows", DT_FLOAT, ref_attn_sparse_sink_tree),
+SIMPLE("ref_index_score_tree", "index_score_tree", "attn",
+       "index_score over a tree verify's rows", DT_FLOAT, ref_index_score_tree),
+SIMPLE("ref_qsa_work_tree", "qsa_work_tree", "attn",
+       "the compressor's work list over a tree verify's rows", DT_FLOAT, ref_qsa_work_tree),
+SIMPLE("ref_ngram_ids_tree", "ngram_ids_tree", "vocab",
+       "n-gram row ids over a tree verify's paths", DT_ANY, ref_ngram_ids_tree),
+SIMPLE("ref_tree_commit_entries", "tree_commit_entries", "draft",
+       "the accepted path's in-tree entries into their cache blocks", "any", ref_tree_commit_entries),
+SIMPLE("ref_tree_commit_rows", "tree_commit_rows", "draft",
+       "the accepted path's state rows into their places", "f32 or i32", ref_tree_commit_rows),
+SIMPLE("ref_dspark_tree_assemble", "dspark_tree_assemble", "draft",
+       "DSpark's tree proposal: the walk and its position-1 branches", "i32", ref_dspark_tree_assemble),
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),

@@ -4561,3 +4561,169 @@ int ref_bwe_up_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     o.t(D, { M, ch });                                         /* y */
     return o.finish("bwe_up", operand, out);
 }
+
+/* ================================================================== a tree verify (ref_tree.cpp)
+ * The row table is drawn as indices over the rows, so most rows describe no tree (a depth past the
+ * table) and the rest name arbitrary ancestors: every op must give the same answer on any table. */
+int ref_tree_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), W = gi(p, n_p, "width", 0);
+    if (M <= 0 || W < 3) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M }, M, -1, 0);                                     /* spec_parent */
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);            /* cu_seqlens */
+    o.t_idx({ M }, M, -1, 0);                                     /* positions */
+    o.t((uint32_t)RAD_I32, { M, W });                             /* tree */
+    o.t((uint32_t)RAD_I32, { M });                                /* spos */
+    o.t((uint32_t)RAD_I32, { M });                                /* tmark */
+    return o.finish("tree_rows", operand, out);
+}
+
+int ref_attn_sparse_sink_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), H = gi(p, n_p, "heads", 0), Dm = gi(p, n_p, "dim", 0);
+    const int64_t win = gi(p, n_p, "window", 0), ratio = gi(p, n_p, "ratio", 0);
+    const int64_t topk = gi(p, n_p, "topk", 0);
+    if (M <= 0 || H < 1 || Dm < 2 || win < 1 || ratio < 0 || (ratio > 0 && (topk < 1 || Dm % ratio)))
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const char* lf = gs(p, n_p, "latent_format");
+    const bool nv = ratio > 0 && lf && !std::strcmp(lf, "nvfp4");
+    if (lf && std::strcmp(lf, "nvfp4") && std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t cslots = nv ? (Dm / 2 + Dm / 16 + 15) / 16 * 16 / 2 : Dm;
+    if (ratio > 0 && cslots % ratio) return RAD_E_UNSUPPORTED;
+    const int64_t bs = 4, nb = (M + bs - 1) / bs + 1, ncb = M + 1;
+    Opd o;
+    o.t(D, { M, H * Dm });                              /* q */
+    o.t(D, { nb, 1, bs, Dm });                          /* window cache */
+    o.t_idx({ 1, nb }, nb, -1, 0);                      /* window block table */
+    o.t_idx({ 1 }, M + 1, -1, 0);                       /* window tokens held */
+    if (ratio > 0) {
+        o.t(D, { ncb, 1, ratio, cslots / ratio });      /* compressed cache */
+        o.t_idx({ 1, ncb }, ncb, -1, 0);                /* compressed block table */
+        o.t_idx({ M, topk }, ncb, -1, 0);               /* selections */
+    } else {
+        o.skip(); o.skip(); o.skip();
+    }
+    o.t_idx({ M }, M, -1, 0);                           /* positions */
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);  /* cu_seqlens */
+    o.t((uint32_t)RAD_F32, { H });                      /* sinks */
+    o.t(D, { M, H * Dm });                              /* out */
+    o.t_idx({ M, 8 }, M, -1, 0);                        /* tree */
+    if (ratio > 1) o.t(D, { M, 1, ratio, cslots / ratio });   /* tree_cache */
+    else o.skip();
+    return o.finish("attn_sparse_sink_tree", operand, out);
+}
+
+int ref_index_score_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), H = gi(p, n_p, "heads", 0), Dm = gi(p, n_p, "dim", 0);
+    const int64_t ratio = gi(p, n_p, "ratio", 0), C = gi(p, n_p, "width", 0);
+    if (M <= 0 || H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || C < 1) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t ncb = C + 1;
+    const char* kf = gs(p, n_p, "key_format");
+    const bool kmx = kf && !std::strcmp(kf, "mxfp4");
+    if (kf && !kmx && std::strcmp(kf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t kslots = kmx ? (Dm / 2 + Dm / 32 + 15) / 16 * 16 / 2 : Dm;
+    if (kslots % ratio) return RAD_E_UNSUPPORTED;
+    const int64_t part = gi(p, n_p, "row_part", 0), Mq = part > 0 ? (part + 1) * M : M;
+    Opd o;
+    o.t(D, { Mq, H * Dm });                             /* q */
+    o.t(D, { Mq, H });                                  /* head weights */
+    o.t(D, { ncb, 1, ratio, kslots / ratio });          /* index cache */
+    o.t_idx({ 1, ncb }, ncb, -1, 0);                    /* block table */
+    o.t_idx({ Mq }, Mq, -1, 0);                         /* positions */
+    o.t_idx({ 2 }, Mq, -1, (uint32_t)RAD_OPD_F_IDX_CU); /* cu_seqlens */
+    o.t((uint32_t)RAD_F32, { M, C });                   /* score */
+    if (gi(p, n_p, "block", 0) > 0) o.t_idx({ M, ref_keep_words(C, gi(p, n_p, "block", 0)) }, 0x7fffffff, -1, 0);
+    else o.skip();
+    o.t_idx({ Mq, 8 }, Mq, -1, 0);                      /* tree */
+    if (ratio > 1) o.t(D, { Mq, 1, ratio, kslots / ratio });  /* tree_cache */
+    else o.skip();
+    return o.finish("index_score_tree", operand, out);
+}
+
+int ref_qsa_work_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ratio = gi(p, n_p, "ratio", 0), ring = gi(p, n_p, "ring", ratio);
+    const int64_t work = gi(p, n_p, "work", 0);
+    if (M <= 0 || n <= 0 || ratio <= 0 || ring < ratio || work <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t S = std::min(qsa_seqs(p, n_p, M), work);
+    Opd o;
+    o.t(D, { M, n });                                             /* k */
+    o.t_idx({ M }, 0, ratio - 1, 0);                              /* pos */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu */
+    o.t(D, { S, 1, ring, n });                                    /* state */
+    o.t_idx({ S, 1 }, S, -1, 0);                                  /* sidx */
+    o.t_idx({ S, 2 }, 1 << 16, -1, 0);                            /* bt */
+    o.skip();                                                     /* rope */
+    o.t(D, { work * ratio, n });                                  /* stage */
+    o.t((uint32_t)RAD_I32, { work });                             /* page */
+    o.t((uint32_t)RAD_I32, { work });                             /* bpos */
+    o.t((uint32_t)RAD_I32, { S });                                /* nc */
+    o.t_idx({ M, 8 }, M, -1, 0);                                  /* tree */
+    o.t((uint32_t)RAD_I32, { work });                             /* mpage */
+    o.t((uint32_t)RAD_I32, { work });                             /* tpage */
+    return o.finish("qsa_work_tree", operand, out);
+}
+
+int ref_ngram_ids_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M     = gi(p, n_p, "M", 0);
+    const int64_t heads = gi(p, n_p, "heads", 0);
+    const int64_t ngram = gi(p, n_p, "ngram", 0);
+    const int64_t eos   = gi(p, n_p, "eos", 0);
+    const int64_t ctx   = ngram > 0 ? ngram - 1 : 0;
+    const int64_t S = 1, depth = ctx - 1 + M;
+    Opd o;
+    o.t_idx({ M }, 0, -1, 0);                                        /* tok */
+    o.t_idx({ S, depth }, 0, -1, 0);                                 /* state, INOUT */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);           /* cu */
+    o.t((uint32_t)RAD_I64, { ngram });                               /* mult */
+    o.t_idx_dt((uint32_t)RAD_I64, { heads }, 0, eos + 1, 0);         /* vocab_sizes */
+    o.t_idx_dt((uint32_t)RAD_I64, { heads }, 0, -1, 0);              /* offsets */
+    o.t_idx({ S }, S, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);           /* cache_idx */
+    o.t_idx({ S }, 0, 1, 0);                                         /* has_init */
+    o.t_idx({ S }, 0, M, 0);                                         /* num_accepted */
+    o.t((uint32_t)RAD_I32, { M, heads });                            /* ids */
+    o.skip();                                                        /* ahead_ids */
+    o.t_idx({ M, 8 }, M, -1, 0);                                     /* tree */
+    return o.finish("ngram_ids_tree", operand, out);
+}
+
+int ref_tree_commit_entries_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), ratio = gi(p, n_p, "ratio", 0);
+    if (M <= 0 || ratio < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M }, 2, -1, 0);                                     /* tmark */
+    o.t_idx({ M }, M * ratio, -1, 0);                             /* positions */
+    o.t_idx({ M }, M * ratio, -1, 0);                             /* slot_mapping */
+    o.t((uint32_t)RAD_BF16, { M, 1, ratio, 4 });                  /* scratch */
+    o.t((uint32_t)RAD_BF16, { M, 1, ratio, 4 });                  /* cache */
+    return o.finish("tree_commit_entries", operand, out);
+}
+
+int ref_tree_commit_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), ring = gi(p, n_p, "ring", 0);
+    const int64_t off = gi(p, n_p, "off", 0);
+    if (M <= 0 || n < 1 || ring < 0 || off < 0) return RAD_E_UNSUPPORTED;
+    const int64_t R = ring > 0 ? ring : off + M;
+    Opd o;
+    o.t_idx({ M }, 2, -1, 0);                                     /* tmark */
+    o.t_idx({ M }, M, -1, 0);                                     /* positions */
+    o.t_idx({ 2 }, M, -1, (uint32_t)RAD_OPD_F_IDX_CU);            /* cu_seqlens */
+    o.t_idx({ M }, M, -1, 0);                                     /* slot_mapping */
+    o.t_idx({ 1 }, 1, -1, 0);                                     /* sidx */
+    o.t((uint32_t)RAD_F32, { 1, R * n });                         /* state */
+    return o.finish("tree_commit_rows", operand, out);
+}
+
+int ref_dspark_tree_assemble_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), K = gi(p, n_p, "K", 0), B = gi(p, n_p, "B", -1);
+    const int64_t P = gi(p, n_p, "pitch", 0), na = gi(p, n_p, "n_alt", 0);
+    if (M <= 0 || K < 1 || B < 0 || P < K || na < 1) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M, K }, 100, -1, 0);                                /* tokens */
+    o.t_idx({ M, na * K }, 100, -1, 0);                           /* alt */
+    o.t((uint32_t)RAD_I32, { M, P });                             /* prop */
+    o.t((uint32_t)RAD_I32, { M, P });                             /* par */
+    return o.finish("dspark_tree_assemble", operand, out);
+}

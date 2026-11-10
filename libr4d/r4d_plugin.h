@@ -232,6 +232,14 @@ int     r4d_rad_pair_argmax_f32(const RadArgs*, RadStream);
  * continued by the walk (r4d_dspark_extra.hip). */
 int     r4d_rad_dspark_conf(const RadArgs*, RadStream);
 int     r4d_rad_dspark_alt (const RadArgs*, RadStream);
+/* A tree verify for DSpark (lever T1): the rows' table, the tree variants of qsa_work and ngram_ids, the
+ * context pass's commits and the tree proposal (r4d_tree.hip, r4d_qsa_work_bf16.hip, r4d_ngram_ids.hip). */
+int     r4d_rad_tree_rows(const RadArgs*, RadStream);
+int     r4d_rad_qsa_work_tree(const RadArgs*, RadStream);
+int     r4d_rad_ngram_ids_tree(const RadArgs*, RadStream);
+int     r4d_rad_tree_commit_entries(const RadArgs*, RadStream);
+int     r4d_rad_tree_commit_rows(const RadArgs*, RadStream);
+int     r4d_rad_dspark_tree_assemble(const RadArgs*, RadStream);
 /* LiLiCorr's correlator (r4d_lili.hip). */
 int     r4d_rad_lili_cand  (const RadArgs*, RadStream);
 int     r4d_rad_lili_attn  (const RadArgs*, RadStream);

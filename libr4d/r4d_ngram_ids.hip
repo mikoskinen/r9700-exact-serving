@@ -47,6 +47,17 @@ enum { kNgMaxShift = 8, kNgThreads = 256 };
  *
  * At decode this op's cost is the dispatch itself (flat from M=1 to M=512), so avoiding a second
  * launch for the write-back is most of the saving. */
+/* ngram_ids_tree (lever T1, TREE): a tree row (tree_rows' table [ttrows, ttw]: depth, root, ancestors by
+ * depth; libref/ref_tree.h's rules) of depth d hashes its path: shift k reads its ancestor at depth
+ * d - k's token while d - k >= 0 (an ancestor out of range reads eos), the committed id
+ * prev[ctx + d - k] past the root. The write-back is ngram_ids' (every row in order). A tree
+ * sequence's rows that read the window are in tile 0 (at most 256 rows a tree), as the fold needs. */
+struct NgTree {
+    const int32_t* tt;
+    int ttr, ttw, ttrows, ntok;
+};
+
+template <bool TREE>
 __global__ __launch_bounds__(kNgThreads) void ngram_ids_kernel(
     const int32_t* __restrict__ tok, int32_t* __restrict__ state,
     const int32_t* __restrict__ cu, const long long* __restrict__ mult,
@@ -55,7 +66,7 @@ __global__ __launch_bounds__(kNgThreads) void ngram_ids_kernel(
     const int32_t* __restrict__ nacc, int32_t* __restrict__ ids,
     uint32_t heads, uint32_t ngram, uint32_t per, uint32_t W,
     long long eos, uint32_t ids_ld, int32_t* __restrict__ ahead, uint32_t n_ahead,
-    uint32_t ahead_ld) {
+    uint32_t ahead_ld, NgTree tr) {
 
     const uint32_t s   = blockIdx.y;
     const uint32_t bos = (uint32_t)cu[s];
@@ -90,8 +101,25 @@ __global__ __launch_bounds__(kNgThreads) void ngram_ids_kernel(
         long long sh[kNgMaxShift];
         sh[0] = (long long)tok[t];
         bool cut = false;
+        int td = -1;
+        if constexpr (TREE) {
+            if (lt < slen && (int)t < tr.ttrows && tr.ttw >= 3) {
+                const int d = tr.tt[(long long)t * tr.ttr], r0 = tr.tt[(long long)t * tr.ttr + 1];
+                if (d >= 0 && d <= tr.ttw - 3 && r0 >= 0 && r0 < tr.ntok) td = d;
+            }
+        }
         for (uint32_t k = 1; k < ngram; ++k) {
             if (cut || sh[k - 1] == eos) { cut = true; sh[k] = eos; continue; }
+            if (TREE && td >= 0) {
+                const int x = td - (int)k;
+                if (x >= 0) {
+                    const int an = tr.tt[(long long)t * tr.ttr + 2 + x];
+                    sh[k] = an >= 0 && an < tr.ntok ? (long long)tok[an] : eos;
+                } else {
+                    sh[k] = prev[(int)ctx + x];
+                }
+                continue;
+            }
             const uint32_t q = p - k;
             sh[k] = q < ctx ? prev[q] : (long long)tok[bos + (q - ctx)];
         }
@@ -149,9 +177,9 @@ __global__ __launch_bounds__(kNgThreads) void ngram_ids_kernel(
 }  // namespace
 
 enum { NG_TOK = 0, NG_STATE, NG_CU, NG_MULT, NG_VSZ, NG_OFF, NG_CIDX, NG_HINIT, NG_NACC, NG_IDS,
-       NG_AHEAD };
+       NG_AHEAD, NG_TREE };
 
-extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
+static int ngram_ids_launch(const RadArgs* a, RadStream stream, bool tree) {
     const RadTensor* tok  = r4d_opt(a, NG_TOK);
     const RadTensor* st   = r4d_opt(a, NG_STATE);
     const RadTensor* cu   = r4d_opt(a, NG_CU);
@@ -206,7 +234,29 @@ extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
      * any one sequence's; a short sequence's extra blocks find their rows past its end. A
      * per-sequence count would mean reading `cu` on the host. */
     const uint32_t tiles = (uint32_t)((T + A + kNgThreads - 1) / kNgThreads);
-    return R4D_EMIT(stream, ngram_ids_kernel, dim3(tiles, (uint32_t)N), dim3(kNgThreads), 0,
+    NgTree tr{};
+    if (tree) {
+        const RadTensor* tt = r4d_opt(a, NG_TREE);
+        if (!tt || tt->rank != 2 || tt->dtype != RAD_I32 || tt->shape[1] < 3 || tt->stride[1] != 1)
+            return R4D_NO(RAD_E_SHAPE);
+        tr.tt = (const int32_t*)r4d_addr(tt);
+        tr.ttr = (int)tt->stride[0];
+        tr.ttw = (int)tt->shape[1];
+        tr.ttrows = (int)tt->shape[0];
+        tr.ntok = (int)r4d_numel(tok);
+        return R4D_EMIT(stream, ngram_ids_kernel<true>, dim3(tiles, (uint32_t)N), dim3(kNgThreads), 0,
+                        (const int32_t*)r4d_addr(tok), (int32_t*)r4d_addr(st),
+                        (const int32_t*)r4d_addr(cu), (const long long*)r4d_addr(mult),
+                        (const long long*)r4d_addr(vsz), (const long long*)r4d_addr(off),
+                        cidx ? (const int32_t*)r4d_addr(cidx) : nullptr,
+                        hini ? (const int32_t*)r4d_addr(hini) : nullptr,
+                        nacc ? (const int32_t*)r4d_addr(nacc) : nullptr,
+                        (int32_t*)r4d_addr(ids), (uint32_t)heads, (uint32_t)ngram,
+                        (uint32_t)per, (uint32_t)W, eos, (uint32_t)ids_ld,
+                        A > 0 ? (int32_t*)r4d_addr(ahd) : nullptr, (uint32_t)A,
+                        (uint32_t)ahead_ld, tr);
+    }
+    return R4D_EMIT(stream, ngram_ids_kernel<false>, dim3(tiles, (uint32_t)N), dim3(kNgThreads), 0,
                        (const int32_t*)r4d_addr(tok), (int32_t*)r4d_addr(st),
                        (const int32_t*)r4d_addr(cu), (const long long*)r4d_addr(mult),
                        (const long long*)r4d_addr(vsz), (const long long*)r4d_addr(off),
@@ -216,5 +266,9 @@ extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) {
                        (int32_t*)r4d_addr(ids), (uint32_t)heads, (uint32_t)ngram,
                        (uint32_t)per, (uint32_t)W, eos, (uint32_t)ids_ld,
                        A > 0 ? (int32_t*)r4d_addr(ahd) : nullptr, (uint32_t)A,
-                       (uint32_t)ahead_ld);
+                       (uint32_t)ahead_ld, tr);
 }
+
+extern "C" int r4d_rad_ngram_ids(const RadArgs* a, RadStream stream) { return ngram_ids_launch(a, stream, false); }
+/* ngram_ids_tree: ngram_ids' operands, then the row table (11). */
+extern "C" int r4d_rad_ngram_ids_tree(const RadArgs* a, RadStream stream) { return ngram_ids_launch(a, stream, true); }

@@ -145,6 +145,129 @@ __global__ __launch_bounds__(kThreads) void r4dchain_qsa_work(
     r4d_chain_done();
 }
 
+/* ---- qsa_work_tree (lever T1): the same gather over a tree verify's rows. A sequence whose first
+ * row is a root of the row table (tree_rows' [rows, ttw]: depth, root, ancestors by depth) completes
+ * one block a tree row whose position does, in row order, its keys from the row's ancestors (q >= A,
+ * the anchor) or the tail; page as qsa_work, mpage = page at depth 0 and -1 past it, tpage = the row
+ * at depth >= 1 (page >= 0). Any other sequence is qsa_work's (mpage = page, tpage = -1). libref's
+ * ref_qsa_work_tree, element for element. */
+struct QwTree {
+    const int32_t* tt;
+    int ttr, ttw, ttrows, npos, T, bstep;
+    int32_t* mpage;
+    int32_t* tpage;
+};
+/* Row m's depth (-1: an ordinary row) and root (libref/ref_tree.h's rules). */
+__device__ __forceinline__ int qw_tree_row(const QwTree& t, int m, int* r0) {
+    if (m < 0 || m >= t.ttrows || t.ttw < 3) return -1;
+    const int d = t.tt[(size_t)m * t.ttr], r = t.tt[(size_t)m * t.ttr + 1];
+    if (d < 0 || d > t.ttw - 3 || r < 0 || r >= t.npos) return -1;
+    *r0 = r;
+    return d;
+}
+
+template <typename E>
+__device__ __forceinline__ void qsa_work_tree_body(
+    const E* __restrict__ k, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, const E* __restrict__ state,
+    const int32_t* __restrict__ sidx, const int32_t* __restrict__ bt,
+    E* __restrict__ stage, int32_t* __restrict__ page, int32_t* __restrict__ bpos,
+    int32_t* __restrict__ nc, QwTree tr,
+    int n, int ratio, int ring, int seqs, int max_work, int k_ld, int s_slot, int s_row,
+    int sidx_ld, int bt_ld, int g_ld) {
+
+    const int w = (int)blockIdx.x;
+    if (w < seqs && threadIdx.x == 0) {
+        const int t0 = cu[w], t1 = cu[w + 1];
+        int r0 = -1;
+        if (t1 > t0 && qw_tree_row(tr, t0, &r0) == 0) {
+            int mx = 0;
+            for (int m = t0; m < t1; ++m) mx = pos[m] > mx ? pos[m] : mx;
+            nc[w] = (mx + 1) / ratio;
+        } else {
+            nc[w] = t1 > t0 ? (pos[t1 - 1] + 1) / ratio : 0;
+        }
+    }
+    if (w >= max_work) return;
+
+    /* The item: (sequence, block, completing tree row or -1). */
+    int s = -1, b = 0, m = -1, run = 0;
+    for (int i = 0; i < seqs && i < kMaxSeq && s < 0; ++i) {
+        const int t0 = cu[i], t1 = cu[i + 1];
+        if (t1 <= t0) continue;
+        int r0 = -1;
+        if (qw_tree_row(tr, t0, &r0) == 0) {
+            for (int r = t0; r < t1; ++r) {
+                int rr = -1;
+                if ((pos[r] + 1) % ratio || qw_tree_row(tr, r, &rr) < 0) continue;
+                if (run == w) { s = i; m = r; b = (pos[r] + 1) / ratio - 1; break; }
+                ++run;
+            }
+            continue;
+        }
+        const int p0 = pos[t0], p1 = pos[t1 - 1];
+        const int lo = p0 / ratio, hi = (p1 + 1) / ratio - 1;
+        const int cnt = hi >= lo ? hi - lo + 1 : 0;
+        if (w < run + cnt) { s = i; b = w - run + lo; break; }
+        run += cnt;
+    }
+    if (s < 0) {
+        if (threadIdx.x == 0) {
+            page[w] = -1;
+            tr.mpage[w] = -1;
+            tr.tpage[w] = -1;
+            bpos[(size_t)w * tr.bstep] = 0;
+        }
+        return;
+    }
+    const int t0 = cu[s];
+    const int si = sidx[(size_t)s * sidx_ld];
+    int r0 = -1;
+    const int dm = m >= 0 ? qw_tree_row(tr, m, &r0) : 0;
+    const int pg = si < 0 ? -1 : bt[(size_t)s * bt_ld + b];
+    if (threadIdx.x == 0) {
+        page[w] = pg;
+        tr.mpage[w] = dm >= 1 ? -1 : pg;
+        tr.tpage[w] = dm >= 1 && pg >= 0 ? m : -1;
+        bpos[(size_t)w * tr.bstep] = b * ratio;
+    }
+    if (si < 0) return;
+    const int A = m >= 0 ? pos[r0] : pos[t0];
+    for (int i = 0; i < ratio; ++i) {
+        const int q = b * ratio + i;
+        E* dst = stage + (size_t)(w * ratio + i) * g_ld;
+        const E* src;
+        if (m < 0) {
+            src = q >= A ? k + (size_t)(t0 + (q - A)) * k_ld
+                         : state + (size_t)si * s_slot + (size_t)(q % ring) * s_row;
+        } else if (q >= A) {
+            const int x = q - A;
+            const int an = x <= dm ? tr.tt[(size_t)m * tr.ttr + 2 + x] : -1;
+            if (an < 0 || an >= tr.npos || an >= tr.T) {
+                for (int d = (int)threadIdx.x; d < n; d += kThreads) dst[d] = (E)0;
+                continue;
+            }
+            src = k + (size_t)an * k_ld;
+        } else {
+            src = state + (size_t)si * s_slot + (size_t)(q % ring) * s_row;
+        }
+        for (int d = (int)threadIdx.x; d < n; d += kThreads) dst[d] = src[d];
+    }
+}
+
+template <typename E>
+__global__ __launch_bounds__(kThreads) void qsa_work_tree_kernel(
+    const E* __restrict__ k, const int32_t* __restrict__ pos,
+    const int32_t* __restrict__ cu, const E* __restrict__ state,
+    const int32_t* __restrict__ sidx, const int32_t* __restrict__ bt,
+    E* __restrict__ stage, int32_t* __restrict__ page, int32_t* __restrict__ bpos,
+    int32_t* __restrict__ nc, QwTree tr,
+    int n, int ratio, int ring, int seqs, int max_work, int k_ld, int s_slot, int s_row,
+    int sidx_ld, int bt_ld, int g_ld) {
+    qsa_work_tree_body<E>(k, pos, cu, state, sidx, bt, stage, page, bpos, nc, tr, n, ratio, ring, seqs,
+                          max_work, k_ld, s_slot, s_row, sidx_ld, bt_ld, g_ld);
+}
+
 }  // namespace
 
 //   k      [T][n]                  bf16, this step's raw index keys
@@ -266,3 +389,78 @@ extern "C" int r4d_rad_qsa_work(const RadArgs* a, RadStream stream) {
                                   k->dtype == RAD_F32, stream);
 }
 
+/* qsa_work_tree: qsa_work's operands (rope absent), then the row table (11) and the split pages
+ * mpage (12) and tpage (13). */
+enum { QWT_TREE = 11, QWT_MPAGE, QWT_TPAGE };
+extern "C" int r4d_rad_qsa_work_tree(const RadArgs* a, RadStream stream) {
+    const RadTensor* k  = r4d_opt(a, QW_K);
+    const RadTensor* po = r4d_opt(a, QW_POS);
+    const RadTensor* cu = r4d_opt(a, QW_CU);
+    const RadTensor* tl = r4d_opt(a, QW_STATE);
+    const RadTensor* sx = r4d_opt(a, QW_SIDX);
+    const RadTensor* bt = r4d_opt(a, QW_BT);
+    const RadTensor* rp = r4d_opt(a, QW_ROPE);
+    const RadTensor* st = r4d_opt(a, QW_STAGE);
+    const RadTensor* pg = r4d_opt(a, QW_PAGE);
+    const RadTensor* bp = r4d_opt(a, QW_BPOS);
+    const RadTensor* nc = r4d_opt(a, QW_NC);
+    const RadTensor* tt = r4d_opt(a, QWT_TREE);
+    const RadTensor* mp = r4d_opt(a, QWT_MPAGE);
+    const RadTensor* tp = r4d_opt(a, QWT_TPAGE);
+    if (!k || !po || !cu || !tl || !sx || !bt || !st || !pg || !bp || !nc || !tt || !mp || !tp)
+        return R4D_NO(RAD_E_INVAL);
+    if (rp) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (k->rank != 2 || bt->rank != 2 || st->rank != 2 || tt->rank != 2) return R4D_NO(RAD_E_SHAPE);
+    if (tl->rank != 4 || tl->shape[1] != 1) return R4D_NO(RAD_E_SHAPE);
+    if (tl->stride[3] != 1 || tt->stride[1] != 1) return R4D_NO(RAD_E_STRIDE);
+    const long long n     = r4d_geti_or(a, "n", 0);
+    const long long ratio = r4d_geti_or(a, "ratio", 0);
+    const long long ring  = r4d_geti_or(a, "ring", 0);
+    if (n <= 0 || ratio <= 0 || ring < ratio) return R4D_NO(RAD_E_INVAL);
+    const long long seqs = r4d_numel(cu) - 1;
+    const long long T    = k->shape[0];
+    if (seqs < 1 || T < 1 || r4d_numel(po) < T || seqs > kMaxSeq) return R4D_NO(RAD_E_SHAPE);
+    if (k->shape[1] != n || st->shape[1] != n) return R4D_NO(RAD_E_SHAPE);
+    if (tl->shape[2] < ring || tl->shape[3] != n) return R4D_NO(RAD_E_SHAPE);
+    if (bt->shape[0] < seqs) return R4D_NO(RAD_E_SHAPE);
+    const long long sxp = sx->rank >= 2 ? r4d_row_pitch(sx) : 1;
+    if (sxp < 1 || r4d_dim(sx, 0) < seqs) return R4D_NO(RAD_E_SHAPE);
+    const long long mw = r4d_numel(pg);
+    if (mw < 1 || st->shape[0] < mw * ratio || r4d_numel(bp) < mw || r4d_numel(mp) < mw ||
+        r4d_numel(tp) < mw || r4d_numel(nc) < seqs || mw < seqs)
+        return R4D_NO(RAD_E_SHAPE);
+    if (bp->rank == 2 && bp->stride[1] != 1) return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(po) || !r4d_contig(cu) || !r4d_contig(pg) || !r4d_contig(mp) || !r4d_contig(tp) ||
+        !r4d_contig(nc) || (bp->rank != 2 && !r4d_contig(bp)))
+        return R4D_NO(RAD_E_STRIDE);
+    const long long kp = r4d_row_pitch(k), bp2 = r4d_row_pitch(bt), sp = r4d_row_pitch(st);
+    if (kp < 0 || bp2 < 0 || sp < 0) return R4D_NO(RAD_E_STRIDE);
+    if ((k->dtype != RAD_BF16 && k->dtype != RAD_F32) || tl->dtype != k->dtype || st->dtype != k->dtype ||
+        tt->dtype != RAD_I32)
+        return R4D_NO(RAD_E_DTYPE);
+    QwTree tr{};
+    tr.tt = (const int32_t*)r4d_addr(tt);
+    tr.ttr = (int)r4d_row_pitch(tt);
+    tr.ttw = (int)tt->shape[1];
+    tr.ttrows = (int)tt->shape[0];
+    tr.npos = (int)r4d_numel(po);
+    tr.T = (int)T;
+    tr.bstep = bp->rank == 2 ? (int)bp->stride[0] : 1;
+    tr.mpage = (int32_t*)r4d_addr(mp);
+    tr.tpage = (int32_t*)r4d_addr(tp);
+    const int sidx_ld = (int)sxp, bt_ld = (int)bp2, g_ld = (int)sp, k_ld = (int)kp;
+    const int s_slot = (int)tl->stride[0], s_row = (int)tl->stride[2];
+    if (k->dtype == RAD_F32)
+        return R4D_EMIT(stream, &qsa_work_tree_kernel<uint32_t>, dim3((unsigned)mw), dim3(kThreads), 0,
+                        (const uint32_t*)r4d_addr(k), (const int32_t*)r4d_addr(po), (const int32_t*)r4d_addr(cu),
+                        (const uint32_t*)r4d_addr(tl), (const int32_t*)r4d_addr(sx), (const int32_t*)r4d_addr(bt),
+                        (uint32_t*)r4d_addr(st), (int32_t*)r4d_addr(pg), (int32_t*)r4d_addr(bp),
+                        (int32_t*)r4d_addr(nc), tr, (int)n, (int)ratio, (int)ring, (int)seqs, (int)mw, k_ld,
+                        s_slot, s_row, sidx_ld, bt_ld, g_ld);
+    return R4D_EMIT(stream, &qsa_work_tree_kernel<uint16_t>, dim3((unsigned)mw), dim3(kThreads), 0,
+                    (const uint16_t*)r4d_addr(k), (const int32_t*)r4d_addr(po), (const int32_t*)r4d_addr(cu),
+                    (const uint16_t*)r4d_addr(tl), (const int32_t*)r4d_addr(sx), (const int32_t*)r4d_addr(bt),
+                    (uint16_t*)r4d_addr(st), (int32_t*)r4d_addr(pg), (int32_t*)r4d_addr(bp),
+                    (int32_t*)r4d_addr(nc), tr, (int)n, (int)ratio, (int)ring, (int)seqs, (int)mw, k_ld,
+                    s_slot, s_row, sidx_ld, bt_ld, g_ld);
+}

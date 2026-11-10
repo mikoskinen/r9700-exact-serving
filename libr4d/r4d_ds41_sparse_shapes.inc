@@ -83,6 +83,43 @@ extern "C" int r4d_shape_index_score(const RadParam* p, int n_p, int operand, Ra
     R4D_PICK(l);
 }
 
+/* The tree variants: the op's operands, then the row table (rows x 8, drawn as row indices) and the
+ * in-tree entries (ratio > 1: rows entries in the cache's own format). */
+extern "C" int r4d_shape_attn_sparse_sink_tree(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 11) return r4d_shape_attn_sparse_sink(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), Dm = pi(p, n_p, "dim"), ratio = pi(p, n_p, "ratio");
+    if (M <= 0 || Dm < 2 || ratio < 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const char* lf = r4d_pgets(p, n_p, "latent_format");
+    const bool nv = ratio > 0 && lf && !std::strcmp(lf, "nvfp4");
+    const int64_t cslots = nv ? (Dm / 2 + Dm / 16 + 15) / 16 * 16 / 2 : Dm;
+    if (ratio > 1 && cslots % ratio) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd_none(), opd_none(), opd_none(),
+        opd_idx(M, 8, M),                                                  /* tree */
+        ratio > 1 ? opd(D, M, 1, ratio, cslots / ratio) : opd_none(),      /* tree_cache */
+    };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_index_score_tree(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 8) return r4d_shape_index_score(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), Dm = pi(p, n_p, "dim"), ratio = pi(p, n_p, "ratio");
+    if (M <= 0 || Dm < 1 || ratio < 1) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const char* kf = r4d_pgets(p, n_p, "key_format");
+    const bool kmx = kf && !std::strcmp(kf, "mxfp4");
+    const int64_t kslots = kmx ? (Dm / 2 + Dm / 32 + 15) / 16 * 16 / 2 : Dm;
+    if (kslots % ratio) return RAD_E_UNSUPPORTED;
+    const int64_t part = pi(p, n_p, "row_part"), Mq = part > 0 ? (part + 1) * M : M;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd_idx(Mq, 8, Mq),                                                /* tree */
+        ratio > 1 ? opd(D, Mq, 1, ratio, kslots / ratio) : opd_none(),     /* tree_cache */
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_index_candidates(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), C = pi(p, n_p, "width"), block = pi(p, n_p, "block");
     if (M <= 0 || C < 1 || block < 1 || pi(p, n_p, "topk_blocks") < 1 || pi(p, n_p, "ratio") < 1)
