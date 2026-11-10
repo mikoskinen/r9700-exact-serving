@@ -1256,6 +1256,49 @@ TEST(a_tree_drafter_takes_a_short_block) {
     CHECK_EQ(b7.program().drafter_short_block, 8);
 }
 
+/* A tree's node layout (rad_drafter_tree_layout): a main chain of 5 rows' predictions and three
+ * branches of 5 -- 20 nodes, the drafter's depth -- after rad_drafter_tree; a layout past the depth,
+ * deeper branches than the main chain, or one with no tree declared is refused. rad_kv_group_tree_self
+ * marks a paged group only. */
+TEST(a_tree_drafter_declares_its_node_layout_and_the_groups_it_moves_itself) {
+    Registry reg;
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 8; bd.shape[1] = 20;
+    Builder b(reg, make_meta(), make_ctx());
+    const rad_buf prop = rad_decl_buffer(&b, "prop", &bd);
+    const rad_buf par = rad_decl_buffer(&b, "par", &bd);
+    RadDrafterDecl d{};
+    d.kind = RAD_DRAFT_BLOCK; d.name = "dspark"; d.depth = 20; d.block = 5; d.mask_token = 5;
+    d.proposal = prop; d.proposal_pitch = 20;
+    CHECK_OK(rad_declare_drafter(&b, &d));
+    CHECK_EQ(rad_drafter_tree_layout(&b, 5, 3, 5), RAD_E_STATE);      /* no tree yet */
+    CHECK_OK(rad_drafter_tree(&b, par));
+    CHECK_EQ(rad_drafter_tree_layout(&b, 5, 4, 5), RAD_E_INVAL);      /* 25 nodes past the depth */
+    CHECK_EQ(rad_drafter_tree_layout(&b, 3, 3, 5), RAD_E_INVAL);      /* branches deeper than the chain */
+    CHECK_EQ(rad_drafter_tree_layout(&b, 6, 2, 5), RAD_E_INVAL);      /* a main chain past the block */
+    CHECK_EQ(rad_drafter_tree_layout(&b, 0, 0, 0), RAD_E_INVAL);
+    CHECK_EQ(b.program().drafter_tree_k, 0);
+    CHECK_OK(rad_drafter_tree_layout(&b, 5, 3, 5));
+    CHECK_EQ(b.program().drafter_tree_k, 5);
+    CHECK_EQ(b.program().drafter_tree_bmax, 3);
+    CHECK_EQ(b.program().drafter_tree_lmax, 5);
+
+    RadKVGroupDecl full{};
+    full.kind = RAD_KV_FULL; full.dtype = RAD_BF16; full.n_head_kv = 1; full.head_dim = 64;
+    const rad_kvgroup gf = rad_decl_kv_group(&b, "comp", &full);
+    RadKVGroupDecl lin{};
+    lin.kind = RAD_KV_LINEAR; lin.dtype = RAD_F32; lin.n_head_kv = 1;
+    lin.state_dim[0] = 8; lin.state_dim[1] = 16;
+    const rad_kvgroup gl = rad_decl_kv_group(&b, "tail", &lin);
+    REQUIRE(gf != 0);
+    REQUIRE(gl != 0);
+    CHECK_OK(rad_kv_group_tree_self(&b, gf));
+    CHECK(b.program().kv_groups[gf].tree_self);
+    CHECK_EQ(rad_kv_group_tree_self(&b, gl), RAD_E_INVAL);
+    CHECK(!b.program().kv_groups[gl].tree_self);
+    CHECK_EQ(rad_kv_group_tree_self(&b, (rad_kvgroup)999), RAD_E_INVAL);
+}
+
 /* A block drafter's proposal pitch is its row pitch, which the engine reads row s at: left at 0 it
  * defaults to depth, and under depth it is refused, since a row could not hold the proposals. */
 TEST(a_block_drafters_proposal_pitch_holds_its_proposals) {

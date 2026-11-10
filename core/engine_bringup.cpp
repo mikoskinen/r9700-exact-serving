@@ -1335,7 +1335,18 @@ int Engine::declare() {
         /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
         draft_tree_ = cfg_.n_spec > 0 && cfg_.spec_ngram <= 0 && pb.tree_pays != 0;
-        if (draft_tree_ && !cfg_.debug_draft_oracle.empty()) {
+        /* RADIANCE_DEBUG_ORACLE_TREE=1 keeps a tree under the harness: a drafter that declares a
+         * node layout (rad_drafter_tree_layout) gets its proposals replaced by an oracle tree
+         * (Scheduler::set_draft), verified on host-built steps; one that declares none is refused
+         * at the step loop. Unset: the harness asks for chains, as before. */
+        const char* ot = std::getenv("RADIANCE_DEBUG_ORACLE_TREE");
+        oracle_tree_ = ot && !std::strcmp(ot, "1") && !cfg_.debug_draft_oracle.empty();
+        if (draft_tree_ && oracle_tree_) {
+            const char* why = "RADIANCE_DEBUG_ORACLE_TREE=1: the harness's ids replace the head's tree node "
+                              "for node (an oracle tree)";
+            RAD_INFO("draft trees: asked under --debug-draft-oracle -- %s", why);
+            decide("draft trees", "asked", why);
+        } else if (draft_tree_ && !cfg_.debug_draft_oracle.empty()) {
             /* --debug-draft-oracle replaces a head's proposal with a chain of fixed ids
              * (Scheduler::set_draft) and issues no step ahead (Engine::step_loop), which a tree
              * needs: the head proposes a chain under the harness. */
@@ -1344,7 +1355,7 @@ int Engine::declare() {
             RAD_INFO("draft trees: not asked -- %s", why);
             decide("draft trees", "not asked", why);
         }
-        if (draft_tree_) {
+        if (draft_tree_ && !oracle_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);
             decide("draft trees", "asked", why);
@@ -1629,6 +1640,7 @@ int Engine::declare() {
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
+    tree_k_       = tree_ ? (int)p0.drafter_tree_k : 0;
     /* --draft-short-from auto: a chain keeps its own block, a tree runs its short block from two
      * decoding sequences on. Its nodes are verify rows every drafting sequence pays for, which a
      * wide tree's extra nodes repay at one sequence and not at many. */

@@ -291,6 +291,11 @@ public:
      * (draft_cap): the controller's depth, or what the adaptive policy gives the sequence. */
     /* `parents`: a tree drafter's (rad_drafter_tree), node j + 1's parent node, null for a chain. */
     int      set_draft(uint64_t id, const int32_t* tokens, int n, const int32_t* parents = nullptr);
+    /* Tests and tools: a tree layout's live branches, depth and force in place of the plugin's fn4
+     * switches (-1 each: back to the switch). Applied at once and in every draft cycle after. */
+    void     set_tree_live(int branches, int depth, int force);
+    /* The draft controller, read-only, for tests and reports. */
+    const DraftController& draft_controller() const { return draft_; }
 
     /* ---------------------------------------------------------- media the encoder owes
      * A request carrying media is admitted only once every item is encoded; until then it keeps
@@ -649,6 +654,17 @@ private:
      * allocate. */
     std::vector<DraftAdapt*> draft_est_;
     void    draft_cycle();
+    /* A tree layout's live branches, depth and force (DraftController::set_tree) from the plugin's
+     * fn4 switches dspark_tree / dspark_tree_depth / dspark_tree_force, read without a lock
+     * (fn4::tree_live); first in every draft cycle. tree_test_*: set_tree_live's values in place of
+     * the switches (-1: the switch). */
+    void    tree_cycle();
+    int     tree_test_b_ = -1, tree_test_l_ = -1, tree_test_f_ = -1;
+    /* Steps whose tree proposals a prefill chunk turned into their main chains (step()). */
+    int64_t tree_chain_steps_ = 0;
+public:
+    int64_t tree_chain_steps() const { return tree_chain_steps_; }
+private:
 
     /* The built-in prompt-lookup drafter (scheduler.cpp, ngram.h). Fills s.draft and returns how
      * many tokens it proposed; 0 when the sequence has no repeated pattern to extend. It tries
@@ -717,6 +733,19 @@ private:
      * past the file's end; each replaced by its neighbour id where a hash of (n, position) falls
      * under kDebugMiss. Returns how many it wrote to `out`. */
     int debug_oracle_ids(int64_t n, int depth, int32_t* out) const;
+    /* The harness over a tree with a node layout (RADIANCE_DEBUG_ORACLE_TREE=1): `count` nodes whose
+     * parents are `par` (node j + 1's parent node; the head's layout, kept). The main chain (the
+     * branch of node 1) takes debug_oracle_ids' ids depth for depth; where its first draft is a miss,
+     * one other branch at position 1 (a hash of n) takes the true id at depth 1 and the oracle ids
+     * below, missed at the same rate under another hash; every other branch node takes an id that
+     * is never the true one. A node past the file keeps the head's token. Returns the nodes it
+     * rewrote. */
+    int debug_oracle_tree(int64_t n, int count, const int32_t* par, int32_t* out) const;
+public:
+    /* For tests: the harness's tree on its own (debug_oracle_tree), from a list of ids. */
+    int test_oracle_tree(const std::vector<int32_t>& ids, int64_t n_vocab, int64_t n, int count,
+                         const int32_t* par, int32_t* out);
+private:
 
     mutable std::mutex mu_;
 

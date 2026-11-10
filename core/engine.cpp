@@ -997,9 +997,20 @@ int Engine::step_loop() {
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
      * drafts nothing and an embedding model declares no drafter, so no server reaches this today;
      * it keeps a tree from running unverified should another path turn pipelining off. */
-    if (tree_ && !pipelining_) {
+    /* RADIANCE_DEBUG_ORACLE_TREE=1 under the harness: the harness builds every step on the host
+     * after the commit, staging each tree from the host's copy of its parents (the builder), and
+     * the card's acceptance, the move of the accepted path (tree_compact) and the context pass's
+     * restaging (ADV_CTXTREE: every block row is marked a card row) run behind it as they do behind
+     * a step issued ahead. Only for a drafter with a node layout, whose oracle tree set_draft
+     * builds. */
+    if (tree_ && !pipelining_ && oracle_tree_ && oracle_head && tree_k_ > 0) {
+        RAD_WARN("RADIANCE_DEBUG_ORACLE_TREE=1: drafter '%s' proposes trees, replaced by the harness's oracle "
+                 "trees and verified on host-built steps", drafter_.name);
+    } else if (tree_ && !pipelining_) {
         RAD_ERR("speculation: drafter '%s' proposes trees, which are verified only on steps issued "
-                "ahead, and this server issues none; ask the plugin for a chain", drafter_.name);
+                "ahead, and this server issues none; ask the plugin for a chain%s", drafter_.name,
+                oracle_tree_ ? " (RADIANCE_DEBUG_ORACLE_TREE=1 needs a drafter with a node layout, "
+                               "rad_drafter_tree_layout)" : "");
         return fail_loop(RAD_E_UNSUPPORTED);
     }
     const bool t_on = (int)log_level() >= (int)Log::Debug;

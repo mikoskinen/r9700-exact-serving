@@ -326,6 +326,9 @@ struct KVGroupInfo {
     /* Bound only at meta.n_layers and above: the drafter's own cache, which no trunk layer reads.
      * Set at declare (Builder::finish_kv_groups). */
     bool            drafter = false;
+    /* rad_kv_group_tree_self: the plugin moves a tree verify's accepted path in this group itself,
+     * so ADV_COMPACT leaves it alone (Engine::tree_compact). */
+    bool            tree_self = false;
 };
 
 /* A RAD_KV_CONV group's window in entries: conv_width - 1 of history plus one per speculative
@@ -438,6 +441,12 @@ public:
      * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
     bool           drafter_tree = false;
     rad_buf        drafter_parents = 0;
+    /* Its fixed node layout (rad_drafter_tree_layout): a main chain of `drafter_tree_k` nodes, then
+     * up to `drafter_tree_bmax` alternative branches at position 1 of up to `drafter_tree_lmax`
+     * nodes each, depth-major. 0 for a tree without one (DFlash2's) and for a chain. */
+    int64_t        drafter_tree_k = 0;
+    int64_t        drafter_tree_bmax = 0;
+    int64_t        drafter_tree_lmax = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.

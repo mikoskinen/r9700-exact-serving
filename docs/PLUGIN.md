@@ -408,6 +408,21 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   depth (a row holds the whole block's proposals and a short block fills its front) and is refused
   below it. The pass's block is `n_tok / n_seq`; a block the plugin has no ops for should fail the
   step (`rad_block_dflash2.h` does). Appended in ABI 27.
+- **A tree drafter may state its node layout.** `rad_drafter_tree_layout(b, main_depth,
+  max_branches, max_branch_depth)`, called once after `rad_drafter_tree`: a main chain of
+  `main_depth` nodes (node j the child of j - 1), then up to `max_branches` branches at position 1
+  of up to `max_branch_depth` nodes each, depth-major (with B live, node `K + (k-1) B + b + 1` is
+  branch b's node at depth k). Every row of such a drafter's block predicts, so its head reads all
+  `block` rows (DSpark's convention, block = depth of the chain). The core then prices the
+  branches' nodes with the adaptive window's step-cost model past a full main chain
+  (`core/sched/draft.h`), reads the live branch count, depth and force from the plugin's fn4
+  switches `dspark_tree` / `dspark_tree_depth` / `dspark_tree_force`, caps every verify at
+  `K + B L` nodes (B = 0: the main chain, as a chain drafter of depth K), takes a step carrying a
+  prefill chunk as a chain of the main chain, and allows the draft hybrid (prompt lookup capped at
+  K). `rad_kv_group_tree_self(b, g)` marks a paged group whose accepted tree path the plugin moves
+  itself (an entry a block of several positions): the acceptance's ADV_COMPACT leaves it alone.
+  Both additive exports; RAD_ABI_VERSION does not move, so a plugin binds them weak to load on
+  older hosts.
 - **Media preprocessing is the core's** (`core/mm`): resizing, patching, placeholder-token
   expansion and positions, in six processor families (Qwen-VL, Gemma 4, LFM2-VL, Unlimited-OCR,
   GLM-5.3 and Pixtral for Nemotron 3.5) chosen by the container's `vision_config.model_type`

@@ -879,6 +879,30 @@ int rad_chain_on(void);
 /* ---- appended in ABI 27 (a block drafter's short block) */
 int rad_drafter_short_block(RadBuilder* b, int64_t block);
 
+/* A tree drafter's (rad_drafter_tree, declared first) fixed node layout: a main chain of
+ * `main_depth` nodes (node j, 1 <= j <= main_depth, the child of node j - 1; node 0 the verify's
+ * root) followed by up to `max_branches` alternative branches at position 1, each a chain of up to
+ * `max_branch_depth` nodes, laid out depth-major: with B branches live, node
+ * main_depth + (k - 1) * B + b + 1 is branch b's node at depth k (its parent 0 at depth 1, else the
+ * node B before it). Every row of the block predicts (the head reads all `block` rows, the
+ * convention of a drafter whose block is its depth), so the proposal pitch is at least
+ * main_depth + max_branches * max_branch_depth nodes, which is RadDrafterDecl::depth.
+ *
+ * The core then prices the tree's nodes with the adaptive window's cost model (sched/draft.h): the
+ * main chain as a chain of main_depth, and the alternative nodes only past a full main chain, each
+ * worth its chance of being the accepted path's node; the live branch count and depth come from the
+ * plugin's fn4 switches dspark_tree / dspark_tree_depth / dspark_tree_force (runtime/fn4_switch.h).
+ * Its verify takes a node prefix, which depth-major makes a cut in depth. A step that carries a
+ * prefill chunk verifies the main chain alone, as a chain. Called once, after rad_drafter_tree.
+ * Additive export; RAD_ABI_VERSION does not move (a plugin binds it weak to load on older hosts). */
+int rad_drafter_tree_layout(RadBuilder* b, int64_t main_depth, int64_t max_branches,
+                            int64_t max_branch_depth);
+
+/* The plugin moves this paged group's accepted tree path itself (an entry a block of several
+ * positions, which a row-by-row move would tear): a tree verify's acceptance (ADV_COMPACT) leaves
+ * it alone. RAD_KV_FULL or RAD_KV_WINDOW groups only. Additive export, as above. */
+int rad_kv_group_tree_self(RadBuilder* b, rad_kvgroup g);
+
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
  * reads its result, so the plugin declares it. A plugin that declares none serves text only, and

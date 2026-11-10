@@ -223,6 +223,8 @@ int Engine::tree_compact(int rows) {
         for (size_t g = 1; g < p.kv_groups.size() && (int)g < a.n_groups; ++g) {
             const int kind = p.kv_groups[g].decl.kind;
             if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) continue;
+            /* The plugin moves this one itself (rad_kv_group_tree_self). */
+            if (p.kv_groups[g].tree_self) continue;
             const KVPoolBinding* b = rk.ctx.kv_binding((uint32_t)g);
             if (!b || !b->base || b->rank != 4) continue;   /* a zero group on this rank */
             const int bits = rad_dtype_bits(b->dtype);
@@ -591,8 +593,9 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     block_steps_ = steps;
     block_row_.resize((size_t)cfg_.max_seqs);
     /* The head reads the block's draft rows. A tree (rad_drafter_tree; DFlash2's convention, the
-     * anchor predicts nothing) reads all block - 1 of them whatever its node count. */
-    const int head = tree_ ? block - 1 : steps;
+     * anchor predicts nothing) reads all block - 1 of them whatever its node count; a tree with a
+     * node layout (rad_drafter_tree_layout: DSpark's, every row predicting) all `block`. */
+    const int head = tree_ ? (tree_k_ > 0 ? block : block - 1) : steps;
     const int n = sched_.block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
 

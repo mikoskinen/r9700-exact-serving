@@ -20,11 +20,12 @@ namespace {
 const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", "ds41_argather",
                                         "ds41_shexp_lane", "ds41_kvfold", "ds41_ofold", "ds41_onefill",
                                         "draft_depth0", "draft_probe", "draft_hybrid", "draft_hybrid_match",
-                                        "draft_probe_backoff", "draft_lend", "draft_lend_borrow" };
+                                        "draft_probe_backoff", "draft_lend", "draft_lend_borrow", "dspark_tree",
+                                        "dspark_tree_depth", "dspark_tree_force" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
-           i == kDs41OneFill;
+           i == kDs41OneFill || i == kDsparkTree || i == kDsparkTreeDepth || i == kDsparkTreeForce;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -163,6 +164,18 @@ int value(int i) {
 }
 uint64_t epoch() { return st().epoch.load(std::memory_order_acquire); }
 
+int tree_live(int i) {
+    if (i != kDsparkTree && i != kDsparkTreeDepth && i != kDsparkTreeForce) return -1;
+    return st().val[i].load(std::memory_order_acquire);
+}
+
+void tree_prime() {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    for (int i : { (int)kDsparkTree, (int)kDsparkTreeDepth, (int)kDsparkTreeForce })
+        s.val[i].store(plugin_value(s, i), std::memory_order_release);
+}
+
 int aql_acq_rule() {
     const int v = st().val[kAqlAcq].load(std::memory_order_acquire);
     return v >= 0 ? v : env_acq();
@@ -224,7 +237,7 @@ bool check(const std::string& name, int v, std::string* err) {
         if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, ds41_argather, "
                         "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
-                        "epoch_bump)";
+                        "dspark_tree, dspark_tree_depth, dspark_tree_force, epoch_bump)";
         return false;
     }
     State& s = st();

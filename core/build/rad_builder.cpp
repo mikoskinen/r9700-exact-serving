@@ -2299,6 +2299,50 @@ int Builder::drafter_tree(rad_buf parents) {
     return RAD_OK;
 }
 
+/* A tree drafter's fixed node layout (rad_builder.h, rad_drafter_tree_layout). */
+int Builder::drafter_tree_layout(int64_t main_depth, int64_t max_branches, int64_t max_branch_depth) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_tree_layout after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!prog_.drafter_tree) {
+        err(RAD_E_STATE, "drafter_tree_layout: no tree drafter; call rad_drafter_tree first");
+        return RAD_E_STATE;
+    }
+    const int64_t full = prog_.drafter.block > 0 ? prog_.drafter.block : prog_.drafter.depth + 1;
+    const int64_t nodes = main_depth + max_branches * max_branch_depth;
+    if (main_depth < 1 || main_depth > full || max_branches < 0 || max_branches > 8 ||
+        (max_branches > 0 && (max_branch_depth < 1 || max_branch_depth > main_depth)) ||
+        nodes > prog_.drafter.depth || nodes > 64) {
+        err(RAD_E_INVAL, "drafter_tree_layout '%s': main chain %lld, %lld branch(es) of %lld: the "
+                         "main chain is 1 .. the block (%lld rows), at most 8 branches each no deeper "
+                         "than the main chain, and the nodes (%lld) within the drafter's depth (%d)",
+            prog_.drafter_name.c_str(), (long long)main_depth, (long long)max_branches,
+            (long long)max_branch_depth, (long long)full, (long long)nodes, prog_.drafter.depth);
+        return RAD_E_INVAL;
+    }
+    prog_.drafter_tree_k    = main_depth;
+    prog_.drafter_tree_bmax = max_branches;
+    prog_.drafter_tree_lmax = max_branches > 0 ? max_branch_depth : 0;
+    return RAD_OK;
+}
+
+int Builder::kv_group_tree_self(rad_kvgroup h) {
+    if (finished_) { err(RAD_E_STATE, "kv_group_tree_self after declare finished"); return RAD_E_STATE; }
+    if (h == 0 || h >= prog_.kv_groups.size()) {
+        err(RAD_E_INVAL, "kv_group_tree_self: %u is not a declared KV group", (unsigned)h);
+        return RAD_E_INVAL;
+    }
+    const int kind = prog_.kv_groups[h].decl.kind;
+    if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) {
+        err(RAD_E_INVAL, "kv group '%s': kv_group_tree_self on a group that is not paged",
+            prog_.kv_groups[h].name.c_str());
+        return RAD_E_INVAL;
+    }
+    prog_.kv_groups[h].tree_self = true;
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -2859,6 +2903,17 @@ int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const ch
 int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_tree(parents);
+}
+
+int rad_drafter_tree_layout(RadBuilder* b, int64_t main_depth, int64_t max_branches,
+                            int64_t max_branch_depth) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_tree_layout(main_depth, max_branches, max_branch_depth);
+}
+
+int rad_kv_group_tree_self(RadBuilder* b, rad_kvgroup g) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->kv_group_tree_self(g);
 }
 
 int rad_chain_on(void) { return rad_dev_chain_enabled(); }

@@ -73,7 +73,7 @@ struct RecMap {
     std::vector<int>         src_index;   /* RadNameMap::src_index, one per source */
 };
 struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; bool replicated = false;
-                  bool dense = false; };
+                  bool dense = false; bool tree_self = false; };
 struct RecIssue {
     rad_op                  op = 0;
     std::vector<RadOperand> opd;
@@ -127,6 +127,8 @@ struct RadBuilder {
     int64_t        drafter_short = 0;     /* rad_drafter_short_block */
     /* A tree drafter's parents buffer (rad_drafter_tree), 0 for a chain. */
     rad_buf        drafter_parents = 0;
+    /* Its node layout (rad_drafter_tree_layout): main chain, branches, branch depth; 0 for none. */
+    int64_t        tree_k = 0, tree_bmax = 0, tree_lmax = 0;
 
     /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
     std::vector<rad_buf> concurrent;
@@ -441,6 +443,31 @@ struct ChainOn {
     explicit ChainOn(int on) { g_chain_on = on; }
     ~ChainOn() { g_chain_on = 0; }
 };
+
+/* As the real builder checks it (core/build/rad_builder.cpp). Not part of graph_hash(): the layout
+ * changes how the core prices and verifies the tree, not the graph. */
+extern "C" int rad_drafter_tree_layout(RadBuilder* b, int64_t main_depth, int64_t max_branches,
+                                       int64_t max_branch_depth) {
+    if (!b || !b->drafter_parents) return RAD_E_STATE;
+    const int64_t full = b->drafter.block > 0 ? b->drafter.block : b->drafter.depth + 1;
+    const int64_t nodes = main_depth + max_branches * max_branch_depth;
+    if (main_depth < 1 || main_depth > full || max_branches < 0 || max_branches > 8 ||
+        (max_branches > 0 && (max_branch_depth < 1 || max_branch_depth > main_depth)) ||
+        nodes > b->drafter.depth || nodes > 64)
+        return RAD_E_INVAL;
+    b->tree_k = main_depth;
+    b->tree_bmax = max_branches;
+    b->tree_lmax = max_branches > 0 ? max_branch_depth : 0;
+    return RAD_OK;
+}
+/* Recorded like dense_read; refused on an unpaged group. Not part of graph_hash(). */
+extern "C" int rad_kv_group_tree_self(RadBuilder* b, rad_kvgroup g) {
+    if (!b || g == 0 || g > b->kv_groups.size()) return RAD_E_INVAL;
+    RecKV& k = b->kv_groups[g - 1];
+    if (k.d.kind != RAD_KV_FULL && k.d.kind != RAD_KV_WINDOW) return RAD_E_INVAL;
+    k.tree_self = true;
+    return RAD_OK;
+}
 
 extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     const int64_t full = b ? (b->drafter.block > 0 ? b->drafter.block : b->drafter.depth + 1) : 0;
