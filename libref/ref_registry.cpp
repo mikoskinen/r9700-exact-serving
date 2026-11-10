@@ -546,7 +546,8 @@ static const RadOperandSpec oQuantRoundtrip[] = { INOUT("x") };
 static const RadParamSpec pSoftmaxPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype") };
 static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("page") };
 static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format") };
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format") };
 static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
     OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
     WGT("sinks"), OUT("out") };
@@ -579,6 +580,9 @@ static const RadOperandSpec oEmbedGgml[] = { OPD("tokens"), WGT("wte"), OUT("x")
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype"),
     P_STRO("format") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
+static const RadParamSpec pWindowStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("format"),
+    P_STR("dtype") };
+static const RadOperandSpec oWindowStore[] = { OPD("x"), OPD("slot_mapping"), INOUT("kv_cache") };
 static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
     P_INTO("block") };
 static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
@@ -1705,6 +1709,14 @@ static const RadOpSchema kSchemas[] = {
   "the selected compressed entries c (tokens [c ratio, (c+1) ratio), block cbt[s][c ratio/cbs], "
   "cache [blocks,1,cbs,dim/ratio]). f32 scores q.k*scale, max floored at -1e30, "
   "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero." },
+{ "window_store", ARR(pWindowStore), ARR(oWindowStore),
+  "x[m] (n values, n a multiple of 32) packed into slot slot_mapping[m] of a paged cache [n_blocks, 1, "
+  "block_size, slot] (kv_store's slot rule: a negative slot or one past the cache stores nothing). format "
+  "fp8_e4m3 (the fp8 window slot, heads*slot*2 = (n + n/32) bytes rounded up to 16): n e4m3 codes (value d "
+  "at byte d), then a scale byte e a block of 32 (scale 2^(e-127)), then zeros. A block's k: 120 if its amax "
+  "(NaN as 0) is inf, 0 if it is 0, else the least k with amax <= 448 2^k, at least -126; e = k + 127; code "
+  "= fp8(v 2^-k) (RNE, saturating). A value reads back as e4m3(code) x 2^(e-127) in f32: exactly the stored "
+  "bf16 where the row is quant_roundtrip(fp8_e4m3, ue8m0, 32) output (DeepSeek-V4.1's window key)." },
 { "index_score", ARR(pIndexScore), ARR(oIndexScore),
   "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
   "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
@@ -2842,6 +2854,7 @@ ROW_GGML("ref_logits_gemm_ggml", "logits_gemm_ggml", "vocab", "lm_head over llam
 ROW_GGML("ref_embed_lookup_ggml", "embed_lookup_ggml", "vocab", "embedding gather from llama.cpp native blocks", DT_FLOAT, ref_embed_lookup_ggml),
 #endif
 SIMPLE("ref_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT, ref_entry_store),
+SIMPLE("ref_window_store", "window_store", "attn", "a key row packed into the fp8 window slot of a paged cache", DT_FLOAT, ref_window_store),
 SIMPLE("ref_index_score", "index_score", "attn", "indexer relu-gated head scores over a paged index cache", DT_FLOAT, ref_index_score),
 SIMPLE("ref_index_candidates", "index_candidates", "attn", "two-level top-k: kept candidate blocks", DT_ANY, ref_index_candidates),
 SIMPLE("ref_index_topk", "index_topk", "attn", "top-k passed positions in position order", DT_ANY, ref_index_topk),

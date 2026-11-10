@@ -1249,6 +1249,53 @@ int entry_store_body(const RadArgs* a, RadStream stream) {
                     (int)n, W);
 }
 
+/* ==================================================================== window_store (lever KVWIN)
+ * x[m] (n values, n a multiple of 32) packed into the fp8 window slot (r4d_ds41_qrt.h ds_w8_*) at
+ * slot_mapping[m] of a paged cache [n_blocks, 1, block_size, ds_w8_bytes(n) / 2] -- kv_store's slot rule: a
+ * negative slot or s / block_size >= n_blocks stores nothing. 256 threads a row, a wave a block of 32
+ * columns (its scale from the wave's amax), a byte a thread. */
+__global__ __launch_bounds__(256) void window_store_kernel(const uint16_t* x, long xp, const int32_t* slot,
+                                                           long ss, unsigned char* cache, long bs,
+                                                           long n_blocks, int n, long M) {
+    const int sb = ds_w8_bytes(n);
+    for (long m = blockIdx.x; m < M; m += gridDim.x) {
+        const long s = slot[m * ss];
+        if (s < 0 || s / bs >= n_blocks) continue;    /* block-uniform */
+        unsigned char* e = cache + s * (long)sb;
+        for (int base = 0; base < n; base += 256) {   /* n % 32 == 0: a wave's lanes are all in or all out */
+            const int col = base + (int)threadIdx.x;
+            const bool in = col < n;
+            const float v = in ? ds_bf(x[m * xp + col]) : 0.0f;
+            const uint32_t sc = ds_w8_scale(r4d_xor_max<32>(ds_amax_term(v)));
+            if (in) {
+                e[col] = (unsigned char)ds_w8_code(v, sc);
+                if ((col & 31) == 0) e[n + col / 32] = (unsigned char)sc;
+            }
+        }
+        for (int z = n + n / 32 + (int)threadIdx.x; z < sb; z += 256) e[z] = 0;
+    }
+}
+
+int window_store_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
+    const char* f = r4d_gets(a, "format");
+    if (!f || std::strcmp(f, "fp8_e4m3")) return R4D_NO(RAD_E_UNSUPPORTED);
+    const RadTensor &x = a->t[0], &sm = a->t[1], &kc = a->t[2];
+    const long n = (long)r4d_geti_or(a, "n", 0), bs = (long)r4d_geti_or(a, "block_size", 0);
+    if (n < 32 || n % 32 || n > 16384 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
+        rad_tensor_numel(&sm) < x.shape[0] || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[2] != bs ||
+        kc.shape[3] * 2 != ds_w8_bytes((int)n) || kc.shape[0] < 1)
+        return R4D_NO(RAD_E_SHAPE);
+    if (x.dtype != RAD_BF16 || sm.dtype != RAD_I32 || kc.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(&kc)) return R4D_NO(RAD_E_STRIDE);
+    const long M = x.shape[0];
+    long ss;
+    if (!mat(x, RAD_BF16, M, n) || !lin_step(sm, &ss)) return R4D_NO(RAD_E_SHAPE);
+    return R4D_EMIT(stream, window_store_kernel, dim3(grid_rows(M)), dim3(256), 0, (const uint16_t*)x.data,
+                    (long)x.stride[0], (const int32_t*)sm.data, ss, (unsigned char*)kc.data, bs,
+                    (long)kc.shape[0], (int)n, M);
+}
+
 /* ==================================================================== router_scored_topk
  * One wave a row, as r4d_glm.hip's router_sigmoid_topk: lane l holds experts l, l+32, ...; the
  * score is libref's (sigmoid, sqrt(softplus) or the softmax with its sum in expert order), round j
@@ -1666,7 +1713,10 @@ __device__ __forceinline__ float fz_block_sum(float v, float* lds) {
 // quant_group_kernel's step over a row held in `buf`: lane groups of B columns, `width` threads.
 // KV (rmsnorm_rope_roundtrip_kv_store): each value is also stored at kc[col] when the row has a cache
 // slot (kc not null) -- the very bf16 written to yr[col], so the cache holds what kv_store would copy.
-template <int B, bool KV = false>
+// W8 (kv_dtype fp8_e4m3, lever KVWIN): the cache slot is the fp8 window slot (ds_w8_*, r4d_ds41_qrt.h) at
+// kc's bytes -- each wave's 32 columns are one block (width and n multiples of 32), packed from the bf16
+// the step stores in y, with window_store's arithmetic (its scale from the wave's amax of those bf16).
+template <int B, bool KV = false, bool W8 = false>
 __device__ __forceinline__ void fz_quant_group(const uint16_t* buf, uint16_t* yr, int n,
                                                uint32_t width, int fmt, int sc,
                                                uint16_t* kc = nullptr) {
@@ -1677,11 +1727,22 @@ __device__ __forceinline__ void fz_quant_group(const uint16_t* buf, uint16_t* yr
         float a = fabsf(v);
         a = a == a ? a : 0.0f;
         const float amax = r4d_xor_max<B>(a);
+        [[maybe_unused]] uint16_t ow = 0;
         if (in) {
             const uint16_t o = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
             yr[col] = o;
-            if constexpr (KV) {
+            if constexpr (KV && !W8) {
                 if (kc) kc[col] = o;
+            }
+            ow = o;
+        }
+        if constexpr (W8) {   /* every lane of the wave, in or not (a block is all in or all out) */
+            const float ov = ds_bf(ow);
+            const uint32_t e = ds_w8_scale(r4d_xor_max<32>(ds_amax_term(ov)));
+            if (kc && in) {
+                unsigned char* k8 = (unsigned char*)kc;
+                k8[col] = (unsigned char)ds_w8_code(ov, e);
+                if ((col & 31) == 0) k8[n + col / 32] = (unsigned char)e;
             }
         }
     }
@@ -1714,6 +1775,7 @@ struct FzKv {
     const int32_t* slot;
     uint16_t* kv;
     uint32_t bs, n_blocks;
+    uint32_t slotb;   /* W8: the fp8 window slot's bytes (ds_w8_bytes(n)) */
 };
 struct FzKvNone {};
 
@@ -1723,7 +1785,7 @@ struct FzKvNone {};
  * y to the row's cache slot, as kv_store_bf16 copies y's row there (kv_store_kernel: slot s < 0 or
  * s / block_size >= n_blocks stores nothing; else entry (s / block_size, s % block_size) of the one head,
  * K = y[0, n/2) at [0, n/2), V = y[n/2, n) at [n/2, n)): the same bytes, without the second launch. */
-template <bool WF32, uint32_t THR, bool KV = false>
+template <bool WF32, uint32_t THR, bool KV = false, bool W8 = false>
 __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
@@ -1790,12 +1852,32 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
 
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     uint16_t* kc = nullptr;
-    if constexpr (KV) {   // kv_store_kernel's slot rule and address, kv_heads 1, 2 * head_dim = n
+    if constexpr (KV && !W8) {   // kv_store_kernel's slot rule and address, kv_heads 1, 2 * head_dim = n
         const int32_t s = kv.slot[m];
         if (s >= 0 && (uint32_t)s / kv.bs < kv.n_blocks)
             kc = kv.kv + ((size_t)((uint32_t)s / kv.bs) * kv.bs + (size_t)((uint32_t)s % kv.bs)) * n;
+    } else if constexpr (KV && W8) {   // the same slot rule; the slot is ds_w8_bytes(n) bytes
+        const int32_t s = kv.slot[m];
+        if (s >= 0 && (uint32_t)s / kv.bs < kv.n_blocks)
+            kc = (uint16_t*)((unsigned char*)kv.kv +
+                             ((size_t)((uint32_t)s / kv.bs) * kv.bs + (size_t)((uint32_t)s % kv.bs)) * kv.slotb);
     } else {
         (void)kv;
+    }
+    if constexpr (W8) {   /* the launch admits W8 at a lane-group block only, n a multiple of 32 */
+        switch (block) {
+            case 1: fz_quant_group<1, KV, true>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+            case 2: fz_quant_group<2, KV, true>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+            case 4: fz_quant_group<4, KV, true>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+            case 8: fz_quant_group<8, KV, true>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+            case 16: fz_quant_group<16, KV, true>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+            default: fz_quant_group<32, KV, true>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+        }
+        if (kc) {   /* the slot's pad bytes past the scales */
+            unsigned char* k8 = (unsigned char*)kc;
+            for (uint32_t z = n + n / 32 + threadIdx.x; z < kv.slotb; z += THR) k8[z] = 0;
+        }
+        return;
     }
     switch (block) {
         case 1: fz_quant_group<1, KV>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
@@ -2089,34 +2171,46 @@ int norm_rope_rt_launch(const RadArgs* a, RadStream stream) {
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
     const float mult = (float)r4d_getf(a, "mult", 1.0);
     std::conditional_t<KV, FzKv, FzKvNone> kv{};
+    [[maybe_unused]] bool w8 = false;
     if constexpr (KV) {   /* kv_store_geom's checks at one head of n / 2 (K) + n / 2 (V) */
         const RadTensor &sm = a->t[5], &kc = a->t[6];
         if (!sm.data || !kc.data) return R4D_NO(RAD_E_INVAL);
         const char* kd = r4d_gets(a, "kv_dtype");
         const long long bs = r4d_geti_or(a, "block_size", 0);
-        if (!kd || std::strcmp(kd, "bf16")) return R4D_NO(RAD_E_UNSUPPORTED);
+        /* kv_dtype fp8_e4m3 (lever KVWIN): the fp8 window slot, ds_w8_bytes(n) bytes in bf16 slots; packed
+         * a wave a block, so n a multiple of 32 and the round trip's block a lane group (power of two <= 32) */
+        w8 = kd && !std::strcmp(kd, "fp8_e4m3");
+        if (!kd || (std::strcmp(kd, "bf16") && !w8)) return R4D_NO(RAD_E_UNSUPPORTED);
+        if (w8 && (n % 32 || block > 32 || (block & (block - 1)))) return R4D_NO(RAD_E_UNSUPPORTED);
         if (sm.dtype != RAD_I32 || kc.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
         if (!r4d_contig(&sm) || !r4d_contig(&kc)) return R4D_NO(RAD_E_STRIDE);
         if (bs <= 0 || (n & 1) || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[2] != bs ||
-            kc.shape[3] != n || kc.shape[0] < 1 || kc.shape[0] > UINT32_MAX || bs > UINT32_MAX ||
-            r4d_numel(&sm) != M)
+            kc.shape[3] != (w8 ? ds_w8_bytes((int)n) / 2 : n) || kc.shape[0] < 1 || kc.shape[0] > UINT32_MAX ||
+            bs > UINT32_MAX || r4d_numel(&sm) != M)
             return R4D_NO(RAD_E_SHAPE);
         kv.slot = (const int32_t*)sm.data;
         kv.kv = (uint16_t*)kc.data;
         kv.bs = (uint32_t)bs;
         kv.n_blocks = (uint32_t)kc.shape[0];
+        kv.slotb = (uint32_t)ds_w8_bytes((int)n);
     }
     const int thr = r4d_act_threads((int)M, (int)n);
     const uint32_t lds = (uint32_t)(n * sizeof(uint16_t));
-#define FZ_NRQ(WF, T)                                                                             \
-    R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T, KV>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
+#define FZ_NRQ(WF, T, W)                                                                          \
+    R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T, KV, W>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
              dim3(T), lds, (const uint16_t*)x.data, (uint32_t)x_ld, (const void*)w.data,          \
              (uint16_t*)y.data, (uint32_t)y.stride[0], (uint32_t)n, eps, wadd, mult, (uint32_t)M, \
              r, (int)block, fmt, sc, kv)
-#define FZ_NRQ_W(WF)                                                                              \
-    return thr == 1024 ? FZ_NRQ(WF, 1024) : thr == 512 ? FZ_NRQ(WF, 512) : FZ_NRQ(WF, 256)
-    if (w.dtype == RAD_F32) FZ_NRQ_W(true);
-    FZ_NRQ_W(false);
+#define FZ_NRQ_W(WF, W)                                                                           \
+    return thr == 1024 ? FZ_NRQ(WF, 1024, W) : thr == 512 ? FZ_NRQ(WF, 512, W) : FZ_NRQ(WF, 256, W)
+    if constexpr (KV) {
+        if (w8) {
+            if (w.dtype == RAD_F32) FZ_NRQ_W(true, true);
+            FZ_NRQ_W(false, true);
+        }
+    }
+    if (w.dtype == RAD_F32) FZ_NRQ_W(true, false);
+    FZ_NRQ_W(false, false);
 #undef FZ_NRQ_W
 #undef FZ_NRQ
 }
@@ -2350,6 +2444,7 @@ extern "C" int r4d_rad_softmax_pool(const RadArgs* a, RadStream s) {
     return softmax_pool_body(a, s);
 }
 extern "C" int r4d_rad_entry_store(const RadArgs* a, RadStream s) { return entry_store_body(a, s); }
+extern "C" int r4d_rad_window_store(const RadArgs* a, RadStream s) { return window_store_body(a, s); }
 extern "C" int r4d_rad_router_scored_topk(const RadArgs* a, RadStream s) {
     return router_scored_body(a, s);
 }

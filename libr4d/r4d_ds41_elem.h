@@ -15,6 +15,8 @@ void r4d_ds41_mix_fuse_force(int on);
 int r4d_rad_mhc_collapse(const RadArgs* a, RadStream stream);
 int r4d_rad_softmax_pool(const RadArgs* a, RadStream stream);
 int r4d_rad_entry_store(const RadArgs* a, RadStream stream);
+/* lever KVWIN: a key row packed into the fp8 window slot */
+int r4d_rad_window_store(const RadArgs* a, RadStream stream);
 int r4d_rad_router_scored_topk(const RadArgs* a, RadStream stream);
 int r4d_rad_router_scored_topk_scatter(const RadArgs* a, RadStream stream);
 int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream stream);
@@ -35,6 +37,7 @@ int r4d_shape_mhc_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_mhc_collapse(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_softmax_pool(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_entry_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r4d_shape_window_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_router_scored_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_router_scored_topk_scatter(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int operand, RadOpdDesc* out);

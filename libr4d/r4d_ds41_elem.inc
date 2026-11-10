@@ -89,6 +89,17 @@ static const RadConstraint cDs41EntryStore[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("block_size", 1), C_IN("dtype", "bf16"),
 };
 
+/* window_store (lever KVWIN): a key row packed into the fp8 window slot of a paged cache, kv_store's slot rule. */
+static const RadParamSpec pDs41WindowStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("format"),
+                                                 P_STR("dtype") };
+static const RadOperandSpec oDs41WindowStore[] = {
+    { "x", RAD_OPD_IN, 0 }, { "slot_mapping", RAD_OPD_IN, 0 }, { "kv_cache", RAD_OPD_INOUT, 0 },
+};
+static const RadConstraint cDs41WindowStore[] = {
+    C_GE("M", 1), C_GE("n", 32), C_LE("n", 16384), C_DIV("n", 32), C_GE("block_size", 1),
+    C_IN("format", "fp8_e4m3"), C_IN("dtype", "bf16"),
+};
+
 static const RadParamSpec pDs41RouterScored[] = { P_INT("M"),           P_INT("n_expert"),
                                                   P_INT("top_k"),       P_INT("norm"),
                                                   P_F64("route_scale"), P_STR("score"),
@@ -176,7 +187,7 @@ static const RadOperandSpec oDs41NormRopeRtKv[] = {
 };
 static const RadConstraint cDs41NormRopeRtKvFp8[] = {
     C_DS41_ROPE, C_GE("n", 2), C_LE("n", 16384), C_DIV("n", 2), C_IN("format", "fp8_e4m3"),
-    C_IN("scale", "ue8m0 f32"), C_GE("block_size", 1), C_IN("kv_dtype", "bf16"),
+    C_IN("scale", "ue8m0 f32"), C_GE("block_size", 1), C_IN("kv_dtype", "bf16 fp8_e4m3"),
 };
 
 static const RadParamSpec pDs41RopeRt[] = {
@@ -256,6 +267,14 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
            "nvfp4 (n a multiple of 32): blocks of 16 with an e4m3 scale (n/2 code bytes, n/16 scale bytes, "
            "zeros to 16), the scale searched among amax/c (c = 6, 4, 3, 2, 1.5, 1, 0.5) for one that gives "
            "every value back exactly, else quant_roundtrip(fp4_e2m1, e4m3)'s."),
+    SCHEMA("window_store", pDs41WindowStore, oDs41WindowStore,
+           "x[m] (n values, n a multiple of 32) packed into slot slot_mapping[m] of a paged cache [n_blocks, 1, "
+           "block_size, slot] (kv_store's slot rule: a negative slot or one past the cache stores nothing). format "
+           "fp8_e4m3 (the fp8 window slot, heads*slot*2 = (n + n/32) bytes rounded up to 16): n e4m3 codes (value d "
+           "at byte d), then a scale byte e a block of 32 (scale 2^(e-127)), then zeros. A block's k: 120 if its amax "
+           "(NaN as 0) is inf, 0 if it is 0, else the least k with amax <= 448 2^k, at least -126; e = k + 127; code "
+           "= fp8(v 2^-k) (RNE, saturating). A value reads back as e4m3(code) x 2^(e-127) in f32: exactly the stored "
+           "bf16 where the row is quant_roundtrip(fp8_e4m3, ue8m0, 32) output (DeepSeek-V4.1's window key)."),
     SCHEMA("router_scored_topk", pDs41RouterScored, oDs41RouterScored,
            "router_sigmoid_topk with the score function a required name: sigmoid, sqrtsoftplus "
            "(sqrt(softplus(logit)), softplus linear above 20) or softmax over all n_expert logits."),
@@ -279,7 +298,9 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
            "cache at its slot (slot_mapping; negative or past the cache: no store), the row one entry of a "
            "[n_blocks, 1, block_size, n] cache (kv_store at n_head_kv 1, head_dim n / 2: K = y[0, n/2), "
            "V = y[n/2, n)): y and the cache as the two ops leave them. A key normalised, rotated, "
-           "quantise-dequantised and stored in one pass (DeepSeek-V4.1's window key)."),
+           "quantise-dequantised and stored in one pass (DeepSeek-V4.1's window key). kv_dtype fp8_e4m3: the "
+           "cache is window_store's fp8 window slot ([n_blocks, 1, block_size, (n + n/32) rounded up to 16 bytes "
+           "/ 2]) and y's row is stored there as window_store packs it."),
     SCHEMA("rope_rows_roundtrip", pDs41RopeRt, oDs41RopeRt,
            "rope_rows then quant_roundtrip over the n_head * head_dim columns of x, in place: x as the "
            "two ops leave it, each step rounded to dtype where that op stores."),
@@ -343,6 +364,12 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
   "any M, n and block_size; one thread an element", "bf16 x and cache, i32 page",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41EntryStore), NOTUNE,
   nullptr, nullptr, r4d_rad_entry_store, nullptr, nullptr, nullptr, r4d_shape_entry_store },
+{ "window_store_fp8_bf16", "window_store", "attn",
+  "a key row packed into the fp8 window slot (e4m3 codes, a ue8m0-style scale byte a block of 32) at its slot",
+  "any M, n a multiple of 32 up to 16384, any block_size; 256 threads a row, a wave a block, a byte a thread",
+  "bf16 x, i32 slot mapping, the cache's bytes in bf16 slots", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDs41WindowStore), NOTUNE, nullptr, nullptr, r4d_rad_window_store, nullptr, nullptr, nullptr,
+  r4d_shape_window_store },
 { "router_scored_topk_f32", "router_scored_topk", "moe",
   "correction-bias routing over sigmoid, sqrt(softplus) or softmax scores",
   "single group, experts <= 512, top_k <= 32; one wave a row",

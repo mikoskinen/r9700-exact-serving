@@ -23,9 +23,14 @@ extern "C" int r4d_shape_attn_sparse_sink(const RadParam* p, int n_p, int operan
     if (lf && std::strcmp(lf, "nvfp4") && std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
     const int64_t cslots = nv ? (Dm / 2 + Dm / 16 + 15) / 16 * 16 / 2 : Dm;
     if (comp && cslots % ratio) return RAD_E_UNSUPPORTED;
+    /* window_format fp8_e4m3: a window key is (Dm + Dm/32) bytes rounded up to 16, in bf16 slots */
+    const char* wf = r4d_pgets(p, n_p, "window_format");
+    const bool w8 = wf && !std::strcmp(wf, "fp8_e4m3");
+    if (wf && !w8 && std::strcmp(wf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t wslots = w8 ? (Dm + Dm / 32 + 15) / 16 * 16 / 2 : Dm;
     const RadOpdDesc l[] = {
         opd(D, M, H * Dm),                                  /* q */
-        opd(D, nb, 1, bs, Dm),                              /* window cache */
+        opd(D, nb, 1, bs, wslots),                          /* window cache */
         opd_idx(1, nb, nb),                                 /* window block table */
         opd_idx(1, 0, M + 1),                               /* window tokens held from the table's start */
         comp ? opd(D, ncb, 1, ratio, cslots / ratio) : opd_none(),  /* compressed cache: an entry a block */

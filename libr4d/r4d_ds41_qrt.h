@@ -145,6 +145,35 @@ __device__ __forceinline__ float ds_amax_term(float v) {
     return a == a ? a : 0.0f;
 }
 
+/* ==================================================================== the fp8 window slot (lever KVWIN)
+ * RADIANCE_DS41_KVWIN_FP8: DeepSeek-V4.1's window caches hold each key packed -- n e4m3 codes (value d at byte
+ * d), then n/32 scale bytes (block j = values [32 j, 32 j + 32) at byte n + j), then zeros to a multiple of
+ * 16: 528 bytes for the 512-wide latent instead of 1024. A value is e4m3(code) x f32(e << 23) in f32 (scale
+ * 2^(e - 127) for e = 1..254). The writers (window_store, rmsnorm_rope_roundtrip_kv_store kv_dtype fp8_e4m3)
+ * pack the bf16 row the round trip stored, block by block:
+ *   am = max |v| over the block (a NaN as 0, inf kept); k = 120 if am is inf, 0 if am is 0, else the least k
+ *   with am <= 448 x 2^k (am = 1.m x 2^E: k = E - 8, or E - 7 when 1.m > 1.75), clamped to -126; e = k + 127;
+ *   code = rad_f32_to_fp8e4m3(v x 2^-k) (RNE, saturating at 448, NaN to 0x7f | sign).
+ * Exact for every block quant_roundtrip(fp8_e4m3, ue8m0, 32) stores (docs/OPS.md window_store): such a block
+ * is c_i 2^K (c_i e4m3 values, one K in [-22, 120]; an inf only at K = 120, a NaN where the input was
+ * one), and the least k above is <= K, where every c_i 2^K is again an e4m3 value times 2^k: the codes are
+ * exact and every decoded value is the stored bf16's value (a NaN decodes to a NaN). */
+__host__ __device__ constexpr int ds_w8_bytes(int n) { return (n + n / 32 + 15) / 16 * 16; }
+
+// The scale byte of a block whose |values| reach `am` (ds_amax_term's: NaN as 0, inf kept).
+__device__ __forceinline__ uint32_t ds_w8_scale(float am) {
+    const uint32_t u = __float_as_uint(am);
+    if (u >= 0x7f800000u) return 247u;                            // inf: k = 120
+    if (u == 0u) return 127u;                                    // zeros (and NaN): any k
+    int k = u < 0x00800000u ? -126 : (int)(u >> 23) - 135 + ((u & 0x7fffffu) > 0x600000u ? 1 : 0);
+    k = k < -126 ? -126 : k;
+    return (uint32_t)(k + 127);
+}
+// The code of v in a block of scale byte e: v x 2^-k (exact: a power of two in range), then e4m3.
+__device__ __forceinline__ uint32_t ds_w8_code(float v, uint32_t e) {
+    return ds_to_e4m3(v * __uint_as_float((254u - e) << 23));
+}
+
 // rope_rows' operands and geometry, as rope_rows_body passes them to rope_rows_kernel.
 struct FzRope {
     const float* cs;

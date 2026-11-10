@@ -5,7 +5,8 @@
 
 /* libref's schemas (libref/ref_registry.cpp), field for field. */
 static const RadParamSpec pDs41AttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format") };
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format") };
 static const RadOperandSpec oDs41AttnSparseSink[] = {
     { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
     { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
@@ -17,8 +18,8 @@ static const RadOperandSpec oDs41AttnSparseSink[] = {
  * its scale named block_scale; the attention's operands, then the rope's cos_sin. */
 static const RadParamSpec pDs41AttnSparseSinkRt[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
     P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
-    P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_INT("block"), P_STR("format"),
-    P_STR("block_scale") };
+    P_STRO("window_format"), P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_INT("block"),
+    P_STR("format"), P_STR("block_scale") };
 static const RadOperandSpec oDs41AttnSparseSinkRt[] = {
     { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
     { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
@@ -86,7 +87,11 @@ SCHEMA("attn_sparse_sink", pDs41AttnSparseSink, oDs41AttnSparseSink,
        "latent_format nvfp4: the compressed cache holds each entry packed (entry_store format nvfp4: "
        "e2m1 codes, an e4m3 scale a block of 16, 288 bytes for 512 values), the window a multiple of "
        "32; every output is the bf16 cache's, bit for bit, where the entries are "
-       "quant_roundtrip(fp4_e2m1, e4m3, 16) values."),
+       "quant_roundtrip(fp4_e2m1, e4m3, 16) values. window_format fp8_e4m3: the window cache holds each key "
+       "packed (window_store format fp8_e4m3: e4m3 codes, a scale byte a block of 32, 528 bytes for 512 "
+       "values; a value is e4m3(code) x 2^(e-127) in f32), the window a multiple of 32 when ratio > 0; every "
+       "output is the bf16 cache's, bit for bit, where the keys are quant_roundtrip(fp8_e4m3, ue8m0, 32) "
+       "values window_store packed."),
 SCHEMA("attn_sparse_sink_rope_roundtrip", pDs41AttnSparseSinkRt, oDs41AttnSparseSinkRt,
        "attn_sparse_sink (operands q .. out, its parameters), then rope_rows_roundtrip over out (n_head = "
        "heads, head_dim = dim, rot, off, mode, inverse, block, format, scale = block_scale) with cos_sin at "

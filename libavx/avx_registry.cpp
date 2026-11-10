@@ -447,7 +447,8 @@ static const RadOperandSpec oQuantRoundtrip[] = { INOUT("x") };
 static const RadParamSpec pSoftmaxPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype") };
 static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("page") };
 static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format") };
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format") };
 static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
     OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"),
     OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
@@ -465,6 +466,9 @@ static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("p
 static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype"),
     P_STRO("format") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
+static const RadParamSpec pWindowStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("format"),
+    P_STR("dtype") };
+static const RadOperandSpec oWindowStore[] = { OPD("x"), OPD("slot_mapping"), INOUT("kv_cache") };
 static const RadParamSpec pTokenMap[] = { P_INT("M"), P_INT("n_vocab") };
 static const RadOperandSpec oTokenMap[] = { OPD("ids"), WGT("table"), OUT("mapped") };
 static const RadParamSpec pStreamGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
@@ -1290,6 +1294,9 @@ static const RadOpSchema kSchemas[] = {
   "the topk best passed positions inside keep's blocks of `block`, in position order, then -1." },
 { "entry_store", ARR(pEntryStore), ARR(oEntryStore),
   "x[w] into the whole of block page[w] of a paged cache; a negative page writes nothing." },
+{ "window_store", ARR(pWindowStore), ARR(oWindowStore),
+  "x[m] packed into the fp8 window slot at slot_mapping[m] (e4m3 codes, a scale byte a block of 32); a negative "
+  "slot or one past the cache writes nothing." },
 { "token_map", ARR(pTokenMap), ARR(oTokenMap),
   "mapped[m] = table[ids[m]], -1 for an id outside [0, n_vocab)." },
 { "stream_gate_add", ARR(pStreamGate), ARR(oStreamGate),
@@ -2127,6 +2134,8 @@ SIMPLE("avx_index_topk", "index_topk", "attn", "top-k passed positions in positi
        L(index_topk)),
 SIMPLE("avx_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT,
        L(entry_store)),
+SIMPLE("avx_window_store", "window_store", "attn", "a key row packed into the fp8 window slot of a paged cache",
+       DT_FLOAT, L(window_store)),
 SIMPLE("avx_token_map", "token_map", "embed", "ids through an id table", DT_ANY, L(token_map)),
 SIMPLE("avx_stream_gate_add", "stream_gate_add", "norm", "normalized-dot gated write into hc streams",
        DT_FLOAT, L(stream_gate_add)),

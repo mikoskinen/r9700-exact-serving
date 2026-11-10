@@ -3392,6 +3392,246 @@ static void ds41_ofold_case(const Plugin& pl) {
            (long long)changed, first.empty() ? "" : "; first: ", first.c_str()));
 }
 
+/* ---- lever KVWIN (10.11.2026): DeepSeek-V4.1's window keys as the fp8 window slot (r4d_ds41_qrt.h ds_w8_*:
+ * 512 e4m3 codes and 16 scale bytes, 528 bytes instead of 1024), on the card, byte for byte:
+ *   window_store_fp8_bf16 over quant_roundtrip_fp8_bf16's rows (the window key's round trip, ue8m0, blocks of 32;
+ *       rows of mixed block scales 2^-40 .. 2^40, some blocks under the 1e-4 floor, some zero): every packed value
+ *       e4m3(code) x 2^(e-127) is the round-tripped bf16, bit for bit (host decode);
+ *   rmsnorm_rope_roundtrip_kv_store_fp8_bf16 at kv_dtype fp8_e4m3 against rmsnorm_rope_roundtrip_fp8_bf16 then
+ *       window_store_fp8_bf16: y and every cache byte, M 1..48, 64, 130;
+ *   ds41_attn_sparse_sink_d512_bf16 and ds41_attn_sparse_sink_rope_rt_d512_bf16 with window_format fp8_e4m3 over
+ *       the packed window against the same rows over the bf16 window: every output, at the TP4 rank's geometry (16
+ *       heads, window 128, 512 selections), M 1..48 (the decode band's forms), 64 and 130 (WMMA), window-only and
+ *       ratio 4 layers, bf16 and nvfp4 latents; and window-only at the drafter's window 133 (nk == window). */
+static void ds41_kvwin_case(const Plugin& pl) {
+    const char* row = "window_store_fp8_bf16";
+    if (!sel(row)) return;
+    const char* name = "lever KVWIN: the fp8 window slot gives the window keys back and every attention output bit for bit";
+    const RadKernelInfo* rw = find(pl, row);
+    const RadKernelInfo* rq = find(pl, "quant_roundtrip_fp8_bf16");
+    const RadKernelInfo* ra = find(pl, "ds41_attn_sparse_sink_d512_bf16");
+    const RadKernelInfo* ro = find(pl, "ds41_attn_sparse_sink_rope_rt_d512_bf16");
+    const RadKernelInfo* rn = find(pl, "rmsnorm_rope_roundtrip_fp8_bf16");
+    const RadKernelInfo* rk = find(pl, "rmsnorm_rope_roundtrip_kv_store_fp8_bf16");
+    const RadKernelInfo* re = find(pl, "entry_store_bf16");
+    if (!rw || !rq || !ra || !ro || !rn || !rk || !re) { ok(name, false, "row absent"); return; }
+    const int64_t D = 512, W8 = 264, rot = 64, tab = 16384, slots = 144, bs = 16;
+    int64_t miss = 0, packed = 0, bad_attn = 0, bad_fold = 0, bad_y = 0, bad_c = 0, rc_bad = 0, passes = 0;
+    std::string first;
+    std::mt19937 rng(9191);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto up = [&](const void* h, size_t b) {
+        void* d = dalloc(b);
+        if (d && b) st_memcpy(d, h, b, hipMemcpyHostToDevice);
+        return d;
+    };
+    auto w8val = [](const uint8_t* e, int d) {
+        const float sc = [&] { uint32_t u = (uint32_t)e[512 + d / 32] << 23; float f; std::memcpy(&f, &u, 4); return f; }();
+        return rad_fp8e4m3_to_f32(e[d]) * sc;
+    };
+    /* ---- the attention, over the round-tripped window as bf16 and packed */
+    struct Shape { int M, ratio, win; bool nv; };
+    std::vector<Shape> shapes;
+    for (int M = 1; M <= 48; ++M) shapes.push_back({ M, M % 3 == 0 ? 0 : 4, 128, M % 3 == 2 });
+    shapes.push_back({ 64, 4, 128, false });
+    shapes.push_back({ 130, 4, 128, true });
+    shapes.push_back({ 64, 0, 128, false });
+    shapes.push_back({ 40, 0, 133, false });
+    shapes.push_back({ 1, 0, 133, false });
+    for (const Shape& sh : shapes) {
+        const int S = std::min(sh.M, 4);
+        std::vector<std::pair<int, int>> seqs;
+        for (int s = 0; s < S; ++s) seqs.push_back({ sh.M / S + (s < sh.M % S ? 1 : 0), 3000 + 1500 * s + (int)(rng() % 900) });
+        K1Attn f = k1_attn_fix(rng, sh.ratio, 512, seqs);
+        f.win = sh.win;
+        const int64_t M = f.M, H = f.H, n = H * D, nslot = f.nwblk * f.bs;
+        /* window rows of mixed block scales, then the window key's round trip on the card */
+        for (int64_t r = 0; r < nslot; ++r)
+            for (int b = 0; b < 16; ++b) {
+                const int k = (int)(rng() % 100);
+                const float sc = k < 6 ? 1e-6f : k < 10 ? 0.0f : std::ldexp(1.0f, (int)(rng() % 81) - 40);
+                for (int i = 0; i < 32; ++i) f.wc[(size_t)(r * D + b * 32 + i)] = rad_f32_to_bf16(nd(rng) * sc);
+            }
+        void* dwc = up(f.wc.data(), f.wc.size() * 2);
+        void* dwp = dalloc((size_t)(nslot * W8 * 2));
+        std::vector<int32_t> sl((size_t)nslot);
+        for (int64_t i = 0; i < nslot; ++i) sl[(size_t)i] = (int32_t)i;
+        void* dsl = up(sl.data(), sl.size() * 4);
+        if (!dwc || !dwp || !dsl) { ok(name, false, "hipMalloc failed"); return; }
+        int rc = k1_launch(rq, { T(dwc, RAD_BF16, { nslot, D }) }, { PI("M", nslot), PI("n", D), PI("block", 32),
+                           PS("format", "fp8_e4m3"), PS("scale", "ue8m0"), PS("dtype", "bf16") });
+        if (rc == RAD_OK)
+            rc = k1_launch(rw, { T(dwc, RAD_BF16, { nslot, D }), T(dsl, RAD_I32, { nslot }), T(dwp, RAD_BF16, { f.nwblk, 1, f.bs, W8 }) },
+                           { PI("M", nslot), PI("n", D), PI("block_size", f.bs), PS("format", "fp8_e4m3"), PS("dtype", "bf16") });
+        if (rc != RAD_OK) { ++rc_bad; if (first.empty()) first = fmt("M=%d store rc %d", sh.M, rc); dfree_all(); continue; }
+        {   /* the packer: every value back */
+            std::vector<uint16_t> wr((size_t)(nslot * D));
+            std::vector<uint8_t> wp((size_t)(nslot * W8 * 2));
+            st_memcpy(wr.data(), dwc, wr.size() * 2, hipMemcpyDeviceToHost);
+            st_memcpy(wp.data(), dwp, wp.size(), hipMemcpyDeviceToHost);
+            for (int64_t r = 0; r < nslot; ++r)
+                for (int d = 0; d < D; ++d) {
+                    const float v = w8val(&wp[(size_t)(r * 528)], d);
+                    uint32_t u;
+                    std::memcpy(&u, &v, 4);
+                    const uint16_t want = wr[(size_t)(r * D + d)];
+                    miss += (want & 0x7fffu) > 0x7f80u ? (v == v) : (u != ((uint32_t)want << 16));
+                }
+            packed += nslot * D;
+        }
+        void* dq = up(f.q.data(), f.q.size() * 2);
+        void* dwbt = up(f.wbt.data(), f.wbt.size() * 4);
+        void* dwu = up(f.wused.data(), f.wused.size() * 4);
+        void* dpos = up(f.pos.data(), f.pos.size() * 4);
+        void* dcu = up(f.cu.data(), f.cu.size() * 4);
+        void* dsk = up(f.sink.data(), f.sink.size() * 4);
+        std::vector<float> cs((size_t)(tab * rot));
+        for (int64_t p = 0; p < tab; ++p)
+            for (int64_t i = 0; i < rot / 2; ++i) {
+                const float a = 6.4f * ((float)(rng() % 100000) / 100000.0f - 0.5f);
+                cs[(size_t)(p * rot + i)] = std::cos(a);
+                cs[(size_t)(p * rot + rot / 2 + i)] = std::sin(a);
+            }
+        void* dcs = up(cs.data(), cs.size() * 4);
+        void* dcc = sh.ratio ? up(f.cc.data(), f.cc.size() * 2) : nullptr;
+        void* dcbt = sh.ratio ? up(f.cbt.data(), f.cbt.size() * 4) : nullptr;
+        void* dsel = sh.ratio ? up(f.sel.data(), f.sel.size() * 4) : nullptr;
+        void* dpk = nullptr;
+        if (sh.nv && sh.ratio) {
+            std::vector<int32_t> page((size_t)f.ncblk);
+            for (int64_t i = 0; i < f.ncblk; ++i) page[(size_t)i] = (int32_t)i;
+            void* dpg = up(page.data(), page.size() * 4);
+            dpk = dalloc((size_t)(f.ncblk * slots * 2));
+            k1_launch(re, { T(dcc, RAD_BF16, { f.ncblk, D }), T(dpg, RAD_I32, { f.ncblk }),
+                            T(dpk, RAD_BF16, { f.ncblk, 1, sh.ratio, slots / sh.ratio }) },
+                      { PI("M", f.ncblk), PI("n", D), PI("block_size", sh.ratio), PS("dtype", "bf16"), PS("format", "nvfp4") });
+        }
+        const size_t ob = (size_t)(M * n * 2);
+        void* doA = dalloc(ob); void* doB = dalloc(ob);
+        if (!dq || !dwbt || !dwu || !dpos || !dcu || !dsk || !dcs || !doA || !doB) { ok(name, false, "hipMalloc failed"); return; }
+        const bool nv = dpk != nullptr;
+        auto ops = [&](void* o, bool w8) {
+            return std::vector<RadTensor>{
+                T(dq, RAD_BF16, { M, n }),
+                w8 ? T(dwp, RAD_BF16, { f.nwblk, 1, f.bs, W8 }) : T(dwc, RAD_BF16, { f.nwblk, 1, f.bs, D }),
+                T(dwbt, RAD_I32, { f.S, f.nwbt }), T(dwu, RAD_I32, { f.S }),
+                !f.ratio ? RadTensor{}
+                : nv     ? T(dpk, RAD_BF16, { f.ncblk, 1, f.ratio, slots / f.ratio })
+                         : T(dcc, RAD_BF16, { f.ncblk, 1, f.ratio, D / f.ratio }),
+                f.ratio ? T(dcbt, RAD_I32, { f.S, f.ncbt }) : RadTensor{},
+                f.ratio ? T(dsel, RAD_I32, { M, f.topk }) : RadTensor{},
+                T(dpos, RAD_I32, { M }), T(dcu, RAD_I32, { f.S + 1 }), T(dsk, RAD_F32, { H }), T(o, RAD_BF16, { M, n }) };
+        };
+        auto params = [&](bool w8, bool rt) {
+            std::vector<RadParam> pa = { PI("M", M), PI("heads", H), PI("dim", D), PI("window", f.win), PI("ratio", f.ratio),
+                                         PI("topk", f.topk), PF("scale", 1.0 / std::sqrt((double)D)), PS("dtype", "bf16") };
+            if (nv) pa.push_back(PS("latent_format", "nvfp4"));
+            if (w8) pa.push_back(PS("window_format", "fp8_e4m3"));
+            if (rt)
+                for (const RadParam& p : { PI("rot", rot), PI("off", D - rot), PS("mode", "gptj"), PI("inverse", 1),
+                                           PI("block", 32), PS("format", "fp8_e4m3"), PS("block_scale", "ue8m0") })
+                    pa.push_back(p);
+            return pa;
+        };
+        for (const bool rt : { false, true }) {
+            st_memset(doA, 0x11, ob);
+            st_memset(doB, 0x22, ob);
+            std::vector<RadTensor> tA = ops(doA, false), tB = ops(doB, true);
+            if (rt) { tA.push_back(T(dcs, RAD_F32, { tab, rot })); tB.push_back(T(dcs, RAD_F32, { tab, rot })); }
+            const int r1 = k1_launch(rt ? ro : ra, tA, params(false, rt)), r2 = k1_launch(rt ? ro : ra, tB, params(true, rt));
+            ++passes;
+            if (r1 != RAD_OK || r2 != RAD_OK) {
+                ++rc_bad;
+                if (first.empty()) first = fmt("M=%lld %s rc bf16 %d fp8 %d", (long long)M, rt ? "fold d" : "attn", r1, r2);
+                continue;
+            }
+            std::vector<uint16_t> oa((size_t)(M * n)), obv((size_t)(M * n));
+            st_memcpy(oa.data(), doA, ob, hipMemcpyDeviceToHost);
+            st_memcpy(obv.data(), doB, ob, hipMemcpyDeviceToHost);
+            int64_t d = 0;
+            for (size_t i = 0; i < oa.size(); ++i) d += oa[i] != obv[i];
+            (rt ? bad_fold : bad_attn) += d;
+            if (d && first.empty())
+                first = fmt("M=%lld ratio %d window %d %s%s: %lld of %lld outputs differ", (long long)M, f.ratio, f.win,
+                            nv ? "nvfp4" : "bf16", rt ? " fold d" : "", (long long)d, (long long)oa.size());
+            if (!rt && (M == 1 || M == 8 || M == 48) && f.ratio == 4) {
+                const double t1 = k1_time_us([&] { k1_launch(ra, ops(doA, false), params(false, false)); });
+                const double t2 = k1_time_us([&] { k1_launch(ra, ops(doB, true), params(true, false)); });
+                std::printf("  info  kvwin attn M=%lld ratio %d %s: bf16 window %.2f us, fp8 window %.2f us (warm)\n",
+                            (long long)M, f.ratio, nv ? "nvfp4" : "bf16", t1, t2);
+            }
+        }
+        dfree_all();
+    }
+    /* ---- fold c into the packed slot against rmsnorm_rope_roundtrip + window_store */
+    std::vector<int64_t> Ms;
+    for (int64_t M = 1; M <= 48; ++M) Ms.push_back(M);
+    Ms.push_back(64);
+    Ms.push_back(130);
+    for (const int64_t M : Ms) {
+        const int64_t nb = M / bs + 3;
+        std::vector<uint16_t> x((size_t)(M * D));
+        for (auto& v : x) v = rad_f32_to_bf16(nd(rng));
+        std::vector<float> w((size_t)D), cs((size_t)(tab * rot));
+        for (int64_t i = 0; i < D; ++i) w[(size_t)i] = (0.5f + 0.1f * nd(rng)) * std::ldexp(1.0f, (int)((i / 32) * 6) - 45);
+        for (auto& v : cs) v = std::cos(6.4f * ((float)(rng() % 100000) / 100000.0f - 0.5f));
+        std::vector<int32_t> pos((size_t)M), slot((size_t)M), perm((size_t)(nb * bs));
+        for (size_t i = 0; i < perm.size(); ++i) perm[i] = (int32_t)i;
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (int64_t m = 0; m < M; ++m) {
+            pos[(size_t)m] = (int32_t)(rng() % tab);
+            slot[(size_t)m] = rng() % 100 < 8 ? -1 : perm[(size_t)m];
+        }
+        if (M > 4) slot[(size_t)(M - 2)] = (int32_t)(nb * bs + 1);
+        const size_t cb = (size_t)(nb * bs * W8 * 2), yb = (size_t)(M * D * 2);
+        std::vector<uint8_t> c0(cb);
+        for (auto& v : c0) v = (uint8_t)(rng() & 0xff);
+        void* dx = up(x.data(), yb); void* dw = up(w.data(), (size_t)D * 4); void* dcs = up(cs.data(), cs.size() * 4);
+        void* dp = up(pos.data(), (size_t)M * 4); void* dsl = up(slot.data(), (size_t)M * 4);
+        void* dyA = dalloc(yb); void* dyB = dalloc(yb); void* dcA = up(c0.data(), cb); void* dcB = up(c0.data(), cb);
+        if (!dx || !dw || !dcs || !dp || !dsl || !dyA || !dyB || !dcA || !dcB) { ok(name, false, "hipMalloc failed"); return; }
+        std::vector<RadParam> pn = { PI("M", M), PI("n", D), PF("eps", 1e-6), PI("n_head", 1), PI("head_dim", D),
+                                     PI("rot", rot), PI("off", D - rot), PS("mode", "gptj"), PI("inverse", 0), PI("block", 32),
+                                     PS("format", "fp8_e4m3"), PS("scale", "ue8m0"), PS("dtype", "bf16") };
+        std::vector<RadParam> pk = pn;
+        pk.push_back(PI("block_size", bs));
+        pk.push_back(PS("kv_dtype", "fp8_e4m3"));
+        int r1 = k1_launch(rn, { T(dx, RAD_BF16, { M, D }), T(dw, RAD_F32, { D }), T(dyA, RAD_BF16, { M, D }),
+                                 T(dcs, RAD_F32, { tab, rot }), T(dp, RAD_I32, { M }) }, pn);
+        if (r1 == RAD_OK)
+            r1 = k1_launch(rw, { T(dyA, RAD_BF16, { M, D }), T(dsl, RAD_I32, { M }), T(dcA, RAD_BF16, { nb, 1, bs, W8 }) },
+                           { PI("M", M), PI("n", D), PI("block_size", bs), PS("format", "fp8_e4m3"), PS("dtype", "bf16") });
+        const int r2 = k1_launch(rk, { T(dx, RAD_BF16, { M, D }), T(dw, RAD_F32, { D }), T(dyB, RAD_BF16, { M, D }),
+                                       T(dcs, RAD_F32, { tab, rot }), T(dp, RAD_I32, { M }), T(dsl, RAD_I32, { M }),
+                                       T(dcB, RAD_BF16, { nb, 1, bs, W8 }) }, pk);
+        if (r1 != RAD_OK || r2 != RAD_OK) {
+            ++rc_bad;
+            if (first.empty()) first = fmt("fold c M=%lld rc pair %d fold %d", (long long)M, r1, r2);
+            dfree_all();
+            continue;
+        }
+        std::vector<uint8_t> ya(yb), ybv(yb), ca(cb), cbv(cb);
+        st_memcpy(ya.data(), dyA, yb, hipMemcpyDeviceToHost);
+        st_memcpy(ybv.data(), dyB, yb, hipMemcpyDeviceToHost);
+        st_memcpy(ca.data(), dcA, cb, hipMemcpyDeviceToHost);
+        st_memcpy(cbv.data(), dcB, cb, hipMemcpyDeviceToHost);
+        int64_t dy = 0, dc = 0;
+        for (size_t i = 0; i < yb; ++i) dy += ya[i] != ybv[i];
+        for (size_t i = 0; i < cb; ++i) dc += ca[i] != cbv[i];
+        bad_y += dy;
+        bad_c += dc;
+        if ((dy || dc) && first.empty())
+            first = fmt("fold c M=%lld: y %lld, cache %lld bytes differ", (long long)M, (long long)dy, (long long)dc);
+        dfree_all();
+    }
+    ok(name, miss == 0 && bad_attn == 0 && bad_fold == 0 && bad_y == 0 && bad_c == 0 && rc_bad == 0 && packed > 0,
+       fmt("%lld window values packed, %lld do not decode; %lld attention passes (1..48 rows, 64, 130; ratio 0 / 4, bf16 / "
+           "nvfp4 latents, window 128 / 133; attn and fold d): %lld / %lld outputs differ; fold c fp8 (1..48, 64, 130): y %lld, "
+           "cache %lld bytes differ; %lld launch failures%s%s",
+           (long long)packed, (long long)miss, (long long)passes, (long long)bad_attn, (long long)bad_fold, (long long)bad_y,
+           (long long)bad_c, (long long)rc_bad, first.empty() ? "" : "; first: ", first.c_str()));
+}
+
 /* ------------------------------------------------ the k-only form, against the pair it replaces
  *
  * `n_head` 0 is what the QSA indexer asks for: its query heads are already plain `head_dim` runs
@@ -35598,6 +35838,7 @@ static void device_phase(const Plugin& pl) {
         ds41_ggfold_case(pl, "rmsnorm_gemm_nt_ggml_qk32", 1);
         ds41_ggfold_case(pl, "swiglu_clamped_gemm_nt_ggml_qk256", 2);
         ds41_ggfold_case(pl, "swiglu_clamped_gemm_nt_ggml_qk32", 2);
+        ds41_kvwin_case(pl);
         qsa_qprep_case(pl);
         topk_scatter_case(pl);
         router_gemm_fused_case(pl);

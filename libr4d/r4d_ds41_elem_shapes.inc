@@ -105,6 +105,21 @@ extern "C" int r4d_shape_entry_store(const RadParam* p, int n_p, int operand, Ra
     R4D_PICK(l);
 }
 
+/* window_store (lever KVWIN): kv_store's slot mapping (two blocks of slack, no slot repeated), the cache in
+ * the fp8 window slot's bf16 slots ((n + n/32) bytes rounded up to 16). */
+extern "C" int r4d_shape_window_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bs = pi(p, n_p, "block_size");
+    const char* f = r4d_pgets(p, n_p, "format");
+    if (M <= 0 || n < 32 || n % 32 || bs <= 0 || !f || std::strcmp(f, "fp8_e4m3")) return RAD_E_UNSUPPORTED;
+    const int64_t nb = (M + bs - 1) / bs + 2, slot = (n + n / 32 + 15) / 16 * 16 / 2;
+    const RadOpdDesc l[] = {
+        opd(dt_act(p, n_p, "dtype"), M, n),                  /* x */
+        opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),   /* slot_mapping */
+        opd((uint32_t)RAD_BF16, nb, 1, bs, slot),           /* kv_cache */
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_router_scored_topk(const RadParam* p, int n_p, int operand,
                                             RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
@@ -167,10 +182,15 @@ extern "C" int r4d_shape_rmsnorm_rope_roundtrip_kv_store(const RadParam* p, int 
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bs = pi(p, n_p, "block_size");
     if (M <= 0 || n < 2 || (n & 1) || bs <= 0) return RAD_E_UNSUPPORTED;
     const int64_t nb = (M + bs - 1) / bs + 2;
+    /* kv_dtype fp8_e4m3: window_store's fp8 window slot in bf16 slots */
+    const char* kd = r4d_pgets(p, n_p, "kv_dtype");
+    const bool w8 = kd && !std::strcmp(kd, "fp8_e4m3");
+    if (w8 && n % 32) return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = {
         opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
         opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),   /* slot_mapping */
-        opd(dt_act(p, n_p, "kv_dtype"), nb, 1, bs, n),       /* kv_cache */
+        w8 ? opd((uint32_t)RAD_BF16, nb, 1, bs, (n + n / 32 + 15) / 16 * 16 / 2)
+           : opd(dt_act(p, n_p, "kv_dtype"), nb, 1, bs, n),  /* kv_cache */
     };
     R4D_PICK(l);
 }

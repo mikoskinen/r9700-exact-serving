@@ -471,6 +471,12 @@ struct Model {
      * attn_sparse_sink latent_format nvfp4). Lossless: the latent is quant_roundtrip(fp4_e2m1, e4m3, 16)
      * output, which the packing reproduces bit for bit (docs/OPS.md "Packed compressed latent"). */
     bool lnv = false;
+    /* RADIANCE_DS41_KVWIN_FP8=1 (lever KVWIN; "trunk": the trunk's window only): the window caches -- the trunk's
+     * kv_window (w8) and the DSpark drafter's kv_dspark (w8d) -- hold each 512-value key packed (528 bytes instead
+     * of 1024: e4m3 codes, a scale byte a block of 32; window_store / rmsnorm_rope_roundtrip_kv_store kv_dtype /
+     * attn_sparse_sink window_format fp8_e4m3). Lossless: the window key is quant_roundtrip(fp8_e4m3, ue8m0, 32)
+     * output over the whole row, which the packing reproduces bit for bit (docs/OPS.md window_store). */
+    bool w8 = false, w8d = false;
     rad_buf sel_part = 0;
     rad_op sel_gather = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
@@ -1232,6 +1238,13 @@ static void index_mode(Model& m) {
     const char* lx = std::getenv("RADIANCE_DS41_LATENT");
     m.lnv = lx && !std::strcmp(lx, "nvfp4") && m.c.window % 32 == 0;
     idx_balance_env();
+    m.w8 = m.w8d = false;
+    if (const char* wx = std::getenv("RADIANCE_DS41_KVWIN_FP8"); wx && *wx && std::strcmp(wx, "0") && std::strcmp(wx, "off")) {
+        /* the packed slot's readers take the 512-wide latent; the trunk's window keys end where its selections
+         * start, so a multiple of 32 there (the kernels' key blocks) */
+        m.w8 = m.c.head_dim == 512 && m.c.window % 32 == 0;
+        m.w8d = m.c.head_dim == 512 && std::strcmp(wx, "trunk") != 0;
+    }
 }
 
 /* RADIANCE_DS41_ARENA_DECODE_ROWS=<rows> (lever VA "arena"): the core adds an activation-arena level
@@ -1405,14 +1418,29 @@ static int buffers(RadBuilder* b, Model& m) {
  * index group holds one entry a block of `ratio` slots (entry_store fixes the block size); the
  * compressor's tail is a per-sequence ring of r + max_spec f32 rows. Declared identically on every
  * rank (an attention-zero rank zeroes them). */
+/* A window key's bf16 slots: hd, or (lever KVWIN) the fp8 window slot's (hd + hd/32) bytes rounded up to 16. */
+static int64_t window_slots(int64_t hd, bool w8) { return w8 ? (hd + hd / 32 + 15) / 16 * 16 / 2 : hd; }
 static rad_kvgroup win_group(RadBuilder* b, Model& m) {
     RadKVGroupDecl d{};
     d.kind = RAD_KV_WINDOW;
     d.dtype = RAD_BF16;
     d.window = m.c.window + m.g.max_spec;
     d.n_head_kv = 1;
-    d.head_dim = m.c.head_dim / 2;
+    d.head_dim = window_slots(m.c.head_dim, m.w8) / 2;
     return rad_decl_kv_group(b, m.nm.f("kv_window"), &d);
+}
+/* The window key's store into a window group: kv_store of its K and V halves, or (lever KVWIN) window_store's
+ * packed slot. Declared right after the group, its block_size sets the group's. */
+static rad_op window_key_store(RadBuilder* b, int64_t rows, int64_t hd, bool w8, rad_buf x) {
+    if (w8)
+        return op(b, "window_store",
+                  { RAD_RANGE("M", 1, rows), RAD_INT("n", hd), RAD_INT("block_size", 16),
+                    RAD_STR("format", "fp8_e4m3"), RAD_STR("dtype", "bf16") },
+                  {}, { x }, {});
+    return op(b, "kv_store",
+              { RAD_RANGE("M", 1, rows), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
+                RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") },
+              {}, { x }, {});
 }
 static rad_kvgroup tail_group(RadBuilder* b, Model& m, int64_t r) {
     RadKVGroupDecl d{};
@@ -1617,10 +1645,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
          * but never issued, then zeroed (rad_kv_group_zero); the block's output is a fill of zeros
          * the all-reduce adds. */
         if (!m.win && !(m.win = win_group(b, m))) return RAD_E_INVAL;
-        L.kv_st = op(b, "kv_store",
-                     { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
-                       RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") },
-                     {}, { m.kvn }, {});
+        L.kv_st = window_key_store(b, T, hd, m.w8, m.kvn);
         if (!m.win_bs && (m.win_bs = rad_kv_block_size(b, m.win)) < 1) return RAD_E_INVAL;
         DS_TRY(rad_bind_layer_kv(b, l, m.win));
         DS_TRY(rad_kv_group_zero(b, m.win));
@@ -1681,10 +1706,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.kv_q = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", m.kvn);
         }
         if (!m.win && !(m.win = win_group(b, m))) return RAD_E_INVAL;
-        L.kv_st = op(b, "kv_store",
-                     { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
-                       RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") },
-                     {}, { m.kvn }, {});
+        L.kv_st = window_key_store(b, T, hd, m.w8, m.kvn);
         if (!m.win_bs) {
             m.win_bs = rad_kv_block_size(b, m.win);
             if (m.win_bs < 1) return RAD_E_INVAL;
@@ -1698,7 +1720,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                               RAD_INT("head_dim", hd), RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope),
                               RAD_STR("mode", "gptj"), RAD_INT("inverse", 0), RAD_INT("block", 32),
                               RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16"),
-                              RAD_INT("block_size", m.win_bs), RAD_STR("kv_dtype", "bf16") },
+                              RAD_INT("block_size", m.win_bs), RAD_STR("kv_dtype", m.w8 ? "fp8_e4m3" : "bf16") },
                             { L.kv_norm }, { m.kv, cs }, { m.kvn });
             if (L.kv_fs) g_sw_kvf_ok.store(1, std::memory_order_relaxed);
         }
@@ -1857,6 +1879,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                      RAD_INT("topk", r > 0 ? c.itopk : 0),
                                      RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
         if (m.lnv && r > 0) ap.push_back(RAD_STR("latent_format", "nvfp4"));
+        if (m.w8) ap.push_back(RAD_STR("window_format", "fp8_e4m3"));
         L.attn = op(b, "attn_sparse_sink", ap,
                     { L.sinks },
                     r > 0 ? std::initializer_list<rad_buf>{ m.q, m.sel }
@@ -2186,17 +2209,21 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
         L.kv_n = rmsnorm(b, m, Q, L.kv_norm, hd, d.kv_, d.kvn);
         L.kv_rope = rope_rows(b, m, Q, 1, hd, 0, d.kvn, m.cs_a);
         L.kv_q = roundtrip(b, Q, hd, 32, "fp8_e4m3", "ue8m0", d.kvn);
-        L.kv_st = op(b, "kv_store",
-                     { RAD_RANGE("M", 1, Q), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
-                       RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", "bf16") },
-                     {}, { d.kvn }, {});
+        L.kv_st = m.w8d ? op(b, "window_store",
+                             { RAD_RANGE("M", 1, Q), RAD_INT("n", hd), RAD_INT("block_size", d.kv_bs),
+                               RAD_STR("format", "fp8_e4m3"), RAD_STR("dtype", "bf16") },
+                             {}, { d.kvn }, {})
+                        : op(b, "kv_store",
+                             { RAD_RANGE("M", 1, Q), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
+                               RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", "bf16") },
+                             {}, { d.kvn }, {});
         /* The window of `c.window` context keys before the anchor plus the block's own `block` keys,
          * for every row: each row is placed at its block's last position (apos). */
-        L.attn = op(b, "attn_sparse_sink",
-                    { RAD_RANGE("M", 1, Q), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
-                      RAD_INT("window", c.window + d.block), RAD_INT("ratio", 0), RAD_INT("topk", 0),
-                      RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") },
-                    { L.sinks }, { d.q, d.apos }, { d.o });
+        std::vector<RadParam> dap = { RAD_RANGE("M", 1, Q), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
+                                      RAD_INT("window", c.window + d.block), RAD_INT("ratio", 0), RAD_INT("topk", 0),
+                                      RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
+        if (m.w8d) dap.push_back(RAD_STR("window_format", "fp8_e4m3"));
+        L.attn = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
         L.o_rope = rope_rows(b, m, Q, g.n_head, hd, 1, d.o, m.cs_a);
         L.o_q = roundtrip(b, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
         const int64_t gd = HD / m.gr;
@@ -2335,12 +2362,10 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     kd.dtype = RAD_BF16;
     kd.window = c.window + d.block + g.max_spec;
     kd.n_head_kv = 1;
-    kd.head_dim = hd / 2;
-    const std::vector<RadParam> stp = { RAD_RANGE("M", 1, T), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
-                                        RAD_INT("block_size", 16), RAD_STR("kv_dtype", "bf16") };
+    kd.head_dim = window_slots(hd, m.w8d) / 2;
     if (m.zero) {
         if (!(d.kv = rad_decl_kv_group(b, nm.f("kv_dspark"), &kd))) return RAD_E_INVAL;
-        d.sizing = op(b, "kv_store", stp, {}, { d.ckvn }, {});   /* fixes the block size; never issued */
+        d.sizing = window_key_store(b, T, hd, m.w8d, d.ckvn);   /* fixes the block size; never issued */
     } else {
         d.c_tab = op(b, "rope_table",
                      { RAD_RANGE("M", 1, T), RAD_INT("rot", c.rope), RAD_F64("theta", c.theta),
@@ -2354,7 +2379,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             L.d_kvrope = rope_rows(b, m, T, 1, hd, 0, d.ckvn, m.cs_a);
             L.d_kvq = roundtrip(b, T, hd, 32, "fp8_e4m3", "ue8m0", d.ckvn);
             if (!d.kv && !(d.kv = rad_decl_kv_group(b, nm.f("kv_dspark"), &kd))) return RAD_E_INVAL;
-            L.d_kvst = op(b, "kv_store", stp, {}, { d.ckvn }, {});
+            L.d_kvst = window_key_store(b, T, hd, m.w8d, d.ckvn);
             if (!L.d_kv || !L.d_kvn || !L.d_kvrope || !L.d_kvst) return RAD_E_INVAL;
         }
         if (!d.c_tab || !d.c_fc || !d.c_norm) return RAD_E_INVAL;
@@ -2855,6 +2880,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                    [](const Layer& L) { return L.moe.sone_live != nullptr; }),
                 g_sw_one.load(std::memory_order_relaxed), qnote, snote);
     }
+    /* Lever KVWIN (RADIANCE_DS41_KVWIN_FP8): said only when asked for, so an unset start logs what it did. */
+    if (const char* wx = std::getenv("RADIANCE_DS41_KVWIN_FP8"); wx && *wx && std::strcmp(wx, "0") && std::strcmp(wx, "off")) {
+        const int64_t wb = 2 * window_slots(c.head_dim, true), pb = 2 * window_slots(c.head_dim, false);
+        rad_note(b, "lever KVWIN: window keys fp8_e4m3, %lld bytes a key instead of %lld: kv_window %s, kv_dspark %s "
+                    "(RADIANCE_DS41_KVWIN_FP8=%s)",
+                 (long long)wb, (long long)pb, m.w8 ? "packed" : "bf16",
+                 !m.dsp.on ? "none" : m.w8d ? "packed" : "bf16", wx);
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever KVWIN: the window caches hold each key as fp8_e4m3 codes and a "
+                            "scale byte a block of 32, %lld bytes a key and layer instead of %lld: kv_window %s at %zu "
+                            "layers, kv_dspark %s (RADIANCE_DS41_KVWIN_FP8=%s; window %lld, latent %lld wide)\n",
+                    (long long)wb, (long long)pb, m.w8 ? "packed" : "bf16 (the window is not a multiple of 32)",
+                    (size_t)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.kv_st != 0; }),
+                    !m.dsp.on ? "not declared" : m.w8d ? "packed" : "bf16", wx,
+                    (long long)c.window, (long long)c.head_dim);
+    }
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
@@ -2916,8 +2957,11 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
         RAD_ISSUE_N(x, L.d_kvn, T, brows(d.ckv, T), RAD_W(L.kv_norm), brows(d.ckvn, T));
         RAD_ISSUE_N(x, L.d_kvrope, T, brows(d.ckvn, T), brows(m.cs_a, g.max_ctx), pos);
         if (L.d_kvq) RAD_ISSUE_N(x, L.d_kvq, T, brows(d.ckvn, T));
-        RAD_ISSUE_N(x, L.d_kvst, T, bcol(d.ckvn, 0, hd / 2, T), bcol(d.ckvn, hd / 2, hd / 2, T),
-                    praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+        if (m.w8d)   /* window_store: the row packed into its slot (lever KVWIN) */
+            RAD_ISSUE_N(x, L.d_kvst, T, brows(d.ckvn, T), praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+        else
+            RAD_ISSUE_N(x, L.d_kvst, T, bcol(d.ckvn, 0, hd / 2, T), bcol(d.ckvn, hd / 2, hd / 2, T),
+                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
     }
 }
 
@@ -2967,8 +3011,11 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.kv_rope, T, brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos);
             if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(d.kvn, T));
             /* The block's keys past the committed end; the next context pass overwrites them. */
-            RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
-                        praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+            if (m.w8d)
+                RAD_ISSUE_N(x, L.kv_st, T, brows(d.kvn, T), praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+            else
+                RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
+                            praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
             RAD_ISSUE_N(x, L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
                         praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
                         RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
@@ -3246,8 +3293,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto kv_st = [&] {
                 if (kvfold) return;   /* kv_fs stored the row */
-                RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
-                            praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
+                if (m.w8)             /* window_store: the row packed into its slot (lever KVWIN) */
+                    RAD_ISSUE_N(x, L.kv_st, T, brows(m.kvn, T), praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
+                else
+                    RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
+                                praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
             };
             const auto c_gemm = [&] {
                 if (L.src)
