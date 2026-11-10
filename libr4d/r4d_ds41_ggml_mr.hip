@@ -432,7 +432,8 @@ bool mr_tab(const R4dGgMrCall& c, int* H, int* R, int* cap, int* WN) {
 
 bool mr_pick(const R4dGgMrCall& c, MrForm* f) {
     int H = 4, R = c.N >= 4096 ? 2 : 1, cap = 0, WN = 0, w64 = 0;
-    if (g_mr_pin_h <= 0 && !c.f32out) (void)mr_tab(c, &H, &R, &cap, &WN);
+    /* The table under the runtime switch only: a pin, and the bench's forced rule (h -1), keep their own form. */
+    if (g_mr_pin_h == 0 && !c.f32out) (void)mr_tab(c, &H, &R, &cap, &WN);
     if (g_mr_pin_h > 0) {
         H = g_mr_pin_h;
         R = g_mr_pin_r > 0 ? g_mr_pin_r : 1;
