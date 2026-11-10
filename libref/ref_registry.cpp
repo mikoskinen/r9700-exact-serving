@@ -352,6 +352,16 @@ static const RadParamSpec pDflashTree[] = { P_INT("M"), P_INT("steps"), P_INT("t
 static const RadOperandSpec oDflashTree[] = { OPD("cand"), OPD("unary"), OPD_O("hp"),
                                               OPD("anchor"), WGT("pred"), WGT("succ"),
                                               OUT("tokens"), OUT("parents") };
+static const RadParamSpec pDsparkConf[] = { P_INT("M"), P_INT("steps"), P_INT("n_embd"),
+                                            P_INT("rank"), P_INT("n_vocab"), P_INTO("anchor_stride"),
+                                            P_F64O("bias"), P_STR("dtype") };
+static const RadOperandSpec oDsparkConf[] = { OPD("x"), OPD("anchor"), OPD("tokens"), WGT("pred"),
+                                              OPD("w"), OUT("conf") };
+static const RadParamSpec pDsparkAlt[] = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
+                                           P_INT("rank"), P_INT("n_vocab"), P_INTO("anchor_stride"),
+                                           P_INT("n_alt"), P_STR("dtype") };
+static const RadOperandSpec oDsparkAlt[] = { OPD("cand"), OPD("unary"), OPD("anchor"), OPD("tokens"),
+                                             WGT("pred"), WGT("succ"), OUT("alt") };
 
 static const RadParamSpec pRmsHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                              P_STR("dtype"), P_F64O("wadd") };
@@ -1541,6 +1551,15 @@ static const RadOpSchema kSchemas[] = {
   "with log probability parent + log_softmax(score / temp) over them, and each round selects the "
   "unselected child with the largest (ties to the first pushed). tokens[j-1] and parents[j-1] are "
   "the j-th selected node and its parent's index (0 the anchor)." },
+{ "dspark_conf", ARR(pDsparkConf), ARR(oDsparkConf),
+  "DSpark's confidence head over a query pass: conf[s, j] = bias + w[:n_embd] . x[s*steps+j] + "
+  "w[n_embd:] . pred[pid], pid the anchor (anchor[s*anchor_stride]) at j = 0 and tokens[s, j-1] "
+  "after, an out-of-range pid adding nothing; f32. A logit for proposal j; it changes no proposal." },
+{ "dspark_alt", ARR(pDsparkAlt), ARR(oDsparkAlt),
+  "The DSpark walk's n_alt next-best first proposals: row 0's candidates scored as dflash_select "
+  "scores them, the best whose id is valid and not tokens[s, 0] (ties to the lower index), each "
+  "continued greedily over rows 1..steps-1 as dflash_select walks; alt[s, a*steps + l], -1 for a "
+  "branch with no candidate." },
 { "givens_dense_quant", ARR(pGivensDense), ARR(oGivensDense),
   "ParoQuant's activation quantiser with the rotation as a dense per-group matrix: y = T (x / "
   "rscale) for each of `parts` rotated copies, T the [128, 128] f16 matrix a (part, 128-column "
@@ -2675,6 +2694,12 @@ SIMPLE("ref_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
        "Full-vocabulary greedy Markov walk with F32 base logits",
        "f32 logits, bf16 codebooks, f32/i32 tile winners, i32 tokens out",
        ref_dflash_markov_greedy_f32),
+SIMPLE("ref_dspark_conf", "dspark_conf", "draft",
+       "DSpark's confidence head over a query pass's rows",
+       "bf16 rows and table, f32 weights and logits, i32 ids", ref_dspark_conf),
+SIMPLE("ref_dspark_alt", "dspark_alt", "draft",
+       "the DSpark walk's next-best first proposals, each walked on",
+       "i32 candidates and ids, f32 unary, bf16 codebooks", ref_dspark_alt),
 SIMPLE("ref_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, bf16 codebooks, i32 tokens and parents out", ref_dflash_tree),

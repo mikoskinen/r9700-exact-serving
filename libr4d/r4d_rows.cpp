@@ -817,6 +817,29 @@ static const RadOperandSpec oDflashTree[] = {
     { "tokens",  RAD_OPD_OUT,    0 },
     { "parents", RAD_OPD_OUT,    0 },
 };
+/* DSpark beside its walk (r4d_dspark_extra.hip): the confidence head over a query pass's rows, and
+ * the walk's next-best first proposals each continued by the walk. */
+static const RadParamSpec pDsparkConf[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "steps", RAD_P_INT, RAD_REQUIRED },
+    { "n_embd", RAD_P_INT, RAD_REQUIRED }, { "rank", RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED }, { "anchor_stride", RAD_P_INT, RAD_OPTIONAL },
+    { "bias", RAD_P_F64, RAD_OPTIONAL }, { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oDsparkConf[] = {
+    { "x", RAD_OPD_IN, 0 }, { "anchor", RAD_OPD_IN, 0 }, { "tokens", RAD_OPD_IN, 0 },
+    { "pred", RAD_OPD_WEIGHT, 0 }, { "w", RAD_OPD_IN, 0 }, { "conf", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pDsparkAlt[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "steps", RAD_P_INT, RAD_REQUIRED },
+    { "top_k", RAD_P_INT, RAD_REQUIRED }, { "rank", RAD_P_INT, RAD_REQUIRED },
+    { "n_vocab", RAD_P_INT, RAD_REQUIRED }, { "anchor_stride", RAD_P_INT, RAD_OPTIONAL },
+    { "n_alt", RAD_P_INT, RAD_REQUIRED }, { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oDsparkAlt[] = {
+    { "cand", RAD_OPD_IN, 0 }, { "unary", RAD_OPD_IN, 0 }, { "anchor", RAD_OPD_IN, 0 },
+    { "tokens", RAD_OPD_IN, 0 }, { "pred", RAD_OPD_WEIGHT, 0 }, { "succ", RAD_OPD_WEIGHT, 0 },
+    { "alt", RAD_OPD_OUT, 0 },
+};
 
 /* ------------------------------------------------------------------------------ collectives */
 static const RadParamSpec pAllReduce[] = {
@@ -3657,6 +3680,14 @@ static const RadOpSchema kSchemas[] = {
            "probability parent + log_softmax(score / temp) over them; each round takes the largest "
            "untaken child (ties to the first pushed). tokens and parents list the taken nodes in "
            "order, a parent as its node index, 0 for the anchor."),
+    SCHEMA("dspark_conf", pDsparkConf, oDsparkConf,
+           "DSpark's confidence head over a query pass: conf[s, j] = bias + w[:n_embd] . x[s*steps+j] "
+           "+ w[n_embd:] . pred[pid], pid the anchor at j = 0 and tokens[s, j-1] after; f32. A "
+           "logit for proposal j; it changes no proposal."),
+    SCHEMA("dspark_alt", pDsparkAlt, oDsparkAlt,
+           "The DSpark walk's n_alt next-best first proposals (dflash_select's row-0 scores, the walk's "
+           "own first proposal and invalid ids left out, ties to the lower index), each continued "
+           "greedily over rows 1..steps-1: alt[s, a*steps + l]; -1 for a branch with no candidate."),
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
            "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
@@ -4979,6 +5010,14 @@ static const RadConstraint cDflashTree[] = {
     C_GE("steps", 1), C_LE("steps", 63), C_GE("top_k", 1), C_LE("top_k", 32),
     C_DIV("rank", 32), C_LE("rank", 512), C_GE("nodes", 1), C_LE("nodes", 63),
     C_IN("dtype", "bf16"),
+};
+/* dspark_alt keeps the candidates' scores and the predecessor row in LDS; dspark_conf any width. */
+static const RadConstraint cDsparkConf[] = {
+    C_GE("steps", 1), C_GE("n_embd", 1), C_GE("rank", 1), C_GE("n_vocab", 1), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cDsparkAlt[] = {
+    C_GE("steps", 1), C_GE("top_k", 1), C_LE("top_k", 32), C_GE("rank", 1), C_LE("rank", 512),
+    C_GE("n_alt", 1), C_LE("n_alt", 4), C_IN("dtype", "bf16"),
 };
 /* The sandwich-norm joins hold 24 elements a thread over a 256-thread block (n <= 6144), and the
  * route form quantises in whole 128-column groups. pair_argmax takes any row; expert_scale's top_k
@@ -10330,6 +10369,23 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDflashTree), NOTUNE,
   nullptr, nullptr, r4d_rad_dflash_tree, nullptr, nullptr, nullptr, nullptr },
+
+{ "dspark_conf_bf16", "dspark_conf", "dflash",
+  "DSpark's confidence head: a logit a query row from its pre-norm hidden and its predecessor's "
+  "Markov row, one workgroup a row",
+  "any width; the predecessor table replicated over the vocabulary",
+  "bf16 rows and table, f32 weights and logits, i32 anchor and proposals",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDsparkConf), NOTUNE,
+  nullptr, nullptr, r4d_rad_dspark_conf, nullptr, nullptr, nullptr, nullptr },
+
+{ "dspark_alt_bf16", "dspark_alt", "dflash",
+  "The DSpark walk's next-best first proposals, each continued by the walk, one workgroup a sequence",
+  "top_k <= 32, rank <= 512, n_alt <= 4: the scores and the predecessor row are LDS extents",
+  "i32 candidates, anchor, proposals and branches, f32 unary, bf16 codebooks",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDsparkAlt), NOTUNE,
+  nullptr, nullptr, r4d_rad_dspark_alt, nullptr, nullptr, nullptr, nullptr },
 
 /* pair_argmax, the sandwich-norm joins and expert_scale. The joins and expert_scale have no
  * opd_shape: libref has no row for them, and tests/r4d_emu holds their source to the replaced chain

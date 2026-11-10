@@ -227,6 +227,8 @@ set(R4D_UNITS
   "r4d_ds41_ggml_mr64|-mwavefrontsize64"
   # GGUF MXFP4 blocks (type=mxfp4) for gemm_nt_ggml and moe_gemm_ggml: the DSpark drafter's experts.
   "r4d_ds41_mxfp4|"
+  # DSpark beside its walk: the confidence head (dspark_conf) and the walk's next-best first proposals (dspark_alt).
+  "r4d_dspark_extra|"
 )
 
 set(R4D_SRC "")
