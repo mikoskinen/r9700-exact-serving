@@ -8,10 +8,16 @@
  * near the f16 top); activations: random bf16 with zeros of both signs, subnormals, huge values (products and sums
  * that overflow to inf, inf - inf NaNs) and infinities.
  *
- *   r4d_emu_ds41pf [quick]      quick: one K, two M */
+ * Lever GPF-b (r4d_ds41_f32pf.hip): every tiled gemm_nt_f32 form against the stock gemm_nt_f32 (r4d_glm.hip's
+ * launcher with the switch off, the form it picks at that M) at the real K 5120 and N 96 (router, a quarter of 384),
+ * 384 and 1024 (compressor kv | gate), M 49 / 64 / 97 / 130, for f32 weights and for bf16 weights (the
+ * RADIANCE_DS41_ROUTER_BF16 storage), pitches past the widths; tail columns of the output pitch must stay untouched.
+ *
+ *   r4d_emu_ds41pf [quick]      quick: one K, two M (and fewer f32 cases) */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_ds41_ggml_pf.h"
+#include "r4d_plugin.h"
 
 #include <cmath>
 #include <cstdint>
@@ -25,6 +31,9 @@ int r4d_gg_pf_emu_stock(const R4dGgPfCall& c);
 extern "C" void r4d_gg_pf_pin(int code);
 extern "C" const char* r4d_gg_pf_last();
 extern "C" int r4d_gg_pf_forms(int* out, int cap);
+extern "C" void r4d_f32pf_pin(int code);
+extern "C" const char* r4d_f32pf_last();
+extern "C" int r4d_f32pf_forms(int* out, int cap);
 
 namespace {
 
@@ -139,6 +148,73 @@ int main(int argc, char** argv) {
         }
     }
     std::printf("INFO stock reference outputs: %lld finite, %lld inf, %lld NaN\n", g_fin, g_inf, g_nan);
+    /* ---- lever GPF-b: gemm_nt_f32's tiled form vs the stock launcher */
+    {
+        const int nfb = r4d_f32pf_forms(fbuf, 64);
+        struct F32Shape { int N, K; };
+        const std::vector<F32Shape> fsh = quick ? std::vector<F32Shape>{ { 96, 5120 } }
+                                                : std::vector<F32Shape>{ { 96, 5120 }, { 384, 5120 }, { 1024, 5120 } };
+        const std::vector<int> fM = quick ? std::vector<int>{ 49, 97 } : std::vector<int>{ 49, 64, 97, 130 };
+        int fcases = 0, ffails = 0;
+        for (const F32Shape& sh : fsh) {
+            const int N = sh.N, K = sh.K;
+            for (int M : fM) {
+                if (N >= 1024 && M > 64) continue;   /* emulator time */
+                const int xp = K + 8, yp = N + 3;
+                std::vector<uint16_t> x((size_t)M * xp);
+                for (int m = 0; m < M; ++m) { const int r8 = (int)(rnd() % 8); fill_row(x.data() + (size_t)m * xp, K, r8 == 0 ? 1 : r8 == 1 ? 2 : 0); }
+                for (int bf = 0; bf < 2; ++bf) {
+                    /* weights: random bf16-representable values (zeros, subnormals, a few huge), as f32 or as bf16 */
+                    std::vector<uint16_t> wb((size_t)N * K);
+                    for (int c = 0; c < N; ++c) fill_row(wb.data() + (size_t)c * K, K, (c % 13) == 0 ? 2 : 0);
+                    /* f32 storage: full-precision values (products inexact, so the fma's single rounding shows), with the
+                     * bf16 rows' zeros / subnormals / huge values kept; bf16 storage: the bf16 values themselves */
+                    std::vector<float> wf((size_t)N * K);
+                    for (size_t e = 0; e < wb.size(); ++e) {
+                        uint32_t u = (uint32_t)wb[e] << 16;
+                        if ((u & 0x7f800000u) != 0 && (u & 0x7f800000u) != 0x7f800000u) u |= (uint32_t)(rnd() & 0xffffu);
+                        std::memcpy(&wf[e], &u, 4);
+                    }
+                    RadTensor t[3]{};
+                    t[0].data = x.data(); t[0].dtype = RAD_BF16; t[0].rank = 2; t[0].shape[0] = M; t[0].shape[1] = K; t[0].stride[0] = xp; t[0].stride[1] = 1;
+                    t[1].data = bf ? (void*)wb.data() : (void*)wf.data(); t[1].dtype = bf ? RAD_BF16 : RAD_F32; t[1].rank = 2;
+                    t[1].shape[0] = N; t[1].shape[1] = K; t[1].stride[0] = K; t[1].stride[1] = 1;
+                    t[2].dtype = RAD_F32; t[2].rank = 2; t[2].shape[0] = M; t[2].shape[1] = N; t[2].stride[0] = yp; t[2].stride[1] = 1;
+                    RadParam p[4]{};
+                    p[0] = { "M", RAD_P_INT, M };
+                    p[1] = { "N", RAD_P_INT, N };
+                    p[2] = { "K", RAD_P_INT, K };
+                    p[3].key = "dtype"; p[3].kind = RAD_P_STR; p[3].sval = "bf16";
+                    RadArgs a{};
+                    a.t = t; a.n_t = 3; a.p = p; a.n_p = 4;
+                    std::vector<float> ref((size_t)M * yp, -7.25f), got((size_t)M * yp);
+                    t[2].data = ref.data();
+                    r4d_f32pf_pin(0);
+                    if (r4d_rad_gemm_nt_f32(&a, nullptr) != RAD_OK) { std::printf("FAIL f32 stock rc N=%d M=%d\n", N, M); ++ffails; continue; }
+                    for (int i = 0; i < nfb; ++i) {
+                        std::fill(got.begin(), got.end(), -7.25f);
+                        t[2].data = got.data();
+                        r4d_f32pf_pin(fbuf[i]);
+                        const int rc = r4d_rad_gemm_nt_f32(&a, nullptr);
+                        r4d_f32pf_pin(0);
+                        ++fcases;
+                        if (rc != RAD_OK || std::memcmp(got.data(), ref.data(), got.size() * 4)) {
+                            size_t bad = 0, first = 0;
+                            for (size_t e = 0; e < got.size(); ++e)
+                                if (std::memcmp(&got[e], &ref[e], 4)) { if (!bad) first = e; ++bad; }
+                            std::printf("FAIL f32 %s N=%d K=%d M=%d form %d (%s): rc %d, %zu words differ, first m=%zu n=%zu\n", bf ? "bf16-w" : "f32-w",
+                                        N, K, M, fbuf[i], r4d_f32pf_last(), rc, bad, first / yp, first % yp);
+                            ++ffails;
+                        }
+                    }
+                }
+            }
+            std::printf("f32 N=%d K=%d: done (%d cases, %d failures so far)\n", N, K, fcases, ffails);
+            std::fflush(stdout);
+        }
+        g_cases += fcases;
+        g_fail += ffails;
+    }
     std::printf("%s: %d cases, %d failures\n", g_fail ? "FAIL" : "PASS", g_cases, g_fail);
     return g_fail ? 1 : 0;
 }

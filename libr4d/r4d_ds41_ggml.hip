@@ -41,6 +41,7 @@
 #include "r4d_plugin.h"
 #include "r4d_ds41_ggml_mr.h"
 #include "r4d_ds41_ggml_pf.h"
+#include "r4d_ds41_f32pf.h"
 #include "r4d_ds41_mxfp4_mr.h"
 #include "r4d_gemm_bf16_nt_pf.h"
 
@@ -3986,11 +3987,14 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
  * (r4d_ds41_mxfp4_mr.hip, RADIANCE_DS41_DRAFTER_MX at load); "drafter_bf" 0 / 1, gemm_nt bf16's decode band in the
  * prefetching form (r4d_gemm_bf16_nt_pf.hip, RADIANCE_DS41_DRAFTER_BF). Both keep the stock kernels' bits.
  * Lever GPF: "gg_pf" 0 / 1 / a form code, gemm_nt_ggml's prefill rows in the WMMA forms of r4d_ds41_ggml_pf.hip (1 its
- * per-shape rule, a code that form everywhere; RADIANCE_DS41_GG_PF at load); the stock WMMA kernel's bits. */
+ * per-shape rule, a code that form everywhere; RADIANCE_DS41_GG_PF at load); the stock WMMA kernel's bits. Lever GPF-b:
+ * "f32_pf" 0 / 1 / a form code 20.., gemm_nt_f32's prefill rows in r4d_ds41_f32pf.hip's tiled form (RADIANCE_DS41_F32_PF
+ * at load); the stock gemm_nt_f32's bits for f32 and bf16 weights. */
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
+    if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "drafter_mx") || !std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
@@ -4000,6 +4004,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_set(value);
+    if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_set(value);
     g_gg_gemv.store(value, std::memory_order_relaxed);
     r4d_gg_mr_set(value == 2);   /* lever D2's form runs ahead of gg_gemm's stock launch while on */
     return 1;
@@ -4013,6 +4018,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
     if (!std::strcmp(name, "gg_pf")) { *applied = r4d_gg_pf_get(); return 1; }
+    if (!std::strcmp(name, "f32_pf")) { *applied = r4d_f32pf_get(); return 1; }
     return 0;
 }
 

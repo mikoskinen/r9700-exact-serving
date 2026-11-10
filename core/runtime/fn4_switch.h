@@ -73,6 +73,10 @@
  *                   stock kernel), or a form code (r4d_ds41_ggml_pf.hip: 100 MT + 10 NT + WN / 4) for every shape.
  *                   Every form keeps the stock kernel's per-output WMMA chains and scale fmas, so the bytes are the
  *                   same; RADIANCE_DS41_GG_PF at load. -1 when no loaded object serves it.
+ *   f32_pf          libr4d (rad_fn4_*; lever GPF-b): gemm_nt_f32's prefill rows (the router and the compressor's kv | gate
+ *                   projection above 63 rows), 0 the stock tile kernel, 1 the tiled form (r4d_ds41_f32pf.hip, form 20),
+ *                   20.. a form code. Every form keeps each output's 32 lane-strided fmaf chains and the xor butterfly,
+ *                   so the bytes are the same for f32 and bf16 weight storage; RADIANCE_DS41_F32_PF at load.
  *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule in force, 0 off, 1 rule,
  *                   2 rule-w -- the switch once set, else RADIANCE_AQL_ACQ=rule | rule-w at start (ds41-ar-acq
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
@@ -117,7 +121,7 @@ namespace fn4 {
 
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
-              kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf, kGgPf, kSwitches };
+              kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf, kGgPf, kF32Pf, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
