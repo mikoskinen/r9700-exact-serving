@@ -227,6 +227,10 @@ set(R4D_UNITS
   "r4d_ds41_ggml_mr64|-mwavefrontsize64"
   # GGUF MXFP4 blocks (type=mxfp4) for gemm_nt_ggml and moe_gemm_ggml: the DSpark drafter's experts.
   "r4d_ds41_mxfp4|"
+  # ds41-drk: the drafter's kernels -- the MXFP4 grouped GEMM's multi-row forms (drafter_mx) and the skinny bf16
+  # GEMM's prefetching decode form (drafter_bf); both off unless switched on, both the stock kernels' bits.
+  "r4d_ds41_mxfp4_mr|"
+  "r4d_gemm_bf16_nt_pf|"
 )
 
 set(R4D_SRC "")
