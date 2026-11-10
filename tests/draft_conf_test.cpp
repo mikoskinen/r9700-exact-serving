@@ -136,4 +136,16 @@ TEST(tracker_calibration_and_cuts) {
     CHECK_EQ(after(t.json(), "calib"), after(j, "calib"));
 }
 
+/* ds41-small: dspark_conf_rows' counts -- a cycle without a bound is not counted. */
+TEST(tracker_counts_the_load_gate) {
+    dconf::Tracker t;
+    t.load_gate(false, false);
+    t.load_gate(true, false);
+    t.load_gate(true, true);
+    t.load_gate(true, true);
+    const std::string j = t.json();
+    CHECK_EQ(after(j, "rows_bounded"), std::string("3"));
+    CHECK_EQ(after(j, "rows_gated"), std::string("2"));
+}
+
 RAD_TEST_MAIN()

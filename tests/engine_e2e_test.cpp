@@ -2261,6 +2261,37 @@ TEST(the_confidence_gate_cuts_a_block_heads_chain_and_keeps_the_plain_text) {
     (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 0 } }, &st);
     CHECK_EQ(st, 200);
     same("dspark_conf 0");
+    /* ds41-small: the load gate (dspark_conf_rows 1) -- one sequence is gated as before; four in flight
+     * read no plane (rows_gated grows, no cut), the text the plain run's either way */
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 1 }, { "dspark_conf_rows", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    CHECK_EQ(fn4get()["switches"].value("dspark_conf_rows", -9), 1);
+    same("dspark_conf 1, dspark_conf_rows 1, one sequence");
+    const json r1 = stats()["draft_conf"]["conf"];
+    CHECK(r1.value("rows_bounded", (int64_t)0) > 0);
+    {
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 40).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+            if (t != plain[(size_t)i])
+                fprintf(stderr, "    load gate 1, four in flight, prompt %d\n    plain %s\n    gated %s\n", i,
+                        show(plain[(size_t)i]).c_str(), show(t).c_str());
+            CHECK(t == plain[(size_t)i]);
+        }
+    }
+    const json r2 = stats()["draft_conf"]["conf"];
+    fprintf(stderr, "    load gate: bounded %lld -> %lld, gated %lld -> %lld cycles\n",
+            (long long)r1.value("rows_bounded", (int64_t)0), (long long)r2.value("rows_bounded", (int64_t)0),
+            (long long)r1.value("rows_gated", (int64_t)0), (long long)r2.value("rows_gated", (int64_t)0));
+    CHECK(r2.value("rows_gated", (int64_t)0) > r1.value("rows_gated", (int64_t)0));
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf_rows", 65 } }, &st);
+    CHECK_EQ(st, 400);
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 0 }, { "dspark_conf_rows", 0 } }, &st);
+    CHECK_EQ(st, 200);
     /* refused: a value outside the set, and branches the drafter does not declare */
     (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 3 } }, &st);
     CHECK_EQ(st, 400);

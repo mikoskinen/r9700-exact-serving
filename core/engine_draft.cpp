@@ -667,6 +667,14 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
      * plugin issued them (the switches move only at a step release, after this). A gate records
      * the event the next verify's build waits on (conf_gate). */
     conf_val_ = conf_buf_ || conf_dbg_ ? std::max(0, fn4::get(fn4::kDsparkConf)) : 0;
+    /* ds41-small: dspark_conf_rows, the gate's load bound -- above it this cycle reads no plane and
+     * waits for nothing, as dspark_conf 0 (the head the plugin issued is left unread). */
+    if (conf_val_) {
+        const int cap = fn4::get(fn4::kDsparkConfRows);
+        const bool gated = cap > 0 && sched_.decoded_seqs() > cap;
+        dconf::tracker().load_gate(cap > 0, gated);
+        if (gated) conf_val_ = 0;
+    }
     alt_on_   = alt_buf_ && fn4::get(fn4::kDsparkAlt) == 1;
     if (conf_val_ && conf_buf_) {
         const void* src = r0.ctx.buf_ptr(conf_buf_);

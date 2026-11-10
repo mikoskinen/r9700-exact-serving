@@ -136,9 +136,17 @@ void Tracker::purge(int step, int age) {
     }
 }
 
+void Tracker::load_gate(bool bounded, bool gated) {
+    if (!bounded) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    ++lg_bounded_;
+    if (gated) ++lg_gated_;
+}
+
 std::string Tracker::json() const {
     std::lock_guard<std::mutex> lk(mu_);
-    std::string o = "{\"conf\": {\"cuts\": " + std::to_string(cuts_) + ", \"cut_drafts\": " +
+    std::string o = "{\"conf\": {\"rows_bounded\": " + std::to_string(lg_bounded_) + ", \"rows_gated\": " +
+                    std::to_string(lg_gated_) + ", \"cuts\": " + std::to_string(cuts_) + ", \"cut_drafts\": " +
                     std::to_string(cut_drafts_) + ", \"cut_full\": " + std::to_string(cut_full_) + ", \"cut_hist\": [";
     int top = 0;
     for (int k = 0; k <= kMaxLen; ++k)

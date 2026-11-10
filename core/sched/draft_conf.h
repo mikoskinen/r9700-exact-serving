@@ -54,6 +54,8 @@ public:
     void verified(uint64_t seq, int step, int drafted, int accepted, const int32_t* emitted, int n_emitted);
     /* Records idle for `age` steps are closed (a finished request): its open branches end where they are. */
     void purge(int step, int age = 64);
+    /* dspark_conf_rows: a cycle under a load bound (`bounded`), and whether its load was above it (`gated`). */
+    void load_gate(bool bounded, bool gated);
     std::string json() const;
 
 private:
@@ -74,6 +76,7 @@ private:
     /* calibration: [position][decile] */
     int64_t reached_[kMaxLen][kDeciles] = {}, hit_[kMaxLen][kDeciles] = {};
     int64_t cuts_ = 0, cut_hist_[kMaxLen + 1] = {}, cut_drafts_ = 0, cut_full_ = 0;
+    int64_t lg_bounded_ = 0, lg_gated_ = 0;     /* dspark_conf_rows: cycles under a bound, cycles above it */
     /* shadow */
     int64_t sh_verifies_ = 0, sh_chain_acc_ = 0, sh_p1_miss_ = 0, sh_zero_ = 0;
     int64_t sh_hit_[kMaxAlt] = {};

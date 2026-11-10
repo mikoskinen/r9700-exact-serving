@@ -116,6 +116,11 @@
  *                   deepseek41 with RADIANCE_DS41_DSPARK_ALT) are computed and compared with the tokens the
  *                   target emits -- a shadow of a tree that branches at the first draft, counted under
  *                   /stats draft_conf.shadow, never verified; 0 nothing. 1 refused where none is declared.
+ *   dspark_conf_rows engine (ds41-small: dspark_conf's load gate): 0 the confidence plane acts at every drafter
+ *                   cycle (as ds41-acc measured it); N in 1..64 only at a cycle whose step decoded at most N
+ *                   sequences -- above that the engine neither reads the plane nor waits for it (no cut, no host
+ *                   wait before the step issued ahead), as at dspark_conf 0. Exact as dspark_conf: verify counts
+ *                   only. Nonzero is refused where no confidence plane is declared.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -140,7 +145,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
-              kDsparkConf, kDsparkAlt, kSwitches };
+              kDsparkConf, kDsparkAlt, kDsparkConfRows, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

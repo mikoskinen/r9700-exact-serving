@@ -22,7 +22,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_depth0", "draft_probe", "draft_hybrid", "draft_hybrid_match",
                                         "draft_probe_backoff", "draft_lend", "draft_lend_borrow",
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
-                                        "dspark_conf", "dspark_alt" };
+                                        "dspark_conf", "dspark_alt", "dspark_conf_rows" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -246,7 +246,8 @@ bool check(const std::string& name, int v, std::string* err) {
         if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, ds41_argather, "
                         "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
-                        "idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, epoch_bump)";
+                        "idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
+                        "dspark_conf_rows, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -326,6 +327,23 @@ bool check(const std::string& name, int v, std::string* err) {
     if (i == kDraftHybridMatch) {
         if (v < 1 || v > 256) {
             if (err) *err = "draft_hybrid_match takes 1 .. 256 (tokens the lookup's match runs back)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kDsparkConfRows) {
+        if (v < 0 || v > 64) {
+            if (err) *err = "dspark_conf_rows takes 0 (the confidence plane at every cycle) or 1 .. 64 (only where the "
+                            "step decoded at most that many sequences)";
+            return false;
+        }
+        if (v != 0 && s.conf_capable.load(std::memory_order_acquire) != 1) {
+            if (err)
+                *err = std::string("dspark_conf_rows=") + std::to_string(v) + " refused: " +
+                       (s.conf_capable.load(std::memory_order_acquire) < 0
+                            ? "no engine has registered a drafter"
+                            : "this deployment's drafter declares no confidence plane (deepseek41: "
+                              "RADIANCE_DS41_DSPARK_CONF at start)");
             return false;
         }
         return true;
