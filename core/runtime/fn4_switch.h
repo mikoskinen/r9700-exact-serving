@@ -30,6 +30,9 @@
  *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule, 0 off, 1 rule,
  *                   2 rule-w (cohbench2 7.11.: a CU can serve a line it stored after another CU rewrote it, so
  *                   rule-w is the safe one); -1 until set = RADIANCE_AQL_ACQ=rule | rule-w at start
+ *   exl3_pfprep     exl3r4d (rad_fn4_switch): gate_up's prep in the EXL3 prefill band -- 0 the build's (the map,
+ *                   then the prep by map entry), 2 the map and the prep by row in one launch; no start value (the
+ *                   plugin reads no environment), so it is set through POST /admin/fn4 only
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -49,7 +52,7 @@ namespace rad {
 namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
-              kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kSwitches };
+              kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
