@@ -66,7 +66,8 @@ static const RadParamSpec pHcRead[]    = { P_INT("M"), P_INT("n"), P_INT("hc"), 
                                            P_STRO("mix") };
 static const RadOperandSpec oHcRead[]  = { OPD("h"), WGT("w"), WGT("mix_down"), WGT("mix_up"),
                                            WGT_O("inject_w"), OUT("x"), OUT_O("inj"), OUT_O("q"),
-                                           OUT_O("scale"), OUT_O("rq"), OUT_O("rscale") };
+                                           OUT_O("scale"), OUT_O("rq"), OUT_O("rscale"),
+                                           OPD_O("ss") /* fn4 W1b (libr4d) */ };
 
 static const RadParamSpec pMhcPre[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
     P_INT("iterations"), P_F64("eps"), P_F64("hc_eps"), P_STR("dtype") };
@@ -124,7 +125,9 @@ static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_st
 
 static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
-static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
+/* hc_write: optional `eps` and `ss` output, libr4d's fn4 W1b (the next read's norm scales); not computed here. */
+static const RadParamSpec pHcWriteSs[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype"), P_F64O("eps") };
+static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h"), OUT_O("ss") };
 /* The control vector's projection: one unit direction per layer (f32) and an int32 per-row switch. */
 static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
                                            P_STR("dtype") };
@@ -998,7 +1001,7 @@ static const RadOpSchema kSchemas[] = {
   "a second implementation has to match (the mix is a MEAN, there is a separate / hc inside each "
   "gate argument, and hc_write adds into the UNNORMED h). `mix` names the matrices' stored "
   "format; a host kernel reads them as the dense tensors it is handed." },
-{ "hc_write", ARR(pHcWrite), ARR(oHcWrite), "h[s] += inj[s] * y, into the unnormed stream." },
+{ "hc_write", ARR(pHcWriteSs), ARR(oHcWrite), "h[s] += inj[s] * y, into the unnormed stream." },
 { "hc_project", ARR(pHcProject), ARR(oHcProject),
   "The control vector's projection (llama.cpp's `--cvec-mode project`): h[s] -= scale * "
   "(h[s] . v) * v for each of the hc streams of a row whose flag is on. A zero flag is not read." },

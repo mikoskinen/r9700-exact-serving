@@ -642,8 +642,14 @@ static const RadOperandSpec oSsdUpdate[] = {
     {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
     {"o", RAD_OPD_OUT, 0},
 };
+/* hc_write's own list: `eps` and the `ss` output (fn4 W1b) are optional -- with both, the write also stores the
+ * next read's norm scales ([M][8] f32, the read's grouped-rmsnorm rsqrt per stream at that eps), which that read
+ * takes as its `ss` input instead of its own pass over the stream. */
+static const RadParamSpec pHcWrite[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype"), P_F64O("eps"),
+};
 static const RadOperandSpec oHcWrite[] = {
-    { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
+    { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 }, { "ss", RAD_OPD_OUT, 1 },
 };
 /* hc_write with the preceding all-reduce folded in: `y` is also the message, so it is inout and
  * holds the reduced sum as the standalone collective leaves it. */
@@ -695,6 +701,7 @@ static const RadOperandSpec oHcRead[] = {
     { "scale",    RAD_OPD_OUT,    1 },
     { "rq",       RAD_OPD_OUT,    1 },
     { "rscale",   RAD_OPD_OUT,    1 },
+    { "ss",       RAD_OPD_IN,     1 },   /* fn4 W1b: the norm scales the preceding hc_write stored */
 };
 
 static const RadParamSpec pGdnGatedRmsNorm[] = {
@@ -3568,7 +3575,7 @@ static const RadOpSchema kSchemas[] = {
            "layer's unit direction -- the same v for every stream -- and scale its stored norm. A "
            "row whose flag is 0 is neither read nor written, so an unprojected request's stream is "
            "the stock model's."),
-    SCHEMA("hc_write", pHcPlain, oHcWrite,
+    SCHEMA("hc_write", pHcWrite, oHcWrite,
            "the write half: h[s] += inj[s] * y, into the UNNORMED stream."),
     SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
            "The MTP head's entry for a wide residual stream: x[k*n+i] = fc_h[i] . "

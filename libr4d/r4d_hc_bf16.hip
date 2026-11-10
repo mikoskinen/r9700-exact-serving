@@ -3563,18 +3563,35 @@ static bool hc_write_vec(long rows) {
  * r4d_hc_readv, rad_fn4_switch("hc_readv")): bit 0 the decode tiles (17-64 rows: the down product
  * software-pipelined, hc_down_tiled_pipe_kernel, and from 33 rows the down product and the up-mix at
  * the 32-row tile -- the split-K kept at the 64-row tile's chunk), bit 1 the PF2 prefill form's down
- * product at 32 rows a workgroup (hc_down_pf2_r32_kernel). -1 until the environment is read. */
+ * product at 32 rows a workgroup (hc_down_pf2_r32_kernel), bit 2 PF2's norm scales inside the down product
+ * (hc_down_pf2_fs_kernel; lost in 138), bit 3 the norm scales from the preceding hc_write (W1b: hc_write's
+ * optional `ss` output, the read's optional `ss` input, both [rows][kHcMax] f32, used from kHcSsMinRows rows;
+ * see hc_ss_on). -1 until the environment is read. */
 static std::atomic<int> g_hc_readv{-1};
 static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 7) : 0;
+        const int on = (e && *e) ? (std::atoi(e) & 15) : 0;
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
     }
     return v;
+}
+/* fn4 hc_readv bit 3 (W1b): from this many rows an hc_write handed an `ss` operand stores the next read's norm
+ * scales there, and an hc_read handed the same operand takes them instead of its own pass. Both sides decide by
+ * the same rule (the bit, these rows, an f32 [rows][kHcMax] operand), and the architecture hands the operand to
+ * a read only right after the write that filled it, so a read never trusts scales nobody wrote. 17: up to 16
+ * rows decode forms G and S compute their norms inside kernel A' and would not use them. */
+constexpr long kHcSsMinRows = 17;
+static bool hc_ss_on(long rows) { return (hc_readv() & 8) != 0 && rows >= kHcSsMinRows; }
+/* The `ss` operand when it is usable for `rows` rows: f32, kHcMax a row, at least `rows` rows; else null. */
+static const RadTensor* hc_ss_operand(const RadTensor* t, long rows) {
+    if (!t || !t->data || t->dtype != RAD_F32 || !hc_ss_on(rows)) return nullptr;
+    long long n = 0;
+    const long long pitch = r4d_rows_pitch(t, kHcMax, &n);
+    return (pitch == kHcMax && n >= rows && (((uintptr_t)t->data & 15u) == 0u)) ? t : nullptr;
 }
 /* fn4 hc_upmix: other tiles for hc_read's up-mix, same bytes (RADIANCE_FN4_HC_UPMIX, r4d_hc_upmix,
  * rad_fn4_switch("hc_upmix")): value & 7 picks PF2's (prefill) form -- 0 stock (hc_up_mix_wide_kernel<4,
@@ -5045,6 +5062,17 @@ constexpr long kPf2MinRows = 512;                // the rule's floor, and where 
  *   `udec`, mix_up decoded to plain [HN][lr] bf16 (E4M3 only; a bf16 mix_up is read in place).
  *
  * Every decoded element is f2bf(code * scale) as in the wide form's staging. */
+/* The wave's sum of squares from its lanes' eight running sums: back into thread order through `st`, then the k-th
+ * wave_sum over threads 32k .. 32k + 31, in ascending k. Every lane returns it. */
+__device__ __forceinline__ float hc_wave_ss_tail(const float (&acc)[8], int lane, float* __restrict__ st) {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) st[lane * 8 + e] = acc[e];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kWaves; ++k) ss += wave_sum(st[k * kWave + lane]);
+    return ss;
+}
+
 /* One (row, stream)'s norm scale by one wave -- hc_norm_scale_kernel's sums in its order (see hc_pf2_prep_kernel):
  * lane L loads elements 8L .. 8L + 7 of each 256-element chunk (thread 8L .. 8L + 7's running sums), the wave-private
  * `st` (kThreads floats) puts them back in thread order, and lane L of the k-th wave_sum holds thread 32k + L's sum.
@@ -5075,12 +5103,65 @@ __device__ __forceinline__ float hc_scale_wave(const unsigned short* __restrict_
 #pragma unroll
         for (int e = 0; e < 8; ++e) acc[e] += f[e] * f[e];
     }
+    return __frsqrt_rn(hc_wave_ss_tail(acc, lane, st) / (float)n + eps);
+}
+
+/* fn4 hc_readv bit 3 (W1b): hc_write's update of one (row, stream) by one wave -- h = f2bf(h + g * y), the
+ * expression hc_write_vec_kernel evaluates, on the same elements -- with hc_scale_wave's sums taken on the bytes
+ * it stores: lane L owns elements 8L .. 8L + 7 of each 256-element chunk, the chunks in ascending order, the same
+ * tail. So the scale equals, bit for bit, what the next read's pass over the stored stream computes, and that pass
+ * can go. `hp` is read and written in place, one 16-byte word a lane at a time. */
+__device__ __forceinline__ float hc_write_scale_wave(unsigned short* hp, const unsigned short* __restrict__ yp,
+                                                     float g, long n, float eps, int lane, float* __restrict__ st) {
+    constexpr int kU = 5;
+    float acc[8];
 #pragma unroll
-    for (int e = 0; e < 8; ++e) st[lane * 8 + e] = acc[e];
-    float ss = 0.0f;
+    for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+    auto one = [&](uint4 hw, uint4 yw, unsigned short* p) {
+        float hv[8], yv[8], o[8];
+        bf8_f(hw, hv);
+        bf8_f(yw, yv);
 #pragma unroll
-    for (int k = 0; k < kWaves; ++k) ss += wave_sum(st[k * kWave + lane]);
-    return __frsqrt_rn(ss / (float)n + eps);
+        for (int k = 0; k < 8; ++k) o[k] = hv[k] + g * yv[k];
+        const uint4 w = f2bf8(o);
+        *(uint4*)p = w;
+        float f[8];
+        bf16x8(w, f);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] += f[e] * f[e];
+    };
+    long j0 = 0;
+    for (; j0 + kU * kThreads <= n; j0 += kU * kThreads) {
+        uint4 hw[kU], yw[kU];
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            hw[u] = *(const uint4*)(hp + j0 + u * kThreads + lane * 8);
+            yw[u] = *(const uint4*)(yp + j0 + u * kThreads + lane * 8);
+        }
+#pragma unroll
+        for (int u = 0; u < kU; ++u) one(hw[u], yw[u], hp + j0 + u * kThreads + lane * 8);
+    }
+    for (; j0 < n; j0 += kThreads)
+        one(*(const uint4*)(hp + j0 + lane * 8), *(const uint4*)(yp + j0 + lane * 8), hp + j0 + lane * 8);
+    return __frsqrt_rn(hc_wave_ss_tail(acc, lane, st) / (float)n + eps);
+}
+
+/* hc_write with the next read's norm scales (fn4 hc_readv bit 3): one wave a (row, stream), a workgroup two rows'
+ * four streams (so the four waves of a row read its `y` together, from cache after the first). `ssout` is
+ * [rows][kHcMax], the read's scale layout. n a multiple of 256, every base and pitch 16-byte aligned. */
+__global__ __launch_bounds__(kThreads)
+void hc_write_ss_kernel(const unsigned short* __restrict__ y, const unsigned short* __restrict__ inj,
+                        unsigned short* __restrict__ h, float* __restrict__ ssout,
+                        long rows, long n, int hc, long yrow, long irow, long hrow, float eps) {
+    __shared__ float s_t[kWaves][kThreads];
+    const int  tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const long p = (long)blockIdx.x * kWaves + wave;
+    if (p >= rows * hc) return;
+    const long r = p / hc;
+    const int  c = (int)(p - r * hc);
+    const float g  = bf2f(inj[r * irow + c]);
+    const float sc = hc_write_scale_wave(h + r * hrow + (long)c * n, y + r * yrow, g, n, eps, lane, s_t[wave]);
+    if (lane == 0) ssout[r * kHcMax + c] = sc;
 }
 
 __global__ __launch_bounds__(kThreads)
@@ -6005,7 +6086,7 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
                          unsigned short* inj, unsigned char* q, float* qs, unsigned char* rq,
                          float* rqs, long rows, long n, int hc, long lr, long ncol, long hrow,
                          long irow, long xrow, long qrow, long srow, long rqrow, long rsrow,
-                         long kc, int ks, float eps, float wadd, RadStream s) {
+                         long kc, int ks, float eps, float wadd, bool sc_ready, RadStream s) {
     const long HN  = (long)hc * n;
     const long ntt = (ncol + 15) / 16;                        /* plane n-tiles */
     uint4* const          plane = (uint4*)wsp;
@@ -6019,9 +6100,10 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
     const int stg = g_hc_pf2_stages.load(std::memory_order_relaxed);
     const bool r32 = (hc_readv() & 2) != 0;
     /* fn4 hc_readv bit 2: the norm scales in the down product (whole-stream K chunks only); the prologue then
-     * decodes the weight planes alone. */
-    const bool fsc = (hc_readv() & 4) != 0 && kc % n == 0;
-    const long nnb_p = fsc ? 0 : nnb;
+     * decodes the weight planes alone. Bit 3 (`sc_ready`): `scale` already holds them (the preceding hc_write
+     * stored them), so neither computes them and the prologue decodes the planes alone. */
+    const bool fsc = !sc_ready && (hc_readv() & 4) != 0 && kc % n == 0;
+    const long nnb_p = (fsc || sc_ready) ? 0 : nnb;
     if (stg & 1)
     hipLaunchKernelGGL(hc_pf2_prep_kernel, dim3((unsigned)(nnb_p + ndec)), dim3(kThreads), 0,
                        (hipStream_t)s, h, scale, rows, n, hc, hrow, eps, nnb_p, down, dld, f8, injw,
@@ -6101,8 +6183,8 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
 // ============================================================== the plugin ABI entry points
 
 enum { HCE_X = 0, HCE_H };
-enum { HCW_Y = 0, HCW_INJ, HCW_H };
-enum { HCR_H = 0, HCR_W, HCR_DOWN, HCR_UP, HCR_INJW, HCR_X, HCR_INJ, HCR_Q, HCR_S, HCR_RQ, HCR_RS };
+enum { HCW_Y = 0, HCW_INJ, HCW_H, HCW_SS };
+enum { HCR_H = 0, HCR_W, HCR_DOWN, HCR_UP, HCR_INJW, HCR_X, HCR_INJ, HCR_Q, HCR_S, HCR_RQ, HCR_RS, HCR_SS };
 
 /* LDS for kernel A's bf16 N beside its static planes: gfx1201 gives a workgroup 64 KiB, so N gets
  * 64 KiB less kHcReadAStaticLds (30576 elements). The row table claims `n <= 7552` and `hc <= 4`
@@ -6153,22 +6235,49 @@ extern "C" int r4d_rad_hc_write(const RadArgs* a, RadStream stream) {
     const long long irow = r4d_rows_pitch(inj, hc, &irows);
     if (yrow < 0 || irow < 0 || yrows < rows || irows < rows) return R4D_NO(RAD_E_STRIDE);
 
+    /* fn4 hc_readv bit 3 (W1b): the next read's norm scales into `ss` (hc_ss_operand's rule, which the read applies
+     * to the same operand). Where every access is 16-byte aligned and n is whole 256-element chunks, the write
+     * itself computes them (hc_write_ss_kernel); elsewhere the plain write runs and then the read's own pass
+     * (hc_norm_scale_kernel) into `ss`, so a read handed `ss` always finds them. `eps` is the read's; a write asked
+     * for scales without it is refused rather than guessed. */
+    const RadTensor* ss = hc_ss_operand(r4d_opt(a, HCW_SS), (long)rows);
+    float eps = 0.0f;
+    if (ss) {
+        const double e = r4d_getf(a, "eps", -1.0);
+        if (!(e >= 0.0)) return R4D_NO(RAD_E_INVAL);
+        eps = (float)e;
+        if ((n % kThreads) == 0 && (yrow % 8) == 0 && (hrow % 8) == 0 &&
+            ((uintptr_t)y->data % 16) == 0 && ((uintptr_t)h->data % 16) == 0) {
+            const long nb = ((long)rows * hc + kWaves - 1) / kWaves;
+            return R4D_EMIT(stream, hc_write_ss_kernel, dim3((unsigned)nb), dim3(kThreads), 0,
+                            (const unsigned short*)y->data, (const unsigned short*)inj->data,
+                            (unsigned short*)h->data, (float*)ss->data, (long)rows, (long)n, (int)hc,
+                            (long)yrow, (long)irow, (long)hrow, eps);
+        }
+    }
+
     /* fn4 hcw: the eight-wide form where every 16-byte access is aligned (same bytes). Through
      * r4d_emit, so r4d_record_dispatches sees which form ran. */
     if (hc_write_vec((long)rows) && (n % 8) == 0 && (yrow % 8) == 0 && (hrow % 8) == 0 &&
         ((uintptr_t)y->data % 16) == 0 && ((uintptr_t)h->data % 16) == 0) {
         const long items = (long)rows * (long)(n / 8);
         const unsigned vblocks = (unsigned)((items + kThreads - 1) / kThreads);
-        return R4D_EMIT(stream, hc_write_vec_kernel, dim3(vblocks), dim3(kThreads), 0,
-                        (const unsigned short*)y->data,
-                        (const unsigned short*)inj->data, (unsigned short*)h->data,
-                        (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+        const int wrc = R4D_EMIT(stream, hc_write_vec_kernel, dim3(vblocks), dim3(kThreads), 0,
+                                 (const unsigned short*)y->data,
+                                 (const unsigned short*)inj->data, (unsigned short*)h->data,
+                                 (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+        if (wrc != RAD_OK || !ss) return wrc;
+    } else {
+        const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
+        const int wrc = R4D_EMIT(stream, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
+                                 (const unsigned short*)y->data,
+                                 (const unsigned short*)inj->data, (unsigned short*)h->data,
+                                 (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+        if (wrc != RAD_OK || !ss) return wrc;
     }
-    const unsigned blocks = (unsigned)((n + kThreads - 1) / kThreads);
-    return R4D_EMIT(stream, hc_write_kernel, dim3(blocks, (unsigned)rows), dim3(kThreads), 0,
-                    (const unsigned short*)y->data,
-                    (const unsigned short*)inj->data, (unsigned short*)h->data,
-                    (long)rows, (long)n, (int)hc, (long)yrow, (long)irow, (long)hrow);
+    /* The scales the fused form could not take: the read's own pass, into `ss`. */
+    return R4D_EMIT(stream, hc_norm_scale_kernel, dim3((unsigned)hc, (unsigned)rows), dim3(kThreads), 0,
+                    (const unsigned short*)h->data, (float*)ss->data, (long)rows, (long)n, (long)hrow, eps);
 }
 
 enum { HCP_H = 0, HCP_V, HCP_ON };
@@ -6522,6 +6631,11 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     const bool hcw = hcg && lr == 320 && rows <= 16 && (rows <= 8 || hcs) && (n % 128) == 0
                      && (hrow % 2) == 0 && (xrow % 2) == 0;
     const bool tiled  = can_tile && rows >= kDecMinRows && !hcg;
+    /* fn4 hc_readv bit 3 (W1b): the norm scales the preceding hc_write stored in `ss` (hc_ss_operand, the rule the
+     * write applied), on the unchained tiled forms; there they replace this read's pass and `scale` points at them. */
+    const bool chained_tiles = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* chain_arg's rule below */
+    const RadTensor* ssin = tiled && !chained_tiles ? hc_ss_operand(r4d_opt(a, HCR_SS), (long)rows) : nullptr;
+    if (ssin) scale = (float*)ssin->data;
     if (tiled) {
         /* The chained forms of the tiled kernels (r4d_chain.h) at decode heights, where the row
          * resolved with `chain`. */
@@ -6568,7 +6682,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                 q ? (unsigned char*)q->data : nullptr, q ? (float*)qs->data : nullptr,
                 rq ? (unsigned char*)rq->data : nullptr, rq ? (float*)rqs->data : nullptr,
                 (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow, (long)irow, (long)xrow,
-                (long)qrow, (long)srow, (long)rqrow, (long)rsrow, kc, ks, eps, wadd, s);
+                (long)qrow, (long)srow, (long)rqrow, (long)rsrow, kc, ks, eps, wadd, ssin != nullptr, s);
             return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
         }
 
@@ -6576,7 +6690,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
          * (row, s) through hc_pf2_prep_kernel's scale blocks alone -- a grid of exactly nnb blocks,
          * so no block reaches its plane loop -- where its 16-byte loads fit (n a multiple of 256,
          * rows 8-aligned) and nothing is chained. Through r4d_emit, so r4d_record_dispatches sees it. */
-        if (hc_norm_wave((long)rows) && !g_r4d_chain_arg && (n % kThreads) == 0 && (hrow % 8) == 0
+        if (ssin) {
+            /* the scales are already in `ss` */
+        } else if (hc_norm_wave((long)rows) && !g_r4d_chain_arg && (n % kThreads) == 0 && (hrow % 8) == 0
             && (((uintptr_t)h->data & 15u) == 0u)) {
             const long nnb = ((long)rows * hc + kWaves - 1) / kWaves;
             (void)R4D_EMIT(s, &hc_pf2_prep_kernel, dim3((unsigned)nnb), dim3(kThreads), 0,
@@ -6862,7 +6978,7 @@ extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_write_vec(int on) { g_hc_write_vec.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
-extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 7), std::memory_order_relaxed); }
+extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 15), std::memory_order_relaxed); }
 /* Test hook (r4d_selftest, fn4): frees this device's mix-counter slots. hc_mix_ctr keeps four
  * streams a device and never frees a slot, so a test that makes a stream a case runs out after four
  * and every later case takes the unfused up product (and no decode form G / S) -- the stock and the
@@ -6891,7 +7007,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 7) return -1;
+        if (value < 0 || value > 15) return -1;
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }

@@ -323,6 +323,7 @@ int ref_hc_read_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) 
         o.skip();
         o.skip();
     }
+    o.skip();                                   /* ss (libr4d's fn4 W1b), not described */
     return o.finish("hc_read", operand, out);
 }
 
@@ -454,6 +455,7 @@ int ref_hc_write_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     o.t(D, { M, n });          /* y */
     o.t(D, { M, hc });         /* inj */
     o.t(D, { M, hc * n });     /* h, in place */
+    o.skip();                  /* ss (libr4d's fn4 W1b), not described */
     return o.finish("hc_write", operand, out);
 }
 

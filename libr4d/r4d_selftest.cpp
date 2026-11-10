@@ -20983,6 +20983,229 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     ok(nm.c_str(), true);
 }
 
+/* fn4 hc_readv bit 3 (W1b): a write and the read after it at Qwen3.8-Flash-Next's shape, the pair as the trunk
+ * issues it -- hc_write_bf16 (y, inj, h, ss; eps) then hc_read_e4m3 (..., ss) -- on device buffers the case and
+ * the timing share. `ss` is [M][8] f32. */
+struct HcSsRig {
+    int64_t M = 0, n = 2560, hc = 4, lr = 320, HN = 10240, grp = 128, nkb = 20;
+    const RadKernelInfo* rw = nullptr;
+    const RadKernelInfo* rr = nullptr;
+    std::vector<uint16_t> h0;
+    void *d_h = nullptr, *d_y = nullptr, *d_y1 = nullptr, *d_i = nullptr, *d_ss = nullptr;
+    void *d_w = nullptr, *d_dn = nullptr, *d_up = nullptr, *d_iw = nullptr, *d_x = nullptr, *d_inj = nullptr;
+    void *d_q = nullptr, *d_qs = nullptr, *d_rq = nullptr, *d_rs = nullptr;
+    size_t hb = 0, xb = 0, ib = 0, qb = 0, sb = 0, ssb = 0;
+    std::vector<RadTensor> tw, tr;
+    std::vector<RadParam> pw, pr;
+    RadArgs aw{}, ar{};
+    hipStream_t hs = nullptr;
+    bool ready = false;
+
+    /* `misaligned`: the write's `y` 2 bytes off a 16-byte boundary, so it takes the plain form and the separate
+     * pass. `with_ss`: hand `ss` to both ops (else the 4th and 12th operands are absent). */
+    bool build(const Plugin& pl, int64_t rows, bool i8) {
+        M = rows; HN = hc * n; nkb = n / grp;
+        rw = find(pl, "hc_write_bf16");
+        rr = find(pl, "hc_read_e4m3");
+        if (!rw || !rr) return false;
+        const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+        const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+        uint64_t rs = 0x5851F42D4C957F2Dull ^ (uint64_t)M;
+        auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+        h0.resize((size_t)(M * HN));
+        std::vector<uint16_t> y((size_t)(M * n)), inj((size_t)(M * hc));
+        for (auto& v : h0) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 997.0f);
+        for (auto& v : y) v = h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 3001.0f);
+        for (auto& v : inj) v = h_to_bf16(0.2f + (float)(rnd() % 1601) / 1000.0f);   /* (0, 2), as 2 sigmoid */
+        std::vector<float> wg((size_t)HN);
+        for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+        auto plane = [&](int64_t prow, int64_t K, int64_t G, int64_t ld) {
+            std::vector<uint8_t> b((size_t)(prow * ld), 0);
+            for (int64_t r0 = 0; r0 < prow; ++r0) {
+                uint8_t* row = b.data() + r0 * ld;
+                for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+                float* sc = (float*)(row + K);
+                for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+            }
+            return b;
+        };
+        std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+        std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+        std::vector<uint16_t> injw((size_t)(hc * HN));
+        for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+        hb = h0.size() * 2; xb = (size_t)(M * n * 2); ib = (size_t)(M * hc * 2); qb = (size_t)(M * n);
+        sb = (size_t)(M * nkb * 4); ssb = (size_t)(M * 8 * 4);
+        d_h = dalloc(hb); d_y = dalloc(y.size() * 2); d_y1 = dalloc(y.size() * 2 + 16); d_i = dalloc(inj.size() * 2);
+        d_ss = dalloc(ssb); d_w = dalloc(wg.size() * 4); d_dn = dalloc(down.size()); d_up = dalloc(up.size());
+        d_iw = dalloc(injw.size() * 2); d_x = dalloc(xb); d_inj = dalloc(ib); d_q = dalloc(qb); d_qs = dalloc(sb);
+        d_rq = dalloc(qb); d_rs = dalloc(sb);
+        if (!d_h || !d_y || !d_y1 || !d_i || !d_ss || !d_w || !d_dn || !d_up || !d_iw || !d_x || !d_inj || !d_q ||
+            !d_qs || !d_rq || !d_rs)
+            return false;
+        st_memcpy(d_y, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy((char*)d_y1 + 2, y.data(), y.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_i, inj.data(), inj.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+        if (hipStreamCreate(&hs) != hipSuccess) return false;
+        const uint32_t qdt = i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+        tr = {
+            T(d_h,  RAD_BF16,   { M, HN }),     T(d_w,  RAD_F32,    { HN }),
+            T(d_dn, RAD_F8E4M3, { lr, HN }),    T(d_up, RAD_F8E4M3, { HN, lr }),
+            T(d_iw, RAD_BF16,   { hc, HN }),    T(d_x,  RAD_BF16,   { M, n }),
+            T(d_inj, RAD_BF16,  { M, hc }),     T(d_q,  qdt,        { M, n }),
+            T(d_qs, RAD_F32,    { M, nkb }),    T(d_rq, RAD_F8E4M3, { M, n }),
+            T(d_rs, RAD_F32,    { M, nkb }),    T(d_ss, RAD_F32,    { M, 8 }),
+        };
+        pr = {
+            PI("M", M), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+            PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+            PI("rotate", 1), PS("mix", "e4m3"),
+        };
+        tw = { T(d_y, RAD_BF16, { M, n }), T(d_i, RAD_BF16, { M, hc }), T(d_h, RAD_BF16, { M, HN }),
+               T(d_ss, RAD_F32, { M, 8 }) };
+        pw = { PI("M", M), PI("n", n), PI("hc", hc), PS("dtype", "bf16"), PF("eps", 1e-6) };
+        std::memset(&aw, 0, sizeof(aw)); std::memset(&ar, 0, sizeof(ar));
+        aw.t = tw.data(); aw.n_t = (int)tw.size(); aw.p = pw.data(); aw.n_p = (int)pw.size();
+        ar.t = tr.data(); ar.n_t = (int)tr.size(); ar.p = pr.data(); ar.n_p = (int)pr.size();
+        if (rr->scratch) {
+            const int64_t need = rr->scratch(&ar);
+            if (need > 0) { ar.scratch = dalloc((size_t)need); ar.scratch_bytes = need; }
+        }
+        ready = true;
+        return true;
+    }
+    /* The operands for the next launches: `ss` handed or absent, `y` aligned or not. */
+    void set(bool with_ss, bool misaligned) {
+        tw[0] = T(misaligned ? (void*)((char*)d_y1 + 2) : d_y, RAD_BF16, { M, n });
+        tw[3] = with_ss ? T(d_ss, RAD_F32, { M, 8 }) : RadTensor{};
+        tr[11] = with_ss ? T(d_ss, RAD_F32, { M, 8 }) : RadTensor{};
+    }
+    void reset() {
+        st_memcpy(d_h, h0.data(), hb, hipMemcpyHostToDevice);
+        st_memset(d_ss, 0xa5, ssb);
+        st_memset(d_x, 0xa5, xb); st_memset(d_q, 0xa5, qb); st_memset(d_qs, 0xa5, sb);
+        st_memset(d_rq, 0xa5, qb); st_memset(d_rs, 0xa5, sb); st_memset(d_inj, 0xa5, ib);
+        if (ar.scratch) st_memset(ar.scratch, 0xa5, (size_t)ar.scratch_bytes);
+    }
+    ~HcSsRig() { if (hs) (void)hipStreamDestroy(hs); }
+};
+
+/* The case: the pair under hc_readv 3 without `ss` (the stack) is the reference; under 11 with `ss` the write's
+ * stream bytes, the scales it stores (against the read's own pass, which hc_read keeps in its scratch after `d`)
+ * and every output of the read must be the same bytes, with the read's norm launch gone below PF2's rows; with
+ * the write misaligned (plain write + the separate pass), F1n off, and the bit off or the rows below 17 with
+ * `ss` handed (then neither side may touch it). */
+static void hc_ss_case(const Plugin& pl, int64_t M, bool i8) {
+    const std::string nm = fmt("hc_write + hc_read_e4m3 at M=%lld, %s codes: the norm scales from the write (fn4 "
+                               "hc_readv bit 3) byte-identical to the read's own pass", (long long)M, i8 ? "int8" : "E4M3");
+    if (!pl.readv_hc || !pl.norm_hc_wave || !pl.write_hc_vec || !pl.record) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, i8)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    struct Out { std::vector<uint8_t> h, ss, x, inj, q, qs, rq, rs, sc; int nw = 0, nr = 0; };
+    auto run = [&](int readv, int wave, bool with_ss, bool mis, Out& o) -> bool {
+        pl.readv_hc(readv); pl.norm_hc_wave(wave); pl.write_hc_vec(1);
+        g.set(with_ss, mis);
+        g.reset();
+        const void* fns[64] = {};
+        pl.record(fns, 64);
+        if (g.rw->launch(&g.aw, (RadStream)g.hs) != RAD_OK) { pl.record(nullptr, 0); return false; }
+        o.nw = pl.record(fns, 64);                 /* the write's launches; recording restarts */
+        if (g.rr->launch(&g.ar, (RadStream)g.hs) != RAD_OK) { pl.record(nullptr, 0); return false; }
+        o.nr = pl.record(nullptr, 0);              /* the read's */
+        if (st_stream_sync(g.hs) != hipSuccess) return false;
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) { v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost); };
+        get(o.h, g.d_h, g.hb); get(o.ss, g.d_ss, g.ssb); get(o.x, g.d_x, g.xb); get(o.inj, g.d_inj, g.ib);
+        get(o.q, g.d_q, g.qb); get(o.qs, g.d_qs, g.sb); get(o.rq, g.d_rq, g.qb); get(o.rs, g.d_rs, g.sb);
+        /* the read's own scales: hc_read's scratch holds `d` (M x lr bf16) and then [M][8] f32 */
+        if (g.ar.scratch && (size_t)g.ar.scratch_bytes >= (size_t)(M * g.lr * 2) + g.ssb)
+            get(o.sc, (const char*)g.ar.scratch + M * g.lr * 2, g.ssb);
+        return true;
+    };
+    enum { REF = 0, SS, SS_MIS, SS_NOWAVE, OFF_SS, kRuns };
+    Out o[kRuns];
+    const bool ok_runs = run(3, 1, false, false, o[REF]) && run(11, 1, true, false, o[SS]) &&
+                         run(11, 1, true, true, o[SS_MIS]) && run(11, 0, true, false, o[SS_NOWAVE]) &&
+                         run(3, 1, true, false, o[OFF_SS]);
+    pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0);
+    if (!ok_runs) { ok(nm.c_str(), false, "a launch failed"); return; }
+    const bool used = M >= 17;   /* kHcSsMinRows */
+    std::string bad;
+    auto outs = [&](int r, const char* at) {
+        if (o[r].h != o[REF].h)     bad += std::string(" h") + at;
+        if (o[r].x != o[REF].x)     bad += std::string(" x") + at;
+        if (o[r].inj != o[REF].inj) bad += std::string(" inj") + at;
+        if (o[r].q != o[REF].q)     bad += std::string(" q") + at;
+        if (o[r].qs != o[REF].qs)   bad += std::string(" qs") + at;
+        if (o[r].rq != o[REF].rq)   bad += std::string(" rq") + at;
+        if (o[r].rs != o[REF].rs)   bad += std::string(" rs") + at;
+    };
+    /* the stored scales against the reference read's: hc entries a row (the rest of the row is not written) */
+    auto scales = [&](int r, const char* at) {
+        if (o[REF].sc.size() != g.ssb) { bad += std::string(" (no reference scales)") + at; return; }
+        const float* a = (const float*)o[r].ss.data();
+        const float* b = (const float*)o[REF].sc.data();
+        int64_t nbad = 0;
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t c = 0; c < g.hc; ++c) nbad += std::memcmp(&a[i * 8 + c], &b[i * 8 + c], 4) != 0;
+        if (nbad) bad += fmt(" ss%s (%lld of %lld)", at, (long long)nbad, (long long)(M * g.hc));
+    };
+    auto untouched = [&](int r, const char* at) {
+        for (uint8_t v : o[r].ss) if (v != 0xa5) { bad += std::string(" ss written") + at; return; }
+    };
+    outs(SS, " (11)"); outs(SS_MIS, " (11, misaligned write)"); outs(SS_NOWAVE, " (11, F1n off)"); outs(OFF_SS, " (3, ss handed)");
+    if (used) { scales(SS, " (11)"); scales(SS_MIS, " (11, misaligned write)"); scales(SS_NOWAVE, " (11, F1n off)"); }
+    else untouched(SS, " (11, below 17 rows)");
+    untouched(OFF_SS, " (3)");
+    /* Launch counts (r4d_emit's log): the write is one launch (fused) or two (misaligned: write + pass); the read
+     * loses its norm launch on the tiled forms below PF2 (PF2's prologue is not logged and stays). */
+    const int rw_ref = o[REF].nw, rr_ref = o[REF].nr;
+    const int rw_ss = o[SS].nw, rr_ss = o[SS].nr;
+    const int rw_mis = o[SS_MIS].nw;
+    const bool counts = !used || (rw_ss == rw_ref && rw_mis == rw_ref + 1 && rr_ss == rr_ref - (M < 512 ? 1 : 0));
+    int64_t nz = 0;
+    for (uint8_t v : o[REF].q) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && counts && nz > (int64_t)g.qb / 2,
+       !bad.empty() ? "differs in" + bad
+       : !counts ? fmt("launches: write %d / %d / %d (ref / ss / misaligned), read %d / %d", rw_ref, rw_ss, rw_mis, rr_ref, rr_ss)
+                 : fmt("write %d launch(es), read %d -> %d", rw_ref, rr_ref, rr_ss));
+}
+
+/* --perfhcs M [iters]: the pair at M rows, hc_readv 3 without `ss` against 11 with it, each op timed alone (warm,
+ * or cold under --cold) and the pair back to back. */
+static void hc_ss_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
+    const std::string nm = fmt("hc_write + hc_read_e4m3 timing at M=%lld (hc_readv 3 vs 11)", (long long)M);
+    if (!pl.readv_hc || !pl.norm_hc_wave || !pl.write_hc_vec) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, i8)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    pl.norm_hc_wave(1); pl.write_hc_vec(1);
+    double tw[2], tr[2], tp[2];
+    for (int k = 0; k < 2; ++k) {
+        const int v = k ? 11 : 3;
+        pl.readv_hc(v);
+        g.set(k == 1, false);
+        g.reset();
+        if (g.rw->launch(&g.aw, (RadStream)g.hs) != RAD_OK || g.rr->launch(&g.ar, (RadStream)g.hs) != RAD_OK ||
+            st_stream_sync(g.hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_readv %d launch failed", v)); pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0); return;
+        }
+        /* Repeated writes keep adding into h; the bytes moved and the work do not depend on its values. */
+        tw[k] = st_time_us([&](int) { (void)g.rw->launch(&g.aw, (RadStream)g.hs); }, iters, g.hs);
+        tr[k] = st_time_us([&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, iters, g.hs);
+        tp[k] = st_time_us([&](int) { (void)g.rw->launch(&g.aw, (RadStream)g.hs); (void)g.rr->launch(&g.ar, (RadStream)g.hs); },
+                           iters, g.hs);
+    }
+    pl.readv_hc(0); pl.norm_hc_wave(0); pl.write_hc_vec(0);
+    std::printf("hc_ss M=%lld %s%s (F1n, hcw): write %.2f -> %.2f us, read %.2f -> %.2f us, pair %.2f -> %.2f us "
+                "(%+.2f us, %.3fx)\n", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm",
+                tw[0], tw[1], tr[0], tr[1], tp[0], tp[1], tp[1] - tp[0], tp[0] / tp[1]);
+    ok(nm.c_str(), true);
+}
+
 /* fn4 hc_upmix: the up-mix's other tiles against the stock one, byte for byte on every output (hc_readv 3
  * and F1n in both): PF2's forms 1-4 from 512 rows, the 64-row decode tile (8) at 33-64 rows. */
 static void hc_upmix_case(const Plugin& pl, int64_t M, bool i8) {
@@ -34634,6 +34857,10 @@ static void device_phase(const Plugin& pl) {
         /* fn4 hc_upmix: the up-mix's other tiles against the stock one. */
         for (int64_t m : { 24, 33, 48, 64, 512, 700, 2048 })
             for (bool i8 : { false, true }) hc_upmix_case(pl, m, i8);
+        /* fn4 hc_readv bit 3 (W1b): the norm scales from the preceding write, below and at its 17-row floor, on
+         * the decode tiles, the wide tile and PF2. */
+        for (int64_t m : { 16, 17, 33, 64, 300, 512, 2048 }) hc_ss_case(pl, m, false);
+        for (int64_t m : { 64, 2048 }) hc_ss_case(pl, m, true);
     }
     if (sel("hc_write_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's write: the eight-wide form (fn4 hcw) against "
@@ -35156,6 +35383,8 @@ static void usage(void) {
                 "             that serves M (fn4), and from 512 rows the up-mix stage alone.\n"
                 "  --perfhcv M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows with F1n,\n"
                 "             the stock forms against hc_readv 1 / 2 / 3 (fn4), and PF2's stages from 512.\n"
+                "  --perfhcs M [iters]:  hc_write + hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows,\n"
+                "             hc_readv 3 against 11 (fn4 W1b: the read's norm scales from the write).\n"
                 "  --perfhcw M [iters]:  hc_write at Qwen3.8-Flash-Next's shape and M rows, the plain\n"
                 "             and the eight-wide form (fn4 hcw) timed as one op each, GB/s, bytes compared.\n"
                 "  --perfhc M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows, every\n"
@@ -35289,6 +35518,8 @@ int main(int argc, char** argv) {
     int hcw_it = 50;
     long long hcv_m = 0;
     int hcv_it = 50;
+    long long hcs_m = 0;
+    int hcs_it = 50;
     long long hcu_m = 0;
     int hcu_it = 50;
     int hc_it = 20;
@@ -35570,6 +35801,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hcv_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcv_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcs")) {
+            /* The write + read pair with the norm scales handed over (fn4 hc_readv bit 3) at M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcs_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcs_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhcw")) {
             /* The gated residual's write at M rows, both forms (fn4 hcw). */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -35691,6 +35927,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("gated residual read timing (hc_readv)", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcs_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_ss_perf(pl, hcs_m, hcs_it, true);
+        dfree_all();
+#else
+        skip("gated residual write + read timing (hc_readv 11)", "built without HIP");
 #endif
         return 0;
     }

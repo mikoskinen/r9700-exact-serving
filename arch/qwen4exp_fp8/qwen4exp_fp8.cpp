@@ -152,6 +152,10 @@ struct Model {
     rad_buf b_h = 0;
     ActFP8  a_x{};
     rad_buf b_inj = 0;
+    /* fn4 W1b (RADIANCE_FN4_HC_SS=1): the trunk connections' norm-scale handoff, [T, 8] f32 (HyperConn::Wire::ss).
+     * Declared only on request, so the default plan is unchanged; with it, buffers under its 128 KiB (at T 4096) may
+     * land elsewhere in the arena (the packer places largest first), so A/B it in process (hc_readv bit 3). */
+    rad_buf b_hss = 0;
 
     /* the attention block's own activations, shared across the 12 attention layers */
     rad_buf b_qg = 0, b_k = 0, b_v = 0, b_q = 0, b_rope_cs = 0, b_gate = 0;
@@ -1013,6 +1017,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     HyperConn::Wire hw{};
     hw.h = m.b_h; hw.x = m.a_x; hw.inj = m.b_inj;
+    if (fn4_env_on("RADIANCE_FN4_HC_SS")) {
+        m.b_hss = decl_b(b, nm.f("hc_ss"), RAD_F32, {T, 8});
+        hw.ss = m.b_hss;
+    }
 
     m.layers.resize((size_t)g.n_layer);
     const char* pre = "model.language_model.layers";
@@ -1591,8 +1599,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 behind = true;
                 issued = p + 2;
             }
-            l.hc_mix.write(c, T, r0(p), rn(p));
-            l.hc_ffn.read(c, T, r0(p), rn(p));
+            const bool ss_mix = l.hc_mix.write(c, T, r0(p), rn(p));
+            l.hc_ffn.read(c, T, r0(p), rn(p), ss_mix);
             l.mlp.pass(c, T, r0(p), rn(p), false);
             /* Lane 0 waits here for the next piece's mixer all-reduce and the last piece's MoE
              * one, both issued before this pass; lane 1 then takes this piece's behind its
@@ -1607,10 +1615,10 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         const bool ple_next = nx && li + 1 == m.ple_layer;
         for (int64_t p = 0; p < K; ++p) {
             if (p == K - 1) wait1();
-            l.hc_ffn.write(c, T, r0(p), rn(p));
+            const bool ss_ffn = l.hc_ffn.write(c, T, r0(p), rn(p));
             /* The projection of this piece, before the next layer reads it. */
-            l.proj.step(c, batch, r0(p), rn(p));
-            if (nx && !ple_next) nx->hc_mix.read(c, T, r0(p), rn(p));
+            const bool projected = l.proj.step(c, batch, r0(p), rn(p));
+            if (nx && !ple_next) nx->hc_mix.read(c, T, r0(p), rn(p), ss_ffn && !projected);
         }
         if (ple_next) {
             m.ple.step(c, batch);
@@ -1639,22 +1647,24 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
+    /* fn4 W1b: whether the stream's last change was a write that stored the norm scales for its rows. */
+    bool ss_ok = false;
     for (int64_t li = 0; li < (int64_t)m.layers.size(); ++li) {
         const Layer& l = m.layers[(size_t)li];
         /* Before the attention connection reads the stream, which is where the reference puts it. */
-        if (li == m.ple_layer) m.ple.step(c, batch);
-        l.hc_mix.read_pieces(c, T);
+        if (li == m.ple_layer) { m.ple.step(c, batch); ss_ok = false; }
+        l.hc_mix.read_pieces(c, T, ss_ok);
         /* The indexer runs first, since the attention reads its selection. The block's input is
          * already normed and quantised by the connection (`ext_in`), so `w.h` is final. */
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch); }
         else        l.gdn.step(c, batch);
-        l.hc_mix.write(c, T, 0, T);
+        const bool ss_mix = l.hc_mix.write(c, T, 0, T);
         dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
-        l.hc_ffn.read_pieces(c, T);
+        l.hc_ffn.read_pieces(c, T, ss_mix);
         l.mlp.step(c, batch);
-        l.hc_ffn.write(c, T, 0, T);
+        ss_ok = l.hc_ffn.write(c, T, 0, T);
         /* The request's control vector, on the stream the write just finished. */
-        l.proj.step(c, batch, 0, T);
+        if (l.proj.step(c, batch, 0, T)) ss_ok = false;
         dbg_resid(c, (int)li, "ffn", g.n_embd, m.b_h, m.a_x.x);
     }
 }

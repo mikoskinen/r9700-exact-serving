@@ -199,8 +199,8 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_pre_finish` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `chunk` `dtype` | `part`, `h`, `scale`w, `base`w → `x`, `post`, `comb` |
 | `mhc_post` | `M`(range) `n` `hc` `dtype` | `x`, `h`, `post`, `comb` → `out` |
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
-| `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
-| `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
+| `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`?; in `ss`? |
+| `hc_write` | `M`(range) `n` `hc` `dtype` `eps`:f64/opt | `y`, `inj`, `h`:inout → `ss`? |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
@@ -391,6 +391,11 @@ is easy to miss.
   1.26 GB a step. The scales in the row's tail are libr4d's arrangement; the container holds codes
   and an f32 scale plane (a group of 128 for `mix_down`, a quarter row for `mix_up`), which a host
   kernel reads joined (Weights of several planes).
+- `ss` (fn4 test builds, libr4d only; optional on both ops, ignored elsewhere): `[M, 8]` f32, the
+  grouped norm's rsqrt per (row, stream) at `eps`. A write handed `ss` and `eps` stores the scales
+  of the stream it leaves; a read handed the same `ss` takes them instead of its own pass. An
+  architecture hands `ss` to a read only right after the write that filled it, with nothing
+  touching `h` in between. Under fn4's `hc_readv` bit 3, from 17 rows; same bits as the read's pass.
 
 **mHC** (manifold-constrained hyper-connections) keeps `hc` residual streams in one `[M, hc*n]`
 row and is a separate family from `hc_read`/`hc_write`. `mhc_pre` projects the whole row with the

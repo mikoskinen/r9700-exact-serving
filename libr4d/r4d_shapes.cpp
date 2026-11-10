@@ -520,7 +520,9 @@ extern "C" int r4d_shape_hc_write(const RadParam* p, int n_p, int operand, RadOp
     const uint32_t D = dt_act(p, n_p, "dtype");
     /* `inj` is a gain in (0, 2), twice a sigmoid, so it is drawn in (0, 1) rather than as a
      * normal: the op's gains are small and data-dependent. */
-    const RadOpdDesc l[] = { opd(D, M, n), in_unit(opd(D, M, hc)), opd(D, M, hc * n) };
+    /* `ss` (fn4 W1b, the next read's norm scales) is not described: the fused form is checked against its own
+     * read by r4d_selftest's hc_ss cases. */
+    const RadOpdDesc l[] = { opd(D, M, n), in_unit(opd(D, M, hc)), opd(D, M, hc * n), opd_none() };
     R4D_PICK(l);
 }
 
@@ -583,6 +585,7 @@ extern "C" int r4d_shape_hc_read(const RadParam* p, int n_p, int operand, RadOpd
         group > 0 ? opd((uint32_t)RAD_F32, M, n / (group > 0 ? group : 1)) : opd_none(),
         group > 0 && rotate ? opd((uint32_t)RAD_F8E4M3, M, n) : opd_none(),           /* rq */
         group > 0 && rotate ? opd((uint32_t)RAD_F32, M, n / group) : opd_none(),      /* rscale */
+        opd_none(),                                           /* ss (fn4 W1b), not described */
     };
     R4D_PICK(l);
 }
