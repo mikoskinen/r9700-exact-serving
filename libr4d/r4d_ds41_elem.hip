@@ -1080,15 +1080,16 @@ __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long 
 
 long mix_chunks(long width) { return (width + kMixCols - 1) / kMixCols; }
 
-/* mhc_mix's one-launch form (mix_split_kernel FIN). R4D_DS41_MIX_FUSE: unset or anything but "0" =
- * on; "0" = the split and finish kernels (the same bits). r4d_ds41_mix_fuse_force pins it for tests
- * (-1 = the environment's). */
+/* mhc_mix's one-launch form (mix_split_kernel FIN). R4D_DS41_MIX_FUSE: "1" = on; unset or anything
+ * else = the split and finish kernels (the same bits). Default off since 10.11. (gpu02 item 77: with
+ * the router fusion c4 -1.0..-1.4 %: rejected, the switch kept). r4d_ds41_mix_fuse_force pins it for
+ * tests (-1 = the environment's). */
 constexpr long kDsMixCtr = 8192;   // split_ctr's counters a block (r4d_gemm_fp8a8.hip kMaxCtr)
 std::atomic<int> g_mix_fuse_force{-1};
 bool ds_mix_fuse_on() {
     const int f = g_mix_fuse_force.load(std::memory_order_relaxed);
     if (f >= 0) return f != 0;
-    static const bool on = [] { const char* e = std::getenv("R4D_DS41_MIX_FUSE"); return !(e && e[0] == '0' && !e[1]); }();
+    static const bool on = [] { const char* e = std::getenv("R4D_DS41_MIX_FUSE"); return e && e[0] == '1' && !e[1]; }();
     return on;
 }
 #ifdef R4D_EMU_HOST

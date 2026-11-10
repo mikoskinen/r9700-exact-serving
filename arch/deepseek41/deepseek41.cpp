@@ -1007,11 +1007,12 @@ static int ds41_ar_pcn_mode() {
 static int ds41_ar_pcn() { return ds41_ar_pcn_mode() >= 1; }
 static int ds41_ar_pcn_moe() { return ds41_ar_pcn_mode() == 2; }
 
-/* RADIANCE_DS41_ROUTER_FUSE: unset or anything but "0" = the selection and the sort as one launch
- * (router_scored_topk_scatter, where a loaded library declares it and the pass fits the sort's one
- * workgroup; byte-identical to router_scored_topk + moe_scatter); "0" = the two launches. */
+/* RADIANCE_DS41_ROUTER_FUSE: "1" = the selection and the sort as one launch (router_scored_topk_scatter,
+ * where a loaded library declares it and the pass fits the sort's one workgroup; byte-identical to
+ * router_scored_topk + moe_scatter); unset or anything else = the two launches. Default off since
+ * 10.11. (gpu02 item 77: c4 -1.0..-1.4 %, 1 user 0 %: rejected, the switch kept). */
 static int ds41_router_fuse() {
-    static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_ROUTER_FUSE"); return !(e && e[0] == '0' && !e[1]); }();
+    static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_ROUTER_FUSE"); return e && e[0] == '1' && !e[1]; }();
     return on ? 1 : 0;
 }
 
