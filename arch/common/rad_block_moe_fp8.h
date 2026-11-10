@@ -52,6 +52,7 @@
 #include "rad_device.h"
 #include "exl3/exl3_abi.h"   /* EXL3 experts (radiance-exl3): the encoding, op schemas, operand positions */
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -426,6 +427,11 @@ struct MoeFP8 {
     /* Config::gather_ar_rows: moe_gather_all_reduce over at most `gar_rows` tokens, or 0. */
     rad_op op_gar = 0;
     int64_t gar_rows = 0;
+    /* Optional, set by the architecture: a live bound on the fused gather's rows (an in-process
+     * switch, read at every pass), capped by `gar_rows`; negative = `gar_rows`. The issue then takes
+     * the fused op at T <= min(gar_rows, live) and the gather + all-reduce above, both declared,
+     * byte-identical either way. Null: `gar_rows` alone, as before. */
+    const std::atomic<int>* gar_live = nullptr;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -2382,7 +2388,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes
      * the block's delta into `h.x`. With Config::gather_ar_rows a single-pass step this short
      * gathers and reduces in one kernel, byte for byte the two it replaces. */
-    const bool gar = op_gar && own_ar && r0 == 0 && rows == T && T <= gar_rows && !op_combine &&
+    int64_t gar_lim = gar_rows;
+    if (gar_live) {
+        const int lv = gar_live->load(std::memory_order_relaxed);
+        if (lv >= 0 && lv < gar_lim) gar_lim = lv;
+    }
+    const bool gar = op_gar && own_ar && r0 == 0 && rows == T && T <= gar_lim && !op_combine &&
                      issues_ar(T, rows) && !gather_taken(g, T, gather_out_rows, gather_out_rows6);
     if (gar)
         RAD_ISSUE_N(c_, op_gar, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),

@@ -10141,15 +10141,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_shape_ar_gather_hc_write, nullptr, r4d_fuse_ar_gather_hc_write },
 
 { "moe_gather_all_reduce_4rank", "moe_gather_all_reduce", "norm",
-  "moe_gather folded in front of the four-rank exact one-shot all-reduce: each block sums its "
-  "words' tokens back from the routed experts' rows, keeps the result as its message and pushes "
-  "it, then reduces in place -- ar_gather_hc_write_4rank's kernel at hc 0, which writes no stream",
+  "moe_gather folded in front of the four-rank exact all-reduce: each block sums its words' tokens "
+  "back from the routed experts' rows, keeps the result as its message and pushes it, then reduces "
+  "in place -- below the tuned ts_min ar_gather_hc_write_4rank's one-shot kernel at hc 0 (which "
+  "writes no stream), from it the exact two-shot with the gather as its phase-1 source "
+  "(r4d_ar_gather_twoshot_4rank), as the unfused all_reduce changes transport there",
   "exactly 4 ranks, all peer-accessible; exact wire; n a multiple of 8, y unpitched and y_expert's "
-  "pitch a multiple of 8, because both move as 16B words; top_k <= 64; one-shot transport (every "
-  "rank pushes the whole message to every peer), so a caller keeps it to decode-sized M where the "
-  "unfused all_reduce is the one-shot too; on an instance keyed by its own M bound as "
-  "ar_gather_hc_write_4rank's is; the grid widened until a block's slot table fits in LDS, or the "
-  "inverse table in the scratch; cudagraph-safe",
+  "pitch a multiple of 8, because both move as 16B words; top_k <= 64; on an instance keyed by its "
+  "own M bound as ar_gather_hc_write_4rank's is; the one-shot's grid widened until a block's slot "
+  "table fits in LDS, or the inverse table in the scratch; the two-shot form where every row's "
+  "slot list fits one block's LDS (M <= 256, M * top_k <= 2048), else the one-shot; "
+  "cudagraph-safe",
   "bf16 throughout; the gather's sums and narrows are moe_gather's (round-to-nearest-even, the "
   "shared arm's product rounded before the add), the sum in fp32 in ascending rank order and "
   "rounded to bf16 exactly as the four-rank exact all-reduce stores it -- byte-identical to the "

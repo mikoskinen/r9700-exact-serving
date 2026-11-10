@@ -29,6 +29,7 @@
 #include "ds41_index_split.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -848,15 +849,67 @@ static constexpr int64_t kSharedBlock = 256;
 /* RADIANCE_DS41_ARGATHER: the MoE gather and its all-reduce as one kernel (moe_gather_all_reduce,
  * MoeFP8::Config::gather_ar_rows) for a step of at most this many tokens at four ranks; unset, empty,
  * 0 or off is the two kernels, on is 4 (a decode step of up to four sequences, where the unfused
- * all-reduce is the one-shot too). Byte-identical either way. */
+ * all-reduce is the one-shot too). Byte-identical either way.
+ *
+ * RADIANCE_DS41_ARGATHER_MAX=<rows> (1..256, read at declare; lever D3): with ARGATHER on (or a
+ * number) the fused op is declared up to this many rows instead, so a step of up to <rows> tokens
+ * (c8, a mixed step that small, a drafting verify) takes it. Unset: today's bound, nothing else
+ * declared. libr4d's moe_gather_all_reduce runs the one-shot below the all-reduce's ts_min (32768
+ * elements, 7 rows of 5120) and from it the gather in front of the exact two-shot (the transport the
+ * unfused all-reduce takes there). Every form folds a token's slots on its rank in ascending slot
+ * order, rounds that partial (with the shared arm's) to bf16 and sums the four ranks' partials in
+ * fp32 in ascending rank order, rounded once: the bytes of moe_gather + all_reduce at every row count.
+ * The in-process switch ds41_argather (POST /admin/fn4, 0..the declared bound) lowers the bound the
+ * issue takes; the ops above it stay declared. */
+static int64_t gather_ar_max() {
+    const char* e = std::getenv("RADIANCE_DS41_ARGATHER_MAX");
+    if (!e || !*e) return 0;
+    const long n = std::strtol(e, nullptr, 10);
+    return n > 0 ? std::min<long>(n, 256) : 0;
+}
 static int64_t gather_ar_rows() {
     const char* e = std::getenv("RADIANCE_DS41_ARGATHER");
     if (!e || !*e) return 0;
     const std::string v(e);
     if (v == "off" || v == "0" || v == "none") return 0;
+    if (gather_ar_max() > 0) return gather_ar_max();
     if (v == "on") return 4;
     const long n = std::strtol(e, nullptr, 10);
     return n > 0 ? std::min<long>(n, 64) : 0;
+}
+
+/* The in-process switch this plugin serves (core/runtime/fn4_switch.h; the core finds the hooks
+ * below through the plugin's handle): "ds41_argather" -- the fused gather's live row bound, 0..the
+ * declared bound (gather_ar_rows), the issue taking moe_gather_all_reduce at T <= it and moe_gather
+ * + all_reduce above (MoeFP8::gar_live). Applied between steps with every rank thread parked; the
+ * core's epoch then re-records every pass. Process-wide: every rank's blocks read the same word. */
+static std::atomic<int> g_sw_gar{-1};          /* -1: the declared bound */
+static std::atomic<int> g_sw_gar_decl{0};      /* the largest bound a layer declared */
+static void sw_note_decl(int64_t rows) {
+    int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
+    while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
+}
+
+extern "C" int rad_fn4_accepts(const char* name, int value) {
+    if (!name) return 0;
+    if (!std::strcmp(name, "ds41_argather"))
+        return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
+    return 0;
+}
+extern "C" int rad_fn4_switch(const char* name, int value) {
+    const int ok = rad_fn4_accepts(name, value);
+    if (ok <= 0) return ok;
+    g_sw_gar.store(value, std::memory_order_relaxed);
+    return 1;
+}
+extern "C" int rad_fn4_value(const char* name, int* applied) {
+    if (!name || !applied) return 0;
+    if (!std::strcmp(name, "ds41_argather")) {
+        const int v = g_sw_gar.load(std::memory_order_relaxed);
+        *applied = v >= 0 ? v : g_sw_gar_decl.load(std::memory_order_relaxed);
+        return 1;
+    }
+    return 0;
 }
 
 static void shared_slice(int64_t n_ff, int world, int rank, int64_t* lo, int64_t* hi) {
@@ -1641,6 +1694,9 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.calib = (m.calib_hi > m.calib_lo && l >= m.calib_lo && l < m.calib_hi) ? 1 : 0;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
+    /* the in-process switch (rad_fn4_*): the fused gather's live bound */
+    L.moe.gar_live = &g_sw_gar;
+    sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
     return RAD_OK;
 }
@@ -1864,6 +1920,8 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.gather_ar_rows = gather_ar_rows();
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
+    L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
+    sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
 }
@@ -2358,9 +2416,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)),
              m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate", n_arpcn ? "fused" : "separate",
              n_arpcn, n_arpcn_moe ? "fused" : "separate", n_arpcn_moe);
-    if (ctx->rank == 0 && !ctx->shape_probe && g.world == 4 && gather_ar_rows() > 0)
-        fprintf(stderr, "radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to %lld "
-                        "tokens a step (RADIANCE_DS41_ARGATHER)\n", (long long)gather_ar_rows());
+    if (ctx->rank == 0 && !ctx->shape_probe && g.world == 4 && gather_ar_rows() > 0) {
+        if (gather_ar_max() > 0)
+            fprintf(stderr, "radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to %lld "
+                            "tokens a step (RADIANCE_DS41_ARGATHER, RADIANCE_DS41_ARGATHER_MAX; %d layers declare "
+                            "it up to %d rows; the one-shot below the all-reduce's ts_min, the two-shot from it; "
+                            "switch ds41_argather)\n", (long long)gather_ar_rows(),
+                    (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.moe.op_gar != 0; }),
+                    g_sw_gar_decl.load(std::memory_order_relaxed));
+        else
+            fprintf(stderr, "radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to %lld "
+                            "tokens a step (RADIANCE_DS41_ARGATHER)\n", (long long)gather_ar_rows());
+    }
+
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "

@@ -482,6 +482,21 @@ void r4d_ar_twoshot_4rank_exact_coded(long peer_scratch0, long peer_scratch1, lo
                                       long rank, long stream, long nblocks, long nthreads,
                                       long drain, long acq, long pub, long gate, long gate_ctr,
                                       long chain);
+// moe_gather_all_reduce's two-shot form (four ranks, exact wire, bf16; r4d_ar_twoshot_Nrank_exact.hip):
+// the MoE gather (r4d_ar_gather_hc_write_4rank's gather operands, words and arithmetic) as the
+// plain two-shot's phase-1 source, then its reduce and assemble on the same instance (flags, seq,
+// slots, block partition, fold). Byte-identical to moe_gather + the exact all-reduce, and to the
+// one-shot form. r4d_ar_gather_twoshot_ok: the call fits the form (a slot list of M <= 256 rows
+// and M * top_k <= 2048 slots in LDS, a word a rank, both regions of the longest shard in a slot).
+int  r4d_ar_gather_twoshot_ok(long M, long n, long top_k, long slot_stride16);
+void r4d_ar_gather_twoshot_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                 long peer_flags0, long peer_flags1, long peer_flags2,
+                                 long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                                 long y, long M, long n, long ye, long ew, long sorted, long sh,
+                                 long sg, long ye_ld, long ew_ld, long sh_ld, long sg_ld,
+                                 long top_k, long sig, long rank, long stream, long nblocks,
+                                 long nthreads, long drain, long acq, long pub, long gate,
+                                 long gate_ctr);
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,

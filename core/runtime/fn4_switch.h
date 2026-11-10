@@ -35,6 +35,12 @@
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
  *                   since haz_mark marks the records at recording. RADIANCE_AQL_ACQ=none stays start-time only.
  *
+ *   ds41_argather   deepseek41 (rad_fn4_*; lever D3): the MoE gather + all-reduce fusion's live row bound,
+ *                   0..the bound the layers declared (RADIANCE_DS41_ARGATHER / _ARGATHER_MAX): a step of at most
+ *                   that many rows issues moe_gather_all_reduce, a wider one moe_gather + all_reduce. Every form
+ *                   is the same fold, so the bytes are the same at any value; a value past the declared bound is
+ *                   refused. -1 when no loaded object serves it.
+ *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
  *
@@ -54,7 +60,7 @@
 namespace rad {
 namespace fn4 {
 
-enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kSwitches };
+enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

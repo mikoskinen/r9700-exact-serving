@@ -914,15 +914,17 @@ extern "C" int r4d_fuse_ar_gather_hc_write(const RadParam* p, int n_p, uint64_t 
 
 /* ==========================================================================================
  * moe_gather_all_reduce -- moe_gather, then the four-rank exact all-reduce of its output.
- * (kernel: libr4d/r4d_ar_oneshot_Nrank_exact.hip, r4d_ar_gather_hc_write_wide_kernel at hc 0;
+ * (kernels: libr4d/r4d_ar_oneshot_Nrank_exact.hip, r4d_ar_gather_hc_write_wide_kernel at hc 0, below
+ *  ts_min; libr4d/r4d_ar_twoshot_Nrank_exact.hip, r4d_ar_gather_twoshot_kernel, from it;
  *  shim: r4d_ar_entry.hip, r4d_rad_moe_gather_ar_4rank)
  *
  * Operands: [0] y_expert  [1] expert_w  [2] sorted_tok  [3] shared?  [4] shared_gate?  [5] y (inout)
  *
  * ar_gather_hc_write's chain without its third step: the gather writes `y`, which is reduced in
  * place. `numel` is M * n and `exact` 1, selecting the exact all_reduce rows; at M * n under the
- * four-rank one-shot's ts_min both the fused kernel and the chain take the one-shot transport, and
- * above it the two-shot's fold is the one-shot's element for element, so the bytes agree either way.
+ * four-rank one-shot's ts_min both the fused kernel and the chain take the one-shot transport, from
+ * it both take the two-shot (the fused one where its slot list fits LDS), and the two-shot's fold is
+ * the one-shot's element for element, so the bytes agree either way.
  */
 extern "C" int r4d_fuse_moe_gather_ar(const RadParam* p, int n_p, uint64_t present, int step,
                                       RadFuseStep* out) {

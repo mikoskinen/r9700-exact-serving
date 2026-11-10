@@ -31276,6 +31276,245 @@ static void ar_mhc_pcn_case(const Plugin& pl, const std::vector<int>& devs, cons
     }
 }
 
+/* ---- moe_gather_all_reduce_4rank (lever D3): DeepSeek-V4.1's MoE gather + its all-reduce at every
+ * transport, against the slot-order oracle.
+ *
+ * The routing is expert-parallel as DeepSeek-V4.1 serves it: n_expert experts over four ranks, so a
+ * rank's sort holds only the slots its own experts take (stable by local expert, then slot), the
+ * other ranks' slots and dropped ones (expert -1) nowhere, -1 after the live count. Each rank's
+ * routed rows, the shared arm's partial (a width slice of the shared expert) and its gate plane are
+ * its own; the slot weights are the replicated router's, the same on every rank.
+ *
+ * Oracle (r4d_ar_gather_word, then ar_vsum): per rank and token, acc from 0 over the rank's live
+ * slots in ascending slot order (fmaf for f32 weights, multiply then add for bf16), rounded to bf16
+ * nearest-even; with the shared arm bf16(bf16(sh * gate) + that); then the four ranks' partials in
+ * fp32 in ascending rank order, rounded once. Every rank's y must hold the sum.
+ *
+ * Each shape runs three launches on one instance, with the transport pinned per launch through the
+ * tuned point's `ts_min` (the default 32768, 0 = the one-shot throughout, the default again), so both
+ * forms are held to the oracle, both of the instance's scratch parities are used, and a two-shot
+ * launch after a one-shot one (and the reverse) shows they share the flag and slot space. The
+ * DeepSeek-V4.1 shape (n 5120, top_k 6, 384 experts, f32 weights, the ungated shared arm: "none",
+ * a gate plane of ones) runs at every M from 1 to 48 and at 56 and 64 -- the one-shot below 7 rows,
+ * the two-shot from 7. Then generic arms: bf16 weights, no shared arm, a sigmoid gate (the oracle's
+ * exp is not __expf: an element within 2 % counts as moved, not failed, as ar_hc_write_case does), and
+ * M 300 x top_k 8, past the two-shot's slot list (the one-shot over the inverse table serves it). */
+struct MgAr {
+    const RadKernelInfo* row = nullptr;
+    int rank = 0, dev = 0;
+    int64_t M = 0, n = 0, top_k = 0;
+    bool f32w = false, use_scratch = false;
+    const char* act = nullptr;
+    std::vector<int64_t> ts;                   /* each launch's ts_min, -1 = not passed (the default) */
+    void* inst = nullptr;
+    int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
+    std::vector<uint16_t> ye, ewb, sh, sg;
+    std::vector<float> ewf;
+    std::vector<int32_t> sorted;
+    std::vector<std::vector<uint16_t>> y_out;  /* one a launch */
+};
+
+static void mgar_worker(MgAr* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc_init = RAD_E_DEVICE; return; }
+    const int64_t Tn = t->M * t->top_k;
+    std::vector<RadParam> ps = { PI("world_size", 4), PI("M", t->M), PI("n", t->n), PI("top_k", t->top_k),
+                                 PS("dtype", "bf16") };
+    if (t->act) ps.push_back(PS("act", t->act));
+    t->rc_init = t->row->init(ps.data(), (int)ps.size(), t->rank, 4, &t->inst);
+    if (t->rc_init != RAD_OK) return;
+    void* ye = nullptr; void* ew = nullptr; void* so = nullptr; void* sh = nullptr; void* sg = nullptr;
+    void* y = nullptr; void* scr = nullptr;
+    const size_t yb = (size_t)(t->M * t->n * 2), ewbytes = (size_t)(Tn * (t->f32w ? 4 : 2));
+    bool mem = hipMalloc(&y, yb) == hipSuccess && hipMalloc(&ye, (size_t)(Tn * t->n * 2)) == hipSuccess &&
+               hipMalloc(&ew, ewbytes) == hipSuccess && hipMalloc(&so, (size_t)(Tn * 4)) == hipSuccess &&
+               (!t->act || (hipMalloc(&sh, yb) == hipSuccess && hipMalloc(&sg, (size_t)(t->M * 2)) == hipSuccess));
+    if (!mem) {
+        t->rc_launch = RAD_E_NOMEM;
+    } else {
+        st_memcpy(ye, t->ye.data(), (size_t)(Tn * t->n * 2), hipMemcpyHostToDevice);
+        st_memcpy(ew, t->f32w ? (const void*)t->ewf.data() : (const void*)t->ewb.data(), ewbytes,
+                  hipMemcpyHostToDevice);
+        st_memcpy(so, t->sorted.data(), (size_t)(Tn * 4), hipMemcpyHostToDevice);
+        if (t->act) {
+            st_memcpy(sh, t->sh.data(), yb, hipMemcpyHostToDevice);
+            st_memcpy(sg, t->sg.data(), (size_t)(t->M * 2), hipMemcpyHostToDevice);
+        }
+        std::vector<RadTensor> ts = { T(ye, RAD_BF16, { Tn, t->n }),
+                                      T(ew, t->f32w ? RAD_F32 : RAD_BF16, { t->M, t->top_k }),
+                                      T(so, RAD_I32, { Tn }), T(sh, RAD_BF16, { t->M, t->n }),
+                                      T(sg, RAD_BF16, { t->M, 1 }), T(y, RAD_BF16, { t->M, t->n }) };
+        if (!t->act) { absent(ts[3]); absent(ts[4]); }
+        for (const int64_t tsm : t->ts) {
+            std::vector<RadParam> lp = ps;
+            if (tsm >= 0) lp.push_back(PI("ts_min", tsm));
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = ts.data(); a.n_t = (int)ts.size();
+            a.p = lp.data(); a.n_p = (int)lp.size();
+            a.instance = t->inst;
+            a.rank = t->rank;
+            a.world_size = 4;
+            if (t->use_scratch && !scr) {
+                const int64_t need = t->row->scratch ? t->row->scratch(&a) : 0;
+                if (need <= 0 || hipMalloc(&scr, (size_t)need) != hipSuccess) { t->rc_launch = RAD_E_NOMEM; break; }
+                st_memset(scr, 0, (size_t)need);
+            }
+            if (scr) { a.scratch = scr; a.scratch_bytes = t->row->scratch(&a); }
+            st_memset(y, 0x7f, yb);   /* junk: the launch overwrites every element */
+            const int rc = t->row->launch(&a, nullptr);
+            st_stream_sync(nullptr);
+            if (rc != RAD_OK && rc != RAD_LINK_ENDED) { t->rc_launch = rc; break; }
+            t->y_out.emplace_back((size_t)(t->M * t->n));
+            st_memcpy(t->y_out.back().data(), y, yb, hipMemcpyDeviceToHost);
+        }
+    }
+    for (void* p : { y, ye, ew, so, sh, sg, scr }) if (p) st_free(p);
+}
+
+static void moe_gather_ar_case(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if ((int)devs.size() < 4) { skip(name, "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 4)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
+    struct Shape { int64_t M, n, top_k, n_expert; bool f32w; const char* act; bool scratch; };
+    std::vector<Shape> shapes;
+    for (int64_t M = 1; M <= 48; ++M) shapes.push_back({ M, 5120, 6, 384, true, "none", false });
+    shapes.push_back({ 56, 5120, 6, 384, true, "none", false });
+    shapes.push_back({ 64, 5120, 6, 384, true, "none", false });
+    shapes.push_back({ 9, 2048, 8, 128, false, nullptr, false });
+    shapes.push_back({ 40, 2048, 8, 128, false, "none", false });
+    shapes.push_back({ 12, 2048, 8, 128, true, "sigmoid", false });
+    shapes.push_back({ 300, 512, 8, 64, false, "none", true });
+    const std::string nm(name);
+    int64_t n_twoshot = 0, n_oneshot = 0;
+    for (const Shape& s : shapes) {
+        const int64_t M = s.M, n = s.n, k = s.top_k, T = M * k, E = s.n_expert, El = E / 4;
+        const bool sig = s.act && !std::strcmp(s.act, "sigmoid");
+        const std::string at = " M=" + std::to_string(M) + " n=" + std::to_string(n) + " top_k=" +
+                               std::to_string(k) + (s.f32w ? " f32" : " bf16") + " weights, " +
+                               (s.act ? std::string("shared ") + s.act : std::string("no shared arm"));
+        /* The replicated routing: top_k distinct experts a token (1 in 31 slots dropped). */
+        uint64_t rs = 0x9E3779B97F4A7C15ull ^ ((uint64_t)M * 1315423911ull) ^ ((uint64_t)n * 2654435761ull) ^
+                      (uint64_t)k;
+        auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+        std::vector<int32_t> ex((size_t)T, -1);
+        for (int64_t tok = 0; tok < M; ++tok)
+            for (int64_t j = 0; j < k; ++j) {
+                if (rnd() % 31 == 0) continue;
+                int32_t e = 0;
+                bool dup = true;
+                while (dup) {
+                    e = (int32_t)(rnd() % (uint64_t)E);
+                    dup = false;
+                    for (int64_t q = 0; q < j; ++q) dup = dup || ex[(size_t)(tok * k + q)] == e;
+                }
+                ex[(size_t)(tok * k + j)] = e;
+            }
+        std::vector<float> ewf((size_t)T);
+        std::vector<uint16_t> ewb((size_t)T);
+        for (int64_t i = 0; i < T; ++i) {
+            ewf[(size_t)i] = (float)(rnd() % 100000 + 1) / 40000.0f;
+            ewb[(size_t)i] = h_to_bf16((float)(rnd() % 1000 + 1) / 1024.0f);
+        }
+        std::vector<MgAr> t(4);
+        std::vector<std::vector<int32_t>> inv(4, std::vector<int32_t>((size_t)T, -1));
+        std::vector<std::thread> th;
+        for (int r = 0; r < 4; ++r) {
+            MgAr& x = t[(size_t)r];
+            x.row = row; x.rank = r; x.dev = devs[(size_t)r];
+            x.M = M; x.n = n; x.top_k = k; x.f32w = s.f32w; x.act = s.act; x.use_scratch = s.scratch;
+            x.ts = { -1, 0, -1 };
+            x.sorted.assign((size_t)T, -1);
+            int64_t pos = 0;
+            for (int32_t e = (int32_t)(r * El); e < (int32_t)((r + 1) * El); ++e)
+                for (int64_t i = 0; i < T; ++i)
+                    if (ex[(size_t)i] == e) x.sorted[(size_t)pos++] = (int32_t)i;
+            for (int64_t i = 0; i < pos; ++i) inv[(size_t)r][(size_t)x.sorted[(size_t)i]] = (int32_t)i;
+            uint64_t rr = 0xD1B54A32D192ED03ull ^ ((uint64_t)(r + 1) * 0x9E3779B97F4A7C15ull) ^
+                          ((uint64_t)M * 1315423911ull) ^ ((uint64_t)n * 2654435761ull);
+            auto rn = [&]() { rr ^= rr << 13; rr ^= rr >> 7; rr ^= rr << 17; return rr; };
+            x.ye.resize((size_t)(T * n));
+            for (auto& v : x.ye) v = h_to_bf16(((int64_t)(rn() % 4001) - 2000) / 512.0f);
+            x.ewf = ewf; x.ewb = ewb;
+            if (s.act) {
+                x.sh.resize((size_t)(M * n));
+                x.sg.resize((size_t)M);
+                for (auto& v : x.sh) v = h_to_bf16(((int64_t)(rn() % 4001) - 2000) / 256.0f);
+                for (auto& v : x.sg)
+                    v = sig ? h_to_bf16(((int64_t)(rn() % 801) - 400) / 100.0f) : h_to_bf16(1.0f);
+            }
+            th.emplace_back(mgar_worker, &x);
+        }
+        for (std::thread& x : th) x.join();
+        bool up = true, ran = true;
+        std::string rcs;
+        for (const MgAr& x : t) {
+            up = up && x.rc_init == RAD_OK;
+            ran = ran && x.rc_launch == RAD_OK && x.y_out.size() == x.ts.size();
+            rcs += std::to_string(x.rc_init) + "/" + std::to_string(x.rc_launch) + " ";
+        }
+        if (!up) { ok((nm + at + " init (peer rendezvous)").c_str(), false, "init/launch rc " + rcs); return; }
+        if (row->fini) for (MgAr& x : t) if (x.inst) row->fini(x.inst);
+        if (!ran) { ok((nm + at + " launch").c_str(), false, "init/launch rc " + rcs); continue; }
+
+        /* The oracle: each rank's partial in slot order, then the ascending-rank fold. */
+        std::vector<std::vector<uint16_t>> part(4, std::vector<uint16_t>((size_t)(M * n)));
+        for (int r = 0; r < 4; ++r) {
+            const MgAr& x = t[(size_t)r];
+            for (int64_t tok = 0; tok < M; ++tok)
+                for (int64_t e = 0; e < n; ++e) {
+                    float acc = 0.0f;
+                    for (int64_t j = 0; j < k; ++j) {
+                        const int32_t idx = inv[(size_t)r][(size_t)(tok * k + j)];
+                        if (idx < 0) continue;
+                        const float yv = h_bf16(x.ye[(size_t)(idx * n + e)]);
+                        if (s.f32w) {
+                            acc = std::fmaf(x.ewf[(size_t)(tok * k + j)], yv, acc);
+                        } else {
+                            const float pr = h_bf16(x.ewb[(size_t)(tok * k + j)]) * yv;
+                            acc = acc + pr;
+                        }
+                    }
+                    uint16_t out = h_to_bf16(acc);
+                    if (s.act) {
+                        const float g0 = h_bf16(x.sg[(size_t)tok]);
+                        const float gate = sig ? 1.0f / (1.0f + std::exp(-g0)) : g0;
+                        const uint16_t pr = h_to_bf16(h_bf16(x.sh[(size_t)(tok * n + e)]) * gate);
+                        out = h_to_bf16(h_bf16(pr) + h_bf16(out));
+                    }
+                    part[(size_t)r][(size_t)(tok * n + e)] = out;
+                }
+        }
+        int64_t bad = 0, moved = 0, first = -1;
+        double worst = 0.0;
+        for (int64_t i = 0; i < M * n; ++i) {
+            float acc = 0.0f;
+            for (int r = 0; r < 4; ++r) acc += h_bf16(part[(size_t)r][(size_t)i]);
+            const uint16_t want = h_to_bf16(acc);
+            for (const MgAr& x : t)
+                for (const auto& yo : x.y_out) {
+                    const uint16_t got = yo[(size_t)i];
+                    if (got == want) continue;
+                    const double rel = std::fabs((double)h_bf16(got) - (double)acc) / (std::fabs((double)acc) + 1.0);
+                    if (sig && rel <= 0.02) { ++moved; if (rel > worst) worst = rel; }
+                    else { ++bad; if (first < 0) first = i; }
+                }
+        }
+        /* Which transport the default point took: the two-shot from ts_min where its slot list fits. */
+        const bool two = M * n >= 32768 && M <= 256 && M * k <= 2048;
+        (two ? n_twoshot : n_oneshot) += 1;
+        ok((nm + at + (two ? ", two-shot / one-shot / two-shot" : ", one-shot x3") +
+            " = the slot-order oracle on every rank").c_str(),
+           bad == 0,
+           fmt("%lld of %lld elements x 12 differ, first at %lld", (long long)bad, (long long)(M * n),
+               (long long)first) + (moved ? fmt(" (%lld within 2 %%, worst %.4f)", (long long)moved, worst) : ""));
+        if (sig && moved) std::printf("        (%lld elements within 2 %% of the f64-exp oracle, worst %.4f)\n",
+                                      (long long)moved, worst);
+    }
+    std::printf("        %lld shapes took the two-shot at the default point, %lld the one-shot\n",
+                (long long)n_twoshot, (long long)n_oneshot);
+}
+
 /* ------------------------------------------------------------------ the fused junction (ar_rmsnorm_quant_i8) */
 /* The all-reduce with the sandwich-norm junction as its epilogue, at two ranks
  * (ar_rmsnorm_quant_i8) and at four (ar_rmsnorm_quant_i8_4rank), against the chain it replaces:
@@ -35466,6 +35705,14 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\ncross-rank, fused with mhc_post_collapse_rmsnorm\n");
         std::printf("  ar_mhc_post_collapse_rmsnorm_4rank\n");
         ar_mhc_pcn_case(pl, devs, "ar_mhc_post_collapse_rmsnorm_4rank");
+    }
+    /* DeepSeek-V4.1's MoE gather + all-reduce (four ranks, exact wire), both transports against the
+     * slot-order oracle (lever D3), and its host twin. */
+    for (const char* n : { "moe_gather_all_reduce_4rank", "moe_gather_all_reduce_4rank_host" }) {
+        if (!sel(n)) continue;
+        if (!g_case) std::printf("\ncross-rank, the MoE gather folded in\n");
+        std::printf("  %s\n", n);
+        moe_gather_ar_case(pl, devs, n);
     }
     /* The wide rows at every width are dispatched above and skip themselves, naming the width
      * they need, on a box with fewer cards. */

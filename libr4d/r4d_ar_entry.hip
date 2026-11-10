@@ -1812,9 +1812,37 @@ extern "C" int r4d_rad_moe_gather_ar_4rank(const RadArgs* a, RadStream s) {
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);
     const long words16 = (long)(M * n * 2 / 16);
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
+    /* From `ts_min` elements, where the unfused all-reduce takes the exact two-shot
+     * (r4d_rad_ar_oneshot_4rank_exact), the gather in front of the same two-shot: the same words and
+     * the same fold, so the same bytes, for half the bytes a rank. A call the form does not take (a
+     * slot list past LDS) keeps the one-shot below, as every call under ts_min does. Blocks: the
+     * plain two-shot's decode rule over a shard (nb_for_shard), at least one per 8192 words of the
+     * message, since every block also gathers its share of all four shards (ceiling 16). */
+    const long ts_min = r4d_cfg_ar_ts_min(a);
+    if (ts_min > 0 && (long)(M * n) >= ts_min &&
+        r4d_ar_gather_twoshot_ok((long)M, (long)n, (long)top_k, in->slot16)) {
+        int nb = cfgv.nblocks;
+        if (nb <= 0) {
+            nb = nb_for_shard(words16 / 4, in->nb_cap > 24 ? 24 : in->nb_cap);
+            const int g = (int)((words16 + 8191) / 8192);
+            if (nb < g) nb = g < 16 ? g : 16;
+        }
+        if (nb > in->max_blocks) nb = in->max_blocks;
+        R4D_TRY("moe_gather_ar_4rank (two-shot)",
+            r4d_ar_gather_twoshot_4rank(
+                in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                r4d_addr(y), (long)M, (long)n, r4d_addr(ye), r4d_addr(ew), r4d_addr(so),
+                sh ? r4d_addr(sh) : 0L, sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld,
+                (long)sh_ld, (long)sg_ld, (long)top_k, (long)sig | ewf, (long)in->rank,
+                (long)(uintptr_t)s, nb, cfgv.nthreads, cfgv.drain, cfgv.acq, cfgv.pub, early,
+                early ? in->gate_ctr : 0L));
+        return early ? RAD_LINK_ENDED : RAD_OK;
+    }
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(words16, in->nb_cap);
     if (nblocks > in->max_blocks) nblocks = in->max_blocks;
-    const long gate = link_gate(a), early = in->host ? 0L : gate;
 
     R4D_TRY("moe_gather_ar_4rank",
         r4d_ar_gather_hc_write_4rank(
