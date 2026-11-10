@@ -65,6 +65,7 @@ int DraftController::configure(const Params& p) {
         for (int c = 0; c < kCostClasses; ++c) { cost_ms_[d][c] = 0.0; cost_n_[d][c] = 0; }
     }
     depth0_ = p.depth0;
+    forced_ = p.depth0 && p.depth0_forced;
     probe_every_ = p.probe_every > 0 ? p.probe_every : kProbeEvery;
     zero_ = false;
     zero_held_ = kHold;
@@ -98,6 +99,9 @@ int DraftController::configure(const Params& p) {
                  "measured, emits %.0f%% more tokens a millisecond than the window; at 0, %d "
                  "cycles of the drafting depth every %d keep its estimates measured",
                  100.0 * kHyst, kProbeSteps, probe_every_);
+    if (adapt_ && forced_)
+        RAD_INFO("draft depth 0 FORCED (RADIANCE_DRAFT_DEPTH0=2, a test hook): every cycle at 0 but the "
+                 "probes; nothing is weighed");
     if (adapt_ && depth0_ && backoff_max_ > 0)
         RAD_INFO("draft probe back-off: each probe that leaves depth 0 in place doubles the interval to "
                  "the next, up to %d cycles; a move between 0 and drafting starts it over",
@@ -409,7 +413,17 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
      * lend the plain step is the lent one where measured (plain_ms). */
     const bool measured = cost_n_[0][c] > 0 || (lend_hold() > 0 && lent_n_[c] > 0);
     bool moved = false;
-    if (measured) {
+    if (forced_) {
+        /* Depth 0 forced (draft_depth0 2): to 0 at once and held there; only the probes below draft. */
+        if (!zero_) {
+            zero_ = true;
+            zero_held_ = 0;
+            since_probe_ = 0;
+            ++n_zero_moves_;
+            backoff_k_ = 0;
+            moved = true;
+        }
+    } else if (measured) {
         /* The drafting side is the lower of the model's yield at the drafting depth and the
          * yield drafting steps measured here: E(D) comes from estimates a new sequence starts
          * optimistic, and a plain step's yield is n_rows a step by construction. Erring toward 0

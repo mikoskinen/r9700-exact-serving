@@ -50,6 +50,9 @@ struct State {
     std::atomic<int64_t> cnt[6];   /* note_draft_counts */
     std::atomic<int> lend_capable{-1};   /* -1 no scheduler registered, 0 / 1 */
     std::atomic<int64_t> lend[17];       /* note_lend_sched [0, 9) and 16, note_lend_engine [9, 16) */
+    std::atomic<int64_t> acc[4];         /* note_draft_accept */
+    std::atomic<int> ctxskip_capable{-1};   /* -1 no engine registered, 0 / 1 */
+    std::atomic<int64_t> ctxs[8];        /* note_ctxskip */
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -70,6 +73,8 @@ struct State {
         }
         for (auto& c : cnt) c.store(0, std::memory_order_relaxed);
         for (auto& c : lend) c.store(0, std::memory_order_relaxed);
+        for (auto& c : acc) c.store(0, std::memory_order_relaxed);
+        for (auto& c : ctxs) c.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -148,7 +153,8 @@ int reported(State& s, int i) {
 
 bool sched_switch(int i) {
     return i == kDraftAdaptive || i == kDraftDepth0 || i == kDraftProbe || i == kDraftHybrid ||
-           i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow;
+           i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow ||
+           i == kDraftCtxSkip;
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -203,6 +209,22 @@ void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_l
 }
 
 void lend_register(bool capable) { st().lend_capable.store(capable ? 1 : 0, std::memory_order_release); }
+
+void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted) {
+    State& s = st();
+    const int64_t v[4] = { head_drafted, head_accepted, lookup_drafted, lookup_accepted };
+    for (int k = 0; k < 4; ++k) s.acc[k].store(v[k], std::memory_order_relaxed);
+}
+
+void ctxskip_register(bool capable) { st().ctxskip_capable.store(capable ? 1 : 0, std::memory_order_release); }
+
+void note_ctxskip(int64_t skipped, int64_t refill_passes, int64_t refill_rows, int64_t dropped_rows,
+                  int64_t ring_full, int64_t pending_rows, int64_t ring_slots, int64_t ring_mib) {
+    State& s = st();
+    const int64_t v[8] = { skipped, refill_passes, refill_rows, dropped_rows, ring_full, pending_rows, ring_slots,
+                           ring_mib };
+    for (int k = 0; k < 8; ++k) s.ctxs[k].store(v[k], std::memory_order_relaxed);
+}
 
 void note_lend_sched(int64_t lent_cycles, int64_t plain_steps, int64_t plain_ms, int64_t probe_steps,
                      int64_t probe_ms, int64_t transit_steps, int64_t transit_ms, int64_t backoff_k,
@@ -300,15 +322,34 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
-    if (i == kDraftDepth0 || i == kDraftHybrid) {
+    if (i == kDraftCtxSkip) {
         if (v < 0 || v > 1) {
-            if (err) *err = std::string(kNames[i]) + " takes 1 (on) or 0 (off)";
+            if (err) *err = "draft_ctxskip takes 1 (on) or 0 (off)";
+            return false;
+        }
+        const int cap = s.ctxskip_capable.load(std::memory_order_acquire);
+        if (v == 1 && cap != 1) {
+            if (err)
+                *err = std::string("draft_ctxskip=1 refused: ") +
+                       (cap < 0 ? "the context skip is not set up: RADIANCE_DRAFT_CTXSKIP was not set at start"
+                                : "the context skip is not set up here: no windowed block drafter drafting, or no "
+                                  "tapped rows the engine can keep");
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftDepth0 || i == kDraftHybrid) {
+        /* draft_depth0 2: depth 0 forced (a test hook), accepted wherever 1 is. */
+        if (v < 0 || v > (i == kDraftDepth0 ? 2 : 1)) {
+            if (err)
+                *err = std::string(kNames[i]) +
+                       (i == kDraftDepth0 ? " takes 1 (on), 2 (forced, a test hook) or 0 (off)" : " takes 1 (on) or 0 (off)");
             return false;
         }
         const int cap = (i == kDraftHybrid ? s.hybrid_capable : s.draft_capable).load(std::memory_order_acquire);
-        if (v == 1 && cap != 1) {
+        if (v >= 1 && cap != 1) {
             if (err)
-                *err = std::string(kNames[i]) + "=1 refused: " +
+                *err = std::string(kNames[i]) + "=" + std::to_string(v) + " refused: " +
                        (cap < 0 ? std::string("no scheduler has registered a drafter")
                         : i == kDraftHybrid
                             ? std::string("this deployment has no draft head that drafts chains (a serial or block "
@@ -524,6 +565,12 @@ std::string state_json() {
         o += std::string(k ? ", " : "") + "\"" + kCnt[k] + "\": " +
              std::to_string((long long)s.cnt[k].load(std::memory_order_relaxed));
     o += "}";
+    static const char* const kAcc[4] = { "head_drafted", "head_accepted", "lookup_drafted", "lookup_accepted" };
+    o += ", \"accept\": {";
+    for (int k = 0; k < 4; ++k)
+        o += std::string(k ? ", " : "") + "\"" + kAcc[k] + "\": " +
+             std::to_string((long long)s.acc[k].load(std::memory_order_relaxed));
+    o += "}";
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {
         static const char* const kLend[17] = { "lent_cycles", "lent_plain_steps", "lent_plain_ms", "lent_probe_steps",
@@ -534,6 +581,16 @@ std::string state_json() {
         for (int k = 0; k < 17; ++k)
             o += std::string(", \"") + kLend[k] + "\": " +
                  std::to_string((long long)s.lend[k].load(std::memory_order_relaxed));
+        o += "}";
+    }
+    /* The depth-0 context skip, once the engine registered it (set up or not). */
+    if (const int cap = s.ctxskip_capable.load(std::memory_order_acquire); cap >= 0) {
+        static const char* const kCs[8] = { "skipped_steps", "refill_passes", "refill_rows", "dropped_rows",
+                                            "ring_full_refills", "pending_rows", "ring_slots", "ring_mib" };
+        o += ", \"ctxskip\": {\"capable\": " + std::to_string(cap);
+        for (int k = 0; k < 8; ++k)
+            o += std::string(", \"") + kCs[k] + "\": " +
+                 std::to_string((long long)s.ctxs[k].load(std::memory_order_relaxed));
         o += "}";
     }
     o += "}";

@@ -866,6 +866,12 @@ int Engine::prepare_release(const RadBatch* b) {
                 fn4::note_sched(fn4::kDraftLend, sched_.set_draft_lend(sw[fn4::kDraftLend]));
             if (sw[fn4::kDraftLendBorrow] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftLendBorrow, sched_.set_draft_lend_borrow(sw[fn4::kDraftLendBorrow]));
+            /* The depth-0 context skip: the engine's own (block_context_pass); 1 only where set up (fn4 refuses
+             * it otherwise). */
+            if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {
+                if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 ? 1 : 0;
+                fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.ready ? ctxs_.on : 0);
+            }
         }
     }
     /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its

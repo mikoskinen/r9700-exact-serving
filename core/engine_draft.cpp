@@ -174,6 +174,272 @@ void Engine::step_state_fini() {
     alt_host_ = nullptr;
     if (conf_ev_) rad_event_destroy(conf_ev_);
     conf_ev_ = nullptr;
+    ctxskip_fini();
+}
+
+/* ------------------------------------------------------------------ the depth-0 context skip
+ *
+ * Under depth 0 (sched/draft.h) a block drafter's head runs only at probes, yet its context pass ran
+ * on every step: it stores each trunk row's key in the drafter's window cache, which a hole would
+ * leave unusable for the next window. With fn4 draft_ctxskip (RADIANCE_DRAFT_CTXSKIP=0 | 1 at start
+ * sets it up) a plain decode step -- every row one decode token -- whose head does not run keeps the
+ * trunk's tapped rows instead: one copy of the step's rows a rank into a ring of kCtxSlots step
+ * slots on the card (Scheduler::ctx_keep records which slot and row each sequence's position is in).
+ * The keys are then computed by refill passes: context passes (draft_pass -1, the same ops) over
+ * the kept rows of each sequence's last `window` positions, staged back into the tapped rows buffer
+ * from the ring, one entry a sequence at its first kept position, as a prompt's context pass runs
+ * (Scheduler::ctx_refill). A refill runs before the head next runs, on any step that cannot skip
+ * (rows of more than one token, a prefill, a verify), when the ring is full, before a checkpoint
+ * carrying the drafter's window (drafter_snap_), and once the switch is back at 0. Kept rows of a
+ * sequence that ends or is preempted are dropped with its drafter state.
+ *
+ * Where the head runs, the step's own rows still get today's context pass, last: they are stashed
+ * (slot kCtxSlots), the refill stages over them, they come back, and the context pass runs over them
+ * in the trunk's row order, which a drafter reading its context pass's rows at the anchors
+ * (RadBatch::anchor_rows, LiLiCorr) needs. On a step that cannot skip, the context pass runs first
+ * and the refill after it.
+ *
+ * Exact for the target: the drafter only proposes, and every emitted token is the target's (the
+ * verify, core/sample/accept.h). The drafter's keys are the same function of the same rows; their
+ * bytes equal a per-step pass's where the context pass's kernels give each row the same bytes at
+ * any row count (a GEMM's decode band, r4d_ds41_ggml.hip; above it a tiled form may round
+ * differently, which moves proposals only). The context pass and the refill read no routed expert,
+ * so the drafter's lend (lever DL), which lends only its expert slab, leaves them as they are.
+ *
+ * The tapped rows buffer is the plugin's "dspark_src" (deepseek41's DSpark) or "dflash_src" (the DFlash
+ * drafters): [max_tok, taps x n_embd], row i the trunk step's row i, written by taps inside the trunk
+ * step and read only by the context pass. A program without one, or a drafter without a window, sets
+ * nothing up. */
+namespace {
+constexpr int kCtxSlots = 32;   /* step slots between refills; slot kCtxSlots is the stash */
+/* RADIANCE_DRAFT_CTXSKIP: -1 unset (or not 0 / 1, warned), else the start value. */
+int ctxskip_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DRAFT_CTXSKIP");
+        if (!e || !*e) return -1;
+        if (!std::strcmp(e, "0")) return 0;
+        if (!std::strcmp(e, "1")) return 1;
+        RAD_WARN("RADIANCE_DRAFT_CTXSKIP=%s is not 0 or 1; ignored (the context skip is not set up)", e);
+        return -1;
+    }();
+    return v;
+}
+int64_t dtype_bytes(int32_t dt) {
+    switch (dt) {
+        case RAD_BF16: case RAD_F16: return 2;
+        case RAD_F32: case RAD_I32: return 4;
+        default: return 0;
+    }
+}
+}  /* namespace */
+
+int64_t Engine::ctxskip_bytes(const Program& p, rad_buf* src, int64_t* pitch, int* slots) const {
+    if (src) *src = 0;
+    if (ctxskip_env() < 0 || cfg_.n_spec <= 0 || p.drafter.kind != RAD_DRAFT_BLOCK || p.drafter.depth <= 0 ||
+        p.drafter.window <= 0)
+        return 0;
+    const auto ends = [](const std::string& name, const char* suffix) {
+        const size_t n = std::strlen(suffix);
+        return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    for (size_t i = 1; i < p.buffers.size(); ++i) {
+        const BufferInfo& b = p.buffers[i];
+        if (!ends(b.name, "dspark_src") && !ends(b.name, "dflash_src")) continue;
+        const int64_t eb = dtype_bytes(b.decl.dtype);
+        if (b.decl.rank != 2 || eb <= 0 || b.decl.shape[1] <= 0) return 0;
+        const int64_t pb = b.decl.shape[1] * eb;
+        const int sl = std::min<int>(kCtxSlots, (int)p.drafter.window);
+        if (src) *src = (rad_buf)i;
+        if (pitch) *pitch = pb;
+        if (slots) *slots = sl;
+        const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
+        return (int64_t)(sl + 1) * seqs * pb;
+    }
+    return 0;
+}
+
+int Engine::ctxskip_setup() {
+    ctxskip_fini();
+    const int ev = ctxskip_env();
+    if (ev < 0) return RAD_OK;
+    ctxs_.declared = true;
+    ctxs_.start = ev;
+    ctxs_.src.assign(ranks_.size(), 0);
+    ctxs_.ring.assign(ranks_.size(), nullptr);
+    int taps = 0;
+    bool same = true;
+    if (block_drafting() && drafter_.window > 0)
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            rad_buf b = 0;
+            int64_t pb = 0;
+            int sl = 0;
+            if (ctxskip_bytes(ranks_[r]->program, &b, &pb, &sl) <= 0 || !b) continue;
+            if (taps && (pb != ctxs_.pitch || sl != ctxs_.slots)) same = false;
+            ctxs_.src[r] = b;
+            ctxs_.pitch = pb;
+            ctxs_.slots = sl;
+            ++taps;
+        }
+    if (!taps || !same) {
+        RAD_INFO("RADIANCE_DRAFT_CTXSKIP=%d: %s; the context skip is not set up", ev,
+                 !block_drafting() || drafter_.window <= 0
+                     ? "no windowed block drafter drafting here (--num-speculative-tokens N with a DSpark-style head)"
+                     : !taps ? "no rank taps rows for the drafter in a buffer the engine knows ('dspark_src', "
+                                       "'dflash_src')"
+                             : "the ranks' tapped rows differ in shape");
+        ctxs_ = CtxSkip{};
+        fn4::ctxskip_register(false);
+        return RAD_OK;
+    }
+    const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
+    ctxs_.ring_bytes = (int64_t)(ctxs_.slots + 1) * seqs * ctxs_.pitch;
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        if (!ctxs_.src[r]) continue;
+        RAD_TRY(rad_dev_set(ranks_[r]->device));
+        ctxs_.ring[r] = static_cast<char*>(rad_dev_alloc(ctxs_.ring_bytes, RAD_MEM_DEVICE));
+        if (!ctxs_.ring[r]) {
+            RAD_ERR("draft context skip: no device memory for the %s ring on card %d",
+                    humanb(ctxs_.ring_bytes).c_str(), ranks_[r]->device);
+            (void)rad_dev_set(ranks_[0]->device);
+            return RAD_E_NOMEM;
+        }
+    }
+    (void)rad_dev_set(ranks_[0]->device);
+    ctxs_.ready = true;
+    ctxs_.on = ev;
+    fn4::ctxskip_register(true);
+    fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.on);
+    RAD_INFO("draft context skip (RADIANCE_DRAFT_CTXSKIP=%d, fn4 draft_ctxskip): while the head does not run, a "
+             "plain decode step keeps its tapped rows instead of the drafter's context pass, in a ring of %d steps "
+             "(+1 stash) x %lld rows x %s = %s a rank on %d of %zu ranks; the drafter's window (%d positions) is "
+             "refilled from them before the head runs", ev, ctxs_.slots, (long long)seqs,
+             humanb(ctxs_.pitch).c_str(), humanb(ctxs_.ring_bytes).c_str(), taps, ranks_.size(),
+             (int)drafter_.window);
+    ctx_note();
+    return RAD_OK;
+}
+
+void Engine::ctxskip_fini() {
+    for (size_t r = 0; r < ctxs_.ring.size(); ++r)
+        if (ctxs_.ring[r]) {
+            if (r < ranks_.size()) (void)rad_dev_set(ranks_[r]->device);
+            rad_dev_free(ctxs_.ring[r], RAD_MEM_DEVICE);
+        }
+    if (!ranks_.empty() && !ctxs_.ring.empty()) (void)rad_dev_set(ranks_[0]->device);
+    ctxs_ = CtxSkip{};
+}
+
+void Engine::ctx_note() const {
+    if (!ctxs_.ready) return;
+    fn4::note_ctxskip(ctxs_.skipped, ctxs_.refills, ctxs_.refill_rows, ctxs_.dropped, ctxs_.ring_full,
+                      sched_.ctx_pending(), ctxs_.slots, ctxs_.ring_bytes >> 20);
+}
+
+/* The step's first `rows` tapped rows into ring slot `slot` (to_ring), or back. Every rank that taps,
+ * on its stream: behind the trunk step that wrote them, ahead of the next pass that reads them. */
+int Engine::ctx_copy_rows(int slot, int64_t rows, bool to_ring) {
+    if (rows <= 0) return RAD_OK;
+    const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
+    if (slot < 0 || slot > ctxs_.slots || rows > seqs) return RAD_E_STATE;
+    const int64_t bytes = rows * ctxs_.pitch;
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        if (!ctxs_.src[r]) continue;
+        Rank& rk = *ranks_[r];
+        char* sp = static_cast<char*>(rk.ctx.buf_ptr(ctxs_.src[r]));
+        char* rp = ctxs_.ring[r] + (int64_t)slot * seqs * ctxs_.pitch;
+        if (!sp || !rp) return RAD_E_STATE;
+        RAD_TRY(to_ring ? rad_memcpy_async(rp, sp, bytes, rk.ctx.stream())
+                        : rad_memcpy_async(sp, rp, bytes, rk.ctx.stream()));
+    }
+    return RAD_OK;
+}
+
+/* Refill passes until no kept row is left, each at most the active arena level's rows. */
+int Engine::ctx_refill_all(int step) {
+    const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
+    int64_t cap = cfg_.max_tok;
+    if (!ranks_.empty()) {
+        const int lvl = ranks_[0]->ctx.level();
+        if (lvl >= 0 && (size_t)lvl < arena_rows_.size() && arena_rows_[(size_t)lvl] > 0)
+            cap = std::min<int64_t>(cap, arena_rows_[(size_t)lvl]);
+    }
+    if (cap <= 0) return RAD_E_STATE;
+    for (;;) {
+        int64_t nr = 0, nd = 0;
+        const RadBatch* rb = sched_.ctx_refill(step, cap, (int64_t)drafter_.window, &ctxs_.runs, &nr, &nd);
+        ctxs_.dropped += nd;
+        if (!rb) break;
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            if (!ctxs_.src[r]) continue;
+            Rank& rk = *ranks_[r];
+            char* sp = static_cast<char*>(rk.ctx.buf_ptr(ctxs_.src[r]));
+            if (!sp) return RAD_E_STATE;
+            for (const Scheduler::CtxRun& u : ctxs_.runs) {
+                if (u.slot < 0 || u.slot + u.n > ctxs_.slots || u.row < 0 || u.row >= seqs || u.dst < 0 ||
+                    u.dst + u.n > nr)
+                    return RAD_E_STATE;
+                const char* from = ctxs_.ring[r] + ((int64_t)u.slot * seqs + u.row) * ctxs_.pitch;
+                RAD_TRY(rad_memcpy_2d_async(sp + (int64_t)u.dst * ctxs_.pitch, ctxs_.pitch, from,
+                                            seqs * ctxs_.pitch, ctxs_.pitch, u.n, rk.ctx.stream()));
+            }
+        }
+        RAD_TRY(block_pass(rb, "refill", step));
+        ++ctxs_.refills;
+        ctxs_.refill_rows += nr;
+    }
+    ctxs_.used = 0;
+    return RAD_OK;
+}
+
+/* issue_block_drafter's context pass: today's where the skip is not set up; under it a kept step, or
+ * a refill around the context pass (the top of this section). */
+int Engine::block_context_pass(int step) {
+    const auto ctx_pass = [&]() -> int {
+        if (const RadBatch* cb = sched_.block_context(step)) {
+            if (tree_) RAD_TRY(advance_all(ADV_CTXTREE, 0, false));
+            RAD_TRY(block_pass(cb, "context", step));
+        }
+        return RAD_OK;
+    };
+    if (!ctxs_.ready) return ctx_pass();
+    const bool head = sched_.block_head_runs();
+    bool snap = false;
+    if (drafter_snap_)
+        for (const StepEntry& e : sched_.plan().e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { snap = true; break; }
+    int64_t rows = 0, live = 0;
+    const bool keepable = sched_.ctx_keepable(&rows, &live) && rows <= (cfg_.max_seqs > 0 ? cfg_.max_seqs : 1);
+    if (ctxs_.on && !head && !snap && keepable) {
+        if (live == 0) {   /* every row a finished sequence's placeholder: the pass would store nothing */
+            ++ctxs_.skipped;
+            ctx_note();
+            return RAD_OK;
+        }
+        if (ctxs_.used < ctxs_.slots) {
+            RAD_TRY(ctx_copy_rows(ctxs_.used, rows, true));
+            (void)sched_.ctx_keep(ctxs_.used);
+            ++ctxs_.used;
+            ++ctxs_.skipped;
+            ctx_note();
+            return RAD_OK;
+        }
+        ++ctxs_.ring_full;   /* refilled below; this step's rows get their context pass */
+    }
+    if (sched_.ctx_pending() == 0) {
+        ctxs_.used = 0;
+        return ctx_pass();
+    }
+    if (head && keepable) {
+        RAD_TRY(ctx_copy_rows(ctxs_.slots, rows, true));    /* the stash */
+        RAD_TRY(ctx_refill_all(step));
+        RAD_TRY(ctx_copy_rows(ctxs_.slots, rows, false));
+        RAD_TRY(ctx_pass());
+    } else {
+        RAD_TRY(ctx_pass());
+        RAD_TRY(ctx_refill_all(step));
+    }
+    ctx_note();
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ the serial driver
@@ -637,11 +903,10 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
 
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
      * drafter will need, and skipping would leave a permanent hole in its cache. A tree verify's
-     * context rows store only the accepted path, at its committed positions (ADV_CTXTREE). */
-    if (const RadBatch* cb = sched_.block_context(step)) {
-        if (tree_) RAD_TRY(advance_all(ADV_CTXTREE, 0, false));
-        RAD_TRY(block_pass(cb, "context", step));
-    }
+     * context rows store only the accepted path, at its committed positions (ADV_CTXTREE). Under
+     * the depth-0 context skip a plain step's rows may be kept for a later refill instead
+     * (block_context_pass), which fills the hole before any query pass reads the window. */
+    RAD_TRY(block_context_pass(step));
     /* A snapshot carrying the drafter's window is saved now, with the step's context rows stored
      * and before the query pass and the step issued ahead (save_checkpoints). */
     if (drafter_snap_) RAD_TRY(save_checkpoints());

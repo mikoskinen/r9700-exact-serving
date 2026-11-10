@@ -62,12 +62,16 @@ bool Scheduler::set_draft_adaptive(int v) {
 
 int Scheduler::set_draft_depth0(int v) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (v == 1 && !draft_.can_adapt())
-        RAD_WARN("fn4: draft_depth0=1 refused: this deployment's drafter cannot run the adaptive "
-                 "window");
-    else
+    if (v >= 1 && !draft_.can_adapt())
+        RAD_WARN("fn4: draft_depth0=%d refused: this deployment's drafter cannot run the adaptive "
+                 "window", v);
+    else if (v == 2)
+        draft_.set_depth0_forced(true);   /* a test hook: depth 0 at every cycle but the probes */
+    else {
+        draft_.set_depth0_forced(false);  /* 1 from 2: depth 0 measured again */
         draft_.set_depth0(v == 1);
-    return draft_.depth0() ? 1 : 0;
+    }
+    return draft_.depth0_mode();
 }
 
 int Scheduler::set_draft_probe(int v) {
@@ -240,6 +244,15 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         if (prog.kv_groups[i].decl.kind == RAD_KV_WINDOW) hit_needs_window_ = true;
         else hit_holes_trunk_ = true;
     }
+    /* The drafter's own paged group: every layer it binds at the trunk's layer count or above. */
+    draft_group_ = -1;
+    for (size_t i = 0; i < prog.kv_groups.size() && draft_group_ < 0; ++i) {
+        const std::vector<int>& ls = prog.kv_groups[i].layers;
+        if (kv->block_tokens((int32_t)i) <= 0 || ls.empty()) continue;
+        bool drafter = true;
+        for (int l : ls) drafter = drafter && l >= prog.meta.n_layers;
+        if (drafter) draft_group_ = (int32_t)i;
+    }
     if (hit_holes_trunk_ && cfg.prefix_cache)
         RAD_INFO("prefix cache: a trunk layer's paged group is neither prefix-cached nor carried "
                  "by a checkpoint slot -- a hit re-prefills");
@@ -359,7 +372,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             }
             return (int)v;
         };
-        dp.depth0 = env_int("RADIANCE_DRAFT_DEPTH0", 0, 1, 0) == 1;
+        {
+            const int d0 = env_int("RADIANCE_DRAFT_DEPTH0", 0, 2, 0);   /* 2: forced (a test hook) */
+            dp.depth0 = d0 >= 1;
+            dp.depth0_forced = d0 == 2;
+        }
         dp.probe_every = env_int("RADIANCE_DRAFT_PROBE", 2, 4096, DraftController::kProbeEvery);
         dp.backoff = env_int("RADIANCE_DRAFT_PROBE_BACKOFF", 0, DraftController::kBackoffMax, 0);
         /* The lend's start value; it acts only once the engine set it up (set_lend_view). */
@@ -380,13 +397,14 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "verifies the lookup's proposal instead of the head's, and its next step is "
                      "planned after the commit", hybrid_match_);
         hybrid_lookup_ = hybrid_head_ = hybrid_unahead_ = 0;
+        acc_head_d_ = acc_head_a_ = acc_look_d_ = acc_look_a_ = 0;
     }
     RAD_TRY(draft_.configure(dp));
     /* fn4 (runtime/fn4_switch.h): /admin/fn4 reports this scheduler's window and refuses an
      * adaptive one its drafter cannot run. */
     fn4::draft_register(draft_.can_adapt(), draft_.adaptive());
     fn4::hybrid_register(draft_head_);
-    fn4::note_sched(fn4::kDraftDepth0, draft_.depth0() ? 1 : 0);
+    fn4::note_sched(fn4::kDraftDepth0, draft_.depth0_mode());
     fn4::note_sched(fn4::kDraftProbe, draft_.probe_every());
     fn4::note_sched(fn4::kDraftHybrid, hybrid_ ? 1 : 0);
     fn4::note_sched(fn4::kDraftHybridMatch, hybrid_match_);
@@ -3095,6 +3113,8 @@ int Scheduler::commit(StepResult& res) {
 
             if (e.n_spec > 0) {
                 draft_.observe(e.n_spec, a);
+                if (e.ngram) { acc_look_d_ += e.n_spec; acc_look_a_ += a; }
+                else         { acc_head_d_ += e.n_spec; acc_head_a_ += a; }
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
                  * rule. A move takes effect at the next draft; this step's drafter already ran. */
@@ -3286,6 +3306,7 @@ void Scheduler::step_finished() {
     }
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
                            hybrid_lookup_, hybrid_head_, hybrid_unahead_);
+    fn4::note_draft_accept(acc_head_d_, acc_head_a_, acc_look_d_, acc_look_a_);
     if (lend_view_)
         fn4::note_lend_sched(lent_cycles_, lent_plain_steps_, (int64_t)(lent_plain_ms_ + 0.5), lent_probe_steps_,
                              (int64_t)(lent_probe_ms_ + 0.5), transit_steps_, (int64_t)(transit_ms_ + 0.5),
@@ -3559,6 +3580,7 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_.clear();
     block_len_ = 0;
     block_depth_ = 0;
+    block_may_draft_ = false;
     if (block < 2 || depth <= 0 || depth > block || !out || max <= 0) return 0;
     block_len_   = (int32_t)block;
     block_depth_ = (int32_t)depth;
@@ -3567,6 +3589,7 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     /* Not the drafter's declared `depth`: whether the draft policy wants any tokens this step
      * (0 when it has backed off, or depth 0 holds D at 0: then the context pass runs alone). */
     const bool may_draft = draft_.head_runs();
+    block_may_draft_ = may_draft;
     /* The query pass is `block` tokens per drafting sequence, and the builder's staging arrays
      * are sized at max_tok. Unlike a decode step it can put more rows than sequences in a batch,
      * which on a small token budget would overrun h_tok. Under --prefill-span a step of several
@@ -3797,6 +3820,123 @@ void Scheduler::block_end() {
     /* The snapshot ends here: both passes are built, and keeping the rows would keep deferring
      * the release of a request cancelled or reaped while the passes ran. */
     block_.clear();
+}
+
+bool Scheduler::block_head_runs() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return block_may_draft_;
+}
+
+/* ------------------------------------------------------------------ the depth-0 context skip
+ * (fn4 draft_ctxskip; scheduler.h). The kept rows live with the drafter's state (SchedReq::ctx_kept),
+ * so admission and preemption drop them (drafter_reset). */
+bool Scheduler::ctx_keepable(int64_t* rows, int64_t* live) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    int64_t n = 0, l = 0;
+    for (const BlockSeq& d : block_) {
+        if (d.n_tokens != 1 || d.n_spec != 0) return false;
+        ++n;
+        if (d.mirror) continue;
+        const SchedReq* s = (d.slot >= 0 && (size_t)d.slot < reqs_.size()) ? reqs_[(size_t)d.slot].get() : nullptr;
+        if (!s || !s->req || s->req->id != d.seq) return false;
+        /* Contiguous with what the sequence kept so far: one row a step, at its next position. */
+        if (!s->ctx_kept.empty() && s->ctx_lo + (int64_t)s->ctx_kept.size() != (int64_t)d.ctx_len) return false;
+        ++l;
+    }
+    if (rows) *rows = n;
+    if (live) *live = l;
+    return n > 0;
+}
+
+int64_t Scheduler::ctx_keep(int slot) {
+    std::lock_guard<std::mutex> lk(mu_);
+    int64_t kept = 0;
+    for (size_t i = 0; i < block_.size(); ++i) {
+        const BlockSeq& d = block_[i];
+        if (d.mirror || d.slot < 0 || (size_t)d.slot >= reqs_.size()) continue;
+        SchedReq* s = reqs_[(size_t)d.slot].get();
+        if (!s || !s->req || s->req->id != d.seq) continue;
+        if (s->ctx_kept.empty()) s->ctx_lo = d.ctx_len;
+        s->ctx_kept.push_back(((uint32_t)slot << 16) | (uint32_t)i);
+        ++kept;
+    }
+    return kept;
+}
+
+int64_t Scheduler::ctx_pending() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    int64_t n = 0;
+    /* Every slot's, live or not: a refill round drops the rest, so the ring holds nothing once it ends. */
+    for (const auto& sp : reqs_)
+        if (sp) n += (int64_t)sp->ctx_kept.size();
+    return n;
+}
+
+const RadBatch* Scheduler::ctx_refill(int step, int64_t cap, int64_t window, std::vector<CtxRun>* runs,
+                                      int64_t* rows, int64_t* dropped) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (runs) runs->clear();
+    int64_t nr = 0, nd = 0;
+    block_plan_.reset();
+    block_plan_.phase      = RAD_PHASE_DECODE;
+    block_plan_.draft_pass = -1;           /* a context pass, as block_context's */
+    for (size_t slot = 0; slot < reqs_.size() && nr < cap; ++slot) {
+        SchedReq* s = reqs_[slot].get();
+        if (!s || s->ctx_kept.empty()) continue;
+        /* Ended, cancelled or preempted: nothing of its drafter's cache is read again. */
+        if (!s->req || s->req->state != ReqState::Running || !s->running || s->card < 0) {
+            nd += (int64_t)s->ctx_kept.size();
+            s->ctx_kept.clear();
+            continue;
+        }
+        /* Only the last `window` positions are read by a query; and none below the drafter group's
+         * first held position (its window recycles the rest). */
+        int64_t drop = 0;
+        const int64_t n = (int64_t)s->ctx_kept.size();
+        if (window > 0 && n > window) drop = n - window;
+        if (draft_group_ >= 0) {
+            const int64_t first = kv_->first_block_pos(s->req->id, draft_group_);
+            if (s->ctx_lo + drop < first) drop = std::min<int64_t>(n, first - s->ctx_lo);
+        }
+        if (drop > 0) {
+            s->ctx_kept.erase(s->ctx_kept.begin(), s->ctx_kept.begin() + drop);
+            s->ctx_lo += drop;
+            nd += drop;
+        }
+        if (s->ctx_kept.empty()) continue;
+        const int64_t take = std::min<int64_t>((int64_t)s->ctx_kept.size(), cap - nr);
+        StepEntry e;
+        e.req        = s->req.get();
+        e.seq        = s->req->id;
+        e.slot       = (int32_t)slot;
+        e.card       = s->card;
+        e.n_tokens   = (int32_t)take;
+        e.ctx_len    = (int32_t)s->ctx_lo;
+        e.n_spec     = 0;
+        e.n_accepted = 1;
+        e.produces_token = false;   /* a context pass reads tapped rows, not token ids */
+        block_plan_.e.push_back(e);
+        if (runs) {
+            /* Consecutive slots of one row are one run (a 2-D copy). */
+            for (int64_t j = 0; j < take; ++j) {
+                const int32_t k = (int32_t)(s->ctx_kept[(size_t)j] >> 16);
+                const int32_t r = (int32_t)(s->ctx_kept[(size_t)j] & 0xffffu);
+                if (!runs->empty()) {
+                    CtxRun& b = runs->back();
+                    if (b.row == r && b.slot + b.n == k && b.dst + b.n == (int32_t)(nr + j)) { ++b.n; continue; }
+                }
+                runs->push_back(CtxRun{ (int32_t)(nr + j), k, r, 1 });
+            }
+        }
+        s->ctx_kept.erase(s->ctx_kept.begin(), s->ctx_kept.begin() + take);
+        s->ctx_lo += take;
+        nr += take;
+        block_plan_.n_tok += take;
+    }
+    if (rows) *rows = nr;
+    if (dropped) *dropped = nd;
+    if (block_plan_.e.empty()) return nullptr;
+    return builder_.build(block_plan_, *kv_, step);
 }
 
 int32_t Scheduler::conv_window() const {

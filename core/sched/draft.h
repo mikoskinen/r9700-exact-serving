@@ -98,6 +98,9 @@ public:
         /* Depth 0 (see the top of this file): the adaptive policy may also choose D = 0. Inert
          * while the policy is off. */
         bool depth0 = false;
+        /* Depth 0 forced (fn4 draft_depth0 2, a test hook): with depth0, every cycle at D = 0 but the probes,
+         * nothing weighed. */
+        bool depth0_forced = false;
         /* Cycles at D = 0 between probes; 0 is kProbeEvery. */
         int  probe_every = 0;
         /* Probe back-off: at most this many doublings of the interval (0 off, 1..kBackoffMax). */
@@ -231,8 +234,19 @@ public:
     void set_depth0(bool on) {
         if (on && !depth0_) zero_held_ = kHold;
         depth0_ = on;
-        if (!on) { zero_ = false; probe_left_ = 0; since_probe_ = 0; backoff_k_ = 0; }
+        if (!on) { zero_ = false; probe_left_ = 0; since_probe_ = 0; backoff_k_ = 0; forced_ = false; }
     }
+    /* Depth 0 forced (fn4 draft_depth0 2, a test hook): D = 0 at every cycle but the probes, which run at the
+     * drafting depth every probe_interval() cycles as at depth 0; no plain step is weighed against the window and
+     * no plain probe runs. Exact as depth 0 is: it moves only what a step verifies. It lets one sequence exercise
+     * depth 0's paths (the drafter's lend, the context skip) where the measured choice would keep drafting.
+     * set_depth0(false) ends it; 0 / 1 / 2 is depth0_mode(). */
+    bool depth0_forced() const { return depth0_ && forced_; }
+    void set_depth0_forced(bool on) {
+        if (on) set_depth0(true);
+        forced_ = on && depth0_;
+    }
+    int  depth0_mode() const { return depth0_ ? (forced_ ? 2 : 1) : 0; }
     int  probe_every() const { return probe_every_; }
     void set_probe_every(int n) { probe_every_ = n > 0 ? n : kProbeEvery; }
     /* Probe back-off (fn4 draft_probe_backoff): the most doublings, 0 off; a change starts over. */
@@ -382,6 +396,7 @@ private:
      * instead. A probe runs probe_left_ more cycles at probe_d_ (0: a plain probe from drafting;
      * else the drafting depth, from 0). */
     bool    depth0_ = false;
+    bool    forced_ = false;                      /* depth0_forced() */
     int32_t probe_every_ = kProbeEvery;
     bool    zero_ = false;
     int32_t zero_held_ = 0;                       /* cycles since zero_ last moved */
