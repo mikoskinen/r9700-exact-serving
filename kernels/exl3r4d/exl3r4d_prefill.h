@@ -92,6 +92,8 @@ int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int bits, int a
 #if EXL3R4D_OPSTAMP   /* P10-K5 reading only (exl3r4d_prefill.hip) */
 int exl3r4d_opstamp(int site, long long T, void* stream);   /* site: op * 2 + phase */
 #endif
+/* v10's shared map (prefill.c): the map kernel alone, into a->map at a->fm rows an entry (chunk_n 1, no order array). */
+int exl3r4d_launch_pf_map(const Exl3r4dPrefill* a, void* stream);
 int exl3r4d_launch_prefill4(const Exl3r4dPrefill4* a, int gate_up, int bits, int am, int prep, int run,
                             void* stream);
 

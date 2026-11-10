@@ -187,17 +187,32 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     const int64_t need = rows_bytes(&g, T, run) + map_bytes(&g, T, run);
     if (need > 0 && (!a->scratch || a->scratch_bytes < need)) return RAD_E_SCRATCH;
     if (need > 0 && !rad_ptr_aligned(a->scratch, 16)) return RAD_E_ALIGN;   /* the map's 16-byte entries */
+    /* v10 THE SHARED MAP (include/exl3_abi.h; fn4 10.11.2026): the pass's `map` operand, when given, holds the map at
+     * EXL3_MAP_ROWS rows an entry -- gate_up writes it (its own map form's map, or a map kernel of its own for down
+     * when its form keeps none), down reads it in place of its map kernel (prep 4). Same routing, same T, same
+     * entries (pf_map_build is a function of off[], T, fm and cap only), so the same bits. A build whose map entries
+     * are not 64 rows (MTX != 4) neither writes nor reads it. */
+    const Exl3Positions* at = exl3_positions(op);
+    const RadTensor* mt = at->map >= 0 ? rad_arg_in(a, at->map) : NULL;
+    uint32_t* smap = NULL;
+    const int64_t cap64 = exl3r4d_pf_map_cap(T, g.n_expert, EXL3_MAP_ROWS);
+    if (mt && 16 * EXL3R4D_PF_MTX == EXL3_MAP_ROWS && g.n_class != 4) {
+        if (rad_dtype_bytes(mt->dtype, rad_tensor_numel(mt)) < (4 + 4 * cap64) * 4) return RAD_E_SHAPE;
+        if (!rad_ptr_aligned(mt->data, 16)) return RAD_E_ALIGN;
+        smap = (uint32_t*)mt->data;
+    }
+    char* const mbase = run ? 0 : (char*)a->scratch + rows_bytes(&g, T, run);   /* the scratch map's place */
     d.g.xr = dn_prerot(&g) ? (void*)d.g.x : rot_am(am) ? 0 : a->scratch;
     d.g.xr_pitch = xr_pitch;
     d.g.chunk = 16;
     d.g.sk = 1;
-    d.map = run ? 0 : (uint32_t*)((char*)a->scratch + rows_bytes(&g, T, run));
+    d.map = (uint32_t*)mbase;
     d.fm = (int32_t)fm_of(&g, run);
     d.cap = run ? 0 : (int32_t)exl3r4d_pf_map_cap(T, g.n_expert, d.fm);
     d.chunk_n = 1;
     d.ystream = ystream(&g, T, d.g.y_cols, run, am);
     d.order = lpt(&g, run) && !rot_am(am) && am == 0
-                  ? (uint32_t*)((char*)d.map + map_only_bytes(&g, T) + ctab_bytes(&g, T, run)) : 0;
+                  ? (uint32_t*)(mbase + map_only_bytes(&g, T) + ctab_bytes(&g, T, run)) : 0;
     {
         const int64_t R = chunk_rows(&g, T, run);
         if (R) {   /* the scratch cap: chunks by row; a chunk's entries <= R / fm + 1 whole-or-partial entries of the
@@ -207,12 +222,25 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
             d.chunk_n = (int32_t)n_chunks(&g, T, run);
             d.chunk_rows = (int32_t)R;
             d.chunk_gy = (int32_t)(gy < d.cap ? gy : d.cap);
-            d.ctab = (uint32_t*)((char*)d.map + map_only_bytes(&g, T));
+            d.ctab = (uint32_t*)(mbase + map_only_bytes(&g, T));
         }
     }
     /* prep 3: none (h_rot's down reads h as it is) */
     int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
     if (gate_up && !run && g_fn4_pf_prep_gu && d.chunk_n == 1 && !rot_am(am)) prep = g_fn4_pf_prep_gu;   /* fn4 */
+    if (smap && gate_up) {   /* v10: the shared map is gate_up's own, or a map kernel of its own writes it for down */
+        if (!run && d.fm == EXL3_MAP_ROWS) {
+            d.map = smap;
+        } else {
+            Exl3r4dPrefill m = d;
+            m.map = smap, m.fm = EXL3_MAP_ROWS, m.cap = (int32_t)cap64, m.chunk_n = 1, m.chunk_c = 0;
+            m.ctab = 0, m.order = 0;
+            if ((rc = exl3r4d_launch_pf_map(&m, s)) != RAD_OK) return rc;
+        }
+    } else if (smap && prep == 3 && !run && d.fm == EXL3_MAP_ROWS && d.chunk_n == 1 && d.cap == cap64) {
+        d.map = smap;   /* v10: down reads gate_up's map; no map kernel */
+        prep = 4;
+    }
 #if EXL3R4D_OPSTAMP
     if (g.n_class != 4) {
         (void)exl3r4d_opstamp((gate_up ? 0 : 1) * 2, d.g.T, s);

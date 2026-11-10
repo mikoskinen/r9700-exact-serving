@@ -75,6 +75,11 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
         desc(&v[at->ids], RAD_I32, 2, (int64_t[]){ g.M, g.top_k }, RAD_FILL_INDEX);
         v[at->ids].idx_max = g.n_expert;
     }
+    if (at->map >= 0) {   /* v10's shared map: a workspace, not a value a tool builds (absent: each op as at v8) */
+        memset(&v[at->map], 0, sizeof v[at->map]);
+        v[at->map].idx_const = -1;
+        v[at->map].flags = RAD_OPD_F_ABSENT;
+    }
 
     /* A present operand with an empty extent -- an odd class of no experts -- is a geometry this
      * description cannot build, and a tool skips and counts it rather than inventing one. */
