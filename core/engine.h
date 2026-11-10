@@ -57,6 +57,8 @@ struct TierJob;
 struct StepSlot;
 class ExpertStats;   /* place/xstats.h */
 class XsTally;
+class MissLog;       /* place/misslog.h */
+class MissRank;
 
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
@@ -159,6 +161,8 @@ private:
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */
     std::unique_ptr<ExpertStats> xstats_;
+    /* RADIANCE_DEBUG_MISS_LOG=FILE (place/misslog.h); null without it. */
+    std::unique_ptr<MissLog> missl_;
     /* HeatParams::prefill_share as bring-up read it (RADIANCE_HEAT_PREFILL); 1 records nothing. */
     float heat_prefill_share_ = 1.0f;
     /* HeatParams::prefill_decay in (0, 1): dual heat, which also records each step's rows. */
@@ -690,11 +694,18 @@ private:
     /* The routing histograms landed since the last drain (tiering_dispatch), and the drain alone
      * for --expert-stats where the heat engine is off. */
     void find_histograms(Rank& r, int before_step);
-    void xstats_drain(Rank& r, XsTally* xs, int before_step);
+    void xstats_drain(Rank& r, XsTally* xs, MissRank* ml, int before_step);
     /* --expert-stats: the map and the file, opened before the rank threads start; closed after they
      * stop, crediting what the ring still holds once the streams are drained. */
     int  xstats_open();
     void xstats_close();
+    /* RADIANCE_DEBUG_MISS_LOG: the same life as --expert-stats; one found histogram into the rank's
+     * log, classed by the tier of each live expert (`now_step` the draining dispatch, -1 at
+     * shutdown); the snapshot of the tiers a pass reads, taken at its issue. */
+    int  missl_open();
+    void missl_close();
+    void missl_credit(Rank& r, MissRank& ml, int layer, int bank, const int32_t* h, int now_step);
+    void missl_issued(Rank& r, MissRank& ml, const RadBatch& b);
     void rank_loop(int rank);
 };
 

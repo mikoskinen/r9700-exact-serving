@@ -469,18 +469,40 @@ static void xstats_credit(XsTally* xs, Ctx& ctx, int layer, int bank, const int3
                ctx.last_histogram_reports(layer, bank), rt ? rt->top_k : 0);
 }
 
-/* The drain alone, for the tally, where the heat engine is off or the engine is stopping
- * (`before_step` INT_MAX once the streams are drained). */
-void Engine::xstats_drain(Rank& r, XsTally* xs, int before_step) {
+/* The drain alone, for the tally and the miss log, where the heat engine is off or the engine is
+ * stopping (`before_step` INT_MAX once the streams are drained). */
+void Engine::xstats_drain(Rank& r, XsTally* xs, MissRank* ml, int before_step) {
     find_histograms(r, before_step);
-    std::lock_guard<std::mutex> lk(xs->mutex());
+    std::unique_lock<std::mutex> lk;
+    if (xs) lk = std::unique_lock<std::mutex>(xs->mutex());
     for (const Rank::HeatRow& hr : r.heat_rows) {
-        xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (ml) missl_credit(r, *ml, hr.layer, hr.bank, hr.h, before_step == INT_MAX ? -1 : before_step);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
     }
-    xs->note_dropped(r.ctx.route_dropped());
+    if (xs) xs->note_dropped(r.ctx.route_dropped());
+    if (ml) ml->end_drain();
+}
+
+/* RADIANCE_DEBUG_MISS_LOG (place/misslog.h): a unit's tier as the run phase reads it, the heat
+ * engine's where it runs and the plan's where the plan is static. Both on the rank thread. */
+void Engine::missl_credit(Rank& r, MissRank& ml, int layer, int bank, const int32_t* h,
+                          int now_step) {
+    const RadRouting* rt = r.ctx.last_routing(layer);
+    const int64_t n = rt ? std::min<int64_t>(rt->n_expert, r.ctx.route_n_expert())
+                         : r.ctx.route_n_expert();
+    const bool live = r.heat.enabled();
+    ml.credit(layer, r.ctx.last_histogram_step(layer, bank), h, n,
+              r.ctx.last_histogram_reports(layer, bank), now_step,
+              [&r, live](int32_t u) { return live ? r.heat.tier(u) : r.plan.units[(size_t)u].tier; });
+}
+
+void Engine::missl_issued(Rank& r, MissRank& ml, const RadBatch& b) {
+    const bool live = r.heat.enabled();
+    ml.issued(b.step, b.draft_pass, b.n_seq, b.n_seq_decode, b.n_tok,
+              [&r, live](int32_t u) { return live ? r.heat.tier(u) : r.plan.units[(size_t)u].tier; });
 }
 
 /* How much of a step a trunk histogram of step `step` counts as (HeatParams::prefill_share): its
@@ -501,8 +523,9 @@ float Engine::heat_share(const Rank& r, int layer, int step, float* pshare) cons
 
 void Engine::tiering_dispatch(Rank& r, int step) {
     XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
+    MissRank* const ml = missl_ ? missl_->rank(r.index) : nullptr;
     if (!r.heat.enabled()) {
-        if (xs) xstats_drain(r, xs, step);
+        if (xs || ml) xstats_drain(r, xs, ml, step);
         return;
     }
 
@@ -526,6 +549,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f, share, pshare);
         /* The row is in cache now. */
         if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
+        if (ml) missl_credit(r, *ml, hr.layer, hr.bank, hr.h, step);
         r.heat_seen[(size_t)hr.layer] = r.ctx.last_histogram_step(hr.layer, hr.bank);
         r.ctx.mark_credited(hr.layer, hr.bank);
         ++r.heat_credited;
@@ -534,6 +558,7 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         xs->note_dropped(r.ctx.route_dropped());
         xl.unlock();
     }
+    if (ml) ml->end_drain();
 
     /* No swaps behind a pass the stager armed: that step is bound by its own copies on the same
      * transfer stream, and the turnover slots are filled for it (below). Histograms are still
@@ -644,16 +669,104 @@ void Engine::xstats_close() {
             XsTally* xs = xstats_->tally(r->index);
             if (!xs) continue;
             if (rad_dev_set(r->device) < 0 || rad_stream_sync(r->ctx.stream()) < 0) continue;
-            xstats_drain(*r, xs, INT_MAX);
+            xstats_drain(*r, xs, nullptr, INT_MAX);
         }
         if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
     }
     (void)xstats_->write(true);
 }
 
+/* ------------------------------------------------------------------ RADIANCE_DEBUG_MISS_LOG
+ *
+ * Each rank's expert units by (routed layer, the rank's expert index): the histogram row's index
+ * (place/xstats.h), which is the unit's group expert. A debug log: a file that cannot be written
+ * is warned about and the engine serves without it. */
+int Engine::missl_open() {
+    const char* path = miss_log_path();
+    if (!path) return RAD_OK;
+    const int n_layer = ranks_[0]->ctx.n_route_layers();
+    const int64_t n_ex = ranks_[0]->ctx.route_n_expert();
+    if (n_layer <= 0 || n_ex <= 0) {
+        RAD_WARN("%s: '%s' routes no experts; %s is not written", kMissLogEnv,
+                 meta_.name ? meta_.name : "the model", path);
+        return RAD_OK;
+    }
+    MlInfo info;
+    info.model = meta_.name ? meta_.name : "";
+    info.arch = meta_.arch_id ? meta_.arch_id : "";
+    info.tp = (int)ranks_.size();
+    info.n_layer = n_layer;
+    info.n_trunk = (int)std::min<int64_t>(meta_.n_layers, n_layer);
+    info.n_expert = n_ex;
+    missl_ = std::make_unique<MissLog>();
+    missl_->init(path, info);
+    for (auto& rk : ranks_) {
+        const Plan& p = rk->plan;
+        const int64_t E = rk->ctx.route_n_expert();
+        const int L = rk->ctx.n_route_layers();
+        std::vector<int32_t> unit_of((size_t)std::max(L, 0) * (size_t)std::max<int64_t>(E, 0), -1);
+        std::vector<int64_t> bytes(p.units.size(), 0);
+        std::vector<uint8_t> cls(p.units.size(), (uint8_t)kMlOther);
+        const bool live = rk->heat.enabled();
+        for (size_t u = 0; u < p.units.size(); ++u) {
+            const MoveUnit& mu = p.units[u];
+            bytes[u] = mu.bytes;
+            cls[u] = ml_class(live ? rk->heat.tier((int32_t)u) : mu.tier);
+            /* Two units naming one (layer, expert): the later is the expert, as in the heat
+             * engine's index. */
+            if (mu.layer >= 0 && mu.layer < L && mu.expert >= 0 && mu.expert < E)
+                unit_of[(size_t)mu.layer * (size_t)E + (size_t)mu.expert] = (int32_t)u;
+        }
+        missl_->rank(rk->index)->init(rk->index, L, info.n_trunk, E, std::move(unit_of),
+                                      std::move(bytes), cls);
+    }
+    if (missl_->start() < 0) {
+        missl_.reset();
+        return RAD_OK;
+    }
+    RAD_INFO("miss log: %d routed layers (%d trunk), %lld experts a rank's row, %d rank%s, written "
+             "to %s every second and at shutdown", n_layer, info.n_trunk, (long long)n_ex,
+             info.tp, info.tp == 1 ? "" : "s", path);
+    return RAD_OK;
+}
+
+/* After the rank threads stop and before xstats_close: the banks still in the ring, read without
+ * crediting them, so xstats_close still finds them. */
+void Engine::missl_close() {
+    if (!missl_) return;
+    if (loop_status_.load(std::memory_order_acquire) >= 0) {
+        for (auto& r : ranks_) {
+            MissRank* ml = missl_->rank(r->index);
+            if (!ml) continue;
+            if (rad_dev_set(r->device) < 0 || rad_stream_sync(r->ctx.stream()) < 0) continue;
+            find_histograms(*r, INT_MAX);
+            for (const Rank::HeatRow& hr : r->heat_rows)
+                missl_credit(*r, *ml, hr.layer, hr.bank, hr.h, -1);
+            ml->end_drain();
+        }
+        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    }
+    /* The heat engine's own pricing (/stats), beside the log's. */
+    std::string tail;
+    for (auto& r : ranks_) {
+        if (!r->heat.enabled()) continue;
+        const HeatStats hs = r->heat.stats();
+        tail += fmt("# heat rank %d dispatches %llu routed %llu routed_resident %llu "
+                    "stream_bytes %llu route_dropped %llu\n", r->index,
+                    (unsigned long long)hs.dispatches, (unsigned long long)hs.routed,
+                    (unsigned long long)hs.routed_resident, (unsigned long long)hs.stream_bytes,
+                    (unsigned long long)r->ctx.route_dropped());
+    }
+    /* ~Engine prints --profile-ops' final table set. */
+    if (cfg_.profile_ops) missl_->profile_mark(missl_->last_step(), true);
+    missl_->close(tail);
+    missl_.reset();
+}
+
 /* ------------------------------------------------------------------ the rank thread */
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
+    MissRank* const ml = missl_ ? missl_->rank(index) : nullptr;
     if (r.ctx.bind_thread() < 0) {
         RAD_ERR("rank %d: could not bind its device", index);
         step_status_.store(RAD_E_DEVICE, std::memory_order_release);
@@ -689,7 +802,12 @@ void Engine::rank_loop(int index) {
                 hs.n_tok = b->n_tok;
                 hs.n_tok_decode = b->n_tok_decode;
             }
+            /* RADIANCE_DEBUG_MISS_LOG: the tiers this pass will read. The mover publishes only
+             * between passes on this thread, so they are the ones run_step resolves. */
+            const bool ml_pass = ml && what != kIssueSampler && b->enc == 0;
+            if (ml_pass) missl_issued(r, *ml, *b);
             int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            if (ml_pass && s >= 0) ml->ran(b->step, b->draft_pass, r.stager.staged());
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
@@ -1135,8 +1253,11 @@ int Engine::step_loop() {
             const int n = (v && *v) ? (int)std::strtol(v, nullptr, 10) : 32;
             return n > 0 ? n : 32;
         }();
-        if (cfg_.profile_ops && b->step > 0 && (b->step % prof_every) == 0)
+        if (cfg_.profile_ops && b->step > 0 && (b->step % prof_every) == 0) {
             for (auto& rk : ranks_) rk->ctx.dump_profile();
+            /* RADIANCE_DEBUG_MISS_LOG: which step this table set stands behind. */
+            if (missl_) missl_->profile_mark(b->step, false);
+        }
 
         /* One line per step at -vv, the only log view of the loop itself. */
         RAD_TRACE("step %d: %lld tok / %lld seq, %lld logit row(s) -> tokens %s", b->step,
@@ -2397,6 +2518,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
     if (const int xs = xstats_open(); xs < 0) return xs;
+    (void)missl_open();
 
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
     stopping_.store(false, std::memory_order_release);
@@ -2422,6 +2544,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    missl_close();
     xstats_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);

@@ -23,6 +23,7 @@
 #include "place/mover.h"
 #include "place/stager.h"
 #include "place/xstats.h"
+#include "place/misslog.h"
 #include "runtime/ctx.h"
 #include "sample/sampler.h"
 #include "sched/advance.h"
