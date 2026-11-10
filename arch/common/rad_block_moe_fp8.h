@@ -210,8 +210,10 @@ struct MoeFP8 {
         int     swiglu_quant = 0;
         /* A shared arm without its sigmoid gate: the gate plane is filled with 1. */
         int     shared_ungated = 0;
-        /* At TP1 the caller may fill the ungated arm's ones plane once for the whole step,
-         * rather than each layer/pass filling the same plane again. */
+        /* The caller may fill the ungated arm's ones plane once for the whole step, rather than
+         * each layer/pass filling the same plane again: at TP1 (HYV3), and at any TP where the gather
+         * folds the shared arm (no separate FP32 combine; DeepSeek-V4.1's fold f, switched by
+         * `sone_live`). */
         int     shared_one_external = 0;
         /* At four ranks, exact: the gather and the block's all-reduce as one kernel
          * (moe_gather_all_reduce) for a single-pass step of at most this many tokens; 0 is the two
@@ -446,6 +448,11 @@ struct MoeFP8 {
      * concurrent buffers, none a quantiser of the block's input). Null: one lane, as before. */
     const std::atomic<int>* shexp_lane = nullptr;
     bool shexp_lane_ok = false;
+    /* Optional, set by the architecture with Config::shared_one_external: read at every pass, > 0 =
+     * the caller filled the step's ones plane (the layer issues no fill), 0 = the layer fills its
+     * pass's rows itself (op_sgate, declared either way). The gather reads the same ones. Null with
+     * shared_one_external: always the caller's, as before. */
+    const std::atomic<int>* sone_live = nullptr;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -780,7 +787,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                          src.shared)) return RAD_E_INVAL;
     const bool shared = c.n_ff_shared > 0 && (src.shared || src.shared_mlp_gate);
     if (shared && c.shared_ungated && src.shared_gate) return RAD_E_INVAL;
-    if (c.shared_one_external && (!shared || !c.shared_ungated || !w.sgate || g.world != 1))
+    if (c.shared_one_external &&
+        (!shared || !c.shared_ungated || !w.sgate || (g.world != 1 && c.shared_fp32_combine)))
         return RAD_E_INVAL;
     if (c.shared_fp32_combine && (!shared || !w.moe || std::strcmp(g.dtype, "bf16"))) {
         fprintf(stderr, "radiance: layer %d requests an FP32 shared/routed combine without its "
@@ -2162,7 +2170,9 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
      * reads no ones plane. At TP1 an ungated folded gather does, unless the caller prepared the
      * whole step's ones plane once (shared_one_external). */
     if (!gate_done && c.shared_ungated) {
-        if (gfold && !c.shared_one_external)
+        const bool external = c.shared_one_external &&
+                              (!sone_live || sone_live->load(std::memory_order_relaxed) > 0);
+        if (gfold && !external)
             RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.sgate, r0, rows, 1));
     } else if (!gate_done) {
         RAD_ISSUE_N(c_, op_sgate, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_sgate),

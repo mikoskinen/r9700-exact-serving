@@ -37,6 +37,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace deepseek41 {
@@ -306,6 +307,10 @@ struct Layer {
     bool i_keep = false;
     rad_op attn = 0, o_rope = 0, o_q = 0, o_b = 0, post_a = 0, attn_fill = 0, ar_attn = 0;
     std::vector<rad_op> o_a;
+    /* Lever K1's folds (k1_read_env), 0 where not declared: kv_fs = kv_f + kv_st
+     * (rmsnorm_rope_roundtrip_kv_store), attn_rt = attn + o_f, or attn + o_rope + o_q
+     * (attn_sparse_sink_rope_roundtrip). Issued for those when their switch is 1. */
+    rad_op kv_fs = 0, attn_rt = 0;
     /* The fused chains (fused()), each 0 where its chain above is declared instead: kv_n + kv_rope
      * + kv_q, k_norm + k_rope + k_q, o_rope + o_q, l_rope + l_q, i_rope + i_qq, col_a + norm_a,
      * col_f + norm_f. */
@@ -468,6 +473,9 @@ struct Model {
     int64_t ple_group = 0;
     rad_op embed = 0, expand = 0, pre0 = 0, pre1 = 0, rope_a = 0, rope_b_step = 0, tok_map = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0, embed_ar = 0;
+    /* Lever K1 fold f (RADIANCE_DS41_ONEFILL): the step's plane of ones for every MoE layer's ungated shared
+     * gate (mw.sgate), filled once at the step's start while the ds41_onefill switch is 1; 0 = not declared. */
+    rad_op sone = 0;
     rad_op cn_fin = 0;   /* contract + fnorm fused (fused()), or 0 */
     rad_op pcn_fin = 0;  /* the last post_f + contract + fnorm fused, or 0 */
     /* The last layer's MoE all-reduce + pcn_fin as one collective (RADIANCE_DS41_AR_PCN=2), or 0. */
@@ -902,6 +910,48 @@ static std::atomic<int> g_sw_gar_decl{0};      /* the largest bound a layer decl
 static std::atomic<int> g_sw_shexp{0};
 static std::atomic<int> g_sw_shexp_ok{0};      /* a trunk layer's shared arm is lane-safe */
 static std::atomic<int> g_sw_shexp_env{-1};    /* RADIANCE_DS41_SHEXP_LANE, read once */
+/* Lever K1's exact launch folds (10.11.2026), each declared beside the ops it folds only when its environment
+ * asks (RADIANCE_DS41_KVFOLD / _OFOLD / _ONEFILL = 1 or on, read at the first declare; unset: nothing more is
+ * declared, the issue is today's, and the switch takes only 0), and picked per step by its switch:
+ *   ds41_kvfold   fold c: the window key's rmsnorm_rope_roundtrip + kv_store as rmsnorm_rope_roundtrip_kv_store
+ *                 (Layer::kv_fs), one launch writing y and the cache slot with the same bytes;
+ *   ds41_ofold    fold d: attn_sparse_sink + rope_rows_roundtrip (the output's inverse rope and fp8 round trip)
+ *                 as attn_sparse_sink_rope_roundtrip (Layer::attn_rt), the decode band in one launch;
+ *   ds41_onefill  fold f: the ungated shared expert's gate plane of ones filled once a step (Model::sone) instead
+ *                 of by each MoE layer (MoeFP8 shared_one_external, live through sone_live).
+ * `_ok`: a layer (or the model) declared the fold, so 1 is accepted. Process-wide, as the switches above. */
+static std::atomic<int> g_sw_kvf{0}, g_sw_kvf_ok{0}, g_sw_kvf_env{-1};
+static std::atomic<int> g_sw_of{0}, g_sw_of_ok{0}, g_sw_of_env{-1};
+static std::atomic<int> g_sw_one{0}, g_sw_one_ok{0}, g_sw_one_env{-1};
+static int k1_env(const char* name) {
+    const char* e = std::getenv(name);
+    return e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : 0;
+}
+struct K1Switch {
+    const char* name;
+    std::atomic<int>* val;
+    std::atomic<int>* ok;
+};
+static const K1Switch kK1Switches[] = { { "ds41_kvfold", &g_sw_kvf, &g_sw_kvf_ok },
+                                        { "ds41_ofold", &g_sw_of, &g_sw_of_ok },
+                                        { "ds41_onefill", &g_sw_one, &g_sw_one_ok } };
+static const K1Switch* k1_switch(const char* name) {
+    for (const K1Switch& k : kK1Switches)
+        if (!std::strcmp(name, k.name)) return &k;
+    return nullptr;
+}
+/* Once, at the first declare: a later declare (a sizing probe, a re-declare) keeps what the switch set since. */
+static void k1_read_env() {
+    const std::pair<std::atomic<int>*, const char*> e[] = { { &g_sw_kvf_env, "RADIANCE_DS41_KVFOLD" },
+                                                            { &g_sw_of_env, "RADIANCE_DS41_OFOLD" },
+                                                            { &g_sw_one_env, "RADIANCE_DS41_ONEFILL" } };
+    std::atomic<int>* const v[] = { &g_sw_kvf, &g_sw_of, &g_sw_one };
+    for (int i = 0; i < 3; ++i) {
+        int unread = -1;
+        if (e[i].first->compare_exchange_strong(unread, k1_env(e[i].second)))
+            v[i]->store(e[i].first->load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+}
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -913,12 +963,15 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
     if (!std::strcmp(name, "ds41_shexp_lane"))
         return value == 0 || (value == 1 && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (const K1Switch* k = k1_switch(name))
+        return value == 0 || (value == 1 && k->ok->load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
     if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
+    else if (const K1Switch* k = k1_switch(name)) k->val->store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -931,6 +984,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_shexp_lane")) {
         *applied = g_sw_shexp.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (const K1Switch* k = k1_switch(name)) {
+        *applied = k->val->load(std::memory_order_relaxed);
         return 1;
     }
     return 0;
@@ -1479,6 +1536,18 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             if (m.win_bs < 1) return RAD_E_INVAL;
         }
         DS_TRY(rad_bind_layer_kv(b, l, m.win));
+        /* Lever K1 fold c (RADIANCE_DS41_KVFOLD): kv_f and kv_st as one op where a library serves it, declared
+         * after the window group's block size is fixed (its block_size must not claim a group: kv_st did). */
+        if (L.kv_f && g_sw_kvf_env.load(std::memory_order_relaxed) > 0) {
+            L.kv_fs = fused(b, "rmsnorm_rope_roundtrip_kv_store",
+                            { RAD_RANGE("M", 1, T), RAD_INT("n", hd), RAD_F64("eps", m.c.eps), RAD_INT("n_head", 1),
+                              RAD_INT("head_dim", hd), RAD_INT("rot", m.c.rope), RAD_INT("off", hd - m.c.rope),
+                              RAD_STR("mode", "gptj"), RAD_INT("inverse", 0), RAD_INT("block", 32),
+                              RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16"),
+                              RAD_INT("block_size", m.win_bs), RAD_STR("kv_dtype", "bf16") },
+                            { L.kv_norm }, { m.kv, cs }, { m.kvn });
+            if (L.kv_fs) g_sw_kvf_ok.store(1, std::memory_order_relaxed);
+        }
 
         /* ---- the compressor and the index keys, at a kv source */
         const int64_t r = L.r;
@@ -1644,6 +1713,23 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.o_rope = rope_rows(b, m, T, g.n_head, hd, 1, m.o, cs);
             L.o_q = roundtrip(b, T, HD, 32, "fp8_e4m3", "ue8m0", m.o);
         }
+        /* Lever K1 fold d (RADIANCE_DS41_OFOLD): the attention and its output's inverse rope + round trip as one
+         * op where a library serves it (the decode band in one launch); the pair above stays declared. */
+        if (g_sw_of_env.load(std::memory_order_relaxed) > 0) {
+            std::vector<RadParam> fp = ap;
+            fp.push_back(RAD_INT("rot", m.c.rope));
+            fp.push_back(RAD_INT("off", hd - m.c.rope));
+            fp.push_back(RAD_STR("mode", "gptj"));
+            fp.push_back(RAD_INT("inverse", 1));
+            fp.push_back(RAD_INT("block", 32));
+            fp.push_back(RAD_STR("format", "fp8_e4m3"));
+            fp.push_back(RAD_STR("block_scale", "ue8m0"));
+            if (r > 0)
+                L.attn_rt = fused(b, "attn_sparse_sink_rope_roundtrip", fp, { L.sinks }, { m.q, m.sel, cs }, { m.o });
+            else
+                L.attn_rt = fused(b, "attn_sparse_sink_rope_roundtrip", fp, { L.sinks }, { m.q, cs }, { m.o });
+            if (L.attn_rt) g_sw_of_ok.store(1, std::memory_order_relaxed);
+        }
         /* This rank's output groups, each a block of the block-diagonal wo_a. */
         const int64_t gd = HD / m.gr;
         for (int j = 0; j < m.gr; ++j) {
@@ -1716,11 +1802,18 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.shared_ungated = 1;
     s.cfg.gather_ar_rows = gather_ar_rows();
     s.cfg.calib = (m.calib_hi > m.calib_lo && l >= m.calib_lo && l < m.calib_hi) ? 1 : 0;
+    /* Lever K1 fold f: the step's ones plane (Model::sone) where declared; the layer's own fill stays declared
+     * and serves while the ds41_onefill switch is 0 (sone_live). */
+    s.cfg.shared_one_external = m.sone && g.n_ff > 0 ? 1 : 0;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
     /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane */
     L.moe.gar_live = &g_sw_gar;
     L.moe.shexp_lane = &g_sw_shexp;
+    if (s.cfg.shared_one_external) {
+        L.moe.sone_live = &g_sw_one;
+        if (L.moe.gfold) g_sw_one_ok.store(1, std::memory_order_relaxed);
+    }
     sw_note_decl(L.moe.gar_rows);
     if (L.moe.shexp_lane_ok) g_sw_shexp_ok.store(1, std::memory_order_relaxed);
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
@@ -2224,6 +2317,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (g_sw_shexp_env.compare_exchange_strong(unread, shexp_lane_env()))
             g_sw_shexp.store(g_sw_shexp_env.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
+    k1_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -2314,6 +2408,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.pre1 = op(b, "fill", { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_STR("dtype", "f32"),
                              RAD_F64("value", 1.0) },
                 {}, {}, { m.pre_f });
+    /* Lever K1 fold f (RADIANCE_DS41_ONEFILL): the MoE layers' ungated shared gate, a plane of bf16 ones, filled
+     * once at the step's start -- the op each layer issues (MoeFP8 op_sgate: fill n 1, value 1, the block's
+     * dtype) over the step's rows. Only where this rank has a shared slice (the layers then take it). */
+    if (g_sw_one_env.load(std::memory_order_relaxed) > 0 && g.n_ff > 0 && m.mw.sgate) {
+        m.sone = op(b, "fill", { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_STR("dtype", g.dtype),
+                                 RAD_F64("value", 1.0) },
+                    {}, {}, { m.mw.sgate });
+        if (!m.sone) return RAD_E_INVAL;
+    }
     m.rope_a = op(b, "rope_table",
                   { RAD_RANGE("M", 1, T), RAD_INT("rot", c.rope), RAD_F64("theta", c.theta),
                     RAD_F64("scale", 1.0), RAD_STR("dtype", "f32") },
@@ -2468,6 +2571,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 (long long)kMoeShexpLaneRows,
                 (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.moe.shexp_lane_ok; }),
                 m.layers.size());
+    if (ctx->rank == 0 && !ctx->shape_probe &&
+        (g_sw_kvf_env.load(std::memory_order_relaxed) > 0 || g_sw_of_env.load(std::memory_order_relaxed) > 0 ||
+         g_sw_one_env.load(std::memory_order_relaxed) > 0))
+        fprintf(stderr, "radiance: deepseek41: lever K1 folds: window key norm+rope+round trip+store in one launch "
+                        "at %d of %zu layers (RADIANCE_DS41_KVFOLD; switch ds41_kvfold=%d), attention + output "
+                        "rope+round trip at %d (RADIANCE_DS41_OFOLD; ds41_ofold=%d), the shared gate's ones once a "
+                        "step %s at %d MoE layers (RADIANCE_DS41_ONEFILL; ds41_onefill=%d)\n",
+                (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.kv_fs != 0; }),
+                m.layers.size(), g_sw_kvf.load(std::memory_order_relaxed),
+                (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.attn_rt != 0; }),
+                g_sw_of.load(std::memory_order_relaxed), m.sone ? "declared" : "not declared",
+                (int)std::count_if(m.layers.begin(), m.layers.end(),
+                                   [](const Layer& L) { return L.moe.sone_live != nullptr; }),
+                g_sw_one.load(std::memory_order_relaxed));
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
@@ -2648,6 +2765,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
     RAD_ISSUE_N(x, m.pre1, T, bcol(m.pre_f, 0, 1, T));
+    if (m.sone && g_sw_one.load(std::memory_order_relaxed) > 0) RAD_ISSUE_N(x, m.sone, T, brows(m.mw.sgate, T));
     RAD_ISSUE_N(x, m.rope_a, T, pos, brows(m.cs_a, g.max_ctx));
     RAD_ISSUE_N(x, m.rope_b_step, T, pos, brows(m.cs_b, g.max_ctx));
     if (m.tok_map)
@@ -2781,9 +2899,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
             const auto q_rope = [&] { RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos); };
             const auto kv_g = [&] { lin_issue(x, m, L.kv_g, T, brows(m.xn, T), L.wkv, brows(m.kv, T)); };
             /* The window key's norm, rope and round trip: one op (kv_f) where declared, else
-             * kv_n here and kv_rope / kv_q at the next two points. */
+             * kv_n here and kv_rope / kv_q at the next two points. Lever K1 fold c (switch ds41_kvfold):
+             * kv_fs at kv_f's point, which also writes the cache slot, and no kv_st. */
+            const bool kvfold = L.kv_fs && g_sw_kvf.load(std::memory_order_relaxed) > 0;
             const auto kv_n = [&] {
-                if (L.kv_f)
+                if (kvfold)
+                    RAD_ISSUE_N(x, L.kv_fs, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T),
+                                brows(cs, g.max_ctx), pos, praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
+                else if (L.kv_f)
                     RAD_ISSUE_N(x, L.kv_f, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T),
                                 brows(cs, g.max_ctx), pos);
                 else
@@ -2796,6 +2919,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
             };
             const auto kv_st = [&] {
+                if (kvfold) return;   /* kv_fs stored the row */
                 RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
                             praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
             };
@@ -2939,18 +3063,32 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (L.src) i_qq();
             l_q(); k_q(); l_st(); k_st(); i_score();
 
+            /* Lever K1 fold d (switch ds41_ofold): attn_rt for the attention and its output's rope + round trip. */
+            const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
+            const rad_op ah = ofold ? L.attn_rt : L.attn;
+            const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
             if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
+                if (ofold)
+                    RAD_ISSUE_N(x, ah, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
+                                praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T), pos, cu,
+                                RAD_W(L.sinks), brows(m.o, T), acs);
+                else
                 RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused,
                             kv_cache(m.comp[r], src),
                             praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T),
                             pos, cu, RAD_W(L.sinks), brows(m.o, T));
+            } else if (ofold) {
+                RAD_ISSUE_N(x, ah, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, RAD_NONE, RAD_NONE, RAD_NONE,
+                            pos, cu, RAD_W(L.sinks), brows(m.o, T), acs);
             } else {
                 RAD_ISSUE_N(x, L.attn, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, RAD_NONE,
                             RAD_NONE, RAD_NONE, pos, cu, RAD_W(L.sinks), brows(m.o, T));
             }
-            if (L.o_f) {
+            if (ofold) {
+                /* attn_rt rotated and rounded o */
+            } else if (L.o_f) {
                 RAD_ISSUE_N(x, L.o_f, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
             } else {
                 RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);

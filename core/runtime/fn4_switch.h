@@ -42,6 +42,16 @@
  *                   refused. -1 when no loaded object serves it.
  *   ds41_shexp_lane deepseek41 (lever F4): 1 the shared expert on the second lane at decode / verify steps, 0 one
  *                   lane (RADIANCE_DS41_SHEXP_LANE at start); 1 is refused where no layer's arm is lane-safe.
+ *   ds41_kvfold     deepseek41 (lever K1 fold c): 1 the window key's rmsnorm_rope_roundtrip_kv_store (norm, rope,
+ *                   round trip and the cache store in one launch), 0 rmsnorm_rope_roundtrip + kv_store as before.
+ *                   RADIANCE_DS41_KVFOLD=1 declares the fold beside the pair (and starts at 1); unset declares
+ *                   nothing and 1 is refused. Exact: the same bytes in y and the cache.
+ *   ds41_ofold      deepseek41 (lever K1 fold d): 1 attn_sparse_sink_rope_roundtrip (the attention output's inverse
+ *                   rope and round trip in the attention's epilogue at decode heights), 0 attn_sparse_sink +
+ *                   rope_rows_roundtrip. RADIANCE_DS41_OFOLD=1 declares it (starts at 1); unset: 1 refused. Exact.
+ *   ds41_onefill    deepseek41 (lever K1 fold f): 1 the ungated shared expert's gate plane of ones filled once a
+ *                   step (MoeFP8 shared_one_external), 0 by every MoE layer as before. RADIANCE_DS41_ONEFILL=1
+ *                   declares the step's fill (starts at 1); unset: 1 refused. Exact: the gathers read the same ones.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -62,7 +72,8 @@
 namespace rad {
 namespace fn4 {
 
-enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kSwitches };
+enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
+              kDs41OneFill, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
