@@ -1147,3 +1147,57 @@ extern "C" int r4d_fuse_attn_sparse_sink_rope_roundtrip(const RadParam* p, int n
         return RAD_E_NOTFOUND;
     }
 }
+
+/* ==========================================================================================
+ * rmsnorm_gemm_nt_ggml / swiglu_clamped_gemm_nt_ggml -- an activation's producer and the GGUF GEMM over its output
+ * (lever K1 folds a and e). (rows: rmsnorm_gemm_nt_ggml_qk256 / _qk32, swiglu_clamped_gemm_nt_ggml_qk256 / _qk32;
+ * kernels: r4d_ds41_ggml_mr.hip's form with the producer in its staging under lever D2, else the producer's launch
+ * and gemm_nt_ggml's, r4d_ds41_ggml.hip)
+ *
+ * Operands: rmsnorm_gemm_nt_ggml          [0] x  [1] w  [2] g  [3] h  [4] y
+ *           swiglu_clamped_gemm_nt_ggml   [0] gate_up  [1] w  [2] h  [3] y
+ *
+ * The producer writes h (rounded to bf16 where it stores), the GEMM reads h; the fused staging rounds the same
+ * values the same way before the GEMM's widening, and block column 0 stores them to h. */
+extern "C" int r4d_fuse_rmsnorm_gemm_nt_ggml(const RadParam* p, int n_p, uint64_t present, int step,
+                                             RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "K") <= 0 || pi(p, n_p, "N") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "rmsnorm");
+        s.mirror(p, n_p, "M").pint("n", (long long)pi(p, n_p, "K")).mirror(p, n_p, "eps").mirror(p, n_p, "dtype")
+         .mirror_opt(p, n_p, "wadd").mirror_opt(p, n_p, "mult");
+        return s.wire({ 0, 2, 3 });                 /* x, w = g, y = h */
+    }
+    case 1: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "type").mirror(p, n_p, "dtype");
+        return s.wire({ 3, 1, 4 });                 /* a = h, w, y */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+extern "C" int r4d_fuse_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p, uint64_t present, int step,
+                                                    RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "K") <= 0 || pi(p, n_p, "N") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "swiglu_clamped");
+        s.mirror(p, n_p, "M").pint("n", (long long)pi(p, n_p, "K")).mirror(p, n_p, "limit").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 2 });                    /* gate_up, y = h */
+    }
+    case 1: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "type").mirror(p, n_p, "dtype");
+        return s.wire({ 2, 1, 3 });                 /* a = h, w, y */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}

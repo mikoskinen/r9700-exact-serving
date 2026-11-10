@@ -79,3 +79,34 @@ extern "C" int r4d_shape_embed_lookup_ggml(const RadParam* p, int n_p, int opera
     };
     R4D_PICK(l);
 }
+
+/* Lever K1 folds a / e: the producer's input, the weight in its logical form (operand 1, as gemm_nt_ggml's), the
+ * gain (fold a), h and y. */
+extern "C" int r4d_shape_rmsnorm_gemm_nt_ggml(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t blk = ds41_ggml_block(p, n_p);
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    if (blk <= 0 || M <= 0 || N <= 0 || K <= 0 || K % blk) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, K),                       /* x */
+        opd((uint32_t)RAD_F32, N, K),       /* w, the logical form */
+        opd((uint32_t)RAD_F32, K),          /* g */
+        opd(D, M, K),                       /* h */
+        opd(D, M, N),                       /* y */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t blk = ds41_ggml_block(p, n_p);
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    if (blk <= 0 || M <= 0 || N <= 0 || K <= 0 || K % blk) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, 2 * K),                   /* gate_up */
+        opd((uint32_t)RAD_F32, N, K),       /* w, the logical form */
+        opd(D, M, K),                       /* h */
+        opd(D, M, N),                       /* y */
+    };
+    R4D_PICK(l);
+}
