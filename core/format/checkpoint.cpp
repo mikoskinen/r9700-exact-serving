@@ -256,6 +256,10 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
         if (out->arch == "gemma4unified") out->arch = "gemma4";
         /* Nemotron-H Omni wraps a Nemotron-H Puzzle text model (`llm_config`) the same way. */
         if (out->arch == "nemotronhomni") out->arch = "nemotronh";
+        /* DeepSeek-V4.1's release names its text model `deepseek_v41`; the architecture is
+         * spelled `deepseek41` as llama.cpp's GGUF spells it, so one plugin serves the release
+         * and a GGUF of it. */
+        if (out->arch == "deepseekv41") out->arch = "deepseek41";
     }
     if (const char* nm = gs("_name_or_path")) out->name = nm;
 
