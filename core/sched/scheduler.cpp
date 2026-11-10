@@ -60,6 +60,38 @@ bool Scheduler::set_draft_adaptive(int v) {
     return draft_.adaptive();
 }
 
+int Scheduler::set_draft_depth0(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v == 1 && !draft_.can_adapt())
+        RAD_WARN("fn4: draft_depth0=1 refused: this deployment's drafter cannot run the adaptive "
+                 "window");
+    else
+        draft_.set_depth0(v == 1);
+    return draft_.depth0() ? 1 : 0;
+}
+
+int Scheduler::set_draft_probe(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v >= 2) draft_.set_probe_every(v);
+    return draft_.probe_every();
+}
+
+int Scheduler::set_draft_hybrid(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v == 1 && !draft_head_)
+        RAD_WARN("fn4: draft_hybrid=1 refused: this deployment has no draft head that drafts "
+                 "chains");
+    else
+        hybrid_ = v == 1;
+    return hybrid_ ? 1 : 0;
+}
+
+int Scheduler::set_draft_hybrid_match(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v >= 1) hybrid_match_ = v;
+    return hybrid_match_;
+}
+
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
                     const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo) {
     if (!kv || !pc) return RAD_E_INVAL;
@@ -239,10 +271,50 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                          "of it", dd.depth);
         }
     }
+    /* Depth 0 and the hybrid (draft.h; hybrid_ in scheduler.h): start-time environment, then the
+     * fn4 switches. Test-build switches, not flags. */
+    draft_head_ = cfg.n_spec > 0 && (prog.drafter.kind == RAD_DRAFT_SERIAL ||
+                                     prog.drafter.kind == RAD_DRAFT_BLOCK) &&
+                  prog.drafter.depth > 0 && !tree_;
+    {
+        const auto env_int = [](const char* name, int lo, int hi, int dflt) {
+            const char* e = std::getenv(name);
+            if (!e || !*e) return dflt;
+            char* end = nullptr;
+            const long v = std::strtol(e, &end, 10);
+            if (end == e || *end || v < lo || v > hi) {
+                RAD_WARN("%s=%s is not %d .. %d; ignored", name, e, lo, hi);
+                return dflt;
+            }
+            return (int)v;
+        };
+        dp.depth0 = env_int("RADIANCE_DRAFT_DEPTH0", 0, 1, 0) == 1;
+        dp.probe_every = env_int("RADIANCE_DRAFT_PROBE", 2, 4096, DraftController::kProbeEvery);
+        hybrid_ = env_int("RADIANCE_DRAFT_HYBRID", 0, 1, 0) == 1;
+        hybrid_match_ = env_int("RADIANCE_DRAFT_HYBRID_MATCH", 1, 256, LookupGate::kLongMatch);
+        if (dp.depth0 && !dp.adapt)
+            RAD_INFO("RADIANCE_DRAFT_DEPTH0=1: depth 0 acts only under the adaptive window, which "
+                     "is off (--draft-window)");
+        if (hybrid_ && !draft_head_) {
+            RAD_WARN("RADIANCE_DRAFT_HYBRID=1: this deployment has no draft head that drafts "
+                     "chains; off");
+            hybrid_ = false;
+        }
+        if (hybrid_)
+            RAD_INFO("draft hybrid: a sequence whose prompt lookup matches %d or more tokens back "
+                     "verifies the lookup's proposal instead of the head's, and its next step is "
+                     "planned after the commit", hybrid_match_);
+        hybrid_lookup_ = hybrid_head_ = hybrid_unahead_ = 0;
+    }
     RAD_TRY(draft_.configure(dp));
     /* fn4 (runtime/fn4_switch.h): /admin/fn4 reports this scheduler's window and refuses an
      * adaptive one its drafter cannot run. */
     fn4::draft_register(draft_.can_adapt(), draft_.adaptive());
+    fn4::hybrid_register(draft_head_);
+    fn4::note_sched(fn4::kDraftDepth0, draft_.depth0() ? 1 : 0);
+    fn4::note_sched(fn4::kDraftProbe, draft_.probe_every());
+    fn4::note_sched(fn4::kDraftHybrid, hybrid_ ? 1 : 0);
+    fn4::note_sched(fn4::kDraftHybridMatch, hybrid_match_);
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
      * row, is measured. */
@@ -991,6 +1063,25 @@ int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
     if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
     return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, s.draft, match,
                               LookupGate::kLongMatch);
+}
+
+int Scheduler::lookup_into(SchedReq& s, int depth, int32_t* out, int* match, int match_cap) const {
+    *match = 0;
+    if (depth <= 0 || !s.req) return 0;
+    const Request& r = *s.req;
+    TokenSeq seq;
+    seq.a = r.prompt.data();
+    seq.na = (int64_t)r.prompt.size();
+    seq.b = r.output.data();
+    seq.nb = (int64_t)r.output.size();
+    if (seq.size() < 2) return 0;
+    if (depth > RAD_SCHED_MAX_SPEC) depth = RAD_SCHED_MAX_SPEC;
+    if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
+    int m = -1;
+    const int n = s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, out, &m,
+                                     match_cap);
+    *match = n > 0 && m > 0 ? m : 0;
+    return n;
 }
 
 int Scheduler::debug_oracle_ids(int64_t n, int depth, int32_t* out) const {
@@ -2079,6 +2170,20 @@ const RadBatch* Scheduler::step() {
                         ngram = false;
                     }
                 }
+            } else if (hybrid_on() && draft_.head_runs()) {
+                /* The hybrid (scheduler.h): the head proposed; a long lookup match takes the
+                 * window instead, the whole of it. */
+                int32_t look[RAD_SCHED_MAX_SPEC];
+                int match = 0;
+                const int k = lookup_into(s, draft_.next_depth(), look, &match, hybrid_match_);
+                if (k > 0 && match >= hybrid_match_) {
+                    for (int j = 0; j < k; ++j) s.draft[j] = look[j];
+                    s.n_draft = k;
+                    ngram = true;
+                    ++hybrid_lookup_;
+                } else {
+                    ++hybrid_head_;
+                }
             }
             if (!ngram && s.n_draft > cap) s.n_draft = cap;
             s.draft_ngram = ngram;
@@ -2581,6 +2686,22 @@ const RadBatch* Scheduler::step_next_locked() {
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
+    /* The hybrid (scheduler.h): a sequence whose lookup matches long on the text committed so far
+     * verifies the lookup's proposal next, which only step() can plan, after the commit. */
+    if (hybrid_on() && draft_.head_runs()) {
+        for (const StepEntry& e : plan_.e) {
+            if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
+            SchedReq& s = *reqs_[(size_t)e.slot];
+            if (!s.req || !s.req->may_speculate) continue;
+            int32_t look[RAD_SCHED_MAX_SPEC];
+            int match = 0;
+            if (lookup_into(s, draft_.next_depth(), look, &match, hybrid_match_) > 0 &&
+                match >= hybrid_match_) {
+                ++hybrid_unahead_;
+                return nullptr;
+            }
+        }
+    }
 
     plan_next_.reset();
     plan_next_.spec_is_tree = tree_;
@@ -3016,11 +3137,24 @@ void Scheduler::step_finished() {
      * including the draft rounds after it, with a step issued ahead counted once. Decode steps
      * only. Keyed by the deepest window the step verified, which is the head depth it ran at
      * whenever D held from the step before. */
-    if (draft_.adaptive() && plan_.phase == RAD_PHASE_DECODE && plan_.n_spec > 0 && wall > 0) {
-        int rows = 0;
-        for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
-        draft_.step_time((int)plan_.n_spec, rows, wall * 1e3);
+    /* Under depth 0 the key is the cycle's as well: a step verifying drafts while the head no
+     * longer runs (the step after a move to 0) lacks the head's pass and is not a drafting step's
+     * time, and a step verifying none while the head runs (the step after a move from 0) carries a
+     * pass it does not verify. A plain step at D = 0 is key 0. */
+    if (draft_.adaptive() && plan_.phase == RAD_PHASE_DECODE && wall > 0) {
+        const bool head = draft_.head_runs();
+        const bool zero = draft_.depth0();
+        int key = -1;
+        if (plan_.n_spec > 0 && (head || !zero)) key = (int)plan_.n_spec;
+        else if (plan_.n_spec == 0 && !head && zero) key = 0;
+        if (key >= 0) {
+            int rows = 0;
+            for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
+            draft_.step_time(key, rows, wall * 1e3);
+        }
     }
+    fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
+                           hybrid_lookup_, hybrid_head_, hybrid_unahead_);
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};
@@ -3045,7 +3179,8 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
      * take the recurrent path. Neither answer skips the history pass: the head's K and V must be
      * filled either way, e.g. for a sequence still in the middle of a long prompt. */
     const int depth = draft_.next_depth();
-    bool may_draft = depth > 0;
+    /* Depth 0 holds D at 0 (draft.h): the history pass only. */
+    bool may_draft = depth > 0 && draft_.head_runs();
     if (depth > 0 && *rounds > depth) *rounds = depth;
     if (*rounds > RAD_SCHED_MAX_SPEC) *rounds = RAD_SCHED_MAX_SPEC;
 
@@ -3295,8 +3430,8 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_mask_.assign((size_t)(block - 1), mask);
 
     /* Not the drafter's declared `depth`: whether the draft policy wants any tokens this step
-     * (0 when it has backed off). */
-    const bool may_draft = draft_.next_depth() > 0;
+     * (0 when it has backed off, or depth 0 holds D at 0: then the context pass runs alone). */
+    const bool may_draft = draft_.head_runs();
     /* The query pass is `block` tokens per drafting sequence, and the builder's staging arrays
      * are sized at max_tok. Unlike a decode step it can put more rows than sequences in a batch,
      * which on a small token budget would overrun h_tok. Under --prefill-span a step of several

@@ -4169,6 +4169,284 @@ TEST(the_adaptive_window_is_not_fed_by_prompt_lookup) {
 
 /* With prompt lookup the only drafter, its drafts are what the adaptive window measures: refused
  * lookups bring each sequence's window, and the lookup's proposals, down to one draft. */
+/* ------------------------------------------------------------------ depth 0 (draft.h)
+ * The adaptive policy may also choose D = 0 -- no head pass, no verify row -- where a measured plain
+ * step emits more tokens a millisecond than the window. Never on the prior: a plain step is measured
+ * first, by a plain probe once the window is measured. At 0 a probe at the drafting depth every
+ * probe_every cycles keeps the estimates measured, and a probe that finds the window paying again
+ * leaves 0. */
+namespace {
+DraftController depth0_controller(int max_depth, int probe_every = 0) {
+    DraftController c;
+    DraftController::Params p;
+    p.max_depth = max_depth;
+    p.adapt = true;
+    p.depth0 = true;
+    p.probe_every = probe_every;
+    CHECK_OK(c.configure(p));
+    return c;
+}
+}  /* namespace */
+
+TEST(depth_zero_is_taken_only_where_a_measured_plain_step_beats_the_window) {
+    /* Four sequences at 0.6 a position stop at 4 drafts (0.6^5 < 0.1). */
+    DraftController u0 = depth0_controller(5);
+    CHECK(u0.depth0());
+    CHECK_EQ(u0.probe_every(), DraftController::kProbeEvery);
+    DraftAdapt w[4];
+    DraftAdapt* wf[4];
+    for (int i = 0; i < 4; ++i) { w[i] = estimate(u0, 0.6, 0.6); wf[i] = &w[i]; }
+    CHECK_EQ(w[0].depth, 4);
+    /* Nothing measured: never 0, and no plain probe before the window has a price here. */
+    for (int t = 0; t < 3; ++t) {
+        CHECK(u0.plan_step(wf, 4, 4) > 0);
+        CHECK(u0.head_runs());
+    }
+    CHECK_EQ(u0.probe_cycles(), (int64_t)0);
+
+    /* Their window's steps measured at 20 + 10 d ms at four rows: d = 1 pays best, 4 x 1.6 tokens
+     * in 30 ms (0.213 a ms). The plain step not measured: a plain probe, kProbeSteps + 2 cycles
+     * the first time, in which the head does not run and nothing verifies. */
+    DraftController c = depth0_controller(5);
+    DraftAdapt s[4];
+    DraftAdapt* four[4];
+    for (int i = 0; i < 4; ++i) { s[i] = estimate(c, 0.6, 0.6); four[i] = &s[i]; }
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) c.step_time(d, 4, 20.0 + 10.0 * d);
+    CHECK_EQ(c.plan_step(four, 4, 4), 0);
+    CHECK(!c.head_runs());
+    CHECK_EQ(c.step_window(), 0);
+    CHECK_EQ(c.window_for(s[0]), 0);
+    for (int t = 1; t < DraftController::kProbeSteps + 2; ++t) {
+        CHECK_EQ(c.plan_step(four, 4, 4), 0);
+        c.step_time(0, 4, 28.0);                     /* plain: 4 tokens in 28 ms, 0.143 a ms */
+    }
+    CHECK_EQ(c.cost_samples(0, 4), (int64_t)(DraftController::kProbeSteps + 1));
+    CHECK_EQ(c.probe_cycles(), (int64_t)(DraftController::kProbeSteps + 2));
+    /* 0.143 a ms against the window's 0.213: the window stays. */
+    CHECK_EQ(c.plan_step(four, 4, 4), 1);
+    CHECK(c.head_runs());
+    CHECK_EQ(c.window_for(s[0]), 1);
+    CHECK_EQ(c.zero_moves(), (int64_t)0);
+
+    /* The same with a plain step of 15 ms (0.267 a ms): 0, at once (the hold starts spent). */
+    DraftController z = depth0_controller(5);
+    DraftAdapt u[4];
+    DraftAdapt* zf[4];
+    for (int i = 0; i < 4; ++i) { u[i] = estimate(z, 0.6, 0.6); zf[i] = &u[i]; }
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) z.step_time(d, 4, 20.0 + 10.0 * d);
+    for (int t = 0; t < DraftController::kProbeSteps + 2; ++t) {
+        CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+        if (t > 0) z.step_time(0, 4, 15.0);
+    }
+    CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+    CHECK_EQ(z.zero_moves(), (int64_t)1);
+    CHECK(!z.head_runs());
+    CHECK_EQ(z.step_depth(), 0);
+    CHECK_EQ(z.window_for(u[0]), 0);
+    /* At 0: kProbeEvery cycles in all, then kProbeSteps at the drafting depth (the head runs, each
+     * sequence verifies its window), then 0 again while the plain step still pays. */
+    const int64_t probes = z.probe_cycles();
+    for (int t = 2; t < DraftController::kProbeEvery; ++t) {
+        CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+        z.step_time(0, 4, 15.0);
+    }
+    for (int t = 0; t < DraftController::kProbeSteps; ++t) {
+        CHECK_EQ(z.plan_step(zf, 4, 4), 1);
+        CHECK(z.head_runs());
+        CHECK_EQ(z.window_for(u[0]), 1);
+    }
+    CHECK_EQ(z.probe_cycles(), probes + DraftController::kProbeSteps);
+    CHECK_EQ(z.plan_step(zf, 4, 4), 0);
+    CHECK(z.zero_cycles() >= (int64_t)DraftController::kProbeEvery);
+    /* A probe whose verifies find the text predictable again (every sequence at 0.98 a position,
+     * the window 5 deep: 4 x 5.7 tokens in 70 ms, 0.33 a ms) leaves 0 when it ends. */
+    for (int t = 0; t < DraftController::kProbeEvery && !z.head_runs(); ++t)
+        (void)z.plan_step(zf, 4, 4);
+    REQUIRE(z.head_runs());
+    for (int i = 0; i < 4; ++i) u[i] = estimate(z, 0.98, 0.98);
+    int d = 0;
+    for (int t = 0; t < DraftController::kProbeSteps; ++t) d = z.plan_step(zf, 4, 4);
+    CHECK(d > 1);
+    CHECK(z.head_runs());
+    CHECK_EQ(z.zero_moves(), (int64_t)2);
+    CHECK(z.plan_step(zf, 4, 4) > 0);
+    /* Off between steps: the drafting depth at once, and a plain step is no sample. */
+    z.set_depth0(false);
+    CHECK(z.head_runs());
+    CHECK(z.plan_step(zf, 4, 4) > 0);
+    const int64_t n0 = z.cost_samples(0, 4);
+    z.step_time(0, 4, 15.0);
+    CHECK_EQ(z.cost_samples(0, 4), n0);
+    /* A probe interval of its own. */
+    DraftController p = depth0_controller(5, 4);
+    CHECK_EQ(p.probe_every(), 4);
+    p.set_probe_every(0);
+    CHECK_EQ(p.probe_every(), DraftController::kProbeEvery);
+    /* Without the adaptive policy depth 0 is inert. */
+    DraftController f;
+    DraftController::Params fp;
+    fp.max_depth = 5;
+    fp.depth0 = true;
+    CHECK_OK(f.configure(fp));
+    CHECK(f.head_runs());
+    f.step_time(0, 4, 15.0);
+    CHECK_EQ(f.cost_samples(0, 4), (int64_t)0);
+}
+
+/* Through the scheduler: at D = 0 a block drafter's rows are not asked to draft (the context pass
+ * runs alone), a published proposal is cut to nothing, and the step verifies nothing. */
+TEST(depth_zero_leaves_a_block_drafter_its_context_pass_and_verifies_nothing) {
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    CHECK_OK(f.start());
+    REQUIRE(f.sch.draft().adaptive());
+    CHECK_EQ(f.sch.set_draft_depth0(1), 1);
+    CHECK_EQ(f.sch.set_draft_probe(1), DraftController::kProbeEvery);   /* below 2: unchanged */
+    CHECK_EQ(f.sch.set_draft_probe(64), 64);
+    const uint64_t a = f.submit(160, 2000);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_EQ(f.sch.find(a)->n_draft, 4);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 4);
+    /* Measured: one-row windows cost 40 ms and more, a plain step 5 ms. Plain probes, then 0. */
+    DraftController& dc = f.sch.draft();
+    for (int d = 1; d <= 4; ++d)
+        for (int k = 0; k < 4; ++k) dc.step_time(d, 1, 40.0 + d);
+    for (int k = 0; k < 4; ++k) dc.step_time(0, 1, 5.0);
+    f.commit_plain(12);
+    bool zero = false;
+    for (int t = 0; t < 2 * DraftController::kHold && !zero; ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        zero = !f.sch.draft().head_runs();
+        f.commit_plain(13);
+    }
+    REQUIRE(zero);
+    /* The proposal a drafter published before the move is cut to nothing; the step verifies none. */
+    CHECK_OK(f.sch.set_draft(a, draft, 4));
+    CHECK_EQ(f.sch.find(a)->n_draft, 0);
+    REQUIRE(f.sch.step() != nullptr);
+    if (!f.sch.draft().head_runs()) {
+        CHECK_EQ(f.sch.plan().e[0].n_spec, 0);
+        Scheduler::BlockRow rows[4];
+        CHECK_EQ(f.sch.block_begin(5, 4, 0, 0, rows, 4, /*on_card=*/false), 0);
+        f.sch.block_end();
+    }
+    f.commit_plain(14);
+    CHECK_EQ(f.sch.set_draft_depth0(0), 0);
+    CHECK(f.sch.draft().head_runs());
+}
+
+/* ------------------------------------------------------------------ the hybrid (scheduler.h)
+ * Beside a head drafting chains, a sequence whose prompt lookup matches at least the threshold
+ * back verifies the lookup's proposal, the whole window, instead of the head's; a short match or
+ * none leaves the head's. Off, the head's always. A tree head cannot take it. */
+TEST(the_hybrid_takes_a_long_lookup_match_over_the_heads_proposal) {
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.set_draft_hybrid(1), 1);
+    CHECK_EQ(f.sch.set_draft_hybrid_match(8), 8);
+
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 2000;
+    r->prompt.resize(160);
+    for (int i = 0; i < 160; ++i) r->prompt[(size_t)i] = 100 + i % 8;   /* a period of 8 */
+    const uint64_t rep = r->id;
+    CHECK_OK(f.sch.add(std::move(r)));
+    const uint64_t other = f.submit(160, 2000);                         /* 1000 + i: no repeat */
+    /* Each step commits what continues each text: the period for one, a new id for the other. */
+    auto len = [&](uint64_t id) {
+        const Request* q = f.sch.find(id);
+        return (int64_t)(q->prompt.size() + q->output.size());
+    };
+    auto commit_next = [&]() {
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> a(p.e.size(), 0), t(p.e.size(), 0);
+        std::vector<uint8_t> e(p.e.size(), 0);
+        for (size_t i = 0; i < p.e.size(); ++i)
+            t[i] = p.e[i].seq == rep ? (int32_t)(100 + len(rep) % 8) : (int32_t)(2000 + len(other));
+        Scheduler::StepResult res;
+        res.n_seq = (int)p.e.size();
+        res.n_accepted = a.data();
+        res.token = t.data();
+        res.eos = e.data();
+        CHECK_OK(f.sch.commit(res));
+    };
+    for (int t = 0; t < 8 && (f.sch.find(rep)->output.empty() || f.sch.find(other)->output.empty());
+         ++t) {
+        REQUIRE(f.sch.step() != nullptr);
+        commit_next();
+    }
+    REQUIRE(!f.sch.find(rep)->output.empty());
+    REQUIRE(!f.sch.find(other)->output.empty());
+    auto entry = [&](uint64_t id) -> const StepEntry* {
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == id) return &e;
+        return nullptr;
+    };
+    int32_t head[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(rep, head, 4));
+    CHECK_OK(f.sch.set_draft(other, head, 4));
+    const int64_t L = len(rep);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepEntry* er = entry(rep);
+    const StepEntry* eo = entry(other);
+    REQUIRE(er != nullptr);
+    REQUIRE(eo != nullptr);
+    /* The periodic one continues its period: the lookup's, the whole window. */
+    CHECK(er->ngram);
+    CHECK_EQ(er->n_spec, 4);
+    CHECK_EQ(er->draft[0], (int32_t)(100 + L % 8));
+    CHECK_EQ(er->draft[3], (int32_t)(100 + (L + 3) % 8));
+    /* The other has no match: the head's. */
+    CHECK(!eo->ngram);
+    CHECK(eo->n_spec > 0);
+    CHECK_EQ(eo->draft[0], 21);
+    commit_next();
+    /* A threshold past the match the text gives (counted at most that far, 256): the head's. */
+    CHECK_EQ(f.sch.set_draft_hybrid_match(256), 256);
+    CHECK_OK(f.sch.set_draft(rep, head, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    er = entry(rep);
+    REQUIRE(er != nullptr);
+    CHECK(!er->ngram);
+    CHECK_EQ(er->draft[0], 21);
+    commit_next();
+    /* Off: the head's. */
+    CHECK_EQ(f.sch.set_draft_hybrid_match(8), 8);
+    CHECK_EQ(f.sch.set_draft_hybrid(0), 0);
+    CHECK_OK(f.sch.set_draft(rep, head, 4));
+    REQUIRE(f.sch.step() != nullptr);
+    er = entry(rep);
+    REQUIRE(er != nullptr);
+    CHECK(!er->ngram);
+    CHECK_EQ(er->draft[0], 21);
+    commit_next();
+
+    /* A tree head cannot take it. */
+    Fixture t;
+    adaptive_fixture(t, 4);
+    t.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    t.prog.drafter_tree = true;
+    CHECK_OK(t.start());
+    CHECK_EQ(t.sch.set_draft_hybrid(1), 0);
+    /* Nor a deployment with no head. */
+    Fixture n;
+    adaptive_fixture(n, 4);
+    n.prog.drafter.kind = RAD_DRAFT_NONE;
+    n.prog.drafter.depth = 0;
+    CHECK_OK(n.start());
+    CHECK_EQ(n.sch.set_draft_hybrid(1), 0);
+}
+
 TEST(prompt_lookup_alone_follows_its_own_acceptance) {
     Fixture f;
     adaptive_fixture(f, 4);

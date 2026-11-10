@@ -30,6 +30,18 @@
  *                   and takes only the forms it knows; another value there is the stock rule, named on stderr); -1
  *                   when no loaded object serves the switch. A request for a value the serving plugin does not know
  *                   is refused.
+ *   draft_depth0    scheduler: 1 the adaptive window may choose depth 0 (no head pass, no verify row) where a measured
+ *                   plain step beats the window (sched/draft.h), 0 not. RADIANCE_DRAFT_DEPTH0=1 at start. Acts while the
+ *                   adaptive window runs; 1 is refused when the drafter cannot run that window.
+ *   draft_probe     scheduler: cycles at depth 0 between probes at the drafting depth (2 .. 4096; 16 by default,
+ *                   RADIANCE_DRAFT_PROBE at start).
+ *   draft_hybrid    scheduler: 1 a sequence whose prompt lookup matches at least draft_hybrid_match tokens back verifies
+ *                   the lookup's proposal instead of the head's (Scheduler::hybrid_), 0 the head's alone.
+ *                   RADIANCE_DRAFT_HYBRID=1 at start; 1 is refused without a head drafting chains (a tree is
+ *                   verified only on a step issued ahead, and the hybrid plans the steps behind a long match
+ *                   after the commit).
+ *   draft_hybrid_match  scheduler: that match length (1 .. 256; LookupGate::kLongMatch = 8 by default,
+ *                   RADIANCE_DRAFT_HYBRID_MATCH at start).
  *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule in force, 0 off, 1 rule,
  *                   2 rule-w -- the switch once set, else RADIANCE_AQL_ACQ=rule | rule-w at start (ds41-ar-acq
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
@@ -54,7 +66,11 @@
 namespace rad {
 namespace fn4 {
 
-enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kSwitches };
+enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch,
+               kSwitches };
+/* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
+ * runs (note_sched). */
+bool sched_switch(int i);
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
@@ -67,19 +83,29 @@ bool aql_acq_none();
 
 /* The scheduler, at its init: whether its drafter can run the adaptive window, and whether it does. */
 void draft_register(bool capable, bool adaptive);
+/* The scheduler, at its init: whether its drafter can run the hybrid (a head drafting chains beside prompt lookup). */
+void hybrid_register(bool capable);
 /* The scheduler thread, after it applied a draft_adaptive change: the window the scheduler now runs. */
 void note_draft_adaptive(bool adaptive);
+/* The scheduler, at its init and after it applied a change: the value it runs for one of its switches. */
+void note_sched(int i, int value);
+/* The scheduler's draft counters for the report (GET "draft"): cycles at depth 0, probe cycles, moves between 0 and
+ * the drafting depth, hybrid proposals taken from the lookup and left to the head, steps not issued ahead for it. */
+void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_lookup, int64_t hyb_head,
+                       int64_t hyb_unahead);
 
 /* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. */
 bool check(const std::string& name, int value, std::string* err);
 /* Server thread: queue a value; false (with the reason) for anything check() refuses. */
 bool request(const std::string& name, int value, std::string* err);
 /* Scheduler thread, every rank thread parked: apply what is queued. Returns true when anything
- * changed; *draft_adaptive is the draft window to set: 1 adaptive, 0 fixed, kNoChange when it did
- * not change (a request for -1 arrives here as the configured window). */
+ * changed; sched[i] (kSwitches entries) is the value to set for each scheduler switch, kNoChange
+ * where it did not change: draft_adaptive 1 adaptive, 0 fixed (a request for -1 arrives here as the
+ * configured window), the others their value. */
 constexpr int kNoChange = -2;
-bool apply_pending(int step, int* draft_adaptive);
-/* {"switches": {...}, "pending": {...}, "epoch": n, "applied_step": n, "plugins": n, "draft_capable": n} */
+bool apply_pending(int step, int* sched);
+/* {"switches": {...}, "pending": {...}, "epoch": n, "applied_step": n, "plugins": n, "draft_capable": n,
+ *  "draft": {...}} */
 std::string state_json();
 
 }  // namespace fn4

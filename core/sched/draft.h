@@ -30,6 +30,19 @@
  * verifies the first min(D, its stop) of its proposal, which on a MoE that reads each row's routed
  * experts is still the cost that matters.
  *
+ * Depth 0 (Params::depth0: RADIANCE_DRAFT_DEPTH0=1 at start, or the fn4 switch draft_depth0) lets
+ * the step choose D = 0 as well: no head pass and no verify row, each sequence emits one token, so
+ * the step is a plain decode step (a block drafter's context pass still runs: it fills the
+ * drafter's window cache, which a hole would leave unusable for a window). Under load a verify row
+ * costs about what it buys -- each row reads its own routed experts -- and a plain step can emit
+ * more tokens a millisecond than the best window. Its price is measured like any depth's, from
+ * plain steps (step_time keyed 0), so D = 0 is taken only where the measured plain step beats the
+ * window's measured yield by kHyst. While D is 0 nothing is verified, so nothing updates the
+ * acceptance estimates or the window's step times; a probe (kProbeSteps cycles at the drafting
+ * depth every probe_every cycles at 0) keeps both alive, and a plain probe (kProbeSteps cycles at
+ * 0) measures the plain step of a class that has none, or whose last is older than kPlainStale
+ * probe intervals.
+ *
  * It changes only how many drafts a step verifies. Acceptance follows core/sample/accept.h, so
  * every emitted token is the target's own; at temperature 0 the text matches a plain run as far
  * as the logits do, and a verify row's logits are computed at an M that moves with the window
@@ -66,6 +79,11 @@ public:
         /* fn4: the drafter could run the adaptive policy (a serial or block head), whether or not
          * it was asked for at start -- set_adaptive() may turn it on later. */
         bool adapt_capable = false;
+        /* Depth 0 (see the top of this file): the adaptive policy may also choose D = 0. Inert
+         * while the policy is off. */
+        bool depth0 = false;
+        /* Cycles at D = 0 between probes; 0 is kProbeEvery. */
+        int  probe_every = 0;
     };
 
     /* ---------------------------------------------------------- the policy's constants
@@ -110,6 +128,19 @@ public:
     /* Step times are kept per running-row class: 1, 2-3, 4-7, 8-15, 16+. Cost moves with how many
      * rows share the weight reads; power-of-two classes keep every key fed. */
     static constexpr int kCostClasses = 5;
+    /* Depth 0's probes. Every 16 cycles at D = 0 the step drafts at the drafting depth for 2
+     * cycles: the first proposes (its step verifies nothing), the second verifies and proposes, so
+     * its step time is a full drafting step's, and the step after it verifies once more. At the
+     * c4 cost ratio measured on DeepSeek-V4.1 (a d5 adaptive step 72.9 ms for 8.8 tokens, a plain
+     * one 28.1 ms for 4) a probe costs about 15 % of two steps, about 1.7 % over 18 cycles. Each
+     * probe moves a sequence's estimate by two verifies, so a turn from prose into a copied block
+     * shows within a few probes. */
+    static constexpr int kProbeEvery = 16;
+    static constexpr int kProbeSteps = 2;
+    /* A class's plain step is measured again when its last sample is older than 16 probe
+     * intervals (256 cycles; at one sequence 2 slower steps in 256, under 1 %): a context that grows changes the plain step and the window's alike, but only the
+     * window's is refreshed by the probes from D = 0. */
+    static constexpr int kPlainStale = 16;
 
     int  configure(const Params& p);
     const Params& params() const { return p_; }
@@ -127,6 +158,25 @@ public:
         adapt_ = on && can_adapt();
         return adapt_ == on;
     }
+    /* Depth 0 (fn4 draft_depth0): on or off between steps. Off returns to the drafting depth at
+     * once and ends a probe; the measurements stay. */
+    bool depth0() const { return depth0_; }
+    void set_depth0(bool on) {
+        if (on && !depth0_) zero_held_ = kHold;
+        depth0_ = on;
+        if (!on) { zero_ = false; probe_left_ = 0; since_probe_ = 0; }
+    }
+    int  probe_every() const { return probe_every_; }
+    void set_probe_every(int n) { probe_every_ = n > 0 ? n : kProbeEvery; }
+    /* Whether the head drafts this cycle: false only while depth 0 holds D at 0, or a plain probe
+     * runs. A block drafter's context pass runs either way; its query pass and every verify row
+     * do not. */
+    bool head_runs() const { return p_.max_depth > 0 && !zero_now(); }
+    /* Depth 0's counters: cycles planned at D = 0, cycles of probes, and moves between 0 and the
+     * drafting depth. For tests and the fn4 report. */
+    int64_t zero_cycles() const { return n_zero_; }
+    int64_t probe_cycles() const { return n_probe_; }
+    int64_t zero_moves() const { return n_zero_moves_; }
     /* The window this sequence may draft into: min(D, its stop), starting its estimate on the
      * first ask; max_depth when the policy is off. Before any step chooses D, D is the ceiling. */
     int  window_for(DraftAdapt& s) const;
@@ -150,15 +200,23 @@ public:
      * (started here if needed), `n_rows` all decode rows (the rest emit one token and draft
      * nothing). Moves D past the hold and hysteresis; with nothing to draft, D stays. Returns D. */
     int  plan_step(DraftAdapt* const* seq, int n_seq, int n_rows);
-    /* The step depth in force: 0 before the first step chose one. */
-    int  step_depth() const { return step_d_; }
+    /* The step depth in force: 0 before the first step chose one, and while depth 0 holds D at 0
+     * (head_runs() tells the two apart). */
+    int  step_depth() const {
+        if (zero_now()) return 0;
+        return probe_left_ > 0 && probe_d_ > 0 ? probe_d_ : step_d_;
+    }
     /* The deepest window a step at depth D carries: D capped at the deepest stop it was chosen
      * over; the ceiling before the first choice or with the policy off. Proposals from outside
      * the head (prompt lookup) are held to it, so they add no deeper pass shape. */
-    int  step_window() const { return adapt_ && step_w_ > 0 ? step_w_ : p_.max_depth; }
+    int  step_window() const {
+        if (zero_now()) return 0;
+        return adapt_ && step_w_ > 0 ? step_w_ : p_.max_depth;
+    }
 
     /* T(depth, n): a decode step with deepest window `depth` and `n_rows` decode rows took `ms`
-     * since the end of the previous step. Fed by Scheduler::step_finished; adaptive policy only. */
+     * since the end of the previous step. Fed by Scheduler::step_finished; adaptive policy only.
+     * Depth 0, a plain step at D = 0, only under depth 0. */
     void step_time(int depth, int n_rows, double ms);
     /* Expected cost of a step at `depth` with `n_rows` rows: the key's mean (ms) if it has
      * samples; else the nearest measured key scaled by the prior's ratio (1 + 0.06 d); else the
@@ -214,6 +272,23 @@ private:
     int32_t step_d_ = 0;                          /* D; 0 until a step chose one */
     int32_t step_w_ = 0;                          /* min(D, the deepest stop it saw) */
     int32_t step_held_ = 0;                       /* steps since D last moved */
+    /* Depth 0. step_d_ stays the drafting depth (the policy above, unchanged); zero_ says D is 0
+     * instead. A probe runs probe_left_ more cycles at probe_d_ (0: a plain probe from drafting;
+     * else the drafting depth, from 0). */
+    bool    depth0_ = false;
+    int32_t probe_every_ = kProbeEvery;
+    bool    zero_ = false;
+    int32_t zero_held_ = 0;                       /* cycles since zero_ last moved */
+    int32_t probe_left_ = 0;
+    int32_t probe_d_ = 0;
+    int32_t since_probe_ = 0;                     /* cycles at 0 since the last probe */
+    int64_t cycles_ = 0;                          /* cycles planned */
+    int64_t plain_at_[kCostClasses] = {};         /* cycles_ at each class's last plain sample */
+    int64_t plain_probe_at_ = 0;                  /* cycles_ at the last plain probe's start */
+    int64_t n_zero_ = 0, n_probe_ = 0, n_zero_moves_ = 0;
+    bool    zero_now() const {
+        return adapt_ && depth0_ && (probe_left_ > 0 ? probe_d_ == 0 : zero_);
+    }
     /* The prior from finished sequences (adapt_retire), and how many are behind it. */
     float   prior_[RAD_SCHED_MAX_SPEC] = {};
     int64_t prior_n_ = 0;
@@ -221,6 +296,9 @@ private:
     double  cost_ms_[RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
     int64_t cost_n_ [RAD_SCHED_MAX_SPEC + 1][kCostClasses] = {};
 
+    /* Depth 0's half of plan_step: tok[d] the expected tokens at each depth, `plain` the rows
+     * that draft nothing. */
+    void    plan_zero(const double* tok, double plain, int n_rows);
     /* Fill a sequence's estimate from the prior and set its first stop. */
     void    start(DraftAdapt& s) const;
     /* The deepest draft whose chance of being emitted is at least kDraftMinChance. */
