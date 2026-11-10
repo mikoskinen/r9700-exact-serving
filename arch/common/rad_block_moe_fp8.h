@@ -500,6 +500,19 @@ struct MoeFP8 {
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
      * all-reduce itself (issue_ar), as GdnFP8::step describes. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true) const;
+    /* fn4 P2x (10.11.2026): the routed experts of a pipelined step's pieces [0, R) and [R, T) in ONE pass (the
+     * weights read and decoded once for both), the rest a piece at a time as pass() issues it. pair_routed: per
+     * piece the router and the top-k (pass()'s forms at a piece's rows), then over [0, T) the scatter, the expert
+     * GEMMs and the quantiser between them; with `shared_in` each piece's shared arm interleaved there as pass()
+     * interleaves it. pair_finish: a piece's shared arm (`shared_here`, the form without `shared_in`) and its
+     * gather, which reads the joint pass's slots through the inverse table. Each row's bytes are pass()'s: per-row
+     * router / top-k / quantiser / gather, and a sorted row's GEMM output does not depend on the pass's other rows
+     * (162, 10.11.: 4096 vs 2048 rows byte-identical for libr4d's and exl3r4d's chains). pair_ok: the forms the pair
+     * covers (the inverse gather, the separate router + top-k, no protected experts / calibration / separate
+     * combine / add). The caller issues the all-reduces. */
+    bool pair_ok(int64_t T, int64_t R) const;
+    void pair_routed(RadCtx* c, int64_t T, int64_t R, bool shared_in) const;
+    void pair_finish(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool shared_here) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -1940,6 +1953,113 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_add, rows, brow_slice(w.x, r0, rows, g.n_embd),
                     brow_slice(w.h.x, r0, rows, g.n_embd),
                     brow_slice(w.x, r0, rows, g.n_embd));
+}
+
+inline bool MoeFP8::pair_ok(int64_t T, int64_t R) const {
+    const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
+    /* both pieces wider than every fused router / top-k form, so pass() would take the separate ops at each */
+    const int64_t small = R < T - R ? R : T - R;
+    return R > 0 && T > R && T <= c.rows && ext_in && !c.sigmoid_router && !op_sigmoid_scatter && op_router &&
+           op_topk && small > router_fused_rows && small > topk_scatter_rows && small > sigmoid_scatter_rows &&
+           (scatter_inv || inv_now) && (gather_inv || inv_now) && (inv_now ? op_scatter_inv2 && op_gather_inv2
+                                                                            : op_scatter && op_gather) &&
+           !op_pgu && !op_gram_gu && !op_combine && !op_moe_ar && !op_shared_ar && !op_add &&
+           !gather_taken(g, T, gather_out_rows, gather_out_rows6);
+}
+
+inline void MoeFP8::pair_routed(RadCtx* c_, int64_t T, int64_t R, bool shared_in) const {
+    const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
+    const bool shared = op_sgate != 0;
+    const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
+    const int64_t pr0[2] = { 0, R }, prn[2] = { R, T - R };
+    if (xp_next && xp_next->xp.n_parts > 0)
+        (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, 0, T, g.n_embd);
+    const RadOperand ecnt = brows(w.ecnt, ne);
+    /* pass()'s router and top-k at a piece's rows (wider than the fused forms) */
+    for (int q = 0; q < 2; ++q) {
+        RAD_ISSUE_N(c_, op_router, prn[q], brow_slice(w.h.x, pr0[q], prn[q], g.n_embd), RAD_W(w_router),
+                    brow_slice(w.logits, pr0[q], prn[q], ne_all));
+        RAD_ISSUE_N(c_, op_topk, prn[q], brow_slice(w.logits, pr0[q], prn[q], ne_all),
+                    brow_slice(w.ids, pr0[q], prn[q], k), brow_slice(w.ew, pr0[q], prn[q], k));
+    }
+    /* the scatter over both pieces: one sorted list, the inverse table for the pieces' gathers */
+    RAD_ISSUE_N(c_, inv_now ? op_scatter_inv2 : op_scatter, T, brow_slice(w.ids, 0, T, k),
+                brows(w.sorted, T * k), brows(w.eoff, ne + 1), ecnt, brows(w.inv, T * k));
+    const bool rot = c.expert_rot != 0;
+    if (op_hq)
+        for (int q = 0; q < 2; ++q)
+            RAD_ISSUE_N(c_, op_hq, prn[q], brow_slice(w.h.x, pr0[q], prn[q], g.n_embd),
+                        brow_slice(w.hr.q, pr0[q], prn[q], g.n_embd),
+                        brow_slice(w.hr.s, pr0[q], prn[q], g.n_embd / RAD_FP8_BLOCK));
+    const int64_t n4[4] = { (n_reg + 3) / 4, (n_reg + 2) / 4, (n_reg + 1) / 4, n_reg / 4 };
+    (void)rad_expert_prefetch_step(c_, layer);
+    const int64_t rows = T;
+    if (c.expert_bf16)
+        RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, 0, rows, g.n_embd),
+                    RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
+                    brows(w.egu, rows * k));
+    else if (ncls == 4)
+        RAD_ISSUE_N(c_, op_gu, rows,
+                    brow_slice(rot ? w.hr.q : w.h.q, 0, rows, g.n_embd),
+                    brow_slice(rot ? w.hr.s : w.h.s, 0, rows, g.n_embd / RAD_FP8_BLOCK),
+                    RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]),
+                    RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]),
+                    RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]),
+                    brows(w.egu, rows * k));
+    else
+        RAD_ISSUE_N(c_, op_gu, rows,
+                    brow_slice(rot ? w.hr.q : w.h.q, 0, rows, g.n_embd),
+                    brow_slice(rot ? w.hr.s : w.h.s, 0, rows, g.n_embd / RAD_FP8_BLOCK),
+                    RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
+                    brows(w.egu, rows * k));
+    if (shared && shared_in)
+        for (int q = 0; q < 2; ++q) shared_up(c_, T, pr0[q], prn[q], false);
+    gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
+    if (shared && shared_in)
+        for (int q = 0; q < 2; ++q) gq_sh.step(c_, w.sgu, T, pr0[q], prn[q]);
+    if (c.expert_bf16)
+        RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
+                    brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
+    else if (ncls == 4)
+        RAD_ISSUE_N(c_, op_dn, rows,
+                    brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
+                    RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]),
+                    RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]),
+                    RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]),
+                    brows(w.edn, rows * k));
+    else
+        RAD_ISSUE_N(c_, op_dn, rows,
+                    brows(w.eff.q, rows * k), brows(w.eff.s, rows * k),
+                    RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
+                    brows(w.edn, rows * k));
+    (void)rad_expert_prefetch_mark(c_);
+    if (shared && shared_in)
+        for (int q = 0; q < 2; ++q) sh_down.step(c_, w.sff, w.sout, T, pr0[q], prn[q]);
+}
+
+inline void MoeFP8::pair_finish(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool shared_here) const {
+    const int64_t k = c.top_k;
+    const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
+    if (op_sgate != 0 && shared_here) {
+        shared_up(c_, T, r0, rows, false);
+        gq_sh.step(c_, w.sgu, T, r0, rows);
+        sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    }
+    /* the piece's tokens, each reading its slots of the joint pass (the inverse table is pass-relative and the pass
+     * starts at row 0, so the piece's entries are rows r0.. of it) */
+    RAD_ISSUE_N(c_, inv_now ? op_gather_inv2 : op_gather, rows, brows(w.edn, T * k),
+                brow_slice(w.ew, r0, rows, k), brow_slice(w.inv, r0, rows, k),
+                gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
+                gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                brow_slice(w.h.x, r0, rows, g.n_embd));
 }
 
 /* One pass of the per-expert tap. The scatter's expert offsets are copied back first (they decide

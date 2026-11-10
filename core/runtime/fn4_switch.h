@@ -31,6 +31,10 @@
  *                   2 rule-w (cohbench2 7.11.: a CU can serve a line it stored after another CU rewrote it, so
  *                   rule-w is the safe one); -1 until set = RADIANCE_AQL_ACQ=rule | rule-w at start
  *
+ *   moe_pair        architecture plugin (rad_fn4_switch): fn4 P2x, a pipelined prefill step's two pieces through
+ *                   ONE routed-expert pass (0 off, 1 the shared arm a piece after it, 2 the shared arms inside it);
+ *                   needs RADIANCE_FN4_P2X=1 at start (the expert buffers declared two pieces tall)  RADIANCE_FN4_MOE_PAIR
+ *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
  *
@@ -49,7 +53,8 @@ namespace rad {
 namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
-              kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kHcSpProbe, kHcSp, kSwitches };
+              kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kHcSpProbe, kHcSp, kMoePair,
+              kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
