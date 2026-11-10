@@ -196,6 +196,7 @@ struct Model {
     HyperConn mixer;            /* the 97th connection: no write half */
     /* Whether this rank has said that it pipelines a prefill step (step_pipelined), once. */
     bool      pipe_noted = false;
+    int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted */
     /* Whether the deployment spans (RadBuildCtx::max_mixed_tok below a max_tok wider than a MoE
      * pass): a step wider than a pass is then one sequence, the connections read it a pass at a
      * time and the indexer scores it in windows. `pipe_on` adds ranks whose blocks issue their own
@@ -1745,7 +1746,16 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         int64_t issued = pc.handed > 0 ? pc.handed : 1;
         int64_t sp_pend = -1;   /* fn4 SP-hc: a piece whose MoE reduce-scatter is still to be issued */
         bool behind = pc.handed == 0;     /* lane 1 already behind the whole mixer */
-        if (pair_on && l.mlp.pair_ok(T, R)) {
+        const bool pair_now = pair_on && l.mlp.pair_ok(T, R);
+        if (pair_on && li == 0 && g.rank == 0 && m.pair_noted != (pair_now ? pmode : -1)) {
+            m.pair_noted = pair_now ? pmode : -1;
+            fprintf(stderr, pair_now ? "radiance: qwen4exp: fn4 P2x: a pipelined step's two pieces share one routed pass "
+                                       "(moe_pair %d, %lld rows, MoE rows %lld)\n"
+                                     : "radiance: qwen4exp: fn4 P2x: moe_pair %d asked, but the MoE block's forms do not "
+                                       "allow the pair at %lld rows (MoE rows %lld): per-piece passes\n",
+                    pmode, (long long)T, (long long)m.moecfg.rows);
+        }
+        if (pair_now) {
             /* fn4 P2x: piece 0's connections beside piece 1's mixer all-reduce, then piece 1's, then one routed pass
              * over both; piece 0's shared arm (mode 1) + gather, its MoE all-reduce on lane 1 beside piece 1's shared
              * arm + gather, then piece 1's beside the writes below (as the per-piece form's last one). */
