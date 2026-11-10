@@ -5090,7 +5090,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
      * checked by range and by what the registered drafter can run, handed to the scheduler at the
      * step release, and reported as the scheduler noted them; the counters as it noted them. */
     CHECK(has(f.get("/admin/fn4").body, "\"draft_depth0\": -1"));
-    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":2})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":3})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_probe":1})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_hybrid_match":0})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_hybrid_match":257})").status, 400);
@@ -5226,6 +5226,73 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     fn4::note_lend_sched(0, 0, 0, 0, 0, 0, 0, 0, 0);
     fn4::note_lend_engine(0, 0, 0, 0, 0, 0, 0);
     fn4::lend_register(false);
+    fn4::draft_register(false, false);
+}
+
+/* The depth-0 context skip (draft_ctxskip, the engine's): refused until the engine set it up
+ * (RADIANCE_DRAFT_CTXSKIP at start), handed over at the step release, reported as the engine runs it
+ * with its counters ("ctxskip", only once registered). draft_depth0 2 (forced, a test hook) is taken
+ * wherever 1 is; "accept" carries the head's and the lookup's verified and accepted drafts. */
+TEST(the_context_skip_and_forced_depth_zero_are_checked_and_reported) {
+    Fixture f;
+    const HttpResponse g = f.get("/admin/fn4");
+    CHECK(!has(g.body, "\"ctxskip\": {"));
+    CHECK(has(g.body, "\"draft_ctxskip\": "));
+    CHECK(has(g.body, "\"accept\": {\"head_drafted\": 0, \"head_accepted\": 0, \"lookup_drafted\": 0, "
+                      "\"lookup_accepted\": 0}"));
+    const HttpResponse c0 = f.post("/admin/fn4", R"({"draft_ctxskip":1})");
+    CHECK_EQ(c0.status, 400);
+    CHECK(has(c0.body, "RADIANCE_DRAFT_CTXSKIP was not set at start"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_ctxskip":2})").status, 400);
+    fn4::ctxskip_register(false);
+    const HttpResponse c1 = f.post("/admin/fn4", R"({"draft_ctxskip":1})");
+    CHECK_EQ(c1.status, 400);
+    CHECK(has(c1.body, "not set up here"));
+    CHECK(has(f.get("/admin/fn4").body, "\"ctxskip\": {\"capable\": 0"));
+
+    int sw[fn4::kSwitches];
+    fn4::ctxskip_register(true);
+    fn4::note_sched(fn4::kDraftCtxSkip, 0);
+    const uint64_t e0 = fn4::epoch();
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_ctxskip":1})").status, 200);
+    CHECK(fn4::apply_pending(40, sw));
+    CHECK_EQ(sw[fn4::kDraftCtxSkip], 1);
+    CHECK_EQ(sw[fn4::kDraftDepth0], fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), e0 + 1);
+    fn4::note_sched(fn4::kDraftCtxSkip, 1);
+    fn4::note_ctxskip(120, 7, 812, 3, 1, 16, 32, 7);
+    const HttpResponse g1 = f.get("/admin/fn4");
+    CHECK(has(g1.body, "\"draft_ctxskip\": 1"));
+    CHECK(has(g1.body, "\"ctxskip\": {\"capable\": 1, \"skipped_steps\": 120, \"refill_passes\": 7, "
+                       "\"refill_rows\": 812, \"dropped_rows\": 3, \"ring_full_refills\": 1, \"pending_rows\": 16, "
+                       "\"ring_slots\": 32, \"ring_mib\": 7}"));
+
+    /* draft_depth0 2: refused with 1 where the drafter cannot run the adaptive window, taken where it can. */
+    fn4::draft_register(false, false);
+    const HttpResponse d2 = f.post("/admin/fn4", R"({"draft_depth0":2})");
+    CHECK_EQ(d2.status, 400);
+    CHECK(has(d2.body, "draft_depth0=2 refused"));
+    fn4::draft_register(true, true);
+    fn4::note_sched(fn4::kDraftDepth0, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":2})").status, 200);
+    CHECK(fn4::apply_pending(41, sw));
+    CHECK_EQ(sw[fn4::kDraftDepth0], 2);
+    fn4::note_sched(fn4::kDraftDepth0, 2);
+    fn4::note_draft_accept(40, 31, 9, 2);
+    const HttpResponse g2 = f.get("/admin/fn4");
+    CHECK(has(g2.body, "\"draft_depth0\": 2"));
+    CHECK(has(g2.body, "\"accept\": {\"head_drafted\": 40, \"head_accepted\": 31, \"lookup_drafted\": 9, "
+                       "\"lookup_accepted\": 2}"));
+
+    /* Back off for the rest of the binary. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_ctxskip":0,"draft_depth0":0})").status, 200);
+    CHECK(fn4::apply_pending(42, sw));
+    CHECK_EQ(sw[fn4::kDraftCtxSkip], 0);
+    fn4::note_sched(fn4::kDraftCtxSkip, 0);
+    fn4::note_sched(fn4::kDraftDepth0, 0);
+    fn4::note_ctxskip(0, 0, 0, 0, 0, 0, 0, 0);
+    fn4::note_draft_accept(0, 0, 0, 0);
+    fn4::ctxskip_register(false);
     fn4::draft_register(false, false);
 }
 

@@ -32,7 +32,10 @@
  *                   is refused.
  *   draft_depth0    scheduler: 1 the adaptive window may choose depth 0 (no head pass, no verify row) where a measured
  *                   plain step beats the window (sched/draft.h), 0 not. RADIANCE_DRAFT_DEPTH0=1 at start. Acts while the
- *                   adaptive window runs; 1 is refused when the drafter cannot run that window.
+ *                   adaptive window runs; 1 is refused when the drafter cannot run that window. 2 (a test hook, also
+ *                   RADIANCE_DRAFT_DEPTH0=2): depth 0 FORCED -- every cycle at 0 except the probes at the drafting depth
+ *                   every draft_probe cycles, nothing measured or weighed; accepted wherever 1 is. Exact (it moves only
+ *                   what a step verifies), so a one-sequence run exercises depth 0's paths.
  *   draft_probe     scheduler: cycles at depth 0 between probes at the drafting depth (2 .. 4096; 16 by default,
  *                   RADIANCE_DRAFT_PROBE at start).
  *   draft_hybrid    scheduler: 1 a sequence whose prompt lookup matches at least draft_hybrid_match tokens back verifies
@@ -96,11 +99,15 @@
  *   ds41_swfold     deepseek41 (lever K1 fold e): 1 the shared expert's swiglu_clamped computed in its down GEMV's
  *                   activation staging (swiglu_clamped_gemm_nt_ggml, decode band), 0 swiglu_clamped + gemm_nt_ggml.
  *                   RADIANCE_DS41_SWFOLD=1 declares it (starts at 1); unset: 1 refused. Exact.
- *   draft_ctxskip   the core's (block drafter; lever D0 context skip): 1 a block drafter's context pass is skipped on
- *                   a plain decode step while depth 0 holds, the step's tapped rows kept, and the drafter's window
- *                   refilled from them in one context pass before the head next runs; 0 the context pass every step
- *                   as before. RADIANCE_DRAFT_CTXSKIP=1 at start sets it up (and starts at 1); unset: 1 refused.
- *                   Exact for the target (the drafter only proposes).
+ *   draft_ctxskip   the core's (a windowed block drafter; the depth-0 context skip): 1 a block drafter's context pass
+ *                   is skipped on a plain decode step (every row one decode token) while the head does not run (depth 0,
+ *                   not a probe), the trunk's tapped rows kept in a ring on the card, and the drafter's window refilled
+ *                   from them (context passes over the kept rows, the last `window` a sequence) before the head next
+ *                   runs, on any step that cannot skip, when the ring is full, before a checkpoint carrying the drafter's
+ *                   window, and after a switch back to 0; 0 the context pass every step as before.
+ *                   RADIANCE_DRAFT_CTXSKIP=0 | 1 at start sets it up (the ring allocated) and starts at that value;
+ *                   unset sets nothing up, the issue is today's, and 1 is refused. Exact for the target: the drafter
+ *                   only proposes and every emitted token is the target's (core/engine_draft.cpp).
  *
  *   dspark_conf     engine (ds41-acc, lever C1): what a chain block drafter's confidence plane does
  *                   (rad_drafter_confidence; deepseek41 with RADIANCE_DS41_DSPARK_CONF): 0 nothing (the plugin
@@ -192,6 +199,17 @@ void dspark_register(bool conf_capable, bool alt_capable, int conf_start, int al
 bool dspark_conf_value_ok(int v);
 /* The applied value of a core switch without the lock (the step path reads it each step); -1 unregistered. */
 int  get(int i);
+/* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
+ * "accept"; under draft_depth0 2 every head draft is a probe's). */
+void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted);
+/* The depth-0 context skip (draft_ctxskip). The engine, at bring-up: whether it set the skip up (draft_ctxskip=1 is
+ * refused otherwise; GET "ctxskip" only once registered). */
+void ctxskip_register(bool capable);
+/* The engine, after every block drafter's turn: steps whose context pass was skipped, refill passes and their
+ * rows, kept rows dropped (a sequence finished or preempted, or older than the drafter's window), refills forced
+ * by a full ring, rows kept now, and the ring's step slots and MiB a rank. */
+void note_ctxskip(int64_t skipped, int64_t refill_passes, int64_t refill_rows, int64_t dropped_rows,
+                  int64_t ring_full, int64_t pending_rows, int64_t ring_slots, int64_t ring_mib);
 
 /* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. */
 bool check(const std::string& name, int value, std::string* err);
@@ -204,7 +222,8 @@ bool request(const std::string& name, int value, std::string* err);
 constexpr int kNoChange = -2;
 bool apply_pending(int step, int* sched);
 /* {"switches": {...}, "pending": {...}, "epoch": n, "applied_step": n, "plugins": n, "draft_capable": n,
- *  "draft": {...}, "lend": {...}} -- "lend" only once a scheduler registered (lend_register). */
+ *  "draft": {...}, "accept": {...}, "lend": {...}, "ctxskip": {...}} -- "lend" only once a scheduler registered
+ *  (lend_register), "ctxskip" only once the engine did (ctxskip_register). */
 std::string state_json();
 
 }  // namespace fn4

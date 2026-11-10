@@ -72,6 +72,13 @@ struct SchedReq {
     int64_t  draft_lo = 0;
     int64_t  draft_hi = 0;
 
+    /* The depth-0 context skip (fn4 draft_ctxskip; Scheduler::ctx_keep): positions
+     * [ctx_lo, ctx_lo + ctx_kept.size()) whose context rows were kept instead of passed, each as the
+     * engine's ring step slot (high 16 bits) and its row in that step (low 16 bits). Refilled before
+     * the head next runs (Scheduler::ctx_refill); dropped with the drafter's state. */
+    std::vector<uint32_t> ctx_kept;
+    int64_t  ctx_lo = 0;
+
     /* Clears all drafter state for the sequence in this slot, on admission and on preemption.
      * Slots are recycled, so anything not reset here leaks into an unrelated sequence: a stale
      * `draft_filled`, for one, empties the next prefill's history pass (hs = max(draft_filled,
@@ -85,6 +92,8 @@ struct SchedReq {
         draft_lo     = 0;
         draft_hi     = 0;
         conf_gen     = 0;
+        ctx_kept.clear();
+        ctx_lo       = 0;
     }
     /* The confidence gate's verify count for the proposal in flight (Scheduler::set_draft_conf),
      * valid while `conf_gen` is the scheduler's current one; `conf_rep`: it replaces the window's
@@ -487,6 +496,42 @@ public:
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();
+    /* Whether the step block_begin() opened lets the head run (the draft policy wants tokens: not
+     * depth 0, or a probe). False before any block_begin. */
+    bool block_head_runs() const;
+
+    /* ----------------------------------------------------- the depth-0 context skip (fn4 draft_ctxskip)
+     *
+     * The engine may skip a block drafter's context pass on a step whose every row is one decode
+     * token (a plain step) while the head does not run, keeping the trunk's tapped rows of that step
+     * in a ring on the card; before the head next runs (and wherever it cannot skip) it refills the
+     * drafter's window from the kept rows with context passes of their own. Between block_begin()
+     * and block_end():
+     *
+     *   ctx_keepable  whether the step's rows can be kept: every live entry one row, no drafts, at
+     *                 the position after its sequence's kept rows; `rows` the step's rows (mirrors
+     *                 included: the ring keeps the step's rows as the trunk tapped them), `live` its
+     *                 live entries.
+     *   ctx_keep      the step's live rows kept in ring step slot `k` (row i of the step is entry i).
+     *   ctx_refill    a context pass (draft_pass -1) over kept rows: each live sequence's last
+     *                 `window` kept positions, at most `cap` rows a pass, one entry a sequence at its
+     *                 first kept position. `runs` says where each entry's rows are in the ring
+     *                 (consecutive slots of one row each). Consumes what it covers; nullptr when no
+     *                 kept row is left. Rows of a sequence that ended or was preempted, older than
+     *                 the window, or below its drafter group's first held position are dropped
+     *                 (`dropped`).
+     *   ctx_pending   kept rows not yet refilled or dropped (any slot's). */
+    struct CtxRun {
+        int32_t dst = 0;      /* the pass's first row of the run */
+        int32_t slot = 0;     /* the ring step slot of its first row; each next row is the next slot */
+        int32_t row = 0;      /* its row within those steps */
+        int32_t n = 0;
+    };
+    bool ctx_keepable(int64_t* rows, int64_t* live) const;
+    int64_t ctx_keep(int slot);
+    const RadBatch* ctx_refill(int step, int64_t cap, int64_t window, std::vector<CtxRun>* runs,
+                               int64_t* rows, int64_t* dropped);
+    int64_t ctx_pending() const;
 
     const StepPlan&      plan() const { return plan_; }
     const ChunkGeometry& geometry() const { return geo_; }
@@ -695,6 +740,8 @@ private:
     bool    hybrid_ = false;
     int     hybrid_match_ = LookupGate::kLongMatch;
     int64_t hybrid_lookup_ = 0, hybrid_head_ = 0, hybrid_unahead_ = 0;
+    /* Drafts verified and accepted, the head's and prompt lookup's (fn4 "accept"). */
+    int64_t acc_head_d_ = 0, acc_head_a_ = 0, acc_look_d_ = 0, acc_look_a_ = 0;
     /* Lever DL (set_lend_view). The lend's state and transition count as the cycle opened
      * (draft_cycle), the cycles since its last transition, and the counters for the fn4 report:
      * cycles planned while lent; decode steps while lent, plain and drafting (a probe reading the
@@ -858,6 +905,10 @@ private:
          * block_req(). */
     };
     std::vector<BlockSeq> block_;
+    bool               block_may_draft_ = false;   /* block_begin's may_draft (block_head_runs) */
+    /* The drafter's own paged group (bound at the trunk's layer count and above; -1 none): the floor
+     * a refill's positions keep to (ctx_refill). */
+    int32_t            draft_group_ = -1;
     StepPlan           block_plan_;
     int32_t            block_len_ = 0;
     int32_t            block_depth_ = 0;   /* tokens proposed; the head takes the last this many */
