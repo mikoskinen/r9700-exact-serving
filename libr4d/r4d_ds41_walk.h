@@ -1,0 +1,11 @@
+/* r4d_ds41_walk.h -- lever W1, the DSpark Markov walk over the whole vocabulary (op dspark_walk_step): the
+ * launch and the shape hook; included by r4d_plugin.h inside its extern "C".
+ *
+ * Kernel in r4d_ds41_walk.hip, specs and row in r4d_ds41_walk.inc, operands in r4d_ds41_walk_shapes.inc. */
+#ifndef R4D_DS41_WALK_H
+#define R4D_DS41_WALK_H
+
+int r4d_rad_dspark_walk_step(const RadArgs*, RadStream);
+int r4d_shape_dspark_walk_step(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+
+#endif

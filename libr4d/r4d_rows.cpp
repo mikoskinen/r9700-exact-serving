@@ -3168,6 +3168,7 @@ static const RadOperandSpec oQuantCols[] = {
 #include "r4d_ds41_sparse.inc"
 #include "r4d_ds41_ggml.inc"
 #include "r4d_ds41_mxfp4.inc"
+#include "r4d_ds41_walk.inc"
 #undef R4D_DS41_SPECS
 
 static const RadParamSpec pPositionScale[] = { P_INT("M"), P_INT("n"), P_INT("original"),
@@ -3194,6 +3195,7 @@ static const RadOpSchema kSchemas[] = {
 #include "r4d_ds41_sparse.inc"
 #include "r4d_ds41_ggml.inc"
 #include "r4d_ds41_mxfp4.inc"
+#include "r4d_ds41_walk.inc"
 #undef R4D_DS41_SCHEMAS
 { "embed_attn", ROW(pEmbedAttn), ROW(oEmbedAttn),
   "Whole noncausal segments with QK, scaled scores and probabilities rounded to activation dtype." },
@@ -6185,6 +6187,7 @@ static const RadKernelInfo kKernels[] = {
 #include "r4d_ds41_sparse.inc"
 #include "r4d_ds41_ggml.inc"
 #include "r4d_ds41_mxfp4.inc"
+#include "r4d_ds41_walk.inc"
 #undef R4D_DS41_ROWS
 { "gemm_bf16_pixtral_patch", "gemm_nt", "gemm", "RGB 14x14 patch projection with ordered f32 dots",
   "K=588, M<=INT_MAX, N<=INT_MAX, pitched bf16 rows", "bf16",

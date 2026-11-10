@@ -83,6 +83,10 @@
  *   ds41_onefill    deepseek41 (lever K1 fold f): 1 the ungated shared expert's gate plane of ones filled once a
  *                   step (MoeFP8 shared_one_external), 0 by every MoE layer as before. RADIANCE_DS41_ONEFILL=1
  *                   declares the step's fill (starts at 1); unset: 1 refused. Exact: the gathers read the same ones.
+ *   dspark_walk     deepseek41 (lever W1): 1 the DSpark Markov walk over the whole vocabulary (dspark_walk_step a
+ *                   step on each rank's vocabulary shard + an all_gather of the keys; one rank: dflash_markov_greedy_f32),
+ *                   0 the head's top 32 re-ranked (dflash_select) as before. RADIANCE_DS41_DSPARK_WALK=0 / 1 declares
+ *                   the walk (and starts at that value); unset: 1 refused. Exact: proposals only, the trunk verifies.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -105,7 +109,7 @@ namespace fn4 {
 
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
-              kDraftLend, kDraftLendBorrow, kSwitches };
+              kDraftLend, kDraftLendBorrow, kDsparkWalk, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

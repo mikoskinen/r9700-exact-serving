@@ -227,6 +227,8 @@ set(R4D_UNITS
   "r4d_ds41_ggml_mr64|-mwavefrontsize64"
   # GGUF MXFP4 blocks (type=mxfp4) for gemm_nt_ggml and moe_gemm_ggml: the DSpark drafter's experts.
   "r4d_ds41_mxfp4|"
+  # Lever W1: the DSpark Markov walk over the whole vocabulary, a step on a vocabulary shard (dspark_walk_step).
+  "r4d_ds41_walk|"
 )
 
 set(R4D_SRC "")
