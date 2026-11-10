@@ -80,6 +80,11 @@ struct ArenaLevel {
 int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLevel* out,
                std::string* why);
 
+/* Whether `rows` may be the activation arena's decode rung (lever VA "arena",
+ * RADIANCE_DS41_ARENA_DECODE_ROWS) below a ladder whose first rung is `lo`; the reason in `why`
+ * when not. */
+bool arena_decode_rows_ok(int64_t rows, int64_t lo, std::string* why);
+
 /* Bytes a declared buffer occupies. 0 means the core cannot size it: a plugin-private dtype, legal
  * for a weight (the kernel's layout hook sizes it) but not for an activation. */
 int64_t buffer_bytes(const RadBufDecl& d);

@@ -14,7 +14,9 @@ int ref_gemm_nt_f32(const RadArgs* a, RadStream) {
         x.shape[1] != k || w.shape[0] != n || w.shape[1] != k || y.shape[0] != x.shape[0] ||
         y.shape[1] != n)
         return RAD_E_SHAPE;
-    if (x.dtype != RAD_BF16 || w.dtype != RAD_F32 || y.dtype != RAD_F32) return RAD_E_DTYPE;
+    /* f32 weights, or bf16 ones (RADIANCE_DS41_ROUTER_BF16): ldt widens either to the same value. */
+    if (x.dtype != RAD_BF16 || (w.dtype != RAD_F32 && w.dtype != RAD_BF16) || y.dtype != RAD_F32)
+        return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
 #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < x.shape[0]; ++r)

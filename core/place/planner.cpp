@@ -12,6 +12,8 @@
 #include "planner.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -257,7 +259,7 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
     }
     /* build_classes: one expert slab class a stride. */
     for (int64_t s : expert_strides)
-        out->expert_spare += (int64_t)(RAD_PLACE_SHADOW_SLOTS + RAD_PLACE_STAGE_RING) * s +
+        out->expert_spare += (int64_t)(place_shadow_slots() + RAD_PLACE_STAGE_RING) * s +
                              RAD_ALIGN_UNIT;
     for (const auto& le : layer_experts)
         out->expert_layer_max = std::max(out->expert_layer_max, le.second);
@@ -764,7 +766,7 @@ int Planner::assign_expert_tiered(Plan* p) {
             if (mu.site == Site::DeviceStaged && mu.access != RAD_ACCESS_CONDITIONAL)
                 ++staged[(size_t)mu.slab_class];
         }
-        /* The hot VRAM cache's budget. RAD_PLACE_SHADOW_SLOTS (32) is the in-flight swap
+        /* The hot VRAM cache's budget. place_shadow_slots() (32 unless RADIANCE_PLACE_SHADOW_SLOTS) is the in-flight swap
          * depth: enough to move host-pool experts onto the card, not enough to hold a
          * file-tier decode's working set (each miss is a pread plus a relayout, and it
          * repeats every token until the expert stays resident). On a real weights budget
@@ -783,13 +785,13 @@ int Planner::assign_expert_tiered(Plan* p) {
         for (size_t c = 0; c < p->classes.size(); ++c) {
             const int64_t ring = std::min<int64_t>(RAD_PLACE_STAGE_RING, staged[c]);
             const int64_t shadow = (p->dynamic && resident[c] > 0)
-                ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, std::max<int64_t>(1, resident[c] / 4))
+                ? std::min<int64_t>(place_shadow_slots(), std::max<int64_t>(1, resident[c] / 4))
                 : 0;
             const int64_t stride = p->classes[c].stride;
             const int64_t by_bytes = (stride > 0 && hot_share > 0) ? hot_share / stride : 0;
             const int64_t hot = (p->dynamic && on_disk[c] > 0)
                 ? std::min(on_disk[c], std::max(by_bytes,
-                      resident[c] > 0 ? std::min<int64_t>(RAD_PLACE_SHADOW_SLOTS, resident[c])
+                      resident[c] > 0 ? std::min<int64_t>(place_shadow_slots(), resident[c])
                                       : (int64_t)0))
                 : 0;
             p->classes[c].n_shadow = std::max(shadow, hot);
@@ -996,6 +998,24 @@ void Planner::finish(const Program& prog, Plan* p) {
     }
 }
 
+/* ------------------------------------------------------------------ the shadow slot count */
+int place_shadow_slots() {
+    /* Read at each call (a few per class at plan and mover init), so a test can set it; a bad value
+     * is said once. */
+    const char* e = std::getenv("RADIANCE_PLACE_SHADOW_SLOTS");
+    if (!e || !*e) return RAD_PLACE_SHADOW_SLOTS;
+    char* end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (end == e || *end || v < 8 || v > RAD_PLACE_SHADOW_SLOTS) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            RAD_WARN("RADIANCE_PLACE_SHADOW_SLOTS=%s is not a count from 8 to %d; the planner keeps %d", e,
+                     RAD_PLACE_SHADOW_SLOTS, RAD_PLACE_SHADOW_SLOTS);
+        return RAD_PLACE_SHADOW_SLOTS;
+    }
+    return (int)v;
+}
+
 /* ------------------------------------------------------------------ the lookup tables */
 bool read_only_by(const Program& prog, rad_weight w, const char* op) {
     bool read = false;
@@ -1006,6 +1026,12 @@ bool read_only_by(const Program& prog, rad_weight w, const char* op) {
                 read = true;
             }
     return read;
+}
+
+bool embed_ggml_table() {
+    /* Read at each call (a few per weight at declare and plan), so a test can set it. */
+    const char* e = std::getenv("RADIANCE_DS41_EMB_RAM");
+    return e && e[0] == '1' && !e[1];
 }
 
 /* --embedding-placement ram: the token embedding goes to the pinned host pool before any strategy

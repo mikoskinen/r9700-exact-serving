@@ -62,15 +62,23 @@ AVX_KERNEL(gemm_nt_f32) {
         x.shape[1] != k || w.shape[0] != n || w.shape[1] != k || y.shape[0] != x.shape[0] ||
         y.shape[1] != n)
         return RAD_E_SHAPE;
-    if (x.dtype != RAD_BF16 || w.dtype != RAD_F32 || y.dtype != RAD_F32) return RAD_E_DTYPE;
+    /* A bf16 weight (RADIANCE_DS41_ROUTER_BF16) is widened a row at a time into f32 and takes the
+     * same dot: the same values, the same sum. */
+    if (x.dtype != RAD_BF16 || (w.dtype != RAD_F32 && w.dtype != RAD_BF16) || y.dtype != RAD_F32)
+        return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
+    const bool wb = w.dtype == RAD_BF16;
     AVX_PARALLEL_FOR_IF(x.shape[0] * n * k >= AVX_PAR_MIN)
     for (int64_t r = 0; r < x.shape[0]; ++r) {
-        float* query = scratch_f32((size_t)k);
+        float* query = scratch_f32((size_t)(wb ? 2 * k : k));
+        float* wrow = query + k;
         for (int64_t j = 0; j < k; ++j) query[j] = ldt(&x, r * x.stride[0] + j * x.stride[1]);
         for (int64_t col = 0; col < n; ++col) {
             float sum = 0;
-            if (w.stride[1] == 1)
+            if (wb && w.stride[1] == 1) {
+                for (int64_t j = 0; j < k; ++j) wrow[j] = ldt(&w, col * w.stride[0] + j);
+                sum = dot(query, wrow, k);
+            } else if (w.stride[1] == 1)
                 sum = dot(query, (const float*)w.data + col * w.stride[0], k);
             else
                 for (int64_t j = 0; j < k; ++j)

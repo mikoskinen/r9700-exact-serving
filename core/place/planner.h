@@ -168,6 +168,14 @@ struct SlabClass {
  * gets them; the rest of the move budget is RAD_PLACE_TURNOVER_SLOTS. The quarter-of-the-slab cap
  * binds only on very small slabs. */
 #define RAD_PLACE_SHADOW_SLOTS 32
+/* The shadow slots a class gets, at most (lever VA "shadow"): RADIANCE_PLACE_SHADOW_SLOTS=<8..32>
+ * (set at start), unset (or out of range, with a warning) RAD_PLACE_SHADOW_SLOTS. Every use of
+ * the count reads this -- the expert floor's spare (weight_footprint), each class's shadow and hot
+ * budget (Planner), the mover's heat swap range -- so budget, plan and mover agree. Placement only:
+ * a unit's tier decides where its bytes are read from, not what a kernel computes with them. The
+ * lent turnover slots keep their shipped default (RAD_PLACE_TURNOVER_SLOTS, set outright by
+ * RADIANCE_PLACE_TURNOVER), so fewer shadow slots hand their VRAM to the cache and its loan. */
+int place_shadow_slots();
 
 /* Turnover slots: free slab slots the mover keeps out of a loan (Mover::lend_from) beyond the
  * shadow slots. A swap holds a slot for about three steps (copy behind the proposing step,
@@ -443,8 +451,15 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
  * usable; a weight a GEMM also reads (an output head tied to the embedding) would stream whole
  * every step and is neither. Shared by the budget resolver and the planner. */
 bool read_only_by(const Program& prog, rad_weight w, const char* op);
+/* RADIANCE_DS41_EMB_RAM=1 (lever VA "emb"): a model-level table read only by
+ * `embed_lookup_ggml` (a token embedding in llama.cpp's blocks, DeepSeek-V4.1's q6_K table) is a
+ * token embedding too, so --embedding-placement (ram by default) places it like a bf16 one: pinned in
+ * host memory, its M rows a step read over the link in place. Exact: a lookup reads the same bytes
+ * wherever they sit. Unset or anything but "1": only `embed_lookup`'s table qualifies, as before. */
+bool embed_ggml_table();
 inline bool is_embedding_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup");
+    return read_only_by(prog, w, "embed_lookup") ||
+           (embed_ggml_table() && read_only_by(prog, w, "embed_lookup_ggml"));
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup_q") || read_only_by(prog, w, "embed_lookup_planes");

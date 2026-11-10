@@ -986,6 +986,22 @@ int Engine::apply_rope_scaling() {
     return RAD_OK;
 }
 
+/* RADIANCE_XPREFETCH=0 (or off; lever VA "xpoff", read once): no next-layer expert prefetch -- its
+ * DMA queue is never opened, its stream, ring and buffers (xp_device_bytes) leave the VRAM budget, and
+ * that VRAM goes to the split like any other. Exact: the prefetch only copies expert bytes early into
+ * a ring the step may read them from instead of the pool. On DeepSeek-V4.1 it predicts nothing anyway
+ * (Ctx::xp_predict_run takes a router input of at most 4096 columns; the model's is 5120). Unset: as
+ * before. */
+static bool xprefetch_env_off() {
+    static const bool off = [] {
+        const char* e = getenv("RADIANCE_XPREFETCH");
+        const bool o = e && (!std::strcmp(e, "0") || !std::strcmp(e, "off"));
+        if (o) RAD_INFO("expert prefetch: off (RADIANCE_XPREFETCH=%s): no DMA queue, ring or stream for it", e);
+        return o;
+    }();
+    return off;
+}
+
 /* ================================================================== 3 + 4. plugins, declare */
 int Engine::load_plugins() {
     int s = rad_tools_load_plugins(cfg_.radiance_home, cfg_.kernel_hierarchy,
@@ -1065,6 +1081,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
         bc.cvec = &cvec_views_[(size_t) rank];
     return bc;
 }
+
+static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& levels,
+                              const Config& cfg);   /* lever VA's RADIANCE_DEBUG_VRAM, below */
 
 int Engine::declare() {
     /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
@@ -1583,6 +1602,22 @@ int Engine::declare() {
     RAD_INFO("declare: %zu ops, %zu weights, %zu buffers, %zu KV groups",
              ranks_[0]->program.ops.size() - 1, ranks_[0]->program.weights.size() - 1,
              ranks_[0]->program.buffers.size() - 1, ranks_[0]->program.kv_groups.size());
+    /* Lever VA "emb" (RADIANCE_DS41_EMB_RAM): name the table it makes placeable, at declare, so a
+     * host start (--debug-graph) shows it before any placement runs. */
+    if (embed_ggml_table()) {
+        const Program& p0 = ranks_[0]->program;
+        int n = 0;
+        for (size_t w = 1; w < p0.weights.size(); ++w)
+            if (read_only_by(p0, (rad_weight)w, "embed_lookup_ggml")) {
+                ++n;
+                RAD_INFO("embedding: '%s' (%s a rank) is read only by embed_lookup_ggml: a token "
+                         "embedding table --embedding-placement places (RADIANCE_DS41_EMB_RAM)",
+                         p0.weights[w].name.c_str(), humanb(p0.weights[w].stored_bytes).c_str());
+            }
+        if (!n)
+            RAD_INFO("embedding: RADIANCE_DS41_EMB_RAM is set, and no weight is read only by "
+                     "embed_lookup_ggml");
+    }
 
     /* The draft head is exactly what the plugin declared (rad_declare_drafter). The core never
      * infers one from weight names or metadata, so third-party drafters need no core changes. */
@@ -1658,7 +1693,94 @@ int Engine::declare() {
         RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
     }
     probe_arena_levels();
+    if (!ranks_.empty()) debug_vram_report(ranks_[0]->program, ranks_[0]->arena_levels, cfg_);
     return RAD_OK;
+}
+
+/* RADIANCE_DEBUG_VRAM=1: rank 0's VRAM terms the VA levers move, in bytes, at the end of declare -- so a
+ * host start (--debug-graph, no card) shows them: the activation arena's full plan and levels with
+ * their largest transients ("arena"), the router and compressor projections' stored bytes ("bf16"),
+ * the token table the embedding placement can move ("emb"), the expert floor's spare slab and the
+ * shadow count it was sized with ("shadow"), and the expert prefetch's ring and buffers ("xpoff").
+ * Nothing here is used by the engine. */
+static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& levels, const Config& cfg) {
+    const char* d = getenv("RADIANCE_DEBUG_VRAM");
+    if (!(d && *d && std::strcmp(d, "0") != 0)) return;
+    auto top = [&](const ArenaLevel* lv) {
+        std::vector<std::pair<int64_t, size_t>> b;
+        for (size_t i = 1; i < P.buffers.size(); ++i) {
+            const BufferInfo& bi = P.buffers[i];
+            if (bi.decl.kind != RAD_BUF_TRANSIENT || bi.decl.domain == RAD_DOMAIN_HOST) continue;
+            b.emplace_back(lv ? buffer_bytes(lv->decl[i]) : bi.bytes, i);
+        }
+        std::sort(b.begin(), b.end(), [](const std::pair<int64_t, size_t>& x, const std::pair<int64_t, size_t>& y) {
+            return x.first != y.first ? x.first > y.first : x.second < y.second;
+        });
+        int64_t sum = 0;
+        for (const auto& e : b) sum += e.first;
+        std::string o = fmt("%zu transients, %lld B unshared; largest:", b.size(), (long long)sum);
+        for (size_t k = 0; k < b.size() && k < 8; ++k)
+            o += fmt(" %s %lld", P.buffers[b[k].second].name.c_str(), (long long)b[k].first);
+        return o;
+    };
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) arena: full plan %lld rows, end %lld B, fixed %lld B; %s",
+             (long long)cfg.max_tok, (long long)P.arena_bytes, (long long)P.arena_fixed_bytes, top(nullptr).c_str());
+    for (const ArenaLevel& lv : levels)
+        RAD_INFO("vram (RADIANCE_DEBUG_VRAM) arena: level %lld rows, end %lld B (%lld B below the full plan's end); %s",
+                 (long long)lv.rows, (long long)lv.end, (long long)(P.arena_bytes - lv.end), top(&lv).c_str());
+    int64_t router = 0, comp = 0, emb = 0;
+    int n_router = 0, n_comp = 0, n_emb = 0;
+    std::string emb_names;
+    for (size_t w = 1; w < P.weights.size(); ++w) {
+        const WeightInfo& wi = P.weights[w];
+        if (wi.name.find(".glm_router.weight") != std::string::npos) { router += wi.stored_bytes; ++n_router; }
+        if (wi.name.find("attn_compressor_kvg") != std::string::npos) { comp += wi.stored_bytes; ++n_comp; }
+        if (is_embedding_table(P, (rad_weight)w)) {
+            emb += wi.stored_bytes;
+            ++n_emb;
+            emb_names += (emb_names.empty() ? "" : ",") + wi.name;
+        }
+    }
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) bf16: %d router projections %lld B, %d compressor kv|gate projections %lld B",
+             n_router, (long long)router, n_comp, (long long)comp);
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) emb: %d token embedding table(s) the placement flag moves, %lld B (%s)",
+             n_emb, (long long)emb, emb_names.empty() ? "none" : emb_names.c_str());
+    /* The expert slab classes as weight_footprint forms them -- a unit a (layer, expert), its weights
+     * each aligned, the unit rounded to RAD_ALIGN_UNIT, a class a stride -- counted from the weights
+     * themselves: on the host backend no device kernel reads an expert, so weight_footprint maps them
+     * all and sees none. */
+    std::map<std::pair<int32_t, int32_t>, int64_t> unit;
+    int64_t nl = P.meta.n_layers;
+    for (size_t w = 1; w < P.weights.size(); ++w) {
+        const WeightInfo& wi = P.weights[w];
+        if (wi.decl.group.expert < 0 || wi.decl.group.layer < 0) continue;
+        nl = std::max(nl, (int64_t)wi.decl.group.layer + 1);
+        int64_t& b = unit[{ wi.decl.group.layer, wi.decl.group.expert }];
+        b = align_up(b, wi.align > 0 ? wi.align : (int64_t)RAD_ALIGN_UNIT) + weight_bytes(wi);
+    }
+    std::map<int64_t, int64_t> classes;   /* stride -> units */
+    int64_t unit_max = 0;
+    for (const auto& u : unit) {
+        const int64_t st = align_up(u.second, (int64_t)RAD_ALIGN_UNIT);
+        ++classes[st];
+        unit_max = std::max(unit_max, st);
+    }
+    const int sh = place_shadow_slots();
+    int64_t spare = 0, spare32 = 0;
+    std::string cls;
+    for (const auto& c : classes) {
+        spare += (int64_t)(sh + RAD_PLACE_STAGE_RING) * c.first + RAD_ALIGN_UNIT;
+        spare32 += (int64_t)(RAD_PLACE_SHADOW_SLOTS + RAD_PLACE_STAGE_RING) * c.first + RAD_ALIGN_UNIT;
+        cls += fmt("%s%lld x %lld B", cls.empty() ? "" : ", ", (long long)c.second, (long long)c.first);
+    }
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) shadow: %d shadow slots a class at most; %zu expert slab class(es) (%s); the expert "
+             "floor's spare slab %lld B (%lld B at the shipped %d)",
+             sh, classes.size(), cls.c_str(), (long long)spare, (long long)spare32, RAD_PLACE_SHADOW_SLOTS);
+    const int64_t xp = unit_max > 0 && !xprefetch_env_off() ? xp_device_bytes(unit_max, nl) : 0;
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) xpoff: the expert prefetch's ring and buffers %lld B over %lld routed layers "
+             "(the largest unit %lld B)%s",
+             (long long)xp, (long long)nl, (long long)unit_max,
+             xprefetch_env_off() ? " (RADIANCE_XPREFETCH off: none, and no DMA queue)" : "");
 }
 
 /* The mebibyte between a level's highest buffer and the memory above it, which is lent or holds
@@ -1706,6 +1828,28 @@ void Engine::probe_arena_levels() {
     if (const char* e = getenv("RADIANCE_ARENA_LEVEL_MAX"); e && *e) lv_max = std::max<int64_t>(0, std::atoll(e));
     for (int64_t R = lo; R < cfg_.max_tok; R *= 4)
         if (lv_max <= 0 || R <= lv_max) want.push_back(R);
+    /* RADIANCE_DS41_ARENA_DECODE_ROWS=<rows> (lever VA "arena"; unset: no such rung): one rung below
+     * the 256-row floor, for decode and verify steps of at most <rows> rows (arena_step's need:
+     * sequences x (1 + speculative depth) at decode), so the arena above it is lent to the expert
+     * slab while steps stay that small. The floor guards against a kernel writing its last tile's
+     * padding rows past a level; below it the rows must be proven per model, so the rung is offered
+     * to deepseek41 only, at the rows its kernels were audited for (arena_decode_rows_ok: 8..64),
+     * and the plugin sizes its indexer plane by the level (deepseek41.cpp ds41_arena_decode_rows). */
+    if (const char* e = getenv("RADIANCE_DS41_ARENA_DECODE_ROWS"); e && *e) {
+        const int64_t R = std::atoll(e);
+        std::string bad;
+        if (plugins_.arch_plugin != "deepseek41")
+            bad = fmt("the '%s' plugin's kernels were not audited for it (deepseek41 only)",
+                      plugins_.arch_plugin.c_str());
+        else if (!arena_decode_rows_ok(R, lo, &bad)) {}
+        else if (std::find(want.begin(), want.end(), R) == want.end()) {
+            want.push_back(R);
+            std::sort(want.begin(), want.end());
+        }
+        if (!bad.empty())
+            RAD_WARN("activation arena: RADIANCE_DS41_ARENA_DECODE_ROWS=%s is not used -- %s", e,
+                     bad.c_str());
+    }
     arena_span_rows_ = 0;
     const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
     if (span_rows >= lo && span_rows < cfg_.max_tok &&
@@ -1839,7 +1983,7 @@ int Engine::plan() {
             /* The expert prefetch's stream, ring and buffers, when it can run: experts in a pinned
              * pool, not --deterministic, and a spare DMA engine (asked before the free reading
              * below, so its queue is already counted there). */
-            if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic &&
+            if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic && !xprefetch_env_off() &&
                 (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device)) {
                 /* Routed layers counted as Ctx::bind_routing does, including a head past the trunk. */
                 int64_t nl = r->program.meta.n_layers;
@@ -4215,7 +4359,7 @@ int Engine::start() {
     /* The next-layer expert prefetch, wherever experts sit in a pinned pool for routed GEMMs to
      * read over the link (core/runtime/xprefetch.h). Its stream and ring are in the VRAM budget
      * (xp_device_bytes, Engine::plan). Off under --deterministic. */
-    if (!cfg_.deterministic)
+    if (!cfg_.deterministic && !xprefetch_env_off())
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];

@@ -65,6 +65,7 @@ struct XpState {
     int64_t      calls = 0;
     uint32_t     snap_copied = 0, snap_routed = 0;
     bool         have_snap = false, judge = false;
+    bool         said_width = false;   /* xp_predict_run said once that the router input is too wide */
     int          restore_g  = -1;      /* the group the next step puts back */
     XpReq        pend;                 /* made at a router, waiting for its mark */
 

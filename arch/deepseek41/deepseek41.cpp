@@ -404,6 +404,11 @@ struct Model {
      * plane (index_runs()), at most `iparts` runs a step; `kwords` is index_candidates' keep, a bit
      * a block of the candidate layer's width, i32 words a row (0: the model has no candidates). */
     int64_t irows = 0, iparts = 0, kwords = 0;
+    /* Lever VA "arena" (RADIANCE_DS41_ARENA_DECODE_ROWS, ds41_arena_decode_rows()): the rows the
+     * score plane and the selections are declared at in a sizing declare below irows (a level for
+     * steps of at most that many rows, which are one run, never split). 0: irows, as the real
+     * declare (and every declare with the switch unset). */
+    int64_t score_rows = 0;
     /* The indexer's two exact restrictions (index_mode(), RADIANCE_DS41_INDEX at declare):
      * `ikeep` scores a layer past the candidate layer at the candidate layer's kept blocks only
      * (index_score's keep: the same selection, docs/OPS.md); `isplit` deals a step's runs over the
@@ -1126,6 +1131,23 @@ static void index_mode(Model& m) {
     m.lnv = lx && !std::strcmp(lx, "nvfp4") && m.c.window % 32 == 0;
 }
 
+/* RADIANCE_DS41_ARENA_DECODE_ROWS=<rows> (lever VA "arena"): the core adds an activation-arena level
+ * below its 256-row floor for decode steps of at most <rows> rows (Engine::probe_arena_levels, which
+ * reads the same variable), and a sizing declare below irows declares the indexer's score plane, its
+ * selections and the split's part at its own rows instead of the real declare's capacity (Model::
+ * score_rows): a step of at most irows rows is one run of exactly its rows (ds41_idx_runs), never
+ * split, and every index op is issued over bcol / brow_slice views of those rows, so the plane needs
+ * no more. Placement only: the kernels, their launch shapes and their operands' extents are the real
+ * plan's (core/build/rad_bufplan.cpp plan_level refuses anything but fewer rows). At 512k context the
+ * plane is 2 MiB a row, 512 MiB at 256 rows. Unset or 0: every sizing declare as today. */
+static int64_t ds41_arena_decode_rows() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_ARENA_DECODE_ROWS");
+        return e && *e ? std::max<int64_t>(0, std::atoll(e)) : (int64_t)0;
+    }();
+    return v;
+}
+
 /* RADIANCE_DS41_AR_PCN (default off until its TP4 A/B): at four ranks with the exact wire, a decode or verify step's
  * all-reduce and the mhc_post_collapse_rmsnorm after it as one collective (ar_mhc_post_collapse_rmsnorm, byte-identical
  * to the pair). "1" = at the attention's all-reduce (its post + the ffn collapse + norm); "2" = there and at the MoE's
@@ -1147,6 +1169,20 @@ static int ds41_ar_pcn_moe() { return ds41_ar_pcn_mode() == 2; }
  * 10.11. (gpu02 item 77: c4 -1.0..-1.4 %, 1 user 0 %: rejected, the switch kept). */
 static int ds41_router_fuse() {
     static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_ROUTER_FUSE"); return e && e[0] == '1' && !e[1]; }();
+    return on ? 1 : 0;
+}
+
+/* RADIANCE_DS41_ROUTER_BF16=1 (lever VA "bf16"; read at declare): the f32 weights whose checkpoint is
+ * BF16 -- every MoE router projection (trunk and DSpark, [n_expert, n_embd]) and the ratio > 1
+ * compressors' fused kv|gate projection ([2 hd, n_embd]) -- are stored as bf16 instead of f32, half
+ * the bytes (~150 + 30 MiB a card). Exact: the checkpoint holds them as BF16 (the release's
+ * ffn.gate.weight and attn.compressor.wkv / wgate; the container's f32 router planes have zero low
+ * halves), the loader stores those values unchanged (a narrowing of an exact bf16 value is that
+ * value; the compressor's bf16 plane is no longer widened), and gemm_nt_f32 widens each weight to
+ * that same f32 value before the same fmaf in the same order (libr4d gemm_f32_wval, held byte for
+ * byte to the f32 storage by tests/r4d_emu/test_ds41vram.cpp). Unset or anything but "1": f32. */
+static int ds41_router_bf16() {
+    static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_ROUTER_BF16"); return e && e[0] == '1' && !e[1]; }();
     return on ? 1 : 0;
 }
 
@@ -1198,12 +1234,16 @@ static int buffers(RadBuilder* b, Model& m) {
     m.ikn = bf("index_k_normed", { LR, c.idim });
     m.iq = bf("index_q", { T, c.ih * c.idim });
     m.iw = bf("index_w", { T, c.ih });
-    m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.irows, m.cmax });
+    /* score_rows (lever VA "arena", a sizing declare below irows): no split at such a step, so the
+     * selections are its rows too. */
+    m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.score_rows ? m.score_rows : m.irows, m.cmax });
     if (m.kwords > 0) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     /* Split: the gather lays aw parts of qmax runs of at most irows rows, rank r's at r qmax R. */
-    const int64_t sel_rows = m.isplit ? std::max(T, (int64_t)m.aw * m.qmax * m.irows) : T;
+    const int64_t sel_rows = m.isplit && !m.score_rows ? std::max(T, (int64_t)m.aw * m.qmax * m.irows) : T;
     m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { sel_rows, c.itopk });
-    if (m.isplit) m.sel_part = decl_b(b, nm.f("index_sel_part"), RAD_I32, { m.qmax * m.irows, c.itopk });
+    if (m.isplit)
+        m.sel_part = decl_b(b, nm.f("index_sel_part"), RAD_I32,
+                            { m.score_rows ? std::min(m.score_rows, m.qmax * m.irows) : m.qmax * m.irows, c.itopk });
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     m.cs_b = decl_b(b, nm.f("rope_compressed"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     if (!c.ple.empty()) {
@@ -1558,8 +1598,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 const char* cn = nm.f("blk.%d.attn_compressor_kvg.weight", l);
                 DS_TRY(map_concat(b, cn, { ckpt_name(nm.f("blk.%d.attn_compressor_kv.weight", l)),
                                            ckpt_name(nm.f("blk.%d.attn_compressor_gate.weight", l)) }));
-                L.comp_w = decl_w(b, cn, RAD_F32, { 2 * hd, D }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
-                                  grp);
+                L.comp_w = decl_w(b, cn, ds41_router_bf16() ? RAD_BF16 : RAD_F32, { 2 * hd, D },
+                                  RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
                 L.c_gemm = op(b, "gemm_nt_f32",
                               { RAD_RANGE("M", 1, T), RAD_INT("N", 2 * hd), RAD_INT("K", D),
                                 RAD_STR("dtype", "bf16") },
@@ -1796,6 +1836,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
     s.cfg.router_score = "sqrtsoftplus";
+    s.cfg.router_bf16 = ds41_router_bf16();
     s.cfg.router_fuse = ds41_router_fuse();
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
@@ -2032,6 +2073,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
     s.cfg.router_score = "sqrtsoftplus";
+    s.cfg.router_bf16 = ds41_router_bf16();
     s.cfg.router_fuse = ds41_router_fuse();
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
@@ -2349,6 +2391,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.ikeep = full.ikeep;
         m.isplit = full.isplit;
         m.qmax = full.qmax;
+        /* Lever VA "arena": below irows the plane and the selections follow the level's rows. */
+        if (ds41_arena_decode_rows() > 0 && g.max_tok < m.irows) m.score_rows = g.max_tok;
     }
     DS_TRY(buffers(b, m));
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */

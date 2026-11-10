@@ -13,15 +13,22 @@ namespace {
 // k before their FMAs: at a decode pass's few rows a wave streams its weight row with no other
 // work to hide the load behind, and one step in flight left the router at 150 GB/s. Tail rows and
 // columns read a clamped valid address and are never stored.
-template <int R, int C, int U>
+//
+// WT is the weight's storage: float (f32), or uint16_t for bf16 weights (RADIANCE_DS41_ROUTER_BF16,
+// a DeepSeek-V4.1 router or compressor stored as the BF16 its checkpoint holds). A bf16 weight is
+// widened to the f32 value it stands for (exact) before the same fmaf in the same order, so both
+// storages give the same bytes for the same values.
+__device__ __forceinline__ float gemm_f32_wval(float v) { return v; }
+__device__ __forceinline__ float gemm_f32_wval(uint16_t v) { return bf16_to_f32(v); }
+template <int R, int C, int U, typename WT = float>
 __global__ void __launch_bounds__(128)
-    gemm_nt_f32_tile_kernel(const uint16_t* x, const float* w, float* y, long xp, long wp, long yp,
+    gemm_nt_f32_tile_kernel(const uint16_t* x, const WT* w, float* y, long xp, long wp, long yp,
                             int m, int n, int k) {
     const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
               r0 = blockIdx.y * R;
     if (c0 >= n) return;
     const uint16_t* xr[R];
-    const float* wc[C];
+    const WT* wc[C];
 #pragma unroll
     for (int q = 0; q < R; ++q) xr[q] = x + (long)(r0 + q < m ? r0 + q : m - 1) * xp;
 #pragma unroll
@@ -38,7 +45,7 @@ __global__ void __launch_bounds__(128)
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
-            for (int c = 0; c < C; ++c) weight[u][c] = wc[c][j + 32 * u];
+            for (int c = 0; c < C; ++c) weight[u][c] = gemm_f32_wval(wc[c][j + 32 * u]);
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
@@ -57,7 +64,7 @@ __global__ void __launch_bounds__(128)
         for (int q = 0; q < R; ++q) {
             const float v = bf16_to_f32(xr[q][j]);
 #pragma unroll
-            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, wc[c][j], sum[q][c]);
+            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, gemm_f32_wval(wc[c][j]), sum[q][c]);
         }
     }
 #pragma unroll
@@ -80,6 +87,12 @@ template <int R, int C, int U = 1>
 int gemm_f32_tile(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
                   long n, long k) {
     const long m = x.shape[0];
+    if (w.dtype == RAD_BF16)
+        return R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U, uint16_t>),
+                        dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)),
+                        dim3(128), 0, (const uint16_t*)x.data, (const uint16_t*)w.data,
+                        (float*)y.data, x.stride[0], w.stride[0], y.stride[0], (int)m, (int)n,
+                        (int)k);
     return R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U>),
                     dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)),
                     dim3(128), 0, (const uint16_t*)x.data, (const float*)w.data, (float*)y.data,
@@ -89,7 +102,9 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
     const auto &x = a->t[0], &w = a->t[1], &y = a->t[2];
     const long n = r4d_geti_or(a, "N", 0), k = r4d_geti_or(a, "K", 0);
-    if (x.dtype != RAD_BF16 || w.dtype != RAD_F32 || y.dtype != RAD_F32) return RAD_E_DTYPE;
+    /* The weight is f32, or bf16 widened in the kernel (gemm_f32_wval): the same values, the same bytes. */
+    if (x.dtype != RAD_BF16 || (w.dtype != RAD_F32 && w.dtype != RAD_BF16) || y.dtype != RAD_F32)
+        return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
     /* Any width: the grid spans n (a wave a C-column tile), so 512 was only the router's own. A
      * compressor's fused kv|gate projection is 1024 wide. */
