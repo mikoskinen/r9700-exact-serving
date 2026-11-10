@@ -20406,7 +20406,7 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
 static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* fmts) {
     if (iters <= 0) iters = 50;
     if (Mtok < 1 || Mtok > 4096) { std::printf("--perfdsmoe: 1 <= M <= 4096\n"); return; }
-    const std::string want = fmts && *fmts ? fmts : "mx,iqr2,iqr3,iqr4";
+    const std::string want = fmts && *fmts ? fmts : "mx,w4,iqr2,iqr3,iqr4";
     auto has = [&](const char* f) { return ("," + want + ",").find(std::string(",") + f + ",") != std::string::npos; };
     const int64_t EG = 384, E = 96, top_k = 6, world = 4;
     uint64_t rs = 0x9E3779B97F4A7C15ull ^ (uint64_t)(Mtok * 7919);
@@ -20565,6 +20565,104 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
         if (!r) std::printf("  moe_gemm_mxfp4a8 absent\n");
         else std::printf("DSMOE mx layer M=%lld gate_up + down %.1f us (the rule's forms; %.2f MiB an expert: 4.25 bits a weight)\n", (long long)Mtok, layer,
                          (4608.0 * 5120 + 5120.0 * 2304) * 4.25 / 8 / 1048576.0);
+    }
+    /* ------------------------------------------------------------ the plain 4-bit grid (w4a8h: two's complement codes, a
+     * bf16 scale per row per 128 of K, E4M3 activations; Qwen iq4r's expert form family, moe_gemm_q as deepseek41's
+     * quantised expert path issues it, two parity tables) */
+    const uint32_t kW4 = RAD_DT_PLUGIN_BASE + 7;   /* libr4d r4d_args.h R4D_DT_MOEW4 */
+    if (has("w4")) {
+        const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
+        double layer = 0.0;
+        for (int pi = 0; pi < 2 && r; ++pi) {
+            const Proj& P = projs[pi];
+            /* moe_gemm_q (mxfp4a8) takes the step's whole slot buffers, M x top_k rows (y, sorted, and a in
+             * sorted order); the rank's routed rows are [0, off[E]). */
+            const int64_t TS = Mtok * top_k;
+            const int64_t N = P.N, K = P.K, Ma = P.srt ? TS : Mtok, cb = N * K / 2, sb = N * (K / 128) * 2;
+            const int64_t nec[2] = { (E + 1) / 2, E / 2 };
+            const double slice = (double)(cb + sb);
+            std::vector<uint8_t> av((size_t)(Ma * K));
+            for (size_t i = 0; i < av.size(); ++i)
+                av[i] = rad_f32_to_fp8e4m3((float)((int)(st_mix32((uint32_t)i) % 33) - 16) / 4);
+            std::vector<float> asc((size_t)(Ma * (K / 128)));
+            for (size_t i = 0; i < asc.size(); ++i) asc[i] = 0.003f * (float)(1 + i % 5);
+            void* d_a = dalloc(av.size());
+            void* d_as = dalloc(asc.size() * 4);
+            void* d_s = dalloc((size_t)TS * 4);
+            void* d_o = dalloc((size_t)(E + 1) * 4);
+            void* d_y = dalloc((size_t)(TS * N) * 2);
+            void *d_w[2], *d_sc[2], *d_tw[2], *d_ts[2];
+            bool okk = d_a && d_as && d_s && d_o && d_y;
+            for (int c = 0; c < 2 && okk; ++c) {
+                d_w[c] = dalloc((size_t)(nec[c] * cb));
+                d_sc[c] = dalloc((size_t)(nec[c] * sb));
+                d_tw[c] = dalloc((size_t)nec[c] * sizeof(void*));
+                d_ts[c] = dalloc((size_t)nec[c] * sizeof(void*));
+                okk = d_w[c] && d_sc[c] && d_tw[c] && d_ts[c];
+                if (!okk) break;
+                std::vector<uint64_t> hw((size_t)(nec[c] * cb + 7) / 8);
+                for (uint64_t& v : hw) v = rnd();
+                st_memcpy(d_w[c], hw.data(), (size_t)(nec[c] * cb), hipMemcpyHostToDevice);
+                std::vector<uint8_t> hs((size_t)(nec[c] * sb));
+                for (size_t i = 0; i + 1 < hs.size(); i += 2) { const uint16_t v = h_to_bf16(0.002f * (float)(1 + rnd() % 7)); std::memcpy(&hs[i], &v, 2); }
+                st_memcpy(d_sc[c], hs.data(), hs.size(), hipMemcpyHostToDevice);
+                std::vector<const void*> tw((size_t)nec[c]), tsc((size_t)nec[c]);
+                for (int64_t x = 0; x < nec[c]; ++x) {
+                    tw[(size_t)x] = (const char*)d_w[c] + x * cb;
+                    tsc[(size_t)x] = (const char*)d_sc[c] + x * sb;
+                }
+                st_memcpy(d_tw[c], tw.data(), tw.size() * sizeof(void*), hipMemcpyHostToDevice);
+                st_memcpy(d_ts[c], tsc.data(), tsc.size() * sizeof(void*), hipMemcpyHostToDevice);
+            }
+            if (!okk) { std::printf("  w4 %s: alloc failed\n", P.name); dfree_all(); break; }
+            st_memcpy(d_a, av.data(), av.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_as, asc.data(), asc.size() * 4, hipMemcpyHostToDevice);
+            {
+                std::vector<int32_t> sp(sorted);
+                sp.resize((size_t)TS, 0);
+                st_memcpy(d_s, sp.data(), (size_t)TS * 4, hipMemcpyHostToDevice);
+            }
+            st_memcpy(d_o, off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+            std::vector<RadTensor> ts = {
+                T(d_a, RAD_F8E4M3, { Ma, K }), T(d_as, RAD_F32, { Ma, K / 128 }),
+                T(d_tw[0], kW4, { nec[0], N, K }), T(d_ts[0], RAD_BF16, { nec[0], N, K / 128 }),
+                T(d_s, RAD_I32, { TS }), T(d_o, RAD_I32, { E + 1 }),
+                T(d_tw[1], kW4, { nec[1], N, K }), T(d_ts[1], RAD_BF16, { nec[1], N, K / 128 }),
+                T(d_y, RAD_BF16, { TS, N }),
+            };
+            for (int i : { 2, 3, 6, 7 }) ts[(size_t)i].stride[0] = 0;
+            std::vector<RadParam> ps = { PI("M", Mtok), PI("N", N), PI("K", K), PI("N_odd", N), PI("K_odd", K),
+                                         PI("n_expert", E), PI("top_k", top_k), PI("parts", P.parts), PI("group", 128),
+                                         PS("a_order", P.srt ? "sorted" : "token"), PS("dtype", "w4a8h") };
+            RadArgs a = args_of(ts, ps);
+            if (!scratch(r, &a)) { std::printf("  w4 %s: scratch refused\n", P.name); dfree_all(); continue; }
+            std::printf("  w4   %-7s %lld x %lld: %.2f MiB an expert, %.1f MiB touched\n", P.name, (long long)N,
+                        (long long)K, slice / 1048576.0, touched * slice / 1048576.0);
+            std::vector<uint16_t> first;
+            const std::vector<int> forms = { 0 };
+            for (const int form : forms) {
+                                const size_t yb = (size_t)(Tr * N) * 2;   /* the rank's rows, compared */
+                st_memset(d_y, 0xff, (size_t)(TS * N) * 2);
+                const int rc = r->launch(&a, nullptr);
+                const char* nmf = form == 0 ? "rule" : form == 1 ? "pin 1 small-M" : form == 2 ? "pin 2 never small" : "pin 3 small-M K256x4";
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+                    std::printf("    %-22s rc=%d (not served)\n", nmf, rc);
+                    continue;
+                }
+                warm(r, &a);
+                const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+                std::vector<uint16_t> got((size_t)(Tr * N));
+                st_memcpy(got.data(), d_y, yb, hipMemcpyDeviceToHost);
+                const bool same = first.empty() || got == first;
+                if (first.empty()) { first = std::move(got); layer += us; }
+                std::printf("DSMOE w4 %s M=%lld %s %.1f us %.1f GB/s%s\n", P.name, (long long)Mtok, nmf, us,
+                            touched * slice / (us * 1e3), form == 0 ? "" : same ? " (bytes match the rule)" : " OUTPUT DIFFERS");
+            }
+            dfree_all();
+        }
+        if (!r) std::printf("  moe_gemm_w4a8 absent\n");
+        else std::printf("DSMOE w4 layer M=%lld gate_up + down %.1f us (%.2f MiB an expert: 4.125 bits a weight)\n", (long long)Mtok, layer,
+                         (4608.0 * 5120 + 5120.0 * 2304) * 4.125 / 8 / 1048576.0);
     }
     /* ------------------------------------------------------------ EXL3 (the radiance-exl3 extension's exl3r4d rows,
      * as deepseek41 issues them: moe_exl3_gate_up (its prep inside, SwiGLU limit 10, h_rot 1, a_rot 0, bf16 x) and
