@@ -1675,6 +1675,13 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     d.rank = gi(meta, "dspark.markov_rank", 0);
     d.noise = gi(meta, "dspark.noise_token_id", -1);
     d.cand = gi(meta, "dspark.markov_top_k", 16);
+    /* RADIANCE_DS41_DSPARK_CAND (1..32): the Markov walk's candidates from the head's top (the reference biases the
+     * whole vocabulary; the walk re-ranks this many); unset = the container's dspark.markov_top_k, else 16. The
+     * drafter only proposes and the trunk verifies, so the trunk's greedy text does not depend on it. */
+    if (const char* e = std::getenv("RADIANCE_DS41_DSPARK_CAND")) {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v >= 1 && v <= 32) d.cand = v;
+    }
     d.taps = gl(meta, "dspark.target_layers");
     std::sort(d.taps.begin(), d.taps.end());
     bool ok = !d.taps.empty() && d.noise >= 0 && d.noise < c.n_vocab && d.rank > 0 && d.rank % 32 == 0 &&
