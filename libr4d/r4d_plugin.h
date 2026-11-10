@@ -522,6 +522,10 @@ int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs*);
 int  r4d_rad_ar_gather_hc_write_4rank(const RadArgs*, RadStream);
 /* moe_gather + the exact all_reduce at four ranks (ar_gather_hc_write_4rank's kernel at hc 0). */
 int  r4d_rad_moe_gather_ar_4rank(const RadArgs*, RadStream);
+/* moe_gather_all_reduce_slot (lever D3s, r4d_ar_slotsum.hip): the slot-order sum at four ranks, on
+ * its own instance (r4d_rad_ar_slot_init: the planes' scratch). */
+int  r4d_rad_ar_slot_init(const RadParam*, int, int rank, int world, void** out);
+int  r4d_rad_moe_gather_ar_slot_4rank(const RadArgs*, RadStream);
 
 /* -- GEMM (r4d_gemm_*.hip) -- */
 int r4d_rad_gemm_bf16_m16   (const RadArgs*, RadStream);
@@ -580,6 +584,11 @@ int  r4d_rad_router_gemm_topk_scatter_init(const RadParam*, int, int rank, int w
 void r4d_rad_router_gemm_topk_scatter_fini(void*);
 int     r4d_rad_router_gemm_topk_scatter(const RadArgs*, RadStream);
 int64_t r4d_rad_moe_scatter_scratch(const RadArgs*);
+/* moe_scatter_placed (lever D3s, r4d_moe_place.hip): the small sort over a placement table built at
+ * init (per instance, on the card). */
+int     r4d_rad_moe_scatter_placed_init(const RadParam*, int, int rank, int world, void** out);
+void    r4d_rad_moe_scatter_placed_fini(void*);
+int     r4d_rad_moe_scatter_placed(const RadArgs*, RadStream);
 int     r4d_rad_moe_gemm_q         (const RadArgs*, RadStream);
 /* Scratch for the run map that aligns the prefill form. Zero in the decode band and for a shape
  * whose parameters do not describe one, so a caller that never asks still gets a correct uniform
@@ -1041,6 +1050,7 @@ int r4d_shape_router_topk    (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_router_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_router_gemm_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_moe_scatter    (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_moe_scatter_placed(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gemm_q_mod4(const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gather     (const RadParam*, int, int operand, RadOpdDesc*);

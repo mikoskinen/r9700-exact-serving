@@ -42,6 +42,12 @@
  *                   refused. -1 when no loaded object serves it.
  *   ds41_shexp_lane deepseek41 (lever F4): 1 the shared expert on the second lane at decode / verify steps, 0 one
  *                   lane (RADIANCE_DS41_SHEXP_LANE at start); 1 is refused where no layer's arm is lane-safe.
+ *   ds41_slotsum    deepseek41 (lever D3s): 1 the decode band's MoE runs the slot-order sum over an expert
+ *                   placement (moe_scatter_placed, moe_gather_all_reduce_slot) -- NOT today's bytes, the same bytes
+ *                   whatever the placement; 0 today's MoE (home placement, the rank-partial fold) at every step.
+ *                   1 is refused where no layer declared it (RADIANCE_DS41_SLOTSUM unset); -1 when unserved.
+ *   ds41_place      deepseek41 (lever D3s): the placement table the slot path dispatches over, 0 the contiguous
+ *                   split, 1 / 2 RADIANCE_DS41_EP_PLACE / _PLACE2's; a table no layer declared is refused.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -62,7 +68,8 @@
 namespace rad {
 namespace fn4 {
 
-enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kSwitches };
+enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41Slotsum, kDs41Place,
+              kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

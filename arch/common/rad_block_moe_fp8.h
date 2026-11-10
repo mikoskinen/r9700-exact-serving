@@ -218,6 +218,22 @@ struct MoeFP8 {
          * kernels. Its transport is the one-shot, so keep it to decode heights (the unfused
          * all-reduce goes two-shot from ts_min, 32768 elements). Byte-identical either way. */
         int64_t gather_ar_rows = 0;
+        /* Lever D3s, at four ranks with EXL3 whole experts: a second routed path for a single-pass step
+         * of at most this many rows (the decode band) -- moe_scatter_placed over one of the `place`
+         * tables, the EXL3 GEMMs over this rank's home experts and `slot_extras`, and
+         * moe_gather_all_reduce_slot, the slot-order sum whose bytes do not depend on which rank holds
+         * which expert. A wider step keeps today's path (home experts, the rank-partial fold), so prefill
+         * is today's to the byte. 0 declares nothing (MoeFP8::slot_live picks the path at run time). */
+        int64_t slot_rows = 0;
+        /* The placement tables (moe_scatter_placed's `place`: a hex mask of ranks a model expert) and
+         * their optional per-expert loads (`cost`), n_place of them; this rank's extra experts (model
+         * ids, ascending, none of them its home), the union over the tables, an even count with
+         * n_expert. The architecture validates them on every rank alike before any declare. */
+        int         n_place = 0;
+        const char* place[3] = { nullptr, nullptr, nullptr };
+        const char* place_cost[3] = { nullptr, nullptr, nullptr };
+        const int64_t* slot_extras = nullptr;
+        int64_t     n_slot_extras = 0;
         /* Add the already-rounded routed and shared BF16 outputs in FP32, then round to BF16.
          * At TP1 the ungated gather preserves both roundings; TP>1 reduces each arm separately
          * before combining, so its gather cannot fold the shared output. */
@@ -446,6 +462,28 @@ struct MoeFP8 {
      * concurrent buffers, none a quantiser of the block's input). Null: one lane, as before. */
     const std::atomic<int>* shexp_lane = nullptr;
     bool shexp_lane_ok = false;
+    /* Lever D3s (Config::slot_rows): the decode band's placed path. `n_local` experts on this rank, the
+     * home run then the extras (local index -> model id: glob()); a moe_scatter_placed per table; the
+     * EXL3 pair over all n_local (op_gu_s / op_dn_s; op_gu / op_dn keep the home run, today's ops);
+     * moe_gather_all_reduce_slot. `slot_live` (> 0 = the slot path in the band) and `place_live` (the
+     * table) are the architecture's in-process switches, read at every pass; null or 0 = today's path.
+     * `slot_last`: the last pass took it (route_report reports n_local counts then). */
+    int64_t slot_rows = 0, n_local = 0;
+    rad_op  op_place[3] = { 0, 0, 0 };
+    int     n_place = 0;
+    rad_op  op_gu_s = 0, op_dn_s = 0, op_slotar = 0;
+    const std::atomic<int>* slot_live = nullptr;
+    const std::atomic<int>* place_live = nullptr;
+    mutable bool slot_last = false;
+    std::string slot_xs;   /* the extras as moe_scatter_placed's `extras` (kept for the program's life) */
+    int64_t glob(int64_t e) const {
+        return e < c.n_expert ? c.expert_base + e : c.slot_extras[e - c.n_expert];
+    }
+    bool slot_decl() const {
+        return c.slot_rows > 0 && c.expert_exl3 && g.world == 4 && g.wire_exact && c.n_place > 0 &&
+               (c.n_expert + c.n_slot_extras) % 2 == 0;
+    }
+    bool slot_takes(int64_t T, int64_t r0, int64_t rows, bool own_ar) const;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -543,7 +581,8 @@ struct MoeFP8 {
     std::vector<rad_weight> x3_gu[4], x3_dn[3];
     rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
     int declare_exl3(RadBuilder* b, Names& nm, int l);
-    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
+    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out,
+                    bool slot = false) const;
     /* Per projection (gate_up, down), the GGUF type and its block along K of this layer's experts
      * under expert_ggml. */
     const char* ggml_ty[2] = { nullptr, nullptr };
@@ -831,6 +870,16 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                             ge < (long long)(c.probed_expert + c.probed_count);
         RAD_ARCH_TRY(moe_map_expert(b, nm, src, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge),
                                     nm.f("blk.%d.ffn_down_exps.%lld.weight", l, ge), ge, !probed));
+    }
+    /* Lever D3s: this rank's extra experts (another rank's home), mapped as its own. */
+    n_local = c.n_expert;
+    if (slot_decl()) {
+        for (int64_t x = 0; x < c.n_slot_extras; ++x) {
+            const long long ge = (long long)c.slot_extras[x];
+            RAD_ARCH_TRY(moe_map_expert(b, nm, src, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge),
+                                        nm.f("blk.%d.ffn_down_exps.%lld.weight", l, ge), ge, true));
+        }
+        n_local = c.n_expert + c.n_slot_extras;
     }
     prot.clear();
     {
@@ -1982,6 +2031,50 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             gar_rows = mf;
         }
     }
+    /* Lever D3s: the decode band's placed path (Config::slot_rows). The slot-order sum and one placed
+     * sort a table, where libr4d declares both ops; the EXL3 pair over every local expert is declared
+     * with the experts (declare_exl3). Every rank declares the same ops in the same order (the
+     * architecture validated the tables on all of them), so the sum's instance rendezvous matches. A
+     * missing piece leaves the layer on today's path at every step. */
+    slot_rows = 0;
+    n_place = 0;
+    if (slot_decl() && op_ar && !separate_fp32_combine && !op_combine && op_gu_s && op_dn_s &&
+        rad_op_declared(b, "moe_gather_all_reduce_slot") && rad_op_declared(b, "moe_scatter_placed")) {
+        const int64_t mf = std::min<int64_t>(c.slot_rows, c.rows);
+        const rad_buf grd[6] = { w.edn, w.ew, w.sorted, w.h.x, w.sout, w.sgate };
+        const rad_buf gwr[1] = { w.h.x };
+        op_slotar = RAD_OP(b, "moe_gather_all_reduce_slot",
+                           RAD_PARAMS(RAD_RANGE("M", 1, mf), RAD_INT("n", g.n_embd),
+                                      RAD_INT("top_k", c.top_k), RAD_INT("world_size", g.world),
+                                      RAD_STR("dtype", g.dtype),
+                                      RAD_STR("act", gfold && !c.shared_ungated ? "sigmoid" : "none")),
+                           RAD_NOWEIGHTS);
+        if (op_slotar) {
+            RAD_ARCH_TRY(rad_op_reads (b, op_slotar, grd, gfold ? 6 : 4));
+            RAD_ARCH_TRY(rad_op_writes(b, op_slotar, gwr, 1));
+            /* the extras as moe_scatter_placed takes them */
+            slot_xs.clear();
+            for (int64_t x = 0; x < c.n_slot_extras; ++x)
+                slot_xs += (x ? "," : "") + std::to_string((long long)c.slot_extras[x]);
+            const char* xsp = slot_xs.c_str();
+            for (int t = 0; t < c.n_place && t < 3; ++t) {
+                std::vector<RadParam> pp = {
+                    RAD_RANGE("M", 1, mf), RAD_INT("n_expert", n_local), RAD_INT("top_k", c.top_k),
+                    RAD_INT("n_expert_all", c.n_expert_all), RAD_INT("world_size", g.world),
+                    RAD_INT("n_home", c.n_expert), RAD_STR("place", c.place[t]), RAD_STR("extras", xsp) };
+                if (c.place_cost[t] && *c.place_cost[t]) pp.push_back(RAD_STR("cost", c.place_cost[t]));
+                op_place[t] = rw(b, rad_decl_op(b, "moe_scatter_placed", pp.data(), (int)pp.size(), RAD_NOWEIGHTS),
+                                 {w.ids}, {w.sorted, w.eoff, w.ecnt});
+                if (!op_place[t]) break;
+                n_place = t + 1;
+            }
+            if (n_place == c.n_place) slot_rows = mf;
+        }
+        if (!slot_rows)
+            fprintf(stderr, "radiance: layer %d: the slot-order MoE path (lever D3s) did not resolve (sum %s, "
+                            "%d of %d placed sorts); the layer keeps today's path\n", l,
+                    op_slotar ? "resolved" : "unresolved", n_place, c.n_place);
+    }
     /* The same collective for a caller that runs it beside other work (issue_ar, a pipelined
      * prefill): at `overlap` 1 it gets the rows that hold fewer CUs while waiting on the link. */
     if (g.world > 1 && !c.no_reduce && ar_overlap > 0)
@@ -2047,7 +2140,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
  * scatter's order and writes the bf16 `edn` rows the gather sums. The prefill stager keys a layer on its first
  * declared expert op: gate_up, declared first. */
 inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
-    const int64_t ne = c.n_expert;
+    /* `ne` the home run (today's tables); `nd` every expert this rank declares, the home run then the
+     * extras of lever D3s (n_local; ne without it). Each parity run is the even locals then the odd
+     * ones over all nd, so the home tables are the first ne / 2 of each class. */
+    const int64_t ne = c.n_expert, nd = n_local;
     const bool ep = c.n_expert != c.n_expert_all;
     if (c.ff_hi[0] > 0 || c.ff_hi4[0] > 0 || (!ep && g.world > 1)) {
         fprintf(stderr, "radiance: layer %d's EXL3 experts are served whole on their rank (expert parallel, or "
@@ -2059,7 +2155,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
                         "rotated/four-bit form\n", l);
         return RAD_E_UNSUPPORTED;
     }
-    if (ne < 2 || ne % 2) {
+    if (ne < 2 || ne % 2 || nd < ne || nd % 2) {
         fprintf(stderr, "radiance: layer %d holds %lld EXL3 experts on this rank; the ops take two equal "
                         "parity tables\n", l, (long long)ne);
         return RAD_E_INVAL;
@@ -2070,7 +2166,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
         return RAD_E_DTYPE;
     }
     if (g.n_embd % EXL3_HAD || c.n_ff_exp % EXL3_HAD || (2 * c.n_ff_exp) % 256) return RAD_E_SHAPE;
-    const int64_t half = ne / 2, D = g.n_embd, F = c.n_ff_exp;
+    const int64_t half = ne / 2, halfd = nd / 2, D = g.n_embd, F = c.n_ff_exp;
     static const char* const gu_role[4] = { "codes", "suh", "suh.1", "svh" };
     static const char* const dn_role[3] = { "codes", "suh", "svh" };
     for (int proj = 0; proj < 2; ++proj) {
@@ -2084,10 +2180,10 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
             const int64_t cols = per_row ? 1 : codes ? C / x3_cpe[proj] : C;
             std::vector<rad_weight>& run = proj == 0 ? x3_gu[p] : x3_dn[p];
             run.clear();
-            run.reserve((size_t)ne);
+            run.reserve((size_t)nd);
             for (int q = 0; q < 2; ++q)
-                for (int64_t e = q; e < ne; e += 2) {
-                    const long long ge = (long long)(c.expert_base + e);
+                for (int64_t e = q; e < nd; e += 2) {
+                    const long long ge = (long long)glob(e);
                     const char* weight = nm.f("blk.%d.%s.%lld.weight", l, stem, ge);
                     const rad_weight h =
                         decl_view(b, codes ? weight : nm.f("blk.%d.%s.%lld.%s", l, stem, ge, role),
@@ -2102,15 +2198,15 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     b_x3h = decl_b(b, nm.f("blk.%d.moe_exl3_h", l), RAD_F16, {c.rows * c.top_k, F});
     /* the weights in each op's table-operand order: class 0's tables, then class 1's */
     std::vector<rad_weight> tab;
-    const auto tables = [&](bool gate_up) {
+    const auto tables = [&](bool gate_up, int64_t cnt) {
         tab.clear();
         for (int q = 0; q < 2; ++q)
             for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
                 const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
-                for (int64_t i = 0; i < half; ++i) tab.push_back(run[(size_t)(q * half + i)]);
+                for (int64_t i = 0; i < cnt; ++i) tab.push_back(run[(size_t)(q * halfd + i)]);
             }
     };
-    tables(true);
+    tables(true, half);
     std::vector<RadParam> gp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * F), RAD_INT("K", D),
                                  RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                  RAD_STR("dtype", x3_dtype[0]), RAD_STR("codebook", x3_cb[0]),
@@ -2119,7 +2215,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
                {w.h.x, w.sorted, w.eoff}, {b_x3h});
-    tables(false);
+    tables(false, half);
     std::vector<RadParam> dp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", D), RAD_INT("K", F),
                                  RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                  RAD_STR("dtype", x3_dtype[1]), RAD_STR("codebook", x3_cb[1]),
@@ -2127,19 +2223,40 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
                {b_x3h, w.sorted, w.eoff}, {w.edn});
     if (!op_gu || !op_dn) return RAD_E_INVAL;
-    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank, swiglu limit %g", l,
-             x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, c.swiglu_limit);
+    /* Lever D3s: the same pair over all nd (the decode band's placed path), declared after the home
+     * pair so the prefill stager still keys the layer on the home gate_up. */
+    op_gu_s = op_gu;
+    op_dn_s = op_dn;
+    if (nd > ne) {
+        const int64_t mr = std::max<int64_t>(1, std::min<int64_t>(c.rows, c.slot_rows));
+        tables(true, halfd);
+        gp[0] = RAD_RANGE("M", 1, mr);
+        gp[3] = RAD_INT("n_expert", nd);
+        op_gu_s = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
+                     {w.h.x, w.sorted, w.eoff}, {b_x3h});
+        tables(false, halfd);
+        dp[0] = RAD_RANGE("M", 1, mr);
+        dp[3] = RAD_INT("n_expert", nd);
+        op_dn_s = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
+                     {b_x3h, w.sorted, w.eoff}, {w.edn});
+        if (!op_gu_s || !op_dn_s) return RAD_E_INVAL;
+    }
+    const std::string xn = nd > ne ? " + " + std::to_string((long long)(nd - ne)) + " extras (lever D3s)" : std::string();
+    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank%s, swiglu limit %g", l,
+             x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, xn.c_str(), c.swiglu_limit);
     return RAD_OK;
 }
 
 /* One EXL3 op over this rank's tables, each operand where exl3_positions() puts it. */
 inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in,
-                               RadOperand out) const {
+                               RadOperand out, bool slot) const {
     const Exl3Positions& at = *exl3_positions(op);
     static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
     static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
     const bool gate_up = op == EXL3_GATE_UP;
-    const int64_t ne = c.n_expert, half = ne / 2, k = c.top_k;
+    /* slot: lever D3s's pair over every local expert (n_local); otherwise the home run, whose tables are
+     * the first n_expert / 2 of each parity run. */
+    const int64_t ne = slot ? n_local : c.n_expert, half = ne / 2, halfd = n_local / 2, k = c.top_k;
     RadOperand opd[16];
     for (RadOperand& o : opd) o = RAD_NONE;
     opd[at.x] = in;
@@ -2149,7 +2266,7 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
     for (int q = 0; q < 2; ++q)
         for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
             const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
-            opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] = RAD_WTAB(run[(size_t)(q * half)], half);
+            opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] = RAD_WTAB(run[(size_t)(q * halfd)], half);
         }
     rad_issue(c_, op_h, opd, at.n_opd, rows);
 }
@@ -2177,6 +2294,15 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  *
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
+/* Lever D3s: whether this pass runs the decode band's placed path -- declared (slot_rows), switched on
+ * (slot_live), a single pass of at most slot_rows rows that owns its all-reduce and whose consumer
+ * takes neither the gather nor the reduction. Every rank asks it with the same T, so all agree. */
+inline bool MoeFP8::slot_takes(int64_t T, int64_t r0, int64_t rows, bool own_ar) const {
+    if (!op_slotar || slot_rows <= 0 || !slot_live || slot_live->load(std::memory_order_relaxed) <= 0) return false;
+    return own_ar && r0 == 0 && rows == T && T <= slot_rows && !op_combine && issues_ar(T, rows) &&
+           !gather_taken(g, T, gather_out_rows, gather_out_rows6);
+}
+
 inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
                           const Beside* beside) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
@@ -2189,6 +2315,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
     const bool gate_done = (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate);
     /* The shared arm on the second lane (shexp_lane): a decode or verify step of one pass. */
+    /* Lever D3s: the placed path (slot_takes) -- moe_scatter_placed for the sort, the EXL3 pair over
+     * every local expert, moe_gather_all_reduce_slot for the gather and the reduction. */
+    const bool slot = slot_takes(T, r0, rows, own_ar);
+    int ptab = place_live ? place_live->load(std::memory_order_relaxed) : 0;
+    if (ptab < 0 || ptab >= n_place) ptab = 0;
     const bool want_lane1 = shared && shexp_lane_ok && shexp_lane &&
                             shexp_lane->load(std::memory_order_relaxed) > 0 && r0 == 0 && rows == T &&
                             T <= kMoeShexpLaneRows;
@@ -2258,7 +2389,9 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         if (!c.sigmoid_router)
         RAD_ISSUE_N(c_, op_topk, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k));
-        if (scatter_inv)
+        if (slot) {
+            /* the placed sort below writes what the home sort would */
+        } else if (scatter_inv)
             RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
                         brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
                         brows(w.inv, rows * k));
@@ -2266,6 +2399,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
                         brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
     }
+    /* Lever D3s: this rank's slots under the live table (after a fused selection, whose home sort it
+     * overwrites), offsets and counts over its n_local experts. */
+    if (slot)
+        RAD_ISSUE_N(c_, op_place[ptab], rows, brow_slice(w.ids, r0, rows, k), brows(w.sorted, rows * k),
+                    brows(w.eoff, n_local + 1), brows(w.ecnt, n_local));
 
     /* The file stager reads this layer at the first expert-weight issue, below. It uses the
      * pointer the last route_report named. That report used to run after every pass, so the
@@ -2273,7 +2411,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * router and scatter are issued and before those weights are issued. The stager's copy is
      * ordered behind the router on this stream, so it reads this pass. The report at the end of
      * the step still samples the last pass for the heat engine. */
-    if (r0 == 0) route_report(c_);
+    if (r0 == 0) {
+        slot_last = slot;
+        route_report(c_);
+    }
 
     /* The rotated quantisation of the input, when the experts are rotated and the caller did not
      * write it. Unrotated, the GEMM reads `h`'s pair. */
@@ -2295,8 +2436,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brow_slice(iqr_a.q8, r0, rows, g.n_embd),
                     brow_slice(iqr_a.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK));
     if (c.expert_exl3)
-        issue_exl3(c_, op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
-                   brows(b_x3h, rows * k));
+        issue_exl3(c_, slot ? op_gu_s : op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                   brows(b_x3h, rows * k), slot);
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(iqr_a.q8, r0, rows, g.n_embd),
                     brow_slice(iqr_a.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK),
@@ -2333,7 +2474,8 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !lane1) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (c.expert_exl3)
-        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
+        issue_exl3(c_, slot ? op_dn_s : op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k),
+                   slot);
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_dn, rows, brows(iqr_d.q8, rows * k), brows(iqr_d.s8, rows * k),
                     RAD_WTAB(w_dn[0], ne), RAD_WTAB(w_dns[0], ne),
@@ -2434,9 +2576,15 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         const int lv = gar_live->load(std::memory_order_relaxed);
         if (lv >= 0 && lv < gar_lim) gar_lim = lv;
     }
-    const bool gar = op_gar && own_ar && r0 == 0 && rows == T && T <= gar_lim && !op_combine &&
+    const bool gar = !slot && op_gar && own_ar && r0 == 0 && rows == T && T <= gar_lim && !op_combine &&
                      issues_ar(T, rows) && !gather_taken(g, T, gather_out_rows, gather_out_rows6);
-    if (gar)
+    if (slot)
+        RAD_ISSUE_N(c_, op_slotar, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k),
+                    gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
+                    gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    brow_slice(w.h.x, r0, rows, g.n_embd));
+    else if (gar)
         RAD_ISSUE_N(c_, op_gar, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
                     brows(w.sorted, rows * k),
                     gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
@@ -2461,7 +2609,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
 
     /* A write that takes the all-reduce does it once for the whole step, deciding on T, so this
      * pass must ask with T, not its own rows. */
-    if (own_ar && issues_ar(T, rows) && !gar) issue_ar(c_, r0, rows, false);
+    if (own_ar && issues_ar(T, rows) && !gar && !slot) issue_ar(c_, r0, rows, false);
     if (op_add)
         RAD_ISSUE_N(c_, op_add, rows, brow_slice(w.x, r0, rows, g.n_embd),
                     brow_slice(w.h.x, r0, rows, g.n_embd),
@@ -2556,7 +2704,10 @@ inline void MoeFP8::route_report(RadCtx* c_) const {
     r.sorted_tok    = (const int32_t*)rad_buf_ptr(c_, w.sorted);
     r.expert_offset = (const int32_t*)rad_buf_ptr(c_, w.eoff);
     r.top_k         = c.top_k;
-    r.n_expert      = c.n_expert;
+    /* Lever D3s: a placed pass's counts are over every local expert (the extras' units after the home
+     * run). A home pass reports the home run, as before; the core's row then keeps the extras' counts
+     * from the layer's last placed report until the next one (a prefill step re-credits them once). */
+    r.n_expert      = slot_last ? n_local : c.n_expert;
     rad_route_report(c_, layer, &r);
 }
 

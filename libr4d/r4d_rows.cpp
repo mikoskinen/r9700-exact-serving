@@ -1080,6 +1080,11 @@ static const RadOperandSpec oRouterGemmTopkScatter[] = {
     { "expert_count",  RAD_OPD_OUT,    0 },
     { "gate",          RAD_OPD_OUT,    1 },
 };
+/* moe_scatter_placed: the sort's shape, the model's expert count and the placement (r4d_moe_place.hip). */
+static const RadParamSpec pMoeScatterPlaced[] = {
+    P_INT("M"), P_INT("n_expert"), P_INT("top_k"), P_INT("n_expert_all"), P_INT("world_size"),
+    P_INT("n_home"), P_STR("place"), P_STRO("extras"), P_STRO("cost"),
+};
 static const RadOperandSpec oMoeScatter[] = {
     { "expert_ids",    RAD_OPD_IN,  0 },
     { "sorted_tok",    RAD_OPD_OUT, 0 },
@@ -3735,6 +3740,15 @@ static const RadOpSchema kSchemas[] = {
            "does not depend on the scheduler. `protect` lists local experts sorted LAST, in that "
            "order, the rest closed up: `expert_offset` and `expert_count` are then in sort order, "
            "and a layer's protected experts are one trailing run a second grouped GEMM serves."),
+    SCHEMA("moe_scatter_placed", pMoeScatterPlaced, oMoeScatter,
+           "`moe_scatter`'s stable sort of this rank's slots over an expert PLACEMENT instead of the "
+           "contiguous split: `place` gives every model expert's copies (one hex digit, bit r = rank r), "
+           "rank r holds its home run of `n_home` experts (r * n_home ..) at local 0.. and `extras` "
+           "(ascending model ids) after them. A slot whose expert has one copy goes to that rank; the "
+           "active experts with several copies go, in ascending id, each to the copy whose rank is least "
+           "loaded by `cost` (default 16 an expert) so far, every slot of the expert with it -- the same "
+           "choice on every rank, so every slot lands on exactly one. Offsets and counts over the "
+           "n_expert locals; ids index the n_expert_all model experts. Decode band: M * top_k <= 1024."),
     SCHEMA("moe_scatter_inv", pMoeScatter, oMoeScatterInv,
            "`moe_scatter`, also writing `inverse`: for every slot token*top_k + slot its row in "
            "`sorted_tok`, -1 for a dropped slot. That is the table `moe_gather` builds from "
@@ -4018,6 +4032,14 @@ static const RadOpSchema kSchemas[] = {
            "rows summed back to token order (with the shared arm folded when present) ARE the "
            "all-reduce's message, reduced in place in `y`. ar_gather_hc_write without the write; "
            "byte-identical to moe_gather and the exact all_reduce it replaces."),
+    SCHEMA("moe_gather_all_reduce_slot", pMoeGatherAr, oMoeGatherAr,
+           "the routed experts' rows and the shared arm summed back to token order AND across the "
+           "ranks as one SLOT-ORDER sum: for every element the ranks' shared-arm products (each "
+           "bf16(shared * gate), as moe_gather narrows it) in ascending rank order, then every slot's "
+           "row times its weight in ascending slot order, in fp32, rounded once -- the same bytes "
+           "whichever rank holds which expert, so experts may be moved or replicated (moe_scatter_placed) "
+           "without changing the output. NOT moe_gather + all_reduce: there is no per-rank partial and "
+           "no rank-order fold. Every slot must be held by exactly one rank."),
     SCHEMA("pair_argmax", pPairArgmax, oPairArgmax,
            "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in "
            "the first f32 slot and its value in the second (row_topk's `pairs`, all-gathered): ties "
@@ -5208,6 +5230,11 @@ static const RadConstraint cRouterGemmTopkScatter[] = {
 };
 static const RadConstraint cMoeScatter[] = {
     C_GE("M", 1), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("top_k", 1),
+};
+static const RadConstraint cMoeScatterPlaced[] = {
+    C_GE("M", 1), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("n_expert_all", 1),
+    C_LE("n_expert_all", 512), C_GE("top_k", 1), C_GE("world_size", 1), C_LE("world_size", 4),
+    C_GE("n_home", 0),
 };
 static const RadConstraint cMoeGemmQ[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
@@ -9305,6 +9332,18 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_moe_scatter_inv, r4d_rad_moe_scatter_scratch, nullptr, nullptr,
   r4d_shape_moe_scatter_inv },
 
+{ "moe_scatter_placed_i32", "moe_scatter_placed", "moe",
+  "moe_scatter's small sort over an expert placement table (any expert on any rank, replicated "
+  "experts served by the least-loaded copy, the same choice on every rank)",
+  "n_expert and n_expert_all <= 512; world <= 4; one launch, M*top_k <= 1024; the table lives in the "
+  "instance (built at init from place / n_home / extras / cost)",
+  "i32 throughout; integer loads, so the dispatch is order-free",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeScatterPlaced), NOTUNE,
+  r4d_rad_moe_scatter_placed_init, r4d_rad_moe_scatter_placed_fini, r4d_rad_moe_scatter_placed,
+  nullptr, nullptr, nullptr,
+  r4d_shape_moe_scatter_placed },
+
 { "moe_gemm_mxfp4a8", "moe_gemm_q", "moe",
   "canonical MXFP4 experts decoded in packed words into exact FP8 WMMA tiles, scales folded per 32 values",
   "K multiple 128, parity tables, token and sorted order, parts and narrower odd experts",
@@ -10161,6 +10200,26 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_moe_gather_ar_4rank,
   r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
   r4d_shape_moe_gather_ar, nullptr, r4d_fuse_moe_gather_ar },
+
+{ "moe_gather_all_reduce_slot_4rank", "moe_gather_all_reduce_slot", "norm",
+  "the MoE gather and the four-rank exact all-reduce as one slot-order sum (r4d_ar_slotsum.hip): every "
+  "rank writes its slots' rows and its shared product into planes of the reducing rank's scratch, so a "
+  "slot's word lands at one place whichever rank holds the expert -- below the tuned ts_min the one-shot "
+  "(every rank sums every word after one handshake), from it the two-shot (each shard's owner sums, then "
+  "every rank assembles)",
+  "exactly 4 ranks, all peer-accessible; exact wire; n a multiple of 8, y unpitched and y_expert's and "
+  "the shared arm's pitch a multiple of 8; top_k <= 64, M <= 256, M * top_k <= 2048 (the slot table in "
+  "LDS); its own instance sized for top_k + 4 messages a parity; every slot held by exactly one rank; "
+  "cudagraph-safe",
+  "bf16 in and out; the shared products narrowed as moe_gather narrows them, then fp32 over the ranks' "
+  "products in ascending rank order and the slots in ascending slot order (fmaf with f32 weights, "
+  "multiply then add with bf16 ones), rounded once to nearest-even -- independent of placement, and "
+  "different from moe_gather + all_reduce at rounding level",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGatherAr4), ROW(tAr), nullptr,
+  r4d_rad_ar_slot_init, r4d_rad_ar_fini, r4d_rad_moe_gather_ar_slot_4rank,
+  nullptr, nullptr, nullptr,
+  r4d_shape_moe_gather_ar, nullptr, nullptr },
 
 { "qk_norm_rope_gate", "qk_norm_rope_gate", "attn",
   "the gated-attention QKV preamble in one pass: split [q|gate] per head, QK RMS norm over the "
@@ -11450,7 +11509,8 @@ extern "C" int rad_kernel_collective(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k || !k->init) return 0;
     const bool coll = host_init_for(k->init) != nullptr || k->init == r4d_rad_ar_host_init ||
-                      k->init == r4d_rad_ar_ln_host_init || k->init == r4d_rad_ar_hc_wide_host_init;
+                      k->init == r4d_rad_ar_ln_host_init || k->init == r4d_rad_ar_hc_wide_host_init ||
+                      k->init == r4d_rad_ar_slot_init;
     if (!coll) return 0;
     /* The rows that end the engine's link hold themselves, through `link_gate`, as soon as the
      * peers' pushes have landed over P2P (RAD_LINK_ENDED); through the host mailbox they leave it
@@ -11469,6 +11529,7 @@ extern "C" int rad_kernel_collective(int i) {
         r4d_rad_ar_twoshot_4rank_ti8, r4d_rad_ar_gather_4rank,
         r4d_rad_ar_hc_write_4rank, r4d_rad_ar_gather_hc_write_4rank, r4d_rad_ar_mhc_pcn_4rank,
         r4d_rad_ar_rmsnorm_quant_i8_4rank, r4d_rad_moe_gather_ar_4rank,
+        r4d_rad_moe_gather_ar_slot_4rank,
     };
     for (RadLaunchFn f : kReleasing)
         if (k->launch == f) return 2;

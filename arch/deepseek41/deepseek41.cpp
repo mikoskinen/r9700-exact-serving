@@ -36,6 +36,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -890,6 +891,184 @@ static int shexp_lane_env() {
     return e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : 0;
 }
 
+/* ---- Lever D3s: the decode band's MoE as a SLOT-ORDER sum over an expert placement.
+ *
+ * RADIANCE_DS41_SLOTSUM=<rows> (1..256, or on = 48; read at declare; four ranks, EXL3 experts): every routed layer
+ * (the trunk's and the drafter's, when its experts split evenly) declares beside today's path a second one for a
+ * single-pass step of at most <rows> rows -- moe_scatter_placed over a placement table, the EXL3 pair over the rank's
+ * home experts and its extras, and moe_gather_all_reduce_slot: for every element the ranks' shared-arm products in
+ * ascending rank order, then every slot's routed row times its weight in ascending slot order, rounded once. That sum
+ * does not depend on which rank holds which expert, so experts may be moved or replicated (a replicated expert's
+ * slots go to its least-loaded copy, the same choice on every rank) without moving a byte. It is NOT today's
+ * arithmetic (no rank partial, no rank-order fold): approved to change the output once, at rounding level. A wider
+ * step (every prefill chunk) keeps today's path, home placement and today's sum, so prefill is today's to the byte
+ * and the output depends on the placement nowhere. Unset: nothing new is declared, today's arithmetic byte for byte.
+ *
+ * The tables: 0 the contiguous split (always); 1 RADIANCE_DS41_EP_PLACE=FILE; 2 RADIANCE_DS41_EP_PLACE2=FILE. A file
+ * holds lines "L <layer> <mask>" (one hex digit a model expert: the ranks holding a copy, bit r = rank r) and
+ * optionally "C <layer> <c0,c1,...>" (each expert's load units for the dispatch, default 16); '#' starts a comment; a
+ * layer the file does not name keeps the contiguous split. Each rank declares, after its home run, every expert any
+ * table places on it (the extras: VRAM-honest, they are movement units the planner and heat engine place like any
+ * other), padded to an even count. Every rank reads the same files and checks them alike before any declare.
+ * In-process switches: ds41_slotsum (1 the placed path in the band, 0 today's at every step; the start value
+ * RADIANCE_DS41_SLOTSUM_ON, default 1) and ds41_place (the table; start RADIANCE_DS41_EP_PLACE_TAB, default 1 with a
+ * file, else 0). */
+static int64_t slotsum_rows() {
+    const char* e = std::getenv("RADIANCE_DS41_SLOTSUM");
+    if (!e || !*e || !std::strcmp(e, "off") || !std::strcmp(e, "0")) return 0;
+    if (!std::strcmp(e, "on")) return 48;
+    const long n = std::strtol(e, nullptr, 10);
+    return n > 0 ? std::min<long>(n, 256) : 0;
+}
+struct SlotPlace {
+    bool read = false;
+    int  n_tab = 1;
+    std::string file[3];
+    std::string err;
+    /* per table, per absolute layer: the file's mask and cost lines */
+    std::map<int, std::string> mask[3], cost[3];
+    /* per absolute layer: the tables' masks as declared (the file's or the contiguous one) and this rank's extras */
+    std::map<int, std::string> decl_mask[3];
+    std::map<std::pair<int, int>, std::vector<int64_t>> extras;   /* (rank, layer) */
+    /* Every rank declares on its own thread: everything here is under `mu`, and a string or list handed to a
+     * config is inserted once and never reassigned (map nodes do not move). */
+    std::mutex mu;
+    /* rank 0's note: per table, experts placed off home / replicated, over the layers; the extras a rank */
+    int64_t moved[3] = { 0, 0, 0 }, repl[3] = { 0, 0, 0 }, layers[3] = { 0, 0, 0 };
+    int64_t extras_rank[4] = { 0, 0, 0, 0 };   /* the extras each rank declares, over the layers */
+    int     n_layers = 0;
+};
+static SlotPlace& slot_place() {
+    static SlotPlace* s = new SlotPlace();
+    return *s;
+}
+static int slot_read_files() {
+    SlotPlace& sp = slot_place();
+    if (sp.read) return sp.err.empty() ? RAD_OK : RAD_E_INVAL;
+    sp.read = true;
+    const char* env[3] = { nullptr, "RADIANCE_DS41_EP_PLACE", "RADIANCE_DS41_EP_PLACE2" };
+    for (int t = 1; t < 3; ++t) {
+        const char* f = std::getenv(env[t]);
+        if (!f || !*f) {
+            if (t == 2) break;
+            continue;
+        }
+        if (t == 2 && sp.n_tab < 2) {
+            sp.err = "RADIANCE_DS41_EP_PLACE2 without RADIANCE_DS41_EP_PLACE";
+            return RAD_E_INVAL;
+        }
+        FILE* fp = std::fopen(f, "r");
+        if (!fp) {
+            sp.err = std::string(env[t]) + "=" + f + " cannot be read";
+            return RAD_E_INVAL;
+        }
+        sp.file[t] = f;
+        char line[8192];
+        int ln = 0;
+        while (std::fgets(line, sizeof line, fp)) {
+            ++ln;
+            std::string s(line);
+            const size_t h = s.find('#');
+            if (h != std::string::npos) s.resize(h);
+            char kind[8] = { 0 };
+            int layer = -1;
+            char val[8000] = { 0 };
+            const int n = std::sscanf(s.c_str(), " %7s %d %7999s", kind, &layer, val);
+            if (n <= 0) continue;
+            if (n != 3 || layer < 0 || (std::strcmp(kind, "L") && std::strcmp(kind, "C"))) {
+                sp.err = std::string(f) + ":" + std::to_string(ln) + ": expected 'L <layer> <mask>' or 'C <layer> <costs>'";
+                std::fclose(fp);
+                return RAD_E_INVAL;
+            }
+            (kind[0] == 'L' ? sp.mask[t] : sp.cost[t])[layer] = val;
+        }
+        std::fclose(fp);
+        sp.n_tab = t + 1;
+    }
+    return RAD_OK;
+}
+/* The slot path's part of a routed layer's config at absolute layer `l` with `E` experts split evenly over `world`
+ * ranks (n_home each): every table's mask, costs and this rank's extras. Every rank runs it alike: a fault in any
+ * rank's share (a mask that does not parse, extras past the counts the sort takes) fails every rank's declare. */
+static int slot_cfg(int l, int64_t E, int world, int rank, MoeFP8::Config* cfg) {
+    const int64_t rows = slotsum_rows();
+    if (rows <= 0 || world != 4) return RAD_OK;
+    SlotPlace& sp = slot_place();
+    std::lock_guard<std::mutex> lk(sp.mu);
+    if (slot_read_files() != RAD_OK) {
+        fprintf(stderr, "radiance: deepseek41: %s\n", sp.err.c_str());
+        return RAD_E_INVAL;
+    }
+    if (E % world || (E / world) % 2 || E > 512) return RAD_OK;   /* the home rule is the contiguous split */
+    const int64_t nh = E / world;
+    std::string cont((size_t)E, '0');
+    for (int64_t e = 0; e < E; ++e) cont[(size_t)e] = "0123456789abcdef"[1 << (e / nh)];
+    std::vector<std::vector<int64_t>> xs((size_t)world);
+    for (int t = 0; t < sp.n_tab; ++t) {
+        std::string m = cont;
+        auto it = sp.mask[t].find(l);
+        if (t > 0 && it != sp.mask[t].end()) {
+            m = it->second;
+            if ((int64_t)m.size() != E) {
+                fprintf(stderr, "radiance: deepseek41: %s layer %d: a mask of %zu experts, the layer has %lld\n",
+                        sp.file[t].c_str(), l, m.size(), (long long)E);
+                return RAD_E_INVAL;
+            }
+            for (char& ch : m) {
+                const int v = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                            : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+                if (v <= 0 || v >= (1 << world)) {
+                    fprintf(stderr, "radiance: deepseek41: %s layer %d: '%c' is no non-empty set of %d ranks\n",
+                            sp.file[t].c_str(), l, ch, world);
+                    return RAD_E_INVAL;
+                }
+                ch = "0123456789abcdef"[v];
+            }
+            if (rank == 0) sp.layers[t] += 1;
+        }
+        sp.decl_mask[t].emplace(l, m);
+        for (int64_t e = 0; e < E; ++e) {
+            const int v = m[(size_t)e] >= 'a' ? m[(size_t)e] - 'a' + 10 : m[(size_t)e] - '0';
+            if (t > 0 && rank == 0) {
+                if (__builtin_popcount((unsigned)v) > 1) ++sp.repl[t];
+                else if (v != (1 << (e / nh))) ++sp.moved[t];
+            }
+            for (int r = 0; r < world; ++r)
+                if (((v >> r) & 1) && e / nh != r) xs[(size_t)r].push_back(e);
+        }
+        auto ci = sp.cost[t].find(l);
+        cfg->place_cost[t] = t > 0 && ci != sp.cost[t].end() ? ci->second.c_str() : nullptr;
+    }
+    for (int r = 0; r < world; ++r) {
+        auto& v = xs[(size_t)r];
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        if ((nh + (int64_t)v.size()) % 2) {   /* the parity tables take an even count: one more, never dispatched to */
+            for (int64_t e = 0; e < E; ++e)
+                if (e / nh != r && !std::binary_search(v.begin(), v.end(), e)) {
+                    v.insert(std::lower_bound(v.begin(), v.end(), e), e);
+                    break;
+                }
+        }
+        if (nh + (int64_t)v.size() > E) {
+            fprintf(stderr, "radiance: deepseek41: layer %d: rank %d would hold %lld experts, more than the layer's %lld\n",
+                    l, r, (long long)(nh + (int64_t)v.size()), (long long)E);
+            return RAD_E_INVAL;
+        }
+    }
+    const auto& mine = sp.extras.emplace(std::make_pair(rank, l), xs[(size_t)rank]).first->second;
+    if (rank == 0) {
+        sp.n_layers += 1;
+        for (int r = 0; r < world && r < 4; ++r) sp.extras_rank[r] += (int64_t)xs[(size_t)r].size();
+    }
+    cfg->slot_rows = rows;
+    cfg->n_place = sp.n_tab;
+    for (int t = 0; t < sp.n_tab; ++t) cfg->place[t] = sp.decl_mask[t].at(l).c_str();
+    cfg->slot_extras = mine.empty() ? nullptr : mine.data();
+    cfg->n_slot_extras = (int64_t)mine.size();
+    return RAD_OK;
+}
+
 /* The in-process switches this plugin serves (core/runtime/fn4_switch.h; the core finds the hooks
  * below through the plugin's handle): "ds41_argather" -- the fused gather's live row bound, 0..the
  * declared bound (gather_ar_rows), the issue taking moe_gather_all_reduce at T <= it and moe_gather
@@ -902,6 +1081,24 @@ static std::atomic<int> g_sw_gar_decl{0};      /* the largest bound a layer decl
 static std::atomic<int> g_sw_shexp{0};
 static std::atomic<int> g_sw_shexp_ok{0};      /* a trunk layer's shared arm is lane-safe */
 static std::atomic<int> g_sw_shexp_env{-1};    /* RADIANCE_DS41_SHEXP_LANE, read once */
+static std::atomic<int> g_sw_slot{0};          /* lever D3s: 1 the placed path in the decode band */
+static std::atomic<int> g_sw_slot_decl{0};     /* the layers that declared it */
+static std::atomic<int> g_sw_place{0};         /* the placement table */
+static std::atomic<int> g_sw_place_n{0};       /* the tables every declaring layer holds */
+static std::atomic<int> g_sw_slot_init{0};     /* the start values were taken */
+static void slot_note_decl(const MoeFP8& moe) {
+    if (moe.slot_rows <= 0) return;
+    g_sw_slot_decl.fetch_add(1, std::memory_order_relaxed);
+    int cur = g_sw_place_n.load(std::memory_order_relaxed);
+    while ((cur == 0 || moe.n_place < cur) && !g_sw_place_n.compare_exchange_weak(cur, moe.n_place)) {}
+    if (!g_sw_slot_init.exchange(1)) {
+        const char* on = std::getenv("RADIANCE_DS41_SLOTSUM_ON");
+        g_sw_slot.store(on && !std::strcmp(on, "0") ? 0 : 1, std::memory_order_relaxed);
+        const char* tb = std::getenv("RADIANCE_DS41_EP_PLACE_TAB");
+        const int t0 = tb && *tb ? (int)std::strtol(tb, nullptr, 10) : (slot_place().n_tab > 1 ? 1 : 0);
+        g_sw_place.store(t0 >= 0 && t0 < moe.n_place ? t0 : 0, std::memory_order_relaxed);
+    }
+}
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -913,12 +1110,18 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
     if (!std::strcmp(name, "ds41_shexp_lane"))
         return value == 0 || (value == 1 && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_slotsum"))
+        return value == 0 || (value == 1 && g_sw_slot_decl.load(std::memory_order_relaxed) > 0) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_place"))
+        return value == 0 || (value > 0 && value < g_sw_place_n.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
     if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_slotsum")) g_sw_slot.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_place")) g_sw_place.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -931,6 +1134,14 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_shexp_lane")) {
         *applied = g_sw_shexp.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_slotsum")) {
+        *applied = g_sw_slot_decl.load(std::memory_order_relaxed) > 0 ? g_sw_slot.load(std::memory_order_relaxed) : 0;
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_place")) {
+        *applied = g_sw_place.load(std::memory_order_relaxed);
         return 1;
     }
     return 0;
@@ -1716,11 +1927,15 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.shared_ungated = 1;
     s.cfg.gather_ar_rows = gather_ar_rows();
     s.cfg.calib = (m.calib_hi > m.calib_lo && l >= m.calib_lo && l < m.calib_hi) ? 1 : 0;
+    DS_TRY(slot_cfg(l, c.n_expert, g.world, g.rank, &s.cfg));
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
-    /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane */
+    /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane, lever D3s */
     L.moe.gar_live = &g_sw_gar;
     L.moe.shexp_lane = &g_sw_shexp;
+    L.moe.slot_live = &g_sw_slot;
+    L.moe.place_live = &g_sw_place;
+    slot_note_decl(L.moe);
     sw_note_decl(L.moe.gar_rows);
     if (L.moe.shexp_lane_ok) g_sw_shexp_ok.store(1, std::memory_order_relaxed);
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
@@ -1944,9 +2159,13 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.swiglu_limit = c.swiglu_limit;
     s.cfg.shared_ungated = 1;
     s.cfg.gather_ar_rows = gather_ar_rows();
+    if (d.ne_rank * g.world == d.n_expert) DS_TRY(slot_cfg(l, d.n_expert, g.world, g.rank, &s.cfg));
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
+    L.moe.slot_live = &g_sw_slot;
+    L.moe.place_live = &g_sw_place;
+    slot_note_decl(L.moe);
     sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
@@ -2468,6 +2687,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 (long long)kMoeShexpLaneRows,
                 (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.moe.shexp_lane_ok; }),
                 m.layers.size());
+    if (ctx->rank == 0 && !ctx->shape_probe && slotsum_rows() > 0) {
+        SlotPlace& sp = slot_place();
+        std::lock_guard<std::mutex> lk(sp.mu);
+        const int nt = (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.moe.slot_rows > 0; });
+        const int nd = (int)std::count_if(m.dsp.st.begin(), m.dsp.st.end(), [](const Layer& L) { return L.moe.slot_rows > 0; });
+        std::string tabs = "0 contiguous";
+        for (int t = 1; t < sp.n_tab; ++t)
+            tabs += ", " + std::to_string(t) + " " + sp.file[t] + " (" + std::to_string(sp.layers[t]) + " layers placed, " +
+                    std::to_string(sp.moved[t]) + " experts off home, " + std::to_string(sp.repl[t]) + " replicated)";
+        int64_t xmin = -1, xmax = 0;
+        for (int r = 0; r < g.world && r < 4; ++r) {
+            xmin = xmin < 0 || sp.extras_rank[r] < xmin ? sp.extras_rank[r] : xmin;
+            xmax = std::max(xmax, sp.extras_rank[r]);
+        }
+        fprintf(stderr, "radiance: deepseek41: the slot-order MoE sum (lever D3s) in the decode band, steps of up to %lld "
+                        "rows: %d of %zu trunk layers and %d of %zu drafter layers declare it (moe_scatter_placed, the EXL3 "
+                        "pair over home + extra experts, moe_gather_all_reduce_slot; a wider step runs today's path); "
+                        "tables: %s; extra experts a rank %lld..%lld over the layers; switches ds41_slotsum %d, ds41_place "
+                        "%d (RADIANCE_DS41_SLOTSUM, _EP_PLACE, _EP_PLACE2, _SLOTSUM_ON, _EP_PLACE_TAB)\n",
+                (long long)slotsum_rows(), nt, m.layers.size(), nd, m.dsp.st.size(), tabs.c_str(), (long long)xmin,
+                (long long)xmax, g_sw_slot.load(std::memory_order_relaxed), g_sw_place.load(std::memory_order_relaxed));
+    }
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "

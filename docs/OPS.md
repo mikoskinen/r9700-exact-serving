@@ -2185,6 +2185,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `router_scored_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `score`:str `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
+| `moe_scatter_placed` | `M`(range) `n_expert` `top_k` `n_expert_all` `world_size` `n_home` `place`:str `extras`:str/opt `cost`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
@@ -2652,6 +2653,7 @@ device code.
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `moe_gather_all_reduce` | `M`(range) `n` `top_k` `world_size` `dtype` `act`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout |
+| `moe_gather_all_reduce_slot` | `M`(range) `n` `top_k` `world_size` `dtype` `act`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
 
@@ -2698,6 +2700,21 @@ MoE block whose reduced output feeds neither a norm junction nor a gated residua
 V4.1's hyper-connection post): `ar_gather_hc_write` without the write, four ranks, exact wire. Its
 transport is the one-shot, so a caller keeps it to decode-sized `M`; byte-identical to the two
 kernels it replaces at any `M`.
+
+`moe_gather_all_reduce_slot` (device-only, four ranks, exact) has `moe_gather_all_reduce`'s operands but NOT its
+arithmetic: a token's output is one SLOT-ORDER sum, for every element the ranks' shared-arm products (each
+`bf16(shared * gate)`, as `moe_gather` narrows it) in ascending rank order, then every slot's `y_expert` row times its
+weight in ascending slot order (fmaf with f32 weights), in fp32, rounded once. There is no per-rank partial and no
+rank-order fold, so the bytes do not depend on which rank holds which expert: experts may be placed anywhere or replicated
+(`moe_scatter_placed`) without moving a byte. Every slot must be held by exactly one rank. It differs from `moe_gather`
++ `all_reduce` at rounding level.
+
+`moe_scatter_placed` is `moe_scatter`'s sort over a placement table instead of the contiguous split: `place` is one hex
+digit a model expert (the ranks holding a copy), rank r holds its home run of `n_home` experts at local 0.. and `extras`
+(ascending model ids) after it; an expert with several copies goes, each launch, to the copy whose rank is least loaded by
+`cost` (the single-copy experts load first, then the replicated ones in ascending id), every slot of it with it -- the
+same choice on every rank, so every slot lands on exactly one. Offsets and counts are over the `n_expert` locals. One
+workgroup: `M * top_k` <= 1024.
 
 `ar_rmsnorm_quant_i8` is the exact `all_reduce` of `x` followed by `rmsnorm_quant_i8`'s junction
 over the reduced sum, at two ranks and at four. At four it is the exact one-shot's transport with

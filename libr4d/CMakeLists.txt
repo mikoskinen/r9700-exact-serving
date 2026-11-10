@@ -135,6 +135,7 @@ set(R4D_UNITS
   "r4d_ar_oneshot_2rank_wht6|"
   "r4d_ar_oneshot_Nrank_exact|"
   "r4d_ar_twoshot_Nrank_exact|"
+  "r4d_ar_slotsum|"
   "r4d_ar_twoshot_Nrank_ti8|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
@@ -213,6 +214,7 @@ set(R4D_UNITS
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
+  "r4d_moe_place|"
   "r4d_moe_iqr|"
   "r4d_iqr_relayout|"
   # DeepSeek-V4.1-Flash: the elementwise and small ops, the sparse attention and its indexer, and

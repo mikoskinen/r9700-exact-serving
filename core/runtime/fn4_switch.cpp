@@ -18,9 +18,11 @@ namespace fn4 {
 namespace {
 
 const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", "ds41_argather",
-                                        "ds41_shexp_lane" };
+                                        "ds41_shexp_lane", "ds41_slotsum", "ds41_place" };
 /* Switches a plugin serves (the rest are the core's own). */
-bool plugin_switch(int i) { return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane; }
+bool plugin_switch(int i) {
+    return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41Slotsum || i == kDs41Place;
+}
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
 struct Hooks {
@@ -172,7 +174,7 @@ bool check(const std::string& name, int v, std::string* err) {
     const int i = switch_index(name);
     if (i < 0) {
         if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, ds41_argather, "
-                        "ds41_shexp_lane, epoch_bump)";
+                        "ds41_shexp_lane, ds41_slotsum, ds41_place, epoch_bump)";
         return false;
     }
     State& s = st();

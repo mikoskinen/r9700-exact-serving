@@ -1649,6 +1649,23 @@ extern "C" int r4d_shape_moe_scatter(const RadParam* p, int n_p, int operand, Ra
     R4D_PICK(l);
 }
 
+/* moe_scatter's operands over a placement: the ids range over the model's experts, the offsets and
+ * counts over this rank's n_expert locals. */
+extern "C" int r4d_shape_moe_scatter_placed(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t ne = pi(p, n_p, "n_expert");
+    const int64_t na = pi(p, n_p, "n_expert_all");
+    const int64_t k  = pi(p, n_p, "top_k");
+    if (ne <= 0 || ne > 512 || na <= 0 || na > 512 || k <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_idx(M, k, na, -1),
+        opd((uint32_t)RAD_I32, M * k),
+        opd((uint32_t)RAD_I32, ne + 1),
+        opd((uint32_t)RAD_I32, ne),
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_moe_scatter_inv(const RadParam* p, int n_p, int operand,
                                          RadOpdDesc* out) {
     const int64_t M  = pi(p, n_p, "M");
