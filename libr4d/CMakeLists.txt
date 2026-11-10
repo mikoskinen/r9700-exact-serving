@@ -220,6 +220,11 @@ set(R4D_UNITS
   "r4d_ds41_elem|"
   "r4d_ds41_sparse|"
   "r4d_ds41_ggml|"
+  # Lever D2: gemm_nt_ggml / logits_gemm_ggml's decode band in the multi-row form (every weight block dequantised
+  # once for all the call's rows, the stock kernel's bits), off unless switched on; the wave64 unit is the same
+  # source compiled -mwavefrontsize64, reached only through its bench pin.
+  "r4d_ds41_ggml_mr|"
+  "r4d_ds41_ggml_mr64|-mwavefrontsize64"
   # GGUF MXFP4 blocks (type=mxfp4) for gemm_nt_ggml and moe_gemm_ggml: the DSpark drafter's experts.
   "r4d_ds41_mxfp4|"
 )
