@@ -4343,52 +4343,60 @@ static void dspark_walk_case(const Plugin& pl) {
             st_memcpy(d_lg[(size_t)k], sh.data(), sh.size() * 4, hipMemcpyHostToDevice);
             st_memset(d_t[(size_t)k], 0xff, (size_t)(S * steps) * 4);
         }
-        std::vector<uint64_t> kk((size_t)(S * SL / 2)), gg((size_t)(S * W * SL / 2), 0);
-        int rcbad = 0;
-        for (int64_t step = 0; step <= steps; ++step) {
-            for (int k = 0; k < W; ++k) {
-                if (step < steps) st_memset(d_k[(size_t)k], 0, (size_t)(S * SL) * 4);
-                std::vector<RadTensor> ts = {
-                    T(d_lg[(size_t)k], RAD_F32, { S * steps, std::max<int64_t>(1, ext[(size_t)k]) }),
-                    T(d_anc, RAD_I32, { (int64_t)anc.size() }),
-                    T(step > 0 ? d_g : nullptr, RAD_F32, { S, SL * W }),
-                    T(d_w1, RAD_BF16, { V, R }), T(d_w2, RAD_BF16, { V, R }),
-                    T(step < steps ? d_k[(size_t)k] : nullptr, RAD_F32, { S, SL }),
-                    T(d_t[(size_t)k], RAD_I32, { S, steps }),
-                };
-                if (step == 0) absent(ts[2]);
-                if (step == steps) absent(ts[5]);
-                std::vector<RadParam> ps = { PI("M", S), PI("step", step), PI("steps", steps), PI("rank", R),
-                                             PI("n_vocab", V), PI("N", ext[(size_t)k]), PI("vocab_off", beg[(size_t)k]),
-                                             PI("world", W), PI("anchor_stride", steps), PS("dtype", "f32") };
-                RadArgs a;
-                std::memset(&a, 0, sizeof(a));
-                a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
-                rcbad += r->launch(&a, (RadStream) nullptr) != RAD_OK;
-                st_stream_sync(nullptr);
-            }
-            if (step < steps)
+        std::vector<uint64_t> klog[2];   /* every rank's key slots of every step, a form */
+        for (int form = 0; form < 2; ++form) {
+            std::vector<uint64_t> kk((size_t)(S * SL / 2)), gg((size_t)(S * W * SL / 2), 0);
+            int rcbad = 0;
+            for (int k = 0; k < W; ++k) st_memset(d_t[(size_t)k], 0xff, (size_t)(S * steps) * 4);
+            for (int64_t step = 0; step <= steps; ++step) {
                 for (int k = 0; k < W; ++k) {
-                    st_memcpy(kk.data(), d_k[(size_t)k], kk.size() * 8, hipMemcpyDeviceToHost);
-                    for (int64_t s = 0; s < S; ++s)   /* whole slots, [s][w], as the gather lands them */
-                        for (int64_t q = 0; q < SL / 2; ++q)
-                            gg[(size_t)((s * W + k) * (SL / 2) + q)] = kk[(size_t)(s * (SL / 2) + q)];
+                    if (step < steps) st_memset(d_k[(size_t)k], 0, (size_t)(S * SL) * 4);
+                    std::vector<RadTensor> ts = {
+                        T(d_lg[(size_t)k], RAD_F32, { S * steps, std::max<int64_t>(1, ext[(size_t)k]) }),
+                        T(d_anc, RAD_I32, { (int64_t)anc.size() }),
+                        T(step > 0 ? d_g : nullptr, RAD_F32, { S, SL * W }),
+                        T(d_w1, RAD_BF16, { V, R }), T(d_w2, RAD_BF16, { V, R }),
+                        T(step < steps ? d_k[(size_t)k] : nullptr, RAD_F32, { S, SL }),
+                        T(d_t[(size_t)k], RAD_I32, { S, steps }),
+                    };
+                    if (step == 0) absent(ts[2]);
+                    if (step == steps) absent(ts[5]);
+                    std::vector<RadParam> ps = { PI("M", S), PI("step", step), PI("steps", steps), PI("rank", R),
+                                                 PI("n_vocab", V), PI("N", ext[(size_t)k]), PI("vocab_off", beg[(size_t)k]),
+                                                 PI("world", W), PI("anchor_stride", steps), PS("dtype", "f32"),
+                                                 PI("form", form) };
+                    RadArgs a;
+                    std::memset(&a, 0, sizeof(a));
+                    a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+                    rcbad += r->launch(&a, (RadStream) nullptr) != RAD_OK;
+                    st_stream_sync(nullptr);
                 }
-            if (step < steps) st_memcpy(d_g, gg.data(), gg.size() * 8, hipMemcpyHostToDevice);
+                if (step < steps)
+                    for (int k = 0; k < W; ++k) {
+                        st_memcpy(kk.data(), d_k[(size_t)k], kk.size() * 8, hipMemcpyDeviceToHost);
+                        klog[form].insert(klog[form].end(), kk.begin(), kk.end());
+                        for (int64_t s = 0; s < S; ++s)   /* whole slots, [s][w], as the gather lands them */
+                            for (int64_t q = 0; q < SL / 2; ++q)
+                                gg[(size_t)((s * W + k) * (SL / 2) + q)] = kk[(size_t)(s * (SL / 2) + q)];
+                    }
+                if (step < steps) st_memcpy(d_g, gg.data(), gg.size() * 8, hipMemcpyHostToDevice);
+            }
+            int bad = 0; std::string first;
+            for (int k = 0; k < W; ++k) {
+                std::vector<int32_t> got((size_t)(S * steps));
+                st_memcpy(got.data(), d_t[(size_t)k], got.size() * 4, hipMemcpyDeviceToHost);
+                for (size_t i = 0; i < got.size(); ++i)
+                    if (got[i] != want[i]) {
+                        if (!bad) first = fmt("rank %d seq %lld pos %lld: %d want %d", k, (long long)(i / steps),
+                                              (long long)(i % steps), got[i], want[i]);
+                        ++bad;
+                    }
+            }
+            if (c.tie && want[0] != (int32_t)(V / 10)) { ++bad; first += " (the host walk did not take the tie's lower id)"; }
+            ok((nm + fmt(", form %d", form)).c_str(), rcbad == 0 && bad == 0, rcbad ? fmt("%d launch(es) refused", rcbad) : first);
         }
-        int bad = 0; std::string first;
-        for (int k = 0; k < W; ++k) {
-            std::vector<int32_t> got((size_t)(S * steps));
-            st_memcpy(got.data(), d_t[(size_t)k], got.size() * 4, hipMemcpyDeviceToHost);
-            for (size_t i = 0; i < got.size(); ++i)
-                if (got[i] != want[i]) {
-                    if (!bad) first = fmt("rank %d seq %lld pos %lld: %d want %d", k, (long long)(i / steps),
-                                          (long long)(i % steps), got[i], want[i]);
-                    ++bad;
-                }
-        }
-        if (c.tie && want[0] != (int32_t)(V / 10)) { ++bad; first += " (the host walk did not take the tie's lower id)"; }
-        ok(nm.c_str(), rcbad == 0 && bad == 0, rcbad ? fmt("%d launch(es) refused", rcbad) : first);
+        ok(fmt("dspark_walk_step_f32 V %lld R %lld S %lld over %d rank(s): form 1's keys (the scores' bits) = form 0's, every "
+               "rank and step", (long long)V, (long long)R, (long long)S, W).c_str(), klog[0] == klog[1] && !klog[0].empty());
     }
 
     /* Launch time of one step at the TP4 shard of the real vocabulary, warm. */
@@ -4403,6 +4411,7 @@ static void dspark_walk_case(const Plugin& pl) {
         st_memset(d_w, 0x3c, (size_t)(V * R) * 2);
         st_memset(d_l, 0, (size_t)(Smax * steps * N) * 4);
         st_memset(d_a, 0, (size_t)(Smax * steps) * 4);
+        for (int form = 0; form < 2; ++form)
         for (int64_t S : { 1, 4, 8 }) {
             std::vector<RadTensor> ts = { T(d_l, RAD_F32, { S * steps, N }), T(d_a, RAD_I32, { S * steps }),
                                           T(nullptr, RAD_F32, { S, R4D_DS41_WALK_SLOT }), T(d_w, RAD_BF16, { V, R }),
@@ -4411,13 +4420,13 @@ static void dspark_walk_case(const Plugin& pl) {
             absent(ts[2]);
             std::vector<RadParam> ps = { PI("M", S), PI("step", 0), PI("steps", steps), PI("rank", R), PI("n_vocab", V),
                                          PI("N", N), PI("vocab_off", voff), PI("world", 4), PI("anchor_stride", steps),
-                                         PS("dtype", "f32") };
+                                         PS("dtype", "f32"), PI("form", form) };
             RadArgs a;
             std::memset(&a, 0, sizeof(a));
             a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
             const double us = st_time_us([&](int) { (void)r->launch(&a, (RadStream) nullptr); }, 50, nullptr);
-            std::printf("  PERF  dspark_walk_step_f32 one step, shard N %lld R %lld, %lld sequence(s): %.1f us a launch "
-                        "(warm; 16.5 MB of succ a step)\n", (long long)N, (long long)R, (long long)S, us);
+            std::printf("  PERF  dspark_walk_step_f32 one step, form %d, shard N %lld R %lld, %lld sequence(s): %.1f us a "
+                        "launch (warm; 16.5 MB of succ a step)\n", form, (long long)N, (long long)R, (long long)S, us);
         }
         ok("dspark_walk_step_f32 timing", true);
     }

@@ -390,6 +390,9 @@ struct Dsp {
     rad_buf wkeys = 0, wgath = 0, wts = 0, wtt = 0;
     rad_op wfill = 0, wag = 0, wmarkov = 0;
     std::vector<rad_op> wstep;
+    /* lever W1b: the scoring steps again at form 1 (succ staged through LDS as whole lines; the same bits), issued
+     * while dspark_walk is 2 (the last merge is wstep's) */
+    std::vector<rad_op> wstep2;
     std::vector<Layer> st;
 };
 
@@ -970,19 +973,21 @@ static void k1_read_env() {
  * the reference's walk, declared beside today's (the head's top `cand` re-ranked by dflash_select) only when
  * RADIANCE_DS41_DSPARK_WALK is set at the first declare: 0 / off declares it and starts at 0, 1 / on declares it and
  * starts at 1; unset (or another value) declares nothing more, the issue is today's and the switch takes only 0.
- * Switch "dspark_walk" (fn4): 0 the top-K re-rank, 1 the full-vocabulary walk; picked per query pass. The drafter
+ * Switch "dspark_walk" (fn4): 0 the top-K re-rank, 1 the full-vocabulary walk, 2 the same walk with libr4d's form 1
+ * (lever W1b: each block's succ rows staged through LDS as whole lines; the same fma chain an id, so the same bits and
+ * tokens as 1; RADIANCE_DS41_DSPARK_WALK=2 starts there); picked per query pass. The drafter
  * only proposes and the trunk verifies, so the greedy text does not depend on it. `_ok`: a drafter declared the
  * walk. Process-wide, as the switches above. */
-static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk_env{-2};   /* env: -2 unread, -1 unset */
+static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_walk_env{-2};   /* env: -2 unread, -1 unset */
 static void walk_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_DSPARK_WALK");
-    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : !std::strcmp(e, "2") ? 2
                           : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
     if (g_sw_walk_env.compare_exchange_strong(unread, v)) {
         if (v >= 0) g_sw_walk.store(v, std::memory_order_relaxed);
         if (e && v < 0)
-            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_WALK=%s is not 0 / off or 1 / on: the "
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_WALK=%s is not 0 / off, 1 / on or 2: the "
                             "full-vocabulary walk is not declared\n", e);
     }
 }
@@ -1000,7 +1005,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (const K1Switch* k = k1_switch(name))
         return value == 0 || (value == 1 && k->ok->load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_walk"))
-        return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
+               (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -2376,6 +2382,19 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 wok = wok && w && rad_op_resolved(b, w);   /* declared, and a kernel serves it on this device */
                 d.wstep.push_back(w);
             }
+            /* W1b: the scoring steps at form 1 (a libr4d without `form` refuses them: only dspark_walk 2 is lost) */
+            bool w2ok = true;
+            for (int64_t l = 0; l < d.block; ++l) {
+                const rad_op w = op(b, "dspark_walk_step",
+                                    { RAD_RANGE("M", 1, d.wseqs), RAD_INT("step", l), RAD_INT("steps", d.block),
+                                      RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("N", g.n_vocab),
+                                      RAD_INT("vocab_off", g.vocab_off), RAD_INT("world", g.world),
+                                      RAD_INT("anchor_stride", d.block), RAD_STR("dtype", "f32"), RAD_INT("form", 1) },
+                                    { d.mk1, d.mk2 }, { d.logits, d.wgath, d.wkeys }, { d.wkeys, d.tokens });
+                w2ok = w2ok && w && rad_op_resolved(b, w);
+                d.wstep2.push_back(w);
+            }
+            if (!w2ok) d.wstep2.clear();
             wok = wok && d.wkeys && d.wgath && d.wfill && d.wag && rad_op_resolved(b, d.wfill) && rad_op_resolved(b, d.wag);
         } else {
             const int64_t tiles = (c.n_vocab + 63) / 64;
@@ -2389,10 +2408,12 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         }
         if (wok) {
             g_sw_walk_ok.store(1, std::memory_order_relaxed);
+            if (!d.wstep2.empty()) g_sw_walk2_ok.store(1, std::memory_order_relaxed);
         } else {
             /* Anything declared stays unissued: the switch keeps refusing 1 and the walk is today's. */
             d.wfill = d.wag = d.wmarkov = 0;
             d.wstep.clear();
+            d.wstep2.clear();
             rad_note(b, "DSpark lever W1 NOT declared: no kernel serves %s here; the top-%lld walk only",
                      g.world > 1 ? "dspark_walk_step" : "dflash_markov_greedy_f32", (long long)R);
             if (ctx->rank == 0 && !ctx->shape_probe)
@@ -2432,9 +2453,10 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         if (ctx->rank == 0 && !ctx->shape_probe)
             fprintf(stderr, "radiance: deepseek41: DSpark lever W1: the full-vocabulary Markov walk declared (%s over %d "
                             "rank(s), %lld sequences a pass); fn4 dspark_walk=%d (0 the head's top %lld re-ranked, 1 the "
-                            "whole vocabulary; RADIANCE_DS41_DSPARK_WALK)\n",
+                            "whole vocabulary, 2 the same with succ staged through LDS -- W1b, %s; RADIANCE_DS41_DSPARK_WALK)\n",
                     d.wfill ? "dspark_walk_step a step + all_gather" : "dflash_markov_greedy_f32", g.world,
-                    (long long)d.wseqs, g_sw_walk.load(std::memory_order_relaxed), (long long)R);
+                    (long long)d.wseqs, g_sw_walk.load(std::memory_order_relaxed), (long long)R,
+                    d.wstep2.empty() ? "not declared" : "declared");
     }
     return RAD_OK;
 }
@@ -2854,7 +2876,8 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     RAD_ISSUE_N(x, d.gather, N, brows(d.fin, T), praw(batch->out_ids, RAD_I32, N), brows(d.rows, N));
     RAD_ISSUE_N(x, d.head, N, brows(d.rows, N), RAD_W(m.head), brows(d.logits, N));
     /* Lever W1: the full-vocabulary walk while the dspark_walk switch is 1 (declared: RADIANCE_DS41_DSPARK_WALK). */
-    if ((d.wfill || d.wmarkov) && g_sw_walk.load(std::memory_order_relaxed) == 1 && N == S * d.block && S <= d.wseqs) {
+    const int wsw = g_sw_walk.load(std::memory_order_relaxed);
+    if ((d.wfill || d.wmarkov) && wsw >= 1 && N == S * d.block && S <= d.wseqs) {
         const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
         if (d.wmarkov) {
             RAD_ISSUE_N(x, d.wmarkov, S, brows(d.logits, N), anchor, RAD_W(d.mk1), RAD_W(d.mk2), brows(d.wts, S),
@@ -2866,7 +2889,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
         for (int64_t l = 0; l < d.block; ++l) {
             const int64_t r0 = ds41walk::step_row(l, WS);
-            RAD_ISSUE_N(x, d.wstep[(size_t)l], S, brows(d.logits, N), anchor,
+            RAD_ISSUE_N(x, (wsw == 2 && !d.wstep2.empty() ? d.wstep2 : d.wstep)[(size_t)l], S, brows(d.logits, N), anchor,
                         l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
                         RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
             RAD_ISSUE(x, d.wag, brow_slice(d.wkeys, r0, S, KC), brow_slice(d.wgath, r0, S, GW));

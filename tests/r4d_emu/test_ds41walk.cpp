@@ -20,6 +20,10 @@
  * at the real vocabulary over four ranks, random seeds, plus a forced cross-shard tie on them, and the test
  * prints where in the head's own order each walked token sat (how often the walk leaves the head's top 32).
  *
+ * Every case runs both forms of the kernel -- form 0 (a thread reads its own succ row) and form 1 (lever W1b: the block's
+ * rows staged through LDS in 64-element chunks as whole lines) -- and requires every rank's key of every step (the
+ * score's bits) to be the same in both, besides the tokens matching the plain walk.
+ *
  * THE GATHER (10.11.2026: the first full-vocabulary query pass on the cards died in ar_gather_4rank, "refused op
  * 'all_gather' ... numel=16 dtype=f32 row=2" -- an 8-byte key a row, where libr4d's all-gather moves whole 16-byte
  * words a row): the keys now travel in 16-byte slots, and every case above runs the planes at deepseek41's geometry
@@ -120,7 +124,8 @@ RadParam pint(const char* k, int64_t v) { RadParam p{}; p.key = k; p.kind = RAD_
 
 /* The sharded walk over W ranks as deepseek41 issues it; every rank's tokens (pitch steps + 2, padding
  * sentinel -77) into `tok[w]`. Returns false on a refused launch. */
-bool sharded_walk(const Walk& w, int W, std::vector<std::vector<int32_t>>& tok, std::string* why) {
+bool sharded_walk(const Walk& w, int W, std::vector<std::vector<int32_t>>& tok, std::string* why, int form = 0,
+                  std::vector<uint64_t>* keylog = nullptr) {
     const int S = w.S, steps = w.steps, tp = steps + 2;
     std::vector<std::vector<float>> lg((size_t)W);
     std::vector<int64_t> beg((size_t)W), ext((size_t)W), lp((size_t)W);
@@ -150,23 +155,26 @@ bool sharded_walk(const Walk& w, int W, std::vector<std::vector<int32_t>>& tok, 
                 step < steps ? mat(keys[(size_t)r].data(), RAD_F32, S, KC, KC) : RadTensor{},
                 mat(tok[(size_t)r].data(), RAD_I32, S, steps, tp),
             };
-            RadParam p[10] = { pint("M", S), pint("step", step), pint("steps", steps), pint("rank", w.R),
+            RadParam p[11] = { pint("M", S), pint("step", step), pint("steps", steps), pint("rank", w.R),
                                pint("n_vocab", w.V), pint("N", ext[(size_t)r]), pint("vocab_off", beg[(size_t)r]),
                                pint("world", W), pint("anchor_stride", w.astride), RadParam{} };
             p[9].key = "dtype";
             p[9].kind = RAD_P_STR;
             p[9].sval = "f32";
+            p[10] = pint("form", form);
             RadArgs a{};
             a.t = t;
             a.n_t = 7;
             a.p = p;
-            a.n_p = 10;
+            a.n_p = 11;
             const int rc = r4d_rad_dspark_walk_step(&a, nullptr);
             if (rc != RAD_OK) {
                 if (why) *why = "rank " + std::to_string(r) + " step " + std::to_string(step) + " rc " + std::to_string(rc);
                 return false;
             }
         }
+        if (step < steps && keylog)   /* every rank's keys of the step: the scores' bits, for the form comparison */
+            for (int r = 0; r < W; ++r) keylog->insert(keylog->end(), keys[(size_t)r].begin(), keys[(size_t)r].end());
         if (step < steps)   /* all_gather, row-interleaved by slot: y[s][w] = rank w's x[s], whole slots */
             for (int s = 0; s < S; ++s)
                 for (int r = 0; r < W; ++r)
@@ -183,10 +191,16 @@ void check(const char* what, const Walk& w, std::initializer_list<int> worlds, c
     const std::vector<int32_t> want = want_in ? *want_in : ref_walk(w);
     for (int W : worlds) {
         ++g_cases;
-        std::vector<std::vector<int32_t>> tok;
-        std::string why;
+        std::vector<std::vector<int32_t>> tok, tok1;
+        std::vector<uint64_t> k0, k1;
+        std::string why, why1;
         int bad = 0, pad = 0, first = -1;
-        const bool ran = sharded_walk(w, W, tok, &why);
+        /* form 0 (a thread reads its row) and form 1 (lever W1b: rows staged through LDS) -- the same keys, bit for bit */
+        const bool ran0 = sharded_walk(w, W, tok, &why, 0, &k0);
+        const bool ran1 = sharded_walk(w, W, tok1, &why1, 1, &k1);
+        const bool ran = ran0 && ran1;
+        if (!ran1 && why.empty()) why = "form 1: " + why1;
+        const bool same_keys = ran && k0 == k1 && tok == tok1;
         if (ran)
             for (int r = 0; r < W; ++r)
                 for (int s = 0; s < w.S; ++s) {
@@ -197,9 +211,10 @@ void check(const char* what, const Walk& w, std::initializer_list<int> worlds, c
                         }
                     for (int l = w.steps; l < w.steps + 2; ++l) pad += tok[(size_t)r][(size_t)s * (w.steps + 2) + l] != -77;
                 }
-        const bool ok = ran && !bad && !pad;
+        const bool ok = ran && !bad && !pad && same_keys;
         std::printf("%-58s V %6d R %3d S %2d W %d: %s", what, w.V, w.R, w.S, W,
-                    !ran ? "LAUNCH REFUSED" : bad ? "DIFFERS" : pad ? "PADDING TOUCHED" : "byte-identical to the plain walk");
+                    !ran ? "LAUNCH REFUSED" : bad ? "DIFFERS" : pad ? "PADDING TOUCHED"
+                    : !same_keys ? "FORM 1 KEYS DIFFER FROM FORM 0" : "byte-identical to the plain walk (forms 0 and 1, every key)");
         if (!ran) std::printf(" (%s)", why.c_str());
         if (bad) std::printf(" (%d token(s) of %d x %d ranks; first rank %d seq %d pos %d)", bad, w.S * w.steps, W,
                              first / 1000000, first / 100 % 10000, first % 100);

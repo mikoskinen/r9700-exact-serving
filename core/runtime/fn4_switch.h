@@ -85,8 +85,9 @@
  *                   declares the step's fill (starts at 1); unset: 1 refused. Exact: the gathers read the same ones.
  *   dspark_walk     deepseek41 (lever W1): 1 the DSpark Markov walk over the whole vocabulary (dspark_walk_step a
  *                   step on each rank's vocabulary shard + an all_gather of the keys; one rank: dflash_markov_greedy_f32),
- *                   0 the head's top 32 re-ranked (dflash_select) as before. RADIANCE_DS41_DSPARK_WALK=0 / 1 declares
- *                   the walk (and starts at that value); unset: 1 refused. Exact: proposals only, the trunk verifies.
+ *                   0 the head's top 32 re-ranked (dflash_select) as before; 2 the walk of 1 with libr4d's form 1 (lever
+ *                   W1b: succ staged through LDS, the same bits). RADIANCE_DS41_DSPARK_WALK=0 / 1 / 2 declares the walk
+ *                   (and starts at that value); unset: 1 / 2 refused. Exact: proposals only, the trunk verifies.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.

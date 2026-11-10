@@ -3555,7 +3555,7 @@ candidates, and what enters the head from the trunk.
 |---|---|---|
 | `dflash_markov_greedy` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | BF16 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
 | `dflash_markov_greedy_f32` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | F32 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
-| `dspark_walk_step` | `M` `step` `steps` `rank` `n_vocab` `N` `vocab_off` `world` `anchor_stride`/opt `dtype` | F32 `logits`, `anchor`, `prev`?, `pred`w, `succ`w, `keys`:inout? → `tokens` |
+| `dspark_walk_step` | `M` `step` `steps` `rank` `n_vocab` `N` `vocab_off` `world` `anchor_stride`/opt `dtype` `form`/opt | F32 `logits`, `anchor`, `prev`?, `pred`w, `succ`w, `keys`:inout? → `tokens` |
 
 `dflash_markov_greedy` implements the DSpark full-vocabulary greedy walk, not DFlash2's
 candidate-lattice selector. For every position it adds `sum_r pred[previous,r] * succ[token,r]`
@@ -3579,7 +3579,9 @@ anchor at `l = 0`), written to `tokens[s][l-1]`. Each column's score
 order, keyed as `(ordered score bits) << 32 | ~id` (ties to the lower id; a NaN score is never chosen,
 -0 counts as +0) and the shard's greatest key is max-ed into `keys[s]` (the u64 of a 16-byte slot, an F32 `[M, 4]`
 plane, zeroed before the step). The key is order-free, so every rank derives the same token from the same
-gathered bytes. libr4d only; no libref oracle (tests/r4d_emu/test_ds41walk holds it to a host walk).
+gathered bytes. `form` (default 0) only picks how a block reads `succ` (1: the block's rows staged through
+LDS as whole lines); every id's chain is the same, so the bits are. libr4d only; no libref oracle
+(tests/r4d_emu/test_ds41walk holds it to a host walk).
 
 ### DFlash2
 

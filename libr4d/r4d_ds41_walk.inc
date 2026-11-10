@@ -10,7 +10,7 @@
 
 static const RadParamSpec pDs41Walk[] = {
     P_INT("M"), P_INT("step"), P_INT("steps"), P_INT("rank"), P_INT("n_vocab"), P_INT("N"),
-    P_INT("vocab_off"), P_INT("world"), P_INTO("anchor_stride"), P_STR("dtype"),
+    P_INT("vocab_off"), P_INT("world"), P_INTO("anchor_stride"), P_STR("dtype"), P_INTO("form"),
 };
 static const RadOperandSpec oDs41Walk[] = {
     { "logits", RAD_OPD_IN, 0 },     { "anchor", RAD_OPD_IN, 0 }, { "prev", RAD_OPD_IN, 1 },
@@ -32,14 +32,16 @@ SCHEMA("dspark_walk_step", pDs41Walk, oDs41Walk,
        "column's score logits[s * steps + l][j] + sum_r pred[prev][r] * succ[vocab_off + j][r] (fma, r "
        "ascending) is keyed (ordered score bits << 32 | ~id: ties to the lower id, NaN never) and the shard's "
        "best max-ed into keys[s] (the u64 of a 16-byte slot, an f32 [M, 4] plane, zeroed before). step = steps only merges the "
-       "last token."),
+       "last token. `form` (default 0) picks how a block reads succ (1: through LDS as whole lines); the bits are the "
+       "same."),
 
 #elif defined(R4D_DS41_ROWS)
 
 { "dspark_walk_step_f32", "dspark_walk_step", "dflash",
   "one step of the full-vocabulary DSpark Markov walk on a vocabulary shard: a thread a column, 128 a block, "
   "every sequence in passes of eight (their predecessor rows in LDS), the shard's best key a sequence by a wave "
-  "max and one atomicMax a block",
+  "max and one atomicMax a block; form 0 a thread reads its succ row in 16-byte pieces, form 1 the block's rows "
+  "come through LDS as whole 128-byte lines (the same fma chain a thread)",
   "rank a multiple of 32 up to 512, vocab_off + N <= n_vocab, succ 16-byte aligned, keys [M, 4] / prev [M, 4 * world] "
   "f32 planes of 16-byte key slots, keys zeroed before the step",
   "f32 logits, bf16 pred / succ (widened exactly), f32 fma in rank order, u64 keys in 16-byte slots of f32 planes, i32 tokens",
