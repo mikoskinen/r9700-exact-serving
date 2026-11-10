@@ -12325,12 +12325,14 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         int world, rank;
         uint64_t graph, steps;
     };
+    /* fn4 W1b (10.11.2026): qwen4exp's step hashes re-pinned -- hc_read and hc_write now issue their trailing optional
+     * `ss` operand (absent, RAD_NONE) so each issue still carries the schema's full count; the graphs are unchanged. */
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0x32869dce302eb0e0ull, 0x26a9e2c23cf85696ull },
-        { "qwen4exp_fp8", 2, 0, 0xf0b6701dd7cbb37aull, 0x889c6b36c014609full },
-        { "qwen4exp_fp8", 2, 1, 0x4bc19e44d0743e49ull, 0x959ef6b7c6f57d8bull },
-        { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0xfbe74f2b9d7020bfull },
-        { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x36df57cac613c6cfull },
+        { "qwen4exp_fp8", 1, 0, 0x32869dce302eb0e0ull, 0xe8f31869db7cc67aull },
+        { "qwen4exp_fp8", 2, 0, 0xf0b6701dd7cbb37aull, 0x3bfababbd75d9957ull },
+        { "qwen4exp_fp8", 2, 1, 0x4bc19e44d0743e49ull, 0xb7256695da2dfb73ull },
+        { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0x8cf4e752ed7ea163ull },
+        { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x8314501760657f93ull },
         { "qwen35_fp8", 1, 0, 0x0f08ba5027cba71aull, 0xa7ec3cf6252cd441ull },
         { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0xdd5d65ef158c4136ull },
         { "qwen35moe_fp8", 1, 0, 0xb1e6173bd121dc2aull, 0x2b5989b2a6dbc7dfull },

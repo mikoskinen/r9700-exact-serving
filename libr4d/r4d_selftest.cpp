@@ -21174,6 +21174,95 @@ static void hc_ss_case(const Plugin& pl, int64_t M, bool i8) {
                  : fmt("write %d launch(es), read %d -> %d", rw_ref, rr_ref, rr_ss));
 }
 
+/* fn4 W2 (hc_readv bits 4-5): the codes stage at two, four and five groups a wave against one, byte for byte on every
+ * read output (hc_read alone, the stack's hc_readv 3 under it); the dispatched codes kernel must change from 65 rows
+ * (the wide tile and PF2, which run it as a launch of its own) and nowhere below. */
+static void hc_quantg_case(const Plugin& pl, int64_t M, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 at M=%lld, %s codes: the codes stage at 2 / 4 / 5 groups a wave (fn4 W2) "
+                               "byte-identical to one", (long long)M, i8 ? "int8" : "E4M3");
+    if (!pl.readv_hc || !pl.norm_hc_wave || !pl.record) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, i8)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs; std::vector<const void*> fns; int nd = 0; };
+    static const int kV[4] = { 3, 3 | 16, 3 | 32, 3 | 48 };
+    Out o[4];
+    pl.norm_hc_wave(1);
+    g.set(false, false);
+    for (int k = 0; k < 4; ++k) {
+        pl.readv_hc(kV[k]);
+        g.reset();
+        const void* fns[64] = {};
+        pl.record(fns, 64);
+        const int rc = g.rr->launch(&g.ar, (RadStream)g.hs);
+        o[k].nd = pl.record(nullptr, 0);
+        o[k].fns.assign(fns, fns + (o[k].nd < 64 ? o[k].nd : 64));
+        if (rc != RAD_OK || st_stream_sync(g.hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_readv %d rc=%d", kV[k], rc)); pl.readv_hc(0); pl.norm_hc_wave(0); return;
+        }
+        auto get = [&](std::vector<uint8_t>& v, const void* d, size_t b) { v.resize(b); st_memcpy(v.data(), d, b, hipMemcpyDeviceToHost); };
+        get(o[k].x, g.d_x, g.xb); get(o[k].inj, g.d_inj, g.ib); get(o[k].q, g.d_q, g.qb);
+        get(o[k].qs, g.d_qs, g.sb); get(o[k].rq, g.d_rq, g.qb); get(o[k].rs, g.d_rs, g.sb);
+    }
+    pl.readv_hc(0); pl.norm_hc_wave(0);
+    std::string bad;
+    for (int k = 1; k < 4; ++k) {
+        const std::string at = fmt(" (%d)", kV[k]);
+        if (o[k].x != o[0].x)     bad += " x" + at;
+        if (o[k].inj != o[0].inj) bad += " inj" + at;
+        if (o[k].q != o[0].q)     bad += " q" + at;
+        if (o[k].qs != o[0].qs)   bad += " qs" + at;
+        if (o[k].rq != o[0].rq)   bad += " rq" + at;
+        if (o[k].rs != o[0].rs)   bad += " rs" + at;
+    }
+    const bool here = M > 64;
+    bool swapped = true, same_n = true;
+    for (int k = 1; k < 4; ++k) { swapped = swapped && o[k].fns != o[0].fns; same_n = same_n && o[k].nd == o[0].nd; }
+    if (!here) { swapped = false; for (int k = 1; k < 4; ++k) swapped = swapped || o[k].fns != o[0].fns; }
+    int64_t nz = 0;
+    for (uint8_t v : o[0].q) nz += v != 0xa5;
+    ok(nm.c_str(), bad.empty() && swapped == here && same_n && nz > (int64_t)g.qb / 2,
+       !bad.empty() ? "differs in" + bad
+       : swapped != here ? fmt("the dispatched kernels %s (want %s)", swapped ? "changed" : "did not change", here ? "changed" : "unchanged")
+                         : fmt("%d launches logged%s", o[0].nd, same_n ? "" : " (counts differ)"));
+}
+
+/* --perfhcq M [iters]: hc_read_e4m3 at M rows (F1n, hc_readv 3), the codes stage at one / two / four / five groups a
+ * wave: the read timed as one op, and from 512 rows PF2's codes stage alone (its cumulative stage masks 15 and 31). */
+static void hc_quantg_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
+    const std::string nm = fmt("hc_read_e4m3 codes-stage timing at M=%lld (fn4 W2)", (long long)M);
+    if (!pl.readv_hc || !pl.norm_hc_wave) { skip(nm.c_str(), "no r4d_hc_readv"); return; }
+    if (pl.release_hc_ctr) pl.release_hc_ctr();
+    HcSsRig g;
+    if (!g.build(pl, M, i8)) { ok(nm.c_str(), false, "rows absent or setup failed"); return; }
+    pl.norm_hc_wave(1);
+    g.set(false, false);
+    g.reset();
+    static const int kV[4] = { 3, 3 | 16, 3 | 32, 3 | 48 };
+    static const int kGr[4] = { 1, 2, 4, 5 };
+    double t[4], c[4] = { 0, 0, 0, 0 };
+    for (int k = 0; k < 4; ++k) {
+        pl.readv_hc(kV[k]);
+        if (g.rr->launch(&g.ar, (RadStream)g.hs) != RAD_OK || st_stream_sync(g.hs) != hipSuccess) {
+            ok(nm.c_str(), false, fmt("hc_readv %d launch failed", kV[k])); pl.readv_hc(0); pl.norm_hc_wave(0); return;
+        }
+        t[k] = st_time_us([&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, iters, g.hs);
+        if (M >= 512 && pl.pf2_stages_hc) {
+            pl.pf2_stages_hc(15);
+            const double t15 = st_time_us([&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, iters, g.hs);
+            pl.pf2_stages_hc(31);
+            const double t31 = st_time_us([&](int) { (void)g.rr->launch(&g.ar, (RadStream)g.hs); }, iters, g.hs);
+            c[k] = t31 - t15;
+        }
+    }
+    pl.readv_hc(0); pl.norm_hc_wave(0);
+    std::printf("hc_quantg M=%lld %s%s (F1n, hc_readv 3):", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm");
+    for (int k = 0; k < 4; ++k)
+        std::printf(" G%d read %.2f us%s", kGr[k], t[k], M >= 512 ? fmt(" (codes %.2f)", c[k]).c_str() : "");
+    std::printf("\n");
+    ok(nm.c_str(), true);
+}
+
 /* --perfhcs M [iters]: the pair at M rows, hc_readv 3 without `ss` against 11 with it, each op timed alone (warm,
  * or cold under --cold) and the pair back to back. */
 static void hc_ss_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
@@ -34861,6 +34950,9 @@ static void device_phase(const Plugin& pl) {
          * the decode tiles, the wide tile and PF2. */
         for (int64_t m : { 16, 17, 33, 64, 300, 512, 2048 }) hc_ss_case(pl, m, false);
         for (int64_t m : { 64, 2048 }) hc_ss_case(pl, m, true);
+        /* fn4 W2: the codes stage's grouped form, below and from the wide tile. */
+        for (int64_t m : { 64, 65, 300, 512, 2048 })
+            for (bool i8 : { false, true }) hc_quantg_case(pl, m, i8);
     }
     if (sel("hc_write_bf16")) {
         if (!g_case) std::printf("\nthe gated residual's write: the eight-wide form (fn4 hcw) against "
@@ -35383,6 +35475,8 @@ static void usage(void) {
                 "             that serves M (fn4), and from 512 rows the up-mix stage alone.\n"
                 "  --perfhcv M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows with F1n,\n"
                 "             the stock forms against hc_readv 1 / 2 / 3 (fn4), and PF2's stages from 512.\n"
+                "  --perfhcq M [iters]:  hc_read_e4m3 at M rows (F1n, hc_readv 3), the codes stage at 1 / 2 / 4 / 5\n"
+                "             groups a wave (fn4 W2), and from 512 rows PF2's codes stage alone.\n"
                 "  --perfhcs M [iters]:  hc_write + hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows,\n"
                 "             hc_readv 3 against 11 (fn4 W1b: the read's norm scales from the write).\n"
                 "  --perfhcw M [iters]:  hc_write at Qwen3.8-Flash-Next's shape and M rows, the plain\n"
@@ -35520,6 +35614,8 @@ int main(int argc, char** argv) {
     int hcv_it = 50;
     long long hcs_m = 0;
     int hcs_it = 50;
+    long long hcq_m = 0;
+    int hcq_it = 50;
     long long hcu_m = 0;
     int hcu_it = 50;
     int hc_it = 20;
@@ -35801,6 +35897,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hcv_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcv_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcq")) {
+            /* The codes stage's groups a wave (fn4 W2) at M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcq_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcq_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhcs")) {
             /* The write + read pair with the norm scales handed over (fn4 hc_readv bit 3) at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -35927,6 +36028,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("gated residual read timing (hc_readv)", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcq_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_quantg_perf(pl, hcq_m, hcq_it, true);
+        dfree_all();
+#else
+        skip("gated residual codes-stage timing (W2)", "built without HIP");
 #endif
         return 0;
     }

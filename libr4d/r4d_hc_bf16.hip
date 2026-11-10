@@ -3566,13 +3566,14 @@ static bool hc_write_vec(long rows) {
  * product at 32 rows a workgroup (hc_down_pf2_r32_kernel), bit 2 PF2's norm scales inside the down product
  * (hc_down_pf2_fs_kernel; lost in 138), bit 3 the norm scales from the preceding hc_write (W1b: hc_write's
  * optional `ss` output, the read's optional `ss` input, both [rows][kHcMax] f32, used from kHcSsMinRows rows;
- * see hc_ss_on). -1 until the environment is read. */
+ * see hc_ss_on), bits 4-5 the codes stage's groups a wave (W2, hc_quant_rows_g_kernel: 0 one, 1 two, 2 four, 3 five).
+ * -1 until the environment is read. */
 static std::atomic<int> g_hc_readv{-1};
 static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 15) : 0;
+        const int on = (e && *e) ? (std::atoi(e) & 63) : 0;
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
@@ -4831,17 +4832,13 @@ void hc_up_mix_pf5_kernel(const unsigned short* __restrict__ ub, long lr_,
  * eight workgroups walking the group's 128 rows alone behind a counter and fences (82 of its
  * 356 us at a 2048-row chunk); this launch streams over `x` at memory speed. Same bytes: the amax
  * is exact in any order and each code converts the same bf16 by the same scale. */
-template <bool I8 = false>
-__global__ __launch_bounds__(kThreads)
-void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* __restrict__ q,
-                          float* __restrict__ qs, unsigned char* __restrict__ rq,
-                          float* __restrict__ rqs, long rows, long ngrp, long xrow, long qrow,
-                          long srow, long rqrow, long rsrow) {
-    const int  lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
-    const long item = (long)blockIdx.x * kWaves + wave;
-    if (item >= rows * ngrp) return;
-    const long r = item / ngrp, g = item % ngrp, base = g * kUpTB;
-    const uint2 raw = *(const uint2*)(x + r * xrow + base + lane * 4);
+/* One (row r, group g) of the codes from its 128 bf16 (four a lane, `raw`): the amax, scale, packing and rotation every
+ * form below shares. */
+template <bool I8>
+__device__ __forceinline__ void hc_quant_group(uint2 raw, int lane, long r, long g, unsigned char* __restrict__ q,
+                                               float* __restrict__ qs, unsigned char* __restrict__ rq,
+                                               float* __restrict__ rqs, long qrow, long srow, long rqrow, long rsrow) {
+    const long base = g * kUpTB;
     const unsigned short* xs = reinterpret_cast<const unsigned short*>(&raw);
     float v[4], t[4];
 #pragma unroll
@@ -4858,6 +4855,42 @@ void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* _
     *(unsigned*)(q + r * qrow + base + lane * 4) = (unsigned)pk;
 
     if (rq) hc_rot_group(t, lane, rq + r * rqrow + base, rqs + r * rsrow + g);
+}
+
+template <bool I8 = false>
+__global__ __launch_bounds__(kThreads)
+void hc_quant_rows_kernel(const unsigned short* __restrict__ x, unsigned char* __restrict__ q,
+                          float* __restrict__ qs, unsigned char* __restrict__ rq,
+                          float* __restrict__ rqs, long rows, long ngrp, long xrow, long qrow,
+                          long srow, long rqrow, long rsrow) {
+    const int  lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    const long item = (long)blockIdx.x * kWaves + wave;
+    if (item >= rows * ngrp) return;
+    const long r = item / ngrp, g = item % ngrp;
+    const uint2 raw = *(const uint2*)(x + r * xrow + g * kUpTB + lane * 4);
+    hc_quant_group<I8>(raw, lane, r, g, q, qs, rq, rqs, qrow, srow, rqrow, rsrow);
+}
+
+/* fn4 W2 (hc_readv bits 4-5): the same codes, G consecutive groups of a row a wave -- the wave's G loads go out
+ * together, then each group runs hc_quant_group unchanged, so the bytes are the stock form's. 1/G as many waves, each
+ * with G loads in flight: the stock form's 40960 one-group waves at a 2048-row call are ~20 rounds of a load's
+ * latency plus three shuffle chains (57-61 us for ~21 MB, ~56 % of the card's bandwidth). `ngrp` a multiple of G. */
+template <bool I8, int G>
+__global__ __launch_bounds__(kThreads)
+void hc_quant_rows_g_kernel(const unsigned short* __restrict__ x, unsigned char* __restrict__ q,
+                            float* __restrict__ qs, unsigned char* __restrict__ rq,
+                            float* __restrict__ rqs, long rows, long ngrp, long xrow, long qrow,
+                            long srow, long rqrow, long rsrow) {
+    const int  lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    const long npr = ngrp / G;
+    const long item = (long)blockIdx.x * kWaves + wave;
+    if (item >= rows * npr) return;
+    const long r = item / npr, g0 = (item - r * npr) * G;
+    uint2 raw[G];
+#pragma unroll
+    for (int k = 0; k < G; ++k) raw[k] = *(const uint2*)(x + r * xrow + (g0 + k) * kUpTB + lane * 4);
+#pragma unroll
+    for (int k = 0; k < G; ++k) hc_quant_group<I8>(raw[k], lane, r, g0 + k, q, qs, rq, rqs, qrow, srow, rqrow, rsrow);
 }
 
 /* The mix finisher's arrival counters, one block per stream (as gemm_fp8a8's split_ctr): a
@@ -4983,15 +5016,27 @@ static inline void hc_quant_rows_launch(bool i8, const unsigned short* x, unsign
                                         long n, long xrow, long qrow, long srow, long rqrow,
                                         long rsrow, RadStream s) {
     if (!q) return;
-    const long items = rows * (n / kUpTB);
+    const long ngrp = n / kUpTB;
+    /* fn4 W2: hc_readv's bits 4-5 pick G (1, 2, 4, 5); a G that does not divide the row's groups takes the stock form.
+     * Through r4d_emit, so r4d_record_dispatches sees which form ran. */
+    static const int kG[4] = { 1, 2, 4, 5 };
+    const int G = kG[(hc_readv() >> 4) & 3];
+    if (G > 1 && ngrp % G == 0) {
+        const unsigned nb = (unsigned)((rows * (ngrp / G) + kWaves - 1) / kWaves);
+#define HC_QG(I8_, G_) (void)R4D_EMIT(s, (&hc_quant_rows_g_kernel<I8_, G_>), dim3(nb), dim3(kThreads), 0, x, q, qs, rq, \
+                                      rqs, rows, ngrp, xrow, qrow, srow, rqrow, rsrow)
+        if (i8) { if (G == 2) HC_QG(true, 2);  else if (G == 4) HC_QG(true, 4);  else HC_QG(true, 5); }
+        else    { if (G == 2) HC_QG(false, 2); else if (G == 4) HC_QG(false, 4); else HC_QG(false, 5); }
+#undef HC_QG
+        return;
+    }
+    const long items = rows * ngrp;
     if (i8)
-        hipLaunchKernelGGL(hc_quant_rows_kernel<true>, dim3((unsigned)((items + kWaves - 1) / kWaves)),
-                           dim3(kThreads), 0, (hipStream_t)s, x, q, qs, rq, rqs, rows, n / kUpTB,
-                           xrow, qrow, srow, rqrow, rsrow);
+        (void)R4D_EMIT(s, &hc_quant_rows_kernel<true>, dim3((unsigned)((items + kWaves - 1) / kWaves)),
+                       dim3(kThreads), 0, x, q, qs, rq, rqs, rows, ngrp, xrow, qrow, srow, rqrow, rsrow);
     else
-        hipLaunchKernelGGL(hc_quant_rows_kernel<false>, dim3((unsigned)((items + kWaves - 1) / kWaves)),
-                           dim3(kThreads), 0, (hipStream_t)s, x, q, qs, rq, rqs, rows, n / kUpTB,
-                           xrow, qrow, srow, rqrow, rsrow);
+        (void)R4D_EMIT(s, &hc_quant_rows_kernel<false>, dim3((unsigned)((items + kWaves - 1) / kWaves)),
+                       dim3(kThreads), 0, x, q, qs, rq, rqs, rows, ngrp, xrow, qrow, srow, rqrow, rsrow);
 }
 
 static inline void hc_up_mix_wide_launch(bool f8, bool i8, const void* up, long uld,
@@ -6978,7 +7023,7 @@ extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_write_vec(int on) { g_hc_write_vec.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
-extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 15), std::memory_order_relaxed); }
+extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 63), std::memory_order_relaxed); }
 /* Test hook (r4d_selftest, fn4): frees this device's mix-counter slots. hc_mix_ctr keeps four
  * streams a device and never frees a slot, so a test that makes a stream a case runs out after four
  * and every later case takes the unfused up product (and no decode form G / S) -- the stock and the
@@ -7007,7 +7052,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 15) return -1;
+        if (value < 0 || value > 63) return -1;
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }
