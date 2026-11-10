@@ -1010,6 +1010,13 @@ int rad_expert_prefetch_step(RadCtx* c, int layer);
 void* rad_weight_ptr(RadCtx* c, rad_weight w);
 void* rad_buf_ptr(RadCtx* c, rad_buf b);
 
+/* The value a runtime switch applies (core/runtime/fn4_switch.h, POST /admin/fn4): 1 and the value,
+ * or 0 when the core knows no switch of that name. A plugin that issues work only under a switch
+ * reads it at issue: a change starts a new epoch, so a pass recorded before it is not played after
+ * it. Test builds' A/B scaffolding; a plugin that may load in a host without it declares the symbol
+ * weak and reads a missing one as off. Additive export. */
+int rad_fn4_get(const char* name, int* value);
+
 #ifdef __cplusplus
 }   /* extern "C" */
 #endif

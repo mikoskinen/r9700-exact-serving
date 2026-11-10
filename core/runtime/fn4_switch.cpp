@@ -21,7 +21,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_shexp_lane", "ds41_kvfold", "ds41_ofold", "ds41_onefill",
                                         "draft_depth0", "draft_probe", "draft_hybrid", "draft_hybrid_match",
                                         "draft_probe_backoff", "draft_lend", "draft_lend_borrow",
-                                        "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip" };
+                                        "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
+                                        "dspark_conf", "dspark_alt" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -43,6 +44,7 @@ struct State {
     std::atomic<int> draft_capable{-1};      /* -1 no scheduler registered, 0 / 1 */
     std::atomic<int> draft_configured{0};    /* --draft-window adaptive at start */
     std::atomic<int> hybrid_capable{-1};     /* -1 no scheduler registered, 0 / 1 */
+    std::atomic<int> conf_capable{-1}, alt_capable{-1};   /* dspark_conf / dspark_alt: -1 no engine registered */
     std::atomic<uint64_t> epoch{0};
     std::atomic<int> applied_step{-1};
     std::atomic<int64_t> cnt[6];   /* note_draft_counts */
@@ -219,6 +221,24 @@ void note_lend_engine(int64_t state, int64_t lends, int64_t reclaims, int64_t le
     for (int k = 0; k < 7; ++k) s.lend[9 + k].store(v[k], std::memory_order_relaxed);
 }
 
+bool dspark_conf_value_ok(int v) {
+    return v == 0 || v == 1 || v == 2 || v == 101 || (v >= 5 && v <= 95) || (v >= 105 && v <= 195);
+}
+
+void dspark_register(bool conf_capable, bool alt_capable, int conf_start, int alt_start) {
+    State& s = st();
+    s.conf_capable.store(conf_capable ? 1 : 0, std::memory_order_release);
+    s.alt_capable.store(alt_capable ? 1 : 0, std::memory_order_release);
+    s.val[kDsparkConf].store(conf_capable && dspark_conf_value_ok(conf_start) ? conf_start : 0,
+                             std::memory_order_release);
+    s.val[kDsparkAlt].store(alt_capable && alt_start == 1 ? 1 : 0, std::memory_order_release);
+}
+
+int get(int i) {
+    if (i < 0 || i >= kSwitches) return -1;
+    return st().val[i].load(std::memory_order_acquire);
+}
+
 bool check(const std::string& name, int v, std::string* err) {
     if (name == "epoch_bump") return true;
     const int i = switch_index(name);
@@ -226,7 +246,7 @@ bool check(const std::string& name, int v, std::string* err) {
         if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, ds41_argather, "
                         "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
-                        "idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, epoch_bump)";
+                        "idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -306,6 +326,29 @@ bool check(const std::string& name, int v, std::string* err) {
     if (i == kDraftHybridMatch) {
         if (v < 1 || v > 256) {
             if (err) *err = "draft_hybrid_match takes 1 .. 256 (tokens the lookup's match runs back)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kDsparkConf || i == kDsparkAlt) {
+        const bool conf = i == kDsparkConf;
+        if (conf ? !dspark_conf_value_ok(v) : (v < 0 || v > 1)) {
+            if (err)
+                *err = conf ? "dspark_conf takes 0 (off), 1 (the reference rule: verify the longest prefix with "
+                              "sigmoid >= 0.5), 5..95 (that rule at v/100), 101 or 105..195 (the rule capped by the "
+                              "adaptive window, at (v-100)/100, 101 = 0.5) or 2 (observe: count, cut nothing)"
+                            : "dspark_alt takes 1 (the shadow tree's branches, measured) or 0 (off)";
+            return false;
+        }
+        const int cap = (conf ? s.conf_capable : s.alt_capable).load(std::memory_order_acquire);
+        if (v != 0 && cap != 1) {
+            if (err)
+                *err = std::string(kNames[i]) + "=" + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "no engine has registered a drafter"
+                                : conf ? "this deployment's drafter declares no confidence plane (deepseek41: "
+                                         "RADIANCE_DS41_DSPARK_CONF at start)"
+                                       : "this deployment's drafter declares no alternative branches (deepseek41: "
+                                         "RADIANCE_DS41_DSPARK_ALT at start)");
             return false;
         }
         return true;
@@ -480,3 +523,12 @@ std::string state_json() {
 
 }  // namespace fn4
 }  // namespace rad
+
+/* rad_runtime.h: a plugin reads a switch's applied value at issue. */
+extern "C" int rad_fn4_get(const char* name, int* value) {
+    if (!name) return 0;
+    const int i = rad::fn4::switch_index(name);
+    if (i < 0) return 0;
+    if (value) *value = rad::fn4::value(i);
+    return 1;
+}
