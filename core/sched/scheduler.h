@@ -84,7 +84,14 @@ struct SchedReq {
         draft_filled = 0;
         draft_lo     = 0;
         draft_hi     = 0;
+        conf_gen     = 0;
     }
+    /* The confidence gate's verify count for the proposal in flight (Scheduler::set_draft_conf),
+     * valid while `conf_gen` is the scheduler's current one; `conf_rep`: it replaces the window's
+     * stop (else the window caps it). */
+    int32_t  conf_n = -1;
+    uint32_t conf_gen = 0;
+    bool     conf_rep = true;
 
     /* The adaptive draft window's estimate (--draft-window adaptive, draft.h). Not reset by
      * drafter_reset(): it describes the text, which preemption does not change. */
@@ -350,6 +357,12 @@ public:
      * While the next step is open, commit() leaves continuing requests' blocks in place, and a
      * finished request keeps them until that step has run. */
     void            expect_draft(uint64_t id, int n);
+    /* The confidence gate (core/sched/draft_conf.h, the dspark_conf switch): `id` verifies at most
+     * `n` drafts of the proposal in flight -- in place of its window's stop (`replace`), or under
+     * it. draft_conf_begin() forgets every earlier one; the engine calls it as each step's drafter
+     * runs, so a count never outlives its proposal. */
+    void            draft_conf_begin();
+    void            set_draft_conf(uint64_t id, int n, bool replace);
     const RadBatch* step_next();
     const RadBatch* step_next_locked();
     /* Whether the step just issued likely ends every request it carries; step_next_locked then
@@ -610,8 +623,13 @@ private:
      * Every site that caps a proposal applies it: step(), set_draft(), expect_draft() and the
      * rounds in serial_begin(). With the policy off it is next_depth(). */
     int draft_cap(SchedReq& s) const {
-        return draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+        const int w = draft_.adaptive() ? draft_.window_for(s.adapt) : draft_.next_depth();
+        if (conf_gen_ == 0 || s.conf_gen != conf_gen_ || s.conf_n < 0) return w;
+        if (s.conf_rep) return s.conf_n < draft_.next_depth() ? s.conf_n : draft_.next_depth();
+        return s.conf_n < w ? s.conf_n : w;
     }
+    /* The confidence gate's generation (set_draft_conf); 0 before the first. */
+    uint32_t conf_gen_ = 0;
 
     /* The step's head depth D is chosen once per cycle by draft_cycle(), the first thing step()
      * and promote_next() do. A proposal passes four sites that must agree on it: the verifying

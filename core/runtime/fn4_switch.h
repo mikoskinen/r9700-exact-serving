@@ -35,6 +35,21 @@
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
  *                   since haz_mark marks the records at recording. RADIANCE_AQL_ACQ=none stays start-time only.
  *
+ *   dspark_conf     engine (ds41-acc, lever C1): what a chain block drafter's confidence plane does
+ *                   (rad_drafter_confidence; deepseek41 with RADIANCE_DS41_DSPARK_CONF): 0 nothing (the plugin
+ *                   issues no head, the engine reads nothing: today's passes); 1 the reference rule -- each
+ *                   sequence verifies the longest prefix of its proposal whose sigmoid(logit) >= 0.5, in place
+ *                   of the adaptive window's stop; 5..95 the same at threshold v / 100; 101, 105..195 the same
+ *                   rule capped by the window (min of the two; 101 = 0.5); 2 observe -- the head runs and its
+ *                   calibration is counted (/stats draft_conf), nothing is cut. A gate waits for the query
+ *                   pass before the step issued ahead is built (the cut is a row count). Exact: it changes how
+ *                   many drafts a verify carries, never a proposal or an emitted token. Nonzero is refused
+ *                   where no confidence plane is declared.
+ *   dspark_alt      engine (ds41-acc, lever T1): 1 the drafter's alternative branches (rad_drafter_alternatives;
+ *                   deepseek41 with RADIANCE_DS41_DSPARK_ALT) are computed and compared with the tokens the
+ *                   target emits -- a shadow of a tree that branches at the first draft, counted under
+ *                   /stats draft_conf.shadow, never verified; 0 nothing. 1 refused where none is declared.
+ *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
  *
@@ -54,7 +69,7 @@
 namespace rad {
 namespace fn4 {
 
-enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kSwitches };
+enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDsparkConf, kDsparkAlt, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
@@ -69,6 +84,13 @@ bool aql_acq_none();
 void draft_register(bool capable, bool adaptive);
 /* The scheduler thread, after it applied a draft_adaptive change: the window the scheduler now runs. */
 void note_draft_adaptive(bool adaptive);
+/* The engine, at its init: whether its drafter declared a confidence plane / alternative branches, and the
+ * switches' values at start (0 when not capable). */
+void dspark_register(bool conf_capable, bool alt_capable, int conf_start, int alt_start);
+/* Whether `v` is a dspark_conf value (see above). */
+bool dspark_conf_value_ok(int v);
+/* The applied value of a core switch without the lock (the step path reads it each step); -1 unregistered. */
+int  get(int i);
 
 /* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. */
 bool check(const std::string& name, int value, std::string* err);

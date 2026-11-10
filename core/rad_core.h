@@ -438,6 +438,14 @@ public:
      * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
     bool           drafter_tree = false;
     rad_buf        drafter_parents = 0;
+    /* A chain block drafter's confidence plane (rad_drafter_confidence), f32 at `drafter_conf_pitch`
+     * a sequence, and its alternative branches (rad_drafter_alternatives), i32, `drafter_n_alt`
+     * branches of `drafter_alt_pitch` a sequence. 0 for a drafter that declared none. */
+    rad_buf        drafter_conf = 0;
+    int64_t        drafter_conf_pitch = 0;
+    rad_buf        drafter_alt = 0;
+    int64_t        drafter_n_alt = 0;
+    int64_t        drafter_alt_pitch = 0;
 
     /* The declared media encoder (rad_declare_encoder). `modalities == 0` when none: every
      * text-only program, and every deployment with RadBuildCtx::max_enc_patches 0.

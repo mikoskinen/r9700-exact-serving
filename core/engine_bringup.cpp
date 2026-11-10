@@ -1316,6 +1316,13 @@ int Engine::declare() {
         /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
         draft_tree_ = cfg_.n_spec > 0 && cfg_.spec_ngram <= 0 && pb.tree_pays != 0;
+        if (draft_tree_ && std::getenv("RADIANCE_DEBUG_DRAFT_CONF")) {
+            /* ds41-acc's test source of confidence logits (Engine::conf_gate) cuts a chain. */
+            draft_tree_ = false;
+            const char* why = "RADIANCE_DEBUG_DRAFT_CONF cuts a chain's proposals";
+            RAD_INFO("draft trees: not asked -- %s", why);
+            decide("draft trees", "not asked", why);
+        }
         if (draft_tree_ && !cfg_.debug_draft_oracle.empty()) {
             /* --debug-draft-oracle replaces a head's proposal with a chain of fixed ids
              * (Scheduler::set_draft) and issues no step ahead (Engine::step_loop), which a tree
@@ -1594,6 +1601,25 @@ int Engine::declare() {
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
+    /* ds41-acc: a chain block drafter's confidence plane and alternative branches
+     * (rad_drafter_confidence / rad_drafter_alternatives), read on rank 0 (step_state_init). */
+    {
+        const bool chain = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && !tree_;
+        conf_buf_   = chain ? p0.drafter_conf : 0;
+        conf_pitch_ = conf_buf_ ? p0.drafter_conf_pitch : 0;
+        alt_buf_    = chain ? p0.drafter_alt : 0;
+        n_alt_      = alt_buf_ ? p0.drafter_n_alt : 0;
+        alt_pitch_  = alt_buf_ ? p0.drafter_alt_pitch : 0;
+        /* A test source of logits for a drafter that declares no plane: RADIANCE_DEBUG_DRAFT_CONF
+         * (any value) gives every proposal a hashed logit on the host, so the gate's path -- the wait
+         * before the step issued ahead, the cut, the publish -- runs on any chain block drafter. */
+        conf_dbg_ = chain && !conf_buf_ && std::getenv("RADIANCE_DEBUG_DRAFT_CONF") != nullptr;
+        if (conf_dbg_) {
+            conf_pitch_ = drafter_.depth;
+            RAD_WARN("RADIANCE_DEBUG_DRAFT_CONF: drafter '%s' proposals get hashed confidence logits "
+                     "(a test of the dspark_conf gate's path, not a confidence head)", drafter_.name);
+        }
+    }
     /* --draft-short-from auto: a chain keeps its own block, a tree runs its short block from two
      * decoding sequences on. Its nodes are verify rows every drafting sequence pays for, which a
      * wide tree's extra nodes repay at one sequence and not at many. */

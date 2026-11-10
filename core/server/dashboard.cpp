@@ -14,6 +14,7 @@
  */
 #include "server.h"
 #include "../runtime/fn4_switch.h"
+#include "../sched/draft_conf.h"
 #include "oai.h"
 
 #include "rad_internal.h"
@@ -407,6 +408,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             pos.push_back(std::move(p));
         }
         o["draft_positions"] = std::move(pos);
+        /* ds41-acc: the confidence gate's counts and calibration, and the shadow tree
+         * (core/sched/draft_conf.h); zeros where the drafter declares neither plane. */
+        o["draft_conf"] = json::parse(dconf::tracker().json(), nullptr, false);
 
         /* Live request table: counters and timestamps. `decode_tps` is the request's own average
          * since its first token. */

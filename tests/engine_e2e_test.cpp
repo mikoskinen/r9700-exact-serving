@@ -2182,6 +2182,95 @@ TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text)
     CHECK(has(s.output(), "draft trees: not asked"));
 }
 
+/* ds41-acc's confidence gate (dspark_conf; core/sched/draft_conf.h) on DFlash2's block head, with
+ * the test source of logits (RADIANCE_DEBUG_DRAFT_CONF: a hashed logit a proposal, so the gate cuts
+ * some sequences to nothing, some to a prefix, some not at all): the gate waits for the query pass
+ * before the step issued ahead is built and every site that caps a proposal takes its count. The
+ * greedy text must stay the plain run's alone and with four sequences in flight, under the
+ * reference rule, a threshold capped by the adaptive window and the observe mode; the counts must
+ * show cuts of several lengths; dspark_alt is refused where no branches are declared. */
+TEST(the_confidence_gate_cuts_a_block_heads_chain_and_keeps_the_plain_text) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(211 + i, 90 + 23 * i));
+    std::vector<std::vector<int32_t>> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        for (const auto& p : prompts) plain.push_back(tokens_of(post(s.port, "/completion", completion(p, 40))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache", "--max-num-seqs", "4" },
+                    { "RADIANCE_DEBUG_DRAFT_CONF=1", "RADIANCE_FN4_DSPARK_CONF=1" }));
+    auto fn4get = [&]() {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    auto stats = [&]() {
+        Call c;
+        std::string out;
+        if (!c.send(s.port, "GET", "/stats", "") || c.read(&out) != 200) return json();
+        return json::parse(out, nullptr, false);
+    };
+    auto same = [&](const char* what) {
+        const std::vector<int32_t> t = tokens_of(post(s.port, "/completion", completion(prompts[0], 40)));
+        if (t != plain[0]) fprintf(stderr, "    %s\n    plain %s\n    gated %s\n", what, show(plain[0]).c_str(), show(t).c_str());
+        CHECK(t == plain[0]);
+    };
+    CHECK_EQ(fn4get()["switches"].value("dspark_conf", -9), 1);
+    same("dspark_conf 1, one sequence");
+    /* four in flight: each row cut on its own */
+    {
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 40).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+            if (t != plain[(size_t)i])
+                fprintf(stderr, "    gate, four in flight, prompt %d\n    plain %s\n    gated %s\n", i,
+                        show(plain[(size_t)i]).c_str(), show(t).c_str());
+            CHECK(t == plain[(size_t)i]);
+        }
+    }
+    const json g1 = stats()["draft_conf"]["conf"];
+    const int64_t cuts1 = g1.value("cuts", (int64_t)0);
+    int lengths = 0;
+    for (const auto& h : g1["cut_hist"]) lengths += h.get<int64_t>() > 0;
+    fprintf(stderr, "    gate: %lld cuts, histogram %s\n", (long long)cuts1, g1["cut_hist"].dump().c_str());
+    CHECK(cuts1 > 0);
+    CHECK(lengths >= 3);
+    /* the rule capped by the adaptive window, at 0.6 */
+    int st = 0;
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 160 }, { "draft_adaptive", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    same("dspark_conf 160, adaptive");
+    CHECK_EQ(fn4get()["switches"].value("dspark_conf", -9), 160);
+    /* observe: logits counted, nothing cut */
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 2 }, { "draft_adaptive", -1 } }, &st);
+    CHECK_EQ(st, 200);
+    const int64_t cuts2 = stats()["draft_conf"]["conf"].value("cuts", (int64_t)0);
+    same("dspark_conf 2 (observe)");
+    const json g3 = stats()["draft_conf"]["conf"];
+    CHECK_EQ(g3.value("cuts", (int64_t)-1), cuts2);
+    CHECK(g3["calib"].size() >= 2);
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 0 } }, &st);
+    CHECK_EQ(st, 200);
+    same("dspark_conf 0");
+    /* refused: a value outside the set, and branches the drafter does not declare */
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 3 } }, &st);
+    CHECK_EQ(st, 400);
+    (void)post(s.port, "/admin/fn4", json{ { "dspark_alt", 1 } }, &st);
+    CHECK_EQ(st, 400);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(has(s.output(), "draft trees: not asked -- RADIANCE_DEBUG_DRAFT_CONF"));
+    CHECK(has(s.output(), "hashed confidence logits"));
+}
+
 /* Prompt lookup alone on a container that carries a draft head (DFlash2 here; DSpark on
  * deepseek41): --spec-ngram K leaves the head out -- the plugin is told (RadBuildCtx::
  * draft_head_off) and declares none of it, so the serve declares exactly the weights a plain one

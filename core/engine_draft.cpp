@@ -10,6 +10,8 @@
 #include "sched/mtp_couple_bind.h"
 #include "sched/mtp_couple_plan.h"
 #include "sched/scheduler.h"
+#include "sched/draft_conf.h"
+#include "runtime/fn4_switch.h"
 #include "device/device.h"
 
 #include <algorithm>
@@ -121,6 +123,28 @@ int Engine::step_state_init() {
                      drafter_.depth);
     }
 
+    /* ds41-acc: the confidence plane and the alternative branches, pinned beside the slots. Both
+     * switches start off unless RADIANCE_FN4_DSPARK_CONF / RADIANCE_FN4_DSPARK_ALT say otherwise. */
+    if (conf_buf_ || alt_buf_ || conf_dbg_) {
+        if (conf_buf_ || conf_dbg_)
+            conf_host_ = static_cast<float*>(rad_dev_alloc(n_slot * conf_pitch_ * 4, RAD_MEM_HOST_PINNED));
+        if (alt_buf_)
+            alt_host_ = static_cast<int32_t*>(rad_dev_alloc(n_slot * n_alt_ * alt_pitch_ * 4, RAD_MEM_HOST_PINNED));
+        if (((conf_buf_ || conf_dbg_) && !conf_host_) || (alt_buf_ && !alt_host_)) return RAD_E_NOMEM;
+        RAD_TRY(rad_event_create_as(&conf_ev_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+        auto env = [](const char* k) { const char* v = std::getenv(k); return v && *v ? std::atoi(v) : 0; };
+        const int c0 = env("RADIANCE_FN4_DSPARK_CONF"), a0 = env("RADIANCE_FN4_DSPARK_ALT");
+        fn4::dspark_register(conf_buf_ != 0 || conf_dbg_, alt_buf_ != 0, c0, a0);
+        RAD_INFO("drafter '%s': %s%s%s; switches dspark_conf %d, dspark_alt %d (POST /admin/fn4)", drafter_.name,
+                 conf_buf_ || conf_dbg_ ? "a confidence plane (the dspark_conf gate verifies the longest confident prefix)" : "",
+                 (conf_buf_ || conf_dbg_) && alt_buf_ ? ", " : "",
+                 alt_buf_ ? fmt("%lld alternative branch(es) of %lld (the dspark_alt shadow tree, measured only)",
+                                (long long)n_alt_, (long long)alt_pitch_).c_str() : "",
+                 fn4::get(fn4::kDsparkConf), fn4::get(fn4::kDsparkAlt));
+    } else {
+        fn4::dspark_register(false, false, 0, 0);
+    }
+
     RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
     return RAD_OK;
@@ -144,6 +168,12 @@ void Engine::step_state_fini() {
     step_end_ = nullptr;
     if (tok_end_) rad_event_destroy(tok_end_);
     tok_end_ = nullptr;
+    if (conf_host_) rad_dev_free(conf_host_, RAD_MEM_HOST_PINNED);
+    if (alt_host_) rad_dev_free(alt_host_, RAD_MEM_HOST_PINNED);
+    conf_host_ = nullptr;
+    alt_host_ = nullptr;
+    if (conf_ev_) rad_event_destroy(conf_ev_);
+    conf_ev_ = nullptr;
 }
 
 /* ------------------------------------------------------------------ the serial driver
@@ -574,7 +604,13 @@ void Engine::block_shape(int* block, int* steps) {
 
 int Engine::issue_block_drafter(int step, StepOut& so) {
     block_rows_ = 0;
+    conf_val_ = 0;
+    alt_on_ = false;
+    conf_cut_done_ = false;
+    dconf_step_ = step;
     if (!block_drafting()) return RAD_OK;
+    /* The gate's counts belong to the proposal they cut: a new drafter cycle forgets them. */
+    if (conf_buf_ || conf_dbg_) sched_.draft_conf_begin();
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     /* A tree's accepted path into place in the trunk's cache, against the same build (the step
@@ -627,8 +663,70 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     }
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
                              (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
+    /* ds41-acc: the pass's confidence logits and branches, rows in block_row_'s order, read as the
+     * plugin issued them (the switches move only at a step release, after this). A gate records
+     * the event the next verify's build waits on (conf_gate). */
+    conf_val_ = conf_buf_ || conf_dbg_ ? std::max(0, fn4::get(fn4::kDsparkConf)) : 0;
+    alt_on_   = alt_buf_ && fn4::get(fn4::kDsparkAlt) == 1;
+    if (conf_val_ && conf_buf_) {
+        const void* src = r0.ctx.buf_ptr(conf_buf_);
+        if (!src) return RAD_E_STATE;
+        RAD_TRY(rad_memcpy_async(conf_host_, src, (int64_t)n * conf_pitch_ * 4, r0.ctx.stream()));
+    }
+    if (alt_on_) {
+        const void* src = r0.ctx.buf_ptr(alt_buf_);
+        if (!src) return RAD_E_STATE;
+        RAD_TRY(rad_memcpy_async(alt_host_, src, (int64_t)n * n_alt_ * alt_pitch_ * 4, r0.ctx.stream()));
+    }
+    if (conf_val_ && dconf::policy_of(conf_val_).mode == 1) RAD_TRY(rad_event_record(conf_ev_, r0.ctx.stream()));
     block_rows_ = n;
     return RAD_OK;
+}
+
+/* ds41-acc: the confidence gate, once a step, before the next verify is built (issue_ahead, or
+ * finish_block_drafter when no step is issued ahead): each drafting row verifies the longest prefix
+ * of its proposal whose logits clear the threshold (core/sched/draft_conf.h), handed to the scheduler
+ * so every site that caps a proposal applies it (Scheduler::draft_cap). */
+int Engine::conf_gate() {
+    if (conf_cut_done_) return RAD_OK;
+    conf_cut_done_ = true;
+    conf_cut_.assign((size_t)std::max(0, block_rows_), -1);
+    if (!conf_val_ || block_rows_ <= 0) return RAD_OK;
+    const dconf::Policy p = dconf::policy_of(conf_val_);
+    if (p.mode == 1) RAD_TRY(rad_event_sync(conf_ev_));
+    if (conf_dbg_)   /* the test source: a logit in [-3, 3] from (sequence, step, position) */
+        for (int i = 0; i < block_rows_; ++i)
+            for (int64_t j = 0; j < conf_pitch_; ++j) {
+                uint64_t h = block_row_[(size_t)i].seq * 0x9E3779B97F4A7C15ull + (uint64_t)dconf_step_ * 0xBF58476D1CE4E5B9ull +
+                             (uint64_t)j * 0x94D049BB133111EBull;
+                h ^= h >> 31; h *= 0xD6E8FEB86659FD93ull; h ^= h >> 32;
+                conf_host_[(int64_t)i * conf_pitch_ + j] = (float)((int)(h % 601) - 300) / 100.0f;
+            }
+    if (p.mode != 1) return RAD_OK;
+    for (int i = 0; i < block_rows_; ++i) {
+        const int k = dconf::prefix_len(conf_host_ + (int64_t)i * conf_pitch_, block_steps_, p);
+        conf_cut_[(size_t)i] = k;
+        sched_.set_draft_conf(block_row_[(size_t)i].seq, k, p.replace);
+    }
+    return RAD_OK;
+}
+
+/* ds41-acc: the step's verifies against the proposals the tracker holds (calibration, the shadow
+ * tree). A verify emits its accepted drafts, then the target's own token. */
+void Engine::dconf_commit(const StepPlan& plan, const StepOut& so, int step) {
+    if (!conf_buf_ && !alt_buf_ && !conf_dbg_) return;
+    dconf::Tracker& t = dconf::tracker();
+    int32_t em[RAD_SCHED_MAX_SPEC + 1];
+    for (size_t i = 0; i < plan.e.size() && i < so.accepted.size(); ++i) {
+        const StepEntry& e = plan.e[i];
+        if (e.is_prefill || !e.produces_token || so.first_row[i] < 0) continue;
+        const int drafted = e.draft ? std::max(0, std::min<int>(e.n_spec, e.n_draft)) : 0;
+        const int acc = std::max(0, std::min(so.accepted[i], drafted));
+        for (int k = 0; k < acc; ++k) em[k] = e.draft[k];
+        em[acc] = so.token[i];
+        t.verified(e.seq, step, drafted, acc, em, acc + 1);
+    }
+    if ((step & 63) == 0) t.purge(step);
 }
 
 /* After commit: check the host's acceptance against the card's, which positioned the query pass
@@ -654,6 +752,8 @@ int Engine::finish_block_drafter(const StepOut& so) {
     }
     sched_.block_end();
     if (block_rows_ <= 0) return RAD_OK;
+    /* The gate, where no step was issued ahead to apply it (the planes landed with the slots). */
+    RAD_TRY(conf_gate());
 
     Rank& r0 = *ranks_[0];
     const int steps = block_steps_;
@@ -681,7 +781,15 @@ int Engine::finish_block_drafter(const StepOut& so) {
         if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) continue;
         const uint64_t seq = block_row_[(size_t)i].seq;
         const StepSlot& S = slots_host_[block_row_[(size_t)i].card];
-        const int rc = sched_.set_draft(seq, d, steps, tree_ ? S.par : nullptr);
+        /* ds41-acc: the confidence gate's count, as the step issued ahead was built with it. */
+        const int cut = i < (int)conf_cut_.size() ? conf_cut_[(size_t)i] : -1;
+        const int n_pub = cut >= 0 ? std::min(steps, cut) : steps;
+        const int rc = sched_.set_draft(seq, d, n_pub, tree_ ? S.par : nullptr);
+        if (conf_val_ || alt_on_)
+            dconf::tracker().proposed(seq, dconf_step_,
+                                      conf_val_ ? conf_host_ + (int64_t)i * conf_pitch_ : nullptr, steps,
+                                      alt_on_ ? alt_host_ + (int64_t)i * n_alt_ * alt_pitch_ : nullptr,
+                                      (int)n_alt_, (int)alt_pitch_, cut);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
     }

@@ -2055,7 +2055,9 @@ const RadBatch* Scheduler::step() {
             const int cap = draft_.adaptive() ? draft_cap(s) : depth;
             bool ngram = false;
             if (!r.may_speculate) s.n_draft = 0;
-            else if (s.n_draft == 0) {
+            /* A proposal the confidence gate cut to nothing stays empty: the gate said this step
+             * verifies no draft, and a lookup proposal in its place would be another policy. */
+            else if (s.n_draft == 0 && !(conf_gen_ && s.conf_gen == conf_gen_ && s.conf_n == 0)) {
                 /* As the only drafter under the adaptive window, the lookup is the head: its
                  * proposal is cut to the sequence's own window. */
                 int match = -1;
@@ -2527,6 +2529,21 @@ void Scheduler::expect_draft(uint64_t id, int n) {
         if (n > cap) n = cap;
     }
     s.draft_next = n > 0 ? n : 0;
+}
+
+void Scheduler::draft_conf_begin() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (++conf_gen_ == 0) conf_gen_ = 1;
+}
+
+void Scheduler::set_draft_conf(uint64_t id, int n, bool replace) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = by_id_.find(id);
+    if (it == by_id_.end() || conf_gen_ == 0) return;
+    SchedReq& s = *reqs_[(size_t)it->second];
+    s.conf_n   = n < 0 ? 0 : n;
+    s.conf_gen = conf_gen_;
+    s.conf_rep = replace;
 }
 
 const RadBatch* Scheduler::step_next() {

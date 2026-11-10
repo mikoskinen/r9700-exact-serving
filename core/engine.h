@@ -536,6 +536,24 @@ private:
     bool    tree_ = false;
     rad_buf tree_parents_ = 0;
     int     tree_compact(int rows);
+    /* ds41-acc: a chain block drafter's confidence plane and alternative branches
+     * (rad_drafter_confidence / rad_drafter_alternatives, core/sched/draft_conf.h), rank 0's
+     * handles, copied to the pinned planes behind the query pass while the switches ask for them
+     * (dspark_conf / dspark_alt). A gate (dspark_conf 1, 5..95, 101..195) waits for conf_ev_ before
+     * the next verify is built, once a step (conf_gate), and leaves each block row's count in
+     * conf_cut_ (-1: none); dconf_commit holds the step's verifies to them (draft_conf.h Tracker). */
+    rad_buf  conf_buf_ = 0, alt_buf_ = 0;
+    int64_t  conf_pitch_ = 0, n_alt_ = 0, alt_pitch_ = 0;
+    float*   conf_host_ = nullptr;
+    int32_t* alt_host_ = nullptr;
+    RadEvent conf_ev_ = nullptr;
+    int      conf_val_ = 0;
+    bool     alt_on_ = false, conf_cut_done_ = false;
+    bool     conf_dbg_ = false;   /* RADIANCE_DEBUG_DRAFT_CONF: hashed logits on the host (tests) */
+    int      dconf_step_ = 0;
+    std::vector<int32_t> conf_cut_;
+    int  conf_gate();
+    void dconf_commit(const StepPlan& plan, const StepOut& so, int step);
     int  issue_block_drafter(int step, StepOut& so);
     int  finish_block_drafter(const StepOut& so);
     /* The block and proposal count this step's query pass runs at: the drafter's own, or its short

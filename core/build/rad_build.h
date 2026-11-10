@@ -133,6 +133,8 @@ public:
                            int64_t from_hi, int64_t to_lo);
     int         drafter_short_block(int64_t block);
     int         drafter_tree(rad_buf parents);
+    int         drafter_confidence(rad_buf conf, int64_t pitch);
+    int         drafter_alternatives(rad_buf alt, int64_t n_alt, int64_t pitch);
     int         declare_encoder(const RadEncoderDecl* d);
     int         declare_generator(const RadGeneratorDecl* d);
     int         declare_audio_generator(const RadAudioGenDecl* d);

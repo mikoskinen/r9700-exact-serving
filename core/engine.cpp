@@ -758,8 +758,13 @@ int Engine::issue_ahead(const RadBatch** out) {
     if (!pipelining_) return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
-    for (int i = 0; i < block_rows_; ++i)
-        sched_.expect_draft(block_row_[(size_t)i].seq, block_steps_);
+    /* ds41-acc: a confidence gate waits for the query pass here, so the step built next verifies
+     * each row's confident prefix (conf_gate); without one nothing waits. */
+    if (block_rows_ > 0) RAD_TRY(conf_gate());
+    for (int i = 0; i < block_rows_; ++i) {
+        const int cut = (size_t)i < conf_cut_.size() ? conf_cut_[(size_t)i] : -1;
+        sched_.expect_draft(block_row_[(size_t)i].seq, cut >= 0 ? std::min(block_steps_, cut) : block_steps_);
+    }
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -1173,6 +1178,8 @@ int Engine::step_loop() {
         st = sched_.commit(res);
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        /* ds41-acc: the verifies against the confidence plane and the shadow tree's branches. */
+        dconf_commit(plan, so, b->step);
         /* The step has drained, so its counters are readable. A chunk that produced no row did not
          * wait, so its copy is read on a later step; a finished prompt or request always produced
          * a row. */
