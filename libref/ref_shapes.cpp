@@ -1930,11 +1930,16 @@ int ref_attn_sparse_sink_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     if (lf && std::strcmp(lf, "nvfp4") && std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
     const int64_t cslots = nv ? (Dm / 2 + Dm / 16 + 15) / 16 * 16 / 2 : Dm;
     if (ratio > 0 && cslots % ratio) return RAD_E_UNSUPPORTED;
+    /* window_format fp8_e4m3: a window key packed, (Dm + Dm/32) bytes rounded up to 16 */
+    const char* wf = gs(p, n_p, "window_format");
+    const bool w8 = wf && !std::strcmp(wf, "fp8_e4m3");
+    if (wf && !w8 && std::strcmp(wf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t wslots = w8 ? (Dm + Dm / 32 + 15) / 16 * 16 / 2 : Dm;
     /* One sequence; window blocks of 4 slots covering every position a row may hold. */
     const int64_t bs = 4, nb = (M + bs - 1) / bs + 1, ncb = M + 1;
     Opd o;
     o.t(D, { M, H * Dm });                              /* q */
-    o.t(D, { nb, 1, bs, Dm });                          /* window cache */
+    o.t(D, { nb, 1, bs, wslots });                      /* window cache */
     o.t_idx({ 1, nb }, nb, -1, 0);                      /* window block table */
     o.t_idx({ 1 }, M + 1, -1, 0);                       /* window tokens held from the table's start */
     if (ratio > 0) {
@@ -2018,6 +2023,18 @@ int ref_entry_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     o.t_idx({ M }, M, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE); /* page: distinct blocks */
     o.t(D, { M, 1, bs, slots / bs });                   /* cache */
     return o.finish("entry_store", operand, out);
+}
+
+int ref_window_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), bs = gi(p, n_p, "block_size", 0);
+    const char* f = gs(p, n_p, "format");
+    if (M <= 0 || n < 32 || n % 32 || bs < 1 || !f || std::strcmp(f, "fp8_e4m3")) return RAD_E_UNSUPPORTED;
+    const int64_t nb = (M + bs - 1) / bs + 2, slot = (n + n / 32 + 15) / 16 * 16 / 2;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });                      /* x */
+    o.t_idx({ M }, nb * bs, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* slot_mapping: distinct slots */
+    o.t((uint32_t)RAD_BF16, { nb, 1, bs, slot });       /* kv_cache */
+    return o.finish("window_store", operand, out);
 }
 
 #ifdef REF_HAVE_GGML

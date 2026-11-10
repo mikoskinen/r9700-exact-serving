@@ -990,12 +990,13 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
 | `rmsnorm_rope_roundtrip_kv_store` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `block_size` `kv_dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions`, `slot_mapping`, `kv_cache`:inout (device-only: rmsnorm_rope_roundtrip, then kv_store of y's row as one entry [K = y[0, n/2) \| V = y[n/2, n)] of a [n_blocks, 1, block_size, n] cache) |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
-| `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
+| `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt `window_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
 | `attn_sparse_sink_rope_roundtrip` | `attn_sparse_sink`'s, then `rot` `off` `mode` `inverse` `block` `format`:str `block_scale`:str | `attn_sparse_sink`'s operands, then `cos_sin` (device-only: attn_sparse_sink, then rope_rows_roundtrip over `out` with n_head = heads, head_dim = dim, scale = block_scale, at the attention's positions) |
 | `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
 | `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
 | `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
 | `entry_store` | `M`(range) `n` `block_size` `dtype` `format`/opt | `x`, `page`, `cache`:inout |
+| `window_store` | `M`(range) `n` `block_size` `format`:str `dtype` | `x`, `slot_mapping`, `kv_cache`:inout (the fp8 window slot: e4m3 codes and a scale byte a block of 32, kv_store's slot rule) |
 | `token_map` | `M`(range) `n_vocab` | `ids`, `table`w → `mapped` |
 | `stream_gate_add` | `M`(range) `n` `hc` `eps`:f64 `gate_eps`:f64 `dtype` | `h`, `k`, `v`, `w`w → `out` |
 | `position_scale` | `M`(range) `n` `original` `beta`:f64 `dtype` | `x`:inout, `positions` |
@@ -1077,6 +1078,24 @@ own scale is among them) -- and only a block no candidate reproduces takes the r
 `attn_sparse_sink` `latent_format` `nvfp4` reads such a compressed cache (`window` a multiple of 32; the
 window cache stays bf16): a value is code times scale in f32, whose bf16 is the stored one, so every
 output is the bf16 cache's, bit for bit, at 288 bytes an entry instead of 1024.
+
+**Packed window keys (fp8 window slot).** `window_store` `format` `fp8_e4m3` stores a key row of `n` values
+(`n` a multiple of 32) at its slot (`slot_mapping`, `kv_store`'s rule: a negative slot or one past the cache
+stores nothing) as `n` e4m3 codes (value `d` at byte `d`), then `n/32` scale bytes (block `j` = values
+`[32 j, 32 j + 32)` at byte `n + j`), then zeros to a multiple of 16 -- 528 bytes (264 bf16 slots) for
+DeepSeek-V4's 512-value latent. A value is `e4m3(code) * f32(e << 23)` (scale `2^(e-127)`) in f32. A block's
+`k` (`e = k + 127`) is 120 when its amax (a NaN as 0) is inf, 0 when it is 0, else the least `k` with
+`amax <= 448 * 2^k` (`amax = 1.m * 2^E`: `E - 8`, or `E - 7` when `1.m > 1.75`), at least -126; each code is
+`fp8(v * 2^-k)` (round to nearest even, saturating at 448, a NaN to `0x7f | sign`). DeepSeek-V4's window key is
+`quant_roundtrip` (`fp8_e4m3`, `ue8m0`, block 32) output over the whole row (the rope part included), every
+block `c_i * 2^K` with `c_i` e4m3 values and one `K` in [-22, 120] (an inf only at `K` = 120 with `c >= 256`, a
+NaN only where an input was one); the least `k` above is at most `K`, and every `c_i * 2^K` is again an e4m3
+value times `2^k` (a finer grid, still at most 448), so the codes are exact and every decoded value is the
+stored bf16's value -- a NaN decodes to a NaN. `rmsnorm_rope_roundtrip_kv_store` `kv_dtype` `fp8_e4m3` stores
+`y`'s row into such a slot the same way (the same bytes), and `attn_sparse_sink` `window_format` `fp8_e4m3`
+reads such a window cache (`[blocks, 1, bs, 264]`; with `ratio > 0` the `window` a multiple of 32): its decode
+band and scalar kernel take each value as that f32, WMMA as its bf16, so every output is the bf16 window's,
+bit for bit, at 528 bytes a key instead of 1024. libref serves both; libavx refuses `window_format`.
 
 **`attn_dense`** serves vision towers and encoders: nothing paged, `cu_seqlens` bounding one image
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a
@@ -1262,7 +1281,7 @@ stores in `y` is also stored at the row's slot, as `kv_store` would copy it) and
 rows, as the decode kernel with the inverse rope and the round trip in its epilogue (every other pass
 as the two ops' launches). Both are bit-identical to their chains; DeepSeek-V4.1 declares them beside
 the chains under RADIANCE_DS41_KVFOLD / RADIANCE_DS41_OFOLD and picks per step (the ds41_kvfold /
-ds41_ofold switches).
+ds41_ofold switches). `kv_dtype` `fp8_e4m3` takes `window_store`'s fp8 window slot (above) as the cache.
 
 | op | params | operands |
 |---|---|---|

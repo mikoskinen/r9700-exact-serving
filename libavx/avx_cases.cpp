@@ -1328,6 +1328,10 @@ std::vector<Case> build_cases() {
                              HI("width", 13), HF("wscale", 0.25), HS("dtype", dt),
                              HI("row_part", 2), HI("block", 3) });
         add("entry_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("dtype", dt) });
+        /* the fp8 window slot (lever KVWIN): bf16 rows only */
+        if (!std::strcmp(dt, "bf16"))
+            add("window_store", { HI("M", 5), HI("n", 128), HI("block_size", 4), HS("format", "fp8_e4m3"),
+                                  HS("dtype", dt) });
         add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
                                  HF("gate_eps", 1e-6), HS("dtype", dt) });
         for (const char* ty : { "q8_0", "q6_K", "iq4_nl" }) {

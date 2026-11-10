@@ -103,6 +103,30 @@ uint8_t nv4_pack16(const uint16_t* x, unsigned* codes) {
     return sb;
 }
 
+/* The fp8 window slot (window_store format fp8_e4m3, attn_sparse_sink window_format fp8_e4m3; lever KVWIN):
+ * n e4m3 codes (value d at byte d), n/32 scale bytes (block d/32 at byte n + d/32), zeros to a multiple of
+ * 16. A value is e4m3(code) x f32(e << 23) in f32. */
+int64_t w8_bytes(int64_t n) { return (n + n / 32 + 15) / 16 * 16; }
+float f32_bits(uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+float w8_value(const uint8_t* e, int64_t n, int64_t d) {
+    return fp8e4m3_lut(e[d]) * f32_bits((uint32_t)e[n + d / 32] << 23);
+}
+/* A block's scale byte from its amax (|v|, a NaN as 0, inf kept): k = 120 for inf, 0 for 0, else the least
+ * k with amax <= 448 2^k, at least -126; e = k + 127 (r4d_ds41_qrt.h ds_w8_scale). */
+uint8_t w8_scale(float am) {
+    uint32_t u;
+    std::memcpy(&u, &am, 4);
+    if (u >= 0x7f800000u) return 247;
+    if (u == 0u) return 127;
+    int k = u < 0x00800000u ? -126 : (int)(u >> 23) - 135 + ((u & 0x7fffffu) > 0x600000u ? 1 : 0);
+    k = std::max(k, -126);
+    return (uint8_t)(k + 127);
+}
+
 /* Value d of a packed entry `e` of n values: its code times its block's scale, as f32 (a code times
  * a power of two at or above 2^-126 is exact in f32, and in bf16). */
 float mx4_value(const uint8_t* e, int64_t n, int64_t d) {
@@ -224,13 +248,18 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
     const bool cnv = comp && !std::strcmp(lf, "nvfp4");
     if (std::strcmp(lf, "nvfp4") && std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
     const int64_t cslots = cnv ? nv4_bytes(D) / 2 : D;
+    /* window_format fp8_e4m3: the window keys packed (w8_bytes(D) bytes in bf16 slots) */
+    const char* wf = p_str(a, "window_format", "bf16");
+    const bool wf8 = !std::strcmp(wf, "fp8_e4m3");
+    if (!wf8 && std::strcmp(wf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t wslots = wf8 ? w8_bytes(D) / 2 : D;
     if (H < 1 || D < 2 || D > 4096 || win < 1 || ratio < 0 || topk < 0 || !std::isfinite(scale) ||
         scale <= 0 || (comp && (!cc || !cbt || !sel || topk < 1 || D % ratio)))
         return RAD_E_SHAPE;
     if (!q.data || !wc.data || !wbt.data || !wused.data || !pos.data || !cu.data || !sink.data || !out.data ||
         q.rank != 2 || q.shape[0] < 1 || q.shape[1] != H * D || out.rank != 2 ||
         out.shape[0] != q.shape[0] || out.shape[1] != H * D || wc.rank != 4 || wc.shape[1] != 1 ||
-        wc.shape[3] != D || wbt.rank != 2 || numel(&pos) != q.shape[0] || numel(&sink) != H ||
+        wc.shape[3] != wslots || wbt.rank != 2 || numel(&pos) != q.shape[0] || numel(&sink) != H ||
         sink.dtype != RAD_F32 || numel(&cu) < 2 || numel(&wused) < numel(&cu) - 1)
         return RAD_E_SHAPE;
     const int64_t cbs = comp ? cc->shape[2] : 0;
@@ -239,6 +268,7 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
                  sel->shape[1] != topk || cbt->shape[0] != wbt.shape[0]))
         return RAD_E_SHAPE;
     if (cnv && (cc->dtype != RAD_BF16 || !rad_tensor_is_contiguous(cc))) return RAD_E_SHAPE;
+    if (wf8 && (wc.dtype != RAD_BF16 || !rad_tensor_is_contiguous(&wc) || D % 32)) return RAD_E_SHAPE;
     const int64_t M = q.shape[0], S = numel(&cu) - 1, bs = wc.shape[2];
     const int64_t nkeys = win + (comp ? topk : 0);
 #pragma omp parallel for schedule(dynamic)
@@ -257,7 +287,7 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
                                                                (r / bs) * laststride(&wbt));
             if (blk < 0 || blk >= wc.shape[0]) continue;
             kt[(size_t)i] = &wc;
-            ko[(size_t)i] = ((blk * bs) + r % bs) * D;
+            ko[(size_t)i] = ((blk * bs) + r % bs) * wslots;
         }
         for (int64_t t = 0; comp && t < topk; ++t) {
             const int64_t c = ld_int(sel->dtype, sel->data, rowoff(sel, m, topk) + t * laststride(sel));
@@ -270,6 +300,7 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
         }
         /* a key's value d: the bf16 caches' element, or (packed) the entry's decoded value */
         auto kval = [&](int64_t k, int64_t d) {
+            if (wf8 && k < win) return w8_value((const uint8_t*)wc.data + 2 * ko[(size_t)k], D, d);
             return cnv && k >= win ? nv4_value((const uint8_t*)cc->data + 2 * ko[(size_t)k], D, d)
                                    : ldt(kt[(size_t)k], ko[(size_t)k] + d);
         };
@@ -487,6 +518,41 @@ int ref_index_topk(const RadArgs* a, RadStream) {
         for (int64_t t = 0; t < topk; ++t)
             st_int(sel.dtype, sel.data, rowoff(&sel, m, topk) + t * laststride(&sel),
                    t < (int64_t)pick.size() ? pick[(size_t)t] : -1);
+    }
+    return RAD_OK;
+}
+
+/* x[m] (n values, n a multiple of 32) packed into the fp8 window slot at slot_mapping[m] of a paged cache
+ * [n_blocks, 1, block_size, w8_bytes(n) / 2] (bf16 slots holding the bytes): kv_store's slot rule, a negative
+ * slot or one past the cache stores nothing. Per block of 32: the scale byte w8_scale(amax), then each code
+ * fp8(v x 2^-k) (RNE, saturating at 448, a NaN to 0x7f | sign). Lever KVWIN (DeepSeek-V4.1's window key). */
+int ref_window_store(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &sm = a->t[1], &kc = a->t[2];
+    const int64_t n = p_int(a, "n", 0), bs = p_int(a, "block_size", 0);
+    if (std::strcmp(p_str(a, "format", ""), "fp8_e4m3")) return RAD_E_UNSUPPORTED;
+    const int64_t bytes = w8_bytes(n);
+    if (n < 32 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n || x.dtype != RAD_BF16 ||
+        numel(&sm) < x.shape[0] || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[2] != bs || kc.dtype != RAD_BF16 ||
+        kc.shape[3] * 2 != bytes || !rad_tensor_is_contiguous(&kc))
+        return RAD_E_SHAPE;
+    for (int64_t m = 0; m < x.shape[0]; ++m) {
+        const int64_t s = ld_int(sm.dtype, sm.data, offlin(&sm, m));
+        if (s < 0 || s / bs >= kc.shape[0]) continue;
+        const int64_t xb = rowoff(&x, m, n), xs = laststride(&x);
+        uint8_t* e = (uint8_t*)kc.data + s * bytes;
+        std::memset(e, 0, (size_t)bytes);
+        for (int64_t b = 0; b < n / 32; ++b) {
+            float am = 0.0f;
+            for (int64_t i = 0; i < 32; ++i) {
+                const float v = std::fabs(ldt(&x, xb + (b * 32 + i) * xs));
+                if (v > am) am = v;   /* a NaN never wins */
+            }
+            const uint8_t sc = w8_scale(am);
+            const float inv = f32_bits((uint32_t)(254 - sc) << 23);
+            for (int64_t i = 0; i < 32; ++i) e[b * 32 + i] = f32_to_fp8e4m3(ldt(&x, xb + (b * 32 + i) * xs) * inv);
+            e[n + b] = sc;
+        }
     }
     return RAD_OK;
 }

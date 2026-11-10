@@ -220,6 +220,9 @@ AVX_KERNEL(attn_sparse_sink) {
     /* latent_format nvfp4 (packed compressed entries) is libr4d's and libref's */
     if (const char* lf = rad_args_gets(a, "latent_format"))
         if (std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
+    /* window_format fp8_e4m3 (the packed window keys, lever KVWIN) likewise */
+    if (const char* wf = rad_args_gets(a, "window_format"))
+        if (std::strcmp(wf, "bf16")) return RAD_E_UNSUPPORTED;
     const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2], &wused = a->t[3];
     const RadTensor *cc = a->t[4].data ? &a->t[4] : nullptr, *cbt = a->t[5].data ? &a->t[5] : nullptr;
     const RadTensor* sel = a->t[6].data ? &a->t[6] : nullptr;
@@ -533,6 +536,47 @@ AVX_KERNEL(entry_store) {
         float* row = scratch_f32((size_t)n);
         const float* in = in_row(&x, rowoff(&x, w, n), n, row);
         row_from_f32(cache.dtype, in, (void*)byte_at(cache.data, cache.dtype, pg * n), n);
+    }
+    return RAD_OK;
+}
+
+/* A key row packed into the fp8 window slot at its slot (libref's window_store, lever KVWIN): n e4m3 codes, n/32
+ * scale bytes, zeros to 16; a block's scale byte from its amax (a NaN as 0): 247 for inf, 127 for 0, else the
+ * least k with amax <= 448 2^k (at least -126) plus 127; each code fp8(v 2^-k). The code is libref's. */
+AVX_KERNEL(window_store) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const char* f = rad_args_gets(a, "format");
+    if (!f || std::strcmp(f, "fp8_e4m3")) return RAD_E_UNSUPPORTED;
+    const RadTensor &x = a->t[0], &sm = a->t[1], &kc = a->t[2];
+    const int64_t n = p_int(a, "n", 0), bs = p_int(a, "block_size", 0), bytes = (n + n / 32 + 15) / 16 * 16;
+    if (n < 32 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n || x.dtype != RAD_BF16 ||
+        numel(&sm) < x.shape[0] || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[2] != bs || kc.dtype != RAD_BF16 ||
+        kc.shape[3] * 2 != bytes || !rad_tensor_is_contiguous(&kc))
+        return RAD_E_SHAPE;
+    for (int64_t m = 0; m < x.shape[0]; ++m) {
+        const int64_t s = ldi(&sm, offlin(&sm, m));
+        if (s < 0 || s / bs >= kc.shape[0]) continue;
+        float* row = scratch_f32((size_t)n);
+        const float* in = in_row(&x, rowoff(&x, m, n), n, row);
+        uint8_t* e = (uint8_t*)kc.data + s * bytes;
+        std::memset(e, 0, (size_t)bytes);
+        for (int64_t b = 0; b < n / 32; ++b) {
+            float am = 0.0f;
+            for (int64_t i = 0; i < 32; ++i) {
+                const float v = std::fabs(in[b * 32 + i]);
+                if (v > am) am = v;
+            }
+            uint32_t u;
+            std::memcpy(&u, &am, 4);
+            int k = u >= 0x7f800000u ? 120 : u == 0u ? 0
+                  : u < 0x00800000u ? -126 : (int)(u >> 23) - 135 + ((u & 0x7fffffu) > 0x600000u ? 1 : 0);
+            k = std::max(k, -126);
+            const uint32_t sc = (uint32_t)(k + 127), ib = (254u - sc) << 23;
+            float inv;
+            std::memcpy(&inv, &ib, 4);
+            for (int64_t i = 0; i < 32; ++i) e[b * 32 + i] = rad_f32_to_fp8e4m3(in[b * 32 + i] * inv);
+            e[n + b] = (uint8_t)sc;
+        }
     }
     return RAD_OK;
 }

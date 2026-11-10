@@ -198,6 +198,7 @@ static inline int64_t ref_keep_words(int64_t width, int64_t block) {
     return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
 }
 int ref_entry_store        (const RadArgs*, RadStream);
+int ref_window_store       (const RadArgs*, RadStream);
 #ifdef REF_HAVE_GGML
 int ref_gemm_nt_ggml       (const RadArgs*, RadStream);
 int ref_moe_gemm_ggml      (const RadArgs*, RadStream);
@@ -507,6 +508,7 @@ REF_SHAPE_FN(ref_index_score);
 REF_SHAPE_FN(ref_index_candidates);
 REF_SHAPE_FN(ref_index_topk);
 REF_SHAPE_FN(ref_entry_store);
+REF_SHAPE_FN(ref_window_store);
 #ifdef REF_HAVE_GGML
 REF_SHAPE_FN(ref_gemm_nt_ggml);
 REF_SHAPE_FN(ref_moe_gemm_ggml);
