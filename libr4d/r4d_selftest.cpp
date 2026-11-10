@@ -20819,7 +20819,7 @@ static void hc_readv_case(const Plugin& pl, int64_t M, bool i8) {
     struct Out { std::vector<uint8_t> x, inj, q, qs, rq, rs, d; int nd = 0; std::vector<const void*> fns; };
     constexpr int kRuns = 5;
     Out out[kRuns];
-    static const int kV[kRuns]    = { 0, 3, 3, 0, 3 };
+    static const int kV[kRuns]    = { 0, 7, 7, 0, 7 };
     static const int kWave[kRuns] = { 1, 1, 1, 0, 0 };
     for (int run = 0; run < kRuns; ++run) {
         pl.readv_hc(kV[run]);
@@ -20858,7 +20858,7 @@ static void hc_readv_case(const Plugin& pl, int64_t M, bool i8) {
         if (out[ra].rs != out[rb].rs)   bad += std::string(" rs") + at;
         if (out[ra].d != out[rb].d)     bad += std::string(" d") + at;
     };
-    cmp(0, 1, " (F1n, hc_readv 3)"); cmp(0, 2, " (F1n, hc_readv 3 again)"); cmp(3, 4, " (hc_readv 3, F1n off)");
+    cmp(0, 1, " (F1n, hc_readv 7)"); cmp(0, 2, " (F1n, hc_readv 7 again)"); cmp(3, 4, " (hc_readv 7, F1n off)");
     /* The forms: hc_readv may only swap kernels, never add or drop a launch. The dispatch log
      * holds the launches made through r4d_emit (the new forms always are). */
     const bool same_n = out[1].nd == out[0].nd && out[2].nd == out[0].nd && out[4].nd == out[3].nd;
@@ -20950,8 +20950,8 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
         if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
     }
     pl.norm_hc_wave(1);
-    double us[4] = { 0, 0, 0, 0 };
-    for (int v = 0; v < 4; ++v) {
+    double us[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (int v : { 0, 1, 2, 3, 7 }) {
         pl.readv_hc(v);
         if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) {
             ok(nm.c_str(), false, fmt("hc_readv %d launch failed", v)); pl.readv_hc(0); pl.norm_hc_wave(0); return;
@@ -20959,12 +20959,12 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
         us[v] = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
     }
     std::printf("hc_read_e4m3 M=%lld %s%s (F1n): stock %.2f us, hc_readv 1 %.2f us (%.3fx), 2 %.2f us (%.3fx), "
-                "3 %.2f us (%.3fx)\n", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm",
-                us[0], us[1], us[0] / us[1], us[2], us[0] / us[2], us[3], us[0] / us[3]);
+                "3 %.2f us (%.3fx), 7 %.2f us (%.3fx)\n", (long long)M, i8 ? "int8" : "E4M3", g_cold > 0 ? " cold" : " warm",
+                us[0], us[1], us[0] / us[1], us[2], us[0] / us[2], us[3], us[0] / us[3], us[7], us[0] / us[7]);
     if (M >= 512 && pl.pf2_stages_hc) {
         static const int kMask[5] = { 1, 3, 7, 15, 31 };
         static const char* const kStage[5] = { "prologue", "down", "reduce", "up-mix", "codes" };
-        for (int v : { 0, 2 }) {
+        for (int v : { 0, 2, 7 }) {
             pl.readv_hc(v);
             double t[5];
             for (int k = 0; k < 5; ++k) {

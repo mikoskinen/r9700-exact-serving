@@ -737,7 +737,7 @@ void r4d_hc_read_norm_wave(int on);
 void r4d_hc_write_vec(int on);
 // Test hook (fn4 hc_readv): faster hc_read forms with the same bytes, a mask -- 1 the decode tiles
 // (pipelined down product; the 32-row tile from 33 rows, split-K unchanged), 2 PF2's down product at
-// 32 rows a workgroup -- overriding RADIANCE_FN4_HC_READV. r4d_selftest compares their bytes.
+// 32 rows a workgroup, 4 PF2's norm scales in the down product -- overriding RADIANCE_FN4_HC_READV. r4d_selftest compares their bytes.
 void r4d_hc_readv(int v);
 // Measurement hook: the PF2 launches that run (1 prologue, 2 down, 4 reduce, 8 up-mix, 16 codes);
 // anything but 31 leaves the outputs incomplete. r4d_selftest --perfhcv times cumulative masks.
