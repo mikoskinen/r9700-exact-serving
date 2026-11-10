@@ -5,7 +5,7 @@
 
 /* libref's schemas (libref/ref_registry.cpp), field for field. */
 static const RadParamSpec pDs41AttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype") };
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format") };
 static const RadOperandSpec oDs41AttnSparseSink[] = {
     { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
     { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
@@ -13,11 +13,12 @@ static const RadOperandSpec oDs41AttnSparseSink[] = {
     { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },
 };
 static const RadParamSpec pDs41IndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part") };
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
+    P_INTO("block"), P_STRO("key_format") };
 static const RadOperandSpec oDs41IndexScore[] = {
     { "q", RAD_OPD_IN, 0 },  { "w", RAD_OPD_IN, 0 },         { "index_cache", RAD_OPD_IN, 0 },
     { "bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
-    { "score", RAD_OPD_OUT, 0 },
+    { "score", RAD_OPD_OUT, 0 }, { "keep", RAD_OPD_IN, 1 },
 };
 static const RadParamSpec pDs41IndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
@@ -61,13 +62,22 @@ SCHEMA("attn_sparse_sink", pDs41AttnSparseSink, oDs41AttnSparseSink,
        "window_used[s]: block wbt[s][(j-first)/bs], cache [blocks,1,bs,dim]) and, with ratio > 0, "
        "the selected compressed entries c (tokens [c ratio, (c+1) ratio), block cbt[s][c ratio/cbs], "
        "cache [blocks,1,cbs,dim/ratio]). f32 scores q.k*scale, max floored at -1e30, "
-       "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero."),
+       "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero. "
+       "latent_format nvfp4: the compressed cache holds each entry packed (entry_store format nvfp4: "
+       "e2m1 codes, an e4m3 scale a block of 16, 288 bytes for 512 values), the window a multiple of "
+       "32; every output is the bf16 cache's, bit for bit, where the entries are "
+       "quant_roundtrip(fp4_e2m1, e4m3, 16) values."),
 SCHEMA("index_score", pDs41IndexScore, oDs41IndexScore,
        "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
        "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
        "rounded once to dtype. "
        "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]. With row_part "
-       "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf)."),
+       "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf). With "
+       "keep (index_candidates' bits over blocks of `block`, keep row i for score row i) only the kept "
+       "blocks are scored, the rest -inf unread; a kept score is the unkept op's, bit for bit. "
+       "key_format mxfp4: the cache holds each entry packed (entry_store format mxfp4: e2m1 codes, a ue8m0 "
+       "scale a block of 32, 80 bytes for 128 values) and every score is the bf16 cache's, bit for bit, "
+       "where the keys are quant_roundtrip(fp4_e2m1, ue8m0, 32) values."),
 SCHEMA("index_candidates", pDs41IndexCand, oDs41IndexCand,
        "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
        "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is a bit a "
@@ -95,7 +105,7 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   "(> 48 rows: the dot on WMMA, its summation order the only change)",
   "dim 128, any heads, ratio 1..16, row_part; a thread an entry (1, 2, 4 or 8 waves an entry "
   "group by grid size), -inf past (pos+1)/ratio without reading keys; > 48 rows and <= 32 heads a "
-  "wave a row over 128 entries",
+  "wave a row over 128 entries (with keep: over 1024 entries, its unkept 16-entry tiles skipped)",
   "bf16 q, w and cache; i32 tables and positions; f32 score",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_score, nullptr, nullptr, nullptr,

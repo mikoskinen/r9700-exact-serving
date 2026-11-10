@@ -54,6 +54,61 @@ float roundtrip(float v, float scale, QFmt f) {
         return fp8e4m3_lut(f32_to_fp8e4m3(std::clamp(v / scale, -448.0f, 448.0f))) * scale;
     return mxfp4_elem_to_f32((uint8_t)e2m1_code(std::clamp(v / scale, -6.0f, 6.0f))) * scale;
 }
+
+/* The packed index-key form (entry_store format mxfp4, index_score key_format mxfp4): n/2 bytes of
+ * e2m1 codes (value 2i in byte i's low nibble), n/32 ue8m0 scale bytes, zeros to a multiple of 16. */
+int64_t mx4_bytes(int64_t n) { return (n / 2 + n / 32 + 15) / 16 * 16; }
+
+/* The packed latent (entry_store format nvfp4, attn_sparse_sink latent_format nvfp4): n/2 bytes of
+ * e2m1 codes, n/16 e4m3 scale bytes, zeros to a multiple of 16. A value is code x scale in f32; its
+ * bf16 is the product's high half (exact for every value quant_roundtrip(fp4_e2m1, e4m3, 16) stored). */
+int64_t nv4_bytes(int64_t n) { return (n / 2 + n / 16 + 15) / 16 * 16; }
+uint16_t nv4_bf16(unsigned c, float sc) {
+    const float v = std::fabs(mxfp4_elem_to_f32((uint8_t)(c & 7u))) * sc;
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return (uint16_t)((u >> 16) | ((c & 8u) << 12));
+}
+float nv4_value(const uint8_t* e, int64_t n, int64_t d) {
+    const unsigned c = (e[d / 2] >> (4 * (d & 1))) & 15u;
+    uint32_t u = (uint32_t)nv4_bf16(c, fp8e4m3_lut(e[n / 2 + d / 16])) << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+/* One block of 16 bf16 values `x` packed: its scale searched among amax / c, c = 6, 4, 3, 2, 1.5, 1,
+ * 0.5, for an e4m3 value that gives every value back bit for bit; none -> quant_roundtrip's e4m3 rule
+ * (lossy). The scale byte, and the codes into `codes` (16 nibbles). */
+uint8_t nv4_pack16(const uint16_t* x, unsigned* codes) {
+    static const float kCand[7] = { 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f };
+    float v[16], am = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        uint32_t u = (uint32_t)x[i] << 16;
+        std::memcpy(&v[i], &u, 4);
+        const float a = std::fabs(v[i]);
+        if (a > am) am = a;
+    }
+    uint8_t sb = f32_to_fp8e4m3((am > 6.0f * 0x1p-9f ? am : 6.0f * 0x1p-9f) / 6.0f);
+    bool found = am == 0.0f;
+    for (int c = 0; c < 7 && !found; ++c) {
+        const float sc = am / kCand[c];
+        const uint8_t b8 = f32_to_fp8e4m3(sc);
+        if (!(am > 0.0f && fp8e4m3_lut(b8) == sc)) continue;
+        bool ok = true;
+        for (int i = 0; i < 16 && ok; ++i) ok = nv4_bf16(e2m1_code(v[i] / sc), sc) == x[i];
+        if (ok) { found = true; sb = b8; }
+    }
+    const float scale = fp8e4m3_lut(sb);
+    for (int i = 0; i < 16; ++i) codes[i] = e2m1_code(std::clamp(v[i] / scale, -6.0f, 6.0f));
+    return sb;
+}
+
+/* Value d of a packed entry `e` of n values: its code times its block's scale, as f32 (a code times
+ * a power of two at or above 2^-126 is exact in f32, and in bf16). */
+float mx4_value(const uint8_t* e, int64_t n, int64_t d) {
+    const unsigned c = (e[d / 2] >> (4 * (d & 1))) & 15u;
+    return mxfp4_elem_to_f32((uint8_t)c) * pow2_bits((int)e[n / 2 + d / 32] - 127);
+}
 }  // namespace
 
 /* x[m, b*block .. (b+1)*block) quantised to `format` with one `scale`-format scale a block, then
@@ -164,6 +219,11 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
     const int64_t ratio = p_int(a, "ratio", 0), topk = p_int(a, "topk", 0);
     const float scale = p_f32(a, "scale", 0.0f);
     const bool comp = ratio > 0;
+    /* latent_format nvfp4: the compressed entries packed (nv4_bytes(D) bytes in bf16 slots) */
+    const char* lf = p_str(a, "latent_format", "bf16");
+    const bool cnv = comp && !std::strcmp(lf, "nvfp4");
+    if (std::strcmp(lf, "nvfp4") && std::strcmp(lf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t cslots = cnv ? nv4_bytes(D) / 2 : D;
     if (H < 1 || D < 2 || D > 4096 || win < 1 || ratio < 0 || topk < 0 || !std::isfinite(scale) ||
         scale <= 0 || (comp && (!cc || !cbt || !sel || topk < 1 || D % ratio)))
         return RAD_E_SHAPE;
@@ -174,10 +234,11 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
         sink.dtype != RAD_F32 || numel(&cu) < 2 || numel(&wused) < numel(&cu) - 1)
         return RAD_E_SHAPE;
     const int64_t cbs = comp ? cc->shape[2] : 0;
-    if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != D || cbs % ratio ||
+    if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != cslots || cbs % ratio ||
                  cbt->rank != 2 || sel->rank != 2 || sel->shape[0] != q.shape[0] ||
                  sel->shape[1] != topk || cbt->shape[0] != wbt.shape[0]))
         return RAD_E_SHAPE;
+    if (cnv && (cc->dtype != RAD_BF16 || !rad_tensor_is_contiguous(cc))) return RAD_E_SHAPE;
     const int64_t M = q.shape[0], S = numel(&cu) - 1, bs = wc.shape[2];
     const int64_t nkeys = win + (comp ? topk : 0);
 #pragma omp parallel for schedule(dynamic)
@@ -205,8 +266,13 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
                                                                   ((c * ratio) / cbs) * laststride(cbt));
             if (blk < 0 || blk >= cc->shape[0]) continue;
             kt[(size_t)(win + t)] = cc;
-            ko[(size_t)(win + t)] = (blk * cbs + (c * ratio) % cbs) * (D / ratio);
+            ko[(size_t)(win + t)] = (blk * cbs + (c * ratio) % cbs) * (cslots / ratio);
         }
+        /* a key's value d: the bf16 caches' element, or (packed) the entry's decoded value */
+        auto kval = [&](int64_t k, int64_t d) {
+            return cnv && k >= win ? nv4_value((const uint8_t*)cc->data + 2 * ko[(size_t)k], D, d)
+                                   : ldt(kt[(size_t)k], ko[(size_t)k] + d);
+        };
         std::vector<float> sc((size_t)nkeys), acc((size_t)D);
         for (int64_t h = 0; h < H; ++h) {
             const int64_t qb = rowoff(&q, m, H * D) + h * D * laststride(&q);
@@ -215,7 +281,7 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
                 if (!kt[(size_t)k]) continue;
                 float dot = 0;
                 for (int64_t d = 0; d < D; ++d)
-                    dot += ldt(&q, qb + d * laststride(&q)) * ldt(kt[(size_t)k], ko[(size_t)k] + d);
+                    dot += ldt(&q, qb + d * laststride(&q)) * kval(k, d);
                 sc[(size_t)k] = dot * scale;
                 mx = std::max(mx, sc[(size_t)k]);
             }
@@ -225,7 +291,7 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
                 if (!kt[(size_t)k]) continue;
                 const float pk = std::exp(sc[(size_t)k] - mx);
                 den += pk;
-                for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * ldt(kt[(size_t)k], ko[(size_t)k] + d);
+                for (int64_t d = 0; d < D; ++d) acc[(size_t)d] += pk * kval(k, d);
             }
             den += std::exp(ldt(&sink, h * laststride(&sink)) - mx);
             const int64_t ob = rowoff(&out, m, H * D) + h * D * laststride(&out);
@@ -246,23 +312,47 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
  * With `row_part` p, score holds one run of R rows of the step: score row i is query row p R + i
  * of q, w and positions (the whole step's), found in cu_seqlens as that row; a row past the
  * step's rows scores -inf. Each row is the unsplit op's row, so a step scored run by run into one
- * R-row plane is the unsplit score, bit for bit. */
+ * R-row plane is the unsplit score, bit for bit.
+ *
+ * With `keep` (optional, last; index_candidates' bits over blocks of `block`, row i of keep for
+ * score row i: at least the rows the run holds, at most score's), only the kept blocks' positions
+ * are scored and every other position scores -inf without a key read. A kept position's score is
+ * the op's without keep, bit for bit, so index_topk through the same keep selects exactly what it
+ * would from the whole score: the candidate restriction of a layer that reads the candidate
+ * layer's blocks (DeepSeek-V4.1's layers past `candidate_source_layer_id`). */
 int ref_index_score(const RadArgs* a, RadStream) {
     if (!have(a, 7)) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
+    const RadTensor* keep = a->n_t > 7 && a->t[7].data ? &a->t[7] : nullptr;
     const int64_t H = p_int(a, "heads", 0), Dm = p_int(a, "dim", 0), ratio = p_int(a, "ratio", 0);
     const int64_t part = p_int(a, "row_part", -1);
+    const int64_t block = p_int(a, "block", 0);
     const float wscale = p_f32(a, "wscale", 0.0f);
+    /* key_format mxfp4: each entry packed (mx4_bytes(Dm) bytes in bf16 slots), its values decoded */
+    const char* kf = p_str(a, "key_format", "bf16");
+    const bool kmx = !std::strcmp(kf, "mxfp4");
+    if (!kmx && std::strcmp(kf, "bf16")) return RAD_E_UNSUPPORTED;
+    const int64_t kslots = kmx ? mx4_bytes(Dm) / 2 : Dm;
+    if (kmx && (kc.dtype != RAD_BF16 || Dm % 32 || !(kc.stride[3] == 1 && kc.stride[2] == kc.shape[3])))
+        return RAD_E_SHAPE;
     if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
-        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
+        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != kslots ||
         kc.shape[2] % ratio || bt.rank != 2 || numel(&pos) != q.shape[0] || numel(&cu) < 2 ||
         sc.rank != 2 || sc.shape[0] < 1 || (part < 0 && sc.shape[0] != q.shape[0]) ||
         sc.shape[1] < 1 || sc.dtype != RAD_F32)
         return RAD_E_SHAPE;
     const int64_t Mq = q.shape[0], M = sc.shape[0], C = sc.shape[1], S = numel(&cu) - 1, cbs = kc.shape[2];
     const int64_t row0 = part > 0 ? part * M : 0;
+    /* keep: rows for the rows this run holds (at least min(M, Mq - row0), at most M), one word a
+     * 32 blocks of `block` over score's width. */
+    const int64_t held = row0 < Mq ? std::min(M, Mq - row0) : 0;
+    if (keep && (block < 1 || keep->rank != 2 || keep->shape[0] < held || keep->shape[0] > M ||
+                 keep->shape[1] != ref_keep_words(C, block)))
+        return RAD_E_SHAPE;
+    if (keep && keep->dtype != RAD_I32) return RAD_E_DTYPE;
+    const int64_t KW = keep ? keep->shape[1] : 0;
     const uint32_t dt = q.dtype;
 #pragma omp parallel for schedule(dynamic)
     for (int64_t i = 0; i < M; ++i) {
@@ -277,15 +367,23 @@ int ref_index_score(const RadArgs* a, RadStream) {
         for (int64_t j = 0; j < C; ++j) {
             float v = -INFINITY;
             const int64_t col = (j * ratio) / cbs;
-            if (j < reach && col < bt.shape[1]) {
+            bool kept = true;
+            if (keep && j < reach) {
+                const int64_t b = j / block;
+                const uint32_t wd = (uint32_t)ld_int(keep->dtype, keep->data,
+                                                     rowoff(keep, i, KW) + (b / 32) * laststride(keep));
+                kept = ((wd >> (b % 32)) & 1u) != 0;
+            }
+            if (kept && j < reach && col < bt.shape[1]) {
                 const int64_t blk = ld_int(bt.dtype, bt.data, rowoff(&bt, s, bt.shape[1]) + col * laststride(&bt));
                 if (blk >= 0 && blk < kc.shape[0]) {
-                    const int64_t ko = (blk * cbs + (j * ratio) % cbs) * (Dm / ratio);
+                    const int64_t ko = (blk * cbs + (j * ratio) % cbs) * (kslots / ratio);
+                    const uint8_t* ke = kmx ? (const uint8_t*)kc.data + 2 * ko : nullptr;
                     float acc = 0;
                     for (int64_t h = 0; h < H; ++h) {
                         float dot = 0;
                         for (int64_t d = 0; d < Dm; ++d)
-                            dot += ldt(&q, qb + (h * Dm + d) * qs) * ldt(&kc, ko + d);
+                            dot += ldt(&q, qb + (h * Dm + d) * qs) * (ke ? mx4_value(ke, Dm, d) : ldt(&kc, ko + d));
                         dot = round_dt(dt, dot);
                         const float wh =
                             round_dt(dt, ldt(&w, rowoff(&w, m, H) + h * laststride(&w)) * wscale);
@@ -402,6 +500,59 @@ int ref_entry_store(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
     const int64_t n = p_int(a, "n", 0), bs = p_int(a, "block_size", 0);
+    const char* fmt = p_str(a, "format", "bf16");
+    if (!std::strcmp(fmt, "mxfp4")) {
+        /* each block of 32 quantised as quant_roundtrip(fp4_e2m1, ue8m0) does, packed (mx4_bytes) */
+        const int64_t bytes = mx4_bytes(n);
+        if (n < 32 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
+            numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs || cache.dtype != RAD_BF16 ||
+            cache.shape[1] * cache.shape[2] * cache.shape[3] * 2 != bytes || !rad_tensor_is_contiguous(&cache))
+            return RAD_E_SHAPE;
+        for (int64_t w = 0; w < x.shape[0]; ++w) {
+            const int64_t pg = ld_int(page.dtype, page.data, offlin(&page, w));
+            if (pg < 0) continue;
+            if (pg >= cache.shape[0]) return RAD_E_INVAL;
+            const int64_t xb = rowoff(&x, w, n), xs = laststride(&x);
+            uint8_t* e = (uint8_t*)cache.data + pg * bytes;
+            std::memset(e, 0, (size_t)bytes);
+            for (int64_t b = 0; b < n / 32; ++b) {
+                float amax = 0.0f;
+                for (int64_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(ldt(&x, xb + (b * 32 + i) * xs)));
+                const float scale = block_scale(amax, QFmt::Fp4E2m1, QScale::Ue8m0);
+                for (int64_t i = 0; i < 32; ++i) {
+                    const unsigned c = e2m1_code(std::clamp(ldt(&x, xb + (b * 32 + i) * xs) / scale, -6.0f, 6.0f));
+                    e[(b * 32 + i) / 2] |= (uint8_t)(c << (4 * (i & 1)));
+                }
+                e[n / 2 + b] = (uint8_t)(ceil_log2_bits(scale) + 127);
+            }
+        }
+        return RAD_OK;
+    }
+    if (!std::strcmp(fmt, "nvfp4")) {
+        /* each block of 16 packed by nv4_pack16 (the kernel's search, bit for bit) */
+        const int64_t bytes = nv4_bytes(n);
+        if (n < 32 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n || x.dtype != RAD_BF16 ||
+            numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs || cache.dtype != RAD_BF16 ||
+            cache.shape[1] * cache.shape[2] * cache.shape[3] * 2 != bytes || !rad_tensor_is_contiguous(&cache))
+            return RAD_E_SHAPE;
+        for (int64_t w = 0; w < x.shape[0]; ++w) {
+            const int64_t pg = ld_int(page.dtype, page.data, offlin(&page, w));
+            if (pg < 0) continue;
+            if (pg >= cache.shape[0]) return RAD_E_INVAL;
+            const int64_t xb = rowoff(&x, w, n), xs = laststride(&x);
+            uint8_t* e = (uint8_t*)cache.data + pg * bytes;
+            std::memset(e, 0, (size_t)bytes);
+            for (int64_t b = 0; b < n / 16; ++b) {
+                uint16_t v[16];
+                unsigned c[16];
+                for (int i = 0; i < 16; ++i) v[i] = ((const uint16_t*)x.data)[xb + (b * 16 + i) * xs];
+                e[n / 2 + b] = nv4_pack16(v, c);
+                for (int i = 0; i < 16; ++i) e[(b * 16 + i) / 2] |= (uint8_t)(c[i] << (4 * (i & 1)));
+            }
+        }
+        return RAD_OK;
+    }
+    if (std::strcmp(fmt, "bf16")) return RAD_E_UNSUPPORTED;
     if (n < 1 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
         numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs ||
         cache.shape[1] * cache.shape[2] * cache.shape[3] != n)

@@ -89,12 +89,18 @@ extern "C" int r4d_shape_softmax_pool(const RadParam* p, int n_p, int operand, R
 
 extern "C" int r4d_shape_entry_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bs = pi(p, n_p, "block_size");
-    if (M <= 0 || n < 1 || bs < 1 || n % bs) return RAD_E_UNSUPPORTED;
+    /* format mxfp4: a block holds (n/2 + n/32) bytes rounded up to 16, in bf16 slots */
+    const char* f = r4d_pgets(p, n_p, "format");
+    const bool mx = f && !std::strcmp(f, "mxfp4"), nv = f && !std::strcmp(f, "nvfp4");
+    if (f && !mx && !nv && std::strcmp(f, "bf16")) return RAD_E_UNSUPPORTED;
+    /* nvfp4: (n/2 + n/16) bytes rounded up to 16 (the packed latent) */
+    const int64_t slots = mx ? (n / 2 + n / 32 + 15) / 16 * 16 / 2 : nv ? (n / 2 + n / 16 + 15) / 16 * 16 / 2 : n;
+    if (M <= 0 || n < 1 || bs < 1 || slots % bs || ((mx || nv) && (n % 32 || n > 1024))) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = {
         opd(D, M, n),                                       /* x */
         opd_idx(M, 0, M, -1, RAD_OPD_F_IDX_UNIQUE),         /* page: distinct blocks */
-        opd(D, M, 1, bs, n / bs),                           /* cache */
+        opd(D, M, 1, bs, slots / bs),                       /* cache */
     };
     R4D_PICK(l);
 }

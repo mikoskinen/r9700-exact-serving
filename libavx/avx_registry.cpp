@@ -447,21 +447,23 @@ static const RadOperandSpec oQuantRoundtrip[] = { INOUT("x") };
 static const RadParamSpec pSoftmaxPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype") };
 static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("page") };
 static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype") };
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format") };
 static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
     OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"),
     OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
 static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
-    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part") };
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
+    P_INTO("block"), P_STRO("key_format") };
 static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
-    OPD("positions"), OPD("cu_seqlens"), OUT("score") };
+    OPD("positions"), OPD("cu_seqlens"), OUT("score"), OPD_O("keep") };
 static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
 static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
 static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
     P_INTO("block") };
 static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
-static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype") };
+static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype"),
+    P_STRO("format") };
 static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
 static const RadParamSpec pTokenMap[] = { P_INT("M"), P_INT("n_vocab") };
 static const RadOperandSpec oTokenMap[] = { OPD("ids"), WGT("table"), OUT("mapped") };
@@ -1280,7 +1282,7 @@ static const RadOpSchema kSchemas[] = {
   "latent attention with a per-head sink over the window and the selected compressed entries." },
 { "index_score", ARR(pIndexScore), ARR(oIndexScore),
   "the indexer's relu-gated head sum per row and compressed position, -inf where not passed; "
-  "with row_part p, score row i is step row p M + i." },
+  "with row_part p, score row i is step row p M + i; with keep, only keep's blocks are scored." },
 { "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
   "level one of the two-level top-k: the kept blocks, the newest reachable pinned; keep a bit a "
   "block." },

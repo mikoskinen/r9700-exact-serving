@@ -4,7 +4,9 @@
 //   index_score       one thread an entry (or HS waves an entry group, each a slice of the heads,
 //                     the head sum then closed in head order from LDS): the dot in d order,
 //                     rounded to bf16, relu x the rounded head weight, rounded, the head sum in head
-//                     order, rounded.
+//                     order, rounded. With `keep` (index_candidates' bits, the candidate restriction)
+//                     an entry outside the kept blocks scores -inf without a key read, and every
+//                     kept entry is computed by the same instructions as without keep (same bits).
 //   index_candidates  one 1024-thread block a row: block maxima, the newest block pinned, an
 //   index_topk        exact radix select of the k largest (value desc, position asc: libref's
 //                     partial_sort order), then an ordered compaction. index_topk at decode
@@ -30,10 +32,19 @@
 #include "r4d_plugin.h"
 
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <type_traits>
 
+/* The ops' dynamic LDS. tests/r4d_emu runs these sources on the host, which has no extern
+ * __shared__: there it is the launch's dynamic LDS, read at each use. */
+#ifdef R4D_EMU_HOST
+#define r4d_ds41_sparse_dyn ((unsigned char*)emu_dyn_lds())
+#else
 extern __shared__ __align__(16) unsigned char r4d_ds41_sparse_dyn[];
+#endif
 
 namespace {
 
@@ -125,16 +136,261 @@ struct DsScoreArgs {
     const int* pos;
     const int* cu;
     float* sc;
-    long qr, wr, wc, btr, btc, nblk, ps, cs, sr, scs, row0;
-    int nbt, S, M, Mv, C, H, ratio, cbs, slot;
+    /* keep (optional): index_candidates' bits, row m for score row m, a bit a block of `block`
+     * positions (bshift = log2(block) for a power of two, else -1); null scores every entry. */
+    const int* keep;
+    long qr, wr, wc, btr, btc, nblk, ps, cs, sr, scs, row0, kr, kcs;
+    int nbt, S, M, Mv, C, H, ratio, cbs, slot, block, bshift;
+    int kmx;                                         /* key_format mxfp4: the cache holds packed keys */
     float wscale;
 };
 
+/* ---- MXFP4 index keys (index_score key_format mxfp4, entry_store format mxfp4): an n-value key as
+ * n/2 bytes of e2m1 codes (value 2i in byte i's low nibble, 2i+1 in its high nibble; bit 3 the
+ * sign), then n/32 ue8m0 scale bytes (a block of 32 values each, scale 2^(e-127)), then zeros to a
+ * multiple of 16 bytes: 80 bytes (40 bf16 slots) for the 128-value key. The scale is quant_roundtrip's
+ * (fp4_e2m1, ue8m0, block 32): the power of two at or above max(amax, 6 x 2^-126) x f32(1/6). For
+ * values that rule already produced (every index key deepseek41 stores) the codes are exact and the
+ * unpacked bf16 is the stored bf16, bit for bit: such a block is c_i 2^k with c_i e2m1 codes, and
+ * the rule on it picks 2^k / 2^j with c_max 2^j in (3, 6], where every |c_i| <= c_max times 2^j is
+ * again a code (docs/OPS.md). */
+__host__ __device__ constexpr int ds_mx4_bytes(int n) { return (n / 2 + n / 32 + 15) / 16 * 16; }
+constexpr int kDsMx4Bytes = ds_mx4_bytes(128);       /* 80 */
+
+/* bf16 bits of e2m1 code c (bit 3 the sign) times 2^(e-127), e >= 1 (the scale floor): exponent
+ * e + (m >> 1) - 1 for magnitude code m = 1..7 (0.5, 1, 1.5, 2, 3, 4, 6), mantissa 0x40 at m = 3, 5,
+ * 7; 0.5 x 2^-126 is bf16's denormal 0x0040. */
+__host__ __device__ __forceinline__ uint32_t ds_mx4_bf16(uint32_t c, uint32_t e) {
+    const uint32_t m = c & 7u, s = (c & 8u) << 12;
+    if (m == 0u) return s;
+    const uint32_t E = e + (m >> 1) - 1u;
+    if (E == 0u) return s | 0x40u;
+    return s | (E << 7) | ((m & 1u) && m > 1u ? 0x40u : 0u);
+}
+/* Eight codes (a word, value i at bits 4i) at scale byte e -> four bf16 pairs (value 2t low). */
+__device__ __forceinline__ uint4 ds_mx4_unpack8(uint32_t w, uint32_t e) {
+    uint32_t o[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+        o[t] = ds_mx4_bf16((w >> (8 * t)) & 15u, e) | (ds_mx4_bf16((w >> (8 * t + 4)) & 15u, e) << 16);
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
+/* ---- the packed compressed latent (attn_sparse_sink latent_format nvfp4, entry_store format nvfp4):
+ * an n-value entry as n/2 bytes of e2m1 codes (value 2i in byte i's low nibble, 2i+1 in its high
+ * nibble, bit 3 the sign), then n/16 OCP e4m3 scale bytes (a block of 16 values each), then zeros to
+ * a multiple of 16 bytes: 288 bytes (144 bf16 slots) for the 512-value latent. A value is
+ * e2m1(c) x e4m3(s) in f32, exact, and its bf16 is the high half: the latent DeepSeek-V4 stores is
+ * quant_roundtrip(fp4_e2m1, e4m3, 16), every value c_i s exactly, so unpacked it is the stored bf16
+ * bit for bit. The packer (ds41_entry_store_nv4_kernel) searches the block's scale among amax / c,
+ * c = 6, 4, 3, 2, 1.5, 1, 0.5, for one that is an e4m3 value and gives every value back exactly (the
+ * block's own scale is always among them; re-deriving it by the rule is not exact where e4m3 is
+ * subnormal), and falls back to the rule (lossy) for values the rule did not produce. */
+__host__ __device__ constexpr int ds_nv4_bytes(int n) { return (n / 2 + n / 16 + 15) / 16 * 16; }
+constexpr int kDsNv4Bytes = ds_nv4_bytes(512);          /* 288: the 512-value latent */
+
+/* OCP e4m3 (fn) byte -> f32, exact (rad_fp8e4m3_to_f32's rule; 0x7f / 0xff NaN). */
+__host__ __device__ __forceinline__ float ds_e4m3_f32(uint32_t b) {
+    const uint32_t sg = (b & 0x80u) << 24, e = (b >> 3) & 15u;
+    uint32_t m = b & 7u, u;
+    if (e == 0u) {
+        if (m == 0u) {
+            u = sg;
+        } else {
+            int sh = 0;
+            while (!(m & 8u)) { m <<= 1; ++sh; }
+            u = sg | ((uint32_t)(127 - 6 - sh) << 23) | ((m & 7u) << 20);
+        }
+    } else if (e == 15u && m == 7u) {
+        u = sg | 0x7fc00000u;
+    } else {
+        u = sg | ((e - 7u + 127u) << 23) | (m << 20);
+    }
+    return __builtin_bit_cast(float, u);
+}
+/* f32 -> OCP e4m3, round to nearest even, saturating at 448 (rad_f32_to_fp8e4m3's rule). */
+__host__ __device__ __forceinline__ uint32_t ds_f32_e4m3(float f) {
+    const uint32_t u = __builtin_bit_cast(uint32_t, f), sg = (u >> 24) & 0x80u, a = u & 0x7fffffffu;
+    if (a > 0x7f800000u) return sg | 0x7fu;
+    if (a >= 0x43e00000u) return sg | 0x7eu;
+    const int e = (int)(a >> 23) - 127;
+    uint32_t m = a & 0x7fffffu;
+    if (e < -10) return sg;
+    if (e < -6) {
+        const int sh = -6 - e + 20;
+        m |= 0x800000u;
+        const uint32_t lo = m & ((1u << sh) - 1u), half = 1u << (sh - 1);
+        uint32_t q = m >> sh;
+        if (lo > half || (lo == half && (q & 1u))) ++q;
+        return sg | q;
+    }
+    uint32_t q = m >> 20;
+    const uint32_t lo = m & 0xfffffu;
+    int ee = e + 7;
+    if (lo > 0x80000u || (lo == 0x80000u && (q & 1u))) ++q;
+    if (q == 8u) { q = 0u; ++ee; }
+    if (ee > 15 || (ee == 15 && q == 7u)) return sg | 0x7eu;
+    return sg | ((uint32_t)ee << 3) | q;
+}
+/* bf16 bits of e2m1 code c (bit 3 the sign) times scale s (an e4m3 value): the f32 product's high
+ * half, exact for every value the roundtrip stored. */
+__host__ __device__ __forceinline__ uint32_t ds_nv4_bf16(uint32_t c, float s) {
+    const uint32_t m = c & 7u;
+    const float mag = m < 4u ? 0.5f * (float)m : (float)(2u << ((m - 4u) >> 1)) * ((m & 1u) ? 1.5f : 1.0f);
+    return (__builtin_bit_cast(uint32_t, mag * s) >> 16) | ((c & 8u) << 12);
+}
+/* Eight codes (a word, value i at bits 4i), one 16-block's scale s -> four bf16 pairs. */
+__device__ __forceinline__ uint4 ds_nv4_unpack8(uint32_t w, float s) {
+    uint32_t o[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+        o[t] = ds_nv4_bf16((w >> (8 * t)) & 15u, s) | (ds_nv4_bf16((w >> (8 * t + 4)) & 15u, s) << 16);
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
+
+/* ---- the decode kernels' unpack (8.11.): branch-free, about six instructions a value. A value is e2m1(c) x s,
+ * exact in f32; it is computed as (2 |e2m1(c)|) x (s / 2): 2 |e2m1| is an integer 0..12 from a nibble table (0xC8643210:
+ * 0 1 2 3 4 6 8 12), s / 2 is exact (ds_e4m3_half), so the product is the f32 the reference's mag x s is -- and its bf16,
+ * the high half, the stored bit -- with the code's sign bit or-ed in as ds_nv4_bf16 does. All 256 scale bytes x 16 codes
+ * give ds_nv4_bf16's bits (NaN scales: NaN). ds_e4m3_f32's subnormal loop and ds_nv4_bf16's selects compiled to some 180
+ * branches and 27 instructions a value in the decode kernels' unrolled loops: 240 us a call against bf16's 15 at one row. */
+/* 8.11. (v3): the magnitude bits of b at bit 20 are an f32 whose value is e4m3's times 2^-120 -- normal and subnormal
+ * alike, since the f32 subnormal field lines up with e4m3's (exponent 0: m 2^-3 2^-126 = m 2^-9 2^-120) -- so one exact
+ * multiply by 2^119 gives s / 2 (f32 subnormals are kept: denorm mode 3). The same bits as the select form it replaces
+ * for all 256 bytes (NaN 0x7f / 0xff -> 0x7fc00000 | sign), in about seven instructions instead of fifteen; the decode
+ * kernels run it once a scale byte (16 values in the scores, 2 in the direct PV). */
+__device__ __forceinline__ float ds_e4m3_half(uint32_t b) {
+    const uint32_t mg = (b << 20) & 0x07f00000u;
+    uint32_t u = __builtin_bit_cast(uint32_t, __builtin_bit_cast(float, mg) * 0x1p119f);
+    u = mg == 0x07f00000u ? 0x7fc00000u : u;
+    return __builtin_bit_cast(float, u | ((b & 0x80u) << 24));
+}
+/* The f32 of code c (its low four bits; bit 3 the sign) at half scale sh. */
+__device__ __forceinline__ float ds_nv4_val(uint32_t c, float sh) {
+    const float v = (float)((0xC8643210u >> ((c & 7u) << 2)) & 15u) * sh;
+    return __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, v) | ((c & 8u) << 28));
+}
+/* The same for the code at bits [T, T + 4) of w (T a constant): a bit-field extract, the table's field, a convert, a
+ * multiply and the sign -- eight instructions. */
+template <int T>
+__device__ __forceinline__ float ds_nv4_at(uint32_t w, float sh) {
+    const uint32_t m4 = ((w >> T) & 7u) << 2;
+    const float v = (float)((0xC8643210u >> m4) & 15u) * sh;
+    const uint32_t sg = T + 3 <= 31 ? (w >> (T + 3)) << 31 : 0u;
+    return __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, v) | sg);
+}
+/* ds_nv4_unpack8 by ds_nv4_val: eight codes (a word) at half scale sh -> four bf16 pairs, the same bits. */
+__device__ __forceinline__ uint4 ds_nv4_unpack8_fast(uint32_t w, float sh) {
+    uint32_t o[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+        o[t] = (__builtin_bit_cast(uint32_t, ds_nv4_val(w >> (8 * t), sh)) >> 16) |
+               (__builtin_bit_cast(uint32_t, ds_nv4_val(w >> (8 * t + 4), sh)) & 0xffff0000u);
+    return make_uint4(o[0], o[1], o[2], o[3]);
+}
+
+/* e2m1's code of v (quant_roundtrip's e2m1_code): nearest magnitude, ties to the even code, past 6
+ * the largest; NaN 0. */
+__host__ __device__ __forceinline__ uint32_t ds_e2m1_code(float v) {
+    if (v != v) return 0u;
+    const float a = v < 0.0f ? -v : v;
+    const uint32_t m = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) + (a >= 3.5f) + (a > 5.0f);
+    return (__builtin_bit_cast(uint32_t, v) >> 28 & 8u) | m;
+}
+
+/* keep's block of position j. */
+__device__ __forceinline__ long ds_keep_block(const DsScoreArgs& a, long j) {
+    return a.bshift >= 0 ? (j >> a.bshift) : j / a.block;
+}
+/* Is position j kept: bit b % 32 of word b / 32 of the row, b = j's block. */
+__device__ __forceinline__ bool ds_kept(const DsScoreArgs& a, const int* krow, long j) {
+    const long b = ds_keep_block(a, j);
+    return (((unsigned)krow[(b >> 5) * a.kcs] >> (b & 31)) & 1u) != 0u;
+}
+/* Position j's index key in row m's sequence s, or null (past the row's reach or C, an unmapped or
+ * out-of-range block). */
+__device__ __forceinline__ const uint16_t* ds_entry_key(const DsScoreArgs& a, int s, long j, long reach) {
+    if (j >= a.C || j >= reach) return nullptr;
+    const long col = (j * a.ratio) / a.cbs;
+    if (col >= a.nbt) return nullptr;
+    const long blk = a.bt[(long)s * a.btr + col * a.btc];
+    if (blk < 0 || blk >= a.nblk) return nullptr;
+    return a.kc + (blk * a.cbs + (j * a.ratio) % a.cbs) * (long)a.slot;
+}
+
+/* One entry's score from its key kp (null: none): the dot in d order rounded to bf16, relu x the
+ * rounded head weight, rounded, summed in head order -- this wave's heads [h0, h1); with HS > 1 the
+ * waves' slices meet in `part` ([H][EPB]) and wave sub 0 closes the sum in head order. Called
+ * block-uniformly (HS > 1 holds two barriers). Sub 0's result is the entry's f32 sum (before the
+ * final rounding). */
+template <int HS>
+__device__ __forceinline__ float ds_score_entry(const DsScoreArgs& a, long m, const uint16_t* kp, float* part,
+                                                int e, int sub, int h0, int h1) {
+    constexpr int DM = 128, EPB = 256 / HS;
+    float acc = 0.0f;
+    if (kp) {
+        float k[DM];
+        /* mxfp4: 64 code bytes then 4 scale bytes, unpacked to the bf16 the rule stored (same floats) */
+        [[maybe_unused]] const uint32_t sc4 = a.kmx ? *(const uint32_t*)((const unsigned char*)kp + DM / 2) : 0u;
+#pragma unroll
+        for (int c = 0; c < DM / 8; ++c) {
+            const uint4 v = a.kmx ? ds_mx4_unpack8(((const uint32_t*)kp)[c], (sc4 >> (8 * (c / 4))) & 0xffu)
+                                  : *(const uint4*)(kp + c * 8);
+            k[c * 8 + 0] = bf16w_lo(v.x); k[c * 8 + 1] = bf16w_hi(v.x);
+            k[c * 8 + 2] = bf16w_lo(v.y); k[c * 8 + 3] = bf16w_hi(v.y);
+            k[c * 8 + 4] = bf16w_lo(v.z); k[c * 8 + 5] = bf16w_hi(v.z);
+            k[c * 8 + 6] = bf16w_lo(v.w); k[c * 8 + 7] = bf16w_hi(v.w);
+        }
+        const uint32_t* qrow = (const uint32_t*)(a.q + m * a.qr);
+        const uint16_t* wrow = a.w + m * a.wr;
+        for (int h = h0; h < h1; h += 4) {
+            const int nh = min(4, h1 - h);
+            const uint32_t* q0 = qrow + (long)h * (DM / 2);
+            const uint32_t* q1 = qrow + (long)(nh > 1 ? h + 1 : h) * (DM / 2);
+            const uint32_t* q2 = qrow + (long)(nh > 2 ? h + 2 : h) * (DM / 2);
+            const uint32_t* q3 = qrow + (long)(nh > 3 ? h + 3 : h) * (DM / 2);
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#pragma unroll
+            for (int i = 0; i < DM / 2; ++i) {
+                const uint32_t w0 = q0[i], w1 = q1[i], w2 = q2[i], w3 = q3[i];
+                d0 = __builtin_fmaf(bf16w_lo(w0), k[2 * i], d0);
+                d1 = __builtin_fmaf(bf16w_lo(w1), k[2 * i], d1);
+                d2 = __builtin_fmaf(bf16w_lo(w2), k[2 * i], d2);
+                d3 = __builtin_fmaf(bf16w_lo(w3), k[2 * i], d3);
+                d0 = __builtin_fmaf(bf16w_hi(w0), k[2 * i + 1], d0);
+                d1 = __builtin_fmaf(bf16w_hi(w1), k[2 * i + 1], d1);
+                d2 = __builtin_fmaf(bf16w_hi(w2), k[2 * i + 1], d2);
+                d3 = __builtin_fmaf(bf16w_hi(w3), k[2 * i + 1], d3);
+            }
+            const float dd[4] = { d0, d1, d2, d3 };
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                if (u >= nh) break;
+                const int hh = h + u;
+                const float dot = ds_round_bf16(dd[u]);
+                const float wh = ds_round_bf16(ds_bf(wrow[(long)hh * a.wc]) * a.wscale);
+                const float c = ds_round_bf16((dot < 0.0f ? 0.0f : dot) * wh);
+                if (HS == 1) acc = acc + c;
+                else part[hh * EPB + e] = c;
+            }
+        }
+    }
+    if (HS > 1) {
+        __syncthreads();
+        if (sub == 0 && kp) {
+            acc = 0.0f;
+            for (int hh = 0; hh < a.H; ++hh) acc = acc + part[hh * EPB + e];
+        }
+        __syncthreads();
+    }
+    return acc;
+}
+
 /* One thread an entry; HS waves of a block share 32 entries, each wave a slice of the heads (its
- * q then uniform, read through scalar loads). A thread holds its key as 128 floats. */
+ * q then uniform, read through scalar loads). A thread holds its key as 128 floats. Without keep
+ * (the candidate restriction takes ds41_index_score_kept_kernel below). */
 template <int HS>
 __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
-    constexpr int DM = 128, EPB = 256 / HS;
+    constexpr int EPB = 256 / HS;
     float* part = (float*)r4d_ds41_sparse_dyn;       /* [H][EPB], HS > 1 */
     /* The wave index through readfirstlane, so a wave's head slice (and its q) is provably uniform
      * and q stays in scalar loads. */
@@ -151,69 +407,141 @@ __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
             continue;
         }
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
-        const uint16_t* kp = nullptr;
-        if (j < a.C && j < reach) {
-            const long col = (j * a.ratio) / a.cbs;
-            if (col < a.nbt) {
-                const long blk = a.bt[(long)s * a.btr + col * a.btc];
-                if (blk >= 0 && blk < a.nblk)
-                    kp = a.kc + (blk * a.cbs + (j * a.ratio) % a.cbs) * (long)a.slot;
-            }
-        }
-        float acc = 0.0f;
-        if (kp) {
-            float k[DM];
-#pragma unroll
-            for (int c = 0; c < DM / 8; ++c) {
-                const uint4 v = *(const uint4*)(kp + c * 8);
-                k[c * 8 + 0] = bf16w_lo(v.x); k[c * 8 + 1] = bf16w_hi(v.x);
-                k[c * 8 + 2] = bf16w_lo(v.y); k[c * 8 + 3] = bf16w_hi(v.y);
-                k[c * 8 + 4] = bf16w_lo(v.z); k[c * 8 + 5] = bf16w_hi(v.z);
-                k[c * 8 + 6] = bf16w_lo(v.w); k[c * 8 + 7] = bf16w_hi(v.w);
-            }
-            const uint32_t* qrow = (const uint32_t*)(a.q + m * a.qr);
-            const uint16_t* wrow = a.w + m * a.wr;
-            for (int h = h0; h < h1; h += 4) {
-                const int nh = min(4, h1 - h);
-                const uint32_t* q0 = qrow + (long)h * (DM / 2);
-                const uint32_t* q1 = qrow + (long)(nh > 1 ? h + 1 : h) * (DM / 2);
-                const uint32_t* q2 = qrow + (long)(nh > 2 ? h + 2 : h) * (DM / 2);
-                const uint32_t* q3 = qrow + (long)(nh > 3 ? h + 3 : h) * (DM / 2);
-                float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-#pragma unroll
-                for (int i = 0; i < DM / 2; ++i) {
-                    const uint32_t w0 = q0[i], w1 = q1[i], w2 = q2[i], w3 = q3[i];
-                    d0 = __builtin_fmaf(bf16w_lo(w0), k[2 * i], d0);
-                    d1 = __builtin_fmaf(bf16w_lo(w1), k[2 * i], d1);
-                    d2 = __builtin_fmaf(bf16w_lo(w2), k[2 * i], d2);
-                    d3 = __builtin_fmaf(bf16w_lo(w3), k[2 * i], d3);
-                    d0 = __builtin_fmaf(bf16w_hi(w0), k[2 * i + 1], d0);
-                    d1 = __builtin_fmaf(bf16w_hi(w1), k[2 * i + 1], d1);
-                    d2 = __builtin_fmaf(bf16w_hi(w2), k[2 * i + 1], d2);
-                    d3 = __builtin_fmaf(bf16w_hi(w3), k[2 * i + 1], d3);
-                }
-                const float dd[4] = { d0, d1, d2, d3 };
-#pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    if (u >= nh) break;
-                    const int hh = h + u;
-                    const float dot = ds_round_bf16(dd[u]);
-                    const float wh = ds_round_bf16(ds_bf(wrow[(long)hh * a.wc]) * a.wscale);
-                    const float c = ds_round_bf16((dot < 0.0f ? 0.0f : dot) * wh);
-                    if (HS == 1) acc = acc + c;
-                    else part[hh * EPB + e] = c;
-                }
-            }
-        }
-        if (HS > 1) {
-            __syncthreads();
-            if (sub == 0 && kp) {
-                acc = 0.0f;
-                for (int hh = 0; hh < a.H; ++hh) acc = acc + part[hh * EPB + e];
-            }
-            __syncthreads();
-        }
+        const uint16_t* kp = ds_entry_key(a, s, j, reach);
+        const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
         if (sub == 0 && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+    }
+}
+
+/* ---- the candidate restriction over the kept blocks only (index_score's decode band and
+ * index_topk): a row's keep words below its reach, their kept blocks ranked in block order. */
+
+/* Word w of a row's keep, masked to its blocks below nb. */
+__device__ __forceinline__ uint32_t ds_keep_word(const int* krow, long kcs, long w, long nb) {
+    uint32_t bits = (uint32_t)krow[w * kcs];
+    const long lo = w << 5;
+    if (lo + 32 > nb) bits &= nb - lo >= 32 ? ~0u : ((1u << (uint32_t)(nb - lo)) - 1u);
+    return bits;
+}
+
+/* A block-wide exclusive scan of NT threads (NT a multiple of 32, at most 1024); *total is the
+ * sum. ws holds 33 words. Ends on a barrier. */
+template <int NT>
+__device__ __forceinline__ uint32_t ds_excl_scan(uint32_t v, uint32_t* ws, uint32_t* total) {
+    constexpr int NW = NT / 32;
+    static_assert(NT % 32 == 0 && NW <= 32, "a block of 32 waves at most");
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const uint32_t inc = r4d_wave_prefix_u32(v, lane);
+    if (lane == 31) ws[wave] = inc;
+    __syncthreads();
+    if (wave == 0) {
+        const uint32_t w = lane < NW ? ws[lane] : 0u;
+        const uint32_t wi = r4d_wave_prefix_u32(w, lane);
+        if (lane < NW) ws[lane] = wi - w;
+        if (lane == 31) ws[32] = wi;
+    }
+    __syncthreads();
+    const uint32_t r = ws[wave] + inc - v;
+    *total = ws[32];
+    __syncthreads();
+    return r;
+}
+
+/* Thread t's share of a row's keep words below nb blocks: words [t W, t W + W), W = ceil(nw / NT). */
+template <int NT>
+struct DsKeptScan {
+    long w0, w1;                                     /* this thread's words */
+    uint32_t off;                                    /* kept blocks before them (block order) */
+    uint32_t total;                                  /* the row's kept blocks below nb */
+};
+
+template <int NT>
+__device__ __forceinline__ DsKeptScan<NT> ds_kept_scan(const int* krow, long kcs, long nb, uint32_t* ws) {
+    DsKeptScan<NT> k;
+    const long nw = (nb + 31) >> 5, per = (nw + NT - 1) / NT;
+    k.w0 = (long)threadIdx.x * per;
+    k.w1 = k.w0 + per < nw ? k.w0 + per : nw;
+    uint32_t c = 0;
+    for (long w = k.w0; w < k.w1; ++w) c += (uint32_t)__builtin_popcount(ds_keep_word(krow, kcs, w, nb));
+    k.off = ds_excl_scan<NT>(c, ws, &k.total);
+    return k;
+}
+
+/* The kept blocks of rank [r0, r0 + n) to list[rank - r0], in block order. The caller's barrier
+ * publishes the list. */
+template <int NT>
+__device__ __forceinline__ void ds_kept_list(const DsKeptScan<NT>& k, const int* krow, long kcs, long nb,
+                                             uint32_t r0, uint32_t n, uint32_t* list) {
+    uint32_t r = k.off;
+    for (long w = k.w0; w < k.w1 && r < r0 + n; ++w) {
+        uint32_t bits = ds_keep_word(krow, kcs, w, nb);
+        const uint32_t c = (uint32_t)__builtin_popcount(bits);
+        if (r + c <= r0) { r += c; continue; }       /* the whole word is before the range */
+        while (bits) {
+            const uint32_t b = (uint32_t)__builtin_ctz(bits);
+            bits &= bits - 1u;
+            if (r >= r0 && r < r0 + n) list[r - r0] = (uint32_t)(w << 5) + b;
+            ++r;
+        }
+    }
+}
+
+/* kDsKeptEst: kept positions a row is expected to hold (DeepSeek-V4.1: 2048 blocks of 8), which
+ * sizes the kept kernel's grid and head split -- any grid gives the same bits. kDsKeptSpan: the
+ * kept blocks a workgroup's entries can touch, EPB / block + 2 at block >= 1. */
+constexpr long kDsKeptEst = 16384;
+constexpr int kDsKeptSpan = 258;
+
+/* index_score with keep on the scalar kernel's arithmetic (the decode band, and any pass the WMMA
+ * form does not take): a row's kept positions below its reach are compacted (block order, then
+ * position order) and dealt EPB to a workgroup over a grid-stride loop, so the work is the kept
+ * count's, not the context's. A kept entry runs ds_score_entry exactly as the unrestricted kernel
+ * does (same bits); every other position of the row, to C, is written -inf by a sweep the grid
+ * shares. */
+template <int HS>
+__global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs a) {
+    constexpr int EPB = 256 / HS;
+    float* part = (float*)r4d_ds41_sparse_dyn;       /* [H][EPB], HS > 1 */
+    __shared__ uint32_t ws[33];
+    __shared__ uint32_t list[kDsKeptSpan];
+    const int lane = threadIdx.x & 31, wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
+    const int grp = wave / HS, sub = wave % HS;
+    const int e = grp * 32 + lane;
+    const int hp = (a.H + HS - 1) / HS, h0 = sub * hp, h1 = min(a.H, h0 + hp);
+    const long block = a.block;
+    for (long m = blockIdx.y; m < a.M; m += gridDim.y) {
+        float* srow = a.sc + m * a.sr;
+        const long reach = m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
+        const int* krow = reach > 0 ? a.keep + m * a.kr : nullptr;
+        /* the sweep: positions [x C / G, (x + 1) C / G) of this workgroup, -inf unless kept below reach */
+        {
+            const long g = gridDim.x, x = blockIdx.x;
+            const long p0 = (long)a.C * x / g, p1 = (long)a.C * (x + 1) / g;
+            for (long j = p0 + threadIdx.x; j < p1; j += 256)
+                if (j >= reach || !ds_kept(a, krow, j)) srow[j * a.scs] = -kDsInf;
+        }
+        if (reach <= 0) continue;                    /* block-uniform */
+        const long nbr = (reach < a.C ? reach : (long)a.C) + block - 1;
+        const long nb = nbr / block;                 /* blocks holding a passed position */
+        const DsKeptScan<256> ks = ds_kept_scan<256>(krow, a.kcs, nb, ws);
+        const long nk = (long)ks.total * block;      /* compacted entries (some past reach) */
+        const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
+        for (long x0 = (long)blockIdx.x * EPB; x0 < nk; x0 += (long)gridDim.x * EPB) {
+            const long r0 = x0 / block, r1 = (x0 + EPB - 1) / block + 1;   /* ranks [r0, r1) */
+            const long rn = (r1 < (long)ks.total ? r1 : (long)ks.total) - r0;
+            ds_kept_list<256>(ks, krow, a.kcs, nb, (uint32_t)r0, (uint32_t)rn, list);
+            __syncthreads();
+            const long x = x0 + e;
+            long j = -1;
+            if (x < nk) {
+                const long r = x / block;
+                j = (long)list[r - r0] * block + (x - r * block);
+            }
+            const uint16_t* kp = j >= 0 ? ds_entry_key(a, s, j, reach) : nullptr;
+            const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
+            if (sub == 0 && j >= 0 && j < reach && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+            __syncthreads();                         /* the list is rewritten next round */
+        }
     }
 }
 
@@ -361,14 +689,14 @@ __device__ void ds_emit(const Get& get, uint32_t n, const uint32_t* cache, DsSel
 
 /* ------------------------------------------------------------------ index_topk */
 /* keep: index_candidates' bits, a bit a block of `block` positions (bshift = log2(block) when
- * block is a power of two, else -1). */
+ * block is a power of two, else -1). kept: walk only the kept blocks (keep given, block <= 2^16). */
 struct DsTopkArgs {
     const float* sc;
     const int* keep;
     const int* pos;
     int* sel;
     long sr, scs, kr, kcs, ps, selr, selc;
-    int M, C, K, ratio, block, bshift;
+    int M, C, K, ratio, block, bshift, kept;
 };
 
 __device__ __forceinline__ long ds_topk_reach(const DsTopkArgs& a, long m) {
@@ -383,6 +711,7 @@ struct DsTopkKey {
     const int* krow;
     long scs, kcs, j0;
     int block, bshift;
+    __device__ __forceinline__ long pos(uint32_t i) const { return j0 + (long)i; }
     __device__ __forceinline__ uint32_t operator()(uint32_t i) const {
         const long j = j0 + (long)i;
         if (krow) {
@@ -394,50 +723,128 @@ struct DsTopkKey {
     }
 };
 
+/* The same keys over the kept blocks only: entry i is offset i % block of the (i / block)-th
+ * listed block (list: kept blocks in block order). Positions keep their order, so (key desc, index
+ * asc) over these entries is (key desc, position asc) over the row's candidates -- the selection
+ * DsTopkKey makes over [0, reach), whose other positions are not candidates. Past reach (in the
+ * last kept block) an entry is not a candidate either. */
+struct DsKeptKey {
+    const float* row;
+    const uint32_t* list;
+    long scs, reach;
+    int block, bshift;
+    __device__ __forceinline__ long pos(uint32_t i) const {
+        const uint32_t r = bshift >= 0 ? i >> bshift : i / (uint32_t)block;
+        return (long)list[r] * block + (long)(i - r * (uint32_t)block);
+    }
+    __device__ __forceinline__ uint32_t operator()(uint32_t i) const {
+        const long j = pos(i);
+        if (j >= reach) return 0u;
+        const float v = row[j * scs];
+        return v > -kDsInf ? ds_key(v) : 0u;
+    }
+};
+
+/* kDsKeptMax: kept blocks of a row index_topk lists in LDS (a row with more walks its positions). */
+constexpr int kDsKeptMax = 4096;
+
+/* One row's top-K into srow: the selection over n keys of `get`, positions in order, -1 after. */
+template <class Get>
+__device__ __forceinline__ void ds_topk_row(const Get& get, uint32_t n, uint32_t* cache, DsSelShared* s,
+                                            int* srow, long selc, int K) {
+    uint32_t* c = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
+    ds_select(get, n, (uint32_t)K, c, s);
+    ds_emit(get, n, c, s,
+            [&](uint32_t i, bool take, uint32_t out) { if (take) srow[(long)out * selc] = (int)get.pos(i); },
+            [&](uint32_t tot) {
+                for (long t = (long)tot + threadIdx.x; t < K; t += kDsSelThreads) srow[t * selc] = -1;
+            });
+    __syncthreads();
+}
+
 __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_kernel(DsTopkArgs a) {
     __shared__ DsSelShared s;
     __shared__ uint32_t cache[kDsCache];
+    __shared__ uint32_t list[kDsKeptMax];
     for (long m = blockIdx.x; m < a.M; m += gridDim.x) {
         const uint32_t n = (uint32_t)ds_topk_reach(a, m);
-        const DsTopkKey get{ a.sc + m * a.sr, a.keep ? a.keep + m * a.kr : nullptr, a.scs, a.kcs, 0,
-                             a.block, a.bshift };
-        uint32_t* c = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
-        ds_select(get, n, (uint32_t)a.K, c, &s);
+        const int* krow = a.keep ? a.keep + m * a.kr : nullptr;
         int* srow = a.sel + m * a.selr;
-        const long selc = a.selc;
-        const int K = a.K;
-        ds_emit(get, n, c, &s,
-                [&](uint32_t i, bool take, uint32_t out) { if (take) srow[(long)out * selc] = (int)i; },
-                [&](uint32_t tot) {
-                    for (long t = (long)tot + threadIdx.x; t < K; t += kDsSelThreads) srow[t * selc] = -1;
-                });
-        __syncthreads();
+        if (krow && a.kept) {                        /* the kept blocks only, when they fit the list */
+            const long nb = ((long)n + a.block - 1) / a.block;
+            const DsKeptScan<kDsSelThreads> ks = ds_kept_scan<kDsSelThreads>(krow, a.kcs, nb, s.ws);
+            if (ks.total <= (uint32_t)kDsKeptMax) {  /* block-uniform */
+                ds_kept_list<kDsSelThreads>(ks, krow, a.kcs, nb, 0u, ks.total, list);
+                __syncthreads();
+                const DsKeptKey get{ a.sc + m * a.sr, list, a.scs, (long)n, a.block, a.bshift };
+                ds_topk_row(get, ks.total * (uint32_t)a.block, cache, &s, srow, a.selc, a.K);
+                continue;
+            }
+        }
+        const DsTopkKey get{ a.sc + m * a.sr, krow, a.scs, a.kcs, 0, a.block, a.bshift };
+        ds_topk_row(get, n, cache, &s, srow, a.selc, a.K);
     }
 }
 
 /* The decode form over long rows. Stage 1: each (chunk, row) keeps its chunk's exact top-K as
  * (key << 32 | position), in position order, and its count. A row's winner is among its chunk's
- * K best, so stage 2's top-K over the chunks in order (position order again) is the row's. */
+ * K best, so stage 2's top-K over the chunks in order (position order again) is the row's.
+ * With kept (keep, every chunk's list fitting, see index_topk_body): the chunks deal the row's kept
+ * blocks instead of its positions -- `used[m]` chunks of ceil(kept / used) blocks each, used the
+ * fewest that keeps a chunk within kDsKeptChunk entries (at most nch) -- and stage 2 merges only
+ * the used chunks. Without kept, used[m] = nch. */
+constexpr int kDsKeptChunk = 2048;
+
 struct DsSplitArgs {
     DsTopkArgs t;
     unsigned long long* cand;
     int* cnt;
+    int* used;
     int nch, chunk;
 };
 
 __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_split1_kernel(DsSplitArgs a) {
     __shared__ DsSelShared s;
     __shared__ uint32_t cache[kDsCache];
+    __shared__ uint32_t list[kDsKeptMax];
     const int c = blockIdx.x;
     const long m = blockIdx.y;
-    const long j0 = (long)c * a.chunk;
-    long n = ds_topk_reach(a.t, m) - j0;
-    n = n < 0 ? 0 : (n > a.chunk ? a.chunk : n);
-    const DsTopkKey get{ a.t.sc + m * a.t.sr, a.t.keep ? a.t.keep + m * a.t.kr : nullptr, a.t.scs,
-                         a.t.kcs, j0, a.t.block, a.t.bshift };
-    ds_select(get, (uint32_t)n, (uint32_t)a.t.K, cache, &s);
+    const long reach = ds_topk_reach(a.t, m);
     unsigned long long* out = a.cand + (m * a.nch + c) * (long)a.t.K;
     int* cnt = a.cnt + m * a.nch + c;
+    const int* krow = a.t.keep ? a.t.keep + m * a.t.kr : nullptr;
+    if (krow && a.t.kept) {
+        const long block = a.t.block, nb = (reach + block - 1) / block;
+        const DsKeptScan<kDsSelThreads> ks = ds_kept_scan<kDsSelThreads>(krow, a.t.kcs, nb, s.ws);
+        const long nk = ks.total;
+        long used = (nk * block + kDsKeptChunk - 1) / kDsKeptChunk;
+        used = used < a.nch ? used : a.nch;
+        const long per = used > 0 ? (nk + used - 1) / used : 0;   /* blocks a chunk */
+        const long r0 = (long)c * per, rn = c < used ? (nk - r0 < per ? nk - r0 : per) : 0;
+        if (c == 0 && threadIdx.x == 0) a.used[m] = (int)used;
+        if (rn <= 0) {                               /* block-uniform */
+            if (threadIdx.x == 0) *cnt = 0;
+            return;
+        }
+        ds_kept_list<kDsSelThreads>(ks, krow, a.t.kcs, nb, (uint32_t)r0, (uint32_t)rn, list);
+        __syncthreads();
+        const DsKeptKey get{ a.t.sc + m * a.t.sr, list, a.t.scs, reach, a.t.block, a.t.bshift };
+        const uint32_t n = (uint32_t)(rn * block);
+        uint32_t* cc = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
+        ds_select(get, n, (uint32_t)a.t.K, cc, &s);
+        ds_emit(get, n, cc, &s,
+                [&](uint32_t i, bool take, uint32_t o) {
+                    if (take) out[o] = ((unsigned long long)get(i) << 32) | (unsigned long long)(uint32_t)get.pos(i);
+                },
+                [&](uint32_t tot) { if (threadIdx.x == 0) *cnt = (int)tot; });
+        return;
+    }
+    if (c == 0 && threadIdx.x == 0) a.used[m] = a.nch;
+    const long j0 = (long)c * a.chunk;
+    long n = reach - j0;
+    n = n < 0 ? 0 : (n > a.chunk ? a.chunk : n);
+    const DsTopkKey get{ a.t.sc + m * a.t.sr, krow, a.t.scs, a.t.kcs, j0, a.t.block, a.t.bshift };
+    ds_select(get, (uint32_t)n, (uint32_t)a.t.K, cache, &s);
     ds_emit(get, (uint32_t)n, cache, &s,
             [&](uint32_t i, bool take, uint32_t o) {
                 if (take)
@@ -461,7 +868,9 @@ __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_split2_kernel(D
     __shared__ uint32_t cache[kDsCache];
     for (long m = blockIdx.x; m < a.t.M; m += gridDim.x) {
         const unsigned long long* cr = a.cand + m * a.nch * (long)a.t.K;
-        const uint32_t n = (uint32_t)a.nch * (uint32_t)a.t.K;
+        int used = a.used[m];
+        used = used < 0 ? 0 : (used > a.nch ? a.nch : used);
+        const uint32_t n = (uint32_t)used * (uint32_t)a.t.K;
         const DsCandKey get{ cr, a.cnt + m * a.nch, (uint32_t)a.t.K };
         uint32_t* c = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
         ds_select(get, n, (uint32_t)a.t.K, c, &s);
@@ -550,10 +959,24 @@ struct DsAttnArgs {
     uint16_t* out;
     long qr, outr, wbtr, wbtc, nwblk, cbtr, cbtc, ncblk, selr, selc, wus, ps, cs, sks;
     int nwbt, bs, ncbt, cbs, ratio, S, M, H, win, nk, nkp;
+    int cnv;                                         /* latent_format nvfp4: compressed entries packed */
+    int cslot;                                       /* the compressed cache's slots a position (D / ratio plain) */
     float scale;
 };
 
 constexpr int kDsAttnD = 512;
+
+/* The bf16 at column d of a packed entry (byte d/2's nibble, block d/16's scale), and the pair at an
+ * even d as a word (value d low). */
+__device__ __forceinline__ uint32_t ds_nv4_col(const uint16_t* kk, int d) {
+    const unsigned char* b = (const unsigned char*)kk;
+    const uint32_t code = ((uint32_t)b[d / 2] >> (4 * (d & 1))) & 15u;
+    return ds_nv4_bf16(code, ds_e4m3_f32(b[kDsAttnD / 2 + d / 16]));
+}
+__device__ __forceinline__ uint32_t ds_nv4_pair(uint32_t byte2, uint32_t sbyte) {
+    const float sc = ds_e4m3_f32(sbyte);
+    return ds_nv4_bf16(byte2 & 15u, sc) | (ds_nv4_bf16((byte2 >> 4) & 15u, sc) << 16);
+}
 constexpr int kDsTileRow = 80;                       /* 32 bf16 of a key + 16 bytes of padding */
 constexpr int kDsTileBytes = 8 * 32 * kDsTileRow;    /* one 32-key tile a wave */
 
@@ -598,7 +1021,7 @@ __global__ __launch_bounds__(256) void ds41_attn_sparse_sink_kernel(DsAttnArgs a
                 if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
                     const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
                     if (blk >= 0 && blk < a.ncblk)
-                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)(D / a.ratio);
+                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot;
                 }
             }
             kp[k] = ptr;
@@ -624,8 +1047,15 @@ __global__ __launch_bounds__(256) void ds41_attn_sparse_sink_kernel(DsAttnArgs a
                 for (int c = 0; c < D / 32; ++c) {
                     uint4 v[4];
 #pragma unroll
-                    for (int i = 0; i < 4; ++i)
-                        v[i] = lp[i] ? *(const uint4*)(lp[i] + c * 32 + (lane & 3) * 8) : make_uint4(0, 0, 0, 0);
+                    for (int i = 0; i < 4; ++i) {
+                        const int col = c * 32 + (lane & 3) * 8;
+                        if (a.cnv && kb + i * 8 + (lane >> 2) >= a.win && lp[i]) {   /* a packed entry */
+                            const unsigned char* b = (const unsigned char*)lp[i];
+                            v[i] = ds_nv4_unpack8(*(const uint32_t*)(b + col / 2), ds_e4m3_f32(b[D / 2 + col / 16]));
+                        } else {
+                            v[i] = lp[i] ? *(const uint4*)(lp[i] + col) : make_uint4(0, 0, 0, 0);
+                        }
+                    }
 #pragma unroll
                     for (int i = 0; i < 4; ++i)
                         *(uint4*)(tb + (i * 8 + (lane >> 2)) * kDsTileRow + (lane & 3) * 16) = v[i];
@@ -688,12 +1118,15 @@ __global__ __launch_bounds__(256) void ds41_attn_sparse_sink_kernel(DsAttnArgs a
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 const uint16_t* ptr = kp[k + u];
+                const bool pk = a.cnv && k + u >= a.win && ptr;   /* a packed entry */
                 if constexpr (DPT == 2) {
-                    const uint32_t w = ptr ? *(const uint32_t*)(ptr + dcol) : 0u;
+                    const uint32_t w = pk ? ds_nv4_col(ptr, dcol) | (ds_nv4_col(ptr, dcol + 1) << 16)
+                                          : (ptr ? *(const uint32_t*)(ptr + dcol) : 0u);
                     kv[u][0] = bf16w_lo(w);
                     kv[u][DPT - 1] = bf16w_hi(w);
                 } else {
-                    kv[u][0] = ptr ? bf16_to_f32((uint16_t)ldg_u16(ptr + dcol)) : 0.0f;
+                    kv[u][0] = pk ? bf16w_lo(ds_nv4_col(ptr, dcol))
+                                  : (ptr ? bf16_to_f32((uint16_t)ldg_u16(ptr + dcol)) : 0.0f);
                 }
             }
 #pragma unroll
@@ -771,14 +1204,39 @@ __device__ __forceinline__ uint4 ds_ldg16(const uint16_t* p, int i) {
     return make_uint4(v.x, v.y, v.z, v.w);
 }
 
-struct DsDecLds {
-    long kp, sp, smx, sden, tab, u, sq, bmax, total;
+/* ---- the packed latent's loads (latent_format nvfp4, layout above ds_nv4_bytes): 64 columns of a
+ * packed entry from column chunk c (8 columns a chunk, c a multiple of 8) are 32 code bytes at byte
+ * 4c and 4 scale bytes at byte 256 + c/2; unpacked, they are the 8 x 16 bytes of bf16 the plain
+ * entry holds there. The zero row (all zero bytes) unpacks to zeros. */
+struct DsNv4Raw {
+    uint4 c0, c1;
+    uint32_t sc;
 };
+__device__ __forceinline__ DsNv4Raw ds_nv4_ld64(const uint16_t* kk, int c) {
+    DsNv4Raw r;
+    r.c0 = ds_ldg16(kk, c / 4);
+    r.c1 = ds_ldg16(kk, c / 4 + 1);
+    r.sc = ((__attribute__((address_space(1))) const uint32_t*)kk)[64 + c / 8];
+    return r;
+}
+__device__ __forceinline__ void ds_nv4_unpack64(const DsNv4Raw& r, uint4 (&o)[8]) {
+    const uint32_t w[8] = { r.c0.x, r.c0.y, r.c0.z, r.c0.w, r.c1.x, r.c1.y, r.c1.z, r.c1.w };
+#pragma unroll
+    for (int i = 0; i < 8; ++i) o[i] = ds_nv4_unpack8(w[i], ds_e4m3_f32((r.sc >> (8 * (i / 2))) & 0xffu));
+}
+
+struct DsDecLds {
+    long kp, sp, smx, sden, tab, u, sq, bmax, nvt, total;
+};
+/* The packed direct PV's decode tables (8.11., v3), past everything else: 256 code-byte entries of
+ * two words -- the bits of (float) 2|e2m1| of the low and the high nibble, each with its code's sign
+ * bit -- then 256 floats ds_e4m3_half(b). */
+constexpr long kDsNvTabBytes = 256 * 8 + 256 * 4;
 /* nkq: keys rounded up to 32. kp [nkq] pointers, sp [HG][nkq] scores then p, smx / sden [HG] (sden
  * holds the sinks until the den), tab the 32 doubles of the expf table; then, in one region,
  * sq [HG][512] q and bmax [HG][nkq/32] block maxima (scores) or the two key tiles of a tiled PV
- * (2 x nt x 16 bytes; nt = 0 for the direct PV). */
-__host__ __device__ constexpr DsDecLds ds_dec_lds(int nkq, int hg, int nt) {
+ * (2 x nt x 16 bytes; nt = 0 for the direct PV); nvt the packed direct PV's tables (nvt true). */
+__host__ __device__ constexpr DsDecLds ds_dec_lds(int nkq, int hg, int nt, bool nvt = false) {
     DsDecLds l{};
     l.kp = 0;
     l.sp = (long)nkq * 8;
@@ -790,6 +1248,8 @@ __host__ __device__ constexpr DsDecLds ds_dec_lds(int nkq, int hg, int nt) {
     l.bmax = l.sq + (long)hg * kDsAttnD * 4;
     const long sc = l.bmax + (long)hg * (nkq / 32) * 4, pv = l.u + 2L * nt * 16;
     l.total = sc > pv ? sc : pv;
+    l.nvt = (l.total + 15) / 16 * 16;
+    if (nvt) l.total = l.nvt + kDsNvTabBytes;
     return l;
 }
 
@@ -826,6 +1286,11 @@ __device__ __forceinline__ float ds_expf_tab(float x, const unsigned long long* 
 template <int HS>
 __device__ __forceinline__ int ds_dec_step(const float (&acc)[HS], uint32_t (&w)[4]) {
     int z;
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: no ISA on the host; the offset is 0 there too */
+    (void)acc;
+    (void)w;
+    z = 0;
+#else
     if constexpr (HS == 1)
         asm volatile("v_mov_b32 %0, 0" : "=v"(z), "+v"(w[0]), "+v"(w[1]), "+v"(w[2]), "+v"(w[3]) : "v"(acc[0]));
     else if constexpr (HS == 2)
@@ -834,6 +1299,7 @@ __device__ __forceinline__ int ds_dec_step(const float (&acc)[HS], uint32_t (&w)
     else
         asm volatile("v_mov_b32 %0, 0" : "=v"(z), "+v"(w[0]), "+v"(w[1]), "+v"(w[2]), "+v"(w[3])
                      : "v"(acc[0]), "v"(acc[1]), "v"(acc[2]), "v"(acc[3]));
+#endif
     return z;
 }
 
@@ -922,6 +1388,53 @@ __device__ __forceinline__ void ds_dec_dot_s(float (&acc)[HS], const uint4 (&r)[
     }
 }
 
+/* ds_dec_dot (QS false) or ds_dec_dot_s (QS) over a packed key's 64 columns, the raw code words and
+ * scale bytes of ds_nv4_ld64: each 8-column word is unpacked right before its fmas, behind the fence
+ * of the previous word's sums (ds_dec_step), so one word's bf16 is live at a time. Unpacking all 64
+ * columns ahead (ds_nv4_unpack64) held 32 more VGPRs beside the raw words and the hoisted q, and the
+ * 1024-thread forms spilled (7.11.). The same fmas in the same order: the same bits. */
+template <int HS, bool QS>
+__device__ __forceinline__ void ds_dec_dot_nv(float (&acc)[HS], const DsNv4Raw& r, const float* qp,
+                                              const uint32_t* qw, const int (&ho)[HS]) {
+    const uint32_t w8[8] = { r.c0.x, r.c0.y, r.c0.z, r.c0.w, r.c1.x, r.c1.y, r.c1.z, r.c1.w };
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t f[4] = { w8[i], (r.sc >> (8 * (i / 2))) & 0xffu, 0u, 0u };
+        const int z = ds_dec_step<HS>(acc, f);
+        const float sh = ds_e4m3_half(f[1]);
+        const float kf[8] = {                            /* the 8 values as f32: the bf16's own value */
+            ds_nv4_at<0>(f[0], sh), ds_nv4_at<4>(f[0], sh), ds_nv4_at<8>(f[0], sh), ds_nv4_at<12>(f[0], sh),
+            ds_nv4_at<16>(f[0], sh), ds_nv4_at<20>(f[0], sh), ds_nv4_at<24>(f[0], sh), ds_nv4_at<28>(f[0], sh) };
+        if constexpr (QS) {
+            const uint32_t* qi = qw + __builtin_amdgcn_readfirstlane(z) + i * 4;
+#pragma unroll
+            for (int h = 0; h < HS; ++h) {
+                const uint32_t* qh = qi + ho[h];
+                const uint32_t qq[4] = { qh[0], qh[1], qh[2], qh[3] };
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    acc[h] = __builtin_fmaf(bf16w_lo(qq[e]), kf[2 * e], acc[h]);
+                    acc[h] = __builtin_fmaf(bf16w_hi(qq[e]), kf[2 * e + 1], acc[h]);
+                }
+            }
+        } else {
+            /* one head: q not behind the fence (64 hoisted floats, as ds_dec_dot); more: behind it */
+            const float* qi = qp + (HS == 1 ? 0 : z) + i * 8;
+#pragma unroll
+            for (int h = 0; h < HS; ++h) {
+                const float4 qa = *(const float4*)(qi + h * kDsAttnD);
+                const float4 qb = *(const float4*)(qi + h * kDsAttnD + 4);
+                const float qv[8] = { qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w };
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    acc[h] = __builtin_fmaf(qv[2 * e], kf[2 * e], acc[h]);
+                    acc[h] = __builtin_fmaf(qv[2 * e + 1], kf[2 * e + 1], acc[h]);
+                }
+            }
+        }
+    }
+}
+
 /* Four keys (their DPT columns in kw) into the HPT heads' sums p k, and sum p in the den wave,
  * each chain in key order (libref's mul, then add). */
 template <int HPT, int DPT>
@@ -968,19 +1481,170 @@ __device__ __forceinline__ void ds_dec_pvld(uint32_t (&kv)[32], const uint16_t* 
     }
 }
 
+/* ds_dec_pvld for packed keys (DPT 2: dcol even, the pair in one code byte): the code byte and the
+ * scale byte of N of the 32 keys, those whose pointers lanes b0 .. b0 + N - 1 hold (b0 wave-uniform). The two bytes of a
+ * key sit in two registers until they land, so a packed ring holds half the plain ring's keys (N 16)
+ * for the same 32 loads in flight: a 32-key packed ring (64 registers in flight + 32 unpacking)
+ * spilled 280-400 VGPRs to scratch in every 1024-thread form (7.11.: 1 row 30.3 ms/step vs 20.6). */
+/* 8.11. (v3): both bytes of a key land in one register -- the code byte in the low half, the scale byte in the high
+ * (kv = code | scale << 16) -- as two 16-bit halves of a vector (d16 loads). A 32-key slot then holds what a 16-key
+ * slot held, so the direct PV walks the packed blocks a block a step, two blocks of loads in flight, as the plain walk
+ * does (the 16-key ring took twice the steps, each behind the previous slot's sums). (Buffer loads from the same base,
+ * tried for their SGPR addressing, land the bytes in two registers and spilled.) */
+typedef unsigned short ds_u16x2 __attribute__((ext_vector_type(2)));
+template <int N>
+__device__ __forceinline__ void ds_dec_pvld_nv(uint32_t (&kv)[N], const uint16_t* lp, uint32_t cb, uint32_t sb, int b0) {
+    const unsigned long long v = (unsigned long long)lp;
+    const int lo = (int)(uint32_t)v, hi = (int)(uint32_t)(v >> 32);
+#pragma unroll
+    for (int u = 0; u < N; ++u) {
+        const unsigned long long pu = ((unsigned long long)(uint32_t)__builtin_amdgcn_readlane(hi, b0 + u) << 32) |
+                                      (uint32_t)__builtin_amdgcn_readlane(lo, b0 + u);
+        const __attribute__((address_space(1))) const unsigned char* b =
+            (const __attribute__((address_space(1))) unsigned char*)pu;
+        ds_u16x2 h;
+        h.x = (unsigned short)b[cb];
+        h.y = (unsigned short)b[sb];
+        kv[u] = __builtin_bit_cast(uint32_t, h);
+    }
+}
+/* p through an empty asm that reads the PV sums: the packed PV ring's next loads cannot be hoisted
+ * above the previous slot's fmas (the scheduler otherwise issued a whole block's loads at once, two
+ * registers a key, and spilled). */
 template <int HPT, int DPT>
-__device__ __forceinline__ void ds_dec_pvsum(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[32],
+__device__ __forceinline__ const uint16_t* ds_dec_pfence(const uint16_t* p, const float (&acc)[HPT][DPT]) {
+#ifdef R4D_EMU_HOST
+    (void)acc;
+    return p;
+#else
+    static_assert(HPT * DPT <= 4, "the fence reads at most four sums");
+    unsigned long long v = (unsigned long long)p;
+    uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
+    const float* f = &acc[0][0];
+    if constexpr (HPT * DPT == 1) asm volatile("" : "+v"(lo), "+v"(hi) : "v"(f[0]));
+    else if constexpr (HPT * DPT == 2) asm volatile("" : "+v"(lo), "+v"(hi) : "v"(f[0]), "v"(f[1]));
+    else asm volatile("" : "+v"(lo), "+v"(hi) : "v"(f[0]), "v"(f[1]), "v"(f[2]), "v"(f[3]));
+    return (const uint16_t*)(((unsigned long long)hi << 32) | lo);
+#endif
+}
+
+/* ds_dec_pv4 over four packed keys (kv: code byte | scale byte << 16, DPT 2: the column pair of one code byte), the
+ * values as f32 by ds_nv4_at -- the same products and sums in the same order as over their bf16. The forms with two
+ * heads a PV thread (HPT 2) decode in registers, shared by the heads (the LDS tables below spilled them). */
+template <int HPT, int DPT>
+__device__ __forceinline__ void ds_dec_pv4_nv(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kw)[4],
+                                              const float* ph, int nkq, int k0, bool dw) {
+    static_assert(DPT == 2, "a code byte is a column pair");
+    float kf[4][DPT];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const float sh = ds_e4m3_half(kw[u] >> 16);
+        kf[u][0] = ds_nv4_at<0>(kw[u], sh);
+        kf[u][1] = ds_nv4_at<4>(kw[u], sh);
+    }
+#pragma unroll
+    for (int j = 0; j < HPT; ++j) {
+        const float4 pv = *(const float4*)(ph + (long)j * nkq + k0);
+        const float pk[4] = { pv.x, pv.y, pv.z, pv.w };
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+#pragma unroll
+            for (int d = 0; d < DPT; ++d) {
+                const float prod = pk[u] * kf[u][d];
+                acc[j][d] = acc[j][d] + prod;
+            }
+        }
+        if (dw) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) den[j] = den[j] + pk[u];
+        }
+    }
+}
+template <int HPT, int DPT, int N>
+__device__ __forceinline__ void ds_dec_pvsum_nv(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[N],
+                                                const float* ph, int nkq, int k0, bool dw) {
+#pragma unroll
+    for (int u0 = 0; u0 < N; u0 += 4) {
+        const uint32_t kw[4] = { kv[u0], kv[u0 + 1], kv[u0 + 2], kv[u0 + 3] };
+        ds_dec_pv4_nv<HPT, DPT>(acc, den, kw, ph, nkq, k0 + u0, dw);
+    }
+}
+/* Does a decode form decode the packed PV by the LDS tables: the direct PV with one head a PV thread (the kernel's
+ * NHP = min(NT / (512 / DPT), HG), HPT = HG / NHP). The host sizes the LDS by it. */
+__host__ __device__ constexpr bool ds_dec_nvt(int hg, int nt, int dpt, bool pvd, bool nv) {
+    const int ncg = kDsAttnD / dpt, nhp = (nt / ncg) < hg ? (nt / ncg) : hg;
+    return nv && pvd && hg / nhp == 1;
+}
+/* ds_dec_pv4 over four packed keys (kv: code byte | scale byte << 16, DPT 2: the column pair of one code byte) by
+ * the LDS tables (tc: a code byte's two nibbles as the bits of (float) 2|e2m1| with the sign bit,
+ * ts: ds_e4m3_half of a scale byte): the value is |t| x sh with t's sign bit or-ed in -- ds_nv4_at's float, its product
+ * and its sign, the same bits -- in two loads, two multiplies and two ors a key instead of some twenty instructions. */
+template <int HPT, int DPT>
+__device__ __forceinline__ void ds_dec_pv4_nvt(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kw)[4],
+                                               const float* ph, int nkq, int k0, bool dw, const uint2* tc,
+                                               const float* ts) {
+    static_assert(DPT == 2, "a code byte is a column pair");
+    float kf[4][DPT];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const float sh = ts[kw[u] >> 16];
+        const uint2 t = tc[kw[u] & 0xffu];
+        kf[u][0] = __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, __builtin_fabsf(__builtin_bit_cast(float, t.x)) * sh) |
+                                                 (t.x & 0x80000000u));
+        kf[u][1] = __builtin_bit_cast(float, __builtin_bit_cast(uint32_t, __builtin_fabsf(__builtin_bit_cast(float, t.y)) * sh) |
+                                                 (t.y & 0x80000000u));
+    }
+#pragma unroll
+    for (int j = 0; j < HPT; ++j) {
+        const float4 pv = *(const float4*)(ph + (long)j * nkq + k0);
+        const float pk[4] = { pv.x, pv.y, pv.z, pv.w };
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+#pragma unroll
+            for (int d = 0; d < DPT; ++d) {
+                const float prod = pk[u] * kf[u][d];
+                acc[j][d] = acc[j][d] + prod;
+            }
+        }
+        if (dw) {
+#pragma unroll
+            for (int u = 0; u < 4; ++u) den[j] = den[j] + pk[u];
+        }
+    }
+}
+template <int HPT, int DPT, int N>
+__device__ __forceinline__ void ds_dec_pvsum_nvt(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[N],
+                                                 const float* ph, int nkq, int k0, bool dw, const uint2* tc,
+                                                 const float* ts) {
+#pragma unroll
+    for (int u0 = 0; u0 < N; u0 += 4) {
+        const uint32_t kw[4] = { kv[u0], kv[u0 + 1], kv[u0 + 2], kv[u0 + 3] };
+        ds_dec_pv4_nvt<HPT, DPT>(acc, den, kw, ph, nkq, k0 + u0, dw, tc, ts);
+    }
+}
+/* The table entries: code byte c's two values' (float) 2|e2m1| bits with the sign bit (ds_nv4_at<0>, <4>), and
+ * ds_e4m3_half(c). */
+__device__ __forceinline__ uint2 ds_nv4_tab(uint32_t c) {
+    const uint32_t lo = __builtin_bit_cast(uint32_t, (float)((0xC8643210u >> ((c & 7u) << 2)) & 15u)) | ((c & 8u) << 28);
+    const uint32_t hi = __builtin_bit_cast(uint32_t, (float)((0xC8643210u >> (((c >> 4) & 7u) << 2)) & 15u)) |
+                        ((c & 0x80u) << 24);
+    return make_uint2(lo, hi);
+}
+
+template <int HPT, int DPT, int N = 32>
+__device__ __forceinline__ void ds_dec_pvsum(float (&acc)[HPT][DPT], float (&den)[HPT], const uint32_t (&kv)[N],
                                              const float* ph, int nkq, int k0, bool dw) {
 #pragma unroll
-    for (int u0 = 0; u0 < 32; u0 += 4) {
+    for (int u0 = 0; u0 < N; u0 += 4) {
         const uint32_t kw[4] = { kv[u0], kv[u0 + 1], kv[u0 + 2], kv[u0 + 3] };
         ds_dec_pv4<HPT, DPT>(acc, den, kw, ph, nkq, k0 + u0, dw);
     }
 }
 
 
-template <int HG, int NT, int DPT, int P, bool PVD>
+template <int HG, int NT, int DPT, int P, bool PVD, bool NV>
 __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
+    static_assert(!NV || DPT == 2, "the packed latent's PV reads a column pair from one code byte");
     constexpr int D = kDsAttnD, NW = NT / 32, NCG = D / DPT, TK = NT / 64;
     constexpr int NHP = (NT / NCG) < HG ? (NT / NCG) : HG;   /* head parts in PV */
     constexpr int HPT = HG / NHP;                           /* heads a PV thread */
@@ -990,7 +1654,8 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
     static_assert(NT % 64 == 0 && 32 % TK == 0 && TK % 4 == 0 && NT >= NCG && HG % NHP == 0 &&
                   (DPT == 1 || DPT == 2) && P >= 1, "layout");
     const int nkq = (a.nk + 31) / 32 * 32, nkb = nkq / 32, ntl = nkq / TK;
-    const DsDecLds L = ds_dec_lds(nkq, HG, PVD ? 0 : NT);
+    constexpr bool NVT = ds_dec_nvt(HG, NT, DPT, PVD, NV);   /* the packed PV by LDS tables */
+    const DsDecLds L = ds_dec_lds(nkq, HG, PVD ? 0 : NT, NVT);
     const uint16_t** kp = (const uint16_t**)(r4d_ds41_sparse_dyn + L.kp);
     float* sp = (float*)(r4d_ds41_sparse_dyn + L.sp);
     float* sq = (float*)(r4d_ds41_sparse_dyn + L.sq);
@@ -1027,7 +1692,7 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
                 if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
                     const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
                     if (blk >= 0 && blk < a.ncblk)
-                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)(D / a.ratio);
+                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot;
                 }
             }
             kp[k] = ptr;
@@ -1040,13 +1705,25 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
         }
         if (tid < 32) tab[tid] = kDsExp2fTab[tid];
         if (tid < hmax) sden[tid] = a.sink[(long)(hg0 + tid) * a.sks];   /* the sinks, until the den */
+        if constexpr (NVT) {   /* the packed direct PV's decode tables */
+            for (int c = tid; c < 256; c += NT) {
+                ((uint2*)(r4d_ds41_sparse_dyn + L.nvt))[c] = ds_nv4_tab((uint32_t)c);
+                ((float*)(r4d_ds41_sparse_dyn + L.nvt + 256 * 8))[c] = ds_e4m3_half((uint32_t)c);
+            }
+        }
     }
     lds_barrier();
 
     /* ---- scores: a lane a key, every dot in d order. A wave task is (32 keys, HS heads); the
      * NSG tasks of a key block go to neighbouring waves, so the block's second read hits L0.
      * Four heads read q by scalar loads (QS; LDS-bound otherwise), fewer from LDS. */
-    for (int t = wave; t < nkb * NSG; t += NW) {
+    /* Key blocks [0, nwb) are plain bf16; with a packed latent (a.cnv, the window a multiple of 32)
+     * blocks [nwb, nkb) are the packed compressed entries, scored by the same task with packed
+     * loads unpacked to the same 16-byte bf16 words right before the dot: two loops, no branch
+     * around a load in either. */
+    const int nwb = NV ? a.win / 32 : nkb;
+    auto score_task = [&](int t, auto packed) {
+        constexpr bool PK = decltype(packed)::value;
         const int kb = t / NSG, g = t % NSG;
         const int k = kb * 32 + lane;
         const uint16_t* kk = kp[k];
@@ -1059,22 +1736,35 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
         int ho[HS];
 #pragma unroll
         for (int h = 0; h < HS; ++h) ho[h] = (g * HS + h < hmax ? g * HS + h : 0) * (D / 2);
-        uint4 ra[8], rb[8];
+        [[maybe_unused]] uint4 ra[8], rb[8];
+        [[maybe_unused]] DsNv4Raw pa, pb;
+        if constexpr (PK) pa = ds_nv4_ld64(kk, 0);
+        else {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) ra[i] = ds_ldg16(kk, i);
+            for (int i = 0; i < 8; ++i) ra[i] = ds_ldg16(kk, i);
+        }
         /* No branch around a load (the wait counts would fall back to 0): the last pass reloads
          * its own first half, unused. */
 #pragma unroll 1
         for (int c = 0; c < D / 8; c += 16) {
+            if constexpr (PK) {
+                /* packed: each word unpacked right before its fmas (ds_dec_dot_nv) */
+                const int cn = c + 16 < D / 8 ? c + 16 : c;
+                pb = ds_nv4_ld64(kk, c + 8);
+                ds_dec_dot_nv<HS, QS>(acc, pa, qg + c * 8, qw + c * 4, ho);
+                pa = ds_nv4_ld64(kk, cn);
+                ds_dec_dot_nv<HS, QS>(acc, pb, qg + (c + 8) * 8, qw + (c + 8) * 4, ho);
+            } else {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) rb[i] = ds_ldg16(kk, c + 8 + i);
-            if constexpr (QS) ds_dec_dot_s<HS>(acc, ra, qw + c * 4, ho);
-            else ds_dec_dot<HS>(acc, ra, qg + c * 8);
-            const int cn = c + 16 < D / 8 ? c + 16 : c;
+                for (int i = 0; i < 8; ++i) rb[i] = ds_ldg16(kk, c + 8 + i);
+                if constexpr (QS) ds_dec_dot_s<HS>(acc, ra, qw + c * 4, ho);
+                else ds_dec_dot<HS>(acc, ra, qg + c * 8);
+                const int cn = c + 16 < D / 8 ? c + 16 : c;
 #pragma unroll
-            for (int i = 0; i < 8; ++i) ra[i] = ds_ldg16(kk, cn + i);
-            if constexpr (QS) ds_dec_dot_s<HS>(acc, rb, qw + (c + 8) * 4, ho);
-            else ds_dec_dot<HS>(acc, rb, qg + (c + 8) * 8);
+                for (int i = 0; i < 8; ++i) ra[i] = ds_ldg16(kk, cn + i);
+                if constexpr (QS) ds_dec_dot_s<HS>(acc, rb, qw + (c + 8) * 4, ho);
+                else ds_dec_dot<HS>(acc, rb, qg + (c + 8) * 8);
+            }
         }
 #pragma unroll
         for (int h = 0; h < HS; ++h) {
@@ -1084,6 +1774,12 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
             const float t2 = r4d_wave_max(-1e30f < v ? v : -1e30f);
             if (lane == 0) bmax[hh * nkb + kb] = t2;
         }
+    };
+    {
+        int t = wave;
+        for (; t < nwb * NSG; t += NW) score_task(t, std::false_type{});
+        if constexpr (NV)
+            for (; t < nkb * NSG; t += NW) score_task(t, std::true_type{});
     }
 
     /* PV through LDS tiles: the first tiles' loads go out now, under the softmax. A thread carries
@@ -1091,11 +1787,33 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
      * branch (the wait counts would fall back to 0): past the last tile they read the zero row. */
     const int lk = tid >> 6, lc = tid & 63;
     uint4 rg[PVD ? 1 : P];
+    /* NV: a tile of packed keys (tile t * TK >= win) carries its piece as the code word (byte 4 lc)
+     * and the scale byte (256 + lc / 2), unpacked when it goes to LDS; every load reads either the
+     * key or the zero row, so none sits under a branch. */
+    [[maybe_unused]] uint32_t rw[NV && !PVD ? P : 1], rs[NV && !PVD ? P : 1];
+    [[maybe_unused]] const int ptl = NV ? a.win / TK : ntl;   /* tiles [0, ptl) plain */
+    auto ldp = [&](int s, int tt, const uint16_t* pp) {      /* tile tt's piece into ring slot s */
+        if constexpr (NV) {
+            const bool pk = tt >= ptl;
+            rg[s] = ds_ldg16(pk ? zero : pp, lc);
+            const __attribute__((address_space(1))) const unsigned char* b =
+                (const __attribute__((address_space(1))) unsigned char*)(pk ? pp : zero);
+            rw[s] = *(const __attribute__((address_space(1))) uint32_t*)(b + 4 * lc);
+            rs[s] = b[kDsAttnD / 2 + lc / 2];
+        } else {
+            (void)tt;
+            rg[s] = ds_ldg16(pp, lc);
+        }
+    };
+    auto piece = [&](int s, int tt) -> uint4 {              /* ring slot s (tile tt) as 16 bf16 bytes */
+        if constexpr (NV) return tt >= ptl ? ds_nv4_unpack8_fast(rw[s], ds_e4m3_half(rs[s])) : rg[s];
+        else { (void)tt; return rg[s]; }
+    };
     if constexpr (!PVD) {
 #pragma unroll
         for (int s = 0; s < P; ++s) {
             const uint16_t* pp = kp[min(s, ntl - 1) * TK + lk];
-            rg[s] = ds_ldg16(s < ntl ? pp : zero, lc);
+            ldp(s, s, s < ntl ? pp : zero);
         }
     }
     lds_barrier();
@@ -1128,26 +1846,60 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
     if constexpr (PVD) {
         /* Straight from global: a wave walks 32-key blocks, lane L holding block key L's pointer
          * (handed to the whole wave by readlane), one block's loads in flight while the previous
-         * block is summed. Past the last block the loads read the zero row. */
+         * block is summed. Past the last block the loads read the zero row. The plain blocks
+         * [0, nwb) walk so; the packed ones (a.cnv) after them in 16-key slots (below). */
         if (pvt) {
-            uint32_t kv[2][32];
-            const uint16_t* lp = kp[lane];
-            ds_dec_pvld<DPT>(kv[0], lp, dcol);
-#pragma unroll 1
-            for (int kb = 0; kb < nkb; kb += 2) {
-                lp = kb + 1 < nkb ? kp[(kb + 1) * 32 + lane] : zero;
-                ds_dec_pvld<DPT>(kv[1], lp, dcol);
-                ds_dec_pvsum<HPT, DPT>(acc, den, kv[0], ph, nkq, kb * 32, dw);
-                lp = kb + 2 < nkb ? kp[(kb + 2) * 32 + lane] : zero;
+            auto walk = [&](int kb0, int kb1) {
+                if (kb0 >= kb1) return;
+                uint32_t kv[2][32];
+                const uint16_t* lp = kp[kb0 * 32 + lane];
                 ds_dec_pvld<DPT>(kv[0], lp, dcol);
-                if (kb + 1 < nkb) ds_dec_pvsum<HPT, DPT>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw);
+#pragma unroll 1
+                for (int kb = kb0; kb < kb1; kb += 2) {
+                    lp = kb + 1 < kb1 ? kp[(kb + 1) * 32 + lane] : zero;
+                    ds_dec_pvld<DPT>(kv[1], lp, dcol);
+                    ds_dec_pvsum<HPT, DPT>(acc, den, kv[0], ph, nkq, kb * 32, dw);
+                    lp = kb + 2 < kb1 ? kp[(kb + 2) * 32 + lane] : zero;
+                    ds_dec_pvld<DPT>(kv[0], lp, dcol);
+                    if (kb + 1 < kb1) ds_dec_pvsum<HPT, DPT>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw);
+                }
+            };
+            walk(0, nwb);
+            /* The packed blocks [nwb, nkb), a block (32 keys, one register a key: ds_dec_pvld_nv) a
+             * step: the next block's loads go out while this one is summed, in key order, as the
+             * plain walk above; past the last block the loads read the zero row (no load under a
+             * branch). The next loads sit behind the fence of the previous block's sums. */
+            if constexpr (NV) {
+                if (nwb < nkb) {
+                    const uint32_t cb = (uint32_t)dcol / 2u, sb = (uint32_t)(kDsAttnD / 2 + dcol / 16);
+                    [[maybe_unused]] const uint2* tc = (const uint2*)(r4d_ds41_sparse_dyn + L.nvt);
+                    [[maybe_unused]] const float* ts = (const float*)(r4d_ds41_sparse_dyn + L.nvt + 256 * 8);
+                    uint32_t kv[2][32];
+                    const uint16_t* lp = kp[nwb * 32 + lane];
+                    ds_dec_pvld_nv<32>(kv[0], lp, cb, sb, 0);
+#pragma unroll 1
+                    for (int kb = nwb; kb < nkb; kb += 2) {
+                        lp = kb + 1 < nkb ? kp[(kb + 1) * 32 + lane] : zero;
+                        lp = ds_dec_pfence<HPT, DPT>(lp, acc);
+                        ds_dec_pvld_nv<32>(kv[1], lp, cb, sb, 0);
+                        if constexpr (NVT) ds_dec_pvsum_nvt<HPT, DPT, 32>(acc, den, kv[0], ph, nkq, kb * 32, dw, tc, ts);
+                        else ds_dec_pvsum_nv<HPT, DPT, 32>(acc, den, kv[0], ph, nkq, kb * 32, dw);
+                        lp = kb + 2 < nkb ? kp[(kb + 2) * 32 + lane] : zero;
+                        lp = ds_dec_pfence<HPT, DPT>(lp, acc);
+                        ds_dec_pvld_nv<32>(kv[0], lp, cb, sb, 0);
+                        if (kb + 1 < nkb) {
+                            if constexpr (NVT) ds_dec_pvsum_nvt<HPT, DPT, 32>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw, tc, ts);
+                            else ds_dec_pvsum_nv<HPT, DPT, 32>(acc, den, kv[1], ph, nkq, (kb + 1) * 32, dw);
+                        }
+                    }
+                }
             }
         }
     } else {
-        *(uint4*)(tiles + lk * (D * 2) + lc * 16) = rg[0];
+        *(uint4*)(tiles + lk * (D * 2) + lc * 16) = piece(0, 0);
         {
             const uint16_t* pp = kp[min(P, ntl - 1) * TK + lk];
-            rg[0] = ds_ldg16(P < ntl ? pp : zero, lc);
+            ldp(0, P, P < ntl ? pp : zero);
         }
         lds_barrier();
 #pragma unroll 1
@@ -1172,8 +1924,8 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
                 }
                 /* tile t+1 into the other buffer (read last before the previous barrier) */
                 const int sn = (s + 1) % P;
-                *(uint4*)(tiles + ((t + 1) & 1) * (TK * D * 2) + lk * (D * 2) + lc * 16) = rg[sn];
-                rg[sn] = ds_ldg16(t + 1 + P < ntl ? pp : zero, lc);
+                *(uint4*)(tiles + ((t + 1) & 1) * (TK * D * 2) + lk * (D * 2) + lc * 16) = piece(sn, t + 1);
+                ldp(sn, t + 1 + P, t + 1 + P < ntl ? pp : zero);
                 lds_barrier();
             }
         }
@@ -1253,7 +2005,14 @@ __device__ __forceinline__ uint32_t ds_rne_hi(float f) {        /* bf16 of a fin
     return (u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u;
 }
 
-template <bool LO>
+/* NV (latent_format nvfp4): a 16-key tile at or past the window (win a multiple of 16) holds packed
+ * entries. Its K rows (kn) are the 32 code bytes and 4 scale bytes of the lane's 64 columns, unpacked
+ * to the same bf16 words; its transposed rows (kt) come through this wave's 4 KiB of LDS (past the
+ * score buffers): every lane writes its key's 64 values column-major, [128 columns][16 keys], and
+ * reads kt[j] as the 8 keys global_load_tr would hand it, one 16-byte read each. */
+constexpr int kWmNvBytes = kWmWaves * kWmCols * 16 * 2;
+
+template <bool LO, bool NV>
 __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(DsAttnArgs a, float sl2) {
     constexpr int D = kDsAttnD;
     constexpr float kL2e = 1.4426950408889634f;
@@ -1292,7 +2051,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(DsAttnArg
                 if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
                     const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
                     if (blk >= 0 && blk < a.ncblk)
-                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)(D / a.ratio);
+                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot;
                 }
             }
             if (k < nkk) kp[k] = ptr ? ptr : kDsZeroKey;
@@ -1321,14 +2080,45 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(DsAttnArg
         for (int j = 0; j < 8; ++j) o[j] = (ds_v8f)(0.0f);
         float mrun = -1e30f, den = 0.0f;
         uint4 kn[8];
-        {
-            const uint16_t* pk = kp[kq] + c0 + 64 * hf;
+        [[maybe_unused]] DsNv4Raw kr;                /* NV: the next packed tile's raw K row */
+        [[maybe_unused]] unsigned char* tw = (unsigned char*)sbuf + kWmSbufBytes + wave * (kWmCols * 16 * 2);
+        [[maybe_unused]] const int ptk = NV ? a.win / 16 : nkt;   /* tiles [0, ptk) plain */
+        auto ldk = [&](int tt) {                     /* tile tt's K row: kn, or (packed) kr */
+            const uint16_t* pk = kp[tt * 16 + kq];
+            if (NV && tt >= ptk) {
+                const unsigned char* b = (const unsigned char*)pk;
+                kr.c0 = *(const uint4*)(b + (c0 + 64 * hf) / 2);
+                kr.c1 = *(const uint4*)(b + (c0 + 64 * hf) / 2 + 16);
+                kr.sc = *(const uint32_t*)(b + D / 2 + (c0 + 64 * hf) / 16);
+            } else {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) kn[i] = *(const uint4*)(pk + 8 * i);
-        }
+                for (int i = 0; i < 8; ++i) kn[i] = *(const uint4*)(pk + c0 + 64 * hf + 8 * i);
+            }
+        };
+        ldk(0);
         for (int t = 0; t < nkt; ++t) {
             uint4 kt[8];
-            {
+            if (NV && t >= ptk) {                    /* tile-uniform */
+                ds_nv4_unpack64(kr, kn);
+                /* key kq's columns c0 + 64 hf + 8 i + e -> T[64 hf + 8 i + e][kq] */
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const uint32_t w[4] = { kn[i].x, kn[i].y, kn[i].z, kn[i].w };
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const int col = 64 * hf + 8 * i + e;
+                        *(uint16_t*)(tw + (col * 16 + kq) * 2) = (uint16_t)((e & 1) ? (w[e / 2] >> 16) : (w[e / 2] & 0xffffu));
+                    }
+                }
+                ds_wave_sync();
+                /* kt[j] of lane L: keys 8 (L / 16) .. + 7 at column 8 ((L / 8) & 1) + 16 j + L % 8 */
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = 8 * ((lane >> 3) & 1) + 16 * j + (lane & 7);
+                    kt[j] = *(const uint4*)(tw + (col * 16 + 8 * hf) * 2);
+                }
+                ds_wave_sync();                      /* the reads before the next tile's writes */
+            } else {
                 const uint16_t* pt = kp[t * 16 + ktr] + dtr;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) kt[j] = ds_load_tr(pt + 16 * j);
@@ -1336,11 +2126,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(DsAttnArg
             ds_v8f sp = (ds_v8f)(0.0f);
 #pragma unroll
             for (int i = 0; i < 8; ++i) sp = ds_wmma(kn[i], qf[i], sp);
-            if (t + 1 < nkt) {
-                const uint16_t* pk = kp[(t + 1) * 16 + kq] + c0 + 64 * hf;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) kn[i] = *(const uint4*)(pk + 8 * i);
-            }
+            if (t + 1 < nkt) ldk(t + 1);
             float4* sb = sbuf + (t & 1) * (kWmWaves * 64);
             sb[wave * 64 + lane] = make_float4(sp[0], sp[1], sp[2], sp[3]);
             sb[wave * 64 + 32 + lane] = make_float4(sp[4], sp[5], sp[6], sp[7]);
@@ -1427,23 +2213,48 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(DsAttnArg
  * 16 dims, q held in registers), D lane L = entry L%16, heads 8(L/16)+e. Then libref's roundings:
  * the dot to bf16, relu x the rounded head weight, rounded, summed in head order (the running sum
  * hops lanes L <-> L^16 between 8-head runs), rounded. Only the dot's summation order differs
- * from libref, so a score moves only where the f32 dot sat at a bf16 rounding boundary. */
+ * from libref, so a score moves only where the f32 dot sat at a bf16 rounding boundary.
+ *
+ * KEEP (the candidate restriction): a workgroup's 8 waves walk kIwKeepEB entries each instead, and
+ * a 16-entry tile none of whose entries is kept is skipped (-inf written, no key read, no WMMA).
+ * A kept tile runs exactly the instructions of the KEEP = false form on the same operands, an
+ * unkept entry in it reading the zero key (a WMMA column is its own entry's), and an unkept entry
+ * scores -inf: so every kept entry has the KEEP = false form's bits. The wave's keep words over
+ * its span sit one a lane: a 1024-entry span aligned to 1024 touches at most 32 words at any
+ * block (exactly 32 at block 1, at most 18 at block >= 2). */
 constexpr int kIwEB = 128;                           /* entries a workgroup */
+constexpr int kIwKeepEB = 1024;                      /* ... with keep */
+static_assert(kIwKeepEB == 1024, "the keep words of a span, one a lane, assume 1024-entry spans");
 
-template <int HT>
+template <int HT, bool KEEP>
 __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a) {
-    constexpr int DM = 128;
+    constexpr int DM = 128, EB = KEEP ? kIwKeepEB : kIwEB;
     const int lane = threadIdx.x & 31, hf = lane >> 4;
     const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
     const long m = (long)blockIdx.y * 8 + wave;
     if (m >= a.M) return;
-    const long jb = (long)blockIdx.x * kIwEB;
-    const long jend = jb + kIwEB < (long)a.C ? jb + kIwEB : (long)a.C;
+    const long jb = (long)blockIdx.x * EB;
+    const long jend = jb + EB < (long)a.C ? jb + EB : (long)a.C;
     float* srow = a.sc + m * a.sr;
     const long reach = m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
     if (jb >= reach) {
         for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
         return;
+    }
+    /* KEEP: lane i holds the row's keep word kw0 + i of the words over [jb, min(jend, reach)), 0
+     * past them; none set is a span with no kept entry, -inf without a key read (wave-uniform). */
+    [[maybe_unused]] unsigned kword = 0u;
+    [[maybe_unused]] long kw0 = 0;
+    if constexpr (KEEP) {
+        const int* krow = a.keep + m * a.kr;
+        const long jl = (jend < reach ? jend : reach) - 1;
+        kw0 = ds_keep_block(a, jb) >> 5;
+        const long nw = (ds_keep_block(a, jl) >> 5) - kw0 + 1;
+        kword = lane < nw ? (unsigned)krow[(kw0 + lane) * a.kcs] : 0u;
+        if (__builtin_amdgcn_ballot_w32(kword != 0u) == 0u) {
+            for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
+            return;
+        }
     }
     const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
     uint4 qf[HT][8];
@@ -1469,18 +2280,40 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
             break;
         }
         const long j = j0 + (lane & 15);
+        bool live = j < jend && j < reach;
+        if constexpr (KEEP) {
+            /* This entry's bit from the lane holding its word; a tile with none kept is skipped
+             * (wave-uniform: lanes L and L^16 hold the same entry). */
+            long wi = live ? (ds_keep_block(a, j) >> 5) - kw0 : 0;
+            wi = wi < 0 ? 0 : (wi > 31 ? 31 : wi);
+            const unsigned wd = (unsigned)__builtin_amdgcn_ds_bpermute((int)wi << 2, (int)kword);
+            live = live && ((wd >> (ds_keep_block(a, j) & 31)) & 1u) != 0u;
+            if (__builtin_amdgcn_ballot_w32(live) == 0u) {
+                if (hf == 1 && j < jend) srow[j * a.scs] = -kDsInf;
+                continue;
+            }
+        }
         const uint16_t* kp = nullptr;
-        if (j < jend && j < reach) {
+        if (live) {
             const long col = (j * a.ratio) / a.cbs;
             if (col < a.nbt) {
                 const long blk = a.bt[(long)s * a.btr + col * a.btc];
                 if (blk >= 0 && blk < a.nblk) kp = a.kc + (blk * a.cbs + (j * a.ratio) % a.cbs) * (long)a.slot;
             }
         }
-        const uint16_t* pk = (kp ? kp : kDsZeroKey) + 64 * hf;
         uint4 kb[8];
+        if (a.kmx) {   /* this lane's half: code bytes [32 hf, 32 hf + 32), scale bytes 2 hf, 2 hf + 1 */
+            const unsigned char* pb = (const unsigned char*)(kp ? kp : kDsZeroKey);
+            const uint4 c0 = *(const uint4*)(pb + 32 * hf), c1 = *(const uint4*)(pb + 32 * hf + 16);
+            const uint32_t e0 = pb[64 + 2 * hf], e1 = pb[64 + 2 * hf + 1];
+            const uint32_t cw[8] = { c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w };
 #pragma unroll
-        for (int i = 0; i < 8; ++i) kb[i] = *(const uint4*)(pk + 8 * i);
+            for (int i = 0; i < 8; ++i) kb[i] = ds_mx4_unpack8(cw[i], i < 4 ? e0 : e1);
+        } else {
+            const uint16_t* pk = (kp ? kp : kDsZeroKey) + 64 * hf;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) kb[i] = *(const uint4*)(pk + 8 * i);
+        }
         ds_v8f d[HT];
 #pragma unroll
         for (int t = 0; t < HT; ++t) {
@@ -1506,6 +2339,87 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
     }
 }
 
+/* ================================================================== entry_store, mxfp4 */
+/* entry_store's format mxfp4: one thread a value, a wave a 32-value block, a workgroup a row (n / 32
+ * waves): the block's ue8m0 scale by quant_roundtrip's rule from its amax, the e2m1 codes of v /
+ * scale (exact for a power of two), two a byte, then the scale bytes and the zero pad (layout above
+ * ds_mx4_bytes). */
+__global__ __launch_bounds__(1024) void ds41_entry_store_mx4_kernel(const uint16_t* x, long xp, const int32_t* page,
+                                                                    long pgs, unsigned char* cache, long blocks,
+                                                                    int n, long W) {
+    const int lane = threadIdx.x & 31, b = threadIdx.x >> 5;
+    const int bytes = ds_mx4_bytes(n);
+    for (long w = blockIdx.x; w < W; w += gridDim.x) {
+        const long pg = page[w * pgs];
+        if (pg < 0 || pg >= blocks) continue;        /* block-uniform */
+        const float v = ds_bf(x[w * xp + (long)b * 32 + lane]);
+        float am = v < 0.0f ? -v : v;
+        am = am == am ? am : 0.0f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float t = __shfl_xor(am, o);
+            am = t > am ? t : am;
+        }
+        am = am > 6.0f * 0x1p-126f ? am : 6.0f * 0x1p-126f;
+        const uint32_t u = __builtin_bit_cast(uint32_t, am * (1.0f / 6.0f));
+        const int k = (int)((u >> 23) & 0xffu) - 127 + ((u & 0x7fffffu) ? 1 : 0);
+        const float scale = __builtin_bit_cast(float, (uint32_t)(k + 127) << 23);
+        const uint32_t c = ds_e2m1_code(v / scale);
+        const uint32_t co = (uint32_t)__shfl_xor((int)c, 1);
+        unsigned char* e = cache + pg * (long)bytes;
+        if (!(lane & 1)) e[b * 16 + lane / 2] = (unsigned char)(c | (co << 4));
+        if (lane == 0) e[n / 2 + b] = (unsigned char)(k + 127);
+        if (b == 0 && n / 2 + n / 32 + lane < bytes) e[n / 2 + n / 32 + lane] = 0;
+    }
+}
+
+/* ================================================================== entry_store, nvfp4 */
+/* entry_store's format nvfp4: one thread a value, sixteen lanes a block (n / 16 blocks, n threads a
+ * workgroup, a workgroup a row). The block's scale: among amax / c (c = 6, 4, 3, 2, 1.5, 1, 0.5) the
+ * first that is an e4m3 value and gives every value of the block back bit for bit (ds_nv4_bf16 of
+ * its code); none (a block quant_roundtrip did not produce) -> the rule's fp8(max(amax, 6 x 2^-9) /
+ * 6), lossy. Then the codes (e2m1 of v / scale), two a byte, the scale bytes, the zero pad. */
+__global__ __launch_bounds__(1024) void ds41_entry_store_nv4_kernel(const uint16_t* x, long xp, const int32_t* page,
+                                                                    long pgs, unsigned char* cache, long blocks,
+                                                                    int n, long W) {
+    const int lane = threadIdx.x & 31, i = threadIdx.x, blk = i >> 4;
+    const int bytes = ds_nv4_bytes(n);
+    const unsigned half = (lane & 16) ? 0xffff0000u : 0x0000ffffu;
+    const float kCand[7] = { 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f };
+    for (long w = blockIdx.x; w < W; w += gridDim.x) {
+        const long pg = page[w * pgs];
+        if (pg < 0 || pg >= blocks) continue;        /* block-uniform */
+        const uint32_t bits = x[w * xp + i];
+        const float v = ds_bf((uint16_t)bits);
+        float am = v < 0.0f ? -v : v;
+        am = am == am ? am : 0.0f;
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) {
+            const float t = __shfl_xor(am, o);
+            am = t > am ? t : am;
+        }
+        uint32_t sb = ds_f32_e4m3((am > 6.0f * 0x1p-9f ? am : 6.0f * 0x1p-9f) / 6.0f);   /* the rule */
+        bool found = am == 0.0f;
+#pragma unroll
+        for (int c = 0; c < 7; ++c) {
+            const float sc = am / kCand[c];
+            const uint32_t b8 = ds_f32_e4m3(sc);
+            const bool exact = am > 0.0f && ds_e4m3_f32(b8) == sc;
+            const bool ok = exact && ds_nv4_bf16(ds_e2m1_code(v / sc), sc) == bits;
+            const unsigned all = (unsigned)__builtin_amdgcn_ballot_w32(ok) & half;
+            if (!found && all == half) { found = true; sb = b8; }
+        }
+        const float scale = ds_e4m3_f32(sb);
+        const float q = v / scale;
+        const uint32_t c = ds_e2m1_code(q != q ? q : (q > 6.0f ? 6.0f : (q < -6.0f ? -6.0f : q)));
+        const uint32_t co = (uint32_t)__shfl_xor((int)c, 1);
+        unsigned char* e = cache + pg * (long)bytes;
+        if (!(lane & 1)) e[i / 2] = (unsigned char)(c | (co << 4));
+        if ((lane & 15) == 0) e[n / 2 + blk] = (unsigned char)sb;
+        if (i < bytes - n / 2 - n / 16) e[n / 2 + n / 16 + i] = 0;
+    }
+}
+
 /* ================================================================== launch shims */
 /* Linear addressing of an index operand: rank 1 by its stride, anything else only if dense. */
 long lin_stride(const RadTensor& t) {
@@ -1525,10 +2439,11 @@ long long keep_words(long long width, long long block) {
     return block < 1 || width < 1 ? 0 : ((width + block - 1) / block + 31) / 32;
 }
 
+/* The split's scratch: candidates [rows][nch][K] u64, counts [rows][nch] i32, used chunks [rows] i32. */
 int64_t topk_split_bytes(long rows, long C, long K) {
     const long nch = (C + kDsChunk - 1) / kDsChunk;
     if (rows < 1 || nch < kDsSplitMinChunks || K < 1 || K > kDsSplitMaxK) return 0;
-    return (int64_t)rows * nch * K * 8 + (int64_t)rows * nch * 4 + 16;
+    return (int64_t)rows * nch * K * 8 + (int64_t)rows * nch * 4 + (int64_t)rows * 4 + 16;
 }
 
 int index_score_body(const RadArgs* a, RadStream stream) {
@@ -1538,12 +2453,20 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     const long long H = r4d_geti_or(a, "heads", 0), Dm = r4d_geti_or(a, "dim", 0);
     const long long ratio = r4d_geti_or(a, "ratio", 0);
     const long long part = r4d_geti_or(a, "row_part", -1);
+    const long long block = r4d_geti_or(a, "block", 0);
     const float wscale = (float)r4d_getf(a, "wscale", 0.0);
     for (int i = 0; i < 7; ++i)
         if (!a->t[i].data) return R4D_NO(RAD_E_INVAL);
+    const RadTensor* keep = a->n_t > 7 && a->t[7].data ? &a->t[7] : nullptr;
+    /* key_format: bf16 (Dm values an entry) or mxfp4 (ds_mx4_bytes(Dm) bytes an entry, unpacked to the
+     * same bf16); an entry is `ratio` slots of the cache's last extent either way. */
+    const char* kf = r4d_gets(a, "key_format");
+    const bool kmx = kf && !std::strcmp(kf, "mxfp4");
+    if (kf && !kmx && std::strcmp(kf, "bf16")) return R4D_NO(RAD_E_UNSUPPORTED);
+    const long kslots = kmx ? (long)ds_mx4_bytes((int)Dm) / 2 : (long)Dm;
     if (H < 1 || Dm < 1 || ratio < 1 || Dm % ratio || !std::isfinite(wscale) || q.rank != 2 ||
         q.shape[0] < 1 || q.shape[1] != H * Dm || w.rank != 2 || w.shape[0] != q.shape[0] ||
-        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != Dm ||
+        w.shape[1] != H || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[3] * ratio != kslots ||
         kc.shape[2] % ratio || bt.rank != 2 || r4d_numel(&pos) != q.shape[0] || r4d_numel(&cu) < 2 ||
         sc.rank != 2 || sc.shape[0] < 1 || (part < 0 && sc.shape[0] != q.shape[0]) || sc.shape[1] < 1)
         return R4D_NO(RAD_E_SHAPE);
@@ -1566,6 +2489,11 @@ int index_score_body(const RadArgs* a, RadStream stream) {
                                                                        : (long)sc.shape[0])
                         : 0;
     const long r0 = Mv > 0 ? row0 : 0;               /* no pointer past the operands */
+    /* keep: a row for each row the run holds (at most the score's), keep_words over its width. */
+    if (keep && (block < 1 || block > INT_MAX || keep->rank != 2 || keep->dtype != RAD_I32 ||
+                 keep->shape[0] < Mv || keep->shape[0] > sc.shape[0] ||
+                 keep->shape[1] != keep_words(sc.shape[1], block) || keep->stride[1] < 1))
+        return R4D_NO(RAD_E_SHAPE);
     DsScoreArgs s{};
     s.q = (const uint16_t*)q.data + r0 * (long)q.stride[0];
     s.w = (const uint16_t*)w.data + r0 * (long)w.stride[0];
@@ -1593,26 +2521,47 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.H = (int)H;
     s.ratio = (int)ratio;
     s.cbs = (int)kc.shape[2];
-    s.slot = (int)(Dm / ratio);
+    s.slot = (int)kc.shape[3];
+    s.kmx = kmx ? 1 : 0;
     s.wscale = wscale;
+    s.keep = keep ? (const int*)keep->data : nullptr;
+    s.kr = keep ? (long)keep->stride[0] : 0;
+    s.kcs = keep ? (long)keep->stride[1] : 0;
+    s.block = keep ? (int)block : 1;
+    s.bshift = -1;
+    for (int sh = 0; sh < 31; ++sh)
+        if ((1LL << sh) == (long long)s.block) s.bshift = sh;
     /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band on the scalar
-     * kernel below (libref's bits). */
+     * kernel below (libref's bits). The form is picked by the pass height alone, with or without
+     * keep, so a kept entry's score is the unrestricted op's. */
     if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
         (s.M + 7) / 8 <= 65535) {
+        if (keep) {
+            const dim3 grid((unsigned)((s.C + kIwKeepEB - 1) / kIwKeepEB), (unsigned)((s.M + 7) / 8));
+            if (H > 16) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, true>), grid, dim3(256), 0u, s);
+            return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, true>), grid, dim3(256), 0u, s);
+        }
         const dim3 grid((unsigned)((s.C + kIwEB - 1) / kIwEB), (unsigned)((s.M + 7) / 8));
-        if (H > 16) return R4D_EMIT(stream, ds41_index_score_wm_kernel<2>, grid, dim3(256), 0u, s);
-        return R4D_EMIT(stream, ds41_index_score_wm_kernel<1>, grid, dim3(256), 0u, s);
+        if (H > 16) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, false>), grid, dim3(256), 0u, s);
+        return R4D_EMIT(stream, (ds41_index_score_wm_kernel<1, false>), grid, dim3(256), 0u, s);
     }
     /* Head split: more workgroups while the grid is short of the card. The head sum is closed in
-     * head order either way, so every split gives the same bits. */
+     * head order either way, so every split gives the same bits. With keep the work is a row's kept
+     * positions (kDsKeptEst expected), not its width. */
+    const long cw = keep ? (s.C < kDsKeptEst ? (long)s.C : kDsKeptEst) : (long)s.C;
     int HS = 1;
-    while (HS < 8 && HS * 2 <= H && ((long)s.C * HS * 2 + 255) / 256 * s.M <= 1024 &&
+    while (HS < (keep ? 4 : 8) && HS * 2 <= H && (cw * HS * 2 + 255) / 256 * s.M <= 1024 &&
            (long)H * (256 / (HS * 2)) * 4 <= 32768)
         HS *= 2;
     const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
     const int epb = 256 / HS;
-    const dim3 grid((unsigned)((s.C + epb - 1) / epb), gy);
+    const dim3 grid((unsigned)((cw + epb - 1) / epb), gy);
     const uint32_t lds = HS > 1 ? (uint32_t)(H * epb * 4) : 0u;
+    if (keep) switch (HS) {
+        case 1: return R4D_EMIT(stream, ds41_index_score_kept_kernel<1>, grid, dim3(256), lds, s);
+        case 2: return R4D_EMIT(stream, ds41_index_score_kept_kernel<2>, grid, dim3(256), lds, s);
+        default: return R4D_EMIT(stream, ds41_index_score_kept_kernel<4>, grid, dim3(256), lds, s);
+    }
     switch (HS) {
         case 1: return R4D_EMIT(stream, ds41_index_score_kernel<1>, grid, dim3(256), lds, s);
         case 2: return R4D_EMIT(stream, ds41_index_score_kernel<2>, grid, dim3(256), lds, s);
@@ -1699,6 +2648,8 @@ int index_topk_body(const RadArgs* a, RadStream stream) {
     t.bshift = -1;
     for (int sh = 0; sh < 31; ++sh)
         if ((1LL << sh) == (long long)t.block) t.bshift = sh;
+    /* With keep, walk the kept blocks only (the same selection: DsKeptKey). */
+    t.kept = keep && block <= 65536 ? 1 : 0;
     /* Few rows over a long row: chunks in parallel, then one merge a row. The same selection, so
      * the same bits, as the one-block-a-row kernel. */
     const int64_t need = t.M <= kDsSplitRows ? topk_split_bytes(t.M, t.C, t.K) : 0;
@@ -1707,8 +2658,12 @@ int index_topk_body(const RadArgs* a, RadStream stream) {
         sp.t = t;
         sp.chunk = kDsChunk;
         sp.nch = (t.C + kDsChunk - 1) / kDsChunk;
+        /* the kept chunks' lists: at most ceil(blocks / nch) blocks a chunk (every block kept) */
+        const long nbw = ((long)t.C + t.block - 1) / t.block;
+        if ((nbw + sp.nch - 1) / sp.nch > kDsKeptMax) sp.t.kept = 0;
         sp.cand = (unsigned long long*)a->scratch;
         sp.cnt = (int*)((unsigned char*)a->scratch + (int64_t)t.M * sp.nch * t.K * 8);
+        sp.used = sp.cnt + (int64_t)t.M * sp.nch;
         const int rc = R4D_EMIT(stream, ds41_index_topk_split1_kernel,
                                 dim3((unsigned)sp.nch, (unsigned)t.M), dim3(kDsSelThreads), 0, sp);
         if (rc != RAD_OK) return rc;
@@ -1730,19 +2685,60 @@ template <int HG, int NT, int DPT, bool PVD>
 int attn_dec_go(RadStream stream, const DsAttnArgs& s) {
     constexpr int P = 4;                                /* key tiles in flight in PV */
     const int nkq = (s.nk + 31) / 32 * 32;
-    const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT).total;
+    const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT, s.cnv && ds_dec_nvt(HG, NT, DPT, PVD, true)).total;
     if (lds > 65536) return RAD_E_UNSUPPORTED;
     const dim3 grid((unsigned)((s.H + HG - 1) / HG), (unsigned)s.M);
-    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD>), grid, dim3(NT), (uint32_t)lds, s);
+    if (s.cnv) return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, true>), grid, dim3(NT), (uint32_t)lds, s);
+    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, false>), grid, dim3(NT), (uint32_t)lds, s);
 }
 
 /* The decode band's kernel. The form by how many (row, head) pairs the pass has, any choice giving
  * the same bits (measured on R9700, 32 heads x 640 keys: one row 17 us, 2 rows 27, 3-4 rows 44,
  * 5-8 rows 73, 48 rows 367; the scalar kernel 129-582). On an LDS refusal (long rows), the next
  * smaller form; the one-head form takes every row this op accepts. */
+/* Packed-latent forms only the A/B knob reaches (no plain twin is instantiated). */
+template <int HG, int NT, int DPT, bool PVD>
+int attn_dec_go_nv(RadStream stream, const DsAttnArgs& s) {
+    constexpr int P = 4;
+    const int nkq = (s.nk + 31) / 32 * 32;
+    const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT, ds_dec_nvt(HG, NT, DPT, PVD, true)).total;
+    if (lds > 65536 || !s.cnv) return RAD_E_UNSUPPORTED;
+    const dim3 grid((unsigned)((s.H + HG - 1) / HG), (unsigned)s.M);
+    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, true>), grid, dim3(NT), (uint32_t)lds, s);
+}
+
+/* RADIANCE_DS41_NVFORM=N (8.11., an A/B knob for the latency bench; unset: the rule below): the packed latent's decode
+ * band in form N -- 0-6 as attn_dec_emit's switch, 7 one head tiled (512 threads), 8 four heads direct at 512 threads
+ * (two heads a PV thread), 9 two heads direct at 512 threads. Every form sums each output in the same order: the same
+ * bits. A form the LDS refuses falls back to the rule. */
+int ds_nvform() {
+    static const int f = [] {
+        const char* e = std::getenv("RADIANCE_DS41_NVFORM");
+        return e && *e ? std::atoi(e) : -1;
+    }();
+    return f;
+}
+
 int attn_dec_emit(RadStream stream, const DsAttnArgs& s) {
     if (s.M > 65535 || (s.H + 0L) > 65535L * 8) return RAD_E_UNSUPPORTED;
     const long hr = (long)s.M * s.H;
+    if (s.cnv && ds_nvform() >= 0) {
+        int rc = RAD_E_UNSUPPORTED;
+        switch (ds_nvform()) {
+            case 0: rc = attn_dec_go<1, 1024, 2, true>(stream, s); break;
+            case 1: rc = attn_dec_go<2, 1024, 2, true>(stream, s); break;
+            case 2: rc = attn_dec_go<4, 1024, 2, true>(stream, s); break;
+            case 3: rc = attn_dec_go<8, 1024, 2, true>(stream, s); break;
+            case 4: rc = attn_dec_go<8, 512, 2, false>(stream, s); break;
+            case 5: rc = attn_dec_go<4, 512, 2, false>(stream, s); break;
+            case 6: rc = attn_dec_go<2, 512, 2, false>(stream, s); break;
+            case 7: rc = attn_dec_go_nv<1, 512, 2, false>(stream, s); break;
+            case 8: rc = attn_dec_go_nv<4, 512, 2, true>(stream, s); break;
+            case 9: rc = attn_dec_go_nv<2, 512, 2, true>(stream, s); break;
+            default: break;
+        }
+        if (rc != RAD_E_UNSUPPORTED) return rc;
+    }
     int c = hr <= 32 ? 0 : (hr <= 64 ? 1 : (hr <= 128 ? 2 : (hr <= 256 ? 3 : 4)));
     static const int next[7] = { -1, 0, 1, 2, 5, 6, 1 };
     while (c >= 0) {
@@ -1776,6 +2772,13 @@ int attn_body(const RadArgs* a, RadStream stream) {
     const long long topk = r4d_geti_or(a, "topk", 0);
     const float scale = (float)r4d_getf(a, "scale", 0.0);
     const bool comp = ratio > 0;
+    /* latent_format nvfp4: the compressed cache holds each entry packed (ds_nv4_bytes(D) bytes); the
+     * window cache stays bf16, the window a multiple of 32 (the kernels' key blocks start packed at it). */
+    const char* lf = r4d_gets(a, "latent_format");
+    const bool cnv = comp && lf && !std::strcmp(lf, "nvfp4");
+    if (lf && !cnv && std::strcmp(lf, "bf16") && !(std::strcmp(lf, "nvfp4") == 0 && !comp))
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    const long long cslots = cnv ? ds_nv4_bytes((int)D) / 2 : D;
     if (H < 1 || D < 2 || D > 4096 || win < 1 || ratio < 0 || topk < 0 || !std::isfinite(scale) ||
         scale <= 0 || (comp && (!cc || !cbt || !sel || topk < 1 || D % ratio)))
         return R4D_NO(RAD_E_SHAPE);
@@ -1786,7 +2789,8 @@ int attn_body(const RadArgs* a, RadStream stream) {
         sink.dtype != RAD_F32 || r4d_numel(&cu) < 2 || r4d_numel(&wused) < r4d_numel(&cu) - 1)
         return R4D_NO(RAD_E_SHAPE);
     const long long cbs = comp ? cc->shape[2] : 0;
-    if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != D || cbs % ratio ||
+    if (cnv && win % 32) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (comp && (cc->rank != 4 || cc->shape[1] != 1 || cc->shape[3] * ratio != cslots || cbs % ratio ||
                  cbt->rank != 2 || sel->rank != 2 || sel->shape[0] != q.shape[0] ||
                  sel->shape[1] != topk || cbt->shape[0] != wbt.shape[0]))
         return R4D_NO(RAD_E_SHAPE);
@@ -1835,6 +2839,8 @@ int attn_body(const RadArgs* a, RadStream stream) {
     s.ncbt = comp ? (int)cbt->shape[1] : 0;
     s.cbs = comp ? (int)cbs : 1;
     s.ratio = comp ? (int)ratio : 1;
+    s.cnv = cnv ? 1 : 0;
+    s.cslot = comp ? (int)cc->shape[3] : 1;
     s.S = (int)S;
     s.M = (int)q.shape[0];
     s.H = (int)H;
@@ -1846,13 +2852,14 @@ int attn_body(const RadArgs* a, RadStream stream) {
      * below (libref's bits). */
     {
         const int nkt = (s.nk + 15) / 16;
-        const long lds = ds_wm_sbuf_off(nkt) + kWmSbufBytes;
+        const long lds = ds_wm_sbuf_off(nkt) + kWmSbufBytes + (s.cnv ? kWmNvBytes : 0);
         if (s.M > kWmRows && s.qr % 8 == 0 && s.outr % 8 == 0 && aligned(q.data, 16) &&
             aligned(out.data, 16) && lds <= 65536 && (H + 15) / 16 <= 65535) {
             const unsigned gy = (unsigned)(s.M < 65535 ? s.M : 65535);
             const dim3 grid((unsigned)((H + 15) / 16), gy);
             const float sl2 = (float)((double)scale * 1.4426950408889634);
-            return R4D_EMIT(stream, ds41_attn_sparse_sink_wm_kernel<true>, grid, dim3(128), (uint32_t)lds, s, sl2);
+            if (s.cnv) return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true>), grid, dim3(128), (uint32_t)lds, s, sl2);
+            return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, false>), grid, dim3(128), (uint32_t)lds, s, sl2);
         }
     }
     /* Head group and d split by how many workgroups the rows give. Every choice sums each output
@@ -1881,6 +2888,48 @@ int attn_body(const RadArgs* a, RadStream stream) {
 }
 
 }  // namespace
+
+/* entry_store's format mxfp4 (r4d_ds41_elem.hip's entry_store_body hands it over): x [W, n] bf16, n a
+ * multiple of 32 up to 1024, into block page[w] of a cache [blocks, heads, block_size, slot] whose
+ * heads x block_size x slot bf16 slots hold ds_mx4_bytes(n) bytes. */
+extern "C" int r4d_ds41_entry_store_mx4(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
+    const long n = (long)r4d_geti_or(a, "n", 0), bs = (long)r4d_geti_or(a, "block_size", 0);
+    if (n < 32 || n > 1024 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
+        r4d_numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs ||
+        cache.shape[1] * cache.shape[2] * cache.shape[3] * 2 != ds_mx4_bytes((int)n) || x.stride[1] != 1 ||
+        !aligned(cache.data, 16))
+        return R4D_NO(RAD_E_SHAPE);
+    if (x.dtype != RAD_BF16 || page.dtype != RAD_I32 || cache.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    const long W = x.shape[0], pgs = lin_stride(page);
+    if (pgs < 0) return R4D_NO(RAD_E_SHAPE);
+    const unsigned g = (unsigned)(W < 65535 ? W : 65535);
+    return R4D_EMIT(stream, ds41_entry_store_mx4_kernel, dim3(g), dim3((unsigned)n), 0u, (const uint16_t*)x.data,
+                    (long)x.stride[0], (const int32_t*)page.data, pgs, (unsigned char*)cache.data,
+                    (long)cache.shape[0], (int)n, W);
+}
+
+/* entry_store's format nvfp4 (entry_store_body hands it over): x [W, n] bf16, n a multiple of 16 up to
+ * 1024, into block page[w] of a cache [blocks, heads, block_size, slot] whose bf16 slots hold
+ * ds_nv4_bytes(n) bytes. */
+extern "C" int r4d_ds41_entry_store_nv4(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 3 || !a->t[0].data || !a->t[1].data || !a->t[2].data) return RAD_E_INVAL;
+    const RadTensor &x = a->t[0], &page = a->t[1], &cache = a->t[2];
+    const long n = (long)r4d_geti_or(a, "n", 0), bs = (long)r4d_geti_or(a, "block_size", 0);
+    if (n < 32 || n > 1024 || n % 32 || bs < 1 || x.rank != 2 || x.shape[0] < 1 || x.shape[1] != n ||
+        r4d_numel(&page) < x.shape[0] || cache.rank != 4 || cache.shape[2] != bs ||
+        cache.shape[1] * cache.shape[2] * cache.shape[3] * 2 != ds_nv4_bytes((int)n) || x.stride[1] != 1 ||
+        !aligned(cache.data, 16))
+        return R4D_NO(RAD_E_SHAPE);
+    if (x.dtype != RAD_BF16 || page.dtype != RAD_I32 || cache.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    const long W = x.shape[0], pgs = lin_stride(page);
+    if (pgs < 0) return R4D_NO(RAD_E_SHAPE);
+    const unsigned g = (unsigned)(W < 65535 ? W : 65535);
+    return R4D_EMIT(stream, ds41_entry_store_nv4_kernel, dim3(g), dim3((unsigned)n), 0u, (const uint16_t*)x.data,
+                    (long)x.stride[0], (const int32_t*)page.data, pgs, (unsigned char*)cache.data,
+                    (long)cache.shape[0], (int)n, W);
+}
 
 extern "C" int r4d_rad_ds41_index_score(const RadArgs* a, RadStream stream) {
     return index_score_body(a, stream);

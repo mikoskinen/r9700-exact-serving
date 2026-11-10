@@ -989,11 +989,11 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `rope_rows_roundtrip` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` | `x`:inout, `cos_sin`, `positions` (device-only: rope_rows then quant_roundtrip over n_head * head_dim columns) |
 | `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
-| `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
-| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score` |
+| `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
+| `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
 | `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
 | `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
-| `entry_store` | `M`(range) `n` `block_size` `dtype` | `x`, `page`, `cache`:inout |
+| `entry_store` | `M`(range) `n` `block_size` `dtype` `format`/opt | `x`, `page`, `cache`:inout |
 | `token_map` | `M`(range) `n_vocab` | `ids`, `table`w → `mapped` |
 | `stream_gate_add` | `M`(range) `n` `hc` `eps`:f64 `gate_eps`:f64 `dtype` | `h`, `k`, `v`, `w`w → `out` |
 | `position_scale` | `M`(range) `n` `original` `beta`:f64 `dtype` | `x`:inout, `positions` |
@@ -1044,7 +1044,37 @@ row, and a row past the step scores `-inf` everywhere. Every row is the unsplit 
 equal height score the step bit for bit. `keep` lives from the candidate layer to the last layer that
 reads it, for every row of the step, so it is one bit a block: i32 `[M, ceil(ceil(width / block) /
 32)]`, bit `b % 32` of word `b / 32` set when block `b` is kept and the bits past the last block 0.
-`index_topk` reads it with the same `block`.
+`index_topk` reads it with the same `block`. `index_score` may read it too (the candidate
+restriction): with `keep` and `block`, keep row `i` for score row `i` (at least the rows the run
+holds, at most score's), only the kept blocks' positions are scored and every other position scores
+`-inf` without a key read. A kept position's score is the unrestricted op's, bit for bit, so
+`index_topk` through the same keep selects exactly what it selects from the unrestricted score: a
+layer past the candidate layer then scores at most `topk_blocks * block` positions a row instead of
+the whole context.
+
+**MXFP4 index keys.** `entry_store` `format` `mxfp4` stores each block of 32 of an entry's `n` values
+(`n` a multiple of 32) the way `quant_roundtrip` (`fp4_e2m1`, `ue8m0`, block 32) quantises it, packed:
+`n/2` bytes of e2m1 codes (value `2i` in byte `i`'s low nibble, `2i+1` in its high nibble, bit 3 the
+sign), then `n/32` ue8m0 scale bytes (scale `2^(e-127)`: the power of two at or above
+`max(amax, 6 * 2^-126) * f32(1/6)`), then zeros to a multiple of 16 bytes -- 80 bytes for 128 values,
+in the cache's bf16 slots (`heads * block_size * slot` of them, 40). `index_score` `key_format`
+`mxfp4` reads such a cache (an entry `ratio` slots of `slot`) and unpacks each value to the bf16 it
+encodes. For values `quant_roundtrip` already produced -- a block `c_i * 2^k`, `c_i` e2m1 codes, as
+DeepSeek-V4's index keys are -- the packing is exact: the rule picks `2^k / 2^j` with `c_max * 2^j` in
+(3, 6], and every `|c_i| <= c_max` times `2^j` is again a code; so every score is the bf16 cache's,
+bit for bit, at 80 bytes an entry instead of 256. `bf16` (or the parameter absent) is the plain form.
+
+**Packed compressed latent.** `entry_store` `format` `nvfp4` stores each block of 16 of an entry's `n`
+values (`n` a multiple of 32) as e2m1 codes with one OCP e4m3 scale: `n/2` code bytes (value `2i` in byte
+`i`'s low nibble), then `n/16` scale bytes, then zeros to a multiple of 16 -- 288 bytes (144 bf16 slots)
+for DeepSeek-V4's 512-value latent. The latent is `quant_roundtrip` (`fp4_e2m1`, `e4m3`, block 16)
+output, every value `c_i * s` exactly; re-deriving `s` by the rule is not always exact (with a subnormal
+e4m3 scale the block's largest code can be 4), so the scale is searched among `amax / c` for `c` = 6, 4,
+3, 2, 1.5, 1, 0.5 -- the first that is an e4m3 value and turns every value back into itself (the block's
+own scale is among them) -- and only a block no candidate reproduces takes the rule's scale, lossy.
+`attn_sparse_sink` `latent_format` `nvfp4` reads such a compressed cache (`window` a multiple of 32; the
+window cache stays bf16): a value is code times scale in f32, whose bf16 is the stored one, so every
+output is the bf16 cache's, bit for bit, at 288 bytes an entry instead of 1024.
 
 **`attn_dense`** serves vision towers and encoders: nothing paged, `cu_seqlens` bounding one image
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a
@@ -2611,6 +2641,7 @@ device code.
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
+| `moe_gather_all_reduce` | `M`(range) `n` `top_k` `world_size` `dtype` `act`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout |
 | `ar_ln_had_quant_i8` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gdn_gated_norm_had_quant_i8` | `M` `n` `head_dim` `group` `eps`:f64 `dtype` `zgrp`/opt `zblk`/opt | `x`, `z`, `w`w → `q`, `scale` |
 
@@ -2645,6 +2676,12 @@ and a constraint on an absent key does not hold.
 so the gather half writes `y` before it is reduced in place, and the five gather operands and `act`
 mean what they mean on `moe_gather`. `wire` is `ar_hc_write`'s. On either wire it is byte-identical
 to the three kernels it replaces.
+
+`moe_gather_all_reduce` is `moe_gather` followed by the exact `all_reduce` of its output, for a
+MoE block whose reduced output feeds neither a norm junction nor a gated residual write (DeepSeek
+V4.1's hyper-connection post): `ar_gather_hc_write` without the write, four ranks, exact wire. Its
+transport is the one-shot, so a caller keeps it to decode-sized `M`; byte-identical to the two
+kernels it replaces at any `M`.
 
 `ar_rmsnorm_quant_i8` is the exact `all_reduce` of `x` followed by `rmsnorm_quant_i8`'s junction
 over the reduced sum, at two ranks and at four. At four it is the exact one-shot's transport with

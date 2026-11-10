@@ -9,7 +9,8 @@
 // two-shot covers larger sizes.
 //
 // Also r4d_ar_hc_write_4rank (the same one-shot with hc_write as epilogue) and
-// r4d_ar_gather_hc_write_4rank (that plus moe_gather as prologue), exact wire only.
+// r4d_ar_gather_hc_write_4rank (that plus moe_gather as prologue), exact wire only; at hc 0 the
+// latter is moe_gather_all_reduce (the gather and the reduction, no stream written).
 //
 // The IPC helpers live in r4d_ar_oneshot_2rank_exact.hip; this unit links beside it.
 #include "r4d.h"
@@ -239,7 +240,7 @@ __global__ void r4d_ar_gather_hc_write_wide_kernel(
       }
     }
     for (int x = tid; x < nrow * K; x += nt)
-      s_w[x] = bf2f(G.ew[(long)(row_lo + x / K) * G.ew_ld + x % K]);
+      s_w[x] = r4d_ar_gather_w(G, (long)(row_lo + x / K) * G.ew_ld + x % K);
     if (G.sh)
       for (int r = tid; r < nrow; r += nt) {
         const float v0 = bf2f(G.sg[(long)(row_lo + r) * G.sg_ld]);
@@ -488,7 +489,9 @@ static void ar_gather_hc_write_wide_launch(
                              " ranks this entry point is compiled for");
   if (M <= 0 || n <= 0 || n % 8)
     throw std::runtime_error("ar_gather_hc_write: n must be a positive multiple of 8");
-  if (hc < 1 || hrow % 8)
+  /* hc 0 is moe_gather_all_reduce: the reduction with no stream written (the write loop runs over
+   * no stream and never reads `inj` or `h`). */
+  if (hc < 0 || (hc > 0 && hrow % 8))
     throw std::runtime_error("ar_gather_hc_write: the streams must be whole 16B words");
   if (top_k < 1 || top_k > R4D_ARG_SLOTS)
     throw std::runtime_error("ar_gather_hc_write: top_k " + std::to_string(top_k) +
@@ -552,7 +555,9 @@ static void ar_gather_hc_write_wide_launch(
   G.sh = (const unsigned short*)sh;
   G.sg = (const unsigned short*)sg;
   G.ye_ld = ye_ld; G.ew_ld = ew_ld; G.sh_ld = sh_ld; G.sg_ld = sg_ld;
-  G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)sig;
+  /* `sig` bit 0: the shared gate's sigmoid; bit 1: f32 slot weights (moe_gather_all_reduce over
+   * moe_gather's F32 form). ar_gather_hc_write passes 0 or 1. */
+  G.top_k = (int)top_k; G.T = (int)(M * top_k); G.sig = (int)(sig & 1); G.ew_f32 = (int)((sig >> 1) & 1);
 
   hipStream_t st = (hipStream_t)stream_i;
   if (by_inv) {

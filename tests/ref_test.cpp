@@ -731,6 +731,142 @@ TEST(index_score_runs_are_the_unsplit_rows) {
     CHECK_EQ(run("index_score", c), RAD_E_SHAPE);
 }
 
+/* index_score with keep (the candidate restriction): only the kept blocks are scored, each with
+ * the unkept op's bits; every other position, passed or not, is -inf. Rows of two sequences, blocks
+ * of 2 over 7 positions; row 1 keeps nothing, row 2 everything. Malformed keeps are refused. */
+TEST(index_score_keep_scores_only_the_kept_blocks) {
+    const int64_t H = 2, D = 4, M = 3, C = 7, block = 2;
+    T q(RAD_BF16, {M, H * D}), w(RAD_BF16, {M, H}), kc(RAD_BF16, {14, 1, 1, D});
+    for (int64_t i = 0; i < M * H * D; ++i) q.set(i, std::sin(0.7f * (float)i + 0.1f));
+    for (int64_t i = 0; i < M * H; ++i) w.set(i, std::cos(1.1f * (float)i));
+    for (int64_t i = 0; i < 14 * D; ++i) kc.set(i, std::cos(0.37f * (float)i + 0.5f));
+    T bt(RAD_I32, {2, 7}); bt.n({3, 1, 0, 2, 5, 4, -1,   7, 8, 9, 10, 11, 12, 13});
+    T pos(RAD_I32, {M}); pos.n({6, 6, 4});   /* sequence 0 rows 0-1, sequence 1 row 2 */
+    T cu(RAD_I32, {3}); cu.n({0, 2, 3});
+    T keep(RAD_I32, {M, 1}); keep.n({0x5, 0x0, 0xf});   /* blocks {0, 2}, none, all */
+    T whole(RAD_F32, {M, C}), kept(RAD_F32, {M, C});
+    A a; a.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(whole).i("M", M).i("heads", H).i("dim", D)
+        .i("ratio", 1).i("width", C).d("wscale", 0.5).s("dtype", "bf16");
+    REQUIRE_EQ(run("index_score", a), RAD_OK);
+    A b; b.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(kept).t(keep).i("M", M).i("heads", H).i("dim", D)
+        .i("ratio", 1).i("width", C).d("wscale", 0.5).s("dtype", "bf16").i("block", block);
+    REQUIRE_EQ(run("index_score", b), RAD_OK);
+    int finite = 0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t j = 0; j < C; ++j) {
+            const bool in = (keep.iat(m) >> (j / block)) & 1;
+            const float g = kept.at(m * C + j), e = whole.at(m * C + j);
+            if (in) {
+                CHECK(std::memcmp(&g, &e, 4) == 0);
+                finite += std::isfinite(g);
+            } else {
+                CHECK(std::isinf(g) && g < 0);
+            }
+        }
+    CHECK(finite >= 6);   /* row 0 {0, 1, 4, 5}, row 2 {0..4}: the unmapped entry 6 is -inf anyway */
+    /* keep without block, words for another width, more rows than the score: refused */
+    T kept2(RAD_F32, {M, C});
+    A c; c.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(kept2).t(keep).i("M", M).i("heads", H).i("dim", D)
+        .i("ratio", 1).i("width", C).d("wscale", 0.5).s("dtype", "bf16");
+    CHECK_EQ(run("index_score", c), RAD_E_SHAPE);
+    T keepw(RAD_I32, {M, 2});
+    A d; d.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(kept2).t(keepw).i("M", M).i("heads", H).i("dim", D)
+        .i("ratio", 1).i("width", C).d("wscale", 0.5).s("dtype", "bf16").i("block", block);
+    CHECK_EQ(run("index_score", d), RAD_E_SHAPE);
+    T keepr(RAD_I32, {M + 1, 1});
+    A e; e.t(q).t(w).t(kc).t(bt).t(pos).t(cu).t(kept2).t(keepr).i("M", M).i("heads", H).i("dim", D)
+        .i("ratio", 1).i("width", C).d("wscale", 0.5).s("dtype", "bf16").i("block", block);
+    CHECK_EQ(run("index_score", e), RAD_E_SHAPE);
+}
+
+/* The candidate restriction selects what the whole score selects (DeepSeek-V4.1's layers past the
+ * candidate layer): the candidate layer's score -> index_candidates (blocks of 8, the best 2048
+ * kept) -> keep; a later layer's index_topk(top 512) through keep over its whole score and over
+ * its keep-restricted score must be the same positions in the same order on every row, at
+ * contexts of 5k, 70k and 300k (past 2^18), with rows of two sequences, a run of a step scored
+ * with row_part and its keep rows, unmapped blocks and exact ties. Four heads of 128 keep the host
+ * reference quick; the restriction is per position, so the head count does not enter it. */
+TEST(index_score_keep_selects_what_the_whole_score_selects) {
+    const int64_t H = 4, D = 128, block = 8, KB = 2048, K = 512;
+    uint32_t seed = 0x2545F491u;
+    auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return (float)(seed >> 8) / 16777216.0f; };
+    for (const int64_t ctx : { 5000, 70000, 300000 }) {
+        /* sequence 0: one decode row at ctx - 3001; sequence 1: four rows ending at ctx - 1 */
+        const int64_t M = 5, C = ctx, E0 = ctx - 3000, E1 = ctx, KW = ((C + block - 1) / block + 31) / 32;
+        T q(RAD_BF16, {M, H * D}), q2(RAD_BF16, {M, H * D}), w(RAD_BF16, {M, H}), w2(RAD_BF16, {M, H});
+        for (int64_t i = 0; i < M * H * D; ++i) { q.set(i, rnd() - 0.5f); q2.set(i, rnd() - 0.5f); }
+        for (int64_t i = 0; i < M * H; ++i) { w.set(i, rnd() - 0.4f); w2.set(i, rnd() - 0.4f); }
+        const int64_t nblk = E0 + E1 + 2;
+        T kc(RAD_BF16, {nblk, 1, 1, D});
+        for (int64_t i = 0; i < nblk * D; ++i) kc.set(i, rnd() - 0.5f);
+        for (int64_t e = 1; e < nblk; e += 97)   /* exact ties: entry e holds entry e - 1's key */
+            for (int64_t d = 0; d < D; ++d) kc.set(e * D + d, kc.at((e - 1) * D + d));
+        T bt(RAD_I32, {2, E1});
+        for (int64_t j = 0; j < E1; ++j) {
+            st_int(RAD_I32, bt.t.data, j, j < E0 ? (j % 1009 == 7 ? -1 : j) : -1);
+            st_int(RAD_I32, bt.t.data, E1 + j, j % 2003 == 11 ? -1 : E0 + j);
+        }
+        T pos(RAD_I32, {M}); pos.n({ctx - 3001, ctx - 4, ctx - 3, ctx - 2, ctx - 1});
+        T cu(RAD_I32, {3}); cu.n({0, 1, 5});
+        auto score = [&](T& qq, T& ww, T& out, T* kp, int64_t rows, int64_t part) {
+            A a; a.t(qq).t(ww).t(kc).t(bt).t(pos).t(cu).t(out);
+            if (kp) a.t(*kp);
+            a.i("M", rows).i("heads", H).i("dim", D).i("ratio", 1).i("width", C)
+                .d("wscale", 1.0 / std::sqrt((double)D * H)).s("dtype", "bf16");
+            if (part >= 0) a.i("row_part", part);
+            if (kp) a.i("block", block);
+            return run("index_score", a);
+        };
+        T sc20(RAD_F32, {M, C}), scA(RAD_F32, {M, C}), scB(RAD_F32, {M, C});
+        REQUIRE_EQ(score(q2, w2, sc20, nullptr, M, -1), RAD_OK);
+        T keep(RAD_I32, {M, KW});
+        A ca; ca.t(sc20).t(pos).t(keep).i("M", M).i("width", C).i("block", block).i("topk_blocks", KB)
+            .i("ratio", 1);
+        REQUIRE_EQ(run("index_candidates", ca), RAD_OK);
+        REQUIRE_EQ(score(q, w, scA, nullptr, M, -1), RAD_OK);
+        REQUIRE_EQ(score(q, w, scB, &keep, M, -1), RAD_OK);
+        T selA(RAD_I32, {M, K}), selB(RAD_I32, {M, K});
+        for (int pass = 0; pass < 2; ++pass) {
+            A ta; ta.t(pass ? scB : scA).t(keep).t(pos).t(pass ? selB : selA).i("M", M).i("width", C)
+                .i("topk", K).i("ratio", 1).i("block", block);
+            REQUIRE_EQ(run("index_topk", ta), RAD_OK);
+        }
+        int64_t diff = 0, kept = 0, bad = 0, sel = 0;
+        for (int64_t i = 0; i < M * K; ++i) {
+            diff += selA.iat(i) != selB.iat(i);
+            sel += selB.iat(i) >= 0;
+        }
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t j = 0; j < C; ++j) {
+                const int64_t b = j / block;
+                const bool in = ((uint32_t)keep.iat(m * KW + b / 32) >> (b % 32)) & 1u;
+                const float g = scB.at(m * C + j), e = scA.at(m * C + j);
+                if (in) { ++kept; bad += std::memcmp(&g, &e, 4) != 0; }
+                else bad += !(std::isinf(g) && g < 0);
+            }
+        std::printf("    ctx %lld: %lld kept positions of %lld rows, %lld selected, %lld selections differ, "
+                    "%lld scores differ\n", (long long)ctx, (long long)kept, (long long)M, (long long)sel,
+                    (long long)diff, (long long)bad);
+        CHECK_EQ(diff, 0);
+        CHECK_EQ(bad, 0);
+        CHECK(sel == M * K || ctx < 8 * KB);
+        /* the step in runs of two rows (row_part 0..2), each run restricted by its keep rows */
+        for (int64_t p = 0; p < 3; ++p) {
+            const int64_t rows = std::min<int64_t>(2, M - 2 * p);
+            T plane(RAD_F32, {2, C});
+            T kr(RAD_I32, {rows, KW});
+            for (int64_t i = 0; i < rows * KW; ++i) st_int(RAD_I32, kr.t.data, i, keep.iat(2 * p * KW + i));
+            REQUIRE_EQ(score(q, w, plane, &kr, 2, p), RAD_OK);
+            int64_t rb = 0;
+            for (int64_t i = 0; i < rows * C; ++i) {
+                const float g = plane.at(i), e = scB.at(2 * p * C + i);
+                rb += std::memcmp(&g, &e, 4) != 0;
+            }
+            CHECK_EQ(rb, 0);
+        }
+    }
+}
+
 /* entry_store writes whole blocks at their pages and skips a negative page. */
 TEST(entry_store_writes_one_entry_a_block) {
     T x(RAD_F32, {3, 4}); x.f({1, 2, 3, 4,  5, 6, 7, 8,  9, 10, 11, 12});
@@ -11204,6 +11340,10 @@ std::vector<Geo> geometries() {
         G("index_topk", "M", 3, a.i("M", R).i("width", 9).i("topk", 4).i("ratio", 2).i("block", 2)),
         G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 5)
                                  .d("wscale", 0.25).s("dtype", "bf16").i("row_part", 2)),
+        G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 9)
+                                 .d("wscale", 0.25).s("dtype", "bf16").i("block", 2)),
+        G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 9)
+                                 .d("wscale", 0.25).s("dtype", "bf16").i("row_part", 1).i("block", 3)),
         G("entry_store", "M", 3, a.i("M", R).i("n", 8).i("block_size", 2).s("dtype", "bf16")),
         G("token_map", "M", 3, a.i("M", R).i("n_vocab", 11)),
         G("gemm_nt_ggml", "M", 3, a.i("M", R).i("N", 5).i("K", 64).s("type", "q8_0").s("dtype", "bf16")),

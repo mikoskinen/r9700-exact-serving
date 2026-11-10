@@ -277,9 +277,23 @@ int emu_permlanex16(int, int src, unsigned sel_lo, unsigned sel_hi, bool, bool) 
     const unsigned sel = (r < 8 ? sel_lo >> (4 * r) : sel_hi >> (4 * (r - 8))) & 15u;
     return s[(16 - (l & 16)) | (int)sel];
 }
-emu_v8s emu_load_tr_b128(const void*) {
-    std::fprintf(stderr, "emu: global_load_tr_b128 is not emulated\n");
-    std::abort();
+/* global_load_tr_b128: lane 8g+e gives the address of 8 consecutive 16-bit values; lane 8g+i receives
+ * value i of lanes 8g..8g+7, in lane order (an 8x8 transpose in each group of eight lanes). Each lane
+ * reads its own 16 bytes, then four exchanges (two values a word) hand every lane the whole wave's. */
+emu_v8s emu_load_tr_b128(const void* p) {
+    const unsigned short* sp = (const unsigned short*)p;
+    int all[4][32], l = 0;
+    for (int k = 0; k < 4; ++k) {
+        const int w = (int)((unsigned)sp[2 * k] | ((unsigned)sp[2 * k + 1] << 16));
+        std::memcpy(all[k], exchange(w, &l, kOpBpermute), sizeof all[k]);
+    }
+    const int g = l >> 3, i = l & 7;
+    emu_v8s out;
+    for (int e = 0; e < 8; ++e) {
+        const unsigned w = (unsigned)all[i >> 1][8 * g + e];
+        out[e] = (short)(unsigned short)((i & 1) ? (w >> 16) : (w & 0xffffu));
+    }
+    return out;
 }
 
 /* Dynamic LDS: a mapping whose last page is inaccessible, the buffer placed against it with its

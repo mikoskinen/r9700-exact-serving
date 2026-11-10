@@ -666,6 +666,17 @@ static const RadOperandSpec oArGatherHcWrite[] = {
     { "y", RAD_OPD_INOUT, 0 },     { "inj", RAD_OPD_IN, 0 },       { "h", RAD_OPD_INOUT, 0 },
 };
 
+/* moe_gather's parameters and operands, then all_reduce's: the gather's output is the message,
+ * written by the gather and reduced in place (moe_gather_all_reduce). */
+static const RadParamSpec pMoeGatherAr[] = {
+    P_INT("M"), P_INT("n"), P_INT("top_k"), P_INT("world_size"), P_STR("dtype"), P_STRO("act"),
+};
+static const RadOperandSpec oMoeGatherAr[] = {
+    { "y_expert", RAD_OPD_IN, 0 }, { "expert_w", RAD_OPD_IN, 0 }, { "sorted_tok", RAD_OPD_IN, 0 },
+    { "shared", RAD_OPD_IN, 1 },   { "shared_gate", RAD_OPD_IN, 1 },
+    { "y", RAD_OPD_INOUT, 0 },
+};
+
 /* The MTP head's entry, for a model whose residual stream is `hc` wide. `ngroup` (hc rsqrts, one
  * per sub-stream, or one over the whole row) is not in the checkpoint, so it is a parameter; it
  * defaults to the grouped form every gated residual here uses. */
@@ -3988,6 +3999,11 @@ static const RadOpSchema kSchemas[] = {
            "[h | a | h * a] a lattice row, a its sequence's anchor."),
     SCHEMA("lili_walk", pLiliWalk, oLiliWalk,
            "LiLiCorr's normalised edge scores and their greedy walk."),
+    SCHEMA("moe_gather_all_reduce", pMoeGatherAr, oMoeGatherAr,
+           "moe_gather, then the exact all_reduce of its output, in one kernel: the routed experts' "
+           "rows summed back to token order (with the shared arm folded when present) ARE the "
+           "all-reduce's message, reduced in place in `y`. ar_gather_hc_write without the write; "
+           "byte-identical to moe_gather and the exact all_reduce it replaces."),
     SCHEMA("pair_argmax", pPairArgmax, oPairArgmax,
            "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in "
            "the first f32 slot and its value in the second (row_topk's `pairs`, all-gathered): ties "
@@ -5479,6 +5495,13 @@ static const RadConstraint cArGatherHcWrite[] = {
 static const RadConstraint cArGatherHcWrite4[] = {
     C_GE("M", 1), C_DIV("n", 8), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
     C_EQ("world_size", 4), C_EQ("wire", 0), C_GE("top_k", 1), C_LE("top_k", 64),
+    C_P2P,
+};
+/* ar_gather_hc_write_4rank's bounds without the write's: four ranks, exact, top_k up to the 64 slots
+ * a row's table holds in LDS. */
+static const RadConstraint cMoeGatherAr4[] = {
+    C_GE("M", 1), C_DIV("n", 8), C_IN("dtype", "bf16"),
+    C_EQ("world_size", 4), C_GE("top_k", 1), C_LE("top_k", 64),
     C_P2P,
 };
 static const RadConstraint cGatedQuantFp8[] = {
@@ -10082,6 +10105,26 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
   r4d_shape_ar_gather_hc_write, nullptr, r4d_fuse_ar_gather_hc_write },
 
+{ "moe_gather_all_reduce_4rank", "moe_gather_all_reduce", "norm",
+  "moe_gather folded in front of the four-rank exact one-shot all-reduce: each block sums its "
+  "words' tokens back from the routed experts' rows, keeps the result as its message and pushes "
+  "it, then reduces in place -- ar_gather_hc_write_4rank's kernel at hc 0, which writes no stream",
+  "exactly 4 ranks, all peer-accessible; exact wire; n a multiple of 8, y unpitched and y_expert's "
+  "pitch a multiple of 8, because both move as 16B words; top_k <= 64; one-shot transport (every "
+  "rank pushes the whole message to every peer), so a caller keeps it to decode-sized M where the "
+  "unfused all_reduce is the one-shot too; on an instance keyed by its own M bound as "
+  "ar_gather_hc_write_4rank's is; the grid widened until a block's slot table fits in LDS, or the "
+  "inverse table in the scratch; cudagraph-safe",
+  "bf16 throughout; the gather's sums and narrows are moe_gather's (round-to-nearest-even, the "
+  "shared arm's product rounded before the add), the sum in fp32 in ascending rank order and "
+  "rounded to bf16 exactly as the four-rank exact all-reduce stores it -- byte-identical to the "
+  "two kernels it replaces",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGatherAr4), ROW(tAr), nullptr,
+  r4d_rad_ar_hc_wide_init, r4d_rad_ar_fini, r4d_rad_moe_gather_ar_4rank,
+  r4d_rad_ar_gather_hc_write_scratch, nullptr, nullptr,
+  r4d_shape_moe_gather_ar, nullptr, r4d_fuse_moe_gather_ar },
+
 { "qk_norm_rope_gate", "qk_norm_rope_gate", "attn",
   "the gated-attention QKV preamble in one pass: split [q|gate] per head, QK RMS norm over the "
   "head, partial NeoX RoPE and the gate copy",
@@ -11388,7 +11431,7 @@ extern "C" int rad_kernel_collective(int i) {
         r4d_rad_ar_oneshot_4rank_exact, r4d_rad_ar_twoshot_4rank_exact,
         r4d_rad_ar_twoshot_4rank_ti8, r4d_rad_ar_gather_4rank,
         r4d_rad_ar_hc_write_4rank, r4d_rad_ar_gather_hc_write_4rank,
-        r4d_rad_ar_rmsnorm_quant_i8_4rank,
+        r4d_rad_ar_rmsnorm_quant_i8_4rank, r4d_rad_moe_gather_ar_4rank,
     };
     for (RadLaunchFn f : kReleasing)
         if (k->launch == f) return 2;
