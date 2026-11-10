@@ -19,6 +19,7 @@
 #include "kvstream/stage.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
+#include "runtime/fn4_switch.h"
 #include "server/adapters.h"
 #include "server/server.h"
 #include "server/sink.h"
@@ -723,6 +724,14 @@ void Engine::rank_loop(int index) {
 
 /* ------------------------------------------------------------------ the scheduler thread */
 int Engine::prepare_release(const RadBatch* b) {
+    /* fn4: runtime switch changes (POST /admin/fn4) land here, with every rank thread parked, so
+     * every rank issues this step under one setting (runtime/fn4_switch.h). Nothing queued: one
+     * atomic load, no lock. */
+    {
+        int adapt = fn4::kNoChange;
+        if (fn4::apply_pending(b ? b->step : -1, &adapt) && adapt != fn4::kNoChange)
+            sched_.set_draft_adaptive(adapt);
+    }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;

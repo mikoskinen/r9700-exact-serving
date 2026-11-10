@@ -10,6 +10,7 @@
 #include "lora/slots.h"
 #include "server/liveview.h"
 #include "server/metrics.h"
+#include "runtime/fn4_switch.h"
 #include "text/chat.h"
 
 #include <condition_variable>
@@ -4977,6 +4978,74 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
         g3.path = "/admin/control-vector";
         CHECK_EQ(f.srv->router().dispatch(g3).status, 200);   /* in-process */
     }
+}
+
+/* The runtime switches (runtime/fn4_switch.h, POST /admin/fn4): GET reports them; a body with any
+ * unknown switch, out-of-range value or non-number is refused whole, queueing nothing; a good one is
+ * queued under "pending" and applied only at a step release (fn4::apply_pending, which the engine
+ * calls with every rank parked), where the epoch moves once. A plugin switch that no loaded object
+ * takes (no libr4d in this binary) is refused there and keeps its value. Loopback only without a
+ * key. */
+TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release) {
+    Fixture f;
+    const HttpResponse g = f.get("/admin/fn4");
+    CHECK_EQ(g.status, 200);
+    CHECK(has(g.body, "\"draft_adaptive\": -1"));
+    CHECK(has(g.body, "\"gg_gemv\": 0"));
+    CHECK(has(g.body, "\"aql_acq\": -1"));
+    CHECK(has(g.body, "\"epoch\": 0"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"gg_gemv":1,"no_such_switch":1})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"gg_gemv":2})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"gg_gemv":"on"})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":3})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"([1])").status, 400);
+    CHECK(has(f.get("/admin/fn4").body, "\"pending\": {}"));
+    int adapt = 7;
+    CHECK(!fn4::apply_pending(3, &adapt));
+    CHECK_EQ(adapt, fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), (uint64_t)0);
+
+    const HttpResponse p = f.post("/admin/fn4", R"({"gg_gemv":true,"draft_adaptive":1,"epoch_bump":1})");
+    CHECK_EQ(p.status, 200);
+    CHECK(has(p.body, "\"pending\": {\"draft_adaptive\": 1, \"gg_gemv\": 1, \"epoch_bump\": 1}"));
+    CHECK_EQ(fn4::value(fn4::kDraftAdaptive), -1);
+    CHECK(fn4::apply_pending(7, &adapt));
+    CHECK_EQ(adapt, 1);
+    CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 1);
+    CHECK_EQ(fn4::value(fn4::kGgGemv), 0);
+    CHECK_EQ(fn4::epoch(), (uint64_t)1);
+    const HttpResponse g2 = f.get("/admin/fn4");
+    CHECK(has(g2.body, "\"pending\": {}"));
+    CHECK(has(g2.body, "\"applied_step\": 7"));
+    CHECK(!fn4::apply_pending(8, &adapt));
+    CHECK_EQ(adapt, fn4::kNoChange);
+    /* A value equal to the applied one is no change: no new epoch. A bump alone is one. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":1})").status, 200);
+    CHECK(!fn4::apply_pending(9, &adapt));
+    CHECK_EQ(f.post("/admin/fn4", R"({"epoch_bump":1})").status, 200);
+    CHECK(fn4::apply_pending(10, &adapt));
+    CHECK_EQ(adapt, fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), (uint64_t)2);
+    /* aql_acq is the core's own: applied without a plugin. Back to 0, and the draft window to the
+     * configured one (-1), for the rest of the binary. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":2})").status, 200);
+    CHECK(fn4::apply_pending(11, &adapt));
+    CHECK_EQ(fn4::aql_acq_rule(), 2);
+    CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":0,"draft_adaptive":-1})").status, 200);
+    CHECK(fn4::apply_pending(12, &adapt));
+    CHECK_EQ(fn4::aql_acq_rule(), 0);
+    CHECK_EQ(adapt, -1);
+    CHECK_EQ(fn4::epoch(), (uint64_t)4);
+
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/admin/fn4";
+    q.body = R"({"epoch_bump":1})";
+    q.peer = "192.168.1.20:50122";
+    q.raw_peer = q.peer;
+    q.headers["Host"] = "127.0.0.1:8080";
+    CHECK_EQ(f.srv->router().dispatch(q).status, 403);
+    CHECK(has(f.get("/admin/fn4").body, "\"pending\": {}"));
 }
 
 /* The policy oai.cpp's lists state, key by key, on every endpoint: a guarded key is served at its

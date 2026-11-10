@@ -7,6 +7,7 @@
 #include "kvstream/stage.h"
 #include "xp_state.h"
 #include "../device/device.h"
+#include "fn4_switch.h"
 
 #include <algorithm>
 #include <cstring>
@@ -54,13 +55,7 @@ bool ls_meet(const LineSet& a, const LineSet& b) {
 /* RADIANCE_AQL_ACQ=rule | rule-w: haz_mark marks the dispatches that may play without their agent
  * acquire. 0 off, 1 rule (a store leaves no stale line behind on its own CU), 2 rule-w (it may:
  * every line written in the window is risky). */
-int acq_rule_mode() {
-    static const int m = [] {
-        const char* e = std::getenv("RADIANCE_AQL_ACQ");
-        return !e ? 0 : !std::strcmp(e, "rule") ? 1 : !std::strcmp(e, "rule-w") ? 2 : 0;
-    }();
-    return m;
-}
+int acq_rule_mode() { return rad::fn4::aql_acq_rule(); }   /* fn4: the aql_acq switch, else the env at start */
 bool acq_rule_on() { return acq_rule_mode() != 0; }
 }  // namespace
 
@@ -1096,6 +1091,11 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
         mix(geometry);
     }
     mix((uint64_t)level_);
+    /* fn4 (runtime/fn4_switch.h): a runtime switch change records new passes. Mixed here, after the
+     * architecture's part, so it keys the passes of a plugin with no pass-key callback as well
+     * (deepseek41's decode, verify and draft passes, keyed by the bucketed bound). Epoch 0 (no
+     * change applied) mixes nothing: every key is the one this function gave before the switches. */
+    if (const uint64_t fe = fn4::epoch()) mix(fe);
     mix(dense_epoch_);
     mix(domain_epoch_.load(std::memory_order_relaxed));
     ptr(arena_.base());

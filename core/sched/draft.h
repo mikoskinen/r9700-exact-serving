@@ -63,6 +63,9 @@ public:
         /* The adaptive policy: `--draft-window adaptive` with a serial drafter, decided by
          * Scheduler::init. Off, the depth is max_depth. */
         bool adapt = false;
+        /* fn4: the drafter could run the adaptive policy (a serial or block head), whether or not
+         * it was asked for at start -- set_adaptive() may turn it on later. */
+        bool adapt_capable = false;
     };
 
     /* ---------------------------------------------------------- the policy's constants
@@ -117,6 +120,13 @@ public:
 
     /* ---------------------------------------------------------- the adaptive policy */
     bool adaptive() const { return adapt_; }
+    /* fn4 (runtime/fn4_switch.h): the policy on or off between steps. On needs a drafter that can
+     * run it (Params::adapt_capable); off leaves the estimates, which a later on resumes from. */
+    bool set_adaptive(bool on) {
+        const bool can = (p_.adapt || p_.adapt_capable) && p_.max_depth > 0;
+        adapt_ = on && can;
+        return adapt_ == on;
+    }
     /* The window this sequence may draft into: min(D, its stop), starting its estimate on the
      * first ask; max_depth when the policy is off. Before any step chooses D, D is the ceiling. */
     int  window_for(DraftAdapt& s) const;

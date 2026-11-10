@@ -27,6 +27,7 @@
  *   - copies touching host or peer memory carry the scope themselves, as do the barrier packets
  *     that implement events and synchronisation.
  */
+#include "../runtime/fn4_switch.h"   /* fn4 aql_acq */
 #include "device.h"
 
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
@@ -1083,12 +1084,14 @@ inline uint16_t header(hsa_packet_type_t type, int acq, int rel, bool barrier = 
 
 /* Whether the packet at `idx` must acquire at system scope, and the bookkeeping if it does. */
 /* RADIANCE_AQL_ACQ: 0 unset, 1 rule or rule-w (Ctx::haz_mark marks the records), 2 none (PlayRun::put). */
+/* fn4: rule / rule-w is the aql_acq runtime switch (runtime/fn4_switch.h), else the env at start; none is
+ * start-time only, so it stays a constant here. */
+inline bool aql_acq_none_() {
+    static const bool none = rad::fn4::aql_acq_none();
+    return none;
+}
 inline int aql_acq_mode() {
-    static const int m = [] {
-        const char* e = std::getenv("RADIANCE_AQL_ACQ");
-        return !e ? 0 : (!std::strcmp(e, "rule") || !std::strcmp(e, "rule-w")) ? 1 : !std::strcmp(e, "none") ? 2 : 0;
-    }();
-    return m;
+    return aql_acq_none_() ? 2 : rad::fn4::aql_acq_rule() != 0 ? 1 : 0;
 }
 
 inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
@@ -1327,8 +1330,10 @@ struct PlayRun {
          *         every play), the first packet behind packets this thread did not play (`foreign`)
          *         and a system acquire stay.
          *   none  EXPERIMENT ONLY, unsafe in general: every agent-scope acquire becomes none. */
+        /* The rule is read only for a marked packet: only a pass recorded under it has marks, and a
+         * change of the switch re-records (the epoch), so the stock replay costs one constant test. */
         if (acq == HSA_FENCE_SCOPE_AGENT &&
-            (aql_acq_mode() == 2 || (aql_acq_mode() == 1 && r.noacq && !r.chain && !foreign)))
+            (aql_acq_none_() || (r.noacq && !r.chain && !foreign && aql_acq_mode() == 1)))
             acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (rel < rel_min) rel = rel_min;
