@@ -3150,7 +3150,7 @@ void Scheduler::step_finished() {
         if (key >= 0) {
             int rows = 0;
             for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
-            draft_.step_time(key, rows, wall * 1e3);
+            draft_.step_time(key, rows, wall * 1e3, key > 0 ? (double)step_decode_tok_ : -1.0);
         }
     }
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),

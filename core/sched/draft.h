@@ -39,9 +39,10 @@
  * plain steps (step_time keyed 0), so D = 0 is taken only where the measured plain step beats the
  * window's measured yield by kHyst. While D is 0 nothing is verified, so nothing updates the
  * acceptance estimates or the window's step times; a probe (kProbeSteps cycles at the drafting
- * depth every probe_every cycles at 0) keeps both alive, and a plain probe (kProbeSteps cycles at
- * 0) measures the plain step of a class that has none, or whose last is older than kPlainStale
- * probe intervals.
+ * depth every probe_every cycles at 0) keeps both alive, and a plain probe (cycles at 0, the first
+ * kPlainWarm plain steps not sampled) measures the plain step of a class that has none, or whose
+ * last is older than kPlainStale probe intervals. The drafting side of the comparison is the lower
+ * of the model's yield and the yield drafting steps measured (step_time's tokens).
  *
  * It changes only how many drafts a step verifies. Acceptance follows core/sample/accept.h, so
  * every emitted token is the target's own; at temperature 0 the text matches a plain run as far
@@ -141,6 +142,16 @@ public:
      * intervals (256 cycles; at one sequence 2 slower steps in 256, under 1 %): a context that grows changes the plain step and the window's alike, but only the
      * window's is refreshed by the probes from D = 0. */
     static constexpr int kPlainStale = 16;
+    /* The first plain steps after the head stops are not samples of a plain step: the first two
+     * sightings of a pass shape run eagerly and record (runtime/ctx.h), several times slower than
+     * a played one, and the step right after a move still carries the transition. Two such steps
+     * in three samples put the first plain estimate near twice the plain step (gpu02 hc-depth0,
+     * 10.11.2026: depth 0 never fired at c1 essay and c4, where a plain step pays 9-14 % more),
+     * and with one sample a refresh the mean then took hundreds of cycles to come down -- while
+     * drafting nothing else measures it. So the first kPlainWarm plain steps of every run at 0
+     * are left out, and a plain probe is 1 + kPlainWarm cycles longer than the samples it takes:
+     * 3 the first time in a class, 1 at a refresh. */
+    static constexpr int kPlainWarm = 2;
 
     int  configure(const Params& p);
     const Params& params() const { return p_; }
@@ -217,7 +228,7 @@ public:
     /* T(depth, n): a decode step with deepest window `depth` and `n_rows` decode rows took `ms`
      * since the end of the previous step. Fed by Scheduler::step_finished; adaptive policy only.
      * Depth 0, a plain step at D = 0, only under depth 0. */
-    void step_time(int depth, int n_rows, double ms);
+    void step_time(int depth, int n_rows, double ms, double tokens = -1.0);
     /* Expected cost of a step at `depth` with `n_rows` rows: the key's mean (ms) if it has
      * samples; else the nearest measured key scaled by the prior's ratio (1 + 0.06 d); else the
      * unitless prior itself. */
@@ -285,6 +296,13 @@ private:
     int64_t cycles_ = 0;                          /* cycles planned */
     int64_t plain_at_[kCostClasses] = {};         /* cycles_ at each class's last plain sample */
     int64_t plain_probe_at_ = 0;                  /* cycles_ at the last plain probe's start */
+    int32_t zero_run_ = 0;                        /* consecutive cycles the head has not run */
+    /* The drafting steps' MEASURED tokens and time per class (moving averages, any depth): what
+     * depth 0 is weighed against besides the estimates' E(D) / T(D), which can be optimistic
+     * (a new sequence starts from the prior). */
+    double  dtok_[kCostClasses] = {};
+    double  dms_[kCostClasses] = {};
+    int64_t dn_[kCostClasses] = {};
     int64_t n_zero_ = 0, n_probe_ = 0, n_zero_moves_ = 0;
     bool    zero_now() const {
         return adapt_ && depth0_ && (probe_left_ > 0 ? probe_d_ == 0 : zero_);

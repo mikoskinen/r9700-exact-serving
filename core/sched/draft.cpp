@@ -71,8 +71,13 @@ int DraftController::configure(const Params& p) {
     probe_d_ = 0;
     since_probe_ = 0;
     cycles_ = 0;
-    for (int c = 0; c < kCostClasses; ++c) plain_at_[c] = 0;
+    for (int c = 0; c < kCostClasses; ++c) {
+        plain_at_[c] = 0;
+        dtok_[c] = dms_[c] = 0.0;
+        dn_[c] = 0;
+    }
     plain_probe_at_ = -(int64_t)RAD_SCHED_MAX_SPEC * 4096;
+    zero_run_ = 0;
     n_zero_ = n_probe_ = n_zero_moves_ = 0;
     if (adapt_)
         RAD_INFO("draft depth: adaptive, %d..%d; a sequence stops at the first draft emitted less "
@@ -114,12 +119,22 @@ int DraftController::cost_class(int n_rows) {
     return c;
 }
 
-void DraftController::step_time(int depth, int n_rows, double ms) {
+void DraftController::step_time(int depth, int n_rows, double ms, double tokens) {
     if (!adapt_ || depth < (depth0_ ? 0 : 1) || depth > p_.max_depth || n_rows < 1 ||
         !(ms > 0.0) || !std::isfinite(ms))
         return;
+    /* A plain step still warming up (kPlainWarm) is no sample. */
+    if (depth == 0 && zero_run_ <= 1 + kPlainWarm) return;
     const int c = cost_class(n_rows);
     if (depth == 0) plain_at_[c] = cycles_;
+    if (depth > 0 && tokens > 0.0 && std::isfinite(tokens)) {
+        double t = ms;
+        if (dn_[c] >= kCostClipAfter && t > kCostOutlier * dms_[c]) t = kCostOutlier * dms_[c];
+        const double w = settle_weight(kCostHalfLife, dn_[c]);
+        dtok_[c] = dn_[c] ? dtok_[c] + w * (tokens - dtok_[c]) : tokens;
+        dms_[c]  = dn_[c] ? dms_[c] + w * (t - dms_[c]) : t;
+        ++dn_[c];
+    }
     double&  m = cost_ms_[depth][c];
     int64_t& n = cost_n_[depth][c];
     if (n >= kCostClipAfter && ms > kCostOutlier * m) ms = kCostOutlier * m;
@@ -301,7 +316,10 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
         }
     }
     step_w_ = step_d_ < top ? step_d_ : top;
-    if (depth0_) plan_zero(tok, plain, n_rows);
+    if (depth0_) {
+        plan_zero(tok, plain, n_rows);
+        zero_run_ = zero_now() ? (zero_run_ < INT32_MAX ? zero_run_ + 1 : zero_run_) : 0;
+    }
     return step_depth();
 }
 
@@ -325,7 +343,14 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
      * step decides at once, as the first drafting step takes the best depth outright. */
     const bool measured = cost_n_[0][c] > 0;
     if (measured) {
-        const double g_d = (tok[dd] + plain) / step_cost(dd, n_rows);
+        /* The drafting side is the lower of the model's yield at the drafting depth and the
+         * yield drafting steps measured here: E(D) comes from estimates a new sequence starts
+         * optimistic, and a plain step's yield is n_rows a step by construction. Erring toward 0
+         * corrects itself, since at 0 every plain step is a sample and every probe a drafting
+         * one; erring toward drafting does not, since while drafting only plain probes sample
+         * the plain step. */
+        double g_d = (tok[dd] + plain) / step_cost(dd, n_rows);
+        if (dn_[c] >= kCostClipAfter && dms_[c] > 0.0) g_d = std::fmin(g_d, dtok_[c] / dms_[c]);
         const double g_0 = (double)n_rows / cost_ms_[0][c];
         const bool want = zero_ ? !(g_d > g_0 * (1.0 + kHyst)) : g_0 > g_d * (1.0 + kHyst);
         if (want != zero_ && zero_held_ >= kHold) {
@@ -352,15 +377,15 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
     }
     /* Drafting: a plain probe where this class has no plain step measured, or only an old one,
      * once the drafting depth itself is measured here (otherwise the comparison has nothing to
-     * weigh it against). The first one is longer: its first plain steps are new pass shapes,
-     * recorded before they play (runtime/ctx.h), and run slow. At most one every probe_every
+     * weigh it against). Its first kPlainWarm plain steps are no samples; it takes 3 the first
+     * time in a class and 1 at a refresh. At most one every probe_every
      * cycles: a probe whose steps all carried a prefill chunk measured nothing, and must not be
      * followed by another at once. */
     const bool stale = !measured || cycles_ - plain_at_[c] > (int64_t)kPlainStale * probe_every_;
     if (stale && cost_n_[dd][c] >= kCostClipAfter && cycles_ - plain_probe_at_ >= probe_every_) {
         plain_probe_at_ = cycles_;
         probe_d_ = 0;
-        probe_left_ = measured ? kProbeSteps : kProbeSteps + 2;
+        probe_left_ = 1 + kPlainWarm + (measured ? 1 : 3);
         ++n_probe_;
     }
 }

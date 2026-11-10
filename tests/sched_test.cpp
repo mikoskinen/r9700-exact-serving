@@ -4205,8 +4205,9 @@ TEST(depth_zero_is_taken_only_where_a_measured_plain_step_beats_the_window) {
     CHECK_EQ(u0.probe_cycles(), (int64_t)0);
 
     /* Their window's steps measured at 20 + 10 d ms at four rows: d = 1 pays best, 4 x 1.6 tokens
-     * in 30 ms (0.213 a ms). The plain step not measured: a plain probe, kProbeSteps + 2 cycles
-     * the first time, in which the head does not run and nothing verifies. */
+     * in 30 ms (0.213 a ms). The plain step not measured: a plain probe, 1 + kPlainWarm + 3
+     * cycles the first time, in which the head does not run and nothing verifies; its first
+     * kPlainWarm plain steps are no samples. */
     DraftController c = depth0_controller(5);
     DraftAdapt s[4];
     DraftAdapt* four[4];
@@ -4217,12 +4218,13 @@ TEST(depth_zero_is_taken_only_where_a_measured_plain_step_beats_the_window) {
     CHECK(!c.head_runs());
     CHECK_EQ(c.step_window(), 0);
     CHECK_EQ(c.window_for(s[0]), 0);
-    for (int t = 1; t < DraftController::kProbeSteps + 2; ++t) {
+    const int P0 = 1 + DraftController::kPlainWarm + 3;
+    for (int t = 1; t < P0; ++t) {
         CHECK_EQ(c.plan_step(four, 4, 4), 0);
         c.step_time(0, 4, 28.0);                     /* plain: 4 tokens in 28 ms, 0.143 a ms */
     }
-    CHECK_EQ(c.cost_samples(0, 4), (int64_t)(DraftController::kProbeSteps + 1));
-    CHECK_EQ(c.probe_cycles(), (int64_t)(DraftController::kProbeSteps + 2));
+    CHECK_EQ(c.cost_samples(0, 4), (int64_t)3);
+    CHECK_EQ(c.probe_cycles(), (int64_t)P0);
     /* 0.143 a ms against the window's 0.213: the window stays. */
     CHECK_EQ(c.plan_step(four, 4, 4), 1);
     CHECK(c.head_runs());
@@ -4236,10 +4238,11 @@ TEST(depth_zero_is_taken_only_where_a_measured_plain_step_beats_the_window) {
     for (int i = 0; i < 4; ++i) { u[i] = estimate(z, 0.6, 0.6); zf[i] = &u[i]; }
     for (int d = 1; d <= 5; ++d)
         for (int k = 0; k < 4; ++k) z.step_time(d, 4, 20.0 + 10.0 * d);
-    for (int t = 0; t < DraftController::kProbeSteps + 2; ++t) {
+    for (int t = 0; t < P0; ++t) {
         CHECK_EQ(z.plan_step(zf, 4, 4), 0);
         if (t > 0) z.step_time(0, 4, 15.0);
     }
+    CHECK_EQ(z.cost_samples(0, 4), (int64_t)3);
     CHECK_EQ(z.plan_step(zf, 4, 4), 0);
     CHECK_EQ(z.zero_moves(), (int64_t)1);
     CHECK(!z.head_runs());
@@ -4295,6 +4298,62 @@ TEST(depth_zero_is_taken_only_where_a_measured_plain_step_beats_the_window) {
     CHECK_EQ(f.cost_samples(0, 4), (int64_t)0);
 }
 
+/* The situations gpu02 measured (hc-depth0, 10.11.2026; DeepSeek-V4.1 EXL3 2.25 TP4, DSpark NST 5 adaptive,
+ * gg_gemv 2), replayed on the controller with synthetic step times: each cycle plans, then is fed
+ * what its step would measure -- a drafting step that verifies (the head ran this cycle and the one
+ * before) its time and its tokens; a plain step (the head ran in neither) its time, the first
+ * kPlainWarm of each run 2.5x slower as a pass shape's first sightings run; nothing for the
+ * transition steps. The estimates are held at what the policy starts from, more optimistic than
+ * the measured tokens, as a new sequence's prior is.
+ *   c1 essay  drafting 1.45 tokens in 26 ms, plain 16.5 ms: 0 pays 9 %
+ *   c1 code   drafting 3.10 tokens in 32 ms: drafting pays 60 %, and stays
+ *   c4        drafting 10.3 tokens in 79 ms, plain 27 ms: 0 pays 14 %
+ *   c8        drafting 19 tokens in 117 ms, plain 40 ms: 0 pays 23 %
+ * Before the fix the first plain probe's mean held two recording steps and the comparison took the
+ * estimates' yield: depth 0 never fired at c1 essay or c4. */
+namespace {
+double zero_share(int rows, double a0, double rest, double draft_ms, double draft_tok,
+                  double plain_ms, int cycles, int tail, int64_t* moves = nullptr) {
+    DraftController c = depth0_controller(5);
+    std::vector<DraftAdapt> s((size_t)rows);
+    std::vector<DraftAdapt*> sp((size_t)rows);
+    for (int i = 0; i < rows; ++i) { s[(size_t)i] = estimate(c, a0, rest); sp[(size_t)i] = &s[(size_t)i]; }
+    bool prev = true;
+    int plain_run = 0, at0 = 0;
+    for (int t = 0; t < cycles; ++t) {
+        const int d = c.plan_step(sp.data(), rows, rows);
+        const bool head = c.head_runs();
+        if (head && prev) c.step_time(d, rows, draft_ms, draft_tok);
+        if (!head && !prev) {
+            ++plain_run;
+            c.step_time(0, rows, plain_run <= DraftController::kPlainWarm ? 2.5 * plain_ms : plain_ms);
+        }
+        if (head) plain_run = 0;
+        if (!head && t >= cycles - tail) ++at0;
+        prev = head;
+    }
+    if (moves) *moves = c.zero_moves();
+    return (double)at0 / (double)tail;
+}
+}  /* namespace */
+
+TEST(depth_zero_fires_where_the_measured_plain_step_pays_and_not_where_drafting_does) {
+    int64_t mv = 0;
+    const double essay = zero_share(1, 0.5, 0.45, 26.0, 1.45, 16.5, 600, 300, &mv);
+    CHECK(essay >= 0.8);
+    CHECK(mv <= 2);
+    const double code = zero_share(1, 0.75, 0.7, 32.0, 3.10, 16.5, 600, 300, &mv);
+    CHECK_NEAR(code, 0.0, 0.03);                     /* plain probes only */
+    const double c4 = zero_share(4, 0.5, 0.45, 79.0, 10.3, 27.0, 600, 300, &mv);
+    CHECK(c4 >= 0.8);
+    CHECK(mv <= 2);
+    const double c8 = zero_share(8, 0.5, 0.45, 117.0, 19.0, 40.0, 600, 300, &mv);
+    CHECK(c8 >= 0.8);
+    CHECK(mv <= 2);
+    fprintf(stderr, "    share of cycles at 0: c1 essay %.2f, c1 code %.2f, c4 %.2f, c8 %.2f\n", essay, code, c4,
+            c8);
+}
+
 /* Through the scheduler: at D = 0 a block drafter's rows are not asked to draft (the context pass
  * runs alone), a published proposal is cut to nothing, and the step verifies nothing. */
 TEST(depth_zero_leaves_a_block_drafter_its_context_pass_and_verifies_nothing) {
@@ -4318,12 +4377,13 @@ TEST(depth_zero_leaves_a_block_drafter_its_context_pass_and_verifies_nothing) {
     DraftController& dc = f.sch.draft();
     for (int d = 1; d <= 4; ++d)
         for (int k = 0; k < 4; ++k) dc.step_time(d, 1, 40.0 + d);
-    for (int k = 0; k < 4; ++k) dc.step_time(0, 1, 5.0);
     f.commit_plain(12);
+    /* What step_finished would feed: a plain step wherever the head did not run. */
     bool zero = false;
-    for (int t = 0; t < 2 * DraftController::kHold && !zero; ++t) {
+    for (int t = 0; t < 4 * DraftController::kHold && !zero; ++t) {
         REQUIRE(f.sch.step() != nullptr);
-        zero = !f.sch.draft().head_runs();
+        if (!f.sch.draft().head_runs()) dc.step_time(0, 1, 5.0);
+        zero = f.sch.draft().zero_moves() > 0 && !f.sch.draft().head_runs();
         f.commit_plain(13);
     }
     REQUIRE(zero);
