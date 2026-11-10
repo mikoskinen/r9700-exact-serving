@@ -127,6 +127,17 @@ inline std::atomic<int>& fn4_gather_inv_flag() {
  * moe_exl3_gate_up and moe_exl3_down with the pass's `map` buffer (gate_up writes it, down reads it in place of its
  * own map kernel), 0 = without (each op as at v8). The core switch "exl3_mapshare" reaches it through the
  * architecture's rad_fn4_switch (qwen4exp_x3); RADIANCE_FN4_X3MAP=1 at start sets it on. Read at every issue. */
+/* fn4 E10 (10.11.2026): EXL3's decode chain as ONE op (interface v5 moe_exl3_gate_up_down) for passes of
+ * EXL3_GD_MIN_ROWS..16 tokens, 1 = issue it in place of the split gate_up / down, 0 = the split ops. The core switch
+ * "exl3_gd" reaches it through qwen4exp_x3's rad_fn4_switch; RADIANCE_FN4_X3GD=1 at start sets it on. Read at every
+ * issue. From 3 tokens up both forms are split-K 1, so the fused op's y is the split chain's bits (perfmoe GD-CHECK). */
+inline std::atomic<int>& fn4_exl3_gd_flag() {
+    static std::atomic<int> f{[] {
+        const char* e = std::getenv("RADIANCE_FN4_X3GD");
+        return e && *e && std::strcmp(e, "0") != 0 ? 1 : 0;
+    }()};
+    return f;
+}
 inline std::atomic<int>& fn4_exl3_map_flag() {
     static std::atomic<int> f{[] {
         const char* e = std::getenv("RADIANCE_FN4_X3MAP");
@@ -523,6 +534,8 @@ struct MoeFP8 {
     std::vector<rad_weight> x3_gu[4], x3_dn[3];
     rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
     rad_buf     b_x3map = 0;    /* fn4 v10: the pass's shared routing map, i32 [exl3_map_words(rows * top_k, n_reg)] */
+    rad_op      op_x3gd = 0;    /* fn4 E10: moe_exl3_gate_up_down over the decode band, or 0 */
+    int64_t     x3gd_hi = 0;    /* ...its declared top (min(16, rows)) */
     int declare_exl3(RadBuilder* b, Names& nm, int l, const std::vector<int64_t>& reg);
     void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
     /* bf16 and EXL3 experts both read the bf16 activation, whole on their rank. */
@@ -1865,6 +1878,26 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l, const std::vect
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
                {b_x3h, w.sorted, w.eoff, b_x3map}, {w.edn});
     if (!op_gu || !op_dn) return RAD_E_INVAL;
+    /* fn4 E10: the decode chain as one op over EXL3_GD_MIN_ROWS..16 tokens, when a row serves it, both projections
+     * share a dtype and there is no swiglu limit (the fused op takes none). Its tables: each class's gate_up five, then
+     * down's codes and svh (exl3_positions(EXL3_GU_DN)). */
+    x3gd_hi = c.rows < 16 ? c.rows : 16;
+    if (x3gd_hi >= EXL3_GD_MIN_ROWS && rad_op_declared(b, EXL3_OP_GU_DN) && std::strcmp(x3_dtype[0], x3_dtype[1]) == 0 &&
+        !(c.swiglu_limit > 0)) {
+        tab.clear();
+        for (int q = 0; q < 2; ++q)
+            for (int t = 0; t < 7; ++t) {
+                const std::vector<rad_weight>& run = t < 4 ? x3_gu[t] : t == 4 ? x3_dn[1] : t == 5 ? x3_dn[0] : x3_dn[2];
+                for (int64_t i = 0, b0 = q ? n0 : 0, n = q ? ne / 2 : n0; i < n; ++i) tab.push_back(run[(size_t)(b0 + i)]);
+            }
+        std::vector<RadParam> gdp = { RAD_RANGE("M", EXL3_GD_MIN_ROWS, x3gd_hi), RAD_INT("N", 2 * F), RAD_INT("K", D),
+                                      RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
+                                      RAD_STR("dtype", x3_dtype[0]), RAD_STR("codebook", x3_cb[0]),
+                                      RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D) };
+        op_x3gd = rw(b, rad_decl_op(b, EXL3_OP_GU_DN, gdp.data(), (int)gdp.size(), tab.data(), (int)tab.size()),
+                     {w.h.x, w.sorted, w.eoff}, {w.edn});
+    }
+    if (!op_x3gd) x3gd_hi = 0;
     rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank (%zu more kept plain bf16), swiglu "
                 "limit %g", l, x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, prot.size(), c.swiglu_limit);
     return RAD_OK;
@@ -1876,9 +1909,11 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
     const Exl3Positions& at = *exl3_positions(op);
     static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
     static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
-    const bool gate_up = op == EXL3_GATE_UP;
+    static const int slot_gd[7] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH, EXL3_P_DN_CODES,
+                                    EXL3_P_DN_SVH };
+    const bool gate_up = op == EXL3_GATE_UP, gd = op == EXL3_GU_DN;
     const int64_t ne = n_reg, n0 = (ne + 1) / 2, k = c.top_k;   /* the EXL3 experts (protected ones after them) */
-    RadOperand opd[16];
+    RadOperand opd[24];
     for (RadOperand& o : opd) o = RAD_NONE;
     opd[at.x] = in;
     opd[at.sorted] = brows(w.sorted, rows * k);
@@ -1887,10 +1922,11 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
     if (at.map >= 0 && b_x3map && fn4_exl3_map_flag().load(std::memory_order_relaxed))   /* fn4 v10 */
         opd[at.map] = brows(b_x3map, exl3_map_words(rows * k, ne));
     for (int q = 0; q < 2; ++q)
-        for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
-            const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
+        for (int t = 0; t < (gd ? 7 : gate_up ? 5 : 3); ++t) {
+            const std::vector<rad_weight>& run = gd ? (t < 4 ? x3_gu[t] : t == 4 ? x3_dn[1] : t == 5 ? x3_dn[0] : x3_dn[2])
+                                               : gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
             /* class 0: the even places (n0 entries), class 1: the odd ones after them (ne / 2) */
-            opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] =
+            opd[at.plane[q][gd ? slot_gd[t] : gate_up ? slot_gu[t] : slot_dn[t]]] =
                 RAD_WTAB(run[(size_t)(q ? n0 : 0)], q ? ne / 2 : n0);
         }
     rad_issue(c_, op_h, opd, at.n_opd, rows);
@@ -2015,7 +2051,12 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
-    if (c.expert_exl3)
+    /* fn4 E10: the decode band's fused chain, in place of the split gate_up here and down below */
+    const bool x3gd = c.expert_exl3 && op_x3gd && rows >= EXL3_GD_MIN_ROWS && rows <= x3gd_hi &&
+                      fn4_exl3_gd_flag().load(std::memory_order_relaxed);
+    if (x3gd)
+        issue_exl3(c_, op_x3gd, EXL3_GU_DN, rows, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
+    else if (c.expert_exl3)
         issue_exl3(c_, op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                    brows(b_x3h, rows * k));
     else if (c.expert_bf16)
@@ -2045,7 +2086,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (!c.expert_exl3)   /* EXL3: inside gate_up */
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
-    if (c.expert_exl3)
+    if (c.expert_exl3 && !x3gd)
         issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
     else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),

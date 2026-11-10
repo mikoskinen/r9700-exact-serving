@@ -22,13 +22,16 @@ RAD_ARCH_PROBE(qwen4exp_x3)
 RAD_ARCH_PLUGIN(qwen4exp_x3, "qwen4exp", "exl3", "0.1.0",
                 "Qwen4-Exp (Qwen3.8-Flash-Next) from an EXL3 checkpoint: qwen4exp_fp8 under the exl3 "
                 "descriptor (EXL3 routed experts, bf16 elsewhere)")
-/* fn4 runtime switch (the core's runtime/fn4_switch.h, between steps, every rank parked): "exl3_mapshare" 0 / 1 --
- * MoeFP8's EXL3 ops with or without the pass's shared routing map (rad_block_moe_fp8.h, fn4_exl3_map_flag). Every
- * other name is not this plugin's (0). */
+/* fn4 runtime switches (the core's runtime/fn4_switch.h, between steps, every rank parked): "exl3_mapshare" 0 / 1 --
+ * MoeFP8's EXL3 ops with or without the pass's shared routing map (fn4_exl3_map_flag); "exl3_gd" 0 / 1 -- the decode
+ * band's fused moe_exl3_gate_up_down in place of the split pair (fn4_exl3_gd_flag; rad_block_moe_fp8.h). Every other
+ * name is not this plugin's (0). */
 extern "C" int rad_fn4_switch(const char* name, int value) {
-    if (!name || std::strcmp(name, "exl3_mapshare") != 0) return 0;
+    if (!name) return 0;
+    const bool map = std::strcmp(name, "exl3_mapshare") == 0, gd = std::strcmp(name, "exl3_gd") == 0;
+    if (!map && !gd) return 0;
     if (value < 0 || value > 1) return -1;
-    rad::arch::fn4_exl3_map_flag().store(value, std::memory_order_relaxed);
+    (map ? rad::arch::fn4_exl3_map_flag() : rad::arch::fn4_exl3_gd_flag()).store(value, std::memory_order_relaxed);
     return 1;
 }
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
