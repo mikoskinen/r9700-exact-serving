@@ -1929,8 +1929,20 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_prep_kernel(Exl3r4dPrefill a) 
 // owns are left alone: the GEMM zeroes them), every (matrix, 128-feature block) task of the rows one wave's work.
 // Saves the map's own dispatch and its dependent-launch gap (~3 + ~2.8 us a call, the M = 32 trace).
 #define EXL3R4D_PF_ROWS 16
+// fn4 E8' (10.11.2026), what PREP 2 loses (153 B: +7.0 / +14.5 % at M 64 / 32 against PREP 0):
+//   EXL3R4D_MAPPREP_T  the launch's workgroup size (256; 1024 gives workgroup 0's map and order four times the threads,
+//                      the prep workgroups the same rows with four times the waves) -- same work, same bytes;
+//   EXL3R4D_MAPPREP_ABL reading arms: 1 = the prep workgroups return at once (TIMING ONLY, wrong output: what the
+//                      by-row prep costs); 2 = workgroup 0 writes the map's own order instead of the LPT sort (exact: the
+//                      order only schedules the GEMM's entries, the same rows the same bits; what the sort costs).
+#ifndef EXL3R4D_MAPPREP_T
+#define EXL3R4D_MAPPREP_T 256
+#endif
+#ifndef EXL3R4D_MAPPREP_ABL
+#define EXL3R4D_MAPPREP_ABL 0
+#endif
 template <int MATS>
-__global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill a) {
+__global__ void __launch_bounds__(EXL3R4D_MAPPREP_T) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill a) {
   EXL3R4D_KARG_PREFETCH();
   __shared__ int s_w[32];
   __shared__ int s_e[EXL3R4D_PF_ROWS];
@@ -1943,10 +1955,16 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill 
     if (EXL3R4D_PF_LPT && MATS == 2 && a.order) {
       __threadfence_block();
       __syncthreads();
-      pf_order_build(a);
+      if constexpr (EXL3R4D_MAPPREP_ABL == 2) {
+        const int E = (int)a.map[0];
+        for (int k = (int)threadIdx.x; k < E; k += (int)blockDim.x) a.order[k] = (unsigned)k;
+      } else {
+        pf_order_build(a);
+      }
     }
     return;
   }
+  if constexpr (EXL3R4D_MAPPREP_ABL == 1) return;
   const Exl3r4dGemm& p = a.g;
   const int tid = threadIdx.x, lane = tid % WAVE32, nw = (int)blockDim.x / WAVE32;
   const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE32);
@@ -2070,7 +2088,7 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
     return RAD_E_INVAL;
   if (!run && prep == 2 && !rot) {   // the map and the prep by row in one launch
     const void* mk = gate_up ? (const void*)exl3r4d_pf_mapprep_kernel<2> : (const void*)exl3r4d_pf_mapprep_kernel<1>;
-    if (hipLaunchKernel(mk, dim3((unsigned)(1 + (a->g.T + EXL3R4D_PF_ROWS - 1) / EXL3R4D_PF_ROWS)), dim3(256), args, 0,
+    if (hipLaunchKernel(mk, dim3((unsigned)(1 + (a->g.T + EXL3R4D_PF_ROWS - 1) / EXL3R4D_PF_ROWS)), dim3(EXL3R4D_MAPPREP_T), args, 0,
                         st) != hipSuccess)
       return RAD_E_DEVICE;
   } else if (!run && prep != 4 &&
