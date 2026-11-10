@@ -104,6 +104,26 @@ static const RadConstraint cDs41RouterScored[] = {
     C_IN("dtype", "f32"),
 };
 
+/* router_scored_topk and moe_scatter as one op (router_sigmoid_topk_scatter's operands, r4d_rows.cpp
+ * oRouterSigmoidScatter, with the score named), and the `fill` of an ungated shared arm's gate. */
+static const RadParamSpec pDs41RouterScoredScatter[] = {
+    P_INT("M"),     P_INT("n_expert"),     P_INTO("n_local"),  P_INT("top_k"),     P_INT("norm"),
+    P_F64("route_scale"), P_STR("score"),  P_STR("dtype"),     P_INTO("expert_base"),
+    P_STRO("protect") };
+static const RadOperandSpec oDs41RouterScoredScatter[] = {
+    { "logits", RAD_OPD_IN, 0 },        { "bias", RAD_OPD_WEIGHT, 0 },
+    { "ids", RAD_OPD_OUT, 0 },          { "weights", RAD_OPD_OUT, 0 },
+    { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 },
+    { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
+    { "inverse", RAD_OPD_OUT, 1 }
+};
+/* The sort's single workgroup: M * top_k <= 1024 (refused above by the launch and the shape). */
+static const RadConstraint cDs41RouterScoredScatter[] = {
+    C_GE("M", 1),     C_LE("M", 1024),     C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("top_k", 1), C_LE("top_k", 32),   C_IN("score", "sigmoid sqrtsoftplus softmax"),
+    C_IN("dtype", "f32"),
+};
+
 static const RadParamSpec pDs41EmbedPlanes[] = { P_INT("M"),     P_INT("n_embd"),
                                                  P_INT("n_vocab"), P_INT("group"),
                                                  P_STR("dtype"), P_INTO("vocab_offset"),
@@ -221,6 +241,12 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
     SCHEMA("router_scored_topk", pDs41RouterScored, oDs41RouterScored,
            "router_sigmoid_topk with the score function a required name: sigmoid, sqrtsoftplus "
            "(sqrt(softplus(logit)), softplus linear above 20) or softmax over all n_expert logits."),
+    SCHEMA("router_scored_topk_scatter", pDs41RouterScoredScatter, oDs41RouterScoredScatter,
+           "`router_scored_topk` then `moe_scatter` over its ids, in one launch, and with `gate` present "
+           "the ungated shared arm's `fill` of its gate with 1; with `inverse` the sort is "
+           "`moe_scatter_inv` (router_sigmoid_topk_scatter with the score named). Every output is the "
+           "bytes the separate launches write, including a row with fewer finite ranks than top_k. "
+           "Bounded by the sort's single-workgroup form: M * top_k <= 1024, refused above."),
     SCHEMA("embed_lookup_planes", pDs41EmbedPlanes, oDs41EmbedPlanes,
            "A gather from a table stored as single-level affine planes, read in place: x[m, i] = v * "
            "scale[id, i / group] * mult, v = table[code] when a table is given, else the code. Codes are i8, "
@@ -299,6 +325,13 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
   "f32 logits, bias and weights; i32 ids", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDs41RouterScored), NOTUNE, nullptr, nullptr, r4d_rad_router_scored_topk, nullptr, nullptr,
   nullptr, r4d_shape_router_scored_topk },
+{ "router_scored_topk_scatter_f32", "router_scored_topk_scatter", "moe",
+  "router_scored_topk, the stable counting sort and the ungated shared gate in one launch",
+  "single group, experts <= 512, top_k <= 32, M*top_k <= 1024; one workgroup, a wave a row",
+  "f32 logits, bias and weights; i32 ids, sorted slots, offsets and counts; bf16 gate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41RouterScoredScatter), NOTUNE, nullptr, nullptr,
+  r4d_rad_router_scored_topk_scatter, nullptr, nullptr, nullptr,
+  r4d_shape_router_scored_topk_scatter, nullptr, r4d_fuse_router_scored_topk_scatter },
 { "embed_lookup_planes_bf16", "embed_lookup_planes", "vocab",
   "embedding gather from a table's affine planes, read in place (no layout hook)",
   "any M, n_embd a multiple of group; one thread an element of a gathered row",

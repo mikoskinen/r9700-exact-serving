@@ -20,13 +20,25 @@
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_ds41_pcn.h"
+#include "r4d_moe_sort.h"
 #include "r4d_plugin.h"
 
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <type_traits>
+#include <utility>
+
+#ifndef R4D_EMU_HOST
+/* split_ctr's counter blocks (r4d_gemm_fp8a8.hip), for mhc_mix's one-launch form */
+unsigned int* r4d_8a8_split_ctr(RadStream s, const void* out);
+#endif
 
 namespace {
 
@@ -882,10 +894,20 @@ __device__ __forceinline__ void mix_finish(const float (&d)[(HC * (HC + 2) + 32)
 // rows over its waves had it at decode heights, was ~1 us a step: 34 us of a 36 us call).
 constexpr int kMixSteps = 8;
 
-template <int HC, int R, int WV, int TS>
+template <int HC>
+__device__ __forceinline__ void mix_finish_row(const float* part, int chunks, const MixOut& o, long row,
+                                               int lane);
+
+/* FIN (mhc_mix's one-launch form): after a workgroup's partials for its row group are written, it
+ * adds one to the group's counter (ctr, a split_ctr block of this (stream, output): zero, and zeroed
+ * again by the last arriver); the workgroup that brings it to `chunks` finishes the group's rows,
+ * a wave a row, with mix_finish_kernel's row (mix_finish_row): the same partials summed in the same
+ * chunk order, so the finish kernel's bits, one ordered dispatch fewer. */
+template <int HC, int R, int WV, int TS, bool FIN = false>
 __global__ __launch_bounds__(32 * WV) void mix_split_kernel(const uint16_t* h, long hp,
                                                             const float* fn, long fp, float* part,
-                                                            int width, int chunks, long rows) {
+                                                            int width, int chunks, long rows,
+                                                            unsigned* ctr = nullptr, MixOut fo = {}) {
     constexpr int MIX = HC * (HC + 2), S = MIX + 1, JW = (MIX + WV - 1) / WV;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, chunk = blockIdx.x;
     const int c0 = chunk * kMixCols;
@@ -957,16 +979,30 @@ __global__ __launch_bounds__(32 * WV) void mix_split_kernel(const uint16_t* h, l
                 if (!lane && r < nr) part[((r0 + r) * S + j) * chunks + chunk] = s;
             }
         }
+        if constexpr (FIN) {
+            __shared__ unsigned s_last;
+            __threadfence();   // this workgroup's partials, device-wide, before its arrival
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                const unsigned old =
+                    __hip_atomic_fetch_add(&ctr[g], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+                s_last = old + 1u == (unsigned)chunks ? 1u : 0u;
+                if (s_last) __hip_atomic_store(&ctr[g], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            }
+            __syncthreads();
+            if (s_last) {
+                __threadfence();   // every other workgroup's partials: no stale line
+                for (int r = wave; r < nr; r += WV) mix_finish_row<HC>(part, chunks, fo, r0 + r, lane);
+            }
+            __syncthreads();   // s_last is rewritten for the next row group
+        }
     }
 }
 
 template <int HC>
-__global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int chunks, MixOut o,
-                                                         long rows) {
+__device__ __forceinline__ void mix_finish_row(const float* part, int chunks, const MixOut& o, long row,
+                                               int lane) {
     constexpr int MIX = HC * (HC + 2), Q = (MIX + 32) / 32, CU = 32;
-    const int lane = threadIdx.x & 31;
-    const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
-    if (row >= rows) return;
     const MixPre<HC> pr = mix_pre<HC>(lane, o);
     const bool vec = (chunks & 3) == 0 && ((uintptr_t)part & 15) == 0;
     float d[Q];
@@ -1004,6 +1040,15 @@ __global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int 
     mix_finish<HC>(d, lane, row, o, pr);
 }
 
+template <int HC>
+__global__ __launch_bounds__(128) void mix_finish_kernel(const float* part, int chunks, MixOut o,
+                                                         long rows) {
+    const int lane = threadIdx.x & 31;
+    const long row = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (row >= rows) return;
+    mix_finish_row<HC>(part, chunks, o, row, lane);
+}
+
 // Without scratch: one wave a row, the chunks in order, the same partials and the same sums.
 template <int HC>
 __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long hp, const float* fn,
@@ -1035,6 +1080,31 @@ __global__ __launch_bounds__(128) void mix_fused_kernel(const uint16_t* h, long 
 
 long mix_chunks(long width) { return (width + kMixCols - 1) / kMixCols; }
 
+/* mhc_mix's one-launch form (mix_split_kernel FIN). R4D_DS41_MIX_FUSE: unset or anything but "0" =
+ * on; "0" = the split and finish kernels (the same bits). r4d_ds41_mix_fuse_force pins it for tests
+ * (-1 = the environment's). */
+constexpr long kDsMixCtr = 8192;   // split_ctr's counters a block (r4d_gemm_fp8a8.hip kMaxCtr)
+std::atomic<int> g_mix_fuse_force{-1};
+bool ds_mix_fuse_on() {
+    const int f = g_mix_fuse_force.load(std::memory_order_relaxed);
+    if (f >= 0) return f != 0;
+    static const bool on = [] { const char* e = std::getenv("R4D_DS41_MIX_FUSE"); return !(e && e[0] == '0' && !e[1]); }();
+    return on;
+}
+#ifdef R4D_EMU_HOST
+/* tests/r4d_emu: device memory is host memory; a zeroed block a (stream, output), as split_ctr */
+unsigned* ds_mix_ctr(RadStream s, const void* out) {
+    static std::mutex m;
+    static std::map<std::pair<RadStream, const void*>, unsigned*> blocks;
+    std::lock_guard<std::mutex> lk(m);
+    unsigned*& b = blocks[std::make_pair(s, out)];
+    if (!b) b = (unsigned*)std::calloc((size_t)kDsMixCtr, sizeof(unsigned));
+    return b;
+}
+#else
+unsigned* ds_mix_ctr(RadStream s, const void* out) { return r4d_8a8_split_ctr(s, out); }
+#endif
+
 
 template <int HC>
 int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const MixOut& o, long rows,
@@ -1048,16 +1118,26 @@ int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const Mi
         // Rows a wave keeps (its sums' registers), and the fastest split measured per height on
         // gfx1201 (n 5120, hc 4): one row up to 8, four rows 4 steps up to 24, then eight.
         constexpr int RB = HC <= 4 ? 8 : HC <= 6 ? 4 : 2, RM = RB < 4 ? RB : 4;
+        // FIN: the finish in the split launch's last workgroup of each row group (its counters a
+        // split_ctr block of this stream and `pre`; a grid past their count, or no block, takes the
+        // finish kernel -- the same bits)
+        const long RSel = rows <= 8 ? 1 : rows <= 24 ? RM : RB;
+        const long groups = (rows + RSel - 1) / RSel, gy = grid_rows(groups);
+        unsigned* const ctr = ds_mix_fuse_on() && gy <= (long)kDsMixCtr ? ds_mix_ctr(stream, o.pre) : nullptr;
 #define MIX_SPLIT(RS, TS)                                                                          \
-    R4D_EMIT(stream, (mix_split_kernel<HC, RS, 8, TS>),                                            \
-             dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,            \
-             (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,                    \
-             (long)fn.stride[0], part, o.width, (int)chunks, rows)
+    (ctr ? R4D_EMIT(stream, (mix_split_kernel<HC, RS, 8, TS, true>),                               \
+                    dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,     \
+                    (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,             \
+                    (long)fn.stride[0], part, o.width, (int)chunks, rows, ctr, o)                  \
+         : R4D_EMIT(stream, (mix_split_kernel<HC, RS, 8, TS>),                                     \
+                    dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,     \
+                    (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,             \
+                    (long)fn.stride[0], part, o.width, (int)chunks, rows, (unsigned*)nullptr, o))
         const int rc = rows <= 8 ? MIX_SPLIT(1, kMixSteps)
                        : rows <= 24 ? MIX_SPLIT(RM, 4)
                                     : MIX_SPLIT(RB, 4);
 #undef MIX_SPLIT
-        if (rc < 0) return rc;
+        if (rc < 0 || ctr) return rc;
         return R4D_EMIT(stream, mix_finish_kernel<HC>, dim3(fin), dim3(128), 0, (const float*)part,
                         (int)chunks, o, rows);
     }
@@ -1308,15 +1388,14 @@ __device__ __forceinline__ unsigned long long ds_wave_max_u64(unsigned long long
     return b;
 }
 
+/* One row of router_scored_topk by one wave: writes the row's ids and weights and returns the
+ * expert lane j < k wrote (the expert 0 of an empty slot, as `ids` holds it). Shared with
+ * router_scored_topk_scatter, so the fused selection is this function's bits. */
 template <int OWN, int SCORE>
-__global__ __launch_bounds__(128) void router_scored_kernel(const float* logits, long lp,
-                                                            const float* bias, long bp, int32_t* ids,
-                                                            long ip, float* weights, long wp,
-                                                            long m, int ne, int k, int norm,
-                                                            float factor) {
-    const int lane = threadIdx.x & 31;
-    const long r = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
-    if (r >= m) return;
+__device__ __forceinline__ int router_scored_row(const float* logits, long lp, const float* bias,
+                                                 long bp, int32_t* ids, long ip, float* weights,
+                                                 long wp, long r, int ne, int k, int norm,
+                                                 float factor, int lane) {
     float p[OWN], bv[OWN];  // every load first (a clamped index past ne, its value dropped)
 #pragma unroll
     for (int i = 0; i < OWN; ++i) {
@@ -1390,6 +1469,50 @@ __global__ __launch_bounds__(128) void router_scored_kernel(const float* logits,
         ids[r * ip + lane] = e;
         weights[r * wp + lane] = chosen * mult;
     }
+    return e;
+}
+
+template <int OWN, int SCORE>
+__global__ __launch_bounds__(128) void router_scored_kernel(const float* logits, long lp,
+                                                            const float* bias, long bp, int32_t* ids,
+                                                            long ip, float* weights, long wp,
+                                                            long m, int ne, int k, int norm,
+                                                            float factor) {
+    const int lane = threadIdx.x & 31;
+    const long r = (long)blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (r >= m) return;
+    (void)router_scored_row<OWN, SCORE>(logits, lp, bias, bp, ids, ip, weights, wp, r, ne, k, norm,
+                                        factor, lane);
+}
+
+/* router_scored_topk, then moe_scatter over its ids, then the `fill` of an ungated shared arm's
+ * gate with 1, in one workgroup (router_sigmoid_topk_scatter's form, r4d_glm.hip, with the score
+ * named). Rows wrap over the NW waves; each row is router_scored_row's, and its slots go to the
+ * sort's LDS list instead of being read back from `ids`. A slot carries the expert its row wrote,
+ * including the expert 0 of an empty slot, so every output equals the separate launches'. INV also
+ * writes the inverse, as moe_scatter_inv does. */
+template <int OWN, int SCORE, uint32_t NW, bool INV>
+__global__ void __launch_bounds__(NW * 32)
+    router_scored_scatter_kernel(const float* logits, long lp, const float* bias, long bp,
+                                 int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
+                                 int32_t* off, int32_t* cnt, uint16_t* gate, long gp, int32_t* inv,
+                                 int m, int ne, int n_local, int k, int norm, float factor, int base,
+                                 r4d_moesort::Protect prot) {
+    __shared__ r4d_moesort::ScatterLds<NW> sl;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
+    for (int r = wave; r < m; r += (int)NW) {
+        const int e = router_scored_row<OWN, SCORE>(logits, lp, bias, bp, ids, ip, weights, wp, r,
+                                                    ne, k, norm, factor, lane) -
+                      base;
+        if (lane < k)
+            sl.e[r * k + lane] =
+                e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
+        if (gate && !lane) gate[(long)r * gp] = f32_to_bf16(1.0f);
+    }
+    lds_barrier();
+    r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k),
+                                              (uint32_t)n_local, sl, inv);
 }
 
 template <int SCORE>
@@ -1439,6 +1562,102 @@ int router_scored_body(const RadArgs* a, RadStream stream) {
                                               factor);
         default:
             return router_emit<kSoftmax>(stream, lg, bias, ids, w, (int)ne, (int)k, norm, factor);
+    }
+}
+
+/* router_scored_topk_scatter: router_scored_topk's four operands, moe_scatter's three outputs, then
+ * the optional gate and the optional inverse (router_sigmoid_topk_scatter's operands, with the
+ * score named). The sort is the single-workgroup form, so M * top_k must fit it; a larger pass is
+ * refused rather than served at another cost. */
+template <int SCORE>
+int router_scored_scatter_emit(RadStream stream, const RadTensor& lg, const RadTensor& bias,
+                               const RadTensor& ids, const RadTensor& w, const RadTensor* sorted,
+                               const RadTensor* off, const RadTensor* cnt, const RadTensor* gate,
+                               long long gp, const RadTensor* inv, int m, int ne, int nl, int k,
+                               int norm, float factor, int base, const r4d_moesort::Protect& prot) {
+    const int nw = m <= 8 ? 8 : m <= 16 ? 16 : 32;
+#define R4D_RSC_I(OWN, NW, INV)                                                                    \
+    return R4D_EMIT(stream, (router_scored_scatter_kernel<OWN, SCORE, NW, INV>), dim3(1),         \
+                    dim3((NW) * 32), 0, (const float*)lg.data, (long)lg.stride[0],                 \
+                    (const float*)bias.data, (long)bias.stride[0], (int32_t*)ids.data,             \
+                    (long)ids.stride[0], (float*)w.data, (long)w.stride[0],                        \
+                    (int32_t*)sorted->data, (int32_t*)off->data, (int32_t*)cnt->data,              \
+                    gate ? (uint16_t*)gate->data : (uint16_t*)nullptr, (long)gp,                   \
+                    inv ? (int32_t*)inv->data : (int32_t*)nullptr, m, ne, nl, k, norm, factor,     \
+                    base, prot)
+#define R4D_RSC(OWN, NW)                                                                           \
+    do {                                                                                           \
+        if (inv) R4D_RSC_I(OWN, NW, true);                                                         \
+        R4D_RSC_I(OWN, NW, false);                                                                 \
+    } while (0)
+    if (ne <= 384) {
+        if (nw == 8) R4D_RSC(12, 8u);
+        if (nw == 16) R4D_RSC(12, 16u);
+        R4D_RSC(12, 32u);
+    }
+    if (nw == 8) R4D_RSC(16, 8u);
+    if (nw == 16) R4D_RSC(16, 16u);
+    R4D_RSC(16, 32u);
+#undef R4D_RSC
+#undef R4D_RSC_I
+}
+
+int router_scored_scatter_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 7) return RAD_E_INVAL;
+    const char* sc = r4d_gets(a, "score");
+    if (!sc) return R4D_NO(RAD_E_UNSUPPORTED);
+    int score;
+    if (!std::strcmp(sc, "sigmoid")) score = kSigmoid;
+    else if (!std::strcmp(sc, "sqrtsoftplus")) score = kSqrtSoftplus;
+    else if (!std::strcmp(sc, "softmax")) score = kSoftmax;
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+    const RadTensor &lg = a->t[0], &bias = a->t[1], &ids = a->t[2], &w = a->t[3];
+    const RadTensor *sorted = &a->t[4], *off = &a->t[5], *cnt = &a->t[6];
+    const RadTensor* gate = a->n_t > 7 ? r4d_opt(a, 7) : nullptr;
+    const RadTensor* inv = a->n_t > 8 ? r4d_opt(a, 8) : nullptr;
+    const long ne = (long)r4d_geti_or(a, "n_expert", 0), k = (long)r4d_geti_or(a, "top_k", 0);
+    const long nl = (long)r4d_geti_or(a, "n_local", ne), base = (long)r4d_geti_or(a, "expert_base", 0);
+    const float factor = (float)r4d_getf(a, "route_scale", 0);
+    const int norm = r4d_geti_or(a, "norm", 0) != 0 ? 1 : 0;
+    if (lg.dtype != RAD_F32 || bias.dtype != RAD_F32 || ids.dtype != RAD_I32 ||
+        w.dtype != RAD_F32 || sorted->dtype != RAD_I32 || off->dtype != RAD_I32 ||
+        cnt->dtype != RAD_I32 || (gate && gate->dtype != RAD_BF16) ||
+        (inv && inv->dtype != RAD_I32))
+        return R4D_NO(RAD_E_DTYPE);
+    if (ne < 1 || ne > 512 || k < 1 || k > 32 || k > ne || !std::isfinite(factor) || factor <= 0 ||
+        !lg.data || !bias.data || !ids.data || !w.data || !sorted->data || !off->data ||
+        !cnt->data || lg.rank != 2 || lg.shape[0] < 1 || lg.shape[1] != ne || bias.rank != 1 ||
+        bias.shape[0] != ne || ids.rank != 2 || w.rank != 2 || ids.shape[0] != lg.shape[0] ||
+        w.shape[0] != lg.shape[0] || ids.shape[1] != k || w.shape[1] != k || lg.stride[1] != 1 ||
+        ids.stride[1] != 1 || w.stride[1] != 1 || lg.stride[0] < ne || ids.stride[0] < k ||
+        w.stride[0] < k || bias.stride[0] < 1)
+        return R4D_NO(RAD_E_SHAPE);
+    const long m = lg.shape[0], T = m * k;
+    if (T > (long)r4d_moesort::kScatterSmall || nl < 1 || nl > ne || base < 0 || base + nl > ne ||
+        !r4d_contig(sorted) || !r4d_contig(off) || !r4d_contig(cnt) || r4d_numel(sorted) < T ||
+        r4d_numel(off) < nl + 1 || r4d_numel(cnt) < nl ||
+        (inv && (!r4d_contig(inv) || r4d_numel(inv) < T)))
+        return R4D_NO(RAD_E_SHAPE);
+    long long grows = 0;
+    const long long gp = gate ? r4d_rows_pitch(gate, 1, &grows) : 0;
+    if (gate && (gp < 1 || grows < m)) return R4D_NO(RAD_E_SHAPE);
+    r4d_moesort::Protect prot;
+    const int prc = r4d_moesort::protect_of(a, nl, &prot);
+    if (prc != RAD_OK) return prc;
+    switch (score) {
+        case kSigmoid:
+            return router_scored_scatter_emit<kSigmoid>(stream, lg, bias, ids, w, sorted, off, cnt,
+                                                        gate, gp, inv, (int)m, (int)ne, (int)nl,
+                                                        (int)k, norm, factor, (int)base, prot);
+        case kSqrtSoftplus:
+            return router_scored_scatter_emit<kSqrtSoftplus>(stream, lg, bias, ids, w, sorted, off,
+                                                             cnt, gate, gp, inv, (int)m, (int)ne,
+                                                             (int)nl, (int)k, norm, factor,
+                                                             (int)base, prot);
+        default:
+            return router_scored_scatter_emit<kSoftmax>(stream, lg, bias, ids, w, sorted, off, cnt,
+                                                        gate, gp, inv, (int)m, (int)ne, (int)nl,
+                                                        (int)k, norm, factor, (int)base, prot);
     }
 }
 
@@ -1597,7 +1816,11 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
     uint32_t M, FzRope r, int block, int fmt, int sc) {
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
+    uint16_t* const fz_row = (uint16_t*)emu_dyn_lds();
+#else
     extern __shared__ uint16_t fz_row[];
+#endif
     __shared__ float lds[THR / kFzWave];
     const uint32_t m = blockIdx.x;
     if (m >= M) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)
@@ -2055,6 +2278,64 @@ int collapse_norm_body(const RadArgs* a, RadStream stream) {
 
 /* x [M, n], h [M, hc*n], post [M, hc], comb [M, hc*hc] f32 -> out [M, hc*n] (mhc_post_bf16's
  * checks: n <= 16384, out not h); pre, xc, w, y as mhc_collapse_rmsnorm. */
+/* ---- the all-reduce epilogue form of mhc_post_collapse_rmsnorm (fusion 2's single-card step, 6.11.2026).
+ * The one-shot all-reduce splits a pass's M * n / 8 sixteen-byte words over its nb workgroups (w = ceil(words / nb) a
+ * block, never row-aligned). As its epilogue: each block forms its words' out[k] and xc exactly as
+ * post_collapse_norm_kernel forms a column (from zero, comb[j][k] * h[j] in j order, + post[k] * x, f32_to_bf16; then
+ * pre[k] * out[k] in k order, ds_bf16) and stores them; per row a counter (zeroed by the row's last arriver) takes the
+ * block's words in it, and the block that completes a row runs the norm over the stored xc in the norm kernel's own
+ * order: virtual thread v of THR = r4d_act_threads(M, n) adds columns v, v + THR, .. from zero, each wave of 32 virtual
+ * threads closes with r4d_wave_sum (run on real lanes), the wave sums are added from zero in order, then rsqrtf and
+ * y = f32_to_bf16(xv * s * (g + wadd) * mult). Same values in the same order: post_collapse_norm_kernel's bytes, at any
+ * nb and block width. Here without the collective (x is the reduced input); tests/r4d_emu holds it to the norm kernel. */
+template <int HCM>
+__global__ __launch_bounds__(256) void pcn_words_kernel(const uint16_t* __restrict__ xin, long xp,
+                                                        r4d_ds41pcn::PcnArgs A) {
+    __shared__ float vss[1024];          // the virtual threads' partial sums (THR <= 1024)
+    __shared__ float wsum[32];
+    __shared__ unsigned s_done;
+    const uint32_t wpr = A.n / 8, words = A.M * wpr, nb = gridDim.x, b = blockIdx.x, nt = 256;
+    const uint32_t wd = (words + nb - 1) / nb, w0 = b * wd, w1 = min(words, w0 + wd);
+    for (uint32_t k = w0 + threadIdx.x; k < w1; k += nt) {
+        const uint32_t m = k / wpr, i0 = (k - m * wpr) * 8;
+        uint16_t xw[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) xw[e] = xin[(long)m * xp + i0 + (uint32_t)e];
+        r4d_ds41pcn::pcn_word<HCM>(A, m, i0, xw);
+    }
+    r4d_ds41pcn::pcn_arrive(A, w0, w1, nt, vss, wsum, &s_done);
+}
+
+/* tests: post_collapse_norm_body's operands, the epilogue form over `nb` blocks of 256 (ctr: M zeroed words) */
+int pcn_words_body(const RadArgs* a, RadStream stream, int nb, unsigned* ctr) {
+    if (!a || a->n_t < 9 || nb < 1 || !ctr) return RAD_E_INVAL;
+    const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
+    if (n <= 0 || n > 16384 || n % 8 || hc < 2 || hc > 8) return RAD_E_SHAPE;
+    const RadTensor &xi = a->t[0], &h = a->t[1], &po = a->t[2], &cb = a->t[3], &o = a->t[4];
+    const RadTensor &pre = a->t[5], &x = a->t[6], &w = a->t[7], &y = a->t[8];
+    const long rows = xi.shape[0];
+    long long My = 0;
+    const long long y_ld = r4d_rows_pitch(&y, n, &My);
+    const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const float mult = (float)r4d_getf(a, "mult", 1.0);
+    r4d_ds41pcn::PcnArgs A{};
+    A.h = (const uint16_t*)h.data; A.hp = (long)h.stride[0];
+    A.post = (const float*)po.data; A.ptp = (long)po.stride[0];
+    A.comb = (const float*)cb.data; A.cbp = (long)cb.stride[0];
+    A.out = (uint16_t*)o.data; A.op = (long)o.stride[0];
+    A.pre = (const float*)pre.data; A.pp = (long)pre.stride[0]; A.pst = (long)pre.stride[1];
+    A.xc = (uint16_t*)x.data; A.x_ld = (uint32_t)x.stride[0];
+    A.w = w.data; A.wf32 = w.dtype == RAD_F32 ? 1 : 0;
+    A.y = (uint16_t*)y.data; A.y_ld = (uint32_t)y_ld;
+    A.n = (uint32_t)n; A.M = (uint32_t)rows; A.hc = (int)hc; A.thr_v = r4d_act_threads((int)rows, (int)n);
+    A.eps = eps; A.wadd = wadd; A.mult = mult; A.ctr = ctr;
+    if (hc <= 4)
+        return R4D_EMIT(stream, (pcn_words_kernel<4>), dim3((unsigned)nb), dim3(256), 0, (const uint16_t*)xi.data,
+                        (long)xi.stride[0], A);
+    return R4D_EMIT(stream, (pcn_words_kernel<8>), dim3((unsigned)nb), dim3(256), 0, (const uint16_t*)xi.data,
+                    (long)xi.stride[0], A);
+}
+
 int post_collapse_norm_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 9) return RAD_E_INVAL;
     const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
@@ -2111,6 +2392,7 @@ extern "C" int r4d_rad_stream_gate_add(const RadArgs* a, RadStream s) {
 extern "C" int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream s) { return rope_rows_body(a, s); }
 extern "C" int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream s) { return quant_rt_body(a, s); }
 extern "C" int r4d_rad_mhc_mix(const RadArgs* a, RadStream s) { return mhc_mix_body(a, s); }
+extern "C" void r4d_ds41_mix_fuse_force(int on) { g_mix_fuse_force.store(on, std::memory_order_relaxed); }
 /* Partials of every chunk of every row of the band, so the projection spreads over workgroups. */
 extern "C" int64_t r4d_rad_mhc_mix_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), n = r4d_geti_or(a, "n", 0);
@@ -2128,6 +2410,9 @@ extern "C" int r4d_rad_entry_store(const RadArgs* a, RadStream s) { return entry
 extern "C" int r4d_rad_router_scored_topk(const RadArgs* a, RadStream s) {
     return router_scored_body(a, s);
 }
+extern "C" int r4d_rad_router_scored_topk_scatter(const RadArgs* a, RadStream s) {
+    return router_scored_scatter_body(a, s);
+}
 extern "C" int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream s) {
     return embed_planes_body(a, s);
 }
@@ -2142,4 +2427,8 @@ extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream s) {
     return post_collapse_norm_body(a, s);
+}
+/* tests only (tests/r4d_emu): mhc_post_collapse_rmsnorm as the all-reduce's word-partitioned epilogue, nb blocks */
+extern "C" int r4d_ds41_pcn_words(const RadArgs* a, RadStream s, int nb, unsigned* ctr) {
+    return pcn_words_body(a, s, nb, ctr);
 }

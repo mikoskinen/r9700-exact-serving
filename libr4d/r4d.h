@@ -415,6 +415,17 @@ void r4d_ar_hc_write_4rank(long peer_scratch0, long peer_scratch1, long peer_scr
                            long y, long inj, long h, long M, long n, long hc, long irow,
                            long hrow, long rank, long stream, long nblocks, long nthreads,
                            long drain, long acq, long pub, long gate, long gate_ctr);
+// The 4-rank exact one-shot of `y` [M][n] bf16, in place, with DeepSeek-V4.1's mhc_post -> mhc_collapse -> rmsnorm
+// (mhc_post_collapse_rmsnorm) as its epilogue: byte-identical to that all-reduce then that op (r4d_ds41_pcn.h). Buffers,
+// peer order, flag values, slots and block partition are r4d_ar_oneshot_4rank_exact's. ctr: M zeroed row counters.
+void r4d_ar_mhc_pcn_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                          long peer_flags0, long peer_flags1, long peer_flags2,
+                          long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                          long y, long M, long n, long hc, long h, long hrow, long post, long ptp, long comb,
+                          long cbp, long out, long orow, long pre, long pp, long pst, long xc, long xrow,
+                          long wgt, long wf32, long ynorm, long yrow, double eps, long ctr, long rank,
+                          long stream, long nblocks, long nthreads, long drain, long acq, long pub,
+                          long gate, long gate_ctr);
 // r4d_ar_hc_write_4rank with the MoE gather as its prologue, byte-identical to moe_gather, the
 // 4-rank exact all-reduce, then hc_write. Gather operands, `inv` and the grid rule are
 // r4d_ar_gather_hc_write's; buffers, peer order, flag values and slots are

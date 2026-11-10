@@ -2183,6 +2183,7 @@ The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2
 | `router_scored_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `score`:str `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_group_topk` | `M`(range) `n_expert` `top_k` `n_group` `topk_group` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
 | `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
+| `router_scored_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `score`:str `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
 | `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
 | `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
@@ -2345,6 +2346,14 @@ separate launches write, including a row with fewer than `top_k` non-NaN ranks (
 whose empty slots carry expert 0 into the sort as `ids` does (`r4d_selftest`). Bounded like
 `router_topk_scatter` (`M * top_k <= 1024`, one workgroup) and refused past it. With `inverse` the
 sort is `moe_scatter_inv`'s.
+
+**`router_scored_topk_scatter`** (device-only) is `router_sigmoid_topk_scatter` with the score
+function named as in `router_scored_topk` (`sigmoid`, `sqrtsoftplus`, `softmax`): the selection is
+`router_scored_topk`'s row (libr4d runs the same row function in both), then `moe_scatter` (or
+`moe_scatter_inv`) over its ids and, with `gate`, the shared arm's `fill`. Every output is the bytes
+the separate launches write. Bounded like `router_sigmoid_topk_scatter` (`M * top_k <= 1024`, one
+workgroup) and refused past it. DeepSeek-V4.1 issues it in place of its `router_scored_topk` and
+`moe_scatter` (one dispatch fewer a MoE layer).
 
 **`moe_scatter_inv`** and **`moe_gather_inv`** (device-only) are `moe_scatter` and `moe_gather`
 with the gather's slot table passed between them. `inverse` `[M * top_k]` holds, for slot
@@ -2639,6 +2648,7 @@ device code.
 | `ar_rmsnorm_had_quant_i8g` | `M` `n` `eps`:f64 `group` `world_size` `dtype` `wadd`:f64/opt `wire`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `ar_rmsnorm_quant_i8` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt `sp`/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
 | `ar_rmsnorm_quant_i8g` | `M` `n` `eps`:f64 `world_size` `dtype` `wadd`:f64/opt | `x`:inout, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`?; `w_post`w?, `scalar`w? |
+| `ar_mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `world_size` `dtype` `wire`/opt | `x`:inout, `h`, `post`, `comb`, `out`:out, `pre`, `xc`:out, `w`w, `y`:out |
 | `ar_hc_write` | `M`(range) `n` `hc` `world_size` `dtype` `wire`/opt | `y`:inout, `inj`, `h`:inout |
 | `ar_gather_hc_write` | `M`(range) `n` `hc` `top_k` `world_size` `dtype` `act`/opt `wire`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout, `inj`, `h`:inout |
 | `moe_gather_all_reduce` | `M`(range) `n` `top_k` `world_size` `dtype` `act`/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`?, `y`:inout |
@@ -2664,6 +2674,12 @@ until a junction or reduction writes it whole again.
 The norm-carrying forms are two-rank only, except `ar_rmsnorm_quant_i8`, which also has an
 exact-wire four-rank form (below), as `ar_hc_write` and `ar_gather_hc_write` do. At other widths
 the arch blocks issue the plain ops.
+
+`ar_mhc_post_collapse_rmsnorm` (device-only, four ranks, exact wire) is `all_reduce` of `x` followed by
+`mhc_post_collapse_rmsnorm` over the reduced `x`: `x` as the four-rank exact all-reduce leaves it, then `out`, `xc`
+and `y` as that op writes them, byte for byte. It is the wide one-shot (same handshake, slots and block partition as
+the plain all-reduce, so they share an instance) with the post/collapse of each 16-byte word as its epilogue; the
+block that completes a row runs the norm over the stored `xc` in the norm's own summation order. `M` up to 8192.
 
 `ar_hc_write` is `all_reduce` of `y` followed by `hc_write` of the reduced `y`, for a block whose
 output feeds a gated residual rather than a norm; `y` is inout as `x` is above. It serves both

@@ -515,6 +515,7 @@ int  r4d_rad_ar_hc_write(const RadArgs*, RadStream);
  * M bound. */
 int  r4d_rad_ar_hc_wide_init(const RadParam*, int, int rank, int world, void** out);
 int  r4d_rad_ar_hc_write_4rank(const RadArgs*, RadStream);
+int  r4d_rad_ar_mhc_pcn_4rank(const RadArgs*, RadStream);
 int  r4d_rad_ar_gather_hc_write(const RadArgs*, RadStream);
 int64_t r4d_rad_ar_gather_hc_write_scratch(const RadArgs*);
 /* ar_gather_hc_write at four ranks, exact wire only, on an instance from the same init. */
@@ -1026,6 +1027,7 @@ int r4d_shape_ar_ln_had_quant_i8   (const RadParam*, int, int operand, RadOpdDes
 int r4d_shape_ar_rmsnorm_quant_fp8 (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_rmsnorm_had_quant_i8g (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_hc_write          (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_ar_mhc_pcn           (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_ar_gather_hc_write   (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_moe_gather_ar        (const RadParam*, int, int operand, RadOpdDesc*);
 
