@@ -2055,10 +2055,12 @@ static __device__ __forceinline__ void fu_wait(unsigned* c, unsigned need, unsig
 #ifndef EXL3R4D_GD_ABL
 #define EXL3R4D_GD_ABL 0
 #endif
+// GB / DB (fn4 DS variant, 10.11.2026): gate_up's and down's K (the tagged BITS of moe_pass: 2..6, EXL3R4D_K25 = 2.5).
+// The units run the split kernels' moe_pass at that K, so the bits stay the split chain's (GD-CHECK at each pair).
 #if EXL3R4D_GD_SK2
-template <bool AP, int GSK = 1>
+template <bool AP, int GB = 4, int DB = 4, int GSK = 1>
 #else
-template <bool AP>
+template <bool AP, int GB = 4, int DB = 4>
 #endif
 __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
   EXL3R4D_KARG_PREFETCH();
@@ -2550,12 +2552,12 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       if constexpr (AP) {
         const int chunk = __builtin_amdgcn_readfirstlane(q.gu.chunk);
         for (int rc = un.r0; rc < un.r1; rc += chunk)
-          moe_pass<4, 2, 2, true, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+          moe_pass<GB, 2, 2, true, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
       } else if (EXL3R4D_GD_ABL & 4) {
       } else {
         for (int rc = un.r0; rc < un.r1; rc += EXL3_BLOCK) {
-          if constexpr (GSK == 2) moe_pass<4, 4, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
-          else moe_pass<4, 2, 2, false, false, 0, true, EXL3R4D_FU_PF_GU>(q.gu, w, rc, un.r1, lds, 0, cb);
+          if constexpr (GSK == 2) moe_pass<GB, 4, 2, false, false, 0, true>(q.gu, w, rc, un.r1, lds, 0, cb);
+          else moe_pass<GB, 2, 2, false, false, 0, true, EXL3R4D_FU_PF_GU>(q.gu, w, rc, un.r1, lds, 0, cb);
         }
       }
 #if EXL3R4D_WGSTAMP
@@ -2614,7 +2616,7 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
       first_unit = false;
 #endif
       for (int rc = r0; rc < r1 && !(EXL3R4D_GD_ABL & 2); rc += EXL3_BLOCK)
-        moe_pass<4, 2, 1, false, false, 0, true, EXL3R4D_FU_PF_DN>(qdn, w, rc, r1, lds + part * 2048, 0, 2 * pair + part, true,
+        moe_pass<DB, 2, 1, false, false, 0, true, EXL3R4D_FU_PF_DN>(qdn, w, rc, r1, lds + part * 2048, 0, 2 * pair + part, true,
                                                                  part * hw);
 #if EXL3R4D_WGSTAMP
       if (EXL3R4D_WGSTAMP & 2) wgs_exit(0, d);
@@ -2637,8 +2639,8 @@ __global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Ex
   }
 }
 
-extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups,
-                                    int prep, void* stream) {
+static int launch_fused_k(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, int prep,
+                          int bits, void* stream) {
   Exl3r4dFused f = {};
   f.gu = *gu;
   for (int c = 0; c < EXL3R4D_NCLS; ++c) {
@@ -2701,10 +2703,22 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
   if (smem < 2 * 8192) smem = 2 * 8192;  // down's two halves' epilogue tiles
 #if EXL3R4D_GD_SK2
   const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> :
-                   sk2 ? (const void*)exl3r4d_fused_kernel<false, 2> : (const void*)exl3r4d_fused_kernel<false>;
+                   sk2 ? (const void*)exl3r4d_fused_kernel<false, 4, 4, 2> : (const void*)exl3r4d_fused_kernel<false>;
 #else
   const void* fn = ap ? (const void*)exl3r4d_fused_kernel<true> : (const void*)exl3r4d_fused_kernel<false>;
 #endif
+  // fn4 DS variant: gate_up and down at one other K (DS's EXL3 2.25: K 2 or 2.5 a layer, both projections alike) --
+  // the plain form only (no AP, no split-K 2), the two-class build only
+  if (bits != 4) {
+#if EXL3R4D_NCLS == 2
+    if (ap || gu->sk != 1) return RAD_E_UNSUPPORTED;
+    fn = bits == 2 ? (const void*)exl3r4d_fused_kernel<false, 2, 2>
+       : bits == EXL3R4D_K25 ? (const void*)exl3r4d_fused_kernel<false, EXL3R4D_K25, EXL3R4D_K25> : nullptr;
+    if (!fn) return RAD_E_UNSUPPORTED;
+#else
+    return RAD_E_UNSUPPORTED;
+#endif
+  }
   if (workgroups <= 0) {
     workgroups = wq_capacity(fn, 256, (size_t)smem, f.nwgp);
     // EXL3R4D_GD_WGS: percent of the resident capacity the persistent launch takes, so independent work the engine
@@ -2735,6 +2749,19 @@ extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn
     return RAD_E_DEVICE;
   return RAD_OK;
 }
+
+extern "C" int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups,
+                                    int prep, void* stream) {
+  return launch_fused_k(gu, dn, ctr, workgroups, prep, 4, stream);
+}
+#if EXL3R4D_NCLS == 2
+// fn4 DS variant (10.11.2026): the fused launch with both projections at K `bits` (2, 4 or EXL3R4D_K25); RAD_E_UNSUPPORTED
+// for any other K, the AP form or split-K 2 -- the caller then takes the separate kernels (the same bits).
+extern "C" int exl3r4d_launch_fused_k(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups,
+                                      int prep, int bits, void* stream) {
+  return launch_fused_k(gu, dn, ctr, workgroups, prep, bits, stream);
+}
+#endif
 
 #if EXL3R4D_GD4 && EXL3R4D_WGSTAMP   // the reading's entries for the four-class fused kernel's stamps (perfmoe, EXL3_WGS4)
 extern "C" __attribute__((visibility("default"))) int exl3r4d_wgstamp4_clear(void* stream) {

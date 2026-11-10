@@ -6,8 +6,8 @@
 #include "exl3_decode.h"
 #include "exl3_layout.h"
 
-#if EXL3_IFACE_VERSION != 10
-#error "exl3r4d is written against EXL3_IFACE_VERSION 10 (include/exl3_abi.h, PLAN.md D15; v3 h_rot, v4 a_rot + prep_gu, v5 gate_up_down, v6 the _mod4 forms, v7 gate_up_down_mod4, v8 gate_up limit, v10 the shared map; v9 is the ds41 line's)"
+#if EXL3_IFACE_VERSION != 11
+#error "exl3r4d is written against EXL3_IFACE_VERSION 11 (include/exl3_abi.h, PLAN.md D15; v3 h_rot, v4 a_rot + prep_gu, v5 gate_up_down, v6 the _mod4 forms, v7 gate_up_down_mod4, v8 gate_up limit, v10 the shared map, v11 gate_up_down limit; v9 is the ds41 line's)"
 #endif
 #if EXL3_DECODE_API_VERSION != 2 || EXL3_LAYOUT_API_VERSION != 2
 #error "exl3r4d is written against EXL3_DECODE_API_VERSION 2 and EXL3_LAYOUT_API_VERSION 2 (common/: half-integer K)"
