@@ -1674,10 +1674,13 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
     d.top_k = gi(meta, "dspark.expert_used_count", c.top_k);
     d.rank = gi(meta, "dspark.markov_rank", 0);
     d.noise = gi(meta, "dspark.noise_token_id", -1);
-    d.cand = gi(meta, "dspark.markov_top_k", 16);
-    /* RADIANCE_DS41_DSPARK_CAND (1..32): the Markov walk's candidates from the head's top (the reference biases the
-     * whole vocabulary; the walk re-ranks this many); unset = the container's dspark.markov_top_k, else 16. The
-     * drafter only proposes and the trunk verifies, so the trunk's greedy text does not depend on it. */
+    /* The walk's candidates from the head's top: 32, the most the walk takes (the container states 16, its converter's
+     * default). Measured 10.11.2026 on EXL3 2.25, TP4, NST 5 (same image, 16 vs 32): tokens a step 1-user code 4.00 ->
+     * 4.52, c4 9.51 -> 9.76, c8 19.66 -> 20.09 at the same step time. */
+    d.cand = 32;
+    /* RADIANCE_DS41_DSPARK_CAND (1..32) overrides it: the Markov walk's candidates from the head's top (the reference
+     * biases the whole vocabulary; the walk re-ranks this many). The drafter only proposes and the trunk verifies, so
+     * the trunk's greedy text does not depend on it. */
     if (const char* e = std::getenv("RADIANCE_DS41_DSPARK_CAND")) {
         const long v = std::strtol(e, nullptr, 10);
         if (v >= 1 && v <= 32) d.cand = v;
