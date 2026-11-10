@@ -61,12 +61,16 @@ RadTensor none() { return RadTensor{}; }
 RadParam pint(const char* k, long long v) { return { k, RAD_P_INT, v, 0, nullptr, 0.0 }; }
 RadParam pf64(const char* k, double v) { return { k, RAD_P_F64, 0, 0, nullptr, v }; }
 RadParam pstr(const char* k, const char* v) { return { k, RAD_P_STR, 0, 0, v, 0.0 }; }
+void* g_scratch = nullptr;     /* lever NVG: the scratch handed to the next launches (null: none) */
+int64_t g_scratch_bytes = 0;
 int launch(int (*fn)(const RadArgs*, RadStream), RadTensor* t, int nt, const std::vector<RadParam>& p) {
     RadArgs a{};
     a.t = t;
     a.n_t = nt;
     a.p = p.data();
     a.n_p = (int)p.size();
+    a.scratch = g_scratch;
+    a.scratch_bytes = g_scratch_bytes;
     return fn(&a, nullptr);
 }
 
@@ -399,6 +403,30 @@ void ord_case(const std::string& name, const Fix& f, bool packed_lat, const Rt& 
     long long rows_out = 0;
     for (int m = 0; m < f.M; ++m) rows_out += f.pos[(size_t)m] >= tab;
     expect(d12 == 0, name, "the fold differs from attn + rope_rows_roundtrip", d12, (long long)no);
+    /* lever NVG over the packed latent: the fold and the plain op with the gather's scratch (48 rows x topk entries)
+     * -- the same bytes as without */
+    long long dgf = -1, dga = -1, wr = -1;
+    if (packed_lat) {
+        const int64_t need = (int64_t)48 * f.topk * kD * 2;
+        std::vector<uint16_t> scr((size_t)(need / 2 + 8), 0x4444);
+        g_scratch = (void*)(((uintptr_t)scr.data() + 15) & ~(uintptr_t)15);
+        g_scratch_bytes = need;
+        std::vector<uint16_t> og(no, 0x2222), oa(no, 0x1111);
+        expect(attn(r4d_rad_ds41_attn_sparse_sink_rope_roundtrip, f, pkp, og.data(), q_pitch, qv.data(), &rt, &cs, tab) ==
+                   RAD_OK, name, "attn_sparse_sink_rope_roundtrip, NVG gathered");
+        expect(attn(r4d_rad_ds41_attn_sparse_sink, f, pkp, oa.data(), q_pitch, qv.data(), nullptr, nullptr, 0) == RAD_OK,
+               name, "attn_sparse_sink, NVG gathered");
+        wr = 0;
+        for (int64_t i = 0; i < std::min<int64_t>((int64_t)f.M, 48) * f.topk * kD; ++i)
+            wr += ((const uint16_t*)g_scratch)[i] != 0x4444;
+        g_scratch = nullptr;
+        g_scratch_bytes = 0;
+        dgf = diff(og, o1);
+        dga = diff(oa, o0);
+        expect(f.M > 48 || wr > 0, name, "NVG: the gathered path did not write the scratch (not taken)", wr, 0);
+        expect(dgf == 0, name, "NVG: the gathered fold differs from the fold", dgf, (long long)no);
+        expect(dga == 0, name, "NVG: the gathered attention differs from the attention", dga, (long long)no);
+    }
     expect(d13 == 0, name, "the fold differs from attn + rope_rows + quant_roundtrip", d13, (long long)no);
     expect(d23 == 0, name, "rope_rows_roundtrip differs from rope_rows + quant_roundtrip", d23, (long long)no);
     expect(d0 > 0, name, "the rope and round trip changed nothing (the fixture is too weak)", d0, 0);
@@ -408,11 +436,15 @@ void ord_case(const std::string& name, const Fix& f, bool packed_lat, const Rt& 
                 name.c_str(), f.M, f.H, f.ratio, f.win, f.topk, packed_lat ? "nvfp4" : "bf16",
                 q_pitch ? " pitched q" : "", rt.rot, rt.off, rt.inverse, rt.block, rt.fmt, rt.scale, rows_out, d12, d13,
                 (long long)no, d0);
+    if (packed_lat)
+        std::printf("fold d  %-66s NVG gathered: fold %lld, attention %lld differ (%lld scratch slots written)\n",
+                    name.c_str(), dgf, dga, wr);
 }
 
 }  // namespace
 
 int main() {
+    setenv("RADIANCE_DS41_NVGATHER", "48", 1);   /* lever NVG on (read once); taken only where a launch has scratch */
     /* ---- fold c: the window key (n 512, rot 64 at off 448, fp8 / ue8m0 blocks of 32), every decode height */
     const KvCase win = { "window key", 0, 512, 64, 448, 32, "fp8_e4m3", "ue8m0", 0, true };
     uint32_t seed = 100;

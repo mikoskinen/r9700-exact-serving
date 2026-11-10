@@ -9,6 +9,8 @@ int     r4d_rad_ds41_index_candidates(const RadArgs*, RadStream);
 int     r4d_rad_ds41_index_topk(const RadArgs*, RadStream);
 int64_t r4d_rad_ds41_index_topk_scratch(const RadArgs*);
 int     r4d_rad_ds41_attn_sparse_sink(const RadArgs*, RadStream);
+/* lever NVG's scratch (RADIANCE_DS41_NVGATHER), both attn_sparse_sink rows */
+int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs*);
 /* attn_sparse_sink + rope_rows_roundtrip over its output (lever K1 fold d) */
 int     r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs*, RadStream);
 

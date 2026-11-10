@@ -963,6 +963,12 @@ struct DsAttnArgs {
     int cnv;                                         /* latent_format nvfp4: compressed entries packed */
     int cslot;                                       /* the compressed cache's slots a position (D / ratio plain) */
     float scale;
+    /* Lever NVG (RADIANCE_DS41_NVGATHER, 10.11.): the packed latent's selected entries, unpacked to bf16 by
+     * ds41_latent_gather_nv4_kernel into the launch's scratch, [M][nk - win][D] (row m's selection j at
+     * cg + m cgr + j D); the decode band's plain kernel (cnv 0) then reads a valid selection there instead of
+     * in the cache. Null: the cache (every other launch and kernel). */
+    const uint16_t* cg;
+    long cgr;
 };
 
 constexpr int kDsAttnD = 512;
@@ -1739,7 +1745,8 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) {
                 if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
                     const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
                     if (blk >= 0 && blk < a.ncblk)
-                        ptr = a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot;
+                        ptr = a.cg ? a.cg + (m * a.cgr + (long)(k - a.win) * D)
+                                   : a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot;
                 }
             }
             kp[k] = ptr;
@@ -2013,6 +2020,35 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) {
             }
         }
     }
+}
+
+/* ================================================================== lever NVG: the packed latent's selections, unpacked
+ * RADIANCE_DS41_NVGATHER=<rows> (10.11.2026; unset or 0: off, today's launches): a decode-band pass of at most <rows> rows
+ * over the packed latent (latent_format nvfp4) first unpacks each row's valid selections to bf16 in the launch's scratch
+ * (this kernel, one launch), then runs the plain decode kernel (cnv 0) over them (DsAttnArgs::cg). Every head of a row
+ * reads the same entries, so the unpack happens once a (row, selection) instead of once a (head workgroup, key, column)
+ * in the packed kernel's scores and again in its PV, and the attention runs the bf16 path's loads and arithmetic.
+ * Exact: ds_nv4_unpack8_fast gives the stored bf16 bits (the tiled-PV form's piece() unpacks with it; tests/r4d_emu
+ * test_ds41attn holds the packed forms to the bf16 cache's output), and the plain kernel over those bits is the bf16
+ * latent's kernel, which the packed kernel matches bit for bit. A selection is valid exactly where the decode kernel's
+ * key setup finds an entry (the same checks), so the same keys are present; an invalid one is not written (the
+ * kernel reads the zero row for it, as before). Grid (ceil(topk / 8), M), 256 threads: a wave an entry, lane L the 16
+ * values of its block L (8 code bytes at 8 L, scale byte 256 + L) -> 32 bytes at 16 L of the entry's bf16 row. */
+__global__ __launch_bounds__(256) void ds41_latent_gather_nv4_kernel(DsAttnArgs a, uint16_t* out, long rs) {
+    const long m = blockIdx.y;
+    const int j = (int)blockIdx.x * 8 + (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31u);
+    if (j >= a.nk - a.win) return;
+    const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
+    const long c = a.sel[m * a.selr + (long)j * a.selc];
+    if (c < 0 || (c * a.ratio) / a.cbs >= a.ncbt) return;
+    const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
+    if (blk < 0 || blk >= a.ncblk) return;
+    const unsigned char* e = (const unsigned char*)(a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot);
+    const uint2 w = *(const uint2*)(e + 8 * lane);
+    const float sh = ds_e4m3_half(e[kDsAttnD / 2 + lane]);
+    uint4* o = (uint4*)(out + m * rs + (long)j * kDsAttnD + 16 * lane);
+    o[0] = ds_nv4_unpack8_fast(w.x, sh);
+    o[1] = ds_nv4_unpack8_fast(w.y, sh);
 }
 
 /* ================================================================== attn_sparse_sink on WMMA
@@ -2779,6 +2815,39 @@ int ds_nvform() {
     return f;
 }
 
+/* Lever NVG's knob: RADIANCE_DS41_NVGATHER=<rows>, 1..kWmRows (more: kWmRows): passes of at most <rows> rows over the
+ * packed latent take the gather + plain kernel launches; unset, 0 or not a number: off. Read once. */
+int ds_nvgather() {
+    static const int n = [] {
+        const char* e = std::getenv("RADIANCE_DS41_NVGATHER");
+        const int v = e && *e ? std::atoi(e) : 0;
+        return v < 0 ? 0 : (v > kWmRows ? kWmRows : v);
+    }();
+    return n;
+}
+long ds_nvgather_bytes(long rows, long topk) { return rows * topk * kDsAttnD * 2; }
+/* Lever NVG: the gather launch for a pass that takes it (packed latent, the knob on, at most its rows, the scratch
+ * the hook sized) -> RAD_OK with *g = s over the unpacked selections (cnv 0, cg the scratch); RAD_E_UNSUPPORTED with
+ * nothing launched otherwise; the launch's error if it fails. */
+template <class A>
+int nv_gather(RadStream stream, const RadArgs* ra, const A& s, A* g) {
+    const int cap = ds_nvgather();
+    if (!s.cnv || cap < 1 || s.M > cap || !ra || !ra->scratch) return RAD_E_UNSUPPORTED;
+    const long topk = (long)s.nk - s.win;
+    if (topk < 1 || ra->scratch_bytes < ds_nvgather_bytes(s.M, topk) || !aligned(ra->scratch, 16))
+        return RAD_E_UNSUPPORTED;
+    uint16_t* out = (uint16_t*)ra->scratch;
+    const DsAttnArgs& b = s;
+    const int rc = R4D_EMIT(stream, ds41_latent_gather_nv4_kernel, dim3((unsigned)((topk + 7) / 8), (unsigned)s.M),
+                            dim3(256), 0u, b, out, topk * (long)kDsAttnD);
+    if (rc != RAD_OK) return rc;
+    *g = s;
+    g->cnv = 0;
+    g->cg = out;
+    g->cgr = topk * (long)kDsAttnD;
+    return RAD_OK;
+}
+
 /* ORT (attn_sparse_sink_rope_roundtrip): the same forms with the fused epilogue; the knob's packed-only forms
  * 7-9 are not instantiated with it (the rule serves those requests). */
 template <bool ORT = false>
@@ -2943,6 +3012,13 @@ int attn_body(const RadArgs* a, RadStream stream) {
      * in the same order, so the bits do not depend on it. */
     const long rows = s.M;
     if (rows <= kWmRows) {
+        DsAttnArgs g{};
+        const int gr = nv_gather(stream, a, s, &g);   /* lever NVG (off unless RADIANCE_DS41_NVGATHER) */
+        if (gr != RAD_OK && gr != RAD_E_UNSUPPORTED) return gr;
+        if (gr == RAD_OK) {
+            const int rc = attn_dec_emit<false>(stream, g);
+            if (rc != RAD_E_UNSUPPORTED) return rc;
+        }
         const int rc = attn_dec_emit<false>(stream, s);
         if (rc != RAD_E_UNSUPPORTED) return rc;
     }
@@ -3016,6 +3092,13 @@ int attn_ort_body(const RadArgs* a, RadStream stream) {
         so.o.fmt = fmt;
         so.o.sc = sc;
         so.o.sign = inv ? -1.0f : 1.0f;
+        DsAttnArgsOrt sg{};
+        const int gr = nv_gather(stream, a, so, &sg);   /* lever NVG (off unless RADIANCE_DS41_NVGATHER) */
+        if (gr != RAD_OK && gr != RAD_E_UNSUPPORTED) return gr;
+        if (gr == RAD_OK) {
+            const int rc3 = attn_dec_emit<true>(stream, sg);
+            if (rc3 != RAD_E_UNSUPPORTED) return rc3;
+        }
         const int rc2 = attn_dec_emit<true>(stream, so);
         if (rc2 != RAD_E_UNSUPPORTED) return rc2;
     }
@@ -3099,6 +3182,20 @@ extern "C" int64_t r4d_rad_ds41_index_topk_scratch(const RadArgs* a) {
     long long M = r4d_geti_or(a, "M", kDsSplitRows);
     if (M < 1 || M > kDsSplitRows) M = kDsSplitRows;
     return topk_split_bytes((long)M, (long)r4d_geti_or(a, "width", 0), (long)topk);
+}
+/* Lever NVG's scratch (attn_sparse_sink and attn_sparse_sink_rope_roundtrip): the knob's rows (at most the band's
+ * upper bound) x topk unpacked entries of D bf16 when the op reads the packed latent and the knob is on; else none,
+ * so unset the arena is today's. */
+extern "C" int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs* a) {
+    const int cap = ds_nvgather();
+    if (cap < 1) return 0;
+    const char* lf = r4d_gets(a, "latent_format");
+    if (!lf || std::strcmp(lf, "nvfp4") || r4d_geti_or(a, "ratio", 0) < 1) return 0;
+    long long M = r4d_geti_or(a, "M", cap);
+    const long long topk = r4d_geti_or(a, "topk", 0);
+    if (M < 1 || M > cap) M = cap;
+    if (topk < 1 || topk > 2048) return 0;
+    return (int64_t)ds_nvgather_bytes((long)M, (long)topk);
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream) {
     return attn_body(a, stream);

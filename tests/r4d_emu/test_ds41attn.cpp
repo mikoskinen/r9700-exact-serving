@@ -7,7 +7,10 @@
  * must unpack to the stored bf16 bits, and attn_sparse_sink with latent_format nvfp4 over the packed
  * cache must give the bf16 cache's output bit for bit in every form the op takes: the decode band's
  * kernels (1-32 rows: the direct-PV forms, head groups 1-8; 40 rows: the tiled-PV form), the scalar kernel (a pass whose
- * q rows the WMMA form refuses) and the WMMA prefill form (64 rows); and libref the same. */
+ * q rows the WMMA form refuses) and the WMMA prefill form (64 rows); and libref the same.
+ * Lever NVG (RADIANCE_DS41_NVGATHER, set to 48 here before the first launch): a decode-band pass handed the scratch
+ * its hook sizes unpacks the selections there (ds41_latent_gather_nv4_kernel) and runs the plain kernel over them --
+ * the bf16 cache's output bit for bit; a pass without scratch, or with too little, keeps the packed kernel. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 
@@ -24,6 +27,7 @@
 
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs*, RadStream);
 extern "C" int r4d_ds41_entry_store_nv4(const RadArgs*, RadStream);
+extern "C" int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs*);
 
 namespace {
 
@@ -190,7 +194,8 @@ int store_nv4(RadLaunchFn fn, const Fix& f, uint16_t* packed) {
 
 /* attn_sparse_sink over the bf16 cache (packed null) or the packed one; q_pitch > H D gives q rows a
  * pitch the WMMA form refuses (the scalar kernel then). */
-int attn(RadLaunchFn fn, const Fix& f, const uint16_t* packed, uint16_t* out, int64_t q_pitch, const uint16_t* q) {
+int attn(RadLaunchFn fn, const Fix& f, const uint16_t* packed, uint16_t* out, int64_t q_pitch, const uint16_t* q,
+         void* scratch = nullptr, int64_t scratch_bytes = 0) {
     RadTensor t[11] = {
         tens(q, RAD_BF16, { f.M, (int64_t)f.H * kD }, q_pitch),
         tens(f.wc.data(), RAD_BF16, { f.nwblk, 1, f.bs, kD }),
@@ -214,7 +219,21 @@ int attn(RadLaunchFn fn, const Fix& f, const uint16_t* packed, uint16_t* out, in
     a.n_t = 11;
     a.p = p.data();
     a.n_p = (int)p.size();
+    a.scratch = scratch;
+    a.scratch_bytes = scratch_bytes;
     return fn(&a, nullptr);
+}
+
+/* Lever NVG's scratch hook for this fixture's op (packed or not), at the band's upper bound `M`. */
+int64_t gather_scratch(const Fix& f, bool packed, int64_t M) {
+    std::vector<RadParam> p = { pint("M", M), pint("heads", f.H), pint("dim", kD), pint("window", f.win),
+                                pint("ratio", f.ratio), pint("topk", f.topk), pf64("scale", 1.0 / std::sqrt((double)kD)),
+                                pstr("dtype", "bf16") };
+    if (packed) p.push_back(pstr("latent_format", "nvfp4"));
+    RadArgs a{};
+    a.p = p.data();
+    a.n_p = (int)p.size();
+    return r4d_rad_ds41_attn_sparse_sink_scratch(&a);
 }
 
 void run_case(const char* name, const Fix& f, int64_t q_pitch, const Ref& ref) {
@@ -258,6 +277,38 @@ void run_case(const char* name, const Fix& f, int64_t q_pitch, const Ref& ref) {
     }
     expect(dk == 0, name, "the packed latent's output differs from the bf16 cache's", dk, (long long)no);
     expect(nz > (int64_t)no / 2, name, "the output is mostly zero (the fixture did not reach the keys)", nz, (long long)no);
+    /* lever NVG: the gathered path (scratch as the hook sizes it at the band's upper bound 4160), and a pass with one
+     * byte too little scratch (the packed kernel again) -- both the bf16 cache's output */
+    long long dg = -1, ds = -1, wr = -1;
+    {
+        const int64_t need = gather_scratch(f, true, 4160), none = gather_scratch(f, false, 4160);
+        expect(need == (int64_t)48 * f.topk * kD * 2, name, "the scratch hook does not size 48 rows x topk entries", need,
+               (long long)48 * f.topk * kD * 2);
+        expect(none == 0, name, "the scratch hook asks for scratch over the bf16 cache", none, 0);
+        std::vector<uint16_t> scr((size_t)(need / 2 + 8), 0x4444);
+        std::vector<uint16_t> o3(no, 0x2222), o4(no, 0x1111);
+        uint16_t* sp = (uint16_t*)(((uintptr_t)scr.data() + 15) & ~(uintptr_t)15);
+        expect(attn(r4d_rad_ds41_attn_sparse_sink, f, pk.data(), o3.data(), q_pitch, qv.data(), sp, need) == RAD_OK, name,
+               "attn nvfp4, gathered");
+        wr = 0;
+        for (int64_t i = 0; i < std::min<int64_t>((int64_t)f.M, 48) * f.topk * kD; ++i) wr += sp[i] != 0x4444;
+        dg = 0;
+        for (size_t i = 0; i < no; ++i) dg += o1[i] != o3[i];
+        const bool band = f.M <= 48 && (q_pitch == 0 || q_pitch == (int64_t)f.H * kD);
+        if (band) expect(wr > 0, name, "the gathered path did not write the scratch (not taken)", wr, 0);
+        expect(dg == 0, name, "the gathered path's output differs from the bf16 cache's", dg, (long long)no);
+        const int64_t small = (int64_t)f.M * f.topk * kD * 2 - 1;
+        std::vector<uint16_t> scr2((size_t)(small / 2 + 16), 0x4444);
+        uint16_t* sp2 = (uint16_t*)(((uintptr_t)scr2.data() + 15) & ~(uintptr_t)15);
+        expect(attn(r4d_rad_ds41_attn_sparse_sink, f, pk.data(), o4.data(), q_pitch, qv.data(), sp2, small) == RAD_OK,
+               name, "attn nvfp4, scratch one byte short");
+        long long w2 = 0;
+        for (int64_t i = 0; i < small / 2; ++i) w2 += sp2[i] != 0x4444;
+        expect(w2 == 0, name, "the gather ran with too little scratch", w2, 0);
+        ds = 0;
+        for (size_t i = 0; i < no; ++i) ds += o1[i] != o4[i];
+        expect(ds == 0, name, "the packed kernel (scratch short) differs from the bf16 cache's", ds, (long long)no);
+    }
     int64_t dr = -1, dkr = -1;
     if (ref.attn) {
         std::vector<uint16_t> r1(no, 0x1111), r2(no, 0x2222);
@@ -272,14 +323,16 @@ void run_case(const char* name, const Fix& f, int64_t q_pitch, const Ref& ref) {
         expect(dr == 0, name, "libref: the packed latent's output differs from the bf16 cache's", dr, (long long)no);
     }
     std::printf("%-46s rows %d heads %d ratio %d keys %d+%d: %lld entries packed (288 B each), outputs differ "
-                "packed vs bf16: %lld (kernel), %lld (libref); kernel vs libref (bf16, info) %lld of %lld\n",
+                "packed vs bf16: %lld (kernel), %lld (libref); kernel vs libref (bf16, info) %lld of %lld; "
+                "NVG gathered vs bf16 %lld (%lld scratch slots written), scratch short vs bf16 %lld\n",
                 name, f.M, f.H, f.ratio, f.win, f.topk, (long long)f.ncblk, (long long)dk, (long long)dr,
-                (long long)dkr, (long long)no);
+                (long long)dkr, (long long)no, dg, wr, ds);
 }
 
 }  // namespace
 
 int main() {
+    setenv("RADIANCE_DS41_NVGATHER", "48", 1);   /* lever NVG on (read once, at the first launch) */
     const Ref ref = load_libref();
     if (!ref.attn || !ref.store) std::printf("note: libref not loadable (set RADIANCE_HOME): its checks are skipped\n");
     /* decode band: one row (8 heads: the direct-PV form) */
