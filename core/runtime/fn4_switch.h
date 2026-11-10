@@ -65,6 +65,11 @@
  *                   2 rule-w -- the switch once set, else RADIANCE_AQL_ACQ=rule | rule-w at start (ds41-ar-acq
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
  *                   since haz_mark marks the records at recording. RADIANCE_AQL_ACQ=none stays start-time only.
+ *   idx_split       deepseek41 (rad_fn4_*; lever I1): the indexer row split's deal, 0 the plain deal (ceil(n / world)
+ *                   runs a rank), 1 the balanced deal where the world does not divide a step's runs (an equal block of
+ *                   rows a rank; arch/deepseek41/ds41_index_split.h). Exact: every row's selection is the same and the
+ *                   gather lays it in the same place. RADIANCE_DS41_IDX_BALANCE=1 at start; 1 is refused where no rank
+ *                   declared the row split. -1 when no loaded object serves it.
  *
  *   ds41_argather   deepseek41 (rad_fn4_*; lever D3): the MoE gather + all-reduce fusion's live row bound,
  *                   0..the bound the layers declared (RADIANCE_DS41_ARGATHER / _ARGATHER_MAX): a step of at most
@@ -105,7 +110,8 @@ namespace fn4 {
 
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
-              kDraftLend, kDraftLendBorrow, kSwitches };
+              kDraftLend, kDraftLendBorrow,
+              kIdxSplit, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
