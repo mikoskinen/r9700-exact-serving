@@ -136,6 +136,8 @@ set(R4D_UNITS
   "r4d_ar_oneshot_Nrank_exact|"
   "r4d_ar_twoshot_Nrank_exact|"
   "r4d_ar_twoshot_Nrank_ti8|"
+  # fn4 SP-hc: the two-shot's halves over whole-row shards (reduce_scatter_rows / all_gather_rows)
+  "r4d_ar_sp_rows|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
   "r4d_gemm_bf16_nt_tiled|"

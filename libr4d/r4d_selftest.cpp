@@ -30684,6 +30684,124 @@ static void ar_wide_ti8(const Plugin& pl, const std::vector<int>& devs, const ch
     if (row->fini) for (ArTi8& a : t) if (a.inst) row->fini(a.inst);
 }
 
+/* fn4 SP-hc: reduce_scatter_rows / all_gather_rows (r4d_ar_sp_rows.hip) at four ranks over whole-row shards. Per
+ * case, every rank fills x [rows][row] with ar_ti8_value(rank, i), runs the reduce-scatter, keeps a copy, then runs the
+ * all-gather on the ti8 wire, and separately an all-gather raw of its pattern. Checked: the reduce-scatter's own shard
+ * within the wire's error of the fp32 sum and every other row untouched; after the ti8 all-gather every rank holds the
+ * same bytes and each shard is within the wire's error of its owner's reduce-scatter output; after the raw all-gather
+ * every row is its owner's input, bit for bit, on every rank. */
+struct SpRows {
+    const RadKernelInfo* rs = nullptr;
+    const RadKernelInfo* ag = nullptr;
+    int rank = 0, dev = 0, world = 4;
+    int64_t row = 2560;
+    std::vector<int64_t> rows;
+    void* inst_rs = nullptr; void* inst_ag = nullptr;
+    int rc = RAD_OK;
+    std::vector<std::vector<uint16_t>> after_rs, after_ag, after_raw;
+};
+static void sp_rows_worker(SpRows* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; return; }
+    int64_t most = 0;
+    for (int64_t r : t->rows) most = r * t->row > most ? r * t->row : most;
+    std::vector<RadParam> prs = { PI("world_size", t->world), PI("numel", most), PS("dtype", "bf16"), PI("row", t->row) };
+    std::vector<RadParam> pag = prs, praw = prs;
+    pag.push_back(PI("raw", 0));
+    praw.push_back(PI("raw", 1));
+    if ((t->rc = t->rs->init(prs.data(), (int)prs.size(), t->rank, t->world, &t->inst_rs)) != RAD_OK) return;
+    if ((t->rc = t->ag->init(pag.data(), (int)pag.size(), t->rank, t->world, &t->inst_ag)) != RAD_OK) return;
+    void* buf = nullptr;
+    if (hipMalloc(&buf, (size_t)most * 2) != hipSuccess) { t->rc = RAD_E_NOMEM; return; }
+    std::vector<uint16_t> h((size_t)most);
+    auto run = [&](const RadKernelInfo* k, void* inst, std::vector<RadParam>& ps, int64_t n) {
+        RadTensor ts[1] = { T(buf, RAD_BF16, { n }) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts; a.n_t = 1; a.p = ps.data(); a.n_p = (int)ps.size();
+        a.instance = inst; a.rank = t->rank; a.world_size = t->world;
+        const int rc = k->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK && t->rc == RAD_OK) t->rc = rc;
+        std::vector<uint16_t> got((size_t)n);
+        st_memcpy(got.data(), buf, (size_t)n * 2, hipMemcpyDeviceToHost);
+        return got;
+    };
+    for (int64_t r : t->rows) {
+        const int64_t n = r * t->row;
+        for (int64_t i = 0; i < n; ++i) h[(size_t)i] = h_to_bf16(ar_ti8_value(t->rank, i));
+        st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+        t->after_rs.push_back(run(t->rs, t->inst_rs, prs, n));
+        t->after_ag.push_back(run(t->ag, t->inst_ag, pag, n));
+        st_memcpy(buf, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+        t->after_raw.push_back(run(t->ag, t->inst_ag, praw, n));
+    }
+    st_free(buf);
+}
+static void sp_rows_check(const Plugin& pl, const std::vector<int>& devs) {
+    const char* nm = "sp_rs_rows_4rank_ti8 + sp_ag_rows_4rank";
+    const RadKernelInfo* rs = find(pl, "sp_rs_rows_4rank_ti8");
+    const RadKernelInfo* ag = find(pl, "sp_ag_rows_4rank");
+    if (!rs || !ag) { ok(nm, false, "row absent"); return; }
+    const int world = 4;
+    if ((int)devs.size() < world) { skip(nm, "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, world)) { skip(nm, "no peer path between the cards (device.p2p)"); return; }
+    const int64_t row = 2560;
+    const std::vector<int64_t> rows = { 2048, 2049, 1027, 512, 64 };
+    std::vector<SpRows> t((size_t)world);
+    std::vector<std::thread> th;
+    for (int r = 0; r < world; ++r) {
+        t[(size_t)r].rs = rs; t[(size_t)r].ag = ag; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
+        t[(size_t)r].row = row; t[(size_t)r].rows = rows;
+        th.emplace_back(sp_rows_worker, &t[(size_t)r]);
+    }
+    for (std::thread& x : th) x.join();
+    std::string rcs;
+    bool good = true;
+    for (const SpRows& a : t) { good = good && a.rc == RAD_OK; rcs += std::to_string(a.rc) + " "; }
+    ok((std::string(nm) + " init + launches").c_str(), good, "rc " + rcs);
+    if (good) {
+        for (size_t k = 0; k < rows.size(); ++k) {
+            const int64_t R = rows[k], n = R * row, q = (R + world - 1) / world;
+            int64_t untouched_bad = 0, ag_diff_ranks = 0, raw_bad = 0;
+            double se = 0.0, sx = 0.0, se2 = 0.0, sx2 = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                const int64_t rw = i / row;
+                const int owner = (int)(rw / q);
+                float acc = 0.0f;
+                for (int r = 0; r < world; ++r) acc += h_bf16(h_to_bf16(ar_ti8_value(r, i)));
+                for (int r = 0; r < world; ++r) {
+                    const uint16_t v = t[(size_t)r].after_rs[k][(size_t)i];
+                    if (r == owner) { const double e = (double)h_bf16(v) - acc; se += e * e; sx += (double)acc * acc; }
+                    else if (v != h_to_bf16(ar_ti8_value(r, i))) ++untouched_bad;
+                    if (t[(size_t)r].after_ag[k][(size_t)i] != t[0].after_ag[k][(size_t)i]) ++ag_diff_ranks;
+                    if (t[(size_t)r].after_raw[k][(size_t)i] != h_to_bf16(ar_ti8_value(owner, i))) ++raw_bad;
+                }
+                const double ref = h_bf16(t[(size_t)owner].after_rs[k][(size_t)i]);
+                const double e2 = (double)h_bf16(t[0].after_ag[k][(size_t)i]) - ref;
+                se2 += e2 * e2; sx2 += ref * ref;
+            }
+            const double r1 = sx > 0 ? std::sqrt(se / sx) : 0.0, r2 = sx2 > 0 ? std::sqrt(se2 / sx2) : 0.0;
+            const std::string w = std::string(nm) + " rows " + std::to_string(R) + " x " + std::to_string(row);
+            char d[200];
+            std::snprintf(d, sizeof(d), "reduce-scatter relative RMS %.4f%%, ti8 all-gather vs owner %.4f%%", r1 * 100.0,
+                          r2 * 100.0);
+            std::printf("        %s: %s\n", w.c_str(), d);
+            ok((w + ": the reduce-scatter's shard within the wire's error (relative RMS < 1%)").c_str(), r1 < 0.01, d);
+            ok((w + ": the reduce-scatter leaves other rows untouched").c_str(), untouched_bad == 0,
+               std::to_string(untouched_bad) + " elements changed");
+            ok((w + ": after the ti8 all-gather every rank holds the same bytes").c_str(), ag_diff_ranks == 0,
+               std::to_string(ag_diff_ranks) + " elements differ");
+            ok((w + ": the ti8 all-gather within the wire's error of its owner (relative RMS < 1%)").c_str(), r2 < 0.01, d);
+            ok((w + ": the raw all-gather is every owner's rows bit for bit").c_str(), raw_bad == 0,
+               std::to_string(raw_bad) + " elements wrong");
+        }
+    }
+    for (SpRows& a : t) {
+        if (a.inst_rs && rs->fini) rs->fini(a.inst_rs);
+        if (a.inst_ag && ag->fini) ag->fini(a.inst_ag);
+    }
+}
+
 static void gather_wide_rank(const Plugin& pl, const std::vector<int>& devs, const char* name,
                              int world) {
     const RadKernelInfo* row = find(pl, name);
@@ -35346,6 +35464,12 @@ static void device_phase(const Plugin& pl) {
                 ar_wide_pattern(pl, world == 8 ? devs8 : devs, n.c_str(), world);
             }
         }
+    }
+    /* fn4 SP-hc: the two-shot's halves over whole-row shards (sp_rows_check). */
+    if (sel("sp_rs_rows_4rank_ti8") || sel("sp_ag_rows_4rank")) {
+        if (!g_case) std::printf("\ncross-rank, 4, sequence-parallel halves (fn4 SP-hc)\n");
+        std::printf("  sp_rs_rows_4rank_ti8 + sp_ag_rows_4rank\n");
+        sp_rows_check(pl, devs);
     }
     /* The four-rank two-shot's lane row and its host twin, plain and coded (ar_lane_forms). */
     for (const char* n : { "ar_twoshot_4rank_exact_lane", "ar_twoshot_4rank_exact_lane_host" }) {
