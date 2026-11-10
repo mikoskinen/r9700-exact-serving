@@ -805,7 +805,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * linear: the trunk's are, and the routed experts then read the rotated copy or the bf16
      * plane. When experts read the plain E4M3 codes, the connections keep those and the int8
      * linears quantise for themselves. */
-    m.hccfg.codes_i8 = (m.trunk_i8 && (m.moecfg.expert_rot || m.moecfg.expert_bf16)) ? 1 : 0;
+    /* fn4 E12 (10.11.2026): EXL3 experts read the bf16 plane as bf16 ones do (MoeFP8::act_bf16), so with
+     * RADIANCE_FN4_X3CODES=1 their connections write the int8 codes too and the int8 linears stop quantising for
+     * themselves (148's stamps: quant_act_fp8<false, true> 1.64 ms of a 35.9 ms c16 pass, plus its launches). The same
+     * bytes: hc_quant_group<true> and quant_act_fp8_body<false, true> take one amax a 128-group of the same bf16 x,
+     * scale m * (1 / 127), and rintf of the quotient clamped to +-127. */
+    const bool x3codes = m.moecfg.expert_exl3 && fn4_env_on("RADIANCE_FN4_X3CODES");
+    m.hccfg.codes_i8 = (m.trunk_i8 && (m.moecfg.expert_rot || m.moecfg.expert_bf16 || x3codes)) ? 1 : 0;
     m.a_x.q8_fed     = m.hccfg.codes_i8 != 0;
     m.b_inj = decl_b(b, nm.f("hc_inj"), g.act_dtype, {T, m.hccfg.hc});
 
