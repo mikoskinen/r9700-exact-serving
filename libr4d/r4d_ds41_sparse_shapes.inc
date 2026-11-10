@@ -39,6 +39,22 @@ extern "C" int r4d_shape_attn_sparse_sink(const RadParam* p, int n_p, int operan
     R4D_PICK(l);
 }
 
+/* attn_sparse_sink's operands, then rope_rows' cos_sin (a rope_table plane of M rows, as r4d_shape_rope_rows). */
+extern "C" int r4d_shape_attn_sparse_sink_rope_roundtrip(const RadParam* p, int n_p, int operand,
+                                                         RadOpdDesc* out) {
+    if (operand < 11) return r4d_shape_attn_sparse_sink(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), Dm = pi(p, n_p, "dim");
+    const int64_t rot = pi(p, n_p, "rot"), off = pi(p, n_p, "off", -1), block = pi(p, n_p, "block");
+    if (M <= 0 || H < 1 || rot < 2 || (rot & 1) || off < 0 || off + rot > Dm || block < 1 || (H * Dm) % block)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd_none(), opd_none(), opd_none(),
+        opd((uint32_t)RAD_F32, M, rot),   /* cos_sin */
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_index_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), Dm = pi(p, n_p, "dim");
     const int64_t ratio = pi(p, n_p, "ratio"), C = pi(p, n_p, "width"), block = pi(p, n_p, "block");

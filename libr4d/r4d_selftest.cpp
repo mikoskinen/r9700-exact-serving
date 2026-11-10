@@ -3012,6 +3012,385 @@ static void qk_kv_fold_case(const Plugin& pl, bool bf16, int kvq = 0) {
                   (long long)moved);
     ok(name, dq == 0 && dk == 0 && dc == 0 && moved > 0, msg);
 }
+/* ---- lever K1 (10.11.2026): DeepSeek-V4.1's attention-path launch folds, on the card, against the rows
+ * they fold, byte for byte over every output buffer:
+ *
+ *   rmsnorm_rope_roundtrip_kv_store_fp8_bf16  against rmsnorm_rope_roundtrip_fp8_bf16 then kv_store_bf16 over
+ *       y's two halves (k = y[:, 0, 256), v = y[:, 256, 512) as the engine passes them): y and every byte of
+ *       the cache (both start from the same random bytes, so a misplaced or missing store shows), at the window
+ *       key's geometry (n 512, rot 64 at off 448, fp8 e4m3 / ue8m0 in blocks of 32, block_size 16), M 1..48,
+ *       64, 130 and 512, with pad slots (-1), a slot past the cache, and positions past the angle table;
+ *   ds41_attn_sparse_sink_rope_rt_d512_bf16   against ds41_attn_sparse_sink_d512_bf16 then
+ *       rope_rows_roundtrip_fp8_bf16 over its out (inverse gptj rot 64 at off 448, fp8 e4m3 / ue8m0, block 32):
+ *       out, at DeepSeek-V4.1's TP4 rank (16 heads, window 128, 512 selections), M 1..48 (the decode band's
+ *       forms), window-only and compressed (ratio 4) layers, bf16 and packed (nvfp4) latents, and 64 and 130
+ *       rows (the two launches).
+ * Each also times the pair and the fold back to back on one stream (warm, 200 launches; info, not a check). */
+static bool g_k1_sync = true;   /* off while timing: launches go back to back */
+static int k1_launch(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data();
+    a.n_t = (int)ts.size();
+    a.p = ps.data();
+    a.n_p = (int)ps.size();
+    a.world_size = 1;
+    const int rc = r->launch(&a, nullptr);
+    if (!g_k1_sync) return rc;
+    const hipError_t he = (hipError_t)st_stream_sync(nullptr);
+    return he != hipSuccess ? RAD_E_DEVICE : rc;
+}
+template <class F>
+static double k1_time_us(F&& f) {
+    g_k1_sync = false;
+    const double t = st_time_us([&](int) { f(); }, 200, nullptr);
+    g_k1_sync = true;
+    return t;
+}
+
+static void ds41_kvfold_case(const Plugin& pl) {
+    const char* row = "rmsnorm_rope_roundtrip_kv_store_fp8_bf16";
+    if (!sel(row)) return;
+    const char* name = "rmsnorm_rope_roundtrip_kv_store is byte-identical to rmsnorm_rope_roundtrip + kv_store";
+    const RadKernelInfo* rk = find(pl, row);
+    const RadKernelInfo* rf = find(pl, "rmsnorm_rope_roundtrip_fp8_bf16");
+    const RadKernelInfo* rs = find(pl, "kv_store_bf16");
+    if (!rk || !rf || !rs) { ok(name, false, "row absent"); return; }
+    const int64_t n = 512, hd = 256, rot = 64, off = 448, bs = 16, tab = 8192;
+    std::vector<int64_t> Ms;
+    for (int64_t M = 1; M <= 48; ++M) Ms.push_back(M);
+    for (int64_t M : { 64, 130, 512 }) Ms.push_back(M);
+    int64_t bad_y = 0, bad_c = 0, stored = 0, rc_bad = 0;
+    std::string first;
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_int_distribution<int> pct(0, 99);
+    for (const int64_t M : Ms) {
+        const int64_t nb = M / bs + 3;
+        std::vector<uint16_t> x((size_t)(M * n));
+        for (int64_t m = 0; m < M; ++m) {
+            const float sc = m % 7 == 3 ? 1e-3f : m % 7 == 5 ? 40.0f : 1.0f;
+            for (int64_t i = 0; i < n; ++i) x[(size_t)(m * n + i)] = rad_f32_to_bf16(nd(rng) * sc);
+        }
+        std::vector<float> w((size_t)n), cs((size_t)(tab * rot));
+        for (auto& v : w) v = 0.5f + 0.1f * nd(rng);
+        for (int64_t p = 0; p < tab; ++p)
+            for (int64_t i = 0; i < rot / 2; ++i) {
+                const float a = 6.4f * ((float)(rng() % 100000) / 100000.0f - 0.5f);
+                cs[(size_t)(p * rot + i)] = std::cos(a);
+                cs[(size_t)(p * rot + rot / 2 + i)] = std::sin(a);
+            }
+        std::vector<int32_t> pos((size_t)M), slot((size_t)M), perm((size_t)(nb * bs));
+        for (size_t i = 0; i < perm.size(); ++i) perm[i] = (int32_t)i;
+        std::shuffle(perm.begin(), perm.end(), rng);
+        for (int64_t m = 0; m < M; ++m) {
+            const int k = pct(rng);
+            pos[(size_t)m] = k < 5 ? (int32_t)(tab + k) : (int32_t)(rng() % tab);
+            slot[(size_t)m] = pct(rng) < 8 ? -1 : perm[(size_t)m];
+        }
+        if (M > 4) slot[(size_t)(M - 2)] = (int32_t)(nb * bs + 1);
+        const size_t cb = (size_t)(nb * bs * n * 2), yb = (size_t)(M * n * 2);
+        std::vector<uint8_t> c0(cb);
+        for (auto& v : c0) v = (uint8_t)(rng() & 0xff);
+        void* dx = dalloc(yb); void* dw = dalloc((size_t)n * 4); void* dcs = dalloc(cs.size() * 4);
+        void* dp = dalloc((size_t)M * 4); void* dsl = dalloc((size_t)M * 4);
+        void* dyA = dalloc(yb); void* dyB = dalloc(yb); void* dcA = dalloc(cb); void* dcB = dalloc(cb);
+        if (!dx || !dw || !dcs || !dp || !dsl || !dyA || !dyB || !dcA || !dcB) { ok(name, false, "hipMalloc failed"); return; }
+        st_memcpy(dx, x.data(), yb, hipMemcpyHostToDevice);
+        st_memcpy(dw, w.data(), (size_t)n * 4, hipMemcpyHostToDevice);
+        st_memcpy(dcs, cs.data(), cs.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(dp, pos.data(), (size_t)M * 4, hipMemcpyHostToDevice);
+        st_memcpy(dsl, slot.data(), (size_t)M * 4, hipMemcpyHostToDevice);
+        st_memcpy(dcA, c0.data(), cb, hipMemcpyHostToDevice);
+        st_memcpy(dcB, c0.data(), cb, hipMemcpyHostToDevice);
+        st_memset(dyA, 0x11, yb);
+        st_memset(dyB, 0x22, yb);
+        std::vector<RadParam> pn = { PI("M", M), PI("n", n), PF("eps", 1e-6), PI("n_head", 1), PI("head_dim", n),
+                                     PI("rot", rot), PI("off", off), PS("mode", "gptj"), PI("inverse", 0),
+                                     PI("block", 32), PS("format", "fp8_e4m3"), PS("scale", "ue8m0"),
+                                     PS("dtype", "bf16") };
+        std::vector<RadParam> pk = pn;
+        pk.push_back(PI("block_size", bs));
+        pk.push_back(PS("kv_dtype", "bf16"));
+        const std::vector<RadParam> ps = { PI("M", M), PI("head_dim", hd), PI("n_head_kv", 1), PI("block_size", bs),
+                                           PS("kv_dtype", "bf16") };
+        auto half = [&](void* y, int64_t col) {
+            RadTensor t = T((char*)y + col * 2, RAD_BF16, { M, hd });
+            t.stride[0] = n;
+            return t;
+        };
+        auto pair = [&](void* y, void* c) {
+            int rc = k1_launch(rf, { T(dx, RAD_BF16, { M, n }), T(dw, RAD_F32, { n }), T(y, RAD_BF16, { M, n }),
+                                     T(dcs, RAD_F32, { tab, rot }), T(dp, RAD_I32, { M }) }, pn);
+            if (rc == RAD_OK)
+                rc = k1_launch(rs, { half(y, 0), half(y, hd), T(dsl, RAD_I32, { M }), T(c, RAD_BF16, { nb, 1, bs, n }) }, ps);
+            return rc;
+        };
+        auto fold = [&](void* y, void* c) {
+            return k1_launch(rk, { T(dx, RAD_BF16, { M, n }), T(dw, RAD_F32, { n }), T(y, RAD_BF16, { M, n }),
+                                   T(dcs, RAD_F32, { tab, rot }), T(dp, RAD_I32, { M }), T(dsl, RAD_I32, { M }),
+                                   T(c, RAD_BF16, { nb, 1, bs, n }) }, pk);
+        };
+        const int ra = pair(dyA, dcA), rb = fold(dyB, dcB);
+        if (ra != RAD_OK || rb != RAD_OK) {
+            ++rc_bad;
+            if (first.empty()) first = fmt("M=%lld rc pair %d fold %d", (long long)M, ra, rb);
+            dfree_all();
+            continue;
+        }
+        std::vector<uint8_t> ya(yb), ybv(yb), ca(cb), cbv(cb);
+        st_memcpy(ya.data(), dyA, yb, hipMemcpyDeviceToHost);
+        st_memcpy(ybv.data(), dyB, yb, hipMemcpyDeviceToHost);
+        st_memcpy(ca.data(), dcA, cb, hipMemcpyDeviceToHost);
+        st_memcpy(cbv.data(), dcB, cb, hipMemcpyDeviceToHost);
+        int64_t dy = 0, dc = 0, mv = 0;
+        for (size_t i = 0; i < yb; ++i) dy += ya[i] != ybv[i];
+        for (size_t i = 0; i < cb; ++i) { dc += ca[i] != cbv[i]; mv += ca[i] != c0[i]; }
+        bad_y += dy;
+        bad_c += dc;
+        stored += mv;
+        if ((dy || dc) && first.empty()) first = fmt("M=%lld: y %lld, cache %lld bytes differ", (long long)M,
+                                                     (long long)dy, (long long)dc);
+        if (M == 1 || M == 4 || M == 8 || M == 48) {
+            const double tp = k1_time_us([&] { pair(dyA, dcA); });
+            const double tf = k1_time_us([&] { fold(dyB, dcB); });
+            std::printf("  info  kvfold M=%lld: pair %.2f us, fold %.2f us (back to back, warm)\n", (long long)M, tp, tf);
+        }
+        dfree_all();
+    }
+    ok(name, bad_y == 0 && bad_c == 0 && rc_bad == 0 && stored > 0,
+       fmt("%zu heights (1..48, 64, 130, 512): y %lld, cache %lld bytes differ, %lld launch failures; the pair wrote "
+           "%lld cache bytes%s%s", Ms.size(), (long long)bad_y, (long long)bad_c, (long long)rc_bad, (long long)stored,
+           first.empty() ? "" : "; first: ", first.c_str()));
+}
+
+/* attn_sparse_sink's operands at one step (tests/r4d_emu/test_ds41fold.cpp's fixture): window caches and
+ * tables, the compressed latent at `ratio` (none at 0), selections, sinks, positions, cu_seqlens. */
+struct K1Attn {
+    int H = 16, ratio = 4, win = 128, topk = 512, S = 0, M = 0;
+    int64_t nwblk = 0, ncblk = 0, nwbt = 0, ncbt = 0;
+    int bs = 16;
+    std::vector<uint16_t> q, wc, cc;
+    std::vector<int32_t> wbt, wused, cbt, sel, pos, cu;
+    std::vector<float> sink;
+};
+static K1Attn k1_attn_fix(std::mt19937& rng, int ratio, int topk, const std::vector<std::pair<int, int>>& seqs) {
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_int_distribution<int> pct(0, 99);
+    K1Attn f;
+    f.ratio = ratio;
+    f.topk = ratio > 0 ? topk : 0;
+    f.S = (int)seqs.size();
+    f.cu.push_back(0);
+    int64_t maxp = 0;
+    for (const auto& s : seqs) {
+        for (int i = 0; i < s.first; ++i) f.pos.push_back(s.second - s.first + 1 + i);
+        f.cu.push_back(f.cu.back() + s.first);
+        maxp = std::max<int64_t>(maxp, s.second + 1);
+    }
+    f.M = f.cu.back();
+    auto bf = [&](float sc) { return rad_f32_to_bf16(nd(rng) * sc); };
+    f.q.resize((size_t)f.M * f.H * 512);
+    for (auto& v : f.q) v = bf(0.05f);
+    f.nwbt = (maxp + f.bs - 1) / f.bs + 1;
+    f.nwblk = f.S * f.nwbt + 3;
+    std::vector<int32_t> perm((size_t)f.nwblk);
+    for (int64_t i = 0; i < f.nwblk; ++i) perm[(size_t)i] = (int32_t)i;
+    std::shuffle(perm.begin(), perm.end(), rng);
+    f.wbt.assign((size_t)(f.S * f.nwbt), -1);
+    for (int s = 0; s < f.S; ++s)
+        for (int64_t b = 0; b < f.nwbt; ++b) f.wbt[(size_t)(s * f.nwbt + b)] = perm[(size_t)(s * f.nwbt + b)];
+    f.wc.resize((size_t)(f.nwblk * f.bs * 512));
+    for (auto& v : f.wc) v = bf(1.0f);
+    for (const auto& sq : seqs) f.wused.push_back((int32_t)(sq.second + 1));
+    if (ratio > 0) {
+        f.ncbt = maxp / ratio + 2;
+        f.ncblk = f.S * f.ncbt + 5;
+        std::vector<int32_t> cperm((size_t)f.ncblk);
+        for (int64_t i = 0; i < f.ncblk; ++i) cperm[(size_t)i] = (int32_t)i;
+        std::shuffle(cperm.begin(), cperm.end(), rng);
+        f.cbt.assign((size_t)(f.S * f.ncbt), -1);
+        for (int s = 0; s < f.S; ++s)
+            for (int64_t c = 0; c < f.ncbt; ++c)
+                f.cbt[(size_t)(s * f.ncbt + c)] = pct(rng) < 2 ? -1 : cperm[(size_t)(s * f.ncbt + c)];
+        /* the latent: quant_roundtrip(fp4_e2m1, e4m3, 16) values (packable exactly) */
+        static const float kMag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+        f.cc.resize((size_t)(f.ncblk * 512));
+        for (int64_t e = 0; e < f.ncblk; ++e)
+            for (int b = 0; b < 512 / 16; ++b) {
+                const int k = pct(rng);
+                const float sc = k < 8 ? 1e-3f : k < 16 ? 0.02f : k < 18 ? 0.0f : 1.0f;
+                uint16_t* v = &f.cc[(size_t)(e * 512 + b * 16)];
+                float amax = 0.0f;
+                for (int i = 0; i < 16; ++i) {
+                    v[i] = bf(sc);
+                    amax = std::max(amax, std::fabs(rad_bf16_to_f32(v[i])));
+                }
+                amax = std::max(amax, 6.0f * 0x1p-9f);
+                const float scale = rad_fp8e4m3_to_f32(rad_f32_to_fp8e4m3(amax / 6.0f));
+                for (int i = 0; i < 16; ++i) {
+                    const float xx = std::clamp(rad_bf16_to_f32(v[i]) / scale, -6.0f, 6.0f), ax = std::fabs(xx);
+                    unsigned best = 0;
+                    for (unsigned c = 1; c < 8; ++c) {
+                        const float d = std::fabs(kMag[c] - ax), db = std::fabs(kMag[best] - ax);
+                        if (d < db || (d == db && (c & 1u) == 0u)) best = c;
+                    }
+                    v[i] = rad_f32_to_bf16((std::signbit(xx) ? -1.0f : 1.0f) * kMag[best] * scale);
+                }
+            }
+        f.sel.resize((size_t)f.M * f.topk);
+        for (int m = 0; m < f.M; ++m) {
+            const int64_t reach = ((int64_t)f.pos[(size_t)m] + 1) / ratio;
+            for (int t = 0; t < f.topk; ++t)
+                f.sel[(size_t)(m * f.topk + t)] =
+                    (reach > 0 && pct(rng) < 95) ? (int32_t)(rng() % (uint64_t)std::max<int64_t>(1, reach)) : -1;
+        }
+    }
+    f.sink.resize((size_t)f.H);
+    for (auto& v : f.sink) v = nd(rng);
+    return f;
+}
+
+static void ds41_ofold_case(const Plugin& pl) {
+    const char* row = "ds41_attn_sparse_sink_rope_rt_d512_bf16";
+    if (!sel(row)) return;
+    const char* name = "attn_sparse_sink_rope_roundtrip is byte-identical to attn_sparse_sink + rope_rows_roundtrip";
+    const RadKernelInfo* rk = find(pl, row);
+    const RadKernelInfo* ra = find(pl, "ds41_attn_sparse_sink_d512_bf16");
+    const RadKernelInfo* rr = find(pl, "rope_rows_roundtrip_fp8_bf16");
+    const RadKernelInfo* re = find(pl, "entry_store_bf16");
+    if (!rk || !ra || !rr || !re) { ok(name, false, "row absent"); return; }
+    const int64_t D = 512, rot = 64, tab = 16384, slots = 144;   /* a packed entry in bf16 slots (288 bytes) */
+    struct Shape { int M, ratio; bool nv; };
+    std::vector<Shape> shapes;
+    for (int M = 1; M <= 48; ++M) shapes.push_back({ M, M % 3 == 0 ? 0 : 4, M % 3 == 2 });
+    shapes.push_back({ 64, 4, false });
+    shapes.push_back({ 130, 4, true });
+    shapes.push_back({ 64, 0, false });
+    int64_t bad = 0, changed = 0, rc_bad = 0;
+    std::string first;
+    std::mt19937 rng(777);
+    for (const Shape& sh : shapes) {
+        /* up to four sequences, rows split evenly, contexts 3000-9000 (a few rows past the angle table:
+         * the table is 16384 rows, the last sequence ends at 16390 when M % 5 == 4) */
+        const int S = std::min(sh.M, 4);
+        std::vector<std::pair<int, int>> seqs;
+        for (int s = 0; s < S; ++s) {
+            const int rows = sh.M / S + (s < sh.M % S ? 1 : 0);
+            const int last = (s == S - 1 && sh.M % 5 == 4) ? (int)tab + 6 : 3000 + 1500 * s + (int)(rng() % 900);
+            seqs.push_back({ rows, last });
+        }
+        const K1Attn f = k1_attn_fix(rng, sh.ratio, 512, seqs);
+        const int64_t M = f.M, H = f.H, n = H * D;
+        std::vector<float> cs((size_t)(tab * rot));
+        for (int64_t p = 0; p < tab; ++p)
+            for (int64_t i = 0; i < rot / 2; ++i) {
+                const float a = 6.4f * ((float)(rng() % 100000) / 100000.0f - 0.5f);
+                cs[(size_t)(p * rot + i)] = std::cos(a);
+                cs[(size_t)(p * rot + rot / 2 + i)] = std::sin(a);
+            }
+        auto up = [&](const void* h, size_t b) {
+            void* d = dalloc(b);
+            if (d && b) st_memcpy(d, h, b, hipMemcpyHostToDevice);
+            return d;
+        };
+        void* dq = up(f.q.data(), f.q.size() * 2);
+        void* dwc = up(f.wc.data(), f.wc.size() * 2);
+        void* dwbt = up(f.wbt.data(), f.wbt.size() * 4);
+        void* dwu = up(f.wused.data(), f.wused.size() * 4);
+        void* dpos = up(f.pos.data(), f.pos.size() * 4);
+        void* dcu = up(f.cu.data(), f.cu.size() * 4);
+        void* dsk = up(f.sink.data(), f.sink.size() * 4);
+        void* dcs = up(cs.data(), cs.size() * 4);
+        void* dcc = sh.ratio ? up(f.cc.data(), f.cc.size() * 2) : nullptr;
+        void* dcbt = sh.ratio ? up(f.cbt.data(), f.cbt.size() * 4) : nullptr;
+        void* dsel = sh.ratio ? up(f.sel.data(), f.sel.size() * 4) : nullptr;
+        void* dpk = nullptr;
+        const size_t ob = (size_t)(M * n * 2);
+        void* doA = dalloc(ob); void* doB = dalloc(ob);
+        if (!dq || !dwc || !dwbt || !dwu || !dpos || !dcu || !dsk || !dcs || !doA || !doB ||
+            (sh.ratio && (!dcc || !dcbt || !dsel))) { ok(name, false, "hipMalloc failed"); return; }
+        if (sh.nv && sh.ratio) {   /* the packed latent, by entry_store format nvfp4 (the engine's packing) */
+            std::vector<int32_t> page((size_t)f.ncblk);
+            for (int64_t i = 0; i < f.ncblk; ++i) page[(size_t)i] = (int32_t)i;
+            void* dpg = up(page.data(), page.size() * 4);
+            dpk = dalloc((size_t)(f.ncblk * slots * 2));
+            const int rc = k1_launch(re, { T(dcc, RAD_BF16, { f.ncblk, D }), T(dpg, RAD_I32, { f.ncblk }),
+                                           T(dpk, RAD_BF16, { f.ncblk, 1, sh.ratio, slots / sh.ratio }) },
+                                     { PI("M", f.ncblk), PI("n", D), PI("block_size", sh.ratio), PS("dtype", "bf16"),
+                                       PS("format", "nvfp4") });
+            if (rc != RAD_OK) { ok(name, false, fmt("entry_store nvfp4 rc %d", rc)); return; }
+        }
+        const bool nv = dpk != nullptr;
+        std::vector<RadParam> pa = { PI("M", M), PI("heads", H), PI("dim", D), PI("window", f.win),
+                                     PI("ratio", f.ratio), PI("topk", f.topk), PF("scale", 1.0 / std::sqrt((double)D)),
+                                     PS("dtype", "bf16") };
+        if (nv) pa.push_back(PS("latent_format", "nvfp4"));
+        std::vector<RadParam> pf = pa;
+        for (const RadParam& p : { PI("rot", rot), PI("off", D - rot), PS("mode", "gptj"), PI("inverse", 1),
+                                   PI("block", 32), PS("format", "fp8_e4m3"), PS("block_scale", "ue8m0") })
+            pf.push_back(p);
+        const std::vector<RadParam> pr = { PI("M", M), PI("n_head", H), PI("head_dim", D), PI("rot", rot),
+                                           PI("off", D - rot), PS("mode", "gptj"), PI("inverse", 1), PI("block", 32),
+                                           PS("format", "fp8_e4m3"), PS("scale", "ue8m0"), PS("dtype", "bf16") };
+        auto ops = [&](void* o) {
+            std::vector<RadTensor> ts = {
+                T(dq, RAD_BF16, { M, n }), T(dwc, RAD_BF16, { f.nwblk, 1, f.bs, D }), T(dwbt, RAD_I32, { f.S, f.nwbt }),
+                T(dwu, RAD_I32, { f.S }),
+                !f.ratio ? RadTensor{}
+                : nv     ? T(dpk, RAD_BF16, { f.ncblk, 1, f.ratio, slots / f.ratio })
+                         : T(dcc, RAD_BF16, { f.ncblk, 1, f.ratio, D / f.ratio }),
+                f.ratio ? T(dcbt, RAD_I32, { f.S, f.ncbt }) : RadTensor{},
+                f.ratio ? T(dsel, RAD_I32, { M, f.topk }) : RadTensor{},
+                T(dpos, RAD_I32, { M }), T(dcu, RAD_I32, { f.S + 1 }), T(dsk, RAD_F32, { H }), T(o, RAD_BF16, { M, n }) };
+            return ts;
+        };
+        auto pair = [&](void* o) {
+            int rc = k1_launch(ra, ops(o), pa);
+            if (rc == RAD_OK)
+                rc = k1_launch(rr, { T(o, RAD_BF16, { M, n }), T(dcs, RAD_F32, { tab, rot }), T(dpos, RAD_I32, { M }) }, pr);
+            return rc;
+        };
+        auto fold = [&](void* o) {
+            std::vector<RadTensor> ts = ops(o);
+            ts.push_back(T(dcs, RAD_F32, { tab, rot }));
+            return k1_launch(rk, ts, pf);
+        };
+        st_memset(doA, 0x11, ob);
+        st_memset(doB, 0x22, ob);
+        const int r1 = pair(doA), r2 = fold(doB);
+        if (r1 != RAD_OK || r2 != RAD_OK) {
+            ++rc_bad;
+            if (first.empty()) first = fmt("M=%lld rc pair %d fold %d", (long long)M, r1, r2);
+            dfree_all();
+            continue;
+        }
+        std::vector<uint16_t> oa((size_t)(M * n)), obv((size_t)(M * n)), o0((size_t)(M * n));
+        st_memcpy(oa.data(), doA, ob, hipMemcpyDeviceToHost);
+        st_memcpy(obv.data(), doB, ob, hipMemcpyDeviceToHost);
+        /* the attention alone, to see the rope and the round trip changed something */
+        if (k1_launch(ra, ops(doB), pa) == RAD_OK) st_memcpy(o0.data(), doB, ob, hipMemcpyDeviceToHost);
+        int64_t d = 0, ch = 0;
+        for (size_t i = 0; i < oa.size(); ++i) { d += oa[i] != obv[i]; ch += oa[i] != o0[i]; }
+        bad += d;
+        changed += ch;
+        if (d && first.empty())
+            first = fmt("M=%lld ratio %d %s: %lld of %lld outputs differ", (long long)M, f.ratio, nv ? "nvfp4" : "bf16",
+                        (long long)d, (long long)oa.size());
+        if (M == 1 || M == 4 || M == 8 || M == 16 || M == 48) {
+            const double tp = k1_time_us([&] { pair(doA); });
+            const double tf = k1_time_us([&] { fold(doB); });
+            std::printf("  info  ofold M=%lld ratio %d %s: pair %.2f us, fold %.2f us (back to back, warm)\n",
+                        (long long)M, f.ratio, nv ? "nvfp4" : "bf16", tp, tf);
+        }
+        dfree_all();
+    }
+    ok(name, bad == 0 && rc_bad == 0 && changed > 0,
+       fmt("%zu passes (1..48 rows, 64, 130; ratio 0 / 4, bf16 / nvfp4 latents): %lld outputs differ, %lld launch "
+           "failures; the rope + round trip changed %lld outputs%s%s", shapes.size(), (long long)bad, (long long)rc_bad,
+           (long long)changed, first.empty() ? "" : "; first: ", first.c_str()));
+}
+
 /* ------------------------------------------------ the k-only form, against the pair it replaces
  *
  * `n_head` 0 is what the QSA indexer asks for: its query heads are already plain `head_dim` runs
@@ -34594,6 +34973,8 @@ static void device_phase(const Plugin& pl) {
         qk_kv_fold_case(pl, true);
         qk_kv_fold_case(pl, false, 1);
         qk_kv_fold_case(pl, false, 2);
+        ds41_kvfold_case(pl);
+        ds41_ofold_case(pl);
         qsa_qprep_case(pl);
         topk_scatter_case(pl);
         router_gemm_fused_case(pl);

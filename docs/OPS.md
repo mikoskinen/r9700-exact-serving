@@ -988,8 +988,10 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `quant_roundtrip` | `M`(range) `n` `block` `format`:str `scale`:str `dtype` | `x`:inout |
 | `rope_rows_roundtrip` | `M`(range) `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` | `x`:inout, `cos_sin`, `positions` (device-only: rope_rows then quant_roundtrip over n_head * head_dim columns) |
 | `rmsnorm_rope_roundtrip` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions` (device-only: rmsnorm, then rope_rows and quant_roundtrip over y; n = n_head * head_dim) |
+| `rmsnorm_rope_roundtrip_kv_store` | `M`(range) `n` `eps`:f64 `n_head` `head_dim` `rot` `off` `mode` `inverse` `block` `format`:str `scale`:str `dtype` `block_size` `kv_dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w → `y`; `cos_sin`, `positions`, `slot_mapping`, `kv_cache`:inout (device-only: rmsnorm_rope_roundtrip, then kv_store of y's row as one entry [K = y[0, n/2) \| V = y[n/2, n)] of a [n_blocks, 1, block_size, n] cache) |
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
 | `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
+| `attn_sparse_sink_rope_roundtrip` | `attn_sparse_sink`'s, then `rot` `off` `mode` `inverse` `block` `format`:str `block_scale`:str | `attn_sparse_sink`'s operands, then `cos_sin` (device-only: attn_sparse_sink, then rope_rows_roundtrip over `out` with n_head = heads, head_dim = dim, scale = block_scale, at the attention's positions) |
 | `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
 | `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
 | `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
@@ -1251,6 +1253,16 @@ head_dim` columns of `x`, in place; **`rmsnorm_rope_roundtrip`** (device-only) i
 latent and index query, and its window and index keys. Each step rounds where its own op stores, so
 both are bit-identical to the chain; as with `mhc_collapse_rmsnorm`, libr4d declares them with
 `replaces`, libref has no row, and an architecture declares the chain where they do not resolve.
+
+**`rmsnorm_rope_roundtrip_kv_store`** (device-only) is `rmsnorm_rope_roundtrip` followed by `kv_store`
+of `y`'s row (`n_head_kv` 1, `head_dim` n / 2: the row's halves are K and V, so the row is one cache
+entry); **`attn_sparse_sink_rope_roundtrip`** (device-only) is `attn_sparse_sink` followed by
+`rope_rows_roundtrip` over its output. libr4d serves the first in one pass (each bf16 the quantiser
+stores in `y` is also stored at the row's slot, as `kv_store` would copy it) and the second, up to 48
+rows, as the decode kernel with the inverse rope and the round trip in its epilogue (every other pass
+as the two ops' launches). Both are bit-identical to their chains; DeepSeek-V4.1 declares them beside
+the chains under RADIANCE_DS41_KVFOLD / RADIANCE_DS41_OFOLD and picks per step (the ds41_kvfold /
+ds41_ofold switches).
 
 | op | params | operands |
 |---|---|---|

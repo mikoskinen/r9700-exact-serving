@@ -1104,3 +1104,46 @@ extern "C" int r4d_fuse_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, ui
     default: return RAD_E_NOTFOUND;
     }
 }
+
+/* ==========================================================================================
+ * attn_sparse_sink_rope_roundtrip -- DeepSeek-V4.1's attention with its output's inverse rope and round
+ * trip (lever K1 fold d). (row: ds41_attn_sparse_sink_rope_rt_d512_bf16; kernels: r4d_ds41_sparse.hip,
+ * ds41_attn_dec_kernel under ORT, else attn_sparse_sink's launch then rope_rows_roundtrip's)
+ *
+ * Operands: [0] q  [1] window_cache  [2] window_bt  [3] window_used  [4] comp_cache?  [5] comp_bt?
+ *           [6] sel?  [7] positions  [8] cu_seqlens  [9] sinks  [10] out  [11] cos_sin
+ *
+ * attn_sparse_sink writes out; ds41_rope_rows (n_head = heads, head_dim = dim) rotates it in place at the
+ * attention's positions; quant_roundtrip (n = heads * dim, scale = block_scale) rounds it in place. The
+ * fused epilogue keeps exactly the bf16 each step stores (ds_ort_pair). */
+extern "C" int r4d_fuse_attn_sparse_sink_rope_roundtrip(const RadParam* p, int n_p, uint64_t present,
+                                                        int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    auto opt = [present](int i) { return opt_opd(present, i); };
+    const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), Dm = pi(p, n_p, "dim");
+    if (M <= 0 || H < 1 || Dm < 1) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "attn_sparse_sink");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "heads").mirror(p, n_p, "dim").mirror(p, n_p, "window")
+         .mirror(p, n_p, "ratio").mirror(p, n_p, "topk").mirror(p, n_p, "scale").mirror(p, n_p, "dtype")
+         .mirror_opt(p, n_p, "latent_format");
+        return s.wire({ 0, 1, 2, 3, opt(4), opt(5), opt(6), 7, 8, 9, 10 });
+    }
+    case 1: {
+        Step s(out, "ds41_rope_rows");
+        s.mirror(p, n_p, "M").pint("n_head", (long long)H).pint("head_dim", (long long)Dm)
+         .mirror(p, n_p, "rot").mirror(p, n_p, "off").mirror(p, n_p, "mode").mirror(p, n_p, "inverse")
+         .mirror(p, n_p, "dtype");
+        return s.wire({ 10, 11, 7 });               /* x = out, cos_sin, positions */
+    }
+    case 2: {
+        Step s(out, "quant_roundtrip");
+        s.mirror(p, n_p, "M").pint("n", (long long)(H * Dm)).mirror(p, n_p, "block")
+         .mirror(p, n_p, "format").pstr("scale", r4d_pgets(p, n_p, "block_scale")).mirror(p, n_p, "dtype");
+        return s.wire({ 10 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}

@@ -160,6 +160,24 @@ static const RadConstraint cDs41NormRopeRtFp4[] = {
     C_DS41_ROPE, C_GE("n", 1), C_LE("n", 16384), C_IN("format", "fp4_e2m1"),
     C_IN("scale", "ue8m0 e4m3"),
 };
+/* rmsnorm_rope_roundtrip + kv_store of y's row (lever K1 fold c): the chain's parameters, then kv_store's
+ * block_size and kv_dtype; y's row is one cache entry, its K half then its V half (kv_store at n_head_kv 1,
+ * head_dim n / 2: the cache [n_blocks, 1, block_size, n]). */
+static const RadParamSpec pDs41NormRopeRtKv[] = {
+    P_INT("M"),     P_INT("n"),        P_F64("eps"),   P_INT("n_head"),  P_INT("head_dim"),
+    P_INT("rot"),   P_INT("off"),      P_STR("mode"),  P_INT("inverse"), P_INT("block"),
+    P_STR("format"), P_STR("scale"),   P_STR("dtype"), P_INT("block_size"), P_STR("kv_dtype"),
+    P_F64O("wadd"), P_F64O("mult"),
+};
+static const RadOperandSpec oDs41NormRopeRtKv[] = {
+    { "x", RAD_OPD_IN, 0 },       { "w", RAD_OPD_WEIGHT, 0 },    { "y", RAD_OPD_OUT, 0 },
+    { "cos_sin", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "slot_mapping", RAD_OPD_IN, 0 },
+    { "kv_cache", RAD_OPD_INOUT, 0 },
+};
+static const RadConstraint cDs41NormRopeRtKvFp8[] = {
+    C_DS41_ROPE, C_GE("n", 2), C_LE("n", 16384), C_DIV("n", 2), C_IN("format", "fp8_e4m3"),
+    C_IN("scale", "ue8m0 f32"), C_GE("block_size", 1), C_IN("kv_dtype", "bf16"),
+};
 
 static const RadParamSpec pDs41RopeRt[] = {
     P_INT("M"),   P_INT("n_head"), P_INT("head_dim"), P_INT("rot"),    P_INT("off"),
@@ -256,6 +274,12 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
            "rmsnorm (x, w -> y), then rope_rows over y, then quant_roundtrip over y: y as the three ops "
            "leave it, each step rounded to dtype where that op stores. n = n_head * head_dim. A key "
            "normalised, rotated and quantise-dequantised before its cache (DeepSeek-V4.1)."),
+    SCHEMA("rmsnorm_rope_roundtrip_kv_store", pDs41NormRopeRtKv, oDs41NormRopeRtKv,
+           "rmsnorm_rope_roundtrip (x, w -> y, cos_sin, positions), then kv_store of y's row into the paged "
+           "cache at its slot (slot_mapping; negative or past the cache: no store), the row one entry of a "
+           "[n_blocks, 1, block_size, n] cache (kv_store at n_head_kv 1, head_dim n / 2: K = y[0, n/2), "
+           "V = y[n/2, n)): y and the cache as the two ops leave them. A key normalised, rotated, "
+           "quantise-dequantised and stored in one pass (DeepSeek-V4.1's window key)."),
     SCHEMA("rope_rows_roundtrip", pDs41RopeRt, oDs41RopeRt,
            "rope_rows then quant_roundtrip over the n_head * head_dim columns of x, in place: x as the "
            "two ops leave it, each step rounded to dtype where that op stores."),
@@ -354,6 +378,16 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
   "bf16 x and y, f32 or bf16 w, f32 cos_sin, i32 positions", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDs41NormRopeRtFp4), NOTUNE, nullptr, nullptr, r4d_rad_rmsnorm_rope_roundtrip, nullptr,
   nullptr, nullptr, r4d_shape_rmsnorm_rope_roundtrip, nullptr, r4d_fuse_rmsnorm_rope_roundtrip },
+/* No `replaces`: kv_store reads y's two halves as its k and v, column slices of one operand that a chain's
+ * wiring cannot name. The selftest (ds41 fold c case) and tests/r4d_emu ds41fold hold it to the two rows. */
+{ "rmsnorm_rope_roundtrip_kv_store_fp8_bf16", "rmsnorm_rope_roundtrip_kv_store", "norm",
+  "rmsnorm, rope_rows and an E4M3 quant_roundtrip of a row, and kv_store of the row, in one pass",
+  "any M, n <= 16384 even; rmsnorm_bf16's workgroup a row (r4d_act_threads), the row in LDS between steps, "
+  "each stored bf16 also written to the row's cache slot",
+  "bf16 x, y and cache, f32 or bf16 w, f32 cos_sin, i32 positions and slot mapping", RAD_DOMAIN_DEVICE,
+  R4D_PRIO_ONLY, ROW(cDs41NormRopeRtKvFp8), NOTUNE, nullptr, nullptr,
+  r4d_rad_rmsnorm_rope_roundtrip_kv_store, nullptr, nullptr, nullptr,
+  r4d_shape_rmsnorm_rope_roundtrip_kv_store },
 { "rope_rows_roundtrip_fp8_bf16", "rope_rows_roundtrip", "attn",
   "rope_rows then an E4M3 quant_roundtrip, in place, in one pass",
   "any M; a thread a column, the gptj partner by a lane shuffle (head_dim and off even, block a "

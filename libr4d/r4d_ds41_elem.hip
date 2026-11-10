@@ -21,6 +21,7 @@
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_ds41_pcn.h"
+#include "r4d_ds41_qrt.h"
 #include "r4d_moe_sort.h"
 #include "r4d_plugin.h"
 
@@ -42,15 +43,11 @@ unsigned int* r4d_8a8_split_ctr(RadStream s, const void* out);
 
 namespace {
 
-/* ==================================================================== libref's scalar rules */
-
-// rad_f32_to_bf16 (abi/rad_plugin.h): round to nearest even, a NaN quieted rather than rounded.
-__device__ __forceinline__ uint16_t ds_bf16(float f) {
-    const uint32_t u = __float_as_uint(f);
-    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);
-    return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-}
-__device__ __forceinline__ float ds_bf(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
+/* ==================================================================== libref's scalar rules
+ * ds_bf16, ds_bf, ds_e4m3, ds_to_e4m3, ds_e8m0, ds_max, ds_clamp, quant_roundtrip's block_scale and
+ * roundtrip, and FzRope live in r4d_ds41_qrt.h (one definition, shared with r4d_ds41_sparse.hip's fused
+ * epilogue). */
+using namespace r4d_ds41q;
 
 // rad_f16_to_f32, bit for bit (subnormals renormalised, a NaN's payload kept).
 __device__ __forceinline__ float ds_f16(uint16_t h) {
@@ -72,68 +69,6 @@ __device__ __forceinline__ float ds_f16(uint16_t h) {
         u = s | ((e - 15u + 127u) << 23) | (m << 13);
     }
     return __uint_as_float(u);
-}
-
-// rad_fp8e4m3_to_f32.
-__device__ __forceinline__ float ds_e4m3(uint32_t b) {
-    const uint32_t s = (b >> 7) << 31;
-    const uint32_t e = (b >> 3) & 0xfu;
-    uint32_t m = b & 0x7u, u;
-    if (e == 0u) {
-        if (m == 0u) {
-            u = s;
-        } else {
-            int sh = 0;
-            while (!(m & 0x8u)) { m <<= 1; ++sh; }
-            m &= 0x7u;
-            u = s | ((uint32_t)(127 - 6 - sh) << 23) | (m << 20);
-        }
-    } else if (e == 0xfu && m == 0x7u) {
-        u = s | 0x7fc00000u;
-    } else {
-        u = s | ((e - 7u + 127u) << 23) | (m << 20);
-    }
-    return __uint_as_float(u);
-}
-
-// rad_f32_to_fp8e4m3: RNE, saturating at 448, NaN to 0x7f.
-__device__ __forceinline__ uint32_t ds_to_e4m3(float f) {
-    const uint32_t u = __float_as_uint(f);
-    const uint32_t s = (u >> 24) & 0x80u;
-    const uint32_t a = u & 0x7fffffffu;
-    if (a > 0x7f800000u) return s | 0x7fu;
-    if (a >= 0x43e00000u) return s | 0x7eu;
-    const int e = (int)(a >> 23) - 127;
-    uint32_t m = a & 0x7fffffu;
-    if (e < -10) return s;
-    if (e < -6) {
-        const int sh = -6 - e + 20;
-        m |= 0x800000u;
-        const uint32_t lo = m & ((1u << sh) - 1u), half = 1u << (sh - 1);
-        uint32_t q = m >> sh;
-        if (lo > half || (lo == half && (q & 1u))) ++q;
-        return s | q;
-    }
-    uint32_t q = m >> 20;
-    const uint32_t lo = m & 0xfffffu;
-    int ee = e + 7;
-    if (lo > 0x80000u || (lo == 0x80000u && (q & 1u))) ++q;
-    if (q == 0x8u) { q = 0; ++ee; }
-    if (ee > 15 || (ee == 15 && q >= 7u)) return s | 0x7eu;
-    return s | ((uint32_t)ee << 3) | q;
-}
-
-// ref e8m0_to_f32: 2^(e-127), 0xff NaN (e 0 is the subnormal 2^-127).
-__device__ __forceinline__ float ds_e8m0(uint32_t e) {
-    if (e == 0xffu) return __uint_as_float(0x7fc00000u);
-    return __uint_as_float(e ? e << 23 : 0x00400000u);
-}
-
-// std::max(a, b) and std::clamp as libstdc++ evaluates them (a NaN `b` is dropped by max, kept by
-// clamp), which fmaxf/fminf would not reproduce.
-__device__ __forceinline__ float ds_max(float a, float b) { return (a < b) ? b : a; }
-__device__ __forceinline__ float ds_clamp(float v, float lo, float hi) {
-    return v < lo ? lo : (hi < v ? hi : v);
 }
 
 // The double routines rounded once, as libref's contract states them.
@@ -589,52 +524,7 @@ int rope_rows_body(const RadArgs* a, RadStream stream) {
  * A block's amax, its scale and the round trip of each value, as ref_quant_roundtrip's
  * block_scale and roundtrip. A power-of-two block up to 32 is a lane group (one value a thread, the
  * max over the group's lanes); any other block is one thread a block. amax is a max, so both give
- * the same bits. */
-
-enum { kFp8 = 0, kFp4 = 1 };
-enum { kUe8m0 = 0, kE4m3 = 1, kScaleF32 = 2 };
-
-__device__ __forceinline__ int ds_ceil_log2(float v) {
-    const uint32_t u = __float_as_uint(v);
-    return (int)((u >> 23) & 0xffu) - 127 + ((u & 0x7fffffu) ? 1 : 0);
-}
-__device__ __forceinline__ float ds_pow2(int e) { return __uint_as_float((uint32_t)(e + 127) << 23); }
-
-__device__ __forceinline__ float block_scale(float amax, int fmt, int sc) {
-    if (fmt == kFp8) {
-        amax = ds_max(amax, 1e-4f);
-        const float inv = 1.0f / 448.0f;
-        return sc == kUe8m0 ? ds_pow2(ds_ceil_log2(amax * inv)) : amax * inv;
-    }
-    if (sc == kE4m3) {
-        amax = ds_max(amax, 6.0f * 0x1p-9f);
-        return ds_e4m3(ds_to_e4m3(amax / 6.0f));
-    }
-    amax = ds_max(amax, 6.0f * 0x1p-126f);
-    const float inv = 1.0f / 6.0f;
-    return sc == kUe8m0 ? ds_pow2(ds_ceil_log2(amax * inv)) : amax * inv;
-}
-
-// ref e2m1_code then mxfp4_elem_to_f32: the nearest of the eight magnitudes, ties to the even
-// code, the sign kept (so -0 for a small negative), NaN to +0.
-__device__ __forceinline__ float ds_e2m1_rt(float v) {
-    if (v != v) return 0.0f;
-    const bool neg = (__float_as_uint(v) >> 31) != 0;
-    const float a = fabsf(v);
-    const float mag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
-    float bm = 0.0f;
-#pragma unroll
-    for (int c = 1; c < 8; ++c) {
-        const float d = fabsf(mag[c] - a), db = fabsf(bm - a);
-        if (d < db || (d == db && (c & 1) == 0)) bm = mag[c];
-    }
-    return neg ? -bm : bm;
-}
-
-__device__ __forceinline__ float roundtrip(float v, float scale, int fmt) {
-    if (fmt == kFp8) return ds_e4m3(ds_to_e4m3(ds_clamp(v / scale, -448.0f, 448.0f))) * scale;
-    return ds_e2m1_rt(ds_clamp(v / scale, -6.0f, 6.0f)) * scale;
-}
+ * the same bits. The scalar rules (block_scale, roundtrip) are r4d_ds41_qrt.h's. */
 
 template <int B>
 __global__ __launch_bounds__(256) void quant_group_kernel(uint16_t* x, long xp, int n, long rows,
@@ -1773,20 +1663,13 @@ __device__ __forceinline__ float fz_block_sum(float v, float* lds) {
     return s;
 }
 
-// rope_rows' operands and geometry, as rope_rows_body passes them to rope_rows_kernel.
-struct FzRope {
-    const float* cs;
-    long cp, cst;
-    const int32_t* pos;
-    long ps, tab_rows;
-    int hd, half, off, pairs, gptj;
-    float sign;
-};
-
 // quant_group_kernel's step over a row held in `buf`: lane groups of B columns, `width` threads.
-template <int B>
+// KV (rmsnorm_rope_roundtrip_kv_store): each value is also stored at kc[col] when the row has a cache
+// slot (kc not null) -- the very bf16 written to yr[col], so the cache holds what kv_store would copy.
+template <int B, bool KV = false>
 __device__ __forceinline__ void fz_quant_group(const uint16_t* buf, uint16_t* yr, int n,
-                                               uint32_t width, int fmt, int sc) {
+                                               uint32_t width, int fmt, int sc,
+                                               uint16_t* kc = nullptr) {
     for (int base = 0; base < n; base += (int)width) {
         const int col = base + (int)threadIdx.x;
         const bool in = col < n;
@@ -1794,29 +1677,57 @@ __device__ __forceinline__ void fz_quant_group(const uint16_t* buf, uint16_t* yr
         float a = fabsf(v);
         a = a == a ? a : 0.0f;
         const float amax = r4d_xor_max<B>(a);
-        if (in) yr[col] = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
+        if (in) {
+            const uint16_t o = ds_bf16(roundtrip(v, block_scale(amax, fmt, sc), fmt));
+            yr[col] = o;
+            if constexpr (KV) {
+                if (kc) kc[col] = o;
+            }
+        }
     }
 }
 
-// quant_serial_kernel's step: one thread a block.
+// quant_serial_kernel's step: one thread a block (KV as fz_quant_group).
+template <bool KV = false>
 __device__ __forceinline__ void fz_quant_serial(const uint16_t* buf, uint16_t* yr, int n, int block,
-                                                uint32_t width, int fmt, int sc) {
+                                                uint32_t width, int fmt, int sc,
+                                                uint16_t* kc = nullptr) {
     for (int b = (int)threadIdx.x; b < n / block; b += (int)width) {
         const uint16_t* p = buf + (long)b * block;
         float amax = 0;
         for (int i = 0; i < block; ++i) amax = ds_max(amax, fabsf(ds_bf(p[i])));
         const float s = block_scale(amax, fmt, sc);
-        for (int i = 0; i < block; ++i) yr[(long)b * block + i] = ds_bf16(roundtrip(ds_bf(p[i]), s, fmt));
+        for (int i = 0; i < block; ++i) {
+            const uint16_t o = ds_bf16(roundtrip(ds_bf(p[i]), s, fmt));
+            yr[(long)b * block + i] = o;
+            if constexpr (KV) {
+                if (kc) kc[(long)b * block + i] = o;
+            }
+        }
     }
 }
 
+/* rmsnorm_rope_roundtrip_kv_store's cache (kv_store_bf16's operands at one head): the row's slot from the
+ * slot mapping, the paged cache [n_blocks, 1, block_size, n] (an entry's K half then its V half, kv_store's
+ * layout at n_head_kv 1 and head_dim n / 2). FzKvNone is the plain chain's (no cache). */
+struct FzKv {
+    const int32_t* slot;
+    uint16_t* kv;
+    uint32_t bs, n_blocks;
+};
+struct FzKvNone {};
+
 /* rmsnorm_rope_roundtrip: one workgroup a row (rmsnorm's grid and width); the row passes between
- * the steps through LDS as the bf16 each step stores. */
-template <bool WF32, uint32_t THR>
+ * the steps through LDS as the bf16 each step stores.
+ * KV (rmsnorm_rope_roundtrip_kv_store, lever K1 fold c): the quant step also writes each bf16 it stores in
+ * y to the row's cache slot, as kv_store_bf16 copies y's row there (kv_store_kernel: slot s < 0 or
+ * s / block_size >= n_blocks stores nothing; else entry (s / block_size, s % block_size) of the one head,
+ * K = y[0, n/2) at [0, n/2), V = y[n/2, n) at [n/2, n)): the same bytes, without the second launch. */
+template <bool WF32, uint32_t THR, bool KV = false>
 __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     const uint16_t* __restrict__ x, uint32_t x_ld, const void* __restrict__ w,
     uint16_t* __restrict__ y, uint32_t y_ld, uint32_t n, float eps, float wadd, float mult,
-    uint32_t M, FzRope r, int block, int fmt, int sc) {
+    uint32_t M, FzRope r, int block, int fmt, int sc, std::conditional_t<KV, FzKv, FzKvNone> kv) {
 #ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
     uint16_t* const fz_row = (uint16_t*)emu_dyn_lds();
 #else
@@ -1878,14 +1789,22 @@ __global__ __launch_bounds__(THR) void norm_rope_rt_kernel(
     __syncthreads();
 
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
+    uint16_t* kc = nullptr;
+    if constexpr (KV) {   // kv_store_kernel's slot rule and address, kv_heads 1, 2 * head_dim = n
+        const int32_t s = kv.slot[m];
+        if (s >= 0 && (uint32_t)s / kv.bs < kv.n_blocks)
+            kc = kv.kv + ((size_t)((uint32_t)s / kv.bs) * kv.bs + (size_t)((uint32_t)s % kv.bs)) * n;
+    } else {
+        (void)kv;
+    }
     switch (block) {
-        case 1: fz_quant_group<1>(fz_row, yr, (int)n, THR, fmt, sc); break;
-        case 2: fz_quant_group<2>(fz_row, yr, (int)n, THR, fmt, sc); break;
-        case 4: fz_quant_group<4>(fz_row, yr, (int)n, THR, fmt, sc); break;
-        case 8: fz_quant_group<8>(fz_row, yr, (int)n, THR, fmt, sc); break;
-        case 16: fz_quant_group<16>(fz_row, yr, (int)n, THR, fmt, sc); break;
-        case 32: fz_quant_group<32>(fz_row, yr, (int)n, THR, fmt, sc); break;
-        default: fz_quant_serial(fz_row, yr, (int)n, block, THR, fmt, sc); break;
+        case 1: fz_quant_group<1, KV>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+        case 2: fz_quant_group<2, KV>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+        case 4: fz_quant_group<4, KV>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+        case 8: fz_quant_group<8, KV>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+        case 16: fz_quant_group<16, KV>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+        case 32: fz_quant_group<32, KV>(fz_row, yr, (int)n, THR, fmt, sc, kc); break;
+        default: fz_quant_serial<KV>(fz_row, yr, (int)n, block, THR, fmt, sc, kc); break;
     }
 }
 
@@ -2142,9 +2061,12 @@ int fz_rope_args(const RadArgs* a, const RadTensor& x, const RadTensor& cs, cons
 // Most columns the fused norm holds in LDS (the row as bf16); the row's constraint says the same.
 constexpr long kFzMaxN = 16384;
 
-/* x [M, n] (rows as rmsnorm reads them), w, y [M, n], cos_sin, positions. */
-int norm_rope_rt_body(const RadArgs* a, RadStream stream) {
-    if (!a || a->n_t < 5) return RAD_E_INVAL;
+/* x [M, n] (rows as rmsnorm reads them), w, y [M, n], cos_sin, positions; with KV
+ * (rmsnorm_rope_roundtrip_kv_store) then kv_store_bf16's slot_mapping [M] and kv_cache [n_blocks, 1,
+ * block_size, n] (block_size and kv_dtype bf16 as kv_store declares them). */
+template <bool KV>
+int norm_rope_rt_launch(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < (KV ? 7 : 5)) return RAD_E_INVAL;
     const RadTensor &x = a->t[0], &w = a->t[1], &y = a->t[2], &cs = a->t[3], &pos = a->t[4];
     if (!x.data || !w.data || !y.data || !cs.data || !pos.data) return R4D_NO(RAD_E_INVAL);
     if (x.dtype != RAD_BF16 || y.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
@@ -2166,13 +2088,31 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream) {
     if (block < 1 || n % block) return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0);
     const float mult = (float)r4d_getf(a, "mult", 1.0);
+    std::conditional_t<KV, FzKv, FzKvNone> kv{};
+    if constexpr (KV) {   /* kv_store_geom's checks at one head of n / 2 (K) + n / 2 (V) */
+        const RadTensor &sm = a->t[5], &kc = a->t[6];
+        if (!sm.data || !kc.data) return R4D_NO(RAD_E_INVAL);
+        const char* kd = r4d_gets(a, "kv_dtype");
+        const long long bs = r4d_geti_or(a, "block_size", 0);
+        if (!kd || std::strcmp(kd, "bf16")) return R4D_NO(RAD_E_UNSUPPORTED);
+        if (sm.dtype != RAD_I32 || kc.dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+        if (!r4d_contig(&sm) || !r4d_contig(&kc)) return R4D_NO(RAD_E_STRIDE);
+        if (bs <= 0 || (n & 1) || kc.rank != 4 || kc.shape[1] != 1 || kc.shape[2] != bs ||
+            kc.shape[3] != n || kc.shape[0] < 1 || kc.shape[0] > UINT32_MAX || bs > UINT32_MAX ||
+            r4d_numel(&sm) != M)
+            return R4D_NO(RAD_E_SHAPE);
+        kv.slot = (const int32_t*)sm.data;
+        kv.kv = (uint16_t*)kc.data;
+        kv.bs = (uint32_t)bs;
+        kv.n_blocks = (uint32_t)kc.shape[0];
+    }
     const int thr = r4d_act_threads((int)M, (int)n);
     const uint32_t lds = (uint32_t)(n * sizeof(uint16_t));
 #define FZ_NRQ(WF, T)                                                                             \
-    R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
+    R4D_EMIT(stream, (norm_rope_rt_kernel<WF, T, KV>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kFzWave)), \
              dim3(T), lds, (const uint16_t*)x.data, (uint32_t)x_ld, (const void*)w.data,          \
              (uint16_t*)y.data, (uint32_t)y.stride[0], (uint32_t)n, eps, wadd, mult, (uint32_t)M, \
-             r, (int)block, fmt, sc)
+             r, (int)block, fmt, sc, kv)
 #define FZ_NRQ_W(WF)                                                                              \
     return thr == 1024 ? FZ_NRQ(WF, 1024) : thr == 512 ? FZ_NRQ(WF, 512) : FZ_NRQ(WF, 256)
     if (w.dtype == RAD_F32) FZ_NRQ_W(true);
@@ -2180,6 +2120,8 @@ int norm_rope_rt_body(const RadArgs* a, RadStream stream) {
 #undef FZ_NRQ_W
 #undef FZ_NRQ
 }
+int norm_rope_rt_body(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<false>(a, stream); }
+int norm_rope_rt_kv_body(const RadArgs* a, RadStream stream) { return norm_rope_rt_launch<true>(a, stream); }
 
 /* x [M, n_head*head_dim] in place, cos_sin, positions. The lane-group form needs a gptj pair on
  * one wave's even/odd lanes (head_dim and off even, the row's constraints) and a power-of-two block
@@ -2419,6 +2361,9 @@ extern "C" int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream s) {
     return norm_rope_rt_body(a, s);
+}
+extern "C" int r4d_rad_rmsnorm_rope_roundtrip_kv_store(const RadArgs* a, RadStream s) {
+    return norm_rope_rt_kv_body(a, s);
 }
 extern "C" int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream s) {
     return rope_rt_body(a, s);

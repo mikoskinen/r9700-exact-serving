@@ -159,6 +159,22 @@ extern "C" int r4d_shape_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, int 
     R4D_PICK(l);
 }
 
+/* rmsnorm_rope_roundtrip's operands, then kv_store's slot mapping and cache at kv_store's own shapes
+ * (r4d_shape_kv_store: two blocks of slack, no slot repeated) at n_head_kv 1, head_dim n / 2. */
+extern "C" int r4d_shape_rmsnorm_rope_roundtrip_kv_store(const RadParam* p, int n_p, int operand,
+                                                         RadOpdDesc* out) {
+    if (operand < 5) return r4d_shape_rmsnorm_rope_roundtrip(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), bs = pi(p, n_p, "block_size");
+    if (M <= 0 || n < 2 || (n & 1) || bs <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t nb = (M + bs - 1) / bs + 2;
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd_idx(M, 0, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),   /* slot_mapping */
+        opd(dt_act(p, n_p, "kv_dtype"), nb, 1, bs, n),       /* kv_cache */
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_rope_rows_roundtrip(const RadParam* p, int n_p, int operand,
                                              RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), nh = pi(p, n_p, "n_head"), hd = pi(p, n_p, "head_dim");

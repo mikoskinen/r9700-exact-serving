@@ -28,6 +28,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
+#include "r4d_ds41_qrt.h"
 #include "r4d_emit.h"
 #include "r4d_plugin.h"
 
@@ -966,6 +967,22 @@ struct DsAttnArgs {
 
 constexpr int kDsAttnD = 512;
 
+/* attn_sparse_sink_rope_roundtrip (lever K1 fold d): the decode band's kernel with the inverse rope and the
+ * round trip of its output (rope_rows_roundtrip's work) in its epilogue. The rope's angle table and geometry
+ * (rope_rows_body's cos_sin plane, columns [off, off + 2 half) of each 512-wide head, gptj pairs, sign -1 for
+ * inverse) and the round trip's format and scale (quant_roundtrip's, blocks of 32). */
+struct DsOrt {
+    const float* cs;
+    long cp, cst, tab_rows;
+    int off, half, fmt, sc;
+    float sign;
+};
+struct DsAttnArgsOrt : DsAttnArgs {
+    DsOrt o;
+};
+template <bool ORT>
+using DsAttnArgsT = std::conditional_t<ORT, DsAttnArgsOrt, DsAttnArgs>;
+
 /* The bf16 at column d of a packed entry (byte d/2's nibble, block d/16's scale), and the pair at an
  * even d as a word (value d low). */
 __device__ __forceinline__ uint32_t ds_nv4_col(const uint16_t* kk, int d) {
@@ -1642,9 +1659,39 @@ __device__ __forceinline__ void ds_dec_pvsum(float (&acc)[HPT][DPT], float (&den
 }
 
 
-template <int HG, int NT, int DPT, int P, bool PVD, bool NV>
-__global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
+/* attn_sparse_sink_rope_roundtrip's epilogue on one thread's column pair (c0 = dcol, c0 + 1) of a head:
+ * rope_rows_roundtrip's work (rope_rt_kernel, the separate launch) on the pair of bf16 (lo, hi) the plain
+ * kernel stores there, with r4d_ds41_qrt.h's rules:
+ *   - the rope: when the pair is rotated (off <= c0 < off + 2 half, c0 - off even, a gptj pair inside the
+ *     thread) and the row's position is in the table, rope_rows' expressions on the stored values,
+ *     a' = bf16(a c - b s), b' = bf16(a s + b c), c = cs[p][i], s = sign cs[p][half + i], i = (c0 - off) / 2;
+ *   - the round trip: the block's amax over its 32 columns, which are this lane's two and those of the 15
+ *     other lanes of its half-wave (columns 2 cg, cg = tid % 256, so lanes 0-15 and 16-31 each hold one
+ *     32-aligned block), every |v| a NaN-free non-negative float, so fmaxf of the lane's pair then the
+ *     16-lane butterfly is the same maximum as quant_group_kernel's 32-lane butterfly; then block_scale and
+ *     roundtrip of each value, rounded to bf16.
+ * Every lane of the wave calls it (the callers' branches are wave-uniform). */
+__device__ __forceinline__ void ds_ort_pair(uint32_t& lo, uint32_t& hi, bool rot, float c, float sn, int fmt,
+                                            int sc) {
+    namespace q = r4d_ds41q;
+    float v0 = q::ds_bf((uint16_t)lo), v1 = q::ds_bf((uint16_t)hi);
+    if (rot) {
+        const float va = v0, vb = v1;
+        v0 = q::ds_bf(q::ds_bf16(va * c - vb * sn));
+        v1 = q::ds_bf(q::ds_bf16(va * sn + vb * c));
+    }
+    const float amax = r4d_xor_max<16>(fmaxf(q::ds_amax_term(v0), q::ds_amax_term(v1)));
+    const float bs = q::block_scale(amax, fmt, sc);
+    lo = q::ds_bf16(q::roundtrip(v0, bs, fmt));
+    hi = q::ds_bf16(q::roundtrip(v1, bs, fmt));
+}
+
+/* ORT (attn_sparse_sink_rope_roundtrip): the epilogue also runs ds_ort_pair on every stored pair, so the
+ * output is the bytes attn_sparse_sink + rope_rows_roundtrip leave; everything before it is the same code. */
+template <int HG, int NT, int DPT, int P, bool PVD, bool NV, bool ORT = false>
+__global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) {
     static_assert(!NV || DPT == 2, "the packed latent's PV reads a column pair from one code byte");
+    static_assert(!ORT || DPT == 2, "the fused round trip takes a column pair a thread");
     constexpr int D = kDsAttnD, NW = NT / 32, NCG = D / DPT, TK = NT / 64;
     constexpr int NHP = (NT / NCG) < HG ? (NT / NCG) : HG;   /* head parts in PV */
     constexpr int HPT = HG / NHP;                           /* heads a PV thread */
@@ -1940,13 +1987,26 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgs a) {
     lds_barrier();
     if (pvt) {
         uint16_t* orow = a.out + m * a.outr + (long)hg0 * D + dcol;
+        [[maybe_unused]] bool orot = false;
+        [[maybe_unused]] float oc = 0.0f, osn = 0.0f;
+        if constexpr (ORT) {   /* rope_rt_kernel's pair test and angles, for this thread's pair */
+            const long p = a.pos[m * a.ps];
+            const int d0 = dcol - a.o.off;
+            orot = d0 >= 0 && d0 < 2 * a.o.half && p >= 0 && p < a.o.tab_rows;
+            if (orot) {
+                const int i = d0 >> 1;
+                oc = a.o.cs[p * a.o.cp + (long)i * a.o.cst];
+                osn = a.o.sign * a.o.cs[p * a.o.cp + (long)(a.o.half + i) * a.o.cst];
+            }
+        }
 #pragma unroll
         for (int j = 0; j < HPT; ++j) {
             const int h = hp * HPT + j;
             if (h >= hmax) break;
             const float dn = sden[h];
             if constexpr (DPT == 2) {
-                const uint32_t lo = ds_bf16_bits(acc[j][0] / dn), hi = ds_bf16_bits(acc[j][DPT - 1] / dn);
+                [[maybe_unused]] uint32_t lo = ds_bf16_bits(acc[j][0] / dn), hi = ds_bf16_bits(acc[j][DPT - 1] / dn);
+                if constexpr (ORT) ds_ort_pair(lo, hi, orot, oc, osn, a.o.fmt, a.o.sc);
                 *(uint32_t*)(orow + (long)h * D) = lo | (hi << 16);
             } else {
                 orow[(long)h * D] = (uint16_t)ds_bf16_bits(acc[j][0] / dn);
@@ -2681,15 +2741,15 @@ int attn_emit(RadStream stream, const DsAttnArgs& s, unsigned gz) {
     return R4D_EMIT(stream, (ds41_attn_sparse_sink_kernel<HG, DS>), grid, dim3(256), lds, s);
 }
 
-template <int HG, int NT, int DPT, bool PVD>
-int attn_dec_go(RadStream stream, const DsAttnArgs& s) {
+template <int HG, int NT, int DPT, bool PVD, bool ORT = false>
+int attn_dec_go(RadStream stream, const DsAttnArgsT<ORT>& s) {
     constexpr int P = 4;                                /* key tiles in flight in PV */
     const int nkq = (s.nk + 31) / 32 * 32;
     const long lds = ds_dec_lds(nkq, HG, PVD ? 0 : NT, s.cnv && ds_dec_nvt(HG, NT, DPT, PVD, true)).total;
     if (lds > 65536) return RAD_E_UNSUPPORTED;
     const dim3 grid((unsigned)((s.H + HG - 1) / HG), (unsigned)s.M);
-    if (s.cnv) return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, true>), grid, dim3(NT), (uint32_t)lds, s);
-    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, false>), grid, dim3(NT), (uint32_t)lds, s);
+    if (s.cnv) return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, true, ORT>), grid, dim3(NT), (uint32_t)lds, s);
+    return R4D_EMIT(stream, (ds41_attn_dec_kernel<HG, NT, DPT, P, PVD, false, ORT>), grid, dim3(NT), (uint32_t)lds, s);
 }
 
 /* The decode band's kernel. The form by how many (row, head) pairs the pass has, any choice giving
@@ -2719,22 +2779,25 @@ int ds_nvform() {
     return f;
 }
 
-int attn_dec_emit(RadStream stream, const DsAttnArgs& s) {
+/* ORT (attn_sparse_sink_rope_roundtrip): the same forms with the fused epilogue; the knob's packed-only forms
+ * 7-9 are not instantiated with it (the rule serves those requests). */
+template <bool ORT = false>
+int attn_dec_emit(RadStream stream, const DsAttnArgsT<ORT>& s) {
     if (s.M > 65535 || (s.H + 0L) > 65535L * 8) return RAD_E_UNSUPPORTED;
     const long hr = (long)s.M * s.H;
     if (s.cnv && ds_nvform() >= 0) {
         int rc = RAD_E_UNSUPPORTED;
         switch (ds_nvform()) {
-            case 0: rc = attn_dec_go<1, 1024, 2, true>(stream, s); break;
-            case 1: rc = attn_dec_go<2, 1024, 2, true>(stream, s); break;
-            case 2: rc = attn_dec_go<4, 1024, 2, true>(stream, s); break;
-            case 3: rc = attn_dec_go<8, 1024, 2, true>(stream, s); break;
-            case 4: rc = attn_dec_go<8, 512, 2, false>(stream, s); break;
-            case 5: rc = attn_dec_go<4, 512, 2, false>(stream, s); break;
-            case 6: rc = attn_dec_go<2, 512, 2, false>(stream, s); break;
-            case 7: rc = attn_dec_go_nv<1, 512, 2, false>(stream, s); break;
-            case 8: rc = attn_dec_go_nv<4, 512, 2, true>(stream, s); break;
-            case 9: rc = attn_dec_go_nv<2, 512, 2, true>(stream, s); break;
+            case 0: rc = attn_dec_go<1, 1024, 2, true, ORT>(stream, s); break;
+            case 1: rc = attn_dec_go<2, 1024, 2, true, ORT>(stream, s); break;
+            case 2: rc = attn_dec_go<4, 1024, 2, true, ORT>(stream, s); break;
+            case 3: rc = attn_dec_go<8, 1024, 2, true, ORT>(stream, s); break;
+            case 4: rc = attn_dec_go<8, 512, 2, false, ORT>(stream, s); break;
+            case 5: rc = attn_dec_go<4, 512, 2, false, ORT>(stream, s); break;
+            case 6: rc = attn_dec_go<2, 512, 2, false, ORT>(stream, s); break;
+            case 7: if constexpr (!ORT) rc = attn_dec_go_nv<1, 512, 2, false>(stream, s); break;
+            case 8: if constexpr (!ORT) rc = attn_dec_go_nv<4, 512, 2, true>(stream, s); break;
+            case 9: if constexpr (!ORT) rc = attn_dec_go_nv<2, 512, 2, true>(stream, s); break;
             default: break;
         }
         if (rc != RAD_E_UNSUPPORTED) return rc;
@@ -2744,13 +2807,13 @@ int attn_dec_emit(RadStream stream, const DsAttnArgs& s) {
     while (c >= 0) {
         int rc = RAD_E_UNSUPPORTED;
         switch (c) {
-            case 0: rc = attn_dec_go<1, 1024, 2, true>(stream, s); break;
-            case 1: rc = attn_dec_go<2, 1024, 2, true>(stream, s); break;
-            case 2: rc = attn_dec_go<4, 1024, 2, true>(stream, s); break;
-            case 3: rc = attn_dec_go<8, 1024, 2, true>(stream, s); break;
-            case 4: rc = attn_dec_go<8, 512, 2, false>(stream, s); break;
-            case 5: rc = attn_dec_go<4, 512, 2, false>(stream, s); break;
-            case 6: rc = attn_dec_go<2, 512, 2, false>(stream, s); break;
+            case 0: rc = attn_dec_go<1, 1024, 2, true, ORT>(stream, s); break;
+            case 1: rc = attn_dec_go<2, 1024, 2, true, ORT>(stream, s); break;
+            case 2: rc = attn_dec_go<4, 1024, 2, true, ORT>(stream, s); break;
+            case 3: rc = attn_dec_go<8, 1024, 2, true, ORT>(stream, s); break;
+            case 4: rc = attn_dec_go<8, 512, 2, false, ORT>(stream, s); break;
+            case 5: rc = attn_dec_go<4, 512, 2, false, ORT>(stream, s); break;
+            case 6: rc = attn_dec_go<2, 512, 2, false, ORT>(stream, s); break;
             default: break;
         }
         if (rc != RAD_E_UNSUPPORTED) return rc;
@@ -2759,7 +2822,8 @@ int attn_dec_emit(RadStream stream, const DsAttnArgs& s) {
     return RAD_E_UNSUPPORTED;
 }
 
-int attn_body(const RadArgs* a, RadStream stream) {
+/* attn_sparse_sink's checks and arguments (the launch below; attn_sparse_sink_rope_roundtrip's too). */
+int attn_setup(const RadArgs* a, DsAttnArgs* res) {
     /* Operands 4-6 are optional (null without a compressed source), as in libref. */
     if (!a || a->n_t < 11 || !a->t) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2], &wused = a->t[3];
@@ -2848,6 +2912,19 @@ int attn_body(const RadArgs* a, RadStream stream) {
     s.nk = (int)(win + (comp ? topk : 0));
     s.nkp = (s.nk + 3) / 4 * 4;
     s.scale = scale;
+    *res = s;
+    return RAD_OK;
+}
+
+int attn_body(const RadArgs* a, RadStream stream) {
+    DsAttnArgs s{};
+    {
+        const int rc = attn_setup(a, &s);
+        if (rc != RAD_OK) return rc;
+    }
+    const long long H = s.H;
+    const float scale = s.scale;
+    const RadTensor &q = a->t[0], &out = a->t[10];
     /* Prefill heights on WMMA (16-byte q and out rows); the decode band on the scalar kernels
      * below (libref's bits). */
     {
@@ -2866,7 +2943,7 @@ int attn_body(const RadArgs* a, RadStream stream) {
      * in the same order, so the bits do not depend on it. */
     const long rows = s.M;
     if (rows <= kWmRows) {
-        const int rc = attn_dec_emit(stream, s);
+        const int rc = attn_dec_emit<false>(stream, s);
         if (rc != RAD_E_UNSUPPORTED) return rc;
     }
     int HG = 8, DS = 1;
@@ -2885,6 +2962,80 @@ int attn_body(const RadArgs* a, RadStream stream) {
         case 2: return attn_emit<2, 1>(stream, s, gz);
         default: return attn_emit<1, 1>(stream, s, gz);
     }
+}
+
+/* attn_sparse_sink_rope_roundtrip (lever K1 fold d): attn_sparse_sink over operands 0-10, then
+ * rope_rows_roundtrip over its `out` with cos_sin (operand 11) at the attention's positions -- the
+ * attention output's inverse rope and fp8 round trip (DeepSeek-V4.1's o, before wo_a). A pass of at most
+ * kWmRows rows whose geometry the fused epilogue takes (gptj, `off` even so a rotated pair is one thread's
+ * column pair, blocks of 32 = a half-wave of column pairs) runs the decode band's kernel with ds_ort_pair in
+ * its epilogue: one launch, the bytes of the two. Any other pass (prefill heights, another geometry) issues
+ * attn_sparse_sink's launch and then rope_rows_roundtrip's, the two ops themselves. Parameters: the
+ * attention's, then rope_rows' rot / off / mode / inverse (n_head = heads, head_dim = dim) and
+ * quant_roundtrip's block / format, its scale as `block_scale` (`scale` is the attention's). */
+int attn_ort_body(const RadArgs* a, RadStream stream) {
+    namespace q = r4d_ds41q;
+    if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
+    const RadTensor &pos = a->t[7], &out = a->t[10], &cs = a->t[11];
+    const long long H = r4d_geti_or(a, "heads", 0), D = r4d_geti_or(a, "dim", 0);
+    const long long rot = r4d_geti_or(a, "rot", 0), off = r4d_geti_or(a, "off", -1);
+    const long long inv = r4d_geti_or(a, "inverse", -1), block = r4d_geti_or(a, "block", 0);
+    const char* mode = r4d_gets(a, "mode");
+    const char* fs = r4d_gets(a, "format");
+    const char* ss = r4d_gets(a, "block_scale");
+    if (!mode || !fs || !ss) return R4D_NO(RAD_E_UNSUPPORTED);
+    const bool gptj = !std::strcmp(mode, "gptj");
+    if (!gptj && std::strcmp(mode, "neox")) return R4D_NO(RAD_E_UNSUPPORTED);
+    int fmt, sc;   /* quant_rt_body's names */
+    if (!std::strcmp(fs, "fp8_e4m3")) fmt = q::kFp8;
+    else if (!std::strcmp(fs, "fp4_e2m1")) fmt = q::kFp4;
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+    if (!std::strcmp(ss, "ue8m0")) sc = q::kUe8m0;
+    else if (!std::strcmp(ss, "e4m3") && fmt == q::kFp4) sc = q::kE4m3;
+    else if (!std::strcmp(ss, "f32") && fmt == q::kFp8) sc = q::kScaleF32;
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+    if (H < 1 || D < 2 || rot < 2 || (rot & 1) || off < 0 || off + rot > D || (inv != 0 && inv != 1) ||
+        block < 1 || (H * D) % block)
+        return R4D_NO(RAD_E_SHAPE);
+    /* rope_rows_body's angle plane */
+    if (!cs.data || !pos.data || !out.data || cs.dtype != RAD_F32 || cs.rank != 2 || cs.shape[1] != rot ||
+        out.rank != 2)
+        return R4D_NO(RAD_E_SHAPE);
+    if (out.shape[0] <= kWmRows && gptj && !(off & 1) && block == 32) {
+        DsAttnArgs s{};
+        const int rc = attn_setup(a, &s);
+        if (rc != RAD_OK) return rc;
+        DsAttnArgsOrt so{};
+        static_cast<DsAttnArgs&>(so) = s;
+        so.o.cs = (const float*)cs.data;
+        so.o.cp = (long)cs.stride[0];
+        so.o.cst = (long)cs.stride[1];
+        so.o.tab_rows = (long)cs.shape[0];
+        so.o.off = (int)off;
+        so.o.half = (int)(rot / 2);
+        so.o.fmt = fmt;
+        so.o.sc = sc;
+        so.o.sign = inv ? -1.0f : 1.0f;
+        const int rc2 = attn_dec_emit<true>(stream, so);
+        if (rc2 != RAD_E_UNSUPPORTED) return rc2;
+    }
+    /* the two launches: attn_sparse_sink, then rope_rows_roundtrip over out at its own parameters */
+    {
+        const int rc = attn_body(a, stream);
+        if (rc != RAD_OK) return rc;
+    }
+    auto pint = [](const char* k, long long v) { RadParam r{}; r.key = k; r.kind = RAD_P_INT; r.ival = v; return r; };
+    auto pstr = [](const char* k, const char* v) { RadParam r{}; r.key = k; r.kind = RAD_P_STR; r.sval = v; return r; };
+    RadParam pp[] = { pint("M", out.shape[0]), pint("n_head", H), pint("head_dim", D), pint("rot", rot),
+                      pint("off", off), pstr("mode", mode), pint("inverse", inv), pint("block", block),
+                      pstr("format", fs), pstr("scale", ss), pstr("dtype", "bf16") };
+    RadTensor tt[3] = { out, cs, pos };
+    RadArgs ra = *a;
+    ra.t = tt;
+    ra.n_t = 3;
+    ra.p = pp;
+    ra.n_p = (int)(sizeof(pp) / sizeof(pp[0]));
+    return r4d_rad_rope_rows_roundtrip(&ra, stream);
 }
 
 }  // namespace
@@ -2951,4 +3102,7 @@ extern "C" int64_t r4d_rad_ds41_index_topk_scratch(const RadArgs* a) {
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream) {
     return attn_body(a, stream);
+}
+extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs* a, RadStream stream) {
+    return attn_ort_body(a, stream);
 }
