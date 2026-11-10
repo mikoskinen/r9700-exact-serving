@@ -93,6 +93,17 @@ struct GgMrArgs {
     int NS;                              /* stages a row (the last may be partial) */
     int SS;                              /* stages a slab */
     int x_al;
+    /* Lever K1 folds a / e (PRO > 0, r4d_gg_mr_fold): the activation's producer computed in the staging, from its own
+     * input in `x` (PRO 1: rmsnorm's x [M, K]; PRO 2: swiglu_clamped's gate_up [M, 2K], the up half at x + K), each
+     * value rounded to bf16 as the producer stores it and widened as gg_x8 widens a stored bf16; block column 0 also
+     * writes those bf16 to `h` (h_ld elements a row), the producer's own output. */
+    const float* g;                      /* PRO 1: rmsnorm's f32 gain [K] */
+    float eps, wadd, mult;               /* PRO 1: rmsnorm's scalars as its launch reads them */
+    int nw;                              /* PRO 1: the waves of rmsnorm's workgroup a row (r4d_act_threads(M, K) / 32) */
+    float limit;                         /* PRO 2: swiglu_clamped's limit */
+    uint16_t* h;
+    long long h_ld;
+    int h_al, u_al;                      /* 16-byte aligned rows of h / of gate_up's up half */
 };
 
 /* ------------------------------------------------------------------ weight words
@@ -148,10 +159,57 @@ __device__ __forceinline__ void mr_piece(int k, int& U, int& G) {
     }
 }
 
+/* The eight bf16 a fold's producer stores at columns k .. k + 7 of row `row`, and the same values widened (exact), as
+ * the GEMM would read them back from the producer's output. Each value is the producer's own expression:
+ *   PRO 1  rmsnorm_body (r4d_model_bf16.hip): f32_to_bf16(act_f32(x) * s * (g + wadd) * mult), s the row's
+ *          rsqrtf(sum / n + eps) (mr_norm_scales), g the f32 gain;
+ *   PRO 2  swiglu_clamped_kernel (r4d_glm.hip): g = fminf(gate, limit), u = fminf(fmaxf(up, -limit), limit),
+ *          f32_to_bf16((g / (1.0f + expf(-g))) * u).
+ * Every unit is compiled -ffp-contract=off, so each product and sum rounds on its own here as there. */
+template <int PRO>
+__device__ __forceinline__ void mr_produce(const GgMrArgs& A, int row, int k, float sc, uint16_t* hb, float* v) {
+    const uint16_t* xr = A.x + (long long)row * A.x_ld;
+    uint32_t q[4];
+    gg_x8raw(xr + k, A.x_al != 0, q);
+    if constexpr (PRO == 1) {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const float x = (t & 1) ? bf16w_hi(q[t >> 1]) : bf16w_lo(q[t >> 1]);
+            hb[t] = f32_to_bf16(x * sc * (A.g[k + t] + A.wadd) * A.mult);
+        }
+    } else {
+        uint32_t u[4];
+        gg_x8raw(xr + A.K + k, A.u_al != 0, u);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const float g = fminf((t & 1) ? bf16w_hi(q[t >> 1]) : bf16w_lo(q[t >> 1]), A.limit);
+            const float uu = fminf(fmaxf((t & 1) ? bf16w_hi(u[t >> 1]) : bf16w_lo(u[t >> 1]), -A.limit), A.limit);
+            hb[t] = f32_to_bf16((g / (1.0f + expf(-g))) * uu);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < 8; ++t) v[t] = bf16_to_f32(hb[t]);
+}
+/* Block column 0's copy of a produced octet into the producer's output row. */
+__device__ __forceinline__ void mr_put_h(const GgMrArgs& A, int row, int k, const uint16_t* hb) {
+    uint16_t* d = A.h + (long long)row * A.h_ld + k;
+    if (A.h_al) {
+        r4d_u32x4 t;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) t[i] = (uint32_t)hb[2 * i] | ((uint32_t)hb[2 * i + 1] << 16);
+        *(r4d_u32x4*)(void*)d = t;
+    } else {
+#pragma unroll
+        for (int t = 0; t < 8; ++t) d[t] = hb[t];
+    }
+}
+
 /* Stages [s0, s1) of activation rows m0 .. m0 + MT - 1 (rows from mc on, and values past K, as zeros) into the
- * slab: [stage][row][group][half][lane][4] f32, VPS floats a stage a row. */
-template <int T, int H, int MT>
-__device__ __forceinline__ void mr_stage(const GgMrArgs& A, float* xs, int m0, int mc, int s0, int s1) {
+ * slab: [stage][row][group][half][lane][4] f32, VPS floats a stage a row. PRO > 0: the producer's values
+ * (mr_produce, `sc` the rows' norm scales under PRO 1), and block column 0 writes them to h as well. */
+template <int T, int H, int MT, int PRO = 0>
+__device__ __forceinline__ void mr_stage(const GgMrArgs& A, float* xs, int m0, int mc, int s0, int s1,
+                                         const float* sc = nullptr) {
     constexpr int LPR = 32 / H, VPS = 32 * LPR, PPS = VPS / 8;
     const int np = (s1 - s0) * MT * PPS;
     for (int idx = (int)threadIdx.x; idx < np; idx += (int)blockDim.x) {
@@ -160,7 +218,13 @@ __device__ __forceinline__ void mr_stage(const GgMrArgs& A, float* xs, int m0, i
         const int s = s0 + ss, k = s * VPS + 8 * q;
         float v[8];
         if (m < mc && k < A.K) {
-            gg_x8(A.x + (long long)(m0 + m) * A.x_ld + k, A.x_al != 0, v);
+            if constexpr (PRO == 0) {
+                gg_x8(A.x + (long long)(m0 + m) * A.x_ld + k, A.x_al != 0, v);
+            } else {
+                uint16_t hb[8];
+                mr_produce<PRO>(A, m0 + m, k, PRO == 1 ? sc[m] : 0.0f, hb, v);
+                if (blockIdx.x == 0) mr_put_h(A, m0 + m, k, hb);
+            }
         } else {
 #pragma unroll
             for (int t = 0; t < 8; ++t) v[t] = 0.0f;
@@ -208,7 +272,39 @@ __device__ __forceinline__ float mr_reduce(const float (&a)[H]) {
 template <int MT, int R>
 constexpr int mr_pd() { return MT * R >= 24 ? 1 : (MT * R >= 8 ? 2 : 4); }
 
-template <int T, int H, int R, int MT, typename OT>
+/* PRO 1 (lever K1 fold a): the norm scale of each of the block's rows, rmsnorm_body's (r4d_model_bf16.hip) to the
+ * bit. There a row's workgroup sums squares over kR4dSumLanes' partition (r4d_lanes_sumsq: lane v < 256 adds
+ * columns v, v + 256, ... in order from 0), block_sum adds each wave's r4d_wave_sum in wave order from 0 (the waves
+ * past the eighth add their zero sums: `nw` waves in all at r4d_act_threads(M, n)), then s = rsqrtf(sum / n +
+ * eps). Here the eight waves of that partition are virtual: this block's waves take them (and the rows) in turn,
+ * each lane its partition lane's columns in the same order, the same butterfly on the same 32 values, and one
+ * thread a row adds the eight sums in order, then nw - 8 zeros, then takes rsqrtf. */
+template <int MT>
+__device__ __forceinline__ void mr_norm_scales(const GgMrArgs& A, int m0, int mc, float (&ws)[MT][8], float* sc) {
+    const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5, nw = (int)blockDim.x >> 5;
+    for (int pv = wave; pv < mc * 8; pv += nw) {
+        const int m = pv >> 3, vw = pv & 7;
+        const uint16_t* xr = A.x + (long long)(m0 + m) * A.x_ld;
+        float ss = 0.0f;
+        for (int c = vw * 32 + lane; c < A.K; c += 256) {
+            const float v = bf16_to_f32(xr[c]);
+            ss += v * v;
+        }
+        ss = r4d_wave_sum(ss);
+        if (lane == 0) ws[m][vw] = ss;
+    }
+    lds_barrier();
+    for (int m = (int)threadIdx.x; m < mc; m += (int)blockDim.x) {
+        float t = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) t += ws[m][w];
+        for (int w = 8; w < A.nw; ++w) t += 0.0f;
+        sc[m] = rsqrtf(t / (float)A.K + A.eps);
+    }
+    lds_barrier();
+}
+
+template <int T, int H, int R, int MT, typename OT, int PRO = 0>
 __global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
     using Q = Gg<T>;
     static_assert(H == 1 || H == 2 || H == 4 || H == 8, "row slots a wave");
@@ -296,10 +392,20 @@ __global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
         rotate();
     };
 
+    /* fold a: the rows' norm scales before the first slab (the first stages' weight loads are in flight). Static LDS
+     * only in the fold's kernels (r4d_gg_mr_fold leaves room for it); the plain form keeps all 64 KiB for its slab. */
+    const float* sc = nullptr;
+    if constexpr (PRO == 1) {
+        __shared__ float mr_sc[MT];
+        __shared__ float mr_ws[MT][8];
+        mr_norm_scales<MT>(A, m0, mc, mr_ws, mr_sc);
+        sc = mr_sc;
+    }
+
     for (int s0 = 0; s0 < A.NS; s0 += A.SS) {
         const int s1 = min(s0 + A.SS, A.NS);
         lds_barrier();
-        mr_stage<T, H, MT>(A, xs, m0, mc, s0, s1);
+        mr_stage<T, H, MT, PRO>(A, xs, m0, mc, s0, s1, sc);
         lds_barrier();
         /* groups of PD stages from a multiple of PD, so stage s is raw[s % PD] whatever the slab's start */
 #pragma unroll 1
@@ -478,6 +584,25 @@ bool mr_pick(const R4dGgMrCall& c, MrForm* f) {
     return true;
 }
 
+/* Lever K1 folds (PRO 1 rmsnorm, 2 swiglu_clamped): the same forms, bf16 out, q5_K / q6_K / q8_0. */
+template <int T, int PRO>
+int mr_launch_fold_t(RadStream s, int H, int R, int MT, const GgMrArgs& A, dim3 grid, unsigned thr, unsigned lds) {
+#define MR_CASE(h, r, mt)                                                                                  \
+    if (H == h && R == r && MT == mt) return R4D_EMIT(s, (gg_mr_kernel<T, h, r, mt, uint16_t, PRO>), grid, dim3(thr), lds, A);
+    MR_FORMS(MR_CASE)
+#undef MR_CASE
+    return R4D_GG_MR_DECLINE;
+}
+template <int PRO>
+int mr_launch_fold(RadStream s, int ty, int H, int R, int MT, const GgMrArgs& A, dim3 grid, unsigned thr, unsigned lds) {
+    switch (ty) {
+    case GG_Q5_K: return mr_launch_fold_t<GG_Q5_K, PRO>(s, H, R, MT, A, grid, thr, lds);
+    case GG_Q6_K: return mr_launch_fold_t<GG_Q6_K, PRO>(s, H, R, MT, A, grid, thr, lds);
+    case GG_Q8_0: return mr_launch_fold_t<GG_Q8_0, PRO>(s, H, R, MT, A, grid, thr, lds);
+    default: return R4D_GG_MR_DECLINE;
+    }
+}
+
 }  // namespace
 
 #ifndef R4D_EMU_HOST
@@ -512,6 +637,46 @@ int r4d_gg_mr_gemm(RadStream s, const R4dGgMrCall& c) {
                                     f.lds);
 #endif
     return mr_launch(s, c.ty, c.f32out, f.H, f.R, f.MT, A, dim3((unsigned)f.gx, (unsigned)f.gy), 32u * f.WN, f.lds);
+}
+
+/* Lever K1 folds a / e: the form (mr_pick's, as r4d_gg_mr_gemm takes it) with the activation's producer in its
+ * staging (gg_mr_kernel's PRO, mr_produce): y = gemm_nt_ggml(producer(x)), and the producer's bf16 output in h,
+ * the bytes of the two separate launches. Declined (R4D_GG_MR_DECLINE: the caller issues the two launches) where
+ * r4d_gg_mr_gemm would decline, for f32 out, a wave64 pin, and where the fold's static LDS (fold a: 36 bytes a
+ * row) does not fit beside the slab after shrinking it (SS only groups stages between barriers: the arithmetic of
+ * an output is the same at any SS). The caller decides whether the form is on (r4d_gg_mr_on). */
+int r4d_gg_mr_fold(RadStream s, const R4dGgMrCall& c, const R4dGgMrFold& fo) {
+    if (fo.pro != 1 && fo.pro != 2) return R4D_GG_MR_DECLINE;
+    if (c.f32out || !fo.h || (fo.pro == 1 && !fo.g)) return R4D_GG_MR_DECLINE;
+    if (c.ty != GG_Q5_K && c.ty != GG_Q6_K && c.ty != GG_Q8_0) return R4D_GG_MR_DECLINE;
+    if (c.M < 1 || c.M > kMrMaxM || c.N < 1 || c.K < 1 || (c.K & 7)) return R4D_GG_MR_DECLINE;
+    if (c.ty == GG_Q5_K && ((uintptr_t)c.w & 3u)) return R4D_GG_MR_DECLINE;
+    MrForm f{};
+    if (!mr_pick(c, &f) || f.w64) return R4D_GG_MR_DECLINE;
+    const unsigned stat = fo.pro == 1 ? (unsigned)(f.MT * 4 * 9) : 0u;
+    if (f.lds + stat > 65536u) {
+        const unsigned sb = f.lds / (unsigned)f.SS;
+        const unsigned ss = (65536u - stat) / sb;
+        if (ss < 1) return R4D_GG_MR_DECLINE;
+        f.SS = (int)ss;
+        f.lds = ss * sb;
+    }
+    GgMrArgs A{};
+    A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.w_ld = c.w_ld; A.y = c.y; A.y_ld = c.y_ld;
+    A.M = c.M; A.N = c.N; A.K = c.K;
+    const int Q = c.ty == GG_Q8_0 ? 32 : 256, UPB = c.ty == GG_Q8_0 ? 1 : 8;
+    A.UK = c.K / Q * UPB;
+    A.NS = (A.UK + 32 / f.H - 1) / (32 / f.H);
+    A.SS = f.SS;
+    A.x_al = c.x_al;
+    A.g = fo.g; A.eps = fo.eps; A.wadd = fo.wadd; A.mult = fo.mult; A.nw = fo.nw;
+    A.limit = fo.limit;
+    A.h = fo.h; A.h_ld = fo.h_ld; A.h_al = fo.h_al; A.u_al = fo.u_al;
+    std::snprintf(g_mr_last, sizeof g_mr_last, "fold%d H%d R%d MT%d WN%d SS%d grid %dx%d lds %u", fo.pro, f.H, f.R, f.MT,
+                  f.WN, f.SS, f.gx, f.gy, f.lds);
+    const dim3 grid((unsigned)f.gx, (unsigned)f.gy);
+    return fo.pro == 1 ? mr_launch_fold<1>(s, c.ty, f.H, f.R, f.MT, A, grid, 32u * f.WN, f.lds)
+                       : mr_launch_fold<2>(s, c.ty, f.H, f.R, f.MT, A, grid, 32u * f.WN, f.lds);
 }
 
 /* r4d_gg_mr_pin (bench / test hook, r4d_selftest --mrcheck / --perfmr): h 0 clears the pin (the runtime switch

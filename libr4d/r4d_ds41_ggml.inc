@@ -99,6 +99,26 @@ static const RadConstraint cDs41GgEmbed32[] = {
     C_GE("M", 1), C_GE("n_vocab", 1), C_GE("n_embd", 32), C_DIV("n_embd", 32),
     C_IN("type", R4D_DS41_GG_T32), C_IN("dtype", "bf16"),
 };
+/* Lever K1 folds a / e (rmsnorm_gemm_nt_ggml, swiglu_clamped_gemm_nt_ggml): the GGUF weight is operand 1, as
+ * gemm_nt_ggml's, so its layout hooks (operand 1 only) relayout it into the same stored form. Any M (the decode
+ * band folds while lever D2's form is on; the rest issues the two launches); the types the form reads. */
+static const RadParamSpec pDs41NormGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("type"), P_STR("dtype"),
+    P_F64("eps"), P_F64O("wadd"), P_F64O("mult") };
+static const RadOperandSpec oDs41NormGemmGgml[] = {
+    { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "g", RAD_OPD_WEIGHT, 0 }, { "h", RAD_OPD_OUT, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pDs41SwiGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("type"), P_STR("dtype"),
+    P_F64("limit") };
+static const RadOperandSpec oDs41SwiGemmGgml[] = {
+    { "gate_up", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "h", RAD_OPD_OUT, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadConstraint cDs41GgFold256[] = {
+    C_GE("M", 1), C_GE("N", 1), C_GE("K", 256), C_DIV("K", 256), C_IN("type", "q5_K q6_K"), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cDs41GgFold32[] = {
+    C_GE("M", 1), C_GE("N", 1), C_GE("K", 32), C_DIV("K", 32), C_IN("type", "q8_0"), C_IN("dtype", "bf16"),
+};
 #undef R4D_DS41_GG_T256
 #undef R4D_DS41_GG_T32
 
@@ -117,6 +137,12 @@ SCHEMA("moe_gemm_ggml", pDs41MoeGemmGgml, oDs41MoeGemmGgml,
 SCHEMA("logits_gemm_ggml", pDs41LogitsGgml, oDs41LogitsGgml,
        "logits_gemm with lm_head in llama.cpp's blocks of GGUF type `type`, read as gemm_nt_ggml reads its "
        "weight: logits[M, n_vocab] (f32) = x[M, n_embd] . lm_head^T."),
+SCHEMA("rmsnorm_gemm_nt_ggml", pDs41NormGemmGgml, oDs41NormGemmGgml,
+       "rmsnorm (x, g -> h; eps, wadd, mult as rmsnorm reads them) then gemm_nt_ggml (h, w -> y; type, N, K): h and "
+       "y as the two ops leave them. A query's norm and its up-projection (DeepSeek-V4.1's q_a_norm and q_b)."),
+SCHEMA("swiglu_clamped_gemm_nt_ggml", pDs41SwiGemmGgml, oDs41SwiGemmGgml,
+       "swiglu_clamped (gate_up [M, 2K] -> h [M, K]; limit) then gemm_nt_ggml (h, w -> y; type, N, K): h and y as "
+       "the two ops leave them. A clamped SwiGLU and its down projection (DeepSeek-V4.1's shared expert)."),
 SCHEMA("embed_lookup_ggml", pDs41EmbedGgml, oDs41EmbedGgml,
        "embed_lookup from a table in llama.cpp's blocks of GGUF type `type`: the id's row dequantised as "
        "llama.cpp does, times `mult` when given, rounded once. Padding, bounds and vocab_offset behave as "
@@ -219,6 +245,36 @@ SCHEMA("embed_lookup_ggml", pDs41EmbedGgml, oDs41EmbedGgml,
   "i32 tokens, bf16 x; q8_0 or iq4_nl table (or the f32 logical form)",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgEmbed32), NOTUNE,
   nullptr, nullptr, r4d_rad_embed_lookup_ggml, nullptr, R4D_DS41_GG_HOOKS(r4d_shape_embed_lookup_ggml) },
+
+/* Lever K1 folds a / e: one launch in the decode band while lever D2's form is on (the form's kernel with the
+ * producer in its staging), else the producer's launch and gemm_nt_ggml's (r4d_ds41_ggml.hip). */
+{ "rmsnorm_gemm_nt_ggml_qk256", "rmsnorm_gemm_nt_ggml", "gemm",
+  "rmsnorm then gemm_nt_ggml: in the decode band under lever D2's form one launch, each block summing its rows' "
+  "squares in rmsnorm's partition and staging the normed bf16 values (block column 0 also stores h); else the "
+  "two launches",
+  "any M, N; K a multiple of 256; q5_K or q6_K", "bf16 x, h and y, f32 (or bf16, two launches) gain",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgFold256), NOTUNE,
+  nullptr, nullptr, r4d_rad_rmsnorm_gemm_nt_ggml, nullptr, R4D_DS41_GG_HOOKS(r4d_shape_rmsnorm_gemm_nt_ggml),
+  r4d_fuse_rmsnorm_gemm_nt_ggml },
+{ "rmsnorm_gemm_nt_ggml_qk32", "rmsnorm_gemm_nt_ggml", "gemm",
+  "rmsnorm_gemm_nt_ggml_qk256 over q8_0 blocks", "any M, N; K a multiple of 32; q8_0",
+  "bf16 x, h and y, f32 (or bf16, two launches) gain",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgFold32), NOTUNE,
+  nullptr, nullptr, r4d_rad_rmsnorm_gemm_nt_ggml, nullptr, R4D_DS41_GG_HOOKS(r4d_shape_rmsnorm_gemm_nt_ggml),
+  r4d_fuse_rmsnorm_gemm_nt_ggml },
+{ "swiglu_clamped_gemm_nt_ggml_qk256", "swiglu_clamped_gemm_nt_ggml", "gemm",
+  "swiglu_clamped then gemm_nt_ggml: in the decode band under lever D2's form one launch staging the clamped "
+  "product's bf16 values (block column 0 also stores h); else the two launches",
+  "any M up to 65535, N; K a multiple of 256; q5_K or q6_K; positive finite limit", "bf16 gate_up, h and y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgFold256), NOTUNE,
+  nullptr, nullptr, r4d_rad_swiglu_clamped_gemm_nt_ggml, nullptr,
+  R4D_DS41_GG_HOOKS(r4d_shape_swiglu_clamped_gemm_nt_ggml), r4d_fuse_swiglu_clamped_gemm_nt_ggml },
+{ "swiglu_clamped_gemm_nt_ggml_qk32", "swiglu_clamped_gemm_nt_ggml", "gemm",
+  "swiglu_clamped_gemm_nt_ggml_qk256 over q8_0 blocks", "any M up to 65535, N; K a multiple of 32; q8_0",
+  "bf16 gate_up, h and y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgFold32), NOTUNE,
+  nullptr, nullptr, r4d_rad_swiglu_clamped_gemm_nt_ggml, nullptr,
+  R4D_DS41_GG_HOOKS(r4d_shape_swiglu_clamped_gemm_nt_ggml), r4d_fuse_swiglu_clamped_gemm_nt_ggml },
 
 #undef R4D_DS41_GG_HOOKS
 #endif  /* R4D_HAVE_GGML */

@@ -35,4 +35,24 @@ int r4d_gg_mr_gemm(RadStream s, const R4dGgMrCall& c);
 /* The on/off state the runtime switch sets (0 off, 1 the form's rule); a pin overrides it. */
 void r4d_gg_mr_set(int on);
 
+/* Lever K1 folds a / e (rmsnorm_gemm_nt_ggml, swiglu_clamped_gemm_nt_ggml): the activation's producer run in the
+ * form's staging. The call's x is the producer's input: pro 1 rmsnorm's x [M, K] (gain g [K] f32, eps, wadd, mult,
+ * nw = the waves of rmsnorm's workgroup a row at this M, r4d_act_threads(M, K) / 32); pro 2 swiglu_clamped's gate_up
+ * [M, 2K] (limit; u_al: the up half's rows 16-byte aligned). h [M, K] bf16 (h_ld elements a row, h_al: 16-byte
+ * aligned rows) receives the producer's output, the GEMM reads its values: y and h are the bytes of the producer's
+ * launch then gemm_nt_ggml's. */
+struct R4dGgMrFold {
+    int pro;
+    const float* g;
+    float eps, wadd, mult;
+    int nw;
+    float limit;
+    uint16_t* h;
+    long long h_ld;
+    int h_al, u_al;
+};
+/* RAD_OK, a launch failure, or R4D_GG_MR_DECLINE (the caller issues the producer and gemm_nt_ggml). Does not read
+ * the runtime switch: the caller does (r4d_gg_mr_on). */
+int r4d_gg_mr_fold(RadStream s, const R4dGgMrCall& c, const R4dGgMrFold& f);
+
 #endif

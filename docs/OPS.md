@@ -809,6 +809,8 @@ may not have arrived.
 | `gemm_nt_q_short` | `M`(range) `N` `K` `group` `dtype` `pb1`/opt `pb2`/opt `split_n`/opt `w_rb`/opt | `a`, `a_scale`?, `b`w, `b_scale`w → `y`; `a_sum`?, `b_ref`w? (the narrow fp8 row with the short-prompt split rule: N <= 512, K <= 5120 and 41..64 rows run unsplit) |
 | `gemm_nt_q_bias` | `M`(range) `N` `K` `group` `dtype` | `a`, `a_scale`, `b`w, `b_scale`w, `bias`w → `y` |
 | `gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y` |
+| `rmsnorm_gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` `eps`:f64 `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w, `g`w → `h`, `y` (device-only: rmsnorm (x, g → h; n = K), then gemm_nt_ggml (h, w → y)) |
+| `swiglu_clamped_gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` `limit`:f64 | `gate_up`, `w`w → `h`, `y` (device-only: swiglu_clamped (gate_up [M, 2K] → h; n = K), then gemm_nt_ggml (h, w → y)) |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
 a transformer already has. `gemm_nt_q`'s `dtype` names the operand combination, so one op covers
@@ -1263,6 +1265,16 @@ rows, as the decode kernel with the inverse rope and the round trip in its epilo
 as the two ops' launches). Both are bit-identical to their chains; DeepSeek-V4.1 declares them beside
 the chains under RADIANCE_DS41_KVFOLD / RADIANCE_DS41_OFOLD and picks per step (the ds41_kvfold /
 ds41_ofold switches).
+
+**`rmsnorm_gemm_nt_ggml`** and **`swiglu_clamped_gemm_nt_ggml`** (device-only) are an activation's producer
+(`rmsnorm`, `swiglu_clamped`) followed by `gemm_nt_ggml` over its output `h`; both outputs are the chain's. libr4d
+serves them in one launch in the decode band (up to 48 rows) while lever D2's multi-row form is on (`gg_gemv` 2):
+the form's kernel computes the producer's values in its activation staging, each rounded to bf16 where the
+producer stores it (the norm's sum of squares in rmsnorm's own partition, kR4dSumLanes), and one block column also
+stores them to `h`. Every other pass (another `gg_gemv` form, prefill heights, a bf16 gain) is the two ops'
+launches. The GGUF weight is operand 1, as `gemm_nt_ggml`'s, so both read one stored form. DeepSeek-V4.1 declares
+them beside the pairs under RADIANCE_DS41_QNFOLD / RADIANCE_DS41_SWFOLD (lever K1 folds a and e) and picks per step
+(the ds41_qnfold / ds41_swfold switches).
 
 | op | params | operands |
 |---|---|---|

@@ -21593,6 +21593,153 @@ static void ds_mr_check(const Plugin& pl, const char* tlist) {
  * shape) pairs; the weight streams from DRAM (rotated copies past 256 MiB, "rot": the mean) or, with --cold MIB,
  * past a flush ("cold": the median). Every form's bytes are compared with the stock rule's. One MRPERF line a
  * (type, shape, M) with every form, then MRSUM (stock rule, stock best, mr best, speedups); MRVERDICT at the end. */
+/* ---- lever K1 folds a / e (10.11.2026): rmsnorm_gemm_nt_ggml and swiglu_clamped_gemm_nt_ggml on the card, against
+ * the rows they fold, byte for byte over both outputs (h, the producer's; y, the GEMM's):
+ *
+ *   rmsnorm_gemm_nt_ggml_qk256 / _qk32           against rmsnorm_bf16 (x, g -> h) then gemm_nt_ggml_qk256_gemv / _qk32_gemv
+ *       (h, w -> y), at q_b's TP4 shape (N 8192, K 1280; q5_K / q6_K, and q8_0 on the qk32 row), eps 1e-20 and 1e-6;
+ *   swiglu_clamped_gemm_nt_ggml_qk256 / _qk32    against swiglu_clamped_bf16 (gate_up -> h; limit 10) then the gemm row,
+ *       at the shared expert's down (N 5120, K 768 on rank 0 and 512 on ranks 1-3; q6_K / q8_0, and q5_K);
+ *
+ * each at M 1..48 (the decode band) and 64 / 130 (prefill heights), under gg_gemv 2 (lever D2's form on: the one-launch
+ * fold, the table's forms and the rule), under pinned forms (H 1 / 2 / 4, R 1 / 2, small MT caps, 1 / 2 / 8 waves: the
+ * norm's virtual waves over fewer real ones), and under gg_gemv 0 (the fold's two launches). Rows of random bf16 with
+ * zeros of both signs, a few huge values and an infinity (the norm's sum past f32), gate / up values past the clamp;
+ * h starts from a sentinel, so a value block column 0 failed to store shows. Info: the pair and the fold back to back
+ * under gg_gemv 2 at M 1 / 6 / 8 / 24 (200 launches each, warm; not a check). */
+static void ds41_ggfold_case(const Plugin& pl, const char* row, int pro) {
+    if (!sel(row)) return;
+    const bool qk32 = std::strstr(row, "_qk32") != nullptr;
+    const std::string name = std::string(row) + (pro == 1 ? " is byte-identical to rmsnorm + gemm_nt_ggml"
+                                                           : " is byte-identical to swiglu_clamped + gemm_nt_ggml");
+    const RadKernelInfo* rf = find(pl, row);
+    const RadKernelInfo* rp = find(pl, pro == 1 ? "rmsnorm_bf16" : "swiglu_clamped_bf16");
+    const RadKernelInfo* rg = find(pl, qk32 ? "gemm_nt_ggml_qk32_gemv" : "gemm_nt_ggml_qk256_gemv");
+    if (!rf || !rp || !rg) { ok(name.c_str(), false, "row absent"); return; }
+    const MrHooks hk = mr_hooks(pl);
+    auto sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
+    if (!hk.pin || !sw) { ok(name.c_str(), false, "r4d_gg_mr_pin / rad_fn4_switch absent"); return; }
+    struct Shp { int64_t N, K; };
+    std::vector<Shp> shapes = pro == 1 ? std::vector<Shp>{ { 8192, 1280 } } : std::vector<Shp>{ { 5120, 768 }, { 5120, 512 } };
+    std::vector<const MrTy*> tys;
+    for (const MrTy& t : kMrTypes)
+        if (qk32 ? t.qk == 32 : t.qk == 256) tys.push_back(&t);
+    std::vector<int64_t> Ms;
+    for (int64_t M = 1; M <= 48; ++M) Ms.push_back(M);
+    Ms.push_back(64); Ms.push_back(130);
+    /* modes: 0 = gg_gemv 2, 1.. = a pin, last = gg_gemv 0 */
+    const MrPin pins[] = { { 1, 1, 4, 1, 0 }, { 2, 2, 6, 2, 0 }, { 4, 1, 8, 0, 0 }, { 4, 2, 3, 8, 0 }, { -1, 0, 0, 0, 0 } };
+    const int n_modes = 2 + (int)(sizeof(pins) / sizeof(pins[0]));
+    long long launches = 0, bad_h = 0, bad_y = 0, rc_bad = 0;
+    std::string first;
+    std::mt19937 rng(pro == 1 ? 7101 : 7102);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_int_distribution<int> pct(0, 999);
+    auto set_mode = [&](int k) {
+        if (k == 0) { hk.pin(0, 0, 0, 0); sw("gg_gemv", 2); }
+        else if (k == n_modes - 1) { hk.pin(0, 0, 0, 0); sw("gg_gemv", 0); }
+        else { sw("gg_gemv", 0); mr_apply(hk, pins[k - 1]); }
+    };
+    auto mode_name = [&](int k) {
+        return k == 0 ? std::string("gg_gemv 2") : k == n_modes - 1 ? std::string("gg_gemv 0") : mr_pin_name(pins[k - 1]);
+    };
+    std::string timing;
+    for (const MrTy* ty : tys)
+        for (const Shp& sh : shapes) {
+            if (sh.K % ty->qk) continue;
+            dfree_all();
+            std::vector<uint8_t> hw;
+            mr_weights(hw, *ty, sh.N, sh.K, 0xC0FFEEull ^ (uint64_t)(sh.N * 7 + sh.K) ^ (uint64_t)pro);
+            const int64_t Mmax = 130, xc = pro == 1 ? sh.K : 2 * sh.K;
+            std::vector<uint16_t> hx((size_t)(Mmax * xc));
+            for (int64_t m = 0; m < Mmax; ++m)
+                for (int64_t k = 0; k < xc; ++k) {
+                    const int c = pct(rng);
+                    const float scale = pro == 2 && (m % 4 == 1) ? 25.0f : pro == 1 && (m % 5 == 2) ? 0.01f : 2.0f;
+                    hx[(size_t)(m * xc + k)] = c < 5 ? 0x0000 : c < 10 ? 0x8000 : rad_f32_to_bf16(nd(rng) * scale);
+                }
+            for (int e = 0; e < 3; ++e) hx[(size_t)(9 * xc + (int64_t)(rng() % xc))] = rad_f32_to_bf16(3.0e30f);
+            hx[(size_t)(13 * xc + (int64_t)(rng() % xc))] = 0x7f80;
+            std::vector<float> g((size_t)sh.K);
+            for (auto& v : g) { const int c = pct(rng); v = c < 20 ? 0.0f : c < 40 ? -0.25f : 0.8f + 0.1f * nd(rng); }
+            const size_t hb = (size_t)(Mmax * sh.K * 2), yb = (size_t)(Mmax * sh.N * 2);
+            void* dw = dalloc(hw.size()); void* dx = dalloc(hx.size() * 2); void* dg = dalloc((size_t)sh.K * 4);
+            void* dhA = dalloc(hb); void* dhB = dalloc(hb); void* dyA = dalloc(yb); void* dyB = dalloc(yb);
+            if (!dw || !dx || !dg || !dhA || !dhB || !dyA || !dyB) { ok(name.c_str(), false, "hipMalloc failed"); sw("gg_gemv", 0); return; }
+            st_memcpy(dw, hw.data(), hw.size(), hipMemcpyHostToDevice);
+            st_memcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(dg, g.data(), (size_t)sh.K * 4, hipMemcpyHostToDevice);
+            const int64_t rb = sh.K / ty->qk * ty->bb;
+            for (const double eps : (pro == 1 ? std::vector<double>{ 1e-20, 1e-6 } : std::vector<double>{ 0.0 }))
+                for (const int64_t M : Ms) {
+                    std::vector<RadParam> pg = { PI("M", M), PI("N", sh.N), PI("K", sh.K), PS("type", ty->name), PS("dtype", "bf16") };
+                    std::vector<RadParam> pf = pg;
+                    std::vector<RadParam> pp;
+                    if (pro == 1) {
+                        pf.push_back(PF("eps", eps));
+                        pp = { PI("M", M), PI("n", sh.K), PF("eps", eps), PS("dtype", "bf16") };
+                    } else {
+                        pf.push_back(PF("limit", 10.0));
+                        pp = { PI("M", M), PI("n", sh.K), PF("limit", 10.0), PS("dtype", "bf16") };
+                    }
+                    auto pair = [&](void* h, void* y) {
+                        int rc = pro == 1
+                                     ? k1_launch(rp, { T(dx, RAD_BF16, { M, sh.K }), T(dg, RAD_F32, { sh.K }), T(h, RAD_BF16, { M, sh.K }) }, pp)
+                                     : k1_launch(rp, { T(dx, RAD_BF16, { M, 2 * sh.K }), T(h, RAD_BF16, { M, sh.K }) }, pp);
+                        if (rc == RAD_OK)
+                            rc = k1_launch(rg, { T(h, RAD_BF16, { M, sh.K }), T(dw, RAD_U8, { sh.N, rb }), T(y, RAD_BF16, { M, sh.N }) }, pg);
+                        return rc;
+                    };
+                    auto fold = [&](void* h, void* y) {
+                        return pro == 1
+                                   ? k1_launch(rf, { T(dx, RAD_BF16, { M, sh.K }), T(dw, RAD_U8, { sh.N, rb }), T(dg, RAD_F32, { sh.K }),
+                                                     T(h, RAD_BF16, { M, sh.K }), T(y, RAD_BF16, { M, sh.N }) }, pf)
+                                   : k1_launch(rf, { T(dx, RAD_BF16, { M, 2 * sh.K }), T(dw, RAD_U8, { sh.N, rb }),
+                                                     T(h, RAD_BF16, { M, sh.K }), T(y, RAD_BF16, { M, sh.N }) }, pf);
+                    };
+                    const size_t mh = (size_t)(M * sh.K * 2), my = (size_t)(M * sh.N * 2);
+                    std::vector<uint8_t> hA(mh), hB(mh), yA(my), yB(my);
+                    for (int k = 0; k < n_modes; ++k) {
+                        set_mode(k);
+                        st_memset(dhA, 0x11, mh); st_memset(dhB, 0x22, mh);
+                        st_memset(dyA, 0x33, my); st_memset(dyB, 0x44, my);
+                        const int ra = pair(dhA, dyA), rbf = fold(dhB, dyB);
+                        ++launches;
+                        if (ra != RAD_OK || rbf != RAD_OK) {
+                            ++rc_bad;
+                            if (first.empty()) first = fmt("%s M=%lld %s: rc pair %d fold %d", ty->name, (long long)M, mode_name(k).c_str(), ra, rbf);
+                            continue;
+                        }
+                        st_memcpy(hA.data(), dhA, mh, hipMemcpyDeviceToHost); st_memcpy(hB.data(), dhB, mh, hipMemcpyDeviceToHost);
+                        st_memcpy(yA.data(), dyA, my, hipMemcpyDeviceToHost); st_memcpy(yB.data(), dyB, my, hipMemcpyDeviceToHost);
+                        const bool dh = hA != hB, dy = yA != yB;
+                        bad_h += dh; bad_y += dy;
+                        if ((dh || dy) && first.empty()) {
+                            size_t i = 0;
+                            if (dh) while (i < mh && hA[i] == hB[i]) ++i;
+                            else while (i < my && yA[i] == yB[i]) ++i;
+                            first = fmt("%s N=%lld K=%lld M=%lld eps %g %s: %s differs first at byte %zu", ty->name, (long long)sh.N,
+                                        (long long)sh.K, (long long)M, eps, mode_name(k).c_str(), dh ? "h" : "y", i);
+                        }
+                    }
+                    if ((M == 1 || M == 6 || M == 8 || M == 24) && (pro == 2 || eps < 1e-10) && (sh.K != 512 || M == 1)) {
+                        set_mode(0);
+                        const double tp = k1_time_us([&] { pair(dhA, dyA); });
+                        const double tf = k1_time_us([&] { fold(dhB, dyB); });
+                        timing += fmt(" %s K%lld M%lld %.1f/%.1f;", ty->name, (long long)sh.K, (long long)M, tp, tf);
+                    }
+                }
+        }
+    hk.pin(0, 0, 0, 0);
+    sw("gg_gemv", 0);
+    std::printf("  info  %s pair/fold us (gg_gemv 2, back to back):%s\n", row, timing.c_str());
+    char msg[400];
+    std::snprintf(msg, sizeof msg, "%lld launch pairs (%d modes), h differs in %lld, y in %lld, launch failures %lld%s%s",
+                  launches, n_modes, bad_h, bad_y, rc_bad, first.empty() ? "" : "; first: ", first.c_str());
+    ok(name.c_str(), launches > 0 && bad_h == 0 && bad_y == 0 && rc_bad == 0, msg);
+    dfree_all();
+}
+
 static void ds_mr_perf(const Plugin& pl, const char* mlist, int iters, const char* tlist) {
     if (iters <= 0) iters = 100;
     const MrHooks h = mr_hooks(pl);
@@ -34975,6 +35122,10 @@ static void device_phase(const Plugin& pl) {
         qk_kv_fold_case(pl, false, 2);
         ds41_kvfold_case(pl);
         ds41_ofold_case(pl);
+        ds41_ggfold_case(pl, "rmsnorm_gemm_nt_ggml_qk256", 1);
+        ds41_ggfold_case(pl, "rmsnorm_gemm_nt_ggml_qk32", 1);
+        ds41_ggfold_case(pl, "swiglu_clamped_gemm_nt_ggml_qk256", 2);
+        ds41_ggfold_case(pl, "swiglu_clamped_gemm_nt_ggml_qk32", 2);
         qsa_qprep_case(pl);
         topk_scatter_case(pl);
         router_gemm_fused_case(pl);
