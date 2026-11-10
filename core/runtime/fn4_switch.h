@@ -40,6 +40,8 @@
  *                   that many rows issues moe_gather_all_reduce, a wider one moe_gather + all_reduce. Every form
  *                   is the same fold, so the bytes are the same at any value; a value past the declared bound is
  *                   refused. -1 when no loaded object serves it.
+ *   ds41_shexp_lane deepseek41 (lever F4): 1 the shared expert on the second lane at decode / verify steps, 0 one
+ *                   lane (RADIANCE_DS41_SHEXP_LANE at start); 1 is refused where no layer's arm is lane-safe.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -60,7 +62,7 @@
 namespace rad {
 namespace fn4 {
 
-enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kSwitches };
+enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

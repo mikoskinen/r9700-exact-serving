@@ -878,13 +878,30 @@ static int64_t gather_ar_rows() {
     return n > 0 ? std::min<long>(n, 64) : 0;
 }
 
-/* The in-process switch this plugin serves (core/runtime/fn4_switch.h; the core finds the hooks
+/* RADIANCE_DS41_SHEXP_LANE=1 (or on; lever F4): at a decode or verify step of one pass (at most
+ * kMoeShexpLaneRows rows) every trunk MoE layer issues its shared expert (gate, gate_up, the clamped
+ * activation, down) on the second lane beside the router, the sort and the routed EXL3 experts, and
+ * lane 0 joins it back in front of the gather (MoeFP8::shexp_lane). Nothing is declared for it; the
+ * gather combines the arms as before, so the bytes are the same. Unset or anything else: one lane,
+ * as before. The in-process switch ds41_shexp_lane (0 / 1) changes it at a step release. Read at the
+ * first declare. */
+static int shexp_lane_env() {
+    const char* e = std::getenv("RADIANCE_DS41_SHEXP_LANE");
+    return e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : 0;
+}
+
+/* The in-process switches this plugin serves (core/runtime/fn4_switch.h; the core finds the hooks
  * below through the plugin's handle): "ds41_argather" -- the fused gather's live row bound, 0..the
  * declared bound (gather_ar_rows), the issue taking moe_gather_all_reduce at T <= it and moe_gather
- * + all_reduce above (MoeFP8::gar_live). Applied between steps with every rank thread parked; the
- * core's epoch then re-records every pass. Process-wide: every rank's blocks read the same word. */
+ * + all_reduce above (MoeFP8::gar_live); "ds41_shexp_lane" -- 0 / 1, the shared expert on the second
+ * lane (MoeFP8::shexp_lane), 1 only where a trunk layer's arm is lane-safe. Applied between steps
+ * with every rank thread parked; the core's epoch then re-records every pass. Process-wide: every
+ * rank's blocks read the same words. */
 static std::atomic<int> g_sw_gar{-1};          /* -1: the declared bound */
 static std::atomic<int> g_sw_gar_decl{0};      /* the largest bound a layer declared */
+static std::atomic<int> g_sw_shexp{0};
+static std::atomic<int> g_sw_shexp_ok{0};      /* a trunk layer's shared arm is lane-safe */
+static std::atomic<int> g_sw_shexp_env{-1};    /* RADIANCE_DS41_SHEXP_LANE, read once */
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -894,12 +911,15 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_shexp_lane"))
+        return value == 0 || (value == 1 && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
-    g_sw_gar.store(value, std::memory_order_relaxed);
+    if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
+    else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
 extern "C" int rad_fn4_value(const char* name, int* applied) {
@@ -907,6 +927,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "ds41_argather")) {
         const int v = g_sw_gar.load(std::memory_order_relaxed);
         *applied = v >= 0 ? v : g_sw_gar_decl.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_shexp_lane")) {
+        *applied = g_sw_shexp.load(std::memory_order_relaxed);
         return 1;
     }
     return 0;
@@ -1694,9 +1718,11 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.calib = (m.calib_hi > m.calib_lo && l >= m.calib_lo && l < m.calib_hi) ? 1 : 0;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
-    /* the in-process switch (rad_fn4_*): the fused gather's live bound */
+    /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane */
     L.moe.gar_live = &g_sw_gar;
+    L.moe.shexp_lane = &g_sw_shexp;
     sw_note_decl(L.moe.gar_rows);
+    if (L.moe.shexp_lane_ok) g_sw_shexp_ok.store(1, std::memory_order_relaxed);
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
     return RAD_OK;
 }
@@ -2191,6 +2217,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     auto& slot = ctx->shape_probe ? probe_model : models[ctx->rank];
     slot = std::make_unique<Model>();
     auto& m = *slot;
+    /* RADIANCE_DS41_SHEXP_LANE once, at the first declare: a later one (a sizing probe, a re-declare)
+     * keeps what the ds41_shexp_lane switch has set since. */
+    {
+        int unread = -1;
+        if (g_sw_shexp_env.compare_exchange_strong(unread, shexp_lane_env()))
+            g_sw_shexp.store(g_sw_shexp_env.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -2428,7 +2461,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             fprintf(stderr, "radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to %lld "
                             "tokens a step (RADIANCE_DS41_ARGATHER)\n", (long long)gather_ar_rows());
     }
-
+    if (ctx->rank == 0 && !ctx->shape_probe && g_sw_shexp.load(std::memory_order_relaxed) > 0)
+        fprintf(stderr, "radiance: deepseek41: the shared expert on the second lane beside the routed experts "
+                        "at a decode or verify step of up to %lld rows, joined before the gather "
+                        "(RADIANCE_DS41_SHEXP_LANE; switch ds41_shexp_lane): %d of %zu layers lane-safe\n",
+                (long long)kMoeShexpLaneRows,
+                (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.moe.shexp_lane_ok; }),
+                m.layers.size());
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "

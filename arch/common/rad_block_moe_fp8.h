@@ -115,6 +115,11 @@ inline void moe_debug_weights(RadCtx* c_, int layer, int64_t top_k, rad_buf ids,
  * its `protect` list. */
 constexpr int64_t kMaxProtected = 8;
 
+/* The most rows a step may have for MoeFP8::shexp_lane to put the shared arm on the second lane:
+ * decode and verify heights. A wider step (prefill, a mixed step) keeps the one-lane issue, where
+ * both arms are GEMM-bound and a recorded pass already overlaps their stages (haz_mark). */
+static const int64_t kMoeShexpLaneRows = 64;
+
 struct MoeFP8 {
     struct Config {
         /* Routed experts this rank owns. Equal to `n_expert_all` unless experts are split across
@@ -432,6 +437,15 @@ struct MoeFP8 {
      * the fused op at T <= min(gar_rows, live) and the gather + all-reduce above, both declared,
      * byte-identical either way. Null: `gar_rows` alone, as before. */
     const std::atomic<int>* gar_live = nullptr;
+    /* Optional, set by the architecture: the shared arm on the second lane (rad_lane 1) beside the
+     * routed arm at a decode or verify step of one pass (T <= kMoeShexpLaneRows), joined back before
+     * the gather; read at every pass, > 0 = on. The two arms share nothing but their read of the
+     * normed input until the gather (the arm's buffers are rad_buf_concurrent, see declare), and the
+     * gather combines them exactly as before, so the bytes are the same. Taken only where declare
+     * found the arm lane-safe (`shexp_lane_ok`: every op of the arm reads the bf16 input or its own
+     * concurrent buffers, none a quantiser of the block's input). Null: one lane, as before. */
+    const std::atomic<int>* shexp_lane = nullptr;
+    bool shexp_lane_ok = false;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -1987,6 +2001,15 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                         RAD_NOWEIGHTS),
                     {w.x, w.h.x}, {w.x});
 
+    /* Whether the shared arm may run on the second lane (shexp_lane): it is folded into the gather
+     * (no separate combine), no calibration tap reads it, and each of its linears is one op over the
+     * bf16 input (a GGUF or bf16 weight; an int8 one quantises the input into a buffer the routed
+     * arm's lane could share). Its other buffers are rad_buf_concurrent above. Nothing is declared
+     * for it: the same ops serve both lanes. */
+    shexp_lane_ok = op_sgate != 0 && gfold && !op_combine && !c.calib &&
+                    (sh_gate_up.ggml || sh_gate_up.bf16) && (sh_down.ggml || sh_down.bf16) &&
+                    !sh_gate_up.probed_i8 && !sh_down.probed_i8;
+
     /* The layer as the prefetch sees it, indexed by model expert number (what the router ranks). */
     if (!c.sigmoid_router && !act_bf16() && c.n_expert_all > 0 && n_reg > 0) {
         const int64_t na = c.n_expert_all;
@@ -2160,8 +2183,30 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
     const bool shared = op_sgate != 0;
+    /* The fused router when it resolved and the pass fits: router, topk + scatter and (with
+     * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
+    const bool rfused = op_router_fused && rows <= router_fused_rows;
+    const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
+    const bool gate_done = (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate);
+    /* The shared arm on the second lane (shexp_lane): a decode or verify step of one pass. */
+    const bool want_lane1 = shared && shexp_lane_ok && shexp_lane &&
+                            shexp_lane->load(std::memory_order_relaxed) > 0 && r0 == 0 && rows == T &&
+                            T <= kMoeShexpLaneRows;
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);
+
+    /* Lane 1, behind everything lane 0 has issued (the normed input is written): the whole shared
+     * arm -- its gate (unless the fused selection writes it, on lane 0 ahead of the gather), gate_up,
+     * the activation, down -- beside the router, the sort and the routed experts. Lane 0 joins it
+     * back in front of the gather, which reads `sout` and `sgate` as before. The join-then-switch
+     * order is GdnFP8's a|b lane; a lane that cannot be had leaves the arm on lane 0, as before. */
+    const bool lane1 = want_lane1 && rad_lane_join(c_, 0, 1) == RAD_OK && rad_lane(c_, 1) == RAD_OK;
+    if (lane1) {
+        shared_up(c_, T, r0, rows, gate_done);
+        gq_sh.step(c_, w.sgu, T, r0, rows);
+        sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+        rad_lane(c_, 0);
+    }
 
     /* The shared arm is interleaved with the routed arm on the same queue. It reads the same
      * input and writes nothing the routed arm touches before the gather, so each of its stages
@@ -2182,10 +2227,6 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * weights. The declared buffer is stable across record and replay, and route_report hands
      * the same buffer on, so the stager's stream-ordered read sees this pass's counts. */
     const RadOperand ecnt = brows(w.ecnt, ne);
-    /* The fused router when it resolved and the pass fits: router, topk + scatter and (with
-     * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
-    const bool rfused = op_router_fused && rows <= router_fused_rows;
-    const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
     if (sfused) {
         glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
@@ -2284,14 +2325,13 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
                     RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
                     brows(w.egu, rows * k));
-    if (shared) shared_up(c_, T, r0, rows,
-                          (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+    if (shared && !lane1) shared_up(c_, T, r0, rows, gate_done);
     if (beside && beside->fn && r0 == 0) beside->fn(c_, beside->arg);
     if (c.expert_iqr)
         gq_iqr.step(c_, w.egu, rows * k, 0, rows * k);
     else if (!c.expert_exl3)   /* EXL3: inside gate_up */
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
-    if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
+    if (shared && !lane1) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (c.expert_exl3)
         issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
     else if (c.expert_iqr)
@@ -2332,7 +2372,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
-    if (shared) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (shared && !lane1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {
@@ -2388,6 +2428,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes
      * the block's delta into `h.x`. With Config::gather_ar_rows a single-pass step this short
      * gathers and reduces in one kernel, byte for byte the two it replaces. */
+    if (lane1) rad_lane_join(c_, 1, 0);
     int64_t gar_lim = gar_rows;
     if (gar_live) {
         const int lv = gar_live->load(std::memory_order_relaxed);

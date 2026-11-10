@@ -4995,7 +4995,8 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK_EQ(g.status, 200);
     CHECK(has(g.body, "\"draft_adaptive\": -1"));
     CHECK(has(g.body, "\"gg_gemv\": -1"));
-    CHECK(has(g.body, "\"ds41_argather\": -1"));     /* deepseek41's (lever D3): not loaded here */
+    CHECK(has(g.body, "\"ds41_argather\": -1"));     /* deepseek41's (levers D3, F4): not loaded here */
+    CHECK(has(g.body, "\"ds41_shexp_lane\": -1"));
     CHECK(has(g.body, "\"aql_acq\": 0"));
     CHECK(has(g.body, "\"epoch\": 0"));
     CHECK(has(g.body, "\"draft_capable\": -1"));
@@ -5003,7 +5004,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     const HttpResponse gg = f.post("/admin/fn4", R"({"epoch_bump":1,"gg_gemv":1})");
     CHECK_EQ(gg.status, 400);
     CHECK(has(gg.body, "no loaded plugin serves it"));
-    for (const char* b : { R"({"ds41_argather":4})" }) {
+    for (const char* b : { R"({"ds41_argather":4})", R"({"ds41_shexp_lane":1})" }) {
         const HttpResponse r = f.post("/admin/fn4", b);
         CHECK_EQ(r.status, 400);
         CHECK(has(r.body, "no loaded plugin serves it"));
