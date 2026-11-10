@@ -92,6 +92,77 @@ int Scheduler::set_draft_hybrid_match(int v) {
     return hybrid_match_;
 }
 
+int Scheduler::set_draft_probe_backoff(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v > 0 && !draft_.can_adapt())
+        RAD_WARN("fn4: draft_probe_backoff=%d refused: this deployment's drafter cannot run the adaptive "
+                 "window", v);
+    else if (v >= 0)
+        draft_.set_backoff(v);
+    return draft_.backoff();
+}
+
+int Scheduler::set_draft_lend(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v != 0 && (!lend_capable_ || !draft_.can_adapt()))
+        RAD_WARN("fn4: draft_lend=%d refused: %s", v,
+                 !lend_capable_ ? "the drafter's lend is not set up (RADIANCE_DRAFT_LEND unset at start, or "
+                                  "no drafter slab to lend)"
+                                : "this deployment's drafter cannot run the adaptive window");
+    else if (v >= -1)
+        draft_.set_lend(v);
+    return draft_.lend();
+}
+
+int Scheduler::set_draft_lend_borrow(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v == 1 && !lend_capable_)
+        RAD_WARN("fn4: draft_lend_borrow=1 refused: the drafter's lend is not set up (RADIANCE_DRAFT_LEND unset "
+                 "at start, or no drafter slab to lend)");
+    else if (v == 0 || v == 1)
+        draft_.set_borrow(v == 1);
+    return draft_.borrow() ? 1 : 0;
+}
+
+void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) {
+    std::lock_guard<std::mutex> lk(mu_);
+    lend_view_ = std::move(view);
+    lend_capable_ = capable && (bool)lend_view_ && draft_.can_adapt();
+    if (!lend_capable_ && draft_.lend() != 0) {
+        RAD_WARN("RADIANCE_DRAFT_LEND=%d: the drafter's slab cannot be lent here (no drafter class to lend, "
+                 "a static plan, or a drafter that cannot run the adaptive window); off", draft_.lend());
+        draft_.set_lend(0);
+    }
+    if (!lend_capable_ && draft_.borrow()) {
+        RAD_WARN("RADIANCE_DRAFT_LEND_BORROW=1: the drafter's lend is not set up; off");
+        draft_.set_borrow(false);
+    }
+    if (lend_view_) {
+        uint64_t ch = 0;
+        dl_state_ = lend_view_(&ch);
+        dl_changes_ = ch;
+    }
+    fn4::lend_register(lend_capable_);
+    fn4::note_sched(fn4::kDraftLend, draft_.lend());
+    fn4::note_sched(fn4::kDraftLendBorrow, draft_.borrow() ? 1 : 0);
+    if (lend_capable_ && draft_.borrow())
+        RAD_INFO("draft lend borrow: a cost class with no lent plain step of its own prices it with the nearest "
+                 "class's lent ratio (%lld samples at least; a lower class's as it is, a higher one's gain x %.2f "
+                 "a class step)", (long long)DraftController::kBorrowMin, DraftController::kBorrowDamp);
+    if (lend_capable_)
+        RAD_INFO("draft lend: %s; once depth 0 has held %d cycles with probes at least %d cycles apart, the "
+                 "drafter's expert slab is lent to the trunk's experts, and taken back when drafting resumes",
+                 draft_.lend() > 0 ? "on" : draft_.lend() < 0 ? "forced: lent at every step (identity check)"
+                                                               : "set up, off (fn4 draft_lend turns it on)",
+                 draft_.lend() > 0 ? draft_.lend_hold() : DraftController::kLendHold,
+                 DraftController::kLendInterval);
+}
+
+bool Scheduler::draft_lend_wanted() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return lend_capable_ && draft_.lend_wanted();
+}
+
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
                     const std::vector<BatchBuilder::RankIO>& ranks, const ChunkGeometry* geo) {
     if (!kv || !pc) return RAD_E_INVAL;
@@ -290,6 +361,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         };
         dp.depth0 = env_int("RADIANCE_DRAFT_DEPTH0", 0, 1, 0) == 1;
         dp.probe_every = env_int("RADIANCE_DRAFT_PROBE", 2, 4096, DraftController::kProbeEvery);
+        dp.backoff = env_int("RADIANCE_DRAFT_PROBE_BACKOFF", 0, DraftController::kBackoffMax, 0);
+        /* The lend's start value; it acts only once the engine set it up (set_lend_view). */
+        dp.lend = env_int("RADIANCE_DRAFT_LEND", -1, 4096, 0);
+        dp.borrow = env_int("RADIANCE_DRAFT_LEND_BORROW", 0, 1, 0) == 1;
         hybrid_ = env_int("RADIANCE_DRAFT_HYBRID", 0, 1, 0) == 1;
         hybrid_match_ = env_int("RADIANCE_DRAFT_HYBRID_MATCH", 1, 256, LookupGate::kLongMatch);
         if (dp.depth0 && !dp.adapt)
@@ -315,6 +390,17 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     fn4::note_sched(fn4::kDraftProbe, draft_.probe_every());
     fn4::note_sched(fn4::kDraftHybrid, hybrid_ ? 1 : 0);
     fn4::note_sched(fn4::kDraftHybridMatch, hybrid_match_);
+    fn4::note_sched(fn4::kDraftProbeBackoff, draft_.backoff());
+    /* Lever DL: reported as set; acting only once the engine sets it up (set_lend_view). */
+    lend_view_ = nullptr;
+    lend_capable_ = false;
+    dl_state_ = 0;
+    dl_changes_ = 0;
+    dl_cycles_ = 0;
+    lent_cycles_ = lent_plain_steps_ = lent_probe_steps_ = transit_steps_ = 0;
+    lent_plain_ms_ = lent_probe_ms_ = transit_ms_ = 0.0;
+    fn4::note_sched(fn4::kDraftLend, draft_.lend());
+    fn4::note_sched(fn4::kDraftLendBorrow, draft_.borrow() ? 1 : 0);
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
      * row, is measured. */
@@ -2616,6 +2702,15 @@ void Scheduler::draft_cycle() {
         if (r.may_speculate) draft_est_.push_back(&s.adapt);
     }
     (void)draft_.plan_step(draft_est_.data(), (int)draft_est_.size(), n_rows);
+    /* Lever DL: the lend's state this cycle opens under (the movers last moved it in the previous
+     * step's balance), for step_finished's sample. */
+    if (lend_view_) {
+        uint64_t ch = 0;
+        dl_state_ = lend_view_(&ch);
+        dl_cycles_ = ch != dl_changes_ ? 0 : dl_cycles_ + 1;
+        dl_changes_ = ch;
+        if (dl_state_ == DraftController::kLendLent) ++lent_cycles_;
+    }
 }
 
 /* ------------------------------------------------------------------ the next step */
@@ -3150,11 +3245,34 @@ void Scheduler::step_finished() {
         if (key >= 0) {
             int rows = 0;
             for (const StepEntry& e : plan_.e) rows += (e.produces_token && !e.is_prefill) ? 1 : 0;
-            draft_.step_time(key, rows, wall * 1e3, key > 0 ? (double)step_decode_tok_ : -1.0);
+            /* Lever DL: the step's lend state -- a transition if the movers moved since the cycle
+             * opened, or it opened on one; lent only past kLendWarm cycles of it. */
+            int lend = DraftController::kLendResident;
+            if (lend_view_) {
+                uint64_t ch = 0;
+                const int now = lend_view_(&ch);
+                if (ch != dl_changes_ || now != dl_state_ || now == DraftController::kLendTransit)
+                    lend = DraftController::kLendTransit;
+                else if (now == DraftController::kLendLent)
+                    lend = dl_cycles_ >= DraftController::kLendWarm ? DraftController::kLendLent
+                                                                    : DraftController::kLendTransit;
+                if (lend == DraftController::kLendTransit) {
+                    ++transit_steps_;
+                    transit_ms_ += wall * 1e3;
+                } else if (lend == DraftController::kLendLent) {
+                    if (key > 0) { ++lent_probe_steps_; lent_probe_ms_ += wall * 1e3; }
+                    else         { ++lent_plain_steps_; lent_plain_ms_ += wall * 1e3; }
+                }
+            }
+            draft_.step_time(key, rows, wall * 1e3, key > 0 ? (double)step_decode_tok_ : -1.0, lend);
         }
     }
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
                            hybrid_lookup_, hybrid_head_, hybrid_unahead_);
+    if (lend_view_)
+        fn4::note_lend_sched(lent_cycles_, lent_plain_steps_, (int64_t)(lent_plain_ms_ + 0.5), lent_probe_steps_,
+                             (int64_t)(lent_probe_ms_ + 0.5), transit_steps_, (int64_t)(transit_ms_ + 0.5),
+                             draft_.backoff_k(), draft_.probe_interval(), draft_.borrow_cycles());
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};

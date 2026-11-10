@@ -859,7 +859,25 @@ int Engine::prepare_release(const RadBatch* b) {
             if (sw[fn4::kDraftHybridMatch] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftHybridMatch,
                                 sched_.set_draft_hybrid_match(sw[fn4::kDraftHybridMatch]));
+            if (sw[fn4::kDraftProbeBackoff] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftProbeBackoff,
+                                sched_.set_draft_probe_backoff(sw[fn4::kDraftProbeBackoff]));
+            if (sw[fn4::kDraftLend] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftLend, sched_.set_draft_lend(sw[fn4::kDraftLend]));
+            if (sw[fn4::kDraftLendBorrow] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftLendBorrow, sched_.set_draft_lend_borrow(sw[fn4::kDraftLendBorrow]));
         }
+    }
+    /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
+     * own balance(), behind the step's trunk pass); and the report. Nothing when undeclared. */
+    if (dl_capable_) {
+        const bool want = sched_.draft_lend_wanted();
+        for (auto& r : ranks_) r->mover.set_draft_lend(want);
+        uint64_t ch = 0;
+        const int state = draft_lend_state(&ch);
+        const Mover& m0 = ranks_[0]->mover;
+        fn4::note_lend_engine(state, (int64_t)m0.draft_lends(), (int64_t)m0.draft_reclaims(), m0.draft_lent_units(),
+                              m0.draft_resident(), m0.draft_units(), m0.draft_slab_bytes() >> 20);
     }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
@@ -880,6 +898,23 @@ int Engine::prepare_release(const RadBatch* b) {
     kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
     return RAD_OK;
+}
+
+/* Lever DL: the drafter's lend over every rank, as DraftController::LendSample counts it -- resident
+ * when every rank's drafter is home, lent when every rank's slab is lent, a transition otherwise --
+ * and the transitions so far. Any thread: the movers' state is atomic. */
+int Engine::draft_lend_state(uint64_t* changes) const {
+    uint64_t ch = 0;
+    bool home = true, lent = true;
+    for (const auto& r : ranks_) {
+        const int st = r->mover.draft_lend_state();
+        ch += r->mover.draft_lend_changes();
+        home = home && st == Mover::kDlResident;
+        lent = lent && st == Mover::kDlLent;
+    }
+    if (changes) *changes = ch;
+    return home ? DraftController::kLendResident : lent ? DraftController::kLendLent
+                                                       : DraftController::kLendTransit;
 }
 
 int Engine::issue_ahead(const RadBatch** out) {
@@ -2505,8 +2540,12 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         img_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
-    } else
+    } else {
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    /* Lever DL: the scheduler sees the drafter's lend once it was declared (start()). */
+    if (dl_declared_)
+        sched_.set_lend_view([this](uint64_t* ch) { return draft_lend_state(ch); }, dl_capable_);
+    }
     /* The smallest step the prefill stager overlaps. A chunk held back for other work
      * (--busy-prefill-chunk) stays at or above it; below it every routed layer reads its pooled
      * experts synchronously, which costs far more than sharing the step saves. The maximum over

@@ -313,6 +313,12 @@ struct MoverConfig {
     /* Pinned staging buffers for file-tier reads, one class stride each; the count the planner
      * charged to --host-pool-mib. */
     int stage_slots = RAD_PLACE_FILE_STAGE_SLOTS;
+
+    /* Lever DL, the drafter's lend (RADIANCE_DRAFT_LEND set at start; Mover::draft_lend_setup): the
+     * routed units of plan layers at or above this one -- a draft head's experts, whose own slab
+     * classes hold nothing else -- keep a pinned host copy beside their VRAM slot, so their slab can
+     * be lent to the trunk while the drafter does not run. -1 (the default): none, today's mover. */
+    int32_t draft_keep_from = -1;
 };
 
 /* ------------------------------------------------------------------ the loan */
@@ -501,7 +507,9 @@ public:
      * A unit in a lent slot keeps its host copy (weights never change), so giving the slot back
      * is a change of address: a recall waits only for kernels to stop naming the slot. */
 
-    enum Lender { kLendKV = 0, kLendArena = 1, kLenders = 2 };
+    /* kLendDraft: the drafter's own slab classes (lever DL, draft_lend_setup), lent to the trunk's
+     * classes while the drafter's experts sit at their host copies. */
+    enum Lender { kLendKV = 0, kLendArena = 1, kLendDraft = 2, kLenders = 3 };
 
     /* Registers the stretches a lender may ever lend; once per lender, after its memory is
      * carved. Each stretch is cut into slots of each class's stride from the top down, so a small
@@ -567,6 +575,54 @@ public:
             }
         return n;
     }
+
+    /* ---- lever DL: the drafter's slab, lent to the trunk while the drafter does not draft -------
+     *
+     * A block drafter (DSpark) runs its routed experts only in its query pass: the context pass that
+     * runs on every step reads the projection and the window keys, no expert (deepseek41.cpp
+     * dsp_declare). So while the scheduler holds the drafting depth at 0 the drafter's experts are
+     * read by nothing, and the slab classes that hold them (a stride no trunk unit has, so heat never
+     * puts a trunk unit there) are idle VRAM: on DeepSeek-V4.1 EXL3 2.25 TP4, 96 units of 17.93 MiB
+     * plus 24 shadow slots, 2.10 GiB a rank, about 230 trunk units.
+     *
+     * With MoverConfig::draft_keep_from set, every drafter unit keeps a pinned host copy (allocated
+     * here, outside --host-pool-mib, so the plan and the VRAM split are today's), and its promotions
+     * keep it, so leaving VRAM is a change of address (Kind::Drop), never a copy. The drafter's slab
+     * is registered as a third lender, kLendDraft, cut into the trunk classes' strides like any loan.
+     *
+     * set_draft_lend(true) parks the drafter: its slots stop being covered, each unit is dropped to
+     * its host copy, and once every slot has left quarantine the whole slab is lent (set_loan), which
+     * balance() fills with the hottest pooled trunk units. A query pass that runs meanwhile (a probe)
+     * reads the drafter's experts from host memory, as --draft-expert-placement host does: placement
+     * only, the same bytes. set_draft_lend(false) recalls it: the loan goes to 0 and balance() drops
+     * the trunk units (they kept their host copies), and once nothing of the trunk holds or
+     * quarantines a slot the drafter's slots are covered again and every unit is promoted back from
+     * its copy. Until a promotion lands its unit is read where it was published, so the drafter is
+     * correct at every point of either transition. The two never share a byte: the loan is raised
+     * only when no drafter slot is held, the drafter's slots covered only when the loan holds none.
+     *
+     * Everything advances in balance() (draft_advance), on the rank thread, a step at a time; the
+     * engine sets the target between steps. */
+    enum DraftLend { kDlResident = 0, kDlParking = 1, kDlLent = 2, kDlUnlending = 3, kDlLoading = 4 };
+    /* After the load and once the compute stream is bound: fills the host copies from the units'
+     * VRAM slots (a synchronous copy on the mover's stream) and carves the drafter's slab for the
+     * trunk. RAD_OK with draft_lend_ready() false when there is nothing to lend (no keep configured,
+     * a static plan, no drafter class, or no trunk class to lend to). */
+    int  draft_lend_setup();
+    bool draft_lend_ready() const { return dl_ready_; }
+    void set_draft_lend(bool lend) { dl_want_ = lend; }
+    bool draft_lend_target() const { return dl_want_; }
+    /* For the engine (any thread): the state, transitions so far, lends and recalls begun, the drafter's
+     * units in VRAM, trunk units in its memory, and the drafter's slab bytes. */
+    int      draft_lend_state() const { return dl_state_.load(std::memory_order_relaxed); }
+    uint64_t draft_lend_changes() const { return dl_changes_.load(std::memory_order_relaxed); }
+    uint64_t draft_lends() const { return dl_lends_.load(std::memory_order_relaxed); }
+    uint64_t draft_reclaims() const { return dl_reclaims_.load(std::memory_order_relaxed); }
+    int64_t  draft_units() const { return (int64_t)dl_units_.size(); }
+    int64_t  draft_resident() const { return dl_resident_.load(std::memory_order_relaxed); }
+    int64_t  draft_lent_units() const { return dl_lent_units_.load(std::memory_order_relaxed); }
+    int64_t  draft_slab_bytes() const { return dl_slab_bytes_; }
+    int64_t  draft_keep_bytes() const { return dl_keep_bytes_; }
 
     /* Where a unit's bytes are right now, as a device-visible address, or null for a file-tier
      * unit that has not been staged. */
@@ -740,6 +796,11 @@ private:
                                         * (MoverConfig::turnover_slots) */
         int64_t  n_donated = 0;        /* units in lent slots that gave their host copy away
                                         * (Mover::donor_slot); at most n_turn of them */
+        /* Lever DL: a drafter class whose units keep their host copy wherever they sit (a promotion
+         * into a budgeted slot keeps the pool slot, as one into a lent slot does). Its pool is
+         * allocated by the mover itself (keep_base), outside the budget. */
+        bool     keep = false;
+        void*    keep_base = nullptr;
         std::vector<char*>   flex_ptr;
         /* One slab segment per lender that carved slots for this class. `need[i]` is the loan,
          * in the lender's measure, that covers the segment's i-th slot; ascending. */
@@ -878,6 +939,22 @@ private:
     int32_t               prefetch_cursor_ = 0;
     int32_t               last_op_ = -1;
     int                   dispatch_ = 0;
+
+    /* Lever DL (draft_lend_setup, draft_advance). */
+    bool                  dl_ready_ = false;
+    bool                  dl_want_ = false;
+    std::vector<int32_t>  dl_units_;        /* the drafter's units */
+    std::vector<int32_t>  dl_classes_;      /* the classes they make up, keep set */
+    int64_t               dl_slab_bytes_ = 0, dl_keep_bytes_ = 0;
+    std::atomic<int>      dl_state_{kDlResident};
+    std::atomic<uint64_t> dl_changes_{0}, dl_lends_{0}, dl_reclaims_{0};
+    std::atomic<int64_t>  dl_resident_{0}, dl_lent_units_{0};
+    void dl_set(int st) {
+        dl_state_.store(st, std::memory_order_relaxed);
+        dl_changes_.fetch_add(1, std::memory_order_relaxed);
+    }
+    int  draft_advance(HeatEngine* heat);
+    void dl_count();
 
     /* Each lender's loan in its own measure, and the totals the dashboard reads. */
     int64_t              loan_[kLenders] = {};
