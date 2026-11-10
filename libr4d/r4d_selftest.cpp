@@ -21250,7 +21250,7 @@ static void ds_mr_perf(const Plugin& pl, const char* mlist, int iters, const cha
                     st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
                     if (ref.empty()) ref = got;
                     const bool same = got == ref;
-                    const std::string form = h.last ? h.last() : "";
+                    const std::string form = (h.last && nm.rfind("stock", 0) != 0) ? h.last() : "";   /* the form's own launch */
                     for (int i = 0; i < 20; ++i) L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y);
                     const double us = st_time_us([&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); }, iters, nullptr);
                     return { nm, form, us, same };
@@ -21264,7 +21264,6 @@ static void ds_mr_perf(const Plugin& pl, const char* mlist, int iters, const cha
                         for (int g : { 256, 1024 }) {
                             h.gpin(rp, g);
                             R r = time_form(fmt("stock-r%dg%d", rp, g));
-                            r.form = "";
                             if (r.us > 0 && (sbest.us <= 0 || r.us < sbest.us)) sbest = r;
                             res.push_back(r);
                         }
