@@ -196,6 +196,7 @@ struct Model {
     HyperConn mixer;            /* the 97th connection: no write half */
     /* Whether this rank has said that it pipelines a prefill step (step_pipelined), once. */
     bool      pipe_noted = false;
+    int       pair_noted = 0;   /* fn4 P2x: the mode last noted (taken), -1 refused noted */
     /* Whether the deployment spans (RadBuildCtx::max_mixed_tok below a max_tok wider than a MoE
      * pass): a step wider than a pass is then one sequence, the connections read it a pass at a
      * time and the indexer scores it in windows. `pipe_on` adds ranks whose blocks issue their own
@@ -205,6 +206,10 @@ struct Model {
      * from the real declare, so it declares the same ops. */
     bool      span_on = false;
     bool      pipe_on = false;
+    /* The pass a span cuts a wide step into (the pipelined step's pieces, the connections' read width, the indexer's
+     * window): the MoE's rows, except under fn4 P2x (RADIANCE_FN4_P2X=1 at start), where the MoE is declared two
+     * pieces tall (moecfg.rows = 2 pass_rows) so a pipelined step's pieces can share one routed pass (switch moe_pair). */
+    int64_t   pass_rows = 0;
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -464,6 +469,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * prefill chunk to, so the shipped configuration is one pass. It also sizes four buffers at
          * `rows * top_k`, so a smaller max_tok lowers it. */
         mc.rows        = g.max_tok < 2048 ? g.max_tok : 2048;
+        m.pass_rows    = mc.rows;
+        /* fn4 P2x: the expert buffers two pieces tall (the pieces as before) */
+        if (fn4_env_on("RADIANCE_FN4_P2X") && g.max_tok >= 2 * mc.rows) mc.rows = 2 * mc.rows;
         if (mc.n_expert <= 0 || mc.top_k <= 0 || mc.top_k > mc.n_expert) {
             fprintf(stderr, "radiance: qwen4exp: the container describes %lld expert(s) with "
                             "top_k %lld\n", (long long)mc.n_expert, (long long)mc.top_k);
@@ -781,7 +789,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.pipe_on = g_model[ctx->rank].pipe_on;
     } else {
         m.span_on = ctx->max_mixed_tok > 0 && ctx->max_mixed_tok < g.max_tok &&
-                    g.max_tok > m.moecfg.rows;
+                    g.max_tok > m.pass_rows;
         /* Only where the blocks issue their own all-reduce at a step wider than a pass: at two
          * ranks the gated residual's fused write takes every step's (ar_exact_write_rows), so such
          * a step runs serially. */
@@ -799,7 +807,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Under a span every connection reads a step wider than a pass a pass at a time
      * (HyperConn::read_pieces, and the pipelined step's own reads), so the reads are declared no
      * wider than a pass and their scratch is sized for that band. */
-    if (m.span_on) m.hccfg.read_rows = m.moecfg.rows;
+    if (m.span_on) m.hccfg.read_rows = m.pass_rows;
     RAD_ARCH_TRY(m.a_x.declare_qs(b, nm, g, "x", g.n_embd, 0, m.trunk_i8));
     /* The connections write int8 codes themselves when every reader of their codes is an int8
      * linear: the trunk's are, and the routed experts then read the rotated copy or the bf16
@@ -844,8 +852,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * pass (QsaIndexer::step, with the bounds in b_pipe_cu). The plane is the largest buffer
          * the span would otherwise grow, max_ctx / ratio floats a query row (512 MiB more at 4096
          * rows and 256K of context). */
-        const int64_t qsa_rows = (m.span_on && ctx->max_mixed_tok <= m.moecfg.rows)
-                                     ? m.moecfg.rows : g.max_tok;
+        const int64_t qsa_rows = (m.span_on && ctx->max_mixed_tok <= m.pass_rows)
+                                     ? m.pass_rows : g.max_tok;
         m.qsacfg.plane_rows = qsa_rows < g.max_tok ? qsa_rows : 0;
         /* One row per query, not per sequence (arch/common/rad_qsa.h). The score plane is the
          * only buffer whose size is the product of two deployment bounds, so an oversized one is
@@ -1486,7 +1494,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * of the sharing pool (declare). The collectives there are declared at `overlap` 1, whose rows
  * leave the CUs to the work beside them. */
 static bool pipelined(const Model& m, int64_t T) {
-    const int64_t R = m.moecfg.rows;
+    const int64_t R = m.pass_rows;
     if (!m.pipe_on || R <= 0 || T <= R) return false;
     if (m.moecfg.calib || dbg_resid_on() || !m.op_embed_ar) return false;
     for (const Layer& l : m.layers) {
@@ -1524,7 +1532,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
         m.pipe_cu_h = (int32_t*)rad_dev_alloc(2 * sizeof(int32_t), RAD_MEM_HOST_PINNED);
         if (m.pipe_cu_h) {
             m.pipe_cu_h[0] = 0;
-            m.pipe_cu_h[1] = (int32_t)m.moecfg.rows;
+            m.pipe_cu_h[1] = (int32_t)m.pass_rows;
         } else if (m.g.rank == 0) {
             fprintf(stderr, "radiance: qwen4exp: no pinned host memory for the window bounds; a "
                             "step wider than a pass cannot run\n");
@@ -1532,7 +1540,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
     }
     if (!m.pipe_cu_h) return nullptr;
     int32_t* d = (int32_t*)rad_buf_ptr(c, m.b_pipe_cu);
-    if (batch->n_tok > m.moecfg.rows && batch->n_seq == 1) {
+    if (batch->n_tok > m.pass_rows && batch->n_seq == 1) {
         const RadStream s = rad_stream(c);
         if (rad_memcpy_async(d, m.pipe_cu_h, 2 * sizeof(int32_t), s) != RAD_OK ||
             rad_memcpy_async(d + 2, batch->cu_seqlens + 1, sizeof(int32_t), s) != RAD_OK)
@@ -1541,12 +1549,28 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
     return d;
 }
 
+/* fn4 P2x (declared with RADIANCE_FN4_P2X=1: the expert buffers two pieces tall): switch "moe_pair" 0 / 1 / 2 puts a
+ * pipelined prefill step's two pieces through ONE routed-expert pass (MoeFP8::pair_routed) -- 1 with each piece's
+ * shared arm after it (beside piece 0's MoE all-reduce), 2 with the shared arms inside it (pass()'s interleave);
+ * RADIANCE_FN4_MOE_PAIR=<n> starts it at n. */
+static std::atomic<int>& fn4_pair_flag() {
+    static std::atomic<int> f{[] {
+        const char* v = std::getenv("RADIANCE_FN4_MOE_PAIR");
+        const int n = v && *v ? std::atoi(v) : 0;
+        return n >= 0 && n <= 2 ? n : 0;
+    }()};
+    return f;
+}
+
 static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
-    const int64_t T = batch->n_tok, R = m.moecfg.rows;
+    const int64_t T = batch->n_tok, R = m.pass_rows;
     const int64_t K = (T + R - 1) / R;
     auto r0 = [&](int64_t p) { return p * R; };
     auto rn = [&](int64_t p) { return T - p * R < R ? T - p * R : R; };
+    /* fn4 P2x: the two pieces' routed experts in one pass (moe_pair 1 / 2), where the MoE was declared for it */
+    const int pmode = fn4_pair_flag().load(std::memory_order_relaxed);
+    const bool pair_on = pmode > 0 && K == 2 && m.moecfg.rows >= T;
     /* A collective on the second lane, ordered behind lane 0 where it reads what lane 0 just
      * wrote (a join to a lane not yet built is a no-op). */
     auto on1 = [&](bool behind0, auto&& issue) {
@@ -1603,6 +1627,36 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         wait1();
         int64_t issued = pc.handed > 0 ? pc.handed : 1;
         bool behind = pc.handed == 0;     /* lane 1 already behind the whole mixer */
+        const bool pair_now = pair_on && l.mlp.pair_ok(T, R);
+        if (pair_on && li == 0 && g.rank == 0 && m.pair_noted != (pair_now ? pmode : -1)) {
+            m.pair_noted = pair_now ? pmode : -1;
+            fprintf(stderr, pair_now ? "radiance: qwen4exp: fn4 P2x: a pipelined step's two pieces share one routed pass "
+                                       "(moe_pair %d, %lld rows, MoE rows %lld)\n"
+                                     : "radiance: qwen4exp: fn4 P2x: moe_pair %d asked, but the MoE block's forms do not "
+                                       "allow the pair at %lld rows (MoE rows %lld): per-piece passes\n",
+                    pmode, (long long)T, (long long)m.moecfg.rows);
+        }
+        if (pair_now) {
+            /* fn4 P2x: piece 0's connections beside piece 1's mixer all-reduce, then piece 1's, then one routed pass
+             * over both; piece 0's shared arm (mode 1) + gather, its MoE all-reduce on lane 1 beside piece 1's shared
+             * arm + gather, then piece 1's beside the writes below (as the per-piece form's last one). */
+            if (1 >= issued) {
+                on1(!behind, [&] { ar_mix(1); });
+                behind = true;
+                issued = 2;
+            }
+            const bool ss0 = l.hc_mix.write(c, T, r0(0), rn(0));
+            l.hc_ffn.read(c, T, r0(0), rn(0), ss0);
+            wait1();
+            const bool ss1 = l.hc_mix.write(c, T, r0(1), rn(1));
+            l.hc_ffn.read(c, T, r0(1), rn(1), ss1);
+            l.mlp.pair_routed(c, T, R, pmode == 2);
+            l.mlp.pair_finish(c, T, r0(0), rn(0), pmode != 2);
+            on1(true, [&] { l.mlp.issue_ar(c, r0(0), rn(0)); });
+            l.mlp.pair_finish(c, T, r0(1), rn(1), pmode != 2);
+            wait1();
+            on1(true, [&] { l.mlp.issue_ar(c, r0(1), rn(1)); });
+        } else
         for (int64_t p = 0; p < K; ++p) {
             if (p + 1 < K && p + 1 >= issued) {
                 on1(!behind, [&] { ar_mix(p + 1); });
@@ -1847,6 +1901,12 @@ RAD_ARCH_PLUGIN(qwen4exp_fp8, "qwen4exp", "", "0.1.0",
  * picks MoeFP8's inverse twins when the blocks were declared switchable (RADIANCE_FN4_SWITCHABLE=1 at
  * start); refused (-1) otherwise. */
 extern "C" int rad_fn4_switch(const char* name, int value) {
+    if (name && std::strcmp(name, "moe_pair") == 0) {   /* fn4 P2x (step_pipelined; RADIANCE_FN4_P2X=1 declares) */
+        if (value < 0 || value > 2) return -1;
+        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
+        qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (!name || std::strcmp(name, "gather_inv") != 0) return 0;
     if (!qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SWITCHABLE")) return -1;
     rad::arch::fn4_gather_inv_flag().store(value ? 1 : 0, std::memory_order_relaxed);
