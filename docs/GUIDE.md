@@ -1407,12 +1407,15 @@ radiance --model m.rad --spec-ngram 5 --draft-window adaptive # each sequence's 
 radiance --model m.rad --num-speculative-tokens 4             # a head drafts; lookup fills in where it declines
 ```
 
-`--spec-ngram K` sets the window to K (a different `--num-speculative-tokens` is refused) for a
-container that declares no draft head; one that declares a head is refused at startup, because the
-head would draft in lookup's place (serve it with `--num-speculative-tokens N`). Without the flag,
-prompt lookup still drafts for every sequence a declared head declines, and is the only drafter when
-speculation is on (`--num-speculative-tokens N`) and the container has no head. Startup says which
-(`speculation: prompt lookup only -- this container declares no draft head`), and the drafts count in `draft_n` /
+`--spec-ngram K` sets the window to K (leave `--num-speculative-tokens` unset; a different value is
+refused). On a container that carries a draft head, the head is left out: the plugin is told so
+(`RadBuildCtx::draft_head_off`) and declares none of it, so its weights are neither loaded nor
+placed, while every verify buffer is still sized for K drafts; a plugin that declares its head anyway
+is refused at startup. Without the flag, prompt lookup still drafts for every sequence a declared
+head declines, and is the only drafter when speculation is on (`--num-speculative-tokens N`) and the
+container has no head. Startup says which (`speculation: prompt lookup only (--spec-ngram K) -- the
+container's draft head is left out: ...`, or `... -- this container declares no draft head`), and
+the drafts count in `draft_n` /
 `draft_n_accepted` and the `radiance:draft_*` metrics like a head's. Prompt lookup reads the
 committed sequence, so a step is not issued ahead of the previous one's readback.
 
@@ -2159,7 +2162,7 @@ by 0.002-0.003 nats.
 | flag | default | |
 |---|---|---|
 | `--num-speculative-tokens N` | auto | speculative window; 0 disables. The ceiling under `--draft-window adaptive` |
-| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a container that declares a draft head is refused; sets the window to K (§4.6) |
+| `--spec-ngram K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a draft head the container carries is not declared, loaded or placed; sets the window to K (leave `--num-speculative-tokens` unset or give K) (§4.6) |
 | `--spec-ngram-min N`, `--spec-ngram-max N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `--draft-window MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
 | `--draft-short-from N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
