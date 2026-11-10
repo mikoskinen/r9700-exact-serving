@@ -8,7 +8,13 @@
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P] [--pfstamps FILE]
 //           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump)]
 //           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
-//           [--ep N [--ep-rank r|-1]] [--fn4 name=value ...] [--x3map]
+//           [--ep N [--ep-rank r|-1]] [--fn4 name=value ...] [--x3map] [--split-seed --dump-sorted FILE --dump-y-r4d FILE]
+//
+// --split-seed (fn4 P2x, 10.11.2026; with --chain --layers 1 --pools 1): the token inputs and the weights reseeded from
+// fixed values after the routing draw, so a run at M and one at M / 2 hold the SAME first M / 2 tokens (the draw is
+// sequential per token), the same x rows and the same weights; --dump-sorted writes layer 0's sorted_tok (int32) and
+// --dump-y-r4d the libr4d chain's y of layer 0 (as --dump-y does the exl3r4d chain's): a script then compares each
+// slot of the first M / 2 tokens' output between the two pass sizes, byte for byte.
 //
 // --ep N (ported 10.11.2026 from the ds41 exl3-gu25c line, without its --ep-param): EXPERT PARALLELISM over N ranks --
 // every token's top_k is drawn over E x N experts and this rank keeps experts [r E, r E + E) (--experts E is the rank's
@@ -186,6 +192,8 @@ struct Opts {
     int ep = 1, ep_rank = 0;  // --ep N [--ep-rank r]: expert parallelism over N ranks (see the header)
     std::vector<std::pair<std::string, int>> fn4;   // --fn4 name=value: the library's runtime switches
     bool x3map = false;       // --x3map (with --chain): v10's shared map between the chain's gate_up and down
+    bool split_seed = false;  // --split-seed: data reseeded after the draw (fn4 P2x pass-size byte compare)
+    std::string dump_sorted, dump_y_r4d;   // --dump-sorted / --dump-y-r4d FILE
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
     int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
     int a_rot = 0;            // --a-rot 1 (with --chain; or --op gate_up: the GEMM alone over xr): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
@@ -265,7 +273,8 @@ Route draw_ep(int64_t M, int64_t E, int64_t topk, int ep, int rank) {
 // A class's entries in one buffer a plane and a device pointer table onto them.
 // The engine's non-resident tier (playbook R5, libr4d's moe_perf pool_pct, r4d_selftest.cpp:5742-5782): a pooled
 // entry points into pinned, mapped host memory (a copy of the device entry), which the GEMM reads over the link.
-void* g_fu_h = nullptr; void* g_fu_y = nullptr; size_t g_fu_hb = 0, g_fu_yb = 0;   // --fused: the chain's h and y
+void* g_fu_h = nullptr; void* g_fu_y = nullptr; size_t g_fu_hb = 0, g_fu_yb = 0;
+void* g_r4d_y = nullptr; size_t g_r4d_yb = 0;   // fn4 P2x: the libr4d chain's y   // --fused: the chain's h and y
 void* g_gd_y = nullptr;                                                               // --gd: the v5 row's y
 std::vector<char> g_pooled[EXL3_MAX_CLS];   // [class][entry]: read from host memory
 void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
@@ -374,6 +383,9 @@ int main(int argc, char** argv) {
         else if (a == "--ep") o.ep = std::atoi(nx());
         else if (a == "--ep-rank") o.ep_rank = std::atoi(nx());
         else if (a == "--x3map") o.x3map = true;
+        else if (a == "--split-seed") o.split_seed = true;
+        else if (a == "--dump-sorted") o.dump_sorted = nx();
+        else if (a == "--dump-y-r4d") o.dump_y_r4d = nx();
         else if (a == "--fn4") {
             const std::string v = nx();
             const size_t eq = v.find('=');
@@ -520,6 +532,12 @@ int main(int argc, char** argv) {
         for (int64_t e = 0; e < o.E; ++e) live_sum += route.back().rows[(size_t)e] > 0;
     }
     std::printf("perfmoe: %.1f live experts a dispatch (mean over layers)\n", live_sum / o.layers);
+    if (!o.dump_sorted.empty()) {   // fn4 P2x: layer 0's sorted_tok
+        FILE* f = std::fopen(o.dump_sorted.c_str(), "wb");
+        if (!f || std::fwrite(route[0].sorted.data(), 4, route[0].sorted.size(), f) != route[0].sorted.size())
+            die("cannot write " + o.dump_sorted);
+        std::fclose(f);
+    }
     if (o.pooled > 0) {   // the least routed P% of each class's experts, over every draw (residency keeps the hot ones)
         for (int c = 0; c < nc; ++c) {
             std::vector<int64_t> cnt((size_t)nec[c], 0), order((size_t)nec[c]);
@@ -601,7 +619,9 @@ int main(int argc, char** argv) {
             const Exl3Positions* gpos = exl3_positions(o.mod4 ? EXL3_GATE_UP4 : EXL3_GATE_UP);
             const Exl3Positions* dpos = exl3_positions(o.mod4 ? EXL3_DOWN4 : EXL3_DOWN);
             const Exl3Positions* ppos = exl3_positions(o.mod4 ? EXL3_PREP_GU4 : EXL3_PREP_GU);
+            if (o.split_seed) g_rs = 0x5EED000000000001ull;   // fn4 P2x: x's rows independent of M's draw
             void* x = o.rand_data ? f16_rand((size_t)(o.M * o.hidden), 1.0f, 0) : f16_buf((size_t)(o.M * o.hidden), 0.5f);
+            if (o.split_seed) g_rs = 0x5EED000000000002ull;   // ...and the weights independent of M
             void* h = dalloc((size_t)(Tr * wmax * 2));
             void* y = dalloc((size_t)(Tr * o.hidden * 2));
             const int64_t mapw = exl3_map_words(Tr, o.E);   // --x3map: one buffer; the chain is stream-ordered a layer
@@ -725,7 +745,9 @@ int main(int argc, char** argv) {
             cls_params(D.p, Rd, Cd);
             D.p.insert(D.p.end(), { PI("parts", 1), PI("n_expert", o.E), PI("top_k", o.topk), PI("group", 128),
                                     PS("a_order", "sorted"), PS("dtype", "w4nl64a8h") });
+            if (o.split_seed) g_rs = 0x5EED000000000003ull;   // fn4 P2x
             void* a = random_buf((size_t)(o.M * o.hidden), 8, 111);
+            if (o.split_seed) g_rs = 0x5EED000000000004ull;
             std::vector<float> asc((size_t)(o.M * o.hidden / 128), 0.013f);
             void* as = dalloc(asc.size() * 4);
             put(as, asc.data(), asc.size() * 4);
@@ -733,6 +755,7 @@ int main(int argc, char** argv) {
             void* eq = dalloc((size_t)(Tr * wmax));
             void* es = dalloc((size_t)(Tr * (wmax / 128) * 4));
             void* y = dalloc((size_t)(Tr * o.hidden * 2));
+            g_r4d_y = y; g_r4d_yb = (size_t)(Tr * o.hidden * 2);   // fn4 P2x: --dump-y-r4d
             std::vector<std::array<std::array<RadTensor, 2>, EXL3_MAX_CLS>> pg((size_t)o.pools), pd((size_t)o.pools);
             for (int q = 0; q < o.pools; ++q)
                 for (int c = 0; c < nc; ++c) {
@@ -1236,6 +1259,19 @@ int main(int argc, char** argv) {
         if (!o.dump_y.empty()) {
             FILE* f = std::fopen(o.dump_y.c_str(), "wb");
             if (!f || std::fwrite(y1.data(), 1, y1.size(), f) != y1.size()) die("cannot write " + o.dump_y);
+            std::fclose(f);
+        }
+        if (!o.dump_y_r4d.empty() && g_r4d_y) {   // fn4 P2x: the libr4d chain's layer-0 y, fresh
+            size_t li = libs.size();
+            for (size_t i = 0; i < libs.size(); ++i) if (std::strcmp(libs[i].name, "libr4d chain") == 0) li = i;
+            if (li == libs.size()) die("--dump-y-r4d needs --r4d");
+            std::vector<char> yr(g_r4d_yb);
+            ck(hipMemset(g_r4d_y, 0x5a, g_r4d_yb), "poison");
+            (void)launch_layer(libs[li], 0);
+            ck(hipStreamSynchronize(stream), "r4d y");
+            ck(hipMemcpy(yr.data(), g_r4d_y, g_r4d_yb, hipMemcpyDeviceToHost), "copy");
+            FILE* f = std::fopen(o.dump_y_r4d.c_str(), "wb");
+            if (!f || std::fwrite(yr.data(), 1, yr.size(), f) != yr.size()) die("cannot write " + o.dump_y_r4d);
             std::fclose(f);
         }
         size_t dg = 0;
