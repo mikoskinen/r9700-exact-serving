@@ -56,6 +56,11 @@
  *                   (outside --host-pool-mib, the plan unchanged) and its slab is carved for the trunk;
  *                   the value is the start value. Unset: nothing declared, and 1 is refused. Exact:
  *                   placement only. The counters are GET's "lend" object (state_json).
+ *   draft_lend_borrow  scheduler (lever DL, sched/draft.h kBorrowMin / kBorrowDamp): 1 a cost class with no lent
+ *                   plain step of its own prices its plain step with the nearest class's lent ratio (16 samples
+ *                   at least; a lower class's as it is, a higher one's gain damped 0.75 a class step), 0 not.
+ *                   RADIANCE_DRAFT_LEND_BORROW=1 at start. 1 refused unless the lend is set up. Exact: it moves
+ *                   only D7's choice of depth.
  *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule in force, 0 off, 1 rule,
  *                   2 rule-w -- the switch once set, else RADIANCE_AQL_ACQ=rule | rule-w at start (ds41-ar-acq
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
@@ -100,7 +105,7 @@ namespace fn4 {
 
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
-              kDraftLend, kSwitches };
+              kDraftLend, kDraftLendBorrow, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -134,7 +139,7 @@ void lend_register(bool capable);
  * ms; the probe back-off's doublings now and the probe interval they give. */
 void note_lend_sched(int64_t lent_cycles, int64_t plain_steps, int64_t plain_ms, int64_t probe_steps,
                      int64_t probe_ms, int64_t transit_steps, int64_t transit_ms, int64_t backoff_k,
-                     int64_t probe_interval);
+                     int64_t probe_interval, int64_t borrow_cycles = 0);
 /* The engine, at every step release: the lend's state over the ranks (0 resident, 1 moving, 2 lent), rank 0's
  * lends and recalls begun, trunk units in the drafter's memory, the drafter's units in VRAM and in all, and
  * the drafter's slab in MiB. */

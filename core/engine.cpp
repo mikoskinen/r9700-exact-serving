@@ -864,6 +864,8 @@ int Engine::prepare_release(const RadBatch* b) {
                                 sched_.set_draft_probe_backoff(sw[fn4::kDraftProbeBackoff]));
             if (sw[fn4::kDraftLend] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftLend, sched_.set_draft_lend(sw[fn4::kDraftLend]));
+            if (sw[fn4::kDraftLendBorrow] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftLendBorrow, sched_.set_draft_lend_borrow(sw[fn4::kDraftLendBorrow]));
         }
     }
     /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its

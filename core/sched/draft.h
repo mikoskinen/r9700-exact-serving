@@ -105,6 +105,8 @@ public:
         /* The drafter's lend (lever DL): 0 off, 1 on after kLendHold cycles at 0, 2..4096 on after
          * that many. Acts only where the engine set the lend up (Scheduler::set_lend_view). */
         int  lend = 0;
+        /* The lent ratio borrowed by a class with none of its own (kBorrowMin, kBorrowDamp). */
+        bool borrow = false;
     };
 
     /* ---------------------------------------------------------- the policy's constants
@@ -190,6 +192,19 @@ public:
      * price the lend. */
     static constexpr double kLentRatioMin = 0.5;
     static constexpr double kLentRatioMax = 1.25;
+    /* The borrow (fn4 draft_lend_borrow): a class with no lent ratio of its own prices its plain step
+     * with a neighbour's, so D7 can choose 0 where the lend would pay before the lend ever ran there
+     * (c4: the plain step it weighs is the VRAM-reduced NST 5 one). From the nearest class with at
+     * least kBorrowMin ratio samples (half the cost half-life: past the running mean's first noise);
+     * at equal distance the lower class (fewer rows). The lent gain, 1 - ratio, is taken as it is from
+     * a lower class and damped by kBorrowDamp per class step from a higher one: by the VRAM sweep's
+     * slope over the ~237 units the lend returns, the gain is 6.1 % of the plain step at one row (1.0
+     * of 16.4 ms), 10.5 % at four (3.1 of 29.3) and 10.7 % at eight (4.7 of 44.05, d0attr) -- it never
+     * shrinks toward more rows, so a lower class's ratio is never optimistic upward, while downward it
+     * shrinks by 0.98 for the c8 -> c4 step and 0.58 over the two c4 -> c1 steps (0.76 a step). 0.75 a
+     * step stays at or under both: c8's 10.7 % prices c4 at 8.0 %, under its 10.5 %. */
+    static constexpr int64_t kBorrowMin = 16;
+    static constexpr double  kBorrowDamp = 0.75;
     /* The lend's state as the scheduler hands it to step_time: a stable resident drafter (every
      * sample as before), a stable lent slab past its warm-up (plain samples into the lent table,
      * drafting ones none), or a transition (no sample). */
@@ -250,8 +265,15 @@ public:
     }
     /* Plain steps measured while lent, for tests and the report. */
     int64_t lent_samples(int n_rows) const { return n_rows >= 1 ? lent_n_[cost_class(n_rows)] : 0; }
-    /* The plain step's expected ms for `n_rows` under the lend where measured (else the unlent one). */
-    double plain_ms(int n_rows) const;
+    /* The plain step's expected ms for `n_rows` under the lend where measured (else the unlent one);
+     * under the borrow, a class with no lent ratio of its own takes a neighbour's (kBorrowMin).
+     * `borrowed`, if set, says whether it did. */
+    double plain_ms(int n_rows, bool* borrowed = nullptr) const;
+    /* The borrow (fn4 draft_lend_borrow): on or off between steps. */
+    bool borrow() const { return borrow_; }
+    void set_borrow(bool on) { borrow_ = on; }
+    /* Depth-0 decisions whose plain step was priced with a borrowed ratio. For the report. */
+    int64_t borrow_cycles() const { return n_borrow_; }
     /* Whether the head drafts this cycle: false only while depth 0 holds D at 0, or a plain probe
      * runs. A block drafter's context pass runs either way; its query pass and every verify row
      * do not. */
@@ -386,6 +408,10 @@ private:
     double  lent_ms_[kCostClasses] = {};
     int64_t lent_n_[kCostClasses] = {};
     int64_t lent_rn_[kCostClasses] = {};
+    bool    borrow_ = false;
+    int64_t n_borrow_ = 0;
+    /* The ratio class `c` borrows (kBorrowMin, kBorrowDamp), or 0 when no neighbour has one. */
+    double  borrowed_ratio(int c) const;
     bool    zero_now() const {
         return adapt_ && depth0_ && (probe_left_ > 0 ? probe_d_ == 0 : zero_);
     }

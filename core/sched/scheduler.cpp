@@ -114,6 +114,16 @@ int Scheduler::set_draft_lend(int v) {
     return draft_.lend();
 }
 
+int Scheduler::set_draft_lend_borrow(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v == 1 && !lend_capable_)
+        RAD_WARN("fn4: draft_lend_borrow=1 refused: the drafter's lend is not set up (RADIANCE_DRAFT_LEND unset "
+                 "at start, or no drafter slab to lend)");
+    else if (v == 0 || v == 1)
+        draft_.set_borrow(v == 1);
+    return draft_.borrow() ? 1 : 0;
+}
+
 void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) {
     std::lock_guard<std::mutex> lk(mu_);
     lend_view_ = std::move(view);
@@ -123,6 +133,10 @@ void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) 
                  "a static plan, or a drafter that cannot run the adaptive window); off", draft_.lend());
         draft_.set_lend(0);
     }
+    if (!lend_capable_ && draft_.borrow()) {
+        RAD_WARN("RADIANCE_DRAFT_LEND_BORROW=1: the drafter's lend is not set up; off");
+        draft_.set_borrow(false);
+    }
     if (lend_view_) {
         uint64_t ch = 0;
         dl_state_ = lend_view_(&ch);
@@ -130,6 +144,11 @@ void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) 
     }
     fn4::lend_register(lend_capable_);
     fn4::note_sched(fn4::kDraftLend, draft_.lend());
+    fn4::note_sched(fn4::kDraftLendBorrow, draft_.borrow() ? 1 : 0);
+    if (lend_capable_ && draft_.borrow())
+        RAD_INFO("draft lend borrow: a cost class with no lent plain step of its own prices it with the nearest "
+                 "class's lent ratio (%lld samples at least; a lower class's as it is, a higher one's gain x %.2f "
+                 "a class step)", (long long)DraftController::kBorrowMin, DraftController::kBorrowDamp);
     if (lend_capable_)
         RAD_INFO("draft lend: %s; once depth 0 has held %d cycles with probes at least %d cycles apart, the "
                  "drafter's expert slab is lent to the trunk's experts, and taken back when drafting resumes",
@@ -345,6 +364,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         dp.backoff = env_int("RADIANCE_DRAFT_PROBE_BACKOFF", 0, DraftController::kBackoffMax, 0);
         /* The lend's start value; it acts only once the engine set it up (set_lend_view). */
         dp.lend = env_int("RADIANCE_DRAFT_LEND", -1, 4096, 0);
+        dp.borrow = env_int("RADIANCE_DRAFT_LEND_BORROW", 0, 1, 0) == 1;
         hybrid_ = env_int("RADIANCE_DRAFT_HYBRID", 0, 1, 0) == 1;
         hybrid_match_ = env_int("RADIANCE_DRAFT_HYBRID_MATCH", 1, 256, LookupGate::kLongMatch);
         if (dp.depth0 && !dp.adapt)
@@ -380,6 +400,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     lent_cycles_ = lent_plain_steps_ = lent_probe_steps_ = transit_steps_ = 0;
     lent_plain_ms_ = lent_probe_ms_ = transit_ms_ = 0.0;
     fn4::note_sched(fn4::kDraftLend, draft_.lend());
+    fn4::note_sched(fn4::kDraftLendBorrow, draft_.borrow() ? 1 : 0);
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
      * row, is measured. */
@@ -3251,7 +3272,7 @@ void Scheduler::step_finished() {
     if (lend_view_)
         fn4::note_lend_sched(lent_cycles_, lent_plain_steps_, (int64_t)(lent_plain_ms_ + 0.5), lent_probe_steps_,
                              (int64_t)(lent_probe_ms_ + 0.5), transit_steps_, (int64_t)(transit_ms_ + 0.5),
-                             draft_.backoff_k(), draft_.probe_interval());
+                             draft_.backoff_k(), draft_.probe_interval(), draft_.borrow_cycles());
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};

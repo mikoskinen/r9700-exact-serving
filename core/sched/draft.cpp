@@ -82,6 +82,8 @@ int DraftController::configure(const Params& p) {
     n_zero_ = n_probe_ = n_zero_moves_ = 0;
     set_backoff(p.backoff);
     set_lend(p.lend);
+    borrow_ = p.borrow;
+    n_borrow_ = 0;
     for (int c = 0; c < kCostClasses; ++c) {
         lent_ratio_[c] = lent_ms_[c] = 0.0;
         lent_n_[c] = lent_rn_[c] = 0;
@@ -174,12 +176,32 @@ void DraftController::step_time(int depth, int n_rows, double ms, double tokens,
     ++n;
 }
 
-double DraftController::plain_ms(int n_rows) const {
+double DraftController::borrowed_ratio(int c) const {
+    for (int d = 1; d < kCostClasses; ++d) {
+        const int lo = c - d, hi = c + d;
+        if (lo >= 0 && lent_rn_[lo] >= kBorrowMin) return lent_ratio_[lo];
+        if (hi < kCostClasses && lent_rn_[hi] >= kBorrowMin)
+            return 1.0 - (1.0 - lent_ratio_[hi]) * std::pow(kBorrowDamp, (double)d);
+    }
+    return 0.0;
+}
+
+double DraftController::plain_ms(int n_rows, bool* borrowed) const {
+    if (borrowed) *borrowed = false;
     const int c = n_rows >= 1 ? cost_class(n_rows) : 0;
     const double base = cost_ms_[0][c];
-    if (lend_hold() <= 0 || lent_n_[c] <= 0) return base;
-    if (cost_n_[0][c] > 0) return lent_rn_[c] > 0 ? base * lent_ratio_[c] : base;
-    return lent_ms_[c];
+    if (lend_hold() <= 0) return base;
+    if (lent_n_[c] > 0 && cost_n_[0][c] <= 0) return lent_ms_[c];
+    if (lent_rn_[c] > 0) return base * lent_ratio_[c];
+    /* No ratio of its own: the unlent plain step, or under the borrow a neighbour's ratio on it. */
+    if (borrow_ && cost_n_[0][c] > 0) {
+        const double r = borrowed_ratio(c);
+        if (r > 0.0) {
+            if (borrowed) *borrowed = true;
+            return base * r;
+        }
+    }
+    return base;
 }
 
 int64_t DraftController::cost_samples(int depth, int n_rows) const {
@@ -396,7 +418,9 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
          * the plain step. */
         double g_d = (tok[dd] + plain) / step_cost(dd, n_rows);
         if (dn_[c] >= kCostClipAfter && dms_[c] > 0.0) g_d = std::fmin(g_d, dtok_[c] / dms_[c]);
-        const double g_0 = (double)n_rows / plain_ms(n_rows);
+        bool borrowed = false;
+        const double g_0 = (double)n_rows / plain_ms(n_rows, &borrowed);
+        if (borrowed) ++n_borrow_;
         const bool want = zero_ ? !(g_d > g_0 * (1.0 + kHyst)) : g_0 > g_d * (1.0 + kHyst);
         if (want != zero_ && zero_held_ >= kHold) {
             RAD_DEBUG("draft window: head depth %d -> %d over %d rows (%.3f -> %.3f tokens a ms)",

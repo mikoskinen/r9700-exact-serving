@@ -314,6 +314,10 @@ public:
      * value the scheduler now runs. */
     int      set_draft_probe_backoff(int v);
     int      set_draft_lend(int v);
+    /* fn4 draft_lend_borrow (lever DL): 1 a class with no lent ratio prices its plain step with a
+     * neighbour's (DraftController::kBorrowMin, kBorrowDamp), 0 not. Refused (left 0) unless the lend
+     * is set up. Returns the value the scheduler now runs. */
+    int      set_draft_lend_borrow(int v);
     /* Lever DL: the engine's view of the drafter's lend (Engine::serve, once the movers set it up):
      * `view` returns DraftController::LendSample's state over every rank (resident, transit, lent)
      * and writes the transitions so far; `capable` whether any slab can be lent. Without it the

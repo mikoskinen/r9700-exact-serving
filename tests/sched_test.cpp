@@ -4630,6 +4630,114 @@ TEST(staying_at_zero_is_priced_at_the_lent_plain_step) {
     CHECK(off.zero_moves() > mo);
 }
 
+/* The borrow (draft_lend_borrow): a cost class with no lent ratio of its own prices its plain step with the
+ * nearest class's (kBorrowMin samples at least), a lower class's as it is, a higher one's gain damped kBorrowDamp
+ * a class step. Off, pricing is 9461f81's exactly. The case D7 meets at c4: lent at c8 (40 -> 35.72 ms, the
+ * d0attr gain of 4.7 ms in 44, ratio 0.893), never at c4, where drafting yields 9.82 tokens in 67.85 ms (0.1447 a
+ * ms, depth0b) against an unlent plain step of 29.3 ms (0.1365): unborrowed, 0 is left; borrowed, c4's plain step
+ * is priced 29.3 x (1 - 0.107 x 0.75) = 26.95 ms (0.1484), within kHyst of staying, so 0 holds. */
+namespace {
+/* At 0 at eight rows (plain 40 ms against windows of 100 + 10 d ms), `lent8` lent plain steps of 35.72 ms there,
+ * and at four rows an unlent plain step of 29.3 ms and drafting steps of 9.82 tokens in 67.85 ms measured. */
+DraftController c4_controller(bool borrow, int lent8, DraftAdapt* u, DraftAdapt** uf) {
+    DraftController z;
+    DraftController::Params p;
+    p.max_depth = 5;
+    p.adapt = true;
+    p.depth0 = true;
+    p.lend = 1;
+    p.borrow = borrow;
+    CHECK_OK(z.configure(p));
+    for (int i = 0; i < 8; ++i) { u[i] = estimate(z, 0.6, 0.6); uf[i] = &u[i]; }
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) z.step_time(d, 8, 100.0 + 10.0 * d);
+    for (int t = 0; t < 1 + DraftController::kPlainWarm + 3 + 8; ++t) {
+        (void)z.plan_step(uf, 8, 8);
+        if (!z.head_runs() && t > 0) z.step_time(0, 8, 40.0);
+    }
+    CHECK(!z.head_runs());
+    CHECK_EQ(z.zero_moves(), (int64_t)1);
+    for (int k = 0; k < lent8; ++k) z.step_time(0, 8, 35.72, -1.0, DraftController::kLendLent);
+    for (int k = 0; k < 4; ++k) z.step_time(0, 4, 29.3);
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) z.step_time(d, 4, 67.85, 9.82);
+    for (int i = 0; i < 4; ++i) u[i] = estimate(z, 0.9, 0.9);
+    return z;
+}
+}  /* namespace */
+
+TEST(the_borrow_prices_a_class_never_lent_with_its_nearest_neighbours_lent_ratio) {
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    const double r8 = 35.72 / 40.0;
+    /* Off: c4 is priced at its unlent plain step whatever c8 measured (9461f81's pricing). */
+    DraftController off = c4_controller(false, 32, u, uf);
+    CHECK(!off.borrow());
+    CHECK_NEAR(off.plain_ms(8), 40.0 * r8, 1e-6);
+    bool b = true;
+    CHECK_NEAR(off.plain_ms(4, &b), 29.3, 1e-9);
+    CHECK(!b);
+    /* On, below kBorrowMin ratio samples at c8: nothing to borrow. */
+    DraftController few = c4_controller(true, (int)DraftController::kBorrowMin - 1, u, uf);
+    CHECK_NEAR(few.plain_ms(4, &b), 29.3, 1e-9);
+    CHECK(!b);
+    /* On, kBorrowMin: c8 is one class above c4, its gain damped once. */
+    DraftController on = c4_controller(true, (int)DraftController::kBorrowMin, u, uf);
+    CHECK_NEAR(on.plain_ms(4, &b), 29.3 * (1.0 - (1.0 - r8) * DraftController::kBorrowDamp), 1e-6);
+    CHECK(b);
+    /* Two classes down (two rows: class 1), damped twice -- once it has an unlent plain step to scale. */
+    CHECK_EQ(on.cost_samples(0, 2), (int64_t)0);   /* no unlent plain step there: nothing to scale */
+    CHECK_NEAR(on.plain_ms(2), 0.0, 1e-12);
+    on.step_time(0, 2, 20.0);
+    CHECK_NEAR(on.plain_ms(2, &b), 20.0 * (1.0 - (1.0 - r8) * DraftController::kBorrowDamp * DraftController::kBorrowDamp), 1e-6);
+    CHECK(b);
+    /* A class with a ratio of its own keeps it: c8 itself. */
+    CHECK_NEAR(on.plain_ms(8, &b), 40.0 * r8, 1e-6);
+    CHECK(!b);
+    /* Upward a lower class's ratio is taken as it is, and at equal distance the lower class wins: c4 lent at
+     * 0.95 (16 samples), then 16 rows (class 4) -- c8 is nearer (one step, as it is); 2..3 rows (class 1) -- c0
+     * has none, c4 at one step above (damped). */
+    for (int k = 0; k < 16; ++k) on.step_time(0, 4, 29.3 * 0.95, -1.0, DraftController::kLendLent);
+    CHECK_NEAR(on.plain_ms(4, &b), 29.3 * 0.95, 1e-3);
+    CHECK(!b);
+    on.step_time(0, 16, 60.0);
+    CHECK_NEAR(on.plain_ms(16, &b), 60.0 * r8, 1e-6);
+    CHECK(b);
+    const double r4 = on.plain_ms(4) / 29.3;
+    CHECK_NEAR(on.plain_ms(2, &b), 20.0 * (1.0 - (1.0 - r4) * DraftController::kBorrowDamp), 1e-6);
+    CHECK(b);
+    on.step_time(0, 1, 15.0);
+    for (int k = 0; k < 16; ++k) on.step_time(0, 1, 15.0 * 0.97, -1.0, DraftController::kLendLent);
+    CHECK_NEAR(on.plain_ms(2, &b), 20.0 * (on.plain_ms(1) / 15.0), 1e-6);   /* c0 below, c2 above: the lower */
+    CHECK(b);
+    /* Lend off: no borrow either. */
+    on.set_lend(0);
+    CHECK_NEAR(on.plain_ms(16), 60.0, 1e-9);
+}
+
+TEST(the_borrow_lets_depth_zero_hold_at_c4_where_the_lent_c8_ratio_says_it_pays) {
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    DraftController off = c4_controller(false, 32, u, uf);
+    DraftController few = c4_controller(true, (int)DraftController::kBorrowMin - 1, u, uf);
+    DraftController on = c4_controller(true, 32, u, uf);
+    const int64_t m = off.zero_moves();
+    for (int t = 0; t < 200; ++t) {
+        (void)off.plan_step(uf, 4, 4);
+        (void)few.plan_step(uf, 4, 4);
+        (void)on.plan_step(uf, 4, 4);
+    }
+    CHECK(off.zero_moves() > m);                   /* 0.1447 > 0.1365 x 1.02: drafting */
+    CHECK(few.zero_moves() > m);
+    CHECK_EQ(on.zero_moves(), m);                  /* 0.1447 < 0.1484 x 1.02: 0 holds */
+    CHECK(on.borrow_cycles() > 0);
+    CHECK_EQ(off.borrow_cycles(), (int64_t)0);
+    /* The switch off between steps: the same history leaves 0. */
+    on.set_borrow(false);
+    for (int t = 0; t < 200; ++t) (void)on.plan_step(uf, 4, 4);
+    CHECK(on.zero_moves() > m);
+}
+
 /* Through the scheduler: the switches, refused until the engine set the lend up, and each step's lend state
  * as the engine's view reports it -- no sample while it moves, a lent plain step into the lent table past
  * kLendWarm cycles of a settled lend. */
@@ -4641,6 +4749,7 @@ TEST(the_scheduler_hands_the_lend_its_state_and_refuses_it_until_set_up) {
     REQUIRE(f.sch.draft().adaptive());
     CHECK(!f.sch.lend_capable());
     CHECK_EQ(f.sch.set_draft_lend(1), 0);            /* no view: refused */
+    CHECK_EQ(f.sch.set_draft_lend_borrow(1), 0);
     CHECK(!f.sch.draft_lend_wanted());
     int state = DraftController::kLendResident;
     uint64_t changes = 0;
@@ -4695,6 +4804,10 @@ TEST(the_scheduler_hands_the_lend_its_state_and_refuses_it_until_set_up) {
     /* Depth 0 off: drafting at once, the lend not wanted. */
     CHECK_EQ(f.sch.set_draft_depth0(0), 0);
     CHECK(!f.sch.draft_lend_wanted());
+    CHECK_EQ(f.sch.set_draft_lend_borrow(1), 1);
+    CHECK(f.sch.draft().borrow());
+    CHECK_EQ(f.sch.set_draft_lend_borrow(2), 1);      /* not 0 or 1: unchanged */
+    CHECK_EQ(f.sch.set_draft_lend_borrow(0), 0);
     CHECK_EQ(f.sch.set_draft_lend(-1), -1);           /* forced: wanted whatever the depth */
     CHECK(f.sch.draft_lend_wanted());
     CHECK_EQ(f.sch.set_draft_lend(0), 0);
@@ -4704,6 +4817,7 @@ TEST(the_scheduler_hands_the_lend_its_state_and_refuses_it_until_set_up) {
     CHECK(!f.sch.lend_capable());
     CHECK_EQ(f.sch.set_draft_lend(1), 0);
     CHECK_EQ(f.sch.set_draft_lend(-1), 0);
+    CHECK_EQ(f.sch.set_draft_lend_borrow(1), 0);
 }
 
 /* ------------------------------------------------------------------ the hybrid (scheduler.h)

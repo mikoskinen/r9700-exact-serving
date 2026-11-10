@@ -5153,6 +5153,9 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     const HttpResponse l0 = f.post("/admin/fn4", R"({"draft_lend":1})");
     CHECK_EQ(l0.status, 400);
     CHECK(has(l0.body, "RADIANCE_DRAFT_LEND was not set at start"));
+    const HttpResponse lb = f.post("/admin/fn4", R"({"draft_lend_borrow":1})");
+    CHECK_EQ(lb.status, 400);
+    CHECK(has(lb.body, "RADIANCE_DRAFT_LEND was not set at start"));
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":5000})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-2})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_probe_backoff":9})").status, 400);
@@ -5187,14 +5190,27 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK(has(g1.body, "\"lend\": {\"capable\": 1, \"lent_cycles\": 100, \"lent_plain_steps\": 80, \"lent_plain_ms\": 3200, "
                        "\"lent_probe_steps\": 2, \"lent_probe_ms\": 300, \"transit_steps\": 9, \"transit_ms\": 450, "
                        "\"backoff_k\": 3, \"probe_interval\": 128, \"state\": 2, \"lends\": 1, \"reclaims\": 0, "
-                       "\"lent_units\": 237, \"draft_resident\": 0, \"draft_units\": 96, \"slab_mib\": 2151}"));
+                       "\"lent_units\": 237, \"draft_resident\": 0, \"draft_units\": 96, \"slab_mib\": 2151, "
+                       "\"borrow_cycles\": 0}"));
+    /* The borrow: 0 / 1, refused unless the lend is set up; its count at the end of "lend". */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_borrow":2})").status, 400);
+    fn4::note_sched(fn4::kDraftLendBorrow, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_borrow":1})").status, 200);
+    CHECK(fn4::apply_pending(29, sw));
+    CHECK_EQ(sw[fn4::kDraftLendBorrow], 1);
+    fn4::note_sched(fn4::kDraftLendBorrow, 1);
+    fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128, 41);
+    const HttpResponse g2 = f.get("/admin/fn4");
+    CHECK(has(g2.body, "\"draft_lend\": 1, \"draft_lend_borrow\": 1"));
+    CHECK(has(g2.body, "\"slab_mib\": 2151, \"borrow_cycles\": 41}"));
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
     CHECK_EQ(sw[fn4::kDraftLend], -1);
     /* Back off. */
-    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":0,"draft_probe_backoff":0})").status, 200);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":0,"draft_probe_backoff":0,"draft_lend_borrow":0})").status, 200);
     CHECK(fn4::apply_pending(32, sw));
     fn4::note_sched(fn4::kDraftLend, 0);
+    fn4::note_sched(fn4::kDraftLendBorrow, 0);
     fn4::note_sched(fn4::kDraftProbeBackoff, 0);
     fn4::note_lend_sched(0, 0, 0, 0, 0, 0, 0, 0, 0);
     fn4::note_lend_engine(0, 0, 0, 0, 0, 0, 0);
