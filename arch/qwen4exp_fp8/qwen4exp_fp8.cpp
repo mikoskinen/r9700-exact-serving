@@ -1595,6 +1595,40 @@ static std::atomic<int>& fn4_sp_flag() {
 }
 constexpr int64_t kSpMinRows = 64;
 
+/* fn4 P-2 reading (10.11.2026, measurement only): RADIANCE_FN4_QSADUMP=<dir> writes, on rank 0, the QSA selection of
+ * full-attention layers 3 / 15 / 27 / 39 for one-sequence pipelined prefill steps that START near the depths 8k, 32k,
+ * 64k and 112k (the step's first position in [d, d + 4096)): per file a header {rows, width, first position} (int64),
+ * then nsel [rows] and sel [rows][width] (int32) -- what a q-tiled union walk would read, measured. Synchronous host
+ * copies: a reading run only. */
+static void qsa_dump(RadCtx* c, const Model& m, const RadBatch* batch, int li, int64_t T) {
+    static const char* dir = std::getenv("RADIANCE_FN4_QSADUMP");
+    if (!dir || !*dir || m.g.rank != 0 || !m.qsaw.sel || !m.qsaw.nsel || batch->n_seq != 1 || !batch->positions_h)
+        return;
+    if (li != 3 && li != 15 && li != 27 && li != 39) return;
+    const int64_t p0 = batch->positions_h[0];
+    bool near = false;
+    for (int64_t d : { 8192LL, 32768LL, 65536LL, 114688LL }) near = near || (p0 >= d && p0 < d + 4096);
+    if (!near) return;
+    const int64_t w = m.qsacfg.topk + 1;
+    std::vector<int32_t> sel((size_t)(T * w)), nsel((size_t)T);
+    void* ps = rad_buf_ptr(c, m.qsaw.sel);
+    void* pn = rad_buf_ptr(c, m.qsaw.nsel);
+    if (!ps || !pn) return;
+    if (rad_memcpy_async(sel.data(), ps, (size_t)(T * w * 4), rad_stream(c)) < 0 ||
+        rad_memcpy_async(nsel.data(), pn, (size_t)(T * 4), rad_stream(c)) < 0)
+        return;
+    rad_stream_sync(rad_stream(c));
+    char fn[512];
+    std::snprintf(fn, sizeof fn, "%s/qsa-L%02d-p%07lld.bin", dir, li, (long long)p0);
+    FILE* f = std::fopen(fn, "wb");
+    if (!f) return;
+    const int64_t hdr[3] = { T, w, p0 };
+    std::fwrite(hdr, 8, 3, f);
+    std::fwrite(nsel.data(), 4, nsel.size(), f);
+    std::fwrite(sel.data(), 4, sel.size(), f);
+    std::fclose(f);
+}
+
 static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, R = m.moecfg.rows;
@@ -1677,6 +1711,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
         else        l.gdn.step(c, batch, false, &pc);
+        if (l.full) qsa_dump(c, m, batch, (int)li, T);   /* fn4 P-2 reading (RADIANCE_FN4_QSADUMP) */
         auto ar_mix = [&](int64_t p) {
             if (sp_p(p))     rs_p(p);
             else if (l.full) l.attn.issue_ar(c, r0(p), rn(p));
