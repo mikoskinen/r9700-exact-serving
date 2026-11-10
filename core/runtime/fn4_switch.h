@@ -34,6 +34,8 @@
  *                   then the prep by map entry), 2 the map and the prep by row in one launch; no start value (the
  *                   plugin reads no environment), so it is set through POST /admin/fn4 only
  *
+ *   exl3_dz         exl3r4d (rad_fn4_switch): fn4 DZ at run time -- the decode band's spare workgroups zero their own
+ *                   dead rows directly (1) or by the scan (0); a plugin built at EXL3R4D_DZ 2 takes both  RADIANCE_FN4_X3DZ
  *   moe_pair        architecture plugin (rad_fn4_switch): fn4 P2x, a pipelined prefill step's two pieces through
  *                   ONE routed-expert pass (0 off, 1 the shared arm a piece after it, 2 the shared arms inside it);
  *                   needs RADIANCE_FN4_P2X=1 at start (the expert buffers declared two pieces tall)  RADIANCE_FN4_MOE_PAIR
@@ -56,7 +58,7 @@ namespace rad {
 namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
-              kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair,
+              kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz,
               kSwitches };
 
 const char* switch_name(int i);
