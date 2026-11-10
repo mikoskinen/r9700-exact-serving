@@ -123,6 +123,18 @@ inline std::atomic<int>& fn4_gather_inv_flag() {
     return f;
 }
 
+/* fn4 (10.11.2026) EXL3's shared routing map (exl3/exl3_abi.h v10) as a runtime switch: 1 = issue the layer's
+ * moe_exl3_gate_up and moe_exl3_down with the pass's `map` buffer (gate_up writes it, down reads it in place of its
+ * own map kernel), 0 = without (each op as at v8). The core switch "exl3_mapshare" reaches it through the
+ * architecture's rad_fn4_switch (qwen4exp_x3); RADIANCE_FN4_X3MAP=1 at start sets it on. Read at every issue. */
+inline std::atomic<int>& fn4_exl3_map_flag() {
+    static std::atomic<int> f{[] {
+        const char* e = std::getenv("RADIANCE_FN4_X3MAP");
+        return e && *e && std::strcmp(e, "0") != 0 ? 1 : 0;
+    }()};
+    return f;
+}
+
 struct MoeFP8 {
     struct Config {
         /* Routed experts this rank owns. Equal to `n_expert_all` unless experts are split across
@@ -510,6 +522,7 @@ struct MoeFP8 {
     uint32_t    x3_cdt[2]   = { 0, 0 };
     std::vector<rad_weight> x3_gu[4], x3_dn[3];
     rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
+    rad_buf     b_x3map = 0;    /* fn4 v10: the pass's shared routing map, i32 [exl3_map_words(rows * top_k, n_reg)] */
     int declare_exl3(RadBuilder* b, Names& nm, int l, const std::vector<int64_t>& reg);
     void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
     /* bf16 and EXL3 experts both read the bf16 activation, whole on their rank. */
@@ -1821,6 +1834,9 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l, const std::vect
         }
     }
     b_x3h = decl_b(b, nm.f("blk.%d.moe_exl3_h", l), RAD_F16, {c.rows * c.top_k, F});
+    /* fn4 v10: declared whatever the switch says, so it can flip between steps; gate_up writes it, down reads it, and
+     * nothing between them does (the shared expert's ops have their own buffers). */
+    b_x3map = decl_b(b, nm.f("blk.%d.moe_exl3_map", l), RAD_I32, {exl3_map_words(c.rows * c.top_k, ne)});
     /* the weights in each op's table-operand order: class 0's tables, then class 1's */
     std::vector<rad_weight> tab;
     const auto tables = [&](bool gate_up) {
@@ -1840,14 +1856,14 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l, const std::vect
                                  RAD_INT("a_rot", 0) };
     if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
-               {w.h.x, w.sorted, w.eoff}, {b_x3h});
+               {w.h.x, w.sorted, w.eoff}, {b_x3h, b_x3map});
     tables(false);
     std::vector<RadParam> dp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", D), RAD_INT("K", F),
                                  RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                  RAD_STR("dtype", x3_dtype[1]), RAD_STR("codebook", x3_cb[1]),
                                  RAD_INT("N_odd", D), RAD_INT("K_odd", F), RAD_INT("h_rot", 1) };
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
-               {b_x3h, w.sorted, w.eoff}, {w.edn});
+               {b_x3h, w.sorted, w.eoff, b_x3map}, {w.edn});
     if (!op_gu || !op_dn) return RAD_E_INVAL;
     rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank (%zu more kept plain bf16), swiglu "
                 "limit %g", l, x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, prot.size(), c.swiglu_limit);
@@ -1868,6 +1884,8 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
     opd[at.sorted] = brows(w.sorted, rows * k);
     opd[at.offset] = brows(w.eoff, ne + 1);
     opd[at.y] = out;
+    if (at.map >= 0 && b_x3map && fn4_exl3_map_flag().load(std::memory_order_relaxed))   /* fn4 v10 */
+        opd[at.map] = brows(b_x3map, exl3_map_words(rows * k, ne));
     for (int q = 0; q < 2; ++q)
         for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
             const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];

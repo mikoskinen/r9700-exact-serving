@@ -19,7 +19,7 @@ namespace {
 
 const char* const kNames[kSwitches] = { "no_route", "gather_inv", "hc_fusedown", "hc_normwave",
                                          "draft_adaptive", "hc_writevec", "hc_readv", "ar_lanethreads",
-                                         "hc_upmix", "ar_laneblocks", "aql_acq", "exl3_pfprep" };
+                                         "hc_upmix", "ar_laneblocks", "aql_acq", "exl3_pfprep", "exl3_mapshare" };
 const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_GATHER_INV",
                                          "RADIANCE_FN4_HC_FUSEDOWN", "RADIANCE_FN4_HC_NORMWAVE",
                                          nullptr, "RADIANCE_FN4_HC_WRITEVEC", "RADIANCE_FN4_HC_READV",
@@ -165,7 +165,8 @@ bool apply_pending(int step, int* draft_adaptive) {
         if (s.val[i].load(std::memory_order_relaxed) == v) continue;
         int handled = 1;
         if (i == kGatherInv || i == kHcFuseDown || i == kHcNormWave || i == kHcWriteVec ||
-            i == kHcReadV || i == kArLaneThreads || i == kHcUpMix || i == kArLaneBlocks || i == kExl3PfPrep) {
+            i == kHcReadV || i == kArLaneThreads || i == kHcUpMix || i == kArLaneBlocks || i == kExl3PfPrep ||
+            i == kExl3MapShare) {
             find_hooks(s);
             handled = 0;
             bool refused = false;
