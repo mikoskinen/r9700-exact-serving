@@ -5003,6 +5003,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(g.body, "\"idx_split\": -1"));       /* deepseek41's (lever I1): not loaded here */
     CHECK(has(g.body, "\"ds41_qnfold\": -1"));     /* deepseek41's (lever K1 folds a, e) */
     CHECK(has(g.body, "\"ds41_swfold\": -1"));
+    CHECK(has(g.body, "\"ds41_embrep\": -1"));     /* deepseek41's (lever EAR) */
     CHECK(has(g.body, "\"aql_acq\": 0"));
     CHECK(has(g.body, "\"epoch\": 0"));
     CHECK(has(g.body, "\"draft_capable\": -1"));
@@ -5019,7 +5020,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     const HttpResponse ix = f.post("/admin/fn4", R"({"idx_split":1})");
     CHECK_EQ(ix.status, 400);
     CHECK(has(ix.body, "no loaded plugin serves it"));
-    for (const char* b : { R"({"ds41_qnfold":1})", R"({"ds41_swfold":1})" }) {
+    for (const char* b : { R"({"ds41_qnfold":1})", R"({"ds41_swfold":1})", R"({"ds41_embrep":64})" }) {
         const HttpResponse r = f.post("/admin/fn4", b);
         CHECK_EQ(r.status, 400);
         CHECK(has(r.body, "no loaded plugin serves it"));

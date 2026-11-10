@@ -134,6 +134,12 @@
  *                   sequences -- above that the engine neither reads the plane nor waits for it (no cut, no host
  *                   wait before the step issued ahead), as at dspark_conf 0. Exact as dspark_conf: verify counts
  *                   only. Nonzero is refused where no confidence plane is declared.
+ *   ds41_embrep     deepseek41 (rad_fn4_*; lever EAR): the row bound up to which a step (trunk or DSpark query pass)
+ *                   looks its tokens up in the WHOLE token table (each rank holds it beside its shard) and skips the
+ *                   embedding all-reduce; 0 off .. max_tok. RADIANCE_DS41_EMB_REP=<rows> (needs
+ *                   RADIANCE_DS41_EMB_RAM=1) declares it for every height and starts at <rows>. Exact: the hc copies
+ *                   are written as row + 0, the exact all-reduce's bytes (its -0.0 comes out +0.0). Unset: nothing
+ *                   declared and only 0 is accepted. -1 when no loaded object serves it.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -158,7 +164,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
-              kDsparkConf, kDsparkAlt, kDsparkConfRows, kSwitches };
+              kDsparkConf, kDsparkAlt, kDsparkConfRows, kDs41EmbRep, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

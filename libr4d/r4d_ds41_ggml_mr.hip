@@ -723,6 +723,20 @@ template <int T, int RPW, typename OT>
 int mr_emu_stock_t(const R4dGgMrCall& c, unsigned grid, unsigned lds, const GgGemvArgs& A) {
     return R4D_EMIT(nullptr, (gg_gemv_kernel<T, RPW, false, OT>), dim3(grid), dim3(kGgThreads), lds, A);
 }
+/* tests/r4d_emu (ds41emb, lever EAR): embed_lookup_ggml's launch as gg_launch_embed issues it (a block a row, up to
+ * 4096 blocks; q8_0 / q5_K / q6_K need no LDS table), from this unit's copy of gg_embed_kernel. */
+int r4d_gg_embed_emu(int ty, const int32_t* tok, const uint8_t* w, long long w_ld, uint16_t* x, long long x_ld, int M,
+                     int E, int V, long long voff, float mult) {
+    const unsigned grid = (unsigned)(M < 4096 ? M : 4096);
+#define MR_EMU_EMB(T) R4D_EMIT(nullptr, gg_embed_kernel<T>, dim3(grid), dim3(kGgThreads), 0, tok, w, w_ld, x, x_ld, M, E, V, voff, mult)
+    switch (ty) {
+    case GG_Q5_K: return MR_EMU_EMB(GG_Q5_K);
+    case GG_Q6_K: return MR_EMU_EMB(GG_Q6_K);
+    case GG_Q8_0: return MR_EMU_EMB(GG_Q8_0);
+    default: return -1;
+    }
+#undef MR_EMU_EMB
+}
 int r4d_gg_mr_emu_stock(const R4dGgMrCall& c, int rpw) {
     GgGemvArgs A{};
     A.x = c.x; A.x_ld = c.x_ld;

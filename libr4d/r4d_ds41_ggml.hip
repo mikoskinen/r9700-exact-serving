@@ -1183,6 +1183,48 @@ __global__ __launch_bounds__(kGgThreads) void gg_gemv_kernel(GgGemvArgs A) {
     }
 }
 
+/* ================================================================== embed_lookup
+ * (Here, inside the part r4d_ds41_ggml_mr.hip includes, so tests/r4d_emu's ds41emb runs this same source:
+ * lever EAR holds the shard + all-reduce path to the whole-table lookup with it.) */
+template <int T>
+__global__ __launch_bounds__(kGgThreads) void gg_embed_kernel(const int32_t* tok, const uint8_t* w,
+                                                              long long w_ld, uint16_t* x,
+                                                              long long x_ld, int M, int E, int V,
+                                                              long long voff, float mult) {
+    using Q = Gg<T>;
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
+    uint8_t* const gg_smem = (uint8_t*)emu_dyn_lds();
+#else
+    extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
+#endif
+    gg_load_table<T>(gg_smem);
+    __syncthreads();
+    const void* tab = gg_smem;
+    const int nU = E / Q::QK * Q::UPB;
+    for (int m = (int)blockIdx.x; m < M; m += (int)gridDim.x) {
+        const long long id = (long long)tok[m] - voff;
+        uint16_t* xr = x + (long long)m * x_ld;
+        if (id < 0 || id >= V) {
+            for (int k = (int)threadIdx.x; k < E; k += kGgThreads) xr[k] = 0;
+            continue;
+        }
+        const uint8_t* wr = w + id * w_ld;
+        for (int U = (int)threadIdx.x; U < nU; U += kGgThreads) {
+            const int b = U / Q::UPB, u = U - b * Q::UPB;
+            uint32_t raw[Q::NR];
+            Q::load(wr + (long long)b * Q::BB, u, raw);
+            gg_for<4>([&](auto gi) {
+                constexpr int G = decltype(gi)::value;
+                float v[8];
+                Q::template dec<G>(raw, u, tab, v);
+                uint16_t* d = xr + b * Q::QK + Q::goff(u, G);
+#pragma unroll
+                for (int t = 0; t < 8; ++t) gg_put(d + t, v[t] * mult);
+            });
+        }
+    }
+}
+
 /* r4d_ds41_ggml_mr.hip (lever D2, the decode band's multi-row form) includes this file up to here with
  * R4D_GG_BLOCKS_ONLY: the tables, the block types and their decoders, the activation loads and the stock gemv
  * kernel, so both units dequantise from one source. */
@@ -3242,42 +3284,6 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
             constexpr int NM = decltype(ic)::value + 1;
             if (nmt == NM) run(std::integral_constant<int, NM>{});
         });
-    }
-}
-
-/* ================================================================== embed_lookup */
-template <int T>
-__global__ __launch_bounds__(kGgThreads) void gg_embed_kernel(const int32_t* tok, const uint8_t* w,
-                                                              long long w_ld, uint16_t* x,
-                                                              long long x_ld, int M, int E, int V,
-                                                              long long voff, float mult) {
-    using Q = Gg<T>;
-    extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
-    gg_load_table<T>(gg_smem);
-    __syncthreads();
-    const void* tab = gg_smem;
-    const int nU = E / Q::QK * Q::UPB;
-    for (int m = (int)blockIdx.x; m < M; m += (int)gridDim.x) {
-        const long long id = (long long)tok[m] - voff;
-        uint16_t* xr = x + (long long)m * x_ld;
-        if (id < 0 || id >= V) {
-            for (int k = (int)threadIdx.x; k < E; k += kGgThreads) xr[k] = 0;
-            continue;
-        }
-        const uint8_t* wr = w + id * w_ld;
-        for (int U = (int)threadIdx.x; U < nU; U += kGgThreads) {
-            const int b = U / Q::UPB, u = U - b * Q::UPB;
-            uint32_t raw[Q::NR];
-            Q::load(wr + (long long)b * Q::BB, u, raw);
-            gg_for<4>([&](auto gi) {
-                constexpr int G = decltype(gi)::value;
-                float v[8];
-                Q::template dec<G>(raw, u, tab, v);
-                uint16_t* d = xr + b * Q::QK + Q::goff(u, G);
-#pragma unroll
-                for (int t = 0; t < 8; ++t) gg_put(d + t, v[t] * mult);
-            });
-        }
     }
 }
 

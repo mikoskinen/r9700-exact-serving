@@ -408,6 +408,9 @@ struct Dsp {
     rad_op c_tab = 0, c_fc = 0, c_norm = 0, sizing = 0;
     rad_op embed = 0, embed_ar = 0, expand = 0, pre0 = 0, pre1 = 0, q_tab = 0, poff_op = 0, apos_op = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
+    /* Lever EAR (Model::embed_rep): the query pass's lookup in the whole table, its zero row and the hc adds; 0 = not
+     * declared, the embedding all-reduce as before. */
+    rad_op embed_rep = 0, ezero = 0, eadd = 0;
     std::vector<Layer> st;
     /* The confidence head (lever C1): the sidecar's D + rank weights and bias, the device copy
      * (`cwb`, uploaded at this rank's first query pass), the plane; the branches (lever T1). Rank 0. */
@@ -520,6 +523,12 @@ struct Model {
     int64_t ple_group = 0;
     rad_op embed = 0, expand = 0, pre0 = 0, pre1 = 0, rope_a = 0, rope_b_step = 0, tok_map = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head_op = 0, embed_ar = 0;
+    /* Lever EAR (RADIANCE_DS41_EMB_REP, ear_declare): the whole token table on every rank beside its shard
+     * (token_rep), a bf16 row of zeros (ezb), the lookup over the whole table (embed_rep), the row's fill (ezero)
+     * and the add that writes each hc copy (eadd); 0 = not declared, the embedding all-reduce as before. */
+    rad_weight token_rep = 0;
+    rad_buf ezb = 0;
+    rad_op embed_rep = 0, ezero = 0, eadd = 0;
     /* Lever K1 fold f (RADIANCE_DS41_ONEFILL): the step's plane of ones for every MoE layer's ungated shared
      * gate (mw.sgate), filled once at the step's start while the ds41_onefill switch is 1; 0 = not declared. */
     rad_op sone = 0;
@@ -1026,6 +1035,59 @@ static void sw_note_decl(int64_t rows) {
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
 }
 
+/* Lever EAR (10.11.2026): the token embedding without its all-reduce. Today the table is split by vocabulary
+ * (m.token, RAD_SHARD_ROW): each rank's embed_lookup_ggml writes its own rows' dequantised values and a zero row
+ * (+0.0) for every id outside its shard (gg_embed_kernel), and an exact all-reduce completes it (m.embed_ar;
+ * d.embed_ar on the DSpark query pass), whose every row (the one-shot's ar_vsum, the two-shot's reduce and the coded
+ * two-shot's, r4d_ar_oneshot_Nrank_exact.hip / r4d_ar_twoshot_Nrank_exact.hip) folds the ranks' bf16 values in fp32
+ * from 0.0f in ascending rank order and rounds once, so each element is the owner's value v -- except a v of -0.0,
+ * which comes out +0.0 (0.0f + -0.0 = +0.0, and the other ranks add +0.0). The 2.25 model's q6_K table dequantises
+ * ds * (float)(q - 32) (Gg<GG_Q6_K>::dec): every q = 32 under a negative d * sc is -0.0, ~1.3 % of its values, so a
+ * lookup alone is NOT the all-reduce's bytes. Its d are all finite and nonzero, so no NaN, infinity or subnormal
+ * reaches either path (tests/r4d_emu/test_ds41emb.cpp checks every block of the real table).
+ * With RADIANCE_DS41_EMB_REP=<rows> (needs RADIANCE_DS41_EMB_RAM=1, which pins the tables in host memory, read in
+ * place: the whole table on the card would take four shards' VRAM) each rank also declares the WHOLE table
+ * (token_embd_rep.weight, the same checkpoint tensor; pinned beside the shard, 518 MiB a rank more host memory, no
+ * VRAM) and the ops that read it at every height, and a step of at most `rows` rows (the switch "ds41_embrep", 0 off
+ * .. max_tok; RADIANCE_DS41_EMB_REP sets where it starts) looks its tokens up there and writes each hc copy with
+ * add(row, a row of +0.0) (binary_kernel: fp32 v + 0 rounded by f32_to_bf16) -- v exactly, -0.0 as +0.0: the
+ * all-reduce's bytes, which the copies (cast bf16 -> bf16, byte for byte) it replaces would have carried. A wider
+ * step takes the shard + all-reduce as before. Unset: nothing declared, the issue is today's byte for byte. */
+static std::atomic<int> g_ear{0};         /* the live row bound, 0 off */
+static std::atomic<int> g_ear_decl{0};    /* max_tok where a real declare took the lever (0: not declared) */
+static std::atomic<int> g_ear_env{-1};    /* RADIANCE_DS41_EMB_REP's rows, read once (0: unset or not a count) */
+static void ear_read_env() {
+    int unread = -1;
+    const char* e = std::getenv("RADIANCE_DS41_EMB_REP");
+    char* end = nullptr;
+    const long v = e && *e ? std::strtol(e, &end, 10) : 0;
+    const int rows = end && !*end && v >= 1 && v <= (1L << 20) ? (int)v : 0;
+    if (g_ear_env.compare_exchange_strong(unread, rows)) g_ear.store(rows, std::memory_order_relaxed);
+}
+static bool ear_emb_ram() {
+    const char* e = std::getenv("RADIANCE_DS41_EMB_RAM");
+    return e && e[0] == '1' && !e[1];
+}
+/* The bound a step's rows are held to: the switch, 0 where nothing was declared. */
+static int64_t ear_rows() {
+    const int v = g_ear.load(std::memory_order_relaxed), d = g_ear_decl.load(std::memory_order_relaxed);
+    return v < d ? v : d;
+}
+static int ear_fn4_accepts(const char* name, int value) {
+    if (!name || std::strcmp(name, "ds41_embrep")) return 0;
+    return value >= 0 && value <= g_ear_decl.load(std::memory_order_relaxed) ? 1 : -1;
+}
+static int ear_fn4_switch(const char* name, int value) {
+    const int ok = ear_fn4_accepts(name, value);
+    if (ok > 0) g_ear.store(value, std::memory_order_relaxed);
+    return ok;
+}
+static int ear_fn4_value(const char* name, int* applied) {
+    if (!name || !applied || std::strcmp(name, "ds41_embrep")) return 0;
+    *applied = (int)ear_rows();
+    return 1;
+}
+
 /* idx_split: the indexer's balanced deal (lever I1), below index_runs(). */
 static int idx_fn4_accepts(const char* name, int value);
 static int idx_fn4_switch(const char* name, int value);
@@ -1034,6 +1096,7 @@ static int idx_fn4_value(const char* name, int* applied);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (const int r = idx_fn4_accepts(name, value)) return r;
+    if (const int r = ear_fn4_accepts(name, value)) return r;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
     if (!std::strcmp(name, "ds41_shexp_lane"))
@@ -1044,6 +1107,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && !std::strcmp(name, "idx_split")) return idx_fn4_switch(name, value);
+    if (name && !std::strcmp(name, "ds41_embrep")) return ear_fn4_switch(name, value);
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
     if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
@@ -1054,6 +1118,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
 extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!name || !applied) return 0;
     if (idx_fn4_value(name, applied)) return 1;
+    if (ear_fn4_value(name, applied)) return 1;
     if (!std::strcmp(name, "ds41_argather")) {
         const int v = g_sw_gar.load(std::memory_order_relaxed);
         *applied = v >= 0 ? v : g_sw_gar_decl.load(std::memory_order_relaxed);
@@ -2419,6 +2484,18 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                         { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, Q * D), RAD_STR("dtype", "bf16"),
                           RAD_INT("exact", 1) },
                         {}, { d.x }, { d.x });
+    /* Lever EAR: the query pass's lookup in the whole table where the trunk declared it (ear_declare). */
+    if (m.embed_rep && d.embed_ar && tt != m.wty.end()) {
+        d.embed_rep = op(b, "embed_lookup_ggml",
+                         { RAD_RANGE("M", 1, Q), RAD_INT("n_embd", D), RAD_INT("n_vocab", c.n_vocab),
+                           RAD_STR("type", tt->second), RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", 0) },
+                         { m.token_rep }, {}, { d.x });
+        d.ezero = op(b, "fill", { RAD_RANGE("M", 1, 1), RAD_INT("n", D), RAD_STR("dtype", "bf16"), RAD_F64("value", 0.0) },
+                     {}, {}, { m.ezb });
+        d.eadd = op(b, "add", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {}, { d.x, m.ezb },
+                    { d.h0 });
+        if (!d.embed_rep || !d.ezero || !d.eadd) d.embed_rep = d.ezero = d.eadd = 0;
+    }
     d.expand = op(b, "cast", { RAD_RANGE("M", 1, Q), RAD_INT("n", D), RAD_STR("from", "bf16"), RAD_STR("to", "bf16") },
                   {}, { d.x }, { d.h0 });
     d.pre0 = op(b, "fill", { RAD_RANGE("M", 1, Q), RAD_INT("n", c.hc), RAD_STR("dtype", "f32"), RAD_F64("value", 0.0) },
@@ -2567,6 +2644,62 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     return RAD_OK;
 }
 
+/* Lever EAR (the comment above g_ear): the whole token table beside this rank's shard and the trunk's ops that
+ * read it, declared right after the shard's lookup and its all-reduce (dsp_declare adds the DSpark query pass's).
+ * `ty` is the shard's ggml type (null: the table is not in llama.cpp's blocks). Nothing at all unless
+ * RADIANCE_DS41_EMB_REP names a row count; a reason it cannot apply is said once on rank 0 and the start goes on
+ * without it (the issue is today's). */
+static int ear_declare(RadBuilder* b, Model& m, int64_t T, const char* ty, const RadBuildCtx* ctx) {
+    ear_read_env();
+    const int want = g_ear_env.load(std::memory_order_relaxed);
+    if (want <= 0) return RAD_OK;
+    const auto& c = m.c;
+    const auto& g = m.g;
+    const int64_t D = c.n_embd;
+    const char* why = g.world <= 1                       ? "one rank: there is no embedding all-reduce"
+                      : !ty || !m.embed || !m.embed_ar   ? "the token table is not read by embed_lookup_ggml"
+                      : !ear_emb_ram()                   ? "it needs RADIANCE_DS41_EMB_RAM=1 (the whole table pinned in host "
+                                                           "memory, read in place; on the card it would take four shards' VRAM)"
+                                                         : nullptr;
+    if (!why) {
+        const std::string rn = m.nm.f("token_embd_rep.weight");
+        const std::string src = ckpt_name(m.nm.f("token_embd.weight"));
+        if (map_copy(b, rn.c_str(), src.c_str()) == RAD_OK)
+            m.token_rep = lw(b, m, rn.c_str(), c.n_vocab, D, grp_model(), RAD_SHARD_NONE, 0, 0, true,
+                             RAD_ACCESS_VOCAB);
+        const auto t = m.token_rep ? m.wty.find(m.token_rep) : m.wty.end();
+        if (t == m.wty.end() || std::strcmp(t->second, ty)) why = "the whole table was refused or is not the shard's type";
+    }
+    if (!why) {
+        m.ezb = decl_b(b, m.nm.f("embed_zero_row"), RAD_BF16, { 1, D });
+        if (m.ezb) {
+            m.embed_rep = op(b, "embed_lookup_ggml",
+                             { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", c.n_vocab),
+                               RAD_STR("type", ty), RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", 0) },
+                             { m.token_rep }, {}, { m.xcol });
+            m.ezero = op(b, "fill", { RAD_RANGE("M", 1, 1), RAD_INT("n", D), RAD_STR("dtype", "bf16"),
+                                      RAD_F64("value", 0.0) },
+                         {}, {}, { m.ezb });
+            m.eadd = op(b, "add", { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("dtype", "bf16") }, {},
+                        { m.xcol, m.ezb }, { m.h0 });
+        }
+        if (!m.ezb || !m.embed_rep || !m.ezero || !m.eadd) {
+            m.embed_rep = m.ezero = m.eadd = 0;
+            why = "a library refused the whole table's lookup, the zero row's fill or the add";
+        }
+    }
+    if (why) {
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_EMB_REP=%d is not used -- %s\n", want, why);
+        return RAD_OK;
+    }
+    /* Declared for every height (the ops' M runs to max_tok): the switch moves the bound in process. */
+    const int bound = (int)T;
+    int cur = g_ear_decl.load(std::memory_order_relaxed);
+    while (cur < bound && !g_ear_decl.compare_exchange_weak(cur, bound)) {}
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ declare */
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -2673,6 +2806,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
                           RAD_STR("dtype", "bf16"), RAD_INT("exact", 1) },
                         {}, { m.xcol }, { m.xcol });
+    DS_TRY(ear_declare(b, m, T, tt != m.wty.end() ? tt->second : nullptr, ctx));
     m.expand = op(b, "cast",
                   { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("from", "bf16"),
                     RAD_STR("to", "bf16") },
@@ -2840,6 +2974,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             fprintf(stderr, "radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to %lld "
                             "tokens a step (RADIANCE_DS41_ARGATHER)\n", (long long)gather_ar_rows());
     }
+    if (ctx->rank == 0 && !ctx->shape_probe && m.embed_rep)
+        fprintf(stderr, "radiance: deepseek41: lever EAR: the whole token table (%s) on every rank beside its shard, "
+                        "pinned in host memory; a step of at most %lld rows looks its tokens up there and writes the "
+                        "hc copies as row + 0 (the exact all-reduce's bytes), no embedding all-reduce; trunk%s "
+                        "(RADIANCE_DS41_EMB_REP; switch ds41_embrep 0 off .. %lld)\n",
+                m.wty.at(m.token_rep), (long long)ear_rows(), m.dsp.embed_rep ? " and the DSpark query pass" : "",
+                (long long)g_ear_decl.load(std::memory_order_relaxed));
     if (ctx->rank == 0 && !ctx->shape_probe && g_sw_shexp.load(std::memory_order_relaxed) > 0)
         fprintf(stderr, "radiance: deepseek41: the shared expert on the second lane beside the routed experts "
                         "at a decode or verify step of up to %lld rows, joined before the gather "
@@ -2985,9 +3126,16 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         return;
     }
 
-    RAD_ISSUE_N(x, d.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(d.x, T));
-    if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
-    for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
+    if (d.embed_rep && T <= ear_rows()) {   /* lever EAR, as the trunk's issue */
+        RAD_ISSUE_N(x, d.embed_rep, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token_rep), brows(d.x, T));
+        RAD_ISSUE_N(x, d.ezero, 1, brows(m.ezb, 1));
+        for (int64_t i = 0; i < c.hc; ++i)
+            RAD_ISSUE_N(x, d.eadd, T, brows(d.x, T), brows(m.ezb, 1), bcol(d.h0, i * D, D, T));
+    } else {
+        RAD_ISSUE_N(x, d.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(d.x, T));
+        if (d.embed_ar) RAD_ISSUE_N(x, d.embed_ar, T * D, brows(d.x, T), RAD_NONE);
+        for (int64_t i = 0; i < c.hc; ++i) RAD_ISSUE_N(x, d.expand, T, brows(d.x, T), bcol(d.h0, i * D, D, T));
+    }
     RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
     RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
     RAD_ISSUE_N(x, d.q_tab, T, pos, brows(m.cs_a, g.max_ctx));
@@ -3118,10 +3266,19 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * from there, and attn_sparse_sink recovers the base from it (docs/OPS.md). */
     const RadOperand wused = praw(wb->seqused, RAD_I32, S);
 
-    RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
-    if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
-    for (int64_t i = 0; i < c.hc; ++i)
-        RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
+    /* Lever EAR (switch ds41_embrep): at most ear_rows() rows look up the whole table and write each hc copy as
+     * row + 0 (the all-reduce's bytes, -0.0 as +0.0); otherwise the shard, its all-reduce and the copies. */
+    if (m.embed_rep && T <= ear_rows()) {
+        RAD_ISSUE_N(x, m.embed_rep, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token_rep), brows(m.xcol, T));
+        RAD_ISSUE_N(x, m.ezero, 1, brows(m.ezb, 1));
+        for (int64_t i = 0; i < c.hc; ++i)
+            RAD_ISSUE_N(x, m.eadd, T, brows(m.xcol, T), brows(m.ezb, 1), bcol(m.h0, i * D, D, T));
+    } else {
+        RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
+        if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
+        for (int64_t i = 0; i < c.hc; ++i)
+            RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
+    }
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
     RAD_ISSUE_N(x, m.pre1, T, bcol(m.pre_f, 0, 1, T));
     if (m.sone && g_sw_one.load(std::memory_order_relaxed) > 0) RAD_ISSUE_N(x, m.sone, T, brows(m.mw.sgate, T));
