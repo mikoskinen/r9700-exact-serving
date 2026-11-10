@@ -986,6 +986,22 @@ int Engine::apply_rope_scaling() {
     return RAD_OK;
 }
 
+/* RADIANCE_XPREFETCH=0 (or off; lever VA "xpoff", read once): no next-layer expert prefetch -- its
+ * DMA queue is never opened, its stream, ring and buffers (xp_device_bytes) leave the VRAM budget, and
+ * that VRAM goes to the split like any other. Exact: the prefetch only copies expert bytes early into
+ * a ring the step may read them from instead of the pool. On DeepSeek-V4.1 it predicts nothing anyway
+ * (Ctx::xp_predict_run takes a router input of at most 4096 columns; the model's is 5120). Unset: as
+ * before. */
+static bool xprefetch_env_off() {
+    static const bool off = [] {
+        const char* e = getenv("RADIANCE_XPREFETCH");
+        const bool o = e && (!std::strcmp(e, "0") || !std::strcmp(e, "off"));
+        if (o) RAD_INFO("expert prefetch: off (RADIANCE_XPREFETCH=%s): no DMA queue, ring or stream for it", e);
+        return o;
+    }();
+    return off;
+}
+
 /* ================================================================== 3 + 4. plugins, declare */
 int Engine::load_plugins() {
     int s = rad_tools_load_plugins(cfg_.radiance_home, cfg_.kernel_hierarchy,
@@ -1877,7 +1893,7 @@ int Engine::plan() {
             /* The expert prefetch's stream, ring and buffers, when it can run: experts in a pinned
              * pool, not --deterministic, and a spare DMA engine (asked before the free reading
              * below, so its queue is already counted there). */
-            if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic &&
+            if (wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic && !xprefetch_env_off() &&
                 (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device)) {
                 /* Routed layers counted as Ctx::bind_routing does, including a head past the trunk. */
                 int64_t nl = r->program.meta.n_layers;
@@ -4253,7 +4269,7 @@ int Engine::start() {
     /* The next-layer expert prefetch, wherever experts sit in a pinned pool for routed GEMMs to
      * read over the link (core/runtime/xprefetch.h). Its stream and ring are in the VRAM budget
      * (xp_device_bytes, Engine::plan). Off under --deterministic. */
-    if (!cfg_.deterministic)
+    if (!cfg_.deterministic && !xprefetch_env_off())
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];

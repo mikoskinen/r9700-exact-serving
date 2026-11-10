@@ -313,8 +313,17 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
     const int layer = nx.layer;
     if (rows <= 0 || rows > kXpMaxRows || nx.top_k <= 0 || nx.top_k > kXpMaxK || nx.n_expert <= 0 ||
         nx.n_expert > kXpMaxNe || nx.n_parts <= 0 || nx.n_parts > kXpParts || !nx.parts || n_embd % 256 ||
-        n_embd > 4096 || layer < 0 || layer >= (int)x.layers.size())
+        n_embd > 4096 || layer < 0 || layer >= (int)x.layers.size()) {
+        /* Said once a rank (lever VA "xpoff"): a router input this predictor never takes means the
+         * prefetch copies nothing for the model, and its ring is VRAM the slab could hold. */
+        if ((n_embd % 256 || n_embd > 4096) && !x.said_width) {
+            x.said_width = true;
+            RAD_INFO("rank %d: expert prefetch: the router input is %lld columns, which the predictor does not "
+                     "take (a multiple of 256, at most 4096): it copies nothing for this model "
+                     "(RADIANCE_XPREFETCH=0 returns its ring to the slab)", rank_, (long long)n_embd);
+        }
         return RAD_OK;
+    }
     XpLayer& L = x.layers[(size_t)layer];
     if (!L.bound) {
         L.next = nx;
