@@ -13,8 +13,22 @@
  * prefill form was not given the scratch its map and rows need, and RAD_E_SHAPE when the prep's rows would not be
  * addressable by the 32-bit lane offsets (T rows, or a chunk's under the scratch cap, x mats x K x 2 bytes >= 4 GiB). */
 #include <stddef.h>
+#include <string.h>
 
 #include "exl3r4d_prefill.h"
+
+/* fn4 (10.11.2026, the EXL3 side-launch fold): gate_up's prep digit at run time -- 0 the build's (EXL3R4D_PF_PREP % 4: the
+ * map kernel, then the prep by map entry, two launches), 2 the map and the prep by row in ONE launch
+ * (exl3r4d_pf_mapprep_kernel, the form down's non-rotated path adopted [38]). Same rows, same map, so the same bytes.
+ * Set only through the engine's fn4 switch "exl3_pfprep" (runtime/fn4_switch.h: between steps, every rank parked);
+ * no environment read (R6). The scratch cap's chunked form needs digit 1 and keeps it. */
+static volatile int g_fn4_pf_prep_gu = 0;
+__attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
+    if (!name || strcmp(name, "exl3_pfprep") != 0) return 0;
+    if (value < 0 || value > 2) return -1;
+    g_fn4_pf_prep_gu = value;
+    return 1;
+}
 #if EXL3R4D_ROUTEDUMP
 int exl3r4d_routedump(const void* off, int n, long long rows, void* stream);
 #endif
@@ -197,7 +211,8 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
         }
     }
     /* prep 3: none (h_rot's down reads h as it is) */
-    const int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
+    int prep = dn_prerot(&g) ? 3 : gate_up ? EXL3R4D_PF_PREP % 4 : EXL3R4D_PF_PREP / 4;
+    if (gate_up && !run && g_fn4_pf_prep_gu && d.chunk_n == 1 && !rot_am(am)) prep = g_fn4_pf_prep_gu;   /* fn4 */
 #if EXL3R4D_OPSTAMP
     if (g.n_class != 4) {
         (void)exl3r4d_opstamp((gate_up ? 0 : 1) * 2, d.g.T, s);
