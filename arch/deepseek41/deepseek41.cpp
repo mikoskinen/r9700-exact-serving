@@ -40,6 +40,18 @@
 #include <utility>
 #include <vector>
 
+/* The engine's runtime switches (abi/rad_runtime.h), weak: a host without them (an older core, a tool)
+ * reads every switch as off. The DSpark extras (ds41-acc) are issued only while theirs is on. */
+extern "C" int rad_fn4_get(const char* name, int* value) __attribute__((weak));
+/* ...and the drafter's extras' declarations (abi/rad_builder.h), weak too: a host built before them (rad-info,
+ * rad-convert or rad-kbench of an older image) still loads this plugin, and a serve there declares no extras. */
+extern "C" int rad_drafter_confidence(RadBuilder* b, rad_buf conf, int64_t pitch) __attribute__((weak));
+extern "C" int rad_drafter_alternatives(RadBuilder* b, rad_buf alt, int64_t n_alt, int64_t pitch) __attribute__((weak));
+static int ds41_switch(const char* name) {
+    int v = 0;
+    return rad_fn4_get && rad_fn4_get(name, &v) > 0 ? v : 0;
+}
+
 namespace deepseek41 {
 using namespace rad::arch;
 
@@ -359,8 +371,20 @@ struct Layer {
  *                 arch/common/rad_block_dspark.h) into the proposal buffer. Every row predicts the token
  *                 after it (forward_head: logits[i] + bias(output_ids[i]) -> output_ids[i + 1]), so the
  *                 block is the depth.
- *   not applied   the confidence head (adaptive block length; it changes no proposal), and the bias
- *                 from outside the head's top `cand` (the walk's only approximation, acceptance only). */
+ *   confidence    (ds41-acc, lever C1) the release's confidence head (mtp.{n-1}.confidence_head.proj,
+ *                 [1, D + rank], no bias), which no container carries: read at declare from the sidecar
+ *                 RADIANCE_DS41_DSPARK_CONF names (D + rank f32, an optional bias after them). Rank 0 then
+ *                 declares dspark_conf after the walk, its logit a row from the collapse's output before
+ *                 the norm and the walk's predecessor's Markov row (forward_head's
+ *                 confidence_head(x, markov_embed)), into the plane rad_drafter_confidence names; the
+ *                 engine's dspark_conf switch issues it and cuts each verify to the longest confident
+ *                 prefix (exllamav3's rule). It changes no proposal.
+ *   branches      (ds41-acc, lever T1) RADIANCE_DS41_DSPARK_ALT=N (1..4): rank 0 declares dspark_alt, the
+ *                 walk's N next-best first proposals each walked on (rad_drafter_alternatives), which the
+ *                 engine's dspark_alt switch issues and compares with the target's tokens: a shadow of a
+ *                 tree at position 1, measured, never verified.
+ *   not applied   the bias from outside the head's top `cand` (the walk's only approximation, acceptance
+ *                 only). */
 struct Dsp {
     bool on = false;
     int base = 0, n_stage = 0;            /* stages at absolute layers base .. base + n_stage - 1 */
@@ -382,6 +406,15 @@ struct Dsp {
     rad_op embed = 0, embed_ar = 0, expand = 0, pre0 = 0, pre1 = 0, q_tab = 0, poff_op = 0, apos_op = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
     std::vector<Layer> st;
+    /* The confidence head (lever C1): the sidecar's D + rank weights and bias, the device copy
+     * (`cwb`, uploaded at this rank's first query pass), the plane; the branches (lever T1). Rank 0. */
+    std::vector<float> cw;
+    double cbias = 0.0;
+    std::string conf_path;
+    int64_t n_alt = 0;
+    rad_buf cwb = 0, conf = 0, alt = 0;
+    rad_op conf_op = 0, alt_op = 0;
+    bool cw_up = false;
 };
 
 /* A dense linear's int8 activation pair, keyed by the GEMM op a linear() declared: the quantiser
@@ -1946,6 +1979,46 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
         const long v = std::strtol(e, nullptr, 10);
         if (v >= 1 && v <= 32) d.cand = v;
     }
+    /* Lever C1: the confidence head from the sidecar (the containers carry no confidence_head). A
+     * named file that does not read as D + rank f32 values (and an optional bias) is refused: the
+     * serve asked for the head by name. */
+    d.cw.clear();
+    d.cbias = 0.0;
+    d.conf_path.clear();
+    if (const char* e = std::getenv("RADIANCE_DS41_DSPARK_CONF"); e && *e && g.rank == 0) {
+        const int64_t want = c.n_embd + gi(meta, "dspark.markov_rank", 0);
+        FILE* f = std::fopen(e, "rb");
+        std::vector<float> v;
+        if (f) {
+            float x = 0.0f;
+            while (std::fread(&x, 4, 1, f) == 1 && (int64_t)v.size() <= want) v.push_back(x);
+            std::fclose(f);
+        }
+        if (want <= c.n_embd || ((int64_t)v.size() != want && (int64_t)v.size() != want + 1)) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_CONF=%s: %s; the DSpark confidence head is "
+                            "%lld f32 values (n_embd %lld + markov rank %lld) and an optional bias\n", e,
+                    f ? (std::to_string(v.size()) + " values").c_str() : "cannot be read", (long long)want, (long long)c.n_embd,
+                    (long long)(want - c.n_embd));
+            return RAD_E_INVAL;
+        }
+        if ((int64_t)v.size() == want + 1) {
+            d.cbias = v.back();
+            v.pop_back();
+        }
+        d.cw = std::move(v);
+        d.conf_path = e;
+    }
+    /* Lever T1: the shadow tree's branches. */
+    d.n_alt = 0;
+    if (const char* e = std::getenv("RADIANCE_DS41_DSPARK_ALT"); e && *e && g.rank == 0) {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v < 0 || v > 4) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_ALT=%s: the shadow tree takes 1..4 "
+                            "branches (0 or unset: none)\n", e);
+            return RAD_E_INVAL;
+        }
+        d.n_alt = v;
+    }
     d.taps = gl(meta, "dspark.target_layers");
     std::sort(d.taps.begin(), d.taps.end());
     bool ok = !d.taps.empty() && d.noise >= 0 && d.noise < c.n_vocab && d.rank > 0 && d.rank % 32 == 0 &&
@@ -2354,6 +2427,43 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                   { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens });
     if (!d.contract || !d.fnorm || !d.gather || !d.head || !d.topk || !d.select) return RAD_E_INVAL;
 
+    /* Lever C1 (rank 0): the confidence head after the walk, over the collapse's output before its
+     * norm (d.x, which nothing after the collapse writes) and the walk's predecessors; its weights in a
+     * persistent buffer the first query pass fills from the sidecar. */
+    if (!d.cw.empty() && !rad_drafter_confidence) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_CONF: this host has no rad_drafter_confidence; "
+                        "the confidence head is not declared\n");
+        d.cw.clear();
+    }
+    if (d.n_alt > 0 && !rad_drafter_alternatives) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_ALT: this host has no rad_drafter_alternatives; "
+                        "the branches are not declared\n");
+        d.n_alt = 0;
+    }
+    if (!d.cw.empty()) {
+        const int64_t W = (int64_t)d.cw.size();
+        d.cwb  = decl_b(b, nm.f("dspark_conf_w"), RAD_F32, { 1, W }, RAD_BUF_PERSIST);
+        d.conf = decl_b(b, nm.f("dspark_conf"), RAD_F32, { g.max_seqs, d.block }, RAD_BUF_PERSIST);
+        if (!d.cwb || !d.conf) return RAD_E_INVAL;
+        d.conf_op = op(b, "dspark_conf",
+                       { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", d.block), RAD_INT("n_embd", D),
+                         RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", d.block),
+                         RAD_F64("bias", d.cbias), RAD_STR("dtype", "bf16") },
+                       { d.mk1 }, { d.x, d.tokens, d.cwb }, { d.conf });
+        if (!d.conf_op) return RAD_E_INVAL;
+    }
+    /* Lever T1 (rank 0): the walk's next-best first proposals, each walked on. */
+    if (d.n_alt > 0) {
+        d.alt = decl_b(b, nm.f("dspark_alt"), RAD_I32, { g.max_seqs, d.n_alt * d.block }, RAD_BUF_PERSIST);
+        if (!d.alt) return RAD_E_INVAL;
+        d.alt_op = op(b, "dspark_alt",
+                      { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", d.block), RAD_INT("top_k", R),
+                        RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", d.block),
+                        RAD_INT("n_alt", d.n_alt), RAD_STR("dtype", "bf16") },
+                      { d.mk1, d.mk2 }, { d.cand_, d.unary, d.tokens }, { d.alt });
+        if (!d.alt_op) return RAD_E_INVAL;
+    }
+
     RadDrafterDecl drf{};
     drf.name = "dspark";
     drf.kind = RAD_DRAFT_BLOCK;
@@ -2365,18 +2475,30 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     drf.window = c.window + 1;
     drf.mask_token = (int32_t)d.noise;
     DS_TRY(rad_declare_drafter(b, &drf));
+    if (d.conf) DS_TRY(rad_drafter_confidence(b, d.conf, d.block));
+    if (d.alt) DS_TRY(rad_drafter_alternatives(b, d.alt, d.n_alt, d.block));
+    if (d.conf || d.alt)
+        rad_note(b, "DSpark extras (ds41-acc): %s%s%s", d.conf ? "the confidence head (sidecar " : "",
+                 d.conf ? d.conf_path.c_str() : "", d.conf ? ", dspark_conf)" : "");
+    if (d.alt) rad_note(b, "DSpark extras (ds41-acc): %lld shadow branch(es) at position 1 (dspark_alt)", (long long)d.n_alt);
     rad_note(b, "DSpark drafter: %d stages at absolute layers %d..%d (window-only V4 blocks, %lld experts top-%lld), "
                 "taps before %zu trunk layer(s), one pass over [anchor, noise %lld x %lld] proposes %lld tokens; "
                 "attention over %lld context keys + the block's own; Markov rank %lld walked over the head's top %lld; "
-                "the confidence head is not applied",
+                "the confidence head %s",
              d.n_stage, d.base, d.base + d.n_stage - 1, (long long)d.n_expert, (long long)d.top_k, d.taps.size(),
              (long long)d.noise, (long long)(d.block - 1), (long long)d.block, (long long)c.window,
-             (long long)d.rank, (long long)R);
+             (long long)d.rank, (long long)R,
+             d.conf ? "is declared (its gate is the engine's dspark_conf switch)" : "is not applied");
     /* The same on stderr once (rank 0's real declare), so a serve log says which walk ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41: DSpark drafter: %d stages, %lld experts top-%lld, block %lld; Markov rank %lld "
                         "walked over the head's top %lld (RADIANCE_DS41_DSPARK_CAND)\n",
                 d.n_stage, (long long)d.n_expert, (long long)d.top_k, (long long)d.block, (long long)d.rank, (long long)R);
+    if (ctx->rank == 0 && !ctx->shape_probe && (d.conf || d.alt))
+        fprintf(stderr, "radiance: deepseek41: DSpark extras (ds41-acc): confidence head %s%s%s, shadow branches %lld "
+                        "(switches dspark_conf / dspark_alt; neither changes a proposal)\n",
+                d.conf ? "from " : "off", d.conf ? d.conf_path.c_str() : "",
+                d.conf ? (d.cbias != 0.0 ? " with a bias" : " (no bias, as the release)") : "", (long long)d.n_alt);
     return RAD_OK;
 }
 
@@ -2742,7 +2864,7 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
 
 /* The drafter's query pass (draft_pass > 0): `block` rows a drafting sequence, the anchor first. */
 static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
-    const auto& d = m.dsp;
+    auto& d = m.dsp;   /* cw_up moves once (the confidence head's weights) */
     const auto& c = m.c;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
@@ -2826,6 +2948,24 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     }
     RAD_ISSUE_N(x, d.select, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE, praw(batch->token_ids, RAD_I32, T),
                 RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
+    /* The DSpark extras (ds41-acc, rank 0), each only while its switch is on: the switches move at a
+     * step release with a new epoch, so a pass recorded without them is never played with them. */
+    if (d.conf_op && ds41_switch("dspark_conf") > 0) {
+        if (!d.cw_up) {   /* the sidecar's weights, once, landed before the head is issued */
+            void* p = rad_buf_ptr(x, d.cwb);
+            if (!p || rad_memcpy_async(p, d.cw.data(), (int64_t)d.cw.size() * 4, rad_stream(x)) < 0 ||
+                rad_stream_sync(rad_stream(x)) < 0) {
+                rad_step_fail(x, "deepseek41: the DSpark confidence head's weights could not be copied to the card");
+                return;
+            }
+            d.cw_up = true;
+        }
+        RAD_ISSUE_N(x, d.conf_op, S, brows(d.x, T), praw(batch->token_ids, RAD_I32, T), brows(d.tokens, S),
+                    RAD_W(d.mk1), brows(d.cwb, 1), brows(d.conf, S));
+    }
+    if (d.alt_op && ds41_switch("dspark_alt") > 0)
+        RAD_ISSUE_N(x, d.alt_op, S, brows(d.cand_, N), brows(d.unary, N), praw(batch->token_ids, RAD_I32, T),
+                    brows(d.tokens, S), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.alt, S));
 }
 
 /* The ffn connection's mix, issued by the MoE block behind its routed gate_up (MoeFP8::Beside). */

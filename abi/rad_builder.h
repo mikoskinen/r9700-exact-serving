@@ -879,6 +879,25 @@ int rad_chain_on(void);
 /* ---- appended in ABI 27 (a block drafter's short block) */
 int rad_drafter_short_block(RadBuilder* b, int64_t block);
 
+/* A chain BLOCK drafter's confidence plane: an f32 buffer of at least [max_seqs, pitch] whose row i
+ * holds, once a query pass has run, a logit for each proposal of that pass's i-th sequence (entry j
+ * for proposal j, the token at draft position j + 1; DSpark's confidence head). The engine copies it
+ * from rank 0 behind the pass. Under the engine's `dspark_conf` switch (core/runtime/fn4_switch.h) a
+ * sequence then verifies the longest prefix of its proposal whose sigmoid clears a threshold, so it
+ * changes how many drafts a verify carries, never a proposal or an emitted token. Called once, after
+ * rad_declare_drafter; refused for a serial drafter and beside rad_drafter_tree. Additive export;
+ * RAD_ABI_VERSION does not move. */
+int rad_drafter_confidence(RadBuilder* b, rad_buf conf, int64_t pitch);
+
+/* A chain BLOCK drafter's alternative branches: an i32 buffer of at least [max_seqs, n_alt * pitch]
+ * whose row i holds, once a query pass has run, `n_alt` other proposals of that pass's i-th
+ * sequence, branch a at [a * pitch, (a + 1) * pitch), each starting with another first token than
+ * the proposal's (DSpark: the walk's next-best first tokens, each walked on), -1 where there is none.
+ * The engine compares them with the tokens the target emits (`dspark_alt` switch): a shadow of a
+ * tree that branches at the first draft, measured, never verified. Called once, after
+ * rad_declare_drafter. Additive export; RAD_ABI_VERSION does not move. */
+int rad_drafter_alternatives(RadBuilder* b, rad_buf alt, int64_t n_alt, int64_t pitch);
+
 /* ================================================================== the encoder */
 /* A media encoder the plugin runs on an encoder pass (RadBatch::enc). The core drives the pass and
  * reads its result, so the plugin declares it. A plugin that declares none serves text only, and

@@ -2299,6 +2299,84 @@ int Builder::drafter_tree(rad_buf parents) {
     return RAD_OK;
 }
 
+/* A chain block drafter's confidence plane and its alternative branches (rad_builder.h). Both are
+ * read by the engine behind the query pass and change no proposal. */
+static int64_t drafter_plane_numel(const Program& p, rad_buf b) {
+    const RadBufDecl& d = p.buffers[b].decl;
+    int64_t n = 1;
+    for (uint32_t i = 0; i < d.rank; ++i) n *= d.shape[i];
+    return d.rank ? n : 0;
+}
+
+int Builder::drafter_confidence(rad_buf conf, int64_t pitch) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_confidence after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK || prog_.drafter_tree) {
+        err(RAD_E_STATE, "drafter_confidence: %s. A confidence plane cuts a chain block drafter's "
+                         "proposal; declare it after rad_declare_drafter, without rad_drafter_tree.",
+            prog_.drafter.kind == RAD_DRAFT_NONE   ? "no drafter is declared"
+            : prog_.drafter.kind != RAD_DRAFT_BLOCK ? "the declared drafter is a SERIAL head"
+                                                    : "the drafter proposes trees");
+        return RAD_E_STATE;
+    }
+    if (conf == RAD_NULL_HANDLE || (size_t)conf >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "drafter_confidence '%s': buffer %u is not a declared buffer",
+            prog_.drafter_name.c_str(), (unsigned)conf);
+        return RAD_E_INVAL;
+    }
+    if (prog_.buffers[conf].decl.dtype != RAD_F32) {
+        err(RAD_E_DTYPE, "drafter_confidence '%s': buffer '%s' is not f32", prog_.drafter_name.c_str(),
+            prog_.buffers[conf].name.c_str());
+        return RAD_E_DTYPE;
+    }
+    if (pitch < prog_.drafter.depth || drafter_plane_numel(prog_, conf) < pitch * prog_.ctx.max_seqs) {
+        err(RAD_E_SHAPE, "drafter_confidence '%s': buffer '%s' must hold %lld sequences of %lld logits "
+                         "(the pitch, at least the drafter's depth %d)",
+            prog_.drafter_name.c_str(), prog_.buffers[conf].name.c_str(), (long long)prog_.ctx.max_seqs,
+            (long long)pitch, prog_.drafter.depth);
+        return RAD_E_SHAPE;
+    }
+    prog_.drafter_conf       = conf;
+    prog_.drafter_conf_pitch = pitch;
+    return RAD_OK;
+}
+
+int Builder::drafter_alternatives(rad_buf alt, int64_t n_alt, int64_t pitch) {
+    if (finished_) {
+        err(RAD_E_STATE, "drafter_alternatives after declare finished");
+        return RAD_E_STATE;
+    }
+    if (prog_.drafter.kind != RAD_DRAFT_BLOCK || prog_.drafter_tree) {
+        err(RAD_E_STATE, "drafter_alternatives: a chain block drafter's branches; declare them after "
+                         "rad_declare_drafter, without rad_drafter_tree");
+        return RAD_E_STATE;
+    }
+    if (alt == RAD_NULL_HANDLE || (size_t)alt >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "drafter_alternatives '%s': buffer %u is not a declared buffer",
+            prog_.drafter_name.c_str(), (unsigned)alt);
+        return RAD_E_INVAL;
+    }
+    if (prog_.buffers[alt].decl.dtype != RAD_I32) {
+        err(RAD_E_DTYPE, "drafter_alternatives '%s': buffer '%s' is not i32", prog_.drafter_name.c_str(),
+            prog_.buffers[alt].name.c_str());
+        return RAD_E_DTYPE;
+    }
+    if (n_alt < 1 || n_alt > 8 || pitch < 1 ||
+        drafter_plane_numel(prog_, alt) < n_alt * pitch * prog_.ctx.max_seqs) {
+        err(RAD_E_SHAPE, "drafter_alternatives '%s': buffer '%s' must hold %lld sequences of %lld branches "
+                         "of %lld tokens (1 to 8 branches)",
+            prog_.drafter_name.c_str(), prog_.buffers[alt].name.c_str(), (long long)prog_.ctx.max_seqs,
+            (long long)n_alt, (long long)pitch);
+        return RAD_E_SHAPE;
+    }
+    prog_.drafter_alt       = alt;
+    prog_.drafter_n_alt     = n_alt;
+    prog_.drafter_alt_pitch = pitch;
+    return RAD_OK;
+}
+
 void Builder::note_v(const char* f, va_list ap) {
     char msg[1024];
     vsnprintf(msg, sizeof msg, f ? f : "", ap);
@@ -2866,6 +2944,16 @@ int rad_chain_on(void) { return rad_dev_chain_enabled(); }
 int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     if (!b) return RAD_E_INVAL;
     return B(b)->drafter_short_block(block);
+}
+
+int rad_drafter_confidence(RadBuilder* b, rad_buf conf, int64_t pitch) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_confidence(conf, pitch);
+}
+
+int rad_drafter_alternatives(RadBuilder* b, rad_buf alt, int64_t n_alt, int64_t pitch) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->drafter_alternatives(alt, n_alt, pitch);
 }
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
