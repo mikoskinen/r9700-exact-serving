@@ -33,6 +33,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <condition_variable>
 #include <cstring>
@@ -2314,6 +2315,147 @@ TEST(depth_zero_beside_a_draft_head_keeps_the_plain_text) {
     CHECK_EQ(st, 400);
     CHECK(has(body, "no draft head that drafts chains"));
     CHECK_EQ(s.stop(), 0);
+}
+
+/* The depth-0 context skip (fn4 draft_ctxskip, core/engine_draft.cpp) beside DFlash2's windowed block
+ * drafter, under depth 0 forced (draft_depth0 2, a probe every 4 cycles): a plain step's context pass is
+ * skipped and its tapped rows kept, and the drafter's window is refilled from them before each probe.
+ * Greedy text equals one-token-a-step decoding with the skip on and off. Two fresh servers, the skip set
+ * up on (1) and off (0), run the same requests in the same order, so their probes fall on the same steps:
+ * every proposal the drafter publishes (-v, "proposes") is the same in both, i.e. the refilled window
+ * is the window the per-step context passes write; the counters show steps skipped and refills run in
+ * the first and none in the second, until the switch turns it on in process. Unset, nothing is set up:
+ * no log line, no "ctxskip" report, and 1 is refused. */
+TEST(the_depth_zero_context_skip_keeps_the_plain_text_and_the_drafters_window) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    const std::vector<int32_t> rnd = prompt_ids(61, 160);
+    const std::vector<const std::vector<int32_t>*> prompts = { &repetitive_prompt(), &edit, &rnd };
+    std::vector<std::vector<int32_t>> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        for (const std::vector<int32_t>* p : prompts)
+            plain.push_back(tokens_of(post(s.port, "/completion", completion(*p, 64))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    const std::vector<std::string> args = { "--num-speculative-tokens", "7", "--draft-window", "adaptive",
+                                            "--no-prefix-cache", "-v" };
+    {
+        Server u;
+        REQUIRE(u.start(world().g31_df2, args, { "RADIANCE_DRAFT_DEPTH0=2", "RADIANCE_DRAFT_PROBE=4" }));
+        CHECK(!has(u.output(), "draft context skip"));
+        CHECK(has(u.output(), "draft depth 0 FORCED"));
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(u.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        CHECK(!has(out, "\"ctxskip\": {"));
+        int st = 0;
+        (void)post(u.port, "/admin/fn4", json{ { "draft_ctxskip", 1 } }, &st);
+        CHECK_EQ(st, 400);
+        CHECK_EQ(u.stop(), 0);
+    }
+    struct Arm { int64_t drafted = 0, accepted = 0, skipped = 0, refills = 0, rows = 0; std::string proposals; };
+    auto fn4get = [](Server& s) {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    auto proposals = [](const std::string& log, size_t from) {
+        std::string o;
+        size_t at = from;
+        for (;;) {
+            const size_t k = log.find(" proposes", at);
+            if (k == std::string::npos) break;
+            const size_t b = log.rfind('\n', k), e = log.find('\n', k);
+            const size_t s0 = log.find("sequence ", b == std::string::npos ? 0 : b);
+            o += log.substr(s0, (e == std::string::npos ? log.size() : e) - s0) + "\n";
+            at = k + 9;
+        }
+        return o;
+    };
+    auto run_all = [&](Server& s, const char* arm) {
+        const json a = fn4get(s);
+        const size_t from = s.output().size();
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            int status = 0;
+            const std::vector<int32_t> got = tokens_of(post(s.port, "/completion", completion(*prompts[i], 64),
+                                                            &status));
+            CHECK_EQ(status, 200);
+            if (got != plain[i])
+                fprintf(stderr, "    %s prompt %zu\n    plain %s\n    got   %s\n", arm, i, show(plain[i]).c_str(),
+                        show(got).c_str());
+            CHECK(got == plain[i]);
+        }
+        const json b = fn4get(s);
+        Arm r;
+        r.drafted  = b["accept"].value("head_drafted", (int64_t)0) - a["accept"].value("head_drafted", (int64_t)0);
+        r.accepted = b["accept"].value("head_accepted", (int64_t)0) - a["accept"].value("head_accepted", (int64_t)0);
+        if (b.contains("ctxskip")) {
+            r.skipped = b["ctxskip"].value("skipped_steps", (int64_t)0) - a["ctxskip"].value("skipped_steps", (int64_t)0);
+            r.refills = b["ctxskip"].value("refill_passes", (int64_t)0) - a["ctxskip"].value("refill_passes", (int64_t)0);
+            r.rows    = b["ctxskip"].value("refill_rows", (int64_t)0) - a["ctxskip"].value("refill_rows", (int64_t)0);
+        }
+        r.proposals = proposals(s.output(), from);
+        fprintf(stderr, "    g31_df2 %s: head drafted %lld, accepted %lld; context passes skipped %lld, refills %lld "
+                        "(%lld rows); %zu proposals\n", arm, (long long)r.drafted, (long long)r.accepted,
+                (long long)r.skipped, (long long)r.refills, (long long)r.rows,
+                (size_t)std::count(r.proposals.begin(), r.proposals.end(), '\n'));
+        return r;
+    };
+    Server s1;
+    REQUIRE(s1.start(world().g31_df2, args,
+                     { "RADIANCE_DRAFT_DEPTH0=2", "RADIANCE_DRAFT_PROBE=4", "RADIANCE_DRAFT_CTXSKIP=1" }));
+    CHECK(has(s1.output(), "draft context skip (RADIANCE_DRAFT_CTXSKIP=1"));
+    const json g0 = fn4get(s1);
+    CHECK_EQ(g0["switches"].value("draft_ctxskip", -9), 1);
+    CHECK_EQ(g0["switches"].value("draft_depth0", -9), 2);
+    CHECK_EQ(g0["ctxskip"].value("capable", -9), 1);
+    const Arm on = run_all(s1, "ctxskip 1");
+    CHECK(on.skipped > 0);
+    CHECK(on.refills > 0);
+    CHECK(on.rows > 0);
+    CHECK(on.drafted > 0);
+    CHECK_EQ(s1.stop(), 0);
+
+    Server s0;
+    REQUIRE(s0.start(world().g31_df2, args,
+                     { "RADIANCE_DRAFT_DEPTH0=2", "RADIANCE_DRAFT_PROBE=4", "RADIANCE_DRAFT_CTXSKIP=0" }));
+    CHECK(has(s0.output(), "draft context skip (RADIANCE_DRAFT_CTXSKIP=0"));
+    CHECK_EQ(fn4get(s0)["switches"].value("draft_ctxskip", -9), 0);
+    const Arm off = run_all(s0, "ctxskip 0");
+    CHECK_EQ(off.skipped, 0);
+    CHECK_EQ(off.refills, 0);
+    /* The same probes over the same text: the refilled window proposes what the per-step one did. Each
+     * proposal is the drafter's whole block whatever window the step then verifies (the adaptive D moves
+     * with measured step times, so the drafted counts may differ); with no draft accepted every step
+     * emits one token, so the probes fall on the same steps in both. */
+    CHECK(!on.proposals.empty());
+    if (on.accepted == 0 && off.accepted == 0) {
+        if (on.proposals != off.proposals)
+            fprintf(stderr, "    proposals differ:\n    on:\n%s    off:\n%s", on.proposals.substr(0, 2000).c_str(),
+                    off.proposals.substr(0, 2000).c_str());
+        CHECK(on.proposals == off.proposals);
+    } else {
+        fprintf(stderr, "    drafts were accepted (%lld / %lld): the probes may fall on other steps, proposals not "
+                        "compared\n", (long long)on.accepted, (long long)off.accepted);
+    }
+    /* In process: on, and back to measured depth 0. */
+    int st = 0;
+    (void)post(s0.port, "/admin/fn4", json{ { "draft_ctxskip", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    const Arm flip = run_all(s0, "ctxskip 0 -> 1");
+    CHECK(flip.skipped > 0);
+    CHECK_EQ(fn4get(s0)["switches"].value("draft_ctxskip", -9), 1);
+    (void)post(s0.port, "/admin/fn4", json{ { "draft_depth0", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    (void)run_all(s0, "ctxskip 1, depth0 1");
+    CHECK_EQ(fn4get(s0)["switches"].value("draft_depth0", -9), 1);
+    CHECK_EQ(s0.stop(), 0);
 }
 
 /* The runtime switches through a running server (POST /admin/fn4, runtime/fn4_switch.h): a change

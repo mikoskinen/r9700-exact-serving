@@ -553,6 +553,38 @@ private:
     /* The proposals a row of the query pass took (block_shape), for finish_block_drafter and
      * issue_ahead's expect_draft. */
     int  block_steps_ = 0;
+    /* The depth-0 context skip (fn4 draft_ctxskip; engine_draft.cpp, "the depth-0 context skip").
+     * RADIANCE_DRAFT_CTXSKIP=0 | 1 at start declares it for a windowed block drafter drafting: the
+     * budget reserves the ring (ctxskip_bytes), step_state_init allocates it on every rank that taps
+     * rows for the drafter (its buffer named "dspark_src"), and block_context_pass then keeps a plain
+     * step's tapped rows in it instead of passing them while the head does not run, and refills the
+     * drafter's window from them before it runs again. Unset: nothing declared, allocated or
+     * logged, and block_context_pass is today's context pass. */
+    struct CtxSkip {
+        bool    declared = false;
+        bool    ready = false;           /* the ring on every rank that taps */
+        int     start = 0;               /* RADIANCE_DRAFT_CTXSKIP's value */
+        int     on = 0;                  /* the switch */
+        int     slots = 0;               /* step slots kept between refills; slot `slots` is the stash */
+        int     used = 0;                /* slots holding kept rows */
+        int64_t pitch = 0;               /* bytes a tapped row */
+        int64_t ring_bytes = 0;          /* a rank */
+        std::vector<rad_buf> src;        /* a rank's tapped rows buffer; 0 where it taps none */
+        std::vector<char*>   ring;
+        int64_t skipped = 0, refills = 0, refill_rows = 0, dropped = 0, ring_full = 0;
+        std::vector<Scheduler::CtxRun> runs;
+    } ctxs_;
+    /* The ring's bytes a rank for `p` (0 when the skip is not declared or `p` taps nothing for a
+     * windowed block drafter); `src`, `pitch`, `slots` as found. */
+    int64_t ctxskip_bytes(const Program& p, rad_buf* src = nullptr, int64_t* pitch = nullptr,
+                          int* slots = nullptr) const;
+    int  ctxskip_setup();
+    void ctxskip_fini();
+    /* The context pass of issue_block_drafter: today's, or under the skip a kept step / a refill. */
+    int  block_context_pass(int step);
+    int  ctx_copy_rows(int slot, int64_t rows, bool to_ring);
+    int  ctx_refill_all(int step);
+    void ctx_note() const;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */

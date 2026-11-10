@@ -2068,6 +2068,9 @@ int Engine::plan() {
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
+            /* The depth-0 context skip's ring (RADIANCE_DRAFT_CTXSKIP): allocated at start beside the step
+             * state (ctxskip_setup), so in the budget and not kept for later. 0 when unset. */
+            f.staging += ctxskip_bytes(r->program);
             int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
             /* The KV tiers' copy staging, built by TierExec::device_init on the first copy out.
              * The cached groups are settled later, so every paged group is counted (an upper
@@ -4532,6 +4535,9 @@ int Engine::start() {
     }
 
     RAD_TRY(step_state_init());
+    /* The depth-0 context skip's ring (RADIANCE_DRAFT_CTXSKIP; engine_draft.cpp), reserved by the budget
+     * beside the step staging. Nothing when unset. */
+    RAD_TRY(ctxskip_setup());
 
     /* ---- the budget, checked against the card --------------------------------------------
      *

@@ -8774,3 +8774,226 @@ TEST(sim_burst_of_long_prompts) {
                 (double)N * (double)L / tt.back(), pct(0.5), pct(0.95), tt.back(),
                 dec_s > 0 ? (double)dec_tok / dec_s : 0.0, t);
 }
+
+/* ================================================== the depth-0 context skip (fn4 draft_ctxskip)
+ * A plain step's rows (every entry one decode token) can be kept instead of passed; a refill pass is a
+ * context pass (draft_pass -1) over each live sequence's kept positions, its last `window` at most, one
+ * entry a sequence at its first kept position, its rows where the ring kept them (CtxRun). The engine
+ * side (the ring, the copies, when to refill) is engine_draft.cpp's; these hold the plan to its rows. */
+namespace {
+/* A trunk with a block drafter whose own paged window group is bound past the trunk's layers and not
+ * prefix-cached; group 3 (attn, gdn, conv, draft). */
+void ctx_fixture(Fixture& f, int window) {
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/8192);
+    f.cfg.n_spec = 7;
+    f.prog.meta.n_layers = 16;
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    f.prog.drafter.window = window;
+    KVGroupInfo w;
+    w.name = "draft";
+    w.decl.kind = RAD_KV_WINDOW;
+    w.decl.window = 512;   /* FakeKV maps from position 0 (first_block_pos 0): a window past every position here */
+    w.block_size = 16;
+    w.layers = { 16 };
+    f.prog.kv_groups.push_back(w);
+    f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 4096, 64);
+    f.pc.groups = { 0 };
+}
+/* One decode step: plan, commit `tok`, open the block pass; keep its rows in `slot` when keepable and
+ * `slot` >= 0. Returns whether the step was keepable. */
+bool ctx_step(Fixture& f, int32_t tok, int slot, int64_t* rows = nullptr) {
+    if (!f.sch.step()) { CHECK(!"ctx_step: no step planned"); return false; }
+    f.commit_plain(tok);
+    Scheduler::BlockRow br[8];
+    (void)f.sch.block_begin(8, 7, (int)f.prog.drafter.window, 99, br, 8);
+    int64_t r = 0, l = 0;
+    const bool k = f.sch.ctx_keepable(&r, &l);
+    if (rows) *rows = r;
+    if (k && slot >= 0) CHECK_EQ(f.sch.ctx_keep(slot), l);
+    f.sch.block_end();
+    return k;
+}
+const RadKVGroupBatch* kvg(const RadBatch* b, int32_t group) {
+    for (int g = 0; g < b->n_kv_groups; ++g)
+        if (b->kv[g].group == group) return &b->kv[g];
+    return nullptr;
+}
+}  /* namespace */
+
+TEST(a_kept_plain_steps_rows_refill_in_one_context_pass_at_their_positions) {
+    Fixture f;
+    ctx_fixture(f, 64);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(100, 64), b = f.submit(100, 64);
+    /* The prompts' step carries 100 rows a sequence: not a plain step. */
+    CHECK(!ctx_step(f, 11, 0));
+    CHECK_EQ(f.sch.ctx_pending(), 0);
+    for (int k = 0; k < 5; ++k) {
+        int64_t rows = 0;
+        CHECK(ctx_step(f, (int32_t)(12 + k), k, &rows));
+        CHECK_EQ(rows, 2);
+    }
+    CHECK_EQ(f.sch.ctx_pending(), 10);
+    std::vector<Scheduler::CtxRun> runs;
+    int64_t nr = 0, nd = 0;
+    const RadBatch* rb = f.sch.ctx_refill(/*step=*/9, /*cap=*/512, /*window=*/64, &runs, &nr, &nd);
+    REQUIRE(rb != nullptr);
+    CHECK_EQ(rb->draft_pass, -1);
+    CHECK_EQ(rb->n_seq, 2);
+    CHECK_EQ(rb->n_tok, 10);
+    CHECK_EQ(nr, 10);
+    CHECK_EQ(nd, 0);
+    CHECK_EQ(rb->cu_seqlens[1], 5);
+    /* seq_ids are card indices: A's then B's, as the last step's plan has them. */
+    REQUIRE_EQ((int)f.sch.plan().e.size(), 2);
+    CHECK_EQ((uint64_t)f.sch.plan().e[0].seq, a);
+    CHECK_EQ((uint64_t)f.sch.plan().e[1].seq, b);
+    CHECK_EQ(rb->seq_ids[0], f.sch.plan().e[0].card);
+    CHECK_EQ(rb->seq_ids[1], f.sch.plan().e[1].card);
+    /* Each sequence's kept positions 100..104 (its first decode step was at 100), in order. */
+    for (int j = 0; j < 5; ++j) {
+        CHECK_EQ(rb->positions[j], 100 + j);
+        CHECK_EQ(rb->positions[5 + j], 100 + j);
+    }
+    const RadKVGroupBatch* g = kvg(rb, 3);
+    REQUIRE(g != nullptr);
+    for (int j = 0; j < 10; ++j) CHECK(g->slot_mapping[j] >= 0);
+    CHECK(g->slot_mapping[0] != g->slot_mapping[5]);   /* two sequences, two caches */
+    /* A's rows were row 0 of steps 0..4, B's row 1: one run each. */
+    REQUIRE_EQ((int)runs.size(), 2);
+    CHECK_EQ(runs[0].dst, 0);  CHECK_EQ(runs[0].slot, 0);  CHECK_EQ(runs[0].row, 0);  CHECK_EQ(runs[0].n, 5);
+    CHECK_EQ(runs[1].dst, 5);  CHECK_EQ(runs[1].slot, 0);  CHECK_EQ(runs[1].row, 1);  CHECK_EQ(runs[1].n, 5);
+    /* Consumed: nothing left, and the next step keeps from its own position on. */
+    CHECK(f.sch.ctx_refill(9, 512, 64, &runs, &nr, &nd) == nullptr);
+    CHECK_EQ(f.sch.ctx_pending(), 0);
+    CHECK(ctx_step(f, 20, 0));
+    CHECK_EQ(f.sch.ctx_pending(), 2);
+    rb = f.sch.ctx_refill(10, 512, 64, &runs, &nr, &nd);
+    REQUIRE(rb != nullptr);
+    CHECK_EQ(rb->positions[0], 105);
+}
+
+/* The refill reads only what a query reads (the last `window` positions; the rest dropped), splits at
+ * the cap (one sequence's rows over two passes, positions continuing), drops a finished sequence's
+ * rows, and a kept sequence that skipped a position, or a step carrying drafts, is not keepable. */
+TEST(a_refill_keeps_the_window_splits_at_the_cap_and_drops_what_no_query_reads) {
+    Fixture f;
+    ctx_fixture(f, 3);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(100, 64);
+    f.submit(100, 64);
+    CHECK(!ctx_step(f, 11, 0));
+    for (int k = 0; k < 5; ++k) CHECK(ctx_step(f, (int32_t)(12 + k), k));
+    std::vector<Scheduler::CtxRun> runs;
+    int64_t nr = 0, nd = 0;
+    const RadBatch* rb = f.sch.ctx_refill(9, /*cap=*/4, /*window=*/3, &runs, &nr, &nd);
+    REQUIRE(rb != nullptr);
+    CHECK_EQ(nd, 4);                 /* A's and B's 100, 101: older than the window */
+    CHECK_EQ(nr, 4);                 /* A's last three, B's first of its last three */
+    CHECK_EQ(rb->n_seq, 2);
+    CHECK_EQ(rb->positions[0], 102);
+    CHECK_EQ(rb->positions[2], 104);
+    CHECK_EQ(rb->positions[3], 102);
+    REQUIRE_EQ((int)runs.size(), 2);
+    CHECK_EQ(runs[0].slot, 2);  CHECK_EQ(runs[0].n, 3);
+    CHECK_EQ(runs[1].slot, 2);  CHECK_EQ(runs[1].n, 1);  CHECK_EQ(runs[1].row, 1);
+    rb = f.sch.ctx_refill(9, 4, 3, &runs, &nr, &nd);
+    REQUIRE(rb != nullptr);
+    CHECK_EQ(nd, 0);                 /* B's two oldest were dropped in the first call */
+    CHECK_EQ(nr, 2);
+    CHECK_EQ(rb->n_seq, 1);
+    CHECK_EQ(rb->positions[0], 103);
+    CHECK_EQ(rb->positions[1], 104);
+    REQUIRE_EQ((int)runs.size(), 1);
+    CHECK_EQ(runs[0].slot, 3);  CHECK_EQ(runs[0].row, 1);  CHECK_EQ(runs[0].n, 2);
+    CHECK(f.sch.ctx_refill(9, 4, 3, &runs, &nr, &nd) == nullptr);
+
+    /* A step whose rows were not kept, then a keepable-looking one: A and B kept nothing, so it is
+     * keepable; keep it, skip keeping the next, and the one after is not (a hole at the skipped position). */
+    CHECK(ctx_step(f, 30, 0));
+    CHECK(ctx_step(f, 31, -1));
+    CHECK(!ctx_step(f, 32, -1));
+    rb = f.sch.ctx_refill(9, 64, 3, &runs, &nr, &nd);
+    REQUIRE(rb != nullptr);
+    CHECK_EQ(nr, 2);
+
+    /* A ends with its kept rows: they are dropped, B's refilled. */
+    CHECK(ctx_step(f, 33, 0));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_OK(f.commit(34, /*eos=*/1));
+    CHECK(f.sch.find(a) == nullptr || f.sch.find(a)->state != ReqState::Running);
+    rb = f.sch.ctx_refill(9, 64, 3, &runs, &nr, &nd);
+    /* both ended at the eos commit here: nothing to pass, both sequences' rows dropped */
+    CHECK(rb == nullptr);
+    CHECK_EQ(nd, 2);
+    CHECK_EQ(f.sch.ctx_pending(), 0);
+}
+
+TEST(a_step_carrying_drafts_is_not_a_plain_step) {
+    Fixture f;
+    ctx_fixture(f, 64);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(100, 64);
+    CHECK(!ctx_step(f, 11, 0));
+    CHECK(ctx_step(f, 12, 0));
+    int32_t draft[3] = { 21, 22, 23 };
+    CHECK_OK(f.sch.set_draft(a, draft, 3));
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_spec, 3);
+    CHECK_OK(f.commit(13, 0, [](const StepEntry&) { return 1; }));
+    Scheduler::BlockRow br[4];
+    (void)f.sch.block_begin(8, 7, 64, 99, br, 4);
+    int64_t r = 0, l = 0;
+    CHECK(!f.sch.ctx_keepable(&r, &l));
+    f.sch.block_end();
+    CHECK_EQ(f.sch.ctx_pending(), 1);
+}
+
+/* draft_depth0 2 (a test hook): D = 0 at every cycle but the probes, at the drafting depth every
+ * probe_every cycles at 0, however the measured costs say drafting pays; 1 / 0 as before. */
+TEST(forced_depth_zero_holds_zero_but_for_the_probes) {
+    DraftController z;
+    DraftController::Params p;
+    p.max_depth = 5;
+    p.adapt = true;
+    p.depth0 = true;
+    p.depth0_forced = true;
+    p.probe_every = 4;
+    REQUIRE(z.configure(p) == RAD_OK);
+    CHECK_EQ(z.depth0_mode(), 2);
+    DraftAdapt u;
+    DraftAdapt* one[1] = { &u };
+    /* Drafting measured far ahead of a plain step: the measured choice would draft. */
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 8; ++k) z.step_time(d, 1, 10.0, 6.0);
+    for (int k = 0; k < 8; ++k) z.step_time(0, 1, 30.0);
+    int run = 0, heads = 0, zeros = 0, worst = 0;
+    for (int t = 0; t < 60; ++t) {
+        z.plan_step(one, 1, 1);
+        if (z.head_runs()) { ++heads; ++run; worst = std::max(worst, run); }
+        else { ++zeros; run = 0; }
+    }
+    CHECK(zeros > heads);
+    CHECK(heads > 0);
+    CHECK(worst <= DraftController::kProbeSteps);
+    CHECK(z.probe_cycles() > 0);
+    CHECK_EQ(z.zero_moves(), 1);
+    z.set_depth0(false);
+    CHECK_EQ(z.depth0_mode(), 0);
+    CHECK(z.head_runs());
+    z.set_depth0_forced(true);
+    CHECK_EQ(z.depth0_mode(), 2);
+    z.set_depth0(true);   /* 1 from 2: depth 0 stays on, forced stays as it was */
+    CHECK(z.depth0());
+
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.set_draft_depth0(2), 2);
+    CHECK(f.sch.draft().depth0_forced());
+    CHECK_EQ(f.sch.set_draft_depth0(1), 1);
+    CHECK(!f.sch.draft().depth0_forced());
+    CHECK_EQ(f.sch.set_draft_depth0(0), 0);
+}
