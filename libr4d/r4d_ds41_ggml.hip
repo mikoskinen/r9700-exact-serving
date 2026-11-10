@@ -3308,9 +3308,17 @@ long long gg_xbuf(int xm, long long K, int* xlm, int* xr, int* kc) {
 bool gg_inner1(const RadTensor* t) { return t->rank < 2 || t->shape[t->rank - 1] == 1 || t->stride[t->rank - 1] == 1; }
 bool gg_al16(const void* p, long long ld) { return ((uintptr_t)p & 15u) == 0 && ld % 8 == 0; }
 
+/* r4d_gg_gemv_pin (bench hook, r4d_selftest --perfgg): the decode band of gemm_nt_ggml / logits_gemm_ggml at a pinned
+ * rows-a-wave (1, 2 or 4) and grid cap, 0 = the rule. Every form keeps lane = unit mod 32, a lane's units in order and
+ * the same butterfly, so the bits are the rule's whatever is pinned. */
+int g_gg_pin_rpw = 0, g_gg_pin_grid = 0;
 template <int T>
 int gg_launch_gemv_t(RadStream s, int rpw, bool moe, bool f32out, const GgGemvArgs& A, unsigned grid,
                      unsigned lds) {
+    if (!moe && rpw == 4 && T != GG_F32) {
+        if (f32out) return R4D_EMIT(s, (gg_gemv_kernel<T, (T == GG_F32 ? 1 : 4), false, float>), dim3(grid), dim3(kGgThreads), lds, A);
+        return R4D_EMIT(s, (gg_gemv_kernel<T, (T == GG_F32 ? 1 : 4), false, uint16_t>), dim3(grid), dim3(kGgThreads), lds, A);
+    }
     if (moe) {
         if (rpw == 2 && T != GG_F32)
             return R4D_EMIT(s, (gg_gemv_kernel<T, (T == GG_F32 ? 1 : 2), true, uint16_t>), dim3(grid), dim3(kGgThreads), lds, A);
@@ -3545,13 +3553,15 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
         A.M = (int)M; A.N = (int)N; A.K = (int)K;
         A.XM = (int)(M < kGgXM ? M : kGgXM);
         const long long xbuf = gg_xbuf(A.XM, K, &A.XLM, &A.XR, &A.KC);
-        const int rpw = (M >= 3 && ty != GG_F32 && (N + 15) / 16 >= 128) ? 2 : 1;
+        int rpw = (M >= 3 && ty != GG_F32 && (N + 15) / 16 >= 128) ? 2 : 1;
+        if (g_gg_pin_rpw > 0 && ty != GG_F32) rpw = g_gg_pin_rpw;
         const long long nrg = (N + 8 * rpw - 1) / (8 * rpw);
         A.rgpi = 1; A.ipe = (int)nrg;
         A.x_al = x_al;
         A.live_off = (int)tb; A.x_off = (int)tb;
         const long long lds = tb + xbuf * 4;
-        const unsigned grid = (unsigned)(nrg < 256 ? nrg : 256);
+        const long long gcap = g_gg_pin_grid > 0 ? g_gg_pin_grid : 256;
+        const unsigned grid = (unsigned)(nrg < gcap ? nrg : gcap);
         return gg_launch_gemv(s, ty, rpw, false, logits, A, grid, (unsigned)lds);
     }
     GgTiledArgs A{};
@@ -3822,4 +3832,9 @@ extern "C" int r4d_rad_embed_lookup_ggml(const RadArgs* a, RadStream s) {
     const float mult = (float)r4d_getf(a, "mult", 1.0);
     return gg_launch_embed(s, ty, (const int32_t*)tok->data, (const uint8_t*)w->data, w_ld,
                            (uint16_t*)x->data, x_ld, (int)M, (int)E, (int)V, voff, mult);
+}
+
+extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
+    g_gg_pin_rpw = (rpw == 1 || rpw == 2 || rpw == 4) ? rpw : 0;
+    g_gg_pin_grid = grid > 0 ? grid : 0;
 }
