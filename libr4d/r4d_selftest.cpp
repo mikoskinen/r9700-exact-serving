@@ -20967,6 +20967,340 @@ static void ds_gg_perf(const Plugin& pl, const char* mlist, int iters, const cha
     dfree_all();
 }
 
+/* ---- lever D2 (ds41-mr, 10.11.2026): gemm_nt_ggml / logits_gemm_ggml's decode band in the multi-row form
+ * (r4d_ds41_ggml_mr.hip), switched by its exported pin (r4d_gg_mr_pin / r4d_gg_mr_pin_w64; absent from a plugin
+ * without the form: the modes skip). The stock path is the same row with the pin cleared (gg_gemm runs today's
+ * gg_gemv_kernel); the form goes through gg_gemm's hook, as a served launch would.
+ *
+ * DeepSeek-V4.1-Flash's dense TP4 shapes as the 2.25 bpw .rad types them (rad-info): attention q5_K (13 layers) or
+ * q6_K (27), the shared expert q6_K (27) or q8_0 (13) at rank 0's width (768 of 2304) and ranks 1-3's (512),
+ * engram_kv q6_K, the head (output.weight 129280 x 5120 q6_K, a quarter a rank, f32 logits). --mrcheck also runs
+ * the other two types at every dense shape. */
+struct MrShape { const char* name; int64_t N, K; const char* types; bool logits; };
+static const MrShape kMrShapes[] = {
+    { "attn_q_b", 8192, 1280, "q5_K,q6_K", false },       { "attn_output_b", 5120, 2048, "q5_K,q6_K", false },
+    { "attn_q_a", 1280, 5120, "q5_K,q6_K", false },       { "attn_output_a", 1024, 4096, "q5_K,q6_K", false },
+    { "attn_kv", 512, 5120, "q5_K,q6_K", false },         { "shexp_gate_up", 1536, 5120, "q6_K,q8_0", false },
+    { "shexp_down", 5120, 768, "q6_K,q8_0", false },      { "shexp_gate_up_w512", 1024, 5120, "q6_K,q8_0", false },
+    { "shexp_down_w512", 5120, 512, "q6_K,q8_0", false }, { "engram_kv", 25600, 6144, "q6_K", false },
+    { "head", 32320, 5120, "q6_K", true },
+};
+struct MrTy { const char* name; int qk, bb; };
+static const MrTy kMrTypes[] = { { "q5_K", 256, 176 }, { "q6_K", 256, 210 }, { "q8_0", 32, 34 } };
+static bool mr_in(const char* list, const char* name) {
+    return (std::string(",") + list + ",").find(std::string(",") + name + ",") != std::string::npos;
+}
+
+struct MrHooks {
+    void (*pin)(int, int, int, int) = nullptr;
+    void (*pin_w64)(int) = nullptr;
+    const char* (*last)() = nullptr;
+    void (*gpin)(int, int) = nullptr;   /* r4d_gg_gemv_pin: the stock form's rows a wave / grid cap */
+};
+static MrHooks mr_hooks(const Plugin& pl) {
+    MrHooks h;
+    h.pin = (void (*)(int, int, int, int))dlsym(pl.h, "r4d_gg_mr_pin");
+    h.pin_w64 = (void (*)(int))dlsym(pl.h, "r4d_gg_mr_pin_w64");
+    h.last = (const char* (*)())dlsym(pl.h, "r4d_gg_mr_last");
+    h.gpin = (void (*)(int, int))dlsym(pl.h, "r4d_gg_gemv_pin");
+    return h;
+}
+
+/* A form of the multi-row path: (H, R, MT cap, WN, wave64); h 0 = the stock path, -1 = the form's rule. */
+struct MrPin { int h, r, mt, wn, w64; };
+static std::string mr_pin_name(const MrPin& p) {
+    if (p.h == 0) return "stock";
+    if (p.h < 0) return "mr-rule";
+    std::string s = fmt("H%dR%d", p.h, p.r);
+    if (p.mt) s += fmt("c%d", p.mt);
+    if (p.wn) s += fmt("w%d", p.wn);
+    if (p.w64) s += "-w64";
+    return s;
+}
+static void mr_apply(const MrHooks& h, const MrPin& p) {
+    h.pin(p.h, p.r, p.mt, p.wn);
+    if (h.pin_w64) h.pin_w64(p.w64);
+}
+
+/* Random native blocks with finite scales (normal, a few subnormal, a few near f16's top), the type's layout. */
+static void mr_weights(std::vector<uint8_t>& hw, const MrTy& ty, int64_t N, int64_t K, uint64_t seed) {
+    uint64_t rs = seed;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    const int64_t rb = K / ty.qk * ty.bb;
+    hw.resize((size_t)(N * rb));
+    for (size_t i = 0; i < hw.size(); i += 8) { const uint64_t v = rnd(); std::memcpy(&hw[i], &v, std::min<size_t>(8, hw.size() - i)); }
+    auto f16 = [&]() {
+        const uint32_t k = (uint32_t)(rnd() % 100);
+        const uint16_t sign = (uint16_t)((rnd() & 1) << 15);
+        const uint16_t e = k < 4 ? 0 : k < 6 ? (uint16_t)(26 + rnd() % 4) : (uint16_t)(5 + rnd() % 7);
+        return (uint16_t)(sign | (e << 10) | (uint16_t)(rnd() & 0x3ff));
+    };
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t b = 0; b < K / ty.qk; ++b) {
+            uint8_t* blk = hw.data() + n * rb + b * ty.bb;
+            const uint16_t d = f16(), dm = f16();
+            if (!std::strcmp(ty.name, "q6_K")) std::memcpy(blk + 208, &d, 2);
+            else { std::memcpy(blk, &d, 2); if (!std::strcmp(ty.name, "q5_K")) std::memcpy(blk + 2, &dm, 2); }
+        }
+}
+/* 48 activation rows: values in [-4, 4], zeros of both signs and bf16 subnormals sprinkled; row 5 holds an
+ * infinity and row 17 a few huge values (overflowing products and sums: inf, inf - inf). */
+static void mr_acts(std::vector<uint16_t>& hx, int64_t K, uint64_t seed) {
+    uint64_t rs = seed;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    hx.assign((size_t)(48 * K), 0);
+    for (size_t i = 0; i < hx.size(); ++i) {
+        const uint32_t c = (uint32_t)(rnd() % 1000);
+        hx[i] = c < 5 ? 0x0000 : c < 10 ? 0x8000 : c < 15 ? (uint16_t)((rnd() & 1 ? 0x8000 : 0) | (rnd() % 0x7f + 1))
+                                                          : h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 2500.0f);
+    }
+    hx[(size_t)(5 * K + (int64_t)(rnd() % K))] = 0x7f80;
+    for (int e = 0; e < 3; ++e) hx[(size_t)(17 * K + (int64_t)(rnd() % K))] = (uint16_t)(0x7e80 + rnd() % 0x80);
+}
+
+/* One decode-band launch of the shape's row (gemm_nt_ggml, or logits_gemm_ggml for the head): y[M, N] from M rows
+ * of x. Returns the launch's rc. */
+struct MrLaunch {
+    const RadKernelInfo* row = nullptr;
+    std::vector<RadTensor> ts;
+    std::vector<RadParam> ps;
+    RadArgs a{};
+    int run(void* x, void* w, void* y) {
+        ts[0].data = x; ts[1].data = w; ts[2].data = y;
+        return row->launch(&a, nullptr);
+    }
+};
+static bool mr_setup(MrLaunch& L, const Plugin& pl, const MrShape& sh, const MrTy& ty, int64_t M) {
+    const char* rn = sh.logits ? (ty.qk == 256 ? "logits_gemm_ggml_qk256_gemv" : "logits_gemm_ggml_qk32_gemv")
+                               : (ty.qk == 256 ? "gemm_nt_ggml_qk256_gemv" : "gemm_nt_ggml_qk32_gemv");
+    L.row = find(pl, rn);
+    if (!L.row) return false;
+    const int64_t rb = sh.K / ty.qk * ty.bb;
+    L.ts = { T(nullptr, RAD_BF16, { M, sh.K }), T(nullptr, RAD_U8, { sh.N, rb }),
+             T(nullptr, sh.logits ? RAD_F32 : RAD_BF16, { M, sh.N }) };
+    if (sh.logits)
+        L.ps = { PI("M", M), PI("n_vocab", sh.N), PI("n_embd", sh.K), PS("type", ty.name), PS("dtype", "bf16") };
+    else
+        L.ps = { PI("M", M), PI("N", sh.N), PI("K", sh.K), PS("type", ty.name), PS("dtype", "bf16") };
+    std::memset(&L.a, 0, sizeof(L.a));
+    L.a.t = L.ts.data(); L.a.n_t = (int)L.ts.size(); L.a.p = L.ps.data(); L.a.n_p = (int)L.ps.size(); L.a.world_size = 1;
+    return true;
+}
+
+/* --mrcheck [types]: the form against the stock path, byte for byte, at every shape above (q5_K / q6_K / q8_0 at
+ * every dense shape, the head in q6_K), M = 1 .. 48, in every (H, R) pair at its largest MT cap and at a small one
+ * (M split over the grid), the wave64 unit, and the rule. One MRCHECK line a (type, shape); FAIL lines name the
+ * form and the first differing output. Also, as information (MRINFO): whether the stock path gives row m of an
+ * M-row call the bytes it gives the row alone, for every m < M <= 48 (whether a speculative verify pass's rows can
+ * ever differ from plain decode's). */
+static void ds_mr_check(const Plugin& pl, const char* tlist) {
+    const MrHooks h = mr_hooks(pl);
+    if (!h.pin) { std::printf("--mrcheck: r4d_gg_mr_pin absent (a plugin without lever D2)\n"); return; }
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    const MrPin pins[] = { { 1, 1, 0, 0, 0 }, { 1, 1, 4, 0, 0 }, { 2, 1, 0, 0, 0 }, { 2, 2, 0, 0, 0 }, { 2, 2, 6, 0, 0 }, { 4, 1, 0, 0, 0 },
+                           { 4, 1, 8, 0, 0 }, { 4, 2, 0, 0, 0 }, { 4, 2, 3, 0, 0 }, { 4, 1, 0, 0, 1 }, { 4, 2, 0, 0, 1 },
+                           { 2, 2, 0, 0, 1 }, { 1, 1, 0, 2, 1 }, { -1, 0, 0, 0, 0 } };
+    long long launches = 0, diffs = 0, diffs64 = 0, info_rows = 0, info_same = 0;
+    std::printf("lever D2 byte check: the multi-row form vs the stock decode band, M = 1..48, %d forms each\n",
+                (int)(sizeof(pins) / sizeof(pins[0])));
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        for (const MrShape& sh : kMrShapes) {
+            if (sh.logits && std::strcmp(ty.name, "q6_K")) continue;   /* the head is q6_K; f32 logits only there */
+            if (sh.K % ty.qk) continue;
+            dfree_all();
+            std::vector<uint8_t> hw;
+            mr_weights(hw, ty, sh.N, sh.K, 0x9E3779B97F4A7C15ull ^ (uint64_t)(sh.N * 131 + sh.K));
+            std::vector<uint16_t> hx;
+            mr_acts(hx, sh.K, 0x1234567ull ^ (uint64_t)sh.K);
+            const size_t ob = sh.logits ? 4 : 2, yb = (size_t)(48 * sh.N) * ob;
+            void* d_w = dalloc(hw.size());
+            void* d_x = dalloc(hx.size() * 2);
+            void* d_y = dalloc(yb);
+            if (!d_w || !d_x || !d_y) { std::printf("  FAIL %s %s: alloc\n", ty.name, sh.name); ++g_fail; continue; }
+            st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            /* the stock path's rows alone (M = 1), for the information check */
+            std::vector<uint8_t> alone(yb);
+            {
+                MrLaunch L;
+                if (!mr_setup(L, pl, sh, ty, 1)) { std::printf("  %s %s: row absent\n", ty.name, sh.name); continue; }
+                h.pin(0, 0, 0, 0);
+                for (int m = 0; m < 48; ++m)
+                    L.run((uint16_t*)d_x + (size_t)m * sh.K, d_w, (uint8_t*)d_y + (size_t)m * sh.N * ob);
+                st_stream_sync(nullptr);
+                st_memcpy(alone.data(), d_y, yb, hipMemcpyDeviceToHost);
+            }
+            int bad_m = 0, info_m = 0;
+            std::string fails;
+            for (int64_t M = 1; M <= 48; ++M) {
+                MrLaunch L;
+                mr_setup(L, pl, sh, ty, M);
+                const size_t mb = (size_t)(M * sh.N) * ob;
+                std::vector<uint8_t> ref(mb), got(mb);
+                h.pin(0, 0, 0, 0);
+                st_memset(d_y, 0xff, mb);
+                int rc = L.run(d_x, d_w, d_y);
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { std::printf("  FAIL %s %s M=%lld stock rc %d\n", ty.name, sh.name, (long long)M, rc); ++g_fail; continue; }
+                st_memcpy(ref.data(), d_y, mb, hipMemcpyDeviceToHost);
+                bool same_alone = true;
+                for (int64_t m = 0; m < M; ++m)
+                    if (std::memcmp(ref.data() + (size_t)m * sh.N * ob, alone.data() + (size_t)m * sh.N * ob, (size_t)sh.N * ob)) same_alone = false;
+                info_m += same_alone ? 1 : 0;
+                ++info_rows; info_same += same_alone ? 1 : 0;
+                bool mbad = false;
+                for (const MrPin& p : pins) {
+                    mr_apply(h, p);
+                    st_memset(d_y, 0xff, mb);
+                    rc = L.run(d_x, d_w, d_y);
+                    const bool ok_rc = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                    ++launches;
+                    if (!ok_rc) { fails += fmt(" M=%lld %s rc %d;", (long long)M, mr_pin_name(p).c_str(), rc); ++(p.w64 ? diffs64 : diffs); mbad = true; continue; }
+                    st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
+                    if (got != ref) {
+                        size_t nb = 0, first = 0;
+                        for (size_t e = 0; e < mb; e += ob)
+                            if (std::memcmp(&got[e], &ref[e], ob)) { if (!nb) first = e / ob; ++nb; }
+                        std::printf("  FAIL %s %s M=%lld form %s (%s): %zu of %zu outputs differ, first m=%zu n=%zu\n", ty.name,
+                                    sh.name, (long long)M, mr_pin_name(p).c_str(), h.last ? h.last() : "?", nb, mb / ob,
+                                    first / (size_t)sh.N, first % (size_t)sh.N);
+                        ++(p.w64 ? diffs64 : diffs); mbad = true;
+                    }
+                }
+                h.pin(0, 0, 0, 0);
+                if (h.pin_w64) h.pin_w64(0);
+                bad_m += mbad ? 1 : 0;
+            }
+            g_fail += bad_m ? 1 : 0;
+            std::printf("MRCHECK %s %s %lldx%lld%s M=1..48: %s (%d of 48 M with a difference)%s; MRINFO stock row alone == row in the M call at %d of 48 M\n",
+                        ty.name, sh.name, (long long)sh.N, (long long)sh.K, sh.logits ? " f32" : "",
+                        bad_m ? "DIFFERS" : "identical in every form", bad_m, fails.c_str(), info_m);
+            std::fflush(stdout);
+        }
+    }
+    dfree_all();
+    std::printf("MRVERDICT check: %lld form launches; wave32 forms %lld differ, wave64 forms %lld differ -> %s; stock row alone == in-call row at %lld of %lld (type, shape, M)\n",
+                launches, diffs, diffs64,
+                diffs ? "FAIL" : (diffs64 ? "PASS for the wave32 forms (byte-identical), FAIL for wave64" : "PASS (byte-identical, every form)"),
+                info_same, info_rows);
+}
+
+/* --perfmr [M list] [iters] [types]: us a call of the stock rule, the best pinned stock form (r4d_gg_gemv_pin rows a
+ * wave 1 / 2 / 4 x grid cap 256 / 1024), the multi-row form's rule and its pinned forms, at the 2.25 .rad's (type,
+ * shape) pairs; the weight streams from DRAM (rotated copies past 256 MiB, "rot": the mean) or, with --cold MIB,
+ * past a flush ("cold": the median). Every form's bytes are compared with the stock rule's. One MRPERF line a
+ * (type, shape, M) with every form, then MRSUM (stock rule, stock best, mr best, speedups); MRVERDICT at the end. */
+static void ds_mr_perf(const Plugin& pl, const char* mlist, int iters, const char* tlist) {
+    if (iters <= 0) iters = 100;
+    const MrHooks h = mr_hooks(pl);
+    if (!h.pin) { std::printf("--perfmr: r4d_gg_mr_pin absent (a plugin without lever D2)\n"); return; }
+    std::vector<int64_t> Ms;
+    { std::string m = mlist && *mlist ? mlist : "1,2,3,4,6,8,12,16,24,32,48"; size_t p = 0;
+      while (p < m.size()) { size_t q = m.find(',', p); if (q == std::string::npos) q = m.size(); Ms.push_back(std::strtoll(m.substr(p, q - p).c_str(), nullptr, 10)); p = q + 1; } }
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    const char* mode = g_cold > 0 ? "cold" : "rot";
+    const MrPin mine[] = { { -1, 0, 0, 0, 0 }, { 1, 1, 0, 0, 0 }, { 2, 1, 0, 0, 0 }, { 2, 2, 0, 0, 0 }, { 4, 1, 0, 0, 0 }, { 4, 2, 0, 0, 0 },
+                           { 4, 1, 12, 0, 0 }, { 4, 1, 8, 0, 0 }, { 4, 1, 0, 8, 0 }, { 4, 2, 0, 8, 0 }, { 4, 1, 0, 0, 1 },
+                           { 4, 2, 0, 0, 1 }, { 2, 2, 0, 0, 1 } };
+    std::printf("lever D2 timing (%s, %d launches): stock rule, stock pinned forms, multi-row forms; bytes vs the stock rule\n",
+                g_cold > 0 ? fmt("cold, %lld MiB read before each, median", (long long)(g_cold >> 20)).c_str() : "rotated weight copies, mean", iters);
+    double lsum_vs_rule = 0, lsum_vs_best = 0;
+    int nsum = 0, nwin = 0, ndiff = 0;
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        for (const MrShape& sh : kMrShapes) {
+            if (!mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
+            const int64_t rb = sh.K / ty.qk * ty.bb, wbytes = sh.N * rb;
+            std::vector<uint8_t> hw;
+            mr_weights(hw, ty, sh.N, sh.K, 0x51ED2701ull ^ (uint64_t)(sh.N * 7 + sh.K));
+            const int copies = (int)std::max<int64_t>(2, (256ll << 20) / wbytes + 1);
+            for (int64_t M : Ms) {
+                if (M < 1 || M > 48) continue;
+                dfree_all();
+                std::vector<uint16_t> hx;
+                mr_acts(hx, sh.K, 0xABCDEFull ^ (uint64_t)M);
+                const size_t ob = sh.logits ? 4 : 2, mb = (size_t)(M * sh.N) * ob;
+                void* d_x = dalloc((size_t)(M * sh.K) * 2);
+                void* d_w = dalloc((size_t)wbytes * (size_t)copies);
+                void* d_y = dalloc(mb);
+                if (!d_x || !d_w || !d_y) { std::printf("  %s %s M=%lld: alloc failed\n", ty.name, sh.name, (long long)M); continue; }
+                st_memcpy(d_x, hx.data(), (size_t)(M * sh.K) * 2, hipMemcpyHostToDevice);
+                for (int c = 0; c < copies; ++c)
+                    st_memcpy((uint8_t*)d_w + (size_t)c * (size_t)wbytes, hw.data(), (size_t)wbytes, hipMemcpyHostToDevice);
+                MrLaunch L;
+                if (!mr_setup(L, pl, sh, ty, M)) { std::printf("  %s %s: row absent\n", ty.name, sh.name); continue; }
+                std::vector<uint8_t> ref;
+                struct R { std::string nm, form; double us; bool same; };
+                std::vector<R> res;
+                auto time_form = [&](const std::string& nm) -> R {
+                    st_memset(d_y, 0xff, mb);
+                    const int rc = L.run(d_x, d_w, d_y);
+                    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return { nm, fmt("rc %d", rc), -1.0, false };
+                    std::vector<uint8_t> got(mb);
+                    st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
+                    if (ref.empty()) ref = got;
+                    const bool same = got == ref;
+                    const std::string form = h.last ? h.last() : "";
+                    for (int i = 0; i < 20; ++i) L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y);
+                    const double us = st_time_us([&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); }, iters, nullptr);
+                    return { nm, form, us, same };
+                };
+                h.pin(0, 0, 0, 0);
+                if (h.pin_w64) h.pin_w64(0);
+                res.push_back(time_form("stock"));
+                R sbest = res[0];
+                if (h.gpin) {
+                    for (int rp : { 1, 2, 4 })
+                        for (int g : { 256, 1024 }) {
+                            h.gpin(rp, g);
+                            R r = time_form(fmt("stock-r%dg%d", rp, g));
+                            r.form = "";
+                            if (r.us > 0 && (sbest.us <= 0 || r.us < sbest.us)) sbest = r;
+                            res.push_back(r);
+                        }
+                    h.gpin(0, 0);
+                }
+                R mbest{ "", "", -1.0, true }, mrule{ "", "", -1.0, true };
+                for (const MrPin& p : mine) {
+                    mr_apply(h, p);
+                    R r = time_form(mr_pin_name(p));
+                    if (p.h < 0) mrule = r;
+                    if (r.us > 0 && r.same && (mbest.us <= 0 || r.us < mbest.us)) mbest = r;
+                    res.push_back(r);
+                }
+                h.pin(0, 0, 0, 0);
+                if (h.pin_w64) h.pin_w64(0);
+                bool alls = true;
+                std::string line = fmt("MRPERF %s %s %lldx%lld M=%lld (%.2f MiB) %s:", ty.name, sh.name, (long long)sh.N,
+                                       (long long)sh.K, (long long)M, wbytes / 1048576.0, mode);
+                for (const R& r : res) {
+                    alls = alls && r.same;
+                    line += fmt(" %s %.1f%s%s;", r.nm.c_str(), r.us, r.form.empty() ? "" : fmt(" [%s]", r.form.c_str()).c_str(),
+                                r.same ? "" : " OUTPUT DIFFERS");
+                }
+                std::printf("%s\n", line.c_str());
+                if (!alls) { ++g_fail; ++ndiff; }
+                const double st = res[0].us;
+                if (mbest.us > 0 && st > 0 && sbest.us > 0) {
+                    std::printf("MRSUM %s %s %lldx%lld M=%lld %s: stock %.1f us | stock best %s %.1f | mr rule %.1f | mr best %s %.1f [%s] | x%.2f vs stock, x%.2f vs stock best | %.0f GB/s | bytes %s\n",
+                                ty.name, sh.name, (long long)sh.N, (long long)sh.K, (long long)M, mode, st, sbest.nm.c_str(), sbest.us,
+                                mrule.us, mbest.nm.c_str(), mbest.us, mbest.form.c_str(), st / mbest.us, sbest.us / mbest.us,
+                                wbytes / (mbest.us * 1e3), alls ? "identical" : "DIFFER");
+                    lsum_vs_rule += std::log(st / mbest.us);
+                    lsum_vs_best += std::log(sbest.us / mbest.us);
+                    ++nsum;
+                    nwin += mbest.us < sbest.us ? 1 : 0;
+                }
+                std::fflush(stdout);
+            }
+        }
+    }
+    dfree_all();
+    std::printf("MRVERDICT %s: %d (type, shape, M); mr best vs stock rule geomean x%.2f, vs stock best x%.2f; faster than stock best at %d; bytes %s\n",
+                mode, nsum, nsum ? std::exp(lsum_vs_rule / nsum) : 0.0, nsum ? std::exp(lsum_vs_best / nsum) : 0.0, nwin,
+                ndiff ? fmt("DIFFER at %d", ndiff).c_str() : "identical everywhere");
+}
+
 /* The gated residual's read at int8 codes. The same inputs run with the codes plane as E4M3 and
  * as I8: the bf16 block input and the rotated E4M3 twin must be byte-identical, and the int8 codes
  * must equal quant_act_i8g's over the bf16 input (per (row, 128) at amax / 127). Row counts reach
@@ -35247,6 +35581,11 @@ static void usage(void) {
                 "             PF2 from M=512) compared byte for byte and timed as one op each,\n"
                 "             then the two-grid decode form against the launcher's rule;\n"
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
+                "  --mrcheck [types]:  lever D2: gemm_nt_ggml / logits_gemm_ggml's decode band in the\n"
+                "             multi-row form vs the stock path, byte for byte, DeepSeek-V4.1's dense TP4\n"
+                "             shapes, M 1..48, every form; MRINFO: a row alone vs inside an M-row call.\n"
+                "  --perfmr [Ms] [iters] [types]:  lever D2's timing: stock rule, pinned stock forms,\n"
+                "             multi-row forms (MRPERF / MRSUM a (type, shape, M), MRVERDICT).\n"
                 "  --cold MIB:  with a --perf mode, time cold: read MIB through the caches before\n"
                 "             every timed launch (256 empties this card's L2 and last level) and\n"
                 "             time each launch alone, the median reported. Warm, a weight under\n"
@@ -35403,6 +35742,7 @@ int main(int argc, char** argv) {
     long long mx_m = 0, mx_e = 288, mx_k = 8;
     long long dsm_m = 0; int dsm_it = 0; const char* dsm_fmts = nullptr;   /* --perfdsmoe */
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
+    bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
     const char* mx_skew = nullptr;
     int mx_tp = 8;
     bool mx_f8 = false;
@@ -35633,6 +35973,16 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_e = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_k = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_skew = argv[++i];
+        } else if (!std::strcmp(argv[i], "--mrcheck")) {
+            /* lever D2: the multi-row decode-band form vs the stock path, byte for byte (ds_mr_check). */
+            mrc = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfmr")) {
+            /* lever D2: the multi-row form's timing vs the stock rule and pinned forms (ds_mr_perf). */
+            mrp = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_t = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfgg")) {
             /* gemm_nt_ggml's decode band at DeepSeek-V4.1's dense shapes, the rule vs pinned forms (ds_gg_perf). */
             dsg = true;
@@ -35864,6 +36214,17 @@ int main(int argc, char** argv) {
         skip("bf16 head timing", "built without HIP");
 #endif
         return 0;
+    }
+    if (mrc || mrp) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        if (mrc) ds_mr_check(pl, mr_t);
+        if (mrp) ds_mr_perf(pl, mr_m, mr_it, mr_t);
+        dfree_all();
+#else
+        skip("lever D2 multi-row form", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (dsg) {
         if (!load(&pl, path)) return 1;
