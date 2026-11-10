@@ -34,6 +34,7 @@
 #include "r4d_emit.h"
 #include "r4d_launch.h"
 #include "r4d_plugin.h"
+#include "r4d_ds41_mxfp4_mr.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -588,6 +589,13 @@ __global__ __launch_bounds__(kMxThreads) void mx_tiled_kernel(MxTiledArgs A) {
     }
 }
 
+/* r4d_ds41_mxfp4_mr.hip (drafter_mx, the grouped GEMM's multi-row forms) includes this file up to here with
+ * R4D_MX_BLOCKS_ONLY: the table, the block decoders, the activation loads and the stock gemv and tiled kernels, so
+ * both units dequantise from one source. */
+#ifdef R4D_MX_BLOCKS_ONLY
+}  // namespace
+#else
+
 /* ================================================================== host side */
 constexpr long long kQK = 32, kBB = 17;
 long long mx_r16(long long v) { return (v + 15) / 16 * 16; }
@@ -754,6 +762,18 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv) {
     const long long tb = mx_r16(mx_tab_bytes(ty));
     const long long tokens = a_sorted ? (T + top_k - 1) / top_k : AR;
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
+    /* drafter_mx (r4d_ds41_mxfp4_mr.hip): the multi-row forms when switched on, in the summation order of the
+     * stock path this call would run (the gemv band's lane partials, else the tiled kernel's one chain an
+     * output); the same bits. What they decline runs the stock kernels below. */
+    if (ty == MX_FP4 && r4d_mx_mr_on()) {
+        const R4dMxMrCall c{ (const uint16_t*)A_->data, x_ld, mx_al16(A_->data, x_ld) ? 1 : 0, (int)AR,
+                             table ? nullptr : (const uint8_t*)W->data, table ? (const uint8_t* const*)W->data : nullptr,
+                             w_ld, w_es, (uint16_t*)Y->data, y_ld, (const int32_t*)so->data, (const int32_t*)of->data,
+                             (int)T, (int)N, (int)K, (int)ne, (int)top_k, a_sorted ? 1 : 0, (int)tokens,
+                             gemv && tokens <= 16 };
+        const int mr = r4d_mx_mr_moe(s, c);
+        if (mr != R4D_MX_MR_DECLINE) return mr;
+    }
     if (gemv && tokens <= 16) {
         MxGemvArgs A{};
         A.x = (const uint16_t*)A_->data; A.x_ld = x_ld;
@@ -808,3 +828,5 @@ extern "C" int r4d_rad_gemm_nt_mxfp4_gemv(const RadArgs* a, RadStream s) { retur
 extern "C" int r4d_rad_gemm_nt_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_gemm(a, s, false); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_gemv(const RadArgs* a, RadStream s) { return mx_moe(a, s, true); }
 extern "C" int r4d_rad_moe_gemm_mxfp4_tiled(const RadArgs* a, RadStream s) { return mx_moe(a, s, false); }
+
+#endif  /* R4D_MX_BLOCKS_ONLY */

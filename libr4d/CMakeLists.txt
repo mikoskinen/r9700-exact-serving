@@ -229,6 +229,10 @@ set(R4D_UNITS
   "r4d_ds41_mxfp4|"
   # DSpark beside its walk: the confidence head (dspark_conf) and the walk's next-best first proposals (dspark_alt).
   "r4d_dspark_extra|"
+  # ds41-drk: the drafter's kernels -- the MXFP4 grouped GEMM's multi-row forms (drafter_mx) and the skinny bf16
+  # GEMM's prefetching decode form (drafter_bf); both off unless switched on, both the stock kernels' bits.
+  "r4d_ds41_mxfp4_mr|"
+  "r4d_gemm_bf16_nt_pf|"
 )
 
 set(R4D_SRC "")

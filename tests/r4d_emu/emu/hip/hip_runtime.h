@@ -33,6 +33,8 @@ typedef void* hipStream_t;
 typedef int hipError_t;
 enum { hipSuccess = 0 };
 inline hipError_t hipGetLastError() { return 0; }
+/* every launch here succeeds; a unit that names the error in a throw still compiles */
+inline const char* hipGetErrorString(hipError_t) { return "hipSuccess"; }
 /* one device, with the R9700's 64 KiB of LDS a workgroup, which launchers size dynamic LDS by */
 struct hipDeviceProp_t { size_t sharedMemPerBlock; int multiProcessorCount; };
 inline hipError_t hipGetDevice(int* d) { *d = 0; return hipSuccess; }
