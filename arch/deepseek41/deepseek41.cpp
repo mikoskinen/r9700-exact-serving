@@ -29,6 +29,7 @@
 #include "ds41_index_split.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -963,6 +964,49 @@ static void index_runs(Model& m) {
         m.kwords = keep_words(g.max_ctx / c.ratio[(size_t)c.cand] + 1, c.cand_block);
 }
 
+/* The row split's balanced deal (ds41_index_split.h; lever I1) as an in-process switch, "idx_split": 0 = the plain
+ * deal (n = ceil(T / irows) runs of ceil(T / n) rows, ceil(n / world) a rank: a mixed step of 2048 prefill rows and
+ * a few decode rows is 9 runs dealt 3 / 3 / 3 / 0), 1 = the balanced deal where the world does not divide n (every
+ * rank an equal block of ceil(T / world) rows in equal runs: 12 runs, 3 a rank). Exact either way: a row's score,
+ * candidates and selection are its own whichever run holds it, and the gather lays every row where the plain deal
+ * does (the header). RADIANCE_DS41_IDX_BALANCE=1 sets 1 at the first declare (unset or anything else: 0, the issue
+ * as before, byte for byte); POST /admin/fn4 {"idx_split": v} changes it at a step release with every rank thread
+ * parked (core/runtime/fn4_switch.h), so every rank deals each step under one value. Nothing is declared for it: a
+ * balanced step fits the plain deal's run ops (row_part < iparts), part, sel and score plane, or it takes the plain
+ * deal. 1 is refused while no real declare has the split on (one rank, RADIANCE_DS41_INDEX without split, ...).
+ * Only a step of more than irows rows at split_min_live positions is split, so decode and verify steps never see it. */
+static std::atomic<int> g_idx_bal{-1};        /* -1: RADIANCE_DS41_IDX_BALANCE not read yet */
+static std::atomic<int> g_idx_bal_ok{0};      /* a real declare has the row split on */
+static std::atomic<int> g_idx_bal_noted{0};   /* rank 0 said so at its first balanced step */
+static void idx_balance_env() {
+    int unread = -1;
+    const char* e = std::getenv("RADIANCE_DS41_IDX_BALANCE");
+    g_idx_bal.compare_exchange_strong(unread, e && !std::strcmp(e, "1") ? 1 : 0);
+}
+static bool idx_balance() { return g_idx_bal.load(std::memory_order_relaxed) == 1; }
+/* The hooks' idx_split part (rad_fn4_* below): 1 / 0 / -1 as the core reads them. */
+static int idx_fn4_accepts(const char* name, int value) {
+    if (!name || std::strcmp(name, "idx_split")) return 0;
+    return value == 0 || (value == 1 && g_idx_bal_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+}
+static int idx_fn4_switch(const char* name, int value) {
+    const int ok = idx_fn4_accepts(name, value);
+    if (ok > 0) g_idx_bal.store(value, std::memory_order_relaxed);
+    return ok;
+}
+static int idx_fn4_value(const char* name, int* applied) {
+    if (!name || !applied || std::strcmp(name, "idx_split")) return 0;
+    *applied = idx_balance() ? 1 : 0;
+    return 1;
+}
+
+/* The in-process switches this plugin serves (core/runtime/fn4_switch.h; the core finds these through the plugin's
+ * handle): "idx_split" above. Applied between steps with every rank thread parked. Process-wide: every rank's
+ * issue reads the same word. */
+extern "C" int rad_fn4_accepts(const char* name, int value) { return idx_fn4_accepts(name, value); }
+extern "C" int rad_fn4_switch(const char* name, int value) { return idx_fn4_switch(name, value); }
+extern "C" int rad_fn4_value(const char* name, int* applied) { return idx_fn4_value(name, applied); }
+
 /* RADIANCE_DS41_INDEX: a list of `keep` (the candidate restriction) and `split` (the row split
  * over the ranks), or `off`; unset or empty is `keep,split`. Both are exact -- every selection is the one
  * the unrestricted, unsplit indexer makes (docs/OPS.md index_score; ds41_index_split.h) -- so the
@@ -990,6 +1034,7 @@ static void index_mode(Model& m) {
     m.ikmx = kx && !std::strcmp(kx, "mxfp4") && m.c.idim % 32 == 0;
     const char* lx = std::getenv("RADIANCE_DS41_LATENT");
     m.lnv = lx && !std::strcmp(lx, "nvfp4") && m.c.window % 32 == 0;
+    idx_balance_env();
 }
 
 /* RADIANCE_DS41_AR_PCN (default off until its TP4 A/B): at four ranks with the exact wire, a decode or verify step's
@@ -2374,6 +2419,30 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 (long long)(2 * index_slots(m)), m.lnv ? "nvfp4" : "bf16", (long long)(2 * latent_slots(m, c.head_dim)),
                 m.ctail_full ? "full" : "bound", ds41_router_fuse() ? "fused" : "separate", n_arpcn ? "fused" : "separate",
                 n_arpcn, n_arpcn_moe ? "fused" : "separate", n_arpcn_moe);
+    /* The row split's deal (idx_split): the value at start and what 1 does at this geometry, on a mixed step of
+     * 8 runs' rows and 4 decode rows (2052 at 256-row runs). */
+    if (!ctx->shape_probe) {
+        const bool split = m.isplit && m.sel_gather;
+        if (split) g_idx_bal_ok.store(1, std::memory_order_relaxed);
+        const int64_t ex = 8 * m.irows + 4;
+        const Ds41IdxRuns pl = ds41_idx_runs(ex, m.irows, m.split_min_live, m.aw, 0, split, m.split_min_live);
+        const Ds41IdxRuns bl = ds41_idx_runs(ex, m.irows, m.split_min_live, m.aw, 0, split, m.split_min_live, true,
+                                             m.iparts);
+        char what[512];
+        if (split)
+            snprintf(what, sizeof what, "1 = an equal block of rows a rank where %d ranks do not divide a step's runs, "
+                     "within the %lld declared runs (a %lld-row step: %lld runs of %lld, %lld a rank, instead of %lld "
+                     "runs of %lld dealt %lld a rank, the last rank %lld)", m.aw, (long long)m.iparts, (long long)ex,
+                     (long long)bl.n, (long long)bl.R, (long long)bl.q, (long long)pl.n, (long long)pl.R,
+                     (long long)pl.q, (long long)std::max<int64_t>(0, pl.n - (int64_t)(m.aw - 1) * pl.q));
+        else
+            snprintf(what, sizeof what, "the row split is off, so every step is the unsplit runs and 1 is refused");
+        rad_note(b, "deepseek41 indexer deal: idx_split %d (RADIANCE_DS41_IDX_BALANCE at start, POST /admin/fn4 "
+                    "idx_split): %s", idx_balance() ? 1 : 0, what);
+        if (ctx->rank == 0)
+            fprintf(stderr, "radiance: deepseek41 indexer deal: idx_split %d (RADIANCE_DS41_IDX_BALANCE at start, "
+                            "POST /admin/fn4 idx_split): %s\n", idx_balance() ? 1 : 0, what);
+    }
     return RAD_OK;
 }
 
@@ -2788,9 +2857,22 @@ static void step(RadCtx* x, const RadBatch* batch) {
                  * candidates and selection are the whole step's. Split (m.isplit, a step of two
                  * runs or more at a long enough context), this rank takes runs [p0, p1) into its
                  * part and the gather joins every rank's part into sel (ds41_index_split.h). A
-                 * layer past the candidate layer scores its kept blocks only (L.i_keep). */
-                const Ds41IdxRuns ru = ds41_idx_runs(T, m.irows, live, m.aw, m.ar, m.isplit && m.sel_gather,
-                                                     m.split_min_live);
+                 * layer past the candidate layer scores its kept blocks only (L.i_keep). Under the
+                 * idx_split switch (idx_balance()) a split step whose runs the ranks do not divide
+                 * takes the balanced deal: an equal block of rows a rank, in runs within the
+                 * declared ones -- the same loop and gather below, only R, q and the runs' bounds move. */
+                const bool split = m.isplit && m.sel_gather;
+                const Ds41IdxRuns ru = ds41_idx_runs(T, m.irows, live, m.aw, m.ar, split, m.split_min_live,
+                                                     split && idx_balance(), (int64_t)L.i_runs.size());
+                if (ru.balanced && m.ar == 0 && !g_idx_bal_noted.exchange(1, std::memory_order_relaxed)) {
+                    const Ds41IdxRuns pl = ds41_idx_runs(T, m.irows, live, m.aw, 0, split, m.split_min_live);
+                    fprintf(stderr, "radiance: deepseek41 indexer deal: idx_split 1 took its first step: %lld rows as "
+                                    "%lld runs of %lld, %lld a rank (the plain deal: %lld runs of %lld, %lld a "
+                                    "rank, the last rank %lld)\n",
+                            (long long)T, (long long)ru.n, (long long)ru.R, (long long)ru.q, (long long)pl.n,
+                            (long long)pl.R, (long long)pl.q,
+                            (long long)std::max<int64_t>(0, pl.n - (int64_t)(m.aw - 1) * pl.q));
+                }
                 /* the restriction below its threshold is the unrestricted op (the optional keep left out) */
                 const bool rkeep = L.i_keep && live >= m.keep_min_live;
                 for (int64_t p = ru.p0; p < ru.p1; ++p) {

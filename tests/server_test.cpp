@@ -4995,6 +4995,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK_EQ(g.status, 200);
     CHECK(has(g.body, "\"draft_adaptive\": -1"));
     CHECK(has(g.body, "\"gg_gemv\": -1"));
+    CHECK(has(g.body, "\"idx_split\": -1"));       /* deepseek41's (lever I1): not loaded here */
     CHECK(has(g.body, "\"aql_acq\": 0"));
     CHECK(has(g.body, "\"epoch\": 0"));
     CHECK(has(g.body, "\"draft_capable\": -1"));
@@ -5002,6 +5003,9 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     const HttpResponse gg = f.post("/admin/fn4", R"({"epoch_bump":1,"gg_gemv":1})");
     CHECK_EQ(gg.status, 400);
     CHECK(has(gg.body, "no loaded plugin serves it"));
+    const HttpResponse ix = f.post("/admin/fn4", R"({"idx_split":1})");
+    CHECK_EQ(ix.status, 400);
+    CHECK(has(ix.body, "no loaded plugin serves it"));
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":"on"})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":3})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":2})").status, 400);
