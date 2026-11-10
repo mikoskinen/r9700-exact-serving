@@ -218,6 +218,10 @@ struct MoeFP8 {
          * folds the shared arm (no separate FP32 combine; DeepSeek-V4.1's fold f, switched by
          * `sone_live`). */
         int     shared_one_external = 0;
+        /* DeepSeek-V4.1's lever K1 fold e: declare the shared arm's clamped SwiGLU and its GGUF down projection
+         * also as one op (swiglu_clamped_gemm_nt_ggml, `op_swfold`) where a library serves it, issued in their
+         * place while `swfold_live` > 0. 0 (every other caller): nothing more declared. */
+        int     shared_swfold = 0;
         /* At four ranks, exact: the gather and the block's all-reduce as one kernel
          * (moe_gather_all_reduce) for a single-pass step of at most this many tokens; 0 is the two
          * kernels. Its transport is the one-shot, so keep it to decode heights (the unfused
@@ -456,6 +460,11 @@ struct MoeFP8 {
      * pass's rows itself (op_sgate, declared either way). The gather reads the same ones. Null with
      * shared_one_external: always the caller's, as before. */
     const std::atomic<int>* sone_live = nullptr;
+    /* Config::shared_swfold: the fused swiglu_clamped + down (declared only where asked and served; 0 otherwise) and
+     * the architecture's in-process switch for it (read at every pass, > 0 = the fused op at the down's point and no
+     * separate activation; null or 0 = the two ops). The fused op writes the activation plane too, with its bytes. */
+    rad_op op_swfold = 0;
+    const std::atomic<int>* swfold_live = nullptr;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -1827,6 +1836,19 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                      { shared_down },
                                      w.sff, w.sout, c.rows, {},
                                      c.shared_lo, c.shared_hi));
+        /* Fold e: the clamped SwiGLU (its bf16 product alone, no quantiser) and a GGUF down over it, as one op. */
+        op_swfold = 0;
+        if (c.shared_swfold && sh_down.ggml && gq_sh.clipped && !c.swiglu_step && gq_sh.op && !gq_sh.op_quant &&
+            !gq_sh.clamped_fused && gq_sh.want_x && w.sff.x && sh_down.K == gq_sh.n &&
+            rad_op_declared(b, "swiglu_clamped_gemm_nt_ggml")) {
+            const rad_op h = RAD_OP(b, "swiglu_clamped_gemm_nt_ggml",
+                                    RAD_PARAMS(RAD_RANGE("M", 1, c.rows > 0 ? c.rows : g.max_tok),
+                                               RAD_INT("N", sh_down.N), RAD_INT("K", sh_down.K),
+                                               RAD_STR("type", sh_down.ggml), RAD_STR("dtype", g.dtype),
+                                               RAD_F64("limit", sh_limit)),
+                                    RAD_WEIGHTS(sh_down.w));
+            if (h && rad_op_resolved(b, h)) op_swfold = rw(b, h, { w.sgu }, { w.sff.x, w.sout });
+        }
         /* The shared gate, replicated like the router so every rank computes the same gate. One
          * output column: the skinny GEMM kernel clamps its N tile rather than masking, so N = 1 is
          * legal. An ungated arm (shared_ungated) fills the gate with 1 instead. */
@@ -2215,10 +2237,21 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * back in front of the gather, which reads `sout` and `sgate` as before. The join-then-switch
      * order is GdnFP8's a|b lane; a lane that cannot be had leaves the arm on lane 0, as before. */
     const bool lane1 = want_lane1 && rad_lane_join(c_, 0, 1) == RAD_OK && rad_lane(c_, 1) == RAD_OK;
+    /* Fold e (Config::shared_swfold, switched by swfold_live): the activation and the down as op_swfold, at the
+     * down's point; nothing at the activation's. */
+    const bool swf = shared && op_swfold && swfold_live && swfold_live->load(std::memory_order_relaxed) > 0;
+    const auto sh_fold = [&] {
+        RAD_ISSUE_N(c_, op_swfold, rows, brow_slice(w.sgu, r0, rows, 2 * gq_sh.n), RAD_W(sh_down.w),
+                    brow_slice(w.sff.x, r0, rows, gq_sh.n), brow_slice(w.sout, r0, rows, sh_down.N));
+    };
     if (lane1) {
         shared_up(c_, T, r0, rows, gate_done);
-        gq_sh.step(c_, w.sgu, T, r0, rows);
-        sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+        if (swf) {
+            sh_fold();
+        } else {
+            gq_sh.step(c_, w.sgu, T, r0, rows);
+            sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+        }
         rad_lane(c_, 0);
     }
 
@@ -2345,7 +2378,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         gq_iqr.step(c_, w.egu, rows * k, 0, rows * k);
     else if (!c.expert_exl3)   /* EXL3: inside gate_up */
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
-    if (shared && !lane1) gq_sh.step(c_, w.sgu, T, r0, rows);
+    if (shared && !lane1 && !swf) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (c.expert_exl3)
         issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
     else if (c.expert_iqr)
@@ -2386,7 +2419,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_pdn, rows, brows(pff.x, rows * k), RAD_WTAB(w_pdn[0], np),
                     brows(w.sorted, rows * k), poff, brows(w.edn, rows * k));
     }
-    if (shared && !lane1) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    if (shared && !lane1) {
+        if (swf) sh_fold();
+        else sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+    }
     /* The calibration tap reads the GEMMs' operands and writes nothing they touch, so it does not
      * change the model's output. */
     if (op_gram_gu && !calib_done) {
