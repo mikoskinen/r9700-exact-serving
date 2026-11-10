@@ -41,6 +41,7 @@
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
 #include "r4d_iqr.h"
+#include "../arch/common/exl3/exl3_abi.h"   /* --perfdsmoe: the EXL3 ops' operand positions */
 #include "rad_encoding.h"
 #include "rad_philox.h"
 #include "rad_sample.h"
@@ -20562,7 +20563,120 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
             dfree_all();
         }
         if (!r) std::printf("  moe_gemm_mxfp4a8 absent\n");
-        else std::printf("DSMOE mx layer M=%lld gate_up + down %.1f us (the rule's forms)\n", (long long)Mtok, layer);
+        else std::printf("DSMOE mx layer M=%lld gate_up + down %.1f us (the rule's forms; %.2f MiB an expert: 4.25 bits a weight)\n", (long long)Mtok, layer,
+                         (4608.0 * 5120 + 5120.0 * 2304) * 4.25 / 8 / 1048576.0);
+    }
+    /* ------------------------------------------------------------ EXL3 (the radiance-exl3 extension's exl3r4d rows,
+     * as deepseek41 issues them: moe_exl3_gate_up (its prep inside, SwiGLU limit 10, h_rot 1, a_rot 0, bf16 x) and
+     * moe_exl3_down, two parity pointer tables, the decode band's _m16 rows up to 16 tokens, the _pf rows above;
+     * tables as tools/perfmoe.cpp builds them: random codes in the trellis record, constant suh / svh) */
+    const char* x3lib = std::getenv("DSMOE_EXL3");
+    if (x3lib && *x3lib) {
+        void* xh = dlopen(x3lib, RTLD_NOW | RTLD_LOCAL);
+        auto xcount = xh ? (int (*)())dlsym(xh, "rad_kernel_count") : nullptr;
+        auto xat = xh ? (const RadKernelInfo* (*)(int))dlsym(xh, "rad_kernel_at") : nullptr;
+        auto xrow = [&](const char* nm) -> const RadKernelInfo* {
+            if (!xcount || !xat) return nullptr;
+            for (int i = 0; i < xcount(); ++i)
+                if (xat(i) && xat(i)->name && !std::strcmp(xat(i)->name, nm)) return xat(i);
+            return nullptr;
+        };
+        const bool pf = Mtok > 16;
+        const RadKernelInfo* rgu = xrow(pf ? "exl3r4d_moe_gate_up_pf" : "exl3r4d_moe_gate_up_m16");
+        const RadKernelInfo* rdn = xrow(pf ? "exl3r4d_moe_down_pf" : "exl3r4d_moe_down_m16");
+        if (!rgu || !rdn) std::printf("  exl3r4d rows absent in %s (%s)\n", x3lib, xh ? "rows" : dlerror());
+        const std::string x3want = std::getenv("DSMOE_EXL3_K") ? std::getenv("DSMOE_EXL3_K") : "exl3k2,exl3k2h,exl3k3";
+        size_t pos0 = 0;
+        while (rgu && rdn && pos0 < x3want.size()) {
+            size_t q1 = x3want.find(',', pos0); if (q1 == std::string::npos) q1 = x3want.size();
+            const std::string kdt = x3want.substr(pos0, q1 - pos0); pos0 = q1 + 1;
+            const double bits = kdt == "exl3k2" ? 2.0 : kdt == "exl3k2h" ? 2.5 : kdt == "exl3k3" ? 3.0 : kdt == "exl3k4" ? 4.0 : kdt == "exl3k1h" ? 1.5 : 0;
+            if (bits <= 0) { std::printf("  exl3: unknown dtype %s\n", kdt.c_str()); continue; }
+            const int64_t D = 5120, F = 2304, TS = Mtok * top_k, half = E / 2;
+            const Exl3Positions* pgu = exl3_positions(EXL3_GATE_UP);
+            const Exl3Positions* pdn = exl3_positions(EXL3_DOWN);
+            auto f16c = [&](size_t n, float v) { std::vector<uint16_t> h(n, rad_f32_to_f16(v)); void* d = dalloc(n * 2); if (d) st_memcpy(d, h.data(), n * 2, hipMemcpyHostToDevice); return d; };
+            auto rbuf = [&](size_t n) { std::vector<uint64_t> h((n + 7) / 8); for (auto& v : h) v = rnd(); void* d = dalloc(n); if (d) st_memcpy(d, h.data(), n, hipMemcpyHostToDevice); return d; };
+            auto ptab = [&](void* base, int64_t n, size_t stride) {
+                std::vector<void*> p((size_t)n);
+                for (int64_t i = 0; i < n; ++i) p[(size_t)i] = (char*)base + (size_t)i * stride;
+                void* d = dalloc(p.size() * sizeof(void*)); if (d) st_memcpy(d, p.data(), p.size() * sizeof(void*), hipMemcpyHostToDevice); return d; };
+            auto tab = [&](void* t, uint32_t dt, std::vector<int64_t> s) { RadTensor x = T(t, dt, s); x.stride[0] = 0; return x; };
+            const uint32_t kTr = RAD_DT_PLUGIN_BASE + 0;
+            const size_t cbg = (size_t)((double)(2 * F) * (double)D * bits / 8.0), cbd = (size_t)((double)D * (double)F * bits / 8.0);
+            const double eb_gu = (double)cbg + 2.0 * (2 * D + 2 * F) + 2.0 * F, eb_dn = (double)cbd + 2.0 * (F + D);
+            /* the step's slot buffers: sorted [TS], y [TS, *]; gate_up reads x [M, D] bf16, down x [TS, F] f16 */
+            std::vector<uint16_t> hx((size_t)(Mtok * D));
+            for (size_t i = 0; i < hx.size(); ++i) hx[i] = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 1000.0f);
+            void* d_xg = dalloc(hx.size() * 2);
+            void* d_h = f16c((size_t)(TS * F), 0.25f);
+            void* d_yg = d_h;                                   /* gate_up's output is down's input (b_x3h) */
+            void* d_yd = dalloc((size_t)(TS * D) * 2);
+            void* d_s = dalloc((size_t)TS * 4);
+            void* d_o = dalloc((size_t)(E + 1) * 4);
+            bool okk = d_xg && d_h && d_yd && d_s && d_o;
+            if (okk) {
+                st_memcpy(d_xg, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+                std::vector<int32_t> sp(sorted); sp.resize((size_t)TS, 0);
+                st_memcpy(d_s, sp.data(), (size_t)TS * 4, hipMemcpyHostToDevice);
+                st_memcpy(d_o, off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
+            }
+            std::vector<RadTensor> tg((size_t)pgu->n_opd), td((size_t)pdn->n_opd);
+            for (int c = 0; c < 2 && okk; ++c) {
+                void* cg = rbuf(cbg * (size_t)half); void* cd = rbuf(cbd * (size_t)half);
+                void* sg = f16c((size_t)(D * half), 0.01f); void* sg1 = f16c((size_t)(D * half), 0.01f);
+                void* vg = f16c((size_t)(2 * F * half), 1.0f); void* dsuh = f16c((size_t)(F * half), 0.01f);
+                void* vd = f16c((size_t)(D * half), 1.0f);
+                okk = cg && cd && sg && sg1 && vg && dsuh && vd;
+                if (!okk) break;
+                tg[(size_t)pgu->plane[c][EXL3_P_CODES]] = tab(ptab(cg, half, cbg), kTr, { half, 2 * F, D });
+                tg[(size_t)pgu->plane[c][EXL3_P_SUH]] = tab(ptab(sg, half, (size_t)D * 2), RAD_F16, { half, 1, D });
+                tg[(size_t)pgu->plane[c][EXL3_P_SUH1]] = tab(ptab(sg1, half, (size_t)D * 2), RAD_F16, { half, 1, D });
+                tg[(size_t)pgu->plane[c][EXL3_P_SVH]] = tab(ptab(vg, half, (size_t)2 * F * 2), RAD_F16, { half, 2 * F, 1 });
+                tg[(size_t)pgu->plane[c][EXL3_P_DN_SUH]] = tab(ptab(dsuh, half, (size_t)F * 2), RAD_F16, { half, 1, F });
+                td[(size_t)pdn->plane[c][EXL3_P_CODES]] = tab(ptab(cd, half, cbd), kTr, { half, D, F });
+                td[(size_t)pdn->plane[c][EXL3_P_SUH]] = tab(ptab(dsuh, half, (size_t)F * 2), RAD_F16, { half, 1, F });
+                td[(size_t)pdn->plane[c][EXL3_P_SVH]] = tab(ptab(vd, half, (size_t)D * 2), RAD_F16, { half, D, 1 });
+            }
+            if (!okk) { std::printf("  %s: alloc failed\n", kdt.c_str()); dfree_all(); continue; }
+            tg[(size_t)pgu->x] = T(d_xg, RAD_BF16, { Mtok, D });
+            tg[(size_t)pgu->sorted] = T(d_s, RAD_I32, { TS });
+            tg[(size_t)pgu->offset] = T(d_o, RAD_I32, { E + 1 });
+            tg[(size_t)pgu->y] = T(d_yg, RAD_F16, { TS, F });
+            td[(size_t)pdn->x] = T(d_h, RAD_F16, { TS, F });
+            td[(size_t)pdn->sorted] = T(d_s, RAD_I32, { TS });
+            td[(size_t)pdn->offset] = T(d_o, RAD_I32, { E + 1 });
+            td[(size_t)pdn->y] = T(d_yd, RAD_BF16, { TS, D });
+            std::vector<RadParam> pg = { PI("M", Mtok), PI("N", 2 * F), PI("K", D), PI("n_expert", E), PI("top_k", top_k),
+                                         PS("dtype", kdt.c_str()), PS("codebook", "mul1"), PI("N_odd", 2 * F), PI("K_odd", D),
+                                         PI("h_rot", 1), PI("a_rot", 0), PF("limit", 10.0) };
+            std::vector<RadParam> pd = { PI("M", Mtok), PI("N", D), PI("K", F), PI("n_expert", E), PI("top_k", top_k),
+                                         PS("dtype", kdt.c_str()), PS("codebook", "mul1"), PI("N_odd", D), PI("K_odd", F),
+                                         PI("h_rot", 1) };
+            double layer = 0.0;
+            for (int pi = 0; pi < 2; ++pi) {
+                const RadKernelInfo* rr = pi == 0 ? rgu : rdn;
+                std::vector<RadTensor>& ts = pi == 0 ? tg : td;
+                std::vector<RadParam>& ps = pi == 0 ? pg : pd;
+                RadArgs a = args_of(ts, ps);
+                if (!scratch(rr, &a)) { std::printf("DSMOE %s %s M=%lld scratch refused\n", kdt.c_str(), projs[pi].name, (long long)Mtok); continue; }
+                const int rc = rr->launch(&a, nullptr);
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+                    std::printf("DSMOE %s %s M=%lld rc=%d (not served by %s)\n", kdt.c_str(), projs[pi].name, (long long)Mtok, rc, rr->name);
+                    continue;
+                }
+                warm(rr, &a);
+                const double us = st_time_us([&](int) { rr->launch(&a, nullptr); }, iters, nullptr);
+                const double eb = pi == 0 ? eb_gu : eb_dn;
+                layer += us;
+                std::printf("DSMOE %s %s M=%lld %.1f us %.1f GB/s (%.2f MiB an expert, %s)\n", kdt.c_str(), projs[pi].name, (long long)Mtok,
+                            us, touched * eb / (us * 1e3), eb / 1048576.0, rr->name);
+            }
+            std::printf("DSMOE %s layer M=%lld gate_up + down %.1f us (%.2f MiB an expert: %.2f bits a weight)\n", kdt.c_str(), (long long)Mtok, layer,
+                        (eb_gu + eb_dn) / 1048576.0, 8.0 * (eb_gu + eb_dn) / ((double)(2 * F) * D + (double)D * F));
+            dfree_all();
+        }
+        if (xh) dlclose(xh);
     }
     /* ------------------------------------------------------------ IQR-V4 */
     const RadKernelInfo* ri = find(pl, "moe_gemm_iqr");
@@ -20571,7 +20685,7 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
         if (!ri || !ri->layout || !ri->relayout) { std::printf("  moe_gemm_iqr row or hooks absent\n"); break; }
         static const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6 };
         constexpr int L = 16;
-        double layer = 0.0;
+        double layer = 0.0, iqr_eb = 0.0;
         for (int pi = 0; pi < 2; ++pi) {
             const Proj& P = projs[pi];
             const int64_t N = P.N, K = P.K, Ma = P.srt ? Tr : Mtok, nkb = K / 128;
@@ -20610,6 +20724,7 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
             if (!okk) { std::printf("  iqr%d %s: relayout refused\n", B, P.name); continue; }
             const size_t eb = wq[0].size(), es = wsc[0].size();
             const double slice = (double)(eb + es);
+            iqr_eb += slice;
             void* d_w = dalloc(eb * (size_t)E);
             void* d_sc = dalloc(es * (size_t)E);
             std::vector<int8_t> ha((size_t)(Ma * K));
@@ -20657,7 +20772,8 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
                         touched * slice / (us * 1e3));
             dfree_all();
         }
-        std::printf("DSMOE iqr%d layer M=%lld gate_up + down %.1f us\n", B, (long long)Mtok, layer);
+        std::printf("DSMOE iqr%d layer M=%lld gate_up + down %.1f us (%.2f MiB an expert: %.2f bits a weight)\n", B, (long long)Mtok, layer,
+                    iqr_eb / 1048576.0, 8.0 * iqr_eb / (4608.0 * 5120 + 5120.0 * 2304));
     }
 }
 
