@@ -23,11 +23,32 @@
  * Set only through the engine's fn4 switch "exl3_pfprep" (runtime/fn4_switch.h: between steps, every rank parked);
  * no environment read (R6). The scratch cap's chunked form needs digit 1 and keeps it. */
 static volatile int g_fn4_pf_prep_gu = 0;
+/* ds41 eport (10.11.2026): fn4 DZ at run time, "exl3_dz" 0 / 1 -- fill() puts it in every argument block's dz, read
+ * by zero_dead_rows in a build at EXL3R4D_DZ 2 (exl3r4d_common.hip.h); 0 at start = the scan (today). A build at 0 or
+ * 1 takes no exl3_dz (rad_fn4_accepts says -1 for 1 / 0 respectively), so a switch never claims a form it lacks. */
+#ifndef EXL3R4D_DZ
+#define EXL3R4D_DZ 0
+#endif
+static volatile int g_fn4_dz = EXL3R4D_DZ == 1;
+int exl3r4d_fn4_dz(void) { return EXL3R4D_DZ == 2 ? g_fn4_dz : EXL3R4D_DZ == 1; }
+__attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
+    if (!name) return 0;
+    if (!strcmp(name, "exl3_pfprep")) return value >= 0 && value <= 2 ? 1 : -1;
+    if (!strcmp(name, "exl3_dz")) return EXL3R4D_DZ == 2 ? (value == 0 || value == 1 ? 1 : -1) : value == (EXL3R4D_DZ == 1) ? 1 : -1;
+    return 0;
+}
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
-    if (!name || strcmp(name, "exl3_pfprep") != 0) return 0;
-    if (value < 0 || value > 2) return -1;
-    g_fn4_pf_prep_gu = value;
+    const int ok = rad_fn4_accepts(name, value);
+    if (ok <= 0) return ok;
+    if (!strcmp(name, "exl3_pfprep")) g_fn4_pf_prep_gu = value;
+    else if (EXL3R4D_DZ == 2) g_fn4_dz = value;
     return 1;
+}
+__attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* applied) {
+    if (!name || !applied) return 0;
+    if (!strcmp(name, "exl3_pfprep")) { *applied = g_fn4_pf_prep_gu; return 1; }
+    if (!strcmp(name, "exl3_dz")) { *applied = exl3r4d_fn4_dz(); return 1; }
+    return 0;
 }
 #if EXL3R4D_ROUTEDUMP
 int exl3r4d_routedump(const void* off, int n, long long rows, void* stream);

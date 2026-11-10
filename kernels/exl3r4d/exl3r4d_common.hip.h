@@ -702,6 +702,8 @@ static __device__ __forceinline__ void zero_rows(const Exl3r4dGemm& p, int a, in
 // spares a column block each scanned ~120 x 16 units with an integer modulo -- 161 (gpu02, one card, EP4 rank -1, down)
 // stage 2 - stage 1 = +9.84 us a dispatch at M 16 (M 4 +0.75, M 1 +0.47). The same rows, columns and zero bytes are
 // stored: bit-identical.
+// ds41 eport: EXL3R4D_DZ 2 = either form at run time, by the argument block's dz (the core switch exl3_dz through
+// rad_fn4_switch, prefill.c; 0 at start = the scan, today's form). Both bodies are fn4's, unchanged.
 #ifndef EXL3R4D_DZ
 #define EXL3R4D_DZ 0
 #endif
@@ -709,21 +711,23 @@ static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspar
   const int lo = clamp_row(p.off[0], p.T), hi = clamp_row(p.off[p.n_expert], p.T);
   const int dead = lo + (p.T - hi);
 #if EXL3R4D_DZ
-  if (spare >= dead) return;
-  const int mine = (dead - 1 - spare) / nspare + 1;   // rows spare, spare + nspare, ... below dead
-  for (int u = threadIdx.x; u < mine * 16; u += EXL3R4D_BDIM) {
-    const int d = spare + (int)(u / 16) * nspare;
-    const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
-    *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
+  if (EXL3R4D_DZ == 1 || p.dz) {
+    if (spare >= dead) return;
+    const int mine = (dead - 1 - spare) / nspare + 1;   // rows spare, spare + nspare, ... below dead
+    for (int u = threadIdx.x; u < mine * 16; u += EXL3R4D_BDIM) {
+      const int d = spare + (int)(u / 16) * nspare;
+      const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
+      *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
+    }
+    return;
   }
-#else
+#endif
   for (int u = threadIdx.x; u < dead * 16; u += EXL3R4D_BDIM) {
     const int d = u / 16;
     if (d % nspare != spare) continue;
     const int r = d < lo ? d : hi + (d - lo), c = cb * 128 + (u % 16) * 8;
     *(v4u*)((unsigned short*)p.y + (size_t)r * p.y_pitch + c) = (v4u){0u, 0u, 0u, 0u};
   }
-#endif
 }
 
 // One expert's planes, resolved once per workgroup (uniform: scalar registers).
