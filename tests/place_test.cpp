@@ -446,6 +446,77 @@ TEST(the_expert_floor_places_every_expert) {
     CHECK(!q.unfit.empty());
 }
 
+/* Lever VA "shadow": RADIANCE_PLACE_SHADOW_SLOTS sets the shadow slots a class gets (8..32; unset or
+ * out of range the shipped 32), and every place that counts them agrees -- the expert floor's spare
+ * (weight_footprint) shrinks by the difference times each class's stride, and the plan gives each
+ * class min(count, residents / 4). Unset is the shipped arithmetic exactly. */
+TEST(the_shadow_slot_count_is_a_start_switch_every_counter_reads) {
+    Fixture f;
+    const rad_weight m = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {m}, false);
+    for (int l = 0; l < 8; ++l) {
+        const int64_t gu = l < 4 ? 600 * KiB : 1 * MiB, dn = l < 4 ? 300 * KiB : 500 * KiB;
+        std::vector<rad_weight> g, d;
+        for (int e = 0; e < 160; ++e) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            g.push_back(f.weight(b + "ffn_gate_up_exps." + std::to_string(e) + ".weight", gu,
+                                 RAD_ACCESS_CONDITIONAL, l, e));
+            d.push_back(f.weight(b + "ffn_down_exps." + std::to_string(e) + ".weight", dn,
+                                 RAD_ACCESS_CONDITIONAL, l, e));
+        }
+        f.op("moe_gemm", g, false);
+        f.op("moe_gemm", d, false);
+    }
+    auto spare_at = [&](const char* v) {
+        if (v) setenv("RADIANCE_PLACE_SHADOW_SLOTS", v, 1);
+        else unsetenv("RADIANCE_PLACE_SHADOW_SLOTS");
+        WeightFootprint wf;
+        weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk, false, true);
+        return wf.expert_spare;
+    };
+    unsetenv("RADIANCE_PLACE_SHADOW_SLOTS");
+    CHECK_EQ(place_shadow_slots(), RAD_PLACE_SHADOW_SLOTS);
+    const int64_t s32 = spare_at(nullptr), s16 = spare_at("16"), s8 = spare_at("8");
+    CHECK_EQ(place_shadow_slots(), 8);
+    CHECK_EQ(spare_at("32"), s32);
+    CHECK_EQ(spare_at("7"), s32);        /* out of range: the shipped count */
+    CHECK_EQ(spare_at("33"), s32);
+    CHECK_EQ(spare_at("x"), s32);
+    /* Two classes (two strides): 16 fewer slots each, then 8 more fewer. */
+    CHECK(s32 > s16 && s16 > s8);
+    CHECK_EQ(s32 - s16, 2 * (s16 - s8));
+
+    /* The plan: two classes of 4 x 160 = 640 experts, three quarters of the experts' bytes resident
+     * (at least 128 of either class whichever fills first), each take min(count, residents / 4) =
+     * the count shadow slots. */
+    auto plan_at = [&](const char* v, Plan* p) {
+        if (v) setenv("RADIANCE_PLACE_SHADOW_SLOTS", v, 1);
+        else unsetenv("RADIANCE_PLACE_SHADOW_SLOTS");
+        WeightFootprint wf;
+        weight_footprint(f.prog, &wf, TablePlacement::Vram, TablePlacement::Disk, false, true);
+        Config c = base_config();
+        c.placement = "expert_tiered";
+        c.vram_weights_mib = (wf.statics + wf.experts * 3 / 4 + wf.expert_spare) / MiB;
+        c.host_pool_mib = 4096;
+        PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+        return Planner(in).plan(p);
+    };
+    for (const char* v : { (const char*)nullptr, "16", "8" }) {
+        Plan p;
+        CHECK_OK(plan_at(v, &p));
+        const int64_t want = v ? std::atoll(v) : RAD_PLACE_SHADOW_SLOTS;
+        int dyn = 0;
+        for (const SlabClass& sc : p.classes)
+            if (sc.n_shadow > 0) {
+                ++dyn;
+                CHECK_EQ(sc.n_shadow, want);
+            }
+        CHECK(p.dynamic);
+        CHECK_EQ(dyn, 2);
+    }
+    unsetenv("RADIANCE_PLACE_SHADOW_SLOTS");
+}
+
 TEST(planner_warm_starts_from_the_container_profile) {
     Fixture f;
     std::vector<rad_weight> ex;

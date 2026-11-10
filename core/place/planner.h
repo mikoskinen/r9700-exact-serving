@@ -168,6 +168,14 @@ struct SlabClass {
  * gets them; the rest of the move budget is RAD_PLACE_TURNOVER_SLOTS. The quarter-of-the-slab cap
  * binds only on very small slabs. */
 #define RAD_PLACE_SHADOW_SLOTS 32
+/* The shadow slots a class gets, at most (lever VA "shadow"): RADIANCE_PLACE_SHADOW_SLOTS=<8..32>
+ * (set at start), unset (or out of range, with a warning) RAD_PLACE_SHADOW_SLOTS. Every use of
+ * the count reads this -- the expert floor's spare (weight_footprint), each class's shadow and hot
+ * budget (Planner), the mover's heat swap range -- so budget, plan and mover agree. Placement only:
+ * a unit's tier decides where its bytes are read from, not what a kernel computes with them. The
+ * lent turnover slots keep their shipped default (RAD_PLACE_TURNOVER_SLOTS, set outright by
+ * RADIANCE_PLACE_TURNOVER), so fewer shadow slots hand their VRAM to the cache and its loan. */
+int place_shadow_slots();
 
 /* Turnover slots: free slab slots the mover keeps out of a loan (Mover::lend_from) beyond the
  * shadow slots. A swap holds a slot for about three steps (copy behind the proposing step,

@@ -174,12 +174,14 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         /* Flex slots are added later by lend_from(), once the lender's memory is carved. */
         cp.n_fixed = slab_slots;
         cp.n_work = shadow + sc.n_stage;
-        /* The first RAD_PLACE_SHADOW_SLOTS of the shadow range are the swap budget heat
-         * promotes into. The rest is the file-tier hot cache; a heat promotion that takes
-         * one of those keeps it, and the cache never fills. */
-        cp.n_hot_lo = n_slab[c] + std::min<int64_t>(shadow, RAD_PLACE_SHADOW_SLOTS);
+        /* The first place_shadow_slots() (RAD_PLACE_SHADOW_SLOTS unless RADIANCE_PLACE_SHADOW_SLOTS)
+         * of the shadow range are the swap budget heat promotes into. The rest is the file-tier hot
+         * cache; a heat promotion that takes one of those keeps it, and the cache never fills. The
+         * turnover cap is the shipped count scaled to the class's shadow slots over that budget, so
+         * a class with the whole budget keeps the shipped cap whatever the budget is. */
+        cp.n_hot_lo = n_slab[c] + std::min<int64_t>(shadow, place_shadow_slots());
         cp.n_turn = std::min<int64_t>(std::max(cfg.turnover_slots, 0),
-                                      shadow * RAD_PLACE_TURNOVER_SLOTS / RAD_PLACE_SHADOW_SLOTS);
+                                      shadow * RAD_PLACE_TURNOVER_SLOTS / place_shadow_slots());
         total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
         total_slab += slab_slots;
