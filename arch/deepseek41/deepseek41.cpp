@@ -2960,6 +2960,25 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return rad::arch:
 }  // namespace deepseek41
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* The core's runtime switches (core/runtime/fn4_switch.h, between steps, every rank thread parked): "exl3_mapshare"
+ * 0 / 1 -- MoeFP8's EXL3 ops with or without the pass's shared routing map (rad_block_moe_fp8.h, fn4_exl3_map_flag;
+ * the eport of fn4-x3 e22f6f0b). Every other name is not this plugin's (0). rad_fn4_accepts checks without applying,
+ * rad_fn4_value reports what is applied. */
+extern "C" int rad_fn4_accepts(const char* name, int value) {
+    if (!name || std::strcmp(name, "exl3_mapshare") != 0) return 0;
+    return value == 0 || value == 1 ? 1 : -1;
+}
+extern "C" int rad_fn4_switch(const char* name, int value) {
+    const int ok = rad_fn4_accepts(name, value);
+    if (ok <= 0) return ok;
+    rad::arch::fn4_exl3_map_flag().store(value, std::memory_order_relaxed);
+    return 1;
+}
+extern "C" int rad_fn4_value(const char* name, int* applied) {
+    if (!name || std::strcmp(name, "exl3_mapshare") != 0 || !applied) return 0;
+    *applied = rad::arch::fn4_exl3_map_flag().load(std::memory_order_relaxed);
+    return 1;
+}
 RAD_ARCH_PROBE(deepseek41)
 RAD_ARCH_CHAT_FORMAT(deepseek41)
 RAD_ARCH_PLUGIN(deepseek41, "deepseek41", "", "0.1.0",

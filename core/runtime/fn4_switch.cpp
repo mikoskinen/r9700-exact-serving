@@ -17,9 +17,9 @@ namespace fn4 {
 
 namespace {
 
-const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq" };
+const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", "exl3_mapshare", "exl3_dz" };
 /* Switches a plugin serves (the rest are the core's own). */
-bool plugin_switch(int i) { return i == kGgGemv; }
+bool plugin_switch(int i) { return i == kGgGemv || i == kExl3MapShare || i == kExl3Dz; }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
 struct Hooks {
@@ -170,7 +170,7 @@ bool check(const std::string& name, int v, std::string* err) {
     if (name == "epoch_bump") return true;
     const int i = switch_index(name);
     if (i < 0) {
-        if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, epoch_bump)";
+        if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, exl3_mapshare, exl3_dz, epoch_bump)";
         return false;
     }
     State& s = st();

@@ -5002,6 +5002,14 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     const HttpResponse gg = f.post("/admin/fn4", R"({"epoch_bump":1,"gg_gemv":1})");
     CHECK_EQ(gg.status, 400);
     CHECK(has(gg.body, "no loaded plugin serves it"));
+    /* ds41 eport: the EXL3 switches are plugins' too (deepseek41's exl3_mapshare, exl3r4d's exl3_dz) */
+    CHECK(has(g.body, "\"exl3_mapshare\": -1"));
+    CHECK(has(g.body, "\"exl3_dz\": -1"));
+    for (const char* b : { R"({"exl3_mapshare":1})", R"({"exl3_dz":1})" }) {
+        const HttpResponse x = f.post("/admin/fn4", b);
+        CHECK_EQ(x.status, 400);
+        CHECK(has(x.body, "no loaded plugin serves it"));
+    }
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":"on"})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":3})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":2})").status, 400);

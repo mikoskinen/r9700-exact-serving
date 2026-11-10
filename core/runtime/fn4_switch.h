@@ -35,6 +35,12 @@
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
  *                   since haz_mark marks the records at recording. RADIANCE_AQL_ACQ=none stays start-time only.
  *
+ *   exl3_mapshare   deepseek41 (rad_fn4_*; ds41-eport, fn4-x3 e22f6f0b's E9): MoeFP8's EXL3 gate_up / down with
+ *                   the pass's shared routing map (exl3_abi.h v10; exl3r4d's prefill band), 0 without (today); the
+ *                   arch's value (RADIANCE_DS41_X3MAP=1 at start sets 1). Exact: the same map entries.
+ *   exl3_dz         exl3r4d (rad_fn4_*; ds41-eport, fn4 DZ): 1 = the spare workgroups zero the dead rows directly,
+ *                   0 = the stock scan with an integer modulo (today); the plugin's value. Exact: the same stores.
+ *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
  *
@@ -54,7 +60,7 @@
 namespace rad {
 namespace fn4 {
 
-enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kSwitches };
+enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kExl3MapShare, kExl3Dz, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
