@@ -232,6 +232,7 @@ void dspark_register(bool conf_capable, bool alt_capable, int conf_start, int al
     s.val[kDsparkConf].store(conf_capable && dspark_conf_value_ok(conf_start) ? conf_start : 0,
                              std::memory_order_release);
     s.val[kDsparkAlt].store(alt_capable && alt_start == 1 ? 1 : 0, std::memory_order_release);
+    s.val[kDsparkConfRows].store(0, std::memory_order_release);   /* ds41-small: no load bound at start */
 }
 
 int get(int i) {

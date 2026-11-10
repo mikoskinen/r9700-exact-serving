@@ -2265,8 +2265,8 @@ TEST(the_confidence_gate_cuts_a_block_heads_chain_and_keeps_the_plain_text) {
      * read no plane (rows_gated grows, no cut), the text the plain run's either way */
     (void)post(s.port, "/admin/fn4", json{ { "dspark_conf", 1 }, { "dspark_conf_rows", 1 } }, &st);
     CHECK_EQ(st, 200);
+    same("dspark_conf 1, dspark_conf_rows 1, one sequence");   /* applied at that request's first step */
     CHECK_EQ(fn4get()["switches"].value("dspark_conf_rows", -9), 1);
-    same("dspark_conf 1, dspark_conf_rows 1, one sequence");
     const json r1 = stats()["draft_conf"]["conf"];
     CHECK(r1.value("rows_bounded", (int64_t)0) > 0);
     {
