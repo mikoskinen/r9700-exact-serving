@@ -2098,7 +2098,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (!c.expert_exl3)   /* EXL3: inside gate_up */
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared) gq_sh.step(c_, w.sgu, T, r0, rows);
-    if (c.expert_exl3 && !x3gd)
+    /* fn4 E10 fix (156, 10.11.): with the fused chain the down projection is already done -- before this, x3gd fell
+     * through to the fp8 two-class branch and issued the EXL3 down handle with that branch's 9 operands (schema 11) */
+    if (x3gd) {
+        /* moe_exl3_gate_up_down wrote edn */
+    } else if (c.expert_exl3)
         issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
     else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
