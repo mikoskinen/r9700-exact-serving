@@ -40,6 +40,7 @@
 #include "r4d_emit.h"
 #include "r4d_plugin.h"
 #include "r4d_ds41_ggml_mr.h"
+#include "r4d_ds41_ggml_pf.h"
 #include "r4d_ds41_mxfp4_mr.h"
 #include "r4d_gemm_bf16_nt_pf.h"
 
@@ -1182,12 +1183,26 @@ __global__ __launch_bounds__(kGgThreads) void gg_gemv_kernel(GgGemvArgs A) {
     }
 }
 
+/* The prefill kernels' arguments (the tiled kernel, the WMMA kernel, lever GPF's forms). */
+struct GgTiledArgs {
+    const uint16_t* x;
+    long long x_ld;
+    const uint8_t* w;
+    const uint8_t* const* wtab;
+    long long w_ld, w_es;
+    void* y;
+    long long y_ld;
+    const int32_t* sorted;
+    const int32_t* off;
+    int M, N, K;                         /* MoE: M is T, the output rows */
+    int n_expert, top_k, a_sorted, AR, x_al, tab_bytes;
+};
+
 /* r4d_ds41_ggml_mr.hip (lever D2, the decode band's multi-row form) includes this file up to here with
  * R4D_GG_BLOCKS_ONLY: the tables, the block types and their decoders, the activation loads and the stock gemv
- * kernel, so both units dequantise from one source. */
-#ifdef R4D_GG_BLOCKS_ONLY
-}  // namespace
-#else
+ * kernel, so both units dequantise from one source. r4d_ds41_ggml_pf.hip (lever GPF, the prefill WMMA forms) adds
+ * R4D_GG_WM_SRC: the WMMA section below as well (the Wq decoders and the stock gg_wm_kernel), nothing else. */
+#ifndef R4D_GG_BLOCKS_ONLY
 
 /* ================================================================== moe decode
  *
@@ -2294,19 +2309,6 @@ __global__ __launch_bounds__(NW * 32) void gg_md_kernel(GgMdArgs A) {
 /* ================================================================== tiled (prefill) */
 constexpr int kTN = 128, kTP = 132;   /* tile columns (weight rows), LDS row floats of Ws */
 
-struct GgTiledArgs {
-    const uint16_t* x;
-    long long x_ld;
-    const uint8_t* w;
-    const uint8_t* const* wtab;
-    long long w_ld, w_es;
-    void* y;
-    long long y_ld;
-    const int32_t* sorted;
-    const int32_t* off;
-    int M, N, K;                         /* MoE: M is T, the output rows */
-    int n_expert, top_k, a_sorted, AR, x_al, tab_bytes;
-};
 
 /* BM activation rows x 128 weight rows a block. BM 128: 8 x 8 outputs a thread; BM 32: 4 x 4. Each
  * output is the same chain at either height (slabs in order, the slab's 32 values in order), so
@@ -2467,6 +2469,8 @@ __global__ __launch_bounds__(kGgThreads) void gg_tiled_kernel(GgTiledArgs A) {
     }
 }
 
+#endif  /* !R4D_GG_BLOCKS_ONLY: moe decode, tiled */
+#if !defined(R4D_GG_BLOCKS_ONLY) || defined(R4D_GG_WM_SRC)
 /* ================================================================== WMMA (prefill)
  *
  * The large-M rows on v_wmma_f32_16x16x16_bf16 with the scale factored out. libref's weight value
@@ -2874,7 +2878,11 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
     constexpr int BM = 16 * MT;
     constexpr int XE = BM * kWmXP;                                  /* bf16 a staged slab */
     constexpr int XGE = W::XG > 0 ? kWmS / W::XG * BM : 0;          /* floats a slab's group sums */
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu (ds41pf): the launch's dynamic LDS */
+    uint8_t* const gg_smem = (uint8_t*)emu_dyn_lds();
+#else
     extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
+#endif
     __shared__ int s_e, s_r0, s_r1, s_nmt, s_any;
     __shared__ int s_tok[BM];
     const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
@@ -3244,6 +3252,10 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
     }
 }
 
+#endif  /* WMMA */
+#ifdef R4D_GG_BLOCKS_ONLY
+}  // namespace
+#else
 /* ================================================================== embed_lookup */
 template <int T>
 __global__ __launch_bounds__(kGgThreads) void gg_embed_kernel(const int32_t* tok, const uint8_t* w,
@@ -3690,6 +3702,14 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
     A.x_al = x_al; A.tab_bytes = (int)tb;
     /* The WMMA kernel (factored scales) for every block type DeepSeek-V4.1 uses. */
     if (x_al && ty != GG_F32 && ty != GG_IQ4_NL && K % (2 * kWmS) == 0 && (N + kWmBN - 1) / kWmBN <= 65535) {
+        /* lever GPF (r4d_ds41_ggml_pf.hip): the stock kernel's arithmetic in another tile geometry when switched on
+         * or pinned, for the shapes its rule names (it declines the rest to the stock launch below); the same bits. */
+        if (r4d_gg_pf_on()) {
+            const R4dGgPfCall c{ ty, logits, (const uint16_t*)x->data, x_ld, (const uint8_t*)w->data, w_ld, y->data, y_ld,
+                                 (int)M, (int)N, (int)K };
+            const int pf = r4d_gg_pf_gemm(s, c);
+            if (pf != R4D_GG_PF_DECLINE) return pf;
+        }
         const int bmw = 16 * gg_wm_mt(ty);
         const long long gx = (M + bmw - 1) / bmw, gyw = (N + kWmBN - 1) / kWmBN;
         return gg_launch_wm(s, ty, false, logits, A, dim3((unsigned)gx, (unsigned)gyw));
@@ -3964,10 +3984,13 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
  * checks a request with it before queueing), rad_fn4_value what is applied (what /admin/fn4 reports). */
 /* The drafter's kernels (ds41-drk): "drafter_mx" 0 / 1, moe_gemm_ggml type=mxfp4 in the multi-row forms
  * (r4d_ds41_mxfp4_mr.hip, RADIANCE_DS41_DRAFTER_MX at load); "drafter_bf" 0 / 1, gemm_nt bf16's decode band in the
- * prefetching form (r4d_gemm_bf16_nt_pf.hip, RADIANCE_DS41_DRAFTER_BF). Both keep the stock kernels' bits. */
+ * prefetching form (r4d_gemm_bf16_nt_pf.hip, RADIANCE_DS41_DRAFTER_BF). Both keep the stock kernels' bits.
+ * Lever GPF: "gg_pf" 0 / 1 / a form code, gemm_nt_ggml's prefill rows in the WMMA forms of r4d_ds41_ggml_pf.hip (1 its
+ * per-shape rule, a code that form everywhere; RADIANCE_DS41_GG_PF at load); the stock WMMA kernel's bits. */
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
+    if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "drafter_mx") || !std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
@@ -3976,6 +3999,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (ok <= 0) return ok;
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
+    if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_set(value);
     g_gg_gemv.store(value, std::memory_order_relaxed);
     r4d_gg_mr_set(value == 2);   /* lever D2's form runs ahead of gg_gemm's stock launch while on */
     return 1;
@@ -3988,6 +4012,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
+    if (!std::strcmp(name, "gg_pf")) { *applied = r4d_gg_pf_get(); return 1; }
     return 0;
 }
 

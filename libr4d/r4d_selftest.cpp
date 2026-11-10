@@ -21705,6 +21705,262 @@ static void ds_mr_perf(const Plugin& pl, const char* mlist, int iters, const cha
                 nsum == 0 ? "NO DATA" : ndiff ? fmt("DIFFER at %d", ndiff).c_str() : "identical everywhere");
 }
 
+/* ---- lever GPF (ds41-gpf, 10.11.2026): gemm_nt_ggml / logits_gemm_ggml's prefill rows (above the decode band) in the
+ * WMMA forms of r4d_ds41_ggml_pf.hip, switched by its exported pin (r4d_gg_pf_pin; absent from a plugin without the
+ * forms: the modes skip). The stock path is the same row with the pin cleared (gg_gemm runs today's gg_wm_kernel);
+ * a form goes through gg_gemm's hook, as a served launch would. The shapes are lever D2's (kMrShapes). */
+struct GpHooks {
+    void (*pin)(int) = nullptr;
+    const char* (*last)() = nullptr;
+    int (*forms)(int*, int) = nullptr;
+};
+static GpHooks gp_hooks(const Plugin& pl) {
+    GpHooks h;
+    h.pin = (void (*)(int))dlsym(pl.h, "r4d_gg_pf_pin");
+    h.last = (const char* (*)())dlsym(pl.h, "r4d_gg_pf_last");
+    h.forms = (int (*)(int*, int))dlsym(pl.h, "r4d_gg_pf_forms");
+    return h;
+}
+static std::string gp_name(int code) {
+    if (code == 0) return "stock";
+    if (code < 0) return "rule";
+    const int abl = code / 1000, g = code % 1000;
+    std::string s = fmt("m%dn%dw%d%s", g / 100, (g / 10) % 10, 4 * (g % 10 % 4), g % 10 >= 4 ? "f" : "");
+    if (abl) s += fmt("-abl%d", abl);
+    return s;
+}
+static std::vector<int64_t> gp_list(const char* l, const char* dflt) {
+    std::vector<int64_t> v;
+    std::string m = l && *l ? l : dflt;
+    size_t p = 0;
+    while (p < m.size()) {
+        size_t q = m.find(',', p);
+        if (q == std::string::npos) q = m.size();
+        v.push_back(std::strtoll(m.substr(p, q - p).c_str(), nullptr, 10));
+        p = q + 1;
+    }
+    return v;
+}
+/* M activation rows: values in [-4, 4], zeros of both signs and bf16 subnormals sprinkled; one row in 61 holds an
+ * infinity and one in 67 a few huge values (overflowing products and sums: inf, inf - inf); the rest finite. */
+static void gp_acts(std::vector<uint16_t>& hx, int64_t M, int64_t K, uint64_t seed) {
+    uint64_t rs = seed;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    hx.assign((size_t)(M * K), 0);
+    for (size_t i = 0; i < hx.size(); ++i) {
+        const uint32_t c = (uint32_t)(rnd() % 1000);
+        hx[i] = c < 5 ? 0x0000 : c < 10 ? 0x8000 : c < 15 ? (uint16_t)((rnd() & 1 ? 0x8000 : 0) | (rnd() % 0x7f + 1))
+                                                          : h_to_bf16((float)((int)(rnd() % 20001) - 10000) / 2500.0f);
+    }
+    for (int64_t m = 5; m < M; m += 61) hx[(size_t)(m * K + (int64_t)(rnd() % K))] = 0x7f80;
+    for (int64_t m = 17; m < M; m += 67)
+        for (int e = 0; e < 3; ++e) hx[(size_t)(m * K + (int64_t)(rnd() % K))] = (uint16_t)(0x7e80 + rnd() % 0x80);
+}
+/* The forms the plugin built (r4d_gg_pf_forms), without (abl false) or with the ablations. */
+static std::vector<int> gp_forms(const GpHooks& h, bool abl) {
+    std::vector<int> v;
+    int buf[64];
+    const int n = h.forms ? h.forms(buf, 64) : 0;
+    for (int i = 0; i < n && i < 64; ++i)
+        if (abl || buf[i] < 1000) v.push_back(buf[i]);
+    return v;
+}
+
+/* --gpcheck [Ms] [types]: every form against the stock WMMA kernel, byte for byte, at every dense shape (all three
+ * types at each, as --mrcheck) and the head (q6_K, f32 out), at M 2048 / 4096 and odd tails (default 49, 63, 64,
+ * 100, 1000, 2047, 2048, 4095, 4096, 4097, 4160). GPCHECK a (type, shape); FAIL lines name the form, M and the
+ * first differing output; GPVERDICT check at the end. */
+static void ds_gp_check(const Plugin& pl, const char* mlist, const char* tlist) {
+    const GpHooks h = gp_hooks(pl);
+    if (!h.pin || !h.forms) { std::printf("--gpcheck: r4d_gg_pf_pin absent (a plugin without lever GPF)\n"); ++g_fail; return; }
+    const std::vector<int64_t> Ms = gp_list(mlist, "49,63,64,100,1000,2047,2048,4095,4096,4097,4160");
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    const std::vector<int> forms = gp_forms(h, false);
+    int64_t mmax = 0;
+    for (int64_t M : Ms) mmax = std::max(mmax, M);
+    long long launches = 0, diffs = 0;
+    int planned = 0, done = 0;
+    std::printf("lever GPF byte check: %zu forms vs the stock WMMA kernel, M [%s]\n", forms.size(), mlist && *mlist ? mlist : "default");
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        for (const MrShape& sh : kMrShapes) {
+            if (sh.logits && std::strcmp(ty.name, "q6_K")) continue;
+            if (sh.K % ty.qk) continue;
+            ++planned;
+            dfree_all();
+            std::vector<uint8_t> hw;
+            mr_weights(hw, ty, sh.N, sh.K, 0x9E3779B97F4A7C15ull ^ (uint64_t)(sh.N * 131 + sh.K) ^ 0x6770u);
+            std::vector<uint16_t> hx;
+            gp_acts(hx, mmax, sh.K, 0x1234567ull ^ (uint64_t)sh.K ^ 0x6770u);
+            const size_t ob = sh.logits ? 4 : 2, yb = (size_t)(mmax * sh.N) * ob;
+            void* d_w = dalloc(hw.size());
+            void* d_x = dalloc(hx.size() * 2);
+            void* d_y = dalloc(yb);
+            if (!d_w || !d_x || !d_y) { std::printf("  FAIL %s %s: alloc\n", ty.name, sh.name); ++g_fail; continue; }
+            st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            int bad = 0;
+            long long fin = 0, nonfin = 0;
+            std::string fails;
+            for (int64_t M : Ms) {
+                if (M <= 48) continue;
+                MrLaunch L;
+                if (!mr_setup(L, pl, sh, ty, M)) { std::printf("  %s %s: row absent\n", ty.name, sh.name); break; }
+                const size_t mb = (size_t)(M * sh.N) * ob;
+                std::vector<uint8_t> ref(mb), got(mb);
+                h.pin(0);
+                st_memset(d_y, 0xff, mb);
+                int rc = L.run(d_x, d_w, d_y);
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+                    fails += fmt(" M=%lld stock rc %d;", (long long)M, rc);
+                    ++bad;
+                    continue;
+                }
+                st_memcpy(ref.data(), d_y, mb, hipMemcpyDeviceToHost);
+                for (size_t e = 0; e < mb; e += ob) {
+                    float v;
+                    if (ob == 4) std::memcpy(&v, &ref[e], 4);
+                    else { const uint32_t u = (uint32_t)(ref[e] | (ref[e + 1] << 8)) << 16; std::memcpy(&v, &u, 4); }
+                    if (std::isfinite(v)) ++fin; else ++nonfin;
+                }
+                for (int code : forms) {
+                    h.pin(code);
+                    st_memset(d_y, 0xff, mb);
+                    rc = L.run(d_x, d_w, d_y);
+                    const bool ok_rc = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                    ++launches;
+                    if (!ok_rc) { fails += fmt(" M=%lld %s rc %d;", (long long)M, gp_name(code).c_str(), rc); ++diffs; ++bad; continue; }
+                    st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
+                    if (got != ref) {
+                        size_t nb = 0, first = 0;
+                        for (size_t e = 0; e < mb; e += ob)
+                            if (std::memcmp(&got[e], &ref[e], ob)) { if (!nb) first = e / ob; ++nb; }
+                        std::printf("  FAIL %s %s M=%lld form %s (%s): %zu of %zu outputs differ, first m=%zu n=%zu\n", ty.name,
+                                    sh.name, (long long)M, gp_name(code).c_str(), h.last ? h.last() : "?", nb, mb / ob,
+                                    first / (size_t)sh.N, first % (size_t)sh.N);
+                        fails += fmt(" M=%lld %s;", (long long)M, gp_name(code).c_str());
+                        ++diffs;
+                        ++bad;
+                    }
+                }
+                h.pin(0);
+            }
+            g_fail += bad ? 1 : 0;
+            ++done;
+            std::printf("GPCHECK %s %s %lldx%lld%s: %s (stock outputs %lld finite, %lld inf / NaN)%s\n", ty.name, sh.name,
+                        (long long)sh.N, (long long)sh.K, sh.logits ? " f32" : "", bad ? "DIFFERS" : "identical in every form",
+                        fin, nonfin, fails.c_str());
+            std::fflush(stdout);
+        }
+    }
+    dfree_all();
+    const bool complete = done == planned && planned > 0 && launches > 0;
+    if (!complete) ++g_fail;
+    std::printf("GPVERDICT check: %d of %d (type, shape) pairs ran, %lld form launches, %lld differ -> %s\n", done, planned,
+                launches, diffs, !complete ? "INCOMPLETE" : diffs ? "FAIL" : "PASS (byte-identical, every form)");
+}
+
+/* --perfgp [Ms] [iters] [types]: us a call of the stock WMMA kernel and every form (and the stock-geometry
+ * ablations, whose bytes differ by design) at the 2.25 .rad's (type, shape) pairs, M 4096 and 2048 by default;
+ * weights rotated past 256 MiB (each call reads its weight from DRAM once, as the engine's), the mean of `iters`
+ * after as many untimed. GPPERF a (type, shape, M) with every form's us and TFLOP/s; GPSUM the stock, the best
+ * identical form and the speedup; GPABL the ablations' us (what each cut part costs); GPTAB the
+ * RADIANCE_DS41_GG_PF_TABLE string (the best identical form where it beats the stock by >= 1 % at the largest M);
+ * GPVERDICT at the end. */
+static void ds_gp_perf(const Plugin& pl, const char* mlist, int iters, const char* tlist) {
+    if (iters <= 0) iters = 30;
+    const GpHooks h = gp_hooks(pl);
+    if (!h.pin || !h.forms) { std::printf("--perfgp: r4d_gg_pf_pin absent (a plugin without lever GPF)\n"); ++g_fail; return; }
+    const std::vector<int64_t> Ms = gp_list(mlist, "4096,2048");
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    const std::vector<int> forms = gp_forms(h, true);
+    int64_t mtab = 0;
+    for (int64_t M : Ms) mtab = std::max(mtab, M);
+    std::printf("lever GPF timing (rotated weight copies, mean of %d): stock WMMA kernel vs %zu forms / ablations; bytes vs the stock\n",
+                iters, forms.size());
+    double lsum = 0;
+    int nsum = 0, nwin = 0, ndiff = 0;
+    std::string tab;
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        for (const MrShape& sh : kMrShapes) {
+            if (sh.logits || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
+            const int64_t rb = sh.K / ty.qk * ty.bb, wbytes = sh.N * rb;
+            std::vector<uint8_t> hw;
+            mr_weights(hw, ty, sh.N, sh.K, 0x51ED2701ull ^ (uint64_t)(sh.N * 7 + sh.K));
+            const int copies = (int)std::max<int64_t>(2, (256ll << 20) / wbytes + 1);
+            for (int64_t M : Ms) {
+                if (M <= 48) continue;
+                dfree_all();
+                std::vector<uint16_t> hx;
+                gp_acts(hx, M, sh.K, 0xABCDEFull ^ (uint64_t)M);
+                const size_t mb = (size_t)(M * sh.N) * 2;
+                void* d_x = dalloc((size_t)(M * sh.K) * 2);
+                void* d_w = dalloc((size_t)wbytes * (size_t)copies);
+                void* d_y = dalloc(mb);
+                if (!d_x || !d_w || !d_y) { std::printf("  %s %s M=%lld: alloc failed\n", ty.name, sh.name, (long long)M); ++g_fail; continue; }
+                st_memcpy(d_x, hx.data(), (size_t)(M * sh.K) * 2, hipMemcpyHostToDevice);
+                for (int c = 0; c < copies; ++c)
+                    st_memcpy((uint8_t*)d_w + (size_t)c * (size_t)wbytes, hw.data(), (size_t)wbytes, hipMemcpyHostToDevice);
+                MrLaunch L;
+                if (!mr_setup(L, pl, sh, ty, M)) { std::printf("  %s %s: row absent\n", ty.name, sh.name); ++g_fail; continue; }
+                std::vector<uint8_t> ref;
+                struct R { int code; double us; bool same; };
+                std::vector<R> res;
+                auto time_form = [&](int code) -> R {
+                    h.pin(code);
+                    st_memset(d_y, 0xff, mb);
+                    const int rc = L.run(d_x, d_w, d_y);
+                    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { h.pin(0); return { code, -1.0, false }; }
+                    std::vector<uint8_t> got(mb);
+                    st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
+                    if (ref.empty()) ref = got;
+                    const bool same = got == ref;
+                    const double us = st_time_us([&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); }, iters, nullptr);
+                    h.pin(0);
+                    return { code, us, same };
+                };
+                res.push_back(time_form(0));
+                for (int code : forms) res.push_back(time_form(code));
+                const double st = res[0].us, fl = 2.0 * (double)M * (double)sh.N * (double)sh.K;
+                R best{ 0, st, true };
+                bool alls = true;
+                std::string line = fmt("GPPERF %s %s %lldx%lld M=%lld (%.2f MiB):", ty.name, sh.name, (long long)sh.N,
+                                       (long long)sh.K, (long long)M, wbytes / 1048576.0);
+                std::string abl;
+                for (const R& r : res) {
+                    const bool isabl = r.code >= 1000;
+                    line += fmt(" %s %.1f (%.1f TF)%s;", gp_name(r.code).c_str(), r.us, r.us > 0 ? fl / (r.us * 1e6) : 0.0,
+                                r.same ? "" : isabl ? " (ablation: differs)" : " OUTPUT DIFFERS");
+                    if (isabl) { abl += fmt(" %s %.1f (%+.1f %%)", gp_name(r.code).c_str(), r.us, st > 0 && r.us > 0 ? 100.0 * (r.us / st - 1.0) : 0.0); continue; }
+                    alls = alls && r.same;
+                    if (r.code && r.same && r.us > 0 && r.us < best.us) best = r;
+                }
+                std::printf("%s\n", line.c_str());
+                if (!alls) { ++g_fail; ++ndiff; }
+                if (st > 0) {
+                    std::printf("GPSUM %s %s %lldx%lld M=%lld: stock %.1f us (%.1f TF) | best %s %.1f us (%.1f TF) | x%.3f | bytes %s\n",
+                                ty.name, sh.name, (long long)sh.N, (long long)sh.K, (long long)M, st, fl / (st * 1e6),
+                                gp_name(best.code).c_str(), best.us, fl / (best.us * 1e6), st / best.us, alls ? "identical" : "DIFFER");
+                    std::printf("GPABL %s %s %lldx%lld M=%lld: stock %.1f us |%s\n", ty.name, sh.name, (long long)sh.N,
+                                (long long)sh.K, (long long)M, st, abl.c_str());
+                    lsum += std::log(st / best.us);
+                    ++nsum;
+                    nwin += best.code ? 1 : 0;
+                    if (M == mtab && best.code && best.us < 0.99 * st)
+                        tab += fmt("%s%s:%lldx%lld=%d", tab.empty() ? "" : ",", ty.name, (long long)sh.N, (long long)sh.K, best.code);
+                }
+                std::fflush(stdout);
+            }
+        }
+    }
+    dfree_all();
+    if (nsum == 0) ++g_fail;
+    std::printf("GPTAB %s\n", tab.empty() ? "-" : tab.c_str());
+    std::printf("GPVERDICT perf: %d (type, shape, M); best identical form vs stock geomean x%.3f; a form beats the stock at %d; bytes %s\n",
+                nsum, nsum ? std::exp(lsum / nsum) : 0.0, nwin, nsum == 0 ? "NO DATA" : ndiff ? fmt("DIFFER at %d", ndiff).c_str() : "identical everywhere");
+}
+
 /* ---- ds41-drk (10.11.2026): the DSpark drafter's kernels at DeepSeek-V4.1-Flash's TP4 layout, through the rows the
  * engine runs, against the stock path with the switches' pins cleared.
  *   drafter_mx: moe_gemm_ggml type=mxfp4 (128 experts, 32 a rank, top 3; gate_up 4608 x 5120 by token rows, down
@@ -36713,6 +36969,10 @@ static void usage(void) {
                 "             shapes, M 1..48, every form; MRINFO: a row alone vs inside an M-row call.\n"
                 "  --perfmr [Ms] [iters] [types]:  lever D2's timing: stock rule, pinned stock forms,\n"
                 "             multi-row forms (MRPERF / MRSUM a (type, shape, M), MRVERDICT).\n"
+                "  --gpcheck [Ms] [types]:  lever GPF: gemm_nt_ggml's prefill WMMA forms vs the stock\n"
+                "             kernel, byte for byte, every dense shape and type, M 49..4160 (GPCHECK, GPVERDICT).\n"
+                "  --perfgp [Ms] [iters] [types]:  lever GPF's timing: stock, every form and the ablations at\n"
+                "             the .rad's (type, shape) pairs, M 4096 / 2048 (GPPERF / GPSUM / GPABL / GPTAB).\n"
                 "  --cold MIB:  with a --perf mode, time cold: read MIB through the caches before\n"
                 "             every timed launch (256 empties this card's L2 and last level) and\n"
                 "             time each launch alone, the median reported. Warm, a weight under\n"
@@ -36870,6 +37130,7 @@ int main(int argc, char** argv) {
     long long dsm_m = 0; int dsm_it = 0; const char* dsm_fmts = nullptr;   /* --perfdsmoe */
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
+    bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
     bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
     const char* mx_skew = nullptr;
     int mx_tp = 8;
@@ -37119,6 +37380,17 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_m = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--gpcheck")) {
+            /* lever GPF: the prefill WMMA forms vs the stock WMMA kernel, byte for byte (ds_gp_check). */
+            gpc = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) gp_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) gp_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfgp")) {
+            /* lever GPF: the forms' and ablations' timing vs the stock WMMA kernel (ds_gp_perf). */
+            gpp = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) gp_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) gp_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) gp_t = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfgg")) {
             /* gemm_nt_ggml's decode band at DeepSeek-V4.1's dense shapes, the rule vs pinned forms (ds_gg_perf). */
             dsg = true;
@@ -37361,6 +37633,17 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("ds41-drk drafter kernels", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
+    }
+    if (gpc || gpp) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        if (gpc) ds_gp_check(pl, gp_m, gp_t);
+        if (gpp) ds_gp_perf(pl, gp_m, gp_it, gp_t);
+        dfree_all();
+#else
+        skip("lever GPF prefill forms", "built without HIP");
 #endif
         return g_fail ? 1 : 0;
     }

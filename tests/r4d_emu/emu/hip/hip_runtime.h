@@ -87,10 +87,14 @@ inline unsigned long long __ballot(int p) { return emu_ballot(p != 0); }
 inline int __popcll(unsigned long long v) { return __builtin_popcountll(v); }
 /* v_readfirstlane_b32: a cross-lane op is a wave barrier here, so every lane is active, lane 0 first */
 #define __builtin_amdgcn_readfirstlane(v) emu_readlane((v), 0)
-/* DPP16 row_shl, row_shr and row_xmask with every row and bank written; a source outside the row
+/* DPP16 quad_perm, row_shl, row_shr and row_xmask with every row and bank written; a source outside the row
  * reads 0 under bound_ctrl, else leaves `old`. Other controls and masks are reported. */
 int emu_update_dpp(int old, int src, int ctrl, int row_mask, int bank_mask, bool bound_ctrl);
 #define __builtin_amdgcn_update_dpp(o, s, c, rm, bm, bc) emu_update_dpp((o), (s), (c), (rm), (bm), (bc))
+/* v_mov_b32 with DPP (every row and bank written, so `old` is never read) */
+#define __builtin_amdgcn_mov_dpp(s, c, rm, bm, bc) emu_update_dpp(0, (s), (c), (rm), (bm), (bc))
+/* s_prefetch_data: an L2 hint, nothing to emulate */
+#define __builtin_amdgcn_s_prefetch_data(p, n) ((void)(p), (void)(n))
 /* v_permlanex16_b32: lane L reads the lane of the other row of sixteen that L's selector names */
 int emu_permlanex16(int old, int src, unsigned sel_lo, unsigned sel_hi, bool fi, bool bc);
 #define __builtin_amdgcn_permlanex16(o, s, lo, hi, fi, bc) emu_permlanex16((o), (s), (lo), (hi), (fi), (bc))
