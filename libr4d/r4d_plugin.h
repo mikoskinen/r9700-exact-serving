@@ -228,6 +228,10 @@ int     r4d_rad_dflash_tree(const RadArgs*, RadStream);
 /* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded
  * draft head's merge (r4d_pair_argmax_f32.hip). */
 int     r4d_rad_pair_argmax_f32(const RadArgs*, RadStream);
+/* DSpark's confidence head over a query pass's rows, and its walk's next-best first proposals each
+ * continued by the walk (r4d_dspark_extra.hip). */
+int     r4d_rad_dspark_conf(const RadArgs*, RadStream);
+int     r4d_rad_dspark_alt (const RadArgs*, RadStream);
 /* LiLiCorr's correlator (r4d_lili.hip). */
 int     r4d_rad_lili_cand  (const RadArgs*, RadStream);
 int     r4d_rad_lili_attn  (const RadArgs*, RadStream);

@@ -3556,6 +3556,32 @@ argmax chooses the last equal maximum; its GPU reduction uses a backend-specific
 lower-id tie rule is not a claim of reference tie equivalence. Near-tie proposal equivalence is
 therefore not established.
 
+Beside the walk, two ops a deployment may run (arch/deepseek41: the confidence head from a sidecar,
+`RADIANCE_DS41_DSPARK_CONF`, and the shadow tree's branches, `RADIANCE_DS41_DSPARK_ALT`); neither
+changes a proposal:
+
+| op | params | operands |
+|---|---|---|
+| `dspark_conf` | `M` `steps` `n_embd` `rank` `n_vocab` `anchor_stride`/opt `bias`:f64/opt `dtype` | `x`, `anchor`, `tokens`, `pred`w, `w` → `conf` |
+| `dspark_alt` | `M` `steps` `top_k` `rank` `n_vocab` `anchor_stride`/opt `n_alt` `dtype` | `cand`, `unary`, `anchor`, `tokens`, `pred`w, `succ`w → `alt` |
+
+`dspark_conf` is the release's confidence head (inference/model.py `DSparkConfidenceHead`, `mtp.{n-1}.
+confidence_head.proj`, `[1, n_embd + rank]`, no bias) over a query pass's rows: `conf[s, j] = bias +
+w[:n_embd] . x[s*steps + j] + w[n_embd:] . pred[pid]`, `x` the head's input before its final norm,
+`pred` the Markov head's predecessor table, `pid` the anchor (`anchor[s * anchor_stride]`) at `j = 0`
+and the walk's proposal `tokens[s, j-1]` after (an out-of-range id adds nothing); f32. Row `j`'s
+value is a logit for proposal `j`. The reference applies nothing to it; the engine's `dspark_conf`
+switch verifies the longest prefix whose sigmoid clears a threshold (exllamav3's rule). `w` is an
+input buffer, not a container weight: the release's tensor is not in the containers.
+
+`dspark_alt` gives each sequence `n_alt` other first proposals, each continued by the walk: row 0's
+candidates scored as `dflash_select` scores them, the best whose id is valid and is not the walk's
+own first proposal `tokens[s, 0]` (ties to the lower index), then rows `1 .. steps-1` walked greedily
+from each (`dflash_select`'s rule). `alt[s, a*steps + l]` is branch `a`'s token at position `l`; a
+branch with no candidate left is -1 throughout. The engine compares them with the tokens the target
+emits (a shadow of a position-1 tree, never verified). libr4d's row sums a candidate's edge in
+another order than `dflash_select`'s, so a near-tie may rank otherwise there.
+
 ### DFlash2
 
 | op | params | operands |

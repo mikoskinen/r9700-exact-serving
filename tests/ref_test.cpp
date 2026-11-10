@@ -2125,6 +2125,8 @@ TEST(op_vocabulary) {
         "dflash_markov_greedy", "dflash_markov_greedy_f32",
         /* Tree verification (rad_drafter_tree): the drafter's tree and the attention over it. */
         "dflash_tree", "attn_paged_tree", "attn_paged_anchor_window",
+        /* DSpark beside its walk: the confidence head and the shadow tree's branches. */
+        "dspark_conf", "dspark_alt",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
         "dequant", "dequant_w4",
@@ -11284,6 +11286,10 @@ std::vector<Geo> geometries() {
                                                  .s("dtype", "bf16")),
         G("dflash_tree", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                  .i("n_vocab", 30).i("nodes", 3).s("dtype", "bf16")),
+        G("dspark_conf", "M", 2, a.i("M", R).i("steps", 3).i("n_embd", 16).i("rank", 8)
+                                 .i("n_vocab", 30).i("anchor_stride", 3).s("dtype", "bf16")),
+        G("dspark_alt", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
+                                .i("n_vocab", 30).i("anchor_stride", 3).i("n_alt", 2).s("dtype", "bf16")),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_q", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),

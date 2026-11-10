@@ -2746,6 +2746,50 @@ int ref_dflash_tree_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     return o.finish("dflash_tree", operand, out);
 }
 
+/* DSpark's confidence head: steps rows of x a sequence, the anchor at a stride, steps - 1 proposals
+ * a sequence read as predecessors (a [M, steps] plane: the walk's own), the predecessor table and
+ * the weights, one logit a row. */
+int ref_dspark_conf_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M     = gi(p, n_p, "M", 0);
+    const int64_t steps = gi(p, n_p, "steps", 0);
+    const int64_t D     = gi(p, n_p, "n_embd", 0);
+    const int64_t R     = gi(p, n_p, "rank", 0);
+    const int64_t nv    = gi(p, n_p, "n_vocab", 0);
+    const int64_t astr  = gi(p, n_p, "anchor_stride", 1);
+    if (M <= 0 || steps <= 0 || D <= 0 || R <= 0 || nv <= 0 || astr <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_BF16, { M * steps, D });               /* x */
+    o.t_idx_dt((uint32_t)RAD_I32, { M * astr }, nv, -1, 0);  /* anchor */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);  /* tokens */
+    o.t((uint32_t)RAD_BF16, { nv, R });                      /* pred */
+    o.t((uint32_t)RAD_F32, { D + R });                       /* w */
+    o.t((uint32_t)RAD_F32, { M, steps });                    /* conf */
+    return o.finish("dspark_conf", operand, out);
+}
+
+/* dflash_select's lattice without hp, the walk's own proposal, then n_alt branches a sequence. */
+int ref_dspark_alt_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M     = gi(p, n_p, "M", 0);
+    const int64_t steps = gi(p, n_p, "steps", 0);
+    const int64_t K     = gi(p, n_p, "top_k", 0);
+    const int64_t R     = gi(p, n_p, "rank", 0);
+    const int64_t nv    = gi(p, n_p, "n_vocab", 0);
+    const int64_t astr  = gi(p, n_p, "anchor_stride", 1);
+    const int64_t na    = gi(p, n_p, "n_alt", 0);
+    if (M <= 0 || steps <= 0 || K <= 0 || R <= 0 || nv <= 0 || astr <= 0 || na <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t rows = M * steps;
+    Opd o;
+    o.t_idx_dt((uint32_t)RAD_I32, { rows, K }, nv, -1, 0);       /* cand */
+    o.t((uint32_t)RAD_F32, { rows, K });                         /* unary */
+    o.t_idx_dt((uint32_t)RAD_I32, { M * astr }, nv, -1, 0);      /* anchor */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, steps }, nv, -1, 0);      /* tokens */
+    o.t((uint32_t)RAD_BF16, { nv, R });                          /* pred */
+    o.t((uint32_t)RAD_BF16, { nv, R });                          /* succ */
+    o.t_idx_dt((uint32_t)RAD_I32, { M, na * steps }, nv, -1, 0); /* alt */
+    return o.finish("dspark_alt", operand, out);
+}
+
 /* ================================================================== gated delta net
  *
  * The layouts are libref/ref_gdn.cpp's:
