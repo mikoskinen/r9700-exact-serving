@@ -450,6 +450,9 @@ public:
         int64_t expired = 0, ckpt_expired = 0;
         /* Entries and snapshots a client released (release_session). */
         int64_t released = 0, ckpt_released = 0;
+        /* Entries whose bytes a later publisher's took over (republish): no snapshot rested on
+         * the first copy, and the publisher's snapshots rest on its own. */
+        int64_t republished = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -462,6 +465,12 @@ private:
          * off-device entry owns no block, so eviction must not reach it. */
         bool in_lru = false;
         bool drop_wait = false;         /* in drop_wait_: clean, but a sequence still reads it */
+        /* A committed snapshot rests on these bytes: a request that published or adopted them
+         * had a checkpoint deeper in a chain through this entry when it published (insert). Such
+         * bytes stay. Bytes no snapshot rests on (a short prompt's one chunk, a prompt's last
+         * chunk, a reply's decode steps) give way to a later publisher whose own snapshots rest
+         * on its copy (republish). Never cleared: a retired snapshot only keeps the bytes. */
+        bool pinned = false;
         /* Blocks ever published right after this one, saturating: the ways prompts went on from
          * this head (CacheHit::branch_at). An evicted child still counts. */
         uint8_t n_children = 0;
@@ -496,6 +505,17 @@ private:
     bool shared_with_live(const Entry& e) const;
     /* Whether `e` holds the block_size_ token ids at `src`, so a hash collision is a miss. */
     bool same_tokens(const Entry& e, const int32_t* src) const;
+    /* Whether `e`'s blocks are entry `b` of a sequence's tables `bt` (one per cached group): the
+     * sequence adopted them, or published them. Only meaningful for an entry in VRAM; an
+     * off-device entry's recorded ids belong to whoever the pool gave them to since. */
+    bool holds_own(const Entry& e, const std::vector<std::vector<int32_t>>& bt, int64_t b) const;
+    /* insert(): the publisher recomputed entry `b` (key `h`) in its own blocks and has a snapshot
+     * resting on it, while the cache holds another copy no snapshot rests on. The publisher's
+     * bytes take its place, so a hit restores what the publisher's snapshot was computed from.
+     * False, with nothing changed, where the entry cannot move now: a live sequence reads the
+     * old copy, a transfer is out, or the publisher already holds the cache's blocks. */
+    bool republish(const BlockHash& h, Entry& e, const std::vector<std::vector<int32_t>>& bt,
+                   int64_t b, uint64_t now_ns);
     /* Gives the entry's blocks in every group back to the KV manager. */
     void release_blocks(const Entry& e);
     /* Takes the cache's reference on the blocks of entry `b` of a sequence's tables `bt` (one per
