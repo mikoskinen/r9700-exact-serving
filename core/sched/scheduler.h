@@ -298,8 +298,9 @@ public:
      * (take_encodes) and encodes them between steps, which keeps the encoder off the step path. */
     bool     encodes_pending() const;
     /* fn4 (runtime/fn4_switch.h): the draft window between steps, from the scheduler thread: 1
-     * adaptive, 0 fixed, -1 the configured one (--draft-window). */
-    void     set_draft_adaptive(int v);
+     * adaptive, 0 fixed, -1 the configured one (--draft-window). Returns the window the scheduler
+     * now runs (true adaptive), which is what /admin/fn4 reports. */
+    bool     set_draft_adaptive(int v);
     /* --debug-draft-oracle is loaded: the harness replaces a draft head's proposals (set_draft),
      * so the engine issues no step ahead of its commit (Engine::step_loop). */
     bool     debug_oracle_on() const { return !debug_oracle_.empty(); }

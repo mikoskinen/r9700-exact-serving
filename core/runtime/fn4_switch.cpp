@@ -18,23 +18,22 @@ namespace fn4 {
 namespace {
 
 const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq" };
-/* The variable a switch starts from; libr4d reads RADIANCE_DS41_GG_GEMV itself the same way (r4d_ds41_ggml.hip), so
- * the two agree before the first request. draft_adaptive and aql_acq start at -1 (the configuration / the env). */
-const char* const kEnv[kSwitches]   = { nullptr, "RADIANCE_DS41_GG_GEMV", nullptr };
-/* The values a request may set. */
-const int kLo[kSwitches] = { -1, 0, 0 };
-const int kHi[kSwitches] = { 1, 1, 2 };
+/* Switches a plugin serves (the rest are the core's own). */
+bool plugin_switch(int i) { return i == kGgGemv; }
 
-/* the value a switch starts with: unset / empty / 0 -> 0, a number > 1 as given, anything else 1 */
-int env_val(const char* k) {
-    const char* v = k ? std::getenv(k) : nullptr;
-    if (!(v && *v && *v != '0')) return 0;
-    const int n = std::atoi(v);
-    return n > 1 ? n : 1;
-}
+/* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
+struct Hooks {
+    int (*sw)(const char*, int) = nullptr;
+    int (*accepts)(const char*, int) = nullptr;
+    int (*value)(const char*, int*) = nullptr;
+};
 
 struct State {
+    /* draft_adaptive: the scheduler's window (-1 until one registers); gg_gemv: the plugins' value as last read
+     * (state_json reads it live); aql_acq: the switch once set, -1 = the environment's rule. */
     std::atomic<int> val[kSwitches];
+    std::atomic<int> draft_capable{-1};      /* -1 no scheduler registered, 0 / 1 */
+    std::atomic<int> draft_configured{0};    /* --draft-window adaptive at start */
     std::atomic<uint64_t> epoch{0};
     std::atomic<int> applied_step{-1};
     std::mutex mu;
@@ -45,12 +44,13 @@ struct State {
      * takes the lock only when a request queued something. */
     std::atomic<bool> queued{false};
     bool bump = false;   /* "epoch_bump": a new epoch with no switch changed (re-records like a flip) */
-    /* The plugins' hooks, found once at the first change a plugin handles. */
-    bool hooks_found = false;
-    std::vector<int (*)(const char*, int)> hooks;
+    /* The plugins' hooks. Looked for again while none has been found: a request may come before the
+     * engine loaded its plugins. */
+    bool scanned = false;
+    std::vector<Hooks> hooks;
     State() {
         for (int i = 0; i < kSwitches; ++i) {
-            val[i].store(i == kDraftAdaptive || i == kAqlAcq ? -1 : env_val(kEnv[i]), std::memory_order_relaxed);
+            val[i].store(-1, std::memory_order_relaxed);
             want[i] = 0;
             pend[i] = false;
         }
@@ -68,27 +68,64 @@ int collect(struct dl_phdr_info* info, size_t, void* data) {
     return 0;
 }
 
+template <typename F>
+F sym(void* h, const char* name) {
+    dlerror();
+    void* f = dlsym(h, name);
+    F fn = nullptr;
+    if (f && !dlerror()) std::memcpy(&fn, &f, sizeof f);
+    return fn;
+}
+
 /* Every loaded object that exports rad_fn4_switch: the kernel and architecture plugins are
- * dlopen'ed RTLD_LOCAL, so their symbols are reached through their own handles. */
+ * dlopen'ed RTLD_LOCAL, so their symbols are reached through their own handles. Under s.mu. */
 void find_hooks(State& s) {
-    if (s.hooks_found) return;
-    s.hooks_found = true;
+    if (s.scanned && !s.hooks.empty()) return;
+    s.scanned = true;
     std::vector<std::string> paths;
     dl_iterate_phdr(collect, &paths);
     for (const std::string& p : paths) {
         void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_NOLOAD);
         if (!h) continue;
-        dlerror();
-        void* f = dlsym(h, "rad_fn4_switch");
-        if (f && !dlerror()) {
-            int (*fn)(const char*, int) = nullptr;
-            std::memcpy(&fn, &f, sizeof f);
+        Hooks k;
+        k.sw = sym<int (*)(const char*, int)>(h, "rad_fn4_switch");
+        if (k.sw) {
+            k.accepts = sym<int (*)(const char*, int)>(h, "rad_fn4_accepts");
+            k.value = sym<int (*)(const char*, int*)>(h, "rad_fn4_value");
             bool dup = false;
-            for (auto* g : s.hooks) dup = dup || g == fn;
-            if (!dup) s.hooks.push_back(fn);
+            for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
+            if (!dup) s.hooks.push_back(k);
         }
         dlclose(h);   /* the NOLOAD reference only; the object stays loaded */
     }
+}
+
+/* The value the plugins apply for switch i: the first that reports one, or -1 when none serves it. Under s.mu. */
+int plugin_value(State& s, int i) {
+    find_hooks(s);
+    for (const Hooks& k : s.hooks) {
+        int v = 0;
+        if (k.value && k.value(kNames[i], &v) > 0) return v;
+    }
+    return -1;
+}
+
+int env_acq() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_AQL_ACQ");
+        return !e ? 0 : !std::strcmp(e, "rule") ? 1 : !std::strcmp(e, "rule-w") ? 2 : 0;
+    }();
+    return env;
+}
+
+/* The reported value of switch i. Under s.mu. */
+int reported(State& s, int i) {
+    if (plugin_switch(i)) return plugin_value(s, i);
+    if (i == kAqlAcq) {
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_acq();
+    }
+    return s.val[i].load(std::memory_order_acquire);
 }
 
 }  // namespace
@@ -101,20 +138,32 @@ int switch_index(const std::string& name) {
     return -1;
 }
 
-int value(int i) { return i >= 0 && i < kSwitches ? st().val[i].load(std::memory_order_acquire) : 0; }
+int value(int i) {
+    if (i < 0 || i >= kSwitches) return 0;
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    return reported(s, i);
+}
 uint64_t epoch() { return st().epoch.load(std::memory_order_acquire); }
 
 int aql_acq_rule() {
-    static const int env = [] {
-        const char* e = std::getenv("RADIANCE_AQL_ACQ");
-        return !e ? 0 : !std::strcmp(e, "rule") ? 1 : !std::strcmp(e, "rule-w") ? 2 : 0;
-    }();
     const int v = st().val[kAqlAcq].load(std::memory_order_acquire);
-    return v >= 0 ? v : env;
+    return v >= 0 ? v : env_acq();
 }
 bool aql_acq_none() {
     static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
     return none;
+}
+
+void draft_register(bool capable, bool adaptive) {
+    State& s = st();
+    s.draft_capable.store(capable ? 1 : 0, std::memory_order_release);
+    s.draft_configured.store(adaptive ? 1 : 0, std::memory_order_release);
+    s.val[kDraftAdaptive].store(adaptive ? 1 : 0, std::memory_order_release);
+}
+
+void note_draft_adaptive(bool adaptive) {
+    st().val[kDraftAdaptive].store(adaptive ? 1 : 0, std::memory_order_release);
 }
 
 bool check(const std::string& name, int v, std::string* err) {
@@ -124,8 +173,46 @@ bool check(const std::string& name, int v, std::string* err) {
         if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, epoch_bump)";
         return false;
     }
-    if (v < kLo[i] || v > kHi[i]) {
-        if (err) *err = std::string(kNames[i]) + " takes " + std::to_string(kLo[i]) + ".." + std::to_string(kHi[i]);
+    State& s = st();
+    if (i == kDraftAdaptive) {
+        if (v < -1 || v > 1) {
+            if (err) *err = "draft_adaptive takes 1 (adaptive), 0 (fixed) or -1 (the configured window)";
+            return false;
+        }
+        const int cap = s.draft_capable.load(std::memory_order_acquire);
+        if (v == 1 && cap != 1) {
+            if (err)
+                *err = cap < 0 ? "draft_adaptive=1 refused: no scheduler has registered a drafter"
+                               : "draft_adaptive=1 refused: this deployment's drafter cannot run the adaptive window "
+                                 "(it needs a serial or block head drafting, --num-speculative-tokens N)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kAqlAcq) {
+        if (v < 0 || v > 2) {
+            if (err) *err = "aql_acq takes 0 (off), 1 (rule) or 2 (rule-w)";
+            return false;
+        }
+        return true;
+    }
+    /* A plugin's switch: the plugin that serves it says which values it knows. */
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    int owners = 0, refused = 0, unchecked = 0;
+    for (const Hooks& k : s.hooks) {
+        if (!k.accepts) { ++unchecked; continue; }
+        const int r = k.accepts(kNames[i], v);
+        if (r > 0) ++owners;
+        if (r < 0) ++refused;
+    }
+    if (refused > 0) {
+        if (err) *err = std::string(kNames[i]) + "=" + std::to_string(v) + " refused: the plugin that serves it does not "
+                        "know that value";
+        return false;
+    }
+    if (owners == 0 && unchecked == 0) {
+        if (err) *err = std::string(kNames[i]) + " refused: no loaded plugin serves it";
         return false;
     }
     return true;
@@ -162,17 +249,27 @@ bool apply_pending(int step, int* draft_adaptive) {
     for (int i = 0; i < kSwitches; ++i) {
         if (!s.pend[i]) continue;
         s.pend[i] = false;
-        const int v = s.want[i];
-        if (s.val[i].load(std::memory_order_relaxed) == v) continue;
+        int v = s.want[i];
+        if (i == kDraftAdaptive) {
+            if (v < 0) v = s.draft_configured.load(std::memory_order_acquire);
+            if (v == 1 && s.draft_capable.load(std::memory_order_acquire) != 1) {
+                RAD_WARN("fn4: draft_adaptive -> 1 at step %d refused: the drafter cannot run the adaptive window", step);
+                continue;
+            }
+        }
+        if (reported(s, i) == v) {
+            if (i == kAqlAcq) s.val[i].store(v, std::memory_order_release);   /* pinned, the same rule */
+            continue;
+        }
         int handled = 1;
-        if (i == kGgGemv) {
-            /* A plugin's switch: every loaded object exporting the hook is asked; none taking it, or one
-             * refusing, leaves the value as it was. */
+        if (plugin_switch(i)) {
+            /* Every loaded object exporting the hook is asked; none taking it, or one refusing, leaves the
+             * value as it was. What is reported afterwards is what the plugins say they apply. */
             find_hooks(s);
             handled = 0;
             bool refused = false;
-            for (auto* fn : s.hooks) {
-                const int r = fn(kNames[i], v);
+            for (const Hooks& k : s.hooks) {
+                const int r = k.sw(kNames[i], v);
                 if (r > 0) ++handled;
                 if (r < 0) refused = true;
             }
@@ -181,6 +278,7 @@ bool apply_pending(int step, int* draft_adaptive) {
                          handled);
                 continue;
             }
+            if (const int got = plugin_value(s, i); got >= 0) v = got;
         }
         if (i == kDraftAdaptive && draft_adaptive) *draft_adaptive = v;
         s.val[i].store(v, std::memory_order_release);
@@ -207,8 +305,7 @@ std::string state_json() {
     std::lock_guard<std::mutex> lk(s.mu);
     std::string o = "{\"switches\": {";
     for (int i = 0; i < kSwitches; ++i)
-        o += std::string(i ? ", " : "") + "\"" + kNames[i] + "\": " +
-             std::to_string(s.val[i].load(std::memory_order_acquire));
+        o += std::string(i ? ", " : "") + "\"" + kNames[i] + "\": " + std::to_string(reported(s, i));
     o += "}, \"pending\": {";
     bool first = true;
     for (int i = 0; i < kSwitches; ++i) {
@@ -219,7 +316,8 @@ std::string state_json() {
     if (s.bump) o += std::string(first ? "" : ", ") + "\"epoch_bump\": 1";
     o += "}, \"epoch\": " + std::to_string(s.epoch.load(std::memory_order_acquire)) +
          ", \"applied_step\": " + std::to_string(s.applied_step.load(std::memory_order_acquire)) +
-         ", \"plugins\": " + std::to_string(s.hooks_found ? (int)s.hooks.size() : -1) + "}";
+         ", \"plugins\": " + std::to_string((int)s.hooks.size()) +
+         ", \"draft_capable\": " + std::to_string(s.draft_capable.load(std::memory_order_acquire)) + "}";
     return o;
 }
 

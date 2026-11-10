@@ -4980,24 +4980,34 @@ TEST(the_control_vector_field_overrides_the_default_or_is_refused) {
     }
 }
 
-/* The runtime switches (runtime/fn4_switch.h, POST /admin/fn4): GET reports them; a body with any
- * unknown switch, out-of-range value or non-number is refused whole, queueing nothing; a good one is
- * queued under "pending" and applied only at a step release (fn4::apply_pending, which the engine
- * calls with every rank parked), where the epoch moves once. A plugin switch that no loaded object
- * takes (no libr4d in this binary) is refused there and keeps its value. Loopback only without a
- * key. */
+/* The runtime switches (runtime/fn4_switch.h, POST /admin/fn4). GET reports what is applied, read
+ * from its owner: no scheduler has registered here, so draft_adaptive is -1, and no loaded object
+ * serves gg_gemv (no libr4d in this binary), so it is -1. A body with any unknown switch, a value
+ * out of range, a value the owner does not take, a switch nothing serves or a non-number is refused
+ * whole, the reason in the response, and queues nothing. A good body is queued under "pending" and
+ * applied only at a step release (fn4::apply_pending, which the engine calls with every rank
+ * parked), where the epoch moves once. draft_adaptive=1 is refused unless the registered drafter
+ * can run the adaptive window; what GET reports is the scheduler's window the engine reads back
+ * (note_draft_adaptive). Loopback only without a key. */
 TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release) {
     Fixture f;
     const HttpResponse g = f.get("/admin/fn4");
     CHECK_EQ(g.status, 200);
     CHECK(has(g.body, "\"draft_adaptive\": -1"));
-    CHECK(has(g.body, "\"gg_gemv\": 0"));
-    CHECK(has(g.body, "\"aql_acq\": -1"));
+    CHECK(has(g.body, "\"gg_gemv\": -1"));
+    CHECK(has(g.body, "\"aql_acq\": 0"));
     CHECK(has(g.body, "\"epoch\": 0"));
-    CHECK_EQ(f.post("/admin/fn4", R"({"gg_gemv":1,"no_such_switch":1})").status, 400);
-    CHECK_EQ(f.post("/admin/fn4", R"({"gg_gemv":2})").status, 400);
-    CHECK_EQ(f.post("/admin/fn4", R"({"gg_gemv":"on"})").status, 400);
+    CHECK(has(g.body, "\"draft_capable\": -1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"epoch_bump":1,"no_such_switch":1})").status, 400);
+    const HttpResponse gg = f.post("/admin/fn4", R"({"epoch_bump":1,"gg_gemv":1})");
+    CHECK_EQ(gg.status, 400);
+    CHECK(has(gg.body, "no loaded plugin serves it"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":"on"})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":3})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":2})").status, 400);
+    const HttpResponse da = f.post("/admin/fn4", R"({"draft_adaptive":1})");
+    CHECK_EQ(da.status, 400);
+    CHECK(has(da.body, "no scheduler has registered a drafter"));
     CHECK_EQ(f.post("/admin/fn4", R"([1])").status, 400);
     CHECK(has(f.get("/admin/fn4").body, "\"pending\": {}"));
     int adapt = 7;
@@ -5005,37 +5015,53 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK_EQ(adapt, fn4::kNoChange);
     CHECK_EQ(fn4::epoch(), (uint64_t)0);
 
-    const HttpResponse p = f.post("/admin/fn4", R"({"gg_gemv":true,"draft_adaptive":1,"epoch_bump":1})");
+    /* A drafter that cannot run the adaptive window: 1 refused by name, 0 is no change. */
+    fn4::draft_register(false, false);
+    const HttpResponse dn = f.post("/admin/fn4", R"({"draft_adaptive":1})");
+    CHECK_EQ(dn.status, 400);
+    CHECK(has(dn.body, "cannot run the adaptive window"));
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_adaptive\": 0"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":0})").status, 200);
+    CHECK(!fn4::apply_pending(4, &adapt));
+    CHECK_EQ(fn4::epoch(), (uint64_t)0);
+
+    /* One that can: queued, applied at a step, the epoch moves once; GET reports the window the
+     * scheduler took (here the engine's read-back is played by hand). */
+    fn4::draft_register(true, false);
+    const HttpResponse p = f.post("/admin/fn4", R"({"draft_adaptive":1,"aql_acq":2,"epoch_bump":1})");
     CHECK_EQ(p.status, 200);
-    CHECK(has(p.body, "\"pending\": {\"draft_adaptive\": 1, \"gg_gemv\": 1, \"epoch_bump\": 1}"));
-    CHECK_EQ(fn4::value(fn4::kDraftAdaptive), -1);
+    CHECK(has(p.body, "\"pending\": {\"draft_adaptive\": 1, \"aql_acq\": 2, \"epoch_bump\": 1}"));
+    CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 0);
     CHECK(fn4::apply_pending(7, &adapt));
     CHECK_EQ(adapt, 1);
+    fn4::note_draft_adaptive(true);
     CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 1);
-    CHECK_EQ(fn4::value(fn4::kGgGemv), 0);
+    CHECK_EQ(fn4::aql_acq_rule(), 2);
     CHECK_EQ(fn4::epoch(), (uint64_t)1);
     const HttpResponse g2 = f.get("/admin/fn4");
     CHECK(has(g2.body, "\"pending\": {}"));
     CHECK(has(g2.body, "\"applied_step\": 7"));
+    CHECK(has(g2.body, "\"aql_acq\": 2"));
+    CHECK(has(g2.body, "\"draft_capable\": 1"));
     CHECK(!fn4::apply_pending(8, &adapt));
     CHECK_EQ(adapt, fn4::kNoChange);
     /* A value equal to the applied one is no change: no new epoch. A bump alone is one. */
-    CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":1})").status, 200);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":1,"aql_acq":2})").status, 200);
     CHECK(!fn4::apply_pending(9, &adapt));
     CHECK_EQ(f.post("/admin/fn4", R"({"epoch_bump":1})").status, 200);
     CHECK(fn4::apply_pending(10, &adapt));
     CHECK_EQ(adapt, fn4::kNoChange);
     CHECK_EQ(fn4::epoch(), (uint64_t)2);
-    /* aql_acq is the core's own: applied without a plugin. Back to 0, and the draft window to the
-     * configured one (-1), for the rest of the binary. */
-    CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":2})").status, 200);
-    CHECK(fn4::apply_pending(11, &adapt));
-    CHECK_EQ(fn4::aql_acq_rule(), 2);
+    /* -1 is the configured window (fixed here); the rule back to off. Left that way for the rest of
+     * the binary, with no drafter registered as capable. */
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":0,"draft_adaptive":-1})").status, 200);
-    CHECK(fn4::apply_pending(12, &adapt));
+    CHECK(fn4::apply_pending(11, &adapt));
+    CHECK_EQ(adapt, 0);
+    fn4::note_draft_adaptive(false);
     CHECK_EQ(fn4::aql_acq_rule(), 0);
-    CHECK_EQ(adapt, -1);
-    CHECK_EQ(fn4::epoch(), (uint64_t)4);
+    CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 0);
+    CHECK_EQ(fn4::epoch(), (uint64_t)3);
+    fn4::draft_register(false, false);
 
     HttpRequest q;
     q.method = "POST";

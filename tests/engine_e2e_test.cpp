@@ -2144,7 +2144,29 @@ TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text)
     REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache",
                                        "--debug-draft-oracle", oracle }));
     const json r = post(s.port, "/completion", completion(p, 48));
+    /* The head can run the adaptive window: switched on in process, the same text and the harness
+     * still drafting; GET reports the scheduler's window; -1 returns to the configured (fixed) one. */
+    auto fn4get = [&]() {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    CHECK_EQ(fn4get().value("draft_capable", -9), 1);
+    CHECK_EQ(fn4get()["switches"].value("draft_adaptive", -9), 0);
+    int st = 0;
+    (void)post(s.port, "/admin/fn4", json{ { "draft_adaptive", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    const json ra = post(s.port, "/completion", completion(p, 48));
+    CHECK_EQ(fn4get()["switches"].value("draft_adaptive", -9), 1);
+    (void)post(s.port, "/admin/fn4", json{ { "draft_adaptive", -1 } }, &st);
+    CHECK_EQ(st, 200);
+    const json rf = post(s.port, "/completion", completion(p, 48));
+    CHECK_EQ(fn4get()["switches"].value("draft_adaptive", -9), 0);
     CHECK_EQ(s.stop(), 0);
+    CHECK(tokens_of(ra) == plain);
+    CHECK(tokens_of(rf) == plain);
+    CHECK(timing(ra, "draft_n") > 0);
     const std::vector<int32_t> got = tokens_of(r);
     if (got != plain)
         fprintf(stderr, "    plain  %s\n    oracle %s\n", show(plain).c_str(), show(got).c_str());
@@ -2163,8 +2185,9 @@ TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text)
 /* The runtime switches through a running server (POST /admin/fn4, runtime/fn4_switch.h): a change
  * is queued, applied at the next step release with every rank parked, and moves the epoch the
  * recorded passes are keyed by, so the passes before it are not played after it; the text stays
- * the same across the changes. gg_gemv is libr4d's: the state reports whether a loaded object took
- * it. */
+ * the same across the changes. GET reports what is applied, from its owner: a server with no draft
+ * head reports the fixed window and refuses an adaptive one in the response; gg_gemv is libr4d's
+ * (-1 where no loaded object serves it), and a value it does not know is refused. */
 TEST(the_runtime_switches_apply_at_a_step_release_and_keep_the_text) {
     REQUIRE(world().ok);
     Server s;
@@ -2179,9 +2202,26 @@ TEST(the_runtime_switches_apply_at_a_step_release_and_keep_the_text) {
     const json req = completion(prompt_ids(71, 120), 32);
     const json g0 = get();
     CHECK_EQ(g0.value("epoch", -1), 0);
+    CHECK_EQ(g0.value("draft_capable", -9), 0);
+    CHECK_EQ(g0["switches"].value("draft_adaptive", -9), 0);
+    CHECK_EQ(g0["switches"].value("aql_acq", -9), 0);
+    const int gg0 = g0["switches"].value("gg_gemv", -9);
+    const bool gg = gg0 >= 0;   /* a loaded libr4d serves it */
+    CHECK(gg0 == -1 || gg0 == 0);
     const std::vector<int32_t> a = tokens_of(post(s.port, "/completion", req));
     int st = 0;
-    const json p = post(s.port, "/admin/fn4", json{ { "epoch_bump", 1 }, { "gg_gemv", 1 }, { "aql_acq", 1 } }, &st);
+    std::string body;
+    {
+        Call c;
+        st = c.send(s.port, "POST", "/admin/fn4", R"({"draft_adaptive":1})") ? c.read(&body) : -1;
+    }
+    CHECK_EQ(st, 400);
+    CHECK(has(body, "cannot run the adaptive window"));
+    (void)post(s.port, "/admin/fn4", json{ { "gg_gemv", 2 } }, &st);
+    CHECK_EQ(st, 400);
+    json on = { { "epoch_bump", 1 }, { "aql_acq", 1 } };
+    if (gg) on["gg_gemv"] = 1;
+    const json p = post(s.port, "/admin/fn4", on, &st);
     CHECK_EQ(st, 200);
     CHECK_EQ(p["pending"].value("aql_acq", -9), 1);
     const std::vector<int32_t> b = tokens_of(post(s.port, "/completion", req));
@@ -2190,21 +2230,24 @@ TEST(the_runtime_switches_apply_at_a_step_release_and_keep_the_text) {
     CHECK(g1.value("applied_step", -1) >= 0);
     CHECK(g1["pending"].empty());
     CHECK_EQ(g1["switches"].value("aql_acq", -9), 1);
-    /* gg_gemv took effect only where a loaded object exports rad_fn4_switch (libr4d). */
-    CHECK_EQ(g1["switches"].value("gg_gemv", -9), g1.value("plugins", 0) > 0 ? 1 : 0);
-    (void)post(s.port, "/admin/fn4", json{ { "aql_acq", 0 }, { "gg_gemv", 0 } }, &st);
+    CHECK_EQ(g1["switches"].value("gg_gemv", -9), gg ? 1 : -1);
+    json off = { { "aql_acq", 0 } };
+    if (gg) off["gg_gemv"] = 0;
+    (void)post(s.port, "/admin/fn4", off, &st);
     CHECK_EQ(st, 200);
     const std::vector<int32_t> c = tokens_of(post(s.port, "/completion", req));
     const json g2 = get();
-    CHECK(g2.value("epoch", -1) >= 2);
+    CHECK_EQ(g2.value("epoch", -1), 2);
     CHECK_EQ(g2["switches"].value("aql_acq", -9), 0);
+    CHECK_EQ(g2["switches"].value("gg_gemv", -9), gg ? 0 : -1);
     CHECK_EQ(a.size(), (size_t)32);
     CHECK(a == b);
     CHECK(a == c);
-    CHECK_EQ(post(s.port, "/admin/fn4", json{ { "no_such_switch", 1 } }, &st).is_object(), true);
+    (void)post(s.port, "/admin/fn4", json{ { "no_such_switch", 1 } }, &st);
     CHECK_EQ(st, 400);
     CHECK_EQ(s.stop(), 0);
     CHECK(has(s.output(), "fn4: switches"));
+    fprintf(stderr, "    runtime switches: gg_gemv %s on this host\n", gg ? "served (libr4d loaded)" : "not served");
 }
 
 /* The row a running server's /diagnostics reports for `option`, or null. */

@@ -3354,15 +3354,27 @@ struct GgForm {
 };
 #include "r4d_ds41_gg_forms.h"
 
-/* RADIANCE_DS41_GG_GEMV at load (unset / empty / 0: 0, anything else 1), the core's fn4 switch table reading the same
- * variable the same way; then rad_fn4_switch's "gg_gemv". */
+/* The gg_gemv values this libr4d knows: 0 the stock rule, 1 the form table. Others are refused (rad_fn4_accepts /
+ * rad_fn4_switch), so a later form can take the next value without an older libr4d misreading it. */
+bool gg_gemv_known(int v) { return v == 0 || v == 1; }
+
+/* RADIANCE_DS41_GG_GEMV at load: unset or empty is 0; a value this libr4d knows is taken; anything else is the stock
+ * rule, said on stderr (the core's /admin/fn4 reports what this applies, rad_fn4_value). Then rad_fn4_switch's
+ * "gg_gemv". */
 int gg_gemv_env() {
     const char* v = std::getenv("RADIANCE_DS41_GG_GEMV");
-    const int on = (v && *v && *v != '0') ? 1 : 0;
-    if (on)
+    if (!v || !*v) return 0;
+    char* end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    if (end == v || *end || !gg_gemv_known((int)n)) {
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_GG_GEMV=%s is not a decode-band form this libr4d knows "
+                             "(0 the stock rule, 1 the form table): the stock rule\n", v);
+        return 0;
+    }
+    if (n == 1)
         std::fprintf(stderr, "radiance: libr4d: gemm_nt_ggml's decode band takes the measured form table (%d entries; "
                              "RADIANCE_DS41_GG_GEMV=1, the fn4 switch gg_gemv)\n", (int)R4D_GG_FORMS_N);
-    return on;
+    return (int)n;
 }
 std::atomic<int> g_gg_gemv{ gg_gemv_env() };
 
@@ -3915,13 +3927,25 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
     g_gg_pin_grid = grid > 0 ? grid : 0;
 }
 
-/* The core's runtime switches (core/runtime/fn4_switch.h), called between steps with every rank thread parked:
- * "gg_gemv" 0 / 1 (the decode band's form, see GgForm). 1 = applied, 0 = not a libr4d switch, < 0 = refused. */
-extern "C" int rad_fn4_switch(const char* name, int value) {
+/* The core's runtime switches (core/runtime/fn4_switch.h): "gg_gemv" 0 / 1 (the decode band's form, see GgForm).
+ * rad_fn4_switch applies, called between steps with every rank thread parked: 1 = applied, 0 = not a libr4d switch,
+ * < 0 = refused (a value this libr4d does not know). rad_fn4_accepts says the same without applying (the server
+ * checks a request with it before queueing), rad_fn4_value what is applied (what /admin/fn4 reports). */
+extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
+    if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
+    return 0;
+}
+extern "C" int rad_fn4_switch(const char* name, int value) {
+    const int ok = rad_fn4_accepts(name, value);
+    if (ok <= 0) return ok;
+    g_gg_gemv.store(value, std::memory_order_relaxed);
+    return 1;
+}
+extern "C" int rad_fn4_value(const char* name, int* applied) {
+    if (!name || !applied) return 0;
     if (!std::strcmp(name, "gg_gemv")) {
-        if (value != 0 && value != 1) return -1;
-        g_gg_gemv.store(value, std::memory_order_relaxed);
+        *applied = g_gg_gemv.load(std::memory_order_relaxed);
         return 1;
     }
     return 0;

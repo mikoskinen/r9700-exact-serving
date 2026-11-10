@@ -4,6 +4,7 @@
 #include "mm/processor.h"
 
 #include "server/sink.h"
+#include "runtime/fn4_switch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -51,11 +52,12 @@ void Scheduler::queue_erase(std::vector<int32_t>& q, int32_t slot) {
 
 /* ------------------------------------------------------------------ init */
 /* fn4 (runtime/fn4_switch.h). */
-void Scheduler::set_draft_adaptive(int v) {
+bool Scheduler::set_draft_adaptive(int v) {
     const bool on = v < 0 ? draft_.params().adapt : v == 1;
     if (!draft_.set_adaptive(on))
         RAD_WARN("fn4: draft_adaptive=%d refused: this deployment's drafter cannot run the adaptive "
                  "window", v);
+    return draft_.adaptive();
 }
 
 int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCache* pc,
@@ -238,6 +240,9 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         }
     }
     RAD_TRY(draft_.configure(dp));
+    /* fn4 (runtime/fn4_switch.h): /admin/fn4 reports this scheduler's window and refuses an
+     * adaptive one its drafter cannot run. */
+    fn4::draft_register(draft_.can_adapt(), draft_.adaptive());
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
      * row, is measured. */

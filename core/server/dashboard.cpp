@@ -91,12 +91,13 @@ HttpResponse Server::handle_control_vector(const HttpRequest& req) {
 
 /* ------------------------------------------------------------------ /admin/fn4
  *
- * Runtime switches for in-process A/B blocks (test builds; runtime/fn4_switch.h): GET reports them;
- * POST takes {"<switch>": n, ...} (0 / 1 or a boolean; draft_adaptive also -1, aql_acq 0..2,
+ * Runtime switches for in-process A/B blocks (test builds; runtime/fn4_switch.h): GET reports what
+ * each switch's owner applies; POST takes {"<switch>": n, ...} (an integer or a boolean;
  * "epoch_bump": 1 a new epoch with no switch changed), queues them for the next step release and
  * answers with the state, the queued values under "pending". Every key is checked before any is
- * queued, so a refused body changes nothing. Loopback only without --api-key, as the control
- * vector. */
+ * queued -- an unknown switch, a value its owner does not take (the plugin serving gg_gemv, the
+ * drafter for draft_adaptive=1), a switch nothing serves -- and a refused body changes nothing and
+ * names the reason. Loopback only without --api-key, as the control vector. */
 HttpResponse Server::handle_fn4(const HttpRequest& req) {
     if (opt_.api_key.empty() && !local_operator(req)) {
         ApiError e;

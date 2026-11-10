@@ -730,7 +730,7 @@ int Engine::prepare_release(const RadBatch* b) {
     {
         int adapt = fn4::kNoChange;
         if (fn4::apply_pending(b ? b->step : -1, &adapt) && adapt != fn4::kNoChange)
-            sched_.set_draft_adaptive(adapt);
+            fn4::note_draft_adaptive(sched_.set_draft_adaptive(adapt));
     }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */

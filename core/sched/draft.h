@@ -122,9 +122,9 @@ public:
     bool adaptive() const { return adapt_; }
     /* fn4 (runtime/fn4_switch.h): the policy on or off between steps. On needs a drafter that can
      * run it (Params::adapt_capable); off leaves the estimates, which a later on resumes from. */
+    bool can_adapt() const { return (p_.adapt || p_.adapt_capable) && p_.max_depth > 0; }
     bool set_adaptive(bool on) {
-        const bool can = (p_.adapt || p_.adapt_capable) && p_.max_depth > 0;
-        adapt_ = on && can;
+        adapt_ = on && can_adapt();
         return adapt_ == on;
     }
     /* The window this sequence may draft into: min(D, its stop), starting its estimate on the
