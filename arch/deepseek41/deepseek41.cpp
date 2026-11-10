@@ -1520,13 +1520,12 @@ static int tree_source(RadBuilder* b, Model& m, Layer& L) {
     if (m.ikmx) kp.push_back(RAD_STR("format", "mxfp4"));
     L.l_st_t = op(b, "entry_store", lp, {}, { m.lat, m.tpage }, { L.tcc });
     L.k_st_t = op(b, "entry_store", kp, {}, { m.ikn, m.tpage }, { L.tic });
-    L.cm_lat = op(b, "tree_commit_entries", { RAD_RANGE("M", 1, T), RAD_INT("ratio", r), RAD_INT("rows", TR) }, {},
+    L.cm_lat = op(b, "tree_commit_entries", { RAD_RANGE("M", 1, T), RAD_INT("ratio", r) }, {},
                   { m.tmark, L.tcc }, {});
-    L.cm_idx = op(b, "tree_commit_entries", { RAD_RANGE("M", 1, T), RAD_INT("ratio", r), RAD_INT("rows", TR) }, {},
+    L.cm_idx = op(b, "tree_commit_entries", { RAD_RANGE("M", 1, T), RAD_INT("ratio", r) }, {},
                   { m.tmark, L.tic }, {});
     L.cm_tail = op(b, "tree_commit_rows",
-                   { RAD_RANGE("M", 1, T), RAD_INT("n", 2 * hd), RAD_INT("ring", r + g.max_spec), RAD_INT("off", 0),
-                     RAD_INT("rows", TR) },
+                   { RAD_RANGE("M", 1, T), RAD_INT("n", 2 * hd), RAD_INT("ring", r + g.max_spec), RAD_INT("off", 0) },
                    {}, { m.tmark }, {});
     if (!L.c_work_t || !L.tcc || !L.tic || !L.l_st_t || !L.k_st_t || !L.cm_lat || !L.cm_idx || !L.cm_tail)
         return RAD_E_INVAL;
@@ -1632,8 +1631,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                              RAD_INT("eos", c.pad) },
                            { L.e_mult, L.e_vsz, L.e_off }, { m.ctok, m.tt }, { L.ids });
             L.cm_conv = op(b, "tree_commit_rows",
-                           { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_INT("ring", 0), RAD_INT("off", c.ngram - 2),
-                             RAD_INT("rows", m.tree_rows) },
+                           { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_INT("ring", 0), RAD_INT("off", c.ngram - 2) },
                            {}, { m.tmark }, {});
             if (!L.e_ids_t || !L.cm_conv) return RAD_E_INVAL;
         }
