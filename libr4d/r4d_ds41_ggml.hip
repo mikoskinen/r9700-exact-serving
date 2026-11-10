@@ -39,6 +39,7 @@
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_plugin.h"
+#include "r4d_ds41_ggml_mr.h"
 
 #include <atomic>
 #include <cstdint>
@@ -1073,7 +1074,11 @@ __device__ __forceinline__ void gg_row(const GgGemvArgs& A, const uint8_t* wb, c
 template <int T, int RPW, bool MOE, typename OT>
 __global__ __launch_bounds__(kGgThreads) void gg_gemv_kernel(GgGemvArgs A) {
     using Q = Gg<T>;
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS (no extern __shared__ on the host) */
+    uint8_t* const gg_smem = (uint8_t*)emu_dyn_lds();
+#else
     extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
+#endif
     __shared__ int s_nlive;
     const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
     gg_load_table<T>(gg_smem);
@@ -1174,6 +1179,13 @@ __global__ __launch_bounds__(kGgThreads) void gg_gemv_kernel(GgGemvArgs A) {
         }
     }
 }
+
+/* r4d_ds41_ggml_mr.hip (lever D2, the decode band's multi-row form) includes this file up to here with
+ * R4D_GG_BLOCKS_ONLY: the tables, the block types and their decoders, the activation loads and the stock gemv
+ * kernel, so both units dequantise from one source. */
+#ifdef R4D_GG_BLOCKS_ONLY
+}  // namespace
+#else
 
 /* ================================================================== moe decode
  *
@@ -3623,6 +3635,14 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
      * another order. */
     (void)gemv;
     if (M <= kGgDecodeRows) {
+        /* lever D2 (r4d_ds41_ggml_mr.hip): the multi-row form when it is switched on or pinned, for the block types
+         * and widths it takes (it declines the rest to the stock kernel below); the same bits as the stock form. */
+        if (r4d_gg_mr_on()) {
+            const R4dGgMrCall c{ ty, logits, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld,
+                                 y->data, y_ld, (int)M, (int)N, (int)K };
+            const int mr = r4d_gg_mr_gemm(s, c);
+            if (mr != R4D_GG_MR_DECLINE) return mr;
+        }
         GgGemvArgs A{};
         A.x = (const uint16_t*)x->data; A.x_ld = x_ld;
         A.w = (const uint8_t*)w->data; A.wtab = nullptr; A.w_ld = w_ld; A.w_es = 0;
@@ -3950,3 +3970,5 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     return 0;
 }
+
+#endif  /* R4D_GG_BLOCKS_ONLY */
