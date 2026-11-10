@@ -1781,6 +1781,21 @@ static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& l
              "(the largest unit %lld B)%s",
              (long long)xp, (long long)nl, (long long)unit_max,
              xprefetch_env_off() ? " (RADIANCE_XPREFETCH off: none, and no DMA queue)" : "");
+    /* Lever KVWIN: each fixed-window group's page and its pool on a card -- KVManager::window_pool_cap's blocks,
+     * max_seqs x (window_blocks + 1) + ceil(max_tok / block), window_blocks = ceil(window / block) + 1 -- and the
+     * window a checkpoint slot carries (window_blocks pages), from the declared group. */
+    for (size_t g = 1; g < P.kv_groups.size(); ++g) {
+        const KVGroupInfo& gi = P.kv_groups[g];
+        if (gi.decl.kind != RAD_KV_WINDOW || gi.block_size <= 0 || gi.decl.window <= 0) continue;
+        const int64_t bs = gi.block_size, wbl = (gi.decl.window + bs - 1) / bs + 1;
+        const int64_t cap = (cfg.max_seqs > 0 ? cfg.max_seqs : 1) * (wbl + 1) + (cfg.max_tok > 0 ? (cfg.max_tok + bs - 1) / bs : 0);
+        const int64_t slot = gi.layers.empty() ? 0 : gi.bytes_per_block / bs / (int64_t)gi.layers.size();
+        RAD_INFO("vram (RADIANCE_DEBUG_VRAM) kvwin: group '%s' %zu layer(s), %lld B a key and layer, %lld B a block of %lld; "
+                 "pool cap %lld blocks = %lld B a card%s; %lld B of window a checkpoint slot",
+                 gi.name.c_str(), gi.layers.size(), (long long)slot, (long long)gi.bytes_per_block, (long long)bs,
+                 (long long)cap, (long long)(cap * gi.bytes_per_block), gi.zero ? " (zero on this rank)" : "",
+                 (long long)(wbl * gi.bytes_per_block));
+    }
 }
 
 /* The mebibyte between a level's highest buffer and the memory above it, which is lent or holds
