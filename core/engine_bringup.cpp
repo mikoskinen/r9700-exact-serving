@@ -1033,6 +1033,10 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.gen_max_refs   = cfg_.image_gen_max_refs;
     bc.state_dtype = cfg_.state_cache_dtype == "f16" ? RAD_F16 : 0;
     bc.draft_coupling = cfg_.draft_coupling ? 1 : 0;
+    /* --spec-ngram K: prompt lookup alone drafts; the plugin declares no draft head (so a head the
+     * container carries is neither loaded nor placed) and sizes every verify buffer, state ring and
+     * kernel band for max_spec = K as at any speculative serve (RadBuildCtx::draft_head_off). */
+    bc.draft_head_off = cfg_.spec_ngram > 0 ? 1 : 0;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.expert_file_tier = cfg_.weights_disk_tier ? 1 : 0;
     bc.scope      = "";
@@ -1291,7 +1295,8 @@ int Engine::declare() {
     {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
-        const bool pays = cfg_.n_spec > 0 && pb.chain_pays;
+        /* A head drafts: speculation on, and not prompt lookup alone (--spec-ngram leaves the head out). */
+        const bool pays = cfg_.n_spec > 0 && cfg_.spec_ngram <= 0 && pb.chain_pays;
         rad_dev_chain_infer(pays);
         const bool on = rad_dev_chain_enabled() != 0;
         const char* why = on     ? "the model's plugin measured a gain with its speculative drafter"
@@ -1310,7 +1315,7 @@ int Engine::declare() {
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
-        draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
+        draft_tree_ = cfg_.n_spec > 0 && cfg_.spec_ngram <= 0 && pb.tree_pays != 0;
         if (draft_tree_ && !cfg_.debug_draft_oracle.empty()) {
             /* --debug-draft-oracle replaces a head's proposal with a chain of fixed ids
              * (Scheduler::set_draft) and issues no step ahead (Engine::step_loop), which a tree
@@ -1620,11 +1625,15 @@ int Engine::declare() {
         RAD_INFO("speculation: '%s' proposes a tree of %d node(s); each verify follows the deepest "
                  "path the target agrees with, and that path's K and V move into place",
                  drafter_.name, drafter_.depth);
+    /* --spec-ngram asked the plugin to leave its head out (RadBuildCtx::draft_head_off). One that
+     * declared it anyway would hold its weights and passes for nothing, so startup stops. */
     if (cfg_.spec_ngram > 0 && drafter_.kind != RAD_DRAFT_NONE) {
-        RAD_ERR("--spec-ngram drafts by prompt lookup alone, and this container declares the draft "
-                "head '%s'; serve it with --num-speculative-tokens N, where prompt lookup fills in "
-                "for the sequences the head declines", drafter_.name);
-        return RAD_E_INVAL;
+        RAD_ERR("--spec-ngram %d: the '%s' plugin declared its draft head '%s' although the "
+                "deployment drafts by prompt lookup alone (it does not read "
+                "RadBuildCtx::draft_head_off). Use --num-speculative-tokens N instead: the head "
+                "drafts and prompt lookup fills in for any sequence it declines",
+                cfg_.spec_ngram, plugins_.arch_plugin.c_str(), drafter_.name);
+        return RAD_E_UNSUPPORTED;
     }
     if (drafter_.kind != RAD_DRAFT_NONE) {
         /* A zero proposal handle means the sampler's token buffer: the head's logits go through
@@ -1638,6 +1647,13 @@ int Engine::declare() {
                  : fmt("'%s' drafts %d token(s) a step in %d serial pass(es); prompt lookup fills "
                        "in for any sequence it declines",
                        drafter_.name, drafter_.depth, drafter_.depth).c_str());
+    } else if (cfg_.n_spec > 0 && cfg_.spec_ngram > 0) {
+        /* The probe still names the container's head (its stated depth) though nothing declared it. */
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
+        RAD_INFO("speculation: prompt lookup only (--spec-ngram %d) -- %s", cfg_.spec_ngram,
+                 pb.draft_depth > 0 ? "the container's draft head is left out: not declared, loaded or placed"
+                                    : "this container declares no draft head");
     } else if (cfg_.n_spec > 0) {
         RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
     }

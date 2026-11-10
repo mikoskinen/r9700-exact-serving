@@ -2182,6 +2182,62 @@ TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text)
     CHECK(has(s.output(), "draft trees: not asked"));
 }
 
+/* Prompt lookup alone on a container that carries a draft head (DFlash2 here; DSpark on
+ * deepseek41): --spec-ngram K leaves the head out -- the plugin is told (RadBuildCtx::
+ * draft_head_off) and declares none of it, so the serve declares exactly the weights a plain one
+ * does, and no tree is asked -- and lookup drafts alone, fixed window and adaptive. Greedy text
+ * must equal one-token-a-step decoding, on a repetitive prompt and a code edit. */
+TEST(spec_ngram_alone_leaves_a_draft_head_out_and_returns_the_plain_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    /* "declare: N ops, W weights, ..." -- W, the weights the plugin declared */
+    auto weights = [](const std::string& log) {
+        const size_t at = log.find("declare: ");
+        if (at == std::string::npos) return std::string();
+        const size_t w = log.find(" weights", at), c = log.rfind(", ", w);
+        return (w == std::string::npos || c == std::string::npos || c < at) ? std::string()
+                                                                            : log.substr(c + 2, w - c - 2);
+    };
+    Server plain;
+    REQUIRE(plain.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+    const std::vector<std::string> kArms[] = {
+        { "--spec-ngram", "4", "--no-prefix-cache" },
+        { "--spec-ngram", "4", "--draft-window", "adaptive", "--no-prefix-cache" } };
+    for (const std::vector<std::string>& arm : kArms) {
+        Server ng;
+        REQUIRE(ng.start(world().g31_df2, arm));
+        const std::string log = ng.output();
+        CHECK(has(log, "speculation: prompt lookup only (--spec-ngram 4) -- the container's draft head is left out"));
+        CHECK(!has(log, "'dflash2' proposes"));
+        CHECK(!has(log, "draft trees: asked"));
+        CHECK(!weights(log).empty());
+        CHECK_EQ(weights(log), weights(plain.output()));
+        int64_t drafted = 0, accepted = 0;
+        for (const std::vector<int32_t>* p : { &repetitive_prompt(), &edit }) {
+            const std::vector<int32_t> ta = tokens_of(post(plain.port, "/completion", completion(*p, 48)));
+            int status = 0;
+            const json b = post(ng.port, "/completion", completion(*p, 48), &status);
+            CHECK_EQ(status, 200);
+            const std::vector<int32_t> tb = tokens_of(b);
+            CHECK_EQ(ta.size(), (size_t)48);
+            if (ta != tb)
+                fprintf(stderr, "    g31_df2 %s plain %s\n    ngram %s\n", arm.size() > 3 ? arm[3].c_str() : "fixed",
+                        show(ta).c_str(), show(tb).c_str());
+            CHECK(ta == tb);
+            drafted += std::max<int64_t>(timing(b, "draft_n"), 0);
+            accepted += std::max<int64_t>(timing(b, "draft_n_accepted"), 0);
+        }
+        fprintf(stderr, "    g31_df2 lookup alone (%s): drafted %lld, accepted %lld\n",
+                arm.size() > 3 ? arm[3].c_str() : "fixed", (long long)drafted, (long long)accepted);
+        CHECK(drafted > 0);
+        CHECK_EQ(ng.stop(), 0);
+    }
+    CHECK_EQ(plain.stop(), 0);
+}
+
 /* The runtime switches through a running server (POST /admin/fn4, runtime/fn4_switch.h): a change
  * is queued, applied at the next step release with every rank parked, and moves the epoch the
  * recorded passes are keyed by, so the passes before it are not played after it; the text stays

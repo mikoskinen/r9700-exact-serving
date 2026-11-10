@@ -1411,8 +1411,9 @@ TEST(auto_speculation_is_negative_one_and_not_zero) {
 }
 
 /* --spec-ngram K is prompt lookup alone at window K: it sets the window, agrees with a matching
- * --num-speculative-tokens and refuses another; the pattern range must be a range. Off by
- * default, at the lengths 2..4. */
+ * --num-speculative-tokens and refuses another (0 and auto included); the pattern range must be a
+ * range. Off by default, at the lengths 2..4. The help says a head the container carries is left
+ * out (the engine tells the plugin, RadBuildCtx::draft_head_off). */
 TEST(spec_ngram_sets_the_window_and_refuses_another) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
@@ -1432,10 +1433,14 @@ TEST(spec_ngram_sets_the_window_and_refuses_another) {
         CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "3" }, &f), RAD_E_INVAL);
         CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "auto" }, &f),
                  RAD_E_INVAL);
+        /* 0 turns speculation off, which lookup alone at K contradicts. */
+        CHECK_EQ(parse({ "--spec-ngram", "5", "--num-speculative-tokens", "0" }, &f), RAD_E_INVAL);
         CHECK_EQ(parse({ "--spec-ngram-min", "5", "--spec-ngram-max", "3" }, &f), RAD_E_INVAL);
         CHECK_EQ(parse({ "--spec-ngram-max", "16" }, &f), RAD_E_INVAL);
         CHECK_EQ(parse({ "--spec-ngram", "65" }, &f), RAD_E_INVAL);
     }
+    const std::string help = stderr_of([] { config_usage("radiance"); });
+    CHECK(has(help, "declared, loaded or placed"));
     Config g;
     CHECK_EQ(parse({ "--spec-ngram-min", "1", "--spec-ngram-max", "8" }, &g), RAD_OK);
     CHECK_EQ(g.spec_ngram_min, 1);
