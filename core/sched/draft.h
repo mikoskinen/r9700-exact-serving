@@ -234,13 +234,17 @@ public:
         return p > 4096 ? 4096 : (int)p;
     }
     /* The drafter's lend (fn4 draft_lend): 0 off, 1 on after kLendHold cycles, 2..4096 after that
-     * many. lend() is the switch as set, lend_hold() the cycles (0 off). */
+     * many, -1 lent at every step whatever the depth (an identity check of the lent placement: every
+     * drafting step then reads the drafter's experts over the link). lend() is the switch as set,
+     * lend_hold() the cycles (0 off or forced). */
     int  lend() const { return lend_sw_; }
     int  lend_hold() const { return lend_sw_ <= 0 ? 0 : lend_sw_ == 1 ? kLendHold : lend_sw_; }
-    void set_lend(int v) { lend_sw_ = v < 0 ? 0 : v > 4096 ? 4096 : v; }
+    void set_lend(int v) { lend_sw_ = v < -1 ? 0 : v > 4096 ? 4096 : v; }
     /* Whether the engine should lend the drafter's slab for the cycle just planned: depth 0 holds
-     * (not a probe's choice) since lend_hold() cycles, and probes are at least kLendInterval apart. */
+     * (not a probe's choice) since lend_hold() cycles, and probes are at least kLendInterval apart;
+     * or always, under -1. */
     bool lend_wanted() const {
+        if (lend_sw_ < 0) return true;
         return adapt_ && depth0_ && lend_hold() > 0 && zero_ && zero_held_ >= lend_hold() &&
                probe_interval() >= kLendInterval;
     }

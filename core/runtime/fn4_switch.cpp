@@ -242,12 +242,13 @@ bool check(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kDraftLend) {
-        if (v < 0 || v > 4096) {
-            if (err) *err = "draft_lend takes 0 (off), 1 (on) or 2 .. 4096 (on, after that many cycles at depth 0)";
+        if (v < -1 || v > 4096) {
+            if (err) *err = "draft_lend takes 0 (off), 1 (on), 2 .. 4096 (on, after that many cycles at depth 0) or -1 "
+                            "(lent at every step, an identity check)";
             return false;
         }
         const int cap = s.lend_capable.load(std::memory_order_acquire);
-        if (v > 0 && cap != 1) {
+        if (v != 0 && cap != 1) {
             if (err)
                 *err = std::string("draft_lend=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "the drafter's lend is not set up: RADIANCE_DRAFT_LEND was not set at start"

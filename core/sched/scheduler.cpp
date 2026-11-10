@@ -104,12 +104,12 @@ int Scheduler::set_draft_probe_backoff(int v) {
 
 int Scheduler::set_draft_lend(int v) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (v > 0 && (!lend_capable_ || !draft_.can_adapt()))
+    if (v != 0 && (!lend_capable_ || !draft_.can_adapt()))
         RAD_WARN("fn4: draft_lend=%d refused: %s", v,
                  !lend_capable_ ? "the drafter's lend is not set up (RADIANCE_DRAFT_LEND unset at start, or "
                                   "no drafter slab to lend)"
                                 : "this deployment's drafter cannot run the adaptive window");
-    else if (v >= 0)
+    else if (v >= -1)
         draft_.set_lend(v);
     return draft_.lend();
 }
@@ -118,7 +118,7 @@ void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) 
     std::lock_guard<std::mutex> lk(mu_);
     lend_view_ = std::move(view);
     lend_capable_ = capable && (bool)lend_view_ && draft_.can_adapt();
-    if (!lend_capable_ && draft_.lend() > 0) {
+    if (!lend_capable_ && draft_.lend() != 0) {
         RAD_WARN("RADIANCE_DRAFT_LEND=%d: the drafter's slab cannot be lent here (no drafter class to lend, "
                  "a static plan, or a drafter that cannot run the adaptive window); off", draft_.lend());
         draft_.set_lend(0);
@@ -133,7 +133,8 @@ void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) 
     if (lend_capable_)
         RAD_INFO("draft lend: %s; once depth 0 has held %d cycles with probes at least %d cycles apart, the "
                  "drafter's expert slab is lent to the trunk's experts, and taken back when drafting resumes",
-                 draft_.lend() > 0 ? "on" : "set up, off (fn4 draft_lend turns it on)",
+                 draft_.lend() > 0 ? "on" : draft_.lend() < 0 ? "forced: lent at every step (identity check)"
+                                                               : "set up, off (fn4 draft_lend turns it on)",
                  draft_.lend() > 0 ? draft_.lend_hold() : DraftController::kLendHold,
                  DraftController::kLendInterval);
 }
@@ -343,7 +344,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         dp.probe_every = env_int("RADIANCE_DRAFT_PROBE", 2, 4096, DraftController::kProbeEvery);
         dp.backoff = env_int("RADIANCE_DRAFT_PROBE_BACKOFF", 0, DraftController::kBackoffMax, 0);
         /* The lend's start value; it acts only once the engine set it up (set_lend_view). */
-        dp.lend = env_int("RADIANCE_DRAFT_LEND", 0, 4096, 0);
+        dp.lend = env_int("RADIANCE_DRAFT_LEND", -1, 4096, 0);
         hybrid_ = env_int("RADIANCE_DRAFT_HYBRID", 0, 1, 0) == 1;
         hybrid_match_ = env_int("RADIANCE_DRAFT_HYBRID_MATCH", 1, 256, LookupGate::kLongMatch);
         if (dp.depth0 && !dp.adapt)

@@ -4553,6 +4553,16 @@ TEST(the_drafters_lend_is_wanted_only_at_a_settled_depth_zero_with_probes_far_ap
     CHECK(d.lend_wanted());
     d.set_lend(0);
     CHECK(!d.lend_wanted());
+    /* -1: lent at every step, drafting or not (an identity check of the lent placement). */
+    d.set_depth0(false);
+    CHECK(d.head_runs());
+    d.set_lend(-1);
+    CHECK_EQ(d.lend(), -1);
+    CHECK_EQ(d.lend_hold(), 0);
+    CHECK(d.lend_wanted());
+    d.set_lend(-7);
+    CHECK_EQ(d.lend(), 0);
+    CHECK(!d.lend_wanted());
 }
 
 TEST(a_lent_step_feeds_its_own_plain_table_and_no_drafting_sample) {
@@ -4685,11 +4695,15 @@ TEST(the_scheduler_hands_the_lend_its_state_and_refuses_it_until_set_up) {
     /* Depth 0 off: drafting at once, the lend not wanted. */
     CHECK_EQ(f.sch.set_draft_depth0(0), 0);
     CHECK(!f.sch.draft_lend_wanted());
+    CHECK_EQ(f.sch.set_draft_lend(-1), -1);           /* forced: wanted whatever the depth */
+    CHECK(f.sch.draft_lend_wanted());
     CHECK_EQ(f.sch.set_draft_lend(0), 0);
+    CHECK(!f.sch.draft_lend_wanted());
     /* A view that cannot lend: the switch refused and left off. */
     f.sch.set_lend_view([&](uint64_t* ch) { *ch = changes; return state; }, false);
     CHECK(!f.sch.lend_capable());
     CHECK_EQ(f.sch.set_draft_lend(1), 0);
+    CHECK_EQ(f.sch.set_draft_lend(-1), 0);
 }
 
 /* ------------------------------------------------------------------ the hybrid (scheduler.h)

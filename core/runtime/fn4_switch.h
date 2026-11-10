@@ -50,7 +50,8 @@
  *   draft_lend      scheduler + every rank's mover (lever DL, place/mover.h): 0 off; 1 on, the drafter's
  *                   expert slab lent to the trunk's experts once depth 0 has held 32 cycles with probes at
  *                   least 64 cycles apart (draft_probe_backoff or draft_probe), taken back when drafting
- *                   resumes; 2 .. 4096 on, after that many cycles at 0. RADIANCE_DRAFT_LEND set at start
+ *                   resumes; 2 .. 4096 on, after that many cycles at 0; -1 lent at every step whatever the
+ *                   depth (an identity check of the lent placement). RADIANCE_DRAFT_LEND set at start
  *                   (any value, 0 included) declares it: every drafter unit keeps a pinned host copy
  *                   (outside --host-pool-mib, the plan unchanged) and its slab is carved for the trunk;
  *                   the value is the start value. Unset: nothing declared, and 1 is refused. Exact:

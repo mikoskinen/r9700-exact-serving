@@ -5140,6 +5140,68 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(f.get("/admin/fn4").body, "\"pending\": {}"));
 }
 
+/* Lever DL's switches (fn4_switch.h): draft_probe_backoff (0 .. 8) needs a drafter that runs the adaptive
+ * window; draft_lend (0, 1, 2 .. 4096, -1) needs the lend set up -- refused by name before any scheduler
+ * registered it (RADIANCE_DRAFT_LEND unset) and when it registered nothing to lend. GET reports a "lend"
+ * object only once registered. Runs after the case above, whose registrations it leaves as it found them. */
+TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
+    Fixture f;
+    const HttpResponse g = f.get("/admin/fn4");
+    CHECK(!has(g.body, "\"lend\": {"));
+    CHECK(has(g.body, "\"draft_probe_backoff\": "));
+    CHECK(has(g.body, "\"draft_lend\": "));
+    const HttpResponse l0 = f.post("/admin/fn4", R"({"draft_lend":1})");
+    CHECK_EQ(l0.status, 400);
+    CHECK(has(l0.body, "RADIANCE_DRAFT_LEND was not set at start"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":5000})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-2})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_probe_backoff":9})").status, 400);
+    fn4::draft_register(false, false);
+    const HttpResponse b0 = f.post("/admin/fn4", R"({"draft_probe_backoff":1})");
+    CHECK_EQ(b0.status, 400);
+    CHECK(has(b0.body, "cannot run the adaptive window"));
+    fn4::lend_register(false);
+    const HttpResponse l1 = f.post("/admin/fn4", R"({"draft_lend":-1})");
+    CHECK_EQ(l1.status, 400);
+    CHECK(has(l1.body, "no drafter expert slab to lend"));
+    CHECK(has(f.get("/admin/fn4").body, "\"lend\": {\"capable\": 0"));
+
+    int sw[fn4::kSwitches];
+    fn4::draft_register(true, true);
+    fn4::lend_register(true);
+    fn4::note_sched(fn4::kDraftLend, 0);
+    fn4::note_sched(fn4::kDraftProbeBackoff, 0);
+    const uint64_t e0 = fn4::epoch();
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":1,"draft_probe_backoff":3})").status, 200);
+    CHECK(fn4::apply_pending(30, sw));
+    CHECK_EQ(sw[fn4::kDraftLend], 1);
+    CHECK_EQ(sw[fn4::kDraftProbeBackoff], 3);
+    CHECK_EQ(sw[fn4::kDraftDepth0], fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), e0 + 1);
+    fn4::note_sched(fn4::kDraftLend, 1);
+    fn4::note_sched(fn4::kDraftProbeBackoff, 3);
+    fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128);
+    fn4::note_lend_engine(2, 1, 0, 237, 0, 96, 2151);
+    const HttpResponse g1 = f.get("/admin/fn4");
+    CHECK(has(g1.body, "\"draft_probe_backoff\": 3, \"draft_lend\": 1"));
+    CHECK(has(g1.body, "\"lend\": {\"capable\": 1, \"lent_cycles\": 100, \"lent_plain_steps\": 80, \"lent_plain_ms\": 3200, "
+                       "\"lent_probe_steps\": 2, \"lent_probe_ms\": 300, \"transit_steps\": 9, \"transit_ms\": 450, "
+                       "\"backoff_k\": 3, \"probe_interval\": 128, \"state\": 2, \"lends\": 1, \"reclaims\": 0, "
+                       "\"lent_units\": 237, \"draft_resident\": 0, \"draft_units\": 96, \"slab_mib\": 2151}"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
+    CHECK(fn4::apply_pending(31, sw));
+    CHECK_EQ(sw[fn4::kDraftLend], -1);
+    /* Back off. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":0,"draft_probe_backoff":0})").status, 200);
+    CHECK(fn4::apply_pending(32, sw));
+    fn4::note_sched(fn4::kDraftLend, 0);
+    fn4::note_sched(fn4::kDraftProbeBackoff, 0);
+    fn4::note_lend_sched(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    fn4::note_lend_engine(0, 0, 0, 0, 0, 0, 0);
+    fn4::lend_register(false);
+    fn4::draft_register(false, false);
+}
+
 /* The policy oai.cpp's lists state, key by key, on every endpoint: a guarded key is served at its
  * neutral value and refused by name at any other (a 200 means every answer-changing field was
  * honoured); an inert key and an unknown one are accepted and ignored; an accepted key with a
