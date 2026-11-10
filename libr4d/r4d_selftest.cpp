@@ -20661,34 +20661,45 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
     }
 }
 
-/* --perfgg [M list] [iters] [types] (10.11.2026, the ds-main-port bench): gemm_nt_ggml's decode band (gg_gemv_kernel)
- * at DeepSeek-V4.1-Flash's dense TP4 shapes on one card -- attn_q_b 8192 x 1280, attn_output_b 5120 x 2048, the shared
- * expert's gate_up 1536 x 5120 and down 5120 x 768, attn_q_a 1280 x 5120, attn_output_a 1024 x 4096, attn_kv 512 x 5120,
- * engram_kv 25600 x 6144 -- in q5_K / q6_K / q8_0, at M rows (default 1, 4, 8). The weight streams from DRAM (rotated
- * copies past 256 MiB) or, with --cold, past a flush. The rule's form, then every form r4d_gg_gemv_pin names (rows a
- * wave 1 / 2 / 4, grid cap 256 / 1024) where the pin is exported, each output compared with the rule's byte for byte
- * (every form keeps the per-output order, so a difference is a bug). us a call and GB/s of weight bytes. */
+/* --perfgg [M list] [iters] [types] (10.11.2026, the ds-main-port bench; lever 1's extension on ds41-gg): gemm_nt_ggml's
+ * decode band (gg_gemv_kernel) at DeepSeek-V4.1-Flash's dense TP4 shapes on one card -- attn_q_b 8192 x 1280,
+ * attn_output_b 5120 x 2048, the shared expert's gate_up and down at rank 0's width (768 of 2304: 1536 x 5120,
+ * 5120 x 768) and at ranks 1-3's (512: 1024 x 5120, 5120 x 512), attn_q_a 1280 x 5120, attn_output_a 1024 x 4096,
+ * attn_kv 512 x 5120, engram_kv 25600 x 6144 -- in q5_K / q6_K / q8_0 (the 2.25 bpw .rad's attention is q5_K / q6_K,
+ * its shared expert q6_K / q8_0, engram_kv q6_K; the others are measured too), at M rows (default 1 2 3 4 5 6 8 12 16
+ * 24 32 48: the whole band, the verify shapes of DSpark's block of 5 at 1 / 2 / 4 / 8 sequences among them). The
+ * weight streams from DRAM (rotated copies past 256 MiB, "rot") or, with --cold, past a flush ("cold"). The stock
+ * rule's form first, then the measured form table (gg_gemv = 1 through rad_fn4_switch, "table"; the stock launch
+ * where the table has no entry), then every form r4d_gg_gemv_pin names (rows a wave 1 / 2 / 4, grid cap 256 / 1024)
+ * where the hooks are exported, each output compared with the rule's byte for byte (every form keeps the per-output
+ * order, so a difference is a bug and fails the run). us a call and GB/s of weight bytes; tools/gg_forms.py reads
+ * these lines into libr4d/r4d_ds41_gg_forms.h. */
 static void ds_gg_perf(const Plugin& pl, const char* mlist, int iters, const char* tlist) {
     if (iters <= 0) iters = 100;
     const RadKernelInfo* r = find(pl, "gemm_nt_ggml_qk256_gemv");
     const RadKernelInfo* r32 = find(pl, "gemm_nt_ggml_qk32_gemv");
     auto pin = (void (*)(int, int))dlsym(pl.h, "r4d_gg_gemv_pin");
+    auto sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
     if (!r || !r32) { std::printf("--perfgg: gemm_nt_ggml gemv rows absent\n"); return; }
     std::vector<int64_t> Ms;
-    { std::string m = mlist && *mlist ? mlist : "1,4,8"; size_t p = 0;
+    { std::string m = mlist && *mlist ? mlist : "1,2,3,4,5,6,8,12,16,24,32,48"; size_t p = 0;
       while (p < m.size()) { size_t q = m.find(',', p); if (q == std::string::npos) q = m.size(); Ms.push_back(std::strtoll(m.substr(p, q - p).c_str(), nullptr, 10)); p = q + 1; } }
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
     struct Sh { const char* name; int64_t N, K; };
     const Sh shapes[] = { { "attn_q_b", 8192, 1280 }, { "attn_output_b", 5120, 2048 }, { "shexp_gate_up", 1536, 5120 },
-                          { "shexp_down", 5120, 768 }, { "attn_q_a", 1280, 5120 }, { "attn_output_a", 1024, 4096 },
-                          { "attn_kv", 512, 5120 }, { "engram_kv", 25600, 6144 } };
+                          { "shexp_down", 5120, 768 }, { "shexp_gate_up_w512", 1024, 5120 }, { "shexp_down_w512", 5120, 512 },
+                          { "attn_q_a", 1280, 5120 }, { "attn_output_a", 1024, 4096 }, { "attn_kv", 512, 5120 },
+                          { "engram_kv", 25600, 6144 } };
     struct Ty { const char* name; int qk, bb; };
     const Ty types[] = { { "q5_K", 256, 176 }, { "q6_K", 256, 210 }, { "q8_0", 32, 34 } };
     uint64_t rs = 0x9E3779B97F4A7C15ull;
     auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
-    std::printf("gemm_nt_ggml decode band at DeepSeek-V4.1's dense TP4 shapes; %s, %d launches; pin %s\n",
+    const char* mode = g_cold > 0 ? "cold" : "rot";
+    std::printf("gemm_nt_ggml decode band at DeepSeek-V4.1's dense TP4 shapes; %s, %d launches; pin %s; form table %s\n",
                 g_cold > 0 ? fmt("cold (%lld MiB read before each, median)", (long long)(g_cold >> 20)).c_str()
-                           : "rotated weight copies (mean)", iters, pin ? "exported" : "ABSENT (rule only)");
+                           : "rotated weight copies (mean)", iters, pin ? "exported" : "ABSENT (rule only)",
+                sw ? "switchable (gg_gemv)" : "ABSENT");
+    if (sw) sw("gg_gemv", 0);
     for (const Ty& ty : types) {
         if (("," + want + ",").find(std::string(",") + ty.name + ",") == std::string::npos) continue;
         for (const Sh& sh : shapes) {
@@ -20723,13 +20734,15 @@ static void ds_gg_perf(const Plugin& pl, const char* mlist, int iters, const cha
                 std::memset(&a, 0, sizeof(a));
                 a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
                 const RadKernelInfo* row = ty.qk == 256 ? r : r32;
-                struct Form { int rpw, grid; const char* nm; };
-                std::vector<Form> forms = { { 0, 0, "rule" } };
-                if (pin) for (int rp : { 1, 2, 4 }) for (int g : { 256, 1024 }) forms.push_back({ rp, g, nullptr });
+                struct Form { int rpw, grid, table; const char* nm; };
+                std::vector<Form> forms = { { 0, 0, 0, "rule" } };
+                if (sw) forms.push_back({ 0, 0, 1, "table" });
+                if (pin) for (int rp : { 1, 2, 4 }) for (int g : { 256, 1024 }) forms.push_back({ rp, g, 0, nullptr });
                 std::vector<uint16_t> first;
-                std::string line = fmt("GGPERF %s %s %lldx%lld M=%lld (%.2f MiB):", ty.name, sh.name, (long long)N, (long long)K, (long long)M, wbytes / 1048576.0);
+                std::string line = fmt("GGPERF %s %s %lldx%lld M=%lld (%.2f MiB) %s:", ty.name, sh.name, (long long)N, (long long)K, (long long)M, wbytes / 1048576.0, mode);
                 for (const Form& f : forms) {
                     if (pin) pin(f.rpw, f.grid);
+                    if (sw) sw("gg_gemv", f.table);
                     st_memset(d_y, 0xff, (size_t)(M * N) * 2);
                     ts[1].data = (uint8_t*)d_w;
                     const int rc = row->launch(&a, nullptr);
@@ -20745,6 +20758,7 @@ static void ds_gg_perf(const Plugin& pl, const char* mlist, int iters, const cha
                     if (!same) ++g_fail;
                 }
                 if (pin) pin(0, 0);
+                if (sw) sw("gg_gemv", 0);
                 std::printf("%s\n", line.c_str());
                 std::fflush(stdout);
             }
