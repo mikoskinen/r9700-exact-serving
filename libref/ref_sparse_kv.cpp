@@ -5,6 +5,7 @@
  * a model. */
 #include "ref_common.h"
 #include "ref_ops.h"
+#include "ref_tree.h"
 
 #include <algorithm>
 #include <cmath>
@@ -208,9 +209,16 @@ int64_t seq_of_row(const RadTensor& cu, int64_t n_seq, int64_t row) {
  * block or selection is no key. Per head: f32 scores q.k * scale, max floored at -1e30,
  * p = exp(s - max), out = sum p k / (sum p + exp(sink - max)), rounded once to out's dtype. A row
  * with no key gives zeros. */
-int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
+/* attn_sparse_sink, and with `tree_op` attn_sparse_sink_tree: operands 11 (the row table) and 12
+ * (the in-tree entries, ratio > 1) after the eleven. A tree row (ref_tree.h) of sequence s reads its
+ * window table from first = A + rows(s) - window_used[s], a window position j >= A at the slot
+ * position A + (ancestor at depth j - A) - r0, and, at depth >= 1, a compressed entry c that
+ * completes on its path (ratio 1: c >= A + 1, at the slot position of its ancestor at depth c - A;
+ * ratio > 1: e = (c + 1) ratio - 1 >= A + 1, block `row` of the in-tree cache, row its ancestor at
+ * depth e - A). Everything else is attn_sparse_sink's. */
+static int attn_sparse_sink_impl(const RadArgs* a, bool tree_op) {
     /* Operands 4-6 are optional (null without a compressed source), so count rather than have(). */
-    if (!a || a->n_t < 11 || !a->t) return RAD_E_INVAL;
+    if (!a || a->n_t < (tree_op ? 12 : 11) || !a->t) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &wc = a->t[1], &wbt = a->t[2], &wused = a->t[3];
     const RadTensor *cc = a->t[4].data ? &a->t[4] : nullptr, *cbt = a->t[5].data ? &a->t[5] : nullptr;
     const RadTensor *sel = a->t[6].data ? &a->t[6] : nullptr;
@@ -241,17 +249,37 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
     if (cnv && (cc->dtype != RAD_BF16 || !rad_tensor_is_contiguous(cc))) return RAD_E_SHAPE;
     const int64_t M = q.shape[0], S = numel(&cu) - 1, bs = wc.shape[2];
     const int64_t nkeys = win + (comp ? topk : 0);
+    /* attn_sparse_sink_tree's row table and in-tree entries: [TR, 1, ratio, cslots / ratio] like the
+     * compressed cache, one entry a block, block = the step row that completed it. */
+    const RefTree tr(tree_op && a->t[11].data ? &a->t[11] : nullptr, &pos);
+    const RadTensor* tc = tree_op && a->n_t > 12 && a->t[12].data ? &a->t[12] : nullptr;
+    if (tree_op && (!tr.tt || tr.tt->dtype != RAD_I32 || tr.W < 3)) return RAD_E_SHAPE;
+    if (tc && (!comp || tc->rank != 4 || tc->shape[1] != 1 || tc->shape[2] * tc->shape[3] != cslots ||
+               tc->dtype != cc->dtype || !rad_tensor_is_contiguous(tc)))
+        return RAD_E_SHAPE;
 #pragma omp parallel for schedule(dynamic)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t s = seq_of_row(cu, S, m);
         const int64_t p = ld_int(pos.dtype, pos.data, offlin(&pos, m));
         const int64_t last = ld_int(pos.dtype, pos.data, offlin(&pos, cu_at(&cu, s + 1) - 1));
-        const int64_t first = last + 1 - ld_int(wused.dtype, wused.data, offlin(&wused, s));
+        int64_t td = -1, tr0 = -1, A = 0;
+        const bool tree = tr.row(m, &td, &tr0);
+        if (tree) A = tr.at(tr0);
+        const int64_t first = tree ? A + (cu_at(&cu, s + 1) - cu_at(&cu, s)) -
+                                         ld_int(wused.dtype, wused.data, offlin(&wused, s))
+                                   : last + 1 - ld_int(wused.dtype, wused.data, offlin(&wused, s));
         /* Each key's first element as a (tensor, flat offset) pair; -1 when there is no key. */
         std::vector<const RadTensor*> kt((size_t)nkeys, nullptr);
         std::vector<int64_t> ko((size_t)nkeys, -1);
         for (int64_t i = 0; i < win; ++i) {
-            const int64_t j = p - win + 1 + i, r = j - first;
+            const int64_t j = p - win + 1 + i;
+            int64_t js = j;
+            if (tree && j >= A) {
+                const int64_t an = tr.anc(m, td, j - A);
+                if (an < 0) continue;
+                js = A + (an - tr0);
+            }
+            const int64_t r = js - first;
             if (j < 0 || r < 0 || r / bs >= wbt.shape[1]) continue;
             const int64_t blk = ld_int(wbt.dtype, wbt.data, rowoff(&wbt, s, wbt.shape[1]) +
                                                                (r / bs) * laststride(&wbt));
@@ -260,7 +288,21 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
             ko[(size_t)i] = ((blk * bs) + r % bs) * D;
         }
         for (int64_t t = 0; comp && t < topk; ++t) {
-            const int64_t c = ld_int(sel->dtype, sel->data, rowoff(sel, m, topk) + t * laststride(sel));
+            int64_t c = ld_int(sel->dtype, sel->data, rowoff(sel, m, topk) + t * laststride(sel));
+            if (c < 0) continue;
+            if (tree && td >= 1) {
+                if (ratio == 1 && c >= A + 1) {
+                    const int64_t an = tr.anc(m, td, c - A);
+                    if (an < 0) continue;
+                    c = A + (an - tr0);
+                } else if (ratio > 1 && (c + 1) * ratio - 1 >= A + 1) {
+                    const int64_t an = tr.anc(m, td, (c + 1) * ratio - 1 - A);
+                    if (an < 0 || !tc || an >= tc->shape[0]) continue;
+                    kt[(size_t)(win + t)] = tc;
+                    ko[(size_t)(win + t)] = an * cslots;
+                    continue;
+                }
+            }
             if (c < 0 || (c * ratio) / cbs >= cbt->shape[1]) continue;
             const int64_t blk = ld_int(cbt->dtype, cbt->data, rowoff(cbt, s, cbt->shape[1]) +
                                                                   ((c * ratio) / cbs) * laststride(cbt));
@@ -270,7 +312,7 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
         }
         /* a key's value d: the bf16 caches' element, or (packed) the entry's decoded value */
         auto kval = [&](int64_t k, int64_t d) {
-            return cnv && k >= win ? nv4_value((const uint8_t*)cc->data + 2 * ko[(size_t)k], D, d)
+            return cnv && k >= win ? nv4_value((const uint8_t*)kt[(size_t)k]->data + 2 * ko[(size_t)k], D, d)
                                    : ldt(kt[(size_t)k], ko[(size_t)k] + d);
         };
         std::vector<float> sc((size_t)nkeys), acc((size_t)D);
@@ -301,6 +343,9 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+int ref_attn_sparse_sink(const RadArgs* a, RadStream) { return attn_sparse_sink_impl(a, false); }
+int ref_attn_sparse_sink_tree(const RadArgs* a, RadStream) { return attn_sparse_sink_impl(a, true); }
+
 /* The indexer's score of each compressed position for each row: sum over heads h of
  * relu(q_h . k_j) w_h, where k_j is entry j of the paged index cache (addressed as
  * attn_sparse_sink's compressed entries) and w_h = round(w[m, h] * wscale) (the reference scales
@@ -320,7 +365,12 @@ int ref_attn_sparse_sink(const RadArgs* a, RadStream) {
  * the op's without keep, bit for bit, so index_topk through the same keep selects exactly what it
  * would from the whole score: the candidate restriction of a layer that reads the candidate
  * layer's blocks (DeepSeek-V4.1's layers past `candidate_source_layer_id`). */
-int ref_index_score(const RadArgs* a, RadStream) {
+/* index_score, and with `tree_op` index_score_tree: operands 8 (the row table) and 9 (the in-tree
+ * keys, ratio > 1) after the eight (keep, 7, may be absent). A tree row's entry j that completes on
+ * its path reads its key as attn_sparse_sink_tree reads the entry (ratio 1: j >= A + 1, at the slot
+ * position of its ancestor at depth j - A; ratio > 1: (j + 1) ratio - 1 >= A + 1, block `row` of the
+ * in-tree keys); every other entry, and every other row, is index_score's. */
+static int index_score_impl(const RadArgs* a, bool tree_op) {
     if (!have(a, 7)) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
@@ -354,6 +404,12 @@ int ref_index_score(const RadArgs* a, RadStream) {
     if (keep && keep->dtype != RAD_I32) return RAD_E_DTYPE;
     const int64_t KW = keep ? keep->shape[1] : 0;
     const uint32_t dt = q.dtype;
+    const RefTree tr(tree_op && a->n_t > 8 && a->t[8].data ? &a->t[8] : nullptr, &pos);
+    const RadTensor* tk = tree_op && a->n_t > 9 && a->t[9].data ? &a->t[9] : nullptr;
+    if (tree_op && (!tr.tt || tr.tt->dtype != RAD_I32 || tr.W < 3)) return RAD_E_SHAPE;
+    if (tk && (tk->rank != 4 || tk->shape[1] != 1 || tk->shape[2] * tk->shape[3] != kslots ||
+               tk->dtype != kc.dtype || !rad_tensor_is_contiguous(tk)))
+        return RAD_E_SHAPE;
 #pragma omp parallel for schedule(dynamic)
     for (int64_t i = 0; i < M; ++i) {
         const int64_t m = row0 + i;
@@ -364,9 +420,23 @@ int ref_index_score(const RadArgs* a, RadStream) {
         const int64_t s = seq_of_row(cu, S, m);
         const int64_t reach = (ld_int(pos.dtype, pos.data, offlin(&pos, m)) + 1) / ratio;
         const int64_t qb = rowoff(&q, m, H * Dm), qs = laststride(&q);
+        int64_t td = -1, tr0 = -1, A = 0;
+        const bool tree = tr.row(m, &td, &tr0) && td >= 1;
+        if (tree) A = tr.at(tr0);
         for (int64_t j = 0; j < C; ++j) {
             float v = -INFINITY;
-            const int64_t col = (j * ratio) / cbs;
+            /* the entry's slot position (j itself but for a tree row's in-path entry), or its
+             * in-tree block (tb >= 0), or none (je < 0) */
+            int64_t je = j, tb = -1;
+            if (tree && ratio == 1 && j >= A + 1) {
+                const int64_t an = tr.anc(m, td, j - A);
+                je = an < 0 ? -1 : A + (an - tr0);
+            } else if (tree && ratio > 1 && (j + 1) * ratio - 1 >= A + 1) {
+                const int64_t an = tr.anc(m, td, (j + 1) * ratio - 1 - A);
+                je = -1;
+                if (an >= 0 && tk && an < tk->shape[0]) tb = an;
+            }
+            const int64_t col = je >= 0 ? (je * ratio) / cbs : 0;
             bool kept = true;
             if (keep && j < reach) {
                 const int64_t b = j / block;
@@ -374,16 +444,17 @@ int ref_index_score(const RadArgs* a, RadStream) {
                                                      rowoff(keep, i, KW) + (b / 32) * laststride(keep));
                 kept = ((wd >> (b % 32)) & 1u) != 0;
             }
-            if (kept && j < reach && col < bt.shape[1]) {
-                const int64_t blk = ld_int(bt.dtype, bt.data, rowoff(&bt, s, bt.shape[1]) + col * laststride(&bt));
-                if (blk >= 0 && blk < kc.shape[0]) {
-                    const int64_t ko = (blk * cbs + (j * ratio) % cbs) * (kslots / ratio);
-                    const uint8_t* ke = kmx ? (const uint8_t*)kc.data + 2 * ko : nullptr;
+            if (kept && j < reach && (tb >= 0 || (je >= 0 && col < bt.shape[1]))) {
+                const int64_t blk = tb >= 0 ? 0 : ld_int(bt.dtype, bt.data, rowoff(&bt, s, bt.shape[1]) + col * laststride(&bt));
+                if (tb >= 0 || (blk >= 0 && blk < kc.shape[0])) {
+                    const RadTensor& kt = tb >= 0 ? *tk : kc;
+                    const int64_t ko = tb >= 0 ? tb * kslots : (blk * cbs + (je * ratio) % cbs) * (kslots / ratio);
+                    const uint8_t* ke = kmx ? (const uint8_t*)kt.data + 2 * ko : nullptr;
                     float acc = 0;
                     for (int64_t h = 0; h < H; ++h) {
                         float dot = 0;
                         for (int64_t d = 0; d < Dm; ++d)
-                            dot += ldt(&q, qb + (h * Dm + d) * qs) * (ke ? mx4_value(ke, Dm, d) : ldt(&kc, ko + d));
+                            dot += ldt(&q, qb + (h * Dm + d) * qs) * (ke ? mx4_value(ke, Dm, d) : ldt(&kt, ko + d));
                         dot = round_dt(dt, dot);
                         const float wh =
                             round_dt(dt, ldt(&w, rowoff(&w, m, H) + h * laststride(&w)) * wscale);
@@ -397,6 +468,9 @@ int ref_index_score(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+int ref_index_score(const RadArgs* a, RadStream) { return index_score_impl(a, false); }
+int ref_index_score_tree(const RadArgs* a, RadStream) { return index_score_impl(a, true); }
 
 namespace {
 /* The k largest of v[0..n) by value, ties to the lower index, as indices (fewer when n < k). */

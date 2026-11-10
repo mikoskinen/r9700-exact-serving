@@ -2464,6 +2464,59 @@ static const RadOperandSpec oNgramIds[] = {
     { "ids",          RAD_OPD_OUT,    0 },
     { "ahead_ids",    RAD_OPD_OUT,    1 },
 };
+/* A tree verify for DeepSeek-V4.1's DSpark (lever T1; r4d_tree.hip, the tree variants in
+ * r4d_qsa_work_bf16.hip / r4d_ngram_ids.hip): the rows' tree table, the compressor gather and the
+ * n-gram ids through a row's path, the context pass's commits and the drafter's tree proposal. */
+static const RadOperandSpec oNgramIdsTree[] = {
+    { "tok",          RAD_OPD_IN,     0 },
+    { "state",        RAD_OPD_INOUT,  0 },
+    { "cu",           RAD_OPD_IN,     0 },
+    { "mult",         RAD_OPD_WEIGHT, 0 },
+    { "vocab_sizes",  RAD_OPD_WEIGHT, 0 },
+    { "offsets",      RAD_OPD_WEIGHT, 0 },
+    { "cache_idx",    RAD_OPD_IN,     1 },
+    { "has_init",     RAD_OPD_IN,     1 },
+    { "num_accepted", RAD_OPD_IN,     1 },
+    { "ids",          RAD_OPD_OUT,    0 },
+    { "ahead_ids",    RAD_OPD_OUT,    1 },
+    { "tree",         RAD_OPD_IN,     0 },
+};
+static const RadOperandSpec oQsaWorkTree[] = {
+    { "k", RAD_OPD_IN, 0 },     { "pos", RAD_OPD_IN, 0 },    { "cu", RAD_OPD_IN, 0 },
+    { "state", RAD_OPD_IN, 0 }, { "sidx", RAD_OPD_IN, 0 },   { "bt", RAD_OPD_IN, 0 },
+    { "rope", RAD_OPD_IN, 1 },  { "stage", RAD_OPD_OUT, 0 }, { "page", RAD_OPD_OUT, 0 },
+    { "bpos", RAD_OPD_OUT, 0 }, { "nc", RAD_OPD_OUT, 0 },    { "tree", RAD_OPD_IN, 0 },
+    { "mpage", RAD_OPD_OUT, 0 }, { "tpage", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pTreeRows[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "width", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oTreeRows[] = {
+    { "spec_parent", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 },
+    { "tree", RAD_OPD_OUT, 0 },       { "spos", RAD_OPD_OUT, 0 },      { "tmark", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pTreeCommitEntries[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "ratio", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oTreeCommitEntries[] = {
+    { "tmark", RAD_OPD_IN, 0 },   { "positions", RAD_OPD_IN, 0 }, { "slot_mapping", RAD_OPD_IN, 0 },
+    { "scratch", RAD_OPD_IN, 0 }, { "cache", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pTreeCommitRows[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "n", RAD_P_INT, RAD_REQUIRED }, { "ring", RAD_P_INT, RAD_REQUIRED },
+    { "off", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oTreeCommitRows[] = {
+    { "tmark", RAD_OPD_IN, 0 },        { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "slot_mapping", RAD_OPD_IN, 0 }, { "sidx", RAD_OPD_IN, 0 },      { "state", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pDsparkTreeAsm[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED }, { "K", RAD_P_INT, RAD_REQUIRED }, { "B", RAD_P_INT, RAD_REQUIRED },
+    { "pitch", RAD_P_INT, RAD_REQUIRED }, { "n_alt", RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oDsparkTreeAsm[] = {
+    { "tokens", RAD_OPD_IN, 0 }, { "alt", RAD_OPD_IN, 0 }, { "prop", RAD_OPD_OUT, 0 }, { "par", RAD_OPD_OUT, 0 },
+};
 
 static const RadParamSpec pLogits[] = {
     { "M",       RAD_P_INT, RAD_REQUIRED },
@@ -3688,6 +3741,37 @@ static const RadOpSchema kSchemas[] = {
            "The DSpark walk's n_alt next-best first proposals (dflash_select's row-0 scores, the walk's "
            "own first proposal and invalid ids left out, ties to the lower index), each continued "
            "greedily over rows 1..steps-1: alt[s, a*steps + l]; -1 for a branch with no candidate."),
+    SCHEMA("tree_rows", pTreeRows, oTreeRows,
+           "A tree verify's row table from RadBatch::spec_parent (-1 a root, p >= 0 the parent row cu[s] + p, "
+           "before the row and itself a tree row; anything else an ordinary row): tree[m] = [depth (-1 "
+           "ordinary; at most width - 3), the root's row, the ancestors' rows at depth 0 .. depth, -1 ...]; "
+           "spos[m] = positions[root] + (m - root) for a tree row, positions[m] otherwise; tmark[m] = 1 for "
+           "a tree row of depth >= 1."),
+    SCHEMA("qsa_work_tree", pQsaWork, oQsaWorkTree,
+           "qsa_work over a tree verify (rope absent): a sequence whose first row is a root completes one "
+           "block a tree row whose position does, in row order, its keys from the row's ancestors (q >= A) "
+           "or the tail (q % ring); page as qsa_work, mpage = page at depth 0 and -1 past it, tpage = the "
+           "row at depth >= 1 (page >= 0), nc from the largest position. Other sequences are qsa_work's "
+           "(mpage = page, tpage = -1)."),
+    SCHEMA("ngram_ids_tree", pNgramIds, oNgramIdsTree,
+           "ngram_ids over a tree verify: a tree row of depth d hashes its path's tokens (shift k: its "
+           "ancestor at depth d - k while d - k >= 0, else the committed id prev[ctx + d - k]); the state's "
+           "write-back is ngram_ids' (every row in order)."),
+    SCHEMA("tree_commit_entries", pTreeCommitEntries, oTreeCommitEntries,
+           "The context pass after a tree verify: row m < min(M, rows(tmark), rows(scratch)) with tmark 1, "
+           "slot_mapping >= 0 and (positions[m] + 1) % ratio == 0 copies scratch block m to cache block "
+           "slot / ratio (bytes, the entry's own format)."),
+    SCHEMA("tree_commit_rows", pTreeCommitRows, oTreeCommitRows,
+           "The context pass after a tree verify: per sequence (root r0 = cu[s], slot sidx[s] col 0), the "
+           "rows m after r0 in order with tmark 1 and slot_mapping >= 0, depth t = positions[m] - "
+           "positions[r0], j = m - r0: state row src -> dst of n 4-byte words, ring mode (ring > 0) src = "
+           "(positions[r0] + j) % ring, dst = (positions[r0] + t) % ring, linear mode src = off + j, "
+           "dst = off + t."),
+    SCHEMA("dspark_tree_assemble", pDsparkTreeAsm, oDsparkTreeAsm,
+           "DSpark's tree proposal: nodes 1..K the walk (parent n - 1), then B branches at position 1 "
+           "depth-major (node K + (k-1) B + b + 1 is alt[s, b K + k - 1], parent 0 at k = 1, n - B after; "
+           "an alternative below 0 or b >= n_alt is the walk's token at depth k), nodes past K + B K the "
+           "walk's last token (parent n - 1). par[n - 1] is node n's parent."),
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
            "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
@@ -6066,6 +6150,12 @@ static const RadConstraint cU8Row4[]    = { C_IN("dtype", "u8"), C_DIV("n", 4) }
 /* The n-gram hash reads no activation, so no dtype. The shift window lives in a register array;
  * `ngram` past 8 would spill it to scratch. */
 static const RadConstraint cNgramIds[]  = { C_GE("ngram", 2), C_LE("ngram", 8), C_GE("heads", 1) };
+/* The tree verify's ops (lever T1): a table of at most 64 columns; a tree's proposal any pitch. */
+static const RadConstraint cTreeRows[] = { C_GE("M", 1), C_GE("width", 3), C_LE("width", 64) };
+static const RadConstraint cTreeCommitEntries[] = { C_GE("M", 1), C_GE("ratio", 1) };
+static const RadConstraint cTreeCommitRows[] = { C_GE("M", 1), C_GE("n", 1), C_GE("ring", 0) };
+static const RadConstraint cDsparkTreeAsm[] = { C_GE("M", 1), C_GE("K", 1), C_GE("B", 0), C_GE("pitch", 1),
+                                                 C_GE("n_alt", 0) };
 /* PLE's gate. `n` is the per-stream width every reduction runs over within a workgroup; 4096 is
  * 16 values per thread at 256 threads, what the register arrays hold. */
 static const RadConstraint cPleGate[]   = { C_IN("dtype", "bf16"), C_GE("n", 1), C_LE("n", 4096),
@@ -10386,6 +10476,50 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDsparkAlt), NOTUNE,
   nullptr, nullptr, r4d_rad_dspark_alt, nullptr, nullptr, nullptr, nullptr },
+
+/* A tree verify for DSpark (lever T1): libref/ref_tree.cpp and the tree variants are the oracles. */
+{ "tree_rows_i32", "tree_rows", "dflash",
+  "a tree verify's row table from spec_parent, one thread a row",
+  "any rows, a table of 3..64 columns (depth width - 3 at most)",
+  "i32 parents, cu_seqlens and positions in; i32 table, slot positions and marks out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cTreeRows), NOTUNE,
+  nullptr, nullptr, r4d_rad_tree_rows, nullptr, nullptr, nullptr, nullptr },
+{ "qsa_work_tree_bf16", "qsa_work_tree", "attn",
+  "qsa_work over a tree verify's rows: one workgroup a potential block, a tree row's keys through its path",
+  "as qsa_work_bf16, no rope plane",
+  "bf16 keys, tail and staging plane; i32 positions, table, pages",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cQsaWork), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_work_tree, nullptr, nullptr, nullptr, nullptr },
+{ "qsa_work_tree_f32", "qsa_work_tree", "attn",
+  "qsa_work_tree_bf16's gather over f32 planes",
+  "as qsa_work_tree_bf16",
+  "f32 keys, tail and staging plane; the i32 operands as qsa_work_tree_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cQsaWorkF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_work_tree, nullptr, nullptr, nullptr, nullptr },
+{ "ngram_ids_tree_i32", "ngram_ids_tree", "vocab",
+  "ngram_ids over a tree verify's paths, one thread a token",
+  "as ngram_ids_i32; a tree sequence of at most 256 rows",
+  "i32 tokens, state and table, i64 multipliers and per-head vocab sizes and offsets",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cNgramIds), NOTUNE,
+  nullptr, nullptr, r4d_rad_ngram_ids_tree, nullptr, nullptr, nullptr, nullptr },
+{ "tree_commit_entries", "tree_commit_entries", "dflash",
+  "the accepted path's in-tree entries into their cache blocks, one workgroup a row",
+  "any entry size, contiguous planes",
+  "any element type (bytes copied); i32 marks, positions and slots",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cTreeCommitEntries), NOTUNE,
+  nullptr, nullptr, r4d_rad_tree_commit_entries, nullptr, nullptr, nullptr, nullptr },
+{ "tree_commit_rows", "tree_commit_rows", "dflash",
+  "the accepted path's state rows into their places, one workgroup a sequence, rows serial",
+  "4-byte elements, a contiguous state",
+  "f32 or i32 state; i32 marks, positions, cu_seqlens, slots and state index",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cTreeCommitRows), NOTUNE,
+  nullptr, nullptr, r4d_rad_tree_commit_rows, nullptr, nullptr, nullptr, nullptr },
+{ "dspark_tree_assemble_i32", "dspark_tree_assemble", "dflash",
+  "DSpark's tree proposal from the walk and its position-1 branches, one thread a node",
+  "any K, B, pitch",
+  "i32 tokens, branches, proposal and parents",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsparkTreeAsm), NOTUNE,
+  nullptr, nullptr, r4d_rad_dspark_tree_assemble, nullptr, nullptr, nullptr, nullptr },
 
 /* pair_argmax, the sandwich-norm joins and expert_scale. The joins and expert_scale have no
  * opd_shape: libref has no row for them, and tests/r4d_emu holds their source to the replaced chain

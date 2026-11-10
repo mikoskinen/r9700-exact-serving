@@ -229,6 +229,8 @@ set(R4D_UNITS
   "r4d_ds41_mxfp4|"
   # DSpark beside its walk: the confidence head (dspark_conf) and the walk's next-best first proposals (dspark_alt).
   "r4d_dspark_extra|"
+  # A tree verify for DSpark (lever T1): the rows' table, the context pass's commits, the tree proposal.
+  "r4d_tree|"
 )
 
 set(R4D_SRC "")

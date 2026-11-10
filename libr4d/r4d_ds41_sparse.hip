@@ -125,6 +125,32 @@ __device__ __forceinline__ void ds_wave_sync() {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 }
 
+/* ================================================================== a tree verify's rows
+ * tree_rows' table as the tree variants read it (libref/ref_tree.h's rules, element for element):
+ * row m's [0] depth d (a tree row: 0 <= d <= width - 3), [1] root row r0 (in [0, npos)), [2 + x] its
+ * ancestor at depth x (out of [0, npos): no row). The anchor A = positions[r0]. */
+struct DsTreeRow {
+    int d;      /* -1: an ordinary row */
+    long r0, A;
+};
+__device__ __forceinline__ DsTreeRow ds_tree_row(const int* tt, long ttr, int ttw, int ttrows, const int* pos0,
+                                                 long ps, int npos, long m) {
+    DsTreeRow t{ -1, -1, 0 };
+    if (!tt || ttw < 3 || m < 0 || m >= ttrows) return t;
+    const int d = tt[m * ttr], r0 = tt[m * ttr + 1];
+    if (d < 0 || d > ttw - 3 || r0 < 0 || r0 >= npos) return t;
+    t.d = d;
+    t.r0 = r0;
+    t.A = pos0[(long)r0 * ps];
+    return t;
+}
+/* Row m's ancestor at depth x, or -1. */
+__device__ __forceinline__ long ds_tree_anc(const int* tt, long ttr, int npos, long m, const DsTreeRow& t, long x) {
+    if (x < 0 || x > t.d) return -1;
+    const int r = tt[m * ttr + 2 + x];
+    return r >= 0 && r < npos ? r : -1;
+}
+
 /* ================================================================== index_score */
 /* q, w and pos start at the run's first row (row_part); row0 is that row's index in cu_seqlens.
  * M is the score's rows (the pass height, which picks the form), Mv how many of them the step
@@ -144,6 +170,14 @@ struct DsScoreArgs {
     int nbt, S, M, Mv, C, H, ratio, cbs, slot, block, bshift;
     int kmx;                                         /* key_format mxfp4: the cache holds packed keys */
     float wscale;
+    /* index_score_tree (null tt: index_score): the row table [ttrows, ttw] by absolute step row, the
+     * step's positions from row 0 (pos0, npos of them), the in-tree keys tkc (tkrows entries of
+     * `slot * ratio` bf16 slots, block = the step row that completed it). */
+    const int* tt;
+    const int* pos0;
+    const uint16_t* tkc;
+    long ttr;
+    int ttw, ttrows, npos, tkrows;
 };
 
 /* ---- MXFP4 index keys (index_score key_format mxfp4, entry_store format mxfp4): an n-value key as
@@ -318,6 +352,38 @@ __device__ __forceinline__ const uint16_t* ds_entry_key(const DsScoreArgs& a, in
     return a.kc + (blk * a.cbs + (j * a.ratio) % a.cbs) * (long)a.slot;
 }
 
+/* ds_entry_key for row m (score row, step row row0 + m) of index_score_tree: a tree row of depth >= 1
+ * reads an entry completing on its path from its ancestor's slot position (ratio 1) or the in-tree
+ * keys (ratio > 1); every other entry, and an ordinary row, is ds_entry_key's. */
+__device__ __forceinline__ const uint16_t* ds_entry_key_t(const DsScoreArgs& a, int s, long m, long j, long reach,
+                                                          const DsTreeRow& tr) {
+    if (!a.tt || tr.d < 1) return ds_entry_key(a, s, j, reach);
+    if (j >= a.C || j >= reach) return nullptr;
+    const long mm = a.row0 + m;
+    if (a.ratio == 1 && j >= tr.A + 1) {
+        const long an = ds_tree_anc(a.tt, a.ttr, a.npos, mm, tr, j - tr.A);
+        if (an < 0) return nullptr;
+        const long je = tr.A + (an - tr.r0);
+        if (je < 0) return nullptr;
+        const long col = je / a.cbs;
+        if (col >= a.nbt) return nullptr;
+        const long blk = a.bt[(long)s * a.btr + col * a.btc];
+        if (blk < 0 || blk >= a.nblk) return nullptr;
+        return a.kc + (blk * a.cbs + je % a.cbs) * (long)a.slot;
+    }
+    if (a.ratio > 1 && (j + 1) * a.ratio - 1 >= tr.A + 1) {
+        const long an = ds_tree_anc(a.tt, a.ttr, a.npos, mm, tr, (j + 1) * a.ratio - 1 - tr.A);
+        if (an < 0 || !a.tkc || an >= a.tkrows) return nullptr;
+        return a.tkc + an * (long)a.slot * a.ratio;
+    }
+    return ds_entry_key(a, s, j, reach);
+}
+/* The row's tree reading (index_score_tree), or an ordinary row. */
+__device__ __forceinline__ DsTreeRow ds_score_tree_row(const DsScoreArgs& a, long m) {
+    if (!a.tt) return DsTreeRow{ -1, -1, 0 };
+    return ds_tree_row(a.tt, a.ttr, a.ttw, a.ttrows, a.pos0, a.ps, a.npos, a.row0 + m);
+}
+
 /* One entry's score from its key kp (null: none): the dot in d order rounded to bf16, relu x the
  * rounded head weight, rounded, summed in head order -- this wave's heads [h0, h1); with HS > 1 the
  * waves' slices meet in `part` ([H][EPB]) and wave sub 0 closes the sum in head order. Called
@@ -408,7 +474,8 @@ __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
             continue;
         }
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
-        const uint16_t* kp = ds_entry_key(a, s, j, reach);
+        const DsTreeRow tr = ds_score_tree_row(a, m);
+        const uint16_t* kp = ds_entry_key_t(a, s, m, j, reach, tr);
         const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
         if (sub == 0 && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
     }
@@ -527,6 +594,7 @@ __global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs 
         const DsKeptScan<256> ks = ds_kept_scan<256>(krow, a.kcs, nb, ws);
         const long nk = (long)ks.total * block;      /* compacted entries (some past reach) */
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
+        const DsTreeRow tr = ds_score_tree_row(a, m);
         for (long x0 = (long)blockIdx.x * EPB; x0 < nk; x0 += (long)gridDim.x * EPB) {
             const long r0 = x0 / block, r1 = (x0 + EPB - 1) / block + 1;   /* ranks [r0, r1) */
             const long rn = (r1 < (long)ks.total ? r1 : (long)ks.total) - r0;
@@ -538,7 +606,7 @@ __global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs 
                 const long r = x / block;
                 j = (long)list[r - r0] * block + (x - r * block);
             }
-            const uint16_t* kp = j >= 0 ? ds_entry_key(a, s, j, reach) : nullptr;
+            const uint16_t* kp = j >= 0 ? ds_entry_key_t(a, s, m, j, reach, tr) : nullptr;
             const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
             if (sub == 0 && j >= 0 && j < reach && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
             __syncthreads();                         /* the list is rewritten next round */
@@ -963,6 +1031,12 @@ struct DsAttnArgs {
     int cnv;                                         /* latent_format nvfp4: compressed entries packed */
     int cslot;                                       /* the compressed cache's slots a position (D / ratio plain) */
     float scale;
+    /* attn_sparse_sink_tree (null tt: attn_sparse_sink): the row table [ttrows, ttw], the in-tree
+     * entries tcc (tcrows entries of cslot * ratio bf16 slots, block = the step row that completed it). */
+    const int* tt;
+    const uint16_t* tcc;
+    long ttr;
+    int ttw, ttrows, tcrows;
 };
 
 constexpr int kDsAttnD = 512;
@@ -1001,6 +1075,59 @@ __host__ __device__ constexpr long ds_attn_tile_off(int nkp, int hg) {
     return ((long)nkp * 8 + (long)hg * nkp * 4 + (long)hg * 8 + 15) / 16 * 16;
 }
 
+/* Row m's (sequence s, position p) table base and key k's pointer, `none` for no key: the window
+ * keys [p - win + 1, p], then the selections, as libref orders them. A tree row (attn_sparse_sink_tree)
+ * reads its window table from first = A + rows(s) - used and a window position j >= A at its
+ * ancestor's slot position A + (row - r0); at depth >= 1 a selection completing on its path from its
+ * ancestor's slot position (ratio 1) or block `ancestor` of the in-tree entries (ratio > 1). */
+__device__ __forceinline__ long ds_attn_first(const DsAttnArgs& a, int s, const DsTreeRow& tr) {
+    if (tr.d >= 0) {
+        const long ns = (long)a.cu[(long)(s + 1) * a.cs] - (long)a.cu[(long)s * a.cs];
+        return tr.A + ns - (long)a.wused[(long)s * a.wus];
+    }
+    long lr = (long)a.cu[(long)(s + 1) * a.cs] - 1;
+    lr = lr < 0 ? 0 : (lr >= a.M ? a.M - 1 : lr);
+    const long last = a.pos[lr * a.ps];
+    return last + 1 - (long)a.wused[(long)s * a.wus];
+}
+__device__ __forceinline__ const uint16_t* ds_attn_key(const DsAttnArgs& a, int s, long m, long p, long first,
+                                                       const DsTreeRow& tr, int k, const uint16_t* none) {
+    constexpr int D = kDsAttnD;
+    if (k < a.win) {
+        const long j = p - a.win + 1 + k;
+        long js = j;
+        if (tr.d >= 0 && j >= tr.A) {
+            const long an = ds_tree_anc(a.tt, a.ttr, a.M, m, tr, j - tr.A);
+            if (an < 0) return none;
+            js = tr.A + (an - tr.r0);
+        }
+        const long r = js - first;
+        if (j >= 0 && r >= 0 && r / a.bs < a.nwbt) {
+            const long blk = a.wbt[(long)s * a.wbtr + (r / a.bs) * a.wbtc];
+            if (blk >= 0 && blk < a.nwblk) return a.wc + (blk * a.bs + r % a.bs) * (long)D;
+        }
+    } else if (k < a.nk) {
+        long c = a.sel[m * a.selr + (long)(k - a.win) * a.selc];
+        if (c < 0) return none;
+        if (tr.d >= 1) {
+            if (a.ratio == 1 && c >= tr.A + 1) {
+                const long an = ds_tree_anc(a.tt, a.ttr, a.M, m, tr, c - tr.A);
+                if (an < 0) return none;
+                c = tr.A + (an - tr.r0);
+            } else if (a.ratio > 1 && (c + 1) * a.ratio - 1 >= tr.A + 1) {
+                const long an = ds_tree_anc(a.tt, a.ttr, a.M, m, tr, (c + 1) * a.ratio - 1 - tr.A);
+                if (an < 0 || !a.tcc || an >= a.tcrows) return none;
+                return a.tcc + an * (long)a.cslot * a.ratio;
+            }
+        }
+        if (c >= 0 && (c * a.ratio) / a.cbs < a.ncbt) {
+            const long blk = a.cbt[(long)s * a.cbtr + ((c * a.ratio) / a.cbs) * a.cbtc];
+            if (blk >= 0 && blk < a.ncblk) return a.cc + (blk * a.cbs + (c * a.ratio) % a.cbs) * (long)a.cslot;
+        }
+    }
+    return none;
+}
+
 /* Workgroup (d half, head group, row). LDS: the row's key pointers (null = no key), scores then p
  * [HG][nkp], max and den [HG], and the waves' transpose tiles. */
 template <int HG, int DS>
@@ -1021,6 +1148,11 @@ __global__ __launch_bounds__(256) void ds41_attn_sparse_sink_kernel(DsAttnArgs a
         /* ---- the row's keys, in libref's order: the window, then the selections */
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
         const long p = a.pos[m * a.ps];
+        if (a.tt) {   /* attn_sparse_sink_tree: the row's tree reading (ds_attn_key) */
+            const DsTreeRow tr = ds_tree_row(a.tt, a.ttr, a.ttw, a.ttrows, a.pos, a.ps, a.M, m);
+            const long first = ds_attn_first(a, s, tr);
+            for (int k = tid; k < a.nkp; k += 256) kp[k] = ds_attn_key(a, s, m, p, first, tr, k, nullptr);
+        } else {
         long lr = (long)a.cu[(long)(s + 1) * a.cs] - 1;
         lr = lr < 0 ? 0 : (lr >= a.M ? a.M - 1 : lr);
         const long last = a.pos[lr * a.ps];
@@ -1042,6 +1174,7 @@ __global__ __launch_bounds__(256) void ds41_attn_sparse_sink_kernel(DsAttnArgs a
                 }
             }
             kp[k] = ptr;
+        }
         }
         __syncthreads();
 
@@ -1722,6 +1855,11 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) {
     {
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, m);
         const long p = a.pos[m * a.ps];
+        if (a.tt) {   /* attn_sparse_sink_tree: the row's tree reading (ds_attn_key) */
+            const DsTreeRow tr = ds_tree_row(a.tt, a.ttr, a.ttw, a.ttrows, a.pos, a.ps, a.M, m);
+            const long first = ds_attn_first(a, s, tr);
+            for (int k = tid; k < nkq; k += NT) kp[k] = ds_attn_key(a, s, m, p, first, tr, k, zero);
+        } else {
         long lr = (long)a.cu[(long)(s + 1) * a.cs] - 1;
         lr = lr < 0 ? 0 : (lr >= a.M ? a.M - 1 : lr);
         const long last = a.pos[lr * a.ps];
@@ -1743,6 +1881,7 @@ __global__ __launch_bounds__(NT) void ds41_attn_dec_kernel(DsAttnArgsT<ORT> a) {
                 }
             }
             kp[k] = ptr;
+        }
         }
         const uint32_t* qrow = (const uint32_t*)(a.q + m * a.qr) + (long)hg0 * (D / 2);
         for (int i = tid; i < (QS ? 0 : HG * (D / 2)); i += NT) {
@@ -2506,8 +2645,10 @@ int64_t topk_split_bytes(long rows, long C, long K) {
     return (int64_t)rows * nch * K * 8 + (int64_t)rows * nch * 4 + (int64_t)rows * 4 + 16;
 }
 
-int index_score_body(const RadArgs* a, RadStream stream) {
-    if (!a || a->n_t < 7 || !a->t) return RAD_E_INVAL;
+/* index_score, and with `tree` index_score_tree (operands 8 the row table, 9 the in-tree keys): the
+ * scalar kernels at every height (libref's bits: a tree verify reproduces the chain its rows are). */
+int index_score_body(const RadArgs* a, RadStream stream, bool tree = false) {
+    if (!a || a->n_t < (tree ? 9 : 7) || !a->t) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
     const RadTensor &pos = a->t[4], &cu = a->t[5], &sc = a->t[6];
     const long long H = r4d_geti_or(a, "heads", 0), Dm = r4d_geti_or(a, "dim", 0);
@@ -2591,10 +2732,28 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.bshift = -1;
     for (int sh = 0; sh < 31; ++sh)
         if ((1LL << sh) == (long long)s.block) s.bshift = sh;
+    if (tree) {
+        const RadTensor& tt = a->t[8];
+        const RadTensor* tk = a->n_t > 9 && a->t[9].data ? &a->t[9] : nullptr;
+        if (!tt.data || tt.rank != 2 || tt.dtype != RAD_I32 || tt.shape[1] < 3 || tt.stride[1] != 1 ||
+            tt.shape[0] > INT_MAX || r4d_numel(&pos) > INT_MAX)
+            return R4D_NO(RAD_E_SHAPE);
+        if (tk && (tk->rank != 4 || tk->shape[1] != 1 || tk->shape[2] * tk->shape[3] != kslots ||
+                   tk->dtype != RAD_BF16 || !r4d_contig(tk) || !aligned(tk->data, 16) || tk->shape[0] > INT_MAX))
+            return R4D_NO(RAD_E_SHAPE);
+        s.tt = (const int*)tt.data;
+        s.ttr = (long)tt.stride[0];
+        s.ttw = (int)tt.shape[1];
+        s.ttrows = (int)tt.shape[0];
+        s.pos0 = (const int*)pos.data;
+        s.npos = (int)r4d_numel(&pos);
+        s.tkc = tk ? (const uint16_t*)tk->data : nullptr;
+        s.tkrows = tk ? (int)tk->shape[0] : 0;
+    }
     /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band on the scalar
      * kernel below (libref's bits). The form is picked by the pass height alone, with or without
-     * keep, so a kept entry's score is the unrestricted op's. */
-    if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
+     * keep, so a kept entry's score is the unrestricted op's. A tree takes the scalar kernels. */
+    if (!tree && s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
         (s.M + 7) / 8 <= 65535) {
         if (keep) {
             const dim3 grid((unsigned)((s.C + kIwKeepEB - 1) / kIwKeepEB), (unsigned)((s.M + 7) / 8));
@@ -2916,6 +3075,8 @@ int attn_setup(const RadArgs* a, DsAttnArgs* res) {
     return RAD_OK;
 }
 
+int attn_scalar(RadStream stream, const DsAttnArgs& s);
+
 int attn_body(const RadArgs* a, RadStream stream) {
     DsAttnArgs s{};
     {
@@ -2939,6 +3100,12 @@ int attn_body(const RadArgs* a, RadStream stream) {
             return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, false>), grid, dim3(128), (uint32_t)lds, s, sl2);
         }
     }
+    return attn_scalar(stream, s);
+}
+
+/* The scalar forms (libref's bits) at any height. */
+int attn_scalar(RadStream stream, const DsAttnArgs& s) {
+    const long long H = s.H;
     /* Head group and d split by how many workgroups the rows give. Every choice sums each output
      * in the same order, so the bits do not depend on it. */
     const long rows = s.M;
@@ -2962,6 +3129,34 @@ int attn_body(const RadArgs* a, RadStream stream) {
         case 2: return attn_emit<2, 1>(stream, s, gz);
         default: return attn_emit<1, 1>(stream, s, gz);
     }
+}
+
+/* attn_sparse_sink_tree: attn_sparse_sink's operands, then the row table (11) and the in-tree
+ * entries (12, ratio > 1), on the scalar forms at every height (libref's bits, so a tree row is the
+ * chain its path is, bit for bit). */
+int attn_tree_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
+    DsAttnArgs s{};
+    {
+        const int rc = attn_setup(a, &s);
+        if (rc != RAD_OK) return rc;
+    }
+    const RadTensor& tt = a->t[11];
+    const RadTensor* tc = a->n_t > 12 && a->t[12].data ? &a->t[12] : nullptr;
+    if (!tt.data || tt.rank != 2 || tt.dtype != RAD_I32 || tt.shape[1] < 3 || tt.stride[1] != 1 ||
+        tt.shape[0] > INT_MAX)
+        return R4D_NO(RAD_E_SHAPE);
+    if (tc && (!s.cc || tc->rank != 4 || tc->shape[1] != 1 ||
+               tc->shape[2] * tc->shape[3] != (long long)s.cslot * s.ratio || tc->dtype != RAD_BF16 ||
+               !r4d_contig(tc) || !aligned(tc->data, 16) || tc->shape[0] > INT_MAX))
+        return R4D_NO(RAD_E_SHAPE);
+    s.tt = (const int*)tt.data;
+    s.ttr = (long)tt.stride[0];
+    s.ttw = (int)tt.shape[1];
+    s.ttrows = (int)tt.shape[0];
+    s.tcc = tc ? (const uint16_t*)tc->data : nullptr;
+    s.tcrows = tc ? (int)tc->shape[0] : 0;
+    return attn_scalar(stream, s);
 }
 
 /* attn_sparse_sink_rope_roundtrip (lever K1 fold d): attn_sparse_sink over operands 0-10, then
@@ -3099,6 +3294,12 @@ extern "C" int64_t r4d_rad_ds41_index_topk_scratch(const RadArgs* a) {
     long long M = r4d_geti_or(a, "M", kDsSplitRows);
     if (M < 1 || M > kDsSplitRows) M = kDsSplitRows;
     return topk_split_bytes((long)M, (long)r4d_geti_or(a, "width", 0), (long)topk);
+}
+extern "C" int r4d_rad_ds41_attn_sparse_sink_tree(const RadArgs* a, RadStream stream) {
+    return attn_tree_body(a, stream);
+}
+extern "C" int r4d_rad_ds41_index_score_tree(const RadArgs* a, RadStream stream) {
+    return index_score_body(a, stream, true);
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream) {
     return attn_body(a, stream);

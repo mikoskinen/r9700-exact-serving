@@ -54,6 +54,7 @@
  */
 #include "ref_common.h"
 #include "ref_ops.h"
+#include "ref_tree.h"
 
 using namespace ref;
 
@@ -94,10 +95,14 @@ inline int64_t floor_mod(int64_t a, int64_t b) {    /* b > 0 */
  *                                          as the step that runs them will compute them. The
  *                                          window is the step's own.
  */
-int ref_ngram_ids(const RadArgs* a, RadStream) {
+/* ngram_ids, and with `tree_op` ngram_ids_tree: operand 11 (the row table, ref_tree.h) after the
+ * eleven. A tree row of depth d hashes the tokens of its path: shift k reads its ancestor at depth
+ * d - k's token while d - k >= 0 (an ancestor out of range reads eos), the committed id
+ * prev[ctx + d - k] past the root. The state's write-back is ngram_ids': every row in order. */
+static int ngram_ids_impl(const RadArgs* a, bool tree_op) {
     /* Eleven positions, four optional, so the optionals are tested one by one; `have()` would
      * refuse an absent optional operand. */
-    if (a->n_t < 10) return RAD_E_INVAL;
+    if (a->n_t < (tree_op ? 12 : 10)) return RAD_E_INVAL;
     const RadTensor* tok   = t_in(a, 0);
     const RadTensor* st    = t_in(a, 1);
     const RadTensor* cu    = t_in(a, 2);
@@ -148,6 +153,8 @@ int ref_ngram_ids(const RadArgs* a, RadStream) {
         if (nacc && eot > bos && ctx - 1 + (eot - bos) > W) return RAD_E_SHAPE;
     }
 
+    const RefTree tr(tree_op ? t_in(a, 11) : nullptr, tok);
+    if (tree_op && (!tr.tt || tr.W < 3)) return RAD_E_SHAPE;
     const int64_t ids_ld = rowoff(ids, 1, heads);
     const int64_t ahd_ld = ahead ? rowoff(ahead, 1, heads) : 0;
 
@@ -181,10 +188,19 @@ int ref_ngram_ids(const RadArgs* a, RadStream) {
              * back to eos, every deeper one does too. */
             int64_t sh[8];
             sh[0] = hist(p);
+            int64_t td = -1, tr0 = -1;
+            const bool tree = t < T && tr.row(bos + t, &td, &tr0);
             bool cut = false;
             for (int64_t k = 1; k < ngram; ++k) {
                 if (cut || sh[k - 1] == eos) { cut = true; sh[k] = eos; continue; }
-                sh[k] = hist(p - k);
+                if (tree && td - k >= 0) {
+                    const int64_t an = tr.anc(bos + t, td, td - k);
+                    sh[k] = an >= 0 && an < numel(tok) ? ld_int(tok->dtype, tok->data, offlin(tok, an)) : eos;
+                } else if (tree) {
+                    sh[k] = prev[ctx + td - k];
+                } else {
+                    sh[k] = hist(p - k);
+                }
             }
 
             /* One mix per n-gram order, extended in place: the (b+2)-gram's mix is the
@@ -231,3 +247,6 @@ int ref_ngram_ids(const RadArgs* a, RadStream) {
     }
     return RAD_OK;
 }
+
+int ref_ngram_ids(const RadArgs* a, RadStream) { return ngram_ids_impl(a, false); }
+int ref_ngram_ids_tree(const RadArgs* a, RadStream) { return ngram_ids_impl(a, true); }

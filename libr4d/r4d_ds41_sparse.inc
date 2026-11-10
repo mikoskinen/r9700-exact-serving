@@ -33,6 +33,20 @@ static const RadOperandSpec oDs41IndexScore[] = {
     { "bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "score", RAD_OPD_OUT, 0 }, { "keep", RAD_OPD_IN, 1 },
 };
+/* The tree verify's variants (lever T1): the op's operands, then the row table and the in-tree entries. */
+static const RadOperandSpec oDs41AttnSparseSinkTree[] = {
+    { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
+    { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
+    { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "tree", RAD_OPD_IN, 0 },
+    { "tree_cache", RAD_OPD_IN, 1 },
+};
+static const RadOperandSpec oDs41IndexScoreTree[] = {
+    { "q", RAD_OPD_IN, 0 },  { "w", RAD_OPD_IN, 0 },         { "index_cache", RAD_OPD_IN, 0 },
+    { "bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "score", RAD_OPD_OUT, 0 }, { "keep", RAD_OPD_IN, 1 },  { "tree", RAD_OPD_IN, 0 },
+    { "tree_cache", RAD_OPD_IN, 1 },
+};
 static const RadParamSpec pDs41IndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
     P_INT("topk_blocks"), P_INT("ratio") };
 static const RadOperandSpec oDs41IndexCand[] = {
@@ -103,6 +117,18 @@ SCHEMA("index_score", pDs41IndexScore, oDs41IndexScore,
        "key_format mxfp4: the cache holds each entry packed (entry_store format mxfp4: e2m1 codes, a ue8m0 "
        "scale a block of 32, 80 bytes for 128 values) and every score is the bf16 cache's, bit for bit, "
        "where the keys are quant_roundtrip(fp4_e2m1, ue8m0, 32) values."),
+SCHEMA("attn_sparse_sink_tree", pDs41AttnSparseSink, oDs41AttnSparseSinkTree,
+       "attn_sparse_sink over a tree verify: a tree row (tree_rows' table) of sequence s, anchor A = "
+       "positions[root], reads its window table from first = A + rows(s) - window_used[s] and a window "
+       "position j >= A at the slot position A + (its ancestor at depth j - A) - root; at depth >= 1 a "
+       "compressed entry c completing on its path is, at ratio 1 (c >= A + 1), the entry at its "
+       "ancestor's slot position, at ratio > 1 ((c + 1) ratio - 1 >= A + 1) block `ancestor` of "
+       "tree_cache ([rows, 1, ratio, slots / ratio], the comp cache's format). Every other key and row "
+       "is attn_sparse_sink's, bit for bit (the chain the row's path is)."),
+SCHEMA("index_score_tree", pDs41IndexScore, oDs41IndexScoreTree,
+       "index_score over a tree verify: a tree row's entry j completing on its path reads its key as "
+       "attn_sparse_sink_tree reads that entry (ratio 1: at its ancestor's slot position; ratio > 1: "
+       "block `ancestor` of tree_cache, the index cache's format); everything else is index_score's."),
 SCHEMA("index_candidates", pDs41IndexCand, oDs41IndexCand,
        "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
        "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is a bit a "
@@ -144,6 +170,24 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_score, nullptr, nullptr, nullptr,
   r4d_shape_index_score },
+{ "ds41_attn_sparse_sink_tree_d512_bf16", "attn_sparse_sink_tree", "attn",
+  "attn_sparse_sink over a tree verify's rows (lever T1): libref's key order and roundings at every "
+  "height (the scalar forms only), a tree row's keys through its path, so the chain its path is, bit "
+  "for bit",
+  "attn_sparse_sink's scalar forms (decode band up to 48 rows, the head-group kernel past it); the key "
+  "list read through the row table",
+  "bf16 q, caches, in-tree entries and out; f32 sinks; i32 tables, positions, selections, row table",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSink), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_tree, nullptr, nullptr, nullptr,
+  r4d_shape_attn_sparse_sink_tree },
+{ "ds41_index_score_tree_d128_bf16", "index_score_tree", "attn",
+  "index_score over a tree verify's rows (lever T1): the scalar kernels at every height (libref's "
+  "roundings and order), a tree row's in-path entries read through the row table",
+  "index_score's scalar and kept kernels",
+  "bf16 q, w, cache and in-tree keys; i32 tables, positions and row table; f32 score",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexScore), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_index_score_tree, nullptr, nullptr, nullptr,
+  r4d_shape_index_score_tree },
 { "ds41_index_candidates", "index_candidates", "select",
   "two-level top-k level one: block maxima, newest block pinned, exact top topk_blocks by radix "
   "select, ties to the lower block",

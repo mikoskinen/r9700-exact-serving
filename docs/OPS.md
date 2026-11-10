@@ -3594,6 +3594,69 @@ branch with no candidate left is -1 throughout. The engine compares them with th
 emits (a shadow of a position-1 tree, never verified). libr4d's row sums a candidate's edge in
 another order than `dflash_select`'s, so a near-tie may rank otherwise there.
 
+### Tree verify (DSpark)
+
+DeepSeek-V4.1's DSpark verified as a tree (lever T1, `rad_drafter_tree`): the walk's main chain and
+`B` alternative branches at position 1. A tree verify (RadBatch::spec_parent) runs node `j` of a
+sequence's proposal at row `j`, rotated at the anchor + its depth, its K / V stored at the anchor + `j`
+(siblings share a depth, so a position cannot address them). DeepSeek-V4.1's attention reads more than
+the window: compressed entries a compressor builds from `ratio` consecutive positions, an indexer that
+scores them, n-gram ids over the last tokens. Each of those reads a row's path, never the rows beside
+it, through the tree variants below; the plugin's own per-node state (in-tree compressed entries, the
+compressor's tail ring, the Engram window) moves into place after the acceptance, in the drafter's
+context pass.
+
+| op | params | operands |
+|---|---|---|
+| `tree_rows` | `M`(range) `width` | `spec_parent`, `cu_seqlens`, `positions` → `tree`, `spos`, `tmark` |
+| `attn_sparse_sink_tree` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out`; `tree`, `tree_cache`? |
+| `index_score_tree` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`?, `tree`, `tree_cache`? |
+| `qsa_work_tree` | `M`(range) `n` `ratio` `ring` `seqs` `work` `dtype` | `k`, `pos`, `cu`, `state`, `sidx`, `bt`, `rope`? → `stage`, `page`, `bpos`, `nc`; `tree` → `mpage`, `tpage` |
+| `ngram_ids_tree` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`?; `tree` |
+| `tree_commit_entries` | `M`(range) `ratio` | `tmark`, `positions`, `slot_mapping`, `scratch`, `cache`:inout |
+| `tree_commit_rows` | `M`(range) `n` `ring` `off`/opt | `tmark`, `positions`, `cu_seqlens`, `slot_mapping`, `sidx`, `state`:inout |
+| `dspark_tree_assemble` | `M`(range) `K` `B` `pitch` `n_alt` | `tokens`, `alt` → `prop`, `par` |
+
+**`tree_rows`** reads spec_parent (-1 a root, `p >= 0` the parent row `cu[s] + p`, which must precede
+the row in its sequence and be a tree row itself; anything else is an ordinary row) into a table, i32
+`[M, width]`: column 0 the node's depth (-1 ordinary; at most `width - 3`), 1 the root's row, `2 + x`
+the ancestor at depth `x` (`x = 0 .. depth`, the row itself last), the rest -1. `spos` is a tree row's
+slot position `positions[root] + (m - root)` (`positions[m]` otherwise), the position the tail store
+and anything else that stores by row writes at; `tmark` is 1 for a tree row of depth >= 1. A table row
+whose depth or root is out of range is an ordinary row, and an ancestor out of range names no row: every
+op reads any table the same way (libref's `ref_tree.h`, libr4d's kernels element for element).
+
+**The tree variants** read a tree row `m` (depth `d`, root `r0`, anchor `A = positions[r0]`) as the
+chain its path is: the window table of a tree sequence is based at `first = A + rows(s) - window_used[s]`
+(its rows store at row-indexed slots up to `A + rows - 1`), a window position `j >= A` at the slot
+position `A + (ancestor at depth j - A) - r0`; at depth >= 1 a compressed entry completing on its path
+is, at ratio 1 (`c >= A + 1`), the entry at its ancestor's slot position, and at ratio > 1
+(`(c + 1) ratio - 1 >= A + 1`) block `ancestor` of `tree_cache` (`[rows, 1, ratio, slots / ratio]`,
+the cache's own entry format, one entry a step row). `index_score_tree` reads keys the same way. Every
+other key, and every ordinary row, is the plain op's. The attention and the scores take the scalar
+kernels at every height (no WMMA form), so a tree row's output is the chain's, bit for bit.
+`qsa_work_tree` completes one block a tree row whose position does, in row order, its keys from the
+row's ancestors (q >= A) or the tail (`q % ring`); `page` as `qsa_work` (it says the block is
+computed), `mpage` the page for a depth-0 row and -1 past it, `tpage` the completing row at depth >= 1
+(the in-tree block its entry goes to). `ngram_ids_tree` hashes a tree row's path: shift `k` reads its
+ancestor at depth `d - k` while `d - k >= 0`, then the committed window.
+
+**The commits** run in the context pass after a tree verify, whose rows mirror the verify's: the root
+at the anchor, accepted path node `t` at `anchor + t + 1` and stored there, a rejected row stored
+nowhere (slot -1). `tree_commit_entries` copies the in-tree entry of every accepted tree row of depth
+>= 1 that completed a block to the cache block its slot names (`slot / ratio`). `tree_commit_rows`
+moves state rows of 4-byte words, per sequence and in row order: ring mode (the compressor's tail,
+`ring` its length) from `(positions[r0] + j) % ring`, where the verify's tail store left row `j`, to
+`(positions[r0] + t) % ring`, its position's row; linear mode (the Engram window, `off = ngram - 2`)
+from `off + j` to `off + t`. After both the state is the one a chain step of the accepted path leaves,
+at every row a later step reads.
+
+**`dspark_tree_assemble`** lays the proposal out: nodes `1..K` the walk (parent `n - 1`), then the `B`
+branches depth-major -- node `K + (k-1) B + b + 1` is `alt[s, b K + k - 1]` (`dspark_alt`'s), parent
+0 at `k = 1` and `n - B` after; an alternative below 0 (none left), or `b >= n_alt`, is the walk's own
+token at that depth. Nodes past `K + B K` repeat the walk's last token (parent `n - 1`). A prefix of
+`K + B L` nodes is the tree with branches of depth `L`.
+
 ### DFlash2
 
 | op | params | operands |

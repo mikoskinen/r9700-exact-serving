@@ -2127,6 +2127,10 @@ TEST(op_vocabulary) {
         "dflash_tree", "attn_paged_tree", "attn_paged_anchor_window",
         /* DSpark beside its walk: the confidence head and the shadow tree's branches. */
         "dspark_conf", "dspark_alt",
+        /* A tree verify for DSpark (lever T1): the rows' table, the tree-aware attention, indexer,
+         * compressor gather and n-gram ids, the context pass's commits, the tree proposal. */
+        "tree_rows", "attn_sparse_sink_tree", "index_score_tree", "qsa_work_tree", "ngram_ids_tree",
+        "tree_commit_entries", "tree_commit_rows", "dspark_tree_assemble",
         "rmsnorm_had_quant_i8",
         "gated_had_quant_i8",
         "dequant", "dequant_w4",
@@ -11290,6 +11294,22 @@ std::vector<Geo> geometries() {
                                  .i("n_vocab", 30).i("anchor_stride", 3).s("dtype", "bf16")),
         G("dspark_alt", "M", 2, a.i("M", R).i("steps", 3).i("top_k", 4).i("rank", 8)
                                 .i("n_vocab", 30).i("anchor_stride", 3).i("n_alt", 2).s("dtype", "bf16")),
+        G("tree_rows", "M", 4, a.i("M", R).i("width", 8)),
+        G("attn_sparse_sink_tree", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("window", 4).i("ratio", 2)
+                                           .i("topk", 3).d("scale", 0.35).s("dtype", "f32")),
+        G("attn_sparse_sink_tree", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("window", 4).i("ratio", 1)
+                                           .i("topk", 3).d("scale", 0.35).s("dtype", "f32")),
+        G("index_score_tree", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 2).i("width", 5)
+                                      .d("wscale", 0.25).s("dtype", "bf16")),
+        G("index_score_tree", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 1).i("width", 9)
+                                      .d("wscale", 0.25).s("dtype", "bf16").i("block", 2)),
+        G("qsa_work_tree", "M", 6, a.i("M", R).i("n", 32).i("ratio", 4).i("ring", 6).i("seqs", 2)
+                                   .i("work", 8).s("dtype", "bf16")),
+        G("ngram_ids_tree", "M", 4, a.i("M", R).i("heads", 2).i("ngram", 3).i("eos", 1)),
+        G("tree_commit_entries", "M", 4, a.i("M", R).i("ratio", 2)),
+        G("tree_commit_rows", "M", 4, a.i("M", R).i("n", 2).i("ring", 4)),
+        G("tree_commit_rows", "M", 4, a.i("M", R).i("n", 1).i("ring", 0).i("off", 2)),
+        G("dspark_tree_assemble", "M", 2, a.i("M", R).i("K", 5).i("B", 3).i("pitch", 20).i("n_alt", 3)),
         G("gemm_nt", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_bias", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "f32")),
         G("gemm_nt_q", "M", 3, a.i("M", R).i("N", 20).i("K", 256).i("group", 128).s("dtype", "fp8a8")),
