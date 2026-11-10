@@ -26,6 +26,7 @@
 #include "runtime/residency.h"
 #include "runtime/rowprefetch.h"
 #include "runtime/wtab.h"
+#include "place/misslog.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -829,6 +830,71 @@ TEST(a_bank_is_credited_once_for_every_pass_of_its_step) {
     CHECK_OK(f.step(1, 9, report));
     CHECK_OK(f.step(1, 9 + rad::kRouteBanks, report));
     CHECK_EQ(f.ctx.route_dropped(), (uint64_t)1);
+}
+
+/* RADIANCE_DEBUG_MISS_LOG (place/misslog.h) on the route ring's own rows, drained the way
+ * Engine::tiering_dispatch drains them: each histogram classed by the tiers snapshotted when its
+ * pass was issued, a move published since counted apart (`mv`), the draft head's layer on a line of
+ * its own, and the context synchronises nothing for it. */
+TEST(the_miss_log_classes_the_route_rings_rows_by_their_passes_tiers) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    CHECK_OK(f.start());
+    REQUIRE_EQ(f.ctx.n_route_layers(), 2);
+    REQUIRE_EQ(f.ctx.route_n_expert(), (int64_t)4);
+
+    /* Layer 0 is the trunk's, layer 1 a draft head's; unit = layer * 4 + expert, 2 KiB each. */
+    std::vector<int32_t> unit_of(8);
+    for (int u = 0; u < 8; ++u) unit_of[(size_t)u] = u;
+    std::vector<rad::Tier> tier(8, rad::Tier::VRAM);
+    tier[1] = rad::Tier::HostPinned;
+    for (int u = 4; u < 8; ++u) tier[(size_t)u] = rad::Tier::HostPinned;
+    const auto tier_of = [&](int32_t u) { return tier[(size_t)u]; };
+    rad::MissRank m;
+    m.init(0, 2, 1, 4, unit_of, std::vector<int64_t>(8, 2048), std::vector<uint8_t>(8, 0));
+
+    int32_t c0[4] = { 3, 1, 0, 0 }, c1[4] = { 0, 0, 2, 0 }, c2[4] = { 0, 1, 0, 1 };
+    RadRouting r{};
+    r.n_expert = 4;
+    r.top_k = 2;
+    const int64_t syncs0 = f.ctx.host_syncs();
+
+    m.issued(0, 0, 1, 1, 1, tier_of);
+    r.expert_count = c0;
+    CHECK_OK(f.step(1, 0, [&](Ctx& c) { CHECK_OK(c.route_report(0, &r)); }));
+    m.ran(0, 0, false);
+    m.issued(0, -1, 1, 1, 1, tier_of);
+    r.expert_count = c1;
+    CHECK_OK(f.step(1, 0, [&](Ctx& c) { CHECK_OK(c.route_report(1, &r)); }));
+    tier[1] = rad::Tier::VRAM;                         /* step 0's dispatch promotes (0, 1) */
+    m.issued(1, 0, 1, 1, 1, tier_of);
+    r.expert_count = c2;
+    CHECK_OK(f.step(1, 1, [&](Ctx& c) { CHECK_OK(c.route_report(0, &r)); }));
+    m.ran(1, 0, false);
+
+    /* Step 2's dispatch: every landed bank of each layer, oldest first. */
+    int found = 0;
+    std::vector<int> seen(2, -1);
+    for (int spin = 0; spin < 1000000 && found < 3; ++spin) {
+        for (int l = 0; l < 2; ++l)
+            for (int b; (b = f.ctx.next_histogram(l, seen[(size_t)l], 2)) >= 0;) {
+                const int step = f.ctx.last_histogram_step(l, b);
+                m.credit(l, step, f.ctx.last_histogram(l, b), 4, f.ctx.last_histogram_reports(l, b),
+                         2, tier_of);
+                seen[(size_t)l] = step;
+                f.ctx.mark_credited(l, b);
+                ++found;
+            }
+        if (found < 3) std::this_thread::yield();
+    }
+    REQUIRE_EQ(found, 3);
+    m.end_drain();
+    std::string out;
+    m.take(&out);
+    CHECK_EQ(out, std::string("0 decode 0 1 1 1 0 0 2 1 1 0 1 2 1 0:1.1\n"
+                              "0 draft 0 1 1 1 0 0 1 0 1 0 1 2 0 1:0.1\n"
+                              "1 decode 0 1 1 1 0 0 2 2 0 0 0 0 0 0:2\n"));
+    CHECK_EQ(f.ctx.host_syncs() - syncs0, (int64_t)0);
 }
 
 /* Every event the context creates at bind is one Ctx::shutdown destroys: the routing ring holds
