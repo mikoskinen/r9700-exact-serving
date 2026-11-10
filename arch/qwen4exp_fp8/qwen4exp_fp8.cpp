@@ -1531,12 +1531,37 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
     return d;
 }
 
+/* fn4 SP-hc SPEED PROBE (10.11.2026, measurement only -- WRONG OUTPUT): the sequence-parallel gated residual's compute
+ * without its collectives' new form. With the flag on, every hc write / read between two blocks of a pipelined prefill
+ * step runs on this rank's quarter of the piece's rows only (rows [r0 + rank q, r0 + (rank + 1) q), q = ceil(rn /
+ * world)), the all-reduces stay as they are (a two-shot = the reduce-scatter + all-gather sequence-parallel would
+ * issue, the same bytes), so a step's critical path is SP's -- reduce, the hc ops on T / world rows, gather -- less the
+ * gather's re-quantisation; the other ranks' rows of the block input stay stale. Decode and serial steps unchanged.
+ * Core switch "hc_spprobe" -> this plugin's rad_fn4_switch; RADIANCE_FN4_SPPROBE=1 at start. */
+static std::atomic<int>& fn4_spprobe_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_SPPROBE") ? 1 : 0};
+    return f;
+}
+
 static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, R = m.moecfg.rows;
     const int64_t K = (T + R - 1) / R;
     auto r0 = [&](int64_t p) { return p * R; };
     auto rn = [&](int64_t p) { return T - p * R < R ? T - p * R : R; };
+    /* fn4 SP-hc speed probe: the hc ops' rows of piece p (this rank's quarter while the probe is on) */
+    const bool spp = g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
+    auto hq0 = [&](int64_t p) {
+        if (!spp) return r0(p);
+        const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
+        return r0(p) + (lo < rn(p) ? lo : rn(p) - 1);
+    };
+    auto hqn = [&](int64_t p) {
+        if (!spp) return rn(p);
+        const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
+        const int64_t n = rn(p) - lo < q ? rn(p) - lo : q;
+        return n > 0 ? n : (int64_t)1;
+    };
     /* A collective on the second lane, ordered behind lane 0 where it reads what lane 0 just
      * wrote (a join to a lane not yet built is a no-op). */
     auto on1 = [&](bool behind0, auto&& issue) {
@@ -1599,8 +1624,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 behind = true;
                 issued = p + 2;
             }
-            const bool ss_mix = l.hc_mix.write(c, T, r0(p), rn(p));
-            l.hc_ffn.read(c, T, r0(p), rn(p), ss_mix);
+            const bool ss_mix = l.hc_mix.write(c, T, hq0(p), hqn(p));
+            l.hc_ffn.read(c, T, hq0(p), hqn(p), ss_mix);
             l.mlp.pass(c, T, r0(p), rn(p), false);
             /* Lane 0 waits here for the next piece's mixer all-reduce and the last piece's MoE
              * one, both issued before this pass; lane 1 then takes this piece's behind its
@@ -1615,10 +1640,10 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         const bool ple_next = nx && li + 1 == m.ple_layer;
         for (int64_t p = 0; p < K; ++p) {
             if (p == K - 1) wait1();
-            const bool ss_ffn = l.hc_ffn.write(c, T, r0(p), rn(p));
+            const bool ss_ffn = l.hc_ffn.write(c, T, hq0(p), hqn(p));
             /* The projection of this piece, before the next layer reads it. */
             const bool projected = l.proj.step(c, batch, r0(p), rn(p));
-            if (nx && !ple_next) nx->hc_mix.read(c, T, r0(p), rn(p), ss_ffn && !projected);
+            if (nx && !ple_next) nx->hc_mix.read(c, T, hq0(p), hqn(p), ss_ffn && !projected);
         }
         if (ple_next) {
             m.ple.step(c, batch);
@@ -1837,6 +1862,11 @@ RAD_ARCH_PLUGIN(qwen4exp_fp8, "qwen4exp", "", "0.1.0",
  * picks MoeFP8's inverse twins when the blocks were declared switchable (RADIANCE_FN4_SWITCHABLE=1 at
  * start); refused (-1) otherwise. */
 extern "C" int rad_fn4_switch(const char* name, int value) {
+    if (name && std::strcmp(name, "hc_spprobe") == 0) {   /* fn4 SP-hc speed probe (step_pipelined) */
+        if (value < 0 || value > 1) return -1;
+        qwen4exp_fp8::fn4_spprobe_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (!name || std::strcmp(name, "gather_inv") != 0) return 0;
     if (!qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SWITCHABLE")) return -1;
     rad::arch::fn4_gather_inv_flag().store(value ? 1 : 0, std::memory_order_relaxed);
