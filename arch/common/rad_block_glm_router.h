@@ -17,6 +17,11 @@ struct GlmRouter {
         /* The score function by name (router_scored_topk: "sqrtsoftplus" for DeepSeek-V4); null is
          * GLM's sigmoid (router_sigmoid_topk). */
         const char* score = nullptr;
+        /* The projection stored as bf16 rather than f32, for a checkpoint whose router is BF16
+         * (DeepSeek-V4.1, RADIANCE_DS41_ROUTER_BF16): gemm_nt_f32 widens each weight to the same
+         * f32 value in its loop, so the logits are the f32 projection's bit for bit, at half the
+         * bytes. 0 keeps f32. */
+        int bf16 = 0;
     };
     struct Src {
         const char *weight = nullptr, *correction = nullptr;
@@ -45,8 +50,8 @@ struct GlmRouter {
         const char *pn = nm.f("%s.weight", name), *cn = nm.f("%s.correction", name);
         RAD_ARCH_TRY(map_copy(b, pn, src.weight));
         RAD_ARCH_TRY(map_copy(b, cn, src.correction));
-        projection = decl_w(b, pn, RAD_F32, { c.experts, g.n_embd }, RAD_ACCESS_PER_TOKEN,
-                            RAD_SHARD_NONE, grp_layer(layer));
+        projection = decl_w(b, pn, c.bf16 ? RAD_BF16 : RAD_F32, { c.experts, g.n_embd },
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(layer));
         correction = decl_w(b, cn, RAD_F32, { c.experts }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                             grp_layer(layer));
         if (!projection || !correction) return RAD_E_INVAL;

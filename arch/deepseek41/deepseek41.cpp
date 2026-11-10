@@ -1172,6 +1172,20 @@ static int ds41_router_fuse() {
     return on ? 1 : 0;
 }
 
+/* RADIANCE_DS41_ROUTER_BF16=1 (lever VA "bf16"; read at declare): the f32 weights whose checkpoint is
+ * BF16 -- every MoE router projection (trunk and DSpark, [n_expert, n_embd]) and the ratio > 1
+ * compressors' fused kv|gate projection ([2 hd, n_embd]) -- are stored as bf16 instead of f32, half
+ * the bytes (~150 + 30 MiB a card). Exact: the checkpoint holds them as BF16 (the release's
+ * ffn.gate.weight and attn.compressor.wkv / wgate; the container's f32 router planes have zero low
+ * halves), the loader stores those values unchanged (a narrowing of an exact bf16 value is that
+ * value; the compressor's bf16 plane is no longer widened), and gemm_nt_f32 widens each weight to
+ * that same f32 value before the same fmaf in the same order (libr4d gemm_f32_wval, held byte for
+ * byte to the f32 storage by tests/r4d_emu/test_ds41vram.cpp). Unset or anything but "1": f32. */
+static int ds41_router_bf16() {
+    static const int on = [] { const char* e = std::getenv("RADIANCE_DS41_ROUTER_BF16"); return e && e[0] == '1' && !e[1]; }();
+    return on ? 1 : 0;
+}
+
 /* A compressed latent entry's bf16 slots: its hd values, or its packed bytes / 2 (nvfp4). */
 static int64_t latent_slots(const Model& m, int64_t hd) {
     return m.lnv ? (hd / 2 + hd / 16 + 15) / 16 * 16 / 2 : hd;
@@ -1584,8 +1598,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                 const char* cn = nm.f("blk.%d.attn_compressor_kvg.weight", l);
                 DS_TRY(map_concat(b, cn, { ckpt_name(nm.f("blk.%d.attn_compressor_kv.weight", l)),
                                            ckpt_name(nm.f("blk.%d.attn_compressor_gate.weight", l)) }));
-                L.comp_w = decl_w(b, cn, RAD_F32, { 2 * hd, D }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
-                                  grp);
+                L.comp_w = decl_w(b, cn, ds41_router_bf16() ? RAD_BF16 : RAD_F32, { 2 * hd, D },
+                                  RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp);
                 L.c_gemm = op(b, "gemm_nt_f32",
                               { RAD_RANGE("M", 1, T), RAD_INT("N", 2 * hd), RAD_INT("K", D),
                                 RAD_STR("dtype", "bf16") },
@@ -1822,6 +1836,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
     s.cfg.router_score = "sqrtsoftplus";
+    s.cfg.router_bf16 = ds41_router_bf16();
     s.cfg.router_fuse = ds41_router_fuse();
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
@@ -2058,6 +2073,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.norm_topk = c.norm_topk;
     s.cfg.sigmoid_router = 1;
     s.cfg.router_score = "sqrtsoftplus";
+    s.cfg.router_bf16 = ds41_router_bf16();
     s.cfg.router_fuse = ds41_router_fuse();
     s.cfg.route_scale = c.route_scale;
     s.cfg.swiglu_limit = c.swiglu_limit;
