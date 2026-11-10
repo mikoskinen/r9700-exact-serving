@@ -3617,6 +3617,11 @@ static int hc_upmix() {
  * 2 the down product, 4 the split-K reduce, 8 the up-mix, 16 the codes. A mask other than 31
  * leaves the outputs incomplete; r4d_selftest --perfhcv times the cumulative masks. */
 static std::atomic<int> g_hc_pf2_stages{31};
+/* fn4 P-1 reading hook (measurement only, r4d_hc_pf2_abl): the 32-row PF2 down product (hc_readv bit 1) with parts
+ * DELETED, to see which resource binds it -- 1 the B fragment loads (register values that vary by step), 2 the A loads
+ * from `h` (register values; the LDS staging stays), 4 the WMMAs (the fragments still read and consumed), 8 the slice
+ * barrier. Any value but 0 makes wrong output; r4d_selftest --perfhcd times the arms. */
+static std::atomic<int> g_hc_pf2_abl{0};
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
@@ -5279,7 +5284,7 @@ void hc_pf2_prep_kernel(const unsigned short* __restrict__ h, float* __restrict_
  *
  * Each accumulator sees its chunk's K steps in ascending order from zero with the wide form's
  * fragments, so partials (or the one-chunk epilogue) match. */
-template <int RT_, bool FS = false>
+template <int RT_, bool FS = false, int ABL = 0>
 __device__ __forceinline__ void hc_down_pf2_body(const unsigned short* __restrict__ h, const float* __restrict__ w,
                         const uint4* __restrict__ plane, const float* __restrict__ scalein,
                         unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
@@ -5340,12 +5345,17 @@ __device__ __forceinline__ void hc_down_pf2_body(const unsigned short* __restric
         const int c = (int)(k0 / n);
 #pragma unroll
         for (int i = 0; i < kAV; ++i) {
+            if constexpr ((ABL & 2) != 0) {   /* P-1 reading: no A loads */
+                pa[i] = make_uint4((unsigned)k0 ^ 0x3f803f80u, (unsigned)i, (unsigned)tid, 0x3f803f80u);
+                psc[i] = 1.0f;
+                continue;
+            }
             pa[i]  = *(const uint4*)(h + arow[i] * hrow + k0 + k8a);
             if constexpr (FS) psc[i] = s_sc[(arow[i] - r0) * kHcMax + c];
             else              psc[i] = scalein[arow[i] * kHcMax + c];
         }
 #pragma unroll
-        for (int e = 0; e < 8; ++e) pw[e] = w[k0 + k8a + e];
+        for (int e = 0; e < 8; ++e) pw[e] = (ABL & 2) ? 0.5f : w[k0 + k8a + e];
     };
     auto stageA = [&](unsigned short* dst) {
 #pragma unroll
@@ -5372,7 +5382,7 @@ __device__ __forceinline__ void hc_down_pf2_body(const unsigned short* __restric
     for (int s = 0; s < KST; ++s)
 #pragma unroll
         for (int i = 0; i < NW; ++i)
-            rb[s][i] = live[i] ? bp[i][(long)s * kWave] : make_uint4(0u, 0u, 0u, 0u);
+            rb[s][i] = live[i] && !(ABL & 1) ? bp[i][(long)s * kWave] : make_uint4((unsigned)s, (unsigned)i, (unsigned)lane, 0u);
 
     v8f acc[MT][NW];
 #pragma unroll
@@ -5401,12 +5411,18 @@ __device__ __forceinline__ void hc_down_pf2_body(const unsigned short* __restric
                 union { uint4 q; v8bf f; } bu;
                 bu.q = rb[s][i];
 #pragma unroll
-                for (int m = 0; m < MT; ++m) acc[m][i] = mma(af[m], bu.f, acc[m][i]);
-                rb[s][i] = bp[i][(tn * KST + s) * kWave];
+                for (int m = 0; m < MT; ++m) {
+                    if constexpr ((ABL & 4) != 0)   /* P-1 reading: no WMMA, the fragments still consumed */
+                        acc[m][i][m & 7] += __uint_as_float(bu.q.x ^ bu.q.w) + (float)af[m][i & 7];
+                    else
+                        acc[m][i] = mma(af[m], bu.f, acc[m][i]);
+                }
+                if constexpr ((ABL & 1) != 0) rb[s][i].x += (unsigned)tn;   /* P-1 reading: no B loads */
+                else rb[s][i] = bp[i][(tn * KST + s) * kWave];
             }
         }
         stageA(sA + ((t + 1) & 1) * (RT * kTAP));
-        __syncthreads();
+        if constexpr ((ABL & 8) == 0) __syncthreads();
     }
 
     const float inv_hc = 1.0f / (float)hc;
@@ -5456,6 +5472,18 @@ void hc_down_pf2_fs_kernel(const unsigned short* __restrict__ h, const float* __
                            long irow, long kc, float wadd, float* __restrict__ scaleout, float eps) {
     hc_down_pf2_body<RT, true>(h, w, plane, scalein, dout, inj, part, rows, n, hc, lr, ncol, ntt, hrow,
                                irow, kc, wadd, scaleout, eps);
+}
+/* fn4 P-1 reading arms (r4d_hc_pf2_abl): the 32-row form with parts deleted. */
+template <int ABL>
+__global__ __launch_bounds__(kThreads)
+void hc_down_pf2_abl_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                            const uint4* __restrict__ plane, const float* __restrict__ scalein,
+                            unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                            float* __restrict__ part,
+                            long rows, long n, int hc, long lr, long ncol, long ntt, long hrow,
+                            long irow, long kc, float wadd) {
+    hc_down_pf2_body<32, false, ABL>(h, w, plane, scalein, dout, inj, part, rows, n, hc, lr, ncol, ntt, hrow,
+                                     irow, kc, wadd);
 }
 __global__ __launch_bounds__(kThreads)
 void hc_down_pf2_r32_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
@@ -6162,7 +6190,23 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
                        dim3((unsigned)((rows + (r32 ? 31 : kPf2RT - 1)) / (r32 ? 32 : kPf2RT)), (unsigned)ks),
                        dim3(kThreads), 0, h, w, (const uint4*)plane, (const float*)scale, dbuf, inj,
                        kpart, rows, n, hc, lr, ncol, ntt, hrow, irow, kc, wadd, scale, eps);
-    else if ((stg & 2) && r32)
+    else if ((stg & 2) && r32 && g_hc_pf2_abl.load(std::memory_order_relaxed)) {   /* fn4 P-1 reading arms */
+        const int abl = g_hc_pf2_abl.load(std::memory_order_relaxed);
+        const dim3 gr((unsigned)((rows + 31) / 32), (unsigned)ks);
+#define HC_PF2_ABL(A_) hipLaunchKernelGGL((hc_down_pf2_abl_kernel<A_>), gr, dim3(kThreads), 0, (hipStream_t)s, h, w, \
+                                          (const uint4*)plane, (const float*)scale, dbuf, inj, kpart, rows, n, hc, lr, \
+                                          ncol, ntt, hrow, irow, kc, wadd)
+        switch (abl) {
+            case 1: HC_PF2_ABL(1); break;
+            case 2: HC_PF2_ABL(2); break;
+            case 3: HC_PF2_ABL(3); break;
+            case 4: HC_PF2_ABL(4); break;
+            case 8: HC_PF2_ABL(8); break;
+            case 12: HC_PF2_ABL(12); break;
+            default: HC_PF2_ABL(15); break;
+        }
+#undef HC_PF2_ABL
+    } else if ((stg & 2) && r32)
         (void)R4D_EMIT(s, &hc_down_pf2_r32_kernel, dim3((unsigned)((rows + 31) / 32), (unsigned)ks),
                        dim3(kThreads), 0, h, w, (const uint4*)plane, (const float*)scale, dbuf, inj,
                        kpart, rows, n, hc, lr, ncol, ntt, hrow, irow, kc, wadd);
@@ -7043,6 +7087,7 @@ extern "C" void r4d_hc_mix_ctr_release() {
 }
 extern "C" void r4d_hc_upmix(int v) { g_hc_upmix.store((v < 0 || v > 15 || (v & 7) > 5) ? 0 : v, std::memory_order_relaxed); }
 extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (m & 31), std::memory_order_relaxed); }
+extern "C" void r4d_hc_pf2_abl(int m) { g_hc_pf2_abl.store(m < 0 ? 0 : (m & 15), std::memory_order_relaxed); }
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
  * parked): hc_read's two forms, hc_write's eight-wide form, hc_read's faster forms (hc_readv) and the
  * all-reduce lane's thread count (ar_lanethreads, r4d_ar_entry.hip). 1 = applied, 0 = not a libr4d switch. */

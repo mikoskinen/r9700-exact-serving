@@ -742,6 +742,7 @@ void r4d_hc_readv(int v);
 // Measurement hook: the PF2 launches that run (1 prologue, 2 down, 4 reduce, 8 up-mix, 16 codes);
 // anything but 31 leaves the outputs incomplete. r4d_selftest --perfhcv times cumulative masks.
 void r4d_hc_pf2_stages(int mask);
+void r4d_hc_pf2_abl(int mask);   /* fn4 P-1 reading arms (measurement only; r4d_hc_bf16.hip) */
 // Test hook (fn4 hc_upmix): the up-mix's tile, same bytes -- value & 7 PF2's form (0 stock, 1-4 the
 // hc_up_mix_pf3_kernel variants), bit 3 the 33-64-row decode up-mix at the 64-row tile pipelined (with
 // hc_readv bit 0); overrides RADIANCE_FN4_HC_UPMIX. r4d_selftest compares their bytes.

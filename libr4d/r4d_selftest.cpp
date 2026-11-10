@@ -151,6 +151,7 @@ struct Plugin {
     void (*write_hc_vec)(int) = nullptr;   /* optional (fn4 hcw) */
     void (*readv_hc)(int) = nullptr;       /* optional (fn4 hc_readv) */
     void (*pf2_stages_hc)(int) = nullptr;  /* optional (fn4 hc_readv timing) */
+    void (*pf2_abl_hc)(int) = nullptr;     /* optional (fn4 P-1 reading arms, --perfhcd) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
     void (*pin_qsel)(int) = nullptr;
@@ -231,6 +232,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->write_hc_vec = (void (*)(int))dlsym(pl->h, "r4d_hc_write_vec");
     pl->readv_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_readv");
     pl->pf2_stages_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_pf2_stages");
+    pl->pf2_abl_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_pf2_abl");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
@@ -20876,7 +20878,7 @@ static void hc_readv_case(const Plugin& pl, int64_t M, bool i8) {
 /* --perfhcv M [iters]: hc_read_e4m3 at M rows with F1n, the stock forms against hc_readv 3, each
  * timed as one op (cold under --cold), and from 512 rows PF2's launches one stage at a time
  * (cumulative masks of r4d_hc_pf2_stages, so a stage's time is the difference). */
-static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
+static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8, int mode = 0) {
     const std::string nm = fmt("hc_read_e4m3 timing at M=%lld", (long long)M);
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
     if (!r || !pl.readv_hc || !pl.norm_hc_wave) { skip(nm.c_str(), "row absent or no r4d_hc_readv"); return; }
@@ -20950,6 +20952,32 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
         if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
     }
     pl.norm_hc_wave(1);
+    if (mode == 1) {   /* --perfhcd (fn4 P-1 reading): PF2's 32-row down product with parts deleted */
+        if (M < 512 || !pl.pf2_stages_hc || !pl.pf2_abl_hc) { skip(nm.c_str(), "M < 512 or no r4d_hc_pf2_abl"); return; }
+        static const int kArm[8] = { 0, 1, 2, 3, 4, 8, 12, 15 };
+        static const char* const kName[8] = { "stock r32", "no B loads", "no A loads", "no A+B loads", "no WMMA",
+                                               "no barrier", "no WMMA+barrier", "all four" };
+        for (int v : { 3, 1 }) {   /* hc_readv 3: the 32-row down (the stack's); 1: the 64-row stock for scale */
+            pl.readv_hc(v);
+            for (int k = 0; k < (v == 3 ? 8 : 1); ++k) {
+                pl.pf2_abl_hc(kArm[k]);
+                pl.pf2_stages_hc(1);
+                const double t1 = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+                pl.pf2_stages_hc(3);
+                const double t3 = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+                std::printf("  PF2 down M=%lld hc_readv %d %-16s (abl %2d): down %.2f us (prologue %.2f, both %.2f)%s\n",
+                            (long long)M, v, v == 3 ? kName[k] : "stock 64-row", kArm[k], t3 - t1, t1, t3,
+                            g_cold > 0 ? " cold" : " warm");
+            }
+            pl.pf2_abl_hc(0);
+        }
+        pl.pf2_stages_hc(31);
+        pl.readv_hc(0);
+        pl.norm_hc_wave(0);
+        (void)hipStreamDestroy(hs);
+        ok(nm.c_str(), true);
+        return;
+    }
     double us[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     for (int v : { 0, 1, 2, 3, 7 }) {
         pl.readv_hc(v);
@@ -35475,6 +35503,8 @@ static void usage(void) {
                 "             that serves M (fn4), and from 512 rows the up-mix stage alone.\n"
                 "  --perfhcv M [iters]:  hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows with F1n,\n"
                 "             the stock forms against hc_readv 1 / 2 / 3 (fn4), and PF2's stages from 512.\n"
+                "  --perfhcd M [iters]:  fn4 P-1 reading: PF2's 32-row down product (hc_readv 3) with its B loads,\n"
+                "             A loads, WMMAs and slice barrier deleted (r4d_hc_pf2_abl; wrong output, timing only).\n"
                 "  --perfhcq M [iters]:  hc_read_e4m3 at M rows (F1n, hc_readv 3), the codes stage at 1 / 2 / 4 / 5\n"
                 "             groups a wave (fn4 W2), and from 512 rows PF2's codes stage alone.\n"
                 "  --perfhcs M [iters]:  hc_write + hc_read_e4m3 at Qwen3.8-Flash-Next's shape and M rows,\n"
@@ -35612,6 +35642,8 @@ int main(int argc, char** argv) {
     int hcw_it = 50;
     long long hcv_m = 0;
     int hcv_it = 50;
+    long long hcd_m = 0;
+    int hcd_it = 50;
     long long hcs_m = 0;
     int hcs_it = 50;
     long long hcq_m = 0;
@@ -35897,6 +35929,11 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hcv_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcv_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfhcd")) {
+            /* fn4 P-1 reading: PF2's 32-row down product with parts deleted, at M rows. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            hcd_m = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcd_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhcq")) {
             /* The codes stage's groups a wave (fn4 W2) at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -36018,6 +36055,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("gated residual read timing (hc_upmix)", "built without HIP");
+#endif
+        return 0;
+    }
+    if (hcd_m) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_readv_perf(pl, hcd_m, hcd_it, true, 1);
+        dfree_all();
+#else
+        skip("gated residual read timing (hc_readv)", "built without HIP");
 #endif
         return 0;
     }
