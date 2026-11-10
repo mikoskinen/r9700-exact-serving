@@ -42,6 +42,7 @@
 #include "r4d_ds41_ggml_mr.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -3615,6 +3616,9 @@ int gg_weight2(const RadTensor* w, const GgType* gt, long long N, long long K, i
     return R4D_NO(RAD_E_DTYPE);
 }
 
+int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long x_ld, int x_al, const uint8_t* wd,
+                long long w_ld, void* yd, long long y_ld, long long M, long long N, long long K);
+
 /* gemm_nt_ggml and logits_gemm_ggml: y[M, N] = x[M, K] . w[N, K]^T. */
 int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool logits, bool gemv) {
     if (!a || a->n_t < 3) return R4D_NO(RAD_E_INVAL);
@@ -3636,25 +3640,31 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
     if (rc != RAD_OK) return rc;
     const long long x_ld = M > 1 ? x->stride[0] : K, y_ld = M > 1 ? y->stride[0] : N;
     const int x_al = gg_al16(x->data, x_ld) ? 1 : 0;
+    (void)gemv;
+    return gg_gemm_run(s, ty, logits, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld, y->data,
+                       y_ld, M, N, K);
+}
+
+/* gg_gemm's launch once its operands are resolved (also the second launch of the K1 folds' unfused passes). */
+int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long x_ld, int x_al, const uint8_t* wd,
+                long long w_ld, void* yd, long long y_ld, long long M, long long N, long long K) {
     const long long tb = gg_r16(gg_tab_bytes(ty));
     /* Every pass of up to kGgDecodeRows rows runs the decode kernel, whichever row (gemv or tiled)
      * the engine picked: a row's outputs are then the same bits whatever else is in the pass
      * (decode, a speculative verify pass and a short prefill agree); the tiled kernel sums in
      * another order. */
-    (void)gemv;
     if (M <= kGgDecodeRows) {
         /* lever D2 (r4d_ds41_ggml_mr.hip): the multi-row form when it is switched on or pinned, for the block types
          * and widths it takes (it declines the rest to the stock kernel below); the same bits as the stock form. */
         if (r4d_gg_mr_on()) {
-            const R4dGgMrCall c{ ty, logits, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld,
-                                 y->data, y_ld, (int)M, (int)N, (int)K };
+            const R4dGgMrCall c{ ty, logits, xd, x_ld, x_al, wd, w_ld, yd, y_ld, (int)M, (int)N, (int)K };
             const int mr = r4d_gg_mr_gemm(s, c);
             if (mr != R4D_GG_MR_DECLINE) return mr;
         }
         GgGemvArgs A{};
-        A.x = (const uint16_t*)x->data; A.x_ld = x_ld;
-        A.w = (const uint8_t*)w->data; A.wtab = nullptr; A.w_ld = w_ld; A.w_es = 0;
-        A.y = y->data; A.y_ld = y_ld;
+        A.x = xd; A.x_ld = x_ld;
+        A.w = wd; A.wtab = nullptr; A.w_ld = w_ld; A.w_es = 0;
+        A.y = yd; A.y_ld = y_ld;
         A.M = (int)M; A.N = (int)N; A.K = (int)K;
         A.XM = (int)(M < kGgXM ? M : kGgXM);
         const long long xbuf = gg_xbuf(A.XM, K, &A.XLM, &A.XR, &A.KC);
@@ -3681,9 +3691,9 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
         return gg_launch_gemv(s, ty, rpw, false, logits, A, grid, (unsigned)lds);
     }
     GgTiledArgs A{};
-    A.x = (const uint16_t*)x->data; A.x_ld = x_ld;
-    A.w = (const uint8_t*)w->data; A.wtab = nullptr; A.w_ld = w_ld; A.w_es = 0;
-    A.y = y->data; A.y_ld = y_ld;
+    A.x = xd; A.x_ld = x_ld;
+    A.w = wd; A.wtab = nullptr; A.w_ld = w_ld; A.w_es = 0;
+    A.y = yd; A.y_ld = y_ld;
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = x_al; A.tab_bytes = (int)tb;
     /* The WMMA kernel (factored scales) for every block type DeepSeek-V4.1 uses. */
@@ -3909,6 +3919,130 @@ extern "C" int r4d_rad_logits_gemm_ggml_tiled(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_moe_gemm_ggml_gemv(const RadArgs* a, RadStream s) { return gg_moe(a, s, true); }
 extern "C" int r4d_rad_moe_gemm_ggml_tiled(const RadArgs* a, RadStream s) { return gg_moe(a, s, false); }
+
+/* ------------------------------------------------------------------ lever K1 folds a / e (10.11.2026)
+ *
+ * rmsnorm_gemm_nt_ggml (fold a) and swiglu_clamped_gemm_nt_ggml (fold e): an activation's producer and the
+ * gemm_nt_ggml that reads its output, as one op with the two ops' bytes in both outputs (h, the producer's;
+ * y, the GEMM's). In the decode band, while lever D2's multi-row form is on (gg_gemv 2, or its bench pin), one
+ * launch: the form's kernel computes the producer's values in its activation staging (r4d_ds41_ggml_mr.hip,
+ * r4d_gg_mr_fold: each value the producer's expression, rounded to bf16 where the producer stores, widened as the
+ * GEMM reads a stored bf16; block column 0 also stores them to h). Everywhere else (gg_gemv 0 / 1, prefill
+ * heights, a form the fold declines, a bf16 gain) the producer's own launch, then gg_gemm_run's: the two launches
+ * the unfused ops issue, the same kernels.
+ *
+ *   rmsnorm_gemm_nt_ggml          x [M, K] bf16, w (GGUF blocks or the f32 logical form [N, K]), g [K] f32 / bf16
+ *                                 gain, h [M, K] bf16 = rmsnorm(x, g) (eps, wadd, mult as rmsnorm reads them),
+ *                                 y [M, N] bf16 = h . w^T
+ *   swiglu_clamped_gemm_nt_ggml   gate_up [M, 2K] bf16, w, h [M, K] bf16 = swiglu_clamped(gate_up; limit),
+ *                                 y [M, N] bf16 = h . w^T
+ */
+extern "C" int r4d_rmsnorm_mult_bf16(long x, long w, long y, int M, int n, float eps, float wadd, float mult,
+                                     int w_f32, int x_ld, int y_ld, long stream);
+extern "C" int r4d_rad_swiglu_clamped(const RadArgs* a, RadStream stream);
+
+namespace {
+/* The GEMM half's operands: the weight at (N, K), h [>= M, K] and y [>= M, N] bf16 with unit inner strides. */
+int k1f_gemm_opds(const RadArgs* a, const RadTensor* w, const RadTensor* h, const RadTensor* y, long long M,
+                  long long* N, long long* K, int* ty, long long* w_ld, long long* h_ld, long long* y_ld) {
+    const GgType* gt = gg_type(r4d_gets(a, "type"));
+    if (!gt) return R4D_NO(RAD_E_DTYPE);
+    *N = r4d_geti_or(a, "N", 0);
+    *K = r4d_geti_or(a, "K", 0);
+    if (*N <= 0 || *K <= 0 || *K % gt->qk || *K % 8 || *N > 0x7fffffffLL || *K > 0x7fffffffLL)
+        return R4D_NO(RAD_E_SHAPE);
+    if (h->rank != 2 || h->dtype != RAD_BF16 || h->shape[1] != *K || h->shape[0] < M || !gg_inner1(h))
+        return R4D_NO(RAD_E_SHAPE);
+    if (y->rank != 2 || y->dtype != RAD_BF16 || y->shape[1] != *N || y->shape[0] < M || !gg_inner1(y))
+        return R4D_NO(RAD_E_SHAPE);
+    const int rc = gg_weight2(w, gt, *N, *K, ty, w_ld);
+    if (rc != RAD_OK) return rc;
+    *h_ld = M > 1 ? h->stride[0] : *K;
+    *y_ld = M > 1 ? y->stride[0] : *N;
+    return RAD_OK;
+}
+}  // namespace
+
+extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
+    if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
+    const RadTensor *x = r4d_opt(a, 0), *w = r4d_opt(a, 1), *g = r4d_opt(a, 2), *h = r4d_opt(a, 3), *y = r4d_opt(a, 4);
+    if (!x || !w || !g || !h || !y || !x->data || !w->data || !g->data || !h->data || !y->data)
+        return R4D_NO(RAD_E_INVAL);
+    if (x->rank != 2 || x->dtype != RAD_BF16 || !gg_inner1(x)) return R4D_NO(RAD_E_SHAPE);
+    const long long M = x->shape[0], Mb = r4d_geti_or(a, "M", 0);
+    if (M <= 0 || M > 0x7fffffffLL || (Mb > 0 && M > Mb)) return R4D_NO(RAD_E_SHAPE);
+    long long N = 0, K = 0, w_ld = 0, h_ld = 0, y_ld = 0;
+    int ty = 0;
+    const int rc = k1f_gemm_opds(a, w, h, y, M, &N, &K, &ty, &w_ld, &h_ld, &y_ld);
+    if (rc != RAD_OK) return rc;
+    if (x->shape[1] != K) return R4D_NO(RAD_E_SHAPE);
+    if ((g->dtype != RAD_F32 && g->dtype != RAD_BF16) || !r4d_contig(g) || r4d_numel(g) < K) return R4D_NO(RAD_E_SHAPE);
+    const long long x_ld = M > 1 ? x->stride[0] : K;
+    /* rmsnorm's own reading of its scalars (rmsnorm_emit, r4d_model_bf16.hip) */
+    const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0),
+                mult = (float)r4d_getf(a, "mult", 1.0);
+    const int h_al = gg_al16(h->data, h_ld) ? 1 : 0;
+    if (M <= kGgDecodeRows && g->dtype == RAD_F32 && r4d_gg_mr_on()) {
+        const R4dGgMrCall c{ ty, false, (const uint16_t*)x->data, x_ld, gg_al16(x->data, x_ld) ? 1 : 0,
+                             (const uint8_t*)w->data, w_ld, y->data, y_ld, (int)M, (int)N, (int)K };
+        R4dGgMrFold f{};
+        f.pro = 1;
+        f.g = (const float*)g->data;
+        f.eps = eps; f.wadd = wadd; f.mult = mult;
+        f.nw = r4d_act_threads((int)M, (int)K) / 32;
+        f.h = (uint16_t*)h->data; f.h_ld = h_ld; f.h_al = h_al;
+        const int fr = r4d_gg_mr_fold(s, c, f);
+        if (fr != R4D_GG_MR_DECLINE) return fr;
+    }
+    if (r4d_rmsnorm_mult_bf16((long)(uintptr_t)x->data, (long)(uintptr_t)g->data, (long)(uintptr_t)h->data, (int)M,
+                              (int)K, eps, wadd, mult, g->dtype == RAD_F32 ? 1 : 0, (int)x_ld, (int)h_ld,
+                              (long)(uintptr_t)s) != 0)
+        return R4D_NO(RAD_E_DEVICE);
+    return gg_gemm_run(s, ty, false, (const uint16_t*)h->data, h_ld, h_al, (const uint8_t*)w->data, w_ld, y->data, y_ld,
+                       M, N, K);
+}
+
+extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s) {
+    if (!a || a->n_t < 4) return R4D_NO(RAD_E_INVAL);
+    const RadTensor *gu = r4d_opt(a, 0), *w = r4d_opt(a, 1), *h = r4d_opt(a, 2), *y = r4d_opt(a, 3);
+    if (!gu || !w || !h || !y || !gu->data || !w->data || !h->data || !y->data) return R4D_NO(RAD_E_INVAL);
+    if (gu->rank != 2 || gu->dtype != RAD_BF16 || !gg_inner1(gu)) return R4D_NO(RAD_E_SHAPE);
+    const long long M = gu->shape[0], Mb = r4d_geti_or(a, "M", 0);
+    if (M <= 0 || M > 65535 || (Mb > 0 && M > Mb)) return R4D_NO(RAD_E_SHAPE);
+    long long N = 0, K = 0, w_ld = 0, h_ld = 0, y_ld = 0;
+    int ty = 0;
+    const int rc = k1f_gemm_opds(a, w, h, y, M, &N, &K, &ty, &w_ld, &h_ld, &y_ld);
+    if (rc != RAD_OK) return rc;
+    if (gu->shape[1] != 2 * K) return R4D_NO(RAD_E_SHAPE);
+    const float limit = (float)r4d_getf(a, "limit", 0);
+    if (!std::isfinite(limit) || limit <= 0) return R4D_NO(RAD_E_SHAPE);
+    const long long g_ld = M > 1 ? gu->stride[0] : 2 * K;
+    if (g_ld < 2 * K || h_ld < K) return R4D_NO(RAD_E_SHAPE);
+    const int h_al = gg_al16(h->data, h_ld) ? 1 : 0;
+    if (M <= kGgDecodeRows && r4d_gg_mr_on()) {
+        const uint16_t* gp = (const uint16_t*)gu->data;
+        const R4dGgMrCall c{ ty, false, gp, g_ld, gg_al16(gp, g_ld) ? 1 : 0, (const uint8_t*)w->data, w_ld, y->data,
+                             y_ld, (int)M, (int)N, (int)K };
+        R4dGgMrFold f{};
+        f.pro = 2;
+        f.limit = limit;
+        f.u_al = gg_al16(gp + K, g_ld) ? 1 : 0;
+        f.h = (uint16_t*)h->data; f.h_ld = h_ld; f.h_al = h_al;
+        const int fr = r4d_gg_mr_fold(s, c, f);
+        if (fr != R4D_GG_MR_DECLINE) return fr;
+    }
+    /* swiglu_clamped's own launch (r4d_glm.hip), at the call's M rows, then the GEMM's */
+    RadTensor ts[2] = { *gu, *h };
+    ts[0].shape[0] = M; ts[0].stride[0] = g_ld;
+    ts[1].shape[0] = M; ts[1].stride[0] = h_ld;
+    const RadParam ps[2] = { RAD_INT("n", K), RadParam{ "limit", RAD_P_F64, 0, 0, nullptr, (double)limit } };
+    RadArgs sa{};
+    sa.t = ts; sa.n_t = 2; sa.p = ps; sa.n_p = 2; sa.world_size = 1;
+    const int sr = r4d_rad_swiglu_clamped(&sa, s);
+    if (sr != RAD_OK) return sr;
+    return gg_gemm_run(s, ty, false, (const uint16_t*)h->data, h_ld, h_al, (const uint8_t*)w->data, w_ld, y->data, y_ld,
+                       M, N, K);
+}
 
 /* embed_lookup_ggml: the id's row dequantised, times `mult`, rounded once. A negative id or one
  * outside [vocab_offset, vocab_offset + n_vocab) writes a zero row (libref also refuses an id past
