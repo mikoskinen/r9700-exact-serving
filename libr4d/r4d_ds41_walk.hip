@@ -113,6 +113,8 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
         for (int sl = 0; sl < kWalkSeqs; ++sl) acc[sl] = 0.0f;
         if (live) {
             const r4d_u16* __restrict__ w = succ + (long)(voff + j) * R;
+            /* R is a multiple of 32: four 16-byte pieces of the row in flight. */
+#pragma unroll 4
             for (int r0 = 0; r0 < R; r0 += 8) {
                 R4dV8 v;
                 v.v = *(const r4d_u32x4*)(w + r0);

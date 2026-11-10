@@ -2351,7 +2351,10 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (g_sw_walk_env.load(std::memory_order_relaxed) >= 0) {
         d.wseqs = d.Q / d.block;
         const int64_t KR = d.block * d.wseqs;
-        if (g.world > 1) {
+        bool wok = true;
+        if (g.world > 1 && !rad_op_declared(b, "dspark_walk_step")) {
+            wok = false;   /* no loaded kernel plugin serves it (libr4d does): today's walk only */
+        } else if (g.world > 1) {
             d.wkeys = decl_b(b, nm.f("dspark_walk_keys"), RAD_F32, { KR, 2 });
             d.wgath = decl_b(b, nm.f("dspark_walk_keys_all"), RAD_F32, { KR, (int64_t)g.world * 2 });
             d.wfill = op(b, "fill", { RAD_RANGE("M", 1, KR), RAD_INT("n", 2), RAD_STR("dtype", "f32"), RAD_F64("value", 0.0) },
@@ -2366,10 +2369,10 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                                       RAD_INT("vocab_off", g.vocab_off), RAD_INT("world", g.world),
                                       RAD_INT("anchor_stride", d.block), RAD_STR("dtype", "f32") },
                                     { d.mk1, d.mk2 }, { d.logits, d.wgath, d.wkeys }, { d.wkeys, d.tokens });
-                if (!w) return RAD_E_INVAL;
+                wok = wok && w && rad_op_resolved(b, w);   /* declared, and a kernel serves it on this device */
                 d.wstep.push_back(w);
             }
-            if (!d.wkeys || !d.wgath || !d.wfill || !d.wag) return RAD_E_INVAL;
+            wok = wok && d.wkeys && d.wgath && d.wfill && d.wag && rad_op_resolved(b, d.wfill) && rad_op_resolved(b, d.wag);
         } else {
             const int64_t tiles = (c.n_vocab + 63) / 64;
             d.wts = decl_b(b, nm.f("dspark_walk_tile_scores"), RAD_F32, { d.wseqs, tiles });
@@ -2378,9 +2381,21 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                            { RAD_RANGE("M", 1, d.wseqs), RAD_INT("steps", d.block), RAD_INT("rank", d.rank),
                              RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", d.block), RAD_STR("dtype", "bf16") },
                            { d.mk1, d.mk2 }, { d.logits }, { d.wts, d.wtt, d.tokens });
-            if (!d.wts || !d.wtt || !d.wmarkov) return RAD_E_INVAL;
+            wok = d.wts && d.wtt && d.wmarkov && rad_op_resolved(b, d.wmarkov);
         }
-        g_sw_walk_ok.store(1, std::memory_order_relaxed);
+        if (wok) {
+            g_sw_walk_ok.store(1, std::memory_order_relaxed);
+        } else {
+            /* Anything declared stays unissued: the switch keeps refusing 1 and the walk is today's. */
+            d.wfill = d.wag = d.wmarkov = 0;
+            d.wstep.clear();
+            rad_note(b, "DSpark lever W1 NOT declared: no kernel serves %s here; the top-%lld walk only",
+                     g.world > 1 ? "dspark_walk_step" : "dflash_markov_greedy_f32", (long long)R);
+            if (ctx->rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_WALK is set but no loaded kernel serves %s: the "
+                                "full-vocabulary walk is not declared (dspark_walk takes only 0)\n",
+                        g.world > 1 ? "dspark_walk_step" : "dflash_markov_greedy_f32");
+        }
     }
 
     RadDrafterDecl drf{};
