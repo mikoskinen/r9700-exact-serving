@@ -301,6 +301,13 @@ public:
      * adaptive, 0 fixed, -1 the configured one (--draft-window). Returns the window the scheduler
      * now runs (true adaptive), which is what /admin/fn4 reports. */
     bool     set_draft_adaptive(int v);
+    /* fn4 draft_depth0 / draft_probe / draft_hybrid / draft_hybrid_match, the same way: each returns
+     * the value the scheduler now runs. Depth 0 and its probe interval are DraftController's
+     * (draft.h); the hybrid is hybrid_ below. */
+    int      set_draft_depth0(int v);
+    int      set_draft_probe(int v);
+    int      set_draft_hybrid(int v);
+    int      set_draft_hybrid_match(int v);
     /* --debug-draft-oracle is loaded: the harness replaces a draft head's proposals (set_draft),
      * so the engine issues no step ahead of its commit (Engine::step_loop). */
     bool     debug_oracle_on() const { return !debug_oracle_.empty(); }
@@ -630,6 +637,32 @@ private:
      * far the match behind the proposal runs back (NgramIndex::propose), -1 when the proposal did
      * not come from the index (--debug-draft-oracle). */
     int draft_ngram(SchedReq& s, int depth, int* match = nullptr) const;
+    /* The same lookup into `out` rather than s.draft, the match counted up to `match_cap`; never the
+     * oracle's ids. For the hybrid, which must not touch a head's published proposal until it
+     * takes the lookup's. */
+    int lookup_into(SchedReq& s, int depth, int32_t* out, int* match, int match_cap) const;
+
+    /* The hybrid (RADIANCE_DRAFT_HYBRID=1 at start, fn4 draft_hybrid): beside a draft head, a
+     * sequence whose prompt lookup matches at least hybrid_match_ tokens back verifies the lookup's
+     * proposal instead of the head's. A long match is a copy (an edit re-emitting a region, a quoted
+     * block, a repeated structure), where the lookup's drafts come true far more often than a
+     * head's, and cost no head pass. The head still drafts every sequence; its proposal is the one
+     * replaced. The lookup needs the sequence's text up to the anchor, which the host has only after
+     * the commit, so a step issued ahead (which verifies the card's proposals before the commit) is
+     * not issued while a running sequence's last match was long: that step is planned by step()
+     * instead, after the commit, where the lookup and the head's proposal are both known.
+     * hybrid_match_ is RADIANCE_DRAFT_HYBRID_MATCH (or fn4 draft_hybrid_match), LookupGate's
+     * kLongMatch by default. A lookup proposal is the whole window (next_depth()), not the head's
+     * estimate of the sequence, and stays out of that estimate (commit). The counts are for the fn4
+     * report. */
+    bool    hybrid_ = false;
+    int     hybrid_match_ = LookupGate::kLongMatch;
+    int64_t hybrid_lookup_ = 0, hybrid_head_ = 0, hybrid_unahead_ = 0;
+    bool    hybrid_on() const { return hybrid_ && draft_head_ && debug_oracle_.empty(); }
+    /* The deployment declares a draft head (serial or block) that drafts chains. Not a tree head:
+     * a tree is verified only on a step issued ahead (Engine::step_loop), and the hybrid plans the
+     * steps behind a long match after the commit, where a neighbour's tree could not be verified. */
+    bool    draft_head_ = false;
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;

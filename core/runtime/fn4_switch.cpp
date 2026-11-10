@@ -18,7 +18,8 @@ namespace fn4 {
 namespace {
 
 const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", "ds41_argather",
-                                        "ds41_shexp_lane", "ds41_kvfold", "ds41_ofold", "ds41_onefill" };
+                                        "ds41_shexp_lane", "ds41_kvfold", "ds41_ofold", "ds41_onefill",
+                                        "draft_depth0", "draft_probe", "draft_hybrid", "draft_hybrid_match" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -38,8 +39,10 @@ struct State {
     std::atomic<int> val[kSwitches];
     std::atomic<int> draft_capable{-1};      /* -1 no scheduler registered, 0 / 1 */
     std::atomic<int> draft_configured{0};    /* --draft-window adaptive at start */
+    std::atomic<int> hybrid_capable{-1};     /* -1 no scheduler registered, 0 / 1 */
     std::atomic<uint64_t> epoch{0};
     std::atomic<int> applied_step{-1};
+    std::atomic<int64_t> cnt[6];   /* note_draft_counts */
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -58,6 +61,7 @@ struct State {
             want[i] = 0;
             pend[i] = false;
         }
+        for (auto& c : cnt) c.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -134,6 +138,11 @@ int reported(State& s, int i) {
 
 }  // namespace
 
+bool sched_switch(int i) {
+    return i == kDraftAdaptive || i == kDraftDepth0 || i == kDraftProbe || i == kDraftHybrid ||
+           i == kDraftHybridMatch;
+}
+
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
 
 int switch_index(const std::string& name) {
@@ -170,15 +179,63 @@ void note_draft_adaptive(bool adaptive) {
     st().val[kDraftAdaptive].store(adaptive ? 1 : 0, std::memory_order_release);
 }
 
+void hybrid_register(bool capable) {
+    st().hybrid_capable.store(capable ? 1 : 0, std::memory_order_release);
+}
+
+void note_sched(int i, int value) {
+    if (sched_switch(i)) st().val[i].store(value, std::memory_order_release);
+}
+
+void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_lookup, int64_t hyb_head,
+                       int64_t hyb_unahead) {
+    State& s = st();
+    const int64_t v[6] = { zero, probe, moves, hyb_lookup, hyb_head, hyb_unahead };
+    for (int k = 0; k < 6; ++k) s.cnt[k].store(v[k], std::memory_order_relaxed);
+}
+
 bool check(const std::string& name, int v, std::string* err) {
     if (name == "epoch_bump") return true;
     const int i = switch_index(name);
     if (i < 0) {
         if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, ds41_argather, "
-                        "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, epoch_bump)";
+                        "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
+                        "draft_hybrid, draft_hybrid_match, epoch_bump)";
         return false;
     }
     State& s = st();
+    if (i == kDraftDepth0 || i == kDraftHybrid) {
+        if (v < 0 || v > 1) {
+            if (err) *err = std::string(kNames[i]) + " takes 1 (on) or 0 (off)";
+            return false;
+        }
+        const int cap = (i == kDraftHybrid ? s.hybrid_capable : s.draft_capable).load(std::memory_order_acquire);
+        if (v == 1 && cap != 1) {
+            if (err)
+                *err = std::string(kNames[i]) + "=1 refused: " +
+                       (cap < 0 ? std::string("no scheduler has registered a drafter")
+                        : i == kDraftHybrid
+                            ? std::string("this deployment has no draft head that drafts chains (a serial or block "
+                                          "head, not a tree, with --num-speculative-tokens N)")
+                            : std::string("this deployment's drafter cannot run the adaptive window"));
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftProbe) {
+        if (v < 2 || v > 4096) {
+            if (err) *err = "draft_probe takes 2 .. 4096 (cycles at depth 0 between probes)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftHybridMatch) {
+        if (v < 1 || v > 256) {
+            if (err) *err = "draft_hybrid_match takes 1 .. 256 (tokens the lookup's match runs back)";
+            return false;
+        }
+        return true;
+    }
     if (i == kDraftAdaptive) {
         if (v < -1 || v > 1) {
             if (err) *err = "draft_adaptive takes 1 (adaptive), 0 (fixed) or -1 (the configured window)";
@@ -241,8 +298,9 @@ bool request(const std::string& name, int v, std::string* err) {
     return true;
 }
 
-bool apply_pending(int step, int* draft_adaptive) {
-    if (draft_adaptive) *draft_adaptive = kNoChange;
+bool apply_pending(int step, int* sched) {
+    if (sched)
+        for (int i = 0; i < kSwitches; ++i) sched[i] = kNoChange;
     State& s = st();
     if (!s.queued.load(std::memory_order_acquire)) return false;
     std::lock_guard<std::mutex> lk(s.mu);
@@ -285,7 +343,7 @@ bool apply_pending(int step, int* draft_adaptive) {
             }
             if (const int got = plugin_value(s, i); got >= 0) v = got;
         }
-        if (i == kDraftAdaptive && draft_adaptive) *draft_adaptive = v;
+        if (sched_switch(i) && sched) sched[i] = v;
         s.val[i].store(v, std::memory_order_release);
         changed = true;
         what += std::string(what.empty() ? "" : ", ") + kNames[i] + "=" + std::to_string(v);
@@ -322,7 +380,14 @@ std::string state_json() {
     o += "}, \"epoch\": " + std::to_string(s.epoch.load(std::memory_order_acquire)) +
          ", \"applied_step\": " + std::to_string(s.applied_step.load(std::memory_order_acquire)) +
          ", \"plugins\": " + std::to_string((int)s.hooks.size()) +
-         ", \"draft_capable\": " + std::to_string(s.draft_capable.load(std::memory_order_acquire)) + "}";
+         ", \"draft_capable\": " + std::to_string(s.draft_capable.load(std::memory_order_acquire));
+    static const char* const kCnt[6] = { "zero_cycles", "probe_cycles", "zero_moves", "hybrid_lookup", "hybrid_head",
+                                         "hybrid_unahead" };
+    o += ", \"draft\": {";
+    for (int k = 0; k < 6; ++k)
+        o += std::string(k ? ", " : "") + "\"" + kCnt[k] + "\": " +
+             std::to_string((long long)s.cnt[k].load(std::memory_order_relaxed));
+    o += "}}";
     return o;
 }
 

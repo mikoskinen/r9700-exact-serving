@@ -5021,8 +5021,10 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(da.body, "no scheduler has registered a drafter"));
     CHECK_EQ(f.post("/admin/fn4", R"([1])").status, 400);
     CHECK(has(f.get("/admin/fn4").body, "\"pending\": {}"));
-    int adapt = 7;
-    CHECK(!fn4::apply_pending(3, &adapt));
+    int sw[fn4::kSwitches];
+    int& adapt = sw[fn4::kDraftAdaptive];
+    adapt = 7;
+    CHECK(!fn4::apply_pending(3, sw));
     CHECK_EQ(adapt, fn4::kNoChange);
     CHECK_EQ(fn4::epoch(), (uint64_t)0);
 
@@ -5033,7 +5035,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(dn.body, "cannot run the adaptive window"));
     CHECK(has(f.get("/admin/fn4").body, "\"draft_adaptive\": 0"));
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":0})").status, 200);
-    CHECK(!fn4::apply_pending(4, &adapt));
+    CHECK(!fn4::apply_pending(4, sw));
     CHECK_EQ(fn4::epoch(), (uint64_t)0);
 
     /* One that can: queued, applied at a step, the epoch moves once; GET reports the window the
@@ -5043,7 +5045,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK_EQ(p.status, 200);
     CHECK(has(p.body, "\"pending\": {\"draft_adaptive\": 1, \"aql_acq\": 2, \"epoch_bump\": 1}"));
     CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 0);
-    CHECK(fn4::apply_pending(7, &adapt));
+    CHECK(fn4::apply_pending(7, sw));
     CHECK_EQ(adapt, 1);
     fn4::note_draft_adaptive(true);
     CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 1);
@@ -5054,25 +5056,78 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(g2.body, "\"applied_step\": 7"));
     CHECK(has(g2.body, "\"aql_acq\": 2"));
     CHECK(has(g2.body, "\"draft_capable\": 1"));
-    CHECK(!fn4::apply_pending(8, &adapt));
+    CHECK(!fn4::apply_pending(8, sw));
     CHECK_EQ(adapt, fn4::kNoChange);
     /* A value equal to the applied one is no change: no new epoch. A bump alone is one. */
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":1,"aql_acq":2})").status, 200);
-    CHECK(!fn4::apply_pending(9, &adapt));
+    CHECK(!fn4::apply_pending(9, sw));
     CHECK_EQ(f.post("/admin/fn4", R"({"epoch_bump":1})").status, 200);
-    CHECK(fn4::apply_pending(10, &adapt));
+    CHECK(fn4::apply_pending(10, sw));
     CHECK_EQ(adapt, fn4::kNoChange);
     CHECK_EQ(fn4::epoch(), (uint64_t)2);
     /* -1 is the configured window (fixed here); the rule back to off. Left that way for the rest of
      * the binary, with no drafter registered as capable. */
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":0,"draft_adaptive":-1})").status, 200);
-    CHECK(fn4::apply_pending(11, &adapt));
+    CHECK(fn4::apply_pending(11, sw));
     CHECK_EQ(adapt, 0);
     fn4::note_draft_adaptive(false);
     CHECK_EQ(fn4::aql_acq_rule(), 0);
     CHECK_EQ(fn4::value(fn4::kDraftAdaptive), 0);
     CHECK_EQ(fn4::epoch(), (uint64_t)3);
+
+    /* The scheduler's draft switches (draft_depth0, draft_probe, draft_hybrid, draft_hybrid_match):
+     * checked by range and by what the registered drafter can run, handed to the scheduler at the
+     * step release, and reported as the scheduler noted them; the counters as it noted them. */
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_depth0\": -1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":2})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_probe":1})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_hybrid_match":0})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_hybrid_match":257})").status, 400);
     fn4::draft_register(false, false);
+    fn4::hybrid_register(false);
+    const HttpResponse d0 = f.post("/admin/fn4", R"({"draft_depth0":1})");
+    CHECK_EQ(d0.status, 400);
+    CHECK(has(d0.body, "cannot run the adaptive window"));
+    const HttpResponse h0 = f.post("/admin/fn4", R"({"draft_hybrid":1})");
+    CHECK_EQ(h0.status, 400);
+    CHECK(has(h0.body, "no draft head that drafts chains"));
+    fn4::draft_register(true, true);
+    fn4::hybrid_register(true);
+    fn4::note_sched(fn4::kDraftDepth0, 0);
+    fn4::note_sched(fn4::kDraftProbe, 16);
+    fn4::note_sched(fn4::kDraftHybrid, 0);
+    fn4::note_sched(fn4::kDraftHybridMatch, 8);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":1,"draft_probe":4,"draft_hybrid":1,"draft_hybrid_match":12})")
+                 .status, 200);
+    CHECK(fn4::apply_pending(12, sw));
+    CHECK_EQ(sw[fn4::kDraftAdaptive], fn4::kNoChange);
+    CHECK_EQ(sw[fn4::kDraftDepth0], 1);
+    CHECK_EQ(sw[fn4::kDraftProbe], 4);
+    CHECK_EQ(sw[fn4::kDraftHybrid], 1);
+    CHECK_EQ(sw[fn4::kDraftHybridMatch], 12);
+    CHECK_EQ(sw[fn4::kAqlAcq], fn4::kNoChange);
+    CHECK_EQ(fn4::epoch(), (uint64_t)4);
+    fn4::note_sched(fn4::kDraftDepth0, 1);
+    fn4::note_sched(fn4::kDraftProbe, 4);
+    fn4::note_sched(fn4::kDraftHybrid, 1);
+    fn4::note_sched(fn4::kDraftHybridMatch, 12);
+    fn4::note_draft_counts(5, 6, 1, 7, 8, 9);
+    const HttpResponse g3 = f.get("/admin/fn4");
+    CHECK(has(g3.body, "\"draft_depth0\": 1, \"draft_probe\": 4, \"draft_hybrid\": 1, \"draft_hybrid_match\": 12"));
+    CHECK(has(g3.body, "\"draft\": {\"zero_cycles\": 5, \"probe_cycles\": 6, \"zero_moves\": 1, "
+                       "\"hybrid_lookup\": 7, \"hybrid_head\": 8, \"hybrid_unahead\": 9}"));
+    /* The same values again: no change, no epoch. Back off for the rest of the binary. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":1,"draft_hybrid":1})").status, 200);
+    CHECK(!fn4::apply_pending(13, sw));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":0,"draft_hybrid":0})").status, 200);
+    CHECK(fn4::apply_pending(14, sw));
+    CHECK_EQ(sw[fn4::kDraftDepth0], 0);
+    CHECK_EQ(sw[fn4::kDraftHybrid], 0);
+    fn4::note_sched(fn4::kDraftDepth0, 0);
+    fn4::note_sched(fn4::kDraftHybrid, 0);
+    fn4::note_draft_counts(0, 0, 0, 0, 0, 0);
+    fn4::draft_register(false, false);
+    fn4::hybrid_register(false);
 
     HttpRequest q;
     q.method = "POST";

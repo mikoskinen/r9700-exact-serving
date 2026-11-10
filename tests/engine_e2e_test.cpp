@@ -2238,6 +2238,84 @@ TEST(spec_ngram_alone_leaves_a_draft_head_out_and_returns_the_plain_tokens) {
     CHECK_EQ(plain.stop(), 0);
 }
 
+/* Depth 0 beside a draft head (sched/draft.h): the adaptive window may choose to draft nothing and
+ * verify nothing where a measured plain step pays more, with probes at the drafting depth. It
+ * changes only what a step verifies, so greedy text equals one-token-a-step decoding: started from
+ * the environment with a probe every 2 cycles, so the head moves between 0 and its window within a
+ * reply; switched off and on again in process. GET /admin/fn4 reports it as the scheduler runs it,
+ * and the counters show the probes ran. DFlash2 drafts trees, which the hybrid cannot take (a tree
+ * is verified only on a step issued ahead): refused by name. */
+TEST(depth_zero_beside_a_draft_head_keeps_the_plain_text) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> edit = tiny::byte_ids(
+        "Rename total to acc in this function and keep the rest as it is.\n"
+        "def add_all(xs):\n    total = 0\n    for x in xs:\n        total = total + x\n"
+        "    return total\n\ndef add_all(xs):\n    acc = 0\n    for x in xs:\n");
+    const std::vector<int32_t> rnd = prompt_ids(61, 160);
+    const std::vector<const std::vector<int32_t>*> prompts = { &repetitive_prompt(), &edit, &rnd };
+    std::vector<std::vector<int32_t>> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        for (const std::vector<int32_t>* p : prompts)
+            plain.push_back(tokens_of(post(s.port, "/completion", completion(*p, 48))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--draft-window", "adaptive",
+                                       "--no-prefix-cache" },
+                    { "RADIANCE_DRAFT_DEPTH0=1", "RADIANCE_DRAFT_PROBE=2" }));
+    CHECK(has(s.output(), "draft depth 0: a step drafts nothing and verifies nothing"));
+    auto fn4get = [&]() {
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        return json::parse(out, nullptr, false);
+    };
+    const json g0 = fn4get();
+    CHECK_EQ(g0["switches"].value("draft_adaptive", -9), 1);
+    CHECK_EQ(g0["switches"].value("draft_depth0", -9), 1);
+    CHECK_EQ(g0["switches"].value("draft_probe", -9), 2);
+    CHECK_EQ(g0["switches"].value("draft_hybrid", -9), 0);
+    auto run_all = [&](const char* arm) {
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            int status = 0;
+            const std::vector<int32_t> got = tokens_of(post(s.port, "/completion", completion(*prompts[i], 48),
+                                                            &status));
+            CHECK_EQ(status, 200);
+            if (got != plain[i])
+                fprintf(stderr, "    %s prompt %zu\n    plain %s\n    got   %s\n", arm, i, show(plain[i]).c_str(),
+                        show(got).c_str());
+            CHECK(got == plain[i]);
+        }
+    };
+    run_all("depth0 (env)");
+    const json g1 = fn4get();
+    const int64_t probes = g1["draft"].value("probe_cycles", (int64_t)-1);
+    fprintf(stderr, "    g31_df2 depth 0: %lld cycles at 0, %lld probe cycles, %lld moves\n",
+            (long long)g1["draft"].value("zero_cycles", (int64_t)-1), (long long)probes,
+            (long long)g1["draft"].value("zero_moves", (int64_t)-1));
+    CHECK(probes > 0);
+    int st = 0;
+    (void)post(s.port, "/admin/fn4", json{ { "draft_depth0", 0 } }, &st);
+    CHECK_EQ(st, 200);
+    run_all("depth0 off");
+    CHECK_EQ(fn4get()["switches"].value("draft_depth0", -9), 0);
+    (void)post(s.port, "/admin/fn4", json{ { "draft_depth0", 1 }, { "draft_probe", 3 } }, &st);
+    CHECK_EQ(st, 200);
+    run_all("depth0 on again");
+    CHECK_EQ(fn4get()["switches"].value("draft_depth0", -9), 1);
+    CHECK_EQ(fn4get()["switches"].value("draft_probe", -9), 3);
+    std::string body;
+    {
+        Call c;
+        st = c.send(s.port, "POST", "/admin/fn4", R"({"draft_hybrid":1})") ? c.read(&body) : -1;
+    }
+    CHECK_EQ(st, 400);
+    CHECK(has(body, "no draft head that drafts chains"));
+    CHECK_EQ(s.stop(), 0);
+}
+
 /* The runtime switches through a running server (POST /admin/fn4, runtime/fn4_switch.h): a change
  * is queued, applied at the next step release with every rank parked, and moves the epoch the
  * recorded passes are keyed by, so the passes before it are not played after it; the text stays
@@ -2275,6 +2353,14 @@ TEST(the_runtime_switches_apply_at_a_step_release_and_keep_the_text) {
     CHECK(has(body, "cannot run the adaptive window"));
     (void)post(s.port, "/admin/fn4", json{ { "gg_gemv", 3 } }, &st);
     CHECK_EQ(st, 400);
+    /* Depth 0 and the hybrid need a drafting head: refused here, reported off. */
+    (void)post(s.port, "/admin/fn4", json{ { "draft_depth0", 1 } }, &st);
+    CHECK_EQ(st, 400);
+    (void)post(s.port, "/admin/fn4", json{ { "draft_hybrid", 1 } }, &st);
+    CHECK_EQ(st, 400);
+    CHECK_EQ(g0["switches"].value("draft_depth0", -9), 0);
+    CHECK_EQ(g0["switches"].value("draft_hybrid", -9), 0);
+    CHECK_EQ(g0["switches"].value("draft_hybrid_match", -9), 8);
     json on = { { "epoch_bump", 1 }, { "aql_acq", 1 } };
     if (gg) on["gg_gemv"] = 1;
     const json p = post(s.port, "/admin/fn4", on, &st);

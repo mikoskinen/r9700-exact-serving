@@ -846,9 +846,20 @@ int Engine::prepare_release(const RadBatch* b) {
      * every rank issues this step under one setting (runtime/fn4_switch.h). Nothing queued: one
      * atomic load, no lock. */
     {
-        int adapt = fn4::kNoChange;
-        if (fn4::apply_pending(b ? b->step : -1, &adapt) && adapt != fn4::kNoChange)
-            fn4::note_draft_adaptive(sched_.set_draft_adaptive(adapt));
+        int sw[fn4::kSwitches];
+        if (fn4::apply_pending(b ? b->step : -1, sw)) {
+            if (sw[fn4::kDraftAdaptive] != fn4::kNoChange)
+                fn4::note_draft_adaptive(sched_.set_draft_adaptive(sw[fn4::kDraftAdaptive]));
+            if (sw[fn4::kDraftDepth0] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftDepth0, sched_.set_draft_depth0(sw[fn4::kDraftDepth0]));
+            if (sw[fn4::kDraftProbe] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftProbe, sched_.set_draft_probe(sw[fn4::kDraftProbe]));
+            if (sw[fn4::kDraftHybrid] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftHybrid, sched_.set_draft_hybrid(sw[fn4::kDraftHybrid]));
+            if (sw[fn4::kDraftHybridMatch] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftHybridMatch,
+                                sched_.set_draft_hybrid_match(sw[fn4::kDraftHybridMatch]));
+        }
     }
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
