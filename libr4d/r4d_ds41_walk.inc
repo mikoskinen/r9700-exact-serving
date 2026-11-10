@@ -28,10 +28,10 @@ static const RadConstraint cDs41Walk[] = {
 SCHEMA("dspark_walk_step", pDs41Walk, oDs41Walk,
        "One step of DSpark's greedy Markov walk over the whole vocabulary, on one rank's vocabulary shard "
        "[vocab_off, vocab_off + N): step l's predecessor is the max of step l-1's gathered keys `prev` "
-       "([M, world] u64 in an f32 [M, 2 * world] plane; the anchor at l = 0), written to tokens[s][l-1]; every "
+       "(16-byte slots, the u64 key first: an f32 [M, 4 * world] plane; the anchor at l = 0), written to tokens[s][l-1]; every "
        "column's score logits[s * steps + l][j] + sum_r pred[prev][r] * succ[vocab_off + j][r] (fma, r "
        "ascending) is keyed (ordered score bits << 32 | ~id: ties to the lower id, NaN never) and the shard's "
-       "best max-ed into keys[s] (u64 in an f32 [M, 2] plane, zeroed before). step = steps only merges the "
+       "best max-ed into keys[s] (the u64 of a 16-byte slot, an f32 [M, 4] plane, zeroed before). step = steps only merges the "
        "last token."),
 
 #elif defined(R4D_DS41_ROWS)
@@ -40,9 +40,9 @@ SCHEMA("dspark_walk_step", pDs41Walk, oDs41Walk,
   "one step of the full-vocabulary DSpark Markov walk on a vocabulary shard: a thread a column, 128 a block, "
   "every sequence in passes of eight (their predecessor rows in LDS), the shard's best key a sequence by a wave "
   "max and one atomicMax a block",
-  "rank a multiple of 32 up to 512, vocab_off + N <= n_vocab, succ 16-byte aligned, keys / prev u64-aligned "
-  "rows, keys zeroed before the step",
-  "f32 logits, bf16 pred / succ (widened exactly), f32 fma in rank order, u64 keys in f32 planes, i32 tokens",
+  "rank a multiple of 32 up to 512, vocab_off + N <= n_vocab, succ 16-byte aligned, keys [M, 4] / prev [M, 4 * world] "
+  "f32 planes of 16-byte key slots, keys zeroed before the step",
+  "f32 logits, bf16 pred / succ (widened exactly), f32 fma in rank order, u64 keys in 16-byte slots of f32 planes, i32 tokens",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cDs41Walk), NOTUNE,
   nullptr, nullptr, r4d_rad_dspark_walk_step, nullptr, nullptr, nullptr,

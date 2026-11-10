@@ -18,11 +18,22 @@
  * alone. With RADIANCE_DS41_WALK_TABLES=<dir> (markov_w1.bf16 / markov_w2.bf16: the checkpoint's
  * mtp.2.markov_head embed / head tables, [129280, 256] bf16 each, extracted from the .rad) the real tables run
  * at the real vocabulary over four ranks, random seeds, plus a forced cross-shard tie on them, and the test
- * prints where in the head's own order each walked token sat (how often the walk leaves the head's top 32). */
+ * prints where in the head's own order each walked token sat (how often the walk leaves the head's top 32).
+ *
+ * THE GATHER (10.11.2026: the first full-vocabulary query pass on the cards died in ar_gather_4rank, "refused op
+ * 'all_gather' ... numel=16 dtype=f32 row=2" -- an 8-byte key a row, where libr4d's all-gather moves whole 16-byte
+ * words a row): the keys now travel in 16-byte slots, and every case above runs the planes at deepseek41's geometry
+ * (ds41_walk_geom.h). The last section builds, from that same header, the all_gather operands deepseek41 issues
+ * between steps -- every world 2 / 3 / 4 / 8, sequences a pass 1 .. 16, every sequence count S and step, at a
+ * 256-byte-aligned plane as the arena places it -- and holds each to libr4d's own launch-time admission of the
+ * gather rows (r4d_ar_gather_admit.h, which ar_gather_wide_setup calls); the 8-byte geometry that failed on the
+ * cards must be refused there. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
 #include "ref_host.h"
+#include "r4d_ar_gather_admit.h"
+#include "../../arch/deepseek41/ds41_walk_geom.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -123,18 +134,20 @@ bool sharded_walk(const Walk& w, int W, std::vector<std::vector<int32_t>>& tok, 
                 lg[(size_t)r][(size_t)(i * lp[(size_t)r] + j)] = w.logits[(size_t)i * w.V + beg[(size_t)r] + j];
     }
     tok.assign((size_t)W, std::vector<int32_t>((size_t)S * tp, -77));
-    std::vector<std::vector<uint64_t>> keys((size_t)W, std::vector<uint64_t>((size_t)S));
-    std::vector<uint64_t> gath((size_t)S * W, 0);
+    /* 16-byte key slots (ds41_walk_geom.h): keys [S, kSlot] f32 = [S][2] u64, gath [S, W * kSlot] = [S][2 W] u64 */
+    const int64_t KC = ds41walk::keys_cols(), GC = ds41walk::gath_cols(W), U = ds41walk::kSlot / 2;
+    std::vector<std::vector<uint64_t>> keys((size_t)W, std::vector<uint64_t>((size_t)S * U));
+    std::vector<uint64_t> gath((size_t)S * W * U, 0);
     for (int step = 0; step <= steps; ++step) {
         for (int r = 0; r < W; ++r) {
             std::fill(keys[(size_t)r].begin(), keys[(size_t)r].end(), 0ull);
             RadTensor t[7] = {
                 mat(lg[(size_t)r].data(), RAD_F32, (int64_t)S * steps, ext[(size_t)r], lp[(size_t)r]),
                 vec((void*)w.anchor.data(), RAD_I32, (int64_t)w.anchor.size()),
-                step > 0 ? mat(gath.data(), RAD_F32, S, 2 * W, 2 * W) : RadTensor{},
+                step > 0 ? mat(gath.data(), RAD_F32, S, GC, GC) : RadTensor{},
                 mat((void*)w.w1, RAD_BF16, w.V, w.R, w.R),
                 mat((void*)w.w2, RAD_BF16, w.V, w.R, w.R),
-                step < steps ? mat(keys[(size_t)r].data(), RAD_F32, S, 2, 2) : RadTensor{},
+                step < steps ? mat(keys[(size_t)r].data(), RAD_F32, S, KC, KC) : RadTensor{},
                 mat(tok[(size_t)r].data(), RAD_I32, S, steps, tp),
             };
             RadParam p[10] = { pint("M", S), pint("step", step), pint("steps", steps), pint("rank", w.R),
@@ -154,9 +167,11 @@ bool sharded_walk(const Walk& w, int W, std::vector<std::vector<int32_t>>& tok, 
                 return false;
             }
         }
-        if (step < steps)   /* all_gather, row-interleaved: y[s][w] = rank w's x[s] */
+        if (step < steps)   /* all_gather, row-interleaved by slot: y[s][w] = rank w's x[s], whole slots */
             for (int s = 0; s < S; ++s)
-                for (int r = 0; r < W; ++r) gath[(size_t)s * W + r] = keys[(size_t)r][(size_t)s];
+                for (int r = 0; r < W; ++r)
+                    for (int64_t q = 0; q < U; ++q)
+                        gath[(size_t)((s * W + r) * U + q)] = keys[(size_t)r][(size_t)(s * U + q)];
     }
     return true;
 }
@@ -364,6 +379,54 @@ int main(int argc, char** argv) {
         }
     } else {
         std::printf("checkpoint tables: not run (RADIANCE_DS41_WALK_TABLES unset%s)\n", quick ? ", or --quick" : "");
+    }
+    /* ---- the gather between steps, as deepseek41 issues it, against libr4d's admission of the gather rows */
+    {
+        ++g_cases;
+        const bool same = ds41walk::kSlot == R4D_DS41_WALK_SLOT;
+        std::printf("%-58s deepseek41's slot %lld f32 = libr4d's R4D_DS41_WALK_SLOT %d: %s\n", "key slot", (long long)ds41walk::kSlot,
+                    R4D_DS41_WALK_SLOT, same ? "yes" : "NO");
+        if (!same) ++g_fails;
+        const int64_t block = 5;
+        int calls = 0, refused = 0;
+        std::string first;
+        for (int W : { 2, 3, 4, 8 })
+            for (int64_t wseqs : { 1, 2, 3, 5, 8, 16 }) {
+                const int64_t KR = ds41walk::plane_rows(block, wseqs), KC = ds41walk::keys_cols(), GC = ds41walk::gath_cols(W);
+                /* the arena's planes, 256-byte aligned */
+                float* kp = (float*)std::aligned_alloc(256, (size_t)((KR * KC * 4 + 255) / 256 * 256));
+                float* gp = (float*)std::aligned_alloc(256, (size_t)((KR * GC * 4 + 255) / 256 * 256));
+                for (int64_t S = 1; S <= wseqs; ++S)
+                    for (int64_t l = 0; l < block; ++l) {
+                        const int64_t r0 = ds41walk::step_row(l, wseqs);
+                        RadTensor x = mat(kp + r0 * KC, RAD_F32, S, KC, KC), y = mat(gp + r0 * GC, RAD_F32, S, GC, GC);
+                        long long dp = -1, sp = -1;
+                        const int rc = r4d_ar_gather_admit(&x, &y, W, (long)ds41walk::gather_numel(wseqs), 4,
+                                                           ds41walk::gather_row(), &dp, &sp);
+                        ++calls;
+                        if (rc != RAD_OK || dp != 0 || sp != 0) {
+                            if (!refused++) first = "world " + std::to_string(W) + " wseqs " + std::to_string(wseqs) + " S " +
+                                                    std::to_string(S) + " step " + std::to_string(l) + ": rc " + std::to_string(rc);
+                        }
+                    }
+                std::free(kp);
+                std::free(gp);
+            }
+        ++g_cases;
+        std::printf("%-58s %d issues (world 2/3/4/8, 1-16 sequences a pass, every S and step): %s%s\n",
+                    "the walk's all_gather vs libr4d's gather admission", calls, refused ? "REFUSED " : "all admitted",
+                    refused ? first.c_str() : "");
+        if (refused) ++g_fails;
+        /* the geometry that failed on the cards: an 8-byte key a row */
+        float* kp = (float*)std::aligned_alloc(256, 4096);
+        float* gp = (float*)std::aligned_alloc(256, 4096);
+        RadTensor x = mat(kp, RAD_F32, 1, 2, 2), y = mat(gp, RAD_F32, 1, 8, 8);
+        const int old = r4d_ar_gather_admit(&x, &y, 4, 16, 4, 2, nullptr, nullptr);
+        std::free(kp);
+        std::free(gp);
+        ++g_cases;
+        std::printf("%-58s refused: %s (rc %d)\n", "the old 8-byte key row (row 2 f32), as on the cards", old != RAD_OK ? "yes" : "NO", old);
+        if (old == RAD_OK) ++g_fails;
     }
     std::printf("ds41 walk: %d case(s), %d failure(s)\n", g_cases, g_fails);
     return g_fails ? 1 : 0;

@@ -1,9 +1,9 @@
 /* r4d_ds41_walk_shapes.inc -- operand descriptions of dspark_walk_step (lever W1); included at the end of
  * r4d_shapes.cpp for its helpers (opd, opd_idx, R4D_PICK, pi).
  *
- * In schema order: logits [M * steps, N] f32, anchor (ids < n_vocab at anchor_stride), prev [M, 2 * world]
- * (the previous step's gathered keys, read as u64), pred / succ [n_vocab, rank] bf16, keys [M, 2] (this
- * step's key a sequence, read as u64 and max-ed into), tokens [M, steps] i32. Random keys are legal input:
+ * In schema order: logits [M * steps, N] f32, anchor (ids < n_vocab at anchor_stride), prev [M, 4 * world]
+ * (the previous step's gathered key slots: a u64 key and 8 bytes of padding each), pred / succ [n_vocab, rank] bf16, keys [M, 4] (this
+ * step's key slot a sequence, its u64 max-ed into), tokens [M, steps] i32. Random keys are legal input:
  * a key decodes to some id, and an id outside [0, n_vocab) contributes zeros. */
 extern "C" int r4d_shape_dspark_walk_step(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), steps = pi(p, n_p, "steps"), R = pi(p, n_p, "rank");
@@ -14,10 +14,10 @@ extern "C" int r4d_shape_dspark_walk_step(const RadParam* p, int n_p, int operan
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_F32, M * steps, N),           /* logits, this rank's shard */
         opd_idx((M - 1) * astr + 1, 0, V),              /* anchor */
-        opd((uint32_t)RAD_F32, M, 2 * world),           /* prev, gathered keys */
+        opd((uint32_t)RAD_F32, M, 4 * world),           /* prev, gathered key slots */
         opd((uint32_t)RAD_BF16, V, R),                  /* pred */
         opd((uint32_t)RAD_BF16, V, R),                  /* succ */
-        opd((uint32_t)RAD_F32, M, 2),                   /* keys */
+        opd((uint32_t)RAD_F32, M, 4),                   /* keys, one slot a sequence */
         opd_idx(M, steps, V),                           /* tokens */
     };
     R4D_PICK(l);

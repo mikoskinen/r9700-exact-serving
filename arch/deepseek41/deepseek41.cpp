@@ -27,6 +27,7 @@
 #include <arch/rad_deepseek41_chat.h>
 
 #include "ds41_index_split.h"
+#include "ds41_walk_geom.h"
 
 #include <algorithm>
 #include <atomic>
@@ -382,8 +383,9 @@ struct Dsp {
     rad_op embed = 0, embed_ar = 0, expand = 0, pre0 = 0, pre1 = 0, q_tab = 0, poff_op = 0, apos_op = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
     /* lever W1, the full-vocabulary walk (RADIANCE_DS41_DSPARK_WALK; walk_read_env): world > 1, a dspark_walk_step a
-     * step + the last merge, the keys a step [block * wseqs, 2] (u64 in f32 pairs) zeroed by wfill and gathered by
-     * wag into wgath [block * wseqs, world * 2]; world 1, dflash_markov_greedy_f32 (wmarkov) with its tile scratch. */
+     * step + the last merge, the keys a step [block * wseqs, 4] (a u64 in a 16-byte slot, ds41_walk_geom.h) zeroed by
+     * wfill and gathered by wag into wgath [block * wseqs, world * 4]; world 1, dflash_markov_greedy_f32 (wmarkov)
+     * with its tile scratch. */
     int64_t wseqs = 0;
     rad_buf wkeys = 0, wgath = 0, wts = 0, wtt = 0;
     rad_op wfill = 0, wag = 0, wmarkov = 0;
@@ -2344,23 +2346,25 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (!d.contract || !d.fnorm || !d.gather || !d.head || !d.topk || !d.select) return RAD_E_INVAL;
     /* Lever W1: the full-vocabulary walk beside it, when RADIANCE_DS41_DSPARK_WALK asked at the first declare. Every
      * rank scores its own vocabulary shard (the head's logits are vocab-sharded) and the ranks agree on each step's
-     * token through one all_gather of a u64 key a sequence (dspark_walk_step: the score's ordered bits and the id's
+     * token through one all_gather of a u64 key (in a 16-byte slot) a sequence (dspark_walk_step: the score's ordered bits and the id's
      * complement, ties to the lower id), so a step costs a shard scan and a gather; the last merge writes the last
      * token. One rank: the reference op dflash_markov_greedy_f32 over the whole vocabulary. Declared after the top-K
      * walk, so the planner keeps the logits live to the last step. */
     if (g_sw_walk_env.load(std::memory_order_relaxed) >= 0) {
         d.wseqs = d.Q / d.block;
-        const int64_t KR = d.block * d.wseqs;
+        const int64_t KR = ds41walk::plane_rows(d.block, d.wseqs);
         bool wok = true;
         if (g.world > 1 && !rad_op_declared(b, "dspark_walk_step")) {
             wok = false;   /* no loaded kernel plugin serves it (libr4d does): today's walk only */
         } else if (g.world > 1) {
-            d.wkeys = decl_b(b, nm.f("dspark_walk_keys"), RAD_F32, { KR, 2 });
-            d.wgath = decl_b(b, nm.f("dspark_walk_keys_all"), RAD_F32, { KR, (int64_t)g.world * 2 });
-            d.wfill = op(b, "fill", { RAD_RANGE("M", 1, KR), RAD_INT("n", 2), RAD_STR("dtype", "f32"), RAD_F64("value", 0.0) },
+            /* 16-byte key slots (ds41_walk_geom.h): the card's all-gather moves whole 16-byte words a row. */
+            d.wkeys = decl_b(b, nm.f("dspark_walk_keys"), RAD_F32, { KR, ds41walk::keys_cols() });
+            d.wgath = decl_b(b, nm.f("dspark_walk_keys_all"), RAD_F32, { KR, ds41walk::gath_cols(g.world) });
+            d.wfill = op(b, "fill", { RAD_RANGE("M", 1, KR), RAD_INT("n", ds41walk::keys_cols()), RAD_STR("dtype", "f32"),
+                                      RAD_F64("value", 0.0) },
                          {}, {}, { d.wkeys });
-            d.wag = op(b, "all_gather", { RAD_INT("world_size", g.world), RAD_INT("numel", d.wseqs * 2),
-                                          RAD_STR("dtype", "f32"), RAD_INT("row", 2) },
+            d.wag = op(b, "all_gather", { RAD_INT("world_size", g.world), RAD_INT("numel", ds41walk::gather_numel(d.wseqs)),
+                                          RAD_STR("dtype", "f32"), RAD_INT("row", ds41walk::gather_row()) },
                        {}, { d.wkeys }, { d.wgath });
             for (int64_t l = 0; l <= d.block; ++l) {
                 const rad_op w = op(b, "dspark_walk_step",
@@ -2857,17 +2861,19 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
                         brows(d.wtt, S), brows(d.tokens, S));
             return;
         }
-        const int64_t WS = d.wseqs, GW = (int64_t)g.world * 2;
-        RAD_ISSUE_N(x, d.wfill, d.block * WS, brows(d.wkeys, d.block * WS));
+        const int64_t WS = d.wseqs, KC = ds41walk::keys_cols(), GW = ds41walk::gath_cols(g.world);
+        const int64_t KR = ds41walk::plane_rows(d.block, WS);
+        RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
         for (int64_t l = 0; l < d.block; ++l) {
+            const int64_t r0 = ds41walk::step_row(l, WS);
             RAD_ISSUE_N(x, d.wstep[(size_t)l], S, brows(d.logits, N), anchor,
-                        l ? brow_slice(d.wgath, (l - 1) * WS, S, GW) : RAD_NONE, RAD_W(d.mk1), RAD_W(d.mk2),
-                        brow_slice(d.wkeys, l * WS, S, 2), brows(d.tokens, S));
-            RAD_ISSUE(x, d.wag, brow_slice(d.wkeys, l * WS, S, 2), brow_slice(d.wgath, l * WS, S, GW));
+                        l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
+                        RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
+            RAD_ISSUE(x, d.wag, brow_slice(d.wkeys, r0, S, KC), brow_slice(d.wgath, r0, S, GW));
         }
         RAD_ISSUE_N(x, d.wstep[(size_t)d.block], S, brows(d.logits, N), anchor,
-                    brow_slice(d.wgath, (d.block - 1) * WS, S, GW), RAD_W(d.mk1), RAD_W(d.mk2), RAD_NONE,
-                    brows(d.tokens, S));
+                    brow_slice(d.wgath, ds41walk::step_row(d.block - 1, WS), S, GW), RAD_W(d.mk1), RAD_W(d.mk2),
+                    RAD_NONE, brows(d.tokens, S));
         return;
     }
     if (d.merge) {

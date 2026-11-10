@@ -26,6 +26,9 @@
 // with ties to the lower id, so the rank-local reduction is one atomicMax per (block, sequence) and the
 // cross-rank one a max over the gathered keys: both are order-independent, so every rank derives the same
 // token from the same gathered bytes. Key 0 is "none" (a valid key's high word is at least 0x007fffff).
+// A key travels in a 16-byte SLOT (R4D_DS41_WALK_SLOT f32: the key, then 8 bytes nobody reads), because the
+// card's all-gather moves whole 16-byte words a row (r4d_ar_gather_admit.h); keys is [M, 4] f32 and the
+// gathered prev [M, world * 4] f32, rank w's key of sequence s at prev's u64 [s][2 w].
 //
 // One thread a vocabulary column, 128 a block, every sequence of the call in passes of eight (their
 // predecessor rows staged in LDS as f32); a thread reads its succ row once a pass in 16-byte pieces.
@@ -93,7 +96,7 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
                 p = anchor[(long)s * astride];
             } else {
                 unsigned long long k = 0ull;
-                for (int w = 0; w < world; ++w) k = walk_umax(k, prev[(long)s * ppitch + w]);
+                for (int w = 0; w < world; ++w) k = walk_umax(k, prev[(long)s * ppitch + 2 * w]);
                 p = walk_token(k);
                 if (blockIdx.x == 0) tokens[(long)s * tpitch + step - 1] = p;
             }
@@ -155,7 +158,8 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
 /* ------------------------------------------------------------------ plugin entry */
 enum { WK_LOGITS = 0, WK_ANCHOR, WK_PREV, WK_PRED, WK_SUCC, WK_KEYS, WK_TOKENS };
 
-/* An f32 [rows, 2 * width] plane read as [rows, width] u64: its row pitch in u64, or -1. */
+/* An f32 [rows, 2 * width] plane read as [rows, width] u64 (a key slot is two of them): its row pitch in u64,
+ * or -1. */
 static long long wk_u64_plane(const RadTensor* t, long long rows, long long width) {
     if (!t || !t->data || t->dtype != RAD_F32 || t->rank != 2) return -1;
     if (t->shape[0] < rows || t->shape[1] < 2 * width) return -1;
@@ -191,9 +195,9 @@ extern "C" int r4d_rad_dspark_walk_step(const RadArgs* a, RadStream stream) {
         r4d_numel(pred) < V * R || r4d_numel(succ) < V * R || ((uintptr_t)succ->data & 15))
         return R4D_NO(RAD_E_SHAPE);
     long long ppitch = 0, kpitch = 0, lpitch = 0;
-    if (step > 0 && (ppitch = wk_u64_plane(prev, S, world)) < 0) return R4D_NO(RAD_E_SHAPE);
+    if (step > 0 && (ppitch = wk_u64_plane(prev, S, 2 * world)) < 0) return R4D_NO(RAD_E_SHAPE);
     if (step < steps) {
-        if ((kpitch = wk_u64_plane(keys, S, 1)) < 0) return R4D_NO(RAD_E_SHAPE);
+        if ((kpitch = wk_u64_plane(keys, S, 2)) < 0) return R4D_NO(RAD_E_SHAPE);
         if (logits->dtype != RAD_F32 || logits->rank != 2 || logits->shape[0] < S * steps ||
             logits->shape[1] < N || (lpitch = r4d_row_pitch(logits)) < N || lpitch < 1)
             return R4D_NO(RAD_E_SHAPE);

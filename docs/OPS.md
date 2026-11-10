@@ -3572,12 +3572,13 @@ therefore not established.
 `dspark_walk_step` is the same walk on a vocabulary-sharded head (tensor parallelism; lever W1 of
 DeepSeek-V4.1): one step on one rank's shard `[vocab_off, vocab_off + N)` of the `n_vocab` ids, issued
 `steps` times with an `all_gather` of `keys` between steps and once more at `step = steps`. Step `l`'s
-predecessor is the greatest of step `l-1`'s gathered keys `prev` (`[M, world]` u64 carried in an F32
-`[M, 2 * world]` plane; the anchor at `l = 0`), written to `tokens[s][l-1]`. Each column's score
+predecessor is the greatest of step `l-1`'s gathered keys `prev` (an F32 `[M, 4 * world]` plane of 16-byte
+slots, each a u64 key and 8 bytes of padding: libr4d's all-gather moves whole 16-byte words a row; the
+anchor at `l = 0`), written to `tokens[s][l-1]`. Each column's score
 `logits[s * steps + l][j] + sum_r pred[prev, r] * succ[vocab_off + j, r]` is summed by `fma` in rank
 order, keyed as `(ordered score bits) << 32 | ~id` (ties to the lower id; a NaN score is never chosen,
--0 counts as +0) and the shard's greatest key is max-ed into `keys[s]` (u64 in an F32 `[M, 2]` plane,
-zeroed before the step). The key is order-free, so every rank derives the same token from the same
+-0 counts as +0) and the shard's greatest key is max-ed into `keys[s]` (the u64 of a 16-byte slot, an F32 `[M, 4]`
+plane, zeroed before the step). The key is order-free, so every rank derives the same token from the same
 gathered bytes. libr4d only; no libref oracle (tests/r4d_emu/test_ds41walk holds it to a host walk).
 
 ### DFlash2
