@@ -20474,7 +20474,10 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
         double layer = 0.0;
         for (int pi = 0; pi < 2 && r; ++pi) {
             const Proj& P = projs[pi];
-            const int64_t N = P.N, K = P.K, Ma = P.srt ? Tr : Mtok, cb = N * K / 2, sb = N * K / 32;
+            /* moe_gemm_q (mxfp4a8) takes the step's whole slot buffers, M x top_k rows (y, sorted, and a in
+             * sorted order); the rank's routed rows are [0, off[E]). */
+            const int64_t TS = Mtok * top_k;
+            const int64_t N = P.N, K = P.K, Ma = P.srt ? TS : Mtok, cb = N * K / 2, sb = N * K / 32;
             const int64_t nec[2] = { (E + 1) / 2, E / 2 };
             const double slice = (double)(cb + sb);
             std::vector<uint8_t> av((size_t)(Ma * K));
@@ -20484,9 +20487,9 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
             for (size_t i = 0; i < asc.size(); ++i) asc[i] = 0.003f * (float)(1 + i % 5);
             void* d_a = dalloc(av.size());
             void* d_as = dalloc(asc.size() * 4);
-            void* d_s = dalloc((size_t)Tr * 4);
+            void* d_s = dalloc((size_t)TS * 4);
             void* d_o = dalloc((size_t)(E + 1) * 4);
-            void* d_y = dalloc((size_t)(Tr * N) * 2);
+            void* d_y = dalloc((size_t)(TS * N) * 2);
             void *d_w[2], *d_sc[2], *d_tw[2], *d_ts[2];
             bool okk = d_a && d_as && d_s && d_o && d_y;
             for (int c = 0; c < 2 && okk; ++c) {
@@ -20513,14 +20516,18 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
             if (!okk) { std::printf("  mx %s: alloc failed\n", P.name); dfree_all(); break; }
             st_memcpy(d_a, av.data(), av.size(), hipMemcpyHostToDevice);
             st_memcpy(d_as, asc.data(), asc.size() * 4, hipMemcpyHostToDevice);
-            st_memcpy(d_s, sorted.data(), (size_t)Tr * 4, hipMemcpyHostToDevice);
+            {
+                std::vector<int32_t> sp(sorted);
+                sp.resize((size_t)TS, 0);
+                st_memcpy(d_s, sp.data(), (size_t)TS * 4, hipMemcpyHostToDevice);
+            }
             st_memcpy(d_o, off.data(), (size_t)(E + 1) * 4, hipMemcpyHostToDevice);
             std::vector<RadTensor> ts = {
                 T(d_a, RAD_F8E4M3, { Ma, K }), T(d_as, RAD_F32, { Ma, K / 128 }),
                 T(d_tw[0], RAD_FP4E2M1, { nec[0], N, K }), T(d_ts[0], RAD_E8M0, { nec[0], N, K / 32 }),
-                T(d_s, RAD_I32, { Tr }), T(d_o, RAD_I32, { E + 1 }),
+                T(d_s, RAD_I32, { TS }), T(d_o, RAD_I32, { E + 1 }),
                 T(d_tw[1], RAD_FP4E2M1, { nec[1], N, K }), T(d_ts[1], RAD_E8M0, { nec[1], N, K / 32 }),
-                T(d_y, RAD_BF16, { Tr, N }),
+                T(d_y, RAD_BF16, { TS, N }),
             };
             for (int i : { 2, 3, 6, 7 }) ts[(size_t)i].stride[0] = 0;
             std::vector<RadParam> ps = { PI("M", Mtok), PI("N", N), PI("K", K), PI("N_odd", N), PI("K_odd", K),
@@ -20534,8 +20541,8 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
             const std::vector<int> forms = pl.pin_mx_small ? std::vector<int>{ 0, 2, 1, 3 } : std::vector<int>{ 0 };
             for (const int form : forms) {
                 if (pl.pin_mx_small) pl.pin_mx_small(form);
-                const size_t yb = (size_t)(Tr * N) * 2;
-                st_memset(d_y, 0xff, yb);
+                const size_t yb = (size_t)(Tr * N) * 2;   /* the rank's rows, compared */
+                st_memset(d_y, 0xff, (size_t)(TS * N) * 2);
                 const int rc = r->launch(&a, nullptr);
                 const char* nmf = form == 0 ? "rule" : form == 1 ? "pin 1 small-M" : form == 2 ? "pin 2 never small" : "pin 3 small-M K256x4";
                 if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
@@ -20652,6 +20659,98 @@ static void ds_moe_perf(const Plugin& pl, int64_t Mtok, int iters, const char* f
         }
         std::printf("DSMOE iqr%d layer M=%lld gate_up + down %.1f us\n", B, (long long)Mtok, layer);
     }
+}
+
+/* --perfgg [M list] [iters] [types] (10.11.2026, the ds-main-port bench): gemm_nt_ggml's decode band (gg_gemv_kernel)
+ * at DeepSeek-V4.1-Flash's dense TP4 shapes on one card -- attn_q_b 8192 x 1280, attn_output_b 5120 x 2048, the shared
+ * expert's gate_up 1536 x 5120 and down 5120 x 768, attn_q_a 1280 x 5120, attn_output_a 1024 x 4096, attn_kv 512 x 5120,
+ * engram_kv 25600 x 6144 -- in q5_K / q6_K / q8_0, at M rows (default 1, 4, 8). The weight streams from DRAM (rotated
+ * copies past 256 MiB) or, with --cold, past a flush. The rule's form, then every form r4d_gg_gemv_pin names (rows a
+ * wave 1 / 2 / 4, grid cap 256 / 1024) where the pin is exported, each output compared with the rule's byte for byte
+ * (every form keeps the per-output order, so a difference is a bug). us a call and GB/s of weight bytes. */
+static void ds_gg_perf(const Plugin& pl, const char* mlist, int iters, const char* tlist) {
+    if (iters <= 0) iters = 100;
+    const RadKernelInfo* r = find(pl, "gemm_nt_ggml_qk256_gemv");
+    const RadKernelInfo* r32 = find(pl, "gemm_nt_ggml_qk32_gemv");
+    auto pin = (void (*)(int, int))dlsym(pl.h, "r4d_gg_gemv_pin");
+    if (!r || !r32) { std::printf("--perfgg: gemm_nt_ggml gemv rows absent\n"); return; }
+    std::vector<int64_t> Ms;
+    { std::string m = mlist && *mlist ? mlist : "1,4,8"; size_t p = 0;
+      while (p < m.size()) { size_t q = m.find(',', p); if (q == std::string::npos) q = m.size(); Ms.push_back(std::strtoll(m.substr(p, q - p).c_str(), nullptr, 10)); p = q + 1; } }
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    struct Sh { const char* name; int64_t N, K; };
+    const Sh shapes[] = { { "attn_q_b", 8192, 1280 }, { "attn_output_b", 5120, 2048 }, { "shexp_gate_up", 1536, 5120 },
+                          { "shexp_down", 5120, 768 }, { "attn_q_a", 1280, 5120 }, { "attn_output_a", 1024, 4096 },
+                          { "attn_kv", 512, 5120 }, { "engram_kv", 25600, 6144 } };
+    struct Ty { const char* name; int qk, bb; };
+    const Ty types[] = { { "q5_K", 256, 176 }, { "q6_K", 256, 210 }, { "q8_0", 32, 34 } };
+    uint64_t rs = 0x9E3779B97F4A7C15ull;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::printf("gemm_nt_ggml decode band at DeepSeek-V4.1's dense TP4 shapes; %s, %d launches; pin %s\n",
+                g_cold > 0 ? fmt("cold (%lld MiB read before each, median)", (long long)(g_cold >> 20)).c_str()
+                           : "rotated weight copies (mean)", iters, pin ? "exported" : "ABSENT (rule only)");
+    for (const Ty& ty : types) {
+        if (("," + want + ",").find(std::string(",") + ty.name + ",") == std::string::npos) continue;
+        for (const Sh& sh : shapes) {
+            const int64_t N = sh.N, K = sh.K;
+            if (K % ty.qk) continue;
+            const int64_t rb = K / ty.qk * ty.bb, wbytes = N * rb;
+            std::vector<uint8_t> hw((size_t)wbytes);
+            for (size_t i = 0; i < hw.size(); i += 8) { const uint64_t v = rnd(); std::memcpy(&hw[i], &v, std::min<size_t>(8, hw.size() - i)); }
+            const uint16_t d16 = 0x211F, dm16 = 0x1C00;   /* ~0.0102 and ~0.0039: finite products, no exceptional values */
+            for (int64_t n = 0; n < N; ++n)
+                for (int64_t b = 0; b < K / ty.qk; ++b) {
+                    uint8_t* blk = hw.data() + n * rb + b * ty.bb;
+                    if (!std::strcmp(ty.name, "q6_K")) std::memcpy(blk + 208, &d16, 2);
+                    else { std::memcpy(blk, &d16, 2); if (!std::strcmp(ty.name, "q5_K")) std::memcpy(blk + 2, &dm16, 2); }
+                }
+            const int copies = (int)std::max<int64_t>(2, (256ll << 20) / wbytes + 1);
+            for (int64_t M : Ms) {
+                if (M < 1 || M > 48) continue;
+                dfree_all();
+                std::vector<uint16_t> hx((size_t)(M * K));
+                for (size_t i = 0; i < hx.size(); ++i) hx[i] = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 1000.0f);
+                void* d_x = dalloc(hx.size() * 2);
+                void* d_w = dalloc((size_t)wbytes * (size_t)copies);
+                void* d_y = dalloc((size_t)(M * N) * 2);
+                if (!d_x || !d_w || !d_y) { std::printf("  %s %s M=%lld: alloc failed\n", ty.name, sh.name, (long long)M); continue; }
+                st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+                for (int c = 0; c < copies; ++c)
+                    st_memcpy((uint8_t*)d_w + (size_t)c * (size_t)wbytes, hw.data(), (size_t)wbytes, hipMemcpyHostToDevice);
+                std::vector<RadTensor> ts = { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, rb }), T(d_y, RAD_BF16, { M, N }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("type", ty.name), PS("dtype", "bf16") };
+                RadArgs a;
+                std::memset(&a, 0, sizeof(a));
+                a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+                const RadKernelInfo* row = ty.qk == 256 ? r : r32;
+                struct Form { int rpw, grid; const char* nm; };
+                std::vector<Form> forms = { { 0, 0, "rule" } };
+                if (pin) for (int rp : { 1, 2, 4 }) for (int g : { 256, 1024 }) forms.push_back({ rp, g, nullptr });
+                std::vector<uint16_t> first;
+                std::string line = fmt("GGPERF %s %s %lldx%lld M=%lld (%.2f MiB):", ty.name, sh.name, (long long)N, (long long)K, (long long)M, wbytes / 1048576.0);
+                for (const Form& f : forms) {
+                    if (pin) pin(f.rpw, f.grid);
+                    st_memset(d_y, 0xff, (size_t)(M * N) * 2);
+                    ts[1].data = (uint8_t*)d_w;
+                    const int rc = row->launch(&a, nullptr);
+                    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { line += fmt(" %s rc=%d;", f.nm ? f.nm : fmt("r%dg%d", f.rpw, f.grid).c_str(), rc); continue; }
+                    std::vector<uint16_t> got((size_t)(M * N));
+                    st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+                    const bool same = first.empty() || got == first;
+                    if (first.empty()) first = got;
+                    for (int i = 0; i < 20; ++i) { ts[1].data = (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes; row->launch(&a, nullptr); }
+                    const double us = st_time_us([&](int i) { ts[1].data = (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes; row->launch(&a, nullptr); }, iters, nullptr);
+                    line += fmt(" %s %.1f us %.0f GB/s%s;", f.nm ? f.nm : fmt("r%dg%d", f.rpw, f.grid).c_str(), us, wbytes / (us * 1e3),
+                                same ? "" : " OUTPUT DIFFERS");
+                    if (!same) ++g_fail;
+                }
+                if (pin) pin(0, 0);
+                std::printf("%s\n", line.c_str());
+                std::fflush(stdout);
+            }
+        }
+    }
+    dfree_all();
 }
 
 /* The gated residual's read at int8 codes. The same inputs run with the codes plane as E4M3 and
@@ -35089,6 +35188,7 @@ int main(int argc, char** argv) {
     const char* ar8_w = nullptr;
     long long mx_m = 0, mx_e = 288, mx_k = 8;
     long long dsm_m = 0; int dsm_it = 0; const char* dsm_fmts = nullptr;   /* --perfdsmoe */
+    bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     const char* mx_skew = nullptr;
     int mx_tp = 8;
     bool mx_f8 = false;
@@ -35319,6 +35419,12 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_e = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_k = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mx_skew = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfgg")) {
+            /* gemm_nt_ggml's decode band at DeepSeek-V4.1's dense shapes, the rule vs pinned forms (ds_gg_perf). */
+            dsg = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsg_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) dsg_t = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfdsmoe")) {
             /* DeepSeek-V4.1's routed-expert GEMMs at its TP4 layout, MXFP4 vs IQR-V4 (ds_moe_perf). */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -35544,6 +35650,16 @@ int main(int argc, char** argv) {
         skip("bf16 head timing", "built without HIP");
 #endif
         return 0;
+    }
+    if (dsg) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        ds_gg_perf(pl, dsg_m, dsg_it, dsg_t);
+        dfree_all();
+#else
+        skip("DeepSeek dense GEMV timing", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (dsm_m) {
         if (!load(&pl, path)) return 1;
