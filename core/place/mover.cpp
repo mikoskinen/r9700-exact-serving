@@ -85,11 +85,14 @@ Mover::~Mover() {
     if (gate_) rad_event_destroy(gate_);
     for (ClassPools& c : pools_)
         if (c.park_base) rad_dev_free(c.park_base, RAD_MEM_HOST_PINNED);
+    /* Lever DL's host copies are always the mover's own (outside the budget). */
+    for (ClassPools& c : pools_)
+        if (c.keep_base) rad_dev_free(c.keep_base, RAD_MEM_HOST_MAPPED);
     /* Only what this object allocated; a Pool reservation belongs to the Pool. */
     if (owns_memory_) {
         for (ClassPools& c : pools_) {
             if (c.slab_base) rad_dev_free(c.slab_base, RAD_MEM_DEVICE);
-            if (c.pool_base) rad_dev_free(c.pool_base, RAD_MEM_HOST_PINNED);
+            if (c.pool_base && c.pool_base != c.keep_base) rad_dev_free(c.pool_base, RAD_MEM_HOST_PINNED);
         }
         if (static_vram_) rad_dev_free(static_vram_, RAD_MEM_DEVICE);
         if (stage_) rad_dev_free(stage_, RAD_MEM_HOST_PINNED);
@@ -158,6 +161,44 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         }
     }
 
+    /* ---- lever DL: the drafter's classes, and the host copies their resident units keep ------
+     *
+     * A class is the drafter's when every unit in it is a routed unit of a layer at or above
+     * draft_keep_from (classes are per stride, and the drafter's experts have a stride of their
+     * own). Its units resident in VRAM get a pool slot past the plan's pooled ones, filled from
+     * their VRAM slots by draft_lend_setup; promotions keep it. Nothing else of the plan moves. */
+    dl_units_.clear();
+    dl_classes_.clear();
+    dl_ready_ = false;
+    dl_want_ = false;
+    dl_slab_bytes_ = dl_keep_bytes_ = 0;
+    dl_state_.store(kDlResident, std::memory_order_relaxed);
+    std::vector<int64_t> n_keep(plan.classes.size(), 0);
+    if (cfg.draft_keep_from >= 0 && plan.dynamic) {
+        const size_t nc = plan.classes.size();
+        std::vector<int64_t> drafter(nc, 0), other(nc, 0);
+        for (const MoveUnit& mu : plan.units) {
+            if (mu.slab_class < 0) continue;
+            const bool d = mu.expert >= 0 && mu.layer >= cfg.draft_keep_from && !mu.host_forced &&
+                           (mu.tier == Tier::HostPinned || (mu.tier == Tier::VRAM && mu.slab_slot >= 0));
+            ++(d ? drafter : other)[(size_t)mu.slab_class];
+        }
+        for (size_t c = 0; c < nc; ++c)
+            if (drafter[c] > 0 && other[c] == 0) {
+                pools_[c].keep = true;
+                dl_classes_.push_back((int32_t)c);
+            }
+        for (size_t u = 0; u < plan.units.size(); ++u) {
+            const MoveUnit& mu = plan.units[u];
+            if (mu.slab_class < 0 || !pools_[(size_t)mu.slab_class].keep) continue;
+            dl_units_.push_back((int32_t)u);
+            if (mu.tier != Tier::VRAM) continue;
+            const size_t c = (size_t)mu.slab_class;
+            unit_[u].pool_slot = n_pool[c] + n_keep[c]++;
+            pool_layer_[c].push_back(mu.layer);
+        }
+    }
+
     /* ---- allocate ------------------------------------------------------------------------- */
     int64_t total_shadow = 0, total_turn = 0, total_slab = 0, total_pool = 0;
     for (size_t c = 0; c < plan.classes.size(); ++c) {
@@ -183,7 +224,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         total_turn += cp.n_turn;
         cp.slab.init(slab_slots, sc.stride);
         total_slab += slab_slots;
-        total_pool += n_pool[c];
+        total_pool += n_pool[c] + n_keep[c];
         if (slab_slots > 0) {
             /* Tail padding: a kernel assembling a packed code window from a wide read may read a
              * few bytes past the last slot; without padding that runs off the allocation and
@@ -199,8 +240,30 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         for (int64_t s = n_slab[c]; s < slab_slots; ++s) cp.slab.add_free(s);
         total_shadow += shadow + sc.n_stage;
 
-        cp.pool.init(n_pool[c], sc.stride);
-        if (n_pool[c] > 0) {
+        cp.pool.init(n_pool[c] + n_keep[c], sc.stride);
+        if (cp.keep && n_pool[c] + n_keep[c] > 0) {
+            /* Lever DL: the drafter's pool, its planned pooled units and the host copies, in one
+             * mapped allocation of the mover's own. Outside --host-pool-mib on purpose: charged to
+             * the budget it would change the split (the expert floor counts the pool's room), and
+             * the plan must stay today's. The bytes the planner charged for the pooled part stay
+             * unreserved in the budget pool. */
+            const int64_t bytes = (n_pool[c] + n_keep[c]) * sc.stride;
+            cp.keep_base = rad_dev_alloc(bytes, RAD_MEM_HOST_MAPPED);
+            if (!cp.keep_base) {
+                RAD_ERR("mover: no pinned host memory for the drafter's '%s' pool and host copies: "
+                        "%lld slots of %s", sc.name.c_str(), (long long)(n_pool[c] + n_keep[c]),
+                        humanb(sc.stride).c_str());
+                return RAD_E_NOMEM;
+            }
+            cp.pool_base = cp.keep_base;
+            cp.pool_dev = rad_dev_device_ptr(cp.pool_base);
+            if (!cp.pool_dev) {
+                RAD_WARN("mover: the drafter's '%s' host pool has no device address; a kernel reading "
+                         "it zero-copy would fault", sc.name.c_str());
+                cp.pool_dev = cp.pool_base;
+            }
+            dl_keep_bytes_ += n_keep[c] * sc.stride;
+        } else if (n_pool[c] > 0) {
             cp.pool_base = reserve(sc.name.c_str(), n_pool[c] * sc.stride, RAD_MEM_HOST_PINNED);
             if (!cp.pool_base) {
                 RAD_ERR("mover: no pinned host memory for the '%s' pool: %lld slots of %s",
@@ -1413,7 +1476,8 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
 /* ------------------------------------------------------------------ the loan */
 static const char* lender_name(int lender) {
-    return lender == Mover::kLendKV ? "KV cache" : "activation arena";
+    return lender == Mover::kLendKV ? "KV cache"
+         : lender == Mover::kLendArena ? "activation arena" : "drafter's expert slab";
 }
 
 static char* align_down_ptr(char* p) {
@@ -1439,6 +1503,8 @@ int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
         const UnitState& us = unit_[u];
         if (us.klass < 0 || us.tier != Tier::HostPinned || us.pool_slot < 0) continue;
         if (!plan_->units[u].movable) continue;
+        /* The drafter's slab is lent to the trunk, never to the drafter's own classes. */
+        if (lender == kLendDraft && pools_[(size_t)us.klass].keep) continue;
         ++want[(size_t)us.klass];
     }
     std::vector<double> weight(nc, 0.0);
@@ -1791,8 +1857,10 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
     /* Into a lent slot the host copy stays: the loan can be recalled at any time, and a unit
      * that kept its pool slot goes back by a change of address instead of needing a pool slot and
      * a link copy just as the cache wants its memory. The quarantine then has no pool slot to
-     * free. Every pool unit keeps its slot on promotion: the pool is one cache, so the later demotion is a copyless drop for natives and deposits alike. */
-    m.pool_slot = cp.is_flex(slot) ? -1 : us.pool_slot;
+     * free. Every pool unit keeps its slot on promotion: the pool is one cache, so the later demotion is a copyless drop for natives and deposits alike.
+     * A drafter class under lever DL (ClassPools::keep) keeps it into a budgeted slot too, so the
+     * drafter leaves the card by a change of address whenever its slab is lent. */
+    m.pool_slot = cp.is_flex(slot) || cp.keep ? -1 : us.pool_slot;
     m.state = Move::State::Copying;
     m.unit = unit;
     ++copying_[(size_t)unit];
@@ -1858,6 +1926,8 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
 
 int Mover::balance(HeatEngine* heat, bool turnover) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;
+    /* Lever DL first: a recall sets the loan to 0 here and the sweep below drops what it covered. */
+    RAD_TRY(draft_advance(heat));
 
     for (size_t c = 0; c < pools_.size(); ++c) {
         ClassPools& cp = pools_[c];
@@ -2096,6 +2166,173 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
                 (long long)loan_held(lender));
         return RAD_E_STATE;
     }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ lever DL */
+int Mover::draft_lend_setup() {
+    dl_ready_ = false;
+    if (!plan_ || !plan_->dynamic || dl_classes_.empty()) return RAD_OK;
+    if (!mover_ || !compute_) {
+        RAD_ERR("mover: the drafter's lend is set up after the compute stream is bound");
+        return RAD_E_STATE;
+    }
+    /* The host copies, from the VRAM slots the load filled: the stored form, byte for byte, as a
+     * demotion copies it (the slab layout is the pool layout). */
+    int64_t copied = 0;
+    for (int32_t u : dl_units_) {
+        const UnitState& us = unit_[(size_t)u];
+        if (us.slab_slot < 0 || us.pool_slot < 0) continue;
+        const ClassPools& cp = pools_[(size_t)us.klass];
+        RAD_TRY(rad_memcpy_async((char*)cp.pool_base + us.pool_slot * cp.stride, cp.slot_ptr(us.slab_slot),
+                                 us.bytes, mover_));
+        copied += us.bytes;
+    }
+    RAD_TRY(rad_stream_sync(mover_));
+    /* The drafter's whole budgeted slab (resident, shadow and staging slots), one stretch a class,
+     * lent in bytes from the top. */
+    std::vector<LoanStrip> strips;
+    dl_slab_bytes_ = 0;
+    for (int32_t c : dl_classes_) {
+        const ClassPools& cp = pools_[(size_t)c];
+        if (!cp.slab_base || cp.n_fixed <= 0) continue;
+        LoanStrip st;
+        st.top = (char*)cp.slab_base + cp.n_fixed * cp.stride;
+        st.bytes = cp.n_fixed * cp.stride;
+        st.unit_bytes = 1;
+        st.unit_tokens = 1;
+        strips.push_back(st);
+        dl_slab_bytes_ += st.bytes;
+    }
+    int64_t before = 0;
+    for (const ClassPools& cp : pools_) before += (int64_t)cp.flex_ptr.size();
+    RAD_TRY(lend_from(kLendDraft, strips));
+    int64_t slots = -before;
+    for (const ClassPools& cp : pools_) slots += (int64_t)cp.flex_ptr.size();
+    dl_ready_ = slots > 0 && loan_ceiling(kLendDraft) > 0;
+    dl_count();
+    RAD_INFO("mover: lever DL: %lld drafter units in %zu class(es), %s of host copies filled (outside "
+             "--host-pool-mib); the drafter's slab, %s, lends %lld trunk slots while the drafter "
+             "does not draft%s", (long long)dl_units_.size(), dl_classes_.size(), humanb(copied).c_str(),
+             humanb(dl_slab_bytes_).c_str(), (long long)slots, dl_ready_ ? "" : " -- nothing to lend");
+    return RAD_OK;
+}
+
+void Mover::dl_count() {
+    int64_t res = 0, lent = 0;
+    for (int32_t u : dl_units_) {
+        const UnitState& us = unit_[(size_t)u];
+        if (us.slab_slot >= 0 && us.tier == Tier::VRAM && !unit_in_flight(u)) ++res;
+    }
+    /* Trunk units whose slot is in the drafter's memory (a kLendDraft segment). */
+    for (size_t u = 0; u < unit_.size(); ++u) {
+        const UnitState& us = unit_[u];
+        if (us.klass < 0 || us.slab_slot < 0) continue;
+        const ClassPools& cp = pools_[(size_t)us.klass];
+        if (!cp.is_flex(us.slab_slot)) continue;
+        for (const ClassPools::Lent& l : cp.lent)
+            if (l.lender == kLendDraft && us.slab_slot >= l.first &&
+                us.slab_slot < l.first + (int64_t)l.need.size())
+                ++lent;
+    }
+    dl_resident_.store(res, std::memory_order_relaxed);
+    dl_lent_units_.store(lent, std::memory_order_relaxed);
+}
+
+/* The state machine (mover.h, lever DL), one step a dispatch. Parking and loading leave a unit that
+ * cannot move now (a copy in flight, no free record, no free slot) for a later call; every edge
+ * is guarded by what the slots hold, never by time. */
+int Mover::draft_advance(HeatEngine* heat) {
+    if (!dl_ready_) return RAD_OK;
+    const int st0 = dl_state_.load(std::memory_order_relaxed);
+    int st = st0;
+    if (dl_want_) {
+        /* A recall not yet past its drops: the drafter's slots were never covered again, so the slab is
+         * still the trunk's alone; lend it again at once rather than empty and refill it. */
+        if (st == kDlUnlending) {
+            RAD_TRY(set_loan(kLendDraft, loan_ceiling(kLendDraft)));
+            st = kDlLent;
+            dl_set(st);
+            dl_lends_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (st == kDlResident || st == kDlLoading) {
+            /* No drafter slot is covered from here on: nothing can be promoted into one, and each
+             * slot leaves the class's range as its unit drops and its quarantine clears. */
+            for (int32_t c : dl_classes_) pools_[(size_t)c].slab.set_target(0, 0);
+            st = kDlParking;
+            dl_set(st);
+        }
+        if (st == kDlParking) {
+            bool left = false;
+            for (int32_t u : dl_units_) {
+                UnitState& us = unit_[(size_t)u];
+                if (us.slab_slot < 0) continue;
+                if (unit_in_flight(u)) { left = true; continue; }   /* its promotion lands first */
+                if (drop(u, heat) < 0) { left = true; break; }       /* no record free: next call */
+            }
+            bool clear = !left;
+            for (int32_t c : dl_classes_)
+                if (pools_[(size_t)c].slab.top_held(0) >= 0) clear = false;
+            /* And nothing of an earlier loan still in the drafter's memory (a lend after a recall
+             * that had not finished). */
+            if (clear && loan_held(kLendDraft) == 0) {
+                RAD_TRY(set_loan(kLendDraft, loan_ceiling(kLendDraft)));
+                st = kDlLent;
+                dl_set(st);
+                dl_lends_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        /* Parked units are busy to the heat engine: nothing may propose them while their class has
+         * no slot (a quarantine's retire clears the flag; it is set again here). */
+        if (heat)
+            for (int32_t u : dl_units_)
+                if (unit_[(size_t)u].slab_slot < 0 && !unit_in_flight(u) && !heat->busy(u))
+                    heat->set_busy(u, true);
+        dl_count();
+        return RAD_OK;
+    }
+
+    /* Recall. */
+    if (st == kDlParking || st == kDlLent) {
+        if (loan_[kLendDraft] > 0) RAD_TRY(set_loan(kLendDraft, 0));   /* the sweep in balance() drops */
+        st = kDlUnlending;
+        dl_set(st);
+        dl_reclaims_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (st == kDlUnlending) {
+        /* A trunk unit still in the drafter's memory, a copy landing there or a quarantine. */
+        if (loan_held(kLendDraft) > 0) { dl_count(); return RAD_OK; }
+        for (int32_t c : dl_classes_) {
+            ClassPools& cp = pools_[(size_t)c];
+            cp.slab.set_target(0, cp.n_fixed);
+        }
+        st = kDlLoading;
+        dl_set(st);
+    }
+    if (st == kDlLoading) {
+        bool left = false;
+        for (int32_t u : dl_units_) {
+            UnitState& us = unit_[(size_t)u];
+            if (us.slab_slot >= 0 && us.tier == Tier::VRAM && !unit_in_flight(u)) continue;   /* home */
+            left = true;
+            if (us.slab_slot >= 0 || unit_in_flight(u) || us.pool_slot < 0) continue;      /* on its way */
+            ClassPools& cp = pools_[(size_t)us.klass];
+            /* The lowest free slot, so the units pack at the bottom and the working slots stay free
+             * above them, as the plan laid them out. */
+            const int64_t slot = cp.slab.take();
+            if (slot < 0) continue;
+            if (heat) heat->set_busy(u, true);
+            if (promote_to(u, slot) < 0) {   /* no record left: next call */
+                cp.slab.add_free(slot);
+                break;
+            }
+        }
+        if (!left) {
+            st = kDlResident;
+            dl_set(st);
+        }
+    }
+    dl_count();
     return RAD_OK;
 }
 

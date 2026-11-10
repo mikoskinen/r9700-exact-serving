@@ -3053,6 +3053,19 @@ int Engine::load_weights() {
         MoverConfig mc{};
         mc.container_path = file_ ? cfg_.model : std::string();
         mc.turnover_slots = mover_turnover_from_env(hp);
+        /* Lever DL: RADIANCE_DRAFT_LEND set at start (any value; it is the switch's start value)
+         * declares the drafter's lend. Only a block drafter: its experts run in its query pass alone
+         * (deepseek41.cpp dsp_declare), while a serial head's history pass runs every step. */
+        if (const char* e = std::getenv("RADIANCE_DRAFT_LEND"); e && *e) {
+            const RadDrafterDecl& dd = r->program.drafter;
+            if (dd.kind == RAD_DRAFT_BLOCK && dd.depth > 0 && cfg_.n_spec > 0 && r->program.meta.n_layers > 0) {
+                mc.draft_keep_from = (int32_t)r->program.meta.n_layers;
+                dl_declared_ = true;
+            } else if (r->index == 0) {
+                RAD_INFO("RADIANCE_DRAFT_LEND=%s: this deployment has no block drafter drafting "
+                         "(--num-speculative-tokens N with a DSpark-style head); nothing to lend", e);
+            }
+        }
         /* A file-tier weight the kernel relayouts is relaid on every read, by the kernel's own
          * relayout, as the relayout pool does once for a resident one. */
         {
@@ -4317,6 +4330,28 @@ int Engine::start() {
             for (auto& r : ranks_) r->arena_lent.clear();
         }
     }
+    /* ---- lever DL: the drafter's expert slab, lent to the trunk while it does not draft --------
+     *
+     * Every rank's mover kept a host copy of each drafter unit (load_weights); here the copies are
+     * filled from the VRAM slots the load wrote and the slab is carved for the trunk's classes. It
+     * is lent only when the scheduler asks (Scheduler::draft_lend_wanted, at each step release). */
+    dl_capable_ = false;
+    if (dl_declared_) {
+        bool all = true;
+        for (auto& r : ranks_) {
+            if (!r->heat.enabled()) { all = false; continue; }
+            RAD_TRY(rad_dev_set(r->device));
+            LogRank lr(r->index);
+            RAD_TRY(r->mover.draft_lend_setup());
+            all = all && r->mover.draft_lend_ready();
+        }
+        (void)rad_dev_set(ranks_[0]->device);
+        dl_capable_ = all && !ranks_.empty();
+        if (!dl_capable_)
+            RAD_INFO("RADIANCE_DRAFT_LEND: the drafter's slab cannot be lent on every rank (a static plan, "
+                     "or no drafter class of its own); the lend stays off");
+    }
+
     /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
      * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is
      * drained to the affordable loan before the blocks are handed out, and the followers' marks

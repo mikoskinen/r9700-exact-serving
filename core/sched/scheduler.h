@@ -308,6 +308,21 @@ public:
     int      set_draft_probe(int v);
     int      set_draft_hybrid(int v);
     int      set_draft_hybrid_match(int v);
+    /* fn4 draft_probe_backoff (0 off, 1..kBackoffMax doublings of the probe interval while depth 0
+     * keeps winning probes) and draft_lend (lever DL: 0 off, 1 on, 2..4096 on after that many cycles
+     * at 0; refused -- left 0 -- unless the engine set the lend up, set_lend_view). Each returns the
+     * value the scheduler now runs. */
+    int      set_draft_probe_backoff(int v);
+    int      set_draft_lend(int v);
+    /* Lever DL: the engine's view of the drafter's lend (Engine::serve, once the movers set it up):
+     * `view` returns DraftController::LendSample's state over every rank (resident, transit, lent)
+     * and writes the transitions so far; `capable` whether any slab can be lent. Without it the
+     * lend never acts and every step is sampled as today. */
+    void     set_lend_view(std::function<int(uint64_t*)> view, bool capable);
+    bool     lend_capable() const { return lend_capable_; }
+    /* Whether the drafter's slab should be lent for the step just planned (DraftController::
+     * lend_wanted); the engine hands it to every rank's mover at the step release. */
+    bool     draft_lend_wanted() const;
     /* --debug-draft-oracle is loaded: the harness replaces a draft head's proposals (set_draft),
      * so the engine issues no step ahead of its commit (Engine::step_loop). */
     bool     debug_oracle_on() const { return !debug_oracle_.empty(); }
@@ -658,6 +673,17 @@ private:
     bool    hybrid_ = false;
     int     hybrid_match_ = LookupGate::kLongMatch;
     int64_t hybrid_lookup_ = 0, hybrid_head_ = 0, hybrid_unahead_ = 0;
+    /* Lever DL (set_lend_view). The lend's state and transition count as the cycle opened
+     * (draft_cycle), the cycles since its last transition, and the counters for the fn4 report:
+     * cycles planned while lent; decode steps while lent, plain and drafting (a probe reading the
+     * drafter's experts over the link), and steps while the slab moved, each with their wall ms. */
+    std::function<int(uint64_t*)> lend_view_;
+    bool     lend_capable_ = false;
+    int      dl_state_ = 0;
+    uint64_t dl_changes_ = 0;
+    int64_t  dl_cycles_ = 0;
+    int64_t  lent_cycles_ = 0, lent_plain_steps_ = 0, lent_probe_steps_ = 0, transit_steps_ = 0;
+    double   lent_plain_ms_ = 0.0, lent_probe_ms_ = 0.0, transit_ms_ = 0.0;
     bool    hybrid_on() const { return hybrid_ && draft_head_ && debug_oracle_.empty(); }
     /* The deployment declares a draft head (serial or block) that drafts chains. Not a tree head:
      * a tree is verified only on a step issued ahead (Engine::step_loop), and the hybrid plans the

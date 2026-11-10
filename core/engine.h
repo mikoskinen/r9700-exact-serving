@@ -578,6 +578,14 @@ private:
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
+    /* Lever DL (place/mover.h, the drafter's lend): RADIANCE_DRAFT_LEND set at start declares it
+     * (every drafter unit keeps a host copy; Engine::load_weights); set up in start() once the
+     * loans are carved, where `dl_capable_` says whether any rank has a drafter slab to lend. The
+     * scheduler sees it through set_lend_view (serve); prepare_release hands its target to every
+     * rank's mover. */
+    bool     dl_declared_ = false;
+    bool     dl_capable_ = false;
+    int      draft_lend_state(uint64_t* changes) const;
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a

@@ -42,6 +42,19 @@
  *                   after the commit).
  *   draft_hybrid_match  scheduler: that match length (1 .. 256; LookupGate::kLongMatch = 8 by default,
  *                   RADIANCE_DRAFT_HYBRID_MATCH at start).
+ *   draft_probe_backoff scheduler (sched/draft.h): 0 off; N (1 .. 8) each probe at the drafting depth that
+ *                   leaves depth 0 in place doubles the interval to the next, up to draft_probe << N (at most
+ *                   4096); a move between 0 and drafting starts it over. RADIANCE_DRAFT_PROBE_BACKOFF at
+ *                   start. Exact: it changes only how many drafts a step verifies. 1 refused when the
+ *                   drafter cannot run the adaptive window.
+ *   draft_lend      scheduler + every rank's mover (lever DL, place/mover.h): 0 off; 1 on, the drafter's
+ *                   expert slab lent to the trunk's experts once depth 0 has held 32 cycles with probes at
+ *                   least 64 cycles apart (draft_probe_backoff or draft_probe), taken back when drafting
+ *                   resumes; 2 .. 4096 on, after that many cycles at 0. RADIANCE_DRAFT_LEND set at start
+ *                   (any value, 0 included) declares it: every drafter unit keeps a pinned host copy
+ *                   (outside --host-pool-mib, the plan unchanged) and its slab is carved for the trunk;
+ *                   the value is the start value. Unset: nothing declared, and 1 is refused. Exact:
+ *                   placement only. The counters are GET's "lend" object (state_json).
  *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule in force, 0 off, 1 rule,
  *                   2 rule-w -- the switch once set, else RADIANCE_AQL_ACQ=rule | rule-w at start (ds41-ar-acq
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
@@ -85,7 +98,8 @@ namespace rad {
 namespace fn4 {
 
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
-              kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kSwitches };
+              kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
+              kDraftLend, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -111,6 +125,20 @@ void note_sched(int i, int value);
  * the drafting depth, hybrid proposals taken from the lookup and left to the head, steps not issued ahead for it. */
 void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_lookup, int64_t hyb_head,
                        int64_t hyb_unahead);
+/* Lever DL. The scheduler, once the engine set the lend up: whether a slab can be lent (draft_lend=1 is
+ * refused otherwise). */
+void lend_register(bool capable);
+/* The scheduler, after every step: cycles planned while lent; decode steps while lent, plain and drafting
+ * (a probe reading the drafter's experts over the link), and steps while the slab moved, each with their wall
+ * ms; the probe back-off's doublings now and the probe interval they give. */
+void note_lend_sched(int64_t lent_cycles, int64_t plain_steps, int64_t plain_ms, int64_t probe_steps,
+                     int64_t probe_ms, int64_t transit_steps, int64_t transit_ms, int64_t backoff_k,
+                     int64_t probe_interval);
+/* The engine, at every step release: the lend's state over the ranks (0 resident, 1 moving, 2 lent), rank 0's
+ * lends and recalls begun, trunk units in the drafter's memory, the drafter's units in VRAM and in all, and
+ * the drafter's slab in MiB. */
+void note_lend_engine(int64_t state, int64_t lends, int64_t reclaims, int64_t lent_units, int64_t draft_resident,
+                      int64_t draft_units, int64_t slab_mib);
 
 /* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. */
 bool check(const std::string& name, int value, std::string* err);
@@ -123,7 +151,7 @@ bool request(const std::string& name, int value, std::string* err);
 constexpr int kNoChange = -2;
 bool apply_pending(int step, int* sched);
 /* {"switches": {...}, "pending": {...}, "epoch": n, "applied_step": n, "plugins": n, "draft_capable": n,
- *  "draft": {...}} */
+ *  "draft": {...}, "lend": {...}} -- "lend" only once a scheduler registered (lend_register). */
 std::string state_json();
 
 }  // namespace fn4

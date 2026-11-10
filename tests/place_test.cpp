@@ -2661,6 +2661,278 @@ TEST(a_recall_takes_the_slots_back_before_it_returns) {
     CHECK(resident_count(r.h, r.hf.plan) > r.planned);
 }
 
+/* ---- lever DL: the drafter's expert slab, lent to the trunk while the drafter does not draft. Two trunk
+ * layers of eight 1 MiB experts and a drafter layer of four 2 MiB experts (a stride of its own, so a class
+ * of its own), the drafter's hot enough to be resident; every unit carries its own byte pattern. Lent, the
+ * drafter's units are read at their host copies and pooled trunk units fill its slab; recalled, the trunk
+ * units leave and the drafter's are copied back, every byte the same throughout and no byte shared. */
+namespace {
+struct DraftLendRig {
+    static constexpr int kL = 2, kE = 8, kD = 4;
+    Fixture     f;
+    Plan        plan;
+    Config      cfg;
+    HeatEngine  h;
+    Mover       m;
+    RadStream   compute = nullptr;
+    ComputeWork work;
+    int         d = 0;
+    std::vector<int32_t> drafter, trunk;
+    std::vector<std::vector<uint8_t>> want;   /* by unit: its bytes */
+    const char* lo = nullptr;                  /* the drafter's slab, [lo, hi) */
+    const char* hi = nullptr;
+
+    explicit DraftLendRig(int32_t keep_from = kL, int vram_mib = 24) {
+        const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+        f.op("embed", {emb}, false);
+        for (int l = 0; l < kL; ++l) {
+            std::vector<rad_weight> g;
+            for (int e = 0; e < kE; ++e)
+                g.push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." + std::to_string(e) + ".weight",
+                                     1 * MiB, RAD_ACCESS_CONDITIONAL, l, e));
+            f.op("moe" + std::to_string(l), g, false);
+        }
+        std::vector<rad_weight> dg;
+        for (int e = 0; e < kD; ++e)
+            dg.push_back(f.weight("blk." + std::to_string(kL) + ".ffn_gate_exps." + std::to_string(e) + ".weight",
+                                  2 * MiB, RAD_ACCESS_CONDITIONAL, kL, e));
+        f.op("moe_draft", dg, false);
+        cfg = base_config();
+        cfg.placement = "expert_tiered";
+        cfg.vram_weights_mib = vram_mib;
+        cfg.host_pool_mib = 64;
+        std::vector<RadFileProfile> prof;
+        for (int e = 0; e < kD; ++e) prof.push_back(RadFileProfile{kL, e, 0.9f, 0.0f});
+        for (int l = 0; l < kL; ++l)
+            for (int e = 0; e < kE; ++e) prof.push_back(RadFileProfile{l, e, 0.1f - 0.01f * (float)e, 0.0f});
+        PlannerInput in{&f.prog, &cfg, 0, 1, prof.data(), (int64_t)prof.size()};
+        (void)Planner(in).plan(&plan);
+        keep = keep_from;
+    }
+    int32_t keep = kL;
+    ~DraftLendRig() { if (compute) { rad_stream_sync(compute); rad_stream_destroy(compute); } }
+
+    char* addr(int32_t u) {
+        const MoveUnit& mu = plan.units[(size_t)u];
+        return (char*)m.residency()->lookup(mu.weights.front())->ptr - mu.offset.front();
+    }
+    int build() {
+        HeatParams hp;
+        RAD_TRY(h.init(plan, hp));
+        MoverConfig mc;
+        mc.turnover_slots = 0;
+        mc.draft_keep_from = keep;
+        RAD_TRY(m.init(f.prog, plan, mc));
+        RAD_TRY(rad_stream_create(&compute, 0));
+        RAD_TRY(m.bind_compute_stream(compute));
+        /* The load: each routed unit's own pattern where it was published. */
+        want.assign(plan.units.size(), {});
+        for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u) {
+            const MoveUnit& mu = plan.units[(size_t)u];
+            if (mu.expert < 0) continue;
+            (mu.layer >= kL ? drafter : trunk).push_back(u);
+            want[(size_t)u].resize((size_t)mu.bytes);
+            for (size_t i = 0; i < want[(size_t)u].size(); ++i)
+                want[(size_t)u][i] = (uint8_t)(u * 131 + i * 7 + (i >> 12));
+            RAD_TRY(rad_memcpy_async(addr(u), want[(size_t)u].data(), mu.bytes, compute));
+        }
+        RAD_TRY(rad_stream_sync(compute));
+        lo = nullptr;
+        for (int32_t u : drafter)
+            if (h.tier(u) == Tier::VRAM && (!lo || addr(u) < lo)) lo = addr(u);
+        RAD_TRY(m.draft_lend_setup());
+        hi = lo ? lo + m.draft_slab_bytes() : nullptr;
+        return RAD_OK;
+    }
+    int dispatch() {
+        RAD_TRY(m.begin_dispatch(d++, &h));
+        work.run(compute);
+        return m.balance(&h);
+    }
+    bool in_slab(int32_t u) { const char* p = addr(u); return lo && p >= lo && p < hi; }
+    /* Every routed unit's bytes as loaded, wherever it is published now. */
+    bool bytes_ok() {
+        rad_stream_sync(compute);
+        rad_stream_sync(m.transfer_stream());
+        for (int32_t u : drafter)
+            if (std::memcmp(addr(u), want[(size_t)u].data(), want[(size_t)u].size()) != 0) return false;
+        for (int32_t u : trunk)
+            if (std::memcmp(addr(u), want[(size_t)u].data(), want[(size_t)u].size()) != 0) return false;
+        return true;
+    }
+    /* No two routed units share a byte. */
+    bool disjoint() {
+        std::vector<std::pair<const char*, const char*>> sp;
+        for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u)
+            if (plan.units[(size_t)u].expert >= 0) sp.emplace_back(addr(u), addr(u) + plan.units[(size_t)u].bytes);
+        std::sort(sp.begin(), sp.end());
+        for (size_t i = 1; i < sp.size(); ++i)
+            if (sp[i].first < sp[i - 1].second) return false;
+        return true;
+    }
+    /* Dispatches until the lend is in `state` and every move has settled (a parked drafter unit stays
+     * busy on purpose). */
+    int drive(int state) {
+        for (Deadline dl; !dl.passed();) {
+            RAD_TRY(dispatch());
+            if (m.draft_lend_state() != state) continue;
+            bool busy = false;
+            for (int32_t u : trunk) busy = busy || h.busy(u);
+            if (state != Mover::kDlLent)
+                for (int32_t u : drafter) busy = busy || h.busy(u);
+            if (!busy) return RAD_OK;
+        }
+        return RAD_E_STATE;
+    }
+};
+}  /* namespace */
+
+TEST(the_drafters_slab_is_lent_to_the_trunk_and_taken_back_by_address) {
+    DraftLendRig r;
+    REQUIRE(r.plan.dynamic);
+    CHECK_OK(r.build());
+    REQUIRE(r.m.draft_lend_ready());
+    CHECK_EQ(r.m.draft_units(), (int64_t)DraftLendRig::kD);
+    CHECK_EQ(r.m.draft_resident(), (int64_t)DraftLendRig::kD);
+    CHECK(r.m.draft_keep_bytes() >= (int64_t)DraftLendRig::kD * 2 * MiB);
+    CHECK(r.m.draft_slab_bytes() >= (int64_t)DraftLendRig::kD * 2 * MiB);
+    for (int32_t u : r.drafter) CHECK(r.in_slab(u));
+    CHECK(r.bytes_ok());
+    const int32_t planned = resident_count(r.h, r.plan);
+
+    /* Not asked: nothing moves, nothing of the trunk enters the drafter's slab. */
+    for (int t = 0; t < 6; ++t) CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlResident);
+    CHECK_EQ(r.m.draft_lend_changes(), (uint64_t)0);
+    CHECK_EQ(r.m.loan(Mover::kLendDraft), (int64_t)0);
+    for (int32_t u : r.trunk) CHECK(!r.in_slab(u));
+    CHECK_EQ(r.m.stats().promotions, (uint64_t)0);
+
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        /* Lend: the drafter at its host copies, the trunk's pooled units in its slab. */
+        r.m.set_draft_lend(true);
+        CHECK_OK(r.drive(Mover::kDlLent));
+        CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlLent);
+        CHECK_EQ(r.m.draft_lends(), (uint64_t)(cycle + 1));
+        CHECK_EQ(r.m.draft_resident(), (int64_t)0);
+        for (int32_t u : r.drafter) {
+            CHECK(!r.in_slab(u));
+            CHECK(r.h.tier(u) == Tier::HostPinned);
+            CHECK(r.h.busy(u));                       /* parked: heat leaves it alone */
+        }
+        int32_t lent = 0;
+        for (int32_t u : r.trunk) lent += r.in_slab(u);
+        CHECK(lent > 0);
+        CHECK_EQ((int64_t)lent, r.m.draft_lent_units());
+        CHECK(resident_count(r.h, r.plan) - planned == lent - DraftLendRig::kD);
+        CHECK(r.bytes_ok());
+        CHECK(r.disjoint());
+        CHECK(r.m.loan_held(Mover::kLendDraft) > 0);
+
+        /* Recall: the trunk out, the drafter back in its slab, every byte the same. */
+        r.m.set_draft_lend(false);
+        CHECK_OK(r.drive(Mover::kDlResident));
+        CHECK_EQ(r.m.draft_reclaims(), (uint64_t)(cycle + 1));
+        CHECK_EQ(r.m.draft_resident(), (int64_t)DraftLendRig::kD);
+        CHECK_EQ(r.m.draft_lent_units(), (int64_t)0);
+        CHECK_EQ(r.m.loan_held(Mover::kLendDraft), (int64_t)0);
+        for (int32_t u : r.drafter) {
+            CHECK(r.in_slab(u));
+            CHECK(r.h.tier(u) == Tier::VRAM);
+        }
+        for (int32_t u : r.trunk) CHECK(!r.in_slab(u));
+        CHECK_EQ(resident_count(r.h, r.plan), planned);
+        CHECK(r.bytes_ok());
+        CHECK(r.disjoint());
+    }
+    /* Neither transition copied a drafter unit out: leaving is a change of address. */
+    CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+}
+
+/* A recall that comes while the drafter is still parking (drops in quarantine, nothing lent yet), and a
+ * lend that comes while it is still loading back: each turns around from where it is, and nothing of the
+ * trunk ever lands in a slot the drafter's quarantine still holds. */
+TEST(a_lend_turned_around_half_way_leaves_no_slot_shared) {
+    DraftLendRig r;
+    REQUIRE(r.plan.dynamic);
+    CHECK_OK(r.build());
+    REQUIRE(r.m.draft_lend_ready());
+    r.m.set_draft_lend(true);
+    CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlParking);
+    CHECK_EQ(r.m.loan(Mover::kLendDraft), (int64_t)0);   /* the drops are in quarantine */
+    r.m.set_draft_lend(false);
+    CHECK_OK(r.drive(Mover::kDlResident));
+    for (int32_t u : r.drafter) CHECK(r.in_slab(u));
+    for (int32_t u : r.trunk) CHECK(!r.in_slab(u));
+    CHECK(r.bytes_ok());
+    CHECK(r.disjoint());
+
+    /* Lent, recalled, and lent again before the drafter is home. */
+    r.m.set_draft_lend(true);
+    CHECK_OK(r.drive(Mover::kDlLent));
+    r.m.set_draft_lend(false);
+    for (Deadline dl; r.m.draft_lend_state() != Mover::kDlLoading && !dl.passed();) CHECK_OK(r.dispatch());
+    REQUIRE(r.m.draft_lend_state() == Mover::kDlLoading);
+    r.m.set_draft_lend(true);
+    for (int t = 0; t < 3; ++t) {
+        CHECK_OK(r.dispatch());
+        CHECK(r.disjoint());
+    }
+    CHECK_OK(r.drive(Mover::kDlLent));
+    CHECK(r.bytes_ok());
+    CHECK(r.disjoint());
+    /* Recalled and wanted again while the trunk's drops are still in quarantine: the drafter's slots were
+     * never covered, so the slab is lent again at once. */
+    r.m.set_draft_lend(false);
+    CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlUnlending);
+    CHECK_EQ(r.m.loan(Mover::kLendDraft), (int64_t)0);
+    r.m.set_draft_lend(true);
+    CHECK_OK(r.dispatch());
+    CHECK_EQ(r.m.draft_lend_state(), (int)Mover::kDlLent);
+    CHECK(r.disjoint());
+    for (int32_t u : r.drafter) CHECK(!r.in_slab(u));
+    CHECK_OK(r.drive(Mover::kDlLent));
+    CHECK(r.bytes_ok());
+    CHECK(r.disjoint());
+    r.m.set_draft_lend(false);
+    CHECK_OK(r.drive(Mover::kDlResident));
+    CHECK(r.bytes_ok());
+    CHECK(r.disjoint());
+    CHECK_EQ(r.m.draft_resident(), (int64_t)DraftLendRig::kD);
+}
+
+/* Undeclared (draft_keep_from -1, RADIANCE_DRAFT_LEND unset), the mover is today's: no host copies, nothing
+ * set up, nothing moved however often the lend is asked for. Declared and never asked, the placement is
+ * the undeclared one's. */
+TEST(an_undeclared_drafter_lend_is_todays_mover) {
+    DraftLendRig u(-1);
+    CHECK_OK(u.build());
+    CHECK(!u.m.draft_lend_ready());
+    CHECK_EQ(u.m.draft_units(), (int64_t)0);
+    CHECK_EQ(u.m.draft_keep_bytes(), (int64_t)0);
+    std::vector<char*> home;
+    for (int32_t x = 0; x < (int32_t)u.plan.units.size(); ++x) home.push_back(u.addr(x));
+    u.m.set_draft_lend(true);
+    for (int t = 0; t < 8; ++t) CHECK_OK(u.dispatch());
+    CHECK_EQ(u.m.draft_lend_state(), (int)Mover::kDlResident);
+    CHECK_EQ(u.m.stats().promotions, (uint64_t)0);
+    CHECK_EQ(u.m.stats().demotions, (uint64_t)0);
+    for (int32_t x = 0; x < (int32_t)u.plan.units.size(); ++x) CHECK(u.addr(x) == home[(size_t)x]);
+
+    DraftLendRig k;
+    CHECK_OK(k.build());
+    REQUIRE(k.m.draft_lend_ready());
+    for (int t = 0; t < 8; ++t) CHECK_OK(k.dispatch());
+    for (int32_t x = 0; x < (int32_t)k.plan.units.size(); ++x)
+        CHECK(k.h.tier(x) == u.h.tier(x));
+    CHECK_EQ(k.m.stats().promotions, (uint64_t)0);
+    CHECK_EQ(k.m.stats().demotions, (uint64_t)0);
+    CHECK_EQ(k.m.flex_offered_bytes(), (int64_t)0);
+    CHECK(k.bytes_ok());
+}
+
 /* An idle server still fills what it is lent, via its own tick, so a loan made while idle is not
  * left empty until the next request pays for filling it. */
 TEST(an_idle_mover_fills_what_it_is_lent) {
