@@ -43,6 +43,10 @@
 /* The engine's runtime switches (abi/rad_runtime.h), weak: a host without them (an older core, a tool)
  * reads every switch as off. The DSpark extras (ds41-acc) are issued only while theirs is on. */
 extern "C" int rad_fn4_get(const char* name, int* value) __attribute__((weak));
+/* ...and the drafter's extras' declarations (abi/rad_builder.h), weak too: a host built before them (rad-info,
+ * rad-convert or rad-kbench of an older image) still loads this plugin, and a serve there declares no extras. */
+extern "C" int rad_drafter_confidence(RadBuilder* b, rad_buf conf, int64_t pitch) __attribute__((weak));
+extern "C" int rad_drafter_alternatives(RadBuilder* b, rad_buf alt, int64_t n_alt, int64_t pitch) __attribute__((weak));
 static int ds41_switch(const char* name) {
     int v = 0;
     return rad_fn4_get && rad_fn4_get(name, &v) > 0 ? v : 0;
@@ -2426,6 +2430,16 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     /* Lever C1 (rank 0): the confidence head after the walk, over the collapse's output before its
      * norm (d.x, which nothing after the collapse writes) and the walk's predecessors; its weights in a
      * persistent buffer the first query pass fills from the sidecar. */
+    if (!d.cw.empty() && !rad_drafter_confidence) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_CONF: this host has no rad_drafter_confidence; "
+                        "the confidence head is not declared\n");
+        d.cw.clear();
+    }
+    if (d.n_alt > 0 && !rad_drafter_alternatives) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_ALT: this host has no rad_drafter_alternatives; "
+                        "the branches are not declared\n");
+        d.n_alt = 0;
+    }
     if (!d.cw.empty()) {
         const int64_t W = (int64_t)d.cw.size();
         d.cwb  = decl_b(b, nm.f("dspark_conf_w"), RAD_F32, { 1, W }, RAD_BUF_PERSIST);
