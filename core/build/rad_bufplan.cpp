@@ -212,4 +212,31 @@ int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLev
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ the decode rung's rows */
+
+/* Lever VA "arena" (RADIANCE_DS41_ARENA_DECODE_ROWS, Engine::probe_arena_levels): the decode rung's
+ * rows, from kArenaDecodeRowsMin to kArenaDecodeRowsMax and below the ladder's first rung `lo`.
+ *
+ * The ladder's 256-row floor is there because "a tiled kernel may write padding rows of its last
+ * tile". For deepseek41 that was audited kernel by kernel at every step of 1..64 rows (10.11.2026,
+ * libr4d and exl3r4d at the ds41-stack sources: every GEMM form -- gg_gemv, the multi-row forms, the
+ * 48-row WMMA and 32-row tiled ggml forms, bf16 m64, gemm_nt_f32's tiles --, the EXL3 expert GEMMs,
+ * the MoE sort / gather / gather all-reduce, attention's decode / WMMA / scalar forms, the indexer,
+ * the norms, mHC, rope and round trips, the lookups and the samplers): none stores a row at or past
+ * the rows it is issued for (each tiled store is guarded by min(r0 + tile, M)), and the plugin issues
+ * every activation over brows / bcol views of the step's rows, so no row count reaches a kernel from
+ * the level. Up to 64 rows is what the audit covers; a step at the rung has at most that many. */
+static constexpr int64_t kArenaDecodeRowsMin = 8, kArenaDecodeRowsMax = 64;
+bool arena_decode_rows_ok(int64_t rows, int64_t lo, std::string* why) {
+    auto no = [&](const std::string& w) {
+        if (why) *why = w;
+        return false;
+    };
+    if (rows < kArenaDecodeRowsMin || rows > kArenaDecodeRowsMax)
+        return no(fmt("not from %lld to %lld rows (the rows deepseek41's kernels were audited at)",
+                      (long long)kArenaDecodeRowsMin, (long long)kArenaDecodeRowsMax));
+    if (rows >= lo) return no(fmt("not below the ladder's first rung (%lld rows)", (long long)lo));
+    return true;
+}
+
 }  /* namespace rad */

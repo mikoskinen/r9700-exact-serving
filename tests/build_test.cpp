@@ -331,6 +331,92 @@ TEST(a_smaller_step_packs_its_transients_lower_and_keeps_the_fixed_region) {
     CHECK_EQ(plan_level(full, grew, 256, &lv, &why), RAD_E_STATE);
 }
 
+/* Lever VA "arena" (RADIANCE_DS41_ARENA_DECODE_ROWS): the decode rung below the 256-row floor takes
+ * 8 to 64 rows (what deepseek41's kernels were audited at) and only below the ladder's first rung. */
+TEST(the_decode_rung_takes_8_to_64_rows_below_the_first_rung) {
+    std::string why;
+    CHECK(arena_decode_rows_ok(8, 256, &why));
+    CHECK(arena_decode_rows_ok(16, 256, &why));
+    CHECK(arena_decode_rows_ok(48, 256, &why));
+    CHECK(arena_decode_rows_ok(64, 256, &why));
+    CHECK(!arena_decode_rows_ok(0, 256, &why));
+    CHECK(!arena_decode_rows_ok(7, 256, &why));
+    CHECK(!arena_decode_rows_ok(65, 256, &why));
+    CHECK(why.find("audited") != std::string::npos);
+    CHECK(!arena_decode_rows_ok(256, 256, &why));
+    CHECK(!arena_decode_rows_ok(64, 64, &why));
+    CHECK(why.find("first rung") != std::string::npos);
+}
+
+/* A DeepSeek-V4.1-shaped plan (TP4 rank, 4160-row chunk, 512k context): the index score plane is
+ * [irows = 256, cmax] f32, 2 MiB a row, the largest transient. Today's sizing declare keeps it at
+ * irows at every level, so a rung below 256 rows saves only the row-scaled buffers; with the plane at
+ * the rung's rows (deepseek41's Model::score_rows) the rung ends lower by about the plane's 192 rows.
+ * Either way the fixed region stays put, the capacity-sized work plane keeps its size, no two
+ * buffers live at once share a byte, and every transient lies below the level's end. */
+TEST(a_decode_rung_packs_the_index_plane_at_its_own_rows) {
+    const int64_t cmax = 524289, T = 4160, W = T + 8;
+    auto mk = [&](int64_t rows, int64_t score_rows) {
+        Program p;
+        p.buffers.emplace_back();
+        p.ops.resize(12);
+        auto buf = [&](const char* n, uint32_t dt, int64_t r, int64_t w, int32_t lo, int32_t hi) {
+            BufferInfo b = make_buf(n, 0, RAD_BUF_TRANSIENT, lo, hi);
+            b.decl.dtype = dt;
+            b.decl.rank = 2;
+            b.decl.shape[0] = r;
+            b.decl.shape[1] = w;
+            b.bytes = 0;
+            return b;
+        };
+        p.buffers.push_back(buf("streams", RAD_BF16, rows, 20480, 1, 10));
+        p.buffers.push_back(buf("normed", RAD_BF16, rows, 5120, 2, 9));
+        p.buffers.push_back(buf("q", RAD_BF16, rows, 32768, 3, 6));
+        p.buffers.push_back(buf("comp_stage", RAD_F32, 2 * W, 1024, 3, 4));   /* capacity: never scales */
+        p.buffers.push_back(buf("index_score", RAD_F32, score_rows, cmax, 4, 5));
+        p.buffers.push_back(buf("index_sel", RAD_I32, rows, 512, 5, 7));
+        p.buffers.push_back(buf("expert_gate_up", RAD_BF16, rows * 6, 4608, 7, 8));
+        BufferInfo rope = make_buf("rope_window", 0, RAD_BUF_PERSIST, -1, -1);
+        rope.decl.dtype = RAD_F32;
+        rope.decl.rank = 2;
+        rope.decl.shape[0] = 524288;
+        rope.decl.shape[1] = 64;
+        rope.bytes = 0;
+        p.buffers.push_back(rope);
+        return p;
+    };
+    Program full = mk(T, 256);
+    CHECK_OK(plan_buffers(full));
+    std::string why;
+    ArenaLevel l256, today, lever;
+    CHECK_OK(plan_level(full, mk(256, 256), 256, &l256, &why));
+    CHECK_OK(plan_level(full, mk(64, 256), 64, &today, &why));
+    CHECK_OK(plan_level(full, mk(64, 64), 64, &lever, &why));
+    CHECK(today.end < l256.end);
+    CHECK(lever.end < today.end);
+    const int64_t plane_rows_saved = (256 - 64) * cmax * 4;
+    CHECK(today.end - lever.end >= plane_rows_saved - (4ll << 20));
+    CHECK_EQ(lever.decl[5].shape[0], 64);
+    CHECK_EQ(lever.decl[5].shape[1], cmax);
+    CHECK_EQ(lever.decl[4].shape[0], 2 * W);
+    for (const ArenaLevel* lv : { &l256, &today, &lever }) {
+        CHECK_EQ(lv->offset[8], full.buffers[8].arena_offset);   /* the fixed region stays */
+        for (size_t i = 1; i <= 7; ++i) {
+            const int64_t a0 = lv->offset[i], a1 = a0 + buffer_bytes(lv->decl[i]);
+            CHECK(a0 >= full.arena_fixed_bytes);
+            CHECK(a1 <= lv->end);
+            for (size_t j = i + 1; j <= 7; ++j) {
+                const BufferInfo &bi = full.buffers[i], &bj = full.buffers[j];
+                if (bi.last_use < bj.first_def || bj.last_use < bi.first_def) continue;
+                const int64_t b0 = lv->offset[j], b1 = b0 + buffer_bytes(lv->decl[j]);
+                CHECK(a1 <= b0 || b1 <= a0);
+            }
+        }
+    }
+    /* A plane taller than the real declare's at a smaller step is refused, as any buffer. */
+    CHECK_EQ(plan_level(full, mk(64, 512), 64, &lever, &why), RAD_E_STATE);
+}
+
 TEST(unknown_liveness_is_conservative) {
     Program p;
     p.buffers.emplace_back();

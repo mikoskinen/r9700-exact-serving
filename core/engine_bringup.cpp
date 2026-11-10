@@ -1706,6 +1706,28 @@ void Engine::probe_arena_levels() {
     if (const char* e = getenv("RADIANCE_ARENA_LEVEL_MAX"); e && *e) lv_max = std::max<int64_t>(0, std::atoll(e));
     for (int64_t R = lo; R < cfg_.max_tok; R *= 4)
         if (lv_max <= 0 || R <= lv_max) want.push_back(R);
+    /* RADIANCE_DS41_ARENA_DECODE_ROWS=<rows> (lever VA "arena"; unset: no such rung): one rung below
+     * the 256-row floor, for decode and verify steps of at most <rows> rows (arena_step's need:
+     * sequences x (1 + speculative depth) at decode), so the arena above it is lent to the expert
+     * slab while steps stay that small. The floor guards against a kernel writing its last tile's
+     * padding rows past a level; below it the rows must be proven per model, so the rung is offered
+     * to deepseek41 only, at the rows its kernels were audited for (arena_decode_rows_ok: 8..64),
+     * and the plugin sizes its indexer plane by the level (deepseek41.cpp ds41_arena_decode_rows). */
+    if (const char* e = getenv("RADIANCE_DS41_ARENA_DECODE_ROWS"); e && *e) {
+        const int64_t R = std::atoll(e);
+        std::string bad;
+        if (plugins_.arch_plugin != "deepseek41")
+            bad = fmt("the '%s' plugin's kernels were not audited for it (deepseek41 only)",
+                      plugins_.arch_plugin.c_str());
+        else if (!arena_decode_rows_ok(R, lo, &bad)) {}
+        else if (std::find(want.begin(), want.end(), R) == want.end()) {
+            want.push_back(R);
+            std::sort(want.begin(), want.end());
+        }
+        if (!bad.empty())
+            RAD_WARN("activation arena: RADIANCE_DS41_ARENA_DECODE_ROWS=%s is not used -- %s", e,
+                     bad.c_str());
+    }
     arena_span_rows_ = 0;
     const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
     if (span_rows >= lo && span_rows < cfg_.max_tok &&
