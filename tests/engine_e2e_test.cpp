@@ -2160,6 +2160,53 @@ TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text)
     CHECK(has(s.output(), "draft trees: not asked"));
 }
 
+/* The runtime switches through a running server (POST /admin/fn4, runtime/fn4_switch.h): a change
+ * is queued, applied at the next step release with every rank parked, and moves the epoch the
+ * recorded passes are keyed by, so the passes before it are not played after it; the text stays
+ * the same across the changes. gg_gemv is libr4d's: the state reports whether a loaded object took
+ * it. */
+TEST(the_runtime_switches_apply_at_a_step_release_and_keep_the_text) {
+    REQUIRE(world().ok);
+    Server s;
+    REQUIRE(s.start(world().qwen35, kPlain));
+    auto get = [&]() {
+        Call c;
+        std::string out;
+        const int st = c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1;
+        CHECK_EQ(st, 200);
+        return json::parse(out, nullptr, false);
+    };
+    const json req = completion(prompt_ids(71, 120), 32);
+    const json g0 = get();
+    CHECK_EQ(g0.value("epoch", -1), 0);
+    const std::vector<int32_t> a = tokens_of(post(s.port, "/completion", req));
+    int st = 0;
+    const json p = post(s.port, "/admin/fn4", json{ { "epoch_bump", 1 }, { "gg_gemv", 1 }, { "aql_acq", 1 } }, &st);
+    CHECK_EQ(st, 200);
+    CHECK_EQ(p["pending"].value("aql_acq", -9), 1);
+    const std::vector<int32_t> b = tokens_of(post(s.port, "/completion", req));
+    const json g1 = get();
+    CHECK_EQ(g1.value("epoch", -1), 1);
+    CHECK(g1.value("applied_step", -1) >= 0);
+    CHECK(g1["pending"].empty());
+    CHECK_EQ(g1["switches"].value("aql_acq", -9), 1);
+    /* gg_gemv took effect only where a loaded object exports rad_fn4_switch (libr4d). */
+    CHECK_EQ(g1["switches"].value("gg_gemv", -9), g1.value("plugins", 0) > 0 ? 1 : 0);
+    (void)post(s.port, "/admin/fn4", json{ { "aql_acq", 0 }, { "gg_gemv", 0 } }, &st);
+    CHECK_EQ(st, 200);
+    const std::vector<int32_t> c = tokens_of(post(s.port, "/completion", req));
+    const json g2 = get();
+    CHECK(g2.value("epoch", -1) >= 2);
+    CHECK_EQ(g2["switches"].value("aql_acq", -9), 0);
+    CHECK_EQ(a.size(), (size_t)32);
+    CHECK(a == b);
+    CHECK(a == c);
+    CHECK_EQ(post(s.port, "/admin/fn4", json{ { "no_such_switch", 1 } }, &st).is_object(), true);
+    CHECK_EQ(st, 400);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(has(s.output(), "fn4: switches"));
+}
+
 /* The row a running server's /diagnostics reports for `option`, or null. */
 json config_row(int port, const std::string& option) {
     Call c;
