@@ -40,6 +40,12 @@
 #include <utility>
 #include <vector>
 
+/* Lever T1's builder exports (abi/rad_builder.h), weak: a host built before them (the base image's rad-info,
+ * rad-convert or rad-kbench) still loads this plugin, and a serve there declares no tree (tree_on()). */
+extern "C" int rad_drafter_tree_layout(RadBuilder* b, int64_t main_depth, int64_t max_branches,
+                                       int64_t max_branch_depth) __attribute__((weak));
+extern "C" int rad_kv_group_tree_self(RadBuilder* b, rad_kvgroup g) __attribute__((weak));
+
 namespace deepseek41 {
 using namespace rad::arch;
 
@@ -335,6 +341,19 @@ struct Layer {
     int tap_col = -1;
     /* A DSpark stage's context pass: its window key from the projected trunk rows. */
     rad_op d_kv = 0, d_kvn = 0, d_kvrope = 0, d_kvq = 0, d_kvst = 0;
+    /* Lever T1 (Model::tree): this layer's ops on a tree verify (RadBatch::spec_parent), each the op
+     * above it replaces there, with the tree table (Model::tt) beside it -- the Engram's ids by the
+     * row's path, the compressor's blocks by the path (and its completed entries into the scratch
+     * below), the attention and the index scores by the path; 0 where the layer has no such op. */
+    rad_op e_ids_t = 0, c_work_t = 0, l_st_t = 0, k_st_t = 0, attn_t = 0, i_score_t = 0;
+    /* A ratio > 1 kv source's scratch: the compressed latent and the index key of every block a
+     * tree row (depth >= 1) completed, one entry a step row ([rows, 1, ratio, slots / ratio], the
+     * caches' block layout), kept until the context pass commits the accepted path's (PERSIST). */
+    rad_buf tcc = 0, tic = 0;
+    /* The context pass's commits after a tree verify: the accepted path's entries into the
+     * compressed and index caches, its tail rows to their positions (ratio > 1 kv source), its ids
+     * to the Engram window's decode layout (Engram layer). */
+    rad_op cm_lat = 0, cm_idx = 0, cm_tail = 0, cm_conv = 0;
 };
 
 /* The DSpark block drafter (the checkpoint's mtp.0 .. mtp.{n-1}; official inference/model.py DSparkBlock,
@@ -382,6 +401,15 @@ struct Dsp {
     rad_op embed = 0, embed_ar = 0, expand = 0, pre0 = 0, pre1 = 0, q_tab = 0, poff_op = 0, apos_op = 0;
     rad_op contract = 0, fnorm = 0, gather = 0, head = 0, topk = 0, pgather = 0, merge = 0, select = 0;
     std::vector<Layer> st;
+    /* Lever T1 (RADIANCE_DS41_DSPARK_TREE=1): the proposal is a tree -- the walk's `block` tokens (the
+     * main chain), then kTreeBranches alternative first tokens at position 1 (dspark_alt: the walk's
+     * next-best first proposals, each walked on), depth-major (tree_assemble's layout) -- in `prop`
+     * [max_seqs, pitch] with its parents in `par` (rad_drafter_tree). One assemble op a live branch
+     * count (dspark_tree 0..3); `tokens` stays the walk's chain. */
+    bool tree = false;
+    int64_t pitch = 0;
+    rad_buf alt = 0, prop = 0, par = 0;
+    rad_op alt_op = 0, asm_op[4] = { 0, 0, 0, 0 };
 };
 
 /* A dense linear's int8 activation pair, keyed by the GEMM op a linear() declared: the quantiser
@@ -486,6 +514,19 @@ struct Model {
     /* The last layer's MoE all-reduce + pcn_fin as one collective (RADIANCE_DS41_AR_PCN=2), or 0. */
     rad_op ar_pcn_fin = 0;
     Dsp dsp{};
+    /* Lever T1, the trunk's half (tree_on() and a DSpark tree): a step whose RadBatch carries
+     * spec_parent issues tree_rows first -- `tt` [max_tok, kTreeCols] each row's depth, root and
+     * ancestors, `spos` each row's slot position (where its K / V and tail row are stored: the
+     * anchor + its row), `tmark` [max_tok] the tree rows below the root (PERSIST: the context pass
+     * after the step reads it) -- and the layers' tree ops. `tree_last`: the last trunk step on this
+     * rank was a tree verify, so the context pass behind it commits the accepted path. `tree_rows`:
+     * the scratch's rows, every decode row a step can carry (max_seqs x (1 + max_spec)). */
+    bool tree = false, tree_last = false;
+    int64_t tree_rows = 0;
+    rad_buf tt = 0, spos = 0, tmark = 0, mpage = 0, tpage = 0;
+    rad_op tree_op = 0;
+    /* The ratio > 1 compressed and index groups told to the core as moved by this plugin (rad_kv_group_tree_self). */
+    std::map<rad_kvgroup, bool> tself;
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
     bool release = false;
@@ -560,6 +601,18 @@ static rad_op op(RadBuilder* b, const char* name, std::vector<RadParam> ps,
                                  ws.empty() ? nullptr : ws.data(), (int)ws.size());
     if (!h) std::fprintf(stderr, "radiance: deepseek41: op %s refused\n", name);
     return rw(b, h, rd, wr);
+}
+/* op() with the buffers it reads as a vector (lever T1's tree ops read optional ones). */
+static rad_op opv(RadBuilder* b, const char* name, std::vector<RadParam> ps, std::vector<rad_weight> ws,
+                  const std::vector<rad_buf>& rd, const std::vector<rad_buf>& wr) {
+    const rad_op h = rad_decl_op(b, name, ps.data(), (int)ps.size(), ws.empty() ? nullptr : ws.data(), (int)ws.size());
+    if (!h) {
+        std::fprintf(stderr, "radiance: deepseek41: op %s refused\n", name);
+        return h;
+    }
+    rad_op_reads(b, h, rd.data(), (int)rd.size());
+    rad_op_writes(b, h, wr.data(), (int)wr.size());
+    return h;
 }
 static rad_weight wt(RadBuilder* b, const char* name, uint32_t dt,
                      std::initializer_list<int64_t> shape, RadWeightGroup grp,
@@ -962,8 +1015,62 @@ static void sw_note_decl(int64_t rows) {
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
 }
 
+/* Lever T1 (10.11.2026): a tree verify at draft position 1 for the DSpark drafter. RADIANCE_DS41_DSPARK_TREE=1
+ * (or on) at start declares it: the drafter proposes its walk's `block` tokens (the main chain) and kTreeBranches
+ * alternative branches at position 1 -- the walk's next-best first proposals, each walked on (dspark_alt), every
+ * branch `block` deep -- as a tree (rad_drafter_tree + rad_drafter_tree_layout: main chain first, the branches
+ * depth-major), which the core verifies in one trunk step. The serve runs --num-speculative-tokens
+ * block x (1 + kTreeBranches) (20 for the 1017's block of 5): the tree's node slots. Unset: nothing of it is
+ * declared, the probe asks the block as before, and the switches below take only their defaults.
+ *
+ * Exact by construction: a tree verify's row computes what the chain row of its own path computes, bit for bit --
+ * the window keys, the compressed entries and the index keys it reads are its ancestors' (the tree ops below,
+ * by the tree table tree_rows writes), the Engram ids hash its own path, and the compressor's blocks gather its
+ * own path; the accepted path's state moves where a plain run leaves it (the core's ADV_COMPACT for the window,
+ * ratio-1 compressed and index caches; the context pass's commits here for the ratio > 1 scratch entries, the
+ * compressor's tail rows and the Engram window). The tree ops take only the exact kernels (no WMMA form).
+ *
+ * In-process switches (POST /admin/fn4; start values RADIANCE_DS41_DSPARK_TREE_B / _L / _FORCE):
+ *   dspark_tree        0..3 alternative branches the drafter proposes (0: the chain, today's proposal)
+ *   dspark_tree_depth  1..5 the most nodes of each branch the core verifies (depth-major order: a prefix cut)
+ *   dspark_tree_force  1: every drafting step whose window reaches the main chain's end verifies the whole tree;
+ *                      0: the core's draft-window cost model (D7's step-time pricing) prices each extra node.
+ * The core reads all three each draft cycle (core/sched/draft.h). Process-wide, like the switches above. */
+constexpr int kTreeBranches = 3;
+constexpr int kTreeCols = 8;   /* tree_rows' width: depth, root row, the ancestors at depths 0..5 */
+static std::atomic<int> g_tree_env{-1};   /* RADIANCE_DS41_DSPARK_TREE, read once */
+static std::atomic<int> g_tree_ok{0};     /* a DSpark tree was declared: the switches take every value */
+static std::atomic<int> g_sw_tree_b{0}, g_sw_tree_l{5}, g_sw_tree_f{0};
+static int env_int_in(const char* name, int lo, int hi, int dflt) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return dflt;
+    char* end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    return end != e && !*end && v >= lo && v <= hi ? (int)v : dflt;
+}
+static void tree_read_env() {
+    int unread = -1;
+    if (!g_tree_env.compare_exchange_strong(unread, k1_env("RADIANCE_DS41_DSPARK_TREE"))) return;
+    g_sw_tree_b.store(env_int_in("RADIANCE_DS41_DSPARK_TREE_B", 0, kTreeBranches, 0), std::memory_order_relaxed);
+    g_sw_tree_l.store(env_int_in("RADIANCE_DS41_DSPARK_TREE_L", 1, 5, 5), std::memory_order_relaxed);
+    g_sw_tree_f.store(env_int_in("RADIANCE_DS41_DSPARK_TREE_FORCE", 0, 1, 0), std::memory_order_relaxed);
+}
+/* Asked at start, and this host has the builder's tree exports. */
+static bool tree_asked() {
+    tree_read_env();
+    return g_tree_env.load(std::memory_order_relaxed) > 0 && rad_drafter_tree_layout && rad_kv_group_tree_self;
+}
+static int tree_switch_ok(const char* name, int value) {
+    const bool ok = g_tree_ok.load(std::memory_order_relaxed) != 0;
+    if (!std::strcmp(name, "dspark_tree")) return value == 0 || (ok && value >= 1 && value <= kTreeBranches) ? 1 : -1;
+    if (!std::strcmp(name, "dspark_tree_depth")) return value == 5 || (ok && value >= 1 && value <= 5) ? 1 : -1;
+    if (!std::strcmp(name, "dspark_tree_force")) return value == 0 || (ok && value == 1) ? 1 : -1;
+    return 0;
+}
+
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
+    if (const int t = tree_switch_ok(name, value)) return t;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
     if (!std::strcmp(name, "ds41_shexp_lane"))
@@ -975,13 +1082,25 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
 extern "C" int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
-    if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
+    if (!std::strcmp(name, "dspark_tree")) g_sw_tree_b.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "dspark_tree_depth")) g_sw_tree_l.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "dspark_tree_force")) g_sw_tree_f.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
     else if (const K1Switch* k = k1_switch(name)) k->val->store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
 extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!name || !applied) return 0;
+    if (!std::strcmp(name, "dspark_tree") || !std::strcmp(name, "dspark_tree_depth") ||
+        !std::strcmp(name, "dspark_tree_force")) {
+        tree_read_env();
+        const std::atomic<int>& v = !std::strcmp(name, "dspark_tree")         ? g_sw_tree_b
+                                    : !std::strcmp(name, "dspark_tree_depth") ? g_sw_tree_l
+                                                                              : g_sw_tree_f;
+        *applied = v.load(std::memory_order_relaxed);
+        return 1;
+    }
     if (!std::strcmp(name, "ds41_argather")) {
         const int v = g_sw_gar.load(std::memory_order_relaxed);
         *applied = v >= 0 ? v : g_sw_gar_decl.load(std::memory_order_relaxed);
@@ -1292,6 +1411,17 @@ static int buffers(RadBuilder* b, Model& m) {
     }
     mw.sout = bf("shared_out", { T, D });
     mw.sgate = bf("shared_one", { T, 1 });
+    /* Lever T1's tables (Model::tree): written by tree_rows at a tree verify's start, read by every layer's tree
+     * ops; tmark lives on to the context pass; mpage / tpage split qsa_work_tree's pages (the root's blocks into the
+     * caches, the deeper nodes' into the scratch). */
+    if (m.tree) {
+        m.tt = decl_b(b, nm.f("tree_table"), RAD_I32, { T, kTreeCols });
+        m.spos = decl_b(b, nm.f("tree_slot_pos"), RAD_I32, { T });
+        m.tmark = decl_b(b, nm.f("tree_mark"), RAD_I32, { T }, RAD_BUF_PERSIST);
+        m.mpage = decl_b(b, nm.f("comp_page_main"), RAD_I32, { W });
+        m.tpage = decl_b(b, nm.f("comp_page_tree"), RAD_I32, { W });
+        if (!m.tt || !m.spos || !m.tmark || !m.mpage || !m.tpage) return RAD_E_INVAL;
+    }
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, D }, RAD_BUF_PERSIST);
     m.logit_input = bf("logit_input", { g.max_logit_rows, D });
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
@@ -1350,6 +1480,58 @@ static void moe_names(Model& m, int l, MoeFP8::Src* s) {
     s->experts_gate = nm.f("blk.%d.ffn_gate_exps.weight", l);
     s->experts_up = nm.f("blk.%d.ffn_up_exps.weight", l);
     s->experts_down = nm.f("blk.%d.ffn_down_exps.weight", l);
+}
+
+/* ------------------------------------------------------------------ lever T1, a layer's tree ops */
+/* A group whose accepted path this plugin moves itself (the context pass's commits), which ADV_COMPACT leaves
+ * alone: a ratio > 1 compressed or index cache holds one entry a block of `ratio` slots, not one a slot. */
+static int tree_self(RadBuilder* b, Model& m, rad_kvgroup g) {
+    if (!m.tree || !g || m.tself.count(g)) return RAD_OK;
+    m.tself[g] = true;
+    if (!rad_kv_group_tree_self) return RAD_E_UNSUPPORTED;
+    DS_TRY(rad_kv_group_tree_self(b, g));
+    return RAD_OK;
+}
+
+/* A ratio > 1 kv source on an attention rank (layer()'s compressor declared): qsa_work_tree, the scratch for the
+ * entries a tree row below the root completes (latent and index key, the caches' block layout, one block a step
+ * row), their stores, and the context pass's commits of the accepted path (entries, tail rows). */
+static int tree_source(RadBuilder* b, Model& m, Layer& L) {
+    const auto& g = m.g;
+    auto& nm = m.nm;
+    const int64_t r = L.r, hd = m.c.head_dim, W = m.work, T = g.max_tok, TR = m.tree_rows;
+    const int64_t ls = latent_slots(m, hd), ks = index_slots(m);
+    if (ls % r || ks % r) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_TREE: layer %d's entries (%lld and %lld slots) do "
+                        "not split into blocks of %lld\n", L.l, (long long)ls, (long long)ks, (long long)r);
+        return RAD_E_UNSUPPORTED;
+    }
+    L.c_work_t = op(b, "qsa_work_tree",
+                    { RAD_RANGE("M", 1, T), RAD_INT("n", 2 * hd), RAD_INT("ratio", r), RAD_INT("ring", r + g.max_spec),
+                      RAD_INT("seqs", g.max_seqs), RAD_INT("work", W), RAD_STR("dtype", "f32") },
+                    {}, { m.kvs, m.tt }, { m.stage, m.page, m.bpos, m.nc, m.mpage, m.tpage });
+    L.tcc = decl_b(b, nm.f("blk.%d.tree_latent", L.l), RAD_BF16, { TR, 1, r, ls / r }, RAD_BUF_PERSIST);
+    L.tic = decl_b(b, nm.f("blk.%d.tree_index_key", L.l), RAD_BF16, { TR, 1, r, ks / r }, RAD_BUF_PERSIST);
+    std::vector<RadParam> lp = { RAD_RANGE("M", 1, W), RAD_INT("n", hd), RAD_INT("block_size", r), RAD_STR("dtype", "bf16") };
+    if (m.lnv) lp.push_back(RAD_STR("format", "nvfp4"));
+    std::vector<RadParam> kp = { RAD_RANGE("M", 1, W), RAD_INT("n", m.c.idim), RAD_INT("block_size", r),
+                                 RAD_STR("dtype", "bf16") };
+    if (m.ikmx) kp.push_back(RAD_STR("format", "mxfp4"));
+    L.l_st_t = op(b, "entry_store", lp, {}, { m.lat, m.tpage }, { L.tcc });
+    L.k_st_t = op(b, "entry_store", kp, {}, { m.ikn, m.tpage }, { L.tic });
+    L.cm_lat = op(b, "tree_commit_entries", { RAD_RANGE("M", 1, T), RAD_INT("ratio", r), RAD_INT("rows", TR) }, {},
+                  { m.tmark, L.tcc }, {});
+    L.cm_idx = op(b, "tree_commit_entries", { RAD_RANGE("M", 1, T), RAD_INT("ratio", r), RAD_INT("rows", TR) }, {},
+                  { m.tmark, L.tic }, {});
+    L.cm_tail = op(b, "tree_commit_rows",
+                   { RAD_RANGE("M", 1, T), RAD_INT("n", 2 * hd), RAD_INT("ring", r + g.max_spec), RAD_INT("off", 0),
+                     RAD_INT("rows", TR) },
+                   {}, { m.tmark }, {});
+    if (!L.c_work_t || !L.tcc || !L.tic || !L.l_st_t || !L.k_st_t || !L.cm_lat || !L.cm_idx || !L.cm_tail)
+        return RAD_E_INVAL;
+    DS_TRY(tree_self(b, m, m.comp[r]));
+    DS_TRY(tree_self(b, m, m.index[r]));
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ one layer */
@@ -1441,6 +1623,19 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                      { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("ngram", c.ngram),
                        RAD_INT("eos", c.pad) },
                      { L.e_mult, L.e_vsz, L.e_off }, { m.ctok }, { L.ids });
+        /* Lever T1: a tree row hashes its own path's ids; the context pass after a tree verify moves the
+         * accepted path's ids into the window's decode layout (ids from offset ngram - 2 on, rows in order). */
+        if (m.tree) {
+            L.e_ids_t = op(b, "ngram_ids_tree",
+                           { RAD_RANGE("M", 1, T), RAD_INT("heads", H), RAD_INT("ngram", c.ngram),
+                             RAD_INT("eos", c.pad) },
+                           { L.e_mult, L.e_vsz, L.e_off }, { m.ctok, m.tt }, { L.ids });
+            L.cm_conv = op(b, "tree_commit_rows",
+                           { RAD_RANGE("M", 1, T), RAD_INT("n", 1), RAD_INT("ring", 0), RAD_INT("off", c.ngram - 2),
+                             RAD_INT("rows", m.tree_rows) },
+                           {}, { m.tmark }, {});
+            if (!L.e_ids_t || !L.cm_conv) return RAD_E_INVAL;
+        }
         if (m.ple_group > 0 && m.ple_tab)
             L.e_emb = op(b, "embed_lookup_planes",
                          { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
@@ -1540,6 +1735,10 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
             DS_TRY(rad_kv_group_zero(b, m.comp[r]));
+            if (r > 1) {   /* lever T1: as on an attention rank (a zeroed group is moved by nobody) */
+                DS_TRY(tree_self(b, m, m.comp[r]));
+                DS_TRY(tree_self(b, m, m.index[r]));
+            }
         }
         L.attn_fill = op(b, "fill", { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("dtype", "bf16"),
                                       RAD_F64("value", 0.0) },
@@ -1659,6 +1858,11 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                 RAD_INT("ring", r + g.max_spec), RAD_INT("seqs", g.max_seqs),
                                 RAD_STR("dtype", "f32") },
                               {}, { m.kvs }, {});
+            /* Lever T1, a ratio > 1 source: the blocks a tree row completes gathered by its path; the root's
+             * entries stored as before (mpage), a deeper node's into this source's scratch at its step row
+             * (tpage), which the context pass commits for the accepted path only. The tail stores each row at
+             * its slot position (spos: the anchor + its row), as the core stores its K and V. */
+            if (m.tree && r > 1) DS_TRY(tree_source(b, m, L));
         }
 
         /* ---- the indexer, at an index source */
@@ -1733,6 +1937,25 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                           { sel_out });
             if (L.i_topk && m.isplit && rw(b, L.i_topk, {}, { m.sel }) == 0) return RAD_E_INVAL;
             if (!L.i_topk) return RAD_E_INVAL;
+            /* Lever T1: a tree verify's scores (one run: a tree step's rows are a decode step's, under irows) by
+             * each row's path -- an entry a deeper node completed from the source's scratch (ratio > 1) or its
+             * ancestor's slot (ratio 1). */
+            if (m.tree) {
+                std::vector<RadParam> sp = { RAD_RANGE("M", 1, IR), RAD_INT("heads", c.ih), RAD_INT("dim", c.idim),
+                                             RAD_INT("ratio", r), RAD_INT("width", width),
+                                             RAD_F64("wscale", 1.0 / std::sqrt((double)c.idim * (double)c.ih)),
+                                             RAD_STR("dtype", "bf16"), RAD_INT("row_part", 0) };
+                if (kept) sp.push_back(RAD_INT("block", c.cand_block));
+                if (m.ikmx) sp.push_back(RAD_STR("key_format", "mxfp4"));
+                const rad_buf tic = r > 1 ? m.layers[(size_t)c.src_of[(size_t)l]].tic : 0;
+                if (r > 1 && !tic) return RAD_E_INVAL;
+                std::vector<rad_buf> rd = { m.iq, m.iw };
+                if (kept) rd.push_back(m.keep);
+                rd.push_back(m.tt);
+                if (tic) rd.push_back(tic);
+                L.i_score_t = opv(b, "index_score_tree", sp, {}, rd, { m.score });
+                if (!L.i_score_t) return RAD_E_INVAL;
+            }
         }
 
         /* ---- the sparse attention and the output projection */
@@ -1748,6 +1971,17 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                     r > 0 ? std::initializer_list<rad_buf>{ m.q, m.sel }
                           : std::initializer_list<rad_buf>{ m.q },
                     { m.o });
+        /* Lever T1: a tree verify's attention by each row's path: the window keys of its ancestors, a compressed
+         * entry a deeper node completed from the source's scratch (ratio > 1) or its ancestor's slot (ratio 1). */
+        if (m.tree) {
+            const rad_buf tcc = r > 1 ? m.layers[(size_t)c.src_of[(size_t)l]].tcc : 0;
+            if (r > 1 && !tcc) return RAD_E_INVAL;
+            std::vector<rad_buf> rd = r > 0 ? std::vector<rad_buf>{ m.q, m.sel } : std::vector<rad_buf>{ m.q };
+            rd.push_back(m.tt);
+            if (tcc) rd.push_back(tcc);
+            L.attn_t = opv(b, "attn_sparse_sink_tree", ap, { L.sinks }, rd, { m.o });
+            if (!L.attn_t) return RAD_E_INVAL;
+        }
         L.o_f = rope_rt(b, m, T, g.n_head, hd, 1, 32, "fp8_e4m3", "ue8m0", m.o, cs);
         if (!L.o_f) {
             L.o_rope = rope_rows(b, m, T, g.n_head, hd, 1, m.o, cs);
@@ -1880,7 +2114,19 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
         return RAD_OK;
     }
     if (!rad_ctx_draft_head(ctx)) return RAD_OK;   /* no speculation, or prompt lookup alone */
-    if (ctx->max_spec != blk) {
+    /* Lever T1: a tree's node slots, when the core asked for one (RadBuildCtx::draft_tree, from the probe's
+     * tree_pays) and the serve gives them; anything else is the chain of `block`. */
+    if (tree_asked() && ctx->draft_tree) {
+        if (ctx->max_spec != blk * (1 + kTreeBranches)) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_TREE=1: the DSpark tree has %lld node slots "
+                            "(its block of %lld and %d branches of it) and this serve asks for %d; run "
+                            "--num-speculative-tokens %lld (or auto)\n", (long long)(blk * (1 + kTreeBranches)),
+                    (long long)blk, kTreeBranches, ctx->max_spec, (long long)(blk * (1 + kTreeBranches)));
+            return RAD_E_UNSUPPORTED;
+        }
+        d.tree = true;
+        d.pitch = blk * (1 + kTreeBranches);
+    } else if (ctx->max_spec != blk) {
         fprintf(stderr, "radiance: deepseek41: the DSpark drafter proposes a whole block of %lld tokens "
                         "(dspark.block_size, the length it was trained at) and this serve asks for %d; run "
                         "--num-speculative-tokens %lld (or auto)\n", (long long)blk, ctx->max_spec, (long long)blk);
@@ -2308,18 +2554,59 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                     RAD_STR("dtype", "bf16") },
                   { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens });
     if (!d.contract || !d.fnorm || !d.gather || !d.head || !d.topk || !d.select) return RAD_E_INVAL;
+    /* Lever T1: the tree -- the walk's chain, then kTreeBranches branches at position 1: the walk's next-best first
+     * proposals, each walked on (dspark_alt, every rank: the same candidates and tables give every rank the same
+     * tokens, which each rank's ADV_BTAKE reads), assembled depth-major with their parents for the live branch
+     * count (tree_assemble, one op a count). */
+    if (d.tree) {
+        d.alt = decl_b(b, nm.f("dspark_alt"), RAD_I32, { g.max_seqs, kTreeBranches * d.block });
+        d.prop = decl_b(b, nm.f("dspark_tree_tokens"), RAD_I32, { g.max_seqs, d.pitch }, RAD_BUF_PERSIST);
+        d.par = decl_b(b, nm.f("dspark_tree_parents"), RAD_I32, { g.max_seqs, d.pitch }, RAD_BUF_PERSIST);
+        if (!d.alt || !d.prop || !d.par) return RAD_E_INVAL;
+        d.alt_op = op(b, "dspark_alt",
+                      { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", d.block), RAD_INT("top_k", R),
+                        RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", d.block),
+                        RAD_INT("n_alt", kTreeBranches), RAD_STR("dtype", "bf16") },
+                      { d.mk1, d.mk2 }, { d.cand_, d.unary, d.tokens }, { d.alt });
+        if (!d.alt_op) return RAD_E_INVAL;
+        for (int nb = 0; nb <= kTreeBranches; ++nb) {
+            d.asm_op[nb] = op(b, "dspark_tree_assemble",
+                              { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("K", d.block), RAD_INT("B", nb),
+                                RAD_INT("pitch", d.pitch), RAD_INT("n_alt", kTreeBranches) },
+                              {}, { d.tokens, d.alt }, { d.prop, d.par });
+            if (!d.asm_op[nb]) return RAD_E_INVAL;
+        }
+    }
 
     RadDrafterDecl drf{};
     drf.name = "dspark";
     drf.kind = RAD_DRAFT_BLOCK;
     drf.depth = ctx->max_spec;
     drf.block = d.block;
-    drf.proposal = d.tokens;
-    drf.proposal_pitch = d.block;
+    drf.proposal = d.tree ? d.prop : d.tokens;
+    drf.proposal_pitch = d.tree ? d.pitch : d.block;
     /* The query block's first row reads back `window` keys before itself. */
     drf.window = c.window + 1;
     drf.mask_token = (int32_t)d.noise;
     DS_TRY(rad_declare_drafter(b, &drf));
+    if (d.tree) {
+        DS_TRY(rad_drafter_tree(b, d.par));
+        DS_TRY(rad_drafter_tree_layout(b, d.block, kTreeBranches, d.block));
+        g_tree_ok.store(1, std::memory_order_relaxed);
+        rad_note(b, "DSpark tree (lever T1): the walk's %lld tokens and %d branches at position 1 of %lld each, %lld "
+                    "node slots, verified as a tree (dspark_tree %d, dspark_tree_depth %d, dspark_tree_force %d)",
+                 (long long)d.block, kTreeBranches, (long long)d.block, (long long)d.pitch,
+                 g_sw_tree_b.load(std::memory_order_relaxed), g_sw_tree_l.load(std::memory_order_relaxed),
+                 g_sw_tree_f.load(std::memory_order_relaxed));
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: DSpark tree (lever T1, RADIANCE_DS41_DSPARK_TREE): the walk's %lld "
+                            "tokens and %d branches at position 1 of %lld each in %lld node slots; the trunk verifies "
+                            "trees by each row's path (tree ops) and the context pass commits the accepted path; "
+                            "switches dspark_tree %d, dspark_tree_depth %d, dspark_tree_force %d\n",
+                    (long long)d.block, kTreeBranches, (long long)d.block, (long long)d.pitch,
+                    g_sw_tree_b.load(std::memory_order_relaxed), g_sw_tree_l.load(std::memory_order_relaxed),
+                    g_sw_tree_f.load(std::memory_order_relaxed));
+    }
     rad_note(b, "DSpark drafter: %d stages at absolute layers %d..%d (window-only V4 blocks, %lld experts top-%lld), "
                 "taps before %zu trunk layer(s), one pass over [anchor, noise %lld x %lld] proposes %lld tokens; "
                 "attention over %lld context keys + the block's own; Markov rank %lld walked over the head's top %lld; "
@@ -2370,6 +2657,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(dsp_config(b, m, meta, ctx));
     const auto& c = m.c;
     auto& g = m.g;
+    /* Lever T1: the trunk verifies trees where the drafter proposes them (dsp_config). */
+    m.tree = m.dsp.on && m.dsp.tree;
+    m.tree_rows = std::min<int64_t>(g.max_tok, g.max_seqs * (1 + (int64_t)g.max_spec));
     int64_t rmin = 0;
     for (int l = 0; l < c.n_layer; ++l)
         if (c.ratio[(size_t)l] > 0 && (rmin == 0 || c.ratio[(size_t)l] < rmin)) rmin = c.ratio[(size_t)l];
@@ -2528,6 +2818,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.tok_map = op(b, "token_map", { RAD_RANGE("M", 1, T), RAD_INT("n_vocab", c.n_vocab) },
                        { m.tmap }, {}, { m.ctok });
     }
+    /* Lever T1: each row's depth, root and ancestors from RadBatch::spec_parent, issued first on a tree verify. */
+    if (m.tree) {
+        m.tree_op = op(b, "tree_rows", { RAD_RANGE("M", 1, T), RAD_INT("width", kTreeCols) }, {}, {},
+                       { m.tt, m.spos, m.tmark });
+        if (!m.tree_op) return RAD_E_INVAL;
+    }
     m.layers.resize((size_t)c.n_layer);
     if (ctx->calib_dir && ctx->calib_dir[0]) {
         m.calib_lo = ctx->calib_layer_lo;
@@ -2646,11 +2942,63 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 /* ------------------------------------------------------------------ step */
+/* Lever T1: the context pass behind a tree verify commits its accepted path where a plain run keeps it. The core
+ * has staged this pass from the acceptance (ADV_CTXTREE): context row r is trunk row r, the root at the anchor and
+ * accepted node t at the anchor + t + 1 (positions and every paged group's slots), a rejected row at slot -1; and
+ * ADV_COMPACT has moved the window and ratio-1 caches. Here, for the rows tree_rows marked (below the root): the
+ * Engram window's ids (every rank: every rank runs the Engram) and, on an attention rank, each ratio > 1 source's
+ * scratch entries into the compressed and index caches and its tail rows from their slot positions to their
+ * positions. Rows in order, so a move never overwrites a row a later one still reads (a node's row index is at or
+ * past its depth). */
+static void tree_commit(RadCtx* x, Model& m, const RadBatch* batch) {
+    if (!m.tree || !m.tree_last) return;
+    m.tree_last = false;
+    const auto& d = m.dsp;
+    const int64_t T = batch->n_tok, S = batch->n_seq;
+    if (T <= 0 || S <= 0) return;
+    const auto* kb = kv_batch(batch, d.kv);   /* the accepted rows: slot >= 0 in any paged group */
+    if (!kb || !kb->slot_mapping) {
+        rad_step_fail(x, "deepseek41: the context pass after a tree verify has no slots to read its accepted path from");
+        return;
+    }
+    const RadOperand pos = praw(batch->positions, RAD_I32, T), cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
+    const RadOperand acc = praw(kb->slot_mapping, RAD_I32, T), mark = brows(m.tmark, T);
+    for (const Layer& L : m.layers) {
+        if (L.cm_conv) {
+            const auto* tk = kv_batch(batch, m.tok);
+            if (!tk || !tk->state_index) {
+                rad_step_fail(x, "deepseek41: the Engram window has no state slots on a context pass");
+                return;
+            }
+            RAD_ISSUE_N(x, L.cm_conv, T, mark, pos, cu, acc,
+                        praw2(tk->state_index, RAD_I32, S, tk->state_index_pitch > 0 ? tk->state_index_pitch : 1),
+                        kv_cache(m.tok, L.l));
+        }
+        if (m.zero || !L.cm_lat) continue;
+        const int64_t r = L.r;
+        const auto* cb = kv_batch(batch, m.comp.at(r));
+        const auto* ib = kv_batch(batch, m.index.at(r));
+        const auto* tb = kv_batch(batch, m.tail.at(r));
+        if (!cb || !cb->slot_mapping || !ib || !ib->slot_mapping || !tb || !tb->state_index) {
+            rad_step_fail(x, "deepseek41: a compressed group has no slots on a context pass");
+            return;
+        }
+        RAD_ISSUE_N(x, L.cm_lat, T, mark, pos, praw(cb->slot_mapping, RAD_I32, T), RAD_B(L.tcc),
+                    kv_cache(m.comp.at(r), L.l));
+        RAD_ISSUE_N(x, L.cm_idx, T, mark, pos, praw(ib->slot_mapping, RAD_I32, T), RAD_B(L.tic),
+                    kv_cache(m.index.at(r), L.l));
+        RAD_ISSUE_N(x, L.cm_tail, T, mark, pos, cu, acc,
+                    praw2(tb->state_index, RAD_I32, S, tb->state_index_pitch > 0 ? tb->state_index_pitch : 1),
+                    kv_cache(m.tail.at(r), L.l));
+    }
+}
+
 /* The drafter's context pass (draft_pass < 0): the trunk step's rows, in order. */
 static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
     const auto& d = m.dsp;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, hd = m.c.head_dim;
+    tree_commit(x, m, batch);
     if (T <= 0 || m.zero) return;   /* an attention-zero rank keeps no keys (its cache is zeroed) */
     const auto* kb = kv_batch(batch, d.kv);
     if (!kb || !kb->slot_mapping) {
@@ -2757,6 +3105,15 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     }
     RAD_ISSUE_N(x, d.select, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE, praw(batch->token_ids, RAD_I32, T),
                 RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
+    /* Lever T1: the branches (the live count; none at 0) and the tree into the proposal. */
+    if (d.tree) {
+        int nb = g_sw_tree_b.load(std::memory_order_relaxed);
+        nb = nb < 0 ? 0 : nb > kTreeBranches ? kTreeBranches : nb;
+        if (nb > 0)
+            RAD_ISSUE_N(x, d.alt_op, S, brows(d.cand_, N), brows(d.unary, N), praw(batch->token_ids, RAD_I32, T),
+                        brows(d.tokens, S), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.alt, S));
+        RAD_ISSUE_N(x, d.asm_op[nb], S, brows(d.tokens, S), brows(d.alt, S), brows(d.prop, S), brows(d.par, S));
+    }
 }
 
 /* The ffn connection's mix, issued by the MoE block behind its routed gate_up (MoeFP8::Beside). */
@@ -2815,6 +3172,19 @@ static void step(RadCtx* x, const RadBatch* batch) {
     if (m.tok_map)
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap),
                     brows(m.ctok, T));
+    /* Lever T1: a tree verify (the core staged spec_parent: a decode-only step, every drafting sequence's rows a
+     * tree; n_spec 0 is a step that verifies nothing, every row ordinary) issues each layer's tree op in place of the
+     * op it replaces, after the tree table. */
+    const bool tree = m.tree && batch->spec_parent != nullptr && batch->n_spec > 0;
+    m.tree_last = tree;
+    if (tree) {
+        if (T > m.tree_rows) {
+            rad_step_fail(x, "deepseek41: a tree verify of more rows than its scratch holds");
+            return;
+        }
+        RAD_ISSUE_N(x, m.tree_op, T, praw(batch->spec_parent, RAD_I32, T), cu, pos, brows(m.tt, T),
+                    brows(m.spos, T), brows(m.tmark, T));
+    }
 
     /* The Engram's row ids are a function of the batch's tokens alone (token_map, each Engram
      * layer's token history), never of an activation, so every Engram layer's ngram_ids is issued
@@ -2832,7 +3202,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
         int64_t Dn = 0, DT = 0;
         batch_split(batch, &Dn, &DT);
         const int64_t P = S - Dn;
-        if (Dn > 0)
+        if (Dn > 0 && tree)
+            RAD_ISSUE_N(x, L.e_ids_t, DT, brows(m.ctok, DT), kv_cache(m.tok, l),
+                        praw(batch->cu_seqlens, RAD_I32, Dn + 1), RAD_W(L.e_mult),
+                        RAD_W(L.e_vsz), RAD_W(L.e_off), praw(tk_idx, RAD_I32, Dn),
+                        praw(batch->ctx_lens, RAD_I32, Dn),
+                        praw(batch->num_accepted, RAD_I32, Dn), brows(L.ids, DT), RAD_NONE,
+                        brows(m.tt, DT));
+        else if (Dn > 0)
             RAD_ISSUE_N(x, L.e_ids, DT, brows(m.ctok, DT), kv_cache(m.tok, l),
                         praw(batch->cu_seqlens, RAD_I32, Dn + 1), RAD_W(L.e_mult),
                         RAD_W(L.e_vsz), RAD_W(L.e_off), praw(tk_idx, RAD_I32, Dn),
@@ -2929,7 +3306,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                      * page -1 either way. */
                     rows = m.ctail_full ? m.work
                                         : std::min<int64_t>(m.work, std::max<int64_t>((T + r - 1) / r + S, g.max_seqs));
-                    page = brows(m.page, rows);
+                    /* Lever T1: a tree verify completes a block at every node whose position ends one (siblings
+                     * at one depth complete the same block, each its own), at most one a row. */
+                    if (tree && !m.ctail_full) rows = std::min<int64_t>(m.work, std::max<int64_t>(T + S, g.max_seqs));
+                    page = brows(tree ? m.mpage : m.page, rows);
                     bpos = brows(m.bpos, rows);
                 }
             }
@@ -2973,7 +3353,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                 brows(ctail ? m.kvs : m.pooled, T));
             };
             const auto c_work = [&] {
-                if (ctail)
+                if (ctail && tree)
+                    RAD_ISSUE_N(x, L.c_work_t, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
+                                praw2(tb->state_index, RAD_I32, S, tpitch),
+                                praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), RAD_NONE,
+                                brows(m.stage, rows * r), brows(m.page, rows), brows(m.bpos, rows),
+                                brows(m.nc, S), brows(m.tt, T), brows(m.mpage, rows), brows(m.tpage, rows));
+                else if (ctail)
                     RAD_ISSUE_N(x, L.c_work, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
                                 praw2(tb->state_index, RAD_I32, S, tpitch),
                                 praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), RAD_NONE,
@@ -3015,6 +3401,8 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto k_st = [&] {
                 if (L.src) RAD_ISSUE_N(x, L.k_st, rows, brows(m.ikn, rows), page, kv_cache(m.index[r], l));
+                /* Lever T1: a deeper node's index key into the scratch (tpage: its step row). */
+                if (ctail && tree) RAD_ISSUE_N(x, L.k_st_t, rows, brows(m.ikn, rows), brows(m.tpage, rows), RAD_B(L.tic));
             };
             const auto l_rope = [&] {
                 if (!L.src) return;
@@ -3028,11 +3416,15 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
             const auto l_st = [&] {
                 if (L.src) RAD_ISSUE_N(x, L.l_st, rows, brows(m.lat, rows), page, kv_cache(m.comp[r], l));
+                /* Lever T1: a deeper node's latent into the scratch (tpage: its step row). */
+                if (ctail && tree) RAD_ISSUE_N(x, L.l_st_t, rows, brows(m.lat, rows), brows(m.tpage, rows), RAD_B(L.tcc));
             };
             const auto c_tail = [&] {
+                /* Lever T1: a tree verify's rows at their slot positions (the anchor + their row), as their K / V;
+                 * the context pass moves the accepted path's to their positions. */
                 if (ctail && L.c_tail)
-                    RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
-                                praw2(tb->state_index, RAD_I32, S, tpitch));
+                    RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), tree ? brows(m.spos, T) : pos, cu,
+                                kv_cache(m.tail[r], l), praw2(tb->state_index, RAD_I32, S, tpitch));
             };
             const auto i_q = [&] {
                 if (L.i_score) lin_issue(x, m, L.i_q, T, brows(m.qrn, T), L.iq_w, brows(m.iq, T));
@@ -3068,9 +3460,22 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                                      m.split_min_live);
                 /* the restriction below its threshold is the unrestricted op (the optional keep left out) */
                 const bool rkeep = L.i_keep && live >= m.keep_min_live;
+                if (tree && (ru.split || ru.p0 != 0 || ru.p1 != 1)) {
+                    rad_step_fail(x, "deepseek41: a tree verify's index scores in more than one run");
+                    return;
+                }
                 for (int64_t p = ru.p0; p < ru.p1; ++p) {
                     const int64_t r0 = p * ru.R, rows = std::min(ru.R, T - r0);
                     const RadOperand prow = praw(batch->positions + r0, RAD_I32, rows);
+                    /* Lever T1: the scores by each row's path (index_score_tree, run 0 only). */
+                    if (tree)
+                        RAD_ISSUE_N(x, L.i_score_t, ru.R, brows(m.iq, T), brows(m.iw, T),
+                                    kv_cache(m.index[r], src),
+                                    praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
+                                    bcol(m.score, 0, live, ru.R),
+                                    rkeep ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE, brows(m.tt, T),
+                                    r > 1 ? RAD_B(m.layers[(size_t)src].tic) : RAD_NONE);
+                    else
                     RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, brows(m.iq, T), brows(m.iw, T),
                                 kv_cache(m.index[r], src),
                                 praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
@@ -3107,11 +3512,20 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (L.src) i_qq();
             l_q(); k_q(); l_st(); k_st(); i_score();
 
-            /* Lever K1 fold d (switch ds41_ofold): attn_rt for the attention and its output's rope + round trip. */
-            const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
+            /* Lever K1 fold d (switch ds41_ofold): attn_rt for the attention and its output's rope + round trip.
+             * Lever T1: a tree verify takes the tree attention (and the unfolded rope + round trip after it). */
+            const bool ofold = !tree && L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
             const rad_op ah = ofold ? L.attn_rt : L.attn;
             const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
-            if (r > 0) {
+            if (tree) {
+                const int src = r > 0 ? c.src_of[(size_t)l] : -1;
+                const auto* cb = r > 0 ? kv_batch(batch, m.comp[r]) : nullptr;
+                RAD_ISSUE_N(x, L.attn_t, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused,
+                            r > 0 ? kv_cache(m.comp[r], src) : RAD_NONE,
+                            r > 0 ? praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch) : RAD_NONE,
+                            r > 0 ? brows(m.sel, T) : RAD_NONE, pos, cu, RAD_W(L.sinks), brows(m.o, T),
+                            brows(m.tt, T), r > 1 ? RAD_B(m.layers[(size_t)src].tcc) : RAD_NONE);
+            } else if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
                 if (ofold)
@@ -3240,6 +3654,13 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (ns > 0 && blk > 0) {
         out->draft_depth = (int)blk;
         out->draft_depth_fixed = 1;
+        /* Lever T1: the tree's node slots (the main chain and kTreeBranches branches of `block`), and
+         * trees asked of the core (RadArchProbe::tree_pays; the core's draft-window cost model prices the
+         * extra nodes step by step, dspark_tree / dspark_tree_force choose them). */
+        if (tree_asked()) {
+            out->draft_depth = (int)(blk * (1 + kTreeBranches));
+            out->tree_pays = 1;
+        }
     }
     return RAD_OK;
 }
