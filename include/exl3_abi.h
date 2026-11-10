@@ -70,7 +70,12 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 10
+#define EXL3_IFACE_VERSION 11
+
+/* v11 (fn4 DS variant, 10.11.2026): moe_exl3_gate_up_down (the two-class form) takes gate_up's SwiGLU clamp as an
+ * OPTIONAL parameter `limit` (f64, absent or 0 none), as moe_exl3_gate_up has since v8 -- DeepSeek's swiglu_limit, so a
+ * clamped model can take the fused decode chain. exl3_gd_params hands it to the gate_up view only. Nothing else changes;
+ * an architecture vendoring v10 keeps declaring the fused op without it. */
 
 /* v10 (fn4, 10.11.2026; v9 is the ds41 line's ep_ranks, not on this branch): THE SHARED ROUTING MAP. moe_exl3_gate_up and moe_exl3_down (the two-class forms) take one more
  * OPTIONAL operand, last: `map`, i32 [exl3_map_words(T, n_expert)] with T = M * top_k -- a workspace the gate_up and
@@ -455,6 +460,8 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "codebook", RAD_P_STR, RAD_REQUIRED, RAD_PROLE_NONE },
         { "N_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
         { "K_odd",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        /* v11: gate_up's SwiGLU clamp (as p_gu's v8 `limit`); absent or 0 is none */
+        { "limit",    RAD_P_F64, RAD_OPTIONAL, RAD_PROLE_NONE },
     };
     static const RadOperandSpec gate_up_down[18] = {
         { "a",             RAD_OPD_IN,   0 },
@@ -781,7 +788,7 @@ static inline int exl3_geom_parse(const RadParam* p, int n_p, int op_in, int two
  * The fused op read as the pair it is defined by, so every implementation reuses its gate_up and down: the
  * gate_up view (a_rot = 0, h_rot = 1, gate_up's operands, output h) and the down view (h_rot = 1, down's
  * geometry [K, N / 2], operands h, dn_codes, dn_suh, dn_svh, routing, output y). `h` is the caller's buffer (a
- * [T, max(N, N_odd) / 2] f16 tensor). The parameter arrays are the caller's: gate_up at most 11, down 10. */
+ * [T, max(N, N_odd) / 2] f16 tensor). The parameter arrays are the caller's: gate_up at most 12 (v11 `limit`), down 10. */
 static inline void exl3_gd_params(const RadParam* p, int n_p, RadParam* pg, int* n_pg, RadParam* pd, int* n_pd) {
     static const RadParam h1 = { "h_rot", RAD_P_INT, 1, 0, 0, 0.0 }, a0 = { "a_rot", RAD_P_INT, 0, 0, 0, 0.0 };
     const int64_t N = rad_param_geti(p, n_p, "N", 0), K = rad_param_geti(p, n_p, "K", 0);
@@ -791,8 +798,9 @@ static inline void exl3_gd_params(const RadParam* p, int n_p, RadParam* pg, int*
     for (int i = 0; i < n_p; ++i) {
         const char* k = p[i].key;
         if (!strcmp(k, "h_rot") || !strcmp(k, "a_rot")) continue;
-        if (ng < 9) pg[ng++] = p[i];
-        if (!strcmp(k, "N") || !strcmp(k, "K") || !strcmp(k, "N_odd") || !strcmp(k, "K_odd")) continue;
+        if (ng < 10) pg[ng++] = p[i];   /* v11: `limit` too -- gate_up's alone */
+        if (!strcmp(k, "N") || !strcmp(k, "K") || !strcmp(k, "N_odd") || !strcmp(k, "K_odd") || !strcmp(k, "limit"))
+            continue;
         if (nd < 6) pd[nd++] = p[i];   /* M, n_expert, top_k, dtype, codebook */
     }
     pg[ng++] = h1;

@@ -471,6 +471,9 @@ void exl3r4d_ctr_fini(void* inst) {
 int exl3r4d_launch_fused(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, int prep,
                          void* stream);
 /* ...and v7's at four classes (exl3r4d_gd_mod4.hip: the fused kernel with no hidden argument block) */
+/* ...and the two-class one at another K for both projections (fn4 DS variant: 2, 4 or EXL3R4D_BITS_H25) */
+int exl3r4d_launch_fused_k(const Exl3r4dGemm* gu, const Exl3r4dGemm* dn, unsigned* ctr, int workgroups, int prep, int bits,
+                           void* stream);
 int exl3r4d_launch_fused4(const Exl3r4dGemm4* gu, const Exl3r4dGemm4* dn, unsigned* ctr, int workgroups, int prep,
                           void* stream);
 
@@ -753,13 +756,16 @@ static int launch_gd(const RadArgs* a, RadStream s, int op) {
     B.xr = (void*)B.x; B.xr_pitch = B.x_pitch; B.chunk = 16;       /* h, written rotated by gate_up (h_rot) */
     if (EXL3R4D_SPLIT) return RAD_E_UNSUPPORTED;   /* down reads h' rotated (h_rot): no split epilogue */
     /* nslot - 1: the most live experts this launch can have (the kernel's list holds 256) */
-    unsigned* ctr = gg.bits == 4 && gdd.bits == 4 && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE && (A.sk == 1 || EXL3R4D_GD_SK2) &&
+    /* fn4 DS variant: both projections at one K -- 4, or (two classes) 2 / 2.5, which take the plain fused form */
+    const int k4 = gg.bits == 4 && gdd.bits == 4;
+    const int kx = gg.bits == gdd.bits && !mod4 && (gg.bits == 2 || gg.bits == EXL3R4D_BITS_H25);
+    unsigned* ctr = (k4 || kx) && A.nslot - 1 <= EXL3R4D_GD_MAX_LIVE && (A.sk == 1 || (EXL3R4D_GD_SK2 && k4)) &&
                             A.n_tok >= EXL3R4D_GD_MIN_TOK
                         ? ctr_block(a->instance, s, B.y, 0) : NULL;
     if (ctr) {
         const int fit = exl3r4d_fused_rows(1, gg.x_cols);
         const int64_t need = run_rows_max(&gg, A.n_tok, A.T);
-        const int ap = EXL3R4D_GD_AP && need >= 1 && need <= fit && need <= EXL3R4D_GD_AP;   /* AP: the most rows */
+        const int ap = EXL3R4D_GD_AP && !kx && need >= 1 && need <= fit && need <= EXL3R4D_GD_AP;   /* AP: the most rows */
         Exl3r4dGemm Af = A;
         if (ap) {
             Af.xr = NULL;
@@ -770,7 +776,7 @@ static int launch_gd(const RadArgs* a, RadStream s, int op) {
             rc = exl3r4d_gemm4(&Af, ha, &A4) != RAD_OK || exl3r4d_gemm4(&B, hb, &B4) != RAD_OK
                      ? RAD_E_UNSUPPORTED : exl3r4d_launch_fused4(&A4, &B4, ctr, 0, !ap, s);
         } else {
-            rc = exl3r4d_launch_fused(&Af, &B, ctr, 0, !ap, s);
+            rc = kx ? exl3r4d_launch_fused_k(&Af, &B, ctr, 0, !ap, gg.bits, s) : exl3r4d_launch_fused(&Af, &B, ctr, 0, !ap, s);
         }
 #ifdef EXL3R4D_GD_DEBUG
         if (rc != RAD_OK)
