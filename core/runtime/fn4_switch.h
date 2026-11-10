@@ -89,6 +89,19 @@
  *                   step (MoeFP8 shared_one_external), 0 by every MoE layer as before. RADIANCE_DS41_ONEFILL=1
  *                   declares the step's fill (starts at 1); unset: 1 refused. Exact: the gathers read the same ones.
  *
+ *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
+ *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
+ *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
+ *                   and 1 is refused. Exact: the same bytes in q (and in the normed rows the indexer reads).
+ *   ds41_swfold     deepseek41 (lever K1 fold e): 1 the shared expert's swiglu_clamped computed in its down GEMV's
+ *                   activation staging (swiglu_clamped_gemm_nt_ggml, decode band), 0 swiglu_clamped + gemm_nt_ggml.
+ *                   RADIANCE_DS41_SWFOLD=1 declares it (starts at 1); unset: 1 refused. Exact.
+ *   draft_ctxskip   the core's (block drafter; lever D0 context skip): 1 a block drafter's context pass is skipped on
+ *                   a plain decode step while depth 0 holds, the step's tapped rows kept, and the drafter's window
+ *                   refilled from them in one context pass before the head next runs; 0 the context pass every step
+ *                   as before. RADIANCE_DRAFT_CTXSKIP=1 at start sets it up (and starts at 1); unset: 1 refused.
+ *                   Exact for the target (the drafter only proposes).
+ *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
  *
@@ -111,7 +124,7 @@ namespace fn4 {
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow,
-              kIdxSplit, kSwitches };
+              kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

@@ -21,12 +21,12 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_shexp_lane", "ds41_kvfold", "ds41_ofold", "ds41_onefill",
                                         "draft_depth0", "draft_probe", "draft_hybrid", "draft_hybrid_match",
                                         "draft_probe_backoff", "draft_lend", "draft_lend_borrow",
-                                        "idx_split" };
+                                        "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
            i == kDs41OneFill ||
-           i == kIdxSplit;
+           i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -226,7 +226,7 @@ bool check(const std::string& name, int v, std::string* err) {
         if (err) *err = "unknown switch '" + name + "' (draft_adaptive, gg_gemv, aql_acq, ds41_argather, "
                         "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
-                        "idx_split, epoch_bump)";
+                        "idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, epoch_bump)";
         return false;
     }
     State& s = st();
