@@ -248,6 +248,12 @@ bool IdleTiers::resident_off_device(const BlockHash& key) const {
     return !it->second.pending && it->second.tier != KVTier::Device;
 }
 
+bool IdleTiers::moving(const BlockHash& key) const {
+    std::lock_guard lk(mu_);
+    auto it = recs_.find(key);
+    return it != recs_.end() && it->second.pending;
+}
+
 /* ------------------------------------------------------------------ copy on idle */
 
 bool IdleTiers::writeback_waiting() const {

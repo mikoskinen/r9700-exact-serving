@@ -135,6 +135,9 @@ public:
     /* Device for keys this object has never seen: the cache holds them in the pool. */
     KVTier tier_of(const BlockHash& key) const;
     bool   resident_off_device(const BlockHash& key) const;
+    /* A transfer is out for this record (a copy reading its blocks, or a promotion writing
+     * them). The cache leaves such an entry's blocks alone until the engine reports the job. */
+    bool   moving(const BlockHash& key) const;
 
     /* ---------------- copy on idle ----------------
      *
