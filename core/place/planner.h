@@ -443,8 +443,15 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
  * usable; a weight a GEMM also reads (an output head tied to the embedding) would stream whole
  * every step and is neither. Shared by the budget resolver and the planner. */
 bool read_only_by(const Program& prog, rad_weight w, const char* op);
+/* RADIANCE_DS41_EMB_RAM=1 (lever VA "emb"): a model-level table read only by
+ * `embed_lookup_ggml` (a token embedding in llama.cpp's blocks, DeepSeek-V4.1's q6_K table) is a
+ * token embedding too, so --embedding-placement (ram by default) places it like a bf16 one: pinned in
+ * host memory, its M rows a step read over the link in place. Exact: a lookup reads the same bytes
+ * wherever they sit. Unset or anything but "1": only `embed_lookup`'s table qualifies, as before. */
+bool embed_ggml_table();
 inline bool is_embedding_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup");
+    return read_only_by(prog, w, "embed_lookup") ||
+           (embed_ggml_table() && read_only_by(prog, w, "embed_lookup_ggml"));
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup_q") || read_only_by(prog, w, "embed_lookup_planes");

@@ -1583,6 +1583,22 @@ int Engine::declare() {
     RAD_INFO("declare: %zu ops, %zu weights, %zu buffers, %zu KV groups",
              ranks_[0]->program.ops.size() - 1, ranks_[0]->program.weights.size() - 1,
              ranks_[0]->program.buffers.size() - 1, ranks_[0]->program.kv_groups.size());
+    /* Lever VA "emb" (RADIANCE_DS41_EMB_RAM): name the table it makes placeable, at declare, so a
+     * host start (--debug-graph) shows it before any placement runs. */
+    if (embed_ggml_table()) {
+        const Program& p0 = ranks_[0]->program;
+        int n = 0;
+        for (size_t w = 1; w < p0.weights.size(); ++w)
+            if (read_only_by(p0, (rad_weight)w, "embed_lookup_ggml")) {
+                ++n;
+                RAD_INFO("embedding: '%s' (%s a rank) is read only by embed_lookup_ggml: a token "
+                         "embedding table --embedding-placement places (RADIANCE_DS41_EMB_RAM)",
+                         p0.weights[w].name.c_str(), humanb(p0.weights[w].stored_bytes).c_str());
+            }
+        if (!n)
+            RAD_INFO("embedding: RADIANCE_DS41_EMB_RAM is set, and no weight is read only by "
+                     "embed_lookup_ggml");
+    }
 
     /* The draft head is exactly what the plugin declared (rad_declare_drafter). The core never
      * infers one from weight names or metadata, so third-party drafters need no core changes. */

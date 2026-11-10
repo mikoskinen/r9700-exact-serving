@@ -3706,6 +3706,61 @@ TEST(the_placement_flags_find_their_tables_by_what_reads_them) {
     CHECK_EQ(fp.hosted, 0ll);
 }
 
+/* Lever VA "emb": RADIANCE_DS41_EMB_RAM=1 makes a model-level table read only by embed_lookup_ggml (a
+ * token embedding in llama.cpp's blocks, DeepSeek-V4.1's) a token embedding the placement flag
+ * moves, as embed_lookup's; unset, it is not one (the start keeps it on the card, as before). A table
+ * a GEMM also reads stays out either way. */
+TEST(a_ggml_token_table_is_an_embedding_only_under_its_switch) {
+    Fixture f;
+    const rad_weight m = f.weight("token_embd.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed_lookup_ggml", {m}, false);
+    f.op("embed_lookup_ggml", {m}, false);          /* a drafter's lookup of the same table */
+    const rad_weight w = f.weight("blk.0.ffn_down.weight", 4 * MiB, RAD_ACCESS_PER_TOKEN, 0, -1);
+    f.op("gemm", {w}, false);
+    const rad_weight o = f.weight("output.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("logits_gemm_ggml", {o}, false);
+    Fixture t;                                       /* tied: the lookup and the head */
+    const rad_weight tm = t.weight("token_embd.weight", 2 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    t.op("embed_lookup_ggml", {tm}, false);
+    t.op("logits_gemm_ggml", {tm}, false);
+
+    WeightFootprint fp;
+    unsetenv("RADIANCE_DS41_EMB_RAM");
+    CHECK(!embed_ggml_table());
+    CHECK(!is_embedding_table(f.prog, m));
+    weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
+    CHECK_EQ(fp.embedding, 0ll);
+    CHECK_EQ(fp.hosted, 0ll);
+    const int64_t statics_off = fp.statics;
+
+    setenv("RADIANCE_DS41_EMB_RAM", "1", 1);
+    CHECK(embed_ggml_table());
+    CHECK(is_embedding_table(f.prog, m));
+    CHECK(!is_embedding_table(f.prog, w));
+    CHECK(!is_embedding_table(f.prog, o));
+    CHECK(!is_embedding_table(t.prog, tm));
+    weight_footprint(f.prog, &fp, TablePlacement::Ram, TablePlacement::Disk, false, true);
+    CHECK_EQ(fp.embedding, 2 * MiB);
+    CHECK_EQ(fp.hosted, 2 * MiB);
+    CHECK_EQ(fp.statics, statics_off - 2 * MiB);
+    /* Placed in RAM: the pinned pool, read in place by the card. */
+    Config c = base_config();
+    c.placement = "all_vram";
+    c.vram_weights_mib = 8;
+    c.host_pool_mib = 4;
+    c.embedding_placement = TablePlacement::Ram;
+    c.embedding_resolved = TablePlacement::Ram;
+    Plan plan;
+    PlannerInput in{&f.prog, &c, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    CHECK(plan.weight[m].tier == Tier::HostPinned);
+    CHECK(plan.weight[m].site == Site::DeviceZeroCopy);
+    CHECK_EQ(plan.embedding_host_bytes, 2 * MiB);
+    setenv("RADIANCE_DS41_EMB_RAM", "0", 1);
+    CHECK(!embed_ggml_table());
+    unsetenv("RADIANCE_DS41_EMB_RAM");
+}
+
 TEST(embedding_ram_goes_to_the_pinned_pool_read_in_place_and_costs_no_vram) {
     Fixture f;
     build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);

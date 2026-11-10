@@ -12,6 +12,8 @@
 #include "planner.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -1006,6 +1008,12 @@ bool read_only_by(const Program& prog, rad_weight w, const char* op) {
                 read = true;
             }
     return read;
+}
+
+bool embed_ggml_table() {
+    /* Read at each call (a few per weight at declare and plan), so a test can set it. */
+    const char* e = std::getenv("RADIANCE_DS41_EMB_RAM");
+    return e && e[0] == '1' && !e[1];
 }
 
 /* --embedding-placement ram: the token embedding goes to the pinned host pool before any strategy
