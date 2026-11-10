@@ -28,6 +28,9 @@
  *   ar_laneblocks   libr4d (rad_fn4_switch): the prefill all-reduce lane's blocks   RADIANCE_FN4_AR_LANE_BLOCKS
  *                   -- 0 the resolved tunable (4), 4..24 in steps of 4
  *
+ * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
+ * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
+ *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair
  * re-records exactly as an A/B pair does.
  *

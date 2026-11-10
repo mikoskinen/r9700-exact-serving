@@ -1818,6 +1818,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
      * 1/2/4/8/16 streams 174/291/458/657/851 -> 207/339/493/647/843 tok/s. */
     out->chain_pays = 0;   /* fn4 9.11.: off -- with the MTP drafter chained launches cost draft acceptance under
                             * concurrent multi-turn load (113: cc_sim u16 0.259 against 0.351) and gain <= 1 % */
+    /* fn4 10.11.: RADIANCE_FN4_CHAIN=1 at start turns them on again for an A/B across restarts (the core decides
+     * chaining at bring-up and the rows resolve with it, so it is not a runtime switch); natural-mode data
+     * since showed no acceptance cost (0.922 vs 0.920). */
+    if (fn4_env_on("RADIANCE_FN4_CHAIN")) out->chain_pays = 1;
     return RAD_OK;
 }
 

@@ -11244,6 +11244,9 @@ extern "C" int rad_kernel_chain(int i) {
         /* ...and the rest of a delta-net layer */
         "hc_read_bf16", "hc_read_e4m3", "gdn_recurrent_update_k128_v128_bf16_fp32state",
         "gdn_conv_recurrent_update_k128_v128_bf16", "ar_hc_write", "ar_gather_hc_write",
+        /* fn4 10.11.: the four-rank fused all-reduce + write at width (r4d_ar_wide_chain.h: r4dchain_
+         * wrappers around the unchanged kernel bodies, chained at <= r4d_chain_rows_ok rows) */
+        "ar_hc_write_4rank", "ar_gather_hc_write_4rank",
         /* the four-bit routed experts and their rotated quantiser */
         "moe_gemm_w4a8", "moe_gemm_w4a8_mod4", "gated_had_quant_fp8", "gated_had_quant_i8g",
         /* ...and an attention layer: the indexer, the norm/rope/gate, the quantiser before o_proj
