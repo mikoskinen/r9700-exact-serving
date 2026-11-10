@@ -9,7 +9,9 @@
  *     1 and 2, with unmapped blocks, rows of several sequences and exact ties.
  * (b) a step's runs (row_part) dealt over the ranks by arch/deepseek41/ds41_index_split.h, each
  *     rank's candidates, restricted scores and selections of its own runs, joined as the all_gather
- *     concatenates them: every row must be the unsplit runs' selection, at worlds 2, 3 and 4.
+ *     concatenates them: every row must be the unsplit runs' selection, at worlds 2, 3 and 4; and
+ *     under the balanced deal (idx_split 1: other run heights where the world does not divide the
+ *     runs) every row's score bits and selection the unsplit runs', at the scalar and WMMA forms.
  * libref (RADIANCE_HOME's libref.so) is held to the kernels: its index_topk over the restricted
  * score and keep is the kernel's selection, its index_candidates the test's keep (a host port of
  * it), its index_score with keep the scalar kernel's bits, and at every kept position its own
@@ -379,25 +381,38 @@ void restriction(const char* name, const Fix& f, int block, int kb, int k, const
 
 /* (b) a step scored in runs of at most `irows` rows, the runs dealt over `world` ranks: each rank's
  * candidates, restricted scores and selections of its own runs, the parts concatenated as the
- * all_gather lays them, against the unsplit runs (world 1). */
+ * all_gather lays them, against the unsplit runs (world 1). Then the balanced deal (deepseek41's
+ * idx_split 1) wherever it differs from the plain one: other run heights, the same rows -- every
+ * row's two score rows (the candidate layer's, the restricted one) must be the unsplit runs' bits,
+ * and its selection the same, at the row the gather lays it. */
 void deal(const char* name, const Fix& f, int64_t irows, int block, int kb, int k) {
     const int64_t M = f.M, C = f.C, KW = keep_words(C, block);
-    auto run_world = [&](int world, std::vector<int32_t>* out) {
-        const Ds41IdxRuns r0 = ds41_idx_runs(M, irows, C, world, 0, true);
+    /* sel: the gathered selections; s1 / s2: each step row's candidate-layer and restricted score
+     * rows, as its rank computed them (bits, -inf past reach included). */
+    auto run_world = [&](int world, bool bal, std::vector<int32_t>* out, std::vector<float>* s1,
+                         std::vector<float>* s2) {
+        const Ds41IdxRuns r0 = ds41_idx_runs(M, irows, C, world, 0, true, kDs41SplitMinLive, bal);
         const int64_t rows_all = world > 1 && r0.split ? (int64_t)world * r0.q * r0.R : M;
         out->assign((size_t)(std::max(rows_all, M) * k), 0x77777777);
+        s1->assign((size_t)(M * C), 0.0f);
+        s2->assign((size_t)(M * C), 0.0f);
         for (int rank = 0; rank < world; ++rank) {
-            const Ds41IdxRuns r = ds41_idx_runs(M, irows, C, world, rank, true);
+            const Ds41IdxRuns r = ds41_idx_runs(M, irows, C, world, rank, true, kDs41SplitMinLive, bal);
+            expect(r.n == r0.n && r.R == r0.R && r.q == r0.q && r.split == r0.split && r.balanced == r0.balanced,
+                   name, "the ranks deal differently");
             std::vector<int32_t> keep((size_t)(M * KW), 0x0F0F0F0F);
             std::vector<int32_t> part((size_t)(r.q * r.R * k), 0x66666666);
             std::vector<float> plane((size_t)(r.R * C));
             for (int64_t p = r.p0; p < r.p1; ++p) {
                 const int64_t rr0 = p * r.R, rows = std::min(r.R, M - rr0);
+                expect(rows >= 1, name, "a run past the step");
                 expect(score(r4d_rad_ds41_index_score, f, true, r.R, (int)p, nullptr, 0, block, plane.data()) ==
                        RAD_OK, name, "run score (candidate layer)");
+                std::memcpy(s1->data() + rr0 * C, plane.data(), (size_t)(rows * C) * 4);
                 host_candidates(f, plane.data(), rows, f.pos.data() + rr0, block, kb, keep.data() + rr0 * KW);
                 expect(score(r4d_rad_ds41_index_score, f, false, r.R, (int)p, keep.data() + rr0 * KW, rows,
                              block, plane.data()) == RAD_OK, name, "run restricted score");
+                std::memcpy(s2->data() + rr0 * C, plane.data(), (size_t)(rows * C) * 4);
                 int32_t* dst = r.split ? part.data() + (p - r.p0) * r.R * k : out->data() + rr0 * k;
                 expect(topk(r4d_rad_ds41_index_topk, f, plane.data(), rows, keep.data() + rr0 * KW,
                             f.pos.data() + rr0, block, k, rows <= 16, dst) == RAD_OK, name, "run topk");
@@ -410,21 +425,38 @@ void deal(const char* name, const Fix& f, int64_t irows, int block, int kb, int 
         }
     };
     std::vector<int32_t> one;
-    run_world(1, &one);
-    for (int world : { 2, 3, 4 }) {
-        std::vector<int32_t> got;
-        run_world(world, &got);
-        const Ds41IdxRuns r = ds41_idx_runs(M, irows, C, world, 0, true);
-        int64_t d = 0;
-        for (int64_t i = 0; i < M * k; ++i) d += got[(size_t)i] != one[(size_t)i];
-        char what[160];
-        std::snprintf(what, sizeof what, "world %d (%lld runs of %lld rows, %lld a rank, split %d) differs "
-                      "from the unsplit runs", world, (long long)r.n, (long long)r.R, (long long)r.q, (int)r.split);
-        expect(d == 0, name, what, d, M * k);
-        std::printf("%-48s world %d: %lld runs of %lld rows, %lld a rank, split %d, %lld of %lld entries differ\n",
-                    name, world, (long long)r.n, (long long)r.R, (long long)r.q, (int)r.split, (long long)d,
-                    (long long)(M * k));
-    }
+    std::vector<float> one1, one2;
+    run_world(1, false, &one, &one1, &one2);
+    const Ds41IdxRuns u = ds41_idx_runs(M, irows, C, 1, 0, true);
+    for (int world : { 2, 3, 4 })
+        for (const bool bal : { false, true }) {
+            const Ds41IdxRuns r = ds41_idx_runs(M, irows, C, world, 0, true, kDs41SplitMinLive, bal);
+            if (bal && !r.balanced) {   /* the plain deal again (world divides n, or the form guard) */
+                const Ds41IdxRuns pl = ds41_idx_runs(M, irows, C, world, 0, true);
+                expect(r.n == pl.n && r.R == pl.R && r.q == pl.q, name, "balanced off but not the plain deal");
+                std::printf("%-48s world %d balanced: the plain deal (%s)\n", name, world,
+                            !pl.split ? "no split" : pl.n % world == 0 ? "world divides the runs" : "the form guard");
+                continue;
+            }
+            std::vector<int32_t> got;
+            std::vector<float> g1, g2;
+            run_world(world, bal, &got, &g1, &g2);
+            int64_t d = 0, ds = 0;
+            for (int64_t i = 0; i < M * k; ++i) d += got[(size_t)i] != one[(size_t)i];
+            for (int64_t i = 0; i < M * C; ++i)
+                ds += (bits(g1[(size_t)i]) != bits(one1[(size_t)i])) + (bits(g2[(size_t)i]) != bits(one2[(size_t)i]));
+            char what[200];
+            std::snprintf(what, sizeof what, "world %d %s (%lld runs of %lld rows, %lld a rank, split %d) differs "
+                          "from the unsplit runs", world, bal ? "balanced" : "plain", (long long)r.n, (long long)r.R,
+                          (long long)r.q, (int)r.split);
+            expect(d == 0, name, what, d, M * k);
+            expect(ds == 0, name, "score bits differ from the unsplit runs'", ds, 2 * M * C);
+            std::printf("%-48s world %d %s: %lld runs of %lld rows, %lld a rank, split %d (unsplit %lld runs of "
+                        "%lld, %s form both): %lld of %lld entries, %lld of %lld score bits differ\n",
+                        name, world, bal ? "balanced" : "plain", (long long)r.n, (long long)r.R, (long long)r.q,
+                        (int)r.split, (long long)u.n, (long long)u.R, r.R > kDs41IdxFormRows ? "WMMA" : "scalar",
+                        (long long)d, (long long)(M * k), (long long)ds, (long long)(2 * M * C));
+        }
 }
 
 /* (c) MXFP4 index keys. The fixture's keys made quant_roundtrip(fp4_e2m1, ue8m0, 32) values (a host
@@ -584,6 +616,13 @@ int main(int argc, char** argv) {
         deal("row split, 200 rows, runs <= 64", f, 64, 8, 64, 128);
         const Fix g = make(16, 16, 1, { { 3, 2000 }, { 127, 5000 } });
         deal("row split, 130 rows, runs <= 48", g, 48, 8, 48, 96);
+        /* the balanced deal where the plain one leaves ranks short (a mixed step: decode rows beside
+         * a prefill chunk; 3 runs of 87 -> 4 of 65 at worlds 2 and 4), and at ratio 2 (4 runs of 100,
+         * dealt 2 / 2 / 0 at world 3 -> 6 of 67, 2 a rank); widths past kDs41SplitMinLive, so split */
+        const Fix h = make(25, 16, 1, { { 3, 4400 }, { 257, 5000 } });
+        deal("row split, 260 rows, runs <= 128", h, 128, 8, 64, 128);
+        const Fix i = make(26, 16, 2, { { 400, 8399 } });
+        deal("row split, 400 rows, ratio 2, runs <= 128", i, 128, 8, 48, 96);
     }
     if (longrun) {
         const Fix f = make(17, 16, 1, { { 49, 299999 } });
