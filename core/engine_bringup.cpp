@@ -1745,18 +1745,42 @@ static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& l
              n_router, (long long)router, n_comp, (long long)comp);
     RAD_INFO("vram (RADIANCE_DEBUG_VRAM) emb: %d token embedding table(s) the placement flag moves, %lld B (%s)",
              n_emb, (long long)emb, emb_names.empty() ? "none" : emb_names.c_str());
-    WeightFootprint wf;
-    weight_footprint(P, &wf, TablePlacement::Vram, TablePlacement::Disk, false, true);
+    /* The expert slab classes as weight_footprint forms them -- a unit a (layer, expert), its weights
+     * each aligned, the unit rounded to RAD_ALIGN_UNIT, a class a stride -- counted from the weights
+     * themselves: on the host backend no device kernel reads an expert, so weight_footprint maps them
+     * all and sees none. */
+    std::map<std::pair<int32_t, int32_t>, int64_t> unit;
     int64_t nl = P.meta.n_layers;
-    for (const WeightInfo& w : P.weights)
-        if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
-    const int64_t xp = wf.routed && wf.expert_unit_max > 0 && !xprefetch_env_off() ? xp_device_bytes(wf.expert_unit_max, nl) : 0;
-    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) shadow: %d shadow slots a class at most, the expert floor's spare slab %lld B; "
-             "statics %lld B, experts %lld B, the largest expert unit %lld B",
-             place_shadow_slots(), (long long)wf.expert_spare, (long long)wf.statics, (long long)wf.experts,
-             (long long)wf.expert_unit_max);
-    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) xpoff: the expert prefetch's ring and buffers %lld B over %lld routed layers%s",
-             (long long)xp, (long long)nl, xprefetch_env_off() ? " (RADIANCE_XPREFETCH off: none, and no DMA queue)" : "");
+    for (size_t w = 1; w < P.weights.size(); ++w) {
+        const WeightInfo& wi = P.weights[w];
+        if (wi.decl.group.expert < 0 || wi.decl.group.layer < 0) continue;
+        nl = std::max(nl, (int64_t)wi.decl.group.layer + 1);
+        int64_t& b = unit[{ wi.decl.group.layer, wi.decl.group.expert }];
+        b = align_up(b, wi.align > 0 ? wi.align : (int64_t)RAD_ALIGN_UNIT) + weight_bytes(wi);
+    }
+    std::map<int64_t, int64_t> classes;   /* stride -> units */
+    int64_t unit_max = 0;
+    for (const auto& u : unit) {
+        const int64_t st = align_up(u.second, (int64_t)RAD_ALIGN_UNIT);
+        ++classes[st];
+        unit_max = std::max(unit_max, st);
+    }
+    const int sh = place_shadow_slots();
+    int64_t spare = 0, spare32 = 0;
+    std::string cls;
+    for (const auto& c : classes) {
+        spare += (int64_t)(sh + RAD_PLACE_STAGE_RING) * c.first + RAD_ALIGN_UNIT;
+        spare32 += (int64_t)(RAD_PLACE_SHADOW_SLOTS + RAD_PLACE_STAGE_RING) * c.first + RAD_ALIGN_UNIT;
+        cls += fmt("%s%lld x %lld B", cls.empty() ? "" : ", ", (long long)c.second, (long long)c.first);
+    }
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) shadow: %d shadow slots a class at most; %zu expert slab class(es) (%s); the expert "
+             "floor's spare slab %lld B (%lld B at the shipped %d)",
+             sh, classes.size(), cls.c_str(), (long long)spare, (long long)spare32, RAD_PLACE_SHADOW_SLOTS);
+    const int64_t xp = unit_max > 0 && !xprefetch_env_off() ? xp_device_bytes(unit_max, nl) : 0;
+    RAD_INFO("vram (RADIANCE_DEBUG_VRAM) xpoff: the expert prefetch's ring and buffers %lld B over %lld routed layers "
+             "(the largest unit %lld B)%s",
+             (long long)xp, (long long)nl, (long long)unit_max,
+             xprefetch_env_off() ? " (RADIANCE_XPREFETCH off: none, and no DMA queue)" : "");
 }
 
 /* The mebibyte between a level's highest buffer and the memory above it, which is lent or holds
