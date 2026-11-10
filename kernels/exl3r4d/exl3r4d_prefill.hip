@@ -1936,6 +1936,15 @@ __global__ void __launch_bounds__(256) exl3r4d_pf_mapprep_kernel(Exl3r4dPrefill 
   __shared__ int s_e[EXL3R4D_PF_ROWS];
   if (blockIdx.x == 0) {
     pf_map_build(a, s_w);
+    // fn4 fix (10.11.2026, 149's fault): gate_up's map form reads its entries through the LPT order array
+    // (EXL3R4D_PF_LPT; pf_gemm k = a.order[k] at MATS 2), which only exl3r4d_pf_map_kernel built -- this kernel left it
+    // unwritten, so the GEMM took scratch garbage as entry indices (gpu02 06:38 UTC: page-not-present in the GEMM). The
+    // map kernel's own tail, here: same entries, same order rules, so the same GEMM schedule as PREP 1.
+    if (EXL3R4D_PF_LPT && MATS == 2 && a.order) {
+      __threadfence_block();
+      __syncthreads();
+      pf_order_build(a);
+    }
     return;
   }
   const Exl3r4dGemm& p = a.g;
@@ -2056,14 +2065,16 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   Exl3r4dPrefill p = *a;
   void* args[] = {&p};
   hipStream_t st = (hipStream_t)stream;
-  if (prep == 3 && (gate_up || !a->g.h_rot || rot || a->g.xr != a->g.x)) return RAD_E_INVAL;   // no prep: h_rot's down
+  // no prep: h_rot's down (3), and with v10's shared map no map kernel either (4: the pass's gate_up wrote a->map)
+  if ((prep == 3 || prep == 4) && (gate_up || !a->g.h_rot || rot || a->g.xr != a->g.x || run || a->chunk_n > 1))
+    return RAD_E_INVAL;
   if (!run && prep == 2 && !rot) {   // the map and the prep by row in one launch
     const void* mk = gate_up ? (const void*)exl3r4d_pf_mapprep_kernel<2> : (const void*)exl3r4d_pf_mapprep_kernel<1>;
     if (hipLaunchKernel(mk, dim3((unsigned)(1 + (a->g.T + EXL3R4D_PF_ROWS - 1) / EXL3R4D_PF_ROWS)), dim3(256), args, 0,
                         st) != hipSuccess)
       return RAD_E_DEVICE;
-  } else if (!run && hipLaunchKernel((const void*)exl3r4d_pf_map_kernel, dim3(1), dim3(1024), args, 0, st) !=
-             hipSuccess) {
+  } else if (!run && prep != 4 &&
+             hipLaunchKernel((const void*)exl3r4d_pf_map_kernel, dim3(1), dim3(1024), args, 0, st) != hipSuccess) {
     return RAD_E_DEVICE;
   }
   if (!run && a->chunk_n > 1) {   // the scratch cap: the map form in chunks by row, prep then GEMM a chunk
@@ -2084,8 +2095,8 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
     }
     return RAD_OK;
   }
-  if ((!run && prep == 2 && !rot) || prep == 3) {
-    // done above (2), or none (3)
+  if ((!run && prep == 2 && !rot) || prep == 3 || prep == 4) {
+    // done above (2), or none (3, 4)
   } else if (!rot && (run || prep == 0)) {   // P4's prep kernel: one workgroup a live expert (find_run)
     const int rc = exl3r4d_launch_prep(&a->g, gate_up, stream);
     if (rc != RAD_OK) return rc;
@@ -2115,6 +2126,19 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
     return RAD_E_DEVICE;
   return RAD_OK;
 }
+
+#if EXL3R4D_NCLS == 2
+// v10's shared map (prefill.c): the map kernel alone -- gate_up's run form (or a map of other entry size) writes the
+// pass's map for down. pf_map_build reads T, off, n_expert, fm, cap; chunk_n 1 and no order array: nothing else.
+extern "C" int exl3r4d_launch_pf_map(const Exl3r4dPrefill* a, void* stream) {
+  if (!a->map || a->cap < 1 || a->chunk_n != 1 || a->order) return RAD_E_INVAL;
+  if (a->g.n_expert < 1 || a->g.n_expert > 4096) return RAD_E_SHAPE;
+  Exl3r4dPrefill p = *a;
+  void* args[] = {&p};
+  return hipLaunchKernel((const void*)exl3r4d_pf_map_kernel, dim3(1), dim3(1024), args, 0, (hipStream_t)stream) ==
+                 hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+#endif
 
 // ============================================================================= lab notes
 //

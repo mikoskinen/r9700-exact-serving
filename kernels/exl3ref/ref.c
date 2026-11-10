@@ -288,7 +288,7 @@ static int launch_gu_dn(const RadArgs* a, int op) {
 int exl3ref_launch(const RadArgs* a, int op) {
     if (exl3_op_base(op) == EXL3_GU_DN) return launch_gu_dn(a, op);
     const Exl3Positions* at = exl3_positions(op);
-    if (a->n_t < at->n_opd) return RAD_E_INVAL;
+    if (a->n_t < at->n_opd - (at->map >= 0)) return RAD_E_INVAL;   /* v10's map: optional and last; not read here */
     if (!rad_arg_in(a, at->x) || !rad_arg_in(a, at->sorted) || !rad_arg_in(a, at->offset) ||
         !rad_arg_in(a, at->y))
         return RAD_E_INVAL;

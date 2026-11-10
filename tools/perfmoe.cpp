@@ -8,6 +8,16 @@
 //           [--warm-ms ms (500)] [--exl3-row <row name>] [--rand-data] [--h-rot 0|1] [--dump-stamps] [--pooled P] [--pfstamps FILE]
 //           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump)]
 //           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
+//           [--ep N [--ep-rank r|-1]] [--fn4 name=value ...] [--x3map]
+//
+// --ep N (ported 10.11.2026 from the ds41 exl3-gu25c line, without its --ep-param): EXPERT PARALLELISM over N ranks --
+// every token's top_k is drawn over E x N experts and this rank keeps experts [r E, r E + E) (--experts E is the rank's
+// count, e.g. 128 of Flash-Next's 512 at EP4); the other ranks' slots are DROPPED (sorted_tok -1 past off[E], the sort's
+// EP form). --ep-rank r picks the rank (default 0); -1 takes, a layer, the rank with the most live experts.
+// --fn4 name=value (fn4, 10.11.2026): calls the exl3r4d library's rad_fn4_switch(name, value) before any launch, as the
+// engine's fn4 switch does between steps (e.g. exl3_pfprep=2); refused or unknown -> exit 1.
+// --x3map (fn4, with --chain; interface v10): the chain's gate_up and down share one routing map buffer (operand `map`),
+// as the engine's exl3_mapshare switch issues them.
 //
 // --tp 4 --rank r: rank r's widths of a four-rank split -- by parity, as the architecture split every world through
 // v1.1.x (ranks 0 and 1 three of every even/odd pair's 5+5 blocks, ranks 2 and 3 two), or with --mod4 by number mod 4
@@ -173,6 +183,9 @@ struct Opts {
                               // as in the engine when other kernels hold slots; a launch that needs co-residency stalls
     int pooled = 0;
     bool chain = false;
+    int ep = 1, ep_rank = 0;  // --ep N [--ep-rank r]: expert parallelism over N ranks (see the header)
+    std::vector<std::pair<std::string, int>> fn4;   // --fn4 name=value: the library's runtime switches
+    bool x3map = false;       // --x3map (with --chain): v10's shared map between the chain's gate_up and down
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
     int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
     int a_rot = 0;            // --a-rot 1 (with --chain; or --op gate_up: the GEMM alone over xr): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
@@ -218,6 +231,34 @@ Route draw(int64_t M, int64_t E, int64_t topk) {
         r.off[(size_t)e + 1] = r.off[(size_t)e] + (int32_t)r.rows[(size_t)e];
         r.sorted.insert(r.sorted.end(), by[(size_t)e].begin(), by[(size_t)e].end());
     }
+    return r;
+}
+
+// --ep N: a draw over E x N experts, this rank's E kept (renumbered 0..E-1), the other ranks' slots dropped -- sorted_tok
+// -1 from off[E] on, as the EP sort leaves them. rank -1: the rank with the most live experts (then the most rows).
+Route draw_ep(int64_t M, int64_t E, int64_t topk, int ep, int rank) {
+    const Route full = draw(M, E * ep, topk);
+    if (rank < 0) {
+        int64_t best_live = -1, best_rows = -1;
+        for (int r = 0; r < ep; ++r) {
+            int64_t live = 0, rows = 0;
+            for (int64_t e = 0; e < E; ++e) {
+                live += full.rows[(size_t)(r * E + e)] > 0;
+                rows += full.rows[(size_t)(r * E + e)];
+            }
+            if (live > best_live || (live == best_live && rows > best_rows)) { best_live = live; best_rows = rows; rank = r; }
+        }
+    }
+    Route r;
+    r.off.assign((size_t)E + 1, 0);
+    r.rows.assign((size_t)E, 0);
+    for (int64_t e = 0; e < E; ++e) {
+        const int64_t g = rank * E + e;
+        r.rows[(size_t)e] = full.rows[(size_t)g];
+        r.off[(size_t)e + 1] = r.off[(size_t)e] + (int32_t)r.rows[(size_t)e];
+        r.sorted.insert(r.sorted.end(), full.sorted.begin() + full.off[(size_t)g], full.sorted.begin() + full.off[(size_t)g + 1]);
+    }
+    r.sorted.resize((size_t)(M * topk), -1);   // the dropped slots
     return r;
 }
 
@@ -330,6 +371,15 @@ int main(int argc, char** argv) {
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--chain") o.chain = true;
+        else if (a == "--ep") o.ep = std::atoi(nx());
+        else if (a == "--ep-rank") o.ep_rank = std::atoi(nx());
+        else if (a == "--x3map") o.x3map = true;
+        else if (a == "--fn4") {
+            const std::string v = nx();
+            const size_t eq = v.find('=');
+            if (eq == std::string::npos || eq == 0) die("--fn4 takes name=value");
+            o.fn4.emplace_back(v.substr(0, eq), std::atoi(v.c_str() + eq + 1));
+        }
         else if (a == "--gd") o.gd = true;
         else if (a == "--gd-nocheck") o.gd_nocheck = true;
         else if (a == "--cu-pct") o.cu_pct = std::atoi(nx());
@@ -356,6 +406,19 @@ int main(int argc, char** argv) {
     if (o.rank < 0 || o.rank >= o.tp) die("--rank is below --tp");
     if (o.mod4 && o.tp != 4) die("--mod4 is the four-rank split (--tp 4)");
     if (o.bits < 2 || o.bits > 6) die("--bits is 2..6");
+    if (o.ep < 1 || o.ep > 64 || o.ep_rank < -1 || o.ep_rank >= o.ep) die("--ep is 1..64, --ep-rank below it (or -1)");
+    if (o.ep > 1 && (o.tp != 1 || o.mod4)) die("--ep splits whole experts: --tp 1 (the rank's widths are whole)");
+    if (o.x3map && (!o.chain || o.mod4)) die("--x3map needs --chain (two classes)");
+    if (!o.fn4.empty()) {   // the library's runtime switches, before any row is resolved or launched
+        void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL);
+        auto sw = hl ? (int (*)(const char*, int))dlsym(hl, "rad_fn4_switch") : nullptr;
+        if (!sw) die("--fn4: " + o.exl3 + " exports no rad_fn4_switch");
+        for (const auto& kv : o.fn4) {
+            const int r = sw(kv.first.c_str(), kv.second);
+            std::printf("perfmoe: fn4 %s=%d -> %d\n", kv.first.c_str(), kv.second, r);
+            if (r <= 0) die("--fn4 " + kv.first + " refused (" + std::to_string(r) + ")");
+        }
+    }
     if (g_group < 1 || g_group_mix < 0 || g_group_mix > 1) die("--group is >= 1, --group-mix 0..1");
     char kdt[16];
     std::snprintf(kdt, sizeof kdt, "exl3k%d", o.bits);
@@ -410,7 +473,7 @@ int main(int argc, char** argv) {
                 o.layers, o.pools, o.iters, o.reps);
 
     if (o.skew >= 0) {
-        g_logp.resize((size_t)o.E);
+        g_logp.resize((size_t)(o.E * o.ep));
         for (auto& v : g_logp) v = o.skew * std::sqrt(-2.0 * std::log(unif())) * std::cos(6.283185307 * unif());
     }
     std::vector<Route> route;
@@ -432,7 +495,7 @@ int main(int argc, char** argv) {
                     (long long)(o.M * o.topk));
     }
     for (int l = 0; l < o.layers; ++l) {
-        if (recs.empty()) route.push_back(draw(o.M, o.E, o.topk));
+        if (recs.empty()) route.push_back(o.ep > 1 ? draw_ep(o.M, o.E, o.topk, o.ep, o.ep_rank) : draw(o.M, o.E, o.topk));
         else {
             const std::vector<int32_t>& rc = recs[(size_t)l % recs.size()];
             const int32_t Tr = (int32_t)(o.M * o.topk);
@@ -541,6 +604,8 @@ int main(int argc, char** argv) {
             void* x = o.rand_data ? f16_rand((size_t)(o.M * o.hidden), 1.0f, 0) : f16_buf((size_t)(o.M * o.hidden), 0.5f);
             void* h = dalloc((size_t)(Tr * wmax * 2));
             void* y = dalloc((size_t)(Tr * o.hidden * 2));
+            const int64_t mapw = exl3_map_words(Tr, o.E);   // --x3map: one buffer; the chain is stream-ordered a layer
+            void* mbuf = o.x3map ? dalloc((size_t)(mapw * 4)) : nullptr;
             g_fu_h = h; g_fu_y = y; g_fu_hb = (size_t)(Tr * wmax * 2); g_fu_yb = (size_t)(Tr * o.hidden * 2);
             auto f16t = [&](size_t n, float v, int kind) { return o.rand_data ? f16_rand(n, kind == 1 ? 1.0f : v, kind)
                                                                               : f16_buf(n, v); };
@@ -592,6 +657,8 @@ int main(int argc, char** argv) {
                 gt[(size_t)gpos->y] = T(h, RAD_F16, { Tr, wmax });
                 dt[(size_t)dpos->x] = T(h, RAD_F16, { Tr, wmax }); dt[(size_t)dpos->sorted] = st;
                 dt[(size_t)dpos->offset] = ot; dt[(size_t)dpos->y] = T(y, RAD_BF16, { Tr, o.hidden });
+                if (mbuf && gpos->map >= 0 && dpos->map >= 0)
+                    gt[(size_t)gpos->map] = dt[(size_t)dpos->map] = T(mbuf, RAD_I32, { mapw });
                 pt[(size_t)ppos->x] = T(x, RAD_F16, { o.M, o.hidden }); pt[(size_t)ppos->sorted] = st;
                 pt[(size_t)ppos->offset] = ot; pt[(size_t)ppos->y] = T(xr, RAD_F16, { Tr, 2 * o.hidden });
                 if (ppos->ids >= 0 && !o.no_ids) pt[(size_t)ppos->ids] = T(rs_ids[(size_t)l], RAD_I32, { o.M, o.topk });
