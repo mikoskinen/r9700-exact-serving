@@ -346,6 +346,24 @@ TEST(the_paths_and_names_reach_their_fields) {
     CHECK_EQ(c.override_chat_template, std::string("/t.jinja"));
 }
 
+/* The verify-path harness takes a draft head's count as readily as prompt lookup's: the file and the
+ * count reach their fields (the scheduler loads the ids; beside a head they replace its proposals),
+ * and the help says it works beside a head. */
+TEST(the_draft_oracle_pairs_with_a_draft_heads_count_or_with_prompt_lookup) {
+    Config c;
+    CHECK_EQ(parse({ "--debug-draft-oracle", "/o.txt", "--num-speculative-tokens", "5" }, &c), RAD_OK);
+    CHECK_EQ(c.debug_draft_oracle, std::string("/o.txt"));
+    CHECK_EQ(c.n_spec, 5);
+    CHECK_EQ(c.spec_ngram, 0);
+    Config d;
+    CHECK_EQ(parse({ "--debug-draft-oracle", "/o.txt", "--spec-ngram", "4" }, &d), RAD_OK);
+    CHECK_EQ(d.debug_draft_oracle, std::string("/o.txt"));
+    CHECK(d.spec_ngram > 0);
+    const std::string text = stderr_of([] { config_usage("radiance"); });
+    CHECK(has(text, "--debug-draft-oracle"));
+    CHECK(has(text, "beside a draft head"));
+}
+
 /* The reasoning budget is a count or unset (-1); a negative value cannot be given. */
 TEST(thinking_token_budget_takes_a_count_and_defaults_to_none) {
     Config c;

@@ -2248,7 +2248,7 @@ flags are refused on it, and so are the pixel bands.
 | `--debug-graph` | print the declared graph and the selection table, and exit |
 | `--debug-selection` | print the selection table |
 | `--debug-placement` | print the placement plan |
-| `--debug-draft-oracle FILE` | a verify-path test, not a drafter: with `--spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's |
+| `--debug-draft-oracle FILE` | a verify-path test, not a drafter: with `--spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's. It also works beside a draft head (`--num-speculative-tokens N` on a container that declares one): the ids replace each proposal the head publishes, at the head's own count, so the verify runs at the head's shape; no step is then issued ahead of its commit, so the run is not a speed measurement, and a tree drafter proposes a chain |
 | `--debug-accept-reference-kernels` | serve even when ops resolve to `libref`. Not a production configuration |
 | `--proceed-with-incompatible-configuration` | start on a machine configuration startup refuses (§1.1: CWSR off where cards serve). **Unsupported**: all guarantees are off, and the log and the startup report say so |
 | `--profile-ops` | per-op device timing |

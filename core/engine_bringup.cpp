@@ -1311,6 +1311,15 @@ int Engine::declare() {
         /* A tree is verified only behind a step issued ahead (step_loop). The KL mode, which issues
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
         draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
+        if (draft_tree_ && !cfg_.debug_draft_oracle.empty()) {
+            /* --debug-draft-oracle replaces a head's proposal with a chain of fixed ids
+             * (Scheduler::set_draft) and issues no step ahead (Engine::step_loop), which a tree
+             * needs: the head proposes a chain under the harness. */
+            draft_tree_ = false;
+            const char* why = "--debug-draft-oracle replaces the head's proposals with a chain";
+            RAD_INFO("draft trees: not asked -- %s", why);
+            decide("draft trees", "not asked", why);
+        }
         if (draft_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);

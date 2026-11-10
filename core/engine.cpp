@@ -813,9 +813,22 @@ int Engine::step_loop() {
     int idle = 0;
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
-     * pass issued ahead would overwrite them. */
-    pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ &&
+     * pass issued ahead would overwrite them.
+     *
+     * Nor under --debug-draft-oracle beside a draft head, which replaces each proposal the head
+     * publishes (Scheduler::set_draft) and so needs the proposal on the host before the verify is
+     * built: a step issued ahead verifies the head's tokens straight from the card (ADV_TRUNK),
+     * before the host has committed and so before it knows where the harness's ids start. Under
+     * the harness every step is built from the host's plan after the commit; the head's passes run
+     * as they do otherwise, behind the step, positioned by the card's acceptance. A tree drafter
+     * proposes a chain under the harness (Engine::declare asks for no trees). */
+    const bool oracle_head = sched_.debug_oracle_on() && (serial_drafting() || block_drafting());
+    pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ && !oracle_head &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+    if (oracle_head)
+        RAD_WARN("--debug-draft-oracle beside the draft head '%s': no step is issued ahead of its "
+                 "commit, so the harness's ids replace the head's proposals before each verify is "
+                 "built (a verify-path test at the head's own shape, not a speed)", drafter_.name);
     early_ids_ = !cfg_.kld() && !embedding_;
     /* A tree's acceptance moves K and V on the card behind the step issued ahead. The KL mode
      * drafts nothing and an embedding model declares no drafter, so no server reaches this today;

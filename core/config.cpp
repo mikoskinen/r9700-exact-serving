@@ -351,7 +351,10 @@ static const Flag g_flags[] = {
     { "--debug-draft-oracle", "FILE",   "a verify-path test, not a drafter: with --spec-ngram, prompt\n"
     "                                    lookup proposes from the token ids in FILE (a plain greedy\n"
     "                                    run's continuation of the one prompt the test sends), 30% of\n"
-    "                                    the drafts corrupted; the text must stay the plain run's" },
+    "                                    the drafts corrupted; the text must stay the plain run's.\n"
+    "                                    Also beside a draft head (--num-speculative-tokens N): the\n"
+    "                                    ids replace each head proposal at the head's own count, and\n"
+    "                                    no step is issued ahead of its commit (not a speed)" },
     { "--debug-accept-reference-kernels", nullptr,
       "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
       "                              implementation is an oracle and a last resort, and falling back\n"

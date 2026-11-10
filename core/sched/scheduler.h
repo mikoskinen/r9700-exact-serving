@@ -300,6 +300,9 @@ public:
     /* fn4 (runtime/fn4_switch.h): the draft window between steps, from the scheduler thread: 1
      * adaptive, 0 fixed, -1 the configured one (--draft-window). */
     void     set_draft_adaptive(int v);
+    /* --debug-draft-oracle is loaded: the harness replaces a draft head's proposals (set_draft),
+     * so the engine issues no step ahead of its commit (Engine::step_loop). */
+    bool     debug_oracle_on() const { return !debug_oracle_.empty(); }
     void     take_encodes(std::vector<std::shared_ptr<mm::Item>>* out);
     /* An encoder pass over whole segments; see BatchBuilder::build_encoder. */
     const RadBatch* build_encoder(const std::vector<BatchBuilder::EncoderPart>& parts, int step,
@@ -641,9 +644,15 @@ private:
     double     gate_tokens_ = 0.0;
     /* --debug-draft-oracle (draft_ngram): a fixed continuation the lookup proposes from instead,
      * with kDebugMiss of the drafts corrupted, so a verify accepts and rejects at every depth on
-     * any model. A test harness; empty when not given. */
+     * any model. Beside a draft head it also replaces each proposal the head publishes
+     * (set_draft), at the head's own count, so the verify runs at the head's shape. A test
+     * harness; empty when not given. */
     std::vector<int32_t>    debug_oracle_;
     static constexpr double kDebugMiss = 0.3;
+    /* The harness's ids n.. (n the sequence's committed output length), at most `depth`, fewer
+     * past the file's end; each replaced by its neighbour id where a hash of (n, position) falls
+     * under kDebugMiss. Returns how many it wrote to `out`. */
+    int debug_oracle_ids(int64_t n, int depth, int32_t* out) const;
 
     mutable std::mutex mu_;
 

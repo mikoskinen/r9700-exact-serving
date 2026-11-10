@@ -2117,6 +2117,49 @@ TEST(a_prompt_resumed_from_a_window_snapshot_returns_what_a_cold_run_does) {
     }
 }
 
+/* The verify-path harness beside a draft head (DFlash2's block drafter here; DSpark's block of 5 on
+ * deepseek41, where --spec-ngram is refused beside the head): the harness's ids, a plain greedy run's
+ * reply with 30% of the drafts corrupted, replace each proposal the head publishes, at the head's own
+ * count, so every verify runs at the head's shape and accepts and rejects where the harness says. The
+ * text must stay the plain run's, the harness must have been both accepted and rejected, and the
+ * serve log says the head's proposals are replaced, no step is issued ahead and no tree is asked. */
+TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(61, 160);
+    std::vector<int32_t> plain;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "0", "--no-prefix-cache" }));
+        plain = tokens_of(post(s.port, "/completion", completion(p, 48)));
+        CHECK_EQ(s.stop(), 0);
+    }
+    REQUIRE_EQ(plain.size(), (size_t)48);
+    const std::string oracle = radtest::tmp_path("oracle-head-g31.txt");
+    {
+        std::string ids;
+        for (int32_t t : plain) ids += std::to_string(t) + " ";
+        REQUIRE(tiny::write_text(oracle, ids));
+    }
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache",
+                                       "--debug-draft-oracle", oracle }));
+    const json r = post(s.port, "/completion", completion(p, 48));
+    CHECK_EQ(s.stop(), 0);
+    const std::vector<int32_t> got = tokens_of(r);
+    if (got != plain)
+        fprintf(stderr, "    plain  %s\n    oracle %s\n", show(plain).c_str(), show(got).c_str());
+    CHECK(got == plain);
+    const int64_t drafted = timing(r, "draft_n"), accepted = timing(r, "draft_n_accepted");
+    fprintf(stderr, "    dflash2 + harness: drafted %lld, accepted %lld\n", (long long)drafted,
+            (long long)accepted);
+    CHECK(drafted > accepted);
+    CHECK(accepted > 0);
+    CHECK(has(s.output(), "every proposal of the draft head"));
+    CHECK(has(s.output(), "beside the draft head 'dflash2': no step is issued ahead"));
+    /* DFlash2 proposes trees where its plugin measured a gain; under the harness it proposes a chain. */
+    CHECK(has(s.output(), "draft trees: not asked"));
+}
+
 /* The row a running server's /diagnostics reports for `option`, or null. */
 json config_row(int port, const std::string& option) {
     Call c;

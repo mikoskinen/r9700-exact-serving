@@ -209,8 +209,13 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                 if (v >= 0 && v < prog.meta.n_vocab) debug_oracle_.push_back((int32_t)v);
             }
         }
-        RAD_WARN("--debug-draft-oracle: prompt lookup proposes from %zu fixed ids in %s, "
-                 "%.0f%% of drafts corrupted -- a verify-path test, not a drafter",
+        const bool head = (prog.drafter.kind == RAD_DRAFT_SERIAL ||
+                           prog.drafter.kind == RAD_DRAFT_BLOCK) && prog.drafter.depth > 0;
+        RAD_WARN("--debug-draft-oracle: %s from %zu fixed ids in %s, %.0f%% of drafts corrupted -- "
+                 "a verify-path test, not a drafter",
+                 head ? "every proposal of the draft head (and of prompt lookup where the head "
+                        "declines) is replaced by the harness's"
+                      : "prompt lookup proposes",
                  debug_oracle_.size(), f, 100.0 * kDebugMiss);
     }
     if (cfg.draft_window == DraftWindow::Adaptive) {
@@ -507,6 +512,14 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
     if (n > cap) n = cap;
     if (n > RAD_SCHED_MAX_SPEC) n = RAD_SCHED_MAX_SPEC;
     for (int i = 0; i < n; ++i) s.draft[i] = tokens[i];
+    /* --debug-draft-oracle beside a head: the harness's ids replace the head's proposal, as many as
+     * the head proposed (its window and the caps above already applied), so the verify runs at the
+     * head's own shape and accepts and rejects where the harness says. Past the file's end the
+     * head's own tokens stay. A chain only: a tree's parents would not describe the ids, and under
+     * the harness the engine asks no plugin for trees (Engine::declare). The engine issues no step
+     * ahead under the harness, so this path, not the one above, publishes every proposal. */
+    if (!debug_oracle_.empty() && !parents && n > 0)
+        (void)debug_oracle_ids((int64_t)s.req->output.size(), n, s.draft);
     s.n_draft = n;
     s.req->n_draft = n;
     s.req->draft = s.draft;
@@ -968,25 +981,25 @@ int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
     seq.nb = (int64_t)r.output.size();
     if (seq.size() < 2) return 0;
     if (depth > RAD_SCHED_MAX_SPEC) depth = RAD_SCHED_MAX_SPEC;
-    if (!debug_oracle_.empty()) {
-        /* The harness: ids n.. of the plain run's continuation, each replaced by its neighbour id
-         * where a hash of (n, position) falls under the miss rate. */
-        const int64_t n = seq.nb;
-        int d = 0;
-        for (; d < depth && n + d < (int64_t)debug_oracle_.size(); ++d) {
-            uint64_t h = (uint64_t)(n * RAD_SCHED_MAX_SPEC + d + 1) * 0x9E3779B97F4A7C15ull;
-            h ^= h >> 31;
-            h *= 0xbf58476d1ce4e5b9ull;
-            h ^= h >> 29;
-            const bool miss = (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
-            const int32_t t = debug_oracle_[(size_t)(n + d)];
-            s.draft[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
-        }
-        return d;
-    }
+    /* The harness: ids n.. of the plain run's continuation (debug_oracle_ids). */
+    if (!debug_oracle_.empty()) return debug_oracle_ids(seq.nb, depth, s.draft);
     if (s.ngram_ix.owner() != r.id) s.ngram_ix.reset(r.id);
     return s.ngram_ix.propose(seq, cfg_.spec_ngram_min, cfg_.spec_ngram_max, depth, s.draft, match,
                               LookupGate::kLongMatch);
+}
+
+int Scheduler::debug_oracle_ids(int64_t n, int depth, int32_t* out) const {
+    int d = 0;
+    for (; d < depth && n + d < (int64_t)debug_oracle_.size(); ++d) {
+        uint64_t h = (uint64_t)(n * RAD_SCHED_MAX_SPEC + d + 1) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 31;
+        h *= 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 29;
+        const bool miss = (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
+        const int32_t t = debug_oracle_[(size_t)(n + d)];
+        out[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
+    }
+    return d;
 }
 
 /* ------------------------------------------------------------------ chunking */
