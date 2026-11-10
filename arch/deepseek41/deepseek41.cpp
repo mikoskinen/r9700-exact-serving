@@ -1033,8 +1033,9 @@ static void sw_note_decl(int64_t rows) {
  * In-process switches (POST /admin/fn4; start values RADIANCE_DS41_DSPARK_TREE_B / _L / _FORCE):
  *   dspark_tree        0..3 alternative branches the drafter proposes (0: the chain, today's proposal)
  *   dspark_tree_depth  1..5 the most nodes of each branch the core verifies (depth-major order: a prefix cut)
- *   dspark_tree_force  1: every drafting step whose window reaches the main chain's end verifies the whole tree;
- *                      0: the core's draft-window cost model (D7's step-time pricing) prices each extra node.
+ *   dspark_tree_force  1: every drafting step verifies the whole tree, whatever the adaptive window (a measurement
+ *                      mode: the tree's full gain and full row cost); 0: the core's draft-window cost model (D7's
+ *                      step-time pricing) prices each extra node, so the tree shrinks where rows cost what they buy.
  * The core reads all three each draft cycle (core/sched/draft.h). Process-wide, like the switches above. */
 constexpr int kTreeBranches = 3;
 constexpr int kTreeCols = 8;   /* tree_rows' width: depth, root row, the ancestors at depths 0..5 */
