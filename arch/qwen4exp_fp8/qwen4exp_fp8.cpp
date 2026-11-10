@@ -1250,6 +1250,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                      RAD_INT("overlap", 1)),
                           RAD_NOWEIGHTS),
                       {m.b_h}, {m.b_h});
+        /* the raw gather writes the wide stream on the second lane (rad_runtime.h: every buffer lane 1 touches) */
+        RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
         bool ok = m.sp_rs && m.sp_ag && m.sp_agh;
         const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : T;
         for (Layer& lay : m.layers) {
