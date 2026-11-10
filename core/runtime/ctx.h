@@ -572,6 +572,7 @@ private:
         int64_t  plays = 0;
         uint64_t used = 0;
         int32_t  dispatches = 0, unordered = 0;   /* its kernels, and those haz_mark left unordered */
+        int32_t  noacq = 0, noacq_ordered = 0;    /* those the acquire rule plays without their acquire */
     };
     /* The byte ranges each device op of a recorded pass reads and writes, so haz_mark can leave
      * dispatches that depend on nothing still running without the barrier bit. Otherwise the

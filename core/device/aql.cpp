@@ -1030,6 +1030,9 @@ struct TapeRec {
      * on the queue still run. Set only where the dispatch touches nothing those packets write
      * (tape_set_overlap). */
     uint8_t  overlap = 0;
+    /* May be played without its agent-scope acquire under RADIANCE_AQL_ACQ=rule: nothing it reads
+     * can be stale in a CU cache (tape_set_noacq; Ctx::haz_mark's address rule). */
+    uint8_t  noacq = 0;
     /* A chained kernel (RadKernelChainFn): played from the queue's own argument slot with a chain
      * record, and without the barrier bit behind another chained kernel. */
     uint8_t  chain = 0;
@@ -1079,6 +1082,15 @@ inline uint16_t header(hsa_packet_type_t type, int acq, int rel, bool barrier = 
 }
 
 /* Whether the packet at `idx` must acquire at system scope, and the bookkeeping if it does. */
+/* RADIANCE_AQL_ACQ: 0 unset, 1 rule or rule-w (Ctx::haz_mark marks the records), 2 none (PlayRun::put). */
+inline int aql_acq_mode() {
+    static const int m = [] {
+        const char* e = std::getenv("RADIANCE_AQL_ACQ");
+        return !e ? 0 : (!std::strcmp(e, "rule") || !std::strcmp(e, "rule-w")) ? 1 : !std::strcmp(e, "none") ? 2 : 0;
+    }();
+    return m;
+}
+
 inline int acquire_scope(Stream* s, uint64_t idx, bool forced) {
     const uint64_t ep = G().host_epoch.load(std::memory_order_acquire);
     const bool lap = (int64_t)idx - s->last_sys_acq >= (int64_t)(kQueuePackets / 2);
@@ -1308,7 +1320,16 @@ struct PlayRun {
                 chain_record(s, slot, true);
             }
         }
-        const int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
+        int acq = acquire_scope(s, idx, (r.fence & kFenceAcquireSystem) != 0);
+        /* RADIANCE_AQL_ACQ: unset = every played packet keeps the acquire acquire_scope gives it.
+         *   rule, rule-w  a packet haz_mark marked (TapeRec::noacq: no line it reads can be stale) plays its
+         *         agent-scope acquire as none; a chained record (its argument slot is rewritten
+         *         every play), the first packet behind packets this thread did not play (`foreign`)
+         *         and a system acquire stay.
+         *   none  EXPERIMENT ONLY, unsafe in general: every agent-scope acquire becomes none. */
+        if (acq == HSA_FENCE_SCOPE_AGENT &&
+            (aql_acq_mode() == 2 || (aql_acq_mode() == 1 && r.noacq && !r.chain && !foreign)))
+            acq = HSA_FENCE_SCOPE_NONE;
         int rel = (r.fence & kFenceReleaseSystem) ? HSA_FENCE_SCOPE_SYSTEM : HSA_FENCE_SCOPE_AGENT;
         if (rel < rel_min) rel = rel_min;
         /* A dispatch carrying a record keeps the bit: its completion must cover everything before
@@ -2053,6 +2074,14 @@ int a_tape_set_overlap(RadTape rt, int i, int on) {
     if (!t || i < 0 || i >= (int)t->rec.size() || t->rec[(size_t)i].kind != kTapeDispatch)
         return RAD_E_INVAL;
     t->rec[(size_t)i].overlap = on ? 1 : 0;
+    return RAD_OK;
+}
+
+int a_tape_set_noacq(RadTape rt, int i, int on) {
+    Tape* t = tape_of(rt);
+    if (!t || i < 0 || i >= (int)t->rec.size() || t->rec[(size_t)i].kind != kTapeDispatch)
+        return RAD_E_INVAL;
+    t->rec[(size_t)i].noacq = on ? 1 : 0;
     return RAD_OK;
 }
 
@@ -4126,6 +4155,7 @@ const DeviceBackend* aql_backend_if_present(void) {
         g_aql.code_mark = a_code_mark;
         g_aql.code_runs = a_code_runs;
         g_aql.tape_set_overlap = a_tape_set_overlap;
+        g_aql.tape_set_noacq = a_tape_set_noacq;
         g_aql.tape_destroy = a_tape_destroy;
         g_aql.stream_gate = a_stream_gate;
         g_aql.gate_open = a_gate_open;
