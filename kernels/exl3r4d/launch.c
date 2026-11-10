@@ -232,6 +232,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->h_rot = g->h_rot;
     d->a_rot = g->a_rot;
     d->limit = (float)g->limit;
+    d->dz = (int32_t)exl3r4d_fn4_dz();   /* ds41 eport: fn4 DZ's form at run time (prefill.c; 0 unless EXL3R4D_DZ 1 / 2) */
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
@@ -286,6 +287,9 @@ static int64_t raw_pitch(const Exl3Geom* g) {
  * RAD_E_SHAPE for a stacked table whose stride does not fit (the engine's pointer tables have none). */
 _Static_assert(sizeof(Exl3r4dGemm) - offsetof(Exl3r4dGemm, x) == sizeof(Exl3r4dGemm4) - offsetof(Exl3r4dGemm4, x),
                "the two argument blocks share every field after their class records");
+_Static_assert(offsetof(Exl3r4dGemm, dz) == offsetof(Exl3r4dGemm, tpw) + 4 &&
+                   offsetof(Exl3r4dGemm, raw) == offsetof(Exl3r4dGemm, tpw) + 8,
+               "ds41 eport: dz sits in the hole before raw; no other field moves");
 static int s0_32(int64_t s0, int32_t* out) {
     if (s0 < 0 || s0 > 0x7fffffff) return RAD_E_SHAPE;
     *out = (int32_t)s0;

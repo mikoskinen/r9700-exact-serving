@@ -25,6 +25,9 @@
                               * [2 + slot] slot ready -- zero at entry, reset to zero by the last workgroup; null:
                               * the prep kernel and the GEMM as two dispatches */
     int32_t        tpw;      /* split epilogue: 16-column tiles a GEMM workgroup owns (of one matrix) */
+    int32_t        dz;       /* ds41 eport, EXL3R4D_DZ 2: fn4 DZ at run time (the core switch exl3_dz, fill() from
+                              * exl3r4d_fn4_dz()), 1 = zero_dead_rows' direct form, 0 the scan. In the 4-byte hole
+                              * before `raw`: the block's size and every other offset are unchanged. */
     float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
                               * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
     int64_t        raw_pitch;
