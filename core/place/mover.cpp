@@ -2177,14 +2177,14 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
 
 /* ------------------------------------------------------------------ lever Z0-W */
 int Mover::draft_w_setup(const std::function<bool(const std::string&, int32_t)>& lendable) {
+    if (!dw_.empty()) {   /* before anything changes: a second call leaves the first one's lend as it is */
+        RAD_ERR("mover: draft_w_setup called twice; its stretches are carved once");
+        return RAD_E_STATE;
+    }
     dw_ready_ = false;
     if (!plan_ || !plan_->dynamic || !static_vram_ || !prog_ || !lendable) return RAD_OK;
     if (!mover_ || !compute_) {
         RAD_ERR("mover: the drafter's weight lend is set up after the compute stream is bound");
-        return RAD_E_STATE;
-    }
-    if (!dw_.empty()) {
-        RAD_ERR("mover: draft_w_setup called twice; its stretches are carved once");
         return RAD_E_STATE;
     }
     /* Every statically placed weight, [lo, hi) in the static region (a weight's extent runs to the next
