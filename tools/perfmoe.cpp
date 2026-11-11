@@ -344,6 +344,7 @@ struct Lib {
 
 }  // namespace
 
+static bool check_args = false;   // --check-args: parse and validate the line, print "perfmoe: ARGS OK", exit 0 (no GPU)
 int main(int argc, char** argv) {
     Opts o;
     for (int i = 1; i < argc; ++i) {
@@ -376,6 +377,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-y") o.dump_y = nx();
         else if (a == "--dump-h") o.dump_h = nx();
         else if (a == "--x-bf16") g_x_bf16 = true;
+        else if (a == "--check-args") check_args = true;
         else if (a == "--chain-band") o.chain_band = nx();
         else if (a == "--wgstamps-lib") o.wgstamps_lib = std::atoi(nx());
         else if (a == "--overlap") o.overlap = true;
@@ -432,6 +434,7 @@ int main(int argc, char** argv) {
     if (o.ep < 1 || o.ep > 64 || o.ep_rank < -1 || o.ep_rank >= o.ep) die("--ep is 1..64, --ep-rank below it (or -1)");
     if (o.ep > 1 && (o.tp != 1 || o.mod4)) die("--ep splits whole experts: --tp 1 (the rank's widths are whole)");
     if (o.x3map && (!o.chain || o.mod4)) die("--x3map needs --chain (two classes)");
+    if (check_args) { std::printf("perfmoe: ARGS OK\n"); return 0; }   // an item's dry run: every flag known, the values valid
     if (!o.fn4.empty()) {   // the library's runtime switches, before any row is resolved or launched
         void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL);
         auto sw = hl ? (int (*)(const char*, int))dlsym(hl, "rad_fn4_switch") : nullptr;
