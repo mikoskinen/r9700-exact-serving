@@ -564,6 +564,11 @@ struct Model {
     /* The last layer's MoE all-reduce + pcn_fin as one collective (RADIANCE_DS41_AR_PCN=2), or 0. */
     rad_op ar_pcn_fin = 0;
     BiTr bt{};
+    /* Lever BI (step_bi): each prefill segment's cu view {0, rows} (sub_i32 of cu at its sequence), a row a segment;
+     * the row pitch of every buffer step_bi slices. */
+    rad_buf bi_cu = 0;
+    rad_op bi_sub = 0;
+    std::map<rad_buf, int64_t> bp;
     Dsp dsp{};
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
@@ -1080,6 +1085,26 @@ static void walk_read_env() {
                             "full-vocabulary walk is not declared\n", e);
     }
 }
+/* Lever BI (batch invariance, ds41-bi 11.11.2026; USER RULING: an answer that changes under load vs alone is a BUG).
+ * Switch "ds41_bi" (fn4): 1 = a step whose rows belong to more than one shape class is issued in segments by each row's
+ * own sequence (step_bi): the decode rows as one segment, each prefill sequence as its own, so every row-banded op
+ * (gemm_nt_ggml's decode band <= 48 rows vs WMMA, attn_sparse_sink's and index_score's decode band <= 48 vs WMMA, the
+ * fused norms' r4d_act_threads widths 1024 <= 32 rows, 512, 256) sees the rows its sequence gives it alone; the MoE one
+ * pass a segment. 0 = one launch over the step (today). RADIANCE_DS41_BI=0 / off declares it and starts at 0, 1 / on
+ * at 1; unset declares nothing (the switch takes only 0, step() is today's). `_ok`: a declare had it on. */
+static std::atomic<int> g_sw_bi{0}, g_sw_bi_ok{0}, g_sw_bi_env{-2};   /* env: -2 unread, -1 unset */
+static void bi_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_BI");
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+    if (g_sw_bi_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_bi.store(v, std::memory_order_relaxed);
+        if (e && v < 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_BI=%s is not 0 / off or 1 / on: lever BI is not declared\n", e);
+    }
+}
+static bool bi_declared() { return g_sw_bi_env.load(std::memory_order_relaxed) >= 0; }
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -1102,6 +1127,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_bi"))
+        return value == 0 || (value == 1 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -1111,6 +1138,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
     else if (const K1Switch* k = k1_switch(name)) k->val->store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "dspark_walk")) g_sw_walk.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_bi")) g_sw_bi.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1128,6 +1156,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (const K1Switch* k = k1_switch(name)) {
         *applied = k->val->load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_bi")) {
+        *applied = g_sw_bi.load(std::memory_order_relaxed);
         return 1;
     }
     if (!std::strcmp(name, "dspark_walk")) {
@@ -1422,7 +1454,10 @@ static int buffers(RadBuilder* b, Model& m) {
     m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.score_rows ? m.score_rows : m.irows, m.cmax });
     if (m.kwords > 0) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     /* Split: the gather lays aw parts of qmax runs of at most irows rows, rank r's at r qmax R. */
-    const int64_t sel_rows = m.isplit && !m.score_rows ? std::max(T, (int64_t)m.aw * m.qmax * m.irows) : T;
+    /* lever BI: a prefill segment's split runs are laid from its first row, so up to a decode segment's rows (48)
+     * past the unsplit plane */
+    const int64_t sel_rows = (m.isplit && !m.score_rows ? std::max(T, (int64_t)m.aw * m.qmax * m.irows) : T) +
+                             (bi_declared() ? (int64_t)m.aw * m.irows + 64 : 0);
     m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { sel_rows, c.itopk });
     if (m.isplit)
         m.sel_part = decl_b(b, nm.f("index_sel_part"), RAD_I32,
@@ -1476,6 +1511,17 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.sout = bf("shared_out", { T, D });
     mw.sgate = bf("shared_one", { T, 1 });
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, D }, RAD_BUF_PERSIST);
+    {   /* lever BI: the row pitch of each per-token buffer step_bi slices (its declared width) */
+        const std::pair<rad_buf, int64_t> bp[] = {
+            { m.h0, HN }, { m.h1, HN }, { m.xcol, D }, { m.xn, D }, { m.pre_a, c.hc }, { m.pre_f, c.hc }, { m.post, c.hc },
+            { m.comb, c.hc * c.hc }, { m.qr, c.q_lora }, { m.qrn, c.q_lora }, { m.q, HD }, { m.kv, c.head_dim },
+            { m.kvn, c.head_dim }, { m.o, HD }, { m.oa, m.gr * c.o_rank }, { m.attn_out, D }, { m.kvs, 2 * c.head_dim },
+            { m.iq, c.ih * c.idim }, { m.iw, c.ih }, { m.sel, c.itopk }, { m.act.x, D }, { m.final_hidden, D },
+            { m.embd, c.ple_heads * c.ple_dim }, { m.ekv, (c.hc + 1) * D }, { m.ctok, 1 }, { m.iqr_q8, QK },
+            { m.iqr_s8, fp8_blocks(QK) }, { m.mw.sgate, 1 } };
+        for (const auto& e : bp)
+            if (e.first) m.bp[e.first] = e.second;
+    }
     m.logit_input = bf("logit_input", { g.max_logit_rows, D });
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
     return rad_declare_logits(b, m.logits);
@@ -2720,6 +2766,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
 
 /* ------------------------------------------------------------------ declare */
 static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI's tracer, below */
+static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI, below */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -2746,6 +2793,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     k1_read_env();
     walk_read_env();
+    bi_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3087,6 +3135,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             fprintf(stderr, "radiance: deepseek41 indexer deal: idx_split %d (RADIANCE_DS41_IDX_BALANCE at start, "
                             "POST /admin/fn4 idx_split): %s\n", idx_balance() ? 1 : 0, what);
     }
+    DS_TRY(bi_declare(b, m, ctx));
     DS_TRY(bt_declare(b, m, ctx));
     return RAD_OK;
 }
@@ -3101,6 +3150,23 @@ static const char* bt_dir() {
 }
 /* At the end of a declare: the plane and one bi_rowhash a traced buffer (read after everything the model declared, so
  * no traced buffer shares memory with a later op's under tracing). */
+/* Lever BI at the end of a declare (RADIANCE_DS41_BI set): each prefill segment's cu view plane and its op. */
+static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    if (!bi_declared()) return RAD_OK;
+    m.bi_cu = decl_b(b, m.nm.f("bi_cu"), RAD_I32, { m.g.max_seqs + 1, 2 }, RAD_BUF_PERSIST);
+    if (!m.bi_cu) return RAD_E_INVAL;
+    m.bi_sub = op(b, "sub_i32", { RAD_RANGE("M", 1, 2) }, {}, {}, { m.bi_cu });
+    if (!m.bi_sub) return RAD_E_UNSUPPORTED;
+    if (!ctx->shape_probe) g_sw_bi_ok.store(1, std::memory_order_relaxed);
+    if (ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: lever BI declared (RADIANCE_DS41_BI, fn4 ds41_bi, now %d): a step of more "
+                        "than one shape class runs in segments by sequence (decode rows <= %lld a dense / attention / "
+                        "indexer launch, <= %lld a fused norm; each prefill sequence at its own rows; the MoE a pass a "
+                        "segment); a pass with two or more prefill sequences is not recorded\n",
+                g_sw_bi.load(std::memory_order_relaxed), (long long)kBiBand, (long long)kBiNorm);
+    return RAD_OK;
+}
+
 static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (!bt_dir()) return RAD_OK;
     auto& t = m.bt;
@@ -3415,6 +3481,461 @@ static void mix_f_beside(RadCtx* x, void* a) {
                 RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
 }
 
+/* ------------------------------------------------------------------ lever BI: the step in segments */
+/* A segment: rows [r0, r0 + n) of sequences [s0, s1); `dec` the step's decode rows (sequences [0, n_seq_decode)), else
+ * ONE prefill sequence. `cu`: the segment's cu_seqlens view -- the batch's own at s0 = 0 (decode rows start the step),
+ * else row `k` of bi_cu, {0, n}, written by bi_sub at the step's start. */
+struct BiSeg {
+    int64_t r0 = 0, n = 0, s0 = 0, s1 = 0;
+    bool dec = false;
+    int k = -1;   /* bi_cu's row (a prefill segment), -1 for the batch's cu */
+};
+static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
+static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
+static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0};
+/* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
+ * segment, decode rows within the norms' width): step() then runs today's issue. Prefill sequences' bounds from the
+ * host mirror of positions (each sequence's rows are consecutive positions; a jump starts the next); when that does not
+ * give the step's prefill sequence count (two sequences whose positions continue), cu_seqlens is read back (a sync). */
+static bool bi_segments(RadCtx* x, const Model& m, const RadBatch* b, std::vector<BiSeg>& sg) {
+    sg.clear();
+    const int64_t T = b->n_tok, S = b->n_seq;
+    int64_t Dn = 0, DT = 0;
+    batch_split(b, &Dn, &DT);
+    const int64_t P = S - Dn;
+    if (DT > 0) sg.push_back({ 0, DT, 0, Dn, true, -1 });
+    if (P == 1) sg.push_back({ DT, T - DT, Dn, S, false, -1 });
+    if (P >= 2) {
+        std::vector<int64_t> st{ DT };
+        if (b->positions_h)
+            for (int64_t r = DT + 1; r < T; ++r)
+                if (b->positions_h[r] != b->positions_h[r - 1] + 1) st.push_back(r);
+        if ((int64_t)st.size() != P) {
+            std::vector<int32_t> cu((size_t)S + 1);
+            rad_memcpy_async(cu.data(), b->cu_seqlens, (S + 1) * 4, rad_stream(x));
+            rad_stream_sync(rad_stream(x));
+            st.clear();
+            for (int64_t s = Dn; s < S; ++s) st.push_back(cu[(size_t)s]);
+            g_bi_sync.fetch_add(1, std::memory_order_relaxed);
+        }
+        for (int64_t i = 0; i < P; ++i) {
+            const int64_t r1 = i + 1 < P ? st[(size_t)i + 1] : T;
+            sg.push_back({ st[(size_t)i], r1 - st[(size_t)i], Dn + i, Dn + i + 1, false, -1 });
+        }
+    }
+    int k = 0;
+    for (BiSeg& s : sg)
+        if (!s.dec) s.k = s.s0 == 0 ? -1 : k++;
+    if (DT > kBiBand) g_bi_wide.fetch_add(1, std::memory_order_relaxed);   /* > 48 decode rows: one segment past the band */
+    (void)m;
+    return sg.size() > 1 || (sg.size() == 1 && sg[0].dec && sg[0].n > kBiNorm);
+}
+
+static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg) {
+    const auto& c = m.c;
+    const auto& g = m.g;
+    const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
+    const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
+    if (g_bi_steps.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0) {
+        std::string seg;
+        for (const BiSeg& s : sg) seg += std::string(seg.empty() ? "" : ", ") + (s.dec ? "decode " : "prefill ") +
+                                         std::to_string(s.n);
+        fprintf(stderr, "radiance: deepseek41: lever BI (ds41_bi 1): the first segmented step, %lld rows as [%s]\n",
+                (long long)T, seg.c_str());
+    }
+    bt_begin(m);
+    const RadOperand pos = praw(batch->positions, RAD_I32, T);
+    const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
+    const auto* wb = kv_batch(batch, m.win);
+    if (!wb || !wb->block_table || !wb->slot_mapping) {
+        rad_step_fail(x, "deepseek41: the window group has no block table");
+        return;
+    }
+    /* row slices of the per-token buffers (their declared pitch) */
+    auto R = [&](rad_buf h, int64_t r0, int64_t n) {
+        if (r0 == 0) return brows(h, n);
+        return brow_slice(h, r0, n, m.bp.at(h));
+    };
+    auto C = [&](rad_buf h, int64_t first, int64_t width, int64_t r0, int64_t n) {
+        return bcol_at(h, r0, m.bp.at(h), first, width, n);
+    };
+    auto P = [&](const int32_t* p, int64_t r0, int64_t n) { return praw(p + r0, RAD_I32, n); };
+    /* fn over the step's rows by segment, the decode segment in launches of at most `cap` rows */
+    auto rows = [&](int64_t cap, const auto& fn) {
+        for (const BiSeg& s : sg) {
+            if (!s.dec || s.n <= cap) { fn(s.r0, s.n); continue; }
+            for (int64_t a = 0; a < s.n; a += cap) fn(s.r0 + a, std::min(cap, s.n - a));
+        }
+    };
+    /* a segment's cu view and per-sequence slices */
+    auto segcu = [&](const BiSeg& s) {
+        if (s.k < 0) return praw(batch->cu_seqlens + s.s0, RAD_I32, s.s1 - s.s0 + 1);
+        return brow_slice(m.bi_cu, s.k, 1, 2);
+    };
+    /* the prefill segments' cu views, once a step: {cu[s0] - cu[s0], cu[s0 + 1] - cu[s0]} */
+    for (const BiSeg& s : sg)
+        if (s.k >= 0)
+            RAD_ISSUE_N(x, m.bi_sub, 2, praw(batch->cu_seqlens + s.s0, RAD_I32, 2),
+                        praw(batch->cu_seqlens + s.s0, RAD_I32, 1), brow_slice(m.bi_cu, s.k, 1, 2));
+
+    /* the step's head ops: as step() (per-token, over the step) */
+    RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
+    if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
+    for (int64_t i = 0; i < c.hc; ++i)
+        RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
+    RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
+    RAD_ISSUE_N(x, m.pre1, T, bcol(m.pre_f, 0, 1, T));
+    if (m.sone && g_sw_one.load(std::memory_order_relaxed) > 0) RAD_ISSUE_N(x, m.sone, T, brows(m.mw.sgate, T));
+    RAD_ISSUE_N(x, m.rope_a, T, pos, brows(m.cs_a, g.max_ctx));
+    RAD_ISSUE_N(x, m.rope_b_step, T, pos, brows(m.cs_b, g.max_ctx));
+    if (m.tok_map)
+        RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap), brows(m.ctok, T));
+    for (auto& L : m.layers) {
+        if (!L.e_ids) continue;
+        const int l = L.l;
+        const auto* tk = kv_batch(batch, m.tok);
+        const int32_t* tk_idx = tk ? tk->state_index : nullptr;
+        int64_t Dn = 0, DT = 0;
+        batch_split(batch, &Dn, &DT);
+        const int64_t Pn = S - Dn;
+        if (Dn > 0)
+            RAD_ISSUE_N(x, L.e_ids, DT, brows(m.ctok, DT), kv_cache(m.tok, l),
+                        praw(batch->cu_seqlens, RAD_I32, Dn + 1), RAD_W(L.e_mult),
+                        RAD_W(L.e_vsz), RAD_W(L.e_off), praw(tk_idx, RAD_I32, Dn),
+                        praw(batch->ctx_lens, RAD_I32, Dn),
+                        praw(batch->num_accepted, RAD_I32, Dn), brows(L.ids, DT), RAD_NONE);
+        if (Pn > 0)
+            RAD_ISSUE_N(x, L.e_ids, T, brows(m.ctok, T), kv_cache(m.tok, l),
+                        praw(batch->cu_seqlens + Dn, RAD_I32, Pn + 1), RAD_W(L.e_mult),
+                        RAD_W(L.e_vsz), RAD_W(L.e_off),
+                        praw(tk_idx ? tk_idx + Dn : nullptr, RAD_I32, Pn),
+                        praw(batch->ctx_lens + Dn, RAD_I32, Pn), RAD_NONE, brows(L.ids, T),
+                        RAD_NONE);
+    }
+
+    for (auto& L : m.layers) {
+        const int l = L.l;
+        const int64_t r = L.r;
+        if (L.e_ids) {
+            const int64_t H = c.ple_heads;
+            if (m.ple_group > 0)
+                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                            m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
+            else
+                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
+            RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
+            /* the Engram GEMM (gemm_nt_ggml, banded) by segment */
+            rows(kBiBand, [&](int64_t r0, int64_t n) { lin_issue(x, m, L.e_gemm, n, R(m.embd, r0, n), L.e_kv, R(m.ekv, r0, n)); });
+            RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
+                        bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
+            RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
+        }
+        bt_pt(x, m, m.h0, T, "h0", l);
+        if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
+        const bool late = !m.zero;
+        const auto mix_a = [&] {
+            RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
+                        RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
+        };
+        /* the collapse (+ norm: a fused norm, by segment within its 32-row width) */
+        if (L.cn_a)
+            rows(kBiNorm, [&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.cn_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm),
+                            R(m.xn, r0, n));
+            });
+        else if (L.col_a)
+            RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+        if (!late) mix_a();
+        if (m.zero) {
+            RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
+        } else {
+            if (L.norm_a)
+                RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
+            bt_pt(x, m, m.xn, T, "xn", l);
+            const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
+            const bool ctail = L.src && r > 1;
+            int64_t crows = T, tpitch = 1;
+            RadOperand page = RAD_NONE, bpos = pos;
+            const auto* cb = L.src ? kv_batch(batch, m.comp[r]) : nullptr;
+            const auto* tb = ctail ? kv_batch(batch, m.tail[r]) : nullptr;
+            if (L.src) {
+                const auto* ib = kv_batch(batch, m.index[r]);
+                if (!cb || !ib || !cb->block_table || !ib->block_table) {
+                    rad_step_fail(x, "deepseek41: a compressed group has no block table");
+                    return;
+                }
+                page = praw(cb->slot_mapping, RAD_I32, T);
+                if (ctail) {
+                    if (!tb || !tb->state_index) {
+                        rad_step_fail(x, "deepseek41: the compressor tail has no state slots");
+                        return;
+                    }
+                    tpitch = tb->state_index_pitch > 0 ? tb->state_index_pitch : 1;
+                    crows = m.ctail_full ? m.work
+                                         : std::min<int64_t>(m.work, std::max<int64_t>((T + r - 1) / r + S, g.max_seqs));
+                    page = brows(m.page, crows);
+                    bpos = brows(m.bpos, crows);
+                }
+            }
+            /* A1: the query, window key and index query / weight chains by segment (each row-banded op at its
+             * segment's rows); their reads of the angles (cs) stay ahead of c_tab's rewrite below. */
+            const int qnf = L.q_bf ? g_sw_qnf.load(std::memory_order_relaxed) : 0;
+            const bool qfold = qnf == 1 || (qnf == 2 && !L.i_score);
+            const bool kvfold = L.kv_fs && g_sw_kvf.load(std::memory_order_relaxed) > 0;
+            for (const BiSeg& s : sg) {
+                const int64_t r0 = s.r0, n = s.n;
+                lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
+                lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
+                if (L.i_score) lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
+                if (qfold)
+                    RAD_ISSUE_N(x, L.q_bf, n, R(m.qr, r0, n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, r0, n), R(m.q, r0, n));
+                else
+                    RAD_ISSUE_N(x, L.q_an, n, R(m.qr, r0, n), RAD_W(L.q_norm), R(m.qrn, r0, n));
+                /* the window key's norm (+ rope + round trip [+ store]): a fused norm, decode rows within 32 */
+                const auto kvn = [&](int64_t a0, int64_t an) {
+                    if (kvfold)
+                        RAD_ISSUE_N(x, L.kv_fs, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an),
+                                    brows(cs, g.max_ctx), P(batch->positions, a0, an), P(wb->slot_mapping, a0, an),
+                                    kv_cache(m.win, l));
+                    else if (L.kv_f)
+                        RAD_ISSUE_N(x, L.kv_f, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an),
+                                    brows(cs, g.max_ctx), P(batch->positions, a0, an));
+                    else
+                        RAD_ISSUE_N(x, L.kv_n, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an));
+                };
+                if (s.dec && n > kBiNorm)
+                    for (int64_t a = 0; a < n; a += kBiNorm) kvn(r0 + a, std::min(kBiNorm, n - a));
+                else
+                    kvn(r0, n);
+                if (L.i_score) lin_issue(x, m, L.i_q, n, R(m.qrn, r0, n), L.iq_w, R(m.iq, r0, n));
+                if (!qfold) lin_issue(x, m, L.q_b, n, R(m.qrn, r0, n), L.wq_b, R(m.q, r0, n));
+                if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, n, R(m.kvn, r0, n), brows(cs, g.max_ctx), P(batch->positions, r0, n));
+                if (!L.src && L.i_score) {
+                    if (L.i_f) RAD_ISSUE_N(x, L.i_f, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), P(batch->positions, r0, n));
+                    else RAD_ISSUE_N(x, L.i_rope, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), P(batch->positions, r0, n));
+                    if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, n, R(m.iq, r0, n));
+                }
+                RAD_ISSUE_N(x, L.q_rope, n, R(m.q, r0, n), brows(cs, g.max_ctx), P(batch->positions, r0, n));
+                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, n, R(m.kvn, r0, n));
+                if (!kvfold) {
+                    if (m.w8)
+                        RAD_ISSUE_N(x, L.kv_st, n, R(m.kvn, r0, n), P(wb->slot_mapping, r0, n), kv_cache(m.win, l));
+                    else
+                        RAD_ISSUE_N(x, L.kv_st, n, C(m.kvn, 0, hd / 2, r0, n), C(m.kvn, hd / 2, hd / 2, r0, n),
+                                    P(wb->slot_mapping, r0, n), kv_cache(m.win, l));
+                }
+            }
+            /* B: the compressor chain over the step, as step() (per entry; no row-banded op) */
+            if (L.src)
+                RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w), brows(ctail ? m.kvs : m.pooled, T));
+            if (ctail)
+                RAD_ISSUE_N(x, L.c_work, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
+                            praw2(tb->state_index, RAD_I32, S, tpitch),
+                            praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), RAD_NONE,
+                            brows(m.stage, crows * r), brows(m.page, crows), brows(m.bpos, crows), brows(m.nc, S));
+            if (ctail)
+                RAD_ISSUE_N(x, L.c_pool, crows, brows(m.stage, crows * r), brows(m.pooled, crows), brows(m.page, crows));
+            if (ctail && L.c_tail)
+                RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
+                            praw2(tb->state_index, RAD_I32, S, tpitch));
+            if (L.src) RAD_ISSUE_N(x, L.c_norm, crows, brows(m.pooled, crows), RAD_W(L.comp_norm), brows(m.lat, crows));
+            if (L.src) lin_issue(x, m, L.k_gemm, crows, brows(m.lat, crows), L.ik_w, brows(m.ik, crows));
+            if (L.src) RAD_ISSUE_N(x, L.c_tab, crows, bpos, brows(m.cs_b, g.max_ctx));
+            if (L.src) {
+                if (L.k_f)
+                    RAD_ISSUE_N(x, L.k_f, crows, brows(m.ik, crows), RAD_W(L.ik_norm), brows(m.ikn, crows),
+                                brows(m.cs_b, g.max_ctx), bpos);
+                else
+                    RAD_ISSUE_N(x, L.k_norm, crows, brows(m.ik, crows), RAD_W(L.ik_norm), brows(m.ikn, crows));
+            }
+            /* A2: a source layer's index query rope reads the angles c_tab rewrote */
+            if (L.src && L.i_score)
+                for (const BiSeg& s : sg) {
+                    if (L.i_f) RAD_ISSUE_N(x, L.i_f, s.n, R(m.iq, s.r0, s.n), brows(m.cs_b, g.max_ctx), P(batch->positions, s.r0, s.n));
+                    else RAD_ISSUE_N(x, L.i_rope, s.n, R(m.iq, s.r0, s.n), brows(m.cs_b, g.max_ctx), P(batch->positions, s.r0, s.n));
+                }
+            if (L.src) {
+                if (L.l_f) RAD_ISSUE_N(x, L.l_f, crows, brows(m.lat, crows), brows(m.cs_b, g.max_ctx), bpos);
+                else RAD_ISSUE_N(x, L.l_rope, crows, brows(m.lat, crows), brows(m.cs_b, g.max_ctx), bpos);
+                if (!L.k_f) RAD_ISSUE_N(x, L.k_rope, crows, brows(m.ikn, crows), brows(m.cs_b, g.max_ctx), bpos);
+            }
+            if (L.src && L.i_score && L.i_qq)
+                for (const BiSeg& s : sg) RAD_ISSUE_N(x, L.i_qq, s.n, R(m.iq, s.r0, s.n));
+            if (L.src && L.l_q) RAD_ISSUE_N(x, L.l_q, crows, brows(m.lat, crows));
+            if (L.src && L.k_q) RAD_ISSUE_N(x, L.k_q, crows, brows(m.ikn, crows));
+            if (L.src) RAD_ISSUE_N(x, L.l_st, crows, brows(m.lat, crows), page, kv_cache(m.comp[r], l));
+            if (L.src) RAD_ISSUE_N(x, L.k_st, crows, brows(m.ikn, crows), page, kv_cache(m.index[r], l));
+            /* the indexer: score / candidates / selection by segment, each segment's runs from its own first row */
+            if (L.i_score) {
+                const int src = c.src_of[(size_t)l];
+                const auto* ib = kv_batch(batch, m.index[r]);
+                const int64_t live = std::min<int64_t>(
+                    g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
+                const int64_t kw = keep_words(live, c.cand_block);
+                const bool uses = c.cand >= 0 && c.cand < l;
+                const bool split = m.isplit && m.sel_gather;
+                const bool rkeep = L.i_keep && live >= m.keep_min_live;
+                for (const BiSeg& s : sg) {
+                    const Ds41IdxRuns ru = ds41_idx_runs(s.n, m.irows, live, m.aw, m.ar, split && !s.dec, m.split_min_live,
+                                                         split && !s.dec && idx_balance(), (int64_t)L.i_runs.size());
+                    for (int64_t p = ru.p0; p < ru.p1; ++p) {
+                        const int64_t q0 = p * ru.R, qn = std::min(ru.R, s.n - q0);
+                        RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, R(m.iq, s.r0, s.n), R(m.iw, s.r0, s.n),
+                                    kv_cache(m.index[r], src),
+                                    praw2(ib->block_table + s.s0 * ib->block_table_pitch, RAD_I32, s.s1 - s.s0,
+                                          ib->block_table_pitch),
+                                    P(batch->positions, s.r0, s.n), segcu(s), bcol(m.score, 0, live, ru.R),
+                                    rkeep ? bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn) : RAD_NONE);
+                        if (L.i_cand)
+                            RAD_ISSUE_N(x, L.i_cand, qn, bcol(m.score, 0, live, qn), P(batch->positions, s.r0 + q0, qn),
+                                        bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn));
+                        RAD_ISSUE_N(x, L.i_topk, qn, bcol(m.score, 0, live, qn),
+                                    uses ? bcol_at(m.keep, s.r0 + q0, m.kwords, 0, kw, qn) : RAD_NONE,
+                                    P(batch->positions, s.r0 + q0, qn),
+                                    ru.split ? brow_slice(m.sel_part, (p - ru.p0) * ru.R, qn, c.itopk)
+                                             : brow_slice(m.sel, s.r0 + q0, qn, c.itopk));
+                    }
+                    if (ru.split)
+                        RAD_ISSUE(x, m.sel_gather, brows(m.sel_part, ru.q * ru.R),
+                                  brow_slice(m.sel, s.r0, (int64_t)m.aw * ru.q * ru.R, c.itopk));
+                }
+            }
+            bt_pt(x, m, m.qr, T, "qr", l);
+            bt_pt(x, m, m.q, T, "q", l);
+            bt_pt(x, m, m.kvn, T, "kvn", l);
+            if (L.i_score) {
+                bt_pt(x, m, m.iq, T, "iq", l);
+                bt_pt(x, m, m.iw, T, "iw", l);
+                bt_pt(x, m, m.sel, T, "sel", l);
+            }
+            /* the attention by segment (its band at the segment's rows), its sequences' slices */
+            const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
+            const rad_op ah = ofold ? L.attn_rt : L.attn;
+            const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
+            for (const BiSeg& s : sg) {
+                const int64_t ns = s.s1 - s.s0;
+                const RadOperand wbt = praw2(wb->block_table + s.s0 * wb->block_table_pitch, RAD_I32, ns, wb->block_table_pitch);
+                const RadOperand wused = praw(wb->seqused + s.s0, RAD_I32, ns);
+                if (r > 0) {
+                    const int src = c.src_of[(size_t)l];
+                    const auto* cbb = kv_batch(batch, m.comp[r]);
+                    const RadOperand cbt = praw2(cbb->block_table + s.s0 * cbb->block_table_pitch, RAD_I32, ns,
+                                                 cbb->block_table_pitch);
+                    if (ofold)
+                        RAD_ISSUE_N(x, ah, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
+                                    cbt, R(m.sel, s.r0, s.n), P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks),
+                                    R(m.o, s.r0, s.n), acs);
+                    else
+                        RAD_ISSUE_N(x, L.attn, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused,
+                                    kv_cache(m.comp[r], src), cbt, R(m.sel, s.r0, s.n), P(batch->positions, s.r0, s.n),
+                                    segcu(s), RAD_W(L.sinks), R(m.o, s.r0, s.n));
+                } else if (ofold) {
+                    RAD_ISSUE_N(x, ah, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused, RAD_NONE, RAD_NONE, RAD_NONE,
+                                P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks), R(m.o, s.r0, s.n), acs);
+                } else {
+                    RAD_ISSUE_N(x, L.attn, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused, RAD_NONE, RAD_NONE,
+                                RAD_NONE, P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks), R(m.o, s.r0, s.n));
+                }
+            }
+            if (ofold) {
+            } else if (L.o_f) {
+                RAD_ISSUE_N(x, L.o_f, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
+            } else {
+                RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
+                if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
+            }
+            bt_pt(x, m, m.o, T, "o", l);
+            const int64_t gd = HD / m.gr;
+            rows(kBiBand, [&](int64_t r0, int64_t n) {
+                for (int j = 0; j < m.gr; ++j)
+                    lin_issue(x, m, L.o_a[(size_t)j], n, C(m.o, j * gd, gd, r0, n), L.wo_a[(size_t)j],
+                              C(m.oa, j * c.o_rank, c.o_rank, r0, n));
+            });
+            bt_pt(x, m, m.oa, T, "oa", l);
+            if (late) mix_a();
+            rows(kBiBand, [&](int64_t r0, int64_t n) {
+                lin_issue(x, m, L.o_b, n, R(m.oa, r0, n), L.wo_b, R(m.attn_out, r0, n));
+            });
+            bt_pt(x, m, m.attn_out, T, "attn_out", l);
+        }
+        /* the attention's all-reduce over the step (exact: 0 + r0 + .. + r3 a value), then post / collapse / norm (a
+         * fused norm) by segment; ar_pcn_f (the all-reduce with it, RADIANCE_DS41_AR_PCN) is not taken under ds41_bi */
+        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
+        if (L.pcn_f)
+            rows(kBiNorm, [&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.pcn_f, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                            R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm), R(m.act.x, r0, n));
+            });
+        else
+            RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h1, T));
+        if (L.pcn_f) {
+        } else if (L.cn_f) {
+            rows(kBiNorm, [&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.cn_f, n, R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm),
+                            R(m.act.x, r0, n));
+            });
+        } else {
+            RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
+            RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
+        }
+        bt_pt(x, m, m.h1, T, "h1", l);
+        bt_pt(x, m, m.act.x, T, "ffn_in", l);
+        /* the MoE: one pass a segment (the router, the experts at the segment's rows, the shared arm, the gather and
+         * the all-reduce over its rows); the ffn mix beside the first (r0 = 0) */
+        MixBeside mb{ &L, &m, T };
+        MoeFP8::Beside bs;
+        bs.fn = mix_f_beside;
+        bs.arg = &mb;
+        for (const BiSeg& s : sg) L.moe.pass(x, T, s.r0, s.n, true, &bs);
+        L.moe.route_report(x);
+        bt_pt(x, m, m.mw.logits, T, "router", l);
+        bt_pt(x, m, m.mw.ids, T, "ids", l);
+        bt_pt(x, m, m.mw.ew, T, "ew", l);
+        bt_pt(x, m, m.mw.sout, T, "sout", l);
+        bt_pt(x, m, m.act.x, T, "moe_out", l);
+        /* post_f, or post_f with the next collapse + norm (a fused norm, by segment); never the AR_PCN forms here */
+        const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
+        if (nx && nx->pcn_a)
+            rows(kBiNorm, [&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, nx->pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                            R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(nx->attn_norm), R(m.xn, r0, n));
+            });
+        else if (!nx && m.pcn_fin)
+            rows(kBiNorm, [&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, m.pcn_fin, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                            R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(m.final_gain),
+                            R(m.final_hidden, r0, n));
+            });
+        else
+            RAD_ISSUE_N(x, L.post_f, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h0, T));
+    }
+    if (m.pcn_fin) {
+    } else if (m.cn_fin) {
+        rows(kBiNorm, [&](int64_t r0, int64_t n) {
+            RAD_ISSUE_N(x, m.cn_fin, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(m.final_gain),
+                        R(m.final_hidden, r0, n));
+        });
+    } else {
+        RAD_ISSUE_N(x, m.contract, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+        RAD_ISSUE_N(x, m.fnorm, T, brows(m.xcol, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
+    }
+    bt_pt(x, m, m.final_hidden, T, "final", -1);
+    if (batch->n_out > 0) {
+        RAD_ISSUE_N(x, m.gather, batch->n_out, brows(m.final_hidden, T),
+                    praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
+        /* the head (logits_gemm_ggml, banded): the sampled rows in launches within the decode band */
+        for (int64_t a = 0; a < batch->n_out; a += kBiBand) {
+            const int64_t n = std::min(kBiBand, batch->n_out - a);
+            RAD_ISSUE_N(x, m.head_op, n, a ? brow_slice(m.logit_input, a, n, D) : brows(m.logit_input, n), RAD_W(m.head),
+                        a ? brow_slice(m.logits, a, n, g.n_vocab) : brows(m.logits, n));
+        }
+        bt_pt(x, m, m.logits, batch->n_out, "logits", -1, 1);
+    }
+    bt_flush(x, m, batch);
+}
+
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
     /* A drafter pass: the sign gives the kind (rad_runtime.h); zero is a trunk step. */
@@ -3427,6 +3948,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
         if (batch->draft_pass > 0) dsp_query(x, m, batch);
         else dsp_context(x, m, batch);
         return;
+    }
+    /* lever BI (ds41_bi 1): a step of more than one shape class runs in segments (step_bi) */
+    if (m.bi_sub && g_sw_bi.load(std::memory_order_relaxed) > 0) {
+        static thread_local std::vector<BiSeg> sg;
+        if (bi_segments(x, m, batch, sg)) {
+            step_bi(x, m, batch, sg);
+            return;
+        }
     }
     const auto& c = m.c;
     const auto& g = m.g;
@@ -3944,6 +4473,20 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return rad::arch:
 }  // namespace deepseek41
 
 #ifndef RAD_ARCH_NO_EXPORTS
+/* Lever BI: a pass whose segments come from its prefill sequences' own lengths (two or more prefill sequences under
+ * ds41_bi 1) is not recorded -- the key below does not hold those lengths; every other pass keys as before (a constant).
+ * No DeepSeek kernel reads RadArgs::kv_used_max_h, the one thing the callback's presence changes in the issue path. */
+extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_t* kv_used_max_h) {
+    (void)c;
+    (void)kv_used_max_h;
+    if (b && b->draft_pass == 0 && deepseek41::g_sw_bi.load(std::memory_order_relaxed) > 0) {
+        int64_t Dn = 0, DT = 0;
+        rad::arch::batch_split(b, &Dn, &DT);
+        if (b->n_seq - Dn >= 2) return 0;
+    }
+    return 1;
+}
+
 RAD_ARCH_PROBE(deepseek41)
 RAD_ARCH_CHAT_FORMAT(deepseek41)
 RAD_ARCH_PLUGIN(deepseek41, "deepseek41", "", "0.1.0",

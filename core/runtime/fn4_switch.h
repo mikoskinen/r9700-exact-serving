@@ -113,6 +113,14 @@
  *                   W1b: succ staged through LDS, the same bits). RADIANCE_DS41_DSPARK_WALK=0 / 1 / 2 declares the walk
  *                   (and starts at that value); unset: 1 / 2 refused. Exact: proposals only, the trunk verifies.
  *
+ *   ds41_bi         deepseek41 (lever BI, batch invariance): 1 a step's rows are issued in segments by their own
+ *                   sequence's shape -- the decode rows as one segment (dense GEMMs, attention and the indexer score
+ *                   in one launch up to 48 rows, the fused norms in launches of at most 32), each prefill sequence as its
+ *                   own segment at its own rows (attention and the indexer through a two-entry cu view), the MoE one pass
+ *                   a segment -- so a row's arithmetic is the one its sequence gets alone; 0 one launch over the step as
+ *                   before. RADIANCE_DS41_BI=0 / 1 declares it (and starts at that value); unset: 1 refused. A step with
+ *                   one segment runs today's issue either way. Changes the bytes of rows that shared a step with other
+ *                   sequences (toward their alone bytes); a one-sequence step is unchanged.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -173,7 +181,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
-              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kSwitches };
+              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
