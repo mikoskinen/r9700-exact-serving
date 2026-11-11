@@ -232,11 +232,12 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->h_rot = g->h_rot;
     d->a_rot = g->a_rot;
     d->limit = (float)g->limit;
-    d->dz = (int32_t)exl3r4d_fn4_dz();   /* ds41 eport: fn4 DZ's form at run time (prefill.c; 0 unless EXL3R4D_DZ 1 / 2) */
+    d->dz = (int32_t)(exl3r4d_fn4_dz() | (exl3r4d_fn4_bi() ? 2 : 0));   /* bit 0 DZ, bit 1 BI (fn4) */   /* ds41 eport: fn4 DZ's form at run time (prefill.c; 0 unless EXL3R4D_DZ 1 / 2) */
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
-    if (gate_up && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = EXL3R4D_SK_SMALL_V;
+    if (gate_up && EXL3R4D_SK_SMALL_M > 0 && !exl3r4d_fn4_bi() && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M)
+        d->sk = EXL3R4D_SK_SMALL_V;   /* fn4 BI: split-K 1 at every M under exl3_bi */
     if (gate_up && EXL3R4D_SK_ONE_V > 0 && (T + g->top_k - 1) / g->top_k <= 1) d->sk = EXL3R4D_SK_ONE_V;
     if (gate_up && EXL3R4D_SK_FIT && d->sk > 1) {
         const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);

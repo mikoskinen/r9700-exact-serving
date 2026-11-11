@@ -118,6 +118,7 @@ int64_t exl3r4d_pf_scratch(const RadArgs* a, int op);
  * _mod4 op's classes 2 and 3 go to `hi`, and exl3r4d_gemm4 packs the four-class block from both (v6). */
 int     exl3r4d_fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCls hi[2]);
 int     exl3r4d_fn4_dz(void);   /* ds41 eport: fn4 DZ's form for fill() (prefill.c, the exl3_dz switch) */
+int     exl3r4d_fn4_bi(void);   /* fn4 BI: the decode band as the prefill band computes a row (prefill.c, exl3_bi) */
 int     exl3r4d_gemm4(const Exl3r4dGemm* d, const Exl3r4dCls hi[2], Exl3r4dGemm4* o);
 #endif
 

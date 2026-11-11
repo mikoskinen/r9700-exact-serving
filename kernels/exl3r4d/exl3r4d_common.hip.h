@@ -711,7 +711,7 @@ static __device__ void zero_dead_rows(const Exl3r4dGemm& p, int spare, int nspar
   const int lo = clamp_row(p.off[0], p.T), hi = clamp_row(p.off[p.n_expert], p.T);
   const int dead = lo + (p.T - hi);
 #if EXL3R4D_DZ
-  if (EXL3R4D_DZ == 1 || p.dz) {
+  if (EXL3R4D_DZ == 1 || (p.dz & 1)) {
     if (spare >= dead) return;
     const int mine = (dead - 1 - spare) / nspare + 1;   // rows spare, spare + nspare, ... below dead
     for (int u = threadIdx.x; u < mine * 16; u += EXL3R4D_BDIM) {
@@ -1171,7 +1171,10 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
 #if EXL3R4D_ABLATE_EPI
         for (int e = 0; e < 8; e++) r[e] = xs[t * 256 + lane * 8 + e];
 #else
-        if constexpr (EPIC && OPW == 2) {  // both of the wave's tiles from one pass (o = 0 computes, o = 1 reuses)
+        // fn4 BI (11.11.2026): with the switch exl3_bi (p.dz bit 1) the decode band's down takes the plain tile sums
+        // (had_tiles), the prefill band's (pf_epi_dn) statement for statement -- EPIC's paired across-tile sum rounds a few
+        // outputs differently (177b: decode vs prefill y 3 / 22 .. 8 / 53 slots differ, h identical).
+        if (EPIC && OPW == 2 && !(p.dz & 2)) {  // both of the wave's tiles from one pass (o = 0 computes, o = 1 reuses)
           if (o == 0) {
 #pragma unroll
             for (int e = 0; e < 8; e++) { epc_e[e] = 0.f; epc_o[e] = 0.f; }

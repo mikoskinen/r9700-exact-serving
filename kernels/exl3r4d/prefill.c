@@ -31,16 +31,24 @@ static volatile int g_fn4_pf_prep_gu = 0;
 #endif
 static volatile int g_fn4_dz = EXL3R4D_DZ == 1;
 int exl3r4d_fn4_dz(void) { return EXL3R4D_DZ == 2 ? g_fn4_dz : EXL3R4D_DZ == 1; }
+/* fn4 BI (11.11.2026, batch invariance), "exl3_bi" 0 / 1: the decode band computes every row as the prefill band does --
+ * down's epilogue without EPIC (the plain tile sums; fill() puts it in dz bit 1), gate_up without the small-M split-K 2
+ * (EXL3R4D_SK_SMALL_M). 177b: from 3 tokens each band is M-invariant and gate_up's h is the same bits in both; down's y
+ * differed (EPIC) and Flash-Next's M 1 (split-K 2). 0 at start = today's forms. */
+static volatile int g_fn4_bi = 0;
+int exl3r4d_fn4_bi(void) { return g_fn4_bi; }
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_pfprep")) return value >= 0 && value <= 2 ? 1 : -1;
     if (!strcmp(name, "exl3_dz")) return EXL3R4D_DZ == 2 ? (value == 0 || value == 1 ? 1 : -1) : value == (EXL3R4D_DZ == 1) ? 1 : -1;
+    if (!strcmp(name, "exl3_bi")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
     if (!strcmp(name, "exl3_pfprep")) g_fn4_pf_prep_gu = value;
+    else if (!strcmp(name, "exl3_bi")) g_fn4_bi = value;
     else if (EXL3R4D_DZ == 2) g_fn4_dz = value;
     return 1;
 }
@@ -48,6 +56,7 @@ __attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* 
     if (!name || !applied) return 0;
     if (!strcmp(name, "exl3_pfprep")) { *applied = g_fn4_pf_prep_gu; return 1; }
     if (!strcmp(name, "exl3_dz")) { *applied = exl3r4d_fn4_dz(); return 1; }
+    if (!strcmp(name, "exl3_bi")) { *applied = g_fn4_bi; return 1; }
     return 0;
 }
 #if EXL3R4D_ROUTEDUMP
