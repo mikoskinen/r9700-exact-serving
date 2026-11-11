@@ -130,6 +130,15 @@
  *                   RADIANCE_DS41_BI=0..9 declares it (and starts at that value); unset: 1..9 refused. A step with
  *                   one segment runs today's issue either way. Changes the bytes of rows that shared a step with other
  *                   sequences (toward their alone bytes); a one-sequence step is unchanged.
+ *   sched_bi_chunk  scheduler (lever BI, class (ii)): how a prefill's chunk boundaries are planned beside other work
+ *                   (core/sched/scheduler.cpp bi_chunk_plan): 0 today's (budget cuts, busy-chunk share); 1 alone's
+ *                   boundaries, the step budget --max-num-batched-tokens; 2 the checkpoint-interval grid, alone too;
+ *                   3 / 4 alone's pieces, beside other work cut on the interval / RADIANCE_SCHED_BI_GRID (1024) grid
+ *                   inside them, >= 128 rows a side. RADIANCE_SCHED_BI_CHUNK at start; unset = 0. The scheduler reads
+ *                   it at every step it plans, and a change is applied at a step release (after that step was
+ *                   planned), so the value takes effect from the next planned step: an A/B pins it, runs one short
+ *                   request, then measures. A prefill in flight keeps nothing of the old value's plan except the rest
+ *                   of an alone piece 3 / 4 cut in two, which runs whole under any value.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -190,7 +199,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
-              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kSwitches };
+              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kSchedBiChunk, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -237,6 +246,9 @@ void dspark_register(bool conf_capable, bool alt_capable, int conf_start, int al
 bool dspark_conf_value_ok(int v);
 /* The applied value of a core switch without the lock (the step path reads it each step); -1 unregistered. */
 int  get(int i);
+/* Lever BI's chunking (sched_bi_chunk): the switch once set, else RADIANCE_SCHED_BI_CHUNK (0 .. 4) at start, else 0.
+ * The scheduler reads it at every step it plans. */
+int  sched_bi_chunk();
 /* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
  * "accept"; under draft_depth0 2 every head draft is a probe's). */
 void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted);
