@@ -1265,7 +1265,9 @@ int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
  *     RADIANCE_SCHED_BI_GRID (default 1024) -- leaving at least kBiMinPiece rows on both sides: the row count from which
  *     no kernel form of the line depends on a piece's rows (the fused norms' widest thread band ends at 120, the decode /
  *     WMMA bands at 48, the EXL3 band at 16). So every row runs in a piece of the same form band as alone (alone's small
- *     final piece whole, from the same boundary), and the loaded boundaries land on G.
+ *     final piece whole, from the same boundary), and the loaded boundaries land on G. When no such cut fits what is
+ *     left of the step, the step's only prefill takes its smallest admissible piece over the shared budget (up to
+ *     --max-num-batched-tokens), so it never waits on the decode rows beside it.
  * Either way no budget cut, busy-chunk share or long-prefill fair share shortens a chunk. Request::checkpoint_at (a
  * prefix another request starts from) still splits where it falls, as alone. */
 static int bi_chunk_env() {
@@ -1363,13 +1365,25 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
             }
         }
     }
+    /* Nothing fits what is left of the step (the decode rows planned ahead took the shared budget's slack, or the piece
+     * cannot be cut): the step's only prefill takes its smallest admissible piece -- the first grid end inside alone's
+     * piece with >= kBiMinPiece rows on both sides, else the piece whole -- over the shared budget, up to
+     * --max-num-batched-tokens less what is planned; the rows behind it that no longer fit wait a step. Without this a
+     * long prefill waits as long as more decode rows than the slack (2112 - 2048 = 64 at the DS line's budget) run beside
+     * it. The piece is one D would cut at any budget, so exactness is D's. */
     bool pf = false;
     for (const StepEntry& e : plan_.e) pf = pf || e.is_prefill;
-    bool cut = false;
+    if (pf) return 0;
+    int64_t emin = pe;
     if (G > 0)
-        for (int64_t e = (n / G + 1) * G; e < pe && !cut; e += G) cut = e - n >= kBiMinPiece && pe - e >= kBiMinPiece;
-    if (!pf && !cut && pe - n <= cfg_.max_tok - plan_.n_tok) return whole();
-    return 0;
+        for (int64_t e = (n / G + 1) * G; e < pe; e += G)
+            if (e - n >= kBiMinPiece && pe - e >= kBiMinPiece) { emin = e; break; }
+    if (emin - n > cfg_.max_tok - plan_.n_tok) return 0;
+    if (emin == pe) return whole();
+    s.bi_beg = pb;
+    s.bi_end = pe;
+    s.bi_ckpt = ck;
+    return emin - n;
 }
 
 /* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
