@@ -16,6 +16,8 @@
 
 namespace rad {
 
+static int bi_chunk_env();   /* lever BI chunking (RADIANCE_SCHED_BI_CHUNK), below */
+
 /* Microseconds on the monotonic clock, for the live request table only; the step path keeps its
  * own steady_clock points. */
 static int64_t mono_us() {
@@ -174,6 +176,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
+    {   /* lever BI's chunking, once a process (a re-init keeps it) */
+        static const int bi = bi_chunk_env();
+        bi_chunk_ = bi;
+    }
 
     /* The engine resolves the geometry once, because the prefix cache needs its checkpoint
      * interval first; a caller without one (tests) resolves its own from prog and cfg. Both
@@ -1209,6 +1215,110 @@ int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
     return std::min(n_target, r.n_computed < prompt ? prompt : r.n_computed + 1);
 }
 
+/* Lever BI, class (ii) (RADIANCE_SCHED_BI_CHUNK, read once at load; unset / 0 = today): a long prompt's chunk
+ * boundaries must not depend on what else the engine runs, or its rows' arithmetic does (a 32- or 112-row piece takes
+ * other kernel forms than a 2048-row one; deepseek41 ds41_bi keeps a step's sequences apart, not a sequence's pieces).
+ *   1 (option A, alone's boundaries): every prefill chunk is the one an idle engine plans from the same position -- the
+ *     span where the request would span alone (2048 first, then 2 x the interval), the interval grid, the tail and the
+ *     prompt's end -- and the step budget stays --max-num-batched-tokens beside decode rows (not the span's shared
+ *     budget); a chunk that does not fit what is left of the step waits for a step that holds it whole.
+ *   2 (option B, the interval grid): no span (alone too), every prefill chunk runs to the next checkpoint-interval
+ *     boundary or the prompt's end, whole, or waits.
+ *   3 / 4 (option D, alone's boundaries on a grid): a lone prefill takes alone's piece; beside other work (the shared
+ *     budget, as today) a chunk ends at alone's piece end or on a grid G inside it -- 3: the checkpoint interval, 4:
+ *     RADIANCE_SCHED_BI_GRID (default 1024) -- leaving at least kBiMinPiece rows on both sides: the row count from which
+ *     no kernel form of the line depends on a piece's rows (the fused norms' widest thread band ends at 120, the decode /
+ *     WMMA bands at 48, the EXL3 band at 16). So every row runs in a piece of the same form band as alone (alone's small
+ *     final piece whole, from the same boundary), and the loaded boundaries land on G.
+ * Either way no budget cut, busy-chunk share or long-prefill fair share shortens a chunk. Request::checkpoint_at (a
+ * prefix another request starts from) still splits where it falls, as alone. */
+static int bi_chunk_env() {
+    const char* v = std::getenv("RADIANCE_SCHED_BI_CHUNK");
+    const int m = (v && v[0] >= '1' && v[0] <= '4' && !v[1]) ? v[0] - '0' : 0;
+    if (v && *v && !(m || (v[0] == '0' && !v[1])))
+        std::fprintf(stderr, "radiance: scheduler: RADIANCE_SCHED_BI_CHUNK=%s is not 0 / 1 / 2 / 3 / 4: today's chunking\n", v);
+    if (m)
+        std::fprintf(stderr, "radiance: scheduler: lever BI chunking %d (RADIANCE_SCHED_BI_CHUNK): %s; a chunk that does "
+                             "not fit the step waits\n", m,
+                     m == 1 ? "every prefill chunk on alone's boundaries (span, interval grid, tail, end)"
+                     : m == 2 ? "every prefill chunk on the checkpoint-interval grid or the prompt's end, no span"
+                     : m == 3 ? "beside other work a chunk ends on the checkpoint-interval grid inside alone's piece (each "
+                                "part >= 128 rows) or at the piece's end"
+                              : "beside other work a chunk ends on the RADIANCE_SCHED_BI_GRID grid (default 1024) inside alone's "
+                                "piece (each part >= 128 rows) or at the piece's end");
+    return m;
+}
+
+static constexpr int64_t kBiMinPiece = 128;
+
+/* RADIANCE_SCHED_BI_GRID: lever BI chunking 4's grid G (default 1024); a divisor of the interval, a multiple of 32. */
+static int64_t bi_grid_env() {
+    const char* v = std::getenv("RADIANCE_SCHED_BI_GRID");
+    const long g = v && *v ? std::strtol(v, nullptr, 10) : 1024;
+    return g >= 128 && g % 32 == 0 ? g : 1024;
+}
+
+int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
+                                 bool share) {
+    const int64_t n = r.n_computed;
+    if (checkpoint_pos) *checkpoint_pos = -1;
+    /* the alone piece holding n: [pb, pe) and the checkpoint its end carries -- the rest of one cut short before, or the
+     * piece an idle engine plans from n (n is then one of alone's boundaries) */
+    int64_t pb = n, pe = 0, ck = -1;
+    if (bi_chunk_ >= 3 && s.bi_beg < n && n < s.bi_end) {
+        pb = s.bi_beg;
+        pe = s.bi_end;
+        ck = s.bi_ckpt;
+    } else {
+        const bool keep = span_now_;
+        span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+                    (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+        const int64_t full = plan_chunk(n, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
+        span_now_ = keep;
+        if (full <= 0) return 0;
+        pe = n + full;
+        s.bi_beg = s.bi_end = 0;
+        s.bi_ckpt = -1;
+    }
+    auto whole = [&]() -> int64_t {
+        s.bi_beg = s.bi_end = 0;
+        s.bi_ckpt = -1;
+        if (checkpoint_pos) *checkpoint_pos = ck;
+        return pe - n;
+    };
+    if (bi_chunk_ <= 2 || span_now_) return pe - n <= room ? whole() : 0;   /* 1 / 2, or a lone prefill: the piece */
+    /* 3 / 4 beside other work (option D): an end on the grid G (3: the interval, 4: RADIANCE_SCHED_BI_GRID) inside the
+     * piece leaving at least kBiMinPiece rows on both sides, or the piece's end; the largest that fits the room. A piece
+     * that cannot be cut and does not fit the shared budget runs whole over it when it is the step's first prefill
+     * (else it would wait as long as anything decodes beside it). */
+    static const int64_t G4 = bi_grid_env();
+    const int64_t I = geo_.checkpoint_interval;
+    const int64_t G = bi_chunk_ == 3 ? I : G4;
+    /* 4 with another prefill behind it or a request waiting (today's busy-chunk share): one grid step left for it */
+    const int64_t give = bi_chunk_ == 4 && share ? G : 0;
+    for (int64_t pass = give > 0 ? 0 : 1; pass < 2; ++pass) {
+        const int64_t rm = pass == 0 ? room - give : room;
+        if (pe - n <= rm) return whole();
+        if (G <= 0 || rm <= 0) continue;
+        for (int64_t e = (n + rm) / G * G; e > n; e -= G) {
+            if (e >= pe) continue;
+            if (e - n >= kBiMinPiece && pe - e >= kBiMinPiece) {
+                s.bi_beg = pb;
+                s.bi_end = pe;
+                s.bi_ckpt = ck;
+                return e - n;
+            }
+        }
+    }
+    bool pf = false;
+    for (const StepEntry& e : plan_.e) pf = pf || e.is_prefill;
+    bool cut = false;
+    if (G > 0)
+        for (int64_t e = (n / G + 1) * G; e < pe && !cut; e += G) cut = e - n >= kBiMinPiece && pe - e >= kBiMinPiece;
+    if (!pf && !cut && pe - n <= cfg_.max_tok - plan_.n_tok) return whole();
+    return 0;
+}
+
 /* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
  * written (spec §7.3; see scheduler.h).
  *
@@ -1818,6 +1928,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * it. An embedding input is never resumed, so it takes no checkpoint. */
         const int64_t rest = target - (int64_t)r.n_computed;
         want = rest <= budget ? rest : 0;
+    } else if (bi_chunk_) {
+        want = bi_chunk_plan(s, r, target, budget, &ckpt, reserve > 0);   /* lever BI: the whole chunk or none */
     } else {
         /* An admission shares the step the same way: otherwise a cold prompt with requests
          * queued behind it takes every token left. The hit is known by now, so the cap applies
@@ -2148,8 +2260,8 @@ const RadBatch* Scheduler::step() {
             const SchedReq& w = *reqs_[(size_t)waiting_[0]];
             lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
         }
-        span_now_ = lone;
-        if (!lone) budget = geo_.shared_tok;
+        span_now_ = bi_chunk_ == 2 ? false : lone;
+        if (!lone && bi_chunk_ != 1) budget = geo_.shared_tok;
     }
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
@@ -2217,7 +2329,10 @@ const RadBatch* Scheduler::step() {
         int64_t ckpt = -1;
         int64_t want;
         if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
-        if (prefill) {
+        if (prefill && bi_chunk_) {
+            want = bi_chunk_plan(s, r, target, budget, &ckpt, share_step && (behind_pf > 0 || admit_waits));
+            if (want <= 0) { ++i; continue; }   /* lever BI: the whole chunk or none; decode rows behind it go on */
+        } else if (prefill) {
             const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
             const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),

@@ -41,6 +41,9 @@ struct SchedReq {
      * returned with the sequence's KV (free_kv, preempt_back). */
     int32_t  card = -1;
     bool     running = false;
+    /* Lever BI chunking 3 (Scheduler::bi_chunk_plan): the alone piece [bi_beg, bi_end) this request runs in two halves, and
+     * the checkpoint its end carries; valid while bi_beg < n_computed < bi_end. */
+    int64_t  bi_beg = 0, bi_end = 0, bi_ckpt = -1;
 
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
@@ -632,6 +635,11 @@ private:
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
+    /* Lever BI's chunking (RADIANCE_SCHED_BI_CHUNK at start; 0 = today): a prefill chunk whose rows do not depend on what
+     * else is in the step, or none this step (bi_chunk_plan). */
+    int           bi_chunk_ = 0;
+    int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
+                                bool share = false);
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;
