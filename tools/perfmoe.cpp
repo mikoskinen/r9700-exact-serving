@@ -177,6 +177,7 @@ struct Opts {
     bool overlap = false;     // --overlap (with --chain, TIMING ONLY, wrong output): a library's chain launches beside each
                               // other on two streams, joined a layer -- the ceiling of fusing them into one dispatch
     std::string chain_band = "_m16";   // --chain-band SUFFIX: the exl3r4d rows the chain takes (_m16 decode, _pf M > 16)
+    std::string dump_h;       // --dump-h FILE (fn4 BI, with --chain): layer 0's gate_up output h after the warm pass, raw bytes
     std::string dump_y;       // --dump-y FILE (with --chain): layer 0's exl3r4d chain y after the timed passes, raw bytes --
                               // two builds' files compared byte for byte (same seed: same routing and data)
     std::string routing;      // --routing FILE: EXL3R4D_ROUTEDUMP records replayed as the layers' routings (P10-K5)
@@ -312,12 +313,13 @@ void* f16_buf(size_t n, float v) {
     return d;
 }
 // kind 0: uniform in (-v, v); 1: +-v (the EXL3 sign vectors suh / suh.1 are +-1); 2: uniform in (v/2, 3v/2)
-void* f16_rand(size_t n, float v, int kind) {
+bool g_x_bf16 = false;   // fn4 BI (--x-bf16): the chain's x as bf16, as the engine passes the normed input
+void* f16_rand(size_t n, float v, int kind, bool bf16 = false) {
     std::vector<uint16_t> h(n);
     for (auto& e : h) {
         const double u = unif();
         const float f = kind == 1 ? (u < 0.5 ? -v : v) : kind == 2 ? (float)(v * (0.5 + u)) : (float)(v * (2 * u - 1));
-        e = rad_f32_to_f16(f);
+        e = bf16 ? rad_f32_to_bf16(f) : rad_f32_to_f16(f);
     }
     void* d = dalloc(n * 2);
     put(d, h.data(), n * 2);
@@ -370,6 +372,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-ids") o.no_ids = true;
         else if (a == "--pfstamps") o.pfstamps = nx();
         else if (a == "--dump-y") o.dump_y = nx();
+        else if (a == "--dump-h") o.dump_h = nx();
+        else if (a == "--x-bf16") g_x_bf16 = true;
         else if (a == "--chain-band") o.chain_band = nx();
         else if (a == "--wgstamps-lib") o.wgstamps_lib = std::atoi(nx());
         else if (a == "--overlap") o.overlap = true;
@@ -620,7 +624,8 @@ int main(int argc, char** argv) {
             const Exl3Positions* dpos = exl3_positions(o.mod4 ? EXL3_DOWN4 : EXL3_DOWN);
             const Exl3Positions* ppos = exl3_positions(o.mod4 ? EXL3_PREP_GU4 : EXL3_PREP_GU);
             if (o.split_seed) g_rs = 0x5EED000000000001ull;   // fn4 P2x: x's rows independent of M's draw
-            void* x = o.rand_data ? f16_rand((size_t)(o.M * o.hidden), 1.0f, 0) : f16_buf((size_t)(o.M * o.hidden), 0.5f);
+            void* x = o.rand_data ? f16_rand((size_t)(o.M * o.hidden), 1.0f, 0, g_x_bf16) : f16_buf((size_t)(o.M * o.hidden), 0.5f);
+            if (g_x_bf16 && !o.rand_data) die("--x-bf16 needs --rand-data");
             if (o.split_seed) g_rs = 0x5EED000000000002ull;   // ...and the weights independent of M
             void* h = dalloc((size_t)(Tr * wmax * 2));
             void* y = dalloc((size_t)(Tr * o.hidden * 2));
@@ -670,7 +675,7 @@ int main(int argc, char** argv) {
                 const auto& a = pg[(size_t)(l % o.pools)];
                 const auto& b = pd[(size_t)(l % o.pools)];
                 const RadTensor st = T(rs_sorted[(size_t)l], RAD_I32, { Tr }), ot = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
-                const RadTensor xin = o.a_rot ? T(xr, RAD_F16, { Tr, 2 * o.hidden }) : T(x, RAD_F16, { o.M, o.hidden });
+                const RadTensor xin = o.a_rot ? T(xr, RAD_F16, { Tr, 2 * o.hidden }) : T(x, g_x_bf16 ? RAD_BF16 : RAD_F16, { o.M, o.hidden });
                 // the operands in each op's schema order (include/exl3_abi.h exl3_positions)
                 std::vector<RadTensor> gt((size_t)gpos->n_opd), dt((size_t)dpos->n_opd), pt((size_t)ppos->n_opd);
                 gt[(size_t)gpos->x] = xin; gt[(size_t)gpos->sorted] = st; gt[(size_t)gpos->offset] = ot;
@@ -679,7 +684,7 @@ int main(int argc, char** argv) {
                 dt[(size_t)dpos->offset] = ot; dt[(size_t)dpos->y] = T(y, RAD_BF16, { Tr, o.hidden });
                 if (mbuf && gpos->map >= 0 && dpos->map >= 0)
                     gt[(size_t)gpos->map] = dt[(size_t)dpos->map] = T(mbuf, RAD_I32, { mapw });
-                pt[(size_t)ppos->x] = T(x, RAD_F16, { o.M, o.hidden }); pt[(size_t)ppos->sorted] = st;
+                pt[(size_t)ppos->x] = T(x, g_x_bf16 ? RAD_BF16 : RAD_F16, { o.M, o.hidden }); pt[(size_t)ppos->sorted] = st;
                 pt[(size_t)ppos->offset] = ot; pt[(size_t)ppos->y] = T(xr, RAD_F16, { Tr, 2 * o.hidden });
                 if (ppos->ids >= 0 && !o.no_ids) pt[(size_t)ppos->ids] = T(rs_ids[(size_t)l], RAD_I32, { o.M, o.topk });
                 for (int c = 0; c < nc; ++c) {
@@ -715,7 +720,7 @@ int main(int argc, char** argv) {
                     const auto& a = pg[(size_t)(l % o.pools)];
                     const auto& b = pd[(size_t)(l % o.pools)];
                     std::vector<RadTensor> ft((size_t)fpos->n_opd);
-                    ft[(size_t)fpos->x] = T(x, RAD_F16, { o.M, o.hidden });
+                    ft[(size_t)fpos->x] = T(x, g_x_bf16 ? RAD_BF16 : RAD_F16, { o.M, o.hidden });
                     ft[(size_t)fpos->sorted] = T(rs_sorted[(size_t)l], RAD_I32, { Tr });
                     ft[(size_t)fpos->offset] = T(rs_off[(size_t)l], RAD_I32, { o.E + 1 });
                     ft[(size_t)fpos->y] = T(g_gd_y, RAD_BF16, { Tr, o.hidden });
@@ -1256,6 +1261,13 @@ int main(int argc, char** argv) {
         ck(hipMemcpy(y1.data(), g_fu_y, g_fu_yb, hipMemcpyDeviceToHost), "copy");
         size_t dy = 0;
         for (size_t i = 0; i < g_fu_yb; ++i) dy += wy0[i] != y1[i];
+        if (!o.dump_h.empty() && g_fu_h) {   // fn4 BI: the h the warm launch left (layer 0's gate_up output)
+            std::vector<char> hh(g_fu_hb);
+            ck(hipMemcpy(hh.data(), g_fu_h, g_fu_hb, hipMemcpyDeviceToHost), "copy");
+            FILE* f = std::fopen(o.dump_h.c_str(), "wb");
+            if (!f || std::fwrite(hh.data(), 1, hh.size(), f) != hh.size()) die("cannot write " + o.dump_h);
+            std::fclose(f);
+        }
         if (!o.dump_y.empty()) {
             FILE* f = std::fopen(o.dump_y.c_str(), "wb");
             if (!f || std::fwrite(y1.data(), 1, y1.size(), f) != y1.size()) die("cannot write " + o.dump_y);
