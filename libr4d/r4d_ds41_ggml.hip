@@ -3716,8 +3716,7 @@ int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long 
         /* lever GPF (r4d_ds41_ggml_pf.hip): the stock kernel's arithmetic in another tile geometry when switched on
          * or pinned, for the shapes its rule names (it declines the rest to the stock launch below); the same bits. */
         if (r4d_gg_pf_on()) {
-            const R4dGgPfCall c{ ty, logits, (const uint16_t*)x->data, x_ld, (const uint8_t*)w->data, w_ld, y->data, y_ld,
-                                 (int)M, (int)N, (int)K };
+            const R4dGgPfCall c{ ty, logits, xd, x_ld, wd, w_ld, yd, y_ld, (int)M, (int)N, (int)K };
             const int pf = r4d_gg_pf_gemm(s, c);
             if (pf != R4D_GG_PF_DECLINE) return pf;
         }
