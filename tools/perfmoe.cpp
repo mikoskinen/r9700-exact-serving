@@ -124,6 +124,7 @@ double unif() { return ((double)(rnd() >> 11) + 0.5) * (1.0 / 9007199254740992.0
 
 RadParam PI(const char* k, long long v) { RadParam p = RAD_INT(k, v); return p; }
 RadParam PS(const char* k, const char* v) { RadParam p = RAD_STR(k, v); return p; }
+RadParam PD(const char* k, double v) { RadParam p = RAD_F64(k, v); return p; }
 RadTensor T(void* d, uint32_t dt, std::vector<int64_t> s) {
     RadTensor t;
     std::memset(&t, 0, sizeof t);
@@ -196,7 +197,8 @@ struct Opts {
     bool split_seed = false;  // --split-seed: data reseeded after the draw (fn4 P2x pass-size byte compare)
     std::string dump_sorted, dump_y_r4d;   // --dump-sorted / --dump-y-r4d FILE
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
-    int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
+    int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 or 2.5 (tagged; libr4d's side is its w4 form whatever K is)
+    double limit = 0;         // --limit L (fn4 DS variant): gate_up's SwiGLU clamp (v8), and the fused op's (v11); 0 none
     int a_rot = 0;            // --a-rot 1 (with --chain; or --op gate_up: the GEMM alone over xr): the v4 decode form, moe_exl3_prep_gu -> gate_up(a_rot 1) -> down       // --chain: the routed-expert CHAIN a layer -- exl3r4d gate_up -> down; libr4d gate_up ->
                               // gated_had_quant_fp8 -> down (the served baseline block's three launches)           // --pooled P: P% of each class's experts (the least routed) read from mapped host memory            // --h-rot 1: interface v3 EPI 1 (gate_up writes h rotated for down; down reads it so) // --dump-stamps: print exl3r4d's EXL3R4D_TSTAMP phase stamps (a timing-only build)   // --rand-data: x random, suh / suh.1 random +-1, svh random (the default: constants)
 };
@@ -403,7 +405,11 @@ int main(int argc, char** argv) {
         else if (a == "--skew") o.skew = std::atof(nx());
         else if (a == "--group") g_group = std::atoll(nx());
         else if (a == "--group-mix") g_group_mix = std::atof(nx());
-        else if (a == "--bits") o.bits = std::atoi(nx());
+        else if (a == "--bits") {   // fn4 DS variant: "2.5" is the half-integer K (tagged EXL3_HALF(2))
+            const std::string v = nx();
+            o.bits = v == "2.5" ? EXL3_HALF(2) : std::atoi(v.c_str());
+        }
+        else if (a == "--limit") o.limit = std::atof(nx());
         else if (a == "--a-rot") o.a_rot = std::atoi(nx());
         else if (a == "--arena") g_arena_bytes = (size_t)std::atof(nx()) * (1ull << 30);
         else if (a == "--experts") o.E = std::atoll(nx());
@@ -421,7 +427,8 @@ int main(int argc, char** argv) {
     if (o.tp != 1 && o.tp != 2 && o.tp != 4) die("--tp is 1, 2 or 4");
     if (o.rank < 0 || o.rank >= o.tp) die("--rank is below --tp");
     if (o.mod4 && o.tp != 4) die("--mod4 is the four-rank split (--tp 4)");
-    if (o.bits < 2 || o.bits > 6) die("--bits is 2..6");
+    if ((o.bits < 2 || o.bits > 6) && o.bits != EXL3_HALF(2)) die("--bits is 2..6 or 2.5");
+    if (o.limit < 0) die("--limit is >= 0 (0: no SwiGLU clamp)");
     if (o.ep < 1 || o.ep > 64 || o.ep_rank < -1 || o.ep_rank >= o.ep) die("--ep is 1..64, --ep-rank below it (or -1)");
     if (o.ep > 1 && (o.tp != 1 || o.mod4)) die("--ep splits whole experts: --tp 1 (the rank's widths are whole)");
     if (o.x3map && (!o.chain || o.mod4)) die("--x3map needs --chain (two classes)");
@@ -437,7 +444,7 @@ int main(int argc, char** argv) {
     }
     if (g_group < 1 || g_group_mix < 0 || g_group_mix > 1) die("--group is >= 1, --group-mix 0..1");
     char kdt[16];
-    std::snprintf(kdt, sizeof kdt, "exl3k%d", o.bits);
+    std::snprintf(kdt, sizeof kdt, "%s", exl3_gemm_dtype(o.bits));
     const bool gu = o.op == "gate_up";
     // This rank's widths a class -- the architecture's split (qwen4exp_exl3.cpp): the expert's 128-blocks cut over the
     // ranks, the rank taking an extra block rotating with the class. tp1 every expert whole; tp2 rank 0 holds 3 of 5
@@ -596,7 +603,7 @@ int main(int argc, char** argv) {
             for (int c = 0; c < nc; ++c)
                 for (int64_t e = c; e < o.E; e += nc)
                     if (route[(size_t)l].rows[(size_t)e])
-                        b += exl3 ? (double)(R_[c] * C_[c] * o.bits / 8) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
+                        b += exl3 ? (double)(R_[c] * C_[c] * exl3_k2(o.bits) / 16) + 2.0 * ((g ? 2 : 1) * C_[c] + R_[c])
                                   : (double)(R_[c] * C_[c] / 2 + R_[c] * 2 * C_[c] / 128);
             return b;
         };
@@ -612,6 +619,7 @@ int main(int argc, char** argv) {
             cls_params(G.p, Rg, Cg);
             G.p.push_back(PI("h_rot", o.h_rot));
             G.p.push_back(PI("a_rot", o.a_rot));
+            if (o.limit > 0) G.p.push_back(PD("limit", o.limit));   // v8 gate_up clamp (fn4 DS variant)
             Lib P{ "exl3r4d prep_gu", o.a_rot ? row_of(o.exl3.c_str(), pn.c_str()) : nullptr, {}, {}, {} };
             P.p = { PI("M", o.M), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk), PS("dtype", kdt) };
             prep_params(P.p, Cg);
@@ -658,7 +666,7 @@ int main(int argc, char** argv) {
                 };
                 for (int c = 0; c < nc; ++c) {
                     for (auto& v : nb) v = nullptr;
-                    const size_t cbg = (size_t)(Rg[c] * Cg[c] * o.bits / 8), cbd = (size_t)(Rd[c] * Cd[c] * o.bits / 8);
+                    const size_t cbg = (size_t)(Rg[c] * Cg[c] * exl3_k2(o.bits) / 16), cbd = (size_t)(Rd[c] * Cd[c] * exl3_k2(o.bits) / 16);
                     auto rb = [](size_t b) { return [b](int64_t n) { return random_buf(b * (size_t)n); }; };
                     auto ft = [&](int64_t w, float v, int kind) { return [&f16t, w, v, kind](int64_t n) { return f16t((size_t)(w * n), v, kind); }; };
                     pg[(size_t)q][c][0] = TAB(tab(c, 0, cbg, rb(cbg)), kDtTrellis, { nec[c], Rg[c], Cg[c] });
@@ -714,6 +722,7 @@ int main(int argc, char** argv) {
                 F.p = { PI("M", o.M), PI("N", Rg[0]), PI("K", Cg[0]), PI("n_expert", o.E), PI("top_k", o.topk),
                         PS("dtype", kdt), PS("codebook", "mul1") };
                 cls_params(F.p, Rg, Cg);
+                if (o.limit > 0 && !o.mod4) F.p.push_back(PD("limit", o.limit));   // v11 (fn4 DS variant)
                 g_gd_y = dalloc((size_t)(Tr * o.hidden * 2));
                 const Exl3Positions* fpos = exl3_positions(o.mod4 ? EXL3_GU_DN4 : EXL3_GU_DN);
                 for (int l = 0; l < o.layers; ++l) {
@@ -815,6 +824,7 @@ int main(int argc, char** argv) {
         // without the prep kernel in front -- the decode band's gate_up dispatch as the arch issues it
         const bool arot = gu && o.a_rot;
         if (gu) L.p.push_back(PI("a_rot", arot ? 1 : 0));
+        if (gu && o.limit > 0) L.p.push_back(PD("limit", o.limit));
         const Exl3Positions* spos = exl3_positions(sop);
         const int64_t xrows = arot ? Tr : Ma, xw = arot ? 2 * xcols : xcols;
         void* x = o.rand_data ? f16_rand((size_t)(xrows * xw), 1.0f, 0) : f16_buf((size_t)(xrows * xw), 0.5f);
@@ -823,7 +833,7 @@ int main(int argc, char** argv) {
         std::vector<std::array<std::array<RadTensor, 5>, EXL3_MAX_CLS>> pool((size_t)o.pools);
         for (auto& pc : pool)
             for (int c = 0; c < nc; ++c) {
-                const size_t cb = (size_t)(R[c] * C[c] * o.bits / 8);
+                const size_t cb = (size_t)(R[c] * C[c] * exl3_k2(o.bits) / 16);
                 void* codes = random_buf(cb * (size_t)nec[c]);
                 void* suh = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
                 void* suh1 = o.rand_data ? f16_rand((size_t)(C[c] * nec[c]), 1.0f, 1) : f16_buf((size_t)(C[c] * nec[c]), 0.01f);
@@ -848,7 +858,7 @@ int main(int argc, char** argv) {
             double bytes = 0;
             for (int c = 0; c < nc; ++c)
                 for (int64_t e = c; e < o.E; e += nc)
-                    if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] * o.bits / 8) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
+                    if (rt.rows[(size_t)e]) bytes += (double)(R[c] * C[c] * exl3_k2(o.bits) / 16) + 2.0 * ((gu ? 2 : 1) * C[c] + R[c]);
             L.bytes.push_back(bytes);
             std::vector<RadTensor> t((size_t)spos->n_opd);   // the op's schema order (include/exl3_abi.h)
             t[(size_t)spos->x] = T(x, RAD_F16, { xrows, xw });
