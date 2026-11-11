@@ -25,6 +25,7 @@
 
 #include "mm/media.h"
 #include "server/oai.h"
+#include "format/radfile.h"
 
 #include <nlohmann/json.hpp>
 
@@ -3763,6 +3764,93 @@ TEST(nemotron35_rerank_real_weights_match_native_scores_and_rankings) {
         if (const char* output = std::getenv("RAD_NEMOTRON_RERANK_SERVER_LOG"))
             REQUIRE(tiny::write_text(output, s.output()));
     }
+}
+
+/* Lever DA (ds41-da, 11.11.2026): RADIANCE_KLD_DUMP writes a named buffer's rows beside a --kld-record reference, row r of
+ * the dump at the reference's row r; RADIANCE_WEIGHT_OVERLAY replaces whole planes of container entries as the load sweep
+ * reads them. The dump: every reference row written, the file exactly rows x row bytes, a manifest last, the same bytes on
+ * a second identical run, and a name no buffer answers to refused. The overlay: the container's own bytes record the
+ * reference's numbers, other bytes change them, and an entry the container does not hold is refused at startup. */
+TEST(lever_da_kld_dump_and_weight_overlay) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const std::vector<std::string> shape = { "--max-num-batched-tokens", "512", "--max-num-seqs", "1" };
+    /* The dump: the llama's residual rows ("x", [max_tok, n_embd]). */
+    tiny::TempDir d("e2e_da");
+    REQUIRE(d.ok());
+    std::vector<std::string> a = { "--kld-record", d / "r1", "--kld-corpus", w.corpus_short };
+    a.insert(a.end(), shape.begin(), shape.end());
+    Ran r1 = radiance(w.llama_rad, a, { "RADIANCE_KLD_DUMP=x" });
+    REQUIRE_RAN(r1);
+    CHECK(has(r1.log, "RADIANCE_KLD_DUMP x"));
+    const json m = json::parse(tiny::read_text((d / "r1") + "/dump-x.json"), nullptr, false);
+    REQUIRE(m.is_object());
+    const json k = json::parse(tiny::read_text((d / "r1") + "/kld.json"), nullptr, false);
+    REQUIRE(k.is_object());
+    const int64_t rows = m.value("rows", (int64_t)-1), rb = m.value("row_bytes", (int64_t)-1);
+    const int64_t ref_rows = k.value("rows", (int64_t)-2);
+    fprintf(stderr, "    dump: %lld rows of %lld bytes, the reference %lld rows\n", (long long)rows, (long long)rb,
+            (long long)ref_rows);
+    CHECK(rows > 0);
+    CHECK_EQ(rows, ref_rows);
+    const std::string bin1 = tiny::read_text((d / "r1") + "/dump-x.bin");
+    CHECK_EQ((int64_t)bin1.size(), rows * rb);
+    a[1] = d / "r2";
+    Ran r2 = radiance(w.llama_rad, a, { "RADIANCE_KLD_DUMP=x" });
+    REQUIRE_RAN(r2);
+    CHECK(tiny::read_text((d / "r2") + "/dump-x.bin") == bin1);
+    a[1] = d / "r3";
+    Ran r3 = radiance(w.llama_rad, a, { "RADIANCE_KLD_DUMP=no_such_buffer" });
+    CHECK(r3.status != 0);
+    CHECK(has(r3.log, "declared no buffer of that name"));
+
+    /* The overlay: a single-plane norm gain of the container. */
+    rad::RadFile f;
+    REQUIRE_EQ(f.open(w.llama_rad.c_str()), 0);
+    const RadFileEntry* pick = nullptr;
+    for (int64_t i = 0; i < f.entry_count() && !pick; ++i) {
+        const RadFileEntry& e = f.entry(i);
+        const std::string nm = f.str(e.name);
+        if (e.n_planes == 1 && e.rank == 1 && nm.find("norm") != std::string::npos) pick = &e;
+    }
+    REQUIRE(pick != nullptr);
+    const std::string name = f.str(pick->name);
+    const RadFilePlane& pl = f.plane(*pick, 0);
+    std::string same((const char*)f.data(pl), (size_t)pl.bytes);
+    fprintf(stderr, "    overlay entry %s, %llu bytes\n", name.c_str(), (unsigned long long)pl.bytes);
+    auto overlay = [&](const std::string& path, const std::string& ename, const std::string& bytes) {
+        std::string o("RADOVL1\n");
+        const uint32_t n = 1, nl = (uint32_t)ename.size();
+        const uint64_t nb = bytes.size();
+        o.append((const char*)&n, 4);
+        o.append((const char*)&nl, 4);
+        o += ename;
+        o.append((const char*)&nb, 8);
+        o += bytes;
+        return tiny::write_text(path, o);
+    };
+    std::string rlog;
+    const std::string ref = w.reference(w.llama_rad, w.corpus_short, &rlog);
+    REQUIRE(!ref.empty());
+    REQUIRE(overlay(d / "same.ovl", name, same));
+    a[1] = d / "o1";
+    Ran o1 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_OVERLAY=" + (d / "same.ovl") });
+    REQUIRE_RAN(o1);
+    CHECK(has(o1.log, "weight overlay: all 1 entries applied"));
+    std::string why;
+    CHECK(same_recording(ref, d / "o1", &why));
+    std::string other = same;
+    for (size_t i = 0; i + 1 < other.size(); i += 2) other[i + 1] = (char)(other[i + 1] ^ 0x01);   /* every value moved */
+    REQUIRE(overlay(d / "other.ovl", name, other));
+    a[1] = d / "o2";
+    Ran o2 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_OVERLAY=" + (d / "other.ovl") });
+    REQUIRE_RAN(o2);
+    CHECK(!same_recording(ref, d / "o2", &why));
+    REQUIRE(overlay(d / "bad.ovl", "no.such.weight", same));
+    a[1] = d / "o3";
+    Ran o3 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_OVERLAY=" + (d / "bad.ovl") });
+    CHECK(o3.status != 0);
+    CHECK(has(o3.log, "is not an entry of the container"));
 }
 
 RAD_TEST_MAIN()

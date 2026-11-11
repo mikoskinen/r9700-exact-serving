@@ -44,6 +44,8 @@ using IqrGpuRelayout = int (*)(const void*, void*, int64_t, int64_t, uint32_t, u
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <numeric>
@@ -2854,6 +2856,102 @@ private:
     int status_ = RAD_OK;
 };
 
+/* Lever DA (11.11.2026): RADIANCE_WEIGHT_OVERLAY=FILE -- whole planes of container entries replaced by FILE's bytes as the
+ * sweep reads them, before any copy or relayout sees the window: a weight's every rank, share and stored form then come
+ * from the overlay, and the container on disk is never written. FILE: "RADOVL1\n", a u32 count, then per entry a u32 name
+ * length, the name, a u64 byte count and the bytes -- one plane of a single-plane (plain) entry of exactly that many
+ * bytes. Every entry must exist and be read whole by the sweep, or the start is refused (a weight the sweep does not read,
+ * e.g. one on the mapped tier, cannot be overlaid). Unset: no overlay, the sweep reads the container as before. */
+struct OverlayPatch {
+    std::string          name;
+    int64_t              foff = 0;
+    std::vector<uint8_t> bytes;
+    int64_t              applied = 0;
+};
+
+static int load_weight_overlay(const RadFile* file, std::vector<OverlayPatch>* out) {
+    out->clear();
+    const char* path = std::getenv("RADIANCE_WEIGHT_OVERLAY");
+    if (!path || !*path) return RAD_OK;
+    FILE* f = std::fopen(path, "rb");
+    if (!f) {
+        RAD_ERR("RADIANCE_WEIGHT_OVERLAY=%s: cannot be read: %s", path, std::strerror(errno));
+        return RAD_E_IO;
+    }
+    auto fail = [&](const char* what) {
+        RAD_ERR("RADIANCE_WEIGHT_OVERLAY=%s: %s", path, what);
+        std::fclose(f);
+        out->clear();
+        return RAD_E_FORMAT;
+    };
+    char magic[8];
+    uint32_t n = 0;
+    if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "RADOVL1\n", 8) != 0) return fail("not an overlay (magic)");
+    if (std::fread(&n, 4, 1, f) != 1 || n == 0 || n > 100000) return fail("bad entry count");
+    int64_t total = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t nl = 0;
+        uint64_t nb = 0;
+        if (std::fread(&nl, 4, 1, f) != 1 || nl == 0 || nl > 4096) return fail("bad name length");
+        std::string name(nl, '\0');
+        if (std::fread(name.data(), 1, nl, f) != nl || std::fread(&nb, 8, 1, f) != 1) return fail("truncated entry header");
+        const RadFileEntry* e = file->find(name);
+        if (!e) {
+            RAD_ERR("RADIANCE_WEIGHT_OVERLAY=%s: '%s' is not an entry of the container", path, name.c_str());
+            std::fclose(f);
+            out->clear();
+            return RAD_E_NOTFOUND;
+        }
+        const RadEncoding& enc = file->encoding(*e);
+        if (e->n_planes != 1 || enc.n_planes != 1) {
+            RAD_ERR("RADIANCE_WEIGHT_OVERLAY=%s: '%s' has %u planes; only a single-plane (plain) entry is overlaid", path,
+                    name.c_str(), (unsigned)e->n_planes);
+            std::fclose(f);
+            out->clear();
+            return RAD_E_FORMAT;
+        }
+        const RadFilePlane& pl = file->plane(*e, 0);
+        if (nb != pl.bytes) {
+            RAD_ERR("RADIANCE_WEIGHT_OVERLAY=%s: '%s' carries %llu bytes and the container's plane %llu", path, name.c_str(),
+                    (unsigned long long)nb, (unsigned long long)pl.bytes);
+            std::fclose(f);
+            out->clear();
+            return RAD_E_FORMAT;
+        }
+        OverlayPatch p;
+        p.name = name;
+        p.foff = (int64_t)pl.offset;
+        p.bytes.resize((size_t)nb);
+        if (std::fread(p.bytes.data(), 1, (size_t)nb, f) != (size_t)nb) return fail("truncated entry bytes");
+        total += (int64_t)nb;
+        out->push_back(std::move(p));
+    }
+    uint8_t extra;
+    if (std::fread(&extra, 1, 1, f) == 1) return fail("bytes past the last entry");
+    std::fclose(f);
+    std::sort(out->begin(), out->end(), [](const OverlayPatch& a, const OverlayPatch& b) { return a.foff < b.foff; });
+    for (size_t i = 1; i < out->size(); ++i)
+        if ((*out)[i].foff < (*out)[i - 1].foff + (int64_t)(*out)[i - 1].bytes.size()) {
+            RAD_ERR("RADIANCE_WEIGHT_OVERLAY=%s: '%s' and '%s' overlap", path, (*out)[i - 1].name.c_str(),
+                    (*out)[i].name.c_str());
+            out->clear();
+            return RAD_E_FORMAT;
+        }
+    RAD_INFO("weight overlay: %zu entries, %.1f MiB replace the container's bytes as the sweep reads them "
+             "(RADIANCE_WEIGHT_OVERLAY=%s)", out->size(), total / 1048576.0, path);
+    return RAD_OK;
+}
+
+/* The overlay's bytes over a window holding file bytes [c0, c1) at `at`. */
+static void apply_weight_overlay(std::vector<OverlayPatch>& ov, int64_t c0, int64_t c1, uint8_t* at) {
+    for (OverlayPatch& p : ov) {
+        const int64_t a = std::max<int64_t>(p.foff, c0), z = std::min<int64_t>(p.foff + (int64_t)p.bytes.size(), c1);
+        if (z <= a) continue;
+        std::memcpy(at + (a - c0), p.bytes.data() + (a - p.foff), (size_t)(z - a));
+        p.applied += z - a;
+    }
+}
+
 /* One pass over the container, serving every rank. The runs (declaration order, grouped by rank)
  * are sorted by file offset into one front-to-back sweep: read a window, hand it to every rank
  * that wants a piece, move on.
@@ -2874,6 +2972,8 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            int64_t* read_out) {
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
+    std::vector<OverlayPatch> overlay;
+    RAD_TRY(load_weight_overlay(file, &overlay));
 
     /* Sort by file offset into a reading order; the span tie-break makes the order total, so the
      * same load always issues copies in the same sequence. */
@@ -2962,6 +3062,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
             read_bytes += c1 - c0;
             if (!dio.direct()) file->drop_range(c0, c1 - c0);
             *at = w + (c0 - a0);
+            if (!overlay.empty()) apply_weight_overlay(overlay, c0, c1, w + (c0 - a0));
             return RAD_OK;
         };
 
@@ -3091,6 +3192,14 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         /* The last host synchronisation before serving (spec §5.4). */
         for (size_t k = 0; k < nr; ++k) RAD_TRY(rad_stream_sync(st[k]));
         for (int b = 0; b < kWin; ++b) pool->drain(b);
+        /* RADIANCE_WEIGHT_OVERLAY: every entry read whole, or the start is refused. */
+        for (const OverlayPatch& p : overlay)
+            if (p.applied != (int64_t)p.bytes.size()) {
+                RAD_ERR("weight overlay: '%s' was read for %lld of its %zu bytes; a weight the sweep does not read whole "
+                        "cannot be overlaid", p.name.c_str(), (long long)p.applied, p.bytes.size());
+                return RAD_E_STATE;
+            }
+        if (!overlay.empty()) RAD_INFO("weight overlay: all %zu entries applied", overlay.size());
 
         const double s = std::chrono::duration<double>(
                              std::chrono::steady_clock::now() - t0).count();

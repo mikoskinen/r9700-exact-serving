@@ -7,14 +7,55 @@
 #include "server/sink.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 namespace rad {
+
+/* Lever DA (11.11.2026): RADIANCE_KLD_DUMP=NAME[,NAME...] beside --kld-record -- each named rank-0 buffer's rows of every
+ * scored position, written to DIR/dump-NAME.bin at the reference's own row (row r at byte r * row_bytes, the rows
+ * top.bin / rows.f32 hold), and DIR/dump-NAME.json once every row is written. A buffer is named as RADIANCE_DUMP_BUF names
+ * one (the whole name or its trailing scope components); it must be [>= max_tok rows, ...] and hold the step's token rows
+ * after the step (a PERSIST buffer: deepseek41's dspark_main_normed under RADIANCE_DS41_DA_TAPS=1). Unset: nothing. */
+namespace {
+struct KldDump {
+    std::string name, path;
+    rad_buf     buf = 0;
+    uint32_t    dtype = 0;
+    int64_t     row_bytes = 0, cols = 0, written = 0;
+    int         fd = -1;
+    uint8_t*    host = nullptr;
+    std::vector<char> seen;
+};
+std::vector<KldDump> g_kld_dump;
+
+bool kld_dump_answers(const std::string& name, const std::string& want) {
+    if (name.size() < want.size() || name.compare(name.size() - want.size(), want.size(), want) != 0) return false;
+    return name.size() == want.size() || name[name.size() - want.size() - 1] == '.';
+}
+
+void kld_dump_close() {
+    for (KldDump& k : g_kld_dump) {
+        if (k.fd >= 0) ::close(k.fd);
+        if (k.host) rad_dev_free(k.host, RAD_MEM_HOST_PINNED);
+        k.fd = -1;
+        k.host = nullptr;
+    }
+    g_kld_dump.clear();
+}
+}  // namespace
 
 /* Every request of a corpus run through the scheduler, each reaped once its sink is done; the
  * documents that ended in an error go to *bad. With `fit_pool`, a request is submitted only while
@@ -148,6 +189,58 @@ int Engine::run_kld() {
 
     auto kld = std::make_unique<Kld>();
     RAD_TRY(kld->open(cfg_, vocab_, nv, cfg_.model));
+    /* RADIANCE_KLD_DUMP (lever DA): resolve each named buffer on rank 0 and create its file beside the reference. */
+    kld_dump_close();
+    if (const char* names = std::getenv("RADIANCE_KLD_DUMP"); names && *names) {
+        if (!kld->recording()) {
+            RAD_ERR("kld: RADIANCE_KLD_DUMP writes beside a --kld-record reference; this run scores one");
+            return RAD_E_INVAL;
+        }
+        const Program& p0 = ranks_[0]->program;
+        for (const char* q = names; *q;) {
+            const char* e = q;
+            while (*e && *e != ',') ++e;
+            std::string want(q, (size_t)(e - q));
+            q = *e ? e + 1 : e;
+            if (want.empty()) continue;
+            KldDump k;
+            for (size_t i = 1; i < p0.buffers.size(); ++i) {
+                const BufferInfo& bi = p0.buffers[i];
+                if (!kld_dump_answers(bi.name, want)) continue;
+                if (bi.decl.rank != 2 || bi.decl.shape[0] < cfg_.max_tok || bi.bytes <= 0) {
+                    RAD_ERR("kld: RADIANCE_KLD_DUMP %s is %s, not [>= %lld rows, columns]", want.c_str(), bi.name.c_str(),
+                            (long long)cfg_.max_tok);
+                    return RAD_E_INVAL;
+                }
+                k.name = want;
+                k.buf = (rad_buf)i;
+                k.dtype = bi.decl.dtype;
+                k.cols = bi.decl.shape[1];
+                k.row_bytes = bi.bytes / bi.decl.shape[0];
+                break;
+            }
+            if (!k.buf) {
+                RAD_ERR("kld: RADIANCE_KLD_DUMP names %s and rank 0 declared no buffer of that name (did the plugin's "
+                        "switch that declares it reach the container?)", want.c_str());
+                kld_dump_close();
+                return RAD_E_NOTFOUND;
+            }
+            k.path = kld->dir() + "/dump-" + want + ".bin";
+            k.fd = ::open(k.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            k.host = static_cast<uint8_t*>(rad_dev_alloc(cfg_.max_tok * k.row_bytes, RAD_MEM_HOST_PINNED));
+            if (k.fd < 0 || !k.host || ::ftruncate(k.fd, (off_t)(kld->n_rows() * k.row_bytes)) != 0) {
+                RAD_ERR("kld: RADIANCE_KLD_DUMP %s: cannot create %s (%lld rows of %lld bytes) or its staging: %s",
+                        want.c_str(), k.path.c_str(), (long long)kld->n_rows(), (long long)k.row_bytes, std::strerror(errno));
+                g_kld_dump.push_back(std::move(k));
+                kld_dump_close();
+                return RAD_E_IO;
+            }
+            k.seen.assign((size_t)kld->n_rows(), 0);
+            RAD_INFO("kld: RADIANCE_KLD_DUMP %s (rank 0 buffer, %lld bytes a row) -> %s, %lld rows aligned to the reference",
+                     want.c_str(), (long long)k.row_bytes, k.path.c_str(), (long long)kld->n_rows());
+            g_kld_dump.push_back(std::move(k));
+        }
+    }
     /* Published before add_all takes the scheduler's lock; the step loop reads it only on steps
      * planned under that lock afterwards. */
     kld_ = std::move(kld);
@@ -229,8 +322,36 @@ int Engine::run_kld() {
                 "twice; the reference is written, the statistics are not to be used",
                 (long long)sched_.metrics().preemptions);
         RAD_TRY(kld_->finish());
+        kld_dump_close();
         return RAD_E_STATE;
     }
+    /* RADIANCE_KLD_DUMP: every reference row must have its dump row; the manifest is written last. */
+    for (KldDump& k : g_kld_dump) {
+        int64_t miss = 0;
+        for (char c : k.seen) miss += c ? 0 : 1;
+        if (::fsync(k.fd) != 0) miss = -1;
+        if (miss) {
+            RAD_ERR("kld: RADIANCE_KLD_DUMP %s: %lld of %lld rows not written", k.name.c_str(), (long long)miss,
+                    (long long)k.seen.size());
+            kld_dump_close();
+            return RAD_E_STATE;
+        }
+        const std::string mp = kld_->dir() + "/dump-" + k.name + ".json";
+        FILE* f = std::fopen(mp.c_str(), "w");
+        const bool ok = f && std::fprintf(f, "{\"format\": \"radiance-kld-dump-1\", \"name\": \"%s\", \"dtype\": %u, "
+                                             "\"cols\": %lld, \"row_bytes\": %lld, \"rows\": %lld, \"file\": \"dump-%s.bin\"}\n",
+                                          k.name.c_str(), (unsigned)k.dtype, (long long)k.cols, (long long)k.row_bytes,
+                                          (long long)k.seen.size(), k.name.c_str()) > 0;
+        if (f) std::fclose(f);
+        if (!ok) {
+            RAD_ERR("kld: RADIANCE_KLD_DUMP %s: cannot write %s", k.name.c_str(), mp.c_str());
+            kld_dump_close();
+            return RAD_E_IO;
+        }
+        RAD_INFO("kld: RADIANCE_KLD_DUMP %s: %lld rows (%lld row writes) in %s", k.name.c_str(), (long long)k.seen.size(),
+                 (long long)k.written, k.path.c_str());
+    }
+    kld_dump_close();
     return kld_->finish();
 }
 
@@ -304,6 +425,45 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
         RAD_ERR("kld: step %d names %lld scored rows and its plan %lld", b->step, (long long)n,
                 (long long)row);
         return RAD_E_STATE;
+    }
+    /* RADIANCE_KLD_DUMP: the step's token rows of each named rank-0 buffer, each scored position's row at its reference
+     * row. The plan's entries lay their tokens out in entry order (core/sched/batch.cpp), so a scored entry's first
+     * token row is the sum of the tokens of every entry before it. */
+    if (!g_kld_dump.empty() && b->n_tok > 0) {
+        Rank& r0 = *ranks_[0];
+        RAD_TRY(rad_dev_set(r0.device));
+        const int64_t T = std::min<int64_t>(b->n_tok, cfg_.max_tok);
+        for (KldDump& k : g_kld_dump) {
+            const auto* src = static_cast<const uint8_t*>(r0.ctx.buf_ptr(k.buf));
+            if (!src) return RAD_E_STATE;
+            RAD_TRY(rad_memcpy_async(k.host, src, T * k.row_bytes, r0.ctx.stream()));
+        }
+        RAD_TRY(rad_stream_sync(r0.ctx.stream()));
+        int64_t at = 0;
+        for (const StepEntry& e : plan.e) {
+            const int64_t a0 = at;
+            at += e.n_tokens;
+            if (!(e.req && e.req->score && e.is_prefill && e.hidden_row < 0)) continue;
+            for (int64_t j = 0; j < e.n_tokens && a0 + j < T; ++j) {
+                const int64_t rr = kld_->row_of(e.req->id, (int64_t)e.ctx_len + j);
+                if (rr < 0) continue;
+                for (KldDump& k : g_kld_dump) {
+                    const uint8_t* h = k.host + (a0 + j) * k.row_bytes;
+                    if (::pwrite(k.fd, h, (size_t)k.row_bytes, (off_t)(rr * k.row_bytes)) != (ssize_t)k.row_bytes) {
+                        RAD_ERR("kld: RADIANCE_KLD_DUMP %s: writing row %lld: %s", k.name.c_str(), (long long)rr,
+                                std::strerror(errno));
+                        return RAD_E_IO;
+                    }
+                    k.seen[(size_t)rr] = 1;
+                    ++k.written;
+                }
+            }
+        }
+        if (at != b->n_tok) {
+            RAD_ERR("kld: RADIANCE_KLD_DUMP: step %d's plan lays out %lld token rows and the batch %lld", b->step,
+                    (long long)at, (long long)b->n_tok);
+            return RAD_E_STATE;
+        }
     }
     for (size_t r = 0; r < kld_width_.size(); ++r) {
         Rank& rk = *ranks_[r];

@@ -313,14 +313,29 @@ int Kld::load_corpus(const std::string& path, const std::shared_ptr<const Vocab>
             RAD_ERR("kld: %s line %lld is not JSON: %s", corpus_.c_str(), (long long)lineno, e.what());
             return RAD_E_FORMAT;
         }
-        if (!j.contains("prompt") || !j["prompt"].is_string()) {
+        /* {"ids": [...]} (lever DA, 11.11.2026): a document given as token ids, taken as they are -- a
+         * reply's own ids after its prompt's, which a re-tokenisation of the text need not reproduce. */
+        const bool by_ids = j.contains("ids") && j["ids"].is_array();
+        if (!by_ids && (!j.contains("prompt") || !j["prompt"].is_string())) {
             RAD_ERR("kld: %s line %lld has no \"prompt\" string", corpus_.c_str(), (long long)lineno);
             return RAD_E_FORMAT;
         }
         /* Tokenised as the server tokenises a rendered template: control tokens parsed, nothing
          * prepended. */
         std::vector<int32_t> ids;
-        RAD_TRY(tok.encode(j["prompt"].get<std::string>(), ids, false, true));
+        if (by_ids) {
+            const int64_t nv = vocab ? (int64_t)vocab->n_tokens() : 0;
+            for (const auto& v : j["ids"]) {
+                if (!v.is_number_integer() || v.get<int64_t>() < 0 || (nv > 0 && v.get<int64_t>() >= nv)) {
+                    RAD_ERR("kld: %s line %lld: \"ids\" holds a value that is not a token id", corpus_.c_str(),
+                            (long long)lineno);
+                    return RAD_E_FORMAT;
+                }
+                ids.push_back((int32_t)v.get<int64_t>());
+            }
+        } else {
+            RAD_TRY(tok.encode(j["prompt"].get<std::string>(), ids, false, true));
+        }
         const int64_t from = j.value("score_from", (int64_t)0);
         if (add_doc(j.value("source", std::string()), ids, from) < 0) {
             RAD_ERR("kld: %s line %lld: %zu tokens leave nothing to score from position %lld",

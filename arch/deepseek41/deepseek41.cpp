@@ -540,6 +540,11 @@ struct Model {
     /* The last layer's MoE all-reduce + pcn_fin as one collective (RADIANCE_DS41_AR_PCN=2), or 0. */
     rad_op ar_pcn_fin = 0;
     Dsp dsp{};
+    /* Lever DA's tap dump (RADIANCE_DS41_DA_TAPS=1, da_taps_env()): a serve WITHOUT the drafter (the KL mode, which runs at
+     * --num-speculative-tokens 0) still declares the drafter's trunk taps (dspark_src, the hc means at the target layers) and
+     * its context pass's projection main_x = main_norm(fc(src)) into dspark_main_normed (PERSIST, so the core can read it
+     * after the step: core/engine_kld.cpp RADIANCE_KLD_DUMP), issued at the end of every trunk step. Unset: nothing declared. */
+    bool da_taps = false;
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
     bool release = false;
@@ -1649,7 +1654,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     }
 
     /* ---- a DSpark target: the attention input's hc mean (model.py main_hiddens), after the Engram */
-    if (m.dsp.on && !m.zero)   /* the context pass is an attention rank's */
+    if ((m.dsp.on || m.da_taps) && !m.zero)   /* the context pass is an attention rank's (DA: the tap dump) */
         for (size_t j = 0; j < m.dsp.taps.size(); ++j)
             if (m.dsp.taps[j] == l) {
                 L.tap_col = (int)j;
@@ -2051,6 +2056,13 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
  * stages, and get no drafter. The official checkpoint's own stages (mtp.*, fp8 / MXFP4) reach a GGUF
  * trunk as one more split shard in these names, re-spelled value for value (BF16 linears, Q8_0 experts)
  * by a graft outside the tree, so they arrive here as any GGUF weight does. */
+/* Lever DA (11.11.2026): RADIANCE_DS41_DA_TAPS=1 declares the drafter's trunk taps and main_x in a serve without the drafter
+ * (Model::da_taps). Read at declare; unset or anything else = today's declare. */
+static bool da_taps_env() {
+    const char* e = std::getenv("RADIANCE_DS41_DA_TAPS");
+    return e && !std::strcmp(e, "1");
+}
+
 static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     auto& d = m.dsp;
     const auto& c = m.c;
@@ -2062,7 +2074,22 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
                     "stages (no nextn_predict_layers): no drafter", (long long)blk);
         return RAD_OK;
     }
-    if (!rad_ctx_draft_head(ctx)) return RAD_OK;   /* no speculation, or prompt lookup alone */
+    if (!rad_ctx_draft_head(ctx)) {   /* no speculation, or prompt lookup alone */
+        /* Lever DA's tap dump: the taps and main_x without the drafter (no stage, no cache, no query pass). */
+        if (da_taps_env()) {
+            d.taps = gl(meta, "dspark.target_layers");
+            std::sort(d.taps.begin(), d.taps.end());
+            bool ok = !d.taps.empty();
+            for (int64_t t : d.taps) ok = ok && t >= 0 && t < c.n_layer;
+            if (!ok) {
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DA_TAPS: the checkpoint's dspark.target_layers "
+                                "name no trunk layer\n");
+                return RAD_E_UNSUPPORTED;
+            }
+            m.da_taps = true;
+        }
+        return RAD_OK;
+    }
     if (ctx->max_spec != blk) {
         fprintf(stderr, "radiance: deepseek41: the DSpark drafter proposes a whole block of %lld tokens "
                         "(dspark.block_size, the length it was trained at) and this serve asks for %d; run "
@@ -2312,6 +2339,32 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
     return L.mix_a && L.col_a && L.post_a && L.mix_f && L.col_f && L.norm_f && L.post_f ? RAD_OK : RAD_E_INVAL;
+}
+
+/* Lever DA's tap dump (Model::da_taps): the context pass's first two ops over the trunk step's rows, after the head --
+ * main_x = main_norm(fc(src)) into dspark_main_normed, PERSIST so no later transient shares its bytes and the core reads
+ * the step's rows after it (RADIANCE_KLD_DUMP). The same weights, ops and arithmetic as dsp_declare's context pass. */
+static int da_taps_declare(RadBuilder* b, Model& m) {
+    auto& g = m.g;
+    auto& nm = m.nm;
+    const auto& c = m.c;
+    auto& d = m.dsp;
+    const int64_t T = g.max_tok, D = c.n_embd, nt = (int64_t)d.taps.size();
+    d.c = decl_b(b, nm.f("dspark_main"), RAD_BF16, { T, D });
+    d.cn = decl_b(b, nm.f("dspark_main_normed"), RAD_BF16, { T, D }, RAD_BUF_PERSIST);
+    d.fc = lw(b, m, nm.f("dspark.fc.weight"), D, nt * D, grp_model());
+    d.main_norm = wt(b, nm.f("dspark.enc.output_norm.weight"), RAD_F32, { D }, grp_model());
+    if (!d.c || !d.cn || !d.fc || !d.main_norm) return RAD_E_INVAL;
+    d.c_fc = linear(b, m, T, d.fc, D, nt * D, d.src, d.c);
+    d.c_norm = rmsnorm(b, m, T, d.main_norm, D, d.c, d.cn);
+    if (!d.c_fc || !d.c_norm) return RAD_E_INVAL;
+    rad_note(b, "lever DA tap dump (RADIANCE_DS41_DA_TAPS=1): the DSpark taps at layers %s into dspark_src and "
+                "main_x = main_norm(fc(src)) into dspark_main_normed (PERSIST) every trunk step; no drafter is declared",
+             [&] { std::string s; for (int64_t t : d.taps) s += (s.empty() ? "" : ",") + std::to_string(t); return s; }().c_str());
+    if (g.rank == 0)
+        fprintf(stderr, "radiance: deepseek41: lever DA tap dump: taps at %zu layers -> dspark_src, main_x -> "
+                        "dspark_main_normed every trunk step (RADIANCE_DS41_DA_TAPS=1; no drafter)\n", d.taps.size());
+    return RAD_OK;
 }
 
 /* Everything of the drafter past the trunk's head (declaration order is the buffer planner's
@@ -2755,7 +2808,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     DS_TRY(buffers(b, m));
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */
-    if (m.dsp.on && !m.zero &&
+    if ((m.dsp.on || m.da_taps) && !m.zero &&
         !(m.dsp.src = decl_b(b, nm.f("dspark_src"), RAD_BF16, { g.max_tok, (int64_t)m.dsp.taps.size() * c.n_embd })))
         return RAD_E_INVAL;
 
@@ -2935,6 +2988,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The drafter after everything the trunk step issues (llama_fp8's rule: declaration order is
      * liveness, and its passes run behind the step). */
     if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
+    else if (m.da_taps && !m.zero) DS_TRY(da_taps_declare(b, m));
     rad_note(b, "DeepSeek-V4.1: %lld layers, hc %lld, window %lld, %zu kv sources, %zu index "
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
@@ -3718,6 +3772,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
         RAD_ISSUE_N(x, m.head_op, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
                     brows(m.logits, batch->n_out));
+    }
+    /* Lever DA's tap dump: main_x of the step's rows (da_taps_declare), after everything the step reads. */
+    if (m.da_taps && m.dsp.c_fc) {
+        lin_issue(x, m, m.dsp.c_fc, T, brows(m.dsp.src, T), m.dsp.fc, brows(m.dsp.c, T));
+        RAD_ISSUE_N(x, m.dsp.c_norm, T, brows(m.dsp.c, T), RAD_W(m.dsp.main_norm), brows(m.dsp.cn, T));
     }
 }
 

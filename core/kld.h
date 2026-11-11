@@ -98,6 +98,16 @@ public:
     std::vector<int32_t> tokens(size_t d) const;
     int64_t n_rows() const { return n_rows_; }
     int64_t rows_done() const { return done_n_.load(std::memory_order_relaxed); }
+    /* The reference row of request `id`'s position `p` (id = document + 1), or -1 where the corpus
+     * scores none there -- the rows a dump beside the reference is aligned to (lever DA,
+     * RADIANCE_KLD_DUMP in engine_kld.cpp). */
+    int64_t row_of(uint64_t id, int64_t p) const {
+        if (id == 0 || id > docs_.size()) return -1;
+        const Doc& d = docs_[(size_t)(id - 1)];
+        return (p < d.score_from || p >= d.n - 1) ? -1 : d.row0 + p - d.score_from;
+    }
+    const std::string& dir() const { return dir_; }
+    bool recording() const { return record_; }
 
     /* A step's scored rows. Rows outside a document's scored range are skipped; a row seen twice
      * (re-prefill after preemption) is recomputed. Blocks until every row is written or scored,
