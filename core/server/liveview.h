@@ -91,6 +91,18 @@ struct ExpertPlane {
      * nothing. */
     int64_t flex_bytes = 0, flex_capacity = 0;
     bool    heat_enabled = false;  /* false = the plan is static and none of the above will move */
+    /* Every rank's own expert residency and traffic (everything above is rank 0's): units by tier, the trunk's
+     * (layers below the trunk's count) and a draft head's in VRAM apart, the heat engine's routed / resident
+     * selections and streamed bytes, and the trunk units in the drafter's lent slab (lever DL). Cumulative counters;
+     * readers take rates by subtracting two polls. */
+    struct Rank {
+        int     rank = 0;
+        int64_t vram_units = 0, pinned_units = 0, other_units = 0;
+        int64_t trunk_vram_units = 0, draft_vram_units = 0;
+        int64_t routed = 0, routed_resident = 0, stream_bytes = 0;
+        int64_t draft_lent_units = 0, flex_bytes = 0;
+    };
+    std::vector<Rank> ranks;
 };
 
 /* Interconnect traffic by consumer.

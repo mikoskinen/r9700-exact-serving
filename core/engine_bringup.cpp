@@ -33,6 +33,7 @@ using IqrGpuRelayout = int (*)(const void*, void*, int64_t, int64_t, uint32_t, u
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
 #include "runtime/arena.h"
+#include "runtime/fn4_switch.h"
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
 #include "sample/gbnf.h"
@@ -1967,20 +1968,35 @@ void Engine::probe_arena_levels() {
      * padding rows past a level; below it the rows must be proven per model, so the rung is offered
      * to deepseek41 only, at the rows its kernels were audited for (arena_decode_rows_ok: 8..64),
      * and the plugin sizes its indexer plane by the level (deepseek41.cpp ds41_arena_decode_rows). */
+    /* Lever Z0-A (ds41-z0): the variable takes a list ("8,48"), one rung a value. The largest is the rung
+     * today's decode and verify steps take (arena_dec_max_); a smaller one is chosen only under fn4
+     * arena_d0 1, by a step that verifies nothing and runs no head (arena_step). One value = today. */
+    arena_dec_max_ = 0;
+    arena_dec_rungs_ = 0;
     if (const char* e = getenv("RADIANCE_DS41_ARENA_DECODE_ROWS"); e && *e) {
-        const int64_t R = std::atoll(e);
-        std::string bad;
-        if (plugins_.arch_plugin != "deepseek41")
-            bad = fmt("the '%s' plugin's kernels were not audited for it (deepseek41 only)",
-                      plugins_.arch_plugin.c_str());
-        else if (!arena_decode_rows_ok(R, lo, &bad)) {}
-        else if (std::find(want.begin(), want.end(), R) == want.end()) {
-            want.push_back(R);
-            std::sort(want.begin(), want.end());
+        std::string junk;
+        const std::vector<int64_t> rs = arena_decode_rows_list(e, &junk);
+        if (!junk.empty())
+            RAD_WARN("activation arena: RADIANCE_DS41_ARENA_DECODE_ROWS=%s: '%s' is not a row count; ignored", e,
+                     junk.c_str());
+        for (const int64_t R : rs) {
+            std::string bad;
+            if (plugins_.arch_plugin != "deepseek41")
+                bad = fmt("the '%s' plugin's kernels were not audited for it (deepseek41 only)",
+                          plugins_.arch_plugin.c_str());
+            else if (!arena_decode_rows_ok(R, lo, &bad)) {}
+            else {
+                if (std::find(want.begin(), want.end(), R) == want.end()) {
+                    want.push_back(R);
+                    std::sort(want.begin(), want.end());
+                }
+                arena_dec_max_ = std::max(arena_dec_max_, R);
+                ++arena_dec_rungs_;
+            }
+            if (!bad.empty())
+                RAD_WARN("activation arena: RADIANCE_DS41_ARENA_DECODE_ROWS=%s: %lld rows is not used -- %s", e,
+                         (long long)R, bad.c_str());
         }
-        if (!bad.empty())
-            RAD_WARN("activation arena: RADIANCE_DS41_ARENA_DECODE_ROWS=%s is not used -- %s", e,
-                     bad.c_str());
     }
     arena_span_rows_ = 0;
     const int64_t span_rows = cfg_.prefill_span > 1 ? prefill_shared_tok(cfg_) : 0;
@@ -4677,6 +4693,20 @@ int Engine::start() {
             for (auto& r : ranks_) r->arena_lent.clear();
         }
     }
+    /* Lever Z0-A: arena_d0 can act only with a rung below the decode rung today's steps take. */
+    {
+        bool lower = false;
+        for (size_t k = 1; k < arena_rows_.size(); ++k)
+            if (arena_rows_[k] < arena_dec_max_) lower = true;
+        const bool cap = arena_dec_max_ > 0 && arena_dec_rungs_ >= 2 && lower;
+        fn4::arena_d0_register(cap);
+        arena_d0_.store(0, std::memory_order_relaxed);
+        fn4::note_sched(fn4::kArenaD0, 0);
+        if (cap)
+            RAD_INFO("activation arena: lever Z0-A set up (fn4 arena_d0, off): decode and verify steps take the "
+                     "%lld-token rung; under arena_d0 1 a step that verifies nothing and runs no head (depth 0) "
+                     "takes the smallest rung that holds its own rows", (long long)arena_dec_max_);
+    }
     /* ---- lever DL: the drafter's expert slab, lent to the trunk while it does not draft --------
      *
      * Every rank's mover kept a host copy of each drafter unit (load_weights); here the copies are
@@ -4698,6 +4728,48 @@ int Engine::start() {
             RAD_INFO("RADIANCE_DRAFT_LEND: the drafter's slab cannot be lent on every rank (a static plan, "
                      "or no drafter class of its own); the lend stays off");
     }
+    /* Lever Z0-W: RADIANCE_DRAFT_LEND_WEIGHTS (any value declares it; 1 starts it on) -- the drafter's static
+     * weights only its query pass reads, lent with the slab (Mover::draft_w_setup). The context pass (and so
+     * every refill) reads dspark.fc, dspark.enc.output_norm and each block's attn_kv / attn_kv_a_norm: those
+     * stay (hy-z0prof2's depth-0 profile: the drafter ops there read no other weight). */
+    dw_capable_ = false;
+    dw_lent_ = false;
+    dw_on_.store(0, std::memory_order_relaxed);
+    if (const char* e = getenv("RADIANCE_DRAFT_LEND_WEIGHTS"); e) {
+        if (!dl_capable_) {
+            RAD_INFO("RADIANCE_DRAFT_LEND_WEIGHTS=%s: the drafter's slab lend (lever DL) is not set up; the weight "
+                     "lend needs it and stays off", e);
+        } else {
+            bool all = true;
+            int64_t lent_bytes = 0, kept = 0;
+            for (auto& r : ranks_) {
+                RAD_TRY(rad_dev_set(r->device));
+                LogRank lr(r->index);
+                const int32_t first = r->mover.draft_first_layer();
+                RAD_TRY(r->mover.draft_w_setup([first](const std::string& n, int32_t layer) {
+                    const bool drafter = n.rfind("dspark.", 0) == 0 || (first >= 0 && layer >= first);
+                    if (!drafter) return false;
+                    if (n == "dspark.fc.weight" || n == "dspark.enc.output_norm.weight") return false;
+                    if (n.find(".attn_kv.") != std::string::npos || n.find(".attn_kv_a_norm.") != std::string::npos)
+                        return false;
+                    return true;
+                }));
+                all = all && r->mover.draft_w_ready();
+                lent_bytes = std::max(lent_bytes, r->mover.draft_w_bytes());
+                kept = std::max(kept, r->mover.draft_w_kept_bytes());
+            }
+            (void)rad_dev_set(ranks_[0]->device);
+            dw_capable_ = all && !ranks_.empty();
+            dw_on_.store(dw_capable_ && std::atoi(e) == 1 ? 1 : 0, std::memory_order_relaxed);
+            RAD_INFO("draft weight lend (lever Z0-W, RADIANCE_DRAFT_LEND_WEIGHTS=%s, fn4 draft_lend_w): %s; %s of the "
+                     "drafter's query-pass weights a rank lent with its slab while depth 0 holds, recalled and copied "
+                     "back before its head next runs; the context pass's %s stay",
+                     e, dw_capable_ ? (dw_on_.load() ? "on" : "set up, off") : "not set up on every rank",
+                     humanb(lent_bytes).c_str(), humanb(kept).c_str());
+        }
+    }
+    fn4::draft_w_register(dw_capable_);
+    fn4::note_sched(fn4::kDraftLendW, dw_on_.load(std::memory_order_relaxed));
 
     /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
      * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is

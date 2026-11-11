@@ -105,6 +105,13 @@ void populated(LiveSnapshot& s) {
     s.experts.layer_units = { 3, 3 };
     s.experts.layer_resident = { 2, 3 };
     s.experts.promotions = 9; s.experts.demotions = 8; s.experts.readmits = 2;
+    for (int r = 0; r < 2; ++r) {   /* every rank's own (ExpertPlane::ranks, ds41-z0) */
+        ExpertPlane::Rank er;
+        er.rank = r; er.vram_units = 4 + r; er.pinned_units = 2 - r; er.trunk_vram_units = 3 + r; er.draft_vram_units = 1;
+        er.routed = 100 * (r + 1); er.routed_resident = 90 * (r + 1); er.stream_bytes = 1000 + r; er.draft_lent_units = 7 * r;
+        er.flex_bytes = 5 << 20;
+        s.experts.ranks.push_back(er);
+    }
     s.experts.distinct_promoted = 7; s.experts.dispatches = 20; s.experts.refused = 3;
     s.experts.no_candidate = 1; s.experts.routed = 100; s.experts.routed_resident = 80;
     s.experts.flex_bytes = 1 << 20; s.experts.flex_capacity = 2 << 20;
@@ -230,6 +237,14 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
         CHECK_EQ(s["experts"]["tiers"][t].value("name", ""), std::string(tier_name((Tier)t)));
         CHECK_EQ(s["experts"]["tiers"][t].value("units", (int64_t)0), (int64_t)(t + 1));
     }
+    REQUIRE(s["experts"]["ranks"].size() == 2);
+    CHECK_EQ(s["experts"]["ranks"][1].value("rank", -1), 1);
+    CHECK_EQ(s["experts"]["ranks"][1].value("vram", (int64_t)0), (int64_t)5);
+    CHECK_EQ(s["experts"]["ranks"][1].value("trunk_vram", (int64_t)0), (int64_t)4);
+    CHECK_EQ(s["experts"]["ranks"][1].value("draft_vram", (int64_t)0), (int64_t)1);
+    CHECK_EQ(s["experts"]["ranks"][1].value("routed_res", (int64_t)0), (int64_t)180);
+    CHECK_EQ(s["experts"]["ranks"][1].value("draft_lent_units", (int64_t)0), (int64_t)7);
+    CHECK_EQ(s["experts"]["ranks"][0].value("stream_bytes", 0.0), 1000.0);
     CHECK_EQ(s["link"].value("stream_bytes", (int64_t)0), (int64_t)700);
     CHECK_EQ(s["link"].value("kv_stream_bytes", (int64_t)0), (int64_t)600);
     CHECK(s["link"].value("kv_streaming", false));

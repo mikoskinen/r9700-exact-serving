@@ -2404,7 +2404,14 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.shared_ungated = 1;
     s.cfg.gather_ar_rows = gather_ar_rows();
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
-    DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
+    /* Lever Z0-A (ds41-z0): the block's sigmoid router refuses rows above its geometry's max_tok
+     * (rad_block_glm_router.h, GlmRouter::declare: c.rows > g.max_tok -> RAD_E_INVAL). A sizing declare below Q (the
+     * 8-row rung at NST 5) keeps the head's real Q rows (the shape_probe block in declare()), so the drafter's block
+     * takes max_tok = max(T, Q). The real declare has Q <= T (dsp_config: Q = min(max_seqs x block, max_tok)), so its
+     * geometry, graph and parameters are today's. */
+    Geom gq = g;
+    gq.max_tok = std::max<int64_t>(g.max_tok, Q);
+    DS_TRY(L.moe.declare(b, nm, gq, l, d.mw, s, false, false));
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
     sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
@@ -2927,6 +2934,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.ikeep = full.ikeep;
         m.isplit = full.isplit;
         m.qmax = full.qmax;
+        /* Lever Z0-A (ds41-z0): the DSpark head's query rows Q (max_seqs x block, capped by max_tok: dsp_config) size
+         * FIXED parameters -- the candidates' all_gather numel Q x R x 2, the walk's wseqs = Q / block and its gather --
+         * so a level below Q (the 8-row rung at NST 5: Q 8 instead of 40, numel 512 instead of 2560) declared a different
+         * graph and was refused ("no level for 8-token steps"). A level keeps the real Q: the head's buffers keep their real
+         * rows (not larger, so plan_level takes them), and the head never runs at such a level (Engine::arena_step gives
+         * a step below the largest decode rung only when it verifies nothing and runs no head). */
+        m.dsp.Q = full.dsp.Q;
+        m.dsp.on = full.dsp.on;
         /* Lever VA "arena": below irows the plane and the selections follow the level's rows. */
         if (ds41_arena_decode_rows() > 0 && g.max_tok < m.irows) m.score_rows = g.max_tok;
     }

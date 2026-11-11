@@ -866,11 +866,27 @@ int Engine::prepare_release(const RadBatch* b) {
                 fn4::note_sched(fn4::kDraftLend, sched_.set_draft_lend(sw[fn4::kDraftLend]));
             if (sw[fn4::kDraftLendBorrow] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftLendBorrow, sched_.set_draft_lend_borrow(sw[fn4::kDraftLendBorrow]));
+            if (sw[fn4::kDraftLendHyst] != fn4::kNoChange)   /* lever Z0-H */
+                fn4::note_sched(fn4::kDraftLendHyst, sched_.set_draft_lend_hyst(sw[fn4::kDraftLendHyst]));
+            if (sw[fn4::kDraftOcc] != fn4::kNoChange)        /* lever Z0-O */
+                fn4::note_sched(fn4::kDraftOcc, sched_.set_draft_occ(sw[fn4::kDraftOcc]));
+            if (sw[fn4::kDraftOccK] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftOccK, sched_.set_draft_occ_k(sw[fn4::kDraftOccK]));
             /* The depth-0 context skip: the engine's own (block_context_pass); 1 only where set up (fn4 refuses
              * it otherwise). */
             if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {
                 if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 ? 1 : 0;
                 fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.ready ? ctxs_.on : 0);
+            }
+            /* Lever Z0-W: the engine's own, acted on at the next release (draft_w_step; fn4 refuses 1 unless set up). */
+            if (sw[fn4::kDraftLendW] != fn4::kNoChange) {
+                dw_on_.store(sw[fn4::kDraftLendW] == 1 && dw_capable_ ? 1 : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kDraftLendW, dw_on_.load(std::memory_order_relaxed));
+            }
+            /* Lever Z0-A: the engine's own, read by the next arena_step (fn4 refuses 1 unless set up). */
+            if (sw[fn4::kArenaD0] != fn4::kNoChange) {
+                arena_d0_.store(sw[fn4::kArenaD0] == 1 ? 1 : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kArenaD0, arena_d0_.load(std::memory_order_relaxed));
             }
         }
     }
@@ -885,6 +901,9 @@ int Engine::prepare_release(const RadBatch* b) {
         fn4::note_lend_engine(state, (int64_t)m0.draft_lends(), (int64_t)m0.draft_reclaims(), m0.draft_lent_units(),
                               m0.draft_resident(), m0.draft_units(), m0.draft_slab_bytes() >> 20);
     }
+    /* Lever Z0-W: the drafter's query-pass weights lent while the slab's lend is wanted and this step runs no
+     * head; recalled (and copied back) before a step whose head runs. Every rank thread is parked. */
+    if (const int ws = draft_w_step(); ws < 0) return ws;
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
@@ -2079,8 +2098,24 @@ int Engine::arena_step(const RadBatch* b) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
      * declares them small under shape_probe. */
-    const int64_t need = b->enc ? INT64_MAX : std::max<int64_t>(
+    int64_t need = b->enc ? INT64_MAX : std::max<int64_t>(
         b->n_tok, (int64_t)b->n_seq * (1 + std::max(cfg_.n_spec, 0)));
+    /* Lever Z0-A (fn4 arena_d0): with decode rungs declared below the one today's steps take
+     * (RADIANCE_DS41_ARENA_DECODE_ROWS=8,48), off every decode and verify step takes at least that one, as
+     * today; on, a decode step that verifies nothing and runs no head (one row a sequence, depth 0 or a
+     * plain probe) takes the smallest rung holding its own rows, as an NST 0 step does, unless the context
+     * skip refills in it (ctx_refill_due: refills are cut to the step's rung, 8-row passes would multiply
+     * them); under arena_d0 1 the skip keeps rows to the end of its ring (ctx_limit, RADIANCE_DRAFT_CTXSKIP_
+     * SLOTS), so refills come at probes and prefills. Placement only: plan_level gives a smaller rung only
+     * fewer rows of the same buffers. */
+    if (!b->enc && arena_dec_max_ > 0) {
+        const bool d0 = arena_d0_.load(std::memory_order_relaxed) == 1;
+        if (d0 && b->phase == RAD_PHASE_DECODE && b->n_tok == b->n_seq && !sched_.draft().head_runs() &&
+            !ctx_refill_due())
+            need = b->n_tok;
+        else   /* every other step, under either value, at least today's rung: the head never runs below it */
+            need = std::max<int64_t>(need, arena_dec_max_);
+    }
     const int level = arena_level(need);
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];
@@ -2127,6 +2162,35 @@ int Engine::arena_step(const RadBatch* b) {
 }
 
 int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_, rows); }
+
+/* Lever Z0-W (Mover::draft_w_lend / draft_w_reclaim), at a step's release with every rank parked: lent while
+ * fn4 draft_lend_w is 1, the scheduler wants the slab lent (depth 0 held, probes far apart) and this step's head
+ * does not run; otherwise recalled, which copies the weights back before the step is issued. A probe's first
+ * step (its head proposes) therefore pays one recall: ~0.3 GiB a rank over the link, the price DL's reload
+ * pays for the slab, at the steps D7 already leaves unsampled under the lend. */
+int Engine::draft_w_step() {
+    if (!dw_capable_) return RAD_OK;
+    const bool want = dw_on_.load(std::memory_order_relaxed) == 1 && sched_.draft_lend_wanted() &&
+                      !sched_.draft().head_runs();
+    if (want == dw_lent_) {
+        const Mover& m0 = ranks_[0]->mover;
+        fn4::note_lend_w(dw_lent_ ? 1 : 0, (int64_t)m0.draft_w_lends(), (int64_t)m0.draft_w_reclaims(),
+                         m0.draft_w_lent_units(), m0.draft_w_bytes() >> 20);
+        return RAD_OK;
+    }
+    for (auto& r : ranks_) {
+        RAD_TRY(rad_dev_set(r->device));
+        const int st = want ? r->mover.draft_w_lend() : r->mover.draft_w_reclaim(&r->heat);
+        if (st < 0) {
+            RAD_ERR("rank %d: %s the drafter's query-pass weights: %s", r->index, want ? "lending" : "recalling",
+                    rad_strerror(st));
+            return st;
+        }
+    }
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    dw_lent_ = want;
+    return RAD_OK;
+}
 
 /* The arena loan grows only after large steps stop. A prefill is chunks with decode steps between,
  * and lending after every chunk would refill and recall the slab each time. So the floor (the
@@ -3009,6 +3073,36 @@ int Engine::run_server() {
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;
 
+                /* Every rank's own (ranks[]): the published tiers and the heat engine's counters, as for rank 0
+                 * above, and the drafter's lent trunk units (an atomic). */
+                const int32_t n_trunk = meta_.n_layers > 0 ? (int32_t)meta_.n_layers : n_layer;
+                for (const auto& rk : ranks_) {
+                    server::ExpertPlane::Rank er;
+                    er.rank = rk->index;
+                    const HeatEngine& rh = rk->heat;
+                    const bool rlive = rh.enabled();
+                    const Plan& rp = rk->plan;
+                    for (size_t u = 0; u < rp.units.size(); ++u) {
+                        const MoveUnit& mu = rp.units[u];
+                        if (mu.expert < 0 || mu.layer < 0) continue;
+                        const Tier t = rlive ? rh.tier_published((int32_t)u) : mu.tier;
+                        if (t == Tier::VRAM) {
+                            ++er.vram_units;
+                            if (mu.layer < n_trunk) ++er.trunk_vram_units; else ++er.draft_vram_units;
+                        } else if (t == Tier::HostPinned) {
+                            ++er.pinned_units;
+                        } else {
+                            ++er.other_units;
+                        }
+                    }
+                    const HeatStats rs = rh.stats();
+                    er.routed           = (int64_t)rs.routed;
+                    er.routed_resident  = (int64_t)rs.routed_resident;
+                    er.stream_bytes     = (int64_t)rs.stream_bytes;
+                    er.draft_lent_units = rk->mover.draft_lent_units();
+                    er.flex_bytes       = rk->mover.flex_used_bytes();
+                    s.experts.ranks.push_back(er);
+                }
             }
 
             /* The link panel. All-reduce counts come from rank 0 only: the ranks are symmetric,

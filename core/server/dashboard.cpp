@@ -504,6 +504,25 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["staged_bytes"]   = (double)s.experts.staged_bytes;
             e["stage_overflow"] = s.experts.stage_overflow;
             e["stage_copies"]   = s.experts.stage_copies;
+            if (!s.experts.ranks.empty()) {
+                json rk = json::array();
+                for (const auto& r : s.experts.ranks) {
+                    json x;
+                    x["rank"]             = r.rank;
+                    x["vram"]             = r.vram_units;
+                    x["pinned"]           = r.pinned_units;
+                    x["other"]            = r.other_units;
+                    x["trunk_vram"]       = r.trunk_vram_units;
+                    x["draft_vram"]       = r.draft_vram_units;
+                    x["routed"]           = r.routed;
+                    x["routed_res"]       = r.routed_resident;
+                    x["stream_bytes"]     = (double)r.stream_bytes;
+                    x["draft_lent_units"] = r.draft_lent_units;
+                    x["flex_bytes"]       = (double)r.flex_bytes;
+                    rk.push_back(std::move(x));
+                }
+                e["ranks"] = std::move(rk);
+            }
             o["experts"] = std::move(e);
         }
 

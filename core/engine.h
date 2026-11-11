@@ -617,6 +617,8 @@ private:
                           int* slots = nullptr) const;
     int  ctxskip_setup();
     void ctxskip_fini();
+    int  ctx_limit() const;      /* lever Z0-A */
+    bool ctx_refill_due();       /* lever Z0-A */
     /* The context pass of issue_block_drafter: today's, or under the skip a kept step / a refill. */
     int  block_context_pass(int step);
     int  ctx_copy_rows(int slot, int64_t rows, bool to_ring);
@@ -663,6 +665,17 @@ private:
     void arena_tick(uint64_t now_ns);
     int  arena_level(int64_t rows) const;
     std::vector<int64_t> arena_rows_;
+    /* Lever Z0-A (RADIANCE_DS41_ARENA_DECODE_ROWS as a list, fn4 arena_d0): the largest decode rung declared
+     * (the one today's decode and verify steps take), how many were accepted, and the switch. */
+    int64_t          arena_dec_max_ = 0;
+    /* Lever Z0-W (RADIANCE_DRAFT_LEND_WEIGHTS at start, fn4 draft_lend_w): set up on every rank, the switch,
+     * and whether the drafter's query-pass weights are lent now. */
+    bool             dw_capable_ = false;
+    std::atomic<int> dw_on_{0};
+    bool             dw_lent_ = false;
+    int  draft_w_step();
+    int              arena_dec_rungs_ = 0;
+    std::atomic<int> arena_d0_{0};
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
      * (stager.h); 0 without one. */

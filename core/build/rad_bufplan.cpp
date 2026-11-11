@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 
 namespace rad {
 
@@ -227,6 +228,28 @@ int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLev
  * every activation over brows / bcol views of the step's rows, so no row count reaches a kernel from
  * the level. Up to 64 rows is what the audit covers; a step at the rung has at most that many. */
 static constexpr int64_t kArenaDecodeRowsMin = 8, kArenaDecodeRowsMax = 64;
+std::vector<int64_t> arena_decode_rows_list(const char* s, std::string* bad) {
+    std::vector<int64_t> out;
+    if (bad) bad->clear();
+    if (!s) return out;
+    std::string w;
+    for (const char* p = s;; ++p) {
+        if (*p == ',' || *p == '\0') {
+            if (!w.empty()) {
+                char* end = nullptr;
+                const long long v = std::strtoll(w.c_str(), &end, 10);
+                if (end && *end == '\0' && v > 0) out.push_back((int64_t)v);
+                else if (bad) *bad += (bad->empty() ? "" : ",") + w;
+            }
+            w.clear();
+            if (*p == '\0') break;
+        } else if (*p != ' ') {
+            w += *p;
+        }
+    }
+    return out;
+}
+
 bool arena_decode_rows_ok(int64_t rows, int64_t lo, std::string* why) {
     auto no = [&](const std::string& w) {
         if (why) *why = w;

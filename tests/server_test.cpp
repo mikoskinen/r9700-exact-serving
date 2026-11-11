@@ -5135,7 +5135,8 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     const HttpResponse g3 = f.get("/admin/fn4");
     CHECK(has(g3.body, "\"draft_depth0\": 1, \"draft_probe\": 4, \"draft_hybrid\": 1, \"draft_hybrid_match\": 12"));
     CHECK(has(g3.body, "\"draft\": {\"zero_cycles\": 5, \"probe_cycles\": 6, \"zero_moves\": 1, "
-                       "\"hybrid_lookup\": 7, \"hybrid_head\": 8, \"hybrid_unahead\": 9}"));
+                       "\"hybrid_lookup\": 7, \"hybrid_head\": 8, \"hybrid_unahead\": 9, \"occ_cycles\": 0, "
+                       "\"occ_moves\": 0}"));
     /* The same values again: no change, no epoch. Back off for the rest of the binary. */
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":1,"draft_hybrid":1})").status, 200);
     CHECK(!fn4::apply_pending(13, sw));
@@ -5211,7 +5212,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
                        "\"lent_probe_steps\": 2, \"lent_probe_ms\": 300, \"transit_steps\": 9, \"transit_ms\": 450, "
                        "\"backoff_k\": 3, \"probe_interval\": 128, \"state\": 2, \"lends\": 1, \"reclaims\": 0, "
                        "\"lent_units\": 237, \"draft_resident\": 0, \"draft_units\": 96, \"slab_mib\": 2151, "
-                       "\"borrow_cycles\": 0}"));
+                       "\"borrow_cycles\": 0, \"hyst_holds\": 0}"));
     /* The borrow: 0 / 1, refused unless the lend is set up; its count at the end of "lend". */
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_borrow":2})").status, 400);
     fn4::note_sched(fn4::kDraftLendBorrow, 0);
@@ -5222,7 +5223,106 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128, 41);
     const HttpResponse g2 = f.get("/admin/fn4");
     CHECK(has(g2.body, "\"draft_lend\": 1, \"draft_lend_borrow\": 1"));
-    CHECK(has(g2.body, "\"slab_mib\": 2151, \"borrow_cycles\": 41}"));
+    CHECK(has(g2.body, "\"slab_mib\": 2151, \"borrow_cycles\": 41, \"hyst_holds\": 0}"));
+    /* Lever Z0-H, the lend's hysteresis: 0 .. 100, above 0 refused unless the lend is set up; its count last in "lend". */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":101})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":-1})").status, 400);
+    fn4::note_sched(fn4::kDraftLendHyst, 0);   /* the scheduler reports it at its init (-1 before) */
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_lend_hyst\": 0"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":20})").status, 200);
+    CHECK(fn4::apply_pending(33, sw));
+    CHECK_EQ(sw[fn4::kDraftLendHyst], 20);
+    CHECK_EQ(sw[fn4::kDraftLend], fn4::kNoChange);
+    fn4::note_sched(fn4::kDraftLendHyst, 20);
+    fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128, 41, 7);
+    const HttpResponse g3 = f.get("/admin/fn4");
+    CHECK(has(g3.body, "\"draft_lend_hyst\": 20"));
+    CHECK(has(g3.body, "\"borrow_cycles\": 41, \"hyst_holds\": 7}"));
+    fn4::lend_register(false);
+    const HttpResponse h0 = f.post("/admin/fn4", R"({"draft_lend_hyst":20})");
+    CHECK_EQ(h0.status, 400);
+    CHECK(has(h0.body, "no drafter expert slab to lend"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":0})").status, 200);   /* 0 is always taken */
+    CHECK(fn4::apply_pending(34, sw));
+    fn4::note_sched(fn4::kDraftLendHyst, 0);
+    fn4::lend_register(true);
+    /* Lever Z0-A, arena_d0 (the engine's): 0 / 1, 1 refused until the engine registered a rung below the largest. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":2})").status, 400);
+    const HttpResponse a0 = f.post("/admin/fn4", R"({"arena_d0":1})");
+    CHECK_EQ(a0.status, 400);
+    CHECK(has(a0.body, "no engine has registered its activation arena"));
+    fn4::arena_d0_register(false);
+    const HttpResponse a1 = f.post("/admin/fn4", R"({"arena_d0":1})");
+    CHECK_EQ(a1.status, 400);
+    CHECK(has(a1.body, "no decode rung below the largest"));
+    fn4::arena_d0_register(true);
+    fn4::note_sched(fn4::kArenaD0, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":1})").status, 200);
+    CHECK(fn4::apply_pending(35, sw));
+    CHECK_EQ(sw[fn4::kArenaD0], 1);
+    CHECK_EQ(sw[fn4::kDraftLendHyst], fn4::kNoChange);
+    fn4::note_sched(fn4::kArenaD0, 1);
+    CHECK(has(f.get("/admin/fn4").body, "\"arena_d0\": 1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":0})").status, 200);
+    CHECK(fn4::apply_pending(36, sw));
+    fn4::note_sched(fn4::kArenaD0, 0);
+    fn4::arena_d0_register(false);
+    /* Lever Z0-W, draft_lend_w (the engine's): 0 / 1, 1 refused until an engine registered the weight lend set up;
+     * its counters at the end of "lend" only then. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_w":2})").status, 400);
+    const HttpResponse w0 = f.post("/admin/fn4", R"({"draft_lend_w":1})");
+    CHECK_EQ(w0.status, 400);
+    CHECK(has(w0.body, "no engine has registered the drafter's weight lend"));
+    CHECK(!has(f.get("/admin/fn4").body, "\"w_lent\""));
+    fn4::draft_w_register(false);
+    const HttpResponse w1 = f.post("/admin/fn4", R"({"draft_lend_w":1})");
+    CHECK_EQ(w1.status, 400);
+    CHECK(has(w1.body, "RADIANCE_DRAFT_LEND_WEIGHTS"));
+    fn4::draft_w_register(true);
+    fn4::note_sched(fn4::kDraftLendW, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_w":1})").status, 200);
+    CHECK(fn4::apply_pending(37, sw));
+    CHECK_EQ(sw[fn4::kDraftLendW], 1);
+    fn4::note_sched(fn4::kDraftLendW, 1);
+    fn4::note_lend_w(1, 3, 2, 35, 302);
+    const HttpResponse gw = f.get("/admin/fn4");
+    CHECK(has(gw.body, "\"draft_lend_w\": 1"));
+    CHECK(has(gw.body, "\"hyst_holds\": 7, \"w_lent\": 1, \"w_lends\": 3, \"w_reclaims\": 2, \"w_lent_units\": 35, \"w_mib\": 302}"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_w":0})").status, 200);
+    CHECK(fn4::apply_pending(38, sw));
+    fn4::note_sched(fn4::kDraftLendW, 0);
+    fn4::note_lend_w(0, 0, 0, 0, 0);
+    fn4::draft_w_register(false);
+    /* Lever Z0-O, draft_occ (rows, 0 off .. 64) and draft_occ_k (cycles, 1 .. 4096), the scheduler's: draft_occ above 0
+     * refused without a drafter that runs the adaptive window; their counters close GET's "draft". */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":65})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":-1})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ_k":0})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ_k":4097})").status, 400);
+    fn4::note_sched(fn4::kDraftOcc, 0);
+    fn4::note_sched(fn4::kDraftOccK, 32);
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_occ\": 0, \"draft_occ_k\": 32"));
+    fn4::draft_register(false, false);
+    const HttpResponse o0 = f.post("/admin/fn4", R"({"draft_occ":3})");
+    CHECK_EQ(o0.status, 400);
+    CHECK(has(o0.body, "cannot run the adaptive window"));
+    fn4::draft_register(true, true);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":3,"draft_occ_k":16})").status, 200);
+    CHECK(fn4::apply_pending(39, sw));
+    CHECK_EQ(sw[fn4::kDraftOcc], 3);
+    CHECK_EQ(sw[fn4::kDraftOccK], 16);
+    CHECK_EQ(sw[fn4::kDraftLendW], fn4::kNoChange);
+    fn4::note_sched(fn4::kDraftOcc, 3);
+    fn4::note_sched(fn4::kDraftOccK, 16);
+    fn4::note_draft_counts(5, 6, 1, 7, 8, 9, 400, 2);
+    const HttpResponse go = f.get("/admin/fn4");
+    CHECK(has(go.body, "\"draft_occ\": 3, \"draft_occ_k\": 16"));
+    CHECK(has(go.body, "\"hybrid_unahead\": 9, \"occ_cycles\": 400, \"occ_moves\": 2}"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":0,"draft_occ_k":32})").status, 200);
+    CHECK(fn4::apply_pending(40, sw));
+    fn4::note_sched(fn4::kDraftOcc, 0);
+    fn4::note_sched(fn4::kDraftOccK, 32);
+    fn4::note_draft_counts(0, 0, 0, 0, 0, 0);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
     CHECK_EQ(sw[fn4::kDraftLend], -1);

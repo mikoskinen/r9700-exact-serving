@@ -88,6 +88,9 @@ Mover::~Mover() {
     /* Lever DL's host copies are always the mover's own (outside the budget). */
     for (ClassPools& c : pools_)
         if (c.keep_base) rad_dev_free(c.keep_base, RAD_MEM_HOST_MAPPED);
+    /* Lever Z0-W's host copies too. */
+    for (DwStretch& d : dw_)
+        if (d.host) rad_dev_free(d.host, RAD_MEM_HOST_PINNED);
     /* Only what this object allocated; a Pool reservation belongs to the Pool. */
     if (owns_memory_) {
         for (ClassPools& c : pools_) {
@@ -1479,7 +1482,8 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 /* ------------------------------------------------------------------ the loan */
 static const char* lender_name(int lender) {
     return lender == Mover::kLendKV ? "KV cache"
-         : lender == Mover::kLendArena ? "activation arena" : "drafter's expert slab";
+         : lender == Mover::kLendArena ? "activation arena"
+         : lender == Mover::kLendDraftW ? "drafter's query-pass weights" : "drafter's expert slab";
 }
 
 static char* align_down_ptr(char* p) {
@@ -2169,6 +2173,130 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
         return RAD_E_STATE;
     }
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ lever Z0-W */
+int Mover::draft_w_setup(const std::function<bool(const std::string&, int32_t)>& lendable) {
+    if (!dw_.empty()) {   /* before anything changes: a second call leaves the first one's lend as it is */
+        RAD_ERR("mover: draft_w_setup called twice; its stretches are carved once");
+        return RAD_E_STATE;
+    }
+    dw_ready_ = false;
+    if (!plan_ || !plan_->dynamic || !static_vram_ || !prog_ || !lendable) return RAD_OK;
+    if (!mover_ || !compute_) {
+        RAD_ERR("mover: the drafter's weight lend is set up after the compute stream is bound");
+        return RAD_E_STATE;
+    }
+    /* Every statically placed weight, [lo, hi) in the static region (a weight's extent runs to the next
+     * weight of its unit, or the unit's padded end), and whether it may be lent. */
+    struct Iv { int64_t lo, hi; bool lend; };
+    std::vector<Iv> iv;
+    for (size_t u = 0; u < plan_->units.size(); ++u) {
+        const UnitState& us = unit_[u];
+        if (us.tier != Tier::VRAM || us.static_off < 0 || us.slab_slot >= 0) continue;
+        const MoveUnit& mu = plan_->units[u];
+        for (size_t k = 0; k < mu.weights.size() && k < mu.offset.size(); ++k) {
+            const int64_t a = us.static_off + mu.offset[k];
+            const int64_t b = us.static_off + (k + 1 < mu.offset.size() ? mu.offset[k + 1] : mu.bytes);
+            if (b <= a) continue;
+            const WeightInfo& w = prog_->weights[(size_t)mu.weights[k]];
+            iv.push_back(Iv{ a, b, lendable(w.name, mu.layer) });
+        }
+    }
+    std::sort(iv.begin(), iv.end(), [](const Iv& x, const Iv& y) { return x.lo < y.lo; });
+    /* Stretches: runs of lendable weights; the bytes between two of them (a unit's alignment pad)
+     * belong to no weight and join the run, a weight that is not lendable ends it. */
+    std::vector<std::pair<int64_t, int64_t>> runs;
+    int64_t kept = 0;
+    for (size_t i = 0; i < iv.size(); ++i) {
+        if (!iv[i].lend) continue;
+        if (!runs.empty() && i > 0 && iv[i - 1].lend && runs.back().second <= iv[i].lo) runs.back().second = iv[i].hi;
+        else runs.push_back({ iv[i].lo, iv[i].hi });
+    }
+    for (size_t i = 0; i < iv.size(); ++i) if (!iv[i].lend) kept += iv[i].hi - iv[i].lo;
+    std::vector<LoanStrip> strips;
+    int64_t bytes = 0;
+    for (const auto& r : runs) {
+        const int64_t n = r.second - r.first;
+        if (n <= 2 * (int64_t)RAD_ALIGN_UNIT) continue;
+        DwStretch d;
+        d.dev = (char*)static_vram_ + r.first;
+        d.bytes = n;
+        d.host = rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+        if (!d.host) {
+            RAD_ERR("mover: no pinned host memory for a %s copy of the drafter's weights", humanb(n).c_str());
+            return RAD_E_NOMEM;
+        }
+        /* The weights as loaded, byte for byte: what a recall puts back. */
+        RAD_TRY(rad_memcpy_async(d.host, d.dev, n, mover_));
+        dw_.push_back(d);
+        LoanStrip st;
+        st.top = d.dev + n;
+        st.bytes = n;
+        st.unit_bytes = 1;
+        st.unit_tokens = 1;
+        strips.push_back(st);
+        bytes += n;
+    }
+    RAD_TRY(rad_stream_sync(mover_));
+    dw_kept_bytes_ = kept;
+    if (strips.empty()) return RAD_OK;
+    int64_t before = 0;
+    for (const ClassPools& cp : pools_) before += (int64_t)cp.flex_ptr.size();
+    RAD_TRY(lend_from(kLendDraftW, strips));
+    int64_t slots = -before;
+    for (const ClassPools& cp : pools_) slots += (int64_t)cp.flex_ptr.size();
+    dw_bytes_ = bytes;
+    dw_ready_ = slots > 0 && loan_ceiling(kLendDraftW) > 0;
+    RAD_INFO("mover: lever Z0-W: %zu stretch(es) of the drafter's query-pass weights, %s (a pinned host copy each), "
+             "lend %lld trunk slots while the drafter does not draft; %s of its static weights stay%s",
+             dw_.size(), humanb(bytes).c_str(), (long long)slots, humanb(kept).c_str(),
+             dw_ready_ ? "" : " -- nothing to lend");
+    return RAD_OK;
+}
+
+int Mover::draft_w_lend() {
+    if (!dw_ready_ || dw_lent_) return RAD_OK;
+    RAD_TRY(set_loan(kLendDraftW, loan_ceiling(kLendDraftW)));
+    dw_lent_ = true;
+    ++dw_lends_;
+    return RAD_OK;
+}
+
+int Mover::draft_w_reclaim(HeatEngine* heat) {
+    if (!dw_ready_ || !dw_lent_) return RAD_OK;
+    /* Every unit in a stretch back to its host copy, both streams drained (Mover::reclaim)... */
+    RAD_TRY(reclaim(kLendDraftW, 0, heat));
+    /* ...then the weights' own bytes, from their copies, before anything else reads them. */
+    for (const DwStretch& d : dw_) RAD_TRY(rad_memcpy_async(d.dev, d.host, d.bytes, mover_));
+    RAD_TRY(rad_stream_sync(mover_));
+    dw_lent_ = false;
+    ++dw_reclaims_;
+    return RAD_OK;
+}
+
+int32_t Mover::draft_first_layer() const {
+    int32_t lo = -1;
+    if (!plan_) return lo;
+    for (int32_t u : dl_units_) {
+        const int32_t l = plan_->units[(size_t)u].layer;
+        if (l >= 0 && (lo < 0 || l < lo)) lo = l;
+    }
+    return lo;
+}
+
+int64_t Mover::draft_w_lent_units() const {
+    int64_t lent = 0;
+    for (size_t u = 0; u < unit_.size(); ++u) {
+        const UnitState& us = unit_[u];
+        if (us.klass < 0 || us.slab_slot < 0) continue;
+        const ClassPools& cp = pools_[(size_t)us.klass];
+        if (!cp.is_flex(us.slab_slot)) continue;
+        for (const ClassPools::Lent& l : cp.lent)
+            if (l.lender == kLendDraftW && us.slab_slot >= l.first && us.slab_slot < l.first + (int64_t)l.need.size())
+                ++lent;
+    }
+    return lent;
 }
 
 /* ------------------------------------------------------------------ lever DL */

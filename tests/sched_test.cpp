@@ -4630,6 +4630,131 @@ TEST(staying_at_zero_is_priced_at_the_lent_plain_step) {
     CHECK(off.zero_moves() > mo);
 }
 
+/* Lever Z0-H, the lend's hysteresis (draft_lend_hyst): at a lent 0 (unlent plain step 15 ms, lent 14), the text turns
+ * predictable enough (0.98 a position) that the best window yields 4 x 5.71 tokens in 70 ms (0.326 a ms), 14 % past the
+ * lent plain step's 0.286. With kHyst alone (the switch 0) 0 is left; at 10 % it is left too; at 20 % it holds, and
+ * the holds are counted; with the lend off the same 20 % does not act (the unlent plain step, kHyst). A move back to 0
+ * keeps kHyst (draft.cpp: the drafting side of the decision is unchanged). */
+TEST(the_lend_hysteresis_holds_a_lent_zero_against_a_window_that_gains_less_than_it) {
+    DraftAdapt u[4];
+    DraftAdapt* zf[4];
+    DraftController z = zero_controller(3, 1, u, zf);
+    for (int t = 0; t < 8; ++t) {
+        (void)z.plan_step(zf, 4, 4);
+        if (!z.head_runs()) z.step_time(0, 4, 15.0);
+    }
+    for (int k = 0; k < 8; ++k) z.step_time(0, 4, 14.0, -1.0, DraftController::kLendLent);
+    CHECK_NEAR(z.plain_ms(4), 14.0, 1e-6);
+    CHECK_EQ(z.lend_hyst(), 0);
+    DraftController h10 = z, h20 = z, off = z;
+    h10.set_lend_hyst(10);
+    h20.set_lend_hyst(20);
+    CHECK_EQ(h20.lend_hyst(), 20);
+    h20.set_lend_hyst(101);
+    CHECK_EQ(h20.lend_hyst(), 100);   /* clamped (fn4 refuses 101) */
+    h20.set_lend_hyst(20);
+    off.set_lend(0);
+    off.set_lend_hyst(20);
+    for (int i = 0; i < 4; ++i) u[i] = estimate(z, 0.98, 0.98);
+    const int64_t mz = z.zero_moves(), m10 = h10.zero_moves(), m20 = h20.zero_moves(), mo = off.zero_moves();
+    for (int t = 0; t < 600; ++t) {
+        (void)z.plan_step(zf, 4, 4);
+        (void)h10.plan_step(zf, 4, 4);
+        (void)h20.plan_step(zf, 4, 4);
+        (void)off.plan_step(zf, 4, 4);
+    }
+    CHECK(z.zero_moves() > mz);
+    CHECK(h10.zero_moves() > m10);
+    CHECK_EQ(h20.zero_moves(), m20);
+    CHECK(h20.lend_hyst_holds() > 0);
+    CHECK_EQ(z.lend_hyst_holds(), (int64_t)0);
+    CHECK(off.zero_moves() > mo);
+    CHECK_EQ(off.lend_hyst_holds(), (int64_t)0);
+}
+
+/* Lever Z0-O, depth 0 by sustained occupancy (draft_occ / draft_occ_k): from a controller settled at 0 over four rows,
+ * the text turns predictable enough (0.98 a position) that D7 leaves 0 and drafts. With draft_occ 3 and draft_occ_k 8,
+ * four rows for 8 cycles hold 0 from then on with no probe, whatever the estimates; a dip to two rows shorter than 8
+ * cycles keeps it; 8 cycles at two rows hand the choice back to D7. With draft_occ 0 every cycle is D7's own. Under the
+ * drafter's lend, occupancy's 0 (no probe) is a 0 the lend may take, where D7's probes every 16 cycles keep it off. */
+TEST(depth_zero_by_sustained_occupancy_holds_without_probes_and_hands_back_below_its_rows) {
+    DraftAdapt u[4];
+    DraftAdapt* zf[4];
+    DraftController z = zero_controller(0, 0, u, zf);
+    CHECK_EQ(z.occ(), 0);
+    CHECK_EQ(z.occ_k(), DraftController::kOccK);
+    DraftController d7 = z, off = z, occ = z;
+    off.set_occ_k(8);
+    occ.set_occ(65);
+    CHECK_EQ(occ.occ(), 64);   /* clamped (fn4 refuses 65) */
+    occ.set_occ(3);
+    occ.set_occ_k(8);
+    CHECK_EQ(occ.occ(), 3);
+    CHECK_EQ(occ.occ_k(), 8);
+    for (int i = 0; i < 4; ++i) u[i] = estimate(z, 0.98, 0.98);
+    int head_d7 = 0, head_off = 0, head_occ_late = 0;
+    int64_t probes_at_hold = -1;
+    for (int t = 0; t < 600; ++t) {
+        (void)d7.plan_step(zf, 4, 4);
+        (void)off.plan_step(zf, 4, 4);
+        (void)occ.plan_step(zf, 4, 4);
+        head_d7 += d7.head_runs() ? 1 : 0;
+        head_off += off.head_runs() ? 1 : 0;
+        if (t >= 8) head_occ_late += occ.head_runs() ? 1 : 0;
+        if (t == 8) probes_at_hold = occ.probe_cycles();
+    }
+    CHECK(head_d7 > 300);                                 /* D7 drafts */
+    CHECK_EQ(head_off, head_d7);                          /* draft_occ 0: D7's own choice, cycle for cycle */
+    CHECK_EQ(off.zero_moves(), d7.zero_moves());
+    CHECK_EQ(off.probe_cycles(), d7.probe_cycles());
+    CHECK_EQ(off.occ_cycles(), (int64_t)0);
+    CHECK_EQ(head_occ_late, 0);                           /* held at 0 from the 8th cycle at four rows */
+    CHECK(occ.occ_held());
+    CHECK_EQ(occ.occ_moves(), (int64_t)1);
+    CHECK(occ.occ_cycles() >= 592);
+    CHECK_EQ(occ.probe_cycles(), probes_at_hold);         /* no probe while held */
+    CHECK_EQ(occ.step_depth(), 0);
+    /* A dip to two rows for 7 cycles: still held. */
+    for (int t = 0; t < 7; ++t) { (void)occ.plan_step(zf, 2, 2); CHECK(!occ.head_runs()); }
+    for (int t = 0; t < 3; ++t) (void)occ.plan_step(zf, 4, 4);
+    CHECK(occ.occ_held());
+    CHECK_EQ(occ.occ_moves(), (int64_t)1);
+    /* 8 cycles at two rows: D7 decides again (probes, drafting). */
+    for (int t = 0; t < 8; ++t) (void)occ.plan_step(zf, 2, 2);
+    CHECK(!occ.occ_held());
+    CHECK_EQ(occ.occ_moves(), (int64_t)2);
+    const int64_t held = occ.occ_cycles();
+    int head_after = 0;
+    for (int t = 0; t < 200; ++t) { (void)occ.plan_step(zf, 2, 2); head_after += occ.head_runs() ? 1 : 0; }
+    CHECK(head_after > 0);
+    CHECK_EQ(occ.occ_cycles(), held);
+    /* Off between steps: D7 at once. */
+    for (int t = 0; t < 8; ++t) (void)occ.plan_step(zf, 4, 4);
+    CHECK(occ.occ_held());
+    occ.set_occ(0);
+    CHECK(!occ.occ_held());
+
+    /* The lend: estimates that keep D7 at 0 (0.6), probes every 16 cycles -- under kLendInterval, so D7's 0 is never
+     * lent; occupancy's is, once lend_hold() cycles have passed. */
+    DraftAdapt v[4];
+    DraftAdapt* vf[4];
+    DraftController l7 = zero_controller(0, 1, v, vf);
+    DraftController lo = l7;
+    lo.set_occ(3);
+    lo.set_occ_k(8);
+    int want7 = 0, wanto = 0;
+    for (int t = 0; t < 200; ++t) {
+        (void)l7.plan_step(vf, 4, 4);
+        (void)lo.plan_step(vf, 4, 4);
+        if (!l7.head_runs()) l7.step_time(0, 4, 15.0);
+        if (!lo.head_runs()) lo.step_time(0, 4, 15.0);
+        want7 += l7.lend_wanted() ? 1 : 0;
+        wanto += lo.lend_wanted() ? 1 : 0;
+    }
+    CHECK_EQ(want7, 0);
+    CHECK(wanto > 100);
+}
+
 /* The borrow (draft_lend_borrow): a cost class with no lent ratio of its own prices its plain step with the
  * nearest class's (kBorrowMin samples at least), a lower class's as it is, a higher one's gain damped kBorrowDamp
  * a class step. Off, pricing is 9461f81's exactly. The case D7 meets at c4: lent at c8 (40 -> 35.72 ms, the

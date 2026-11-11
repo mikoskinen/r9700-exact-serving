@@ -140,6 +140,7 @@ void DraftController::step_time(int depth, int n_rows, double ms, double tokens,
     if (!adapt_ || depth < (depth0_ ? 0 : 1) || depth > p_.max_depth || n_rows < 1 ||
         !(ms > 0.0) || !std::isfinite(ms))
         return;
+    lent_seen_ = lend == kLendLent;   /* lever Z0-H: the lend's state at the last step */
     /* A plain step still warming up (kPlainWarm) is no sample. */
     if (depth == 0 && zero_run_ <= 1 + kPlainWarm) return;
     /* The drafter's lend (lever DL): a step while its slab moved is no sample; a drafting step
@@ -394,6 +395,28 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
 void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
     ++cycles_;
     if (zero_held_ < INT32_MAX) ++zero_held_;
+    /* Lever Z0-O, depth 0 by sustained occupancy (occ()): it decides first, before a probe runs its cycles out. */
+    if (occ_n_ > 0 && !forced_) {
+        if (n_rows >= occ_n_) { occ_lo_ = 0; if (occ_hi_ < INT32_MAX) ++occ_hi_; }
+        else                  { occ_hi_ = 0; if (occ_lo_ < INT32_MAX) ++occ_lo_; }
+        if (!occ_on_ && occ_hi_ >= occ_k_)     { occ_on_ = true;  ++n_occ_moves_; }
+        else if (occ_on_ && occ_lo_ >= occ_k_) { occ_on_ = false; ++n_occ_moves_; }
+        if (occ_on_) {
+            probe_left_ = 0;   /* a probe under way ends: no single-step probe decides here */
+            if (!zero_) {
+                RAD_DEBUG("draft window: head depth %d -> 0, %d decode rows for %d cycles (draft_occ %d)",
+                          step_w_ > 0 ? step_w_ : kMinDepth, n_rows, occ_k_, occ_n_);
+                zero_ = true;
+                zero_held_ = 0;
+                since_probe_ = 0;
+                ++n_zero_moves_;
+                backoff_k_ = 0;
+            }
+            ++n_zero_;
+            ++n_occ_;
+            return;
+        }
+    }
     const int c  = cost_class(n_rows);
     const int dd = step_w_ > 0 ? step_w_ : kMinDepth;
 
@@ -435,7 +458,11 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
         bool borrowed = false;
         const double g_0 = (double)n_rows / plain_ms(n_rows, &borrowed);
         if (borrowed) ++n_borrow_;
-        const bool want = zero_ ? !(g_d > g_0 * (1.0 + kHyst)) : g_0 > g_d * (1.0 + kHyst);
+        /* Lever Z0-H: leaving a lent 0 (or one the lend is about to take) needs draft_lend_hyst % more yield. */
+        const bool lent_zero = zero_ && lend_hyst_ > 0 && lend_hold() > 0 && (lent_seen_ || lend_wanted());
+        const double hyst = lent_zero ? std::fmax(kHyst, 0.01 * (double)lend_hyst_) : kHyst;
+        const bool want = zero_ ? !(g_d > g_0 * (1.0 + hyst)) : g_0 > g_d * (1.0 + kHyst);
+        if (lent_zero && want && g_d > g_0 * (1.0 + kHyst) && zero_held_ >= kHold) ++n_lend_hyst_;
         if (want != zero_ && zero_held_ >= kHold) {
             RAD_DEBUG("draft window: head depth %d -> %d over %d rows (%.3f -> %.3f tokens a ms)",
                       zero_ ? 0 : dd, want ? 0 : dd, n_rows, want ? g_d : g_0, want ? g_0 : g_d);
