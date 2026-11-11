@@ -123,6 +123,17 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     routed_as_.assign(np, 0u);
     miss_bytes_.assign(np, 0);
     for (size_t u = 0; u < n; ++u) set_place((int32_t)u);
+    /* ds41-lf: the slot classes (the plan's resident set sits in trunk slots; a draft head's units are counted
+     * apart) and the long-memory decode heat. Counters only: nothing here ranks or moves a unit. */
+    if (!(params_.long_decay > 0.0f && params_.long_decay < 1.0f)) params_.long_decay = HeatParams{}.long_decay;
+    heat_l_.assign(np, 0.0f);
+    scls_.assign(np, kSlotNone);
+    for (size_t u = 0; u < n; ++u) {
+        const size_t p = (size_t)pos_[u];
+        if (params_.trunk_layers >= 0 && layer_of_[u] >= params_.trunk_layers) scls_[p] = kSlotDraftOwn;
+        else if (tier_[u] == Tier::VRAM) scls_[p] = kSlotTrunk;
+    }
+    for (int c = 0; c < kSlotClasses; ++c) { slot_hit_[c] = Relaxed<uint64_t>(0); slot_miss_[c] = Relaxed<uint64_t>(0); }
 
     /* Each slot's lowest movable unit index, for step()'s tie test. */
     min_unit_.assign((size_t)n_layer_ + 1, INT32_MAX);
@@ -236,16 +247,20 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     if (!(share > 0.0f)) {
         int32_t routed = 0, resident = 0;
         int64_t miss = 0;
+        uint32_t sh[kSlotClasses] = {}, sm[kSlotClasses] = {};
         for (int32_t j = 0; j < n; ++j) {
             if (counts[j] <= 0) continue;
             const size_t q = (size_t)(lo + j);
             routed += routed_as_[q] != 0;
             resident += routed_as_[q] == 2;
             miss += miss_bytes_[q];
+            if (routed_as_[q] == 2) ++sh[scls_[q]];
+            else if (routed_as_[q] == 1) ++sm[scls_[q]];
         }
         stats_.routed += (uint64_t)routed * passes;
         stats_.routed_resident += (uint64_t)resident * passes;
         stats_.stream_bytes += (uint64_t)miss * passes;
+        add_slots(sh, sm, passes);
         ++stats_.dispatches;
         return;
     }
@@ -263,6 +278,10 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
 
     float* __restrict h = heat_.data() + lo;
     for (int32_t j = 0; j < len; ++j) h[j] *= d;
+    /* Lever LF's long-memory heat: the same credit, decayed by long_decay^share. */
+    const float dl = share < 1.0f ? std::pow(params_.long_decay, share) : params_.long_decay;
+    float* __restrict hl = heat_l_.data() + lo;
+    for (int32_t j = 0; j < len; ++j) hl[j] *= dl;
 
     bool ends = end_ok_[l] != 0;
     float hot = ends && end_n_off_[l] > 0 ? end_hot_[l] * d : -INFINITY;
@@ -270,15 +289,19 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     int32_t n_cold = ends ? end_n_cold_[l] : 0;
     int32_t routed = 0, resident = 0;
     int64_t miss = 0;
+    uint32_t sh[kSlotClasses] = {}, sm[kSlotClasses] = {};
     auto credit = [&](int32_t j) {
         const int32_t c = counts[j];
         const size_t q = (size_t)(lo + j);
         const float was = h[j];
         const float x = was + (float)c * w;
         h[j] = x;
+        hl[j] += (float)c * w;
         routed += routed_as_[q] != 0;
         resident += routed_as_[q] == 2;
         miss += miss_bytes_[q];
+        if (routed_as_[q] == 2) ++sh[scls_[q]];
+        else if (routed_as_[q] == 1) ++sm[scls_[q]];
         if (rank_as_[q] == 1) hot = std::max(hot, x);
         else if (rank_as_[q] == 2 && was <= cold && --n_cold <= 0) ends = false;
     };
@@ -304,6 +327,7 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
     stats_.routed += (uint64_t)routed * passes;
     stats_.routed_resident += (uint64_t)resident * passes;
     stats_.stream_bytes += (uint64_t)miss * passes;
+    add_slots(sh, sm, passes);
     ++stats_.dispatches;
 }
 
@@ -391,6 +415,11 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
         hq[j] *= dp;
         h[j] = hd[j] + hq[j];
     }
+    /* Lever LF's long-memory heat: the decode heat's credit, decayed by long_decay^share. */
+    const float dl = sd >= 1.0f ? params_.long_decay : (sd > 0.0f ? std::pow(params_.long_decay, sd) : 1.0f);
+    float* __restrict hl = heat_l_.data() + lo;
+    if (dl != 1.0f)
+        for (int32_t j = 0; j < len; ++j) hl[j] *= dl;
     /* HeatParams::decode_pin: a protected resident ranks far above any heat, so it is never the
      * cold end. Only residents (rank_as_ 2) and only for the ranking: the heats stay apart. */
     const bool pin = params_.decode_pin > 0.0f;
@@ -405,6 +434,7 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
         for (int32_t j = 0; j < len; ++j) h[j] += pinned_bonus(j);
     int32_t routed = 0, resident = 0;
     int64_t miss = 0;
+    uint32_t sh[kSlotClasses] = {}, sm[kSlotClasses] = {};
     for (int32_t j = 0; j < n; ++j) {
         const int32_t c = counts[j];
         if (c <= 0) continue;
@@ -412,14 +442,18 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
         hd[j] += (float)c * wd;
         hq[j] += (float)c * wp;
         h[j] = hd[j] + hq[j] + pinned_bonus(j);
+        hl[j] += (float)c * wd;
         routed += routed_as_[q] != 0;
         resident += routed_as_[q] == 2;
         miss += miss_bytes_[q];
+        if (routed_as_[q] == 2) ++sh[scls_[q]];
+        else if (routed_as_[q] == 1) ++sm[scls_[q]];
     }
     end_rebuild(l);
     stats_.routed += (uint64_t)routed * passes;
     stats_.routed_resident += (uint64_t)resident * passes;
     stats_.stream_bytes += (uint64_t)miss * passes;
+    add_slots(sh, sm, passes);
     ++stats_.dispatches;
 }
 

@@ -185,6 +185,13 @@ public:
             if (held_[(size_t)s]) return s;
         return -1;
     }
+    /* How many of segment `k`'s existing slots something holds (ds41-lf's lent occupancy). */
+    int64_t held_in(int k) const {
+        const Seg& g = segs_[(size_t)k];
+        int64_t n = 0;
+        for (int64_t s = g.lo; s < g.live; ++s) n += held_[(size_t)s];
+        return n;
+    }
     /* How many existing slots at or past `from` something holds, over every segment. */
     int64_t held_from(int64_t from) const {
         int64_t k = 0;
@@ -427,6 +434,34 @@ struct MoverCounters {
         s.ssd_wait_ns        = ssd_wait_ns;
         s.ssd_skipped_units  = ssd_skipped_units;
         s.ssd_skipped_bytes  = ssd_skipped_bytes;
+        return s;
+    }
+};
+
+/* ds41-lf: each lender's slots (Mover::Lender order: KV cache, arena, drafter's slab, drafter's query-pass
+ * weights), counted on the rank thread. `covered` slots the loan offers now and `held` slots something holds
+ * (a unit, a copy in flight, a quarantine) -- the occupancy; `fills` promotions into them (Mover::fill, the only
+ * way a unit enters a lent slot), of which `fills_lf` ranked by lever LF and `fills_hot` of a unit with a short
+ * heat of at least 1 (routed off the device in the last steps: a just-missed expert); drops out of them by cause:
+ * `drop_victim` a swap's demotion (the heat engine chose it as the coldest), `drop_reserve` balance() rebuilding
+ * the working slots, `drop_recall` a shrinking loan (balance()'s sweep or reclaim()). */
+struct LentStats {
+    static constexpr int kN = 4;
+    int64_t  covered[kN] = {}, held[kN] = {};
+    uint64_t fills[kN] = {}, fills_lf[kN] = {}, fills_hot[kN] = {};
+    uint64_t drop_victim[kN] = {}, drop_reserve[kN] = {}, drop_recall[kN] = {};
+};
+struct LentCounters {
+    static constexpr int kN = LentStats::kN;
+    Relaxed<int64_t>  covered[kN], held[kN];
+    Relaxed<uint64_t> fills[kN], fills_lf[kN], fills_hot[kN], drop_victim[kN], drop_reserve[kN], drop_recall[kN];
+    LentStats snapshot() const {
+        LentStats s;
+        for (int k = 0; k < kN; ++k) {
+            s.covered[k] = covered[k];          s.held[k] = held[k];
+            s.fills[k] = fills[k];              s.fills_lf[k] = fills_lf[k];      s.fills_hot[k] = fills_hot[k];
+            s.drop_victim[k] = drop_victim[k];  s.drop_reserve[k] = drop_reserve[k]; s.drop_recall[k] = drop_recall[k];
+        }
         return s;
     }
 };
@@ -752,6 +787,15 @@ public:
     MoverStats stats() const { return stats_.snapshot(); }
     std::string report() const;
 
+    /* ds41-lf: each lender's occupancy, fills and drops (LentStats), readable from the HTTP thread. */
+    LentStats lent_stats() const { return lent_.snapshot(); }
+    /* Lever LF (fn4 place_lf): true ranks fill()'s candidates -- the units that go into free lent slots, at a
+     * loan's growth and after drops -- by the heat engine's long-memory decode heat (HeatEngine::heat_long)
+     * instead of its placement heat; the tie-break, the slots, the copies and every drop and recall are today's.
+     * Set between steps (every rank thread parked). Placement only. */
+    void set_place_lf(bool on) { place_lf_ = on; }
+    bool place_lf() const { return place_lf_; }
+
 private:
     /* One in-flight relocation: Free -> Copying -> Published -> Quarantine -> Free. Transfers
      * are asynchronous; every transition is made by the dispatch thread at a layer boundary. No
@@ -987,6 +1031,16 @@ private:
     int  draft_advance(HeatEngine* heat);
     void dl_count();
 
+    /* ds41-lf: the lent-slot counters, lever LF's switch, and the slot-class helpers. lender_of: the lender
+     * whose segment holds `slot` of `cp`, -1 for a budgeted one; note_slot: tells the heat engine the class of
+     * the slot `unit` now sits in (SlotClass). */
+    LentCounters         lent_;
+    bool                 place_lf_ = false;
+    int  lender_of(const ClassPools& cp, int64_t slot) const;
+    void note_slot(int32_t unit, HeatEngine* heat) const;
+    enum DropCause { kDropOther = 0, kDropVictim = 1, kDropReserve = 2, kDropRecall = 3 };
+    void count_drop(const ClassPools& cp, int64_t slot, int cause);
+
     /* Each lender's loan in its own measure, and the totals the dashboard reads. */
     int64_t              loan_[kLenders] = {};
     std::atomic<int64_t> flex_used_{0};
@@ -1005,8 +1059,9 @@ private:
     bool unit_in_flight(int32_t unit) const;
     /* Whether stage_units would copy `unit`: pooled, with no slab slot and no copy in flight. */
     bool stageable(int32_t unit) const;
-    /* A unit in a lent slot back to the host copy it kept. See Move::Kind::Drop. */
-    int  drop(int32_t unit, HeatEngine* heat);
+    /* A unit in a lent slot back to the host copy it kept. See Move::Kind::Drop. `cause` (DropCause) is only
+     * counted (LentStats). */
+    int  drop(int32_t unit, HeatEngine* heat, int cause = 0);
     /* The pool slot a demotion copies `unit` into: one its layer's units started out in, else a
      * same-layer donor's, else any free one, else any donor's; -1 when there is none. */
     int64_t pool_slot_for(int32_t unit, HeatEngine* heat);

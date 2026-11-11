@@ -674,6 +674,10 @@ private:
     std::atomic<int> dw_on_{0};
     bool             dw_lent_ = false;
     int  draft_w_step();
+    /* Lever LF (ds41-lf, fn4 place_lf; RADIANCE_PLACE_LF=1 at start): every rank places dynamically, and the switch
+     * (Mover::set_place_lf on every rank). */
+    bool             lf_capable_ = false;
+    std::atomic<int> lf_on_{0};
     int              arena_dec_rungs_ = 0;
     std::atomic<int> arena_d0_{0};
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one

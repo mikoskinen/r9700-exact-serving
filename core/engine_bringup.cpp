@@ -3334,6 +3334,9 @@ static HeatParams heat_params_from_env() {
     if (num("RADIANCE_HEAT_PREFILL_DECAY", &v) && v > 0.0f && v < 1.0f) hp.prefill_decay = v;
     if (num("RADIANCE_HEAT_PREFILL_GAIN", &v) && v > 0.0f) hp.prefill_gain = v;
     if (num("RADIANCE_HEAT_DECODE_PIN", &v) && v > 0.0f) hp.decode_pin = std::min(v, 0.99f);
+    /* Lever LF (ds41-lf): the long-memory decode heat's decay (HeatParams::long_decay), read only by the lent
+     * slots' fill under fn4 place_lf 1. */
+    if (num("RADIANCE_PLACE_LF_DECAY", &v) && v > 0.0f && v < 1.0f) hp.long_decay = v;
     return hp;
 }
 
@@ -3468,7 +3471,12 @@ int Engine::load_weights() {
          * returns RAD_OK with `enabled() == false`. */
         heat_prefill_share_ = hp.prefill_share;
         heat_dual_ = hp.prefill_decay > 0.0f && hp.prefill_decay < 1.0f;
-        RAD_TRY(r->heat.init(r->plan, hp));
+        {
+            /* ds41-lf: a draft head's units (layers past the trunk's) are counted apart by slot class. */
+            HeatParams hpr = hp;
+            hpr.trunk_layers = r->program.meta.n_layers > 0 ? (int32_t)r->program.meta.n_layers : -1;
+            RAD_TRY(r->heat.init(r->plan, hpr));
+        }
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes
@@ -4770,6 +4778,25 @@ int Engine::start() {
     }
     fn4::draft_w_register(dw_capable_);
     fn4::note_sched(fn4::kDraftLendW, dw_on_.load(std::memory_order_relaxed));
+
+    /* Lever LF (ds41-lf, fn4 place_lf): the lent slots' fill ranks by the long-memory decode heat. It can act
+     * wherever every rank places dynamically (a heat engine and a mover that move). RADIANCE_PLACE_LF=1 starts
+     * it on; unset or 0: off (today's fill). */
+    {
+        bool all = !ranks_.empty();
+        for (auto& r : ranks_) all = all && r->heat.enabled();
+        lf_capable_ = all;
+        const char* e = getenv("RADIANCE_PLACE_LF");
+        const int on = lf_capable_ && e && std::atoi(e) == 1 ? 1 : 0;
+        lf_on_.store(on, std::memory_order_relaxed);
+        for (auto& r : ranks_) r->mover.set_place_lf(on == 1);
+        if (e && *e)
+            RAD_INFO("lent-slot fill (lever LF, RADIANCE_PLACE_LF=%s, fn4 place_lf): %s; the long-memory decode heat "
+                     "decays %.4f a step", e, !lf_capable_ ? "not available (a static plan)" : on ? "on" : "off",
+                     lf_capable_ ? (double)heat_params_from_env().long_decay : 0.0);
+        fn4::place_lf_register(lf_capable_);
+        fn4::note_sched(fn4::kPlaceLf, on);
+    }
 
     /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
      * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is

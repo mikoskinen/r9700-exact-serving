@@ -519,6 +519,30 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
                     x["stream_bytes"]     = (double)r.stream_bytes;
                     x["draft_lent_units"] = r.draft_lent_units;
                     x["flex_bytes"]       = (double)r.flex_bytes;
+                    if (r.slots) {   /* ds41-lf */
+                        static const char* const kC[7] = { "cold", "trunk", "kv", "arena", "dslab", "dw", "draft" };
+                        static const char* const kL[4] = { "kv", "arena", "dslab", "dw" };
+                        json hit, miss, lent;
+                        for (int c = 0; c < 7; ++c) { hit[kC[c]] = r.slot_hit[c]; miss[kC[c]] = r.slot_miss[c]; }
+                        for (int k = 0; k < 4; ++k) {
+                            json l;
+                            l["covered"]      = r.lent_covered[k];
+                            l["held"]         = r.lent_held[k];
+                            l["fills"]        = r.lent_fills[k];
+                            l["fills_lf"]     = r.lent_fills_lf[k];
+                            l["fills_hot"]    = r.lent_fills_hot[k];
+                            l["drop_victim"]  = r.lent_drop_victim[k];
+                            l["drop_reserve"] = r.lent_drop_reserve[k];
+                            l["drop_recall"]  = r.lent_drop_recall[k];
+                            lent[kL[k]] = std::move(l);
+                        }
+                        json sl;
+                        sl["hit"]  = std::move(hit);
+                        sl["miss"] = std::move(miss);
+                        x["slots"]    = std::move(sl);
+                        x["lent"]     = std::move(lent);
+                        x["place_lf"] = r.place_lf;
+                    }
                     rk.push_back(std::move(x));
                 }
                 e["ranks"] = std::move(rk);

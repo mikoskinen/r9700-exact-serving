@@ -1402,7 +1402,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
         /* A unit that kept its host copy is dropped, not demoted: its pool slot still holds its
          * bytes, so there is nothing to copy and no second pool slot to take. */
-        if (!promote && us.pool_slot >= 0 && us.slab_slot >= 0) return drop(unit, heat) >= 0;
+        if (!promote && us.pool_slot >= 0 && us.slab_slot >= 0) return drop(unit, heat, kDropVictim) >= 0;
 
         /* A hot-cache unit has no pool slot to demote into and needs none:
          * the container holds its bytes, so the eviction is bookkeeping — free the slot,
@@ -1636,20 +1636,53 @@ int64_t Mover::loan_ceiling(int lender) const {
 
 void Mover::count_flex() {
     int64_t used = 0, offered = 0;
+    int64_t cov[LentStats::kN] = {}, held[LentStats::kN] = {};
     for (const ClassPools& cp : pools_) {
         if (cp.flex_ptr.empty()) continue;
         used += cp.slab.held_from(cp.n_fixed) * cp.stride;
-        for (const ClassPools::Lent& l : cp.lent)
+        for (const ClassPools::Lent& l : cp.lent) {
             offered += (cp.slab.target(l.seg) - l.first) * cp.stride;
+            /* ds41-lf: each lender's occupancy, in slots. */
+            if (l.lender >= 0 && l.lender < LentStats::kN) {
+                cov[l.lender] += cp.slab.target(l.seg) - l.first;
+                held[l.lender] += cp.slab.held_in(l.seg);
+            }
+        }
     }
     flex_used_.store(used, std::memory_order_relaxed);
     flex_offered_.store(offered, std::memory_order_relaxed);
+    for (int k = 0; k < LentStats::kN; ++k) { lent_.covered[k] = cov[k]; lent_.held[k] = held[k]; }
 }
 
-int Mover::drop(int32_t unit, HeatEngine* heat) {
+/* ds41-lf: the slot-class bookkeeping (counters only; nothing here moves a unit). */
+int Mover::lender_of(const ClassPools& cp, int64_t slot) const {
+    if (slot < 0 || !cp.is_flex(slot)) return -1;
+    for (const ClassPools::Lent& l : cp.lent)
+        if (slot >= l.first && slot < l.first + (int64_t)l.need.size()) return l.lender;
+    return -1;
+}
+
+void Mover::note_slot(int32_t unit, HeatEngine* heat) const {
+    if (!heat || unit < 0 || (size_t)unit >= unit_.size()) return;
+    const UnitState& us = unit_[(size_t)unit];
+    if (us.klass < 0 || us.slab_slot < 0) return;
+    const int ld = lender_of(pools_[(size_t)us.klass], us.slab_slot);
+    heat->set_slot_class(unit, ld < 0 ? (uint8_t)kSlotTrunk : (uint8_t)(kSlotKV + ld));
+}
+
+void Mover::count_drop(const ClassPools& cp, int64_t slot, int cause) {
+    const int ld = lender_of(cp, slot);
+    if (ld < 0 || ld >= LentStats::kN) return;
+    if (cause == kDropVictim) ++lent_.drop_victim[ld];
+    else if (cause == kDropReserve) ++lent_.drop_reserve[ld];
+    else if (cause == kDropRecall) ++lent_.drop_recall[ld];
+}
+
+int Mover::drop(int32_t unit, HeatEngine* heat, int cause) {
     const int rec = free_move_record();
     if (rec < 0) { ++stats_.no_record; return RAD_E_FULL; }
     UnitState& us = unit_[(size_t)unit];
+    if (us.klass >= 0) count_drop(pools_[(size_t)us.klass], us.slab_slot, cause);
     Move& m = moves_[(size_t)rec];
     m.state = Move::State::Published;       /* nothing to copy: the host copy never went away */
     m.kind = Move::Kind::Drop;
@@ -1883,7 +1916,9 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
         if (us.klass != (int32_t)klass || us.tier != Tier::HostPinned || us.pool_slot < 0) continue;
         if (!plan_->units[(size_t)u].movable) continue;
         if (heat && heat->busy(u)) continue;
-        cand.push_back(Cand{ heat ? heat->heat(u) : 0.0f, plan_->units[(size_t)u].layer, u });
+        /* Lever LF (place_lf): the long-memory decode heat ranks the candidates instead (same tie-break). */
+        const float key = !heat ? 0.0f : place_lf_ ? heat->heat_long(u) : heat->heat(u);
+        cand.push_back(Cand{ key, plan_->units[(size_t)u].layer, u });
     }
     std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.h > b.h; });
 
@@ -1920,6 +1955,12 @@ int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
                 pools_[klass].slab.add_free(slot);
                 if (heat) heat->set_busy(u, false);
                 return RAD_OK;
+            }
+            /* ds41-lf: the fill's counters, by lender. */
+            if (const int ld = lender_of(pools_[klass], slot); ld >= 0 && ld < LentStats::kN) {
+                ++lent_.fills[ld];
+                if (place_lf_) ++lent_.fills_lf[ld];
+                if (heat && heat->heat(u) >= 1.0f) ++lent_.fills_hot[ld];
             }
             ++issued;
             ++added[k.second];
@@ -1969,7 +2010,7 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
                     left = true;
                     continue;
                 }
-                if (drop(u, heat) < 0) { left = true; break; }
+                if (drop(u, heat, kDropRecall) < 0) { left = true; break; }
                 drained = true;
             }
             cp.strand_check = left;
@@ -2009,7 +2050,7 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
             std::partial_sort(drop_cand_.begin(), drop_cand_.begin() + (ptrdiff_t)k, drop_cand_.end(),
                               colder);
             for (size_t i = 0; i < k; ++i) {
-                if (drop(drop_cand_[i].second, heat) < 0) break;
+                if (drop(drop_cand_[i].second, heat, kDropReserve) < 0) break;
                 drained = true;
                 --short_by;
             }
@@ -2085,6 +2126,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
         if (us.klass < 0 || us.slab_slot < 0) continue;
         ClassPools& cp = pools_[(size_t)us.klass];
         if (!cp.is_flex(us.slab_slot) || cp.slab.covered(us.slab_slot)) continue;
+        count_drop(cp, us.slab_slot, kDropRecall);
         if (us.pool_slot < 0) {
             const int64_t from = us.slab_slot;
             int64_t to = cp.slab.take();
@@ -2096,6 +2138,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
             if (to >= 0) {
                 RAD_TRY(rad_memcpy_async(cp.slot_ptr(to), cp.slot_ptr(from), us.bytes, mover_));
                 us.slab_slot = to;
+                note_slot(u, heat);
             } else if (g >= 0) {
                 RAD_TRY(rad_memcpy_async((char*)cp.pool_base + g * cp.stride, cp.slot_ptr(from),
                                          us.bytes, mover_));
@@ -2508,6 +2551,7 @@ int Mover::retire(HeatEngine* heat) {
                 us.site = Site::Device;
                 ++stats_.promotions;
                 if (heat) heat->set_tier(m.unit, Tier::VRAM);
+                note_slot(m.unit, heat);
                 break;
             case Move::Kind::Demote:
                 /* Out of a lent slot, the unit was a donor (donor_slot): any other unit there is
@@ -2548,6 +2592,7 @@ int Mover::retire(HeatEngine* heat) {
                     heat->set_tier(m.unit, Tier::VRAM);
                     heat->set_busy(m.unit, false);
                 }
+                note_slot(m.unit, heat);
                 m.clear();
                 continue;
             case Move::Kind::Deposit:
@@ -2565,6 +2610,7 @@ int Mover::retire(HeatEngine* heat) {
                 us.slab_slot = m.to_slot;
                 --pools_[(size_t)us.klass].n_donated;
                 ++stats_.relocated;
+                note_slot(m.unit, heat);
                 break;
             case Move::Kind::Release:
             case Move::Kind::Drop:

@@ -5323,6 +5323,29 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     fn4::note_sched(fn4::kDraftOcc, 0);
     fn4::note_sched(fn4::kDraftOccK, 32);
     fn4::note_draft_counts(0, 0, 0, 0, 0, 0);
+    /* Lever LF, place_lf (the engine's, ds41-lf): 0 / 1, 1 refused until an engine registered dynamic placement
+     * on every rank; GET reports what the engine applied. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"place_lf":2})").status, 400);
+    const HttpResponse lf0 = f.post("/admin/fn4", R"({"place_lf":1})");
+    CHECK_EQ(lf0.status, 400);
+    CHECK(has(lf0.body, "no engine has registered its placement"));
+    fn4::place_lf_register(false);
+    const HttpResponse lf1 = f.post("/admin/fn4", R"({"place_lf":1})");
+    CHECK_EQ(lf1.status, 400);
+    CHECK(has(lf1.body, "placement is static here"));
+    fn4::place_lf_register(true);
+    fn4::note_sched(fn4::kPlaceLf, 0);
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_occ_k\": 32, \"place_lf\": 0"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"place_lf":1})").status, 200);
+    CHECK(fn4::apply_pending(41, sw));
+    CHECK_EQ(sw[fn4::kPlaceLf], 1);
+    CHECK_EQ(sw[fn4::kDraftOcc], fn4::kNoChange);
+    fn4::note_sched(fn4::kPlaceLf, 1);
+    CHECK(has(f.get("/admin/fn4").body, "\"place_lf\": 1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"place_lf":0})").status, 200);
+    CHECK(fn4::apply_pending(42, sw));
+    fn4::note_sched(fn4::kPlaceLf, 0);
+    fn4::place_lf_register(false);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
     CHECK_EQ(sw[fn4::kDraftLend], -1);

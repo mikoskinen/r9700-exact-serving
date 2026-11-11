@@ -25,7 +25,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
                                         "dspark_walk", "ds41_bi", "draft_sample", "draft_lend_hyst", "arena_d0",
-                                        "draft_lend_w", "draft_occ", "draft_occ_k" };
+                                        "draft_lend_w", "draft_occ", "draft_occ_k", "place_lf" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -58,6 +58,7 @@ struct State {
     std::atomic<int> ctxskip_capable{-1};   /* -1 no engine registered, 0 / 1 */
     std::atomic<int> arena_d0_capable{-1};  /* lever Z0-A: -1 no engine registered, 0 / 1 */
     std::atomic<int> draft_w_capable{-1};   /* lever Z0-W: -1 no engine registered, 0 / 1 */
+    std::atomic<int> place_lf_capable{-1};  /* lever LF: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> lendw[5];          /* note_lend_w */
     std::atomic<int64_t> ctxs[8];        /* note_ctxskip */
     std::atomic<int> sample_capable{-1};   /* draft_sample: -1 no engine registered, 0 / 1 */
@@ -165,7 +166,7 @@ bool sched_switch(int i) {
     return i == kDraftAdaptive || i == kDraftDepth0 || i == kDraftProbe || i == kDraftHybrid ||
            i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow ||
            i == kDraftCtxSkip || i == kDraftLendHyst || i == kArenaD0 || i == kDraftLendW ||
-           i == kDraftOcc || i == kDraftOccK;
+           i == kDraftOcc || i == kDraftOccK || i == kPlaceLf;
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -230,6 +231,7 @@ void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t look
 void ctxskip_register(bool capable) { st().ctxskip_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void arena_d0_register(bool capable) { st().arena_d0_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void draft_w_register(bool capable) { st().draft_w_capable.store(capable ? 1 : 0, std::memory_order_release); }
+void place_lf_register(bool capable) { st().place_lf_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void note_lend_w(int64_t lent, int64_t lends, int64_t reclaims, int64_t lent_units, int64_t mib) {
     State& s = st();
     const int64_t v[5] = { lent, lends, reclaims, lent_units, mib };
@@ -303,7 +305,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
-                        "draft_lend_w, draft_occ, draft_occ_k, epoch_bump)";
+                        "draft_lend_w, draft_occ, draft_occ_k, place_lf, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -355,6 +357,21 @@ bool check(const std::string& name, int v, std::string* err) {
                 *err = std::string("draft_occ=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no scheduler has registered a drafter"
                                 : "this deployment's drafter cannot run the adaptive window");
+            return false;
+        }
+        return true;
+    }
+    if (i == kPlaceLf) {   /* lever LF */
+        if (v < 0 || v > 1) {
+            if (err) *err = "place_lf takes 1 (lent slots filled by the long-memory decode heat) or 0 (off)";
+            return false;
+        }
+        const int cap = s.place_lf_capable.load(std::memory_order_acquire);
+        if (v == 1 && cap != 1) {
+            if (err)
+                *err = std::string("place_lf=1 refused: ") +
+                       (cap < 0 ? "no engine has registered its placement"
+                                : "placement is static here (no heat engine on every rank): nothing fills lent slots");
             return false;
         }
         return true;

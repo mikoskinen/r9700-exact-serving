@@ -80,6 +80,13 @@
  *                   it moves only D7's choice of depth. GET's "draft" object counts occ_cycles and occ_moves.
  *   draft_occ_k     scheduler (lever Z0-O, DraftController::occ_k): the consecutive cycles draft_occ counts each way,
  *                   1 .. 4096; starts 32 (DraftController::kOccK).
+ *   place_lf        engine (lever LF, ds41-lf; Mover::fill): 0 off -- free lent slots (a KV / arena / drafter loan's) are
+ *                   filled hottest pooled unit first by the heat engine's placement heat, as today; 1 by its long-memory
+ *                   decode heat (the decode heat's credit at decay RADIANCE_PLACE_LF_DECAY, 0.998 a step: how often decode
+ *                   routed an expert over the last few hundred steps), the same tie-break, slots and copies; every drop,
+ *                   recall and swap as today. RADIANCE_PLACE_LF=1 at start starts it on. 1 refused unless every rank
+ *                   places dynamically. Exact: placement only (which expert sits in which slot). /stats
+ *                   experts.ranks[] carries the slot classes' hits / misses and each lender's occupancy, fills and drops.
  *   draft_lend_hyst scheduler (lever Z0-H, sched/draft.h DraftController::lend_hyst): 0 off (kHyst, 2 %, throughout);
  *                   1 .. 100: while the drafter's slab is lent or the lend is wanted, a move from depth 0 to drafting
  *                   needs the window's yield to beat the lent plain step's by that many percent (at least kHyst); a
@@ -225,7 +232,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
-              kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kSwitches };
+              kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -293,6 +300,8 @@ void ctxskip_register(bool capable);
 void arena_d0_register(bool capable);
 /* The engine, at bring-up (lever Z0-W): whether draft_lend_w can act (declared and set up on every rank). */
 void draft_w_register(bool capable);
+/* The engine, at bring-up (lever LF): whether place_lf can act (every rank places dynamically). */
+void place_lf_register(bool capable);
 /* The engine, after every block drafter's turn: steps whose context pass was skipped, refill passes and their
  * rows, kept rows dropped (a sequence finished or preempted, or older than the drafter's window), refills forced
  * by a full ring, rows kept now, and the ring's step slots and MiB a rank. */
