@@ -139,6 +139,7 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
     if (layer_end_ != INT32_MAX) {
         lim_ = 0;
         while ((size_t)lim_ < layers_.size() && layers_[(size_t)lim_].layer < layer_end_) ++lim_;
+        skipped_ += (int64_t)layers_.size() - lim_;
     }
     return true;
 }

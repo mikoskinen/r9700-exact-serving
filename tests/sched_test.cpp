@@ -9812,6 +9812,205 @@ TEST(dst_bypass_total_on_the_ds_geometry) {
     }
 }
 
+/* ================================================== lever PSK design 2 on every admission path (ds41-int7-pskglue)
+ * The DS41 line's geometry (total_run's `ds`: exact resume, interval 2048, span 2, span floor 16384, MNBT 4160): targets
+ * q_i = 2048 + (i - 1) x 4096 (alone's span ends), the tail snapshot, the end, checkpoint_at. A run: four decoders, a long
+ * prompt p beside them, on the first held step after p's first chunk the newcomers `lens`; every prefill piece with its
+ * checkpoint and its plan (`ahead`, kPskNoPlan when unplanned), the snapshots committed, the scheduler's metrics. */
+namespace {
+struct PskPiece { int64_t at, n, ck; int32_t ahead; int step; };
+struct PskModeRun {
+    std::string shape;
+    std::map<uint64_t, std::vector<PskPiece>> pieces;
+    std::vector<int64_t> committed;
+    std::vector<uint64_t> ids;
+    uint64_t p = 0;
+    int planned_steps = 0;
+    SchedMetrics m{};
+};
+PskModeRun psk_mode_run(int mode, int k, int bic, int bypass, int total, int64_t L, const std::vector<int>& lens, int steps,
+                        int64_t hit = 0, int64_t hit_lin = 0) {
+    PskModeRun out;
+    DstSwitches restore;
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefill_interleave = 8;
+    f.cfg.prefix_exact = true;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1024);
+    f.sch.set_span_min(16384);
+    CHECK(DstSwitches::set("sched_bi_chunk", bic));
+    CHECK(DstSwitches::set("sched_short_bypass", bypass));
+    CHECK(DstSwitches::set("sched_bypass_total", total));
+    if (mode >= 0) f.sch.set_psk_mode(mode);
+    f.sch.set_psk_k(k);
+    for (int d = 0; d < 4; ++d) f.submit(100, 4000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    out.p = f.submit((int)L, 2);
+    bool sent = false;
+    for (int s = 0; s < steps; ++s) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        std::vector<int32_t> ahead, rows;
+        int64_t dec = -1;
+        const bool planned = f.sch.psk_plan(b->step, &ahead, &rows, &dec);
+        out.planned_steps += planned ? 1 : 0;
+        bool chunk = false;
+        size_t pi = 0;
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (!e.is_prefill) continue;
+            if (e.seq == out.p) chunk = true;
+            const int32_t a = planned && pi < ahead.size() ? ahead[pi] : Scheduler::kPskNoPlan;
+            if (planned) CHECK(pi < rows.size() && rows[pi] == e.n_tokens);
+            out.pieces[e.seq].push_back({ e.ctx_len, e.n_tokens, e.ckpt_slot >= 0 ? e.ctx_len + e.ckpt_tok + 1 : -1, a, s });
+            ++pi;
+        }
+        out.shape += chunk ? 'C' : 'D';
+        f.commit_plain(12);
+        if (!sent && chunk) {
+            if (hit > 0) { f.pc.seed((int32_t)hit); f.pc.lin = (int32_t)hit_lin; f.pc.src = 3; }
+            for (int l : lens) out.ids.push_back(f.submit(l, 4));
+            sent = true;
+        }
+    }
+    out.committed = f.pc.committed;
+    out.m = f.sch.metrics();
+    (void)DstSwitches::set("sched_bypass_total", 0);
+    return out;
+}
+/* the targets of an L-token prompt from `from` (K = 2 here: q_2 = 6144, q_4 = 14336, ...; the tail; L) */
+std::vector<int64_t> psk_targets_of(int64_t L, int k) {
+    std::vector<int64_t> t;
+    for (int64_t i = k; 2048 + (i - 1) * 4096 < L; i += k) t.push_back(2048 + (i - 1) * 4096);
+    const int64_t tail = L - 1 >= 2048 ? 2048 + (L - 1 - 2048) / 4096 * 4096 : -1;
+    if (tail > 2048 && std::find(t.begin(), t.end(), tail) == t.end()) t.push_back(tail);
+    t.push_back(L);
+    std::sort(t.begin(), t.end());
+    return t;
+}
+/* every piece planned with ahead = (the first target past its start) - its end */
+void psk_check_plan(const std::vector<PskPiece>& pc, const std::vector<int64_t>& tg, const char* what) {
+    for (const PskPiece& x : pc) {
+        int64_t t1 = -1;
+        for (int64_t t : tg) if (t > x.at) { t1 = t; break; }
+        const int64_t want = t1 - (x.at + x.n);
+        CHECK(x.ahead != Scheduler::kPskNoPlan);
+        CHECK_EQ((int64_t)x.ahead, want);
+        if (x.ahead == Scheduler::kPskNoPlan || (int64_t)x.ahead != want)
+            fprintf(stderr, "    %s: piece [%lld, %lld) ahead %d, want %lld\n", what, (long long)x.at, (long long)(x.at + x.n),
+                    (int)x.ahead, (long long)want);
+    }
+}
+}  // namespace
+
+/* sched_bi_chunk 3 (option D) beside decode rows, ds41_psk 2, K 2: p (20000 tokens, over the span floor: alone's 4096-row
+ * spans, which D cuts on the 2048 grid beside decode rows; 4 / 1 / 0 as they plan) is planned at every piece; its snapshots are its targets only (6144 = q_2, 14336 = q_4, the tail 18432 = q_5),
+ * each one of D's chunk ends; D's pieces are the same as under ds41_psk 0; a prefix hit at 16384 (the deepest snapshot
+ * below it the anchor 14336) resumes there, planned, and is counted as a fallback. */
+TEST(psk_glue_option_d_plans_every_piece_and_snapshots_at_targets) {
+    const int64_t L = 20000;
+    const auto tg = psk_targets_of(L, 2);
+    CHECK((tg == std::vector<int64_t>{ 6144, 14336, 18432, 20000 }));
+    for (int bic : { 3, 4, 1, 0 }) {
+        const PskModeRun off = psk_mode_run(0, 2, bic, 0, 0, L, {}, 240);
+        const PskModeRun on = psk_mode_run(2, 2, bic, 0, 0, L, {}, 240);
+        const auto& po = on.pieces.at(on.p);
+        const auto& pf = off.pieces.at(off.p);
+        CHECK_EQ(po.size(), pf.size());
+        int64_t sum = 0;
+        std::vector<int64_t> ends, cks;
+        for (size_t i = 0; i < po.size() && i < pf.size(); ++i) {
+            CHECK(po[i].at == pf[i].at && po[i].n == pf[i].n);   /* chunking untouched */
+            sum += po[i].n;
+            ends.push_back(po[i].at + po[i].n);
+            if (po[i].ck > 0) cks.push_back(po[i].ck);
+        }
+        CHECK_EQ(sum, L);
+        psk_check_plan(po, tg, "option D");
+        CHECK((cks == std::vector<int64_t>{ 6144, 14336, 18432 }));
+        for (int64_t t : tg) CHECK(std::find(ends.begin(), ends.end(), t) != ends.end());   /* anchors on D's chunk ends */
+        std::vector<int64_t> want_off;                               /* today: every grid point a piece ends on */
+        for (const PskPiece& x : pf) if (x.ck > 0) want_off.push_back(x.ck);
+        CHECK((want_off == std::vector<int64_t>{ 2048, 6144, 10240, 14336, 18432 }));
+        CHECK_EQ(on.m.psk_latched, (int64_t)5);                   /* the four decoders' prompts and p */
+        CHECK(on.m.psk_planned_steps > 0);
+        CHECK_EQ(on.m.psk_ckpt_anchor, (int64_t)3);
+        CHECK_EQ(on.m.psk_ckpt_dropped, (int64_t)2);
+        CHECK_EQ(on.m.psk_mode, 2);
+        CHECK_EQ(on.m.psk_k, 2);
+        CHECK(on.shape == off.shape);
+    }
+    /* the hit: a 24000-token newcomer whose match the cache gives as 16384 attention / 14336 linear (the anchor below) */
+    const PskModeRun hit = psk_mode_run(2, 2, 3, 0, 0, L, { 24000 }, 400, 16384, 14336);
+    REQUIRE(hit.ids.size() == 1);
+    const auto& ph = hit.pieces.at(hit.ids[0]);
+    REQUIRE(!ph.empty());
+    CHECK_EQ(ph[0].at, (int64_t)14336);
+    psk_check_plan(ph, psk_targets_of(24000, 2), "hit");
+    CHECK_EQ(hit.m.psk_fallback_resumes, (int64_t)1);
+    CHECK_EQ(hit.m.psk_fallback_tokens, (int64_t)(16384 - 14336));
+    CHECK_EQ(hit.m.psk_latched, (int64_t)6);
+}
+
+/* sched_short_bypass (and sched_bypass_total): a 1000-token newcomer runs its alone piece on a held step and is planned
+ * there (its one target its end: ahead 0); a 3000-token one through the bypass total (two alone pieces on held steps), both
+ * planned; under sched_bi_chunk 0 and 3. */
+TEST(psk_glue_a_bypassed_newcomer_gets_its_plan) {
+    for (int bic : { 0, 3 }) {
+        const PskModeRun on = psk_mode_run(2, 8, bic, 1280, 0, 40000, { 1000 }, 40);
+        REQUIRE(on.ids.size() == 1);
+        const int c1 = (int)on.shape.find('C');
+        REQUIRE(on.pieces.count(on.ids[0]));
+        const auto& q = on.pieces.at(on.ids[0]);
+        REQUIRE(q.size() == 1);
+        CHECK_EQ(q[0].step, c1 + 1);                         /* the held step: the bypass took it */
+        CHECK_EQ(q[0].n, (int64_t)1000);
+        CHECK_EQ((int64_t)q[0].ahead, (int64_t)0);
+        CHECK_EQ(on.m.psk_latched, (int64_t)6);                   /* four decoders, p, the newcomer */
+        const PskModeRun tot = psk_mode_run(2, 8, bic, 2112, 4096, 40000, { 3000 }, 40);
+        REQUIRE(tot.ids.size() == 1 && tot.pieces.count(tot.ids[0]));
+        const auto& t = tot.pieces.at(tot.ids[0]);
+        CHECK(t.size() == 2);
+        CHECK_EQ(t[0].step, (int)tot.shape.find('C') + 1);
+        psk_check_plan(t, psk_targets_of(3000, 8), "bypass total");
+    }
+}
+
+/* Unset, ds41_psk 0 and 1: no request latched, no plan, every snapshot as today, the counters 0 -- under every
+ * sched_bi_chunk and with the bypass on and off; the same pieces and snapshots as unset. */
+TEST(psk_glue_unset_0_and_1_change_nothing_in_any_mode) {
+    for (int bic : { 0, 1, 2, 3, 4 })
+        for (int byp : { 0, 1280 }) {
+            const PskModeRun u = psk_mode_run(-1, 8, bic, byp, 0, 20000, { 1000, 3000 }, 60);
+            for (int mode : { 0, 1 }) {
+                const PskModeRun r = psk_mode_run(mode, 8, bic, byp, 0, 20000, { 1000, 3000 }, 60);
+                CHECK(r.shape == u.shape);
+                CHECK(r.committed == u.committed);
+                CHECK_EQ(r.pieces.size(), u.pieces.size());
+                for (const auto& kv : r.pieces) {
+                    const auto it = u.pieces.find(kv.first);
+                    REQUIRE(it != u.pieces.end());
+                    CHECK_EQ(kv.second.size(), it->second.size());
+                    for (size_t i = 0; i < kv.second.size() && i < it->second.size(); ++i) {
+                        CHECK(kv.second[i].at == it->second[i].at && kv.second[i].n == it->second[i].n &&
+                              kv.second[i].ck == it->second[i].ck);
+                        CHECK(kv.second[i].ahead == Scheduler::kPskNoPlan);
+                    }
+                }
+                CHECK_EQ(r.planned_steps, 0);
+                CHECK_EQ(r.m.psk_latched + r.m.psk_planned_steps + r.m.psk_ckpt_anchor + r.m.psk_ckpt_dropped +
+                         r.m.psk_fallback_resumes + r.m.psk_fallback_tokens, (int64_t)0);
+                CHECK_EQ(r.m.psk_mode, mode);
+            }
+            CHECK_EQ(u.planned_steps, 0);
+            CHECK_EQ(u.m.psk_latched + u.m.psk_planned_steps + u.m.psk_ckpt_anchor + u.m.psk_ckpt_dropped, (int64_t)0);
+            CHECK_EQ(u.m.psk_mode, -1);
+        }
+}
+
 /* ================================================== lever DST: a long prompt beside c4, timed (not a check)
  * A measurement harness for the DST switches, run on request only:
  *

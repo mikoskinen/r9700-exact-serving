@@ -364,6 +364,36 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["linear_hit_rate"] = m.linear_hit_rate;
         o["linear_cached_tokens"] = (double)m.linear_cached_tokens;
         o["checkpoints_written"] = (double)m.checkpoints_written;
+        /* Lever PSK (ds41-int7-pskglue): live, cumulative. The scheduler's (design 2): its mode and K, requests admitted
+         * planned, steps carrying a plan, snapshots at a planned request's targets and dropped off them, planned admissions
+         * whose hit resumed below its attention match (the anchor below) and the tokens recomputed; the engine's: passes
+         * handed a plan, those that ended before the last layer, routed layers rank 0's stager did not stage for them; the
+         * plugin's (rank 0): planned passes, passes with a cut (designs 1 and 2), layers skipped whole, layer-rows not run
+         * at layers 21-29 and 30-39, plans dropped as not matching their pass. All 0 with PSK unset, 0 or not served. */
+        {
+            int64_t eg[3], pl[6];
+            fn4::psk_engine(eg);
+            fn4::psk_stats(pl);
+            json p;
+            p["mode"] = m.psk_mode;
+            p["k"] = m.psk_k;
+            p["latched"] = m.psk_latched;
+            p["planned_steps"] = m.psk_planned_steps;
+            p["ckpt_anchor"] = m.psk_ckpt_anchor;
+            p["ckpt_dropped"] = m.psk_ckpt_dropped;
+            p["fallback_resumes"] = m.psk_fallback_resumes;
+            p["fallback_tokens"] = m.psk_fallback_tokens;
+            p["engine_planned_passes"] = eg[0];
+            p["passes_ended_early"] = eg[1];
+            p["stager_layers_skipped"] = eg[2];
+            p["plugin_planned_passes"] = pl[0];
+            p["cut_passes"] = pl[1];
+            p["layers_skipped"] = pl[2];
+            p["rows_skipped_l21_29"] = pl[3];
+            p["rows_skipped_l30_39"] = pl[4];
+            p["plan_mismatch"] = pl[5];
+            o["psk"] = std::move(p);
+        }
         /* Why snapshots went and why hits reused nothing: on a hybrid model these say why a
          * long prompt was prefilled again. `hit_cut_tokens` is the checkpoint shortfall,
          * prompt tokens the attention cache held and admission computed again. */

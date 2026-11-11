@@ -43,6 +43,7 @@ struct Hooks {
     int (*value)(const char*, int*) = nullptr;
     /* lever PSK design 2 (deepseek41's rad_psk_plan), absent elsewhere */
     int (*psk_plan)(int, long long, int, const int32_t*, const int32_t*) = nullptr;
+    int (*psk_stats)(long long*, int) = nullptr;   /* its live counters (ds41-int7-pskglue) */
 };
 
 struct State {
@@ -136,6 +137,7 @@ void find_hooks(State& s) {
             k.accepts = sym<int (*)(const char*, int)>(h, "rad_fn4_accepts");
             k.value = sym<int (*)(const char*, int*)>(h, "rad_fn4_value");
             k.psk_plan = sym<int (*)(int, long long, int, const int32_t*, const int32_t*)>(h, "rad_psk_plan");
+            k.psk_stats = sym<int (*)(long long*, int)>(h, "rad_psk_stats");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -363,6 +365,32 @@ void note_sample(int64_t rows_sampled, int64_t rows_greedy, int64_t rounds_bound
 int get(int i) {
     if (i < 0 || i >= kSwitches) return -1;
     return st().val[i].load(std::memory_order_acquire);
+}
+
+namespace {
+std::atomic<int64_t> g_psk_eng[3];   /* note_psk_engine */
+}
+void note_psk_engine(int64_t planned, int64_t ended_early, int64_t stager_skipped) {
+    g_psk_eng[0].store(planned, std::memory_order_relaxed);
+    g_psk_eng[1].store(ended_early, std::memory_order_relaxed);
+    g_psk_eng[2].store(stager_skipped, std::memory_order_relaxed);
+}
+void psk_engine(int64_t out[3]) {
+    for (int i = 0; i < 3; ++i) out[i] = g_psk_eng[i].load(std::memory_order_relaxed);
+}
+int psk_stats(int64_t out[6]) {
+    for (int i = 0; i < 6; ++i) out[i] = 0;
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    for (const Hooks& k : s.hooks)
+        if (k.psk_stats) {
+            long long v[6] = { 0, 0, 0, 0, 0, 0 };
+            const int n = k.psk_stats(v, 6);
+            for (int i = 0; i < n && i < 6; ++i) out[i] = (int64_t)v[i];
+            return n;
+        }
+    return 0;
 }
 
 int psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows) {

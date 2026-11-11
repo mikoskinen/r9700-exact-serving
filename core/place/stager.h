@@ -125,6 +125,8 @@ public:
      * op of. Its routed layers from there on are not staged, and the next pass's first layers are paced on the last ones
      * the pass runs. INT32_MAX (the default, and every pass the plugin does not plan): every layer, as before. */
     void set_layer_end(int32_t layer) { layer_end_ = layer; }
+    /* Routed layers armed passes did not stage for a layer end below their last (cumulative; lever PSK's /stats). */
+    int64_t layers_skipped() const { return skipped_; }
 
     bool    enabled() const { return !layers_.empty(); }
     int64_t ring_bytes() const { return ring_; }
@@ -206,6 +208,7 @@ private:
     /* Lever PSK design 2: set_layer_end's layer, and the routed layers (layers_ entries) the armed pass runs. */
     int32_t layer_end_ = INT32_MAX;
     int32_t lim_ = 0;
+    int64_t skipped_ = 0;
     enum { kStaged, kNone, kLater };
     int  stage_ahead(int32_t cur, bool* resync);
     int  stage_layer(int32_t li, bool now, RadEvent gate, int* got);

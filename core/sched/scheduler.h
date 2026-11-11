@@ -986,7 +986,7 @@ private:
     std::vector<int32_t> psk_ahead_, psk_rows_;
     /* The request's latch at its admission (SchedReq::psk_k / psk_32k), and the checkpoint `ckpt` a chunk of a planned
      * request takes: dropped (-1) where it is not a target. */
-    void     psk_latch(SchedReq& s) const;
+    void     psk_latch(SchedReq& s);
     void     psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt);
     /* The periodic checkpoint positions q_1 < q_2 < ... (the exact grid's points from its origin, else the interval's
      * multiples): q_i, and the smallest i with q_i >= pos. */

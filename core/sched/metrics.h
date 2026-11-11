@@ -121,6 +121,18 @@ struct SchedMetrics {
     int64_t prefix_held_tokens = 0;
     float   linear_hit_rate = 0.0f;
     int64_t checkpoints_written = 0;
+    /* Lever PSK design 2 (ds41-int7-pskglue), live and cumulative: the plugin's ds41_psk as the scheduler plans by it
+     * (-1 none) and ds41_psk_k; requests admitted planned (latched, on every admission path); steps that carried a
+     * plan; snapshots taken at a planned request's target and dropped off one; admissions of a planned request whose
+     * prefix hit resumed at a snapshot below its attention match (the anchor below), and the tokens that recomputed. */
+    int32_t psk_mode = -1;
+    int32_t psk_k = 0;
+    int64_t psk_latched = 0;
+    int64_t psk_planned_steps = 0;
+    int64_t psk_ckpt_anchor = 0;
+    int64_t psk_ckpt_dropped = 0;
+    int64_t psk_fallback_resumes = 0;
+    int64_t psk_fallback_tokens = 0;
 
     /* Throughput: tokens over wall time in a 1-second decaying window (Scheduler::step_finished);
      * the counters beside them are exact. */

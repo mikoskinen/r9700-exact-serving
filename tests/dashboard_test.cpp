@@ -228,6 +228,15 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s.value("running", (int64_t)0), (int64_t)1);
     CHECK_EQ(s.value("kv_tokens_cached", (int64_t)0), (int64_t)300);
     CHECK_EQ(s.value("kv_tokens_max", (int64_t)0), (int64_t)6000);
+    /* lever PSK's live counters (ds41-int7-pskglue): present, and 0 with no plan made and no plugin serving it */
+    REQUIRE(s.contains("psk"));
+    CHECK_EQ(s["psk"].value("mode", 99), -1);
+    for (const char* k : { "latched", "planned_steps", "ckpt_anchor", "ckpt_dropped", "fallback_resumes", "fallback_tokens",
+                           "engine_planned_passes", "passes_ended_early", "stager_layers_skipped", "plugin_planned_passes",
+                           "cut_passes", "layers_skipped", "rows_skipped_l21_29", "rows_skipped_l30_39", "plan_mismatch" }) {
+        CHECK(s["psk"].contains(k));
+        CHECK_EQ(s["psk"].value(k, (int64_t)-1), (int64_t)0);
+    }
     REQUIRE(s["draft_positions"].size() == 2);
     CHECK_NEAR(s["draft_positions"][1]["rate"].get<double>(), 0.25, 1e-12);
     CHECK_EQ(s["draft_positions"][1]["reached"].get<int64_t>(), (int64_t)8);

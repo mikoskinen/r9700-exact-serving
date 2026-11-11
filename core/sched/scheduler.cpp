@@ -966,6 +966,9 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
     e.ckpt_tok = tok;
     e.ckpt_slot = cs;
     ++m_.checkpoints_written;
+    /* lever PSK design 2: a planned request's snapshot (psk_ckpt kept only its targets) */
+    if (e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] && reqs_[(size_t)e.slot]->psk_k > 0)
+        ++m_.psk_ckpt_anchor;
 }
 
 int Scheduler::fail_prefilling(const char* why) {
@@ -1677,21 +1680,29 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
  * targets only (psk_ckpt): a chunk end elsewhere takes none, so a prefix hit there resumes from the deepest snapshot
  * below it -- the cache's lookup already steps back to it -- and never reads a window the cut left stale. Chunking is
  * unchanged (plan_chunk splits where it did), so layers 0..20 run the same rows in the same chunks. */
+/* The grid as (origin, step): exact's own; under nearest with a span, alone's span ends (the first interval, then span
+ * intervals each: the chunk ends an idle prefill reaches, which a shared step also ends on); else the interval's
+ * multiples (ds41-int7-pskglue: nearest + span took the interval's multiples, off alone's chunk ends). */
+static void psk_grid(const ChunkGeometry& g, int64_t* o, int64_t* s) {
+    if (g.exact && g.grid > 0) { *o = g.grid_origin; *s = g.grid; return; }
+    const int64_t I = g.checkpoint_interval;
+    if (g.span > 1) { *o = I; *s = g.span * I; return; }
+    *o = 0;
+    *s = I;
+}
+
 int64_t Scheduler::psk_q(int64_t i) const {
-    if (geo_.exact && geo_.grid > 0)
-        return geo_.grid_origin > 0 ? geo_.grid_origin + (i - 1) * geo_.grid : i * geo_.grid;
-    return i * geo_.checkpoint_interval;
+    int64_t o = 0, g = 0;
+    psk_grid(geo_, &o, &g);
+    return o > 0 ? o + (i - 1) * g : i * g;
 }
 
 int64_t Scheduler::psk_i_at(int64_t pos) const {
     if (pos < 1) pos = 1;
-    if (geo_.exact && geo_.grid > 0) {
-        const int64_t o = geo_.grid_origin, g = geo_.grid;
-        if (o > 0) return pos <= o ? 1 : (pos - o + g - 1) / g + 1;
-        return (pos + g - 1) / g;
-    }
-    const int64_t u = geo_.checkpoint_interval;
-    return (pos + u - 1) / u;
+    int64_t o = 0, g = 0;
+    psk_grid(geo_, &o, &g);
+    if (o > 0) return pos <= o ? 1 : (pos - o + g - 1) / g + 1;
+    return (pos + g - 1) / g;
 }
 
 int64_t Scheduler::psk_next_target(const SchedReq& s, int64_t from, int64_t n) const {
@@ -1722,7 +1733,7 @@ bool Scheduler::psk_is_target(const SchedReq& s, int64_t pos, int64_t n) const {
 /* At admission: planned when the plugin runs anchors (psk_mode_ 2 / 3) and the request is a plain trunk prompt -- no
  * row of it the sampler or a scorer wants but its last (no embedding, scored rows, words for the plugin), no media, no
  * runtime window. */
-void Scheduler::psk_latch(SchedReq& s) const {
+void Scheduler::psk_latch(SchedReq& s) {
     s.psk_k = 0;
     s.psk_32k = false;
     if ((psk_mode_ != 2 && psk_mode_ != 3) || !s.req) return;
@@ -1737,6 +1748,7 @@ void Scheduler::psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt) {
     if (!ckpt || *ckpt <= 0 || s.psk_k <= 0 || psk_is_target(s, *ckpt, n)) return;
     *ckpt = -1;
     ++psk_dropped_;
+    ++m_.psk_ckpt_dropped;
 }
 
 /* ------------------------------------------------------------------ a prefill sharing a step */
@@ -2135,6 +2147,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
     int64_t ckpt = -1;
     int64_t want;
     bool bp_take = false;   /* lever DST: sched_bypass_total took it (bypass_piece) */
+    /* lever PSK design 2: this admission's targets, on every admission path (default chunking, sched_bi_chunk's
+     * bi_chunk_plan, the bypass's alone pieces); the chunking itself is the path's own */
+    psk_latch(s);
     if (r.embed) {
         /* The whole input or nothing this step (Request::embed): the next step starts with a
          * whole budget, and add_locked refused an input no budget holds. Not through plan_chunk,
@@ -2181,14 +2196,12 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * to what really has to run. */
         const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
         const int64_t end = chunk_end(r, target);
-        psk_latch(s);   /* lever PSK design 2: this admission's targets */
         want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at, &r);
         /* A run read both ways (bidi_fit) the share cannot hold takes the step instead. */
         if (want <= 0 && cap < budget && prog_->encoder.bidirectional)
             want = plan_chunk(r.n_computed, end, budget, &ckpt, r.checkpoint_at, &r);
         else if (cap < budget && want > 0)
             admit_full_ = plan_chunk(r.n_computed, end, budget, nullptr, r.checkpoint_at, &r);
-        psk_ckpt(s, target, &ckpt);
     }
     int rc = RAD_OK;
     if (want <= 0)                                          rc = RAD_E_FULL;
@@ -2232,7 +2245,14 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
                 case SchedReq::HitCut::ResumedBelow: ++m_.hit_cut_resumed_below; break;
                 case SchedReq::HitCut::None:       break;
             }
+            /* lever PSK design 2: a planned request's hit that resumed below its attention match (at the deepest
+             * snapshot under it, the anchor below; 0 when none) */
+            if (s.psk_k > 0 && s.hit_attn > r.n_cached) {
+                ++m_.psk_fallback_resumes;
+                m_.psk_fallback_tokens += s.hit_attn - r.n_cached;
+            }
         }
+        if (s.psk_k > 0) ++m_.psk_latched;
         s.hit_owed = false;
     }
 
@@ -2245,6 +2265,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
     server::sink_admitted(r.sink);
     server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
     s.sched_tokens = (int32_t)want;
+    /* lever PSK design 2: whichever path planned the chunk (default, bi_chunk_plan, the bypass), its snapshot is kept at
+     * a target only (a no-op unlatched); here, once the admission happened */
+    psk_ckpt(s, target, &ckpt);
     s.pending_ckpt = ckpt;
     s.bypass_run = bp_take;
     ++m_.admitted;
@@ -2602,13 +2625,14 @@ const RadBatch* Scheduler::step() {
             want = bypass_total_ > 0 ? bypass_piece(s, r, target, budget, &ckpt) : -1;
             if (want < 0) s.bypass_run = false;
             else if (want == 0) { ++held_prefill_; ++i; continue; }   /* waits for room; decode rows behind go on */
-            else bp = true;
+            else { bp = true; psk_ckpt(s, target, &ckpt); }   /* lever PSK design 2: a snapshot at a target only */
         }
         if (bp) {
         } else if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
         else if (prefill && bi_chunk_) {
             want = bi_chunk_plan(s, r, target, budget, &ckpt, share_step && (behind_pf > 0 || admit_waits));
             if (want <= 0) { ++i; continue; }   /* lever BI: the whole chunk or none; decode rows behind it go on */
+            psk_ckpt(s, target, &ckpt);         /* lever PSK design 2: a snapshot at a target only */
         } else if (prefill) {
             const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
@@ -3043,7 +3067,7 @@ const RadBatch* Scheduler::step() {
             psk_ahead_.push_back(a);
             psk_rows_.push_back(e.n_tokens);
         }
-        if (planned) psk_step_ = step_;
+        if (planned) { psk_step_ = step_; ++m_.psk_planned_steps; }
     }
     step_start_ = std::chrono::steady_clock::now();
     const RadBatch* b = lost_restore ? nullptr : builder_.build(plan_, *kv_, step_);
@@ -4413,6 +4437,8 @@ int Scheduler::observed_requests(ReqStat* out, int max) const {
 SchedMetrics Scheduler::metrics_locked() const {
     SchedMetrics m = m_;
     m.step = step_;
+    m.psk_mode = psk_mode_;   /* lever PSK design 2 */
+    m.psk_k = psk_k_;
     m.running = (int64_t)running_.size();
     m.queue_depth = (int64_t)waiting_.size();
     m.preempted_waiting = 0;

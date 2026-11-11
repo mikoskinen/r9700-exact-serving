@@ -959,6 +959,9 @@ void Engine::psk_release(const RadBatch* b) {
                      psk_ahead_.empty() ? 0 : psk_ahead_[0], (long long)dec, l);
     }
     for (auto& r : ranks_) r->stager.set_layer_end(end);
+    /* lever PSK's live counters (/stats "psk"): rank 0's stager counts what its armed passes did not stage */
+    if (psk_planned_ > 0)
+        fn4::note_psk_engine(psk_planned_, psk_cut_passes_, ranks_.empty() ? 0 : ranks_[0]->stager.layers_skipped());
 }
 
 /* Lever DL: the drafter's lend over every rank, as DraftController::LendSample counts it -- resident

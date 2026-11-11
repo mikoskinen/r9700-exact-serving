@@ -94,6 +94,10 @@ struct SchedMetrics {
     int64_t attn_cached_tokens = 0;
     int64_t linear_cached_tokens = 0;
     int64_t checkpoints_written = 0;
+    /* Lever PSK design 2's scheduler counters (rad::SchedMetrics::psk_*, /stats "psk"). */
+    int32_t psk_mode = -1, psk_k = 0;
+    int64_t psk_latched = 0, psk_planned_steps = 0, psk_ckpt_anchor = 0, psk_ckpt_dropped = 0;
+    int64_t psk_fallback_resumes = 0, psk_fallback_tokens = 0;
     double  prefill_tps = 0.0;
     double  decode_tps = 0.0;
     /* Exact cumulative counts behind the EWMA rates above, for comparing runs.

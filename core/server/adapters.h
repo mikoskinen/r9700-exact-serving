@@ -128,6 +128,11 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.attn_cached_tokens = m.attn_cached_tokens;
     o.linear_cached_tokens = m.linear_cached_tokens;
     o.checkpoints_written = m.checkpoints_written;
+    o.psk_mode = m.psk_mode;                     o.psk_k = m.psk_k;   /* lever PSK design 2 */
+    o.psk_latched = m.psk_latched;               o.psk_planned_steps = m.psk_planned_steps;
+    o.psk_ckpt_anchor = m.psk_ckpt_anchor;       o.psk_ckpt_dropped = m.psk_ckpt_dropped;
+    o.psk_fallback_resumes = m.psk_fallback_resumes;
+    o.psk_fallback_tokens = m.psk_fallback_tokens;
     o.draft_depth_seen = m.draft_depth_seen;
     if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
         o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;

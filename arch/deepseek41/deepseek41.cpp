@@ -1200,6 +1200,9 @@ static constexpr int64_t kPskBase = 160;
 static constexpr int32_t kPskNoHint = INT32_MIN;
 static std::atomic<int> g_sw_psk2_ok{0}, g_psk_first{0}, g_psk_nlayer{0}, g_psk_window{0};
 static std::atomic<long long> g_psk_hsteps{0}, g_psk_skips{0}, g_psk_hbad{0};
+/* Live counters for /stats (rad_psk_stats, ds41-int7-pskglue; rank 0's): layer-rows not run at the first nine cut layers
+ * (21..29 on the 1017) and at the rest (30..39), and passes with a cut (design 1 or 2). */
+static std::atomic<long long> g_psk_rows_lo{0}, g_psk_rows_hi{0}, g_psk_cut_passes{0};
 struct PskPlan {
     int step = -1;               /* the trunk pass the plan is for (RadBatch::step); -1 none */
     long long dec_tok = 0;
@@ -3993,7 +3996,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 if (s0.dec) { psk_sg.push_back(s0); continue; }
                 const int64_t n = psk_rows(C, psk_ahead(hint, pi++), s0.n);
                 if (n >= s0.n) { psk_sg.push_back(s0); continue; }
-                if (rad_rank(x) == 0) g_psk_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
+                if (rad_rank(x) == 0) {
+                    g_psk_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
+                    (l < m.psk_first + 9 ? g_psk_rows_lo : g_psk_rows_hi).fetch_add(s0.n - n, std::memory_order_relaxed);
+                }
                 cut = true;
                 if (n <= 0) continue;   /* design 2: no row of this segment at this layer */
                 BiSeg s = s0;
@@ -4427,6 +4433,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             });
     }
     if (psk && cur != &sg && rad_rank(x) == 0) {   /* lever PSK: a cut step (stats; the first one's cut rows) */
+        g_psk_cut_passes.fetch_add(1, std::memory_order_relaxed);
         const long long n = g_psk_steps.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n == 1 || n % 256 == 0) {
             std::string seg;
@@ -5047,6 +5054,22 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
  * the chunk's first position, less the chunk's end; kPskNoHint: not planned) and its chunk rows, and the step's decode
  * rows. Returns the first layer from which no row of the step runs (the pass issues nothing from it on; the stager stages
  * no layer from it), n_layer when every layer runs, -1 when lever PSK is not declared here (the plan is not kept). */
+/* Lever PSK's live counters for /stats (ds41-int7-pskglue), rank 0's, cumulative: out[0] trunk passes that followed a
+ * scheduler plan, [1] passes with a cut (design 1 or 2), [2] layers skipped whole (design 2), [3] layer-rows not run at
+ * the first nine cut layers (21..29), [4] at the rest (30..39), [5] plans dropped as not matching their pass. Returns
+ * how many it wrote (6), 0 when lever PSK is not declared here. */
+extern "C" int rad_psk_stats(long long* out, int n) {
+    using namespace deepseek41;
+    if (!out || n < 6 || g_psk_first.load(std::memory_order_relaxed) <= 0) return 0;
+    out[0] = g_psk_hsteps.load(std::memory_order_relaxed);
+    out[1] = g_psk_cut_passes.load(std::memory_order_relaxed);
+    out[2] = g_psk_skips.load(std::memory_order_relaxed);
+    out[3] = g_psk_rows_lo.load(std::memory_order_relaxed);
+    out[4] = g_psk_rows_hi.load(std::memory_order_relaxed);
+    out[5] = g_psk_hbad.load(std::memory_order_relaxed);
+    return 6;
+}
+
 extern "C" int rad_psk_plan(int step, long long dec_tok, int n, const int32_t* ahead, const int32_t* rows) {
     using namespace deepseek41;
     const int first = g_psk_first.load(std::memory_order_relaxed), nl = g_psk_nlayer.load(std::memory_order_relaxed);

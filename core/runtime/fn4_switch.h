@@ -382,6 +382,13 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
  * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
  * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */
 int  psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows);
+/* Lever PSK's live counters (ds41-int7-pskglue, /stats "psk"). The engine, at every step release: trunk passes it handed a
+ * plan to, those that ended before the last layer, and the routed layers rank 0's stager did not stage for it. The
+ * plugin's (rad_psk_stats, rank 0's): planned passes, passes with a cut, layers skipped whole, layer-rows not run at the
+ * first nine cut layers and at the rest, plans dropped as not matching -- 0s and a return of 0 with no plugin serving it. */
+void note_psk_engine(int64_t planned, int64_t ended_early, int64_t stager_skipped);
+void psk_engine(int64_t out[3]);
+int  psk_stats(int64_t out[6]);
 /* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
  * "accept"; under draft_depth0 2 every head draft is a probe's). */
 void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted);
