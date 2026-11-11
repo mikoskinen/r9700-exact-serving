@@ -1162,7 +1162,8 @@ static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 10
  * The indexer at a cut layer (ds41-psk-fix): the candidate layer's keep (index_keep) is rank-local -- under the row split
  * each rank's index_candidates writes only its own runs' rows, and keep is not gathered -- so a cut layer's indexer keeps
  * the step's deal (ds41_idx_runs over the uncut segment, as every uncut layer) and skips the runs wholly before its cut
- * rows; re-dealt over the cut rows, a rank would read keep rows another rank wrote (r00y's trace: L28.sel). */
+ * rows; re-dealt over the cut rows, a rank would read keep rows another rank wrote (r00y's trace: L28.sel).
+ * ds41_psk 3 (diagnostic, ds41-psk-fix): the cut as 1 with ds41-psk's indexer -- the runs re-dealt over the cut rows. */
 static std::atomic<int> g_sw_psk{0}, g_sw_psk_ok{0}, g_sw_psk_env{-2};   /* env: -2 unread, -1 unset */
 static std::atomic<long long> g_psk_steps{0}, g_psk_rows{0};
 static void psk_read_env() {
@@ -1203,7 +1204,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_bi"))
         return value == 0 || (value >= 1 && value <= 4 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))
-        return value == 0 || ((value == 1 || value == 2) && g_sw_psk_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || (value >= 1 && value <= 3 && g_sw_psk_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -3786,7 +3787,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     int64_t psk_pre = 0, psk_dec = 0;
     for (const BiSeg& s : sg) (s.dec ? psk_dec : psk_pre) += s.dec ? s.n : 1;
     const bool psk = psk_step_ok(m, batch, psk_pre, psk_dec);
-    const bool psk_cut = psk && g_sw_psk.load(std::memory_order_relaxed) == 1;   /* ds41_psk 2: the path, no cut */
+    const int pskv = g_sw_psk.load(std::memory_order_relaxed);
+    const bool psk_cut = psk && (pskv == 1 || pskv == 3);   /* ds41_psk 2: the path, no cut */
+    const bool psk_redeal = psk_cut && pskv == 3;             /* ds41_psk 3: ds41-psk's indexer deal (diagnostic) */
     if (!psk_only) {   /* rank 0, every 512 segmented steps: the counts (MoE passes a layer summed over those steps: the launch cost of P) */
         const long long n = g_bi_steps.load(std::memory_order_relaxed);
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0)
@@ -4152,7 +4155,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                      * at the same run height. Runs wholly before the layer's cut rows are skipped; a run reaching
                      * them runs whole (its rows before the cut are not read at this layer). Uncut: sg[si] is
                      * sg_step[si], nothing skipped, the issue as before. */
-                    const BiSeg& s = sg_step[si];
+                    const BiSeg& s = psk_redeal ? sg[si] : sg_step[si];
                     const int64_t cut0 = sg[si].r0;
                     const Ds41IdxRuns ru = ds41_idx_runs(s.n, m.irows, live, m.aw, m.ar, split && !s.dec, m.split_min_live,
                                                          split && !s.dec && idx_balance(), (int64_t)L.i_runs.size());
