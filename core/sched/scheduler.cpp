@@ -200,9 +200,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
-    {   /* lever BI's chunking, once a process (a re-init keeps it) */
+    {   /* lever BI's chunking: RADIANCE_SCHED_BI_CHUNK's start line once a process; the value is the fn4 switch
+         * sched_bi_chunk's, read at every step planned (step()) */
         static const int bi = bi_chunk_env();
-        bi_chunk_ = bi;
+        (void)bi;
+        bi_chunk_ = fn4::sched_bi_chunk();
     }
 
     /* The engine resolves the geometry once, because the prefix cache needs its checkpoint
@@ -1242,7 +1244,8 @@ int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
     return std::min(n_target, r.n_computed < prompt ? prompt : r.n_computed + 1);
 }
 
-/* Lever BI, class (ii) (RADIANCE_SCHED_BI_CHUNK, read once at load; unset / 0 = today): a long prompt's chunk
+/* Lever BI, class (ii) (the fn4 switch sched_bi_chunk, read at every step planned; RADIANCE_SCHED_BI_CHUNK its start
+ * value; unset / 0 = today): a long prompt's chunk
  * boundaries must not depend on what else the engine runs, or its rows' arithmetic does (a 32- or 112-row piece takes
  * other kernel forms than a 2048-row one; deepseek41 ds41_bi keeps a step's sequences apart, not a sequence's pieces).
  *   1 (option A, alone's boundaries): every prefill chunk is the one an idle engine plans from the same position -- the
@@ -2240,6 +2243,9 @@ const RadBatch* Scheduler::step() {
 
     int64_t budget = cfg_.max_tok;
     bool preempted_here = false;
+    /* lever BI's chunking for this step's plan: the fn4 switch sched_bi_chunk as applied now (a change lands at a step
+     * release, so it takes effect from the step planned after it) */
+    bi_chunk_ = fn4::sched_bi_chunk();
     /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
      * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
      * decoding there is nothing to give steps to, and the hold is dropped. */

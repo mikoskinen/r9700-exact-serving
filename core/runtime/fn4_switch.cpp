@@ -25,7 +25,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
                                         "dspark_walk", "ds41_bi", "draft_sample", "draft_lend_hyst", "arena_d0",
-                                        "draft_lend_w", "draft_occ", "draft_occ_k" };
+                                        "draft_lend_w", "draft_occ", "draft_occ_k", "sched_bi_chunk" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -141,6 +141,14 @@ int plugin_value(State& s, int i) {
     return -1;
 }
 
+int env_sched_bi() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_SCHED_BI_CHUNK");
+        return e && e[0] >= '0' && e[0] <= '4' && !e[1] ? e[0] - '0' : 0;
+    }();
+    return env;
+}
+
 int env_acq() {
     static const int env = [] {
         const char* e = std::getenv("RADIANCE_AQL_ACQ");
@@ -155,6 +163,10 @@ int reported(State& s, int i) {
     if (i == kAqlAcq) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_acq();
+    }
+    if (i == kSchedBiChunk) {
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_sched_bi();
     }
     return s.val[i].load(std::memory_order_acquire);
 }
@@ -187,6 +199,10 @@ uint64_t epoch() { return st().epoch.load(std::memory_order_acquire); }
 int aql_acq_rule() {
     const int v = st().val[kAqlAcq].load(std::memory_order_acquire);
     return v >= 0 ? v : env_acq();
+}
+int sched_bi_chunk() {
+    const int v = st().val[kSchedBiChunk].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_sched_bi();
 }
 bool aql_acq_none() {
     static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
@@ -303,7 +319,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
-                        "draft_lend_w, draft_occ, draft_occ_k, epoch_bump)";
+                        "draft_lend_w, draft_occ, draft_occ_k, sched_bi_chunk, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -551,6 +567,14 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedBiChunk) {
+        if (v < 0 || v > 4) {
+            if (err) *err = "sched_bi_chunk takes 0 (today), 1 (alone's boundaries), 2 (the interval grid), 3 / 4 (alone's "
+                            "pieces cut on the interval / RADIANCE_SCHED_BI_GRID grid)";
+            return false;
+        }
+        return true;
+    }
     /* A plugin's switch: the plugin that serves it says which values it knows. */
     std::lock_guard<std::mutex> lk(s.mu);
     find_hooks(s);
@@ -614,7 +638,7 @@ bool apply_pending(int step, int* sched) {
             }
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq) s.val[i].store(v, std::memory_order_release);   /* pinned, the same rule */
+            if (i == kAqlAcq || i == kSchedBiChunk) s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
         int handled = 1;
