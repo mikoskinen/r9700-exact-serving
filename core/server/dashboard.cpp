@@ -371,7 +371,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
          * plugin's (rank 0): planned passes, passes with a cut (designs 1 and 2), layers skipped whole, layer-rows not run
          * at layers 21-29 and 30-39, plans dropped as not matching their pass. All 0 with PSK unset, 0 or not served. */
         {
-            int64_t eg[3], pl[6];
+            int64_t eg[3], pl[10];
             fn4::psk_engine(eg);
             fn4::psk_stats(pl);
             json p;
@@ -392,7 +392,25 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             p["rows_skipped_l21_29"] = pl[3];
             p["rows_skipped_l30_39"] = pl[4];
             p["plan_mismatch"] = pl[5];
+            /* lever PSK-L20 (ds41-pskl20): passes whose layer 20 was cut, its cone-part rows not run, passes it ran its
+             * all-row part only, planned passes told to end at it (its experts not staged) */
+            p["l20_cut_passes"] = pl[6];
+            p["l20_rows_skipped"] = pl[7];
+            p["l20_cone_empty"] = pl[8];
+            p["l20_layers_not_staged"] = pl[9];
             o["psk"] = std::move(p);
+        }
+        /* Lever PSK-DS (ds41-pskl20): the switch (-1 not served), DSpark context passes cut, their rows not run, the rows
+         * they ran -- live, cumulative, rank 0's. */
+        {
+            int64_t pc[4];
+            fn4::dspark_pfctx_stats(pc);
+            json p;
+            p["mode"] = pc[0];
+            p["passes"] = pc[1];
+            p["rows_skipped"] = pc[2];
+            p["rows_run"] = pc[3];
+            o["dspark_pfctx"] = std::move(p);
         }
         /* Why snapshots went and why hits reused nothing: on a hybrid model these say why a
          * long prompt was prefilled again. `hit_cut_tokens` is the checkpoint shortfall,
