@@ -10248,3 +10248,90 @@ TEST(bi_chunk_d_progresses_with_more_decode_rows_than_the_slack) {
     for (const auto& p : pc) CHECK(p.second <= 576);
 }
 
+/* ================================================== review: lever PSK design 2 on every admission / chunk path
+ * (DST agent, the second reading of ds41-int7-pskglue). Under ds41_psk 2 every prefill a step plans -- today's chunks, a
+ * sched_bi_chunk 1 / 3 / 4 piece, a sched_short_bypass piece, a sched_bypass_total piece -- must be latched (psk_plan
+ * names a target for it) and take snapshots at targets only, while the chunks themselves (every entry's start and rows,
+ * step by step) are exactly those of ds41_psk 0: PSK changes which layers run, never the chunking. */
+namespace {
+struct PskPathRun {
+    std::vector<std::vector<std::pair<uint64_t, std::pair<int32_t, int32_t>>>> steps;   /* per step: (seq, (ctx, rows)) */
+    std::vector<std::pair<uint64_t, int64_t>> ckpts;                                  /* (seq, snapshot position) */
+    int64_t unplanned = 0, planned = 0, dropped = 0;
+};
+PskPathRun psk_path_run(int psk, int bic, int byp, int tot, const std::vector<int>& lens) {
+    PskPathRun out;
+    DstSwitches restore;
+    Fixture f;
+    f.build(8192, 64, 4160, 60000);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefill_interleave = 8;
+    f.cfg.prefix_exact = true;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1024);
+    f.sch.set_span_min(16384);
+    f.sch.set_psk_mode(psk);
+    CHECK(DstSwitches::set("sched_bi_chunk", bic));
+    CHECK(DstSwitches::set("sched_short_bypass", byp));
+    CHECK(DstSwitches::set("sched_bypass_total", tot));
+    f.submit(100, 4000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(40000, 4);
+    bool sent = false;
+    for (int k = 0; k < 70; ++k) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        std::vector<std::pair<uint64_t, std::pair<int32_t, int32_t>>> row;
+        bool chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (!e.is_prefill) continue;
+            row.push_back({ e.seq, { e.ctx_len, e.n_tokens } });
+            if (e.ckpt_slot >= 0) out.ckpts.push_back({ e.seq, (int64_t)e.ctx_len + e.ckpt_tok + 1 });
+            chunk = chunk || e.seq == p;
+        }
+        if (psk) {
+            std::vector<int32_t> ahead, rows;
+            int64_t dec = 0;
+            if (f.sch.psk_plan(b->step, &ahead, &rows, &dec)) {
+                for (int32_t a : ahead) (a == Scheduler::kPskNoPlan ? out.unplanned : out.planned) += 1;
+            } else {
+                out.unplanned += (int64_t)row.size();
+            }
+        }
+        out.steps.push_back(row);
+        f.commit_plain(12);
+        if (!sent && chunk) { for (int l : lens) f.submit(l, 64); sent = true; }
+    }
+    out.dropped = f.sch.psk_ckpt_dropped();
+    return out;
+}
+}  // namespace
+
+TEST(dst_review_psk2_latches_every_chunk_path_and_keeps_the_chunks) {
+    struct Case { int bic, byp, tot; std::vector<int> lens; const char* what; };
+    const Case cases[] = {
+        { 0, 0, 0, { 1000 }, "today's chunks" },
+        { 1, 0, 0, { 1000 }, "sched_bi_chunk 1" },
+        { 3, 0, 0, { 1000 }, "sched_bi_chunk 3" },
+        { 4, 0, 0, { 1000 }, "sched_bi_chunk 4" },
+        { 0, 1280, 0, { 1000 }, "sched_short_bypass (one piece), today's chunks" },
+        { 3, 2112, 4096, { 3000 }, "sched_bypass_total (two pieces), sched_bi_chunk 3" },
+    };
+    for (const Case& c : cases) {
+        const PskPathRun off = psk_path_run(0, c.bic, c.byp, c.tot, c.lens);
+        const PskPathRun on = psk_path_run(2, c.bic, c.byp, c.tot, c.lens);
+        if (on.steps != off.steps) std::fprintf(stderr, "    %s: the chunks differ under ds41_psk 2\n", c.what);
+        CHECK(on.steps == off.steps);                 /* PSK never changes a chunk */
+        if (on.unplanned) std::fprintf(stderr, "    %s: %lld prefill entr(ies) not latched (planned %lld)\n", c.what,
+                                       (long long)on.unplanned, (long long)on.planned);
+        CHECK_EQ(on.unplanned, (int64_t)0);           /* every prefill entry latched */
+        CHECK(on.planned > 0);
+        /* snapshots at targets only: a subset of today's, and fewer of them */
+        for (const auto& ck : on.ckpts) CHECK(std::find(off.ckpts.begin(), off.ckpts.end(), ck) != off.ckpts.end());
+        if (!(on.dropped > 0)) std::fprintf(stderr, "    %s: no snapshot dropped at a non-target\n", c.what);
+        CHECK(on.dropped > 0);
+    }
+}
+
