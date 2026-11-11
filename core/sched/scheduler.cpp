@@ -152,6 +152,27 @@ int Scheduler::set_draft_occ_k(int v) {   /* lever Z0-O */
     return draft_.occ_k();
 }
 
+int Scheduler::set_psk_mode(int mode) {   /* lever PSK design 2 */
+    std::lock_guard<std::mutex> lk(mu_);
+    psk_mode_ = mode;
+    return psk_mode_;
+}
+
+int Scheduler::set_psk_k(int k) {   /* lever PSK design 2 */
+    std::lock_guard<std::mutex> lk(mu_);
+    if (k >= 1 && k <= 4096) psk_k_ = k;
+    return psk_k_;
+}
+
+bool Scheduler::psk_plan(int step, std::vector<int32_t>* ahead, std::vector<int32_t>* rows, int64_t* dec_tok) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (psk_step_ < 0 || step != psk_step_) return false;
+    *ahead = psk_ahead_;
+    *rows = psk_rows_;
+    *dec_tok = psk_dec_;
+    return true;
+}
+
 void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) {
     std::lock_guard<std::mutex> lk(mu_);
     lend_view_ = std::move(view);
@@ -461,6 +482,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     fn4::note_sched(fn4::kDraftLendHyst, draft_.lend_hyst());
     fn4::note_sched(fn4::kDraftOcc, draft_.occ());       /* lever Z0-O */
     fn4::note_sched(fn4::kDraftOccK, draft_.occ_k());
+    fn4::note_sched(fn4::kDs41PskK, psk_k_);            /* lever PSK design 2 */
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
      * row, is measured. */
@@ -1646,6 +1668,77 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
     return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
 
+/* ------------------------------------------------------------------ lever PSK design 2: targets */
+/* Lever PSK design 2 (fn4 ds41_psk 2 / 3 + ds41_psk_k, ds41-psk2 11.11.2026). The deepseek41 plugin runs the layers past
+ * the last kv source only over the cones of a request's TARGETS: the positions where their window state must be whole
+ * -- the prefill's end n (the first decode, the logits row, the drafter's context), its tail snapshot
+ * (tail_checkpoint), every K-th periodic checkpoint position q_K, q_2K, ... (K = ds41_psk_k, latched at admission), a
+ * request's own checkpoint_at, and under ds41_psk 3 the first q_i at or past 32768. Window snapshots are reserved at
+ * targets only (psk_ckpt): a chunk end elsewhere takes none, so a prefix hit there resumes from the deepest snapshot
+ * below it -- the cache's lookup already steps back to it -- and never reads a window the cut left stale. Chunking is
+ * unchanged (plan_chunk splits where it did), so layers 0..20 run the same rows in the same chunks. */
+int64_t Scheduler::psk_q(int64_t i) const {
+    if (geo_.exact && geo_.grid > 0)
+        return geo_.grid_origin > 0 ? geo_.grid_origin + (i - 1) * geo_.grid : i * geo_.grid;
+    return i * geo_.checkpoint_interval;
+}
+
+int64_t Scheduler::psk_i_at(int64_t pos) const {
+    if (pos < 1) pos = 1;
+    if (geo_.exact && geo_.grid > 0) {
+        const int64_t o = geo_.grid_origin, g = geo_.grid;
+        if (o > 0) return pos <= o ? 1 : (pos - o + g - 1) / g + 1;
+        return (pos + g - 1) / g;
+    }
+    const int64_t u = geo_.checkpoint_interval;
+    return (pos + u - 1) / u;
+}
+
+int64_t Scheduler::psk_next_target(const SchedReq& s, int64_t from, int64_t n) const {
+    int64_t t = n;
+    const auto take = [&](int64_t p) { if (p > from && p < t) t = p; };
+    if (geo_.checkpoints() && s.psk_k > 0) {
+        take(tail_checkpoint(n));
+        const int64_t K = s.psk_k;
+        const int64_t i = (psk_i_at(from + 1) + K - 1) / K * K;
+        take(psk_q(i));
+        if (s.psk_32k) take(psk_q(psk_i_at(32768)));
+        if (s.req && s.req->checkpoint_at > 0) take(s.req->checkpoint_at / geo_.quantum * geo_.quantum);
+    }
+    return t;
+}
+
+bool Scheduler::psk_is_target(const SchedReq& s, int64_t pos, int64_t n) const {
+    if (pos <= 0) return false;
+    if (pos == n) return true;
+    if (!geo_.checkpoints() || s.psk_k <= 0) return false;
+    if (pos == tail_checkpoint(n)) return true;
+    const int64_t i = psk_i_at(pos);
+    if (psk_q(i) == pos && i % s.psk_k == 0) return true;
+    if (s.psk_32k && pos == psk_q(psk_i_at(32768))) return true;
+    return s.req && s.req->checkpoint_at > 0 && pos == s.req->checkpoint_at / geo_.quantum * geo_.quantum;
+}
+
+/* At admission: planned when the plugin runs anchors (psk_mode_ 2 / 3) and the request is a plain trunk prompt -- no
+ * row of it the sampler or a scorer wants but its last (no embedding, scored rows, words for the plugin), no media, no
+ * runtime window. */
+void Scheduler::psk_latch(SchedReq& s) const {
+    s.psk_k = 0;
+    s.psk_32k = false;
+    if ((psk_mode_ != 2 && psk_mode_ != 3) || !s.req) return;
+    const Request& r = *s.req;
+    if (r.embed || r.score || r.token_scores || !r.plugin_words.empty() || r.media) return;
+    if (kv_ && kv_->has_runtime_window(r.id)) return;
+    s.psk_k = psk_k_;
+    s.psk_32k = psk_mode_ == 3;
+}
+
+void Scheduler::psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt) {
+    if (!ckpt || *ckpt <= 0 || s.psk_k <= 0 || psk_is_target(s, *ckpt, n)) return;
+    *ckpt = -1;
+    ++psk_dropped_;
+}
+
 /* ------------------------------------------------------------------ a prefill sharing a step */
 void Scheduler::set_span_min(int64_t tokens) {
     span_min_ = tokens > 0 ? tokens : 0;
@@ -2088,12 +2181,14 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * to what really has to run. */
         const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty());
         const int64_t end = chunk_end(r, target);
+        psk_latch(s);   /* lever PSK design 2: this admission's targets */
         want = plan_chunk(r.n_computed, end, cap, &ckpt, r.checkpoint_at, &r);
         /* A run read both ways (bidi_fit) the share cannot hold takes the step instead. */
         if (want <= 0 && cap < budget && prog_->encoder.bidirectional)
             want = plan_chunk(r.n_computed, end, budget, &ckpt, r.checkpoint_at, &r);
         else if (cap < budget && want > 0)
             admit_full_ = plan_chunk(r.n_computed, end, budget, nullptr, r.checkpoint_at, &r);
+        psk_ckpt(s, target, &ckpt);
     }
     int rc = RAD_OK;
     if (want <= 0)                                          rc = RAD_E_FULL;
@@ -2529,6 +2624,7 @@ const RadBatch* Scheduler::step() {
                                                 r.checkpoint_at, &r);
                 if (want < full) { capped_at = (int32_t)plan_.e.size(); capped_full = full; }
             }
+            psk_ckpt(s, target, &ckpt);   /* lever PSK design 2: a snapshot at a target only */
             /* A prefill with no room left does not end the walk: it takes nothing this step, but
              * a decode row behind it needs only 1 + its window. With --busy-prefill-chunk off the
              * walk stops here. */
@@ -2829,6 +2925,7 @@ const RadBatch* Scheduler::step() {
         const int64_t grown = e.ckpt_slot < 0 && limit > had
             ? plan_chunk(r.n_computed, chunk_end(r, s.seq_len()), limit, &ckpt, r.checkpoint_at, &r)
             : had;
+        psk_ckpt(s, s.seq_len(), &ckpt);   /* lever PSK design 2: a snapshot at a target only */
         if (grown > had && kv_->ensure_from(r.id, r.n_computed + grown, r.n_computed) >= 0) {
             e.n_tokens = (int32_t)grown;
             e.produces_token = (r.n_computed + grown >= s.seq_len());
@@ -2926,6 +3023,28 @@ const RadBatch* Scheduler::step() {
         lost_restore = true;
     }
 
+    /* Lever PSK design 2: the plan the plugin cuts this pass by (psk_plan; Engine::psk_release hands it over), per
+     * prefill entry in the batch's order: its next target less its chunk's end, or kPskNoPlan. */
+    psk_step_ = -1;
+    psk_dec_ = 0;
+    psk_ahead_.clear();
+    psk_rows_.clear();
+    {
+        bool planned = false;
+        for (const StepEntry& e : plan_.e) {
+            if (!e.is_prefill) { psk_dec_ += e.n_tokens; continue; }
+            const SchedReq* sr = e.slot >= 0 && (size_t)e.slot < reqs_.size() ? reqs_[(size_t)e.slot].get() : nullptr;
+            int32_t a = kPskNoPlan;
+            if (sr && sr->req && sr->psk_k > 0) {
+                const int64_t from = e.ctx_len, end = from + e.n_tokens;
+                a = (int32_t)(psk_next_target(*sr, from, sr->seq_len()) - end);
+                planned = true;
+            }
+            psk_ahead_.push_back(a);
+            psk_rows_.push_back(e.n_tokens);
+        }
+        if (planned) psk_step_ = step_;
+    }
     step_start_ = std::chrono::steady_clock::now();
     const RadBatch* b = lost_restore ? nullptr : builder_.build(plan_, *kv_, step_);
     if (!b) {

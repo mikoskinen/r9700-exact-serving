@@ -474,6 +474,10 @@ private:
     int  issue_ahead(const RadBatch** out);
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
+    /* Lever PSK design 2 (ds41-psk2), at a step's release with every rank parked: the scheduler's plan for the step's
+     * trunk pass to the plugin (fn4::psk_plan), and the pass's layer end to every rank's stager (INT32_MAX: every
+     * layer, the default and every pass without a plan). */
+    void psk_release(const RadBatch* b);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;
@@ -680,6 +684,11 @@ private:
     std::atomic<int> lf_on_{0};
     int              arena_dec_rungs_ = 0;
     std::atomic<int> arena_d0_{0};
+    /* Lever PSK design 2: whether the plugin's ds41_psk has been read for the scheduler (first release, then after every
+     * fn4 change), the plan's buffers, the planned passes and the ones whose layers past an end were not staged. */
+    bool psk_mode_read_ = false;
+    std::vector<int32_t> psk_ahead_, psk_rows_;
+    int64_t psk_planned_ = 0, psk_cut_passes_ = 0;
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
      * (stager.h); 0 without one. */

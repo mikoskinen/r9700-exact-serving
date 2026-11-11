@@ -86,6 +86,7 @@
 #include "mover.h"
 #include "planner.h"
 
+#include <climits>
 #include <deque>
 #include <map>
 #include <vector>
@@ -120,6 +121,10 @@ public:
     /* Per step, before release: whether the next step continues a prompt in a pass this stager
      * arms for, so this step's trunk pass stages that pass's first layers. */
     void set_next_prefill(bool more) { next_prefill_ = more; }
+    /* Per step, before release (lever PSK design 2, Engine::psk_release): the first model layer the trunk pass issues no
+     * op of. Its routed layers from there on are not staged, and the next pass's first layers are paced on the last ones
+     * the pass runs. INT32_MAX (the default, and every pass the plugin does not plan): every layer, as before. */
+    void set_layer_end(int32_t layer) { layer_end_ = layer; }
 
     bool    enabled() const { return !layers_.empty(); }
     int64_t ring_bytes() const { return ring_; }
@@ -198,6 +203,9 @@ private:
     /* The next trunk pass's first layers, staged at this pass's end: layers [0, n_early_). */
     int32_t  n_early_ = 0;
 
+    /* Lever PSK design 2: set_layer_end's layer, and the routed layers (layers_ entries) the armed pass runs. */
+    int32_t layer_end_ = INT32_MAX;
+    int32_t lim_ = 0;
     enum { kStaged, kNone, kLater };
     int  stage_ahead(int32_t cur, bool* resync);
     int  stage_layer(int32_t li, bool now, RadEvent gate, int* got);

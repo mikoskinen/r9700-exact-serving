@@ -3499,6 +3499,34 @@ TEST(the_stager_stages_ahead_and_releases_each_layer_when_the_next_starts) {
     CHECK_OK(st.end_pass(compute));
     CHECK(at_home(p0));
     CHECK(at_home(p1));
+
+    /* Lever PSK design 2: a pass that issues no op from layer 1 on (set_layer_end, Engine::psk_release) stages layer 0
+     * only; layer 1 stays at its pool slots. INT32_MAX (the default) stages both again. */
+    const uint64_t sl = m.stats().stage_layers;
+    st.set_layer_end(1);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_ring(p0));
+    CHECK(at_home(p1));
+    CHECK_OK(st.after_op(0, compute));
+    CHECK_OK(st.before_op(1, compute, &resync));
+    CHECK_OK(st.before_op(2, compute, &resync));
+    CHECK(in_ring(p0));
+    CHECK(at_home(p1));
+    CHECK_OK(st.after_op(2, compute));
+    CHECK_OK(st.end_pass(compute));
+    CHECK(at_home(p0));
+    CHECK(at_home(p1));
+    CHECK_EQ(m.stats().stage_layers, sl + 1);
+    st.set_layer_end(INT32_MAX);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_ring(p0));
+    CHECK(in_ring(p1));
+    CHECK_OK(st.end_pass(compute));
+    CHECK(at_home(p0));
+    CHECK(at_home(p1));
+    CHECK_EQ(m.stats().stage_layers, sl + 3);
     /* The copies are the mover stream's, and the region is this test's. */
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     rad_stream_destroy(compute);
