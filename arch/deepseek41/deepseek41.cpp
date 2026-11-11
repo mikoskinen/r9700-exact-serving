@@ -311,6 +311,9 @@ struct Layer {
      * (rmsnorm_rope_roundtrip_kv_store), attn_rt = attn + o_f, or attn + o_rope + o_q
      * (attn_sparse_sink_rope_roundtrip). Issued for those when their switch is 1. */
     rad_op kv_fs = 0, attn_rt = 0;
+    /* Lever NVG-fold (nvf_read_env), 0 where not declared: i_topkg = index_topk_nvg (an index source's selection and
+     * its unpacked rows into Model::selkv), attn_g / attn_rtg = attn / attn_rt reading those rows. */
+    rad_op i_topkg = 0, attn_g = 0, attn_rtg = 0;
     /* The fused chains (fused()), each 0 where its chain above is declared instead: kv_n + kv_rope
      * + kv_q, k_norm + k_rope + k_q, o_rope + o_q, l_rope + l_q, i_rope + i_qq, col_a + norm_a,
      * col_f + norm_f. */
@@ -435,6 +438,10 @@ struct Model {
      * attn_sparse_sink latent_format nvfp4). Lossless: the latent is quant_roundtrip(fp4_e2m1, e4m3, 16)
      * output, which the packing reproduces bit for bit (docs/OPS.md "Packed compressed latent"). */
     bool lnv = false;
+    /* Lever NVG-fold (nvf_read_env): the unpacked selections of a step of at most nvf_rows rows, [nvf_rows][itopk hd]
+     * bf16, written by index_topk_nvg at each index source and read by the gathered attentions; 0: not declared. */
+    rad_buf selkv = 0;
+    int64_t nvf_rows = 0;
     rad_buf sel_part = 0;
     rad_op sel_gather = 0;
     /* The attention world (geometry()): attention ranks [0, aw), this rank's index `ar` in it and
@@ -962,8 +969,33 @@ static void sw_note_decl(int64_t rows) {
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
 }
 
+/* Lever NVG-fold (11.11.2026; on top of lever NVG, libr4d's RADIANCE_DS41_NVGATHER): with the packed latent
+ * (RADIANCE_DS41_LATENT=nvfp4), RADIANCE_DS41_NVGATHER_FOLD=<rows> (1..48, read once at the first declare) declares, at
+ * every index source, index_topk_nvg beside index_topk -- the same selection, whose kernel also unpacks each row's valid
+ * selections into Model::selkv -- and at every compressing layer whose selection comes from such a source over the same
+ * kv source, attn_sparse_sink(_rope_roundtrip)_gathered beside the attention, which reads those rows instead of
+ * unpacking the cache (lever NVG: one gather launch in each of the 38 attentions; here one unpack in each of the 8
+ * selections, inside its own launch). A step of at most <rows> rows that is one indexer run takes them while the switch
+ * ds41_nvgfold is 1 (the env starts it at 1); any other step, and switch 0, issues today's ops. Exact: the selection is
+ * index_topk's kernels line for line; the unpack is the gather kernel's work on the same selection, cache and block
+ * table (the cache is written only at kv sources, which are index sources, before their selection); the attention is
+ * lever NVG's plain-kernel pass over the same bytes (tests/r4d_emu test_ds41nvgf). Unset: nothing declared. */
+static std::atomic<int> g_nvf_env{-1};   /* RADIANCE_DS41_NVGATHER_FOLD's rows, read once (0: unset or not 1..48) */
+static std::atomic<int> g_sw_nvf{0};     /* the switch ds41_nvgfold */
+static std::atomic<int> g_sw_nvf_ok{0};  /* a declare took the fold (index_topk_nvg and a gathered attention) */
+static void nvf_read_env() {
+    int unread = -1;
+    const char* e = std::getenv("RADIANCE_DS41_NVGATHER_FOLD");
+    char* end = nullptr;
+    const long v = e && *e ? std::strtol(e, &end, 10) : 0;
+    const int rows = end && !*end && v >= 1 && v <= 48 ? (int)v : 0;
+    if (g_nvf_env.compare_exchange_strong(unread, rows)) g_sw_nvf.store(rows > 0 ? 1 : 0, std::memory_order_relaxed);
+}
+
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
+    if (!std::strcmp(name, "ds41_nvgfold"))
+        return value == 0 || (value == 1 && g_sw_nvf_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
     if (!std::strcmp(name, "ds41_shexp_lane"))
@@ -976,6 +1008,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
     if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_nvgfold")) g_sw_nvf.store(value, std::memory_order_relaxed);
     else if (const K1Switch* k = k1_switch(name)) k->val->store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
@@ -989,6 +1022,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_shexp_lane")) {
         *applied = g_sw_shexp.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_nvgfold")) {
+        *applied = g_sw_nvf_ok.load(std::memory_order_relaxed) ? g_sw_nvf.load(std::memory_order_relaxed) : 0;
         return 1;
     }
     if (const K1Switch* k = k1_switch(name)) {
@@ -1733,6 +1770,24 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                           { sel_out });
             if (L.i_topk && m.isplit && rw(b, L.i_topk, {}, { m.sel }) == 0) return RAD_E_INVAL;
             if (!L.i_topk) return RAD_E_INVAL;
+            /* Lever NVG-fold (nvf_read_env): the same selection into sel (an unsplit step's) and its unpacked rows, over
+             * this source's packed latent cache, for a step of at most nvf_rows rows; the rows' buffer at the first. */
+            const int nvf = g_nvf_env.load(std::memory_order_relaxed);
+            if (nvf > 0 && m.lnv && !m.zero && hd == 512) {
+                const int64_t rows_nv = std::min<int64_t>(T, nvf);
+                if (!m.selkv) {
+                    m.nvf_rows = rows_nv;
+                    m.selkv = decl_b(b, nm.f("index_sel_unpacked"), RAD_BF16, { rows_nv, c.itopk * hd });
+                }
+                if (m.selkv) {
+                    std::vector<RadParam> gp = tp;
+                    gp[0] = RAD_RANGE("M", 1, m.nvf_rows);
+                    gp.push_back(RAD_INT("dim", hd));
+                    gp.push_back(RAD_STR("latent_format", "nvfp4"));
+                    L.i_topkg = uses ? fused(b, "index_topk_nvg", gp, {}, { m.score, m.keep }, { m.sel, m.selkv })
+                                     : fused(b, "index_topk_nvg", gp, {}, { m.score }, { m.sel, m.selkv });
+                }
+            }
         }
 
         /* ---- the sparse attention and the output projection */
@@ -1769,6 +1824,29 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             else
                 L.attn_rt = fused(b, "attn_sparse_sink_rope_roundtrip", fp, { L.sinks }, { m.q, cs }, { m.o });
             if (L.attn_rt) g_sw_of_ok.store(1, std::memory_order_relaxed);
+        }
+        /* Lever NVG-fold: the attention (and its fold d form) over the rows its selection's source unpacked, where that
+         * index source declared index_topk_nvg over this layer's kv source. */
+        if (r > 0 && m.selkv) {
+            const int xi = c.idx_of[(size_t)l];
+            const Layer* X = xi >= 0 && xi <= l ? &m.layers[(size_t)xi] : nullptr;
+            if (X && X->i_topkg && c.src_of[(size_t)l] == c.src_of[(size_t)xi]) {
+                std::vector<RadParam> gp = ap;
+                gp[0] = RAD_RANGE("M", 1, m.nvf_rows);
+                L.attn_g = fused(b, "attn_sparse_sink_gathered", gp, { L.sinks }, { m.q, m.sel, m.selkv }, { m.o });
+                if (L.attn_rt) {
+                    gp.push_back(RAD_INT("rot", m.c.rope));
+                    gp.push_back(RAD_INT("off", hd - m.c.rope));
+                    gp.push_back(RAD_STR("mode", "gptj"));
+                    gp.push_back(RAD_INT("inverse", 1));
+                    gp.push_back(RAD_INT("block", 32));
+                    gp.push_back(RAD_STR("format", "fp8_e4m3"));
+                    gp.push_back(RAD_STR("block_scale", "ue8m0"));
+                    L.attn_rtg = fused(b, "attn_sparse_sink_rope_roundtrip_gathered", gp, { L.sinks },
+                                       { m.q, m.sel, cs, m.selkv }, { m.o });
+                }
+                if (L.attn_g || L.attn_rtg) g_sw_nvf_ok.store(1, std::memory_order_relaxed);
+            }
         }
         /* This rank's output groups, each a block of the block-diagonal wo_a. */
         const int64_t gd = HD / m.gr;
@@ -2360,6 +2438,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             g_sw_shexp.store(g_sw_shexp_env.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
     k1_read_env();
+    nvf_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -2629,6 +2708,28 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 (int)std::count_if(m.layers.begin(), m.layers.end(),
                                    [](const Layer& L) { return L.moe.sone_live != nullptr; }),
                 g_sw_one.load(std::memory_order_relaxed));
+    if (ctx->rank == 0 && !ctx->shape_probe && g_nvf_env.load(std::memory_order_relaxed) > 0) {
+        const int ns = (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.i_topkg != 0; });
+        const int ni = (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.i_topk != 0; });
+        const int na = (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.attn_g != 0; });
+        const int nr = (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.attn_rtg != 0; });
+        const int nc = (int)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.r > 0; });
+        if (ns > 0 && (na > 0 || nr > 0))
+            fprintf(stderr, "radiance: deepseek41: lever NVG-fold: the selection unpacks the packed latent's selected "
+                            "entries (index_topk_nvg) at %d of %d index sources, the attention reads them "
+                            "(attn_sparse_sink_gathered) at %d and its fold d form at %d of %d compressing layers, steps "
+                            "of at most %lld rows (RADIANCE_DS41_NVGATHER_FOLD=%d; switch ds41_nvgfold=%d); %.2f MiB of "
+                            "unpacked rows\n",
+                    ns, ni, na, nr, nc, (long long)m.nvf_rows, g_nvf_env.load(std::memory_order_relaxed),
+                    g_sw_nvf.load(std::memory_order_relaxed),
+                    (double)(m.nvf_rows * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0));
+        else
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_NVGATHER_FOLD=%d is not used -- %s\n",
+                    g_nvf_env.load(std::memory_order_relaxed),
+                    !m.lnv ? "it needs the packed latent (RADIANCE_DS41_LATENT=nvfp4)"
+                    : m.zero ? "this rank attends nothing"
+                    : "no library serves index_topk_nvg and attn_sparse_sink(_rope_roundtrip)_gathered here");
+    }
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
@@ -2847,6 +2948,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         RAD_NONE);
     }
 
+    /* Lever NVG-fold (switch ds41_nvgfold): a step of at most nvf_rows rows takes index_topk_nvg at an index source
+     * whose selection is one run; nvf_live then says the rows in selkv are this source's, for the attentions up to the
+     * next index source (each sets it again). */
+    const bool nvf_step = m.selkv && T <= m.nvf_rows && g_sw_nvf.load(std::memory_order_relaxed) > 0;
+    bool nvf_live = false;
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
@@ -3068,6 +3174,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                                      m.split_min_live);
                 /* the restriction below its threshold is the unrestricted op (the optional keep left out) */
                 const bool rkeep = L.i_keep && live >= m.keep_min_live;
+                /* Lever NVG-fold: one unsplit run over the step's rows, this source's packed latent's block table */
+                const auto* cbn = nvf_step && L.i_topkg ? kv_batch(batch, m.comp[r]) : nullptr;
+                const bool nvf = cbn && cbn->block_table && !ru.split && ru.p0 == 0 && ru.p1 == 1 && ru.R >= T;
+                nvf_live = nvf;
                 for (int64_t p = ru.p0; p < ru.p1; ++p) {
                     const int64_t r0 = p * ru.R, rows = std::min(ru.R, T - r0);
                     const RadOperand prow = praw(batch->positions + r0, RAD_I32, rows);
@@ -3079,6 +3189,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
                     if (L.i_cand)
                         RAD_ISSUE_N(x, L.i_cand, rows, bcol(m.score, 0, live, rows), prow,
                                     bcol_at(m.keep, r0, m.kwords, 0, kw, rows));
+                    if (nvf)
+                        RAD_ISSUE_N(x, L.i_topkg, rows, bcol(m.score, 0, live, rows),
+                                    uses ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE, prow,
+                                    brow_slice(m.sel, r0, rows, c.itopk), kv_cache(m.comp[r], src),
+                                    praw2(cbn->block_table, RAD_I32, S, cbn->block_table_pitch), cu,
+                                    brows(m.selkv, rows));
+                    else
                     RAD_ISSUE_N(x, L.i_topk, rows, bcol(m.score, 0, live, rows),
                                 uses ? bcol_at(m.keep, r0, m.kwords, 0, kw, rows) : RAD_NONE, prow,
                                 ru.split ? brow_slice(m.sel_part, (p - ru.p0) * ru.R, rows, c.itopk)
@@ -3111,7 +3228,20 @@ static void step(RadCtx* x, const RadBatch* batch) {
             const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
             const rad_op ah = ofold ? L.attn_rt : L.attn;
             const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
-            if (r > 0) {
+            /* Lever NVG-fold: the gathered form where this step's selection source unpacked its rows */
+            const rad_op gh = !nvf_live ? 0 : ofold ? L.attn_rtg : L.attn_g;
+            if (r > 0 && gh) {
+                const int src = c.src_of[(size_t)l];
+                const auto* cb = kv_batch(batch, m.comp[r]);
+                if (ofold)
+                    RAD_ISSUE_N(x, gh, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
+                                praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T), pos, cu,
+                                RAD_W(L.sinks), brows(m.o, T), acs, brows(m.selkv, T));
+                else
+                    RAD_ISSUE_N(x, gh, T, brows(m.q, T), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
+                                praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T), pos, cu,
+                                RAD_W(L.sinks), brows(m.o, T), brows(m.selkv, T));
+            } else if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
                 if (ofold)

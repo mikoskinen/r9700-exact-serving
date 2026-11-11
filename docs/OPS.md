@@ -992,9 +992,12 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `softmax_pool` | `M`(range) `n` `ratio` `dtype` | `stage` → `out`; `page`? |
 | `attn_sparse_sink` | `M`(range) `heads` `dim` `window` `ratio` `topk` `scale`:f64 `dtype` `latent_format`/opt | `q`, `window_cache`, `window_bt`, `window_used`, `comp_cache`?, `comp_bt`?, `sel`?, `positions`, `cu_seqlens`, `sinks`w → `out` |
 | `attn_sparse_sink_rope_roundtrip` | `attn_sparse_sink`'s, then `rot` `off` `mode` `inverse` `block` `format`:str `block_scale`:str | `attn_sparse_sink`'s operands, then `cos_sin` (device-only: attn_sparse_sink, then rope_rows_roundtrip over `out` with n_head = heads, head_dim = dim, scale = block_scale, at the attention's positions) |
+| `attn_sparse_sink_gathered` | `attn_sparse_sink`'s (`latent_format` nvfp4) | `attn_sparse_sink`'s operands, then `gathered` (device-only: attn_sparse_sink with the selected entries read from `index_topk_nvg`'s rows; lever NVG-fold) |
+| `attn_sparse_sink_rope_roundtrip_gathered` | `attn_sparse_sink_rope_roundtrip`'s | its operands, then `gathered` (device-only, as above) |
 | `index_score` | `M`(range) `heads` `dim` `ratio` `width` `wscale`:f64 `dtype` `row_part`/opt `block`/opt `key_format`/opt | `q`, `w`, `index_cache`, `bt`, `positions`, `cu_seqlens` → `score`; `keep`? |
 | `index_candidates` | `M`(range) `width` `block` `topk_blocks` `ratio` | `score`, `positions` → `keep` |
 | `index_topk` | `M`(range) `width` `topk` `ratio` `block`/opt | `score`, `keep`?, `positions` → `sel` |
+| `index_topk_nvg` | `index_topk`'s, then `dim` `latent_format`:str | `index_topk`'s operands, then `comp_cache`, `comp_bt`, `cu_seqlens` → `gathered` (device-only; lever NVG-fold) |
 | `entry_store` | `M`(range) `n` `block_size` `dtype` `format`/opt | `x`, `page`, `cache`:inout |
 | `token_map` | `M`(range) `n_vocab` | `ids`, `table`w → `mapped` |
 | `stream_gate_add` | `M`(range) `n` `hc` `eps`:f64 `gate_eps`:f64 `dtype` | `h`, `k`, `v`, `w`w → `out` |
@@ -1263,6 +1266,17 @@ rows, as the decode kernel with the inverse rope and the round trip in its epilo
 as the two ops' launches). Both are bit-identical to their chains; DeepSeek-V4.1 declares them beside
 the chains under RADIANCE_DS41_KVFOLD / RADIANCE_DS41_OFOLD and picks per step (the ds41_kvfold /
 ds41_ofold switches).
+
+**`index_topk_nvg`** (device-only; lever NVG-fold) is `index_topk` (`score`, `keep`?, `positions` →
+`sel`; its parameters, then `dim` 512 and `latent_format` nvfp4) that also writes, for each row's
+selection j that `attn_sparse_sink`'s key setup finds in the packed compressed cache (`comp_cache`,
+`comp_bt`, `cu_seqlens` as that op's), the entry's bf16 values at `gathered`[row][j dim, (j + 1) dim);
+the other selections' rows are left as they are. **`attn_sparse_sink_gathered`** and
+**`attn_sparse_sink_rope_roundtrip_gathered`** are the two attentions with `gathered` appended: a
+decode-band pass reads a selected entry's values there instead of unpacking the cache, the same
+output. DeepSeek-V4.1 declares them under RADIANCE_DS41_NVGATHER_FOLD (the selection at each index
+source, the attentions where their selection's source reads the same kv source) and picks per step
+(the ds41_nvgfold switch).
 
 | op | params | operands |
 |---|---|---|

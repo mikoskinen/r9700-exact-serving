@@ -13,6 +13,11 @@ int     r4d_rad_ds41_attn_sparse_sink(const RadArgs*, RadStream);
 int64_t r4d_rad_ds41_attn_sparse_sink_scratch(const RadArgs*);
 /* attn_sparse_sink + rope_rows_roundtrip over its output (lever K1 fold d) */
 int     r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs*, RadStream);
+/* lever NVG-fold (RADIANCE_DS41_NVGATHER_FOLD): index_topk that also unpacks the selections, and the two attentions
+ * over those rows */
+int     r4d_rad_ds41_index_topk_nvg(const RadArgs*, RadStream);
+int     r4d_rad_ds41_attn_sparse_sink_gathered(const RadArgs*, RadStream);
+int     r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered(const RadArgs*, RadStream);
 
 /* r4d_ds41_sparse_shapes.inc */
 int r4d_shape_index_score(const RadParam*, int, int, RadOpdDesc*);
@@ -20,6 +25,9 @@ int r4d_shape_index_candidates(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_index_topk(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_attn_sparse_sink(const RadParam*, int, int, RadOpdDesc*);
 int r4d_shape_attn_sparse_sink_rope_roundtrip(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_index_topk_nvg(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_attn_sparse_sink_gathered(const RadParam*, int, int, RadOpdDesc*);
+int r4d_shape_attn_sparse_sink_rope_roundtrip_gathered(const RadParam*, int, int, RadOpdDesc*);
 
 /* r4d_fuse.cpp */
 int r4d_fuse_attn_sparse_sink_rope_roundtrip(const RadParam*, int, uint64_t, int, RadFuseStep*);

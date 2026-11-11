@@ -688,6 +688,78 @@ __device__ void ds_emit(const Get& get, uint32_t n, const uint32_t* cache, DsSel
     finish(base_gt + min(base_eq, need));
 }
 
+/* ---- lever NVG-fold: the packed latent's selected entries, unpacked by the selection's launch
+ * Selection c of a row of sequence s -> the slot of its entry in the compressed cache (its bytes at cc + slot cslot), or -1
+ * where ds41_attn_dec_kernel's key setup (and lever NVG's ds41_latent_gather_nv4_kernel) finds no entry: the same checks
+ * in the same order (c >= 0, its block inside the table, the block mapped and inside the cache). */
+__device__ __forceinline__ long ds_nv4_sel_slot(const int* cbt, long cbtr, long cbtc, long ncblk, int ncbt, int cbs,
+                                                int ratio, int s, long c) {
+    if (c < 0 || (c * ratio) / cbs >= ncbt) return -1;
+    const long blk = cbt[(long)s * cbtr + ((c * ratio) / cbs) * cbtc];
+    if (blk < 0 || blk >= ncblk) return -1;
+    return blk * cbs + (c * ratio) % cbs;
+}
+constexpr int kDsNvRowD = 512;   /* the latent (kDsAttnD, defined below) */
+
+/* Lever NVG-fold (RADIANCE_DS41_NVGATHER_FOLD, 11.11.2026; index_topk_nvg): lever NVG's unpack done by the selection's own
+ * launch. Each row's workgroup, once its selections are written (the row's last barrier), unpacks every valid one into
+ * `out` (row m's selection j at out + m outr + j 512, bf16) -- the bytes ds41_latent_gather_nv4_kernel writes into the
+ * attention's scratch, from the same cache, block table and selections -- so the attention ops that read this selection
+ * (every layer up to the next index source; attn_sparse_sink_gathered) run the plain decode kernel without a gather
+ * launch of their own. The packed cache is the layer's kv source's (the arch declares the fold only where every reader's
+ * source is the index source's). */
+struct DsNvFold {
+    const uint16_t* cc;     /* the packed compressed cache [blocks][1][cbs][cslot] */
+    const int* cbt;         /* its block table [S'][ncbt] */
+    const int* cu;          /* cu_seqlens: the row's sequence */
+    uint16_t* out;          /* [rows][K][512] bf16 */
+    long cbtr, cbtc, ncblk, cs, outr;
+    int ncbt, cbs, ratio, cslot, S;
+};
+/* Row m's K selections (srow at stride selc, written by this workgroup before its last barrier) -> out. First every
+ * selection's slot into `tab` (the selection's LDS key cache, free once the row is selected; K <= kDsCache), a thread a
+ * selection, so the dependent loads (selection, block table) run side by side; then a wave an entry, lane L block L, 8
+ * entries a wave at a time with their loads ahead of the stores. Lane L's work on an entry is the gather kernel's,
+ * expression for expression: the uint2 of codes at 8 L, ds_e4m3_half of scale byte 256 + L, two ds_nv4_unpack8_fast
+ * into the 32 bytes at 16 L of the entry's bf16 row. Ends on a barrier: the next row's selection rewrites `tab`. */
+template <int NT>
+__device__ __forceinline__ void ds_nv4_fold_row(const DsNvFold& g, const int* srow, long selc, int K, long m,
+                                                int* tab) {
+    const int s = ds_seq_of_row(g.cu, g.cs, g.S, m);
+    for (int j = (int)threadIdx.x; j < K; j += NT) {
+        const long t = ds_nv4_sel_slot(g.cbt, g.cbtr, g.cbtc, g.ncblk, g.ncbt, g.cbs, g.ratio, s, (long)srow[(long)j * selc]);
+        tab[j] = (int)t;   /* < 2^31: the launch checks ncblk cbs */
+    }
+    __syncthreads();
+    constexpr int NW = NT / 32, U = 8;
+    const int lane = (int)(threadIdx.x & 31u), wave = (int)(threadIdx.x >> 5);
+    uint16_t* orow = g.out + m * g.outr;
+    for (int j0 = wave; j0 < K; j0 += NW * U) {
+        uint2 w[U];
+        uint32_t sb[U];
+        int sl[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int j = j0 + u * NW;
+            sl[u] = j < K ? tab[j] : -1;
+            if (sl[u] >= 0) {
+                const unsigned char* e = (const unsigned char*)(g.cc + (long)sl[u] * (long)g.cslot);
+                w[u] = *(const uint2*)(e + 8 * lane);
+                sb[u] = e[kDsNvRowD / 2 + lane];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (sl[u] < 0) continue;
+            const float sh = ds_e4m3_half(sb[u]);
+            uint4* o = (uint4*)(orow + (long)(j0 + u * NW) * kDsNvRowD + 16 * lane);
+            o[0] = ds_nv4_unpack8_fast(w[u].x, sh);
+            o[1] = ds_nv4_unpack8_fast(w[u].y, sh);
+        }
+    }
+    __syncthreads();
+}
+
 /* ------------------------------------------------------------------ index_topk */
 /* keep: index_candidates' bits, a bit a block of `block` positions (bshift = log2(block) when
  * block is a power of two, else -1). kept: walk only the kept blocks (keep given, block <= 2^16). */
@@ -889,6 +961,63 @@ __global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_split2_kernel(D
     }
 }
 
+/* Lever NVG-fold (index_topk_nvg): the two kernels that write a row's final selection, each the kernel above line for
+ * line (the same selection code on the same operands, so sel holds the same bytes), then ds_nv4_fold_row over the row
+ * while its workgroup is still resident: no launch of its own. */
+__global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_nvg_kernel(DsTopkArgs a, DsNvFold g) {
+    __shared__ DsSelShared s;
+    __shared__ uint32_t cache[kDsCache];
+    __shared__ uint32_t list[kDsKeptMax];
+    for (long m = blockIdx.x; m < a.M; m += gridDim.x) {
+        const uint32_t n = (uint32_t)ds_topk_reach(a, m);
+        const int* krow = a.keep ? a.keep + m * a.kr : nullptr;
+        int* srow = a.sel + m * a.selr;
+        bool done = false;
+        if (krow && a.kept) {                        /* the kept blocks only, when they fit the list */
+            const long nb = ((long)n + a.block - 1) / a.block;
+            const DsKeptScan<kDsSelThreads> ks = ds_kept_scan<kDsSelThreads>(krow, a.kcs, nb, s.ws);
+            if (ks.total <= (uint32_t)kDsKeptMax) {  /* block-uniform */
+                ds_kept_list<kDsSelThreads>(ks, krow, a.kcs, nb, 0u, ks.total, list);
+                __syncthreads();
+                const DsKeptKey get{ a.sc + m * a.sr, list, a.scs, (long)n, a.block, a.bshift };
+                ds_topk_row(get, ks.total * (uint32_t)a.block, cache, &s, srow, a.selc, a.K);
+                done = true;
+            }
+        }
+        if (!done) {
+            const DsTopkKey get{ a.sc + m * a.sr, krow, a.scs, a.kcs, 0, a.block, a.bshift };
+            ds_topk_row(get, n, cache, &s, srow, a.selc, a.K);
+        }
+        ds_nv4_fold_row<kDsSelThreads>(g, srow, a.selc, a.K, m, (int*)cache);
+    }
+}
+
+__global__ __launch_bounds__(kDsSelThreads) void ds41_index_topk_split2_nvg_kernel(DsSplitArgs a, DsNvFold g) {
+    __shared__ DsSelShared s;
+    __shared__ uint32_t cache[kDsCache];
+    for (long m = blockIdx.x; m < a.t.M; m += gridDim.x) {
+        const unsigned long long* cr = a.cand + m * a.nch * (long)a.t.K;
+        int used = a.used[m];
+        used = used < 0 ? 0 : (used > a.nch ? a.nch : used);
+        const uint32_t n = (uint32_t)used * (uint32_t)a.t.K;
+        const DsCandKey get{ cr, a.cnt + m * a.nch, (uint32_t)a.t.K };
+        uint32_t* c = n <= (uint32_t)kDsCacheUse ? cache : nullptr;
+        ds_select(get, n, (uint32_t)a.t.K, c, &s);
+        int* srow = a.t.sel + m * a.t.selr;
+        const long selc = a.t.selc;
+        const int K = a.t.K;
+        ds_emit(get, n, c, &s,
+                [&](uint32_t i, bool take, uint32_t out) {
+                    if (take) srow[(long)out * selc] = (int)(uint32_t)(cr[i] & 0xffffffffull);
+                },
+                [&](uint32_t tot) {
+                    for (long t = (long)tot + threadIdx.x; t < K; t += kDsSelThreads) srow[t * selc] = -1;
+                });
+        __syncthreads();
+        ds_nv4_fold_row<kDsSelThreads>(g, srow, selc, K, m, (int*)cache);
+    }
+}
+
 /* ------------------------------------------------------------------ index_candidates */
 /* keep: a bit a block, word b / 32 of a row holding blocks [32 (b / 32), 32 (b / 32) + 32). */
 struct DsCandArgs {
@@ -972,6 +1101,7 @@ struct DsAttnArgs {
 };
 
 constexpr int kDsAttnD = 512;
+static_assert(kDsNvRowD == kDsAttnD, "lever NVG-fold unpacks the attention's latent rows");
 
 /* attn_sparse_sink_rope_roundtrip (lever K1 fold d): the decode band's kernel with the inverse rope and the
  * round trip of its output (rope_rows_roundtrip's work) in its epilogue. The rope's angle table and geometry
@@ -2704,7 +2834,9 @@ int index_topk_params(const RadArgs* a, long long* topk, long long* ratio) {
     return (*topk < 1 || *ratio < 1) ? RAD_E_SHAPE : RAD_OK;
 }
 
-int index_topk_body(const RadArgs* a, RadStream stream) {
+/* `fold` (lever NVG-fold, index_topk_nvg): the final selection's kernel also unpacks each row's selections there
+ * (ds41_index_topk_nvg_kernel / ds41_index_topk_split2_nvg_kernel); null: today's kernels. */
+int index_topk_body(const RadArgs* a, RadStream stream, const DsNvFold* fold = nullptr) {
     if (!a || a->n_t < 4 || !a->t) return RAD_E_INVAL;
     const RadTensor &sc = a->t[0], &pos = a->t[2], &sel = a->t[3];
     const RadTensor* keep = a->t[1].data ? &a->t[1] : nullptr;
@@ -2763,10 +2895,14 @@ int index_topk_body(const RadArgs* a, RadStream stream) {
         const int rc = R4D_EMIT(stream, ds41_index_topk_split1_kernel,
                                 dim3((unsigned)sp.nch, (unsigned)t.M), dim3(kDsSelThreads), 0, sp);
         if (rc != RAD_OK) return rc;
+        if (fold)
+            return R4D_EMIT(stream, ds41_index_topk_split2_nvg_kernel, dim3((unsigned)t.M), dim3(kDsSelThreads), 0, sp,
+                            *fold);
         return R4D_EMIT(stream, ds41_index_topk_split2_kernel, dim3((unsigned)t.M),
                         dim3(kDsSelThreads), 0, sp);
     }
     const unsigned g = (unsigned)(t.M < 65535 ? t.M : 65535);
+    if (fold) return R4D_EMIT(stream, ds41_index_topk_nvg_kernel, dim3(g), dim3(kDsSelThreads), 0, t, *fold);
     return R4D_EMIT(stream, ds41_index_topk_kernel, dim3(g), dim3(kDsSelThreads), 0, t);
 }
 
@@ -2845,6 +2981,25 @@ int nv_gather(RadStream stream, const RadArgs* ra, const A& s, A* g) {
     g->cnv = 0;
     g->cg = out;
     g->cgr = topk * (long)kDsAttnD;
+    return RAD_OK;
+}
+/* Lever NVG-fold: a pass whose selections index_topk_nvg already unpacked (`gth`, the op's gathered operand: [rows >=
+ * M][topk 512] bf16, row m's selection j at data + m stride[0] + j 512) -> RAD_OK with *g = s over them (cnv 0, cg the
+ * operand: a valid selection's key pointer goes to its unpacked row, as nv_gather's scratch gives it; nothing is launched);
+ * RAD_E_UNSUPPORTED (nothing changed) where the pass does not read the packed latent; RAD_E_SHAPE for an operand that
+ * cannot hold the pass's rows. */
+template <class A>
+int nv_folded(const RadTensor& gth, const A& s, A* g) {
+    if (!s.cnv) return RAD_E_UNSUPPORTED;
+    const long topk = (long)s.nk - s.win;
+    if (!gth.data || gth.dtype != RAD_BF16 || gth.rank != 2 || gth.shape[0] < s.M ||
+        gth.shape[1] != topk * (long)kDsAttnD || gth.stride[1] != 1 || gth.stride[0] < topk * (long)kDsAttnD ||
+        gth.stride[0] % 8 || !aligned(gth.data, 16))
+        return R4D_NO(RAD_E_SHAPE);
+    *g = s;
+    g->cnv = 0;
+    g->cg = (const uint16_t*)gth.data;
+    g->cgr = (long)gth.stride[0];
     return RAD_OK;
 }
 
@@ -2985,7 +3140,9 @@ int attn_setup(const RadArgs* a, DsAttnArgs* res) {
     return RAD_OK;
 }
 
-int attn_body(const RadArgs* a, RadStream stream) {
+/* `gth` (lever NVG-fold, attn_sparse_sink_gathered): the pass's selections as index_topk_nvg unpacked them (nv_folded);
+ * null: lever NVG's own gather where its knob takes the pass, else the cache. */
+int attn_body(const RadArgs* a, RadStream stream, const RadTensor* gth = nullptr) {
     DsAttnArgs s{};
     {
         const int rc = attn_setup(a, &s);
@@ -3013,7 +3170,8 @@ int attn_body(const RadArgs* a, RadStream stream) {
     const long rows = s.M;
     if (rows <= kWmRows) {
         DsAttnArgs g{};
-        const int gr = nv_gather(stream, a, s, &g);   /* lever NVG (off unless RADIANCE_DS41_NVGATHER) */
+        /* lever NVG-fold's rows, or lever NVG (off unless RADIANCE_DS41_NVGATHER) */
+        const int gr = gth ? nv_folded(*gth, s, &g) : nv_gather(stream, a, s, &g);
         if (gr != RAD_OK && gr != RAD_E_UNSUPPORTED) return gr;
         if (gr == RAD_OK) {
             const int rc = attn_dec_emit<false>(stream, g);
@@ -3049,7 +3207,7 @@ int attn_body(const RadArgs* a, RadStream stream) {
  * attn_sparse_sink's launch and then rope_rows_roundtrip's, the two ops themselves. Parameters: the
  * attention's, then rope_rows' rot / off / mode / inverse (n_head = heads, head_dim = dim) and
  * quant_roundtrip's block / format, its scale as `block_scale` (`scale` is the attention's). */
-int attn_ort_body(const RadArgs* a, RadStream stream) {
+int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* gth = nullptr) {
     namespace q = r4d_ds41q;
     if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
     const RadTensor &pos = a->t[7], &out = a->t[10], &cs = a->t[11];
@@ -3093,7 +3251,8 @@ int attn_ort_body(const RadArgs* a, RadStream stream) {
         so.o.sc = sc;
         so.o.sign = inv ? -1.0f : 1.0f;
         DsAttnArgsOrt sg{};
-        const int gr = nv_gather(stream, a, so, &sg);   /* lever NVG (off unless RADIANCE_DS41_NVGATHER) */
+        /* lever NVG-fold's rows (attn_sparse_sink_rope_roundtrip_gathered), or lever NVG (off unless its knob) */
+        const int gr = gth ? nv_folded(*gth, so, &sg) : nv_gather(stream, a, so, &sg);
         if (gr != RAD_OK && gr != RAD_E_UNSUPPORTED) return gr;
         if (gr == RAD_OK) {
             const int rc3 = attn_dec_emit<true>(stream, sg);
@@ -3104,7 +3263,7 @@ int attn_ort_body(const RadArgs* a, RadStream stream) {
     }
     /* the two launches: attn_sparse_sink, then rope_rows_roundtrip over out at its own parameters */
     {
-        const int rc = attn_body(a, stream);
+        const int rc = attn_body(a, stream, gth);
         if (rc != RAD_OK) return rc;
     }
     auto pint = [](const char* k, long long v) { RadParam r{}; r.key = k; r.kind = RAD_P_INT; r.ival = v; return r; };
@@ -3202,4 +3361,59 @@ extern "C" int r4d_rad_ds41_attn_sparse_sink(const RadArgs* a, RadStream stream)
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip(const RadArgs* a, RadStream stream) {
     return attn_ort_body(a, stream);
+}
+
+/* Lever NVG-fold (RADIANCE_DS41_NVGATHER_FOLD, 11.11.2026). index_topk_nvg: index_topk (operands 0-3 and its
+ * parameters, the same kernels' selection) whose final selection kernel also unpacks each row's valid selections from
+ * the packed compressed cache (operands 4-6, attn_sparse_sink's comp_cache / comp_bt / cu_seqlens) into `gathered`
+ * (operand 7, [rows >= M][topk 512] bf16): the bytes lever NVG's ds41_latent_gather_nv4_kernel writes into an
+ * attention's scratch over the same selections and cache. dim 512, latent_format nvfp4; the split's scratch as
+ * index_topk's. */
+extern "C" int r4d_rad_ds41_index_topk_nvg(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 8 || !a->t) return RAD_E_INVAL;
+    const RadTensor &sc = a->t[0], &cc = a->t[4], &cbt = a->t[5], &cu = a->t[6], &out = a->t[7];
+    long long topk, ratio;
+    if (index_topk_params(a, &topk, &ratio) != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    const char* lf = r4d_gets(a, "latent_format");
+    if (r4d_geti_or(a, "dim", 0) != kDsAttnD || !lf || std::strcmp(lf, "nvfp4")) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (!sc.data || !cc.data || !cbt.data || !cu.data || !out.data || sc.rank != 2) return R4D_NO(RAD_E_SHAPE);
+    const long long cslots = kDsNv4Bytes / 2, M = sc.shape[0], ncu = r4d_numel(&cu);
+    /* the attention's geometry checks (attn_setup) on the same operands; the slots fit an int (the fold's table) */
+    if (cc.rank != 4 || cc.shape[1] != 1 || cc.shape[3] * ratio != cslots || cc.shape[2] < 1 || cc.shape[2] % ratio ||
+        cc.shape[2] > INT_MAX || cc.shape[0] > INT_MAX / cc.shape[2] || cbt.rank != 2 || cbt.shape[1] > INT_MAX ||
+        ncu < 2 || ncu - 1 > INT_MAX || cbt.shape[0] < ncu - 1 || topk > kDsCache || out.rank != 2 ||
+        out.shape[0] < M || out.shape[1] != topk * kDsAttnD || out.stride[1] != 1 || out.stride[0] < topk * kDsAttnD ||
+        out.stride[0] % 8)
+        return R4D_NO(RAD_E_SHAPE);
+    if (cc.dtype != RAD_BF16 || cbt.dtype != RAD_I32 || cu.dtype != RAD_I32 || out.dtype != RAD_BF16)
+        return R4D_NO(RAD_E_DTYPE);
+    const long cs = lin_stride(cu);
+    if (cs < 0 || !aligned(cc.data, 16) || !aligned(out.data, 16)) return R4D_NO(RAD_E_SHAPE);
+    DsNvFold g{};
+    g.cc = (const uint16_t*)cc.data;
+    g.cbt = (const int*)cbt.data;
+    g.cu = (const int*)cu.data;
+    g.out = (uint16_t*)out.data;
+    g.cbtr = (long)cbt.stride[0];
+    g.cbtc = (long)cbt.stride[1];
+    g.ncblk = (long)cc.shape[0];
+    g.cs = cs;
+    g.outr = (long)out.stride[0];
+    g.ncbt = (int)cbt.shape[1];
+    g.cbs = (int)cc.shape[2];
+    g.ratio = (int)ratio;
+    g.cslot = (int)cc.shape[3];
+    g.S = (int)(ncu - 1);
+    return index_topk_body(a, stream, &g);
+}
+/* attn_sparse_sink_gathered / attn_sparse_sink_rope_roundtrip_gathered: the two ops (their operands and parameters),
+ * then `gathered` (index_topk_nvg's rows for these selections): a decode-band pass over the packed latent runs the plain
+ * decode kernel over those rows (nv_folded) with no gather launch; any other pass is the op itself. */
+extern "C" int r4d_rad_ds41_attn_sparse_sink_gathered(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
+    return attn_body(a, stream, &a->t[11]);
+}
+extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 13 || !a->t) return RAD_E_INVAL;
+    return attn_ort_body(a, stream, &a->t[12]);
 }

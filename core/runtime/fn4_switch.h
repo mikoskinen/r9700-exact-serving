@@ -83,6 +83,11 @@
  *   ds41_onefill    deepseek41 (lever K1 fold f): 1 the ungated shared expert's gate plane of ones filled once a
  *                   step (MoeFP8 shared_one_external), 0 by every MoE layer as before. RADIANCE_DS41_ONEFILL=1
  *                   declares the step's fill (starts at 1); unset: 1 refused. Exact: the gathers read the same ones.
+ *   ds41_nvgfold    deepseek41 (lever NVG-fold): 1 a decode-band step over the packed latent takes index_topk_nvg (the
+ *                   selection unpacks its selected entries once, in its own launch) and the gathered attentions
+ *                   that read those rows; 0 index_topk + the attentions as before (lever NVG's gather where
+ *                   RADIANCE_DS41_NVGATHER is set). RADIANCE_DS41_NVGATHER_FOLD=<rows> declares it for steps of at
+ *                   most <rows> rows (starts at 1); unset: 1 refused. Exact: the same selection and key bytes.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -105,7 +110,7 @@ namespace fn4 {
 
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
-              kDraftLend, kDraftLendBorrow, kSwitches };
+              kDraftLend, kDraftLendBorrow, kDs41NvgFold, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

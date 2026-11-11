@@ -545,7 +545,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram)
+                  dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram ds41nvgf)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -589,7 +589,7 @@ else()
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_m2xfp4.cpp ${R4D_EMU}/test_lili.cpp
                 ${R4D_EMU}/test_ds41idx.cpp ${R4D_EMU}/test_ds41attn.cpp ${R4D_EMU}/test_ds41mr.cpp
                 ${R4D_EMU}/test_argts.cpp ${R4D_EMU}/test_ds41fold.cpp ${R4D_EMU}/test_ds41vram.cpp
-                ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_ds41nvgf.cpp ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -627,7 +627,7 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
-            ds41attn ds41mr argts ds41fold ds41vram)
+            ds41attn ds41mr argts ds41fold ds41vram ds41nvgf)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
@@ -639,6 +639,9 @@ if(R4D_EMU_BUILT)
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # Lever K1's folds (rmsnorm_rope_roundtrip_kv_store, attn_sparse_sink_rope_roundtrip) against the rows they fold.
   set_tests_properties(r4d_emu_ds41fold PROPERTIES LABELS "r4d_emu" TIMEOUT 1500)
+  # Lever NVG-fold: index_topk_nvg's selection and unpacked rows against index_topk and lever NVG's gather, and the
+  # gathered attentions against the packed / NVG / bf16 ones, with mutations.
+  set_tests_properties(r4d_emu_ds41nvgf PROPERTIES LABELS "r4d_emu" TIMEOUT 2400)
   # Lever VA "bf16": gemm_nt_f32 over bf16 weights against the same values as f32, DeepSeek-V4.1's shapes.
   set_tests_properties(r4d_emu_ds41vram PROPERTIES LABELS "r4d_emu" TIMEOUT 1800)
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,

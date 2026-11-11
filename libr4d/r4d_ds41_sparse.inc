@@ -44,6 +44,29 @@ static const RadOperandSpec oDs41IndexTopk[] = {
     { "score", RAD_OPD_IN, 0 }, { "keep", RAD_OPD_IN, 1 }, { "positions", RAD_OPD_IN, 0 },
     { "sel", RAD_OPD_OUT, 0 },
 };
+/* Lever NVG-fold (RADIANCE_DS41_NVGATHER_FOLD; device-only, no libref schema): index_topk's parameters and operands, then
+ * the packed latent's (dim, latent_format; attn_sparse_sink's comp_cache, comp_bt, cu_seqlens) and the gathered rows it
+ * writes; the two attentions' parameters and operands, then the gathered rows they read. */
+static const RadParamSpec pDs41IndexTopkNvg[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
+    P_INTO("block"), P_INT("dim"), P_STR("latent_format") };
+static const RadOperandSpec oDs41IndexTopkNvg[] = {
+    { "score", RAD_OPD_IN, 0 },      { "keep", RAD_OPD_IN, 1 },    { "positions", RAD_OPD_IN, 0 },
+    { "sel", RAD_OPD_OUT, 0 },       { "comp_cache", RAD_OPD_IN, 0 }, { "comp_bt", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "gathered", RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oDs41AttnSparseSinkGth[] = {
+    { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
+    { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
+    { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "gathered", RAD_OPD_IN, 0 },
+};
+static const RadOperandSpec oDs41AttnSparseSinkRtGth[] = {
+    { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
+    { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
+    { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "cos_sin", RAD_OPD_IN, 0 },
+    { "gathered", RAD_OPD_IN, 0 },
+};
 
 /* r4d_ds41_sparse.hip's launch checks. The latent is 512 wide (16-byte loads of 512/ratio-wide
  * compressed slots: ratio <= 64), at most 1024 window and 2048 selected keys a row (the per-row
@@ -72,6 +95,24 @@ static const RadConstraint cDs41IndexCand[] = {
 static const RadConstraint cDs41IndexTopk[] = {
     C_GE("M", 1), C_GE("width", 1), C_LE("width", 1073741823), C_GE("topk", 1),
     C_LE("topk", 1073741823), C_GE("ratio", 1),
+};
+/* Lever NVG-fold: decode-band passes (the gathered attention's band) over the packed 512-wide latent; the fold's LDS
+ * table holds topk <= 2048 slots (the attention's own bound). */
+static const RadConstraint cDs41IndexTopkNvg[] = {
+    C_GE("M", 1), C_LE("M", 48), C_GE("width", 1), C_LE("width", 1073741823), C_GE("topk", 1), C_LE("topk", 2048),
+    C_GE("ratio", 1), C_LE("ratio", 64), C_EQ("dim", 512), C_IN("latent_format", "nvfp4"),
+};
+static const RadConstraint cDs41AttnSparseSinkGth[] = {
+    C_GE("M", 1),       C_LE("M", 48),    C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_GE("ratio", 1),   C_LE("ratio", 64), C_GE("topk", 1),  C_LE("topk", 2048),
+    C_IN("dtype", "bf16"), C_IN("latent_format", "nvfp4"),
+};
+static const RadConstraint cDs41AttnSparseSinkRtGth[] = {
+    C_GE("M", 1),       C_LE("M", 48),    C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_GE("ratio", 1),   C_LE("ratio", 64), C_GE("topk", 1),  C_LE("topk", 2048),
+    C_IN("dtype", "bf16"), C_IN("latent_format", "nvfp4"), C_GE("rot", 2), C_DIV("rot", 2), C_GE("off", 0),
+    C_GE("inverse", 0), C_LE("inverse", 1), C_IN("mode", "gptj neox"), C_GE("block", 1),
+    C_IN("format", "fp8_e4m3 fp4_e2m1"), C_IN("block_scale", "ue8m0 e4m3 f32"),
 };
 
 #elif defined(R4D_DS41_SCHEMAS)
@@ -111,6 +152,18 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
        "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given "
        "(index_candidates' bits over blocks of `block`), never -inf, ties to the lower position, in "
        "ascending order, then -1."),
+SCHEMA("index_topk_nvg", pDs41IndexTopkNvg, oDs41IndexTopkNvg,
+       "index_topk (operands score .. sel, its parameters), and each row's selection j that attn_sparse_sink's key setup "
+       "finds in the packed compressed cache (latent_format nvfp4, dim 512; comp_cache / comp_bt / cu_seqlens as that "
+       "op's) unpacked to its bf16 values at gathered[row][j dim .. j dim + dim); the other selections' rows are not "
+       "written. Lever NVG-fold (device-only)."),
+SCHEMA("attn_sparse_sink_gathered", pDs41AttnSparseSink, oDs41AttnSparseSinkGth,
+       "attn_sparse_sink (operands q .. out, its parameters; latent_format nvfp4) whose selected entries are read from "
+       "`gathered` (index_topk_nvg's rows for the same sel, cache, block table and cu_seqlens) instead of unpacked from "
+       "the cache: the same out. Lever NVG-fold (device-only)."),
+SCHEMA("attn_sparse_sink_rope_roundtrip_gathered", pDs41AttnSparseSinkRt, oDs41AttnSparseSinkRtGth,
+       "attn_sparse_sink_rope_roundtrip (operands q .. cos_sin, its parameters) with the selected entries read from "
+       "`gathered`, as attn_sparse_sink_gathered: the same out. Lever NVG-fold (device-only)."),
 
 #elif defined(R4D_DS41_ROWS)
 
@@ -160,5 +213,29 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexTopk), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_topk, r4d_rad_ds41_index_topk_scratch, nullptr, nullptr,
   r4d_shape_index_topk },
+{ "ds41_index_topk_nvg", "index_topk_nvg", "select",
+  "index_topk's kernels, the final selection kernel also unpacking each row's valid selections from the packed "
+  "latent cache into `gathered` once its selection is written (lever NVG-fold: no gather launch of its own)",
+  "index_topk's; decode band (<= 48 rows), topk <= 2048, dim 512 nvfp4; a wave an entry, lane L its block L",
+  "f32 score, i32 keep, positions, sel, tables; packed bf16-slot cache; bf16 gathered",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexTopkNvg), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_index_topk_nvg, r4d_rad_ds41_index_topk_scratch, nullptr, nullptr,
+  r4d_shape_index_topk_nvg },
+{ "ds41_attn_sparse_sink_gathered_d512_bf16", "attn_sparse_sink_gathered", "attn",
+  "attn_sparse_sink over the packed latent with its selections already unpacked (index_topk_nvg): the decode band's "
+  "plain kernel over the gathered rows, no gather launch; libref's bits as attn_sparse_sink's",
+  "attn_sparse_sink's decode band (<= 48 rows), latent_format nvfp4",
+  "bf16 q, caches, gathered and out; f32 sinks; i32 tables, positions, selections",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSinkGth), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_gathered, nullptr, nullptr, nullptr,
+  r4d_shape_attn_sparse_sink_gathered },
+{ "ds41_attn_sparse_sink_rope_rt_gathered_d512_bf16", "attn_sparse_sink_rope_roundtrip_gathered", "attn",
+  "attn_sparse_sink_rope_roundtrip over the packed latent with its selections already unpacked (index_topk_nvg): the "
+  "decode band's plain kernel with the fused epilogue over the gathered rows, no gather launch",
+  "attn_sparse_sink_rope_roundtrip's decode band (<= 48 rows), latent_format nvfp4",
+  "bf16 q, caches, gathered and out; f32 sinks and cos_sin; i32 tables, positions, selections",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSinkRtGth), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered, nullptr, nullptr, nullptr,
+  r4d_shape_attn_sparse_sink_rope_roundtrip_gathered },
 
 #endif
