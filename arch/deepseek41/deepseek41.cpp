@@ -1157,7 +1157,13 @@ static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 10
  * RADIANCE_DS41_PSK=0 / off declares it and starts at 0, 1 / on at 1; unset declares nothing (1 refused, today's issue).
  * Cut: a step with one prefill sequence and no decode rows (any ds41_bi), and the prefill segments of a step ds41_bi
  * segments. Not cut: a step asking more logits rows than its decode rows + one a prefill sequence (prompt logprobs),
- * score-only / generator / encoder / plugin-word passes, a calibration (--calib-layers) serve. */
+ * score-only / generator / encoder / plugin-word passes, a calibration (--calib-layers) serve.
+ * The indexer at a cut layer (ds41-psk-fix cf7bbc7, carried into ds41-psk2): the candidate layer's keep (index_keep) is
+ * rank-local -- under the row split each rank's index_candidates writes only its own runs' rows, and keep is not gathered
+ * -- so a cut layer's indexer keeps the step's deal (ds41_idx_runs over the uncut segment, as every uncut layer) and skips
+ * the runs wholly before its cut rows; re-dealt over the cut rows, a rank would read keep rows another rank wrote (r00y's
+ * trace: L28.sel). Design 2 the same: a segment cut to its target's cone keeps its uncut segment's deal; a segment with no
+ * row at the layer runs no indexer run there. */
 static std::atomic<int> g_sw_psk{0}, g_sw_psk_ok{0}, g_sw_psk_env{-2};   /* env: -2 unread, -1 unset */
 static std::atomic<long long> g_psk_steps{0}, g_psk_rows{0};
 static void psk_read_env() {
@@ -3894,6 +3900,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         return bcol_at(h, r0, m.bp.at(h), first, width, n);
     };
     auto P = [&](const int32_t* p, int64_t r0, int64_t n) { return praw(p + r0, RAD_I32, n); };
+    /* lever PSK: the step's own segments (the indexer's deal at every layer, cut or not: ds41-psk-fix cf7bbc7) */
+    const std::vector<BiSeg>& sg_step = sg;
     /* lever PSK: the layer's segments (`cur`: the step's, or `psk_sg` with the prefill segments cut) and the runs of
      * consecutive rows they cover (`runs`: [0, T) uncut) */
     static thread_local std::vector<BiSeg> psk_sg;
@@ -4233,11 +4241,23 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 const bool uses = c.cand >= 0 && c.cand < l;
                 const bool split = m.isplit && m.sel_gather;
                 const bool rkeep = L.i_keep && live >= m.keep_min_live;
-                for (const BiSeg& s : sg) {
+                size_t sj = 0;
+                for (size_t si = 0; si < sg.size(); ++si) {
+                    /* lever PSK (ds41-psk-fix cf7bbc7): a cut prefill segment keeps the step's deal (sg_step: every
+                     * uncut layer's). The candidate layer's keep rows are rank-local -- each rank writes only its own
+                     * runs' rows, and keep is not gathered -- so a row's selection must run on the rank that wrote its
+                     * keep, at the same run height. Runs wholly before the layer's cut rows are skipped; a run reaching
+                     * them runs whole (its rows before the cut are not read at this layer). Design 2 drops a segment
+                     * with no row at the layer, so the step's segment is found by its sequence (s0, dec; the order is
+                     * kept). Uncut: sg[si] is sg_step[si], nothing skipped, the issue as before. */
+                    while (sj < sg_step.size() && !(sg_step[sj].s0 == sg[si].s0 && sg_step[sj].dec == sg[si].dec)) ++sj;
+                    const BiSeg& s = sj < sg_step.size() ? sg_step[sj] : sg[si];
+                    const int64_t cut0 = sg[si].r0;
                     const Ds41IdxRuns ru = ds41_idx_runs(s.n, m.irows, live, m.aw, m.ar, split && !s.dec, m.split_min_live,
                                                          split && !s.dec && idx_balance(), (int64_t)L.i_runs.size());
                     for (int64_t p = ru.p0; p < ru.p1; ++p) {
                         const int64_t q0 = p * ru.R, qn = std::min(ru.R, s.n - q0);
+                        if (s.r0 + q0 + qn <= cut0) continue;
                         RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, R(m.iq, s.r0, s.n), R(m.iw, s.r0, s.n),
                                     kv_cache(m.index[r], src),
                                     praw2(ib->block_table + s.s0 * ib->block_table_pitch, RAD_I32, s.s1 - s.s0,
