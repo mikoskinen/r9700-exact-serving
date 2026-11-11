@@ -10339,3 +10339,87 @@ TEST(dst_review_psk2_latches_every_chunk_path_and_keeps_the_chunks) {
     }
 }
 
+/* ================================================== review: a shared head under lever PSK design 2 (DST agent)
+ * The coordinator's question: does the branch_at snapshot (Request::checkpoint_at, set in admit_one from CacheHit::branch_at)
+ * survive ds41_psk 2's psk_ckpt as a target, so later sessions resume at the head? The cache's side is the real
+ * PrefixCache's rule (core/mem/prefix.cpp lookup: branch_at only where two cached prompts already left the head
+ * differently, mem_test a_hit_reports_the_head_two_cached_prompts_left_differently); here FakePC hands each admission the
+ * hit that rule and the snapshots committed so far give: attention to the 25600-token head, linear state (the window
+ * snapshot) at the deepest committed snapshot at or below it, branch_at from the third prompt on. DS geometry: exact
+ * resume, interval 2048, span 2 (anchors q_i = 2048 + (i - 1) x 4096: K4 -> 14336, 30720; K8 -> 30720). */
+namespace {
+struct HeadRun { int64_t resumed = -1, ckpt_at = -1; std::vector<int64_t> committed; bool head_snap = false; };
+/* one request alone to completion: its admission's resume point and checkpoint_at, the snapshots it committed */
+HeadRun head_req(Fixture& f, int n_prompt, int64_t attn, int64_t lin, int32_t branch, int64_t head) {
+    HeadRun out;
+    f.pc.committed.clear();
+    if (attn > 0) { f.pc.seed((int32_t)attn); f.pc.lin = (int32_t)lin; f.pc.src = lin > 0 ? 7 : -1; }
+    else { f.pc.attn = 0; f.pc.lin = 0; f.pc.src = -1; }
+    f.pc.branch_at = branch;
+    const uint64_t id = f.submit(n_prompt, 2);
+    bool first = true;
+    for (int k = 0; k < 200; ++k) {
+        if (!f.sch.step()) break;
+        if (first) {
+            if (const Request* r = f.sch.find(id)) { out.resumed = r->n_computed; out.ckpt_at = r->checkpoint_at; }
+            first = false;
+        }
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == id && e.is_prefill && e.ckpt_slot >= 0 && (int64_t)e.ctx_len + e.ckpt_tok + 1 == head) out.head_snap = true;
+        f.commit_plain(12);
+        std::vector<uint64_t> c;
+        f.sch.take_completed(&c);
+        for (uint64_t x : c) (void)f.sch.reap(x);
+        if (!f.sch.find(id)) break;
+    }
+    out.committed = f.pc.committed;
+    return out;
+}
+int64_t deepest_at_or_below(const std::vector<int64_t>& v, int64_t pos) {
+    int64_t d = 0;
+    for (int64_t x : v) if (x <= pos && x > d) d = x;
+    return d;
+}
+}  // namespace
+
+TEST(dst_review_psk2_keeps_the_shared_head_snapshot) {
+    const int64_t H = 25600;   /* the shared head (a block and quantum multiple) */
+    for (int mode : { 0, 2 })
+        for (int k : { 4, 8 }) {
+            if (mode == 0 && k == 8) continue;
+            Fixture f;
+            f.build(/*blocks=*/40000, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+            f.cfg.checkpoint_interval = 2048;
+            f.cfg.prefill_span = 2;
+            f.cfg.prefix_exact = true;
+            CHECK_OK(f.start());
+            f.sch.set_span_min(16384);
+            f.sch.set_psk_mode(mode);
+            f.sch.set_psk_k(k);
+            /* session 1, request 1: a 40000-token prompt, cold */
+            const HeadRun r1 = head_req(f, 40000, 0, 0, 0, H);
+            std::vector<int64_t> snaps = r1.committed;
+            /* session 1, request 2: diverges at the head -- the second prompt past it, so no branch_at (one cached child) */
+            const HeadRun r2 = head_req(f, 32000, H, deepest_at_or_below(snaps, H), 0, H);
+            snaps.insert(snaps.end(), r2.committed.begin(), r2.committed.end());
+            /* session 2: a third prompt with the head -- two cached prompts left it differently: branch_at = H */
+            const HeadRun s2 = head_req(f, 32000, H, deepest_at_or_below(snaps, H), (int32_t)H, H);
+            snaps.insert(snaps.end(), s2.committed.begin(), s2.committed.end());
+            /* session 3: the head's snapshot is there if session 2 kept it */
+            const HeadRun s3 = head_req(f, 32000, H, deepest_at_or_below(snaps, H), (int32_t)H, H);
+            std::fprintf(stderr, "    psk %d K %d: r1 snapshots [", mode, k);
+            for (int64_t x : r1.committed) std::fprintf(stderr, " %lld", (long long)x);
+            std::fprintf(stderr, " ] | r2 resumed %lld (checkpoint_at %lld, head snapshot %d) | s2 resumed %lld (checkpoint_at %lld, "
+                         "head snapshot %d) | s3 resumed %lld (checkpoint_at %lld)\n", (long long)r2.resumed, (long long)r2.ckpt_at,
+                         (int)r2.head_snap, (long long)s2.resumed, (long long)s2.ckpt_at, (int)s2.head_snap, (long long)s3.resumed,
+                         (long long)s3.ckpt_at);
+            const int64_t below = mode == 0 ? 22528 : (k == 4 ? 14336 : 0);
+            CHECK_EQ(r2.resumed, below);                /* the anchor (psk 0: the grid point) below the head */
+            CHECK_EQ(r2.ckpt_at, (int64_t)0);           /* no branch yet */
+            CHECK(!r2.head_snap);
+            CHECK_EQ(s2.resumed, below);                /* the third prompt still resumes below the head ... */
+            CHECK_EQ(s2.ckpt_at, H);                    /* ... and takes the head as its checkpoint_at */
+            CHECK(s2.head_snap);                        /* KEPT under psk 2: psk_is_target(checkpoint_at) */
+            CHECK_EQ(s3.resumed, H);                    /* from the fourth prompt on: at the head */
+        }
+}
