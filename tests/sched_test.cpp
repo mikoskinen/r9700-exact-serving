@@ -10259,7 +10259,7 @@ struct PskPathRun {
     std::vector<std::pair<uint64_t, int64_t>> ckpts;                                  /* (seq, snapshot position) */
     int64_t unplanned = 0, planned = 0, dropped = 0;
 };
-PskPathRun psk_path_run(int psk, int bic, int byp, int tot, const std::vector<int>& lens) {
+PskPathRun psk_path_run(int psk, int bic, int byp, int tot, const std::vector<int>& lens, int mt = 0) {
     PskPathRun out;
     DstSwitches restore;
     Fixture f;
@@ -10275,6 +10275,7 @@ PskPathRun psk_path_run(int psk, int bic, int byp, int tot, const std::vector<in
     CHECK(DstSwitches::set("sched_bi_chunk", bic));
     CHECK(DstSwitches::set("sched_short_bypass", byp));
     CHECK(DstSwitches::set("sched_bypass_total", tot));
+    CHECK(DstSwitches::set("sched_mixed_tok", mt));
     f.submit(100, 4000);
     CHECK(f.sch.step() != nullptr);
     f.commit_plain(11);
@@ -10310,7 +10311,7 @@ PskPathRun psk_path_run(int psk, int bic, int byp, int tot, const std::vector<in
 }  // namespace
 
 TEST(dst_review_psk2_latches_every_chunk_path_and_keeps_the_chunks) {
-    struct Case { int bic, byp, tot; std::vector<int> lens; const char* what; };
+    struct Case { int bic, byp, tot; std::vector<int> lens; const char* what; int mt = 0; };
     const Case cases[] = {
         { 0, 0, 0, { 1000 }, "today's chunks" },
         { 1, 0, 0, { 1000 }, "sched_bi_chunk 1" },
@@ -10318,10 +10319,13 @@ TEST(dst_review_psk2_latches_every_chunk_path_and_keeps_the_chunks) {
         { 4, 0, 0, { 1000 }, "sched_bi_chunk 4" },
         { 0, 1280, 0, { 1000 }, "sched_short_bypass (one piece), today's chunks" },
         { 3, 2112, 4096, { 3000 }, "sched_bypass_total (two pieces), sched_bi_chunk 3" },
+        { 0, 2112, 4096, { 3000 }, "sched_bypass_total (two pieces), today's chunks" },
+        { 4, 1280, 0, { 1000 }, "sched_bi_chunk 4 + sched_mixed_tok 1088 (dst_grid) + one-piece bypass", 1088 },
+        { 3, 0, 0, { 1000 }, "sched_bi_chunk 3 + sched_mixed_tok 576 (dst_grid)", 576 },
     };
     for (const Case& c : cases) {
-        const PskPathRun off = psk_path_run(0, c.bic, c.byp, c.tot, c.lens);
-        const PskPathRun on = psk_path_run(2, c.bic, c.byp, c.tot, c.lens);
+        const PskPathRun off = psk_path_run(0, c.bic, c.byp, c.tot, c.lens, c.mt);
+        const PskPathRun on = psk_path_run(2, c.bic, c.byp, c.tot, c.lens, c.mt);
         if (on.steps != off.steps) std::fprintf(stderr, "    %s: the chunks differ under ds41_psk 2\n", c.what);
         CHECK(on.steps == off.steps);                 /* PSK never changes a chunk */
         if (on.unplanned) std::fprintf(stderr, "    %s: %lld prefill entr(ies) not latched (planned %lld)\n", c.what,
