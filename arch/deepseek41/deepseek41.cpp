@@ -1096,7 +1096,7 @@ static std::atomic<int> g_sw_bi{0}, g_sw_bi_ok{0}, g_sw_bi_env{-2};   /* env: -2
 static void bi_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_BI");
-    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : !std::strcmp(e, "2") ? 2
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : (e[0] >= '2' && e[0] <= '4' && !e[1]) ? e[0] - '0'
                           : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
     if (g_sw_bi_env.compare_exchange_strong(unread, v)) {
         if (v >= 0) g_sw_bi.store(v, std::memory_order_relaxed);
@@ -1112,6 +1112,12 @@ static bool bi_declared() { return g_sw_bi_env.load(std::memory_order_relaxed) >
  * whatever the step's decode rows (a c4 / c8 NST 5 verify: 24-48). Costs a MoE pass (router, gather, all-reduce, the
  * shared arm) per extra piece. */
 static constexpr int64_t kBiMoe = 16;
+/* The values: 1 = the segments (B); 2 = B + the MoE pieces (P); 3 = B, 4 = P, each with the cheap issue (C): the A1 chains
+ * op by op across the segments (each weight's two reads back to back, so the decode rows' GEMV finds it in the last-level
+ * cache) and the per-row ops that never flip (rmsnorm q_an / kv_n, ds41_rope_rows, rope_rows_roundtrip, quant_roundtrip,
+ * the window-key store) once over the step. Every value gives a row its alone bytes. */
+static bool bi_pieces(int v) { return v == 2 || v == 4; }
+static bool bi_cheap(int v) { return v >= 3; }
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
 static void sw_note_decl(int64_t rows) {
@@ -1137,7 +1143,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_bi"))
-        return value == 0 || (value >= 1 && value <= 2 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || (value >= 1 && value <= 4 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -3546,7 +3552,7 @@ static bool bi_segments(RadCtx* x, const Model& m, const RadBatch* b, std::vecto
     if (DT > kBiBand) g_bi_wide.fetch_add(1, std::memory_order_relaxed);   /* > 48 decode rows: one segment past the band */
     (void)m;
     const int bi = g_sw_bi.load(std::memory_order_relaxed);
-    return sg.size() > 1 || (sg.size() == 1 && sg[0].dec && (sg[0].n > kBiNorm || (bi >= 2 && sg[0].n > kBiMoe)));
+    return sg.size() > 1 || (sg.size() == 1 && sg[0].dec && (sg[0].n > kBiNorm || (bi_pieces(bi) && sg[0].n > kBiMoe)));
 }
 
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg) {
@@ -3709,7 +3715,60 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const int qnf = L.q_bf ? g_sw_qnf.load(std::memory_order_relaxed) : 0;
             const bool qfold = qnf == 1 || (qnf == 2 && !L.i_score);
             const bool kvfold = L.kv_fs && g_sw_kvf.load(std::memory_order_relaxed) > 0;
+            const bool cheap = bi_cheap(g_sw_bi.load(std::memory_order_relaxed));
+            /* the fused window-key norm over a segment (decode rows within 32) */
+            const auto kvn_seg = [&](const BiSeg& s) {
+                const auto kvn = [&](int64_t a0, int64_t an) {
+                    if (kvfold)
+                        RAD_ISSUE_N(x, L.kv_fs, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an),
+                                    brows(cs, g.max_ctx), P(batch->positions, a0, an), P(wb->slot_mapping, a0, an),
+                                    kv_cache(m.win, l));
+                    else
+                        RAD_ISSUE_N(x, L.kv_f, an, R(m.kv, a0, an), RAD_W(L.kv_norm), R(m.kvn, a0, an),
+                                    brows(cs, g.max_ctx), P(batch->positions, a0, an));
+                };
+                if (s.dec && s.n > kBiNorm)
+                    for (int64_t a = 0; a < s.n; a += kBiNorm) kvn(s.r0 + a, std::min(kBiNorm, s.n - a));
+                else
+                    kvn(s.r0, s.n);
+            };
+            if (cheap) {   /* C: op by op across the segments; the never-flipping per-row ops once over the step */
+                for (const BiSeg& s : sg) lin_issue(x, m, L.q_a, s.n, R(m.xn, s.r0, s.n), L.wq_a, R(m.qr, s.r0, s.n));
+                for (const BiSeg& s : sg) lin_issue(x, m, L.kv_g, s.n, R(m.xn, s.r0, s.n), L.wkv, R(m.kv, s.r0, s.n));
+                if (L.i_score)
+                    for (const BiSeg& s : sg) lin_issue(x, m, L.i_w, s.n, R(m.xn, s.r0, s.n), L.iproj, R(m.iw, s.r0, s.n));
+                if (qfold)
+                    for (const BiSeg& s : sg)
+                        RAD_ISSUE_N(x, L.q_bf, s.n, R(m.qr, s.r0, s.n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, s.r0, s.n),
+                                    R(m.q, s.r0, s.n));
+                else
+                    RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
+                if (kvfold || L.kv_f)
+                    for (const BiSeg& s : sg) kvn_seg(s);
+                else
+                    RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+                if (L.i_score)
+                    for (const BiSeg& s : sg) lin_issue(x, m, L.i_q, s.n, R(m.qrn, s.r0, s.n), L.iq_w, R(m.iq, s.r0, s.n));
+                if (!qfold)
+                    for (const BiSeg& s : sg) lin_issue(x, m, L.q_b, s.n, R(m.qrn, s.r0, s.n), L.wq_b, R(m.q, s.r0, s.n));
+                if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
+                if (!L.src && L.i_score) {
+                    if (L.i_f) RAD_ISSUE_N(x, L.i_f, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                    else RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                    if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
+                }
+                RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
+                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
+                if (!kvfold) {
+                    if (m.w8)
+                        RAD_ISSUE_N(x, L.kv_st, T, brows(m.kvn, T), praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
+                    else
+                        RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
+                                    praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
+                }
+            }
             for (const BiSeg& s : sg) {
+                if (cheap) break;
                 const int64_t r0 = s.r0, n = s.n;
                 lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
                 lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
@@ -3776,7 +3835,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     RAD_ISSUE_N(x, L.k_norm, crows, brows(m.ik, crows), RAD_W(L.ik_norm), brows(m.ikn, crows));
             }
             /* A2: a source layer's index query rope reads the angles c_tab rewrote */
-            if (L.src && L.i_score)
+            if (L.src && L.i_score && cheap) {
+                if (L.i_f) RAD_ISSUE_N(x, L.i_f, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+                else RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
+            } else if (L.src && L.i_score)
                 for (const BiSeg& s : sg) {
                     if (L.i_f) RAD_ISSUE_N(x, L.i_f, s.n, R(m.iq, s.r0, s.n), brows(m.cs_b, g.max_ctx), P(batch->positions, s.r0, s.n));
                     else RAD_ISSUE_N(x, L.i_rope, s.n, R(m.iq, s.r0, s.n), brows(m.cs_b, g.max_ctx), P(batch->positions, s.r0, s.n));
@@ -3786,7 +3848,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 else RAD_ISSUE_N(x, L.l_rope, crows, brows(m.lat, crows), brows(m.cs_b, g.max_ctx), bpos);
                 if (!L.k_f) RAD_ISSUE_N(x, L.k_rope, crows, brows(m.ikn, crows), brows(m.cs_b, g.max_ctx), bpos);
             }
-            if (L.src && L.i_score && L.i_qq)
+            if (L.src && L.i_score && L.i_qq && cheap)
+                RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
+            else if (L.src && L.i_score && L.i_qq)
                 for (const BiSeg& s : sg) RAD_ISSUE_N(x, L.i_qq, s.n, R(m.iq, s.r0, s.n));
             if (L.src && L.l_q) RAD_ISSUE_N(x, L.l_q, crows, brows(m.lat, crows));
             if (L.src && L.k_q) RAD_ISSUE_N(x, L.k_q, crows, brows(m.ikn, crows));
@@ -3915,7 +3979,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bs.fn = mix_f_beside;
         bs.arg = &mb;
         {   /* ds41_bi 2: the decode segment in pieces within the EXL3 decode band */
-            const int64_t piece = g_sw_bi.load(std::memory_order_relaxed) >= 2 ? kBiMoe : ((int64_t)1 << 40);
+            const int64_t piece = bi_pieces(g_sw_bi.load(std::memory_order_relaxed)) ? kBiMoe : ((int64_t)1 << 40);
             for (const BiSeg& s : sg) {
                 if (!s.dec || s.n <= piece) {
                     L.moe.pass(x, T, s.r0, s.n, true, &bs);

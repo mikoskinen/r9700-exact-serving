@@ -120,7 +120,9 @@
  *                   a segment -- so a row's arithmetic is the one its sequence gets alone; 0 one launch over the step as
  *                   before; 2 (arm BI-P) = 1 + the routed MoE over the decode rows in passes of at most 16 (the EXL3
  *                   experts' decode band), so a c4 / c8 verify's rows keep their alone bytes too, at a MoE pass a piece.
- *                   RADIANCE_DS41_BI=0 / 1 / 2 declares it (and starts at that value); unset: 1 / 2 refused. A step with
+ *                   3 / 4 = 1 / 2 with the cheap issue (the query / key chains op by op across the segments, the
+ *                   per-row ops that never flip once over the step). RADIANCE_DS41_BI=0..4 declares it (and starts at that
+ *                   value); unset: 1..4 refused. A step with
  *                   one segment runs today's issue either way. Changes the bytes of rows that shared a step with other
  *                   sequences (toward their alone bytes); a one-sequence step is unchanged.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
