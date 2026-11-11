@@ -1096,15 +1096,22 @@ static std::atomic<int> g_sw_bi{0}, g_sw_bi_ok{0}, g_sw_bi_env{-2};   /* env: -2
 static void bi_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_BI");
-    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : !std::strcmp(e, "2") ? 2
                           : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
     if (g_sw_bi_env.compare_exchange_strong(unread, v)) {
         if (v >= 0) g_sw_bi.store(v, std::memory_order_relaxed);
         if (e && v < 0)
-            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_BI=%s is not 0 / off or 1 / on: lever BI is not declared\n", e);
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_BI=%s is not 0 / off, 1 / on or 2: lever BI is not declared\n", e);
     }
 }
 static bool bi_declared() { return g_sw_bi_env.load(std::memory_order_relaxed) >= 0; }
+/* ds41_bi 2 (arm BI-P): as 1, and the routed MoE takes the decode segment in passes of at most this many rows -- the EXL3
+ * experts' decode band (radiance-exl3 exl3r4d: <= 16 tokens a pass the decode kernels, above the prefill form). A row's
+ * decode-band bytes do not depend on the pass's other rows (fn4 177b ds25: M-invariant from 1 to 16, split-K 2 at <= 2 not
+ * taken at DeepSeek's widths), and a sequence alone passes <= 1 + n_spec (6) rows, so every decode row gets its alone bytes
+ * whatever the step's decode rows (a c4 / c8 NST 5 verify: 24-48). Costs a MoE pass (router, gather, all-reduce, the
+ * shared arm) per extra piece. */
+static constexpr int64_t kBiMoe = 16;
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
 static void sw_note_decl(int64_t rows) {
@@ -1130,7 +1137,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_bi"))
-        return value == 0 || (value == 1 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || (value >= 1 && value <= 2 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -3502,7 +3509,7 @@ struct BiSeg {
     bool dec = false;
     int k = -1;   /* bi_cu's row (a prefill segment), -1 for the batch's cu */
 };
-static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0};
+static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0}, g_bi_moe{0};
 /* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
  * segment, decode rows within the norms' width): step() then runs today's issue. Prefill sequences' bounds from the
  * host mirror of positions (each sequence's rows are consecutive positions; a jump starts the next); when that does not
@@ -3538,7 +3545,8 @@ static bool bi_segments(RadCtx* x, const Model& m, const RadBatch* b, std::vecto
         if (!s.dec) s.k = s.s0 == 0 ? -1 : k++;
     if (DT > kBiBand) g_bi_wide.fetch_add(1, std::memory_order_relaxed);   /* > 48 decode rows: one segment past the band */
     (void)m;
-    return sg.size() > 1 || (sg.size() == 1 && sg[0].dec && sg[0].n > kBiNorm);
+    const int bi = g_sw_bi.load(std::memory_order_relaxed);
+    return sg.size() > 1 || (sg.size() == 1 && sg[0].dec && (sg[0].n > kBiNorm || (bi >= 2 && sg[0].n > kBiMoe)));
 }
 
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg) {
@@ -3546,12 +3554,21 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
     const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
+    {   /* rank 0, every 512 segmented steps: the counts (MoE passes a layer summed over those steps: the launch cost of P) */
+        const long long n = g_bi_steps.load(std::memory_order_relaxed);
+        if (n > 0 && n % 512 == 0 && rad_rank(x) == 0)
+            fprintf(stderr, "radiance: deepseek41: lever BI stats: %lld segmented steps, %lld MoE passes a layer in them (%.2f a "
+                            "step), %lld cu read-backs, %lld steps with > 48 decode rows; ds41_bi %d\n",
+                    n, g_bi_moe.load(std::memory_order_relaxed),
+                    (double)g_bi_moe.load(std::memory_order_relaxed) / (double)n, g_bi_sync.load(std::memory_order_relaxed),
+                    g_bi_wide.load(std::memory_order_relaxed), g_sw_bi.load(std::memory_order_relaxed));
+    }
     if (g_bi_steps.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0) {
         std::string seg;
         for (const BiSeg& s : sg) seg += std::string(seg.empty() ? "" : ", ") + (s.dec ? "decode " : "prefill ") +
                                          std::to_string(s.n);
-        fprintf(stderr, "radiance: deepseek41: lever BI (ds41_bi 1): the first segmented step, %lld rows as [%s]\n",
-                (long long)T, seg.c_str());
+        fprintf(stderr, "radiance: deepseek41: lever BI (ds41_bi %d): the first segmented step, %lld rows as [%s]\n",
+                g_sw_bi.load(std::memory_order_relaxed), (long long)T, seg.c_str());
     }
     bt_begin(m);
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
@@ -3897,7 +3914,20 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
-        for (const BiSeg& s : sg) L.moe.pass(x, T, s.r0, s.n, true, &bs);
+        {   /* ds41_bi 2: the decode segment in pieces within the EXL3 decode band */
+            const int64_t piece = g_sw_bi.load(std::memory_order_relaxed) >= 2 ? kBiMoe : ((int64_t)1 << 40);
+            for (const BiSeg& s : sg) {
+                if (!s.dec || s.n <= piece) {
+                    L.moe.pass(x, T, s.r0, s.n, true, &bs);
+                    if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                for (int64_t a = 0; a < s.n; a += piece) {
+                    L.moe.pass(x, T, s.r0 + a, std::min(piece, s.n - a), true, &bs);
+                    if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
         L.moe.route_report(x);
         bt_pt(x, m, m.mw.logits, T, "router", l);
         bt_pt(x, m, m.mw.ids, T, "ids", l);
