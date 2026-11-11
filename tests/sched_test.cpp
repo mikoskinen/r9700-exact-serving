@@ -9132,7 +9132,10 @@ TEST(forced_depth_zero_holds_zero_but_for_the_probes) {
  * commit and the next step. The fn4 state is the process's, so every test puts the switches back. */
 namespace {
 struct DstSwitches {
-    ~DstSwitches() { set("sched_interleave", -1); set("sched_mixed_tok", 0); set("sched_bi_chunk", 0); }
+    ~DstSwitches() {
+        set("sched_interleave", -1); set("sched_mixed_tok", 0); set("sched_bi_chunk", 0);
+        set("sched_short_bypass", 0); set("sched_bypass_total", 0);
+    }
     static bool set(const char* name, int v) {
         std::string err;
         if (!fn4::request(name, v, &err)) return false;
@@ -9388,6 +9391,15 @@ TEST(dst_short_bypass_check_and_report) {
     CHECK_EQ(fn4::sched_short_bypass(), 1280);
     CHECK(DstSwitches::set("sched_short_bypass", 0));
     CHECK_EQ(fn4::sched_short_bypass(), 0);
+    CHECK_EQ(fn4::value(fn4::kSchedBypassTotal), 0);
+    CHECK(fn4::check("sched_bypass_total", 4096, &err));
+    CHECK(fn4::check("sched_bypass_total", 65536, &err));
+    CHECK(!fn4::check("sched_bypass_total", 1000, &err));    /* not a multiple of the quantum */
+    CHECK(!fn4::check("sched_bypass_total", 65600, &err));
+    CHECK(DstSwitches::set("sched_bypass_total", 4096));
+    CHECK_EQ(fn4::sched_bypass_total(), 4096);
+    CHECK(DstSwitches::set("sched_bypass_total", 0));
+    CHECK_EQ(fn4::sched_bypass_total(), 0);
 }
 
 namespace {
@@ -9499,6 +9511,143 @@ TEST(dst_short_bypass_takes_a_prefix_hit_tail_only_as_one_alone_piece) {
     CHECK(alone_pieces(5000, 4096).size() == 2);
     CHECK(on.first_step.at(qb) > c1 + 1);
     CHECK(on.shape[(size_t)on.first_step.at(qb)] == 'C');
+}
+
+/* ================================================== lever DST: sched_bypass_total (the bypass, piece by piece)
+ * With sched_bypass_total T, the bypass takes a waiting request whose uncached rest is at most T and runs its alone plan
+ * piece by piece, held steps included: alone's boundaries and checkpoints; under sched_bi_chunk 3 / 4 an alone piece over
+ * the held step (a long conversation's 4096-row span piece) is cut on the interval grid inside it, >= 128 rows a side. */
+namespace {
+struct Piece { int64_t at, n, ck; int step; bool operator==(const Piece& o) const { return at == o.at && n == o.n && ck == o.ck; } };
+struct TotalRun {
+    std::string shape;
+    std::map<uint64_t, std::vector<Piece>> pieces;
+    std::vector<uint64_t> ids;
+    uint64_t p = 0;
+};
+/* dst_fixture (+ prefix_exact / span_min when `ds`: the DS41 line's exact resume and its 16384-token span floor); a
+ * decoder; a 40000-token prompt p; on the first held step after p's first chunk a prefix hit of `hit` tokens is seeded (0:
+ * none) and the newcomers of `lens` arrive. Every prefill piece with its checkpoint position (-1: none). */
+TotalRun total_run(int bic, int n, int total, const std::vector<int>& lens, int steps, int64_t hit, bool ds) {
+    TotalRun out;
+    DstSwitches restore;
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefill_interleave = 8;
+    f.cfg.prefix_exact = ds;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1024);
+    if (ds) f.sch.set_span_min(16384);
+    CHECK(DstSwitches::set("sched_bi_chunk", bic));
+    CHECK(DstSwitches::set("sched_short_bypass", n));
+    CHECK(DstSwitches::set("sched_bypass_total", total));
+    f.submit(100, 4000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    out.p = f.submit(40000, 4);
+    bool sent = false;
+    for (int k = 0; k < steps; ++k) {
+        if (!f.sch.step()) break;
+        bool chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (!e.is_prefill) continue;
+            if (e.seq == out.p) chunk = true;
+            out.pieces[e.seq].push_back({ e.ctx_len, e.n_tokens, e.ckpt_slot >= 0 ? e.ctx_len + e.ckpt_tok + 1 : -1, k });
+        }
+        out.shape += chunk ? 'C' : 'D';
+        f.commit_plain(12);
+        if (!sent && chunk) {
+            if (hit > 0) { f.pc.seed((int32_t)hit); f.pc.lin = (int32_t)hit; f.pc.src = 3; }
+            for (int l : lens) out.ids.push_back(f.submit(l, 64));
+            sent = true;
+        }
+    }
+    (void)DstSwitches::set("sched_bypass_total", 0);
+    return out;
+}
+/* alone's pieces of an n-token prompt from `from`, with checkpoints, on total_run's geometry (an idle engine's walk: a
+ * prompt of >= 16384 tokens spans under `ds`) */
+std::vector<Piece> alone_ck(int64_t n, int64_t from, bool ds) {
+    std::vector<Piece> v;
+    Fixture a;
+    a.build(8192, 64, 4160, 60000);
+    a.cfg.checkpoint_interval = 2048;
+    a.cfg.prefill_span = 2;
+    a.cfg.prefix_exact = ds;
+    CHECK_OK(a.start());
+    const bool span = !ds || n >= 16384;
+    for (int64_t c = from; c < n; ) {
+        int64_t ck = -1;
+        /* plan_chunk answers for a span outside a step; a prompt under the span floor is planned as one that does not */
+        const int64_t q = span ? a.sch.plan_chunk(c, n, a.cfg.max_tok, &ck) : a.sch.plan_chunk(c, n, 2048, &ck);
+        if (q <= 0) break;
+        v.push_back({ c, q, ck, 0 });
+        c += q;
+    }
+    return v;
+}
+bool same_pieces(const std::vector<Piece>& a, const std::vector<Piece>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) if (!(a[i] == b[i])) return false;
+    return true;
+}
+}  // namespace
+
+/* The 904-row tail (prompt 5000, hit 4096) that one-piece bypass turns away (alone splits it at its tail checkpoint 4992, in
+ * the fixture's nearest-resume geometry): with T 4096 it runs on two consecutive held steps as alone's two pieces with
+ * alone's checkpoint; a rest over T (prompt 9000: 4904 rows) is left to an ordinary admission; p's steps keep their shape. */
+TEST(dst_bypass_total_runs_a_split_tail_piece_by_piece) {
+    const auto alone = alone_ck(5000, 4096, false);
+    CHECK_EQ(alone.size(), (size_t)2);
+    CHECK_EQ(alone[0].ck, 4992);
+    for (int bic : { 0, 3 }) {
+        TotalRun off = total_run(bic, 1280, 0, { 5000, 9000 }, 30, 4096, false);
+        TotalRun on = total_run(bic, 1280, 4096, { 5000, 9000 }, 30, 4096, false);
+        CHECK_EQ(on.shape, off.shape);
+        const int c1 = (int)on.shape.find('C');
+        const auto& qa = on.pieces[on.ids[0]];
+        CHECK(same_pieces(qa, alone));
+        CHECK(qa.size() == 2 && qa[0].step == c1 + 1 && qa[1].step == c1 + 2);   /* two held steps in a row */
+        for (const auto& pc : on.pieces[on.ids[1]]) CHECK(on.shape[(size_t)pc.step] == 'C');   /* over T: never held */
+        if (bic == 3) CHECK(same_pieces(on.pieces[on.p], off.pieces[off.p]));
+    }
+}
+
+/* The DS41 geometry (exact resume, span from 16384 tokens). A fresh 3000-token prompt is alone's two interval pieces: two
+ * held steps under 0 and 3. A long conversation's 3000-row tail (prompt 17336, hit 14336 on the resume grid) is ONE alone
+ * span piece over the held step: turned away under 0 (an ordinary admission), cut on the interval (16384) under 3, so
+ * 2048 + 952 rows on two held steps. The long prompt's plan is the same with and without the bypass under 3. */
+TEST(dst_bypass_total_on_the_ds_geometry) {
+    const auto fresh = alone_ck(3000, 0, true);
+    CHECK_EQ(fresh.size(), (size_t)2);
+    const auto tail = alone_ck(17336, 14336, true);
+    CHECK_EQ(tail.size(), (size_t)1);                       /* alone: one 3000-row span piece */
+    for (int bic : { 0, 3 }) {
+        TotalRun off = total_run(bic, 2112, 0, { 3000 }, 30, 0, true);
+        TotalRun on = total_run(bic, 2112, 4096, { 3000 }, 30, 0, true);
+        CHECK_EQ(on.shape, off.shape);
+        const int c1 = (int)on.shape.find('C');
+        const auto& q = on.pieces[on.ids[0]];
+        CHECK(same_pieces(q, fresh));
+        CHECK(q.size() == 2 && q[0].step == c1 + 1 && q[1].step == c1 + 2);
+        if (bic == 3) CHECK(same_pieces(on.pieces[on.p], off.pieces[off.p]));
+        TotalRun hit = total_run(bic, 2112, 4096, { 17336 }, 30, 14336, true);
+        const auto& h = hit.pieces[hit.ids[0]];
+        CHECK(!h.empty());
+        if (bic == 0) {
+            for (const auto& pc : h) CHECK(hit.shape[(size_t)pc.step] == 'C');   /* turned away: ordinary admission */
+        } else {
+            CHECK(h.size() >= 2);
+            CHECK_EQ(h[0].at, (int64_t)14336);
+            CHECK_EQ(h[0].n, (int64_t)2048);                 /* cut on the interval, >= 128 rows a side */
+            CHECK_EQ(h[1].at, (int64_t)16384);
+            CHECK_EQ(h[1].n, (int64_t)952);
+            CHECK_EQ(h[1].ck, tail[0].ck);                   /* alone's checkpoint at the piece's end */
+            CHECK(h[0].step == (int)hit.shape.find('C') + 1 && h[1].step == h[0].step + 1);
+        }
+    }
 }
 
 /* ================================================== lever DST: a long prompt beside c4, timed (not a check)

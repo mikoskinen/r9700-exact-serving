@@ -196,6 +196,15 @@
  *                   waiting at the long prefill's next chunk takes no grid step from it: that cut can be the larger grid
  *                   point). Composes with sched_bi_chunk 0 .. 4 and ds41_bi's per-sequence segments. Read at every step
  *                   planned; GET "dst" counts the bypassed and the turned-away admissions.
+ *   sched_bypass_total scheduler (lever DST, with sched_short_bypass N > 0): 0 = the bypass takes a request only when its
+ *                   uncached rest is ONE alone piece (above); T (a multiple of the quantum, up to 65536; 4096 the A/B value)
+ *                   = it takes a waiting request whose uncached rest is at most T rows and then runs it piece by piece,
+ *                   held steps included, until its prompt is done: each piece the next piece of its alone plan when that
+ *                   is at most N and fits the step (alone's boundaries and checkpoints); under sched_bi_chunk 3 / 4 an
+ *                   alone piece that does not is cut on the checkpoint-interval grid inside it, >= 128 rows a side
+ *                   (option D's own rule, so exact as D is: alone's span pieces of a long conversation's tail are 4096
+ *                   rows, over a held step's ~2112). Under 0 / 1 / 2 such a request is turned away (an ordinary
+ *                   admission). With either switch back to 0 a request taken this way continues as an ordinary prefill.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -270,7 +279,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kSchedBiChunk,
-              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSwitches };
+              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -342,6 +351,8 @@ int  sched_mixed_tok();
  * after every step reports its counts (GET "dst"): requests the bypass admitted on a held step, and requests it turned
  * away because their uncached rest is longer than N or is not one piece of their alone plan. */
 int  sched_short_bypass();
+/* sched_bypass_total: the switch once set, else 0 (the bypass takes one-piece requests only). */
+int  sched_bypass_total();
 void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
 /* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
  * "accept"; under draft_depth0 2 every head draft is a probe's). */

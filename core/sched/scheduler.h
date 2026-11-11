@@ -47,6 +47,9 @@ struct SchedReq {
     /* Lever DST (sched_short_bypass): an admission on a held step turned this request away because its uncached rest is
      * longer than the bypass or not one alone piece; held steps do not ask it again (its next admission is an ordinary one). */
     bool     bypass_no = false;
+    /* sched_bypass_total: the bypass took this request; it runs its alone plan piece by piece (Scheduler::bypass_piece),
+     * held steps included, until its prompt is done. */
+    bool     bypass_run = false;
 
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
@@ -658,6 +661,8 @@ private:
     int64_t       dst_grid() const;
     /* sched_short_bypass in force (0 off), and its counts (fn4 GET "dst") */
     int64_t       bypass_now_ = 0;
+    int64_t       bypass_total_ = 0;   /* sched_bypass_total in force (0: one-piece requests only) */
+    int64_t       bypass_piece(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* ckpt);
     int64_t       n_bypassed_ = 0, n_bypass_refused_ = 0;
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share = false);

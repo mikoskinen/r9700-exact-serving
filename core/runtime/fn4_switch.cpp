@@ -26,7 +26,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
                                         "dspark_walk", "ds41_bi", "draft_sample", "draft_lend_hyst", "arena_d0",
                                         "draft_lend_w", "draft_occ", "draft_occ_k", "sched_bi_chunk",
-                                        "sched_interleave", "sched_mixed_tok", "sched_short_bypass" };
+                                        "sched_interleave", "sched_mixed_tok", "sched_short_bypass",
+                                        "sched_bypass_total" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -184,7 +185,7 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : s.mixed_start.load(std::memory_order_acquire);
     }
-    if (i == kSchedShortBypass) {  /* lever DST: set, else 0 (off) */
+    if (i == kSchedShortBypass || i == kSchedBypassTotal) {   /* lever DST: set, else 0 (off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : 0;
     }
@@ -242,6 +243,10 @@ int sched_mixed_tok() {
 }
 int sched_short_bypass() {
     const int v = st().val[kSchedShortBypass].load(std::memory_order_acquire);
+    return v > 0 ? v : 0;
+}
+int sched_bypass_total() {
+    const int v = st().val[kSchedBypassTotal].load(std::memory_order_acquire);
     return v > 0 ? v : 0;
 }
 void note_sched_dst(int64_t bypassed, int64_t bypass_refused) {
@@ -364,7 +369,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
-                        "draft_lend_w, draft_occ, draft_occ_k, sched_bi_chunk, sched_interleave, sched_mixed_tok, sched_short_bypass, epoch_bump)";
+                        "draft_lend_w, draft_occ, draft_occ_k, sched_bi_chunk, sched_interleave, sched_mixed_tok, sched_short_bypass, sched_bypass_total, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -639,6 +644,16 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedBypassTotal) {  /* lever DST */
+        const int q = s.quantum.load(std::memory_order_acquire);
+        if (v != 0 && (v < 0 || v > 65536 || (q > 0 && v % q != 0))) {
+            if (err)
+                *err = "sched_bypass_total takes 0 (one-piece requests only) or a multiple of the quantum (" + std::to_string(q) +
+                       ") up to 65536: the longest uncached rest the bypass takes and runs piece by piece";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedMixedTok) {     /* lever DST */
         const int cap = s.mixed_capable.load(std::memory_order_acquire);
         const int top = s.mixed_start.load(std::memory_order_acquire);
@@ -742,7 +757,8 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass)
+            if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+                i == kSchedBypassTotal)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
