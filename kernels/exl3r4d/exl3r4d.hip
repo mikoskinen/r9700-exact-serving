@@ -2062,7 +2062,18 @@ template <bool AP, int GB = 4, int DB = 4, int GSK = 1>
 #else
 template <bool AP, int GB = 4, int DB = 4>
 #endif
-__global__ void __launch_bounds__(1024) EXL3R4D_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
+// fn4 E10b screen (11.11.2026): EXL3R4D_GD_WPE caps the FUSED kernel's registers alone (amdgpu_waves_per_eu; 12 = <= 128
+// VGPRs, 16 = <= 96) -- 172 / the static metadata: its down units run at the gate_up path's ~180 VGPRs, the split down
+// kernel at ~94, so on DeepSeek's large down the fused chain has half the down waves. Same code: the bits do not change.
+#ifndef EXL3R4D_GD_WPE
+#define EXL3R4D_GD_WPE 0
+#endif
+#if EXL3R4D_GD_WPE > 0
+#define EXL3R4D_GD_WPE_ATTR __attribute__((amdgpu_waves_per_eu(EXL3R4D_GD_WPE)))
+#else
+#define EXL3R4D_GD_WPE_ATTR EXL3R4D_WPE_ATTR
+#endif
+__global__ void __launch_bounds__(1024) EXL3R4D_GD_WPE_ATTR exl3r4d_fused_kernel(Exl3r4dFused f) {
   EXL3R4D_KARG_PREFETCH();
 #if !EXL3R4D_GD_SK2
   constexpr int GSK = 1;
