@@ -35585,8 +35585,13 @@ static void usage(void) {
                 "             about a third of the step. M is 1 + n_spec.\n"
                 "             rad-tune's declared graph does not reach a gemm_nt_q row, so this\n"
                 "             is the only way to sweep it. Safe to chase hard: the head only\n"
-                "             proposes, so its output bits change acceptance, not text.\n");
+                "             proposes, so its output bits change acceptance, not text.\n"
+                "  --bicheck [classes] [Ms]:  fn4 BI: per op, a row alone (M = 1) vs the same row inside an\n"
+                "             M-row launch, byte for byte, Flash-Next's TP4 shapes (classes hc,gemm or all; Ms a\n"
+                "             comma list, default 1..64 and 65..4160).\n");
 }
+
+#include "r4d_selftest_bi.inc"   /* --bicheck: fn4 BI, a row alone vs inside an M-row launch */
 
 int main(int argc, char** argv) {
     /* Before the runtime starts: eight ranks on one card need a hardware queue each. */
@@ -35598,6 +35603,7 @@ int main(int argc, char** argv) {
     int perf_it = 50, perf_w2 = 0, perf_w4 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0,
         perf_q = 0, perf_mx = 0, perf_wpa = 0, perf_vocab = 0, perf_iqr = 0;
     const char* vocab_spec = nullptr;
+    bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (fn4 BI) */
     long long perf_pb1 = 0;
     long long sop_m = 0, sop_k = 0;
     int sop_it = 2000;
@@ -35788,6 +35794,11 @@ int main(int argc, char** argv) {
             if (hy_m < 1 || hy_m > 256 || hy_it < 1) {
                 std::fprintf(stderr, "--perfhyv3moe: M 1..256, iters > 0\n"); return 2;
             }
+        } else if (!std::strcmp(argv[i], "--bicheck")) {
+            /* fn4 BI: a row alone vs the same row inside an M-row launch, per op, byte for byte (fn_bi_check). */
+            bic = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) bi_c = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) bi_m = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfmoe")) {
             /* The routed-expert GEMM at a prefill chunk of M tokens, every prefill form. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -35961,6 +35972,17 @@ int main(int argc, char** argv) {
     if (!path) path = "libr4d.so";
 
     Plugin pl;
+
+    if (bic) {   /* fn4 BI */
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        fn_bi_check(pl, bi_c, bi_m);
+        dfree_all();
+#else
+        skip("fn4 BI per-op check", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
+    }
 
     /* Timing modes run alone, without the catalogue. */
     if (pg_q > 0 && pg_ctx > 0) {
