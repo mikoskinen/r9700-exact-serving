@@ -1131,6 +1131,18 @@ int Engine::step_loop() {
                 rq->speculation_fixed = ranks_[0]->sampler.speculation_fixed(rq->id);
             }
             if (t_on) phase_mark(PH_BEGIN);
+            /* Lever SD: a prompt-lookup proposal (the hybrid's, or the lookup filling an empty one) was not drawn
+             * from the head's Q, so no coupled state may be applied to it, even one whose round and token happen to
+             * match: the verify keeps the agreement rule there. */
+            if (mtp_couple_)
+                for (const StepEntry& e : plan.e) {
+                    if (!e.produces_token || !e.ngram || e.n_spec <= 0) continue;
+                    ++couple_n_lookup_;
+                    for (auto& rk : ranks_) {
+                        const int cs = rk->sampler.set_mtp_couple(e.seq, nullptr, 0);
+                        if (cs < 0 && cs != RAD_E_NOTFOUND) return cs;
+                    }
+                }
             for (auto& rk : ranks_) {
                 const int s = rk->sampler.build_step(so.reqs, b->step);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }

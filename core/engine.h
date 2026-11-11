@@ -502,6 +502,18 @@ private:
     bool couple_evidence_ = false;   /* the completed-verify line was written (once a process) */
     bool couple_host_note_ = false;  /* the host-domain counterpart was written (once) */
     bool couple_malformed_note_ = false;   /* a status -1 round was reported (once) */
+    /* Lever SD (fn4 draft_sample; engine_draft.cpp). `couple_cycle_`: the drafter cycle in flight staged its draws
+     * (draft_sample >= 1 when it was issued), so its states are read back and bound; otherwise nothing is staged,
+     * read or bound, and a verify carries no coupled row (today's passes). The q_temp column a drafter may declare
+     * (`mtp_couple_qtemp`, [rows, 1] f32: the request's temperature x the switch's scale), by rank, and its pinned
+     * staging. The counters go to fn4::note_sample. */
+    bool couple_cycle_ = false;
+    bool couple_bind_note_ = false;        /* a readback that could not bind was reported (once) */
+    std::vector<rad_buf> couple_qt_rank_;
+    float* couple_qt_stage_ = nullptr;     /* pinned [max_seqs] */
+    int64_t couple_n_samp_ = 0, couple_n_greedy_ = 0, couple_n_bound_ = 0, couple_n_malf_ = 0,
+            couple_n_fallback_ = 0, couple_n_lookup_ = 0;
+    void couple_note();
     /* `rows` are serial_row_ or block_row_ (Scheduler::SerialRow / BlockRow). */
     template <class Row> int stage_couple_draws(const Row* rows, int n);
     int  bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card);

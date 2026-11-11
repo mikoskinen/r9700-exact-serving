@@ -240,6 +240,8 @@ set(R4D_UNITS
   "r4d_gemm_bf16_nt_pf|"
   # Lever W1: the DSpark Markov walk over the whole vocabulary, a step on a vocabulary shard (dspark_walk_step).
   "r4d_ds41_walk|"
+  # Lever SD: sampled drafting on that walk (dspark_walk_sample_step: x ~ Q over the eight best keys, the coupled state).
+  "r4d_ds41_wsamp|"
 )
 
 set(R4D_SRC "")

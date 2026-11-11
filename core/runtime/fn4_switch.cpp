@@ -24,7 +24,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "drafter_mx", "drafter_bf",
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
-                                        "dspark_walk", "ds41_bi" };
+                                        "dspark_walk", "ds41_bi", "draft_sample" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -56,6 +56,8 @@ struct State {
     std::atomic<int64_t> acc[4];         /* note_draft_accept */
     std::atomic<int> ctxskip_capable{-1};   /* -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> ctxs[8];        /* note_ctxskip */
+    std::atomic<int> sample_capable{-1};   /* draft_sample: -1 no engine registered, 0 / 1 */
+    std::atomic<int64_t> smp[6];         /* note_sample */
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -78,6 +80,7 @@ struct State {
         for (auto& c : lend) c.store(0, std::memory_order_relaxed);
         for (auto& c : acc) c.store(0, std::memory_order_relaxed);
         for (auto& c : ctxs) c.store(0, std::memory_order_relaxed);
+        for (auto& c : smp) c.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -260,6 +263,19 @@ void dspark_register(bool conf_capable, bool alt_capable, int conf_start, int al
     s.val[kDsparkConfRows].store(0, std::memory_order_release);   /* ds41-small: no load bound at start */
 }
 
+void sample_register(bool capable, int start) {
+    State& s = st();
+    s.sample_capable.store(capable ? 1 : 0, std::memory_order_release);
+    s.val[kDraftSample].store(capable && start >= 1 && start <= 200 ? start : 0, std::memory_order_release);
+}
+
+void note_sample(int64_t rows_sampled, int64_t rows_greedy, int64_t rounds_bound, int64_t rounds_malformed,
+                 int64_t bind_fallback, int64_t lookup_cleared) {
+    State& s = st();
+    const int64_t v[6] = { rows_sampled, rows_greedy, rounds_bound, rounds_malformed, bind_fallback, lookup_cleared };
+    for (int k = 0; k < 6; ++k) s.smp[k].fetch_add(v[k], std::memory_order_relaxed);
+}
+
 int get(int i) {
     if (i < 0 || i >= kSwitches) return -1;
     return st().val[i].load(std::memory_order_acquire);
@@ -273,10 +289,28 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
-                        "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, epoch_bump)";
+                        "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, epoch_bump)";
         return false;
     }
     State& s = st();
+    if (i == kDraftSample) {
+        if (v < 0 || v > 200) {
+            if (err) *err = "draft_sample takes 0 (greedy drafts, the agreement rule), 1 (sampled drafts x ~ Q at the "
+                            "request's temperature, the maximal coupling at the verify) or 2 .. 200 (Q at the "
+                            "temperature x v / 100)";
+            return false;
+        }
+        const int cap = s.sample_capable.load(std::memory_order_acquire);
+        if (v != 0 && cap != 1) {
+            if (err)
+                *err = std::string("draft_sample=") + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "no engine has registered a drafter"
+                                : "this server has no coupled drafter (--draft-coupling on, and a drafter whose walk "
+                                  "declares the coupling planes: deepseek41's DSpark over 2 .. 4 ranks)");
+            return false;
+        }
+        return true;
+    }
     if (i == kDraftProbeBackoff) {
         if (v < 0 || v > 8) {
             if (err) *err = "draft_probe_backoff takes 0 (off) .. 8 (doublings of the probe interval)";
@@ -584,6 +618,15 @@ std::string state_json() {
         for (int k = 0; k < 17; ++k)
             o += std::string(", \"") + kLend[k] + "\": " +
                  std::to_string((long long)s.lend[k].load(std::memory_order_relaxed));
+        o += "}";
+    }
+    /* Lever SD, once the engine registered it (capable or not). */
+    if (const int cap = s.sample_capable.load(std::memory_order_acquire); cap >= 0) {
+        static const char* const kSm[6] = { "rows_sampled", "rows_greedy", "rounds_bound", "rounds_malformed",
+                                            "bind_fallback", "lookup_cleared" };
+        o += ", \"sample\": {\"capable\": " + std::to_string(cap);
+        for (int k = 0; k < 6; ++k)
+            o += std::string(", \"") + kSm[k] + "\": " + std::to_string((long long)s.smp[k].load(std::memory_order_relaxed));
         o += "}";
     }
     /* The depth-0 context skip, once the engine registered it (set up or not). */
