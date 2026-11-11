@@ -645,6 +645,14 @@ private:
     /* Lever BI's chunking (RADIANCE_SCHED_BI_CHUNK at start; 0 = today): a prefill chunk whose rows do not depend on what
      * else is in the step, or none this step (bi_chunk_plan). */
     int           bi_chunk_ = 0;
+    /* Lever DST (fn4 sched_interleave / sched_mixed_tok, read at every step planned): the decode-only steps after a
+     * chunk beside decoding sequences in force (--prefill-interleave's value until the switch is set; -1 auto), and
+     * the budget of a step that is not a lone prefill's span step (ChunkGeometry::shared_tok until the switch is set,
+     * never above it). dst_grid(): under sched_bi_chunk 3 / 4 with a smaller budget, the cut grid that budget holds
+     * (0: none smaller than the policy's own). */
+    int64_t       il_now_ = 0;
+    int64_t       mixed_now_ = 0;
+    int64_t       dst_grid() const;
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share = false);
     IKVManager*   kv_ = nullptr;

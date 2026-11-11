@@ -25,7 +25,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
                                         "dspark_walk", "ds41_bi", "draft_sample", "draft_lend_hyst", "arena_d0",
-                                        "draft_lend_w", "draft_occ", "draft_occ_k", "sched_bi_chunk" };
+                                        "draft_lend_w", "draft_occ", "draft_occ_k", "sched_bi_chunk",
+                                        "sched_interleave", "sched_mixed_tok" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -62,6 +63,10 @@ struct State {
     std::atomic<int64_t> ctxs[8];        /* note_ctxskip */
     std::atomic<int> sample_capable{-1};   /* draft_sample: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> smp[6];         /* note_sample */
+    /* lever DST (sched_register): --prefill-interleave as configured (-1 auto), the shared budget, whether a shared
+     * step exists (-1 no scheduler registered), the chunk quantum */
+    std::atomic<int> il_flag{0};
+    std::atomic<int> mixed_start{-1}, mixed_capable{-1}, quantum{16};
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -168,6 +173,14 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_sched_bi();
     }
+    if (i == kSchedInterleave) {   /* lever DST: set, else the flag (-1 = auto) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : s.il_flag.load(std::memory_order_acquire);
+    }
+    if (i == kSchedMixedTok) {     /* lever DST: set, else the shared budget (-1 before a scheduler registered) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v > 0 ? v : s.mixed_start.load(std::memory_order_acquire);
+    }
     return s.val[i].load(std::memory_order_acquire);
 }
 
@@ -203,6 +216,21 @@ int aql_acq_rule() {
 int sched_bi_chunk() {
     const int v = st().val[kSchedBiChunk].load(std::memory_order_acquire);
     return v >= 0 ? v : env_sched_bi();
+}
+void sched_register(int interleave_flag, int64_t shared_tok, bool shared_capable, int64_t quantum) {
+    State& s = st();
+    s.il_flag.store(interleave_flag < 0 ? -1 : interleave_flag, std::memory_order_release);
+    s.mixed_start.store((int)shared_tok, std::memory_order_release);
+    s.mixed_capable.store(shared_capable ? 1 : 0, std::memory_order_release);
+    s.quantum.store(quantum > 0 ? (int)quantum : 1, std::memory_order_release);
+}
+int sched_interleave() {
+    const int v = st().val[kSchedInterleave].load(std::memory_order_acquire);
+    return v >= 0 ? v : -1;
+}
+int sched_mixed_tok() {
+    const int v = st().val[kSchedMixedTok].load(std::memory_order_acquire);
+    return v > 0 ? v : 0;
 }
 bool aql_acq_none() {
     static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
@@ -319,7 +347,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
-                        "draft_lend_w, draft_occ, draft_occ_k, sched_bi_chunk, epoch_bump)";
+                        "draft_lend_w, draft_occ, draft_occ_k, sched_bi_chunk, sched_interleave, sched_mixed_tok, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -575,6 +603,35 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedInterleave) {   /* lever DST */
+        if (v < -1 || v > 64) {
+            if (err) *err = "sched_interleave takes 0 .. 64 (decode-only steps after a chunk beside decoding sequences; 0 "
+                            "= none, a chunk may ride every step) or -1 (back to --prefill-interleave)";
+            return false;
+        }
+        return true;
+    }
+    if (i == kSchedMixedTok) {     /* lever DST */
+        const int cap = s.mixed_capable.load(std::memory_order_acquire);
+        const int top = s.mixed_start.load(std::memory_order_acquire);
+        const int q = s.quantum.load(std::memory_order_acquire);
+        if (v != 0 && cap != 1) {
+            if (err)
+                *err = std::string("sched_mixed_tok=") + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "no scheduler has registered" : "no shared step here (--prefill-span 1: every step is "
+                                                                  "planned at --max-num-batched-tokens)");
+            return false;
+        }
+        if (v != 0 && (v < 128 || v > top || (q > 0 && v % q != 0))) {
+            if (err)
+                *err = "sched_mixed_tok takes 0 (back to the shared budget, " + std::to_string(top) + ") or 128 .. " +
+                       std::to_string(top) + ", a multiple of the quantum (" + std::to_string(q) +
+                       "): the budget of a step that is not a lone prefill's span step, never above the one the "
+                       "plugin's arenas were sized for";
+            return false;
+        }
+        return true;
+    }
     /* A plugin's switch: the plugin that serves it says which values it knows. */
     std::lock_guard<std::mutex> lk(s.mu);
     find_hooks(s);
@@ -637,8 +694,28 @@ bool apply_pending(int step, int* sched) {
                 continue;
             }
         }
+        /* lever DST: back to the flag / the shared budget is stored as unset (-1 / 0), compared as the value it means */
+        if (i == kSchedInterleave && v < 0) {
+            const int fl = s.il_flag.load(std::memory_order_acquire);
+            const int was = s.val[i].load(std::memory_order_acquire);
+            s.val[i].store(-1, std::memory_order_release);
+            if (was < 0 || was == fl) continue;   /* the flag's count already ran */
+            changed = true;
+            what += std::string(what.empty() ? "" : ", ") + kNames[i] + "=flag(" + std::to_string(fl) + ")";
+            continue;
+        }
+        if (i == kSchedMixedTok && v <= 0) {
+            const int was = s.val[i].load(std::memory_order_acquire);
+            s.val[i].store(0, std::memory_order_release);
+            if (was <= 0 || was == s.mixed_start.load(std::memory_order_acquire)) continue;   /* the budget already ran */
+            changed = true;
+            what += std::string(what.empty() ? "" : ", ") + kNames[i] + "=" +
+                    std::to_string(s.mixed_start.load(std::memory_order_acquire)) + " (start)";
+            continue;
+        }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kSchedBiChunk) s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
+            if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok)
+                s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
         int handled = 1;

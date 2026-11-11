@@ -212,6 +212,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * must use the resolved interval, never the raw flag, so chunks split in one place. */
     if (geo) geo_ = *geo;
     else RAD_TRY(chunk_geometry_resolve(prog, cfg, &geo_));
+    /* lever DST: the flag and the shared budget the switches start from (fn4 sched_interleave / sched_mixed_tok) */
+    fn4::sched_register((int)cfg.prefill_interleave, geo_.shared_tok, cfg.prefill_span > 1, geo_.quantum);
+    il_now_ = cfg.prefill_interleave;
+    mixed_now_ = geo_.shared_tok;
 
     kvgeom_ = KVGeom::of(prog.kv_groups);
     for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
@@ -1288,6 +1292,21 @@ static int64_t bi_grid_env() {
     return g >= 128 && g % 32 == 0 ? g : 1024;
 }
 
+/* Lever DST, sched_mixed_tok under sched_bi_chunk 3 / 4: the largest divisor of the checkpoint interval reached by halving,
+ * a multiple of the quantum and at least kBiMinPiece rows, that leaves kDstDecodeRoom rows of the shared budget in force to
+ * decode rows (2112 / 1088 / 576 -> 2048 / 1024 / 512 at an interval of 2048); 0 while the budget is the geometry's own
+ * (option D's grid unchanged) or without an interval. The grid is a function of the switch alone, never of the step's
+ * load, so the cut points of a prompt do not move with what else runs; only which of them a step reaches does. */
+static constexpr int64_t kDstDecodeRoom = 64;
+
+int64_t Scheduler::dst_grid() const {
+    const int64_t I = geo_.checkpoint_interval, Q = std::max<int64_t>(geo_.quantum, 1);
+    if (I <= 0 || mixed_now_ >= geo_.shared_tok) return 0;
+    int64_t d = I;
+    while (d > mixed_now_ - kDstDecodeRoom && d % 2 == 0 && (d / 2) % Q == 0 && d / 2 >= kBiMinPiece) d /= 2;
+    return d;
+}
+
 int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                  bool share) {
     const int64_t n = r.n_computed;
@@ -1323,7 +1342,9 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
      * (else it would wait as long as anything decodes beside it). */
     static const int64_t G4 = bi_grid_env();
     const int64_t I = geo_.checkpoint_interval;
-    const int64_t G = bi_chunk_ == 3 ? I : G4;
+    int64_t G = bi_chunk_ == 3 ? I : G4;
+    /* lever DST: a smaller shared budget (sched_mixed_tok) cuts on the grid it holds, so a mixed chunk is that grid step */
+    if (const int64_t gm = dst_grid(); gm > 0 && gm < G) G = gm;
     /* 4 with another prefill behind it or a request waiting (today's busy-chunk share): one grid step left for it */
     const int64_t give = bi_chunk_ == 4 && share ? G : 0;
     for (int64_t pass = give > 0 ? 0 : 1; pass < 2; ++pass) {
@@ -1623,7 +1644,10 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
              * stager's step. */
             cap = std::min(cap, mode);
         } else {
-            const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
+            /* lever DST: under a smaller shared budget (sched_mixed_tok) the floor is at most half of it, so the reserve
+             * of the decode rows behind the chunk and of a waiting request is still kept (unset: today's floor) */
+            int64_t floor = std::max(Q, stage_rows_ / Q * Q);
+            if (mixed_now_ < geo_.shared_tok) floor = std::max(Q, std::min(floor, mixed_now_ / 2 / Q * Q));
             cap = std::max(cap, floor);
             const int64_t remaining = n_target - n_computed;
             int64_t span = remaining;                       /* where this run of chunks must end */
@@ -1678,7 +1702,7 @@ void Scheduler::note_step_cost(bool chunk, double seconds) {
 }
 
 int64_t Scheduler::interleave_steps() const {
-    if (cfg_.prefill_interleave >= 0) return cfg_.prefill_interleave;
+    if (il_now_ >= 0) return il_now_;   /* lever DST: sched_interleave once set, else the flag */
     if (ema_chunk_s_ <= 0.0 || ema_decode_s_ <= 0.0) return 1;
     const double n = cfg_.prefill_interleave_share * ema_chunk_s_ / ema_decode_s_;
     return n >= (double)kInterleaveAutoMax ? kInterleaveAutoMax : (int64_t)n;
@@ -2246,13 +2270,25 @@ const RadBatch* Scheduler::step() {
     /* lever BI's chunking for this step's plan: the fn4 switch sched_bi_chunk as applied now (a change lands at a step
      * release, so it takes effect from the step planned after it) */
     bi_chunk_ = fn4::sched_bi_chunk();
+    /* lever DST: the interleave and the shared budget for this step's plan, as the fn4 switches are applied now (a change
+     * lands at a step release, so it acts from the step planned after it). A hold under way is cut to a smaller count. */
+    {
+        const int il = fn4::sched_interleave();
+        const int64_t now = il >= 0 ? (int64_t)il : cfg_.prefill_interleave;
+        if (now != il_now_) {
+            if (now >= 0 && interleave_left_ > now) interleave_left_ = now;
+            il_now_ = now;
+        }
+        const int64_t mt = fn4::sched_mixed_tok();
+        mixed_now_ = mt > 0 && mt < geo_.shared_tok ? mt : geo_.shared_tok;
+    }
     /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
      * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
      * decoding there is nothing to give steps to, and the hold is dropped. */
     bool any_decoding = false;
     bool hold_prefill = false;
     held_prefill_ = 0;
-    if (cfg_.prefill_interleave != 0) {
+    if (il_now_ != 0) {
         for (int32_t slot : running_) {
             const SchedReq& s = *reqs_[(size_t)slot];
             if (!s.req || !s.running) continue;
@@ -2294,7 +2330,8 @@ const RadBatch* Scheduler::step() {
             lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
         }
         span_now_ = bi_chunk_ == 2 ? false : lone;
-        if (!lone && bi_chunk_ != 1) budget = geo_.shared_tok;
+        /* lever DST: the shared budget in force (sched_mixed_tok); B (2) keeps whole intervals on the geometry's own */
+        if (!lone && bi_chunk_ != 1) budget = bi_chunk_ == 2 ? geo_.shared_tok : mixed_now_;
     }
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
@@ -2722,7 +2759,7 @@ const RadBatch* Scheduler::step() {
         case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
         default:                ++m_.steps_decode;  break;
     }
-    if (cfg_.prefill_interleave != 0) {
+    if (il_now_ != 0) {
         /* Armed only while a prompt continues past this step: after a last chunk nothing is left
          * to interleave, and holding would only keep the next request out. */
         bool continues = false;
@@ -3387,7 +3424,7 @@ void Scheduler::step_finished() {
      * tokens took. */
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
     /* --prefill-interleave auto's two step costs (interleave_steps). */
-    if (wall > 0 && cfg_.prefill_interleave < 0)
+    if (wall > 0 && il_now_ < 0)
         step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall);
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
