@@ -72,6 +72,14 @@
  *                   runs no head (depth 0) takes the smallest rung holding its own rows (with "8,48": 8 at c8 depth 0
  *                   instead of 48), so the arena above it is lent to the expert slab as at NST 0. Starts 0. 1 refused
  *                   unless the variable declared a rung below the largest (arena_d0_register). Exact: placement only.
+ *   draft_occ       scheduler (lever Z0-O, sched/draft.h DraftController::occ): 0 off (D7 as it was); 1 .. 64 = N: once
+ *                   at least N decode rows have run draft_occ_k consecutive cycles, depth 0 holds with no probe; once
+ *                   fewer than N have run draft_occ_k consecutive cycles, D7 decides again (its cost model and probes:
+ *                   the 1 .. N-1 row region). Needs depth 0 on (draft_depth0 1); depth 0 forced (2) is left as it is.
+ *                   Starts 0 (no environment). Above 0 refused without a drafter that runs the adaptive window. Exact:
+ *                   it moves only D7's choice of depth. GET's "draft" object counts occ_cycles and occ_moves.
+ *   draft_occ_k     scheduler (lever Z0-O, DraftController::occ_k): the consecutive cycles draft_occ counts each way,
+ *                   1 .. 4096; starts 32 (DraftController::kOccK).
  *   draft_lend_hyst scheduler (lever Z0-H, sched/draft.h DraftController::lend_hyst): 0 off (kHyst, 2 %, throughout);
  *                   1 .. 100: while the drafter's slab is lent or the lend is wanted, a move from depth 0 to drafting
  *                   needs the window's yield to beat the lent plain step's by that many percent (at least kHyst); a
@@ -193,7 +201,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDraftLendHyst, kArenaD0,
-              kDraftLendW, kSwitches };
+              kDraftLendW, kDraftOcc, kDraftOccK, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -218,7 +226,7 @@ void note_sched(int i, int value);
 /* The scheduler's draft counters for the report (GET "draft"): cycles at depth 0, probe cycles, moves between 0 and
  * the drafting depth, hybrid proposals taken from the lookup and left to the head, steps not issued ahead for it. */
 void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_lookup, int64_t hyb_head,
-                       int64_t hyb_unahead);
+                       int64_t hyb_unahead, int64_t occ_cycles = 0, int64_t occ_moves = 0);
 /* Lever DL. The scheduler, once the engine set the lend up: whether a slab can be lent (draft_lend=1 is
  * refused otherwise). */
 void lend_register(bool capable);

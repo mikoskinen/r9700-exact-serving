@@ -5127,7 +5127,8 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     const HttpResponse g3 = f.get("/admin/fn4");
     CHECK(has(g3.body, "\"draft_depth0\": 1, \"draft_probe\": 4, \"draft_hybrid\": 1, \"draft_hybrid_match\": 12"));
     CHECK(has(g3.body, "\"draft\": {\"zero_cycles\": 5, \"probe_cycles\": 6, \"zero_moves\": 1, "
-                       "\"hybrid_lookup\": 7, \"hybrid_head\": 8, \"hybrid_unahead\": 9}"));
+                       "\"hybrid_lookup\": 7, \"hybrid_head\": 8, \"hybrid_unahead\": 9, \"occ_cycles\": 0, "
+                       "\"occ_moves\": 0}"));
     /* The same values again: no change, no epoch. Back off for the rest of the binary. */
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":1,"draft_hybrid":1})").status, 200);
     CHECK(!fn4::apply_pending(13, sw));
@@ -5284,6 +5285,36 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     fn4::note_sched(fn4::kDraftLendW, 0);
     fn4::note_lend_w(0, 0, 0, 0, 0);
     fn4::draft_w_register(false);
+    /* Lever Z0-O, draft_occ (rows, 0 off .. 64) and draft_occ_k (cycles, 1 .. 4096), the scheduler's: draft_occ above 0
+     * refused without a drafter that runs the adaptive window; their counters close GET's "draft". */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":65})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":-1})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ_k":0})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ_k":4097})").status, 400);
+    fn4::note_sched(fn4::kDraftOcc, 0);
+    fn4::note_sched(fn4::kDraftOccK, 32);
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_occ\": 0, \"draft_occ_k\": 32"));
+    fn4::draft_register(false, false);
+    const HttpResponse o0 = f.post("/admin/fn4", R"({"draft_occ":3})");
+    CHECK_EQ(o0.status, 400);
+    CHECK(has(o0.body, "cannot run the adaptive window"));
+    fn4::draft_register(true, true);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":3,"draft_occ_k":16})").status, 200);
+    CHECK(fn4::apply_pending(39, sw));
+    CHECK_EQ(sw[fn4::kDraftOcc], 3);
+    CHECK_EQ(sw[fn4::kDraftOccK], 16);
+    CHECK_EQ(sw[fn4::kDraftLendW], fn4::kNoChange);
+    fn4::note_sched(fn4::kDraftOcc, 3);
+    fn4::note_sched(fn4::kDraftOccK, 16);
+    fn4::note_draft_counts(5, 6, 1, 7, 8, 9, 400, 2);
+    const HttpResponse go = f.get("/admin/fn4");
+    CHECK(has(go.body, "\"draft_occ\": 3, \"draft_occ_k\": 16"));
+    CHECK(has(go.body, "\"hybrid_unahead\": 9, \"occ_cycles\": 400, \"occ_moves\": 2}"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_occ":0,"draft_occ_k":32})").status, 200);
+    CHECK(fn4::apply_pending(40, sw));
+    fn4::note_sched(fn4::kDraftOcc, 0);
+    fn4::note_sched(fn4::kDraftOccK, 32);
+    fn4::note_draft_counts(0, 0, 0, 0, 0, 0);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
     CHECK_EQ(sw[fn4::kDraftLend], -1);

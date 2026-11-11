@@ -138,6 +138,18 @@ int Scheduler::set_draft_lend_hyst(int v) {
     return draft_.lend_hyst();
 }
 
+int Scheduler::set_draft_occ(int v) {   /* lever Z0-O */
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v >= 0 && v <= 64) draft_.set_occ(v);
+    return draft_.occ();
+}
+
+int Scheduler::set_draft_occ_k(int v) {   /* lever Z0-O */
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v >= 1 && v <= 4096) draft_.set_occ_k(v);
+    return draft_.occ_k();
+}
+
 void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) {
     std::lock_guard<std::mutex> lk(mu_);
     lend_view_ = std::move(view);
@@ -432,6 +444,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     fn4::note_sched(fn4::kDraftLend, draft_.lend());
     fn4::note_sched(fn4::kDraftLendBorrow, draft_.borrow() ? 1 : 0);
     fn4::note_sched(fn4::kDraftLendHyst, draft_.lend_hyst());
+    fn4::note_sched(fn4::kDraftOcc, draft_.occ());       /* lever Z0-O */
+    fn4::note_sched(fn4::kDraftOccK, draft_.occ_k());
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
      * row, is measured. */
@@ -3318,7 +3332,7 @@ void Scheduler::step_finished() {
         }
     }
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
-                           hybrid_lookup_, hybrid_head_, hybrid_unahead_);
+                           hybrid_lookup_, hybrid_head_, hybrid_unahead_, draft_.occ_cycles(), draft_.occ_moves());
     fn4::note_draft_accept(acc_head_d_, acc_head_a_, acc_look_d_, acc_look_a_);
     if (lend_view_)
         fn4::note_lend_sched(lent_cycles_, lent_plain_steps_, (int64_t)(lent_plain_ms_ + 0.5), lent_probe_steps_,

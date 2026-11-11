@@ -275,7 +275,7 @@ public:
     bool lend_wanted() const {
         if (lend_sw_ < 0) return true;
         return adapt_ && depth0_ && lend_hold() > 0 && zero_ && zero_held_ >= lend_hold() &&
-               probe_interval() >= kLendInterval;
+               (probe_interval() >= kLendInterval || occ_on_);   /* lever Z0-O: occupancy's 0 runs no probe */
     }
     /* Plain steps measured while lent, for tests and the report. */
     int64_t lent_samples(int n_rows) const { return n_rows >= 1 ? lent_n_[cost_class(n_rows)] : 0; }
@@ -300,6 +300,25 @@ public:
     void set_lend_hyst(int v) { lend_hyst_ = v < 0 ? 0 : v > 100 ? 100 : v; }
     /* Cycles at which the lend's hysteresis held 0 where kHyst alone would have moved. For the report. */
     int64_t lend_hyst_holds() const { return n_lend_hyst_; }
+    /* Lever Z0-O, depth 0 by sustained occupancy (fn4 draft_occ / draft_occ_k; ds41-z0): 0 off (D7 as it was). N > 0:
+     * once at least N decode rows have run occ_k() consecutive cycles, depth 0 holds with no probe -- the measured
+     * single-step choice (plain step vs the window's yield, probes, the lend's back-off) no longer decides there; once
+     * fewer than N rows have run occ_k() consecutive cycles, D7 decides again from its cost model and probes (the
+     * 1 .. N-1 row region). At c4 the two yields sit within a few percent (z0ad-fix, 11.11.2026: a block at depth 0
+     * 139.0 tok/s, blocks drafting 126-139) and D7's choice swung from 2870 depth-0 cycles in one block to 300-543 in
+     * the next. Depth 0 forced (draft_depth0 2) is left as it is. Exact: it moves only D7's choice of depth. */
+    static constexpr int kOccK = 32;
+    int  occ() const { return occ_n_; }
+    void set_occ(int n) {
+        occ_n_ = n < 0 ? 0 : n > 64 ? 64 : n;
+        if (occ_n_ == 0) { occ_on_ = false; occ_hi_ = occ_lo_ = 0; }
+    }
+    int  occ_k() const { return occ_k_; }
+    void set_occ_k(int k) { occ_k_ = k < 1 ? 1 : k > 4096 ? 4096 : k; }
+    /* Whether occupancy holds depth 0 now; the cycles it held, and its moves (on and off). For tests and the report. */
+    bool    occ_held() const { return occ_on_; }
+    int64_t occ_cycles() const { return n_occ_; }
+    int64_t occ_moves() const { return n_occ_moves_; }
     /* Whether the head drafts this cycle: false only while depth 0 holds D at 0, or a plain probe
      * runs. A block drafter's context pass runs either way; its query pass and every verify row
      * do not. */
@@ -441,6 +460,12 @@ private:
     int32_t lend_hyst_ = 0;
     bool    lent_seen_ = false;
     int64_t n_lend_hyst_ = 0;
+    /* Lever Z0-O (occ()): the switch, the cycles, the state, the consecutive cycles at >= N and < N rows, counters. */
+    int32_t occ_n_ = 0;
+    int32_t occ_k_ = kOccK;
+    bool    occ_on_ = false;
+    int32_t occ_hi_ = 0, occ_lo_ = 0;
+    int64_t n_occ_ = 0, n_occ_moves_ = 0;
     /* The ratio class `c` borrows (kBorrowMin, kBorrowDamp), or 0 when no neighbour has one. */
     double  borrowed_ratio(int c) const;
     bool    zero_now() const {

@@ -395,6 +395,28 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
 void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
     ++cycles_;
     if (zero_held_ < INT32_MAX) ++zero_held_;
+    /* Lever Z0-O, depth 0 by sustained occupancy (occ()): it decides first, before a probe runs its cycles out. */
+    if (occ_n_ > 0 && !forced_) {
+        if (n_rows >= occ_n_) { occ_lo_ = 0; if (occ_hi_ < INT32_MAX) ++occ_hi_; }
+        else                  { occ_hi_ = 0; if (occ_lo_ < INT32_MAX) ++occ_lo_; }
+        if (!occ_on_ && occ_hi_ >= occ_k_)     { occ_on_ = true;  ++n_occ_moves_; }
+        else if (occ_on_ && occ_lo_ >= occ_k_) { occ_on_ = false; ++n_occ_moves_; }
+        if (occ_on_) {
+            probe_left_ = 0;   /* a probe under way ends: no single-step probe decides here */
+            if (!zero_) {
+                RAD_DEBUG("draft window: head depth %d -> 0, %d decode rows for %d cycles (draft_occ %d)",
+                          step_w_ > 0 ? step_w_ : kMinDepth, n_rows, occ_k_, occ_n_);
+                zero_ = true;
+                zero_held_ = 0;
+                since_probe_ = 0;
+                ++n_zero_moves_;
+                backoff_k_ = 0;
+            }
+            ++n_zero_;
+            ++n_occ_;
+            return;
+        }
+    }
     const int c  = cost_class(n_rows);
     const int dd = step_w_ > 0 ? step_w_ : kMinDepth;
 
