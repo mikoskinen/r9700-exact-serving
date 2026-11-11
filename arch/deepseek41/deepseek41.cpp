@@ -1096,7 +1096,7 @@ static std::atomic<int> g_sw_bi{0}, g_sw_bi_ok{0}, g_sw_bi_env{-2};   /* env: -2
 static void bi_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_BI");
-    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : (e[0] >= '2' && e[0] <= '4' && !e[1]) ? e[0] - '0'
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : (e[0] >= '2' && e[0] <= '6' && !e[1]) ? e[0] - '0'
                           : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
     if (g_sw_bi_env.compare_exchange_strong(unread, v)) {
         if (v >= 0) g_sw_bi.store(v, std::memory_order_relaxed);
@@ -1116,8 +1116,13 @@ static constexpr int64_t kBiMoe = 16;
  * op by op across the segments (each weight's two reads back to back, so the decode rows' GEMV finds it in the last-level
  * cache) and the per-row ops that never flip (rmsnorm q_an / kv_n, ds41_rope_rows, rope_rows_roundtrip, quant_roundtrip,
  * the window-key store) once over the step. Every value gives a row its alone bytes. */
-static bool bi_pieces(int v) { return v == 2 || v == 4; }
+/* 5 / 6 = 3 / 4 with the MoE's all-reduce whole (BI-d): every MoE pass of a segmented step gathers its rows without
+ * reducing, then ONE all-reduce over the step's rows (or, with one pass, the pass's own gather + all-reduce / ARGATHER as
+ * today). Exact: the exact all-reduce sums 0 + r0 + r1 + r2 + r3 in fp32 a value whatever the rows it carries, and
+ * ARGATHER is gather + all-reduce byte for byte (lever D3). */
+static bool bi_pieces(int v) { return v == 2 || v == 4 || v == 6; }
 static bool bi_cheap(int v) { return v >= 3; }
+static bool bi_onear(int v) { return v >= 5; }
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
 static void sw_note_decl(int64_t rows) {
@@ -1143,7 +1148,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_bi"))
-        return value == 0 || (value >= 1 && value <= 4 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || (value >= 1 && value <= 6 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -3515,7 +3520,7 @@ struct BiSeg {
     bool dec = false;
     int k = -1;   /* bi_cu's row (a prefill segment), -1 for the batch's cu */
 };
-static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0}, g_bi_moe{0};
+static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0}, g_bi_moe{0}, g_bi_onear{0};
 /* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
  * segment, decode rows within the norms' width): step() then runs today's issue. Prefill sequences' bounds from the
  * host mirror of positions (each sequence's rows are consecutive positions; a jump starts the next); when that does not
@@ -3564,10 +3569,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const long long n = g_bi_steps.load(std::memory_order_relaxed);
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0)
             fprintf(stderr, "radiance: deepseek41: lever BI stats: %lld segmented steps, %lld MoE passes a layer in them (%.2f a "
-                            "step), %lld cu read-backs, %lld steps with > 48 decode rows; ds41_bi %d\n",
+                            "step), %lld cu read-backs, %lld steps with > 48 decode rows, %lld steps with one MoE all-reduce; ds41_bi %d\n",
                     n, g_bi_moe.load(std::memory_order_relaxed),
                     (double)g_bi_moe.load(std::memory_order_relaxed) / (double)n, g_bi_sync.load(std::memory_order_relaxed),
-                    g_bi_wide.load(std::memory_order_relaxed), g_sw_bi.load(std::memory_order_relaxed));
+                    g_bi_wide.load(std::memory_order_relaxed), g_bi_onear.load(std::memory_order_relaxed),
+                    g_sw_bi.load(std::memory_order_relaxed));
     }
     if (g_bi_steps.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0) {
         std::string seg;
@@ -3978,18 +3984,27 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
-        {   /* ds41_bi 2: the decode segment in pieces within the EXL3 decode band */
-            const int64_t piece = bi_pieces(g_sw_bi.load(std::memory_order_relaxed)) ? kBiMoe : ((int64_t)1 << 40);
+        {   /* ds41_bi 2 / 4 / 6: the decode segment in pieces within the EXL3 decode band; 5 / 6: one all-reduce */
+            const int biv = g_sw_bi.load(std::memory_order_relaxed);
+            const int64_t piece = bi_pieces(biv) ? kBiMoe : ((int64_t)1 << 40);
+            /* The MoE's passes: (first row, rows). A hook point for a dual-form expert launch (fn4): the passes are the
+             * row groups whose expert arithmetic must be each group's own. */
+            static thread_local std::vector<std::pair<int64_t, int64_t>> passes;
+            passes.clear();
             for (const BiSeg& s : sg) {
-                if (!s.dec || s.n <= piece) {
-                    L.moe.pass(x, T, s.r0, s.n, true, &bs);
-                    if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-                for (int64_t a = 0; a < s.n; a += piece) {
-                    L.moe.pass(x, T, s.r0 + a, std::min(piece, s.n - a), true, &bs);
-                    if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
-                }
+                if (!s.dec || s.n <= piece) { passes.emplace_back(s.r0, s.n); continue; }
+                for (int64_t a = 0; a < s.n; a += piece) passes.emplace_back(s.r0 + a, std::min(piece, s.n - a));
+            }
+            /* one all-reduce over the step: only where the block reduces its gathered delta in one collective */
+            const bool onear = bi_onear(biv) && passes.size() > 1 && !L.moe.op_moe_ar && !L.moe.op_shared_ar &&
+                               !L.moe.op_combine && !L.moe.op_add;
+            for (const auto& ps : passes) {
+                L.moe.pass(x, T, ps.first, ps.second, !onear, &bs);
+                if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (onear && L.moe.issues_ar(T, T)) {
+                L.moe.issue_ar(x, 0, T, false);
+                if (l == 0) g_bi_onear.fetch_add(1, std::memory_order_relaxed);
             }
         }
         L.moe.route_report(x);

@@ -121,8 +121,10 @@
  *                   before; 2 (arm BI-P) = 1 + the routed MoE over the decode rows in passes of at most 16 (the EXL3
  *                   experts' decode band), so a c4 / c8 verify's rows keep their alone bytes too, at a MoE pass a piece.
  *                   3 / 4 = 1 / 2 with the cheap issue (the query / key chains op by op across the segments, the
- *                   per-row ops that never flip once over the step). RADIANCE_DS41_BI=0..4 declares it (and starts at that
- *                   value); unset: 1..4 refused. A step with
+ *                   per-row ops that never flip once over the step). 5 / 6 = 3 / 4 with the MoE's all-reduce whole:
+ *                   the passes gather without reducing and one all-reduce runs over the step's rows (the exact wire
+ *                   sums each element alike at any size). RADIANCE_DS41_BI=0..6 declares it (and starts at that
+ *                   value); unset: 1..6 refused. A step with
  *                   one segment runs today's issue either way. Changes the bytes of rows that shared a step with other
  *                   sequences (toward their alone bytes); a one-sequence step is unchanged.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
