@@ -178,7 +178,12 @@ int Ctx::prepare() {
      * hold more rows than their header says and be written late. */
     const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
                                   [](const OpInfo& o) { return o.op == "gram_accum"; });
-    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps;
+    /* lever BI's tracer (bi_rowhash, declared only under RADIANCE_DS41_BITRACE) reads every step on the host: no
+     * recorded passes, as for the calibration tap. */
+    const bool trace = std::any_of(program_->ops.begin(), program_->ops.end(),
+                                   [](const OpInfo& o) { return o.op == "bi_rowhash"; });
+    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps && !trace;
+    if (trace && rank_ == 0) RAD_INFO("recorded passes: off, the program traces rows (bi_rowhash, RADIANCE_DS41_BITRACE)");
     if (taps && record_passes_ && tape_supported() && rank_ == 0)
         RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
     return RAD_OK;

@@ -5,6 +5,8 @@
 
 /* Launches (r4d_ds41_elem.hip). */
 int r4d_rad_token_map(const RadArgs* a, RadStream stream);
+/* lever BI's tracer: a 64-bit fingerprint a row (debug, RADIANCE_DS41_BITRACE) */
+int r4d_rad_bi_rowhash(const RadArgs* a, RadStream stream);
 int r4d_rad_stream_gate_add(const RadArgs* a, RadStream stream);
 int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream stream);
 int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream stream);

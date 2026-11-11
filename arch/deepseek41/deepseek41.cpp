@@ -41,6 +41,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>   /* getpid: lever BI's tracer files */
+
 /* The engine's runtime switches (abi/rad_runtime.h), weak: a host without them (an older core, a tool)
  * reads every switch as off. The DSpark extras (ds41-acc) are issued only while theirs is on. */
 extern "C" int rad_fn4_get(const char* name, int* value) __attribute__((weak));
@@ -440,6 +442,28 @@ struct IqrQOp {
     int64_t K  = 0;
 };
 
+/* Lever BI's tracer (RADIANCE_DS41_BITRACE=<dir>, ds41-bi 11.11.2026): a 64-bit fingerprint of every traced row of
+ * every traced buffer after the op that wrote it (bi_rowhash, libr4d), copied to the host at the step's end and written,
+ * for the rows at positions below RADIANCE_DS41_BITRACE_PMAX (default 640), to <dir>/bt-r<rank>-<pid>.bin (names in
+ * .names). A run alone and one under load, matched by a request's (position, token) rows, name the first op whose
+ * output differs (tools/bitrace.py). Unset: nothing declared, nothing issued -- today's graph and passes. Set: the
+ * passes are not recorded (ctx.cpp) and every step synchronises once at its end. */
+struct BiTr {
+    bool on = false;
+    std::string dir;
+    int64_t pmax = 640;
+    rad_buf plane = 0;              /* [cap * max_tok, 2] i32 */
+    int64_t cap = 0;                /* points a step */
+    std::map<rad_buf, rad_op> op;   /* bi_rowhash over each traced buffer */
+    int n = 0;                      /* points issued this step */
+    std::vector<std::string> names; /* this step's points */
+    std::vector<uint8_t> kind;      /* 0: the step's token rows; 1: its output rows (out_ids) */
+    uint64_t names_key = 0;
+    FILE* f = nullptr;
+    FILE* fn = nullptr;
+    std::vector<uint32_t> host;
+};
+
 struct Model {
     Names nm{};
     Geom g{};
@@ -539,6 +563,7 @@ struct Model {
     rad_op pcn_fin = 0;  /* the last post_f + contract + fnorm fused, or 0 */
     /* The last layer's MoE all-reduce + pcn_fin as one collective (RADIANCE_DS41_AR_PCN=2), or 0. */
     rad_op ar_pcn_fin = 0;
+    BiTr bt{};
     Dsp dsp{};
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
@@ -2694,6 +2719,8 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
 }
 
 /* ------------------------------------------------------------------ declare */
+static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI's tracer, below */
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
@@ -3060,7 +3087,150 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             fprintf(stderr, "radiance: deepseek41 indexer deal: idx_split %d (RADIANCE_DS41_IDX_BALANCE at start, "
                             "POST /admin/fn4 idx_split): %s\n", idx_balance() ? 1 : 0, what);
     }
+    DS_TRY(bt_declare(b, m, ctx));
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ lever BI's tracer */
+static const char* bt_dir() {
+    static const char* d = [] {
+        const char* e = std::getenv("RADIANCE_DS41_BITRACE");
+        return e && *e && std::strcmp(e, "0") ? e : (const char*)nullptr;
+    }();
+    return d;
+}
+/* At the end of a declare: the plane and one bi_rowhash a traced buffer (read after everything the model declared, so
+ * no traced buffer shares memory with a later op's under tracing). */
+static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    if (!bt_dir()) return RAD_OK;
+    auto& t = m.bt;
+    t.on = true;
+    t.dir = bt_dir();
+    if (const char* e = std::getenv("RADIANCE_DS41_BITRACE_PMAX")) t.pmax = std::max<int64_t>(1, std::atoll(e));
+    t.cap = 64 + 24 * (int64_t)m.c.n_layer;
+    const int64_t MT = m.g.max_tok;
+    t.plane = decl_b(b, m.nm.f("bi_trace_plane"), RAD_I32, { t.cap * MT, 2 }, RAD_BUF_PERSIST);
+    if (!t.plane) return RAD_E_INVAL;
+    auto add = [&](rad_buf buf, int64_t rows) {
+        if (!buf || t.op.count(buf)) return;
+        t.op[buf] = op(b, "bi_rowhash", { RAD_RANGE("M", 1, rows) }, {}, { buf }, { t.plane });
+    };
+    for (rad_buf buf : { m.h0, m.h1, m.xn, m.qr, m.q, m.kvn, m.iq, m.iw, m.sel, m.o, m.oa, m.attn_out, m.act.x,
+                         m.mw.logits, m.mw.ids, m.mw.ew, m.mw.sout, m.final_hidden })
+        add(buf, MT);
+    add(m.logits, m.g.max_logit_rows);
+    for (const auto& kv : t.op)
+        if (!kv.second) return RAD_E_UNSUPPORTED;
+    if (ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: lever BI's tracer ON (RADIANCE_DS41_BITRACE=%s): %zu traced buffers, %lld "
+                        "points a step at most, rows at positions below %lld; passes not recorded\n",
+                t.dir.c_str(), t.op.size(), (long long)t.cap, (long long)t.pmax);
+    return RAD_OK;
+}
+/* One point: `rows` rows of `buf` as the last op left them. */
+static void bt_pt(RadCtx* x, Model& m, rad_buf buf, int64_t rows, const char* name, int l, int kind = 0) {
+    auto& t = m.bt;
+    if (!t.on || !buf || rows <= 0 || t.n >= t.cap) return;
+    const auto it = t.op.find(buf);
+    if (it == t.op.end() || !it->second) return;
+    RAD_ISSUE_N(x, it->second, rows, brows(buf, rows), brow_slice(t.plane, (int64_t)t.n * m.g.max_tok, rows, 2));
+    char nm[64];
+    if (l >= 0) snprintf(nm, sizeof nm, "L%02d.%s", l, name);
+    else snprintf(nm, sizeof nm, "%s", name);
+    t.names.emplace_back(nm);
+    t.kind.push_back((uint8_t)kind);
+    ++t.n;
+}
+static void bt_begin(Model& m) {
+    if (!m.bt.on) return;
+    m.bt.n = 0;
+    m.bt.names.clear();
+    m.bt.kind.clear();
+}
+/* The step's end: the plane and the batch's rows to the host (one synchronisation), the selected rows to the file. */
+static void bt_flush(RadCtx* x, Model& m, const RadBatch* batch) {
+    auto& t = m.bt;
+    if (!t.on || t.n == 0) return;
+    const int64_t T = batch->n_tok, S = batch->n_seq, NO = batch->n_out > 0 ? batch->n_out : 0, MT = m.g.max_tok;
+    const RadStream st = rad_stream(x);
+    std::vector<int32_t> tok((size_t)T), pos((size_t)T), cu((size_t)S + 1), sid((size_t)S), ql((size_t)S),
+        cl((size_t)S), oid((size_t)NO);
+    auto cp = [&](void* dst, const void* src, int64_t bytes) {
+        if (src && bytes > 0) rad_memcpy_async(dst, src, bytes, st);
+    };
+    cp(tok.data(), batch->token_ids, T * 4);
+    cp(pos.data(), batch->positions, T * 4);
+    cp(cu.data(), batch->cu_seqlens, (S + 1) * 4);
+    cp(sid.data(), batch->seq_ids, S * 4);
+    cp(ql.data(), batch->q_lens, S * 4);
+    cp(cl.data(), batch->ctx_lens, S * 4);
+    cp(oid.data(), batch->out_ids, NO * 4);
+    t.host.resize((size_t)t.n * (size_t)MT * 2);
+    cp(t.host.data(), rad_buf_ptr(x, t.plane), (int64_t)t.n * MT * 8);
+    rad_stream_sync(st);
+    const int rank = rad_rank(x);
+    if (!t.f) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/bt-r%d-%d.bin", t.dir.c_str(), rank, (int)getpid());
+        t.f = fopen(path, "ab");
+        snprintf(path, sizeof path, "%s/bt-r%d-%d.names", t.dir.c_str(), rank, (int)getpid());
+        t.fn = fopen(path, "a");
+        if (!t.f || !t.fn) {
+            fprintf(stderr, "radiance: deepseek41: lever BI's tracer cannot open %s: off\n", path);
+            t.on = false;
+            return;
+        }
+    }
+    uint64_t key = 1469598103934665603ull;
+    for (size_t i = 0; i < t.names.size(); ++i) {
+        for (const char c : t.names[i]) key = (key ^ (uint8_t)c) * 1099511628211ull;
+        key = (key ^ (uint64_t)(t.kind[i] + 1)) * 1099511628211ull;
+    }
+    if (key != t.names_key) {
+        fprintf(t.fn, "N %016llx %d\n", (unsigned long long)key, t.n);
+        for (int i = 0; i < t.n; ++i) fprintf(t.fn, "%s %d\n", t.names[(size_t)i].c_str(), (int)t.kind[(size_t)i]);
+        fflush(t.fn);
+        t.names_key = key;
+    }
+    std::vector<int32_t> sel;
+    for (int64_t r = 0; r < T; ++r)
+        if (pos[(size_t)r] >= 0 && pos[(size_t)r] < t.pmax) sel.push_back((int32_t)r);
+    int64_t seqdec = 0, tokdec = 0;
+    batch_split(batch, &seqdec, &tokdec);
+    struct {
+        char magic[4];
+        int32_t rank;
+        int64_t step;
+        int32_t T, S, NO, NP, nsel, DT, SD, draft;
+        uint64_t names;
+    } h{ { 'B', 'I', 'T', '2' }, rank, (int64_t)batch->step, (int32_t)T, (int32_t)S, (int32_t)NO, t.n,
+         (int32_t)sel.size(), (int32_t)tokdec, (int32_t)seqdec, (int32_t)batch->n_spec, key };
+    fwrite(&h, sizeof h, 1, t.f);
+    fwrite(cu.data(), 4, cu.size(), t.f);
+    fwrite(sid.data(), 4, sid.size(), t.f);
+    fwrite(ql.data(), 4, ql.size(), t.f);
+    fwrite(cl.data(), 4, cl.size(), t.f);
+    fwrite(oid.data(), 4, oid.size(), t.f);
+    std::vector<uint32_t> rec;
+    for (const int32_t r : sel) {
+        int32_t sq = 0;
+        while (sq + 1 <= S && cu[(size_t)sq + 1] <= r) ++sq;
+        const int32_t hd[4] = { r, pos[(size_t)r], tok[(size_t)r], sq };
+        fwrite(hd, 4, 4, t.f);
+        rec.assign((size_t)t.n * 2, 0);
+        int32_t orow = -1;
+        for (int64_t j = 0; j < NO; ++j)
+            if (oid[(size_t)j] == r) orow = (int32_t)j;
+        for (int i = 0; i < t.n; ++i) {
+            const int64_t row = t.kind[(size_t)i] ? orow : r;
+            if (row < 0) continue;
+            const size_t at = ((size_t)i * (size_t)MT + (size_t)row) * 2;
+            rec[(size_t)i * 2] = t.host[at];
+            rec[(size_t)i * 2 + 1] = t.host[at + 1];
+        }
+        fwrite(rec.data(), 4, rec.size(), t.f);
+    }
+    fflush(t.f);
 }
 
 /* ------------------------------------------------------------------ step */
@@ -3262,6 +3432,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
     const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
+    bt_begin(m);
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
     const auto* wb = kv_batch(batch, m.win);
@@ -3336,6 +3507,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
         }
+        bt_pt(x, m, m.h0, T, "h0", l);
         if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         /* Issue order of the connections' mixes (Ctx::haz_mark: a recorded pass leaves a dispatch
          * unordered when it touches nothing in flight). Each connection's collapse reads the gates
@@ -3366,6 +3538,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         } else {
             if (L.norm_a)
                 RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
+            bt_pt(x, m, m.xn, T, "xn", l);
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
             /* The compressor (at a kv source) and the indexer (at an index source) read xn and qrn
              * as the query and key chains do, and their only order with them is the compressed
@@ -3607,6 +3780,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
             l_rope(); k_rope();
             if (L.src) i_qq();
             l_q(); k_q(); l_st(); k_st(); i_score();
+            bt_pt(x, m, m.qr, T, "qr", l);
+            bt_pt(x, m, m.q, T, "q", l);
+            bt_pt(x, m, m.kvn, T, "kvn", l);
+            if (L.i_score) {
+                bt_pt(x, m, m.iq, T, "iq", l);
+                bt_pt(x, m, m.iw, T, "iw", l);
+                bt_pt(x, m, m.sel, T, "sel", l);
+            }
 
             /* Lever K1 fold d (switch ds41_ofold): attn_rt for the attention and its output's rope + round trip. */
             const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
@@ -3639,12 +3820,15 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
                 if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
             }
+            bt_pt(x, m, m.o, T, "o", l);
             const int64_t gd = HD / m.gr;
             for (int j = 0; j < m.gr; ++j)
                 lin_issue(x, m, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), L.wo_a[(size_t)j],
                           bcol(m.oa, j * c.o_rank, c.o_rank, T));
+            bt_pt(x, m, m.oa, T, "oa", l);
             if (late) mix_a();
             lin_issue(x, m, L.o_b, T, brows(m.oa, T), L.wo_b, brows(m.attn_out, T));
+            bt_pt(x, m, m.attn_out, T, "attn_out", l);
         }
         if (L.ar_pcn_f && ar_wide_write_exact(m.g, T))   /* the all-reduce, post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.ar_pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
@@ -3676,11 +3860,18 @@ static void step(RadCtx* x, const RadBatch* batch) {
             }
         };
         col_f();
+        bt_pt(x, m, m.h1, T, "h1", l);
+        bt_pt(x, m, m.act.x, T, "ffn_in", l);
         MixBeside mb{ &L, &m, T };
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
         L.moe.step(x, batch, bs);
+        bt_pt(x, m, m.mw.logits, T, "router", l);
+        bt_pt(x, m, m.mw.ids, T, "ids", l);
+        bt_pt(x, m, m.mw.ew, T, "ew", l);
+        bt_pt(x, m, m.mw.sout, T, "sout", l);
+        bt_pt(x, m, m.act.x, T, "moe_out", l);
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin); under
          * RADIANCE_DS41_AR_PCN=2 with the block's all-reduce in front (the block left it to us: ar_out). */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
@@ -3713,12 +3904,15 @@ static void step(RadCtx* x, const RadBatch* batch) {
         RAD_ISSUE_N(x, m.contract, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
         RAD_ISSUE_N(x, m.fnorm, T, brows(m.xcol, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
     }
+    bt_pt(x, m, m.final_hidden, T, "final", -1);
     if (batch->n_out > 0) {
         RAD_ISSUE_N(x, m.gather, batch->n_out, brows(m.final_hidden, T),
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
         RAD_ISSUE_N(x, m.head_op, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
                     brows(m.logits, batch->n_out));
+        bt_pt(x, m, m.logits, batch->n_out, "logits", -1, 1);
     }
+    bt_flush(x, m, batch);
 }
 
 /* RADIANCE_DS41_LEVELS=1: offer the core's arena levels (RadArchProbe::shape_probe_ok), which lend
