@@ -248,7 +248,8 @@ TEST(sd_q_with_zeros_keeps_the_law) {
         std::vector<float> val;
         for (int v = 0; v < 12; ++v) { ids.push_back(v); val.push_back(0.4f * nd(rng)); }
         const std::vector<double> p = law_of(ids, val, V);
-        report("q zeros (b)", run_case(score, 1.0f, ids, val, V, N, 4), p, expect_acc(score, 1.0f, p, V));
+        report("q zeros (b)", run_case(score, 1.0f, ids, val, V, 1000000, 4), p, expect_acc(score, 1.0f, p, V));
+        report("q zeros (b')", run_case(score, 1.0f, ids, val, V, 1000000, 40), p, expect_acc(score, 1.0f, p, V));
     }
 }
 
@@ -275,6 +276,8 @@ TEST(sd_top_p_truncated_target_law_is_kept) {
         val.push_back(tv[(size_t)v]);
     }
     const std::vector<double> p = law_of(ids, val, V);
+    /* the drafter favours three tokens the cut removed (its law is not the target's), so Q has mass outside P */
+    for (int i = (int)ids.size(), k = 0; i < V && k < 3; ++i, ++k) score[(size_t)order[(size_t)(V - 1 - k)]] += 6.0f;
     uint64_t top[8];
     top8(score, top);
     int outside = 0;
