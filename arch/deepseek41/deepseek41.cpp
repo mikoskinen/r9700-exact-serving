@@ -3423,12 +3423,14 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         g_psk_window.store((int)c.window, std::memory_order_relaxed);
         if (m.bi_sub) g_sw_psk2_ok.store(1, std::memory_order_relaxed);
     }
-    if (ctx->rank == 0 && !ctx->shape_probe && g_sw_psk.load(std::memory_order_relaxed) >= 2)
-        fprintf(stderr, "radiance: deepseek41: lever PSK design 2 (anchors, ds41_psk %d): layers %d..%lld run only the "
-                        "cones of the scheduler's targets (the prompt's end, its tail snapshot, every ds41_psk_k-th "
+    /* RADIANCE_DS41_PSK=2 / 3 (the start value, whatever rank declares first): said once on rank 0; without BI's cu views
+     * design 2 is not available and the switch starts at 1 */
+    const int env = g_sw_psk_env.load(std::memory_order_relaxed);
+    if (ctx->rank == 0 && !ctx->shape_probe && env >= 2)
+        fprintf(stderr, "radiance: deepseek41: lever PSK design 2 (anchors, RADIANCE_DS41_PSK=%d): layers %d..%lld run only "
+                        "the cones of the scheduler's targets (the prompt's end, its tail snapshot, every ds41_psk_k-th "
                         "checkpoint position%s, a request's checkpoint_at); %s\n",
-                g_sw_psk.load(std::memory_order_relaxed), first, (long long)c.n_layer - 1,
-                g_sw_psk.load(std::memory_order_relaxed) == 3 ? ", the first at or past 32768" : "",
+                env, first, (long long)c.n_layer - 1, env == 3 ? ", the first at or past 32768" : "",
                 m.bi_sub ? "window snapshots at targets only" : "NOT available: RADIANCE_DS41_BI is not declared -- starts at 1");
     if (!ctx->shape_probe && !m.bi_sub && g_sw_psk.load(std::memory_order_relaxed) >= 2)
         g_sw_psk.store(1, std::memory_order_relaxed);
