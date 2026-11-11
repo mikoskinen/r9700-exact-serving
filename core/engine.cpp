@@ -3061,6 +3061,36 @@ int Engine::run_server() {
                 s.experts.routed            = (int64_t)hs.routed;
                 s.experts.routed_resident   = (int64_t)hs.routed_resident;
 
+                /* Every rank's own (ranks[]): the published tiers and the heat engine's counters, as for rank 0
+                 * above, and the drafter's lent trunk units (an atomic). */
+                const int32_t n_trunk = meta_.n_layers > 0 ? (int32_t)meta_.n_layers : n_layer;
+                for (const auto& rk : ranks_) {
+                    server::ExpertPlane::Rank er;
+                    er.rank = rk->index;
+                    const HeatEngine& rh = rk->heat;
+                    const bool rlive = rh.enabled();
+                    const Plan& rp = rk->plan;
+                    for (size_t u = 0; u < rp.units.size(); ++u) {
+                        const MoveUnit& mu = rp.units[u];
+                        if (mu.expert < 0 || mu.layer < 0) continue;
+                        const Tier t = rlive ? rh.tier_published((int32_t)u) : mu.tier;
+                        if (t == Tier::VRAM) {
+                            ++er.vram_units;
+                            if (mu.layer < n_trunk) ++er.trunk_vram_units; else ++er.draft_vram_units;
+                        } else if (t == Tier::HostPinned) {
+                            ++er.pinned_units;
+                        } else {
+                            ++er.other_units;
+                        }
+                    }
+                    const HeatStats rs = rh.stats();
+                    er.routed           = (int64_t)rs.routed;
+                    er.routed_resident  = (int64_t)rs.routed_resident;
+                    er.stream_bytes     = (int64_t)rs.stream_bytes;
+                    er.draft_lent_units = rk->mover.draft_lent_units();
+                    er.flex_bytes       = rk->mover.flex_used_bytes();
+                    s.experts.ranks.push_back(er);
+                }
             }
 
             /* The link panel. All-reduce counts come from rank 0 only: the ranks are symmetric,
