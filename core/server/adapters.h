@@ -122,6 +122,11 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.prefill_tokens = m.prefill_tokens;   o.decode_tokens = m.decode_tokens;
     o.draft_tokens = m.draft_tokens;       o.draft_accepted = m.draft_accepted;
     o.draft_refills = m.draft_refills;     o.draft_refill_tokens = m.draft_refill_tokens;
+    o.tree_layout = m.tree_layout;         o.tree_verifies = m.tree_verifies;
+    o.tree_nodes = m.tree_nodes;           o.tree_wide = m.tree_wide;
+    o.tree_branch_nodes = m.tree_branch_nodes;
+    o.tree_branch_paths = m.tree_branch_paths;
+    o.tree_branch_accepted = m.tree_branch_accepted;
     o.lookup_proposals = m.lookup_proposals;     o.lookup_held = m.lookup_held;
     o.lookup_held_drafts = m.lookup_held_drafts; o.lookup_held_hits = m.lookup_held_hits;
     o.linear_hit_rate = m.linear_hit_rate;

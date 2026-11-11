@@ -136,6 +136,16 @@ struct SchedMetrics {
      * and the reusable tokens they gave back to be recomputed. */
     int64_t draft_refills = 0;
     int64_t draft_refill_tokens = 0;
+    /* Lever T1, a tree layout's verifies (rad_drafter_tree_layout; /stats tree_*): the head-drafted verifies of tree
+     * steps and their drafted nodes; those that carried nodes past the main chain, and those nodes; the accepted paths
+     * that start in a branch (first accepted node past the main chain) and their accepted drafts. Zero without one. */
+    bool    tree_layout = false;
+    int64_t tree_verifies = 0;
+    int64_t tree_nodes = 0;
+    int64_t tree_wide = 0;
+    int64_t tree_branch_nodes = 0;
+    int64_t tree_branch_paths = 0;
+    int64_t tree_branch_accepted = 0;
     float   draft_acceptance = 0.0f;
     int     draft_depth = 0;          /* what the controller would choose right now */
     /* Per draft position: `reached` counts verifies where every earlier position was accepted,

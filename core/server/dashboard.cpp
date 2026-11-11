@@ -394,6 +394,15 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["step_ns_decode_best"] = m.step_ns_decode_best;
         o["step_ns_decode_recent"] = m.step_ns_decode_recent;
         o["rows_unspec"]     = m.decode_rows_unspeculated;
+        /* Lever T1: a tree layout's verifies (SchedMetrics::tree_*), only where the drafter declared one. */
+        if (m.tree_layout) {
+            o["tree_verifies"]        = m.tree_verifies;
+            o["tree_nodes"]           = m.tree_nodes;
+            o["tree_wide"]            = m.tree_wide;
+            o["tree_branch_nodes"]    = m.tree_branch_nodes;
+            o["tree_branch_paths"]    = m.tree_branch_paths;
+            o["tree_branch_accepted"] = m.tree_branch_accepted;
+        }
 
         /* Conditional rate per position with its reach count: a rate of 0.0 over a reach of 3 is
          * noise, over a reach of 40000 a broken draft round. */

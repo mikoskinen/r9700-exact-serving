@@ -3252,6 +3252,15 @@ int Scheduler::commit(StepResult& res) {
                 }
                 m_.draft_tokens += e.n_spec;
                 m_.draft_accepted += a;
+                /* Lever T1's counters: a head-drafted verify of a tree step (path: the accepted nodes, by
+                 * row, 1-based; rows 1..K the main chain). */
+                if (path && draft_.tree_layout() && !e.ngram) {
+                    const int K = draft_.chain_depth();
+                    ++m_.tree_verifies;
+                    m_.tree_nodes += e.n_spec;
+                    if (e.n_spec > K) { ++m_.tree_wide; m_.tree_branch_nodes += e.n_spec - K; }
+                    if (a > 0 && path[0] > K) { ++m_.tree_branch_paths; m_.tree_branch_accepted += a; }
+                }
                 server::sink_drafts(r.sink, e.n_spec, a);
             }
         }
@@ -4042,6 +4051,7 @@ SchedMetrics Scheduler::metrics_locked() const {
         ? (float)((double)m.linear_cached_tokens / (double)m.prompt_tokens) : 0.0f;
     m.draft_acceptance = draft_.acceptance();
     m.draft_depth = draft_.next_depth();
+    m.tree_layout = draft_.tree_layout();
     /* The loop bound is the array's extent, not RAD_SCHED_MAX_SPEC: the values are equal, but gcc
      * cannot prove the boundary index safe through the inlined accessors (which guard with
      * `j < RAD_SCHED_MAX_SPEC ? reach_[j] : 0`) and warns. */
