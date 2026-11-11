@@ -5271,4 +5271,118 @@ TEST(the_draft_floor_charges_only_the_trunk) {
     CHECK_EQ(expert_vram_floor_draft_hosted(wf, 80), expert_vram_floor(wf, 80));
 }
 
+/* ---- lever LF (ds41-lf): the lent slots' fill by the long-memory decode heat, and the slot-class counters.
+ *
+ * Expert A was routed ten times long ago and nothing since: its placement heat has decayed to nothing (0.95 a
+ * step) while its long-memory heat (0.998 a step) still holds most of the ten. B and C were routed once on the
+ * last step. A loan of two slots is filled by placement heat with B and C (today's fill); under place_lf with A
+ * first. Either way only which unit sits in which slot changes: every unit's bytes stay where its table entry
+ * says, through the fill and the recall. The counters: the fill by lender (fills, fills_lf, fills_hot), the
+ * occupancy, the class a routed expert is counted under while it sits in a lent slot (a hit) and after the
+ * recall dropped it (a miss), and drop_recall. */
+namespace {
+struct LfCase {
+    int32_t a = -1, b = -1, c = -1;
+    bool    a_lent = false, b_lent = false, c_lent = false;
+    LentStats ls_fill, ls_end;
+    SlotStats ss_hit, ss_end;
+    uint8_t   cls_a = 255;
+    int       bad = 0;
+};
+int lf_case(bool lf, LfCase* out) {
+    LoanRig r(16);
+    RAD_TRY(r.build());
+    std::vector<int32_t> pooled;
+    for (int32_t e = 0; e < 16; ++e) {
+        const int32_t u = r.hf.unit_of_expert(e);
+        if (u >= 0 && r.hf.plan.units[(size_t)u].movable && r.h.tier(u) != Tier::VRAM) pooled.push_back(e);
+    }
+    if (pooled.size() < 3) return RAD_E_STATE;
+    const int32_t ea = pooled[0], eb = pooled[1], ec = pooled[2];
+    out->a = r.hf.unit_of_expert(ea);
+    out->b = r.hf.unit_of_expert(eb);
+    out->c = r.hf.unit_of_expert(ec);
+    std::vector<int32_t> counts(16, 0);
+    counts[(size_t)ea] = 10;
+    r.h.observe(0, counts.data(), 16);
+    counts.assign(16, 0);
+    for (int k = 0; k < 200; ++k) r.h.observe(0, counts.data(), 16);
+    counts[(size_t)eb] = 1;
+    counts[(size_t)ec] = 1;
+    r.h.observe(0, counts.data(), 16);
+    if (!(r.h.heat(out->a) < r.h.heat(out->b) && r.h.heat_long(out->a) > r.h.heat_long(out->b))) return RAD_E_STATE;
+
+    RAD_TRY(stamp_units(r, false, nullptr));
+    r.m.set_place_lf(lf);
+    /* The smallest loan that covers two lent slots (one a stretch: they are cut from each top). */
+    const int64_t stride = r.hf.plan.classes[0].stride;
+    int64_t amount = 0;
+    for (; amount <= Loan::kAll; amount += Loan::kUnitTokens) {
+        RAD_TRY(r.m.set_loan(Mover::kLendKV, amount));
+        if (r.m.flex_offered_bytes() >= 2 * stride) break;
+    }
+    if (r.m.flex_offered_bytes() != 2 * stride) return RAD_E_STATE;
+    for (Deadline dl; (r.m.flex_used_bytes() < 2 * stride || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        RAD_TRY(r.dispatch());
+    out->a_lent = r.loan.inside(r.addr(out->a));
+    out->b_lent = r.loan.inside(r.addr(out->b));
+    out->c_lent = r.loan.inside(r.addr(out->c));
+    out->ls_fill = r.m.lent_stats();
+    out->cls_a = r.h.slot_class(out->a);
+    RAD_TRY(stamp_units(r, true, &out->bad));
+
+    /* Route A once while it sits where the fill put it, recall the loan, route A again. */
+    counts.assign(16, 0);
+    counts[(size_t)ea] = 1;
+    r.h.observe(0, counts.data(), 16);
+    out->ss_hit = r.h.slot_stats();
+    RAD_TRY(r.m.set_loan(Mover::kLendKV, 0));
+    for (Deadline dl; (r.m.loan_held(Mover::kLendKV) > 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        RAD_TRY(r.dispatch());
+    r.h.observe(0, counts.data(), 16);
+    out->ss_end = r.h.slot_stats();
+    out->ls_end = r.m.lent_stats();
+    RAD_TRY(stamp_units(r, true, &out->bad));
+    return RAD_OK;
+}
+}  /* namespace */
+
+TEST(lever_lf_fills_lent_slots_by_the_long_memory_heat) {
+    LfCase off, on;
+    CHECK_OK(lf_case(false, &off));
+    CHECK_OK(lf_case(true, &on));
+    /* Today's fill: the two units routed last; A stays pooled. */
+    CHECK(!off.a_lent);
+    CHECK(off.b_lent && off.c_lent);
+    CHECK_EQ(off.ls_fill.fills[Mover::kLendKV], (uint64_t)2);
+    CHECK_EQ(off.ls_fill.fills_lf[Mover::kLendKV], (uint64_t)0);
+    CHECK_EQ(off.ls_fill.fills_hot[Mover::kLendKV], (uint64_t)2);
+    /* Lever LF: A first, then one of the two (equal long heat). */
+    CHECK(on.a_lent);
+    CHECK(on.b_lent != on.c_lent);
+    CHECK_EQ(on.ls_fill.fills[Mover::kLendKV], (uint64_t)2);
+    CHECK_EQ(on.ls_fill.fills_lf[Mover::kLendKV], (uint64_t)2);
+    CHECK_EQ(on.ls_fill.fills_hot[Mover::kLendKV], (uint64_t)1);
+    /* The occupancy: two slots covered, both held. */
+    CHECK_EQ(on.ls_fill.covered[Mover::kLendKV], (int64_t)2);
+    CHECK_EQ(on.ls_fill.held[Mover::kLendKV], (int64_t)2);
+    CHECK_EQ(on.ls_fill.covered[Mover::kLendArena], (int64_t)0);
+    /* A sits in a KV-lent slot: routed there it is a KV-class hit; after the recall a KV-class miss. */
+    CHECK_EQ((int)on.cls_a, (int)kSlotKV);
+    CHECK_EQ(on.ss_hit.hit[kSlotKV], (uint64_t)1);
+    CHECK_EQ(on.ss_end.miss[kSlotKV], (uint64_t)1);
+    CHECK_EQ(on.ss_end.hit[kSlotKV], (uint64_t)1);
+    /* Off, A never left the pool: its misses are cold-class ones (B and C were routed while pooled too). */
+    CHECK_EQ(off.ss_hit.hit[kSlotKV], (uint64_t)0);
+    CHECK(off.ss_end.miss[kSlotNone] >= 2);
+    /* The recall dropped both lent units, counted as recalls; nothing else dropped them. */
+    CHECK_EQ(on.ls_end.drop_recall[Mover::kLendKV], (uint64_t)2);
+    CHECK_EQ(on.ls_end.drop_victim[Mover::kLendKV] + on.ls_end.drop_reserve[Mover::kLendKV], (uint64_t)0);
+    CHECK_EQ(on.ls_end.covered[Mover::kLendKV], (int64_t)0);
+    CHECK_EQ(on.ls_end.held[Mover::kLendKV], (int64_t)0);
+    /* Exact: every unit's bytes where its table entry says, after the fill and after the recall, both ways. */
+    CHECK_EQ(off.bad, 0);
+    CHECK_EQ(on.bad, 0);
+}
+
 RAD_TEST_MAIN()

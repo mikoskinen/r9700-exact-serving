@@ -131,7 +131,34 @@ struct HeatParams {
      * one decay of a single credit. Eviction is free (the container is ground truth), so a
      * mistake costs one future re-read, and the slot count — not this bar — bounds the cache. */
     float admit_heat = 0.5f;
+
+    /* Lever LF (ds41-lf): the long-memory decode heat's decay a credited step. A second decode heat kept
+     * beside the one placement ranks, credited and decayed on the same pass (a decode share decays it by
+     * long_decay^share), only slower: 0.998 is a half-life of ~350 steps, so it ranks an expert by how often
+     * decode routed it over the last few hundred steps, not the last ~14. It never moves anything by itself;
+     * the mover's fill of lent slots ranks by it under fn4 place_lf 1 (Mover::fill). Outside (0, 1): the
+     * default. RADIANCE_PLACE_LF_DECAY. */
+    float long_decay = 0.998f;
+
+    /* The trunk's layer count: units of layers at or past it (a draft head's) are counted apart in the
+     * slot-class counters (kSlotDraftOwn), whatever slot holds them. -1: every layer is the trunk's. */
+    int32_t trunk_layers = -1;
 };
+
+/* Slot classes (ds41-lf, /stats experts.ranks[].slots): the slot a unit sits in while in VRAM, kept after it
+ * leaves (a miss is counted under the class of the slot its expert last sat in). kSlotNone: never in VRAM since
+ * start; kSlotTrunk: a budgeted slab slot or the static region (the plan's resident set and every swap's
+ * promotion); kSlotKV .. kSlotDraftW: a slot lent by that lender (Mover::kLendKV + 2 ..); kSlotDraftOwn: a draft
+ * head's own units, wherever they sit (HeatParams::trunk_layers). */
+enum SlotClass : uint8_t { kSlotNone = 0, kSlotTrunk = 1, kSlotKV = 2, kSlotArena = 3, kSlotDraft = 4,
+                           kSlotDraftW = 5, kSlotDraftOwn = 6, kSlotClasses = 7 };
+inline const char* slot_class_name(int c) {
+    static const char* const k[kSlotClasses] = { "cold", "trunk", "kv", "arena", "dslab", "dw", "draft" };
+    return c >= 0 && c < kSlotClasses ? k[c] : "?";
+}
+/* Routed experts by slot class, counted on observe's pricing pass with the same weight as HeatStats::routed:
+ * `hit[c]` resident in a class-c slot, `miss[c]` off the device with class c its last slot. */
+struct SlotStats { uint64_t hit[kSlotClasses] = {}, miss[kSlotClasses] = {}; };
 
 /* The share of a step (HeatParams::prefill_share) a histogram of a step with `n_tok` rows,
  * `n_tok_decode` of them decode rows, is credited at: the decode rows in full, the prefill rows at
@@ -342,6 +369,23 @@ public:
      * Engine-internal decisions must use the individual counters (`warm`), not a snapshot. */
     HeatStats stats() const { return stats_.snapshot(); }
 
+    /* ds41-lf. The slot class the mover published `unit` into (SlotClass; kept after it leaves VRAM). Called by
+     * the mover on the dispatch thread when a unit lands in a slot; a draft head's unit keeps kSlotDraftOwn. */
+    void set_slot_class(int32_t unit, uint8_t cls) {
+        if (unit < 0 || (size_t)unit >= pos_.size() || cls >= kSlotClasses) return;
+        uint8_t& c = scls_[(size_t)pos_[(size_t)unit]];
+        if (c != kSlotDraftOwn) c = cls;
+    }
+    uint8_t slot_class(int32_t unit) const { return scls_[(size_t)pos_[(size_t)unit]]; }
+    /* The long-memory decode heat (HeatParams::long_decay); lever LF's fill ranking. */
+    float heat_long(int32_t unit) const { return heat_l_[(size_t)pos_[(size_t)unit]]; }
+    /* By value, readable from the HTTP thread (relaxed counters). */
+    SlotStats slot_stats() const {
+        SlotStats s;
+        for (int c = 0; c < kSlotClasses; ++c) { s.hit[c] = slot_hit_[c]; s.miss[c] = slot_miss_[c]; }
+        return s;
+    }
+
     /* Exit banner, ending with the per-layer resident counts, which show whether every layer kept
      * its share of slots. */
     std::string report() const;
@@ -351,6 +395,18 @@ private:
     bool       enabled_ = false;
     int32_t    n_layer_ = 0;
     HeatCounters stats_;
+    /* ds41-lf: routed experts by slot class (slot_stats), and the class by position (set_slot_class). */
+    Relaxed<uint64_t> slot_hit_[kSlotClasses], slot_miss_[kSlotClasses];
+    std::vector<uint8_t> scls_;
+    /* Lever LF: the long-memory decode heat by position (HeatParams::long_decay). */
+    std::vector<float>   heat_l_;
+    /* observe's tail: the slot-class tallies of one pass into the counters, `passes` each. */
+    void add_slots(const uint32_t* hit, const uint32_t* miss, uint64_t passes) {
+        for (int c = 0; c < kSlotClasses; ++c) {
+            if (hit[c]) slot_hit_[c] += (uint64_t)hit[c] * passes;
+            if (miss[c]) slot_miss_[c] += (uint64_t)miss[c] * passes;
+        }
+    }
 
     /* Heat by position, not by unit. Each layer owns a run of positions whose front is indexed by
      * expert: expert e of layer l is at slot_lo_[l] + e, whether or not the plan has a unit for it

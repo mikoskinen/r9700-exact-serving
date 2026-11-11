@@ -888,6 +888,14 @@ int Engine::prepare_release(const RadBatch* b) {
                 arena_d0_.store(sw[fn4::kArenaD0] == 1 ? 1 : 0, std::memory_order_relaxed);
                 fn4::note_sched(fn4::kArenaD0, arena_d0_.load(std::memory_order_relaxed));
             }
+            /* Lever LF: every rank's mover, read by its next fill (fn4 refuses 1 unless every rank places
+             * dynamically). The slots already filled keep their units. */
+            if (sw[fn4::kPlaceLf] != fn4::kNoChange) {
+                const int on = sw[fn4::kPlaceLf] == 1 && lf_capable_ ? 1 : 0;
+                lf_on_.store(on, std::memory_order_relaxed);
+                for (auto& r : ranks_) r->mover.set_place_lf(on == 1);
+                fn4::note_sched(fn4::kPlaceLf, on);
+            }
         }
     }
     /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
@@ -3101,6 +3109,27 @@ int Engine::run_server() {
                     er.stream_bytes     = (int64_t)rs.stream_bytes;
                     er.draft_lent_units = rk->mover.draft_lent_units();
                     er.flex_bytes       = rk->mover.flex_used_bytes();
+                    /* ds41-lf: the slot classes' hits / misses and each lender's slots (relaxed counters). */
+                    if (rlive) {
+                        er.slots = true;
+                        const SlotStats ss = rh.slot_stats();
+                        for (int c = 0; c < kSlotClasses && c < server::ExpertPlane::Rank::kClasses; ++c) {
+                            er.slot_hit[c]  = (int64_t)ss.hit[c];
+                            er.slot_miss[c] = (int64_t)ss.miss[c];
+                        }
+                        const LentStats ls = rk->mover.lent_stats();
+                        for (int k = 0; k < LentStats::kN && k < server::ExpertPlane::Rank::kLenders; ++k) {
+                            er.lent_covered[k]      = ls.covered[k];
+                            er.lent_held[k]         = ls.held[k];
+                            er.lent_fills[k]        = (int64_t)ls.fills[k];
+                            er.lent_fills_lf[k]     = (int64_t)ls.fills_lf[k];
+                            er.lent_fills_hot[k]    = (int64_t)ls.fills_hot[k];
+                            er.lent_drop_victim[k]  = (int64_t)ls.drop_victim[k];
+                            er.lent_drop_reserve[k] = (int64_t)ls.drop_reserve[k];
+                            er.lent_drop_recall[k]  = (int64_t)ls.drop_recall[k];
+                        }
+                        er.place_lf = lf_on_.load(std::memory_order_relaxed);
+                    }
                     s.experts.ranks.push_back(er);
                 }
             }
