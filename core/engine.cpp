@@ -874,6 +874,11 @@ int Engine::prepare_release(const RadBatch* b) {
                 if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 ? 1 : 0;
                 fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.ready ? ctxs_.on : 0);
             }
+            /* Lever Z0-A: the engine's own, read by the next arena_step (fn4 refuses 1 unless set up). */
+            if (sw[fn4::kArenaD0] != fn4::kNoChange) {
+                arena_d0_.store(sw[fn4::kArenaD0] == 1 ? 1 : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kArenaD0, arena_d0_.load(std::memory_order_relaxed));
+            }
         }
     }
     /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
@@ -2069,8 +2074,21 @@ int Engine::arena_step(const RadBatch* b) {
     if (arena_rows_.size() <= 1 || !b) return RAD_OK;
     /* An encoder pass needs the full plan: its activations are sized by the pass, and a plugin
      * declares them small under shape_probe. */
-    const int64_t need = b->enc ? INT64_MAX : std::max<int64_t>(
+    int64_t need = b->enc ? INT64_MAX : std::max<int64_t>(
         b->n_tok, (int64_t)b->n_seq * (1 + std::max(cfg_.n_spec, 0)));
+    /* Lever Z0-A (fn4 arena_d0): with decode rungs declared below the one today's steps take
+     * (RADIANCE_DS41_ARENA_DECODE_ROWS=8,48), off every decode and verify step takes at least that one, as
+     * today; on, a decode step that verifies nothing and runs no head (one row a sequence, depth 0 or a
+     * plain probe) takes the smallest rung holding its own rows, as an NST 0 step does; a drafter refill
+     * in it is cut to that rung's rows (ctx_refill_all). Placement only: plan_level gives a smaller rung
+     * only fewer rows of the same buffers. */
+    if (!b->enc && arena_dec_max_ > 0) {
+        const bool d0 = arena_d0_.load(std::memory_order_relaxed) == 1;
+        if (d0 && b->phase == RAD_PHASE_DECODE && b->n_tok == b->n_seq && !sched_.draft().head_runs())
+            need = b->n_tok;
+        else if (!d0)
+            need = std::max<int64_t>(need, arena_dec_max_);
+    }
     const int level = arena_level(need);
     const uint64_t now = rad_mono_ns();
     arena_last_ = arena_rows_[(size_t)level];

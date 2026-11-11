@@ -5216,10 +5216,10 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK(has(g2.body, "\"draft_lend\": 1, \"draft_lend_borrow\": 1"));
     CHECK(has(g2.body, "\"slab_mib\": 2151, \"borrow_cycles\": 41, \"hyst_holds\": 0}"));
     /* Lever Z0-H, the lend's hysteresis: 0 .. 100, above 0 refused unless the lend is set up; its count last in "lend". */
-    CHECK(has(g2.body, "\"draft_lend_hyst\": 0"));
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":101})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":-1})").status, 400);
-    fn4::note_sched(fn4::kDraftLendHyst, 0);
+    fn4::note_sched(fn4::kDraftLendHyst, 0);   /* the scheduler reports it at its init (-1 before) */
+    CHECK(has(f.get("/admin/fn4").body, "\"draft_lend_hyst\": 0"));
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":20})").status, 200);
     CHECK(fn4::apply_pending(33, sw));
     CHECK_EQ(sw[fn4::kDraftLendHyst], 20);
@@ -5237,6 +5237,27 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK(fn4::apply_pending(34, sw));
     fn4::note_sched(fn4::kDraftLendHyst, 0);
     fn4::lend_register(true);
+    /* Lever Z0-A, arena_d0 (the engine's): 0 / 1, 1 refused until the engine registered a rung below the largest. */
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":2})").status, 400);
+    const HttpResponse a0 = f.post("/admin/fn4", R"({"arena_d0":1})");
+    CHECK_EQ(a0.status, 400);
+    CHECK(has(a0.body, "no engine has registered its activation arena"));
+    fn4::arena_d0_register(false);
+    const HttpResponse a1 = f.post("/admin/fn4", R"({"arena_d0":1})");
+    CHECK_EQ(a1.status, 400);
+    CHECK(has(a1.body, "no decode rung below the largest"));
+    fn4::arena_d0_register(true);
+    fn4::note_sched(fn4::kArenaD0, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":1})").status, 200);
+    CHECK(fn4::apply_pending(35, sw));
+    CHECK_EQ(sw[fn4::kArenaD0], 1);
+    CHECK_EQ(sw[fn4::kDraftLendHyst], fn4::kNoChange);
+    fn4::note_sched(fn4::kArenaD0, 1);
+    CHECK(has(f.get("/admin/fn4").body, "\"arena_d0\": 1"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"arena_d0":0})").status, 200);
+    CHECK(fn4::apply_pending(36, sw));
+    fn4::note_sched(fn4::kArenaD0, 0);
+    fn4::arena_d0_register(false);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
     CHECK_EQ(sw[fn4::kDraftLend], -1);

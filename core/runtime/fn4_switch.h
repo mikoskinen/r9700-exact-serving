@@ -59,6 +59,11 @@
  *                   (outside --host-pool-mib, the plan unchanged) and its slab is carved for the trunk;
  *                   the value is the start value. Unset: nothing declared, and 1 is refused. Exact:
  *                   placement only. The counters are GET's "lend" object (state_json).
+ *   arena_d0        engine (lever Z0-A, Engine::arena_step): 0 off -- decode and verify steps take the largest decode
+ *                   rung of RADIANCE_DS41_ARENA_DECODE_ROWS (today's choice); 1 a decode step that verifies nothing and
+ *                   runs no head (depth 0) takes the smallest rung holding its own rows (with "8,48": 8 at c8 depth 0
+ *                   instead of 48), so the arena above it is lent to the expert slab as at NST 0. Starts 0. 1 refused
+ *                   unless the variable declared a rung below the largest (arena_d0_register). Exact: placement only.
  *   draft_lend_hyst scheduler (lever Z0-H, sched/draft.h DraftController::lend_hyst): 0 off (kHyst, 2 %, throughout);
  *                   1 .. 100: while the drafter's slab is lent or the lend is wanted, a move from depth 0 to drafting
  *                   needs the window's yield to beat the lent plain step's by that many percent (at least kHyst); a
@@ -179,7 +184,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
-              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDraftLendHyst, kSwitches };
+              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDraftLendHyst, kArenaD0,
+              kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -232,6 +238,8 @@ void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t look
 /* The depth-0 context skip (draft_ctxskip). The engine, at bring-up: whether it set the skip up (draft_ctxskip=1 is
  * refused otherwise; GET "ctxskip" only once registered). */
 void ctxskip_register(bool capable);
+/* The engine, at bring-up (lever Z0-A): whether arena_d0 can act (a decode rung below the largest declared). */
+void arena_d0_register(bool capable);
 /* The engine, after every block drafter's turn: steps whose context pass was skipped, refill passes and their
  * rows, kept rows dropped (a sequence finished or preempted, or older than the drafter's window), refills forced
  * by a full ring, rows kept now, and the ring's step slots and MiB a rank. */

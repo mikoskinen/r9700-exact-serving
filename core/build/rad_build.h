@@ -84,6 +84,9 @@ int plan_level(const Program& full, const Program& probe, int64_t rows, ArenaLev
  * RADIANCE_DS41_ARENA_DECODE_ROWS) below a ladder whose first rung is `lo`; the reason in `why`
  * when not. */
 bool arena_decode_rows_ok(int64_t rows, int64_t lo, std::string* why);
+/* Lever Z0-A: RADIANCE_DS41_ARENA_DECODE_ROWS as a list ("48", "8,48"): every value that parses as a positive integer, in
+ * the order given; `bad` gets the words that do not. Validity against the ladder is arena_decode_rows_ok's. */
+std::vector<int64_t> arena_decode_rows_list(const char* s, std::string* bad);
 
 /* Bytes a declared buffer occupies. 0 means the core cannot size it: a plugin-private dtype, legal
  * for a weight (the kernel's layout hook sizes it) but not for an activation. */

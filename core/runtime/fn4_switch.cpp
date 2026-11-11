@@ -24,7 +24,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "drafter_mx", "drafter_bf",
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
-                                        "dspark_walk", "draft_lend_hyst" };
+                                        "dspark_walk", "draft_lend_hyst", "arena_d0" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -54,6 +54,7 @@ struct State {
     std::atomic<int64_t> lend[18];       /* note_lend_sched [0, 9), 16 and 17, note_lend_engine [9, 16) */
     std::atomic<int64_t> acc[4];         /* note_draft_accept */
     std::atomic<int> ctxskip_capable{-1};   /* -1 no engine registered, 0 / 1 */
+    std::atomic<int> arena_d0_capable{-1};  /* lever Z0-A: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> ctxs[8];        /* note_ctxskip */
     std::mutex mu;
     int  want[kSwitches];
@@ -156,7 +157,7 @@ int reported(State& s, int i) {
 bool sched_switch(int i) {
     return i == kDraftAdaptive || i == kDraftDepth0 || i == kDraftProbe || i == kDraftHybrid ||
            i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow ||
-           i == kDraftCtxSkip || i == kDraftLendHyst;
+           i == kDraftCtxSkip || i == kDraftLendHyst || i == kArenaD0;
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -219,6 +220,7 @@ void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t look
 }
 
 void ctxskip_register(bool capable) { st().ctxskip_capable.store(capable ? 1 : 0, std::memory_order_release); }
+void arena_d0_register(bool capable) { st().arena_d0_capable.store(capable ? 1 : 0, std::memory_order_release); }
 
 void note_ctxskip(int64_t skipped, int64_t refill_passes, int64_t refill_rows, int64_t dropped_rows,
                   int64_t ring_full, int64_t pending_rows, int64_t ring_slots, int64_t ring_mib) {
@@ -273,7 +275,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
-                        "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, draft_lend_hyst, epoch_bump)";
+                        "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, draft_lend_hyst, arena_d0, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -288,6 +290,21 @@ bool check(const std::string& name, int v, std::string* err) {
                 *err = std::string("draft_probe_backoff=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no scheduler has registered a drafter"
                                 : "this deployment's drafter cannot run the adaptive window");
+            return false;
+        }
+        return true;
+    }
+    if (i == kArenaD0) {
+        if (v < 0 || v > 1) {
+            if (err) *err = "arena_d0 takes 1 (on) or 0 (off)";
+            return false;
+        }
+        const int cap = s.arena_d0_capable.load(std::memory_order_acquire);
+        if (v == 1 && cap != 1) {
+            if (err)
+                *err = std::string("arena_d0=1 refused: ") +
+                       (cap < 0 ? "no engine has registered its activation arena"
+                                : "no decode rung below the largest of RADIANCE_DS41_ARENA_DECODE_ROWS (e.g. 8,48)");
             return false;
         }
         return true;

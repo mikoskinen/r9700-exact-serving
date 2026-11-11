@@ -348,6 +348,19 @@ TEST(the_decode_rung_takes_8_to_64_rows_below_the_first_rung) {
     CHECK(why.find("first rung") != std::string::npos);
 }
 
+/* Lever Z0-A: RADIANCE_DS41_ARENA_DECODE_ROWS takes a list; one value is today's. */
+TEST(the_decode_rung_variable_takes_a_list_of_row_counts) {
+    std::string bad;
+    CHECK(arena_decode_rows_list("48", &bad) == std::vector<int64_t>({ 48 }));
+    CHECK(bad.empty());
+    CHECK(arena_decode_rows_list("8,48", &bad) == std::vector<int64_t>({ 8, 48 }));
+    CHECK(arena_decode_rows_list(" 8 , 48 ", &bad) == std::vector<int64_t>({ 8, 48 }));
+    CHECK(arena_decode_rows_list("8,x,48,-4,", &bad) == std::vector<int64_t>({ 8, 48 }));
+    CHECK_EQ(bad, std::string("x,-4"));
+    CHECK(arena_decode_rows_list("", &bad).empty());
+    CHECK(arena_decode_rows_list(nullptr, &bad).empty());
+}
+
 /* A DeepSeek-V4.1-shaped plan (TP4 rank, 4160-row chunk, 512k context): the index score plane is
  * [irows = 256, cmax] f32, 2 MiB a row, the largest transient. Today's sizing declare keeps it at
  * irows at every level, so a rung below 256 rows saves only the row-scaled buffers; with the plane at
