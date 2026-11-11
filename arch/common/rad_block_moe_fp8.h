@@ -120,6 +120,36 @@ constexpr int64_t kMaxProtected = 8;
  * both arms are GEMM-bound and a recorded pass already overlaps their stages (haz_mark). */
 static const int64_t kMoeShexpLaneRows = 64;
 
+/* fn4 BI-dual (exl3 interface v13, 11.11.2026): a step's token bands for MoeFP8::set_band, filled on the host -- the
+ * architecture knows which of a step's rows would run in an M <= 16 pass alone (a decode sequence's rows, a prefill
+ * sequence of at most 16 rows: the EXL3 decode band) -- and copied to its device buffer on the step's stream ahead of the
+ * MoE. A ring of pinned host copies, so a copy still in flight is never rewritten (the engine runs at most a step or two
+ * ahead of its stream). The architecture declares `dev` ([max_tok] i32, RAD_BUF_PERSIST) and sets `cap`; the pinned copies
+ * are made on the first upload and kept for the process (a few KiB a rank). */
+struct Exl3Band {
+    static constexpr int kRing = 4;
+    rad_buf  dev = 0;
+    int64_t  cap = 0;
+    int32_t* host[kRing] = {};
+    int      next = 0;
+    bool     tried = false;
+    /* rows [a[i], b[i]) of the step marked 1, the rest of [0, T) 0; false when it cannot (no pinned memory, T past cap) */
+    bool upload(RadCtx* c, int64_t T, const int64_t* a, const int64_t* b, int n) {
+        if (!dev || T <= 0 || T > cap) return false;
+        if (!tried) {
+            tried = true;
+            for (int32_t*& h : host) h = (int32_t*)rad_dev_alloc(cap * (int64_t)sizeof(int32_t), RAD_MEM_HOST_PINNED);
+        }
+        int32_t* h = host[next];
+        if (!h) return false;
+        next = (next + 1) % kRing;
+        for (int64_t r = 0; r < T; ++r) h[r] = 0;
+        for (int i = 0; i < n; ++i)
+            for (int64_t r = a[i] < 0 ? 0 : a[i]; r < (b[i] < T ? b[i] : T); ++r) h[r] = 1;
+        return rad_memcpy_async(rad_buf_ptr(c, dev), h, T * (int64_t)sizeof(int32_t), rad_stream(c)) == RAD_OK;
+    }
+};
+
 struct MoeFP8 {
     struct Config {
         /* Routed experts this rank owns. Equal to `n_expert_all` unless experts are split across
@@ -562,7 +592,16 @@ struct MoeFP8 {
     std::vector<rad_weight> x3_gu[4], x3_dn[3];
     rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
     int declare_exl3(RadBuilder* b, Names& nm, int l);
-    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
+    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out,
+                    int64_t r0 = -1) const;
+    /* fn4 BI-dual (exl3 interface v13, 11.11.2026): the step's token bands for the EXL3 down's `band` operand, i32
+     * [>= T], or 0. While set (set_band), every EXL3 down this block issues passes its rows [r0, r0 + rows) of it: a row
+     * marked non-zero gets the M <= 16 band's down arithmetic (EPIC's paired tile sums) in an M > 16 launch, so ONE pass
+     * over a mixed step gives the decode rows their decode-band bytes and the prefill rows their prefill-band bytes, each
+     * expert's weights read once. 0 (the default): the operand is not passed (a v8 plugin's schema serves it). The
+     * architecture owns the buffer (declared PERSIST, filled per step: Exl3Band below) and the choice of rows. */
+    mutable rad_buf x3band = 0;
+    void set_band(rad_buf b) const { x3band = b; }
     /* Per projection (gate_up, down), the GGUF type and its block along K of this layer's experts
      * under expert_ggml. */
     const char* ggml_ty[2] = { nullptr, nullptr };
@@ -2168,7 +2207,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
 
 /* One EXL3 op over this rank's tables, each operand where exl3_positions() puts it. */
 inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in,
-                               RadOperand out) const {
+                               RadOperand out, int64_t r0) const {
     const Exl3Positions& at = *exl3_positions(op);
     static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
     static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
@@ -2185,7 +2224,13 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
             const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
             opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] = RAD_WTAB(run[(size_t)(q * half)], half);
         }
-    rad_issue(c_, op_h, opd, at.n_opd, rows);
+    /* fn4 BI-dual (v13): the pass's rows of the step's bands, or the operand left off (n_opd - 1: the trailing optional) */
+    int n_opd = at.n_opd;
+    if (at.band >= 0) {
+        if (x3band && r0 >= 0) opd[at.band] = brow_slice(x3band, r0, rows, 1);
+        else n_opd = at.band;
+    }
+    rad_issue(c_, op_h, opd, n_opd, rows);
 }
 
 /* The shared arm's first stage: its one-column gate and its gate_up over the normed input. Its
@@ -2380,7 +2425,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !lane1 && !swf) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (c.expert_exl3)
-        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
+        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), r0);
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_dn, rows, brows(iqr_d.q8, rows * k), brows(iqr_d.s8, rows * k),
                     RAD_WTAB(w_dn[0], ne), RAD_WTAB(w_dns[0], ne),
