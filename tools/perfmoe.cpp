@@ -9,6 +9,12 @@
 //           [--routing FILE (the engine's routings, an EXL3R4D_ROUTEDUMP dump)]
 //           [--chain [--a-rot 1] [--gd [--gd-nocheck]] [--dump-y FILE] [--chain-band _m16|_pf]] [--bits K] [--skew S] [--group G --group-mix R] [--probe-gap G [--probe-dirty MB]]
 //           [--ep N [--ep-rank r|-1]] [--fn4 name=value ...] [--x3map] [--split-seed --dump-sorted FILE --dump-y-r4d FILE]
+//           [--band LO:HI[,LO:HI...]]
+//
+// --band (fn4 BI-dual, interface v12; with --chain): the chain's down takes the `band` operand, i32 [M], 1 for the token
+// rows in the half-open ranges and 0 elsewhere -- those tokens' rows get the M <= 16 band's down arithmetic (EPIC's
+// paired tile sums) in an M > 16 launch. With --split-seed --dump-y a script compares a marked token's slots with an
+// M <= 16 run's and an unmarked one's with the plain M > 16 run's, byte for byte.
 //
 // --split-seed (fn4 P2x, 10.11.2026; with --chain --layers 1 --pools 1): the token inputs and the weights reseeded from
 // fixed values after the routing draw, so a run at M and one at M / 2 hold the SAME first M / 2 tokens (the draw is
@@ -194,6 +200,7 @@ struct Opts {
     int ep = 1, ep_rank = 0;  // --ep N [--ep-rank r]: expert parallelism over N ranks (see the header)
     std::vector<std::pair<std::string, int>> fn4;   // --fn4 name=value: the library's runtime switches
     bool x3map = false;       // --x3map (with --chain): v10's shared map between the chain's gate_up and down
+    std::vector<std::pair<int64_t, int64_t>> band;   // --band LO:HI,..: v12's marked token rows (fn4 BI-dual)
     bool split_seed = false;  // --split-seed: data reseeded after the draw (fn4 P2x pass-size byte compare)
     std::string dump_sorted, dump_y_r4d;   // --dump-sorted / --dump-y-r4d FILE
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
@@ -391,6 +398,19 @@ int main(int argc, char** argv) {
         else if (a == "--ep") o.ep = std::atoi(nx());
         else if (a == "--ep-rank") o.ep_rank = std::atoi(nx());
         else if (a == "--x3map") o.x3map = true;
+        else if (a == "--band") {   // fn4 BI-dual: LO:HI[,LO:HI...] half-open token ranges
+            std::string v = nx();
+            size_t at = 0;
+            while (at <= v.size()) {
+                const size_t c = v.find(',', at), e = c == std::string::npos ? v.size() : c;
+                const std::string r = v.substr(at, e - at);
+                const size_t k = r.find(':');
+                if (k == std::string::npos || k == 0 || k + 1 >= r.size()) die("--band takes LO:HI[,LO:HI...]");
+                o.band.emplace_back(std::atoll(r.c_str()), std::atoll(r.c_str() + k + 1));
+                if (c == std::string::npos) break;
+                at = c + 1;
+            }
+        }
         else if (a == "--split-seed") o.split_seed = true;
         else if (a == "--dump-sorted") o.dump_sorted = nx();
         else if (a == "--dump-y-r4d") o.dump_y_r4d = nx();
@@ -434,6 +454,9 @@ int main(int argc, char** argv) {
     if (o.ep < 1 || o.ep > 64 || o.ep_rank < -1 || o.ep_rank >= o.ep) die("--ep is 1..64, --ep-rank below it (or -1)");
     if (o.ep > 1 && (o.tp != 1 || o.mod4)) die("--ep splits whole experts: --tp 1 (the rank's widths are whole)");
     if (o.x3map && (!o.chain || o.mod4)) die("--x3map needs --chain (two classes)");
+    if (!o.band.empty() && !o.chain) die("--band needs --chain");
+    for (const auto& b : o.band)
+        if (b.first < 0 || b.second <= b.first || b.second > o.M) die("--band ranges are 0 <= LO < HI <= --M");
     if (check_args) { std::printf("perfmoe: ARGS OK\n"); return 0; }   // an item's dry run: every flag known, the values valid
     if (!o.fn4.empty()) {   // the library's runtime switches, before any row is resolved or launched
         void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -642,6 +665,14 @@ int main(int argc, char** argv) {
             void* y = dalloc((size_t)(Tr * o.hidden * 2));
             const int64_t mapw = exl3_map_words(Tr, o.E);   // --x3map: one buffer; the chain is stream-ordered a layer
             void* mbuf = o.x3map ? dalloc((size_t)(mapw * 4)) : nullptr;
+            void* bbuf = nullptr;   // --band: v12's i32 [M] token bands (fn4 BI-dual)
+            if (!o.band.empty()) {
+                std::vector<int32_t> hb((size_t)o.M, 0);
+                for (const auto& b : o.band)
+                    for (int64_t t = b.first; t < b.second; ++t) hb[(size_t)t] = 1;
+                bbuf = dalloc(hb.size() * 4);
+                put(bbuf, hb.data(), hb.size() * 4);
+            }
             g_fu_h = h; g_fu_y = y; g_fu_hb = (size_t)(Tr * wmax * 2); g_fu_yb = (size_t)(Tr * o.hidden * 2);
             auto f16t = [&](size_t n, float v, int kind) { return o.rand_data ? f16_rand(n, kind == 1 ? 1.0f : v, kind)
                                                                               : f16_buf(n, v); };
@@ -695,6 +726,10 @@ int main(int argc, char** argv) {
                 dt[(size_t)dpos->offset] = ot; dt[(size_t)dpos->y] = T(y, RAD_BF16, { Tr, o.hidden });
                 if (mbuf && gpos->map >= 0 && dpos->map >= 0)
                     gt[(size_t)gpos->map] = dt[(size_t)dpos->map] = T(mbuf, RAD_I32, { mapw });
+                if (bbuf) {
+                    if (dpos->band < 0) die("--band: this down form takes no band operand");
+                    dt[(size_t)dpos->band] = T(bbuf, RAD_I32, { o.M });
+                }
                 pt[(size_t)ppos->x] = T(x, g_x_bf16 ? RAD_BF16 : RAD_F16, { o.M, o.hidden }); pt[(size_t)ppos->sorted] = st;
                 pt[(size_t)ppos->offset] = ot; pt[(size_t)ppos->y] = T(xr, RAD_F16, { Tr, 2 * o.hidden });
                 if (ppos->ids >= 0 && !o.no_ids) pt[(size_t)ppos->ids] = T(rs_ids[(size_t)l], RAD_I32, { o.M, o.topk });

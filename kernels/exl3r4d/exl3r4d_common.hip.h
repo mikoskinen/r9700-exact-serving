@@ -505,6 +505,32 @@ static __device__ __forceinline__ void had_tiles(const float* xs, int t, int lan
   }
 }
 
+// fn4 BI-dual (v12, 11.11.2026): EPIC's paired sum for ONE output tile t of a row, as epilogue_block's EPIC branch
+// computes a wave's tiles 2c and 2c + 1 -- E over the even staged tiles and O over the odd ones, both with tile 2c's
+// signs, in the same fmaf order; out(2c) = E + O, out(2c + 1) = E - O. The M > 16 kernels' down epilogue takes it for a
+// row the `band` operand marks, so that row gets the decode kernels' bits (EXL3R4D_EPIC 1, NPW_DN 2: OPW 2) whatever
+// the launch's M and form, and every other row keeps had_tiles'.
+static __device__ __forceinline__ void epic_tile(const float* xs, int t, int lane, float (&out)[8]) {
+  float pe[8], po[8];
+#pragma unroll
+  for (int e = 0; e < 8; e++) { pe[e] = 0.f; po[e] = 0.f; }
+  const int te = t & ~1;
+#pragma unroll
+  for (int t2 = 0; t2 < 8; t2++) {
+    const float sg = (__builtin_popcount(te & t2) & 1) ? -1.f : 1.f;
+    const v4f a = *(const v4f*)(xs + t2 * 256 + lane * 8);
+    const v4f b = *(const v4f*)(xs + t2 * 256 + lane * 8 + 4);
+    float* acc8 = (t2 & 1) ? po : pe;
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      acc8[e] = fmaf(sg, a[e], acc8[e]);
+      acc8[4 + e] = fmaf(sg, b[e], acc8[4 + e]);
+    }
+  }
+#pragma unroll
+  for (int e = 0; e < 8; e++) out[e] = (t & 1) ? pe[e] - po[e] : pe[e] + po[e];
+}
+
 static __device__ __forceinline__ void load_h8(const _Float16* p, float (&v)[8]) {
   const v8h x = *(const v8h*)p;
 #pragma unroll
@@ -1057,7 +1083,7 @@ template <int NPW, int MATS, bool PRE = false, bool EPIB = false, bool EPIC = fa
 static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, const Planes& w, const v8f (&acc)[NPW],
                                                       int col_local, int ksplit, int lane, int cb, int row,
                                                       bool in_run, bool live, float* lds,
-                                                      const v8h (*svp)[MATS] = nullptr) {
+                                                      const v8h (*svp)[MATS] = nullptr, bool epc = false) {
   constexpr int WV = 8 * MATS / NPW;
   constexpr float RS = 0.08838834764831845f;  // 1 / sqrt(128)
   constexpr int OPW = epi_opw<NPW, MATS>();
@@ -1193,6 +1219,8 @@ static __device__ __forceinline__ void epilogue_block(const Exl3r4dGemm& p, cons
           }
 #pragma unroll
           for (int e = 0; e < 8; e++) r[e] = o == 0 ? epc_e[e] + epc_o[e] : epc_e[e] - epc_o[e];
+        } else if (epc) {   // fn4 BI-dual (v12): this row's token is marked for the M <= 16 band's sums
+          epic_tile(xs, t, lane, r);
         } else {
           had_tiles(xs, t, lane, r);
         }
