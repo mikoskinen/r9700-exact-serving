@@ -9979,6 +9979,45 @@ TEST(psk_glue_a_bypassed_newcomer_gets_its_plan) {
     }
 }
 
+/* A shared head (CacheHit::branch_at): the request that finds it resumes at the anchor below (here none: 0) and takes a
+ * snapshot at the head (Request::checkpoint_at) -- under ds41_psk 2 a target, kept, its cone run -- so every later
+ * request with that head resumes exactly there at any K. A 30000-token prompt, head 20480, K 8: snapshots at the head and
+ * the tail (26624) only; under ds41_psk 0 the head beside every grid point. */
+TEST(psk_glue_a_shared_head_becomes_a_target) {
+    for (int mode : { 2, 0 }) {
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.checkpoint_interval = 2048;
+        f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_span_min(16384);
+        f.sch.set_psk_mode(mode);
+        f.sch.set_psk_k(8);
+        f.pc.seed(20480);
+        f.pc.branch_at = 20480;
+        const uint64_t a = f.submit(30000, 1);
+        std::vector<int32_t> aheads;
+        for (int k = 0; k < 40 && f.sch.find(a); ++k) {
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            std::vector<int32_t> ahead, rows;
+            int64_t dec = 0;
+            if (f.sch.psk_plan(b->step, &ahead, &rows, &dec)) aheads.push_back(ahead[0]);
+            if (k == 0) CHECK_EQ(f.sch.find(a)->checkpoint_at, (int64_t)20480);
+            f.commit_plain();
+        }
+        if (mode == 2) {
+            CHECK((f.pc.committed == std::vector<int64_t>{ 20480, 26624 }));
+            CHECK(!aheads.empty());
+            CHECK_EQ(f.sch.metrics().psk_ckpt_anchor, (int64_t)2);
+        } else {
+            CHECK((f.pc.committed == std::vector<int64_t>{ 2048, 6144, 10240, 14336, 18432, 20480, 26624 }));
+            CHECK(aheads.empty());
+        }
+    }
+}
+
 /* Unset, ds41_psk 0 and 1: no request latched, no plan, every snapshot as today, the counters 0 -- under every
  * sched_bi_chunk and with the bypass on and off; the same pieces and snapshots as unset. */
 TEST(psk_glue_unset_0_and_1_change_nothing_in_any_mode) {
