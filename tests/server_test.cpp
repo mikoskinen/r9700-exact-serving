@@ -5000,6 +5000,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(g.body, "\"ds41_kvfold\": -1"));       /* deepseek41's (lever K1 folds c, d, f) */
     CHECK(has(g.body, "\"ds41_ofold\": -1"));
     CHECK(has(g.body, "\"ds41_onefill\": -1"));
+    CHECK(has(g.body, "\"e10_gd\": -1"));          /* deepseek41's (lever D5 = E10, the fused EXL3 decode chain) */
     CHECK(has(g.body, "\"aql_acq\": 0"));
     CHECK(has(g.body, "\"epoch\": 0"));
     CHECK(has(g.body, "\"draft_capable\": -1"));
@@ -5008,7 +5009,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK_EQ(gg.status, 400);
     CHECK(has(gg.body, "no loaded plugin serves it"));
     for (const char* b : { R"({"ds41_argather":4})", R"({"ds41_shexp_lane":1})", R"({"ds41_kvfold":1})",
-                           R"({"ds41_ofold":1})", R"({"ds41_onefill":1})" }) {
+                           R"({"ds41_ofold":1})", R"({"ds41_onefill":1})", R"({"e10_gd":1})" }) {
         const HttpResponse r = f.post("/admin/fn4", b);
         CHECK_EQ(r.status, 400);
         CHECK(has(r.body, "no loaded plugin serves it"));

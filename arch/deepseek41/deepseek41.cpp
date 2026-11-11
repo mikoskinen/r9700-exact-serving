@@ -970,6 +970,10 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (const K1Switch* k = k1_switch(name))
         return value == 0 || (value == 1 && k->ok->load(std::memory_order_relaxed)) ? 1 : -1;
+    /* ds41 E10 (lever D5): the decode band's fused EXL3 chain (rad_block_moe_fp8.h ds41_e10_gd_flag); 1 only where a
+     * layer declared it (RADIANCE_DS41_E10_GD set at start) */
+    if (!std::strcmp(name, "e10_gd"))
+        return value == 0 || (value == 1 && ds41_e10_gd_declared().load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -977,6 +981,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (ok <= 0) return ok;
     if (!std::strcmp(name, "ds41_argather")) g_sw_gar.store(value, std::memory_order_relaxed);
     else if (const K1Switch* k = k1_switch(name)) k->val->store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "e10_gd")) ds41_e10_gd_flag().store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -993,6 +998,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (const K1Switch* k = k1_switch(name)) {
         *applied = k->val->load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "e10_gd")) {
+        *applied = ds41_e10_gd_flag().load(std::memory_order_relaxed);
         return 1;
     }
     return 0;

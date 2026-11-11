@@ -2715,6 +2715,179 @@ TEST(mxfp4_expert_declarations_preserve_tp4_and_tp8_scale_geometry_and_movement_
             }
 }
 
+/* ds41 E10 (lever D5, 11.11.2026): the decode band's fused EXL3 chain on the DeepSeek-V4.1 MoeFP8, at both K sets of the
+ * 2.25 bpw model (<exl3k2, exl3k2> and <exl3k2h, exl3k2h>) under swiglu_limit 10. RADIANCE_DS41_E10_GD unset declares
+ * nothing (today's ops; the fused op is not even asked for) and every pass issues the split pair whatever the flag says.
+ * Set, moe_exl3_gate_up_down is declared over 3..16 tokens with interface v11's `limit` (the gate_up half's clamp), its
+ * tables the split pair's own weights (per class gate_up's five, then down's codes and svh), reading the token rows and
+ * the routing and writing edn. Every EXL3 issue carries its schema's operand count (fn4 156's fall-through defect), and
+ * with e10_gd 1 the fused op replaces exactly the split pair inside its band (e10_gd 0, or outside: the split pair).
+ * Mixed K, a layer whose passes stay below 3 tokens, or no library declaring the op: nothing declared, a note says why. */
+TEST(ds41_e10_fused_exl3_decode_chain_declared_only_when_asked_replacing_the_split_pair_in_its_band) {
+    using namespace rad::arch;
+    const char* env0 = std::getenv("RADIANCE_DS41_E10_GD");
+    const std::string env_saved = env0 ? env0 : "";
+    const bool env_was = env0 != nullptr;
+    const int flag_saved = ds41_e10_gd_flag().load();
+    const int64_t D = 256, F = 128, NE = 8, TK = 2, HALF = NE / 2;
+    auto schema_of = [](const std::string& op) {   /* {operands, required}, or {-1, -1} */
+        for (int i = 0; i < exl3_schema_count(); ++i) {
+            const RadOpSchema* s = exl3_schema_at(i);
+            if (op != s->op) continue;
+            int req = 0;
+            for (int j = 0; j < s->n_operands; ++j)
+                if (!s->operands[j].optional) req = j + 1;
+            return std::make_pair(s->n_operands, req);
+        }
+        return std::make_pair(-1, -1);
+    };
+    /* kg / kd: gate_up's and down's K; rows: the layer's declared rows; env: RADIANCE_DS41_E10_GD (nullptr unset);
+     * undecl: no library declares the fused op. want: the fused op declared; why: the note's reason when not. */
+    auto run = [&](int kg, int kd, int64_t rows_decl, const char* env, bool undecl, bool want, const char* why) {
+        if (env) setenv("RADIANCE_DS41_E10_GD", env, 1);
+        else unsetenv("RADIANCE_DS41_E10_GD");
+        RadEncoding gu{}, dn{};
+        REQUIRE_EQ(exl3_encoding_make(kg, EXL3_CB_MUL1, 1, &gu), RAD_OK);
+        REQUIRE_EQ(exl3_encoding_make(kd, EXL3_CB_MUL1, 0, &dn), RAD_OK);
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", gu }, { "ffn_down_exps", dn } };
+        if (undecl) b.undeclared.insert(EXL3_OP_GU_DN);
+        Names nm("");
+        Geom g{};
+        g.n_embd = D;
+        g.max_tok = rows_decl;
+        g.world = 1;
+        g.rank = 0;
+        MoeFP8::Src src{};
+        src.router = "mlp.gate.weight";
+        src.experts = "mlp.experts";
+        src.cfg.n_expert = src.cfg.n_expert_all = NE;
+        src.cfg.top_k = TK;
+        src.cfg.n_ff_exp = F;
+        src.cfg.rows = rows_decl;
+        src.cfg.swiglu_limit = 10;
+        REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
+        REQUIRE_EQ(src.cfg.expert_exl3, 1);
+        MoeFP8::Wire w{};
+        auto buf = [&](const char* name, uint32_t dt, int64_t r, int64_t cols) { return decl_b(&b, name, dt, { r, cols }); };
+        w.h.x = buf("h", RAD_BF16, rows_decl, D);
+        REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", D), RAD_OK);
+        w.logits = buf("logits", RAD_BF16, rows_decl, NE);
+        w.ids = buf("ids", RAD_I32, rows_decl, TK);
+        w.ew = buf("ew", RAD_BF16, rows_decl, TK);
+        w.eoff = decl_b(&b, "offset", RAD_I32, { NE + 1 });
+        w.ecnt = decl_b(&b, "count", RAD_I32, { NE });
+        w.sorted = decl_b(&b, "sorted", RAD_I32, { rows_decl * TK });
+        w.egu = buf("gate_up", RAD_BF16, rows_decl * TK, 2 * F);
+        w.eff.x = buf("ff", RAD_BF16, rows_decl * TK, F);
+        REQUIRE_EQ(w.eff.declare_qs(&b, nm, g, "ff", F, rows_decl * TK), RAD_OK);
+        w.edn = buf("down", RAD_BF16, rows_decl * TK, D);
+        MoeFP8 moe;
+        REQUIRE_EQ(moe.declare(&b, nm, g, 3, w, src, false, false), RAD_OK);
+        int n_gd_decl = 0, n_e10_note = 0, n_why = 0;
+        for (const RecOp& o : b.ops) n_gd_decl += o.op == EXL3_OP_GU_DN;
+        for (const std::string& n : b.notes) {
+            n_e10_note += n.find("E10 the EXL3 decode chain as one op") != std::string::npos;
+            n_why += why && n.find(std::string("E10 not declared (RADIANCE_DS41_E10_GD): ") + why) != std::string::npos;
+        }
+        CHECK_EQ(n_gd_decl, want ? 1 : 0);
+        CHECK_EQ(moe.op_x3gd != 0u, want);
+        CHECK_EQ(moe.x3gd_hi, want ? std::min<int64_t>(rows_decl, 16) : 0);
+        CHECK_EQ(n_e10_note, want ? 1 : 0);
+        if (!env || (!want && !why)) {   /* unset (or not 0 / 1): today's declare, the fused op never asked for */
+            CHECK(std::find(b.asked_undeclared.begin(), b.asked_undeclared.end(), EXL3_OP_GU_DN) == b.asked_undeclared.end());
+            int notes = 0;
+            for (const std::string& n : b.notes) notes += n.find("E10") != std::string::npos;
+            CHECK_EQ(notes, 0);
+        } else if (!want) {
+            CHECK_EQ(n_why, 1);
+        }
+        if (want) {
+            const RecOp& o = *b.op_of(moe.op_x3gd);
+            std::map<std::string, RecParam> p;
+            for (const RecParam& q : o.p) p[q.key] = q;
+            CHECK_EQ(p.size(), (size_t)10);   /* M N K n_expert top_k dtype codebook N_odd K_odd limit; no h_rot / a_rot */
+            CHECK_EQ(p["M"].ival, (long long)EXL3_GD_MIN_ROWS);
+            CHECK_EQ(p["M"].ihi, (long long)std::min<int64_t>(rows_decl, 16));
+            CHECK_EQ(p["N"].ival, 2 * F);
+            CHECK_EQ(p["K"].ival, D);
+            CHECK_EQ(p["N_odd"].ival, 2 * F);
+            CHECK_EQ(p["K_odd"].ival, D);
+            CHECK_EQ(p["n_expert"].ival, NE);
+            CHECK_EQ(p["top_k"].ival, TK);
+            CHECK_EQ(p["dtype"].sval, std::string(exl3_gemm_dtype(kg)));
+            CHECK_EQ(p["codebook"].sval, std::string("mul1"));
+            CHECK_EQ(p["limit"].kind, (int)RAD_P_F64);
+            CHECK_EQ(p["limit"].dval, 10.0);
+            /* the tables: the split pair's own weights, per class gate_up's five then down's codes and svh */
+            REQUIRE_EQ(o.w.size(), (size_t)(2 * 7 * HALF));
+            for (int q = 0; q < 2; ++q)
+                for (int t = 0; t < 7; ++t) {
+                    const std::vector<rad_weight>& r = t < 4 ? moe.x3_gu[t] : t == 4 ? moe.x3_dn[1] : t == 5 ? moe.x3_dn[0] : moe.x3_dn[2];
+                    for (int64_t i = 0; i < HALF; ++i)
+                        CHECK_EQ(o.w[(size_t)((q * 7 + t) * HALF + i)], r[(size_t)(q * HALF + i)]);
+                }
+            CHECK(o.reads == (std::vector<rad_buf>{ w.h.x, w.sorted, w.eoff }));
+            CHECK(o.writes == (std::vector<rad_buf>{ w.edn }));
+            CHECK_EQ(ds41_e10_gd_declared().load(), 1);
+        }
+        for (int gd = 0; gd <= 1; ++gd)
+            for (int64_t rows : { (int64_t)1, (int64_t)2, (int64_t)EXL3_GD_MIN_ROWS, (int64_t)4, (int64_t)16, (int64_t)17 }) {
+                if (rows > rows_decl) continue;
+                ds41_e10_gd_flag().store(gd);
+                RadCtx ctx;
+                ctx.b = &b;
+                ctx.rank = 0;
+                ctx.world = 1;
+                moe.pass(&ctx, rows, 0, rows);
+                int n_gu = 0, n_dn = 0, n_gd = 0;
+                for (const auto& issue : ctx.issues) {
+                    const std::string op = b.ops[issue.op - 1].op;
+                    if (op.rfind("moe_exl3_", 0) != 0) continue;
+                    const auto [n_schema, n_req] = schema_of(op);
+                    REQUIRE(n_schema > 0);
+                    const int n = (int)issue.opd.size();
+                    if (n < n_req || n > n_schema)
+                        std::fprintf(stderr, "  %s at %lld rows (e10_gd %d): %d operands, schema %d (%d required)\n",
+                                     op.c_str(), (long long)rows, gd, n, n_schema, n_req);
+                    CHECK(n >= n_req && n <= n_schema);
+                    n_gu += op == EXL3_OP_GATE_UP;
+                    n_dn += op == EXL3_OP_DOWN;
+                    if (op == EXL3_OP_GU_DN) {
+                        ++n_gd;
+                        const Exl3Positions& at = *exl3_positions(EXL3_GU_DN);
+                        REQUIRE_EQ(n, at.n_opd);
+                        CHECK_EQ(issue.n, rows);
+                        CHECK_EQ(issue.opd[(size_t)at.x].handle, w.h.x);
+                        CHECK_EQ(issue.opd[(size_t)at.sorted].handle, w.sorted);
+                        CHECK_EQ(issue.opd[(size_t)at.offset].handle, w.eoff);
+                        CHECK_EQ(issue.opd[(size_t)at.y].handle, w.edn);
+                        CHECK_EQ(issue.opd[(size_t)at.plane[0][EXL3_P_DN_CODES]].handle, moe.x3_dn[0][0]);
+                        CHECK_EQ(issue.opd[(size_t)at.plane[1][EXL3_P_DN_SVH]].handle, moe.x3_dn[2][(size_t)HALF]);
+                        CHECK_EQ(issue.opd[(size_t)at.plane[1][EXL3_P_DN_SUH]].handle, moe.x3_dn[1][(size_t)HALF]);
+                    }
+                }
+                const bool fused = want && gd && rows >= EXL3_GD_MIN_ROWS && rows <= 16;
+                CHECK_EQ(n_gd, fused ? 1 : 0);
+                CHECK_EQ(n_gu, fused ? 0 : 1);
+                CHECK_EQ(n_dn, fused ? 0 : 1);
+            }
+    };
+    for (int k : { 2, (int)EXL3_HALF(2) }) {
+        run(k, k, 32, nullptr, false, false, nullptr);   /* unset: today */
+        run(k, k, 32, "1", false, true, nullptr);
+        run(k, k, 32, "0", false, true, nullptr);
+        run(k, k, 8, "1", false, true, nullptr);         /* a layer declared at 8 rows: the band 3..8 */
+        run(k, k, 2, "1", false, false, "the layer's passes are below the band");
+        run(k, k, 32, "1", true, false, "no loaded library declares");
+        run(k, k, 32, "2", false, false, nullptr);       /* not 0 / 1: nothing declared */
+    }
+    run(2, (int)EXL3_HALF(2), 32, "1", false, false, "gate_up and down differ in K");
+    if (env_was) setenv("RADIANCE_DS41_E10_GD", env_saved.c_str(), 1);
+    else unsetenv("RADIANCE_DS41_E10_GD");
+    ds41_e10_gd_flag().store(flag_saved);
+}
+
 /* A quantised container may keep one linear as the checkpoint holds it. Flash-Next's recipe leaves
  * the QSA indexer's projection plain bf16 (its top-k is a hard choice between blocks), so in a
  * four-bit model with fp8 linears it is declared bf16 and read by `gemm_nt` over its input's bf16

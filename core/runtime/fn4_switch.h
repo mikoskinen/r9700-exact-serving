@@ -89,6 +89,13 @@
  *   ds41_onefill    deepseek41 (lever K1 fold f): 1 the ungated shared expert's gate plane of ones filled once a
  *                   step (MoeFP8 shared_one_external), 0 by every MoE layer as before. RADIANCE_DS41_ONEFILL=1
  *                   declares the step's fill (starts at 1); unset: 1 refused. Exact: the gathers read the same ones.
+ *   e10_gd          deepseek41 (lever D5 = E10, ds41-e10; the arch side of fn4-x3 0ddf16fa / c112d7db): 1 the decode
+ *                   band's EXL3 routed-expert chain (passes of 3..16 tokens) as ONE op, moe_exl3_gate_up_down
+ *                   (radiance-exl3 interface v11: the SwiGLU clamp `limit` on the fused op; exl3r4d's fused launch at
+ *                   K 2 / 2.5 for both projections, fn4-dsgd), 0 the split moe_exl3_gate_up + moe_exl3_down as before.
+ *                   RADIANCE_DS41_E10_GD=0 or 1 at start declares the fused op beside the split pair (and starts at that
+ *                   value); unset declares nothing and 1 is refused. Exact: split-K 1 in both forms from 3 tokens, the
+ *                   fused y is the split chain's bits (perfmoe GD-CHECK per K pair at limit 10).
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -111,7 +118,7 @@ namespace fn4 {
 
 enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLane, kDs41KvFold, kDs41OFold,
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
-              kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf, kSwitches };
+              kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf, kE10Gd, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

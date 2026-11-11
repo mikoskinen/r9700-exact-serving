@@ -115,6 +115,35 @@ inline void moe_debug_weights(RadCtx* c_, int layer, int64_t top_k, rad_buf ids,
  * its `protect` list. */
 constexpr int64_t kMaxProtected = 8;
 
+/* ds41 E10 (11.11.2026, lever D5; the arch side of fn4-x3 0ddf16fa + its fix c112d7db on the DeepSeek-V4.1 MoeFP8):
+ * EXL3's decode chain as ONE op, moe_exl3_gate_up_down (exl3/exl3_abi.h v11: the two-class form, with gate_up's
+ * SwiGLU clamp `limit`), issued in place of the split gate_up / down for passes of EXL3_GD_MIN_ROWS..16 tokens.
+ * RADIANCE_DS41_E10_GD at start DECLARES it: unset or empty = nothing declared, the split pair at every M (today, and the
+ * core switch e10_gd 1 is refused); "0" / "1" (or "on") = the fused op declared beside the split pair at every EXL3
+ * layer whose two projections share a dtype and codebook (DS 2.25: <exl3k2, exl3k2> and <exl3k2h, exl3k2h>, limit 10),
+ * the switch starting at that value; any other value declares nothing (said once on stderr). The core switch "e10_gd"
+ * reaches the flag through deepseek41's rad_fn4_switch; it is read at every issue. From 3 tokens both forms are split-K
+ * 1, so the fused y is the split chain's bits (perfmoe --gd GD-CHECK at --limit 10, --bits 2 and 2.5). */
+inline int ds41_e10_gd_env() {   /* -1 not declared, 0 / 1 declared (the start value); read at each declare */
+    const char* e = std::getenv("RADIANCE_DS41_E10_GD");
+    if (!e || !*e) return -1;
+    if (!std::strcmp(e, "0")) return 0;
+    if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+    static std::atomic<int> said{0};
+    if (!said.exchange(1))
+        std::fprintf(stderr, "radiance: RADIANCE_DS41_E10_GD=%s is not 0 or 1: the fused EXL3 decode chain is not "
+                             "declared\n", e);
+    return -1;
+}
+inline std::atomic<int>& ds41_e10_gd_flag() {   /* 1 = issue the fused op in its band (only where declared) */
+    static std::atomic<int> f{ds41_e10_gd_env() > 0 ? 1 : 0};
+    return f;
+}
+inline std::atomic<int>& ds41_e10_gd_declared() {   /* 1 once a layer declared the fused op (e10_gd 1 accepted) */
+    static std::atomic<int> d{0};
+    return d;
+}
+
 /* The most rows a step may have for MoeFP8::shexp_lane to put the shared arm on the second lane:
  * decode and verify heights. A wider step (prefill, a mixed step) keeps the one-lane issue, where
  * both arms are GEMM-bound and a recorded pass already overlaps their stages (haz_mark). */
@@ -552,6 +581,8 @@ struct MoeFP8 {
     uint32_t    x3_cdt[2]   = { 0, 0 };
     std::vector<rad_weight> x3_gu[4], x3_dn[3];
     rad_buf     b_x3h = 0;      /* gate_up's f16 h (rotated for down, h_rot 1), [rows * top_k, n_ff_exp] */
+    rad_op      op_x3gd = 0;    /* ds41 E10: moe_exl3_gate_up_down over the decode band (RADIANCE_DS41_E10_GD set), or 0 */
+    int64_t     x3gd_hi = 0;    /* ...its declared top (min(16, rows)); 0 when not declared */
     int declare_exl3(RadBuilder* b, Names& nm, int l);
     void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
     /* Per projection (gate_up, down), the GGUF type and its block along K of this layer's experts
@@ -2141,6 +2172,45 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     if (!op_gu || !op_dn) return RAD_E_INVAL;
     rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank, swiglu limit %g", l,
              x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, c.swiglu_limit);
+    /* ds41 E10: the decode chain as one op over EXL3_GD_MIN_ROWS..16 tokens, declared only under RADIANCE_DS41_E10_GD,
+     * when a library declares the op and both projections share a dtype (the fused launch runs one K for both; the
+     * codebook is one already, checked above). Its tables (exl3_positions(EXL3_GU_DN)), per class: gate_up's five
+     * (codes, suh, suh.1, svh, and down's suh as dn_suh), then down's codes and svh. v11 `limit` carries the SwiGLU clamp
+     * to the gate_up half. It reads the token rows and the routing and writes edn, as gate_up + down together do; h and
+     * the rotated rows are the op's own scratch. */
+    op_x3gd = 0;
+    x3gd_hi = c.rows < 16 ? c.rows : 16;
+    if (ds41_e10_gd_env() >= 0) {
+        const char* why = nullptr;
+        if (x3gd_hi < EXL3_GD_MIN_ROWS) why = "the layer's passes are below the band";
+        else if (std::strcmp(x3_dtype[0], x3_dtype[1]) != 0) why = "gate_up and down differ in K";
+        else if (!rad_op_declared(b, EXL3_OP_GU_DN)) why = "no loaded library declares " EXL3_OP_GU_DN;
+        if (!why) {
+            tab.clear();
+            for (int q = 0; q < 2; ++q)
+                for (int t = 0; t < 7; ++t) {
+                    const std::vector<rad_weight>& run = t < 4 ? x3_gu[t] : t == 4 ? x3_dn[1] : t == 5 ? x3_dn[0] : x3_dn[2];
+                    for (int64_t i = 0; i < half; ++i) tab.push_back(run[(size_t)(q * half + i)]);
+                }
+            std::vector<RadParam> gdp = { RAD_RANGE("M", EXL3_GD_MIN_ROWS, x3gd_hi), RAD_INT("N", 2 * F), RAD_INT("K", D),
+                                          RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
+                                          RAD_STR("dtype", x3_dtype[0]), RAD_STR("codebook", x3_cb[0]),
+                                          RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D) };
+            if (c.swiglu_limit > 0) gdp.push_back(RAD_F64("limit", c.swiglu_limit));   /* v11 */
+            op_x3gd = rw(b, rad_decl_op(b, EXL3_OP_GU_DN, gdp.data(), (int)gdp.size(), tab.data(), (int)tab.size()),
+                         {w.h.x, w.sorted, w.eoff}, {w.edn});
+            if (!op_x3gd) why = "no kernel serves it at this geometry";
+        }
+        if (op_x3gd) {
+            ds41_e10_gd_declared().store(1, std::memory_order_relaxed);
+            rad_note(b, "layer %d: E10 the EXL3 decode chain as one op (%s, %s, swiglu limit %g) at %d..%lld tokens a pass "
+                        "(RADIANCE_DS41_E10_GD; e10_gd %d)", l, EXL3_OP_GU_DN, x3_dtype[0], c.swiglu_limit,
+                     EXL3_GD_MIN_ROWS, (long long)x3gd_hi, ds41_e10_gd_flag().load(std::memory_order_relaxed));
+        } else {
+            rad_note(b, "layer %d: E10 not declared (RADIANCE_DS41_E10_GD): %s; the split gate_up / down at every M", l, why);
+        }
+    }
+    if (!op_x3gd) x3gd_hi = 0;
     return RAD_OK;
 }
 
@@ -2150,18 +2220,22 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
     const Exl3Positions& at = *exl3_positions(op);
     static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
     static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
-    const bool gate_up = op == EXL3_GATE_UP;
+    /* ds41 E10: the fused op's seven tables a class -- gate_up's five, then down's codes and svh */
+    static const int slot_gd[7] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH, EXL3_P_DN_CODES,
+                                    EXL3_P_DN_SVH };
+    const bool gate_up = op == EXL3_GATE_UP, gd = op == EXL3_GU_DN;
     const int64_t ne = c.n_expert, half = ne / 2, k = c.top_k;
-    RadOperand opd[16];
+    RadOperand opd[24];
     for (RadOperand& o : opd) o = RAD_NONE;
     opd[at.x] = in;
     opd[at.sorted] = brows(w.sorted, rows * k);
     opd[at.offset] = brows(w.eoff, ne + 1);
     opd[at.y] = out;
     for (int q = 0; q < 2; ++q)
-        for (int t = 0; t < (gate_up ? 5 : 3); ++t) {
-            const std::vector<rad_weight>& run = gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
-            opd[at.plane[q][gate_up ? slot_gu[t] : slot_dn[t]]] = RAD_WTAB(run[(size_t)(q * half)], half);
+        for (int t = 0; t < (gd ? 7 : gate_up ? 5 : 3); ++t) {
+            const std::vector<rad_weight>& run = gd ? (t < 4 ? x3_gu[t] : t == 4 ? x3_dn[1] : t == 5 ? x3_dn[0] : x3_dn[2])
+                                               : gate_up ? (t < 4 ? x3_gu[t] : x3_dn[1]) : x3_dn[t];
+            opd[at.plane[q][gd ? slot_gd[t] : gate_up ? slot_gu[t] : slot_dn[t]]] = RAD_WTAB(run[(size_t)(q * half)], half);
         }
     rad_issue(c_, op_h, opd, at.n_opd, rows);
 }
@@ -2308,7 +2382,13 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_aq, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     brow_slice(iqr_a.q8, r0, rows, g.n_embd),
                     brow_slice(iqr_a.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK));
-    if (c.expert_exl3)
+    /* ds41 E10: the decode band's fused chain, in place of the split gate_up here and down below (declared only under
+     * RADIANCE_DS41_E10_GD; the switch e10_gd read at every issue) */
+    const bool x3gd = c.expert_exl3 && op_x3gd && rows >= EXL3_GD_MIN_ROWS && rows <= x3gd_hi &&
+                      ds41_e10_gd_flag().load(std::memory_order_relaxed) == 1;
+    if (x3gd)
+        issue_exl3(c_, op_x3gd, EXL3_GU_DN, rows, brow_slice(w.h.x, r0, rows, g.n_embd), brows(w.edn, rows * k));
+    else if (c.expert_exl3)
         issue_exl3(c_, op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                    brows(b_x3h, rows * k));
     else if (c.expert_iqr)
@@ -2346,7 +2426,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     else if (!c.expert_exl3)   /* EXL3: inside gate_up */
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !lane1) gq_sh.step(c_, w.sgu, T, r0, rows);
-    if (c.expert_exl3)
+    /* ds41 E10: with the fused chain the down projection is done already -- x3gd first, so it never falls through to
+     * another format's down (fn4's 156 defect, fixed in c112d7db) */
+    if (x3gd) {
+        /* moe_exl3_gate_up_down wrote edn */
+    } else if (c.expert_exl3)
         issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_dn, rows, brows(iqr_d.q8, rows * k), brows(iqr_d.s8, rows * k),
