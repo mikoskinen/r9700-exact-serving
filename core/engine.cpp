@@ -1896,6 +1896,42 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             else
                 RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out,
                                       &acc));
+            /* RADIANCE_DEBUG_TREE_STEPS=N (lever T1, a verify-path trace; nothing else changes): the first N
+             * verifies of a tree step, one line each -- the request's committed output length, the entry's
+             * staged rows read back from the card (token ids, positions, spec_parent), the host's draft and
+             * parents, every row's target token, the acceptance and its path. */
+            static const int tree_trace_n = [] {
+                const char* v = std::getenv("RADIANCE_DEBUG_TREE_STEPS");
+                return v && *v ? (int)std::strtol(v, nullptr, 10) : 0;
+            }();
+            static int tree_traced = 0;
+            if (tree && tree_trace_n > 0 && tree_traced < tree_trace_n && e.n_spec < 64) {
+                ++tree_traced;
+                int64_t r0 = 0;
+                for (size_t j = 0; j < i; ++j) r0 += plan.e[j].n_tokens;
+                const int64_t nr = e.n_tokens;
+                std::vector<int32_t> ids((size_t)nr, -9), pos((size_t)nr, -9), par((size_t)nr, -9);
+                auto rd = [&](const int32_t* dev, std::vector<int32_t>& h) {
+                    if (dev && rad_memcpy_async(h.data(), dev + r0, nr * 4, ranks_[0]->ctx.stream()) >= 0)
+                        (void)rad_stream_sync(ranks_[0]->ctx.stream());
+                };
+                rd(b->token_ids, ids);
+                rd(b->positions, pos);
+                rd(b->spec_parent, par);
+                auto join = [](const int32_t* v, int64_t n) {
+                    std::string s;
+                    for (int64_t k = 0; k < n; ++k) s += fmt("%s%d", k ? " " : "", (int)v[k]);
+                    return s;
+                };
+                const int32_t* tg = &so.rows[(size_t)so.first_row[i]];
+                RAD_INFO("tree trace: step %d seq %llu out %lld ctx %d nspec %d rows %lld | ids %s | pos %s | "
+                         "spec_parent %s | draft %s | parent %s | target %s | acc %d path %s",
+                         b->step, (unsigned long long)e.seq, (long long)e.req->output.size(), (int)e.ctx_len,
+                         (int)e.n_spec, (long long)nr, join(ids.data(), nr).c_str(), join(pos.data(), nr).c_str(),
+                         join(par.data(), nr).c_str(), join(e.draft, e.n_spec).c_str(),
+                         e.draft_parent ? join(e.draft_parent, e.n_spec).c_str() : "chain",
+                         join(tg, e.n_spec + 1).c_str(), (int)acc, join(path, acc).c_str());
+            }
 
             /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
