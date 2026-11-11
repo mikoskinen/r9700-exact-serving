@@ -140,6 +140,7 @@ void DraftController::step_time(int depth, int n_rows, double ms, double tokens,
     if (!adapt_ || depth < (depth0_ ? 0 : 1) || depth > p_.max_depth || n_rows < 1 ||
         !(ms > 0.0) || !std::isfinite(ms))
         return;
+    lent_seen_ = lend == kLendLent;   /* lever Z0-H: the lend's state at the last step */
     /* A plain step still warming up (kPlainWarm) is no sample. */
     if (depth == 0 && zero_run_ <= 1 + kPlainWarm) return;
     /* The drafter's lend (lever DL): a step while its slab moved is no sample; a drafting step
@@ -435,7 +436,11 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
         bool borrowed = false;
         const double g_0 = (double)n_rows / plain_ms(n_rows, &borrowed);
         if (borrowed) ++n_borrow_;
-        const bool want = zero_ ? !(g_d > g_0 * (1.0 + kHyst)) : g_0 > g_d * (1.0 + kHyst);
+        /* Lever Z0-H: leaving a lent 0 (or one the lend is about to take) needs draft_lend_hyst % more yield. */
+        const bool lent_zero = zero_ && lend_hyst_ > 0 && lend_hold() > 0 && (lent_seen_ || lend_wanted());
+        const double hyst = lent_zero ? std::fmax(kHyst, 0.01 * (double)lend_hyst_) : kHyst;
+        const bool want = zero_ ? !(g_d > g_0 * (1.0 + hyst)) : g_0 > g_d * (1.0 + kHyst);
+        if (lent_zero && want && g_d > g_0 * (1.0 + kHyst) && zero_held_ >= kHold) ++n_lend_hyst_;
         if (want != zero_ && zero_held_ >= kHold) {
             RAD_DEBUG("draft window: head depth %d -> %d over %d rows (%.3f -> %.3f tokens a ms)",
                       zero_ ? 0 : dd, want ? 0 : dd, n_rows, want ? g_d : g_0, want ? g_0 : g_d);

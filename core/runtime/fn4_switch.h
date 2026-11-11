@@ -59,6 +59,12 @@
  *                   (outside --host-pool-mib, the plan unchanged) and its slab is carved for the trunk;
  *                   the value is the start value. Unset: nothing declared, and 1 is refused. Exact:
  *                   placement only. The counters are GET's "lend" object (state_json).
+ *   draft_lend_hyst scheduler (lever Z0-H, sched/draft.h DraftController::lend_hyst): 0 off (kHyst, 2 %, throughout);
+ *                   1 .. 100: while the drafter's slab is lent or the lend is wanted, a move from depth 0 to drafting
+ *                   needs the window's yield to beat the lent plain step's by that many percent (at least kHyst); a
+ *                   move back to 0 and every move while not lent keep kHyst. Starts 0 (no environment). Above 0
+ *                   refused unless the lend is set up (RADIANCE_DRAFT_LEND at start). Exact: it moves only D7's
+ *                   choice of depth. GET's "lend" object counts the cycles it held 0 (hyst_holds).
  *   draft_lend_borrow  scheduler (lever DL, sched/draft.h kBorrowMin / kBorrowDamp): 1 a cost class with no lent
  *                   plain step of its own prices its plain step with the nearest class's lent ratio (16 samples
  *                   at least; a lower class's as it is, a higher one's gain damped 0.75 a class step), 0 not.
@@ -173,7 +179,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
-              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kSwitches };
+              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDraftLendHyst, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -207,7 +213,7 @@ void lend_register(bool capable);
  * ms; the probe back-off's doublings now and the probe interval they give. */
 void note_lend_sched(int64_t lent_cycles, int64_t plain_steps, int64_t plain_ms, int64_t probe_steps,
                      int64_t probe_ms, int64_t transit_steps, int64_t transit_ms, int64_t backoff_k,
-                     int64_t probe_interval, int64_t borrow_cycles = 0);
+                     int64_t probe_interval, int64_t borrow_cycles = 0, int64_t hyst_holds = 0);
 /* The engine, at every step release: the lend's state over the ranks (0 resident, 1 moving, 2 lent), rank 0's
  * lends and recalls begun, trunk units in the drafter's memory, the drafter's units in VRAM and in all, and
  * the drafter's slab in MiB. */

@@ -4630,6 +4630,48 @@ TEST(staying_at_zero_is_priced_at_the_lent_plain_step) {
     CHECK(off.zero_moves() > mo);
 }
 
+/* Lever Z0-H, the lend's hysteresis (draft_lend_hyst): at a lent 0 (unlent plain step 15 ms, lent 14), the text turns
+ * predictable enough (0.98 a position) that the best window yields 4 x 5.71 tokens in 70 ms (0.326 a ms), 14 % past the
+ * lent plain step's 0.286. With kHyst alone (the switch 0) 0 is left; at 10 % it is left too; at 20 % it holds, and
+ * the holds are counted; with the lend off the same 20 % does not act (the unlent plain step, kHyst). A move back to 0
+ * keeps kHyst (draft.cpp: the drafting side of the decision is unchanged). */
+TEST(the_lend_hysteresis_holds_a_lent_zero_against_a_window_that_gains_less_than_it) {
+    DraftAdapt u[4];
+    DraftAdapt* zf[4];
+    DraftController z = zero_controller(3, 1, u, zf);
+    for (int t = 0; t < 8; ++t) {
+        (void)z.plan_step(zf, 4, 4);
+        if (!z.head_runs()) z.step_time(0, 4, 15.0);
+    }
+    for (int k = 0; k < 8; ++k) z.step_time(0, 4, 14.0, -1.0, DraftController::kLendLent);
+    CHECK_NEAR(z.plain_ms(4), 14.0, 1e-6);
+    CHECK_EQ(z.lend_hyst(), 0);
+    DraftController h10 = z, h20 = z, off = z;
+    h10.set_lend_hyst(10);
+    h20.set_lend_hyst(20);
+    CHECK_EQ(h20.lend_hyst(), 20);
+    h20.set_lend_hyst(101);
+    CHECK_EQ(h20.lend_hyst(), 100);   /* clamped (fn4 refuses 101) */
+    h20.set_lend_hyst(20);
+    off.set_lend(0);
+    off.set_lend_hyst(20);
+    for (int i = 0; i < 4; ++i) u[i] = estimate(z, 0.98, 0.98);
+    const int64_t mz = z.zero_moves(), m10 = h10.zero_moves(), m20 = h20.zero_moves(), mo = off.zero_moves();
+    for (int t = 0; t < 600; ++t) {
+        (void)z.plan_step(zf, 4, 4);
+        (void)h10.plan_step(zf, 4, 4);
+        (void)h20.plan_step(zf, 4, 4);
+        (void)off.plan_step(zf, 4, 4);
+    }
+    CHECK(z.zero_moves() > mz);
+    CHECK(h10.zero_moves() > m10);
+    CHECK_EQ(h20.zero_moves(), m20);
+    CHECK(h20.lend_hyst_holds() > 0);
+    CHECK_EQ(z.lend_hyst_holds(), (int64_t)0);
+    CHECK(off.zero_moves() > mo);
+    CHECK_EQ(off.lend_hyst_holds(), (int64_t)0);
+}
+
 /* The borrow (draft_lend_borrow): a cost class with no lent ratio of its own prices its plain step with the
  * nearest class's (kBorrowMin samples at least), a lower class's as it is, a higher one's gain damped kBorrowDamp
  * a class step. Off, pricing is 9461f81's exactly. The case D7 meets at c4: lent at c8 (40 -> 35.72 ms, the

@@ -334,6 +334,9 @@ public:
      * neighbour's (DraftController::kBorrowMin, kBorrowDamp), 0 not. Refused (left 0) unless the lend
      * is set up. Returns the value the scheduler now runs. */
     int      set_draft_lend_borrow(int v);
+    /* fn4 draft_lend_hyst (lever Z0-H, DraftController::lend_hyst): 0 off, 1 .. 100 the percent a move off a lent
+     * depth 0 must gain. Refused (left as it is) above 0 unless the lend is set up. Returns the value it now runs. */
+    int      set_draft_lend_hyst(int v);
     /* Lever DL: the engine's view of the drafter's lend (Engine::serve, once the movers set it up):
      * `view` returns DraftController::LendSample's state over every rank (resident, transit, lent)
      * and writes the transitions so far; `capable` whether any slab can be lent. Without it the

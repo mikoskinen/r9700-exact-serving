@@ -866,6 +866,8 @@ int Engine::prepare_release(const RadBatch* b) {
                 fn4::note_sched(fn4::kDraftLend, sched_.set_draft_lend(sw[fn4::kDraftLend]));
             if (sw[fn4::kDraftLendBorrow] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftLendBorrow, sched_.set_draft_lend_borrow(sw[fn4::kDraftLendBorrow]));
+            if (sw[fn4::kDraftLendHyst] != fn4::kNoChange)   /* lever Z0-H */
+                fn4::note_sched(fn4::kDraftLendHyst, sched_.set_draft_lend_hyst(sw[fn4::kDraftLendHyst]));
             /* The depth-0 context skip: the engine's own (block_context_pass); 1 only where set up (fn4 refuses
              * it otherwise). */
             if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {

@@ -128,6 +128,16 @@ int Scheduler::set_draft_lend_borrow(int v) {
     return draft_.borrow() ? 1 : 0;
 }
 
+int Scheduler::set_draft_lend_hyst(int v) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v > 0 && !lend_capable_)
+        RAD_WARN("fn4: draft_lend_hyst=%d refused: the drafter's lend is not set up (RADIANCE_DRAFT_LEND unset at "
+                 "start, or no drafter slab to lend)", v);
+    else if (v >= 0 && v <= 100)
+        draft_.set_lend_hyst(v);
+    return draft_.lend_hyst();
+}
+
 void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) {
     std::lock_guard<std::mutex> lk(mu_);
     lend_view_ = std::move(view);
@@ -141,6 +151,7 @@ void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) 
         RAD_WARN("RADIANCE_DRAFT_LEND_BORROW=1: the drafter's lend is not set up; off");
         draft_.set_borrow(false);
     }
+    if (!lend_capable_ && draft_.lend_hyst() != 0) draft_.set_lend_hyst(0);
     if (lend_view_) {
         uint64_t ch = 0;
         dl_state_ = lend_view_(&ch);
@@ -149,6 +160,7 @@ void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) 
     fn4::lend_register(lend_capable_);
     fn4::note_sched(fn4::kDraftLend, draft_.lend());
     fn4::note_sched(fn4::kDraftLendBorrow, draft_.borrow() ? 1 : 0);
+    fn4::note_sched(fn4::kDraftLendHyst, draft_.lend_hyst());
     if (lend_capable_ && draft_.borrow())
         RAD_INFO("draft lend borrow: a cost class with no lent plain step of its own prices it with the nearest "
                  "class's lent ratio (%lld samples at least; a lower class's as it is, a higher one's gain x %.2f "
@@ -419,6 +431,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     lent_plain_ms_ = lent_probe_ms_ = transit_ms_ = 0.0;
     fn4::note_sched(fn4::kDraftLend, draft_.lend());
     fn4::note_sched(fn4::kDraftLendBorrow, draft_.borrow() ? 1 : 0);
+    fn4::note_sched(fn4::kDraftLendHyst, draft_.lend_hyst());
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
      * row, is measured. */
@@ -3310,7 +3323,8 @@ void Scheduler::step_finished() {
     if (lend_view_)
         fn4::note_lend_sched(lent_cycles_, lent_plain_steps_, (int64_t)(lent_plain_ms_ + 0.5), lent_probe_steps_,
                              (int64_t)(lent_probe_ms_ + 0.5), transit_steps_, (int64_t)(transit_ms_ + 0.5),
-                             draft_.backoff_k(), draft_.probe_interval(), draft_.borrow_cycles());
+                             draft_.backoff_k(), draft_.probe_interval(), draft_.borrow_cycles(),
+                             draft_.lend_hyst_holds());
     last_step_at_ = step_end;
     /* So a second call, or one on a loop iteration that ran no step, charges nothing. */
     step_start_ = {};

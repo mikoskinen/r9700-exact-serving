@@ -288,6 +288,18 @@ public:
     void set_borrow(bool on) { borrow_ = on; }
     /* Depth-0 decisions whose plain step was priced with a borrowed ratio. For the report. */
     int64_t borrow_cycles() const { return n_borrow_; }
+    /* Lever Z0-H, the lend's hysteresis (fn4 draft_lend_hyst, percent; 0 = off = kHyst throughout): while the
+     * drafter's slab is lent or the lend is wanted, a move from depth 0 to drafting needs the window's yield to beat
+     * the (lent) plain step's by max(kHyst, draft_lend_hyst %) instead of kHyst. Each move off a lent 0 costs what
+     * kHyst does not price: the reclaim's transit steps (hy-z0prof c4nat2, 11.11.2026: 91 steps at 43 ms against
+     * 24.7 ms plain), the plain steps unlent until the lend holds again (lend_hold() cycles plus two probe
+     * intervals) and the fill; at c4, where the measured yields sit within a few percent (stack2: drafting 0.153
+     * tokens a ms, lent plain 0.157-0.163), D7 then flipped 10-28 times a 75 s phase after a 1-user phase. A move
+     * back to 0, and every move while not lent, keep kHyst. Exact: it moves only D7's choice of depth. */
+    int  lend_hyst() const { return lend_hyst_; }
+    void set_lend_hyst(int v) { lend_hyst_ = v < 0 ? 0 : v > 100 ? 100 : v; }
+    /* Cycles at which the lend's hysteresis held 0 where kHyst alone would have moved. For the report. */
+    int64_t lend_hyst_holds() const { return n_lend_hyst_; }
     /* Whether the head drafts this cycle: false only while depth 0 holds D at 0, or a plain probe
      * runs. A block drafter's context pass runs either way; its query pass and every verify row
      * do not. */
@@ -425,6 +437,10 @@ private:
     int64_t lent_rn_[kCostClasses] = {};
     bool    borrow_ = false;
     int64_t n_borrow_ = 0;
+    /* Lever Z0-H (lend_hyst()): the switch, the last step's lend state as step_time saw it, the holds. */
+    int32_t lend_hyst_ = 0;
+    bool    lent_seen_ = false;
+    int64_t n_lend_hyst_ = 0;
     /* The ratio class `c` borrows (kBorrowMin, kBorrowDamp), or 0 when no neighbour has one. */
     double  borrowed_ratio(int c) const;
     bool    zero_now() const {

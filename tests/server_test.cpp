@@ -5203,7 +5203,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
                        "\"lent_probe_steps\": 2, \"lent_probe_ms\": 300, \"transit_steps\": 9, \"transit_ms\": 450, "
                        "\"backoff_k\": 3, \"probe_interval\": 128, \"state\": 2, \"lends\": 1, \"reclaims\": 0, "
                        "\"lent_units\": 237, \"draft_resident\": 0, \"draft_units\": 96, \"slab_mib\": 2151, "
-                       "\"borrow_cycles\": 0}"));
+                       "\"borrow_cycles\": 0, \"hyst_holds\": 0}"));
     /* The borrow: 0 / 1, refused unless the lend is set up; its count at the end of "lend". */
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_borrow":2})").status, 400);
     fn4::note_sched(fn4::kDraftLendBorrow, 0);
@@ -5214,7 +5214,29 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128, 41);
     const HttpResponse g2 = f.get("/admin/fn4");
     CHECK(has(g2.body, "\"draft_lend\": 1, \"draft_lend_borrow\": 1"));
-    CHECK(has(g2.body, "\"slab_mib\": 2151, \"borrow_cycles\": 41}"));
+    CHECK(has(g2.body, "\"slab_mib\": 2151, \"borrow_cycles\": 41, \"hyst_holds\": 0}"));
+    /* Lever Z0-H, the lend's hysteresis: 0 .. 100, above 0 refused unless the lend is set up; its count last in "lend". */
+    CHECK(has(g2.body, "\"draft_lend_hyst\": 0"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":101})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":-1})").status, 400);
+    fn4::note_sched(fn4::kDraftLendHyst, 0);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":20})").status, 200);
+    CHECK(fn4::apply_pending(33, sw));
+    CHECK_EQ(sw[fn4::kDraftLendHyst], 20);
+    CHECK_EQ(sw[fn4::kDraftLend], fn4::kNoChange);
+    fn4::note_sched(fn4::kDraftLendHyst, 20);
+    fn4::note_lend_sched(100, 80, 3200, 2, 300, 9, 450, 3, 128, 41, 7);
+    const HttpResponse g3 = f.get("/admin/fn4");
+    CHECK(has(g3.body, "\"draft_lend_hyst\": 20"));
+    CHECK(has(g3.body, "\"borrow_cycles\": 41, \"hyst_holds\": 7}"));
+    fn4::lend_register(false);
+    const HttpResponse h0 = f.post("/admin/fn4", R"({"draft_lend_hyst":20})");
+    CHECK_EQ(h0.status, 400);
+    CHECK(has(h0.body, "no drafter expert slab to lend"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend_hyst":0})").status, 200);   /* 0 is always taken */
+    CHECK(fn4::apply_pending(34, sw));
+    fn4::note_sched(fn4::kDraftLendHyst, 0);
+    fn4::lend_register(true);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
     CHECK_EQ(sw[fn4::kDraftLend], -1);

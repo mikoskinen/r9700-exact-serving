@@ -24,7 +24,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "drafter_mx", "drafter_bf",
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
-                                        "dspark_walk" };
+                                        "dspark_walk", "draft_lend_hyst" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -51,7 +51,7 @@ struct State {
     std::atomic<int> applied_step{-1};
     std::atomic<int64_t> cnt[6];   /* note_draft_counts */
     std::atomic<int> lend_capable{-1};   /* -1 no scheduler registered, 0 / 1 */
-    std::atomic<int64_t> lend[17];       /* note_lend_sched [0, 9) and 16, note_lend_engine [9, 16) */
+    std::atomic<int64_t> lend[18];       /* note_lend_sched [0, 9), 16 and 17, note_lend_engine [9, 16) */
     std::atomic<int64_t> acc[4];         /* note_draft_accept */
     std::atomic<int> ctxskip_capable{-1};   /* -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> ctxs[8];        /* note_ctxskip */
@@ -156,7 +156,7 @@ int reported(State& s, int i) {
 bool sched_switch(int i) {
     return i == kDraftAdaptive || i == kDraftDepth0 || i == kDraftProbe || i == kDraftHybrid ||
            i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow ||
-           i == kDraftCtxSkip;
+           i == kDraftCtxSkip || i == kDraftLendHyst;
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -230,12 +230,13 @@ void note_ctxskip(int64_t skipped, int64_t refill_passes, int64_t refill_rows, i
 
 void note_lend_sched(int64_t lent_cycles, int64_t plain_steps, int64_t plain_ms, int64_t probe_steps,
                      int64_t probe_ms, int64_t transit_steps, int64_t transit_ms, int64_t backoff_k,
-                     int64_t probe_interval, int64_t borrow_cycles) {
+                     int64_t probe_interval, int64_t borrow_cycles, int64_t hyst_holds) {
     State& s = st();
     const int64_t v[9] = { lent_cycles, plain_steps, plain_ms, probe_steps, probe_ms, transit_steps, transit_ms,
                            backoff_k, probe_interval };
     for (int k = 0; k < 9; ++k) s.lend[k].store(v[k], std::memory_order_relaxed);
     s.lend[16].store(borrow_cycles, std::memory_order_relaxed);
+    s.lend[17].store(hyst_holds, std::memory_order_relaxed);
 }
 
 void note_lend_engine(int64_t state, int64_t lends, int64_t reclaims, int64_t lent_units, int64_t draft_resident,
@@ -272,7 +273,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
-                        "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, epoch_bump)";
+                        "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, draft_lend_hyst, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -287,6 +288,21 @@ bool check(const std::string& name, int v, std::string* err) {
                 *err = std::string("draft_probe_backoff=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no scheduler has registered a drafter"
                                 : "this deployment's drafter cannot run the adaptive window");
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftLendHyst) {
+        if (v < 0 || v > 100) {
+            if (err) *err = "draft_lend_hyst takes 0 (off) .. 100 (percent a move off a lent depth 0 must gain)";
+            return false;
+        }
+        const int cap = s.lend_capable.load(std::memory_order_acquire);
+        if (v > 0 && cap != 1) {
+            if (err)
+                *err = std::string("draft_lend_hyst=") + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "the drafter's lend is not set up: RADIANCE_DRAFT_LEND was not set at start"
+                                : "the drafter's lend is not set up here: no drafter expert slab to lend");
             return false;
         }
         return true;
@@ -575,12 +591,13 @@ std::string state_json() {
     o += "}";
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {
-        static const char* const kLend[17] = { "lent_cycles", "lent_plain_steps", "lent_plain_ms", "lent_probe_steps",
+        static const char* const kLend[18] = { "lent_cycles", "lent_plain_steps", "lent_plain_ms", "lent_probe_steps",
                                                "lent_probe_ms", "transit_steps", "transit_ms", "backoff_k",
                                                "probe_interval", "state", "lends", "reclaims", "lent_units",
-                                               "draft_resident", "draft_units", "slab_mib", "borrow_cycles" };
+                                               "draft_resident", "draft_units", "slab_mib", "borrow_cycles",
+                                               "hyst_holds" };
         o += ", \"lend\": {\"capable\": " + std::to_string(cap);
-        for (int k = 0; k < 17; ++k)
+        for (int k = 0; k < 18; ++k)
             o += std::string(", \"") + kLend[k] + "\": " +
                  std::to_string((long long)s.lend[k].load(std::memory_order_relaxed));
         o += "}";
