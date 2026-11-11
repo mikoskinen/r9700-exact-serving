@@ -1105,6 +1105,8 @@ static void bi_read_env() {
     }
 }
 static bool bi_declared() { return g_sw_bi_env.load(std::memory_order_relaxed) >= 0; }
+static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
+static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -3153,6 +3155,16 @@ static const char* bt_dir() {
 /* Lever BI at the end of a declare (RADIANCE_DS41_BI set): each prefill segment's cu view plane and its op. */
 static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (!bi_declared()) return RAD_OK;
+    /* The all-reduce + post-collapse-norm collectives (RADIANCE_DS41_AR_PCN) take the step's rows whole; step_bi issues
+     * the all-reduce and the fused norms apart, so the two are not combined: lever BI stays undeclared (1 refused). */
+    bool arpcn = m.ar_pcn_fin != 0;
+    for (const Layer& L : m.layers) arpcn = arpcn || L.ar_pcn_f || L.ar_pcn_a;
+    if (arpcn) {
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever BI not declared: RADIANCE_DS41_AR_PCN's collectives take a step's "
+                            "rows whole (unset it to use RADIANCE_DS41_BI)\n");
+        return RAD_OK;
+    }
     m.bi_cu = decl_b(b, m.nm.f("bi_cu"), RAD_I32, { m.g.max_seqs + 1, 2 }, RAD_BUF_PERSIST);
     if (!m.bi_cu) return RAD_E_INVAL;
     m.bi_sub = op(b, "sub_i32", { RAD_RANGE("M", 1, 2) }, {}, {}, { m.bi_cu });
@@ -3490,8 +3502,6 @@ struct BiSeg {
     bool dec = false;
     int k = -1;   /* bi_cu's row (a prefill segment), -1 for the batch's cu */
 };
-static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
-static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
 static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0};
 /* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
  * segment, decode rows within the norms' width): step() then runs today's issue. Prefill sequences' bounds from the
