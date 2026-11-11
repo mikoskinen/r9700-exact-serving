@@ -1156,7 +1156,9 @@ static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 10
  * RADIANCE_DS41_PSK=0 / off declares it and starts at 0, 1 / on at 1; unset declares nothing (1 refused, today's issue).
  * Cut: a step with one prefill sequence and no decode rows (any ds41_bi), and the prefill segments of a step ds41_bi
  * segments. Not cut: a step asking more logits rows than its decode rows + one a prefill sequence (prompt logprobs),
- * score-only / generator / encoder / plugin-word passes, a calibration (--calib-layers) serve. */
+ * score-only / generator / encoder / plugin-word passes, a calibration (--calib-layers) serve.
+ * ds41_psk 2 (diagnostic, ds41-psk-fix): every step value 1 hands to step_bi goes there as at 1, with no layer cut (the
+ * cone = every row) -- step_bi's issue against step()'s, the cut taken out. */
 static std::atomic<int> g_sw_psk{0}, g_sw_psk_ok{0}, g_sw_psk_env{-2};   /* env: -2 unread, -1 unset */
 static std::atomic<long long> g_psk_steps{0}, g_psk_rows{0};
 static void psk_read_env() {
@@ -1197,7 +1199,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_bi"))
         return value == 0 || (value >= 1 && value <= 4 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))
-        return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || ((value == 1 || value == 2) && g_sw_psk_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -3780,6 +3782,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     int64_t psk_pre = 0, psk_dec = 0;
     for (const BiSeg& s : sg) (s.dec ? psk_dec : psk_pre) += s.dec ? s.n : 1;
     const bool psk = psk_step_ok(m, batch, psk_pre, psk_dec);
+    const bool psk_cut = psk && g_sw_psk.load(std::memory_order_relaxed) == 1;   /* ds41_psk 2: the path, no cut */
     if (!psk_only) {   /* rank 0, every 512 segmented steps: the counts (MoE passes a layer summed over those steps: the launch cost of P) */
         const long long n = g_bi_steps.load(std::memory_order_relaxed);
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0)
@@ -3888,7 +3891,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const int64_t r = L.r;
         /* lever PSK: from m.psk_first on, each prefill segment longer than its cone runs its last C_l rows */
         bool cut = false;
-        if (psk && l >= m.psk_first) {
+        if (psk_cut && l >= m.psk_first) {
             const int64_t C = kPskBase + (c.n_layer - 1 - l) * c.window;
             psk_sg = sg;
             for (BiSeg& s : psk_sg)
