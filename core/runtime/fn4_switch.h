@@ -159,6 +159,59 @@
  *                   value); unset: 1..4 refused. A step with
  *                   one segment runs today's issue either way. Changes the bytes of rows that shared a step with other
  *                   sequences (toward their alone bytes); a one-sequence step is unchanged.
+ *   sched_bi_chunk  scheduler (lever BI, class (ii)): how a prefill's chunk boundaries are planned beside other work
+ *                   (core/sched/scheduler.cpp bi_chunk_plan): 0 today's (budget cuts, busy-chunk share); 1 alone's
+ *                   boundaries, the step budget --max-num-batched-tokens; 2 the checkpoint-interval grid, alone too;
+ *                   3 / 4 alone's pieces, beside other work cut on the interval / RADIANCE_SCHED_BI_GRID (1024) grid
+ *                   inside them, >= 128 rows a side. RADIANCE_SCHED_BI_CHUNK at start; unset = 0. The scheduler reads
+ *                   it at every step it plans, and a change is applied at a step release (after that step was
+ *                   planned), so the value takes effect from the next planned step: an A/B pins it, runs one short
+ *                   request, then measures. A prefill in flight keeps nothing of the old value's plan except the rest
+ *                   of an alone piece 3 / 4 cut in two, which runs whole under any value.
+ *   sched_interleave scheduler (lever DST): --prefill-interleave's count, the decode-only steps (admitting nothing)
+ *                   after a prefill chunk that ran beside decoding sequences and left its prompt unfinished
+ *                   (Scheduler::step, interleave_left_). 0 .. 64 (the flag's range): 0 = no hold, a chunk may ride
+ *                   every step; -1 = back to the flag (which may be auto). Unset: the flag; GET reports the flag's
+ *                   value (-1 = auto) until a value is set. Read at every step planned; applied at a step release,
+ *                   so it acts from the next planned step: a hold under way is cut to the new count when that is
+ *                   smaller (0 ends it), a larger count arms after the next chunk. Timing only: it moves which
+ *                   step carries a chunk, never a chunk's own plan rules (the chunk's rows may still differ with
+ *                   what that step carries, as today's cuts beside decode rows do; sched_bi_chunk 3 / 4 keep them
+ *                   on the grid).
+ *   sched_mixed_tok scheduler (lever DST): the token budget of a step that is not a lone prefill's span step (the
+ *                   shared budget, ChunkGeometry::shared_tok, 2112 at MNBT 4160 / interval 2048 / span 2): 128 ..
+ *                   shared_tok, a multiple of the quantum; 0 = back to shared_tok (the start value; GET reports
+ *                   the budget in force). Only under --prefill-span > 1 (refused otherwise) and only smaller: the
+ *                   plugin's arenas were sized for shared_tok (RadBuildCtx::max_mixed_tok). Under sched_bi_chunk 0
+ *                   the chunk beside decode rows is cut as today from the smaller budget (budget less the rows
+ *                   ahead, the busy-chunk share; off the interval grid); under 3 / 4 (option D) the cut grid inside
+ *                   alone's piece is min(G, the largest divisor of the interval, a multiple of the quantum, that
+ *                   leaves 64 rows of the budget to decode rows) -- 2112 / 1088 / 576 give 2048 / 1024 / 512-row
+ *                   mixed chunks on the grid, >= 128 rows a side; under 1 (A: the step budget stays MNBT) and 2
+ *                   (B: whole intervals) it has no effect. Read at every step planned; a prefill in flight keeps
+ *                   its position and takes its next chunk at the new budget (an alone piece 3 / 4 cut in two
+ *                   keeps its piece; the rest is cut on the new grid).
+ *   sched_short_bypass scheduler (lever DST): 0 off (today); N (a multiple of the quantum, up to
+ *                   --max-num-batched-tokens; 1280 / 2112 the A/B values): on a step the interleave holds (decode rows
+ *                   only, no admission today), a WAITING request is admitted when its uncached rest (after its prefix
+ *                   hit, as an admission computes it) is at most N rows AND is one whole piece of its alone plan (the
+ *                   chunk an idle engine plans from the same position: span, interval, tail checkpoint) AND fits what
+ *                   the step has left; it runs that one piece, so its rows are cut exactly as alone. Everything else
+ *                   waits as today (a request turned away for length is not asked again on held steps); running
+ *                   prefills stay held, and the held step counts toward the hold as a decode-only step, so the long
+ *                   prefill's chunks and their timing are unchanged by it (under sched_bi_chunk 4 a request no longer
+ *                   waiting at the long prefill's next chunk takes no grid step from it: that cut can be the larger grid
+ *                   point). Composes with sched_bi_chunk 0 .. 4 and ds41_bi's per-sequence segments. Read at every step
+ *                   planned; GET "dst" counts the bypassed and the turned-away admissions.
+ *   sched_bypass_total scheduler (lever DST, with sched_short_bypass N > 0): 0 = the bypass takes a request only when its
+ *                   uncached rest is ONE alone piece (above); T (a multiple of the quantum, up to 65536; 4096 the A/B value)
+ *                   = it takes a waiting request whose uncached rest is at most T rows and then runs it piece by piece,
+ *                   held steps included, until its prompt is done: each piece the next piece of its alone plan when that
+ *                   is at most N and fits the step (alone's boundaries and checkpoints); under sched_bi_chunk 3 / 4 an
+ *                   alone piece that does not is cut on the checkpoint-interval grid inside it, >= 128 rows a side
+ *                   (option D's own rule, so exact as D is: alone's span pieces of a long conversation's tail are 4096
+ *                   rows, over a held step's ~2112). Under 0 / 1 / 2 such a request is turned away (an ordinary
+ *                   admission). With either switch back to 0 a request taken this way continues as an ordinary prefill.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -232,7 +285,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
-              kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSwitches };
+              kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
+              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -290,6 +344,23 @@ void note_sample(int64_t rows_sampled, int64_t rows_greedy, int64_t rounds_bound
 bool dspark_conf_value_ok(int v);
 /* The applied value of a core switch without the lock (the step path reads it each step); -1 unregistered. */
 int  get(int i);
+/* Lever BI's chunking (sched_bi_chunk): the switch once set, else RADIANCE_SCHED_BI_CHUNK (0 .. 4) at start, else 0.
+ * The scheduler reads it at every step it plans. */
+int  sched_bi_chunk();
+/* Lever DST. The scheduler, at its init: --prefill-interleave as configured (-1 auto), the shared budget a non-lone step
+ * is planned at (ChunkGeometry::shared_tok), whether a shared step exists (--prefill-span > 1), and the chunk quantum.
+ * sched_interleave(): the switch once set (0 .. 64), else -1 (the flag applies). sched_mixed_tok(): the switch once set
+ * (a budget), else 0 (shared_tok applies). The scheduler reads both at every step it plans. */
+void sched_register(int interleave_flag, int64_t shared_tok, bool shared_capable, int64_t quantum, int64_t max_tok = 0);
+int  sched_interleave();
+int  sched_mixed_tok();
+/* Lever DST, sched_short_bypass: the switch once set, else 0 (off). The scheduler reads it at every step it plans, and
+ * after every step reports its counts (GET "dst"): requests the bypass admitted on a held step, and requests it turned
+ * away because their uncached rest is longer than N or is not one piece of their alone plan. */
+int  sched_short_bypass();
+/* sched_bypass_total: the switch once set, else 0 (the bypass takes one-piece requests only). */
+int  sched_bypass_total();
+void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
 /* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
  * "accept"; under draft_depth0 2 every head draft is a probe's). */
 void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted);

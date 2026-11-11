@@ -41,6 +41,15 @@ struct SchedReq {
      * returned with the sequence's KV (free_kv, preempt_back). */
     int32_t  card = -1;
     bool     running = false;
+    /* Lever BI chunking 3 (Scheduler::bi_chunk_plan): the alone piece [bi_beg, bi_end) this request runs in two halves, and
+     * the checkpoint its end carries; valid while bi_beg < n_computed < bi_end. */
+    int64_t  bi_beg = 0, bi_end = 0, bi_ckpt = -1;
+    /* Lever DST (sched_short_bypass): an admission on a held step turned this request away because its uncached rest is
+     * longer than the bypass or not one alone piece; held steps do not ask it again (its next admission is an ordinary one). */
+    bool     bypass_no = false;
+    /* sched_bypass_total: the bypass took this request; it runs its alone plan piece by piece (Scheduler::bypass_piece),
+     * held steps included, until its prompt is done. */
+    bool     bypass_run = false;
 
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
@@ -639,6 +648,24 @@ private:
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
+    /* Lever BI's chunking (RADIANCE_SCHED_BI_CHUNK at start; 0 = today): a prefill chunk whose rows do not depend on what
+     * else is in the step, or none this step (bi_chunk_plan). */
+    int           bi_chunk_ = 0;
+    /* Lever DST (fn4 sched_interleave / sched_mixed_tok, read at every step planned): the decode-only steps after a
+     * chunk beside decoding sequences in force (--prefill-interleave's value until the switch is set; -1 auto), and
+     * the budget of a step that is not a lone prefill's span step (ChunkGeometry::shared_tok until the switch is set,
+     * never above it). dst_grid(): under sched_bi_chunk 3 / 4 with a smaller budget, the cut grid that budget holds
+     * (0: none smaller than the policy's own). */
+    int64_t       il_now_ = 0;
+    int64_t       mixed_now_ = 0;
+    int64_t       dst_grid() const;
+    /* sched_short_bypass in force (0 off), and its counts (fn4 GET "dst") */
+    int64_t       bypass_now_ = 0;
+    int64_t       bypass_total_ = 0;   /* sched_bypass_total in force (0: one-piece requests only) */
+    int64_t       bypass_piece(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* ckpt);
+    int64_t       n_bypassed_ = 0, n_bypass_refused_ = 0;
+    int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
+                                bool share = false);
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;
@@ -1013,7 +1040,7 @@ private:
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap); 0 plans the chunk on the whole budget. */
-    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0);
+    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0, int64_t whole_max = 0);
     /* Positive sentinel from admit_one: the request waits (its context is still being read off
      * disk, or a preempted prefill has no room yet) and the walk may ask the one behind it. */
     static constexpr int kAdmitWait = 1;

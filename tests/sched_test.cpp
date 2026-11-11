@@ -6,11 +6,14 @@
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
 #include "sched/scheduler.h"
+#include "runtime/fn4_switch.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
 #include "server/sink.h"
 
 #include <algorithm>
+#include <map>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -9122,3 +9125,765 @@ TEST(forced_depth_zero_holds_zero_but_for_the_probes) {
     CHECK(!f.sch.draft().depth0_forced());
     CHECK_EQ(f.sch.set_draft_depth0(0), 0);
 }
+
+/* ================================================== lever DST: fn4 sched_interleave / sched_mixed_tok
+ * The decode-only steps after a chunk and the shared budget beside decode rows, as in-process switches read at every
+ * step planned. Set here as the engine sets them: a request, applied at a step release (fn4::apply_pending) between a
+ * commit and the next step. The fn4 state is the process's, so every test puts the switches back. */
+namespace {
+struct DstSwitches {
+    ~DstSwitches() {
+        set("sched_interleave", -1); set("sched_mixed_tok", 0); set("sched_bi_chunk", 0);
+        set("sched_short_bypass", 0); set("sched_bypass_total", 0);
+    }
+    static bool set(const char* name, int v) {
+        std::string err;
+        if (!fn4::request(name, v, &err)) return false;
+        int sw[fn4::kSwitches];
+        (void)fn4::apply_pending(0, sw);
+        return true;
+    }
+};
+
+/* The DS41 line's geometry: interval 2048, MNBT 4160, span 2 (shared budget 2112), the stager's 1024-row floor. */
+void dst_fixture(Fixture& f, int64_t interleave) {
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefill_interleave = interleave;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1024);
+}
+
+/* One step of a long prompt `p` beside decoders: 'C' when it carries a chunk of p, 'D' otherwise; the chunk's start and
+ * length, and the step's tokens. */
+struct DstStep { char kind; int64_t at, n, tok; bool all_dec; };
+DstStep dst_step(Fixture& f, uint64_t p, const std::vector<uint64_t>& dec) {
+    DstStep d{ 'D', -1, 0, 0, true };
+    CHECK(f.sch.step() != nullptr);
+    const StepPlan& pl = f.sch.plan();
+    d.tok = pl.n_tok;
+    for (uint64_t id : dec) {
+        bool in = false;
+        for (const StepEntry& e : pl.e) in = in || (e.seq == id && !e.is_prefill);
+        d.all_dec = d.all_dec && in;
+    }
+    for (const StepEntry& e : pl.e)
+        if (e.seq == p && e.is_prefill) { d.kind = 'C'; d.at = e.ctx_len; d.n = e.n_tokens; }
+    f.commit_plain(12);
+    return d;
+}
+}  // namespace
+
+TEST(dst_switches_check_and_report) {
+    DstSwitches restore;
+    Fixture f;
+    dst_fixture(f, 8);
+    CHECK_EQ(f.sch.geometry().shared_tok, 2112);
+    std::string err;
+    CHECK_EQ(fn4::value(fn4::kSchedInterleave), 8);        /* unset: the flag */
+    CHECK_EQ(fn4::value(fn4::kSchedMixedTok), 2112);       /* unset: the shared budget */
+    CHECK(fn4::check("sched_interleave", 0, &err));
+    CHECK(fn4::check("sched_interleave", 64, &err));
+    CHECK(fn4::check("sched_interleave", -1, &err));
+    CHECK(!fn4::check("sched_interleave", 65, &err));
+    CHECK(!fn4::check("sched_interleave", -2, &err));
+    CHECK(fn4::check("sched_mixed_tok", 0, &err));
+    CHECK(fn4::check("sched_mixed_tok", 1088, &err));
+    CHECK(fn4::check("sched_mixed_tok", 576, &err));
+    CHECK(fn4::check("sched_mixed_tok", 2112, &err));
+    CHECK(fn4::check("sched_mixed_tok", 128, &err));
+    CHECK(!fn4::check("sched_mixed_tok", 2176, &err));     /* above the arenas' budget */
+    CHECK(!fn4::check("sched_mixed_tok", 64, &err));       /* under 128 */
+    CHECK(!fn4::check("sched_mixed_tok", 1000, &err));     /* not a multiple of the quantum (64 here) */
+    CHECK(DstSwitches::set("sched_interleave", 0));
+    CHECK_EQ(fn4::value(fn4::kSchedInterleave), 0);
+    CHECK_EQ(fn4::sched_interleave(), 0);
+    CHECK(DstSwitches::set("sched_interleave", -1));
+    CHECK_EQ(fn4::value(fn4::kSchedInterleave), 8);
+    CHECK_EQ(fn4::sched_interleave(), -1);
+    CHECK(DstSwitches::set("sched_mixed_tok", 1088));
+    CHECK_EQ(fn4::value(fn4::kSchedMixedTok), 1088);
+    CHECK_EQ(fn4::sched_mixed_tok(), 1088);
+    CHECK(DstSwitches::set("sched_mixed_tok", 0));
+    CHECK_EQ(fn4::value(fn4::kSchedMixedTok), 2112);
+    CHECK_EQ(fn4::sched_mixed_tok(), 0);
+    /* No shared step without a span: the budget is refused, the way back accepted. */
+    Fixture g;
+    g.build();
+    CHECK_OK(g.start());
+    CHECK(!fn4::check("sched_mixed_tok", 128, &err));
+    CHECK(fn4::check("sched_mixed_tok", 0, &err));
+}
+
+/* The interleave from the next planned step: a hold under way is cut to a smaller count, 0 puts a chunk in every step,
+ * -1 goes back to the flag. Chunks keep their plan: every chunk beside the decoder is 2048 rows at an interval. */
+TEST(dst_interleave_switch_acts_from_the_next_planned_step) {
+    DstSwitches restore;
+    Fixture f;
+    dst_fixture(f, 8);
+    const uint64_t d = f.submit(100, 4000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(40000, 4);
+    std::string shape;
+    int bad_chunk = 0;
+    auto run = [&](int n) {
+        for (int k = 0; k < n; ++k) {
+            const DstStep s = dst_step(f, p, { d });
+            shape += s.kind;
+            if (s.kind == 'C') bad_chunk += !(s.n == 2048 && s.at % 2048 == 0);
+        }
+    };
+    run(12);
+    CHECK_EQ(shape, std::string("CDDDDDDDDCDD"));          /* the flag's 8 */
+    CHECK(DstSwitches::set("sched_interleave", 2));        /* 6 of this hold left: cut to 2, then 2 after each chunk */
+    shape.clear();
+    run(7);
+    CHECK_EQ(shape, std::string("DDCDDCD"));
+    CHECK(DstSwitches::set("sched_interleave", 0));        /* the hold ends: a chunk every step */
+    shape.clear();
+    run(4);
+    CHECK_EQ(shape, std::string("CCCC"));
+    CHECK(DstSwitches::set("sched_interleave", -1));       /* the flag again, from the next chunk */
+    shape.clear();
+    run(11);
+    CHECK_EQ(shape, std::string("CDDDDDDDDCD"));
+    CHECK_EQ(bad_chunk, 0);
+}
+
+/* The shared budget: beside a decoder no step is wider than it, under today's cuts (sched_bi_chunk 0) too; a decoder
+ * BEHIND the long prompt in the running order keeps its row in every step (the busy-chunk floor is at most half the
+ * budget); 0 is the geometry's budget again. */
+TEST(dst_mixed_tok_is_the_budget_beside_decode_rows) {
+    DstSwitches restore;
+    Fixture f;
+    dst_fixture(f, 0);
+    const uint64_t p = f.submit(30000, 4);
+    CHECK(f.sch.step() != nullptr);                        /* alone: the first interval */
+    f.commit_plain(11);
+    const uint64_t d = f.submit(100, 4000);                /* behind p in the running order */
+    for (int k = 0; k < 3; ++k) { CHECK(f.sch.step() != nullptr); f.commit_plain(11); }
+    for (int mt : { 1088, 576, 2112 }) {
+        CHECK(DstSwitches::set("sched_mixed_tok", mt == 2112 ? 0 : mt));
+        int wide = 0, dropped = 0, chunks = 0;
+        for (int k = 0; k < 6; ++k) {
+            const DstStep s = dst_step(f, p, { d });
+            if (s.kind != 'C') continue;
+            ++chunks;
+            wide += s.tok > mt;
+            dropped += !s.all_dec;
+        }
+        CHECK(chunks >= 5);
+        CHECK_EQ(wide, 0);
+        CHECK_EQ(dropped, 0);
+    }
+}
+
+/* Under option D (sched_bi_chunk 3 / 4) a smaller budget cuts on the grid it holds: 1088 -> 1024-row and 576 -> 512-row
+ * mixed chunks on their grid (3 too: no wait for a 2048 cut the budget cannot hold), 2112 -> 2048; every piece >= 128
+ * rows; the plan is a function of the switches, not of how many decode rows ride along (1 or 4 decoders, the same
+ * boundaries). */
+TEST(dst_mixed_tok_cuts_on_its_grid_under_option_d) {
+    /* alone's pieces of the 20000-token prompt (an idle engine's plan_chunk walk): a piece under 128 rows is allowed
+     * only where alone has it too */
+    std::vector<std::pair<int64_t, int64_t>> alone;
+    {
+        Fixture a;
+        dst_fixture(a, 0);
+        for (int64_t n = 0; n < 20000; ) {
+            int64_t ck = -1;
+            const int64_t c = a.sch.plan_chunk(n, 20000, a.cfg.max_tok, &ck);
+            if (c <= 0) break;
+            alone.push_back({ n, n + c });
+            n += c;
+        }
+        CHECK(alone.size() >= 5);
+        CHECK_EQ(alone.back().second, (int64_t)20000);
+    }
+    auto alone_end = [&](int64_t e) {
+        for (const auto& pc : alone) if (pc.second == e) return true;
+        return false;
+    };
+    auto alone_piece = [&](int64_t b, int64_t e) {
+        for (const auto& pc : alone) if (pc.first == b && pc.second == e) return true;
+        return false;
+    };
+    for (int opt : { 3, 4 })
+        for (int mt : { 2112, 1088, 576 }) {
+            std::vector<int64_t> ends[2];
+            for (int nd = 0; nd < 2; ++nd) {
+                DstSwitches restore;
+                Fixture f;
+                dst_fixture(f, 0);
+                CHECK(DstSwitches::set("sched_bi_chunk", opt));
+                CHECK(DstSwitches::set("sched_mixed_tok", mt == 2112 ? 0 : mt));
+                std::vector<uint64_t> dec;
+                for (int i = 0; i < (nd ? 4 : 1); ++i) dec.push_back(f.submit(100, 4000));
+                CHECK(f.sch.step() != nullptr);
+                f.commit_plain(11);
+                const uint64_t p = f.submit(20000, 4);
+                const int64_t want = mt == 2112 ? 2048 : mt == 1088 ? 1024 : 512;
+                int off = 0, small = 0, chunks = 0, starved = 0;
+                int64_t done = 0;
+                for (int k = 0; k < 200 && done < 20000; ++k) {
+                    const DstStep s = dst_step(f, p, dec);
+                    if (s.kind != 'C') { ++starved; continue; }
+                    ++chunks;
+                    done = s.at + s.n;
+                    ends[nd].push_back(done);
+                    off += !(s.n <= want && (done % want == 0 || alone_end(done)));
+                    small += s.n < 128 && !alone_piece(s.at, done);
+                }
+                CHECK_EQ(done, (int64_t)20000);
+                CHECK(chunks >= 20000 / want);
+                CHECK_EQ(off, 0);
+                CHECK_EQ(small, 0);
+                CHECK_EQ(starved, 0);
+            }
+            CHECK(ends[0] == ends[1]);
+        }
+}
+
+/* Set to the flag's count and to the geometry's budget, the switches plan every step as unset does. */
+TEST(dst_switches_at_their_start_values_plan_as_unset) {
+    std::vector<std::vector<std::pair<uint64_t, int32_t>>> plans[2];
+    for (int m = 0; m < 2; ++m) {
+        DstSwitches restore;
+        Fixture f;
+        dst_fixture(f, 8);
+        if (m) { CHECK(DstSwitches::set("sched_interleave", 8)); CHECK(DstSwitches::set("sched_mixed_tok", 2112)); }
+        f.submit(100, 4000);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        f.submit(9000, 4);
+        f.submit(700, 4);
+        for (int k = 0; k < 80; ++k) {
+            if (!f.sch.step()) break;
+            std::vector<std::pair<uint64_t, int32_t>> row;
+            for (const StepEntry& e : f.sch.plan().e) row.push_back({ e.seq, e.n_tokens });
+            plans[m].push_back(row);
+            f.commit_plain(12);
+        }
+    }
+    CHECK(plans[0].size() >= 40);
+    CHECK(plans[0] == plans[1]);
+}
+
+/* ================================================== lever DST: sched_short_bypass
+ * On a step the interleave holds, a waiting request whose uncached rest is one alone piece of at most N rows runs that
+ * piece whole; the long prefill stays held and the held step still counts toward the hold. */
+TEST(dst_short_bypass_check_and_report) {
+    DstSwitches restore;
+    Fixture f;
+    dst_fixture(f, 8);
+    std::string err;
+    CHECK_EQ(fn4::value(fn4::kSchedShortBypass), 0);
+    CHECK(fn4::check("sched_short_bypass", 0, &err));
+    CHECK(fn4::check("sched_short_bypass", 1280, &err));
+    CHECK(fn4::check("sched_short_bypass", 2112, &err));
+    CHECK(fn4::check("sched_short_bypass", 4160, &err));     /* up to --max-num-batched-tokens */
+    CHECK(!fn4::check("sched_short_bypass", 4224, &err));
+    CHECK(!fn4::check("sched_short_bypass", 1000, &err));    /* not a multiple of the quantum (64 here) */
+    CHECK(!fn4::check("sched_short_bypass", -1, &err));
+    CHECK(DstSwitches::set("sched_short_bypass", 1280));
+    CHECK_EQ(fn4::value(fn4::kSchedShortBypass), 1280);
+    CHECK_EQ(fn4::sched_short_bypass(), 1280);
+    CHECK(DstSwitches::set("sched_short_bypass", 0));
+    CHECK_EQ(fn4::sched_short_bypass(), 0);
+    CHECK_EQ(fn4::value(fn4::kSchedBypassTotal), 0);
+    CHECK(fn4::check("sched_bypass_total", 4096, &err));
+    CHECK(fn4::check("sched_bypass_total", 65536, &err));
+    CHECK(!fn4::check("sched_bypass_total", 1000, &err));    /* not a multiple of the quantum */
+    CHECK(!fn4::check("sched_bypass_total", 65600, &err));
+    CHECK(DstSwitches::set("sched_bypass_total", 4096));
+    CHECK_EQ(fn4::sched_bypass_total(), 4096);
+    CHECK(DstSwitches::set("sched_bypass_total", 0));
+    CHECK_EQ(fn4::sched_bypass_total(), 0);
+}
+
+namespace {
+/* A decoder, a 40000-token prompt p, and -- on the first held step after p's first chunk -- newcomers of the given lengths.
+ * Per request: its pieces (start, rows) in order and the step each started; p's step shape (C / D). */
+struct BypassRun {
+    std::string shape;
+    std::map<uint64_t, std::vector<std::pair<int64_t, int64_t>>> pieces;
+    std::map<uint64_t, int> first_step;
+    std::vector<uint64_t> ids;   /* the newcomers, in submit order */
+    uint64_t p = 0;
+    int64_t bypassed = 0;
+};
+BypassRun bypass_run(int bic, int bypass, const std::vector<int>& lens, int steps, bool seed_hit = false) {
+    BypassRun out;
+    DstSwitches restore;
+    Fixture f;
+    dst_fixture(f, 8);
+    CHECK(DstSwitches::set("sched_bi_chunk", bic));
+    CHECK(DstSwitches::set("sched_short_bypass", bypass));
+    const uint64_t d = f.submit(100, 4000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    out.p = f.submit(40000, 4);
+    bool sent = false;
+    for (int k = 0; k < steps; ++k) {
+        if (!f.sch.step()) break;
+        bool chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (!e.is_prefill) continue;
+            if (e.seq == out.p) chunk = true;
+            if (!out.pieces.count(e.seq)) out.first_step[e.seq] = k;
+            out.pieces[e.seq].push_back({ e.ctx_len, e.n_tokens });
+        }
+        out.shape += chunk ? 'C' : 'D';
+        f.commit_plain(12);
+        if (!sent && chunk) {   /* p's first chunk ran: the next steps are held */
+            if (seed_hit) { f.pc.seed(4096); f.pc.lin = 4096; f.pc.src = 3; }
+            for (int n : lens) out.ids.push_back(f.submit(n, 64));
+            sent = true;
+        }
+    }
+    (void)d;
+    f.sch.step_finished();   /* the engine's call after a step: it reports the bypass counts to fn4 */
+    std::string g = fn4::state_json();
+    const size_t at = g.find("\"bypassed\": ");
+    out.bypassed = at == std::string::npos ? -1 : std::atoll(g.c_str() + at + 12);
+    return out;
+}
+/* alone's pieces of an n-token prompt from `from` (an idle engine's plan_chunk walk) */
+std::vector<std::pair<int64_t, int64_t>> alone_pieces(int64_t n, int64_t from = 0) {
+    std::vector<std::pair<int64_t, int64_t>> v;
+    Fixture a;
+    dst_fixture(a, 0);
+    for (int64_t c = from; c < n; ) {
+        int64_t ck = -1;
+        const int64_t q = a.sch.plan_chunk(c, n, a.cfg.max_tok, &ck);
+        if (q <= 0) break;
+        v.push_back({ c, q });
+        c += q;
+    }
+    return v;
+}
+}  // namespace
+
+/* A 1000-token newcomer arriving during a hold runs on the next (held) step as its alone piece, under every sched_bi_chunk
+ * (without the bypass it runs at the next chunk step at the earliest -- under 1 / 3 / 4, whose pieces are whole or nothing,
+ * not before the long prompt leaves it room, which in this window it never does);
+ * a 3000-token one (over N) waits for the next chunk step as today; p's step shape is the same with and without the bypass,
+ * and p's chunk boundaries too under 1 (A) and 3 (D3; option 4's give may move them along its grid). */
+TEST(dst_short_bypass_admits_a_short_newcomer_on_a_held_step) {
+    const auto alone1000 = alone_pieces(1000);
+    CHECK(alone1000.size() == 1);
+    for (int bic : { 0, 1, 3, 4 }) {
+        const BypassRun off = bypass_run(bic, 0, { 1000, 3000 }, 40);
+        const BypassRun on = bypass_run(bic, 1280, { 1000, 3000 }, 40);
+        CHECK_EQ(on.shape, off.shape);
+        const uint64_t q1 = on.ids[0], q2 = on.ids[1];
+        const int c1 = (int)on.shape.find('C');
+        /* the step a request's first piece ran, -1 when none ran in the window (option D can keep a newcomer waiting until
+         * the long prompt ends: the starvation the bypass exists for) */
+        auto fs = [](const BypassRun& r, uint64_t id) { auto it = r.first_step.find(id); return it == r.first_step.end() ? -1 : it->second; };
+        CHECK_EQ(fs(on, q1), c1 + 1);                            /* the first held step */
+        CHECK(on.pieces.count(q1) && on.pieces.at(q1) == alone1000);   /* one piece, alone's */
+        const int off1 = fs(off, off.ids[0]);
+        CHECK(off1 < 0 || off1 > c1 + 1);                         /* today: the next chunk step at the earliest */
+        if (bic == 0) CHECK(off1 > c1 + 1);                       /* A (1), D (3 / 4): may wait for the whole prompt */
+        const int s2 = fs(on, q2);                                /* over N: an ordinary admission, never on a held step */
+        CHECK(s2 < 0 || (s2 > c1 + 1 && on.shape[(size_t)s2] == 'C'));
+        CHECK_EQ(on.bypassed, 1);
+        if (bic == 1 || bic == 3) CHECK(on.pieces.at(on.p) == off.pieces.at(off.p));
+        if (bic == 4) for (const auto& pc : on.pieces.at(on.p)) CHECK_EQ((pc.first + pc.second) % 1024, 0);
+        /* N = 2112: a 2000-token newcomer is one alone piece and fits the held step */
+        const BypassRun big = bypass_run(bic, 2112, { 2000 }, 20);
+        CHECK_EQ(fs(big, big.ids[0]), (int)big.shape.find('C') + 1);
+        CHECK(big.pieces.count(big.ids[0]) && big.pieces.at(big.ids[0]) == alone_pieces(2000));
+    }
+}
+
+/* A prefix hit with a short uncached tail (the Claude Code turn): taken on a held step where the tail is one alone piece
+ * (4600 tokens, hit 4096: the 504-row rest), left for an ordinary admission where alone would split it (5000 tokens: alone
+ * cuts at its tail checkpoint 4992, so the 904-row rest is two pieces). */
+TEST(dst_short_bypass_takes_a_prefix_hit_tail_only_as_one_alone_piece) {
+    const BypassRun on = bypass_run(0, 1280, { 4600, 5000 }, 30, /*seed_hit=*/true);
+    const uint64_t qa = on.ids[0], qb = on.ids[1];
+    const int c1 = (int)on.shape.find('C');
+    CHECK_EQ(on.first_step.at(qa), c1 + 1);
+    CHECK(on.pieces.at(qa) == alone_pieces(4600, 4096));
+    CHECK(alone_pieces(5000, 4096).size() == 2);
+    CHECK(on.first_step.at(qb) > c1 + 1);
+    CHECK(on.shape[(size_t)on.first_step.at(qb)] == 'C');
+}
+
+/* ================================================== lever DST: sched_bypass_total (the bypass, piece by piece)
+ * With sched_bypass_total T, the bypass takes a waiting request whose uncached rest is at most T and runs its alone plan
+ * piece by piece, held steps included: alone's boundaries and checkpoints; under sched_bi_chunk 3 / 4 an alone piece over
+ * the held step (a long conversation's 4096-row span piece) is cut on the interval grid inside it, >= 128 rows a side. */
+namespace {
+struct Piece { int64_t at, n, ck; int step; bool operator==(const Piece& o) const { return at == o.at && n == o.n && ck == o.ck; } };
+struct TotalRun {
+    std::string shape;
+    std::map<uint64_t, std::vector<Piece>> pieces;
+    std::vector<uint64_t> ids;
+    uint64_t p = 0;
+};
+/* dst_fixture (+ prefix_exact / span_min when `ds`: the DS41 line's exact resume and its 16384-token span floor); a
+ * decoder; a 40000-token prompt p; on the first held step after p's first chunk a prefix hit of `hit` tokens is seeded (0:
+ * none) and the newcomers of `lens` arrive. Every prefill piece with its checkpoint position (-1: none). */
+TotalRun total_run(int bic, int n, int total, const std::vector<int>& lens, int steps, int64_t hit, bool ds) {
+    TotalRun out;
+    DstSwitches restore;
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefill_interleave = 8;
+    f.cfg.prefix_exact = ds;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1024);
+    if (ds) f.sch.set_span_min(16384);
+    CHECK(DstSwitches::set("sched_bi_chunk", bic));
+    CHECK(DstSwitches::set("sched_short_bypass", n));
+    CHECK(DstSwitches::set("sched_bypass_total", total));
+    f.submit(100, 4000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    out.p = f.submit(40000, 4);
+    bool sent = false;
+    for (int k = 0; k < steps; ++k) {
+        if (!f.sch.step()) break;
+        bool chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (!e.is_prefill) continue;
+            if (e.seq == out.p) chunk = true;
+            out.pieces[e.seq].push_back({ e.ctx_len, e.n_tokens, e.ckpt_slot >= 0 ? e.ctx_len + e.ckpt_tok + 1 : -1, k });
+        }
+        out.shape += chunk ? 'C' : 'D';
+        f.commit_plain(12);
+        if (!sent && chunk) {
+            if (hit > 0) { f.pc.seed((int32_t)hit); f.pc.lin = (int32_t)hit; f.pc.src = 3; }
+            for (int l : lens) out.ids.push_back(f.submit(l, 64));
+            sent = true;
+        }
+    }
+    (void)DstSwitches::set("sched_bypass_total", 0);
+    return out;
+}
+/* alone's pieces of an n-token prompt from `from`, with checkpoints, on total_run's geometry (an idle engine's walk: a
+ * prompt of >= 16384 tokens spans under `ds`) */
+std::vector<Piece> alone_ck(int64_t n, int64_t from, bool ds) {
+    std::vector<Piece> v;
+    Fixture a;
+    a.build(8192, 64, 4160, 60000);
+    a.cfg.checkpoint_interval = 2048;
+    a.cfg.prefill_span = 2;
+    a.cfg.prefix_exact = ds;
+    CHECK_OK(a.start());
+    const bool span = !ds || n >= 16384;
+    for (int64_t c = from; c < n; ) {
+        int64_t ck = -1;
+        /* plan_chunk answers for a span outside a step; a prompt under the span floor is planned as one that does not */
+        const int64_t q = span ? a.sch.plan_chunk(c, n, a.cfg.max_tok, &ck) : a.sch.plan_chunk(c, n, 2048, &ck);
+        if (q <= 0) break;
+        v.push_back({ c, q, ck, 0 });
+        c += q;
+    }
+    return v;
+}
+bool same_pieces(const std::vector<Piece>& a, const std::vector<Piece>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) if (!(a[i] == b[i])) return false;
+    return true;
+}
+}  // namespace
+
+/* The 904-row tail (prompt 5000, hit 4096) that one-piece bypass turns away (alone splits it at its tail checkpoint 4992, in
+ * the fixture's nearest-resume geometry): with T 4096 it runs on two consecutive held steps as alone's two pieces with
+ * alone's checkpoint; a rest over T (prompt 9000: 4904 rows) is left to an ordinary admission; p's steps keep their shape. */
+TEST(dst_bypass_total_runs_a_split_tail_piece_by_piece) {
+    const auto alone = alone_ck(5000, 4096, false);
+    CHECK_EQ(alone.size(), (size_t)2);
+    CHECK_EQ(alone[0].ck, 4992);
+    for (int bic : { 0, 3 }) {
+        TotalRun off = total_run(bic, 1280, 0, { 5000, 9000 }, 30, 4096, false);
+        TotalRun on = total_run(bic, 1280, 4096, { 5000, 9000 }, 30, 4096, false);
+        CHECK_EQ(on.shape, off.shape);
+        const int c1 = (int)on.shape.find('C');
+        const auto& qa = on.pieces[on.ids[0]];
+        CHECK(same_pieces(qa, alone));
+        CHECK(qa.size() == 2 && qa[0].step == c1 + 1 && qa[1].step == c1 + 2);   /* two held steps in a row */
+        for (const auto& pc : on.pieces[on.ids[1]]) CHECK(on.shape[(size_t)pc.step] == 'C');   /* over T: never held */
+        if (bic == 3) CHECK(same_pieces(on.pieces[on.p], off.pieces[off.p]));
+    }
+}
+
+/* The DS41 geometry (exact resume, span from 16384 tokens). A fresh 3000-token prompt is alone's two interval pieces: two
+ * held steps under 0 and 3. A long conversation's 3000-row tail (prompt 17336, hit 14336 on the resume grid) is ONE alone
+ * span piece over the held step: turned away under 0 (an ordinary admission), cut on the interval (16384) under 3, so
+ * 2048 + 952 rows on two held steps. The long prompt's plan is the same with and without the bypass under 3. */
+TEST(dst_bypass_total_on_the_ds_geometry) {
+    const auto fresh = alone_ck(3000, 0, true);
+    CHECK_EQ(fresh.size(), (size_t)2);
+    const auto tail = alone_ck(17336, 14336, true);
+    CHECK_EQ(tail.size(), (size_t)1);                       /* alone: one 3000-row span piece */
+    for (int bic : { 0, 3 }) {
+        TotalRun off = total_run(bic, 2112, 0, { 3000 }, 30, 0, true);
+        TotalRun on = total_run(bic, 2112, 4096, { 3000 }, 30, 0, true);
+        CHECK_EQ(on.shape, off.shape);
+        const int c1 = (int)on.shape.find('C');
+        const auto& q = on.pieces[on.ids[0]];
+        CHECK(same_pieces(q, fresh));
+        CHECK(q.size() == 2 && q[0].step == c1 + 1 && q[1].step == c1 + 2);
+        if (bic == 3) CHECK(same_pieces(on.pieces[on.p], off.pieces[off.p]));
+        TotalRun hit = total_run(bic, 2112, 4096, { 17336 }, 30, 14336, true);
+        const auto& h = hit.pieces[hit.ids[0]];
+        CHECK(!h.empty());
+        if (bic == 0) {
+            for (const auto& pc : h) CHECK(hit.shape[(size_t)pc.step] == 'C');   /* turned away: ordinary admission */
+        } else {
+            CHECK(h.size() >= 2);
+            CHECK_EQ(h[0].at, (int64_t)14336);
+            CHECK_EQ(h[0].n, (int64_t)2048);                 /* cut on the interval, >= 128 rows a side */
+            CHECK_EQ(h[1].at, (int64_t)16384);
+            CHECK_EQ(h[1].n, (int64_t)952);
+            CHECK_EQ(h[1].ck, tail[0].ck);                   /* alone's checkpoint at the piece's end */
+            CHECK(h[0].step == (int)hit.shape.find('C') + 1 && h[1].step == h[0].step + 1);
+        }
+    }
+}
+
+/* ================================================== lever DST: a long prompt beside c4, timed (not a check)
+ * A measurement harness for the DST switches, run on request only:
+ *
+ *   RAD_SCHED_SIM_DST=1 [SIM_IL=8 SIM_MT=2112 SIM_BIC=0 SIM_BYP=0 SIM_LEN=65650 SIM_WARM=10 SIM_PF0=0.44 SIM_PFB=0.26e-3
+ *                        SIM_DEC0=0.022 SIM_DECR=0.0015 SIM_PFSYNC=0 SIM_TRACE=1 SIM_SHAPE=1 SIM_AFTER=1] sched_test sim_dst
+ *
+ * SIM_SHAPE prints every step of the window (C / D, its entries); SIM_AFTER runs 60 s past the probe's first token and
+ * prints every c4 request sent after the probe with its TTFT (a turnover the window does not see whole).
+ *
+ * r00z's loaded arm on the DS41 line's geometry (MNBT 4160, interval 2048, span 2, the stager's 1024-row floor, MAXSEQS 8,
+ * --busy-prefill-chunk auto): four closed-loop decoders (prompts 935 .. 1280 tokens, 512 tokens each, then the next
+ * request at once, as mb.py's c4) decode one token a step (r00z's window ran at depth 0); SIM_WARM s after they start, one
+ * SIM_LEN-token prompt arrives. Step cost in seconds: SIM_DEC0 + SIM_DECR per decode row, plus SIM_PF0 + SIM_PFB per
+ * prefill row when the step carries prefill rows (+ SIM_PFSYNC when they are fewer than the stager's 1024: its experts
+ * read without overlap). The defaults are fitted to r00z A (a 2048-row mixed step 0.97 s, a 4096-row lone step ~1.5 s,
+ * a c4 decode step ~28 ms): the schedule is the scheduler's own, the times an estimate. Over the long prompt's prefill
+ * window it prints the c4 tokens a second, the gaps inside a request (p50 / p90 / p99 / max), the c4 requests' TTFT
+ * (the turnovers r00z's max TPOT was), the long prompt's TTFT, and its chunks (count, sizes, off the 1024 grid). */
+TEST(sim_dst_long_prompt_beside_c4) {
+    if (!std::getenv("RAD_SCHED_SIM_DST")) return;
+    const int64_t IL = (int64_t)sim_env("SIM_IL", 8), MT = (int64_t)sim_env("SIM_MT", 2112);
+    const int BIC = (int)sim_env("SIM_BIC", 0);
+    const int64_t L = (int64_t)sim_env("SIM_LEN", 65650);
+    const double warm = sim_env("SIM_WARM", 10), pf0 = sim_env("SIM_PF0", 0.44), pfb = sim_env("SIM_PFB", 0.26e-3);
+    const double dec0 = sim_env("SIM_DEC0", 0.022), decr = sim_env("SIM_DECR", 0.0015), pfsync = sim_env("SIM_PFSYNC", 0);
+    DstSwitches restore;
+    Fixture f;
+    f.build(/*blocks=*/16384, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/L + 8192);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefill_interleave = 8;
+    f.cfg.max_seqs = 8;
+    f.cfg.prefix_exact = true;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1024);
+    f.sch.set_span_min(16384);
+    CHECK(DstSwitches::set("sched_interleave", (int)IL));
+    CHECK(DstSwitches::set("sched_mixed_tok", MT >= 2112 ? 0 : (int)MT));
+    CHECK(DstSwitches::set("sched_bi_chunk", BIC));
+    CHECK(DstSwitches::set("sched_short_bypass", (int)sim_env("SIM_BYP", 0)));
+    static const int kPrompts[] = { 1048, 935, 1247, 1021, 1180, 1280, 1129, 999, 1089, 1271, 1139, 971 };
+    int seed = 1, next_prompt = 0;
+    auto req = [&](int n, int out) {
+        auto r = f.request(n, out);
+        for (size_t k = 0; k < r->prompt.size(); ++k)
+            r->prompt[k] = 1000 + (int32_t)(((int64_t)k * 7 + seed * 131) % 60000);
+        ++seed;
+        r->ignore_eos = true;
+        return f.add(std::move(r));
+    };
+    struct Dec { uint64_t id; double sent; double first; double last; };
+    std::vector<Dec> dec;
+    for (int i = 0; i < 4; ++i) dec.push_back({ req(kPrompts[next_prompt++ % 12], 512), 0.0, -1.0, -1.0 });
+    uint64_t probe = 0;
+    double t = 0, p_sent = -1, p_first = -1;
+    std::vector<double> gin, nttft;
+    std::vector<std::pair<double, double>> turn;   /* c4 requests sent after the probe: (sent - probe sent, their TTFT) */
+    int64_t c4_win = 0, chunks = 0, off = 0, steps = 0;
+    std::map<int64_t, int> sizes;
+    while (steps < 400000) {
+        if (!probe && t >= warm) { probe = req((int)L, 16); p_sent = t; }
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        int64_t P = 0, nd = 0;
+        for (const StepEntry& e : p.e) {
+            if (e.is_prefill) P += e.n_tokens; else ++nd;
+            if (probe && e.seq == probe && e.is_prefill) {
+                ++chunks;
+                ++sizes[e.n_tokens];
+                const int64_t end = e.ctx_len + e.n_tokens;
+                off += end % 1024 != 0 && end != L;
+            }
+        }
+        const double dt = (nd ? dec0 + decr * (double)nd : 0.0) +
+                          (P ? pf0 + pfb * (double)P + (P < 1024 ? pfsync : 0.0) : 0.0);
+        if (std::getenv("SIM_SHAPE") && p_sent >= 0 && p_first < 0 && steps < 4000) {
+            std::printf("%lld %.2f %s:", (long long)steps, t, P ? "C" : "D");
+            for (const StepEntry& e : p.e)
+                std::printf(" %llu:%s%d@%d", (unsigned long long)e.seq, e.is_prefill ? "P" : "d", e.n_tokens, e.ctx_len);
+            std::printf("\n");
+        }
+        if (std::getenv("SIM_TRACE") && p_sent >= 0 && p_first < 0 && steps % 7 == 0) {
+            std::printf("step %lld t=%.2f:", (long long)steps, t);
+            for (const StepEntry& e : p.e)
+                std::printf(" %llu:%s%d@%d", (unsigned long long)e.seq, e.is_prefill ? "P" : "d", e.n_tokens, e.ctx_len);
+            std::printf("\n");
+        }
+        std::vector<std::pair<uint64_t, size_t>> before;
+        for (const StepEntry& e : p.e) before.push_back({ e.seq, e.req->output.size() });
+        CHECK_OK(f.commit(7));
+        ++steps;
+        t += dt;
+        const bool win = p_sent >= 0 && p_first < 0;
+        for (const auto& b : before) {
+            const Request* r = f.sch.find(b.first);
+            if (!r || r->output.size() <= b.second) continue;
+            if (b.first == probe) { if (p_first < 0) p_first = t; continue; }
+            for (Dec& d : dec) {
+                if (d.id != b.first) continue;
+                if (d.first < 0) {
+                    d.first = t;
+                    if (p_sent >= 0 && d.sent >= p_sent && (p_first < 0 || d.sent <= p_first)) nttft.push_back(t - d.sent);
+                    if (p_sent >= 0 && d.sent >= p_sent) turn.push_back({ d.sent - p_sent, t - d.sent });
+                } else if (win) {
+                    gin.push_back(1000.0 * (t - d.last));
+                }
+                if (win) c4_win += (int64_t)(r->output.size() - b.second);
+                d.last = t;
+            }
+        }
+        std::vector<uint64_t> c;
+        f.sch.take_completed(&c);
+        for (uint64_t id : c) {
+            (void)f.sch.reap(id);
+            for (Dec& d : dec)
+                if (d.id == id) d = { req(kPrompts[next_prompt++ % 12], 512), t, -1.0, -1.0 };
+        }
+        if (p_first >= 0 && (t > p_first + 60 || !std::getenv("SIM_AFTER"))) break;
+    }
+    if (std::getenv("SIM_AFTER")) {
+        std::printf("sim_dst turnovers (sent after the probe, s; their TTFT, s; probe TTFT %.1f):", p_first - p_sent);
+        for (const auto& x : turn) std::printf(" +%.1f:%.1f", x.first, x.second);
+        std::printf("\n");
+    }
+    std::sort(gin.begin(), gin.end());
+    std::sort(nttft.begin(), nttft.end());
+    auto pc = [&](const std::vector<double>& v, double q) { return v.empty() ? 0.0 : v[std::min(v.size() - 1, (size_t)(q * (double)v.size()))]; };
+    std::string sz;
+    for (const auto& kv : sizes) sz += std::to_string(kv.first) + "x" + std::to_string(kv.second) + " ";
+    const double w = p_first - p_sent;
+    std::printf("sim_dst IL %lld MT %lld BIC %d BYP %d: TTFT %.1f s, %lld chunks [%s], %lld ending off the 1024 grid; c4 in the "
+                "window %.1f tok/s; TPOT in a request p50 %.0f p90 %.0f p99 %.0f max %.0f ms; c4 requests sent in the window "
+                "%zu, TTFT max %.1f s\n",
+                (long long)IL, (long long)MT, BIC, (int)sim_env("SIM_BYP", 0), w, (long long)chunks, sz.c_str(), (long long)off,
+                w > 0 ? (double)c4_win / w : 0.0, pc(gin, 0.5), pc(gin, 0.9), pc(gin, 0.99), gin.empty() ? 0.0 : gin.back(),
+                nttft.size(), nttft.empty() ? 0.0 : nttft.back());
+}
+
+/* ------------------------------------------------------------------ lever BI class (ii): sched_bi_chunk 3 (option D)
+ * The fixture's geometry: interval 256, a span of two (512 alone), max_tok 576, so the shared budget is 576 - 256 = 320:
+ * 64 rows of slack beside a 256-row grid piece, as the DS line's 2112 = 2048 + 64. D cuts alone's pieces on the interval
+ * grid inside them, >= 128 rows a side; alone's own pieces otherwise. The switch is the core fn4 switch the scheduler
+ * reads at every step; each test sets it and puts it back to 0 (the process's other tests run today's chunking). */
+namespace {
+struct BiChunk {
+    explicit BiChunk(int v) { set(v); }
+    ~BiChunk() { set(0); }
+    static void set(int v) {
+        std::string err;
+        CHECK(fn4::request("sched_bi_chunk", v, &err));
+        int sw[fn4::kSwitches];
+        (void)fn4::apply_pending(-1, sw);
+        CHECK_EQ(fn4::sched_bi_chunk(), v);
+    }
+};
+/* Run `steps` steps of the fixture; the long request's prefill pieces (start, rows) in order. */
+std::vector<std::pair<int64_t, int64_t>> bi_pieces(Fixture& f, uint64_t id, int steps) {
+    std::vector<std::pair<int64_t, int64_t>> out;
+    int64_t at = 0;
+    for (int k = 0; k < steps; ++k) {
+        if (!f.sch.step()) break;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == id && e.is_prefill) {
+                out.emplace_back(at, e.n_tokens);
+                at += e.n_tokens;
+            }
+        f.commit_plain();
+    }
+    return out;
+}
+/* Alone's pieces of an L-token prompt at this geometry: the first interval, then spans of two, the rest at the end. */
+std::vector<int64_t> bi_alone_ends(int64_t L) {
+    std::vector<int64_t> e;
+    for (int64_t x = 256; x < L; x += 512) e.push_back(x);
+    e.push_back(L);
+    return e;
+}
+void bi_check_d(const std::vector<std::pair<int64_t, int64_t>>& pc, int64_t L) {
+    int64_t sum = 0;
+    const std::vector<int64_t> ae = bi_alone_ends(L);
+    for (const auto& p : pc) {
+        sum += p.second;
+        const int64_t end = p.first + p.second;
+        const bool alone_end = std::find(ae.begin(), ae.end(), end) != ae.end();
+        /* every piece ends on the grid or at one of alone's ends, and none is shorter than 128 rows unless it is alone's
+         * whole final piece, from alone's own boundary */
+        const bool alone_start = p.first == 0 || std::find(ae.begin(), ae.end(), p.first) != ae.end();
+        CHECK(alone_end || end % 256 == 0);
+        CHECK(p.second >= 128 || (end == L && alone_start));
+        if (!(alone_end || end % 256 == 0) || !(p.second >= 128 || (end == L && alone_start)))
+            std::fprintf(stderr, "    bi piece [%lld, %lld)\n", (long long)p.first, (long long)end);
+    }
+    CHECK_EQ(sum, L);
+}
+}  // namespace
+
+/* Beside a few decode rows (within the slack) D takes the grid halves of alone's spans: 256 rows a step, alone's final
+ * piece whole -- the plan the budget allows without going over it. */
+TEST(bi_chunk_d_cuts_alone_spans_on_the_grid_beside_decode_rows) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/576);
+    f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;   /* the engine's default: a prompt's tail snapshot splits no idle chunk */
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().shared_tok, 320);
+    BiChunk on(3);
+    for (int i = 0; i < 8; ++i) CHECK(f.submit(16, 4000, 0, true) != 0);
+    for (int k = 0; k < 4; ++k) { CHECK(f.sch.step() != nullptr); f.commit_plain(); }
+    const int64_t L = 3000;
+    const uint64_t a = f.submit((int)L, 2, 0, true);
+    const auto pc = bi_pieces(f, a, 60);
+    bi_check_d(pc, L);
+    /* within the budget: every piece is a 256-row grid piece but alone's 184-row final one -- no step went over */
+    for (size_t i = 0; i + 1 < pc.size(); ++i) CHECK_EQ(pc[i].second, 256);
+    CHECK_EQ(pc.back().second, 184);
+}
+
+/* More decode rows than the slack ahead of it: no grid piece fits what is left of the shared budget. D's long prefill
+ * then takes its smallest admissible piece over the shared budget (up to max_tok), so it still progresses, every piece
+ * on the grid and >= 128 rows; before this it waited as long as those rows decoded. */
+TEST(bi_chunk_d_progresses_with_more_decode_rows_than_the_slack) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/160, /*max_tok=*/576);
+    f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;
+    f.cfg.max_seqs = 128;
+    CHECK_OK(f.start());
+    BiChunk on(3);
+    for (int i = 0; i < 80; ++i) CHECK(f.submit(4, 4000, 0, true) != 0);
+    for (int k = 0; k < 4; ++k) { CHECK(f.sch.step() != nullptr); f.commit_plain(); }
+    const int64_t L = 3000;
+    const uint64_t a = f.submit((int)L, 2, 0, true);
+    const auto pc = bi_pieces(f, a, 120);
+    bi_check_d(pc, L);
+    for (const auto& p : pc) CHECK(p.second <= 576);
+}
+

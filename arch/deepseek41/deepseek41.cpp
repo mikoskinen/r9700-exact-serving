@@ -463,6 +463,8 @@ struct BiTr {
     bool on = false;
     std::string dir;
     int64_t pmax = 640;
+    int64_t pmin = 0;               /* RADIANCE_DS41_BITRACE_PMIN: rows at positions [pmin, pmax) */
+    int lmax = 1 << 30;             /* RADIANCE_DS41_BITRACE_LMAX: the layers' points below this layer only (head points kept) */
     rad_buf plane = 0;              /* [cap * max_tok, 2] i32 */
     int64_t cap = 0;                /* points a step */
     std::map<rad_buf, rad_op> op;   /* bi_rowhash over each traced buffer */
@@ -3300,6 +3302,8 @@ static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     t.on = true;
     t.dir = bt_dir();
     if (const char* e = std::getenv("RADIANCE_DS41_BITRACE_PMAX")) t.pmax = std::max<int64_t>(1, std::atoll(e));
+    if (const char* e = std::getenv("RADIANCE_DS41_BITRACE_PMIN")) t.pmin = std::max<int64_t>(0, std::atoll(e));
+    if (const char* e = std::getenv("RADIANCE_DS41_BITRACE_LMAX")) t.lmax = std::max(0, std::atoi(e));
     t.cap = 64 + 24 * (int64_t)m.c.n_layer;
     const int64_t MT = m.g.max_tok;
     t.plane = decl_b(b, m.nm.f("bi_trace_plane"), RAD_I32, { t.cap * MT, 2 }, RAD_BUF_PERSIST);
@@ -3316,14 +3320,14 @@ static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         if (!kv.second) return RAD_E_UNSUPPORTED;
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41: lever BI's tracer ON (RADIANCE_DS41_BITRACE=%s): %zu traced buffers, %lld "
-                        "points a step at most, rows at positions below %lld; passes not recorded\n",
-                t.dir.c_str(), t.op.size(), (long long)t.cap, (long long)t.pmax);
+                        "points a step at most, rows at positions %lld..%lld, layers below %d; passes not recorded\n",
+                t.dir.c_str(), t.op.size(), (long long)t.cap, (long long)t.pmin, (long long)t.pmax - 1, t.lmax);
     return RAD_OK;
 }
 /* One point: `rows` rows of `buf` as the last op left them. */
 static void bt_pt(RadCtx* x, Model& m, rad_buf buf, int64_t rows, const char* name, int l, int kind = 0) {
     auto& t = m.bt;
-    if (!t.on || !buf || rows <= 0 || t.n >= t.cap) return;
+    if (!t.on || !buf || rows <= 0 || t.n >= t.cap || l >= t.lmax) return;
     const auto it = t.op.find(buf);
     if (it == t.op.end() || !it->second) return;
     RAD_ISSUE_N(x, it->second, rows, brows(buf, rows), brow_slice(t.plane, (int64_t)t.n * m.g.max_tok, rows, 2));
@@ -3387,7 +3391,7 @@ static void bt_flush(RadCtx* x, Model& m, const RadBatch* batch) {
     }
     std::vector<int32_t> sel;
     for (int64_t r = 0; r < T; ++r)
-        if (pos[(size_t)r] >= 0 && pos[(size_t)r] < t.pmax) sel.push_back((int32_t)r);
+        if (pos[(size_t)r] >= t.pmin && pos[(size_t)r] < t.pmax) sel.push_back((int32_t)r);
     int64_t seqdec = 0, tokdec = 0;
     batch_split(batch, &seqdec, &tokdec);
     struct {

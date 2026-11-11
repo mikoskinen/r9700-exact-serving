@@ -16,6 +16,8 @@
 
 namespace rad {
 
+static int bi_chunk_env();   /* lever BI chunking (RADIANCE_SCHED_BI_CHUNK), below */
+
 /* Microseconds on the monotonic clock, for the live request table only; the step path keeps its
  * own steady_clock points. */
 static int64_t mono_us() {
@@ -198,12 +200,25 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     cfg_ = cfg;
     kv_ = kv;
     pc_ = pc;
+    {   /* lever BI's chunking: RADIANCE_SCHED_BI_CHUNK's start line once a process; the value is the fn4 switch
+         * sched_bi_chunk's, read at every step planned (step()) */
+        static const int bi = bi_chunk_env();
+        (void)bi;
+        bi_chunk_ = fn4::sched_bi_chunk();
+    }
 
     /* The engine resolves the geometry once, because the prefix cache needs its checkpoint
      * interval first; a caller without one (tests) resolves its own from prog and cfg. Both
      * must use the resolved interval, never the raw flag, so chunks split in one place. */
     if (geo) geo_ = *geo;
     else RAD_TRY(chunk_geometry_resolve(prog, cfg, &geo_));
+    /* lever DST: the flag and the shared budget the switches start from (fn4 sched_interleave / sched_mixed_tok) */
+    fn4::sched_register((int)cfg.prefill_interleave, geo_.shared_tok, cfg.prefill_span > 1, geo_.quantum, cfg.max_tok);
+    il_now_ = cfg.prefill_interleave;
+    mixed_now_ = geo_.shared_tok;
+    bypass_now_ = 0;
+    bypass_total_ = 0;
+    n_bypassed_ = n_bypass_refused_ = 0;
 
     kvgeom_ = KVGeom::of(prog.kv_groups);
     for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
@@ -1236,6 +1251,192 @@ int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
     return std::min(n_target, r.n_computed < prompt ? prompt : r.n_computed + 1);
 }
 
+/* Lever BI, class (ii) (the fn4 switch sched_bi_chunk, read at every step planned; RADIANCE_SCHED_BI_CHUNK its start
+ * value; unset / 0 = today): a long prompt's chunk
+ * boundaries must not depend on what else the engine runs, or its rows' arithmetic does (a 32- or 112-row piece takes
+ * other kernel forms than a 2048-row one; deepseek41 ds41_bi keeps a step's sequences apart, not a sequence's pieces).
+ *   1 (option A, alone's boundaries): every prefill chunk is the one an idle engine plans from the same position -- the
+ *     span where the request would span alone (2048 first, then 2 x the interval), the interval grid, the tail and the
+ *     prompt's end -- and the step budget stays --max-num-batched-tokens beside decode rows (not the span's shared
+ *     budget); a chunk that does not fit what is left of the step waits for a step that holds it whole.
+ *   2 (option B, the interval grid): no span (alone too), every prefill chunk runs to the next checkpoint-interval
+ *     boundary or the prompt's end, whole, or waits.
+ *   3 / 4 (option D, alone's boundaries on a grid): a lone prefill takes alone's piece; beside other work (the shared
+ *     budget, as today) a chunk ends at alone's piece end or on a grid G inside it -- 3: the checkpoint interval, 4:
+ *     RADIANCE_SCHED_BI_GRID (default 1024) -- leaving at least kBiMinPiece rows on both sides: the row count from which
+ *     no kernel form of the line depends on a piece's rows (the fused norms' widest thread band ends at 120, the decode /
+ *     WMMA bands at 48, the EXL3 band at 16). So every row runs in a piece of the same form band as alone (alone's small
+ *     final piece whole, from the same boundary), and the loaded boundaries land on G. When no such cut fits what is
+ *     left of the step, the step's only prefill takes its smallest admissible piece over the shared budget (up to
+ *     --max-num-batched-tokens), so it never waits on the decode rows beside it.
+ * Either way no budget cut, busy-chunk share or long-prefill fair share shortens a chunk. Request::checkpoint_at (a
+ * prefix another request starts from) still splits where it falls, as alone. */
+static int bi_chunk_env() {
+    const char* v = std::getenv("RADIANCE_SCHED_BI_CHUNK");
+    const int m = (v && v[0] >= '1' && v[0] <= '4' && !v[1]) ? v[0] - '0' : 0;
+    if (v && *v && !(m || (v[0] == '0' && !v[1])))
+        std::fprintf(stderr, "radiance: scheduler: RADIANCE_SCHED_BI_CHUNK=%s is not 0 / 1 / 2 / 3 / 4: today's chunking\n", v);
+    if (m)
+        std::fprintf(stderr, "radiance: scheduler: lever BI chunking %d (RADIANCE_SCHED_BI_CHUNK): %s; a chunk that does "
+                             "not fit the step waits\n", m,
+                     m == 1 ? "every prefill chunk on alone's boundaries (span, interval grid, tail, end)"
+                     : m == 2 ? "every prefill chunk on the checkpoint-interval grid or the prompt's end, no span"
+                     : m == 3 ? "beside other work a chunk ends on the checkpoint-interval grid inside alone's piece (each "
+                                "part >= 128 rows) or at the piece's end"
+                              : "beside other work a chunk ends on the RADIANCE_SCHED_BI_GRID grid (default 1024) inside alone's "
+                                "piece (each part >= 128 rows) or at the piece's end");
+    return m;
+}
+
+static constexpr int64_t kBiMinPiece = 128;
+
+/* RADIANCE_SCHED_BI_GRID: lever BI chunking 4's grid G (default 1024); a divisor of the interval, a multiple of 32. */
+static int64_t bi_grid_env() {
+    const char* v = std::getenv("RADIANCE_SCHED_BI_GRID");
+    const long g = v && *v ? std::strtol(v, nullptr, 10) : 1024;
+    return g >= 128 && g % 32 == 0 ? g : 1024;
+}
+
+/* Lever DST, sched_mixed_tok under sched_bi_chunk 3 / 4: the largest divisor of the checkpoint interval reached by halving,
+ * a multiple of the quantum and at least kBiMinPiece rows, that leaves kDstDecodeRoom rows of the shared budget in force to
+ * decode rows (2112 / 1088 / 576 -> 2048 / 1024 / 512 at an interval of 2048); 0 while the budget is the geometry's own
+ * (option D's grid unchanged) or without an interval. The grid is a function of the switch alone, never of the step's
+ * load, so the cut points of a prompt do not move with what else runs; only which of them a step reaches does. */
+static constexpr int64_t kDstDecodeRoom = 64;
+
+int64_t Scheduler::dst_grid() const {
+    const int64_t I = geo_.checkpoint_interval, Q = std::max<int64_t>(geo_.quantum, 1);
+    if (I <= 0 || mixed_now_ >= geo_.shared_tok) return 0;
+    int64_t d = I;
+    while (d > mixed_now_ - kDstDecodeRoom && d % 2 == 0 && (d / 2) % Q == 0 && d / 2 >= kBiMinPiece) d /= 2;
+    return d;
+}
+
+/* Lever DST, sched_bypass_total: the next piece of a request the bypass took. The alone piece holding n_computed -- the
+ * rest of one cut before (bi_beg / bi_end), or the piece an idle engine plans from n (alone's span rule as bi_chunk_plan
+ * applies it) -- whole when it is at most sched_short_bypass's N and fits the room; under sched_bi_chunk 3 / 4 otherwise
+ * cut on the checkpoint-interval grid inside it, >= kBiMinPiece rows a side (option D's rule), the largest end that fits;
+ * else 0 (the request waits for a step with room), or -1 under 0 / 1 / 2 for an alone piece over N (never runnable). */
+int64_t Scheduler::bypass_piece(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* ckpt) {
+    const int64_t n = r.n_computed;
+    if (ckpt) *ckpt = -1;
+    int64_t pb = n, pe = 0, ck = -1;
+    if (s.bi_beg < n && n < s.bi_end) {
+        pb = s.bi_beg;
+        pe = s.bi_end;
+        ck = s.bi_ckpt;
+    } else {
+        const bool keep = span_now_;
+        span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+                    (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+        const int64_t full = plan_chunk(n, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
+        span_now_ = keep;
+        if (full <= 0) return 0;
+        pe = n + full;
+        s.bi_beg = s.bi_end = 0;
+        s.bi_ckpt = -1;
+    }
+    const int64_t N = bypass_now_ > 0 ? bypass_now_ : cfg_.max_tok;
+    if (pe - n <= N) {                           /* alone's piece whole: now, or on a step with room */
+        if (pe - n > room) return 0;
+        s.bi_beg = s.bi_end = 0;
+        s.bi_ckpt = -1;
+        if (ckpt) *ckpt = ck;
+        return pe - n;
+    }
+    /* over N: only option D cuts it (the interval grid inside it, >= kBiMinPiece rows a side); -1 where no such cut is
+     * within N either (the bypass can never run it: an ordinary prefill from here) */
+    const int64_t I = geo_.checkpoint_interval;
+    if ((bi_chunk_ != 3 && bi_chunk_ != 4) || I <= 0) return -1;
+    auto cut = [&](int64_t lim) -> int64_t {
+        for (int64_t e = (n + lim) / I * I; e > n; e -= I)
+            if (e < pe && e - n >= kBiMinPiece && pe - e >= kBiMinPiece) return e;
+        return 0;
+    };
+    if (!cut(N)) return -1;
+    const int64_t e = room > 0 ? cut(std::min(N, room)) : 0;
+    if (!e) return 0;
+    s.bi_beg = pb;
+    s.bi_end = pe;
+    s.bi_ckpt = ck;
+    return e - n;
+}
+
+int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
+                                 bool share) {
+    const int64_t n = r.n_computed;
+    if (checkpoint_pos) *checkpoint_pos = -1;
+    /* the alone piece holding n: [pb, pe) and the checkpoint its end carries -- the rest of one cut short before, or the
+     * piece an idle engine plans from n (n is then one of alone's boundaries) */
+    int64_t pb = n, pe = 0, ck = -1;
+    if (bi_chunk_ >= 3 && s.bi_beg < n && n < s.bi_end) {
+        pb = s.bi_beg;
+        pe = s.bi_end;
+        ck = s.bi_ckpt;
+    } else {
+        const bool keep = span_now_;
+        span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+                    (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+        const int64_t full = plan_chunk(n, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
+        span_now_ = keep;
+        if (full <= 0) return 0;
+        pe = n + full;
+        s.bi_beg = s.bi_end = 0;
+        s.bi_ckpt = -1;
+    }
+    auto whole = [&]() -> int64_t {
+        s.bi_beg = s.bi_end = 0;
+        s.bi_ckpt = -1;
+        if (checkpoint_pos) *checkpoint_pos = ck;
+        return pe - n;
+    };
+    if (bi_chunk_ <= 2 || span_now_) return pe - n <= room ? whole() : 0;   /* 1 / 2, or a lone prefill: the piece */
+    /* 3 / 4 beside other work (option D): an end on the grid G (3: the interval, 4: RADIANCE_SCHED_BI_GRID) inside the
+     * piece leaving at least kBiMinPiece rows on both sides, or the piece's end; the largest that fits the room. A piece
+     * that cannot be cut and does not fit the shared budget runs whole over it when it is the step's first prefill
+     * (else it would wait as long as anything decodes beside it). */
+    static const int64_t G4 = bi_grid_env();
+    const int64_t I = geo_.checkpoint_interval;
+    int64_t G = bi_chunk_ == 3 ? I : G4;
+    /* lever DST: a smaller shared budget (sched_mixed_tok) cuts on the grid it holds, so a mixed chunk is that grid step */
+    if (const int64_t gm = dst_grid(); gm > 0 && gm < G) G = gm;
+    /* 4 with another prefill behind it or a request waiting (today's busy-chunk share): one grid step left for it */
+    const int64_t give = bi_chunk_ == 4 && share ? G : 0;
+    for (int64_t pass = give > 0 ? 0 : 1; pass < 2; ++pass) {
+        const int64_t rm = pass == 0 ? room - give : room;
+        if (pe - n <= rm) return whole();
+        if (G <= 0 || rm <= 0) continue;
+        for (int64_t e = (n + rm) / G * G; e > n; e -= G) {
+            if (e >= pe) continue;
+            if (e - n >= kBiMinPiece && pe - e >= kBiMinPiece) {
+                s.bi_beg = pb;
+                s.bi_end = pe;
+                s.bi_ckpt = ck;
+                return e - n;
+            }
+        }
+    }
+    /* Nothing fits what is left of the step (the decode rows planned ahead took the shared budget's slack, or the piece
+     * cannot be cut): the step's only prefill takes its smallest admissible piece -- the first grid end inside alone's
+     * piece with >= kBiMinPiece rows on both sides, else the piece whole -- over the shared budget, up to
+     * --max-num-batched-tokens less what is planned; the rows behind it that no longer fit wait a step. Without this a
+     * long prefill waits as long as more decode rows than the slack (2112 - 2048 = 64 at the DS line's budget) run beside
+     * it. The piece is one D would cut at any budget, so exactness is D's. */
+    bool pf = false;
+    for (const StepEntry& e : plan_.e) pf = pf || e.is_prefill;
+    if (pf) return 0;
+    int64_t emin = pe;
+    if (G > 0)
+        for (int64_t e = (n / G + 1) * G; e < pe; e += G)
+            if (e - n >= kBiMinPiece && pe - e >= kBiMinPiece) { emin = e; break; }
+    if (emin - n > cfg_.max_tok - plan_.n_tok) return 0;
+    if (emin == pe) return whole();
+    s.bi_beg = pb;
+    s.bi_end = pe;
+    s.bi_ckpt = ck;
+    return emin - n;
+}
+
 /* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
  * written (spec §7.3; see scheduler.h).
  *
@@ -1510,7 +1711,10 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
              * stager's step. */
             cap = std::min(cap, mode);
         } else {
-            const int64_t floor = std::max(Q, stage_rows_ / Q * Q);
+            /* lever DST: under a smaller shared budget (sched_mixed_tok) the floor is at most half of it, so the reserve
+             * of the decode rows behind the chunk and of a waiting request is still kept (unset: today's floor) */
+            int64_t floor = std::max(Q, stage_rows_ / Q * Q);
+            if (mixed_now_ < geo_.shared_tok) floor = std::max(Q, std::min(floor, mixed_now_ / 2 / Q * Q));
             cap = std::max(cap, floor);
             const int64_t remaining = n_target - n_computed;
             int64_t span = remaining;                       /* where this run of chunks must end */
@@ -1565,7 +1769,7 @@ void Scheduler::note_step_cost(bool chunk, double seconds) {
 }
 
 int64_t Scheduler::interleave_steps() const {
-    if (cfg_.prefill_interleave >= 0) return cfg_.prefill_interleave;
+    if (il_now_ >= 0) return il_now_;   /* lever DST: sched_interleave once set, else the flag */
     if (ema_chunk_s_ <= 0.0 || ema_decode_s_ <= 0.0) return 1;
     const double n = cfg_.prefill_interleave_share * ema_chunk_s_ / ema_decode_s_;
     return n >= (double)kInterleaveAutoMax ? kInterleaveAutoMax : (int64_t)n;
@@ -1607,7 +1811,7 @@ bool Scheduler::preempt_back() {
 /* ------------------------------------------------------------------ admission */
 /* Admission checks the KV budget before a request enters running; a request admitted without the
  * blocks to run would be preempted on its first step, a full recompute for nothing. */
-int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
+int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t whole_max) {
     Request& r = *s.req;
 
     /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
@@ -1837,6 +2041,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     int64_t target = s.seq_len();
     int64_t ckpt = -1;
     int64_t want;
+    bool bp_take = false;   /* lever DST: sched_bypass_total took it (bypass_piece) */
     if (r.embed) {
         /* The whole input or nothing this step (Request::embed): the next step starts with a
          * whole budget, and add_locked refused an input no budget holds. Not through plan_chunk,
@@ -1845,6 +2050,38 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * it. An embedding input is never resumed, so it takes no checkpoint. */
         const int64_t rest = target - (int64_t)r.n_computed;
         want = rest <= budget ? rest : 0;
+    } else if (whole_max > 0) {
+        /* lever DST, sched_short_bypass on a held step: the uncached rest runs as ONE piece, and only where that is the piece
+         * an idle engine plans from here (alone's span rule as bi_chunk_plan applies it, the interval, the tail
+         * checkpoint), so the request's rows are cut exactly as alone; otherwise it waits for an ordinary admission. */
+        const int64_t rest = target - (int64_t)r.n_computed;
+        want = 0;
+        if (bypass_total_ > 0) {
+            /* sched_bypass_total: any rest up to the total, run piece by piece from here (bypass_piece); turned away when
+             * longer, or when its first alone piece is over N and only option D may cut it */
+            if (rest > bypass_total_) {
+                s.bypass_no = true;
+            } else {
+                want = bypass_piece(s, r, target, budget, &ckpt);
+                bp_take = want > 0;                        /* bypass_run once the admission succeeds */
+                if (want < 0) s.bypass_no = true;          /* its first alone piece never fits a held step */
+                if (want < 0) want = 0;
+            }
+        } else if (rest > whole_max) {
+            s.bypass_no = true;
+        } else {
+            const bool keep = span_now_;
+            span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+                        (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+            int64_t ck = -1;
+            const int64_t alone = plan_chunk(r.n_computed, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
+            span_now_ = keep;
+            if (alone != rest) s.bypass_no = true;
+            else if (rest <= budget) { want = rest; ckpt = ck; }
+        }
+        if (s.bypass_no) ++n_bypass_refused_;
+    } else if (bi_chunk_) {
+        want = bi_chunk_plan(s, r, target, budget, &ckpt, reserve > 0);   /* lever BI: the whole chunk or none */
     } else {
         /* An admission shares the step the same way: otherwise a cold prompt with requests
          * queued behind it takes every token left. The hit is known by now, so the cap applies
@@ -1879,6 +2116,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * recurrent state. Giving the hit back costs a lookup. An attention-only hit holds only
          * refcounted blocks and is kept. */
         if (s.ckpt_src >= 0) undo_hit(s);
+        if (bp_take) { s.bi_beg = s.bi_end = 0; s.bi_ckpt = -1; }   /* lever DST: the piece bypass_piece cut is not run */
         /* What the restore brought back stays for the next attempt (IPrefixCache::hold). */
         if (cfg_.prefix_cache) pc_->hold(r);
         return rc;
@@ -1913,6 +2151,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
     s.sched_tokens = (int32_t)want;
     s.pending_ckpt = ckpt;
+    s.bypass_run = bp_take;
     ++m_.admitted;
     return RAD_OK;
 }
@@ -2128,13 +2367,30 @@ const RadBatch* Scheduler::step() {
 
     int64_t budget = cfg_.max_tok;
     bool preempted_here = false;
+    /* lever BI's chunking for this step's plan: the fn4 switch sched_bi_chunk as applied now (a change lands at a step
+     * release, so it takes effect from the step planned after it) */
+    bi_chunk_ = fn4::sched_bi_chunk();
+    /* lever DST: the interleave and the shared budget for this step's plan, as the fn4 switches are applied now (a change
+     * lands at a step release, so it acts from the step planned after it). A hold under way is cut to a smaller count. */
+    {
+        const int il = fn4::sched_interleave();
+        const int64_t now = il >= 0 ? (int64_t)il : cfg_.prefill_interleave;
+        if (now != il_now_) {
+            if (now >= 0 && interleave_left_ > now) interleave_left_ = now;
+            il_now_ = now;
+        }
+        const int64_t mt = fn4::sched_mixed_tok();
+        mixed_now_ = mt > 0 && mt < geo_.shared_tok ? mt : geo_.shared_tok;
+        bypass_now_ = fn4::sched_short_bypass();
+        bypass_total_ = bypass_now_ > 0 ? fn4::sched_bypass_total() : 0;
+    }
     /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
      * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
      * decoding there is nothing to give steps to, and the hold is dropped. */
     bool any_decoding = false;
     bool hold_prefill = false;
     held_prefill_ = 0;
-    if (cfg_.prefill_interleave != 0) {
+    if (il_now_ != 0) {
         for (int32_t slot : running_) {
             const SchedReq& s = *reqs_[(size_t)slot];
             if (!s.req || !s.running) continue;
@@ -2175,8 +2431,9 @@ const RadBatch* Scheduler::step() {
             const SchedReq& w = *reqs_[(size_t)waiting_[0]];
             lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
         }
-        span_now_ = lone;
-        if (!lone) budget = geo_.shared_tok;
+        span_now_ = bi_chunk_ == 2 ? false : lone;
+        /* lever DST: the shared budget in force (sched_mixed_tok); B (2) keeps whole intervals on the geometry's own */
+        if (!lone && bi_chunk_ != 1) budget = bi_chunk_ == 2 ? geo_.shared_tok : mixed_now_;
     }
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
@@ -2243,8 +2500,21 @@ const RadBatch* Scheduler::step() {
 
         int64_t ckpt = -1;
         int64_t want;
-        if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
-        if (prefill) {
+        /* lever DST (sched_bypass_total): a request the bypass took runs its alone pieces, held steps included; with the
+         * switch off, or at an alone piece the bypass cannot run (over N, not cut under 0 / 1 / 2), an ordinary prefill */
+        bool bp = false;
+        if (prefill && s.bypass_run) {
+            want = bypass_total_ > 0 ? bypass_piece(s, r, target, budget, &ckpt) : -1;
+            if (want < 0) s.bypass_run = false;
+            else if (want == 0) { ++held_prefill_; ++i; continue; }   /* waits for room; decode rows behind go on */
+            else bp = true;
+        }
+        if (bp) {
+        } else if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
+        else if (prefill && bi_chunk_) {
+            want = bi_chunk_plan(s, r, target, budget, &ckpt, share_step && (behind_pf > 0 || admit_waits));
+            if (want <= 0) { ++i; continue; }   /* lever BI: the whole chunk or none; decode rows behind it go on */
+        } else if (prefill) {
             const int64_t shares = share_step ? behind_pf + (admit_waits ? 1 : 0) : 0;
             const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
             const int64_t cap = busy_cap(r.n_computed, target, budget, reserve, !plan_.e.empty(),
@@ -2417,7 +2687,10 @@ const RadBatch* Scheduler::step() {
     /* ---------------------------------------------------------- admission */
     /* Skipped in a step that preempted: the pool just refused a request that already had blocks,
      * so it would refuse a new one, and the queue's front is now the preempted request. */
-    if (!preempted_here && !hold_prefill) {
+    /* lever DST (sched_short_bypass): a held step admits too, but only a waiting request whose uncached rest is one whole
+     * piece of its alone plan of at most bypass_now_ rows (admit_one's whole_max); the rest of the queue keeps its place. */
+    const bool bypass = hold_prefill && bypass_now_ > 0;
+    if (!preempted_here && (!hold_prefill || bypass)) {
         /* `at` walks the queue and `took_` is what it admitted: a request whose media is not
          * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
          * after the walk rather than cut at its front. */
@@ -2429,6 +2702,9 @@ const RadBatch* Scheduler::step() {
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
+            /* lever DST: on a held step only a fresh request not turned away before is asked */
+            if (bypass && (s.bypass_no || !s.req || s.req->embed || s.req->media ||
+                           s.req->state == ReqState::Preempted)) { ++at; continue; }
             /* Generation reserves one position after the prompt. An embedding consumes just
              * the prompt, so its exact context boundary fits without a generation slot.
              * close_request removes a refused input from waiting_, so `at` names the next one. */
@@ -2453,7 +2729,11 @@ const RadBatch* Scheduler::step() {
                     ? share_tok : 0;
             admit_full_ = 0;
             admit_next_step_ = false;
-            const int as = admit_one(s, budget, areserve);
+            const int as = admit_one(s, budget, bypass ? 0 : areserve, bypass ? bypass_now_ : 0);
+            /* lever DST: a request the bypass does not take keeps its place for the next ordinary admission, and the
+             * walk asks the one behind it */
+            if (bypass && as != RAD_OK) { ++at; continue; }
+            if (bypass) ++n_bypassed_;
             /* A preempted request waiting for its whole-recompute gate lets the next one be asked;
              * an overdue one does not. The room the overdue path made this step is for it, and a
              * request queued behind it would take that room back: a victim just forced off for it,
@@ -2601,13 +2881,14 @@ const RadBatch* Scheduler::step() {
         case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
         default:                ++m_.steps_decode;  break;
     }
-    if (cfg_.prefill_interleave != 0) {
+    if (il_now_ != 0) {
         /* Armed only while a prompt continues past this step: after a last chunk nothing is left
          * to interleave, and holding would only keep the next request out. */
         bool continues = false;
         for (const StepEntry& e : plan_.e)
             if (e.is_prefill && !e.produces_token) continues = true;
-        if (any_pf) interleave_left_ = any_decoding && continues ? interleave_steps() : 0;
+        /* lever DST: a held step that admitted a short request (sched_short_bypass) is still one of the hold's steps */
+        if (any_pf && !hold_prefill) interleave_left_ = any_decoding && continues ? interleave_steps() : 0;
         else if (interleave_left_ > 0) --interleave_left_;
         if (held_prefill_ > 0) ++m_.steps_held;
     }
@@ -3266,7 +3547,7 @@ void Scheduler::step_finished() {
      * tokens took. */
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
     /* --prefill-interleave auto's two step costs (interleave_steps). */
-    if (wall > 0 && cfg_.prefill_interleave < 0)
+    if (wall > 0 && il_now_ < 0)
         step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall);
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
@@ -3331,6 +3612,7 @@ void Scheduler::step_finished() {
             draft_.step_time(key, rows, wall * 1e3, key > 0 ? (double)step_decode_tok_ : -1.0, lend);
         }
     }
+    fn4::note_sched_dst(n_bypassed_, n_bypass_refused_);   /* lever DST: sched_short_bypass's counts */
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
                            hybrid_lookup_, hybrid_head_, hybrid_unahead_, draft_.occ_cycles(), draft_.occ_moves());
     fn4::note_draft_accept(acc_head_d_, acc_head_a_, acc_look_d_, acc_look_a_);
