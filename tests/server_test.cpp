@@ -5004,6 +5004,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(g.body, "\"ds41_qnfold\": -1"));     /* deepseek41's (lever K1 folds a, e) */
     CHECK(has(g.body, "\"ds41_swfold\": -1"));
     CHECK(has(g.body, "\"dspark_walk\": -1"));      /* deepseek41's (lever W1, the full-vocabulary walk) */
+    CHECK(has(g.body, "\"draft_sample\": -1"));     /* the engine's (lever SD): no engine registered here */
     CHECK(has(g.body, "\"aql_acq\": 0"));
     CHECK(has(g.body, "\"epoch\": 0"));
     CHECK(has(g.body, "\"draft_capable\": -1"));
@@ -5028,6 +5029,11 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":"on"})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"aql_acq":3})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_adaptive":2})").status, 400);
+    /* lever SD: out of range, and 1 with no engine (so no coupled drafter) registered */
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_sample":201})").status, 400);
+    const HttpResponse ds = f.post("/admin/fn4", R"({"draft_sample":1})");
+    CHECK_EQ(ds.status, 400);
+    CHECK(has(ds.body, "no engine has registered a drafter"));
     const HttpResponse da = f.post("/admin/fn4", R"({"draft_adaptive":1})");
     CHECK_EQ(da.status, 400);
     CHECK(has(da.body, "no scheduler has registered a drafter"));

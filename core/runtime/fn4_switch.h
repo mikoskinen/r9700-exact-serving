@@ -150,6 +150,18 @@
  *                   wait before the step issued ahead), as at dspark_conf 0. Exact as dspark_conf: verify counts
  *                   only. Nonzero is refused where no confidence plane is declared.
  *
+ *   draft_sample    engine (lever SD, sampled drafting, 11.11.2026; the user's GO: distribution-exact, NOT byte-identical
+ *                   to non-speculative sampling at temperature > 0): 0 today's rule -- greedy drafts, a draft accepted
+ *                   when it equals the target's own sampled draw at its RNG coordinate (core/sample/accept.h); 1 a sampled
+ *                   request's drafts are drawn from the drafter's law Q (deepseek41: the W1 walk's eight best keys,
+ *                   softmax at the request's temperature, x ~ Q at the request's seed, r4d_ds41_wsamp_math.h) and the
+ *                   verify keeps x with probability min(1, P(x) / Q(x)), else draws from norm(max(0, P - Q)) (the
+ *                   sampler's mtp_couple_verify); 2 .. 200 the same with Q at the request's temperature x v / 100.
+ *                   A greedy request (temperature 0 / top_k 1) drafts and verifies as at 0 at every value, so
+ *                   temperature 0 stays byte-identical. A prompt-lookup proposal never couples. Needs --draft-coupling
+ *                   on and a drafter whose walk declares the coupling planes (refused otherwise); RADIANCE_DRAFT_SAMPLE
+ *                   at start (unset: 0). The counters are GET's "sample" object.
+ *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
  *
@@ -173,7 +185,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
-              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kSwitches };
+              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDraftSample, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -216,6 +228,14 @@ void note_lend_engine(int64_t state, int64_t lends, int64_t reclaims, int64_t le
 /* The engine, at its init: whether its drafter declared a confidence plane / alternative branches, and the
  * switches' values at start (0 when not capable). */
 void dspark_register(bool conf_capable, bool alt_capable, int conf_start, int alt_start);
+/* Lever SD. The engine, at its init: whether --draft-coupling is live with a drafter that declared the coupling
+ * planes (draft_sample >= 1 is refused otherwise), and the start value (RADIANCE_DRAFT_SAMPLE). */
+void sample_register(bool capable, int start);
+/* The engine, after every drafter cycle that ran the sampled walk: drafting rows staged sampled (mode 1) and greedy,
+ * rounds bound to the verify, rounds the walk marked status -1, rows whose readback could not bind (cleared: the
+ * ordinary rule applies to them), and prompt-lookup proposals whose coupling was cleared before a build. */
+void note_sample(int64_t rows_sampled, int64_t rows_greedy, int64_t rounds_bound, int64_t rounds_malformed,
+                 int64_t bind_fallback, int64_t lookup_cleared);
 /* Whether `v` is a dspark_conf value (see above). */
 bool dspark_conf_value_ok(int v);
 /* The applied value of a core switch without the lock (the step path reads it each step); -1 unregistered. */

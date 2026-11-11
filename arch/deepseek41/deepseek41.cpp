@@ -28,6 +28,7 @@
 
 #include "ds41_index_split.h"
 #include "ds41_walk_geom.h"
+#include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
 
 #include <algorithm>
 #include <atomic>
@@ -420,6 +421,16 @@ struct Dsp {
     /* lever W1b: the scoring steps again at form 1 (succ staged through LDS as whole lines; the same bits), issued
      * while dspark_walk is 2 (the last merge is wstep's) */
     std::vector<rad_op> wstep2;
+    /* lever SD, sampled drafting (--draft-coupling on; fn4 draft_sample, the engine's): the walk of W1 sampled, a
+     * dspark_walk_sample_step a step + the last merge (libr4d r4d_ds41_wsamp.hip). The coupling planes the engine finds
+     * by name -- draws [max_seqs, 8] u32 it stages, q_temp [max_seqs, 1] f32 it stages (the request's temperature x the
+     * switch's scale), state [block, max_seqs, 38] u32 it reads back -- and the walk's own: eight u64 keys a sequence a
+     * step [block * sseqs, 16] gathered into [block * sseqs, 16 * world], each block's eight [sseqs * snblk, 16], and an
+     * arrival counter a step [block, 4] zeroed by sfill every pass. */
+    int64_t sseqs = 0, snblk = 0;
+    rad_buf sdraw = 0, sqt = 0, sstate = 0, skeys = 0, sgath = 0, sscr = 0, scnt = 0;
+    rad_op sfill = 0, sag = 0;
+    std::vector<rad_op> sstep;
     std::vector<Layer> st;
     /* The confidence head (lever C1): the sidecar's D + rank weights and bias, the device copy
      * (`cwb`, uploaded at this rank's first query pass), the plane; the branches (lever T1). Rank 0. */
@@ -2606,6 +2617,82 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         }
     }
 
+    /* Lever SD (11.11.2026, the user's GO: distribution-exact, not byte-identical at temperature > 0): under
+     * --draft-coupling on (RadBuildCtx::draft_coupling) the W1 walk again, SAMPLED -- at each position the eight best
+     * keys of the whole vocabulary, Q their FP64 softmax at the request's temperature, x ~ Q at the request's seed
+     * (r4d_ds41_wsamp_math.h), the state the sampler's coupled verify (mtp_couple_verify: accept min(1, P / Q), else
+     * the residual) reads. Issued in place of the walk while the engine's fn4 draft_sample is >= 1; a greedy request's
+     * row drafts W1's token (the best key), so temperature 0 drafts what draft_sample 0 drafts. Planes named as the MTP
+     * head's, which is how the engine finds them; every rank declares them (the engine stages the draws on all). */
+    if (ctx->draft_coupling) {
+        const char* why = nullptr;
+        if (g.world < 2 || g.world > 4) why = "it runs over 2 .. 4 vocabulary shards (TP2 .. TP4)";
+        else if (d.block > RAD_MTP_COUPLE_MAX_ROUNDS) why = "the block is longer than the coupling's rounds";
+        else if (!rad_op_declared(b, "dspark_walk_sample_step")) why = "no loaded kernel plugin serves dspark_walk_sample_step";
+        if (!why) {
+            d.sseqs = d.Q / d.block;
+            d.snblk = (g.n_vocab + 127) / 128;
+            const int64_t KR = d.block * d.sseqs, SR = 16;
+            /* The steps first, without their buffers, so a device none of them resolves on declares no coupling plane
+             * (the engine then refuses --draft-coupling on by name instead of serving it uncoupled). */
+            const rad_weight ws[2] = { d.mk1, d.mk2 };
+            bool sok = true;
+            for (int64_t l = 0; l <= d.block; ++l) {
+                const RadParam ps[] = { RAD_RANGE("M", 1, d.sseqs), RAD_INT("step", l), RAD_INT("steps", d.block),
+                                        RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("N", g.n_vocab),
+                                        RAD_INT("vocab_off", g.vocab_off), RAD_INT("world", g.world),
+                                        RAD_INT("anchor_stride", d.block), RAD_STR("dtype", "f32") };
+                const rad_op w = rad_decl_op(b, "dspark_walk_sample_step", ps, (int)(sizeof ps / sizeof ps[0]), ws, 2);
+                sok = sok && w && rad_op_resolved(b, w);
+                d.sstep.push_back(w);
+            }
+            if (!sok) why = "no kernel serves dspark_walk_sample_step on this device";
+            if (!why) {
+                d.sdraw = decl_b(b, nm.f("mtp_couple_draws"), RAD_U32,
+                                 { g.max_seqs, (int64_t)RAD_MTP_COUPLE_DRAW_WORDS }, RAD_BUF_PERSIST);
+                d.sqt = decl_b(b, nm.f("mtp_couple_qtemp"), RAD_F32, { g.max_seqs, 1 }, RAD_BUF_PERSIST);
+                d.sstate = decl_b(b, nm.f("mtp_couple_state"), RAD_U32,
+                                  { d.block, g.max_seqs, (int64_t)RAD_MTP_COUPLE_STATE_WORDS }, RAD_BUF_PERSIST);
+                d.skeys = decl_b(b, nm.f("dspark_wsamp_keys"), RAD_F32, { KR, SR });
+                d.sgath = decl_b(b, nm.f("dspark_wsamp_keys_all"), RAD_F32, { KR, SR * g.world });
+                d.sscr = decl_b(b, nm.f("dspark_wsamp_scratch"), RAD_F32, { d.sseqs * d.snblk, SR });
+                d.scnt = decl_b(b, nm.f("dspark_wsamp_count"), RAD_F32, { d.block, 4 });
+                if (!d.sdraw || !d.sqt || !d.sstate || !d.skeys || !d.sgath || !d.sscr || !d.scnt) return RAD_E_INVAL;
+                d.sfill = op(b, "fill", { RAD_RANGE("M", 1, d.block), RAD_INT("n", 4), RAD_STR("dtype", "f32"),
+                                          RAD_F64("value", 0.0) },
+                             {}, {}, { d.scnt });
+                d.sag = op(b, "all_gather", { RAD_INT("world_size", g.world), RAD_INT("numel", d.sseqs * SR),
+                                              RAD_STR("dtype", "f32"), RAD_INT("row", SR) },
+                           {}, { d.skeys }, { d.sgath });
+                if (!d.sfill || !d.sag || !rad_op_resolved(b, d.sfill) || !rad_op_resolved(b, d.sag))
+                    return RAD_E_UNSUPPORTED;   /* the stock fill / gather: every device that runs the walk has them */
+                for (const rad_op w : d.sstep)
+                    rw(b, w, { d.logits, d.sgath, d.skeys, d.sscr, d.scnt, d.sdraw, d.sqt, d.sstate },
+                       { d.skeys, d.tokens, d.sscr, d.scnt, d.sstate });
+            }
+        }
+        if (why) {
+            d.sfill = d.sag = 0;
+            d.sstep.clear();
+            /* No planes named mtp_couple_*: the engine refuses --draft-coupling on by name at bring-up. */
+            rad_note(b, "DSpark lever SD (sampled drafting) NOT declared: %s", why);
+            if (ctx->rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: --draft-coupling on: DSpark lever SD (sampled drafting) NOT "
+                                "declared: %s\n", why);
+        } else {
+            rad_note(b, "DSpark lever SD: the sampled full-vocabulary walk declared (dspark_walk_sample_step a step over "
+                        "%d shard(s) + an all_gather of eight keys a sequence, %lld sequences a pass, %lld blocks a shard); "
+                        "fn4 draft_sample (the engine's) issues it", g.world, (long long)d.sseqs, (long long)d.snblk);
+            if (ctx->rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: DSpark lever SD: the sampled full-vocabulary walk declared "
+                                "(dspark_walk_sample_step a step over %d rank(s) + all_gather of the eight best keys, %lld "
+                                "sequences a pass); x ~ Q = softmax(score / (temperature x scale)) over the eight best, "
+                                "the maximal coupling at the verify; issued while fn4 draft_sample >= 1 "
+                                "(RADIANCE_DRAFT_SAMPLE at start)\n",
+                        g.world, (long long)d.sseqs);
+        }
+    }
+
     /* Lever C1 (rank 0): the confidence head after the walk, over the collapse's output before its
      * norm (d.x, which nothing after the collapse writes) and the walk's predecessors; its weights in a
      * persistent buffer the first query pass fills from the sidecar. */
@@ -3179,8 +3266,25 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
      * the full-vocabulary walk does not compute: it is not issued while that walk runs. Every pass with the walk off,
      * or with the walk on and no extra switched on, issues exactly what it issued before. */
     const int wsw = g_sw_walk.load(std::memory_order_relaxed);
-    const bool walked = (d.wfill || d.wmarkov) && wsw >= 1 && N == S * d.block && S <= d.wseqs;
-    if (walked && d.wmarkov) {
+    /* Lever SD: the sampled walk while the engine's draft_sample is >= 1 (declared under --draft-coupling on). It
+     * replaces whichever walk dspark_walk names (a greedy row drafts W1's token); the engine stages the draws and the
+     * q_temp column before this pass and reads the states back behind it. */
+    const bool sampled = !d.sstep.empty() && ds41_switch("draft_sample") >= 1 && N == S * d.block && S <= d.sseqs;
+    const bool walked = sampled || ((d.wfill || d.wmarkov) && wsw >= 1 && N == S * d.block && S <= d.wseqs);
+    if (sampled) {
+        const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
+        const int64_t SS = d.sseqs, SR = 16, GW = SR * g.world;
+        RAD_ISSUE_N(x, d.sfill, d.block, brows(d.scnt, d.block));
+        for (int64_t l = 0; l <= d.block; ++l) {
+            const bool last = l == d.block;
+            RAD_ISSUE_N(x, d.sstep[(size_t)l], S, brows(d.logits, N), anchor,
+                        l ? brow_slice(d.sgath, (l - 1) * SS, S, GW) : RAD_NONE, RAD_W(d.mk1), RAD_W(d.mk2),
+                        last ? RAD_NONE : brow_slice(d.skeys, l * SS, S, SR), brows(d.tokens, S),
+                        last ? RAD_NONE : brows(d.sscr, S * d.snblk), last ? RAD_NONE : brow_slice(d.scnt, l, 1, 4),
+                        praw(batch->seq_ids, RAD_I32, S), brows(d.sdraw, S), brows(d.sqt, S), RAD_B(d.sstate));
+            if (!last) RAD_ISSUE(x, d.sag, brow_slice(d.skeys, l * SS, S, SR), brow_slice(d.sgath, l * SS, S, GW));
+        }
+    } else if (walked && d.wmarkov) {
         const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
         RAD_ISSUE_N(x, d.wmarkov, S, brows(d.logits, N), anchor, RAD_W(d.mk1), RAD_W(d.mk2), brows(d.wts, S),
                     brows(d.wtt, S), brows(d.tokens, S));

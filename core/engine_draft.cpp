@@ -114,6 +114,27 @@ int Engine::step_state_init() {
             (int64_t)drafter_.depth * couple_rows_ * (int64_t)sizeof(RadMtpCoupleState),
             RAD_MEM_HOST_PINNED));
         if (!couple_draw_stage_ || !couple_readback_) return RAD_E_NOMEM;
+        /* Lever SD: the q_temp column, where the drafter declares one (every rank or none). */
+        couple_qt_rank_.assign(ranks_.size(), 0);
+        bool any_qt = false, all_qt = true;
+        for (size_t r = 0; r < ranks_.size(); ++r) {
+            const Program& pr = ranks_[r]->program;
+            for (size_t i = 0; i < pr.buffers.size(); ++i) {
+                const std::string& name = pr.buffers[i].name;
+                static const char kQt[] = "mtp_couple_qtemp";
+                const size_t nq = sizeof kQt - 1;
+                if (name.size() >= nq && name.compare(name.size() - nq, nq, kQt) == 0) couple_qt_rank_[r] = (rad_buf)i;
+            }
+            any_qt = any_qt || couple_qt_rank_[r];
+            all_qt = all_qt && couple_qt_rank_[r];
+        }
+        if (any_qt && !all_qt) {
+            RAD_ERR("--draft-coupling: 'mtp_couple_qtemp' is declared on some ranks only");
+            return RAD_E_STATE;
+        }
+        if (!any_qt) couple_qt_rank_.clear();
+        couple_qt_stage_ = static_cast<float*>(rad_dev_alloc(n_slot * (int64_t)sizeof(float), RAD_MEM_HOST_PINNED));
+        if (!couple_qt_stage_) return RAD_E_NOMEM;
         if (drafter_.kind == RAD_DRAFT_BLOCK)
             RAD_INFO("DFlash coupled LIVE: %d position(s), x~Q along the candidate walk, maximal "
                      "coupling at the verify; fixed-seed tokens are NOT preserved", drafter_.depth);
@@ -121,6 +142,21 @@ int Engine::step_state_init() {
             RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the final reranked top8, "
                      "maximal coupling at the verify; fixed-seed tokens are NOT preserved",
                      drafter_.depth);
+    }
+
+    /* Lever SD: fn4 draft_sample, whose 1 .. 200 need the coupling above; RADIANCE_DRAFT_SAMPLE at start (unset: 0,
+     * today's rule -- nothing is staged, read back or bound, and no verify carries a coupled row). */
+    {
+        const char* e = std::getenv("RADIANCE_DRAFT_SAMPLE");
+        const int v0 = e && *e ? std::atoi(e) : 0;
+        fn4::sample_register(mtp_couple_, v0);
+        if (mtp_couple_)
+            RAD_INFO("lever SD: fn4 draft_sample %d at start (0 greedy drafts + the agreement rule, 1 sampled drafts + "
+                     "the maximal coupling at the request's temperature, 2..200 at temperature x v/100; POST /admin/fn4)%s",
+                     fn4::get(fn4::kDraftSample), couple_qt_rank_.empty() ? "; this drafter declares no q_temp column"
+                                                                          : "");
+        else if (v0 != 0)
+            RAD_WARN("RADIANCE_DRAFT_SAMPLE=%s ignored: --draft-coupling is off (draft_sample stays 0)", e);
     }
 
     /* ds41-acc: the confidence plane and the alternative branches, pinned beside the slots. Both
@@ -702,6 +738,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
     }
+    couple_note();
     return RAD_OK;
 }
 
@@ -727,7 +764,25 @@ int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t car
                                           &couple_readback_[(size_t)i], (int)couple_rows_, done,
                                           slots_host_[card], meta_.n_vocab, couple_bound_,
                                           &n_bound, &why, &n_malformed);
-    if (bs < 0) { RAD_ERR("%s", why.c_str()); return bs; }
+    if (bs < 0) {
+        /* Lever SD: a readback that is not this draw's binds nothing -- the verify applies the agreement rule to the
+         * row's drafts, which is exact for any proposal -- instead of stopping the engine. Counted and logged once. */
+        ++couple_n_fallback_;
+        if (!couple_bind_note_) {
+            couple_bind_note_ = true;
+            RAD_WARN("coupled draft: %s -- not bound; the ordinary verify applies to this proposal (logged once, "
+                     "counted under fn4 sample.bind_fallback)", why.c_str());
+        }
+        for (auto& rk : ranks_) {
+            const int st = rk->sampler.set_mtp_couple(seq, nullptr, 0);
+            if (st < 0 && st != RAD_E_NOTFOUND) return st;
+        }
+        return RAD_OK;
+    }
+    if (drafted) {
+        couple_n_bound_ += n_bound;
+        couple_n_malf_ += n_malformed;
+    }
     if (n_malformed > 0 && !couple_malformed_note_) {
         couple_malformed_note_ = true;
         RAD_WARN("coupled draft: sequence %llu: %d draft position(s) had a shortlist with no valid "
@@ -784,13 +839,44 @@ int Engine::stage_couple_draws(const Row* rows, int n) {
         RAD_ERR("MTP coupled: %s", why.c_str());
         return stg;
     }
+    /* Lever SD: draft_sample 0 drafts greedily (mode 0: the proposer keeps its greedy token, status 0, and the
+     * sampler couples nothing) -- the serial drafter stages draws every cycle; the block drafter stages none at 0. */
+    if (fn4::get(fn4::kDraftSample) < 1)
+        for (int i = 0; i < n; ++i) couple_draw_stage_[i].mode = 0;
+    for (int i = 0; i < n; ++i) ++(couple_draw_stage_[i].mode == 1 ? couple_n_samp_ : couple_n_greedy_);
     for (auto& rk : ranks_) {
         void* dst = rk->ctx.buf_ptr(couple_draws_rank_[(size_t)rk->index]);
         if (!dst) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(dst, couple_draw_stage_,
                                  n * (int64_t)sizeof(RadMtpCoupleDraw), rk->ctx.stream()));
     }
+    /* Lever SD: the q_temp column, row i the temperature of drafting row i's request x the switch's scale (1: 1.0,
+     * 2 .. 200: v / 100). A greedy row's value is never read (its draw is mode 0). */
+    if (!couple_qt_rank_.empty()) {
+        const int v = fn4::get(fn4::kDraftSample);
+        const double scale = v >= 2 && v <= 200 ? v / 100.0 : 1.0;
+        const StepPlan& plan = sched_.plan();
+        for (int i = 0; i < n; ++i) {
+            float t = 1.0f;
+            for (const StepEntry& e : plan.e)
+                if (e.req && e.card == rows[i].card && e.seq == rows[i].seq) { t = (float)(e.req->sp.temp * scale); break; }
+            couple_qt_stage_[i] = t;
+        }
+        for (auto& rk : ranks_) {
+            void* dst = rk->ctx.buf_ptr(couple_qt_rank_[(size_t)rk->index]);
+            if (!dst) return RAD_E_STATE;
+            RAD_TRY(rad_memcpy_async(dst, couple_qt_stage_, n * (int64_t)sizeof(float), rk->ctx.stream()));
+        }
+    }
     return RAD_OK;
+}
+
+void Engine::couple_note() {
+    if (!mtp_couple_) return;
+    if (couple_n_samp_ | couple_n_greedy_ | couple_n_bound_ | couple_n_malf_ | couple_n_fallback_ | couple_n_lookup_)
+        fn4::note_sample(couple_n_samp_, couple_n_greedy_, couple_n_bound_, couple_n_malf_, couple_n_fallback_,
+                         couple_n_lookup_);
+    couple_n_samp_ = couple_n_greedy_ = couple_n_bound_ = couple_n_malf_ = couple_n_fallback_ = couple_n_lookup_ = 0;
 }
 
 /* ------------------------------------------------------------------ the block driver
@@ -898,8 +984,11 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     const int n = sched_.block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
 
-    /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). */
-    if (mtp_couple_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
+    /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). Lever SD: only while
+     * draft_sample is >= 1 -- the switch moves only at a step release, so the plugin issuing this cycle's query pass
+     * reads the same value and runs the sampled walk exactly when the draws are staged. */
+    couple_cycle_ = mtp_couple_ && fn4::get(fn4::kDraftSample) >= 1;
+    if (couple_cycle_ && n > 0) RAD_TRY(stage_couple_draws(block_row_.data(), n));
 
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
      * drafter will need, and skipping would leave a permanent hole in its cache. A tree verify's
@@ -917,7 +1006,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     RAD_TRY(block_pass(qb, "query", step));
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
     Rank& r0 = *ranks_[0];
-    if (mtp_couple_) {
+    if (couple_cycle_) {
         /* Positions 1..steps of the drafting rows, on the stream of the slots below. */
         const void* state = r0.ctx.buf_ptr(couple_state_buf_);
         if (!state || steps > (int)drafter_.depth) return RAD_E_STATE;
@@ -1063,9 +1152,17 @@ int Engine::finish_block_drafter(const StepOut& so) {
                                       conf_val_ ? conf_host_ + (int64_t)i * conf_pitch_ : nullptr, steps,
                                       alt_on_ ? alt_host_ + (int64_t)i * n_alt_ * alt_pitch_ : nullptr,
                                       (int)n_alt_, (int)alt_pitch_, cut);
-        if (mtp_couple_)
+        if (couple_cycle_) {
             RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
+        } else if (mtp_couple_) {
+            /* Lever SD at draft_sample 0: no state of an earlier cycle stays bound to this proposal. */
+            for (auto& rk : ranks_) {
+                const int st = rk->sampler.set_mtp_couple(seq, nullptr, 0);
+                if (st < 0 && st != RAD_E_NOTFOUND) return st;
+            }
+        }
     }
+    couple_note();
     return RAD_OK;
 }
 
