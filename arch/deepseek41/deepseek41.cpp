@@ -568,6 +568,13 @@ struct Model {
      * the row pitch of every buffer step_bi slices. */
     rad_buf bi_cu = 0;
     rad_op bi_sub = 0;
+    /* Lever BI-e (ds41_bi 7 / 9): each dense GGUF linear's gemm_nt_ggml_dual (fused(): where libr4d serves it), by the
+     * linear's gemm_nt_ggml op. Lever BI 8 / 9: the step's EXL3 bands ([max_tok, 1] i32 PERSIST, MoeFP8::set_band) and
+     * the two iota ops (step 0: start 1 / 0) that write them on the card -- a recorded pass replays them with the rows
+     * its key fixes. */
+    std::map<rad_op, rad_op> bi_dual;
+    Exl3Band x3b{};
+    rad_op bi_one = 0, bi_zero = 0;
     std::map<rad_buf, int64_t> bp;
     Dsp dsp{};
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
@@ -793,6 +800,9 @@ static rad_weight lw(RadBuilder* b, Model& m, const char* name, int64_t n, int64
     if (ty) m.wty[w] = ty;
     return w;
 }
+static rad_op fused(RadBuilder* b, const char* name, std::vector<RadParam> ps, std::vector<rad_weight> ws,
+                    std::initializer_list<rad_buf> rd, std::initializer_list<rad_buf> wr);   /* below */
+static bool bi_declared();                                                                     /* lever BI, below */
 /* y = x . w^T over lw()'s weight: for a GGUF block it is gemm_nt_ggml, for an IQR view gemm_nt_q
  * at the weight's code dtype over a rotated int8 activation pair, otherwise gemm_nt at bf16. */
 static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_t n,
@@ -815,11 +825,17 @@ static rad_op linear(RadBuilder* b, Model& m, int64_t rows, rad_weight w, int64_
         return h;
     }
     const auto t = m.wty.find(w);
-    if (t != m.wty.end())
-        return op(b, "gemm_nt_ggml",
-                  { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("type", t->second),
-                    RAD_STR("dtype", m.g.dtype) },
-                  { w }, { x }, { y });
+    if (t != m.wty.end()) {
+        const std::vector<RadParam> ps = { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k),
+                                           RAD_STR("type", t->second), RAD_STR("dtype", m.g.dtype) };
+        const rad_op h = op(b, "gemm_nt_ggml", ps, { w }, { x }, { y });
+        /* lever BI-e: the same linear over a step's decode and prefill row groups in one launch (ds41_bi 7 / 9) */
+        if (h && bi_declared()) {
+            const rad_op d = fused(b, "gemm_nt_ggml_dual", ps, { w }, { x }, { y });
+            if (d) m.bi_dual[h] = d;
+        }
+        return h;
+    }
     return op(b, "gemm_nt",
               { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k), RAD_STR("dtype", m.g.dtype) },
               { w }, { x }, { y });
@@ -1096,7 +1112,7 @@ static std::atomic<int> g_sw_bi{0}, g_sw_bi_ok{0}, g_sw_bi_env{-2};   /* env: -2
 static void bi_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_BI");
-    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : (e[0] >= '2' && e[0] <= '6' && !e[1]) ? e[0] - '0'
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : (e[0] >= '2' && e[0] <= '9' && !e[1]) ? e[0] - '0'
                           : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
     if (g_sw_bi_env.compare_exchange_strong(unread, v)) {
         if (v >= 0) g_sw_bi.store(v, std::memory_order_relaxed);
@@ -1120,9 +1136,19 @@ static constexpr int64_t kBiMoe = 16;
  * reducing, then ONE all-reduce over the step's rows (or, with one pass, the pass's own gather + all-reduce / ARGATHER as
  * today). Exact: the exact all-reduce sums 0 + r0 + r1 + r2 + r3 in fp32 a value whatever the rows it carries, and
  * ARGATHER is gather + all-reduce byte for byte (lever D3). */
-static bool bi_pieces(int v) { return v == 2 || v == 4 || v == 6; }
+/* 7 = 6 + the dense GGUF weights' dual form (BI-e): in a step whose decode rows fit one decode-band launch (<= 48) and
+ * whose prefill sequences are each above it, each dense gemm_nt_ggml weight is ONE gemm_nt_ggml_dual launch -- the decode
+ * rows in the decode band's form, every prefill row in the WMMA form, each row's own launch's bytes (libr4d
+ * r4d_ds41_ggml_dual.hip); a step of prefill sequences only, each above the band, one gemm_nt_ggml over them (the WMMA
+ * form's bytes do not depend on the launch's rows). 8 = 6 + fn4's dual-form EXL3 down (exl3 interface v13): in a step with
+ * a prefill sequence, ONE routed MoE pass over the step (MoeFP8::pass_bi): the selection and the shared arm by piece as
+ * 6's passes, one sort, the experts once with the step's band (the decode rows and the prefill sequences of <= 16 rows
+ * marked: the M <= 16 band's down arithmetic), one gather + all-reduce. 9 = 8 + 7's dense dual form. */
+static bool bi_pieces(int v) { return v == 2 || v == 4 || v >= 6; }
 static bool bi_cheap(int v) { return v >= 3; }
 static bool bi_onear(int v) { return v >= 5; }
+static bool bi_ggdual(int v) { return v == 7 || v == 9; }
+static bool bi_band(int v) { return v == 8 || v == 9; }
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
 static void sw_note_decl(int64_t rows) {
@@ -1148,7 +1174,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_bi"))
-        return value == 0 || (value >= 1 && value <= 6 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || (value >= 1 && value <= 9 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -3187,13 +3213,28 @@ static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (!m.bi_cu) return RAD_E_INVAL;
     m.bi_sub = op(b, "sub_i32", { RAD_RANGE("M", 1, 2) }, {}, {}, { m.bi_cu });
     if (!m.bi_sub) return RAD_E_UNSUPPORTED;
+    /* ds41_bi 8 / 9: the EXL3 down's bands (fn4 BI-dual, exl3 interface v13), written on the card a step */
+    bool x3 = false;
+    for (const Layer& L : m.layers) x3 = x3 || L.moe.c.expert_exl3;
+    if (x3) {
+        m.x3b.dev = decl_b(b, m.nm.f("bi_x3band"), RAD_I32, { m.g.max_tok, 1 }, RAD_BUF_PERSIST);
+        if (!m.x3b.dev) return RAD_E_INVAL;
+        m.x3b.cap = m.g.max_tok;
+        m.bi_one = op(b, "iota", { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("start", 1), RAD_INT("step", 0) }, {}, {},
+                      { m.x3b.dev });
+        m.bi_zero = op(b, "iota", { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("start", 0), RAD_INT("step", 0) }, {}, {},
+                       { m.x3b.dev });
+        if (!m.bi_one || !m.bi_zero) return RAD_E_UNSUPPORTED;
+    }
     if (!ctx->shape_probe) g_sw_bi_ok.store(1, std::memory_order_relaxed);
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41: lever BI declared (RADIANCE_DS41_BI, fn4 ds41_bi, now %d): a step of more "
                         "than one shape class runs in segments by sequence (decode rows <= %lld a dense / attention / "
                         "indexer launch, <= %lld a fused norm; each prefill sequence at its own rows; the MoE a pass a "
-                        "segment); a pass with two or more prefill sequences is not recorded\n",
-                g_sw_bi.load(std::memory_order_relaxed), (long long)kBiBand, (long long)kBiNorm);
+                        "segment); a pass with two or more prefill sequences is not recorded; %zu dense GGUF linears with "
+                        "a dual form (7 / 9), EXL3 bands %s (8 / 9)\n",
+                g_sw_bi.load(std::memory_order_relaxed), (long long)kBiBand, (long long)kBiNorm, m.bi_dual.size(),
+                m.x3b.dev ? "declared" : "not declared (no EXL3 experts)");
     return RAD_OK;
 }
 
@@ -3520,7 +3561,7 @@ struct BiSeg {
     bool dec = false;
     int k = -1;   /* bi_cu's row (a prefill segment), -1 for the batch's cu */
 };
-static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0}, g_bi_moe{0}, g_bi_onear{0};
+static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0}, g_bi_moe{0}, g_bi_onear{0}, g_bi_band{0};
 /* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
  * segment, decode rows within the norms' width): step() then runs today's issue. Prefill sequences' bounds from the
  * host mirror of positions (each sequence's rows are consecutive positions; a jump starts the next); when that does not
@@ -3569,11 +3610,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const long long n = g_bi_steps.load(std::memory_order_relaxed);
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0)
             fprintf(stderr, "radiance: deepseek41: lever BI stats: %lld segmented steps, %lld MoE passes a layer in them (%.2f a "
-                            "step), %lld cu read-backs, %lld steps with > 48 decode rows, %lld steps with one MoE all-reduce; ds41_bi %d\n",
+                            "step), %lld cu read-backs, %lld steps with > 48 decode rows, %lld steps with one MoE all-reduce, %lld with one "
+                            "banded MoE pass; ds41_bi %d\n",
                     n, g_bi_moe.load(std::memory_order_relaxed),
                     (double)g_bi_moe.load(std::memory_order_relaxed) / (double)n, g_bi_sync.load(std::memory_order_relaxed),
                     g_bi_wide.load(std::memory_order_relaxed), g_bi_onear.load(std::memory_order_relaxed),
-                    g_sw_bi.load(std::memory_order_relaxed));
+                    g_bi_band.load(std::memory_order_relaxed), g_sw_bi.load(std::memory_order_relaxed));
     }
     if (g_bi_steps.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0) {
         std::string seg;
@@ -3616,6 +3658,47 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (s.k >= 0)
             RAD_ISSUE_N(x, m.bi_sub, 2, praw(batch->cu_seqlens + s.s0, RAD_I32, 2),
                         praw(batch->cu_seqlens + s.s0, RAD_I32, 1), brow_slice(m.bi_cu, s.k, 1, 2));
+    const int biv = g_sw_bi.load(std::memory_order_relaxed);
+    /* Lever BI-e (ds41_bi 7 / 9): a dense GGUF linear in one launch where each segment's own launch is the decode band
+     * (the decode rows, <= 48) or the WMMA band (every prefill sequence, > 48): gemm_nt_ggml_dual over [0, DT) and
+     * [DT, T) (ggd 1), or, with no decode rows, gemm_nt_ggml over the step (ggd 2: above the band a row's bytes do not
+     * depend on the launch's rows -- the WMMA kernel and lever GPF's forms). Else (0) by segment. */
+    int ggd = 0;
+    const int64_t DT0 = sg[0].dec ? sg[0].n : 0;
+    if (bi_ggdual(biv)) {
+        bool pf = true;
+        for (const BiSeg& s : sg) pf = pf && (s.dec || s.n > kBiBand);
+        if (pf && DT0 > 0 && DT0 <= kBiBand && DT0 < T) ggd = 1;
+        else if (pf && DT0 == 0) ggd = 2;
+    }
+    /* view(r0, n) -> the operand of rows [r0, r0 + n) */
+    auto RV = [&](rad_buf h) { return [&R, h](int64_t r0, int64_t n) { return R(h, r0, n); }; };
+    auto lin2 = [&](rad_op h, rad_weight w, const auto& vin, const auto& vout) -> bool {
+        if (ggd == 1) {
+            const auto d = m.bi_dual.find(h);
+            if (d == m.bi_dual.end()) return false;
+            RAD_ISSUE_N(x, d->second, T, vin(0, DT0), RAD_W(w), vout(0, DT0), vin(DT0, T - DT0), vout(DT0, T - DT0));
+            return true;
+        }
+        if (ggd == 2) {
+            const auto t = m.wty.find(w);
+            if (t == m.wty.end() || (std::strcmp(t->second, "q5_K") && std::strcmp(t->second, "q6_K") &&
+                                     std::strcmp(t->second, "q8_0")))
+                return false;
+            lin_issue(x, m, h, T, vin(0, T), w, vout(0, T));
+            return true;
+        }
+        return false;
+    };
+    /* Lever BI 8 / 9: the step's EXL3 bands, on the card (recorded with the pass): the decode rows and every prefill
+     * sequence of <= 16 rows 1 (the M <= 16 band's down arithmetic in MoeFP8::pass_bi's one pass), the rest 0 */
+    bool band = false;
+    if (bi_band(biv) && m.x3b.dev && m.bi_one && m.bi_zero && T <= m.x3b.cap) {
+        for (const BiSeg& s : sg) band = band || !s.dec;
+        if (band)
+            for (const BiSeg& s : sg)
+                RAD_ISSUE_N(x, (s.dec || s.n <= kBiMoe) ? m.bi_one : m.bi_zero, s.n, brow_slice(m.x3b.dev, s.r0, s.n, 1));
+    }
 
     /* the step's head ops: as step() (per-token, over the step) */
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
@@ -3664,7 +3747,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
             RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
             /* the Engram GEMM (gemm_nt_ggml, banded) by segment */
-            rows(kBiBand, [&](int64_t r0, int64_t n) { lin_issue(x, m, L.e_gemm, n, R(m.embd, r0, n), L.e_kv, R(m.ekv, r0, n)); });
+            if (!lin2(L.e_gemm, L.e_kv, RV(m.embd), RV(m.ekv)))
+                rows(kBiBand, [&](int64_t r0, int64_t n) { lin_issue(x, m, L.e_gemm, n, R(m.embd, r0, n), L.e_kv, R(m.ekv, r0, n)); });
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
@@ -3739,9 +3823,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     kvn(s.r0, s.n);
             };
             if (cheap) {   /* C: op by op across the segments; the never-flipping per-row ops once over the step */
-                for (const BiSeg& s : sg) lin_issue(x, m, L.q_a, s.n, R(m.xn, s.r0, s.n), L.wq_a, R(m.qr, s.r0, s.n));
-                for (const BiSeg& s : sg) lin_issue(x, m, L.kv_g, s.n, R(m.xn, s.r0, s.n), L.wkv, R(m.kv, s.r0, s.n));
-                if (L.i_score)
+                if (!lin2(L.q_a, L.wq_a, RV(m.xn), RV(m.qr)))
+                    for (const BiSeg& s : sg) lin_issue(x, m, L.q_a, s.n, R(m.xn, s.r0, s.n), L.wq_a, R(m.qr, s.r0, s.n));
+                if (!lin2(L.kv_g, L.wkv, RV(m.xn), RV(m.kv)))
+                    for (const BiSeg& s : sg) lin_issue(x, m, L.kv_g, s.n, R(m.xn, s.r0, s.n), L.wkv, R(m.kv, s.r0, s.n));
+                if (L.i_score && !lin2(L.i_w, L.iproj, RV(m.xn), RV(m.iw)))
                     for (const BiSeg& s : sg) lin_issue(x, m, L.i_w, s.n, R(m.xn, s.r0, s.n), L.iproj, R(m.iw, s.r0, s.n));
                 if (qfold)
                     for (const BiSeg& s : sg)
@@ -3753,9 +3839,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     for (const BiSeg& s : sg) kvn_seg(s);
                 else
                     RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
-                if (L.i_score)
+                if (L.i_score && !lin2(L.i_q, L.iq_w, RV(m.qrn), RV(m.iq)))
                     for (const BiSeg& s : sg) lin_issue(x, m, L.i_q, s.n, R(m.qrn, s.r0, s.n), L.iq_w, R(m.iq, s.r0, s.n));
-                if (!qfold)
+                if (!qfold && !lin2(L.q_b, L.wq_b, RV(m.qrn), RV(m.q)))
                     for (const BiSeg& s : sg) lin_issue(x, m, L.q_b, s.n, R(m.qrn, s.r0, s.n), L.wq_b, R(m.q, s.r0, s.n));
                 if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
                 if (!L.src && L.i_score) {
@@ -3943,16 +4029,20 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             }
             bt_pt(x, m, m.o, T, "o", l);
             const int64_t gd = HD / m.gr;
-            rows(kBiBand, [&](int64_t r0, int64_t n) {
-                for (int j = 0; j < m.gr; ++j)
-                    lin_issue(x, m, L.o_a[(size_t)j], n, C(m.o, j * gd, gd, r0, n), L.wo_a[(size_t)j],
-                              C(m.oa, j * c.o_rank, c.o_rank, r0, n));
-            });
+            for (int j = 0; j < m.gr; ++j) {
+                const auto vin = [&](int64_t r0, int64_t n) { return C(m.o, j * gd, gd, r0, n); };
+                const auto vout = [&](int64_t r0, int64_t n) { return C(m.oa, j * c.o_rank, c.o_rank, r0, n); };
+                if (!lin2(L.o_a[(size_t)j], L.wo_a[(size_t)j], vin, vout))
+                    rows(kBiBand, [&](int64_t r0, int64_t n) {
+                        lin_issue(x, m, L.o_a[(size_t)j], n, vin(r0, n), L.wo_a[(size_t)j], vout(r0, n));
+                    });
+            }
             bt_pt(x, m, m.oa, T, "oa", l);
             if (late) mix_a();
-            rows(kBiBand, [&](int64_t r0, int64_t n) {
-                lin_issue(x, m, L.o_b, n, R(m.oa, r0, n), L.wo_b, R(m.attn_out, r0, n));
-            });
+            if (!lin2(L.o_b, L.wo_b, RV(m.oa), RV(m.attn_out)))
+                rows(kBiBand, [&](int64_t r0, int64_t n) {
+                    lin_issue(x, m, L.o_b, n, R(m.oa, r0, n), L.wo_b, R(m.attn_out, r0, n));
+                });
             bt_pt(x, m, m.attn_out, T, "attn_out", l);
         }
         /* the attention's all-reduce over the step (exact: 0 + r0 + .. + r3 a value), then post / collapse / norm (a
@@ -3985,7 +4075,6 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bs.fn = mix_f_beside;
         bs.arg = &mb;
         {   /* ds41_bi 2 / 4 / 6: the decode segment in pieces within the EXL3 decode band; 5 / 6: one all-reduce */
-            const int biv = g_sw_bi.load(std::memory_order_relaxed);
             const int64_t piece = bi_pieces(biv) ? kBiMoe : ((int64_t)1 << 40);
             /* The MoE's passes: (first row, rows). A hook point for a dual-form expert launch (fn4): the passes are the
              * row groups whose expert arithmetic must be each group's own. */
@@ -3995,14 +4084,31 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 if (!s.dec || s.n <= piece) { passes.emplace_back(s.r0, s.n); continue; }
                 for (int64_t a = 0; a < s.n; a += piece) passes.emplace_back(s.r0 + a, std::min(piece, s.n - a));
             }
+            /* 8 / 9: one routed pass over the step with the bands (fn4 BI-dual); the passes are its pieces */
+            bool one = false;
+            if (band && passes.size() > 1) {
+                static thread_local std::vector<int64_t> pa, pn;
+                pa.clear();
+                pn.clear();
+                for (const auto& ps : passes) {
+                    pa.push_back(ps.first);
+                    pn.push_back(ps.second);
+                }
+                one = L.moe.pass_bi(x, T, pa.data(), pn.data(), (int)pa.size(), m.x3b.dev, true, &bs);
+                if (one && l == 0) {
+                    g_bi_moe.fetch_add(1, std::memory_order_relaxed);
+                    g_bi_band.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             /* one all-reduce over the step: only where the block reduces its gathered delta in one collective */
             const bool onear = bi_onear(biv) && passes.size() > 1 && !L.moe.op_moe_ar && !L.moe.op_shared_ar &&
                                !L.moe.op_combine && !L.moe.op_add;
             for (const auto& ps : passes) {
+                if (one) break;
                 L.moe.pass(x, T, ps.first, ps.second, !onear, &bs);
                 if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
             }
-            if (onear && L.moe.issues_ar(T, T)) {
+            if (!one && onear && L.moe.issues_ar(T, T)) {
                 L.moe.issue_ar(x, 0, T, false);
                 if (l == 0) g_bi_onear.fetch_add(1, std::memory_order_relaxed);
             }

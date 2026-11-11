@@ -1181,6 +1181,29 @@ extern "C" int r4d_fuse_rmsnorm_gemm_nt_ggml(const RadParam* p, int n_p, uint64_
     }
 }
 
+/* gemm_nt_ggml_dual (lever BI-e) -- two gemm_nt_ggml over one weight in one launch where the pair allows it (rows:
+ * gemm_nt_ggml_dual_qk256 / _qk32; kernel r4d_ds41_ggml_dual.hip). Operands [0] a  [1] w  [2] y  [3] a1  [4] y1. Each group's
+ * bytes are its own gemm_nt_ggml's. */
+extern "C" int r4d_fuse_gemm_nt_ggml_dual(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "K") <= 0 || pi(p, n_p, "N") <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "type").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2 });                 /* a, w, y */
+    }
+    case 1: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "type").mirror(p, n_p, "dtype");
+        return s.wire({ 3, 1, 4 });                 /* a1, w, y1 */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
 extern "C" int r4d_fuse_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p, uint64_t present, int step,
                                                     RadFuseStep* out) {
     (void)present;

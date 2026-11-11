@@ -70,8 +70,10 @@
  *  r4d_selftest --mrcheck byte-compares this form against the stock path at every DeepSeek-V4.1 dense TP4
  *  shape, q5_K / q6_K / q8_0, M = 1..48; tests/r4d_emu's ds41mr runs both kernels on the host emulator.
  */
+#ifndef R4D_GG_MR_KERNEL_ONLY   /* r4d_ds41_ggml_dual.hip includes the kernel's body only (it includes the blocks itself) */
 #define R4D_GG_BLOCKS_ONLY 1
 #include "r4d_ds41_ggml.hip"
+#endif
 
 #include <cstdio>
 
@@ -304,8 +306,10 @@ __device__ __forceinline__ void mr_norm_scales(const GgMrArgs& A, int m0, int mc
     lds_barrier();
 }
 
+/* The form's block: (bx, by) the block's (blockIdx.x, blockIdx.y) in the form's own grid -- gg_mr_kernel passes those;
+ * lever BI-e's one-launch pair (r4d_ds41_ggml_dual.hip) passes a block's index in its decode group the same way. */
 template <int T, int H, int R, int MT, typename OT, int PRO = 0>
-__global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
+__device__ __forceinline__ void gg_mr_body(const GgMrArgs& A, const int bx, const int by) {
     using Q = Gg<T>;
     static_assert(H == 1 || H == 2 || H == 4 || H == 8, "row slots a wave");
     constexpr int LPR = 32 / H, VPS = 32 * LPR, PD = mr_pd<MT, R>();
@@ -317,8 +321,8 @@ __global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
 #endif
     const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5, nw = (int)blockDim.x >> 5;
     const int g = lane / LPR, i = lane - g * LPR;
-    const int nl = ((int)blockIdx.x * nw + wave) * (H * R) + g * R;   /* this lane's first weight row */
-    const int m0 = (int)blockIdx.y * MT, mc = min(MT, A.M - m0);
+    const int nl = (bx * nw + wave) * (H * R) + g * R;   /* this lane's first weight row */
+    const int m0 = by * MT, mc = min(MT, A.M - m0);
     const uint8_t* wr[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) wr[r] = A.w + (long long)min(nl + r, A.N - 1) * A.w_ld;
@@ -432,6 +436,14 @@ __global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
     }
 }
 
+template <int T, int H, int R, int MT, typename OT, int PRO = 0>
+__global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
+    gg_mr_body<T, H, R, MT, OT, PRO>(A, (int)blockIdx.x, (int)blockIdx.y);
+}
+
+#ifdef R4D_GG_MR_KERNEL_ONLY
+}  // namespace
+#else
 /* ------------------------------------------------------------------ forms
  * (H, R, MT): H weight rows a wave side by side, R a lane, MT activation rows a block. MT is the accumulator
  * count's third factor (R x MT x H floats a lane, <= 96) and one stage of MT rows must fit kMrLdsMax. */
@@ -748,3 +760,4 @@ int r4d_gg_mr_emu_stock(const R4dGgMrCall& c, int rpw) {
 #undef MR_EMU_ST
 }
 #endif
+#endif  /* R4D_GG_MR_KERNEL_ONLY */

@@ -468,4 +468,142 @@ static void ds_bi_check(const Plugin& pl, const char* classes, const char* mlist
     dfree_all();
     std::printf("BICHECK summary: %d cases, %d invariant, %d flip, %d skipped\n", n, inv, flip, sk);
 }
+
+/* --dualcheck [M0 list] [M1 list] [reps] (lever BI-e): gemm_nt_ggml_dual against the two gemm_nt_ggml launches the engine
+ * issues today for a mixed step's decode group (M0 rows, the decode band) and prefill group (M1 rows, above it), byte for
+ * byte over every output of both groups, at DeepSeek-V4.1-Flash's dense TP4 shapes and types (bicheck's gg cases), under
+ * the run's environment (RADIANCE_DS41_GG_GEMV / _GG_PF / _GG_PF_TABLE pick the separate launches' forms as in the engine).
+ * The pair is launched in both block orders (decode blocks first / last, r4d_gg_dual_pin 1 / 2). Then, at a few (M0, M1),
+ * the time of the pair (each order) against the two launches (`reps` back to back, events, the mean). One line a (case,
+ * M1): DUALCHECK <case> M1=<m1>: IDENTICAL at <n> M0 | DIFF at M0=<list> -- form <the last one-launch form>. */
+static void ds_dual_check(const Plugin& pl, const char* m0l, const char* m1l, int reps) {
+    auto parse = [](const char* l, std::vector<long long> d) {
+        if (!l || !*l) return d;
+        std::vector<long long> v;
+        for (const char* s = l; *s;) {
+            char* e = nullptr;
+            const long long x = std::strtoll(s, &e, 10);
+            if (e == s) break;
+            if (x >= 1 && x <= 65535) v.push_back(x);
+            s = *e == ',' ? e + 1 : e;
+        }
+        return v.empty() ? d : v;
+    };
+    const std::vector<long long> M0s = parse(m0l, { 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17, 24, 25, 30, 32, 40, 47, 48 });
+    const std::vector<long long> M1s = parse(m1l, { 49, 64, 100, 128, 2112, 4160 });
+    if (reps < 1) reps = 20;
+    const auto pin = (void (*)(int))dlsym(pl.h, "r4d_gg_dual_pin");
+    const auto last = (const char* (*)())dlsym(pl.h, "r4d_gg_dual_last");
+    std::printf("lever BI-e dual check: gemm_nt_ggml_dual (a: M0 rows, a1: M1 rows) vs gemm_nt_ggml at M0 and at M1, byte for "
+                "byte, both block orders; env RADIANCE_DS41_GG_GEMV=%s _GG_PF=%s; hooks %s\n",
+                std::getenv("RADIANCE_DS41_GG_GEMV") ? std::getenv("RADIANCE_DS41_GG_GEMV") : "(unset)",
+                std::getenv("RADIANCE_DS41_GG_PF") ? std::getenv("RADIANCE_DS41_GG_PF") : "(unset)",
+                pin && last ? "found" : "MISSING (r4d_gg_dual_pin / _last)");
+    if (!pin || !last) { ++g_fail; return; }
+    const long long M0max = *std::max_element(M0s.begin(), M0s.end()), M1max = *std::max_element(M1s.begin(), M1s.end());
+    int ncase = 0, nsame = 0, ndiff = 0;
+    for (const bi::Case& c : bi::cases()) {
+        if (c.op != "gemm_nt_ggml" || c.ggtype.empty()) continue;
+        const MrTy* ty = nullptr;
+        for (const MrTy& t : kMrTypes)
+            if (c.ggtype == t.name) ty = &t;
+        if (!ty) { std::printf("DUALCHECK %s: SKIP (type not generated)\n", c.label.c_str()); continue; }
+        const long long N = bi::param(c.ps, "N")->ival, K = bi::param(c.ps, "K")->ival;
+        dfree_all();
+        std::vector<uint8_t> hw;
+        mr_weights(hw, *ty, N, K, std::hash<std::string>{}(c.label) ^ 0x5bd1e995u);
+        void* wd = dalloc(hw.size());
+        const long long R = M0max + M1max;
+        std::vector<uint16_t> hx((size_t)(R * K));
+        for (long long i = 0; i < R * K; ++i) hx[(size_t)i] = h_to_bf16(bi::normalish(bi::key(7, (uint64_t)i, (uint64_t)K, 3)));
+        void* xd = dalloc(hx.size() * 2);
+        void* yr = dalloc((size_t)(R * N) * 2);
+        void* yd = dalloc((size_t)(R * N) * 2);
+        if (!wd || !xd || !yr || !yd) { std::printf("DUALCHECK %s: SKIP (alloc)\n", c.label.c_str()); continue; }
+        st_memcpy(wd, hw.data(), hw.size(), hipMemcpyHostToDevice);
+        st_memcpy(xd, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+        const RadTensor tw = T(wd, RAD_U8, { N, K / ty->qk * ty->bb });
+        auto xs = [&](long long r0, long long n) { return T((uint16_t*)xd + r0 * K, RAD_BF16, { n, K }); };
+        auto ysl = [&](void* y, long long r0, long long n) { return T((uint16_t*)y + r0 * N, RAD_BF16, { n, N }); };
+        /* the separate launches: gemm_nt_ggml's row at each group's M, as the engine picks it */
+        auto one = [&](long long r0, long long n) -> int {
+            const std::vector<RadParam> ps = bi::with_m(c.ps, n);
+            const RadKernelInfo* r = bi::pick(pl, "gemm_nt_ggml", ps);
+            if (!r) return RAD_E_UNSUPPORTED;
+            return launch_row(r, { xs(r0, n), tw, ysl(yr, r0, n) }, ps);
+        };
+        auto dual = [&](long long M0, long long M1) -> int {
+            const std::vector<RadParam> ps = bi::with_m(c.ps, std::max(M0, M1));
+            const RadKernelInfo* r = bi::pick(pl, "gemm_nt_ggml_dual", ps);
+            if (!r) return RAD_E_UNSUPPORTED;
+            return launch_row(r, { xs(0, M0), tw, ysl(yd, 0, M0), xs(M0, M1), ysl(yd, M0, M1) }, ps);
+        };
+        ++ncase;
+        for (long long M1 : M1s) {
+            std::vector<long long> diff;
+            int n = 0, fails = 0;
+            std::string form;
+            for (long long M0 : M0s) {
+                const size_t bytes = (size_t)((M0 + M1) * N) * 2;
+                st_memset(yr, 0xA5, bytes);
+                if (one(0, M0) != RAD_OK || one(M0, M1) != RAD_OK) { ++fails; continue; }
+                std::vector<uint8_t> ref(bytes), got(bytes);
+                st_memcpy(ref.data(), yr, bytes, hipMemcpyDeviceToHost);
+                bool same = true;
+                for (int order : { 1, 2 }) {
+                    pin(order);
+                    st_memset(yd, 0x5A, bytes);
+                    const int rc = dual(M0, M1);
+                    pin(0);
+                    if (rc != RAD_OK) { ++fails; same = false; break; }
+                    st_memcpy(got.data(), yd, bytes, hipMemcpyDeviceToHost);
+                    same = same && got == ref;
+                    if (order == 1) form = last();
+                }
+                ++n;
+                if (!same) diff.push_back(M0);
+            }
+            if (fails) ++g_fail;
+            if (diff.empty()) ++nsame; else ++ndiff;
+            std::string l;
+            for (size_t i = 0; i < diff.size(); ++i) l += fmt("%s%lld", i ? "," : "", diff[i]);
+            std::printf("DUALCHECK %s M1=%lld: %s at %d M0%s -- form %s\n", c.label.c_str(), M1,
+                        diff.empty() ? "IDENTICAL" : fmt("DIFF at M0=%s", l.c_str()).c_str(), n,
+                        fails ? fmt(" (%d launch failures)", fails).c_str() : "", form.empty() ? "(none)" : form.c_str());
+            std::fflush(stdout);
+        }
+        /* the time: the two launches vs the pair (each order), reps back to back */
+        hipEvent_t e0, e1;
+        st_ev_create(&e0);
+        st_ev_create(&e1);
+        for (long long M1 : { 2112LL, 4160LL })
+            for (long long M0 : { 4LL, 8LL, 24LL, 48LL }) {
+                if (M0 > M0max || M1 > M1max) continue;
+                float tt[3] = { 0, 0, 0 };
+                for (int v = 0; v < 3; ++v) {
+                    if (v) pin(v);
+                    (void)(v ? dual(M0, M1) : (one(0, M0) | one(M0, M1)));   /* warm */
+                    st_ev_record(e0, nullptr);
+                    for (int i = 0; i < reps; ++i) {
+                        if (v) (void)dual(M0, M1);
+                        else { (void)one(0, M0); (void)one(M0, M1); }
+                    }
+                    st_ev_record(e1, nullptr);
+                    st_ev_sync(e1);
+                    st_ev_elapsed(&tt[v], e0, e1);
+                    pin(0);
+                }
+                std::printf("DUALTIME %s M0=%lld M1=%lld: two launches %.1f us, pair decode-first %.1f us (%+.1f %%), "
+                            "decode-last %.1f us (%+.1f %%)\n", c.label.c_str(), M0, M1, 1000.0 * tt[0] / reps,
+                            1000.0 * tt[1] / reps, 100.0 * (tt[1] / tt[0] - 1), 1000.0 * tt[2] / reps,
+                            100.0 * (tt[2] / tt[0] - 1));
+                std::fflush(stdout);
+            }
+        st_ev_destroy(e0);
+        st_ev_destroy(e1);
+    }
+    dfree_all();
+    std::printf("DUALCHECK summary: %d cases, %d (case, M1) identical, %d differ\n", ncase, nsame, ndiff);
+    if (ndiff) ++g_fail;
+}
 #endif

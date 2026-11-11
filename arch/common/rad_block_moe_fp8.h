@@ -629,6 +629,10 @@ struct MoeFP8 {
      * all-reduce itself (issue_ar), as GdnFP8::step describes. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
               const Beside* beside = nullptr) const;
+    /* Lever BI (deepseek41 ds41_bi 8 / 9): one routed pass over a segmented step with the band set for its EXL3 down;
+     * the selection and the shared arm by piece (the definition says what and why). False: nothing issued. */
+    bool pass_bi(RadCtx* c, int64_t T, const int64_t* pa, const int64_t* pn, int np, rad_buf band, bool own_ar,
+                 const Beside* beside) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -2561,6 +2565,141 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_add, rows, brow_slice(w.x, r0, rows, g.n_embd),
                     brow_slice(w.h.x, r0, rows, g.n_embd),
                     brow_slice(w.x, r0, rows, g.n_embd));
+}
+
+/* Lever BI with fn4's BI-dual down (deepseek41 ds41_bi 8 / 9, 11.11.2026): ONE routed pass over a segmented step's rows
+ * [0, T). The pieces [pa[i], pa[i] + pn[i]) are the row groups the segmented step would run as passes of their own, in
+ * order, covering [0, T). Per piece, as pass() issues them for a pass of exactly those rows: the input's norm (unless the
+ * caller wrote it), the selection (the router and its top-k, in the form pass() takes at that piece's rows: the fused
+ * selection-and-sort where it would, whose sort this pass's own then replaces), and the shared arm (gate, gate_up, its
+ * activation, down -- its GEMMs at the piece's rows, so in the band the piece's own pass gives them). Once over [0, T): the
+ * sort (moe_scatter over every row's top-k), the expert prefetch hooks, the EXL3 gate_up (the same bits in both bands at
+ * DeepSeek's widths, fn4 177b), the EXL3 down with `band` (set_band: a row marked non-zero gets the M <= 16 band's down
+ * arithmetic, the others the M > 16 band's), the gather (+ its all-reduce: ARGATHER where pass() would take it over a
+ * one-pass step of T rows), each per row. So every row gets the bytes of its piece's own pass, each routed expert's
+ * weights are read once, and the step has one sort, one gather and one all-reduce. Returns false, issuing nothing, where
+ * the block cannot: not EXL3, no band, no stand-alone sort op, a rotated / IQR quantiser of the input, protected
+ * experts, a calibration tap, the shared arm's second lane switched on for these rows (it is not taken here). */
+inline bool MoeFP8::pass_bi(RadCtx* c_, int64_t T, const int64_t* pa, const int64_t* pn, int np, rad_buf band,
+                            bool own_ar, const Beside* beside) const {
+    if (!c.expert_exl3 || !band || np < 1 || !op_scatter || op_hq || op_aq || op_pgu || op_gram_gu || T < 1) return false;
+    {
+        int64_t at = 0;
+        for (int i = 0; i < np; ++i) {
+            if (pa[i] != at || pn[i] < 1) return false;
+            at += pn[i];
+        }
+        if (at != T) return false;
+    }
+    const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
+    const bool shared = op_sgate != 0;
+    const bool swf = shared && op_swfold && swfold_live && swfold_live->load(std::memory_order_relaxed) > 0;
+    const RadOperand ecnt = brows(w.ecnt, ne);
+    /* per piece: the norm and the selection, as pass() at (r0, rows) = the piece */
+    std::vector<char> gdone((size_t)np, 0);
+    for (int i = 0; i < np; ++i) {
+        const int64_t r0 = pa[i], rows = pn[i];
+        const bool rfused = op_router_fused && rows <= router_fused_rows;
+        const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
+        gdone[(size_t)i] = (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate);
+        if (!ext_in) nq_h.step(c_, T, r0, rows);
+        if (sfused) {
+            glm_router.project(c_, r0, rows, r0);
+            RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
+                        RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
+                        brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
+                        brows(w.eoff, ne + 1), ecnt,
+                        sigmoid_scatter_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                        scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
+        } else if (c.sigmoid_router) {
+            glm_router.step(c_, r0, rows, r0);
+        } else if (rfused) {
+            RAD_ISSUE_N(c_, op_router_fused, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+                        RAD_W(w_router), router_fused_gate ? RAD_W(w_sgate) : RAD_NONE,
+                        brow_slice(w.logits, r0, rows, ne_all),
+                        brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                        brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
+                        router_fused_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE);
+        } else {
+            RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
+                        brow_slice(w.logits, r0, rows, ne_all));
+        }
+        if (rfused || sfused) {
+            /* the fused launch wrote the selection (and a sort of the piece, replaced below) */
+        } else if (op_topk_scatter && rows <= topk_scatter_rows) {
+            RAD_ISSUE_N(c_, op_topk_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
+                        brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
+                        brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt);
+        } else if (!c.sigmoid_router) {
+            RAD_ISSUE_N(c_, op_topk, rows, brow_slice(w.logits, r0, rows, ne_all),
+                        brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k));
+        }
+    }
+    /* the sort, once over the step's rows (sorted_tok step-relative: the pass is the step) */
+    if (scatter_inv)
+        RAD_ISSUE_N(c_, op_scatter, T, brow_slice(w.ids, 0, T, k), brows(w.sorted, T * k), brows(w.eoff, ne + 1),
+                    ecnt, brows(w.inv, T * k));
+    else
+        RAD_ISSUE_N(c_, op_scatter, T, brow_slice(w.ids, 0, T, k), brows(w.sorted, T * k), brows(w.eoff, ne + 1),
+                    ecnt);
+    if (xp_next && xp_next->xp.n_parts > 0) (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, 0, T, g.n_embd);
+    route_report(c_);
+    (void)rad_expert_prefetch_step(c_, layer);
+    issue_exl3(c_, op_gu, EXL3_GATE_UP, T, brow_slice(w.h.x, 0, T, g.n_embd), brows(b_x3h, T * k));
+    /* the shared arm's first half by piece */
+    if (shared)
+        for (int i = 0; i < np; ++i) {
+            shared_up(c_, T, pa[i], pn[i], gdone[(size_t)i] != 0);
+            if (!swf) gq_sh.step(c_, w.sgu, T, pa[i], pn[i]);
+        }
+    if (beside && beside->fn) beside->fn(c_, beside->arg);
+    set_band(band);
+    issue_exl3(c_, op_dn, EXL3_DOWN, T, brows(b_x3h, T * k), brows(w.edn, T * k), 0);
+    set_band(0);
+    (void)rad_expert_prefetch_mark(c_);
+    /* the shared arm's down by piece */
+    if (shared)
+        for (int i = 0; i < np; ++i) {
+            const int64_t r0 = pa[i], rows = pn[i];
+            if (swf)
+                RAD_ISSUE_N(c_, op_swfold, rows, brow_slice(w.sgu, r0, rows, 2 * gq_sh.n), RAD_W(sh_down.w),
+                            brow_slice(w.sff.x, r0, rows, gq_sh.n), brow_slice(w.sout, r0, rows, sh_down.N));
+            else
+                sh_down.step(c_, w.sff, w.sout, T, r0, rows);
+        }
+    /* the gather (+ all-reduce) over [0, T): pass()'s tail at r0 = 0, rows = T */
+    const int64_t r0 = 0, rows = T;
+    int64_t gar_lim = gar_rows;
+    if (gar_live) {
+        const int lv = gar_live->load(std::memory_order_relaxed);
+        if (lv >= 0 && lv < gar_lim) gar_lim = lv;
+    }
+    const bool gar = op_gar && own_ar && T <= gar_lim && !op_combine && issues_ar(T, rows) &&
+                     !gather_taken(g, T, gather_out_rows, gather_out_rows6);
+    if (gar)
+        RAD_ISSUE_N(c_, op_gar, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
+                    brows(w.sorted, rows * k),
+                    gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
+                    gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    brow_slice(w.h.x, r0, rows, g.n_embd));
+    else if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
+        RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
+                    brows(gather_inv ? w.inv : w.sorted, rows * k),
+                    gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
+                    gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    brow_slice(op_combine ? w.moe : w.h.x, r0, rows, g.n_embd));
+    if (op_moe_ar)
+        RAD_ISSUE_N(c_, op_moe_ar, rows * g.n_embd, brow_slice(w.moe, r0, rows, g.n_embd), RAD_NONE);
+    if (op_shared_ar)
+        RAD_ISSUE_N(c_, op_shared_ar, rows * g.n_embd, brow_slice(w.sout, r0, rows, g.n_embd), RAD_NONE);
+    if (op_combine)
+        RAD_ISSUE_N(c_, op_combine, rows, brow_slice(w.moe, r0, rows, g.n_embd),
+                    brow_slice(w.sout, r0, rows, g.n_embd), brow_slice(w.h.x, r0, rows, g.n_embd));
+    if (own_ar && issues_ar(T, rows) && !gar) issue_ar(c_, r0, rows, false);
+    if (op_add)
+        RAD_ISSUE_N(c_, op_add, rows, brow_slice(w.x, r0, rows, g.n_embd), brow_slice(w.h.x, r0, rows, g.n_embd),
+                    brow_slice(w.x, r0, rows, g.n_embd));
+    return true;
 }
 
 /* One pass of the per-expert tap. The scatter's expert offsets are copied back first (they decide

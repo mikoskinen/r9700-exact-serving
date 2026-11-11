@@ -42,9 +42,11 @@
  *
  *  ABL != 0 (bench only, never a rule): timing ablations whose outputs DIFFER -- 1 no chain-init / min group-sum
  *  LDS reads (c0 = 0, min term 0), 2 no B decode (raw words as fragments), 4 no per-group fma (one chain a slab). */
+#ifndef R4D_GG_PF_KERNEL_ONLY   /* r4d_ds41_ggml_dual.hip includes the kernel's body only (it includes the blocks itself) */
 #define R4D_GG_BLOCKS_ONLY 1
 #define R4D_GG_WM_SRC 1
 #include "r4d_ds41_ggml.hip"
+#endif
 #include "r4d_ds41_ggml_pf.h"
 
 #include <atomic>
@@ -56,8 +58,10 @@
 
 namespace {
 
+/* The form's block: (bx, by) the block's (blockIdx.x, blockIdx.y) in the form's own grid -- gg_pf_kernel passes those;
+ * lever BI-e's one-launch pair (r4d_ds41_ggml_dual.hip) passes a block's index in its prefill group the same way. */
 template <int T, int MT, int NT, int WN, typename OT, int ABL, int FI>
-__global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
+__device__ __forceinline__ void gg_pf_body(const GgTiledArgs& A, const int bx, const int by) {
     using W = Wq<T>;
     using Pf = typename W::Pf;
     constexpr int NTH = WN * 32;
@@ -75,10 +79,10 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
     const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
     /* Dense rows: the block's live rows are r0 .. r1 - 1 (the stock's s_tok = i there, -1 past), so its live 16-row
      * tiles are the first ceil((r1 - r0) / 16) (the stock's s_nmt) and a dead row stages r1 - 1 (its s_any). */
-    const int r0 = (int)blockIdx.x * BM, r1 = min(r0 + BM, A.M);
+    const int r0 = bx * BM, r1 = min(r0 + BM, A.M);
     const int nmt = (r1 - r0 + 15) >> 4;
     const int tany = r1 - 1;
-    const int n0 = (int)blockIdx.y * BN;
+    const int n0 = by * BN;
     W::table(gg_smem);
     uint16_t* Xs = (uint16_t*)(void*)(gg_smem + W::TB);
     float* Xg = (float*)(void*)(gg_smem + W::TB + 2 * XE * 2);
@@ -418,11 +422,20 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
     }
 }
 
+template <int T, int MT, int NT, int WN, typename OT, int ABL, int FI>
+__global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
+    gg_pf_body<T, MT, NT, WN, OT, ABL, FI>(A, (int)blockIdx.x, (int)blockIdx.y);
+}
+
 /* LDS of a form: the table, the two staged slabs, their group sums (gg_wm_lds at BM = 16 MT). */
 template <int T>
 constexpr unsigned pf_lds(int mt) {
     return (unsigned)(Wq<T>::TB + 2 * 16 * mt * kWmXP * 2 + (Wq<T>::XG > 0 ? 2 * (kWmS / Wq<T>::XG) * 16 * mt * 4 : 0));
 }
+
+#ifdef R4D_GG_PF_KERNEL_ONLY
+}  // namespace
+#else
 
 /* ---- the forms built: (MT, NT, WN, FI) for every type, and the ablations on the stock geometry. A form's code is
  * 100 MT + 10 NT + WN / 4 + 4 FI (322 = the stock geometry and order, 326 the same with the folds interleaved), plus
@@ -553,6 +566,17 @@ int r4d_gg_pf_set(int v) {
     return 1;
 }
 int r4d_gg_pf_get() { return g_pf_on.load(std::memory_order_relaxed); }
+/* The form r4d_gg_pf_gemm takes for (type, N, K) now -- a code, or 0 for the stock WMMA kernel (off, or no form) -- for lever
+ * BI-e's one-launch pair (r4d_ds41_ggml_dual.hip), which runs that form's body over its prefill group. */
+int r4d_gg_pf_code(int ty, int N, int K) {
+    if (!r4d_gg_pf_on()) return 0;
+    if (ty != GG_Q5_K && ty != GG_Q6_K && ty != GG_Q8_0) return 0;
+    if (N < 1 || K < 2 * kWmS || K % (2 * kWmS)) return 0;
+    int code = g_pf_pin != 0 ? g_pf_pin : g_pf_on.load(std::memory_order_relaxed);
+    if (code == -1 || code == 1) code = pf_rule(ty, N, K);
+    if (code == 0 || !pf_form_known(code)) return 0;
+    return code;
+}
 
 int r4d_gg_pf_gemm(RadStream s, const R4dGgPfCall& c) {
     if (c.ty != GG_Q5_K && c.ty != GG_Q6_K && c.ty != GG_Q8_0) return R4D_GG_PF_DECLINE;
@@ -613,3 +637,4 @@ int r4d_gg_pf_emu_stock(const R4dGgPfCall& c) {
     }
 }
 #endif
+#endif  /* R4D_GG_PF_KERNEL_ONLY */

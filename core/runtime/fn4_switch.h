@@ -123,8 +123,11 @@
  *                   3 / 4 = 1 / 2 with the cheap issue (the query / key chains op by op across the segments, the
  *                   per-row ops that never flip once over the step). 5 / 6 = 3 / 4 with the MoE's all-reduce whole:
  *                   the passes gather without reducing and one all-reduce runs over the step's rows (the exact wire
- *                   sums each element alike at any size). RADIANCE_DS41_BI=0..6 declares it (and starts at that
- *                   value); unset: 1..6 refused. A step with
+ *                   sums each element alike at any size). 7 = 6 + the dense GGUF linears of a mixed step as one
+ *                   gemm_nt_ggml_dual launch (lever BI-e: the decode rows in the decode band's form, the prefill rows
+ *                   in the WMMA form, one grid); 8 = 6 + one routed MoE pass over a mixed step with fn4's EXL3 bands
+ *                   (exl3 interface v13: the decode rows' down in the M <= 16 band's arithmetic); 9 = 8 + 7.
+ *                   RADIANCE_DS41_BI=0..9 declares it (and starts at that value); unset: 1..9 refused. A step with
  *                   one segment runs today's issue either way. Changes the bytes of rows that shared a step with other
  *                   sequences (toward their alone bytes); a one-sequence step is unchanged.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation

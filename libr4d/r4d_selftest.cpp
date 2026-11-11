@@ -37806,6 +37806,8 @@ static void usage(void) {
                 "  --mxcheck / --bfcheck:  ds41-drk: the drafter's MXFP4 grouped GEMM (drafter_mx) / bf16\n"
                 "             skinny GEMM (drafter_bf) forms vs the stock kernels, byte for byte.\n"
                 "  --perfmx [tokens] [iters] / --perfbf [Ms] [iters]:  their timing at the drafter's shapes.\n"
+                "  --dualcheck [M0s] [M1s] [reps]:  lever BI-e: gemm_nt_ggml_dual vs the two gemm_nt_ggml launches\n"
+                "                  (decode group M0, prefill group M1), byte for byte, both block orders, + the time\n"
                 "  --bicheck [classes] [Ms]:  lever BI: per op, a row alone (M = 1) vs the same row inside\n"
                 "             an M-row launch, byte for byte, DeepSeek-V4.1's TP4 shapes (classes gg,f32,bf16,\n"
                 "             norm,mhc,rope,elem,router or all; Ms a comma list, default 1..64 and 65..4160).\n"
@@ -37979,6 +37981,7 @@ int main(int argc, char** argv) {
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
+    bool duc = false; const char* du_0 = nullptr; const char* du_1 = nullptr; int du_r = 0;   /* --dualcheck (BI-e) */
     bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
     bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
     const char* mx_skew = nullptr;
@@ -38219,6 +38222,12 @@ int main(int argc, char** argv) {
             (argv[i][6] == 'm' ? mxp : bfp) = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) drk_l = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) drk_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--dualcheck")) {
+            /* lever BI-e: gemm_nt_ggml_dual vs the two gemm_nt_ggml launches, byte for byte, + the time (ds_dual_check). */
+            duc = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) du_0 = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) du_1 = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) du_r = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--bicheck")) {
             /* lever BI: a row alone vs the same row inside an M-row launch, per op, byte for byte (ds_bi_check). */
             bic = true;
@@ -38498,6 +38507,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("lever GPF prefill forms", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
+    }
+    if (duc) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        ds_dual_check(pl, du_0, du_1, du_r);
+        dfree_all();
+#else
+        skip("lever BI-e dual check", "built without HIP");
 #endif
         return g_fail ? 1 : 0;
     }

@@ -39,5 +39,7 @@ int r4d_gg_pf_set(int v);
 int r4d_gg_pf_get();
 /* Whether `v` is a value gg_pf takes. */
 int r4d_gg_pf_known(int v);
+/* The form code r4d_gg_pf_gemm takes for a (GG_* type, N, K) now, or 0 for the stock WMMA kernel (lever BI-e's pair). */
+int r4d_gg_pf_code(int ty, int N, int K);
 
 #endif

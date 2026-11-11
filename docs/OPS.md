@@ -811,6 +811,7 @@ may not have arrived.
 | `gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y` |
 | `rmsnorm_gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` `eps`:f64 `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w, `g`w → `h`, `y` (device-only: rmsnorm (x, g → h; n = K), then gemm_nt_ggml (h, w → y)) |
 | `swiglu_clamped_gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` `limit`:f64 | `gate_up`, `w`w → `h`, `y` (device-only: swiglu_clamped (gate_up [M, 2K] → h; n = K), then gemm_nt_ggml (h, w → y)) |
+| `gemm_nt_ggml_dual` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y`; `a1` → `y1` (device-only: gemm_nt_ggml (a, w → y) and gemm_nt_ggml (a1, w → y1), each group's bytes its own launch's) |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
 a transformer already has. `gemm_nt_q`'s `dtype` names the operand combination, so one op covers
@@ -1295,6 +1296,15 @@ stores them to `h`. Every other pass (another `gg_gemv` form, prefill heights, a
 launches. The GGUF weight is operand 1, as `gemm_nt_ggml`'s, so both read one stored form. DeepSeek-V4.1 declares
 them beside the pairs under RADIANCE_DS41_QNFOLD / RADIANCE_DS41_SWFOLD (lever K1 folds a and e) and picks per step
 (the ds41_qnfold / ds41_swfold switches).
+
+**`gemm_nt_ggml_dual`** (device-only) is `gemm_nt_ggml` over two row groups of one weight: `y` = `a` . w^T and `y1` =
+`a1` . w^T, each group exactly the bytes `gemm_nt_ggml` gives it at its own rows. libr4d runs a pair whose first group
+is in the decode band (up to 48 rows) and whose second is above it on the WMMA kernel as ONE launch: one grid whose
+first (or last) blocks run lever D2's multi-row form over `a` and the rest the WMMA form over `a1` (lever GPF's code for
+the shape, else the stock geometry, 322), each block that form's kernel body at the block index its own launch gives
+it (r4d_ds41_ggml_dual.hip). Every other pair is the two launches. DeepSeek-V4.1 issues it under lever BI (ds41_bi 7 /
+9) for a mixed step's dense GGUF linears: the decode rows and every prefill row in one launch, a weight read beside
+itself instead of twice.
 
 | op | params | operands |
 |---|---|---|

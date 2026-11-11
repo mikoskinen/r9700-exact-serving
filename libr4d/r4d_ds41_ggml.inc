@@ -119,6 +119,12 @@ static const RadConstraint cDs41GgFold256[] = {
 static const RadConstraint cDs41GgFold32[] = {
     C_GE("M", 1), C_GE("N", 1), C_GE("K", 32), C_DIV("K", 32), C_IN("type", "q8_0"), C_IN("dtype", "bf16"),
 };
+/* Lever BI-e (gemm_nt_ggml_dual): gemm_nt_ggml's parameters and its GGUF weight at operand 1 (the same layout hooks); two
+ * row groups (a -> y, a1 -> y1). The constraints are gemm_nt_ggml's tiled rows' (the pair falls back to its two launches). */
+static const RadOperandSpec oDs41GemmGgmlDual[] = {
+    { "a", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 }, { "a1", RAD_OPD_IN, 0 },
+    { "y1", RAD_OPD_OUT, 0 },
+};
 #undef R4D_DS41_GG_T256
 #undef R4D_DS41_GG_T32
 
@@ -143,6 +149,10 @@ SCHEMA("rmsnorm_gemm_nt_ggml", pDs41NormGemmGgml, oDs41NormGemmGgml,
 SCHEMA("swiglu_clamped_gemm_nt_ggml", pDs41SwiGemmGgml, oDs41SwiGemmGgml,
        "swiglu_clamped (gate_up [M, 2K] -> h [M, K]; limit) then gemm_nt_ggml (h, w -> y; type, N, K): h and y as "
        "the two ops leave them. A clamped SwiGLU and its down projection (DeepSeek-V4.1's shared expert)."),
+SCHEMA("gemm_nt_ggml_dual", pDs41GemmGgml, oDs41GemmGgmlDual,
+       "gemm_nt_ggml over two row groups of one weight: y = a . w^T and y1 = a1 . w^T, each exactly as gemm_nt_ggml gives "
+       "it at its own rows (type, N, K, dtype as gemm_nt_ggml's). Lever BI's mixed step: a decode group and a prefill "
+       "group in one launch."),
 SCHEMA("embed_lookup_ggml", pDs41EmbedGgml, oDs41EmbedGgml,
        "embed_lookup from a table in llama.cpp's blocks of GGUF type `type`: the id's row dequantised as "
        "llama.cpp does, times `mult` when given, rounded once. Padding, bounds and vocab_offset behave as "
@@ -275,6 +285,22 @@ SCHEMA("embed_lookup_ggml", pDs41EmbedGgml, oDs41EmbedGgml,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgFold32), NOTUNE,
   nullptr, nullptr, r4d_rad_swiglu_clamped_gemm_nt_ggml, nullptr,
   R4D_DS41_GG_HOOKS(r4d_shape_swiglu_clamped_gemm_nt_ggml), r4d_fuse_swiglu_clamped_gemm_nt_ggml },
+
+/* Lever BI-e: one launch for a decode group in the decode band and a prefill group above it (the decode band's multi-row
+ * form's blocks and the WMMA form's blocks in one grid, r4d_ds41_ggml_dual.hip), else the two gemm_nt_ggml launches. */
+{ "gemm_nt_ggml_dual_qk256", "gemm_nt_ggml_dual", "gemm",
+  "gemm_nt_ggml over two row groups of one weight: a decode group (<= 48 rows) and a prefill group (> 48) in one grid, "
+  "each block running its group's form (lever D2's multi-row form, the WMMA form at lever GPF's code); else two launches",
+  "any M, N; K a multiple of 256", "bf16 a, a1, y and y1; gemm_nt_ggml's block types",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgTiled256), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_nt_ggml_dual, nullptr, R4D_DS41_GG_HOOKS(r4d_shape_gemm_nt_ggml_dual),
+  r4d_fuse_gemm_nt_ggml_dual },
+{ "gemm_nt_ggml_dual_qk32", "gemm_nt_ggml_dual", "gemm",
+  "gemm_nt_ggml_dual_qk256 over the 32-value block types", "any M, N; K a multiple of 32",
+  "bf16 a, a1, y and y1; q8_0 or iq4_nl blocks",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgTiled32), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_nt_ggml_dual, nullptr, R4D_DS41_GG_HOOKS(r4d_shape_gemm_nt_ggml_dual),
+  r4d_fuse_gemm_nt_ggml_dual },
 
 #undef R4D_DS41_GG_HOOKS
 #endif  /* R4D_HAVE_GGML */

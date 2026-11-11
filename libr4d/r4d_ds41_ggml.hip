@@ -41,6 +41,7 @@
 #include "r4d_plugin.h"
 #include "r4d_ds41_ggml_mr.h"
 #include "r4d_ds41_ggml_pf.h"
+#include "r4d_ds41_ggml_dual.h"
 #include "r4d_ds41_f32pf.h"
 #include "r4d_ds41_mxfp4_mr.h"
 #include "r4d_gemm_bf16_nt_pf.h"
@@ -3933,6 +3934,50 @@ int gg_moe(const RadArgs* a, RadStream s, bool gemv) {
 
 extern "C" int r4d_rad_gemm_nt_ggml_gemv(const RadArgs* a, RadStream s) { return gg_gemm(a, s, "N", "K", false, true); }
 extern "C" int r4d_rad_gemm_nt_ggml_tiled(const RadArgs* a, RadStream s) { return gg_gemm(a, s, "N", "K", false, false); }
+
+/* gemm_nt_ggml_dual (lever BI-e): gemm_nt_ggml over two row groups of one weight, (a, w -> y) and (a1, w -> y1), each
+ * group's bytes exactly gemm_nt_ggml's at its own rows. ONE launch where r4d_gg_dual_gemm takes the pair (a in the decode
+ * band, a1 above it on the WMMA kernel: r4d_ds41_ggml_dual.hip), else the two gemm_nt_ggml launches gg_gemm issues. */
+extern "C" int r4d_rad_gemm_nt_ggml_dual(const RadArgs* a, RadStream s) {
+    if (!a || a->n_t < 5) return R4D_NO(RAD_E_INVAL);
+    const RadTensor *w = r4d_opt(a, 1);
+    const RadTensor* xs[2] = { r4d_opt(a, 0), r4d_opt(a, 3) };
+    const RadTensor* ys[2] = { r4d_opt(a, 2), r4d_opt(a, 4) };
+    if (!w || !w->data) return R4D_NO(RAD_E_INVAL);
+    const GgType* gt = gg_type(r4d_gets(a, "type"));
+    if (!gt) return R4D_NO(RAD_E_DTYPE);
+    const long long N = r4d_geti_or(a, "N", 0), K = r4d_geti_or(a, "K", 0), Mb = r4d_geti_or(a, "M", 0);
+    if (N <= 0 || K <= 0 || K % gt->qk || N > 0x7fffffffLL || K > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);
+    long long M[2] = { 0, 0 }, x_ld[2] = { 0, 0 }, y_ld[2] = { 0, 0 };
+    int x_al[2] = { 0, 0 };
+    for (int g = 0; g < 2; ++g) {
+        const RadTensor *x = xs[g], *y = ys[g];
+        if (!x || !y || !x->data || !y->data) return R4D_NO(RAD_E_INVAL);
+        if (x->rank != 2 || x->dtype != RAD_BF16 || x->shape[1] != K || !gg_inner1(x)) return R4D_NO(RAD_E_SHAPE);
+        M[g] = x->shape[0];
+        if (M[g] <= 0 || M[g] > 0x7fffffffLL || (Mb > 0 && M[g] > Mb)) return R4D_NO(RAD_E_SHAPE);
+        if (y->rank != 2 || y->dtype != RAD_BF16 || y->shape[1] != N || y->shape[0] < M[g] || !gg_inner1(y))
+            return R4D_NO(RAD_E_SHAPE);
+        x_ld[g] = M[g] > 1 ? x->stride[0] : K;
+        y_ld[g] = M[g] > 1 ? y->stride[0] : N;
+        x_al[g] = gg_al16(x->data, x_ld[g]) ? 1 : 0;
+    }
+    int ty = 0;
+    long long w_ld = 0;
+    const int rc = gg_weight2(w, gt, N, K, &ty, &w_ld);
+    if (rc != RAD_OK) return rc;
+    const R4dGgDualCall c{ ty, (const uint8_t*)w->data, w_ld, (int)N, (int)K,
+                           (const uint16_t*)xs[0]->data, x_ld[0], ys[0]->data, y_ld[0], (int)M[0],
+                           (const uint16_t*)xs[1]->data, x_ld[1], ys[1]->data, y_ld[1], (int)M[1] };
+    const int d = r4d_gg_dual_gemm(s, c);
+    if (d != R4D_GG_DUAL_DECLINE) return d;
+    for (int g = 0; g < 2; ++g) {
+        const int r = gg_gemm_run(s, ty, false, (const uint16_t*)xs[g]->data, x_ld[g], x_al[g], (const uint8_t*)w->data,
+                                  w_ld, ys[g]->data, y_ld[g], M[g], N, K);
+        if (r != RAD_OK) return r;
+    }
+    return RAD_OK;
+}
 extern "C" int r4d_rad_logits_gemm_ggml_gemv(const RadArgs* a, RadStream s) {
     return gg_gemm(a, s, "n_vocab", "n_embd", true, true);
 }

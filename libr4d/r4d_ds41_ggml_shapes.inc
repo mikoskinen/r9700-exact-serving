@@ -97,6 +97,22 @@ extern "C" int r4d_shape_rmsnorm_gemm_nt_ggml(const RadParam* p, int n_p, int op
     R4D_PICK(l);
 }
 
+/* Lever BI-e's pair (gemm_nt_ggml_dual): two gemm_nt_ggml over one weight, each row group at most M rows. */
+extern "C" int r4d_shape_gemm_nt_ggml_dual(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t blk = ds41_ggml_block(p, n_p);
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    if (blk <= 0 || M <= 0 || N <= 0 || K <= 0 || K % blk) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, K),                       /* a, the first group's rows */
+        opd((uint32_t)RAD_F32, N, K),       /* w, the logical form */
+        opd(D, M, N),                       /* y */
+        opd(D, M, K),                       /* a1, the second group's rows */
+        opd(D, M, N),                       /* y1 */
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t blk = ds41_ggml_block(p, n_p);
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
