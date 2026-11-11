@@ -339,7 +339,7 @@ endif()
 # the host backend; convert_test runs rad-convert on the same checkpoints. Both start the built
 # binaries as children, so they depend on them and on every plugin the checkpoints select
 # (llama_fp8 for convert_test's --set of an fp8 quantization_config).
-set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf16 lfm2_bf16 gemma4 gemma4_bf16
+set(RAD_E2E_DEPS radiance rad-convert rad-sidecar libref libquant nemotron35_embed qwen35_bf16 lfm2_bf16 gemma4 gemma4_bf16
                  llama_dense_fp8 llama_fp8 qwenimage21)
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
@@ -348,6 +348,7 @@ foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spa
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
+      RAD_E2E_SIDECAR="$<TARGET_FILE:rad-sidecar>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
     if(t STREQUAL "spark25_convert_test")
       add_dependencies(${t} rad-convert libref spark25_bf16)

@@ -156,7 +156,14 @@ private:
     std::unique_ptr<RadFile> file_;
     std::unique_ptr<Checkpoint> ckpt_;
     std::unique_ptr<CheckpointSources> ckpt_src_;
-    /* The source rad_weight_encoding answers from: container entries or checkpoint tensors. */
+    /* Lever DLW (ds41-dlw, 11.11.2026): RADIANCE_WEIGHT_SIDECAR=FILE -- a second, small container
+     * (written by rad-sidecar) whose entries replace the container's entries of the same name and
+     * logical shape in another encoding: declare sees the sidecar's encoding, the load reads its
+     * planes. Null unset (open_weight_sidecar). */
+    std::unique_ptr<RadFile> side_;
+    int open_weight_sidecar();
+    /* The source rad_weight_encoding answers from: container entries (or a sidecar's in their
+     * place) or checkpoint tensors. */
     WeightSourceFn sources() const;
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */

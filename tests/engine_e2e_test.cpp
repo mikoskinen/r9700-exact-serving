@@ -25,6 +25,7 @@
 
 #include "mm/media.h"
 #include "server/oai.h"
+#include "format/radfile.h"
 
 #include <nlohmann/json.hpp>
 
@@ -3763,6 +3764,88 @@ TEST(nemotron35_rerank_real_weights_match_native_scores_and_rankings) {
         if (const char* output = std::getenv("RAD_NEMOTRON_RERANK_SERVER_LOG"))
             REQUIRE(tiny::write_text(output, s.output()));
     }
+}
+
+/* Lever DLW (ds41-dlw, 11.11.2026): rad-sidecar quantises some of a container's plain weights into a sidecar, and
+ * RADIANCE_WEIGHT_SIDECAR serves its entries in place of the container's. The sidecar of llama.rad's bf16 head under
+ * the int8 rule llama_i8head.rad was converted with must give exactly that container's numbers: the same quantiser
+ * over the same values writes the same planes, and the loader reads them from the sidecar into the same stored form.
+ * Refused: a rule over a quantised entry (rad-sidecar), a sidecar written from another container, an entry the
+ * container does not hold, one of another shape. */
+TEST(lever_dlw_weight_sidecar) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_dlw");
+    REQUIRE(d.ok());
+    const std::string rule = "output.weight=rtn:codes=i8,group=128,scale=bf16,clamp=sym";
+    std::string slog;
+    const int st = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "head_i8.rad", "--quant", rule }, engine_env(),
+                             &slog);
+    if (st != 0) fprintf(stderr, "    rad-sidecar exited %d:\n%s\n", st, tail(slog).c_str());
+    REQUIRE_EQ(st, 0);
+    CHECK(has(slog, "1 entries of llama.rad"));
+    std::string rlog;
+    const std::string ref = w.reference(w.llama_i8head, w.corpus_short, &rlog);
+    REQUIRE(!ref.empty());
+    std::vector<std::string> a = { "--kld-record", d / "s1", "--kld-corpus", w.corpus_short, "--max-num-batched-tokens",
+                                   "512", "--max-num-seqs", "1" };
+    Ran s1 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "head_i8.rad") });
+    REQUIRE_RAN(s1);
+    CHECK(has(s1.log, "weight sidecar: 1 entries"));
+    CHECK(has(s1.log, "read from the weight sidecar"));
+    std::string why;
+    const bool same = same_recording(ref, d / "s1", &why);
+    if (!same) fprintf(stderr, "    sidecar vs llama_i8head.rad: %s\n", why.c_str());
+    CHECK(same);
+    /* unset: llama.rad's own numbers, which differ from the int8 head's */
+    const std::string ref0 = w.reference(w.llama_rad, w.corpus_short, &rlog);
+    REQUIRE(!ref0.empty());
+    CHECK(!same_recording(ref0, d / "s1", &why));
+
+    /* a quantised entry is not quantised again */
+    const int st2 = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "bad.rad", "--quant",
+                                "blk.0.attn_qkv.weight=rtn:codes=i8,group=128,scale=bf16" }, engine_env(), &slog);
+    CHECK(st2 != 0);
+    CHECK(has(slog, "not a quantised one again"));
+    /* a sidecar written from another container (llama_mxfp4.rad's plain head) */
+    const int st3 = tiny::run({ RAD_E2E_SIDECAR, w.llama_mxfp4, "-o", d / "other.rad", "--quant", rule }, engine_env(),
+                              &slog);
+    REQUIRE_EQ(st3, 0);
+    a[1] = d / "s2";
+    Ran s2 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "other.rad") });
+    CHECK(s2.status != 0);
+    CHECK(has(s2.log, "a sidecar serves only the container rad-sidecar read"));
+    /* hand-made sidecars: an entry the container does not hold, and its head at another shape */
+    rad::RadFile f;
+    REQUIRE_EQ(f.open(w.llama_rad.c_str()), 0);
+    const RadFileEntry* head = f.find("output.weight");
+    REQUIRE(head != nullptr);
+    auto handmade = [&](const std::string& path, const std::string& name, int64_t rows) {
+        rad::RadWriter wr;
+        if (wr.begin(path.c_str()) != 0) return false;
+        wr.set_arch(f.str(f.header().arch_id));
+        wr.meta_i("sidecar.container_bytes", f.size());
+        rad::RadWriter::Weight ww;
+        ww.name = name;
+        ww.enc = rad_enc_plain(RAD_BF16);
+        ww.rank = 2;
+        ww.shape[0] = rows;
+        ww.shape[1] = head->shape[1];
+        std::vector<uint8_t> zeros((size_t)(rows * head->shape[1] * 2), 0);
+        const void* pl[1] = { zeros.data() };
+        if (wr.add_weight(ww, pl) < 0) { wr.abort(); return false; }
+        return wr.finish() == 0;
+    };
+    REQUIRE(handmade(d / "noname.rad", "no.such.weight", head->shape[0]));
+    a[1] = d / "s3";
+    Ran s3 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "noname.rad") });
+    CHECK(s3.status != 0);
+    CHECK(has(s3.log, "is not an entry of"));
+    REQUIRE(handmade(d / "reshape.rad", "output.weight", head->shape[0] / 2));
+    a[1] = d / "s4";
+    Ran s4 = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "reshape.rad") });
+    CHECK(s4.status != 0);
+    CHECK(has(s4.log, "it does not reshape it"));
 }
 
 RAD_TEST_MAIN()

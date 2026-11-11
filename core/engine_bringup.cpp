@@ -829,12 +829,103 @@ bool is_container(const std::string& path) {
 }  /* namespace */
 
 WeightSourceFn Engine::sources() const {
+    /* Lever DLW: a sidecar's entry answers before the container's of the same name. */
+    if (file_ && side_) {
+        const WeightSourceFn side = rad_container_sources(*side_), main = rad_container_sources(*file_);
+        return [side, main](const std::string& name, const Program& prog, WeightSource* out) {
+            const int st = side(name, prog, out);
+            return st == RAD_E_NOTFOUND ? main(name, prog, out) : st;
+        };
+    }
     if (file_) return rad_container_sources(*file_);
     return ckpt_src_ ? ckpt_src_->fn() : WeightSourceFn{};
 }
 
+/* Lever DLW (ds41-dlw, 11.11.2026): RADIANCE_WEIGHT_SIDECAR=FILE, a container rad-sidecar wrote from
+ * this one: each of its entries stands in for the container's entry of the same name -- the same
+ * logical rank and shape, any encoding (a bf16 linear as llama.cpp's q8_0, say) -- so declare sees
+ * the sidecar's encoding (rad_weight_encoding) and the load reads the sidecar's planes. Numbers are
+ * chosen offline, by the quantiser rad-sidecar runs (abi/rad_abi.h: a lossy step is the quantiser's
+ * job), and served as stored. Refused at open: a file that is not a container, a sidecar written
+ * from a container of another size or architecture, an entry the container does not hold or holds
+ * at another rank or shape, a routed expert's entry (experts sit at a fixed stride the container's
+ * own expert directory addresses). Unset: no second file, the container answers alone. */
+int Engine::open_weight_sidecar() {
+    side_.reset();
+    const char* path = std::getenv("RADIANCE_WEIGHT_SIDECAR");
+    if (!path || !*path) return RAD_OK;
+    if (!file_) {
+        RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: a sidecar replaces entries of a .rad container, and %s is a "
+                "checkpoint", path, cfg_.model.c_str());
+        return RAD_E_INVAL;
+    }
+    auto side = std::make_unique<RadFile>();
+    RAD_TRY(side->open(path));
+    int64_t of_bytes = -1;
+    if (!side->get_i("sidecar.container_bytes", &of_bytes) || of_bytes != file_->size()) {
+        RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: it was written from a container of %lld bytes, and %s holds %lld; "
+                "a sidecar serves only the container rad-sidecar read", path, (long long)of_bytes,
+                cfg_.model.c_str(), (long long)file_->size());
+        return RAD_E_FORMAT;
+    }
+    const std::string a_side = side->str(side->header().arch_id), a_main = file_->str(file_->header().arch_id);
+    if (a_side != a_main) {
+        RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: its architecture is '%s', the container's '%s'", path,
+                a_side.c_str(), a_main.c_str());
+        return RAD_E_FORMAT;
+    }
+    if (side->entry_count() <= 0) {
+        RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s holds no entries", path);
+        return RAD_E_FORMAT;
+    }
+    int64_t bytes = 0, replaced = 0;
+    std::map<std::string, int> forms;
+    for (int64_t i = 0; i < side->entry_count(); ++i) {
+        const RadFileEntry& s = side->entry(i);
+        const std::string name = side->str(s.name);
+        const RadFileEntry* m = file_->find(name);
+        if (!m) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is not an entry of %s", path, name.c_str(), cfg_.model.c_str());
+            return RAD_E_NOTFOUND;
+        }
+        bool same = s.rank == m->rank;
+        for (uint32_t k = 0; same && k < s.rank && k < RAD_MAX_RANK; ++k) same = s.shape[k] == m->shape[k];
+        if (!same) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is a rank-%u weight there and a rank-%u one of another "
+                    "shape in the container; a sidecar re-encodes a weight, it does not reshape it", path,
+                    name.c_str(), (unsigned)s.rank, (unsigned)m->rank);
+            return RAD_E_SHAPE;
+        }
+        if (s.expert >= 0 || m->expert >= 0) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' is a routed expert's weight, which the container's expert "
+                    "directory addresses at a fixed stride; a sidecar replaces only other weights", path,
+                    name.c_str());
+            return RAD_E_INVAL;
+        }
+        if (!rad_enc_valid(&side->encoding(s))) {
+            RAD_ERR("RADIANCE_WEIGHT_SIDECAR=%s: '%s' carries a malformed encoding", path, name.c_str());
+            return RAD_E_FORMAT;
+        }
+        char e[160];
+        rad_enc_format(&side->encoding(s), e, sizeof e);
+        ++forms[e];
+        bytes += (int64_t)s.bytes;
+        replaced += (int64_t)m->bytes;
+    }
+    std::string fl;
+    for (const auto& [f, n] : forms) fl += fmt("%s%d x %s", fl.empty() ? "" : ", ", n, f.c_str());
+    RAD_INFO("weight sidecar: %lld entries, %s in place of the container's %s, read from %s "
+             "(RADIANCE_WEIGHT_SIDECAR): %s", (long long)side->entry_count(), humanb(bytes).c_str(),
+             humanb(replaced).c_str(), path, fl.c_str());
+    side_ = std::move(side);
+    return RAD_OK;
+}
+
 int Engine::read_metadata() {
-    if (!is_container(cfg_.model)) return read_checkpoint_metadata();
+    if (!is_container(cfg_.model)) {
+        RAD_TRY(read_checkpoint_metadata());
+        return open_weight_sidecar();   /* lever DLW: refused for a checkpoint when set; nothing unset */
+    }
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
 
@@ -901,7 +992,7 @@ int Engine::read_metadata() {
              meta_.name && *meta_.name ? meta_.name : "(unnamed)",
              meta_.arch_id, meta_.quant && *meta_.quant ? meta_.quant : "bf16",
              (long long)meta_.n_layers, (long long)meta_.n_ctx_train);
-    return RAD_OK;
+    return open_weight_sidecar();   /* lever DLW: RADIANCE_WEIGHT_SIDECAR; unset = RAD_OK, nothing opened */
 }
 
 /* A checkpoint served directly (spec §4.3): config.json or the GGUF header is the metadata, read
@@ -3164,6 +3255,39 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
     return RAD_OK;
 }
 
+/* Lever DLW: this rank's share of a sidecar entry's selected planes, out of the sidecar's mapping, laid
+ * out as the sweep lays a container entry's (each rectangle's rows packed, the planes at `offs`). */
+static int fill_from_sidecar(const RadFile& side, const RadFileEntry& se, const std::vector<PlaneShare>& shares,
+                             const std::vector<int>& sel, const std::vector<int64_t>& offs, const std::string& name,
+                             uint8_t* in) {
+    for (size_t k = 0; k < shares.size(); ++k) {
+        const PlaneShare& sh = shares[k];
+        const RadFilePlane& pk = side.plane(se, sel[k]);
+        const uint8_t* base = side.data(pk);
+        uint8_t* at = in + offs[k];
+        for (const PlaneShare::Rect& q : sh.rects) {
+            if (q.rows <= 0) continue;
+            const int64_t a = q.row0 * sh.row_bytes + q.byte0, len = (q.rows - 1) * sh.row_bytes + q.bytes;
+            if (a < 0 || a + len > (int64_t)pk.bytes) {
+                RAD_ERR("load: '%s' would read [%lld, %lld) of a %llu-byte '%s' plane of the weight sidecar %s",
+                        name.c_str(), (long long)a, (long long)(a + len), (unsigned long long)pk.bytes,
+                        side.encoding(se).plane[sel[k]].role, side.path());
+                return RAD_E_FORMAT;
+            }
+            if (q.byte0 == 0 && q.bytes == sh.row_bytes) {
+                std::memcpy(at, base + a, (size_t)(q.rows * q.bytes));
+                at += q.rows * q.bytes;
+                continue;
+            }
+            for (int64_t y = 0; y < q.rows; ++y) {
+                std::memcpy(at, base + a + y * sh.row_bytes, (size_t)q.bytes);
+                at += q.bytes;
+            }
+        }
+    }
+    return RAD_OK;
+}
+
 /* The heat engine's parameters: the shipped HeatParams, with policy knobs from the environment
  * for A/B runs (docs/GUIDE.md section 8). RADIANCE_HEAT_PREFILL is HeatParams::prefill_share,
  * clamped to 0..1; RADIANCE_HEAT_CREDIT_CAP is HeatParams::credit_cap, taken when above 0;
@@ -3219,6 +3343,8 @@ int Engine::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
+    /* Lever DLW: weights a sidecar's entry stands in for (also in n_loaded / total). */
+    int64_t n_side = 0, side_bytes = 0;
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
@@ -3354,10 +3480,13 @@ int Engine::load_weights() {
         for (size_t i = 1; i < r->program.weights.size(); ++i) {
             WeightInfo& w = r->program.weights[i];
             /* The planes' source: a container entry or the checkpoint tensors declare resolved,
-             * giving the encoding and logical shape the share is cut in. */
-            const RadFileEntry* e = file_ ? file_->find(w.source) : nullptr;
+             * giving the encoding and logical shape the share is cut in. Lever DLW: a weight
+             * sidecar's entry stands in for the container's of the same name (open_weight_sidecar);
+             * its planes are staged like a checkpoint's, read by the workers, not the sweep. */
+            const RadFileEntry* se = side_ ? side_->find(w.source) : nullptr;
+            const RadFileEntry* e = se ? nullptr : file_ ? file_->find(w.source) : nullptr;
             const CkptWeight* cw = ckpt_src_ ? ckpt_src_->find(w.source) : nullptr;
-            if (!e && !cw) {
+            if (!e && !cw && !se) {
                 if (w.decl.optional) continue;
                 const std::string why = ckpt_src_ ? ckpt_src_->missing(w.source) : std::string();
                 if (!why.empty())
@@ -3369,9 +3498,9 @@ int Engine::load_weights() {
                 ++n_missing;
                 continue;
             }
-            const RadEncoding& src_enc = e ? file_->encoding(*e) : cw->enc;
-            const uint32_t src_rank = e ? e->rank : cw->rank;
-            const int64_t* src_shape = e ? e->shape : cw->shape;
+            const RadEncoding& src_enc = se ? side_->encoding(*se) : e ? file_->encoding(*e) : cw->enc;
+            const uint32_t src_rank = se ? se->rank : e ? e->rank : cw->rank;
+            const int64_t* src_shape = se ? se->shape : e ? e->shape : cw->shape;
 
             /* The source must hold the encoding declare saw (rad_weight_encoding) and every layout
              * hook answered for; otherwise refuse rather than relayout the wrong bytes. */
@@ -3380,8 +3509,8 @@ int Engine::load_weights() {
                 rad_enc_format(&w.enc, want, sizeof want);
                 rad_enc_format(&src_enc, have, sizeof have);
                 RAD_ERR("rank %d: '%s' was declared against '%s' as %s, and %s holds it as %s",
-                        r->index, w.name.c_str(), w.source.c_str(), want, cfg_.model.c_str(),
-                        have);
+                        r->index, w.name.c_str(), w.source.c_str(), want,
+                        se ? side_->path() : cfg_.model.c_str(), have);
                 return RAD_E_FORMAT;
             }
 
@@ -3415,6 +3544,13 @@ int Engine::load_weights() {
                         return RAD_E_FORMAT;
                     }
                 }
+            if (se && (w.tier == Tier::Mapped || w.tier == Tier::SSD)) {
+                RAD_ERR("rank %d: '%s' comes from the weight sidecar %s (RADIANCE_WEIGHT_SIDECAR) and was "
+                        "placed on the %s tier, which reads the container where it lies; a sidecar's "
+                        "weight is loaded into a pool", r->index, w.name.c_str(), side_->path(),
+                        tier_name(w.tier));
+                return RAD_E_STATE;
+            }
             if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e) && !relaid) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
@@ -3543,7 +3679,9 @@ int Engine::load_weights() {
             }
 
             /* From a checkpoint every weight is staged and read by its worker (no sweep); the pool
-             * stores it as is, widened, or relaid. */
+             * stores it as is, widened, or relaid. So is a weight a sidecar's entry stands in for
+             * (lever DLW): its worker copies this rank's share out of the sidecar's mapping, and
+             * the sweep, which reads only the container, delivers it afterwards. */
             if (!e) {
                 StagedWeight sw;
                 sw.prog = &r->program;
@@ -3570,9 +3708,18 @@ int Engine::load_weights() {
                 std::vector<int> sel(w.sel, w.sel + w.n_sel);
                 std::vector<int64_t> offs(sw.plane_off, sw.plane_off + w.n_sel);
                 const std::string name = w.name;
-                sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
-                    return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
-                };
+                if (se) {
+                    const RadFile* sf = side_.get();
+                    sw.fill = [sf, se, shares, sel, offs, name](uint8_t* in) -> int {
+                        return fill_from_sidecar(*sf, *se, shares, sel, offs, name, in);
+                    };
+                    ++n_side;
+                    for (int k = 0; k < w.n_sel; ++k) side_bytes += sh[k].dense_bytes();
+                } else {
+                    sw.fill = [cw, shares, sel, offs, name](uint8_t* in) -> int {
+                        return fill_from_checkpoint(*cw, shares, sel, offs, name, in);
+                    };
+                }
                 staged.push_back(std::move(sw));
                 ++n_loaded;
                 continue;
@@ -3659,6 +3806,14 @@ int Engine::load_weights() {
     int sw_st = RAD_OK;
     if (file_) {
         sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        /* Lever DLW: the sidecar's weights, which no sweep run delivers (they alone carry a fill
+         * in a container's load), to the workers once the container is read. */
+        for (size_t k = 0; k < staged.size() && sw_st == RAD_OK && !pool.failed(); ++k) {
+            if (!staged[k].fill) continue;
+            const int64_t n = staged[k].remaining;
+            pool.reserve((int)k);
+            pool.arrived((int)k, n);
+        }
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -3685,6 +3840,10 @@ int Engine::load_weights() {
     RAD_INFO("load: %lld weights, %s placed from %s of %s read", (long long)n_loaded,
              humanb(total).c_str(), humanb(read_bytes).c_str(),
              file_ ? "container" : "checkpoint");
+    if (side_)
+        RAD_INFO("load: %lld weight share(s), %s, read from the weight sidecar %s instead of the container "
+                 "(RADIANCE_WEIGHT_SIDECAR; summed over ranks)", (long long)n_side, humanb(side_bytes).c_str(),
+                 side_->path());
     if (n_mapped)
         /* Summed over ranks, which map the same file, so under TP the resident bytes are this
          * divided by --tp; the message says so. */
