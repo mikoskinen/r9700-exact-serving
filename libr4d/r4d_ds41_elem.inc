@@ -13,6 +13,11 @@ static const RadOperandSpec oDs41TokenMap[] = {
 };
 static const RadConstraint cDs41TokenMap[] = { C_GE("M", 1), C_GE("n_vocab", 1) };
 
+/* lever BI's tracer (debug): a fingerprint of each row of any operand */
+static const RadParamSpec pBiRowHash[] = { P_INT("M") };
+static const RadOperandSpec oBiRowHash[] = { { "x", RAD_OPD_IN, 0 }, { "h", RAD_OPD_OUT, 0 } };
+static const RadConstraint cBiRowHash[] = { C_GE("M", 1) };
+
 static const RadParamSpec pDs41StreamGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
                                                 P_F64("gate_eps"), P_STR("dtype") };
 static const RadOperandSpec oDs41StreamGate[] = {
@@ -229,6 +234,8 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
 
 #elif defined(R4D_DS41_SCHEMAS)
 
+    SCHEMA("bi_rowhash", pBiRowHash, oBiRowHash,
+           "h[m] = a 64-bit fingerprint of row m's bytes (two i32 a row): debug only, lever BI's tracer."),
     SCHEMA("token_map", pDs41TokenMap, oDs41TokenMap,
            "mapped[m] = table[ids[m]], -1 for an id outside [0, n_vocab): ids through an id table."),
     SCHEMA("stream_gate_add", pDs41StreamGate, oDs41StreamGate,
@@ -316,6 +323,10 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
 
 /* ---------------------------------- DeepSeek-V4.1's elem ops (r4d_ds41_elem.hip) -------------
  * R4D_PRIO_ONLY throughout: nothing else in this plugin implements them. */
+{ "bi_rowhash", "bi_rowhash", "debug",
+  "a 64-bit fingerprint of each row's bytes (XOR of mixed 16-bit units; order-free)", "any M; a workgroup a row",
+  "any x dtype (2-byte aligned rows), i32 pairs h", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cBiRowHash), NOTUNE,
+  nullptr, nullptr, r4d_rad_bi_rowhash, nullptr, nullptr, nullptr, nullptr },
 { "token_map_i32", "token_map", "embed",
   "ids through an id table, -1 outside [0, n_vocab)", "any M; one thread an id",
   "i32 ids, table and mapped", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41TokenMap), NOTUNE,

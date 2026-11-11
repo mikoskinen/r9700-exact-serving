@@ -1000,6 +1000,7 @@ as the weight's GEMM stored them and claims no form. It changes no value.
 | `entry_store` | `M`(range) `n` `block_size` `dtype` `format`/opt | `x`, `page`, `cache`:inout |
 | `window_store` | `M`(range) `n` `block_size` `format`:str `dtype` | `x`, `slot_mapping`, `kv_cache`:inout (the fp8 window slot: e4m3 codes and a scale byte a block of 32, kv_store's slot rule) |
 | `token_map` | `M`(range) `n_vocab` | `ids`, `table`w → `mapped` |
+| `bi_rowhash` | `M`(range) | `x` → `h` (debug, lever BI's tracer: a 64-bit fingerprint of each row's bytes as two i32, an order-free fold, so a function of the row's bytes alone; deepseek41 declares it only under RADIANCE_DS41_BITRACE) |
 | `stream_gate_add` | `M`(range) `n` `hc` `eps`:f64 `gate_eps`:f64 `dtype` | `h`, `k`, `v`, `w`w → `out` |
 | `position_scale` | `M`(range) `n` `original` `beta`:f64 `dtype` | `x`:inout, `positions` |
 | `embed_attn` | `M`(range) `head_dim` `gqa` `causal` `max_seqlen`/opt `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
