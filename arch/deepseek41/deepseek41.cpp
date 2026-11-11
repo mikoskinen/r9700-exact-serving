@@ -2662,13 +2662,19 @@ static int ear_declare(RadBuilder* b, Model& m, int64_t T, const char* ty, const
                                                            "memory, read in place; on the card it would take four shards' VRAM)"
                                                          : nullptr;
     if (!why) {
-        const std::string rn = m.nm.f("token_embd_rep.weight");
-        const std::string src = ckpt_name(m.nm.f("token_embd.weight"));
-        if (map_copy(b, rn.c_str(), src.c_str()) == RAD_OK)
-            m.token_rep = lw(b, m, rn.c_str(), c.n_vocab, D, grp_model(), RAD_SHARD_NONE, 0, 0, true,
-                             RAD_ACCESS_VOCAB);
-        const auto t = m.token_rep ? m.wty.find(m.token_rep) : m.wty.end();
-        if (t == m.wty.end() || std::strcmp(t->second, ty)) why = "the whole table was refused or is not the shard's type";
+        /* A view of the shard's own source, every plane, unsharded (RadWeightDecl::source): the container (or the
+         * checkpoint through the shard's name map) holds one entry, token_embd.weight, which both declarations read;
+         * the loader packs each into llama.cpp's blocks as embed_lookup_ggml's layout asks. (A name of its own over
+         * a copy map is not in a .rad container's index: its encoding would be unknown and it would load as bf16.) */
+        const std::string src = m.nm.f("token_embd.weight");
+        RadEncoding e{};
+        int64_t blk = 0;
+        const char* rty = weight_enc(b, src.c_str(), &e) ? ggml_type_of(e, &blk) : nullptr;
+        if (rty && !std::strcmp(rty, ty))
+            m.token_rep = decl_view(b, m.nm.f("token_embd_rep.weight"), src.c_str(), nullptr, ggml_codes_dtype(e),
+                                    { c.n_vocab, D }, RAD_ACCESS_VOCAB, RAD_SHARD_NONE, grp_model());
+        if (m.token_rep) m.wty[m.token_rep] = rty;
+        else why = "the whole table's view was refused or its encoding is not the shard's ggml type";
     }
     if (!why) {
         m.ezb = decl_b(b, m.nm.f("embed_zero_row"), RAD_BF16, { 1, D });
