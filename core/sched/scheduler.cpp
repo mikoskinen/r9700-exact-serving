@@ -213,9 +213,11 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     if (geo) geo_ = *geo;
     else RAD_TRY(chunk_geometry_resolve(prog, cfg, &geo_));
     /* lever DST: the flag and the shared budget the switches start from (fn4 sched_interleave / sched_mixed_tok) */
-    fn4::sched_register((int)cfg.prefill_interleave, geo_.shared_tok, cfg.prefill_span > 1, geo_.quantum);
+    fn4::sched_register((int)cfg.prefill_interleave, geo_.shared_tok, cfg.prefill_span > 1, geo_.quantum, cfg.max_tok);
     il_now_ = cfg.prefill_interleave;
     mixed_now_ = geo_.shared_tok;
+    bypass_now_ = 0;
+    n_bypassed_ = n_bypass_refused_ = 0;
 
     kvgeom_ = KVGeom::of(prog.kv_groups);
     for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
@@ -1744,7 +1746,7 @@ bool Scheduler::preempt_back() {
 /* ------------------------------------------------------------------ admission */
 /* Admission checks the KV budget before a request enters running; a request admitted without the
  * blocks to run would be preempted on its first step, a full recompute for nothing. */
-int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
+int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t whole_max) {
     Request& r = *s.req;
 
     /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
@@ -1982,6 +1984,25 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * it. An embedding input is never resumed, so it takes no checkpoint. */
         const int64_t rest = target - (int64_t)r.n_computed;
         want = rest <= budget ? rest : 0;
+    } else if (whole_max > 0) {
+        /* lever DST, sched_short_bypass on a held step: the uncached rest runs as ONE piece, and only where that is the piece
+         * an idle engine plans from here (alone's span rule as bi_chunk_plan applies it, the interval, the tail
+         * checkpoint), so the request's rows are cut exactly as alone; otherwise it waits for an ordinary admission. */
+        const int64_t rest = target - (int64_t)r.n_computed;
+        want = 0;
+        if (rest > whole_max) {
+            s.bypass_no = true;
+        } else {
+            const bool keep = span_now_;
+            span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+                        (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+            int64_t ck = -1;
+            const int64_t alone = plan_chunk(r.n_computed, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
+            span_now_ = keep;
+            if (alone != rest) s.bypass_no = true;
+            else if (rest <= budget) { want = rest; ckpt = ck; }
+        }
+        if (s.bypass_no) ++n_bypass_refused_;
     } else if (bi_chunk_) {
         want = bi_chunk_plan(s, r, target, budget, &ckpt, reserve > 0);   /* lever BI: the whole chunk or none */
     } else {
@@ -2281,6 +2302,7 @@ const RadBatch* Scheduler::step() {
         }
         const int64_t mt = fn4::sched_mixed_tok();
         mixed_now_ = mt > 0 && mt < geo_.shared_tok ? mt : geo_.shared_tok;
+        bypass_now_ = fn4::sched_short_bypass();
     }
     /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
      * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
@@ -2575,7 +2597,10 @@ const RadBatch* Scheduler::step() {
     /* ---------------------------------------------------------- admission */
     /* Skipped in a step that preempted: the pool just refused a request that already had blocks,
      * so it would refuse a new one, and the queue's front is now the preempted request. */
-    if (!preempted_here && !hold_prefill) {
+    /* lever DST (sched_short_bypass): a held step admits too, but only a waiting request whose uncached rest is one whole
+     * piece of its alone plan of at most bypass_now_ rows (admit_one's whole_max); the rest of the queue keeps its place. */
+    const bool bypass = hold_prefill && bypass_now_ > 0;
+    if (!preempted_here && (!hold_prefill || bypass)) {
         /* `at` walks the queue and `took_` is what it admitted: a request whose media is not
          * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
          * after the walk rather than cut at its front. */
@@ -2587,6 +2612,9 @@ const RadBatch* Scheduler::step() {
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
+            /* lever DST: on a held step only a fresh request not turned away before is asked */
+            if (bypass && (s.bypass_no || !s.req || s.req->embed || s.req->media ||
+                           s.req->state == ReqState::Preempted)) { ++at; continue; }
             /* Generation reserves one position after the prompt. An embedding consumes just
              * the prompt, so its exact context boundary fits without a generation slot.
              * close_request removes a refused input from waiting_, so `at` names the next one. */
@@ -2611,7 +2639,11 @@ const RadBatch* Scheduler::step() {
                     ? share_tok : 0;
             admit_full_ = 0;
             admit_next_step_ = false;
-            const int as = admit_one(s, budget, areserve);
+            const int as = admit_one(s, budget, bypass ? 0 : areserve, bypass ? bypass_now_ : 0);
+            /* lever DST: a request the bypass does not take keeps its place for the next ordinary admission, and the
+             * walk asks the one behind it */
+            if (bypass && as != RAD_OK) { ++at; continue; }
+            if (bypass) ++n_bypassed_;
             /* A preempted request waiting for its whole-recompute gate lets the next one be asked;
              * an overdue one does not. The room the overdue path made this step is for it, and a
              * request queued behind it would take that room back: a victim just forced off for it,
@@ -2765,7 +2797,8 @@ const RadBatch* Scheduler::step() {
         bool continues = false;
         for (const StepEntry& e : plan_.e)
             if (e.is_prefill && !e.produces_token) continues = true;
-        if (any_pf) interleave_left_ = any_decoding && continues ? interleave_steps() : 0;
+        /* lever DST: a held step that admitted a short request (sched_short_bypass) is still one of the hold's steps */
+        if (any_pf && !hold_prefill) interleave_left_ = any_decoding && continues ? interleave_steps() : 0;
         else if (interleave_left_ > 0) --interleave_left_;
         if (held_prefill_ > 0) ++m_.steps_held;
     }
@@ -3489,6 +3522,7 @@ void Scheduler::step_finished() {
             draft_.step_time(key, rows, wall * 1e3, key > 0 ? (double)step_decode_tok_ : -1.0, lend);
         }
     }
+    fn4::note_sched_dst(n_bypassed_, n_bypass_refused_);   /* lever DST: sched_short_bypass's counts */
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
                            hybrid_lookup_, hybrid_head_, hybrid_unahead_, draft_.occ_cycles(), draft_.occ_moves());
     fn4::note_draft_accept(acc_head_d_, acc_head_a_, acc_look_d_, acc_look_a_);

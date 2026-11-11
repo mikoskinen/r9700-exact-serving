@@ -26,7 +26,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
                                         "dspark_walk", "ds41_bi", "draft_sample", "draft_lend_hyst", "arena_d0",
                                         "draft_lend_w", "draft_occ", "draft_occ_k", "sched_bi_chunk",
-                                        "sched_interleave", "sched_mixed_tok" };
+                                        "sched_interleave", "sched_mixed_tok", "sched_short_bypass" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -67,6 +67,8 @@ struct State {
      * step exists (-1 no scheduler registered), the chunk quantum */
     std::atomic<int> il_flag{0};
     std::atomic<int> mixed_start{-1}, mixed_capable{-1}, quantum{16};
+    std::atomic<int> max_tok{0};                            /* sched_short_bypass's ceiling */
+    std::atomic<int64_t> dst[2];                            /* note_sched_dst: bypassed, turned away */
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -90,6 +92,7 @@ struct State {
         for (auto& c : acc) c.store(0, std::memory_order_relaxed);
         for (auto& c : ctxs) c.store(0, std::memory_order_relaxed);
         for (auto& c : smp) c.store(0, std::memory_order_relaxed);
+        for (auto& c : dst) c.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -181,6 +184,10 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : s.mixed_start.load(std::memory_order_acquire);
     }
+    if (i == kSchedShortBypass) {  /* lever DST: set, else 0 (off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v > 0 ? v : 0;
+    }
     return s.val[i].load(std::memory_order_acquire);
 }
 
@@ -217,8 +224,9 @@ int sched_bi_chunk() {
     const int v = st().val[kSchedBiChunk].load(std::memory_order_acquire);
     return v >= 0 ? v : env_sched_bi();
 }
-void sched_register(int interleave_flag, int64_t shared_tok, bool shared_capable, int64_t quantum) {
+void sched_register(int interleave_flag, int64_t shared_tok, bool shared_capable, int64_t quantum, int64_t max_tok) {
     State& s = st();
+    s.max_tok.store((int)max_tok, std::memory_order_release);
     s.il_flag.store(interleave_flag < 0 ? -1 : interleave_flag, std::memory_order_release);
     s.mixed_start.store((int)shared_tok, std::memory_order_release);
     s.mixed_capable.store(shared_capable ? 1 : 0, std::memory_order_release);
@@ -231,6 +239,15 @@ int sched_interleave() {
 int sched_mixed_tok() {
     const int v = st().val[kSchedMixedTok].load(std::memory_order_acquire);
     return v > 0 ? v : 0;
+}
+int sched_short_bypass() {
+    const int v = st().val[kSchedShortBypass].load(std::memory_order_acquire);
+    return v > 0 ? v : 0;
+}
+void note_sched_dst(int64_t bypassed, int64_t bypass_refused) {
+    State& s = st();
+    s.dst[0].store(bypassed, std::memory_order_relaxed);
+    s.dst[1].store(bypass_refused, std::memory_order_relaxed);
 }
 bool aql_acq_none() {
     static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
@@ -347,7 +364,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
-                        "draft_lend_w, draft_occ, draft_occ_k, sched_bi_chunk, sched_interleave, sched_mixed_tok, epoch_bump)";
+                        "draft_lend_w, draft_occ, draft_occ_k, sched_bi_chunk, sched_interleave, sched_mixed_tok, sched_short_bypass, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -611,6 +628,17 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedShortBypass) {  /* lever DST */
+        const int q = s.quantum.load(std::memory_order_acquire), top = s.max_tok.load(std::memory_order_acquire);
+        if (v != 0 && (v < 0 || (q > 0 && v % q != 0) || (top > 0 && v > top) || top <= 0)) {
+            if (err)
+                *err = "sched_short_bypass takes 0 (off) or a multiple of the quantum (" + std::to_string(q) + ") up to " +
+                       (top > 0 ? std::to_string(top) : std::string("--max-num-batched-tokens (no scheduler registered)")) +
+                       ": the longest uncached rest a waiting request may run as one whole piece on a held step";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedMixedTok) {     /* lever DST */
         const int cap = s.mixed_capable.load(std::memory_order_acquire);
         const int top = s.mixed_start.load(std::memory_order_acquire);
@@ -714,7 +742,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok)
+            if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
@@ -816,6 +844,10 @@ std::string state_json() {
             o += std::string(", \"") + kSm[k] + "\": " + std::to_string((long long)s.smp[k].load(std::memory_order_relaxed));
         o += "}";
     }
+    /* Lever DST's bypass counts, once a scheduler registered (sched_register). */
+    if (s.max_tok.load(std::memory_order_acquire) > 0)
+        o += ", \"dst\": {\"bypassed\": " + std::to_string((long long)s.dst[0].load(std::memory_order_relaxed)) +
+             ", \"bypass_refused\": " + std::to_string((long long)s.dst[1].load(std::memory_order_relaxed)) + "}";
     /* The depth-0 context skip, once the engine registered it (set up or not). */
     if (const int cap = s.ctxskip_capable.load(std::memory_order_acquire); cap >= 0) {
         static const char* const kCs[8] = { "skipped_steps", "refill_passes", "refill_rows", "dropped_rows",

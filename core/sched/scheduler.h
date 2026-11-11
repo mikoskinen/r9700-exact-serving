@@ -44,6 +44,9 @@ struct SchedReq {
     /* Lever BI chunking 3 (Scheduler::bi_chunk_plan): the alone piece [bi_beg, bi_end) this request runs in two halves, and
      * the checkpoint its end carries; valid while bi_beg < n_computed < bi_end. */
     int64_t  bi_beg = 0, bi_end = 0, bi_ckpt = -1;
+    /* Lever DST (sched_short_bypass): an admission on a held step turned this request away because its uncached rest is
+     * longer than the bypass or not one alone piece; held steps do not ask it again (its next admission is an ordinary one). */
+    bool     bypass_no = false;
 
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
@@ -653,6 +656,9 @@ private:
     int64_t       il_now_ = 0;
     int64_t       mixed_now_ = 0;
     int64_t       dst_grid() const;
+    /* sched_short_bypass in force (0 off), and its counts (fn4 GET "dst") */
+    int64_t       bypass_now_ = 0;
+    int64_t       n_bypassed_ = 0, n_bypass_refused_ = 0;
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share = false);
     IKVManager*   kv_ = nullptr;
@@ -1029,7 +1035,7 @@ private:
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind
      * it. `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap); 0 plans the chunk on the whole budget. */
-    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0);
+    int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0, int64_t whole_max = 0);
     /* Positive sentinel from admit_one: the request waits (its context is still being read off
      * disk, or a preempted prefill has no room yet) and the walk may ask the one behind it. */
     static constexpr int kAdmitWait = 1;

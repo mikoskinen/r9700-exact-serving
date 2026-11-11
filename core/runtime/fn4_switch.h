@@ -184,6 +184,18 @@
  *                   (B: whole intervals) it has no effect. Read at every step planned; a prefill in flight keeps
  *                   its position and takes its next chunk at the new budget (an alone piece 3 / 4 cut in two
  *                   keeps its piece; the rest is cut on the new grid).
+ *   sched_short_bypass scheduler (lever DST): 0 off (today); N (a multiple of the quantum, up to
+ *                   --max-num-batched-tokens; 1280 / 2112 the A/B values): on a step the interleave holds (decode rows
+ *                   only, no admission today), a WAITING request is admitted when its uncached rest (after its prefix
+ *                   hit, as an admission computes it) is at most N rows AND is one whole piece of its alone plan (the
+ *                   chunk an idle engine plans from the same position: span, interval, tail checkpoint) AND fits what
+ *                   the step has left; it runs that one piece, so its rows are cut exactly as alone. Everything else
+ *                   waits as today (a request turned away for length is not asked again on held steps); running
+ *                   prefills stay held, and the held step counts toward the hold as a decode-only step, so the long
+ *                   prefill's chunks and their timing are unchanged by it (under sched_bi_chunk 4 a request no longer
+ *                   waiting at the long prefill's next chunk takes no grid step from it: that cut can be the larger grid
+ *                   point). Composes with sched_bi_chunk 0 .. 4 and ds41_bi's per-sequence segments. Read at every step
+ *                   planned; GET "dst" counts the bypassed and the turned-away admissions.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -258,7 +270,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kSchedBiChunk,
-              kSchedInterleave, kSchedMixedTok, kSwitches };
+              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -323,9 +335,14 @@ int  sched_bi_chunk();
  * is planned at (ChunkGeometry::shared_tok), whether a shared step exists (--prefill-span > 1), and the chunk quantum.
  * sched_interleave(): the switch once set (0 .. 64), else -1 (the flag applies). sched_mixed_tok(): the switch once set
  * (a budget), else 0 (shared_tok applies). The scheduler reads both at every step it plans. */
-void sched_register(int interleave_flag, int64_t shared_tok, bool shared_capable, int64_t quantum);
+void sched_register(int interleave_flag, int64_t shared_tok, bool shared_capable, int64_t quantum, int64_t max_tok = 0);
 int  sched_interleave();
 int  sched_mixed_tok();
+/* Lever DST, sched_short_bypass: the switch once set, else 0 (off). The scheduler reads it at every step it plans, and
+ * after every step reports its counts (GET "dst"): requests the bypass admitted on a held step, and requests it turned
+ * away because their uncached rest is longer than N or is not one piece of their alone plan. */
+int  sched_short_bypass();
+void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
 /* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
  * "accept"; under draft_depth0 2 every head draft is a probe's). */
 void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted);
