@@ -159,6 +159,13 @@
  *                   value); unset: 1..4 refused. A step with
  *                   one segment runs today's issue either way. Changes the bytes of rows that shared a step with other
  *                   sequences (toward their alone bytes); a one-sequence step is unchanged.
+ *   ds41_psk        deepseek41 (lever PSK, prefill skip above the last cache source): 1 a prefill sequence's chunk runs
+ *                   the layers past the last kv source (21..39 of the 1017's 40) over its last 160 + (39 - l) x 128 rows
+ *                   only -- the rows the chunk's end reads through the layers' 128-key windows (its window state, the
+ *                   logits row, the DSpark taps) -- every row through the last source; 0 every row as before.
+ *                   RADIANCE_DS41_PSK=0 | 1 declares it (and starts at that value); unset: 1 refused, today's issue.
+ *                   Changes no row the step's end reads (the cut rows' streams feed nothing later); a computed row
+ *                   sees a launch of >= 160 rows, above every row-count form switch -- bytes to be measured.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -232,7 +239,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
-              kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSwitches };
+              kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kDs41Psk, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

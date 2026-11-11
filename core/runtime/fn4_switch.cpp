@@ -25,13 +25,13 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
                                         "dspark_walk", "ds41_bi", "draft_sample", "draft_lend_hyst", "arena_d0",
-                                        "draft_lend_w", "draft_occ", "draft_occ_k", "place_lf" };
+                                        "draft_lend_w", "draft_occ", "draft_occ_k", "place_lf", "ds41_psk" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
            i == kDs41OneFill || i == kDrafterMx || i == kDrafterBf ||
            i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk ||
-           i == kDs41Bi;
+           i == kDs41Bi || i == kDs41Psk;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -305,7 +305,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
-                        "draft_lend_w, draft_occ, draft_occ_k, place_lf, epoch_bump)";
+                        "draft_lend_w, draft_occ, draft_occ_k, place_lf, ds41_psk, epoch_bump)";
         return false;
     }
     State& s = st();

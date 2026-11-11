@@ -580,6 +580,8 @@ struct Model {
     rad_buf bi_cu = 0;
     rad_op bi_sub = 0;
     std::map<rad_buf, int64_t> bp;
+    /* Lever PSK: the first layer a prefill segment is cut at (the last kv source + 1); 0 where PSK is not declared. */
+    int psk_first = 0;
     Dsp dsp{};
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
@@ -1131,6 +1133,45 @@ static bool bi_pieces(int v) { return v == 2 || v == 4; }
 static bool bi_cheap(int v) { return v >= 3; }
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
+
+/* Lever PSK (prefill skip above the last cache source, ds41-psk 11.11.2026). A layer past the last kv source (the
+ * largest of attention.kv_source_layers: 20 of the 1017's 40) writes nothing a later token reads but its own window keys
+ * (kv_window, the attention's reach: `window` keys with the row's own) and, at the DSpark target layers (37-39), the
+ * drafter's tapped rows: the compressed latent, the index keys and the compressor tails are written at the kv sources
+ * only (layer(): L.src), the indexer's candidates at the candidate layer (20), the Engram's token history from the
+ * tokens alone (step(): e_ids, before the blocks). So a prefill chunk needs every row through the last source, and a
+ * layer l past it only the rows its chunk's END reads: the last C_l = kPskBase + (n_layer - 1 - l) * window rows of
+ * each prefill sequence's chunk. A row's output at l is right where its window's keys at l are -- the outputs of l - 1
+ * at the window rows before it -- so C_l - C_{l+1} = window covers each layer's reach; the last layer keeps kPskBase
+ * rows: >= window keys for the next token, the logits row, and C_{n_layer-2} - (window - 1) = kPskBase + 1 tapped rows
+ * for the drafter's window + 1 (129) context keys. Every chunk computes its own end cone, so the window state at every
+ * chunk END is the full prefill's: the checkpoint snapshots (a model with linear state checkpoints at chunk ends only,
+ * Scheduler::plan_chunk), the next chunk, the first decode and the drafter's context read nothing else. The rows outside
+ * the cone keep a lower layer's stream; their window keys at l are never read (a computed row reads <= window - 1
+ * positions back, all inside the cone of the layer below), nor their taps (the drafter reads its last window + 1 keys).
+ * Each cut prefill segment is at least kPskBase (> 120) rows, above every row-count form switch of the trunk's kernels
+ * (decode bands <= 48, fused-norm widths <= 120, EXL3 decode band <= 16, index_topk's split <= 16). The cut steps run
+ * through step_bi (one segment a prefill sequence, its cu view; attn_sparse_sink clamps a sequence's last row to the
+ * launch's, and the cut rows end at it). Switch ds41_psk (fn4): 1 = the cone, 0 = every row (today).
+ * RADIANCE_DS41_PSK=0 / off declares it and starts at 0, 1 / on at 1; unset declares nothing (1 refused, today's issue).
+ * Cut: a step with one prefill sequence and no decode rows (any ds41_bi), and the prefill segments of a step ds41_bi
+ * segments. Not cut: a step asking more logits rows than its decode rows + one a prefill sequence (prompt logprobs),
+ * score-only / generator / encoder / plugin-word passes, a calibration (--calib-layers) serve. */
+static std::atomic<int> g_sw_psk{0}, g_sw_psk_ok{0}, g_sw_psk_env{-2};   /* env: -2 unread, -1 unset */
+static std::atomic<long long> g_psk_steps{0}, g_psk_rows{0};
+static void psk_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_PSK");
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+    if (g_sw_psk_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_psk.store(v, std::memory_order_relaxed);
+        if (e && v < 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PSK=%s is not 0 / off or 1 / on: lever PSK is not declared\n", e);
+    }
+}
+static bool psk_declared() { return g_sw_psk_env.load(std::memory_order_relaxed) >= 0; }
+static constexpr int64_t kPskBase = 160;
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -1155,6 +1196,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_bi"))
         return value == 0 || (value >= 1 && value <= 4 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_psk"))
+        return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -1165,6 +1208,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (const K1Switch* k = k1_switch(name)) k->val->store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "dspark_walk")) g_sw_walk.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_bi")) g_sw_bi.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_psk")) g_sw_psk.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1186,6 +1230,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_bi")) {
         *applied = g_sw_bi.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_psk")) {
+        *applied = g_sw_psk.load(std::memory_order_relaxed);
         return 1;
     }
     if (!std::strcmp(name, "dspark_walk")) {
@@ -1481,9 +1529,9 @@ static int buffers(RadBuilder* b, Model& m) {
     if (m.kwords > 0) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     /* Split: the gather lays aw parts of qmax runs of at most irows rows, rank r's at r qmax R. */
     /* lever BI: a prefill segment's split runs are laid from its first row, so up to a decode segment's rows (48)
-     * past the unsplit plane */
+     * past the unsplit plane; lever PSK: a cut segment's runs from its cut row, up to the ranks' runs past the step */
     const int64_t sel_rows = (m.isplit && !m.score_rows ? std::max(T, (int64_t)m.aw * m.qmax * m.irows) : T) +
-                             (bi_declared() ? (int64_t)m.aw * m.irows + 64 : 0);
+                             (bi_declared() || psk_declared() ? (int64_t)m.aw * m.irows + 64 : 0);
     m.sel = decl_b(b, nm.f("index_sel"), RAD_I32, { sel_rows, c.itopk });
     if (m.isplit)
         m.sel_part = decl_b(b, nm.f("index_sel_part"), RAD_I32,
@@ -2875,6 +2923,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
 
 /* ------------------------------------------------------------------ declare */
 static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI's tracer, below */
+static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lever PSK, below */
 static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI, below */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
@@ -2903,6 +2952,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     k1_read_env();
     walk_read_env();
     bi_read_env();
+    psk_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3253,6 +3303,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             "POST /admin/fn4 idx_split): %s\n", idx_balance() ? 1 : 0, what);
     }
     DS_TRY(bi_declare(b, m, ctx));
+    DS_TRY(psk_declare(b, m, ctx));
     DS_TRY(bt_declare(b, m, ctx));
     return RAD_OK;
 }
@@ -3291,6 +3342,43 @@ static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                         "indexer launch, <= %lld a fused norm; each prefill sequence at its own rows; the MoE a pass a "
                         "segment); a pass with two or more prefill sequences is not recorded\n",
                 g_sw_bi.load(std::memory_order_relaxed), (long long)kBiBand, (long long)kBiNorm);
+    return RAD_OK;
+}
+
+/* Lever PSK at the end of a declare (RADIANCE_DS41_PSK set): the first layer a prefill segment is cut at -- past the
+ * last kv source, where no layer is a kv source (L.src: the compressor, the latent and index caches, the tails) and none
+ * the indexer's candidate layer (its keep is every row's). Not with RADIANCE_DS41_AR_PCN's collectives (they take a
+ * step's rows whole; step_bi issues apart), a calibration tap, or no window. */
+static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    m.psk_first = 0;
+    if (!psk_declared()) return RAD_OK;
+    const auto& c = m.c;
+    int last = -1;
+    for (int64_t s : c.kv_src) last = std::max(last, (int)s);
+    const int first = last + 1;
+    bool ok = last >= 0 && first < (int)c.n_layer && c.window > 0 && m.calib_hi <= m.calib_lo && c.cand < first;
+    for (const Layer& L : m.layers) ok = ok && !(L.l >= first && L.src);
+    bool arpcn = m.ar_pcn_fin != 0;
+    for (const Layer& L : m.layers) arpcn = arpcn || L.ar_pcn_f || L.ar_pcn_a;
+    if (!ok || arpcn) {
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever PSK not declared: %s\n",
+                    arpcn ? "RADIANCE_DS41_AR_PCN's collectives take a step's rows whole (unset it to use RADIANCE_DS41_PSK)"
+                          : "no layer past the last kv source is cut-safe here (kv sources, candidate layer, window, "
+                            "calibration)");
+        return RAD_OK;
+    }
+    m.psk_first = first;
+    (void)b;
+    if (!ctx->shape_probe) g_sw_psk_ok.store(1, std::memory_order_relaxed);
+    if (ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: lever PSK declared (RADIANCE_DS41_PSK, fn4 ds41_psk, now %d): a prefill "
+                        "sequence's chunk runs layers %d..%lld over its last %lld + (%lld - l) x %lld rows only (layer %d: "
+                        "%lld, layer %lld: %lld); every row through layer %d (the last kv source)\n",
+                g_sw_psk.load(std::memory_order_relaxed), first, (long long)c.n_layer - 1, (long long)kPskBase,
+                (long long)c.n_layer - 1, (long long)c.window, first,
+                (long long)(kPskBase + (c.n_layer - 1 - first) * c.window), (long long)c.n_layer - 1, (long long)kPskBase,
+                last);
     return RAD_OK;
 }
 
@@ -3674,12 +3762,25 @@ static bool bi_segments(RadCtx* x, const Model& m, const RadBatch* b, std::vecto
     return sg.size() > 1 || (sg.size() == 1 && sg[0].dec && (sg[0].n > kBiNorm || (bi_pieces(bi) && sg[0].n > kBiMoe)));
 }
 
-static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg) {
+/* Lever PSK: may this step's prefill segments be cut? (the switch, a declare that has it, and no pass that wants a
+ * prefill row's logits beyond its last: n_out within the decode rows + one a prefill sequence) */
+static bool psk_step_ok(const Model& m, const RadBatch* b, int64_t prefill_seqs, int64_t decode_rows) {
+    return m.psk_first > 0 && g_sw_psk.load(std::memory_order_relaxed) > 0 && b->draft_pass == 0 && !b->enc &&
+           b->n_mm_rows == 0 && b->n_bidi == 0 && !b->gen && b->n_plugin_words == 0 && !b->score_only &&
+           prefill_seqs > 0 && b->n_out <= decode_rows + prefill_seqs;
+}
+
+/* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
+static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
     const auto& c = m.c;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
     const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
-    {   /* rank 0, every 512 segmented steps: the counts (MoE passes a layer summed over those steps: the launch cost of P) */
+    /* lever PSK (psk_step_ok): the prefill segments past m.psk_first cut to their cone, layer by layer (below) */
+    int64_t psk_pre = 0, psk_dec = 0;
+    for (const BiSeg& s : sg) (s.dec ? psk_dec : psk_pre) += s.dec ? s.n : 1;
+    const bool psk = psk_step_ok(m, batch, psk_pre, psk_dec);
+    if (!psk_only) {   /* rank 0, every 512 segmented steps: the counts (MoE passes a layer summed over those steps: the launch cost of P) */
         const long long n = g_bi_steps.load(std::memory_order_relaxed);
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0)
             fprintf(stderr, "radiance: deepseek41: lever BI stats: %lld segmented steps, %lld MoE passes a layer in them (%.2f a "
@@ -3688,7 +3789,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     (double)g_bi_moe.load(std::memory_order_relaxed) / (double)n, g_bi_sync.load(std::memory_order_relaxed),
                     g_bi_wide.load(std::memory_order_relaxed), g_sw_bi.load(std::memory_order_relaxed));
     }
-    if (g_bi_steps.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0) {
+    if (!psk_only && g_bi_steps.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0) {
         std::string seg;
         for (const BiSeg& s : sg) seg += std::string(seg.empty() ? "" : ", ") + (s.dec ? "decode " : "prefill ") +
                                          std::to_string(s.n);
@@ -3712,9 +3813,26 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         return bcol_at(h, r0, m.bp.at(h), first, width, n);
     };
     auto P = [&](const int32_t* p, int64_t r0, int64_t n) { return praw(p + r0, RAD_I32, n); };
+    /* lever PSK: the layer's segments (`cur`: the step's, or `psk_sg` with the prefill segments cut) and the runs of
+     * consecutive rows they cover (`runs`: [0, T) uncut) */
+    static thread_local std::vector<BiSeg> psk_sg;
+    static thread_local std::vector<std::pair<int64_t, int64_t>> runs;
+    const std::vector<BiSeg>* cur = &sg;
+    const auto set_runs = [&] {
+        runs.clear();
+        for (const BiSeg& s : *cur) {
+            if (!runs.empty() && runs.back().first + runs.back().second == s.r0) runs.back().second += s.n;
+            else runs.push_back({ s.r0, s.n });
+        }
+    };
+    set_runs();
+    /* fn over the layer's rows: each run of consecutive rows in one launch */
+    auto whole = [&](const auto& fn) {
+        for (const auto& u : runs) fn(u.first, u.second);
+    };
     /* fn over the step's rows by segment, the decode segment in launches of at most `cap` rows */
     auto rows = [&](int64_t cap, const auto& fn) {
-        for (const BiSeg& s : sg) {
+        for (const BiSeg& s : *cur) {
             if (!s.dec || s.n <= cap) { fn(s.r0, s.n); continue; }
             for (int64_t a = 0; a < s.n; a += cap) fn(s.r0 + a, std::min(cap, s.n - a));
         }
@@ -3768,6 +3886,26 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
+        /* lever PSK: from m.psk_first on, each prefill segment longer than its cone runs its last C_l rows */
+        bool cut = false;
+        if (psk && l >= m.psk_first) {
+            const int64_t C = kPskBase + (c.n_layer - 1 - l) * c.window;
+            psk_sg = sg;
+            for (BiSeg& s : psk_sg)
+                if (!s.dec && s.n > C) {
+                    if (rad_rank(x) == 0) g_psk_rows.fetch_add(s.n - C, std::memory_order_relaxed);
+                    s.r0 += s.n - C;
+                    s.n = C;
+                    cut = true;
+                }
+        }
+        if (cut != (cur != &sg)) {
+            cur = cut ? &psk_sg : &sg;
+            set_runs();
+        } else if (cut) {
+            set_runs();
+        }
+        const std::vector<BiSeg>& sg = *cur;   /* the layer's segments, below */
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
             if (m.ple_group > 0)
@@ -3786,8 +3924,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         const bool late = !m.zero;
         const auto mix_a = [&] {
-            RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
-                        RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
+            whole([&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.mix_a, n, R(m.h0, r0, n), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
+                            RAD_W(L.hc_a_base), R(m.pre_a, r0, n), R(m.post, r0, n), R(m.comb, r0, n));
+            });
         };
         /* the collapse (+ norm: a fused norm, by segment within its 32-row width) */
         if (L.cn_a)
@@ -3796,13 +3936,17 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             R(m.xn, r0, n));
             });
         else if (L.col_a)
-            RAD_ISSUE_N(x, L.col_a, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
+            whole([&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.col_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n));
+            });
         if (!late) mix_a();
         if (m.zero) {
-            RAD_ISSUE_N(x, L.attn_fill, T, brows(m.attn_out, T));
+            whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.attn_fill, n, R(m.attn_out, r0, n)); });
         } else {
             if (L.norm_a)
-                RAD_ISSUE_N(x, L.norm_a, T, brows(m.xcol, T), RAD_W(L.attn_norm), brows(m.xn, T));
+                whole([&](int64_t r0, int64_t n) {
+                    RAD_ISSUE_N(x, L.norm_a, n, R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n));
+                });
             bt_pt(x, m, m.xn, T, "xn", l);
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
             const bool ctail = L.src && r > 1;
@@ -3861,30 +4005,37 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         RAD_ISSUE_N(x, L.q_bf, s.n, R(m.qr, s.r0, s.n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, s.r0, s.n),
                                     R(m.q, s.r0, s.n));
                 else
-                    RAD_ISSUE_N(x, L.q_an, T, brows(m.qr, T), RAD_W(L.q_norm), brows(m.qrn, T));
+                    whole([&](int64_t r0, int64_t n) {
+                        RAD_ISSUE_N(x, L.q_an, n, R(m.qr, r0, n), RAD_W(L.q_norm), R(m.qrn, r0, n));
+                    });
                 if (kvfold || L.kv_f)
                     for (const BiSeg& s : sg) kvn_seg(s);
                 else
-                    RAD_ISSUE_N(x, L.kv_n, T, brows(m.kv, T), RAD_W(L.kv_norm), brows(m.kvn, T));
+                    whole([&](int64_t r0, int64_t n) {
+                        RAD_ISSUE_N(x, L.kv_n, n, R(m.kv, r0, n), RAD_W(L.kv_norm), R(m.kvn, r0, n));
+                    });
                 if (L.i_score)
                     for (const BiSeg& s : sg) lin_issue(x, m, L.i_q, s.n, R(m.qrn, s.r0, s.n), L.iq_w, R(m.iq, s.r0, s.n));
                 if (!qfold)
                     for (const BiSeg& s : sg) lin_issue(x, m, L.q_b, s.n, R(m.qrn, s.r0, s.n), L.wq_b, R(m.q, s.r0, s.n));
-                if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, T, brows(m.kvn, T), brows(cs, g.max_ctx), pos);
-                if (!L.src && L.i_score) {
-                    if (L.i_f) RAD_ISSUE_N(x, L.i_f, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
-                    else RAD_ISSUE_N(x, L.i_rope, T, brows(m.iq, T), brows(m.cs_b, g.max_ctx), pos);
-                    if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
-                }
-                RAD_ISSUE_N(x, L.q_rope, T, brows(m.q, T), brows(cs, g.max_ctx), pos);
-                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(m.kvn, T));
-                if (!kvfold) {
-                    if (m.w8)
-                        RAD_ISSUE_N(x, L.kv_st, T, brows(m.kvn, T), praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
-                    else
-                        RAD_ISSUE_N(x, L.kv_st, T, bcol(m.kvn, 0, hd / 2, T), bcol(m.kvn, hd / 2, hd / 2, T),
-                                    praw(wb->slot_mapping, RAD_I32, T), kv_cache(m.win, l));
-                }
+                whole([&](int64_t r0, int64_t n) {
+                    const RadOperand pn = P(batch->positions, r0, n);
+                    if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, n, R(m.kvn, r0, n), brows(cs, g.max_ctx), pn);
+                    if (!L.src && L.i_score) {
+                        if (L.i_f) RAD_ISSUE_N(x, L.i_f, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), pn);
+                        else RAD_ISSUE_N(x, L.i_rope, n, R(m.iq, r0, n), brows(m.cs_b, g.max_ctx), pn);
+                        if (L.i_qq) RAD_ISSUE_N(x, L.i_qq, n, R(m.iq, r0, n));
+                    }
+                    RAD_ISSUE_N(x, L.q_rope, n, R(m.q, r0, n), brows(cs, g.max_ctx), pn);
+                    if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, n, R(m.kvn, r0, n));
+                    if (!kvfold) {
+                        if (m.w8)
+                            RAD_ISSUE_N(x, L.kv_st, n, R(m.kvn, r0, n), P(wb->slot_mapping, r0, n), kv_cache(m.win, l));
+                        else
+                            RAD_ISSUE_N(x, L.kv_st, n, C(m.kvn, 0, hd / 2, r0, n), C(m.kvn, hd / 2, hd / 2, r0, n),
+                                        P(wb->slot_mapping, r0, n), kv_cache(m.win, l));
+                    }
+                });
             }
             for (const BiSeg& s : sg) {
                 if (cheap) break;
@@ -4049,10 +4200,14 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             }
             if (ofold) {
             } else if (L.o_f) {
-                RAD_ISSUE_N(x, L.o_f, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
+                whole([&](int64_t r0, int64_t n) {
+                    RAD_ISSUE_N(x, L.o_f, n, R(m.o, r0, n), brows(cs, g.max_ctx), P(batch->positions, r0, n));
+                });
             } else {
-                RAD_ISSUE_N(x, L.o_rope, T, brows(m.o, T), brows(cs, g.max_ctx), pos);
-                if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(m.o, T));
+                whole([&](int64_t r0, int64_t n) {
+                    RAD_ISSUE_N(x, L.o_rope, n, R(m.o, r0, n), brows(cs, g.max_ctx), P(batch->positions, r0, n));
+                    if (L.o_q) RAD_ISSUE_N(x, L.o_q, n, R(m.o, r0, n));
+                });
             }
             bt_pt(x, m, m.o, T, "o", l);
             const int64_t gd = HD / m.gr;
@@ -4070,15 +4225,18 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         /* the attention's all-reduce over the step (exact: 0 + r0 + .. + r3 a value), then post / collapse / norm (a
          * fused norm) by segment; ar_pcn_f (the all-reduce with it, RADIANCE_DS41_AR_PCN) is not taken under ds41_bi */
-        if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
+        if (L.ar_attn)
+            whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.ar_attn, n * D, R(m.attn_out, r0, n), RAD_NONE); });
         if (L.pcn_f)
             rows(kBiNorm, [&](int64_t r0, int64_t n) {
                 RAD_ISSUE_N(x, L.pcn_f, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm), R(m.act.x, r0, n));
             });
         else
-            RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
-                        brows(m.comb, T), brows(m.h1, T));
+            whole([&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.post_a, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                            R(m.h1, r0, n));
+            });
         if (L.pcn_f) {
         } else if (L.cn_f) {
             rows(kBiNorm, [&](int64_t r0, int64_t n) {
@@ -4086,8 +4244,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             R(m.act.x, r0, n));
             });
         } else {
-            RAD_ISSUE_N(x, L.col_f, T, brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T));
-            RAD_ISSUE_N(x, L.norm_f, T, brows(m.xcol, T), RAD_W(L.ffn_norm), brows(m.act.x, T));
+            whole([&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.col_f, n, R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n));
+                RAD_ISSUE_N(x, L.norm_f, n, R(m.xcol, r0, n), RAD_W(L.ffn_norm), R(m.act.x, r0, n));
+            });
         }
         bt_pt(x, m, m.h1, T, "h1", l);
         bt_pt(x, m, m.act.x, T, "ffn_in", l);
@@ -4097,16 +4257,25 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
+        /* lever PSK: a cut layer's ffn mix over its runs, here (the block issues a beside only in a pass from row 0) */
+        const MoeFP8::Beside* bsp = &bs;
+        if (cut) {
+            whole([&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.mix_f, n, R(m.h1, r0, n), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
+                            R(m.pre_f, r0, n), R(m.post, r0, n), R(m.comb, r0, n));
+            });
+            bsp = nullptr;
+        }
         {   /* ds41_bi 2: the decode segment in pieces within the EXL3 decode band */
             const int64_t piece = bi_pieces(g_sw_bi.load(std::memory_order_relaxed)) ? kBiMoe : ((int64_t)1 << 40);
             for (const BiSeg& s : sg) {
                 if (!s.dec || s.n <= piece) {
-                    L.moe.pass(x, T, s.r0, s.n, true, &bs);
+                    L.moe.pass(x, T, s.r0, s.n, true, bsp);
                     if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 for (int64_t a = 0; a < s.n; a += piece) {
-                    L.moe.pass(x, T, s.r0 + a, std::min(piece, s.n - a), true, &bs);
+                    L.moe.pass(x, T, s.r0 + a, std::min(piece, s.n - a), true, bsp);
                     if (l == 0) g_bi_moe.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -4131,8 +4300,23 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             R(m.final_hidden, r0, n));
             });
         else
-            RAD_ISSUE_N(x, L.post_f, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
-                        brows(m.comb, T), brows(m.h0, T));
+            whole([&](int64_t r0, int64_t n) {
+                RAD_ISSUE_N(x, L.post_f, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                            R(m.h0, r0, n));
+            });
+    }
+    if (psk && cur != &sg && rad_rank(x) == 0) {   /* lever PSK: a cut step (stats; the first one's cut rows) */
+        const long long n = g_psk_steps.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n % 256 == 0) {
+            std::string seg;
+            for (const BiSeg& s : sg) seg += std::string(seg.empty() ? "" : ", ") + (s.dec ? "decode " : "prefill ") +
+                                             std::to_string(s.n);
+            fprintf(stderr, "radiance: deepseek41: lever PSK: %lld cut steps, %lld layer-rows not run (this step: %lld rows "
+                            "as [%s]; layer %d runs %lld a cut prefill segment, layer %lld %lld)\n", n,
+                    g_psk_rows.load(std::memory_order_relaxed), (long long)T, seg.c_str(), m.psk_first,
+                    (long long)(kPskBase + (c.n_layer - 1 - m.psk_first) * c.window), (long long)c.n_layer - 1,
+                    (long long)kPskBase);
+        }
     }
     if (m.pcn_fin) {
     } else if (m.cn_fin) {
@@ -4141,8 +4325,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         R(m.final_hidden, r0, n));
         });
     } else {
-        RAD_ISSUE_N(x, m.contract, T, brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T));
-        RAD_ISSUE_N(x, m.fnorm, T, brows(m.xcol, T), RAD_W(m.final_gain), brows(m.final_hidden, T));
+        whole([&](int64_t r0, int64_t n) {
+            RAD_ISSUE_N(x, m.contract, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n));
+            RAD_ISSUE_N(x, m.fnorm, n, R(m.xcol, r0, n), RAD_W(m.final_gain), R(m.final_hidden, r0, n));
+        });
     }
     bt_pt(x, m, m.final_hidden, T, "final", -1);
     if (batch->n_out > 0) {
@@ -4177,6 +4363,20 @@ static void step(RadCtx* x, const RadBatch* batch) {
         static thread_local std::vector<BiSeg> sg;
         if (bi_segments(x, m, batch, sg)) {
             step_bi(x, m, batch, sg);
+            return;
+        }
+    }
+    /* lever PSK (ds41_psk 1): a step of one prefill sequence and no decode rows, longer than the last layer's cone, runs
+     * through step_bi as that one segment, cut from m.psk_first on (a one-segment step_bi issues step()'s ops on the same
+     * rows below the cut) */
+    if (m.psk_first > 0 && batch->draft_pass == 0 && batch->n_seq == 1 && batch->n_tok > kPskBase &&
+        g_sw_psk.load(std::memory_order_relaxed) > 0) {
+        int64_t Dn = 0, DT = 0;
+        batch_split(batch, &Dn, &DT);
+        if (Dn == 0 && psk_step_ok(m, batch, 1, 0)) {
+            static thread_local std::vector<BiSeg> ps(1);
+            ps[0] = BiSeg{ 0, batch->n_tok, 0, 1, false, -1 };
+            step_bi(x, m, batch, ps, true);
             return;
         }
     }
