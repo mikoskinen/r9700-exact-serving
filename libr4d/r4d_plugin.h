@@ -242,6 +242,8 @@ int     r4d_rad_join_add_scale_bf16     (const RadArgs*, RadStream);
 int     r4d_rad_expert_scale_bf16       (const RadArgs*, RadStream);
 /* fn4 BI's engine tracer: a 64-bit fingerprint a row (debug, RADIANCE_FN4_BITRACE; r4d_fn4_bi.hip) */
 int     r4d_rad_bi_rowhash              (const RadArgs*, RadStream);
+/* fn4 BI-dual: a step's row bands from its cu_seqlens (r4d_fn4_bi.hip) */
+int     r4d_rad_bi_band                 (const RadArgs*, RadStream);
 /* Runtime LoRA's two halves, each row's adapter named by its slot (r4d_lora_bf16.hip): the scalar
  * rows, and the tiled rows (a WMMA shrink over row tiles with a K split fixed by K and R, its
  * partials in the op's scratch, and an expand that stages B[s] in LDS for a tile of rows). */

@@ -537,7 +537,16 @@ struct MoeFP8 {
     rad_op      op_x3gd = 0;    /* fn4 E10: moe_exl3_gate_up_down over the decode band, or 0 */
     int64_t     x3gd_hi = 0;    /* ...its declared top (min(16, rows)) */
     int declare_exl3(RadBuilder* b, Names& nm, int l, const std::vector<int64_t>& reg);
-    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out) const;
+    void issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in, RadOperand out,
+                    int64_t r0 = -1) const;
+    /* fn4 BI-dual (exl3 interface v12, 11.11.2026): the step's token bands for the EXL3 down's `band` operand, i32
+     * [>= T], or 0. While set (set_band), every EXL3 down this block issues passes its rows [r0, r0 + rows) of it: a
+     * row marked non-zero gets the M <= 16 band's down arithmetic (EPIC's paired tile sums) in an M > 16 launch, so a
+     * mixed step's decode rows get their decode-band bytes and its prefill rows their prefill-band bytes in one pass.
+     * 0 (the default): the operand is not passed (a v10 plugin's schema serves it). The architecture owns the buffer
+     * (PERSIST, written each step by libr4d's bi_band) and the switch (exl3_dual). */
+    mutable rad_buf x3band = 0;
+    void set_band(rad_buf b) const { x3band = b; }
     /* bf16 and EXL3 experts both read the bf16 activation, whole on their rank. */
     bool act_bf16() const { return c.expert_bf16 || c.expert_exl3; }
 
@@ -1917,7 +1926,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l, const std::vect
 
 /* One EXL3 op over this rank's tables, each operand where exl3_positions() puts it. */
 inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, RadOperand in,
-                               RadOperand out) const {
+                               RadOperand out, int64_t r0) const {
     const Exl3Positions& at = *exl3_positions(op);
     static const int slot_gu[5] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SUH1, EXL3_P_SVH, EXL3_P_DN_SUH };
     static const int slot_dn[3] = { EXL3_P_CODES, EXL3_P_SUH, EXL3_P_SVH };
@@ -1941,7 +1950,13 @@ inline void MoeFP8::issue_exl3(RadCtx* c_, rad_op op_h, int op, int64_t rows, Ra
             opd[at.plane[q][gd ? slot_gd[t] : gate_up ? slot_gu[t] : slot_dn[t]]] =
                 RAD_WTAB(run[(size_t)(q ? n0 : 0)], q ? ne / 2 : n0);
         }
-    rad_issue(c_, op_h, opd, at.n_opd, rows);
+    /* fn4 BI-dual (v12): the pass's rows of the step's bands, or the operand left off (the trailing optional) */
+    int n_opd = at.n_opd;
+    if (at.band >= 0) {
+        if (x3band && r0 >= 0) opd[at.band] = brow_slice(x3band, r0, rows, 1);
+        else n_opd = at.band;
+    }
+    rad_issue(c_, op_h, opd, n_opd, rows);
 }
 
 /* The shared arm's first stage: its one-column gate and its gate_up over the normed input. Its
@@ -2103,7 +2118,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (x3gd) {
         /* moe_exl3_gate_up_down wrote edn */
     } else if (c.expert_exl3)
-        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
+        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), r0);
     else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
@@ -2283,7 +2298,7 @@ inline void MoeFP8::pair_routed(RadCtx* c_, int64_t T, int64_t R, bool shared_in
     if (shared && shared_in)
         for (int q = 0; q < 2; ++q) gq_sh.step(c_, w.sgu, T, pr0[q], prn[q]);
     if (c.expert_exl3)
-        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
+        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k), 0);
     else if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));

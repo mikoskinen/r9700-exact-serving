@@ -70,7 +70,20 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 10
+#define EXL3_IFACE_VERSION 12
+
+/* v12 (fn4 BI-dual, 11.11.2026; v11 is the fn4-dsgd branch's gate_up_down limit, not on this branch; the ds41 line's
+ * v8-based form of this is its own number): THE DUAL-FORM DOWN. moe_exl3_down and moe_exl3_down_mod4 take one more
+ * OPTIONAL operand, last: `band`, i32 [M] -- a value a token row of the op (the rows `a` / sorted_tok's tokens count,
+ * pass-relative). A token whose entry is non-zero gets the M <= 16 band's down arithmetic in a launch of any M: in
+ * exl3r4d, down's epilogue sums the 8 staged tiles of the output Hadamard as EPIC's paired even / odd sums, as the
+ * decode kernels do, where the M > 16 kernels take the plain sequential sum (had_tiles). gate_up's h is the same bits
+ * in both bands (fn4 177b), so with `band` one pass over a step's rows -- one routing, each expert's weights read once --
+ * gives a row flagged 1 the bytes it gets in an M <= 16 pass and a row flagged 0 the bytes of an M > 16 pass (exl3r4d
+ * from M 3 on Flash-Next's widths, from M 1 on DeepSeek's: the M <= 2 gate_up split-K is not reproduced). Absent, or
+ * a launch in the M <= 16 band: each op exactly as at v10. Under exl3r4d's exl3_bi switch (every row the M > 16
+ * arithmetic) `band` is ignored. A reference library ignores it (its sums are not exl3r4d's either). The other ops
+ * take no band (Exl3Positions::band -1). */
 
 /* v10 (fn4, 10.11.2026; v9 is the ds41 line's ep_ranks, not on this branch): THE SHARED ROUTING MAP. moe_exl3_gate_up and moe_exl3_down (the two-class forms) take one more
  * OPTIONAL operand, last: `map`, i32 [exl3_map_words(T, n_expert)] with T = M * top_k -- a workspace the gate_up and
@@ -325,30 +338,31 @@ typedef struct Exl3Positions {
     int plane[EXL3_MAX_CLS][EXL3_N_P];
     int ids;   /* the router's top-k ids (OPTIONAL operand; prep_gu_mod4 only), -1 for every other op */
     int map;   /* v10: the pass's shared routing map (OPTIONAL operand, last; gate_up and down only), else -1 */
+    int band;  /* v12: the dual-form down's row bands (OPTIONAL operand, last; down and down_mod4 only), else -1 */
 } Exl3Positions;
 
 static inline const Exl3Positions* exl3_positions(int op) {
 #define EXL3_NO_CLASS { -1, -1, -1, -1, -1, -1, -1 }
     static const Exl3Positions gu = { 0, 6, 7, 13, 15, 2, { { 1, 2, 3, 4, 5, -1, -1 }, { 8, 9, 10, 11, 12, -1, -1 },
-                                                            EXL3_NO_CLASS, EXL3_NO_CLASS }, -1, 14 };
-    static const Exl3Positions dn = { 0, 4, 5, 9, 11, 2, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 },
-                                                           EXL3_NO_CLASS, EXL3_NO_CLASS }, -1, 10 };
+                                                            EXL3_NO_CLASS, EXL3_NO_CLASS }, -1, 14, -1 };
+    static const Exl3Positions dn = { 0, 4, 5, 9, 12, 2, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 },
+                                                           EXL3_NO_CLASS, EXL3_NO_CLASS }, -1, 10, 11 };
     static const Exl3Positions pg = { 0, 3, 4, 7, 8, 2, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 },
-                                                          EXL3_NO_CLASS, EXL3_NO_CLASS }, -1, -1 };
+                                                          EXL3_NO_CLASS, EXL3_NO_CLASS }, -1, -1, -1 };
     static const Exl3Positions gd = { 0, 8, 9, 17, 18, 2, { { 1, 2, 3, 4, 5, 6, 7 }, { 10, 11, 12, 13, 14, 15, 16 },
-                                                            EXL3_NO_CLASS, EXL3_NO_CLASS }, -1, -1 };
+                                                            EXL3_NO_CLASS, EXL3_NO_CLASS }, -1, -1, -1 };
     static const Exl3Positions gu4 = { 0, 6, 7, 23, 24, 4, { { 1, 2, 3, 4, 5, -1, -1 }, { 8, 9, 10, 11, 12, -1, -1 },
                                                              { 13, 14, 15, 16, 17, -1, -1 },
-                                                             { 18, 19, 20, 21, 22, -1, -1 } }, -1, -1 };
-    static const Exl3Positions dn4 = { 0, 4, 5, 15, 16, 4, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 },
+                                                             { 18, 19, 20, 21, 22, -1, -1 } }, -1, -1, -1 };
+    static const Exl3Positions dn4 = { 0, 4, 5, 15, 17, 4, { { 1, 2, -1, 3, -1, -1, -1 }, { 6, 7, -1, 8, -1, -1, -1 },
                                                              { 9, 10, -1, 11, -1, -1, -1 },
-                                                             { 12, 13, -1, 14, -1, -1, -1 } }, -1, -1 };
+                                                             { 12, 13, -1, 14, -1, -1, -1 } }, -1, -1, 16 };
     static const Exl3Positions pg4 = { 0, 3, 4, 11, 13, 4, { { -1, 1, 2, -1, -1, -1, -1 }, { -1, 5, 6, -1, -1, -1, -1 },
                                                              { -1, 7, 8, -1, -1, -1, -1 },
-                                                             { -1, 9, 10, -1, -1, -1, -1 } }, 12, -1 };
+                                                             { -1, 9, 10, -1, -1, -1, -1 } }, 12, -1, -1 };
     static const Exl3Positions gd4 = { 0, 8, 9, 31, 32, 4, { { 1, 2, 3, 4, 5, 6, 7 }, { 10, 11, 12, 13, 14, 15, 16 },
                                                              { 17, 18, 19, 20, 21, 22, 23 },
-                                                             { 24, 25, 26, 27, 28, 29, 30 } }, -1, -1 };
+                                                             { 24, 25, 26, 27, 28, 29, 30 } }, -1, -1, -1 };
 #undef EXL3_NO_CLASS
     switch (op) {
     case EXL3_GU_DN:    return &gd;
@@ -432,7 +446,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "h",             RAD_OPD_OUT,  0 },
         { "map",           RAD_OPD_OUT,  1 },   /* v10: the pass's shared routing map */
     };
-    static const RadOperandSpec down[11] = {
+    static const RadOperandSpec down[12] = {
         { "h",             RAD_OPD_IN,   0 },
         { "codes",         RAD_OPD_WTAB, 0 },
         { "suh",           RAD_OPD_WTAB, 0 },
@@ -444,6 +458,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "svh_odd",       RAD_OPD_WTAB, 1 },
         { "y",             RAD_OPD_OUT,  0 },
         { "map",           RAD_OPD_IN,   1 },   /* v10: gate_up's, of the same pass */
+        { "band",          RAD_OPD_IN,   1 },   /* v12: i32 [M], non-zero = the token's M <= 16 band arithmetic */
     };
     static const RadParamSpec p_gd[] = {
         { "M",        RAD_P_INT, RAD_REQUIRED, RAD_PROLE_NONE },
@@ -542,7 +557,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "codes_" #q,  RAD_OPD_WTAB, 0 },                \
         { "suh_" #q,    RAD_OPD_WTAB, 0 },                \
         { "svh_" #q,    RAD_OPD_WTAB, 0 }
-    static const RadOperandSpec down4[16] = {
+    static const RadOperandSpec down4[17] = {
         { "h",             RAD_OPD_IN,   0 },
         { "codes",         RAD_OPD_WTAB, 0 },
         { "suh",           RAD_OPD_WTAB, 0 },
@@ -551,6 +566,7 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { "expert_offset", RAD_OPD_IN,   0 },
         EXL3_DN_CLASS(1), EXL3_DN_CLASS(2), EXL3_DN_CLASS(3),
         { "y",             RAD_OPD_OUT,  0 },
+        { "band",          RAD_OPD_IN,   1 },   /* v12: i32 [M], non-zero = the token's M <= 16 band arithmetic */
     };
 #undef EXL3_DN_CLASS
 #define EXL3_PG_CLASS(q)                                  \
@@ -615,12 +631,13 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
           "at entry e/2; rows past expert_offset[n_expert] are zero. expert_w is not applied. "
           "map (optional, v10): a workspace shared with the same pass's down, not a model value. "
           "docs/OPS-exl3.md." },
-        { EXL3_OP_DOWN, p_dn, (int)(sizeof p_dn / sizeof p_dn[0]), down, 11,
+        { EXL3_OP_DOWN, p_dn, (int)(sizeof p_dn / sizeof p_dn[0]), down, 12,
           "EXL3 routed experts, down: per sorted row, h[i] scaled by suh and rotated (with h_rot = "
           "1: h[i] as gate_up already rotated it), times W_hat, rotated back and scaled by svh, "
           "bf16. One weight table a plane a parity class, expert e at entry e/2; rows past "
           "expert_offset[n_expert] are zero. expert_w is not applied. map (optional, v10): what the same "
-          "pass's gate_up left there, not a model value. docs/OPS-exl3.md." },
+          "pass's gate_up left there, not a model value. band (optional, v12): i32 [M], a token whose entry is "
+          "non-zero gets the M <= 16 band's down arithmetic in a launch of any M. docs/OPS-exl3.md." },
         { EXL3_OP_PREP_GU, p_pg, (int)(sizeof p_pg / sizeof p_pg[0]), prep_gu, 8,
           "EXL3 routed experts, gate_up's input rotation as an op: per sorted row, "
           "a[sorted_tok/top_k] scaled by suh and rotated, then by suh.1 and rotated, side by side "
@@ -634,9 +651,10 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
         { EXL3_OP_GATE_UP4, p_gu4, (int)(sizeof p_gu4 / sizeof p_gu4[0]), gate_up4, 24,
           "moe_exl3_gate_up over FOUR classes of experts by number mod 4 (moe_gemm_q_mod4's): class q at "
           "[N_q, K_q], expert e at entry e/4 of class e%4; otherwise moe_exl3_gate_up. docs/OPS-exl3.md." },
-        { EXL3_OP_DOWN4, p_dn4, (int)(sizeof p_dn4 / sizeof p_dn4[0]), down4, 16,
+        { EXL3_OP_DOWN4, p_dn4, (int)(sizeof p_dn4 / sizeof p_dn4[0]), down4, 17,
           "moe_exl3_down over FOUR classes of experts by number mod 4 (moe_gemm_q_mod4's): class q at "
-          "[N_q, K_q], expert e at entry e/4 of class e%4; otherwise moe_exl3_down. docs/OPS-exl3.md." },
+          "[N_q, K_q], expert e at entry e/4 of class e%4; otherwise moe_exl3_down (band, v12, included). "
+          "docs/OPS-exl3.md." },
         { EXL3_OP_PREP_GU4, p_pg4, (int)(sizeof p_pg4 / sizeof p_pg4[0]), prep_gu4, 13,
           "moe_exl3_prep_gu over FOUR classes of experts by number mod 4: class q's input width K_q, "
           "expert e at entry e/4 of class e%4; xr f16 [T, 2*max(K_q)]; otherwise moe_exl3_prep_gu. "

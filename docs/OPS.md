@@ -463,10 +463,14 @@ of the scalar kernels that serve the rows it cannot read.
 | op | params | operands |
 |---|---|---|
 | `bi_rowhash` | `M`(range) | `x` → `h` |
+| `bi_band` | `M`(range) `band` | `cu_seqlens` → `band` |
 
 A 64-bit fingerprint of each row's bytes as two i32: an order-free fold of the row's 16-bit units and
 their indices, so a function of the row's bytes alone, whatever the launch's grid. fn4 BI's engine
 tracer; qwen4exp declares it only under `RADIANCE_FN4_BITRACE`.
+
+`bi_band` (fn4 BI-dual) writes a step's row bands for the EXL3 down's v12 `band` operand: 1 for a row whose sequence
+has at most `band` rows in the step (`cu_seqlens`), 0 for the others and for rows past the last sequence.
 
 ### Gemma 4 fusions (device-only)
 

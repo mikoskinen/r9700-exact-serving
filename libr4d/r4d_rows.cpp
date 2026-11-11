@@ -2664,6 +2664,9 @@ static const RadOperandSpec oJoinAddScale[] = {
 /* fn4 BI's engine tracer (debug, r4d_fn4_bi.hip): a fingerprint of each row of any operand. */
 static const RadParamSpec pBiRowHash[] = { P_INT("M") };
 static const RadOperandSpec oBiRowHash[] = { { "x", RAD_OPD_IN, 0 }, { "h", RAD_OPD_OUT, 0 } };
+/* fn4 BI-dual: a step's row bands from its cu_seqlens (r4d_fn4_bi.hip). */
+static const RadParamSpec pBiBand[] = { P_INT("M"), P_INT("band") };
+static const RadOperandSpec oBiBand[] = { { "cu_seqlens", RAD_OPD_IN, 0 }, { "band", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pExpertScale[] = {
     P_INT("M"),
     P_INT("n_expert"),
@@ -3982,6 +3985,9 @@ static const RadOpSchema kSchemas[] = {
            "join)."),
     SCHEMA("bi_rowhash", pBiRowHash, oBiRowHash,
            "h[m] = a 64-bit fingerprint of row m's bytes (two i32 a row): debug only, fn4 BI's tracer."),
+    SCHEMA("bi_band", pBiBand, oBiBand,
+           "band[m] = 1 when row m's sequence (cu_seqlens) has at most `band` rows in the step, else 0 (rows past the "
+           "last sequence 0): fn4 BI-dual's row bands for the EXL3 down's v12 band operand."),
     SCHEMA("expert_scale", pExpertScale, oExpertScale,
            "ew[t, k] = ew[t, k] * w_e[ids[t, k]] over [M, top_k], w_e an [n_expert] table, an id "
            "outside it reading 0; one product rounded once, so the embed_lookup + mul pair's value "
@@ -4943,6 +4949,7 @@ static const RadConstraint cLiliAttn[] = {
 static const RadConstraint cLiliFactor[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cLiliWalk[] = { C_GE("k", 1), C_LE("k", 64), C_IN("dtype", "bf16") };
 static const RadConstraint cBiRowHash[] = { C_GE("M", 1) };
+static const RadConstraint cBiBand[] = { C_GE("M", 1), C_GE("band", 1), C_LE("band", 65536) };
 static const RadConstraint cExpertScale[] = {
     C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1), C_IN("dtype", "bf16"),
 };
@@ -10230,6 +10237,10 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "a 64-bit fingerprint of each row's bytes (XOR of mixed 16-bit units; order-free)", "any M; a workgroup a row",
   "any x dtype (2-byte aligned rows), i32 pairs h", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cBiRowHash), NOTUNE,
   nullptr, nullptr, r4d_rad_bi_rowhash },
+{ "bi_band", "bi_band", "elem",
+  "a step's row bands from its cu_seqlens: a thread a row, a binary search over the sequences", "any M",
+  "i32 cu_seqlens and band", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cBiBand), NOTUNE,
+  nullptr, nullptr, r4d_rad_bi_band },
 
 { "expert_scale_bf16", "expert_scale", "moe",
   "routing weight times its expert's scale, in place: one thread an element",

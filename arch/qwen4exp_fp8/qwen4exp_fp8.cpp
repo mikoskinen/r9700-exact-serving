@@ -272,9 +272,22 @@ struct Model {
     MediaRows   mrows{};
 
     BiTr        bt{};   /* fn4 BI's engine tracer: inert unless RADIANCE_FN4_BITRACE */
+    /* fn4 BI-dual (RADIANCE_FN4_X3DUAL=1 at start, switch exl3_dual): the step's row bands (libr4d bi_band from
+     * cu_seqlens: 1 for a row whose sequence has at most 16 rows in the step) for every trunk MoE layer's EXL3 down
+     * (exl3 interface v12), so a mixed step's decode rows get the decode band's bytes in the prefill band's pass.
+     * PERSIST: the downs read it all step, and their declarations do not name it. */
+    rad_buf     b_band = 0;
+    rad_op      op_band = 0;
 };
 
 static Model g_model[MAX_RANKS];
+
+/* fn4 BI-dual: switch exl3_dual's value (RADIANCE_FN4_X3DUAL starts it at 1; declared ranks only issue it). */
+static std::atomic<int>& fn4_dual_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_X3DUAL") ? 1 : 0};
+    return f;
+}
+static std::atomic<int> g_dual_declared{0};
 
 /* ============================== fn4 BI's engine tracer (BiTr) ============================== */
 static const char* bt_dir() {
@@ -1751,6 +1764,24 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * arena with every buffer above. Its weight groups start past every text layer and the MTP
      * head. */
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer + 64));
+    /* fn4 BI-dual (RADIANCE_FN4_X3DUAL=1): the step's row bands, for the EXL3 experts' downs */
+    if (fn4_env_on("RADIANCE_FN4_X3DUAL") && m.moecfg.expert_exl3) {
+        m.b_band = decl_b(b, nm.f("x3_band"), RAD_I32, {g.max_tok}, RAD_BUF_PERSIST);
+        m.op_band = m.b_band ? rw(b, RAD_OP(b, "bi_band",
+                                            RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("band", 16)),
+                                            RAD_NOWEIGHTS),
+                                  {}, {m.b_band})
+                             : 0;
+        if (!m.op_band) {
+            fprintf(stderr, "radiance: qwen4exp: RADIANCE_FN4_X3DUAL: bi_band did not resolve (a libr4d with r4d_fn4_bi?)\n");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (!ctx->shape_probe) g_dual_declared.store(1, std::memory_order_relaxed);
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: qwen4exp: fn4 BI-dual declared (RADIANCE_FN4_X3DUAL, switch exl3_dual now %d): the "
+                            "EXL3 downs take the step's row bands (sequences of at most 16 rows: the decode band's sums)\n",
+                    fn4_dual_flag().load(std::memory_order_relaxed));
+    }
     /* fn4 BI's tracer, after everything (RADIANCE_FN4_BITRACE; unset: nothing declared). */
     RAD_ARCH_TRY(bt_declare(b, m, ctx));
     return RAD_OK;
@@ -2096,6 +2127,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     bt_begin(c, m, T);
+    {   /* fn4 BI-dual: the step's row bands, and every trunk MoE layer's downs told (exl3_dual) */
+        const bool dual = m.op_band && fn4_dual_flag().load(std::memory_order_relaxed) > 0;
+        if (dual)
+            RAD_ISSUE_N(c, m.op_band, T, praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1), brows(m.b_band, T));
+        if (m.op_band)
+            for (const Layer& l : m.layers) l.mlp.set_band(dual ? m.b_band : 0);
+    }
     const int32_t* pcu = pipe_bounds(c, batch, m);
     if (pipelined(m, T)) step_pipelined(c, batch, m, pcu);
     else                 step_serial(c, batch, m, pcu);
