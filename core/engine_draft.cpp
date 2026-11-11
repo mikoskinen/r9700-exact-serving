@@ -212,6 +212,21 @@ void Engine::step_state_fini() {
  * nothing up. */
 namespace {
 constexpr int kCtxSlots = 32;   /* step slots between refills; slot kCtxSlots is the stash */
+/* Lever Z0-A: RADIANCE_DRAFT_CTXSKIP_SLOTS (2 .. 1024; unset kCtxSlots) sizes the ring (at most the drafter's window);
+ * the rows kept before a refill stay kCtxSlots unless fn4 arena_d0 is 1 (Engine::ctx_limit). */
+int ctx_slots_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DRAFT_CTXSKIP_SLOTS");
+        if (!e || !*e) return kCtxSlots;
+        const int n = std::atoi(e);
+        if (n < 2 || n > 1024) {
+            RAD_WARN("RADIANCE_DRAFT_CTXSKIP_SLOTS=%s is not 2 .. 1024; %d", e, kCtxSlots);
+            return kCtxSlots;
+        }
+        return n;
+    }();
+    return v;
+}
 /* RADIANCE_DRAFT_CTXSKIP: -1 unset (or not 0 / 1, warned), else the start value. */
 int ctxskip_env() {
     static const int v = [] {
@@ -248,7 +263,7 @@ int64_t Engine::ctxskip_bytes(const Program& p, rad_buf* src, int64_t* pitch, in
         const int64_t eb = dtype_bytes(b.decl.dtype);
         if (b.decl.rank != 2 || eb <= 0 || b.decl.shape[1] <= 0) return 0;
         const int64_t pb = b.decl.shape[1] * eb;
-        const int sl = std::min<int>(kCtxSlots, (int)p.drafter.window);
+        const int sl = std::min<int>(ctx_slots_env(), (int)p.drafter.window);
         if (src) *src = (rad_buf)i;
         if (pitch) *pitch = pb;
         if (slots) *slots = sl;
@@ -335,6 +350,23 @@ void Engine::ctx_note() const {
                       sched_.ctx_pending(), ctxs_.slots, ctxs_.ring_bytes >> 20);
 }
 
+/* Lever Z0-A: the step slots kept before a refill -- today's kCtxSlots (or fewer: the ring), the whole ring under fn4
+ * arena_d0 1, so a depth-0 step refills only at a probe, a prefill or the ring's end and keeps the small arena rung. */
+int Engine::ctx_limit() const {
+    return arena_d0_.load(std::memory_order_relaxed) == 1 ? ctxs_.slots : std::min(ctxs_.slots, kCtxSlots);
+}
+
+/* Lever Z0-A: whether block_context_pass will refill in the step about to be released (the ring at its limit, or a
+ * checkpoint carrying the drafter's window); such a step needs the rung the refill passes are cut to. */
+bool Engine::ctx_refill_due() {
+    if (!ctxs_.ready || !ctxs_.on || sched_.ctx_pending() == 0) return false;
+    if (ctxs_.used >= ctx_limit()) return true;
+    if (drafter_snap_)
+        for (const StepEntry& e : sched_.plan().e)
+            if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) return true;
+    return false;
+}
+
 /* The step's first `rows` tapped rows into ring slot `slot` (to_ring), or back. Every rank that taps,
  * on its stream: behind the trunk step that wrote them, ahead of the next pass that reads them. */
 int Engine::ctx_copy_rows(int slot, int64_t rows, bool to_ring) {
@@ -415,7 +447,7 @@ int Engine::block_context_pass(int step) {
             ctx_note();
             return RAD_OK;
         }
-        if (ctxs_.used < ctxs_.slots) {
+        if (ctxs_.used < ctx_limit()) {
             RAD_TRY(ctx_copy_rows(ctxs_.used, rows, true));
             (void)sched_.ctx_keep(ctxs_.used);
             ++ctxs_.used;

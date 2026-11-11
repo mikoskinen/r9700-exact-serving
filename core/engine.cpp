@@ -2079,12 +2079,15 @@ int Engine::arena_step(const RadBatch* b) {
     /* Lever Z0-A (fn4 arena_d0): with decode rungs declared below the one today's steps take
      * (RADIANCE_DS41_ARENA_DECODE_ROWS=8,48), off every decode and verify step takes at least that one, as
      * today; on, a decode step that verifies nothing and runs no head (one row a sequence, depth 0 or a
-     * plain probe) takes the smallest rung holding its own rows, as an NST 0 step does; a drafter refill
-     * in it is cut to that rung's rows (ctx_refill_all). Placement only: plan_level gives a smaller rung
-     * only fewer rows of the same buffers. */
+     * plain probe) takes the smallest rung holding its own rows, as an NST 0 step does, unless the context
+     * skip refills in it (ctx_refill_due: refills are cut to the step's rung, 8-row passes would multiply
+     * them); under arena_d0 1 the skip keeps rows to the end of its ring (ctx_limit, RADIANCE_DRAFT_CTXSKIP_
+     * SLOTS), so refills come at probes and prefills. Placement only: plan_level gives a smaller rung only
+     * fewer rows of the same buffers. */
     if (!b->enc && arena_dec_max_ > 0) {
         const bool d0 = arena_d0_.load(std::memory_order_relaxed) == 1;
-        if (d0 && b->phase == RAD_PHASE_DECODE && b->n_tok == b->n_seq && !sched_.draft().head_runs())
+        if (d0 && b->phase == RAD_PHASE_DECODE && b->n_tok == b->n_seq && !sched_.draft().head_runs() &&
+            !ctx_refill_due())
             need = b->n_tok;
         else if (!d0)
             need = std::max<int64_t>(need, arena_dec_max_);

@@ -598,6 +598,8 @@ private:
                           int* slots = nullptr) const;
     int  ctxskip_setup();
     void ctxskip_fini();
+    int  ctx_limit() const;      /* lever Z0-A */
+    bool ctx_refill_due();       /* lever Z0-A */
     /* The context pass of issue_block_drafter: today's, or under the skip a kept step / a refill. */
     int  block_context_pass(int step);
     int  ctx_copy_rows(int slot, int64_t rows, bool to_ring);
