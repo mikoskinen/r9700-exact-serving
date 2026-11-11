@@ -4148,20 +4148,26 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 const bool uses = c.cand >= 0 && c.cand < l;
                 const bool split = m.isplit && m.sel_gather;
                 const bool rkeep = L.i_keep && live >= m.keep_min_live;
-                for (size_t si = 0; si < sg.size(); ++si) {
-                    /* lever PSK (ds41-psk-fix): a cut prefill segment keeps the step's deal (sg_step: every uncut
-                     * layer's). The candidate layer's keep rows are rank-local -- each rank writes only its own runs'
-                     * rows, and keep is not gathered -- so a row's selection must run on the rank that wrote its keep,
-                     * at the same run height. Runs wholly before the layer's cut rows are skipped; a run reaching
-                     * them runs whole (its rows before the cut are not read at this layer). Uncut: sg[si] is
-                     * sg_step[si], nothing skipped, the issue as before. */
-                    const BiSeg& s = psk_redeal ? sg[si] : sg_step[si];
-                    const int64_t cut0 = sg[si].r0;
+                for (const BiSeg& sl : sg) {
+                    /* lever PSK (ds41-psk-fix): a cut prefill segment keeps the deal of the step's segment that holds
+                     * its rows (sg_step: every uncut layer's). The candidate layer's keep rows are rank-local -- each
+                     * rank writes only its own runs' rows, and keep is not gathered -- so a row's selection must run
+                     * on the rank that wrote its keep, at the same run height. Runs that miss the layer's rows
+                     * [sl.r0, sl.r0 + sl.n) are skipped; a run reaching them runs whole (its other rows are not read
+                     * at this layer). Uncut: the step's segment is sl itself, nothing skipped, the issue as before. */
+                    const BiSeg* sf = &sl;
+                    for (const BiSeg& t : sg_step)
+                        if (t.dec == sl.dec && t.r0 <= sl.r0 && sl.r0 + sl.n <= t.r0 + t.n) {
+                            sf = &t;
+                            break;
+                        }
+                    const BiSeg& s = psk_redeal ? sl : *sf;
+                    const int64_t lo = sl.r0, hi = sl.r0 + sl.n;
                     const Ds41IdxRuns ru = ds41_idx_runs(s.n, m.irows, live, m.aw, m.ar, split && !s.dec, m.split_min_live,
                                                          split && !s.dec && idx_balance(), (int64_t)L.i_runs.size());
                     for (int64_t p = ru.p0; p < ru.p1; ++p) {
                         const int64_t q0 = p * ru.R, qn = std::min(ru.R, s.n - q0);
-                        if (s.r0 + q0 + qn <= cut0) continue;
+                        if (s.r0 + q0 + qn <= lo || s.r0 + q0 >= hi) continue;
                         RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, R(m.iq, s.r0, s.n), R(m.iw, s.r0, s.n),
                                     kv_cache(m.index[r], src),
                                     praw2(ib->block_table + s.s0 * ib->block_table_pitch, RAD_I32, s.s1 - s.s0,
