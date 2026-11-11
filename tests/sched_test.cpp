@@ -6,11 +6,13 @@
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
 #include "sched/scheduler.h"
+#include "runtime/fn4_switch.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
 #include "server/sink.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -8997,3 +8999,103 @@ TEST(forced_depth_zero_holds_zero_but_for_the_probes) {
     CHECK(!f.sch.draft().depth0_forced());
     CHECK_EQ(f.sch.set_draft_depth0(0), 0);
 }
+
+/* ------------------------------------------------------------------ lever BI class (ii): sched_bi_chunk 3 (option D)
+ * The fixture's geometry: interval 256, a span of two (512 alone), max_tok 576, so the shared budget is 576 - 256 = 320:
+ * 64 rows of slack beside a 256-row grid piece, as the DS line's 2112 = 2048 + 64. D cuts alone's pieces on the interval
+ * grid inside them, >= 128 rows a side; alone's own pieces otherwise. The switch is the core fn4 switch the scheduler
+ * reads at every step; each test sets it and puts it back to 0 (the process's other tests run today's chunking). */
+namespace {
+struct BiChunk {
+    explicit BiChunk(int v) { set(v); }
+    ~BiChunk() { set(0); }
+    static void set(int v) {
+        std::string err;
+        CHECK(fn4::request("sched_bi_chunk", v, &err));
+        int sw[fn4::kSwitches];
+        (void)fn4::apply_pending(-1, sw);
+        CHECK_EQ(fn4::sched_bi_chunk(), v);
+    }
+};
+/* Run `steps` steps of the fixture; the long request's prefill pieces (start, rows) in order. */
+std::vector<std::pair<int64_t, int64_t>> bi_pieces(Fixture& f, uint64_t id, int steps) {
+    std::vector<std::pair<int64_t, int64_t>> out;
+    int64_t at = 0;
+    for (int k = 0; k < steps; ++k) {
+        if (!f.sch.step()) break;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == id && e.is_prefill) {
+                out.emplace_back(at, e.n_tokens);
+                at += e.n_tokens;
+            }
+        f.commit_plain();
+    }
+    return out;
+}
+/* Alone's pieces of an L-token prompt at this geometry: the first interval, then spans of two, the rest at the end. */
+std::vector<int64_t> bi_alone_ends(int64_t L) {
+    std::vector<int64_t> e;
+    for (int64_t x = 256; x < L; x += 512) e.push_back(x);
+    e.push_back(L);
+    return e;
+}
+void bi_check_d(const std::vector<std::pair<int64_t, int64_t>>& pc, int64_t L) {
+    int64_t sum = 0;
+    const std::vector<int64_t> ae = bi_alone_ends(L);
+    for (const auto& p : pc) {
+        sum += p.second;
+        const int64_t end = p.first + p.second;
+        const bool alone_end = std::find(ae.begin(), ae.end(), end) != ae.end();
+        /* every piece ends on the grid or at one of alone's ends, and none is shorter than 128 rows unless it is alone's
+         * whole final piece, from alone's own boundary */
+        const bool alone_start = p.first == 0 || std::find(ae.begin(), ae.end(), p.first) != ae.end();
+        CHECK(alone_end || end % 256 == 0);
+        CHECK(p.second >= 128 || (end == L && alone_start));
+        if (!(alone_end || end % 256 == 0) || !(p.second >= 128 || (end == L && alone_start)))
+            std::fprintf(stderr, "    bi piece [%lld, %lld)\n", (long long)p.first, (long long)end);
+    }
+    CHECK_EQ(sum, L);
+}
+}  // namespace
+
+/* Beside a few decode rows (within the slack) D takes the grid halves of alone's spans: 256 rows a step, alone's final
+ * piece whole -- the plan the budget allows without going over it. */
+TEST(bi_chunk_d_cuts_alone_spans_on_the_grid_beside_decode_rows) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/576);
+    f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;   /* the engine's default: a prompt's tail snapshot splits no idle chunk */
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.geometry().shared_tok, 320);
+    BiChunk on(3);
+    for (int i = 0; i < 8; ++i) CHECK(f.submit(16, 4000, 0, true) != 0);
+    for (int k = 0; k < 4; ++k) { CHECK(f.sch.step() != nullptr); f.commit_plain(); }
+    const int64_t L = 3000;
+    const uint64_t a = f.submit((int)L, 2, 0, true);
+    const auto pc = bi_pieces(f, a, 60);
+    bi_check_d(pc, L);
+    /* within the budget: every piece is a 256-row grid piece but alone's 184-row final one -- no step went over */
+    for (size_t i = 0; i + 1 < pc.size(); ++i) CHECK_EQ(pc[i].second, 256);
+    CHECK_EQ(pc.back().second, 184);
+}
+
+/* More decode rows than the slack ahead of it: no grid piece fits what is left of the shared budget. D's long prefill
+ * then takes its smallest admissible piece over the shared budget (up to max_tok), so it still progresses, every piece
+ * on the grid and >= 128 rows; before this it waited as long as those rows decoded. */
+TEST(bi_chunk_d_progresses_with_more_decode_rows_than_the_slack) {
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/160, /*max_tok=*/576);
+    f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;
+    f.cfg.max_seqs = 128;
+    CHECK_OK(f.start());
+    BiChunk on(3);
+    for (int i = 0; i < 80; ++i) CHECK(f.submit(4, 4000, 0, true) != 0);
+    for (int k = 0; k < 4; ++k) { CHECK(f.sch.step() != nullptr); f.commit_plain(); }
+    const int64_t L = 3000;
+    const uint64_t a = f.submit((int)L, 2, 0, true);
+    const auto pc = bi_pieces(f, a, 120);
+    bi_check_d(pc, L);
+    for (const auto& p : pc) CHECK(p.second <= 576);
+}
+
