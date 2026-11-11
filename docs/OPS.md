@@ -458,6 +458,16 @@ of the scalar kernels that serve the rows it cannot read.
   `inv[i] = exp(i * -log(max_timescale) / max(n/2 - 1, 1))`, each step in f32 as the reference's
   torch expressions are, then rounded.
 
+### `bi_rowhash` (debug, device-only)
+
+| op | params | operands |
+|---|---|---|
+| `bi_rowhash` | `M`(range) | `x` → `h` |
+
+A 64-bit fingerprint of each row's bytes as two i32: an order-free fold of the row's 16-bit units and
+their indices, so a function of the row's bytes alone, whatever the launch's grid. fn4 BI's engine
+tracer; qwen4exp declares it only under `RADIANCE_FN4_BITRACE`.
+
 ### Gemma 4 fusions (device-only)
 
 | op | params | operands |

@@ -2661,6 +2661,9 @@ static const RadOperandSpec oJoinAddScale[] = {
     { "w_n", RAD_OPD_WEIGHT, 1 },
     { "y",   RAD_OPD_OUT,    1 },
 };
+/* fn4 BI's engine tracer (debug, r4d_fn4_bi.hip): a fingerprint of each row of any operand. */
+static const RadParamSpec pBiRowHash[] = { P_INT("M") };
+static const RadOperandSpec oBiRowHash[] = { { "x", RAD_OPD_IN, 0 }, { "h", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pExpertScale[] = {
     P_INT("M"),
     P_INT("n_expert"),
@@ -3977,6 +3980,8 @@ static const RadOpSchema kSchemas[] = {
            "where the unfused chain rounds. Two arms' post-norms, their sum, its norm, the residual "
            "add, a per-layer scalar and the next layer's input norm (Gemma 4's feed-forward "
            "join)."),
+    SCHEMA("bi_rowhash", pBiRowHash, oBiRowHash,
+           "h[m] = a 64-bit fingerprint of row m's bytes (two i32 a row): debug only, fn4 BI's tracer."),
     SCHEMA("expert_scale", pExpertScale, oExpertScale,
            "ew[t, k] = ew[t, k] * w_e[ids[t, k]] over [M, top_k], w_e an [n_expert] table, an id "
            "outside it reading 0; one product rounded once, so the embed_lookup + mul pair's value "
@@ -4937,6 +4942,7 @@ static const RadConstraint cLiliAttn[] = {
 };
 static const RadConstraint cLiliFactor[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cLiliWalk[] = { C_GE("k", 1), C_LE("k", 64), C_IN("dtype", "bf16") };
+static const RadConstraint cBiRowHash[] = { C_GE("M", 1) };
 static const RadConstraint cExpertScale[] = {
     C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1), C_IN("dtype", "bf16"),
 };
@@ -10219,6 +10225,11 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cNormJoin), NOTUNE,
   nullptr, nullptr, r4d_rad_join_add_scale_bf16 },
+
+{ "bi_rowhash", "bi_rowhash", "debug",
+  "a 64-bit fingerprint of each row's bytes (XOR of mixed 16-bit units; order-free)", "any M; a workgroup a row",
+  "any x dtype (2-byte aligned rows), i32 pairs h", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cBiRowHash), NOTUNE,
+  nullptr, nullptr, r4d_rad_bi_rowhash },
 
 { "expert_scale_bf16", "expert_scale", "moe",
   "routing weight times its expert's scale, in place: one thread an element",

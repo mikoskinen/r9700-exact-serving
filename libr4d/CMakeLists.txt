@@ -204,6 +204,8 @@ set(R4D_UNITS
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
   "r4d_expert_scale_bf16|"
+  # fn4 BI's engine tracer (debug): bi_rowhash, a fingerprint of each row.
+  "r4d_fn4_bi|"
   # Runtime LoRA's two halves (lora_shrink, lora_expand), per-row adapter slot: scalar and tiled rows.
   "r4d_lora_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
