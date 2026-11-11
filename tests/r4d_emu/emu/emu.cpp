@@ -260,7 +260,8 @@ int emu_update_dpp(int old, int src, int ctrl, int row_mask, int bank_mask, bool
     const int* s = exchange(src, &l, kOpDpp | (ctrl & 0xffff));
     const int r = l & 15, k = ctrl & 15;
     int from;
-    if (ctrl > 0x100 && ctrl < 0x110)      from = r + k < 16 ? l + k : -1;     /* row_shl */
+    if (ctrl >= 0 && ctrl < 0x100)         from = (l & ~3) | ((ctrl >> (2 * (l & 3))) & 3);   /* quad_perm */
+    else if (ctrl > 0x100 && ctrl < 0x110) from = r + k < 16 ? l + k : -1;     /* row_shl */
     else if (ctrl > 0x110 && ctrl < 0x120) from = r - k >= 0 ? l - k : -1;     /* row_shr */
     else if (ctrl >= 0x160 && ctrl < 0x170) from = (l & 16) | (r ^ k);         /* row_xmask */
     else { std::fprintf(stderr, "emu: dpp_ctrl 0x%x is not emulated\n", ctrl); std::abort(); }

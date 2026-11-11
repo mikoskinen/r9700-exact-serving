@@ -3,6 +3,7 @@
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_moe_sort.h"
+#include "r4d_ds41_f32pf.h"
 #include <climits>
 #include <cmath>
 
@@ -122,6 +123,14 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * at every count below 64; at N 288 from 17 rows 8x1 with 8 steps is faster.
      * A projection of a few columns has too few waves for wide tiles at any M. */
     const long rows = x.shape[0];
+    /* lever GPF-b (r4d_ds41_f32pf.hip): the tiled prefill form when switched on (above 63 rows) or pinned; the same
+     * bits as every form here. */
+    if (n > 8 && r4d_f32pf_on()) {
+        const R4dF32PfCall c{ (const uint16_t*)x.data, w.data, (float*)y.data, (long)x.stride[0], (long)w.stride[0],
+                              (long)y.stride[0], (int)rows, (int)n, (int)k, w.dtype == RAD_BF16 };
+        const int rc = r4d_f32pf_gemm(stream, c);
+        if (rc != R4D_F32PF_DECLINE) return rc;
+    }
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k);
     if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k);

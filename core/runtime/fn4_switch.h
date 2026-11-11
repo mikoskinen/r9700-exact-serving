@@ -70,6 +70,16 @@
  *   drafter_bf      libr4d (rad_fn4_*): gemm_nt bf16's decode band (the drafter's attention / main_proj / shared
  *                   expert), 0 the stock skinny WMMA kernel, 1 its prefetching form (r4d_gemm_bf16_nt_pf.hip), the
  *                   same chains and so the same bits; RADIANCE_DS41_DRAFTER_BF=1 at load.
+ *   gg_pf           libr4d (rad_fn4_*; lever GPF): gemm_nt_ggml / logits_gemm_ggml's prefill WMMA rows (q5_K / q6_K /
+ *                   q8_0 above the decode band), 0 the stock kernel (gg_wm_kernel), 1 the per-shape form table
+ *                   (RADIANCE_DS41_GG_PF_TABLE at load, else the built-in one; a shape it does not name runs the
+ *                   stock kernel), or a form code (r4d_ds41_ggml_pf.hip: 100 MT + 10 NT + WN / 4) for every shape.
+ *                   Every form keeps the stock kernel's per-output WMMA chains and scale fmas, so the bytes are the
+ *                   same; RADIANCE_DS41_GG_PF at load. -1 when no loaded object serves it.
+ *   f32_pf          libr4d (rad_fn4_*; lever GPF-b): gemm_nt_f32's prefill rows (the router and the compressor's kv | gate
+ *                   projection above 63 rows), 0 the stock tile kernel, 1 the tiled form (r4d_ds41_f32pf.hip, form 20),
+ *                   20.. a form code. Every form keeps each output's 32 lane-strided fmaf chains and the xor butterfly,
+ *                   so the bytes are the same for f32 and bf16 weight storage; RADIANCE_DS41_F32_PF at load.
  *   aql_acq         core (Ctx::haz_mark + the AQL replay): the address-based acquire rule in force, 0 off, 1 rule,
  *                   2 rule-w -- the switch once set, else RADIANCE_AQL_ACQ=rule | rule-w at start (ds41-ar-acq
  *                   4c9e6c2's start-time rule, now read through here). A change re-records every pass (the epoch),
@@ -158,7 +168,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41OneFill, kDraftDepth0, kDraftProbe, kDraftHybrid, kDraftHybridMatch, kDraftProbeBackoff,
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
-              kDsparkConf, kDsparkAlt, kDsparkConfRows, kSwitches };
+              kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

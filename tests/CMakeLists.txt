@@ -542,11 +542,13 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_gemm_m2xfp4a8_decode.hip ${R4D_DIR}/r4d_gemm_m2xfp4a8_tiled.hip
                 ${R4D_DIR}/r4d_lili.hip ${R4D_DIR}/r4d_ds41_sparse.hip ${R4D_DIR}/r4d_ds41_elem.hip
                 ${R4D_DIR}/r4d_ds41_ggml_mr.hip ${R4D_DIR}/r4d_dspark_extra.hip ${R4D_DIR}/r4d_ds41_mxfp4_mr.hip
-                ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16_nt_pf.hip)
+                ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16_nt_pf.hip
+                ${R4D_DIR}/r4d_ds41_ggml_pf.hip ${R4D_DIR}/r4d_ds41_f32pf.hip)
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
-                  dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin)
+                  dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
+                  ds41pf)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -591,7 +593,7 @@ else()
                 ${R4D_EMU}/test_ds41idx.cpp ${R4D_EMU}/test_ds41attn.cpp ${R4D_EMU}/test_ds41mr.cpp
                 ${R4D_EMU}/test_argts.cpp ${R4D_EMU}/test_ds41fold.cpp ${R4D_EMU}/test_ds41vram.cpp
                 ${R4D_EMU}/test_dspark.cpp ${R4D_EMU}/test_ds41fold2.cpp ${R4D_EMU}/test_ds41drk.cpp
-                ${R4D_EMU}/test_ds41kvwin.cpp ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_ds41kvwin.cpp ${R4D_EMU}/test_ds41pf.cpp ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -629,7 +631,7 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
-            ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin)
+            ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
@@ -649,6 +651,8 @@ if(R4D_EMU_BUILT)
   # the bf16 window and to libref.
   set_tests_properties(r4d_emu_ds41kvwin PROPERTIES LABELS "r4d_emu" TIMEOUT 2400
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
+  # Lever GPF: the prefill WMMA forms against the stock WMMA kernel, byte for byte.
+  set_tests_properties(r4d_emu_ds41pf PROPERTIES LABELS "r4d_emu" TIMEOUT 1800)
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
   foreach(k 0 1 2)
