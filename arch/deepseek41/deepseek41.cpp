@@ -2307,7 +2307,14 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     s.cfg.shared_ungated = 1;
     s.cfg.gather_ar_rows = gather_ar_rows();
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
-    DS_TRY(L.moe.declare(b, nm, g, l, d.mw, s, false, false));
+    /* Lever Z0-A (ds41-z0): the block's sigmoid router refuses rows above its geometry's max_tok
+     * (rad_block_glm_router.h, GlmRouter::declare: c.rows > g.max_tok -> RAD_E_INVAL). A sizing declare below Q (the
+     * 8-row rung at NST 5) keeps the head's real Q rows (the shape_probe block in declare()), so the drafter's block
+     * takes max_tok = max(T, Q). The real declare has Q <= T (dsp_config: Q = min(max_seqs x block, max_tok)), so its
+     * geometry, graph and parameters are today's. */
+    Geom gq = g;
+    gq.max_tok = std::max<int64_t>(g.max_tok, Q);
+    DS_TRY(L.moe.declare(b, nm, gq, l, d.mw, s, false, false));
     L.moe.gar_live = &g_sw_gar;   /* the same live bound as the trunk's (rad_fn4_*); one lane always */
     sw_note_decl(L.moe.gar_rows);
     L.post_f = op(b, "mhc_post", hcp, {}, { d.act.x, d.h1, d.post, d.comb }, { d.h0 });
