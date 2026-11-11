@@ -4569,6 +4569,48 @@ int Engine::start() {
             RAD_INFO("RADIANCE_DRAFT_LEND: the drafter's slab cannot be lent on every rank (a static plan, "
                      "or no drafter class of its own); the lend stays off");
     }
+    /* Lever Z0-W: RADIANCE_DRAFT_LEND_WEIGHTS (any value declares it; 1 starts it on) -- the drafter's static
+     * weights only its query pass reads, lent with the slab (Mover::draft_w_setup). The context pass (and so
+     * every refill) reads dspark.fc, dspark.enc.output_norm and each block's attn_kv / attn_kv_a_norm: those
+     * stay (hy-z0prof2's depth-0 profile: the drafter ops there read no other weight). */
+    dw_capable_ = false;
+    dw_lent_ = false;
+    dw_on_.store(0, std::memory_order_relaxed);
+    if (const char* e = getenv("RADIANCE_DRAFT_LEND_WEIGHTS"); e) {
+        if (!dl_capable_) {
+            RAD_INFO("RADIANCE_DRAFT_LEND_WEIGHTS=%s: the drafter's slab lend (lever DL) is not set up; the weight "
+                     "lend needs it and stays off", e);
+        } else {
+            bool all = true;
+            int64_t lent_bytes = 0, kept = 0;
+            for (auto& r : ranks_) {
+                RAD_TRY(rad_dev_set(r->device));
+                LogRank lr(r->index);
+                const int32_t first = r->mover.draft_first_layer();
+                RAD_TRY(r->mover.draft_w_setup([first](const std::string& n, int32_t layer) {
+                    const bool drafter = n.rfind("dspark.", 0) == 0 || (first >= 0 && layer >= first);
+                    if (!drafter) return false;
+                    if (n == "dspark.fc.weight" || n == "dspark.enc.output_norm.weight") return false;
+                    if (n.find(".attn_kv.") != std::string::npos || n.find(".attn_kv_a_norm.") != std::string::npos)
+                        return false;
+                    return true;
+                }));
+                all = all && r->mover.draft_w_ready();
+                lent_bytes = std::max(lent_bytes, r->mover.draft_w_bytes());
+                kept = std::max(kept, r->mover.draft_w_kept_bytes());
+            }
+            (void)rad_dev_set(ranks_[0]->device);
+            dw_capable_ = all && !ranks_.empty();
+            dw_on_.store(dw_capable_ && std::atoi(e) == 1 ? 1 : 0, std::memory_order_relaxed);
+            RAD_INFO("draft weight lend (lever Z0-W, RADIANCE_DRAFT_LEND_WEIGHTS=%s, fn4 draft_lend_w): %s; %s of the "
+                     "drafter's query-pass weights a rank lent with its slab while depth 0 holds, recalled and copied "
+                     "back before its head next runs; the context pass's %s stay",
+                     e, dw_capable_ ? (dw_on_.load() ? "on" : "set up, off") : "not set up on every rank",
+                     humanb(lent_bytes).c_str(), humanb(kept).c_str());
+        }
+    }
+    fn4::draft_w_register(dw_capable_);
+    fn4::note_sched(fn4::kDraftLendW, dw_on_.load(std::memory_order_relaxed));
 
     /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
      * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is

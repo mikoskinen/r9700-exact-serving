@@ -59,6 +59,14 @@
  *                   (outside --host-pool-mib, the plan unchanged) and its slab is carved for the trunk;
  *                   the value is the start value. Unset: nothing declared, and 1 is refused. Exact:
  *                   placement only. The counters are GET's "lend" object (state_json).
+ *   draft_lend_w    engine (lever Z0-W, Mover::draft_w_setup): 1 the drafter's static weights that only its query
+ *                   pass reads (each block's q / o / shared expert / router / norms, the Markov walk's, the confidence
+ *                   head) are lent to the trunk's experts while the slab's lend is wanted and a step runs no head,
+ *                   recalled and copied back from a pinned host copy before a step whose head runs; 0 not.
+ *                   RADIANCE_DRAFT_LEND_WEIGHTS at start declares it (needs RADIANCE_DRAFT_LEND); its value (1) starts
+ *                   it on. 1 refused unless declared and set up on every rank. Exact: placement only -- the drafter
+ *                   reads its weights' own bytes, copied back, at their own addresses. GET "lend" counts w_lends,
+ *                   w_reclaims, w_lent_units, w_mib.
  *   arena_d0        engine (lever Z0-A, Engine::arena_step): 0 off -- decode and verify steps take the largest decode
  *                   rung of RADIANCE_DS41_ARENA_DECODE_ROWS (today's choice); 1 a decode step that verifies nothing and
  *                   runs no head (depth 0) takes the smallest rung holding its own rows (with "8,48": 8 at c8 depth 0
@@ -185,7 +193,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDraftLendHyst, kArenaD0,
-              kSwitches };
+              kDraftLendW, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -220,6 +228,9 @@ void lend_register(bool capable);
 void note_lend_sched(int64_t lent_cycles, int64_t plain_steps, int64_t plain_ms, int64_t probe_steps,
                      int64_t probe_ms, int64_t transit_steps, int64_t transit_ms, int64_t backoff_k,
                      int64_t probe_interval, int64_t borrow_cycles = 0, int64_t hyst_holds = 0);
+/* The engine, at every step release (lever Z0-W): whether the weights are lent now, lends and recalls so far,
+ * trunk units in their memory, and the lendable bytes in MiB (rank 0's). */
+void note_lend_w(int64_t lent, int64_t lends, int64_t reclaims, int64_t lent_units, int64_t mib);
 /* The engine, at every step release: the lend's state over the ranks (0 resident, 1 moving, 2 lent), rank 0's
  * lends and recalls begun, trunk units in the drafter's memory, the drafter's units in VRAM and in all, and
  * the drafter's slab in MiB. */
@@ -240,6 +251,8 @@ void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t look
 void ctxskip_register(bool capable);
 /* The engine, at bring-up (lever Z0-A): whether arena_d0 can act (a decode rung below the largest declared). */
 void arena_d0_register(bool capable);
+/* The engine, at bring-up (lever Z0-W): whether draft_lend_w can act (declared and set up on every rank). */
+void draft_w_register(bool capable);
 /* The engine, after every block drafter's turn: steps whose context pass was skipped, refill passes and their
  * rows, kept rows dropped (a sequence finished or preempted, or older than the drafter's window), refills forced
  * by a full ring, rows kept now, and the ring's step slots and MiB a rank. */

@@ -2748,14 +2748,25 @@ struct DraftLendRig {
     RadStream   compute = nullptr;
     ComputeWork work;
     int         d = 0;
-    std::vector<int32_t> drafter, trunk;
+    std::vector<int32_t> drafter, trunk, statics;
     std::vector<std::vector<uint8_t>> want;   /* by unit: its bytes */
     const char* lo = nullptr;                  /* the drafter's slab, [lo, hi) */
     const char* hi = nullptr;
 
-    explicit DraftLendRig(int32_t keep_from = kL, int vram_mib = 24) {
+    /* dense: lever Z0-W's case -- the drafter's own static weights beside its experts (a block's q_b and attn_kv,
+     * the walk's and the context pass's model-level ones) and a trunk layer's, all placed statically. */
+    explicit DraftLendRig(int32_t keep_from = kL, int vram_mib = 24, bool dense = false) {
         const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
         f.op("embed", {emb}, false);
+        if (dense) {
+            f.op("trunk_dense", { f.weight("blk.0.attn_q_b.weight", 1 * MiB, RAD_ACCESS_PER_TOKEN, 0, -1) }, false);
+            f.op("draft_dense", { f.weight("blk." + std::to_string(kL) + ".attn_q_b.weight", 3 * MiB, RAD_ACCESS_PER_TOKEN, kL, -1),
+                                  f.weight("blk." + std::to_string(kL) + ".attn_kv.weight", 1 * MiB, RAD_ACCESS_PER_TOKEN, kL, -1),
+                                  f.weight("blk." + std::to_string(kL) + ".attn_output_b.weight", 2 * MiB, RAD_ACCESS_PER_TOKEN, kL, -1) },
+                 false);
+            f.op("draft_model", { f.weight("dspark.fc.weight", 1 * MiB, RAD_ACCESS_PER_TOKEN, -1, -1),
+                                  f.weight("dspark.markov_w1.weight", 2 * MiB, RAD_ACCESS_PER_TOKEN, -1, -1) }, false);
+        }
         for (int l = 0; l < kL; ++l) {
             std::vector<rad_weight> g;
             for (int e = 0; e < kE; ++e)
@@ -2796,11 +2807,19 @@ struct DraftLendRig {
         RAD_TRY(m.init(f.prog, plan, mc));
         RAD_TRY(rad_stream_create(&compute, 0));
         RAD_TRY(m.bind_compute_stream(compute));
-        /* The load: each routed unit's own pattern where it was published. */
+        /* The load: each routed unit's own pattern where it was published (and, dense, each static unit's). */
         want.assign(plan.units.size(), {});
         for (int32_t u = 0; u < (int32_t)plan.units.size(); ++u) {
             const MoveUnit& mu = plan.units[(size_t)u];
-            if (mu.expert < 0) continue;
+            if (mu.expert < 0) {
+                if (mu.tier != Tier::VRAM || mu.slab_slot >= 0) continue;
+                statics.push_back(u);
+                want[(size_t)u].resize((size_t)mu.bytes);
+                for (size_t i = 0; i < want[(size_t)u].size(); ++i)
+                    want[(size_t)u][i] = (uint8_t)(u * 77 + i * 13 + (i >> 11));
+                RAD_TRY(rad_memcpy_async(addr(u), want[(size_t)u].data(), mu.bytes, compute));
+                continue;
+            }
             (mu.layer >= kL ? drafter : trunk).push_back(u);
             want[(size_t)u].resize((size_t)mu.bytes);
             for (size_t i = 0; i < want[(size_t)u].size(); ++i)
@@ -2821,6 +2840,21 @@ struct DraftLendRig {
         return m.balance(&h);
     }
     bool in_slab(int32_t u) { const char* p = addr(u); return lo && p >= lo && p < hi; }
+    /* Lever Z0-W: every static unit's bytes as loaded. */
+    bool statics_ok() {
+        rad_stream_sync(compute);
+        rad_stream_sync(m.transfer_stream());
+        for (int32_t u : statics)
+            if (std::memcmp(addr(u), want[(size_t)u].data(), want[(size_t)u].size()) != 0) return false;
+        return true;
+    }
+    /* Whether a trunk unit's bytes sit inside a static unit's. */
+    bool trunk_in_statics() {
+        for (int32_t t : trunk)
+            for (int32_t s : statics)
+                if (addr(t) >= addr(s) && addr(t) < addr(s) + plan.units[(size_t)s].bytes) return true;
+        return false;
+    }
     /* Every routed unit's bytes as loaded, wherever it is published now. */
     bool bytes_ok() {
         rad_stream_sync(compute);
@@ -2918,6 +2952,68 @@ TEST(the_drafters_slab_is_lent_to_the_trunk_and_taken_back_by_address) {
     }
     /* Neither transition copied a drafter unit out: leaving is a change of address. */
     CHECK_EQ(r.m.stats().d2h_bytes, (uint64_t)0);
+}
+
+/* Lever Z0-W: the drafter's query-pass weights (here its block's q_b and attn_output_b, and the walk's markov_w1)
+ * are lent to the trunk and recalled with their own bytes back; the context pass's (the block's attn_kv,
+ * dspark.fc) and the trunk's static weights are never touched; a lend turned around twice ends where it began. */
+TEST(the_drafters_query_pass_weights_are_lent_and_come_back_byte_for_byte) {
+    DraftLendRig r(DraftLendRig::kL, 34, true);
+    REQUIRE(r.plan.dynamic);
+    CHECK_OK(r.build());
+    REQUIRE(r.statics.size() >= 3);
+    CHECK(r.statics_ok());
+    const int32_t first = r.m.draft_first_layer();
+    CHECK_EQ(first, (int32_t)DraftLendRig::kL);
+    std::vector<std::string> asked;
+    CHECK_OK(r.m.draft_w_setup([&](const std::string& n, int32_t layer) {
+        asked.push_back(n);
+        const bool drafter = n.rfind("dspark.", 0) == 0 || (first >= 0 && layer >= first);
+        return drafter && n != "dspark.fc.weight" && n.find(".attn_kv.") == std::string::npos;
+    }));
+    REQUIRE(r.m.draft_w_ready());
+    CHECK(std::find(asked.begin(), asked.end(), "blk.0.attn_q_b.weight") != asked.end());   /* asked, not lent */
+    CHECK(r.m.draft_w_bytes() >= 4 * MiB);     /* q_b + attn_output_b or markov_w1, each a stretch at least */
+    CHECK(r.m.draft_w_kept_bytes() >= 3 * MiB);  /* blk.0's q_b, attn_kv, dspark.fc */
+    CHECK_EQ(r.m.draft_w_setup([](const std::string&, int32_t) { return true; }), RAD_E_STATE);   /* carved once */
+    CHECK(!r.m.draft_w_lent());
+    CHECK_OK(r.m.draft_w_reclaim(&r.h));        /* nothing lent: nothing to do */
+    CHECK_EQ(r.m.draft_w_reclaims(), (uint64_t)0);
+    const int32_t planned = resident_count(r.h, r.plan);
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        CHECK_OK(r.m.draft_w_lend());
+        CHECK(r.m.draft_w_lent());
+        CHECK(r.m.loan(Mover::kLendDraftW) > 0);
+        for (Deadline dl; (r.m.draft_w_lent_units() == 0 || any_busy(r.h, r.plan)) && !dl.passed();) CHECK_OK(r.dispatch());
+        CHECK(r.m.draft_w_lent_units() > 0);
+        CHECK(r.trunk_in_statics());
+        CHECK(resident_count(r.h, r.plan) > planned);
+        CHECK(r.bytes_ok());                   /* every routed unit reads its own bytes where it is published */
+        CHECK(r.disjoint());
+        CHECK_OK(r.m.draft_w_reclaim(&r.h));
+        CHECK(!r.m.draft_w_lent());
+        CHECK_EQ(r.m.draft_w_reclaims(), (uint64_t)(cycle + 1));
+        CHECK_EQ(r.m.draft_w_lent_units(), (int64_t)0);
+        CHECK_EQ(r.m.loan_held(Mover::kLendDraftW), (int64_t)0);
+        CHECK(!r.trunk_in_statics());
+        CHECK(r.statics_ok());                 /* the lent weights' own bytes back, the kept ones never touched */
+        CHECK(r.bytes_ok());
+        CHECK(r.disjoint());
+    }
+    CHECK_EQ(r.m.draft_w_lends(), (uint64_t)2);
+}
+
+/* Without the setup the fourth lender is not there: draft_w_lend / draft_w_reclaim do nothing. */
+TEST(an_undeclared_weight_lend_is_todays_mover) {
+    DraftLendRig r(DraftLendRig::kL, 34, true);
+    CHECK_OK(r.build());
+    CHECK(!r.m.draft_w_ready());
+    CHECK_OK(r.m.draft_w_lend());
+    CHECK(!r.m.draft_w_lent());
+    CHECK_EQ(r.m.loan_ceiling(Mover::kLendDraftW), (int64_t)0);
+    for (int t = 0; t < 6; ++t) CHECK_OK(r.dispatch());
+    CHECK(!r.trunk_in_statics());
+    CHECK(r.statics_ok());
 }
 
 /* A recall that comes while the drafter is still parking (drops in quarantine, nothing lent yet), and a

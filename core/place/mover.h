@@ -509,7 +509,7 @@ public:
 
     /* kLendDraft: the drafter's own slab classes (lever DL, draft_lend_setup), lent to the trunk's
      * classes while the drafter's experts sit at their host copies. */
-    enum Lender { kLendKV = 0, kLendArena = 1, kLendDraft = 2, kLenders = 3 };
+    enum Lender { kLendKV = 0, kLendArena = 1, kLendDraft = 2, kLendDraftW = 3, kLenders = 4 };
 
     /* Registers the stretches a lender may ever lend; once per lender, after its memory is
      * carved. Each stretch is cut into slots of each class's stride from the top down, so a small
@@ -623,6 +623,31 @@ public:
     int64_t  draft_lent_units() const { return dl_lent_units_.load(std::memory_order_relaxed); }
     int64_t  draft_slab_bytes() const { return dl_slab_bytes_; }
     int64_t  draft_keep_bytes() const { return dl_keep_bytes_; }
+
+    /* Lever Z0-W (ds41-z0): the drafter's static weights that only its query pass reads, lent to the trunk's
+     * experts while the drafter does not draft. draft_w_setup() finds them in the static VRAM region
+     * (`lendable(name, layer)` per weight of every statically placed unit), merges adjacent lendable weights
+     * into stretches (a weight it must keep -- the context pass's -- ends one), keeps a pinned host copy of
+     * each stretch and registers them as a fourth lender, kLendDraftW, cut into the trunk classes' strides
+     * like any loan. draft_w_lend() raises the loan to its ceiling (balance() fills it with the hottest
+     * pooled units); draft_w_reclaim() recalls it synchronously (Mover::reclaim: every unit there back to
+     * its host copy, both streams drained) and copies every stretch back from its host copy, waiting for
+     * the copy, so the drafter reads its weights' own bytes at their own addresses again (recorded passes
+     * keep their pointers). The engine calls both between steps with every rank parked, the recall ahead
+     * of any step whose drafter head runs. Placement only: a unit lent here is read where it is published,
+     * a weight only after its bytes are back. RAD_OK with draft_w_ready() false when nothing is lendable. */
+    int      draft_w_setup(const std::function<bool(const std::string& name, int32_t layer)>& lendable);
+    bool     draft_w_ready() const { return dw_ready_; }
+    bool     draft_w_lent() const { return dw_lent_; }
+    int      draft_w_lend();
+    int      draft_w_reclaim(HeatEngine* heat);
+    int64_t  draft_w_bytes() const { return dw_bytes_; }          /* the stretches' bytes */
+    int64_t  draft_w_kept_bytes() const { return dw_kept_bytes_; } /* the drafter's static bytes it must keep */
+    uint64_t draft_w_lends() const { return dw_lends_; }
+    uint64_t draft_w_reclaims() const { return dw_reclaims_; }
+    int64_t  draft_w_lent_units() const;                           /* trunk units in a kLendDraftW slot */
+    /* The drafter's first layer (the lowest layer of its expert units, lever DL's), or -1 without one. */
+    int32_t  draft_first_layer() const;
 
     /* Where a unit's bytes are right now, as a device-visible address, or null for a file-tier
      * unit that has not been staged. */
@@ -946,6 +971,12 @@ private:
     std::vector<int32_t>  dl_units_;        /* the drafter's units */
     std::vector<int32_t>  dl_classes_;      /* the classes they make up, keep set */
     int64_t               dl_slab_bytes_ = 0, dl_keep_bytes_ = 0;
+    /* Lever Z0-W (draft_w_setup). */
+    struct DwStretch { char* dev = nullptr; int64_t bytes = 0; void* host = nullptr; };
+    std::vector<DwStretch> dw_;
+    bool                   dw_ready_ = false, dw_lent_ = false;
+    int64_t                dw_bytes_ = 0, dw_kept_bytes_ = 0;
+    uint64_t               dw_lends_ = 0, dw_reclaims_ = 0;
     std::atomic<int>      dl_state_{kDlResident};
     std::atomic<uint64_t> dl_changes_{0}, dl_lends_{0}, dl_reclaims_{0};
     std::atomic<int64_t>  dl_resident_{0}, dl_lent_units_{0};

@@ -649,6 +649,12 @@ private:
     /* Lever Z0-A (RADIANCE_DS41_ARENA_DECODE_ROWS as a list, fn4 arena_d0): the largest decode rung declared
      * (the one today's decode and verify steps take), how many were accepted, and the switch. */
     int64_t          arena_dec_max_ = 0;
+    /* Lever Z0-W (RADIANCE_DRAFT_LEND_WEIGHTS at start, fn4 draft_lend_w): set up on every rank, the switch,
+     * and whether the drafter's query-pass weights are lent now. */
+    bool             dw_capable_ = false;
+    std::atomic<int> dw_on_{0};
+    bool             dw_lent_ = false;
+    int  draft_w_step();
     int              arena_dec_rungs_ = 0;
     std::atomic<int> arena_d0_{0};
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one

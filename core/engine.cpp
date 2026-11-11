@@ -874,6 +874,11 @@ int Engine::prepare_release(const RadBatch* b) {
                 if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 ? 1 : 0;
                 fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.ready ? ctxs_.on : 0);
             }
+            /* Lever Z0-W: the engine's own, acted on at the next release (draft_w_step; fn4 refuses 1 unless set up). */
+            if (sw[fn4::kDraftLendW] != fn4::kNoChange) {
+                dw_on_.store(sw[fn4::kDraftLendW] == 1 && dw_capable_ ? 1 : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kDraftLendW, dw_on_.load(std::memory_order_relaxed));
+            }
             /* Lever Z0-A: the engine's own, read by the next arena_step (fn4 refuses 1 unless set up). */
             if (sw[fn4::kArenaD0] != fn4::kNoChange) {
                 arena_d0_.store(sw[fn4::kArenaD0] == 1 ? 1 : 0, std::memory_order_relaxed);
@@ -892,6 +897,9 @@ int Engine::prepare_release(const RadBatch* b) {
         fn4::note_lend_engine(state, (int64_t)m0.draft_lends(), (int64_t)m0.draft_reclaims(), m0.draft_lent_units(),
                               m0.draft_resident(), m0.draft_units(), m0.draft_slab_bytes() >> 20);
     }
+    /* Lever Z0-W: the drafter's query-pass weights lent while the slab's lend is wanted and this step runs no
+     * head; recalled (and copied back) before a step whose head runs. Every rank thread is parked. */
+    if (const int ws = draft_w_step(); ws < 0) return ws;
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
@@ -2138,6 +2146,35 @@ int Engine::arena_step(const RadBatch* b) {
 }
 
 int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_, rows); }
+
+/* Lever Z0-W (Mover::draft_w_lend / draft_w_reclaim), at a step's release with every rank parked: lent while
+ * fn4 draft_lend_w is 1, the scheduler wants the slab lent (depth 0 held, probes far apart) and this step's head
+ * does not run; otherwise recalled, which copies the weights back before the step is issued. A probe's first
+ * step (its head proposes) therefore pays one recall: ~0.3 GiB a rank over the link, the price DL's reload
+ * pays for the slab, at the steps D7 already leaves unsampled under the lend. */
+int Engine::draft_w_step() {
+    if (!dw_capable_) return RAD_OK;
+    const bool want = dw_on_.load(std::memory_order_relaxed) == 1 && sched_.draft_lend_wanted() &&
+                      !sched_.draft().head_runs();
+    if (want == dw_lent_) {
+        const Mover& m0 = ranks_[0]->mover;
+        fn4::note_lend_w(dw_lent_ ? 1 : 0, (int64_t)m0.draft_w_lends(), (int64_t)m0.draft_w_reclaims(),
+                         m0.draft_w_lent_units(), m0.draft_w_bytes() >> 20);
+        return RAD_OK;
+    }
+    for (auto& r : ranks_) {
+        RAD_TRY(rad_dev_set(r->device));
+        const int st = want ? r->mover.draft_w_lend() : r->mover.draft_w_reclaim(&r->heat);
+        if (st < 0) {
+            RAD_ERR("rank %d: %s the drafter's query-pass weights: %s", r->index, want ? "lending" : "recalling",
+                    rad_strerror(st));
+            return st;
+        }
+    }
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    dw_lent_ = want;
+    return RAD_OK;
+}
 
 /* The arena loan grows only after large steps stop. A prefill is chunks with decode steps between,
  * and lending after every chunk would refill and recall the slab each time. So the floor (the
