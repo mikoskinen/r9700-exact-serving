@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1163,15 +1164,57 @@ static void psk_read_env() {
     int unread = -2;
     const char* e = std::getenv("RADIANCE_DS41_PSK");
     const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
-                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0
+                          : !std::strcmp(e, "2") ? 2 : !std::strcmp(e, "3") ? 3 : -1;
     if (g_sw_psk_env.compare_exchange_strong(unread, v)) {
         if (v >= 0) g_sw_psk.store(v, std::memory_order_relaxed);
         if (e && v < 0)
-            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PSK=%s is not 0 / off or 1 / on: lever PSK is not declared\n", e);
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PSK=%s is not 0 / off, 1 / on, 2 or 3: lever PSK is not "
+                            "declared\n", e);
     }
 }
 static bool psk_declared() { return g_sw_psk_env.load(std::memory_order_relaxed) >= 0; }
 static constexpr int64_t kPskBase = 160;
+
+/* Lever PSK design 2 (anchors, ds41-psk2 11.11.2026). ds41_psk 2 (3: + an anchor at the first checkpoint position at
+ * or past 32768) hands the scheduler the choice of where the window state of layers past the last kv source must be
+ * whole: its TARGETS, per prefill sequence -- the prompt's end, its tail snapshot, every ds41_psk_k-th checkpoint
+ * position of the chunk grid, a request's own checkpoint_at (Scheduler::psk_next_target); the scheduler reserves window
+ * snapshots at targets only. Each step, before its release, the core hands this plugin (rad_psk_plan, below) for every
+ * prefill sequence of the step `ahead` = T1 - e: T1 the first target past the chunk's first position, e the chunk's end
+ * (kPskNoHint: a sequence the scheduler did not latch, which runs design 1's cone under ds41_psk >= 1). A cone reaches
+ * C_l rows back from its target at layer l, so the chunk runs at layer l its last psk_rows(C_l, ahead, n) rows: none
+ * when T1 - C_l >= e, else from max(T1 - C_l, chunk start) to the chunk's end, at least kPskBase (>= 121) rows. ahead 0
+ * (every chunk end a target) is design 1 to the row. A target's cone crossing the chunk start was run by the chunks
+ * before it (the targets are fixed per request), so its rows read whole windows. A layer no segment runs a row of is
+ * skipped whole (no op, no collective; the stager is told the pass's last layer, Engine::psk_release). The K/V store
+ * range per layer is psk_kv_cone, a parameter apart from the forward range psk_cone (today the same). */
+static constexpr int32_t kPskNoHint = INT32_MIN;
+static std::atomic<int> g_sw_psk2_ok{0}, g_psk_first{0}, g_psk_nlayer{0}, g_psk_window{0};
+static std::atomic<long long> g_psk_hsteps{0}, g_psk_skips{0}, g_psk_hbad{0};
+struct PskPlan {
+    int step = -1;               /* the trunk pass the plan is for (RadBatch::step); -1 none */
+    long long dec_tok = 0;
+    std::vector<int32_t> ahead, rows;   /* per prefill sequence, in the step's order */
+};
+static PskPlan g_psk_plan;     /* written by rad_psk_plan with every rank thread parked, read by the ranks' issue */
+static int64_t psk_cone(int64_t n_layer, int64_t window, int64_t l) { return kPskBase + (n_layer - 1 - l) * window; }
+static int64_t psk_kv_cone(int64_t n_layer, int64_t window, int64_t l) { return psk_cone(n_layer, window, l); }
+/* The rows a prefill segment of `n` rows runs at a layer of cone C, its next target `ahead` rows past its end. */
+static int64_t psk_rows(int64_t C, int32_t ahead, int64_t n) {
+    if (ahead == kPskNoHint) return n;
+    if ((int64_t)ahead >= C) return 0;
+    return std::min(n, std::max(C - (int64_t)ahead, kPskBase));
+}
+/* The plan for this trunk pass, or null. */
+static const PskPlan* psk_hint(const RadBatch* b) {
+    return b && b->draft_pass == 0 && g_psk_plan.step >= 0 && g_psk_plan.step == b->step ? &g_psk_plan : nullptr;
+}
+/* A prefill sequence's `ahead`: the plan's, else design 1's (0) under ds41_psk >= 1, else no cut. */
+static int32_t psk_ahead(const PskPlan* p, size_t i) {
+    if (p && i < p->ahead.size() && p->ahead[i] != kPskNoHint) return p->ahead[i];
+    return g_sw_psk.load(std::memory_order_relaxed) >= 1 ? 0 : kPskNoHint;
+}
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -1197,7 +1240,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_bi"))
         return value == 0 || (value >= 1 && value <= 4 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))
-        return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+        return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ||
+               ((value == 2 || value == 3) && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -3370,7 +3414,24 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     }
     m.psk_first = first;
     (void)b;
-    if (!ctx->shape_probe) g_sw_psk_ok.store(1, std::memory_order_relaxed);
+    if (!ctx->shape_probe) {
+        g_sw_psk_ok.store(1, std::memory_order_relaxed);
+        /* design 2 (ds41_psk 2 / 3): the scheduler's plan per step; a step with decode rows or two prefill sequences
+         * is cut in BI's segments (step_bi), which need BI's cu views (RADIANCE_DS41_BI declared) */
+        g_psk_first.store(first, std::memory_order_relaxed);
+        g_psk_nlayer.store((int)c.n_layer, std::memory_order_relaxed);
+        g_psk_window.store((int)c.window, std::memory_order_relaxed);
+        if (m.bi_sub) g_sw_psk2_ok.store(1, std::memory_order_relaxed);
+    }
+    if (ctx->rank == 0 && !ctx->shape_probe && g_sw_psk.load(std::memory_order_relaxed) >= 2)
+        fprintf(stderr, "radiance: deepseek41: lever PSK design 2 (anchors, ds41_psk %d): layers %d..%lld run only the "
+                        "cones of the scheduler's targets (the prompt's end, its tail snapshot, every ds41_psk_k-th "
+                        "checkpoint position%s, a request's checkpoint_at); %s\n",
+                g_sw_psk.load(std::memory_order_relaxed), first, (long long)c.n_layer - 1,
+                g_sw_psk.load(std::memory_order_relaxed) == 3 ? ", the first at or past 32768" : "",
+                m.bi_sub ? "window snapshots at targets only" : "NOT available: RADIANCE_DS41_BI is not declared -- starts at 1");
+    if (!ctx->shape_probe && !m.bi_sub && g_sw_psk.load(std::memory_order_relaxed) >= 2)
+        g_sw_psk.store(1, std::memory_order_relaxed);
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41: lever PSK declared (RADIANCE_DS41_PSK, fn4 ds41_psk, now %d): a prefill "
                         "sequence's chunk runs layers %d..%lld over its last %lld + (%lld - l) x %lld rows only (layer %d: "
@@ -3765,7 +3826,7 @@ static bool bi_segments(RadCtx* x, const Model& m, const RadBatch* b, std::vecto
 /* Lever PSK: may this step's prefill segments be cut? (the switch, a declare that has it, and no pass that wants a
  * prefill row's logits beyond its last: n_out within the decode rows + one a prefill sequence) */
 static bool psk_step_ok(const Model& m, const RadBatch* b, int64_t prefill_seqs, int64_t decode_rows) {
-    return m.psk_first > 0 && g_sw_psk.load(std::memory_order_relaxed) > 0 && b->draft_pass == 0 && !b->enc &&
+    return m.psk_first > 0 && (g_sw_psk.load(std::memory_order_relaxed) > 0 || psk_hint(b)) && b->draft_pass == 0 && !b->enc &&
            b->n_mm_rows == 0 && b->n_bidi == 0 && !b->gen && b->n_plugin_words == 0 && !b->score_only &&
            prefill_seqs > 0 && b->n_out <= decode_rows + prefill_seqs;
 }
@@ -3780,6 +3841,24 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     int64_t psk_pre = 0, psk_dec = 0;
     for (const BiSeg& s : sg) (s.dec ? psk_dec : psk_pre) += s.dec ? s.n : 1;
     const bool psk = psk_step_ok(m, batch, psk_pre, psk_dec);
+    /* design 2: the scheduler's plan for this pass, its entries matched to the prefill segments in order */
+    const PskPlan* hint = psk_hint(batch);
+    if (hint) {
+        bool ok = psk && (int64_t)hint->ahead.size() == psk_pre && (int64_t)hint->rows.size() == psk_pre;
+        size_t i = 0;
+        for (const BiSeg& s : sg)
+            if (!s.dec) { ok = ok && i < hint->rows.size() && (int64_t)hint->rows[i] == s.n; ++i; }
+        if (!ok) {
+            /* a plan this pass cannot follow (a core bug, or a pass PSK does not cut): every row runs, said once */
+            if (rad_rank(x) == 0 && g_psk_hbad.fetch_add(1, std::memory_order_relaxed) == 0)
+                fprintf(stderr, "radiance: deepseek41: lever PSK design 2: VIRHE step %d's plan (%zu prefill sequences) "
+                                "does not match the pass (%lld prefill segments%s) -- every row runs\n", batch->step,
+                        hint->ahead.size(), (long long)psk_pre, psk ? "" : ", a pass PSK does not cut");
+            hint = nullptr;
+        } else if (rad_rank(x) == 0) {
+            g_psk_hsteps.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (!psk_only) {   /* rank 0, every 512 segmented steps: the counts (MoE passes a layer summed over those steps: the launch cost of P) */
         const long long n = g_bi_steps.load(std::memory_order_relaxed);
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0)
@@ -3886,24 +3965,40 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
-        /* lever PSK: from m.psk_first on, each prefill segment longer than its cone runs its last C_l rows */
+        /* lever PSK: from m.psk_first on, each prefill segment runs its last psk_rows(C_l, ahead, n) rows -- design 1
+         * (ahead 0): its last C_l; design 2: the cone of its next target, none when that does not reach the chunk */
         bool cut = false;
         if (psk && l >= m.psk_first) {
-            const int64_t C = kPskBase + (c.n_layer - 1 - l) * c.window;
-            psk_sg = sg;
-            for (BiSeg& s : psk_sg)
-                if (!s.dec && s.n > C) {
-                    if (rad_rank(x) == 0) g_psk_rows.fetch_add(s.n - C, std::memory_order_relaxed);
-                    s.r0 += s.n - C;
-                    s.n = C;
-                    cut = true;
-                }
+            const int64_t C = psk_cone(c.n_layer, c.window, l);
+            /* the K/V store range (psk_kv_cone, today = C): the forward rows' window keys come from it */
+            const int64_t CK = psk_kv_cone(c.n_layer, c.window, l);
+            (void)CK;
+            psk_sg.clear();
+            size_t pi = 0;
+            for (const BiSeg& s0 : sg) {
+                if (s0.dec) { psk_sg.push_back(s0); continue; }
+                const int64_t n = psk_rows(C, psk_ahead(hint, pi++), s0.n);
+                if (n >= s0.n) { psk_sg.push_back(s0); continue; }
+                if (rad_rank(x) == 0) g_psk_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
+                cut = true;
+                if (n <= 0) continue;   /* design 2: no row of this segment at this layer */
+                BiSeg s = s0;
+                s.r0 += s0.n - n;
+                s.n = n;
+                psk_sg.push_back(s);
+            }
         }
         if (cut != (cur != &sg)) {
             cur = cut ? &psk_sg : &sg;
             set_runs();
         } else if (cut) {
             set_runs();
+        }
+        /* design 2: a layer no segment runs a row of is skipped whole (and so is every layer after it: the cones shrink
+         * with l) -- no op, no collective; the runs stay empty for the final norm */
+        if (cut && cur->empty()) {
+            if (rad_rank(x) == 0) g_psk_skips.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
         const std::vector<BiSeg>& sg = *cur;   /* the layer's segments, below */
         if (L.e_ids) {
@@ -4311,11 +4406,16 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             std::string seg;
             for (const BiSeg& s : sg) seg += std::string(seg.empty() ? "" : ", ") + (s.dec ? "decode " : "prefill ") +
                                              std::to_string(s.n);
+            /* design 2's counters only once a planned pass ran (design 1's line is today's text) */
+            std::string d2;
+            if (const long long h = g_psk_hsteps.load(std::memory_order_relaxed))
+                d2 = "; design 2: " + std::to_string(h) + " planned passes, " +
+                     std::to_string(g_psk_skips.load(std::memory_order_relaxed)) + " layers skipped whole";
             fprintf(stderr, "radiance: deepseek41: lever PSK: %lld cut steps, %lld layer-rows not run (this step: %lld rows "
-                            "as [%s]; layer %d runs %lld a cut prefill segment, layer %lld %lld)\n", n,
+                            "as [%s]; layer %d runs %lld a cut prefill segment, layer %lld %lld%s)\n", n,
                     g_psk_rows.load(std::memory_order_relaxed), (long long)T, seg.c_str(), m.psk_first,
                     (long long)(kPskBase + (c.n_layer - 1 - m.psk_first) * c.window), (long long)c.n_layer - 1,
-                    (long long)kPskBase);
+                    (long long)kPskBase, d2.c_str());
         }
     }
     if (m.pcn_fin) {
@@ -4358,8 +4458,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
         else dsp_context(x, m, batch);
         return;
     }
+    /* lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is always cut, so a step of more than one segment
+     * runs in BI's segments even under ds41_bi 0 (then as ds41_bi 1: segments, no pieces) */
+    const bool psk_plan = m.psk_first > 0 && psk_hint(batch) != nullptr;
     /* lever BI (ds41_bi 1): a step of more than one shape class runs in segments (step_bi) */
-    if (m.bi_sub && g_sw_bi.load(std::memory_order_relaxed) > 0) {
+    if (m.bi_sub && (g_sw_bi.load(std::memory_order_relaxed) > 0 || psk_plan)) {
         static thread_local std::vector<BiSeg> sg;
         if (bi_segments(x, m, batch, sg)) {
             step_bi(x, m, batch, sg);
@@ -4368,9 +4471,9 @@ static void step(RadCtx* x, const RadBatch* batch) {
     }
     /* lever PSK (ds41_psk 1): a step of one prefill sequence and no decode rows, longer than the last layer's cone, runs
      * through step_bi as that one segment, cut from m.psk_first on (a one-segment step_bi issues step()'s ops on the same
-     * rows below the cut) */
-    if (m.psk_first > 0 && batch->draft_pass == 0 && batch->n_seq == 1 && batch->n_tok > kPskBase &&
-        g_sw_psk.load(std::memory_order_relaxed) > 0) {
+     * rows below the cut); design 2: any planned one-sequence prefill step */
+    if (m.psk_first > 0 && batch->draft_pass == 0 && batch->n_seq == 1 &&
+        ((batch->n_tok > kPskBase && g_sw_psk.load(std::memory_order_relaxed) > 0) || psk_plan)) {
         int64_t Dn = 0, DT = 0;
         batch_split(batch, &Dn, &DT);
         if (Dn == 0 && psk_step_ok(m, batch, 1, 0)) {
@@ -4902,12 +5005,42 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return rad::arch:
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_t* kv_used_max_h) {
     (void)c;
     (void)kv_used_max_h;
+    /* Lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is shaped by its targets, which no key holds: not
+     * recorded */
+    if (deepseek41::psk_hint(b)) return 0;
     if (b && b->draft_pass == 0 && deepseek41::g_sw_bi.load(std::memory_order_relaxed) > 0) {
         int64_t Dn = 0, DT = 0;
         rad::arch::batch_split(b, &Dn, &DT);
         if (b->n_seq - Dn >= 2) return 0;
     }
     return 1;
+}
+
+/* Lever PSK design 2 (ds41-psk2): the core, at a step's release with every rank thread parked (Engine::psk_release), hands
+ * the scheduler's plan for trunk pass `step`: per prefill sequence in the step's order its `ahead` (the first target past
+ * the chunk's first position, less the chunk's end; kPskNoHint: not planned) and its chunk rows, and the step's decode
+ * rows. Returns the first layer from which no row of the step runs (the pass issues nothing from it on; the stager stages
+ * no layer from it), n_layer when every layer runs, -1 when lever PSK is not declared here (the plan is not kept). */
+extern "C" int rad_psk_plan(int step, long long dec_tok, int n, const int32_t* ahead, const int32_t* rows) {
+    using namespace deepseek41;
+    const int first = g_psk_first.load(std::memory_order_relaxed), nl = g_psk_nlayer.load(std::memory_order_relaxed);
+    const int w = g_psk_window.load(std::memory_order_relaxed);
+    if (first <= 0 || nl <= first || n < 0 || (n > 0 && (!ahead || !rows))) {
+        g_psk_plan.step = -1;
+        return -1;
+    }
+    g_psk_plan.step = step;
+    g_psk_plan.dec_tok = dec_tok;
+    g_psk_plan.ahead.assign(ahead, ahead + n);
+    g_psk_plan.rows.assign(rows, rows + n);
+    if (dec_tok > 0 || n == 0) return nl;
+    for (int l = first; l < nl; ++l) {
+        bool any = false;
+        for (int i = 0; i < n && !any; ++i)
+            any = psk_rows(psk_kv_cone(nl, w, l), psk_ahead(&g_psk_plan, (size_t)i), rows[i]) > 0;
+        if (!any) return l;
+    }
+    return nl;
 }
 
 RAD_ARCH_PROBE(deepseek41)

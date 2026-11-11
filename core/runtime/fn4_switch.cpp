@@ -25,7 +25,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
                                         "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
                                         "dspark_walk", "ds41_bi", "draft_sample", "draft_lend_hyst", "arena_d0",
-                                        "draft_lend_w", "draft_occ", "draft_occ_k", "ds41_psk" };
+                                        "draft_lend_w", "draft_occ", "draft_occ_k", "ds41_psk", "ds41_psk_k" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -39,6 +39,8 @@ struct Hooks {
     int (*sw)(const char*, int) = nullptr;
     int (*accepts)(const char*, int) = nullptr;
     int (*value)(const char*, int*) = nullptr;
+    /* lever PSK design 2 (deepseek41's rad_psk_plan), absent elsewhere */
+    int (*psk_plan)(int, long long, int, const int32_t*, const int32_t*) = nullptr;
 };
 
 struct State {
@@ -123,6 +125,7 @@ void find_hooks(State& s) {
         if (k.sw) {
             k.accepts = sym<int (*)(const char*, int)>(h, "rad_fn4_accepts");
             k.value = sym<int (*)(const char*, int*)>(h, "rad_fn4_value");
+            k.psk_plan = sym<int (*)(int, long long, int, const int32_t*, const int32_t*)>(h, "rad_psk_plan");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -165,7 +168,7 @@ bool sched_switch(int i) {
     return i == kDraftAdaptive || i == kDraftDepth0 || i == kDraftProbe || i == kDraftHybrid ||
            i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow ||
            i == kDraftCtxSkip || i == kDraftLendHyst || i == kArenaD0 || i == kDraftLendW ||
-           i == kDraftOcc || i == kDraftOccK;
+           i == kDraftOcc || i == kDraftOccK || i == kDs41PskK;
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -294,6 +297,15 @@ int get(int i) {
     return st().val[i].load(std::memory_order_acquire);
 }
 
+int psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    for (const Hooks& k : s.hooks)
+        if (k.psk_plan) return k.psk_plan(step, (long long)dec_tok, n, ahead, rows);
+    return -1;
+}
+
 bool check(const std::string& name, int v, std::string* err) {
     if (name == "epoch_bump") return true;
     const int i = switch_index(name);
@@ -303,7 +315,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
-                        "draft_lend_w, draft_occ, draft_occ_k, ds41_psk, epoch_bump)";
+                        "draft_lend_w, draft_occ, draft_occ_k, ds41_psk, ds41_psk_k, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -355,6 +367,13 @@ bool check(const std::string& name, int v, std::string* err) {
                 *err = std::string("draft_occ=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no scheduler has registered a drafter"
                                 : "this deployment's drafter cannot run the adaptive window");
+            return false;
+        }
+        return true;
+    }
+    if (i == kDs41PskK) {   /* lever PSK design 2: the scheduler's anchor stride */
+        if (v < 1 || v > 4096) {
+            if (err) *err = "ds41_psk_k takes 1 .. 4096 (every K-th periodic checkpoint position is an anchor under ds41_psk 2 / 3)";
             return false;
         }
         return true;

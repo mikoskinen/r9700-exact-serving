@@ -19,6 +19,7 @@
 #include "ngram.h"
 
 #include <chrono>
+#include <climits>
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
 #include <functional>
 #endif
@@ -132,6 +133,11 @@ struct SchedReq {
      * client's tokens into a re-admitted slot. */
     bool     reap_pending = false;
     int64_t  pending_ckpt = -1;  /* absolute position this step's chunk checkpoints at */
+    /* Lever PSK design 2 (fn4 ds41_psk 2 / 3, ds41-psk2): latched when the request is admitted (Scheduler::psk_latch) and
+     * fixed while it is prefilled, so every chunk of its prompt computes the same targets -- the anchor stride K over the
+     * periodic checkpoint positions (0: not planned, every chunk runs as before) and the first one at or past 32768. */
+    int32_t  psk_k = 0;
+    bool     psk_32k = false;
 
     /* The checkpoint the linear state is seeded from on admission, handed to the sequence's first
      * entry as StepEntry::ckpt_restore. Never held across a step: nothing pins a checkpoint slot,
@@ -341,6 +347,25 @@ public:
      * the rows N (1 .. 64); the cycles K (1 .. 4096, default 32). Return the values the scheduler now runs. */
     int      set_draft_occ(int v);
     int      set_draft_occ_k(int v);
+    /* Lever PSK design 2 (ds41-psk2): `mode` the deepseek41 plugin's applied fn4 ds41_psk (2 / 3 = anchors; anything
+     * else plans nothing), read by the engine at its first release and after every fn4 change; fn4 ds41_psk_k (the
+     * scheduler's: 1 .. 4096, default kPskK) the anchor stride over the periodic checkpoint positions. A request takes
+     * both when admitted (psk_latch). Return the value now run. */
+    int      set_psk_mode(int mode);
+    int      set_psk_k(int k);
+    int      psk_k() const { return psk_k_; }
+    static constexpr int kPskK = 8;
+    /* The plan for trunk pass `step` (RadBatch::step) when the step that built it carries a planned prefill: per prefill
+     * entry in the batch's order `ahead` = its next target less its chunk's end (kPskNoPlan for an entry not planned)
+     * and its chunk rows, and the step's decode rows. False (nothing written) for any other pass. */
+    static constexpr int32_t kPskNoPlan = INT32_MIN;
+    bool     psk_plan(int step, std::vector<int32_t>* ahead, std::vector<int32_t>* rows, int64_t* dec_tok) const;
+    /* The targets of a planned request (tests and the plan): the first past `from` (always <= the prefill end `n`), and
+     * whether `pos` is one (a window snapshot is reserved only there). */
+    int64_t  psk_next_target(const SchedReq& s, int64_t from, int64_t n) const;
+    bool     psk_is_target(const SchedReq& s, int64_t pos, int64_t n) const;
+    /* Snapshots a planned request's chunk ends did not take (not a target) since start. */
+    int64_t  psk_ckpt_dropped() const { return psk_dropped_; }
     /* Lever DL: the engine's view of the drafter's lend (Engine::serve, once the movers set it up):
      * `view` returns DraftController::LendSample's state over every rank (resident, transit, lent)
      * and writes the transitions so far; `capable` whether any slab can be lent. Without it the
@@ -925,6 +950,21 @@ private:
     std::vector<int32_t> block_mask_;
     int      step_ = 0;
     uint64_t arrival_ = 0;
+    /* Lever PSK design 2 (set_psk_mode / set_psk_k, psk_plan). */
+    int      psk_mode_ = -1;
+    int      psk_k_ = kPskK;
+    int64_t  psk_dropped_ = 0;
+    int      psk_step_ = -1;
+    int64_t  psk_dec_ = 0;
+    std::vector<int32_t> psk_ahead_, psk_rows_;
+    /* The request's latch at its admission (SchedReq::psk_k / psk_32k), and the checkpoint `ckpt` a chunk of a planned
+     * request takes: dropped (-1) where it is not a target. */
+    void     psk_latch(SchedReq& s) const;
+    void     psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt);
+    /* The periodic checkpoint positions q_1 < q_2 < ... (the exact grid's points from its origin, else the interval's
+     * multiples): q_i, and the smallest i with q_i >= pos. */
+    int64_t  psk_q(int64_t i) const;
+    int64_t  psk_i_at(int64_t pos) const;
 
     SchedMetrics m_{};
     std::chrono::steady_clock::time_point step_start_{};

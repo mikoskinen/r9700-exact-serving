@@ -847,7 +847,11 @@ int Engine::prepare_release(const RadBatch* b) {
      * atomic load, no lock. */
     {
         int sw[fn4::kSwitches];
-        if (fn4::apply_pending(b ? b->step : -1, sw)) {
+        const bool fn4_changed = fn4::apply_pending(b ? b->step : -1, sw);
+        if (fn4_changed) {
+            /* Lever PSK design 2: the scheduler's anchor stride */
+            if (sw[fn4::kDs41PskK] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDs41PskK, sched_.set_psk_k(sw[fn4::kDs41PskK]));
             if (sw[fn4::kDraftAdaptive] != fn4::kNoChange)
                 fn4::note_draft_adaptive(sched_.set_draft_adaptive(sw[fn4::kDraftAdaptive]));
             if (sw[fn4::kDraftDepth0] != fn4::kNoChange)
@@ -889,7 +893,14 @@ int Engine::prepare_release(const RadBatch* b) {
                 fn4::note_sched(fn4::kArenaD0, arena_d0_.load(std::memory_order_relaxed));
             }
         }
+        /* Lever PSK design 2: the plugin's ds41_psk as the scheduler plans by it (2 / 3 anchors), read once and after
+         * every change (a request takes it at admission) */
+        if (fn4_changed || !psk_mode_read_) {
+            psk_mode_read_ = true;
+            sched_.set_psk_mode(fn4::value(fn4::kDs41Psk));
+        }
     }
+    psk_release(b);
     /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
      * own balance(), behind the step's trunk pass); and the report. Nothing when undeclared. */
     if (dl_capable_) {
@@ -923,6 +934,23 @@ int Engine::prepare_release(const RadBatch* b) {
     kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
     return RAD_OK;
+}
+
+void Engine::psk_release(const RadBatch* b) {
+    int32_t end = INT32_MAX;
+    int64_t dec = 0;
+    if (b && b->draft_pass == 0 && sched_.psk_plan(b->step, &psk_ahead_, &psk_rows_, &dec)) {
+        const int l = fn4::psk_plan(b->step, dec, (int)psk_ahead_.size(), psk_ahead_.data(), psk_rows_.data());
+        if (l >= 0) end = l;
+        ++psk_planned_;
+        if (l >= 0 && l < (int)meta_.n_layers) ++psk_cut_passes_;
+        if (psk_planned_ == 1 || psk_planned_ % 256 == 0)
+            RAD_INFO("lever PSK design 2: %lld planned passes, %lld of them ended before the last layer; step %d: %zu "
+                     "prefill sequence(s) (the first's next target %d rows past its chunk), %lld decode rows -> the pass "
+                     "ends at layer %d", (long long)psk_planned_, (long long)psk_cut_passes_, b->step, psk_ahead_.size(),
+                     psk_ahead_.empty() ? 0 : psk_ahead_[0], (long long)dec, l);
+    }
+    for (auto& r : ranks_) r->stager.set_layer_end(end);
 }
 
 /* Lever DL: the drafter's lend over every rank, as DraftController::LendSample counts it -- resident

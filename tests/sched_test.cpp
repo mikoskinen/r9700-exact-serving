@@ -1154,6 +1154,168 @@ TEST(an_exact_cold_prefill_keeps_its_last_chunk_whole) {
     CHECK((ckpts == std::vector<int64_t>{ 256, 512, 768 }));
 }
 
+/* ================================================================== lever PSK design 2: anchors */
+/* ds41_psk 2 (the plugin's switch, read into the scheduler by the engine) with ds41_psk_k K: a request admitted then is
+ * planned -- its targets are the prompt's end, its tail snapshot and every K-th periodic checkpoint position (the exact
+ * grid's points from its origin: 256, 768, 1280, ... here) -- and the step hands the plugin, per prefill entry, its next
+ * target less its chunk's end. Window / linear-state snapshots are reserved at targets only; chunking is unchanged. */
+struct PskRun { std::vector<int64_t> ends, ckpts, ahead; std::vector<int> planned; };
+static PskRun psk_run(Fixture& f, uint64_t id, int max_steps = 64) {
+    PskRun r;
+    for (int i = 0; i < max_steps && f.sch.find(id) && f.sch.find(id)->n_computed < (int32_t)f.sch.find(id)->prompt.size();
+         ++i) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        r.ends.push_back(b->ctx_lens[0] + b->n_tok);
+        for (int k = 0; k < b->n_checkpoints; ++k) r.ckpts.push_back(b->ctx_lens[0] + b->checkpoint_tok[k] + 1);
+        std::vector<int32_t> ahead, rows;
+        int64_t dec = -1;
+        const bool p = f.sch.psk_plan(b->step, &ahead, &rows, &dec);
+        r.planned.push_back(p ? 1 : 0);
+        if (p) {
+            CHECK_EQ((int)ahead.size(), 1);
+            CHECK_EQ((int)rows.size(), 1);
+            CHECK_EQ((int64_t)rows[0], b->n_tok);
+            CHECK_EQ(dec, (int64_t)0);
+            r.ahead.push_back(ahead.empty() ? -999999 : ahead[0]);
+        }
+        f.commit_plain();
+    }
+    return r;
+}
+
+TEST(psk_anchors_plan_each_chunk_and_snapshot_at_targets_only) {
+    /* today (no mode, and modes 0 / 1): every grid chunk end snapshots, nothing is planned */
+    for (int mode : { -1, 0, 1 }) {
+        Fixture f;
+        exact_fixture(f, 2);                  /* interval 256, span 2: chunks [0,256), then 512 each */
+        REQUIRE_EQ(f.start(), RAD_OK);
+        if (mode >= 0) f.sch.set_psk_mode(mode);
+        const PskRun r = psk_run(f, f.submit(3000, 1));
+        CHECK((r.ends == std::vector<int64_t>{ 256, 768, 1280, 1792, 2304, 2816, 3000 }));
+        CHECK((r.ckpts == std::vector<int64_t>{ 256, 768, 1280, 1792, 2304, 2816 }));
+        CHECK((r.planned == std::vector<int>(7, 0)));
+        CHECK_EQ(f.sch.psk_ckpt_dropped(), (int64_t)0);
+    }
+    /* ds41_psk 2, K 2: anchors q_2 = 768, q_4 = 1792, q_6 = 2816 (also the tail), and the end 3000 */
+    Fixture f;
+    exact_fixture(f, 2);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK_EQ(f.sch.psk_k(), Scheduler::kPskK);
+    CHECK_EQ(f.sch.set_psk_k(0), Scheduler::kPskK);      /* refused: kept */
+    CHECK_EQ(f.sch.set_psk_k(2), 2);
+    f.sch.set_psk_mode(2);
+    const PskRun r = psk_run(f, f.submit(3000, 1));
+    CHECK((r.ends == std::vector<int64_t>{ 256, 768, 1280, 1792, 2304, 2816, 3000 }));   /* chunks unchanged */
+    CHECK((r.ckpts == std::vector<int64_t>{ 768, 1792, 2816 }));
+    CHECK((r.planned == std::vector<int>(7, 1)));
+    /* next target less the chunk end: [0,256) -> 768, [256,768) -> 768, [768,1280) -> 1792, ... [2816,3000) -> 3000 */
+    CHECK((r.ahead == std::vector<int64_t>{ 512, 0, 512, 0, 512, 0, 0 }));
+    CHECK_EQ(f.sch.psk_ckpt_dropped(), (int64_t)3);
+    CHECK((f.pc.committed == std::vector<int64_t>{ 768, 1792, 2816 }));
+}
+
+/* The plan is the request's, latched at admission: a mode change while it prefills changes nothing of its chunks (their
+ * targets must agree, or a cone crossing a chunk start would read a window no chunk computed), and the next request takes
+ * the new mode. K = 1: every grid point is an anchor, so every snapshot is kept. */
+TEST(psk_anchors_are_latched_per_request) {
+    Fixture f;
+    exact_fixture(f, 2);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.sch.set_psk_k(4);
+    f.sch.set_psk_mode(2);
+    const uint64_t a = f.submit(3000, 1);
+    const RadBatch* b0 = f.sch.step();                  /* admitted: [0, 256) planned */
+    REQUIRE(b0 != nullptr);
+    std::vector<int32_t> ahead, rows;
+    int64_t dec = 0;
+    CHECK(f.sch.psk_plan(b0->step, &ahead, &rows, &dec));
+    CHECK(!f.sch.psk_plan(b0->step + 1, &ahead, &rows, &dec));
+    CHECK_EQ(ahead[0], 1792 - 256);                     /* q_4 = 1792 */
+    CHECK_EQ(b0->n_checkpoints, 0);                     /* 256 = q_1: not a target */
+    f.commit_plain();
+    f.sch.set_psk_mode(0);
+    f.sch.set_psk_k(1);
+    const PskRun r = psk_run(f, a);
+    CHECK((r.planned == std::vector<int>(6, 1)));
+    CHECK((r.ckpts == std::vector<int64_t>{ 1792, 2816 }));   /* q_4, and the tail q_6 */
+    CHECK((r.ahead == std::vector<int64_t>{ 1024, 512, 0, 512, 0, 0 }));
+    /* the next request: not planned (mode 0), every grid snapshot */
+    const PskRun r2 = psk_run(f, f.submit(1000, 1));
+    CHECK((r2.planned == std::vector<int>(3, 0)));
+    /* mode 2 again with K = 1: every grid point is an anchor */
+    f.sch.set_psk_mode(2);
+    const int64_t dropped = f.sch.psk_ckpt_dropped();
+    const PskRun r3 = psk_run(f, f.submit(1500, 1));
+    CHECK((r3.planned == std::vector<int>(4, 1)));
+    CHECK((r3.ckpts == std::vector<int64_t>{ 256, 768, 1280 }));
+    CHECK_EQ(f.sch.psk_ckpt_dropped(), dropped);
+}
+
+/* The targets themselves: the next one past a position, at most the prefill's end; a request's checkpoint_at; ds41_psk
+ * 3's first grid point at or past 32768 (256 + 64 x 512 = 33024 on this grid). */
+TEST(psk_targets_are_the_end_the_tail_every_kth_grid_point_and_checkpoint_at) {
+    Fixture f;
+    exact_fixture(f, 2);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    SchedReq s;
+    s.req = f.request(50000, 1);
+    s.psk_k = 8;                                        /* q_8 = 3840, q_16 = 7936, ... q_64 = 32512, q_72 = 36608 */
+    CHECK_EQ(f.sch.psk_next_target(s, 0, 50000), 3840);
+    CHECK_EQ(f.sch.psk_next_target(s, 3840, 50000), 7936);
+    CHECK_EQ(f.sch.psk_next_target(s, 3839, 50000), 3840);
+    CHECK_EQ(f.sch.psk_next_target(s, 32512, 50000), 36608);
+    CHECK_EQ(f.sch.psk_next_target(s, 0, 3000), 2816);  /* the tail snapshot of a 3000-token prompt (q_6) */
+    CHECK_EQ(f.sch.psk_next_target(s, 2816, 3000), 3000);
+    CHECK(f.sch.psk_is_target(s, 3840, 50000));
+    CHECK(!f.sch.psk_is_target(s, 3328, 50000));        /* q_7 */
+    CHECK(f.sch.psk_is_target(s, 50000, 50000));
+    CHECK(!f.sch.psk_is_target(s, 33024, 50000));
+    s.psk_32k = true;                                   /* ds41_psk 3 */
+    CHECK_EQ(f.sch.psk_next_target(s, 32512, 50000), 33024);
+    CHECK(f.sch.psk_is_target(s, 33024, 50000));
+    s.req->checkpoint_at = 5000;                        /* on the quantum (64): 4992 */
+    CHECK_EQ(f.sch.psk_next_target(s, 3840, 50000), 4992);
+    CHECK(f.sch.psk_is_target(s, 4992, 50000));
+    s.psk_k = 0;                                        /* not planned: the end only */
+    CHECK_EQ(f.sch.psk_next_target(s, 0, 50000), 50000);
+    CHECK(!f.sch.psk_is_target(s, 3840, 50000));
+}
+
+/* A prefix hit under anchors: the cache resumes a hit at its deepest snapshot at or below it (PrefixCache::deepest_ckpt),
+ * and a planned request reserved none but at its targets, so a hit at a non-anchor position (here 2304, the 1280 grid
+ * snapshot not taken) falls back to the anchor below it (768), never to a window a skipped chunk left stale. The resumed
+ * request's chunks are the cold run's (the exact grid) and it plans from there. */
+TEST(psk_a_hit_between_anchors_resumes_at_the_anchor_below) {
+    Fixture f;
+    exact_fixture(f, 2);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    f.sch.set_psk_k(2);
+    f.sch.set_psk_mode(2);
+    const PskRun cold = psk_run(f, f.submit(3000, 1));
+    CHECK((f.pc.committed == std::vector<int64_t>{ 768, 1792, 2816 }));
+    /* the cache as the real one answers a 2304-token match: attention to 2304, the deepest snapshot below it 1792 */
+    f.pc.seed(2304);
+    f.pc.lin = 1792;
+    f.pc.src = 5;
+    const uint64_t b = f.submit(3500, 1);
+    const RadBatch* bb = f.sch.step();
+    REQUIRE(bb != nullptr);
+    CHECK_EQ(f.sch.find(b)->n_computed, 1792);
+    CHECK_EQ(bb->ctx_lens[0], 1792);
+    CHECK_EQ(bb->n_tok, 512);                           /* [1792, 2304): the cold run's chunk */
+    CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 5);
+    std::vector<int32_t> ahead, rows;
+    int64_t dec = 0;
+    CHECK(f.sch.psk_plan(bb->step, &ahead, &rows, &dec));
+    CHECK_EQ(ahead[0], 2816 - 2304);                    /* q_6 = 2816 (and the 3500 prompt's tail is q_7 = 3328) */
+    f.commit_plain();
+    const PskRun rest = psk_run(f, b);
+    CHECK((rest.ends == std::vector<int64_t>{ 2816, 3328, 3500 }));
+    CHECK((rest.ahead == std::vector<int64_t>{ 0, 0, 0 }));      /* 2816 a K-th point, 3328 the tail, 3500 the end */
+    (void)cold;
+}
+
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     Fixture f;
     f.build();

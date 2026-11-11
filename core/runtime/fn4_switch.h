@@ -159,6 +159,16 @@
  *                   RADIANCE_DS41_PSK=0 | 1 declares it (and starts at that value); unset: 1 refused, today's issue.
  *                   Changes no row the step's end reads (the cut rows' streams feed nothing later); a computed row
  *                   sees a launch of >= 160 rows, above every row-count form switch -- bytes to be measured.
+ *                   Design 2 (ds41-psk2): 2 = anchors -- the scheduler names, per prefill sequence, the positions its
+ *                   window state must be whole at (the prompt's end, its tail snapshot, every ds41_psk_k-th periodic
+ *                   checkpoint position, checkpoint_at), reserves window snapshots there only, and hands each step's plan
+ *                   to the plugin (rad_psk_plan); a chunk runs layers 21..39 only over those targets' cones (none: the
+ *                   layers are skipped whole, and their experts not staged); 3 = 2 + an anchor at the first checkpoint
+ *                   position at or past 32768. Needs RADIANCE_DS41_BI declared (2 / 3 refused otherwise). A request takes
+ *                   the mode and K at admission and keeps them while it prefills.
+ *   ds41_psk_k      scheduler (lever PSK design 2): the anchor stride K, 1 .. 4096 (default 8): the K-th, 2K-th, ...
+ *                   periodic checkpoint position (the exact grid's points from its origin, else the interval's
+ *                   multiples) is a target under ds41_psk 2 / 3. Read at a request's admission.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -232,7 +242,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLend, kDraftLendBorrow, kDrafterMx, kDrafterBf,
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
-              kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kDs41Psk, kSwitches };
+              kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kDs41Psk, kDs41PskK, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -290,6 +300,10 @@ void note_sample(int64_t rows_sampled, int64_t rows_greedy, int64_t rounds_bound
 bool dspark_conf_value_ok(int v);
 /* The applied value of a core switch without the lock (the step path reads it each step); -1 unregistered. */
 int  get(int i);
+/* Lever PSK design 2: hand the scheduler's plan for trunk pass `step` to the plugin that cuts by it (rad_psk_plan, every
+ * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
+ * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */
+int  psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows);
 /* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
  * "accept"; under draft_depth0 2 every head draft is a probe's). */
 void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted);

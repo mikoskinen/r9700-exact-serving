@@ -5016,7 +5016,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(gg.body, "no loaded plugin serves it"));
     for (const char* b : { R"({"ds41_argather":4})", R"({"ds41_shexp_lane":1})", R"({"ds41_kvfold":1})",
                            R"({"ds41_ofold":1})", R"({"ds41_onefill":1})", R"({"dspark_walk":1})",
-                           R"({"ds41_bi":1})", R"({"ds41_psk":1})" }) {
+                           R"({"ds41_bi":1})", R"({"ds41_psk":1})", R"({"ds41_psk":2})" }) {
         const HttpResponse r = f.post("/admin/fn4", b);
         CHECK_EQ(r.status, 400);
         CHECK(has(r.body, "no loaded plugin serves it"));
@@ -5324,6 +5324,25 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     fn4::note_sched(fn4::kDraftOcc, 0);
     fn4::note_sched(fn4::kDraftOccK, 32);
     fn4::note_draft_counts(0, 0, 0, 0, 0, 0);
+    /* Lever PSK design 2, ds41_psk_k (the scheduler's anchor stride, 1 .. 4096): after ds41_psk in the registry; no
+     * plugin takes a plan here */
+    CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":0})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":4097})").status, 400);
+    fn4::note_sched(fn4::kDs41PskK, 8);
+    CHECK(has(f.get("/admin/fn4").body, "\"ds41_psk\": -1, \"ds41_psk_k\": 8"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":4})").status, 200);
+    CHECK(fn4::apply_pending(41, sw));
+    CHECK_EQ(sw[fn4::kDs41PskK], 4);
+    CHECK_EQ(sw[fn4::kDraftOccK], fn4::kNoChange);
+    fn4::note_sched(fn4::kDs41PskK, 4);
+    CHECK(has(f.get("/admin/fn4").body, "\"ds41_psk_k\": 4"));
+    CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":8})").status, 200);
+    CHECK(fn4::apply_pending(42, sw));
+    fn4::note_sched(fn4::kDs41PskK, 8);
+    {
+        const int32_t ah[1] = { 0 }, rw[1] = { 4096 };
+        CHECK_EQ(fn4::psk_plan(7, 0, 1, ah, rw), -1);
+    }
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
     CHECK_EQ(sw[fn4::kDraftLend], -1);

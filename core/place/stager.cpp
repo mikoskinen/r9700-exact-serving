@@ -134,6 +134,12 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
     next_ = 0;
     first_li_ = -1;
     for (int32_t& g : gate_li_) g = -1;
+    /* lever PSK design 2: the routed layers before the pass's layer end (all of them unless set) */
+    lim_ = (int32_t)layers_.size();
+    if (layer_end_ != INT32_MAX) {
+        lim_ = 0;
+        while ((size_t)lim_ < layers_.size() && layers_[(size_t)lim_].layer < layer_end_) ++lim_;
+    }
     return true;
 }
 
@@ -255,7 +261,7 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
  * is skipped; one without room yet, or whose pace layer the run has not reached, stops the walk
  * until a later op. */
 int PrefillStager::stage_ahead(int32_t cur, bool* resync) {
-    while ((size_t)next_ < layers_.size()) {
+    while (next_ < lim_) {
         const int32_t g = next_ - kLead;
         RadEvent gate = nullptr;
         if (g >= first_li_) {
@@ -353,7 +359,7 @@ int PrefillStager::end_pass(RadStream s) {
         retire(p);
     }
     if (rc < 0 || !next_prefill_) return rc;
-    const int32_t n = (int32_t)layers_.size();
+    const int32_t n = lim_;   /* the pass's last routed layers pace the next pass's first (lever PSK: its layer end) */
     for (int32_t k = 0; k < kLead && k < n; ++k) {
         const int32_t g = n - kLead + k;
         if (g < first_li_ || gate_li_[g % kGates] != g) break;
