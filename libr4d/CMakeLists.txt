@@ -238,6 +238,8 @@ set(R4D_UNITS
   # GEMM's prefetching decode form (drafter_bf); both off unless switched on, both the stock kernels' bits.
   "r4d_ds41_mxfp4_mr|"
   "r4d_gemm_bf16_nt_pf|"
+  # Lever W1: the DSpark Markov walk over the whole vocabulary, a step on a vocabulary shard (dspark_walk_step).
+  "r4d_ds41_walk|"
 )
 
 set(R4D_SRC "")

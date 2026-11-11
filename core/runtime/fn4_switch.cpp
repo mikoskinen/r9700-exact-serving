@@ -23,12 +23,13 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_probe_backoff", "draft_lend", "draft_lend_borrow",
                                         "drafter_mx", "drafter_bf",
                                         "idx_split", "ds41_qnfold", "ds41_swfold", "draft_ctxskip",
-                                        "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf" };
+                                        "dspark_conf", "dspark_alt", "dspark_conf_rows", "gg_pf", "f32_pf",
+                                        "dspark_walk" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
            i == kDs41OneFill || i == kDrafterMx || i == kDrafterBf ||
-           i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf;
+           i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -271,7 +272,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, "
                         "draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, "
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
-                        "dspark_conf_rows, gg_pf, f32_pf, epoch_bump)";
+                        "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, epoch_bump)";
         return false;
     }
     State& s = st();

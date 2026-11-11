@@ -20,6 +20,7 @@
 
 #include "r4d_chain.h"
 #include "r4d_args.h"
+#include "r4d_ar_gather_admit.h"
 #include "r4d.h"
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
@@ -748,40 +749,13 @@ static int ar_gather_wide_setup(const RadArgs* a, int ws, const ArInst** out_in,
 
     const RadTensor* x = r4d_opt(a, AR_X);
     const RadTensor* y = r4d_opt(a, AR_Y);
-    if (!x || !y) return RAD_E_INVAL;             /* the gather has no in-place form */
-    if (y->data == x->data) return RAD_E_INVAL;
-
-    const long n = (long)r4d_numel(x);
-    if (n <= 0 || n > in->max_numel) return RAD_E_SHAPE;
-    /* y is [world_size * numel], rank r's contribution at offset r * numel (docs/OPS.md). */
-    if ((long long)r4d_numel(y) != (long long)n * in->world) return RAD_E_SHAPE;
-
+    /* The operand rules (r4d_ar_gather_admit.h: host-callable, so a test holds an architecture's issued
+     * gather to them without a card). */
     const long long row = r4d_pgeti_or(a->p, a->n_p, "row", 0);
-    if (row < 0 || (row > 0 && (n % row || (row * in->esize) % 16))) return RAD_E_SHAPE;
-    /* A row-interleaved gather's [rows][world * row] may sit in the leading columns of a wider
-     * buffer, the pitch in whole 16-byte words: rows land at that pitch, the rest of each row is
-     * left alone. */
-    long long dpitch = 0;
-    if (!r4d_contig(y)) {
-        const long long p = r4d_row_pitch(y);
-        if (row <= 0 || y->rank != 2 || p <= 0 || y->shape[1] != (int64_t)row * in->world ||
-            (p * in->esize) % 16)
-            return RAD_E_STRIDE;
-        dpitch = p;
-    }
-    /* Likewise x may be [rows][row] read at a wider pitch: a rank's window of a row it computed
-     * wider (a split linear's block-aligned superset, arch/common/rad_block_dflash2.h). */
-    long long spitch = 0;
-    if (!r4d_contig(x)) {
-        const long long p = r4d_row_pitch(x);
-        if (row <= 0 || x->rank != 2 || p <= 0 || x->shape[1] != (int64_t)row ||
-            (p * in->esize) % 16)
-            return RAD_E_STRIDE;
-        spitch = p;
-    }
-
-    if (((long long)n * in->esize) % 16) return RAD_E_ALIGN;
-    if (!r4d_aligned(x->data, 16) || !r4d_aligned(y->data, 16)) return RAD_E_ALIGN;
+    long long dpitch = 0, spitch = 0;
+    const int adm = r4d_ar_gather_admit(x, y, in->world, in->max_numel, in->esize, row, &dpitch, &spitch);
+    if (adm != RAD_OK) return adm;
+    const long n = (long)r4d_numel(x);
 
     R4dArCfg cfgv;
     r4d_cfg_ar(a, &cfgv);

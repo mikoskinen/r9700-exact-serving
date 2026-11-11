@@ -3586,6 +3586,7 @@ candidates, and what enters the head from the trunk.
 |---|---|---|
 | `dflash_markov_greedy` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | BF16 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
 | `dflash_markov_greedy_f32` | `M` `steps` `rank` `n_vocab` `anchor_stride`/opt `dtype` | F32 `logits`, `anchor`, `pred`w, `succ`w → `tile_scores`, `tile_tokens`, `tokens` |
+| `dspark_walk_step` | `M` `step` `steps` `rank` `n_vocab` `N` `vocab_off` `world` `anchor_stride`/opt `dtype` `form`/opt | F32 `logits`, `anchor`, `prev`?, `pred`w, `succ`w, `keys`:inout? → `tokens` |
 
 `dflash_markov_greedy` implements the DSpark full-vocabulary greedy walk, not DFlash2's
 candidate-lattice selector. For every position it adds `sum_r pred[previous,r] * succ[token,r]`
@@ -3598,6 +3599,20 @@ pinned llama.cpp reference also uses F32 base logits, but reduction orders may d
 argmax chooses the last equal maximum; its GPU reduction uses a backend-specific order. This op's
 lower-id tie rule is not a claim of reference tie equivalence. Near-tie proposal equivalence is
 therefore not established.
+
+`dspark_walk_step` is the same walk on a vocabulary-sharded head (tensor parallelism; lever W1 of
+DeepSeek-V4.1): one step on one rank's shard `[vocab_off, vocab_off + N)` of the `n_vocab` ids, issued
+`steps` times with an `all_gather` of `keys` between steps and once more at `step = steps`. Step `l`'s
+predecessor is the greatest of step `l-1`'s gathered keys `prev` (an F32 `[M, 4 * world]` plane of 16-byte
+slots, each a u64 key and 8 bytes of padding: libr4d's all-gather moves whole 16-byte words a row; the
+anchor at `l = 0`), written to `tokens[s][l-1]`. Each column's score
+`logits[s * steps + l][j] + sum_r pred[prev, r] * succ[vocab_off + j, r]` is summed by `fma` in rank
+order, keyed as `(ordered score bits) << 32 | ~id` (ties to the lower id; a NaN score is never chosen,
+-0 counts as +0) and the shard's greatest key is max-ed into `keys[s]` (the u64 of a 16-byte slot, an F32 `[M, 4]`
+plane, zeroed before the step). The key is order-free, so every rank derives the same token from the same
+gathered bytes. `form` (default 0) only picks how a block reads `succ` (1: the block's rows staged through
+LDS as whole lines); every id's chain is the same, so the bits are. libr4d only; no libref oracle
+(tests/r4d_emu/test_ds41walk holds it to a host walk).
 
 Beside the walk, two ops a deployment may run (arch/deepseek41: the confidence head from a sidecar,
 `RADIANCE_DS41_DSPARK_CONF`, and the shadow tree's branches, `RADIANCE_DS41_DSPARK_ALT`); neither

@@ -41,6 +41,9 @@
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
 #include "r4d_iqr.h"
+extern "C" {
+#include "r4d_ds41_walk.h"   /* R4D_DS41_WALK_SLOT: lever W1's key slot */
+}
 #include "../arch/common/exl3/exl3_abi.h"   /* --perfdsmoe: the EXL3 ops' operand positions */
 #include "rad_encoding.h"
 #include "rad_philox.h"
@@ -4489,6 +4492,185 @@ static void rowtopk_shard_case(const Plugin& pl) {
                     std::to_string(wv[i]) + ")";
         }
     ok("rowtopk_merge matches an unsharded top-R", bad == 0, bad ? first : "");
+}
+
+/* ------------------------------------------- lever W1: the full-vocabulary DSpark walk, sharded
+ *
+ * dspark_walk_step (r4d_ds41_walk.hip) on the card against a host walk, token for token: W ranks'
+ * vocabulary shards (deepseek41's split), each step's keys zeroed, one launch a rank, the keys gathered
+ * as all_gather moves them ([s][w]), then the last merge; every rank's tokens must be the host walk's
+ *   tok[l] = the lowest id with the greatest logits[l][v] + fma-chain_r(pred[prev][r], succ[v][r]).
+ * The host chain is the kernel's documented order (r ascending, one fma a term), so a different
+ * contraction or a wrong tie rule on the card shows. Ties are forced (one succ row copied to an id in
+ * another shard, equal logits on top). Then the launch time of one step at the TP4 shard of the real
+ * vocabulary (32320 columns, rank 256) at 1 / 4 / 8 sequences, warm (the shard's 16.5 MB in the on-die
+ * cache) -- information for the lever's cost a round. */
+static void dspark_walk_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "dspark_walk_step_f32");
+    if (!r) { ok("dspark_walk_step_f32", false, "row absent"); return; }
+    auto per = [](int64_t total, int w) -> int64_t {
+        if (total % w == 0) return total / w;
+        return ((total + w - 1) / w + 127) / 128 * 128;
+    };
+    struct C { int64_t V, R, S; int W; uint32_t seed; bool tie; };
+    const C cs[] = { { 3001, 256, 1, 1, 1, false }, { 3001, 256, 5, 2, 2, true }, { 3001, 64, 9, 4, 3, true },
+                     { 4096, 256, 8, 4, 4, false }, { 129280, 256, 3, 4, 5, true }, { 129280, 256, 1, 3, 6, false } };
+    for (const C& c : cs) {
+        const int64_t V = c.V, R = c.R, S = c.S, steps = 5;
+        const int W = c.W;
+        uint32_t st = 0x9e3779b9u ^ c.seed;
+        auto rnd = [&]() { st = st * 1664525u + 1013904223u; return ((float)(st >> 8) / 16777216.0f) * 2.0f - 1.0f; };
+        std::vector<uint16_t> w1((size_t)(V * R)), w2((size_t)(V * R));
+        for (auto& x : w1) x = h_to_bf16(rnd() * 0.7f);
+        for (auto& x : w2) x = h_to_bf16(rnd() * 0.7f);
+        std::vector<float> lg((size_t)(S * steps * V));
+        for (auto& x : lg) x = h_bf16(h_to_bf16(rnd() * 4.0f));   /* bf16 values: equal logits are common */
+        std::vector<int32_t> anc((size_t)((S - 1) * steps + 1), 0);
+        for (int64_t s = 0; s < S; ++s) anc[(size_t)(s * steps)] = (int32_t)((s * 7919 + c.seed * 104729) % V);
+        if (c.tie) {   /* sequence 0: ids a < b in different shards, the same succ row and logit, on top */
+            const int64_t a = V / 10, b = V - V / 10;
+            for (int64_t k = 0; k < R; ++k) w2[(size_t)(b * R + k)] = w2[(size_t)(a * R + k)];
+            for (int64_t l = 0; l < steps; ++l) lg[(size_t)(l * V + a)] = lg[(size_t)(l * V + b)] = 90.0f;
+        }
+        /* the host walk */
+        std::vector<int32_t> want((size_t)(S * steps));
+        std::vector<float> u((size_t)R);
+        for (int64_t s = 0; s < S; ++s) {
+            int32_t prev = anc[(size_t)(s * steps)];
+            for (int64_t l = 0; l < steps; ++l) {
+                const bool okp = prev >= 0 && prev < V;
+                for (int64_t k = 0; k < R; ++k) u[(size_t)k] = okp ? h_bf16(w1[(size_t)(prev * R + k)]) : 0.0f;
+                const float* row = lg.data() + (size_t)((s * steps + l) * V);
+                bool have = false; float best = 0.0f; int32_t tok = 0;
+                for (int64_t v = 0; v < V; ++v) {
+                    float acc = 0.0f;
+                    for (int64_t k = 0; k < R; ++k) acc = std::fma(u[(size_t)k], h_bf16(w2[(size_t)(v * R + k)]), acc);
+                    const float sc = row[v] + acc;
+                    if (std::isnan(sc)) continue;
+                    if (!have || sc > best) { have = true; best = sc; tok = (int32_t)v; }
+                }
+                want[(size_t)(s * steps + l)] = tok;
+                prev = tok;
+            }
+        }
+        /* the card: shards, keys, the host gather */
+        void* d_w1 = dalloc(w1.size() * 2);
+        void* d_w2 = dalloc(w2.size() * 2);
+        void* d_anc = dalloc(anc.size() * 4);
+        const int64_t SL = R4D_DS41_WALK_SLOT;   /* f32 a key slot (16 bytes: the u64 key + padding) */
+        void* d_g = dalloc((size_t)(S * W * SL) * 4);
+        std::vector<void*> d_lg((size_t)W), d_k((size_t)W), d_t((size_t)W);
+        std::vector<int64_t> beg((size_t)W), ext((size_t)W);
+        bool alloc_ok = d_w1 && d_w2 && d_anc && d_g;
+        for (int k = 0; k < W; ++k) {
+            const int64_t b0 = std::min(V, per(V, W) * k), e0 = std::min(V, b0 + per(V, W));
+            beg[(size_t)k] = b0; ext[(size_t)k] = e0 - b0;
+            d_lg[(size_t)k] = dalloc((size_t)(S * steps * std::max<int64_t>(1, ext[(size_t)k])) * 4);
+            d_k[(size_t)k] = dalloc((size_t)(S * SL) * 4);
+            d_t[(size_t)k] = dalloc((size_t)(S * steps) * 4);
+            alloc_ok = alloc_ok && d_lg[(size_t)k] && d_k[(size_t)k] && d_t[(size_t)k];
+        }
+        const std::string nm = fmt("dspark_walk_step_f32 V %lld R %lld S %lld over %d rank(s)%s = the host walk",
+                                   (long long)V, (long long)R, (long long)S, W, c.tie ? ", a cross-shard tie" : "");
+        if (!alloc_ok) { ok(nm.c_str(), false, "hipMalloc failed"); continue; }
+        st_memcpy(d_w1, w1.data(), w1.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_w2, w2.data(), w2.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_anc, anc.data(), anc.size() * 4, hipMemcpyHostToDevice);
+        for (int k = 0; k < W; ++k) {
+            std::vector<float> sh((size_t)(S * steps * std::max<int64_t>(1, ext[(size_t)k])));
+            for (int64_t i = 0; i < S * steps; ++i)
+                for (int64_t j = 0; j < ext[(size_t)k]; ++j)
+                    sh[(size_t)(i * ext[(size_t)k] + j)] = lg[(size_t)(i * V + beg[(size_t)k] + j)];
+            st_memcpy(d_lg[(size_t)k], sh.data(), sh.size() * 4, hipMemcpyHostToDevice);
+            st_memset(d_t[(size_t)k], 0xff, (size_t)(S * steps) * 4);
+        }
+        std::vector<uint64_t> klog[2];   /* every rank's key slots of every step, a form */
+        for (int form = 0; form < 2; ++form) {
+            std::vector<uint64_t> kk((size_t)(S * SL / 2)), gg((size_t)(S * W * SL / 2), 0);
+            int rcbad = 0;
+            for (int k = 0; k < W; ++k) st_memset(d_t[(size_t)k], 0xff, (size_t)(S * steps) * 4);
+            for (int64_t step = 0; step <= steps; ++step) {
+                for (int k = 0; k < W; ++k) {
+                    if (step < steps) st_memset(d_k[(size_t)k], 0, (size_t)(S * SL) * 4);
+                    std::vector<RadTensor> ts = {
+                        T(d_lg[(size_t)k], RAD_F32, { S * steps, std::max<int64_t>(1, ext[(size_t)k]) }),
+                        T(d_anc, RAD_I32, { (int64_t)anc.size() }),
+                        T(step > 0 ? d_g : nullptr, RAD_F32, { S, SL * W }),
+                        T(d_w1, RAD_BF16, { V, R }), T(d_w2, RAD_BF16, { V, R }),
+                        T(step < steps ? d_k[(size_t)k] : nullptr, RAD_F32, { S, SL }),
+                        T(d_t[(size_t)k], RAD_I32, { S, steps }),
+                    };
+                    if (step == 0) absent(ts[2]);
+                    if (step == steps) absent(ts[5]);
+                    std::vector<RadParam> ps = { PI("M", S), PI("step", step), PI("steps", steps), PI("rank", R),
+                                                 PI("n_vocab", V), PI("N", ext[(size_t)k]), PI("vocab_off", beg[(size_t)k]),
+                                                 PI("world", W), PI("anchor_stride", steps), PS("dtype", "f32"),
+                                                 PI("form", form) };
+                    RadArgs a;
+                    std::memset(&a, 0, sizeof(a));
+                    a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+                    rcbad += r->launch(&a, (RadStream) nullptr) != RAD_OK;
+                    st_stream_sync(nullptr);
+                }
+                if (step < steps)
+                    for (int k = 0; k < W; ++k) {
+                        st_memcpy(kk.data(), d_k[(size_t)k], kk.size() * 8, hipMemcpyDeviceToHost);
+                        klog[form].insert(klog[form].end(), kk.begin(), kk.end());
+                        for (int64_t s = 0; s < S; ++s)   /* whole slots, [s][w], as the gather lands them */
+                            for (int64_t q = 0; q < SL / 2; ++q)
+                                gg[(size_t)((s * W + k) * (SL / 2) + q)] = kk[(size_t)(s * (SL / 2) + q)];
+                    }
+                if (step < steps) st_memcpy(d_g, gg.data(), gg.size() * 8, hipMemcpyHostToDevice);
+            }
+            int bad = 0; std::string first;
+            for (int k = 0; k < W; ++k) {
+                std::vector<int32_t> got((size_t)(S * steps));
+                st_memcpy(got.data(), d_t[(size_t)k], got.size() * 4, hipMemcpyDeviceToHost);
+                for (size_t i = 0; i < got.size(); ++i)
+                    if (got[i] != want[i]) {
+                        if (!bad) first = fmt("rank %d seq %lld pos %lld: %d want %d", k, (long long)(i / steps),
+                                              (long long)(i % steps), got[i], want[i]);
+                        ++bad;
+                    }
+            }
+            if (c.tie && want[0] != (int32_t)(V / 10)) { ++bad; first += " (the host walk did not take the tie's lower id)"; }
+            ok((nm + fmt(", form %d", form)).c_str(), rcbad == 0 && bad == 0, rcbad ? fmt("%d launch(es) refused", rcbad) : first);
+        }
+        ok(fmt("dspark_walk_step_f32 V %lld R %lld S %lld over %d rank(s): form 1's keys (the scores' bits) = form 0's, every "
+               "rank and step", (long long)V, (long long)R, (long long)S, W).c_str(), klog[0] == klog[1] && !klog[0].empty());
+    }
+
+    /* Launch time of one step at the TP4 shard of the real vocabulary, warm. */
+    {
+        const int64_t V = 129280, R = 256, N = 32320, voff = 32320, steps = 5, Smax = 8;
+        void* d_w = dalloc((size_t)(V * R) * 2);
+        void* d_l = dalloc((size_t)(Smax * steps * N) * 4);
+        void* d_a = dalloc((size_t)(Smax * steps) * 4);
+        void* d_k = dalloc((size_t)(Smax * R4D_DS41_WALK_SLOT) * 4);
+        void* d_t = dalloc((size_t)(Smax * steps) * 4);
+        if (!d_w || !d_l || !d_a || !d_k || !d_t) { ok("dspark_walk_step_f32 timing", false, "hipMalloc failed"); return; }
+        st_memset(d_w, 0x3c, (size_t)(V * R) * 2);
+        st_memset(d_l, 0, (size_t)(Smax * steps * N) * 4);
+        st_memset(d_a, 0, (size_t)(Smax * steps) * 4);
+        for (int form = 0; form < 2; ++form)
+        for (int64_t S : { 1, 4, 8 }) {
+            std::vector<RadTensor> ts = { T(d_l, RAD_F32, { S * steps, N }), T(d_a, RAD_I32, { S * steps }),
+                                          T(nullptr, RAD_F32, { S, R4D_DS41_WALK_SLOT }), T(d_w, RAD_BF16, { V, R }),
+                                          T(d_w, RAD_BF16, { V, R }), T(d_k, RAD_F32, { S, R4D_DS41_WALK_SLOT }),
+                                          T(d_t, RAD_I32, { S, steps }) };
+            absent(ts[2]);
+            std::vector<RadParam> ps = { PI("M", S), PI("step", 0), PI("steps", steps), PI("rank", R), PI("n_vocab", V),
+                                         PI("N", N), PI("vocab_off", voff), PI("world", 4), PI("anchor_stride", steps),
+                                         PS("dtype", "f32"), PI("form", form) };
+            RadArgs a;
+            std::memset(&a, 0, sizeof(a));
+            a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+            const double us = st_time_us([&](int) { (void)r->launch(&a, (RadStream) nullptr); }, 50, nullptr);
+            std::printf("  PERF  dspark_walk_step_f32 one step, form %d, shard N %lld R %lld, %lld sequence(s): %.1f us a "
+                        "launch (warm; 16.5 MB of succ a step)\n", form, (long long)N, (long long)R, (long long)S, us);
+        }
+        ok("dspark_walk_step_f32 timing", true);
+    }
 }
 /* --------------------------- the attention with the output gate and quantiser in its merge, vs the pair
  *
@@ -32300,6 +32482,77 @@ static void ar_wide_ti8(const Plugin& pl, const std::vector<int>& devs, const ch
     if (row->fini) for (ArTi8& a : t) if (a.inst) row->fini(a.inst);
 }
 
+/* Lever W1's gather between walk steps on the cards: ar_gather_4rank (the row deepseek41's all_gather resolves to at
+ * TP4) at the walk's geometry -- a 16-byte key slot a row (4 f32), S sequences (numel S * 4), row-interleaved
+ * [S][4][4] -- for S 1 .. 8, every rank's bytes on every rank; and the 8-byte row the first full-vocabulary pass
+ * issued (row 2 f32), which the launch must refuse as it did at step 4251 (10.11.2026). */
+static void dspark_walk_gather_case(const Plugin& pl, const std::vector<int>& devs) {
+    const char* name = "ar_gather_4rank";
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok("dspark_walk_step_f32 gather: ar_gather_4rank", false, "row absent"); return; }
+    if ((int)devs.size() < 4) { skip("dspark_walk_step_f32 gather", "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 4)) { skip("dspark_walk_step_f32 gather", "no peer path between the 4 cards"); return; }
+    const int W = 4;
+    auto sent = [](int rank, int64_t i) -> uint32_t {   /* gather_worker's pattern */
+        if ((i & 1) == 0) return (uint32_t)(rank * 124160 + (int)i + 1);
+        uint32_t u; const float v = (float)(rank + 1) * 0.5f + (float)(i - 1);
+        std::memcpy(&u, &v, 4);
+        return u;
+    };
+    for (int64_t S : { 1, 2, 3, 5, 8 }) {
+        const int64_t rowe = 4, numel = S * rowe;
+        std::vector<ArThread> t((size_t)W);
+        std::vector<std::thread> th;
+        for (int r = 0; r < W; ++r) {
+            t[(size_t)r] = ArThread{ row, r, devs[(size_t)r], numel };
+            t[(size_t)r].world = W;
+            t[(size_t)r].row_elems = rowe;
+            th.emplace_back(gather_worker, &t[(size_t)r]);
+        }
+        for (std::thread& x : th) x.join();
+        bool up = true;
+        std::string rcs;
+        for (const ArThread& a : t) {
+            up = up && a.rc_init == RAD_OK && a.rc_launch == RAD_OK;
+            rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+        }
+        int64_t bad = 0;
+        if (up)
+            for (const ArThread& a : t)
+                for (int64_t m = 0; m < S; ++m)
+                    for (int r = 0; r < W; ++r)
+                        for (int64_t j = 0; j < rowe; ++j) {
+                            uint32_t got;
+                            std::memcpy(&got, &a.out[(size_t)(m * W * rowe + r * rowe + j)], 4);
+                            bad += got != sent(r, m * rowe + j);
+                        }
+        ok(fmt("dspark_walk_step_f32 gather: ar_gather_4rank moves the walk's 16-byte key slots, %lld sequence(s), "
+               "[S][4][4] on every rank", (long long)S).c_str(),
+           up && bad == 0, up ? std::to_string(bad) + " words wrong" : "init/launch rc " + rcs);
+        if (row->fini) for (ArThread& a : t) if (a.inst) row->fini(a.inst);
+    }
+    {   /* the 8-byte row: refused at launch on every rank, before any handshake */
+        std::vector<ArThread> t((size_t)W);
+        std::vector<std::thread> th;
+        for (int r = 0; r < W; ++r) {
+            t[(size_t)r] = ArThread{ row, r, devs[(size_t)r], 2 };
+            t[(size_t)r].world = W;
+            t[(size_t)r].row_elems = 2;
+            th.emplace_back(gather_worker, &t[(size_t)r]);
+        }
+        for (std::thread& x : th) x.join();
+        bool refused = true;
+        std::string rcs;
+        for (const ArThread& a : t) {
+            refused = refused && a.rc_init == RAD_OK && a.rc_launch == RAD_E_SHAPE;
+            rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+        }
+        ok("dspark_walk_step_f32 gather: the 8-byte key row of step 4251 is refused (RAD_E_SHAPE), as on the cards",
+           refused, "init/launch rc " + rcs);
+        if (row->fini) for (ArThread& a : t) if (a.inst) row->fini(a.inst);
+    }
+}
+
 static void gather_wide_rank(const Plugin& pl, const std::vector<int>& devs, const char* name,
                              int world) {
     const RadKernelInfo* row = find(pl, name);
@@ -35810,6 +36063,12 @@ static void device_phase(const Plugin& pl) {
                 ok("dflash_select_bf16 absent hp is a plane of ones (the bigram form)", bsame);
             }
         }
+    }
+
+    /* --- lever W1: the full-vocabulary DSpark walk on vocabulary shards, against a host walk */
+    if (sel("dspark_walk_step_f32")) {
+        dspark_walk_case(pl);
+        dspark_walk_gather_case(pl, devs);
     }
 
     /* --- GEMM --- */
