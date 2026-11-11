@@ -1857,6 +1857,16 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                                 RAD_INT("ring", r + g.max_spec), RAD_INT("seqs", g.max_seqs),
                                 RAD_STR("dtype", "f32") },
                               {}, { m.kvs }, {});
+            /* Lever T1: on a tree verify c_tail reads the slot positions (spos, which tree_rows writes) and the two
+             * entry stores read the root's pages (mpage, which qsa_work_tree writes; `page` in step()). Each says
+             * so: otherwise the arena's liveness plan ends spos at tree_rows and starts mpage at the first source's
+             * qsa_work_tree, declared after these stores, and the issue refuses the op as one that never declared
+             * the buffer (core/runtime/issue.cpp), at the first tree step. Without a tree nothing changes. */
+            if (m.tree && r > 1) {
+                rw(b, L.c_tail, { m.spos }, {});
+                rw(b, L.k_st, { m.mpage }, {});
+                rw(b, L.l_st, { m.mpage }, {});
+            }
             /* Lever T1, a ratio > 1 source: the blocks a tree row completes gathered by its path; the root's
              * entries stored as before (mpage), a deeper node's into this source's scratch at its step row
              * (tpage), which the context pass commits for the accepted path only. The tail stores each row at
