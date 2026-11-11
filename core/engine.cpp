@@ -2097,7 +2097,7 @@ int Engine::arena_step(const RadBatch* b) {
         if (d0 && b->phase == RAD_PHASE_DECODE && b->n_tok == b->n_seq && !sched_.draft().head_runs() &&
             !ctx_refill_due())
             need = b->n_tok;
-        else if (!d0)
+        else   /* every other step, under either value, at least today's rung: the head never runs below it */
             need = std::max<int64_t>(need, arena_dec_max_);
     }
     const int level = arena_level(need);

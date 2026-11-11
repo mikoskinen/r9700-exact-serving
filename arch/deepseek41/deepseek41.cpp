@@ -2750,6 +2750,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.ikeep = full.ikeep;
         m.isplit = full.isplit;
         m.qmax = full.qmax;
+        /* Lever Z0-A (ds41-z0): the DSpark head's query rows Q (max_seqs x block, capped by max_tok: dsp_config) size
+         * FIXED parameters -- the candidates' all_gather numel Q x R x 2, the walk's wseqs = Q / block and its gather --
+         * so a level below Q (the 8-row rung at NST 5: Q 8 instead of 40, numel 512 instead of 2560) declared a different
+         * graph and was refused ("no level for 8-token steps"). A level keeps the real Q: the head's buffers keep their real
+         * rows (not larger, so plan_level takes them), and the head never runs at such a level (Engine::arena_step gives
+         * a step below the largest decode rung only when it verifies nothing and runs no head). */
+        m.dsp.Q = full.dsp.Q;
+        m.dsp.on = full.dsp.on;
         /* Lever VA "arena": below irows the plane and the selections follow the level's rows. */
         if (ds41_arena_decode_rows() > 0 && g.max_tok < m.irows) m.score_rows = g.max_tok;
     }
