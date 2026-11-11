@@ -28,6 +28,9 @@
     float*         raw;      /* split epilogue (lever L8): the GEMM's raw f32 sums [T][raw_pitch] (scratch), which
                               * the finisher rotates, scales and writes out; null: the GEMM's own epilogue */
     int64_t        raw_pitch;
+    const int32_t* band;     /* v13 (fn4 BI-dual): down in the M > 16 band, [n_tok] a token's band -- non-zero: that token's
+                              * rows take the M <= 16 band's epilogue (EPIC's paired tile sums, epic_tile); null: every row
+                              * the launch's own. fill() leaves it null for every other op. */
 #if EXL3R4D_SUHC  /* (two fields: the argument block grows 16 B; gate_up_down's 744 B < 768) -- with it on */
     void*          suhc;     /* SUHC: this layer's resident copy of every expert's suh, suh.1 -- f16 [n_expert][2][K] --
                               * filled by the prep as it meets each expert; null: the planes, wherever they lie */

@@ -75,6 +75,11 @@ static int shape(const RadParam* p, int n_p, int op, int operand, RadOpdDesc* ou
         desc(&v[at->ids], RAD_I32, 2, (int64_t[]){ g.M, g.top_k }, RAD_FILL_INDEX);
         v[at->ids].idx_max = g.n_expert;
     }
+    if (at->band >= 0) {   /* v13's dual-form bands: the architecture's choice a token, not a value a tool builds */
+        memset(&v[at->band], 0, sizeof v[at->band]);
+        v[at->band].idx_const = -1;
+        v[at->band].flags = RAD_OPD_F_ABSENT;
+    }
 
     /* A present operand with an empty extent -- an odd class of no experts -- is a geometry this
      * description cannot build, and a tool skips and counts it rather than inventing one. */

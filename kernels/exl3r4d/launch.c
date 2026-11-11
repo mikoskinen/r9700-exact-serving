@@ -232,6 +232,16 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->h_rot = g->h_rot;
     d->a_rot = g->a_rot;
     d->limit = (float)g->limit;
+    d->band = NULL;   /* v13 (fn4 BI-dual): the dual-form down's row bands, when given */
+    if (!gate_up && pos->band >= 0 && pos->band < a->n_t) {
+        const RadTensor* bt = rad_arg_in(a, pos->band);
+        if (bt && bt->data) {
+            if (bt->dtype != RAD_I32) return RAD_E_DTYPE;
+            if (!rad_tensor_is_contiguous(bt)) return RAD_E_STRIDE;
+            if (rad_tensor_numel(bt) < T / g->top_k) return RAD_E_SHAPE;
+            d->band = (const int32_t*)bt->data;
+        }
+    }
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;

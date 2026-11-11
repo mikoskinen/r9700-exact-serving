@@ -356,7 +356,7 @@ constexpr int kGrpEpi = 16384 + 4096;   // bytes of LDS a group's epilogue takes
 template <int NPW>
 static __device__ __forceinline__ void pf_epi_dn(const Exl3r4dGemm& p, const Planes& w, const v8f (&acc)[NPW],
                                                  int col_local, int lane, int cb, int row, bool in_run, bool live,
-                                                 float* xs, const v8h (*svp)[1]) {
+                                                 float* xs, const v8h (*svp)[1], bool epc = false) {
   constexpr int OPW = epi_opw<NPW, 1>();
   constexpr float RS = 0.08838834764831845f;  // 1 / sqrt(128)
   const int h = lane >> 4;
@@ -377,7 +377,8 @@ static __device__ __forceinline__ void pf_epi_dn(const Exl3r4dGemm& p, const Pla
       const int t = col_local * OPW + o;
       const int n0 = cb * 128 + 16 * t + 8 * h;
       float r[8], sv[8];
-      had_tiles(xs, t, lane, r);
+      if (epc) epic_tile(xs, t, lane, r);   // fn4 BI-dual (v13): a marked row takes the M <= 16 band's sums
+      else had_tiles(xs, t, lane, r);
 #pragma unroll
       for (int e = 0; e < 8; e++) sv[e] = (float)svp[o][0][e];
       v4u out;
@@ -405,7 +406,7 @@ constexpr int kYStage = 8 * 256 * 4;   // bytes: after the epilogue's 8 tiles x 
 template <int NPW>
 static __device__ __forceinline__ void pf_epi_dn_ys(const Exl3r4dGemm& p, const v8f (&acc)[NPW], int col_local,
                                                     int lane, int cb, int row, bool in_run, bool live, float* lds,
-                                                    const v8h (*svp)[1]) {
+                                                    const v8h (*svp)[1], bool epc = false) {
   constexpr int OPW = epi_opw<NPW, 1>();
   constexpr float RS = 0.08838834764831845f;  // 1 / sqrt(128)
   const int h = lane >> 4;
@@ -427,7 +428,8 @@ static __device__ __forceinline__ void pf_epi_dn_ys(const Exl3r4dGemm& p, const 
     for (int o = 0; o < OPW; o++) {
       const int t = col_local * OPW + o;
       float r[8], sv[8];
-      had_tiles(xs, t, lane, r);
+      if (epc) epic_tile(xs, t, lane, r);   // fn4 BI-dual (v13): a marked row takes the M <= 16 band's sums
+      else had_tiles(xs, t, lane, r);
 #pragma unroll
       for (int e = 0; e < 8; e++) sv[e] = (float)svp[o][0][e];
       v4u out;
@@ -813,20 +815,22 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     const int row = r0 + 16 * i + nl;
     const bool in_run = row < r1;
     const int tok = p.sorted[in_run ? row : r0];   // unconditional, clamped into the entry
+    // fn4 BI-dual (v13): down's rows whose token the band marks take the M <= 16 band's epilogue sums
+    const bool epc = MATS == 1 && p.band && in_run && tok >= 0 && p.band[tok / p.top_k] != 0;
     v8f blk[NPW];
 #pragma unroll
     for (int j = 0; j < NPW; j++) blk[j] = acc[j][i];
     if constexpr (YS && MATS == 1)
-      pf_epi_dn_ys<NPW>(p, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds, svp);
+      pf_epi_dn_ys<NPW>(p, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds, svp, epc);
     else if constexpr (EXL3R4D_PF_EPI_DN2 && MATS == 1)
-      pf_epi_dn<NPW>(p, w, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds + (i & 1) * 2048, svp);
+      pf_epi_dn<NPW>(p, w, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds + (i & 1) * 2048, svp, epc);
     else if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2)
       pf_epi_gu<NPW>(p, w, blk, wave, lane, cb, row, in_run, in_run && tok >= 0, lds, svp, dsr, wave,
                      (int)blockDim.x / WAVE32);
     else if constexpr (SVE || EXL3R4D_PF_EPI_PRE)
-      epilogue_block<NPW, MATS, true>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds, svp);
+      epilogue_block<NPW, MATS, true>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds, svp, epc);
     else
-      epilogue_block<NPW, MATS>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds);
+      epilogue_block<NPW, MATS>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds, nullptr, epc);
   }
   if constexpr (EXL3R4D_PF_EPI_DN2 && !YS && MATS == 1) lds_barrier();   // the regions are rewritten next pass
 }
@@ -923,10 +927,11 @@ static __device__ __forceinline__ void pf_body_dg(const Exl3r4dGemm& p, const Pl
       const int row = r0 + 16 * i + nl;
       const bool in_run = row < r1;
       const int tok = p.sorted[in_run ? row : r0];
+      const bool epc = p.band && in_run && tok >= 0 && p.band[tok / p.top_k] != 0;   // fn4 BI-dual (v13)
       v8f blk[NPW];
 #pragma unroll
       for (int j = 0; j < NPW; j++) blk[j] = acc[j][i];
-      epilogue_block<NPW, 1, true>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds, svp);
+      epilogue_block<NPW, 1, true>(p, w, blk, wave, 0, lane, cb, row, in_run, in_run && tok >= 0, lds, svp, epc);
     }
   }
 #undef DG_LOAD
