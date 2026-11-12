@@ -845,11 +845,12 @@ static inline void exl3_gd_operands(const RadTensor* t, const RadTensor* h, RadT
     td[dn->y] = t[gd->y];
     if (gu->map >= 0) memset(&tg[gu->map], 0, sizeof tg[gu->map]);   /* v10: no shared map inside the fused op */
     if (dn->map >= 0) memset(&td[dn->map], 0, sizeof td[dn->map]);
+    if (dn->band >= 0) memset(&td[dn->band], 0, sizeof td[dn->band]);   /* v12: no band inside the fused op */
 }
 
 /* ...and version 7's four-class op the same way: the gate_up_mod4 view (a_rot = 0, h_rot = 1) and the down_mod4 view
  * (class q at [K_q, N_q / 2]). Parameter arrays: gate_up at most 15, down 14. Operands `t` (32): gate_up_mod4's 24
- * (output h) and down_mod4's 16 (input h, output t[31]). */
+ * (output h) and down_mod4's 16 (input h, output t[31]); `td` holds 17 (v12: the band slot, cleared). */
 static inline void exl3_gd4_params(const RadParam* p, int n_p, RadParam* pg, int* n_pg, RadParam* pd, int* n_pd) {
     static const RadParam h1 = { "h_rot", RAD_P_INT, 1, 0, 0, 0.0 }, a0 = { "a_rot", RAD_P_INT, 0, 0, 0, 0.0 };
     static const char* const nq[EXL3_MAX_CLS] = { "N", "N_1", "N_2", "N_3" };
@@ -892,6 +893,7 @@ static inline void exl3_gd4_operands(const RadTensor* t, const RadTensor* h, Rad
     td[dn->y] = t[gd->y];
     if (gu->map >= 0) memset(&tg[gu->map], 0, sizeof tg[gu->map]);   /* v10: no shared map inside the fused op */
     if (dn->map >= 0) memset(&td[dn->map], 0, sizeof td[dn->map]);
+    if (dn->band >= 0) memset(&td[dn->band], 0, sizeof td[dn->band]);   /* v12: no band inside the fused op */
 }
 
 /* Expert e's class and its entry in that class's tables. */
