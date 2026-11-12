@@ -500,7 +500,9 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         const char* ee = std::getenv("R4D_SDMA_ENGINE");
         const int engine = ee && *ee ? std::atoi(ee) : 1;   /* the core's DMA lane has engine 0 */
         char why[256] = { 0 };
-        in->sdma = r4d_sdma_ar_create(world, rank, dev, engine, max_numel, 1, why, (int)sizeof why);
+        const char* se = std::getenv("R4D_SDMA_SCR");   /* the scratch: 1 fine-grained (default), 0 coarse, 2 uncached */
+        const int scr = se && *se ? std::atoi(se) : 1;
+        in->sdma = r4d_sdma_ar_create(world, rank, dev, engine, max_numel, scr >= 0 && scr <= 2 ? scr : 1, why, (int)sizeof why);
         if (rank == 0)
             std::fprintf(stderr, in->sdma ? "[r4d] fn4 SDMA-AR: copy-engine context (engine %d) for messages of %lld to "
                                             "%lld elements%s\n"

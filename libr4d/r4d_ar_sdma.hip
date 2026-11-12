@@ -614,8 +614,8 @@ int rv_barrier(int world) {
 }
 
 struct SdmaAr {
-    int world = 4, rank = 0, dev = 0, scr_mode = 1;
-    SdmaQ* q = nullptr;
+    int world = 4, rank = 0, dev = 0, scr_mode = 1, engine = 1;
+    SdmaQ* q = nullptr;         /* opened at create, or at the first launch (R4D_SDMA_QLAZY=1) */
     long long max_numel = 0;
     size_t slot_bytes = 0;      /* one shard's slot */
     char* scr_a = nullptr;      /* 2 parities x world slots: slot (par, s) written by rank s's engine (first hop) */
@@ -671,6 +671,14 @@ int sdma_launch(SdmaAr* a, const void* in, void* out, long long numel, const lon
     k_sdma_flag<<<1, 64, 0, st>>>(fl, hop1 ? kFGo1 : kFGo2, v, tl);
     int rc = RAD_OK;
     {
+        if (!a->q) {
+            std::string w;
+            a->q = q_open(a->dev, a->engine, &w);
+            if (!a->q) {
+                std::fprintf(stderr, "[r4d] fn4 SDMA-AR: rank %d could not open its copy-engine queue: %s\n", a->rank, w.c_str());
+                return RAD_E_DEVICE;
+            }
+        }
         SdmaQ* q = a->q;
         std::lock_guard<std::mutex> lk(q->mu);
         /* A hop: one copy a peer in ring order from r + 1, each followed by its FENCE; or, with R4D_SDMA_RR=<bytes>
@@ -834,7 +842,11 @@ void* r4d_sdma_ar_create(int world, int rank, int dev, int engine, long long max
         if (hipGetDevice(&cur) != hipSuccess || cur != dev) ok = hipSetDevice(dev) == hipSuccess;
         if (!ok) w = "no such device";
     }
-    if (ok) {
+    a->engine = engine;
+    /* R4D_SDMA_QLAZY=1: the KFD queue is opened by this rank's first launch instead (219 12.11.: a declared context cost
+     * c16 decode ~7 % at ar_sdma 0 -- an idle queue, the scratch or something else: measured apart) */
+    const char* lz = std::getenv("R4D_SDMA_QLAZY");
+    if (ok && !(lz && std::atoi(lz) > 0)) {
         a->q = q_open(dev, engine, &w);
         ok = a->q != nullptr;
     }
