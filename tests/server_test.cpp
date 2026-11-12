@@ -5382,7 +5382,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kIxLds + 1, (int)fn4::kIxNi);
     CHECK_EQ((int)fn4::kIxNi + 1, (int)fn4::kDs41Arcoded);   /* ds41-int10: lever ARC, appended */
     CHECK_EQ((int)fn4::kDs41Arcoded + 1, (int)fn4::kSchedRowCap);   /* ds41-int10: lever CAP48 (ds41-cap48), merged after ARC */
-    CHECK_EQ((int)fn4::kSchedRowCap + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kSchedRowCap + 1, (int)fn4::kExl3X3d);   /* X3D-F (ds41-x3d-eng10): exl3_x3d, appended */
+    CHECK_EQ((int)fn4::kExl3X3d + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
     CHECK_EQ((int)fn4::kPlaceHb, 49);
     CHECK_EQ((int)fn4::kStageFullPick, 51);
