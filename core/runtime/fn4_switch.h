@@ -405,7 +405,7 @@
  *                   while a hold stood, issued ahead included), cob_steps / cob_newcomers (steps that admitted >= 2
  *                   waiting requests, and those requests), single_steps (steps that admitted one) -- the last three at
  *                   any setting.
- *   gg_gemv_m16     libr4d (lever A4, ds41-a4, appended after exl3_x3d): 0 off (gemm_nt_ggml / its pair / folds a and e /
+ *   gg_gemv_m16     libr4d (lever A4, ds41-a4; 64, after exl3_x3d_pf 63 = lever A10, ds41-pfx): 0 off (gemm_nt_ggml / its pair / folds a and e /
  *                   logits_gemm_ggml in the decode band take lever D2's form as with gg_gemv 2 alone); 1 under gg_gemv 2 a
  *                   call of M <= 16 rows takes the A4 table's form where it has an entry (the XP slab one ahead, the grid
  *                   fit's waves a block, H1R2, larger MT; libr4d r4d_ds41_ggml_mr.hip mr_choose). Exact: tiling, lane
@@ -489,7 +489,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d, kGgGemvM16, kSwitches };
+              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d, kExl3X3dPf, kGgGemvM16, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
