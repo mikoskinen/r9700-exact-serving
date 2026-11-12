@@ -10767,7 +10767,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("sched_noa", 3, &err));
     CHECK(!fn4::check("sched_noa", -1, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
-    CHECK(err.find("sched_noa, epoch_bump)") != std::string::npos);
+    CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, epoch_bump)") != std::string::npos);   /* ds41-int8: SA / HB after NOA */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
     CHECK_EQ(fn4::sched_noa(), 2);

@@ -5358,14 +5358,23 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     fn4::note_sched(fn4::kDs41PskK, 8);
     CHECK(has(f.get("/admin/fn4").body, "\"ds41_psk\": -1, \"ds41_psk_k\": 8"));
     /* levers PSK-L20 / PSK-DS (ds41-pskl20): appended after ds41_psk_k, deepseek41's (not loaded here: -1) */
-    /* lever PSK-CR (ds41-pskcr): ds41_psk_cr appended after dspark_pfctx, deepseek41's (-1 here) */
+    /* lever PSK-CR (ds41-pskcr): ds41_psk_cr appended after dspark_pfctx, deepseek41's (-1 here); ds41-int8: then ds41_engdd
+     * (lever E1, deepseek41's: -1 here), sched_noa (lever NOA, the core's: 0), stage_short / stage_pick / place_hb (levers SA / HB) */
     CHECK(has(f.get("/admin/fn4").body,
-              "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1}"));
+              "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1, \"ds41_engdd\": -1, "
+              "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0}"));
     CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
     CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
     CHECK_EQ(fn4::switch_index("ds41_psk_cr"), (int)fn4::kDs41PskCr);
     CHECK_EQ((int)fn4::kDsparkPfctx + 1, (int)fn4::kDs41PskCr);
-    CHECK_EQ((int)fn4::kDs41PskCr + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kDs41PskCr + 1, (int)fn4::kDs41Engdd);   /* ds41-int8's one order: psk_l20, dspark_pfctx, psk_cr, engdd, */
+    CHECK_EQ((int)fn4::kDs41Engdd + 1, (int)fn4::kSchedNoa);     /* noa, stage_short, stage_pick, place_hb */
+    CHECK_EQ((int)fn4::kSchedNoa + 1, (int)fn4::kStageShort);
+    CHECK_EQ((int)fn4::kStageShort + 1, (int)fn4::kStagePick);
+    CHECK_EQ((int)fn4::kStagePick + 1, (int)fn4::kPlaceHb);
+    CHECK_EQ((int)fn4::kPlaceHb + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kDs41PskK, 41);
+    CHECK_EQ((int)fn4::kSwitches, 50);
     CHECK(!fn4::sched_switch(fn4::kDs41PskL20) && !fn4::sched_switch(fn4::kDsparkPfctx) &&
           !fn4::sched_switch(fn4::kDs41PskCr));
     {   /* no plugin serves a plan, a replay plan or a reach here */
@@ -5394,7 +5403,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
      * registered, per rank. */
     {
         const HttpResponse g0 = f.get("/admin/fn4");
-        CHECK(has(g0.body, "\"ds41_psk_k\": 8, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0"));
+        CHECK(has(g0.body, "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0}"));   /* ds41-int8: after sched_noa */
         CHECK(!has(g0.body, "\"sahb\": {"));
         const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_short":1025})");
         CHECK_EQ(s0.status, 400);
