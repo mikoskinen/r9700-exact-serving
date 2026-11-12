@@ -754,6 +754,69 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
                          brow_slice(qsa_nsel, off, rows, 1), kv, layer, rows);
     };
+    /* fn4 att_bi (12.11.2026, 193's trace: L03.att first-differing in 12 of 20 pf probes): the sparse / dense choice is the
+     * step's (reach = the longest sequence), so a short sequence beside a long one takes the sparse path where it alone takes
+     * the dense one. Under att_bi each sequence takes the path its alone step would: sparse (gated, per row, its rows only)
+     * when its own context passes qsa_exact_to or it has one row, else dense in a launch shaped as its alone step's, with
+     * the gate over its rows. Only when the step mixes both; a pipelined piece pass and a ring-bound pass keep today's. */
+    if (gated && fn4_attbi_flag().load(std::memory_order_relaxed) > 0 && batch->n_seq > 1 && batch->draft_pass == 0 &&
+        table && used && kvb && kvb->seqused_h && !ring_bound && qsa_exact_to > 0 && op_attn && op_gq &&
+        !(pieces && pieces->cuts(T))) {
+        int64_t D = 0, DT = 0;
+        batch_split(batch, &D, &DT);
+        const int64_t qd = D > 0 ? DT / D : 0;
+        std::vector<int64_t> bq;
+        if ((D == 0 || DT == D * qd) && attbi_rows(batch, kvb, D, DT, T, bq)) {
+            const int64_t ns = batch->n_seq;
+            std::vector<int64_t> r0(ns), nr(ns);
+            std::vector<char> sp(ns);
+            int64_t at = 0;
+            for (int64_t s2 = 0; s2 < ns; ++s2) {
+                r0[s2] = at; nr[s2] = s2 < D ? qd : bq[(size_t)(s2 - D)]; at += nr[s2];
+                sp[s2] = nr[s2] == 1 || (int64_t)kvb->seqused_h[s2] > qsa_exact_to;
+            }
+            bool any_dense = false;
+            for (int64_t s2 = 0; s2 < ns; ++s2) any_dense = any_dense || !sp[s2];
+            if (any_dense && at == T) {
+                const int64_t qw = g.q_dim(), hd = g.head_dim, chunk = qsa_gq_rows();
+                const int64_t pitch = kvb->block_table_pitch;
+                for (int64_t s2 = 0; s2 < ns; ++s2) {
+                    const int64_t a0 = r0[s2], n = nr[s2];
+                    if (sp[s2]) {
+                        for (int64_t off = a0; off < a0 + n; off += chunk) {
+                            const int64_t rows = (a0 + n - off) < chunk ? (a0 + n - off) : chunk;
+                            resolve_sel(off, rows);
+                            RAD_ISSUE_N(c, op_attn_gq, 1,
+                                        brow_slice(w.q, off, rows, qw), kv_cache(kv, layer),
+                                        brow_slice(qsa_sel, off, rows, qsa_topk + 1),
+                                        brow_slice(qsa_sequ, off, rows, 1),
+                                        RAD_NONE, RAD_NONE, RAD_NONE,
+                                        brow_slice(w.attn.x, off, rows, qw),
+                                        bcol_at(w.qg, off, g.n_head * 2 * hd, hd, hd, rows),
+                                        brow_slice(w.attn.cq(), off, rows, qw),
+                                        brow_slice(w.attn.cs(), off, rows, fp8_blocks(qw)));
+                        }
+                    } else {
+                        RAD_ISSUE_N(c, op_attn, n,
+                                    brow_slice(w.q, a0, n, qw), kv_cache(kv, layer),
+                                    praw2(table + s2 * pitch, RAD_I32, 1, pitch), praw(used + s2, RAD_I32, 1),
+                                    RAD_NONE, RAD_NONE, RAD_NONE,
+                                    brow_slice(w.attn.x, a0, n, qw));
+                        RAD_ISSUE_N(c, op_gq, n * g.n_head,
+                                    bcol_at(w.qg, a0, g.n_head * 2 * hd, hd, hd, n), brow_slice(w.attn.x, a0, n, qw),
+                                    brow_slice(w.attn.cq(), a0, n, qw), brow_slice(w.attn.cs(), a0, n, fp8_blocks(qw)),
+                                    brow_slice(w.attn.x, a0, n, qw));
+                    }
+                }
+                if (kvb->stream) kv_stage_next(c, kv, layer);
+                o.step(c, w.attn, w.h.x, T);
+                if (own_ar && op_ar && !ar_taken(g, T, ar_out, ar_out_take))
+                    RAD_ISSUE_N(c, op_ar, T * g.n_embd, brows(w.h.x, T), RAD_NONE);
+                if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
+                return;
+            }
+        }
+    }
     /* A piece at a time where the caller takes the all-reduce that way (ArPieces). On the gated
      * sparse path every query row is its own (q_len 1) and the gate rides in the merge, so the
      * attention and out projection can finish a piece's rows and hand off its reduction while the
