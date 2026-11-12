@@ -28,7 +28,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_lend_w", "draft_occ", "draft_occ_k", "place_lf", "sched_bi_chunk",
                                         "sched_interleave", "sched_mixed_tok", "sched_short_bypass",
                                         "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_psk_l20",
-                                        "dspark_pfctx", "ds41_psk_cr", "ds41_engdd" };
+                                        "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -81,6 +81,7 @@ struct State {
     std::atomic<int> mixed_start{-1}, mixed_capable{-1}, quantum{16};
     std::atomic<int> max_tok{0};                            /* sched_short_bypass's ceiling */
     std::atomic<int64_t> dst[2];                            /* note_sched_dst: bypassed, turned away */
+    std::atomic<int64_t> noa[kNoaCounts];                   /* note_sched_noa (lever NOA) */
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -105,6 +106,7 @@ struct State {
         for (auto& c : ctxs) c.store(0, std::memory_order_relaxed);
         for (auto& c : smp) c.store(0, std::memory_order_relaxed);
         for (auto& c : dst) c.store(0, std::memory_order_relaxed);
+        for (auto& c : noa) c.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -202,7 +204,7 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : s.mixed_start.load(std::memory_order_acquire);
     }
-    if (i == kSchedShortBypass || i == kSchedBypassTotal) {   /* lever DST: set, else 0 (off) */
+    if (i == kSchedShortBypass || i == kSchedBypassTotal || i == kSchedNoa) {   /* lever DST / NOA: set, else 0 (off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : 0;
     }
@@ -270,6 +272,14 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused) {
     State& s = st();
     s.dst[0].store(bypassed, std::memory_order_relaxed);
     s.dst[1].store(bypass_refused, std::memory_order_relaxed);
+}
+int sched_noa() {
+    const int v = st().val[kSchedNoa].load(std::memory_order_acquire);
+    return v > 0 ? v : 0;
+}
+void note_sched_noa(const int64_t* v) {
+    State& s = st();
+    for (int k = 0; k < kNoaCounts; ++k) s.noa[k].store(v[k], std::memory_order_relaxed);
 }
 bool aql_acq_none() {
     static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
@@ -469,7 +479,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
-                        "ds41_psk_cr, ds41_engdd, epoch_bump)";
+                        "ds41_psk_cr, ds41_engdd, sched_noa, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -766,6 +776,21 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedNoa) {          /* lever NOA */
+        const int cap = s.mixed_capable.load(std::memory_order_acquire);
+        if (v != 0 && (v < 1 || v > 2 || cap != 1)) {
+            if (err)
+                *err = (v < 1 || v > 2) ? std::string("sched_noa takes 0 (off), 1 (one prefill a step D turns away beside another "
+                                                      "prefill takes D's piece at the step's --max-num-batched-tokens room) "
+                                                      "or 2 (as many as that room holds)")
+                              : std::string("sched_noa=") + std::to_string(v) + " refused: " +
+                                    (cap < 0 ? "no scheduler has registered"
+                                             : "no shared step here (--prefill-span 1: every step is planned at "
+                                               "--max-num-batched-tokens)");
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedBypassTotal) {  /* lever DST */
         const int q = s.quantum.load(std::memory_order_acquire);
         if (v != 0 && (v < 0 || v > 65536 || (q > 0 && v % q != 0))) {
@@ -880,7 +905,7 @@ bool apply_pending(int step, int* sched) {
         }
         if (reported(s, i) == v) {
             if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
-                i == kSchedBypassTotal)
+                i == kSchedBypassTotal || i == kSchedNoa)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
@@ -986,6 +1011,16 @@ std::string state_json() {
     if (s.max_tok.load(std::memory_order_acquire) > 0)
         o += ", \"dst\": {\"bypassed\": " + std::to_string((long long)s.dst[0].load(std::memory_order_relaxed)) +
              ", \"bypass_refused\": " + std::to_string((long long)s.dst[1].load(std::memory_order_relaxed)) + "}";
+    /* Lever NOA's counts, once a scheduler registered (sched_register). */
+    if (s.max_tok.load(std::memory_order_acquire) > 0) {
+        static const char* const kNoa[kNoaCounts] = { "admitted", "pieces", "rows", "displaced", "waited", "steps",
+                                                      "pf_steps_1", "pf_steps_2", "pf_steps_3", "pf_steps_4plus" };
+        o += ", \"noa\": {";
+        for (int k = 0; k < kNoaCounts; ++k)
+            o += std::string(k ? ", " : "") + "\"" + kNoa[k] + "\": " +
+                 std::to_string((long long)s.noa[k].load(std::memory_order_relaxed));
+        o += "}";
+    }
     /* The depth-0 context skip, once the engine registered it (set up or not). */
     if (const int cap = s.ctxskip_capable.load(std::memory_order_acquire); cap >= 0) {
         static const char* const kCs[8] = { "skipped_steps", "refill_passes", "refill_rows", "dropped_rows",

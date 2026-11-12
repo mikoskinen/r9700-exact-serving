@@ -253,6 +253,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     bypass_now_ = 0;
     bypass_total_ = 0;
     n_bypassed_ = n_bypass_refused_ = 0;
+    noa_mode_ = 0;
+    noa_step_ = noa_disp_ = false;
+    noa_pieces_now_ = 0;
+    for (int64_t& c : noa_n_) c = 0;
 
     kvgeom_ = KVGeom::of(prog.kv_groups);
     for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
@@ -542,6 +546,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* Everything the step path touches is reserved here, so a step never calls the allocator. */
     plan_.e.reserve((size_t)cfg.max_seqs);
     part_.reserve((size_t)cfg.max_seqs);
+    noa_held_.reserve((size_t)cfg.max_seqs);
     running_.reserve((size_t)cfg.max_seqs);
     waiting_.reserve((size_t)cfg.max_seqs * 4 + 64);
     free_slots_.reserve((size_t)cfg.max_seqs);
@@ -686,6 +691,14 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
      * release and its restore would be cut. */
     s.restore_waited = false;
     s.restore_cut = false;
+    /* Lever BI / DST / NOA's per-request state (ds41-noa): a recycled slot kept the previous request's. A stale bypass_no
+     * kept every later request of the slot off the bypass's held steps, uncounted (neither bypassed nor turned away). */
+    s.bi_beg = s.bi_end = 0;
+    s.bi_ckpt = -1;
+    s.bypass_no = false;
+    s.bypass_run = false;
+    s.noa_starved = false;
+    s.noa_displaced = false;
     s.req->state = ReqState::Waiting;
 
     /* The step path appends to `output`, so its capacity is settled here, on the arrival thread.
@@ -1481,6 +1494,17 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
     return emin - n;
 }
 
+/* Lever NOA (fn4 sched_noa): the room a prefill D turned away may take over the shared budget -- the step's max_tok less
+ * every row planned (decode and draft rows, other prefills) -- once another prefill holds the step; 0 when NOA does not act
+ * on this step, no prefill is planned yet (the first prefill is D's own: the shared budget, D's over-budget rule), or under
+ * sched_noa 1 the step already carries a NOA piece. */
+int64_t Scheduler::noa_room() const {
+    if (!noa_step_ || (noa_mode_ == 1 && noa_pieces_now_ > 0)) return 0;
+    for (const StepEntry& e : plan_.e)
+        if (e.is_prefill) return std::max<int64_t>(0, cfg_.max_tok - plan_.n_tok);
+    return 0;
+}
+
 /* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
  * written (spec §7.3; see scheduler.h).
  *
@@ -1957,6 +1981,8 @@ bool Scheduler::preempt_back() {
     r.n_draft = 0;
     r.draft = nullptr;
     s.running = false;
+    s.noa_starved = false;    /* lever NOA: the recompute starts over (its pieces from its new position) */
+    s.noa_displaced = false;
 
     running_.pop_back();
     queue_insert(waiting_, slot);   /* original arrival -> the front of its priority class */
@@ -2028,7 +2054,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
      * restore copies the whole context back, and an admission refused after it would repeat the
      * copy on the next attempt. */
     if (s.card < 0 && free_cards_.empty()) return RAD_E_FULL;
-    if (budget < std::max<int64_t>(geo_.quantum, 1) && budget < s.seq_len() - r.n_computed)
+    /* lever NOA: a D chunk this admission may take over the shared budget (noa_room) counts as budget here */
+    const int64_t nroom = (r.embed || whole_max > 0 || !bi_chunk_) ? 0 : noa_room();
+    if (budget < std::max<int64_t>(geo_.quantum, 1) && budget < s.seq_len() - r.n_computed &&
+        nroom < std::max<int64_t>(geo_.quantum, 1))
         return RAD_E_FULL;
 
     if (r.n_computed == 0 && cfg_.prefix_cache) {
@@ -2261,6 +2290,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
     int64_t ckpt = -1;
     int64_t want;
     bool bp_take = false;   /* lever DST: sched_bypass_total took it (bypass_piece) */
+    bool noa_take = false;  /* lever NOA: D's piece over the shared budget (noa_room) */
     /* lever PSK design 2: this admission's targets, on every admission path (default chunking, sched_bi_chunk's
      * bi_chunk_plan, the bypass's alone pieces); the chunking itself is the path's own */
     psk_latch(s);
@@ -2304,6 +2334,14 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
         if (s.bypass_no) ++n_bypass_refused_;
     } else if (bi_chunk_) {
         want = bi_chunk_plan(s, r, target, budget, &ckpt, reserve > 0);   /* lever BI: the whole chunk or none */
+        /* lever NOA: D turned it away beside another prefill -> D's own piece (alone's whole, else its largest grid cut
+         * >= 128 rows a side) at the step's max_tok room; nothing fits beside the step's first prefill and decode rows
+         * alone (no other NOA piece took room) -> it waits, marked for a displacement step; else the step is just full */
+        if (want <= 0 && nroom > 0) {
+            want = bi_chunk_plan(s, r, target, nroom, &ckpt, false);
+            if (want > 0) noa_take = true;
+            else if (noa_pieces_now_ == 0) { ++noa_n_[4]; s.noa_starved = true; }
+        }
     } else {
         /* An admission shares the step the same way: otherwise a cold prompt with requests
          * queued behind it takes every token left. The hit is known by now, so the cap applies
@@ -2391,6 +2429,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
     psk_ckpt(s, target, &ckpt);
     s.pending_ckpt = ckpt;
     s.bypass_run = bp_take;
+    /* lever NOA: counted where the admission happened; a request that runs a piece is no longer starved */
+    if (noa_take) { ++noa_n_[0]; ++noa_n_[1]; noa_n_[2] += want; ++noa_pieces_now_; }
+    s.noa_starved = false;
+    s.noa_displaced = false;
     ++m_.admitted;
     return RAD_OK;
 }
@@ -2624,6 +2666,7 @@ const RadBatch* Scheduler::step() {
         mixed_now_ = mt > 0 && mt < geo_.shared_tok ? mt : geo_.shared_tok;
         bypass_now_ = fn4::sched_short_bypass();
         bypass_total_ = bypass_now_ > 0 ? fn4::sched_bypass_total() : 0;
+        noa_mode_ = fn4::sched_noa();   /* lever NOA */
     }
     /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
      * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
@@ -2675,6 +2718,36 @@ const RadBatch* Scheduler::step() {
         span_now_ = bi_chunk_ == 2 ? false : lone;
         /* lever DST: the shared budget in force (sched_mixed_tok); B (2) keeps whole intervals on the geometry's own */
         if (!lone && bi_chunk_ != 1) budget = bi_chunk_ == 2 ? geo_.shared_tok : mixed_now_;
+    }
+
+    /* Lever NOA (fn4 sched_noa): acts on a shared step under option D -- not a lone prefill's span step (one prefill by
+     * design), not a step the interleave holds (decode rows only, and the bypass's admissions). */
+    noa_pieces_now_ = 0;
+    noa_held_.clear();
+    noa_step_ = noa_mode_ > 0 && (bi_chunk_ == 3 || bi_chunk_ == 4) && cfg_.prefill_span > 1 && !span_now_ &&
+                !hold_prefill;
+    noa_disp_ = false;
+    if (noa_step_) {
+        /* A request whose D piece did not fit beside another prefill even at max_tok (SchedReq::noa_starved): this step runs
+         * it as the step's only prefill (D's own rule for a prefill alone beside decode rows: its piece over the shared
+         * budget up to max_tok), displacing every other running prefill's chunk by one step -- unless one of them was
+         * displaced before and has not run a chunk since, so a long prompt runs at least every other step that could
+         * displace it. A starved waiting request counts only where an admission is possible (a free card, max_seqs). */
+        bool starved = false, blocked = false;
+        int64_t others = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& x = *reqs_[(size_t)slot];
+            if (!x.req || !x.running) continue;
+            if (!(x.req->n_computed < (int64_t)x.req->prompt.size() || x.req->n_computed + 1 < x.seq_len())) continue;
+            if (x.noa_starved) starved = true;
+            else { ++others; blocked = blocked || x.noa_displaced; }
+        }
+        if (!starved && !free_cards_.empty() && (int64_t)running_.size() < cfg_.max_seqs)
+            for (int32_t slot : waiting_) {
+                const SchedReq& x = *reqs_[(size_t)slot];
+                if (x.req && x.noa_starved) { starved = true; break; }
+            }
+        noa_disp_ = starved && others > 0 && !blocked;
     }
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
@@ -2744,10 +2817,24 @@ const RadBatch* Scheduler::step() {
         /* lever DST (sched_bypass_total): a request the bypass took runs its alone pieces, held steps included; with the
          * switch off, or at an alone piece the bypass cannot run (over N, not cut under 0 / 1 / 2), an ordinary prefill */
         bool bp = false;
+        /* lever NOA: a displacement step runs a starved request as its only prefill; every other prefill's chunk waits a step
+         * (planned unchanged at the next) */
+        if (prefill && noa_disp_ && !s.noa_starved) {
+            s.noa_displaced = true;
+            ++noa_n_[3];
+            ++held_prefill_;
+            ++i;
+            continue;
+        }
         if (prefill && s.bypass_run) {
             want = bypass_total_ > 0 ? bypass_piece(s, r, target, budget, &ckpt) : -1;
             if (want < 0) s.bypass_run = false;
-            else if (want == 0) { ++held_prefill_; ++i; continue; }   /* waits for room; decode rows behind go on */
+            else if (want == 0) {   /* waits for room; decode rows behind go on (lever NOA may still take it, below) */
+                ++held_prefill_;
+                if (noa_step_) noa_held_.push_back(slot);
+                ++i;
+                continue;
+            }
             else { bp = true; psk_ckpt(s, target, &ckpt); }   /* lever PSK design 2: a snapshot at a target only */
         }
         if (bp) {
@@ -2927,7 +3014,83 @@ const RadBatch* Scheduler::step() {
         plan_.n_tok += want;
         if (!prefill && s.n_draft > plan_.n_spec) plan_.n_spec = s.n_draft;
         budget -= want;
+        if (prefill) { s.noa_starved = false; s.noa_displaced = false; }   /* lever NOA: it ran a chunk */
         ++i;
+    }
+
+    /* ---------------------------------------------------------- lever NOA: running prefills over the shared budget */
+    /* After every decode row of the running set was planned: a running prefill that D (or the bypass) turned away while
+     * another prefill holds the step takes D's piece at the step's max_tok room (noa_room; bi_chunk_plan / bypass_piece at
+     * that room: alone's piece whole, else its largest grid cut >= 128 rows a side), in running order; none fits -> it waits,
+     * marked for a displacement step. Never preempts: a piece the pool cannot hold waits, as one D turned away does. */
+    if (noa_step_ && !preempted_here) {
+        for (size_t k = 0; k < running_.size() && (int64_t)plan_.e.size() < cfg_.max_seqs; ++k) {
+            const int64_t room = noa_room();
+            if (room <= 0) break;
+            const int32_t slot = running_[k];
+            SchedReq& s = *reqs_[(size_t)slot];
+            if (!s.req || !s.running) continue;
+            Request& r = *s.req;
+            const int64_t target = s.seq_len();
+            if (!(r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < target)) continue;
+            if (noa_disp_ && !s.noa_starved) continue;   /* displaced this step */
+            bool in = false;
+            for (const StepEntry& pe : plan_.e) in = in || pe.slot == slot;
+            if (in) continue;
+            int64_t ckpt = -1, want = -1;
+            if (s.bypass_run && bypass_total_ > 0) {
+                want = bypass_piece(s, r, target, room, &ckpt);
+                if (want < 0) s.bypass_run = false;     /* as the running loop: an ordinary prefill from here */
+            }
+            if (want < 0) want = bi_chunk_plan(s, r, target, room, &ckpt, false);
+            if (want <= 0) {   /* nothing fits: beside the first prefill and decode rows alone -> marked (see admit_one) */
+                if (noa_pieces_now_ == 0) { ++noa_n_[4]; s.noa_starved = true; }
+                continue;
+            }
+            int rounds = 0;
+            bool got = true;
+            while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
+                if (++rounds > kEvictRounds || !cfg_.prefix_cache || !pc_ || pc_->evict(kEvictBlocks) <= 0) {
+                    got = false;
+                    break;
+                }
+            }
+            if (!got) continue;
+            psk_ckpt(s, target, &ckpt);                  /* lever PSK design 2: a snapshot at a target only */
+            if (std::find(noa_held_.begin(), noa_held_.end(), slot) != noa_held_.end()) --held_prefill_;
+            StepEntry e;
+            e.req = &r;
+            e.seq = r.id;
+            e.slot = slot;
+            e.card = s.card;
+            e.n_tokens = (int32_t)want;
+            e.ctx_len = (int32_t)r.n_computed;
+            e.n_spec = 0;                                /* as the running loop's prefill entry */
+            r.n_draft = 0;
+            r.draft = nullptr;
+            e.n_accepted = 1;
+            e.conv_cursor = s.conv_cursor;
+            e.draft = s.draft;
+            e.n_draft = s.n_draft;
+            e.is_prefill = true;
+            e.ngram = false;
+            e.draft_parent = nullptr;
+            r.draft_parent = nullptr;
+            e.produces_token = (r.n_computed + want >= target);
+            e.ckpt_restore = s.ckpt_src;
+            s.ckpt_src = -1;
+            if (ckpt > 0) reserve_ckpt(e, r, ckpt, (int32_t)(ckpt - r.n_computed - 1));
+            s.entry = (int32_t)plan_.e.size();
+            s.sched_tokens = (int32_t)want;
+            plan_.e.push_back(e);
+            plan_.n_tok += want;
+            budget -= want;
+            ++noa_n_[1];
+            noa_n_[2] += want;
+            ++noa_pieces_now_;
+            s.noa_starved = false;
+            s.noa_displaced = false;
+        }
     }
 
     /* ---------------------------------------------------------- admission */
@@ -2943,7 +3106,7 @@ const RadBatch* Scheduler::step() {
         took_.clear();
         size_t at = 0;
         while (at < waiting_.size() &&
-               (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
+               (int64_t)plan_.e.size() < cfg_.max_seqs && (budget > 0 || noa_room() > 0)) {
             /* A step planned for one prefill holds that one (span_now_ above). */
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
             int32_t slot = waiting_[at];
@@ -2951,6 +3114,8 @@ const RadBatch* Scheduler::step() {
             /* lever DST: on a held step only a fresh request not turned away before is asked */
             if (bypass && (s.bypass_no || !s.req || s.req->embed || s.req->media ||
                            s.req->state == ReqState::Preempted)) { ++at; continue; }
+            /* lever NOA: a displacement step admits only a starved request (the one it displaced the others for) */
+            if (noa_disp_ && !s.noa_starved) { ++at; continue; }
             /* Generation reserves one position after the prompt. An embedding consumes just
              * the prompt, so its exact context boundary fits without a generation slot.
              * close_request removes a refused input from waiting_, so `at` names the next one. */
@@ -3226,6 +3391,13 @@ const RadBatch* Scheduler::step() {
         plan_.reset();
         step_open_ = false;
         return nullptr;
+    }
+    /* lever NOA's step counts: a step carrying a NOA piece; every step with prefill rows by its prefill entries */
+    {
+        int64_t npf = 0;
+        for (const StepEntry& e : plan_.e) npf += e.is_prefill ? 1 : 0;
+        if (npf > 0) ++noa_n_[5 + std::min<int64_t>(npf, 4)];
+        if (noa_pieces_now_ > 0) ++noa_n_[5];
     }
     ++step_;
     step_open_ = true;
@@ -3890,6 +4062,8 @@ void Scheduler::step_finished() {
         }
     }
     fn4::note_sched_dst(n_bypassed_, n_bypass_refused_);   /* lever DST: sched_short_bypass's counts */
+    static_assert(sizeof(noa_n_) / sizeof(noa_n_[0]) == fn4::kNoaCounts, "lever NOA's counts");
+    fn4::note_sched_noa(noa_n_);                           /* lever NOA's counts */
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
                            hybrid_lookup_, hybrid_head_, hybrid_unahead_, draft_.occ_cycles(), draft_.occ_moves());
     fn4::note_draft_accept(acc_head_d_, acc_head_a_, acc_look_d_, acc_look_a_);

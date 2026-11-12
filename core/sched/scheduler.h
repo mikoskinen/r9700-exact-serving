@@ -51,6 +51,11 @@ struct SchedReq {
     /* sched_bypass_total: the bypass took this request; it runs its alone plan piece by piece (Scheduler::bypass_piece),
      * held steps included, until its prompt is done. */
     bool     bypass_run = false;
+    /* Lever NOA (sched_noa): D's piece over the shared budget did not fit the step's max_tok room either (Scheduler::step);
+     * the next step that may displaces every other running prefill for it. Cleared when it runs a piece. */
+    bool     noa_starved = false;
+    /* A displacement step skipped this running prefill's chunk: it is not displaced again before it ran its next one. */
+    bool     noa_displaced = false;
 
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
@@ -711,6 +716,19 @@ private:
     int64_t       bypass_total_ = 0;   /* sched_bypass_total in force (0: one-piece requests only) */
     int64_t       bypass_piece(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* ckpt);
     int64_t       n_bypassed_ = 0, n_bypass_refused_ = 0;
+    /* Lever NOA (fn4 sched_noa, read at every step planned): the switch in force; whether it acts on the step being planned
+     * (sched_bi_chunk 3 / 4, a shared step: not a span step, not a held one); whether that step displaces the other
+     * running prefills for a starved request (SchedReq::noa_starved); the slots the bypass's running loop counted as held
+     * this step; its counts (fn4 GET "noa"). noa_room(): the step's max_tok room for a prefill D turned away beside
+     * another prefill already planned, 0 when NOA does not act, no prefill is planned yet, or (sched_noa 1) the step
+     * already carries a NOA piece. */
+    int           noa_mode_ = 0;           /* sched_noa in force: 0 off, 1 one piece a step, 2 as many as fit */
+    bool          noa_step_ = false, noa_disp_ = false;
+    int64_t       noa_pieces_now_ = 0;     /* NOA pieces planned in the step being planned */
+    std::vector<int32_t> noa_held_;
+    /* admitted, pieces, rows, displaced, waited, steps, steps by prefill entries 1 / 2 / 3 / 4+ (fn4::kNoaCounts) */
+    int64_t       noa_n_[10] = {};
+    int64_t       noa_room() const;
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share = false);
     IKVManager*   kv_ = nullptr;

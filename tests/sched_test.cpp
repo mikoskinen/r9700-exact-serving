@@ -9543,7 +9543,7 @@ namespace {
 struct DstSwitches {
     ~DstSwitches() {
         set("sched_interleave", -1); set("sched_mixed_tok", 0); set("sched_bi_chunk", 0);
-        set("sched_short_bypass", 0); set("sched_bypass_total", 0);
+        set("sched_short_bypass", 0); set("sched_bypass_total", 0); set("sched_noa", 0);
     }
     static bool set(const char* name, int v) {
         std::string err;
@@ -10059,6 +10059,80 @@ TEST(dst_bypass_total_on_the_ds_geometry) {
     }
 }
 
+namespace {
+int64_t dst_json_num(const std::string& g, size_t from, const char* key) {
+    if (from == std::string::npos) return -1;
+    const std::string k = std::string("\"") + key + "\": ";
+    const size_t at = g.find(k, from);
+    return at == std::string::npos ? -1 : std::atoll(g.c_str() + at + k.size());
+}
+}  // namespace
+
+/* A recycled slot starts with the bypass's per-request state cleared (ds41-noa: Scheduler::add_locked): a 3000-token request the
+ * bypass turned away (sched_short_bypass 1280, one-piece only) finishes and is reaped; the 1000-token request that takes
+ * its slot is bypassed on the next held step (before the fix its stale bypass_no kept it off every held step, counted
+ * neither bypassed nor turned away). */
+TEST(dst_a_recycled_slot_starts_with_clean_bypass_state) {
+    DstSwitches restore;
+    Fixture f;
+    dst_fixture(f, 8);
+    CHECK(DstSwitches::set("sched_bi_chunk", 0));   /* today's cuts: the turned-away request runs as an ordinary prefill */
+    CHECK(DstSwitches::set("sched_short_bypass", 1280));
+    f.submit(100, 4000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(60000 - 200, 2);
+    REQUIRE(p != 0);
+    uint64_t x = 0;
+    int slot_x = -1;
+    auto slot_of = [&](uint64_t id) {
+        std::vector<Scheduler::ReqStat> st(16);
+        const int n = f.sch.requests(st.data(), 16);
+        for (int j = 0; j < n; ++j) if (st[(size_t)j].id == id) return st[(size_t)j].slot;
+        return -1;
+    };
+    bool chunk = false;
+    for (int s = 0; s < 400; ++s) {
+        REQUIRE(f.sch.step() != nullptr);
+        chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) chunk = chunk || (e.seq == p && e.is_prefill);
+        f.commit_plain(12);
+        if (!x && chunk) { x = f.submit(3000, 2); slot_x = slot_of(x); }   /* turned away on the held steps */
+        if (x && f.sch.find(x) && f.sch.find(x)->state == ReqState::Finished) break;
+    }
+    REQUIRE(x != 0 && slot_x >= 0);
+    REQUIRE(f.sch.find(x) && f.sch.find(x)->state == ReqState::Finished);
+    CHECK_OK(f.sch.reap(x));
+    f.sch.step_finished();
+    std::string g = fn4::state_json();
+    const int64_t by0 = dst_json_num(g, g.find("\"dst\": {"), "bypassed");
+    CHECK(dst_json_num(g, g.find("\"dst\": {"), "bypass_refused") >= 1);
+    /* the next chunk step of p, then Y arrives during the hold */
+    for (int s = 0; s < 40; ++s) {
+        REQUIRE(f.sch.step() != nullptr);
+        chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) chunk = chunk || (e.seq == p && e.is_prefill);
+        f.commit_plain(12);
+        if (chunk) break;
+    }
+    REQUIRE(chunk);
+    const uint64_t y = f.submit(1000, 2);
+    REQUIRE(y != 0);
+    CHECK_EQ(slot_of(y), slot_x);                                  /* the reuse this case is about */
+    REQUIRE(f.sch.step() != nullptr);
+    bool y_in = false, p_in = false;
+    for (const StepEntry& e : f.sch.plan().e) {
+        y_in = y_in || (e.seq == y && e.is_prefill && e.ctx_len == 0 && e.n_tokens == 1000);
+        p_in = p_in || (e.seq == p && e.is_prefill);
+    }
+    CHECK(y_in);                                                   /* bypassed on the held step */
+    CHECK(!p_in);
+    f.commit_plain(12);
+    f.sch.step_finished();
+    g = fn4::state_json();
+    CHECK_EQ(dst_json_num(g, g.find("\"dst\": {"), "bypassed"), by0 + 1);
+}
+
 /* ================================================== lever PSK design 2 on every admission path (ds41-int7-pskglue)
  * The DS41 line's geometry (total_run's `ds`: exact resume, interval 2048, span 2, span floor 16384, MNBT 4160): targets
  * q_i = 2048 + (i - 1) x 4096 (alone's span ends), the tail snapshot, the end, checkpoint_at. A run: four decoders, a long
@@ -10534,3 +10608,526 @@ TEST(bi_chunk_d_progresses_with_more_decode_rows_than_the_slack) {
     for (const auto& p : pc) CHECK(p.second <= 576);
 }
 
+
+/* ================================================== lever NOA (ds41-noa): a prefill's piece over the shared budget
+ * fn4 sched_noa 1 / 2 under sched_bi_chunk 3 / 4: a prefill D turns away because another prefill already holds the step's
+ * shared budget takes D's piece (alone's whole, else its largest grid cut >= 128 rows a side) at the step's max_tok room;
+ * 1 one such piece a step, 2 as many as fit. The DS41 line's geometry (exact resume, interval 2048, span 2 from 16384
+ * tokens, MNBT 4160, shared budget 2112). A run: `decoders` decoders, a long prompt L, after L's `after_chunks`-th chunk
+ * step the newcomers `lens` (a seeded prefix hit first when `hit`); every prefill piece with its checkpoint, its PSK plan
+ * and its step; every step's shape and size; fn4 GET "noa" and "dst" at the end. */
+namespace {
+struct NoaCfg {
+    int bic = 3, noa = 2, bypass = 0, total = 0, psk = -1, psk_k = 8, il = 8;
+    int decoders = 4, dec_len = 100, dec_tok = 4000;
+    int64_t L = 40000;            /* 0: no long prompt */
+    std::vector<int> lens;
+    int after_chunks = 1;         /* 0: the newcomers arrive with the first step */
+    int steps = 220;
+    int64_t hit = 0, hit_lin = 0;
+    int64_t blocks = 8192;
+    int newc_tok = 4;
+};
+struct NoaRun {
+    std::string shape;                                   /* 'C' a step carrying a chunk of L, 'D' one that does not */
+    std::map<uint64_t, std::vector<PskPiece>> pieces;
+    std::vector<uint64_t> ids;
+    uint64_t p = 0;
+    int sent = -1;                                       /* the first step the newcomers could be planned in */
+    int64_t max_step_tok = 0;
+    std::vector<int> pf_entries;                         /* prefill entries a step */
+    std::map<std::string, int64_t> noa;
+    int64_t bypassed = -1;
+    SchedMetrics m{};
+};
+int64_t noa_json_num(const std::string& g, size_t from, const char* key) {
+    if (from == std::string::npos) return -1;
+    const std::string k = std::string("\"") + key + "\": ";
+    const size_t at = g.find(k, from);
+    return at == std::string::npos ? -1 : std::atoll(g.c_str() + at + k.size());
+}
+NoaRun noa_run(const NoaCfg& c) {
+    NoaRun out;
+    DstSwitches restore;
+    Fixture f;
+    f.build(c.blocks, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefill_interleave = c.il;
+    f.cfg.prefix_exact = true;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1024);
+    f.sch.set_span_min(16384);
+    CHECK(DstSwitches::set("sched_bi_chunk", c.bic));
+    CHECK(DstSwitches::set("sched_short_bypass", c.bypass));
+    CHECK(DstSwitches::set("sched_bypass_total", c.total));
+    CHECK(DstSwitches::set("sched_noa", c.noa));
+    if (c.psk >= 0) { f.sch.set_psk_mode(c.psk); f.sch.set_psk_k(c.psk_k); }
+    for (int d = 0; d < c.decoders; ++d) f.submit(c.dec_len, c.dec_tok);
+    if (c.decoders > 0) { CHECK(f.sch.step() != nullptr); f.commit_plain(11); }
+    if (c.L > 0) out.p = f.submit((int)c.L, 2);
+    auto send = [&](int s) {
+        if (c.hit > 0) { f.pc.seed((int32_t)c.hit); f.pc.lin = (int32_t)c.hit_lin; f.pc.src = 3; }
+        for (int l : c.lens) out.ids.push_back(f.submit(l, c.newc_tok));
+        out.sent = s;
+    };
+    if (c.after_chunks == 0) send(0);
+    int chunks = 0;
+    for (int s = 0; s < c.steps; ++s) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        std::vector<int32_t> ahead, rows;
+        int64_t dec = -1;
+        const bool planned = f.sch.psk_plan(b->step, &ahead, &rows, &dec);
+        bool chunk = false;
+        int npf = 0;
+        size_t pi = 0;
+        for (const StepEntry& e : f.sch.plan().e) {
+            if (!e.is_prefill) continue;
+            ++npf;
+            if (e.seq == out.p) chunk = true;
+            const int32_t a = planned && pi < ahead.size() ? ahead[pi] : Scheduler::kPskNoPlan;
+            out.pieces[e.seq].push_back({ e.ctx_len, e.n_tokens, e.ckpt_slot >= 0 ? e.ctx_len + e.ckpt_tok + 1 : -1, a, s });
+            ++pi;
+        }
+        out.shape += chunk ? 'C' : 'D';
+        out.pf_entries.push_back(npf);
+        out.max_step_tok = std::max<int64_t>(out.max_step_tok, f.sch.plan().n_tok);
+        f.commit_plain(12);
+        chunks += chunk ? 1 : 0;
+        if (out.sent < 0 && c.after_chunks > 0 && chunks >= c.after_chunks) send(s + 1);
+    }
+    f.sch.step_finished();   /* the engine's call after a step: it reports the counts to fn4 */
+    const std::string g = fn4::state_json();
+    const size_t at = g.find("\"noa\": {");
+    for (const char* k : { "admitted", "pieces", "rows", "displaced", "waited", "steps", "pf_steps_1", "pf_steps_2",
+                           "pf_steps_3", "pf_steps_4plus" })
+        out.noa[k] = noa_json_num(g, at, k);
+    out.bypassed = noa_json_num(g, g.find("\"dst\": {"), "bypassed");
+    out.m = f.sch.metrics();
+    return out;
+}
+/* A request's pieces against alone's from the same start: "" when they keep option D's rule -- contiguous from alone's
+ * start to its end, each inside one alone piece, ending at that piece's end or on the G grid with >= 128 rows on both
+ * sides -- else why not. `strict`: alone's pieces exactly (start, rows). */
+std::string noa_check(const std::vector<PskPiece>& pc, const std::vector<Piece>& alone, int64_t G, bool strict) {
+    char why[200];
+    if (pc.empty() || alone.empty()) return "no pieces";
+    if (strict) {
+        if (pc.size() != alone.size()) { std::snprintf(why, sizeof why, "%zu pieces vs alone's %zu", pc.size(), alone.size()); return why; }
+        for (size_t i = 0; i < pc.size(); ++i)
+            if (pc[i].at != alone[i].at || pc[i].n != alone[i].n) {
+                std::snprintf(why, sizeof why, "piece %zu [%lld, +%lld) vs alone's [%lld, +%lld)", i, (long long)pc[i].at,
+                              (long long)pc[i].n, (long long)alone[i].at, (long long)alone[i].n);
+                return why;
+            }
+        return "";
+    }
+    int64_t at = alone[0].at;
+    for (const PskPiece& x : pc) {
+        if (x.at != at) { std::snprintf(why, sizeof why, "a piece starts at %lld, not %lld", (long long)x.at, (long long)at); return why; }
+        const int64_t e = x.at + x.n;
+        const Piece* a = nullptr;
+        for (const Piece& y : alone) if (y.at <= x.at && x.at < y.at + y.n) a = &y;
+        const int64_t ae = a ? a->at + a->n : -1;
+        if (!a || e > ae || (e != ae && !(e % G == 0 && x.n >= 128 && ae - e >= 128))) {
+            std::snprintf(why, sizeof why, "piece [%lld, %lld) is not one of D's inside alone's [%lld, %lld)", (long long)x.at,
+                          (long long)e, a ? (long long)a->at : -1LL, (long long)ae);
+            return why;
+        }
+        at = e;
+    }
+    if (at != alone.back().at + alone.back().n) return "the pieces do not reach the end";
+    return "";
+}
+int noa_first(const NoaRun& r, uint64_t id) {
+    const auto it = r.pieces.find(id);
+    return it == r.pieces.end() || it->second.empty() ? -1 : it->second.front().step;
+}
+int noa_last(const NoaRun& r, uint64_t id) {
+    const auto it = r.pieces.find(id);
+    return it == r.pieces.end() || it->second.empty() ? -1 : it->second.back().step;
+}
+bool noa_same_at_n(const std::vector<PskPiece>& a, const std::vector<PskPiece>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) if (a[i].at != b[i].at || a[i].n != b[i].n) return false;
+    return true;
+}
+}  // namespace
+
+TEST(noa_switch_check_and_report) {
+    DstSwitches restore;
+    Fixture f;
+    dst_fixture(f, 8);
+    std::string err;
+    CHECK_EQ(fn4::value(fn4::kSchedNoa), 0);
+    CHECK(fn4::check("sched_noa", 0, &err));
+    CHECK(fn4::check("sched_noa", 1, &err));
+    CHECK(fn4::check("sched_noa", 2, &err));
+    CHECK(!fn4::check("sched_noa", 3, &err));
+    CHECK(!fn4::check("sched_noa", -1, &err));
+    CHECK(!fn4::check("no_such_switch", 1, &err));
+    CHECK(err.find("sched_noa, epoch_bump)") != std::string::npos);
+    CHECK(DstSwitches::set("sched_noa", 2));
+    CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
+    CHECK_EQ(fn4::sched_noa(), 2);
+    CHECK(DstSwitches::set("sched_noa", 1));
+    CHECK_EQ(fn4::sched_noa(), 1);
+    CHECK(DstSwitches::set("sched_noa", 0));
+    CHECK_EQ(fn4::sched_noa(), 0);
+    const std::string g = fn4::state_json();
+    CHECK(g.find("\"sched_noa\": 0") != std::string::npos);
+    CHECK(g.find("\"noa\": {\"admitted\": ") != std::string::npos);
+    CHECK(g.find("\"pf_steps_4plus\": ") != std::string::npos);
+    /* No shared step without a span: 1 / 2 refused, 0 accepted. */
+    Fixture h;
+    h.build();
+    CHECK_OK(h.start());
+    CHECK(!fn4::check("sched_noa", 1, &err));
+    CHECK(!fn4::check("sched_noa", 2, &err));
+    CHECK(fn4::check("sched_noa", 0, &err));
+}
+
+/* Beside four decoders and a 40000-token prompt L (D's 2048-row chunks, interleave 8), newcomers of 1100 / 1330 / 4419
+ * tokens arriving during a hold: without NOA (sched_noa 0) D keeps them waiting while L prefills (its chunk fills the
+ * shared budget); with NOA each runs its ALONE pieces (4419: 2048 + 2048 + 323, a fresh prompt under the span floor) in
+ * L's chunk steps from the first one after it arrived, never a step over max_tok; L's chunks and their steps are the same
+ * as without NOA under 3 (the step's first prefill is planned as before), on D's rule under 4 (its grid share may move).
+ * sched_noa 1: one NOA piece a step. */
+TEST(noa_a_newcomer_beside_a_long_prefill_and_decoders_runs_its_alone_pieces) {
+    const auto aL = alone_ck(40000, 0, true);
+    const std::vector<int> lens{ 1100, 1330, 4419 };
+    std::vector<std::vector<Piece>> al;
+    for (int l : lens) al.push_back(alone_ck(l, 0, true));
+    CHECK_EQ(al[2].size(), (size_t)3);
+    CHECK(al[2].size() == 3 && al[2][0].n == 2048 && al[2][1].n == 2048 && al[2][2].n == 323);
+    for (int bic : { 3, 4 }) {
+        const int64_t G = bic == 3 ? 2048 : 1024;
+        NoaCfg c;
+        c.bic = bic;
+        c.lens = lens;
+        c.noa = 0;
+        NoaRun off = noa_run(c);
+        c.noa = 2;
+        NoaRun on = noa_run(c);
+        c.noa = 1;
+        NoaRun one = noa_run(c);
+        REQUIRE(on.ids.size() == 3 && off.ids.size() == 3 && one.ids.size() == 3);
+        const int c1 = (int)on.shape.find('C', (size_t)on.sent);   /* the first chunk step the newcomers can ride */
+        CHECK_EQ(noa_first(on, on.ids[0]), c1);
+        for (size_t k = 0; k < 3; ++k) {
+            /* under 3 alone's pieces exactly; under 4 D's rule (L's grid share leaves room that a 1024 cut may take) */
+            CHECK_EQ(noa_check(on.pieces[on.ids[k]], al[k], G, bic == 3), std::string());
+            CHECK_EQ(noa_check(one.pieces[one.ids[k]], al[k], G, bic == 3), std::string());
+            /* D3 alone: they wait for the whole of L (D4 leaves a 1024-row grid step to a waiting request) */
+            if (bic == 3) CHECK(noa_first(off, off.ids[k]) > noa_last(off, off.p));
+            CHECK(noa_last(on, on.ids[k]) < noa_last(on, on.p));        /* NOA: done while L still prefills */
+            for (const PskPiece& x : on.pieces[on.ids[k]]) CHECK(on.shape[(size_t)x.step] == 'C');   /* beside L's chunk */
+        }
+        CHECK_EQ(noa_check(on.pieces[on.p], aL, G, false), std::string());
+        CHECK_EQ(noa_check(one.pieces[one.p], aL, G, false), std::string());
+        if (bic == 3) {
+            CHECK(noa_same_at_n(on.pieces[on.p], off.pieces[off.p]));
+            CHECK(noa_same_at_n(one.pieces[one.p], off.pieces[off.p]));
+            CHECK_EQ(on.shape.substr(0, (size_t)noa_last(on, on.p)), off.shape.substr(0, (size_t)noa_last(on, on.p)));
+        }
+        CHECK(on.max_step_tok <= 4160 && one.max_step_tok <= 4160 && off.max_step_tok <= 4160);
+        CHECK(on.noa["admitted"] >= 1);
+        CHECK_EQ(on.noa["waited"], (int64_t)0);
+        CHECK_EQ(on.noa["displaced"], (int64_t)0);
+        if (bic == 3) {
+            CHECK_EQ(on.noa["admitted"], (int64_t)3);
+            CHECK_EQ(on.noa["pieces"], (int64_t)5);                 /* 4419's second and third pieces as running prefills */
+            CHECK_EQ(on.noa["rows"], (int64_t)(1100 + 1330 + 4419));
+            CHECK_EQ(on.noa["steps"], (int64_t)5);
+        }
+        CHECK_EQ(off.noa["admitted"] + off.noa["pieces"] + off.noa["rows"] + off.noa["displaced"] + off.noa["waited"] +
+                 off.noa["steps"], (int64_t)0);
+        if (bic == 3) {   /* L's chunk + at most one NOA piece (under 4 a newcomer D admits in L's grid share may ride too) */
+            for (int n : one.pf_entries) CHECK(n <= 2);
+            CHECK_EQ(one.noa["admitted"], (int64_t)3);
+        }
+        CHECK(one.noa["steps"] > 0 && one.noa["pieces"] <= one.noa["steps"]);   /* sched_noa 1: one NOA piece a step */
+    }
+}
+
+/* No decode rows (the r00zzz cells whose decoders had finished: no held step, the bypass never asked): L alone spans
+ * (4096-row pieces); the newcomers arrive after its second piece. Without NOA they wait for the whole of L; with NOA each
+ * runs its alone pieces from the very next step, L keeps D's rule (2048-row cuts while anything else runs, spans again
+ * alone). */
+TEST(noa_a_newcomer_beside_a_long_prefill_without_decode_rows) {
+    const auto aL = alone_ck(40000, 0, true);
+    const std::vector<int> lens{ 1100, 1330, 4419 };
+    NoaCfg c;
+    c.decoders = 0;
+    c.lens = lens;
+    c.after_chunks = 2;
+    c.noa = 0;
+    NoaRun off = noa_run(c);
+    c.noa = 2;
+    NoaRun on = noa_run(c);
+    REQUIRE(on.ids.size() == 3);
+    CHECK_EQ(noa_first(on, on.ids[0]), on.sent);
+    for (size_t k = 0; k < 3; ++k) {
+        CHECK_EQ(noa_check(on.pieces[on.ids[k]], alone_ck(lens[k], 0, true), 2048, true), std::string());
+        CHECK(noa_first(off, off.ids[k]) > noa_last(off, off.p));
+        CHECK(noa_last(on, on.ids[k]) < noa_last(on, on.p));
+    }
+    CHECK_EQ(noa_check(on.pieces[on.p], aL, 2048, false), std::string());
+    CHECK_EQ(noa_check(off.pieces[off.p], aL, 2048, false), std::string());
+    CHECK(on.max_step_tok <= 4160);
+    CHECK_EQ(on.noa["admitted"], (int64_t)3);
+    CHECK_EQ(on.noa["waited"], (int64_t)0);
+    CHECK_EQ(on.noa["displaced"], (int64_t)0);
+}
+
+/* The over-max_tok case: a long conversation's tail (prompt 16500, a hit at 14336 on the resume grid) is ONE alone span
+ * piece of 2164 rows that D cannot cut (16384 leaves 116 < 128 rows); beside L's 2048-row chunk and four decode rows it
+ * is over max_tok (4216 > 4160). NOA counts it waited, and the next step it may act on DISPLACES L's chunk once: the tail
+ * runs as that step's only prefill (D's own rule up to max_tok), L's next chunk one step later and unchanged; L is
+ * displaced once in all. */
+TEST(noa_over_max_tok_displaces_the_long_chunk_once) {
+    const auto aL = alone_ck(40000, 0, true);
+    const auto tail = alone_ck(16500, 14336, true);
+    CHECK_EQ(tail.size(), (size_t)1);
+    CHECK_EQ(tail[0].n, (int64_t)2164);
+    NoaCfg c;
+    c.lens = { 16500 };
+    c.hit = 14336;
+    c.hit_lin = 14336;
+    c.noa = 0;
+    NoaRun off = noa_run(c);
+    c.noa = 2;
+    NoaRun on = noa_run(c);
+    REQUIRE(on.ids.size() == 1);
+    const auto& q = on.pieces[on.ids[0]];
+    CHECK_EQ(noa_check(q, tail, 2048, true), std::string());
+    REQUIRE(!q.empty());
+    CHECK_EQ(q[0].ck, tail[0].ck);
+    CHECK(on.shape[(size_t)q[0].step] == 'D');                  /* L's chunk displaced from that step */
+    CHECK_EQ(on.pf_entries[(size_t)q[0].step], 1);
+    CHECK(q[0].step < noa_last(on, on.p));
+    CHECK(noa_first(off, off.ids[0]) > noa_last(off, off.p));
+    CHECK(noa_same_at_n(on.pieces[on.p], off.pieces[off.p]));   /* L's chunks unchanged, one step later */
+    CHECK_EQ(noa_check(on.pieces[on.p], aL, 2048, false), std::string());
+    CHECK_EQ(on.noa["displaced"], (int64_t)1);
+    CHECK(on.noa["waited"] >= 1);
+    CHECK_EQ(on.noa["admitted"], (int64_t)0);                    /* admitted as the step's only prefill: D's own */
+    CHECK(on.max_step_tok <= 4160);
+    /* The bound: two such tails. Each runs in a displacement step of its own; L is displaced twice in all and runs a chunk
+     * between the two (a displaced prefill is not displaced again before its next chunk). */
+    c.lens = { 16500, 16500 };
+    NoaRun two = noa_run(c);
+    REQUIRE(two.ids.size() == 2);
+    const auto& t0 = two.pieces[two.ids[0]];
+    const auto& t1 = two.pieces[two.ids[1]];
+    REQUIRE(t0.size() == 1 && t1.size() == 1);
+    CHECK_EQ(noa_check(t0, tail, 2048, true), std::string());
+    CHECK_EQ(noa_check(t1, tail, 2048, true), std::string());
+    CHECK(t0[0].step < t1[0].step);
+    CHECK_EQ(two.noa["displaced"], (int64_t)2);
+    int between = 0;
+    for (const PskPiece& x : two.pieces[two.p]) between += x.step > t0[0].step && x.step < t1[0].step ? 1 : 0;
+    CHECK(between >= 1);
+    CHECK(noa_same_at_n(two.pieces[two.p], off.pieces[off.p]));
+    CHECK(two.max_step_tok <= 4160);
+}
+
+/* Several newcomers in one step (the coordinator's c8 turnover wave, no long prompt): six decoders, three 1100-token
+ * newcomers at once. D (sched_noa 0) admits one a step (the shared budget holds one), NOA 1 two, NOA 2 all three in one
+ * step, each its alone piece. CONTROL: under sched_bi_chunk 0 (today's cuts; NOA does not act) the second newcomer gets a
+ * PARTIAL piece beside the first -- the checker must flag it (not alone's pieces). */
+TEST(noa_several_newcomers_share_one_step) {
+    const auto a = alone_ck(1100, 0, true);
+    NoaCfg c;
+    c.L = 0;
+    c.decoders = 6;
+    c.lens = { 1100, 1100, 1100 };
+    c.after_chunks = 0;
+    c.steps = 40;
+    std::map<int, NoaRun> r;
+    for (int n : { 0, 1, 2 }) { c.noa = n; r[n] = noa_run(c); }
+    for (int n : { 0, 1, 2 }) {
+        REQUIRE(r[n].ids.size() == 3);
+        for (uint64_t id : r[n].ids) CHECK_EQ(noa_check(r[n].pieces[id], a, 2048, true), std::string());
+        CHECK(r[n].max_step_tok <= 4160);
+    }
+    const int s0 = noa_first(r[2], r[2].ids[0]);
+    CHECK(noa_first(r[2], r[2].ids[1]) == s0 && noa_first(r[2], r[2].ids[2]) == s0);
+    CHECK_EQ(r[2].pf_entries[(size_t)s0], 3);
+    CHECK_EQ(r[2].noa["pf_steps_3"], (int64_t)1);
+    CHECK_EQ(r[2].noa["admitted"], (int64_t)2);
+    CHECK_EQ(r[2].noa["rows"], (int64_t)2200);
+    CHECK_EQ(r[2].noa["steps"], (int64_t)1);
+    CHECK(noa_first(r[1], r[1].ids[1]) == noa_first(r[1], r[1].ids[0]) && noa_first(r[1], r[1].ids[2]) > noa_first(r[1], r[1].ids[0]));
+    for (int k = 1; k < 3; ++k) CHECK(noa_first(r[0], r[0].ids[(size_t)k]) > noa_first(r[0], r[0].ids[(size_t)k - 1]));
+    for (int n : r[0].pf_entries) CHECK(n <= 1);                 /* D: one newcomer a step */
+    /* the control */
+    c.bic = 0;
+    c.noa = 2;
+    NoaRun t = noa_run(c);
+    REQUIRE(t.ids.size() == 3);
+    int bad = 0;
+    for (uint64_t id : t.ids) bad += noa_check(t.pieces[id], a, 2048, true).empty() ? 0 : 1;
+    CHECK(bad >= 1);
+    CHECK_EQ(t.noa["pieces"], (int64_t)0);
+}
+
+/* PSK design 2 (ds41_psk 2, K 8): every request NOA admits is latched (four decoders, L and the two newcomers: 7) and
+ * every NOA piece is planned with its target (1100: its end; 4419: its end through all three pieces); L's pieces too. */
+TEST(noa_psk_design_2_latches_and_plans_every_noa_piece) {
+    NoaCfg c;
+    c.psk = 2;
+    c.psk_k = 8;
+    c.lens = { 1100, 4419 };
+    NoaRun on = noa_run(c);
+    REQUIRE(on.ids.size() == 2);
+    CHECK_EQ(on.m.psk_latched, (int64_t)7);
+    CHECK_EQ(on.noa["admitted"], (int64_t)2);
+    psk_check_plan(on.pieces[on.ids[0]], psk_targets_of(1100, 8), "noa 1100");
+    psk_check_plan(on.pieces[on.ids[1]], psk_targets_of(4419, 8), "noa 4419");
+    psk_check_plan(on.pieces[on.p], psk_targets_of(40000, 8), "L beside noa");
+    CHECK_EQ(noa_check(on.pieces[on.ids[1]], alone_ck(4419, 0, true), 2048, true), std::string());
+    /* and the same pieces as under ds41_psk 0 */
+    c.psk = 0;
+    NoaRun z = noa_run(c);
+    for (size_t k = 0; k < 2; ++k) CHECK(noa_same_at_n(on.pieces[on.ids[k]], z.pieces[z.ids[k]]));
+    CHECK(noa_same_at_n(on.pieces[on.p], z.pieces[z.p]));
+}
+
+/* With the bypass (sched_short_bypass 1280, sched_bypass_total 4096; held steps): the 1100-token newcomer is bypassed on
+ * the first held step, the 1330 (over N, one alone piece) and the 4419 (over T) are turned away and NOA runs them in L's
+ * next chunk steps, all on alone's pieces; L's chunks as with the bypass alone. */
+TEST(noa_and_the_bypass_compose) {
+    NoaCfg c;
+    c.lens = { 1100, 1330, 4419 };
+    c.bypass = 1280;
+    c.total = 4096;
+    c.noa = 0;
+    NoaRun byp = noa_run(c);
+    c.noa = 2;
+    NoaRun both = noa_run(c);
+    REQUIRE(both.ids.size() == 3);
+    for (size_t k = 0; k < 3; ++k)
+        CHECK_EQ(noa_check(both.pieces[both.ids[k]], alone_ck(c.lens[k], 0, true), 2048, true), std::string());
+    CHECK_EQ(noa_first(both, both.ids[0]), both.sent);           /* the first held step */
+    CHECK_EQ(both.bypassed, (int64_t)1);
+    CHECK_EQ(both.noa["admitted"], (int64_t)2);
+    CHECK(noa_same_at_n(both.pieces[both.p], byp.pieces[byp.p]));
+    CHECK(noa_last(both, both.ids[2]) < noa_last(byp, byp.ids[2]));
+}
+
+/* sched_noa 0 plans as unset under every sched_bi_chunk; 1 / 2 change nothing under 0 / 1 / 2 (NOA acts under D only). */
+TEST(noa_off_and_other_chunkings_plan_as_unset) {
+    for (int bic : { 0, 1, 2, 3, 4 }) {
+        NoaCfg c;
+        c.bic = bic;
+        c.lens = { 1100, 1330, 4419 };
+        c.steps = 120;
+        c.noa = 0;
+        NoaRun z = noa_run(c);
+        for (int n : { 1, 2 }) {
+            if (bic == 3 || bic == 4) continue;
+            c.noa = n;
+            NoaRun r = noa_run(c);
+            CHECK(r.shape == z.shape);
+            for (const auto& kv : z.pieces) CHECK(noa_same_at_n(r.pieces[kv.first], kv.second));
+            CHECK_EQ(r.noa["pieces"] + r.noa["waited"] + r.noa["displaced"], (int64_t)0);
+        }
+        CHECK_EQ(z.noa["pieces"] + z.noa["waited"] + z.noa["displaced"], (int64_t)0);
+    }
+}
+
+/* Preemption: a pool too small for L and a NOA newcomer both. The newcomer (the latest arrival, the back of the running
+ * set) is preempted by L's growth, NOA never preempts (its pieces only take room the pool grants), and the newcomer's
+ * recompute runs on alone's pieces of what it then holds (prompt ++ output) from its restart. */
+TEST(noa_a_preempted_newcomer_restarts_on_alone_pieces) {
+    NoaCfg c;
+    c.lens = { 4419 };
+    c.newc_tok = 600;
+    c.decoders = 1;
+    c.blocks = 2800;
+    c.steps = 400;
+    c.noa = 2;
+    NoaRun on = noa_run(c);
+    REQUIRE(on.ids.size() == 1);
+    const auto& q = on.pieces[on.ids[0]];
+    CHECK(on.m.preemptions >= 1);
+    CHECK(on.noa["admitted"] >= 1);
+    /* split the newcomer's pieces at every restart (a piece at 0 after the first) */
+    std::vector<std::vector<PskPiece>> runs;
+    for (const PskPiece& x : q) {
+        if (x.at == 0 || runs.empty()) runs.emplace_back();
+        runs.back().push_back(x);
+    }
+    CHECK(runs.size() >= 2);
+    for (const auto& rn : runs) {
+        int64_t tot = 0;
+        for (const PskPiece& x : rn) tot += x.n;
+        if (rn.back().at + rn.back().n < 4419) continue;   /* a run the preemption cut short */
+        CHECK_EQ(noa_check(rn, alone_ck(tot, 0, true), 2048, false), std::string());
+    }
+    CHECK_EQ(noa_check(on.pieces[on.p], alone_ck(40000, 0, true), 2048, false), std::string());
+}
+
+/* MIXED steps carrying draft rows (NST 5, eight decoders each verifying 1 + 5 rows: 48 decode rows ahead of L): NOA's room
+ * is max_tok less every planned row, draft rows included, and it plans after the whole running set -- so every step
+ * stays <= max_tok, every decoder keeps its row and its five drafts in every step, the newcomers run their alone pieces
+ * beside L's chunk, L keeps D's rule. */
+TEST(noa_mixed_steps_carrying_draft_rows) {
+    for (int noa : { 0, 2 }) {
+        DstSwitches restore;
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.checkpoint_interval = 2048;
+        f.cfg.prefill_span = 2;
+        f.cfg.prefill_interleave = 8;
+        f.cfg.prefix_exact = true;
+        f.cfg.n_spec = 5;
+        f.cfg.max_seqs = 16;
+        CHECK_OK(f.start());
+        f.sch.set_stage_rows(1024);
+        f.sch.set_span_min(16384);
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        CHECK(DstSwitches::set("sched_noa", noa));
+        std::vector<uint64_t> dec;
+        for (int d = 0; d < 8; ++d) dec.push_back(f.submit(100, 4000));
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        const uint64_t p = f.submit(40000, 2);
+        const std::vector<int> lens{ 1100, 1330, 4419 };
+        std::vector<uint64_t> ids;
+        std::map<uint64_t, std::vector<PskPiece>> pc;
+        int64_t maxtok = 0, short_rows = 0, drafted = 0;
+        int chunks = 0;
+        int32_t draft[5] = { 21, 22, 23, 24, 25 };
+        for (int s = 0; s < 260; ++s) {
+            for (uint64_t id : dec) (void)f.sch.set_draft(id, draft, 5);
+            if (!f.sch.step()) break;
+            const StepPlan& pl = f.sch.plan();
+            maxtok = std::max<int64_t>(maxtok, pl.n_tok);
+            int nd = 0;
+            for (const StepEntry& e : pl.e) {
+                if (e.is_prefill) { pc[e.seq].push_back({ e.ctx_len, e.n_tokens, -1, 0, s }); continue; }
+                for (uint64_t id : dec) if (e.seq == id) { ++nd; drafted += e.n_spec == 5 ? 1 : 0; }
+            }
+            short_rows += nd < 8 ? 1 : 0;
+            bool chunk = false;
+            for (const StepEntry& e : pl.e) chunk = chunk || (e.seq == p && e.is_prefill);
+            f.commit_plain(12);
+            chunks += chunk ? 1 : 0;
+            if (chunks == 1 && ids.empty()) for (int l : lens) ids.push_back(f.submit(l, 4));
+        }
+        REQUIRE(ids.size() == 3);
+        CHECK(maxtok <= 4160);
+        CHECK_EQ(short_rows, (int64_t)0);                         /* every decoder planned in every step */
+        CHECK(drafted > 0);
+        CHECK_EQ(noa_check(pc[p], alone_ck(40000, 0, true), 2048, false), std::string());
+        if (noa == 2)
+            for (size_t k = 0; k < 3; ++k) {
+                CHECK_EQ(noa_check(pc[ids[k]], alone_ck(lens[k], 0, true), 2048, true), std::string());
+                REQUIRE(!pc[ids[k]].empty());
+                CHECK(pc[ids[k]].back().step < pc[p].back().step);
+            }
+    }
+}
