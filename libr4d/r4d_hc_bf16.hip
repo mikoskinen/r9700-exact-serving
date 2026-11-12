@@ -2513,7 +2513,7 @@ __device__ __forceinline__ void hc_read_g16_down_body(
  * half the h reads), the two tiles' WMMAs fed by the same A fragments. Per tile the arithmetic is G16's (the same chunk
  * order, the same group-scale folds, the same wave and stream sums), so every row's bytes are G16's = form G's. The inject
  * tile (bf16 gains) keeps a block of its own: blocks p < ntd / 2 take tiles 2p, 2p + 1; block ntd / 2 the inject tile. */
-template <int RG, bool CH>
+template <int RG, bool CH, bool PRE = false>
 __device__ __forceinline__ void hc_read_g16p_down_body(
     const unsigned short* __restrict__ h, const float* __restrict__ w,
     const unsigned char* __restrict__ downv, long dld, const unsigned short* __restrict__ injw,
@@ -2574,26 +2574,33 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
     for (int p = 0; p < kHcGPer; ++p) sW[tid + p * kThreads] = w[(long)c * kHcGN + tid + (long)p * kThreads];
     if constexpr (CH) r4d_chain_wait();
 
+    /* ---- the grouped norm: G16's (= form G's) sums; PRE (hc_readv bit 9): already in scaleout, from hc_g_scale_kernel's
+     * same sums, read back instead of one pass a block */
+    if constexpr (PRE) {
+        if (tid < RG) s_scale[tid] = scaleout[(long)(tid < rr ? tid : rr - 1) * kHcMax + c];
+        __syncthreads();
+    } else {
     /* ---- the grouped norm: G16's (= form G's) sums */
-    for (int r = 0; r < RG; ++r) {
-        const unsigned short* hr = h + (long)(r < rr ? r : rr - 1) * hrow + (long)c * kHcGN;
-        uint32_t hv[kHcGPer];
-#pragma unroll
-        for (int p = 0; p < kHcGPer; ++p) hv[p] = bfw(hr + tid + (long)p * kThreads);
-        float acc = 0.0f;
-#pragma unroll
-        for (int p = 0; p < kHcGPer; ++p) { const float v = bfw_f(hv[p]); acc += v * v; }
-        acc = wave_sum(acc);
-        if (lane == 0) s_part[wave][r] = acc;
+        for (int r = 0; r < RG; ++r) {
+            const unsigned short* hr = h + (long)(r < rr ? r : rr - 1) * hrow + (long)c * kHcGN;
+            uint32_t hv[kHcGPer];
+    #pragma unroll
+            for (int p = 0; p < kHcGPer; ++p) hv[p] = bfw(hr + tid + (long)p * kThreads);
+            float acc = 0.0f;
+    #pragma unroll
+            for (int p = 0; p < kHcGPer; ++p) { const float v = bfw_f(hv[p]); acc += v * v; }
+            acc = wave_sum(acc);
+            if (lane == 0) s_part[wave][r] = acc;
+        }
+        __syncthreads();
+        if (tid < RG) {
+            float ss = 0.0f;
+            for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
+            s_scale[tid] = __frsqrt_rn(ss / (float)kHcGN + eps);
+            if (pb == 0 && scaleout && tid < rr) scaleout[(long)tid * kHcMax + c] = s_scale[tid];
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    if (tid < RG) {
-        float ss = 0.0f;
-        for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
-        s_scale[tid] = __frsqrt_rn(ss / (float)kHcGN + eps);
-        if (pb == 0 && scaleout && tid < rr) scaleout[(long)tid * kHcMax + c] = s_scale[tid];
-    }
-    __syncthreads();
 
     const int  rowl = col < rr ? col : rr - 1;
     const float scl = s_scale[rowl];
@@ -2718,6 +2725,46 @@ __device__ __forceinline__ void hc_read_g16p_down_body(
         __syncthreads();
         if (tid == 0) __hip_atomic_store(&tctr[tt[u]], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
+}
+/* fn4 BI (hc_readv bit 9): form G's per-row norm scales once a (stream, 16-row group), for G16p's PRE form -- the same
+ * thread mapping (ten elements a thread in order), the wave sum, the waves in order, the same __frsqrt_rn. */
+__global__ __launch_bounds__(kThreads)
+void hc_g_scale_kernel(const unsigned short* __restrict__ h, float* __restrict__ scaleout, long hrow, float eps, long rows) {
+    __shared__ float s_part[kWaves][16];
+    const int tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+    const int c = (int)blockIdx.x;
+    const long r0 = (long)blockIdx.y * 16;
+    const int  rr = (int)(rows - r0 < 16 ? rows - r0 : 16);
+    h += r0 * hrow;
+    for (int r = 0; r < rr; ++r) {
+        const unsigned short* hr = h + (long)r * hrow + (long)c * kHcGN;
+        uint32_t hv[kHcGPer];
+#pragma unroll
+        for (int p = 0; p < kHcGPer; ++p) hv[p] = bfw(hr + tid + (long)p * kThreads);
+        float acc = 0.0f;
+#pragma unroll
+        for (int p = 0; p < kHcGPer; ++p) { const float v = bfw_f(hv[p]); acc += v * v; }
+        acc = wave_sum(acc);
+        if (lane == 0) s_part[wave][r] = acc;
+    }
+    __syncthreads();
+    if (tid < rr) {
+        float ss = 0.0f;
+        for (int k = 0; k < kWaves; ++k) ss += s_part[k][tid];
+        scaleout[(r0 + tid) * kHcMax + c] = __frsqrt_rn(ss / (float)kHcGN + eps);
+    }
+}
+template <int RG>
+__global__ __launch_bounds__(kThreads)
+void hc_read_g16pp_down_kernel(const unsigned short* __restrict__ h, const float* __restrict__ w,
+                               const unsigned char* __restrict__ downv, long dld,
+                               const unsigned short* __restrict__ injw,
+                               unsigned short* __restrict__ dout, unsigned short* __restrict__ inj,
+                               float* __restrict__ scaleout, float* __restrict__ part,
+                               unsigned int* __restrict__ tctr, long lr, long hrow, long irow,
+                               float eps, float wadd, int ntd, long rows) {
+    hc_read_g16p_down_body<RG, false, true>(h, w, downv, dld, injw, dout, inj, scaleout, part, tctr, lr,
+                                            hrow, irow, eps, wadd, ntd, rows);
 }
 template <int RG>
 __global__ __launch_bounds__(kThreads)
@@ -4044,7 +4091,7 @@ static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 511) : 0;
+        const int on = (e && *e) ? (std::atoi(e) & 1023) : 0;
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
@@ -7489,6 +7536,18 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
 #undef HC_S_K
     } else if (bidec && !bidec_r && !(g_hc_pf2_stages.load(std::memory_order_relaxed) & 2)) {
         /* fn4 test hook (r4d_hc_pf2_stages, timing only): under bi_dec, mask bit 1 off skips kernel A' (G / G16 / G16p) */
+    } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && !hcg_ch) {
+        /* fn4 hc_readv bit 9 (with 8): the norm scales once a (stream, group), then G16p reading them */
+        emit_rc = R4D_EMIT(s, &hc_g_scale_kernel, dim3((unsigned)hc, (unsigned)hcg_gy), dim3(kThreads), 0,
+                           (const unsigned short*)h->data, scale, (long)hrow, eps, (long)rows);
+        if (emit_rc == RAD_OK)
+            emit_rc = R4D_EMIT(s, &hc_read_g16pp_down_kernel<16>,
+                               dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
+                               (const unsigned short*)h->data, (const float*)w->data,
+                               (const unsigned char*)down->data, (long)dld,
+                               (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
+                               scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
+                               (int)hcg_nt, (long)rows);
     } else if (hcg && g16 && (hc_readv() & 256) != 0 && (hcg_nt % 2) == 0) {
         /* fn4 hc_readv bit 8: G16 with two tiles a block (and the inject tile alone) */
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16> : &hc_read_g16p_down_kernel<16>),
@@ -7614,7 +7673,7 @@ extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_write_vec(int on) { g_hc_write_vec.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
-extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 511), std::memory_order_relaxed); }
+extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 1023), std::memory_order_relaxed); }
 /* Test hook (r4d_selftest, fn4): frees this device's mix-counter slots. hc_mix_ctr keeps four
  * streams a device and never frees a slot, so a test that makes a stream a case runs out after four
  * and every later case takes the unfused up product (and no decode form G / S) -- the stock and the
@@ -7643,7 +7702,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 511) return -1;   /* bit 6: hc_bi 5's 16-row form G (G16); bit 7: the PF2 column split; bit 8: G16 two tiles a block */
+        if (value < 0 || value > 1023) return -1;   /* bit 6: G16; bit 7: the PF2 column split; bit 8: G16 two tiles a block; bit 9: + scales once */
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }
