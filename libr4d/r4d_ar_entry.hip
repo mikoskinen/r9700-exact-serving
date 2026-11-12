@@ -983,7 +983,7 @@ extern "C" int r4d_rad_ar_oneshot_3rank_exact(const RadArgs* a, RadStream s) {
  * bytes (its pushes go to one peer after another). A launch parameter `xpush` overrides it (r4d_selftest --perfar4).
  * -1 until the environment is read. */
 static std::atomic<int> g_ar_xpush{-1};
-static int ar_xpush(const RadArgs* a) {
+static int ar_xpush(const RadArgs* a, long long numel) {
     int v = g_ar_xpush.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_AR_XPUSH");
@@ -992,7 +992,9 @@ static int ar_xpush(const RadArgs* a) {
         g_ar_xpush.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_ar_xpush.load(std::memory_order_relaxed);
     }
-    return (int)r4d_geti_or(a, "xpush", v);
+    /* prefill messages only (202 / 204: at decode heights the interleave was 0.8 us slower): from the fence rule's
+     * 131072 elements, which lies above every decode and verify height and below every prefill piece */
+    return numel >= 131072 ? (int)r4d_geti_or(a, "xpush", v) : 0;
 }
 extern "C" int r4d_ar_xpush_set(int on) {
     if (on < 0 || on > 1) return -1;
@@ -1029,7 +1031,7 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
                                        c.inp, c.out, c.numel, in->dtype, in->rank,
                                        (long)(uintptr_t)s, nb, c.nthreads, c.drain, c.acq,
                                        c.pub, early, early ? in->gate_ctr : 0L,
-                                       ar_chain(a, c.numel), ar_xpush(a) ? (long)R4D_AR8_FORM_XPUSH : 0L,
+                                       ar_chain(a, c.numel), ar_xpush(a, c.numel) ? (long)R4D_AR8_FORM_XPUSH : 0L,
                                        r4d_geti_or(a, "timeline", 0)));
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
@@ -1126,7 +1128,8 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                              in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                              c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s,
                                              4, 1024, c.drain, c.acq, c.pub, early,
-                                             early ? in->gate_ctr : 0L, ar_chain(a, c.numel)));
+                                             early ? in->gate_ctr : 0L, ar_chain(a, c.numel),
+                                             ar_xpush(a, c.numel) ? 1L : 0L));
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
     /* The kernel ends the hold after its second handshake (its reduce is fused with the phase-2
@@ -1139,7 +1142,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
                                    c.pub, early, early ? in->gate_ctr : 0L,
-                                   ar_chain(a, c.numel), ar_xpush(a) ? (long)R4D_AR8_FORM_XPUSH : 0L,
+                                   ar_chain(a, c.numel), ar_xpush(a, c.numel) ? (long)R4D_AR8_FORM_XPUSH : 0L,
                                    r4d_geti_or(a, "timeline", 0)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
@@ -1342,7 +1345,7 @@ static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
                              in->my_scratch, in->my_flags, in->my_seq, in->slot_bytes,
                              c.inp, rows, (long)row, in->dtype, in->rank,
                              (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                             c.pub, early, early ? in->gate_ctr : 0L, op == 3 && ar_xpush(a) ? 1L : 0L));
+                             c.pub, early, early ? in->gate_ctr : 0L, op == 3 && ar_xpush(a, c.numel) ? 1L : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 extern "C" int r4d_rad_ar_rs_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 0); }

@@ -30396,6 +30396,10 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
         want.push_back({ "ar_twoshot_4rank_exact", -1, fmt("AR two-shot exact xpush drain %d", d), 1, cat({ PI("xpush", 1) }, dr(d)) });
     }
     want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR coded exact (lane, 4x1024)", 1, { PI("overlap", 1) } });
+    want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR coded exact (lane) xpush", 1, { PI("overlap", 1), PI("xpush", 1) } });
+    want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR lane plain (coded 0)", 1, { PI("overlap", 1), PI("coded", 0) } });
+    want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR lane plain (coded 0) xpush", 1,
+                     { PI("overlap", 1), PI("coded", 0), PI("xpush", 1) } });
     want.push_back({ "ar_oneshot_4rank_exact", -1, "AR one-shot exact (ts_min 0)", 0, { PI("ts_min", 0) } });
     want.push_back({ "ar_twoshot_4rank_ti8", -1, "AR two-shot ti8 (lossy)", 1, {} });
     want.push_back({ "sp_rs_rows_4rank_ti8", 1, "SP RS raw", 2, {} });
