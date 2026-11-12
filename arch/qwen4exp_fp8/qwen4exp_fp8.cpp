@@ -2359,7 +2359,10 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch); }
         else        l.gdn.step(c, batch);
         bt_blk(c, m, l, T, (int)li);
-        bt_pt(c, m, m.a_x.x, 0, T, "blk", (int)li);
+        /* fn4 tracer (13.11., 222): where the next write takes the all-reduce (four ranks, <= arw_rows rows: ar_hc_write) a_x.x
+         * holds this rank's PARTIAL, else the reduced sum -- named apart ("blkp" / "moep") so an alone step and a wider one are
+         * never compared across the two meanings; the write's output (h_mix / h_ffn) is the comparable point. */
+        bt_pt(c, m, m.a_x.x, 0, T, l.hc_mix.takes_ar(T) ? "blkp" : "blk", (int)li);
         const bool ss_mix = l.hc_mix.write(c, T, 0, T);
         bt_pt(c, m, m.b_h, 0, T, "h_mix", (int)li);
         dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
@@ -2367,7 +2370,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         bt_rd(c, m, 0, T, "rd_ffn", (int)li, true);
         l.mlp.step(c, batch);
         bt_moe(c, m, T, (int)li);
-        bt_pt(c, m, m.a_x.x, 0, T, "moe", (int)li);
+        bt_pt(c, m, m.a_x.x, 0, T, l.hc_ffn.takes_ar(T) ? "moep" : "moe", (int)li);
         ss_ok = l.hc_ffn.write(c, T, 0, T);
         /* The request's control vector, on the stream the write just finished. */
         if (l.proj.step(c, batch, 0, T)) ss_ok = false;
