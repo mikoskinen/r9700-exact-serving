@@ -394,6 +394,23 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             p["plan_mismatch"] = pl[5];
             o["psk"] = std::move(p);
         }
+        /* Lever E1 (ds41-e1): live, cumulative, the plugin's (rank 0): Engram layer passes deduplicated, rows not looked up /
+         * copied / multiplied in them, rows pooled in them, layer passes kept whole by the 48-row guard, below the repeat
+         * share, with no launch above the band, and steps with a deduplicated layer. All 0 with lever E1 unset, 0 or not
+         * served. */
+        {
+            int64_t e[7];
+            fn4::engdd_stats(e);
+            json d;
+            d["passes"] = e[0];
+            d["rows_deduped"] = e[1];
+            d["rows_pooled"] = e[2];
+            d["guard48"] = e[3];
+            d["low_share"] = e[4];
+            d["steps"] = e[5];
+            d["no_pool"] = e[6];
+            o["engdd"] = std::move(d);
+        }
         /* Why snapshots went and why hits reused nothing: on a hybrid model these say why a
          * long prompt was prefilled again. `hit_cut_tokens` is the checkpoint shortfall,
          * prompt tokens the attention cache held and admission computed again. */

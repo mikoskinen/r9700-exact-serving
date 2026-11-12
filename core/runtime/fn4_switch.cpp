@@ -27,13 +27,13 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "dspark_walk", "ds41_bi", "draft_sample", "draft_lend_hyst", "arena_d0",
                                         "draft_lend_w", "draft_occ", "draft_occ_k", "place_lf", "sched_bi_chunk",
                                         "sched_interleave", "sched_mixed_tok", "sched_short_bypass",
-                                        "sched_bypass_total", "ds41_psk", "ds41_psk_k" };
+                                        "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_engdd" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
            i == kDs41OneFill || i == kDrafterMx || i == kDrafterBf ||
            i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk ||
-           i == kDs41Bi || i == kDs41Psk;
+           i == kDs41Bi || i == kDs41Psk || i == kDs41Engdd;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -44,6 +44,7 @@ struct Hooks {
     /* lever PSK design 2 (deepseek41's rad_psk_plan), absent elsewhere */
     int (*psk_plan)(int, long long, int, const int32_t*, const int32_t*) = nullptr;
     int (*psk_stats)(long long*, int) = nullptr;   /* its live counters (ds41-int7-pskglue) */
+    int (*engdd_stats)(long long*, int) = nullptr; /* lever E1's live counters (deepseek41's rad_engdd_stats, ds41-e1) */
 };
 
 struct State {
@@ -138,6 +139,7 @@ void find_hooks(State& s) {
             k.value = sym<int (*)(const char*, int*)>(h, "rad_fn4_value");
             k.psk_plan = sym<int (*)(int, long long, int, const int32_t*, const int32_t*)>(h, "rad_psk_plan");
             k.psk_stats = sym<int (*)(long long*, int)>(h, "rad_psk_stats");
+            k.engdd_stats = sym<int (*)(long long*, int)>(h, "rad_engdd_stats");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -393,6 +395,21 @@ int psk_stats(int64_t out[6]) {
     return 0;
 }
 
+int engdd_stats(int64_t out[7]) {
+    for (int i = 0; i < 7; ++i) out[i] = 0;
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    for (const Hooks& k : s.hooks)
+        if (k.engdd_stats) {
+            long long v[7] = { 0, 0, 0, 0, 0, 0, 0 };
+            const int n = k.engdd_stats(v, 7);
+            for (int i = 0; i < n && i < 7; ++i) out[i] = (int64_t)v[i];
+            return n;
+        }
+    return 0;
+}
+
 int psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows) {
     State& s = st();
     std::lock_guard<std::mutex> lk(s.mu);
@@ -412,7 +429,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, "
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
-                        "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, epoch_bump)";
+                        "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_engdd, epoch_bump)";
         return false;
     }
     State& s = st();

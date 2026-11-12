@@ -237,6 +237,12 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
         CHECK(s["psk"].contains(k));
         CHECK_EQ(s["psk"].value(k, (int64_t)-1), (int64_t)0);
     }
+    /* lever E1's live counters (ds41-e1): present, and 0 with no plugin serving them */
+    REQUIRE(s.contains("engdd"));
+    for (const char* k : { "passes", "rows_deduped", "rows_pooled", "guard48", "low_share", "steps", "no_pool" }) {
+        CHECK(s["engdd"].contains(k));
+        CHECK_EQ(s["engdd"].value(k, (int64_t)-1), (int64_t)0);
+    }
     REQUIRE(s["draft_positions"].size() == 2);
     CHECK_NEAR(s["draft_positions"][1]["rate"].get<double>(), 0.25, 1e-12);
     CHECK_EQ(s["draft_positions"][1]["reached"].get<int64_t>(), (int64_t)8);

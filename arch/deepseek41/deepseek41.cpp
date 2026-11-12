@@ -26,6 +26,7 @@
 #include <arch/rad_block_moe_fp8.h>
 #include <arch/rad_deepseek41_chat.h>
 
+#include "ds41_engram_dedup.h"
 #include "ds41_index_split.h"
 #include "ds41_walk_geom.h"
 #include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
@@ -311,6 +312,12 @@ struct Layer {
     /* This Engram layer's row ids [T, heads]: one buffer a layer, since step() writes every
      * layer's ids before the first block runs (see there). */
     rad_buf ids = 0;
+    /* Lever E1 (RADIANCE_DS41_ENGDD declared): the lookup over the compact ids `edd_ids` ([T, heads] i32, host), the kv
+     * GEMM into Model::ekv_u, the gather of every pooled row's kv row from it through `edd_map` ([T] i32, host). Both
+     * written by the plugin at issue and persistent, one a layer: a layer's gather (and a lookup the card ran) may still
+     * be queued when the next layer's are written. 0 where not declared. */
+    rad_op e_emb_dd = 0, e_gemm_u = 0, e_scat = 0;
+    rad_buf edd_ids = 0, edd_map = 0;
     rad_op mix_a = 0, col_a = 0, norm_a = 0;
     rad_op q_a = 0, q_an = 0, q_b = 0, q_rope = 0;
     rad_op kv_g = 0, kv_n = 0, kv_rope = 0, kv_q = 0, kv_st = 0;
@@ -544,6 +551,13 @@ struct Model {
             ik = 0, ikn = 0;
     rad_buf iq = 0, iw = 0, score = 0, keep = 0, sel = 0, cs_a = 0, cs_b = 0;
     rad_buf ctok = 0, emb = 0, embd = 0, ekv = 0;
+    /* Lever E1: the unique rows' kv [T, (hc + 1) D]; `edd_ev` recorded behind the step's ngram_ids (the host reads the
+     * ids once it completed), `edd_rec` / `edd_synced` this step's record and wait, `edd_counted` the step counted. */
+    rad_buf ekv_u = 0;
+    RadEvent edd_ev = nullptr;
+    bool edd_rec = false, edd_synced = false, edd_counted = false;
+    ds41_engdd::Plan edd_plan;
+    std::vector<ds41_engdd::Launch> edd_ls;
     rad_buf final_hidden = 0, logit_input = 0, logits = 0;
     ActFP8 act{};
     MoeFP8::Wire mw{};
@@ -1226,6 +1240,39 @@ static int32_t psk_ahead(const PskPlan* p, size_t i) {
     if (p && i < p->ahead.size() && p->ahead[i] != kPskNoHint) return p->ahead[i];
     return g_sw_psk.load(std::memory_order_relaxed) >= 1 ? 0 : kPskNoHint;
 }
+/* Lever E1 (ds41-e1, 12.11.2026; audit lever 5): an Engram layer's lookup, copy and kv GEMM over a step's UNIQUE n-gram
+ * id rows, every row's kv row then gathered from its unique row (ds41_engram_dedup.h: why it is exact, the plan, the
+ * 48-row guard). Switch "ds41_engdd" (fn4): 1 = deduplicate a step with a prefill sequence (a pass with no prefill
+ * sequence, the drafter's passes and every launch of <= 48 rows are issued as today), 0 = today's issue.
+ * RADIANCE_DS41_ENGDD=0 / off declares it and starts at 0, 1 / on at 1; unset declares nothing (1 refused, the program
+ * and the issue are today's). Declared: per Engram layer a second lookup (the compact ids), a GEMM into a scratch plane
+ * (engram_kv_u) and a gather_rows back into engram_kv; host buffers for the compact ids and each layer's map. A pass it
+ * may act on is not recorded (rad_arch_pass_key): its row counts come from the step's ids. `_ok`: a declare had it. */
+static std::atomic<int> g_sw_engdd{0}, g_sw_engdd_ok{0}, g_sw_engdd_env{-2};   /* env: -2 unread, -1 unset */
+/* Live counters (/stats "engdd", rad_engdd_stats; rank 0's): Engram layer passes deduplicated, rows not looked up /
+ * copied / multiplied, rows pooled in those passes, layer passes the 48-row guard kept whole, layer passes below the
+ * repeat share, steps with a deduplicated layer, passes with no launch above the band. */
+static std::atomic<long long> g_edd_passes{0}, g_edd_rows{0}, g_edd_pooled{0}, g_edd_guard{0}, g_edd_low{0}, g_edd_steps{0},
+    g_edd_nopool{0};
+static void engdd_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_ENGDD");
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+    if (g_sw_engdd_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_engdd.store(v, std::memory_order_relaxed);
+        if (e && v < 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_ENGDD=%s is not 0 / off or 1 / on: lever E1 is not declared\n", e);
+    }
+}
+static bool engdd_declared() { return g_sw_engdd_env.load(std::memory_order_relaxed) >= 0; }
+/* A pass lever E1 may deduplicate: the switch on where declared, a trunk pass with a prefill sequence wider than the band
+ * (decode / verify passes keep today's issue and their recordings). The same test keys the pass (rad_arch_pass_key). */
+static bool engdd_may_act(const RadBatch* b) {
+    return b && g_sw_engdd.load(std::memory_order_relaxed) >= 1 && g_sw_engdd_ok.load(std::memory_order_relaxed) &&
+           b->draft_pass == 0 && b->n_tok > ds41_engdd::kFormRows && b->n_seq > b->n_seq_decode && !b->enc && !b->gen;
+}
+
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -1253,6 +1300,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_psk"))
         return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ||
                ((value == 2 || value == 3) && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_engdd"))
+        return value == 0 || (value == 1 && g_sw_engdd_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -1264,6 +1313,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "dspark_walk")) g_sw_walk.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_bi")) g_sw_bi.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_psk")) g_sw_psk.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_engdd")) g_sw_engdd.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1289,6 +1339,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_psk")) {
         *applied = g_sw_psk.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_engdd")) {
+        *applied = g_sw_engdd.load(std::memory_order_relaxed);
         return 1;
     }
     if (!std::strcmp(name, "dspark_walk")) {
@@ -1604,6 +1658,8 @@ static int buffers(RadBuilder* b, Model& m) {
                        RAD_BUF_TRANSIENT, RAD_DOMAIN_HOST);
         m.embd = bf("engram_rows_dev", { T, c.ple_heads * c.ple_dim });
         m.ekv = bf("engram_kv", { T, (c.hc + 1) * D });
+        /* lever E1 (RADIANCE_DS41_ENGDD declared): the unique rows' kv plane (the layers declare their compact ids and maps) */
+        if (engdd_declared()) m.ekv_u = bf("engram_kv_u", { T, (c.hc + 1) * D });
     }
     /* The routed FFN's wires (rad_block_moe_fp8.h), bf16 throughout. */
     /* bf16 linears: each ActFP8 carries only its activation (`x`); the plugin norms the FFN input
@@ -1647,6 +1703,7 @@ static int buffers(RadBuilder* b, Model& m) {
             { m.kvn, c.head_dim }, { m.o, HD }, { m.oa, m.gr * c.o_rank }, { m.attn_out, D }, { m.kvs, 2 * c.head_dim },
             { m.iq, c.ih * c.idim }, { m.iw, c.ih }, { m.sel, c.itopk }, { m.act.x, D }, { m.final_hidden, D },
             { m.embd, c.ple_heads * c.ple_dim }, { m.ekv, (c.hc + 1) * D }, { m.ctok, 1 }, { m.iqr_q8, QK },
+            { m.ekv_u, (c.hc + 1) * D },
             { m.iqr_s8, fp8_blocks(QK) }, { m.mw.sgate, 1 } };
         for (const auto& e : bp)
             if (e.first) m.bp[e.first] = e.second;
@@ -1831,11 +1888,40 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                          { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim),
                            RAD_INT("n_vocab", c.ple_rows), RAD_STR("dtype", "bf16") },
                          { m.ple_table }, { L.ids }, { m.emb });
+        /* Lever E1: the same lookup over the layer's compact ids, declared before the copy so the rows' plane stays live
+         * from it to the copy (the order engdd_issue issues them in). Only for a GGUF-block kv weight (gemm_nt_ggml: the
+         * per-row form above the band ds41_engram_dedup.h rests on). */
+        const bool edd = m.ekv_u && m.wty.count(L.e_kv) && !m.wsc.count(L.e_kv);
+        if (edd) {
+            L.edd_ids = decl_b(b, nm.f("blk.%d.engram_ids_dd", l), RAD_I32, { T, H }, RAD_BUF_PERSIST, RAD_DOMAIN_HOST);
+            if (L.edd_ids) m.bp[L.edd_ids] = H;
+            if (m.ple_group > 0)
+                L.e_emb_dd = op(b, "embed_lookup_planes",
+                                { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim), RAD_INT("n_vocab", c.ple_rows),
+                                  RAD_INT("group", m.ple_group), RAD_STR("dtype", "bf16") },
+                                m.ple_tab ? std::vector<rad_weight>{ m.ple_codes, m.ple_scale, m.ple_tab }
+                                          : std::vector<rad_weight>{ m.ple_codes, m.ple_scale },
+                                { L.edd_ids }, { m.emb });
+            else
+                L.e_emb_dd = op(b, "embed_lookup",
+                                { RAD_RANGE("M", 1, T * H), RAD_INT("n_embd", c.ple_dim), RAD_INT("n_vocab", c.ple_rows),
+                                  RAD_STR("dtype", "bf16") },
+                                { m.ple_table }, { L.edd_ids }, { m.emb });
+        }
         L.e_copy = op(b, "cast",
                       { RAD_RANGE("M", 1, T), RAD_INT("n", H * c.ple_dim), RAD_STR("from", "bf16"),
                         RAD_STR("to", "bf16") },
                       {}, { m.emb }, { m.embd });
         L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.embd, m.ekv);
+        /* Lever E1: the GEMM over the unique rows into engram_kv_u, then every pooled row's kv row gathered from it
+         * (gather_rows, a byte copy) through this layer's map */
+        if (edd) {
+            L.edd_map = decl_b(b, nm.f("blk.%d.engram_dd_map", l), RAD_I32, { T }, RAD_BUF_PERSIST, RAD_DOMAIN_HOST);
+            if (L.edd_map) m.bp[L.edd_map] = 1;
+            L.e_gemm_u = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.embd, m.ekv_u);
+            L.e_scat = op(b, "gather_rows", { RAD_RANGE("M", 1, T), RAD_INT("n", (c.hc + 1) * D), RAD_STR("dtype", "bf16") },
+                          {}, { m.ekv_u, L.edd_map }, { m.ekv });
+        }
         L.e_gate_op = op(b, "stream_gate_add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc),
                            RAD_F64("eps", c.eps), RAD_F64("gate_eps", 1e-6),
@@ -2980,6 +3066,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
 static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI's tracer, below */
 static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lever PSK, below */
 static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI, below */
+static void engdd_declare(Model& m, const RadBuildCtx* ctx);               /* lever E1, below */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -3008,6 +3095,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     walk_read_env();
     bi_read_env();
     psk_read_env();
+    engdd_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3359,6 +3447,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     DS_TRY(bi_declare(b, m, ctx));
     DS_TRY(psk_declare(b, m, ctx));
+    engdd_declare(m, ctx);
     DS_TRY(bt_declare(b, m, ctx));
     return RAD_OK;
 }
@@ -3454,6 +3543,36 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 (long long)(kPskBase + (c.n_layer - 1 - first) * c.window), (long long)c.n_layer - 1, (long long)kPskBase,
                 last);
     return RAD_OK;
+}
+
+/* Lever E1 at the end of a declare (RADIANCE_DS41_ENGDD set): every Engram layer declared its deduplicated ops (layer():
+ * a GGUF-block kv weight), else the lever is not available here (1 refused, the switch reads 0). */
+static void engdd_declare(Model& m, const RadBuildCtx* ctx) {
+    if (!engdd_declared() || ctx->shape_probe) return;
+    int n = 0, want = 0;
+    for (const Layer& L : m.layers) {
+        if (!L.e_ids) continue;
+        ++want;
+        n += L.e_emb_dd && L.e_gemm_u && L.e_scat && L.edd_ids && L.edd_map ? 1 : 0;
+    }
+    const bool ok = want > 0 && n == want && m.ekv_u;
+    if (!ok) {
+        g_sw_engdd.store(0, std::memory_order_relaxed);
+        if (ctx->rank == 0)
+            fprintf(stderr, "radiance: deepseek41: lever E1 not declared: %d of %d Engram layers have a GGUF-block kv weight "
+                            "(gemm_nt_ggml) -- the switch stays 0\n", n, want);
+        return;
+    }
+    g_sw_engdd_ok.store(1, std::memory_order_relaxed);
+    if (ctx->rank == 0)
+        fprintf(stderr, "radiance: deepseek41: lever E1 declared (RADIANCE_DS41_ENGDD, fn4 ds41_engdd, now %d): the Engram "
+                        "lookup / copy / kv GEMM (%lld x %lld) of a step with a prefill sequence over its unique n-gram id "
+                        "rows at %d Engram layer(s), then gather_rows back; launches of <= %lld rows as today, and none "
+                        "when the unique rows would be <= %lld or fewer than 1/%lld of the pooled rows repeat; such a pass "
+                        "is not recorded\n",
+                g_sw_engdd.load(std::memory_order_relaxed), (long long)((m.c.hc + 1) * m.c.n_embd),
+                (long long)(m.c.ple_heads * m.c.ple_dim), want, (long long)ds41_engdd::kFormRows,
+                (long long)ds41_engdd::kFormRows, (long long)ds41_engdd::kMinShareDiv);
 }
 
 static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
@@ -3846,6 +3965,93 @@ static bool psk_step_ok(const Model& m, const RadBatch* b, int64_t prefill_seqs,
            prefill_seqs > 0 && b->n_out <= decode_rows + prefill_seqs;
 }
 
+/* Lever E1: the core's rad_dev_host_wrote (core/device/device.h; the radiance binary exports it): the host wrote memory a
+ * kernel issued after it reads, with no host wait between -- the next dispatch on every queue acquires at system scope.
+ * Weak: a host without it (a test loading the plugin) runs on, and lever E1 then relies on the host lookup's own call. */
+extern "C" __attribute__((weak)) void rad_dev_host_wrote(void);
+
+/* Lever E1: behind the step's ngram_ids (both step paths, before the blocks), the event the host waits on before it reads
+ * the ids (engdd_issue) -- on a pass lever E1 may act on only. */
+static void engdd_mark(RadCtx* x, Model& m, const RadBatch* batch) {
+    m.edd_rec = m.edd_synced = m.edd_counted = false;
+    if (!engdd_may_act(batch)) return;
+    if (!m.edd_ev && rad_event_create(&m.edd_ev) < 0) {
+        m.edd_ev = nullptr;
+        return;
+    }
+    m.edd_rec = rad_event_record(m.edd_ev, rad_stream(x)) >= 0;
+}
+
+/* Lever E1: layer L's Engram lookup, copy and kv GEMM over the step's unique id rows, when its plan deduplicates
+ * (ds41_engram_dedup.h); false = nothing issued, the caller issues today's. `ls`: today's kv GEMM launches over the
+ * layer's T rows. The ids are read on the host once the event behind the step's ngram_ids completed -- the point the
+ * host lookup joins on today -- and the compact ids and the map are written before anything that reads them is issued. */
+static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, int64_t T,
+                        const std::vector<ds41_engdd::Launch>& ls) {
+    using namespace ds41_engdd;
+    if (!m.edd_rec || !L.e_emb_dd || !L.e_gemm_u || !L.e_scat || !L.edd_ids || !L.edd_map || !engdd_may_act(batch))
+        return false;
+    const auto& c = m.c;
+    const int64_t H = c.ple_heads;
+    if (!m.edd_synced) {
+        if (rad_event_sync(m.edd_ev) < 0) {
+            m.edd_rec = false;
+            return false;
+        }
+        m.edd_synced = true;
+    }
+    const int32_t* ids = static_cast<const int32_t*>(rad_buf_ptr(x, L.ids));
+    int32_t* cids = static_cast<int32_t*>(rad_buf_ptr(x, L.edd_ids));
+    int32_t* map = static_cast<int32_t*>(rad_buf_ptr(x, L.edd_map));
+    if (!ids || !cids || !map) return false;
+    Plan& p = m.edd_plan;
+    const Outcome o = plan(ids, T, H, ls.data(), ls.size(), p);
+    const bool r0 = rad_rank(x) == 0;
+    if (o != kDedup) {
+        if (r0) (o == kGuard ? g_edd_guard : o == kLowShare ? g_edd_low : g_edd_nopool).fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    compact_ids(p, ids, cids);
+    std::memcpy(map, p.map.data(), (size_t)T * sizeof(int32_t));
+    if (rad_dev_host_wrote) rad_dev_host_wrote();
+    auto RS = [&](rad_buf h, int64_t a, int64_t n) { return a == 0 ? brows(h, n) : brow_slice(h, a, n, m.bp.at(h)); };
+    /* the lookup over the compact rows (the kept launches' rows, then the unique rows), their copy to the card */
+    if (m.ple_group > 0)
+        RAD_ISSUE_N(x, L.e_emb_dd, p.rows * H, brows(L.edd_ids, p.rows), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                    m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, p.rows));
+    else
+        RAD_ISSUE_N(x, L.e_emb_dd, p.rows * H, brows(L.edd_ids, p.rows), RAD_W(m.ple_table), brows(m.emb, p.rows));
+    RAD_ISSUE_N(x, L.e_copy, p.rows, brows(m.emb, p.rows), brows(m.embd, p.rows));
+    /* the kept launches as today (their own rows: the same form), into their step rows */
+    for (const Kept& k : p.kept) lin_issue(x, m, L.e_gemm, k.n, RS(m.embd, k.c0, k.n), L.e_kv, RS(m.ekv, k.r0, k.n));
+    /* the unique rows, one launch of > 48 rows, then each pooled run gathered from them */
+    lin_issue(x, m, L.e_gemm_u, p.uniq, RS(m.embd, p.u0, p.uniq), L.e_kv, brows(m.ekv_u, p.uniq));
+    for (const auto& u : p.runs)
+        RAD_ISSUE_N(x, L.e_scat, u.second, brows(m.ekv_u, p.uniq), RS(L.edd_map, u.first, u.second),
+                    RS(m.ekv, u.first, u.second));
+    if (r0) {
+        g_edd_passes.fetch_add(1, std::memory_order_relaxed);
+        g_edd_rows.fetch_add(p.pooled - p.uniq, std::memory_order_relaxed);
+        g_edd_pooled.fetch_add(p.pooled, std::memory_order_relaxed);
+        if (!m.edd_counted) {
+            m.edd_counted = true;
+            g_edd_steps.fetch_add(1, std::memory_order_relaxed);
+        }
+        const long long n = g_edd_passes.load(std::memory_order_relaxed);
+        if (n == 1 || n % 256 == 0)
+            fprintf(stderr, "radiance: deepseek41: lever E1: %lld Engram layer passes deduplicated (%lld steps), %lld of %lld "
+                            "pooled rows not computed; %lld kept whole by the %lld-row guard, %lld below 1/%lld repeated, %lld "
+                            "with no launch above the band (this pass: layer %d, %lld rows, %lld pooled -> %lld unique, %zu "
+                            "kept launch(es), %zu gather(s))\n",
+                    n, g_edd_steps.load(std::memory_order_relaxed), g_edd_rows.load(std::memory_order_relaxed),
+                    g_edd_pooled.load(std::memory_order_relaxed), g_edd_guard.load(std::memory_order_relaxed),
+                    (long long)kFormRows, g_edd_low.load(std::memory_order_relaxed), (long long)kMinShareDiv,
+                    g_edd_nopool.load(std::memory_order_relaxed), L.l, (long long)T, (long long)p.pooled, (long long)p.uniq,
+                    p.kept.size(), p.runs.size());
+    }
+    return true;
+}
+
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
     const auto& c = m.c;
@@ -3978,6 +4184,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         praw(batch->ctx_lens + Dn, RAD_I32, Pn), RAD_NONE, brows(L.ids, T),
                         RAD_NONE);
     }
+    engdd_mark(x, m, batch);   /* lever E1: the ids' event (a pass it may act on) */
 
     for (auto& L : m.layers) {
         const int l = L.l;
@@ -4023,14 +4230,20 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         const std::vector<BiSeg>& sg = *cur;   /* the layer's segments, below */
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
-            if (m.ple_group > 0)
-                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
-                            m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
-            else
-                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
-            RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
-            /* the Engram GEMM (gemm_nt_ggml, banded) by segment */
-            rows(kBiBand, [&](int64_t r0, int64_t n) { lin_issue(x, m, L.e_gemm, n, R(m.embd, r0, n), L.e_kv, R(m.ekv, r0, n)); });
+            /* lever E1: the lookup, copy and GEMM over the unique id rows of the launches below that are wider than the
+             * band (the decode segment's pieces and a short prefill segment keep their own launch) */
+            m.edd_ls.clear();
+            rows(kBiBand, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); });
+            if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
+                if (m.ple_group > 0)
+                    RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                                m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
+                else
+                    RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
+                RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
+                /* the Engram GEMM (gemm_nt_ggml, banded) by segment */
+                rows(kBiBand, [&](int64_t r0, int64_t n) { lin_issue(x, m, L.e_gemm, n, R(m.embd, r0, n), L.e_kv, R(m.ekv, r0, n)); });
+            }
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
@@ -4576,21 +4789,26 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         praw(batch->ctx_lens + Dn, RAD_I32, P), RAD_NONE, brows(L.ids, T),
                         RAD_NONE);
     }
+    engdd_mark(x, m, batch);   /* lever E1: the ids' event (a pass it may act on) */
 
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
-            /* T rows of operands; the gather's band is T * H, one table row per head per token,
-             * read through the ids and rows as flat (rad_block_ple.h does the same). */
-            if (m.ple_group > 0)
-                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
-                            m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
-            else
-                RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
-            RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
-            lin_issue(x, m, L.e_gemm, T, brows(m.embd, T), L.e_kv, brows(m.ekv, T));
+            /* lever E1: the step's rows are one kv GEMM launch below; deduplicated when its plan says so */
+            m.edd_ls.assign(1, ds41_engdd::Launch{ 0, T });
+            if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
+                /* T rows of operands; the gather's band is T * H, one table row per head per token,
+                 * read through the ids and rows as flat (rad_block_ple.h does the same). */
+                if (m.ple_group > 0)
+                    RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
+                                m.ple_tab ? RAD_W(m.ple_tab) : RAD_NONE, brows(m.emb, T));
+                else
+                    RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
+                RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
+                lin_issue(x, m, L.e_gemm, T, brows(m.embd, T), L.e_kv, brows(m.ekv, T));
+            }
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
@@ -5041,6 +5259,8 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
     /* Lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is shaped by its targets, which no key holds: not
      * recorded */
     if (deepseek41::psk_hint(b)) return 0;
+    /* Lever E1: a pass it may deduplicate issues row counts read from the step's ids at issue: not recorded */
+    if (deepseek41::engdd_may_act(b)) return 0;
     if (b && b->draft_pass == 0 && deepseek41::g_sw_bi.load(std::memory_order_relaxed) > 0) {
         int64_t Dn = 0, DT = 0;
         rad::arch::batch_split(b, &Dn, &DT);
@@ -5068,6 +5288,23 @@ extern "C" int rad_psk_stats(long long* out, int n) {
     out[4] = g_psk_rows_hi.load(std::memory_order_relaxed);
     out[5] = g_psk_hbad.load(std::memory_order_relaxed);
     return 6;
+}
+
+/* Lever E1's live counters for /stats "engdd" (ds41-e1), rank 0's, cumulative: out[0] Engram layer passes deduplicated,
+ * [1] rows not looked up / copied / multiplied in them, [2] rows pooled in them, [3] layer passes the 48-row guard kept
+ * whole, [4] layer passes below the repeat share, [5] steps with a deduplicated layer, [6] layer passes with no launch
+ * above the band. Returns how many it wrote (7), 0 when lever E1 is not declared here. */
+extern "C" int rad_engdd_stats(long long* out, int n) {
+    using namespace deepseek41;
+    if (!out || n < 7 || !g_sw_engdd_ok.load(std::memory_order_relaxed)) return 0;
+    out[0] = g_edd_passes.load(std::memory_order_relaxed);
+    out[1] = g_edd_rows.load(std::memory_order_relaxed);
+    out[2] = g_edd_pooled.load(std::memory_order_relaxed);
+    out[3] = g_edd_guard.load(std::memory_order_relaxed);
+    out[4] = g_edd_low.load(std::memory_order_relaxed);
+    out[5] = g_edd_steps.load(std::memory_order_relaxed);
+    out[6] = g_edd_nopool.load(std::memory_order_relaxed);
+    return 7;
 }
 
 extern "C" int rad_psk_plan(int step, long long dec_tok, int n, const int32_t* ahead, const int32_t* rows) {

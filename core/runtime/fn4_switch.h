@@ -229,6 +229,14 @@
  *   ds41_psk_k      scheduler (lever PSK design 2): the anchor stride K, 1 .. 4096 (default 8): the K-th, 2K-th, ...
  *                   periodic checkpoint position (the exact grid's points from its origin, else the interval's
  *                   multiples) is a target under ds41_psk 2 / 3. Read at a request's admission.
+ *   ds41_engdd      deepseek41 (lever E1, ds41-e1; arch/deepseek41/ds41_engram_dedup.h): 1 an Engram layer's lookup, copy
+ *                   and kv GEMM of a pass with a prefill sequence run over the step's UNIQUE n-gram id rows (the kv row is
+ *                   a function of the row's ids alone, inference/model.py:353), and gather_rows copies every row's kv row
+ *                   from its unique row; launches of <= 48 rows (the decode band) are issued as today, and nothing is
+ *                   deduplicated when the unique rows would be <= 48 or fewer than 1/16 of the pooled rows repeat;
+ *                   0 today's issue. RADIANCE_DS41_ENGDD=0 | 1 declares it (and starts at that value); unset: 1 refused,
+ *                   the program and the issue are today's. A pass it may act on is not recorded. Exact: the same bytes
+ *                   (gemm_nt_ggml's per-row form above the band). Live counters: /stats "engdd".
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -303,7 +311,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
-              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK, kSwitches };
+              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK, kDs41Engdd,
+              kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -389,6 +398,11 @@ int  psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int3
 void note_psk_engine(int64_t planned, int64_t ended_early, int64_t stager_skipped);
 void psk_engine(int64_t out[3]);
 int  psk_stats(int64_t out[6]);
+/* Lever E1's live counters (ds41-e1, /stats "engdd"; the plugin's rad_engdd_stats, rank 0's, cumulative): Engram layer
+ * passes deduplicated, rows not computed in them, rows pooled in them, layer passes kept whole by the 48-row guard, layer
+ * passes below the repeat share, steps with a deduplicated layer, layer passes with no launch above the band -- 0s and a
+ * return of 0 with no plugin serving it. */
+int  engdd_stats(int64_t out[7]);
 /* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
  * "accept"; under draft_depth0 2 every head draft is a probe's). */
 void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted);
