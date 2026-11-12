@@ -1034,6 +1034,28 @@ bool ds_mix_fuse_on() {
     static const bool on = [] { const char* e = std::getenv("R4D_DS41_MIX_FUSE"); return e && e[0] == '1' && !e[1]; }();
     return on;
 }
+/* Lever 1U-MX (ds41-int11): libr4d's fn4 switch "ds41_mix_wv" (rad_fn4_* in r4d_ds41_ggml.hip) -- the waves a chunk of the
+ * split launch at decode heights (rows <= 8, R 1), 0 = the stock 8; 12 / 16 / 24 that many (hc 4 only: 24 dots, so two /
+ * two / one a wave). The start value is RADIANCE_DS41_MIX_WV (12 / 16 / 24; anything else or unset: 0), read at the first
+ * launch. Exact by mix_split_kernel's note: a partial (row, chunk, dot) is lane L's columns L, L + 32, .. from zero with
+ * unfused adds and the same r4d_wave_sum whichever wave forms it, the sum of squares likewise on wave MIX % WV, and the
+ * finish reads the same partials. Counters (rad_mx_stats, every rank's launches summed; a recorded pass counts when it is
+ * recorded): the launches taken in a wide form and their rows. */
+bool mix_wv_known(int v) { return v == 0 || v == 12 || v == 16 || v == 24; }
+std::atomic<int> g_mix_wv{-1};
+std::atomic<long long> g_mx_launch{0}, g_mx_rows{0};
+int mix_wv_now() {
+    int v = g_mix_wv.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_DS41_MIX_WV");
+        const int ev = e ? (int)std::strtol(e, nullptr, 10) : 0;
+        int unread = -1;
+        g_mix_wv.compare_exchange_strong(unread, mix_wv_known(ev) ? ev : 0);
+        v = g_mix_wv.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+
 #ifdef R4D_EMU_HOST
 /* tests/r4d_emu: device memory is host memory; a zeroed block a (stream, output), as split_ctr */
 unsigned* ds_mix_ctr(RadStream s, const void* out) {
@@ -1076,9 +1098,25 @@ int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const Mi
                     dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,     \
                     (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,             \
                     (long)fn.stride[0], part, o.width, (int)chunks, rows, (unsigned*)nullptr, o))
-        const int rc = rows <= 8 ? MIX_SPLIT(1, kMixSteps)
-                       : rows <= 24 ? MIX_SPLIT(RM, 4)
-                                    : MIX_SPLIT(RB, 4);
+        /* lever 1U-MX: the decode heights' launch with more waves a chunk (the same partials; not the FIN form) */
+        const int wv = HC == 4 && rows <= 8 && !ctr ? mix_wv_now() : 0;
+#define MIX_WIDE(WV)                                                                                       \
+    R4D_EMIT(stream, (mix_split_kernel<HC, 1, WV, kMixSteps>), dim3((unsigned)chunks, grid_rows(rows)),    \
+             dim3(32 * (WV)), 0, (const uint16_t*)h.data, (long)h.stride[0], (const float*)fn.data,       \
+             (long)fn.stride[0], part, o.width, (int)chunks, rows, (unsigned*)nullptr, o)
+        int rc;
+        if (wv == 12 || wv == 16 || wv == 24) {
+            rc = wv == 12 ? MIX_WIDE(12) : wv == 16 ? MIX_WIDE(16) : MIX_WIDE(24);
+            if (rc >= 0) {
+                g_mx_launch.fetch_add(1, std::memory_order_relaxed);
+                g_mx_rows.fetch_add(rows, std::memory_order_relaxed);
+            }
+        } else {
+            rc = rows <= 8 ? MIX_SPLIT(1, kMixSteps)
+                 : rows <= 24 ? MIX_SPLIT(RM, 4)
+                              : MIX_SPLIT(RB, 4);
+        }
+#undef MIX_WIDE
 #undef MIX_SPLIT
         if (rc < 0 || ctr) return rc;
         return R4D_EMIT(stream, mix_finish_kernel<HC>, dim3(fin), dim3(128), 0, (const float*)part,
@@ -2729,6 +2767,17 @@ extern "C" int r4d_rad_ds41_rope_rows(const RadArgs* a, RadStream s) { return ro
 extern "C" int r4d_rad_quant_roundtrip(const RadArgs* a, RadStream s) { return quant_rt_body(a, s); }
 extern "C" int r4d_rad_mhc_mix(const RadArgs* a, RadStream s) { return mhc_mix_body(a, s); }
 extern "C" void r4d_ds41_mix_fuse_force(int on) { g_mix_fuse_force.store(on, std::memory_order_relaxed); }
+/* Lever 1U-MX (ds41-int11): the fn4 switch ds41_mix_wv (r4d_ds41_ggml.hip's rad_fn4_*) and its counters. */
+bool r4d_mix_wv_known(int v) { return mix_wv_known(v); }
+int r4d_mix_wv_get() { return mix_wv_now(); }
+void r4d_mix_wv_set(int v) { g_mix_wv.store(mix_wv_known(v) ? v : 0, std::memory_order_relaxed); }
+/* out[0] mhc_mix launches in a wide-wave form, [1] their rows; every rank's launches summed, cumulative. */
+extern "C" int rad_mx_stats(long long* out, int n) {
+    if (!out || n < 2) return 0;
+    out[0] = g_mx_launch.load(std::memory_order_relaxed);
+    out[1] = g_mx_rows.load(std::memory_order_relaxed);
+    return 2;
+}
 /* Partials of every chunk of every row of the band, so the projection spreads over workgroups. */
 extern "C" int64_t r4d_rad_mhc_mix_scratch(const RadArgs* a) {
     const long long M = r4d_geti_or(a, "M", 0), n = r4d_geti_or(a, "n", 0);

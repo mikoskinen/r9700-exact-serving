@@ -34490,6 +34490,8 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 
 #include "r4d_selftest_i9b.inc"   /* ds41-int9b: levers M1, IX-LDSR2, IX-NI byte for byte vs the stock forms */
 #include "r4d_selftest_arc.inc"   /* ds41-int10: lever ARC, the coded wire at overlap 0 on four cards (--case ar_arcoded) */
+#include "r4d_selftest_i11.inc"   /* ds41-int11: lever 1U-MX, mhc_mix's wide-wave decode form byte for byte (--case mix_wv) */
+#include "r4d_selftest_gq.inc"    /* ds41-int11: lever 1U-GQ, gemm_nt_ggml_pair vs two gemm_nt_ggml (--case gq_pair) */
 
 static void device_phase(const Plugin& pl) {
     int n = 0;
@@ -35773,6 +35775,8 @@ static void device_phase(const Plugin& pl) {
     }
     /* --- ds41-int9b (r4d_selftest_i9b.inc): --case mhc_pcn_mix / ix_lds / ix_ni (or their rows' names) --- */
     i9b_cases(pl);
+    i11_cases(pl);   /* ds41-int11 (r4d_selftest_i11.inc / _gq.inc): levers 1U-MX and 1U-GQ */
+    gq_cases(pl);
     /* --- byte rows: the KV tier's transfer pair --- */
     /* Pack and unpack a pool, the real layout in miniature: a "layer" is `rows` blocks of `n`
      * bytes, a session's blocks are scattered through it, and exactly those blocks must come back.

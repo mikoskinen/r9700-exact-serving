@@ -364,6 +364,27 @@
  *                   drafts_trimmed, ahead_capped (of them, steps issued ahead), steps_over (left: the sequences alone
  *                   exceed it), steps_gt48 (steps whose decode rows exceed 48, at any setting), max_rows (the most decode
  *                   rows a step carried), decode_steps (steps with decode rows).
+ *   ds41_mix_wv     libr4d (lever 1U-MX, ds41-int11, appended after sched_row_cap): 0 off (today: mhc_mix's split kernel at
+ *                   decode heights, <= 8 rows a launch, runs 8 waves a chunk, three of the 24 dots a wave); 12 / 16 / 24 the
+ *                   same launch with that many waves a chunk (two / two / one dot a wave; the sum of squares on wave
+ *                   24 % WV). Exact: a partial (row, chunk, dot) is the same sum in the same order whichever wave forms it
+ *                   (mix_split_kernel's note: lane L the columns L, L + 32, .. from zero, unfused adds, r4d_wave_sum), and
+ *                   the finish is unchanged. RADIANCE_DS41_MIX_WV=N at load starts it at N. GET "i11".mx counts the
+ *                   launches it took (every rank).
+ *   ds41_gq         deepseek41 (lever 1U-GQ = K1 fold b, ds41-int11): a mask -- 1 the query's q_a and the latent kv
+ *                   projection (both GEMVs over the attention norm's output, one weight type a layer) as ONE launch, 2
+ *                   attention_output_a's two group GEMVs (g0 + g1) as one launch, 3 both; 0 the separate launches.
+ *                   gemm_nt_ggml_pair: lever D2's multi-row form with the two weights' rows side by side in one grid,
+ *                   each output's operations exactly D2's (any form gives the same bytes), decode band only (above it,
+ *                   or with D2 off, the two launches). RADIANCE_DS41_GQ=1|2|3 declares the pair ops (where a library
+ *                   serves them) and starts at that value; unset declares nothing and >= 1 is refused.
+ *   ds41_e2         deepseek41 (lever 1U-E2 = E2 / audit 6, ds41-int11): 1 the Engram kv projection at a decode-band
+ *                   pass (<= 48 rows) computed by output columns over the ranks -- rank r the rows [r N/W, (r+1) N/W) of
+ *                   the replicated weight (a view, nothing loaded twice) into a [rows, N/W] part -- then one
+ *                   row-interleaved all_gather into engram_kv; 0 the whole GEMV on every rank. Exact: each output's dot is
+ *                   gemm_nt_ggml's per-output sequence on a row slice, and the gather only copies.
+ *                   RADIANCE_DS41_E2=1 declares the part, the GEMV and the gather (and starts at 1); unset declares
+ *                   nothing and 1 is refused. GET "i11".gq / .e2 carry the two levers' issue counts (rank 0).
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -441,7 +462,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSchedRowCap, kSwitches };
+              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -571,6 +592,12 @@ void i9b_stats(int64_t out[kI9bStats]);
  * 0s where no plugin serves them. */
 constexpr int kArcStats = 7;
 void arc_stats(int64_t out[kArcStats]);
+/* Levers 1U-MX / 1U-GQ / 1U-E2's live counters (ds41-int11, GET /admin/fn4 "i11"), cumulative, counted at issue (a recorded
+ * pass when it is recorded): out[0..5] deepseek41's rad_i11_stats (rank 0): GQ layers declared, q_a + kv pair launches, out_a
+ * g0 + g1 pair launches, E2 layers declared, E2 split launches, their rows; out[6..7] libr4d's rad_mx_stats (every rank):
+ * mhc_mix launches in a wide-wave form, their rows. 0s where no plugin serves them. */
+constexpr int kI11Stats = 8;
+void i11_stats(int64_t out[kI11Stats]);
 /* Lever E1's live counters (ds41-e1, /stats "engdd"; the plugin's rad_engdd_stats, rank 0's, cumulative): Engram layer
  * passes deduplicated, rows not computed in them, rows pooled in them, layer passes kept whole by the 48-row guard, layer
  * passes below the repeat share, steps with a deduplicated layer, layer passes with no launch above the band -- 0s and a

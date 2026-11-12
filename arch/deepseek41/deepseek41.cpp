@@ -319,6 +319,12 @@ struct Layer {
      * be queued when the next layer's are written. 0 where not declared. */
     rad_op e_emb_dd = 0, e_gemm_u = 0, e_scat = 0;
     rad_buf edd_ids = 0, edd_map = 0;
+    /* Lever 1U-E2 (RADIANCE_DS41_E2 declared): this rank's column part of the kv GEMV (gemm_nt_ggml, N / world, over a row
+     * view of e_kv) into Model::ekv_p and the row-interleaved all_gather into Model::ekv; 0 where not declared. */
+    rad_op e_gemm_p = 0, e_gath = 0;
+    /* Lever 1U-GQ (RADIANCE_DS41_GQ declared): q_a + kv_g as one gemm_nt_ggml_pair (qkv_pair), and the two
+     * attention_output_a groups as one (oa_pair); 0 where not declared. */
+    rad_op qkv_pair = 0, oa_pair = 0;
     rad_op mix_a = 0, col_a = 0, norm_a = 0;
     rad_op q_a = 0, q_an = 0, q_b = 0, q_rope = 0;
     rad_op kv_g = 0, kv_n = 0, kv_rope = 0, kv_q = 0, kv_st = 0;
@@ -560,6 +566,10 @@ struct Model {
     /* Lever E1: the unique rows' kv [T, (hc + 1) D]; `edd_ev` recorded behind the step's ngram_ids (the host reads the
      * ids once it completed), `edd_rec` / `edd_synced` this step's record and wait, `edd_counted` the step counted. */
     rad_buf ekv_u = 0;
+    /* Lever 1U-E2: a rank's column part of the kv rows [e2_rows, e2_part] (bf16), the part's width (N / world), and a
+     * weight row's stored bytes (the view's row step); 0 where not declared. */
+    rad_buf ekv_p = 0;
+    int64_t e2_rows = 0, e2_part = 0, e2_rb = 0;
     RadEvent edd_ev = nullptr;
     bool edd_rec = false, edd_synced = false, edd_counted = false;
     ds41_engdd::Plan edd_plan;
@@ -1435,6 +1445,54 @@ static void mhc_read_env() {
     }
 }
 static bool mhc_declared() { return g_sw_mhc_env.load(std::memory_order_relaxed) >= 0; }
+/* Levers 1U-GQ and 1U-E2 (ds41-int11, from the i9p 1u profile 12.11.2026), each declared only when its environment asks
+ * (read at the first declare; unset: nothing more is declared, the issue is today's and >= 1 is refused) and picked per
+ * pass by its fn4 switch:
+ *   ds41_gq   (RADIANCE_DS41_GQ=1|2|3, a mask; = K1 fold b): bit 0 the query's q_a and the latent kv projection -- two
+ *             GEMVs over the attention norm's output -- as one gemm_nt_ggml_pair launch (Layer::qkv_pair), bit 1
+ *             attention_output_a's two group GEMVs as one (Layer::oa_pair). libr4d runs the pair in lever D2's multi-row
+ *             form, each weight's rows in their own blocks of one grid with D2's per-output order (every D2 form gives a
+ *             row the same bytes), in the decode band; elsewhere (or with D2 off) the two launches.
+ *   ds41_e2   (RADIANCE_DS41_E2=1; audit lever 6): the Engram kv projection at a decode-band pass computed by output
+ *             columns over the ranks: rank r issues gemm_nt_ggml over rows [r N / W, (r + 1) N / W) of the replicated
+ *             weight (an operand view: nothing is loaded twice) into engram_kv_part, then one row-interleaved all_gather
+ *             (row N / W) writes engram_kv whole on every rank (Layer::e_gemm_p, Model::e_gath). Exact: each output is
+ *             gemm_nt_ggml's per-output sequence (the decode band's forms give a row the same bytes at any N), and the
+ *             gather only copies.
+ * `_ok`: at least one layer declared the lever, so >= 1 is accepted. Counters (rank 0, at issue: a recorded pass counts
+ * when it is recorded) for GET "i11" (rad_i11_stats). */
+static std::atomic<int> g_sw_gq{0}, g_sw_gq_ok{0}, g_sw_gq_env{-2};   /* env: -2 unread, -1 unset, else the mask */
+static std::atomic<int> g_sw_e2{0}, g_sw_e2_ok{0}, g_sw_e2_env{-2};
+static std::atomic<int> g_i11_noted{0};
+static std::atomic<long long> g_gq_layers{0}, g_gq_qkv{0}, g_gq_oa{0}, g_e2_layers{0}, g_e2_splits{0}, g_e2_rows{0};
+static void i11_read_env() {
+    auto rd = [](const char* name, int maxv, std::atomic<int>& env, std::atomic<int>& sw) {
+        int unread = -2;
+        const char* e = std::getenv(name);
+        int v = -1;
+        if (e) {
+            if (!std::strcmp(e, "on")) v = maxv;
+            else if (!std::strcmp(e, "off")) v = 0;
+            else {
+                char* end = nullptr;
+                const long n = std::strtol(e, &end, 10);
+                if (end != e && !*end && n >= 0 && n <= maxv) v = (int)n;
+            }
+        }
+        if (env.compare_exchange_strong(unread, v)) {
+            if (v >= 0) sw.store(v, std::memory_order_relaxed);
+            if (e && v < 0)
+                fprintf(stderr, "radiance: deepseek41: %s=%s is not 0 .. %d (or on / off): not declared\n", name, e, maxv);
+        }
+    };
+    rd("RADIANCE_DS41_GQ", 3, g_sw_gq_env, g_sw_gq);
+    rd("RADIANCE_DS41_E2", 1, g_sw_e2_env, g_sw_e2);
+}
+static bool gq_declared() { return g_sw_gq_env.load(std::memory_order_relaxed) >= 0; }
+static bool e2_declared() { return g_sw_e2_env.load(std::memory_order_relaxed) >= 0; }
+/* the live mask / flag, 0 where nothing was declared */
+static int gq_now() { return g_sw_gq_ok.load(std::memory_order_relaxed) ? g_sw_gq.load(std::memory_order_relaxed) : 0; }
+static bool e2_now() { return g_sw_e2_ok.load(std::memory_order_relaxed) && g_sw_e2.load(std::memory_order_relaxed) > 0; }
 /* The fewest rows a pcn_a launch is fused at under the switch; 0 = none. */
 static int64_t mhc_fuse_min() {
     if (!g_sw_mhc_ok.load(std::memory_order_relaxed)) return 0;
@@ -1537,6 +1595,10 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "mhc_fuse"))   /* lever M1 */
         return value == 0 || (value >= 1 && value <= 1048576 && g_sw_mhc_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;   /* lever IX-NI: counted here, libr4d's */
+    if (!std::strcmp(name, "ds41_gq"))   /* lever 1U-GQ */
+        return value == 0 || (value >= 1 && value <= 3 && g_sw_gq_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 */
+        return value == 0 || (value == 1 && g_sw_e2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -1554,6 +1616,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ds41_engdd")) g_sw_engdd.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "mhc_fuse")) g_sw_mhc.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ix_ni")) g_sw_ixni.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_gq")) g_sw_gq.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_e2")) g_sw_e2.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1607,6 +1671,14 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "dspark_walk")) {
         *applied = g_sw_walk.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_gq")) {
+        *applied = gq_now();
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_e2")) {
+        *applied = e2_now() ? 1 : 0;
         return 1;
     }
     return 0;
@@ -1852,6 +1924,75 @@ static int64_t latent_slots(const Model& m, int64_t hd) {
 /* An index cache entry's bf16 slots: the key's idim values, or its packed bytes / 2 (mxfp4). */
 static int64_t index_slots(const Model& m) {
     return m.ikmx ? (m.c.idim / 2 + m.c.idim / 32 + 15) / 16 * 16 / 2 : m.c.idim;
+}
+
+/* Lever 1U-E2 (ds41-int11): a GGUF weight row's stored bytes (gemm_nt_ggml's native blocks: the row step of a row view);
+ * 0 for a type this build cannot name. */
+static int64_t ggml_row_bytes(const char* ty, int64_t k) {
+#ifdef RAD_ARCH_HAVE_GGML
+    for (uint32_t t = 0; ty && t < 64; ++t) {
+        const lq::ggml::PlaneKind* pk = lq::ggml::plane_kind(t);
+        if (pk && pk->name && !std::strcmp(pk->name, ty) && pk->block > 0 && k % pk->block == 0)
+            return k / pk->block * (int64_t)pk->block_bytes;
+    }
+#endif
+    (void)ty;
+    (void)k;
+    return 0;
+}
+
+/* Lever 1U-E2 at an Engram layer (RADIANCE_DS41_E2 declared, world > 1): this rank's part GEMV over rows
+ * [rank n / world, (rank + 1) n / world) of the replicated kv weight (issued through a row view, so nothing is loaded
+ * twice) into the shared part buffer, and the row-interleaved all_gather of the parts into engram_kv, both at the decode
+ * band's heights (<= kBiBand rows). Left undeclared (the whole GEMV only) where the weight is not a GGUF block type, n
+ * does not split evenly into whole 16-byte rows, or no library serves the gather. */
+static int e2_layer(RadBuilder* b, Model& m, Layer& L, int64_t T, int64_t n, int64_t k) {
+    const auto& g = m.g;
+    const auto ty = m.wty.find(L.e_kv);
+    if (ty == m.wty.end() || m.wsc.count(L.e_kv) || n % g.world || ((n / g.world) * 2) % 16) return RAD_OK;
+    const int64_t P = n / g.world, R = std::min<int64_t>(T, kBiBand), rb = ggml_row_bytes(ty->second, k);
+    if (rb <= 0) return RAD_OK;
+    if (!m.ekv_p) {
+        m.ekv_p = decl_b(b, m.nm.f("engram_kv_part"), RAD_BF16, { R, P });
+        if (!m.ekv_p) return RAD_E_INVAL;
+        m.e2_rows = R;
+        m.e2_part = P;
+        m.e2_rb = rb;
+    }
+    if (m.e2_part != P || m.e2_rb != rb) return RAD_OK;   /* one part shape for the model's Engram layers */
+    const rad_op gp = op(b, "gemm_nt_ggml",
+                         { RAD_RANGE("M", 1, R), RAD_INT("N", P), RAD_INT("K", k), RAD_STR("type", ty->second),
+                           RAD_STR("dtype", g.dtype) },
+                         { L.e_kv }, { m.embd }, { m.ekv_p });
+    if (!gp) return RAD_OK;
+    const rad_op ga = op(b, "all_gather",
+                         { RAD_INT("world_size", g.world), RAD_RANGE("numel", P, R * P), RAD_STR("dtype", "bf16"),
+                           RAD_INT("row", P) },
+                         {}, { m.ekv_p }, { m.ekv });
+    if (!ga) return RAD_OK;
+    L.e_gemm_p = gp;
+    L.e_gath = ga;
+    return RAD_OK;
+}
+
+/* Lever 1U-E2 at issue: the Engram kv GEMV of n rows (a -> y, engram_kv rows) as this rank's column part and the gather
+ * when the switch is on, the layer declared it and n is in the band; else the whole GEMV (lin_issue). Exact either way:
+ * each output keeps gemm_nt_ggml's per-output sequence (the band's forms give a row the same bytes at any N), and the
+ * gather moves the parts' bytes into their columns. */
+static void e2_gemm(RadCtx* x, Model& m, const Layer& L, int64_t n, RadOperand a, RadOperand y) {
+    if (L.e_gemm_p && L.e_gath && n >= 1 && n <= m.e2_rows && e2_now()) {
+        RadOperand w = RAD_W(L.e_kv);
+        w.offset = (int64_t)m.g.rank * m.e2_part * m.e2_rb;   /* u8 elements of the stored rows = bytes */
+        w.rows = m.e2_part;
+        RAD_ISSUE_N(x, L.e_gemm_p, n, a, w, brows(m.ekv_p, n));
+        RAD_ISSUE_N(x, L.e_gath, n * m.e2_part, brows(m.ekv_p, n), y);
+        if (m.g.rank == 0) {
+            g_e2_splits.fetch_add(1, std::memory_order_relaxed);
+            g_e2_rows.fetch_add(n, std::memory_order_relaxed);
+        }
+        return;
+    }
+    lin_issue(x, m, L.e_gemm, n, a, L.e_kv, y);
 }
 
 static int buffers(RadBuilder* b, Model& m) {
@@ -2173,6 +2314,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
                         RAD_STR("to", "bf16") },
                       {}, { m.emb }, { m.embd });
         L.e_gemm = linear(b, m, T, L.e_kv, (c.hc + 1) * D, H * c.ple_dim, m.embd, m.ekv);
+        /* Lever 1U-E2: the decode band's split by output columns (e2_issue), beside the whole GEMV */
+        if (e2_declared() && g.world > 1) DS_TRY(e2_layer(b, m, L, T, (c.hc + 1) * D, H * c.ple_dim));
         /* Lever E1: the GEMM over the unique rows into engram_kv_u, then every pooled row's kv row gathered from it
          * (gather_rows, a byte copy) through this layer's map */
         if (edd) {
@@ -3354,6 +3497,7 @@ static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lev
 static void engdd_declare(Model& m, const RadBuildCtx* ctx);               /* lever E1, below */
 static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lever KVR, below */
 static void mhc_declare(Model& m, const RadBuildCtx* ctx);                  /* lever M1, below */
+static void i11_declare(Model& m, const RadBuildCtx* ctx);                  /* levers 1U-GQ / 1U-E2, below */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -3387,6 +3531,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     psk_cr_read_env();
     engdd_read_env();
     mhc_read_env();
+    i11_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3740,6 +3885,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(psk_declare(b, m, ctx));
     engdd_declare(m, ctx);
     mhc_declare(m, ctx);
+    i11_declare(m, ctx);
     DS_TRY(bt_declare(b, m, ctx));
     DS_TRY(kvr_declare(b, m, ctx));
     return RAD_OK;
@@ -3922,6 +4068,43 @@ static void mhc_declare(Model& m, const RadBuildCtx* ctx) {
                         "post, the next connection's collapse + norm and its mhc_mix in one op); 1 = launches of >= %lld "
                         "rows fused, N >= 2 = of >= N rows\n",
                 g_sw_mhc.load(std::memory_order_relaxed), n, want, (long long)kMhcFuseRows);
+}
+
+/* Levers 1U-GQ / 1U-E2 at the end of a declare (their environment set): the layers that declared them; none (no library
+ * serves the pair op / the gather, or the shapes do not split) -> not available (>= 1 refused, the switch reads 0). */
+static void i11_declare(Model& m, const RadBuildCtx* ctx) {
+    if (ctx->shape_probe || (!gq_declared() && !e2_declared())) return;
+    int gq = 0, qkv = 0, oa = 0, e2 = 0, eng = 0;
+    for (const Layer& L : m.layers) {
+        qkv += L.qkv_pair ? 1 : 0;
+        oa += L.oa_pair ? 1 : 0;
+        gq += L.qkv_pair || L.oa_pair ? 1 : 0;
+        e2 += L.e_gemm_p && L.e_gath ? 1 : 0;
+        eng += L.e_ids ? 1 : 0;
+    }
+    if (gq_declared()) {
+        g_sw_gq_ok.store(gq > 0 ? 1 : 0, std::memory_order_relaxed);
+        if (gq == 0) g_sw_gq.store(0, std::memory_order_relaxed);
+    }
+    if (e2_declared()) {
+        g_sw_e2_ok.store(e2 > 0 ? 1 : 0, std::memory_order_relaxed);
+        if (e2 == 0) g_sw_e2.store(0, std::memory_order_relaxed);
+    }
+    if (ctx->rank != 0) return;
+    g_gq_layers.store(gq_declared() ? gq : 0, std::memory_order_relaxed);
+    g_e2_layers.store(e2_declared() ? e2 : 0, std::memory_order_relaxed);
+    if (g_i11_noted.exchange(1, std::memory_order_relaxed)) return;
+    if (gq_declared())
+        fprintf(stderr, "radiance: deepseek41: lever 1U-GQ (ds41_gq, RADIANCE_DS41_GQ, now %d) %s: gemm_nt_ggml_pair beside "
+                        "q_a + kv at %d layers and beside attention_output_a's two groups at %d of %zu layers\n",
+                gq_now(), gq > 0 ? "declared" : "not declared (no library serves gemm_nt_ggml_pair)", qkv, oa,
+                m.layers.size());
+    if (e2_declared())
+        fprintf(stderr, "radiance: deepseek41: lever 1U-E2 (ds41_e2, RADIANCE_DS41_E2, now %d) %s: the Engram kv GEMV by "
+                        "output columns at %d of %d Engram layers -- %lld of the %lld columns a rank over a row view of the "
+                        "weight (%lld bytes a row), then all_gather (row %lld), at <= %lld rows\n",
+                e2_now() ? 1 : 0, e2 > 0 ? "declared" : "not declared", e2, eng, (long long)m.e2_part,
+                (long long)(m.e2_part * m.g.world), (long long)m.e2_rb, (long long)m.e2_part, (long long)m.e2_rows);
 }
 
 /* Lever KVR (ds41-kvr, 12.11.2026): RADIANCE_DS41_KV_REPLICATED=1 declares the prefix-cached groups -- kv_index_r* and
@@ -4772,7 +4955,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
                 RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
                 /* the Engram GEMM (gemm_nt_ggml, banded) by segment */
-                rows(kBiBand, [&](int64_t r0, int64_t n) { lin_issue(x, m, L.e_gemm, n, R(m.embd, r0, n), L.e_kv, R(m.ekv, r0, n)); });
+                rows(kBiBand, [&](int64_t r0, int64_t n) { e2_gemm(x, m, L, n, R(m.embd, r0, n), R(m.ekv, r0, n)); });
             }
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
@@ -5387,7 +5570,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 else
                     RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
                 RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
-                lin_issue(x, m, L.e_gemm, T, brows(m.embd, T), L.e_kv, brows(m.ekv, T));
+                e2_gemm(x, m, L, T, brows(m.embd, T), brows(m.ekv, T));
             }
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
@@ -5938,6 +6121,21 @@ extern "C" int rad_i9b_stats(long long* out, int n) {
     out[3] = g_mhc_small.load(std::memory_order_relaxed);
     out[4] = g_ixni_runs.load(std::memory_order_relaxed);
     out[5] = g_ixni_dead.load(std::memory_order_relaxed);
+    return 6;
+}
+
+/* Levers 1U-GQ / 1U-E2's live counters for GET /admin/fn4 "i11" (ds41-int11), rank 0's, cumulative, counted at issue (a
+ * recorded pass when it is recorded): out[0] layers that declared GQ, [1] q_a + kv pair launches, [2] attention_output_a
+ * pair launches, [3] layers that declared E2, [4] E2 split launches (part GEMV + gather), [5] their rows. Returns 6. */
+extern "C" int rad_i11_stats(long long* out, int n) {
+    using namespace deepseek41;
+    if (!out || n < 6) return 0;
+    out[0] = g_gq_layers.load(std::memory_order_relaxed);
+    out[1] = g_gq_qkv.load(std::memory_order_relaxed);
+    out[2] = g_gq_oa.load(std::memory_order_relaxed);
+    out[3] = g_e2_layers.load(std::memory_order_relaxed);
+    out[4] = g_e2_splits.load(std::memory_order_relaxed);
+    out[5] = g_e2_rows.load(std::memory_order_relaxed);
     return 6;
 }
 

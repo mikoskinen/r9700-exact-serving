@@ -32,14 +32,16 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_psk_l20",
                                         "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa", "stage_short",
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
-                                        "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap" };
+                                        "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
+                                        "ds41_mix_wv", "ds41_gq", "ds41_e2" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
            i == kDs41OneFill || i == kDrafterMx || i == kDrafterBf ||
            i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk ||
            i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx || i == kDs41PskCr || i == kDs41Engdd ||
-           i == kMhcFuse || i == kIxLds || i == kIxNi || i == kDs41Arcoded;
+           i == kMhcFuse || i == kIxLds || i == kIxNi || i == kDs41Arcoded || i == kDs41MixWv || i == kDs41Gq ||
+           i == kDs41E2;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -59,6 +61,8 @@ struct Hooks {
     int (*i9b_stats)(long long*, int) = nullptr;   /* levers M1 / IX-NI (deepseek41's rad_i9b_stats, ds41-int9b) */
     int (*ix_stats)(long long*, int) = nullptr;    /* levers IX-LDSR2 / IX-NI (libr4d's rad_ix_stats, ds41-int9b) */
     int (*arc_stats)(long long*, int) = nullptr;   /* lever ARC (libr4d's rad_arc_stats, ds41-int10) */
+    int (*i11_stats)(long long*, int) = nullptr;   /* levers 1U-GQ / 1U-E2 (deepseek41's rad_i11_stats, ds41-int11) */
+    int (*mx_stats)(long long*, int) = nullptr;    /* lever 1U-MX (libr4d's rad_mx_stats, ds41-int11) */
 };
 
 struct State {
@@ -174,6 +178,8 @@ void find_hooks(State& s) {
             k.i9b_stats = sym<int (*)(long long*, int)>(h, "rad_i9b_stats");
             k.ix_stats = sym<int (*)(long long*, int)>(h, "rad_ix_stats");
             k.arc_stats = sym<int (*)(long long*, int)>(h, "rad_arc_stats");
+            k.i11_stats = sym<int (*)(long long*, int)>(h, "rad_i11_stats");
+            k.mx_stats = sym<int (*)(long long*, int)>(h, "rad_mx_stats");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -550,6 +556,32 @@ void arc_stats(int64_t out[kArcStats]) {
     arc_collect(s, out);
 }
 
+/* Under s.mu. */
+static void i11_collect(State& s, int64_t* out) {
+    for (int i = 0; i < kI11Stats; ++i) out[i] = 0;
+    find_hooks(s);
+    bool got_a = false, got_b = false;
+    for (const Hooks& k : s.hooks) {
+        if (k.i11_stats && !got_a) {
+            long long v[6] = { 0, 0, 0, 0, 0, 0 };
+            const int n = k.i11_stats(v, 6);
+            for (int i = 0; i < n && i < 6; ++i) out[i] = (int64_t)v[i];
+            got_a = n > 0;
+        }
+        if (k.mx_stats && !got_b) {
+            long long v[2] = { 0, 0 };
+            const int n = k.mx_stats(v, 2);
+            for (int i = 0; i < n && i < 2; ++i) out[6 + i] = (int64_t)v[i];
+            got_b = n > 0;
+        }
+    }
+}
+void i11_stats(int64_t out[kI11Stats]) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    i11_collect(s, out);
+}
+
 int engdd_stats(int64_t out[7]) {
     for (int i = 0; i < 7; ++i) out[i] = 0;
     State& s = st();
@@ -601,7 +633,8 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
-                        "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, epoch_bump)";
+                        "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
+                        "epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1210,6 +1243,17 @@ std::string state_json() {
              std::to_string((long long)v[2]) + ", \"plain_rows\": " + std::to_string((long long)v[3]) +
              ", \"below\": " + std::to_string((long long)v[4]) + ", \"declined\": " + std::to_string((long long)v[5]) +
              ", \"coded_all_ranks\": " + std::to_string((long long)v[6]) + "}";
+    }
+    /* Levers 1U-MX / 1U-GQ / 1U-E2 (ds41-int11): always present, 0s where no plugin serves them (i11_stats). */
+    {
+        int64_t v[kI11Stats];
+        i11_collect(s, v);
+        o += ", \"i11\": {\"gq\": {\"declared\": " + std::to_string((long long)v[0]) +
+             ", \"qkv_pairs\": " + std::to_string((long long)v[1]) + ", \"out_pairs\": " + std::to_string((long long)v[2]) +
+             "}, \"e2\": {\"declared\": " + std::to_string((long long)v[3]) + ", \"splits\": " +
+             std::to_string((long long)v[4]) + ", \"rows\": " + std::to_string((long long)v[5]) +
+             "}, \"mx\": {\"wide_launches\": " + std::to_string((long long)v[6]) + ", \"wide_rows\": " +
+             std::to_string((long long)v[7]) + "}}";
     }
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {

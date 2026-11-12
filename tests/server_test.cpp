@@ -5382,14 +5382,40 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kIxLds + 1, (int)fn4::kIxNi);
     CHECK_EQ((int)fn4::kIxNi + 1, (int)fn4::kDs41Arcoded);   /* ds41-int10: lever ARC, appended */
     CHECK_EQ((int)fn4::kDs41Arcoded + 1, (int)fn4::kSchedRowCap);   /* ds41-int10: lever CAP48 (ds41-cap48), merged after ARC */
-    CHECK_EQ((int)fn4::kSchedRowCap + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kSchedRowCap + 1, (int)fn4::kDs41MixWv);   /* ds41-int11: levers 1U-MX, 1U-GQ, 1U-E2, appended */
+    CHECK_EQ((int)fn4::kDs41MixWv + 1, (int)fn4::kDs41Gq);
+    CHECK_EQ((int)fn4::kDs41Gq + 1, (int)fn4::kDs41E2);
+    CHECK_EQ((int)fn4::kDs41E2 + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
     CHECK_EQ((int)fn4::kPlaceHb, 49);
     CHECK_EQ((int)fn4::kStageFullPick, 51);
     CHECK_EQ((int)fn4::kIxNi, 54);
     CHECK_EQ((int)fn4::kDs41Arcoded, 55);
     CHECK_EQ((int)fn4::kSchedRowCap, 56);
-    CHECK_EQ((int)fn4::kSwitches, 57);
+    CHECK_EQ((int)fn4::kDs41MixWv, 57);
+    CHECK_EQ((int)fn4::kDs41E2, 59);
+    CHECK_EQ((int)fn4::kSwitches, 60);
+    CHECK_EQ(fn4::switch_index("ds41_mix_wv"), (int)fn4::kDs41MixWv);
+    CHECK_EQ(fn4::switch_index("ds41_gq"), (int)fn4::kDs41Gq);
+    CHECK_EQ(fn4::switch_index("ds41_e2"), (int)fn4::kDs41E2);
+    CHECK(!fn4::sched_switch(fn4::kDs41MixWv) && !fn4::sched_switch(fn4::kDs41Gq) && !fn4::sched_switch(fn4::kDs41E2));
+    {   /* ds41-int11: no plugin serves the three here: refused (any value), and GET "i11" all 0 */
+        for (const char* b : { R"({"ds41_mix_wv":12})", R"({"ds41_mix_wv":0})", R"({"ds41_gq":1})", R"({"ds41_e2":1})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        const HttpResponse g11 = f.get("/admin/fn4");
+        CHECK(has(g11.body, "\"i11\": {\"gq\": {\"declared\": 0, \"qkv_pairs\": 0, \"out_pairs\": 0}, "
+                            "\"e2\": {\"declared\": 0, \"splits\": 0, \"rows\": 0}, "
+                            "\"mx\": {\"wide_launches\": 0, \"wide_rows\": 0}}"));
+        int64_t v[fn4::kI11Stats];
+        fn4::i11_stats(v);
+        for (int i = 0; i < fn4::kI11Stats; ++i) CHECK_EQ(v[i], (int64_t)0);
+        std::string err;
+        CHECK(!fn4::check("ds41_gq", 1, &err));
+        CHECK(err.find("no loaded plugin serves it") != std::string::npos);
+    }
     CHECK_EQ(fn4::switch_index("sched_row_cap"), (int)fn4::kSchedRowCap);
     CHECK(!fn4::sched_switch(fn4::kSchedRowCap));   /* the scheduler reads it at every step it plans (fn4::sched_row_cap) */
     CHECK_EQ(fn4::switch_index("ds41_arcoded"), (int)fn4::kDs41Arcoded);
