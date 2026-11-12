@@ -52,6 +52,10 @@
 #include "rad_device.h"
 #include "exl3/exl3_abi.h"   /* EXL3 experts (radiance-exl3): the encoding, op schemas, operand positions */
 
+/* Lever 1U-XP's selection key (abi/rad_runtime.h), weak: a host built before it (rad-info, an older core) loads the plugin
+ * and the prediction then ranks by the logits, as before. */
+extern "C" int rad_expert_prefetch_route(RadCtx* c, int layer, rad_weight bias, int score) __attribute__((weak));
+
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -2301,7 +2305,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* Predict the next routed layer's experts from this router's input, on the compute stream
      * (rad_expert_prefetch). A failure only loses the prediction. */
     if (xp_next && xp_next->xp.n_parts > 0 && (!xp_live || xp_live->load(std::memory_order_relaxed) > 0)) {
-        if (xp_next->xp_score > 0)   /* lever 1U-XP: the next layer's selection key (host state, kept) */
+        if (xp_next->xp_score > 0 && rad_expert_prefetch_route)   /* lever 1U-XP: the next layer's selection key (host state, kept) */
             (void)rad_expert_prefetch_route(c_, xp_next->xp.layer, xp_next->xp_bias, xp_next->xp_score);
         (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, r0, rows, g.n_embd);
     }
