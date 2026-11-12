@@ -33,7 +33,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa", "stage_short",
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
-                                        "ds41_mix_wv", "ds41_gq", "ds41_e2" };
+                                        "ds41_mix_wv", "ds41_gq", "ds41_e2", "exl3_x3d" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -41,7 +41,7 @@ bool plugin_switch(int i) {
            i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk ||
            i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx || i == kDs41PskCr || i == kDs41Engdd ||
            i == kMhcFuse || i == kIxLds || i == kIxNi || i == kDs41Arcoded || i == kDs41MixWv || i == kDs41Gq ||
-           i == kDs41E2;
+           i == kDs41E2 || i == kExl3X3d;   /* exl3_x3d (60): the ds41-x3d exl3r4d (X3D-F) */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -633,7 +633,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
-                        "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
+                        "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, exl3_x3d, "
                         "epoch_bump)";
         return false;
     }
