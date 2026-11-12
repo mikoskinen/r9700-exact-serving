@@ -422,13 +422,15 @@ static void arll_case(const Plugin& pl, const std::vector<int>& devs) {
                fmt("OFF %lld wrong (first %lld), ON %lld wrong (first %lld), %d rank hash(es) differ", (long long)b0,
                    (long long)f0, (long long)b1, (long long)f1, hdiff));
         }
-        ok(fmt("ar_ll AR %s counters OFF: no LL launch, %d plain", pat_name(pat), (int)rows.size()).c_str(),
-           d0.v[0] == 0 && d0.v[1] == 0 && d0.v[6] == 0 && d0.v[4] == 0 && d0.v[5] == (long long)rows.size(), ctrs(d0));
+        /* The "plain" counter counts launches of at most 48 rows only (rad_arll_stats [5]): the T 49 / 64 launches never reach the
+         * LL pick, so they count nowhere -- 10 plain OFF, 0 ON (gpu02 12.11. 19:38: the first P0 expected 12 / 2 here). */
+        ok(fmt("ar_ll AR %s counters OFF: no LL launch, %lld plain of <= 48 rows", pat_name(pat), (long long)(n_one + n_two)).c_str(),
+           d0.v[0] == 0 && d0.v[1] == 0 && d0.v[6] == 0 && d0.v[4] == 0 && d0.v[5] == n_one + n_two, ctrs(d0));
         ok(fmt("ar_ll AR %s counters ON: %lld one-shot, %lld two-shot on rank 0 (%lld rows), 4 x that over the ranks, the "
-               "%lld past 48 rows plain, none declined", pat_name(pat), (long long)n_one, (long long)n_two,
+               "%lld past 48 rows plain (uncounted), none declined", pat_name(pat), (long long)n_one, (long long)n_two,
                (long long)n_ll_rows, (long long)n_plain).c_str(),
            d1.v[0] == n_one && d1.v[1] == n_two && d1.v[2] == n_ll_rows && d1.v[6] == 4 * (n_one + n_two) &&
-               d1.v[5] == n_plain && d1.v[4] == 0 && d1.v[3] == 0,
+               d1.v[5] == 0 && d1.v[4] == 0 && d1.v[3] == 0,
            ctrs(d1));
     }
     /* GATHER: the D3 case under ar_ll 1 */
