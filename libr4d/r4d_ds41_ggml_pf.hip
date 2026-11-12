@@ -477,8 +477,12 @@ int pf_launch(RadStream s, int ty, int code, bool f32out, const GgTiledArgs& A) 
 
 /* ---- the rule: a (type, N, K) -> form table. RADIANCE_DS41_GG_PF_TABLE at load ("q6_K:8192x1280=422,..." -- the
  * bench's GPTAB line; an entry naming an unknown form is skipped, named on stderr) overrides the built-in one, which
- * is empty until a bench has been read: a shape with no entry runs the stock kernel. */
-struct PfEnt { int ty, N, K, code; };
+ * is empty until a bench has been read: a shape with no entry runs the stock kernel.
+ * Lever A11 (GPF-1k, ds41-nc 12.11.2026): an entry may also name a row range, "type:NxK@LO-HI=form" (form 0 = the stock
+ * kernel there), read only under gg_pf 2: a launch of LO <= M <= HI rows takes the first such entry of its shape, any
+ * other launch the plain entries as under gg_pf 1. gg_pf 1 ignores the ranged entries (int12's rule to the launch). Every
+ * form keeps the stock kernel's per-output arithmetic, so the choice moves time, never bytes. */
+struct PfEnt { int ty, N, K, code, lo = 0, hi = 0; };   /* hi 0: a plain entry (every M) */
 const PfEnt kPfBuiltin[] = { { -1, 0, 0, 0 } };
 
 std::vector<PfEnt> pf_table_env() {
@@ -493,8 +497,16 @@ std::vector<PfEnt> pf_table_env() {
         const std::string e = s.substr(p, q - p);
         p = q + 1;
         char tn[16] = {0};
-        int N = 0, K = 0, code = 0;
-        if (std::sscanf(e.c_str(), "%15[^:]:%dx%d=%d", tn, &N, &K, &code) != 4 || !pf_form_known(code) || code >= 1000) {
+        int N = 0, K = 0, code = 0, lo = 0, hi = 0, used = 0;
+        const bool ranged = e.find('@') != std::string::npos;
+        if (ranged) {   /* lever A11: "type:NxK@LO-HI=form", form 0 = the stock kernel in that range */
+            if (std::sscanf(e.c_str(), "%15[^:]:%dx%d@%d-%d=%d%n", tn, &N, &K, &lo, &hi, &code, &used) != 6 ||
+                used != (int)e.size() || lo < 49 || hi < lo || (code != 0 && (!pf_form_known(code) || code >= 1000))) {
+                std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_GG_PF_TABLE entry '%s' skipped (type:NxK@LO-HI=form, "
+                                     "49 <= LO <= HI)\n", e.c_str());
+                continue;
+            }
+        } else if (std::sscanf(e.c_str(), "%15[^:]:%dx%d=%d", tn, &N, &K, &code) != 4 || !pf_form_known(code) || code >= 1000) {
             std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_GG_PF_TABLE entry '%s' skipped (type:NxK=form)\n", e.c_str());
             continue;
         }
@@ -503,20 +515,28 @@ std::vector<PfEnt> pf_table_env() {
             std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_GG_PF_TABLE entry '%s' skipped (type)\n", e.c_str());
             continue;
         }
-        t.push_back({ ty, N, K, code });
+        t.push_back({ ty, N, K, code, ranged ? lo : 0, ranged ? hi : 0 });
     }
-    std::fprintf(stderr, "radiance: libr4d: lever GPF form table from RADIANCE_DS41_GG_PF_TABLE: %zu entries\n", t.size());
+    size_t nr = 0;
+    for (const PfEnt& x : t) nr += x.hi > 0;
+    std::fprintf(stderr, "radiance: libr4d: lever GPF form table from RADIANCE_DS41_GG_PF_TABLE: %zu entries\n", t.size() - nr);
+    if (nr > 0)   /* lever A11: only when the table has ranged entries (int12's table prints int12's line alone) */
+        std::fprintf(stderr, "radiance: libr4d: lever A11 (GPF-1k): %zu row-ranged entries in RADIANCE_DS41_GG_PF_TABLE, "
+                             "taken under gg_pf 2 only\n", nr);
     return t;
 }
 const std::vector<PfEnt>& pf_table() {
     static const std::vector<PfEnt> t = pf_table_env();
     return t;
 }
-int pf_rule(int ty, int N, int K) {
+int pf_rule(int ty, int N, int K, int M, bool ranged) {
     const std::vector<PfEnt>& t = pf_table();
     if (!t.empty()) {
+        if (ranged)   /* lever A11 (gg_pf 2): a row-ranged entry of the shape that holds M first */
+            for (const PfEnt& e : t)
+                if (e.hi > 0 && e.ty == ty && e.N == N && e.K == K && M >= e.lo && M <= e.hi) return e.code;
         for (const PfEnt& e : t)
-            if (e.ty == ty && e.N == N && e.K == K) return e.code;
+            if (e.hi == 0 && e.ty == ty && e.N == N && e.K == K) return e.code;
         return 0;
     }
     for (const PfEnt& e : kPfBuiltin)
@@ -524,7 +544,8 @@ int pf_rule(int ty, int N, int K) {
     return 0;
 }
 
-bool pf_value_known(int v) { return v == 0 || v == 1 || (v < 1000 && pf_form_known(v)); }
+/* 2 (lever A11) = the rule with the row-ranged entries; a form code is >= 222 */
+bool pf_value_known(int v) { return v == 0 || v == 1 || v == 2 || (v < 1000 && pf_form_known(v)); }
 
 int pf_env() {
     const char* v = std::getenv("RADIANCE_DS41_GG_PF");
@@ -558,7 +579,7 @@ int r4d_gg_pf_gemm(RadStream s, const R4dGgPfCall& c) {
     if (c.ty != GG_Q5_K && c.ty != GG_Q6_K && c.ty != GG_Q8_0) return R4D_GG_PF_DECLINE;
     if (c.M < 1 || c.N < 1 || c.K < 2 * kWmS || c.K % (2 * kWmS)) return R4D_GG_PF_DECLINE;
     int code = g_pf_pin != 0 ? g_pf_pin : g_pf_on.load(std::memory_order_relaxed);
-    if (code == -1 || code == 1) code = pf_rule(c.ty, c.N, c.K);
+    if (code == -1 || code == 1 || code == 2 || code == -2) code = pf_rule(c.ty, c.N, c.K, c.M, code == 2 || code == -2);
     if (code == 0 || !pf_form_known(code)) return R4D_GG_PF_DECLINE;
     GgTiledArgs A{};
     A.x = c.x; A.x_ld = c.x_ld;
@@ -571,8 +592,11 @@ int r4d_gg_pf_gemm(RadStream s, const R4dGgPfCall& c) {
 }
 
 /* r4d_gg_pf_pin (bench / test hook, r4d_selftest --gpcheck / --perfgp): 0 clears the pin (the runtime switch decides,
- * off by default), -1 forces the rule, a form code (ablations included) pins that form for every shape. */
-extern "C" void r4d_gg_pf_pin(int code) { g_pf_pin = (code == -1 || pf_form_known(code)) ? code : 0; }
+ * off by default), -1 forces the rule, -2 the rule with the row-ranged entries (lever A11), a form code (ablations
+ * included) pins that form for every shape. */
+extern "C" void r4d_gg_pf_pin(int code) { g_pf_pin = (code == -1 || code == -2 || pf_form_known(code)) ? code : 0; }
+/* Lever A11 test hook: the form the rule gives a (type, N, K, M) launch, the ranged entries read or not (0 = stock). */
+extern "C" int r4d_gg_pf_rule(int ty, int N, int K, int M, int ranged) { return pf_rule(ty, N, K, M, ranged != 0); }
 /* The last launch's form ("form 422"), for the bench's lines. */
 extern "C" const char* r4d_gg_pf_last() { return g_pf_last; }
 /* The forms this build has, as codes (the bench iterates them): writes up to `cap`, returns the count. */

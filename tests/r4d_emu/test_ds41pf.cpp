@@ -13,6 +13,11 @@
  * 384 and 1024 (compressor kv | gate), M 49 / 64 / 97 / 130, for f32 weights and for bf16 weights (the
  * RADIANCE_DS41_ROUTER_BF16 storage), pitches past the widths; tail columns of the output pitch must stay untouched.
  *
+ * Lever A11 (GPF-1k, ds41-nc): the table's row-ranged entries ("type:NxK@LO-HI=form", form 0 = the stock kernel) --
+ * parsed (malformed ones skipped), taken under gg_pf 2 / pin -2 only and only for LO <= M <= HI, gg_pf 1 the plain
+ * entries alone (int12's rule) -- and the launches they pick byte-identical to the stock kernel. Runs first: the table is
+ * read once, at the first rule.
+ *
  *   r4d_emu_ds41pf [quick]      quick: one K, two M (and fewer f32 cases) */
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -34,6 +39,7 @@ extern "C" int r4d_gg_pf_forms(int* out, int cap);
 extern "C" void r4d_f32pf_pin(int code);
 extern "C" const char* r4d_f32pf_last();
 extern "C" int r4d_f32pf_forms(int* out, int cap);
+extern "C" int r4d_gg_pf_rule(int ty, int N, int K, int M, int ranged);
 
 namespace {
 
@@ -90,10 +96,66 @@ std::vector<uint8_t> make_w(const Ty& t, int N, int K) {
     return w;
 }
 
+/* Lever A11: the ranged table's rule and its launches (before anything reads the table). */
+void a11_check() {
+    setenv("RADIANCE_DS41_GG_PF_TABLE",
+           "q6_K:300x768=426,q6_K:300x768@60-100=222,q6_K:300x768@101-120=0,q8_0:300x768@49-200=321,"
+           "q6_K:300x768@40-50=222,q6_K:300x768@70-60=222,q6_K:300x768@60-90=999,q6_K:300x768@60-90=222x,bad", 1);
+    struct Want { int ty, M, ranged, code; };
+    const Want ws[] = { { Q6_K, 64, 0, 426 }, { Q6_K, 64, 1, 222 }, { Q6_K, 60, 1, 222 }, { Q6_K, 100, 1, 222 },
+                        { Q6_K, 101, 1, 0 }, { Q6_K, 120, 1, 0 }, { Q6_K, 121, 1, 426 }, { Q6_K, 59, 1, 426 },
+                        { Q6_K, 110, 0, 426 }, { Q8_0, 64, 0, 0 }, { Q8_0, 64, 1, 321 }, { Q8_0, 201, 1, 0 },
+                        { Q5_K, 64, 1, 0 }, { Q5_K, 64, 0, 0 } };
+    int bad = 0;
+    for (const Want& w : ws) {
+        const int got = r4d_gg_pf_rule(w.ty, 300, 768, w.M, w.ranged);
+        ++g_cases;
+        if (got != w.code) {
+            std::printf("FAIL A11 rule ty %d M=%d ranged %d: form %d, want %d\n", w.ty, w.M, w.ranged, got, w.code);
+            ++bad;
+        }
+    }
+    /* the switch: gg_pf 1 / 2 / pin -2 through r4d_gg_pf_gemm, each launch against the stock kernel's bytes */
+    const Ty& t = kTypes[1];   /* q6_K */
+    const int N = 300, K = 768;
+    const std::vector<uint8_t> w = make_w(t, N, K);
+    const long long w_ld = (long long)K / t.qk * t.bb;
+    struct Case { int sw, pin, M, rc; const char* last; };
+    const Case cs[] = { { 1, 0, 64, 0, "form 426" }, { 2, 0, 64, 0, "form 222" }, { 2, 0, 111, 1, nullptr },
+                        { 2, 0, 130, 0, "form 426" }, { 0, -2, 64, 0, "form 222" }, { 0, -1, 64, 0, "form 426" },
+                        { 0, 0, 64, 1, nullptr } };
+    for (const Case& k : cs) {
+        std::vector<uint16_t> x((size_t)k.M * K);
+        for (int m = 0; m < k.M; ++m) fill_row(x.data() + (size_t)m * K, K, m % 7 == 0 ? 1 : 0);
+        std::vector<uint8_t> ref((size_t)k.M * N * 2, 0xA5), got((size_t)k.M * N * 2, 0xC3);
+        R4dGgPfCall c{ t.ty, false, x.data(), (long long)K, w.data(), w_ld, ref.data(), (long long)N, k.M, N, K };
+        if (r4d_gg_pf_emu_stock(c) != 0) { std::printf("FAIL A11 stock launch M=%d\n", k.M); ++bad; continue; }
+        c.y = got.data();
+        if (r4d_gg_pf_set(k.sw) != 1) { std::printf("FAIL A11 gg_pf %d refused\n", k.sw); ++bad; continue; }
+        r4d_gg_pf_pin(k.pin);
+        const int rc = r4d_gg_pf_gemm(nullptr, c);
+        r4d_gg_pf_pin(0);
+        r4d_gg_pf_set(0);
+        ++g_cases;
+        const bool last_ok = !k.last || !std::strcmp(r4d_gg_pf_last(), k.last);
+        if (rc != k.rc || !last_ok || (rc == 0 && got != ref)) {
+            std::printf("FAIL A11 gg_pf %d pin %d M=%d: rc %d (want %d), last '%s' (want '%s'), bytes %s\n", k.sw, k.pin, k.M,
+                        rc, k.rc, r4d_gg_pf_last(), k.last ? k.last : "-", rc == 0 ? (got == ref ? "identical" : "DIFFER") : "-");
+            ++bad;
+        }
+    }
+    if (r4d_gg_pf_known(2) != 1 || r4d_gg_pf_known(3) != 0) { std::printf("FAIL A11 gg_pf 2 / 3 known %d / %d\n", r4d_gg_pf_known(2), r4d_gg_pf_known(3)); ++bad; }
+    ++g_cases;
+    g_fail += bad;
+    std::printf("A11 ranged table: %s (%d failures)\n", bad ? "FAIL" : "ok", bad);
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const bool quick = argc > 1 && !std::strcmp(argv[1], "quick");
+    a11_check();
     const std::vector<int> Ks = quick ? std::vector<int>{ 768 } : std::vector<int>{ 256, 768, 1280 };
     const std::vector<int> Ms = quick ? std::vector<int>{ 49, 111 } : std::vector<int>{ 49, 64, 97, 111 };
     int fbuf[64];
