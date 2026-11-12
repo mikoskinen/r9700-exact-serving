@@ -104,6 +104,16 @@ inline bool sahb_arms(int stage_short, bool capable, bool enc, bool has_prefill,
            span_rows > 0 && level_rows == span_rows && mixed_ok;
 }
 
+/* Lever SP (ds41-int9, fn4 stage_full_min; Engine::arena_step): whether a full-plan step (arena level 0: on DeepSeek-V4.1
+ * at --prefill-span 2 a LONE step of 2113 .. 4160 rows -- a new turn's tail, a lone short prompt, a long prompt's spanned
+ * chunk) is left UNARMED, its pooled experts read in place by the grouped GEMMs (in-kernel streaming) as at every other
+ * level. Only with the switch on (N = stage_full_min > 0), for a step that is no encoder pass, at the full plan, with
+ * fewer than N tokens. 0, every level but the full plan, and every full-plan step of at least N tokens: today's rule (the
+ * full plan's ring, the stager's own size rule in begin_pass). Placement only: which address a GEMM reads, never its bytes. */
+inline bool sp_full_streams(int stage_full_min, bool enc, int64_t n_tok, int level) {
+    return stage_full_min > 0 && !enc && level == 0 && n_tok < (int64_t)stage_full_min;
+}
+
 /* One routed layer a stager serves: its units and the span of ops that read them. */
 struct StagedLayer {
     int32_t              layer = -1;
@@ -145,8 +155,9 @@ public:
      * level, Engine::arena_step) and, for such a step, which pooled units its layers copy: `pick` 0 every pooled unit
      * of the layer (the full-plan rule), K >= 1 only the units one of the last K trunk passes of the stager's size
      * routed (note_routed). The others stay at their pool slots and are read in place, as in an unarmed pass. A
-     * full-plan step (short false) always copies every pooled unit. Which address a GEMM reads changes; its bytes
-     * do not (the copies are the pool's bytes), so the pick is placement only. */
+     * full-plan step (short false) copies every pooled unit unless lever SP's stage_full_pick says otherwise
+     * (set_full). Which address a GEMM reads changes; its bytes do not (the copies are the pool's bytes), so the pick
+     * is placement only. */
     void set_short(bool on, int pick) { short_next_ = on; pick_next_ = on && pick > 0 ? pick : 0; }
     /* The routing of one trunk layer of trunk step `step`, a pass of the stager's size (the engine passes only those:
      * at least min_rows() tokens): every unit of `layer` whose expert `counts` routes (count > 0) is stamped with
@@ -162,6 +173,30 @@ public:
         int64_t big_steps = 0, expect_units = 0, expect_bytes = 0, expect_sum_units = 0, expect_n = 0;
     };
     const SahbStats& sahb() const { return sa_; }
+
+    /* ---- lever SP (ds41-int9, fn4 stage_full_min / stage_full_pick) ----------------------------------------------
+     *
+     * Per step, before release: whether the step runs at the full plan with the full plan's ring (`full`, the engine's
+     * level 0 with a ring: Engine::arena_step) and, for such a step, which pooled units its layers copy -- `pick` 0
+     * every pooled unit of the layer (today's full-plan rule), K >= 1 only the units one of the last K trunk passes of
+     * the stager's size routed (note_routed, lever SA's stamps); the rest are read in place, as in an unarmed pass.
+     * `streamed`: the engine left this full-plan step unarmed under stage_full_min (sp_full_streams; the ring is null),
+     * counted at begin_pass when the stager's own rule would have armed it. A stage_short step (set_short) is never a
+     * full one. Which address a GEMM reads changes; its bytes do not (the copies are the pool's bytes). */
+    void set_full(bool full, int pick, bool streamed) {
+        full_next_ = full;
+        fpick_next_ = full && pick > 0 ? pick : 0;
+        sp_stream_next_ = streamed;
+    }
+    /* Counters (the engine's GET "sp"), cumulative: full-plan trunk passes armed, their tokens, layers / units / bytes
+     * copied (the whole full-plan staging, every pick), the pooled units a stage_full_pick pass kept and left in place,
+     * and the full-plan trunk passes stage_full_min left unarmed (that the stager's size rule would have armed) with
+     * their tokens. */
+    struct SpStats {
+        int64_t full_steps = 0, full_rows = 0, full_layers = 0, full_units = 0, full_bytes = 0;
+        int64_t full_pick_kept = 0, full_pick_dropped = 0, stream_steps = 0, stream_rows = 0;
+    };
+    const SpStats& sp() const { return sp_; }
 
     bool    enabled() const { return !layers_.empty(); }
     int64_t ring_bytes() const { return ring_; }
@@ -251,6 +286,10 @@ private:
     std::deque<int32_t> recent_;
     SahbStats sa_;
     std::vector<int32_t> pick_buf_, one_;
+    /* Lever SP: the next pass's set_full, this pass's (taken at begin_pass; pick_ then holds the full pick), the counters. */
+    bool full_next_ = false, full_ = false, sp_stream_next_ = false;
+    int  fpick_next_ = 0;
+    SpStats sp_;
     void expect_now();
     /* Lever PSK design 2: set_layer_end's layer, and the routed layers (layers_ entries) the armed pass runs. */
     int32_t layer_end_ = INT32_MAX;

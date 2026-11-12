@@ -4993,6 +4993,17 @@ void Engine::sahb_setup() {
     fn4::note_sched(fn4::kStageShort, 0);
     fn4::note_sched(fn4::kStagePick, 0);
     fn4::note_sched(fn4::kPlaceHb, 0);
+    /* Lever SP (ds41-int9, fn4 stage_full_min / stage_full_pick): a prefill stager on every rank; both start at 0
+     * (today's full-plan rule). Said nowhere at start: GET "sp" carries "capable"; fn4 logs every change it applies. */
+    bool sp = !ranks_.empty();
+    for (auto& r : ranks_) sp = sp && r->stager.enabled();
+    sp_capable_ = sp;
+    stage_full_min_.store(0, std::memory_order_relaxed);
+    stage_full_pick_.store(0, std::memory_order_relaxed);
+    for (auto& r : ranks_) r->stager.set_full(false, 0, false);
+    fn4::sp_register(sp);
+    fn4::note_sched(fn4::kStageFullMin, 0);
+    fn4::note_sched(fn4::kStageFullPick, 0);
     const Rank& r0 = *ranks_[0];
     int64_t span_lent = 0, span_lent_sa = 0;
     for (size_t k = 1; k < arena_rows_.size() && k < r0.arena_lent.size() && k < r0.arena_lent_sa.size(); ++k)

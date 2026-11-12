@@ -5362,7 +5362,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
      * (lever E1, deepseek41's: -1 here), sched_noa (lever NOA, the core's: 0), stage_short / stage_pick / place_hb (levers SA / HB) */
     CHECK(has(f.get("/admin/fn4").body,
               "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1, \"ds41_engdd\": -1, "
-              "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0}"));
+              "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, \"stage_full_min\": 0, "
+              "\"stage_full_pick\": 0}"));   /* ds41-int9: lever SP appended after place_hb */
     CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
     CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
     CHECK_EQ(fn4::switch_index("ds41_psk_cr"), (int)fn4::kDs41PskCr);
@@ -5372,9 +5373,15 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kSchedNoa + 1, (int)fn4::kStageShort);
     CHECK_EQ((int)fn4::kStageShort + 1, (int)fn4::kStagePick);
     CHECK_EQ((int)fn4::kStagePick + 1, (int)fn4::kPlaceHb);
-    CHECK_EQ((int)fn4::kPlaceHb + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kPlaceHb + 1, (int)fn4::kStageFullMin);   /* ds41-int9: lever SP, appended */
+    CHECK_EQ((int)fn4::kStageFullMin + 1, (int)fn4::kStageFullPick);
+    CHECK_EQ((int)fn4::kStageFullPick + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
-    CHECK_EQ((int)fn4::kSwitches, 50);
+    CHECK_EQ((int)fn4::kPlaceHb, 49);
+    CHECK_EQ((int)fn4::kSwitches, 52);
+    CHECK_EQ(fn4::switch_index("stage_full_min"), (int)fn4::kStageFullMin);
+    CHECK_EQ(fn4::switch_index("stage_full_pick"), (int)fn4::kStageFullPick);
+    CHECK(fn4::sched_switch(fn4::kStageFullMin) && fn4::sched_switch(fn4::kStageFullPick));
     CHECK(!fn4::sched_switch(fn4::kDs41PskL20) && !fn4::sched_switch(fn4::kDsparkPfctx) &&
           !fn4::sched_switch(fn4::kDs41PskCr));
     {   /* no plugin serves a plan, a replay plan or a reach here */
@@ -5403,7 +5410,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
      * registered, per rank. */
     {
         const HttpResponse g0 = f.get("/admin/fn4");
-        CHECK(has(g0.body, "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0}"));   /* ds41-int8: after sched_noa */
+        CHECK(has(g0.body, "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, "
+                           "\"stage_full_min\": 0, \"stage_full_pick\": 0}"));   /* ds41-int8: after sched_noa; int9: SP after */
         CHECK(!has(g0.body, "\"sahb\": {"));
         const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_short":1025})");
         CHECK_EQ(s0.status, 400);
@@ -5458,6 +5466,64 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         fn4::note_sahb(0, z);
         fn4::note_sahb(1, z);
         fn4::sahb_register(false, false);
+    }
+    /* Lever SP (ds41-int9): stage_full_min 0 .. 1048576, stage_full_pick 0 .. 64, appended after place_hb; either > 0
+     * refused until an engine registered SP capable; GET "sp" once registered, per rank; the values handed to the
+     * engine at the release; pinned at the same value: no epoch. */
+    {
+        const HttpResponse g0 = f.get("/admin/fn4");
+        CHECK(has(g0.body, "\"place_hb\": 0, \"stage_full_min\": 0, \"stage_full_pick\": 0}"));
+        CHECK(!has(g0.body, "\"sp\": {"));
+        const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_full_min":4097})");
+        CHECK_EQ(s0.status, 400);
+        CHECK(has(s0.body, "no engine has registered it"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_pick":1})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":-1})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":1048577})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_pick":65})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_pick":-1})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":0,"stage_full_pick":0})").status, 200);   /* 0 always */
+        CHECK(!fn4::apply_pending(46, sw));                                                             /* same value */
+        fn4::sp_register(false);
+        const HttpResponse s1 = f.post("/admin/fn4", R"({"stage_full_min":4097})");
+        CHECK_EQ(s1.status, 400);
+        CHECK(has(s1.body, "no prefill stager on every rank"));
+        CHECK(has(f.get("/admin/fn4").body, "\"sp\": {\"capable\": 0, \"ranks\": []}"));
+        fn4::sp_register(true);
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":4161,"stage_full_pick":2})").status, 200);
+        CHECK(fn4::apply_pending(47, sw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(sw[fn4::kStageFullMin], 4161);
+        CHECK_EQ(sw[fn4::kStageFullPick], 2);
+        CHECK_EQ(sw[fn4::kStageShort], fn4::kNoChange);
+        CHECK_EQ(sw[fn4::kStagePick], fn4::kNoChange);
+        fn4::note_sched(fn4::kStageFullMin, 4161);
+        fn4::note_sched(fn4::kStageFullPick, 2);
+        CHECK_EQ(fn4::value(fn4::kStageFullMin), 4161);
+        CHECK_EQ(fn4::value(fn4::kStageFullPick), 2);
+        const int64_t v1[fn4::kSpN] = { 3, 7400, 120, 2900, 30408704000, 2800, 410, 5, 11800 };
+        fn4::note_sp(1, v1);
+        const HttpResponse g1 = f.get("/admin/fn4");
+        CHECK(has(g1.body, "\"stage_full_min\": 4161, \"stage_full_pick\": 2}"));
+        CHECK(has(g1.body, "\"sp\": {\"capable\": 1, \"ranks\": [{\"rank\": 0, \"full_steps\": 0"));
+        CHECK(has(g1.body, "{\"rank\": 1, \"full_steps\": 3, \"full_rows\": 7400, \"full_layers\": 120, "
+                           "\"full_units\": 2900, \"full_bytes\": 30408704000, \"full_pick_kept\": 2800, "
+                           "\"full_pick_dropped\": 410, \"stream_steps\": 5, \"stream_rows\": 11800}]}"));
+        const uint64_t e1 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":4161})").status, 200);
+        CHECK(!fn4::apply_pending(48, sw));
+        CHECK_EQ(fn4::epoch(), e1);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_full_min":0,"stage_full_pick":0})").status, 200);
+        CHECK(fn4::apply_pending(49, sw));
+        CHECK_EQ(sw[fn4::kStageFullMin], 0);
+        CHECK_EQ(sw[fn4::kStageFullPick], 0);
+        fn4::note_sched(fn4::kStageFullMin, 0);
+        fn4::note_sched(fn4::kStageFullPick, 0);
+        const int64_t z[fn4::kSpN] = {};
+        fn4::note_sp(0, z);
+        fn4::note_sp(1, z);
+        fn4::sp_register(false);
     }
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));

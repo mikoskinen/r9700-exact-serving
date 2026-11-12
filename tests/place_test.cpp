@@ -3980,6 +3980,215 @@ TEST(sahb_a_short_pass_copies_only_the_pooled_units_recent_steps_routed) {
     rad_stream_destroy(compute);
 }
 
+/* ---- lever SP (ds41-int9, fn4 stage_full_min / stage_full_pick) ------------------------------------------------
+ *
+ * The streaming rule (sp_full_streams, Engine::arena_step): only with the switch on, a step that is no encoder pass, at
+ * the full plan (level 0), with fewer than N tokens. Each refusal is its own case, and the one accepted case flips with
+ * each input. On DeepSeek-V4.1 at --prefill-span 2 the full plan is 4160 rows and the span's shared level 2112, so a
+ * full-plan step has 2113 .. 4160 tokens: N 4097 streams a new turn's tail and every lone step below a long prompt's
+ * 4096-row chunk; N 4161 (above the full plan) streams every full-plan step. */
+TEST(sp_the_full_plan_streams_below_n_only) {
+    /* stage_full_min, enc, n_tok, level */
+    CHECK(sp_full_streams(3001, false, 2386, 0));      /* a scr3 new-turn tail of 2386 rows under N 3001 */
+    CHECK(!sp_full_streams(0, false, 2386, 0));        /* off: today (the full plan's ring) */
+    CHECK(!sp_full_streams(3001, true, 2386, 0));      /* an encoder pass */
+    CHECK(!sp_full_streams(3001, false, 3001, 0));     /* exactly N: armed as today */
+    CHECK(!sp_full_streams(3001, false, 4096, 0));     /* above N: armed as today */
+    CHECK(sp_full_streams(3002, false, 3001, 0));      /* one below N */
+    CHECK(!sp_full_streams(3001, false, 2000, 4));     /* the span's shared level (lever SA's, never SP's) */
+    CHECK(!sp_full_streams(3001, false, 900, 3));      /* another level */
+    CHECK(sp_full_streams(4161, false, 4160, 0));      /* N above the full plan: every full-plan step streams */
+    CHECK(sp_full_streams(4097, false, 4096, 0));      /* a long prompt's lone 4096-row chunk under N 4097 */
+    CHECK(!sp_full_streams(4096, false, 4096, 0));     /* ... and armed under N 4096 */
+    CHECK(sp_full_streams(1, false, 0, 0) && !sp_full_streams(1, false, 1, 0));   /* N 1: only an empty step */
+}
+
+/* The full pick and the counters: under stage_full_pick K an armed full-plan pass (set_full true) copies only the
+ * pooled units one of the last K recorded steps routed (lever SA's stamps); the rest stay at their pool slots (read in
+ * place). The copies hold the pool's bytes. Controls: K 0 copies every pooled unit (today's full plan, counted the
+ * same); a stage_short pass is never a full one; lever SA's counters never move for a full pass; a pass left
+ * unarmed by stage_full_min (no ring, `streamed`) copies nothing and counts a stream step only at the stager's size. */
+TEST(sp_a_full_pass_copies_only_the_picked_units_and_counts_the_full_plan) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    std::vector<rad_weight> lw[2];
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e)
+            lw[l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." + std::to_string(e) + ".weight",
+                                     1 * MiB, RAD_ACCESS_CONDITIONAL, l, e));
+    f.op("attn0", {}, false);
+    f.op("moe0", lw[0], false);
+    f.op("attn1", {}, false);
+    f.op("moe1", lw[1], false);
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 12;
+    cfg.host_pool_mib = 64;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    std::vector<int32_t> pooled[2], resident[2];
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e)
+            (plan.weight[lw[l][(size_t)e]].tier == Tier::HostPinned ? pooled[l] : resident[l]).push_back(e);
+    REQUIRE(pooled[0].size() >= 2 && pooled[1].size() >= 2 && !resident[0].empty());
+    const int64_t n_pooled = (int64_t)(pooled[0].size() + pooled[1].size());
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) home[w] = m.residency()->lookup(w)->ptr;
+
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT), half = each * 8;
+    std::vector<char> region((size_t)(4 * half));
+    char* const low = region.data() + 2 * half;
+    auto at = [&](int l, int e) { return (const char*)m.residency()->lookup(lw[l][(size_t)e])->ptr; };
+    auto in_full = [&](int l, int e) { return at(l, e) >= region.data() && at(l, e) < region.data() + 2 * half; };
+    auto in_low = [&](int l, int e) { return at(l, e) >= low && at(l, e) < low + 2 * half; };
+    auto is_home = [&](int l, int e) { return at(l, e) == home[lw[l][(size_t)e]]; };
+
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), low, 2 * half, 64));
+    REQUIRE(st.enabled());
+    RadBatch b{};
+    b.n_tok = 2386;
+    bool resync = false;
+
+    /* Step 100 routes each layer's first pooled expert and layer 0's first resident one. */
+    int32_t c0[8] = {}, c1[8] = {};
+    c0[pooled[0][0]] = 5;
+    c0[resident[0][0]] = 3;
+    c1[pooled[1][0]] = 2;
+    st.note_routed(0, c0, 8, 100);
+    st.note_routed(1, c1, 8, 100);
+
+    /* stage_full_pick 1: an armed full-plan pass copies the two units step 100 routed, nothing else. */
+    st.set_ring(st.ring_full());
+    st.set_short(false, 0);
+    st.set_full(true, 1, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(resync);
+    CHECK(in_full(0, pooled[0][0]));
+    CHECK(in_full(1, pooled[1][0]));
+    for (int l = 0; l < 2; ++l)
+        for (size_t i = 1; i < pooled[l].size(); ++i) CHECK(is_home(l, pooled[l][i]));
+    for (int e : resident[0]) CHECK(is_home(0, e));    /* a resident unit is never staged */
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_EQ(std::memcmp(at(0, pooled[0][0]), home[lw[0][(size_t)pooled[0][0]]], (size_t)MiB), 0);
+    CHECK_EQ(std::memcmp(at(1, pooled[1][0]), home[lw[1][(size_t)pooled[1][0]]], (size_t)MiB), 0);
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+    CHECK_EQ(st.sp().full_steps, (int64_t)1);
+    CHECK_EQ(st.sp().full_rows, (int64_t)2386);
+    CHECK_EQ(st.sp().full_layers, (int64_t)2);
+    CHECK_EQ(st.sp().full_units, (int64_t)2);
+    CHECK_EQ(st.sp().full_bytes, 2 * MiB);
+    CHECK_EQ(st.sp().full_pick_kept, (int64_t)2);
+    CHECK_EQ(st.sp().full_pick_dropped, n_pooled - 2);
+    CHECK_EQ(st.sp().stream_steps, (int64_t)0);
+    /* lever SA's counters do not move for a full pass */
+    CHECK_EQ(st.sahb().short_steps, (int64_t)0);
+    CHECK_EQ(st.sahb().short_units, (int64_t)0);
+    CHECK_EQ(st.sahb().pick_kept, (int64_t)0);
+    CHECK_EQ(st.sahb().pick_dropped, (int64_t)0);
+
+    /* CONTROL: stage_full_pick 0 = today's full plan, every pooled unit, counted as a full pass; no pick counted. */
+    st.set_full(true, 0, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(in_full(l, e));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK_EQ(std::memcmp(at(l, e), home[lw[l][(size_t)e]], (size_t)MiB), 0);
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sp().full_steps, (int64_t)2);
+    CHECK_EQ(st.sp().full_units, (int64_t)(2 + n_pooled));
+    CHECK_EQ(st.sp().full_bytes, (2 + n_pooled) * MiB);
+    CHECK_EQ(st.sp().full_pick_kept, (int64_t)2);
+    CHECK_EQ(st.sp().full_pick_dropped, n_pooled - 2);
+
+    /* CONTROL: the same pass with set_full false (an int8 engine never calls it) copies every pooled unit too and
+     * counts nothing of lever SP: the pick is SP's alone. */
+    st.set_full(false, 1, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(in_full(l, e));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sp().full_steps, (int64_t)2);
+    CHECK_EQ(st.sp().full_units, (int64_t)(2 + n_pooled));
+
+    /* K: step 101 routes layer 0's second pooled expert only. Under pick 1 that one alone; under pick 2 both steps'. */
+    int32_t d0[8] = {};
+    d0[pooled[0][1]] = 1;
+    st.note_routed(0, d0, 8, 101);
+    st.set_full(true, 1, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_full(0, pooled[0][1]));
+    CHECK(is_home(0, pooled[0][0]));
+    CHECK(is_home(1, pooled[1][0]));
+    CHECK_OK(st.end_pass(compute));
+    st.set_full(true, 2, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_full(0, pooled[0][0]));
+    CHECK(in_full(0, pooled[0][1]));
+    CHECK(in_full(1, pooled[1][0]));
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+    CHECK_EQ(st.sp().full_steps, (int64_t)4);
+
+    /* A stage_short pass is never a full one: lever SA's pick applies, lever SP counts nothing. */
+    const PrefillStager::SpStats before = st.sp();
+    b.n_tok = 1106;
+    st.set_ring(st.ring_low());
+    st.set_short(true, 1);
+    st.set_full(true, 2, false);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_low(0, pooled[0][1]));
+    CHECK(is_home(0, pooled[0][0]));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sahb().short_steps, (int64_t)1);
+    CHECK_EQ(st.sp().full_steps, before.full_steps);
+    CHECK_EQ(st.sp().full_units, before.full_units);
+    CHECK_EQ(st.sp().full_pick_kept, before.full_pick_kept);
+
+    /* stage_full_min: a full-plan step the engine left without a ring copies nothing; a stream step is counted when
+     * the stager's own size rule would have armed it, not below min_rows. */
+    st.set_short(false, 0);
+    st.set_ring(nullptr);
+    st.set_full(false, 0, true);
+    b.n_tok = 2386;
+    CHECK(!st.begin_pass(&b));
+    CHECK(!st.staged());
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+    CHECK_EQ(st.sp().stream_steps, (int64_t)1);
+    CHECK_EQ(st.sp().stream_rows, (int64_t)2386);
+    CHECK_EQ(st.sp().full_steps, before.full_steps);
+    b.n_tok = 32;                                       /* below min_rows (64): no stream step */
+    CHECK(!st.begin_pass(&b));
+    CHECK_EQ(st.sp().stream_steps, (int64_t)1);
+    st.set_full(false, 0, false);                       /* unarmed for another reason: not SP's */
+    b.n_tok = 2386;
+    CHECK(!st.begin_pass(&b));
+    CHECK_EQ(st.sp().stream_steps, (int64_t)1);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
 /* ---- lever HB (ds41-sahb, fn4 place_hb): the reserve by the long-memory prefill heat ----------------------------
  *
  * Fixture: experts 0-3 resident, 4-7 pooled; decode pin 0.5. Prompts route experts 5 and 6; decode rows route 0, 1

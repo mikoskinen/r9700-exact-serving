@@ -686,6 +686,10 @@ private:
      * the switches as applied, and the ranks place_hb acts on (RADIANCE_PLACE_HB_RANKS, a bit a rank; all unset). */
     bool             sa_capable_ = false, hb_capable_ = false;
     std::atomic<int> stage_short_{0}, stage_pick_{0}, place_hb_{0};
+    /* Lever SP (ds41-int9; fn4 stage_full_min / stage_full_pick): whether it can act (a prefill stager on every rank,
+     * Engine::sahb_setup), the switches as applied (read by arena_step). */
+    bool             sp_capable_ = false;
+    std::atomic<int> stage_full_min_{0}, stage_full_pick_{0};
     uint64_t         hb_mask_ = ~(uint64_t)0;
     void sahb_setup();
     void sahb_note();

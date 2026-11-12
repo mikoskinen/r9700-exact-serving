@@ -91,6 +91,9 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
         sa_ = SahbStats{};
         short_next_ = short_ = false;
         pick_next_ = pick_ = 0;
+        full_next_ = full_ = sp_stream_next_ = false;   /* lever SP */
+        fpick_next_ = 0;
+        sp_ = SpStats{};
         one_.assign(1, -1);
     }
 
@@ -150,9 +153,21 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
     /* Lever SA: the step's set_short applies to this trunk pass; a pass of the stager's size reports what the last
      * recorded step's routing would stream in place (armed or not). */
     short_ = armed_ && short_next_;
-    pick_ = short_ ? pick_next_ : 0;
+    /* Lever SP: an armed full-plan pass takes stage_full_pick (0 = every pooled unit, today); a stage_short pass is
+     * never a full one. */
+    full_ = armed_ && full_next_ && !short_;
+    pick_ = short_ ? pick_next_ : full_ ? fpick_next_ : 0;
     if (enabled() && b->n_tok >= min_rows_) expect_now();
     if (short_) ++sa_.short_steps;
+    if (full_) {
+        ++sp_.full_steps;
+        sp_.full_rows += b->n_tok;
+    }
+    /* Lever SP: a full-plan pass stage_full_min left unarmed (no ring) that the size rule would have armed. */
+    if (!armed_ && sp_stream_next_ && enabled() && b->n_tok >= min_rows_) {
+        ++sp_.stream_steps;
+        sp_.stream_rows += b->n_tok;
+    }
     if (!armed_) {
         withdraw_early();
         return false;
@@ -260,10 +275,11 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     *got = kLater;
     const Layer& L = layers_[(size_t)li];
     /* Lever SA: a stage_short pass under stage_pick K copies only the units one of the last K recorded steps routed;
-     * every other unit keeps its pool address (read in place). */
+     * every other unit keeps its pool address (read in place). Lever SP: so does a full-plan pass under stage_full_pick
+     * K (pick_ is set only for one of the two, begin_pass). */
     const std::vector<int32_t>* units = &L.units;
     int64_t dropped = 0, kept = 0;
-    if (short_ && pick_ > 0) {
+    if ((short_ || full_) && pick_ > 0) {
         pick_buf_.clear();
         for (int32_t u : L.units) {
             one_[0] = u;
@@ -281,6 +297,7 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     const int64_t need = mover_->stage_need(*units, &unit);
     if (need <= 0) {
         if (short_) { sa_.pick_dropped += dropped; sa_.pick_kept += kept; }
+        else if (full_) { sp_.full_pick_dropped += dropped; sp_.full_pick_kept += kept; }
         *got = kNone;
         return RAD_OK;
     }
@@ -300,6 +317,7 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
                                { base_, len - std::min(len, ring_ - off) } };
     RAD_TRY(mover_->stage_units(*units, sp, sp[1].cap > 0 ? 2 : 1, nullptr, p.done, &p.staged));
     if (short_) { sa_.pick_dropped += dropped; sa_.pick_kept += kept; }
+    else if (full_) { sp_.full_pick_dropped += dropped; sp_.full_pick_kept += kept; }
     if (p.staged.empty()) {
         p.li = -1;
         spare_.push_back(i);
@@ -310,6 +328,11 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
         ++sa_.short_layers;
         sa_.short_units += (int64_t)p.staged.size();
         for (int32_t u : p.staged) sa_.short_bytes += mover_->unit_bytes_of(u);
+    }
+    if (full_) {   /* lever SP: the full plan's copies, every pick (an end_pass's early layers included) */
+        ++sp_.full_layers;
+        sp_.full_units += (int64_t)p.staged.size();
+        for (int32_t u : p.staged) sp_.full_bytes += mover_->unit_bytes_of(u);
     }
     head_ = p.end;
     ring_order_.push_back(i);

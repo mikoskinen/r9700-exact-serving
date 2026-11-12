@@ -29,7 +29,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "sched_interleave", "sched_mixed_tok", "sched_short_bypass",
                                         "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_psk_l20",
                                         "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa", "stage_short",
-                                        "stage_pick", "place_hb" };
+                                        "stage_pick", "place_hb", "stage_full_min", "stage_full_pick" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -86,6 +86,9 @@ struct State {
     std::atomic<int> stage_capable{-1}, hb_capable{-1};     /* lever SA / HB: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> sahb[kSahbRanks][kSahbN];          /* note_sahb */
     std::atomic<int> sahb_ranks{0};
+    std::atomic<int> sp_capable{-1};                        /* lever SP: -1 no engine registered, 0 / 1 */
+    std::atomic<int64_t> sp[kSahbRanks][kSpN];              /* note_sp */
+    std::atomic<int> sp_ranks{0};
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -112,6 +115,8 @@ struct State {
         for (auto& c : dst) c.store(0, std::memory_order_relaxed);
         for (auto& c : noa) c.store(0, std::memory_order_relaxed);
         for (auto& r : sahb)
+            for (auto& c : r) c.store(0, std::memory_order_relaxed);
+        for (auto& r : sp)
             for (auto& c : r) c.store(0, std::memory_order_relaxed);
     }
 };
@@ -210,7 +215,8 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : s.mixed_start.load(std::memory_order_acquire);
     }
-    if (i == kStageShort || i == kStagePick || i == kPlaceHb) {   /* lever SA / HB: set, else 0 (off) */
+    if (i == kStageShort || i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick) {
+        /* lever SA / HB / SP: set, else 0 (off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : 0;
     }
@@ -228,7 +234,7 @@ bool sched_switch(int i) {
            i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow ||
            i == kDraftCtxSkip || i == kDraftLendHyst || i == kArenaD0 || i == kDraftLendW ||
            i == kDraftOcc || i == kDraftOccK || i == kPlaceLf || i == kDs41PskK || i == kStageShort ||
-           i == kStagePick || i == kPlaceHb;
+           i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick;
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -346,6 +352,14 @@ void note_sahb(int rank, const int64_t* v) {
     for (int k = 0; k < kSahbN; ++k) s.sahb[rank][k].store(v[k], std::memory_order_relaxed);
     int n = s.sahb_ranks.load(std::memory_order_relaxed);
     while (n < rank + 1 && !s.sahb_ranks.compare_exchange_weak(n, rank + 1, std::memory_order_relaxed)) {}
+}
+void sp_register(bool capable) { st().sp_capable.store(capable ? 1 : 0, std::memory_order_release); }
+void note_sp(int rank, const int64_t* v) {
+    if (rank < 0 || rank >= kSahbRanks || !v) return;
+    State& s = st();
+    for (int k = 0; k < kSpN; ++k) s.sp[rank][k].store(v[k], std::memory_order_relaxed);
+    int n = s.sp_ranks.load(std::memory_order_relaxed);
+    while (n < rank + 1 && !s.sp_ranks.compare_exchange_weak(n, rank + 1, std::memory_order_relaxed)) {}
 }
 void note_lend_w(int64_t lent, int64_t lends, int64_t reclaims, int64_t lent_units, int64_t mib) {
     State& s = st();
@@ -502,7 +516,8 @@ bool check(const std::string& name, int v, std::string* err) {
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
-                        "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, epoch_bump)";
+                        "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
+                        "stage_full_pick, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -593,6 +608,27 @@ bool check(const std::string& name, int v, std::string* err) {
                         : i == kPlaceHb ? "no dual heat on every rank (RADIANCE_HEAT_PREFILL_DECAY at start, a dynamic plan)"
                                         : "no prefill stager with a span's shared level on every rank (--prefill-span > 1, "
                                           "a dynamic plan with a staging region)");
+            return false;
+        }
+        return true;
+    }
+    if (i == kStageFullMin || i == kStageFullPick) {   /* lever SP (ds41-int9) */
+        const int hi = i == kStageFullMin ? 1048576 : 64;
+        if (v < 0 || v > hi) {
+            if (err)
+                *err = i == kStageFullMin ? "stage_full_min takes 0 (off) or 1 .. 1048576 (the fewest tokens a full-plan "
+                                            "step arms the prefill stager at; a smaller one streams its pooled experts "
+                                            "in place)"
+                                          : "stage_full_pick takes 0 (every pooled unit) or 1 .. 64 (the units one of the "
+                                            "last K stager-size trunk steps routed)";
+            return false;
+        }
+        const int cap = s.sp_capable.load(std::memory_order_acquire);
+        if (v > 0 && cap != 1) {
+            if (err)
+                *err = std::string(kNames[i]) + "=" + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "no engine has registered it"
+                                : "no prefill stager on every rank (a dynamic plan with a staging region)");
             return false;
         }
         return true;
@@ -952,7 +988,8 @@ bool apply_pending(int step, int* sched) {
         }
         if (reported(s, i) == v) {
             if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
-                i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb)
+                i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
+                i == kStageFullMin || i == kStageFullPick)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
@@ -1040,6 +1077,21 @@ std::string state_json() {
             for (int k = 0; k < kSahbN; ++k)
                 o += std::string(", \"") + kSa[k] + "\": " +
                      std::to_string((long long)s.sahb[r][k].load(std::memory_order_relaxed));
+            o += "}";
+        }
+        o += "]}";
+    }
+    /* Lever SP (ds41-int9), once an engine registered (capable or not): per rank, cumulative. */
+    if (const int pc = s.sp_capable.load(std::memory_order_acquire); pc >= 0) {
+        static const char* const kSp[kSpN] = { "full_steps", "full_rows", "full_layers", "full_units", "full_bytes",
+                                               "full_pick_kept", "full_pick_dropped", "stream_steps", "stream_rows" };
+        o += ", \"sp\": {\"capable\": " + std::to_string(pc) + ", \"ranks\": [";
+        const int nr = s.sp_ranks.load(std::memory_order_relaxed);
+        for (int r = 0; r < nr && r < kSahbRanks; ++r) {
+            o += std::string(r ? ", " : "") + "{\"rank\": " + std::to_string(r);
+            for (int k = 0; k < kSpN; ++k)
+                o += std::string(", \"") + kSp[k] + "\": " +
+                     std::to_string((long long)s.sp[r][k].load(std::memory_order_relaxed));
             o += "}";
         }
         o += "]}";

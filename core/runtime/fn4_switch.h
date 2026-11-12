@@ -308,6 +308,21 @@
  *                   promoted by ordinary swaps, never a victim while reserved; the decode-pinned core
  *                   (RADIANCE_HEAT_DECODE_PIN) stays above them. Needs the dual heat (RADIANCE_HEAT_PREFILL_DECAY) on
  *                   every rank. Placement only (the same bytes from whichever tier).
+ *   stage_full_min  engine (lever SP, ds41-int9: the prefill stager at the FULL plan): 0 off (today: every full-plan step
+ *                   -- on DeepSeek-V4.1 at --prefill-span 2 a lone step of 2113 .. 4160 rows: a new turn's tail, a lone
+ *                   short prompt, a long prompt's spanned chunk -- arms the stager, which copies every pooled unit of
+ *                   every routed layer through the ring, ~12.7 GB a rank); N = 1 .. 1048576 a full-plan step of fewer
+ *                   than N tokens is left unarmed (sp_full_streams, stager.h): its pooled experts are read in place by
+ *                   the grouped GEMMs (in-kernel streaming), as at every other level; N above the full plan's rows
+ *                   (4161 on DeepSeek-V4.1) streams every full-plan step. Placement only: the same weight bytes, from
+ *                   the host pool instead of the ring, the same kernel. Refused where no rank has a prefill stager.
+ *                   Read at every step release.
+ *   stage_full_pick engine (lever SP): which pooled units an ARMED full-plan step copies. 0 every pooled unit of each
+ *                   routed layer (today); K = 1 .. 64 only those that one of the last K trunk steps of the stager's size
+ *                   (>= its smallest pass) routed (lever SA's stamps from the histograms the heat engine credits); the
+ *                   rest are read in place. Placement only. GET "sp" counts, per rank, full_steps / full_rows /
+ *                   full_layers / full_units / full_bytes (every armed full-plan pass, any pick), full_pick_kept /
+ *                   full_pick_dropped, stream_steps / stream_rows (full-plan passes stage_full_min left unarmed).
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -384,7 +399,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
-              kStageShort, kStagePick, kPlaceHb, kSwitches };
+              kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -522,6 +537,11 @@ void sahb_register(bool stage_capable, bool hb_capable);
  * per rank for up to kSahbRanks ranks (see state_json). */
 constexpr int kSahbN = 16, kSahbRanks = 8;
 void note_sahb(int rank, const int64_t* v);
+/* Lever SP (ds41-int9). The engine, at bring-up: whether stage_full_min / stage_full_pick can act (a prefill stager on
+ * every rank). At every step release: lever SP's live counters (GET "sp"), kSpN per rank for up to kSahbRanks ranks. */
+void sp_register(bool capable);
+constexpr int kSpN = 9;
+void note_sp(int rank, const int64_t* v);
 /* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. */
 bool check(const std::string& name, int value, std::string* err);
 /* Server thread: queue a value; false (with the reason) for anything check() refuses. */

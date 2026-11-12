@@ -540,6 +540,11 @@ void Engine::sahb_note() {
                                          r->heat.enabled() ? (int64_t)r->heat.hb_reserve() : 0, h.reserved,
                                          h.resident, h.promotions, r->sa_recall_bytes };
         fn4::note_sahb(r->index, v);
+        /* Lever SP (ds41-int9): GET "sp". */
+        const PrefillStager::SpStats& p = r->stager.sp();
+        const int64_t w[fn4::kSpN] = { p.full_steps, p.full_rows, p.full_layers, p.full_units, p.full_bytes,
+                                       p.full_pick_kept, p.full_pick_dropped, p.stream_steps, p.stream_rows };
+        fn4::note_sp(r->index, w);
     }
 }
 
@@ -935,6 +940,15 @@ int Engine::prepare_release(const RadBatch* b) {
             if (sw[fn4::kStagePick] != fn4::kNoChange) {
                 stage_pick_.store(std::max(0, sw[fn4::kStagePick]), std::memory_order_relaxed);
                 fn4::note_sched(fn4::kStagePick, stage_pick_.load(std::memory_order_relaxed));
+            }
+            /* Lever SP (ds41-int9): read by the next arena_step (fn4 refuses either > 0 unless set up). */
+            if (sw[fn4::kStageFullMin] != fn4::kNoChange) {
+                stage_full_min_.store(sp_capable_ ? std::max(0, sw[fn4::kStageFullMin]) : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStageFullMin, stage_full_min_.load(std::memory_order_relaxed));
+            }
+            if (sw[fn4::kStageFullPick] != fn4::kNoChange) {
+                stage_full_pick_.store(sp_capable_ ? std::max(0, sw[fn4::kStageFullPick]) : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStageFullPick, stage_full_pick_.load(std::memory_order_relaxed));
             }
             /* Lever HB: every named rank's heat engine, read by its next step() (every rank thread parked). */
             if (sw[fn4::kPlaceHb] != fn4::kNoChange) {
@@ -2225,6 +2239,11 @@ int Engine::arena_step(const RadBatch* b) {
     const bool sa = sahb_arms(ssh, sa_capable_, b->enc != 0, b->phase != RAD_PHASE_DECODE, b->n_tok, level,
                               arena_last_, arena_span_rows_, mixed_ok);
     const int spick = stage_pick_.load(std::memory_order_relaxed);
+    /* Lever SP (ds41-int9, fn4 stage_full_min N / stage_full_pick K): a full-plan step of fewer than N tokens gets no
+     * ring (sp_full_streams: its pooled experts are read in place, as at every other level); an armed full-plan step
+     * copies only the pooled units the last K stager-size steps routed. Both 0: today's rule exactly. */
+    const bool sp_stream = sp_full_streams(stage_full_min_.load(std::memory_order_relaxed), b->enc != 0, b->n_tok, level);
+    const int fpick = stage_full_pick_.load(std::memory_order_relaxed);
     for (auto& r : ranks_) {
         const int64_t allow = sa ? r->arena_lent_sa[(size_t)level] : r->arena_lent[(size_t)level];
         /* Lever SA's VRAM price: the loan its step takes back beyond what the level itself would. */
@@ -2245,13 +2264,16 @@ int Engine::arena_step(const RadBatch* b) {
         /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
          * span's shared level keeps a place of its own for it (stager.h); every other level
          * lends both. */
-        char* const ring = !mixed_ok ? nullptr
+        char* const ring = !mixed_ok || sp_stream ? nullptr
                          : level == 0 ? r->stager.ring_full()
                          : arena_last_ == arena_span_rows_ && (r->arena_low_off >= 0 || sa)
                                ? r->stager.ring_low() : nullptr;
         r->stager.set_ring(ring);
         /* Lever SA: this step's pick (stage_pick) applies to a stage_short step only. */
         r->stager.set_short(sa, spick);
+        /* Lever SP: this step's full pick (stage_full_pick) applies to a full-plan step with its ring only; the counter
+         * of full-plan steps stage_full_min left unarmed. */
+        r->stager.set_full(level == 0 && ring != nullptr, fpick, sp_stream && mixed_ok);
         /* The next step's first layers go ahead only from the full plan, into the region at the
          * top that no level's buffers use. At the shared level the ring is memory the full plan
          * computes in, and a copy still going there when such a step starts would race it; a
