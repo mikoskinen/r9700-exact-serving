@@ -348,6 +348,11 @@
  *                   where the coded form fits (bf16, whole-wave shards, the slot); the rest plain. Exact: the coded wire
  *                   decodes the same values, folded in the same order. RADIANCE_DS41_ARCODED=N at load starts it at N.
  *                   GET "arc" carries its counters (arc_stats).
+ *   ar_xpush        libr4d (XPUSH, ds41-int13; ported from fn4-x3-sp3 808866c2, FN RSF 204; 63 here, after exl3_x3d): 0 off
+ *                   (today: lockstep); 1 -- the four-rank exact two-shot's plain launch of a message of >= 131072 elements
+ *                   pushes its first hop interleaved over the peers (R4D_AR8_FORM_XPUSH, r4d_ar_xpush.h: all three links at
+ *                   once); smaller messages and the coded wires as before. Exact: the same stores, the same fold.
+ *                   RADIANCE_FN4_AR_XPUSH=1 at load starts it at 1.
  *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
  *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
  *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
@@ -482,7 +487,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d, kSwitches };
+              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
+              kArXpush, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

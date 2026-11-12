@@ -470,7 +470,8 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub, long gate, long gate_ctr, long chain);
+                                long acq, long pub, long gate, long gate_ctr, long chain,
+                                long form = 0);   /* ds41-int13 XPUSH: form 3 = R4D_AR8_FORM_XPUSH (r4d_ar_shards.h) */
 // The four-rank exact two-shot with both pushes coded losslessly at ~12.2 bits a bf16 value (the
 // same bytes out; r4d_ar_twoshot_Nrank_exact.hip). r4d_ar_twoshot_coded_ok says whether a message
 // and slot fit the coded form: bf16, shards of whole 256-value waves, two coded regions a slot.

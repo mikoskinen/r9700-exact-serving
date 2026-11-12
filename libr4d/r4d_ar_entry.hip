@@ -951,6 +951,38 @@ extern "C" int r4d_rad_ar_oneshot_3rank_exact(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
+/* ds41-int13 XPUSH (ported from fn4-x3-sp3 808866c2, FN RSF item 204): libr4d's fn4 switch "ar_xpush" (r4d_ds41_ggml.hip's
+ * rad_fn4_*), 0 = off (lockstep, as before) or 1 = the four-rank exact two-shot's PLAIN launch (this entry's two-shot hand-off
+ * and r4d_rad_ar_twoshot_4rank_exact's plain launch) pushes its first hop interleaved over the peers (R4D_AR8_FORM_XPUSH, all
+ * three links at once) for a message of at least R4D_AR_XPUSH_MIN_ELEMS elements; smaller messages keep lockstep. The same
+ * stores and the same fp32 ascending-rank fold: the same bytes. FN 204 (gpu02, 4x R9700): 4096 x 5120 3436 -> 2508 us (-27 %),
+ * 2048 x 2560 871 -> 653 us; 16 / 48 x 2560 ~+0.8 us slower, hence the floor (25.6 rows at deepseek41's 5120). The coded
+ * wires (overlap 1, ds41_arcoded) are untouched. The start value is RADIANCE_FN4_AR_XPUSH (> 0: 1; unset / empty / 0: 0),
+ * read at the first launch; a change applies at a step release, every rank parked, and re-records every pass (fn4's epoch).
+ * A process's first XPUSH launch says so on stderr, once. */
+enum { R4D_AR_XPUSH_MIN_ELEMS = 131072 };
+static std::atomic<int> g_ar_xpush{-1};
+static int ar_xpush_on() {
+    int v = g_ar_xpush.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_XPUSH");
+        int unread = -1;
+        g_ar_xpush.compare_exchange_strong(unread, (e && *e && std::atoi(e) > 0) ? 1 : 0, std::memory_order_relaxed);
+        v = g_ar_xpush.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+static long ar_xpush_form(long numel) {
+    if (ar_xpush_on() != 1 || numel < R4D_AR_XPUSH_MIN_ELEMS) return (long)R4D_AR8_FORM_LOCKSTEP;
+    static std::atomic<int> said{0};
+    if (said.exchange(1, std::memory_order_relaxed) == 0)
+        std::fprintf(stderr, "[r4d] ar_xpush 1: the four-rank exact two-shot's first hop interleaved over the peers (XPUSH) "
+                             "from %d elements; the first at %ld\n", (int)R4D_AR_XPUSH_MIN_ELEMS, numel);
+    return (long)R4D_AR8_FORM_XPUSH;
+}
+int r4d_ar_xpush_get() { return ar_xpush_on(); }
+void r4d_ar_xpush_set(int v) { g_ar_xpush.store(v == 1 ? 1 : 0, std::memory_order_relaxed); }
+
 extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 0);
@@ -980,7 +1012,7 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
                                        c.inp, c.out, c.numel, in->dtype, in->rank,
                                        (long)(uintptr_t)s, nb, c.nthreads, c.drain, c.acq,
                                        c.pub, early, early ? in->gate_ctr : 0L,
-                                       ar_chain(a, c.numel)));
+                                       ar_chain(a, c.numel), ar_xpush_form(c.numel)));
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
     /* The wide release, the two-rank family's rule: over P2P the kernel ends the engine's hold
@@ -1162,7 +1194,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
                                    c.pub, early, early ? in->gate_ctr : 0L,
-                                   ar_chain(a, c.numel)));
+                                   ar_chain(a, c.numel), ar_xpush_form(c.numel)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
