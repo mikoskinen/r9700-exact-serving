@@ -775,9 +775,10 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 r0[s2] = at; nr[s2] = s2 < D ? qd : bq[(size_t)(s2 - D)]; at += nr[s2];
                 sp[s2] = nr[s2] == 1 || (int64_t)kvb->seqused_h[s2] > qsa_exact_to;
             }
-            bool any_dense = false;
-            for (int64_t s2 = 0; s2 < ns; ++s2) any_dense = any_dense || !sp[s2];
-            if (any_dense && at == T) {
+            /* every sequence in launches of its own (12.11. x04c: long prompts): a sparse launch's split law reads its
+             * row count as the sequence count (r4d_decode_splits: units = kv_heads x rows), so a sequence's rows inside a
+             * wider launch split their 2048 selected keys otherwise than alone -- all-sparse steps too, not only mixed ones */
+            if (at == T) {
                 const int64_t qw = g.q_dim(), hd = g.head_dim, chunk = qsa_gq_rows();
                 const int64_t pitch = kvb->block_table_pitch;
                 for (int64_t s2 = 0; s2 < ns; ++s2) {
