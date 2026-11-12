@@ -590,6 +590,21 @@ extern "C" int r4d_shape_hc_read(const RadParam* p, int n_p, int operand, RadOpd
     R4D_PICK(l);
 }
 
+/* fn4 SP-hc: hc_codes -- x [M][n] bf16 in; the plain codes (E4M3; int8 with codes_i8 1) and scales, and with rotate 1
+ * the rotated E4M3 codes and scales. */
+extern "C" int r4d_shape_hc_codes(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t group = pi(p, n_p, "group", 128), rotate = pi(p, n_p, "rotate", 0), i8 = pi(p, n_p, "codes_i8", 0);
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n),
+        opd(i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, n / (group > 0 ? group : 1)),
+        rotate ? opd((uint32_t)RAD_F8E4M3, M, n) : opd_none(),
+        rotate ? opd((uint32_t)RAD_F32, M, n / (group > 0 ? group : 1)) : opd_none(),
+    };
+    R4D_PICK(l);
+}
+
 /* add and mul share an operand list. Only the elementwise form is described, the one every caller
  * issues; the broadcast form (`b` of exactly n elements against M rows) is a second geometry. */
 extern "C" int r4d_shape_binary(const RadParam* p, int n_p, int operand,

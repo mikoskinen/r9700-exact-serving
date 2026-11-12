@@ -499,6 +499,12 @@ void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_
                               long slot_stride_bytes, long inp, long out, long n_elem,
                               long dtype, long rank, long stream, long nblocks,
                               long nthreads, long drain, long acq, long pub);
+/* fn4 SP-hc (r4d_ar_sp_rows.hip): the four-rank two-shot's halves over whole-row shards, in place on `buf`
+ * [n_rows][row]; `op` 0 the reduce-scatter (ti8), 1 the all-gather on the ti8 wire, 2 the all-gather raw. */
+void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
+                          long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
+                          long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
+                          long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr);
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                               long peer_flags0, long peer_flags1, long peer_flags2,
                               long my_scratch, long my_flags, long seq_ctrs,

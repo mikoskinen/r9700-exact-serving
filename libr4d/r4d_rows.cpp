@@ -688,6 +688,14 @@ static const RadOperandSpec oMtpEnter[] = {
     { "fc_h", RAD_OPD_WEIGHT, 0 }, { "fc_e", RAD_OPD_WEIGHT, 0 },
     { "x", RAD_OPD_OUT, 0 },
 };
+/* fn4 SP-hc: hc_read's codes stage alone (r4d_rad_hc_codes). */
+static const RadParamSpec pHcCodes[] = {
+    P_INT("M"), P_INT("n"), P_INTO("group"), P_INTO("rotate"), P_INTO("codes_i8"),
+};
+static const RadOperandSpec oHcCodes[] = {
+    { "x", RAD_OPD_IN, 0 }, { "q", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 },
+    { "rq", RAD_OPD_OUT, 1 }, { "rscale", RAD_OPD_OUT, 1 },
+};
 static const RadParamSpec pHcRead[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"), P_F64("eps"), P_STR("dtype"),
     P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"), P_INTO("bi_dec"),
@@ -837,6 +845,19 @@ static const RadParamSpec pAllReduce[] = {
 static const RadOperandSpec oAllReduce[] = {
     { "x", RAD_OPD_INOUT, 0 },
     { "y", RAD_OPD_OUT,   1 },
+};
+/* fn4 SP-hc (r4d_ar_sp_rows.hip): the two-shot's halves over whole-row shards, in place. */
+static const RadParamSpec pRowsColl[] = {
+    { "world_size", RAD_P_INT, RAD_REQUIRED },
+    { "numel",      RAD_P_INT, RAD_REQUIRED },   /* rows x row at the band's top, as all_reduce's */
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    { "row",        RAD_P_INT, RAD_REQUIRED },   /* elements a row: the shard is whole rows */
+    { "raw",        RAD_P_INT, RAD_OPTIONAL },   /* all_gather_rows: 1 = raw payload words (exact) */
+    { "overlap",    RAD_P_INT, RAD_OPTIONAL },   /* 1 on the caller's second lane, as all_reduce's */
+};
+static const RadOperandSpec oRowsColl[] = {
+    { "x", RAD_OPD_INOUT, 0 },
+    { "y", RAD_OPD_OUT,   1 },   /* absent or x: in place only */
 };
 
 /* No `exact` and no `hops`: a gather has no lossy wire and no second topology at two ranks.
@@ -3574,6 +3595,9 @@ static const RadOpSchema kSchemas[] = {
            "exp(-exp(A_log) dt') and gains dt' x B^T; o = state C + D x. verify stores candidate "
            "states; prefill commits the final state. Absolute cu offsets, accepted-prefix read slot, "
            "optional cold initialization, per_candidate only."),
+    SCHEMA("hc_codes", pHcCodes, oHcCodes,
+           "fn4 SP-hc: hc_read's codes stage alone over rows already read -- x's block-scaled codes (E4M3, or int8 "
+           "with codes_i8) and, with rotate, the Hadamard-rotated E4M3 twin, the bytes hc_read writes for the same x."),
     SCHEMA("hc_read", pHcRead, oHcRead,
            "the read half of a gated residual: a grouped rmsnorm, a low-rank sigmoid gate, and "
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
@@ -3620,6 +3644,14 @@ static const RadOpSchema kSchemas[] = {
            "the exact sum is one-shot up to " R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements "
            "(at 8 ranks " R4D_XSTR(R4D_AR_8RANK_ONESHOT_MAX_ELEMS) ") and two-shot above, chosen "
            "by the message's band; `hops` is accepted and no row of this plugin reads it."),
+    SCHEMA("reduce_scatter_rows", pRowsColl, oRowsColl,
+           "fn4 SP-hc: x [rows][row] summed over the ranks, rank r keeping the sum of its shard -- rows [r q, (r + 1) q), "
+           "q = ceil(rows / world) -- in place; other rows unchanged. Lossy wire (ti8): the peers' contributions decoded, "
+           "the own one exact, fp32 folded in ascending rank, rounded once."),
+    SCHEMA("all_gather_rows", pRowsColl, oRowsColl,
+           "fn4 SP-hc: rank r's shard rows of x [rows][row] (as reduce_scatter_rows cuts them) to every rank, in place. "
+           "raw 0: on the ti8 wire, every rank (the owner too) storing the decode of the owner's words, so all hold the "
+           "same bytes; raw 1: the payload words as they are."),
     SCHEMA("all_gather", pAllGather, oAllGather,
            "y is [world_size * numel] with rank r's contribution at offset r * numel. The bytes are "
            "moved and never summed: the vocab-parallel sampler's payload is (u32 token id, f32 "
@@ -4903,6 +4935,16 @@ static const RadConstraint cArTi8Ts3[] = {
 static const RadConstraint cArTi8Ts4[] = {
     C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
     C_P2P,
+};
+/* fn4 SP-hc rows (reduce_scatter_rows / all_gather_rows). */
+static const RadConstraint cHcCodes[] = {
+    C_DIV("n", 128), C_EQ("group", 128),
+};
+static const RadConstraint cSpRows4[] = {
+    C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16"), C_DIV("row", 32), C_P2P,
+};
+static const RadConstraint cSpRows4Lane[] = {
+    C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16"), C_DIV("row", 32), C_EQ("overlap", 1), C_P2P,
 };
 /* The same at `overlap` 1 (tArTs4Lane). */
 static const RadConstraint cArTi8Ts4Lane[] = {
@@ -8342,6 +8384,15 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr, r4d_rad_hc_read, r4d_rad_hc_read_scratch, nullptr, nullptr,
   r4d_shape_hc_read },
 
+/* fn4 SP-hc: hc_read's codes stage alone. */
+{ "hc_codes_bf16", "hc_codes", "norm",
+  "fn4 SP-hc: hc_read's codes stage over rows already read (the gathered block input of a sequence-parallel residual)",
+  "any M; n a multiple of 128; group 128",
+  "bf16 in, E4M3 / int8 codes + f32 scales, E4M3 rotated twin",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cHcCodes), NOTUNE,
+  nullptr, nullptr, r4d_rad_hc_codes, nullptr, nullptr, nullptr, r4d_shape_hc_codes, nullptr },
+
 { "hc_read_e4m3", "hc_read", "norm",
   "hc_read with the two mixing matrices stored as E4M3 rows -- half their bytes, the largest "
   "weight stream a decode step reads after the experts -- in the same two launches",
@@ -8555,6 +8606,40 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cArTi8Ts4), ROW(tAr), nullptr,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_twoshot_4rank_ti8, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
+/* fn4 SP-hc: the two-shot's halves over whole-row shards (r4d_ar_sp_rows.hip), wide and lane rows each. */
+{ "sp_rs_rows_4rank_ti8", "reduce_scatter_rows", "ar",
+  "fn4 SP-hc reduce-scatter over whole-row shards, tiered-int8 wire (raw 0, lossy) or raw words (raw 1, exact: the exact all-reduce's fold)",
+  "exactly 4 ranks, all peer-accessible; row a multiple of 32, at least 4 rows; in place",
+  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 fold in ascending rank order",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cSpRows4), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_rs_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+{ "sp_rs_rows_4rank_ti8_lane", "reduce_scatter_rows", "ar",
+  "fn4 SP-hc reduce-scatter over whole-row shards, tiered-int8 wire -- lossy; narrow launch beside compute",
+  "exactly 4 ranks, all peer-accessible, overlap 1; row a multiple of 32, at least 4 rows; in place",
+  "as sp_rs_rows_4rank_ti8",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
+  ROW(cSpRows4Lane), ROW(tArTs4Lane), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_rs_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+{ "sp_ag_rows_4rank", "all_gather_rows", "ar",
+  "fn4 SP-hc all-gather over whole-row shards, tiered-int8 wire (raw 0, lossy) or raw words (raw 1)",
+  "exactly 4 ranks, all peer-accessible; row a multiple of 32, at least 4 rows; in place",
+  "bf16 / fp16 payload; on the ti8 wire every rank stores the decode of the owner's words",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cSpRows4), ROW(tAr), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_ag_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+{ "sp_ag_rows_4rank_lane", "all_gather_rows", "ar",
+  "fn4 SP-hc all-gather over whole-row shards; narrow launch beside compute",
+  "exactly 4 ranks, all peer-accessible, overlap 1; row a multiple of 32, at least 4 rows; in place",
+  "as sp_ag_rows_4rank",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
+  ROW(cSpRows4Lane), ROW(tArTs4Lane), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_ag_rows_4rank, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
 /* The row above at `overlap` 1: the same entry point and the same arithmetic, a launch that leaves
@@ -11313,6 +11398,7 @@ extern "C" int rad_kernel_collective(int i) {
         r4d_rad_ar_hc_write, r4d_rad_ar_gather_hc_write,
         r4d_rad_ar_oneshot_4rank_exact, r4d_rad_ar_twoshot_4rank_exact,
         r4d_rad_ar_twoshot_4rank_ti8, r4d_rad_ar_gather_4rank,
+        r4d_rad_ar_rs_rows_4rank, r4d_rad_ar_ag_rows_4rank,   /* fn4 SP-hc: released after their one handshake */
         r4d_rad_ar_hc_write_4rank, r4d_rad_ar_gather_hc_write_4rank,
         r4d_rad_ar_rmsnorm_quant_i8_4rank,
     };
