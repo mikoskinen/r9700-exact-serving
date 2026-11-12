@@ -229,6 +229,19 @@
  *   ds41_psk_k      scheduler (lever PSK design 2): the anchor stride K, 1 .. 4096 (default 8): the K-th, 2K-th, ...
  *                   periodic checkpoint position (the exact grid's points from its origin, else the interval's
  *                   multiples) is a target under ds41_psk 2 / 3. Read at a request's admission.
+ *   ds41_psk_l20    deepseek41 (lever PSK-L20, ds41-pskl20): 1 = wherever lever PSK cuts (ds41_psk >= 1), the last kv
+ *                   source (layer 20 of the 1017, the decoder's first layer: its global KV is projected from the
+ *                   encoder's final hidden state) is split -- its collapse + norm, compressor and latent / index-key
+ *                   stores over every row, its query, indexer, attention, MoE and window store over its cone
+ *                   160 + (39 - 20) x 128 = 2592 rows as layers 21..39 over theirs (a planned pass with no row there
+ *                   stages none of its experts); 0 = every row at layer 20 (today). 1 refused where lever PSK is not
+ *                   declared or layer 20 carries an Engram block / DSpark tap. RADIANCE_DS41_PSK_L20=0 | 1: the start
+ *                   value (unset: 0). Exact by the cone rule (deepseek41.cpp); bytes to be measured.
+ *   dspark_pfctx    deepseek41 (lever PSK-DS, ds41-pskl20): 1 = a DSpark context pass (draft_pass -1) runs each
+ *                   entry's last window + 1 (129) rows only -- the keys a query can still read -- in runs of >= 160 rows
+ *                   (the form band of today's one launch), such a pass not recorded; 0 = every row (today). 1 refused
+ *                   where no DSpark context pass is declared. RADIANCE_DS41_DSPARK_PFCTX=0 | 1: the start value (unset:
+ *                   0). Exact for the target by construction (it reads no draft); the drafter's readable keys unchanged.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -303,7 +316,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
-              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK, kSwitches };
+              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
+              kDs41PskL20, kDsparkPfctx, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -388,7 +402,13 @@ int  psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int3
  * first nine cut layers and at the rest, plans dropped as not matching -- 0s and a return of 0 with no plugin serving it. */
 void note_psk_engine(int64_t planned, int64_t ended_early, int64_t stager_skipped);
 void psk_engine(int64_t out[3]);
-int  psk_stats(int64_t out[6]);
+/* out[0..5] as above; lever PSK-L20 (ds41-pskl20): [6] passes whose split layer was cut, [7] its rows not run in the cone
+ * part, [8] passes it ran its all-row part only, [9] planned passes told to end at it (its experts not staged) -- 0s
+ * from a plugin that writes 6. Returns how many the plugin wrote. */
+int  psk_stats(int64_t out[10]);
+/* Lever PSK-DS's live counters (ds41-pskl20, /stats "dspark_pfctx", the plugin's rad_dspark_pfctx_stats, rank 0's):
+ * [0] dspark_pfctx (-1: no plugin serves it), [1] context passes cut, [2] their rows not run, [3] the rows they ran. */
+int  dspark_pfctx_stats(int64_t out[4]);
 /* The scheduler, after every step: drafts verified and accepted, the head's and prompt lookup's apart (GET
  * "accept"; under draft_depth0 2 every head draft is a probe's). */
 void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t lookup_drafted, int64_t lookup_accepted);

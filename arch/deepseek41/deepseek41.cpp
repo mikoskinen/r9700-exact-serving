@@ -27,6 +27,7 @@
 #include <arch/rad_deepseek41_chat.h>
 
 #include "ds41_index_split.h"
+#include "ds41_psk_cone.h"
 #include "ds41_walk_geom.h"
 #include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
 
@@ -585,6 +586,9 @@ struct Model {
     std::map<rad_buf, int64_t> bp;
     /* Lever PSK: the first layer a prefill segment is cut at (the last kv source + 1); 0 where PSK is not declared. */
     int psk_first = 0;
+    /* Lever PSK-L20 (ds41-pskl20): the last kv source (20 of the 1017's 40), split under ds41_psk_l20 1 -- its all-row
+     * part over every row, its cone part over C_l rows as the layers past it; -1 where the split is not available. */
+    int psk_l20 = -1;
     Dsp dsp{};
     /* The checkpoint is DeepSeek's release (is_release): the name map reads its tensors by
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
@@ -1207,6 +1211,7 @@ struct PskPlan {
     int step = -1;               /* the trunk pass the plan is for (RadBatch::step); -1 none */
     long long dec_tok = 0;
     std::vector<int32_t> ahead, rows;   /* per prefill sequence, in the step's order */
+    bool l20 = false;            /* lever PSK-L20 (ds41_psk_l20) as the plan's layer end was found under it */
 };
 static PskPlan g_psk_plan;     /* written by rad_psk_plan with every rank thread parked, read by the ranks' issue */
 static int64_t psk_cone(int64_t n_layer, int64_t window, int64_t l) { return kPskBase + (n_layer - 1 - l) * window; }
@@ -1225,6 +1230,69 @@ static const PskPlan* psk_hint(const RadBatch* b) {
 static int32_t psk_ahead(const PskPlan* p, size_t i) {
     if (p && i < p->ahead.size() && p->ahead[i] != kPskNoHint) return p->ahead[i];
     return g_sw_psk.load(std::memory_order_relaxed) >= 1 ? 0 : kPskNoHint;
+}
+
+/* Lever PSK-L20 (ds41-pskl20 12.11.2026; ARCH-AUDIT-20261112 lever 1). The official model is a causal encoder-decoder
+ * (tech report 2.2): layers 0-19 the encoder, 20-39 the decoder, and the decoder's global KV -- the compressed latent and
+ * the index keys -- is projected from the encoder's final hidden state, layer 20's attention input. So of layer 20 (the
+ * last kv source, L.src, and the indexer's candidate layer) only that projection needs every row: the collapse + norm
+ * into xn, the compressor chain over the step (c_gemm .. c_norm, the tails), the index-key chain and the latent /
+ * index-key stores (l_st / k_st). Its query path, indexer scoring / candidates / selection, attention, o-projection,
+ * MoE and window-key store run over the cone C_20 = kPskBase + (n_layer - 1 - 20) x window rows exactly as layers 21-39
+ * do over theirs (design 1 / 2 alike: psk_rows(C_20, ahead, n)). Why exact: rows outside C_20 reach a later layer only
+ * through the latent / index keys, which still come from every row's layer-20 input; a row's window key at 20 is a
+ * function of its own xn, so every cone row's key is right, and the first window - 1 cone rows (whose earlier window keys
+ * at 20 were not stored) are outside C_21 = C_20 - window; the candidate keep a reindex layer (24..36) reads is per row
+ * and its rows lie in C_20 (the cf7bbc7 deal: the cut indexer keeps the uncut segment's runs). Switch ds41_psk_l20
+ * (fn4): 1 = split layer 20 wherever lever PSK cuts (ds41_psk >= 1), 0 = every row as before (today);
+ * RADIANCE_DS41_PSK_L20=0 / 1 sets the start value (unset: 0). `_ok`: a declare found layer last-source split-safe
+ * (lever PSK declared, no Engram or DSpark tap at it, the candidate layer at or below it). */
+static std::atomic<int> g_sw_psk_l20{0}, g_sw_psk_l20_ok{0}, g_sw_psk_l20_env{-2};   /* env: -2 unread, -1 unset */
+static std::atomic<int> g_psk_l20_layer{-1};   /* the split layer (Model::psk_l20) for rad_psk_plan; -1 none */
+/* Live counters (rank 0's; /stats "psk"): passes whose layer 20 was cut, its rows not run in the cone part, passes
+ * whose layer 20 ran its all-row part only (no query / attention / MoE row), planned passes the stager was told end at
+ * layer 20 (its routed experts not staged: rad_psk_plan). */
+static std::atomic<long long> g_psk_l20_passes{0}, g_psk_l20_rows{0}, g_psk_l20_empty{0}, g_psk_l20_end{0};
+static void psk_l20_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_PSK_L20");
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+    if (g_sw_psk_l20_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_psk_l20.store(v, std::memory_order_relaxed);
+        if (e && v < 0) fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PSK_L20=%s is not 0 / off or 1 / on: ignored\n", e);
+    }
+}
+/* Lever PSK-DS (ds41-pskl20 12.11.2026; ARCH-AUDIT-20261112 lever 2). The DSpark context pass (dsp_context, draft_pass
+ * -1, one row a trunk row) writes each row's context key into the drafter's window cache; a query pass reads the last
+ * c.window keys before its anchor (drf.window = c.window + 1 with the anchor), the anchor at or past its sequence's
+ * committed end; prefix hits leave the drafter's cache a hole and recompute its window (draft refill: a hit ends
+ * window + 1 tokens before the prompt's end), and no checkpoint carries it on this model (the window snapshot rides
+ * only without linear state). So of a context pass only each entry's last c.window + 1 rows can still be read -- across
+ * chunks too: a chunk's rows before its own last window + 1 lie more than a window before the sequence's end -- and
+ * dspark_pfctx 1 runs the pass over those rows (ds41cone::pfctx_runs: each run >= kPskBase rows, widened over skipped
+ * rows where shorter, so every launch is in the form band today's one launch over T >= kPskBase rows had: gemm_nt_ggml's
+ * WMMA (> 48), rmsnorm's fixed partition, per-row rope / round trip / window store). Target output never reads a draft,
+ * so the target is exact by construction; the drafter's readable window is byte-for-byte today's. 0 = every row (today).
+ * RADIANCE_DS41_DSPARK_PFCTX=0 / 1 sets the start value (unset: 0). `_ok`: a declare has the context pass's ops. */
+static std::atomic<int> g_sw_pfctx{0}, g_sw_pfctx_ok{0}, g_sw_pfctx_env{-2};   /* env: -2 unread, -1 unset */
+/* Live counters (rank 0's; /stats "dspark_pfctx"): context passes cut, their rows not run, the rows they ran. */
+static std::atomic<long long> g_pfctx_passes{0}, g_pfctx_skipped{0}, g_pfctx_run{0};
+static std::atomic<int> g_pfctx_window{0};   /* c.window at the declare that set `_ok` (rad_arch_pass_key's plan) */
+static void pfctx_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_DSPARK_PFCTX");
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+    if (g_sw_pfctx_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_pfctx.store(v, std::memory_order_relaxed);
+        if (e && v < 0) fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_PFCTX=%s is not 0 / off or 1 / on: ignored\n", e);
+    }
+}
+/* Lever PSK-DS: this context pass's runs (`runs` [r0, n), `*kept` their rows), or false: every row, the pass as today. */
+static bool pfctx_plan(const RadBatch* b, int64_t window, std::vector<std::pair<int64_t, int64_t>>* runs, int64_t* kept) {
+    if (!b || b->draft_pass >= 0 || g_sw_pfctx.load(std::memory_order_relaxed) <= 0 || window <= 0) return false;
+    return ds41cone::pfctx_runs(b->positions_h, b->n_tok, b->n_seq, window + 1, kPskBase, runs, kept);
 }
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
@@ -1253,6 +1321,10 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_psk"))
         return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ||
                ((value == 2 || value == 3) && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_psk_l20"))
+        return value == 0 || (value == 1 && g_sw_psk_l20_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "dspark_pfctx"))
+        return value == 0 || (value == 1 && g_sw_pfctx_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -1264,6 +1336,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "dspark_walk")) g_sw_walk.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_bi")) g_sw_bi.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_psk")) g_sw_psk.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_psk_l20")) g_sw_psk_l20.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "dspark_pfctx")) g_sw_pfctx.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1289,6 +1363,14 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_psk")) {
         *applied = g_sw_psk.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_psk_l20")) {
+        *applied = g_sw_psk_l20.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "dspark_pfctx")) {
+        *applied = g_sw_pfctx.load(std::memory_order_relaxed);
         return 1;
     }
     if (!std::strcmp(name, "dspark_walk")) {
@@ -2632,6 +2714,16 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             if (!L.d_kv || !L.d_kvn || !L.d_kvrope || !L.d_kvst) return RAD_E_INVAL;
         }
         if (!d.c_tab || !d.c_fc || !d.c_norm) return RAD_E_INVAL;
+        /* lever PSK-DS (dspark_pfctx): the context pass's ops are declared; the line only when its env is set */
+        if (!ctx->shape_probe && c.window > 0) {
+            g_pfctx_window.store((int)c.window, std::memory_order_relaxed);
+            g_sw_pfctx_ok.store(1, std::memory_order_relaxed);
+            if (ctx->rank == 0 && g_sw_pfctx_env.load(std::memory_order_relaxed) >= 0)
+                fprintf(stderr, "radiance: deepseek41: lever PSK-DS (RADIANCE_DS41_DSPARK_PFCTX, fn4 dspark_pfctx, now %d): "
+                                "a DSpark context pass runs each entry's last %lld rows only (the drafter's window + 1), "
+                                "in runs of >= %lld rows\n",
+                        g_sw_pfctx.load(std::memory_order_relaxed), (long long)c.window + 1, (long long)kPskBase);
+        }
     }
     d.kv_bs = rad_kv_block_size(b, d.kv);
     if (d.kv_bs < 1) return RAD_E_INVAL;
@@ -3008,6 +3100,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     walk_read_env();
     bi_read_env();
     psk_read_env();
+    psk_l20_read_env();
+    pfctx_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3425,7 +3519,19 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     }
     m.psk_first = first;
     (void)b;
+    /* lever PSK-L20 (ds41_psk_l20): the last kv source split -- its all-row part (collapse + norm, compressor, latent /
+     * index-key stores) over every row, the rest over its cone; available where no Engram block or DSpark tap sits at
+     * it (they would need every row there too) and the indexer's candidate layer is at or below it (the keep a later
+     * reindex layer reads is written there or earlier; its rows lie in the cone) */
+    {
+        const Layer& L = m.layers[(size_t)last];
+        if (L.l == last && L.src && !L.e_ids && !L.tap && c.cand <= last) m.psk_l20 = last;
+    }
     if (!ctx->shape_probe) {
+        if (m.psk_l20 >= 0) {
+            g_sw_psk_l20_ok.store(1, std::memory_order_relaxed);
+            g_psk_l20_layer.store(m.psk_l20, std::memory_order_relaxed);
+        }
         g_sw_psk_ok.store(1, std::memory_order_relaxed);
         /* design 2 (ds41_psk 2 / 3): the scheduler's plan per step; a step with decode rows or two prefill sequences
          * is cut in BI's segments (step_bi), which need BI's cu views (RADIANCE_DS41_BI declared) */
@@ -3453,6 +3559,15 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 (long long)c.n_layer - 1, (long long)c.window, first,
                 (long long)(kPskBase + (c.n_layer - 1 - first) * c.window), (long long)c.n_layer - 1, (long long)kPskBase,
                 last);
+    if (ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: lever PSK-L20 (fn4 ds41_psk_l20, now %d; RADIANCE_DS41_PSK_L20): %s\n",
+                g_sw_psk_l20.load(std::memory_order_relaxed),
+                m.psk_l20 >= 0 ? ("layer " + std::to_string(m.psk_l20) + " split under lever PSK -- its collapse + norm, "
+                                  "compressor and latent / index-key stores over every row, its query, indexer, attention, "
+                                  "MoE and window store over its last " +
+                                  std::to_string(kPskBase + (c.n_layer - 1 - m.psk_l20) * c.window) + " rows").c_str()
+                               : "NOT available (an Engram block or a DSpark tap at the last kv source, or the candidate "
+                                 "layer above it)");
     return RAD_OK;
 }
 
@@ -3603,6 +3718,59 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
         return;
     }
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
+    /* Lever PSK-DS (dspark_pfctx 1, ds41-pskl20): only the rows a drafter can still read -- each entry's last
+     * c.window + 1 -- in runs of >= kPskBase rows (pfctx_plan; rad_arch_pass_key leaves such a pass unrecorded). Every
+     * run's launches are in the band today's one launch over T (>= kPskBase) rows was: gemm_nt_ggml's WMMA form (> 48
+     * rows), rmsnorm's fixed 256-lane partition, per-row rope / fp8 round trip / window store; so a computed row's
+     * context key is today's byte for byte, and the rows not run are keys no query can reach (dsp_context's note above
+     * pfctx_read_env). The angle table is written over every row as today (the trunk's same angles, rope_a). */
+    {
+        static thread_local std::vector<std::pair<int64_t, int64_t>> pr;
+        int64_t kept = T;
+        if (pfctx_plan(batch, m.c.window, &pr, &kept)) {
+            if (rad_rank(x) == 0) {
+                const long long np = g_pfctx_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+                g_pfctx_skipped.fetch_add(T - kept, std::memory_order_relaxed);
+                g_pfctx_run.fetch_add(kept, std::memory_order_relaxed);
+                if (np == 1 || np % 4096 == 0) {
+                    std::string rs;
+                    for (const auto& u : pr)
+                        rs += std::string(rs.empty() ? "" : ", ") + std::to_string(u.first) + "+" + std::to_string(u.second);
+                    fprintf(stderr, "radiance: deepseek41: lever PSK-DS: %lld context passes cut, %lld rows not run (this "
+                                    "pass: %lld rows, %lld entries -> runs [%s])\n", np,
+                            g_pfctx_skipped.load(std::memory_order_relaxed), (long long)T, (long long)batch->n_seq, rs.c_str());
+                }
+            }
+            const int64_t D = m.c.n_embd, NT = (int64_t)d.taps.size() * D;
+            auto S = [&](rad_buf h, int64_t pitch, int64_t r0, int64_t n) {
+                return r0 ? brow_slice(h, r0, n, pitch) : brows(h, n);
+            };
+            RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
+            for (const auto& u : pr) lin_issue(x, m, d.c_fc, u.second, S(d.src, NT, u.first, u.second), d.fc, S(d.c, D, u.first, u.second));
+            for (const auto& u : pr)
+                RAD_ISSUE_N(x, d.c_norm, u.second, S(d.c, D, u.first, u.second), RAD_W(d.main_norm), S(d.cn, D, u.first, u.second));
+            for (const auto& L : d.st) {
+                for (const auto& u : pr)
+                    lin_issue(x, m, L.d_kv, u.second, S(d.cn, D, u.first, u.second), L.wkv, S(d.ckv, hd, u.first, u.second));
+                for (const auto& u : pr)
+                    RAD_ISSUE_N(x, L.d_kvn, u.second, S(d.ckv, hd, u.first, u.second), RAD_W(L.kv_norm), S(d.ckvn, hd, u.first, u.second));
+                for (const auto& u : pr)
+                    RAD_ISSUE_N(x, L.d_kvrope, u.second, S(d.ckvn, hd, u.first, u.second), brows(m.cs_a, g.max_ctx),
+                                praw(batch->positions + u.first, RAD_I32, u.second));
+                if (L.d_kvq)
+                    for (const auto& u : pr) RAD_ISSUE_N(x, L.d_kvq, u.second, S(d.ckvn, hd, u.first, u.second));
+                for (const auto& u : pr) {
+                    const RadOperand sl = praw(kb->slot_mapping + u.first, RAD_I32, u.second);
+                    if (m.w8d)
+                        RAD_ISSUE_N(x, L.d_kvst, u.second, S(d.ckvn, hd, u.first, u.second), sl, kv_cache(d.kv, L.l));
+                    else
+                        RAD_ISSUE_N(x, L.d_kvst, u.second, bcol_at(d.ckvn, u.first, hd, 0, hd / 2, u.second),
+                                    bcol_at(d.ckvn, u.first, hd, hd / 2, hd / 2, u.second), sl, kv_cache(d.kv, L.l));
+                }
+            }
+            return;
+        }
+    }
     RAD_ISSUE_N(x, d.c_tab, T, pos, brows(m.cs_a, g.max_ctx));
     lin_issue(x, m, d.c_fc, T, brows(d.src, T), d.fc, brows(d.c, T));
     RAD_ISSUE_N(x, d.c_norm, T, brows(d.c, T), RAD_W(d.main_norm), brows(d.cn, T));
@@ -3979,13 +4147,39 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         RAD_NONE);
     }
 
+    /* lever PSK-L20: the split layer's all-row part (its collapse + norm) over the STEP's segments / runs, as rows() /
+     * whole() issue it in an uncut pass */
+    auto rows_step = [&](int64_t cap, const auto& fn) {
+        for (const BiSeg& s : sg_step) {
+            if (!s.dec || s.n <= cap) { fn(s.r0, s.n); continue; }
+            for (int64_t a = 0; a < s.n; a += cap) fn(s.r0 + a, std::min(cap, s.n - a));
+        }
+    };
+    auto whole_step = [&](const auto& fn) {
+        int64_t a = 0, n = 0;
+        for (const BiSeg& s : sg_step) {
+            if (n > 0 && a + n == s.r0) { n += s.n; continue; }
+            if (n > 0) fn(a, n);
+            a = s.r0;
+            n = s.n;
+        }
+        if (n > 0) fn(a, n);
+    };
+    /* lever PSK-L20 (ds41_psk_l20 1, only where lever PSK cuts this pass): a planned pass takes the value its plan was
+     * made under (rad_psk_plan: the stager's layer end), any other the switch's -- the same, read at one release */
+    const bool l20_on = psk && m.psk_l20 >= 0 && m.psk_l20 < m.psk_first &&
+                        (hint ? hint->l20 : g_sw_psk_l20.load(std::memory_order_relaxed) > 0);
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
         /* lever PSK: from m.psk_first on, each prefill segment runs its last psk_rows(C_l, ahead, n) rows -- design 1
-         * (ahead 0): its last C_l; design 2: the cone of its next target, none when that does not reach the chunk */
+         * (ahead 0): its last C_l; design 2: the cone of its next target, none when that does not reach the chunk.
+         * Lever PSK-L20: the last kv source too, as the split layer (`l20`): the cut below is its cone part's; its all-row
+         * part (the collapse + norm here, the compressor chain and the latent / index-key stores over the step's rows
+         * below) runs whatever the cone, so the layer is never skipped whole */
         bool cut = false;
-        if (psk && l >= m.psk_first) {
+        const bool l20 = l20_on && l == m.psk_l20;
+        if (psk && (l >= m.psk_first || l20)) {
             const int64_t C = psk_cone(c.n_layer, c.window, l);
             /* the K/V store range (psk_kv_cone, today = C): the forward rows' window keys come from it */
             const int64_t CK = psk_kv_cone(c.n_layer, c.window, l);
@@ -3998,7 +4192,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 if (n >= s0.n) { psk_sg.push_back(s0); continue; }
                 if (rad_rank(x) == 0) {
                     g_psk_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
-                    (l < m.psk_first + 9 ? g_psk_rows_lo : g_psk_rows_hi).fetch_add(s0.n - n, std::memory_order_relaxed);
+                    if (l20) g_psk_l20_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
+                    else (l < m.psk_first + 9 ? g_psk_rows_lo : g_psk_rows_hi).fetch_add(s0.n - n, std::memory_order_relaxed);
                 }
                 cut = true;
                 if (n <= 0) continue;   /* design 2: no row of this segment at this layer */
@@ -4014,9 +4209,16 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         } else if (cut) {
             set_runs();
         }
+        /* lever PSK-L20: the split layer cut (its cone part over fewer rows); none of its cone part when no segment has a
+         * row there -- the all-row part still runs, every cone-part op below issues over the empty segments / runs */
+        const bool l20_none = l20 && cut && cur->empty();
+        if (l20 && cut && rad_rank(x) == 0) {
+            g_psk_l20_passes.fetch_add(1, std::memory_order_relaxed);
+            if (l20_none) g_psk_l20_empty.fetch_add(1, std::memory_order_relaxed);
+        }
         /* design 2: a layer no segment runs a row of is skipped whole (and so is every layer after it: the cones shrink
          * with l) -- no op, no collective; the runs stay empty for the final norm */
-        if (cut && cur->empty()) {
+        if (cut && cur->empty() && !l20) {
             if (rad_rank(x) == 0) g_psk_skips.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -4044,24 +4246,32 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             RAD_W(L.hc_a_base), R(m.pre_a, r0, n), R(m.post, r0, n), R(m.comb, r0, n));
             });
         };
-        /* the collapse (+ norm: a fused norm, by segment within its 32-row width) */
-        if (L.cn_a)
-            rows(kBiNorm, [&](int64_t r0, int64_t n) {
-                RAD_ISSUE_N(x, L.cn_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm),
-                            R(m.xn, r0, n));
-            });
-        else if (L.col_a)
-            whole([&](int64_t r0, int64_t n) {
-                RAD_ISSUE_N(x, L.col_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n));
-            });
+        /* the collapse (+ norm: a fused norm, by segment within its 32-row width); lever PSK-L20: at the split layer over
+         * the step's own segments, the uncut pass's launches -- xn on every row is the compressor's input */
+        const auto cn_a = [&](int64_t r0, int64_t n) {
+            RAD_ISSUE_N(x, L.cn_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n));
+        };
+        const auto col_a = [&](int64_t r0, int64_t n) {
+            RAD_ISSUE_N(x, L.col_a, n, R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n));
+        };
+        if (L.cn_a) {
+            if (l20) rows_step(kBiNorm, cn_a);
+            else rows(kBiNorm, cn_a);
+        } else if (L.col_a) {
+            if (l20) whole_step(col_a);
+            else whole(col_a);
+        }
         if (!late) mix_a();
         if (m.zero) {
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.attn_fill, n, R(m.attn_out, r0, n)); });
         } else {
-            if (L.norm_a)
-                whole([&](int64_t r0, int64_t n) {
+            if (L.norm_a) {
+                const auto norm_a = [&](int64_t r0, int64_t n) {
                     RAD_ISSUE_N(x, L.norm_a, n, R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n));
-                });
+                };
+                if (l20) whole_step(norm_a);
+                else whole(norm_a);
+            }
             bt_pt(x, m, m.xn, T, "xn", l);
             const rad_buf cs = r > 0 ? m.cs_b : m.cs_a;
             const bool ctail = L.src && r > 1;
@@ -4407,7 +4617,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 }
             }
         }
-        L.moe.route_report(x);
+        /* lever PSK-L20: a split layer that ran no MoE pass reports nothing (as a layer skipped whole: the router's
+         * counts are another layer's) */
+        if (!l20_none) L.moe.route_report(x);
         bt_pt(x, m, m.mw.logits, T, "router", l);
         bt_pt(x, m, m.mw.ids, T, "ids", l);
         bt_pt(x, m, m.mw.ew, T, "ew", l);
@@ -5046,6 +5258,13 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
         rad::arch::batch_split(b, &Dn, &DT);
         if (b->n_seq - Dn >= 2) return 0;
     }
+    /* Lever PSK-DS (dspark_pfctx 1): a context pass cut to its entries' readable rows is shaped by their lengths, which
+     * the key does not hold: not recorded. A pass it leaves whole issues as today and keys as today. */
+    if (b && b->draft_pass < 0 && deepseek41::g_sw_pfctx.load(std::memory_order_relaxed) > 0) {
+        static thread_local std::vector<std::pair<int64_t, int64_t>> ru;
+        int64_t kept = 0;
+        if (deepseek41::pfctx_plan(b, deepseek41::g_pfctx_window.load(std::memory_order_relaxed), &ru, &kept)) return 0;
+    }
     return 1;
 }
 
@@ -5053,7 +5272,9 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
  * the scheduler's plan for trunk pass `step`: per prefill sequence in the step's order its `ahead` (the first target past
  * the chunk's first position, less the chunk's end; kPskNoHint: not planned) and its chunk rows, and the step's decode
  * rows. Returns the first layer from which no row of the step runs (the pass issues nothing from it on; the stager stages
- * no layer from it), n_layer when every layer runs, -1 when lever PSK is not declared here (the plan is not kept). */
+ * no layer from it), n_layer when every layer runs, -1 when lever PSK is not declared here (the plan is not kept). Under
+ * lever PSK-L20 that layer can be the split one: no row in its cone, so no routed expert of it or after it is read, while
+ * its all-row part (collapse + norm, compressor, latent / index-key stores: no routed expert) still issues. */
 /* Lever PSK's live counters for /stats (ds41-int7-pskglue), rank 0's, cumulative: out[0] trunk passes that followed a
  * scheduler plan, [1] passes with a cut (design 1 or 2), [2] layers skipped whole (design 2), [3] layer-rows not run at
  * the first nine cut layers (21..29), [4] at the rest (30..39), [5] plans dropped as not matching their pass. Returns
@@ -5067,7 +5288,14 @@ extern "C" int rad_psk_stats(long long* out, int n) {
     out[3] = g_psk_rows_lo.load(std::memory_order_relaxed);
     out[4] = g_psk_rows_hi.load(std::memory_order_relaxed);
     out[5] = g_psk_hbad.load(std::memory_order_relaxed);
-    return 6;
+    if (n < 10) return 6;
+    /* lever PSK-L20 (ds41-pskl20): [6] passes whose split layer was cut, [7] its rows not run in the cone part, [8]
+     * passes it ran its all-row part only, [9] planned passes told to end at it (its routed experts not staged) */
+    out[6] = g_psk_l20_passes.load(std::memory_order_relaxed);
+    out[7] = g_psk_l20_rows.load(std::memory_order_relaxed);
+    out[8] = g_psk_l20_empty.load(std::memory_order_relaxed);
+    out[9] = g_psk_l20_end.load(std::memory_order_relaxed);
+    return 10;
 }
 
 extern "C" int rad_psk_plan(int step, long long dec_tok, int n, const int32_t* ahead, const int32_t* rows) {
@@ -5082,14 +5310,30 @@ extern "C" int rad_psk_plan(int step, long long dec_tok, int n, const int32_t* a
     g_psk_plan.dec_tok = dec_tok;
     g_psk_plan.ahead.assign(ahead, ahead + n);
     g_psk_plan.rows.assign(rows, rows + n);
+    /* lever PSK-L20: the split layer's cone part is cut as the layers past it; its all-row part stages no routed expert,
+     * so the scan starts there and a pass with no row in its cone ends at it (its experts not staged) */
+    const int l20 = g_psk_l20_layer.load(std::memory_order_relaxed);
+    g_psk_plan.l20 = l20 >= 0 && l20 < first && g_sw_psk_l20.load(std::memory_order_relaxed) > 0;
     if (dec_tok > 0 || n == 0) return nl;
-    for (int l = first; l < nl; ++l) {
-        bool any = false;
-        for (int i = 0; i < n && !any; ++i)
-            any = psk_rows(psk_kv_cone(nl, w, l), psk_ahead(&g_psk_plan, (size_t)i), rows[i]) > 0;
-        if (!any) return l;
-    }
-    return nl;
+    static std::vector<int32_t> ah;   /* the scheduler thread's, every rank parked */
+    ah.resize((size_t)n);
+    for (int i = 0; i < n; ++i) ah[(size_t)i] = psk_ahead(&g_psk_plan, (size_t)i);
+    const int end = ds41cone::plan_end(nl, w, g_psk_plan.l20 ? l20 : first, n, ah.data(), rows);
+    if (g_psk_plan.l20 && end == l20) g_psk_l20_end.fetch_add(1, std::memory_order_relaxed);
+    return end;
+}
+
+/* Lever PSK-DS's live counters for /stats "dspark_pfctx" (ds41-pskl20), rank 0's, cumulative: out[0] the switch
+ * (dspark_pfctx), [1] context passes cut, [2] their rows not run, [3] the rows they ran. Returns how many it wrote (4),
+ * 0 when no declare has the context pass here. */
+extern "C" int rad_dspark_pfctx_stats(long long* out, int n) {
+    using namespace deepseek41;
+    if (!out || n < 4 || !g_sw_pfctx_ok.load(std::memory_order_relaxed)) return 0;
+    out[0] = g_sw_pfctx.load(std::memory_order_relaxed);
+    out[1] = g_pfctx_passes.load(std::memory_order_relaxed);
+    out[2] = g_pfctx_skipped.load(std::memory_order_relaxed);
+    out[3] = g_pfctx_run.load(std::memory_order_relaxed);
+    return 4;
 }
 
 RAD_ARCH_PROBE(deepseek41)

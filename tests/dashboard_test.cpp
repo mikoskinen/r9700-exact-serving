@@ -233,9 +233,17 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s["psk"].value("mode", 99), -1);
     for (const char* k : { "latched", "planned_steps", "ckpt_anchor", "ckpt_dropped", "fallback_resumes", "fallback_tokens",
                            "engine_planned_passes", "passes_ended_early", "stager_layers_skipped", "plugin_planned_passes",
-                           "cut_passes", "layers_skipped", "rows_skipped_l21_29", "rows_skipped_l30_39", "plan_mismatch" }) {
+                           "cut_passes", "layers_skipped", "rows_skipped_l21_29", "rows_skipped_l30_39", "plan_mismatch",
+                           "l20_cut_passes", "l20_rows_skipped", "l20_cone_empty", "l20_layers_not_staged" }) {
         CHECK(s["psk"].contains(k));
         CHECK_EQ(s["psk"].value(k, (int64_t)-1), (int64_t)0);
+    }
+    /* lever PSK-DS's (ds41-pskl20): present, mode -1 and 0s with no plugin serving it */
+    REQUIRE(s.contains("dspark_pfctx"));
+    CHECK_EQ(s["dspark_pfctx"].value("mode", (int64_t)99), (int64_t)-1);
+    for (const char* k : { "passes", "rows_skipped", "rows_run" }) {
+        CHECK(s["dspark_pfctx"].contains(k));
+        CHECK_EQ(s["dspark_pfctx"].value(k, (int64_t)-1), (int64_t)0);
     }
     REQUIRE(s["draft_positions"].size() == 2);
     CHECK_NEAR(s["draft_positions"][1]["rate"].get<double>(), 0.25, 1e-12);
