@@ -1222,6 +1222,82 @@ static void attn_slice_case(const Plugin& pl, const char* name, int64_t head_dim
        ndiff == 0, why);
 }
 
+/* fn4 att_bi 3 (13.11.2026): the dense decode row over k sequences in ONE launch with split_rows 1 (the split law
+ * reads one sequence, as each sequence's alone launch does) against k launches of one sequence each, byte for byte on
+ * every output element; and the same batch without the pin (the law at k sequences) as a control that must differ
+ * where its split count differs. Flash-Next's TP4 decode geometry: head 256, gqa 6, one KV head, 4-token pages, fp8
+ * cache, q_len 1 + n_spec = 4, max_ctx 262144 (the engine's declare), contexts `ctxs`. --case attn_bi_batch. */
+static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::vector<int32_t>& ctxs, int64_t qd) {
+    if (!sel("attn_bi_batch")) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { skip(name, "row absent"); return; }
+    const int64_t head_dim = 256, gqa = 6, kv_heads = 1, bs = 4, q_heads = kv_heads * gqa, k = (int64_t)ctxs.size();
+    int64_t maxb = 0, nblk = 0;
+    for (int32_t c : ctxs) { maxb = std::max<int64_t>(maxb, (c + bs - 1) / bs); nblk += (c + bs - 1) / bs; }
+    const int64_t rowq = q_heads * head_dim, qn = k * qd * rowq, kvn = nblk * kv_heads * bs * 2 * head_dim;
+    std::vector<uint16_t> hq((size_t)qn);
+    for (int64_t i = 0; i < qn; ++i) hq[(size_t)i] = st_rand_bf16((uint32_t)i * 3u + 1u);
+    std::vector<uint8_t> hkv((size_t)kvn);
+    for (int64_t i = 0; i < kvn; ++i) hkv[(size_t)i] = st_rand_e4m3((uint32_t)i + 5u);
+    /* each sequence its own pages, padded rows -1 past its own */
+    std::vector<int32_t> bt((size_t)(k * maxb), 0);
+    int32_t next = 0;
+    for (int64_t s = 0; s < k; ++s) {
+        const int64_t nb = (ctxs[(size_t)s] + bs - 1) / bs;
+        for (int64_t b2 = 0; b2 < maxb; ++b2) bt[(size_t)(s * maxb + b2)] = b2 < nb ? next++ : 0;
+    }
+    void* d_q = dalloc((size_t)qn * 2);
+    void* d_kv = dalloc((size_t)kvn);
+    void* d_o1 = dalloc((size_t)qn * 2);
+    void* d_ob = dalloc((size_t)qn * 2);
+    void* d_oc = dalloc((size_t)qn * 2);
+    if (!d_q || !d_kv || !d_o1 || !d_ob || !d_oc) { ok(name, false, "hipMalloc failed"); return; }
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_kv, hkv.data(), hkv.size(), hipMemcpyHostToDevice);
+    auto run = [&](int64_t s0, int64_t ns, void* out, long long pin) {
+        std::vector<int32_t> b(bt.begin() + s0 * maxb, bt.begin() + (s0 + ns) * maxb);
+        std::vector<int32_t> u(ctxs.begin() + s0, ctxs.begin() + s0 + ns);
+        std::vector<RadTensor> ts = {
+            T((char*)d_q + (size_t)(s0 * qd * rowq * 2), RAD_BF16, { ns * qd, q_heads, head_dim }),
+            T(d_kv, RAD_F8E4M3, { nblk, kv_heads, bs, 2 * head_dim }),
+            TI32({ ns, maxb }, b),
+            TI32({ ns }, u),
+            TF32({ 1, kv_heads }, 1.0f),
+            TF32({ 1, kv_heads }, 1.0f),
+            T(nullptr, RAD_I32, { ns + 1 }),
+            T((char*)out + (size_t)(s0 * qd * rowq * 2), RAD_BF16, { ns * qd, q_heads, head_dim }),
+        };
+        absent(ts[6]);
+        std::vector<RadParam> ps = {
+            PI("q_len", qd), PI("head_dim", head_dim), PI("gqa", gqa), PI("block_size", bs),
+            PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "fp8_e4m3"),
+            PI("max_ctx", 262144),
+        };
+        if (pin > 0) ps.push_back(PI("split_rows", pin));
+        run_case(r, ts, ps);
+    };
+    st_memset(d_o1, 0, (size_t)qn * 2); st_memset(d_ob, 0, (size_t)qn * 2); st_memset(d_oc, 0, (size_t)qn * 2);
+    for (int64_t s = 0; s < k; ++s) run(s, 1, d_o1, 0);   /* alone: one sequence a launch, the law's own count (1) */
+    run(0, k, d_ob, 1);                                     /* att_bi 3: one launch, pinned to one sequence */
+    run(0, k, d_oc, 0);                                     /* control: one launch, the law at k sequences */
+    std::vector<uint16_t> o1((size_t)qn), ob((size_t)qn), oc((size_t)qn);
+    st_memcpy(o1.data(), d_o1, o1.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(ob.data(), d_ob, ob.size() * 2, hipMemcpyDeviceToHost);
+    st_memcpy(oc.data(), d_oc, oc.size() * 2, hipMemcpyDeviceToHost);
+    int64_t nb = 0, nc = 0, fb = -1;
+    for (int64_t i = 0; i < qn; ++i) {
+        if (o1[(size_t)i] != ob[(size_t)i]) { if (fb < 0) fb = i / rowq; ++nb; }
+        nc += o1[(size_t)i] != oc[(size_t)i];
+    }
+    std::string cs;
+    for (int32_t c : ctxs) cs += (cs.empty() ? "" : ",") + std::to_string(c);
+    std::printf("attn_bi_batch %s k %lld q_len %lld ctx [%s]: pinned batch vs alone %lld of %lld elements differ%s; unpinned "
+                "control %lld differ\n", name, (long long)k, (long long)qd, cs.c_str(), (long long)nb, (long long)qn,
+                fb >= 0 ? fmt(" (first at row %lld)", (long long)fb).c_str() : "", (long long)nc);
+    ok(fmt("%s: att_bi 3 one pinned launch = alone launches, k %lld ctx [%s]", name, (long long)k, cs.c_str()).c_str(),
+       nb == 0, nb ? fmt("%lld elements differ, first at row %lld", (long long)nb, (long long)fb) : std::string());
+}
+
 /* A token's bytes in a (block, head) page of an 8-bit cache: kvq 0 fp8 (K then V), 1 fp8_v4, 2
  * k6_v4 (attn_oracle_one has the layouts). */
 static int64_t kvq_row_bytes(int64_t head_dim, int kvq) {
@@ -32743,6 +32819,12 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_fp8v4", 256, 6, 100, "fp8_v4", 0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_fp8v4",  256, 6, 1,   "fp8_v4", 0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_fp8v4",  256, 6, 4,   "fp8_v4", 0, 2048);
+    /* fn4 att_bi 3: Flash-Next's TP4 dense decode row, k sequences in one launch pinned to one sequence = alone launches */
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 300, 2500 }, 4);
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 37, 129, 400, 777, 1024, 2049, 3000, 8191 }, 4);
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv",
+                       { 5, 64, 255, 256, 257, 1000, 1500, 2047, 2048, 2049, 4096, 6000, 9000, 12345, 16384, 20000 }, 4);
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 700, 900, 1100, 1300 }, 1);
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 64,  "k6_v4",  0, 256);
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);

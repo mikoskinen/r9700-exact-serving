@@ -39,9 +39,14 @@ namespace arch {
 /* 2 (12.11.2026, 199: att_bi costs 3.6 % ms/step at c16): as 1, the sparse decode sequences of a step in one launch
  * through op_attn_gq_bi, whose split law counts 1 + n_spec rows as its sequences (libr4d split_rows) -- each row's
  * keys split as in its own sequence's alone launch. */
+/* 3 (13.11.2026, 220: att_bi 2 never engages on dense contexts -- the per-sequence dense attn_paged + gate_quant_fp8
+ * are att_bi's cost): as 2, and a run of DENSE decode sequences in ONE attn_paged launch through op_attn_bi, whose split
+ * law reads one sequence (split_rows 1: each sequence's alone launch is one sequence at its q_len), plus ONE gate_quant
+ * over the run's rows (a row's quantisation is its own). Only where q_len x gqa <= 32: above, the law reads the block
+ * table's depth, which the batch's longest sequence sets. */
 inline std::atomic<int>& fn4_attbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
-                                   const int v = e && *e ? std::atoi(e) : 0; return v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   const int v = e && *e ? std::atoi(e) : 0; return v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 att_bi: the prefill sequences' row counts of a step, from the full-attention group's host seqused and the host
@@ -167,6 +172,9 @@ struct AttnGatedFP8 {
     static constexpr int64_t kGqBiRows = 64;
     rad_op     op_attn_gq_bi = 0;
     int64_t    gq_bi_qd = 0;
+    /* fn4 att_bi 3: op_attn with split_rows = 1 (a dense decode sequence's alone launch is one sequence), declared beside
+     * op_attn_gq_bi; 0 otherwise. */
+    rad_op     op_attn_bi = 0;
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
     rad_op     op_kv_stream = 0;
@@ -397,6 +405,29 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         rad_op_reads(b, op_attn, rd,
                      (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
         rad_op_writes(b, op_attn, &w.attn.x, 1);
+    }
+    {   /* fn4 att_bi 3: the dense decode twin (split_rows 1), under RADIANCE_FN4_BIDEC (default RADIANCE_FN4_X3DUAL) */
+        const char* e = std::getenv("RADIANCE_FN4_BIDEC");
+        if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
+        if (op_attn && e && *e && *e != '0' && g.max_spec > 0) {
+            op_attn_bi = decl_attn(b, g, "attn_paged",
+                             RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                                        RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                        RAD_INT("window", 0),
+                                        RAD_INT("n_head", g.n_head),
+                                        RAD_INT("block_size", kv_block > 0 ? kv_block : (int64_t)RAD_KV_BLOCK),
+                                        RAD_INT("max_seqs", (qsa_sel && qsa_sequ) ? qsa_rows() : g.max_seqs),
+                                        RAD_INT("max_ctx", g.max_ctx),
+                                        RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype),
+                                        RAD_INT("split_rows", 1)),
+                             RAD_NOWEIGHTS);
+            if (op_attn_bi) {
+                const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, qsa_nsel };
+                rad_op_reads(b, op_attn_bi, rd,
+                             (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
+                rad_op_writes(b, op_attn_bi, &w.attn.x, 1);
+            }
+        }
     }
 
     /* The resolve belongs here rather than in the indexer: it must follow this layer's store,
@@ -814,10 +845,29 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 const int64_t qw = g.q_dim(), hd = g.head_dim, chunk = qsa_gq_rows();
                 const int64_t pitch = kvb->block_table_pitch;
                 /* att_bi 2: a run of sparse decode sequences in launches of up to kGqBiRows rows (whole sequences) */
-                const bool one = fn4_attbi_flag().load(std::memory_order_relaxed) == 2 && op_attn_gq_bi &&
+                const int abf = fn4_attbi_flag().load(std::memory_order_relaxed);
+                const bool one = abf >= 2 && op_attn_gq_bi &&
                                  qd == gq_bi_qd && qd > 0 && qd <= kGqBiRows;
+                /* att_bi 3: a run of dense decode sequences in one op_attn_bi launch + one gate_quant (fn4_attbi_flag's note) */
+                const bool oned = abf >= 3 && op_attn_bi && qd > 0 && qd * g.gqa() <= 32;
                 for (int64_t s2 = 0; s2 < ns; ++s2) {
                     const int64_t a0 = r0[s2], n = nr[s2];
+                    if (oned && s2 < D && !sp[s2]) {
+                        int64_t e2 = s2 + 1;
+                        while (e2 < D && !sp[e2]) ++e2;
+                        const int64_t k = e2 - s2, rows = k * qd;
+                        RAD_ISSUE_N(c, op_attn_bi, qd,
+                                    brow_slice(w.q, a0, rows, qw), kv_cache(kv, layer),
+                                    praw2(table + s2 * pitch, RAD_I32, k, pitch), praw(used + s2, RAD_I32, k),
+                                    RAD_NONE, RAD_NONE, RAD_NONE,
+                                    brow_slice(w.attn.x, a0, rows, qw));
+                        RAD_ISSUE_N(c, op_gq, rows * g.n_head,
+                                    bcol_at(w.qg, a0, g.n_head * 2 * hd, hd, hd, rows), brow_slice(w.attn.x, a0, rows, qw),
+                                    brow_slice(w.attn.cq(), a0, rows, qw), brow_slice(w.attn.cs(), a0, rows, fp8_blocks(qw)),
+                                    brow_slice(w.attn.x, a0, rows, qw));
+                        s2 = e2 - 1;
+                        continue;
+                    }
                     if (one && s2 < D && sp[s2]) {
                         int64_t e2 = s2 + 1;
                         while (e2 < D && sp[e2] && (e2 - s2 + 1) * qd <= kGqBiRows) ++e2;

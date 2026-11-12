@@ -113,6 +113,9 @@ static const RadParamSpec pAttnPaged[] = {
     P_INTO("max_seqs"),
     /* e4m3 products a caller accepts (docs/OPS.md): 1 Q.K^T, 2 P.V, 3 both; absent is 0. */
     P_INTO("prefill_fp8"),
+    /* fn4 BI (att_bi 3, 13.11.2026): the split law's sequence count in place of the launch's (libr4d r4d_split_rows_pin, the
+     * split-KV decode rows); absent 0. A launch of several dense decode sequences pinned to 1 splits each as its alone launch. */
+    P_INTO("split_rows"),
 };
 static const RadOperandSpec oAttnPaged[] = {
     { "q",           RAD_OPD_IN,  0 },
