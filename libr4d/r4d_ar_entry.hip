@@ -992,9 +992,16 @@ static int ar_xpush(const RadArgs* a, long long numel) {
         g_ar_xpush.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_ar_xpush.load(std::memory_order_relaxed);
     }
-    /* prefill messages only (202 / 204: at decode heights the interleave was 0.8 us slower): from the fence rule's
-     * 131072 elements, which lies above every decode and verify height and below every prefill piece */
-    return numel >= 131072 ? (int)r4d_geti_or(a, "xpush", v) : 0;
+    /* prefill messages only (202 / 204: at decode heights the interleave was 0.8 us slower, 48 x 2560 31.4 -> 32.2 us). 13.11.:
+     * from 1048576 elements (was 131072, which Qwen's c16 verify pass crosses: 64 rows x 2560 = 163840) -- above every decode /
+     * verify height (Qwen 410 rows of 2560, DS 146 of 7168), below a 2048-row prefill piece (5242880, 204: -25 %). The band in
+     * between keeps the lockstep form (unmeasured there). RADIANCE_FN4_AR_XPUSH_MIN (start) overrides the bound for an A/B. */
+    static const long long kMin = [] {
+        const char* e = std::getenv("RADIANCE_FN4_AR_XPUSH_MIN");
+        const long long m = (e && *e) ? std::atoll(e) : 0;
+        return m > 0 ? m : 1048576LL;
+    }();
+    return numel >= kMin ? (int)r4d_geti_or(a, "xpush", v) : 0;
 }
 extern "C" int r4d_ar_xpush_set(int on) {
     if (on < 0 || on > 1) return -1;
