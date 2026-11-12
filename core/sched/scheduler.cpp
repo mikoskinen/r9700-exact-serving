@@ -2,7 +2,6 @@
  */
 #include "scheduler.h"
 #include "runtime/fn4_switch.h"
-static int bi_chunk_env();   /* lever BI chunking (RADIANCE_SCHED_BI_CHUNK), below */
 #include "mm/processor.h"
 
 #include "server/sink.h"
@@ -16,6 +15,8 @@ static int bi_chunk_env();   /* lever BI chunking (RADIANCE_SCHED_BI_CHUNK), bel
 #include <string>
 
 namespace rad {
+
+static int bi_chunk_env();   /* fn4 lever BI chunking (RADIANCE_SCHED_BI_CHUNK), below */
 
 /* Microseconds on the monotonic clock, for the live request table only; the step path keeps its
  * own steady_clock points. */
