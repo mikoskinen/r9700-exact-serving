@@ -229,6 +229,26 @@
  *   ds41_psk_k      scheduler (lever PSK design 2): the anchor stride K, 1 .. 4096 (default 8): the K-th, 2K-th, ...
  *                   periodic checkpoint position (the exact grid's points from its origin, else the interval's
  *                   multiples) is a target under ds41_psk 2 / 3. Read at a request's admission.
+ *   sched_noa       scheduler (lever NOA, ds41-noa: a prefill's piece over the shared budget): 0 off (today); 1 / 2 on,
+ *                   under sched_bi_chunk 3 / 4 (option D) with --prefill-span > 1 (refused without a shared step). On a
+ *                   step that is neither a lone prefill's span step nor a step the interleave holds, a prefill that D
+ *                   turns away because ANOTHER prefill already holds the step's shared budget -- a waiting request at
+ *                   admission (queue order, the walk stops at the first that does not fit: none is overtaken), or a
+ *                   running prefill (planned after every decode row of the running set) -- takes D's piece at the
+ *                   step's --max-num-batched-tokens room instead (max_tok less every row planned, decode and draft rows
+ *                   included): its alone piece whole, else the largest end on D's grid inside it with >= 128 rows on
+ *                   both sides that fits (Scheduler::bi_chunk_plan, the same rule at another room; a request the bypass
+ *                   runs: Scheduler::bypass_piece). 1 = at most ONE such piece a step; 2 = as many as max_tok and
+ *                   --max-num-seqs hold (several newcomers' whole pieces in one step, with or without a long prompt
+ *                   beside them). The step's first prefill is planned as before, so a long prompt's chunks are D's
+ *                   chunks; every piece is one D (or the bypass) plans, so exact as D is. When even D's smallest piece
+ *                   does not fit, the request waits that step (counted) and is marked; the next such step DISPLACES
+ *                   every other running prefill (their next chunks move one step later, unchanged) so it runs as the
+ *                   step's only prefill (D's own over-budget rule, up to max_tok); a displaced prefill is not displaced
+ *                   again before it ran its next chunk. Never preempts. Read at every step planned; GET "noa" counts
+ *                   admitted (waiting requests), pieces, rows, displaced (chunks moved), waited (did not fit), steps
+ *                   (steps with a NOA piece) and every step with prefill rows by its prefill entries (pf_steps_1 / 2 / 3
+ *                   / 4plus, NOA or not). 0 plans as unset.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -303,7 +323,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kIdxSplit, kDs41QnFold, kDs41SwFold, kDraftCtxSkip,
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
-              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK, kSwitches };
+              kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK, kSchedNoa,
+              kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -378,6 +399,13 @@ int  sched_short_bypass();
 /* sched_bypass_total: the switch once set, else 0 (the bypass takes one-piece requests only). */
 int  sched_bypass_total();
 void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
+/* Lever NOA (sched_noa): the switch once set, else 0 (off). The scheduler reads it at every step it plans and after every
+ * step reports its counts (GET "noa", kNoaCounts values): waiting requests it admitted over the shared budget, its pieces
+ * (admissions and running prefills) and their rows, chunks it displaced, prefills that did not fit even so, steps that
+ * carried a NOA piece, and the steps with prefill rows by how many prefill entries they carried (1, 2, 3, 4 or more). */
+int  sched_noa();
+static constexpr int kNoaCounts = 10;   /* admitted, pieces, rows, displaced, waited, steps, pf_steps_1 .. 4plus */
+void note_sched_noa(const int64_t* v);
 /* Lever PSK design 2: hand the scheduler's plan for trunk pass `step` to the plugin that cuts by it (rad_psk_plan, every
  * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
  * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */
