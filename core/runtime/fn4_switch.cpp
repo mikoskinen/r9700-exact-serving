@@ -20,7 +20,7 @@ namespace {
 const char* const kNames[kSwitches] = { "no_route", "gather_inv", "hc_fusedown", "hc_normwave",
                                          "draft_adaptive", "hc_writevec", "hc_readv", "ar_lanethreads",
                                          "hc_upmix", "ar_laneblocks", "aql_acq", "exl3_pfprep", "exl3_mapshare", "exl3_gd",
-                                         "moe_pair", "exl3_dz", "exl3_bi", "exl3_dual", "hc_bi", "bi_seg", "att_bi", "arw_rows" };
+                                         "moe_pair", "exl3_dz", "exl3_bi", "exl3_dual", "hc_bi", "bi_seg", "att_bi", "arw_rows", "sched_bi_chunk" };
 const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_GATHER_INV",
                                          "RADIANCE_FN4_HC_FUSEDOWN", "RADIANCE_FN4_HC_NORMWAVE",
                                          nullptr, "RADIANCE_FN4_HC_WRITEVEC", "RADIANCE_FN4_HC_READV",
@@ -28,7 +28,7 @@ const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_G
                                          "RADIANCE_FN4_AR_LANE_BLOCKS", nullptr, nullptr,
                                          "RADIANCE_FN4_X3MAP", "RADIANCE_FN4_X3GD",
                                          "RADIANCE_FN4_MOE_PAIR", "RADIANCE_FN4_X3DZ",
-                                         "RADIANCE_FN4_X3BI", "RADIANCE_FN4_X3DUAL", "RADIANCE_FN4_HC_BI", "RADIANCE_FN4_BI_SEG", "RADIANCE_FN4_ATT_BI", "RADIANCE_FN4_ARW_ROWS" };   /* the arch reads these itself */
+                                         "RADIANCE_FN4_X3BI", "RADIANCE_FN4_X3DUAL", "RADIANCE_FN4_HC_BI", "RADIANCE_FN4_BI_SEG", "RADIANCE_FN4_ATT_BI", "RADIANCE_FN4_ARW_ROWS", "RADIANCE_SCHED_BI_CHUNK" };   /* the arch reads these itself */
 
 /* the value a switch starts with: unset / empty / 0 -> 0, a number > 1 as given (hc_fusedown's form,
  * hc_normwave's row floor), anything else 1 -- as the plugins read the same variables */
@@ -119,6 +119,7 @@ int aql_acq_rule() {
     const int v = st().val[kAqlAcq].load(std::memory_order_acquire);
     return v >= 0 ? v : env;
 }
+int sched_bi_chunk() { return st().val[kSchedBiChunk].load(std::memory_order_acquire); }
 bool aql_acq_none() {
     static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
     return none;
@@ -141,7 +142,7 @@ bool request(const std::string& name, int v, std::string* err) {
     const int lo = i == kDraftAdaptive ? -1 : 0;
     const int hi = i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096
                  : i == kHcReadV ? 63 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24
-                 : i == kAqlAcq ? 2 : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 3 : i == kBiSeg ? 2 : i == kArwRows ? 4096 : 1;
+                 : i == kAqlAcq ? 2 : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 3 : i == kBiSeg ? 2 : i == kArwRows ? 4096 : i == kSchedBiChunk ? 4 : 1;
     if (v < lo || v > hi) {
         if (err) *err = std::string(kNames[i]) + " takes " + std::to_string(lo) + ".." + std::to_string(hi);
         return false;

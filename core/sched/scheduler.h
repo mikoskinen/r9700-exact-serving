@@ -32,6 +32,9 @@ namespace rad {
  * frozen; state only the scheduler needs lives here. */
 struct SchedReq {
     std::unique_ptr<Request> req;
+    /* fn4 lever BI chunking 3 / 4 (Scheduler::bi_chunk_plan, ported from ds41-bi): the alone piece [bi_beg, bi_end) this
+     * request runs in two parts, and the checkpoint its end carries; valid while bi_beg < n_computed < bi_end. */
+    int64_t  bi_beg = 0, bi_end = 0, bi_ckpt = -1;
     uint64_t arrival = 0;        /* monotonic; the tiebreak below priority. A preempted request
                                   * keeps it, so it re-enters ahead of later arrivals */
     int32_t  slot = -1;
@@ -538,6 +541,11 @@ private:
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
+    /* fn4 lever BI chunking (switch sched_bi_chunk, RADIANCE_SCHED_BI_CHUNK at start): 0 today; 1 / 2 / 3 / 4 the
+     * ds41-bi options (bi_chunk_plan) -- a prompt's chunk boundaries the same alone and beside other work. */
+    int           bi_chunk_ = 0;
+    int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
+                                bool share);
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;

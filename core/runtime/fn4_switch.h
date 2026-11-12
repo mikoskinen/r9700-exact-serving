@@ -54,6 +54,9 @@
  *   arw_rows        architecture plugin (rad_fn4_switch): fn4 ARW -- the four-rank fused exact write / gather-write
  *                   (one-shot) only up to this many rows, above them the separate all-reduce (two-shot) and write;
  *                   byte-identical; 0 = today                                                      RADIANCE_FN4_ARW_ROWS
+ *   sched_bi_chunk  core scheduler: fn4 BI -- a prompt's prefill chunk boundaries the same alone and beside other work
+ *                   (ported from ds41-bi: 1 alone's boundaries, 2 the interval grid, 3 / 4 alone's pieces cut on the
+ *                   interval / RADIANCE_SCHED_BI_GRID grid, >= 128 rows a side); 0 today          RADIANCE_SCHED_BI_CHUNK
  *   exl3_dual       architecture plugin (rad_fn4_switch): fn4 BI-dual -- every trunk MoE layer's EXL3 down takes the
  *                   step's row bands (libr4d bi_band, exl3 interface v12): a mixed step's decode rows get the decode
  *                   band's bytes in the prefill band's pass; needs RADIANCE_FN4_X3DUAL=1 at start (declares the
@@ -81,7 +84,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
@@ -92,6 +95,9 @@ uint64_t epoch();                             /* applied changes so far */
  * else RADIANCE_AQL_ACQ (rule | rule-w) at start. A change re-records every pass (the epoch), since haz_mark marks
  * the records at recording. aql_acq_none: RADIANCE_AQL_ACQ=none (the unsafe experiment; start-time only). */
 int  aql_acq_rule();
+/* fn4 lever BI chunking (ported from ds41-bi): the scheduler's chunk option, the sched_bi_chunk switch's applied value
+ * (RADIANCE_SCHED_BI_CHUNK at start): 0 today, 1..4 (core/sched/scheduler.cpp bi_chunk_plan). */
+int  sched_bi_chunk();
 bool aql_acq_none();
 
 /* Server thread: queue a value; false (with the reason) for an unknown switch or a bad value. */
