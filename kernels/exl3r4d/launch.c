@@ -104,6 +104,13 @@
 #define EXL3R4D_FUSED_MAX 0
 #endif
 
+/* X3D-F: x3d is appended after raw_pitch (the last field with EXL3R4D_SUHC / EXL3R4D_WGQ off); every earlier field keeps
+ * its offset. exl3r4d.hip asserts the same offsets on the device compile. */
+#if !EXL3R4D_SUHC && !EXL3R4D_WGQ
+_Static_assert(offsetof(Exl3r4dGemm, x3d) == offsetof(Exl3r4dGemm, raw_pitch) + sizeof(int64_t), "x3d right after raw_pitch");
+_Static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 8, "x3d pads the block by 8");
+#endif
+
 /* Tokens a run can hold at most: an expert takes each token once (top-k picks distinct experts). */
 static int64_t run_rows_max(const Exl3Geom* g, int64_t n_tok, int64_t T) {
     const int64_t t = g->gate_up ? n_tok : (T + g->top_k - 1) / g->top_k;
@@ -232,6 +239,7 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->h_rot = g->h_rot;
     d->a_rot = g->a_rot;
     d->limit = (float)g->limit;
+    d->x3d = (g->bits == 2 && exl3r4d_fn4_x3d()) ? 1 : 0;   /* X3D-F: K = 2 only (fn4 exl3_x3d) */
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;

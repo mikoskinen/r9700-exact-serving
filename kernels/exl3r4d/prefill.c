@@ -1,3 +1,4 @@
+#include <string.h>
 /* prefill.c -- the launch and scratch hooks of exl3r4d's M > 16 rows (rows.c, the prefill section). Owner: P5.
  * Plain C against the ABI: nothing allocated, nothing synchronised, no environment read (R6).
  *
@@ -15,6 +16,31 @@
 #include <stddef.h>
 
 #include "exl3r4d_prefill.h"
+
+/* X3D-F (ds41-x3d, 12.11.2026): fn4 switch "exl3_x3d" 0 / 1 -- K = 2's decode reads a lane's eight states from one word
+ * pair (exl3r4d_common.hip.h decode_frag_x3d; the same f16 weights by construction). 0 at start = today's kernels. The
+ * engine reaches it through these hooks (core/runtime/fn4_switch.cpp: every loaded object exporting rad_fn4_switch);
+ * every other name answers 0 (not mine). */
+static volatile int g_fn4_x3d = 0;
+int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
+/* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
+ * with that prefill.c is a union of the name lists in one set of the three functions. */
+__attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
+    if (!name) return 0;
+    if (!strcmp(name, "exl3_x3d")) return value == 0 || value == 1 ? 1 : -1;
+    return 0;
+}
+__attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
+    const int ok = rad_fn4_accepts(name, value);
+    if (ok <= 0) return ok;
+    if (!strcmp(name, "exl3_x3d")) g_fn4_x3d = value;
+    return 1;
+}
+__attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* applied) {
+    if (!name || !applied) return 0;
+    if (!strcmp(name, "exl3_x3d")) { *applied = g_fn4_x3d; return 1; }
+    return 0;
+}
 #if EXL3R4D_ROUTEDUMP
 int exl3r4d_routedump(const void* off, int n, long long rows, void* stream);
 #endif

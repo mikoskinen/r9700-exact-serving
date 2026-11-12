@@ -441,6 +441,32 @@ static __device__ __forceinline__ v8h decode_frag(const unsigned (&w)[2][NW], co
   return x.f;
 }
 
+// X3D-F (ds41-x3d, 12.11.2026): K = 2's fragment from ONE word pair. A lane's two runs (positions base + 0..3 and
+// base + 8..11, Plan) are exactly 16 bits apart at K = 2, and both runs' states lie in the same two ring words for every
+// lane (run 0's and run 1's woff are equal; checked for all 32 lanes, two of them wrap 15 -> 0). So the 32-bit window
+// ending at run 1's state i holds run 1's state i in its low half and run 0's state i in its high half -- hash_pair's
+// input as it is. sx[i] = plan.shift[1] + 6 - 2 i (decode_run's off(i) = 6 - 2 i below run 1's end). The states, the
+// hashes, the byte sums, the fma and the element order are decode_frag's: the same f16 bits by construction, for
+// 2 + 4 x (1 alignbit) + ... instead of 2 runs x (alignbit + 2 lshl + bfi + lshr ...) VALU.
+static __device__ __forceinline__ v8h decode_frag_x3d(unsigned w0, unsigned w1, const unsigned (&sx)[4]) {
+  unsigned h0[4], h1[4];   // run 0's and run 1's state hashes, position i of the run
+#pragma unroll
+  for (int i = 0; i < 4; i++) hash_pair(__builtin_amdgcn_alignbit(w0, w1, sx[i]), h1[i], h0[i]);
+  const _Float16 kinv = __builtin_bit_cast(_Float16, (unsigned short)0x1EEE);
+  const _Float16 kbias = __builtin_bit_cast(_Float16, (unsigned short)0xC931);
+  auto cb = [&](unsigned ha, unsigned hb) {   // positions (q, q + 1) of a run -> one dword of two fp16 weights
+    const unsigned a = sad_hi(hb, sad_lo(ha, 0x64006400u));
+    return __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, a), (v2h){kinv, kinv},
+                                                                  (v2h){kbias, kbias}));
+  };
+  union { unsigned u[4]; v8h f; } x;
+  x.u[0] = cb(h0[0], h0[1]);   // run 0 positions 0, 1 -> e 0, 1
+  x.u[2] = cb(h0[2], h0[3]);   // run 0 positions 2, 3 -> e 4, 5
+  x.u[1] = cb(h1[0], h1[1]);   // run 1 positions 0, 1 -> e 2, 3
+  x.u[3] = cb(h1[2], h1[3]);   // run 1 positions 2, 3 -> e 6, 7
+  return x.f;
+}
+
 // libr4d's fragA (two 8-byte groups 16 bytes apart) from a uniform base plus a per-lane byte offset.
 static __device__ __forceinline__ v8h frag_a8(gu8 base, unsigned off) {
   union { unsigned long long w[2]; v8h f; } x;

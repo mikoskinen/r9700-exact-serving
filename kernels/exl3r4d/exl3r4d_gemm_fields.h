@@ -39,3 +39,5 @@
     const int*     wq_map;   /* WGQ: HW_ID1 key (exl3r4d.hip, wgp_key) -> dense WGP id, or -1; probed at instance init */
     int32_t        wq_nl;    /* WGQ: WGPs (lists) */
 #endif
+    int32_t        x3d;      /* X3D-F (ds41-x3d): 1 = K = 2's decode from one word pair (fill(): bits 2 and the fn4 switch
+                              * exl3_x3d); appended after every other field, so no earlier field moves */

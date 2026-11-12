@@ -580,7 +580,7 @@ static __device__ bool xs_combine(const Exl3r4dGemm& p, v8f (&acc)[NPW], int uni
 // XSM (P10-TP4S L1, the four-class dense gate_up only): this workgroup is slice xsl of xsn of its unit's K; with xsn
 // 2 the two slices' partial sums meet in xs_combine (below) and the second to arrive runs the epilogue.
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false, int PFO = 0,
-          bool XSM = false>
+          bool XSM = false, bool X3D = false>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
                                                 int wsub = 0, int xsn = 1, int xsl = 0, int xunit = 0) {
@@ -855,6 +855,12 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   // R23 (EXL3R4D_KX_BUF): another K takes the buffer form too, four words a tile (each run's two), addresses still
   // free of VALU; K = 4 keeps its three.
   constexpr bool kBuf = EXL3R4D_BUF && NW == 2 && (BITS == 4 || EXL3R4D_KX_BUF);
+  static_assert(!X3D || (BITS == 2 && NW == 2 && kBuf && !kB96 && STAGED == 0 && !APREP), "X3D-F: K = 2's buffer K loop only");
+  [[maybe_unused]] unsigned x3d_sx[4];   // X3D-F: the four windows' shifts within run 1's word pair
+  if constexpr (X3D) {
+#pragma unroll
+    for (int i = 0; i < 4; i++) x3d_sx[i] = plan.shift[1] + 6u - 2u * (unsigned)i;
+  }
   constexpr int kAux = EXL3R4D_NT ? 1 : 0;  // TH_LOAD_NT, as the global form's __builtin_nontemporal_load
 
 #define WOFF_(r, x) wvo[r][x]
@@ -879,6 +885,10 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
         } else if constexpr (kB96) {                                                 \
           const auto t_ = __builtin_amdgcn_raw_buffer_load_b96(wrs, b96o + j * WORDS * 4, so_, kAux); \
           W_[j][0][0] = t_[0]; W_[j][0][1] = t_[1]; W_[j][1][0] = t_[2];            \
+        } else if constexpr (X3D) { /* K = 2: both runs read run 1's two words */    \
+          W_[j][1][0] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[1][0] + j * WORDS * 4, so_, kAux); \
+          W_[j][1][1] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[1][1] + j * WORDS * 4, so_, kAux); \
+          W_[j][0][0] = W_[j][1][0]; W_[j][0][1] = W_[j][1][1];                      \
         } else {                                                                     \
           _Pragma("unroll") for (int r = 0; r < 2; r++)                              \
             _Pragma("unroll") for (int x = 0; x < NW; x++)                           \
@@ -925,6 +935,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
         const unsigned x0_ = b96w ? l_ : v0_, x1_ = b96w ? v0_ : v1_, x2_ = b96w ? v1_ : v2_; \
         const unsigned w2_[2][NW] = { { x0_, x1_ }, { b96p ? x1_ : x0_, b96p ? x2_ : x1_ } }; \
         wf = decode_frag<BITS, NW>(w2_, plan.shift);                                 \
+      } else if constexpr (X3D) {                                                    \
+        wf = decode_frag_x3d(W_[j][1][0], W_[j][1][1], x3d_sx);                      \
       } else {                                                                       \
         wf = decode_frag<BITS, NW>(W_[j], plan.shift);                               \
       }                                                                              \
@@ -1162,6 +1174,38 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kern
   if (EXL3R4D_WGSTAMP & 128)
     wgs_put(MATS - 1, (int)(blockIdx.y * gridDim.x + blockIdx.x), wgt0, wgt1, __builtin_readsteadycounter());
 #endif
+}
+
+// X3D-F (ds41-x3d): the K = 2 decode kernel with decode_frag_x3d -- exl3r4d_gemm_kernel<2, 2, MATS, false> exactly
+// (prep kernel rows, no DNW, EXL3R4D_DNG 1) except moe_pass's X3D. exl3r4d_launch_gemm takes it only when the argument
+// block's x3d is set (fill(): bits 2 and the fn4 switch exl3_x3d), so with the switch off no launch reaches it.
+#if !EXL3R4D_SUHC && !EXL3R4D_WGQ   // the device compile's view of the appended field = the host's (launch.c)
+static_assert(offsetof(Exl3r4dGemm, x3d) == offsetof(Exl3r4dGemm, raw_pitch) + sizeof(int64_t), "x3d right after raw_pitch");
+static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 8, "x3d pads the block by 8");
+#endif
+template <int MATS>
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_kernel(Exl3r4dGemm p) {
+  static_assert(EXL3R4D_DNG == 1 || MATS == 2, "X3D-F: down's E2 grouping is not ported");
+  EXL3R4D_KARG_PREFETCH();
+  inject_delay<MATS == 2 ? EXL3R4D_DLY_GU : EXL3R4D_DLY_DN>(EXL3R4D_WG0);
+  extern __shared__ float lds[];
+  __shared__ int s_find[35];
+  [[maybe_unused]] const unsigned long long tk0 = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0;
+  Planes wpre = {};
+  const bool frp = EXL3R4D_FRP && p.n_expert <= 8 * (int)blockDim.x;
+  const Run run = frp ? find_run_planes(p, blockIdx.y, s_find, wpre) : find_run_any(p, blockIdx.y, s_find);
+  if (run.e < 0) {
+    zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, blockIdx.x);
+    return;
+  }
+  const Planes w = frp ? wpre : planes_of(p, run.e);
+  const int width = MATS == 2 ? w.rows / 2 : w.rows;
+  if ((int)blockIdx.x * 128 >= width) {
+    zero_rows(p, run.r0, run.r1, blockIdx.x);
+    return;
+  }
+  for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+    moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true>(p, w, rc, run.r1, lds, tk0);
 }
 
 // ----------------------------------------------------------------------------- WGB: the persistent decode grid
@@ -3552,6 +3596,8 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     const void* kf = bits == 2 ? kx_fn<2>(gate_up, gscr) : bits == 3 ? kx_fn<3>(gate_up, gscr)
                    : bits == 5 ? kx_fn<5>(gate_up, gscr) : bits == EXL3R4D_K25 ? kx_fn<EXL3R4D_K25>(gate_up, gscr)
                    : kx_fn<6>(gate_up, gscr);
+    if (bits == 2 && a->x3d && !gscr && dngk == 1)   // X3D-F (fn4 exl3_x3d): K = 2's one-word-pair decode
+      kf = gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2> : (const void*)exl3r4d_gemm_x3d_kernel<1>;
     if (hipLaunchKernel(kf, gk, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
       return RAD_E_DEVICE;
     return RAD_OK;
