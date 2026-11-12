@@ -21,6 +21,9 @@ int r4d_rad_embed_lookup_ggml(const RadArgs*, RadStream);
  * lever D2's form, else the two launches. */
 int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs*, RadStream);
 int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs*, RadStream);
+/* Lever 1U-GQ (ds41-int11): two gemm_nt_ggml of one type and K over the same rows, one launch in the decode band under
+ * lever D2's form, else the two launches. */
+int r4d_rad_gemm_nt_ggml_pair(const RadArgs*, RadStream);
 
 /* -- the weight layout (r4d_ds41_ggml_layout.cpp): libref's ref_ggml_layout / relayout /
  * unrelayout, byte for byte and with the same tag, so either library reads the other's bytes. */
@@ -32,6 +35,15 @@ int r4d_ds41_ggml_relayout(const RadParam* p, int n_p, int operand, const RadEnc
 int r4d_ds41_ggml_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                              const int* sel, const void* src, int64_t src_bytes,
                              const RadTensor* planes, int n_planes);
+/* gemm_nt_ggml_pair's two weights (operands 1 and 3), each stored as gemm_nt_ggml stores its weight. */
+int r4d_ds41_ggml_pair_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                              const int* sel, const RadTensor* planes, int n_planes, RadLayout* out);
+int r4d_ds41_ggml_pair_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                const int* sel, const RadTensor* planes, int n_planes, void* dst,
+                                int64_t dst_bytes);
+int r4d_ds41_ggml_pair_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                  const int* sel, const void* src, int64_t src_bytes,
+                                  const RadTensor* planes, int n_planes);
 
 /* -- operand descriptions (r4d_ds41_ggml_shapes.inc), libref's: the weight in its float logical
  * form. */
@@ -41,9 +53,11 @@ int r4d_shape_logits_gemm_ggml(const RadParam* p, int n_p, int operand, RadOpdDe
 int r4d_shape_embed_lookup_ggml(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_rmsnorm_gemm_nt_ggml(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r4d_shape_gemm_nt_ggml_pair(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 /* -- the chains the K1 folds replace (r4d_fuse.cpp). */
 int r4d_fuse_rmsnorm_gemm_nt_ggml(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out);
 int r4d_fuse_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out);
+int r4d_fuse_gemm_nt_ggml_pair(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out);
 
 #endif

@@ -119,6 +119,22 @@ static const RadConstraint cDs41GgFold256[] = {
 static const RadConstraint cDs41GgFold32[] = {
     C_GE("M", 1), C_GE("N", 1), C_GE("K", 32), C_DIV("K", 32), C_IN("type", "q8_0"), C_IN("dtype", "bf16"),
 };
+/* Lever 1U-GQ (gemm_nt_ggml_pair): two GGUF weights of one type at one K (operands 1 and 3, each stored as gemm_nt_ggml
+ * stores its weight), over the same rows; a2 absent reads a. Any M (the decode band pairs while lever D2's form is on;
+ * the rest issues the two launches); the types the form reads. */
+static const RadParamSpec pDs41GemmGgmlPair[] = { P_INT("M"), P_INT("N"), P_INT("N2"), P_INT("K"), P_STR("type"),
+    P_STR("dtype") };
+static const RadOperandSpec oDs41GemmGgmlPair[] = {
+    { "a", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "a2", RAD_OPD_IN, 1 }, { "w2", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT, 0 }, { "y2", RAD_OPD_OUT, 0 },
+};
+static const RadConstraint cDs41GgPair256[] = {
+    C_GE("M", 1), C_GE("N", 1), C_GE("N2", 1), C_GE("K", 256), C_DIV("K", 256), C_IN("type", "q5_K q6_K"),
+    C_IN("dtype", "bf16"),
+};
+static const RadConstraint cDs41GgPair32[] = {
+    C_GE("M", 1), C_GE("N", 1), C_GE("N2", 1), C_GE("K", 32), C_DIV("K", 32), C_IN("type", "q8_0"), C_IN("dtype", "bf16"),
+};
 #undef R4D_DS41_GG_T256
 #undef R4D_DS41_GG_T32
 
@@ -143,6 +159,10 @@ SCHEMA("rmsnorm_gemm_nt_ggml", pDs41NormGemmGgml, oDs41NormGemmGgml,
 SCHEMA("swiglu_clamped_gemm_nt_ggml", pDs41SwiGemmGgml, oDs41SwiGemmGgml,
        "swiglu_clamped (gate_up [M, 2K] -> h [M, K]; limit) then gemm_nt_ggml (h, w -> y; type, N, K): h and y as "
        "the two ops leave them. A clamped SwiGLU and its down projection (DeepSeek-V4.1's shared expert)."),
+SCHEMA("gemm_nt_ggml_pair", pDs41GemmGgmlPair, oDs41GemmGgmlPair,
+       "two gemm_nt_ggml over the same rows: y = a . w^T (N) and y2 = a2 . w2^T (N2; a2 absent: a), w and w2 of one GGUF "
+       "type at one K, each read as gemm_nt_ggml reads its weight; y and y2 as the two ops leave them. A layer's two "
+       "projections of one input (DeepSeek-V4.1's q_a and attn_kv) or its two output groups (attn_output_a)."),
 SCHEMA("embed_lookup_ggml", pDs41EmbedGgml, oDs41EmbedGgml,
        "embed_lookup from a table in llama.cpp's blocks of GGUF type `type`: the id's row dequantised as "
        "llama.cpp does, times `mult` when given, rounded once. Padding, bounds and vocab_offset behave as "
@@ -275,6 +295,21 @@ SCHEMA("embed_lookup_ggml", pDs41EmbedGgml, oDs41EmbedGgml,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgFold32), NOTUNE,
   nullptr, nullptr, r4d_rad_swiglu_clamped_gemm_nt_ggml, nullptr,
   R4D_DS41_GG_HOOKS(r4d_shape_swiglu_clamped_gemm_nt_ggml), r4d_fuse_swiglu_clamped_gemm_nt_ggml },
+
+/* Lever 1U-GQ: one launch in the decode band under lever D2's form (both weights' rows in one grid), else the two
+ * gemm_nt_ggml launches (r4d_ds41_ggml.hip). */
+{ "gemm_nt_ggml_pair_qk256", "gemm_nt_ggml_pair", "gemm",
+  "two gemm_nt_ggml over the same rows: in the decode band under lever D2's form one launch, each weight's rows in "
+  "their own blocks of one grid in the form's per-output order; else the two launches",
+  "any M, N, N2; K a multiple of 256; q5_K or q6_K", "bf16 a, a2, y and y2",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgPair256), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_nt_ggml_pair, nullptr, r4d_ds41_ggml_pair_layout, r4d_ds41_ggml_pair_relayout,
+  r4d_shape_gemm_nt_ggml_pair, r4d_ds41_ggml_pair_unrelayout, r4d_fuse_gemm_nt_ggml_pair },
+{ "gemm_nt_ggml_pair_qk32", "gemm_nt_ggml_pair", "gemm",
+  "gemm_nt_ggml_pair_qk256 over q8_0 blocks", "any M, N, N2; K a multiple of 32; q8_0", "bf16 a, a2, y and y2",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41GgPair32), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_nt_ggml_pair, nullptr, r4d_ds41_ggml_pair_layout, r4d_ds41_ggml_pair_relayout,
+  r4d_shape_gemm_nt_ggml_pair, r4d_ds41_ggml_pair_unrelayout, r4d_fuse_gemm_nt_ggml_pair },
 
 #undef R4D_DS41_GG_HOOKS
 #endif  /* R4D_HAVE_GGML */

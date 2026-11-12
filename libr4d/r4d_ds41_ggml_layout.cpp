@@ -147,3 +147,23 @@ extern "C" int r4d_ds41_ggml_unrelayout(const RadParam* p, int n_p, int operand,
     lq::ggml::write_shared(k->type, *enc, all.data());
     return RAD_OK;
 }
+
+/* gemm_nt_ggml_pair (lever 1U-GQ, ds41-int11): its weights are operands 1 and 3, each the type's native blocks at K, as
+ * gemm_nt_ggml (operand 1) stores them -- the same tag and bytes, so one stored form serves both ops. */
+extern "C" int r4d_ds41_ggml_pair_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                         const int* sel, const RadTensor* planes, int n_planes, RadLayout* out) {
+    if (operand != 1 && operand != 3) return RAD_E_DTYPE;
+    return r4d_ds41_ggml_layout(p, n_p, 1, enc, sel, planes, n_planes, out);
+}
+extern "C" int r4d_ds41_ggml_pair_relayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                           const int* sel, const RadTensor* planes, int n_planes, void* dst,
+                                           int64_t dst_bytes) {
+    if (operand != 1 && operand != 3) return RAD_E_DTYPE;
+    return r4d_ds41_ggml_relayout(p, n_p, 1, enc, sel, planes, n_planes, dst, dst_bytes);
+}
+extern "C" int r4d_ds41_ggml_pair_unrelayout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                             const int* sel, const void* src, int64_t src_bytes,
+                                             const RadTensor* planes, int n_planes) {
+    if (operand != 1 && operand != 3) return RAD_E_DTYPE;
+    return r4d_ds41_ggml_unrelayout(p, n_p, 1, enc, sel, src, src_bytes, planes, n_planes);
+}

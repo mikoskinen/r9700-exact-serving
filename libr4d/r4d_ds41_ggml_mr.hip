@@ -304,8 +304,10 @@ __device__ __forceinline__ void mr_norm_scales(const GgMrArgs& A, int m0, int mc
     lds_barrier();
 }
 
+/* The form's block body: block column `bx` of the call A (the plain kernel's blockIdx.x; lever 1U-GQ's pair kernel runs
+ * two calls' column ranges in one grid, each block the body of its own call at its own column). */
 template <int T, int H, int R, int MT, typename OT, int PRO = 0>
-__global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
+__device__ __forceinline__ void gg_mr_body(const GgMrArgs& A, int bx) {
     using Q = Gg<T>;
     static_assert(H == 1 || H == 2 || H == 4 || H == 8, "row slots a wave");
     constexpr int LPR = 32 / H, VPS = 32 * LPR, PD = mr_pd<MT, R>();
@@ -317,7 +319,7 @@ __global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
 #endif
     const int lane = (int)threadIdx.x & 31, wave = (int)threadIdx.x >> 5, nw = (int)blockDim.x >> 5;
     const int g = lane / LPR, i = lane - g * LPR;
-    const int nl = ((int)blockIdx.x * nw + wave) * (H * R) + g * R;   /* this lane's first weight row */
+    const int nl = (bx * nw + wave) * (H * R) + g * R;   /* this lane's first weight row */
     const int m0 = (int)blockIdx.y * MT, mc = min(MT, A.M - m0);
     const uint8_t* wr[R];
 #pragma unroll
@@ -432,6 +434,21 @@ __global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
     }
 }
 
+template <int T, int H, int R, int MT, typename OT, int PRO = 0>
+__global__ __launch_bounds__(kMrThreads) void gg_mr_kernel(GgMrArgs A) {
+    gg_mr_body<T, H, R, MT, OT, PRO>(A, (int)blockIdx.x);
+}
+
+/* Lever 1U-GQ (ds41-int11, gemm_nt_ggml_pair): two calls of one form (the same type, K, M, H, R, MT, WN, SS) in one
+ * grid -- blocks [0, gxa) are A's columns, [gxa, gridDim.x) B's. Each block runs gg_mr_body of its own call exactly as
+ * that call's own launch of the form would run it, so every output keeps the form's per-output operations: the
+ * pair's bytes are the two launches' (and, by the form's exactness argument above, the stock kernel's). */
+template <int T, int H, int R, int MT, typename OT>
+__global__ __launch_bounds__(kMrThreads) void gg_mr_pair_kernel(GgMrArgs A, GgMrArgs B, int gxa) {
+    if ((int)blockIdx.x < gxa) gg_mr_body<T, H, R, MT, OT, 0>(A, (int)blockIdx.x);
+    else gg_mr_body<T, H, R, MT, OT, 0>(B, (int)blockIdx.x - gxa);
+}
+
 /* ------------------------------------------------------------------ forms
  * (H, R, MT): H weight rows a wave side by side, R a lane, MT activation rows a block. MT is the accumulator
  * count's third factor (R x MT x H floats a lane, <= 96) and one stage of MT rows must fit kMrLdsMax. */
@@ -485,6 +502,40 @@ int mr_launch(RadStream s, int ty, bool f32out, int H, int R, int MT, const GgMr
     }
 }
 
+#ifndef R4D_GG_MR_W64
+template <int T, typename OT>
+int mr_pair_launch_t(RadStream s, int H, int R, int MT, const GgMrArgs& A, const GgMrArgs& B, int gxa, dim3 grid,
+                     unsigned thr, unsigned lds) {
+#define MR_CASE(h, r, mt)                                                                                  \
+    if (H == h && R == r && MT == mt)                                                                      \
+        return R4D_EMIT(s, (gg_mr_pair_kernel<T, h, r, mt, OT>), grid, dim3(thr), lds, A, B, gxa);
+    MR_FORMS(MR_CASE)
+#undef MR_CASE
+    return R4D_GG_MR_DECLINE;
+}
+
+[[maybe_unused]] int mr_pair_launch(RadStream s, int ty, bool f32out, int H, int R, int MT, const GgMrArgs& A,
+                                    const GgMrArgs& B, int gxa, dim3 grid, unsigned thr, unsigned lds) {
+#ifdef R4D_EMU_HOST   /* tests/r4d_emu: f32 outputs at every type, as mr_launch */
+    if (f32out) {
+        switch (ty) {
+        case GG_Q5_K: return mr_pair_launch_t<GG_Q5_K, float>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+        case GG_Q6_K: return mr_pair_launch_t<GG_Q6_K, float>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+        case GG_Q8_0: return mr_pair_launch_t<GG_Q8_0, float>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+        default: return R4D_GG_MR_DECLINE;
+        }
+    }
+#endif
+    if (f32out) return R4D_GG_MR_DECLINE;
+    switch (ty) {
+    case GG_Q5_K: return mr_pair_launch_t<GG_Q5_K, uint16_t>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+    case GG_Q6_K: return mr_pair_launch_t<GG_Q6_K, uint16_t>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+    case GG_Q8_0: return mr_pair_launch_t<GG_Q8_0, uint16_t>(s, H, R, MT, A, B, gxa, grid, thr, lds);
+    default: return R4D_GG_MR_DECLINE;
+    }
+}
+#endif
+
 [[maybe_unused]] int mr_cu_count() {
 #ifdef R4D_EMU_HOST
     return 64;
@@ -536,7 +587,9 @@ bool mr_tab(const R4dGgMrCall& c, int* H, int* R, int* cap, int* WN) {
     return false;
 }
 
-bool mr_pick(const R4dGgMrCall& c, MrForm* f) {
+/* n_all > 0 (lever 1U-GQ's pair): the grid holds that many weight rows in all, so WN is sized for them (the waves of
+ * both calls), not for c's alone; the form (H, R, MT) stays c's. */
+bool mr_pick(const R4dGgMrCall& c, MrForm* f, int n_all = 0) {
     int H = 4, R = c.N >= 4096 ? 2 : 1, cap = 0, WN = 0, w64 = 0;
     /* The table under the runtime switch only: a pin, and the bench's forced rule (h -1), keep their own form. */
     if (g_mr_pin_h == 0 && !c.f32out) (void)mr_tab(c, &H, &R, &cap, &WN);
@@ -560,7 +613,7 @@ bool mr_pick(const R4dGgMrCall& c, MrForm* f) {
     const long long sb = (long long)MT * VPS * 4;
     if (sb > kMrLdsMax) return false;
     const int gy = (c.M + MT - 1) / MT;
-    const long long rw = (long long)H * R, nwv = (c.N + rw - 1) / rw;
+    const long long rw = (long long)H * R, nwv = ((n_all > 0 ? n_all : c.N) + rw - 1) / rw;
     const int wmin = w64 ? 2 : 1;
     if (WN <= 0) {
         const long long want = 2LL * mr_cu_count();
@@ -678,6 +731,47 @@ int r4d_gg_mr_fold(RadStream s, const R4dGgMrCall& c, const R4dGgMrFold& fo) {
     return fo.pro == 1 ? mr_launch_fold<1>(s, c.ty, f.H, f.R, f.MT, A, grid, 32u * f.WN, f.lds)
                        : mr_launch_fold<2>(s, c.ty, f.H, f.R, f.MT, A, grid, 32u * f.WN, f.lds);
 }
+
+/* Lever 1U-GQ (ds41-int11): two decode-band calls in one launch of the form. Both must have the same block type, K and
+ * M (and bf16 out); one form is picked for the pair -- mr_pick's for the call with more weight rows, a pin's when
+ * pinned -- and each call gets its own column range of the grid at that form's WN (gxa = A's columns). Declined
+ * (R4D_GG_MR_DECLINE: the caller issues the two launches) where either call would be declined alone, where the
+ * calls differ in type / K / M, for f32 out and for a wave64 pin. The caller decides whether the form is on. */
+static int mr_pair_go(RadStream s, const R4dGgMrCall& a, const R4dGgMrCall& b, bool f32) {
+    if (a.ty != b.ty || a.K != b.K || a.M != b.M || a.f32out != f32 || b.f32out != f32) return R4D_GG_MR_DECLINE;
+    for (const R4dGgMrCall* c : { &a, &b }) {
+        if (c->ty != GG_Q5_K && c->ty != GG_Q6_K && c->ty != GG_Q8_0) return R4D_GG_MR_DECLINE;
+        if (c->M < 1 || c->M > kMrMaxM || c->N < 1 || c->K < 1) return R4D_GG_MR_DECLINE;
+        if (c->ty == GG_Q5_K && ((uintptr_t)c->w & 3u)) return R4D_GG_MR_DECLINE;
+    }
+    /* the larger call's form (its measured table entry, else the rule), WN sized for both calls' rows */
+    const R4dGgMrCall& big = b.N > a.N ? b : a;
+    MrForm f{};
+    if (a.N + (long long)b.N > 0x7fffffffLL || !mr_pick(big, &f, a.N + b.N) || f.w64) return R4D_GG_MR_DECLINE;
+    const long long rw = (long long)f.H * f.R;
+    const long long gxa = ((a.N + rw - 1) / rw + f.WN - 1) / f.WN, gxb = ((b.N + rw - 1) / rw + f.WN - 1) / f.WN;
+    if (gxa + gxb > 0x7fffffffLL) return R4D_GG_MR_DECLINE;
+    auto args_of = [&](const R4dGgMrCall& c) {
+        GgMrArgs A{};
+        A.x = c.x; A.x_ld = c.x_ld; A.w = c.w; A.w_ld = c.w_ld; A.y = c.y; A.y_ld = c.y_ld;
+        A.M = c.M; A.N = c.N; A.K = c.K;
+        const int Q = c.ty == GG_Q8_0 ? 32 : 256, UPB = c.ty == GG_Q8_0 ? 1 : 8;
+        A.UK = c.K / Q * UPB;
+        A.NS = (A.UK + 32 / f.H - 1) / (32 / f.H);
+        A.SS = f.SS;
+        A.x_al = c.x_al;
+        return A;
+    };
+    std::snprintf(g_mr_last, sizeof g_mr_last, "pair H%d R%d MT%d WN%d SS%d grid %lld+%lldx%d lds %u", f.H, f.R, f.MT,
+                  f.WN, f.SS, gxa, gxb, f.gy, f.lds);
+    return mr_pair_launch(s, a.ty, f32, f.H, f.R, f.MT, args_of(a), args_of(b), (int)gxa,
+                          dim3((unsigned)(gxa + gxb), (unsigned)f.gy), 32u * f.WN, f.lds);
+}
+int r4d_gg_mr_pair(RadStream s, const R4dGgMrCall& a, const R4dGgMrCall& b) { return mr_pair_go(s, a, b, false); }
+#ifdef R4D_EMU_HOST
+/* tests/r4d_emu: the pair with f32 outputs (the emulator's unit instantiates them at every type, as mr_launch). */
+int r4d_gg_mr_pair_f32(RadStream s, const R4dGgMrCall& a, const R4dGgMrCall& b) { return mr_pair_go(s, a, b, true); }
+#endif
 
 /* r4d_gg_mr_pin (bench / test hook, r4d_selftest --mrcheck / --perfmr): h 0 clears the pin (the runtime switch
  * decides, off by default), -1 forces the rule, 1 / 2 / 4 pins H with R rows a lane (1 or 2), MT cap `mt` (0: the

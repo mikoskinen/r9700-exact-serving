@@ -1943,6 +1943,54 @@ static int64_t index_slots(const Model& m) {
     return m.ikmx ? (m.c.idim / 2 + m.c.idim / 32 + 15) / 16 * 16 / 2 : m.c.idim;
 }
 
+/* Lever 1U-GQ (ds41-int11) at a layer's declare (RADIANCE_DS41_GQ declared): gemm_nt_ggml_pair beside q_a + kv_g (both
+ * GEMVs of the attention norm's output `xn`, into `qr` and `kv`) where both weights are GGUF blocks of one type
+ * (gemm_nt_ggml, not an IQR view), and beside the two attention_output_a groups (`o`'s two column halves into `oa`'s)
+ * where the rank holds two of one type. fused(): 0 where no library serves the op (a host deployment), and the
+ * separate ops stay declared for every pass the switch leaves to them. Where it is declared: the pair is issued where
+ * the first of its two ops is (q_a's point, the first group's), so it is declared at or before the point its writes
+ * begin in issue order -- the trunk's after kv_g (the trunk issues q_a and kv_g back to back, and its qr / kv live over
+ * every layer), the drafter's right after its q_a (the drafter issues kv_g after q_an / q_b / q_rope: declared there,
+ * kv_'s planned life starts before them and no query-chain buffer can share its bytes); the groups' after both. */
+static const char* gq_type(const Model& m, rad_weight w1, rad_weight w2) {
+    const auto t1 = m.wty.find(w1), t2 = m.wty.find(w2);
+    if (t1 == m.wty.end() || t2 == m.wty.end() || m.wsc.count(w1) || m.wsc.count(w2)) return nullptr;
+    return std::strcmp(t1->second, t2->second) ? nullptr : t1->second;
+}
+static void gq_qkv(RadBuilder* b, Model& m, Layer& L, int64_t rows, rad_buf xn, rad_buf qr, rad_buf kv) {
+    if (!gq_declared() || !L.q_a || !L.wkv) return;   /* kv_g: declared beside by the caller */
+    const char* ty = gq_type(m, L.wq_a, L.wkv);
+    if (!ty) return;
+    L.qkv_pair = fused(b, "gemm_nt_ggml_pair",
+                       { RAD_RANGE("M", 1, rows), RAD_INT("N", m.c.q_lora), RAD_INT("N2", m.c.head_dim),
+                         RAD_INT("K", m.c.n_embd), RAD_STR("type", ty), RAD_STR("dtype", m.g.dtype) },
+                       { L.wq_a, L.wkv }, { xn }, { qr, kv });
+}
+static void gq_oa(RadBuilder* b, Model& m, Layer& L, int64_t rows, int64_t gd, rad_buf o, rad_buf oa) {
+    if (!gq_declared() || m.gr != 2 || L.o_a.size() != 2 || L.wo_a.size() != 2 || !L.o_a[0] || !L.o_a[1]) return;
+    const char* ty = gq_type(m, L.wo_a[0], L.wo_a[1]);
+    if (!ty) return;
+    L.oa_pair = fused(b, "gemm_nt_ggml_pair",
+                      { RAD_RANGE("M", 1, rows), RAD_INT("N", m.c.o_rank), RAD_INT("N2", m.c.o_rank), RAD_INT("K", gd),
+                        RAD_STR("type", ty), RAD_STR("dtype", m.g.dtype) },
+                      { L.wo_a[0], L.wo_a[1] }, { o }, { oa });
+}
+/* At issue: gq_qkv_on -- q_a + kv_g over n rows as the pair (the switch's bit 0, the layer declared it, n in the band);
+ * else the caller issues the two ops. gq_oa_on the same for the output groups (bit 1). */
+static bool gq_qkv_on(const Layer& L, int64_t n) { return L.qkv_pair && n >= 1 && n <= kBiBand && (gq_now() & 1); }
+static bool gq_oa_on(const Layer& L, int64_t n) { return L.oa_pair && n >= 1 && n <= kBiBand && (gq_now() & 2); }
+static void gq_qkv_issue(RadCtx* x, const Model& m, const Layer& L, int64_t n, RadOperand xn, RadOperand qr,
+                         RadOperand kv) {
+    RAD_ISSUE_N(x, L.qkv_pair, n, xn, RAD_W(L.wq_a), RAD_NONE, RAD_W(L.wkv), qr, kv);
+    if (m.g.rank == 0) g_gq_qkv.fetch_add(1, std::memory_order_relaxed);
+}
+/* ... and the two attention_output_a groups (o's column halves -> oa's) under bit 1 */
+static void gq_oa_issue(RadCtx* x, const Model& m, const Layer& L, int64_t n, RadOperand o0, RadOperand o1,
+                        RadOperand y0, RadOperand y1) {
+    RAD_ISSUE_N(x, L.oa_pair, n, o0, RAD_W(L.wo_a[0]), o1, RAD_W(L.wo_a[1]), y0, y1);
+    if (m.g.rank == 0) g_gq_oa.fetch_add(1, std::memory_order_relaxed);
+}
+
 /* Lever 1U-E2 (ds41-int11): a GGUF weight row's stored bytes (gemm_nt_ggml's native blocks: the row step of a row view);
  * 0 for a type this build cannot name. */
 static int64_t ggml_row_bytes(const char* ty, int64_t k) {
@@ -2455,6 +2503,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         L.wkv = lw(b, m, nm.f("blk.%d.attn_kv.weight", l), hd, D, grp);
         L.kv_norm = w("blk.%d.attn_kv_a_norm.weight", RAD_F32, { hd });
         L.kv_g = linear(b, m, T, L.wkv, hd, D, m.xn, m.kv);
+        gq_qkv(b, m, L, T, m.xn, m.qr, m.kv);   /* lever 1U-GQ: q_a + kv_g as one op, beside them */
         L.kv_f = norm_rope_rt(b, m, T, L.kv_norm, hd, 32, "fp8_e4m3", "ue8m0", m.kv, m.kvn, cs);
         if (!L.kv_f) {
             L.kv_n = rmsnorm(b, m, T, L.kv_norm, hd, m.kv, m.kvn);
@@ -2674,6 +2723,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             if (!L.wo_a.back()) return RAD_E_INVAL;
             L.o_a.push_back(linear(b, m, T, L.wo_a.back(), c.o_rank, gd, m.o, m.oa));
         }
+        gq_oa(b, m, L, T, gd, m.o, m.oa);   /* lever 1U-GQ: the two groups as one op, beside them */
         const int64_t ok = m.gr * c.o_rank;
         L.wo_b = lw(b, m, nm.f("blk.%d.attn_output_b.weight", l), D, ok, grp, RAD_SHARD_COL,
                     m.ar * ok, (m.ar + 1) * ok);
@@ -2965,6 +3015,10 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
     } else {
         L.norm_a = rmsnorm(b, m, Q, L.attn_norm, D, d.x, d.xn);
         L.q_a = linear(b, m, Q, L.wq_a, c.q_lora, D, d.xn, d.qr);
+        /* lever 1U-GQ: the pair is issued at q_a's point, ahead of q_an / q_b / q_rope (kv_g's own point is after
+         * them), so it is declared here: d.kv_'s planned life then starts before q_an, and no buffer of the query
+         * chain can share its bytes. kv_g itself is declared below as before (the stage fails without it). */
+        gq_qkv(b, m, L, Q, d.xn, d.qr, d.kv_);
         L.q_an = rmsnorm(b, m, Q, L.q_norm, c.q_lora, d.qr, d.qrn);
         L.q_b = linear(b, m, Q, L.wq_b, HD, c.q_lora, d.qrn, d.q);
         L.q_rope = rope_rows(b, m, Q, g.n_head, hd, 0, d.q, m.cs_a);
@@ -2991,6 +3045,7 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
         L.o_q = roundtrip(b, Q, HD, 32, "fp8_e4m3", "ue8m0", d.o);
         const int64_t gd = HD / m.gr;
         for (int j = 0; j < m.gr; ++j) L.o_a.push_back(linear(b, m, Q, L.wo_a[(size_t)j], c.o_rank, gd, d.o, d.oa));
+        gq_oa(b, m, L, Q, gd, d.o, d.oa);   /* lever 1U-GQ */
         L.o_b = linear(b, m, Q, L.wo_b, D, m.gr * c.o_rank, d.oa, d.attn_out);
         if (!L.norm_a || !L.q_a || !L.q_an || !L.q_b || !L.q_rope || !L.kv_g || !L.kv_n || !L.kv_rope ||
             !L.kv_st || !L.attn || !L.o_rope || !L.o_b)
@@ -4121,13 +4176,18 @@ static void mhc_declare(Model& m, const RadBuildCtx* ctx) {
  * serves the pair op / the gather, or the shapes do not split) -> not available (>= 1 refused, the switch reads 0). */
 static void i11_declare(Model& m, const RadBuildCtx* ctx) {
     if (ctx->shape_probe || (!gq_declared() && !e2_declared())) return;
-    int gq = 0, qkv = 0, oa = 0, e2 = 0, eng = 0;
+    int gq = 0, qkv = 0, oa = 0, e2 = 0, eng = 0, dqkv = 0, doa = 0;
     for (const Layer& L : m.layers) {
         qkv += L.qkv_pair ? 1 : 0;
         oa += L.oa_pair ? 1 : 0;
         gq += L.qkv_pair || L.oa_pair ? 1 : 0;
         e2 += L.e_gemm_p && L.e_gath ? 1 : 0;
         eng += L.e_ids ? 1 : 0;
+    }
+    for (const Layer& L : m.dsp.st) {   /* the drafter's query-pass stages (lever 1U-GQ there too) */
+        dqkv += L.qkv_pair ? 1 : 0;
+        doa += L.oa_pair ? 1 : 0;
+        gq += L.qkv_pair || L.oa_pair ? 1 : 0;
     }
     if (gq_declared()) {
         g_sw_gq_ok.store(gq > 0 ? 1 : 0, std::memory_order_relaxed);
@@ -4143,9 +4203,10 @@ static void i11_declare(Model& m, const RadBuildCtx* ctx) {
     if (g_i11_noted.exchange(1, std::memory_order_relaxed)) return;
     if (gq_declared())
         fprintf(stderr, "radiance: deepseek41: lever 1U-GQ (ds41_gq, RADIANCE_DS41_GQ, now %d) %s: gemm_nt_ggml_pair beside "
-                        "q_a + kv at %d layers and beside attention_output_a's two groups at %d of %zu layers\n",
+                        "q_a + kv at %d layers and beside attention_output_a's two groups at %d of %zu layers; in the "
+                        "drafter's %zu stage(s) %d / %d; bit 0 q_a + kv, bit 1 the groups, decode band only\n",
                 gq_now(), gq > 0 ? "declared" : "not declared (no library serves gemm_nt_ggml_pair)", qkv, oa,
-                m.layers.size());
+                m.layers.size(), m.dsp.st.size(), dqkv, doa);
     if (e2_declared())
         fprintf(stderr, "radiance: deepseek41: lever 1U-E2 (ds41_e2, RADIANCE_DS41_E2, now %d) %s: the Engram kv GEMV by "
                         "output columns at %d of %d Engram layers -- %lld of the %lld columns a rank over a row view of the "
@@ -4460,11 +4521,13 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
         } else {
             RAD_ISSUE_N(x, L.norm_a, T, brows(d.x, T), RAD_W(L.attn_norm), brows(d.xn, T));
-            lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
+            const bool gqp = gq_qkv_on(L, T);   /* lever 1U-GQ: q_a + kv_g as one launch at q_a's point */
+            if (gqp) gq_qkv_issue(x, m, L, T, brows(d.xn, T), brows(d.qr, T), brows(d.kv_, T));
+            else lin_issue(x, m, L.q_a, T, brows(d.xn, T), L.wq_a, brows(d.qr, T));
             RAD_ISSUE_N(x, L.q_an, T, brows(d.qr, T), RAD_W(L.q_norm), brows(d.qrn, T));
             lin_issue(x, m, L.q_b, T, brows(d.qrn, T), L.wq_b, brows(d.q, T));
             RAD_ISSUE_N(x, L.q_rope, T, brows(d.q, T), brows(m.cs_a, g.max_ctx), pos);
-            lin_issue(x, m, L.kv_g, T, brows(d.xn, T), L.wkv, brows(d.kv_, T));
+            if (!gqp) lin_issue(x, m, L.kv_g, T, brows(d.xn, T), L.wkv, brows(d.kv_, T));
             RAD_ISSUE_N(x, L.kv_n, T, brows(d.kv_, T), RAD_W(L.kv_norm), brows(d.kvn, T));
             RAD_ISSUE_N(x, L.kv_rope, T, brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos);
             if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(d.kvn, T));
@@ -4480,9 +4543,13 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             RAD_ISSUE_N(x, L.o_rope, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
             if (L.o_q) RAD_ISSUE_N(x, L.o_q, T, brows(d.o, T));
             const int64_t gd = HD / m.gr;
-            for (int j = 0; j < m.gr; ++j)
-                lin_issue(x, m, L.o_a[(size_t)j], T, bcol(d.o, j * gd, gd, T), L.wo_a[(size_t)j],
-                          bcol(d.oa, j * c.o_rank, c.o_rank, T));
+            if (gq_oa_on(L, T))   /* lever 1U-GQ */
+                gq_oa_issue(x, m, L, T, bcol(d.o, 0, gd, T), bcol(d.o, gd, gd, T), bcol(d.oa, 0, c.o_rank, T),
+                            bcol(d.oa, c.o_rank, c.o_rank, T));
+            else
+                for (int j = 0; j < m.gr; ++j)
+                    lin_issue(x, m, L.o_a[(size_t)j], T, bcol(d.o, j * gd, gd, T), L.wo_a[(size_t)j],
+                              bcol(d.oa, j * c.o_rank, c.o_rank, T));
             lin_issue(x, m, L.o_b, T, brows(d.oa, T), L.wo_b, brows(d.attn_out, T));
         }
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(d.attn_out, T), RAD_NONE);
@@ -5096,8 +5163,14 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     kvn(s.r0, s.n);
             };
             if (cheap) {   /* C: op by op across the segments; the never-flipping per-row ops once over the step */
-                for (const BiSeg& s : sg) lin_issue(x, m, L.q_a, s.n, R(m.xn, s.r0, s.n), L.wq_a, R(m.qr, s.r0, s.n));
-                for (const BiSeg& s : sg) lin_issue(x, m, L.kv_g, s.n, R(m.xn, s.r0, s.n), L.wkv, R(m.kv, s.r0, s.n));
+                for (const BiSeg& s : sg) {   /* lever 1U-GQ: q_a + kv_g as one launch where the switch takes them */
+                    if (gq_qkv_on(L, s.n))
+                        gq_qkv_issue(x, m, L, s.n, R(m.xn, s.r0, s.n), R(m.qr, s.r0, s.n), R(m.kv, s.r0, s.n));
+                    else
+                        lin_issue(x, m, L.q_a, s.n, R(m.xn, s.r0, s.n), L.wq_a, R(m.qr, s.r0, s.n));
+                }
+                for (const BiSeg& s : sg)
+                    if (!gq_qkv_on(L, s.n)) lin_issue(x, m, L.kv_g, s.n, R(m.xn, s.r0, s.n), L.wkv, R(m.kv, s.r0, s.n));
                 if (L.i_score)
                     for (const BiSeg& s : sg) lin_issue(x, m, L.i_w, s.n, R(m.xn, s.r0, s.n), L.iproj, R(m.iw, s.r0, s.n));
                 if (qfold)
@@ -5140,8 +5213,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             for (const BiSeg& s : sg) {
                 if (cheap) break;
                 const int64_t r0 = s.r0, n = s.n;
-                lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
-                lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
+                if (gq_qkv_on(L, n)) {   /* lever 1U-GQ */
+                    gq_qkv_issue(x, m, L, n, R(m.xn, r0, n), R(m.qr, r0, n), R(m.kv, r0, n));
+                } else {
+                    lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
+                    lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
+                }
                 if (L.i_score) lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
                 if (qfold)
                     RAD_ISSUE_N(x, L.q_bf, n, R(m.qr, r0, n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, r0, n), R(m.q, r0, n));
@@ -5330,6 +5407,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             bt_pt(x, m, m.o, T, "o", l);
             const int64_t gd = HD / m.gr;
             rows(kBiBand, [&](int64_t r0, int64_t n) {
+                if (gq_oa_on(L, n)) {   /* lever 1U-GQ: the two groups as one launch */
+                    gq_oa_issue(x, m, L, n, C(m.o, 0, gd, r0, n), C(m.o, gd, gd, r0, n), C(m.oa, 0, c.o_rank, r0, n),
+                                C(m.oa, c.o_rank, c.o_rank, r0, n));
+                    return;
+                }
                 for (int j = 0; j < m.gr; ++j)
                     lin_issue(x, m, L.o_a[(size_t)j], n, C(m.o, j * gd, gd, r0, n), L.wo_a[(size_t)j],
                               C(m.oa, j * c.o_rank, c.o_rank, r0, n));
@@ -5886,7 +5968,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
             };
 
             c_gemm();
-            q_a(); kv_g();
+            if (gq_qkv_on(L, T))   /* lever 1U-GQ: q_a + kv_g as one launch */
+                gq_qkv_issue(x, m, L, T, brows(m.xn, T), brows(m.qr, T), brows(m.kv, T));
+            else {
+                q_a(); kv_g();
+            }
             i_w(); c_work();
             q_an(); kv_n();
             i_q(); c_pool();
@@ -5944,9 +6030,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
             }
             bt_pt(x, m, m.o, T, "o", l);
             const int64_t gd = HD / m.gr;
-            for (int j = 0; j < m.gr; ++j)
-                lin_issue(x, m, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), L.wo_a[(size_t)j],
-                          bcol(m.oa, j * c.o_rank, c.o_rank, T));
+            if (gq_oa_on(L, T))   /* lever 1U-GQ: the two groups as one launch */
+                gq_oa_issue(x, m, L, T, bcol(m.o, 0, gd, T), bcol(m.o, gd, gd, T), bcol(m.oa, 0, c.o_rank, T),
+                            bcol(m.oa, c.o_rank, c.o_rank, T));
+            else
+                for (int j = 0; j < m.gr; ++j)
+                    lin_issue(x, m, L.o_a[(size_t)j], T, bcol(m.o, j * gd, gd, T), L.wo_a[(size_t)j],
+                              bcol(m.oa, j * c.o_rank, c.o_rank, T));
             bt_pt(x, m, m.oa, T, "oa", l);
             if (late) mix_a();
             lin_issue(x, m, L.o_b, T, brows(m.oa, T), L.wo_b, brows(m.attn_out, T));

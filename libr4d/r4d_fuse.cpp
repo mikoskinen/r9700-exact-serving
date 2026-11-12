@@ -1201,3 +1201,28 @@ extern "C" int r4d_fuse_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p, 
         return RAD_E_NOTFOUND;
     }
 }
+
+/* gemm_nt_ggml_pair (lever 1U-GQ, ds41-int11): two gemm_nt_ggml over the same rows, one launch in the decode band under
+ * lever D2's form (r4d_ds41_ggml_mr.hip r4d_gg_mr_pair), else the two launches.
+ * Operands: [0] a  [1] w  [2] a2 (absent: a)  [3] w2  [4] y  [5] y2 */
+extern "C" int r4d_fuse_gemm_nt_ggml_pair(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (pi(p, n_p, "M") <= 0 || pi(p, n_p, "K") <= 0 || pi(p, n_p, "N") <= 0 || pi(p, n_p, "N2") <= 0)
+        return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K").mirror(p, n_p, "type").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 4 });                 /* a, w, y */
+    }
+    case 1: {
+        Step s(out, "gemm_nt_ggml");
+        s.mirror(p, n_p, "M").pint("N", (long long)pi(p, n_p, "N2")).mirror(p, n_p, "K").mirror(p, n_p, "type")
+         .mirror(p, n_p, "dtype");
+        const int16_t a2 = (present & (1ull << 2)) ? 2 : 0;
+        return s.wire({ a2, 3, 5 });                /* a2 (or a), w2, y2 */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}

@@ -55,4 +55,10 @@ struct R4dGgMrFold {
  * the runtime switch: the caller does (r4d_gg_mr_on). */
 int r4d_gg_mr_fold(RadStream s, const R4dGgMrCall& c, const R4dGgMrFold& f);
 
+/* Lever 1U-GQ (ds41-int11, gemm_nt_ggml_pair): calls a and b (the same block type, K and M, bf16 out) in ONE launch of
+ * the form, each call's rows in its own blocks of the grid, each output the form's operations: the two launches'
+ * bytes. RAD_OK, a launch failure, or R4D_GG_MR_DECLINE (the caller issues the two launches). Does not read the
+ * runtime switch: the caller does (r4d_gg_mr_on). */
+int r4d_gg_mr_pair(RadStream s, const R4dGgMrCall& a, const R4dGgMrCall& b);
+
 #endif

@@ -4066,6 +4066,56 @@ extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s
                        M, N, K);
 }
 
+/* gemm_nt_ggml_pair (lever 1U-GQ, ds41-int11): y = a . w^T and y2 = a2 . w2^T (a2 absent: a), two GGUF weights of one
+ * type at one K, the same M rows. In the decode band under lever D2's form one launch (r4d_gg_mr_pair: each weight's
+ * rows in their own blocks of one grid, each output the form's operations); everywhere else (gg_gemv 0 / 1, prefill
+ * heights, a pair the form declines) gemm_nt_ggml's two launches, gg_gemm_run's. Either way the bytes are the two
+ * gemm_nt_ggml ops'.
+ *   operands [0] a [M, K] bf16  [1] w  [2] a2 [M, K] bf16 (optional)  [3] w2  [4] y [M, N] bf16  [5] y2 [M, N2] bf16 */
+extern "C" int r4d_rad_gemm_nt_ggml_pair(const RadArgs* a, RadStream s) {
+    if (!a || a->n_t < 6) return R4D_NO(RAD_E_INVAL);
+    const RadTensor *x = r4d_opt(a, 0), *w = r4d_opt(a, 1), *x2 = r4d_opt(a, 2), *w2 = r4d_opt(a, 3),
+                    *y = r4d_opt(a, 4), *y2 = r4d_opt(a, 5);
+    if (!x || !w || !w2 || !y || !y2 || !x->data || !w->data || !w2->data || !y->data || !y2->data)
+        return R4D_NO(RAD_E_INVAL);
+    if (!x2 || !x2->data) x2 = x;
+    const GgType* gt = gg_type(r4d_gets(a, "type"));
+    if (!gt) return R4D_NO(RAD_E_DTYPE);
+    const long long N = r4d_geti_or(a, "N", 0), N2 = r4d_geti_or(a, "N2", 0), K = r4d_geti_or(a, "K", 0);
+    if (N <= 0 || N2 <= 0 || K <= 0 || K % gt->qk || N > 0x7fffffffLL || N2 > 0x7fffffffLL || K > 0x7fffffffLL)
+        return R4D_NO(RAD_E_SHAPE);
+    for (const RadTensor* t : { x, x2 })
+        if (t->rank != 2 || t->dtype != RAD_BF16 || t->shape[1] != K || !gg_inner1(t)) return R4D_NO(RAD_E_SHAPE);
+    const long long M = x->shape[0], Mb = r4d_geti_or(a, "M", 0);
+    if (M <= 0 || M > 0x7fffffffLL || (Mb > 0 && M > Mb) || x2->shape[0] < M) return R4D_NO(RAD_E_SHAPE);
+    if (y->rank != 2 || y->dtype != RAD_BF16 || y->shape[1] != N || y->shape[0] < M || !gg_inner1(y))
+        return R4D_NO(RAD_E_SHAPE);
+    if (y2->rank != 2 || y2->dtype != RAD_BF16 || y2->shape[1] != N2 || y2->shape[0] < M || !gg_inner1(y2))
+        return R4D_NO(RAD_E_SHAPE);
+    int ty = 0, ty2 = 0;
+    long long w_ld = 0, w2_ld = 0;
+    int rc = gg_weight2(w, gt, N, K, &ty, &w_ld);
+    if (rc != RAD_OK) return rc;
+    rc = gg_weight2(w2, gt, N2, K, &ty2, &w2_ld);
+    if (rc != RAD_OK) return rc;
+    const long long x_ld = M > 1 ? x->stride[0] : K, x2_ld = M > 1 ? x2->stride[0] : K;
+    const long long y_ld = M > 1 ? y->stride[0] : N, y2_ld = M > 1 ? y2->stride[0] : N2;
+    const int x_al = gg_al16(x->data, x_ld) ? 1 : 0, x2_al = gg_al16(x2->data, x2_ld) ? 1 : 0;
+    if (M <= kGgDecodeRows && ty == ty2 && r4d_gg_mr_on()) {
+        const R4dGgMrCall c1{ ty, false, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld, y->data,
+                              y_ld, (int)M, (int)N, (int)K };
+        const R4dGgMrCall c2{ ty2, false, (const uint16_t*)x2->data, x2_ld, x2_al, (const uint8_t*)w2->data, w2_ld,
+                              y2->data, y2_ld, (int)M, (int)N2, (int)K };
+        const int pr = r4d_gg_mr_pair(s, c1, c2);
+        if (pr != R4D_GG_MR_DECLINE) return pr;
+    }
+    rc = gg_gemm_run(s, ty, false, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld, y->data, y_ld, M,
+                     N, K);
+    if (rc != RAD_OK) return rc;
+    return gg_gemm_run(s, ty2, false, (const uint16_t*)x2->data, x2_ld, x2_al, (const uint8_t*)w2->data, w2_ld,
+                       y2->data, y2_ld, M, N2, K);
+}
+
 /* embed_lookup_ggml: the id's row dequantised, times `mult`, rounded once. A negative id or one
  * outside [vocab_offset, vocab_offset + n_vocab) writes a zero row (libref also refuses an id past
  * the vocabulary on a rank holding all of it, which a device launch cannot see). */

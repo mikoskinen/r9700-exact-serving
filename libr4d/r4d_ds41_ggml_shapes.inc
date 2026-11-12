@@ -110,3 +110,20 @@ extern "C" int r4d_shape_swiglu_clamped_gemm_nt_ggml(const RadParam* p, int n_p,
     };
     R4D_PICK(l);
 }
+
+/* Lever 1U-GQ (gemm_nt_ggml_pair): a, w, a2, w2 (the logical forms), y, y2. */
+extern "C" int r4d_shape_gemm_nt_ggml_pair(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t blk = ds41_ggml_block(p, n_p);
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), N2 = pi(p, n_p, "N2"), K = pi(p, n_p, "K");
+    if (blk <= 0 || M <= 0 || N <= 0 || N2 <= 0 || K <= 0 || K % blk) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, K),                       /* a */
+        opd((uint32_t)RAD_F32, N, K),       /* w, the logical form */
+        opd(D, M, K),                       /* a2 */
+        opd((uint32_t)RAD_F32, N2, K),      /* w2, the logical form */
+        opd(D, M, N),                       /* y */
+        opd(D, M, N2),                      /* y2 */
+    };
+    R4D_PICK(l);
+}
