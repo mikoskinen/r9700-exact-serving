@@ -999,6 +999,7 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
     /* lever PSK design 2: a planned request's snapshot (psk_ckpt kept only its targets) */
     if (e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] && reqs_[(size_t)e.slot]->psk_k > 0)
         ++m_.psk_ckpt_anchor;
+    if (e.cr_replay && pos == r.cr_end) ++m_.psk_cr_end_ckpts;   /* ds41-pskcr2: the snapshot at a replay's end */
 }
 
 int Scheduler::fail_prefilling(const char* why) {
@@ -1806,16 +1807,29 @@ Scheduler::CrResume Scheduler::psk_cr_resume(int64_t attn, int64_t prompt, int64
     if (!geo_.checkpoints() || psk_cr_reach_ <= 0) return c;
     const int64_t at = psk_floor(std::min(attn, prompt - 1));
     if (at <= 0 || at <= snap) return c;
+    /* ds41-pskcr2: the cheaper exact path -- a snapshot (or the prompt's start) at most one grid step below `at` costs at
+     * most one of the cold run's chunks to resume from, less than the replay (scheduler.h) */
+    int64_t o = 0, g = 0;
+    psk_grid(geo_, &o, &g);
+    if (g > 0 && at - std::max<int64_t>(snap, 0) <= g) {
+        c.cheaper = true;
+        return c;
+    }
     c.at = at;
     c.from = psk_floor(std::max<int64_t>(0, at - psk_cr_reach_));
     return c;
 }
 
 void Scheduler::psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt) {
-    /* lever PSK-CR: a replay chunk takes no snapshot -- below its end the window state is whole only in the end's cone,
-     * and its linear-state slot is not written (the batch masks it) */
+    /* lever PSK-CR: a replay chunk takes no snapshot below the replay's end -- there the window state is whole only in
+     * the end's cone, and its linear-state slot is not written (the batch masks it). ds41-pskcr2: it takes one AT the
+     * end H, whatever the request's targets: H is the replay's one target, so every layer's window keys of
+     * [H - window + 1, H) are a cold prefill's (the cone induction, deepseek41.cpp lever PSK-CR), the Engram token
+     * window is the replay's last chunk's, and the compressor tail holds no row a chunk from H reads (H is a multiple of
+     * every ratio) -- the very state the request itself goes on from. Without it the next turn of the conversation (a hit
+     * at the same grid point; the tail snapshot of a prompt that ends within a grid step of H is H) replays again. */
     if (ckpt && *ckpt > 0 && s.req && s.req->cr_end > s.req->n_computed) {
-        *ckpt = -1;
+        if (*ckpt != s.req->cr_end) *ckpt = -1;
         return;
     }
     if (!ckpt || *ckpt <= 0 || s.psk_k <= 0 || psk_is_target(s, *ckpt, n)) return;
@@ -2171,18 +2185,23 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * groups start fresh, ensure() grows them chunk by chunk below the adopted length); its chunks up to `at` are the
          * cold run's grid chunks (chunk_end stops them at `at`), flagged replay (StepEntry::cr_replay: the batch maps
          * their full-group and linear-state slots to -1, so no global KV or compressor tail is written; the plugin cuts
-         * every layer to `at`'s cone) and take no snapshot (psk_ckpt). Every window key and the Engram token window at
-         * `at` are then a cold prefill's (deepseek41.cpp step_bi, lever PSK-CR), and the prompt goes on from `at`. */
+         * every layer to `at`'s cone) and take no snapshot but the one at `at` (psk_ckpt; ds41-pskcr2). Every window key
+         * and the Engram token window at `at` are then a cold prefill's (deepseek41.cpp step_bi, lever PSK-CR), and the
+         * prompt goes on from `at`. ds41-pskcr2: no replay where the snapshot the hit resumes at (or the prompt's start)
+         * lies at most one grid step below `at` -- that recomputes at most one chunk, the cheaper exact path
+         * (psk_cr_resume, counted psk_cr_cheaper). */
         int64_t cr_at = 0, cr_from = 0;
         if (psk_cr_ == 1 && h.n_attn_tokens > 0 && geo_.checkpoints()) {
             const int64_t at_raw = psk_floor(std::min<int64_t>(h.n_attn_tokens, (int64_t)r.prompt.size() - 1));
             const CrResume cr = psk_cr_resume(h.n_attn_tokens, (int64_t)r.prompt.size(), reuse);
             if (at_raw > 0 && at_raw <= reuse) {
                 ++m_.psk_cr_not_needed;
-            } else if (cr.at > 0) {
+            } else if (cr.at > 0 || cr.cheaper) {
                 if (s.psk_k <= 0) ++m_.psk_cr_fb_unplanned;
-                else if (hit_holes_trunk_ || !hit_needs_window_ || kv_->has_runtime_window(r.id) || cr.from >= cr.at)
+                else if (hit_holes_trunk_ || !hit_needs_window_ || kv_->has_runtime_window(r.id) ||
+                         (cr.at > 0 && cr.from >= cr.at))
                     ++m_.psk_cr_fb_geometry;
+                else if (cr.cheaper) ++m_.psk_cr_cheaper;   /* ds41-pskcr2: the snapshot below (or cold) is cheaper */
                 else { cr_at = cr.at; cr_from = cr.from; }
             }
         }

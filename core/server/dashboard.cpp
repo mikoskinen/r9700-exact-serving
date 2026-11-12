@@ -416,6 +416,10 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             p["cr_not_needed"] = m.psk_cr_not_needed;
             p["tail_only_latched"] = m.psk_tail_only;
             p["tail_only_refused"] = m.psk_tail_only_refused;
+            /* ds41-pskcr2: hits that took the snapshot below (or a cold prefill) as the cheaper exact path -- it
+             * recomputes at most one grid step, less than a replay's passes -- and snapshots taken at a replay's end */
+            p["cr_cheaper"] = m.psk_cr_cheaper;
+            p["cr_end_snapshots"] = m.psk_cr_end_ckpts;
             p["cr_passes"] = pl[10];
             p["cr_layer_rows_run"] = pl[11];
             p["cr_layer_rows_skipped"] = pl[12];

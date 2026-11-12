@@ -238,6 +238,8 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
                            "l20_cut_passes", "l20_rows_skipped", "l20_cone_empty", "l20_layers_not_staged",
                            /* lever PSK-CR (ds41-pskcr) */
                            "cr_hits", "cr_rows_replayed", "cr_resume_tokens", "cr_fallbacks", "cr_fallback_unplanned",
+                           /* ds41-pskcr2 */
+                           "cr_cheaper", "cr_end_snapshots",
                            "cr_fallback_geometry", "cr_fallback_adopt", "cr_not_needed", "tail_only_latched",
                            "tail_only_refused", "cr_passes", "cr_layer_rows_run", "cr_layer_rows_skipped",
                            "cr_chains_skipped", "cr_mixed_passes" }) {

@@ -399,8 +399,12 @@ public:
                       std::vector<int32_t>* flags) const;
     /* Lever PSK-CR's resume for a hit (pure, for tests and admission): the deepest periodic checkpoint position
      * (Scheduler::psk_q) `at` <= min(attn, prompt - 1), and the replay's start `from`: the deepest of them (or 0) at or
-     * below at - reach. at = -1 when no grid point lies above `snap` (the snapshot the hit resumes at anyway). */
-    struct CrResume { int64_t at = -1, from = -1; };
+     * below at - reach. at = -1 when no grid point lies above `snap` (the snapshot the hit resumes at anyway).
+     * ds41-pskcr2, the cheaper exact path: at = -1 with `cheaper` set where `at` lies at most one grid step above `snap`
+     * (0: none) -- resuming at the snapshot (or cold) recomputes at most one of the cold run's chunks, which costs less
+     * than a replay's passes (two over every layer's cone, or the first chunk's over all 40 layers; measured on gpu02
+     * r00zzz-cz-tz-scr2: a replay ~1.36-1.41 s, one chunk ~1.0-1.26 s, two ~2.0-2.9 s). Both paths are exact. */
+    struct CrResume { int64_t at = -1, from = -1; bool cheaper = false; };
     CrResume psk_cr_resume(int64_t attn, int64_t prompt, int64_t snap) const;
     /* Lever DL: the engine's view of the drafter's lend (Engine::serve, once the movers set it up):
      * `view` returns DraftController::LendSample's state over every rank (resident, transit, lent)
