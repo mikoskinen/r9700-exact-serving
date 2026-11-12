@@ -20941,6 +20941,8 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
         PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
         PI("rotate", 1), PS("mix", "e4m3"),
     };
+    /* fn4 (12.11.2026): R4D_SELFTEST_KC_ROWS pins the read's K split to that height (hc_read kc_rows, SP-hc's quarter read) */
+    if (const char* e = std::getenv("R4D_SELFTEST_KC_ROWS"); e && std::atoll(e) > 0) ps.push_back(PI("kc_rows", std::atoll(e)));
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size();
