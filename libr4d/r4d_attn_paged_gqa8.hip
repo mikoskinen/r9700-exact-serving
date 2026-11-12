@@ -315,11 +315,14 @@ static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row =
         r.block_size = (int)r4d_geti_or(a, "block_size", 16);
         r.splits     = sp;
         if (r.max_ctx <= 0) return R4D_NO(RAD_E_INVAL);
+        const long long sr = r4d_geti_or(a, "split_rows", 0);   /* fn4 BI: the split law's count (r4d_split_rows_pin) */
         int64_t worst = 0;
         for (long long q = 1; q <= q_hi; ++q)
             for (long long n = 1; n <= max_seqs; ++n) {
                 r.q_len    = (int)q;
                 r.num_seqs = (int)n;
+                r.splits   = sp;
+                r4d_split_rows_pin(&r, sr, G8_D_TILE);
                 const int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
                 if (need > worst) worst = need;
             }
@@ -328,6 +331,7 @@ static int64_t g8_decode_scratch(const RadArgs* a, int head_dim, long long row =
     const int rc = fill_paged_row(a, &r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r.splits = sp;
+    r4d_split_rows_pin(&r, r4d_geti_or(a, "split_rows", 0), G8_D_TILE);
     return GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(&r);
 }
 
@@ -348,6 +352,7 @@ static int g8_decode_common(const RadArgs* a, R4DArgs* r, int head_dim, long lon
     const int rc = fill_paged_row(a, r, head_dim, row > 0 ? row : 2LL * head_dim);
     if (rc != RAD_OK) return rc;
     r->splits = sp;
+    r4d_split_rows_pin(r, r4d_geti_or(a, "split_rows", 0), G8_D_TILE);
     const int64_t need = GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(r);
     if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_SCRATCH);
     return RAD_OK;

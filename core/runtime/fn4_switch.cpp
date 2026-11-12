@@ -142,7 +142,7 @@ bool request(const std::string& name, int v, std::string* err) {
     const int lo = i == kDraftAdaptive ? -1 : 0;
     const int hi = i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096
                  : i == kHcReadV ? 63 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24
-                 : i == kAqlAcq ? 2 : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 5 : i == kBiSeg ? 2 : i == kArwRows ? 4096 : i == kSchedBiChunk ? 5 : 1;
+                 : i == kAqlAcq ? 2 : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 5 : i == kAttBi ? 2 : i == kBiSeg ? 2 : i == kArwRows ? 4096 : i == kSchedBiChunk ? 5 : 1;
     if (v < lo || v > hi) {
         if (err) *err = std::string(kNames[i]) + " takes " + std::to_string(lo) + ".." + std::to_string(hi);
         return false;

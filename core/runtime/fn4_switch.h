@@ -52,7 +52,9 @@
  *                   (a prompt's last row its own M = 1 launch: logits_gemm runs a matvec at M <= 2, WMMA from 3);
  *                   0 one launch over the step                                                     RADIANCE_FN4_BI_SEG
  *   att_bi          architecture plugin (rad_fn4_switch): fn4 BI -- a step's prefill sequences' dense attention each in
- *                   a launch shaped as its alone step's (its rows, its band, its table row and seqused); 0 today's
+ *                   a launch shaped as its alone step's (its rows, its band, its table row and seqused), every sparse
+ *                   sequence in launches of its own; 2 as 1, the sparse decode sequences in one launch whose split law
+ *                   counts 1 + n_spec rows (libr4d split_rows; RADIANCE_FN4_BIDEC / X3DUAL declare it); 0 today's
  *                   launches                                                                       RADIANCE_FN4_ATT_BI
  *   arw_rows        architecture plugin (rad_fn4_switch): fn4 ARW -- the four-rank fused exact write / gather-write
  *                   (one-shot) only up to this many rows, above them the separate all-reduce (two-shot) and write;

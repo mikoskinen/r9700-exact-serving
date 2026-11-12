@@ -36,9 +36,12 @@ namespace arch {
  * band. 0 (default) = today's launches. fn4 180: L03.att first-differing in 19 of 40 probes, every one a prompt's rows in
  * a mixed step -- at 10 rows or fewer the alone step runs the split-KV decode row and the mixed step the query-tiled row
  * at the top band; above, the mixed launch's query bound / split cap moved with the step. */
+/* 2 (12.11.2026, 199: att_bi costs 3.6 % ms/step at c16): as 1, the sparse decode sequences of a step in one launch
+ * through op_attn_gq_bi, whose split law counts 1 + n_spec rows as its sequences (libr4d split_rows) -- each row's
+ * keys split as in its own sequence's alone launch. */
 inline std::atomic<int>& fn4_attbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
-                                   return e && *e && std::atoi(e) > 0 ? 1 : 0; }()};
+                                   const int v = e && *e ? std::atoi(e) : 0; return v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 att_bi: the prefill sequences' row counts of a step, from the full-attention group's host seqused and the host
@@ -159,6 +162,11 @@ struct AttnGatedFP8 {
     rad_op     op_q_norm = 0, op_k_norm = 0, op_rope_q = 0, op_rope_k = 0;
     rad_op     op_attn = 0, op_kv_store = 0, op_gq = 0;
     rad_op     op_attn_gq = 0;                               /* attn_paged + gate_quant_fp8 */
+    /* fn4 att_bi 2: op_attn_gq with split_rows = 1 + max_spec (a decode sequence's alone rows), up to kGqBiRows rows a
+     * launch; declared under RADIANCE_FN4_BIDEC (default RADIANCE_FN4_X3DUAL) with max_spec > 0. 0 otherwise. */
+    static constexpr int64_t kGqBiRows = 64;
+    rad_op     op_attn_gq_bi = 0;
+    int64_t    gq_bi_qd = 0;
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
     rad_op     op_kv_stream = 0;
@@ -525,6 +533,30 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
             RAD_ARCH_TRY(rad_op_reads (b, op_attn_gq, rd, 4));
             RAD_ARCH_TRY(rad_op_writes(b, op_attn_gq, wr, 3));
         }
+        const char* e = std::getenv("RADIANCE_FN4_BIDEC");
+        if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
+        if (op_attn_gq && e && *e && *e != '0' && g.max_spec > 0) {
+            gq_bi_qd = 1 + g.max_spec;
+            op_attn_gq_bi = RAD_OP(b, "attn_paged_gate_quant",
+                                RAD_PARAMS(RAD_INT("q_len", 1), RAD_INT("head_dim", g.head_dim),
+                                           RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
+                                           RAD_INT("window", 0), RAD_INT("n_head", g.n_head),
+                                           RAD_INT("block_size", rad_kv_block_size(b, kv)),
+                                           RAD_INT("max_seqs", kGqBiRows),
+                                           RAD_INT("max_ctx", g.max_ctx),
+                                           RAD_STR("q_dtype", g.dtype),
+                                           RAD_STR("kv_dtype", g.kv_dtype),
+                                           RAD_INT("group", RAD_FP8_BLOCK),
+                                           RAD_STR("act", "sigmoid"),
+                                           RAD_INT("split_rows", gq_bi_qd)),
+                                RAD_NOWEIGHTS);
+            if (op_attn_gq_bi) {
+                const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, w.qg };
+                const rad_buf wr[3] = { w.attn.x, w.attn.cq(), w.attn.cs() };
+                RAD_ARCH_TRY(rad_op_reads (b, op_attn_gq_bi, rd, 4));
+                RAD_ARCH_TRY(rad_op_writes(b, op_attn_gq_bi, wr, 3));
+            }
+        }
     }
 
     RAD_ARCH_TRY(o.declare(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
@@ -781,8 +813,28 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             if (at == T) {
                 const int64_t qw = g.q_dim(), hd = g.head_dim, chunk = qsa_gq_rows();
                 const int64_t pitch = kvb->block_table_pitch;
+                /* att_bi 2: a run of sparse decode sequences in launches of up to kGqBiRows rows (whole sequences) */
+                const bool one = fn4_attbi_flag().load(std::memory_order_relaxed) == 2 && op_attn_gq_bi &&
+                                 qd == gq_bi_qd && qd > 0 && qd <= kGqBiRows;
                 for (int64_t s2 = 0; s2 < ns; ++s2) {
                     const int64_t a0 = r0[s2], n = nr[s2];
+                    if (one && s2 < D && sp[s2]) {
+                        int64_t e2 = s2 + 1;
+                        while (e2 < D && sp[e2] && (e2 - s2 + 1) * qd <= kGqBiRows) ++e2;
+                        const int64_t rows = (e2 - s2) * qd;
+                        resolve_sel(a0, rows);
+                        RAD_ISSUE_N(c, op_attn_gq_bi, 1,
+                                    brow_slice(w.q, a0, rows, qw), kv_cache(kv, layer),
+                                    brow_slice(qsa_sel, a0, rows, qsa_topk + 1),
+                                    brow_slice(qsa_sequ, a0, rows, 1),
+                                    RAD_NONE, RAD_NONE, RAD_NONE,
+                                    brow_slice(w.attn.x, a0, rows, qw),
+                                    bcol_at(w.qg, a0, g.n_head * 2 * hd, hd, hd, rows),
+                                    brow_slice(w.attn.cq(), a0, rows, qw),
+                                    brow_slice(w.attn.cs(), a0, rows, fp8_blocks(qw)));
+                        s2 = e2 - 1;
+                        continue;
+                    }
                     if (sp[s2]) {
                         for (int64_t off = a0; off < a0 + n; off += chunk) {
                             const int64_t rows = (a0 + n - off) < chunk ? (a0 + n - off) : chunk;

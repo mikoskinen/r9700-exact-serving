@@ -156,6 +156,9 @@ static const RadParamSpec pAttnPagedGq[] = {
     { "max_seqs", RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_CAPACITY },
     P_INT("group"),
     P_STR("act"),
+    /* fn4 BI (att_bi 2): the split law's sequence count in place of the launch's rows (libr4d r4d_split_rows_pin; the
+     * decode rows only); absent 0. Not decomposed: attn_paged has no such parameter. */
+    P_INTO("split_rows"),
 };
 static const RadOperandSpec oAttnPagedGq[] = {
     { "q",           RAD_OPD_IN,  0 },

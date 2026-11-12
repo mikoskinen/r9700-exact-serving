@@ -1128,6 +1128,19 @@ static inline int r4d_decode_splits(const R4DArgs* a, int tile) {
     return s;
 }
 
+// fn4 BI (att_bi's one launch, 12.11.2026): `split_rows` (attn_paged / attn_paged_gate_quant, absent 0) is the count
+// the split law reads as the sequence count in place of the launch's. On the sparse path every row is its own (q_len
+// 1, its own selection row), and a sequence's alone launch is its own 1 + n_spec rows: a launch of several decode
+// sequences' rows pinned to that count splits each row's selected keys as the sequence's alone launch does, so each
+// row's bytes are its alone bytes (the merge's two forms are byte-identical). A tuned `splits` wins; the scratch
+// hooks size with the same count.
+static inline void r4d_split_rows_pin(R4DArgs* r, long long split_rows, int tile) {
+    if (r->splits > 0 || split_rows <= 0) return;
+    R4DArgs t = *r;
+    t.num_seqs = (int)split_rows;
+    r->splits = r4d_decode_splits(&t, tile);
+}
+
 // Split law of the windowed legs (the DFlash2 drafter at h128/gqa4, Gemma 4 at h256/gqa2): target
 // 192 workgroups, round down to a power of two (min 16), keep at least two tiles per segment, then
 // step up off splits * units == 256, a slow spot for these geometries. The tile count comes from

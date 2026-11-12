@@ -1200,7 +1200,7 @@ Its parameters are the two ops' own, its operands the prologue's followed by `sl
 
 | op | params | operands |
 |---|---|---|
-| `attn_paged_gate_quant` | `q_len`(range) `head_dim` `gqa` `block_size` `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt:capacity `group` `act` | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `gate` → `q8`, `q8_scale` |
+| `attn_paged_gate_quant` | `q_len`(range) `head_dim` `gqa` `block_size` `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt:capacity `group` `act` `split_rows`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out`; `gate` → `q8`, `q8_scale` |
 
 **`attn_paged_gate_quant`** (device-only) is `attn_paged` followed by `gate_quant_fp8` over its
 output, finished inside the split-KV merge. A merge row is one (token, head) pair of `head_dim`
