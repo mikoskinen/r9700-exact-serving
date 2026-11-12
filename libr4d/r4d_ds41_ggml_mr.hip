@@ -249,7 +249,8 @@ __device__ __forceinline__ void mr_stage(const GgMrArgs& A, float* xs, int m0, i
  * piece -> (stage, row, k) map, the same widening, the producer's same expression under PRO 1 / 2, zeros past mc and
  * past K), so the arithmetic of every output is the plain form's: only when the activation's L2 round trip happens
  * moves (behind the previous slab's arithmetic instead of between two barriers). mr_size2 sizes SS so that a slab
- * has at most mr_xpn(H, MT) pieces a thread. */
+ * has at most mr_xpn(H, MT) pieces a thread where one stage fits; past that (few waves a block) mr_put loads the rest of the slab
+ * itself, as mr_stage does. */
 /* Pieces a thread at most (the registers a form spends on the slab ahead): a stage of MT rows at WN 4 and one stage a
  * slab, between 1 and 8 (= ceil(MT / H)); mr_size2 sizes SS (and declines WN below what a stage needs) by the same rule. */
 constexpr int mr_xpn(int H, int MT) { return (MT + H - 1) / H < 1 ? 1 : ((MT + H - 1) / H > 8 ? 8 : (MT + H - 1) / H); }
@@ -337,6 +338,32 @@ __device__ __forceinline__ void mr_put(const GgMrArgs& A, const MrXp<PRO, XPN>& 
             *(float4*)(d + ((2 * G) * LPR + i) * 4) = make_float4(v[0], v[1], v[2], v[3]);
             *(float4*)(d + ((2 * G + 1) * LPR + i) * 4) = make_float4(v[4], v[5], v[6], v[7]);
         }
+    }
+    /* a slab of more pieces than the registers hold (few waves a block): the rest loaded here, mr_stage's own way (the same values
+     * at the same addresses; only their loads are not ahead) */
+    for (int idx = XPN * (int)blockDim.x + (int)threadIdx.x; idx < np; idx += (int)blockDim.x) {
+        const int q = idx % PPS, rest = idx / PPS;
+        const int m = rest % MT, ss = rest / MT;
+        const int s = s0 + ss, k = s * VPS + 8 * q;
+        float v[8];
+        if (m < mc && k < A.K) {
+            if constexpr (PRO == 0) {
+                gg_x8(A.x + (long long)(m0 + m) * A.x_ld + k, A.x_al != 0, v);
+            } else {
+                uint16_t hb[8];
+                mr_produce<PRO>(A, m0 + m, k, PRO == 1 ? sc[m] : 0.0f, hb, v);
+                if (blockIdx.x == 0) mr_put_h(A, m0 + m, k, hb);
+            }
+        } else {
+#pragma unroll
+            for (int t = 0; t < 8; ++t) v[t] = 0.0f;
+        }
+        int U = 0, G = 0;
+        mr_piece<T>(k, U, G);
+        const int i = U - s * LPR;
+        float* d = xs + (ss * MT + m) * VPS;
+        *(float4*)(d + ((2 * G) * LPR + i) * 4) = make_float4(v[0], v[1], v[2], v[3]);
+        *(float4*)(d + ((2 * G + 1) * LPR + i) * 4) = make_float4(v[4], v[5], v[6], v[7]);
     }
 }
 
@@ -603,10 +630,11 @@ __global__ __launch_bounds__(kMrThreads) void gg_mr_pair_kernel(GgMrArgs A, GgMr
 
 /* Lever A4's XP forms (gg_mr_body XP = true; r4d_ds41_ggml_mr2.hip compiles them, the plain kernel, the pair kernel and
  * both folds): the decode band's 5-16-row heights (the gg_gemv_m16 switch's table, the bench's pins). H1R2 (two weight
- * rows a lane, all 32 lanes on a row's 32 partials) is new; the others are D2's (H, R) pairs at these MT. */
+ * rows a lane, all 32 lanes on a row's 32 partials) is new; the others are D2's (H, R) pairs at these MT. H1 stops at MT 12: a stage of
+ * 16 rows (64 KiB) does not fit kMrLdsMax, so mr_size2 caps MT by the LDS (16 rows: two tiles of 8). */
 #define MR2_FORMS(X)                                                                                       \
-    X(1, 1, 4) X(1, 1, 6) X(1, 1, 8) X(1, 1, 12) X(1, 1, 16)                                                \
-    X(1, 2, 4) X(1, 2, 6) X(1, 2, 8) X(1, 2, 12) X(1, 2, 16)                                                \
+    X(1, 1, 4) X(1, 1, 6) X(1, 1, 8) X(1, 1, 12)                                                            \
+    X(1, 2, 4) X(1, 2, 6) X(1, 2, 8) X(1, 2, 12)                                                            \
     X(2, 1, 4) X(2, 1, 6) X(2, 1, 8) X(2, 1, 12) X(2, 1, 16)                                                \
     X(2, 2, 4) X(2, 2, 6) X(2, 2, 8) X(2, 2, 12) X(2, 2, 16)                                                \
     X(4, 1, 4) X(4, 1, 6) X(4, 1, 8) X(4, 1, 12) X(4, 1, 16)                                                \
@@ -981,7 +1009,7 @@ bool mr2_tab(const R4dGgMrCall& c, int pair, int* H, int* R, int* cap, int* WN, 
 }
 
 /* mr_pick's sizing for an explicit (H, R, MT cap, WN, XP): MT as mr_pick takes it from the unit's list (D2's MR_FORMS, or
- * MR2_FORMS for XP); WN 0 D2's rule, -1 the grid fit, else 1..8; SS as mr_pick's, and under XP no more than mr_xpn(H, MT) pieces
+ * MR2_FORMS for XP); WN 0 D2's rule, -1 the grid fit, else 1..8; SS as mr_pick's, and under XP shrunk toward mr_xpn(H, MT) pieces
  * a thread in a slab. false: not taken (the caller falls back to mr_pick). */
 bool mr_size2(const R4dGgMrCall& c, MrForm* f, int n_all, int H, int R, int cap, int WN, int xp) {
 #ifndef R4D_EMU_HOST   /* the XP unit's f32 out: q6_K (the head) on the card, every type on the emulator */
@@ -991,6 +1019,10 @@ bool mr_size2(const R4dGgMrCall& c, MrForm* f, int n_all, int H, int R, int cap,
     const int nmt = xp ? mr2_mts(H, R, mts) : mr_mts(H, R, mts);
     if (nmt == 0) return false;
     if (cap <= 0 || cap > mts[nmt - 1]) cap = mts[nmt - 1];
+    {   /* a stage of MT rows must fit kMrLdsMax: the cap comes down to the largest MT that does (more tiles, the same outputs) */
+        const int lpr = 32 / H, mlds = kMrLdsMax / (32 * lpr * 4);
+        while (cap > mts[0] && cap > mlds) cap = cap - 1;
+    }
     const int tiles = (c.M + cap - 1) / cap, need = (c.M + tiles - 1) / tiles;
     int MT = 0;
     for (int k = 0; k < nmt; ++k)
@@ -1023,10 +1055,9 @@ bool mr_size2(const R4dGgMrCall& c, MrForm* f, int n_all, int H, int R, int cap,
     if (SS > PD) SS = SS / PD * PD;
     if (SS < 1) SS = 1;
     if (SS >= NS) SS = NS;
-    if (xp) {
+    if (xp) {   /* a slab within the registers where one stage fits (else mr_put loads the rest itself: no decline) */
         const long long room = (long long)mr_xpn(H, MT) * 32 * WN, pps = (long long)MT * (VPS / 8);
         while (SS > 1 && SS * pps > room) --SS;
-        if (SS * pps > room) return false;
     }
     if (SS * sb > 65536) return false;
     f->H = H; f->R = R; f->MT = MT; f->WN = WN; f->SS = (int)SS; f->gx = (int)gx; f->gy = gy; f->w64 = 0;
