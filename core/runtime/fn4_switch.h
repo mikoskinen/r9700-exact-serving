@@ -250,7 +250,11 @@
  *                   cone (layer l: the last 160 + (39 - l) x 128 rows before H) with no global-KV store (the batch maps
  *                   their full-group slots and linear-state slots to -1); the window keys, the Engram token window and
  *                   the DSpark taps at H come out as a cold prefill's. Then the prompt goes on from H as ever. Replay
- *                   chunks take no snapshot. 0 = the anchor below (today). RADIANCE_DS41_PSK_CR=0 | 1: the start value
+ *                   chunks take no snapshot but one at H (ds41-pskcr2: the state the request goes on from, so the next
+ *                   turn of the conversation resumes there instead of replaying again). No replay where the snapshot
+ *                   the hit has (or the prompt's start) lies at most one grid step below H: resuming there recomputes
+ *                   at most one chunk, cheaper than the replay (ds41-pskcr2). 0 = the anchor below (today).
+ *                   RADIANCE_DS41_PSK_CR=0 | 1: the start value
  *                   (unset: 0). 1 refused where design 2 is not available. ds41_psk 4 = TAIL-ONLY anchors (the prompt's
  *                   end, its tail snapshot, checkpoint_at; no K-th grid point): a request admitted under 4 with
  *                   ds41_psk_cr 1 latches tail-only, under ds41_psk_cr 0 it plans as 2 (counted refused).

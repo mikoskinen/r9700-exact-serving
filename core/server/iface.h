@@ -102,6 +102,7 @@ struct SchedMetrics {
     int32_t psk_cr = -1;
     int64_t psk_cr_hits = 0, psk_cr_rows = 0, psk_cr_resume_tokens = 0, psk_cr_fb_unplanned = 0, psk_cr_fb_geometry = 0;
     int64_t psk_cr_fb_adopt = 0, psk_cr_not_needed = 0, psk_tail_only = 0, psk_tail_only_refused = 0;
+    int64_t psk_cr_cheaper = 0, psk_cr_end_ckpts = 0;   /* ds41-pskcr2 */
     double  prefill_tps = 0.0;
     double  decode_tps = 0.0;
     /* Exact cumulative counts behind the EWMA rates above, for comparing runs.

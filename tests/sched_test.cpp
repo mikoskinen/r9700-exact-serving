@@ -1377,7 +1377,8 @@ static std::vector<CrStep> cr_run(Fixture& f, uint64_t id, int max_steps = 64) {
 /* A hit with no snapshot at the grid point under it (K4: the anchor below is 14336, the match 26000, its grid point
  * 22528): under ds41_psk_cr 1 the request adopts the cached full group up to 22528, starts at 14336 (the grid point under
  * 22528 - 5152) with nothing restored, runs the cold run's chunks [14336, 18432) and [18432, 22528) as replay chunks
- * (flag 1, the target 22528, no snapshot, the batch masks), then the prompt's rest as any planned request's; under 0 it
+ * (flag 1, the target 22528, the batch masks; no snapshot inside, ds41-pskcr2: one at the end 22528), then the prompt's
+ * rest as any planned request's; under 0 it
  * resumes at the anchor below as before and no lever PSK-CR counter moves. The batch rows of a replay chunk are its
  * cold chunk's; its full-group slots and linear-state slot are -1 (cr_run). */
 TEST(psk_cr_a_hit_without_a_snapshot_replays_the_cold_grid_chunks_to_its_grid_point) {
@@ -1408,7 +1409,7 @@ TEST(psk_cr_a_hit_without_a_snapshot_replays_the_cold_grid_chunks_to_its_grid_po
             CHECK_EQ(st[1].n, (int64_t)4096);
             CHECK_EQ(st[1].flag, 1);
             CHECK_EQ(st[1].ahead, (int64_t)0);
-            CHECK_EQ(st[1].ckpts, 0);
+            CHECK_EQ(st[1].ckpts, 1);                /* ds41-pskcr2: the snapshot at the replay's end */
             CHECK_EQ(st[2].ctx, (int64_t)22528);      /* the prompt goes on from the replay's end */
             CHECK_EQ(st[2].replay, 0);
             CHECK_EQ(st[2].flag, 0);
@@ -1419,7 +1420,10 @@ TEST(psk_cr_a_hit_without_a_snapshot_replays_the_cold_grid_chunks_to_its_grid_po
             CHECK_EQ(m.psk_cr_resume_tokens, (int64_t)22528);
             CHECK_EQ(m.psk_fallback_resumes, (int64_t)0);
             CHECK_EQ(m.psk_cr, 1);
-            CHECK((f.pc.committed == std::vector<int64_t>{ 30720 }));   /* the K4 anchor = the tail: no replay snapshot */
+            CHECK_EQ(m.psk_cr_end_ckpts, (int64_t)1);
+            CHECK_EQ(m.psk_cr_cheaper, (int64_t)0);
+            /* ds41-pskcr2: the replay's end, then the K4 anchor = the tail (e9e529d took the tail only) */
+            CHECK((f.pc.committed == std::vector<int64_t>{ 22528, 30720 }));
         } else {
             CHECK_EQ(st[0].ctx, (int64_t)14336);
             CHECK_EQ(st[0].replay, 0);
@@ -1427,7 +1431,8 @@ TEST(psk_cr_a_hit_without_a_snapshot_replays_the_cold_grid_chunks_to_its_grid_po
             CHECK_EQ(st[0].restore, 5);              /* the anchor's snapshot */
             for (const CrStep& c : st) CHECK_EQ(c.flag, 0);
             CHECK_EQ(m.psk_cr_hits + m.psk_cr_rows + m.psk_cr_resume_tokens + m.psk_cr_fb_unplanned + m.psk_cr_fb_geometry +
-                         m.psk_cr_fb_adopt + m.psk_cr_not_needed + m.psk_tail_only + m.psk_tail_only_refused, (int64_t)0);
+                         m.psk_cr_fb_adopt + m.psk_cr_not_needed + m.psk_tail_only + m.psk_tail_only_refused +
+                         m.psk_cr_cheaper + m.psk_cr_end_ckpts, (int64_t)0);
             CHECK_EQ(m.psk_fallback_resumes, (int64_t)1);
             CHECK_EQ(m.psk_cr, 0);
         }
@@ -1435,7 +1440,8 @@ TEST(psk_cr_a_hit_without_a_snapshot_replays_the_cold_grid_chunks_to_its_grid_po
 }
 
 /* The resume arithmetic itself (Scheduler::psk_cr_resume) on the production grid: the grid point under the match (and
- * under the prompt's last token), above the snapshot; the start the grid point under it less the reach. */
+ * under the prompt's last token), above the snapshot; the start the grid point under it less the reach. ds41-pskcr2: no
+ * replay (cheaper) where the snapshot (0: the prompt's start) lies at most one grid step (4096) below that point. */
 TEST(psk_cr_resume_is_the_grid_point_under_the_hit_and_its_cone) {
     Fixture f;
     cr_fixture(f);
@@ -1443,15 +1449,23 @@ TEST(psk_cr_resume_is_the_grid_point_under_the_hit_and_its_cone) {
     CHECK_EQ(f.sch.set_psk_cr(1, 0), 0);                /* no reach: no replay */
     CHECK_EQ(f.sch.psk_cr_resume(26000, 32000, 0).at, (int64_t)-1);
     CHECK_EQ(f.sch.set_psk_cr(1, 5152), 1);
-    struct W { int64_t attn, prompt, snap, at, from; };
-    for (const W w : { W{ 26000, 32000, 14336, 22528, 14336 }, W{ 26000, 32000, 0, 22528, 14336 },
-                       W{ 22528, 32000, 0, 22528, 14336 }, W{ 22527, 32000, 0, 18432, 10240 },
-                       W{ 26000, 22529, 0, 22528, 14336 }, W{ 26000, 22528, 0, 18432, 10240 },
-                       W{ 6144, 9000, 0, 6144, 0 }, W{ 2048, 9000, 0, 2048, 0 }, W{ 2047, 9000, 0, -1, -1 },
-                       W{ 26000, 32000, 22528, -1, -1 }, W{ 136000, 140000, 120832, 133120, 124928 } }) {
+    struct W { int64_t attn, prompt, snap, at, from; bool cheaper; };
+    for (const W w : { W{ 26000, 32000, 14336, 22528, 14336, false }, W{ 26000, 32000, 0, 22528, 14336, false },
+                       W{ 22528, 32000, 0, 22528, 14336, false }, W{ 22527, 32000, 0, 18432, 10240, false },
+                       W{ 26000, 22529, 0, 22528, 14336, false }, W{ 26000, 22528, 0, 18432, 10240, false },
+                       W{ 6144, 9000, 0, 6144, 0, false }, W{ 2047, 9000, 0, -1, -1, false },
+                       W{ 26000, 32000, 22528, -1, -1, false }, W{ 136000, 140000, 120832, 133120, 124928, false },
+                       /* ds41-pskcr2: the first chunk's grid point (a cold prefill of it is cheaper than its replay over
+                        * all 40 layers: gpu02 scr2 hit 4096 C +0.32 s), one grid step above the snapshot (the 24576 /
+                        * 40960 / turn cases: one chunk vs two replay passes), off-grid snapshots */
+                       W{ 2048, 9000, 0, -1, -1, true }, W{ 4000, 4100, 0, -1, -1, true },
+                       W{ 26000, 32000, 18432, -1, -1, true }, W{ 40496, 41000, 34816, -1, -1, true },
+                       W{ 44160, 44272, 38912, -1, -1, true }, W{ 26000, 32000, 18431, 22528, 14336, false },
+                       W{ 40496, 41000, 30720, 38912, 30720, false }, W{ 26000, 32000, 18448, -1, -1, true } }) {
         const Scheduler::CrResume c = f.sch.psk_cr_resume(w.attn, w.prompt, w.snap);
         CHECK_EQ(c.at, w.at);
         CHECK_EQ(c.from, w.from);
+        CHECK_EQ(c.cheaper, w.cheaper);
     }
 }
 
@@ -1561,8 +1575,159 @@ TEST(psk_cr_not_needed_unplanned_geometry_and_a_shared_head) {
         CHECK_EQ(st[2].n, (int64_t)(25600 - 22528));    /* the head */
         CHECK_EQ(st[2].ckpts, 1);
         CHECK_EQ(st[2].ahead, (int64_t)0);
-        CHECK((f.pc.committed == std::vector<int64_t>{ 25600, 30720 }));   /* the head and the tail (tail-only) */
+        /* ds41-pskcr2: the replay's end, the head and the tail (tail-only) */
+        CHECK((f.pc.committed == std::vector<int64_t>{ 22528, 25600, 30720 }));
+        CHECK_EQ(f.sch.metrics().psk_cr_end_ckpts, (int64_t)1);
         CHECK_EQ(f.sch.metrics().psk_cr_hits, (int64_t)1);
+    }
+}
+
+/* ================================================================== ds41-pskcr2: conversations over the replay */
+/* One request of a conversation on the production geometry, under arm B (ds41_psk 2 k 4, ds41_psk_cr 0), C (2 k 4, cr 1)
+ * or T (4 = tail-only, cr 1): a fresh scheduler whose cache holds the conversation's global KV up to `match` and the
+ * snapshots `avail` (positions on this request's path); the lookup gives the deepest of them at or below min(match,
+ * n - 1), with a slot -- the real cache's (prefix.cpp: the deepest snapshot under the match). The turn's steps (cr_run:
+ * the batch masks every step), the snapshots it committed and its counters. */
+struct CrTurn { std::vector<CrStep> st; std::vector<int64_t> snaps; SchedMetrics m; int64_t lin = 0; };
+static CrTurn cr_turn(char arm, int64_t n, int64_t match, const std::vector<int64_t>& avail) {
+    Fixture f;
+    f.build(/*blocks=*/16384, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/70000, /*windowed=*/true, /*linear=*/true);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;
+    f.pc.groups = { 0 };
+    f.kv.snap = { 3 };
+    CHECK_OK(f.start());
+    f.sch.set_span_min(16384);
+    f.sch.set_psk_mode(arm == 'T' ? 4 : 2);
+    f.sch.set_psk_k(4);
+    CHECK_EQ(f.sch.set_psk_cr(arm == 'B' ? 0 : 1, 5152), arm == 'B' ? 0 : 1);
+    CrTurn t;
+    if (match > 0) {
+        f.pc.seed((int32_t)match);
+        for (int64_t p : avail)
+            if (p <= std::min(match, n - 1)) t.lin = std::max(t.lin, p);
+        f.pc.lin = (int32_t)t.lin;
+        f.pc.src = t.lin > 0 ? 7 : -1;
+    }
+    const uint64_t id = f.submit((int)n, 1);
+    t.st = cr_run(f, id, 128);
+    t.snaps = f.pc.committed;
+    t.m = f.sch.metrics();
+    return t;
+}
+static std::vector<int64_t> cr_path(const std::vector<int64_t>& a, int64_t match) {   /* the snapshots on a path */
+    std::vector<int64_t> o;
+    for (int64_t p : a)
+        if (p <= match) o.push_back(p);
+    return o;
+}
+/* A conversation: a cold text, then turns, each `match` tokens shared with the previous prompt (turn 1: with the cold
+ * text). Returns the replays it took; every turn's first step in `start` (its ctx; -1 when it replayed) and whether it
+ * restored a snapshot. `drop_end` (a control): the replay's end snapshot taken out of the cache before the next turn, as
+ * ds41-pskcr e9e529d never took it. */
+struct CrChain { int64_t replays = 0; std::vector<int64_t> start; std::vector<int> restored; std::vector<CrTurn> t; };
+static CrChain cr_chain(char arm, int64_t cold, const std::vector<std::pair<int64_t, int64_t>>& turns, bool drop_end = false) {
+    CrChain c;
+    std::vector<int64_t> avail = cr_turn(arm, cold, 0, {}).snaps;
+    for (const auto& tn : turns) {
+        avail = cr_path(avail, tn.second);
+        CrTurn t = cr_turn(arm, tn.first, tn.second, avail);
+        CHECK(!t.st.empty());
+        if (t.st.empty()) return c;
+        c.replays += t.m.psk_cr_hits;
+        c.start.push_back(t.st[0].replay ? -1 : t.st[0].ctx);
+        c.restored.push_back(t.st[0].restore >= 0 ? 1 : 0);
+        for (int64_t p : t.snaps)
+            if (!(drop_end && t.m.psk_cr_hits > 0 && p == t.m.psk_cr_resume_tokens)) avail.push_back(p);
+        std::sort(avail.begin(), avail.end());
+        avail.erase(std::unique(avail.begin(), avail.end()), avail.end());
+        c.t.push_back(std::move(t));
+    }
+    return c;
+}
+
+/* The defect r00zzz-cz-tz-scr2 showed (HIT turn:40960: B 1.21 s, C / T 2.64 / 2.67 s replaying 8192 again at 34816): a
+ * request served by a replay took no snapshot at the replay's end, and its tail snapshot fell there (a prompt that ends
+ * within a grid step of H), so every next turn of the conversation replayed again. A Claude Code conversation: a cold text
+ * of 52000 (K4: snapshots 14336 30720 47104 and the tail 51200; tail-only: 51200), then turn 1 sharing 40496 tokens of it
+ * (the grid point 38912: two grid steps over K4's anchor 30720 -- C replays from 30720; T, with no anchor under it, too; B
+ * falls back to 30720), then three turns, each the previous prompt + its answer + a new message (turn 3's answer of ~3000
+ * tokens moves the grid point under its match one step past turn 2's tail snapshot). Every arm: turn 1 the only replay;
+ * turns 2-4 resume from a snapshot (the replay's end = turn 1's tail, then turn 3's tail), restored, no replay chunk --
+ * as B's do. Then the control: the same conversation under C / T with the replay's end snapshot dropped (e9e529d) replays
+ * again at turn 2. */
+TEST(psk_cr_a_conversation_replays_once_then_resumes_from_its_snapshots) {
+    const std::vector<std::pair<int64_t, int64_t>> turns = { { 41000, 40496 }, { 41168, 41056 }, { 44272, 44160 },
+                                                             { 44432, 44320 } };
+    for (char arm : { 'B', 'C', 'T' }) {
+        const CrChain c = cr_chain(arm, 52000, turns);
+        REQUIRE(c.t.size() == 4);
+        CHECK_EQ(c.replays, (int64_t)(arm == 'B' ? 0 : 1));
+        CHECK_EQ(c.start[0], (int64_t)(arm == 'B' ? 30720 : -1));
+        if (arm != 'B') {
+            CHECK_EQ(c.t[0].st[0].ctx, (int64_t)30720);              /* the replay from the grid point under 38912 - 5152 */
+            CHECK_EQ(c.t[0].m.psk_cr_resume_tokens, (int64_t)38912);
+            CHECK_EQ(c.t[0].m.psk_cr_end_ckpts, (int64_t)1);
+        }
+        CHECK((c.t[0].snaps == std::vector<int64_t>{ 38912 }));     /* the replay's end = the tail (B: the tail) */
+        CHECK((c.start == std::vector<int64_t>{ arm == 'B' ? 30720 : -1, 38912, 38912, 43008 }));
+        for (size_t k = 1; k < 4; ++k) {
+            CHECK_EQ(c.restored[k], 1);
+            CHECK_EQ(c.t[k].m.psk_cr_hits, (int64_t)0);
+            for (const CrStep& s : c.t[k].st) CHECK_EQ(s.replay, 0);
+        }
+        if (arm != 'B') {
+            CHECK_EQ(c.t[1].m.psk_cr_not_needed, (int64_t)1);
+            CHECK_EQ(c.t[2].m.psk_cr_cheaper, (int64_t)1);           /* 43008 one step over 38912: resumed there */
+            CHECK_EQ(c.t[3].m.psk_cr_not_needed, (int64_t)1);
+        }
+        CHECK((c.t[2].snaps == std::vector<int64_t>{ 43008 }));
+    }
+    /* the control: without the replay's end snapshot the next turn replays again -- the check above must see it */
+    for (char arm : { 'C', 'T' }) {
+        const CrChain c = cr_chain(arm, 52000, turns, /*drop_end=*/true);
+        CHECK_EQ(c.start[1], (int64_t)-1);                    /* turn 2 replays again ... */
+        CHECK(c.replays >= 2);                                /* ... and the at-most-once check above fails */
+        CHECK_EQ(c.t[1].m.psk_cr_hits, (int64_t)1);
+    }
+}
+
+/* The scr2 hits that read slower than B (hit 4096: C +0.32 s; hit 24576: C +0.76 s), on the cold text above:
+ * - 4096 (a prompt of 4100, match 4000): the grid point under it is the first chunk's end 2048 and nothing lies under
+ *   it -- e9e529d replayed [0, 2048) over all 40 layers' cones of 2048 (82 % of its layer-rows; B's cold chunk runs 21
+ *   layers + 3 small cones toward its farther target): now no replay, a cold prefill (cheaper, counted);
+ * - 24576 after 20480 (scr2's round-1 order on one text): 20480 (n 18917, match 18592) resumes at 18432 -- T by a replay
+ *   (no snapshot under it), C at K4's 14336 one grid step below (cheaper: one chunk, no replay); either way the request
+ *   takes its snapshot at 18432 (T: the replay's end = its tail). Then 24576 (n 22290; its text shares 18592 with
+ *   20480's) finds that snapshot at its grid point 18432: no replay (e9e529d: none existed under C / T, it replayed
+ *   [10240, 18432) where B resumed at 18432 -- the +0.76 s); and a 23747-token one (match 22608) whose grid point 22528
+ *   lies one step over it resumes there (cheaper). */
+TEST(psk_cr_the_first_chunk_and_a_snapshot_one_step_below_take_the_cheaper_path) {
+    for (char arm : { 'C', 'T' }) {
+        const CrChain c = cr_chain(arm, 52000, { { 4100, 4000 } });
+        CHECK_EQ(c.replays, (int64_t)0);
+        CHECK_EQ(c.start[0], (int64_t)0);                       /* cold */
+        CHECK_EQ(c.restored[0], 0);
+        CHECK_EQ(c.t[0].m.psk_cr_cheaper, (int64_t)1);
+        for (const CrStep& s : c.t[0].st) { CHECK_EQ(s.replay, 0); CHECK_EQ(s.flag, 0); }
+    }
+    for (char arm : { 'B', 'C', 'T' }) {
+        const CrChain c = cr_chain(arm, 52000, { { 18917, 18592 }, { 22290, 18592 }, { 23747, 22608 } });
+        CHECK_EQ(c.replays, (int64_t)(arm == 'T' ? 1 : 0));
+        CHECK_EQ(c.start[0], (int64_t)(arm == 'T' ? -1 : 14336));
+        if (arm == 'C') CHECK_EQ(c.t[0].m.psk_cr_cheaper, (int64_t)1);
+        if (arm == 'T') {
+            CHECK_EQ(c.t[0].st[0].ctx, (int64_t)10240);
+            CHECK_EQ(c.t[0].m.psk_cr_end_ckpts, (int64_t)1);
+        }
+        CHECK((c.t[0].snaps == std::vector<int64_t>{ 18432 }));
+        CHECK_EQ(c.start[1], (int64_t)18432);
+        CHECK_EQ(c.restored[1], 1);
+        if (arm != 'B') CHECK_EQ(c.t[1].m.psk_cr_not_needed, (int64_t)1);
+        CHECK_EQ(c.start[2], (int64_t)18432);
+        if (arm != 'B') CHECK_EQ(c.t[2].m.psk_cr_cheaper, (int64_t)1);
+        CHECK((c.t[2].snaps == std::vector<int64_t>{ 22528 }));
     }
 }
 

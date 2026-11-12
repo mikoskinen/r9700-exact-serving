@@ -22,6 +22,14 @@
  *                     third's snapshot at the head is whole and a fourth resumed from it is right). Controls that must
  *                     fail: a replay cone without its window of slack, a replay starting one chunk short of C_0, and
  *                     no replay at all (the fresh state read at `at`).
+ *   conversations     ds41-pskcr2: snapshots carry their CONTENT (CrSnap: every layer's window keys before the position,
+ *                     the token window) and a resumed request gets exactly that. A conversation is served as the
+ *                     scheduler does (the deepest snapshot under the match; a replay only where the grid point lies more
+ *                     than one grid step over it; a snapshot at a replay's end and at the targets past the start): every
+ *                     snapshot taken is whole, every request's rows are a cold run's, at most one replay a conversation
+ *                     and every later turn from a snapshot (B / C / T, fixed + random turn chains). Controls that must
+ *                     fail: e9e529d's policy replays every turn; a snapshot inside a replay, or at the end of a replay
+ *                     without its slack, is not whole and the turn resumed from it is wrong.
  *   pfctx_runs        lever PSK-DS: the context pass's runs -- every entry's last window + 1 rows covered, runs sorted,
  *                     disjoint, each >= 160 rows, fewer rows than the pass; no plan where nothing is skipped, the
  *                     entries cannot be told apart, or the pass is short. */
@@ -174,6 +182,21 @@ std::vector<int64_t> cr_targets(int64_t at, int64_t N, int K, int64_t ckpt_at = 
     return t;
 }
 
+/* ds41-pskcr2: a snapshot's content in the row model -- every layer's window keys of [pos - window + 1, pos), right or
+ * not, and whether the Engram token window (the last ngram - 1 ids) is right. A restore hands exactly this to the next
+ * request (the window section + the conv state of a checkpoint slot); nothing is assumed whole. */
+struct CrSnap {
+    int64_t pos = 0;
+    std::vector<std::vector<uint8_t>> key;   /* [layer][q - (pos - window + 1)], q in [max(0, pos - window + 1), pos) */
+    bool ids = false;
+    bool whole() const {
+        for (const auto& l : key)
+            for (uint8_t b : l)
+                if (!b) return false;
+        return ids;
+    }
+};
+
 struct CrRun {
     int64_t N = 0, at = 0, from = 0;
     std::vector<std::pair<int64_t, int64_t>> replay, rest;   /* chunks: [from, at) and [at, N) */
@@ -181,6 +204,12 @@ struct CrRun {
     bool l20 = false;
     int64_t cone_sub = 0;       /* a control: every replay cone this many rows short */
     bool restored = false;      /* resumed from a snapshot at `from` (= at): the window and token window whole there */
+    /* ds41-pskcr2: resumed from this snapshot at `from` (= its pos): its content, not assumed whole */
+    const CrSnap* rsnap = nullptr;
+    /* ds41-pskcr2: the chunk ends at which the run takes a snapshot, captured into *snaps (the scheduler's psk_ckpt: a
+     * replay's end, and past it the request's targets) */
+    std::vector<int64_t> snap_at;
+    std::vector<CrSnap>* snaps = nullptr;
 };
 /* Returns "" or what broke. A row's Engram ids (layers 1 and 14, in front of the block) are right iff its ngram - 1
  * predecessors are known: from 0 (the eos window, as cold), or inside rows the sequence ran since its start, or a
@@ -194,7 +223,16 @@ std::string cr_model(const CrRun& R) {
     if (R.restored)
         for (int l = 0; l < kNL; ++l)
             for (int64_t q = std::max<int64_t>(0, R.from - kW + 1); q < R.from; ++q) key[(size_t)l][(size_t)q] = 1;
-    const auto ids_ok = [&](int64_t p) { return R.from == 0 || R.restored || p - (kNgram - 1) >= R.from; };
+    if (R.rsnap) {   /* ds41-pskcr2: the snapshot's own content */
+        if (R.rsnap->pos != R.from) return "restored a snapshot of " + std::to_string(R.rsnap->pos) + " at " +
+                                           std::to_string(R.from);
+        const int64_t q0 = std::max<int64_t>(0, R.from - kW + 1);
+        for (int l = 0; l < kNL; ++l)
+            for (int64_t q = q0; q < R.from; ++q) key[(size_t)l][(size_t)q] = R.rsnap->key[(size_t)l][(size_t)(q - q0)];
+    }
+    const auto ids_ok = [&](int64_t p) {
+        return R.from == 0 || R.restored || (R.rsnap && R.rsnap->ids) || p - (kNgram - 1) >= R.from;
+    };
     const int cut0 = R.l20 ? kL20 : kFirst;
     std::vector<std::pair<std::pair<int64_t, int64_t>, bool>> all;
     for (const auto& c : R.replay) all.push_back({ c, true });
@@ -240,6 +278,16 @@ std::string cr_model(const CrRun& R) {
                 out[(size_t)p] = in[(size_t)p] && pre[(size_t)p + 1] - pre[(size_t)q0] == p + 1 - q0;
             }
             for (int64_t p = s; p < e; ++p) in[(size_t)p] = out[(size_t)p];
+        }
+        if (R.snaps && std::find(R.snap_at.begin(), R.snap_at.end(), e) != R.snap_at.end()) {   /* ds41-pskcr2 */
+            CrSnap sn;
+            sn.pos = e;
+            const int64_t q0 = std::max<int64_t>(0, e - kW + 1);
+            sn.key.assign((size_t)kNL, {});
+            for (int l = 0; l < kNL; ++l)
+                sn.key[(size_t)l].assign(key[(size_t)l].begin() + q0, key[(size_t)l].begin() + e);
+            sn.ids = ids_ok(e);
+            R.snaps->push_back(std::move(sn));
         }
         const bool tgt = (rp && e == R.at) || (!rp && std::binary_search(R.tg.begin(), R.tg.end(), e));
         if (tgt) {
@@ -390,6 +438,232 @@ TEST(cone_replay_controls_fail) {
             c.replay = { { c.from, R.at - kGS }, { R.at - kGS, R.at } };
             CHECK(!cr_model(c).empty());
         }
+    }
+}
+
+namespace {
+
+/* ------------------------------------------------------------------ ds41-pskcr2: conversations over the replay */
+/* How the scheduler serves one request of a conversation (admit_one + psk_cr_resume + psk_ckpt), in the row model: the
+ * cache's deepest snapshot at or below min(match, N - 1) (`reuse`, 0 none) and the grid point `at` under the same; arm B
+ * (cr off) resumes at reuse; C / T: no replay where at <= reuse (not needed) or at - reuse <= one grid step (the cheaper
+ * path, `cheaper`), else a replay from the grid point under at - C_0 to at. Snapshots (taken): a replay's end
+ * (`end_snap`), and past the start the request's targets below N (the tail, K's grid points; tail-only: K 0). The
+ * resumed request gets the snapshot's CONTENT (CrSnap), never an assumed-whole window. */
+struct CrPolicy { bool cr = true, cheaper = true, end_snap = true; };
+struct CrServed {
+    std::string err;
+    int how = 0;                   /* 0 cold, 1 resumed from a snapshot, 2 a replay */
+    int64_t start = 0, at = 0, reuse = 0;
+    std::vector<CrSnap> snaps;     /* what it took */
+};
+CrServed cr_serve(int64_t N, int64_t match, int K, bool l20, const CrPolicy& pol, const std::vector<CrSnap>& avail,
+                  int64_t cone_sub = 0, int64_t extra_snap = 0) {
+    CrServed o;
+    const CrSnap* best = nullptr;
+    const int64_t lim = std::min(match, N - 1);
+    for (const CrSnap& x : avail)
+        if (x.pos <= lim && (!best || x.pos > best->pos)) best = &x;
+    o.reuse = best ? best->pos : 0;
+    o.at = gfloor(lim);
+    CrRun R;
+    R.N = N;
+    R.l20 = l20;
+    R.snaps = &o.snaps;
+    if (match > 0 && pol.cr && o.at > o.reuse && !(pol.cheaper && o.at - o.reuse <= kGS)) {
+        o.how = 2;
+        R.at = o.at;
+        R.from = gfloor(std::max<int64_t>(0, o.at - ds41cone::cone(kNL, kW, 0)));
+        R.replay = grid_chunks(R.from, R.at);
+        R.cone_sub = cone_sub;
+        if (pol.end_snap) R.snap_at.push_back(R.at);
+        if (extra_snap > 0) R.snap_at.push_back(extra_snap);   /* a control: a snapshot inside the replay */
+        o.start = R.from;
+    } else {
+        o.how = o.reuse > 0 ? 1 : 0;
+        R.at = R.from = o.start = o.reuse;
+        R.rsnap = best && o.reuse > 0 ? best : nullptr;
+    }
+    R.rest = grid_chunks(R.at, N);
+    R.tg = cr_targets(R.at, N, K);
+    for (int64_t t : R.tg)
+        if (t < N) R.snap_at.push_back(t);
+    o.err = cr_model(R);
+    return o;
+}
+/* A conversation: a cold text of `cold` tokens, then requests each sharing `match` tokens with the one before (the first:
+ * with the cold text); the cache keeps every snapshot taken on the current path (a later request's path leaves the ones
+ * past its match behind). */
+struct CrConv {
+    std::string err;
+    int replays = 0;
+    std::vector<CrServed> t;
+    bool all_whole = true;   /* every snapshot taken whole (every layer's window keys, the token window) */
+};
+CrConv cr_conversation(int64_t cold, const std::vector<std::pair<int64_t, int64_t>>& turns, int K, bool l20,
+                       const CrPolicy& pol = CrPolicy{}) {
+    CrConv c;
+    CrPolicy coldp = pol;
+    std::vector<CrSnap> avail = cr_serve(cold, 0, K, l20, coldp, {}).snaps;
+    for (const CrSnap& x : avail) c.all_whole = c.all_whole && x.whole();
+    for (const auto& tn : turns) {
+        std::vector<CrSnap> keep;
+        for (CrSnap& x : avail)
+            if (x.pos <= tn.second) keep.push_back(std::move(x));
+        avail = std::move(keep);
+        CrServed r = cr_serve(tn.first, tn.second, K, l20, pol, avail);
+        if (!r.err.empty() && c.err.empty())
+            c.err = "request " + std::to_string(c.t.size() + 1) + " (N " + std::to_string(tn.first) + ", match " +
+                    std::to_string(tn.second) + "): " + r.err;
+        c.replays += r.how == 2;
+        for (CrSnap& x : r.snaps) {
+            c.all_whole = c.all_whole && x.whole();
+            bool dup = false;
+            for (const CrSnap& y : avail) dup = dup || y.pos == x.pos;
+            if (!dup) avail.push_back(x);
+        }
+        c.t.push_back(std::move(r));
+    }
+    return c;
+}
+
+}  // namespace
+
+/* ds41-pskcr2: the defect r00zzz-cz-tz-scr2 showed -- a request served by a replay took no snapshot, so every next turn
+ * of the conversation replayed again -- and its fix, in the row model: the replay's end H is a snapshot whose content
+ * (every layer's window keys of [H - 127, H), the Engram token window) is whole, the same state the request itself goes
+ * on from; every later turn resumes from a snapshot (the replay's end or a tail) with that content handed over, never
+ * assumed, and its answer's rows are a cold run's (end row, taps, every target's window, every chunk's layer-20 input).
+ * Conversations of 3-4 turns under B (K4, no replay) / C (K4 + replay) / T (tail-only + replay), PSK-L20 off and on:
+ * gpu02's (64k text, a 40960 hit then follow-up turns), sched_test's (52000, 4 turns), scr2's 20480 -> 24576 -> 23747
+ * order, the first-chunk hit 4096, turns ending 200 / 228 rows past the replay's end, and 120 random ones (texts 20k-90k, turn 1 anywhere, answers 32-4000 + messages
+ * 16-800, re-render 0-8 tokens): at most ONE replay a conversation (C / T: none, or turn 1's), B none, every later turn
+ * from a snapshot. A 9000-token answer moves the grid point two steps past the tail: a second replay is the cheaper exact
+ * path there, and exact. */
+TEST(cone_replay_conversations_resume_from_whole_snapshots) {
+    struct Arm { char a; int K; bool cr; };
+    int checked = 0;
+    for (const Arm arm : { Arm{ 'B', 4, false }, Arm{ 'C', 4, true }, Arm{ 'T', 0, true } })
+        for (bool l20 : { false, true }) {
+            CrPolicy pol;
+            pol.cr = arm.cr;
+            const std::vector<std::pair<int64_t, std::vector<std::pair<int64_t, int64_t>>>> fixed = {
+                { 64000, { { 38212, 38150 }, { 38304, 38270 }, { 38560, 38500 }, { 41700, 41600 } } },
+                { 52000, { { 41000, 40496 }, { 41168, 41056 }, { 44272, 44160 }, { 44432, 44320 } } },
+                { 52000, { { 18917, 18592 }, { 22290, 18592 }, { 23747, 22608 } } },
+                { 52000, { { 4100, 4000 }, { 4300, 4160 }, { 6900, 6800 } } },
+                /* turns that end 200 / 228 rows past the snapshot they resume at (the replay's end): layer 39's cone of
+                 * their end reads its window there, every layer below too (and the DSpark taps' 129 rows are their own) */
+                { 52000, { { 41000, 40496 }, { 39112, 39000 }, { 39140, 39010 } } },
+            };
+            for (const auto& fc : fixed) {
+                const CrConv c = cr_conversation(fc.first, fc.second, arm.K, l20, pol);
+                if (!c.err.empty()) fprintf(stderr, "conversation %c l20 %d cold %lld: %s\n", arm.a, (int)l20,
+                                            (long long)fc.first, c.err.c_str());
+                CHECK(c.err.empty());
+                CHECK(c.all_whole);
+                CHECK(c.replays <= (arm.cr ? 1 : 0));
+                for (size_t k = 1; k < c.t.size(); ++k) CHECK_EQ(c.t[k].how, 1);
+                ++checked;
+            }
+            /* gpu02's turn chain: turn 1's grid point 34816 lies one step over K4's anchor 30720 -- B / C resume there
+             * (C: the cheaper path) -- while T, with no snapshot under it, replays; every later turn from 34816 */
+            {
+                const CrConv c = cr_conversation(64000, fixed[0].second, arm.K, l20, pol);
+                CHECK_EQ(c.t[0].at, (int64_t)34816);
+                CHECK_EQ(c.t[0].how, arm.a == 'T' ? 2 : 1);
+                CHECK_EQ(c.t[1].start, (int64_t)34816);
+                CHECK_EQ(c.t[2].start, (int64_t)34816);
+            }
+            /* scr2's first-chunk hit: cold (no replay of [0, 2048)) in every arm */
+            {
+                const CrConv c = cr_conversation(52000, fixed[3].second, arm.K, l20, pol);
+                CHECK_EQ(c.t[0].how, 0);
+                CHECK_EQ(c.replays, 0);
+            }
+            std::mt19937 rng(20261112 + 7 + (uint32_t)arm.a + (l20 ? 100 : 0));
+            for (int it = 0; it < 20; ++it) {
+                const int64_t cold = 20000 + (int64_t)(rng() % 70000);
+                int64_t m = 2048 + (int64_t)(rng() % (uint32_t)(cold - 2048)), n = m + 64 + (int64_t)(rng() % 3000);
+                std::vector<std::pair<int64_t, int64_t>> turns{ { n, m } };
+                const int nt = 3 + (int)(rng() % 2);
+                for (int k = 1; k < nt; ++k) {
+                    const int64_t a = 32 + (int64_t)(rng() % 3969), msg = 16 + (int64_t)(rng() % 785);
+                    const int64_t mm = n + a - (int64_t)(rng() % 9);
+                    n = n + a + msg;
+                    turns.push_back({ n, mm });
+                }
+                const CrConv c = cr_conversation(cold, turns, arm.K, l20, pol);
+                if (!c.err.empty()) fprintf(stderr, "random %c l20 %d it %d: %s\n", arm.a, (int)l20, it, c.err.c_str());
+                CHECK(c.err.empty());
+                CHECK(c.all_whole);
+                CHECK(c.replays <= (arm.cr ? 1 : 0));
+                CHECK(c.t[0].how == 2 || c.replays == 0);
+                for (size_t k = 1; k < c.t.size(); ++k) CHECK_EQ(c.t[k].how, 1);
+                ++checked;
+            }
+            /* a 9000-token answer: turn 3's grid point two steps past turn 2's tail -- a second replay, the cheaper
+             * exact path (C / T), exact */
+            {
+                const CrConv c = cr_conversation(52000, { { 41000, 40496 }, { 41168, 41056 }, { 50300, 50160 } }, arm.K,
+                                                 l20, pol);
+                CHECK(c.err.empty());
+                CHECK(c.all_whole);
+                CHECK_EQ(c.t[2].how, arm.cr ? 2 : 1);
+                ++checked;
+            }
+        }
+    CHECK(checked >= 6 * 26);
+}
+
+/* ds41-pskcr2's controls -- each must fail, or the model proves nothing: (a) e9e529d's policy (no snapshot at the
+ * replay's end, a replay wherever the grid point has none) replays at EVERY turn of sched_test's conversation; (b) a
+ * snapshot taken inside the replay (its first chunk's end: layers 9..39 not run there) is not whole, and the turn resumed
+ * from it is wrong; (c) the end snapshot of a replay whose cones lack two windows of slack is not whole (layers 38 / 39),
+ * and a turn resumed from it that reads its window there (its end 200 rows past it) is wrong. */
+TEST(cone_replay_conversation_controls_fail) {
+    const std::vector<std::pair<int64_t, int64_t>> turns = { { 41000, 40496 }, { 41168, 41056 }, { 44272, 44160 },
+                                                             { 44432, 44320 } };
+    for (int K : { 4, 0 }) {
+        CrPolicy old;
+        old.cheaper = false;
+        old.end_snap = false;
+        const CrConv c = cr_conversation(52000, turns, K, false, old);
+        CHECK(c.err.empty());       /* exact -- only slow */
+        CHECK(c.replays > 1);       /* the at-most-once check sees it */
+        CHECK_EQ(c.t[1].how, 2);
+    }
+    CrPolicy pol;
+    std::vector<CrSnap> cold = cr_serve(52000, 0, 0, false, pol, {}).snaps;   /* tail-only: the tail 51200 only */
+    std::vector<CrSnap> path;
+    for (const CrSnap& x : cold)
+        if (x.pos <= 40496) path.push_back(x);
+    {   /* (b) */
+        const CrServed t1 = cr_serve(41000, 40496, 0, false, pol, path, 0, /*extra_snap=*/34816);
+        CHECK(t1.err.empty());
+        CHECK_EQ(t1.how, 2);
+        const CrSnap* in = nullptr;
+        for (const CrSnap& x : t1.snaps)
+            if (x.pos == 34816) in = &x;
+        REQUIRE(in != nullptr);
+        CHECK(!in->whole());
+        const CrServed t2 = cr_serve(36000, 35000, 0, false, pol, { *in });
+        CHECK_EQ(t2.how, 1);
+        CHECK(!t2.err.empty());
+    }
+    {   /* (c): two windows short -- layers 38 and 39 end without their window at H */
+        const CrServed t1 = cr_serve(41000, 40496, 0, false, pol, path, /*cone_sub=*/2 * kW);
+        CHECK(!t1.err.empty());
+        const CrSnap* end = nullptr;
+        for (const CrSnap& x : t1.snaps)
+            if (x.pos == 38912) end = &x;
+        REQUIRE(end != nullptr);
+        CHECK(!end->whole());
+        /* a turn ending 200 rows past the snapshot: its rows [H, H + 95) at layer 38 read the missing keys, and layer 39's
+         * cone of its end and its taps read those rows */
+        const CrServed t2 = cr_serve(39112, 39000, 0, false, pol, { *end });
+        CHECK_EQ(t2.how, 1);
+        CHECK(!t2.err.empty());
     }
 }
 

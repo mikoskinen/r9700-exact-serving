@@ -138,7 +138,9 @@ struct SchedMetrics {
      * resumed at (at summed); hits a replay would have served but did not, by reason -- the request not planned, the
      * geometry (a trunk group the cache holds no window of, a runtime window, no reach), the adoption refused -- and
      * hits whose snapshot was already at the grid point (no replay needed); requests latched tail-only (ds41_psk 4 with
-     * ds41_psk_cr 1) and admitted under 4 without it (planned as 2). */
+     * ds41_psk_cr 1) and admitted under 4 without it (planned as 2). ds41-pskcr2: hits with no snapshot at their grid
+     * point that resumed at the snapshot below (or cold) because that recomputes at most one grid step -- the cheaper
+     * exact path (Scheduler::psk_cr_resume) -- and snapshots taken at a replay's end. */
     int32_t psk_cr = -1;
     int64_t psk_cr_hits = 0;
     int64_t psk_cr_rows = 0;
@@ -149,6 +151,8 @@ struct SchedMetrics {
     int64_t psk_cr_not_needed = 0;
     int64_t psk_tail_only = 0;
     int64_t psk_tail_only_refused = 0;
+    int64_t psk_cr_cheaper = 0;
+    int64_t psk_cr_end_ckpts = 0;
 
     /* Throughput: tokens over wall time in a 1-second decaying window (Scheduler::step_finished);
      * the counters beside them are exact. */
