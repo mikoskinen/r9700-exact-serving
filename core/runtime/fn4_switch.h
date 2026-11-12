@@ -385,6 +385,15 @@
  *                   gemm_nt_ggml's per-output sequence on a row slice, and the gather only copies.
  *                   RADIANCE_DS41_E2=1 declares the part, the GEMV and the gather (and starts at 1); unset declares
  *                   nothing and 1 is refused. GET "i11".gq / .e2 carry the two levers' issue counts (rank 0).
+ *   ds41_xp         deepseek41 (lever 1U-XP, ds41-int11b, appended after ds41_e2): 1 the next-layer expert prefetch
+ *                   (core xprefetch) predicts at every trunk MoE layer of a pass of <= 16 rows: layer l+1's router (bf16,
+ *                   RADIANCE_DS41_ROUTER_BF16=1) over layer l's router input, ranked by DeepSeek-V4's selection key
+ *                   (sqrt(softplus(logit)) + the correction bias), copies the likeliest host-pool experts into the ring
+ *                   by DMA and points layer l+1's EXL3 tables at a copy once it has landed; 0 no prediction (the ring
+ *                   stays allocated: RADIANCE_XPREFETCH=1 at start). Exact: placement only -- a copy holds the pool
+ *                   slot's bytes, an entry is redirected only where it still names that slot and only after the copy
+ *                   landed, the same kernels read the same bytes. RADIANCE_DS41_XP=1 links the layers (and starts at
+ *                   1); unset links nothing and 1 is refused. GET "xp": the prefetch's counters (note_xp).
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -462,7 +471,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSwitches };
+              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kDs41Xp, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -598,6 +607,11 @@ void arc_stats(int64_t out[kArcStats]);
  * mhc_mix launches in a wide-wave form, their rows. 0s where no plugin serves them. */
 constexpr int kI11Stats = 8;
 void i11_stats(int64_t out[kI11Stats]);
+/* Lever 1U-XP's live counters (ds41-int11b, GET /admin/fn4 "xp"), cumulative, per rank, published by the core's prefetch
+ * (xprefetch.cpp) every 64 predictions: copies restored (looked back on), of them routed by the step, copies planned,
+ * requests dropped behind a slow DMA queue, rests (the share used fell under the payoff bar). */
+constexpr int kXpRanks = 8;
+void note_xp(int rank, uint32_t copied, uint32_t routed, uint32_t planned, int64_t dropped, int64_t rests);
 /* Lever E1's live counters (ds41-e1, /stats "engdd"; the plugin's rad_engdd_stats, rank 0's, cumulative): Engram layer
  * passes deduplicated, rows not computed in them, rows pooled in them, layer passes kept whole by the 48-row guard, layer
  * passes below the repeat share, steps with a deduplicated layer, layer passes with no launch above the band -- 0s and a

@@ -478,6 +478,14 @@ struct MoeFP8 {
      * handles its table entries hold and its place in the routing counts. Quantised experts only;
      * a layer without a description gets no prediction. */
     const MoeFP8*           xp_next = nullptr;
+    /* Optional, set by the architecture (lever 1U-XP): read at every pass, > 0 = predict for xp_next (the
+     * prediction is a recorded host step, so a change takes a new epoch); null = whenever xp_next is set, as
+     * before. The marks and steps run either way: a step restores what an earlier prediction redirected. */
+    const std::atomic<int>* xp_live = nullptr;
+    /* The key this layer's experts are ranked by when predicted (rad_expert_prefetch_route): 0 the router's
+     * logits, 1 DeepSeek-V4's sqrt(softplus) + `xp_bias` (the router's correction). */
+    int                     xp_score = 0;
+    rad_weight              xp_bias = 0;
     RadPrefetchNext         xp{};
     std::vector<rad_weight> xp_parts;
     std::vector<int32_t>    xp_count_at;
@@ -2065,6 +2073,33 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         xp.n_parts = 4;
         xp.parts = xp_parts.data();
         xp.count_at = xp_count_at.data();
+    } else if (c.sigmoid_router && c.expert_exl3 && c.router_bf16 && !c.router_k && glm_router.projection &&
+               glm_router.correction && c.n_expert_all > 0 && c.n_expert > 0 && c.n_expert % 2 == 0 &&
+               !x3_gu[0].empty()) {
+        /* Lever 1U-XP (DeepSeek-V4.1's EXL3 experts under the bf16 GLM router): a unit's seven planes -- gate_up's
+         * codes, suh, suh.1, svh and down's codes, suh, svh -- each at the expert's place in its run (class-major:
+         * the even local experts, then the odd), the routing counts at the local index, the router's projection and
+         * its correction for the selection key. */
+        const int64_t na = c.n_expert_all, ne = c.n_expert, half = ne / 2;
+        constexpr int64_t P = 7;
+        xp_parts.assign((size_t)(na * P), 0);
+        xp_count_at.assign((size_t)na, -1);
+        for (int64_t e = 0; e < ne; ++e) {
+            const int64_t me = c.expert_base + e, ri = (e % 2) * half + e / 2;
+            if (me < 0 || me >= na) continue;
+            for (int p = 0; p < 4; ++p) xp_parts[(size_t)(me * P + p)] = x3_gu[p][(size_t)ri];
+            for (int p = 0; p < 3; ++p) xp_parts[(size_t)(me * P + 4 + p)] = x3_dn[p][(size_t)ri];
+            xp_count_at[(size_t)me] = (int32_t)e;
+        }
+        xp.layer = layer;
+        xp.router = glm_router.projection;
+        xp.n_expert = na;
+        xp.top_k = c.top_k;
+        xp.n_parts = P;
+        xp.parts = xp_parts.data();
+        xp.count_at = xp_count_at.data();
+        xp_score = 1;
+        xp_bias = glm_router.correction;
     }
     return RAD_OK;
 }
@@ -2265,8 +2300,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* The routed arm. */
     /* Predict the next routed layer's experts from this router's input, on the compute stream
      * (rad_expert_prefetch). A failure only loses the prediction. */
-    if (xp_next && xp_next->xp.n_parts > 0)
+    if (xp_next && xp_next->xp.n_parts > 0 && (!xp_live || xp_live->load(std::memory_order_relaxed) > 0)) {
+        if (xp_next->xp_score > 0)   /* lever 1U-XP: the next layer's selection key (host state, kept) */
+            (void)rad_expert_prefetch_route(c_, xp_next->xp.layer, xp_next->xp_bias, xp_next->xp_score);
         (void)rad_expert_prefetch(c_, &xp_next->xp, w.h.x, r0, rows, g.n_embd);
+    }
     /* Bind the block's own ecnt buffer, never the core's raw routing row: a raw-pointer operand
      * does not survive the step tape's replay (the decode path re-issues ops from the tape), so
      * the histogram the kernel writes there never lands, and a consumer reading the reported

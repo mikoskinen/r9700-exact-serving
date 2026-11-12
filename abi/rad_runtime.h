@@ -1004,6 +1004,10 @@ int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64
 int rad_expert_prefetch_mark(RadCtx* c);
 /* Ahead of `layer`'s routed GEMMs, on every routed layer of every pass. */
 int rad_expert_prefetch_step(RadCtx* c, int layer);
+/* The key the prediction for `layer` ranks experts by: 0 the router's logits (as before), 1
+ * DeepSeek-V4's sqrt(softplus(logit)) + `bias` ([n_expert] f32, the router's correction). Host
+ * state, kept until replaced; a core without a prefetch ignores it. Additive export (lever 1U-XP). */
+int rad_expert_prefetch_route(RadCtx* c, int layer, rad_weight bias, int score);
 
 /* A weight's pointer, for the rare plugin-private kernel invoked outside the op vocabulary. Waits
  * on the mover. The weight may move afterwards, so the pointer is valid only within one issue. */

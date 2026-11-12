@@ -1488,6 +1488,16 @@ static void i11_read_env() {
     rd("RADIANCE_DS41_GQ", 3, g_sw_gq_env, g_sw_gq);
     rd("RADIANCE_DS41_E2", 1, g_sw_e2_env, g_sw_e2);
 }
+/* Lever 1U-XP (ds41-int11b): RADIANCE_DS41_XP=1 (or on) links every trunk MoE layer to the next one for the core's
+ * next-layer expert prefetch (MoeFP8::xp_next; the layers' EXL3 descriptions need the bf16 router,
+ * RADIANCE_DS41_ROUTER_BF16=1, and the core's ring, RADIANCE_XPREFETCH=1 at start) and starts the switch at 1; unset
+ * links nothing and 1 is refused. Switch "ds41_xp": 0 / 1, read at every pass (MoeFP8::xp_live) -- 0 = no prediction,
+ * the copies' marks and restores run as before. Placement only: the bytes a GEMM reads are a pool slot's either way. */
+static std::atomic<int> g_sw_xp{0}, g_sw_xp_ok{0}, g_sw_xp_env{-1}, g_xp_noted{0};
+static int xp_env() {
+    const char* e = std::getenv("RADIANCE_DS41_XP");
+    return e && (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1 : 0;
+}
 static bool gq_declared() { return g_sw_gq_env.load(std::memory_order_relaxed) >= 0; }
 static bool e2_declared() { return g_sw_e2_env.load(std::memory_order_relaxed) >= 0; }
 /* the live mask / flag, 0 where nothing was declared */
@@ -1599,6 +1609,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value >= 1 && value <= 3 && g_sw_gq_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 */
         return value == 0 || (value == 1 && g_sw_e2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_xp"))   /* lever 1U-XP */
+        return value == 0 || (value == 1 && g_sw_xp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -1618,6 +1630,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ix_ni")) g_sw_ixni.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_gq")) g_sw_gq.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_e2")) g_sw_e2.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_xp")) g_sw_xp.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1679,6 +1692,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_e2")) {
         *applied = e2_now() ? 1 : 0;
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_xp")) {
+        *applied = g_sw_xp_ok.load(std::memory_order_relaxed) ? g_sw_xp.load(std::memory_order_relaxed) : 0;
         return 1;
     }
     return 0;
@@ -3498,6 +3515,30 @@ static void engdd_declare(Model& m, const RadBuildCtx* ctx);               /* le
 static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lever KVR, below */
 static void mhc_declare(Model& m, const RadBuildCtx* ctx);                  /* lever M1, below */
 static void i11_declare(Model& m, const RadBuildCtx* ctx);                  /* levers 1U-GQ / 1U-E2, below */
+/* Lever 1U-XP at the end of a declare (RADIANCE_DS41_XP=1): each trunk MoE layer predicts for the next one that has a
+ * prefetch description (MoeFP8::xp: the EXL3 planes under the bf16 router), under the ds41_xp switch. */
+static void xp_link(Model& m, const RadBuildCtx* ctx) {
+    if (g_sw_xp_env.load(std::memory_order_relaxed) <= 0) return;
+    int n = 0, desc = 0;
+    Layer* prev = nullptr;
+    for (Layer& L : m.layers) {
+        L.moe.xp_live = &g_sw_xp;
+        if (L.moe.xp.n_parts > 0) ++desc;
+        if (prev && L.moe.xp.n_parts > 0) {
+            prev->moe.xp_next = &L.moe;
+            ++n;
+        }
+        prev = &L;
+    }
+    if (ctx->shape_probe) return;
+    if (n > 0) g_sw_xp_ok.store(1, std::memory_order_relaxed);
+    else g_sw_xp.store(0, std::memory_order_relaxed);
+    if (ctx->rank == 0 && !g_xp_noted.exchange(1, std::memory_order_relaxed))
+        fprintf(stderr, "radiance: deepseek41: lever 1U-XP (ds41_xp, RADIANCE_DS41_XP, now %d) %s: %d of %zu trunk layers "
+                        "predict the next layer's experts (%d described; the bf16 router, RADIANCE_DS41_ROUTER_BF16=1, and "
+                        "the core's ring, RADIANCE_XPREFETCH=1, needed)\n",
+                g_sw_xp.load(std::memory_order_relaxed), n > 0 ? "linked" : "not linked", n, m.layers.size(), desc);
+}
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -3521,6 +3562,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         int unread = -1;
         if (g_sw_shexp_env.compare_exchange_strong(unread, shexp_lane_env()))
             g_sw_shexp.store(g_sw_shexp_env.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    {   /* lever 1U-XP: RADIANCE_DS41_XP once, at the first declare */
+        int unread = -1;
+        if (g_sw_xp_env.compare_exchange_strong(unread, xp_env()))
+            g_sw_xp.store(g_sw_xp_env.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
     k1_read_env();
     walk_read_env();
@@ -3881,6 +3927,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             fprintf(stderr, "radiance: deepseek41 indexer deal: idx_split %d (RADIANCE_DS41_IDX_BALANCE at start, "
                             "POST /admin/fn4 idx_split): %s\n", idx_balance() ? 1 : 0, what);
     }
+    xp_link(m, ctx);
     DS_TRY(bi_declare(b, m, ctx));
     DS_TRY(psk_declare(b, m, ctx));
     engdd_declare(m, ctx);

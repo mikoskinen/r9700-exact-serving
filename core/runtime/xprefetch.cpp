@@ -2,6 +2,7 @@
 #include "ctx.h"
 #include "xp_state.h"
 #include "rad_internal.h"
+#include "fn4_switch.h"
 
 #include <algorithm>
 #include <chrono>
@@ -46,6 +47,9 @@ constexpr int64_t  kXpWindow    = 2048;
 constexpr double   kXpMinUse    = 0.30;
 constexpr uint32_t kXpMinJudged = 512;
 constexpr int64_t  kXpRest      = 8192;
+/* Lever 1U-XP's live counters: the device counters are copied to pinned host memory every this many
+ * predictions and published (fn4::note_xp) at the next copy. */
+constexpr int64_t  kXpPubEvery  = 64;
 
 }  // namespace
 
@@ -55,7 +59,7 @@ void Ctx::xp_free(XpState& x) {
     for (void* p : {(void*)x.rec, (void*)x.nrec, (void*)x.stats, (void*)x.logits, (void*)x.maps,
                     (void*)x.places})
         if (p) rad_dev_free(p, RAD_MEM_DEVICE);
-    for (void* p : {(void*)x.box, (void*)x.done, (void*)x.stats_h})
+    for (void* p : {(void*)x.box, (void*)x.done, (void*)x.stats_h, (void*)x.stats_p})
         if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (x.tail) rad_event_destroy(x.tail);
     if (x.sync) rad_event_destroy(x.sync);
@@ -95,8 +99,9 @@ void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride
     x->box    = (XpBox*)rad_dev_alloc((int64_t)sizeof(XpBox) * kXpGroups, RAD_MEM_HOST_PINNED);
     x->done   = (uint32_t*)rad_dev_alloc(4 * kXpGroups, RAD_MEM_HOST_PINNED);
     x->stats_h = (XpStats*)rad_dev_alloc((int64_t)sizeof(XpStats), RAD_MEM_HOST_PINNED);
+    x->stats_p = (XpStats*)rad_dev_alloc((int64_t)sizeof(XpStats), RAD_MEM_HOST_PINNED);
     const bool ok = x->ring && x->rec && x->nrec && x->stats && x->logits && x->maps && x->places && x->box &&
-                    x->done && x->stats_h && rad_xp_stream_create(&x->stream) >= 0 &&
+                    x->done && x->stats_h && x->stats_p && rad_xp_stream_create(&x->stream) >= 0 &&
                     rad_event_create_local(&x->tail) >= 0 && rad_event_create_local(&x->sync) >= 0 &&
                     rad_memset_async(x->nrec, 0, 4 * kXpGroups, stream_) >= 0 &&
                     rad_memset_async(x->stats, 0, sizeof(XpStats), stream_) >= 0 && rad_stream_sync(stream_) >= 0;
@@ -107,6 +112,7 @@ void Ctx::xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride
         return;
     }
     std::memset((void*)x->box, 0, sizeof(XpBox) * kXpGroups);
+    std::memset((void*)x->stats_p, 0, sizeof(XpStats));
     std::memset(x->done, 0, 4 * kXpGroups);
     x->layers.resize((size_t)nl);
     XpState* xs = x.get();
@@ -221,15 +227,21 @@ bool Ctx::xp_bind(XpLayer& L, int layer) {
     for (int64_t e = 0; e < nx.n_expert; ++e) {
         void** ent[kXpParts] = {};
         bool usable = true;
+        /* Every table entry naming one of the unit's weights, in part order (a weight in two tables -- EXL3's
+         * down suh, read by gate_up too -- takes two entries); more than kXpParts: left out. A unit with a part
+         * in no table is left out too (a copy it could not be read through). */
+        int ne_used = 0;
         for (int64_t k = 0; k < nx.n_parts && usable; ++k) {
             const rad_weight w = nx.parts[e * nx.n_parts + k];
             if (!w) continue;
             if ((size_t)w >= wmemb_head_.size() || wmemb_head_[w] < 0) { usable = false; break; }
-            const WMemb& m = wmemb_[(size_t)wmemb_head_[w]];
-            if (m.next >= 0) { usable = false; break; }
-            const WeightTable& t = wtabs_[(size_t)m.slot];
-            if (!t.dev) return false;
-            ent[k] = (void**)t.dev + m.entry;
+            for (int32_t mi = wmemb_head_[w]; mi >= 0 && usable; mi = wmemb_[(size_t)mi].next) {
+                const WMemb& m = wmemb_[(size_t)mi];
+                const WeightTable& t = wtabs_[(size_t)m.slot];
+                if (!t.dev) return false;
+                if (ne_used >= kXpParts) { usable = false; break; }
+                ent[ne_used++] = (void**)t.dev + m.entry;
+            }
         }
         if (usable)
             for (int k = 0; k < kXpParts; ++k) hm[(size_t)(e * kXpParts + k)] = ent[k];
@@ -291,6 +303,19 @@ int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t ro
     return tape_host(st, [&] { return xp_predict_run(*nx, h, r0, rows, n_embd); });
 }
 
+/* Lever 1U-XP: the selection key the plan ranks `layer`'s experts by (kXpScore*; the correction bias for DeepSeek-V4's
+ * key). Host state only, kept across passes; a later call replaces it. */
+int Ctx::xp_route(int layer, rad_weight bias, int score) {
+    if (!xp_) return RAD_OK;
+    XpState& x = *xp_;
+    if (layer < 0 || layer >= (int)x.layers.size()) return RAD_E_INVAL;
+    if (score != kXpScoreLogit && score != kXpScoreSqrtSoftplusBias) return RAD_E_INVAL;
+    XpLayer& L = x.layers[(size_t)layer];
+    L.bias = bias;
+    L.score = score;
+    return RAD_OK;
+}
+
 int Ctx::xp_mark() {
     if (!xp_) return RAD_OK;
     if (!rec_) return xp_mark_run();
@@ -313,14 +338,14 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
     const int layer = nx.layer;
     if (rows <= 0 || rows > kXpMaxRows || nx.top_k <= 0 || nx.top_k > kXpMaxK || nx.n_expert <= 0 ||
         nx.n_expert > kXpMaxNe || nx.n_parts <= 0 || nx.n_parts > kXpParts || !nx.parts || n_embd % 256 ||
-        n_embd > 4096 || layer < 0 || layer >= (int)x.layers.size()) {
+        n_embd > kXpMaxEmbd || layer < 0 || layer >= (int)x.layers.size()) {
         /* Said once a rank (lever VA "xpoff"): a router input this predictor never takes means the
          * prefetch copies nothing for the model, and its ring is VRAM the slab could hold. */
-        if ((n_embd % 256 || n_embd > 4096) && !x.said_width) {
+        if ((n_embd % 256 || n_embd > kXpMaxEmbd) && !x.said_width) {
             x.said_width = true;
             RAD_INFO("rank %d: expert prefetch: the router input is %lld columns, which the predictor does not "
-                     "take (a multiple of 256, at most 4096): it copies nothing for this model "
-                     "(RADIANCE_XPREFETCH=0 returns its ring to the slab)", rank_, (long long)n_embd);
+                     "take (a multiple of 256, at most %d): it copies nothing for this model "
+                     "(RADIANCE_XPREFETCH=0 returns its ring to the slab)", rank_, (long long)n_embd, kXpMaxEmbd);
         }
         return RAD_OK;
     }
@@ -370,14 +395,22 @@ int Ctx::xp_predict_run(const RadPrefetchNext& nx, rad_buf h, int64_t r0, int64_
     const int32_t* cnt = route_n_expert_ > 0 && nx.n_expert <= route_n_expert_
                              ? route_dev_ + (int64_t)layer * route_n_expert_ : nullptr;
     const uint64_t ring = (uint64_t)(uintptr_t)(x.ring + (size_t)g * kXpSlots * x.slot);
+    /* lever 1U-XP: the layer's selection key (rad_expert_prefetch_route); its bias read in place */
+    const float* bias = L.score == kXpScoreSqrtSoftplusBias && L.bias ? (const float*)weight_ptr(L.bias) : nullptr;
     if (rad_xp_logits_launch(hg, (const uint16_t*)w, lg, (uint32_t)rows, (uint32_t)n_embd, (uint32_t)nx.n_expert,
                              (void*)x.stream) ||
         rad_xp_plan_launch(lg, (uint32_t)rows, (uint32_t)nx.n_expert, (uint32_t)nx.top_k, (void** const*)L.map,
                            L.place, cnt, x.pools, ring, x.slot, x.rec + (size_t)g * kXpSlots, x.nrec + g,
-                           (XpBox*)rad_dev_device_ptr(x.box + g), seq, x.stats, (void*)x.stream))
+                           (XpBox*)rad_dev_device_ptr(x.box + g), seq, x.stats, bias, L.score, (void*)x.stream))
         return RAD_E_DEVICE;
     x.tail_live = true;
-    if (++x.calls % kXpWindow == 0) xp_judge(x);
+    if (++x.calls % kXpPubEvery == 0) {
+        /* lever 1U-XP's counters: publish the last copy (landed long since), then copy again */
+        if (x.pub_live)
+            fn4::note_xp(rank_, x.stats_p->copied, x.stats_p->routed, x.stats_p->planned, x.dropped.load(), x.rests);
+        x.pub_live = rad_memcpy_async(x.stats_p, x.stats, sizeof(XpStats), x.stream) >= 0;
+    }
+    if (x.calls % kXpWindow == 0) xp_judge(x);
     x.pend.g = g;
     x.pend.seq = seq;
     x.pend.mark = nullptr;

@@ -33,7 +33,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa", "stage_short",
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
-                                        "ds41_mix_wv", "ds41_gq", "ds41_e2" };
+                                        "ds41_mix_wv", "ds41_gq", "ds41_e2", "ds41_xp" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -41,7 +41,7 @@ bool plugin_switch(int i) {
            i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk ||
            i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx || i == kDs41PskCr || i == kDs41Engdd ||
            i == kMhcFuse || i == kIxLds || i == kIxNi || i == kDs41Arcoded || i == kDs41MixWv || i == kDs41Gq ||
-           i == kDs41E2;
+           i == kDs41E2 || i == kDs41Xp;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -576,6 +576,18 @@ static void i11_collect(State& s, int64_t* out) {
         }
     }
 }
+/* Lever 1U-XP (ds41-int11b): the prefetch's counters, a rank's latest; -1 = never published. */
+namespace {
+std::atomic<int64_t> g_xp[kXpRanks][5];
+std::atomic<int> g_xp_ranks{0};
+}
+void note_xp(int rank, uint32_t copied, uint32_t routed, uint32_t planned, int64_t dropped, int64_t rests) {
+    if (rank < 0 || rank >= kXpRanks) return;
+    const int64_t v[5] = { (int64_t)copied, (int64_t)routed, (int64_t)planned, dropped, rests };
+    for (int k = 0; k < 5; ++k) g_xp[rank][k].store(v[k], std::memory_order_relaxed);
+    int cur = g_xp_ranks.load(std::memory_order_relaxed);
+    while (cur < rank + 1 && !g_xp_ranks.compare_exchange_weak(cur, rank + 1)) {}
+}
 void i11_stats(int64_t out[kI11Stats]) {
     State& s = st();
     std::lock_guard<std::mutex> lk(s.mu);
@@ -634,7 +646,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
-                        "epoch_bump)";
+                        "ds41_xp, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1243,6 +1255,16 @@ std::string state_json() {
              std::to_string((long long)v[2]) + ", \"plain_rows\": " + std::to_string((long long)v[3]) +
              ", \"below\": " + std::to_string((long long)v[4]) + ", \"declined\": " + std::to_string((long long)v[5]) +
              ", \"coded_all_ranks\": " + std::to_string((long long)v[6]) + "}";
+    }
+    /* Lever 1U-XP (ds41-int11b): always present; every rank's latest published counters summed, 0s before any. */
+    {
+        int64_t t[5] = { 0, 0, 0, 0, 0 };
+        const int nr = g_xp_ranks.load(std::memory_order_relaxed);
+        for (int r = 0; r < nr && r < kXpRanks; ++r)
+            for (int k = 0; k < 5; ++k) t[k] += g_xp[r][k].load(std::memory_order_relaxed);
+        o += ", \"xp\": {\"ranks\": " + std::to_string(nr) + ", \"copied\": " + std::to_string((long long)t[0]) +
+             ", \"routed\": " + std::to_string((long long)t[1]) + ", \"planned\": " + std::to_string((long long)t[2]) +
+             ", \"dropped\": " + std::to_string((long long)t[3]) + ", \"rests\": " + std::to_string((long long)t[4]) + "}";
     }
     /* Levers 1U-MX / 1U-GQ / 1U-E2 (ds41-int11): always present, 0s where no plugin serves them (i11_stats). */
     {

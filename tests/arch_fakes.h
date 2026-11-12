@@ -554,6 +554,10 @@ extern "C" int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_b
 }
 extern "C" int rad_expert_prefetch_mark(RadCtx* c) { (void)c; return RAD_OK; }
 extern "C" int rad_expert_prefetch_step(RadCtx* c, int layer) { (void)c; (void)layer; return RAD_OK; }
+extern "C" int rad_expert_prefetch_route(RadCtx* c, int layer, rad_weight bias, int score) {
+    (void)c; (void)layer; (void)bias; (void)score;
+    return RAD_OK;
+}
 /* Never dereferenced: a plugin passes these through to rad_route_report or offsets one into a raw
  * operand. Each handle gets its own 2^36-byte window above any user-space address, tagged by
  * kind in the top bits, so the step lint can map a raw operand inside a buffer back to that buffer

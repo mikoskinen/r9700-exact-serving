@@ -25,6 +25,10 @@ struct XpLayer {
     int32_t* place = nullptr;    /* device [kXpMaxNe]: the expert's place in the routing counts */
     bool     bound = false;
     bool     want  = false;
+    /* The selection the plan ranks by (rad_expert_prefetch_route, lever 1U-XP): kXpScore*, and the
+     * correction bias [n_expert] f32 for kXpScoreSqrtSoftplusBias; 0 = the logits. */
+    rad_weight bias = 0;
+    int      score = 0;
     int      g     = 0;
     uint32_t seq   = 0;
 };
@@ -78,6 +82,10 @@ struct XpState {
     std::deque<std::pair<void*, int64_t>> marks;   /* thread only: a mark and the list that polls it */
     int64_t                  lists = 0;            /* thread only: lists handed over */
     std::atomic<int64_t>     dropped{0};           /* requests the queue was too far behind for */
+    /* Lever 1U-XP's live counters: the device counters copied here every kXpPubEvery predictions and
+     * published to GET /admin/fn4 "xp" (fn4::note_xp) one copy later. */
+    XpStats*                 stats_p = nullptr;    /* pinned host */
+    bool                     pub_live = false;
 };
 
 }  /* namespace rad */

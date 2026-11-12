@@ -1477,6 +1477,9 @@ int rad_expert_prefetch_mark(RadCtx* c) {
 int rad_expert_prefetch_step(RadCtx* c, int layer) {
     return c ? static_cast<rad::Ctx*>(c)->xp_step(layer) : RAD_E_INVAL;
 }
+int rad_expert_prefetch_route(RadCtx* c, int layer, rad_weight bias, int score) {
+    return c ? static_cast<rad::Ctx*>(c)->xp_route(layer, bias, score) : RAD_E_INVAL;
+}
 
 void* rad_weight_ptr(RadCtx* c, rad_weight w) {
     return c ? static_cast<rad::Ctx*>(c)->weight_ptr(w) : nullptr;

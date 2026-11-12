@@ -334,6 +334,7 @@ public:
     int  xp_predict(const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark();
     int  xp_step(int layer);
+    int  xp_route(int layer, rad_weight bias, int score);   /* lever 1U-XP: the plan's selection key */
     /* Drain, do not sample. `next_histogram` returns the oldest bank holding a landed histogram
      * for a step in (`after_step`, `before_step`), or -1. A caller loops on it with the step it
      * last credited, so it sees every histogram in order. The readers below take that bank; they

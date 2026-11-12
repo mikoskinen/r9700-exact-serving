@@ -34,7 +34,17 @@ constexpr int kXpMaxRows  = 16;   /* decode passes; a wider pass makes no predic
 constexpr int kXpMaxK     = 16;
 constexpr int kXpMaxNe    = 512;
 constexpr int kXpMaxPools = 4;
-constexpr int kXpParts    = 4;    /* the weights one expert's unit is made of */
+/* The table entries one expert's unit is redirected through: four weights for the FP8 / IQR experts
+ * (gate_up and down, codes and scales), seven EXL3 planes for DeepSeek-V4.1's (gate_up codes, suh, suh.1,
+ * svh; down codes, suh, svh), down's suh in two tables (gate_up reads it too) -- eight entries
+ * (lever 1U-XP, ds41-int11b). Unused entries are null. */
+constexpr int kXpParts    = 8;
+/* The widest router input the predictor takes (xp_logits holds n_embd / 256 weight loads a lane):
+ * 4096 before lever 1U-XP, DeepSeek-V4.1's 5120 since. */
+constexpr int kXpMaxEmbd  = 5120;
+/* Selection keys the plan can rank by: the router's logits (softmax order), or DeepSeek-V4's
+ * sqrt(softplus(logit)) + the correction bias (router_scored_topk's selection key, lever 1U-XP). */
+enum { kXpScoreLogit = 0, kXpScoreSqrtSoftplusBias = 1 };
 
 /* One copied unit: its table entries, what they held and what they hold while patched, and where the
  * layer's routing counts say whether the step used it. */
@@ -85,6 +95,6 @@ extern "C" int rad_xp_plan_launch(const float* logits, uint32_t rows, uint32_t n
                                   void** const* map, const int32_t* place, const int32_t* cnt,
                                   rad::XpPools pools, uint64_t ring, uint64_t ring_stride, rad::XpRec* rec,
                                   int32_t* nrec, rad::XpBox* box, uint32_t seq, rad::XpStats* stats,
-                                  void* stream);
+                                  const float* bias, int score, void* stream);
 extern "C" int rad_xp_step_launch(const rad::XpRec* rrec, const int32_t* rn, const rad::XpRec* prec,
                                   const int32_t* pn, const uint32_t* done, uint32_t seq, void* stream);

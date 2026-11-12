@@ -1081,9 +1081,9 @@ int Engine::apply_rope_scaling() {
 /* RADIANCE_XPREFETCH=0 (or off; lever VA "xpoff", read once): no next-layer expert prefetch -- its
  * DMA queue is never opened, its stream, ring and buffers (xp_device_bytes) leave the VRAM budget, and
  * that VRAM goes to the split like any other. Exact: the prefetch only copies expert bytes early into
- * a ring the step may read them from instead of the pool. On DeepSeek-V4.1 it predicts nothing anyway
- * (Ctx::xp_predict_run takes a router input of at most 4096 columns; the model's is 5120). Unset: as
- * before. */
+ * a ring the step may read them from instead of the pool. On DeepSeek-V4.1 it predicts only under lever
+ * 1U-XP (RADIANCE_DS41_XP=1 links the layers, fn4 ds41_xp; the predictor takes up to 5120 columns since
+ * ds41-int11b); otherwise its ring is allocated for nothing. Unset: as before. */
 static bool xprefetch_env_off() {
     static const bool off = [] {
         const char* e = getenv("RADIANCE_XPREFETCH");

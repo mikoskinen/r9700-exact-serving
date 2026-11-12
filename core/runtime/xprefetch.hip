@@ -15,10 +15,14 @@ __device__ __forceinline__ float xp_bf(uint32_t x) { return __uint_as_float(x <<
  * launcher checks). The grid is wide on purpose: the router input is read in place and overwritten
  * once the block's GEMMs finish, so a narrower grid waiting for CUs reads it too late. */
 constexpr uint32_t kLgE = 16, kLgJ = 16, kLgLds = 40u << 10;
+/* Lever 1U-XP (ds41-int11b): JM weight loads a lane, 16 up to 4096 columns (the kernel as before) and 20 up to
+ * DeepSeek-V4.1's 5120 (kXpMaxEmbd). Only the prediction reads it. */
+constexpr uint32_t kLgJWide = (uint32_t)rad::kXpMaxEmbd / 256u;
 /* On gfx9-4-generic LLVM does not unroll the row loop inside the unrolled K loop and warns per
  * copy; other targets unroll it. Silenced for this kernel only. */
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
+template <uint32_t JM>
 __global__ __launch_bounds__(256) void xp_logits(const uint16_t* __restrict__ h,
                                                  const uint16_t* __restrict__ w, float* __restrict__ lg,
                                                  uint32_t rows, uint32_t n_embd, uint32_t ne) {
@@ -26,11 +30,11 @@ __global__ __launch_bounds__(256) void xp_logits(const uint16_t* __restrict__ h,
     const uint32_t lane = threadIdx.x % 32u, grp = threadIdx.x / 32u;
     const uint32_t e0 = blockIdx.x * kLgE + grp * 2u;
     const uint32_t J = n_embd / 256u;
-    uint4 wv[2][kLgJ];
+    uint4 wv[2][JM];
 #pragma unroll
     for (int a = 0; a < 2; ++a)
 #pragma unroll
-        for (uint32_t j = 0; j < kLgJ; ++j)
+        for (uint32_t j = 0; j < JM; ++j)
             if (j < J && e0 + a < ne) wv[a][j] = ((const uint4*)(w + (size_t)(e0 + a) * n_embd))[j * 32u + lane];
     float acc[2][rad::kXpMaxRows];
 #pragma unroll
@@ -48,7 +52,7 @@ __global__ __launch_bounds__(256) void xp_logits(const uint16_t* __restrict__ h,
         }
         __syncthreads();
 #pragma unroll
-        for (uint32_t j = 0; j < kLgJ; ++j) {
+        for (uint32_t j = 0; j < JM; ++j) {
             if (j < j0 || j >= j1) continue;
             float wf[2][8];
 #pragma unroll
@@ -100,7 +104,8 @@ __global__ __launch_bounds__(256) void xp_plan(const float* __restrict__ lg, uin
                                                const int32_t* __restrict__ place,
                                                const int32_t* __restrict__ cnt, rad::XpPools pools,
                                                uint64_t ring, uint64_t rs, rad::XpRec* rec, int32_t* nrec,
-                                               rad::XpBox* box, uint32_t seq, rad::XpStats* stats) {
+                                               rad::XpBox* box, uint32_t seq, rad::XpStats* stats,
+                                               const float* __restrict__ bias, int score) {
     constexpr int NC = rad::kXpMaxRows * rad::kXpMaxK;
     __shared__ int      s_e[NC];
     __shared__ float    s_pr[NC];
@@ -129,6 +134,13 @@ __global__ __launch_bounds__(256) void xp_plan(const float* __restrict__ lg, uin
         for (uint32_t i = 0; i < 16; ++i) {
             const uint32_t e = lane + i * warpSize;
             v[i] = e < ne ? lg[(size_t)r * ne + e] : -INFINITY;
+            /* lever 1U-XP: DeepSeek-V4's selection key, sqrt(softplus(logit)) + the correction bias (the
+             * rank and its softmax below then follow the key; a prediction only) */
+            if (score == rad::kXpScoreSqrtSoftplusBias && e < ne) {
+                const float x = v[i];
+                const float sp = x > 20.f ? x : log1pf(__expf(x));
+                v[i] = sqrtf(sp) + (bias ? bias[e] : 0.f);
+            }
             m = fmaxf(m, v[i]);
         }
         for (int o = warpSize / 2; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o));
@@ -287,9 +299,13 @@ __global__ __launch_bounds__(128) void xp_step(const rad::XpRec* __restrict__ rr
 
 extern "C" int rad_xp_logits_launch(const uint16_t* h, const uint16_t* w, float* logits, uint32_t rows,
                                     uint32_t n_embd, uint32_t ne, void* stream) {
-    if (rows == 0 || rows > (uint32_t)rad::kXpMaxRows || n_embd % 256u || n_embd > 256u * kLgJ) return -1;
-    hipLaunchKernelGGL(xp_logits, dim3((ne + kLgE - 1) / kLgE), dim3(256), 0, (hipStream_t)stream, h, w,
-                       logits, rows, n_embd, ne);
+    if (rows == 0 || rows > (uint32_t)rad::kXpMaxRows || n_embd % 256u || n_embd > 256u * kLgJWide) return -1;
+    if (n_embd <= 256u * kLgJ)
+        hipLaunchKernelGGL(xp_logits<kLgJ>, dim3((ne + kLgE - 1) / kLgE), dim3(256), 0, (hipStream_t)stream, h, w,
+                           logits, rows, n_embd, ne);
+    else
+        hipLaunchKernelGGL(xp_logits<kLgJWide>, dim3((ne + kLgE - 1) / kLgE), dim3(256), 0, (hipStream_t)stream, h,
+                           w, logits, rows, n_embd, ne);
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -297,10 +313,10 @@ extern "C" int rad_xp_plan_launch(const float* logits, uint32_t rows, uint32_t n
                                   void** const* map, const int32_t* place, const int32_t* cnt,
                                   rad::XpPools pools, uint64_t ring, uint64_t ring_stride, rad::XpRec* rec,
                                   int32_t* nrec, rad::XpBox* box, uint32_t seq, rad::XpStats* stats,
-                                  void* stream) {
+                                  const float* bias, int score, void* stream) {
     if (k == 0 || k > (uint32_t)rad::kXpMaxK || ne > (uint32_t)rad::kXpMaxNe) return -1;
     hipLaunchKernelGGL(xp_plan, dim3(1), dim3(256), 0, (hipStream_t)stream, logits, rows, ne, k, map, place,
-                       cnt, pools, ring, ring_stride, rec, nrec, box, seq, stats);
+                       cnt, pools, ring, ring_stride, rec, nrec, box, seq, stats, bias, score);
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

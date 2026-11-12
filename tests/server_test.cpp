@@ -5385,7 +5385,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kSchedRowCap + 1, (int)fn4::kDs41MixWv);   /* ds41-int11: levers 1U-MX, 1U-GQ, 1U-E2, appended */
     CHECK_EQ((int)fn4::kDs41MixWv + 1, (int)fn4::kDs41Gq);
     CHECK_EQ((int)fn4::kDs41Gq + 1, (int)fn4::kDs41E2);
-    CHECK_EQ((int)fn4::kDs41E2 + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kDs41E2 + 1, (int)fn4::kDs41Xp);   /* ds41-int11b: lever 1U-XP, appended */
+    CHECK_EQ((int)fn4::kDs41Xp + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
     CHECK_EQ((int)fn4::kPlaceHb, 49);
     CHECK_EQ((int)fn4::kStageFullPick, 51);
@@ -5394,7 +5395,18 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kSchedRowCap, 56);
     CHECK_EQ((int)fn4::kDs41MixWv, 57);
     CHECK_EQ((int)fn4::kDs41E2, 59);
-    CHECK_EQ((int)fn4::kSwitches, 60);
+    CHECK_EQ((int)fn4::kDs41Xp, 60);
+    CHECK_EQ((int)fn4::kSwitches, 61);
+    CHECK_EQ(fn4::switch_index("ds41_xp"), (int)fn4::kDs41Xp);
+    CHECK(!fn4::sched_switch(fn4::kDs41Xp));
+    {   /* ds41-int11b: no plugin serves ds41_xp here: refused; GET "xp" present with 0s (no prefetch published) */
+        const HttpResponse r = f.post("/admin/fn4", R"({"ds41_xp":1})");
+        CHECK_EQ(r.status, 400);
+        CHECK(has(r.body, "no loaded plugin serves it"));
+        const HttpResponse gx = f.get("/admin/fn4");
+        CHECK(has(gx.body, "\"xp\": {\"ranks\": 0, \"copied\": 0, \"routed\": 0, \"planned\": 0, \"dropped\": 0, "
+                           "\"rests\": 0}"));
+    }
     CHECK_EQ(fn4::switch_index("ds41_mix_wv"), (int)fn4::kDs41MixWv);
     CHECK_EQ(fn4::switch_index("ds41_gq"), (int)fn4::kDs41Gq);
     CHECK_EQ(fn4::switch_index("ds41_e2"), (int)fn4::kDs41E2);
