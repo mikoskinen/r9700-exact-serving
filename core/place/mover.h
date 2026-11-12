@@ -444,23 +444,28 @@ struct MoverCounters {
  * way a unit enters a lent slot), of which `fills_lf` ranked by lever LF and `fills_hot` of a unit with a short
  * heat of at least 1 (routed off the device in the last steps: a just-missed expert); drops out of them by cause:
  * `drop_victim` a swap's demotion (the heat engine chose it as the coldest), `drop_reserve` balance() rebuilding
- * the working slots, `drop_recall` a shrinking loan (balance()'s sweep or reclaim()). */
+ * the working slots, `drop_recall` a shrinking loan (balance()'s sweep or reclaim()). ds41-swl: `swaps` heat promotions
+ * (Mover::issue) into a free lent slot under lever SWL (fn4 place_swap_lent 1); 0 while it is off, since only fill()
+ * puts a unit in a lent slot then. */
 struct LentStats {
     static constexpr int kN = 4;
     int64_t  covered[kN] = {}, held[kN] = {};
     uint64_t fills[kN] = {}, fills_lf[kN] = {}, fills_hot[kN] = {};
     uint64_t drop_victim[kN] = {}, drop_reserve[kN] = {}, drop_recall[kN] = {};
+    uint64_t swaps[kN] = {};
 };
 struct LentCounters {
     static constexpr int kN = LentStats::kN;
     Relaxed<int64_t>  covered[kN], held[kN];
     Relaxed<uint64_t> fills[kN], fills_lf[kN], fills_hot[kN], drop_victim[kN], drop_reserve[kN], drop_recall[kN];
+    Relaxed<uint64_t> swaps[kN];
     LentStats snapshot() const {
         LentStats s;
         for (int k = 0; k < kN; ++k) {
             s.covered[k] = covered[k];          s.held[k] = held[k];
             s.fills[k] = fills[k];              s.fills_lf[k] = fills_lf[k];      s.fills_hot[k] = fills_hot[k];
             s.drop_victim[k] = drop_victim[k];  s.drop_reserve[k] = drop_reserve[k]; s.drop_recall[k] = drop_recall[k];
+            s.swaps[k] = swaps[k];
         }
         return s;
     }
@@ -799,6 +804,15 @@ public:
      * Set between steps (every rank thread parked). Placement only. */
     void set_place_lf(bool on) { place_lf_ = on; }
     bool place_lf() const { return place_lf_; }
+    /* Lever SWL (ds41-swl, fn4 place_swap_lent): true lets a heat promotion (issue()) take a free LENT slot when no
+     * budgeted swap slot (below ClassPools::n_hot_lo) is free; the lowest free slot either way, so a budgeted one
+     * still goes first. false (the default) is today's: budgeted swap slots only, else `starved_slab` (the filter
+     * came with upstream 7938081; before it, any free slot). A unit promoted into a lent slot is fill()'s case from
+     * there on: promote_to() keeps its host copy, so a demotion, balance()'s reserve and sweep, an arena / KV
+     * recall (reclaim()) and lever DL / Z0-W's recalls drop it by a change of address, behind the quarantine.
+     * Set between steps (every rank thread parked); an atomic only so /stats may read it. Placement only. */
+    void set_swap_lent(bool on) { swap_lent_.store(on, std::memory_order_relaxed); }
+    bool swap_lent() const { return swap_lent_.load(std::memory_order_relaxed); }
 
 private:
     /* One in-flight relocation: Free -> Copying -> Published -> Quarantine -> Free. Transfers
@@ -1040,6 +1054,7 @@ private:
      * the slot `unit` now sits in (SlotClass). */
     LentCounters         lent_;
     bool                 place_lf_ = false;
+    std::atomic<bool>    swap_lent_{false};   /* lever SWL (set_swap_lent) */
     int  lender_of(const ClassPools& cp, int64_t slot) const;
     void note_slot(int32_t unit, HeatEngine* heat) const;
     enum DropCause { kDropOther = 0, kDropVictim = 1, kDropReserve = 2, kDropRecall = 3 };

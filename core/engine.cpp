@@ -932,6 +932,31 @@ int Engine::prepare_release(const RadBatch* b) {
                 for (auto& r : ranks_) r->mover.set_place_lf(on == 1);
                 fn4::note_sched(fn4::kPlaceLf, on);
             }
+            /* Levers SWL / L2 (ds41-swl): every rank's mover (read by its next issue()) and heat engine (read by its
+             * next step()), every rank thread parked; fn4 refuses a change unless every rank places dynamically. The
+             * slots already taken and the units already resident stay where they are. */
+            if (sw[fn4::kPlaceSwapLent] != fn4::kNoChange) {
+                const int on = sw[fn4::kPlaceSwapLent] == 1 && swl_capable_ ? 1 : 0;
+                swl_on_.store(on, std::memory_order_relaxed);
+                for (auto& r : ranks_) r->mover.set_swap_lent(on == 1);
+                fn4::note_sched(fn4::kPlaceSwapLent, on);
+            }
+            if (sw[fn4::kHeatMinGainX100] != fn4::kNoChange) {
+                if (swl_capable_) {
+                    const int v = std::min(std::max(sw[fn4::kHeatMinGainX100], 0), kHeatMinGainX100Max);
+                    for (auto& r : ranks_)
+                        if (r->heat.enabled()) r->heat.set_min_gain(heat_x100(v));
+                }
+                fn4::note_sched(fn4::kHeatMinGainX100, (int)ranks_[0]->heat.min_gain_x100());
+            }
+            if (sw[fn4::kHeatHystX100] != fn4::kNoChange) {
+                if (swl_capable_) {
+                    const int v = std::min(std::max(sw[fn4::kHeatHystX100], kHeatHystX100Min), kHeatHystX100Max);
+                    for (auto& r : ranks_)
+                        if (r->heat.enabled()) r->heat.set_hysteresis(heat_x100(v));
+                }
+                fn4::note_sched(fn4::kHeatHystX100, (int)ranks_[0]->heat.hysteresis_x100());
+            }
             /* Lever SA (ds41-sahb): read by the next arena_step (fn4 refuses stage_short > 0 unless set up). */
             if (sw[fn4::kStageShort] != fn4::kNoChange) {
                 stage_short_.store(sa_capable_ ? std::max(0, sw[fn4::kStageShort]) : 0, std::memory_order_relaxed);
@@ -3244,6 +3269,12 @@ int Engine::run_server() {
                             er.lent_drop_recall[k]  = (int64_t)ls.drop_recall[k];
                         }
                         er.place_lf = lf_on_.load(std::memory_order_relaxed);
+                        /* ds41-swl: each rank's own SWL / L2 state and its heat promotions into lent slots */
+                        er.place_swl = rk->mover.swap_lent() ? 1 : 0;
+                        er.heat_min_gain_x100 = (int)rh.min_gain_x100();
+                        er.heat_hyst_x100 = (int)rh.hysteresis_x100();
+                        for (int k = 0; k < LentStats::kN && k < server::ExpertPlane::Rank::kLenders; ++k)
+                            er.lent_swaps[k] = (int64_t)ls.swaps[k];
                     }
                     s.experts.ranks.push_back(er);
                 }

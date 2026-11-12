@@ -116,6 +116,7 @@ void populated(LiveSnapshot& s) {
             er.lent_covered[0] = 30; er.lent_held[0] = 28; er.lent_fills[2] = 11; er.lent_fills_lf[2] = 6;
             er.lent_fills_hot[2] = 5; er.lent_drop_victim[1] = 3; er.lent_drop_reserve[0] = 2; er.lent_drop_recall[2] = 1;
             er.place_lf = 1;
+            er.place_swl = 1; er.heat_min_gain_x100 = 75; er.heat_hyst_x100 = 125; er.lent_swaps[1] = 13;   /* ds41-swl */
         }
         s.experts.ranks.push_back(er);
     }
@@ -298,6 +299,12 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s["experts"]["ranks"][1]["lent"]["kv"].value("drop_reserve", (int64_t)0), (int64_t)2);
     CHECK_EQ(s["experts"]["ranks"][1]["lent"]["dslab"].value("drop_recall", (int64_t)0), (int64_t)1);
     CHECK_EQ(s["experts"]["ranks"][1].value("place_lf", 0), 1);
+    /* ds41-swl: lever SWL's heat promotions into lent slots and the rank's SWL / L2 state */
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["arena"].value("swaps", (int64_t)0), (int64_t)13);
+    CHECK_EQ(s["experts"]["ranks"][1]["lent"]["kv"].value("swaps", (int64_t)-1), (int64_t)0);
+    CHECK_EQ(s["experts"]["ranks"][1].value("place_swl", 0), 1);
+    CHECK_EQ(s["experts"]["ranks"][1].value("heat_min_gain_x100", 0), 75);
+    CHECK_EQ(s["experts"]["ranks"][1].value("heat_hyst_x100", 0), 125);
     CHECK_EQ(s["link"].value("stream_bytes", (int64_t)0), (int64_t)700);
     CHECK_EQ(s["link"].value("kv_stream_bytes", (int64_t)0), (int64_t)600);
     CHECK(s["link"].value("kv_streaming", false));

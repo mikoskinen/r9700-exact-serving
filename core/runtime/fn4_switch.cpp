@@ -34,7 +34,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
-                                        "exl3_x3d" };
+                                        "exl3_x3d", "place_swap_lent", "heat_min_gain_x100", "heat_hyst_x100" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -85,6 +85,7 @@ struct State {
     std::atomic<int> arena_d0_capable{-1};  /* lever Z0-A: -1 no engine registered, 0 / 1 */
     std::atomic<int> draft_w_capable{-1};   /* lever Z0-W: -1 no engine registered, 0 / 1 */
     std::atomic<int> place_lf_capable{-1};  /* lever LF: -1 no engine registered, 0 / 1 */
+    std::atomic<int> swl_capable{-1};       /* levers SWL / L2 (ds41-swl): -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> lendw[5];          /* note_lend_w */
     std::atomic<int64_t> ctxs[8];        /* note_ctxskip */
     std::atomic<int> sample_capable{-1};   /* draft_sample: -1 no engine registered, 0 / 1 */
@@ -306,7 +307,8 @@ bool sched_switch(int i) {
            i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow ||
            i == kDraftCtxSkip || i == kDraftLendHyst || i == kArenaD0 || i == kDraftLendW ||
            i == kDraftOcc || i == kDraftOccK || i == kPlaceLf || i == kDs41PskK || i == kStageShort ||
-           i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick;
+           i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick ||
+           i == kPlaceSwapLent || i == kHeatMinGainX100 || i == kHeatHystX100;   /* ds41-swl: the engine's, as place_lf */
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -433,6 +435,7 @@ void ctxskip_register(bool capable) { st().ctxskip_capable.store(capable ? 1 : 0
 void arena_d0_register(bool capable) { st().arena_d0_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void draft_w_register(bool capable) { st().draft_w_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void place_lf_register(bool capable) { st().place_lf_capable.store(capable ? 1 : 0, std::memory_order_release); }
+void swl_register(bool capable) { st().swl_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void sahb_register(bool stage_capable, bool hb_capable) {
     State& s = st();
     s.stage_capable.store(stage_capable ? 1 : 0, std::memory_order_release);
@@ -680,7 +683,8 @@ bool check(const std::string& name, int v, std::string* err) {
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
-                        "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, epoch_bump)";
+                        "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, "
+                        "epoch_bump)";
         return false;
     }
     State& s = st();
@@ -747,6 +751,25 @@ bool check(const std::string& name, int v, std::string* err) {
                 *err = std::string("place_lf=1 refused: ") +
                        (cap < 0 ? "no engine has registered its placement"
                                 : "placement is static here (no heat engine on every rank): nothing fills lent slots");
+            return false;
+        }
+        return true;
+    }
+    if (i == kPlaceSwapLent || i == kHeatMinGainX100 || i == kHeatHystX100) {   /* levers SWL / L2 (ds41-swl) */
+        const int lo = i == kHeatHystX100 ? 100 : 0, hi = i == kPlaceSwapLent ? 1 : i == kHeatMinGainX100 ? 10000 : 1000;
+        if (v < lo || v > hi) {
+            if (err)
+                *err = i == kPlaceSwapLent ? "place_swap_lent takes 1 (a heat promotion may take a free lent slot) or 0 (off)"
+                     : i == kHeatMinGainX100 ? "heat_min_gain_x100 takes 0 .. 10000 (the heat guard's min_gain x 100; 150 shipped)"
+                                             : "heat_hyst_x100 takes 100 .. 1000 (the heat guard's hysteresis x 100; 125 shipped)";
+            return false;
+        }
+        const int cap = s.swl_capable.load(std::memory_order_acquire);
+        if ((i != kPlaceSwapLent || v == 1) && cap != 1) {
+            if (err)
+                *err = std::string(kNames[i]) + "=" + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "no engine has registered its placement"
+                                : "placement is static here (no heat engine on every rank): no heat promotion to steer");
             return false;
         }
         return true;

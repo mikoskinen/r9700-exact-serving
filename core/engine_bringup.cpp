@@ -3339,6 +3339,20 @@ static HeatParams heat_params_from_env() {
     if (num("RADIANCE_PLACE_LF_DECAY", &v) && v > 0.0f && v < 1.0f) hp.long_decay = v;
     /* Lever HB (ds41-sahb): the long-memory prefill heat's decay (HeatParams::hb_decay), read only under fn4 place_hb. */
     if (num("RADIANCE_PLACE_HB_DECAY", &v) && v > 0.0f && v < 1.0f) hp.hb_decay = v;
+    /* Lever L2 (ds41-swl): the swap guard's halves at start, in hundredths (heat_env_x100: "1.5", "0.75"); unset: the
+     * shipped 1.5 / 1.25, untouched. fn4 heat_min_gain_x100 / heat_hyst_x100 change them between steps. */
+    if (const char* e = getenv("RADIANCE_HEAT_MIN_GAIN"); e && *e) {
+        const int x = heat_env_x100(e, 0, kHeatMinGainX100Max);
+        if (x >= 0) hp.min_gain = heat_x100(x);
+        else RAD_WARN("RADIANCE_HEAT_MIN_GAIN=%s is not 0 .. 100 (hundredths); the heat engine keeps min_gain %.2f", e,
+                      (double)hp.min_gain);
+    }
+    if (const char* e = getenv("RADIANCE_HEAT_HYSTERESIS"); e && *e) {
+        const int x = heat_env_x100(e, kHeatHystX100Min, kHeatHystX100Max);
+        if (x >= 0) hp.hysteresis = heat_x100(x);
+        else RAD_WARN("RADIANCE_HEAT_HYSTERESIS=%s is not 1 .. 10 (hundredths); the heat engine keeps hysteresis %.2f", e,
+                      (double)hp.hysteresis);
+    }
     return hp;
 }
 
@@ -4815,6 +4829,28 @@ int Engine::start() {
                      lf_capable_ ? (double)heat_params_from_env().long_decay : 0.0);
         fn4::place_lf_register(lf_capable_);
         fn4::note_sched(fn4::kPlaceLf, on);
+    }
+    /* Levers SWL / L2 (ds41-swl, fn4 place_swap_lent / heat_min_gain_x100 / heat_hyst_x100): heat promotions into free
+     * lent slots, and the heat guard. They can act wherever every rank places dynamically (lever LF's condition).
+     * RADIANCE_PLACE_SWAP_LENT=1 starts SWL on; RADIANCE_HEAT_MIN_GAIN / _HYSTERESIS set the guard at start
+     * (heat_params_from_env; the heat engine's start line shows it). Unset: today's, and nothing is logged. */
+    {
+        swl_capable_ = lf_capable_;
+        const char* e = getenv("RADIANCE_PLACE_SWAP_LENT");
+        const int on = swl_capable_ && e && std::atoi(e) == 1 ? 1 : 0;
+        swl_on_.store(on, std::memory_order_relaxed);
+        for (auto& r : ranks_) r->mover.set_swap_lent(on == 1);
+        if (e && *e)
+            RAD_INFO("heat promotions into free lent slots (lever SWL, RADIANCE_PLACE_SWAP_LENT=%s, fn4 place_swap_lent): %s",
+                     e, !swl_capable_ ? "not available (a static plan)" : on ? "on" : "off");
+        fn4::swl_register(swl_capable_);
+        fn4::note_sched(fn4::kPlaceSwapLent, on);
+        const HeatParams hp0 = heat_params_from_env();
+        const bool h0 = !ranks_.empty() && ranks_[0]->heat.enabled();
+        fn4::note_sched(fn4::kHeatMinGainX100, h0 ? (int)ranks_[0]->heat.min_gain_x100()
+                                                  : (int)std::lround((double)hp0.min_gain * 100.0));
+        fn4::note_sched(fn4::kHeatHystX100, h0 ? (int)ranks_[0]->heat.hysteresis_x100()
+                                               : (int)std::lround((double)hp0.hysteresis * 100.0));
     }
     /* Lever SA / HB (ds41-sahb). */
     sahb_setup();

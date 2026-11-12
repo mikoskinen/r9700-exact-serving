@@ -5902,4 +5902,215 @@ TEST(lever_lf_fills_lent_slots_by_the_long_memory_heat) {
     CHECK_EQ(on.bad, 0);
 }
 
+/* ---- lever L2 (ds41-swl, fn4 heat_min_gain_x100 / heat_hyst_x100): the heat guard, settable between steps. The env
+ * forms (RADIANCE_HEAT_MIN_GAIN / _HYSTERESIS) parse to the switch's hundredths, the shipped values are 150 / 125 to
+ * the bit, and the bar `hot >= cold x hysteresis + min_gain` follows each setter from the next step() on, back to
+ * today's when set back. */
+TEST(lever_l2_heat_guard_parses_and_moves_the_bar) {
+    CHECK_EQ(heat_env_x100("1.5", 0, kHeatMinGainX100Max), 150);
+    CHECK_EQ(heat_env_x100("0.75", 0, kHeatMinGainX100Max), 75);
+    CHECK_EQ(heat_env_x100("1", 0, kHeatMinGainX100Max), 100);
+    CHECK_EQ(heat_env_x100("0", 0, kHeatMinGainX100Max), 0);
+    CHECK_EQ(heat_env_x100("100", 0, kHeatMinGainX100Max), 10000);
+    CHECK_EQ(heat_env_x100("100.01", 0, kHeatMinGainX100Max), -1);
+    CHECK_EQ(heat_env_x100("-0.5", 0, kHeatMinGainX100Max), -1);
+    CHECK_EQ(heat_env_x100("1.25", kHeatHystX100Min, kHeatHystX100Max), 125);
+    CHECK_EQ(heat_env_x100("0.9", kHeatHystX100Min, kHeatHystX100Max), -1);
+    CHECK_EQ(heat_env_x100("10.5", kHeatHystX100Min, kHeatHystX100Max), -1);
+    for (const char* bad : { "", "abc", "1.5x", "nan", " " })
+        CHECK_EQ(heat_env_x100(bad, 0, kHeatMinGainX100Max), -1);
+    CHECK_EQ(heat_env_x100(nullptr, 0, kHeatMinGainX100Max), -1);
+    const HeatParams shipped;
+    CHECK(heat_x100(150) == shipped.min_gain);
+    CHECK(heat_x100(125) == shipped.hysteresis);
+    CHECK(heat_x100(75) == 0.75f);
+    CHECK(heat_x100(100) == 1.0f);
+
+    HeatFixture hf;
+    HeatEngine h;
+    CHECK_OK(h.init(hf.plan, shipped));
+    CHECK_EQ(h.min_gain_x100(), (int64_t)150);
+    CHECK_EQ(h.hysteresis_x100(), (int64_t)125);
+    const int32_t hot = hf.unit_of_expert(7);
+    CHECK(hot >= 0 && h.tier(hot) != Tier::VRAM);
+    /* Every resident expert at heat 1, the pooled expert 7 at 2 (one credit, from zero: exact). */
+    std::vector<int32_t> counts(8, 0);
+    for (int32_t e = 0; e < 8; ++e) {
+        const int32_t u = hf.unit_of_expert(e);
+        if (u >= 0 && h.tier(u) == Tier::VRAM) counts[(size_t)e] = 1;
+    }
+    counts[7] = 2;
+    h.observe(0, counts.data(), 8);
+    CHECK(h.heat(hot) == 2.0f);
+    auto proposes = [&]() {
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        const bool got = !sw.empty() && sw[0].promote == hot;
+        for (const Swap& x : sw) h.abandon(x);
+        return got;
+    };
+    CHECK(!proposes());                          /* 2 < 1 x 1.25 + 1.5 */
+    h.set_min_gain(heat_x100(75));
+    CHECK_EQ(h.min_gain_x100(), (int64_t)75);
+    CHECK(proposes());                           /* 2 >= 1 x 1.25 + 0.75 */
+    h.set_hysteresis(heat_x100(200));
+    CHECK_EQ(h.hysteresis_x100(), (int64_t)200);
+    CHECK(!proposes());                          /* 2 < 1 x 2 + 0.75 */
+    h.set_hysteresis(heat_x100(125));
+    CHECK(proposes());
+    h.set_min_gain(heat_x100(100));
+    CHECK(!proposes());                          /* 2 < 1 x 1.25 + 1 */
+    h.set_min_gain(heat_x100(150));              /* today's, to the bit */
+    CHECK(h.min_gain() == shipped.min_gain && h.hysteresis() == shipped.hysteresis);
+    CHECK(!proposes());
+}
+
+/* ---- lever SWL (ds41-swl, fn4 place_swap_lent): a heat promotion may take a free LENT slot. The rig: a full loan, then
+ * swaps whose promotion takes a budgeted swap slot and whose victim is a lent unit (dropped: its lent slot comes free)
+ * until no budgeted slot is free -- every free slot is then a lent one, the state 63-74 % of DeepSeek's heat promotions
+ * starved in (res12). Off (today), the next promotion starves (starved_slab) and only its victim goes. On, it lands in
+ * a free lent slot, keeps its host copy (promote_to), is counted (lent.swaps) and classed (kSlotKV), and from there is a
+ * fill's unit: a demotion drops it by address, a shrinking loan's sweep (balance) and a synchronous recall (reclaim,
+ * with the promotion still in flight: the hard case) drop it without a copy across the link and leave no table entry
+ * naming a slot the loan gave back. Every unit's bytes stay where its table entry says throughout. */
+namespace {
+struct SwlCase {
+    int       swaps = 0;            /* swaps issued until the decisive one, that one included */
+    int32_t   hot = -1;             /* the decisive promotion's unit */
+    bool      taken = false;        /* right after the decisive swap: its promotion is in flight */
+    bool      hot_vram = false, hot_lent = false, victim_out = false, all_out = false, quiet = false;
+    uint64_t  starved = 0;          /* starved_slab on the decisive swap */
+    uint64_t  d2h = 0;              /* d2h bytes from the decisive swap through the drops of the lent units it concerns */
+    uint8_t   cls = 255;
+    int64_t   held_end = -1;
+    LentStats ls;
+    int       bad = 0;
+};
+/* mode 0: settle; a demotion of the promoted unit; then the loan shrunk to 0 (balance's sweep; its working-reserve
+ * rebuild may then demote budgeted units, a real copy, as today). mode 1: reclaim(0) at once, the promotion still in
+ * flight. */
+int swl_case(bool swl, int mode, SwlCase* out) {
+    LoanRig r(24);
+    RAD_TRY(r.build());
+    RAD_TRY(stamp_units(r, false, nullptr));
+    r.m.set_swap_lent(swl);
+    if (r.m.swap_lent() != swl) return RAD_E_STATE;
+    RAD_TRY(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        RAD_TRY(r.dispatch());
+    for (int k = 0; k < 64; ++k) {
+        int32_t hot = -1, cold = -1;
+        for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) {
+            if (!r.hf.plan.units[(size_t)u].movable || r.h.busy(u)) continue;
+            if (hot < 0 && r.h.tier(u) != Tier::VRAM) hot = u;
+            if (cold < 0 && r.h.tier(u) == Tier::VRAM && r.loan.inside(r.addr(u))) cold = u;
+        }
+        if (hot < 0 || cold < 0) return RAD_E_STATE;
+        const uint64_t st0 = r.m.stats().starved_slab, sw0 = r.m.lent_stats().swaps[Mover::kLendKV];
+        const uint64_t d2h0 = r.m.stats().d2h_bytes;
+        RAD_TRY(r.m.begin_dispatch(r.d++, &r.h));
+        r.work.run(r.compute);
+        Swap sw;
+        sw.promote = hot;
+        sw.demote = cold;
+        r.h.set_busy(hot, true);
+        r.h.set_busy(cold, true);
+        RAD_TRY(r.m.issue(sw, &r.h));                    /* the victim's drop goes out either way */
+        RAD_TRY(r.m.balance(&r.h));
+        ++out->swaps;
+        const bool starved = r.m.stats().starved_slab > st0;
+        const bool lent = r.m.lent_stats().swaps[Mover::kLendKV] > sw0;
+        if (!starved && !lent) {                         /* a budgeted slot took it: settle and go on */
+            for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+            if (r.loan.inside(r.addr(hot))) return RAD_E_STATE;
+            continue;
+        }
+        out->hot = hot;
+        out->starved = r.m.stats().starved_slab - st0;
+        out->taken = r.h.busy(hot);
+        if (mode == 1) {
+            RAD_TRY(r.m.reclaim(Mover::kLendKV, 0, &r.h));
+            out->hot_vram = r.h.tier(hot) == Tier::VRAM;
+            out->hot_lent = r.loan.inside(r.addr(hot));
+            out->d2h = r.m.stats().d2h_bytes - d2h0;
+        } else {
+            for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+            out->hot_vram = r.h.tier(hot) == Tier::VRAM;
+            out->hot_lent = r.loan.inside(r.addr(hot));
+            out->cls = r.h.slot_class(hot);
+            RAD_TRY(stamp_units(r, true, &out->bad));
+            if (out->hot_lent) {                         /* the heat engine's next victim is this unit: a drop */
+                RAD_TRY(r.m.begin_dispatch(r.d++, &r.h));
+                r.work.run(r.compute);
+                Swap dv;
+                dv.demote = hot;
+                r.h.set_busy(hot, true);
+                RAD_TRY(r.m.issue(dv, &r.h));
+                /* A drop publishes the host copy at issue (the fill may take the unit back once the slot clears). */
+                out->victim_out = r.h.tier(hot) != Tier::VRAM && !r.loan.inside(r.addr(hot));
+                for (Deadline dl; any_busy(r.h, r.hf.plan) && !dl.passed();) RAD_TRY(r.dispatch());
+                RAD_TRY(stamp_units(r, true, &out->bad));
+            }
+            out->d2h = r.m.stats().d2h_bytes - d2h0;
+            RAD_TRY(r.m.set_loan(Mover::kLendKV, 0));
+            for (Deadline dl; (r.m.loan_held(Mover::kLendKV) > 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+                RAD_TRY(r.dispatch());
+        }
+        out->held_end = r.m.loan_held(Mover::kLendKV);
+        out->all_out = true;
+        for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+            if (r.loan.inside(r.addr(u))) out->all_out = false;
+        out->quiet = !any_busy(r.h, r.hf.plan);
+        out->ls = r.m.lent_stats();
+        RAD_TRY(stamp_units(r, true, &out->bad));
+        return RAD_OK;
+    }
+    return RAD_E_STATE;
+}
+}  /* namespace */
+
+TEST(lever_swl_promotes_into_a_free_lent_slot_and_a_recall_drops_it) {
+    SwlCase off, on, fly;
+    CHECK_OK(swl_case(false, 0, &off));
+    CHECK_OK(swl_case(true, 0, &on));
+    CHECK_OK(swl_case(true, 1, &fly));
+    /* The same rig and the same swaps up to the decisive one: the budgeted swap slots ran out at the same point. */
+    CHECK(off.swaps >= 2);
+    CHECK_EQ(on.swaps, off.swaps);
+    CHECK_EQ(fly.swaps, off.swaps);
+    /* Off (today): the promotion starves and its unit is let go (the lent slots' fill may take it later); no heat
+     * promotion entered a lent slot. */
+    CHECK_EQ(off.starved, (uint64_t)1);
+    CHECK(!off.taken);
+    CHECK_EQ(off.ls.swaps[Mover::kLendKV], (uint64_t)0);
+    /* On: it lands in a KV-lent slot, classed as one, counted once. */
+    CHECK_EQ(on.starved, (uint64_t)0);
+    CHECK(on.taken);
+    CHECK(on.hot_vram && on.hot_lent);
+    CHECK_EQ((int)on.cls, (int)kSlotKV);
+    CHECK_EQ(on.ls.swaps[Mover::kLendKV], (uint64_t)1);
+    CHECK_EQ(on.ls.swaps[Mover::kLendArena], (uint64_t)0);
+    /* A demotion drops it by address (a victim drop, as every lent victim of the loop), and the shrink to 0 drops the
+     * rest (recall drops). */
+    CHECK(on.victim_out);
+    CHECK(on.ls.drop_victim[Mover::kLendKV] >= (uint64_t)(on.swaps + 1));
+    CHECK(on.ls.drop_recall[Mover::kLendKV] >= 1);
+    /* In flight at a synchronous recall: published, then dropped to its host copy before reclaim returns. */
+    CHECK_EQ(fly.starved, (uint64_t)0);
+    CHECK(fly.taken);
+    CHECK_EQ(fly.ls.swaps[Mover::kLendKV], (uint64_t)1);
+    CHECK(!fly.hot_vram && !fly.hot_lent);
+    CHECK(fly.ls.drop_recall[Mover::kLendKV] >= 1);
+    /* Every way: the lent units' drops crossed nothing over the link, the loan holds nothing at the end, no unit is read
+     * from inside it, nothing is left busy, and every unit's bytes are where its table entry says. */
+    for (const SwlCase* c : { &off, &on, &fly }) {
+        CHECK_EQ(c->d2h, (uint64_t)0);
+        CHECK_EQ(c->held_end, (int64_t)0);
+        CHECK(c->all_out);
+        CHECK(c->quiet);
+        CHECK_EQ(c->ls.held[Mover::kLendKV], (int64_t)0);
+        CHECK_EQ(c->bad, 0);
+    }
+}
+
 RAD_TEST_MAIN()
