@@ -143,6 +143,12 @@ struct HeatParams {
     /* The trunk's layer count: units of layers at or past it (a draft head's) are counted apart in the
      * slot-class counters (kSlotDraftOwn), whatever slot holds them. -1: every layer is the trunk's. */
     int32_t trunk_layers = -1;
+
+    /* Lever HB (ds41-sahb, fn4 place_hb): the long-memory prefill heat's decay, applied once a credited layer
+     * histogram of a step with prefill rows (dual heat only; a decode step leaves it). 0.8 weighs the last
+     * prompts 1, 0.8, 0.64, ...: the experts the recent prompts keep routing. Outside (0, 1): the default.
+     * RADIANCE_PLACE_HB_DECAY. */
+    float hb_decay = 0.8f;
 };
 
 /* Slot classes (ds41-lf, /stats experts.ranks[].slots): the slot a unit sits in while in VRAM, kept after it
@@ -379,6 +385,21 @@ public:
     uint8_t slot_class(int32_t unit) const { return scls_[(size_t)pos_[(size_t)unit]]; }
     /* The long-memory decode heat (HeatParams::long_decay); lever LF's fill ranking. */
     float heat_long(int32_t unit) const { return heat_l_[(size_t)pos_[(size_t)unit]]; }
+    /* ---- lever HB (ds41-sahb, fn4 place_hb): a reserve by the long-memory prefill heat -------------------------
+     *
+     * set_hb_reserve(R), R > 0, dual heat only: from the next step() on, the R units of each slab class with the
+     * highest long-memory prefill heat (heat_pl_, HeatParams::hb_decay; never one at zero) rank kResBonus above
+     * their heat -- above every unprotected resident and below every decode-pinned one (kPinBonus) -- so ordinary
+     * swaps promote them (against the coldest unprotected residents) and none of them is a victim while reserved.
+     * 0: no bonus (today's ranking; the heat itself is still kept, which changes no other heat). Placement only. */
+    void set_hb_reserve(int32_t r) { hb_r_ = r > 0 && dual() ? r : 0; }
+    int32_t hb_reserve() const { return hb_r_; }
+    float heat_prefill_long(int32_t unit) const {
+        return heat_pl_.empty() ? 0.0f : heat_pl_[(size_t)pos_[(size_t)unit]];
+    }
+    /* The reserve as the last step() set it: units holding it, of them resident; promotions it proposed (cumulative). */
+    struct HbStats { int64_t reserved = 0, resident = 0, promotions = 0; };
+    HbStats hb_stats() const { return HbStats{ hb_reserved_.load(), hb_resident_.load(), (int64_t)hb_promotions_.load() }; }
     /* By value, readable from the HTTP thread (relaxed counters). */
     SlotStats slot_stats() const {
         SlotStats s;
@@ -428,6 +449,15 @@ private:
     std::vector<float>   pin_thr_;
     std::vector<std::vector<float>> pin_tmp_;
     void update_pin();
+    /* Lever HB: the long-memory prefill heat by position (dual heat only), the reserve's size, and per class the
+     * long prefill heat from which a unit holds it (+inf: none). */
+    std::vector<float>   heat_pl_;
+    int32_t              hb_r_ = 0;
+    std::vector<float>   hb_thr_;
+    std::vector<std::vector<float>> hb_tmp_;
+    Relaxed<int64_t>     hb_reserved_, hb_resident_;
+    Relaxed<uint64_t>    hb_promotions_;
+    void update_reserve();
     void observe_dual(int32_t layer, const int32_t* counts, int32_t n, float w, uint64_t passes,
                       float share, float pshare);
     std::vector<int32_t> pos_;                /* unit -> position */

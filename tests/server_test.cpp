@@ -5366,6 +5366,67 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         const int32_t ah[1] = { 0 }, rw[1] = { 4096 };
         CHECK_EQ(fn4::psk_plan(7, 0, 1, ah, rw), -1);
     }
+    /* Lever SA / HB (ds41-sahb): stage_short 0 .. 65536, stage_pick 0 .. 64, place_hb 0 .. 4096, appended after
+     * ds41_psk_k; stage_short / place_hb > 0 refused until an engine registered them capable; GET "sahb" once
+     * registered, per rank. */
+    {
+        const HttpResponse g0 = f.get("/admin/fn4");
+        CHECK(has(g0.body, "\"ds41_psk_k\": 8, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0"));
+        CHECK(!has(g0.body, "\"sahb\": {"));
+        const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_short":1025})");
+        CHECK_EQ(s0.status, 400);
+        CHECK(has(s0.body, "no engine has registered it"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":-1})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":65537})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_pick":65})").status, 400);
+        CHECK_EQ(f.post("/admin/fn4", R"({"place_hb":4097})").status, 400);
+        fn4::sahb_register(false, false);
+        const HttpResponse s1 = f.post("/admin/fn4", R"({"stage_short":1025})");
+        CHECK_EQ(s1.status, 400);
+        CHECK(has(s1.body, "no prefill stager with a span's shared level"));
+        const HttpResponse h1 = f.post("/admin/fn4", R"({"place_hb":64})");
+        CHECK_EQ(h1.status, 400);
+        CHECK(has(h1.body, "no dual heat on every rank"));
+        CHECK(has(f.get("/admin/fn4").body, "\"sahb\": {\"stage_capable\": 0, \"hb_capable\": 0, \"ranks\": []}"));
+        fn4::sahb_register(true, true);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":1025,"stage_pick":2,"place_hb":128})").status, 200);
+        CHECK(fn4::apply_pending(43, sw));
+        CHECK_EQ(sw[fn4::kStageShort], 1025);
+        CHECK_EQ(sw[fn4::kStagePick], 2);
+        CHECK_EQ(sw[fn4::kPlaceHb], 128);
+        CHECK_EQ(sw[fn4::kDs41PskK], fn4::kNoChange);
+        fn4::note_sched(fn4::kStageShort, 1025);
+        fn4::note_sched(fn4::kStagePick, 2);
+        fn4::note_sched(fn4::kPlaceHb, 128);
+        const int64_t v1[fn4::kSahbN] = { 3, 120, 700, 7340032000, 700, 900, 5, 230, 2236000000, 690, 3, 128, 128, 97,
+                                          41, 1073741824 };
+        fn4::note_sahb(1, v1);
+        const HttpResponse g1 = f.get("/admin/fn4");
+        CHECK(has(g1.body, "\"stage_short\": 1025, \"stage_pick\": 2, \"place_hb\": 128"));
+        CHECK(has(g1.body, "\"sahb\": {\"stage_capable\": 1, \"hb_capable\": 1, \"ranks\": [{\"rank\": 0, "
+                           "\"short_steps\": 0"));
+        CHECK(has(g1.body, "{\"rank\": 1, \"short_steps\": 3, \"short_layers\": 120, \"short_units\": 700, "
+                           "\"short_bytes\": 7340032000, \"pick_kept\": 700, \"pick_dropped\": 900, \"big_steps\": 5, "
+                           "\"expect_units\": 230, \"expect_bytes\": 2236000000, \"expect_sum_units\": 690, "
+                           "\"expect_n\": 3, \"hb_reserve\": 128, \"hb_reserved\": 128, \"hb_resident\": 97, "
+                           "\"hb_promotions\": 41, \"sa_recall_bytes\": 1073741824}]}"));
+        /* Pinned at the same value: no epoch, nothing handed over. */
+        const uint64_t e1 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":1025})").status, 200);
+        CHECK(!fn4::apply_pending(44, sw));
+        CHECK_EQ(fn4::epoch(), e1);
+        CHECK_EQ(f.post("/admin/fn4", R"({"stage_short":0,"stage_pick":0,"place_hb":0})").status, 200);
+        CHECK(fn4::apply_pending(45, sw));
+        CHECK_EQ(sw[fn4::kStageShort], 0);
+        CHECK_EQ(sw[fn4::kPlaceHb], 0);
+        fn4::note_sched(fn4::kStageShort, 0);
+        fn4::note_sched(fn4::kStagePick, 0);
+        fn4::note_sched(fn4::kPlaceHb, 0);
+        const int64_t z[fn4::kSahbN] = {};
+        fn4::note_sahb(0, z);
+        fn4::note_sahb(1, z);
+        fn4::sahb_register(false, false);
+    }
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
     CHECK_EQ(sw[fn4::kDraftLend], -1);

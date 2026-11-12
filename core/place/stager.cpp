@@ -69,6 +69,31 @@ int PrefillStager::init(const Program& prog, const Plan& plan, Mover* mover, cha
     }
     if (layers_.empty()) return RAD_OK;
 
+    /* Lever SA: each layer's units by expert (the histogram's index, heat.cpp's position rule: the later of two
+     * units naming one expert), and the stamps. */
+    {
+        int32_t top = 0;
+        for (const Layer& L : layers_) top = std::max(top, L.layer + 1);
+        layer_ix_.assign((size_t)top, -1);
+        by_expert_.assign(layers_.size(), {});
+        for (size_t i = 0; i < layers_.size(); ++i) {
+            layer_ix_[(size_t)layers_[i].layer] = (int32_t)i;
+            for (int32_t u : layers_[i].units) {
+                const int32_t e = plan.units[(size_t)u].expert;
+                if (e < 0) continue;
+                std::vector<int32_t>& row = by_expert_[i];
+                if ((size_t)e >= row.size()) row.resize((size_t)e + 1, -1);
+                row[(size_t)e] = u;
+            }
+        }
+        stamp_.assign(plan.units.size(), -1);
+        recent_.clear();
+        sa_ = SahbStats{};
+        short_next_ = short_ = false;
+        pick_next_ = pick_ = 0;
+        one_.assign(1, -1);
+    }
+
     first_of_.assign(prog.ops.size(), -1);
     last_of_.assign(prog.ops.size(), -1);
     for (size_t i = 0; i < layers_.size(); ++i) {
@@ -122,6 +147,12 @@ bool PrefillStager::begin_pass(const RadBatch* b) {
     if (!b || b->draft_pass != 0) return false;
     armed_ = want_ != nullptr && enabled() && b->n_tok >= min_rows_;
     staged_ = armed_;
+    /* Lever SA: the step's set_short applies to this trunk pass; a pass of the stager's size reports what the last
+     * recorded step's routing would stream in place (armed or not). */
+    short_ = armed_ && short_next_;
+    pick_ = short_ ? pick_next_ : 0;
+    if (enabled() && b->n_tok >= min_rows_) expect_now();
+    if (short_) ++sa_.short_steps;
     if (!armed_) {
         withdraw_early();
         return false;
@@ -228,9 +259,31 @@ int PrefillStager::take(int64_t want, bool partial, int32_t* out) {
 int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     *got = kLater;
     const Layer& L = layers_[(size_t)li];
+    /* Lever SA: a stage_short pass under stage_pick K copies only the units one of the last K recorded steps routed;
+     * every other unit keeps its pool address (read in place). */
+    const std::vector<int32_t>* units = &L.units;
+    int64_t dropped = 0, kept = 0;
+    if (short_ && pick_ > 0) {
+        pick_buf_.clear();
+        for (int32_t u : L.units) {
+            one_[0] = u;
+            const bool pooled = mover_->stage_need(one_) > 0;
+            if (picked(u, pick_)) {
+                pick_buf_.push_back(u);
+                kept += pooled;
+            } else {
+                dropped += pooled;
+            }
+        }
+        units = &pick_buf_;
+    }
     int64_t unit = 0;
-    const int64_t need = mover_->stage_need(L.units, &unit);
-    if (need <= 0) { *got = kNone; return RAD_OK; }
+    const int64_t need = mover_->stage_need(*units, &unit);
+    if (need <= 0) {
+        if (short_) { sa_.pick_dropped += dropped; sa_.pick_kept += kept; }
+        *got = kNone;
+        return RAD_OK;
+    }
     if (!now && need > ring_ / 2) return RAD_OK;
     /* A place that wraps past the region's end is two stretches, and the first may end with less
      * room than a unit, so it asks for one unit extra. */
@@ -245,12 +298,18 @@ int PrefillStager::stage_layer(int32_t li, bool now, RadEvent gate, int* got) {
     const int64_t off = p.beg % ring_, len = p.end - p.beg;
     Mover::StageSpan sp[2] = { { base_ + off, std::min(len, ring_ - off) },
                                { base_, len - std::min(len, ring_ - off) } };
-    RAD_TRY(mover_->stage_units(L.units, sp, sp[1].cap > 0 ? 2 : 1, nullptr, p.done, &p.staged));
+    RAD_TRY(mover_->stage_units(*units, sp, sp[1].cap > 0 ? 2 : 1, nullptr, p.done, &p.staged));
+    if (short_) { sa_.pick_dropped += dropped; sa_.pick_kept += kept; }
     if (p.staged.empty()) {
         p.li = -1;
         spare_.push_back(i);
         *got = kNone;
         return RAD_OK;
+    }
+    if (short_) {
+        ++sa_.short_layers;
+        sa_.short_units += (int64_t)p.staged.size();
+        for (int32_t u : p.staged) sa_.short_bytes += mover_->unit_bytes_of(u);
     }
     head_ = p.end;
     ring_order_.push_back(i);
@@ -370,6 +429,55 @@ int PrefillStager::end_pass(RadStream s) {
         n_early_ = k + 1;
     }
     return RAD_OK;
+}
+
+/* ---- lever SA: the recent routing ---------------------------------------------------------------- */
+void PrefillStager::note_routed(int32_t layer, const int32_t* counts, int32_t n_expert, int32_t step) {
+    if (!counts || layer < 0 || (size_t)layer >= layer_ix_.size() || step < 0) return;
+    const int32_t li = layer_ix_[(size_t)layer];
+    if (li < 0) return;
+    if (recent_.empty() || step > recent_.back()) {
+        recent_.push_back(step);
+        while ((int)recent_.size() > kRecent) recent_.pop_front();
+        ++sa_.big_steps;
+    }
+    const std::vector<int32_t>& row = by_expert_[(size_t)li];
+    const int32_t n = std::min<int32_t>(n_expert, (int32_t)row.size());
+    for (int32_t e = 0; e < n; ++e)
+        if (counts[e] > 0 && row[(size_t)e] >= 0) {
+            int32_t& st = stamp_[(size_t)row[(size_t)e]];
+            st = std::max(st, step);
+        }
+}
+
+/* A unit's stamp is the last recorded step that routed it, so it was routed by one of the last k such steps exactly
+ * when its stamp is at least the k-th newest. */
+bool PrefillStager::picked(int32_t u, int k) const {
+    if (u < 0 || (size_t)u >= stamp_.size() || k <= 0 || recent_.empty()) return false;
+    const int32_t st = stamp_[(size_t)u];
+    if (st < 0) return false;
+    const size_t n = recent_.size();
+    const int32_t bar = recent_[n - std::min<size_t>(n, (size_t)k)];
+    return st >= bar;
+}
+
+/* What the last recorded step's routing would stream in place in this pass: the pooled units it routed. */
+void PrefillStager::expect_now() {
+    if (recent_.empty()) return;
+    int64_t nu = 0, nb = 0;
+    for (const Layer& L : layers_)
+        for (int32_t u : L.units) {
+            if (!picked(u, 1)) continue;
+            one_[0] = u;
+            const int64_t need = mover_->stage_need(one_);
+            if (need <= 0) continue;
+            ++nu;
+            nb += mover_->unit_bytes_of(u);
+        }
+    sa_.expect_units = nu;
+    sa_.expect_bytes = nb;
+    sa_.expect_sum_units += nu;
+    ++sa_.expect_n;
 }
 
 /* ================================================================== the file stager */
