@@ -47,8 +47,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_spprobe_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc (step_pipelined; RADIANCE_FN4_SPHC=1 declares) */
-        if (value < 0 || value > 1) return -1;
+    if (std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */
+        if (value < 0 || value > 2) return -1;
         if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SPHC")) return -1;
         qwen4exp_fp8::fn4_sp_flag().store(value, std::memory_order_relaxed);
         return 1;

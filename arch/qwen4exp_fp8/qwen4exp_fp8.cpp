@@ -2080,7 +2080,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * all-gather and the codes redone); spp, the speed probe (the quarter only, all-reduces kept, wrong output). A
      * piece takes SP when it has kSpMinRows rows; its quarter is the reduce-scatter's shard: q = ceil(rn / world),
      * rows [r0 + min(rank q, rn), r0 + min((rank + 1) q, rn)). */
-    const bool sp  = m.sp_on && g.world == 4 && !pair_on && fn4_sp_flag().load(std::memory_order_relaxed);
+    const int  spv = fn4_sp_flag().load(std::memory_order_relaxed);
+    const bool sp  = m.sp_on && g.world == 4 && !pair_on && spv > 0;
+    /* hc_sp 2 (12.11.2026): SP's issue order software-pipelined -- piece p + 1's connections beside piece p's all-gather and
+     * piece p + 1's all-gather beside piece p's codes and MoE (hc_sp 1 waits on every gather right after issuing it: three
+     * of four a layer on lane 0's path at two pieces). The same ops on the same rows: only the order of issue moves. */
+    const bool spo = sp && spv == 2;
     const bool spp = !sp && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
@@ -2208,6 +2213,35 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             l.mlp.pair_finish(c, T, r0(1), rn(1), pmode != 2);
             wait1();
             on1(true, [&] { l.mlp.issue_ar(c, r0(1), rn(1)); });
+        } else if (spo && [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return K >= 2; }()) {
+            /* fn4 hc_sp 2: every piece SP. Piece 0's connections (piece 1's mixer reduce-scatter beside them), one wait for
+             * both reduce-scatters (hw of piece 1 reads piece 1's), then per piece p: piece p + 1's connections beside piece
+             * p's gather, the wait, piece p + 1's gather and piece p - 1's MoE reduce-scatter beside piece p's codes + MoE.
+             * Piece p + 2's mixer reduce-scatter goes out before piece p + 1's write, so the wait at p covers it. */
+            if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; }
+            {
+                const bool ss0 = hw(l.hc_mix, 0);
+                bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
+                hr(l.hc_ffn, 0, ss0);
+                bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
+            }
+            wait1();
+            on1(true, [&] { ag_p(0); });
+            for (int64_t p = 0; p < K; ++p) {
+                if (p + 1 < K) {
+                    if (p + 2 < K && p + 2 >= issued) { on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3; }
+                    const bool ss = hw(l.hc_mix, p + 1);
+                    bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
+                    hr(l.hc_ffn, p + 1, ss);
+                    bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
+                }
+                wait1();
+                if (p + 1 < K) on1(true, [&] { ag_p(p + 1); });
+                if (sp_pend >= 0) { const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
+                l.hc_ffn.codes(c, r0(p), rn(p));
+                l.mlp.pass(c, T, r0(p), rn(p), false);
+                sp_pend = p;
+            }
         } else
         for (int64_t p = 0; p < K; ++p) {
             if (p + 1 < K && p + 1 >= issued) {
@@ -2269,7 +2303,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             }
         }
         /* fn4 SP-hc: the gathered inputs' codes on every row, before the next block reads them */
-        if (sp && nx) {
+        if (sp && nx && spo && !ple_next) {
+            /* hc_sp 2: the writes' last-piece wait already joined every gather but the last piece's: their codes beside it */
+            for (int64_t p = 0; p + 1 < K; ++p)
+                if (sp_p(p)) nx->hc_mix.codes(c, r0(p), rn(p));
+            wait1();
+            if (sp_p(K - 1)) nx->hc_mix.codes(c, r0(K - 1), rn(K - 1));
+        } else if (sp && nx) {
             wait1();
             for (int64_t p = 0; p < K; ++p)
                 if (sp_p(p)) nx->hc_mix.codes(c, r0(p), rn(p));
@@ -2555,8 +2595,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares) */
-        if (value < 0 || value > 1) return -1;
+    if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */
+        if (value < 0 || value > 2) return -1;
         if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SPHC")) return -1;
         qwen4exp_fp8::fn4_sp_flag().store(value, std::memory_order_relaxed);
         return 1;
