@@ -348,7 +348,7 @@
  *                   where the coded form fits (bf16, whole-wave shards, the slot); the rest plain. Exact: the coded wire
  *                   decodes the same values, folded in the same order. RADIANCE_DS41_ARCODED=N at load starts it at N.
  *                   GET "arc" carries its counters (arc_stats).
- *   ar_ll           libr4d (lever A3 / 1U-AR, ds41-ll; 63 here, after exl3_x3d): 0 off (today: the four-rank exact all-reduce
+ *   ar_ll           libr4d (lever A3 / 1U-AR, ds41-ll; 64 here, after exl3_x3d_pf (A10, 63)): 0 off (today: the four-rank exact all-reduce
  *                   and moe_gather_all_reduce_4rank hand off their data with a store drain and a flag word a block and
  *                   phase); 1 -- a message of at most 48 rows (the operand's elements over its last axis; the gather's M)
  *                   carries its flags in its data words instead (r4d_ar_ll.h: 8-byte units of three bf16 and a tag, the
@@ -356,7 +356,7 @@
  *                   N in 2 .. 48 -- at most N rows. Exact: the same words, the same fp32 ascending-rank fold rounded once.
  *                   RADIANCE_AR_LL=N at load starts it at N and builds the instances' LL areas (any value; unset: none,
  *                   and ar_ll takes only 0). GET "arll" carries its counters (arll_stats).
- *   chain_ds41      core (lever A5 / 1U-CHN, ds41-ll; 64 here): only where RADIANCE_CHAIN_DS41 (0 / 1) was set at start on
+ *   chain_ds41      core (lever A5 / 1U-CHN, ds41-ll; 65 here): only where RADIANCE_CHAIN_DS41 (0 / 1) was set at start on
  *                   the AQL backend, which then resolves every chainable row's chained form (whatever the plugin's
  *                   chain_pays); 1 -- a chained form launches chained (no barrier bit behind another chained kernel, a
  *                   wait in its prologue; core/device/aql.cpp), 0 -- it launches as its plain form. Launch mechanics
@@ -497,7 +497,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
-              kArLl, kChainDs41, kSwitches };
+              kExl3X3dPf, kArLl, kChainDs41, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
