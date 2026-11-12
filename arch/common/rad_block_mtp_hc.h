@@ -80,6 +80,9 @@
 namespace rad {
 namespace arch {
 
+/* fn4 MTP-FLAT switch (mtp_flat 0 / 1; RadMtp* op_enter_flat must be declared: RADIANCE_FN4_MTPFLAT=1 at start). */
+inline std::atomic<int>& fn4_mtpflat_flag() { static std::atomic<int> f{0}; return f; }
+
 /* Candidates the coarse 2-bit head proposes for exact rescoring (`logit_rerank` against the
  * full-precision head) before column 0 is read. The 2-bit head's top-1 differs from the exact one
  * often enough to cost acceptance; 8 is the reference implementation's value, which recovered
@@ -152,6 +155,9 @@ struct MtpHcBlock {
     MoeFP8       mlp{};
 
     rad_op op_gather = 0, op_embed = 0, op_embed_ar = 0, op_enter = 0, op_carry = 0;
+    /* fn4 MTP-FLAT (12.11.2026, ARCH-AUDIT-FN lever 1): mtp_enter at ngroup 1, the official flat pre-fc RMSNorm (vLLM / SGLang
+     * one rsqrt over the 10240 row); declared with RADIANCE_FN4_MTPFLAT=1 at start, picked by switch mtp_flat. Drafts only. */
+    rad_op op_enter_flat = 0;
 
     /* Media rows over the head's embedding (see MtpBlockFP8::media). Set before declare when the
      * program has an encoder. */
@@ -251,6 +257,18 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                                 RAD_STR("fc", fdt == RAD_F8E4M3 ? "e4m3" : "bf16")),
                      RAD_WEIGHTS(w_pre_h, w_pre_e, w_fc_h, w_fc_e)),
                  {w.hin, w.e}, {w.hw});
+    {
+        const char* e = std::getenv("RADIANCE_FN4_MTPFLAT");
+        if (e && *e && *e != '0' && ngroup != 1)
+            op_enter_flat = rw(b, RAD_OP(b, "mtp_enter",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", g.n_embd),
+                                             RAD_INT("hc", hc.hc), RAD_F64("eps", g.eps),
+                                             RAD_STR("dtype", g.dtype), RAD_F64("wadd", g.wadd),
+                                             RAD_INT("ngroup", 1),
+                                             RAD_STR("fc", fdt == RAD_F8E4M3 ? "e4m3" : "bf16")),
+                                  RAD_WEIGHTS(w_pre_h, w_pre_e, w_fc_h, w_fc_e)),
+                              {w.hin, w.e}, {w.hw});
+    }
     if (!op_gather || !op_embed || !op_enter) return RAD_E_INVAL;
 
     /* ---- the layer, as a trunk full-attention layer at index n_layer: gated residual, gated
@@ -485,7 +503,8 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
     if (op_embed_ar)
         RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.e, T), RAD_NONE);
 
-    RAD_ISSUE(c, op_enter, brows(w.hin, T), brows(w.e, T), RAD_W(w_pre_h), RAD_W(w_pre_e),
+    RAD_ISSUE(c, op_enter_flat && fn4_mtpflat_flag().load(std::memory_order_relaxed) ? op_enter_flat : op_enter,
+              brows(w.hin, T), brows(w.e, T), RAD_W(w_pre_h), RAD_W(w_pre_e),
               RAD_W(w_fc_h), RAD_W(w_fc_e), brows(w.hw, T));
 
     hc_attn.read_pieces(c, T);

@@ -1694,6 +1694,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : T;
         for (Layer& lay : m.layers) {
             ok = ok && lay.hc_mix.declare_codes(b, band) == RAD_OK && lay.hc_ffn.declare_codes(b, band) == RAD_OK;
+            /* the exact form: every connection has its K-split-pinned quarter read (HyperConn::op_read_sp) */
+            ok = ok && lay.hc_mix.op_read_sp && lay.hc_ffn.op_read_sp;
         }
         m.sp_on = ok;
         if (g.rank == 0)
@@ -2080,7 +2082,9 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * rows [r0 + min(rank q, rn), r0 + min((rank + 1) q, rn)). */
     const bool sp  = m.sp_on && g.world == 4 && !pair_on && fn4_sp_flag().load(std::memory_order_relaxed);
     const bool spp = !sp && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
-    auto sp_p = [&](int64_t p) { return sp && rn(p) >= kSpMinRows; };
+    /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
+     * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
+    auto sp_p = [&](int64_t p) { return sp && rn(p) == R && rn(p) >= kSpMinRows; };
     auto hq0 = [&](int64_t p) {
         if (!(spp || sp_p(p))) return r0(p);
         const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
@@ -2094,7 +2098,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     };
     /* a connection's write / read on piece p's rows of this rank (none when the quarter is empty: SP only) */
     auto hw = [&](const HyperConn& h, int64_t p) { return hqn(p) > 0 ? h.write(c, T, hq0(p), hqn(p)) : false; };
-    auto hr = [&](const HyperConn& h, int64_t p, bool ss) { if (hqn(p) > 0) h.read(c, T, hq0(p), hqn(p), ss); };
+    auto hr = [&](const HyperConn& h, int64_t p, bool ss) {
+        if (hqn(p) <= 0) return;
+        if (sp_p(p) && h.op_read_sp) h.read_sp(c, T, hq0(p), hqn(p), ss);
+        else h.read(c, T, hq0(p), hqn(p), ss);
+    };
     /* SP's collectives on piece p of a_x (the block output; the next block input) and of the wide stream */
     auto rs_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_rs, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
     auto ag_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_ag, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
@@ -2539,6 +2547,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "hc_spprobe") == 0) {   /* fn4 SP-hc speed probe (step_pipelined) */
         if (value < 0 || value > 1) return -1;
         qwen4exp_fp8::fn4_spprobe_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "mtp_flat") == 0) {   /* fn4 MTP-FLAT (RADIANCE_FN4_MTPFLAT=1 declares) */
+        if (value < 0 || value > 1) return -1;
+        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_MTPFLAT")) return -1;
+        rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares) */

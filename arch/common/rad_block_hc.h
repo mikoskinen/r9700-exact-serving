@@ -126,6 +126,9 @@ struct HyperConn {
     static constexpr int64_t kBiDecRowsMax = 64;
     rad_op     op_read_bd = 0;
     void read_bd(RadCtx* c_, int64_t r0, int64_t rows, bool ss_in) const;
+    /* fn4 SP-hc (RADIANCE_FN4_SPHC=1 at start, four ranks, a piece height): the read a rank's quarter of a pipelined piece
+     * takes -- op_read with kc_rows = the piece's rows, so its K split is the whole piece's (libr4d hc_read). */
+    rad_op     op_read_sp = 0;
     /* The write with the all-reduce folded in; 0 when not requested or not served.
      * `op_ar_write6` is the same on the rotated 6-bit wire, declared only when a lossy payload is
      * accepted and issued on the steps ar_wire_is_exact rejects (every trunk all-reduce at a
@@ -184,6 +187,8 @@ struct HyperConn {
     rad_op op_codes = 0;
     int  declare_codes(RadBuilder* b, int64_t rows_hi);
     void codes(RadCtx* c_, int64_t r0, int64_t rows) const;
+    /* fn4 SP-hc: read() through op_read_sp (a quarter of a full piece) */
+    void read_sp(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in) const;
     void read_pieces(RadCtx* c_, int64_t T, bool ss_in = false) const {
         const int64_t piece = c.read_rows;
         if (piece <= 0 || T <= piece) { read(c_, T, 0, T, ss_in); return; }
@@ -307,6 +312,26 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
                 const rad_buf rd[2] = { w.h, w.ss };
                 rad_op_reads (b, op_read_bd, rd, w.ss ? 2 : 1);
                 rad_op_writes(b, op_read_bd, wr, n_wr);
+            }
+        }
+    }
+    {   /* fn4 SP-hc twin: the same read, its K split pinned to the piece height (c.read_rows) */
+        const char* e = std::getenv("RADIANCE_FN4_SPHC");
+        if (e && *e && *e != '0' && g.world == 4 && c.read_rows > 64 && c.read_rows < g.max_tok) {
+            op_read_sp = RAD_OP(b, "hc_read",
+                             RAD_PARAMS(RAD_RANGE("M", 1, c.read_rows), RAD_INT("n", g.n_embd),
+                                        RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
+                                        RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                                        RAD_F64("wadd", g.wadd), RAD_INT("inject", c.inject ? 1 : 0),
+                                        RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                                        RAD_INT("rotate", c.rotate ? 1 : 0),
+                                        RAD_STR("mix", mix_e4m3 ? "e4m3" : "bf16"),
+                                        RAD_INT("kc_rows", c.read_rows)),
+                             wts, n_wts);
+            if (op_read_sp) {
+                const rad_buf rd[2] = { w.h, w.ss };
+                rad_op_reads (b, op_read_sp, rd, w.ss ? 2 : 1);
+                rad_op_writes(b, op_read_sp, wr, n_wr);
             }
         }
     }
@@ -440,6 +465,22 @@ inline void HyperConn::codes(RadCtx* c_, int64_t r0, int64_t rows) const {
                 brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows, fp8_blocks(g.n_embd)),
                 c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
                 c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE);
+}
+
+inline void HyperConn::read_sp(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in) const {
+    (void)T;
+    const int64_t HN = hn();
+    RAD_ISSUE_N(c_, op_read_sp, rows,
+                brow_slice(w.h, r0, rows, HN), RAD_W(w_norm), RAD_W(w_down), RAD_W(w_up),
+                c.inject ? RAD_W(w_inj) : RAD_NONE,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                c.inject ? brow_slice(w.inj, r0, rows, c.hc) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
+                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE,
+                ss_in && w.ss ? brow_slice(w.ss, r0, rows, 8) : RAD_NONE);
 }
 
 inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in) const {

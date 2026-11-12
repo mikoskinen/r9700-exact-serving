@@ -36,6 +36,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (std::strcmp(name, "mtp_flat") == 0) {   /* fn4 MTP-FLAT: the MTP entry norm flat (RADIANCE_FN4_MTPFLAT=1 declares) */
+        if (value < 0 || value > 1) return -1;
+        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_MTPFLAT")) return -1;
+        rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (std::strcmp(name, "hc_spprobe") == 0) {   /* fn4 SP-hc speed probe (measurement only) */
         if (value < 0 || value > 1) return -1;
         qwen4exp_fp8::fn4_spprobe_flag().store(value, std::memory_order_relaxed);

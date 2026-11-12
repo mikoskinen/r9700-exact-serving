@@ -6779,7 +6779,12 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         const long ncol = fold ? lr + hc : lr;
         const long nrt  = (rows + rt - 1) / rt;
         const bool wdown = rt == kWideRT && g_hc_prefill_form != 1;
-        const long kc   = hc_down_kchunk(lr, HN, bi ? 1 : nrt);   /* fn4 BI: the one-tile split at every row count */
+        /* fn4 SP-hc on the exact wire (12.11.2026): `kc_rows`, the height whose K split this read takes -- a rank's quarter
+         * of a pipelined piece reads with the whole piece's split (the same row tile above 64 rows, the same PF2 form from
+         * kPf2MinRows), so every row's down product sums in today's order: byte-identical to the piece read whole. */
+        const long long kcr = r4d_geti_or(a, "kc_rows", 0);
+        const long nrt_k = kcr > rows ? (long)((kcr + rt - 1) / rt) : nrt;
+        const long kc   = hc_down_kchunk(lr, HN, bi ? 1 : nrt_k);   /* fn4 BI: the one-tile split at every row count */
         const int  ks   = (int)((HN + kc - 1) / kc);
         /* fn4 hc_readv bit 0 at the decode tiles: the pipelined down product and, from 33 rows,
          * the 32-row tile for it and the up-mix; kc stays the one `rt` gives, so the split-K and
