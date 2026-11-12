@@ -203,6 +203,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_collapse` | `M`(range) `n` `hc` `dtype` | `h`, `pre` → `x` |
 | `mhc_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `h`, `pre` → `x`; `w`w → `y` (device-only: mhc_collapse then rmsnorm, x rounded before the norm reads it) |
 | `mhc_post_collapse_rmsnorm` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`, `comb` → `out`; `pre` → `xc`; `w`w → `y` (device-only: mhc_post, mhc_collapse over out, rmsnorm over xc; each rounded before the next reads it; out must not alias h) |
+| `mhc_post_collapse_rmsnorm_mix` | `M`(range) `n` `hc` `iterations` `eps`:f64 `hc_eps`:f64 `dtype` `wadd`:f64/opt `mult`:f64/opt | `x`, `h`, `post`:inout, `comb`:inout → `out`; `pre` → `xc`; `w`w → `y`; `fn`w, `scale`w, `base`w → `pre_o` (device-only: mhc_post_collapse_rmsnorm, then mhc_mix over out writing pre_o, post and comb; hc 4, n a multiple of 1024) |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` | `y`, `inj`, `h`:inout |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
@@ -267,6 +268,13 @@ so they are bit-identical to the chain. libr4d declares them with `replaces`, an
 fusion oracle holds each to libr4d's own chain byte for byte. libref has no row: an architecture
 asks `rad_op_declared` and `rad_op_resolved` and declares the chain where they do not resolve, so a
 host deployment runs the chain.
+
+**`mhc_post_collapse_rmsnorm_mix`** (device-only) is `mhc_post_collapse_rmsnorm` followed by `mhc_mix`
+over its `out`: the next connection's gates from the streams the post just wrote, `post` and `comb` read
+as the post's gates and then written as the mix's (`pre_o` the mix's pre gates). libr4d forms the
+mix's projection from the post's output in LDS, in `mhc_mix`'s per-partial order, then runs its finish
+and the norm in the post op's order: bit-identical to the two ops. DeepSeek-V4.1 declares it beside the
+pair under RADIANCE_DS41_MHC_FUSE and issues it in their place per launch (the mhc_fuse switch, lever M1).
 
 **`gelu_mul`** is `silu_mul` with the tanh GELU: Gemma's gated FFN is trained with
 `gelu_pytorch_tanh`, while the unary `gelu` is the exact erf form. Both split the fused `gate_up`
@@ -1057,6 +1065,11 @@ holds, at most score's), only the kept blocks' positions are scored and every ot
 `index_topk` through the same keep selects exactly what it selects from the unrestricted score: a
 layer past the candidate layer then scores at most `topk_blocks * block` positions a row instead of
 the whole context.
+libr4d's runtime switch `ix_ni` (lever IX-NI, ds41-int9b) leaves a score row's words past its reach
+`(pos + 1) / ratio` unwritten (a row past the step: all of them) instead of `-inf`; `index_topk` reads a
+row only below its reach, and under the same switch `index_candidates` does too -- a `-inf` never moves
+a block's maximum, so its keep words are the same -- so no selection changes. `ix_lds` (lever IX-LDSR2)
+is a faster form of the prefill score over MXFP4 keys with the same bits.
 
 **MXFP4 index keys.** `entry_store` `format` `mxfp4` stores each block of 32 of an entry's `n` values
 (`n` a multiple of 32) the way `quant_roundtrip` (`fp4_e2m1`, `ue8m0`, block 32) quantises it, packed:

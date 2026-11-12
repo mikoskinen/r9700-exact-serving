@@ -2472,6 +2472,252 @@ int post_collapse_norm_body(const RadArgs* a, RadStream stream) {
 #undef FZ_PCN
 }
 
+/* ==================================================================== mhc_post_collapse_rmsnorm_mix (lever M1)
+ * mhc_post_collapse_rmsnorm (x, h, post, comb -> out; out, pre -> xc; xc, w -> y) and then mhc_mix over its out (fn,
+ * scale, base -> pre_o, post, comb), as one op of three launches, byte-identical to the two ops (ds41-int9b, lever M1:
+ * the pcn_a -> mix_a pair of DeepSeek-V4.1's attention connection; kbench2 F1R8 12.11.2026, 1874.7 -> 1384.1 us a pair
+ * at 4096 rows, the bytes the image's at 4096 / 8 / 1 rows with real blk.9 / blk.10 weights).
+ *  K1 (grid n / 1024 column blocks x ceil(M / 8) row groups, 256 threads): its 8 rows and its 1024-column block of
+ *     each of the 4 streams, a 128-column slab at a time. Phase A: out[k][i] = f32_to_bf16(sum_j comb[j][k] h[j][i]
+ *     (from zero, j ascending) + post[k] x[i]) and xc[i] = ds_bf16(sum_k pre[k] ds_bf(out[k][i])) --
+ *     post_collapse_norm_kernel's column arithmetic, the same expressions -- stored, and the slab's out kept in LDS.
+ *     Phase B: mhc_mix's partials over the slab: wave w the dots of stream w / 2 with parity w & 1 (dots (w & 1) + 2 q)
+ *     and the sum of squares on parity 0; lane L adds columns L, L + 32, .. of the chunk in column order from zero,
+ *     each product added unfused (-ffp-contract=off, as the whole file) -- mix_split_kernel's per-partial sequence
+ *     (which wave forms a partial does not change its bits: mix_split_kernel's own note) -- closed with r4d_wave_sum
+ *     into mix's scratch layout part[(row * 25 + j) * chunks + chunk], chunk = stream * (n / 1024) + block, the
+ *     1024-column chunks of the flattened 4n row (n a multiple of 1024: a chunk never straddles two streams).
+ *  FIN: the stock mix_finish_kernel<4> over those partials (pre_o, post, comb): mhc_mix's finish, the same bits.
+ *  K2 (a workgroup a row): the norm over the stored xc in post_collapse_norm_kernel's order: virtual thread v of
+ *     THR = r4d_act_threads(M, n) adds ds_bf(xc)^2 over columns v, v + THR, .. from zero (the stock thread v's
+ *     sequence), each wave of 32 virtual threads closes with r4d_wave_sum, the wave sums are added from zero in order
+ *     (fz_block_sum); y = f32_to_bf16(bf(xc) * rsqrtf(ss / n + eps) * (w + wadd) * mult).
+ * post and comb are read by K1 (the previous connection's gates) and written by FIN (this connection's): FIN runs after
+ * K1 on the stream (one op's launches stay ordered: Ctx::haz_mark's "cont"). hc 4, n a multiple of 1024 up to 16384, f32
+ * w, mix's scratch; anything else is refused and the caller issues the pair. REV / K2 virtual-thread count: the
+ * selftest's mutation controls only (r4d_i9b_mutate), never the production launch. */
+constexpr int kPmHC = 4, kPmMix = kPmHC * (kPmHC + 2), kPmS = kPmMix + 1, kPmSlab = 128, kPmR = 8;
+
+struct PmArgs {
+    const uint16_t* xin; long xp;     /* [M, n] x */
+    const uint16_t* h;   long hp;     /* [M, 4n] the streams before */
+    const float* post;   long ptp;    /* [M, 4] */
+    const float* comb;   long cbp;    /* [M, 16] */
+    const float* pre;    long pp, pst;/* [M, 4] the collapse weights */
+    uint16_t* out;       long op;     /* [M, 4n] the streams after */
+    uint16_t* xc;        long xcp;    /* [M, n] */
+    const float* fn;     long fp;     /* [24, 4n] the next mix's projection */
+    float* part;                      /* [M][25][chunks] mix's scratch layout */
+    int n, chunks;
+    long M;
+};
+
+/* the selftest's mutation hook (r4d_i9b_mutate): 0 = the production forms; see the forms that read it */
+std::atomic<int> g_i9b_mut{0};
+
+template <bool REV>
+__global__ __launch_bounds__(256) void pcn_mix_k1_kernel(PmArgs A) {
+    constexpr int R = kPmR, WV = 8, NCG = WV / R, CPW = kPmSlab / NCG, UA = CPW / 32, JD = kPmMix / 2;
+    static_assert(WV == 2 * kPmHC && WV % R == 0 && CPW % 32 == 0, "two waves a stream, R divides the 8 waves");
+    __shared__ uint16_t ob[R][kPmHC][kPmSlab];
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int b = blockIdx.x, n = A.n;
+    const long g0 = (long)blockIdx.y * R;
+    if (g0 >= A.M) return;   /* block-uniform */
+    const int nr = (int)(A.M - g0 < R ? A.M - g0 : R);
+    /* phase A's thread: row ra (wave % R) of the group, column group cg of the slab */
+    const int ra = wave % R, cg = wave / R;
+    const long ma = g0 + (ra < nr ? ra : 0);
+    float pj[kPmHC], pk[kPmHC], cb[kPmHC][kPmHC];
+#pragma unroll
+    for (int k = 0; k < kPmHC; ++k) {
+        pj[k] = A.pre[ma * A.pp + (long)k * A.pst];
+        pk[k] = A.post[ma * A.ptp + k];
+#pragma unroll
+        for (int j = 0; j < kPmHC; ++j) cb[j][k] = A.comb[ma * A.cbp + j * kPmHC + k];
+    }
+    /* phase B's wave: stream kw, dots par + 2 q (q < 12), the squares on par 0 */
+    const int kw = wave >> 1, par = wave & 1;
+    const bool sq = par == 0;
+    const float* wr = A.fn + (long)par * A.fp + (long)kw * n;
+    float acc[JD + 1][R];
+#pragma unroll
+    for (int q = 0; q <= JD; ++q)
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[q][r] = 0.0f;
+#pragma unroll 1
+    for (int si = 0; si < kMixCols / kPmSlab; ++si) {
+        const int sb = REV ? kMixCols / kPmSlab - 1 - si : si;
+        const int c0 = b * kMixCols + sb * kPmSlab;
+        if (ra < nr) {
+            const uint16_t* hr = A.h + ma * A.hp;
+#pragma unroll
+            for (int u = 0; u < UA; ++u) {
+                const int cl = cg * CPW + lane + 32 * u, i = c0 + cl;
+                uint32_t hv[kPmHC];
+#pragma unroll
+                for (int j = 0; j < kPmHC; ++j) hv[j] = hr[(long)j * n + i];
+                const uint32_t xi = A.xin[ma * A.xp + i];
+                float v = 0;
+#pragma unroll
+                for (int k = 0; k < kPmHC; ++k) {
+                    float uu = 0;
+#pragma unroll
+                    for (int j = 0; j < kPmHC; ++j) uu += cb[j][k] * bf16_to_f32((uint16_t)hv[j]);
+                    uu += pk[k] * bf16_to_f32((uint16_t)xi);
+                    const uint16_t o = f32_to_bf16(uu);
+                    A.out[ma * A.op + (long)k * n + i] = o;
+                    ob[ra][k][cl] = o;
+                    v += pj[k] * ds_bf(o);
+                }
+                A.xc[ma * A.xcp + i] = ds_bf16(v);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < kPmSlab / 32; ++u) {
+            const int cl = 32 * u + lane, i = c0 + cl;
+            float v[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) v[r] = r < nr ? ds_bf(ob[r][kw][cl]) : 0.0f;
+            float w[JD];
+#pragma unroll
+            for (int q = 0; q < JD; ++q) w[q] = wr[(long)(2 * q) * A.fp + i];
+#pragma unroll
+            for (int q = 0; q < JD; ++q)
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[q][r] += v[r] * w[q];
+            if (sq)
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[JD][r] += v[r] * v[r];
+        }
+        __syncthreads();
+    }
+    const int chunk = kw * (n / kMixCols) + b;
+#pragma unroll
+    for (int q = 0; q <= JD; ++q) {
+        if (q == JD && !sq) continue;
+        const int j = q < JD ? par + 2 * q : kPmMix;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float s = r4d_wave_sum(acc[q][r]);
+            if (!lane && r < nr) A.part[((g0 + r) * kPmS + j) * A.chunks + chunk] = s;
+        }
+    }
+}
+
+/* K2: the norm over the stored xc, a workgroup of 256 a row, in post_collapse_norm_kernel's order (tv = its THR) */
+__global__ __launch_bounds__(256) void pcn_mix_k2_kernel(const uint16_t* xc, long xcp, const float* w, uint16_t* y,
+                                                         long yp, int n, int tv, float eps, float wadd, float mult,
+                                                         long M) {
+    __shared__ float vss[1024];
+    __shared__ float wsum[32];
+    const long m = blockIdx.x;
+    if (m >= M) return;
+    const uint16_t* xr = xc + m * xcp;
+    for (int v = (int)threadIdx.x; v < tv; v += 256) {
+        float ss = 0.0f;
+        for (int i = v; i < n; i += tv) {
+            const float xv = bf16_to_f32(xr[i]);
+            ss += xv * xv;
+        }
+        vss[v] = ss;
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, nwv = tv / 32;
+    for (int vw = wave; vw < nwv; vw += 8) {
+        const float t = r4d_wave_sum(vss[vw * 32 + lane]);
+        if (lane == 0) wsum[vw] = t;
+    }
+    __syncthreads();
+    float sum = 0.0f;
+    for (int q = 0; q < nwv; ++q) sum += wsum[q];
+    const float sc = rsqrtf(sum / (float)n + eps);
+    uint16_t* yr = y + m * yp;
+    for (int i = threadIdx.x; i < n; i += 256) yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * sc * (w[i] + wadd) * mult);
+}
+
+int64_t pcn_mix_scratch(long rows, long n) { return (int64_t)rows * mix_chunks(kPmHC * n) * kPmS * (int64_t)sizeof(float); }
+
+/* Operands: mhc_post_collapse_rmsnorm's [0] x [1] h [2] post (inout) [3] comb (inout) [4] out [5] pre [6] xc [7] w [8] y,
+ * then mhc_mix's [9] fn [10] scale [11] base [12] pre_o; post and comb are mhc_mix's post / comb outputs too. */
+int pcn_mix_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 13) return RAD_E_INVAL;
+    const long n = (long)r4d_geti_or(a, "n", 0), hc = (long)r4d_geti_or(a, "hc", 0);
+    const long iters = (long)r4d_geti_or(a, "iterations", 0);
+    if (hc != kPmHC || n < kMixCols || n % kMixCols || n > 16384 || iters < 1 || iters > 256)
+        return R4D_NO(RAD_E_UNSUPPORTED);
+    const RadTensor &xi = a->t[0], &h = a->t[1], &po = a->t[2], &cb = a->t[3], &o = a->t[4];
+    const RadTensor &pre = a->t[5], &x = a->t[6], &w = a->t[7], &y = a->t[8];
+    const RadTensor &fn = a->t[9], &sc = a->t[10], &bs = a->t[11], &pro = a->t[12];
+    if (!w.data || !y.data || !fn.data || !sc.data || !bs.data || !pro.data) return R4D_NO(RAD_E_INVAL);
+    if (xi.rank != 2 || xi.shape[0] < 1 || xi.shape[0] > 65535) return R4D_NO(RAD_E_SHAPE);
+    const long rows = xi.shape[0], width = hc * n, mix = hc * (hc + 2);
+    if (xi.dtype != RAD_BF16 || h.dtype != RAD_BF16 || po.dtype != RAD_F32 || cb.dtype != RAD_F32 ||
+        o.dtype != RAD_BF16 || pre.dtype != RAD_F32 || x.dtype != RAD_BF16 || y.dtype != RAD_BF16 ||
+        w.dtype != RAD_F32 || fn.dtype != RAD_F32 || sc.dtype != RAD_F32 || bs.dtype != RAD_F32 || pro.dtype != RAD_F32)
+        return R4D_NO(RAD_E_DTYPE);
+    if (!mat(xi, RAD_BF16, rows, n) || !mat(h, RAD_BF16, rows, width) || !mat(po, RAD_F32, rows, hc) ||
+        !mat(cb, RAD_F32, rows, hc * hc) || !mat(o, RAD_BF16, rows, width) || o.data == h.data ||
+        !mat_s(pre, RAD_F32, rows, hc) || !mat(x, RAD_BF16, rows, n) || !mat(fn, RAD_F32, mix, width) ||
+        sc.rank != 1 || sc.shape[0] != 3 || bs.rank != 1 || bs.shape[0] != mix || !mat_s(pro, RAD_F32, rows, hc))
+        return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(&w) || r4d_numel(&w) < n) return R4D_NO(RAD_E_STRIDE);
+    long long My = 0;
+    const long long y_ld = r4d_rows_pitch(&y, n, &My);
+    if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (My < rows) return R4D_NO(RAD_E_SHAPE);
+    const int64_t need = pcn_mix_scratch(rows, n);
+    if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_INVAL);
+    const float eps = (float)r4d_getf(a, "eps", 0), heps = (float)r4d_getf(a, "hc_eps", 0);
+    const float wadd = (float)r4d_getf(a, "wadd", 0.0), mult = (float)r4d_getf(a, "mult", 1.0);
+    if (!std::isfinite(eps) || !std::isfinite(heps) || eps <= 0 || heps < 0) return R4D_NO(RAD_E_SHAPE);
+    PmArgs A{};
+    A.xin = (const uint16_t*)xi.data; A.xp = (long)xi.stride[0];
+    A.h = (const uint16_t*)h.data; A.hp = (long)h.stride[0];
+    A.post = (const float*)po.data; A.ptp = (long)po.stride[0];
+    A.comb = (const float*)cb.data; A.cbp = (long)cb.stride[0];
+    A.pre = (const float*)pre.data; A.pp = (long)pre.stride[0]; A.pst = (long)pre.stride[1];
+    A.out = (uint16_t*)o.data; A.op = (long)o.stride[0];
+    A.xc = (uint16_t*)x.data; A.xcp = (long)x.stride[0];
+    A.fn = (const float*)fn.data; A.fp = (long)fn.stride[0];
+    A.part = (float*)a->scratch;
+    A.n = (int)n;
+    A.chunks = (int)mix_chunks(width);
+    A.M = rows;
+    MixOut mo;
+    mo.scale = (const float*)sc.data;
+    mo.sst = (long)sc.stride[0];
+    mo.base = (const float*)bs.data;
+    mo.bst = (long)bs.stride[0];
+    mo.pre = (float*)pro.data;
+    mo.prp = (long)pro.stride[0];
+    mo.prs = (long)pro.stride[1];
+    mo.post = (float*)po.data;
+    mo.pop = (long)po.stride[0];
+    mo.pos = (long)po.stride[1];
+    mo.comb = (float*)cb.data;
+    mo.cp = (long)cb.stride[0];
+    mo.cs = (long)cb.stride[1];
+    mo.width = (int)width;
+    mo.iters = (int)iters;
+    mo.eps = eps;
+    mo.heps = heps;
+    const int mut = g_i9b_mut.load(std::memory_order_relaxed);
+    int tv = r4d_act_threads((int)rows, (int)n);
+    if (mut == 2) tv = tv < 1024 ? tv * 2 : tv / 2;   /* mutation control: another virtual-thread count (NOT exact) */
+    const dim3 g1((unsigned)(n / kMixCols), (unsigned)((rows + kPmR - 1) / kPmR));
+    int rc = mut == 1 ? R4D_EMIT(stream, pcn_mix_k1_kernel<true>, g1, dim3(256), 0, A)
+                      : R4D_EMIT(stream, pcn_mix_k1_kernel<false>, g1, dim3(256), 0, A);
+    if (rc < 0) return rc;
+    rc = R4D_EMIT(stream, mix_finish_kernel<kPmHC>, dim3((unsigned)((rows + 3) / 4)), dim3(128), 0,
+                  (const float*)A.part, A.chunks, mo, rows);
+    if (rc < 0) return rc;
+    return R4D_EMIT(stream, pcn_mix_k2_kernel, dim3((unsigned)rows), dim3(256), 0, (const uint16_t*)x.data,
+                    (long)x.stride[0], (const float*)w.data, (uint16_t*)y.data, (long)y_ld, (int)n, tv, eps, wadd,
+                    mult, rows);
+}
+
 }  // namespace
 
 extern "C" int r4d_rad_token_map(const RadArgs* a, RadStream s) { return token_map_body(a, s); }
@@ -2521,6 +2767,22 @@ extern "C" int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream s) {
     return post_collapse_norm_body(a, s);
+}
+/* lever M1 (ds41-int9b): mhc_post_collapse_rmsnorm + mhc_mix over its out, one op (pcn_mix_body); its scratch is mhc_mix's
+ * partials for M rows */
+extern "C" int r4d_rad_mhc_post_collapse_rmsnorm_mix(const RadArgs* a, RadStream s) { return pcn_mix_body(a, s); }
+extern "C" int64_t r4d_rad_mhc_post_collapse_rmsnorm_mix_scratch(const RadArgs* a) {
+    const long long M = r4d_geti_or(a, "M", 0), n = r4d_geti_or(a, "n", 0), hc = r4d_geti_or(a, "hc", 0);
+    if (M < 1 || M > 65535 || hc != kPmHC || n < kMixCols || n % kMixCols || n > 16384) return 0;
+    return pcn_mix_scratch((long)M, (long)n);
+}
+/* tests only (r4d_selftest's mutation controls, ds41-int9b): 0 the production forms; 1 lever M1's K1 with its slabs in
+ * reverse order, 2 its K2 at another virtual-thread count (NOT exact: a check must catch both); the IX forms' hooks
+ * are r4d_ds41_sparse.hip's (3 ..). */
+extern "C" void r4d_ix_mutate(int which);   /* r4d_ds41_sparse.hip */
+extern "C" void r4d_i9b_mutate(int which) {
+    g_i9b_mut.store(which, std::memory_order_relaxed);
+    r4d_ix_mutate(which);
 }
 /* tests only (tests/r4d_emu): mhc_post_collapse_rmsnorm as the all-reduce's word-partitioned epilogue, nb blocks */
 extern "C" int r4d_ds41_pcn_words(const RadArgs* a, RadStream s, int nb, unsigned* ctr) {

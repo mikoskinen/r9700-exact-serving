@@ -347,6 +347,11 @@ struct Layer {
      * col_f + norm_f, issued for post_a; pcn_a = the previous layer's post_f + this layer's col_a +
      * norm_a, issued for that post_f (so before this layer's Engram-free tap and mix_a). */
     rad_op pcn_f = 0, pcn_a = 0;
+    /* Lever M1 (RADIANCE_DS41_MHC_FUSE declared): pcn_a + this layer's mix_a as one op (mhc_post_collapse_rmsnorm_mix),
+     * declared beside pcn_a, issued in its place for a launch the mhc_fuse switch takes (mhc_fuse_min). 0 elsewhere. */
+    rad_op pcn_mix = 0;
+    /* ... and the ffn connection's: pcn_f + this layer's mix_f (the 1017's 40 layers) */
+    rad_op pcn_mix_f = 0;
     /* ar_attn + pcn_f as one four-rank collective (ar_mhc_post_collapse_rmsnorm, RADIANCE_DS41_AR_PCN=1), issued
      * instead of the pair for a step ar_wide_write_exact takes; 0 = the pair. */
     rad_op ar_pcn_f = 0;
@@ -1387,6 +1392,113 @@ static bool engdd_may_act(const RadBatch* b) {
            b->draft_pass == 0 && b->n_tok > ds41_engdd::kFormRows && b->n_seq > b->n_seq_decode && !b->enc && !b->gen;
 }
 
+/* Lever M1 (ds41-int9b, 12.11.2026; audit lever 4, kbench2 F1R8: a pair 1874.7 -> 1384.1 us at 4096 rows, ~-1.28 s a
+ * 136k prefill): the attention connection's pcn_a (the previous layer's mhc_post with this layer's collapse + norm,
+ * issued at the end of the previous layer) and this layer's mix_a (mhc_mix over the streams pcn_a just wrote) as ONE op,
+ * mhc_post_collapse_rmsnorm_mix (libr4d: the mix's projection formed from the post's output in LDS in mhc_mix's
+ * per-partial order, mhc_mix's finish, the norm in pcn's order -- the two ops' bytes, r4d_ds41_elem.hip pcn_mix_body).
+ * Switch "mhc_fuse" (fn4): 0 off; 1 = a pcn_a launch of at least kMhcFuseRows rows is issued as the fused op and the
+ * layer's mix_a is not issued for its rows; N in 2 .. 1048576 the same from N rows (the fused op loses below a few
+ * hundred rows: kbench2 +84 % at 8 rows, +83 % at 1). RADIANCE_DS41_MHC_FUSE=0 / off | 1 / on | N declares it (the
+ * fused op beside every pcn_a: 39 of the 1017's 40 layers, not layer 0 or an Engram layer) and starts at that value;
+ * unset declares nothing (>= 1 refused; the program and the issue today's). Why exact: every output of the fused op is
+ * the pair's bytes; mhc_mix's arithmetic is a row's own (mix_split_kernel: a partial has the same bits for any R, WV and
+ * row count; mix_finish a wave a row), so mixing some of a layer's rows inside the previous layer's pcn_a launches and
+ * the rest in its own mix_a launches gives every row today's mix_a bytes; the mix's outputs (pre_a, post, comb) are read
+ * by nothing between pcn_a and mix_a (step()'s "Issue order of the connections' mixes": the collapse reads the previous
+ * mix's gates, nothing reads a mix's output before the next mhc_post; the tap, the norm, the query / key / indexer read
+ * h0 and xn); only the issue order moves (the mix before the attention instead of before attn_output_b). Under lever PSK
+ * a fused launch can mix rows the layer's cut drops: they feed nothing later (the cone rule) and nothing reads them. */
+static constexpr int64_t kMhcFuseRows = 512;
+static std::atomic<int> g_sw_mhc{0}, g_sw_mhc_ok{0}, g_sw_mhc_env{-2}, g_mhc_noted{0};   /* env: -2 unread, -1 unset */
+/* live counters (rank 0's, at issue: a recorded pass counts when it is recorded): fused launches, their rows, pcn_a
+ * launches the switch left unfused (below its rows) */
+static std::atomic<long long> g_mhc_pairs{0}, g_mhc_rows{0}, g_mhc_small{0};
+static void mhc_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_MHC_FUSE");
+    int v = -1;
+    if (e) {
+        if (!std::strcmp(e, "on")) v = 1;
+        else if (!std::strcmp(e, "off")) v = 0;
+        else {
+            char* end = nullptr;
+            const long n = std::strtol(e, &end, 10);
+            if (end != e && !*end && n >= 0 && n <= 1048576) v = (int)n;
+        }
+    }
+    if (g_sw_mhc_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_mhc.store(v, std::memory_order_relaxed);
+        if (e && v < 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_MHC_FUSE=%s is not 0 / off, 1 / on or a row count up to "
+                            "1048576: lever M1 is not declared\n", e);
+    }
+}
+static bool mhc_declared() { return g_sw_mhc_env.load(std::memory_order_relaxed) >= 0; }
+/* The fewest rows a pcn_a launch is fused at under the switch; 0 = none. */
+static int64_t mhc_fuse_min() {
+    if (!g_sw_mhc_ok.load(std::memory_order_relaxed)) return 0;
+    const int v = g_sw_mhc.load(std::memory_order_relaxed);
+    return v <= 0 ? 0 : v == 1 ? kMhcFuseRows : (int64_t)v;
+}
+/* fn over the rows of [r0, r0 + n) that the fused launches `done` (disjoint) did not mix, a run at a time */
+template <class F>
+static void mhc_rest(std::vector<std::pair<int64_t, int64_t>>& done, int64_t r0, int64_t n, const F& fn) {
+    if (done.empty()) { fn(r0, n); return; }
+    std::sort(done.begin(), done.end());
+    int64_t a = r0;
+    const int64_t e = r0 + n;
+    for (const auto& d : done) {
+        const int64_t d0 = d.first, d1 = d.first + d.second;
+        if (d1 <= a || d0 >= e) continue;
+        if (d0 > a) fn(a, d0 - a);
+        a = std::max(a, d1);
+        if (a >= e) break;
+    }
+    if (a < e) fn(a, e - a);
+}
+
+/* The rows a step's fused launches mixed (each rank thread its own; set where the fused op is issued, read where the
+ * mix is): t_mhc_a the attention mix of layer t_mhc_a_l (fused into the previous layer's pcn_a), t_mhc_f this layer's
+ * ffn mix (fused into its pcn_f; cleared at each layer's ffn connection). */
+static thread_local std::vector<std::pair<int64_t, int64_t>> t_mhc_a, t_mhc_f;
+static thread_local int t_mhc_a_l = -1;
+static void mhc_note(RadCtx* x, int64_t n) {
+    if (rad_rank(x) != 0) return;
+    g_mhc_pairs.fetch_add(1, std::memory_order_relaxed);
+    g_mhc_rows.fetch_add(n, std::memory_order_relaxed);
+}
+
+/* Lever IX-NI's live count (ds41-int9b): libr4d serves fn4 ix_ni (index_score writes no -inf past a row's reach;
+ * index_candidates then reads below it only); deepseek41 takes the switch too, only to count what the issue leaves
+ * unwritten (rank 0, at issue: a recorded pass counts when it is recorded): index_score runs issued under it, and the
+ * dead bytes, 4 x (live - min(live, reach)) for each row of a run's plane (a row past the step: the whole live width).
+ * RADIANCE_DS41_IX_NI=1: the start value (libr4d reads the same). */
+static std::atomic<int> g_sw_ixni{-1};
+static std::atomic<long long> g_ixni_runs{0}, g_ixni_dead{0};
+static int ixni_on() {
+    int v = g_sw_ixni.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_DS41_IX_NI");
+        int unread = -1;
+        g_sw_ixni.compare_exchange_strong(unread, e && e[0] == '1' && !e[1] ? 1 : 0);
+        v = g_sw_ixni.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+/* one run's count: R plane rows, `rows` of them the step's from host positions `hp` (null: runs only), width `live` */
+static void ixni_note(RadCtx* x, const int32_t* hp, int64_t rows, int64_t R, int64_t live, int64_t ratio) {
+    if (ixni_on() <= 0 || rad_rank(x) != 0) return;
+    g_ixni_runs.fetch_add(1, std::memory_order_relaxed);
+    if (!hp || ratio < 1) return;
+    long long dead = 0;
+    for (int64_t m = 0; m < R; ++m) {
+        const int64_t reach = m < rows ? ((int64_t)hp[m] + 1) / ratio : 0;
+        dead += (long long)(live - std::min<int64_t>(live, std::max<int64_t>(reach, 0)));
+    }
+    g_ixni_dead.fetch_add(4 * dead, std::memory_order_relaxed);
+}
+
 static void sw_note_decl(int64_t rows) {
     int cur = g_sw_gar_decl.load(std::memory_order_relaxed);
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
@@ -1422,6 +1534,9 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_pfctx_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_engdd"))
         return value == 0 || (value == 1 && g_sw_engdd_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "mhc_fuse"))   /* lever M1 */
+        return value == 0 || (value >= 1 && value <= 1048576 && g_sw_mhc_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;   /* lever IX-NI: counted here, libr4d's */
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -1437,6 +1552,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "dspark_pfctx")) g_sw_pfctx.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_psk_cr")) g_sw_psk_cr.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_engdd")) g_sw_engdd.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "mhc_fuse")) g_sw_mhc.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ix_ni")) g_sw_ixni.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1478,6 +1595,14 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_engdd")) {
         *applied = g_sw_engdd.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "mhc_fuse")) {
+        *applied = g_sw_mhc.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ix_ni")) {
+        *applied = ixni_on();
         return 1;
     }
     if (!std::strcmp(name, "dspark_walk")) {
@@ -2098,6 +2223,14 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
         if (l > 0 && !L.e_ids)
             L.pcn_a = post_collapse_norm(b, m, T, L.attn_norm, m.act.x, m.h1, m.h0, m.pre_f,
                                          m.xcol, m.xn);
+        /* lever M1 (RADIANCE_DS41_MHC_FUSE): pcn_a + mix_a as one op, beside the pair (fused(): 0 where no library
+         * declares and serves it, and the lever is then not available) */
+        if (L.pcn_a && mhc_declared() && c.hc == 4 && D % 1024 == 0)
+            L.pcn_mix = fused(b, "mhc_post_collapse_rmsnorm_mix",
+                              { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_INT("iterations", c.hc_iters),
+                                RAD_F64("eps", c.eps), RAD_F64("hc_eps", c.hc_eps), RAD_STR("dtype", "bf16") },
+                              { L.attn_norm, L.hc_a_fn, L.hc_a_scale, L.hc_a_base },
+                              { m.act.x, m.h1, m.post, m.comb, m.pre_f }, { m.h0, m.xcol, m.xn, m.pre_a, m.post, m.comb });
         if (!L.pcn_a) L.cn_a = collapse_norm(b, m, T, L.attn_norm, m.h0, m.pre_f, m.xcol, m.xn);
     }
     if (!L.cn_a && !L.pcn_a) L.col_a = op(b, "mhc_collapse", hcp, {}, { m.h0, m.pre_f }, { m.xcol });
@@ -2404,6 +2537,13 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     L.ffn_norm = w("blk.%d.ffn_norm.weight", RAD_F32, { D });
     L.pcn_f = post_collapse_norm(b, m, T, L.ffn_norm, m.attn_out, m.h0, m.h1, m.pre_a, m.xcol,
                                  m.act.x);
+    /* lever M1: pcn_f + mix_f as one op, beside the pair */
+    if (L.pcn_f && mhc_declared() && c.hc == 4 && D % 1024 == 0)
+        L.pcn_mix_f = fused(b, "mhc_post_collapse_rmsnorm_mix",
+                            { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_INT("iterations", c.hc_iters),
+                              RAD_F64("eps", c.eps), RAD_F64("hc_eps", c.hc_eps), RAD_STR("dtype", "bf16") },
+                            { L.ffn_norm, L.hc_f_fn, L.hc_f_scale, L.hc_f_base },
+                            { m.attn_out, m.h0, m.post, m.comb, m.pre_a }, { m.h1, m.xcol, m.act.x, m.pre_f, m.post, m.comb });
     if (!L.pcn_f) L.cn_f = collapse_norm(b, m, T, L.ffn_norm, m.h1, m.pre_a, m.xcol, m.act.x);
     if (!L.pcn_f && !L.cn_f) {
         L.col_f = op(b, "mhc_collapse", hcp, {}, { m.h1, m.pre_a }, { m.xcol });
@@ -3213,6 +3353,7 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lev
 static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI, below */
 static void engdd_declare(Model& m, const RadBuildCtx* ctx);               /* lever E1, below */
 static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lever KVR, below */
+static void mhc_declare(Model& m, const RadBuildCtx* ctx);                  /* lever M1, below */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -3245,6 +3386,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     pfctx_read_env();
     psk_cr_read_env();
     engdd_read_env();
+    mhc_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3597,6 +3739,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(bi_declare(b, m, ctx));
     DS_TRY(psk_declare(b, m, ctx));
     engdd_declare(m, ctx);
+    mhc_declare(m, ctx);
     DS_TRY(bt_declare(b, m, ctx));
     DS_TRY(kvr_declare(b, m, ctx));
     return RAD_OK;
@@ -3754,6 +3897,31 @@ static void engdd_declare(Model& m, const RadBuildCtx* ctx) {
                 g_sw_engdd.load(std::memory_order_relaxed), (long long)((m.c.hc + 1) * m.c.n_embd),
                 (long long)(m.c.ple_heads * m.c.ple_dim), want, (long long)ds41_engdd::kFormRows,
                 (long long)ds41_engdd::kFormRows, (long long)ds41_engdd::kMinShareDiv);
+}
+
+/* Lever M1 at the end of a declare (RADIANCE_DS41_MHC_FUSE set): the layers that declared the fused op beside pcn_a; none
+ * (no library serves it: a host deployment) -> not available (>= 1 refused, the switch reads 0). */
+static void mhc_declare(Model& m, const RadBuildCtx* ctx) {
+    if (!mhc_declared() || ctx->shape_probe) return;
+    int n = 0, want = 0;
+    for (const Layer& L : m.layers) {
+        want += (L.pcn_a ? 1 : 0) + (L.pcn_f ? 1 : 0);
+        n += (L.pcn_mix ? 1 : 0) + (L.pcn_mix_f ? 1 : 0);
+    }
+    if (n == 0) {
+        g_sw_mhc.store(0, std::memory_order_relaxed);
+        if (ctx->rank == 0 && !g_mhc_noted.exchange(1, std::memory_order_relaxed))
+            fprintf(stderr, "radiance: deepseek41: lever M1 not declared: no layer's mhc_post_collapse_rmsnorm_mix resolves "
+                            "(%d pcn_a / pcn_f pairs) -- the switch stays 0\n", want);
+        return;
+    }
+    g_sw_mhc_ok.store(1, std::memory_order_relaxed);
+    if (ctx->rank == 0 && !g_mhc_noted.exchange(1, std::memory_order_relaxed))
+        fprintf(stderr, "radiance: deepseek41: lever M1 (mhc_fuse) declared (RADIANCE_DS41_MHC_FUSE, fn4 mhc_fuse, now %d): "
+                        "mhc_post_collapse_rmsnorm_mix beside %d of %d mhc_post_collapse_rmsnorm (pcn_a / pcn_f: the "
+                        "post, the next connection's collapse + norm and its mhc_mix in one op); 1 = launches of >= %lld "
+                        "rows fused, N >= 2 = of >= N rows\n",
+                g_sw_mhc.load(std::memory_order_relaxed), n, want, (long long)kMhcFuseRows);
 }
 
 /* Lever KVR (ds41-kvr, 12.11.2026): RADIANCE_DS41_KV_REPLICATED=1 declares the prefix-cached groups -- kv_index_r* and
@@ -4186,13 +4354,22 @@ struct MixBeside {
     const Model* m;
     int64_t T;
 };
+/* The ffn mix over the step's rows -- lever M1: those its pcn_f launches did not mix (t_mhc_f), a run a launch */
 static void mix_f_beside(RadCtx* x, void* a) {
     const MixBeside& p = *(const MixBeside*)a;
     const Layer& L = *p.L;
     const Model& m = *p.m;
     const int64_t T = p.T;
-    RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
-                RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
+    if (t_mhc_f.empty()) {
+        RAD_ISSUE_N(x, L.mix_f, T, brows(m.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
+                    RAD_W(L.hc_f_base), brows(m.pre_f, T), brows(m.post, T), brows(m.comb, T));
+        return;
+    }
+    mhc_rest(t_mhc_f, 0, T, [&](int64_t r0, int64_t n) {
+        auto R = [&](rad_buf h) { return r0 == 0 ? brows(h, n) : brow_slice(h, r0, n, m.bp.at(h)); };
+        RAD_ISSUE_N(x, L.mix_f, n, R(m.h1), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base), R(m.pre_f), R(m.post),
+                    R(m.comb));
+    });
 }
 
 /* ------------------------------------------------------------------ lever BI: the step in segments */
@@ -4432,6 +4609,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
     };
     set_runs();
+    t_mhc_a.clear();   /* lever M1: nothing fused yet this step */
+    t_mhc_a_l = -1;
     /* fn over the layer's rows: each run of consecutive rows in one launch */
     auto whole = [&](const auto& fn) {
         for (const auto& u : runs) fn(u.first, u.second);
@@ -4603,9 +4782,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (L.tap) RAD_ISSUE_N(x, L.tap, T, brows(m.h0, T), bcol(m.dsp.src, L.tap_col * D, D, T));
         const bool late = !m.zero;
         const auto mix_a = [&] {
-            whole([&](int64_t r0, int64_t n) {
-                RAD_ISSUE_N(x, L.mix_a, n, R(m.h0, r0, n), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
-                            RAD_W(L.hc_a_base), R(m.pre_a, r0, n), R(m.post, r0, n), R(m.comb, r0, n));
+            /* lever M1: the rows the previous layer's fused pcn_a launches did not mix */
+            if (t_mhc_a_l != l) t_mhc_a.clear();
+            whole([&](int64_t r0w, int64_t nw) {
+                mhc_rest(t_mhc_a, r0w, nw, [&](int64_t r0, int64_t n) {
+                    RAD_ISSUE_N(x, L.mix_a, n, R(m.h0, r0, n), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
+                                RAD_W(L.hc_a_base), R(m.pre_a, r0, n), R(m.post, r0, n), R(m.comb, r0, n));
+                });
             });
         };
         /* the collapse (+ norm: a fused norm, by segment within its 32-row width); lever PSK-L20: at the split layer over
@@ -4845,6 +5028,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     for (int64_t p = ru.p0; p < ru.p1; ++p) {
                         const int64_t q0 = p * ru.R, qn = std::min(ru.R, s.n - q0);
                         if (s.r0 + q0 + qn <= cut0) continue;
+                        ixni_note(x, batch->positions_h ? batch->positions_h + s.r0 + q0 : nullptr, qn, ru.R, live, r);
                         RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, R(m.iq, s.r0, s.n), R(m.iw, s.r0, s.n),
                                     kv_cache(m.index[r], src),
                                     praw2(ib->block_table + s.s0 * ib->block_table_pitch, RAD_I32, s.s1 - s.s0,
@@ -4931,12 +5115,25 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
          * fused norm) by segment; ar_pcn_f (the all-reduce with it, RADIANCE_DS41_AR_PCN) is not taken under ds41_bi */
         if (L.ar_attn)
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.ar_attn, n * D, R(m.attn_out, r0, n), RAD_NONE); });
-        if (L.pcn_f)
+        t_mhc_f.clear();
+        if (L.pcn_f) {
+            /* lever M1: a launch of >= mhc_fuse_min() rows as pcn_f + mix_f in one op (its rows' mix_f then not issued) */
+            const int64_t fmin = L.pcn_mix_f ? mhc_fuse_min() : 0;
             rows(kBiNorm, [&](int64_t r0, int64_t n) {
+                if (fmin > 0 && n >= fmin) {
+                    RAD_ISSUE_N(x, L.pcn_mix_f, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n),
+                                R(m.comb, r0, n), R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm),
+                                R(m.act.x, r0, n), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
+                                R(m.pre_f, r0, n));
+                    t_mhc_f.push_back({ r0, n });
+                    mhc_note(x, n);
+                    return;
+                }
+                if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
                 RAD_ISSUE_N(x, L.pcn_f, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h1, r0, n), R(m.pre_a, r0, n), R(m.xcol, r0, n), RAD_W(L.ffn_norm), R(m.act.x, r0, n));
             });
-        else
+        } else
             whole([&](int64_t r0, int64_t n) {
                 RAD_ISSUE_N(x, L.post_a, n, R(m.attn_out, r0, n), R(m.h0, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h1, r0, n));
@@ -4964,9 +5161,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         /* lever PSK: a cut layer's ffn mix over its runs, here (the block issues a beside only in a pass from row 0) */
         const MoeFP8::Beside* bsp = &bs;
         if (cut) {
-            whole([&](int64_t r0, int64_t n) {
-                RAD_ISSUE_N(x, L.mix_f, n, R(m.h1, r0, n), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
-                            R(m.pre_f, r0, n), R(m.post, r0, n), R(m.comb, r0, n));
+            whole([&](int64_t r0w, int64_t nw) {
+                mhc_rest(t_mhc_f, r0w, nw, [&](int64_t r0, int64_t n) {   /* lever M1: the rows not mixed in pcn_f */
+                    RAD_ISSUE_N(x, L.mix_f, n, R(m.h1, r0, n), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
+                                R(m.pre_f, r0, n), R(m.post, r0, n), R(m.comb, r0, n));
+                });
             });
             bsp = nullptr;
         }
@@ -4994,12 +5193,25 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bt_pt(x, m, m.act.x, T, "moe_out", l);
         /* post_f, or post_f with the next collapse + norm (a fused norm, by segment); never the AR_PCN forms here */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
-        if (nx && nx->pcn_a)
+        if (nx && nx->pcn_a) {
+            /* lever M1: a launch of >= mhc_fuse_min() rows as pcn_a + the next layer's mix_a in one op */
+            const int64_t fmin = nx->pcn_mix ? mhc_fuse_min() : 0;
+            t_mhc_a.clear();
+            t_mhc_a_l = nx->l;
             rows(kBiNorm, [&](int64_t r0, int64_t n) {
+                if (fmin > 0 && n >= fmin) {
+                    RAD_ISSUE_N(x, nx->pcn_mix, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                                R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(nx->attn_norm), R(m.xn, r0, n),
+                                RAD_W(nx->hc_a_fn), RAD_W(nx->hc_a_scale), RAD_W(nx->hc_a_base), R(m.pre_a, r0, n));
+                    t_mhc_a.push_back({ r0, n });
+                    mhc_note(x, n);
+                    return;
+                }
+                if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
                 RAD_ISSUE_N(x, nx->pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(nx->attn_norm), R(m.xn, r0, n));
             });
-        else if (!nx && m.pcn_fin)
+        } else if (!nx && m.pcn_fin)
             rows(kBiNorm, [&](int64_t r0, int64_t n) {
                 RAD_ISSUE_N(x, m.pcn_fin, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(m.final_gain),
@@ -5156,6 +5368,8 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         RAD_NONE);
     }
     engdd_mark(x, m, batch);   /* lever E1: the ids' event (a pass it may act on) */
+    t_mhc_a.clear();           /* lever M1: nothing fused yet this step */
+    t_mhc_a_l = -1;
 
     for (auto& L : m.layers) {
         const int l = L.l;
@@ -5193,8 +5407,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
          *   alone at the layer's start; on the attention-zero rank it follows the collapse. */
         const bool late = !m.zero;
         const auto mix_a = [&] {
-            RAD_ISSUE_N(x, L.mix_a, T, brows(m.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
-                        RAD_W(L.hc_a_base), brows(m.pre_a, T), brows(m.post, T), brows(m.comb, T));
+            /* lever M1: the rows the previous layer's fused pcn_a did not mix (here all or none) */
+            if (t_mhc_a_l != l) t_mhc_a.clear();
+            mhc_rest(t_mhc_a, 0, T, [&](int64_t r0, int64_t n) {
+                auto Rs = [&](rad_buf h) { return r0 == 0 ? brows(h, n) : brow_slice(h, r0, n, m.bp.at(h)); };
+                RAD_ISSUE_N(x, L.mix_a, n, Rs(m.h0), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
+                            RAD_W(L.hc_a_base), Rs(m.pre_a), Rs(m.post), Rs(m.comb));
+            });
         };
         const auto col_a = [&] {
             if (L.cn_a)
@@ -5417,6 +5636,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 for (int64_t p = ru.p0; p < ru.p1; ++p) {
                     const int64_t r0 = p * ru.R, rows = std::min(ru.R, T - r0);
                     const RadOperand prow = praw(batch->positions + r0, RAD_I32, rows);
+                    ixni_note(x, batch->positions_h ? batch->positions_h + r0 : nullptr, rows, ru.R, live, r);
                     RAD_ISSUE_N(x, L.i_runs[(size_t)p], ru.R, brows(m.iq, T), brows(m.iw, T),
                                 kv_cache(m.index[r], src),
                                 praw2(ib->block_table, RAD_I32, S, ib->block_table_pitch), pos, cu,
@@ -5502,17 +5722,27 @@ static void step(RadCtx* x, const RadBatch* batch) {
             lin_issue(x, m, L.o_b, T, brows(m.oa, T), L.wo_b, brows(m.attn_out, T));
             bt_pt(x, m, m.attn_out, T, "attn_out", l);
         }
+        t_mhc_f.clear();   /* lever M1: this layer's ffn mix not fused yet */
         if (L.ar_pcn_f && ar_wide_write_exact(m.g, T))   /* the all-reduce, post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.ar_pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
                         RAD_W(L.ffn_norm), brows(m.act.x, T));
         else {
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
-        if (L.pcn_f)   /* post_a, col_f and norm_f in one */
+        const int64_t fmin_f = L.pcn_mix_f ? mhc_fuse_min() : 0;
+        if (L.pcn_f && fmin_f > 0 && T >= fmin_f) {   /* lever M1: post_a, col_f, norm_f and the ffn mix in one */
+            RAD_ISSUE_N(x, L.pcn_mix_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
+                        brows(m.comb, T), brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
+                        RAD_W(L.ffn_norm), brows(m.act.x, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale),
+                        RAD_W(L.hc_f_base), brows(m.pre_f, T));
+            t_mhc_f.push_back({ 0, T });
+            mhc_note(x, T);
+        } else if (L.pcn_f) {   /* post_a, col_f and norm_f in one */
+            if (fmin_f > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
             RAD_ISSUE_N(x, L.pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
                         RAD_W(L.ffn_norm), brows(m.act.x, T));
-        else
+        } else
             RAD_ISSUE_N(x, L.post_a, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h1, T));
         }
@@ -5556,11 +5786,24 @@ static void step(RadCtx* x, const RadBatch* batch) {
             RAD_ISSUE_N(x, m.ar_pcn_fin, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
                         RAD_W(m.final_gain), brows(m.final_hidden, T));
-        else if (nx && nx->pcn_a)
-            RAD_ISSUE_N(x, nx->pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
-                        brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
-                        RAD_W(nx->attn_norm), brows(m.xn, T));
-        else if (!nx && m.pcn_fin)
+        else if (nx && nx->pcn_a) {
+            const int64_t fmin = nx->pcn_mix ? mhc_fuse_min() : 0;
+            t_mhc_a.clear();
+            t_mhc_a_l = nx->l;
+            if (fmin > 0 && T >= fmin) {   /* lever M1: pcn_a + the next layer's mix_a in one */
+                RAD_ISSUE_N(x, nx->pcn_mix, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                            brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                            RAD_W(nx->attn_norm), brows(m.xn, T), RAD_W(nx->hc_a_fn), RAD_W(nx->hc_a_scale),
+                            RAD_W(nx->hc_a_base), brows(m.pre_a, T));
+                t_mhc_a.push_back({ 0, T });
+                mhc_note(x, T);
+            } else {
+                if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
+                RAD_ISSUE_N(x, nx->pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                            brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                            RAD_W(nx->attn_norm), brows(m.xn, T));
+            }
+        } else if (!nx && m.pcn_fin)
             RAD_ISSUE_N(x, m.pcn_fin, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
                         RAD_W(m.final_gain), brows(m.final_hidden, T));
@@ -5679,6 +5922,23 @@ extern "C" int rad_psk_stats(long long* out, int n) {
     out[14] = g_cr_mixed.load(std::memory_order_relaxed);
     out[15] = 0;
     return 16;
+}
+
+/* Levers M1 / IX-NI's live counters (ds41-int9b, GET /admin/fn4 "i9b"), rank 0's, cumulative, counted at issue (a
+ * recorded pass when it is recorded): out[0] lever M1 declared and served here (1 / 0), [1] fused launches
+ * (mhc_post_collapse_rmsnorm_mix), [2] their rows, [3] launches of the pair the switch left unfused (below its rows),
+ * [4] index_score runs issued under ix_ni, [5] the plane bytes those runs leave unwritten (past each row's reach).
+ * Returns how many it wrote (6). */
+extern "C" int rad_i9b_stats(long long* out, int n) {
+    using namespace deepseek41;
+    if (!out || n < 6) return 0;
+    out[0] = g_sw_mhc_ok.load(std::memory_order_relaxed);
+    out[1] = g_mhc_pairs.load(std::memory_order_relaxed);
+    out[2] = g_mhc_rows.load(std::memory_order_relaxed);
+    out[3] = g_mhc_small.load(std::memory_order_relaxed);
+    out[4] = g_ixni_runs.load(std::memory_order_relaxed);
+    out[5] = g_ixni_dead.load(std::memory_order_relaxed);
+    return 6;
 }
 
 /* Lever E1's live counters for /stats "engdd" (ds41-e1), rank 0's, cumulative: out[0] Engram layer passes deduplicated,

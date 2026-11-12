@@ -4123,8 +4123,16 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
  * per-shape rule, a code that form everywhere; RADIANCE_DS41_GG_PF at load); the stock WMMA kernel's bits. Lever GPF-b:
  * "f32_pf" 0 / 1 / a form code 20.., gemm_nt_f32's prefill rows in r4d_ds41_f32pf.hip's tiled form (RADIANCE_DS41_F32_PF
  * at load); the stock gemm_nt_f32's bits for f32 and bf16 weights. */
+/* Levers IX-LDSR2 / IX-NI (ds41-int9b, r4d_ds41_sparse.hip): "ix_lds" 0 / 1, index_score's LDS form (keys unpacked once a
+ * workgroup, two rows a wave; the stock form's bits); "ix_ni" 0 / 1, no -inf past a row's reach in index_score's plane and
+ * index_candidates reading below it only (the selection's bits). */
+int r4d_ix_lds_get();
+int r4d_ix_ni_get();
+void r4d_ix_lds_set(int v);
+void r4d_ix_ni_set(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
+    if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
@@ -4134,6 +4142,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
 extern "C" int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
+    if (!std::strcmp(name, "ix_lds")) { r4d_ix_lds_set(value); return 1; }
+    if (!std::strcmp(name, "ix_ni")) { r4d_ix_ni_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_set(value);
@@ -4148,6 +4158,8 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
         *applied = g_gg_gemv.load(std::memory_order_relaxed);
         return 1;
     }
+    if (!std::strcmp(name, "ix_lds")) { *applied = r4d_ix_lds_get(); return 1; }
+    if (!std::strcmp(name, "ix_ni")) { *applied = r4d_ix_ni_get(); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
     if (!std::strcmp(name, "gg_pf")) { *applied = r4d_gg_pf_get(); return 1; }

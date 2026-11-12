@@ -29,6 +29,11 @@ int r4d_rad_rmsnorm_rope_roundtrip_kv_store(const RadArgs* a, RadStream stream);
 int r4d_rad_rope_rows_roundtrip(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_collapse_rmsnorm(const RadArgs* a, RadStream stream);
 int r4d_rad_mhc_post_collapse_rmsnorm(const RadArgs* a, RadStream stream);
+/* lever M1 (ds41-int9b): mhc_post_collapse_rmsnorm + mhc_mix over its out, one op (three launches), and its scratch */
+int r4d_rad_mhc_post_collapse_rmsnorm_mix(const RadArgs* a, RadStream stream);
+int64_t r4d_rad_mhc_post_collapse_rmsnorm_mix_scratch(const RadArgs* a);
+/* tests only (r4d_selftest's mutation controls): 0 the production forms, else a deliberately NOT exact variant */
+void r4d_i9b_mutate(int which);
 
 /* Shapes (r4d_ds41_elem_shapes.inc), libref's ref_<op>_shape operand for operand. */
 int r4d_shape_token_map(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
@@ -48,6 +53,7 @@ int r4d_shape_rmsnorm_rope_roundtrip_kv_store(const RadParam* p, int n_p, int op
 int r4d_shape_rope_rows_roundtrip(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_mhc_collapse_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r4d_shape_mhc_post_collapse_rmsnorm_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 /* The chains the fused rows replace (r4d_fuse.cpp). */
 int r4d_fuse_rmsnorm_rope_roundtrip(const RadParam*, int, uint64_t, int, RadFuseStep*);

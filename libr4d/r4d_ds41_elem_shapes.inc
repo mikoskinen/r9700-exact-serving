@@ -244,3 +244,19 @@ extern "C" int r4d_shape_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, i
     };
     R4D_PICK(l);
 }
+
+/* lever M1 (ds41-int9b): mhc_post_collapse_rmsnorm's operands, then mhc_mix's fn, scale, base and pre (post and comb
+ * are the first's, inout); hc 4, n a multiple of 1024. */
+extern "C" int r4d_shape_mhc_post_collapse_rmsnorm_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    if (M <= 0 || hc != 4 || n < 1024 || n % 1024 || n > 16384) return RAD_E_UNSUPPORTED;
+    if (operand < 9) return r4d_shape_mhc_post_collapse_rmsnorm(p, n_p, operand, out);
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd((uint32_t)RAD_F32, hc * (hc + 2), hc * n),  /* fn */
+        opd((uint32_t)RAD_F32, 3),                      /* scale */
+        opd((uint32_t)RAD_F32, hc * (hc + 2)),          /* base */
+        opd((uint32_t)RAD_F32, M, hc),                  /* pre_o */
+    };
+    R4D_PICK(l);
+}

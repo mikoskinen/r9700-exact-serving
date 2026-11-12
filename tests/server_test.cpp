@@ -5363,7 +5363,9 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK(has(f.get("/admin/fn4").body,
               "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1, \"ds41_engdd\": -1, "
               "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, \"stage_full_min\": 0, "
-              "\"stage_full_pick\": 0}"));   /* ds41-int9: lever SP appended after place_hb */
+              "\"stage_full_pick\": 0, \"mhc_fuse\": -1, \"ix_lds\": -1, \"ix_ni\": -1}"));   /* ds41-int9: lever SP appended
+                                                                                    after place_hb; int9b: M1, IX-LDSR2, IX-NI (plugins'
+                                                                                    switches: -1 here) */
     CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
     CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
     CHECK_EQ(fn4::switch_index("ds41_psk_cr"), (int)fn4::kDs41PskCr);
@@ -5375,10 +5377,32 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kStagePick + 1, (int)fn4::kPlaceHb);
     CHECK_EQ((int)fn4::kPlaceHb + 1, (int)fn4::kStageFullMin);   /* ds41-int9: lever SP, appended */
     CHECK_EQ((int)fn4::kStageFullMin + 1, (int)fn4::kStageFullPick);
-    CHECK_EQ((int)fn4::kStageFullPick + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kStageFullPick + 1, (int)fn4::kMhcFuse);   /* ds41-int9b: levers M1, IX-LDSR2, IX-NI, appended */
+    CHECK_EQ((int)fn4::kMhcFuse + 1, (int)fn4::kIxLds);
+    CHECK_EQ((int)fn4::kIxLds + 1, (int)fn4::kIxNi);
+    CHECK_EQ((int)fn4::kIxNi + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
     CHECK_EQ((int)fn4::kPlaceHb, 49);
-    CHECK_EQ((int)fn4::kSwitches, 52);
+    CHECK_EQ((int)fn4::kStageFullPick, 51);
+    CHECK_EQ((int)fn4::kSwitches, 55);
+    CHECK_EQ(fn4::switch_index("mhc_fuse"), (int)fn4::kMhcFuse);
+    CHECK_EQ(fn4::switch_index("ix_lds"), (int)fn4::kIxLds);
+    CHECK_EQ(fn4::switch_index("ix_ni"), (int)fn4::kIxNi);
+    CHECK(!fn4::sched_switch(fn4::kMhcFuse) && !fn4::sched_switch(fn4::kIxLds) && !fn4::sched_switch(fn4::kIxNi));
+    {   /* ds41-int9b: no plugin serves the three here: refused, and GET "i9b" all 0 */
+        for (const char* b : { R"({"mhc_fuse":1})", R"({"ix_lds":1})", R"({"ix_ni":1})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        const HttpResponse g9 = f.get("/admin/fn4");
+        CHECK(has(g9.body, "\"i9b\": {\"mhc\": {\"declared\": 0, \"pairs\": 0, \"rows\": 0, \"small\": 0}, "
+                           "\"ix\": {\"lds_launches\": 0, \"lds_rows\": 0, \"ni_launches\": 0, \"ni_cand_launches\": 0}, "
+                           "\"ni\": {\"runs\": 0, \"dead_bytes\": 0}}"));
+        int64_t v[fn4::kI9bStats];
+        fn4::i9b_stats(v);
+        for (int i = 0; i < fn4::kI9bStats; ++i) CHECK_EQ(v[i], (int64_t)0);
+    }
     CHECK_EQ(fn4::switch_index("stage_full_min"), (int)fn4::kStageFullMin);
     CHECK_EQ(fn4::switch_index("stage_full_pick"), (int)fn4::kStageFullPick);
     CHECK(fn4::sched_switch(fn4::kStageFullMin) && fn4::sched_switch(fn4::kStageFullPick));
@@ -5411,7 +5435,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     {
         const HttpResponse g0 = f.get("/admin/fn4");
         CHECK(has(g0.body, "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, "
-                           "\"stage_full_min\": 0, \"stage_full_pick\": 0}"));   /* ds41-int8: after sched_noa; int9: SP after */
+                           "\"stage_full_min\": 0, \"stage_full_pick\": 0, \"mhc_fuse\": -1"));   /* ds41-int8: after sched_noa; int9: SP
+                                                                                        after; int9b: M1 / IX after */
         CHECK(!has(g0.body, "\"sahb\": {"));
         const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_short":1025})");
         CHECK_EQ(s0.status, 400);
@@ -5472,7 +5497,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
      * engine at the release; pinned at the same value: no epoch. */
     {
         const HttpResponse g0 = f.get("/admin/fn4");
-        CHECK(has(g0.body, "\"place_hb\": 0, \"stage_full_min\": 0, \"stage_full_pick\": 0}"));
+        CHECK(has(g0.body, "\"place_hb\": 0, \"stage_full_min\": 0, \"stage_full_pick\": 0, \"mhc_fuse\": -1"));
         CHECK(!has(g0.body, "\"sp\": {"));
         const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_full_min":4097})");
         CHECK_EQ(s0.status, 400);
@@ -5505,7 +5530,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         const int64_t v1[fn4::kSpN] = { 3, 7400, 120, 2900, 30408704000, 2800, 410, 5, 11800 };
         fn4::note_sp(1, v1);
         const HttpResponse g1 = f.get("/admin/fn4");
-        CHECK(has(g1.body, "\"stage_full_min\": 4161, \"stage_full_pick\": 2}"));
+        CHECK(has(g1.body, "\"stage_full_min\": 4161, \"stage_full_pick\": 2, \"mhc_fuse\": -1"));
         CHECK(has(g1.body, "\"sp\": {\"capable\": 1, \"ranks\": [{\"rank\": 0, \"full_steps\": 0"));
         CHECK(has(g1.body, "{\"rank\": 1, \"full_steps\": 3, \"full_rows\": 7400, \"full_layers\": 120, "
                            "\"full_units\": 2900, \"full_bytes\": 30408704000, \"full_pick_kept\": 2800, "

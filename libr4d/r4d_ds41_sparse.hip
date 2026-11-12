@@ -32,6 +32,7 @@
 #include "r4d_emit.h"
 #include "r4d_plugin.h"
 
+#include <atomic>
 #include <climits>
 #include <cstdlib>
 #include <cmath>
@@ -144,6 +145,11 @@ struct DsScoreArgs {
     int nbt, S, M, Mv, C, H, ratio, cbs, slot, block, bshift;
     int kmx;                                         /* key_format mxfp4: the cache holds packed keys */
     float wscale;
+    /* lever IX-NI (ds41-int9b, libr4d fn4 ix_ni): 1 = no -inf is written past a row's reach (a row from Mv on: none
+     * at all) -- index_topk reads a row only below its reach (ds_topk_reach), and index_candidates under ix_ni only
+     * below it too (DsBlockKey::lim), so no reader sees those words; 0 = every word to C as before. 2 = the selftest's
+     * mutation control (r4d_i9b_mutate 4: the row's last live entry left unwritten too -- NOT exact). */
+    int ni;
 };
 
 /* ---- MXFP4 index keys (index_score key_format mxfp4, entry_store format mxfp4): an n-value key as
@@ -404,13 +410,13 @@ __global__ __launch_bounds__(256) void ds41_index_score_kernel(DsScoreArgs a) {
         float* srow = a.sc + m * a.sr;
         const long reach = m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
         if (jb >= reach) {                           /* block-uniform: no key in this block */
-            if (sub == 0 && j < a.C) srow[j * a.scs] = -kDsInf;
+            if (sub == 0 && j < a.C && !a.ni) srow[j * a.scs] = -kDsInf;
             continue;
         }
         const int s = ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
         const uint16_t* kp = ds_entry_key(a, s, j, reach);
         const float acc = ds_score_entry<HS>(a, m, kp, part, e, sub, h0, h1);
-        if (sub == 0 && j < a.C) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+        if (sub == 0 && j < a.C && !(a.ni && j >= reach)) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
     }
 }
 
@@ -519,7 +525,7 @@ __global__ __launch_bounds__(256) void ds41_index_score_kept_kernel(DsScoreArgs 
             const long g = gridDim.x, x = blockIdx.x;
             const long p0 = (long)a.C * x / g, p1 = (long)a.C * (x + 1) / g;
             for (long j = p0 + threadIdx.x; j < p1; j += 256)
-                if (j >= reach || !ds_kept(a, krow, j)) srow[j * a.scs] = -kDsInf;
+                if (j >= reach ? !a.ni : !ds_kept(a, krow, j)) srow[j * a.scs] = -kDsInf;   /* ix_ni: none past reach */
         }
         if (reach <= 0) continue;                    /* block-uniform */
         const long nbr = (reach < a.C ? reach : (long)a.C) + block - 1;
@@ -897,17 +903,22 @@ struct DsCandArgs {
     int* keep;
     long sr, scs, ps, kr, kcs;
     int M, C, block, KB, ratio;
+    int ni;   /* lever IX-NI (libr4d fn4 ix_ni): a row's positions read only below its reach (DsBlockKey::lim) */
 };
 
 /* Block b's score: the max of its positions (std::max(cur, v): a NaN never replaces), +inf when
- * pinned. A -inf block is never kept, so it is not a candidate. */
+ * pinned. A -inf block is never kept, so it is not a candidate.
+ * lim (lever IX-NI, ds41-int9b): the positions read end at lim = min(reach, C) under ix_ni, else C. Exact: index_score
+ * writes -inf at every position in [reach, C) without ix_ni, and a -inf never replaces bs (bs < -inf is false), so the max
+ * over [j0, min(j1, reach)) is the max over [j0, j1); a block from reach on is then -inf (key 0) either way, and it is
+ * never the pinned one (pin = (reach - 1) / block). Under ix_ni those positions hold whatever an earlier pass left. */
 struct DsBlockKey {
     const float* row;
-    long scs, C, block, pin;
+    long scs, C, block, pin, lim;
     __device__ __forceinline__ uint32_t operator()(uint32_t b) const {
         float bs = -kDsInf;
         const long j0 = (long)b * block;
-        const long j1 = j0 + block < C ? j0 + block : C;
+        const long j1 = j0 + block < lim ? j0 + block : lim;
         for (long j = j0; j < j1; ++j) {
             const float v = row[j * scs];
             bs = bs < v ? v : bs;
@@ -926,7 +937,8 @@ __global__ __launch_bounds__(kDsSelThreads) void ds41_index_candidates_kernel(Ds
     for (long m = blockIdx.x; m < a.M; m += gridDim.x) {
         const long reach = ((long)a.pos[m * a.ps] + 1) / a.ratio;
         const long pin = (reach >= 1 && (reach - 1) / a.block < nb) ? (reach - 1) / a.block : -1;
-        const DsBlockKey get{ a.sc + m * a.sr, a.scs, a.C, a.block, pin };
+        const long lim = a.ni ? (reach < 0 ? 0 : reach < (long)a.C ? reach : (long)a.C) : (long)a.C;
+        const DsBlockKey get{ a.sc + m * a.sr, a.scs, a.C, a.block, pin, lim };
         uint32_t* c = nb <= kDsCacheUse ? cache : nullptr;
         ds_select(get, (uint32_t)nb, (uint32_t)a.KB, c, &s);
         int* krow = a.keep + m * a.kr;
@@ -2590,9 +2602,11 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
     float* srow = a.sc + m * a.sr;
     const long reach = m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
     if (jb >= reach) {
-        for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
+        if (!a.ni)                                   /* ix_ni: nothing past the row's reach */
+            for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
         return;
     }
+    const long dead = a.ni == 2 ? reach - 1 : reach;   /* ix_ni: the first word not written (2: the mutation) */
     /* KEEP: lane i holds the row's keep word kw0 + i of the words over [jb, min(jend, reach)), 0
      * past them; none set is a span with no kept entry, -inf without a key read (wave-uniform). */
     [[maybe_unused]] unsigned kword = 0u;
@@ -2604,7 +2618,8 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
         const long nw = (ds_keep_block(a, jl) >> 5) - kw0 + 1;
         kword = lane < nw ? (unsigned)krow[(kw0 + lane) * a.kcs] : 0u;
         if (__builtin_amdgcn_ballot_w32(kword != 0u) == 0u) {
-            for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
+            const long je = a.ni && reach < jend ? reach : jend;
+            for (long j = jb + lane; j < je; j += 32) srow[j * a.scs] = -kDsInf;
             return;
         }
     }
@@ -2628,7 +2643,8 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
     }
     for (long j0 = jb; j0 < jend; j0 += 16) {
         if (j0 >= reach) {                           /* wave-uniform: the rest is past the row */
-            for (long j = j0 + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
+            if (!a.ni)
+                for (long j = j0 + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
             break;
         }
         const long j = j0 + (lane & 15);
@@ -2641,7 +2657,7 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
             const unsigned wd = (unsigned)__builtin_amdgcn_ds_bpermute((int)wi << 2, (int)kword);
             live = live && ((wd >> (ds_keep_block(a, j) & 31)) & 1u) != 0u;
             if (__builtin_amdgcn_ballot_w32(live) == 0u) {
-                if (hf == 1 && j < jend) srow[j * a.scs] = -kDsInf;
+                if (hf == 1 && j < jend && !(a.ni && j >= dead)) srow[j * a.scs] = -kDsInf;
                 continue;
             }
         }
@@ -2687,7 +2703,170 @@ __global__ __launch_bounds__(256) void ds41_index_score_wm_kernel(DsScoreArgs a)
                 }
             }
         }
-        if (hf == 1 && j < jend) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+        if (hf == 1 && j < jend && !(a.ni && j >= dead)) srow[j * a.scs] = kp ? ds_round_bf16(acc) : -kDsInf;
+    }
+}
+
+/* ---- index_score's LDS form (lever IX-LDSR2, ds41-int9b, libr4d fn4 ix_lds; kbench2 12.11.2026: -33..-34 % at 136k,
+ * -20..-27 % at 64k, the bytes the image's at 136k / 64k / 16k x ratio 1 / 2 and on stress data). The passes the form
+ * above takes WITHOUT keep, over MXFP4 keys: a workgroup's kIwEB entries are unpacked ONCE into LDS (ds_mx4_unpack8 of the
+ * same words, a padded row of 17 uint4 an entry, so lanes on 16 consecutive entries hit distinct banks) and each of its
+ * 8 waves scores TWO rows from them (16 rows a workgroup) instead of a wave unpacking every tile for its one row. Per
+ * output the stock form's arithmetic: the same q tiles and key tiles into the same 8-step WMMA chain a head tile, the same
+ * epilogue in head order, -inf where the stock form writes it (past the row's reach, an unmapped entry). An entry another
+ * row of the workgroup reaches but this one does not is staged with its real key and multiplied, but scores -inf: a WMMA
+ * output column depends on its own B column only, so no other entry moves. The staged keys are the workgroup's sequence's:
+ * a workgroup whose rows are of more than one sequence (a run across a sequence boundary: ds41_bi off) walks the stock
+ * way instead, each row's own keys read and unpacked a tile at a time -- the stock loop. REVK (the 8-step chain in
+ * reverse) is the selftest's mutation control only (r4d_i9b_mutate 3: NOT exact). */
+__device__ __forceinline__ const uint16_t* ds_iw_key(const DsScoreArgs& a, int s, long j) {
+    const long col = (j * a.ratio) / a.cbs;
+    if (col < a.nbt) {
+        const long blk = a.bt[(long)s * a.btr + col * a.btc];
+        if (blk >= 0 && blk < a.nblk) return a.kc + (blk * a.cbs + (j * a.ratio) % a.cbs) * (long)a.slot;
+    }
+    return nullptr;
+}
+__device__ __forceinline__ void ds_iw_unpack(const uint16_t* kp, int hf, uint4 (&kb)[8]) {
+    const unsigned char* pb = (const unsigned char*)(kp ? kp : kDsZeroKey);
+    const uint4 c0 = *(const uint4*)(pb + 32 * hf), c1 = *(const uint4*)(pb + 32 * hf + 16);
+    const uint32_t e0 = pb[64 + 2 * hf], e1 = pb[64 + 2 * hf + 1];
+    const uint32_t cw[8] = { c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w };
+#pragma unroll
+    for (int i = 0; i < 8; ++i) kb[i] = ds_mx4_unpack8(cw[i], i < 4 ? e0 : e1);
+}
+constexpr int kIwLdsRows = 2;                        /* rows a wave */
+constexpr int kIwLdsPad = 17;                        /* uint4 an entry's LDS row */
+
+template <int HT, bool REVK>
+__global__ __launch_bounds__(256) void ds41_index_score_lds_kernel(DsScoreArgs a) {
+    constexpr int DM = 128, EB = kIwEB, RPW = kIwLdsRows, KP = kIwLdsPad;
+    __shared__ uint4 kl[EB * KP];
+    __shared__ unsigned char kmap[EB];
+    __shared__ long s_reach[8 * RPW];
+    __shared__ int s_seq[8 * RPW];
+    const int lane = threadIdx.x & 31, hf = lane >> 4;
+    const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
+    const long g0 = (long)blockIdx.y * 8 * RPW;
+    if (threadIdx.x < 8 * RPW) {
+        const long m = g0 + threadIdx.x;
+        const long rc = m < a.M && m < a.Mv ? ((long)a.pos[m * a.ps] + 1) / a.ratio : 0;
+        s_reach[threadIdx.x] = rc;
+        s_seq[threadIdx.x] = rc > 0 ? ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m) : -1;
+    }
+    __syncthreads();
+    long rwg = 0;
+    int s = -1;
+    bool uni = true;
+    for (int i = 0; i < 8 * RPW; ++i) {
+        rwg = s_reach[i] > rwg ? s_reach[i] : rwg;
+        if (s_seq[i] >= 0) {
+            if (s < 0) s = s_seq[i];
+            else if (s_seq[i] != s) uni = false;
+        }
+    }
+    const long jb = (long)blockIdx.x * EB;
+    const long jend = jb + EB < (long)a.C ? jb + EB : (long)a.C;
+    const long mb = g0 + (long)wave * RPW;
+    if (jb >= rwg) {                                 /* workgroup-uniform: every row past this span */
+        if (!a.ni)
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) {
+                const long m = mb + r;
+                if (m >= a.M) continue;
+                float* srow = a.sc + m * a.sr;
+                for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
+            }
+        return;
+    }
+    if (uni) {                                       /* workgroup-uniform: stage the span's keys, a thread pair a key */
+        for (int e = (int)threadIdx.x >> 1; e < EB; e += 128) {
+            const int h2 = threadIdx.x & 1;
+            const long j = jb + e;
+            const uint16_t* kp = j < jend && j < rwg ? ds_iw_key(a, s, j) : nullptr;
+            uint4 kb[8];
+            ds_iw_unpack(kp, h2, kb);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) kl[e * KP + 8 * h2 + i] = kb[i];
+            if (h2 == 0) kmap[e] = kp ? 1 : 0;
+        }
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int r = 0; r < RPW; ++r) {
+        const long m = mb + r;
+        if (m >= a.M) continue;                      /* wave-uniform */
+        float* srow = a.sc + m * a.sr;
+        const long reach = s_reach[wave * RPW + r];
+        if (jb >= reach) {
+            if (!a.ni)
+                for (long j = jb + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
+            continue;
+        }
+        const long dead = a.ni == 2 ? reach - 1 : reach;
+        const int sr = uni ? s : ds_seq_of_row(a.cu, a.cs, a.S, a.row0 + m);
+        uint4 qf[HT][8];
+        float wh[HT][8];
+#pragma unroll
+        for (int t = 0; t < HT; ++t) {
+            const int h = t * 16 + (lane & 15);
+            const uint16_t* qp = a.q + m * a.qr + (long)(h < a.H ? h : 0) * DM + 64 * hf;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                qf[t][i] = *(const uint4*)(qp + 8 * i);
+                if (h >= a.H) qf[t][i] = make_uint4(0u, 0u, 0u, 0u);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int hh = t * 16 + 8 * hf + e;
+                wh[t][e] = hh < a.H ? ds_round_bf16(ds_bf(a.w[m * a.wr + (long)hh * a.wc]) * a.wscale) : 0.0f;
+            }
+        }
+        for (long j0 = jb; j0 < jend; j0 += 16) {
+            if (j0 >= reach) {                       /* wave-uniform: the rest is past the row */
+                if (!a.ni)
+                    for (long j = j0 + lane; j < jend; j += 32) srow[j * a.scs] = -kDsInf;
+                break;
+            }
+            const int el = (int)(j0 - jb) + (lane & 15);
+            const long j = j0 + (lane & 15);
+            bool live = j < jend && j < reach;
+            uint4 kb[8];
+            if (uni) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) kb[i] = kl[el * KP + 8 * hf + i];
+                live = live && kmap[el] != 0;
+            } else {
+                const uint16_t* kp = live ? ds_iw_key(a, sr, j) : nullptr;
+                ds_iw_unpack(kp, hf, kb);
+                live = live && kp != nullptr;
+            }
+            ds_v8f d[HT];
+#pragma unroll
+            for (int t = 0; t < HT; ++t) {
+                d[t] = (ds_v8f)(0.0f);
+#pragma unroll
+                for (int ii = 0; ii < 8; ++ii) {
+                    const int i = REVK ? 7 - ii : ii;
+                    d[t] = ds_wmma(qf[t][i], kb[i], d[t]);
+                }
+            }
+            /* heads 0-7 in lane L, 8-15 in L^16, then 16-23 back in L and 24-31 in L^16 */
+            float acc = 0.0f;
+#pragma unroll
+            for (int t = 0; t < HT; ++t) {
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    if (t + half > 0) acc = ds_xor16(acc);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const float dot = ds_round_bf16(d[t][e]);
+                        acc = acc + ds_round_bf16((dot < 0.0f ? 0.0f : dot) * wh[t][e]);
+                    }
+                }
+            }
+            if (hf == 1 && j < jend && !(a.ni && j >= dead)) srow[j * a.scs] = live ? ds_round_bf16(acc) : -kDsInf;
+        }
     }
 }
 
@@ -2798,6 +2977,36 @@ int64_t topk_split_bytes(long rows, long C, long K) {
     return (int64_t)rows * nch * K * 8 + (int64_t)rows * nch * 4 + (int64_t)rows * 4 + 16;
 }
 
+/* Levers IX-LDSR2 / IX-NI (ds41-int9b): libr4d's fn4 switches ix_lds and ix_ni (rad_fn4_* in r4d_ds41_ggml.hip), each
+ * 0 / 1, the start value RADIANCE_DS41_IX_LDS / RADIANCE_DS41_IX_NI = 1 (anything else or unset: 0); read at each launch.
+ * Their counters (rad_ix_stats, every rank's launches summed; a recorded pass counts when it is recorded): LDS-form
+ * launches and their rows, index_score launches under ix_ni, index_candidates launches under ix_ni. g_ix_mut: the
+ * selftest's mutation controls (r4d_i9b_mutate 3 / 4 / 5), never set in production. */
+int ix_env(const char* name) {
+    const char* e = std::getenv(name);
+    return e && e[0] == '1' && !e[1] ? 1 : 0;
+}
+std::atomic<int> g_ix_lds{-1}, g_ix_ni{-1}, g_ix_mut{0};
+std::atomic<long long> g_ix_lds_launch{0}, g_ix_lds_rows{0}, g_ix_ni_launch{0}, g_ix_ni_cand{0};
+int ix_lds_on() {
+    int v = g_ix_lds.load(std::memory_order_relaxed);
+    if (v < 0) {
+        int unread = -1;
+        g_ix_lds.compare_exchange_strong(unread, ix_env("RADIANCE_DS41_IX_LDS"));
+        v = g_ix_lds.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+int ix_ni_on() {
+    int v = g_ix_ni.load(std::memory_order_relaxed);
+    if (v < 0) {
+        int unread = -1;
+        g_ix_ni.compare_exchange_strong(unread, ix_env("RADIANCE_DS41_IX_NI"));
+        v = g_ix_ni.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+
 int index_score_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 7 || !a->t) return RAD_E_INVAL;
     const RadTensor &q = a->t[0], &w = a->t[1], &kc = a->t[2], &bt = a->t[3];
@@ -2883,11 +3092,26 @@ int index_score_body(const RadArgs* a, RadStream stream) {
     s.bshift = -1;
     for (int sh = 0; sh < 31; ++sh)
         if ((1LL << sh) == (long long)s.block) s.bshift = sh;
+    const int mut = g_ix_mut.load(std::memory_order_relaxed);
+    s.ni = ix_ni_on() > 0 ? (mut == 4 ? 2 : 1) : 0;
+    if (s.ni) g_ix_ni_launch.fetch_add(1, std::memory_order_relaxed);
     /* Prefill heights on WMMA (up to 32 heads, 16-byte q rows); the decode band on the scalar
      * kernel below (libref's bits). The form is picked by the pass height alone, with or without
      * keep, so a kept entry's score is the unrestricted op's. */
     if (s.M > kWmRows && H <= 32 && s.qr % 8 == 0 && aligned(s.q, 16) &&
         (s.M + 7) / 8 <= 65535) {
+        /* lever IX-LDSR2 (ix_lds 1): the LDS form, without keep, over MXFP4 keys -- the same bits */
+        if (!keep && s.kmx && ix_lds_on() > 0 && (s.M + 8 * kIwLdsRows - 1) / (8 * kIwLdsRows) <= 65535) {
+            g_ix_lds_launch.fetch_add(1, std::memory_order_relaxed);
+            g_ix_lds_rows.fetch_add(s.Mv, std::memory_order_relaxed);
+            const dim3 grid((unsigned)((s.C + kIwEB - 1) / kIwEB), (unsigned)((s.M + 8 * kIwLdsRows - 1) / (8 * kIwLdsRows)));
+            if (mut == 3) {
+                if (H > 16) return R4D_EMIT(stream, (ds41_index_score_lds_kernel<2, true>), grid, dim3(256), 0u, s);
+                return R4D_EMIT(stream, (ds41_index_score_lds_kernel<1, true>), grid, dim3(256), 0u, s);
+            }
+            if (H > 16) return R4D_EMIT(stream, (ds41_index_score_lds_kernel<2, false>), grid, dim3(256), 0u, s);
+            return R4D_EMIT(stream, (ds41_index_score_lds_kernel<1, false>), grid, dim3(256), 0u, s);
+        }
         if (keep) {
             const dim3 grid((unsigned)((s.C + kIwKeepEB - 1) / kIwKeepEB), (unsigned)((s.M + 7) / 8));
             if (H > 16) return R4D_EMIT(stream, (ds41_index_score_wm_kernel<2, true>), grid, dim3(256), 0u, s);
@@ -2950,6 +3174,10 @@ int index_candidates_body(const RadArgs* a, RadStream stream) {
     c.block = (int)block;
     c.KB = (int)(kb < INT_MAX ? kb : INT_MAX);
     c.ratio = (int)(ratio < INT_MAX ? ratio : INT_MAX);
+    /* lever IX-NI: read a row only below its reach (exact, DsBlockKey); 5 = the selftest's mutation (the full width
+     * read over a plane ix_ni left unwritten past reach: NOT exact) */
+    c.ni = ix_ni_on() > 0 && g_ix_mut.load(std::memory_order_relaxed) != 5 ? 1 : 0;
+    if (ix_ni_on() > 0) g_ix_ni_cand.fetch_add(1, std::memory_order_relaxed);
     const unsigned g = (unsigned)(c.M < 65535 ? c.M : 65535);
     return R4D_EMIT(stream, ds41_index_candidates_kernel, dim3(g), dim3(kDsSelThreads), 0, c);
 }
@@ -3439,6 +3667,23 @@ extern "C" int r4d_ds41_entry_store_nv4(const RadArgs* a, RadStream stream) {
 
 extern "C" int r4d_rad_ds41_index_score(const RadArgs* a, RadStream stream) {
     return index_score_body(a, stream);
+}
+/* Levers IX-LDSR2 / IX-NI (ds41-int9b): the fn4 switches' state (r4d_ds41_ggml.hip's rad_fn4_*), the counters and the
+ * selftest's mutation hook. */
+int r4d_ix_lds_get() { return ix_lds_on(); }
+int r4d_ix_ni_get() { return ix_ni_on(); }
+void r4d_ix_lds_set(int v) { g_ix_lds.store(v ? 1 : 0, std::memory_order_relaxed); }
+void r4d_ix_ni_set(int v) { g_ix_ni.store(v ? 1 : 0, std::memory_order_relaxed); }
+extern "C" void r4d_ix_mutate(int which) { g_ix_mut.store(which, std::memory_order_relaxed); }
+/* out[0] LDS-form launches, [1] their rows (the run rows each launch holds), [2] index_score launches under ix_ni, [3]
+ * index_candidates launches under ix_ni; every rank's launches summed, cumulative. Returns how many it wrote (4). */
+extern "C" int rad_ix_stats(long long* out, int n) {
+    if (!out || n < 4) return 0;
+    out[0] = g_ix_lds_launch.load(std::memory_order_relaxed);
+    out[1] = g_ix_lds_rows.load(std::memory_order_relaxed);
+    out[2] = g_ix_ni_launch.load(std::memory_order_relaxed);
+    out[3] = g_ix_ni_cand.load(std::memory_order_relaxed);
+    return 4;
 }
 extern "C" int r4d_rad_ds41_index_candidates(const RadArgs* a, RadStream stream) {
     return index_candidates_body(a, stream);

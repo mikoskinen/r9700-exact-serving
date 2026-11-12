@@ -323,6 +323,20 @@
  *                   rest are read in place. Placement only. GET "sp" counts, per rank, full_steps / full_rows /
  *                   full_layers / full_units / full_bytes (every armed full-plan pass, any pick), full_pick_kept /
  *                   full_pick_dropped, stream_steps / stream_rows (full-plan passes stage_full_min left unarmed).
+ *   mhc_fuse        deepseek41 (lever M1, ds41-int9b): 0 off (today); 1 a pcn_a / pcn_f launch (mhc_post_collapse_rmsnorm: the
+ *                   post, the next connection's collapse and norm) of at least 512 rows is issued as
+ *                   mhc_post_collapse_rmsnorm_mix -- the same op with that connection's mhc_mix over the streams it wrote, in
+ *                   one op -- and the mix is not issued for those rows; N in 2 .. 1048576 the same from N rows.
+ *                   RADIANCE_DS41_MHC_FUSE=0 | 1 | N declares it (the fused op beside every pair) and starts at that value;
+ *                   unset declares nothing and >= 1 is refused. Exact: the two ops' bytes (libr4d pcn_mix_body; mhc_mix's
+ *                   arithmetic is a row's own, so mixing some rows in the fused launch and the rest in the mix is too).
+ *   ix_lds          libr4d (lever IX-LDSR2): 0 / 1 -- index_score's prefill WMMA form without keep, over MXFP4 keys, with a
+ *                   workgroup's keys unpacked once into LDS and two rows a wave (16 a workgroup); the stock form's
+ *                   per-output arithmetic, so the same bytes. RADIANCE_DS41_IX_LDS=1 at load starts it at 1.
+ *   ix_ni           libr4d (lever IX-NI) + deepseek41 (its count): 0 / 1 -- index_score writes no -inf past a row's reach
+ *                   (index_topk reads a row only below its reach) and index_candidates reads a row only below its reach (a
+ *                   -inf never moves a block maximum, so the same keep words). RADIANCE_DS41_IX_NI=1 starts it at 1.
+ *                   GET "i9b" carries the three levers' counters (i9b_stats).
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -399,7 +413,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
-              kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kSwitches };
+              kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -507,6 +521,13 @@ int  psk_stats(int64_t out[kPskStats]);
 /* Lever PSK-DS's live counters (ds41-pskl20, /stats "dspark_pfctx", the plugin's rad_dspark_pfctx_stats, rank 0's):
  * [0] dspark_pfctx (-1: no plugin serves it), [1] context passes cut, [2] their rows not run, [3] the rows they ran. */
 int  dspark_pfctx_stats(int64_t out[4]);
+/* Levers M1 / IX-LDSR2 / IX-NI's live counters (ds41-int9b, GET /admin/fn4 "i9b"), cumulative, counted at issue (a
+ * recorded pass when it is recorded): out[0..5] deepseek41's rad_i9b_stats (rank 0): M1 declared, fused launches, their
+ * rows, launches left unfused below the switch's rows, index_score runs issued under ix_ni, the plane bytes they leave
+ * unwritten; out[6..9] libr4d's rad_ix_stats (every rank summed): LDS-form launches, their rows, index_score launches under
+ * ix_ni, index_candidates launches under ix_ni. 0s where no plugin serves them. */
+constexpr int kI9bStats = 10;
+void i9b_stats(int64_t out[kI9bStats]);
 /* Lever E1's live counters (ds41-e1, /stats "engdd"; the plugin's rad_engdd_stats, rank 0's, cumulative): Engram layer
  * passes deduplicated, rows not computed in them, rows pooled in them, layer passes kept whole by the 48-row guard, layer
  * passes below the repeat share, steps with a deduplicated layer, layer passes with no launch above the band -- 0s and a

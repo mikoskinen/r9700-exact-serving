@@ -231,6 +231,24 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
     C_GE("M", 1),  C_LE("M", 65535), C_GE("n", 1),          C_LE("n", 16384),
     C_GE("hc", 2), C_LE("hc", 8),    C_IN("dtype", "bf16"),
 };
+/* lever M1 (ds41-int9b): mhc_post_collapse_rmsnorm, then mhc_mix over its out -- the first's parameters and operands, then
+ * mhc_mix's iterations / hc_eps and fn, scale, base and pre (`eps` is both ops': DeepSeek-V4.1 gives the norm and the mix
+ * rms_norm_eps); post and comb are read as the post's gates and written as the mix's. */
+static const RadParamSpec pDs41PcnMix[] = { P_INT("M"),     P_INT("n"),          P_INT("hc"),
+                                            P_INT("iterations"), P_F64("eps"),   P_F64("hc_eps"),
+                                            P_STR("dtype"), P_F64O("wadd"),      P_F64O("mult") };
+static const RadOperandSpec oDs41PcnMix[] = {
+    { "x", RAD_OPD_IN, 0 },       { "h", RAD_OPD_IN, 0 },       { "post", RAD_OPD_INOUT, 0 },
+    { "comb", RAD_OPD_INOUT, 0 }, { "out", RAD_OPD_OUT, 0 },    { "pre", RAD_OPD_IN, 0 },
+    { "xc", RAD_OPD_OUT, 0 },     { "w", RAD_OPD_WEIGHT, 0 },   { "y", RAD_OPD_OUT, 0 },
+    { "fn", RAD_OPD_WEIGHT, 0 },  { "scale", RAD_OPD_WEIGHT, 0 }, { "base", RAD_OPD_WEIGHT, 0 },
+    { "pre_o", RAD_OPD_OUT, 0 },
+};
+static const RadConstraint cDs41PcnMix[] = {
+    C_GE("M", 1),          C_LE("M", 65535),        C_GE("n", 1024), C_LE("n", 16384), C_DIV("n", 1024),
+    C_GE("hc", 4),         C_LE("hc", 4),           C_GE("iterations", 1), C_LE("iterations", 256),
+    C_IN("dtype", "bf16"),
+};
 
 #elif defined(R4D_DS41_SCHEMAS)
 
@@ -318,6 +336,11 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
            "mhc_post (x, h, post, comb -> out), then mhc_collapse (out, pre -> xc), then rmsnorm (xc, "
            "w -> y): out, xc and y as the three ops leave them, each rounded to dtype before the next "
            "step reads it. out must not alias h."),
+    SCHEMA("mhc_post_collapse_rmsnorm_mix", pDs41PcnMix, oDs41PcnMix,
+           "mhc_post_collapse_rmsnorm (x, h, post, comb -> out; out, pre -> xc; xc, w -> y), then mhc_mix over out "
+           "(fn, scale, base -> pre_o, post, comb): every output as the two ops leave them. post and comb are read "
+           "as the post's gates and then written as the mix's. A sublayer's output into the next connection's "
+           "collapse, norm and gates in one op (DeepSeek-V4.1's attention connection, lever M1)."),
 
 #elif defined(R4D_DS41_ROWS)
 
@@ -453,5 +476,15 @@ static const RadConstraint cDs41PostCollapseNorm[] = {
   R4D_PRIO_ONLY, ROW(cDs41PostCollapseNorm), NOTUNE, nullptr, nullptr,
   r4d_rad_mhc_post_collapse_rmsnorm, nullptr, nullptr, nullptr,
   r4d_shape_mhc_post_collapse_rmsnorm, nullptr, r4d_fuse_mhc_post_collapse_rmsnorm },
+/* lever M1 (ds41-int9b). No `replaces`: the arch issues it in place of the pair (deepseek41, RADIANCE_DS41_MHC_FUSE /
+ * fn4 mhc_fuse). r4d_selftest --case mhc_pcn_mix and tests/r4d_emu ds41i9b hold it to the two rows byte for byte. */
+{ "mhc_post_collapse_rmsnorm_mix_bf16", "mhc_post_collapse_rmsnorm_mix", "norm",
+  "mhc_post_collapse_rmsnorm, then mhc_mix over its out: three launches, the mix's projection formed from the post's "
+  "output in LDS",
+  "M 1..65535, hc 4, n a multiple of 1024 up to 16384; 8 rows x 1024 columns a workgroup, mhc_mix's finish kernel, a "
+  "workgroup a row for the norm (r4d_act_threads' order); mhc_mix's partials in scratch",
+  "bf16 x, h, out, xc and y, f32 post, comb, pre, w, fn, scale, base and pre_o", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cDs41PcnMix), NOTUNE, nullptr, nullptr, r4d_rad_mhc_post_collapse_rmsnorm_mix,
+  r4d_rad_mhc_post_collapse_rmsnorm_mix_scratch, nullptr, nullptr, r4d_shape_mhc_post_collapse_rmsnorm_mix },
 
 #endif
