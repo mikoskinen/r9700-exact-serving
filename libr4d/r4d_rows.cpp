@@ -11494,8 +11494,10 @@ extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
     out->pub      = 1;                 /* not an axis; see the note at tAr */
     /* Operand 0 is the message on every collective that reads this (all_reduce's x, a junction's
      * [M, n] input, all_gather's source). */
+    /* fn4 RSF (12.11.2026): a launch parameter `drain_force` 1 keeps the `drain` given (r4d_selftest --perfar4's fence
+     * A/B and stale-read stress); no declaration carries it. */
     if (a && a->t && a->n_t > 0 && rad_tensor_numel(&a->t[0]) >= kArFenceFromElems &&
-        r4d_geti_or(a, "world_size", a->world_size) == 4)
+        r4d_geti_or(a, "world_size", a->world_size) == 4 && r4d_geti_or(a, "drain_force", 0) == 0)
         out->drain = 1;
 }
 extern "C" int r4d_cfg_ar_tail(const RadArgs* a) {

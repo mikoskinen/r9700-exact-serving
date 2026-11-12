@@ -111,7 +111,7 @@ __global__ void r4d_ar_rs_rows_ti8_kernel(T* __restrict__ buf, R4DArWidePeers<ch
 // fn4 SP-hc on the exact line (12.11.2026): the reduce-scatter on RAW payload words -- every rank pushes its raw
 // contribution to each peer-owned shard; the owner folds every rank's words (its own included) in fp32 in ascending
 // source rank and rounds once, the four-rank exact all-reduce's per-element arithmetic (its two-shot's first half).
-template <typename T, int WS>
+template <typename T, int WS, bool XP = false>
 __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<char, WS - 1> peers,
                                           char* __restrict__ my_base, unsigned int* __restrict__ my_flags,
                                           unsigned int* __restrict__ seq_ctrs, int n_rows, int rg,
@@ -136,6 +136,26 @@ __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<ch
     pslot[p] = peers.scratch[p] + ((size_t)parity * WS + rank) * (size_t)slot_stride_bytes;
 
   // ---- my contribution to each peer-owned shard, raw, into its owner's slot for me
+  if constexpr (XP) {
+    /* fn4 RSF: every peer's word in the same pass, so all links carry the pushes at once (the same stores) */
+    const T* src[NPEERS];
+    int kE[NPEERS], kmax = 4 * gA;
+#pragma unroll
+    for (int p = 0; p < NPEERS; ++p) {
+      long g0; int ng;
+      sp_shard(peers.rank[p], n_rows, q, rg, g0, ng);
+      src[p] = buf + g0 * TI8_GROUP;
+      kE[p] = 4 * (gB < ng ? gB : ng);
+      kmax = kE[p] > kmax ? kE[p] : kmax;
+    }
+    for (int k = 4 * gA + tid; k < kmax; k += nt) {
+      uint4 v[NPEERS];
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) if (k < kE[p]) v[p] = *reinterpret_cast<const uint4*>(src[p] + (long)k * TI8_EPL);
+#pragma unroll
+      for (int p = 0; p < NPEERS; ++p) if (k < kE[p]) ((uint4*)pslot[p])[k] = v[p];
+    }
+  } else
   for (int p = 0; p < NPEERS; ++p) {
     long g0; int ng;
     sp_shard(peers.rank[p], n_rows, q, rg, g0, ng);
@@ -256,7 +276,7 @@ template <int WS>
 static void sp_rows_launch(int op, const long* peer_scratch, const long* peer_flags, long my_scratch, long my_flags,
                            long seq_ctrs, long slot_stride_bytes, long buf, long n_rows, long row, long dtype,
                            long rank, long stream_i, long nblocks, long nthreads, long drain, long acq, long pub,
-                           long gate, long gate_ctr) {
+                           long gate, long gate_ctr, bool xpush = false) {
   constexpr int NPEERS = WS - 1;
   const char* who = (op == 0 || op == 3) ? "sp rs" : "sp ag";
   if (rank < 0 || rank >= WS) throw std::runtime_error(std::string(who) + ": rank out of range");
@@ -299,11 +319,13 @@ static void sp_rows_launch(int op, const long* peer_scratch, const long* peer_fl
       (long)slot_stride_bytes, (int)rank, (int)drain, (int)acq, (int)pub, (long long*)gate, (unsigned int*)gate_ctr
   if (dtype == 0) {
     if (op == 0) r4d_ar_rs_rows_ti8_kernel<__hip_bfloat16, WS><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__hip_bfloat16));
+    else if (op == 3 && xpush) r4d_ar_rs_rows_raw_kernel<__hip_bfloat16, WS, true><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__hip_bfloat16));
     else if (op == 3) r4d_ar_rs_rows_raw_kernel<__hip_bfloat16, WS><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__hip_bfloat16));
     else if (op == 1) r4d_ar_ag_rows_kernel<__hip_bfloat16, WS, false><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__hip_bfloat16));
     else r4d_ar_ag_rows_kernel<__hip_bfloat16, WS, true><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__hip_bfloat16));
   } else {
     if (op == 0) r4d_ar_rs_rows_ti8_kernel<__half, WS><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__half));
+    else if (op == 3 && xpush) r4d_ar_rs_rows_raw_kernel<__half, WS, true><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__half));
     else if (op == 3) r4d_ar_rs_rows_raw_kernel<__half, WS><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__half));
     else if (op == 1) r4d_ar_ag_rows_kernel<__half, WS, false><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__half));
     else r4d_ar_ag_rows_kernel<__half, WS, true><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__half));
@@ -314,9 +336,10 @@ static void sp_rows_launch(int op, const long* peer_scratch, const long* peer_fl
 void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
                           long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
                           long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
-                          long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr) {
+                          long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr,
+                          long xpush) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   sp_rows_launch<4>(op, ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride_bytes, buf, n_rows, row, dtype, rank, stream,
-                    nblocks, nthreads, drain, acq, pub, gate, gate_ctr);
+                    nblocks, nthreads, drain, acq, pub, gate, gate_ctr, xpush != 0);
 }

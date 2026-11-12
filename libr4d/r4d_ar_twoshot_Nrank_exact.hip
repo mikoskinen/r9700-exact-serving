@@ -106,6 +106,25 @@ __device__ __forceinline__ void r4d_ar_twoshot_wide_exact_body(
   // phase 1: my contribution to each peer-owned shard -> owner's region A
   auto push1 = [&](int j) {
     const int p0 = w0 + j * pw, p1 = p0 + pw < w1 ? p0 + pw : w1;
+    if constexpr (FORM == R4D_AR8_FORM_XPUSH) {
+      const int4* s1[NPEERS];
+      int lim[NPEERS], lmax = p0;
+#pragma unroll
+      for (int i = 0; i < NPEERS; ++i) {
+        const int owner = peers.rank[i];
+        s1[i] = in4 + (size_t)R4D_TS_OFF(owner);
+        lim[i] = p1 < R4D_TS_LEN(owner) ? p1 : R4D_TS_LEN(owner);
+        lmax = lim[i] > lmax ? lim[i] : lmax;
+      }
+      for (int k = p0 + tid; k < lmax; k += nt) {
+        int4 v[NPEERS];
+#pragma unroll
+        for (int i = 0; i < NPEERS; ++i) if (k < lim[i]) v[i] = s1[i][k];
+#pragma unroll
+        for (int i = 0; i < NPEERS; ++i) if (k < lim[i]) pa[i][k] = v[i];
+      }
+      return;
+    }
     for (int i = 0; i < NPEERS; ++i) {
       const int p = FORM == R4D_AR8_FORM_LOCKSTEP ? i : (i + rank) % NPEERS;
       const int owner = peers.rank[p];
@@ -526,8 +545,8 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
   if (pieces < 1 || pieces > R4D_AR_TS_MAX_PIECES)
     throw std::runtime_error("all_reduce: pieces " + std::to_string(pieces) + " outside 1.." +
                              std::to_string((int)R4D_AR_TS_MAX_PIECES));
-  if (form < R4D_AR8_FORM_LOCKSTEP || form > R4D_AR8_FORM_SPLIT ||
-      (WS != 8 && form != R4D_AR8_FORM_LOCKSTEP))
+  if (form < R4D_AR8_FORM_LOCKSTEP || form > R4D_AR8_FORM_XPUSH ||
+      (WS != 8 && form != R4D_AR8_FORM_LOCKSTEP && form != R4D_AR8_FORM_XPUSH))
     throw std::runtime_error("all_reduce: form " + std::to_string(form) + " at " +
                              std::to_string(WS) + " ranks (ring and split are eight-rank forms)");
   // a block's share of the longest shard bounds the pieces worth a handshake each
@@ -572,8 +591,12 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
         R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_RING);                              \
       else if (form == R4D_AR8_FORM_SPLIT)                                            \
         R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_SPLIT);                             \
+      else if (form == R4D_AR8_FORM_XPUSH)                                            \
+        R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_XPUSH);                             \
       else                                                                            \
         R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_LOCKSTEP);                          \
+    } else if (form == R4D_AR8_FORM_XPUSH) {                                          \
+      R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_XPUSH);                               \
     } else {                                                                          \
       R4D_AR_TS_LAUNCH_F(T, LN, P, R4D_AR8_FORM_LOCKSTEP);                            \
     }                                                                                 \
@@ -610,12 +633,13 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub, long gate, long gate_ctr, long chain) {
+                                long acq, long pub, long gate, long gate_ctr, long chain, long form,
+                                long timeline) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub, gate, gate_ctr,
-                       nullptr, 1L, 0L, 0L, chain != 0);
+                       nullptr, 1L, timeline, form, chain != 0);
 }
 
 /* The coded form's conditions: bf16, a message that shards evenly into whole waves' 32 chunks

@@ -30000,6 +30000,7 @@ struct Ar8Perf {
      * size's width from `widths`); empty for --perfar8. */
     std::vector<int> sp_raw;
     std::vector<int64_t> widths;
+    std::vector<std::vector<RadParam>> extra;   /* --perfar4: per row, launch parameters appended */
     std::vector<int> nbs;
     StBarrier* bar = nullptr;
     int rc_init = RAD_OK;
@@ -30072,6 +30073,7 @@ static void ar8_perf_worker(Ar8Perf* t) {
                 if (nb > 0) ps.push_back(PI("nblocks", nb));
                 if (t->ks[j] > 0) ps.push_back(PI("pieces", t->ks[j]));
                 if (t->forms[j] >= 0) ps.push_back(PI("form", t->forms[j]));
+                if (j < t->extra.size()) for (const RadParam& q : t->extra[j]) ps.push_back(q);
                 const bool spr = j < t->sp_raw.size() && t->sp_raw[j] >= 0;
                 if (spr) {
                     ps.push_back(PI("raw", t->sp_raw[j]));
@@ -30264,11 +30266,92 @@ static bool ar8_weights_as_plugin(const std::vector<int>& devs, int* w, std::str
 
 /* --perfar4 RxW[,RxW..] [iters] (fn4 12.11.2026, after the riser move): the four-rank collectives a TP4 step runs, timed on
  * the four cards as ar8_perf times the eight-rank ones (one thread a card, warm, the slowest rank's period, the block rule):
- * the exact one-shot and two-shot, the tiered-int8 coded two-shot (lossy), and fn4 SP-hc's whole-row halves
- * (reduce_scatter_rows raw 1 = the exact fold, raw 0 = ti8; all_gather_rows raw 1 / 0), each message R rows of W bf16.
- * Bytes a rank sends: one-shot (N-1) S, two-shot 2 (N-1) / N S (both phases), a reduce-scatter or all-gather alone (N-1) / N S.
- * The all-reduces are checked against the fp32 ascending-rank fold (the ti8 row is lossy: its count is information);
- * the SP rows run in place and are timed only. */
+ * the exact two-shot (lockstep and RSF's interleaved first hop, `xpush`), its coded lane form (overlap 1, ~12.2 bits a
+ * value, exact), the true one-shot (ts_min 0), the tiered-int8 two-shot (lossy), and fn4 SP-hc's whole-row halves
+ * (reduce_scatter_rows raw 1 = the exact fold, lockstep and xpush; all_gather_rows raw 1; the ti8 pair), each message R rows
+ * of W bf16. The exact rows also at drain 1 / 2 / 3 / 0 (drain_force: the fence before the flag; r4d_ar_wide.h). Bytes a
+ * rank sends: one-shot (N-1) S, two-shot 2 (N-1) / N S (both phases), a reduce-scatter or all-gather alone (N-1) / N S.
+ * The all-reduces are checked against the fp32 ascending-rank fold after the first launch (ti8 lossy: information); the
+ * SP rows are timed only here. R4D_SELFTEST_AR4_STRESS=N then runs N launches a point of the exact two-shot (lockstep /
+ * xpush) and the raw reduce-scatter (lockstep / xpush) at each drain, from the first launch of a fresh instance (the
+ * slots' first reuse included), every launch's output checked: eight launches back to back into eight output buffers
+ * (the reduce-scatter: its input restored on the device before each, its own shard copied out after), then the checks. */
+struct Ar4Stress {
+    int rank = 0, dev = 0, world = 4, launches = 0;
+    const RadKernelInfo* row = nullptr;
+    std::vector<RadParam> extra;
+    bool rs = false;
+    int64_t n = 0, width = 0;
+    StBarrier* bar = nullptr;
+    int rc = RAD_OK;
+    int64_t bad = 0, bad_launches = 0, first_bad = -1;
+};
+static void ar4_stress_worker(Ar4Stress* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; t->bar->wait(); return; }
+    constexpr int NB = 8;
+    const int64_t n = t->n, rows = n / t->width, q = (rows + t->world - 1) / t->world;
+    const int64_t lo = std::min<int64_t>(t->rank * q, rows) * t->width, hi = std::min<int64_t>((t->rank + 1) * q, rows) * t->width;
+    void* inst = nullptr;
+    std::vector<RadParam> ip = { PI("world_size", t->world), PI("numel", n), PS("dtype", "bf16"), PI("exact", 1) };
+    t->rc = t->row->init(ip.data(), (int)ip.size(), t->rank, t->world, &inst);
+    void *in = nullptr, *pristine = nullptr;
+    void* outs[NB] = { nullptr };
+    if (t->rc == RAD_OK) {
+        if (hipMalloc(&in, (size_t)n * 2) != hipSuccess || hipMalloc(&pristine, (size_t)n * 2) != hipSuccess) t->rc = RAD_E_NOMEM;
+        for (int j = 0; j < NB && t->rc == RAD_OK; ++j)
+            if (hipMalloc(&outs[j], (size_t)(t->rs ? hi - lo : n) * 2) != hipSuccess) t->rc = RAD_E_NOMEM;
+    }
+    std::vector<uint16_t> h((size_t)n), want((size_t)n), got((size_t)n);
+    for (int64_t i = 0; i < n; ++i) {
+        float acc = 0.0f;
+        for (int r = 0; r < t->world; ++r) acc += h_bf16(h_to_bf16(ar_rough_value(r, i)));
+        h[(size_t)i] = h_to_bf16(ar_rough_value(t->rank, i));
+        want[(size_t)i] = h_to_bf16(acc);
+    }
+    if (t->rc == RAD_OK) {
+        st_memcpy(pristine, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+        st_memcpy(in, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
+    }
+    t->bar->wait();
+    if (t->rc != RAD_OK) { t->bar->wait(); return; }
+    std::vector<RadParam> ps = ip;
+    for (const RadParam& x : t->extra) ps.push_back(x);
+    if (t->rs) { ps.push_back(PI("raw", 1)); ps.push_back(PI("row", t->width)); }
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.p = ps.data(); a.n_p = (int)ps.size(); a.instance = inst; a.rank = t->rank; a.world_size = t->world;
+    for (int L = 0; L < t->launches && t->rc == RAD_OK; L += NB) {
+        const int nb = std::min(NB, t->launches - L);
+        for (int j = 0; j < nb && t->rc == RAD_OK; ++j) {
+            RadTensor ts[2];
+            if (t->rs) {
+                hip_ck(hipMemcpyAsync(in, pristine, (size_t)n * 2, hipMemcpyDeviceToDevice, nullptr), "hipMemcpyAsync", __LINE__);
+                ts[0] = T(in, RAD_BF16, { n }); ts[1] = T(in, RAD_BF16, { n });
+            } else {
+                ts[0] = T(in, RAD_BF16, { n }); ts[1] = T(outs[j], RAD_BF16, { n });
+            }
+            a.t = ts; a.n_t = 2;
+            const int rc = t->row->launch(&a, nullptr);
+            if (rc != RAD_OK) { t->rc = rc; break; }
+            if (t->rs)
+                hip_ck(hipMemcpyAsync(outs[j], (const uint16_t*)in + lo, (size_t)(hi - lo) * 2, hipMemcpyDeviceToDevice, nullptr),
+                       "hipMemcpyAsync", __LINE__);
+        }
+        if (st_stream_sync(nullptr) != hipSuccess && t->rc == RAD_OK) t->rc = RAD_E_DEVICE;
+        for (int j = 0; j < nb && t->rc == RAD_OK; ++j) {
+            const int64_t len = t->rs ? hi - lo : n, off = t->rs ? lo : 0;
+            st_memcpy(got.data(), outs[j], (size_t)len * 2, hipMemcpyDeviceToHost);
+            int64_t b = 0;
+            for (int64_t i = 0; i < len; ++i) b += got[(size_t)i] != want[(size_t)(off + i)];
+            if (b) { t->bad += b; ++t->bad_launches; if (t->first_bad < 0) t->first_bad = L + j; }
+        }
+    }
+    t->bar->wait();
+    if (inst && t->row->fini) t->row->fini(inst);
+    for (void* p : { in, pristine }) if (p) st_free(p);
+    for (void* p : outs) if (p) st_free(p);
+}
+
 static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
     constexpr int W = 4;
     if (iters <= 0) iters = 100;
@@ -30299,24 +30382,41 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
     }
     if ((int)devs.size() < W) { std::printf("--perfar4: needs 4 gfx1201 cards, found %zu\n", devs.size()); return; }
     devs.resize(W);
-    struct Rw { const char* row; int raw; const char* label; int kind; };   /* kind 0 one-shot, 1 two-shot, 2 RS / AG */
-    const Rw want[] = {
-        { "ar_oneshot_4rank_exact", -1, "AR one-shot exact", 0 },
-        { "ar_twoshot_4rank_exact", -1, "AR two-shot exact", 1 },
-        { "ar_twoshot_4rank_ti8", -1, "AR two-shot ti8 (coded, lossy)", 1 },
-        { "sp_rs_rows_4rank_ti8", 1, "SP reduce-scatter raw (exact)", 2 },
-        { "sp_ag_rows_4rank", 1, "SP all-gather raw", 2 },
-        { "sp_rs_rows_4rank_ti8", 0, "SP reduce-scatter ti8", 2 },
-        { "sp_ag_rows_4rank", 0, "SP all-gather ti8", 2 },
-    };
+    int wall_khz_i = 0;
+    if (hipDeviceGetAttribute(&wall_khz_i, hipDeviceAttributeWallClockRate, devs[0]) != hipSuccess) wall_khz_i = 0;
+    /* kind 0 one-shot, 1 two-shot, 2 RS / AG; raw -1 = not an SP row */
+    struct Rw { const char* row; int raw; std::string label; int kind; std::vector<RadParam> extra; };
+    std::vector<Rw> want;
+    auto dr = [](int d) { return std::vector<RadParam>{ PI("drain", d), PI("drain_force", 1) }; };
+    auto cat = [](std::vector<RadParam> a, const std::vector<RadParam>& b) { a.insert(a.end(), b.begin(), b.end()); return a; };
+    want.push_back({ "ar_twoshot_4rank_exact", -1, "AR two-shot exact", 1, {} });
+    want.push_back({ "ar_twoshot_4rank_exact", -1, "AR two-shot exact xpush", 1, { PI("xpush", 1) } });
+    for (int d : { 2, 3, 0 }) {
+        want.push_back({ "ar_twoshot_4rank_exact", -1, fmt("AR two-shot exact drain %d", d), 1, dr(d) });
+        want.push_back({ "ar_twoshot_4rank_exact", -1, fmt("AR two-shot exact xpush drain %d", d), 1, cat({ PI("xpush", 1) }, dr(d)) });
+    }
+    want.push_back({ "ar_twoshot_4rank_exact_lane", -1, "AR coded exact (lane, 4x1024)", 1, { PI("overlap", 1) } });
+    want.push_back({ "ar_oneshot_4rank_exact", -1, "AR one-shot exact (ts_min 0)", 0, { PI("ts_min", 0) } });
+    want.push_back({ "ar_twoshot_4rank_ti8", -1, "AR two-shot ti8 (lossy)", 1, {} });
+    want.push_back({ "sp_rs_rows_4rank_ti8", 1, "SP RS raw", 2, {} });
+    want.push_back({ "sp_rs_rows_4rank_ti8", 1, "SP RS raw xpush", 2, { PI("xpush", 1) } });
+    for (int d : { 2, 3, 0 }) {
+        want.push_back({ "sp_rs_rows_4rank_ti8", 1, fmt("SP RS raw drain %d", d), 2, dr(d) });
+        want.push_back({ "sp_rs_rows_4rank_ti8", 1, fmt("SP RS raw xpush drain %d", d), 2, cat({ PI("xpush", 1) }, dr(d)) });
+    }
+    want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw", 2, {} });
+    want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw drain 3", 2, dr(3) });
+    want.push_back({ "sp_rs_rows_4rank_ti8", 0, "SP RS ti8", 2, {} });
+    want.push_back({ "sp_ag_rows_4rank", 0, "SP AG ti8", 2, {} });
     std::vector<const RadKernelInfo*> rows;
     std::vector<int> ks, forms, raws, kinds;
     std::vector<std::string> labels;
+    std::vector<std::vector<RadParam>> extras;
     for (const Rw& w : want) {
         const RadKernelInfo* r = find(pl, w.row);
-        if (!r) { std::printf("  %-32s row %s absent\n", w.label, w.row); continue; }
+        if (!r) { std::printf("  %-36s row %s absent\n", w.label.c_str(), w.row); continue; }
         rows.push_back(r); ks.push_back(0); forms.push_back(-1); raws.push_back(w.raw); kinds.push_back(w.kind);
-        labels.push_back(w.label);
+        labels.push_back(w.label); extras.push_back(w.extra);
     }
     if (rows.empty()) return;
     std::printf("four-rank collectives, bf16, cards");
@@ -30333,7 +30433,7 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
         Ar8Perf& x = t[(size_t)r];
         x.rank = r; x.dev = devs[(size_t)r]; x.world = W; x.iters = iters; x.dtype = "bf16";
         x.sizes = sizes; x.rows = rows; x.ks = ks; x.forms = forms; x.nbs = { 0 }; x.bar = &bar;
-        x.sp_raw = raws; x.widths = widths;
+        x.sp_raw = raws; x.widths = widths; x.extra = extras;
         th.emplace_back(ar8_perf_worker, &x);
     }
     for (std::thread& x : th) x.join();
@@ -30345,7 +30445,7 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
         std::printf("  %lld x %lld bf16 (%.2f MB)\n", (long long)(sizes[si] / widths[si]), (long long)widths[si], bytes / 1e6);
         for (size_t j = 0; j < rows.size(); ++j, ++cfg) {
             if (t[0].rc[cfg] != RAD_OK) {
-                std::printf("    %-32s rc=%d (not served)\n", labels[j].c_str(), t[0].rc[cfg]);
+                std::printf("    %-36s rc=%d (not served)\n", labels[j].c_str(), t[0].rc[cfg]);
                 continue;
             }
             double us = 0.0;
@@ -30358,15 +30458,56 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
                               : kinds[j] == 1 ? 2.0 * (W - 1) / W * bytes : (double)(W - 1) / W * bytes;
             int64_t bad = 0;
             for (const Ar8Perf& x : t) bad += x.bad[cfg];
-            std::printf("    %-32s %9.1f us  %6.2f GB/s payload  %6.2f GB/s a rank a direction  %s | us by rank:%s\n",
+            std::printf("    %-36s %9.1f us  %6.2f GB/s payload  %6.2f GB/s a rank a direction  %s | us by rank:%s\n",
                         labels[j].c_str(), us, us > 0 ? bytes / (us * 1e3) : 0.0, us > 0 ? sent / (us * 1e3) : 0.0,
                         kinds[j] == 2 ? "(timed only)" : bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()
                                                              : "= fold on every rank", per.c_str());
+            if (g_timeline && kinds[j] == 1) ar8_print_timeline(t, cfg, (double)wall_khz_i);
             std::printf("AR4 %s\n", fmt("{\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"op\": \"%s\", \"us\": %.1f, "
-                                        "\"gbs_dir\": %.2f, \"bad\": %lld}", (long long)(sizes[si] / widths[si]),
+                                        "\"gbs_dir\": %.2f, \"bad\": %lld, \"checked\": %s}", (long long)(sizes[si] / widths[si]),
                                         (long long)widths[si], bytes / 1e6, labels[j].c_str(), us,
-                                        us > 0 ? sent / (us * 1e3) : 0.0, (long long)bad).c_str());
+                                        us > 0 ? sent / (us * 1e3) : 0.0, (long long)bad,
+                                        kinds[j] == 2 ? "false" : "true").c_str());
         }
+    }
+    /* the stale-read stress (R4D_SELFTEST_AR4_STRESS launches a point): fresh instances, every launch checked */
+    const char* se = std::getenv("R4D_SELFTEST_AR4_STRESS");
+    const int nst = se ? std::atoi(se) : 0;
+    if (nst <= 0) return;
+    const RadKernelInfo* two = find(pl, "ar_twoshot_4rank_exact");
+    const RadKernelInfo* rsr = find(pl, "sp_rs_rows_4rank_ti8");
+    for (size_t si = 0; si < sizes.size(); ++si) {
+        if (sizes[si] / widths[si] < 64) continue;   /* the prefill sizes: the fence rule's (>= 131072 elements) */
+        for (int rs = 0; rs <= 1; ++rs)
+            for (int xp = 0; xp <= 1; ++xp)
+                for (int d : { 1, 2, 3, 0 }) {
+                    const RadKernelInfo* row = rs ? rsr : two;
+                    if (!row) continue;
+                    StBarrier b2(W);
+                    std::vector<Ar4Stress> st((size_t)W);
+                    std::vector<std::thread> th2;
+                    for (int r = 0; r < W; ++r) {
+                        Ar4Stress& x = st[(size_t)r];
+                        x.rank = r; x.dev = devs[(size_t)r]; x.launches = nst; x.row = row; x.rs = rs != 0;
+                        x.n = sizes[si]; x.width = widths[si]; x.bar = &b2;
+                        x.extra = { PI("drain", d), PI("drain_force", 1) };
+                        if (xp) x.extra.push_back(PI("xpush", 1));
+                        th2.emplace_back(ar4_stress_worker, &x);
+                    }
+                    for (std::thread& x : th2) x.join();
+                    int64_t bad = 0, bl = 0, fb = -1;
+                    int rc = RAD_OK;
+                    for (const Ar4Stress& x : st) {
+                        bad += x.bad; bl += x.bad_launches;
+                        if (x.first_bad >= 0 && (fb < 0 || x.first_bad < fb)) fb = x.first_bad;
+                        if (x.rc != RAD_OK) rc = x.rc;
+                    }
+                    std::printf("STRESS {\"rows\": %lld, \"width\": %lld, \"op\": \"%s\", \"xpush\": %d, \"drain\": %d, "
+                                "\"launches\": %d, \"rc\": %d, \"bad\": %lld, \"bad_launches\": %lld, \"first_bad\": %lld}\n",
+                                (long long)(sizes[si] / widths[si]), (long long)widths[si], rs ? "SP RS raw" : "AR two-shot exact",
+                                xp, d, nst, rc, (long long)bad, (long long)bl, (long long)fb);
+                    std::fflush(stdout);
+                }
     }
 }
 

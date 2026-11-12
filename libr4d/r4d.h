@@ -459,7 +459,8 @@ void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
                                 long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub, long gate, long gate_ctr, long chain);
+                                long acq, long pub, long gate, long gate_ctr, long chain,
+                                long form = 0, long timeline = 0);   /* fn4 RSF: form 3 = XPUSH (r4d_ar_shards.h) */
 // The four-rank exact two-shot with both pushes coded losslessly at ~12.2 bits a bf16 value (the
 // same bytes out; r4d_ar_twoshot_Nrank_exact.hip). r4d_ar_twoshot_coded_ok says whether a message
 // and slot fit the coded form: bf16, shards of whole 256-value waves, two coded regions a slot.
@@ -504,7 +505,8 @@ void r4d_ar_twoshot_3rank_ti8(long peer_scratch0, long peer_scratch1, long peer_
 void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long peer_scratch2, long peer_flags0,
                           long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
                           long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
-                          long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr);
+                          long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr,
+                          long xpush = 0);   /* fn4 RSF: the raw reduce-scatter's pushes interleaved over the peers */
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                               long peer_flags0, long peer_flags1, long peer_flags2,
                               long my_scratch, long my_flags, long seq_ctrs,
@@ -759,6 +761,8 @@ void r4d_hc_mix_ctr_release(void);
 // pipelined prefill's all-reduce lane) launches with -- 0 the resolved tunable, else 256 / 512 /
 // 1024 (RADIANCE_FN4_AR_LANE_THREADS at start). The sums do not depend on it. 1 applied, -1 refused.
 int r4d_ar_lane_threads_set(int threads);
+/* fn4 RSF: the four-rank exact two-shot's first hop and SP's raw reduce-scatter pushes interleaved over the peers (0 / 1) */
+int r4d_ar_xpush_set(int on);
 // fn4 ar_laneblocks: that lane's block count -- 0 the resolved tunable (4), else 4..24 in steps of 4
 // (RADIANCE_FN4_AR_LANE_BLOCKS at start). The sums do not depend on it. 1 applied, -1 refused.
 int r4d_ar_lane_blocks_set(int blocks);

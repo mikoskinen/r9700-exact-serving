@@ -7158,6 +7158,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (!std::strcmp(name, "ar_lanethreads")) return r4d_ar_lane_threads_set(value);
+    if (!std::strcmp(name, "ar_xpush")) return r4d_ar_xpush_set(value);   /* fn4 RSF */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
     if (!std::strcmp(name, "hc_upmix")) {
         if (value < 0 || value > 15 || (value & 7) > 5) return -1;

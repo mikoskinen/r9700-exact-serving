@@ -977,6 +977,29 @@ extern "C" int r4d_rad_ar_oneshot_3rank_exact(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
+/* fn4 RSF (12.11.2026; RADIANCE_FN4_AR_XPUSH, rad_fn4_switch("ar_xpush")): 1 = the four-rank exact two-shot's first hop and
+ * SP's raw reduce-scatter push every peer's word in one pass (R4D_AR8_FORM_XPUSH), so all links carry the pushes at once;
+ * the same stores, the same fold: the same bits. 202 12.11.: the raw reduce-scatter 1.5-1.7x the all-gather for the same
+ * bytes (its pushes go to one peer after another). A launch parameter `xpush` overrides it (r4d_selftest --perfar4).
+ * -1 until the environment is read. */
+static std::atomic<int> g_ar_xpush{-1};
+static int ar_xpush(const RadArgs* a) {
+    int v = g_ar_xpush.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_XPUSH");
+        const int on = (e && *e && std::atoi(e) > 0) ? 1 : 0;
+        int want = -1;
+        g_ar_xpush.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_ar_xpush.load(std::memory_order_relaxed);
+    }
+    return (int)r4d_geti_or(a, "xpush", v);
+}
+extern "C" int r4d_ar_xpush_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    g_ar_xpush.store(on, std::memory_order_relaxed);
+    return 1;
+}
+
 extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 0);
@@ -1006,7 +1029,8 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
                                        c.inp, c.out, c.numel, in->dtype, in->rank,
                                        (long)(uintptr_t)s, nb, c.nthreads, c.drain, c.acq,
                                        c.pub, early, early ? in->gate_ctr : 0L,
-                                       ar_chain(a, c.numel)));
+                                       ar_chain(a, c.numel), ar_xpush(a) ? (long)R4D_AR8_FORM_XPUSH : 0L,
+                                       r4d_geti_or(a, "timeline", 0)));
         return early ? RAD_LINK_ENDED : RAD_OK;
     }
     /* The wide release, the two-rank family's rule: over P2P the kernel ends the engine's hold
@@ -1115,7 +1139,8 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
                                    c.pub, early, early ? in->gate_ctr : 0L,
-                                   ar_chain(a, c.numel)));
+                                   ar_chain(a, c.numel), ar_xpush(a) ? (long)R4D_AR8_FORM_XPUSH : 0L,
+                                   r4d_geti_or(a, "timeline", 0)));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
@@ -1317,7 +1342,7 @@ static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
                              in->my_scratch, in->my_flags, in->my_seq, in->slot_bytes,
                              c.inp, rows, (long)row, in->dtype, in->rank,
                              (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                             c.pub, early, early ? in->gate_ctr : 0L));
+                             c.pub, early, early ? in->gate_ctr : 0L, op == 3 && ar_xpush(a) ? 1L : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 extern "C" int r4d_rad_ar_rs_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 0); }
