@@ -51,6 +51,7 @@ extern "C" {
 #include "rad_yarn.h"
 
 #include <dlfcn.h>
+#include <chrono>   /* ds41-int13: ar_xpush_perf's launch times */
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -31378,6 +31379,9 @@ struct ArPattern {
     int coded_pattern = 0;             /* 1: ar_coded_value, not ar_pattern_value */
     int coded = -1;                    /* >= 0: the lane row's `coded` launch parameter */
     int form = -1;                     /* >= 0: the eight-rank two-shot's `form` parameter */
+    int reps = 0;                      /* ds41-int13 ar_xpush_perf: > 0 -- after a size's checked launch, 3 warm-ups and `reps`
+                                          launches back to back (in place), their wall time a launch -> us */
+    std::vector<double> us;            /* per size, when reps > 0 */
     /* Set when the ranks share a card (st_one_card): the ranks meet here before their first
      * launch, since an allocation may wait for the card, and the card for a launch spinning on a
      * rank that has not launched yet. */
@@ -31498,6 +31502,14 @@ static void ar_pattern_worker(ArPattern* t) {
             else    std::memcpy(&got[(size_t)i], &h[(size_t)i * 4], 4);
         }
         t->out.push_back(std::move(got));
+        if (t->reps > 0 && rc == RAD_OK) {   /* ds41-int13 ar_xpush_perf (the checked launch above is untouched) */
+            for (int w = 0; w < 3; ++w) t->row->launch(&a, st);
+            st_stream_sync(st);
+            const auto c0 = std::chrono::steady_clock::now();
+            for (int w = 0; w < t->reps; ++w) t->row->launch(&a, st);
+            st_stream_sync(st);
+            t->us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - c0).count() / t->reps);
+        }
     }
     if (in) st_free(in);
     if (out) st_free(out);
@@ -31577,6 +31589,73 @@ static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& d
     }
     if (row->fini) for (ArPattern& a : t) if (a.inst) row->fini(a.inst);
     return true;
+}
+
+/* ds41-int13 XPUSH: --case ar_xpush_perf (INFO) -- the four-rank exact two-shot's plain launch (row ar_twoshot_4rank_exact) at
+ * deepseek41's newcomer / prefill message sizes, rows x 5120 bf16 (R4D_SELFTEST_XPUSH_ROWS, default 256,1024,2048,4096), with
+ * libr4d's fn4 switch ar_xpush 0 (lockstep) then 1 (XPUSH, >= 131072 elements): each rank's first launch is checked against the
+ * fp32 ascending-rank fold (an ok line), then 3 warm-ups and 40 launches back to back in place; "info AR4XP" lines give the
+ * slowest rank's us a launch at 0 and 1 and the difference. The byte checks are ar_twoshot_4rank_exact's / ar_oneshot_4rank_exact's
+ * cases (P0); this one times the two forms. */
+static void ar_xpush_perf(const Plugin& pl, const std::vector<int>& devs) {
+    const char* name = "ar_twoshot_4rank_exact";
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok("ar_xpush_perf", false, "row ar_twoshot_4rank_exact absent"); return; }
+    if ((int)devs.size() < 4) { skip("ar_xpush_perf", "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 4)) { skip("ar_xpush_perf", "no peer path between the cards (device.p2p)"); return; }
+    auto sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
+    auto val = (int (*)(const char*, int*))dlsym(pl.h, "rad_fn4_value");
+    int got = -1;
+    if (!sw || !val || sw("ar_xpush", 0) != 1 || val("ar_xpush", &got) != 1 || got != 0) {
+        ok("ar_xpush_perf: libr4d serves fn4 ar_xpush (rad_fn4_switch / rad_fn4_value)", false); return;
+    }
+    std::vector<int64_t> rows = { 256, 1024, 2048, 4096 };
+    if (const char* e = std::getenv("R4D_SELFTEST_XPUSH_ROWS")) {
+        rows.clear();
+        for (const char* q = e; *q;) {
+            char* end = nullptr;
+            const long long v = std::strtoll(q, &end, 10);
+            if (end == q || v < 1 || v > 8192) { ok("ar_xpush_perf: R4D_SELFTEST_XPUSH_ROWS is rows 1..8192, comma separated", false, e); return; }
+            rows.push_back(v);
+            q = *end == ',' ? end + 1 : end;
+            if (*end && *end != ',') { ok("ar_xpush_perf: R4D_SELFTEST_XPUSH_ROWS is rows 1..8192, comma separated", false, e); return; }
+        }
+    }
+    constexpr int kReps = 40;
+    for (int64_t r : rows) {
+        const int64_t n = r * 5120;
+        double us[2] = { 0.0, 0.0 };
+        bool fine = true;
+        for (int xp = 0; xp < 2 && fine; ++xp) {
+            sw("ar_xpush", xp);
+            std::vector<ArPattern> t(4);
+            for (ArPattern& x : t) { x.row = row; x.dtype = "bf16"; x.sizes = { n }; x.out_of_place = -1; x.reps = kReps; }
+            ar_pattern_run(t, devs);
+            int64_t bad = 0;
+            for (int64_t i = 0; i < n && fine; ++i) {
+                float acc = 0.0f;
+                for (int k = 0; k < 4; ++k) acc += h_bf16(h_to_bf16(ar_rough_value(k, i)));
+                const float want = h_bf16(h_to_bf16(acc));
+                for (int k = 0; k < 4; ++k)
+                    if (t[(size_t)k].out.empty() || t[(size_t)k].out[0][(size_t)i] != want) ++bad;
+            }
+            std::string rcs;
+            for (const ArPattern& x : t) {
+                rcs += std::to_string(x.rc_init) + "/" + std::to_string(x.rc_launch) + " ";
+                if (x.rc_init != RAD_OK || x.rc_launch != RAD_OK || x.us.empty()) fine = false;
+                else us[xp] = std::max(us[xp], x.us[0]);
+            }
+            ok(fmt("ar_xpush_perf %lld x 5120 bf16, ar_xpush %d: the first launch == the fp32 ascending-rank fold on every rank, bit for bit",
+                   (long long)r, xp).c_str(), fine && bad == 0, std::to_string(bad) + " elements wrong, init/launch rc " + rcs);
+            if (row->fini) for (ArPattern& x : t) if (x.inst) row->fini(x.inst);
+            if (bad) fine = false;
+        }
+        if (fine)
+            std::printf("  info  AR4XP rows %lld x 5120 bf16 (%.2f MB, %lld elements): lockstep %.1f us, xpush %.1f us a launch (%+.1f %%), "
+                        "the slowest rank, %d launches back to back in place\n", (long long)r, (double)n * 2 / 1e6, (long long)n, us[0], us[1],
+                        us[0] > 0 ? 100.0 * (us[1] / us[0] - 1.0) : 0.0, kReps);
+    }
+    sw("ar_xpush", 0);
 }
 
 static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name,
@@ -37705,6 +37784,11 @@ static void device_phase(const Plugin& pl) {
     /* ds41-int10 (r4d_selftest_arc.inc): --case ar_arcoded -- lever ARC, the four-rank two-shot at overlap 0 under fn4
      * ds41_arcoded 0 / 1024, every rank and size == the fold, the counters proving the wire */
     arc_cases(pl, devs);
+    /* ds41-int13 XPUSH: --case ar_xpush_perf -- the two-shot's lockstep and XPUSH forms timed at deepseek41's sizes (INFO) */
+    if (sel("ar_xpush_perf")) {
+        if (!g_case) std::printf("\ncross-rank, XPUSH timed (ar_xpush 0 / 1)\n");
+        ar_xpush_perf(pl, devs);
+    }
     /* The fused write rows at both widths and both gathers. The `_host` twins take the same
      * calls; they differ only in where the mailbox lives. */
     for (const char* base : { "ar_hc_write", "ar_gather_hc_write",
