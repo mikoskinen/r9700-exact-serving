@@ -682,6 +682,11 @@ private:
      * (Mover::set_place_lf on every rank). */
     bool             lf_capable_ = false;
     std::atomic<int> lf_on_{0};
+    /* Levers SWL / L2 (ds41-swl; fn4 place_swap_lent, heat_min_gain_x100, heat_hyst_x100): every rank places dynamically
+     * (lf_capable_'s condition), and SWL as applied (Mover::set_swap_lent on every rank); L2 lives in each rank's
+     * heat engine (HeatEngine::set_min_gain / set_hysteresis). */
+    bool             swl_capable_ = false;
+    std::atomic<int> swl_on_{0};
     /* Lever SA / HB (ds41-sahb; fn4 stage_short / stage_pick / place_hb): whether each can act (Engine::sahb_setup),
      * the switches as applied, and the ranks place_hb acts on (RADIANCE_PLACE_HB_RANKS, a bit a rank; all unset). */
     bool             sa_capable_ = false, hb_capable_ = false;

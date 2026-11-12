@@ -112,6 +112,10 @@ struct ExpertPlane {
         int64_t lent_fills[kLenders] = {}, lent_fills_lf[kLenders] = {}, lent_fills_hot[kLenders] = {};
         int64_t lent_drop_victim[kLenders] = {}, lent_drop_reserve[kLenders] = {}, lent_drop_recall[kLenders] = {};
         int     place_lf = 0;
+        /* ds41-swl: lever SWL on this rank's mover, its heat promotions into each lender's slots (cumulative), and
+         * lever L2's guard on its heat engine (x 100). */
+        int     place_swl = 0, heat_min_gain_x100 = 0, heat_hyst_x100 = 0;
+        int64_t lent_swaps[kLenders] = {};
     };
     std::vector<Rank> ranks;
 };

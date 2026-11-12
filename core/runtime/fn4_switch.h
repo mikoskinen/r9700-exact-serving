@@ -353,6 +353,21 @@
  *                   pushes its first hop interleaved over the peers (R4D_AR8_FORM_XPUSH, r4d_ar_xpush.h: all three links at
  *                   once); smaller messages and the coded wires as before. Exact: the same stores, the same fold.
  *                   RADIANCE_FN4_AR_XPUSH=1 at load starts it at 1.
+ *   place_swap_lent engine (lever SWL, ds41-swl; 65 here, after gg_gemv_m16; Mover::issue): 0 off (today: a heat
+ *                   promotion takes only a free budgeted swap slot, else it starves -- experts.starved_slab -- and its unit
+ *                   comes in later through the lent slots' fill); 1 a heat promotion may also take a free LENT slot (a KV /
+ *                   arena / drafter loan's), the lowest free slot either way. A unit promoted there keeps its host copy, as
+ *                   a fill's does, and is dropped by every demotion, reserve rebuild and recall the fill's units are.
+ *                   RADIANCE_PLACE_SWAP_LENT=1 at start starts it on. 1 refused unless every rank places dynamically.
+ *                   Exact: placement only. /stats experts.ranks[].lent.<lender>.swaps counts those promotions,
+ *                   .place_swl the setting.
+ *   heat_min_gain_x100  engine (lever L2, ds41-swl; 66 here): the heat guard's additive half, HeatParams::min_gain x 100,
+ *                   0 .. 10000 (a swap needs hot >= cold x hysteresis + min_gain). Starts at RADIANCE_HEAT_MIN_GAIN x 100
+ *                   (two decimals) or the shipped 150. Set on every rank's heat engine between steps (read by the next
+ *                   step()). Refused unless every rank places dynamically. Exact: placement only.
+ *   heat_hyst_x100  engine (lever L2, ds41-swl; 67 here): the guard's ratio, HeatParams::hysteresis x 100, 100 .. 1000; starts
+ *                   at RADIANCE_HEAT_HYSTERESIS x 100 or the shipped 125. As heat_min_gain_x100 otherwise. /stats
+ *                   experts.ranks[].heat_min_gain_x100 / heat_hyst_x100 read each rank's engine back.
  *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
  *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
  *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
@@ -495,7 +510,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
-              kArXpush, kGgGemvM16, kSwitches };
+              kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -656,6 +671,9 @@ void arena_d0_register(bool capable);
 void draft_w_register(bool capable);
 /* The engine, at bring-up (lever LF): whether place_lf can act (every rank places dynamically). */
 void place_lf_register(bool capable);
+/* The engine, at bring-up (levers SWL / L2, ds41-swl): whether place_swap_lent, heat_min_gain_x100 and heat_hyst_x100
+ * can act (every rank places dynamically: a heat engine and a mover that move). */
+void swl_register(bool capable);
 /* The engine, after every block drafter's turn: steps whose context pass was skipped, refill passes and their
  * rows, kept rows dropped (a sequence finished or preempted, or older than the drafter's window), refills forced
  * by a full ring, rows kept now, and the ring's step slots and MiB a rank. */

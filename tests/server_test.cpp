@@ -5365,11 +5365,11 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
               "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, \"stage_full_min\": 0, "
               "\"stage_full_pick\": 0, \"mhc_fuse\": -1, \"ix_lds\": -1, \"ix_ni\": -1, \"ds41_arcoded\": -1, "
               "\"sched_row_cap\": 0, \"ds41_mix_wv\": -1, \"ds41_gq\": -1, \"ds41_e2\": -1, \"sched_cb_hold_ms\": 0, \"sched_cb_hold_k\": 2, \"exl3_x3d\": -1, "
-              "\"ar_xpush\": -1, \"gg_gemv_m16\": -1}"));
+              "\"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, \"heat_hyst_x100\": -1}"));
     /* ds41-int9: lever SP appended after place_hb; int9b: M1, IX-LDSR2, IX-NI; int10: ARC (plugins' switches: -1 here), then
      * CAP48 (merged); int11: 1U-MX / 1U-GQ / 1U-E2 (plugins' switches: -1 here), then CBH (ds41-int10b, merged: 0 off, K 2);
      * int12: X3D-F exl3_x3d (the exl3r4d plugin's: -1 here); int13: XPUSH ar_xpush (libr4d's: -1 here); int14c: lever A4
-     * gg_gemv_m16 (ds41-a4; libr4d's: -1 here) */
+     * gg_gemv_m16 (ds41-a4; libr4d's: -1 here), then ds41-swl's SWL / L2 (the engine's: -1 until one registers) */
     CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
     CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
     CHECK_EQ(fn4::switch_index("ds41_psk_cr"), (int)fn4::kDs41PskCr);
@@ -5394,7 +5394,10 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kSchedCbHoldK + 1, (int)fn4::kExl3X3d);   /* ds41-int12: X3D-F (ds41-x3d-eng10), merged after CBH */
     CHECK_EQ((int)fn4::kExl3X3d + 1, (int)fn4::kArXpush);   /* ds41-int13: XPUSH (FN's ar_xpush), appended */
     CHECK_EQ((int)fn4::kArXpush + 1, (int)fn4::kGgGemvM16);   /* ds41-int14c: lever A4 (ds41-a4), appended */
-    CHECK_EQ((int)fn4::kGgGemvM16 + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kGgGemvM16 + 1, (int)fn4::kPlaceSwapLent);   /* ds41-int14c: levers SWL / L2 (ds41-swl), appended */
+    CHECK_EQ((int)fn4::kPlaceSwapLent + 1, (int)fn4::kHeatMinGainX100);
+    CHECK_EQ((int)fn4::kHeatMinGainX100 + 1, (int)fn4::kHeatHystX100);
+    CHECK_EQ((int)fn4::kHeatHystX100 + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
     CHECK_EQ((int)fn4::kPlaceHb, 49);
     CHECK_EQ((int)fn4::kStageFullPick, 51);
@@ -5408,7 +5411,9 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kExl3X3d, 62);   /* X3D-F: exl3_x3d, the exl3r4d plugin's */
     CHECK_EQ((int)fn4::kArXpush, 63);   /* XPUSH: ar_xpush, libr4d's */
     CHECK_EQ((int)fn4::kGgGemvM16, 64);   /* lever A4: gg_gemv_m16, libr4d's */
-    CHECK_EQ((int)fn4::kSwitches, 65);
+    CHECK_EQ((int)fn4::kPlaceSwapLent, 65);   /* ds41-swl: SWL, then L2's two (63..65 on ds41-swl) */
+    CHECK_EQ((int)fn4::kHeatHystX100, 67);
+    CHECK_EQ((int)fn4::kSwitches, 68);
     CHECK_EQ(fn4::switch_index("gg_gemv_m16"), (int)fn4::kGgGemvM16);
     CHECK_EQ(fn4::switch_index("exl3_x3d"), (int)fn4::kExl3X3d);
     CHECK_EQ(fn4::switch_index("ar_xpush"), (int)fn4::kArXpush);
@@ -5422,6 +5427,55 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         std::string xerr;
         CHECK(!fn4::check("ar_xpush", 1, &xerr));
         CHECK(xerr.find("no loaded plugin serves it") != std::string::npos);
+    }
+    {   /* ds41-swl: levers SWL / L2, the engine's (as place_lf): range-checked; a change refused until an engine registered
+         * dynamic placement on every rank (place_swap_lent 0 always takes); GET reports what the engine applied. */
+        CHECK_EQ(fn4::switch_index("place_swap_lent"), (int)fn4::kPlaceSwapLent);
+        CHECK_EQ(fn4::switch_index("heat_min_gain_x100"), (int)fn4::kHeatMinGainX100);
+        CHECK_EQ(fn4::switch_index("heat_hyst_x100"), (int)fn4::kHeatHystX100);
+        CHECK(fn4::sched_switch(fn4::kPlaceSwapLent) && fn4::sched_switch(fn4::kHeatMinGainX100) &&
+              fn4::sched_switch(fn4::kHeatHystX100));
+        for (const char* b : { R"({"place_swap_lent":2})", R"({"place_swap_lent":-1})", R"({"heat_min_gain_x100":-1})",
+                               R"({"heat_min_gain_x100":10001})", R"({"heat_hyst_x100":99})", R"({"heat_hyst_x100":1001})" })
+            CHECK_EQ(f.post("/admin/fn4", b).status, 400);
+        const HttpResponse s0 = f.post("/admin/fn4", R"({"place_swap_lent":1})");
+        CHECK_EQ(s0.status, 400);
+        CHECK(has(s0.body, "no engine has registered its placement"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"heat_min_gain_x100":100})").status, 400);
+        fn4::swl_register(false);
+        const HttpResponse s1 = f.post("/admin/fn4", R"({"heat_hyst_x100":125})");
+        CHECK_EQ(s1.status, 400);
+        CHECK(has(s1.body, "placement is static here"));
+        fn4::swl_register(true);
+        fn4::note_sched(fn4::kPlaceSwapLent, 0);
+        fn4::note_sched(fn4::kHeatMinGainX100, 150);
+        fn4::note_sched(fn4::kHeatHystX100, 125);
+        CHECK(has(f.get("/admin/fn4").body, "\"exl3_x3d\": -1, \"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": 0, "
+                                            "\"heat_min_gain_x100\": 150, "
+                                            "\"heat_hyst_x100\": 125}"));
+        int ssw[fn4::kSwitches];
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"place_swap_lent":0,"heat_min_gain_x100":150,"heat_hyst_x100":125})").status, 200);
+        CHECK(!fn4::apply_pending(70, ssw));                 /* today's values: nothing changes, no epoch */
+        CHECK_EQ(fn4::epoch(), e0);
+        CHECK_EQ(f.post("/admin/fn4", R"({"place_swap_lent":1,"heat_min_gain_x100":75})").status, 200);
+        CHECK(fn4::apply_pending(71, ssw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(ssw[fn4::kPlaceSwapLent], 1);
+        CHECK_EQ(ssw[fn4::kHeatMinGainX100], 75);
+        CHECK_EQ(ssw[fn4::kHeatHystX100], fn4::kNoChange);
+        fn4::note_sched(fn4::kPlaceSwapLent, 1);
+        fn4::note_sched(fn4::kHeatMinGainX100, 75);
+        CHECK(has(f.get("/admin/fn4").body, "\"place_swap_lent\": 1, \"heat_min_gain_x100\": 75, \"heat_hyst_x100\": 125}"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"place_swap_lent":0,"heat_min_gain_x100":150})").status, 200);
+        CHECK(fn4::apply_pending(72, ssw));
+        CHECK_EQ(ssw[fn4::kPlaceSwapLent], 0);
+        CHECK_EQ(ssw[fn4::kHeatMinGainX100], 150);
+        /* back to unregistered for the cases below */
+        fn4::note_sched(fn4::kPlaceSwapLent, -1);
+        fn4::note_sched(fn4::kHeatMinGainX100, -1);
+        fn4::note_sched(fn4::kHeatHystX100, -1);
+        fn4::swl_register(false);
     }
     CHECK_EQ(fn4::switch_index("ds41_mix_wv"), (int)fn4::kDs41MixWv);
     CHECK_EQ(fn4::switch_index("ds41_gq"), (int)fn4::kDs41Gq);
@@ -5682,7 +5736,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         CHECK_EQ(fn4::sched_cb_hold_k(), 3);
         CHECK_EQ(fn4::value(fn4::kSchedCbHoldMs), 500);
         CHECK(has(f.get("/admin/fn4").body, "\"ds41_e2\": -1, \"sched_cb_hold_ms\": 500, \"sched_cb_hold_k\": 3, \"exl3_x3d\": -1, "
-                                            "\"ar_xpush\": -1, \"gg_gemv_m16\": -1}"));
+                                            "\"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, "
+                                            "\"heat_hyst_x100\": -1}"));
         CHECK_EQ(f.post("/admin/fn4", R"({"sched_cb_hold_ms":500})").status, 200);
         CHECK(!fn4::apply_pending(54, sw));                 /* the same value: pinned, no epoch */
         CHECK_EQ(fn4::epoch(), e0 + 1);
@@ -5691,7 +5746,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         CHECK_EQ(fn4::sched_cb_hold_ms(), 0);
         CHECK_EQ(fn4::sched_cb_hold_k(), 2);
         CHECK(has(f.get("/admin/fn4").body, "\"sched_cb_hold_ms\": 0, \"sched_cb_hold_k\": 2, \"exl3_x3d\": -1, \"ar_xpush\": -1, "
-                                            "\"gg_gemv_m16\": -1}"));
+                                            "\"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, \"heat_hyst_x100\": -1}"));
     }
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));

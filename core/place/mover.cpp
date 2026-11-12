@@ -1435,9 +1435,16 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
         }
 
         if (promote) {
-            const int64_t slot = cp.slab.take_where([&](int64_t s) { return s < cp.n_hot_lo; });
+            /* Budgeted swap slots only (the file tier's hot cache sits above n_hot_lo), unless lever SWL lets a
+             * free lent slot take the promotion: the lowest free slot either way, so a budgeted one goes first. Into
+             * a lent slot the unit keeps its host copy (promote_to), as fill()'s units do. */
+            const bool swl = swap_lent_.load(std::memory_order_relaxed);
+            const int64_t slot = cp.slab.take_where([&](int64_t s) {
+                return s < cp.n_hot_lo || (swl && s >= cp.n_fixed);
+            });
             if (slot < 0) { ++stats_.starved_slab; return false; }
             if (promote_to(unit, slot) < 0) { cp.slab.add_free(slot); return false; }
+            if (const int ld = lender_of(cp, slot); ld >= 0 && ld < LentStats::kN) ++lent_.swaps[ld];   /* ds41-swl */
             return true;
         }
 

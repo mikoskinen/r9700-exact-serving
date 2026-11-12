@@ -30,6 +30,7 @@
 #pragma once
 #include "planner.h"
 
+#include <cmath>
 #include <string>
 #include <atomic>
 #include <memory>
@@ -150,6 +151,16 @@ struct HeatParams {
      * RADIANCE_PLACE_HB_DECAY. */
     float hb_decay = 0.8f;
 };
+
+/* Lever L2 (ds41-swl): the swap guard's two halves (HeatParams::min_gain, ::hysteresis) in hundredths, as fn4
+ * heat_min_gain_x100 / heat_hyst_x100 and RADIANCE_HEAT_MIN_GAIN / RADIANCE_HEAT_HYSTERESIS carry them. heat_x100(v) is
+ * the float the engine compares with (150 -> 1.5f and 125 -> 1.25f exactly: the shipped values). heat_env_x100 reads
+ * an env value ("1.5", "0.75", "1") as hundredths, rounded, in lo .. hi; -1 for null, empty, not a number or out of
+ * range (the caller then keeps the default). */
+inline float heat_x100(int v) { return (float)v / 100.0f; }
+int heat_env_x100(const char* s, int lo, int hi);
+constexpr int kHeatMinGainX100Max = 10000;           /* 0 .. 100.00 */
+constexpr int kHeatHystX100Min = 100, kHeatHystX100Max = 1000;   /* 1.00 .. 10.00 */
 
 /* Slot classes (ds41-lf, /stats experts.ranks[].slots): the slot a unit sits in while in VRAM, kept after it
  * leaves (a miss is counted under the class of the slot its expert last sat in). kSlotNone: never in VRAM since
@@ -393,6 +404,24 @@ public:
      * swaps promote them (against the coldest unprotected residents) and none of them is a victim while reserved.
      * 0: no bonus (today's ranking; the heat itself is still kept, which changes no other heat). Placement only. */
     void set_hb_reserve(int32_t r) { hb_r_ = r > 0 && dual() ? r : 0; }
+    /* ---- lever L2 (ds41-swl, fn4 heat_min_gain_x100 / heat_hyst_x100): the swap guard, settable ----------------
+     *
+     * step() and pick() read HeatParams::min_gain and ::hysteresis afresh on every call (the bar `hot >= cold x
+     * hysteresis + min_gain`), so a change made between steps (every rank thread parked) takes the next step; no
+     * ranking state depends on them. The x100 mirrors are for the HTTP thread. Placement only. */
+    void set_min_gain(float g) {
+        params_.min_gain = g;
+        guard_x100_[0] = (int64_t)std::lround((double)g * 100.0);
+    }
+    void set_hysteresis(float h) {
+        params_.hysteresis = h;
+        guard_x100_[1] = (int64_t)std::lround((double)h * 100.0);
+    }
+    float min_gain() const { return params_.min_gain; }
+    float hysteresis() const { return params_.hysteresis; }
+    /* For any thread: min_gain and hysteresis in hundredths, as last set (init or the setters). */
+    int64_t min_gain_x100() const { return guard_x100_[0]; }
+    int64_t hysteresis_x100() const { return guard_x100_[1]; }
     int32_t hb_reserve() const { return hb_r_; }
     float heat_prefill_long(int32_t unit) const {
         return heat_pl_.empty() ? 0.0f : heat_pl_[(size_t)pos_[(size_t)unit]];
@@ -413,6 +442,7 @@ public:
 
 private:
     HeatParams params_;
+    Relaxed<int64_t> guard_x100_[2];   /* lever L2: min_gain, hysteresis x 100 (set_min_gain / set_hysteresis) */
     bool       enabled_ = false;
     int32_t    n_layer_ = 0;
     HeatCounters stats_;

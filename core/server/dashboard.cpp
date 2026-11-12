@@ -626,6 +626,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
                             l["drop_victim"]  = r.lent_drop_victim[k];
                             l["drop_reserve"] = r.lent_drop_reserve[k];
                             l["drop_recall"]  = r.lent_drop_recall[k];
+                            l["swaps"]        = r.lent_swaps[k];   /* ds41-swl */
                             lent[kL[k]] = std::move(l);
                         }
                         json sl;
@@ -634,6 +635,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
                         x["slots"]    = std::move(sl);
                         x["lent"]     = std::move(lent);
                         x["place_lf"] = r.place_lf;
+                        x["place_swl"] = r.place_swl;                       /* ds41-swl */
+                        x["heat_min_gain_x100"] = r.heat_min_gain_x100;
+                        x["heat_hyst_x100"] = r.heat_hyst_x100;
                     }
                     rk.push_back(std::move(x));
                 }

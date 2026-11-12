@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 
 namespace rad {
@@ -19,9 +20,20 @@ constexpr float kPinBonus = 1.0e9f;
 constexpr float kResBonus = 1.0e5f;
 }  /* namespace */
 
+int heat_env_x100(const char* s, int lo, int hi) {
+    if (!s || !*s) return -1;
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s || *end || !(v == v) || v < -1.0e9 || v > 1.0e9) return -1;
+    const long r = std::lround(v * 100.0);
+    return r < lo || r > hi ? -1 : (int)r;
+}
+
 int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     params_ = params;
     stats_ = HeatCounters{};
+    guard_x100_[0] = (int64_t)std::lround((double)params_.min_gain * 100.0);   /* lever L2's mirrors */
+    guard_x100_[1] = (int64_t)std::lround((double)params_.hysteresis * 100.0);
 
     const size_t n = plan.units.size();
     tier_.assign(n, Tier::VRAM);
