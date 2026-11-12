@@ -11947,7 +11947,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 0, &err));
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
-    CHECK(err.find("sched_row_cap, sched_cb_hold_ms, sched_cb_hold_k, epoch_bump)") != std::string::npos);
+    CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
