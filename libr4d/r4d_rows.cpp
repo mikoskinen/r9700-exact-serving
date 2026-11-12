@@ -7792,6 +7792,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   nullptr, nullptr,
   r4d_shape_attn_paged_gate_quant, nullptr, r4d_fuse_attn_paged_gate_quant },
 
+/* fn4 BI (att_bi 3): the TP2 leg's decode row under attn_paged_pin (split_rows), the same launcher */
+{ "attn_decode_pin_h256_gqa12_fp8kv", "attn_paged_pin", "attn",
+  "attn_decode_h256_gqa12_fp8kv with split_rows: the split law reads that many sequences (fn4 BI att_bi 3)",
+  "head_dim 256, 12 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G12Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa12_fp8, r4d_rad_attn_decode_h256_gqa12_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
 { "attn_decode_h256_gqa12_bf16kv", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
   "head_dim 256, 12 queries per kv head, paged block 4, q_len*gqa <= 64, no window",

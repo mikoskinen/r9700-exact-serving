@@ -1227,14 +1227,15 @@ static void attn_slice_case(const Plugin& pl, const char* name, int64_t head_dim
  * every output element; and the same batch without the pin (the law at k sequences) as a control that must differ
  * where its split count differs. Flash-Next's TP4 decode geometry: head 256, gqa 6, one KV head, 4-token pages, fp8
  * cache, q_len 1 + n_spec = 4, max_ctx 262144 (the engine's declare), contexts `ctxs`. --case attn_bi_batch. */
-static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::vector<int32_t>& ctxs, int64_t qd) {
+static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::vector<int32_t>& ctxs, int64_t qd,
+                               int64_t gqa_ = 6) {
     if (!sel("attn_bi_batch")) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { skip(name, "row absent"); return; }
     /* the batched run through the attn_paged_pin row (the arch's op_attn_bi) where it exists */
-    const RadKernelInfo* rp = find(pl, "attn_decode_pin_h256_gqa6_bs4_fp8kv");
+    const RadKernelInfo* rp = find(pl, gqa_ == 12 ? "attn_decode_pin_h256_gqa12_fp8kv" : "attn_decode_pin_h256_gqa6_bs4_fp8kv");
     if (!rp) rp = r;
-    const int64_t head_dim = 256, gqa = 6, kv_heads = 1, bs = 4, q_heads = kv_heads * gqa, k = (int64_t)ctxs.size();
+    const int64_t head_dim = 256, gqa = gqa_, kv_heads = 1, bs = 4, q_heads = kv_heads * gqa, k = (int64_t)ctxs.size();
     int64_t maxb = 0, nblk = 0;
     for (int32_t c : ctxs) { maxb = std::max<int64_t>(maxb, (c + bs - 1) / bs); nblk += (c + bs - 1) / bs; }
     const int64_t rowq = q_heads * head_dim, qn = k * qd * rowq, kvn = nblk * kv_heads * bs * 2 * head_dim;
@@ -32829,6 +32830,7 @@ static void device_phase(const Plugin& pl) {
     attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv",
                        { 5, 64, 255, 256, 257, 1000, 1500, 2047, 2048, 2049, 4096, 6000, 9000, 12345, 16384, 20000 }, 4);
     attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 700, 900, 1100, 1300 }, 1);
+    attn_bi_batch_case(pl, "attn_decode_h256_gqa12_fp8kv", { 37, 129, 400, 777, 1024, 2049, 3000, 8191 }, 4, 12);
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 64,  "k6_v4",  0, 256);
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);

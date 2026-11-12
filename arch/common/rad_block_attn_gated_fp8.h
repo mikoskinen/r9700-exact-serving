@@ -42,8 +42,8 @@ namespace arch {
 /* 3 (13.11.2026, 220: att_bi 2 never engages on dense contexts -- the per-sequence dense attn_paged + gate_quant_fp8
  * are att_bi's cost): as 2, and a run of DENSE decode sequences in ONE attn_paged launch through op_attn_bi, whose split
  * law reads one sequence (split_rows 1: each sequence's alone launch is one sequence at its q_len), plus ONE gate_quant
- * over the run's rows (a row's quantisation is its own). Only where q_len x gqa <= 32: above, the law reads the block
- * table's depth, which the batch's longest sequence sets. */
+ * over the run's rows (a row's quantisation is its own). Above q_len x gqa 32 the law reads the block table's depth (the
+ * step's pitch), as the per-sequence launches of 1 / 2 do. */
 inline std::atomic<int>& fn4_attbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
                                    const int v = e && *e ? std::atoi(e) : 0; return v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
@@ -410,8 +410,9 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
         const char* e = std::getenv("RADIANCE_FN4_BIDEC");
         if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
         if (op_attn && e && *e && *e != '0' && g.max_spec > 0 && rad_op_declared(b, "attn_paged_pin")) {
+            /* the decode band only (1 + n_spec rows a sequence): attn_paged_pin has decode rows alone */
             op_attn_bi = decl_attn(b, g, "attn_paged_pin",
-                             RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                             RAD_PARAMS(RAD_RANGE("q_len", 1, 1 + g.max_spec), RAD_INT("head_dim", g.head_dim),
                                         RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                         RAD_INT("window", 0),
                                         RAD_INT("n_head", g.n_head),
@@ -849,7 +850,9 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 const bool one = abf >= 2 && op_attn_gq_bi &&
                                  qd == gq_bi_qd && qd > 0 && qd <= kGqBiRows;
                 /* att_bi 3: a run of dense decode sequences in one op_attn_bi launch + one gate_quant (fn4_attbi_flag's note) */
-                const bool oned = abf >= 3 && op_attn_bi && qd > 0 && qd * g.gqa() <= 32;
+                /* no q_len x gqa bound: above 32 the law reads the block table's depth, the step's pitch, which the
+                 * per-sequence launches of att_bi 1 / 2 pass too (praw2(table + s2 * pitch, .., 1, pitch)) */
+                const bool oned = abf >= 3 && op_attn_bi && qd > 0 && qd <= 1 + g.max_spec;
                 for (int64_t s2 = 0; s2 < ns; ++s2) {
                     const int64_t a0 = r0[s2], n = nr[s2];
                     if (oned && s2 < D && !sp[s2]) {
