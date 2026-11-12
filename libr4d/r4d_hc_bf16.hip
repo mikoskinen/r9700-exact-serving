@@ -4175,7 +4175,7 @@ static int hc_bi() {
  * the form each hc_read call took, a device, counted where the launcher issues it -- a recorded pass counts once, at
  * its recording (its plays do not call the launcher; the tape's issue check keeps them the same launches), a
  * profiled run issues every step live. Cumulative lines "fn4 formctr dev D readv V hc_bi B: FORM calls/rows-mean/max
- * [bd N] ..." to stderr at most every 10 s at an issue, and before any fn4 switch lands (rad_fn4_switch). */
+ * [bd N] ..." to stderr at most every 2 s at an issue, and before any fn4 switch lands (rad_fn4_switch). */
 enum { kFcPf2, kFcTiled, kFcFused, kFcS, kFcG16q, kFcG16pp, kFcG16p, kFcG16, kFcG, kFcRowA, kFcA2, kFcApre, kFcA, kFcN };
 static const char* const kFcName[kFcN] = {"pf2", "tiled", "fused", "S", "G16q", "G16pp", "G16p", "G16", "G", "rowA",
                                           "A2", "Apre", "A"};
@@ -4218,7 +4218,7 @@ static void fc_add(int f, long rows, bool bd) {
     const long long now = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::steady_clock::now().time_since_epoch()).count();
     long long last = g_fc_last.load(std::memory_order_relaxed);
-    if (now - last < 10000 || !g_fc_last.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    if (now - last < 2000 || !g_fc_last.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     fc_dump();
 }
 /* Test hook (measurement only, r4d_hc_pf2_stages): which of PF2's launches run -- 1 the prologue,
