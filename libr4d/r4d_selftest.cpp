@@ -35714,6 +35714,60 @@ static void device_phase(const Plugin& pl) {
             ok("fill_f32 leaves the columns past the pitch alone", !spilled);
         }
     }
+    /* --- gather_rows bf16 (ds41-e1): y[i] = x[idx[i]], a zero row for a negative or past-the-source index, byte for
+     * byte -- the 2-byte body (<= 48 rows, a row or pitch not of whole 16-byte words, a base off 16 bytes) and the 16-byte
+     * one (lever E1's form: > 48 rows of whole words), at the Engram kv width (25600) and at others. --- */
+    if (sel("gather_rows_bf16")) {
+        const RadKernelInfo* rg = find(pl, "gather_rows_bf16");
+        if (!rg) ok("gather_rows_bf16", false, "row absent");
+        else {
+            struct GrCase { int64_t M, n, src, x_ld, y_ld, off; const char* what; };
+            const GrCase cases[] = { { 600, 25600, 500, 25600, 25600, 0, "600 rows x 25600 (the 16-byte form)" },
+                                     { 49, 5120, 64, 5120, 5120, 0, "49 rows x 5120 (16-byte form)" },
+                                     { 48, 25600, 64, 25600, 25600, 0, "48 rows x 25600 (2-byte form)" },
+                                     { 300, 1001, 120, 1001, 1001, 0, "300 rows x 1001 (2-byte form: odd row)" },
+                                     { 300, 1000, 120, 1008, 1000, 0, "300 rows x 1000, source pitch 1008 (16-byte form)" },
+                                     { 300, 1000, 120, 1004, 1000, 0, "300 rows x 1000, source pitch 1004 (2-byte form)" },
+                                     { 300, 1000, 120, 1000, 1000, 2, "300 rows x 1000, base off 4 bytes (2-byte form)" } };
+            for (const GrCase& g : cases) {
+                std::vector<uint16_t> x((size_t)(g.src * g.x_ld + g.off));
+                for (size_t i = 0; i < x.size(); ++i) x[i] = (uint16_t)((i * 2654435761u + 12345u) >> 7);
+                std::vector<int32_t> idx((size_t)g.M);
+                for (int64_t i = 0; i < g.M; ++i) {
+                    const uint32_t h = (uint32_t)(i * 2246822519u + 3266489917u);
+                    idx[(size_t)i] = i % 37 == 5 ? -1 : i % 41 == 7 ? (int32_t)(g.src + 3) : (int32_t)(h % (uint32_t)g.src);
+                }
+                const size_t ybytes = (size_t)(g.M * g.y_ld + g.off) * 2;
+                void* dx = dalloc(x.size() * 2);
+                void* di = dalloc(idx.size() * 4);
+                void* dy = dalloc(ybytes);
+                if (!dx || !di || !dy) { ok("gather_rows_bf16 alloc", false, "hipMalloc failed"); break; }
+                st_memcpy(dx, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+                st_memcpy(di, idx.data(), idx.size() * 4, hipMemcpyHostToDevice);
+                std::vector<uint16_t> poison(ybytes / 2, 0xA5A5);
+                st_memcpy(dy, poison.data(), ybytes, hipMemcpyHostToDevice);
+                RadTensor tx = T((uint16_t*)dx + g.off, RAD_BF16, { g.src, g.n });
+                tx.stride[0] = g.x_ld;
+                RadTensor ty = T((uint16_t*)dy + g.off, RAD_BF16, { g.M, g.n });
+                ty.stride[0] = g.y_ld;
+                std::vector<RadTensor> ts = { tx, T(di, RAD_I32, { g.M }), ty };
+                std::vector<RadParam> ps = { PI("M", g.M), PI("n", g.n), PS("dtype", "bf16") };
+                run_case(rg, ts, ps);
+                std::vector<uint16_t> got(ybytes / 2);
+                st_memcpy(got.data(), dy, ybytes, hipMemcpyDeviceToHost);
+                bool same = true;
+                for (int64_t i = 0; i < g.M && same; ++i) {
+                    const int32_t r = idx[(size_t)i];
+                    for (int64_t c = 0; c < g.n; ++c) {
+                        const uint16_t want = r < 0 || r >= g.src ? 0 : x[(size_t)(g.off + r * g.x_ld + c)];
+                        if (got[(size_t)(g.off + i * g.y_ld + c)] != want) { same = false; break; }
+                    }
+                }
+                ok((std::string("gather_rows_bf16 byte for byte, ") + g.what).c_str(), same);
+                dfree_all();
+            }
+        }
+    }
     /* --- byte rows: the KV tier's transfer pair --- */
     /* Pack and unpack a pool, the real layout in miniature: a "layer" is `rows` blocks of `n`
      * bytes, a session's blocks are scattered through it, and exactly those blocks must come back.
