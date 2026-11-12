@@ -179,6 +179,24 @@ __global__ __launch_bounds__(kThreads) void r4dchain_gather_rows(R4D_GR_PARAMS) 
     r4d_chain_done();
 }
 #undef R4D_GR_PARAMS
+/* The same rows 16 bytes a thread step (ds41-e1: lever E1 gathers up to 4k rows of 25600 bf16 a step, where the 2-byte
+ * form above runs far under the copy rate), for a gather of more than 48 rows where every row and both pitches are whole
+ * 16-byte words and both bases are 16-byte aligned (gather_rows_bf16_emit decides); a row is moved whole, a dead index
+ * writes zeros: the same bytes. */
+__global__ __launch_bounds__(kThreads) void gather_rows_w16_kernel(
+    const uint4* __restrict__ x, const int32_t* __restrict__ idx, uint4* __restrict__ y,
+    uint32_t n16, int32_t src_rows, uint32_t x_ld16, uint32_t y_ld16) {
+    const uint32_t m = blockIdx.x;
+    const int32_t r = idx[m];
+    uint4* __restrict__ dst = y + (size_t)m * y_ld16;
+    if (r < 0 || r >= src_rows) {
+        const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+        for (uint32_t i = threadIdx.x; i < n16; i += kThreads) dst[i] = z;
+        return;
+    }
+    const uint4* __restrict__ src = x + (size_t)r * x_ld16;
+    for (uint32_t i = threadIdx.x; i < n16; i += kThreads) dst[i] = src[i];
+}
 
 // ---------------------------------------------------------------- byte row gather / scatter
 //
@@ -977,6 +995,13 @@ static int gather_rows_bf16_emit(long x, long idx, long y, int M, int n, int src
     if (M <= 0 || n <= 0 || src_rows <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
+    /* more than 48 rows (a decode / logits gather keeps the 2-byte body, as does the chained form), each of whole
+     * 16-byte words: 8 bf16 a word in every row, both pitches and both bases */
+    if (!chain && M > 48 && n % 8 == 0 && x_ld % 8 == 0 && y_ld % 8 == 0 && ((unsigned long)x & 15) == 0 &&
+        ((unsigned long)y & 15) == 0)
+        return R4D_EMIT(stream, gather_rows_w16_kernel, dim3((uint32_t)M), dim3(kThreads), 0,
+                        (const uint4*)x, (const int32_t*)idx, (uint4*)y, (uint32_t)(n / 8), (int32_t)src_rows,
+                        (uint32_t)(x_ld / 8), (uint32_t)(y_ld / 8)) == RAD_OK ? 0 : -4;
     return R4D_EMIT(stream, (chain ? r4dchain_gather_rows : gather_rows_kernel),
                     dim3((uint32_t)M), dim3(kThreads), 0,
                     (const uint16_t*)x, (const int32_t*)idx,

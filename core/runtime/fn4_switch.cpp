@@ -28,13 +28,13 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_lend_w", "draft_occ", "draft_occ_k", "place_lf", "sched_bi_chunk",
                                         "sched_interleave", "sched_mixed_tok", "sched_short_bypass",
                                         "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_psk_l20",
-                                        "dspark_pfctx", "ds41_psk_cr" };
+                                        "dspark_pfctx", "ds41_psk_cr", "ds41_engdd" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
            i == kDs41OneFill || i == kDrafterMx || i == kDrafterBf ||
            i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk ||
-           i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx || i == kDs41PskCr;
+           i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx || i == kDs41PskCr || i == kDs41Engdd;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -50,6 +50,7 @@ struct Hooks {
      * reaches back from its end (rad_psk_cr_reach) */
     int (*psk_plan2)(int, long long, int, const int32_t*, const int32_t*, const int32_t*) = nullptr;
     int (*psk_cr_reach)(void) = nullptr;
+    int (*engdd_stats)(long long*, int) = nullptr; /* lever E1's live counters (deepseek41's rad_engdd_stats, ds41-e1) */
 };
 
 struct State {
@@ -147,6 +148,7 @@ void find_hooks(State& s) {
             k.pfctx_stats = sym<int (*)(long long*, int)>(h, "rad_dspark_pfctx_stats");
             k.psk_plan2 = sym<int (*)(int, long long, int, const int32_t*, const int32_t*, const int32_t*)>(h, "rad_psk_plan2");
             k.psk_cr_reach = sym<int (*)(void)>(h, "rad_psk_cr_reach");
+            k.engdd_stats = sym<int (*)(long long*, int)>(h, "rad_engdd_stats");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -417,6 +419,21 @@ int dspark_pfctx_stats(int64_t out[4]) {
     return 0;
 }
 
+int engdd_stats(int64_t out[7]) {
+    for (int i = 0; i < 7; ++i) out[i] = 0;
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    for (const Hooks& k : s.hooks)
+        if (k.engdd_stats) {
+            long long v[7] = { 0, 0, 0, 0, 0, 0, 0 };
+            const int n = k.engdd_stats(v, 7);
+            for (int i = 0; i < n && i < 7; ++i) out[i] = (int64_t)v[i];
+            return n;
+        }
+    return 0;
+}
+
 int psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows, const int32_t* flags) {
     State& s = st();
     std::lock_guard<std::mutex> lk(s.mu);
@@ -452,7 +469,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
-                        "ds41_psk_cr, epoch_bump)";
+                        "ds41_psk_cr, ds41_engdd, epoch_bump)";
         return false;
     }
     State& s = st();

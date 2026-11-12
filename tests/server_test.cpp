@@ -5006,6 +5006,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     CHECK(has(g.body, "\"dspark_walk\": -1"));      /* deepseek41's (lever W1, the full-vocabulary walk) */
     CHECK(has(g.body, "\"ds41_bi\": -1"));          /* deepseek41's (lever BI, the step in segments) */
     CHECK(has(g.body, "\"ds41_psk\": -1"));         /* deepseek41's (lever PSK, the prefill cone): not loaded here */
+    CHECK(has(g.body, "\"ds41_engdd\": -1"));       /* deepseek41's (lever E1, the Engram kv dedup): not loaded here */
     CHECK(has(g.body, "\"draft_sample\": -1"));     /* the engine's (lever SD): no engine registered here */
     CHECK(has(g.body, "\"aql_acq\": 0"));
     CHECK(has(g.body, "\"epoch\": 0"));
@@ -5018,7 +5019,8 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
                            R"({"ds41_ofold":1})", R"({"ds41_onefill":1})", R"({"dspark_walk":1})",
                            R"({"ds41_bi":1})", R"({"ds41_psk":1})", R"({"ds41_psk":2})", R"({"ds41_psk_l20":1})",
                            R"({"ds41_psk_l20":0})", R"({"dspark_pfctx":1})", R"({"dspark_pfctx":0})",
-                           R"({"ds41_psk_cr":1})", R"({"ds41_psk_cr":0})", R"({"ds41_psk":4})" }) {
+                           R"({"ds41_psk_cr":1})", R"({"ds41_psk_cr":0})", R"({"ds41_psk":4})",
+                           R"({"ds41_engdd":1})" }) {
         const HttpResponse r = f.post("/admin/fn4", b);
         CHECK_EQ(r.status, 400);
         CHECK(has(r.body, "no loaded plugin serves it"));
