@@ -11039,7 +11039,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("sched_noa", -1, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
-                   "ds41_arcoded, sched_row_cap, epoch_bump)") !=
+                   "ds41_arcoded, sched_row_cap, sched_cb_hold_ms, sched_cb_hold_k, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -11805,5 +11805,372 @@ TEST(cap48_the_step_issued_ahead_is_capped) {
         CHECK_EQ(m.at("steps_capped"), cap ? (int64_t)2 : (int64_t)0);
         CHECK_EQ(m.at("ahead_capped"), cap ? (int64_t)1 : (int64_t)0);
         CHECK_EQ(m.at("steps_gt48"), cap ? (int64_t)0 : (int64_t)2);
+    }
+}
+
+
+/* ================================================== lever CBH (ds41-int10b): the co-batch hold
+ * fn4 sched_cb_hold_ms H (RADIANCE_SCHED_CB_HOLD_MS at start) / sched_cb_hold_k K: while >= 2 sequences decode, a fresh
+ * newcomer's admission is held until K newcomers wait, H ms after the first arrived, or fewer than two decode; the step the
+ * hold ends at asks the queue exactly as without the switch (queue order, D3's / NOA's pieces). The DS41 geometry (interval
+ * 2048, MNBT 4160, span 2), sched_bi_chunk 3, sched_noa 2, six decoders, a 40 ms test clock a step. GET "cbh". */
+namespace {
+struct CbhSwitch {   /* sched_cb_hold_ms back to 0 and sched_cb_hold_k to 2 when a case ends */
+    ~CbhSwitch() { (void)DstSwitches::set("sched_cb_hold_ms", 0); (void)DstSwitches::set("sched_cb_hold_k", 2); }
+};
+struct CbhCfg {
+    int hold = 500, k = 2, decoders = 6, dec_tok = 4000, il = 0, steps = 24, newc_tok = 4;
+    int64_t step_us = 40000;                    /* the hold's test clock advances 40 ms a step */
+    std::vector<std::pair<int, int>> arrive;    /* (step, prompt tokens): submitted before that step is planned */
+    int media_at = -1;                          /* >= 0: a request whose picture is never encoded arrives at that step */
+    bool ahead = false;                         /* the engine's loop: step_next behind every step, promoted when issued */
+    bool touch = true;                          /* false: the CBH switches are never set (their start values) */
+};
+struct CbhRun {
+    std::vector<uint64_t> ids;                          /* the newcomers, in arrival order */
+    std::map<uint64_t, std::vector<PskPiece>> pieces;   /* each newcomer's prefill entries (at, n, checkpoint, -, step) */
+    std::vector<int> pf_entries, dec_entries;           /* a step's prefill / decode entries */
+    std::string issued;                                 /* a step: 'S' step(), 'A' the step issued ahead, '-' none */
+    std::vector<std::string> sig;                       /* a step's plan: every entry's sequence, context, rows, kind */
+    int64_t max_step_tok = 0;
+    std::map<std::string, int64_t> cbh;
+    std::string log;
+};
+std::map<std::string, int64_t> cbh_counts() {
+    const std::string g = fn4::state_json();
+    std::map<std::string, int64_t> m;
+    const size_t at = g.find("\"cbh\": {");
+    for (const char* k : { "in_force_ms", "k", "holds", "by_k", "by_timeout", "by_idle", "by_other", "hold_ms", "held_steps",
+                           "cob_steps", "cob_newcomers", "single_steps" })
+        m[k] = noa_json_num(g, at, k);
+    return m;
+}
+CbhRun cbh_run(const CbhCfg& c) {
+    CbhRun out;
+    DstSwitches restore;
+    CbhSwitch restore_cbh;
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefill_interleave = c.il;
+    f.cfg.prefix_exact = true;
+    int64_t clk = 0;
+    std::shared_ptr<mm::Item> item;
+    if (c.touch) {
+        CHECK(DstSwitches::set("sched_cb_hold_ms", c.hold));
+        CHECK(DstSwitches::set("sched_cb_hold_k", c.k));
+    }
+    out.log = info_of([&] {
+        CHECK_OK(f.start());
+        f.sch.set_stage_rows(1024);
+        f.sch.set_span_min(16384);
+        f.sch.set_cbh_clock([&clk] { return clk; });
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        CHECK(DstSwitches::set("sched_noa", 2));
+        for (int d = 0; d < c.decoders; ++d) f.submit(100, c.dec_tok);
+        if (c.decoders > 0) { REQUIRE(f.sch.step() != nullptr); f.commit_plain(11); }
+        bool promote = false;
+        for (int s = 0; s < c.steps; ++s) {
+            clk = (int64_t)(s + 1) * c.step_us;
+            for (const auto& a : c.arrive)
+                if (a.first == s) out.ids.push_back(f.submit(a.second, c.newc_tok));
+            if (s == c.media_at) (void)f.submit_unencoded(160, c.newc_tok, &item);
+            if (promote) {
+                f.sch.promote_next();
+                out.issued += 'A';
+            } else if (f.sch.step() != nullptr) {
+                out.issued += 'S';
+            } else {
+                out.issued += '-';
+                out.pf_entries.push_back(0);
+                out.dec_entries.push_back(0);
+                out.sig.push_back("");
+                continue;
+            }
+            const StepPlan& pl = f.sch.plan();
+            int npf = 0, ndec = 0;
+            std::string sg;
+            for (const StepEntry& e : pl.e) {
+                sg += std::to_string(e.seq) + ":" + std::to_string(e.ctx_len) + "+" + std::to_string(e.n_tokens) +
+                      (e.is_prefill ? "p " : "d ");
+                if (!e.is_prefill) { ++ndec; continue; }
+                ++npf;
+                out.pieces[e.seq].push_back({ e.ctx_len, e.n_tokens, e.ckpt_slot >= 0 ? e.ctx_len + e.ckpt_tok + 1 : -1, 0, s });
+            }
+            out.pf_entries.push_back(npf);
+            out.dec_entries.push_back(ndec);
+            out.sig.push_back(sg);
+            out.max_step_tok = std::max<int64_t>(out.max_step_tok, pl.n_tok);
+            promote = false;
+            if (c.ahead) {
+                for (const StepEntry& e : pl.e)
+                    if (Request* r = f.sch.find(e.seq)) r->speculation_fixed = true;
+                promote = f.sch.step_next() != nullptr;
+            }
+            f.commit_plain(12);
+        }
+        f.sch.step_finished();   /* the engine's call after a step: it reports the counts to fn4 */
+    });
+    out.cbh = cbh_counts();
+    return out;
+}
+int cbh_first(const CbhRun& r, uint64_t id) {
+    const auto it = r.pieces.find(id);
+    return it == r.pieces.end() || it->second.empty() ? -1 : it->second.front().step;
+}
+bool cbh_same_pieces(const std::vector<PskPiece>& a, const std::vector<PskPiece>& b) {   /* (at, n, checkpoint) a piece */
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) if (a[i].at != b[i].at || a[i].n != b[i].n || a[i].ck != b[i].ck) return false;
+    return true;
+}
+}  // namespace
+
+TEST(cbh_switch_check_and_report) {
+    DstSwitches restore;
+    CbhSwitch restore_cbh;
+    Fixture f;
+    dst_fixture(f, 8);
+    std::string err;
+    CHECK_EQ(fn4::value(fn4::kSchedCbHoldMs), 0);
+    CHECK_EQ(fn4::value(fn4::kSchedCbHoldK), 2);
+    CHECK_EQ(fn4::sched_cb_hold_ms(), 0);
+    CHECK_EQ(fn4::sched_cb_hold_k(), 2);
+    CHECK(fn4::check("sched_cb_hold_ms", 0, &err));
+    CHECK(fn4::check("sched_cb_hold_ms", 1, &err));
+    CHECK(fn4::check("sched_cb_hold_ms", 60000, &err));
+    CHECK(!fn4::check("sched_cb_hold_ms", 60001, &err));
+    CHECK(!fn4::check("sched_cb_hold_ms", -1, &err));
+    CHECK(fn4::check("sched_cb_hold_k", 2, &err));
+    CHECK(fn4::check("sched_cb_hold_k", 64, &err));
+    CHECK(!fn4::check("sched_cb_hold_k", 1, &err));
+    CHECK(!fn4::check("sched_cb_hold_k", 0, &err));
+    CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
+    CHECK(!fn4::check("no_such_switch", 1, &err));
+    CHECK(err.find("sched_row_cap, sched_cb_hold_ms, sched_cb_hold_k, epoch_bump)") != std::string::npos);
+    CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
+    CHECK(DstSwitches::set("sched_cb_hold_k", 3));
+    CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
+    CHECK_EQ(fn4::sched_cb_hold_k(), 3);
+    CHECK_EQ(fn4::value(fn4::kSchedCbHoldMs), 250);
+    const std::string g = fn4::state_json();
+    CHECK(g.find("\"sched_cb_hold_ms\": 250, \"sched_cb_hold_k\": 3") != std::string::npos);
+    CHECK(g.find("\"cbh\": {\"in_force_ms\": 250, \"k\": 3, \"holds\": ") != std::string::npos);
+    CHECK(g.find("\"single_steps\": ") != std::string::npos);
+    CHECK(DstSwitches::set("sched_cb_hold_ms", 0));
+    CHECK(DstSwitches::set("sched_cb_hold_k", 2));
+    CHECK_EQ(fn4::sched_cb_hold_ms(), 0);
+    CHECK_EQ(fn4::sched_cb_hold_k(), 2);
+}
+
+/* A newcomer A (1100 tokens: one alone piece) at step 2 and B at step 7 beside six decoders. Hold 0: each is admitted the step it
+ * arrives in (two single newcomer steps). Hold 500 ms, K 2: A waits (steps 2..6 carry the six decode rows only) and both start in
+ * step 7, B's arrival ending the hold by K -- each still its alone piece. The counts: one hold, by K, five held steps, 200 ms. */
+TEST(cbh_holds_until_k_newcomers_wait) {
+    const auto a = alone_ck(1100, 0, true);
+    REQUIRE(a.size() == 1);
+    CbhCfg c;
+    c.arrive = { { 2, 1100 }, { 7, 1100 } };
+    c.hold = 0;
+    CbhRun off = cbh_run(c);
+    c.hold = 500;
+    CbhRun on = cbh_run(c);
+    REQUIRE(off.ids.size() == 2 && on.ids.size() == 2);
+    CHECK_EQ(cbh_first(off, off.ids[0]), 2);
+    CHECK_EQ(cbh_first(off, off.ids[1]), 7);
+    CHECK_EQ(cbh_first(on, on.ids[0]), 7);
+    CHECK_EQ(cbh_first(on, on.ids[1]), 7);
+    CHECK_EQ(on.pf_entries[7], 2);
+    for (int s = 2; s < 7; ++s) {
+        CHECK_EQ(on.pf_entries[(size_t)s], 0);
+        CHECK_EQ(on.dec_entries[(size_t)s], 6);
+    }
+    for (int k = 0; k < 2; ++k) {
+        CHECK_EQ(noa_check(off.pieces.at(off.ids[(size_t)k]), a, 2048, true), std::string());
+        CHECK_EQ(noa_check(on.pieces.at(on.ids[(size_t)k]), a, 2048, true), std::string());
+        CHECK(cbh_same_pieces(on.pieces.at(on.ids[(size_t)k]), off.pieces.at(off.ids[(size_t)k])));
+    }
+    CHECK(on.max_step_tok <= 4160);
+    CHECK_EQ(on.cbh["in_force_ms"], (int64_t)500);
+    CHECK_EQ(on.cbh["k"], (int64_t)2);
+    CHECK_EQ(on.cbh["holds"], (int64_t)1);
+    CHECK_EQ(on.cbh["by_k"], (int64_t)1);
+    CHECK_EQ(on.cbh["by_timeout"] + on.cbh["by_idle"] + on.cbh["by_other"], (int64_t)0);
+    CHECK_EQ(on.cbh["held_steps"], (int64_t)5);
+    CHECK_EQ(on.cbh["hold_ms"], (int64_t)200);
+    CHECK_EQ(on.cbh["cob_steps"], (int64_t)2);          /* the six decoders' admission and the pair */
+    CHECK_EQ(on.cbh["cob_newcomers"], (int64_t)8);
+    CHECK_EQ(on.cbh["single_steps"], (int64_t)0);
+    CHECK_EQ(off.cbh["holds"] + off.cbh["held_steps"] + off.cbh["hold_ms"], (int64_t)0);
+    CHECK_EQ(off.cbh["cob_steps"], (int64_t)1);
+    CHECK_EQ(off.cbh["single_steps"], (int64_t)2);
+    CHECK(on.log.find("lever CBH: co-batch hold 500 ms, K 2") != std::string::npos);
+    CHECK(off.log.find("lever CBH") == std::string::npos);
+}
+
+/* A lone newcomer: the hold ends by timeout, H after its arrival on the hold's clock (200 ms = 5 steps; 1000 ms = 25). */
+TEST(cbh_releases_on_timeout) {
+    for (int h : { 200, 1000 }) {
+        CbhCfg c;
+        c.arrive = { { 2, 1100 } };
+        c.hold = h;
+        c.steps = 40;
+        CbhRun r = cbh_run(c);
+        REQUIRE(r.ids.size() == 1);
+        const int n = h / 40;
+        CHECK_EQ(cbh_first(r, r.ids[0]), 2 + n);
+        for (int s = 2; s < 2 + n; ++s) CHECK_EQ(r.pf_entries[(size_t)s], 0);
+        CHECK_EQ(noa_check(r.pieces.at(r.ids[0]), alone_ck(1100, 0, true), 2048, true), std::string());
+        CHECK_EQ(r.cbh["holds"], (int64_t)1);
+        CHECK_EQ(r.cbh["by_timeout"], (int64_t)1);
+        CHECK_EQ(r.cbh["by_k"] + r.cbh["by_idle"] + r.cbh["by_other"], (int64_t)0);
+        CHECK_EQ(r.cbh["held_steps"], (int64_t)n);
+        CHECK_EQ(r.cbh["hold_ms"], (int64_t)h);
+        CHECK_EQ(r.cbh["single_steps"], (int64_t)1);
+    }
+}
+
+/* Never an idle server: with one decoder (or none) a newcomer is admitted the step it arrives in, nothing held; a hold standing
+ * when the decoders finish ends by idle at the first step with fewer than two decoding. */
+TEST(cbh_never_holds_an_idle_server) {
+    for (int d : { 0, 1 }) {
+        CbhCfg c;
+        c.decoders = d;
+        c.arrive = { { 2, 1100 } };
+        c.hold = 10000;
+        CbhRun r = cbh_run(c);
+        REQUIRE(r.ids.size() == 1);
+        CHECK_EQ(cbh_first(r, r.ids[0]), 2);
+        CHECK_EQ(r.cbh["holds"] + r.cbh["held_steps"], (int64_t)0);
+    }
+    CbhCfg c;
+    c.decoders = 2;
+    c.dec_tok = 8;                  /* both end a few steps in */
+    c.arrive = { { 1, 1100 } };
+    c.hold = 10000;
+    CbhRun r = cbh_run(c);
+    REQUIRE(r.ids.size() == 1);
+    const int a = cbh_first(r, r.ids[0]);
+    REQUIRE(a > 1);
+    for (int s = 1; s < a; ++s) {
+        CHECK_EQ(r.dec_entries[(size_t)s], 2);
+        CHECK_EQ(r.pf_entries[(size_t)s], 0);
+    }
+    CHECK(r.dec_entries[(size_t)a] < 2);
+    CHECK_EQ(r.cbh["holds"], (int64_t)1);
+    CHECK_EQ(r.cbh["by_idle"], (int64_t)1);
+    CHECK_EQ(r.cbh["by_k"] + r.cbh["by_timeout"] + r.cbh["by_other"], (int64_t)0);
+    CHECK_EQ(r.cbh["held_steps"], (int64_t)(a - 1));
+}
+
+/* K 3: three newcomers (steps 2, 4, 6) start in one step, each its alone piece (3 x 1100 + six decode rows fit MNBT 4160 under
+ * NOA 2). A waiting request that may not be held (a picture never encoded) means no hold: the fresh one behind it is admitted
+ * the step it arrives in, as without the switch. */
+TEST(cbh_three_newcomers_wait_for_k3_and_a_request_that_may_not_be_held_holds_nothing) {
+    const auto a = alone_ck(1100, 0, true);
+    CbhCfg c;
+    c.arrive = { { 2, 1100 }, { 4, 1100 }, { 6, 1100 } };
+    c.hold = 2000;
+    c.k = 3;
+    CbhRun r = cbh_run(c);
+    REQUIRE(r.ids.size() == 3);
+    for (uint64_t id : r.ids) {
+        CHECK_EQ(cbh_first(r, id), 6);
+        CHECK_EQ(noa_check(r.pieces.at(id), a, 2048, true), std::string());
+    }
+    CHECK_EQ(r.pf_entries[6], 3);
+    CHECK(r.max_step_tok <= 4160);
+    CHECK_EQ(r.cbh["k"], (int64_t)3);
+    CHECK_EQ(r.cbh["by_k"], (int64_t)1);
+    CHECK_EQ(r.cbh["cob_newcomers"], (int64_t)(6 + 3));
+    CbhCfg m;
+    m.media_at = 2;
+    m.arrive = { { 3, 1100 } };
+    m.hold = 2000;
+    CbhRun q = cbh_run(m);
+    REQUIRE(q.ids.size() == 1);
+    CHECK_EQ(cbh_first(q, q.ids[0]), 3);
+    CHECK_EQ(q.cbh["holds"] + q.cbh["held_steps"], (int64_t)0);
+}
+
+/* A long newcomer (4419 = alone's 2048 + 2048 + 323) and a short one co-admitted after a hold: both keep alone's pieces exactly
+ * (D3 + NOA 2), never a step over MNBT; the same pieces as without the hold, only later. */
+TEST(cbh_co_admitted_pieces_stay_alone) {
+    const auto a4 = alone_ck(4419, 0, true);
+    const auto a1 = alone_ck(1100, 0, true);
+    REQUIRE(a4.size() == 3);
+    CbhCfg c;
+    c.arrive = { { 2, 4419 }, { 5, 1100 } };
+    c.hold = 0;
+    CbhRun off = cbh_run(c);
+    c.hold = 500;
+    CbhRun on = cbh_run(c);
+    REQUIRE(off.ids.size() == 2 && on.ids.size() == 2);
+    CHECK_EQ(cbh_first(on, on.ids[0]), 5);
+    CHECK_EQ(cbh_first(on, on.ids[1]), 5);
+    CHECK_EQ(noa_check(on.pieces.at(on.ids[0]), a4, 2048, true), std::string());
+    CHECK_EQ(noa_check(on.pieces.at(on.ids[1]), a1, 2048, true), std::string());
+    CHECK_EQ(noa_check(off.pieces.at(off.ids[0]), a4, 2048, true), std::string());
+    CHECK_EQ(noa_check(off.pieces.at(off.ids[1]), a1, 2048, true), std::string());
+    CHECK(cbh_same_pieces(on.pieces.at(on.ids[0]), off.pieces.at(off.ids[0])));
+    CHECK(cbh_same_pieces(on.pieces.at(on.ids[1]), off.pieces.at(off.ids[1])));
+    CHECK(on.max_step_tok <= 4160 && off.max_step_tok <= 4160);
+    CHECK_EQ(on.cbh["by_k"], (int64_t)1);
+}
+
+/* The engine's loop (a step issued ahead behind every step): with nothing waiting every step after the first is issued ahead.
+ * Hold 0: a newcomer stops it (step_next declines while a request waits) and the next full step admits it. Hold 200 ms: the
+ * steps issued ahead keep running through the hold; when the hold has run out step_next declines, and the full step after it
+ * ends the hold (by timeout) and admits the newcomer. */
+TEST(cbh_the_step_issued_ahead_keeps_running_through_a_hold) {
+    CbhCfg c;
+    c.ahead = true;
+    c.arrive = { { 2, 1100 } };
+    c.steps = 14;
+    c.hold = 0;
+    CbhRun off = cbh_run(c);
+    c.hold = 200;
+    CbhRun on = cbh_run(c);
+    REQUIRE(off.ids.size() == 1 && on.ids.size() == 1);
+    CHECK_EQ(off.issued.substr(0, 4), std::string("SAAS"));   /* step 2's step was issued before the newcomer came */
+    CHECK_EQ(cbh_first(off, off.ids[0]), 3);
+    CHECK_EQ(on.issued.substr(0, 9), std::string("SAAAAAAAS"));
+    CHECK_EQ(cbh_first(on, on.ids[0]), 8);
+    CHECK_EQ(on.cbh["holds"], (int64_t)1);
+    CHECK_EQ(on.cbh["by_timeout"], (int64_t)1);
+    CHECK_EQ(on.cbh["held_steps"], (int64_t)5);                 /* issued ahead at steps 2 .. 6 */
+    CHECK_EQ(on.cbh["hold_ms"], (int64_t)240);                  /* from step 2's issue (120 ms) to step 8's plan (360 ms) */
+    CHECK_EQ(noa_check(on.pieces.at(on.ids[0]), alone_ck(1100, 0, true), 2048, true), std::string());
+}
+
+/* CONTROL: off is today. The switches never set, set to 0, and on but unable to act (one decoder) plan every step the same --
+ * newcomers, decoders, interleave 8, the step issued ahead -- and log nothing. */
+TEST(cbh_off_plans_as_unset) {
+    for (bool ahead : { false, true }) {
+        CbhCfg c;
+        c.ahead = ahead;
+        c.il = 8;
+        c.steps = 40;
+        c.arrive = { { 1, 1100 }, { 3, 4419 }, { 4, 1330 }, { 9, 700 }, { 9, 900 }, { 20, 1100 } };
+        c.touch = false;
+        CbhRun unset = cbh_run(c);
+        c.touch = true;
+        c.hold = 0;
+        CbhRun zero = cbh_run(c);
+        CHECK(unset.sig == zero.sig);
+        CHECK_EQ(unset.issued, zero.issued);
+        CHECK(unset.log.find("lever CBH") == std::string::npos);
+        CHECK_EQ(zero.cbh["holds"] + zero.cbh["held_steps"], (int64_t)0);
+        CHECK_EQ(unset.cbh["in_force_ms"], (int64_t)0);
+        c.decoders = 1;
+        c.newc_tok = 1;             /* a newcomer ends at its prefill: never a second decoder */
+        c.hold = 0;
+        CbhRun one0 = cbh_run(c);
+        c.hold = 500;
+        CbhRun one5 = cbh_run(c);
+        CHECK(one0.sig == one5.sig);
+        CHECK_EQ(one0.issued, one5.issued);
+        CHECK_EQ(one5.cbh["holds"], (int64_t)0);
+        if (ahead) CHECK(unset.issued.find('A') != std::string::npos);
     }
 }
