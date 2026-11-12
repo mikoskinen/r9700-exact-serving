@@ -366,7 +366,13 @@ SdmaQ* q_open(int dev, int engine, std::string* why) {
     a.queue_type = kKfdQueueSdmaByEngine;
     a.sdma_engine_id = (uint32_t)engine;
     a.queue_percentage = KFD_MAX_QUEUE_PERCENTAGE;
-    a.queue_priority = KFD_MAX_QUEUE_PRIORITY;
+    /* R4D_SDMA_QPRIO (0..15, default 15 = KFD_MAX_QUEUE_PRIORITY as core/device/aql.cpp's lane): the 219 decode-cost probe */
+    static const unsigned qprio = [] {
+        const char* e = std::getenv("R4D_SDMA_QPRIO");
+        const int v = e && *e ? std::atoi(e) : KFD_MAX_QUEUE_PRIORITY;
+        return (unsigned)(v >= 0 && v <= KFD_MAX_QUEUE_PRIORITY ? v : KFD_MAX_QUEUE_PRIORITY);
+    }();
+    a.queue_priority = qprio;
     if (ioctl(kfd(), kKfdCreateQueue, &a) < 0) {
         *why = sfmt("the driver refused an SDMA queue on engine %d: %s", engine, std::strerror(errno));
         bo_free(q->gpu_id, &q->ptrs);
