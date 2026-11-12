@@ -20,7 +20,12 @@
 // next one) or split (ring, and a flag after each half of a step, each awaited only where its data
 // is read). Every form folds the same words in the same order, so all give the same bits. The
 // engine runs lockstep; the other two exist to time a board (r4d_selftest --perfar8).
-enum { R4D_AR8_FORM_LOCKSTEP = 0, R4D_AR8_FORM_RING = 1, R4D_AR8_FORM_SPLIT = 2 };
+enum { R4D_AR8_FORM_LOCKSTEP = 0, R4D_AR8_FORM_RING = 1, R4D_AR8_FORM_SPLIT = 2,
+       /* ds41-int13 XPUSH (ported from fn4-x3-sp3 808866c2, FN RSF 204): lockstep with the first hop's pushes
+        * interleaved over the peers -- each thread loads its word of every peer-owned shard and stores them to every
+        * peer, so all links carry the phase-1 bytes at once (lockstep sends to one peer after another). The same
+        * words to the same places: the same bits. Any rank count. */
+       R4D_AR8_FORM_XPUSH = 3 };
 enum {
   R4D_AR_SHARD_WEIGHT_MAX = 65535,
   R4D_AR8_MIN_ELEMS_DEFAULT = 262144,
