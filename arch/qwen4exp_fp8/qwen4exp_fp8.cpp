@@ -282,6 +282,8 @@ struct Model {
      * sequence's rows (host positions: a jump starts the next), as bounds {0, .., T} -- so libr4d's hc_read takes every
      * decode-class run (at most 64 rows) in a read of its own, with its one-family form (r4d_hc_bf16.hip hc_bi). */
     bool        bi_on = false;
+    int         bi_mode = 0;     /* fn4 hc_bi's value this step (3: decode rows read <= kBiDecRows at a time) */
+    int64_t     bi_td = 0;       /* this step's decode rows */
     std::vector<int64_t> bi_cut;
 };
 
@@ -296,7 +298,7 @@ static std::atomic<int> g_dual_declared{0};
 /* fn4 BI: switch hc_bi's value (RADIANCE_FN4_HC_BI starts it; libr4d takes the same switch for its forms). */
 static std::atomic<int>& fn4_hcbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_HC_BI");
-                                   const int v = e && *e ? std::atoi(e) : 0; return v == 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   const int v = e && *e ? std::atoi(e) : 0; return v == 3 ? 3 : v == 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 BI: switch bi_seg's value (RADIANCE_FN4_BI_SEG starts it): the trunk's linears cut at the step's segments. */
@@ -308,7 +310,9 @@ static std::atomic<int>& fn4_biseg_flag() {
 /* fn4 BI: the step's segments (Model::bi_cut) when hc_bi or bi_seg is on; the reads take them under hc_bi
  * (bi_read), every LinearFP8 under bi_seg (rad::arch::bi_cuts, this rank thread's, cleared at a step without). */
 static void bi_segments(Model& m, const RadBatch* batch) {
-    m.bi_on = fn4_hcbi_flag().load(std::memory_order_relaxed) > 0;
+    m.bi_mode = fn4_hcbi_flag().load(std::memory_order_relaxed);
+    m.bi_on = m.bi_mode > 0;
+    m.bi_td = 0;
     const bool seg = fn4_biseg_flag().load(std::memory_order_relaxed) > 0;
     m.bi_cut.clear();
     bi_cuts() = BiCuts{};
@@ -316,6 +320,7 @@ static void bi_segments(Model& m, const RadBatch* batch) {
     const int64_t T = batch->n_tok;
     int64_t sd = 0, td = 0;
     batch_split(batch, &sd, &td);
+    m.bi_td = td;
     m.bi_cut.push_back(0);
     if (td > 0 && td < T) m.bi_cut.push_back(td);
     if (batch->positions_h)
@@ -355,20 +360,31 @@ static bool bi_logits(RadCtx* c, const Model& m, const RadBatch* batch) {
     return true;
 }
 /* A connection's read over rows [r0, r0 + n), cut at the step's segments under hc_bi. */
+/* fn4 BI hc_bi 3 (12.11.2026, 193's trace: L00.rd_mix first-differing in 18 of 20 c4 probes): Flash-Next's mixing matrices
+ * are E4M3, which hc_bi 1 / 2 do not cover (libr4d: !f8) -- its decode forms move with the row count (G to 8 rows, S 9..16,
+ * tiled from 17) while a sequence's own decode read is 4 rows (G). Under 3 the decode rows are read at most kBiDecRows at a
+ * time (form G, its rows' bytes the same at every group size; the up product B3 the same), each prefill sequence alone as
+ * under 1 / 2. A pure decode step is cut too. libr4d keeps today's forms at 3. */
+constexpr int64_t kBiDecRows = 8;
+static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t a, int64_t b, bool ss) {
+    const bool dec = m.bi_mode == 3 && a < m.bi_td;
+    if (!dec) { hcx.read(c, T, a, b - a, ss); return; }
+    for (int64_t p = a; p < b; p += kBiDecRows) hcx.read(c, T, p, std::min(kBiDecRows, b - p), ss);
+}
 static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t r0, int64_t n, bool ss = false) {
-    if (!m.bi_on || m.bi_cut.size() <= 2) { hcx.read(c, T, r0, n, ss); return; }
+    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode == 3 && m.bi_td > kBiDecRows))) { hcx.read(c, T, r0, n, ss); return; }
     for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i) {
         const int64_t a = std::max(m.bi_cut[i], r0), b = std::min(m.bi_cut[i + 1], r0 + n);
-        if (b > a) hcx.read(c, T, a, b - a, ss);
+        if (b > a) bi_read_seg(c, m, hcx, T, a, b, ss);
     }
 }
 /* read_pieces under hc_bi: each segment in pieces of the read's band. */
 static void bi_read_pieces(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, bool ss = false) {
-    if (!m.bi_on || m.bi_cut.size() <= 2) { hcx.read_pieces(c, T, ss); return; }
+    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode == 3 && m.bi_td > kBiDecRows))) { hcx.read_pieces(c, T, ss); return; }
     const int64_t piece = hcx.c.read_rows > 0 ? hcx.c.read_rows : T;
     for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
         for (int64_t a = m.bi_cut[i]; a < m.bi_cut[i + 1]; a += piece)
-            hcx.read(c, T, a, std::min(piece, m.bi_cut[i + 1] - a), ss);
+            bi_read_seg(c, m, hcx, T, a, std::min(a + piece, m.bi_cut[i + 1]), ss);
 }
 
 /* ============================== fn4 BI's engine tracer (BiTr) ============================== */
@@ -2374,7 +2390,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "hc_bi") == 0) {   /* fn4 BI: the reads cut at the step's segments (libr4d takes it too) */
-        if (value < 0 || value > 2) return -1;
+        if (value < 0 || value > 3) return -1;
         qwen4exp_fp8::fn4_hcbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }

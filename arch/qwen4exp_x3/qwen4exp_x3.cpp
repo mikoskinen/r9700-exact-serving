@@ -47,7 +47,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (std::strcmp(name, "hc_bi") == 0) {   /* fn4 BI: the reads cut at the step's segments (libr4d takes it too) */
-        if (value < 0 || value > 2) return -1;
+        if (value < 0 || value > 3) return -1;
         qwen4exp_fp8::fn4_hcbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }

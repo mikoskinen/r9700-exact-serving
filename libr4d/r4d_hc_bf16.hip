@@ -3627,7 +3627,7 @@ static int hc_bi() {
     int v = g_hc_bi.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_BI");
-        const int on = (e && *e) ? (std::atoi(e) == 2 ? 2 : std::atoi(e) > 0 ? 1 : 0) : 0;
+        const int on = (e && *e) ? (std::atoi(e) == 3 ? 3 : std::atoi(e) == 2 ? 2 : std::atoi(e) > 0 ? 1 : 0) : 0;
         int want = -1;
         g_hc_bi.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_bi.load(std::memory_order_relaxed);
@@ -7083,8 +7083,9 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (!std::strcmp(name, "hc_bi")) {   /* fn4 BI: hc_read's one family (1) / the per-row forms (2) up to kHcBiRows */
-        if (value < 0 || value > 2) return -1;
+    if (!std::strcmp(name, "hc_bi")) {   /* fn4 BI: hc_read's one family (1) / the per-row forms (2) up to kHcBiRows;
+                                          * 3 = today's forms here (the architecture reads decode rows <= 8 at a time) */
+        if (value < 0 || value > 3) return -1;
         g_hc_bi.store(value, std::memory_order_relaxed);
         return 1;
     }
