@@ -405,6 +405,13 @@
  *                   while a hold stood, issued ahead included), cob_steps / cob_newcomers (steps that admitted >= 2
  *                   waiting requests, and those requests), single_steps (steps that admitted one) -- the last three at
  *                   any setting.
+ *   gg_gemv_m16     libr4d (lever A4, ds41-a4, appended after exl3_x3d): 0 off (gemm_nt_ggml / its pair / folds a and e /
+ *                   logits_gemm_ggml in the decode band take lever D2's form as with gg_gemv 2 alone); 1 under gg_gemv 2 a
+ *                   call of M <= 16 rows takes the A4 table's form where it has an entry (the XP slab one ahead, the grid
+ *                   fit's waves a block, H1R2, larger MT; libr4d r4d_ds41_ggml_mr.hip mr_choose). Exact: tiling, lane
+ *                   map, loads and pipelining only, each output D2's operation sequence (the stock kernel's bytes, every
+ *                   row count). RADIANCE_DS41_GG_M16=1 at load starts it; RADIANCE_DS41_GG_M16_FORMS=FILE adds a
+ *                   measured table (r4d_selftest --perfm16) ahead of the compiled one.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -482,7 +489,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d, kSwitches };
+              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d, kGgGemvM16, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
