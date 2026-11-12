@@ -2122,6 +2122,16 @@ __device__ __forceinline__ void hc_up_w_body(
     const int col = lane & 15, hh = lane >> 4;
     const long i0 = (long)blockIdx.x * kHcBCh;
     const long iw = i0 + 4 * wave;
+    /* fn4 BI (hc_read's bi_dec): row group blockIdx.y of RG rows (the last may be short) -- a launch of one group is
+     * today's (r0 0, every row of the step). A row's bytes do not depend on its group: its d row is one WMMA column. */
+    const long r0 = (long)blockIdx.y * RG;
+    rows = rows - r0 < RG ? rows - r0 : RG;
+    dbuf += r0 * kLr;
+    h += r0 * hrow;
+    scalein += r0 * kHcMax;
+    x += r0 * xrow;
+    if (q) { q += r0 * qrow; qs += r0 * srow; }
+    if (rq) { rq += r0 * rqrow; rqs += r0 * rsrow; }
 
     /* ---- constant operands before the chain wait: this lane's W_up row (m = col), its half of every quarter */
     const unsigned char* wr = upv + ((long)(col & 3) * n + iw + (col >> 2)) * uld;
@@ -2147,9 +2157,9 @@ __device__ __forceinline__ void hc_up_w_body(
 #pragma unroll
     for (int i = 0; i < (kD8 + kThreads - 1) / kThreads; ++i) {
         const int k = tid + i * kThreads;
-        dq[i] = k < kD8 ? ((const uint4*)dbuf)[k] : make_uint4(0u, 0u, 0u, 0u);
+        dq[i] = k < kD8 && k < (int)rows * (kLr / 8) ? ((const uint4*)dbuf)[k] : make_uint4(0u, 0u, 0u, 0u);
     }
-    const int rr = col < RG ? col : RG - 1;
+    const int rr = col < (int)rows ? col : (int)rows - 1;
     float sc[4];
     uint32_t hv2[4];
 #pragma unroll
@@ -2206,7 +2216,7 @@ __device__ __forceinline__ void hc_up_w_body(
     const int nb = kUpTB / kHcBCh;
     __threadfence();
     __syncthreads();
-    const unsigned slot = (unsigned)(i0 / kUpTB);
+    const unsigned slot = (unsigned)(i0 / kUpTB + (long)blockIdx.y * (n / kUpTB));
     if (tid == 0)
         s_arrived = __hip_atomic_fetch_add(&ctr[slot], 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     __syncthreads();
@@ -3627,7 +3637,7 @@ static int hc_bi() {
     int v = g_hc_bi.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_BI");
-        const int on = (e && *e) ? (std::atoi(e) == 3 ? 3 : std::atoi(e) == 2 ? 2 : std::atoi(e) > 0 ? 1 : 0) : 0;
+        const int on = (e && *e) ? (std::atoi(e) == 5 ? 5 : std::atoi(e) == 3 ? 3 : std::atoi(e) == 2 ? 2 : std::atoi(e) > 0 ? 1 : 0) : 0;
         int want = -1;
         g_hc_bi.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_bi.load(std::memory_order_relaxed);
@@ -6536,8 +6546,14 @@ extern "C" int64_t r4d_rad_hc_read_scratch(const RadArgs* a) {
     /* The split must come from the same number here and at the call site. Only the call site knows
      * whether there are inject weights, so both derive `kc` from `lr` and the buffer is sized for
      * the widest ncol; mismatched derivations overrun the partial buffer. */
-    return M * ((long long)lr * 2 + (long long)kHcMax * 4) + hc_u_rows(M, lr, hc) * HN * 2
-           + hc_part_bytes(M, lr, HN);
+    const long long base = M * ((long long)lr * 2 + (long long)kHcMax * 4) + hc_u_rows(M, lr, hc) * HN * 2;
+    const long long tot  = base + hc_part_bytes(M, lr, HN);
+    /* fn4 BI (bi_dec): form G's partials for every 8-row group of the band */
+    if (r4d_geti_or(a, "bi_dec", 0) != 0) {
+        const long long gp = base + ((M + 7) / 8) * ((lr + kHcGTile - 1) / kHcGTile + 1) * hc * 8 * kHcGTile * 4;
+        return gp > tot ? gp : tot;
+    }
+    return tot;
 }
 
 extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
@@ -6678,18 +6694,24 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
      * kernel A' as (tile, stream) blocks, its partials after `fixed` and its tile counters behind the
      * fused form's, then kernel B3. From 17 rows the tiled path (chained) measured faster (x8 +2.9 %
      * against two 16-row groups of form S). */
+    /* fn4 BI (bi_dec 1, the hc_bi 5 twin: a step's decode rows, every height in one launch): form G's kernel A' in
+     * 8-row groups on grid.y, then kernel B3 in 16-row groups on grid.y -- each row's bytes are the ones its own
+     * sequence's alone read (four rows, form G at RG 4, B3 at RG 4) gives, as hc_bi 3's reads of <= 8 rows a launch
+     * (A': a row's norm, dots and finisher touch only that row; B3: its d row is one WMMA column). No form S, no
+     * tiled form: a shape form G does not take is refused, never read in another form. */
+    const bool bidec = r4d_geti_or(a, "bi_dec", 0) != 0;
     constexpr long hcg_max = 16;
     const long hcg_nt = (lr + kHcGTile - 1) / kHcGTile;
     unsigned int* hcg_ctr = nullptr;
     float* hcg_part = nullptr;
     /* Form S: one block a (tile, stream) holds every row. */
-    const bool hcs = rows > 8 && rows <= 16 && (hrow % 8) == 0
+    const bool hcs = !bidec && rows > 8 && rows <= 16 && (hrow % 8) == 0
                      && (((uintptr_t)h->data & 15u) == 0u) && (((uintptr_t)w->data & 15u) == 0u);
     const long hcg_rg = hcs ? 16 : rows <= 8 ? rows : 8;     /* rows a group of kernel A' */
     const long hcg_gy = (rows + hcg_rg - 1) / hcg_rg;
     if (!bi && f8 && hc == 4 && n == kHcGN && lr % kHcGTile == 0 && lr <= 2L * kThreads
         && (hcg_nt + 1) * hcg_gy <= (long)kHcGTilesMax
-        && rows >= 1 && rows <= hcg_max && injw && inj && g_hc_decode_form == 0
+        && rows >= 1 && (rows <= hcg_max || bidec) && injw && inj && g_hc_decode_form == 0
         && a->scratch_bytes >= fixed + hcg_gy * (hcg_nt + 1) * hc * hcg_rg * kHcGTile * 4) {
         unsigned int* mc = hc_mix_ctr(s);
         if (mc) {
@@ -6699,9 +6721,10 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     }
     const bool hcg = hcg_ctr != nullptr;
     const bool hcg_ch = hcg && r4d_geti_or(a, "chain", 0) != 0;
-    /* Kernel B3 for forms G and S at lr 320, a single row group; else the chained up-mix. */
-    const bool hcw = hcg && lr == 320 && rows <= 16 && (rows <= 8 || hcs) && (n % 128) == 0
+    /* Kernel B3 for forms G and S at lr 320, a single row group (bi_dec: 16-row groups); else the chained up-mix. */
+    const bool hcw = hcg && lr == 320 && (rows <= 16 || bidec) && (rows <= 8 || hcs || bidec) && (n % 128) == 0
                      && (hrow % 2) == 0 && (xrow % 2) == 0;
+    if (bidec && !hcw) return R4D_NO(RAD_E_SHAPE);
     const bool tiled  = can_tile && ((rows >= kDecMinRows && !bi2) || bi) && !hcg;
     /* fn4 hc_readv bit 3 (W1b): the norm scales the preceding hc_write stored in `ss` (hc_ss_operand, the rule the
      * write applied), on the unchained tiled forms; there they replace this read's pass and `scale` points at them. */
@@ -6986,11 +7009,13 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         mctr = hc_mix_ctr(s);
         fused = (mctr != nullptr);
     }
+    if (bidec && (!fused || (n / kUpTB) * ((rows + 15) / 16) > (long long)kMaxMixCtr)) return R4D_NO(RAD_E_SHAPE);
     if (hcw) {
         unsigned int* const qctr = q ? mctr : nullptr;
 #define HC_UPW_K(RG_, I8_)                                                                       \
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_w<RG_, I8_> : &hc_up_w_kernel<RG_, I8_>),  \
-                           dim3((unsigned)(n / kHcBCh)), dim3(kThreads), 0,                       \
+                           dim3((unsigned)(n / kHcBCh), (unsigned)((rows + RG_ - 1) / RG_)),    \
+                           dim3(kThreads), 0,                                                     \
                            (const unsigned char*)up->data, (long)uld, (const unsigned short*)dbuf, \
                            (const unsigned short*)h->data, (const float*)w->data,                \
                            (const float*)scale, (unsigned short*)x->data,                         \
@@ -7000,7 +7025,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (long)hrow, (long)xrow, (long)qrow, (long)srow, (long)rqrow,           \
                            (long)rsrow, wadd)
 #define HC_UPW_R(RG_) do { if (i8) HC_UPW_K(RG_, true); else HC_UPW_K(RG_, false); } while (0)
-        switch (rows) {
+        switch (rows > 16 ? 16 : rows) {   /* bi_dec past 16 rows: 16-row groups on grid.y */
             case 16: HC_UPW_R(16); break; case 15: HC_UPW_R(15); break; case 14: HC_UPW_R(14); break;
             case 13: HC_UPW_R(13); break; case 12: HC_UPW_R(12); break; case 11: HC_UPW_R(11); break;
             case 10: HC_UPW_R(10); break; case 9: HC_UPW_R(9); break;   case 8: HC_UPW_R(8); break;
@@ -7085,7 +7110,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     }
     if (!std::strcmp(name, "hc_bi")) {   /* fn4 BI: hc_read's one family (1) / the per-row forms (2) up to kHcBiRows;
                                           * 3 = today's forms here (the architecture reads decode rows <= 8 at a time) */
-        if (value < 0 || value > 3) return -1;
+        if (value < 0 || value > 5 || value == 4) return -1;   /* 5: hc_bi 3 + the bi_dec twin (architecture) */
         g_hc_bi.store(value, std::memory_order_relaxed);
         return 1;
     }

@@ -687,7 +687,7 @@ static const RadOperandSpec oMtpEnter[] = {
 };
 static const RadParamSpec pHcRead[] = {
     P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"), P_F64("eps"), P_STR("dtype"),
-    P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"),
+    P_F64O("wadd"), P_INTO("inject"), P_INTO("group"), P_INTO("rotate"), P_STRO("mix"), P_INTO("bi_dec"),
 };
 static const RadOperandSpec oHcRead[] = {
     { "h",        RAD_OPD_IN,     0 },

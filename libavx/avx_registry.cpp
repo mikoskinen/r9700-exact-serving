@@ -63,7 +63,7 @@ static const RadOperandSpec oRmsnorm[] = { OPD("x"), WGT_O("w"), OUT("y") };
 static const RadParamSpec pHcRead[]    = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"),
                                            P_F64("eps"), P_STR("dtype"), P_F64O("wadd"),
                                            P_INTO("inject"), P_INTO("group"), P_INTO("rotate"),
-                                           P_STRO("mix") };
+                                           P_STRO("mix"), P_INTO("bi_dec") };
 static const RadOperandSpec oHcRead[]  = { OPD("h"), WGT("w"), WGT("mix_down"), WGT("mix_up"),
                                            WGT_O("inject_w"), OUT("x"), OUT_O("inj"), OUT_O("q"),
                                            OUT_O("scale"), OUT_O("rq"), OUT_O("rscale"),

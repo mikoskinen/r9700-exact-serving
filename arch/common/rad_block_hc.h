@@ -119,6 +119,13 @@ struct HyperConn {
      * `mix`), read from their encoding at declare. */
     bool       mix_e4m3 = false;
     rad_op     op_read = 0, op_write = 0;
+    /* fn4 BI (hc_bi 5): the read of a step's decode rows in one launch -- op_read with bi_dec 1 (libr4d hc_read: form G
+     * in 8-row groups, B3 in 16-row groups, each row's bytes its own sequence's alone read's). Declared with the inject
+     * gains and E4M3 mixing, when RADIANCE_FN4_BIDEC (default: RADIANCE_FN4_X3DUAL, the BI declarations) is on at
+     * start; rows up to kBiDecRowsMax. 0 otherwise (then hc_bi 5 reads as hc_bi 3). */
+    static constexpr int64_t kBiDecRowsMax = 64;
+    rad_op     op_read_bd = 0;
+    void read_bd(RadCtx* c_, int64_t r0, int64_t rows, bool ss_in) const;
     /* The write with the all-reduce folded in; 0 when not requested or not served.
      * `op_ar_write6` is the same on the rotated 6-bit wire, declared only when a lossy payload is
      * accepted and issued on the steps ar_wire_is_exact rejects (every trunk all-reduce at a
@@ -276,6 +283,27 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
         rad_op_reads (b, op_read, rd, w.ss ? 2 : 1);
         rad_op_writes(b, op_read, wr, n_wr);
     }
+    {   /* fn4 BI twin (hc_bi 5): the decode rows' read in one launch */
+        const char* e = std::getenv("RADIANCE_FN4_BIDEC");
+        if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
+        if (e && *e && *e != '0' && c.inject && mix_e4m3) {
+            const int64_t hi = g.max_tok < kBiDecRowsMax ? g.max_tok : kBiDecRowsMax;
+            op_read_bd = RAD_OP(b, "hc_read",
+                             RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", g.n_embd),
+                                        RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),
+                                        RAD_F64("eps", g.eps), RAD_STR("dtype", g.dtype),
+                                        RAD_F64("wadd", g.wadd), RAD_INT("inject", 1),
+                                        RAD_INT("group", c.quant ? RAD_FP8_BLOCK : 0),
+                                        RAD_INT("rotate", c.rotate ? 1 : 0),
+                                        RAD_STR("mix", "e4m3"), RAD_INT("bi_dec", 1)),
+                             wts, n_wts);
+            if (op_read_bd) {
+                const rad_buf rd[2] = { w.h, w.ss };
+                rad_op_reads (b, op_read_bd, rd, w.ss ? 2 : 1);
+                rad_op_writes(b, op_read_bd, wr, n_wr);
+            }
+        }
+    }
 
     if (c.inject) {
         /* fn4 W1b: with `ss` the write also takes the read's eps, at which it stores the scales. */
@@ -365,6 +393,20 @@ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
         }
     }
     return RAD_OK;
+}
+
+inline void HyperConn::read_bd(RadCtx* c_, int64_t r0, int64_t rows, bool ss_in) const {
+    const int64_t HN = hn();
+    RAD_ISSUE_N(c_, op_read_bd, rows,
+                brow_slice(w.h, r0, rows, HN), RAD_W(w_norm), RAD_W(w_down), RAD_W(w_up), RAD_W(w_inj),
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                brow_slice(w.inj, r0, rows, c.hc),
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd) : RAD_NONE,
+                c.quant  ? brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows,
+                                      fp8_blocks(g.n_embd)) : RAD_NONE,
+                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE,
+                ss_in && w.ss ? brow_slice(w.ss, r0, rows, 8) : RAD_NONE);
 }
 
 inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in) const {

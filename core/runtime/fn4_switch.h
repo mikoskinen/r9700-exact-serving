@@ -41,8 +41,11 @@
  *   hc_bi           libr4d + qwen4exp (rad_fn4_switch): fn4 BI -- 1 hc_read up to 64 rows through one form family
  *                   (tiled from a single row, the one-tile K split, hc_norm_scale_kernel's scales: a one-time change
  *                   at 1..7 rows); 2 up to 64 rows through today's per-row kernels (bf16 mixing: today's alone bytes
- *                   kept); both: the architecture reads a step's decode rows / each prefill sequence alone; 0 today
- *                                                                                                    RADIANCE_FN4_HC_BI
+ *                   kept); both: the architecture reads a step's decode rows / each prefill sequence alone; 3 the
+ *                   E4M3 decode rows <= 8 a read (form G), the final read a sequence a read; 5 as 3, the connections
+ *                   with the inject gains read the decode rows in one launch (bi_dec twin: form G / B3 in row groups
+ *                   on grid.y, the same bytes; needs RADIANCE_FN4_BIDEC or RADIANCE_FN4_X3DUAL at start, else as 3);
+ *                   0 today                                                                          RADIANCE_FN4_HC_BI
  *   bi_seg          architecture plugin (rad_fn4_switch): fn4 BI -- every trunk linear (LinearFP8) cut at the step's
  *                   segments (decode rows, each prefill sequence): a decode row's linears at its own height (the
  *                   narrow tiles, M-invariant to 64); 2 also the lm_head at each output row's alone height class
