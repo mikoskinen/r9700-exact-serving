@@ -956,11 +956,28 @@ extern "C" int r4d_rad_ar_oneshot_3rank_exact(const RadArgs* a, RadStream s) {
  * and r4d_rad_ar_twoshot_4rank_exact's plain launch) pushes its first hop interleaved over the peers (R4D_AR8_FORM_XPUSH, all
  * three links at once) for a message of at least R4D_AR_XPUSH_MIN_ELEMS elements; smaller messages keep lockstep. The same
  * stores and the same fp32 ascending-rank fold: the same bytes. FN 204 (gpu02, 4x R9700): 4096 x 5120 3436 -> 2508 us (-27 %),
- * 2048 x 2560 871 -> 653 us; 16 / 48 x 2560 ~+0.8 us slower, hence the floor (25.6 rows at deepseek41's 5120). The coded
- * wires (overlap 1, ds41_arcoded) are untouched. The start value is RADIANCE_FN4_AR_XPUSH (> 0: 1; unset / empty / 0: 0),
- * read at the first launch; a change applies at a step release, every rank parked, and re-records every pass (fn4's epoch).
- * A process's first XPUSH launch says so on stderr, once. */
-enum { R4D_AR_XPUSH_MIN_ELEMS = 131072 };
+ * 2048 x 2560 871 -> 653 us; 16 / 48 x 2560 ~+0.8 us slower, hence the floor. The coded wires (overlap 1, ds41_arcoded) are
+ * untouched. The start value is RADIANCE_FN4_AR_XPUSH (> 0: 1; unset / empty / 0: 0), read at the first launch; a change
+ * applies at a step release, every rank parked, and re-records every pass (fn4's epoch). A process's first XPUSH launch says
+ * so on stderr, once, with the bound.
+ * ds41-int14c (ported from FN fn4-x3-sp3 5f0352a8, 13.11.): the floor is 1048576 elements (was 131072, which deepseek41's
+ * decode steps of >= 26 rows at 5120 cross -- c16's drafted steps up to 48 rows, c4's > 16-row steps; the int13 screen's c16
+ * decode step +0.43 % fits the ~0.8 us an AR there). 1048576 = ~205 rows at 5120: above every decode / verify height (<= 48
+ * rows = 245760), below a newcomer's ~1100-row mixed step (~5.6 M) and every cold-prefill chunk (4160 rows), which keep XPUSH;
+ * the band in between keeps the lockstep form. RADIANCE_FN4_AR_XPUSH_MIN (start, a count > 0) overrides the bound for an A/B
+ * (FN's name); when it is set the load says so, unset it is silent (int12's start log). */
+enum { R4D_AR_XPUSH_MIN_ELEMS = 1048576 };
+static long long ar_xpush_min_load() {
+    const char* e = std::getenv("RADIANCE_FN4_AR_XPUSH_MIN");
+    const long long m = (e && *e) ? std::atoll(e) : 0;
+    const long long v = m > 0 ? m : (long long)R4D_AR_XPUSH_MIN_ELEMS;
+    if (e && *e)
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_FN4_AR_XPUSH_MIN=%s: ar_xpush's XPUSH form from %lld elements (%s; "
+                             "the default %d)\n", e, v, m > 0 ? "the env's bound" : "not a count > 0: the default",
+                     (int)R4D_AR_XPUSH_MIN_ELEMS);
+    return v;
+}
+static const long long g_ar_xpush_min = ar_xpush_min_load();
 static std::atomic<int> g_ar_xpush{-1};
 static int ar_xpush_on() {
     int v = g_ar_xpush.load(std::memory_order_relaxed);
@@ -973,11 +990,11 @@ static int ar_xpush_on() {
     return v;
 }
 static long ar_xpush_form(long numel) {
-    if (ar_xpush_on() != 1 || numel < R4D_AR_XPUSH_MIN_ELEMS) return (long)R4D_AR8_FORM_LOCKSTEP;
+    if (ar_xpush_on() != 1 || (long long)numel < g_ar_xpush_min) return (long)R4D_AR8_FORM_LOCKSTEP;
     static std::atomic<int> said{0};
     if (said.exchange(1, std::memory_order_relaxed) == 0)
         std::fprintf(stderr, "[r4d] ar_xpush 1: the four-rank exact two-shot's first hop interleaved over the peers (XPUSH) "
-                             "from %d elements; the first at %ld\n", (int)R4D_AR_XPUSH_MIN_ELEMS, numel);
+                             "from %lld elements; the first at %ld\n", g_ar_xpush_min, numel);
     return (long)R4D_AR8_FORM_XPUSH;
 }
 int r4d_ar_xpush_get() { return ar_xpush_on(); }

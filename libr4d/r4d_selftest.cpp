@@ -31638,7 +31638,7 @@ static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& d
 
 /* ds41-int13 XPUSH: --case ar_xpush_perf (INFO) -- the four-rank exact two-shot's plain launch (row ar_twoshot_4rank_exact) at
  * deepseek41's newcomer / prefill message sizes, rows x 5120 bf16 (R4D_SELFTEST_XPUSH_ROWS, default 256,1024,2048,4096), with
- * libr4d's fn4 switch ar_xpush 0 (lockstep) then 1 (XPUSH, >= 131072 elements): each rank's first launch is checked against the
+ * libr4d's fn4 switch ar_xpush 0 (lockstep) then 1 (XPUSH from 1048576 elements, RADIANCE_FN4_AR_XPUSH_MIN; below it lockstep): each rank's first launch is checked against the
  * fp32 ascending-rank fold (an ok line), then 3 warm-ups and 40 launches back to back in place; "info AR4XP" lines give the
  * slowest rank's us a launch at 0 and 1 and the difference. The byte checks are ar_twoshot_4rank_exact's / ar_oneshot_4rank_exact's
  * cases (P0); this one times the two forms. */

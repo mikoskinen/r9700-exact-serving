@@ -349,9 +349,10 @@
  *                   decodes the same values, folded in the same order. RADIANCE_DS41_ARCODED=N at load starts it at N.
  *                   GET "arc" carries its counters (arc_stats).
  *   ar_xpush        libr4d (XPUSH, ds41-int13; ported from fn4-x3-sp3 808866c2, FN RSF 204; 63 here, after exl3_x3d): 0 off
- *                   (today: lockstep); 1 -- the four-rank exact two-shot's plain launch of a message of >= 131072 elements
- *                   pushes its first hop interleaved over the peers (R4D_AR8_FORM_XPUSH, r4d_ar_xpush.h: all three links at
- *                   once); smaller messages and the coded wires as before. Exact: the same stores, the same fold.
+ *                   (today: lockstep); 1 -- the four-rank exact two-shot's plain launch of a message of >= 1048576 elements
+ *                   (ds41-int14c, FN 5f0352a8; was 131072; RADIANCE_FN4_AR_XPUSH_MIN at start overrides it) pushes its first
+ *                   hop interleaved over the peers (R4D_AR8_FORM_XPUSH, r4d_ar_xpush.h: all three links at once); smaller
+ *                   messages and the coded wires as before. Exact: the same stores, the same fold.
  *                   RADIANCE_FN4_AR_XPUSH=1 at load starts it at 1.
  *   place_swap_lent engine (lever SWL, ds41-swl; 65 here, after gg_gemv_m16; Mover::issue): 0 off (today: a heat
  *                   promotion takes only a free budgeted swap slot, else it starves -- experts.starved_slab -- and its unit

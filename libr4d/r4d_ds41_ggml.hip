@@ -4186,7 +4186,7 @@ void r4d_ix_ni_set(int v);
 int r4d_arc_get();
 void r4d_arc_set(int v);
 /* ds41-int13 XPUSH (r4d_ar_entry.hip, ported from fn4-x3-sp3 808866c2): "ar_xpush" 0 / 1 -- the four-rank exact two-shot's
- * plain launch of >= 131072 elements pushes its first hop interleaved over the peers (R4D_AR8_FORM_XPUSH; the same bytes). */
+ * plain launch of >= 1048576 elements (int14c, FN 5f0352a8; RADIANCE_FN4_AR_XPUSH_MIN) pushes its first hop interleaved over the peers (R4D_AR8_FORM_XPUSH; the same bytes). */
 int r4d_ar_xpush_get();
 void r4d_ar_xpush_set(int v);
 /* Lever 1U-MX (ds41-int11, r4d_ds41_elem.hip): "ds41_mix_wv" 0 / 12 / 16 / 24 -- mhc_mix's split launch at decode heights
