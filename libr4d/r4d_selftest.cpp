@@ -20876,6 +20876,8 @@ static void hc_readv_case(const Plugin& pl, int64_t M, bool i8) {
 /* --perfhcv M [iters]: hc_read_e4m3 at M rows with F1n, the stock forms against hc_readv 3, each
  * timed as one op (cold under --cold), and from 512 rows PF2's launches one stage at a time
  * (cumulative masks of r4d_hc_pf2_stages, so a stage's time is the difference). */
+/* fn4 (12.11.2026): R4D_SELFTEST_READV_OR bits OR-ed into every hc_readv value --perfhcv sets (64: hc_bi 5's G16) */
+static int st_readv_or() { const char* e = std::getenv("R4D_SELFTEST_READV_OR"); return e && *e ? std::atoi(e) : 0; }
 static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     const std::string nm = fmt("hc_read_e4m3 timing at M=%lld", (long long)M);
     const RadKernelInfo* r = find(pl, "hc_read_e4m3");
@@ -20954,9 +20956,30 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
         if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
     }
     pl.norm_hc_wave(1);
+    /* fn4 (12.11.2026): under bi_dec, G16 (hc_readv bit 6) against 8-row form G on every output byte (x, inj, both codes) */
+    if (std::getenv("R4D_SELFTEST_BI_DEC") && M > 8) {
+        auto grab = [&](int v, std::vector<uint8_t>& o) {
+            pl.readv_hc(v);
+            if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) return false;
+            o.clear();
+            for (auto [p, b] : { std::pair<void*, size_t>{ d_x, xb }, { d_inj, ib }, { d_q, qb }, { d_qs, sb }, { d_rq, qb }, { d_rs, sb } }) {
+                const size_t at = o.size();
+                o.resize(at + b);
+                st_memcpy(o.data() + at, p, b, hipMemcpyDeviceToHost);
+            }
+            return true;
+        };
+        std::vector<uint8_t> g8, g16;
+        const bool okl = grab(0, g8) && grab(64, g16);
+        size_t diff = 0;
+        if (okl) for (size_t i = 0; i < g8.size() && i < g16.size(); ++i) diff += g8[i] != g16[i];
+        std::printf("hc_read_e4m3 M=%lld bi_dec: G16 (hc_readv 64) vs form G (8-row groups): %s\n", (long long)M,
+                    !okl ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical");
+        ok((nm + " G16 = form G").c_str(), okl && diff == 0);
+    }
     double us[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     for (int v : { 0, 1, 2, 3, 7 }) {
-        pl.readv_hc(v);
+        pl.readv_hc(v | st_readv_or());
         if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) {
             ok(nm.c_str(), false, fmt("hc_readv %d launch failed", v)); pl.readv_hc(0); pl.norm_hc_wave(0); return;
         }
@@ -20969,7 +20992,7 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
         static const int kMask[5] = { 1, 3, 7, 15, 31 };
         static const char* const kStage[5] = { "prologue", "down", "reduce", "up-mix", "codes" };
         for (int v : { 0, 2, 7 }) {
-            pl.readv_hc(v);
+            pl.readv_hc(v | st_readv_or());
             double t[5];
             for (int k = 0; k < 5; ++k) {
                 pl.pf2_stages_hc(kMask[k]);
