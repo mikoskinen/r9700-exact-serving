@@ -9700,6 +9700,112 @@ TEST(forced_depth_zero_holds_zero_but_for_the_probes) {
     CHECK_EQ(f.sch.set_draft_depth0(0), 0);
 }
 
+/* draft_depth0 3 (ds41-int10), depth 0 by occupancy only: plain steps measured far cheaper than drafting (D7 under 1
+ * leaves drafting for 0), draft_occ 6 / draft_occ_k 8, the lend on. Under 3: every cycle at 1 .. 5 rows drafts, with no
+ * probe of either kind and no lend; at 6 rows the 8th cycle takes 0 and holds it with no probe, the lend wanted after
+ * lend_hold() cycles, as under 1; 8 cycles back at 4 rows return to drafting at once. 1 / 2 / 3 / 0 switch cleanly, and
+ * the scheduler takes 3 and reports it. */
+TEST(depth_zero_by_occupancy_only_drafts_below_occ_rows_and_holds_zero_above) {
+    DraftController::Params p;
+    p.max_depth = 5;
+    p.adapt = true;
+    p.depth0 = true;
+    p.lend = 1;
+    DraftController m1;
+    CHECK_OK(m1.configure(p));
+    p.depth0_occ = true;
+    DraftController z;
+    CHECK_OK(z.configure(p));
+    CHECK_EQ(z.depth0_mode(), 3);
+    CHECK(z.depth0_occ_only());
+    CHECK(!z.depth0_forced());
+    CHECK_EQ(m1.depth0_mode(), 1);
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    for (int i = 0; i < 8; ++i) { u[i] = estimate(z, 0.6, 0.6); uf[i] = &u[i]; }
+    for (DraftController* c : { &z, &m1 }) {
+        c->set_occ(6);
+        c->set_occ_k(8);
+        for (int r = 1; r <= 8; ++r) {
+            for (int d = 1; d <= 5; ++d)
+                for (int k = 0; k < 4; ++k) c->step_time(d, r, 20.0 + 10.0 * d);
+            for (int k = 0; k < 4; ++k) c->step_time(0, r, 15.0);
+        }
+    }
+    /* below draft_occ rows: 3 always drafts, nothing probed, no 0 to lend; 1 takes 0 there */
+    int heads = 0, cycles = 0, m1_zero = 0, wanted = 0;
+    for (int r = 1; r <= 5; ++r)
+        for (int t = 0; t < 100; ++t) {
+            (void)z.plan_step(uf, r, r);
+            (void)m1.plan_step(uf, r, r);
+            heads += z.head_runs() ? 1 : 0;
+            wanted += z.lend_wanted() ? 1 : 0;
+            m1_zero += m1.head_runs() ? 0 : 1;
+            ++cycles;
+            if (!m1.head_runs()) m1.step_time(0, r, 15.0);
+        }
+    CHECK_EQ(heads, cycles);
+    CHECK_EQ(z.probe_cycles(), (int64_t)0);
+    CHECK_EQ(z.zero_moves(), (int64_t)0);
+    CHECK_EQ(z.occ_cycles(), (int64_t)0);
+    CHECK_EQ(wanted, 0);
+    CHECK(m1_zero > 0);   /* the measured choice (1) would have left drafting here */
+    /* at draft_occ rows: drafting for 7 cycles, 0 from the 8th, held with no probe; the lend after lend_hold() */
+    int head_late = 0, head_early = 0;
+    wanted = 0;
+    for (int t = 0; t < 200; ++t) {
+        (void)z.plan_step(uf, 6, 6);
+        if (t < 7) head_early += z.head_runs() ? 1 : 0;
+        else head_late += z.head_runs() ? 1 : 0;
+        if (!z.head_runs()) z.step_time(0, 6, 15.0);
+        wanted += z.lend_wanted() ? 1 : 0;
+    }
+    CHECK_EQ(head_early, 7);
+    CHECK_EQ(head_late, 0);
+    CHECK(z.occ_held());
+    CHECK_EQ(z.occ_moves(), (int64_t)1);
+    CHECK_EQ(z.zero_moves(), (int64_t)1);
+    CHECK_EQ(z.probe_cycles(), (int64_t)0);
+    CHECK(wanted > 100);
+    /* back below: 0 held for 7 cycles, drafting from the 8th (occupancy released), and on */
+    int head_dip = 0, head_back = 0;
+    for (int t = 0; t < 7; ++t) { (void)z.plan_step(uf, 4, 4); head_dip += z.head_runs() ? 1 : 0; }
+    CHECK_EQ(head_dip, 0);
+    for (int t = 0; t < 100; ++t) { (void)z.plan_step(uf, 4, 4); head_back += z.head_runs() ? 1 : 0; }
+    CHECK_EQ(head_back, 100);
+    CHECK(!z.occ_held());
+    CHECK_EQ(z.occ_moves(), (int64_t)2);
+    CHECK_EQ(z.zero_moves(), (int64_t)2);
+    CHECK_EQ(z.probe_cycles(), (int64_t)0);
+    CHECK(!z.lend_wanted());
+    /* the modes switch cleanly */
+    z.set_depth0_forced(true);
+    CHECK_EQ(z.depth0_mode(), 2);
+    CHECK(!z.depth0_occ_only());
+    z.set_depth0_occ(true);
+    CHECK_EQ(z.depth0_mode(), 3);
+    CHECK(!z.depth0_forced());
+    z.set_depth0_occ(false);
+    CHECK_EQ(z.depth0_mode(), 1);
+    z.set_depth0_occ(true);
+    z.set_depth0(false);
+    CHECK_EQ(z.depth0_mode(), 0);
+    CHECK(!z.depth0_occ_only());
+
+    Fixture f;
+    adaptive_fixture(f, 4);
+    f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.set_draft_depth0(3), 3);
+    CHECK(f.sch.draft().depth0_occ_only());
+    CHECK_EQ(f.sch.set_draft_depth0(2), 2);
+    CHECK(!f.sch.draft().depth0_occ_only());
+    CHECK_EQ(f.sch.set_draft_depth0(3), 3);
+    CHECK_EQ(f.sch.set_draft_depth0(1), 1);
+    CHECK(!f.sch.draft().depth0_occ_only() && !f.sch.draft().depth0_forced());
+    CHECK_EQ(f.sch.set_draft_depth0(0), 0);
+}
+
 /* ================================================== lever DST: fn4 sched_interleave / sched_mixed_tok
  * The decode-only steps after a chunk and the shared budget beside decode rows, as in-process switches read at every
  * step planned. Set here as the engine sets them: a request, applied at a step release (fn4::apply_pending) between a

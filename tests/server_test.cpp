@@ -5104,7 +5104,7 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
      * checked by range and by what the registered drafter can run, handed to the scheduler at the
      * step release, and reported as the scheduler noted them; the counters as it noted them. */
     CHECK(has(f.get("/admin/fn4").body, "\"draft_depth0\": -1"));
-    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":3})").status, 400);
+    CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":4})").status, 400);   /* ds41-int10: 3 is occupancy only, 4 past the range */
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_probe":1})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_hybrid_match":0})").status, 400);
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_hybrid_match":257})").status, 400);
@@ -5638,6 +5638,17 @@ TEST(the_context_skip_and_forced_depth_zero_are_checked_and_reported) {
     fn4::note_draft_accept(40, 31, 9, 2);
     const HttpResponse g2 = f.get("/admin/fn4");
     CHECK(has(g2.body, "\"draft_depth0\": 2"));
+    /* ds41-int10: draft_depth0 3 (depth 0 by occupancy only) taken where 1 is, reported as the scheduler notes it; 4 refused */
+    {
+        const HttpResponse d4 = f.post("/admin/fn4", R"({"draft_depth0":4})");
+        CHECK_EQ(d4.status, 400);
+        CHECK(has(d4.body, "3 (occupancy only)"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"draft_depth0":3})").status, 200);
+        CHECK(fn4::apply_pending(41, sw));
+        CHECK_EQ(sw[fn4::kDraftDepth0], 3);
+        fn4::note_sched(fn4::kDraftDepth0, 3);
+        CHECK(has(f.get("/admin/fn4").body, "\"draft_depth0\": 3"));
+    }
     CHECK(has(g2.body, "\"accept\": {\"head_drafted\": 40, \"head_accepted\": 31, \"lookup_drafted\": 9, "
                        "\"lookup_accepted\": 2}"));
 

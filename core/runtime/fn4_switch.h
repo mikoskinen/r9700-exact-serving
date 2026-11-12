@@ -36,6 +36,10 @@
  *                   RADIANCE_DRAFT_DEPTH0=2): depth 0 FORCED -- every cycle at 0 except the probes at the drafting depth
  *                   every draft_probe cycles, nothing measured or weighed; accepted wherever 1 is. Exact (it moves only
  *                   what a step verifies), so a one-sequence run exercises depth 0's paths.
+ *                   3 (ds41-int10, also RADIANCE_DRAFT_DEPTH0=3): depth 0 by OCCUPANCY ONLY -- draft_occ's rule decides first
+ *                   as under 1 (0 at >= draft_occ rows for draft_occ_k cycles, the lend under it as under 1); where it does
+ *                   not hold the cycle drafts, nothing measured or weighed (no plain-vs-window choice, no probe, no
+ *                   back-off). Exact as 1 is; accepted wherever 1 is.
  *   draft_probe     scheduler: cycles at depth 0 between probes at the drafting depth (2 .. 4096; 16 by default,
  *                   RADIANCE_DRAFT_PROBE at start).
  *   draft_hybrid    scheduler: 1 a sequence whose prompt lookup matches at least draft_hybrid_match tokens back verifies

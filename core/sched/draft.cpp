@@ -66,6 +66,7 @@ int DraftController::configure(const Params& p) {
     }
     depth0_ = p.depth0;
     forced_ = p.depth0 && p.depth0_forced;
+    occ_only_ = p.depth0 && p.depth0_occ && !forced_;
     probe_every_ = p.probe_every > 0 ? p.probe_every : kProbeEvery;
     zero_ = false;
     zero_held_ = kHold;
@@ -102,6 +103,9 @@ int DraftController::configure(const Params& p) {
     if (adapt_ && forced_)
         RAD_INFO("draft depth 0 FORCED (RADIANCE_DRAFT_DEPTH0=2, a test hook): every cycle at 0 but the "
                  "probes; nothing is weighed");
+    if (adapt_ && occ_only_)
+        RAD_INFO("draft depth 0 by OCCUPANCY ONLY (RADIANCE_DRAFT_DEPTH0=3): 0 only where draft_occ's rule holds; "
+                 "below it every cycle drafts, nothing measured or weighed (no probe, no back-off)");
     if (adapt_ && depth0_ && backoff_max_ > 0)
         RAD_INFO("draft probe back-off: each probe that leaves depth 0 in place doubles the interval to "
                  "the next, up to %d cycles; a move between 0 and drafting starts it over",
@@ -416,6 +420,20 @@ void DraftController::plan_zero(const double* tok, double plain, int n_rows) {
             ++n_occ_;
             return;
         }
+    }
+    if (occ_only_) {
+        /* draft_depth0 3: the occupancy rule did not hold this cycle -- draft; nothing measured or weighed below it. */
+        probe_left_ = 0;
+        if (zero_) {
+            RAD_DEBUG("draft window: head depth 0 -> %d over %d rows (draft_depth0 3: occupancy released)",
+                      step_w_ > 0 ? step_w_ : kMinDepth, n_rows);
+            zero_ = false;
+            zero_held_ = 0;
+            since_probe_ = 0;
+            ++n_zero_moves_;
+            backoff_k_ = 0;
+        }
+        return;
     }
     const int c  = cost_class(n_rows);
     const int dd = step_w_ > 0 ? step_w_ : kMinDepth;

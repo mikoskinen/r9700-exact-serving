@@ -69,8 +69,11 @@ int Scheduler::set_draft_depth0(int v) {
                  "window", v);
     else if (v == 2)
         draft_.set_depth0_forced(true);   /* a test hook: depth 0 at every cycle but the probes */
+    else if (v == 3)
+        draft_.set_depth0_occ(true);      /* ds41-int10: depth 0 by occupancy only, drafting below it */
     else {
         draft_.set_depth0_forced(false);  /* 1 from 2: depth 0 measured again */
+        draft_.set_depth0_occ(false);     /* 1 from 3: likewise */
         draft_.set_depth0(v == 1);
     }
     return draft_.depth0_mode();
@@ -450,9 +453,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
             return (int)v;
         };
         {
-            const int d0 = env_int("RADIANCE_DRAFT_DEPTH0", 0, 2, 0);   /* 2: forced (a test hook) */
+            const int d0 = env_int("RADIANCE_DRAFT_DEPTH0", 0, 3, 0);   /* 2: forced (a test hook); 3: occupancy only */
             dp.depth0 = d0 >= 1;
             dp.depth0_forced = d0 == 2;
+            dp.depth0_occ = d0 == 3;
         }
         dp.probe_every = env_int("RADIANCE_DRAFT_PROBE", 2, 4096, DraftController::kProbeEvery);
         dp.backoff = env_int("RADIANCE_DRAFT_PROBE_BACKOFF", 0, DraftController::kBackoffMax, 0);

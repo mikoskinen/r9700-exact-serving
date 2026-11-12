@@ -101,6 +101,10 @@ public:
         /* Depth 0 forced (fn4 draft_depth0 2, a test hook): with depth0, every cycle at D = 0 but the probes,
          * nothing weighed. */
         bool depth0_forced = false;
+        /* Depth 0 by occupancy only (fn4 draft_depth0 3, ds41-int10): with depth0, D = 0 only where the occupancy rule
+         * (occ()) holds; below it the drafting depth, with nothing measured or weighed (no plain-vs-window choice, no
+         * probes, no back-off, no lend from a measured 0). */
+        bool depth0_occ = false;
         /* Cycles at D = 0 between probes; 0 is kProbeEvery. */
         int  probe_every = 0;
         /* Probe back-off: at most this many doublings of the interval (0 off, 1..kBackoffMax). */
@@ -234,19 +238,29 @@ public:
     void set_depth0(bool on) {
         if (on && !depth0_) zero_held_ = kHold;
         depth0_ = on;
-        if (!on) { zero_ = false; probe_left_ = 0; since_probe_ = 0; backoff_k_ = 0; forced_ = false; }
+        if (!on) { zero_ = false; probe_left_ = 0; since_probe_ = 0; backoff_k_ = 0; forced_ = false; occ_only_ = false; }
     }
     /* Depth 0 forced (fn4 draft_depth0 2, a test hook): D = 0 at every cycle but the probes, which run at the
      * drafting depth every probe_interval() cycles as at depth 0; no plain step is weighed against the window and
      * no plain probe runs. Exact as depth 0 is: it moves only what a step verifies. It lets one sequence exercise
      * depth 0's paths (the drafter's lend, the context skip) where the measured choice would keep drafting.
-     * set_depth0(false) ends it; 0 / 1 / 2 is depth0_mode(). */
+     * set_depth0(false) ends it; 0 / 1 / 2 / 3 is depth0_mode(). */
     bool depth0_forced() const { return depth0_ && forced_; }
     void set_depth0_forced(bool on) {
-        if (on) set_depth0(true);
+        if (on) { set_depth0(true); occ_only_ = false; }
         forced_ = on && depth0_;
     }
-    int  depth0_mode() const { return depth0_ ? (forced_ ? 2 : 1) : 0; }
+    /* Depth 0 by occupancy only (fn4 draft_depth0 3, ds41-int10): plan_zero's occupancy rule (lever Z0-O, occ()) decides
+     * first exactly as under 1; where it does not hold, the cycle drafts (a 0 left over is left at once, a move counted)
+     * and nothing is measured or weighed -- no plain-vs-window choice, no probe, no back-off, no lend from a measured 0
+     * (the lend under occupancy as under 1). Below occ() rows it always drafts; at occ() rows for occ_k() cycles it holds
+     * 0. Exact: it moves only the depth a cycle verifies. set_depth0(false) ends it. */
+    bool depth0_occ_only() const { return depth0_ && occ_only_; }
+    void set_depth0_occ(bool on) {
+        if (on) { set_depth0(true); forced_ = false; }
+        occ_only_ = on && depth0_;
+    }
+    int  depth0_mode() const { return depth0_ ? (forced_ ? 2 : occ_only_ ? 3 : 1) : 0; }
     int  probe_every() const { return probe_every_; }
     void set_probe_every(int n) { probe_every_ = n > 0 ? n : kProbeEvery; }
     /* Probe back-off (fn4 draft_probe_backoff): the most doublings, 0 off; a change starts over. */
@@ -428,6 +442,7 @@ private:
      * else the drafting depth, from 0). */
     bool    depth0_ = false;
     bool    forced_ = false;                      /* depth0_forced() */
+    bool    occ_only_ = false;                    /* depth0_occ_only() (draft_depth0 3) */
     int32_t probe_every_ = kProbeEvery;
     bool    zero_ = false;
     int32_t zero_held_ = 0;                       /* cycles since zero_ last moved */

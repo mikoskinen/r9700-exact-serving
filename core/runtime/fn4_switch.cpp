@@ -788,11 +788,12 @@ bool check(const std::string& name, int v, std::string* err) {
         return true;
     }
     if (i == kDraftDepth0 || i == kDraftHybrid) {
-        /* draft_depth0 2: depth 0 forced (a test hook), accepted wherever 1 is. */
-        if (v < 0 || v > (i == kDraftDepth0 ? 2 : 1)) {
+        /* draft_depth0 2: depth 0 forced (a test hook), 3: depth 0 by occupancy only (ds41-int10); accepted wherever 1 is. */
+        if (v < 0 || v > (i == kDraftDepth0 ? 3 : 1)) {
             if (err)
                 *err = std::string(kNames[i]) +
-                       (i == kDraftDepth0 ? " takes 1 (on), 2 (forced, a test hook) or 0 (off)" : " takes 1 (on) or 0 (off)");
+                       (i == kDraftDepth0 ? " takes 1 (on), 2 (forced, a test hook), 3 (occupancy only) or 0 (off)"
+                                          : " takes 1 (on) or 0 (off)");
             return false;
         }
         const int cap = (i == kDraftHybrid ? s.hybrid_capable : s.draft_capable).load(std::memory_order_acquire);
