@@ -23,22 +23,29 @@
  * every other name answers 0 (not mine). */
 static volatile int g_fn4_x3d = 0;
 int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
+/* A10 (ds41-x3d-pf, 12.11.2026): fn4 switch "exl3_x3d_pf" 0 / 1 -- the same one-word-pair decode in THIS band's K = 2 map-form
+ * GEMM (exl3r4d_prefill.hip exl3r4d_pf_gemm_x3d_kernel; the same f16 weights, each output's WMMA order unchanged). 0 at start =
+ * today's kernels. Independent of exl3_x3d (the decode band's). */
+static volatile int g_fn4_x3d_pf = 0;
+int exl3r4d_fn4_x3d_pf(void) { return g_fn4_x3d_pf; }
 /* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
  * with that prefill.c is a union of the name lists in one set of the three functions. */
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
-    if (!strcmp(name, "exl3_x3d")) return value == 0 || value == 1 ? 1 : -1;
+    if (!strcmp(name, "exl3_x3d") || !strcmp(name, "exl3_x3d_pf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
     if (!strcmp(name, "exl3_x3d")) g_fn4_x3d = value;
+    if (!strcmp(name, "exl3_x3d_pf")) g_fn4_x3d_pf = value;
     return 1;
 }
 __attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* applied) {
     if (!name || !applied) return 0;
     if (!strcmp(name, "exl3_x3d")) { *applied = g_fn4_x3d; return 1; }
+    if (!strcmp(name, "exl3_x3d_pf")) { *applied = g_fn4_x3d_pf; return 1; }
     return 0;
 }
 #if EXL3R4D_ROUTEDUMP
@@ -190,6 +197,9 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
 #endif
     const int64_t T = d.g.T, xr_pitch = dn_prerot(&g) ? d.g.x_pitch : (gate_up ? 2 : 1) * g.x_cols;
     const int run = run_form(&g, T), am = am_of(&g, run);
+    /* A10: in the prefill block g.x3d is this band's switch (exl3_x3d_pf, K = 2 only), not fill()'s decode-band value; the
+     * prefill kernels never read it on the card -- exl3r4d_launch_prefill picks the K = 2 map-form GEMM by it. */
+    d.g.x3d = (g.bits == 2 && exl3r4d_fn4_x3d_pf()) ? 1 : 0;
     /* A rotation in the GEMM would rotate an h_rot input a second time: those arms refuse it by name. */
     if (dn_prerot(&g) && rot_am(am)) return RAD_E_UNSUPPORTED;
     {   /* the A operand's 32-bit lane offsets: T rows, or a chunk's at most (the scratch cap) */

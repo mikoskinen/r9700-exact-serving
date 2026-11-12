@@ -462,7 +462,11 @@ static __device__ __forceinline__ v2u pf_dn_suh(const Exl3r4dGemm& p, const Plan
 // matrix. WV = 8 MATS / NPW waves, wave w owns local tiles [w NPW, w NPW + NPW) of the block's 8 MATS tiles (matrix
 // w NPW / 8). The A fragment of block i, lane l is row r0 + 16 i + l % 16 of the prep's rows (clamped into the entry;
 // rows past it are computed and not stored).
-template <int BITS, int MT, int NPW, int MATS, int AM, bool YS = false>
+// X3D (A10, ds41-x3d-pf, fn4 exl3_x3d_pf): K = 2's K loop reads a lane's eight trellis states from ONE word pair and
+// decodes the NPW tiles of a step phase by phase (decode_frags_x3d, the decode band's X3D-F g12b form) -- the same
+// states, hashes, byte sums, codebook fma and element order as decode_frag<2, 2>: the same f16 fragments; each
+// accumulator still takes one WMMA a k-step in K order: the same bits. AM 0 with the buffer form only.
+template <int BITS, int MT, int NPW, int MATS, int AM, bool YS = false, bool X3D = false>
 static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Planes& w, int r0, int r1, float* lds,
                                                int rbase) {
   using P = Plan<BITS>;   // R23: any K the shared decode serves (2..6 at mul1); the buffer form below is K = 4's
@@ -548,13 +552,27 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
   [[maybe_unused]] const unsigned bso = (unsigned)nt0 * WORDS * 4;
   [[maybe_unused]] const unsigned bwm = wvo[0][0], bw0 = wvo[0][1], bwp = wvo[1][NW - 1];
   constexpr int kAux = EXL3R4D_PF_NT ? 1 : 0;   // TH_LOAD_NT, as __builtin_nontemporal_load
+  // X3D (A10): at K = 2 a lane's two runs are 16 bits apart and both lie in run 1's two ring words (woff[0] == woff[1]
+  // for every lane, the decode band's X3D-F finding); sx[i] = plan.shift[1] + 6 - 2 i (exl3r4d.hip's x3d_sx).
+  static_assert(!X3D || (BITS == 2 && NW == 2 && WBUF && AM == 0 && !EXL3R4D_PF_ABLATE_WLOAD && !EXL3R4D_PF_ABLATE_MMA &&
+                         EXL3R4D_PF_SGB == 0),
+                "X3D (A10): K = 2's buffer-form AM 0 K loop only");
+  [[maybe_unused]] unsigned x3d_sx[4];
+  if constexpr (X3D) {
+#pragma unroll
+    for (int i = 0; i < 4; i++) x3d_sx[i] = plan.shift[1] + 6u - 2u * (unsigned)i;
+  }
 
 #define PF_WLOAD(ks, W_)                                                                             \
   do {                                                                                               \
     if constexpr (WBUF && !EXL3R4D_PF_ABLATE_WLOAD) {                                                \
       const unsigned so_ = bso + (unsigned)(ks) * (unsigned)kbytes;                                  \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                              \
-        if constexpr (BITS == 4) {                                                                   \
+        if constexpr (X3D) { /* K = 2: both runs read run 1's two words */                           \
+          W_[j][1][0] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[1][0] + j * WORDS * 4, so_, kAux); \
+          W_[j][1][1] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[1][1] + j * WORDS * 4, so_, kAux); \
+          W_[j][0][0] = W_[j][1][0]; W_[j][0][1] = W_[j][1][1];                                      \
+        } else if constexpr (BITS == 4) {                                                            \
           const unsigned m_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwm + j * 128, so_, kAux);   \
           const unsigned z_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bw0 + j * 128, so_, kAux);   \
           const unsigned q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux);   \
@@ -603,6 +621,15 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
   } while (0)
 #define PF_COMPUTE(W_, A_)                                                                           \
   do {                                                                                               \
+    if constexpr (X3D) { /* A10: the NPW tiles' fragments phase by phase, then the WMMAs (j, i order) */ \
+      unsigned x0_[NPW], x1_[NPW];                                                                   \
+      _Pragma("unroll") for (int j = 0; j < NPW; j++) { x0_[j] = W_[j][1][0]; x1_[j] = W_[j][1][1]; } \
+      v8h wfs_[NPW];                                                                                 \
+      decode_frags_x3d<NPW>(x0_, x1_, x3d_sx, wfs_);                                                 \
+      _Pragma("unroll") for (int j = 0; j < NPW; j++)                                                \
+        _Pragma("unroll") for (int i = 0; i < MT; i++) acc[j][i] = mma(wfs_[j], A_[i], acc[j][i]);   \
+      break;                                                                                         \
+    }                                                                                                \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                                \
       const v8h wf = decode_frag<BITS, NW>(W_[j], plan.shift);                                          \
       _Pragma("unroll") for (int i = 0; i < MT; i++)                                                 \
@@ -947,16 +974,16 @@ static __device__ __forceinline__ void pf_dg_dispatch(int mt, const Exl3r4dGemm&
 }
 
 // mt (1..MTX, workgroup-uniform) -> the body compiled for exactly that many blocks (Dylan's moe_dispatch).
-template <int BITS, int M, int MTX, int NPW, int MATS, int AM, bool YS = false>
+template <int BITS, int M, int MTX, int NPW, int MATS, int AM, bool YS = false, bool X3D = false>
 static __device__ __forceinline__ void pf_dispatch(int mt, const Exl3r4dGemm& p, const Planes& w, int r0, int r1,
                                                    float* lds, int rbase) {
   if constexpr (M == MTX) {
-    pf_body<BITS, M, NPW, MATS, AM, YS>(p, w, r0, r1, lds, rbase);
+    pf_body<BITS, M, NPW, MATS, AM, YS, X3D>(p, w, r0, r1, lds, rbase);
   } else {
     if (mt <= M)
-      pf_body<BITS, M, NPW, MATS, AM, YS>(p, w, r0, r1, lds, rbase);
+      pf_body<BITS, M, NPW, MATS, AM, YS, X3D>(p, w, r0, r1, lds, rbase);
     else
-      pf_dispatch<BITS, M + 1, MTX, NPW, MATS, AM, YS>(mt, p, w, r0, r1, lds, rbase);
+      pf_dispatch<BITS, M + 1, MTX, NPW, MATS, AM, YS, X3D>(mt, p, w, r0, r1, lds, rbase);
   }
 }
 
@@ -1079,6 +1106,42 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
   for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
     const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
     pf_dispatch<BITS, 1, MTX, NPW, MATS, AM, YS>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
+  }
+}
+
+// A10 (ds41-x3d-pf, fn4 exl3_x3d_pf): exl3r4d_pf_gemm_kernel<2, MTX, NPW, MATS, 0, false, YS> -- K = 2's map form, AM 0 --
+// statement for statement, except pf_body's X3D (the K loop's one-word-pair decode, decode_frags_x3d). A kernel of its
+// own (the X3D-F pattern) so the shipped kernels keep their names and code. exl3r4d_launch_prefill takes it only when the
+// block's g.x3d is set (prefill.c: bits 2 and the fn4 switch exl3_x3d_pf) on the two-class build.
+template <int MATS, bool YS>
+__global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_x3d_kernel(Exl3r4dPrefill a) {
+  constexpr int MTX = EXL3R4D_PF_MTX, NPW = EXL3R4D_PF_NPW;
+  static_assert(!EXL3R4D_PF_PAIR && EXL3R4D_PF_DN_G == 1 && !EXL3R4D_PF_WGS_ON,
+                "A10: the stock map-form path without PAIR, DN_G or the stamps (as configured)");
+  EXL3R4D_KARG_PREFETCH();
+  extern __shared__ float lds[];
+  const Exl3r4dGemm& p = a.g;
+  int lo, hi, rbase;
+  pf_chunk(a, a.chunk_c, lo, hi, rbase);
+  int k = lo + (int)blockIdx.y;
+  if (k >= hi) return;
+  if (EXL3R4D_PF_LPT && MATS == 2 && a.order) k = (int)a.order[k];   // longest entries first (EXL3R4D_PF_LPT)
+  const uint4 ent = ((const uint4*)a.map)[1 + k];
+  const int r0 = (int)ent.y, r1 = (int)ent.z;
+  if (ent.x == EXL3R4D_PF_ZERO) {
+    zero_rows(p, r0, r1, blockIdx.x);
+    return;
+  }
+  const int e = (int)ent.x;
+  const Planes w = planes_of(p, e);
+  const int width = MATS == 2 ? w.rows / 2 : w.rows;
+  if ((int)blockIdx.x * 128 >= width) {  // the narrower parity class: zeros past its own width
+    zero_rows(p, r0, r1, blockIdx.x);
+    return;
+  }
+  for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
+    const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
+    pf_dispatch<2, 1, MTX, NPW, MATS, 0, YS, true>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
   }
 }
 
@@ -2048,6 +2111,15 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   if (ys && (gate_up || run || am != 0)) return RAD_E_INVAL;   // the streamed y: down's map form only
   const void* fn = am == 5 ? (const void*)exl3r4d_pf_map_kernel : pf_gemm_select(bits, gate_up, run, am, ys);
   if (!fn) return (bits < 2 || bits > 6) && bits != EXL3R4D_K25 ? RAD_E_DTYPE : RAD_E_UNSUPPORTED;
+#if EXL3R4D_NCLS == 2
+  // A10 (fn4 exl3_x3d_pf): K = 2's map-form AM 0 GEMM with the one-word-pair decode. g.x3d in the PREFILL block is
+  // prefill.c's (bits 2 and exl3_x3d_pf; the prefill kernels never read it on the card); the four-class build keeps the
+  // shipped kernels.
+  if (a->g.x3d && bits == 2 && !run && am == 0 && !pair)
+    fn = gate_up ? (const void*)exl3r4d_pf_gemm_x3d_kernel<2, false>
+         : ys    ? (const void*)exl3r4d_pf_gemm_x3d_kernel<1, true>
+                 : (const void*)exl3r4d_pf_gemm_x3d_kernel<1, false>;
+#endif
   int64_t smem = pf_lds(mats, mtx, am);
   if (!gate_up && EXL3R4D_PF_EPI_DN2 && smem < 2 * 8 * 256 * 4) smem = 2 * 8 * 256 * 4;   // two epilogue regions
   if (gate_up && a->g.h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;   // v3 EPI 1's staged h block
