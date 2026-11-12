@@ -43,6 +43,17 @@ extern "C" void rad_dev_host_wrote(void);
  * decodes speculatively (rad_dev_chain_infer, from the engine before any row resolves). */
 extern "C" int  rad_dev_chain_enabled(void);
 extern "C" void rad_dev_chain_infer(int pays);
+/* Lever A5 / 1U-CHN (ds41-ll): RADIANCE_CHAIN_DS41 at start, -1 unset (the rule above, unchanged), 0 / 1. Set on the AQL
+ * backend, chainable rows resolve their chained forms whatever the plugin measured (rad_dev_chain_forms), and whether a
+ * chained kernel is launched chained follows the fn4 switch chain_ds41 at every dispatch (rad_dev_chain_enabled; the
+ * value at start is the variable's). Off, a chained form's record says "not chained": it runs as its plain form behind
+ * the barrier bit. rad_dev_chain_env: the variable's value, -1 unset or not the AQL backend. */
+extern "C" int  rad_dev_chain_forms(void);
+extern "C" int  rad_dev_chain_env(void);
+/* Its counters (GET /admin/fn4 "chain"): kernels launched chained when issued, played chained from a recorded pass,
+ * and those of them that left the barrier bit off (they wait in their prologue). The AQL backend notes them. */
+extern "C" void rad_dev_chain_note(int played, int unordered);
+extern "C" void rad_dev_chain_counts(long long out[3]);
 
 /* One range of a ranged copy: `bytes` from source offset `src` to destination offset `dst`, all
  * three multiples of four. */

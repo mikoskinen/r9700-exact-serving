@@ -4184,6 +4184,12 @@ void r4d_ix_ni_set(int v);
  * four-rank exact two-shot at overlap 0 of at least N rows takes the coded wire (the plain wire's bytes). */
 int r4d_arc_get();
 void r4d_arc_set(int v);
+/* Lever A3 (ds41-ll, r4d_ar_entry.hip / r4d_ar_ll.h): "ar_ll" 0 (off) or 1 .. 48 -- the four-rank exact all-reduce and
+ * moe_gather_all_reduce_4rank of at most 48 (1) / N rows carry their flags in their data words (the same bytes). Values
+ * above 0 only where the instances have LL areas (RADIANCE_AR_LL set at load). */
+int r4d_arll_get();
+void r4d_arll_set(int v);
+int r4d_arll_capable();
 /* Lever 1U-MX (ds41-int11, r4d_ds41_elem.hip): "ds41_mix_wv" 0 / 12 / 16 / 24 -- mhc_mix's split launch at decode heights
  * with that many waves a chunk (0: the stock 8; the same partials, so the same bytes). */
 bool r4d_mix_wv_known(int v);
@@ -4194,6 +4200,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_arcoded")) return value >= 0 && value <= 1048576 ? 1 : -1;
+    if (!std::strcmp(name, "ar_ll")) return value == 0 || (value >= 1 && value <= 48 && r4d_arll_capable()) ? 1 : -1;
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
@@ -4206,6 +4213,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ix_lds")) { r4d_ix_lds_set(value); return 1; }
     if (!std::strcmp(name, "ix_ni")) { r4d_ix_ni_set(value); return 1; }
     if (!std::strcmp(name, "ds41_arcoded")) { r4d_arc_set(value); return 1; }
+    if (!std::strcmp(name, "ar_ll")) { r4d_arll_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
@@ -4224,6 +4232,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "ix_lds")) { *applied = r4d_ix_lds_get(); return 1; }
     if (!std::strcmp(name, "ix_ni")) { *applied = r4d_ix_ni_get(); return 1; }
     if (!std::strcmp(name, "ds41_arcoded")) { *applied = r4d_arc_get(); return 1; }
+    if (!std::strcmp(name, "ar_ll")) { *applied = r4d_arll_get(); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { *applied = r4d_mix_wv_get(); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }

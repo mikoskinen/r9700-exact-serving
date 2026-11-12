@@ -1409,8 +1409,16 @@ int Engine::declare() {
         /* A head drafts: speculation on, and not prompt lookup alone (--spec-ngram leaves the head out). */
         const bool pays = cfg_.n_spec > 0 && cfg_.spec_ngram <= 0 && pb.chain_pays;
         rad_dev_chain_infer(pays);
+        /* lever A5: fn4 reads the device layer's chain answers through these (GET "chain", chain_ds41's check) */
+        rad::fn4::chain_register(rad_dev_chain_env(), &rad_dev_chain_forms, &rad_dev_chain_enabled, &rad_dev_chain_counts);
         const bool on = rad_dev_chain_enabled() != 0;
-        const char* why = on     ? "the model's plugin measured a gain with its speculative drafter"
+        /* Lever A5 (ds41-ll): RADIANCE_CHAIN_DS41 set (AQL): the chained forms resolve and fn4 chain_ds41 says, at every
+         * dispatch, whether a chained form launches chained. Unset: the line below as it always read. */
+        const int ce = rad_dev_chain_env();
+        const char* why = ce >= 0 ? (on ? "RADIANCE_CHAIN_DS41=1: chained forms resolved, launches chained (fn4 chain_ds41)"
+                                        : "RADIANCE_CHAIN_DS41=0: chained forms resolved, launches unchained until fn4 "
+                                          "chain_ds41 1")
+                          : on   ? "the model's plugin measured a gain with its speculative drafter"
                           : pays ? "the device backend does not chain"
                                  : "no drafter whose plugin measured a gain with them decodes "
                                    "speculatively";

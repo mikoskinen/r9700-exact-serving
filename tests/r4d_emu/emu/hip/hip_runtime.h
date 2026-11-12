@@ -213,7 +213,13 @@ extern int emu_last_block;     /* threads a block of the last grid had: which ke
  * (r4d_lora_bf16.hip): the last block of a group in launch order is the one that reduces. */
 inline void __threadfence() {}
 #define __HIP_MEMORY_SCOPE_AGENT 3
+#define __HIP_MEMORY_SCOPE_SYSTEM 4
 #define __hip_atomic_fetch_add(p, v, order, scope) emu_atomic_fetch_add((p), (v))
+/* Atomic loads and stores at any scope: plain accesses, fibers switch only at barriers (r4d_ar_ll_dev.h's units). */
+#define __hip_atomic_load(p, order, scope) (*(p))
+#define __hip_atomic_store(p, v, order, scope) ((void)(*(p) = (v)))
+/* s_memrealtime: a counter that only moves forward, one tick a read (a spin's deadline still comes). */
+inline unsigned long long wall_clock64() { static unsigned long long t = 0; return ++t; }
 template <typename T> inline T emu_atomic_fetch_add(T* p, T v) { const T o = *p; *p = o + v; return o; }
 /* The device allocations a unit makes for itself (counter blocks): host memory here. */
 inline hipError_t hipMalloc(void** p, size_t n) { *p = std::calloc(n ? n : 1, 1); return *p ? 0 : 2; }

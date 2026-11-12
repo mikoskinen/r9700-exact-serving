@@ -386,8 +386,9 @@ Resolved Registry::resolve(std::string_view op, const Geometry& g, int domain, S
         r.choice = TuneCache::canon_choice(chosen);
     }
     /* A chainable row runs its chained form wherever chaining is on (RadKernelChainFn); the
-     * parameter is outside the tune cache's key, which was taken above. */
-    if (r.row->chain && rad_dev_chain_enabled())
+     * parameter is outside the tune cache's key, which was taken above. Lever A5 (ds41-ll): the forms resolve
+     * wherever RADIANCE_CHAIN_DS41 is set too, whether a launch chains then being fn4's (rad_dev_chain_forms). */
+    if (r.row->chain && rad_dev_chain_forms())
         r.geom.set_i("chain", 1);
 
     /* scratch_bytes stays 0: the scratch hook needs a RadArgs with the operand tensors, which the

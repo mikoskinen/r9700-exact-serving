@@ -348,6 +348,20 @@
  *                   where the coded form fits (bf16, whole-wave shards, the slot); the rest plain. Exact: the coded wire
  *                   decodes the same values, folded in the same order. RADIANCE_DS41_ARCODED=N at load starts it at N.
  *                   GET "arc" carries its counters (arc_stats).
+ *   ar_ll           libr4d (lever A3 / 1U-AR, ds41-ll; 63 here, after exl3_x3d): 0 off (today: the four-rank exact all-reduce
+ *                   and moe_gather_all_reduce_4rank hand off their data with a store drain and a flag word a block and
+ *                   phase); 1 -- a message of at most 48 rows (the operand's elements over its last axis; the gather's M)
+ *                   carries its flags in its data words instead (r4d_ar_ll.h: 8-byte units of three bf16 and a tag, the
+ *                   reader spins on the units and clears them), in today's form (one-shot below ts_min, two-shot from it);
+ *                   N in 2 .. 48 -- at most N rows. Exact: the same words, the same fp32 ascending-rank fold rounded once.
+ *                   RADIANCE_AR_LL=N at load starts it at N and builds the instances' LL areas (any value; unset: none,
+ *                   and ar_ll takes only 0). GET "arll" carries its counters (arll_stats).
+ *   chain_ds41      core (lever A5 / 1U-CHN, ds41-ll; 64 here): only where RADIANCE_CHAIN_DS41 (0 / 1) was set at start on
+ *                   the AQL backend, which then resolves every chainable row's chained form (whatever the plugin's
+ *                   chain_pays); 1 -- a chained form launches chained (no barrier bit behind another chained kernel, a
+ *                   wait in its prologue; core/device/aql.cpp), 0 -- it launches as its plain form. Launch mechanics
+ *                   only: the same kernels' bytes. 0 is taken anywhere (no effect without the variable), 1 only with it.
+ *                   GET "chain" carries the counters.
  *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
  *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
  *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
@@ -482,7 +496,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d, kSwitches };
+              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
+              kArLl, kChainDs41, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -620,6 +635,19 @@ void i9b_stats(int64_t out[kI9bStats]);
  * 0s where no plugin serves them. */
 constexpr int kArcStats = 7;
 void arc_stats(int64_t out[kArcStats]);
+/* Lever A3's live counters (ds41-ll, GET /admin/fn4 "arll"; libr4d's rad_arll_stats, cumulative, launches of at most 48
+ * rows through the four-rank exact all-reduce's one-shot entry and moe_gather_all_reduce_4rank, counted when issued -- a
+ * recorded pass when it is recorded): [0] LL one-shot launches (rank 0), [1] LL two-shot launches (rank 0), [2] their
+ * rows, [3] the gather's among them, [4] launches ar_ll covered that LL declined, [5] plain launches (rank 0, any ar_ll),
+ * [6] LL launches over every rank. 0s where no plugin serves them. */
+constexpr int kArllStats = 7;
+void arll_stats(int64_t out[kArllStats]);
+/* Lever A5 (ds41-ll): whether a chained form launches chained (the switch once set, else RADIANCE_CHAIN_DS41's value, 0
+ * unset); read by core/device/dispatch.cpp at every dispatch where the variable is set. */
+int chain_ds41();
+/* The engine registers the device layer's chain answers at bringup (core/device/dispatch.cpp: rad_dev_chain_env, _forms, _enabled,
+ * _counts) for check / GET "chain"; unregistered (a test without a device): env -1, forms / on / counters 0. */
+void chain_register(int env, int (*forms)(void), int (*enabled)(void), void (*counts)(long long*));
 /* Levers 1U-MX / 1U-GQ / 1U-E2's live counters (ds41-int11, GET /admin/fn4 "i11"), cumulative, counted at issue (a recorded
  * pass when it is recorded): out[0..5] deepseek41's rad_i11_stats (rank 0): GQ layers declared, q_a + kv pair launches, out_a
  * g0 + g1 pair launches, E2 layers declared, E2 split launches, their rows; out[6..7] libr4d's rad_mx_stats (every rank):

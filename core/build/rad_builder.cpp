@@ -2939,7 +2939,7 @@ int rad_drafter_tree(RadBuilder* b, rad_buf parents) {
     return B(b)->drafter_tree(parents);
 }
 
-int rad_chain_on(void) { return rad_dev_chain_enabled(); }
+int rad_chain_on(void) { return rad_dev_chain_forms(); }   /* lever A5: the forms, as the rows resolve them */
 
 int rad_drafter_short_block(RadBuilder* b, int64_t block) {
     if (!b) return RAD_E_INVAL;

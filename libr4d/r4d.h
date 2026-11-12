@@ -497,6 +497,14 @@ void r4d_ar_gather_twoshot_4rank(long peer_scratch0, long peer_scratch1, long pe
                                  long top_k, long sig, long rank, long stream, long nblocks,
                                  long nthreads, long drain, long acq, long pub, long gate,
                                  long gate_ctr);
+// Lever A3 (ds41-ll, r4d_ar_ll.h / r4d_ar_ll.hip): one four-rank exact all-reduce (gather 0: inp -> out) or
+// moe_gather_all_reduce (gather 1: the gather's operands as r4d_ar_gather_twoshot_4rank takes them, y = out) with the
+// flags in the data words, in `form` (R4D_ARLL_ONESHOT / _TWOSHOT) over the instance's LL areas; n16 the message's
+// 16-byte words, slot_units the instance's LL slot. The plain kernels' fold and words: the same bytes.
+void r4d_arll_launch(long form, long gather, const long* peer_ll, long my_ll, long seq_ctrs, long slot_units,
+                     long inp, long out, long n16, long rank, long stream, long nblocks, long nthreads, long gate,
+                     long gate_ctr, long ye, long ew, long sorted, long sh, long sg, long ye_ld, long ew_ld,
+                     long sh_ld, long sg_ld, long top_k, long sig, long M, long n);
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,

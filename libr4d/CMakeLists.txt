@@ -136,6 +136,8 @@ set(R4D_UNITS
   "r4d_ar_oneshot_Nrank_exact|"
   "r4d_ar_twoshot_Nrank_exact|"
   "r4d_ar_twoshot_Nrank_ti8|"
+  # Lever A3 (ds41-ll): the exact all-reduce and moe_gather_all_reduce at decode sizes with the flags in the data words.
+  "r4d_ar_ll|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
   "r4d_gemm_bf16_nt_tiled|"

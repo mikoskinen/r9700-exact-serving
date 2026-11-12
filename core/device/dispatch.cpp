@@ -8,6 +8,7 @@
  */
 #include "device.h"
 #include "../rad_internal.h"
+#include "../runtime/fn4_switch.h"   /* lever A5: fn4 chain_ds41 */
 
 #include <algorithm>
 #include <cstdarg>
@@ -599,7 +600,33 @@ void rad_dev_chain_infer(int pays) {
     g_chain_pays.store(pays ? 1 : 0, std::memory_order_relaxed);
     g_chain.store(-1, std::memory_order_relaxed);
 }
-int rad_dev_chain_enabled(void) {
+/* Lever A5 (ds41-ll, device.h): RADIANCE_CHAIN_DS41 read once; it counts only on the AQL backend, which chains. */
+static int chain_env_raw() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_CHAIN_DS41");
+        if (!e || !*e) return -1;
+        if (!std::strcmp(e, "0")) return 0;
+        if (!std::strcmp(e, "1")) return 1;
+        std::fprintf(stderr, "radiance: RADIANCE_CHAIN_DS41='%s' is not 0 or 1: ignored (chained launches by the "
+                             "plugin's measurement)\n", e);
+        return -1;
+    }();
+    return v;
+}
+int rad_dev_chain_env(void) {
+    const int v = chain_env_raw();
+    return v >= 0 && std::strcmp(rad::device_backend_name(), "aql") == 0 ? v : -1;
+}
+static std::atomic<long long> g_chain_cnt[3];
+void rad_dev_chain_note(int played, int unordered) {
+    g_chain_cnt[played ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+    if (unordered) g_chain_cnt[2].fetch_add(1, std::memory_order_relaxed);
+}
+void rad_dev_chain_counts(long long out[3]) {
+    for (int i = 0; i < 3; ++i) out[i] = g_chain_cnt[i].load(std::memory_order_relaxed);
+}
+/* Today's decision: the plugin measured a gain and the backend chains (cached once taken). */
+static int chain_today() {
     int on = g_chain.load(std::memory_order_relaxed);
     if (on < 0) {
         on = g_chain_pays.load(std::memory_order_relaxed) != 0 &&
@@ -609,6 +636,14 @@ int rad_dev_chain_enabled(void) {
         g_chain.store(on, std::memory_order_relaxed);
     }
     return on;
+}
+int rad_dev_chain_forms(void) {
+    if (rad_dev_chain_env() >= 0) return 1;
+    return chain_today();
+}
+int rad_dev_chain_enabled(void) {
+    if (rad_dev_chain_env() >= 0) return rad::fn4::chain_ds41() != 0 ? 1 : 0;
+    return chain_today();
 }
 
 int  rad_event_elapsed_ms(RadEvent a, RadEvent b, float* out) {

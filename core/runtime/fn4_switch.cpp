@@ -34,7 +34,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
-                                        "exl3_x3d" };
+                                        "exl3_x3d", "ar_ll", "chain_ds41" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -43,7 +43,8 @@ bool plugin_switch(int i) {
            i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx || i == kDs41PskCr || i == kDs41Engdd ||
            i == kMhcFuse || i == kIxLds || i == kIxNi || i == kDs41Arcoded || i == kDs41MixWv || i == kDs41Gq ||
            i == kDs41E2 ||
-           i == kExl3X3d;   /* exl3_x3d (62 here; 57 on ds41-x3d-eng10): the ds41-x3d exl3r4d (X3D-F) */
+           i == kExl3X3d ||   /* exl3_x3d (62 here; 57 on ds41-x3d-eng10): the ds41-x3d exl3r4d (X3D-F) */
+           i == kArLl;        /* ar_ll (63, ds41-ll): libr4d's lever A3 */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -63,6 +64,7 @@ struct Hooks {
     int (*i9b_stats)(long long*, int) = nullptr;   /* levers M1 / IX-NI (deepseek41's rad_i9b_stats, ds41-int9b) */
     int (*ix_stats)(long long*, int) = nullptr;    /* levers IX-LDSR2 / IX-NI (libr4d's rad_ix_stats, ds41-int9b) */
     int (*arc_stats)(long long*, int) = nullptr;   /* lever ARC (libr4d's rad_arc_stats, ds41-int10) */
+    int (*arll_stats)(long long*, int) = nullptr;  /* lever A3 (libr4d's rad_arll_stats, ds41-ll) */
     int (*i11_stats)(long long*, int) = nullptr;   /* levers 1U-GQ / 1U-E2 (deepseek41's rad_i11_stats, ds41-int11) */
     int (*mx_stats)(long long*, int) = nullptr;    /* lever 1U-MX (libr4d's rad_mx_stats, ds41-int11) */
 };
@@ -104,6 +106,10 @@ struct State {
     std::atomic<int> sp_capable{-1};                        /* lever SP: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> sp[kSahbRanks][kSpN];              /* note_sp */
     std::atomic<int> sp_ranks{0};
+    /* lever A5 (chain_register): RADIANCE_CHAIN_DS41 as the device layer reads it (-1 unset / not AQL / not registered), its hooks */
+    std::atomic<int> chain_env{-1};
+    std::atomic<int (*)(void)> chain_forms{nullptr}, chain_enabled{nullptr};
+    std::atomic<void (*)(long long*)> chain_counts{nullptr};
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -182,6 +188,7 @@ void find_hooks(State& s) {
             k.i9b_stats = sym<int (*)(long long*, int)>(h, "rad_i9b_stats");
             k.ix_stats = sym<int (*)(long long*, int)>(h, "rad_ix_stats");
             k.arc_stats = sym<int (*)(long long*, int)>(h, "rad_arc_stats");
+            k.arll_stats = sym<int (*)(long long*, int)>(h, "rad_arll_stats");
             k.i11_stats = sym<int (*)(long long*, int)>(h, "rad_i11_stats");
             k.mx_stats = sym<int (*)(long long*, int)>(h, "rad_mx_stats");
             bool dup = false;
@@ -296,6 +303,10 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : env_cb_hold_k();
     }
+    if (i == kChainDs41) {         /* lever A5: set, else RADIANCE_CHAIN_DS41 (-1 unset: not switchable here) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : s.chain_env.load(std::memory_order_acquire);
+    }
     return s.val[i].load(std::memory_order_acquire);
 }
 
@@ -381,6 +392,22 @@ void note_sched_cap(const int64_t* v) {
 int sched_cb_hold_ms() {
     const int v = st().val[kSchedCbHoldMs].load(std::memory_order_acquire);
     return v >= 0 ? v : env_cb_hold_ms();
+}
+int chain_ds41() {
+    State& s = st();
+    const int v = s.val[kChainDs41].load(std::memory_order_acquire);
+    if (v >= 0) return v;
+    const int e = s.chain_env.load(std::memory_order_acquire);
+    return e > 0 ? e : 0;
+}
+/* The device layer's answers reach fn4 through these (the engine registers them at bringup), so the core's switch table does
+ * not link the device layer into a test that fakes it (sched_test's device fakes). */
+void chain_register(int env, int (*forms)(void), int (*enabled)(void), void (*counts)(long long*)) {
+    State& s = st();
+    s.chain_forms.store(forms, std::memory_order_release);
+    s.chain_enabled.store(enabled, std::memory_order_release);
+    s.chain_counts.store(counts, std::memory_order_release);
+    s.chain_env.store(env, std::memory_order_release);
 }
 int sched_cb_hold_k() {
     const int v = st().val[kSchedCbHoldK].load(std::memory_order_acquire);
@@ -596,6 +623,23 @@ static void arc_collect(State& s, int64_t* out) {
         if (n > 0) break;
     }
 }
+/* Under s.mu. */
+static void arll_collect(State& s, int64_t* out) {
+    for (int i = 0; i < kArllStats; ++i) out[i] = 0;
+    find_hooks(s);
+    for (const Hooks& k : s.hooks) {
+        if (!k.arll_stats) continue;
+        long long v[kArllStats] = {};
+        const int n = k.arll_stats(v, kArllStats);
+        for (int i = 0; i < n && i < kArllStats; ++i) out[i] = (int64_t)v[i];
+        if (n > 0) break;
+    }
+}
+void arll_stats(int64_t out[kArllStats]) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    arll_collect(s, out);
+}
 void arc_stats(int64_t out[kArcStats]) {
     State& s = st();
     std::lock_guard<std::mutex> lk(s.mu);
@@ -680,7 +724,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
-                        "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, epoch_bump)";
+                        "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_ll, chain_ds41, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -996,6 +1040,19 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kChainDs41) {         /* lever A5 */
+        if (v < 0 || v > 1) {
+            if (err) *err = "chain_ds41 takes 0 (chained forms launch unchained) or 1 (they launch chained)";
+            return false;
+        }
+        if (v == 1 && s.chain_env.load(std::memory_order_acquire) < 0) {
+            if (err)
+                *err = "chain_ds41=1 refused: the chained forms resolve only where RADIANCE_CHAIN_DS41 (0 / 1) was set at "
+                       "start on the AQL backend";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedBiChunk) {
         if (v < 0 || v > 4) {
             if (err) *err = "sched_bi_chunk takes 0 (today), 1 (alone's boundaries), 2 (the interval grid), 3 / 4 (alone's "
@@ -1176,7 +1233,8 @@ bool apply_pending(int step, int* sched) {
         if (reported(s, i) == v) {
             if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
-                i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK)
+                i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
+                i == kChainDs41)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
@@ -1304,6 +1362,29 @@ std::string state_json() {
              std::to_string((long long)v[2]) + ", \"plain_rows\": " + std::to_string((long long)v[3]) +
              ", \"below\": " + std::to_string((long long)v[4]) + ", \"declined\": " + std::to_string((long long)v[5]) +
              ", \"coded_all_ranks\": " + std::to_string((long long)v[6]) + "}";
+    }
+    /* Lever A3 (ds41-ll): always present, 0s where no plugin serves it (arll_stats). */
+    {
+        int64_t v[kArllStats];
+        arll_collect(s, v);
+        o += ", \"arll\": {\"oneshot_launches\": " + std::to_string((long long)v[0]) +
+             ", \"twoshot_launches\": " + std::to_string((long long)v[1]) + ", \"rows\": " +
+             std::to_string((long long)v[2]) + ", \"gather_launches\": " + std::to_string((long long)v[3]) +
+             ", \"declined\": " + std::to_string((long long)v[4]) + ", \"plain_launches\": " +
+             std::to_string((long long)v[5]) + ", \"ll_all_ranks\": " + std::to_string((long long)v[6]) + "}";
+    }
+    /* Lever A5 (ds41-ll): always present -- env -1 where RADIANCE_CHAIN_DS41 is unset (or not the AQL backend), 0s where no
+     * engine registered the device layer's hooks (chain_register). */
+    {
+        long long c[3] = { 0, 0, 0 };
+        const auto cf = s.chain_counts.load(std::memory_order_acquire);
+        const auto ff = s.chain_forms.load(std::memory_order_acquire);
+        const auto ef = s.chain_enabled.load(std::memory_order_acquire);
+        if (cf) cf(c);
+        o += ", \"chain\": {\"env\": " + std::to_string(s.chain_env.load(std::memory_order_acquire)) +
+             ", \"forms\": " + std::to_string(ff ? ff() : 0) + ", \"on\": " +
+             std::to_string(ef ? ef() : 0) + ", \"issued_chained\": " + std::to_string(c[0]) +
+             ", \"played_chained\": " + std::to_string(c[1]) + ", \"no_barrier\": " + std::to_string(c[2]) + "}";
     }
     /* Levers 1U-MX / 1U-GQ / 1U-E2 (ds41-int11): always present, 0s where no plugin serves them (i11_stats). */
     {

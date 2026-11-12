@@ -1214,6 +1214,7 @@ int dispatch(Stream* s, const KernelRec* k, dim3 g, dim3 b, void** args, size_t 
     const bool keep = !(chain && s->prev_chained && !s->plain_inflight && !p->completion_signal.handle);
     publish(s, idx, header(HSA_PACKET_TYPE_KERNEL_DISPATCH, acq, rel, keep), setup);
     if (chain) s->chain_issued += blocks_of(p);
+    if (chain) rad_dev_chain_note(0, !keep);   /* lever A5's counters (GET /admin/fn4 "chain") */
     s->prev_chained = chain;
     s->plain_inflight = keep ? !chain : s->plain_inflight || !chain;
     s->unlock();
@@ -1355,6 +1356,7 @@ struct PlayRun {
                          __ATOMIC_RELEASE);
         foreign = false;
         if (chain) s->chain_issued += blocks_of(p);
+        if (chain) rad_dev_chain_note(1, !ordered);   /* lever A5's counters (GET /admin/fn4 "chain") */
         s->prev_chained = chain;
         s->plain_inflight = ordered ? !chain : s->plain_inflight || !chain;
         s->wr = idx + 1;

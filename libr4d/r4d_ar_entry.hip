@@ -25,6 +25,7 @@
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
 #include "r4d_ar_arc.h"     /* lever ARC (ds41-int10): the coded wire at overlap 0, fn4 ds41_arcoded */
+#include "r4d_ar_ll.h"      /* lever A3 (ds41-ll): the flags in the data words at decode sizes, fn4 ar_ll */
 
 #include <atomic>
 #include <condition_variable>
@@ -35,6 +36,9 @@
 #include <mutex>
 #include <vector>
 #include <chrono>
+
+/* Lever A3 (ds41-ll): whether this process builds LL areas (RADIANCE_AR_LL set at load, or r4d_arll_test_settings). */
+int r4d_arll_capable();
 
 static_assert(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS == 268435456,
               "r4d_rows.cpp restates this bound; libr4d changed it");
@@ -74,6 +78,7 @@ struct Rendezvous {
     long flags  [R4D_MAX_RANKS] = { 0 };
     long seq    [R4D_MAX_RANKS] = { 0 };
     int  dev    [R4D_MAX_RANKS] = { 0 };
+    long ll     [R4D_MAX_RANKS] = { 0 };   /* lever A3: each rank's LL area, 0 where it has none */
     /* Each rank's card's link, which the eight-rank two-shot's weights are derived from. */
     R4DArLink ar8_link[R4D_MAX_RANKS];
     int  failed = 0;
@@ -131,6 +136,13 @@ struct ArInst {
     /* Messages under these sizes (elements) run even and in one piece, whatever is configured. */
     long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
     long long pieces_min  = R4D_AR8_MIN_ELEMS_DEFAULT;
+    /* Lever A3 (ds41-ll, r4d_ar_ll.h): this rank's LL area (2 parities x 4 sources x ll_units 8-byte units, fine-grained,
+     * zeroed) and the peers', ascending; ll_ok when every rank of the world has one. Built only at four ranks over P2P
+     * for bf16 while RADIANCE_AR_LL is set at load (r4d_arll_capable); otherwise 0 and nothing is allocated. */
+    long my_ll = 0;
+    long peer_ll[R4D_MAX_PEERS] = { 0 };
+    long ll_units = 0;
+    int  ll_ok = 0;
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -378,11 +390,23 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
                                   handle, &hlen));
     }
 
+    /* Lever A3 (ds41-ll): the LL area, only where LL can run and RADIANCE_AR_LL asked for it at load (so an unset
+     * environment allocates exactly what it did before). Zeroed by r4d_ar_ipc_alloc: the area's state between launches. */
+    long llp = 0, llu = 0;
+    if (world == 4 && !host && dtype_code == 0 && r4d_arll_capable()) {
+        llu = r4d_arll_slot_units(max_numel, in->esize);
+        if (llu > 0) {
+            R4D_TRY("ar_ipc_alloc(ll)", llp = r4d_ar_ipc_alloc(2L * 4 * 8 * llu, 1, handle, &hlen));
+        }
+    }
+
     in->my_scratch = sc;
     in->my_flags   = fl;
     in->my_seq     = sq;
     in->locpack    = lp;
     in->my_stage   = stg;
+    in->my_ll      = llp;
+    in->ll_units   = llp ? llu : 0;
     in->gate_ctr   = sq + 2L * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
     {
@@ -391,6 +415,7 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         g_rv.flags[rank]   = fl;
         g_rv.seq[rank]     = sq;
         g_rv.dev[rank]     = dev;
+        g_rv.ll[rank]      = llp;
     }
     int rc = rv_barrier(world);
     if (rc != RAD_OK) return rc;
@@ -401,11 +426,14 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
      * rank's own card needs none (the runtime refuses to enable it): r4d_selftest runs eight ranks
      * on one card that way, each on its own stream. */
     int j = 0;
+    in->ll_ok = llp != 0;
     for (int r = 0; r < world; ++r) {
         if (r == rank) continue;
         if (!g_rv.scratch[r] || !g_rv.flags[r]) return RAD_E_STATE;
         in->peer_scratch[j] = g_rv.scratch[r];
         in->peer_flags[j]   = g_rv.flags[r];
+        in->peer_ll[j]      = g_rv.ll[r];
+        in->ll_ok           = in->ll_ok && g_rv.ll[r] != 0;   /* every rank reads the same g_rv.ll: the same answer */
         ++j;
         if (!host && g_rv.dev[r] != dev)
             R4D_TRY("ar_ipc_enable_peer", r4d_ar_ipc_enable_peer((long)g_rv.dev[r]));
@@ -494,6 +522,7 @@ void release(ArInst* in) {
     r4d_ar_ipc_free(in->my_seq);
     r4d_ar_ipc_free(in->locpack);
     r4d_ar_ipc_free(in->my_stage);
+    r4d_ar_ipc_free(in->my_ll);
     delete in;
 }
 
@@ -713,6 +742,128 @@ static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
                : (shard_nb && basis <= kTsDecodeShard) ? nb_for_shard(basis, cap) : nb_for(basis, cap);
     if (c->nblocks > in->max_blocks) c->nblocks = in->max_blocks;
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ lever A3: LL at decode sizes
+ *
+ * Lever A3 / 1U-AR (ds41-ll, r4d_ar_ll.h): libr4d's fn4 switch "ar_ll" (r4d_ds41_ggml.hip's rad_fn4_*): 0 = off, today's
+ * flag wire exactly; 1 = the four-rank exact all-reduce (this file's one-shot entry and its two-shot hand-off) and
+ * moe_gather_all_reduce_4rank carry their flags in their data words for a message of at most 48 rows; N in 2 .. 48 = at
+ * most N rows. The start value is RADIANCE_AR_LL (0 .. 48, a decimal integer), read at the first launch; a change applies
+ * at a step release, every rank parked, and re-records every pass (fn4's epoch). RADIANCE_AR_LL set to ANY value also
+ * makes every four-rank P2P bf16 instance built after it allocate its LL area (r4d_ar_ll.h; ~5.5 MiB at a 5120-wide
+ * residual); unset, nothing is allocated, ar_ll takes only 0, and no launch changes. Counters (rad_arll_stats; launches
+ * of at most 48 rows through the two entries, counted when issued -- a recorded pass when it is recorded): rank 0's LL
+ * one-shot launches, LL two-shot launches, their rows, the gather's among them, launches the switch covered but LL
+ * declined (no area, not bf16, the form does not fit), plain launches; LL launches over every rank. */
+static std::atomic<int> g_arll{-1};
+static std::atomic<int> g_arll_cap{-1};
+static std::atomic<int> g_arll_pin_nb{0}, g_arll_pin_nt{0};
+static std::atomic<long long> g_arll_ctr[7];
+static int arll_env(bool* set) {
+    const char* e = std::getenv("RADIANCE_AR_LL");
+    *set = e && *e;
+    if (!*set) return 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(e, &end, 10);
+    if (end && !*end && r4d_arll_known(v)) return (int)v;
+    std::fprintf(stderr, "[r4d] RADIANCE_AR_LL='%s' is not 0 .. %d: lever A3 starts off (ar_ll 0), LL areas built\n", e,
+                 (int)R4D_ARLL_MAX_ROWS);
+    return 0;
+}
+int r4d_arll_capable() {
+    int c = g_arll_cap.load(std::memory_order_relaxed);
+    if (c < 0) {
+        bool set = false;
+        (void)arll_env(&set);
+        int unread = -1;
+        g_arll_cap.compare_exchange_strong(unread, set ? 1 : 0);
+        c = g_arll_cap.load(std::memory_order_relaxed);
+    }
+    return c;
+}
+static int arll_on() {
+    int v = g_arll.load(std::memory_order_relaxed);
+    if (v < 0) {
+        bool set = false;
+        const int e = arll_env(&set);
+        int unread = -1;
+        g_arll.compare_exchange_strong(unread, e);
+        v = g_arll.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+int r4d_arll_get() { return arll_on(); }
+void r4d_arll_set(int v) { g_arll.store(r4d_arll_known(v) ? v : 0, std::memory_order_relaxed); }
+/* r4d_selftest: capable 1 / 0 overrides RADIANCE_AR_LL for instances built after it (-1 leaves it); nb / nt > 0 pin the
+ * LL grid (0: the rule). */
+extern "C" void r4d_arll_test_settings(int capable, int nb, int nt) {
+    if (capable >= 0) g_arll_cap.store(capable ? 1 : 0, std::memory_order_relaxed);
+    g_arll_pin_nb.store(nb > 0 ? nb : 0, std::memory_order_relaxed);
+    g_arll_pin_nt.store(nt > 0 ? nt : 0, std::memory_order_relaxed);
+}
+/* out[0] LL one-shot launches (rank 0), [1] LL two-shot launches (rank 0), [2] their rows, [3] the gather's among them,
+ * [4] launches the switch covered that LL declined (rank 0), [5] plain launches of at most 48 rows (rank 0, any switch
+ * value), [6] LL launches over every rank. Cumulative. Returns 7. */
+extern "C" int rad_arll_stats(long long* out, int n) {
+    if (!out || n < 7) return 0;
+    for (int i = 0; i < 7; ++i) out[i] = g_arll_ctr[i].load(std::memory_order_relaxed);
+    return 7;
+}
+/* The form a launch of `rows` rows takes: 0 = the plain kernel, else 1 + R4D_ARLL_ONESHOT / _TWOSHOT; counted. twoshot =
+ * the form the plain path would take for this message; list_ok = the gather's slot list fits (1 for the plain one). */
+static int arll_pick_count(const ArInst* in, long long rows, long long numel, int twoshot, int list_ok, bool gather) {
+    if (rows < 1 || rows > R4D_ARLL_MAX_ROWS) return 0;   /* not a decode size: no counter moves */
+    const bool r0 = in->rank == 0;
+    bool declined = false;
+    const int esize = in->dtype == 0 ? 2 : 0;           /* bf16 only */
+    const int pick = in->world == 4 && !in->host
+                         ? r4d_arll_pick(arll_on(), rows, numel, esize, in->ll_ok ? in->ll_units : 0, twoshot,
+                                         list_ok, &declined)
+                         : 0;
+    if (pick) {
+        if (r0) {
+            g_arll_ctr[pick == 1 + R4D_ARLL_ONESHOT ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+            g_arll_ctr[2].fetch_add(rows, std::memory_order_relaxed);
+            if (gather) g_arll_ctr[3].fetch_add(1, std::memory_order_relaxed);
+        }
+        g_arll_ctr[6].fetch_add(1, std::memory_order_relaxed);
+    } else if (r0) {
+        g_arll_ctr[5].fetch_add(1, std::memory_order_relaxed);
+        if (declined) g_arll_ctr[4].fetch_add(1, std::memory_order_relaxed);
+    }
+    return pick;
+}
+static constexpr int kArllPlain = -1000;   /* arll_ar / the gather's: run the plain kernel */
+static void arll_grid(int form, long n16, const ArInst* in, int* nb, int* nt);
+/* The plain all-reduce's LL launch (the one-shot entry, before its own form choice): kArllPlain, or the launch's return.
+ * The form is the one this entry would take: the two-shot from ts_min where the hand-off below takes it. */
+static int arll_ar(const RadArgs* a, const ArCall& c, RadStream s) {
+    const ArInst* in = c.in;
+    const RadTensor* x = r4d_opt(a, AR_X);
+    const long long rows = r4d_arc_rows(c.numel, x ? (int)x->rank : 1, x && x->rank >= 1 ? x->shape[x->rank - 1] : 0);
+    if (rows > R4D_ARLL_MAX_ROWS) return kArllPlain;
+    const long ts_min = r4d_cfg_ar_ts_min(a);
+    const long words16 = c.numel * in->esize / 16;
+    const int two = ts_min > 0 && c.numel >= ts_min && words16 % in->world == 0 &&
+                    2 * (c.numel * in->esize) / in->world <= in->slot_bytes &&
+                    c.numel <= R4D_AR_TWOSHOT_WIDE_MAX_ELEMS;
+    const int pick = arll_pick_count(in, rows, c.numel, two, 1, false);
+    if (!pick) return kArllPlain;
+    const int form = pick - 1;
+    int nb = 0, nt = 0;
+    arll_grid(form, words16, in, &nb, &nt);
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
+    R4D_TRY("ar_oneshot_4rank_exact (ar_ll)",
+        r4d_arll_launch(form, 0, in->peer_ll, in->my_ll, in->my_seq, in->ll_units, c.inp, c.out, words16, in->rank,
+                        (long)(uintptr_t)s, nb, nt, early, early ? in->gate_ctr : 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                        0L, 0L, 0L, 0L, 0L));
+    return early ? RAD_LINK_ENDED : RAD_OK;
+}
+static void arll_grid(int form, long n16, const ArInst* in, int* nb, int* nt) {
+    /* the instance's capacity (R4D_AR_MAX_BLOCKS may lower it); r4d_arll_grid stays within the parity words too */
+    r4d_arll_grid(form, n16, in->max_blocks, g_arll_pin_nb.load(std::memory_order_relaxed),
+                  g_arll_pin_nt.load(std::memory_order_relaxed), nb, nt);
 }
 
 /* ------------------------------------------------------------------ all-gather
@@ -957,6 +1108,8 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
     const ArInst* in = c.in;
+    /* Lever A3 (ds41-ll): under ar_ll, a message of at most its rows in the same form with the flags in the data. */
+    if (const int ll = arll_ar(a, c, s); ll != kArllPlain) return ll;
     /* From `ts_min` elements, the exact two-shot on this instance: the same fold per element, so
      * the same bytes, for half the bytes a rank (a 16-row verify's message, 516 KiB a card at
      * 3x, is what the link waits on). It shares the wide family's flags, counters and slots, and
@@ -1862,6 +2015,25 @@ extern "C" int r4d_rad_moe_gather_ar_4rank(const RadArgs* a, RadStream s) {
     r4d_cfg_ar(a, &cfgv);
     const long words16 = (long)(M * n * 2 / 16);
     const long gate = link_gate(a), early = in->host ? 0L : gate;
+    /* Lever A3 (ds41-ll): under ar_ll, at most its rows in the form chosen below, the flags in the data, the words
+     * those of the two-shot gather's slot list (r4d_ar_gather_word_list: moe_gather's bytes). */
+    {
+        const long tsm = r4d_cfg_ar_ts_min(a);
+        const int two = tsm > 0 && (long)(M * n) >= tsm &&
+                        r4d_ar_gather_twoshot_ok((long)M, (long)n, (long)top_k, in->slot16);
+        if (const int pick = arll_pick_count(in, M, M * n, two, r4d_arll_list_ok(M, top_k) ? 1 : 0, true)) {
+            const int form = pick - 1;
+            int nb = 0, nt = 0;
+            arll_grid(form, words16, in, &nb, &nt);
+            R4D_TRY("moe_gather_ar_4rank (ar_ll)",
+                r4d_arll_launch(form, 1, in->peer_ll, in->my_ll, in->my_seq, in->ll_units, 0L, r4d_addr(y), words16,
+                                in->rank, (long)(uintptr_t)s, nb, nt, early, early ? in->gate_ctr : 0L,
+                                r4d_addr(ye), r4d_addr(ew), r4d_addr(so), sh ? r4d_addr(sh) : 0L,
+                                sh ? r4d_addr(sg) : 0L, (long)ye_ld, (long)ew_ld, (long)sh_ld, (long)sg_ld,
+                                (long)top_k, (long)sig | ewf, (long)M, (long)n));
+            return early ? RAD_LINK_ENDED : RAD_OK;
+        }
+    }
     /* From `ts_min` elements, where the unfused all-reduce takes the exact two-shot
      * (r4d_rad_ar_oneshot_4rank_exact), the gather in front of the same two-shot: the same words and
      * the same fold, so the same bytes, for half the bytes a rank. A call the form does not take (a
