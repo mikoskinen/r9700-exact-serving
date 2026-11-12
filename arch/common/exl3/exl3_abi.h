@@ -820,6 +820,7 @@ static inline void exl3_gd_operands(const RadTensor* t, const RadTensor* h, RadT
     tg[gu->offset] = td[dn->offset] = t[gd->offset];
     tg[gu->y] = td[dn->x] = *h;
     td[dn->y] = t[gd->y];
+    if (dn->band >= 0) memset(&td[dn->band], 0, sizeof td[dn->band]);   /* v13: no band inside the fused op */
 }
 
 /* ...and version 7's four-class op the same way: the gate_up_mod4 view (a_rot = 0, h_rot = 1) and the down_mod4 view
@@ -865,6 +866,7 @@ static inline void exl3_gd4_operands(const RadTensor* t, const RadTensor* h, Rad
     tg[gu->offset] = td[dn->offset] = t[gd->offset];
     tg[gu->y] = td[dn->x] = *h;
     td[dn->y] = t[gd->y];
+    if (dn->band >= 0) memset(&td[dn->band], 0, sizeof td[dn->band]);   /* v13: no band inside the fused op */
 }
 
 /* Expert e's class and its entry in that class's tables. */
