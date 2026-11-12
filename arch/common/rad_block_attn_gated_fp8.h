@@ -172,8 +172,8 @@ struct AttnGatedFP8 {
     static constexpr int64_t kGqBiRows = 64;
     rad_op     op_attn_gq_bi = 0;
     int64_t    gq_bi_qd = 0;
-    /* fn4 att_bi 3: op_attn with split_rows = 1 (a dense decode sequence's alone launch is one sequence), declared beside
-     * op_attn_gq_bi; 0 otherwise. */
+    /* fn4 att_bi 3: op_attn as attn_paged_pin with split_rows = 1 (a dense decode sequence's alone launch is one sequence),
+     * declared beside op_attn_gq_bi where a plugin declares attn_paged_pin (libr4d); 0 otherwise. */
     rad_op     op_attn_bi = 0;
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
@@ -409,8 +409,8 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
     {   /* fn4 att_bi 3: the dense decode twin (split_rows 1), under RADIANCE_FN4_BIDEC (default RADIANCE_FN4_X3DUAL) */
         const char* e = std::getenv("RADIANCE_FN4_BIDEC");
         if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
-        if (op_attn && e && *e && *e != '0' && g.max_spec > 0) {
-            op_attn_bi = decl_attn(b, g, "attn_paged",
+        if (op_attn && e && *e && *e != '0' && g.max_spec > 0 && rad_op_declared(b, "attn_paged_pin")) {
+            op_attn_bi = decl_attn(b, g, "attn_paged_pin",
                              RAD_PARAMS(RAD_RANGE("q_len", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
                                         RAD_INT("gqa", g.gqa()), RAD_INT("causal", 1),
                                         RAD_INT("window", 0),

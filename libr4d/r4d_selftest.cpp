@@ -1231,6 +1231,9 @@ static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::ve
     if (!sel("attn_bi_batch")) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { skip(name, "row absent"); return; }
+    /* the batched run through the attn_paged_pin row (the arch's op_attn_bi) where it exists */
+    const RadKernelInfo* rp = find(pl, "attn_decode_pin_h256_gqa6_bs4_fp8kv");
+    if (!rp) rp = r;
     const int64_t head_dim = 256, gqa = 6, kv_heads = 1, bs = 4, q_heads = kv_heads * gqa, k = (int64_t)ctxs.size();
     int64_t maxb = 0, nblk = 0;
     for (int32_t c : ctxs) { maxb = std::max<int64_t>(maxb, (c + bs - 1) / bs); nblk += (c + bs - 1) / bs; }
@@ -1274,7 +1277,7 @@ static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::ve
             PI("max_ctx", 262144),
         };
         if (pin > 0) ps.push_back(PI("split_rows", pin));
-        run_case(r, ts, ps);
+        run_case(pin > 0 ? rp : r, ts, ps);
     };
     st_memset(d_o1, 0, (size_t)qn * 2); st_memset(d_ob, 0, (size_t)qn * 2); st_memset(d_oc, 0, (size_t)qn * 2);
     for (int64_t s = 0; s < k; ++s) run(s, 1, d_o1, 0);   /* alone: one sequence a launch, the law's own count (1) */

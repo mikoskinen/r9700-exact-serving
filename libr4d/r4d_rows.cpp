@@ -113,8 +113,14 @@ static const RadParamSpec pAttnPaged[] = {
     P_INTO("max_seqs"),
     /* e4m3 products a caller accepts (docs/OPS.md): 1 Q.K^T, 2 P.V, 3 both; absent is 0. */
     P_INTO("prefill_fp8"),
-    /* fn4 BI (att_bi 3, 13.11.2026): the split law's sequence count in place of the launch's (libr4d r4d_split_rows_pin, the
-     * split-KV decode rows); absent 0. A launch of several dense decode sequences pinned to 1 splits each as its alone launch. */
+};
+/* fn4 BI (att_bi 3, 13.11.2026): attn_paged under its own name with `split_rows`, the split law's sequence count in place of
+ * the launch's (r4d_split_rows_pin, the split-KV decode rows): a launch of several dense decode sequences pinned to 1 splits
+ * each as its alone launch. Its own op, libr4d's alone: every plugin that declares attn_paged must agree on its schema. */
+static const RadParamSpec pAttnPagedPin[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"), P_INT("window"),
+    P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"), P_INTO("n_head"), P_INTO("max_seqs"),
+    P_INTO("prefill_fp8"),
     P_INTO("split_rows"),
 };
 static const RadOperandSpec oAttnPaged[] = {
@@ -3485,6 +3491,9 @@ static const RadOpSchema kSchemas[] = {
            "paged causal attention, varlen. The ranged parameter is q_len, not M: one query row "
            "at decode, up to 64/gqa at a speculative verify, thousands in a prefill chunk, and "
            "libr4d has a different kernel for each band."),
+    SCHEMA("attn_paged_pin", pAttnPagedPin, oAttnPaged,
+           "fn4 BI: attn_paged with split_rows, the split law's sequence count in place of the launch's "
+           "(a run of decode sequences split each as its own alone launch)."),
     SCHEMA("attn_paged_anchor_window", pAttnPaged, oAttnPaged,
            "paged attention whose query rows all use the sequence's first query as the sliding-window anchor."),
     /* attn_paged under its own name, for q read at its own row pitch. The windowed kernels
@@ -7830,6 +7839,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 
 { "attn_decode_h256_gqa6_bs4_fp8kv", "attn_paged", "attn",
   "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
+  "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
+  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeH256G6Bs4Fp8), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_gqa6_fp8, r4d_rad_attn_decode_h256_gqa6_scratch,
+  nullptr, nullptr,
+  r4d_shape_attn_paged },
+
+/* fn4 BI (att_bi 3): the same row under attn_paged_pin (split_rows), the same launcher (g8_decode_common pins the law) */
+{ "attn_decode_pin_h256_gqa6_bs4_fp8kv", "attn_paged_pin", "attn",
+  "attn_decode_h256_gqa6_bs4_fp8kv with split_rows: the split law reads that many sequences (fn4 BI att_bi 3)",
   "head_dim 256, 6 queries per kv head, paged block 4, q_len*gqa <= 64, no window",
   "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
