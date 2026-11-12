@@ -93,6 +93,17 @@
 
 namespace rad {
 
+/* Lever SA's arming rule (ds41-sahb, fn4 stage_short; Engine::arena_step): a step arms the prefill stager at lever
+ * SA's place when the switch is on (N = stage_short > 0) and the engine set the place up on every rank (capable), the
+ * step is no encoder pass and carries prefill rows, has at least N tokens, and runs at the span's shared level (not
+ * the full plan: level 0 has its own ring), where RADIANCE_STAGE_MIXED allows a pass with decode rows (mixed_ok). The
+ * stager's own size rule (begin_pass: at least min_rows tokens) still applies. */
+inline bool sahb_arms(int stage_short, bool capable, bool enc, bool has_prefill, int64_t n_tok, int level,
+                      int64_t level_rows, int64_t span_rows, bool mixed_ok) {
+    return stage_short > 0 && capable && !enc && has_prefill && n_tok >= (int64_t)stage_short && level != 0 &&
+           span_rows > 0 && level_rows == span_rows && mixed_ok;
+}
+
 /* One routed layer a stager serves: its units and the span of ops that read them. */
 struct StagedLayer {
     int32_t              layer = -1;
@@ -127,6 +138,30 @@ public:
     void set_layer_end(int32_t layer) { layer_end_ = layer; }
     /* Routed layers armed passes did not stage for a layer end below their last (cumulative; lever PSK's /stats). */
     int64_t layers_skipped() const { return skipped_; }
+
+    /* ---- lever SA (ds41-sahb, fn4 stage_short / stage_pick) ------------------------------------------------------
+     *
+     * Per step, before release: whether the step is a stage_short step (the engine armed it at the span's shared
+     * level, Engine::arena_step) and, for such a step, which pooled units its layers copy: `pick` 0 every pooled unit
+     * of the layer (the full-plan rule), K >= 1 only the units one of the last K trunk passes of the stager's size
+     * routed (note_routed). The others stay at their pool slots and are read in place, as in an unarmed pass. A
+     * full-plan step (short false) always copies every pooled unit. Which address a GEMM reads changes; its bytes
+     * do not (the copies are the pool's bytes), so the pick is placement only. */
+    void set_short(bool on, int pick) { short_next_ = on; pick_next_ = on && pick > 0 ? pick : 0; }
+    /* The routing of one trunk layer of trunk step `step`, a pass of the stager's size (the engine passes only those:
+     * at least min_rows() tokens): every unit of `layer` whose expert `counts` routes (count > 0) is stamped with
+     * `step`. A step number above the last one recorded starts a new entry of the recent-steps ring. Rank thread. */
+    void note_routed(int32_t layer, const int32_t* counts, int32_t n_expert, int32_t step);
+    /* Whether unit `u` (a routed unit of a staged layer) was routed by one of the last `k` recorded steps. */
+    bool picked(int32_t u, int k) const;
+    /* Counters (the engine's GET "sahb"): short (stage_short) passes armed, their layers / units / bytes copied, the
+     * pooled units the pick kept and left in place; recorded steps; and, at every armed or stager-size pass, the
+     * pooled units (and bytes) the last recorded step routed -- what the pass would stream in place unstaged. */
+    struct SahbStats {
+        int64_t short_steps = 0, short_layers = 0, short_units = 0, short_bytes = 0, pick_kept = 0, pick_dropped = 0;
+        int64_t big_steps = 0, expect_units = 0, expect_bytes = 0, expect_sum_units = 0, expect_n = 0;
+    };
+    const SahbStats& sahb() const { return sa_; }
 
     bool    enabled() const { return !layers_.empty(); }
     int64_t ring_bytes() const { return ring_; }
@@ -205,6 +240,18 @@ private:
     /* The next trunk pass's first layers, staged at this pass's end: layers [0, n_early_). */
     int32_t  n_early_ = 0;
 
+    /* Lever SA: the next pass's set_short, this pass's (taken at begin_pass), the stamps (by plan unit: the last
+     * recorded step that routed it, -1 never), each layer's units by expert, the recent recorded steps (newest last). */
+    bool short_next_ = false, short_ = false;
+    int  pick_next_ = 0, pick_ = 0;
+    std::vector<int32_t> stamp_;
+    std::vector<int32_t> layer_ix_;                  /* model layer -> layers_ index, -1 none */
+    std::vector<std::vector<int32_t>> by_expert_;    /* layers_ index -> expert -> unit, -1 none */
+    static constexpr int kRecent = 64;
+    std::deque<int32_t> recent_;
+    SahbStats sa_;
+    std::vector<int32_t> pick_buf_, one_;
+    void expect_now();
     /* Lever PSK design 2: set_layer_end's layer, and the routed layers (layers_ entries) the armed pass runs. */
     int32_t layer_end_ = INT32_MAX;
     int32_t lim_ = 0;

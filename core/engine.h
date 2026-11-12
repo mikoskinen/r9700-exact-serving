@@ -682,6 +682,14 @@ private:
      * (Mover::set_place_lf on every rank). */
     bool             lf_capable_ = false;
     std::atomic<int> lf_on_{0};
+    /* Lever SA / HB (ds41-sahb; fn4 stage_short / stage_pick / place_hb): whether each can act (Engine::sahb_setup),
+     * the switches as applied, and the ranks place_hb acts on (RADIANCE_PLACE_HB_RANKS, a bit a rank; all unset). */
+    bool             sa_capable_ = false, hb_capable_ = false;
+    std::atomic<int> stage_short_{0}, stage_pick_{0}, place_hb_{0};
+    uint64_t         hb_mask_ = ~(uint64_t)0;
+    void sahb_setup();
+    void sahb_note();
+    int64_t step_rows(const Rank& r, int step) const;
     int              arena_dec_rungs_ = 0;
     std::atomic<int> arena_d0_{0};
     /* Lever PSK design 2: whether the plugin's ds41_psk has been read for the scheduler (first release, then after every

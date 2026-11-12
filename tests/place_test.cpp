@@ -3812,6 +3812,286 @@ TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     rad_stream_destroy(compute);
 }
 
+/* ---- lever SA (ds41-sahb, fn4 stage_short / stage_pick) --------------------------------------------------------
+ *
+ * The arming rule (sahb_arms, Engine::arena_step): only with the switch on, set up, a step with prefill rows of at
+ * least N tokens at the span's shared level (never the full plan, never another level), where RADIANCE_STAGE_MIXED
+ * lets it arm. Each refusal is its own case, and the one accepted case flips with each input. */
+TEST(sahb_the_short_stager_arms_only_at_the_span_level_and_n) {
+    /* stage_short, capable, enc, has_prefill, n_tok, level, level_rows, span_rows, mixed_ok */
+    CHECK(sahb_arms(1025, true, false, true, 1106, 4, 2112, 2112, true));      /* a c8 newcomer step */
+    CHECK(!sahb_arms(0, true, false, true, 1106, 4, 2112, 2112, true));        /* off: today */
+    CHECK(!sahb_arms(1025, false, false, true, 1106, 4, 2112, 2112, true));    /* not set up */
+    CHECK(!sahb_arms(1025, true, true, true, 1106, 4, 2112, 2112, true));      /* an encoder pass */
+    CHECK(!sahb_arms(1025, true, false, false, 1106, 4, 2112, 2112, true));    /* decode only */
+    CHECK(!sahb_arms(1200, true, false, true, 1106, 4, 2112, 2112, true));     /* fewer than N tokens */
+    CHECK(sahb_arms(1106, true, false, true, 1106, 4, 2112, 2112, true));      /* exactly N */
+    CHECK(!sahb_arms(1025, true, false, true, 3000, 0, 4160, 2112, true));     /* the full plan has its own ring */
+    CHECK(!sahb_arms(1025, true, false, true, 1106, 3, 1024, 2112, true));     /* another level */
+    CHECK(!sahb_arms(1025, true, false, true, 1106, 4, 2112, 0, true));        /* no span's shared level */
+    CHECK(!sahb_arms(1025, true, false, true, 1106, 4, 2112, 2112, false));    /* RADIANCE_STAGE_MIXED says no */
+    CHECK(sahb_arms(1, true, false, true, 2112, 4, 2112, 2112, true));         /* the level's top */
+}
+
+/* The pick: under stage_pick K a stage_short pass copies only the pooled units one of the last K recorded steps
+ * routed; the rest stay at their pool slots (read in place, as unarmed). The copies hold the pool's bytes. Controls:
+ * pick 0 copies every pooled unit, and a full-plan pass (set_short false) ignores the pick. */
+TEST(sahb_a_short_pass_copies_only_the_pooled_units_recent_steps_routed) {
+    Fixture f;
+    const rad_weight emb = f.weight("token_embd.weight", 1 * MiB, RAD_ACCESS_VOCAB, -1, -1);
+    f.op("embed", {emb}, false);
+    std::vector<rad_weight> lw[2];
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e)
+            lw[l].push_back(f.weight("blk." + std::to_string(l) + ".ffn_gate_exps." + std::to_string(e) + ".weight",
+                                     1 * MiB, RAD_ACCESS_CONDITIONAL, l, e));
+    f.op("attn0", {}, false);
+    f.op("moe0", lw[0], false);
+    f.op("attn1", {}, false);
+    f.op("moe1", lw[1], false);
+    Config cfg = base_config();
+    cfg.placement = "expert_tiered";
+    cfg.vram_weights_mib = 12;
+    cfg.host_pool_mib = 64;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    REQUIRE(plan.dynamic);
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(f.prog, plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    /* Each layer's pooled and resident experts. */
+    std::vector<int32_t> pooled[2], resident[2];
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < 8; ++e)
+            (plan.weight[lw[l][(size_t)e]].tier == Tier::HostPinned ? pooled[l] : resident[l]).push_back(e);
+    REQUIRE(pooled[0].size() >= 2 && pooled[1].size() >= 2 && !resident[0].empty());
+    std::vector<void*> home(f.prog.weights.size(), nullptr);
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) home[w] = m.residency()->lookup(w)->ptr;
+
+    const int64_t each = align_up(1 * MiB, RAD_ALIGN_UNIT), half = each * 8;
+    std::vector<char> region((size_t)(4 * half));
+    char* const low = region.data() + 2 * half;
+    auto at = [&](int l, int e) { return (const char*)m.residency()->lookup(lw[l][(size_t)e])->ptr; };
+    auto in_low = [&](int l, int e) { return at(l, e) >= low && at(l, e) < low + 2 * half; };
+    auto in_full = [&](int l, int e) { return at(l, e) >= region.data() && at(l, e) < region.data() + 2 * half; };
+    auto is_home = [&](int l, int e) { return at(l, e) == home[lw[l][(size_t)e]]; };
+
+    PrefillStager st;
+    CHECK_OK(st.init(f.prog, plan, &m, region.data(), low, 2 * half, 64));
+    REQUIRE(st.enabled());
+    RadBatch b{};
+    b.n_tok = 128;
+    bool resync = false;
+
+    /* Step 100 routes each layer's first pooled expert and layer 0's first resident one. */
+    int32_t c0[8] = {}, c1[8] = {};
+    c0[pooled[0][0]] = 5;
+    c0[resident[0][0]] = 3;
+    c1[pooled[1][0]] = 2;
+    st.note_routed(0, c0, 8, 100);
+    st.note_routed(1, c1, 8, 100);
+    st.note_routed(7, c1, 8, 100);                      /* a layer the stager does not serve: ignored */
+    CHECK_EQ(st.sahb().big_steps, (int64_t)1);
+
+    st.set_ring(st.ring_low());
+    st.set_short(true, 1);
+    CHECK(st.begin_pass(&b));
+    CHECK_EQ(st.sahb().expect_units, (int64_t)2);      /* what step 100 would stream in place */
+    CHECK_EQ(st.sahb().expect_bytes, 2 * MiB);
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(resync);
+    CHECK(in_low(0, pooled[0][0]));
+    CHECK(in_low(1, pooled[1][0]));
+    for (int l = 0; l < 2; ++l)
+        for (size_t i = 1; i < pooled[l].size(); ++i) CHECK(is_home(l, pooled[l][i]));
+    for (int e : resident[0]) CHECK(is_home(0, e));    /* a resident unit is never staged */
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_EQ(std::memcmp(at(0, pooled[0][0]), home[lw[0][(size_t)pooled[0][0]]], (size_t)MiB), 0);
+    CHECK_EQ(std::memcmp(at(1, pooled[1][0]), home[lw[1][(size_t)pooled[1][0]]], (size_t)MiB), 0);
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+    const int64_t dropped = (int64_t)(pooled[0].size() + pooled[1].size()) - 2;
+    CHECK_EQ(st.sahb().short_steps, (int64_t)1);
+    CHECK_EQ(st.sahb().short_layers, (int64_t)2);
+    CHECK_EQ(st.sahb().short_units, (int64_t)2);
+    CHECK_EQ(st.sahb().short_bytes, 2 * MiB);
+    CHECK_EQ(st.sahb().pick_kept, (int64_t)2);
+    CHECK_EQ(st.sahb().pick_dropped, dropped);
+
+    /* CONTROL: pick 0 copies every pooled unit of a short pass. */
+    st.set_short(true, 0);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(in_low(l, e));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sahb().short_steps, (int64_t)2);
+    CHECK_EQ(st.sahb().short_units, (int64_t)(2 + pooled[0].size() + pooled[1].size()));
+
+    /* CONTROL: a full-plan pass ignores the pick and is no short pass. */
+    st.set_ring(st.ring_full());
+    st.set_short(false, 1);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(in_full(l, e));
+    CHECK_OK(st.end_pass(compute));
+    CHECK_EQ(st.sahb().short_steps, (int64_t)2);
+
+    /* K: step 101 routes layer 0's second pooled expert only. Under pick 1 that one alone; under pick 2 both steps'. A
+     * histogram of an older step number adds stamps but no step. */
+    int32_t d0[8] = {};
+    d0[pooled[0][1]] = 1;
+    st.note_routed(0, d0, 8, 101);
+    st.note_routed(1, d0, 8, 99);
+    CHECK_EQ(st.sahb().big_steps, (int64_t)2);
+    st.set_ring(st.ring_low());
+    st.set_short(true, 1);
+    CHECK(st.begin_pass(&b));
+    CHECK_EQ(st.sahb().expect_units, (int64_t)1);
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_low(0, pooled[0][1]));
+    CHECK(is_home(0, pooled[0][0]));
+    CHECK(is_home(1, pooled[1][0]));
+    CHECK_OK(st.end_pass(compute));
+    st.set_short(true, 2);
+    CHECK(st.begin_pass(&b));
+    CHECK_OK(st.before_op(0, compute, &resync));
+    CHECK(in_low(0, pooled[0][0]));
+    CHECK(in_low(0, pooled[0][1]));
+    CHECK(in_low(1, pooled[1][0]));
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < 2; ++l)
+        for (int e : pooled[l]) CHECK(is_home(l, e));
+
+    /* An unarmed pass (no ring) copies nothing and counts no short pass, whatever set_short says. */
+    st.set_ring(nullptr);
+    st.set_short(true, 1);
+    const int64_t ss = st.sahb().short_steps;
+    CHECK(!st.begin_pass(&b));
+    CHECK_EQ(st.sahb().short_steps, ss);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_stream_destroy(compute);
+}
+
+/* ---- lever HB (ds41-sahb, fn4 place_hb): the reserve by the long-memory prefill heat ----------------------------
+ *
+ * Fixture: experts 0-3 resident, 4-7 pooled; decode pin 0.5. Prompts route experts 5 and 6; decode rows route 0, 1
+ * (the pinned core) and 2. Without the reserve the prompts' experts leave once their prefill heat decays and the
+ * next prompt streams them; with place_hb 2 the reserve brings them in (ordinary swaps against the unprotected
+ * residents, never the decode core) and keeps them, so the next prompt streams none -- the price is expert 2, which
+ * decode wants, kept out. Back to 0 the ranking is today's again and 2 returns. A rank with the reserve and one
+ * without stream unequal amounts for the same prompt: the balance lever. */
+TEST(sahb_the_hb_reserve_keeps_the_prompts_experts_and_never_the_decode_core) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    hp.prefill_decay = 0.7f;
+    hp.decode_pin = 0.5f;
+    CHECK_OK(h.init(hf.plan, hp));
+    REQUIRE(h.dual());
+    int32_t e[8];
+    for (int i = 0; i < 8; ++i) e[i] = hf.unit_of_expert(i);
+    for (int i = 0; i < 4; ++i) REQUIRE(h.tier(e[i]) == Tier::VRAM);
+    for (int i = 4; i < 8; ++i) REQUIRE(h.tier(e[i]) != Tier::VRAM);
+    bool core_kept = true;
+    std::vector<Swap> sw;
+    auto step_apply = [&] {
+        CHECK_OK(h.step(&sw));
+        for (const Swap& s : sw) {
+            core_kept = core_kept && s.demote != e[0] && s.demote != e[1];
+            h.set_tier(s.promote, Tier::VRAM);
+            h.set_tier(s.demote, Tier::HostPinned);
+            h.set_busy(s.promote, false);
+            h.set_busy(s.demote, false);
+        }
+    };
+    const int32_t dec[8] = {4, 3, 2, 0, 0, 0, 0, 0};
+    const int32_t pf[8] = {0, 0, 0, 0, 0, 40, 30, 0};
+    auto decode = [&](int n) { for (int k = 0; k < n; ++k) { h.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); step_apply(); } };
+    auto prompt = [&] { h.observe(0, pf, 8, 1.0f, 0.0f, 1.0f); step_apply(); };
+    auto streamed = [&] { return (int)(h.tier(e[5]) != Tier::VRAM) + (int)(h.tier(e[6]) != Tier::VRAM); };
+
+    decode(1);
+    for (int p = 0; p < 3; ++p) { prompt(); decode(6); }
+    decode(40);
+    /* Off: today's ranking. The prompts' experts left; expert 2 is back; nothing reserved. */
+    const int streamed_off = streamed();
+    CHECK(streamed_off >= 1);
+    CHECK(h.tier(e[2]) == Tier::VRAM);
+    CHECK_EQ(h.hb_reserve(), 0);
+    CHECK_EQ(h.hb_stats().promotions, (int64_t)0);
+    CHECK(h.heat_prefill_long(e[5]) > 0.0f && h.heat_prefill_long(e[6]) > 0.0f);   /* kept all along */
+    CHECK(h.heat_prefill_long(e[2]) == 0.0f);
+
+    /* place_hb 2: the next step takes the reserve, the next observe ranks by it, and swaps bring 5 and 6 in. */
+    h.set_hb_reserve(2);
+    CHECK_EQ(h.hb_reserve(), 2);
+    decode(3);
+    CHECK_EQ(streamed(), 0);
+    CHECK(h.hb_stats().promotions >= (int64_t)streamed_off);
+    CHECK_EQ(h.hb_stats().reserved, (int64_t)2);
+    CHECK_EQ(h.hb_stats().resident, (int64_t)2);
+    CHECK(h.tier(e[2]) != Tier::VRAM);                 /* the price: decode's expert 2 is out */
+    /* They stay through a long decode stretch and more prompts. */
+    decode(60);
+    prompt();
+    decode(20);
+    CHECK_EQ(streamed(), 0);
+    CHECK(h.tier(e[0]) == Tier::VRAM && h.tier(e[1]) == Tier::VRAM);
+    CHECK(core_kept);
+
+    /* The balance: a second rank with the same history and no reserve streams what the first no longer does. */
+    {
+        HeatEngine g;
+        CHECK_OK(g.init(hf.plan, hp));
+        std::vector<Swap> gs;
+        auto g_apply = [&] {
+            CHECK_OK(g.step(&gs));
+            for (const Swap& s : gs) {
+                g.set_tier(s.promote, Tier::VRAM);
+                g.set_tier(s.demote, Tier::HostPinned);
+                g.set_busy(s.promote, false);
+                g.set_busy(s.demote, false);
+            }
+        };
+        g.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); g_apply();
+        for (int p = 0; p < 3; ++p) {
+            g.observe(0, pf, 8, 1.0f, 0.0f, 1.0f); g_apply();
+            for (int k = 0; k < 6; ++k) { g.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); g_apply(); }
+        }
+        for (int k = 0; k < 43 + 60; ++k) { g.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); g_apply(); }
+        g.observe(0, pf, 8, 1.0f, 0.0f, 1.0f); g_apply();
+        for (int k = 0; k < 20; ++k) { g.observe(0, dec, 8, 1.0f, 1.0f, 0.0f); g_apply(); }
+        const int g_streamed = (int)(g.tier(e[5]) != Tier::VRAM) + (int)(g.tier(e[6]) != Tier::VRAM);
+        CHECK(g_streamed >= 1);
+        CHECK(g.tier(e[2]) == Tier::VRAM);
+    }
+
+    /* Back to 0: no bonus from the next observe on; decode's expert 2 wins its slot back. */
+    h.set_hb_reserve(0);
+    decode(30);
+    CHECK(h.tier(e[2]) == Tier::VRAM);
+    CHECK(core_kept);
+}
+
+/* place_hb without the dual heat is refused by the engine (set_hb_reserve keeps 0). */
+TEST(sahb_the_hb_reserve_needs_the_dual_heat) {
+    HeatFixture hf;
+    HeatEngine h;
+    HeatParams hp;
+    CHECK_OK(h.init(hf.plan, hp));
+    REQUIRE(!h.dual());
+    h.set_hb_reserve(4);
+    CHECK_EQ(h.hb_reserve(), 0);
+}
+
 TEST(mover_reserves_from_the_weight_pool_rather_than_beside_it) {
     /* The production path. Pools has already allocated the weights pool as one block; allocating
      * beside it would spend the budget twice and surface later as an unrelated out-of-memory.

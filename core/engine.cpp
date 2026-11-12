@@ -521,6 +521,28 @@ float Engine::heat_share(const Rank& r, int layer, int step, float* pshare) cons
     return sd;
 }
 
+/* The tokens of trunk step `step` as this rank issued it (Rank::heat_steps), or -1 when the ring no longer holds it. */
+int64_t Engine::step_rows(const Rank& r, int step) const {
+    if (step < 0 || r.heat_steps.empty()) return -1;
+    const Rank::HeatStepRows& s = r.heat_steps[(size_t)(step % Rank::kHeatStepRing)];
+    return s.step == step ? s.n_tok : -1;
+}
+
+/* Lever SA / HB's live counters (GET "sahb"), every step release with every rank parked. */
+void Engine::sahb_note() {
+    for (auto& r : ranks_) {
+        if (r->index >= fn4::kSahbRanks) continue;
+        const PrefillStager::SahbStats& a = r->stager.sahb();
+        const HeatEngine::HbStats h = r->heat.enabled() ? r->heat.hb_stats() : HeatEngine::HbStats{};
+        const int64_t v[fn4::kSahbN] = { a.short_steps, a.short_layers, a.short_units, a.short_bytes, a.pick_kept,
+                                         a.pick_dropped, a.big_steps, a.expect_units, a.expect_bytes,
+                                         a.expect_sum_units, a.expect_n,
+                                         r->heat.enabled() ? (int64_t)r->heat.hb_reserve() : 0, h.reserved,
+                                         h.resident, h.promotions, r->sa_recall_bytes };
+        fn4::note_sahb(r->index, v);
+    }
+}
+
 void Engine::tiering_dispatch(Rank& r, int step) {
     XsTally* const xs = xstats_ ? xstats_->tally(r.index) : nullptr;
     MissRank* const ml = missl_ ? missl_->rank(r.index) : nullptr;
@@ -547,6 +569,11 @@ void Engine::tiering_dispatch(Rank& r, int step) {
         float pshare = 0.0f;
         const float share = heat_share(r, hr.layer, r.ctx.last_histogram_step(hr.layer, hr.bank), &pshare);
         r.heat.observe(hr.layer, hr.h, n_ex, reps > 1 ? (float)reps : 1.0f, share, pshare);
+        /* Lever SA's pick (stage_pick): the routing of a trunk step of the stager's size, by unit. */
+        if (r.stager.enabled()) {
+            const int hs = r.ctx.last_histogram_step(hr.layer, hr.bank);
+            if (step_rows(r, hs) >= r.stager.min_rows()) r.stager.note_routed(hr.layer, hr.h, n_ex, hs);
+        }
         /* The row is in cache now. */
         if (xs) xstats_credit(xs, r.ctx, hr.layer, hr.bank, hr.h);
         if (ml) missl_credit(r, *ml, hr.layer, hr.bank, hr.h, step);
@@ -794,8 +821,8 @@ void Engine::rank_loop(int index) {
             if (xstats_ && what != kIssueSampler && b->enc == 0)
                 if (XsTally* xs = xstats_->tally(index)) xs->issued(*b);
             /* The heat engine's prefill share reads each trunk step's rows at its drain. */
-            if ((heat_prefill_share_ < 1.0f || heat_dual_) && what != kIssueSampler && b->enc == 0 &&
-                b->draft_pass == 0 && b->step >= 0) {
+            if ((heat_prefill_share_ < 1.0f || heat_dual_ || r.stager.enabled()) && what != kIssueSampler &&
+                b->enc == 0 && b->draft_pass == 0 && b->step >= 0) {
                 if (r.heat_steps.empty()) r.heat_steps.resize(Rank::kHeatStepRing);
                 Rank::HeatStepRows& hs = r.heat_steps[(size_t)(b->step % Rank::kHeatStepRing)];
                 hs.step = b->step;
@@ -900,6 +927,24 @@ int Engine::prepare_release(const RadBatch* b) {
                 for (auto& r : ranks_) r->mover.set_place_lf(on == 1);
                 fn4::note_sched(fn4::kPlaceLf, on);
             }
+            /* Lever SA (ds41-sahb): read by the next arena_step (fn4 refuses stage_short > 0 unless set up). */
+            if (sw[fn4::kStageShort] != fn4::kNoChange) {
+                stage_short_.store(sa_capable_ ? std::max(0, sw[fn4::kStageShort]) : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStageShort, stage_short_.load(std::memory_order_relaxed));
+            }
+            if (sw[fn4::kStagePick] != fn4::kNoChange) {
+                stage_pick_.store(std::max(0, sw[fn4::kStagePick]), std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStagePick, stage_pick_.load(std::memory_order_relaxed));
+            }
+            /* Lever HB: every named rank's heat engine, read by its next step() (every rank thread parked). */
+            if (sw[fn4::kPlaceHb] != fn4::kNoChange) {
+                const int R = hb_capable_ ? std::max(0, sw[fn4::kPlaceHb]) : 0;
+                place_hb_.store(R, std::memory_order_relaxed);
+                for (auto& r : ranks_)
+                    if (r->heat.enabled())
+                        r->heat.set_hb_reserve(r->index < 64 && ((hb_mask_ >> r->index) & 1) ? R : 0);
+                fn4::note_sched(fn4::kPlaceHb, R);
+            }
         }
         /* Lever PSK design 2: the plugin's ds41_psk as the scheduler plans by it (2 / 3 anchors), read once and after
          * every change (a request takes it at admission) */
@@ -928,6 +973,7 @@ int Engine::prepare_release(const RadBatch* b) {
     /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
      * parked, so the level can change and a recall can drain both streams. */
     if (const int as = arena_step(b); as < 0) return as;
+    sahb_note();
     /* Grow the followers' pools to match rank 0's before the step's block table is used:
      * admission grew rank 0's cache and the new ids are already in the table. Done here, not on
      * the 100 ms arbiter tick, because the step is about to run; safe because every rank thread is
@@ -2172,8 +2218,19 @@ int Engine::arena_step(const RadBatch* b) {
     const bool lone = b->phase == RAD_PHASE_PREFILL || (b->phase != RAD_PHASE_DECODE && b->n_tok_decode == 0);
     const bool mixed_ok = smode == 1 || lone ||
                           (smode == 2 && b->phase != RAD_PHASE_DECODE && sched_.prefill_has_more());
+    /* Lever SA (ds41-sahb, fn4 stage_short N): a step with prefill rows and at least N tokens at the span's shared
+     * level arms the stager with its ring at lever SA's place (sahb_arms); the step's loan stops below it
+     * (arena_lent_sa), and arena_tick lends it again after the step. 0: today's rule exactly. */
+    const int ssh = stage_short_.load(std::memory_order_relaxed);
+    const bool sa = sahb_arms(ssh, sa_capable_, b->enc != 0, b->phase != RAD_PHASE_DECODE, b->n_tok, level,
+                              arena_last_, arena_span_rows_, mixed_ok);
+    const int spick = stage_pick_.load(std::memory_order_relaxed);
     for (auto& r : ranks_) {
-        const int64_t allow = r->arena_lent[(size_t)level];
+        const int64_t allow = sa ? r->arena_lent_sa[(size_t)level] : r->arena_lent[(size_t)level];
+        /* Lever SA's VRAM price: the loan its step takes back beyond what the level itself would. */
+        if (sa)
+            r->sa_recall_bytes += std::max<int64_t>(
+                0, std::min(r->mover.loan(Mover::kLendArena), r->arena_lent[(size_t)level]) - allow);
         if (r->mover.loan(Mover::kLendArena) > allow ||
             r->mover.loan_held(Mover::kLendArena) > allow) {
             RAD_TRY(rad_dev_set(r->device));
@@ -2190,9 +2247,11 @@ int Engine::arena_step(const RadBatch* b) {
          * lends both. */
         char* const ring = !mixed_ok ? nullptr
                          : level == 0 ? r->stager.ring_full()
-                         : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
+                         : arena_last_ == arena_span_rows_ && (r->arena_low_off >= 0 || sa)
                                ? r->stager.ring_low() : nullptr;
         r->stager.set_ring(ring);
+        /* Lever SA: this step's pick (stage_pick) applies to a stage_short step only. */
+        r->stager.set_short(sa, spick);
         /* The next step's first layers go ahead only from the full plan, into the region at the
          * top that no level's buffers use. At the shared level the ring is memory the full plan
          * computes in, and a copy still going there when such a step starts would race it; a

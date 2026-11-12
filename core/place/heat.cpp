@@ -15,6 +15,8 @@ constexpr int32_t kLanes = 16;
 constexpr int32_t kBlock = 64;
 /* HeatParams::decode_pin: what a protected resident adds to its ranking heat, above any heat. */
 constexpr float kPinBonus = 1.0e9f;
+/* Lever HB: what a reserved unit adds to its ranking heat -- above any heat, below a pinned resident's bonus. */
+constexpr float kResBonus = 1.0e5f;
 }  /* namespace */
 
 int HeatEngine::init(const Plan& plan, const HeatParams& params) {
@@ -119,6 +121,11 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     heat_d_.assign(dual() ? np : 0, 0.0f);
     heat_p_.assign(dual() ? np : 0, 0.0f);
     pin_thr_.assign((size_t)n_cls_, INFINITY);
+    /* Lever HB: kept wherever the dual heat is; ranks nothing until set_hb_reserve. */
+    if (!(params_.hb_decay > 0.0f && params_.hb_decay < 1.0f)) params_.hb_decay = HeatParams{}.hb_decay;
+    heat_pl_.assign(dual() ? np : 0, 0.0f);
+    hb_thr_.assign((size_t)n_cls_, INFINITY);
+    hb_r_ = 0;
     rank_as_.assign(np, 0u);
     routed_as_.assign(np, 0u);
     miss_bytes_.assign(np, 0);
@@ -420,6 +427,10 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
     float* __restrict hl = heat_l_.data() + lo;
     if (dl != 1.0f)
         for (int32_t j = 0; j < len; ++j) hl[j] *= dl;
+    /* Lever HB: the long-memory prefill heat decays once a credited histogram of a step with prefill rows. */
+    float* __restrict hpl = heat_pl_.data() + lo;
+    if (sp > 0.0f)
+        for (int32_t j = 0; j < len; ++j) hpl[j] *= params_.hb_decay;
     /* HeatParams::decode_pin: a protected resident ranks far above any heat, so it is never the
      * cold end. Only residents (rank_as_ 2) and only for the ranking: the heats stay apart. */
     const bool pin = params_.decode_pin > 0.0f;
@@ -430,8 +441,18 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
         const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
         return c >= 0 && hd[j] >= pin_thr_[(size_t)c] ? kPinBonus : 0.0f;
     };
+    /* Lever HB (set_hb_reserve): a reserved unit, resident or not, ranks kResBonus above its heat. */
+    const bool hb = hb_r_ > 0;
+    const auto reserve_bonus = [&](int32_t j) -> float {
+        if (!hb || !(hpl[j] > 0.0f)) return 0.0f;
+        const int32_t u = unit_at_[(size_t)(lo + j)];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        return c >= 0 && hpl[j] >= hb_thr_[(size_t)c] ? kResBonus : 0.0f;
+    };
     if (pin)
         for (int32_t j = 0; j < len; ++j) h[j] += pinned_bonus(j);
+    if (hb)
+        for (int32_t j = 0; j < len; ++j) h[j] += reserve_bonus(j);
     int32_t routed = 0, resident = 0;
     int64_t miss = 0;
     uint32_t sh[kSlotClasses] = {}, sm[kSlotClasses] = {};
@@ -441,7 +462,8 @@ void HeatEngine::observe_dual(int32_t layer, const int32_t* counts, int32_t n, f
         const size_t q = (size_t)(lo + j);
         hd[j] += (float)c * wd;
         hq[j] += (float)c * wp;
-        h[j] = hd[j] + hq[j] + pinned_bonus(j);
+        if (sp > 0.0f) hpl[j] += (float)c * w * sp;
+        h[j] = hd[j] + hq[j] + pinned_bonus(j) + reserve_bonus(j);
         hl[j] += (float)c * wd;
         routed += routed_as_[q] != 0;
         resident += routed_as_[q] == 2;
@@ -476,6 +498,37 @@ void HeatEngine::update_pin() {
         std::nth_element(v.begin(), v.begin() + (std::ptrdiff_t)(k - 1), v.end(), std::greater<float>());
         pin_thr_[c] = std::max(v[k - 1], 1e-6f);
     }
+}
+
+/* Lever HB's thresholds: per class, the long-memory prefill heat of the R-th hottest candidate (movable, not in
+ * flight: rank_as_ 1 or 2), never at or below zero; +inf where the class has none. Also the reserve's counts. */
+void HeatEngine::update_reserve() {
+    hb_tmp_.resize((size_t)n_cls_);
+    for (auto& v : hb_tmp_) v.clear();
+    for (size_t p = 0; p < heat_pl_.size(); ++p) {
+        if (!rank_as_[p] || !(heat_pl_[p] > 0.0f)) continue;
+        const int32_t u = unit_at_[p];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        if (c >= 0) hb_tmp_[(size_t)c].push_back(heat_pl_[p]);
+    }
+    for (size_t c = 0; c < hb_tmp_.size(); ++c) {
+        std::vector<float>& v = hb_tmp_[c];
+        if (v.empty()) { hb_thr_[c] = INFINITY; continue; }
+        const size_t k = std::min(v.size(), (size_t)hb_r_);
+        std::nth_element(v.begin(), v.begin() + (std::ptrdiff_t)(k - 1), v.end(), std::greater<float>());
+        hb_thr_[c] = std::max(v[k - 1], 1e-30f);
+    }
+    int64_t held = 0, res = 0;
+    for (size_t p = 0; p < heat_pl_.size(); ++p) {
+        if (!rank_as_[p] || !(heat_pl_[p] > 0.0f)) continue;
+        const int32_t u = unit_at_[p];
+        const int32_t c = u >= 0 ? cls_[(size_t)u] : -1;
+        if (c < 0 || heat_pl_[p] < hb_thr_[(size_t)c]) continue;
+        ++held;
+        res += rank_as_[p] == 2;
+    }
+    hb_reserved_ = Relaxed<int64_t>(held);
+    hb_resident_ = Relaxed<int64_t>(res);
 }
 
 void HeatEngine::end_rebuild(size_t slot) {
@@ -601,6 +654,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
     if (k <= 0) return RAD_OK;
     /* The next step's protection (HeatParams::decode_pin), from this step's decode heats. */
     if (dual() && params_.decode_pin > 0.0f) update_pin();
+    /* Lever HB: the next step's reserve, from this step's long prefill heats. */
+    if (hb_r_ > 0) update_reserve();
 
     /* Test the best pair from the layers' ends first. If it fails the guard, every pair does,
      * and the dispatch proposes nothing after one entry per layer. The ends' counts also give the
@@ -728,6 +783,11 @@ int HeatEngine::step(std::vector<Swap>* out) {
         s.promote = hot[best * k + m_of[best]].unit;
         s.demote = cold[best * k + m_of[best]].unit;
         ++m_of[best];
+        /* Lever HB: a promotion the reserve's bonus carried (between kResBonus and the pin's bonus). */
+        if (hb_r_ > 0) {
+            const float hh = hot[best * k + m_of[best] - 1].h;
+            if (hh >= 0.5f * kResBonus && hh < 0.5f * kPinBonus) ++hb_promotions_;
+        }
         /* The caller owns the pair until it publishes or abandons it. */
         set_busy(s.promote, true);
         set_busy(s.demote, true);

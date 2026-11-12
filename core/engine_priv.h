@@ -80,6 +80,13 @@ struct Engine::Rank {
     /* Where the prefill stager's ring is at the span's shared level, from the arena's base; -1
      * without that level. */
     int64_t                 arena_low_off = -1;
+    /* Lever SA (ds41-sahb, fn4 stage_short): the ring's place at the span's shared level whether or not that level
+     * keeps it (RADIANCE_STAGE_SPAN=0 lends it), -1 without the level; per Ctx level, the loan a stage_short step
+     * keeps (below the place at the span's shared level, arena_lent elsewhere); the loan bytes stage_short steps took
+     * back beyond their level's (cumulative). */
+    int64_t                 arena_sa_off = -1;
+    std::vector<int64_t>    arena_lent_sa;
+    int64_t                 sa_recall_bytes = 0;
     /* Prefill stager (core/place/stager.h): copies the next routed layer's pooled experts into the
      * top of this rank's arena while a full-plan step runs the layer before. */
     PrefillStager stager;

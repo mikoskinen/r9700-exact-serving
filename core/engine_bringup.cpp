@@ -3337,6 +3337,8 @@ static HeatParams heat_params_from_env() {
     /* Lever LF (ds41-lf): the long-memory decode heat's decay (HeatParams::long_decay), read only by the lent
      * slots' fill under fn4 place_lf 1. */
     if (num("RADIANCE_PLACE_LF_DECAY", &v) && v > 0.0f && v < 1.0f) hp.long_decay = v;
+    /* Lever HB (ds41-sahb): the long-memory prefill heat's decay (HeatParams::hb_decay), read only under fn4 place_hb. */
+    if (num("RADIANCE_PLACE_HB_DECAY", &v) && v > 0.0f && v < 1.0f) hp.hb_decay = v;
     return hp;
 }
 
@@ -4514,6 +4516,7 @@ int Engine::start() {
              * guard, wherever that is below the region at the top (stager.h). */
             int64_t top_level = 0;
             r->arena_low_off = -1;
+            r->arena_sa_off = -1;
             /* RADIANCE_STAGE_SPAN=0: no place at the span's shared level, so that level lends the ring's
              * room to the expert slab too and its steps (every mixed step at --prefill-span) are not
              * staged; only full-plan steps are. 79 (7.11.): with mixed steps unstaged (RADIANCE_STAGE_MIXED
@@ -4522,15 +4525,21 @@ int Engine::start() {
             const bool span_place = !(sse && (!std::strcmp(sse, "0") || !std::strcmp(sse, "off")));
             for (const ArenaLevel& lv : r->arena_levels) {
                 if (lv.rows != arena_span_rows_) { top_level = std::max(top_level, lv.rows); continue; }
-                if (!span_place) continue;
                 const int64_t off = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
                                     RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-                r->arena_low_off = std::min(off, r->program.arena_stage_off);
+                /* Lever SA: the place exists under RADIANCE_STAGE_SPAN=0 too; that level lends it unless a
+                 * stage_short step keeps it (Engine::arena_step). */
+                r->arena_sa_off = std::min(off, r->program.arena_stage_off);
+                if (!span_place) continue;
+                r->arena_low_off = r->arena_sa_off;
             }
             char* const base = (char*)r->ctx.arena_base();
+            /* The ring's second place: the span's shared level's own (RADIANCE_STAGE_SPAN unset), else lever SA's
+             * (the same offset; only a stage_short step uses it there). */
+            const int64_t low_off = r->arena_low_off >= 0 ? r->arena_low_off : r->arena_sa_off;
             RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
                                    base + r->program.arena_stage_off,
-                                   r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
+                                   low_off >= 0 ? base + low_off : nullptr,
                                    r->program.arena_stage_bytes, top_level + 1));
             if (r->stager.enabled() && r->index == 0)
                 RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
@@ -4661,6 +4670,7 @@ int Engine::start() {
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             r->arena_lent.assign(1, 0);
+            r->arena_lent_sa.assign(1, 0);
             const Program& P = r->program;
             const int64_t top = P.arena_bytes;
             for (const ArenaLevel& lv : r->arena_levels) {
@@ -4674,6 +4684,15 @@ int Engine::start() {
                           RAD_ALIGN_UNIT * RAD_ALIGN_UNIT
                     : (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
                 r->arena_lent.push_back(top > edge ? top - edge : 0);
+                /* Lever SA: a stage_short step at that level keeps lever SA's place (below it, what the ring
+                 * would lend); every other level and value lends as above. */
+                int64_t sa = r->arena_lent.back();
+                if (lv.rows == arena_span_rows_ && !ring && r->arena_sa_off >= 0 && r->stager.enabled()) {
+                    const int64_t e2 = (r->arena_sa_off + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
+                                       RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                    sa = std::min(sa, top > e2 ? top - e2 : (int64_t)0);
+                }
+                r->arena_lent_sa.push_back(sa);
             }
             if (!ok) break;
             int64_t most = 0;
@@ -4797,6 +4816,8 @@ int Engine::start() {
         fn4::place_lf_register(lf_capable_);
         fn4::note_sched(fn4::kPlaceLf, on);
     }
+    /* Lever SA / HB (ds41-sahb). */
+    sahb_setup();
 
     /* Immediate recall: when a request needs more cache than is in hand, rank 0's cache calls this
      * from the scheduler between dispatches, with every rank thread parked. Each rank's slab is
@@ -4929,6 +4950,65 @@ const Program& Engine::program() const { return ranks_[0]->program; }
 
 /* ================================================================== dump */
 /* --debug-graph (spec §16); see Engine::dump in engine.h. */
+/* Lever SA / HB (ds41-sahb): what fn4 stage_short / stage_pick / place_hb can act on, said once.
+ *   SA: every rank has a prefill stager and lever SA's place at the span's shared level (arena_sa_off), so a
+ *       stage_short step can keep the ring there (Engine::arena_step).
+ *   HB: every rank runs the dual heat (RADIANCE_HEAT_PREFILL_DECAY). RADIANCE_PLACE_HB_RANKS (a comma list of rank
+ *       indices; unset or empty: every rank) names the ranks place_hb reserves on.
+ * Every switch starts at 0: nothing changes until a request sets one. */
+void Engine::sahb_setup() {
+    bool sa = !ranks_.empty() && arena_span_rows_ > 0;
+    for (auto& r : ranks_)
+        sa = sa && r->stager.enabled() && r->arena_sa_off >= 0 && !r->arena_lent.empty() &&
+             r->arena_lent_sa.size() == r->arena_lent.size();
+    bool hb = !ranks_.empty() && heat_dual_;
+    for (auto& r : ranks_) hb = hb && r->heat.enabled() && r->heat.dual();
+    sa_capable_ = sa;
+    hb_capable_ = hb;
+    hb_mask_ = ~(uint64_t)0;
+    std::string named = "every rank";
+    if (const char* e = getenv("RADIANCE_PLACE_HB_RANKS"); e && *e) {
+        hb_mask_ = 0;
+        named.clear();
+        for (const char* p = e; *p;) {
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p) { ++p; continue; }
+            if (v >= 0 && v < 64) {
+                hb_mask_ |= (uint64_t)1 << v;
+                named += fmt("%s%ld", named.empty() ? "rank " : ", ", v);
+            }
+            p = end;
+        }
+        if (!hb_mask_) named = "none (RADIANCE_PLACE_HB_RANKS names no rank)";
+    }
+    stage_short_.store(0, std::memory_order_relaxed);
+    stage_pick_.store(0, std::memory_order_relaxed);
+    place_hb_.store(0, std::memory_order_relaxed);
+    for (auto& r : ranks_) {
+        r->stager.set_short(false, 0);
+        if (r->heat.enabled()) r->heat.set_hb_reserve(0);
+    }
+    fn4::sahb_register(sa, hb);
+    fn4::note_sched(fn4::kStageShort, 0);
+    fn4::note_sched(fn4::kStagePick, 0);
+    fn4::note_sched(fn4::kPlaceHb, 0);
+    const Rank& r0 = *ranks_[0];
+    int64_t span_lent = 0, span_lent_sa = 0;
+    for (size_t k = 1; k < arena_rows_.size() && k < r0.arena_lent.size() && k < r0.arena_lent_sa.size(); ++k)
+        if (arena_rows_[k] == arena_span_rows_) { span_lent = r0.arena_lent[k]; span_lent_sa = r0.arena_lent_sa[k]; }
+    RAD_INFO("lever SA / HB (ds41-sahb) set up, off: stage_short %s; place_hb %s",
+             sa ? fmt("can arm the prefill stager for a step of %lld .. %lld tokens at the span's shared level (its ring "
+                      "%s at %s of the arena; such a step's loan %s instead of %s)",
+                      (long long)r0.stager.min_rows(), (long long)arena_span_rows_,
+                      humanb(r0.stager.ring_bytes()).c_str(), humanb(r0.arena_sa_off).c_str(),
+                      humanb(span_lent_sa).c_str(), humanb(span_lent).c_str()).c_str()
+                : "not available (no prefill stager or no span's shared level on every rank)",
+             hb ? fmt("can reserve on %s (long prefill heat decay %.2f)", named.c_str(),
+                      (double)heat_params_from_env().hb_decay).c_str()
+                : "not available (no dual heat on every rank)");
+}
+
 int Engine::dump() {
     Program& p = ranks_[0]->program;
     fputs(dump_graph_str(p, nullptr).c_str(), stdout);

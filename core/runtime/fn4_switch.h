@@ -282,6 +282,28 @@
  *                   admitted (waiting requests), pieces, rows, displaced (chunks moved), waited (did not fit), steps
  *                   (steps with a NOA piece) and every step with prefill rows by its prefill entries (pf_steps_1 / 2 / 3
  *                   / 4plus, NOA or not). 0 plans as unset.
+ *   stage_short     engine (lever SA, ds41-sahb: the prefill stager armed for short steps): 0 off (today); N >= 1 a
+ *                   trunk step with prefill rows and at least N tokens that runs at the span's shared arena level
+ *                   (--prefill-span: every step of more than the largest smaller level's rows -- 1024 under
+ *                   RADIANCE_ARENA_LEVEL_MAX=1024 -- up to the shared budget, 2112 on DeepSeek-V4.1) arms the prefill
+ *                   stager with its ring at that level's own place (the one RADIANCE_STAGE_SPAN=0 lends to the slab):
+ *                   the step's arena loan stops below the ring (the slab gives that room back for the step, recalled
+ *                   like any level change), and the loan grows back over it at the next arena tick. Placement only:
+ *                   a staged unit's GEMM reads the same bytes from the ring (stager.h). RADIANCE_STAGE_MIXED still
+ *                   decides which steps with decode rows may arm. Refused where no rank has a stager or the plan has
+ *                   no shared level. Read at every step release.
+ *   stage_pick      engine (lever SA): which pooled units a stage_short step copies. 0 every pooled unit of each
+ *                   routed layer (the stager's rule for full-plan steps); K = 1 .. 64 only those that one of the last K
+ *                   trunk steps of the stager's size (>= its smallest pass) routed (the histograms the heat engine
+ *                   credits); the rest are read in place as without the stager. Full-plan steps always stage every
+ *                   pooled unit.
+ *   place_hb        engine (lever HB, host-link balance): 0 off (today); R = 1 .. 4096 on every rank named by
+ *                   RADIANCE_PLACE_HB_RANKS (a comma list; unset: every rank) the heat engine keeps the R units of each
+ *                   slab class with the highest long-memory prefill heat (prefill rows' credit, decayed
+ *                   RADIANCE_PLACE_HB_DECAY (0.8) a step with prefill rows) ranked above every unprotected resident:
+ *                   promoted by ordinary swaps, never a victim while reserved; the decode-pinned core
+ *                   (RADIANCE_HEAT_DECODE_PIN) stays above them. Needs the dual heat (RADIANCE_HEAT_PREFILL_DECAY) on
+ *                   every rank. Placement only (the same bytes from whichever tier).
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -357,7 +379,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
-              kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa, kSwitches };
+              kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
+              kStageShort, kStagePick, kPlaceHb, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -488,6 +511,13 @@ void place_lf_register(bool capable);
 void note_ctxskip(int64_t skipped, int64_t refill_passes, int64_t refill_rows, int64_t dropped_rows,
                   int64_t ring_full, int64_t pending_rows, int64_t ring_slots, int64_t ring_mib);
 
+/* Lever SA / HB (ds41-sahb). The engine, at bring-up: whether stage_short can act (a prefill stager and a span's shared
+ * level on every rank) and whether place_hb can (the dual heat on every rank). */
+void sahb_register(bool stage_capable, bool hb_capable);
+/* The engine, at every step release (every rank thread parked): lever SA / HB's live counters (GET "sahb"), kSahbN
+ * per rank for up to kSahbRanks ranks (see state_json). */
+constexpr int kSahbN = 16, kSahbRanks = 8;
+void note_sahb(int rank, const int64_t* v);
 /* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. */
 bool check(const std::string& name, int value, std::string* err);
 /* Server thread: queue a value; false (with the reason) for anything check() refuses. */

@@ -28,7 +28,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_lend_w", "draft_occ", "draft_occ_k", "place_lf", "sched_bi_chunk",
                                         "sched_interleave", "sched_mixed_tok", "sched_short_bypass",
                                         "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_psk_l20",
-                                        "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa" };
+                                        "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa", "stage_short",
+                                        "stage_pick", "place_hb" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -82,6 +83,9 @@ struct State {
     std::atomic<int> max_tok{0};                            /* sched_short_bypass's ceiling */
     std::atomic<int64_t> dst[2];                            /* note_sched_dst: bypassed, turned away */
     std::atomic<int64_t> noa[kNoaCounts];                   /* note_sched_noa (lever NOA) */
+    std::atomic<int> stage_capable{-1}, hb_capable{-1};     /* lever SA / HB: -1 no engine registered, 0 / 1 */
+    std::atomic<int64_t> sahb[kSahbRanks][kSahbN];          /* note_sahb */
+    std::atomic<int> sahb_ranks{0};
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
@@ -107,6 +111,8 @@ struct State {
         for (auto& c : smp) c.store(0, std::memory_order_relaxed);
         for (auto& c : dst) c.store(0, std::memory_order_relaxed);
         for (auto& c : noa) c.store(0, std::memory_order_relaxed);
+        for (auto& r : sahb)
+            for (auto& c : r) c.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -204,6 +210,10 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : s.mixed_start.load(std::memory_order_acquire);
     }
+    if (i == kStageShort || i == kStagePick || i == kPlaceHb) {   /* lever SA / HB: set, else 0 (off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v > 0 ? v : 0;
+    }
     if (i == kSchedShortBypass || i == kSchedBypassTotal || i == kSchedNoa) {   /* lever DST / NOA: set, else 0 (off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : 0;
@@ -217,7 +227,8 @@ bool sched_switch(int i) {
     return i == kDraftAdaptive || i == kDraftDepth0 || i == kDraftProbe || i == kDraftHybrid ||
            i == kDraftHybridMatch || i == kDraftProbeBackoff || i == kDraftLend || i == kDraftLendBorrow ||
            i == kDraftCtxSkip || i == kDraftLendHyst || i == kArenaD0 || i == kDraftLendW ||
-           i == kDraftOcc || i == kDraftOccK || i == kPlaceLf || i == kDs41PskK;
+           i == kDraftOcc || i == kDraftOccK || i == kPlaceLf || i == kDs41PskK || i == kStageShort ||
+           i == kStagePick || i == kPlaceHb;
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -324,6 +335,18 @@ void ctxskip_register(bool capable) { st().ctxskip_capable.store(capable ? 1 : 0
 void arena_d0_register(bool capable) { st().arena_d0_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void draft_w_register(bool capable) { st().draft_w_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void place_lf_register(bool capable) { st().place_lf_capable.store(capable ? 1 : 0, std::memory_order_release); }
+void sahb_register(bool stage_capable, bool hb_capable) {
+    State& s = st();
+    s.stage_capable.store(stage_capable ? 1 : 0, std::memory_order_release);
+    s.hb_capable.store(hb_capable ? 1 : 0, std::memory_order_release);
+}
+void note_sahb(int rank, const int64_t* v) {
+    if (rank < 0 || rank >= kSahbRanks || !v) return;
+    State& s = st();
+    for (int k = 0; k < kSahbN; ++k) s.sahb[rank][k].store(v[k], std::memory_order_relaxed);
+    int n = s.sahb_ranks.load(std::memory_order_relaxed);
+    while (n < rank + 1 && !s.sahb_ranks.compare_exchange_weak(n, rank + 1, std::memory_order_relaxed)) {}
+}
 void note_lend_w(int64_t lent, int64_t lends, int64_t reclaims, int64_t lent_units, int64_t mib) {
     State& s = st();
     const int64_t v[5] = { lent, lends, reclaims, lent_units, mib };
@@ -479,7 +502,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
-                        "ds41_psk_cr, ds41_engdd, sched_noa, epoch_bump)";
+                        "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -546,6 +569,30 @@ bool check(const std::string& name, int v, std::string* err) {
                 *err = std::string("place_lf=1 refused: ") +
                        (cap < 0 ? "no engine has registered its placement"
                                 : "placement is static here (no heat engine on every rank): nothing fills lent slots");
+            return false;
+        }
+        return true;
+    }
+    if (i == kStageShort || i == kStagePick || i == kPlaceHb) {   /* lever SA / HB (ds41-sahb) */
+        const int hi = i == kStageShort ? 65536 : i == kStagePick ? 64 : 4096;
+        if (v < 0 || v > hi) {
+            if (err)
+                *err = i == kStageShort ? "stage_short takes 0 (off) or 1 .. 65536 (the fewest tokens a step at the span's "
+                                          "shared level arms the prefill stager at)"
+                     : i == kStagePick  ? "stage_pick takes 0 (every pooled unit) or 1 .. 64 (the units one of the last K "
+                                          "stager-size trunk steps routed)"
+                                        : "place_hb takes 0 (off) or 1 .. 4096 (units a named rank keeps resident by the "
+                                          "long-memory prefill heat)";
+            return false;
+        }
+        const int cap = (i == kPlaceHb ? s.hb_capable : s.stage_capable).load(std::memory_order_acquire);
+        if (v > 0 && i != kStagePick && cap != 1) {
+            if (err)
+                *err = std::string(kNames[i]) + "=" + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "no engine has registered it"
+                        : i == kPlaceHb ? "no dual heat on every rank (RADIANCE_HEAT_PREFILL_DECAY at start, a dynamic plan)"
+                                        : "no prefill stager with a span's shared level on every rank (--prefill-span > 1, "
+                                          "a dynamic plan with a staging region)");
             return false;
         }
         return true;
@@ -905,7 +952,7 @@ bool apply_pending(int step, int* sched) {
         }
         if (reported(s, i) == v) {
             if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
-                i == kSchedBypassTotal || i == kSchedNoa)
+                i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
@@ -979,6 +1026,24 @@ std::string state_json() {
         o += std::string(k ? ", " : "") + "\"" + kAcc[k] + "\": " +
              std::to_string((long long)s.acc[k].load(std::memory_order_relaxed));
     o += "}";
+    /* Lever SA / HB (ds41-sahb), once an engine registered (capable or not): per rank, cumulative unless noted. */
+    if (const int sc = s.stage_capable.load(std::memory_order_acquire); sc >= 0) {
+        static const char* const kSa[kSahbN] = {
+            "short_steps", "short_layers", "short_units", "short_bytes", "pick_kept", "pick_dropped", "big_steps",
+            "expect_units", "expect_bytes", "expect_sum_units", "expect_n", "hb_reserve", "hb_reserved", "hb_resident",
+            "hb_promotions", "sa_recall_bytes" };
+        o += ", \"sahb\": {\"stage_capable\": " + std::to_string(sc) +
+             ", \"hb_capable\": " + std::to_string(s.hb_capable.load(std::memory_order_acquire)) + ", \"ranks\": [";
+        const int nr = s.sahb_ranks.load(std::memory_order_relaxed);
+        for (int r = 0; r < nr && r < kSahbRanks; ++r) {
+            o += std::string(r ? ", " : "") + "{\"rank\": " + std::to_string(r);
+            for (int k = 0; k < kSahbN; ++k)
+                o += std::string(", \"") + kSa[k] + "\": " +
+                     std::to_string((long long)s.sahb[r][k].load(std::memory_order_relaxed));
+            o += "}";
+        }
+        o += "]}";
+    }
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {
         static const char* const kLend[18] = { "lent_cycles", "lent_plain_steps", "lent_plain_ms", "lent_probe_steps",

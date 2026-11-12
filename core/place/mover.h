@@ -713,6 +713,10 @@ public:
                      RadEvent after, RadEvent done, std::vector<int32_t>* staged);
     void unstage_units(const std::vector<int32_t>& staged);
     int64_t stage_need(const std::vector<int32_t>& units, int64_t* largest = nullptr) const;
+    /* Lever SA's counters: a unit's bytes (0 for an index out of range). */
+    int64_t unit_bytes_of(int32_t unit) const {
+        return unit >= 0 && (size_t)unit < unit_.size() ? unit_[(size_t)unit].bytes : 0;
+    }
 
     /* ---- routed layers read from the container: the file stager (core/place/stager.h) --------
      *
