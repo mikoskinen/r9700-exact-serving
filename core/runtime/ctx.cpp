@@ -1136,8 +1136,15 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
     if (!t) {
         if (step_status_ >= 0) {
             tape_refused_.push_back(key);
-            RAD_WARN("rank %d: draft pass %d at %lld tokens is issued in full every step: %s",
-                     rank_, b->draft_pass, (long long)b->n_tok, rad_dev_last_error());
+            /* fn4 SDMA-AR: every prefill pass with a copy-engine collective stays untaped (rad_tape_refuse); said once */
+            const char* why = rad_dev_last_error();
+            static thread_local bool said_sdma = false;
+            const bool sdma = why && std::strstr(why, "fn4 SDMA");
+            if (!sdma || !said_sdma)
+                RAD_WARN("rank %d: draft pass %d at %lld tokens is issued in full every step: %s%s",
+                         rank_, b->draft_pass, (long long)b->n_tok, why,
+                         sdma ? " (later passes untaped for the same reason are not reported)" : "");
+            if (sdma) said_sdma = true;
         }
         return 0;
     }

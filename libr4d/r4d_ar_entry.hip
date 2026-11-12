@@ -34,6 +34,82 @@
 #include <mutex>
 #include <vector>
 #include <chrono>
+#include <dlfcn.h>
+#include <hip/hip_runtime.h>
+
+/* fn4 SDMA-AR (r4d_ar_sdma.hip): the exact collectives with the peer bytes on the copy engines. */
+extern "C" {
+void* r4d_sdma_ar_create(int world, int rank, int dev, int engine, long long max_numel, int scr_mode, char* why, int cap);
+void  r4d_sdma_ar_destroy(void* p);
+int   r4d_sdma_ar_launch_tab(void* p, const void* in, void* out, long long numel, const long long* tab, int mode,
+                             hipStream_t st);
+int   r4d_sdma_untaped_ok(void);
+}
+
+/* fn4 SDMA-AR (12.11.2026; RADIANCE_FN4_AR_SDMA, rad_fn4_switch("ar_sdma")): 1 = a prefill piece's collectives at
+ * `overlap` 1 -- the lane all-reduce (ar_twoshot_4rank_exact_lane: the coded / plain CU two-shot otherwise) and SP's raw
+ * reduce_scatter_rows / all_gather_rows -- move their peer bytes on each card's SDMA engine; the compute units only
+ * fold (the same fp32 ascending-rank sum, the same rounding) and copy the gathered shards out of the scratch: the same
+ * bytes, with the CUs left to the compute beside them (sdma1 12.11.: a VRAM-bound kernel stream lost 162-199 us an
+ * all-reduce at 10.5 MB against 486 us beside the CU xpush two-shot). Declared by setting the variable (0 or 1, its
+ * start value): build() then gives every four-rank P2P bf16 instance whose bound lies in [sdma_min, R4D_SDMA_CAP_MB] a
+ * copy-engine context (collective; ~4x the bound's bytes of fine-grained scratch a card). Messages under sdma_min
+ * (R4D_SDMA_MIN_ELEMS, 1048576: above every decode and verify height) keep the CU forms. A pass recording a tape
+ * cannot replay copy-engine lists, so such a pass's tape is refused (rad_tape_refuse, core/device/aql.cpp) and the pass
+ * stays live: every rank always takes the same path. -1 until the environment is read; a launch parameter `sdma`
+ * overrides the switch (r4d_selftest --sdmaeng4). */
+static std::atomic<int> g_ar_sdma{-1};
+static int sdma_declared() {
+    const char* e = std::getenv("RADIANCE_FN4_AR_SDMA");
+    return e && *e ? 1 : 0;
+}
+static int ar_sdma_switch() {
+    int v = g_ar_sdma.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_SDMA");
+        const int on = (e && *e && std::atoi(e) > 0) ? 1 : 0;
+        int want = -1;
+        g_ar_sdma.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_ar_sdma.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+extern "C" int r4d_ar_sdma_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    if (on && !sdma_declared()) return -1;   /* no context was built: declare with RADIANCE_FN4_AR_SDMA */
+    g_ar_sdma.store(on, std::memory_order_relaxed);
+    return 1;
+}
+static long long sdma_min() {
+    static const long long m = [] {
+        const char* e = std::getenv("R4D_SDMA_MIN_ELEMS");
+        const long long v = e && *e ? std::atoll(e) : 0;
+        return v > 0 ? v : 1048576LL;
+    }();
+    return m;
+}
+static long long sdma_cap_bytes() {
+    static const long long m = [] {
+        const char* e = std::getenv("R4D_SDMA_CAP_MB");
+        const long long v = e && *e ? std::atoll(e) : 0;
+        return (v > 0 ? v : 32LL) << 20;
+    }();
+    return m;
+}
+/* Whether a copy-engine launch may run now: the core's rad_tape_refuse (an open tape is marked unplayable, so the pass
+ * stays live on every rank), or no tapes in this process at all (r4d_selftest). Without either, never. */
+static int sdma_tape_ok() {
+    using RefuseFn = int (*)(const char*);
+    static RefuseFn refuse = [] { return (RefuseFn)dlsym(RTLD_DEFAULT, "rad_tape_refuse"); }();
+    if (refuse) { refuse("fn4 SDMA all-reduce: copy-engine lists a tape cannot replay"); return 1; }
+    if (r4d_sdma_untaped_ok()) return 1;
+    static std::once_flag said;
+    std::call_once(said, [] {
+        std::fprintf(stderr, "[r4d] fn4 SDMA-AR: this engine exports no rad_tape_refuse, so the copy-engine path "
+                             "stays off (the CU collectives serve)\n");
+    });
+    return 0;
+}
 
 static_assert(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS == 268435456,
               "r4d_rows.cpp restates this bound; libr4d changed it");
@@ -130,6 +206,8 @@ struct ArInst {
     /* Messages under these sizes (elements) run even and in one piece, whatever is configured. */
     long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
     long long pieces_min  = R4D_AR8_MIN_ELEMS_DEFAULT;
+    /* fn4 SDMA-AR: the copy-engine context (r4d_ar_sdma.hip), or null (see g_ar_sdma). */
+    void* sdma = nullptr;
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -412,7 +490,25 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
 
     /* Second barrier: no rank may launch until every rank has enabled peer access, or the first
      * message would be pushed into a mapping the receiver has not opened. */
-    return rv_barrier(world);
+    rc = rv_barrier(world);
+    if (rc != RAD_OK) return rc;
+
+    /* fn4 SDMA-AR: the copy-engine context, collective (every rank's conditions are the same: the environment, the world,
+     * the dtype and the bound). A failure leaves every rank without one; the CU forms then serve. */
+    if (sdma_declared() && world == 4 && !host && dtype_code == 0 && max_numel >= sdma_min() &&
+        max_numel * in->esize <= sdma_cap_bytes() && max_numel % 8 == 0) {
+        const char* ee = std::getenv("R4D_SDMA_ENGINE");
+        const int engine = ee && *ee ? std::atoi(ee) : 1;   /* the core's DMA lane has engine 0 */
+        char why[256] = { 0 };
+        in->sdma = r4d_sdma_ar_create(world, rank, dev, engine, max_numel, 1, why, (int)sizeof why);
+        if (rank == 0)
+            std::fprintf(stderr, in->sdma ? "[r4d] fn4 SDMA-AR: copy-engine context (engine %d) for messages of %lld to "
+                                            "%lld elements%s\n"
+                                          : "[r4d] fn4 SDMA-AR: no copy-engine context (engine %d, %lld..%lld elements): "
+                                            "%s; the CU forms serve\n",
+                         engine, sdma_min(), max_numel, in->sdma ? "" : why);
+    }
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ one world, shared
@@ -493,6 +589,7 @@ void release(ArInst* in) {
     r4d_ar_ipc_free(in->my_seq);
     r4d_ar_ipc_free(in->locpack);
     r4d_ar_ipc_free(in->my_stage);
+    r4d_sdma_ar_destroy(in->sdma);
     delete in;
 }
 
@@ -1002,6 +1099,19 @@ extern "C" int r4d_ar_xpush_set(int on) {
     return 1;
 }
 
+/* r4d_selftest --sdmaeng4: whether an instance got a copy-engine context at build. */
+extern "C" int r4d_ar_inst_sdma(const void* inst) { return inst && ((const ArInst*)inst)->sdma ? 1 : 0; }
+
+/* fn4 SDMA-AR: whether this launch takes the copy-engine path (see g_ar_sdma): a context, the switch (or the launch's
+ * `sdma`), a prefill-sized message at `overlap` 1, and a tape that may be refused. The same answer on every rank. */
+static bool sdma_route(const RadArgs* a, const ArInst* in, long long numel) {
+    if (!in->sdma || in->world != 4 || in->dtype != 0 || in->host) return false;
+    if (numel < sdma_min() || numel > in->max_numel) return false;
+    if (r4d_geti_or(a, "overlap", 0) != 1) return false;
+    if (r4d_geti_or(a, "sdma", ar_sdma_switch()) <= 0) return false;
+    return sdma_tape_ok() != 0;
+}
+
 extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 0);
@@ -1119,6 +1229,14 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
      * beside them. `coded` 0, a launch parameter no declaration carries, keeps the plain wire:
      * r4d_selftest's plain arm. */
     const bool lane = r4d_geti_or(a, "overlap", 0) == 1;
+    /* fn4 SDMA-AR: a prefill piece's lane all-reduce on the copy engines (the even shard table, the same fold); the
+     * engine ends the link hold behind the launch (RAD_OK). */
+    if (lane && sdma_route(a, in, c.numel)) {
+        const int src = r4d_sdma_ar_launch_tab(in->sdma, (const void*)c.inp, (void*)c.out, c.numel, nullptr, 0,
+                                               (hipStream_t)s);
+        if (src != RAD_OK) return src;
+        return RAD_OK;
+    }
     if (lane && r4d_geti_or(a, "coded", 1) != 0 &&
         r4d_ar_twoshot_coded_ok(c.numel, in->dtype, 4, in->slot16)) {
         const long gate = link_gate(a), early = in->host ? 0L : gate;
@@ -1338,6 +1456,20 @@ static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
     }
     if (c.nthreads % 32) return RAD_E_INVAL;
     const ArInst* in = c.in;
+    /* fn4 SDMA-AR: the raw halves of a prefill piece on the copy engines, over the same whole-row shards (q = ceil(rows /
+     * 4) rows a rank); the reduce-scatter's fold is the raw kernel's (fp32 from 0, ascending rank, one rounding). */
+    if ((op == 2 || op == 3) && in->dtype == 0 && sdma_route(a, in, c.numel)) {
+        const long q = (rows + 3) / 4;
+        long long tab[5];
+        for (int sh = 0; sh <= 4; ++sh) {
+            const long lo = sh * q < rows ? sh * q : rows;
+            tab[sh] = (long long)lo * row * 2 / 16;
+        }
+        const int src = r4d_sdma_ar_launch_tab(in->sdma, (const void*)c.inp, (void*)c.out, c.numel, tab,
+                                               op == 3 ? 1 : 2, (hipStream_t)s);
+        if (src != RAD_OK) return src;
+        return RAD_OK;
+    }
     const long gate = link_gate(a), early = in->host ? 0L : gate;
     R4D_TRY("sp_rows_4rank",
         r4d_ar_sp_rows_4rank(op, in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],

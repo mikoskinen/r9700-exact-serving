@@ -53,6 +53,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cerrno>
 #include <cstdarg>
@@ -30579,6 +30580,15 @@ struct SdmaApi {
     void (*ar_destroy)(void*) = nullptr;
     unsigned int (*ar_error)(void*) = nullptr;
     int (*ar_launch)(void*, const void*, void*, long long, hipStream_t, int) = nullptr;
+    /* fn4 SDMA-AR engine path (--sdmaeng4) and the timeline (R4D_SDMA_TL) */
+    int (*ar_launch_tab)(void*, const void*, void*, long long, const long long*, int, hipStream_t) = nullptr;
+    int (*tl_on)(void*, int) = nullptr;
+    long long (*tl_read)(void*, unsigned long long*) = nullptr;
+    void (*allow_untaped)(int) = nullptr;
+    int (*k_check2)(hipStream_t, const void*, long long, int, int, int, long long, long long, long long, unsigned int,
+                    unsigned long long*) = nullptr;
+    int (*k_cmp)(hipStream_t, const void*, const void*, long long, unsigned long long*) = nullptr;
+    int (*inst_sdma)(const void*) = nullptr;
 };
 static SdmaApi g_sdma;
 
@@ -30594,6 +30604,10 @@ static bool sdma_api(const Plugin& pl) {
     get("r4d_sdma_k_stream", &g_sdma.k_stream); get("r4d_sdma_k_gen", &g_sdma.k_gen); get("r4d_sdma_k_check", &g_sdma.k_check);
     get("r4d_sdma_ar_create", &g_sdma.ar_create); get("r4d_sdma_ar_destroy", &g_sdma.ar_destroy);
     get("r4d_sdma_ar_error", &g_sdma.ar_error); get("r4d_sdma_ar_launch", &g_sdma.ar_launch);
+    get("r4d_sdma_ar_launch_tab", &g_sdma.ar_launch_tab); get("r4d_sdma_ar_timeline", &g_sdma.tl_on);
+    get("r4d_sdma_ar_timeline_read", &g_sdma.tl_read); get("r4d_sdma_allow_untaped", &g_sdma.allow_untaped);
+    get("r4d_sdma_k_check2", &g_sdma.k_check2); get("r4d_sdma_k_cmp", &g_sdma.k_cmp);
+    get("r4d_ar_inst_sdma", &g_sdma.inst_sdma);
     return okall;
 }
 
@@ -30970,12 +30984,21 @@ struct SdmaArT {
     /* per size */
     std::vector<long long> bad_oop, bad_inp, bad_cu, launches;
     std::vector<double> us_sdma, us_cu, us_rs, us_ag;
+    /* R4D_SDMA_TL=1: the full all-reduce's per-launch phases (medians over the last timed launches, us): the chain wait,
+     * go1 -> the first hop landed, the fold, go2 -> the second hop landed, the assemble, the gap to the next launch;
+     * and us_sdma1 / us_sdma2 apart (the timeline on the second only) */
+    std::vector<std::array<double, 6>> ph;
+    std::vector<double> us_s1, us_s2;
 };
 
 static void sdma_ar_worker(SdmaArT* t) {
     const size_t ns = t->sizes.size();
     t->bad_oop.assign(ns, -1); t->bad_inp.assign(ns, -1); t->bad_cu.assign(ns, -1); t->launches.assign(ns, 0);
     t->us_sdma.assign(ns, 0); t->us_cu.assign(ns, 0); t->us_rs.assign(ns, 0); t->us_ag.assign(ns, 0);
+    t->ph.assign(ns, std::array<double, 6>{}); t->us_s1.assign(ns, 0); t->us_s2.assign(ns, 0);
+    const bool tl_want = std::getenv("R4D_SDMA_TL") && std::atoi(std::getenv("R4D_SDMA_TL")) > 0;
+    int wall_khz = 0;
+    if (hipDeviceGetAttribute(&wall_khz, hipDeviceAttributeWallClockRate, t->dev) != hipSuccess || wall_khz <= 0) wall_khz = 100000;
     if (st_set_device(t->dev) != hipSuccess) t->rc = RAD_E_DEVICE;
     int64_t most = 0;
     for (int64_t n : t->sizes) most = std::max(most, n);
@@ -31077,7 +31100,29 @@ static void sdma_ar_worker(SdmaArT* t) {
         const double s1 = timed(0);
         const double c1 = t->cu ? timed(1) : 0.0;
         const double c2 = t->cu ? timed(1) : 0.0;
+        const bool tl = tl_want && ok && g_sdma.tl_on(ar, 1) == RAD_OK;
         const double s2 = timed(0);
+        if (tl) {
+            std::vector<unsigned long long> st((size_t)64 * 8);
+            const long long last = g_sdma.tl_read(ar, st.data());
+            std::vector<double> d[6];
+            const double tick_us = 1000.0 / (double)wall_khz;
+            for (long long v = std::max(1ll, last - std::min(63, t->iters - 1)); v <= last && last > 0; ++v) {
+                const unsigned long long* x = &st[(size_t)(v % 64) * 8];
+                d[0].push_back((double)(x[1] - x[0]) * tick_us);
+                d[1].push_back((double)(x[2] - x[1]) * tick_us);
+                d[2].push_back((double)(x[3] - x[2]) * tick_us);
+                d[3].push_back((double)(x[4] - x[3]) * tick_us);
+                d[4].push_back((double)(x[5] - x[4]) * tick_us);
+                if (v < last) d[5].push_back((double)(st[(size_t)((v + 1) % 64) * 8] - x[5]) * tick_us);
+            }
+            for (int k = 0; k < 6; ++k) {
+                std::sort(d[k].begin(), d[k].end());
+                t->ph[si][(size_t)k] = d[k].empty() ? 0.0 : d[k][d[k].size() / 2];
+            }
+            g_sdma.tl_on(ar, 0);
+        }
+        t->us_s1[si] = s1; t->us_s2[si] = s2;
         t->us_sdma[si] = 0.5 * (s1 + s2);
         t->us_cu[si] = 0.5 * (c1 + c2);
         t->us_rs[si] = timed(2);
@@ -31162,12 +31207,323 @@ static void sdma_ar4(const Plugin& pl, const char* spec, int iters) {
                     ur > 0 ? sent1 / (ur * 1e3) : 0.0);
         std::printf("    SDMA AG half             %9.1f us  %6.2f GB/s a rank a direction (timed only)\n", ua,
                     ua > 0 ? sent1 / (ua * 1e3) : 0.0);
+        {
+            std::string sp;
+            for (const SdmaArT& x : t) sp += fmt(" %.1f/%.1f", x.us_s1[si], x.us_s2[si]);
+            std::printf("    SDMA AR first / second timing by rank (us):%s\n", sp.c_str());
+        }
+        if (std::getenv("R4D_SDMA_TL") && std::atoi(std::getenv("R4D_SDMA_TL")) > 0) {
+            std::printf("    SDMA AR phases by rank (median us of the last timed launches): chain-wait | go1 -> hop 1 landed | "
+                        "fold | go2 -> hop 2 landed | assemble | gap to the next launch\n");
+            for (const SdmaArT& x : t)
+                std::printf("      rank %d  %7.1f | %7.1f | %7.1f | %7.1f | %7.1f | %7.1f\n", x.rank, x.ph[si][0], x.ph[si][1],
+                            x.ph[si][2], x.ph[si][3], x.ph[si][4], x.ph[si][5]);
+            std::string js;
+            for (const SdmaArT& x : t)
+                js += fmt("%s[%.1f, %.1f, %.1f, %.1f, %.1f, %.1f]", x.rank ? ", " : "", x.ph[si][0], x.ph[si][1], x.ph[si][2],
+                          x.ph[si][3], x.ph[si][4], x.ph[si][5]);
+            std::printf("SDMAPH {\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"phases_us\": [%s]}\n",
+                        (long long)(sizes[si] / widths[si]), (long long)widths[si], bytes / 1e6, js.c_str());
+        }
         std::printf("SDMAAR %s\n", fmt("{\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"engine\": %d, \"scr\": %d, \"launches\": %lld, "
                                        "\"bad_oop\": %lld, \"bad_inplace\": %lld, \"bad_vs_cu\": %lld, \"us_sdma\": %.1f, \"us_cu\": %.1f, "
                                        "\"us_rs\": %.1f, \"us_ag\": %.1f, \"failed\": %s}",
                                        (long long)(sizes[si] / widths[si]), (long long)widths[si], bytes / 1e6, engine, scr, nl / W, bo,
                                        bi, bc, us, uc, ur, ua, any_fail ? "true" : "false").c_str());
         if (bo || bi || bc || any_fail) ++g_fail;
+    }
+}
+
+/* --sdmaeng4 RxW[,RxW..] [iters]: fn4 SDMA-AR through the ENGINE path -- the rows the Qwen prefill lane launches
+ * (ar_twoshot_4rank_exact_lane, sp_rs_rows_4rank_ti8_lane raw 1, sp_ag_rows_4rank_lane raw 1, all at overlap 1 on one
+ * shared instance, its copy-engine context built by init as the engine builds it: RADIANCE_FN4_AR_SDMA set), launched
+ * with `sdma` 0 (today's CU forms: the coded lane two-shot, the raw RS xpush, the raw AG) and 1 (the copy engines).
+ *   checks (R4D_SDMA_CHECKS iterations, default 200): per iteration on fresh generated inputs, CU into buffer A and SDMA
+ *     into buffer B: the all-reduce; the reduce-scatter, then the all-gather of its result; an all-gather alone; a burst
+ *     of eight back to back (RS AG AR AR RS AG AG AR) -- A and B compared word for word after each, B also against the
+ *     fp32 ascending-rank fold (or the halves' expectations); every launch of both paths on one stream, the CU and SDMA
+ *     launches interleaved on the one instance as the engine interleaves decode and prefill;
+ *   cross-stream: rounds of eight SDMA launches over eight buffers alternating two streams with no event between them
+ *     (the context's device-side chain alone orders them), each buffer checked against its expectation;
+ *   timed: each op x sdma 0 / 1, back to back alone; then beside a VRAM-bound kernel stream on a second stream (the
+ *     prefill's compute lane): the collectives' time and the kernel stream's loss per collective. */
+struct SdmaEngT {
+    int rank = 0, dev = 0, world = 4, iters = 50, checks = 200;
+    std::vector<int64_t> sizes, widths;
+    const RadKernelInfo* row[3] = { nullptr, nullptr, nullptr };   /* AR lane, RS, AG */
+    StBarrier* bar = nullptr;
+    int rc = RAD_OK, has_ctx = 0;
+    std::string why;
+    unsigned int err = 0;
+    std::vector<long long> bad_cmp, bad_ana, bad_x, nchk;
+    std::vector<std::array<double, 6>> us_alone, us_with, k_with;   /* [op * 2 + sdma] */
+    std::vector<double> k_alone;
+};
+
+static void sdma_eng_worker(SdmaEngT* t) {
+    const int W = t->world, r = t->rank;
+    const size_t ns = t->sizes.size();
+    t->bad_cmp.assign(ns, -1); t->bad_ana.assign(ns, -1); t->bad_x.assign(ns, -1); t->nchk.assign(ns, 0);
+    t->us_alone.assign(ns, std::array<double, 6>{}); t->us_with.assign(ns, std::array<double, 6>{});
+    t->k_with.assign(ns, std::array<double, 6>{}); t->k_alone.assign(ns, 0);
+    if (st_set_device(t->dev) != hipSuccess) t->rc = RAD_E_DEVICE;
+    int64_t most = 0;
+    for (int64_t n : t->sizes) most = std::max(most, n);
+    hipStream_t s1 = nullptr, s2 = nullptr, s3 = nullptr;
+    if (t->rc == RAD_OK && (hipStreamCreateWithFlags(&s1, hipStreamNonBlocking) != hipSuccess ||
+                            hipStreamCreateWithFlags(&s2, hipStreamNonBlocking) != hipSuccess ||
+                            hipStreamCreateWithFlags(&s3, hipStreamNonBlocking) != hipSuccess))
+        t->rc = RAD_E_DEVICE;
+    /* collective: every rank inits the three rows in the same order (one build, two cache hits) */
+    void* inst[3] = { nullptr, nullptr, nullptr };
+    std::vector<RadParam> ip = { PI("world_size", W), PI("numel", most), PS("dtype", "bf16"), PI("exact", 1), PI("overlap", 1) };
+    for (int k = 0; k < 3; ++k) {
+        const int irc = t->row[k]->init(ip.data(), (int)ip.size(), r, W, &inst[k]);
+        if (irc != RAD_OK && t->rc == RAD_OK) { t->rc = irc; t->why = fmt("init of %s", t->row[k]->name); }
+    }
+    t->has_ctx = inst[0] && g_sdma.inst_sdma(inst[0]) ? 1 : 0;
+    const long long big = 256ll << 20;
+    void *A = nullptr, *B = nullptr, *ka = nullptr, *kb = nullptr;
+    void* X[8] = { nullptr };
+    unsigned long long* bad = nullptr;
+    if (t->rc == RAD_OK) {
+        bool ok = hipMalloc(&A, (size_t)most * 2) == hipSuccess && hipMalloc(&B, (size_t)most * 2) == hipSuccess &&
+                  hipMalloc(&ka, (size_t)big) == hipSuccess && hipMalloc(&kb, (size_t)big) == hipSuccess &&
+                  hipMalloc((void**)&bad, 32) == hipSuccess;
+        for (void*& x : X) ok = ok && hipMalloc(&x, (size_t)most * 2) == hipSuccess;
+        if (!ok) t->rc = RAD_E_NOMEM;
+        else st_memset(ka, 0x33, (size_t)big);
+    }
+    hipEvent_t e0, e1, f0, f1;
+    st_ev_create(&e0); st_ev_create(&e1); st_ev_create(&f0); st_ev_create(&f1);
+    /* one launch of op k (0 AR lane, 1 RS raw, 2 AG raw) on buf, in place */
+    auto launch = [&](int k, void* buf, int64_t n, int64_t w, int sdma, hipStream_t st) -> int {
+        std::vector<RadParam> ps = { PI("world_size", W), PI("numel", n), PS("dtype", "bf16"), PI("exact", 1), PI("overlap", 1),
+                                     PI("sdma", sdma), PI("xpush", 1) };
+        if (k) { ps.push_back(PI("raw", 1)); ps.push_back(PI("row", w)); }
+        RadTensor ts[1] = { T(buf, RAD_BF16, { n }) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts; a.n_t = 1; a.p = ps.data(); a.n_p = (int)ps.size(); a.instance = inst[k]; a.rank = r; a.world_size = W;
+        const int rc = t->row[k]->launch(&a, st);
+        return rc == RAD_LINK_ENDED ? RAD_OK : rc;
+    };
+    unsigned int salt = 101u;
+    for (size_t si = 0; si < ns; ++si) {
+        const int64_t n = t->sizes[si], w = t->widths[si], rows = n / w, q = (rows + 3) / 4 * w;
+        const long long lo = std::min<int64_t>((int64_t)r * q, n), hi = std::min<int64_t>((int64_t)(r + 1) * q, n);
+        t->bar->wait();
+        bool ok = t->rc == RAD_OK;
+        auto L = [&](int k, void* buf, int sdma, hipStream_t st) {
+            if (ok && launch(k, buf, n, w, sdma, st) != RAD_OK) { ok = false; t->rc = RAD_E_DEVICE; t->why = fmt("launch op %d sdma %d", k, sdma); }
+        };
+        /* ---- checks */
+        if (ok) {
+            hip_ck(hipMemset(bad, 0, 32), "hipMemset", __LINE__);
+            unsigned long long* bc = bad;      /* SDMA vs CU */
+            unsigned long long* ba = bad + 1;  /* SDMA vs the expectation */
+            long long it = 0;
+            for (int Lc = 0; Lc < t->checks && ok; ++Lc, salt += 4, ++it) {
+                g_sdma.k_gen(s1, A, n, r, salt); g_sdma.k_gen(s1, B, n, r, salt);
+                L(0, A, 0, s1); L(0, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc); g_sdma.k_check(s1, B, n, W, salt, ba);
+                g_sdma.k_gen(s1, A, n, r, salt + 1); g_sdma.k_gen(s1, B, n, r, salt + 1);
+                L(1, A, 0, s1); L(1, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc); g_sdma.k_check2(s1, B, n, W, r, 1, lo, hi, q, salt + 1, ba);
+                L(2, A, 0, s1); L(2, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc); g_sdma.k_check(s1, B, n, W, salt + 1, ba);
+                g_sdma.k_gen(s1, A, n, r, salt + 2); g_sdma.k_gen(s1, B, n, r, salt + 2);
+                L(2, A, 0, s1); L(2, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc); g_sdma.k_check2(s1, B, n, W, r, 2, 0, 0, q, salt + 2, ba);
+                g_sdma.k_gen(s1, A, n, r, salt + 3); g_sdma.k_gen(s1, B, n, r, salt + 3);
+                static const int burst[8] = { 1, 2, 0, 0, 1, 2, 2, 0 };
+                for (int k : burst) L(k, A, 0, s1);
+                for (int k : burst) L(k, B, 1, s1);
+                g_sdma.k_cmp(s1, A, B, n, bc);
+                if ((Lc & 15) == 15 && st_stream_sync(s1) != hipSuccess) { ok = false; t->rc = RAD_E_DEVICE; }
+            }
+            if (st_stream_sync(s1) != hipSuccess) { ok = false; t->rc = RAD_E_DEVICE; }
+            unsigned long long h[2] = { 0, 0 };
+            st_memcpy(h, bad, 16, hipMemcpyDeviceToHost);
+            t->bad_cmp[si] = ok ? (long long)h[0] : -1;
+            t->bad_ana[si] = ok ? (long long)h[1] : -1;
+            t->nchk[si] = it;
+        }
+        t->bar->wait();
+        /* ---- cross-stream: the device-side chain alone orders the context's launches */
+        if (ok) {
+            hip_ck(hipMemset(bad + 2, 0, 8), "hipMemset", __LINE__);
+            for (int round = 0; round < 20 && ok; ++round, salt += 8) {
+                for (int j = 0; j < 8; ++j) g_sdma.k_gen(s1, X[j], n, r, salt + (unsigned)j);
+                st_stream_sync(s1);
+                t->bar->wait();
+                for (int j = 0; j < 8; ++j) L(j % 3, X[j], 1, (j & 1) ? s3 : s1);
+                st_stream_sync(s1); st_stream_sync(s3);
+                for (int j = 0; j < 8; ++j) {
+                    const int k = j % 3;
+                    if (k == 0) g_sdma.k_check(s1, X[j], n, W, salt + (unsigned)j, bad + 2);
+                    else g_sdma.k_check2(s1, X[j], n, W, r, k, lo, hi, q, salt + (unsigned)j, bad + 2);
+                }
+                st_stream_sync(s1);
+            }
+            unsigned long long h = 0;
+            st_memcpy(&h, bad + 2, 8, hipMemcpyDeviceToHost);
+            t->bad_x[si] = ok ? (long long)h : -1;
+        }
+        t->bar->wait();
+        /* ---- timed alone */
+        for (int k = 0; k < 3; ++k)
+            for (int sd = 0; sd < 2; ++sd) {
+                if (!ok) break;
+                g_sdma.k_gen(s1, B, n, r, 5u);
+                for (int i = 0; i < 10; ++i) L(k, B, sd, s1);
+                st_stream_sync(s1);
+                t->bar->wait();
+                st_ev_record(e0, s1);
+                for (int i = 0; i < t->iters; ++i) L(k, B, sd, s1);
+                st_ev_record(e1, s1);
+                st_ev_sync(e1);
+                float ms = 0;
+                st_ev_elapsed(&ms, e0, e1);
+                t->us_alone[si][(size_t)(k * 2 + sd)] = 1000.0 * ms / t->iters;
+                t->bar->wait();
+            }
+        /* ---- beside a VRAM-bound kernel stream (48 passes of 256 MB -> 256 MB on s2) */
+        const int kpass = 48;
+        if (ok) {
+            st_stream_sync(s1);
+            t->bar->wait();
+            st_ev_record(f0, s2);
+            for (int i = 0; i < kpass; ++i) g_sdma.k_stream(s2, kb, ka, big, 1, 0);
+            st_ev_record(f1, s2);
+            st_ev_sync(f1);
+            float ms = 0;
+            st_ev_elapsed(&ms, f0, f1);
+            t->k_alone[si] = ms;
+            t->bar->wait();
+        }
+        for (int k = 0; k < 3; ++k)
+            for (int sd = 0; sd < 2; ++sd) {
+                if (!ok) break;
+                st_stream_sync(s1); st_stream_sync(s2);
+                t->bar->wait();
+                st_ev_record(f0, s2);
+                for (int i = 0; i < kpass; ++i) g_sdma.k_stream(s2, kb, ka, big, 1, 0);
+                st_ev_record(f1, s2);
+                st_ev_record(e0, s1);
+                for (int i = 0; i < t->iters; ++i) L(k, B, sd, s1);
+                st_ev_record(e1, s1);
+                st_ev_sync(e1); st_ev_sync(f1);
+                float ma = 0, mk = 0;
+                st_ev_elapsed(&ma, e0, e1);
+                st_ev_elapsed(&mk, f0, f1);
+                t->us_with[si][(size_t)(k * 2 + sd)] = 1000.0 * ma / t->iters;
+                t->k_with[si][(size_t)(k * 2 + sd)] = mk;
+                t->bar->wait();
+            }
+        if (!ok) for (int i = 0; i < 64; ++i) t->bar->wait();   /* (not reached in lockstep: every rank fails together) */
+    }
+    t->bar->wait();
+    for (int k = 0; k < 3; ++k) if (inst[k] && t->row[k]->fini) t->row[k]->fini(inst[k]);
+    for (void* p : { A, B, ka, kb, (void*)bad }) if (p) st_free(p);
+    for (void* x : X) if (x) st_free(x);
+    for (hipStream_t s : { s1, s2, s3 }) if (s) (void)hipStreamDestroy(s);
+    st_ev_destroy(e0); st_ev_destroy(e1); st_ev_destroy(f0); st_ev_destroy(f1);
+}
+
+static void sdma_eng4(const Plugin& pl, const char* spec, int iters) {
+    constexpr int W = 4;
+    if (!sdma_api(pl)) { ++g_fail; return; }
+    if (iters <= 0) iters = 50;
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::vector<int64_t> sizes, widths;
+    {
+        std::string all = spec ? spec : "";
+        size_t at = 0;
+        while (at < all.size()) {
+            const size_t comma = all.find(',', at);
+            const std::string one = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+            long long r = 0, w = 0;
+            if (std::sscanf(one.c_str(), "%lldx%lld", &r, &w) != 2 || r < 4 || w <= 0 || w % 32) {
+                std::printf("--sdmaeng4: '%s' is not RxW (R >= 4 rows, W a multiple of 32)\n", one.c_str());
+                return;
+            }
+            sizes.push_back(r * w); widths.push_back(w);
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+        }
+    }
+    if (sizes.empty()) { std::printf("--sdmaeng4: no sizes\n"); return; }
+    const std::vector<int> devs = sdma_cards(W);
+    if ((int)devs.size() < W) { std::printf("--sdmaeng4: needs 4 gfx1201 cards, found %zu\n", devs.size()); return; }
+    const char* names[3] = { "ar_twoshot_4rank_exact_lane", "sp_rs_rows_4rank_ti8_lane", "sp_ag_rows_4rank_lane" };
+    const RadKernelInfo* rows[3];
+    for (int k = 0; k < 3; ++k)
+        if (!(rows[k] = find(pl, names[k]))) { std::printf("--sdmaeng4: row %s absent\n", names[k]); ++g_fail; return; }
+    /* the engine's declaration: contexts built at init; the launches pick the path by `sdma` */
+    if (!std::getenv("RADIANCE_FN4_AR_SDMA")) setenv("RADIANCE_FN4_AR_SDMA", "0", 1);
+    g_sdma.allow_untaped(1);
+    const char* ce = std::getenv("R4D_SDMA_CHECKS");
+    const int checks = ce ? std::atoi(ce) : 200;
+    std::printf("SDMA engine path, four cards: the lane AR / SP raw RS / SP raw AG rows at sdma 0 (CU) and 1 (copy "
+                "engines), %d check iterations a size, %d timed launches\n", checks, iters);
+    StBarrier bar(W);
+    std::vector<SdmaEngT> t((size_t)W);
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+        SdmaEngT& x = t[(size_t)r];
+        x.rank = r; x.dev = devs[(size_t)r]; x.world = W; x.iters = iters; x.checks = checks;
+        x.sizes = sizes; x.widths = widths; x.bar = &bar;
+        for (int k = 0; k < 3; ++k) x.row[k] = rows[k];
+        th.emplace_back(sdma_eng_worker, &x);
+    }
+    for (std::thread& x : th) x.join();
+    bool ctx_all = true;
+    for (const SdmaEngT& x : t) {
+        ctx_all = ctx_all && x.has_ctx;
+        if (x.rc != RAD_OK) std::printf("  rank %d: rc %d%s%s\n", x.rank, x.rc, x.why.empty() ? "" : ": ", x.why.c_str());
+    }
+    if (!ctx_all) std::printf("  NO COPY-ENGINE CONTEXT on some rank (the bound %lld elements outside [R4D_SDMA_MIN_ELEMS, "
+                              "R4D_SDMA_CAP_MB]?): sdma 1 ran the CU forms\n", (long long)*std::max_element(sizes.begin(), sizes.end()));
+    const char* opn[3] = { "AR lane", "RS raw ", "AG raw " };
+    for (size_t si = 0; si < sizes.size(); ++si) {
+        long long bc = 0, ba = 0, bx = 0, nc = 0;
+        bool fail = false;
+        for (const SdmaEngT& x : t) {
+            fail |= x.bad_cmp[si] < 0 || x.bad_ana[si] < 0 || x.bad_x[si] < 0;
+            bc += std::max(0ll, x.bad_cmp[si]); ba += std::max(0ll, x.bad_ana[si]); bx += std::max(0ll, x.bad_x[si]);
+            nc = std::max(nc, x.nchk[si]);
+        }
+        const double mb = (double)sizes[si] * 2 / 1e6;
+        std::printf("  %lld x %lld bf16 (%.2f MB)%s\n", (long long)(sizes[si] / widths[si]), (long long)widths[si], mb,
+                    fail ? "  (A RANK FAILED: counts incomplete)" : "");
+        std::printf("    checks: %lld iterations x 4 ranks (12 launches a path each): SDMA vs CU %lld words differ; SDMA vs "
+                    "the fold / halves' expectations %lld; cross-stream (20 rounds x 8) %lld\n", nc, bc, ba, bx);
+        double ka = 0;
+        for (const SdmaEngT& x : t) ka = std::max(ka, x.k_alone[si]);
+        std::string js;
+        for (int k = 0; k < 3; ++k) {
+            double ua[2] = { 0, 0 }, uw[2] = { 0, 0 }, kw[2] = { 0, 0 };
+            for (int sd = 0; sd < 2; ++sd)
+                for (const SdmaEngT& x : t) {
+                    ua[sd] = std::max(ua[sd], x.us_alone[si][(size_t)(k * 2 + sd)]);
+                    uw[sd] = std::max(uw[sd], x.us_with[si][(size_t)(k * 2 + sd)]);
+                    kw[sd] = std::max(kw[sd], x.k_with[si][(size_t)(k * 2 + sd)]);
+                }
+            const double l0 = 1000.0 * (kw[0] - ka) / iters, l1 = 1000.0 * (kw[1] - ka) / iters;
+            std::printf("    %s alone CU %8.1f us  SDMA %8.1f us (%+.1f %%) | beside the stream: CU %8.1f / SDMA %8.1f us "
+                        "each; the stream lost %6.1f / %6.1f us a collective (CU / SDMA)\n", opn[k], ua[0], ua[1],
+                        ua[0] > 0 ? 100.0 * (ua[1] - ua[0]) / ua[0] : 0.0, uw[0], uw[1], l0, l1);
+            js += fmt("%s\"%s\": {\"cu_us\": %.1f, \"sdma_us\": %.1f, \"cu_with_us\": %.1f, \"sdma_with_us\": %.1f, "
+                      "\"cu_loss_us\": %.1f, \"sdma_loss_us\": %.1f}", k ? ", " : "", k == 0 ? "ar" : k == 1 ? "rs" : "ag",
+                      ua[0], ua[1], uw[0], uw[1], l0, l1);
+        }
+        std::printf("    kernel stream alone %.2f ms (%d passes of 256 MB -> 256 MB)\n", ka, 48);
+        std::printf("SDMAENG {\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"ctx\": %s, \"iters\": %lld, \"bad_vs_cu\": %lld, "
+                    "\"bad_vs_fold\": %lld, \"bad_xstream\": %lld, \"k_alone_ms\": %.2f, %s, \"failed\": %s}\n",
+                    (long long)(sizes[si] / widths[si]), (long long)widths[si], mb, ctx_all ? "true" : "false", nc, bc, ba, bx,
+                    ka, js.c_str(), fail ? "true" : "false");
+        if (bc || ba || bx || fail || !ctx_all) ++g_fail;
     }
 }
 
@@ -36586,6 +36942,9 @@ static void usage(void) {
                 "             VRAM-bound kernel stream's loss beside the CU two-shot vs SDMA copies.\n"
                 "  --sdmaar4 RxW[,RxW..] [iters]:  fn4 SDMA-AR: the exact SDMA two-shot checked\n"
                 "             (R4D_SDMA_CHECKS launches, default 1000) and timed against ar_twoshot_4rank_exact.\n"
+                "             R4D_SDMA_TL=1 adds the per-launch phases (chain, hop 1, fold, hop 2, assemble, gap).\n"
+                "  --sdmaeng4 RxW[,RxW..] [iters]:  fn4 SDMA-AR through the engine's rows (lane AR, SP raw RS / AG)\n"
+                "             at sdma 0 vs 1: bytes (vs CU, vs the fold, cross-stream) and time alone / beside a stream.\n"
                 "  --perfar8 numel [iters] [dtype] [forms]:  the eight-rank exact all-reduce, one thread\n"
                 "             a card: one-shot and two-shot at the block rule and at 4..64 blocks,\n"
                 "             each checked against the rank-order fold; numel 0 runs the decode\n"
@@ -36701,7 +37060,7 @@ int main(int argc, char** argv) {
     bool lo_fp8 = false;
     uint32_t lo_ydt = RAD_BF16;
     long long ar8_n = -1;
-    bool sdma_perf_on = false, sdma_ar_on = false;   /* fn4 SDMA-AR */
+    bool sdma_perf_on = false, sdma_ar_on = false, sdma_eng_on = false;   /* fn4 SDMA-AR */
     const char* sdma_spec = nullptr;
     int sdma_it = 0;
     int ar8_it = 200;
@@ -36905,12 +37264,14 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             ar4_spec = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar4_it = (int)std::strtol(argv[++i], nullptr, 0);
-        } else if (!std::strcmp(argv[i], "--perfsdma") || !std::strcmp(argv[i], "--sdmaar4")) {
-            /* fn4 SDMA-AR: the copy engines' P2P rates / the exact SDMA two-shot (see sdma_perf / sdma_ar4). */
-            (argv[i][2] == 'p' ? sdma_perf_on : sdma_ar_on) = true;
+        } else if (!std::strcmp(argv[i], "--perfsdma") || !std::strcmp(argv[i], "--sdmaar4") ||
+                   !std::strcmp(argv[i], "--sdmaeng4")) {
+            /* fn4 SDMA-AR: the copy engines' P2P rates / the exact SDMA two-shot / the engine path (see sdma_perf /
+             * sdma_ar4 / sdma_eng4). */
+            (argv[i][2] == 'p' ? sdma_perf_on : argv[i][6] == 'e' ? sdma_eng_on : sdma_ar_on) = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) sdma_spec = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) sdma_it = (int)std::strtol(argv[++i], nullptr, 0);
-            if (sdma_ar_on && !sdma_spec) { usage(); return 2; }
+            if ((sdma_ar_on || sdma_eng_on) && !sdma_spec) { usage(); return 2; }
         } else if (!std::strcmp(argv[i], "--perfar8")) {
             /* The eight-rank exact all-reduce rows timed; numel 0 runs the default sizes. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -37214,10 +37575,11 @@ int main(int argc, char** argv) {
 #endif
         return 0;
     }
-    if (sdma_perf_on || sdma_ar_on) {
+    if (sdma_perf_on || sdma_ar_on || sdma_eng_on) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
         if (sdma_perf_on) sdma_perf(pl, sdma_spec, sdma_it);
+        else if (sdma_eng_on) sdma_eng4(pl, sdma_spec, sdma_it);
         else sdma_ar4(pl, sdma_spec, sdma_it);
         dfree_all();
 #else
