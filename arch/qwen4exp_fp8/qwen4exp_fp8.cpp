@@ -278,6 +278,11 @@ struct Model {
      * PERSIST: the downs read it all step, and their declarations do not name it. */
     rad_buf     b_band = 0;
     rad_op      op_band = 0;
+    /* fn4 BI (switch hc_bi, RADIANCE_FN4_HC_BI): this step's read segments -- [0, decode rows), then each prefill
+     * sequence's rows (host positions: a jump starts the next), as bounds {0, .., T} -- so libr4d's hc_read takes every
+     * decode-class run (at most 64 rows) in a read of its own, with its one-family form (r4d_hc_bf16.hip hc_bi). */
+    bool        bi_on = false;
+    std::vector<int64_t> bi_cut;
 };
 
 static Model g_model[MAX_RANKS];
@@ -288,6 +293,42 @@ static std::atomic<int>& fn4_dual_flag() {
     return f;
 }
 static std::atomic<int> g_dual_declared{0};
+/* fn4 BI: switch hc_bi's value (RADIANCE_FN4_HC_BI starts it; libr4d takes the same switch for its forms). */
+static std::atomic<int>& fn4_hcbi_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_HC_BI") ? 1 : 0};
+    return f;
+}
+/* fn4 BI: the step's read segments (Model::bi_cut) when hc_bi is on. */
+static void bi_segments(Model& m, const RadBatch* batch) {
+    m.bi_on = fn4_hcbi_flag().load(std::memory_order_relaxed) > 0;
+    m.bi_cut.clear();
+    if (!m.bi_on) return;
+    const int64_t T = batch->n_tok;
+    int64_t sd = 0, td = 0;
+    batch_split(batch, &sd, &td);
+    m.bi_cut.push_back(0);
+    if (td > 0 && td < T) m.bi_cut.push_back(td);
+    if (batch->positions_h)
+        for (int64_t r = td + 1; r < T; ++r)
+            if (batch->positions_h[r] != batch->positions_h[r - 1] + 1) m.bi_cut.push_back(r);
+    m.bi_cut.push_back(T);
+}
+/* A connection's read over rows [r0, r0 + n), cut at the step's segments under hc_bi. */
+static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t r0, int64_t n, bool ss = false) {
+    if (!m.bi_on || m.bi_cut.size() <= 2) { hcx.read(c, T, r0, n, ss); return; }
+    for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i) {
+        const int64_t a = std::max(m.bi_cut[i], r0), b = std::min(m.bi_cut[i + 1], r0 + n);
+        if (b > a) hcx.read(c, T, a, b - a, ss);
+    }
+}
+/* read_pieces under hc_bi: each segment in pieces of the read's band. */
+static void bi_read_pieces(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, bool ss = false) {
+    if (!m.bi_on || m.bi_cut.size() <= 2) { hcx.read_pieces(c, T, ss); return; }
+    const int64_t piece = hcx.c.read_rows > 0 ? hcx.c.read_rows : T;
+    for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
+        for (int64_t a = m.bi_cut[i]; a < m.bi_cut[i + 1]; a += piece)
+            hcx.read(c, T, a, std::min(piece, m.bi_cut[i + 1] - a), ss);
+}
 
 /* ============================== fn4 BI's engine tracer (BiTr) ============================== */
 static const char* bt_dir() {
@@ -1938,7 +1979,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     if (n > 0) {
         if (m.ple_layer == 0) { m.ple.step(c, batch); bt_pt(c, m, m.b_h, 0, T, "ple", 0); }
         for (int64_t p = 0; p < K; ++p) {
-            m.layers[0].hc_mix.read(c, T, r0(p), rn(p));
+            bi_read(c, m, m.layers[0].hc_mix, T, r0(p), rn(p));
             bt_rd(c, m, r0(p), rn(p), "rd_mix", 0, false);
         }
     }
@@ -1982,12 +2023,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             }
             const bool ss0 = l.hc_mix.write(c, T, r0(0), rn(0));
             bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
-            l.hc_ffn.read(c, T, r0(0), rn(0), ss0);
+            bi_read(c, m, l.hc_ffn, T, r0(0), rn(0), ss0);
             bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
             wait1();
             const bool ss1 = l.hc_mix.write(c, T, r0(1), rn(1));
             bt_pt(c, m, m.b_h, r0(1), rn(1), "h_mix", (int)li);
-            l.hc_ffn.read(c, T, r0(1), rn(1), ss1);
+            bi_read(c, m, l.hc_ffn, T, r0(1), rn(1), ss1);
             bt_rd(c, m, r0(1), rn(1), "rd_ffn", (int)li, true);
             l.mlp.pair_routed(c, T, R, pmode == 2);
             l.mlp.pair_finish(c, T, r0(0), rn(0), pmode != 2);
@@ -2004,7 +2045,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             }
             const bool ss_mix = l.hc_mix.write(c, T, r0(p), rn(p));
             bt_pt(c, m, m.b_h, r0(p), rn(p), "h_mix", (int)li);
-            l.hc_ffn.read(c, T, r0(p), rn(p), ss_mix);
+            bi_read(c, m, l.hc_ffn, T, r0(p), rn(p), ss_mix);
             bt_rd(c, m, r0(p), rn(p), "rd_ffn", (int)li, true);
             l.mlp.pass(c, T, r0(p), rn(p), false);
             /* Lane 0 waits here for the next piece's mixer all-reduce and the last piece's MoE
@@ -2026,7 +2067,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             const bool projected = l.proj.step(c, batch, r0(p), rn(p));
             bt_pt(c, m, m.b_h, r0(p), rn(p), "h_ffn", (int)li);
             if (nx && !ple_next) {
-                nx->hc_mix.read(c, T, r0(p), rn(p), ss_ffn && !projected);
+                bi_read(c, m, nx->hc_mix, T, r0(p), rn(p), ss_ffn && !projected);
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)li + 1, false);   /* lane 1 holds the last piece's rows only */
             }
         }
@@ -2034,7 +2075,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             m.ple.step(c, batch);
             bt_pt(c, m, m.b_h, 0, T, "ple", (int)li + 1);
             for (int64_t p = 0; p < K; ++p) {
-                nx->hc_mix.read(c, T, r0(p), rn(p));
+                bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)li + 1, false);
             }
         }
@@ -2069,7 +2110,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         const Layer& l = m.layers[(size_t)li];
         /* Before the attention connection reads the stream, which is where the reference puts it. */
         if (li == m.ple_layer) { m.ple.step(c, batch); ss_ok = false; bt_pt(c, m, m.b_h, 0, T, "ple", (int)li); }
-        l.hc_mix.read_pieces(c, T, ss_ok);
+        bi_read_pieces(c, m, l.hc_mix, T, ss_ok);
         bt_rd(c, m, 0, T, "rd_mix", (int)li, false);
         /* The indexer runs first, since the attention reads its selection. The block's input is
          * already normed and quantised by the connection (`ext_in`), so `w.h` is final. */
@@ -2080,7 +2121,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         const bool ss_mix = l.hc_mix.write(c, T, 0, T);
         bt_pt(c, m, m.b_h, 0, T, "h_mix", (int)li);
         dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
-        l.hc_ffn.read_pieces(c, T, ss_mix);
+        bi_read_pieces(c, m, l.hc_ffn, T, ss_mix);
         bt_rd(c, m, 0, T, "rd_ffn", (int)li, true);
         l.mlp.step(c, batch);
         bt_moe(c, m, T, (int)li);
@@ -2127,6 +2168,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     bt_begin(c, m, T);
+    bi_segments(m, batch);   /* fn4 BI (hc_bi): the step's read segments */
     {   /* fn4 BI-dual: the step's row bands, and every trunk MoE layer's downs told (exl3_dual) */
         const bool dual = m.op_band && fn4_dual_flag().load(std::memory_order_relaxed) > 0;
         if (dual)
@@ -2138,7 +2180,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     if (pipelined(m, T)) step_pipelined(c, batch, m, pcu);
     else                 step_serial(c, batch, m, pcu);
 
-    m.mixer.read_pieces(c, T);
+    bi_read_pieces(c, m, m.mixer, T);
     bt_pt(c, m, m.a_x.x, 0, T, "final", -1);
 
     if (batch->n_out > 0) {
@@ -2276,6 +2318,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         if (value < 0 || value > 2) return -1;
         if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "hc_bi") == 0) {   /* fn4 BI: the reads cut at the step's segments (libr4d takes it too) */
+        if (value < 0 || value > 1) return -1;
+        qwen4exp_fp8::fn4_hcbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (!name || std::strcmp(name, "gather_inv") != 0) return 0;

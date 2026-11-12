@@ -36,6 +36,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (std::strcmp(name, "hc_bi") == 0) {   /* fn4 BI: the reads cut at the step's segments (libr4d takes it too) */
+        if (value < 0 || value > 1) return -1;
+        qwen4exp_fp8::fn4_hcbi_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (std::strcmp(name, "exl3_dual") == 0) {   /* fn4 BI-dual (qwen4exp_fp8's step; RADIANCE_FN4_X3DUAL=1 declares) */
         if (value < 0 || value > 1) return -1;
         if (value && !qwen4exp_fp8::g_dual_declared.load(std::memory_order_relaxed)) return -1;

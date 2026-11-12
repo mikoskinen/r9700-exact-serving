@@ -165,7 +165,11 @@ Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep)
     Result R;
     const RadOpSchema* sc = schema(pl, c.op.c_str());
     if (!sc) { R.skip = "no schema"; return R; }
-    const long long Mmax = *std::max_element(sweep.begin(), sweep.end());
+    /* R4D_BI_REF=<m> (fn4): the reference a probe row is compared with is that row as row 0 of an m-row launch (default 1:
+     * the row alone) -- e.g. 8, the first tiled height, to see whether the forms above it agree among themselves. */
+    static const long long REF = [] { const char* e = std::getenv("R4D_BI_REF"); const long long v = e ? std::atoll(e) : 1;
+                                      return v >= 1 && v <= 65536 ? v : 1LL; }();
+    const long long Mmax = *std::max_element(sweep.begin(), sweep.end()) + REF;
     const long long Ma = 37, Mb = 53;
     const std::vector<RadParam> pa = with_m(c.ps, Ma), pb = with_m(c.ps, Mb);
     /* the descriptions: any row of the op that has a shape hook (they agree across rows of one op) */
@@ -268,7 +272,7 @@ Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep)
     auto ref = [&](long long content) -> const std::vector<uint8_t>* {
         auto it = alone.find(content);
         if (it != alone.end()) return &it->second;
-        if (launch(1, content, nullptr) != RAD_OK) return nullptr;
+        if (launch(REF, content, nullptr) != RAD_OK) return nullptr;
         std::vector<uint8_t> v;
         outrow(content, 0, v);
         return &(alone[content] = v);
@@ -358,12 +362,13 @@ static void fn_bi_check(const Plugin& pl, const char* classes, const char* mlist
     }
     if (sweep.empty()) sweep = bi::default_sweep();
     auto ev = [](const char* k) { const char* e = std::getenv(k); return e ? e : "(unset)"; };
-    std::printf("fn4 BI per-op check: a row alone (M = 1) vs the same row inside an M-row launch, byte for byte; "
-                "probe rows 0, M/2, M-1; %zu M values up to %lld; env RADIANCE_FN4_HC_READV=%s _HC_UPMIX=%s _HC_WRITEVEC=%s "
-                "_HC_NORMWAVE=%s _HC_SS=%s\n",
+    std::printf("fn4 BI per-op check: a row as row 0 of an R4D_BI_REF=%s-row launch (unset: alone) vs the same row inside an "
+                "M-row launch, byte for byte; ", std::getenv("R4D_BI_REF") ? std::getenv("R4D_BI_REF") : "1");
+    std::printf("probe rows 0, M/2, M-1; %zu M values up to %lld; env RADIANCE_FN4_HC_READV=%s _HC_UPMIX=%s _HC_WRITEVEC=%s "
+                "_HC_NORMWAVE=%s _HC_SS=%s _HC_BI=%s\n",
                 sweep.size(), *std::max_element(sweep.begin(), sweep.end()), ev("RADIANCE_FN4_HC_READV"),
                 ev("RADIANCE_FN4_HC_UPMIX"), ev("RADIANCE_FN4_HC_WRITEVEC"), ev("RADIANCE_FN4_HC_NORMWAVE"),
-                ev("RADIANCE_FN4_HC_SS"));
+                ev("RADIANCE_FN4_HC_SS"), ev("RADIANCE_FN4_HC_BI"));
     int n = 0, inv = 0, flip = 0, sk = 0;
     for (const bi::Case& c : bi::cases()) {
         if (want != "all" && ("," + want + ",").find("," + c.cls + ",") == std::string::npos) continue;

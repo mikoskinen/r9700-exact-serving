@@ -38,6 +38,9 @@
  *                   dead rows directly (1) or by the scan (0); a plugin built at EXL3R4D_DZ 2 takes both  RADIANCE_FN4_X3DZ
  *   exl3_bi         exl3r4d (rad_fn4_switch): fn4 BI -- the decode band computes every row as the prefill band does (no
  *                   EPIC in down, no small-M split-K in gate_up); 0 the adopted forms                RADIANCE_FN4_X3BI
+ *   hc_bi           libr4d (rad_fn4_switch): fn4 BI -- hc_read up to 64 rows through one form family (tiled from a
+ *                   single row, the one-tile K split, the norm scales from hc_norm_scale_kernel): a row's bytes the
+ *                   same at every decode / verify height; 0 today's forms                             RADIANCE_FN4_HC_BI
  *   exl3_dual       architecture plugin (rad_fn4_switch): fn4 BI-dual -- every trunk MoE layer's EXL3 down takes the
  *                   step's row bands (libr4d bi_band, exl3 interface v12): a mixed step's decode rows get the decode
  *                   band's bytes in the prefill band's pass; needs RADIANCE_FN4_X3DUAL=1 at start (declares the
@@ -65,7 +68,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kSwitches };
+              kExl3Dual, kHcBi, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

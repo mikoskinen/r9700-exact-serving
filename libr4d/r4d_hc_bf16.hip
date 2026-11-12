@@ -3613,6 +3613,27 @@ static int hc_upmix() {
     }
     return v;
 }
+/* fn4 BI (hc_bi, 12.11.2026; RADIANCE_FN4_HC_BI, rad_fn4_switch("hc_bi")): batch invariance of hc_read. 184's
+ * bicheck: every form change by row count moves a row's bytes (per-row kernels below kDecMinRows, the tiled family
+ * above with the K split from the row-tile count, the norm scales from three sources). 1 = up to kHcBiRows rows ONE
+ * family: the tiled one from a single row at the 32-row tile, the down product's K split fixed at the one-tile split,
+ * the norm scales always hc_norm_scale_kernel (no `ss`, no wave form), no pipelined / fused-reduce / 64-row up-mix
+ * forms -- so a row's bytes are the same at every row count up to kHcBiRows (a decode or verify step at any load; the
+ * architecture reads a mixed step's decode rows and each short prefill sequence in reads of their own). Above it the
+ * forms as before. A one-time change for 1..7 rows (they leave the per-row kernels). 0 = today's forms. */
+constexpr long kHcBiRows = 64;
+static std::atomic<int> g_hc_bi{-1};
+static int hc_bi() {
+    int v = g_hc_bi.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_HC_BI");
+        const int on = (e && *e) ? (std::atoi(e) > 0 ? 1 : 0) : 0;
+        int want = -1;
+        g_hc_bi.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_hc_bi.load(std::memory_order_relaxed);
+    }
+    return v;
+}
 /* Test hook (measurement only, r4d_hc_pf2_stages): which of PF2's launches run -- 1 the prologue,
  * 2 the down product, 4 the split-K reduce, 8 the up-mix, 16 the codes. A mask other than 31
  * leaves the outputs incomplete; r4d_selftest --perfhcv times the cumulative masks. */
@@ -6637,6 +6658,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
      * workgroups on 64 CUs. Narrowing costs one extra pass over `h` per workgroup (20 KiB against
      * up to 1.3 MiB of weight). It only narrows; rows past kDecMinRows take the tiled path, so
      * `rows` here is a one-to-seven-row speculative window. */
+    /* fn4 BI (hc_bi): rows up to kHcBiRows through one family (above) */
+    const bool bi = hc_bi() > 0 && rows <= kHcBiRows;
     const bool can_tile = (n % kTKT) == 0 && (HN % 8) == 0 && (lr % 8) == 0 && (hrow % 8) == 0
                           && (((uintptr_t)h->data & 15u) == 0u)
                           && (((uintptr_t)down->data & 15u) == 0u)
@@ -6660,7 +6683,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                      && (((uintptr_t)h->data & 15u) == 0u) && (((uintptr_t)w->data & 15u) == 0u);
     const long hcg_rg = hcs ? 16 : rows <= 8 ? rows : 8;     /* rows a group of kernel A' */
     const long hcg_gy = (rows + hcg_rg - 1) / hcg_rg;
-    if (f8 && hc == 4 && n == kHcGN && lr % kHcGTile == 0 && lr <= 2L * kThreads
+    if (!bi && f8 && hc == 4 && n == kHcGN && lr % kHcGTile == 0 && lr <= 2L * kThreads
         && (hcg_nt + 1) * hcg_gy <= (long)kHcGTilesMax
         && rows >= 1 && rows <= hcg_max && injw && inj && g_hc_decode_form == 0
         && a->scratch_bytes >= fixed + hcg_gy * (hcg_nt + 1) * hc * hcg_rg * kHcGTile * 4) {
@@ -6675,28 +6698,28 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     /* Kernel B3 for forms G and S at lr 320, a single row group; else the chained up-mix. */
     const bool hcw = hcg && lr == 320 && rows <= 16 && (rows <= 8 || hcs) && (n % 128) == 0
                      && (hrow % 2) == 0 && (xrow % 2) == 0;
-    const bool tiled  = can_tile && rows >= kDecMinRows && !hcg;
+    const bool tiled  = can_tile && (rows >= kDecMinRows || bi) && !hcg;
     /* fn4 hc_readv bit 3 (W1b): the norm scales the preceding hc_write stored in `ss` (hc_ss_operand, the rule the
      * write applied), on the unchained tiled forms; there they replace this read's pass and `scale` points at them. */
     const bool chained_tiles = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* chain_arg's rule below */
-    const RadTensor* ssin = tiled && !chained_tiles ? hc_ss_operand(r4d_opt(a, HCR_SS), (long)rows) : nullptr;
+    const RadTensor* ssin = tiled && !chained_tiles && !bi ? hc_ss_operand(r4d_opt(a, HCR_SS), (long)rows) : nullptr;
     if (ssin) scale = (float*)ssin->data;
     if (tiled) {
         /* The chained forms of the tiled kernels (r4d_chain.h) at decode heights, where the row
          * resolved with `chain`. */
         const R4dChainArg chain_arg(r4d_geti_or(a, "chain", 0) != 0 && rows <= 64);
-        const int  rt   = hc_down_rt(rows);
+        const int  rt   = bi ? 32 : hc_down_rt(rows);
         /* The inject gains, if any, are hc more columns of the same GEMM. */
         const bool fold = injw != nullptr && inj != nullptr;
         const long ncol = fold ? lr + hc : lr;
         const long nrt  = (rows + rt - 1) / rt;
         const bool wdown = rt == kWideRT && g_hc_prefill_form != 1;
-        const long kc   = hc_down_kchunk(lr, HN, nrt);
+        const long kc   = hc_down_kchunk(lr, HN, bi ? 1 : nrt);   /* fn4 BI: the one-tile split at every row count */
         const int  ks   = (int)((HN + kc - 1) / kc);
         /* fn4 hc_readv bit 0 at the decode tiles: the pipelined down product and, from 33 rows,
          * the 32-row tile for it and the up-mix; kc stays the one `rt` gives, so the split-K and
          * its reduce are unchanged. Unchained, E4M3, w 16-byte aligned. */
-        const bool vdec = (hc_readv() & 1) && f8 && rt <= 64 && !g_r4d_chain_arg
+        const bool vdec = !bi && (hc_readv() & 1) && f8 && rt <= 64 && !g_r4d_chain_arg
                           && (((uintptr_t)w->data & 15u) == 0u) && (lr % kTKT) == 0;
         /* fn4 hc_upmix bit 3: from 33 rows the up-mix at the 64-row tile, pipelined, instead. */
         const bool um64 = vdec && rt == 64 && (hc_upmix() & 8) != 0;
@@ -6737,7 +6760,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
          * rows 8-aligned) and nothing is chained. Through r4d_emit, so r4d_record_dispatches sees it. */
         if (ssin) {
             /* the scales are already in `ss` */
-        } else if (hc_norm_wave((long)rows) && !g_r4d_chain_arg && (n % kThreads) == 0 && (hrow % 8) == 0
+        } else if (!bi && hc_norm_wave((long)rows) && !g_r4d_chain_arg && (n % kThreads) == 0 && (hrow % 8) == 0
             && (((uintptr_t)h->data & 15u) == 0u)) {
             const long nnb = ((long)rows * hc + kWaves - 1) / kWaves;
             (void)R4D_EMIT(s, &hc_pf2_prep_kernel, dim3((unsigned)nnb), dim3(kThreads), 0,
@@ -6757,7 +6780,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         const int fd_form = hc_fuse_down();
         /* the v2 tail's 16-byte loads need 4-column rows and a 16-byte-aligned partial plane */
         const bool fd_v2 = fd_form == 2 && (ncol % 4) == 0 && part && (((uintptr_t)part & 15u) == 0u);
-        if (ks > 1 && !wdown && !vdec && (fd_form == 1 || fd_v2)
+        if (ks > 1 && !wdown && !vdec && !bi && (fd_form == 1 || fd_v2)
             && ((ncol + kTNT - 1) / kTNT) * nrt <= (long)kMaxDownCtr)
             dctr = hc_down_ctr(s);
         if (vdec) {
@@ -7054,6 +7077,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "hc_readv")) {
         if (value < 0 || value > 63) return -1;
         g_hc_readv.store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "hc_bi")) {   /* fn4 BI: hc_read's one family up to kHcBiRows rows */
+        if (value < 0 || value > 1) return -1;
+        g_hc_bi.store(value, std::memory_order_relaxed);
         return 1;
     }
     if (!std::strcmp(name, "ar_lanethreads")) return r4d_ar_lane_threads_set(value);

@@ -1433,8 +1433,18 @@ extern "C" int r4d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand,
     const char* q = r4d_pgets(p, n_p, "dtype");
     const bool a8  = q && !std::strcmp(q, "fp8a8");
     const bool a16 = q && !std::strcmp(q, "fp8a16");
-    if ((!a8 && !a16) || g != R4D_FP8_BLOCK || K <= 0 || N <= 0) return RAD_E_UNSUPPORTED;
+    /* fn4 BI (12.11.2026): the int8 grid too (i8a8 / i8a8h: i8 codes, an f32 activation scale per (row, 128 K), a bf16
+     * weight scale per ROW per 128 K), so r4d_selftest --bicheck reaches the trunk's int8 linears. */
+    const bool i8  = q && (!std::strcmp(q, "i8a8") || !std::strcmp(q, "i8a8h"));
+    if ((!a8 && !a16 && !i8) || g != R4D_FP8_BLOCK || K <= 0 || N <= 0) return RAD_E_UNSUPPORTED;
     const int64_t kb = (K + g - 1) / g, nb = (N + g - 1) / g;
+    if (i8) {
+        const RadOpdDesc li[] = {
+            opd((uint32_t)RAD_I8, M, K), opd((uint32_t)RAD_F32, M, kb), opd((uint32_t)RAD_I8, N, K),
+            opd((uint32_t)RAD_BF16, N, kb), opd((uint32_t)RAD_BF16, M, N), opd_none(), opd_none(),
+        };
+        R4D_PICK(li);
+    }
     const RadOpdDesc l[] = {
         /* a, a_scale. The matvec reads the bf16 activation directly, and its shim refuses an
          * activation scale rather than silently ignoring it. */
