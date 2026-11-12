@@ -43,6 +43,9 @@
  *                   at 1..7 rows); 2 up to 64 rows through today's per-row kernels (bf16 mixing: today's alone bytes
  *                   kept); both: the architecture reads a step's decode rows / each prefill sequence alone; 0 today
  *                                                                                                    RADIANCE_FN4_HC_BI
+ *   bi_seg          architecture plugin (rad_fn4_switch): fn4 BI -- every trunk linear (LinearFP8) cut at the step's
+ *                   segments (decode rows, each prefill sequence): a decode row's linears at its own height (the
+ *                   narrow tiles, M-invariant to 64); 0 one launch over the step                        RADIANCE_FN4_BI_SEG
  *   exl3_dual       architecture plugin (rad_fn4_switch): fn4 BI-dual -- every trunk MoE layer's EXL3 down takes the
  *                   step's row bands (libr4d bi_band, exl3 interface v12): a mixed step's decode rows get the decode
  *                   band's bytes in the prefill band's pass; needs RADIANCE_FN4_X3DUAL=1 at start (declares the
@@ -70,7 +73,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

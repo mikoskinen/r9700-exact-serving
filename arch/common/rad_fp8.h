@@ -884,6 +884,8 @@ struct LinearFP8 {
      * that is set: a rank's run of a step's rows written to a buffer sized for the run. */
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
               int64_t rows = 0, int64_t y0 = -1) const;
+    /* One launch over rows [r0, r0 + rows) (step() cuts at bi_cuts() first). */
+    void step_rows(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0, int64_t rows, int64_t y0) const;
     /* A span per stacked row part (rad_weight_shard_span_parts), in weight rows; the scale plane
      * gets the same spans in its rows. Call after declare(). With a 1/128 plane every span and
      * total must be whole scale blocks. */
@@ -1701,8 +1703,27 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
 /* `gemm_nt_q` has seven positional operands; the optional `a_sum` and `b_ref` after `y` (for
  * asymmetric integer and mxfp4 grids) are passed as RAD_NONE when unused, since the runtime checks
  * the operand count against the schema (core/runtime/issue.cpp). */
+/* fn4 BI (12.11.2026, switch bi_seg): this rank thread's step segments -- {0, decode rows, each prefill sequence's
+ * first row, .., T} -- set by the architecture for a step; while set, every LinearFP8 launch is cut at them, so a decode
+ * row or a short prompt meets its linears in a launch of its own height (libr4d's narrow tiles are M-invariant to 64
+ * rows; the tiled form above differs in rare elements: fn4 185's bicheck). Unset (n 0): one launch, as before. */
+struct BiCuts { const int64_t* cut = nullptr; int n = 0; };
+inline BiCuts& bi_cuts() { static thread_local BiCuts b; return b; }
+
 inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0,
                             int64_t rows, int64_t y0) const {
+    if (rows <= 0) rows = T - r0;
+    const BiCuts& bc = bi_cuts();
+    if (bc.n <= 2 || !bc.cut) { step_rows(c, a, y, T, r0, rows, y0); return; }
+    for (int i = 0; i + 1 < bc.n; ++i) {
+        const int64_t lo = bc.cut[i] > r0 ? bc.cut[i] : r0;
+        const int64_t hi = bc.cut[i + 1] < r0 + rows ? bc.cut[i + 1] : r0 + rows;
+        if (hi > lo) step_rows(c, a, y, T, lo, hi - lo, y0 < 0 ? -1 : y0 + (lo - r0));
+    }
+}
+
+inline void LinearFP8::step_rows(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0,
+                                 int64_t rows, int64_t y0) const {
     if (rows <= 0) rows = T - r0;
     const int64_t yr = y0 < 0 ? r0 : y0;
     if (bf16) {

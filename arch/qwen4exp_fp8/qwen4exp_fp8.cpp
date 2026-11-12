@@ -299,11 +299,19 @@ static std::atomic<int>& fn4_hcbi_flag() {
                                    const int v = e && *e ? std::atoi(e) : 0; return v == 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
-/* fn4 BI: the step's read segments (Model::bi_cut) when hc_bi is on. */
+/* fn4 BI: switch bi_seg's value (RADIANCE_FN4_BI_SEG starts it): the trunk's linears cut at the step's segments. */
+static std::atomic<int>& fn4_biseg_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_BI_SEG") ? 1 : 0};
+    return f;
+}
+/* fn4 BI: the step's segments (Model::bi_cut) when hc_bi or bi_seg is on; the reads take them under hc_bi
+ * (bi_read), every LinearFP8 under bi_seg (rad::arch::bi_cuts, this rank thread's, cleared at a step without). */
 static void bi_segments(Model& m, const RadBatch* batch) {
     m.bi_on = fn4_hcbi_flag().load(std::memory_order_relaxed) > 0;
+    const bool seg = fn4_biseg_flag().load(std::memory_order_relaxed) > 0;
     m.bi_cut.clear();
-    if (!m.bi_on) return;
+    bi_cuts() = BiCuts{};
+    if (!m.bi_on && !seg) return;
     const int64_t T = batch->n_tok;
     int64_t sd = 0, td = 0;
     batch_split(batch, &sd, &td);
@@ -313,6 +321,7 @@ static void bi_segments(Model& m, const RadBatch* batch) {
         for (int64_t r = td + 1; r < T; ++r)
             if (batch->positions_h[r] != batch->positions_h[r - 1] + 1) m.bi_cut.push_back(r);
     m.bi_cut.push_back(T);
+    if (seg && m.bi_cut.size() > 2) bi_cuts() = BiCuts{m.bi_cut.data(), (int)m.bi_cut.size()};
 }
 /* A connection's read over rows [r0, r0 + n), cut at the step's segments under hc_bi. */
 static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t r0, int64_t n, bool ss = false) {
@@ -2194,6 +2203,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         bt_pt(c, m, m.b_logits, 0, batch->n_out, "logits", -1, 1);
     }
     bt_flush(c, m, batch);
+    bi_cuts() = BiCuts{};   /* fn4 BI: the cuts are this trunk step's only */
 }
 
 /* The default draft depth, used by `--num-speculative-tokens auto` and by rad-convert.
@@ -2319,6 +2329,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         if (value < 0 || value > 2) return -1;
         if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_P2X")) return -1;
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments */
+        if (value < 0 || value > 1) return -1;
+        qwen4exp_fp8::fn4_biseg_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "hc_bi") == 0) {   /* fn4 BI: the reads cut at the step's segments (libr4d takes it too) */
