@@ -30258,7 +30258,7 @@ static bool ar8_weights_as_plugin(const std::vector<int>& devs, int* w, std::str
  * a local VRAM copy, and the hop beside a VRAM-bound kernel on every card (the kernel's time with and without it).
  * Timed from the host: every queue polls a start word, the host releases it and waits for each queue's fence.
  * --sdmaar4 RxW[,RxW..] [iters]: the exact SDMA two-shot (r4d_sdma_ar_launch) checked and timed against today's CU
- * exact two-shot (ar_twoshot_4rank_exact) in the same process: R4D_SDMA_CHECKS launches a size (default 1000) from a
+ * exact two-shot (ar_twoshot_4rank_exact, xpush 1) in the same process: R4D_SDMA_CHECKS launches a size (default 1000) from a
  * fresh context, each on newly generated inputs (written by a kernel, through L2) into an output poisoned by a kernel,
  * every output compared on the card with the fp32 ascending-rank fold; then in place; then the CU row's bytes vs the
  * SDMA row's on the same input; then timed (warm, back to back, slowest rank), also its RS and AG halves.
@@ -30737,6 +30737,7 @@ static void sdma_ar_worker(SdmaArT* t) {
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
         std::vector<RadParam> ps = ip;
+        ps.push_back(PI("xpush", 1));   /* 204's baseline (RSF, fn4-x3-sp3); a tree without RSF ignores it */
         RadTensor ts[2] = { T(in, RAD_BF16, { n }), T(cuo, RAD_BF16, { n }) };
         a.t = ts; a.n_t = 2; a.p = ps.data(); a.n_p = (int)ps.size(); a.instance = inst; a.rank = t->rank; a.world_size = t->world;
         if (ok && t->cu) {
@@ -30771,7 +30772,6 @@ static void sdma_ar_worker(SdmaArT* t) {
             t->bar->wait();
             return 1000.0 * ms / t->iters;
         };
-        if (ok && !t->cu) { t->bar->wait(); t->bar->wait(); }
         const double s1 = timed(0);
         const double c1 = t->cu ? timed(1) : 0.0;
         const double c2 = t->cu ? timed(1) : 0.0;
@@ -30854,7 +30854,7 @@ static void sdma_ar4(const Plugin& pl, const char* spec, int iters) {
         std::printf("    checks: %lld launches x 4 ranks out of place, %lld elements differ from the fold; in place %lld; "
                     "SDMA vs CU bytes %lld differ\n", nl / W, bo, bi, bc);
         std::printf("    AR SDMA two-shot exact   %9.1f us  %6.2f GB/s a rank a direction\n", us, us > 0 ? sent2 / (us * 1e3) : 0.0);
-        if (cu) std::printf("    AR CU two-shot exact     %9.1f us  %6.2f GB/s a rank a direction  (SDMA %+.1f %%)\n", uc,
+        if (cu) std::printf("    AR CU two-shot exact xp  %9.1f us  %6.2f GB/s a rank a direction  (SDMA %+.1f %%)\n", uc,
                             uc > 0 ? sent2 / (uc * 1e3) : 0.0, uc > 0 ? 100.0 * (us - uc) / uc : 0.0);
         std::printf("    SDMA RS half             %9.1f us  %6.2f GB/s a rank a direction (timed only)\n", ur,
                     ur > 0 ? sent1 / (ur * 1e3) : 0.0);
