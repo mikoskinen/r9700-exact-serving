@@ -5822,6 +5822,242 @@ TEST(a_group_replicated_on_one_rank_only_is_refused_by_the_slot_layout) {
     }
 }
 
+/* ================================================================== lever KVR: DeepSeek-V4.1's slot
+ *
+ * deepseek41 under RADIANCE_DS41_KV_REPLICATED=1 (ds41-kvr) declares every group its prefix cache holds
+ * rad_kv_group_replicated. The groups at the model's widths (the 11.11. TP4 start log: 'kv tier transfer: 4 paged
+ * group(s), 5.39 KiB an entry in 6 blocks', 'One entry is 21.56 KiB', '84.00 GiB, 4084887 entries, 8169774 tokens'):
+ * kv_index_r2 (mxfp4 keys, 80 B a key, 3 layers) and kv_compressed_r2 (bf16 latent, 1 KiB, 3 layers) at 2-token blocks,
+ * kv_index_r1 / kv_compressed_r1 (1 layer each) at 1-token blocks, so a 2-token entry is 5520 bytes a rank; beside them
+ * the windowed and linear groups the cache leaves out. With every cached group replicated a follower's own window of a
+ * slot is empty, which the two-group fixture above never builds. */
+static std::vector<KVGroupInfo> ds41_groups(bool replicated, bool uncached) {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    if (uncached) {
+        KVGroupInfo w = paged_group("kv_window", RAD_KV_WINDOW, 1, 16, { 0, 1 }, /*window=*/133);
+        w.decl.head_dim = 256;
+        g.push_back(w);
+        KVGroupInfo t;
+        t.name = "kv_comp_tail_r2";
+        t.decl.kind = RAD_KV_LINEAR;
+        t.decl.dtype = RAD_F32;
+        t.decl.n_head_kv = 1;
+        t.decl.state_dim[0] = 2 + 5;
+        t.decl.state_dim[1] = 1024;
+        t.layers = { 2, 8, 14 };
+        g.push_back(t);
+    }
+    /* deepseek41's full_group: head_dim = slots / r / 2 (K and V halves of a block's one entry) */
+    const struct { const char* name; int64_t block, head_dim; std::vector<int32_t> layers; } full[] = {
+        { "kv_index_r2", 2, 40 / 2 / 2, { 2, 8, 14 } },  { "kv_compressed_r2", 2, 512 / 2 / 2, { 2, 8, 14 } },
+        { "kv_index_r1", 1, 40 / 1 / 2, { 20 } },        { "kv_compressed_r1", 1, 512 / 1 / 2, { 20 } } };
+    for (const auto& f : full) {
+        KVGroupInfo k = paged_group(f.name, RAD_KV_FULL, 1, f.block, f.layers);
+        k.decl.head_dim = f.head_dim;
+        k.replicated = replicated;
+        g.push_back(k);
+    }
+    return g;
+}
+
+static bool ds41_build(std::vector<std::unique_ptr<Fixture>>* fx, int world, bool replicated, bool uncached) {
+    for (int r = 0; r < world; ++r) {
+        fx->push_back(std::make_unique<Fixture>());
+        fx->back()->cfg.checkpoint_slots = 0;
+        if (uncached) fx->back()->cfg.vram_kv_mib = 32;   /* the window's 8 sequences x 10 blocks of 32 KiB */
+        const int st = fx->back()->build_groups(ds41_groups(replicated, uncached));
+        CHECK_EQ(st, (int)RAD_OK);
+        if (st != RAD_OK) return false;
+    }
+    return true;
+}
+
+/* The slot at TP4: four rank windows of 5520 bytes (21.56 KiB) without the flag, one replicated window of 5520 with it
+ * and every rank's own window empty. The staging entry is a rank's 5520 bytes either way. --prefix-cache-mib 86016 then
+ * holds 32679098 tokens instead of 8169774, and the same host bytes four times the entries. */
+TEST(ds41_kvr_holds_the_cached_groups_once_a_slot_at_tp4) {
+    if (!device_is_host()) {
+        std::printf("  SKIP  the tier layout fixture needs the host backend\n");
+        return;
+    }
+    const int world = 4;
+    for (bool rep : { false, true }) {
+        std::vector<std::unique_ptr<Fixture>> fx;
+        REQUIRE(ds41_build(&fx, world, rep, /*uncached=*/true));
+        Fixture& f = *fx[0];
+        /* the windowed and linear groups stay out: four cached groups, a 2-token entry of six blocks */
+        std::vector<std::string> names;
+        for (int32_t g : f.pc.cached_groups()) names.push_back(f.kv.plan(g)->name);
+        CHECK(names == (std::vector<std::string>{ "kv_index_r2", "kv_compressed_r2", "kv_index_r1", "kv_compressed_r1" }));
+        CHECK_EQ(f.pc.block_size(), 2ll);
+        REQUIRE_EQ(f.pc.entry_groups().size(), 6u);
+        CHECK(f.pc.report().find("'kv_window' is windowed") != std::string::npos);
+        int64_t entry = 0;
+        for (int32_t g : f.pc.entry_groups()) entry += f.kv.plan(g)->bytes_per_block;
+        CHECK_EQ(entry, 5520ll);
+        for (int32_t g : f.pc.cached_groups()) CHECK_EQ(f.kv.plan(g)->replicated, rep);
+
+        std::vector<const KVManager*> kvs;
+        for (auto& fp : fx) kvs.push_back(&fp->kv);
+        TierExec::SlotLayout L;
+        REQUIRE_EQ(TierExec::slot_layout(kvs, f.pc.entry_groups(), &L), RAD_OK);
+        CHECK_EQ(L.entry_bytes, 5520ll);
+        CHECK_EQ(L.rep_bytes, rep ? 5520ll : 0ll);
+        CHECK_EQ(L.slot_bytes, rep ? 5520ll : 4 * 5520ll);
+        for (int r = 0; r < world; ++r) {
+            CHECK_EQ(L.own_bytes[(size_t)r], rep ? 0ll : 5520ll);
+            CHECK_EQ(L.own_off[(size_t)r], rep ? 5520ll : r * 5520ll);
+        }
+        CHECK_EQ(L.replicated.size(), rep ? 4u : 0u);
+        /* the start log's capacity line: --prefix-cache-mib 86016 in 2-token entries */
+        CHECK_EQ((86016ll << 20) / L.slot_bytes * f.pc.block_size(), rep ? 32679098ll : 8169774ll);
+        /* the host arena counts slots by the slot: the bytes of 64 four-window slots hold 256 entries under the flag */
+        IdleTiers t;
+        CHECK_OK(t.configure(tier_config(64 * 4 * 5520, L.slot_bytes)));
+        CHECK_EQ(t.arena().capacity(), rep ? 256ll : 64ll);
+    }
+}
+
+/* The restore path at TP4 with every cached group replicated: the leader writes the one window, a follower writes
+ * nothing, and every rank reads the leader's bytes back into its own new blocks. The ranks' bytes differ on purpose
+ * (`alike` false), so a follower holding the leader's bytes after the restore proves it read the single copy; without
+ * the flag each rank gets its own back. RADIANCE_DEBUG_TIER_VERIFY: alike, three followers x 20 entries compared and
+ * none differs; differing, every one is caught. */
+static void run_ds41_transfer(bool rep, bool alike, bool verify, bool fragment) {
+    if (verify) setenv("RADIANCE_DEBUG_TIER_VERIFY", "1", 1);
+    else unsetenv("RADIANCE_DEBUG_TIER_VERIFY");
+    if (!device_is_host()) {
+        std::printf("  SKIP  the tier transfer needs the host backend (%s here)\n", device_backend_name());
+        return;
+    }
+    const int world = 4;
+    Registry reg;
+    REQUIRE_EQ(reg.load_plugin(rows_plugin(), 0), RAD_OK);
+    CHECK_OK(reg.check_complete());
+    std::vector<std::unique_ptr<Fixture>> fx;
+    REQUIRE(ds41_build(&fx, world, rep, /*uncached=*/false));
+    Fixture& f = *fx[0];
+    const std::vector<int32_t>& cg = f.pc.entry_groups();
+    REQUIRE_EQ(cg.size(), 6u);
+    std::vector<const KVManager*> kvs;
+    for (auto& fp : fx) kvs.push_back(&fp->kv);
+    TierExec::SlotLayout L;
+    REQUIRE_EQ(TierExec::slot_layout(kvs, cg, &L), RAD_OK);
+    const int64_t slot = L.slot_bytes;
+    CHECK_EQ(slot, rep ? 5520ll : 4 * 5520ll);
+
+    IdleTiers t;
+    CHECK_OK(t.configure(tier_config(40 * slot, slot)));
+    REQUIRE_EQ(t.arena().capacity(), 40);
+    if (fragment) {
+        for (int i = 0; i < 40; ++i) CHECK_EQ(t.arena().alloc(), i);
+        for (int i = 1; i < 40; i += 2) t.arena().free(i);
+    }
+    const int64_t held_before = t.arena().used_slots();
+    f.pc.set_tiers(&t);
+
+    std::vector<RadStream> compute((size_t)world, nullptr);
+    std::vector<std::unique_ptr<TierExec>> x;
+    for (int r = 0; r < world; ++r) {
+        REQUIRE_EQ(rad_stream_create(&compute[(size_t)r], 0), RAD_OK);
+        x.push_back(std::make_unique<TierExec>());
+        REQUIRE_EQ(x.back()->configure(&reg, &fx[(size_t)r]->kv, &t, cg, /*max_batch=*/3, /*max_copy=*/64,
+                                       /*max_chain=*/64, /*leader=*/r == 0, /*device=*/0,
+                                       /*slot_off=*/L.own_off[(size_t)r], /*shared=*/nullptr), RAD_OK);
+    }
+    CHECK_EQ(x[0]->report().find("of it replicated on every rank and held once a slot") != std::string::npos, rep);
+
+    /* skew the groups' block ids, as run_transfer does */
+    int32_t skew = -1;
+    CHECK_OK(f.kv.reserve_block(cg[1], &skew));
+    const auto prompt = tok_run(5100, 48);
+    publish(f, 1, prompt, 40);                     /* twenty 2-token entries */
+    f.kv.free_sequence(1);
+    std::vector<std::vector<int32_t>> hit;
+    REQUIRE_EQ(f.pc.lookup(prompt, {}, &hit).n_attn_tokens, 40);
+    const std::vector<std::vector<int32_t>> was = hit;
+    CHECK_EQ((int64_t)was[0].size(), 20ll);        /* kv_index_r2: a block an entry */
+    CHECK_EQ((int64_t)was[2].size(), 40ll);        /* kv_index_r1: two */
+    for (int r = 0; r < world; ++r) fill(*fx[(size_t)r], r, alike);
+
+    /* ---- out ---- */
+    std::vector<TierJob> jobs;
+    t.plan_writeback(64, &jobs);
+    REQUIRE_EQ(jobs.size(), 20u);
+    for (int r = 0; r < world; ++r) CHECK_OK(x[(size_t)r]->issue_copy(jobs, compute[(size_t)r]));
+    for (int r = 0; r < world; ++r) {
+        int st = 0;
+        for (int spin = 0; spin < 20000 && (st = x[(size_t)r]->copy_state()) == 0; ++spin) usleep(100);
+        CHECK_EQ(st, 1);
+    }
+    if (verify && rep) {
+        for (int r = 1; r < world; ++r)
+            for (const TierJob& j : jobs) {
+                uint64_t sum = 0;
+                REQUIRE(x[(size_t)r]->take_replicated_sum(j.key, &sum));
+                x[0]->verify_replicated(j, r, sum);
+            }
+        CHECK_EQ(x[0]->stats().rep_checked, 20ll * (world - 1));
+        CHECK_EQ(x[0]->stats().rep_mismatch, alike ? 0ll : 20ll * (world - 1));
+    }
+    /* bytes out: the leader its entry, a follower its own window -- nothing under the flag */
+    for (int r = 0; r < world; ++r)
+        CHECK_EQ(x[(size_t)r]->stats().bytes_out, r == 0 || !rep ? 20 * 5520ll : 0ll);
+    x[0]->report_pass(jobs, std::vector<char>(jobs.size(), 1), 0);
+    CHECK_EQ(t.stats().to_host, 20);
+
+    /* ---- the VRAM is dropped and overwritten; a new sequence takes the lowest blocks ---- */
+    CHECK_EQ(f.pc.drop_clean(), 20);
+    for (auto& fp : fx) scribble(*fp);
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, 10));
+
+    /* ---- back ---- */
+    const std::vector<BlockHash> keys = f.pc.restorable_from(prompt, {});
+    REQUIRE_EQ(keys.size(), 20u);
+    std::vector<TierJob> up;
+    for (const BlockHash& k : keys) {
+        TierJob j;
+        REQUIRE(x[0]->plan_promote(k, &j));
+        up.push_back(j);
+    }
+    std::vector<char> ok(up.size(), 1);
+    for (int r = 0; r < world; ++r) {
+        std::vector<char> mine;
+        CHECK_OK(x[(size_t)r]->issue_restore(up, compute[(size_t)r], &mine));
+        for (size_t i = 0; i < ok.size(); ++i) ok[i] = ok[i] && i < mine.size() && mine[i];
+    }
+    for (char c : ok) CHECK(c);
+    x[0]->report_pass(up, ok, 0);
+    for (const TierJob& j : up) CHECK_OK(f.pc.rebind(j.key, j.blocks));
+    for (int r = 0; r < world; ++r) CHECK_OK(rad_stream_sync(compute[(size_t)r]));
+    for (int r = 0; r < world; ++r) CHECK_EQ(x[(size_t)r]->stats().bytes_in, 20 * 5520ll);
+
+    REQUIRE_EQ(f.pc.lookup(prompt, {}, &hit).n_attn_tokens, 40);
+    const std::vector<std::vector<int32_t>> now = hit;
+    int64_t moved = 0;
+    for (size_t k = 0; k < was[0].size(); ++k) moved += was[0][k] != now[0][k];
+    CHECK(moved > 0);
+    /* every rank holds, entry by entry, rank 0's bytes under the flag and its own without it */
+    for (int r = 0; r < world; ++r) CHECK_EQ(same_bytes(*fx[(size_t)r], r, was, now), 20);
+    CHECK_EQ(t.arena().used_slots(), held_before + 20);
+
+    for (auto& xp : x) xp->close();
+    for (RadStream s : compute) rad_stream_destroy(s);
+    f.pc.set_tiers(nullptr);
+    unsetenv("RADIANCE_DEBUG_TIER_VERIFY");
+}
+
+TEST(ds41_kvr_restores_the_one_copy_into_every_rank_at_tp4) {
+    for (bool fragment : { false, true }) {
+        run_ds41_transfer(/*rep=*/false, /*alike=*/false, /*verify=*/false, fragment);
+        run_ds41_transfer(/*rep=*/true, /*alike=*/false, /*verify=*/false, fragment);
+    }
+    run_ds41_transfer(/*rep=*/true, /*alike=*/true, /*verify=*/true, /*fragment=*/false);
+    run_ds41_transfer(/*rep=*/true, /*alike=*/false, /*verify=*/true, /*fragment=*/true);
+}
+
 /* With speculation each sequence has two physical state slots while the free list counts logical
  * ones; mixing them would read an idle pool as half full. */
 TEST(kv_bytes_in_use_count_a_speculating_state_once_per_sequence) {

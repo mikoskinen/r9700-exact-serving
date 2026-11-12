@@ -2980,6 +2980,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
 static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI's tracer, below */
 static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lever PSK, below */
 static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);   /* lever BI, below */
+static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lever KVR, below */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -3360,6 +3361,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(bi_declare(b, m, ctx));
     DS_TRY(psk_declare(b, m, ctx));
     DS_TRY(bt_declare(b, m, ctx));
+    DS_TRY(kvr_declare(b, m, ctx));
     return RAD_OK;
 }
 
@@ -3453,6 +3455,59 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 (long long)c.n_layer - 1, (long long)c.window, first,
                 (long long)(kPskBase + (c.n_layer - 1 - first) * c.window), (long long)c.n_layer - 1, (long long)kPskBase,
                 last);
+    return RAD_OK;
+}
+
+/* Lever KVR (ds41-kvr, 12.11.2026): RADIANCE_DS41_KV_REPLICATED=1 declares the prefix-cached groups -- kv_index_r* and
+ * kv_compressed_r*, the only groups an entry holds (the window and the DSpark ring are windowed, the compressor tail is
+ * linear state in the checkpoint store) -- rad_kv_group_replicated, so a host-tier slot carries them once, at its front,
+ * written by rank 0 and read back by every rank (core/runtime/tierexec.h, TierExec::slot_layout). Storage only: no op,
+ * buffer or kernel changes, and every rank still computes and stores its own copy. The claim holds because every rank
+ * writes the same bytes into these groups: the stores (the compressor GEMM, the pool / norm, the index-key GEMM, the
+ * norm / rope / round trips and entry_store, declare at :1971-2031, issued over the step's whole compressed rows on every
+ * rank in both step paths) read only the normed residual stream, which the exact wire (g.wire_exact, :1371: every word
+ * folded in fp32 in ascending rank order whoever reduces it) leaves bit-identical on every rank, through replicated
+ * weights (lw's RAD_SHARD_NONE); lever PSK cuts only layers past the last kv source; the packed forms write every byte
+ * of an entry (the mxfp4 / nvfp4 zero pad). RADIANCE_DEBUG_TIER_VERIFY checks it on a live server. Declared only when no
+ * rank is attention-zero (aw == world, :1323-1330): a zero rank holds none of these groups, and a replicated group must
+ * be one every rank holds alike. A declare-time layout (the slot's size and the host arena are fixed at bringup), so a
+ * start-time env, not a fn4 switch. Unset or 0 declares nothing: today's slots, byte for byte. */
+static std::atomic<int> g_kvr_env{-2};   /* -2 unread, -1 unset or not understood, 0 off, 1 on */
+static int kvr_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_KV_REPLICATED");
+    const int v = !e || !*e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+                                  : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+    if (g_kvr_env.compare_exchange_strong(unread, v) && e && *e && v < 0)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_KV_REPLICATED=%s is not 0 / off or 1 / on: lever KVR is not "
+                        "declared\n", e);
+    return g_kvr_env.load(std::memory_order_relaxed);
+}
+static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    if (kvr_read_env() != 1) return RAD_OK;
+    const bool say = ctx->rank == 0 && !ctx->shape_probe;
+    if (m.g.world <= 1 || m.aw != m.g.world) {
+        if (say)
+            fprintf(stderr, "radiance: deepseek41: lever KVR not declared (RADIANCE_DS41_KV_REPLICATED=1): %s\n",
+                    m.g.world <= 1 ? "one rank holds every slot alone"
+                                   : "attention-zero ranks hold none of the cached groups, so no group is alike on every rank");
+        return RAD_OK;
+    }
+    std::string names;
+    for (const auto* groups : { &m.index, &m.comp })
+        for (const auto& kv : *groups) {
+            DS_TRY(rad_kv_group_replicated(b, kv.second));
+            names += (names.empty() ? "" : ", ") +
+                     std::string(m.nm.f(groups == &m.index ? "kv_index_r%lld" : "kv_compressed_r%lld", (long long)kv.first));
+        }
+    if (!ctx->shape_probe)
+        rad_note(b, "lever KVR: %s replicated on every rank (RADIANCE_DS41_KV_REPLICATED=1): a host-tier slot holds them once",
+                 names.c_str());
+    if (say)
+        fprintf(stderr, "radiance: deepseek41: lever KVR declared (RADIANCE_DS41_KV_REPLICATED=1): %s hold the same bytes on "
+                        "all %d ranks (rad_kv_group_replicated), so a host-tier slot holds them once instead of %d times; "
+                        "start-time only\n",
+                names.c_str(), m.g.world, m.g.world);
     return RAD_OK;
 }
 
