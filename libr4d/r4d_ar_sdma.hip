@@ -66,6 +66,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <thread>
 
 namespace {
 
@@ -236,7 +237,26 @@ struct SdmaQ {
     uint64_t w = 0, seen = 0;
     uint32_t lists = 0;
     uint64_t ends[kEnds] = { 0 };
+    uint32_t prio = 15;
+    /* R4D_SDMA_QIDLE_MS: the queue is deactivated (KFD update to 0 %, unmapped) once idle that long, reactivated by the
+     * next launch (219: a declared context's queue cost c16 decode ~5 % at ar_sdma 0 -- 220 says whether its existence) */
+    bool active = true;
+    std::chrono::steady_clock::time_point last_kick{};
 };
+
+/* Maps (on) or unmaps (off) the queue: KFD's update with percentage 100 / 0. Call with q->mu held. */
+bool q_set_active(SdmaQ* q, bool on) {
+    if (!q || q->active == on) return true;
+    kfd_ioctl_update_queue_args u{};
+    u.ring_base_address = (uint64_t)(uintptr_t)q->ring.va;
+    u.queue_id = q->qid;
+    u.ring_size = (uint32_t)kRingBytes;
+    u.queue_percentage = on ? KFD_MAX_QUEUE_PERCENTAGE : 0;
+    u.queue_priority = q->prio;
+    if (ioctl(kfd(), AMDKFD_IOC_UPDATE_QUEUE, &u) < 0) return false;
+    q->active = on;
+    return true;
+}
 
 uint64_t q_read(const SdmaQ* q) {
     uint64_t r = *q->rptr;
@@ -373,6 +393,7 @@ SdmaQ* q_open(int dev, int engine, std::string* why) {
         return (unsigned)(v >= 0 && v <= KFD_MAX_QUEUE_PRIORITY ? v : KFD_MAX_QUEUE_PRIORITY);
     }();
     a.queue_priority = qprio;
+    q->prio = qprio;
     if (ioctl(kfd(), kKfdCreateQueue, &a) < 0) {
         *why = sfmt("the driver refused an SDMA queue on engine %d: %s", engine, std::strerror(errno));
         bo_free(q->gpu_id, &q->ptrs);
@@ -633,7 +654,24 @@ struct SdmaAr {
     unsigned int seq = 0;
     int fold_blocks = 0;
     unsigned long long* tl = nullptr;   /* the optional timeline (r4d_sdma_ar_timeline) */
+    /* R4D_SDMA_QIDLE_MS > 0: a thread unmaps the queue once it has been idle that long */
+    std::thread idler;
+    std::atomic<bool> stop{false};
+    int idle_ms = 0;
 };
+
+void idle_loop(SdmaAr* a) {
+    while (!a->stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        SdmaQ* q = a->q;
+        if (!q) continue;
+        std::unique_lock<std::mutex> lk(q->mu, std::try_to_lock);
+        if (!lk.owns_lock() || !q->active) continue;
+        if (*q->fin != q->lists) continue;   /* lists still running */
+        if (std::chrono::steady_clock::now() - q->last_kick < std::chrono::milliseconds(a->idle_ms)) continue;
+        q_set_active(q, false);
+    }
+}
 
 void* dev_alloc(size_t bytes, int mode) {
     void* p = nullptr;
@@ -687,6 +725,11 @@ int sdma_launch(SdmaAr* a, const void* in, void* out, long long numel, const lon
         }
         SdmaQ* q = a->q;
         std::lock_guard<std::mutex> lk(q->mu);
+        if (!q->active && !q_set_active(q, true)) {
+            std::fprintf(stderr, "[r4d] fn4 SDMA-AR: rank %d could not reactivate its copy-engine queue: %s\n", a->rank,
+                         std::strerror(errno));
+            return RAD_E_DEVICE;
+        }
         /* A hop: one copy a peer in ring order from r + 1, each followed by its FENCE; or, with R4D_SDMA_RR=<bytes>
          * (sdma2 12.11.: a hop sometimes ran at half the link rate for whole timing windows, 13.5 vs 26 GB/s -- two
          * senders into one card, the hypothesis), the peers taken round-robin a chunk at a time, so a rank one copy out
@@ -733,6 +776,7 @@ int sdma_launch(SdmaAr* a, const void* in, void* out, long long numel, const lon
         if (rc == RAD_OK) rc = q_fence(q, fl + kFDone * kFlagStride, v);
         const int krc = q_kick(q);
         if (rc == RAD_OK) rc = krc;
+        q->last_kick = std::chrono::steady_clock::now();
     }
     if (rc != RAD_OK) return rc;
     unsigned int mask_a = 0, mask_b = 0;
@@ -917,12 +961,21 @@ void* r4d_sdma_ar_create(int world, int rank, int dev, int engine, long long max
         for (void* p : { (void*)a->scr_a, (void*)a->scr_b, (void*)a->fl }) if (p) (void)hipFree(p);
         return fail(w.empty() ? "another rank failed" : w);
     }
+    if (const char* ie = std::getenv("R4D_SDMA_QIDLE_MS")) {
+        a->idle_ms = std::atoi(ie);
+        if (a->idle_ms > 0) {
+            SdmaAr* raw = a.get();
+            a->idler = std::thread([raw] { idle_loop(raw); });
+        }
+    }
     return a.release();
 }
 
 void r4d_sdma_ar_destroy(void* p) {
     SdmaAr* a = (SdmaAr*)p;
     if (!a) return;
+    a->stop.store(true);
+    if (a->idler.joinable()) a->idler.join();
     q_close(a->q);
     for (void* x : { (void*)a->scr_a, (void*)a->scr_b, (void*)a->fl, (void*)a->tl }) if (x) (void)hipFree(x);
     delete a;
