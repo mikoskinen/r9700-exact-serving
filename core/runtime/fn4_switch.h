@@ -453,6 +453,12 @@
  *                   temperature 0 stays byte-identical. A prompt-lookup proposal never couples. Needs --draft-coupling
  *                   on and a drafter whose walk declares the coupling planes (refused otherwise); RADIANCE_DRAFT_SAMPLE
  *                   at start (unset: 0). The counters are GET's "sample" object.
+ *   ds41_slotsum    deepseek41 (lever D3s): 1 the decode band's MoE runs the slot-order sum over an expert
+ *                   placement (moe_scatter_placed, moe_gather_all_reduce_slot) -- NOT today's bytes, the same bytes
+ *                   whatever the placement; 0 today's MoE (home placement, the rank-partial fold) at every step.
+ *                   1 is refused where no layer declared it (RADIANCE_DS41_SLOTSUM unset); -1 when unserved.
+ *   ds41_place      deepseek41 (lever D3s): the placement table the slot path dispatches over, 0 the contiguous
+ *                   split, 1 / 2 RADIANCE_DS41_EP_PLACE / _PLACE2's; a table no layer declared is refused.
  *
  * "epoch_bump": 1 in a request starts a new epoch without changing a switch, so an A/A block pair re-records
  * exactly as an A/B pair does.
@@ -482,7 +488,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d, kSwitches };
+              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d, kDs41Slotsum,
+              kDs41Place, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

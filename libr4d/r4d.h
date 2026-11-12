@@ -497,6 +497,22 @@ void r4d_ar_gather_twoshot_4rank(long peer_scratch0, long peer_scratch1, long pe
                                  long top_k, long sig, long rank, long stream, long nblocks,
                                  long nthreads, long drain, long acq, long pub, long gate,
                                  long gate_ctr);
+// moe_gather_all_reduce_slot (lever D3s; r4d_ar_slotsum.hip): the MoE gather and the four-rank exact
+// all-reduce as one SLOT-ORDER sum (r4d_ar_hc.h): the ranks' shared-arm products in ascending rank
+// order, then every slot's routed row in ascending slot order, rounded once -- the same bytes
+// whichever rank holds which expert. Gather operands as r4d_ar_gather_twoshot_4rank's; `form` 0 the
+// one-shot, 1 the two-shot (both the same sum), on the wide family's flags, seq and parity, with
+// the planes over a parity's whole half of the scratch. r4d_ar_slot_ok: the call fits `form`;
+// r4d_ar_slot_numel: the instance size (elements of one slot) the one-shot's planes need.
+int  r4d_ar_slot_ok(long M, long n, long top_k, long slot_stride16, long form);
+long r4d_ar_slot_numel(long M, long n, long top_k);
+void r4d_ar_slot_4rank(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                       long peer_flags0, long peer_flags1, long peer_flags2, long my_scratch,
+                       long my_flags, long seq_ctrs, long slot_stride16, long y, long M, long n,
+                       long ye, long ew, long sorted, long sh, long sg, long ye_ld, long ew_ld,
+                       long sh_ld, long sg_ld, long top_k, long sig, long rank, long stream,
+                       long form, long nblocks, long nthreads, long drain, long acq, long pub,
+                       long gate, long gate_ctr);
 void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                                 long peer_scratch3, long peer_scratch4, long peer_scratch5,
                                 long peer_scratch6, long peer_flags0, long peer_flags1,

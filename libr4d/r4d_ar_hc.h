@@ -214,3 +214,131 @@ __device__ __forceinline__ void r4d_ar_hc_write_word(const unsigned short* __res
     *hp = hv;
   }
 }
+
+// ---- The SLOT-ORDER sum (moe_gather_all_reduce_slot, lever D3s; r4d_ar_slotsum.hip).
+//
+// moe_gather_all_reduce and every form above sum a token's slots ON ITS RANK, round that partial
+// (with the rank's shared-arm product) to bf16 and fold the ranks' partials in ascending rank
+// order: moving an expert to another rank moves its term into another partial, so the bytes
+// depend on where each expert sits. The slot-order sum does not: for every element,
+//
+//   acc = 0
+//   acc += H_r            for every rank r ascending   (H_r = bf16(shared_r * gate), the rank's
+//                                                       width slice of the shared arm, moe_gather's
+//                                                       narrow; absent without a shared arm)
+//   acc = fmaf(w_j, S_j, acc)  for every slot j ascending (S_j = the slot's routed-expert row as the
+//                                                       expert GEMM stored it; with bf16 weights
+//                                                       acc + w_j * S_j, no contraction)
+//   y = bf16(acc)         rounded once, nearest-even
+//
+// S_j is the same bytes whichever rank computed the slot (the expert's GEMM row depends on that
+// token and that expert only), and the H_r come from fixed width slices, so the sum is the same
+// whoever holds which expert: expert placement, rebalancing and replication cannot move a byte.
+// Every slot must be held by exactly one rank (the placement is total; there are no dropped slots).
+//
+// Transport: every rank writes its own slots' rows (and its H) into PLANES of the reducing
+// rank's scratch, plane j for slot j and plane K + r for rank r's H, each a run of the reduced
+// words, so a slot's word lands at the same place whichever rank sends it and the reducer needs no
+// placement to find it.
+
+// The block's slot table over every row of the call: s_i[r * K + j] = the sorted row holding
+// slot j of row r ON THIS RANK, -1 where another rank holds it; s_w[r * K + j] every slot's weight
+// (the replicated router's, so the same on every rank); s_g[r] the shared gate (with the arm).
+// M <= R4D_ARGL_ROWS, M * K <= R4D_ARGL_TAB. Every thread calls it; it ends on a barrier.
+__device__ __forceinline__ void r4d_ar_slot_table(const R4dArGather& G, int* s_i, float* s_w,
+                                                  float* s_g) {
+  const int K = G.top_k, T = G.T, M = T / K;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  for (int x = tid; x < T; x += nt) {
+    s_i[x] = -1;
+    s_w[x] = r4d_ar_gather_w(G, (long)(x / K) * G.ew_ld + x % K);
+  }
+  __syncthreads();
+  for (int i = tid; i < T; i += nt) {
+    const int f = G.sorted[i];
+    if (f >= 0 && f < T) s_i[f] = i;
+  }
+  if (G.sh)
+    for (int r = tid; r < M; r += nt) {
+      const float v0 = bf2f(G.sg[(long)r * G.sg_ld]);
+      s_g[r] = G.sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
+    }
+  __syncthreads();
+}
+
+// This rank's share of word (row, i0) into the planes at `P` (plane stride `ps` words, word `k`):
+// its shared product into plane K + rank, each slot of the row it holds into that slot's plane.
+// Returns nothing; the planes are the reducer's (a peer's scratch or this rank's own).
+__device__ __forceinline__ void r4d_ar_slot_push(const R4dArGather& G, const int* s_i,
+                                                 const float* s_g, int row, int i0, int rank,
+                                                 int4* __restrict__ P, long ps, long k) {
+  const int K = G.top_k;
+  if (G.sh) {
+    const int4 v = *reinterpret_cast<const int4*>(G.sh + (long)row * G.sh_ld + i0);
+    const unsigned short* ve = reinterpret_cast<const unsigned short*>(&v);
+    const float gate = s_g[row];
+    int4 o;
+    unsigned short* oe = reinterpret_cast<unsigned short*>(&o);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) oe[e] = arg_bf16_rne(bf2f(ve[e]) * gate);
+    P[(long)(K + rank) * ps + k] = o;
+  }
+  for (int j = 0; j < K; ++j) {
+    const int si = s_i[row * K + j];
+    if (si < 0) continue;
+    P[(long)j * ps + k] = *reinterpret_cast<const int4*>(G.ye + (long)si * G.ye_ld + i0);
+  }
+}
+
+// The reducer's word k: the WS shared products in ascending rank order (has_sh), then the K
+// slots in ascending slot order with their weights `w` (the row's s_w entries), rounded once.
+// Loads go out four at a time ahead of the adds, which stay in order.
+template <int WS>
+__device__ __forceinline__ int4 r4d_ar_slot_sum_word(const int4* __restrict__ P, long ps, long k,
+                                                     int K, bool has_sh, const float* w,
+                                                     int ew_f32) {
+  float acc[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
+  if (has_sh) {
+    int4 v[WS];
+#pragma unroll
+    for (int r = 0; r < WS; ++r) v[r] = P[(long)(K + r) * ps + k];
+#pragma unroll
+    for (int r = 0; r < WS; ++r) {
+      const unsigned short* ve = reinterpret_cast<const unsigned short*>(&v[r]);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[e] += bf2f(ve[e]);
+    }
+  }
+  constexpr int kU = 4;
+  for (int j0 = 0; j0 < K; j0 += kU) {
+    int4 v[kU];
+#pragma unroll
+    for (int u = 0; u < kU; ++u)
+      if (j0 + u < K) v[u] = P[(long)(j0 + u) * ps + k];
+#pragma unroll
+    for (int u = 0; u < kU; ++u) {
+      if (j0 + u >= K) continue;
+      const float wj = w[j0 + u];
+      const unsigned short* ve = reinterpret_cast<const unsigned short*>(&v[u]);
+      if (ew_f32) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] = fmaf(wj, bf2f(ve[e]), acc[e]);
+      } else {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] += wj * bf2f(ve[e]);
+      }
+    }
+  }
+  int4 out;
+  unsigned short* oe = reinterpret_cast<unsigned short*>(&out);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) oe[e] = arg_bf16_rne(acc[e]);
+  return out;
+}
+
+// Plane counts: the one-shot keeps K + WS planes of the whole message a parity, the two-shot
+// K + WS planes of the longest shard plus WS of its reduced words (region B, one an owner).
+#define R4D_ARS_ONESHOT_PLANES(K, WS) ((K) + (WS))
+#define R4D_ARS_TWOSHOT_PLANES(K, WS) ((K) + 2 * (WS))

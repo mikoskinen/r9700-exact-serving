@@ -547,12 +547,12 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_ds41_ggml_mr.hip ${R4D_DIR}/r4d_dspark_extra.hip ${R4D_DIR}/r4d_ds41_mxfp4_mr.hip
                 ${R4D_DIR}/r4d_gemm_bf16_nt_m64.hip ${R4D_DIR}/r4d_gemm_bf16_nt_pf.hip
                 ${R4D_DIR}/r4d_ds41_ggml_pf.hip ${R4D_DIR}/r4d_ds41_f32pf.hip ${R4D_DIR}/r4d_ds41_walk.hip
-                ${R4D_DIR}/r4d_ds41_wsamp.hip)
+                ${R4D_DIR}/r4d_ds41_wsamp.hip ${R4D_DIR}/r4d_moe_place.hip)
 # The M2XFP4 units' plugin entries call two cfg readers that r4d_rows.cpp defines, which is not in
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                   dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
-                  ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq)
+                  ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq slotsum)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -599,7 +599,7 @@ else()
                 ${R4D_EMU}/test_dspark.cpp ${R4D_EMU}/test_ds41fold2.cpp ${R4D_EMU}/test_ds41drk.cpp
                 ${R4D_EMU}/test_ds41kvwin.cpp ${R4D_EMU}/test_ds41pf.cpp ${R4D_EMU}/test_ds41walk.cpp
                 ${R4D_EMU}/test_ds41wsamp.cpp ${R4D_EMU}/test_ds41i9b.cpp ${R4D_EMU}/test_ds41arc.cpp
-                ${R4D_EMU}/test_ds41i11.cpp ${R4D_EMU}/test_ds41gq.cpp
+                ${R4D_EMU}/test_ds41i11.cpp ${R4D_EMU}/test_ds41gq.cpp ${R4D_EMU}/test_slotsum.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -639,7 +639,7 @@ endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
             ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
-            ds41arc ds41i11 ds41gq)
+            ds41arc ds41i11 ds41gq slotsum)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
@@ -685,7 +685,7 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_lili r4d_emu_ds41mr r4d_emu_argts r4d_emu_dspark r4d_emu_ds41drk
+                       r4d_emu_dsa r4d_emu_m2xfp4 r4d_emu_lili r4d_emu_ds41mr r4d_emu_argts r4d_emu_dspark r4d_emu_ds41drk r4d_emu_slotsum
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within

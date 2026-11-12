@@ -33453,6 +33453,327 @@ static void moe_gather_ar_case(const Plugin& pl, const std::vector<int>& devs, c
                 (long long)n_twoshot, (long long)n_oneshot);
 }
 
+/* ---- moe_gather_all_reduce_slot_4rank (lever D3s): the slot-order sum on four cards, against its
+ * oracle and against ITSELF across placements.
+ *
+ * The routing, the slot weights, each slot's routed row and each rank's shared slice are fixed per
+ * shape; only WHICH rank holds each slot changes between placements: contiguous (expert e on rank
+ * e / (E / 4)), scrambled (every expert on a drawn rank) and per-slot (every slot on a drawn rank, as
+ * replicated experts may serve a token's slot from any copy). A rank's sort holds its slots (by
+ * expert, then slot), its y_expert rows are those slots' rows, the shared slice and the gate plane
+ * stay the rank's. Three launches a shape and placement on one instance (ts_min default / 0 /
+ * default: the two-shot from 7 rows of 5120, the one-shot, the two-shot again), so both transports
+ * and both scratch parities run, interleaved.
+ *
+ * Oracle: for every element acc = the four ranks' bf16(shared * gate) in ascending rank order, then
+ * every slot's row times its weight in ascending slot order (fmaf for f32 weights, multiply then add
+ * for bf16), rounded once. Every rank's y must hold it -- to the bit, except a sigmoid gate (the
+ * oracle's exp is not __expf: within 2 % counts as moved) -- and must be the same bytes under every
+ * placement (no tolerance). */
+static void moe_gather_ar_slot_case(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if ((int)devs.size() < 4) { skip(name, "needs 4 gfx1201 cards"); return; }
+    if (!ar_peer_path_ok(devs, 4)) { skip(name, "no peer path between the cards (device.p2p)"); return; }
+    struct Shape { int64_t M, n, top_k, n_expert; bool f32w; const char* act; };
+    std::vector<Shape> shapes;
+    for (int64_t M = 1; M <= 48; ++M) shapes.push_back({ M, 5120, 6, 384, true, "none" });
+    shapes.push_back({ 56, 5120, 6, 384, true, "none" });
+    shapes.push_back({ 64, 5120, 6, 384, true, "none" });
+    shapes.push_back({ 9, 2048, 8, 128, false, nullptr });
+    shapes.push_back({ 40, 2048, 8, 128, false, "none" });
+    shapes.push_back({ 12, 2048, 8, 128, true, "sigmoid" });
+    const std::string nm(name);
+    int64_t n_twoshot = 0, n_oneshot = 0;
+    for (const Shape& s : shapes) {
+        const int64_t M = s.M, n = s.n, k = s.top_k, T = M * k, E = s.n_expert, El = E / 4;
+        const bool sig = s.act && !std::strcmp(s.act, "sigmoid");
+        const std::string at = " M=" + std::to_string(M) + " n=" + std::to_string(n) + " top_k=" +
+                               std::to_string(k) + (s.f32w ? " f32" : " bf16") + " weights, " +
+                               (s.act ? std::string("shared ") + s.act : std::string("no shared arm"));
+        uint64_t rs = 0xA24BAED4963EE407ull ^ ((uint64_t)M * 1315423911ull) ^ ((uint64_t)n * 2654435761ull) ^
+                      (uint64_t)k;
+        auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+        /* the replicated routing, every slot live */
+        std::vector<int32_t> ex((size_t)T, -1);
+        for (int64_t tok = 0; tok < M; ++tok)
+            for (int64_t j = 0; j < k; ++j) {
+                int32_t e = 0;
+                bool dup = true;
+                while (dup) {
+                    e = (int32_t)(rnd() % (uint64_t)E);
+                    dup = false;
+                    for (int64_t q = 0; q < j; ++q) dup = dup || ex[(size_t)(tok * k + q)] == e;
+                }
+                ex[(size_t)(tok * k + j)] = e;
+            }
+        std::vector<float> ewf((size_t)T);
+        std::vector<uint16_t> ewb((size_t)T);
+        for (int64_t i = 0; i < T; ++i) {
+            ewf[(size_t)i] = (float)(rnd() % 100000 + 1) / 40000.0f;
+            ewb[(size_t)i] = h_to_bf16((float)(rnd() % 1000 + 1) / 1024.0f);
+        }
+        std::vector<uint16_t> rowv((size_t)(T * n));
+        for (auto& v : rowv) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 512.0f);
+        std::vector<std::vector<uint16_t>> shr(4), sgr(4);
+        if (s.act)
+            for (int r = 0; r < 4; ++r) {
+                shr[(size_t)r].resize((size_t)(M * n));
+                sgr[(size_t)r].resize((size_t)M);
+                for (auto& v : shr[(size_t)r]) v = h_to_bf16(((int64_t)(rnd() % 4001) - 2000) / 256.0f);
+            }
+        if (s.act)
+            for (int64_t tok = 0; tok < M; ++tok) {
+                const uint16_t g = sig ? h_to_bf16(((int64_t)(rnd() % 801) - 400) / 100.0f) : h_to_bf16(1.0f);
+                for (int r = 0; r < 4; ++r) sgr[(size_t)r][(size_t)tok] = g;   /* the gate is replicated */
+            }
+        /* the oracle */
+        std::vector<float> want((size_t)(M * n));
+        for (int64_t tok = 0; tok < M; ++tok) {
+            float gate = 1.0f;
+            if (s.act) {
+                const float g0 = h_bf16(sgr[0][(size_t)tok]);
+                gate = sig ? 1.0f / (1.0f + std::exp(-g0)) : g0;
+            }
+            for (int64_t e = 0; e < n; ++e) {
+                float acc = 0.0f;
+                if (s.act)
+                    for (int r = 0; r < 4; ++r) acc += h_bf16(h_to_bf16(h_bf16(shr[(size_t)r][(size_t)(tok * n + e)]) * gate));
+                for (int64_t j = 0; j < k; ++j) {
+                    const float yv = h_bf16(rowv[(size_t)((tok * k + j) * n + e)]);
+                    if (s.f32w) acc = std::fmaf(ewf[(size_t)(tok * k + j)], yv, acc);
+                    else { const float pr = h_bf16(ewb[(size_t)(tok * k + j)]) * yv; acc = acc + pr; }
+                }
+                want[(size_t)(tok * n + e)] = acc;
+            }
+        }
+        std::vector<uint16_t> first;
+        const char* const pname[3] = { "contiguous", "scrambled", "per-slot" };
+        std::vector<int32_t> eperm((size_t)E);
+        for (int64_t e = 0; e < E; ++e) eperm[(size_t)e] = (int32_t)(rnd() % 4);
+        bool all_ok = true;
+        std::string why;
+        for (int pi = 0; pi < 3; ++pi) {
+            std::vector<int32_t> owner((size_t)T);
+            for (int64_t i = 0; i < T; ++i)
+                owner[(size_t)i] = pi == 0 ? (int32_t)(ex[(size_t)i] / El) : pi == 1 ? eperm[(size_t)ex[(size_t)i]]
+                                                                                       : (int32_t)(rnd() % 4);
+            std::vector<MgAr> t(4);
+            std::vector<std::thread> th;
+            for (int r = 0; r < 4; ++r) {
+                MgAr& x = t[(size_t)r];
+                x.row = row; x.rank = r; x.dev = devs[(size_t)r];
+                x.M = M; x.n = n; x.top_k = k; x.f32w = s.f32w; x.act = s.act; x.use_scratch = false;
+                x.ts = { -1, 0, -1 };
+                std::vector<std::pair<int32_t, int32_t>> mine;
+                for (int64_t i = 0; i < T; ++i)
+                    if (owner[(size_t)i] == r) mine.push_back({ ex[(size_t)i], (int32_t)i });
+                std::stable_sort(mine.begin(), mine.end());
+                x.sorted.assign((size_t)T, -1);
+                x.ye.assign((size_t)(T * n), h_to_bf16(1e30f));   /* rows past the live count: junk */
+                for (size_t q = 0; q < mine.size(); ++q) {
+                    x.sorted[q] = mine[q].second;
+                    std::memcpy(&x.ye[q * (size_t)n], &rowv[(size_t)mine[q].second * (size_t)n], (size_t)n * 2);
+                }
+                x.ewf = ewf; x.ewb = ewb;
+                if (s.act) { x.sh = shr[(size_t)r]; x.sg = sgr[(size_t)r]; }
+                th.emplace_back(mgar_worker, &x);
+            }
+            for (std::thread& x : th) x.join();
+            bool up = true, ran = true;
+            std::string rcs;
+            for (const MgAr& x : t) {
+                up = up && x.rc_init == RAD_OK;
+                ran = ran && x.rc_launch == RAD_OK && x.y_out.size() == x.ts.size();
+                rcs += std::to_string(x.rc_init) + "/" + std::to_string(x.rc_launch) + " ";
+            }
+            if (!up) { ok((nm + at + " init (peer rendezvous)").c_str(), false, "init/launch rc " + rcs); return; }
+            if (row->fini) for (MgAr& x : t) if (x.inst) row->fini(x.inst);
+            if (!ran) { all_ok = false; why += std::string(" ") + pname[pi] + ": launch rc " + rcs; continue; }
+            int64_t bad = 0, moved = 0, diff0 = 0, firstbad = -1;
+            for (int64_t i = 0; i < M * n; ++i) {
+                const uint16_t w = h_to_bf16(want[(size_t)i]);
+                for (const MgAr& x : t)
+                    for (const auto& yo : x.y_out) {
+                        const uint16_t got = yo[(size_t)i];
+                        if (got == w) continue;
+                        const double rel = std::fabs((double)h_bf16(got) - (double)want[(size_t)i]) /
+                                           (std::fabs((double)want[(size_t)i]) + 1.0);
+                        if (sig && rel <= 0.02) ++moved;
+                        else { ++bad; if (firstbad < 0) firstbad = i; }
+                    }
+            }
+            /* the same bytes as the first placement, every rank, every launch */
+            if (first.empty()) first = t[0].y_out[0];
+            for (const MgAr& x : t)
+                for (const auto& yo : x.y_out)
+                    for (int64_t i = 0; i < M * n; ++i) diff0 += yo[(size_t)i] != first[(size_t)i];
+            if (bad || diff0) {
+                all_ok = false;
+                why += fmt(" %s: %lld vs the oracle (first at %lld), %lld vs the contiguous bytes", pname[pi],
+                           (long long)bad, (long long)firstbad, (long long)diff0);
+            }
+            if (sig && moved) why += fmt(" (%s: %lld within 2 %% of the f64-exp oracle)", pname[pi], (long long)moved);
+        }
+        const bool two = M * n >= 32768;
+        (two ? n_twoshot : n_oneshot) += 1;
+        ok((nm + at + (two ? ", two-shot / one-shot / two-shot" : ", one-shot x3") +
+            ", contiguous / scrambled / per-slot placement: the slot-order oracle, the same bytes on every rank and placement").c_str(),
+           all_ok, why);
+    }
+    std::printf("        %lld shapes took the two-shot at the default point, %lld the one-shot\n",
+                (long long)n_twoshot, (long long)n_oneshot);
+}
+
+/* ---- moe_scatter_placed_i32 (lever D3s), one card: the four ranks' instances of one placement (the
+ * same masks, each its rank's extras), each launched over the same ids. Held to the host reference
+ * of the dispatch (every active single-copy expert loads its rank by its cost; the replicated ones in
+ * ascending id each to the least-loaded copy, ties the first in rotation from id % 4), stable by local
+ * expert then slot; every slot on exactly one rank; and the contiguous table against moe_scatter_i32
+ * with expert_base, today's EP sort, byte for byte. */
+static void moe_scatter_placed_case(const Plugin& pl, const char* name) {
+    const RadKernelInfo* row = find(pl, name);
+    const RadKernelInfo* ms = find(pl, "moe_scatter_i32");
+    if (!row || !ms) { ok(name, false, "row absent"); return; }
+    struct Shape { int64_t M, k, E; };
+    const Shape shapes[] = { { 1, 6, 384 }, { 4, 6, 384 }, { 8, 6, 384 }, { 48, 6, 384 }, { 64, 6, 384 },
+                             { 170, 6, 384 }, { 33, 8, 128 }, { 128, 8, 64 } };
+    for (const Shape& s : shapes) {
+        const int64_t M = s.M, k = s.k, E = s.E, Tn = M * k, nh = E / 4;
+        uint64_t rs = 0x5851F42D4C957F2Dull ^ ((uint64_t)M * 1315423911ull) ^ (uint64_t)(k * 31 + E);
+        auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+        std::vector<int32_t> ex((size_t)Tn);
+        for (int64_t tok = 0; tok < M; ++tok)
+            for (int64_t j = 0; j < k; ++j) {
+                int32_t e = 0;
+                bool dup = true;
+                while (dup) {
+                    e = (int32_t)(rnd() % 3 == 0 ? rnd() % (uint64_t)std::max<int64_t>(8, E / 16) : rnd() % (uint64_t)E);
+                    dup = false;
+                    for (int64_t q = 0; q < j; ++q) dup = dup || ex[(size_t)(tok * k + q)] == e;
+                }
+                ex[(size_t)(tok * k + j)] = e;
+            }
+        for (int pi = 0; pi < 3; ++pi) {
+            const char* pn = pi == 0 ? "contiguous" : pi == 1 ? "scrambled" : "replicated";
+            std::vector<int32_t> mask((size_t)E), cost((size_t)E, 16);
+            for (int64_t e = 0; e < E; ++e) {
+                const int32_t home = 1 << (e / nh);
+                mask[(size_t)e] = pi == 0 ? home : pi == 1 ? 1 << (int)(rnd() % 4)
+                                : (e % 4 == 0 ? (home | (int32_t)(rnd() % 16)) : home);
+                if (pi == 2) cost[(size_t)e] = 8 + (int32_t)(rnd() % 24);
+            }
+            std::string place, cst;
+            for (int64_t e = 0; e < E; ++e) {
+                place += "0123456789abcdef"[mask[(size_t)e]];
+                cst += (e ? "," : "") + std::to_string(cost[(size_t)e]);
+            }
+            /* the host reference */
+            std::vector<char> act((size_t)E, 0);
+            for (int32_t e : ex) act[(size_t)e] = 1;
+            int32_t ld[4] = { 0, 0, 0, 0 };
+            for (int64_t e = 0; e < E; ++e)
+                if (act[(size_t)e] && __builtin_popcount((unsigned)mask[(size_t)e]) == 1)
+                    ld[__builtin_ctz((unsigned)mask[(size_t)e])] += cost[(size_t)e];
+            std::vector<int32_t> choice((size_t)E, -1);
+            for (int64_t e = 0; e < E; ++e) {
+                if (!act[(size_t)e] || __builtin_popcount((unsigned)mask[(size_t)e]) == 1) continue;
+                int32_t best = -1;
+                for (int q = 0; q < 4; ++q) {
+                    const int r = (int)((e + q) % 4);
+                    if (!((mask[(size_t)e] >> r) & 1)) continue;
+                    if (best < 0 || ld[r] < ld[best]) best = r;
+                }
+                choice[(size_t)e] = best;
+                ld[best] += cost[(size_t)e];
+            }
+            std::vector<int> seen((size_t)Tn, 0);
+            bool good = true;
+            std::string why;
+            for (int r = 0; r < 4; ++r) {
+                std::vector<int64_t> xs;
+                for (int64_t e = 0; e < E; ++e)
+                    if (((mask[(size_t)e] >> r) & 1) && e / nh != r) xs.push_back(e);
+                std::string xstr;
+                for (size_t q = 0; q < xs.size(); ++q) xstr += (q ? "," : "") + std::to_string(xs[q]);
+                const int64_t nl = nh + (int64_t)xs.size();
+                std::vector<int32_t> loc((size_t)E, -1);
+                for (int64_t i = 0; i < nh; ++i) loc[(size_t)(r * nh + i)] = (int32_t)i;
+                for (size_t q = 0; q < xs.size(); ++q) loc[(size_t)xs[q]] = (int32_t)(nh + (int64_t)q);
+                std::vector<std::pair<int32_t, int32_t>> mine;
+                for (int64_t i = 0; i < Tn; ++i) {
+                    const int32_t e = ex[(size_t)i];
+                    const int32_t o = __builtin_popcount((unsigned)mask[(size_t)e]) == 1 ? __builtin_ctz((unsigned)mask[(size_t)e])
+                                                                                          : choice[(size_t)e];
+                    if (o == r) mine.push_back({ loc[(size_t)e], (int32_t)i });
+                }
+                std::stable_sort(mine.begin(), mine.end());
+                std::vector<RadParam> ps = { PI("M", M), PI("n_expert", nl), PI("top_k", k), PI("n_expert_all", E),
+                                             PI("world_size", 4), PI("n_home", nh), PS("place", place.c_str()),
+                                             PS("extras", xstr.c_str()) };
+                if (pi == 2) ps.push_back(PS("cost", cst.c_str()));
+                void* inst = nullptr;
+                const int irc = row->init(ps.data(), (int)ps.size(), r, 4, &inst);
+                if (irc != RAD_OK) { good = false; why += fmt(" rank %d init rc %d", r, irc); continue; }
+                void* d_ids = dalloc((size_t)Tn * 4);
+                void* d_so = dalloc((size_t)Tn * 4);
+                void* d_of = dalloc((size_t)(nl + 1) * 4);
+                void* d_cn = dalloc((size_t)nl * 4);
+                fill_i32(d_ids, ex);
+                std::vector<RadTensor> ts = { T(d_ids, RAD_I32, { M, k }), T(d_so, RAD_I32, { Tn }),
+                                              T(d_of, RAD_I32, { nl + 1 }), T(d_cn, RAD_I32, { nl }) };
+                RadArgs a;
+                std::memset(&a, 0, sizeof(a));
+                a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+                a.instance = inst; a.rank = r; a.world_size = 4;
+                const int lrc = row->launch(&a, nullptr);
+                st_stream_sync(nullptr);
+                std::vector<int32_t> so((size_t)Tn), of((size_t)(nl + 1)), cn((size_t)nl);
+                st_memcpy(so.data(), d_so, (size_t)Tn * 4, hipMemcpyDeviceToHost);
+                st_memcpy(of.data(), d_of, (size_t)(nl + 1) * 4, hipMemcpyDeviceToHost);
+                st_memcpy(cn.data(), d_cn, (size_t)nl * 4, hipMemcpyDeviceToHost);
+                if (row->fini) row->fini(inst);
+                if (lrc != RAD_OK) { good = false; why += fmt(" rank %d launch rc %d", r, lrc); continue; }
+                int64_t d = -1;
+                for (int64_t i = 0; i < Tn && d < 0; ++i) {
+                    const int32_t w = i < (int64_t)mine.size() ? mine[(size_t)i].second : -1;
+                    if (so[(size_t)i] != w) d = i;
+                }
+                bool oc = of[0] == 0;
+                for (int64_t l = 0; l < nl; ++l) oc = oc && of[(size_t)l + 1] == of[(size_t)l] + cn[(size_t)l];
+                oc = oc && of[(size_t)nl] == (int32_t)mine.size();
+                for (size_t q = 0; q < mine.size(); ++q) ++seen[(size_t)mine[q].second];
+                if (d >= 0 || !oc) { good = false; why += fmt(" rank %d: sort first diff %lld, offsets/counts %d", r, (long long)d, (int)oc); }
+                if (pi == 0) {   /* today's EP sort */
+                    void* e_so = dalloc((size_t)Tn * 4);
+                    void* e_of = dalloc((size_t)(nh + 1) * 4);
+                    void* e_cn = dalloc((size_t)nh * 4);
+                    std::vector<RadParam> mp = { PI("M", M), PI("n_expert", nh), PI("top_k", k), PI("expert_base", r * nh) };
+                    std::vector<RadTensor> mt = { T(d_ids, RAD_I32, { M, k }), T(e_so, RAD_I32, { Tn }),
+                                                  T(e_of, RAD_I32, { nh + 1 }), T(e_cn, RAD_I32, { nh }) };
+                    RadArgs b2;
+                    std::memset(&b2, 0, sizeof(b2));
+                    b2.t = mt.data(); b2.n_t = (int)mt.size(); b2.p = mp.data(); b2.n_p = (int)mp.size();
+                    const int mrc = ms->launch(&b2, nullptr);
+                    st_stream_sync(nullptr);
+                    std::vector<int32_t> so2((size_t)Tn), of2((size_t)(nh + 1)), cn2((size_t)nh);
+                    st_memcpy(so2.data(), e_so, (size_t)Tn * 4, hipMemcpyDeviceToHost);
+                    st_memcpy(of2.data(), e_of, (size_t)(nh + 1) * 4, hipMemcpyDeviceToHost);
+                    st_memcpy(cn2.data(), e_cn, (size_t)nh * 4, hipMemcpyDeviceToHost);
+                    const bool same = mrc == RAD_OK && so2 == so && std::equal(of2.begin(), of2.end(), of.begin()) &&
+                                      std::equal(cn2.begin(), cn2.end(), cn.begin());
+                    if (!same) { good = false; why += fmt(" rank %d: contiguous differs from moe_scatter_i32 (rc %d)", r, mrc); }
+                }
+            }
+            for (int64_t i = 0; i < Tn; ++i)
+                if (seen[(size_t)i] != 1) { good = false; why += fmt(" slot %lld served %d times", (long long)i, seen[(size_t)i]); break; }
+            ok(fmt("%s M=%lld top_k=%lld E=%lld %s: the dispatch's reference sort on every rank, every slot once%s", name,
+                   (long long)M, (long long)k, (long long)E, pn, pi == 0 ? ", = moe_scatter_i32" : "").c_str(), good, why);
+            dfree_all();
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ the fused junction (ar_rmsnorm_quant_i8) */
 /* The all-reduce with the sandwich-norm junction as its epilogue, at two ranks
  * (ar_rmsnorm_quant_i8) and at four (ar_rmsnorm_quant_i8_4rank), against the chain it replaces:
@@ -37730,6 +38051,15 @@ static void device_phase(const Plugin& pl) {
         if (!g_case) std::printf("\ncross-rank, the MoE gather folded in\n");
         std::printf("  %s\n", n);
         moe_gather_ar_case(pl, devs, n);
+    }
+    /* Lever D3s: the slot-order sum on four cards, against its oracle and itself across placements. */
+    if (sel("moe_gather_all_reduce_slot_4rank")) {
+        std::printf("  moe_gather_all_reduce_slot_4rank\n");
+        moe_gather_ar_slot_case(pl, devs, "moe_gather_all_reduce_slot_4rank");
+    }
+    if (sel("moe_scatter_placed_i32")) {
+        std::printf("  moe_scatter_placed_i32\n");
+        moe_scatter_placed_case(pl, "moe_scatter_placed_i32");
     }
     /* The wide rows at every width are dispatched above and skip themselves, naming the width
      * they need, on a box with fewer cards. */
