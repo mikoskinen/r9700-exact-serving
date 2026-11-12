@@ -254,6 +254,19 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      "rows are not counted and planned as without it", cap_now_);
         cap_seq_note(cfg.max_seqs);
     }
+    {   /* lever CBH: the co-batch hold (fn4 sched_cb_hold_ms / sched_cb_hold_k; RADIANCE_SCHED_CB_HOLD_MS / _K their values at
+         * start), read again at every step planned; a start line only when it is on */
+        cbh_ms_ = fn4::sched_cb_hold_ms();
+        cbh_k_ = fn4::sched_cb_hold_k();
+        cbh_on_ = false;
+        cbh_t0_us_ = cbh_us_ = 0;
+        for (int64_t& c : cbh_n_) c = 0;
+        if (cbh_ms_ > 0)
+            RAD_INFO("lever CBH: co-batch hold %d ms, K %d (RADIANCE_SCHED_CB_HOLD_MS / _K, fn4 sched_cb_hold_ms / "
+                     "sched_cb_hold_k): while >= 2 sequences decode, waiting newcomers are admitted when %d wait or %d ms "
+                     "after the first arrived, so they start in one step; admission order and pieces unchanged",
+                     cbh_ms_, cbh_k_, cbh_k_, cbh_ms_);
+    }
 
     /* The engine resolves the geometry once, because the prefix cache needs its checkpoint
      * interval first; a caller without one (tests) resolves its own from prog and cfg. Both
@@ -679,6 +692,8 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.req = std::move(r);
     s.arrival = ++arrival_;
     s.arrived_us = mono_us();
+    s.cbh_arr_us = cbh_now();   /* lever CBH: the hold's clock (the same monotonic clock unless a test set its own) */
+    s.cbh_free = false;
     s.first_tok_us = 0;
     s.preempted_us = 0;
     /* A recycled slot keeps its struct, and the prefill figure is computed from admitted_us
@@ -1520,6 +1535,63 @@ int64_t Scheduler::noa_room() const {
     for (const StepEntry& e : plan_.e)
         if (e.is_prefill) return std::max<int64_t>(0, cfg_.max_tok - plan_.n_tok);
     return 0;
+}
+
+/* ------------------------------------------------------------------------------------------------------ lever CBH */
+/* Lever CBH (fn4 sched_cb_hold_ms / sched_cb_hold_k): a co-batch hold. Holding a newcomer changes only WHEN a step admits it:
+ * the admission walk itself (queue order, admit_one, NOA's pieces) runs unchanged on the step the hold ends at. */
+int64_t Scheduler::cbh_now() const { return cbh_clock_ ? cbh_clock_() : mono_us(); }
+
+/* What the waiting queue asks of the step being planned at `now`. kCbhHold only when the switch is on, a request could
+ * start now (a free card, --max-num-seqs not reached), every waiting request is a fresh newcomer no admission walk has asked
+ * (not preempted, no media, not an embedding), at least two sequences decode, fewer than K wait and the first arrived less
+ * than the hold ago. Otherwise kCbhNone (nothing to hold: nobody waits, or nothing could start) or the reason a hold ends:
+ * kCbhByOther (switched off, or a waiting request that may not be held), kCbhByIdle (< 2 decoding), kCbhByK, kCbhByTimeout. */
+int Scheduler::cbh_decide(int64_t now) const {
+    if (cbh_ms_ <= 0) return kCbhByOther;
+    if (free_cards_.empty() || (int64_t)running_.size() >= cfg_.max_seqs) return kCbhNone;
+    int64_t fresh = 0, oldest = 0;
+    for (int32_t slot : waiting_) {
+        const SchedReq& w = *reqs_[(size_t)slot];
+        if (!w.req) continue;
+        if (w.cbh_free || w.req->state != ReqState::Waiting || w.req->embed || w.req->media) return kCbhByOther;
+        if (fresh == 0 || w.cbh_arr_us < oldest) oldest = w.cbh_arr_us;
+        ++fresh;
+    }
+    if (fresh == 0) return kCbhNone;
+    int64_t dec = 0;
+    for (int32_t slot : running_) {
+        const SchedReq& x = *reqs_[(size_t)slot];
+        if (!x.req || !x.running) continue;
+        if (x.req->n_computed >= (int64_t)x.req->prompt.size() && x.req->n_computed + 1 >= x.seq_len()) ++dec;
+    }
+    if (dec < 2) return kCbhByIdle;
+    if (fresh >= cbh_k_) return kCbhByK;
+    if (now - oldest >= (int64_t)cbh_ms_ * 1000) return kCbhByTimeout;
+    return kCbhHold;
+}
+
+/* A step planned while the hold stands (the step after a commit, or one issued ahead): the hold starts at the first. */
+void Scheduler::cbh_hold(int64_t now) {
+    if (!cbh_on_) {
+        cbh_on_ = true;
+        cbh_t0_us_ = now;
+        ++cbh_n_[0];
+    }
+    ++cbh_n_[6];
+}
+
+/* A step that admits as without the switch: a standing hold ends for `reason` (kCbhNone: by_other), and every request the walk
+ * now asks is marked asked, so it is never held again (not for kCbhNone: nothing could start, nobody was asked). */
+void Scheduler::cbh_release(int reason, int64_t now) {
+    if (cbh_on_) {
+        ++cbh_n_[reason > 0 ? reason : (int)kCbhByOther];
+        cbh_us_ += std::max<int64_t>(0, now - cbh_t0_us_);
+        cbh_on_ = false;
+    }
+    if (reason == kCbhNone) return;
+    for (int32_t slot : waiting_)
+        if (reqs_[(size_t)slot] && reqs_[(size_t)slot]->req) reqs_[(size_t)slot]->cbh_free = true;
 }
 
 /* ---------------------------------------------------------------------------------------------------- lever CAP48 */
@@ -2786,6 +2858,9 @@ const RadBatch* Scheduler::step() {
     /* lever CAP48: the decode row cap for this step's plan and for the step issued ahead behind it (step_next) */
     cap_now_ = fn4::sched_row_cap();
     cap_seq_note(cfg_.max_seqs);
+    /* lever CBH: the co-batch hold for this step's admission and for the step issued ahead behind it (step_next) */
+    cbh_ms_ = fn4::sched_cb_hold_ms();
+    cbh_k_ = fn4::sched_cb_hold_k();
     /* lever DST: the interleave and the shared budget for this step's plan, as the fn4 switches are applied now (a change
      * lands at a step release, so it acts from the step planned after it). A hold under way is cut to a smaller count. */
     {
@@ -3232,7 +3307,16 @@ const RadBatch* Scheduler::step() {
     /* lever DST (sched_short_bypass): a held step admits too, but only a waiting request whose uncached rest is one whole
      * piece of its alone plan of at most bypass_now_ rows (admit_one's whole_max); the rest of the queue keeps its place. */
     const bool bypass = hold_prefill && bypass_now_ > 0;
-    if (!preempted_here && (!hold_prefill || bypass)) {
+    /* lever CBH (fn4 sched_cb_hold_ms): on a step that would ask the queue, a co-batch hold may keep it from asking (cbh_decide);
+     * once it ends the walk below runs as without the switch. Off with no hold standing: not entered. */
+    bool cb_held = false;
+    if (!preempted_here && (!hold_prefill || bypass) && (cbh_ms_ > 0 || cbh_on_)) {
+        const int64_t now = cbh_now();
+        const int d = waiting_.empty() ? (int)kCbhNone : cbh_decide(now);
+        if (d == kCbhHold) { cbh_hold(now); cb_held = true; }
+        else cbh_release(d, now);
+    }
+    if (!preempted_here && !cb_held && (!hold_prefill || bypass)) {
         /* `at` walks the queue and `took_` is what it admitted: a request whose media is not
          * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
          * after the walk rather than cut at its front. */
@@ -3345,6 +3429,9 @@ const RadBatch* Scheduler::step() {
             took_.push_back(at);
             ++at;
         }
+        /* lever CBH's mix counts (any setting): steps that admitted two or more waiting requests, and steps that admitted one */
+        if (took_.size() >= 2) { ++cbh_n_[7]; cbh_n_[8] += (int64_t)took_.size(); }
+        else if (took_.size() == 1) ++cbh_n_[9];
         if (!took_.empty()) {
             for (size_t i : took_) queue_insert(running_, waiting_[i]);
             size_t w = 0, k = 0;
@@ -3704,8 +3791,17 @@ bool Scheduler::ends_every_request() const {
 
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
-    /* An admission is a decision about the pool and the queue that the full step makes. */
-    if (!waiting_.empty()) return nullptr;
+    /* An admission is a decision about the pool and the queue that the full step makes -- unless lever CBH holds every
+     * waiting request at this step (cbh_decide): the step issued ahead then runs as with nothing waiting, and the full step
+     * planned once the hold ends asks the queue. */
+    bool cbh_ahead = false;
+    int64_t cbh_t = 0;
+    if (!waiting_.empty()) {
+        if (cbh_ms_ <= 0) return nullptr;
+        cbh_t = cbh_now();
+        if (cbh_decide(cbh_t) != kCbhHold) return nullptr;
+        cbh_ahead = true;
+    }
     /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
      * behind decode steps issued ahead. */
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
@@ -3799,6 +3895,7 @@ const RadBatch* Scheduler::step_next_locked() {
     for (size_t i = 0; i < plan_next_.e.size(); ++i)
         reqs_[(size_t)plan_next_.e[i].slot]->entry_next = (int32_t)i;
     next_open_ = true;
+    if (cbh_ahead) cbh_hold(cbh_t);   /* lever CBH: a step issued while the hold stands */
     return b;
 }
 
@@ -4208,6 +4305,9 @@ void Scheduler::step_finished() {
     fn4::note_sched_noa(noa_n_);                           /* lever NOA's counts */
     static_assert(sizeof(cap_n_) / sizeof(cap_n_[0]) == fn4::kCapCounts, "lever CAP48's counts");
     fn4::note_sched_cap(cap_n_);                           /* lever CAP48's counts */
+    static_assert(sizeof(cbh_n_) / sizeof(cbh_n_[0]) == fn4::kCbhCounts, "lever CBH's counts");
+    cbh_n_[5] = cbh_us_ / 1000;                            /* hold_ms: the ended holds' wall */
+    fn4::note_sched_cbh(cbh_n_);                           /* lever CBH's counts */
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
                            hybrid_lookup_, hybrid_head_, hybrid_unahead_, draft_.occ_cycles(), draft_.occ_moves());
     fn4::note_draft_accept(acc_head_d_, acc_head_a_, acc_look_d_, acc_look_a_);

@@ -140,6 +140,10 @@ struct SchedReq {
     /* Lever CAP48 (fn4 sched_row_cap): the step issued ahead verifies fewer of this sequence's drafts than the drafter
      * issued (draft_next was cut by the cap), so the proposal published for it is cut to draft_next (set_draft). */
     bool     cap_cut_next = false;
+    /* Lever CBH (fn4 sched_cb_hold_ms): when the request arrived on the hold's clock (Scheduler::cbh_now), and whether an
+     * admission walk already asked it (a release found it waiting, or a step admitted without a hold): it is never held. */
+    int64_t  cbh_arr_us = 0;
+    bool     cbh_free = false;
 
     /* Cancelled while a step in flight or a drafter snapshot still names it; its blocks are
      * released once nothing does. Freed earlier, a kernel still writing a block would put one
@@ -682,6 +686,9 @@ public:
      * step_finished does: `chunk` for a step that carried a prefill chunk, else a decode step. */
     int64_t interleave_steps() const;
     void    note_step_cost(bool chunk, double seconds);
+    /* Lever CBH, visible for tests: the clock a co-batch hold reads, in microseconds (default: the monotonic clock the live
+     * request table reads). Set before the requests it is to time are added. */
+    void    set_cbh_clock(std::function<int64_t()> now_us) { cbh_clock_ = std::move(now_us); }
 
 private:
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -748,6 +755,23 @@ private:
     bool          cap_seq_noted_ = false, cap_over_noted_ = false;
     int64_t       cap_rows(StepPlan& p, bool ahead);
     void          cap_seq_note(int64_t max_seqs);   /* the cap below --max-num-seqs, said once */
+    /* Lever CBH (fn4 sched_cb_hold_ms / sched_cb_hold_k, read at every step planned; RADIANCE_SCHED_CB_HOLD_MS / _K their values
+     * at start): the hold in force (ms, 0 off) and K; whether a hold stands and since when (cbh_now); its counts (fn4 GET "cbh",
+     * kCbhCounts: holds, by_k, by_timeout, by_idle, by_other, hold_ms, held_steps, cob_steps, cob_newcomers, single_steps; the
+     * holds' wall summed in cbh_us_). cbh_decide(): what the waiting queue asks of the step being planned at `now` (kCbhHold:
+     * hold its admission; kCbhNone: nothing to hold; else the reason a hold ends, the count's index), side-effect free.
+     * cbh_release(): a step that admits as today -- the standing hold ended for `reason`, every fresh waiting request
+     * marked asked. */
+    enum : int { kCbhNone = -1, kCbhHold = -2, kCbhByK = 1, kCbhByTimeout = 2, kCbhByIdle = 3, kCbhByOther = 4 };
+    int           cbh_ms_ = 0, cbh_k_ = 2;
+    bool          cbh_on_ = false;
+    int64_t       cbh_t0_us_ = 0, cbh_us_ = 0;
+    int64_t       cbh_n_[10] = {};
+    std::function<int64_t()> cbh_clock_;
+    int64_t       cbh_now() const;
+    int           cbh_decide(int64_t now) const;
+    void          cbh_hold(int64_t now);
+    void          cbh_release(int reason, int64_t now);
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share = false);
     IKVManager*   kv_ = nullptr;

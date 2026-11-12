@@ -385,6 +385,26 @@
  *                   gemm_nt_ggml's per-output sequence on a row slice, and the gather only copies.
  *                   RADIANCE_DS41_E2=1 declares the part, the GEMV and the gather (and starts at 1); unset declares
  *                   nothing and 1 is refused. GET "i11".gq / .e2 carry the two levers' issue counts (rank 0).
+ *   sched_cb_hold_ms  scheduler (lever CBH, ds41-int10b bafca0c, merged into ds41-int11 after ds41_e2: co-batch hold): 0 off (today, byte
+ *                   for byte); H = 1 .. 60000 the admission of waiting newcomers is held while at least two decoding
+ *                   sequences run, so several newcomers start in ONE step (one link-bound host-expert read for 2-3 of
+ *                   them). A hold covers fresh requests only (waiting, not preempted, no media, not an embedding, never
+ *                   asked by an admission before); any other waiting request means no hold. It ends -- and the step
+ *                   admits exactly as without the switch -- when sched_cb_hold_k newcomers wait, when fewer than two
+ *                   sequences decode (an idle server is never held), or H ms after the oldest one's arrival. A request
+ *                   is held at most once: every newcomer a release finds waiting is asked as today from then on.
+ *                   While a hold stands, the step issued ahead (step_next) keeps running behind the step in flight, as
+ *                   it does with nothing waiting. Admission order and every piece stay as sched_bi_chunk / sched_noa
+ *                   plan them; only the step a newcomer is admitted in moves. Exact: scheduling only (under D3 + NOA
+ *                   every piece is a whole alone piece wherever it runs). RADIANCE_SCHED_CB_HOLD_MS=H at start is the
+ *                   value until the switch is set (unset / 0: off, nothing logged). Read at every step planned.
+ *   sched_cb_hold_k   scheduler (lever CBH): 2 .. 64, the newcomers waiting that end a hold (default 2:
+ *                   RADIANCE_SCHED_CB_HOLD_K at start, else 2). GET "cbh": in_force_ms, k, holds, by_k, by_timeout,
+ *                   by_idle, by_other (a hold ended by a request that may not be held, the switch turned off, no
+ *                   newcomer left, no admission possible), hold_ms (the holds' summed wall), held_steps (steps planned
+ *                   while a hold stood, issued ahead included), cob_steps / cob_newcomers (steps that admitted >= 2
+ *                   waiting requests, and those requests), single_steps (steps that admitted one) -- the last three at
+ *                   any setting.
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -462,7 +482,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSwitches };
+              kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -552,6 +572,14 @@ void note_sched_noa(const int64_t* v);
 int  sched_row_cap();
 static constexpr int kCapCounts = 7;   /* steps_capped, drafts_trimmed, ahead_capped, steps_over, steps_gt48, max_rows, decode_steps */
 void note_sched_cap(const int64_t* v);
+/* Lever CBH (sched_cb_hold_ms / sched_cb_hold_k): the switches once set, else RADIANCE_SCHED_CB_HOLD_MS (0 .. 60000; 0 off) /
+ * RADIANCE_SCHED_CB_HOLD_K (2 .. 64; unset 2) at start. The scheduler reads them at every step it plans (the step issued ahead
+ * takes the step before it's) and after every step reports its counts (GET "cbh", kCbhCounts values, in this order). */
+int  sched_cb_hold_ms();
+int  sched_cb_hold_k();
+static constexpr int kCbhCounts = 10;   /* holds, by_k, by_timeout, by_idle, by_other, hold_ms, held_steps, cob_steps,
+                                          cob_newcomers, single_steps */
+void note_sched_cbh(const int64_t* v);
 /* Lever PSK design 2: hand the scheduler's plan for trunk pass `step` to the plugin that cuts by it (rad_psk_plan, every
  * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
  * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */

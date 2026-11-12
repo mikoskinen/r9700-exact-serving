@@ -33,7 +33,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa", "stage_short",
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
-                                        "ds41_mix_wv", "ds41_gq", "ds41_e2" };
+                                        "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -95,6 +95,7 @@ struct State {
     std::atomic<int64_t> dst[2];                            /* note_sched_dst: bypassed, turned away */
     std::atomic<int64_t> noa[kNoaCounts];                   /* note_sched_noa (lever NOA) */
     std::atomic<int64_t> cap[kCapCounts];                   /* note_sched_cap (lever CAP48) */
+    std::atomic<int64_t> cbh[kCbhCounts];                   /* note_sched_cbh (lever CBH) */
     std::atomic<int> stage_capable{-1}, hb_capable{-1};     /* lever SA / HB: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> sahb[kSahbRanks][kSahbN];          /* note_sahb */
     std::atomic<int> sahb_ranks{0};
@@ -127,6 +128,7 @@ struct State {
         for (auto& c : dst) c.store(0, std::memory_order_relaxed);
         for (auto& c : noa) c.store(0, std::memory_order_relaxed);
         for (auto& c : cap) c.store(0, std::memory_order_relaxed);
+        for (auto& c : cbh) c.store(0, std::memory_order_relaxed);
         for (auto& r : sahb)
             for (auto& c : r) c.store(0, std::memory_order_relaxed);
         for (auto& r : sp)
@@ -222,6 +224,28 @@ int env_row_cap() {
     return env;
 }
 
+/* Lever CBH: RADIANCE_SCHED_CB_HOLD_MS at start, 0 .. 60000 (0 / unset: off), and RADIANCE_SCHED_CB_HOLD_K, 2 .. 64 (unset: 2);
+ * anything else is said once and means off / 2. */
+int env_int(const char* name, int lo, int hi, int dflt, const char* what) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return dflt;
+    char* end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (!std::isdigit((unsigned char)e[0]) || (end && *end) || v < lo || v > hi) {
+        std::fprintf(stderr, "radiance: scheduler: %s=%s is not %d .. %d: %s\n", name, e, lo, hi, what);
+        return dflt;
+    }
+    return (int)v;
+}
+int env_cb_hold_ms() {
+    static const int env = env_int("RADIANCE_SCHED_CB_HOLD_MS", 0, 60000, 0, "no co-batch hold");
+    return env;
+}
+int env_cb_hold_k() {
+    static const int env = env_int("RADIANCE_SCHED_CB_HOLD_K", 2, 64, 2, "a hold ends at 2 waiting");
+    return env;
+}
+
 int env_acq() {
     static const int env = [] {
         const char* e = std::getenv("RADIANCE_AQL_ACQ");
@@ -261,6 +285,14 @@ int reported(State& s, int i) {
     if (i == kSchedRowCap) {       /* lever CAP48: set, else RADIANCE_DECODE_ROW_CAP (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_row_cap();
+    }
+    if (i == kSchedCbHoldMs) {     /* lever CBH: set, else RADIANCE_SCHED_CB_HOLD_MS (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_cb_hold_ms();
+    }
+    if (i == kSchedCbHoldK) {      /* lever CBH: set, else RADIANCE_SCHED_CB_HOLD_K (2) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v > 0 ? v : env_cb_hold_k();
     }
     return s.val[i].load(std::memory_order_acquire);
 }
@@ -343,6 +375,18 @@ int sched_row_cap() {
 void note_sched_cap(const int64_t* v) {
     State& s = st();
     for (int k = 0; k < kCapCounts; ++k) s.cap[k].store(v[k], std::memory_order_relaxed);
+}
+int sched_cb_hold_ms() {
+    const int v = st().val[kSchedCbHoldMs].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_cb_hold_ms();
+}
+int sched_cb_hold_k() {
+    const int v = st().val[kSchedCbHoldK].load(std::memory_order_acquire);
+    return v > 0 ? v : env_cb_hold_k();
+}
+void note_sched_cbh(const int64_t* v) {
+    State& s = st();
+    for (int k = 0; k < kCbhCounts; ++k) s.cbh[k].store(v[k], std::memory_order_relaxed);
 }
 bool aql_acq_none() {
     static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
@@ -634,7 +678,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
-                        "epoch_bump)";
+                        "sched_cb_hold_ms, sched_cb_hold_k, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -992,6 +1036,21 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedCbHoldMs) {     /* lever CBH */
+        if (v < 0 || v > 60000) {
+            if (err) *err = "sched_cb_hold_ms takes 0 (off) or 1 .. 60000: how long a waiting newcomer's admission may be held "
+                            "(while >= 2 sequences decode) so that sched_cb_hold_k newcomers start in one step";
+            return false;
+        }
+        return true;
+    }
+    if (i == kSchedCbHoldK) {      /* lever CBH */
+        if (v < 2 || v > 64) {
+            if (err) *err = "sched_cb_hold_k takes 2 .. 64: the waiting newcomers that end a co-batch hold";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedRowCap) {       /* lever CAP48 */
         if (v < 0 || v > 4096) {
             if (err) *err = "sched_row_cap takes 0 (off) or 1 .. 4096: the most decode rows a step carries (drafts trimmed, "
@@ -1115,7 +1174,7 @@ bool apply_pending(int step, int* sched) {
         if (reported(s, i) == v) {
             if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
-                i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap)
+                i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
@@ -1304,6 +1363,16 @@ std::string state_json() {
         o += ", \"cap\": {\"in_force\": " + std::to_string(reported(s, kSchedRowCap));
         for (int k = 0; k < kCapCounts; ++k)
             o += std::string(", \"") + kCap[k] + "\": " + std::to_string((long long)s.cap[k].load(std::memory_order_relaxed));
+        o += "}";
+    }
+    /* Lever CBH's counts, once a scheduler registered (sched_register). */
+    if (s.max_tok.load(std::memory_order_acquire) > 0) {
+        static const char* const kCbh[kCbhCounts] = { "holds", "by_k", "by_timeout", "by_idle", "by_other", "hold_ms",
+                                                      "held_steps", "cob_steps", "cob_newcomers", "single_steps" };
+        o += ", \"cbh\": {\"in_force_ms\": " + std::to_string(reported(s, kSchedCbHoldMs)) +
+             ", \"k\": " + std::to_string(reported(s, kSchedCbHoldK));
+        for (int k = 0; k < kCbhCounts; ++k)
+            o += std::string(", \"") + kCbh[k] + "\": " + std::to_string((long long)s.cbh[k].load(std::memory_order_relaxed));
         o += "}";
     }
     /* The depth-0 context skip, once the engine registered it (set up or not). */
