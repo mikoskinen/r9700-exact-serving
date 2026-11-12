@@ -252,6 +252,12 @@ struct Model {
      * window): the MoE's rows, except under fn4 P2x (RADIANCE_FN4_P2X=1 at start), where the MoE is declared two
      * pieces tall (moecfg.rows = 2 pass_rows) so a pipelined step's pieces can share one routed pass (switch moe_pair). */
     int64_t   pass_rows = 0;
+    /* fn4 SP-hc (RADIANCE_FN4_SPHC=1 at start declares; switch hc_sp picks it a pipelined prefill step): the trunk's
+     * all-reduces as reduce-scatter (sp_rs) + all-gather of the next block input (sp_ag), the connections' write and
+     * read on this rank's quarter of each piece between them, the codes redone on every row (HyperConn::codes), and the
+     * wide stream gathered raw after the last layer (sp_agh). */
+    rad_op    sp_rs = 0, sp_ag = 0, sp_agh = 0;
+    bool      sp_on = false;
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -1655,6 +1661,39 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* Each routed layer predicts the next one's experts at its router input (MoeFP8::xp_next). */
     for (size_t l = 0; l + 1 < m.layers.size(); ++l) m.layers[l].mlp.xp_next = &m.layers[l + 1].mlp;
 
+    /* fn4 SP-hc (test builds): declared only on request, at four ranks under the pipelined prefill. */
+    if (fn4_env_on("RADIANCE_FN4_SPHC") && g.world == 4 && m.pipe_on) {
+        const int64_t HN = m.hccfg.hc * g.n_embd;
+        m.sp_rs = rw(b, RAD_OP(b, "reduce_scatter_rows",
+                         RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * g.n_embd, T * g.n_embd),
+                                    RAD_STR("dtype", g.dtype), RAD_INT("row", g.n_embd), RAD_INT("raw", g.wire_exact ? 1 : 0),
+                                    RAD_INT("overlap", 1)),
+                         RAD_NOWEIGHTS),
+                     {m.a_x.x}, {m.a_x.x});
+        m.sp_ag = rw(b, RAD_OP(b, "all_gather_rows",
+                         RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * g.n_embd, T * g.n_embd),
+                                    RAD_STR("dtype", g.dtype), RAD_INT("row", g.n_embd), RAD_INT("raw", g.wire_exact ? 1 : 0),
+                                    RAD_INT("overlap", 1)),
+                         RAD_NOWEIGHTS),
+                     {m.a_x.x}, {m.a_x.x});
+        m.sp_agh = rw(b, RAD_OP(b, "all_gather_rows",
+                          RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * HN, T * HN),
+                                     RAD_STR("dtype", g.dtype), RAD_INT("row", HN), RAD_INT("raw", 1),
+                                     RAD_INT("overlap", 1)),
+                          RAD_NOWEIGHTS),
+                      {m.b_h}, {m.b_h});
+        bool ok = m.sp_rs && m.sp_ag && m.sp_agh;
+        const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : T;
+        for (Layer& lay : m.layers) {
+            ok = ok && lay.hc_mix.declare_codes(b, band) == RAD_OK && lay.hc_ffn.declare_codes(b, band) == RAD_OK;
+        }
+        m.sp_on = ok;
+        if (g.rank == 0)
+            fprintf(stderr, "radiance: qwen4exp: fn4 SP-hc %s (RADIANCE_FN4_SPHC; switch hc_sp picks it a pipelined "
+                            "prefill step)\n", ok ? "declared" : "NOT served -- reduce_scatter_rows / all_gather_rows / "
+                            "hc_codes missing");
+    }
+
     /* ---- the 97th connection: no write half, no fp8 copy. It produces the bf16 hidden state the
      * lm_head reads; its `hc_norm` takes the place of a final norm (the checkpoint has no
      * `model.language_model.norm.weight`). */
@@ -1942,12 +1981,17 @@ static bool pipelined(const Model& m, int64_t T) {
 struct MixAr {
     RadCtx*      c = nullptr;
     const Layer* l = nullptr;
+    /* fn4 SP-hc: the reduce-scatter in place of the all-reduce for pieces of at least sp_min rows (0: off) */
+    rad_op       rs = 0;
+    rad_buf      x = 0;
+    int64_t      n_embd = 0, sp_min = 0;
 };
 static void mix_ar_piece(void* u, int64_t r0, int64_t n) {
     const MixAr& s = *(const MixAr*)u;
     rad_lane(s.c, 1);
     rad_lane_join(s.c, 0, 1);
-    if (s.l->full) s.l->attn.issue_ar(s.c, r0, n);
+    if (s.rs && n >= s.sp_min) RAD_ISSUE_N(s.c, s.rs, n * s.n_embd, brow_slice(s.x, r0, n, s.n_embd), RAD_NONE);
+    else if (s.l->full) s.l->attn.issue_ar(s.c, r0, n);
     else           s.l->gdn.issue_ar(s.c, r0, n);
     rad_lane(s.c, 0);
 }
@@ -2005,6 +2049,13 @@ static std::atomic<int>& fn4_spprobe_flag() {
     static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_SPPROBE") ? 1 : 0};
     return f;
 }
+/* fn4 SP-hc proper (declared with RADIANCE_FN4_SPHC=1, Model::sp_on): switch "hc_sp" 0 / 1 picks it for the pipelined
+ * prefill steps; RADIANCE_FN4_HC_SP=1 starts it on. Pieces under kSpMinRows rows keep the all-reduce form. */
+static std::atomic<int>& fn4_sp_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_HC_SP") ? 1 : 0};
+    return f;
+}
+constexpr int64_t kSpMinRows = 64;
 
 static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
@@ -2015,18 +2066,33 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     /* fn4 P2x: the two pieces' routed experts in one pass (moe_pair 1 / 2), where the MoE was declared for it */
     const int pmode = fn4_pair_flag().load(std::memory_order_relaxed);
     const bool pair_on = pmode > 0 && K == 2 && m.moecfg.rows >= T;
-    /* fn4 SP-hc speed probe: the hc ops' rows of piece p (this rank's quarter while the probe is on) */
-    const bool spp = g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
+    /* fn4 SP-hc: sp, the real sequence-parallel residual (reduce-scatter, the connections on this rank's quarter, the
+     * all-gather and the codes redone); spp, the speed probe (the quarter only, all-reduces kept, wrong output). A
+     * piece takes SP when it has kSpMinRows rows; its quarter is the reduce-scatter's shard: q = ceil(rn / world),
+     * rows [r0 + min(rank q, rn), r0 + min((rank + 1) q, rn)). */
+    const bool sp  = m.sp_on && g.world == 4 && !pair_on && fn4_sp_flag().load(std::memory_order_relaxed);
+    const bool spp = !sp && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
+    auto sp_p = [&](int64_t p) { return sp && rn(p) >= kSpMinRows; };
     auto hq0 = [&](int64_t p) {
-        if (!spp) return r0(p);
+        if (!(spp || sp_p(p))) return r0(p);
         const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
         return r0(p) + (lo < rn(p) ? lo : rn(p) - 1);
     };
     auto hqn = [&](int64_t p) {
-        if (!spp) return rn(p);
+        if (!(spp || sp_p(p))) return rn(p);
         const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
         const int64_t n = rn(p) - lo < q ? rn(p) - lo : q;
-        return n > 0 ? n : (int64_t)1;
+        return n > 0 ? n : (int64_t)0;
+    };
+    /* a connection's write / read on piece p's rows of this rank (none when the quarter is empty: SP only) */
+    auto hw = [&](const HyperConn& h, int64_t p) { return hqn(p) > 0 ? h.write(c, T, hq0(p), hqn(p)) : false; };
+    auto hr = [&](const HyperConn& h, int64_t p, bool ss) { if (hqn(p) > 0) h.read(c, T, hq0(p), hqn(p), ss); };
+    /* SP's collectives on piece p of a_x (the block output; the next block input) and of the wide stream */
+    auto rs_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_rs, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
+    auto ag_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_ag, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
+    auto agh_p = [&](int64_t p) {
+        const int64_t HN = m.hccfg.hc * g.n_embd;
+        RAD_ISSUE_N(c, m.sp_agh, rn(p) * HN, brow_slice(m.b_h, r0(p), rn(p), HN), RAD_NONE);
     };
     /* A collective on the second lane, ordered behind lane 0 where it reads what lane 0 just
      * wrote (a join to a lane not yet built is a no-op). */
@@ -2076,19 +2142,22 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
          * hands the first pieces' reductions to the second lane as it goes (ArPieces), so the
          * first piece's all-reduce runs beside the next piece's attention or out projection. */
         MixAr ms{c, &l};
+        if (sp) { ms.rs = m.sp_rs; ms.x = m.a_x.x; ms.n_embd = g.n_embd; ms.sp_min = kSpMinRows; }
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
         else        l.gdn.step(c, batch, false, &pc);
         bt_blk(c, m, l, T, (int)li);   /* lane 0's buffers; lane 1 reduces only `x` */
         auto ar_mix = [&](int64_t p) {
-            if (l.full) l.attn.issue_ar(c, r0(p), rn(p));
-            else        l.gdn.issue_ar(c, r0(p), rn(p));
+            if (sp_p(p))     rs_p(p);
+            else if (l.full) l.attn.issue_ar(c, r0(p), rn(p));
+            else             l.gdn.issue_ar(c, r0(p), rn(p));
         };
         /* A block that handed nothing leaves the first piece's all-reduce to be issued here. */
         if (pc.handed == 0) on1(true, [&] { ar_mix(0); });
         wait1();
         int64_t issued = pc.handed > 0 ? pc.handed : 1;
+        int64_t sp_pend = -1;   /* fn4 SP-hc: a piece whose MoE reduce-scatter is still to be issued */
         bool behind = pc.handed == 0;     /* lane 1 already behind the whole mixer */
         const bool pair_now = pair_on && l.mlp.pair_ok(T, R);
         if (pair_on && li == 0 && g.rank == 0 && m.pair_noted != (pair_now ? pmode : -1)) {
@@ -2130,10 +2199,23 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 behind = true;
                 issued = p + 2;
             }
-            const bool ss_mix = l.hc_mix.write(c, T, hq0(p), hqn(p));
+            const bool ss_mix = hw(l.hc_mix, p);
             bt_pt(c, m, m.b_h, r0(p), rn(p), "h_mix", (int)li);
-            bi_read(c, m, l.hc_ffn, T, hq0(p), hqn(p), ss_mix);
+            if (sp_p(p)) hr(l.hc_ffn, p, ss_mix); else bi_read(c, m, l.hc_ffn, T, hq0(p), hqn(p), ss_mix);
             bt_rd(c, m, r0(p), rn(p), "rd_ffn", (int)li, true);
+            if (sp_p(p)) {
+                /* fn4 SP-hc: every rank's quarter of the MoE input gathered and coded on every row; the previous
+                 * piece's MoE reduce-scatter is issued only after that wait, so it runs beside this piece's MoE (as the
+                 * stock all-reduce does) instead of queueing ahead of the gather on the one collective lane. */
+                on1(true, [&] { ag_p(p); });
+                wait1();
+                if (sp_pend >= 0) { const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
+                l.hc_ffn.codes(c, r0(p), rn(p));
+                l.mlp.pass(c, T, r0(p), rn(p), false);
+                sp_pend = p;
+                continue;
+            }
+            if (sp_pend >= 0) { wait1(); const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
             l.mlp.pass(c, T, r0(p), rn(p), false);
             /* Lane 0 waits here for the next piece's mixer all-reduce and the last piece's MoE
              * one, both issued before this pass; lane 1 then takes this piece's behind its
@@ -2141,6 +2223,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             wait1();
             on1(true, [&] { l.mlp.issue_ar(c, r0(p), rn(p)); });
         }
+        if (sp_pend >= 0) { wait1(); const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
         l.mlp.route_report(c);
         bt_moe(c, m, T, (int)li);   /* lane 1 reduces only `x` */
         /* The writes, and the next layer's reads beside the last piece's all-reduce. PLE adds into
@@ -2149,23 +2232,39 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         const bool ple_next = nx && li + 1 == m.ple_layer;
         for (int64_t p = 0; p < K; ++p) {
             if (p == K - 1) wait1();
-            const bool ss_ffn = l.hc_ffn.write(c, T, hq0(p), hqn(p));
+            const bool ss_ffn = hw(l.hc_ffn, p);
             /* The projection of this piece, before the next layer reads it. */
             const bool projected = l.proj.step(c, batch, r0(p), rn(p));
             bt_pt(c, m, m.b_h, r0(p), rn(p), "h_ffn", (int)li);
             if (nx && !ple_next) {
-                bi_read(c, m, nx->hc_mix, T, hq0(p), hqn(p), ss_ffn && !projected);
+                if (sp_p(p)) hr(nx->hc_mix, p, ss_ffn && !projected);
+                else bi_read(c, m, nx->hc_mix, T, hq0(p), hqn(p), ss_ffn && !projected);
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)li + 1, false);   /* lane 1 holds the last piece's rows only */
+                if (sp_p(p)) on1(true, [&] { ag_p(p); });   /* fn4 SP-hc: the next block's input, every quarter */
             }
         }
         if (ple_next) {
             m.ple.step(c, batch);
             bt_pt(c, m, m.b_h, 0, T, "ple", (int)li + 1);
             for (int64_t p = 0; p < K; ++p) {
-                bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
+                if (sp_p(p)) hr(nx->hc_mix, p, false); else bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)li + 1, false);
+                if (sp_p(p)) on1(true, [&] { ag_p(p); });
             }
         }
+        /* fn4 SP-hc: the gathered inputs' codes on every row, before the next block reads them */
+        if (sp && nx) {
+            wait1();
+            for (int64_t p = 0; p < K; ++p)
+                if (sp_p(p)) nx->hc_mix.codes(c, r0(p), rn(p));
+        }
+    }
+    /* fn4 SP-hc: after the last layer every rank holds only its quarters of the wide stream; the output mixer and the
+     * MTP head read every row of it, so it is gathered raw (exact) here. */
+    if (sp) {
+        for (int64_t p = 0; p < K; ++p)
+            if (sp_p(p)) on1(true, [&] { agh_p(p); });
+        wait1();
     }
 }
 
@@ -2432,6 +2531,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "hc_spprobe") == 0) {   /* fn4 SP-hc speed probe (step_pipelined) */
         if (value < 0 || value > 1) return -1;
         qwen4exp_fp8::fn4_spprobe_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares) */
+        if (value < 0 || value > 1) return -1;
+        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SPHC")) return -1;
+        qwen4exp_fp8::fn4_sp_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (!name || std::strcmp(name, "gather_inv") != 0) return 0;

@@ -171,6 +171,12 @@ struct HyperConn {
      * (hc_down_kchunk in libr4d), so one read over twice the rows sums in a different order than
      * two reads over half of them; reading a wide step in pieces computes what the narrower steps
      * did. */
+    /* fn4 SP-hc: the read's codes stage alone (hc_codes), over rows whose block input `x` another rank read and an
+     * all-gather brought here: the same codes and the same rotated twin the read writes for the same x. Declared by
+     * declare_codes() on a connection with `quant`; 0 otherwise (then a sequence-parallel step has nothing to redo). */
+    rad_op op_codes = 0;
+    int  declare_codes(RadBuilder* b, int64_t rows_hi);
+    void codes(RadCtx* c_, int64_t r0, int64_t rows) const;
     void read_pieces(RadCtx* c_, int64_t T, bool ss_in = false) const {
         const int64_t piece = c.read_rows;
         if (piece <= 0 || T <= piece) { read(c_, T, 0, T, ss_in); return; }
@@ -365,6 +371,33 @@ inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
         }
     }
     return RAD_OK;
+}
+
+inline int HyperConn::declare_codes(RadBuilder* b, int64_t rows_hi) {
+    if (!c.quant) return RAD_OK;
+    rad_buf wr[4] = { c.codes_i8 ? w.x.q8 : w.x.q, c.codes_i8 ? w.x.s8 : w.x.s, 0, 0 };
+    int n_wr = 2;
+    if (c.rotate) { wr[n_wr++] = w.rq; wr[n_wr++] = w.rs; }
+    op_codes = RAD_OP(b, "hc_codes",
+                      RAD_PARAMS(RAD_RANGE("M", 1, rows_hi), RAD_INT("n", g.n_embd),
+                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_INT("rotate", c.rotate ? 1 : 0),
+                                 RAD_INT("codes_i8", c.codes_i8 ? 1 : 0)),
+                      RAD_NOWEIGHTS);
+    if (!op_codes) return RAD_E_INVAL;
+    const rad_buf rd[1] = { w.x.x };
+    rad_op_reads (b, op_codes, rd, 1);
+    rad_op_writes(b, op_codes, wr, n_wr);
+    return RAD_OK;
+}
+
+inline void HyperConn::codes(RadCtx* c_, int64_t r0, int64_t rows) const {
+    if (!op_codes) return;
+    RAD_ISSUE_N(c_, op_codes, rows,
+                brow_slice(w.x.x, r0, rows, g.n_embd),
+                brow_slice(c.codes_i8 ? w.x.q8 : w.x.q, r0, rows, g.n_embd),
+                brow_slice(c.codes_i8 ? w.x.s8 : w.x.s, r0, rows, fp8_blocks(g.n_embd)),
+                c.rotate ? brow_slice(w.rq, r0, rows, g.n_embd) : RAD_NONE,
+                c.rotate ? brow_slice(w.rs, r0, rows, fp8_blocks(g.n_embd)) : RAD_NONE);
 }
 
 inline void HyperConn::read(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool ss_in) const {

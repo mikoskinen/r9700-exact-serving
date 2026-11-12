@@ -200,6 +200,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `mhc_post` | `M`(range) `n` `hc` `dtype` | `x`, `h`, `post`, `comb` → `out` |
 | `mhc_contract` | `M`(range) `n` `hc` `dtype` | `h` → `x` |
 | `hc_read` | `M`(range) `n` `hc` `lowrank` `eps`:f64 `dtype` `wadd`:f64/opt `inject`/opt `group`/opt `rotate`/opt `mix`/opt | `h`, `w`w, `mix_down`w, `mix_up`w, `inject_w`w? → `x`, `inj`?, `q`?, `scale`?, `rq`?, `rscale`?; in `ss`? |
+| `hc_codes` | `M`(range) `n` `group`/opt `rotate`/opt `codes_i8`/opt | `x` → `q`, `scale`, `rq`?, `rscale`? |
 | `hc_write` | `M`(range) `n` `hc` `dtype` `eps`:f64/opt | `y`, `inj`, `h`:inout → `ss`? |
 | `hc_project` | `M`(range) `n` `hc` `scale`:f64 `dtype` | `h`:inout, `v`, `on` |
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
@@ -2529,6 +2530,15 @@ or that slice; only the slice needs the token stride carried separately.
 |---|---|---|
 | `all_reduce` | `world_size` `numel`(range) `dtype` `exact` `min_bytes`/opt `hops`/opt `overlap`/opt | `x`:inout, `y`:out? |
 | `all_gather` | `world_size` `numel` `dtype` `row`/opt | `x` → `y` |
+| `reduce_scatter_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt | `x`:inout, `y`:out? |
+| `all_gather_rows` | `world_size` `numel`(range) `dtype` `row` `raw`/opt `overlap`/opt | `x`:inout, `y`:out? |
+
+`reduce_scatter_rows` / `all_gather_rows` (fn4 SP-hc, test builds): the two halves of the four-rank two-shot over
+WHOLE-ROW shards of `x` [rows][row] -- rank r owns rows [r q, (r + 1) q), q = ceil(rows / world_size) -- in place
+(`y` absent or `x`). The reduce-scatter leaves the sum of each rank's shard on that rank (other rows unchanged); the
+all-gather sends each rank's shard rows to every rank, on the ti8 wire (`raw` 0: every rank, the owner too, stores the
+decode of the owner's words) or as raw words (`raw` 1). A sequence-parallel residual runs its per-row ops on the shard
+between them.
 
 `exact` separates the exact sum from a lossy wire, and a caller must state it: a request that does
 not accept a lossy wire gets no kernel rather than the quantised one.

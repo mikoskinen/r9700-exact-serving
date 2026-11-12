@@ -6540,6 +6540,44 @@ extern "C" int64_t r4d_rad_hc_read_scratch(const RadArgs* a) {
            + hc_part_bytes(M, lr, HN);
 }
 
+/* fn4 SP-hc: hc_codes -- hc_read's codes stage alone over rows a caller already holds (x [M][n] bf16): the plain
+ * codes (E4M3, or int8 when q is I8) and their scales, and with rq / rqs the rotated E4M3 codes, by the same kernels
+ * hc_read's finisher runs (hc_quant_rows_launch), so codes of the same x are the same bytes. Operands: x, q, qs, rq?,
+ * rqs?; params n, group (128). A sequence-parallel residual reads its shard and gathers x; every rank then codes all
+ * rows from the gathered x. */
+enum { HCC_X = 0, HCC_Q, HCC_S, HCC_RQ, HCC_RS };
+extern "C" int r4d_rad_hc_codes(const RadArgs* a, RadStream s) {
+    const RadTensor* x   = r4d_opt(a, HCC_X);
+    const RadTensor* q   = r4d_opt(a, HCC_Q);
+    const RadTensor* qs  = r4d_opt(a, HCC_S);
+    const RadTensor* rq  = r4d_opt(a, HCC_RQ);
+    const RadTensor* rqs = r4d_opt(a, HCC_RS);
+    if (!x || !q || !qs) return R4D_NO(RAD_E_INVAL);
+    R4D_DT(x, RAD_BF16);
+    if (q->dtype != RAD_I8 && q->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    R4D_DT(qs, RAD_F32);
+    if ((rq != nullptr) != (rqs != nullptr)) return R4D_NO(RAD_E_INVAL);
+    if (rq) { R4D_DT(rq, RAD_F8E4M3); R4D_DT(rqs, RAD_F32); }
+    const long long n = r4d_geti_or(a, "n", 0);
+    if (n <= 0 || n % kUpTB || r4d_geti_or(a, "group", 0) != kFp8Grp) return R4D_NO(RAD_E_SHAPE);
+    long long rows = 0, qrows = 0, srows = 0, rqrows = 0, rsrows = 0;
+    const long long xrow = r4d_rows_pitch(x, n, &rows);
+    const long long qrow = r4d_rows_pitch(q, n, &qrows);
+    const long long srow = r4d_rows_pitch(qs, n / kFp8Grp, &srows);
+    if (xrow < 0 || qrow < 0 || srow < 0 || qrows < rows || srows < rows) return R4D_NO(RAD_E_STRIDE);
+    long long rqrow = 0, rsrow = 0;
+    if (rq) {
+        rqrow = r4d_rows_pitch(rq, n, &rqrows);
+        rsrow = r4d_rows_pitch(rqs, n / kFp8Grp, &rsrows);
+        if (rqrow < 0 || rsrow < 0 || rqrows < rows || rsrows < rows) return R4D_NO(RAD_E_STRIDE);
+    }
+    if (rows <= 0) return RAD_OK;
+    hc_quant_rows_launch(q->dtype == RAD_I8, (const unsigned short*)x->data, (unsigned char*)q->data,
+                         (float*)qs->data, rq ? (unsigned char*)rq->data : nullptr, rq ? (float*)rqs->data : nullptr,
+                         (long)rows, (long)n, (long)xrow, (long)qrow, (long)srow, (long)rqrow, (long)rsrow, s);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
 extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     int emit_rc = RAD_OK;
     const RadTensor* h    = r4d_opt(a, HCR_H);

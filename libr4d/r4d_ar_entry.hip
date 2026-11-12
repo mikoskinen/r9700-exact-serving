@@ -1284,6 +1284,45 @@ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 
+/* ------------------------------------------------------------------ fn4 SP-hc: the two-shot's halves
+ * reduce_scatter_rows / all_gather_rows (r4d_ar_sp_rows.hip): x [rows][row] in place (`y` absent or x), `row` the row
+ * length in elements; whole-row shards of ceil(rows / 4). One handshake a launch; each op its own instance. */
+static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
+    ArCall c;
+    int rc = ar_setup(a, &c, 1);
+    if (rc != RAD_OK) return rc;
+    if (c.in->world != 4) return RAD_E_SHAPE;
+    if (c.in->dtype == 2) return RAD_E_DTYPE;
+    if (c.out != c.inp) return RAD_E_INVAL;                  /* in place only */
+    long long row = 0;
+    if (!rad_args_geti(a, "row", &row) || row <= 0 || row % 32) return RAD_E_SHAPE;
+    if (c.numel % row) return RAD_E_SHAPE;
+    const long rows = c.numel / (long)row;
+    if (rows < 4) return RAD_E_SHAPE;
+    long long raw = 0;
+    (void)rad_args_geti(a, "raw", &raw);
+    const int op = op_kind == 0 ? (raw ? 3 : 0) : raw ? 2 : 1;   /* fn4 12.11.: raw 1 = the exact reduce-scatter */
+    if (r4d_geti_or(a, "overlap", 0) == 1) {
+        const int lt = ar_lane_threads();
+        if (lt > 0) c.nthreads = lt;
+        const int lb = ar_lane_blocks();
+        if (lb > 0) c.nblocks = lb < c.in->max_blocks ? lb : c.in->max_blocks;
+    }
+    if (c.nthreads % 32) return RAD_E_INVAL;
+    const ArInst* in = c.in;
+    const long gate = link_gate(a), early = in->host ? 0L : gate;
+    R4D_TRY("sp_rows_4rank",
+        r4d_ar_sp_rows_4rank(op, in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                             in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                             in->my_scratch, in->my_flags, in->my_seq, in->slot_bytes,
+                             c.inp, rows, (long)row, in->dtype, in->rank,
+                             (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
+                             c.pub, early, early ? in->gate_ctr : 0L));
+    return early ? RAD_LINK_ENDED : RAD_OK;
+}
+extern "C" int r4d_rad_ar_rs_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 0); }
+extern "C" int r4d_rad_ar_ag_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 1); }
+
 /* ------------------------------------------------------------------ the fused all-reduce + norm */
 
 enum { AL_X = 0, AL_RESID, AL_W, AL_Q, AL_SCALE, AL_OUTBF16, AL_WPOST };
