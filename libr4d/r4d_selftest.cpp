@@ -29992,6 +29992,10 @@ struct Ar8Perf {
     std::vector<const RadKernelInfo*> rows;
     std::vector<int> ks;               /* per row: the `pieces` parameter, 0 or -1 none */
     std::vector<int> forms;            /* per row: the `form` parameter, -1 none */
+    /* --perfar4 (fn4 12.11.2026): per row the SP rows' `raw` (-1: not an SP row; else in place, with `row` = the
+     * size's width from `widths`); empty for --perfar8. */
+    std::vector<int> sp_raw;
+    std::vector<int64_t> widths;
     std::vector<int> nbs;
     StBarrier* bar = nullptr;
     int rc_init = RAD_OK;
@@ -30040,7 +30044,8 @@ static void ar8_perf_worker(Ar8Perf* t) {
     std::vector<hipEvent_t> ev(2 * (size_t)std::max(t->iters, 1));
     for (hipEvent_t& e : ev) st_ev_create(&e);
     size_t cfg = 0;
-    for (int64_t n : t->sizes) {
+    for (size_t si = 0; si < t->sizes.size(); ++si) {
+        const int64_t n = t->sizes[si];
         for (int64_t i = 0; i < n; ++i) {
             float acc = 0.0f;
             for (int r = 0; r < t->world; ++r) {
@@ -30063,7 +30068,12 @@ static void ar8_perf_worker(Ar8Perf* t) {
                 if (nb > 0) ps.push_back(PI("nblocks", nb));
                 if (t->ks[j] > 0) ps.push_back(PI("pieces", t->ks[j]));
                 if (t->forms[j] >= 0) ps.push_back(PI("form", t->forms[j]));
-                RadTensor ts[2] = { T(in, dt, { n }), T(out, dt, { n }) };
+                const bool spr = j < t->sp_raw.size() && t->sp_raw[j] >= 0;
+                if (spr) {
+                    ps.push_back(PI("raw", t->sp_raw[j]));
+                    ps.push_back(PI("row", si < t->widths.size() ? t->widths[si] : n));
+                }
+                RadTensor ts[2] = { T(in, dt, { n }), T(spr ? in : out, dt, { n }) };
                 RadArgs a;
                 std::memset(&a, 0, sizeof(a));
                 a.t = ts; a.n_t = 2;
@@ -30246,6 +30256,114 @@ static bool ar8_weights_as_plugin(const std::vector<int>& devs, int* w, std::str
                                    wd[3], wd[4], wd[5], wd[6], wd[7]);
     for (int r = 1; r < 8; ++r) if (w[r] != w[0]) return true;
     return false;
+}
+
+/* --perfar4 RxW[,RxW..] [iters] (fn4 12.11.2026, after the riser move): the four-rank collectives a TP4 step runs, timed on
+ * the four cards as ar8_perf times the eight-rank ones (one thread a card, warm, the slowest rank's period, the block rule):
+ * the exact one-shot and two-shot, the tiered-int8 coded two-shot (lossy), and fn4 SP-hc's whole-row halves
+ * (reduce_scatter_rows raw 1 = the exact fold, raw 0 = ti8; all_gather_rows raw 1 / 0), each message R rows of W bf16.
+ * Bytes a rank sends: one-shot (N-1) S, two-shot 2 (N-1) / N S (both phases), a reduce-scatter or all-gather alone (N-1) / N S.
+ * The all-reduces are checked against the fp32 ascending-rank fold (the ti8 row is lossy: its count is information);
+ * the SP rows run in place and are timed only. */
+static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
+    constexpr int W = 4;
+    if (iters <= 0) iters = 100;
+    std::vector<int64_t> sizes, widths;
+    {
+        std::string all = spec ? spec : "";
+        size_t at = 0;
+        while (at < all.size()) {
+            const size_t comma = all.find(',', at);
+            const std::string one = all.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+            long long r = 0, w = 0;
+            if (std::sscanf(one.c_str(), "%lldx%lld", &r, &w) != 2 || r <= 0 || w <= 0 || w % 32 || (r * w * 2) % 16) {
+                std::printf("--perfar4: '%s' is not RxW (W a multiple of 32)\n", one.c_str());
+                return;
+            }
+            sizes.push_back(r * w); widths.push_back(w);
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+        }
+    }
+    if (sizes.empty()) { std::printf("--perfar4: no sizes\n"); return; }
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess) nd = 0;
+    std::vector<int> devs;
+    for (int d = 0; d < nd; ++d) {
+        hipDeviceProp_t pr;
+        if (hipGetDeviceProperties(&pr, d) == hipSuccess && !std::strncmp(pr.gcnArchName, "gfx1201", 7)) devs.push_back(d);
+    }
+    if ((int)devs.size() < W) { std::printf("--perfar4: needs 4 gfx1201 cards, found %zu\n", devs.size()); return; }
+    devs.resize(W);
+    struct Rw { const char* row; int raw; const char* label; int kind; };   /* kind 0 one-shot, 1 two-shot, 2 RS / AG */
+    const Rw want[] = {
+        { "ar_oneshot_4rank_exact", -1, "AR one-shot exact", 0 },
+        { "ar_twoshot_4rank_exact", -1, "AR two-shot exact", 1 },
+        { "ar_twoshot_4rank_ti8", -1, "AR two-shot ti8 (coded, lossy)", 1 },
+        { "sp_rs_rows_4rank_ti8", 1, "SP reduce-scatter raw (exact)", 2 },
+        { "sp_ag_rows_4rank", 1, "SP all-gather raw", 2 },
+        { "sp_rs_rows_4rank_ti8", 0, "SP reduce-scatter ti8", 2 },
+        { "sp_ag_rows_4rank", 0, "SP all-gather ti8", 2 },
+    };
+    std::vector<const RadKernelInfo*> rows;
+    std::vector<int> ks, forms, raws, kinds;
+    std::vector<std::string> labels;
+    for (const Rw& w : want) {
+        const RadKernelInfo* r = find(pl, w.row);
+        if (!r) { std::printf("  %-32s row %s absent\n", w.label, w.row); continue; }
+        rows.push_back(r); ks.push_back(0); forms.push_back(-1); raws.push_back(w.raw); kinds.push_back(w.kind);
+        labels.push_back(w.label);
+    }
+    if (rows.empty()) return;
+    std::printf("four-rank collectives, bf16, cards");
+    for (int d : devs) {
+        char bus[64] = { 0 };
+        if (hipDeviceGetPCIBusId(bus, (int)sizeof bus, d) != hipSuccess) bus[0] = 0;
+        std::printf(" %d=%s", d, bus);
+    }
+    std::printf(", %d launches a point, warm (back to back, period over the span, slowest rank), the block rule\n", iters);
+    StBarrier bar(W);
+    std::vector<Ar8Perf> t((size_t)W);
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+        Ar8Perf& x = t[(size_t)r];
+        x.rank = r; x.dev = devs[(size_t)r]; x.world = W; x.iters = iters; x.dtype = "bf16";
+        x.sizes = sizes; x.rows = rows; x.ks = ks; x.forms = forms; x.nbs = { 0 }; x.bar = &bar;
+        x.sp_raw = raws; x.widths = widths;
+        th.emplace_back(ar8_perf_worker, &x);
+    }
+    for (std::thread& x : th) x.join();
+    for (const Ar8Perf& x : t)
+        if (x.rc_init != RAD_OK) { std::printf("  rank %d: init rc=%d\n", x.rank, x.rc_init); return; }
+    size_t cfg = 0;
+    for (size_t si = 0; si < sizes.size(); ++si) {
+        const double bytes = (double)sizes[si] * 2.0;
+        std::printf("  %lld x %lld bf16 (%.2f MB)\n", (long long)(sizes[si] / widths[si]), (long long)widths[si], bytes / 1e6);
+        for (size_t j = 0; j < rows.size(); ++j, ++cfg) {
+            if (t[0].rc[cfg] != RAD_OK) {
+                std::printf("    %-32s rc=%d (not served)\n", labels[j].c_str(), t[0].rc[cfg]);
+                continue;
+            }
+            double us = 0.0;
+            std::string per;
+            for (const Ar8Perf& x : t) {
+                us = std::max(us, (double)x.period[cfg] * 1000.0);
+                per += fmt(" %.1f", (double)x.period[cfg] * 1000.0);
+            }
+            const double sent = kinds[j] == 0 ? (double)(W - 1) * bytes
+                              : kinds[j] == 1 ? 2.0 * (W - 1) / W * bytes : (double)(W - 1) / W * bytes;
+            int64_t bad = 0;
+            for (const Ar8Perf& x : t) bad += x.bad[cfg];
+            std::printf("    %-32s %9.1f us  %6.2f GB/s payload  %6.2f GB/s a rank a direction  %s | us by rank:%s\n",
+                        labels[j].c_str(), us, us > 0 ? bytes / (us * 1e3) : 0.0, us > 0 ? sent / (us * 1e3) : 0.0,
+                        kinds[j] == 2 ? "(timed only)" : bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()
+                                                             : "= fold on every rank", per.c_str());
+            std::printf("AR4 %s\n", fmt("{\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"op\": \"%s\", \"us\": %.1f, "
+                                        "\"gbs_dir\": %.2f, \"bad\": %lld}", (long long)(sizes[si] / widths[si]),
+                                        (long long)widths[si], bytes / 1e6, labels[j].c_str(), us,
+                                        us > 0 ? sent / (us * 1e3) : 0.0, (long long)bad).c_str());
+        }
+    }
 }
 
 static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dtype,
@@ -35655,6 +35773,9 @@ static void usage(void) {
                 "             or runs (S contiguous runs). a=bf16 (default) or a=fp8_e4m3 (scale\n"
                 "             every 128); y=bf16 (default), y=f16 or y=f32. Each row's t and y are\n"
                 "             compared with the first row's; --cold applies.\n"
+                "  --perfar4 RxW[,RxW..] [iters]:  fn4: the four-rank collectives (exact one-shot / two-shot,\n"
+                "             ti8 two-shot, SP reduce_scatter_rows / all_gather_rows raw 1 and 0) at R rows of W\n"
+                "             bf16, warm, the slowest rank's period; GB/s on the bytes a rank sends (AR4 lines: JSON).\n"
                 "  --perfar8 numel [iters] [dtype] [forms]:  the eight-rank exact all-reduce, one thread\n"
                 "             a card: one-shot and two-shot at the block rule and at 4..64 blocks,\n"
                 "             each checked against the rank-order fold; numel 0 runs the decode\n"
@@ -35771,6 +35892,8 @@ int main(int argc, char** argv) {
     uint32_t lo_ydt = RAD_BF16;
     long long ar8_n = -1;
     int ar8_it = 200;
+    const char* ar4_spec = nullptr;   /* fn4 --perfar4 */
+    int ar4_it = 100;
     const char* ar8_dt = "bf16";
     long long lg_m = 0;
     int lg_it = 200;
@@ -35964,6 +36087,11 @@ int main(int argc, char** argv) {
                     return 2;
                 }
             }
+        } else if (!std::strcmp(argv[i], "--perfar4")) {
+            /* fn4: the four-rank collectives timed at RxW bf16 messages (comma-separated) */
+            if (i + 1 >= argc) { usage(); return 2; }
+            ar4_spec = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar4_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfar8")) {
             /* The eight-rank exact all-reduce rows timed; numel 0 runs the default sizes. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -36254,6 +36382,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("bf16 expert GEMM timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (ar4_spec) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        ar4_perf(pl, ar4_spec, ar4_it);
+        dfree_all();
+#else
+        skip("four-rank collective timing", "built without HIP");
 #endif
         return 0;
     }
