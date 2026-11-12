@@ -7548,8 +7548,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                                (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,
                                scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
                                (int)hcg_nt, (long)rows);
-    } else if (hcg && g16 && (hc_readv() & 256) != 0 && (hcg_nt % 2) == 0) {
-        /* fn4 hc_readv bit 8: G16 with two tiles a block (and the inject tile alone) */
+    } else if (hcg && g16 && (hc_readv() & 256) != 0 && (hcg_nt % 2) == 0 && rows >= 32) {
+        /* fn4 hc_readv bit 8: G16 with two tiles a block (and the inject tile alone), from 32 rows (x19 / x21 one card:
+         * 16 rows +4 % slower, 32 -6 %, 64 -7 %) */
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16> : &hc_read_g16p_down_kernel<16>),
                            dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
