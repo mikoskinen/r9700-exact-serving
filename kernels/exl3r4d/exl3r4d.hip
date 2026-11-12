@@ -554,6 +554,129 @@ constexpr int kDnwB = EXL3R4D_DNW > 1 ? EXL3R4D_DNW : 2;
 #ifndef EXL3R4D_EPIB  // down's output rotation as a butterfly over the tiles (exl3r4d_common.hip.h, epilogue_block)
 #define EXL3R4D_EPIB 0  // REFUTED (runs/epib): +1.1/+3.5/+4.9/+7.2/+11.8 us at down tp2 M=1/2/4/8/16 -- two dependent
 #endif                  // exchange stages lengthen the latency chain and 16 KB of LDS halves the workgroups a WGP
+
+// ----------------------------------------------------------------------------- K25U (ds41-k25u, 13.11.2026)
+// K = 2.5's decode band with UNPACKED states. Since V1c, hash_pair shares nothing between its two states (each half is
+// one v_pk_mul_lo_u16 + one v_mad_u32_u16 of its own), so decode_run's lshl / bfi packing of two extracted states into
+// one dword buys nothing: a state in the LOW 16-bit half of any register hashes in those same two ops whatever lies
+// above it -- v_pk_mul_lo_u16 op_sel_hi:[0,1] against 0x83DC0000 reads only the low half (the low lane times 0, the
+// high lane lo16(state x 0x83DC)), v_mad_u32_u16 reads only the low half: hash_pair's ha, operand for operand. A run's
+// four states are its 32-bit window R (the stream bits ending at the run's end e3) shifted right by exl3r4d_run_off =
+// 8, 5, 3, 0: three v_lshrrev a run instead of decode_run's ubfe + pack ops. The windows (k25_windows), by mode:
+//   K25_G3   gate_up: a lane loads its words d1 - 2, d1 - 1, d1 (mod WORDS; d1 = run 1's end word) as three 4-byte
+//            loads, so the ring wrap lives in the per-lane load offsets (no readlane, no selects). R1 = alignbit(L1, L2,
+//            s1); G = alignbit(L0, L1, s1) = the 32 bits before R1; run 0 ends exactly 20 bits before run 1 for every
+//            lane (8 positions x 2.5 bits; k25_plan_ok), so R0 = alignbit(G, R1, 20).
+//   K25_G2D  gate_up, fallback arm: L0 one 4-byte load, (L1, L2) one 8-byte load at d1 - 1. Only lane 0 has d1 = 0 (its
+//            8-byte load reads word 19 and one word past the tile); it takes word 0 = lane 8's L1 by one DPP select.
+//   K25_UB96 gate_up, unpack-only arm: today's 12-byte load, readlane and selects, decode_run's two windows.
+//   K25_U4   down: today's four 4-byte loads (each run's word pair), decode_run's two windows.
+// Every state is decode_run's 16 stream bits, hashed by the same instructions, summed and mapped by the same v_sad /
+// v_pk_fma and placed in the same fragment element, and the WMMAs run in the same order: the same f16 weights and the
+// same outputs (CPU proof tools/k25proof.cpp; on the card k25probe old vs new, every row byte for byte).
+enum { K25_OFF = 0, K25_G3 = 1, K25_G2D = 2, K25_UB96 = 3, K25_U4 = 4 };
+static __host__ __device__ constexpr int k25_base(int lane) {
+  return 32 * ((lane & 15) & 7) + 4 * ((lane & 15) >> 3) + 16 * (lane >> 4);
+}
+static __host__ __device__ constexpr int k25_e3(int lane, int r) { return (((k25_base(lane) + 8 * r) >> 1) + 2) * 5; }
+static __host__ __device__ constexpr int k25_d1(int lane) { return (k25_e3(lane, 1) - 1) >> 5; }  // = Plan's woff[1][1]
+// G2D: bit L set = lane L keeps its own L2; a clear lane (d1 = 0) takes row_ror:8's partner's L1 (word 0)
+static __host__ __device__ constexpr unsigned k25_g2d_keep() {
+  unsigned m = 0;
+  for (int l = 0; l < 32; ++l)
+    if (k25_d1(l) != 0) m |= 1u << l;
+  return m;
+}
+static __host__ __device__ constexpr bool k25_plan_ok() {
+  for (int l = 0; l < 32; ++l) {
+    if (k25_e3(l, 1) - k25_e3(l, 0) != 20 || k25_d1(l) < 0 || k25_d1(l) >= 20) return false;
+    if (k25_d1(l) == 0 && k25_d1((l & 16) | ((l + 8) & 15)) != 1) return false;   // the partner's d1 - 1 = word 0
+  }
+  return true;
+}
+static_assert(k25_plan_ok() && k25_g2d_keep() == 0xFFFFFFFEu, "K25U: K = 2.5's lane plan is not the one the windows assume");
+
+// The NPW tiles' windows R0 / R1 (the 32 stream bits ending at run 0's / run 1's end) from the step's loaded words W
+// (EXL3_LOAD's slots: G3 / G2D / UB96 hold L0, L1, L2 in [0][0], [0][1], [1][0]; U4 each run's pair), phase by phase.
+template <int MODE, int NPW, int H96>
+static __device__ __forceinline__ void k25_windows(const unsigned (&W)[NPW][2][2], const unsigned (&sh)[2], bool b96w,
+                                                   bool b96p, unsigned (&R0)[NPW], unsigned (&R1)[NPW]) {
+  if constexpr (MODE == K25_G3 || MODE == K25_G2D) {
+    unsigned L2[NPW], G[NPW];
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      if constexpr (MODE == K25_G2D)   // src0 through DPP: lane 0 reads lane 8's L1; every other lane keeps its own L2
+        asm("v_cndmask_b32_e64_dpp %0, %1, %2, %3 row_ror:8 row_mask:0xf bank_mask:0xf"
+            : "=v"(L2[j]) : "v"(W[j][0][1]), "v"(W[j][1][0]), "s"(k25_g2d_keep()));
+      else
+        L2[j] = W[j][1][0];
+    }
+#pragma unroll
+    for (int j = 0; j < NPW; j++) R1[j] = __builtin_amdgcn_alignbit(W[j][0][1], L2[j], sh[1]);
+#pragma unroll
+    for (int j = 0; j < NPW; j++) G[j] = __builtin_amdgcn_alignbit(W[j][0][0], W[j][0][1], sh[1]);
+#pragma unroll
+    for (int j = 0; j < NPW; j++) R0[j] = __builtin_amdgcn_alignbit(G[j], R1[j], 20u);
+  } else if constexpr (MODE == K25_UB96) {   // EXL3_COMPUTE's kB96 selection, then decode_run's windows
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const unsigned v0 = W[j][0][0], v1 = W[j][0][1], v2 = W[j][1][0];
+      const unsigned l = (unsigned)__builtin_amdgcn_readlane((int)((H96 & 3) == 1 ? v1 : v2), H96 >> 2);
+      const unsigned x0 = b96w ? l : v0, x1 = b96w ? v0 : v1, x2 = b96w ? v1 : v2;
+      R0[j] = __builtin_amdgcn_alignbit(x0, x1, sh[0]);
+      R1[j] = __builtin_amdgcn_alignbit(b96p ? x1 : x0, b96p ? x2 : x1, sh[1]);
+    }
+  } else {
+    static_assert(MODE == K25_U4, "K25U: unknown mode");
+#pragma unroll
+    for (int j = 0; j < NPW; j++) R0[j] = __builtin_amdgcn_alignbit(W[j][0][0], W[j][0][1], sh[0]);
+#pragma unroll
+    for (int j = 0; j < NPW; j++) R1[j] = __builtin_amdgcn_alignbit(W[j][1][0], W[j][1][1], sh[1]);
+  }
+}
+
+// The NPW tiles' fragments from their windows, phase-ordered as decode_frags_x3d (X3D-F g12b: each phase over every
+// state before the next, so the hash chains overlap): the shifts, the 8 NPW v_pk_mul_lo_u16, the 8 NPW v_mad_u32_u16
+// (hash_pair's ha form on each state's own register), the byte sums, the fmas. State k = 8 j + 4 r + i: tile j, run r,
+// position i of the run. Element order as decode_frag: u[0] run 0 (0, 1), u[2] run 0 (2, 3), u[1] run 1 (0, 1), u[3]
+// run 1 (2, 3).
+template <int NPW>
+static __device__ __forceinline__ void decode_frags_k25(const unsigned (&R0)[NPW], const unsigned (&R1)[NPW],
+                                                        v8h (&out)[NPW]) {
+  constexpr int N = 8 * NPW;
+  unsigned x[N], pa[N], hs[N];
+#pragma unroll
+  for (int j = 0; j < NPW; j++)
+#pragma unroll
+    for (int r = 0; r < 2; r++)
+#pragma unroll
+      for (int i = 0; i < 4; i++) x[8 * j + 4 * r + i] = (r ? R1[j] : R0[j]) >> exl3r4d_run_off(EXL3R4D_K25, i);
+#pragma unroll
+  for (int k = 0; k < N; k++) asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(pa[k]) : "v"(x[k]), "s"(0x83DC0000u));
+#pragma unroll
+  for (int k = 0; k < N; k++) asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(hs[k]) : "v"(x[k]), "s"(0xD12Du), "v"(pa[k]));
+  unsigned lo[NPW][4], sm[NPW][4];   // q = 2 r + p: run r, positions (2 p, 2 p + 1)
+#pragma unroll
+  for (int j = 0; j < NPW; j++)
+#pragma unroll
+    for (int q = 0; q < 4; q++) lo[j][q] = sad_lo(hs[8 * j + 4 * (q >> 1) + 2 * (q & 1)], 0x64006400u);
+#pragma unroll
+  for (int j = 0; j < NPW; j++)
+#pragma unroll
+    for (int q = 0; q < 4; q++) sm[j][q] = sad_hi(hs[8 * j + 4 * (q >> 1) + 2 * (q & 1) + 1], lo[j][q]);
+  const _Float16 kinv = __builtin_bit_cast(_Float16, (unsigned short)0x1EEE);
+  const _Float16 kbias = __builtin_bit_cast(_Float16, (unsigned short)0xC931);
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    union { unsigned u[4]; v8h f; } x8;
+    const int slot[4] = {0, 2, 1, 3};
+#pragma unroll
+    for (int q = 0; q < 4; q++)
+      x8.u[slot[q]] = __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, sm[j][q]),
+                                                                            (v2h){kinv, kinv}, (v2h){kbias, kbias}));
+    out[j] = x8.f;
+  }
+}
 // P10-TP4S L1: one unit's two K slices meet. Each slice dumps its accumulators (every thread's registers, after the
 // LDS split-K reduction) to p.raw [unit][slice][thread][NPW x 8], releases, and counts in at p.ctr[unit]; the second to
 // arrive acquires, adds the other's dump -- p0 + p1, an IEEE sum's operands commute, so the bits do not depend on which
@@ -580,7 +703,7 @@ static __device__ bool xs_combine(const Exl3r4dGemm& p, v8f (&acc)[NPW], int uni
 // XSM (P10-TP4S L1, the four-class dense gate_up only): this workgroup is slice xsl of xsn of its unit's K; with xsn
 // 2 the two slices' partial sums meet in xs_combine (below) and the second to arrive runs the epilogue.
 template <int BITS, int NPW, int MATS, bool APREP, bool RAW = false, int STAGED = 0, bool PIN = false, int PFO = 0,
-          bool XSM = false, bool X3D = false>
+          bool XSM = false, bool X3D = false, int K25 = K25_OFF>
 static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Planes& w, int rc, int r1, float* lds,
                                                 unsigned long long tk0 = 0, int cbx = -1, bool rot = true,
                                                 int wsub = 0, int xsn = 1, int xsl = 0, int xunit = 0) {
@@ -861,6 +984,16 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 #pragma unroll
     for (int i = 0; i < 4; i++) x3d_sx[i] = plan.shift[1] + 6u - 2u * (unsigned)i;
   }
+  // K25U (above k25_windows): gate_up G3 / G2D / UB96 on the 12-byte form's exact-extent resource (G2D's lane 0 reads
+  // one word past the tile: zero past the matrix), down U4 on today's four-load form
+  static_assert(K25 == K25_OFF || (BITS == EXL3R4D_K25 && NW == 2 && kBuf && STAGED == 0 && !APREP && !RAW && !X3D &&
+                                   (MATS == 1) == (K25 == K25_U4) && (K25 == K25_U4 || kB96)),
+                "K25U: K = 2.5's buffer K loop only (gate_up G3 / G2D / UB96, down U4)");
+  [[maybe_unused]] unsigned k25o[3];   // K25U G3 / G2D: byte offsets of the lane's words d1 - 2, d1 - 1, d1 (mod WORDS)
+  if constexpr (K25 == K25_G3 || K25 == K25_G2D) {
+#pragma unroll
+    for (int k = 0; k < 3; k++) k25o[k] = 4u * (unsigned)((plan.woff[1][1] + WORDS - 2 + k) % WORDS);
+  }
   constexpr int kAux = EXL3R4D_NT ? 1 : 0;  // TH_LOAD_NT, as the global form's __builtin_nontemporal_load
 
 #define WOFF_(r, x) wvo[r][x]
@@ -882,6 +1015,14 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
             q_ = __builtin_amdgcn_raw_buffer_load_b32(wrs, bwp + j * 128, so_, kAux); \
           }                                                                          \
           W_[j][0][0] = m_; W_[j][0][1] = z_; W_[j][1][0] = z_; W_[j][1][1] = q_;   \
+        } else if constexpr (K25 == K25_G3) { /* K25U: words d1-2, d1-1, d1 (mod WORDS) */ \
+          W_[j][0][0] = __builtin_amdgcn_raw_buffer_load_b32(wrs, k25o[0] + j * WORDS * 4, so_, kAux); \
+          W_[j][0][1] = __builtin_amdgcn_raw_buffer_load_b32(wrs, k25o[1] + j * WORDS * 4, so_, kAux); \
+          W_[j][1][0] = __builtin_amdgcn_raw_buffer_load_b32(wrs, k25o[2] + j * WORDS * 4, so_, kAux); \
+        } else if constexpr (K25 == K25_G2D) { /* K25U: d1-2, then d1-1 and the next word in one load */ \
+          W_[j][0][0] = __builtin_amdgcn_raw_buffer_load_b32(wrs, k25o[0] + j * WORDS * 4, so_, kAux); \
+          const auto t_ = __builtin_amdgcn_raw_buffer_load_b64(wrs, k25o[1] + j * WORDS * 4, so_, kAux); \
+          W_[j][0][1] = t_[0]; W_[j][1][0] = t_[1];                                  \
         } else if constexpr (kB96) {                                                 \
           const auto t_ = __builtin_amdgcn_raw_buffer_load_b96(wrs, b96o + j * WORDS * 4, so_, kAux); \
           W_[j][0][0] = t_[0]; W_[j][0][1] = t_[1]; W_[j][1][0] = t_[2];            \
@@ -931,6 +1072,14 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       _Pragma("unroll") for (int j = 0; j < NPW; j++) { x0_[j] = W_[j][1][0]; x1_[j] = W_[j][1][1]; } \
       v8h wfs_[NPW];                                                                 \
       decode_frags_x3d<NPW>(x0_, x1_, x3d_sx, wfs_);                                 \
+      _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = mma(wfs_[j], A_, acc[j]); \
+      break;                                                                         \
+    }                                                                                \
+    if constexpr (K25 != K25_OFF) { /* K25U: the tiles' windows, their unpacked decode phase by phase, the WMMAs */ \
+      unsigned r0_[NPW], r1_[NPW];                                                   \
+      k25_windows<K25, NPW, kB96H>(W_, plan.shift, b96w, b96p, r0_, r1_);            \
+      v8h wfs_[NPW];                                                                 \
+      decode_frags_k25<NPW>(r0_, r1_, wfs_);                                         \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = mma(wfs_[j], A_, acc[j]); \
       break;                                                                         \
     }                                                                                \
@@ -1214,6 +1363,35 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_
   }
   for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
     moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true>(p, w, rc, run.r1, lds, tk0);
+}
+
+// K25U (ds41-k25u): the K = 2.5 decode kernels with unpacked states -- exl3r4d_gemm_kernel<EXL3R4D_K25, 2, MATS, false>
+// exactly (prep kernel rows, no DNW, EXL3R4D_DNG 1) except moe_pass's K25 mode (gate_up K25_G3 / K25_G2D / K25_UB96, down
+// K25_U4). exl3r4d_launch_gemm takes them only when the argument block's x3d is 2 .. 4 (fill(): bits 2.5 and the fn4
+// switch exl3_x3d at 2 / 3 / 4), so with the switch at 0 or 1 no launch reaches them.
+template <int MATS, int MODE>
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_kernel(Exl3r4dGemm p) {
+  static_assert(EXL3R4D_DNG == 1 || MATS == 2, "K25U: down's E2 grouping is not ported");
+  EXL3R4D_KARG_PREFETCH();
+  inject_delay<MATS == 2 ? EXL3R4D_DLY_GU : EXL3R4D_DLY_DN>(EXL3R4D_WG0);
+  extern __shared__ float lds[];
+  __shared__ int s_find[35];
+  [[maybe_unused]] const unsigned long long tk0 = EXL3R4D_TSTAMP ? __builtin_readsteadycounter() : 0;
+  Planes wpre = {};
+  const bool frp = EXL3R4D_FRP && p.n_expert <= 8 * (int)blockDim.x;
+  const Run run = frp ? find_run_planes(p, blockIdx.y, s_find, wpre) : find_run_any(p, blockIdx.y, s_find);
+  if (run.e < 0) {
+    zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, blockIdx.x);
+    return;
+  }
+  const Planes w = frp ? wpre : planes_of(p, run.e);
+  const int width = MATS == 2 ? w.rows / 2 : w.rows;
+  if ((int)blockIdx.x * 128 >= width) {
+    zero_rows(p, run.r0, run.r1, blockIdx.x);
+    return;
+  }
+  for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+    moe_pass<EXL3R4D_K25, 2, MATS, false, false, 0, false, 0, false, false, MODE>(p, w, rc, run.r1, lds, tk0);
 }
 
 // ----------------------------------------------------------------------------- WGB: the persistent decode grid
@@ -3606,6 +3784,11 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
                    : kx_fn<6>(gate_up, gscr);
     if (bits == 2 && a->x3d && !gscr && dngk == 1)   // X3D-F (fn4 exl3_x3d): K = 2's one-word-pair decode
       kf = gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2> : (const void*)exl3r4d_gemm_x3d_kernel<1>;
+    if (bits == EXL3R4D_K25 && a->x3d >= 2 && a->x3d <= 4 && !gscr && dngk == 1)   // K25U (fn4 exl3_x3d 2 / 3 / 4)
+      kf = !gate_up ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4>
+         : a->x3d == 2 ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G3>
+         : a->x3d == 3 ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G2D>
+                       : (const void*)exl3r4d_gemm_k25_kernel<2, K25_UB96>;
     if (hipLaunchKernel(kf, gk, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
       return RAD_E_DEVICE;
     return RAD_OK;

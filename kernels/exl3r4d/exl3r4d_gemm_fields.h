@@ -40,4 +40,5 @@
     int32_t        wq_nl;    /* WGQ: WGPs (lists) */
 #endif
     int32_t        x3d;      /* X3D-F (ds41-x3d): 1 = K = 2's decode from one word pair (fill(): bits 2 and the fn4 switch
-                              * exl3_x3d); appended after every other field, so no earlier field moves */
+                              * exl3_x3d); appended after every other field, so no earlier field moves. K25U (ds41-k25u):
+                              * 2 / 3 / 4 at bits 2.5 = the unpacked decode, gate_up G3 / G2D / UB96 (down U4 at each) */

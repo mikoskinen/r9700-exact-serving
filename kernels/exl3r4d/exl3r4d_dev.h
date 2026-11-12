@@ -81,7 +81,7 @@ int exl3r4d_launch_gemm4(const Exl3r4dGemm4* a, int gate_up, int bits, int npw, 
  * live expert (grid a->nslot). exl3r4d_launch_gemm calls it; a second kernel of this library (the prefill band)
  * may too. RAD_OK, RAD_E_INVAL without a->xr, RAD_E_DEVICE on a launch error. */
 int exl3r4d_launch_prep(const Exl3r4dGemm* a, int gate_up, void* stream);
-int exl3r4d_fn4_x3d(void);   /* X3D-F: the fn4 switch exl3_x3d (prefill.c), 0 at start */
+int exl3r4d_fn4_x3d(void);   /* X3D-F / K25U: the fn4 switch exl3_x3d (prefill.c) 0 .. 4, 0 at start */
 int exl3r4d_launch_prep4(const Exl3r4dGemm4* a, int gate_up, void* stream);
 int exl3r4d_launch_prep_form(const Exl3r4dGemm* a, int gate_up, void* stream, int grid2d);
 int exl3r4d_launch_prep_form4(const Exl3r4dGemm4* a, int gate_up, void* stream, int grid2d);

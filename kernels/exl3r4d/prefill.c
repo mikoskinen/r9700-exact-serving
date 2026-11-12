@@ -20,14 +20,17 @@
 /* X3D-F (ds41-x3d, 12.11.2026): fn4 switch "exl3_x3d" 0 / 1 -- K = 2's decode reads a lane's eight states from one word
  * pair (exl3r4d_common.hip.h decode_frag_x3d; the same f16 weights by construction). 0 at start = today's kernels. The
  * engine reaches it through these hooks (core/runtime/fn4_switch.cpp: every loaded object exporting rad_fn4_switch);
- * every other name answers 0 (not mine). */
+ * every other name answers 0 (not mine).
+ * K25U (ds41-k25u, 13.11.2026): 2 / 3 / 4 = X3D-F (K = 2, as 1) + K = 2.5's decode with unpacked states (exl3r4d.hip
+ * k25_windows / decode_frags_k25; the same f16 weights): gate_up G3 (2), G2D (3) or UB96 (4), down U4 at all three.
+ * 0 / 1 are what they were (no K = 2.5 launch changes). */
 static volatile int g_fn4_x3d = 0;
 int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
 /* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
  * with that prefill.c is a union of the name lists in one set of the three functions. */
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
-    if (!strcmp(name, "exl3_x3d")) return value == 0 || value == 1 ? 1 : -1;
+    if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 4 ? 1 : -1;   /* K25U: 2 .. 4 */
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {

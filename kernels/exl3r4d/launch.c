@@ -239,7 +239,10 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->h_rot = g->h_rot;
     d->a_rot = g->a_rot;
     d->limit = (float)g->limit;
-    d->x3d = (g->bits == 2 && exl3r4d_fn4_x3d()) ? 1 : 0;   /* X3D-F: K = 2 only (fn4 exl3_x3d) */
+    {   /* X3D-F: K = 2 at fn4 exl3_x3d >= 1; K25U: K = 2.5 at 2 / 3 / 4 (the gate_up arm; exl3r4d_launch_gemm) */
+        const int sw = exl3r4d_fn4_x3d();
+        d->x3d = g->bits == 2 ? (sw >= 1 ? 1 : 0) : (g->bits == EXL3R4D_BITS_H25 && sw >= 2 && sw <= 4) ? sw : 0;
+    }
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
