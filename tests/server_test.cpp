@@ -5364,7 +5364,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
               "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1, \"ds41_engdd\": -1, "
               "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, \"stage_full_min\": 0, "
               "\"stage_full_pick\": 0, \"mhc_fuse\": -1, \"ix_lds\": -1, \"ix_ni\": -1, \"ds41_arcoded\": -1, "
-              "\"sched_row_cap\": 0}"));   /* ds41-int9: lever SP appended after place_hb; int9b: M1, IX-LDSR2,
+              "\"sched_row_cap\": 0, \"exl3_x3d\": -1}"));   /* ds41-int9: lever SP appended after place_hb; int9b: M1, IX-LDSR2,
                                                 IX-NI; int10: ARC (plugins' switches: -1 here), then CAP48 (merged) */
     CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
     CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
@@ -5389,7 +5389,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kIxNi, 54);
     CHECK_EQ((int)fn4::kDs41Arcoded, 55);
     CHECK_EQ((int)fn4::kSchedRowCap, 56);
-    CHECK_EQ((int)fn4::kSwitches, 57);
+    CHECK_EQ((int)fn4::kExl3X3d, 57);   /* X3D-F: exl3_x3d, the exl3r4d plugin's */
+    CHECK_EQ((int)fn4::kSwitches, 58);
     CHECK_EQ(fn4::switch_index("sched_row_cap"), (int)fn4::kSchedRowCap);
     CHECK(!fn4::sched_switch(fn4::kSchedRowCap));   /* the scheduler reads it at every step it plans (fn4::sched_row_cap) */
     CHECK_EQ(fn4::switch_index("ds41_arcoded"), (int)fn4::kDs41Arcoded);
@@ -5591,14 +5592,14 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         CHECK_EQ(sw[fn4::kSchedRowCap], fn4::kNoChange);   /* not handed over: read at every step */
         CHECK_EQ(fn4::sched_row_cap(), 48);
         CHECK_EQ(fn4::value(fn4::kSchedRowCap), 48);
-        CHECK(has(f.get("/admin/fn4").body, "\"ds41_arcoded\": -1, \"sched_row_cap\": 48}"));
+        CHECK(has(f.get("/admin/fn4").body, "\"ds41_arcoded\": -1, \"sched_row_cap\": 48, \"exl3_x3d\": -1}"));
         CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":48})").status, 200);
         CHECK(!fn4::apply_pending(51, sw));                 /* the same value: pinned, no epoch */
         CHECK_EQ(fn4::epoch(), e0 + 1);
         CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":0})").status, 200);
         CHECK(fn4::apply_pending(52, sw));
         CHECK_EQ(fn4::sched_row_cap(), 0);
-        CHECK(has(f.get("/admin/fn4").body, "\"ds41_arcoded\": -1, \"sched_row_cap\": 0}"));
+        CHECK(has(f.get("/admin/fn4").body, "\"ds41_arcoded\": -1, \"sched_row_cap\": 0, \"exl3_x3d\": -1}"));
     }
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
