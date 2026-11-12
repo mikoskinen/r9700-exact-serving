@@ -285,6 +285,16 @@ uint64_t max_copy() {
     return m;
 }
 
+/* R4D_SDMA_RR: the round-robin chunk of a hop (bytes, a multiple of 256 from 64 KiB; 0 / unset: one copy a peer). */
+uint64_t rr_chunk() {
+    static const uint64_t m = [] {
+        const char* e = std::getenv("R4D_SDMA_RR");
+        const uint64_t v = e && *e ? std::strtoull(e, nullptr, 0) : 0;
+        return v >= 65536 ? (v & ~(uint64_t)255) : 0;
+    }();
+    return m;
+}
+
 int q_copy(SdmaQ* q, void* dst, const void* src, uint64_t bytes) {
     int rc = RAD_OK;
     const uint64_t mc = max_copy();
@@ -663,23 +673,48 @@ int sdma_launch(SdmaAr* a, const void* in, void* out, long long numel, const lon
     {
         SdmaQ* q = a->q;
         std::lock_guard<std::mutex> lk(q->mu);
-        if (hop1) {
-            rc = q_poll(q, fl + kFGo1 * kFlagStride, v);
+        /* A hop: one copy a peer in ring order from r + 1, each followed by its FENCE; or, with R4D_SDMA_RR=<bytes>
+         * (sdma2 12.11.: a hop sometimes ran at half the link rate for whole timing windows, 13.5 vs 26 GB/s -- two
+         * senders into one card, the hypothesis), the peers taken round-robin a chunk at a time, so a rank one copy out
+         * of phase cannot keep two senders on one card for the whole hop; the FENCEs after the last chunk. */
+        const uint64_t rr = rr_chunk();
+        auto hop = [&](bool second) {
+            char* const* dst = second ? a->peer_b : a->peer_a;
+            const int fk = second ? kFB : kFA;
+            auto src_of = [&](int pr) { return second ? (const char*)(out4 + off[r]) : (const char*)(in4 + off[pr]); };
+            auto len_of = [&](int pr) { return (uint64_t)(second ? off[r + 1] - off[r] : off[pr + 1] - off[pr]) * 16; };
+            if (!rr) {
+                for (int i = 1; rc == RAD_OK && i < W; ++i) {
+                    const int pr = (r + i) % W;
+                    const uint64_t len = len_of(pr);
+                    if (len) rc = q_copy(q, dst[pr] + mine, src_of(pr), len);
+                    if (rc == RAD_OK) rc = q_fence(q, a->peer_fl[pr] + (fk + r) * kFlagStride, v);
+                }
+                return;
+            }
+            for (uint64_t o = 0; rc == RAD_OK; o += rr) {
+                bool any = false;
+                for (int i = 1; rc == RAD_OK && i < W; ++i) {
+                    const int pr = (r + i) % W;
+                    const uint64_t len = len_of(pr);
+                    if (o >= len) continue;
+                    any = true;
+                    rc = q_copy(q, dst[pr] + mine + o, src_of(pr) + o, std::min(rr, len - o));
+                }
+                if (!any) break;
+            }
             for (int i = 1; rc == RAD_OK && i < W; ++i) {
                 const int pr = (r + i) % W;
-                const uint64_t len = (uint64_t)(off[pr + 1] - off[pr]) * 16;
-                if (len) rc = q_copy(q, a->peer_a[pr] + mine, in4 + off[pr], len);
-                if (rc == RAD_OK) rc = q_fence(q, a->peer_fl[pr] + (kFA + r) * kFlagStride, v);
+                rc = q_fence(q, a->peer_fl[pr] + (fk + r) * kFlagStride, v);
             }
+        };
+        if (hop1) {
+            rc = q_poll(q, fl + kFGo1 * kFlagStride, v);
+            hop(false);
         }
         if (hop2) {
             if (rc == RAD_OK) rc = q_poll(q, fl + kFGo2 * kFlagStride, v);
-            const uint64_t mylen = (uint64_t)(off[r + 1] - off[r]) * 16;
-            for (int i = 1; rc == RAD_OK && i < W; ++i) {
-                const int pr = (r + i) % W;
-                if (mylen) rc = q_copy(q, a->peer_b[pr] + mine, out4 + off[r], mylen);
-                if (rc == RAD_OK) rc = q_fence(q, a->peer_fl[pr] + (kFB + r) * kFlagStride, v);
-            }
+            hop(true);
         }
         if (rc == RAD_OK) rc = q_fence(q, fl + kFDone * kFlagStride, v);
         const int krc = q_kick(q);
