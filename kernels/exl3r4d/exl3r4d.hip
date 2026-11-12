@@ -926,6 +926,14 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
 
 #define EXL3_COMPUTE(W_, A_)                                                         \
   do {                                                                               \
+    if constexpr (X3D) { /* g12b: both tiles' fragments phase by phase, then the WMMAs */ \
+      unsigned x0_[NPW], x1_[NPW];                                                   \
+      _Pragma("unroll") for (int j = 0; j < NPW; j++) { x0_[j] = W_[j][1][0]; x1_[j] = W_[j][1][1]; } \
+      v8h wfs_[NPW];                                                                 \
+      decode_frags_x3d<NPW>(x0_, x1_, x3d_sx, wfs_);                                 \
+      _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = mma(wfs_[j], A_, acc[j]); \
+      break;                                                                         \
+    }                                                                                \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                \
       v8h wf;                                                                        \
       if constexpr (kB96) { /* words d0-1, d0, d0+1 (wrapped lanes: last, 0, 1) -> the runs' pairs */ \

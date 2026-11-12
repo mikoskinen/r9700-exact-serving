@@ -467,6 +467,62 @@ static __device__ __forceinline__ v8h decode_frag_x3d(unsigned w0, unsigned w1, 
   return x.f;
 }
 
+// X3D-F, phase-ordered (g12b): the NPW tiles' fragments together, each phase over every window before the next phase --
+// 4 NPW alignbits, the 2 x 4 NPW v_pk_mul_lo_u16, the 2 x 4 NPW v_mad_u32_u16, the byte sums, the fmas -- so the hash
+// chains of different windows overlap instead of each pk_mul -> mad -> sad chain stalling on its own latency (the first
+// form's ISA: s_delay_alu before nearly every dependent op, gate_up +30 %). The same instructions and operands as
+// decode_frag_x3d / hash_pair: the same f16 bits.
+template <int NPW>
+static __device__ __forceinline__ void decode_frags_x3d(const unsigned (&w0)[NPW], const unsigned (&w1)[NPW],
+                                                        const unsigned (&sx)[4], v8h (&out)[NPW]) {
+  constexpr int N = 4 * NPW;
+  unsigned win[N], pa[N], pb[N], ha[N], hb[N];
+#pragma unroll
+  for (int j = 0; j < NPW; j++)
+#pragma unroll
+    for (int i = 0; i < 4; i++) win[4 * j + i] = __builtin_amdgcn_alignbit(w0[j], w1[j], sx[i]);
+#pragma unroll
+  for (int k = 0; k < N; k++) asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(pa[k]) : "v"(win[k]), "s"(0x83DC0000u));
+#pragma unroll
+  for (int k = 0; k < N; k++) asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(pb[k]) : "v"(win[k]), "s"(0x83DC0000u));
+#pragma unroll
+  for (int k = 0; k < N; k++) asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(ha[k]) : "v"(win[k]), "s"(0xD12Du), "v"(pa[k]));
+#pragma unroll
+  for (int k = 0; k < N; k++)
+    asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(hb[k]) : "v"(win[k]), "s"(0xD12Du), "v"(pb[k]));
+  // ha = run 1's state hash (window low half), hb = run 0's (high half); positions (0, 1) and (2, 3) of each run
+  unsigned lo[NPW][4], sm[NPW][4];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int b = 4 * j;
+    lo[j][0] = sad_lo(hb[b + 0], 0x64006400u);   // run 0 positions 0, 1
+    lo[j][1] = sad_lo(hb[b + 2], 0x64006400u);   // run 0 positions 2, 3
+    lo[j][2] = sad_lo(ha[b + 0], 0x64006400u);   // run 1 positions 0, 1
+    lo[j][3] = sad_lo(ha[b + 2], 0x64006400u);   // run 1 positions 2, 3
+  }
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int b = 4 * j;
+    sm[j][0] = sad_hi(hb[b + 1], lo[j][0]);
+    sm[j][1] = sad_hi(hb[b + 3], lo[j][1]);
+    sm[j][2] = sad_hi(ha[b + 1], lo[j][2]);
+    sm[j][3] = sad_hi(ha[b + 3], lo[j][3]);
+  }
+  const _Float16 kinv = __builtin_bit_cast(_Float16, (unsigned short)0x1EEE);
+  const _Float16 kbias = __builtin_bit_cast(_Float16, (unsigned short)0xC931);
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    union { unsigned u[4]; v8h f; } x;
+    // element order as decode_frag: u[0] run 0 (0, 1), u[2] run 0 (2, 3), u[1] run 1 (0, 1), u[3] run 1 (2, 3)
+    const int slot[4] = {0, 2, 1, 3};
+#pragma unroll
+    for (int q = 0; q < 4; q++)
+      x.u[slot[q]] = __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, sm[j][q]),
+                                                                           (v2h){kinv, kinv}, (v2h){kbias, kbias}));
+    out[j] = x.f;
+  }
+}
+
 // libr4d's fragA (two 8-byte groups 16 bytes apart) from a uniform base plus a per-lane byte offset.
 static __device__ __forceinline__ v8h frag_a8(gu8 base, unsigned off) {
   union { unsigned long long w[2]; v8h f; } x;
