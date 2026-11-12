@@ -2342,7 +2342,9 @@ inline void MoeFP8::pair_finish(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
         sh_down.step(c_, w.sff, w.sout, T, r0, rows);
     }
     RAD_ISSUE_N(c_, inv_now ? op_gather_inv2 : op_gather, rows, brows(w.edn, T * k),
-                brow_slice(w.ew, r0, rows, k), brow_slice(w.inv, r0, rows, k),
+                brow_slice(w.ew, r0, rows, k),
+                brow_slice(w.inv, r0 * k, rows * k, 1),   /* fn4 P2x fix 12.11.: w.inv is 1-D [rows * k]; [rows][k] gave
+                                                           * numel `rows` < M * top_k -> moe_gather_inv refused (189) */
                 gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
                 gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
                 brow_slice(w.h.x, r0, rows, g.n_embd));
