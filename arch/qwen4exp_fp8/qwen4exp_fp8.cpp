@@ -284,6 +284,7 @@ struct Model {
     bool        bi_on = false;
     int         bi_mode = 0;     /* fn4 hc_bi's value this step (3: decode rows read <= kBiDecRows at a time) */
     int64_t     bi_td = 0;       /* this step's decode rows */
+    int64_t     bi_qd = 1;       /* rows a decode sequence (1 + n_spec) */
     std::vector<int64_t> bi_cut;
 };
 
@@ -321,6 +322,7 @@ static void bi_segments(Model& m, const RadBatch* batch) {
     int64_t sd = 0, td = 0;
     batch_split(batch, &sd, &td);
     m.bi_td = td;
+    m.bi_qd = sd > 0 && td % sd == 0 ? td / sd : 1;   /* a decode sequence's rows (1 + n_spec) */
     m.bi_cut.push_back(0);
     if (td > 0 && td < T) m.bi_cut.push_back(td);
     if (batch->positions_h)
@@ -369,7 +371,11 @@ constexpr int64_t kBiDecRows = 8;
 static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t a, int64_t b, bool ss) {
     const bool dec = m.bi_mode == 3 && a < m.bi_td;
     if (!dec) { hcx.read(c, T, a, b - a, ss); return; }
-    for (int64_t p = a; p < b; p += kBiDecRows) hcx.read(c, T, p, std::min(kBiDecRows, b - p), ss);
+    /* A connection without the inject gains (the final read: libr4d's form G wants them) takes the per-row kernels
+     * below kDecMinRows (8) and the tiled form from 8: its decode rows go a sequence at a time (1 + n_spec rows, the
+     * alone read; x02 12.11.: 'final' first-differing in 20 of 20 c4 probes with 8-row pieces). */
+    const int64_t pc = hcx.c.inject ? kBiDecRows : std::max<int64_t>(1, std::min<int64_t>(m.bi_qd, kBiDecRows - 1));
+    for (int64_t p = a; p < b; p += pc) hcx.read(c, T, p, std::min(pc, b - p), ss);
 }
 static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t r0, int64_t n, bool ss = false) {
     if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode == 3 && m.bi_td > kBiDecRows))) { hcx.read(c, T, r0, n, ss); return; }
