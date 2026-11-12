@@ -273,7 +273,9 @@ static int launch_gu_dn(const RadArgs* a, int op) {
     h.shape[0] = T;
     h.shape[1] = W;
     rad_tensor_pack(&h);
-    RadTensor tg[24], td[16];
+    RadTensor tg[24], td[24];   /* v13: down's views hold 11 / 17 (the band slot, cleared by the helpers) */
+    memset(tg, 0, sizeof tg);
+    memset(td, 0, sizeof td);
     if (mod4) exl3_gd4_operands(a->t, &h, tg, td);
     else exl3_gd_operands(a->t, &h, tg, td);
     RadArgs ag = *a, ad = *a;
@@ -288,7 +290,7 @@ static int launch_gu_dn(const RadArgs* a, int op) {
 int exl3ref_launch(const RadArgs* a, int op) {
     if (exl3_op_base(op) == EXL3_GU_DN) return launch_gu_dn(a, op);
     const Exl3Positions* at = exl3_positions(op);
-    if (a->n_t < at->n_opd) return RAD_E_INVAL;
+    if (a->n_t < at->n_opd - (at->band >= 0)) return RAD_E_INVAL;   /* v13's band: optional and last; not read here */
     if (!rad_arg_in(a, at->x) || !rad_arg_in(a, at->sorted) || !rad_arg_in(a, at->offset) ||
         !rad_arg_in(a, at->y))
         return RAD_E_INVAL;

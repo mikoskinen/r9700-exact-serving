@@ -742,7 +742,9 @@ static int launch_gd(const RadArgs* a, RadStream s, int op) {
     h.shape[0] = T;
     h.shape[1] = w;
     rad_tensor_pack(&h);
-    RadTensor tg[24], td[16];
+    RadTensor tg[24], td[24];   /* v13: down's views hold 11 / 17 (the band slot, cleared by the helpers) */
+    memset(tg, 0, sizeof tg);
+    memset(td, 0, sizeof td);
     if (mod4) exl3_gd4_operands(a->t, &h, tg, td);
     else exl3_gd_operands(a->t, &h, tg, td);
     RadArgs ag = *a, ad = *a;
