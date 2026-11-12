@@ -1265,11 +1265,12 @@ static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::ve
             T(d_kv, RAD_F8E4M3, { nblk, kv_heads, bs, 2 * head_dim }),
             TI32({ ns, maxb }, b),
             TI32({ ns }, u),
-            TF32({ 1, kv_heads }, 1.0f),
-            TF32({ 1, kv_heads }, 1.0f),
+            TF32({ ns, kv_heads }, 1.0f),
+            TF32({ ns, kv_heads }, 1.0f),
             T(nullptr, RAD_I32, { ns + 1 }),
             T((char*)out + (size_t)(s0 * qd * rowq * 2), RAD_BF16, { ns * qd, q_heads, head_dim }),
         };
+        absent(ts[4]); absent(ts[5]);   /* as the arch issues it (RAD_NONE: no descales); [1, kv] read past seq 0 */
         absent(ts[6]);
         std::vector<RadParam> ps = {
             PI("q_len", qd), PI("head_dim", head_dim), PI("gqa", gqa), PI("block_size", bs),
