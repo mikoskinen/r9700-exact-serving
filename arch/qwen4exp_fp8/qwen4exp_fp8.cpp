@@ -378,7 +378,7 @@ static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t
     for (int64_t p = a; p < b; p += pc) hcx.read(c, T, p, std::min(pc, b - p), ss);
 }
 static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t r0, int64_t n, bool ss = false) {
-    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode == 3 && m.bi_td > kBiDecRows))) { hcx.read(c, T, r0, n, ss); return; }
+    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode == 3 && m.bi_td > 0))) { hcx.read(c, T, r0, n, ss); return; }
     for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i) {
         const int64_t a = std::max(m.bi_cut[i], r0), b = std::min(m.bi_cut[i + 1], r0 + n);
         if (b > a) bi_read_seg(c, m, hcx, T, a, b, ss);
@@ -386,7 +386,7 @@ static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, 
 }
 /* read_pieces under hc_bi: each segment in pieces of the read's band. */
 static void bi_read_pieces(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, bool ss = false) {
-    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode == 3 && m.bi_td > kBiDecRows))) { hcx.read_pieces(c, T, ss); return; }
+    if (!m.bi_on || (m.bi_cut.size() <= 2 && !(m.bi_mode == 3 && m.bi_td > 0))) { hcx.read_pieces(c, T, ss); return; }
     const int64_t piece = hcx.c.read_rows > 0 ? hcx.c.read_rows : T;
     for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i)
         for (int64_t a = m.bi_cut[i]; a < m.bi_cut[i + 1]; a += piece)
