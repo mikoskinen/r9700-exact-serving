@@ -337,6 +337,13 @@
  *                   (index_topk reads a row only below its reach) and index_candidates reads a row only below its reach (a
  *                   -inf never moves a block maximum, so the same keep words). RADIANCE_DS41_IX_NI=1 starts it at 1.
  *                   GET "i9b" carries the three levers' counters (i9b_stats).
+ *   ds41_arcoded    libr4d (lever ARC, ds41-int10): 0 off (today: the four-rank exact two-shot at overlap 0 sends the plain
+ *                   wire); N in 1 .. 1048576 -- such a launch of at least N rows (the operand's elements over its last axis)
+ *                   sends the coded wire instead (~12.2 bits a bf16 value, r4d_ar_coded.h, until now only at overlap 1),
+ *                   at 8 / 16 / 24 blocks of 1024 threads by the message (r4d_ar_arc.h: the ARW item's best grid a size),
+ *                   where the coded form fits (bf16, whole-wave shards, the slot); the rest plain. Exact: the coded wire
+ *                   decodes the same values, folded in the same order. RADIANCE_DS41_ARCODED=N at load starts it at N.
+ *                   GET "arc" carries its counters (arc_stats).
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -413,7 +420,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
-              kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kSwitches };
+              kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
+              kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -528,6 +536,13 @@ int  dspark_pfctx_stats(int64_t out[4]);
  * ix_ni, index_candidates launches under ix_ni. 0s where no plugin serves them. */
 constexpr int kI9bStats = 10;
 void i9b_stats(int64_t out[kI9bStats]);
+/* Lever ARC's live counters (ds41-int10, GET /admin/fn4 "arc"; libr4d's rad_arc_stats, cumulative, launches of the
+ * four-rank exact two-shot at overlap 0 counted when issued -- a recorded pass when it is recorded): [0] coded launches
+ * (rank 0), [1] their rows, [2] plain launches (rank 0, any ds41_arcoded), [3] their rows, [4] plain launches below the
+ * threshold, [5] plain launches at or above it (the coded form declined the message), [6] coded launches over every rank.
+ * 0s where no plugin serves them. */
+constexpr int kArcStats = 7;
+void arc_stats(int64_t out[kArcStats]);
 /* Lever E1's live counters (ds41-e1, /stats "engdd"; the plugin's rad_engdd_stats, rank 0's, cumulative): Engram layer
  * passes deduplicated, rows not computed in them, rows pooled in them, layer passes kept whole by the 48-row guard, layer
  * passes below the repeat share, steps with a deduplicated layer, layer passes with no launch above the band -- 0s and a

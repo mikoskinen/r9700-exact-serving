@@ -5363,9 +5363,9 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK(has(f.get("/admin/fn4").body,
               "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1, \"ds41_engdd\": -1, "
               "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, \"stage_full_min\": 0, "
-              "\"stage_full_pick\": 0, \"mhc_fuse\": -1, \"ix_lds\": -1, \"ix_ni\": -1}"));   /* ds41-int9: lever SP appended
-                                                                                    after place_hb; int9b: M1, IX-LDSR2, IX-NI (plugins'
-                                                                                    switches: -1 here) */
+              "\"stage_full_pick\": 0, \"mhc_fuse\": -1, \"ix_lds\": -1, \"ix_ni\": -1, \"ds41_arcoded\": -1}"));   /* ds41-int9: lever
+                                                                                    SP appended after place_hb; int9b: M1, IX-LDSR2, IX-NI;
+                                                                                    int10: ARC (plugins' switches: -1 here) */
     CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
     CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
     CHECK_EQ(fn4::switch_index("ds41_psk_cr"), (int)fn4::kDs41PskCr);
@@ -5380,11 +5380,32 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kStageFullPick + 1, (int)fn4::kMhcFuse);   /* ds41-int9b: levers M1, IX-LDSR2, IX-NI, appended */
     CHECK_EQ((int)fn4::kMhcFuse + 1, (int)fn4::kIxLds);
     CHECK_EQ((int)fn4::kIxLds + 1, (int)fn4::kIxNi);
-    CHECK_EQ((int)fn4::kIxNi + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kIxNi + 1, (int)fn4::kDs41Arcoded);   /* ds41-int10: lever ARC, appended */
+    CHECK_EQ((int)fn4::kDs41Arcoded + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
     CHECK_EQ((int)fn4::kPlaceHb, 49);
     CHECK_EQ((int)fn4::kStageFullPick, 51);
-    CHECK_EQ((int)fn4::kSwitches, 55);
+    CHECK_EQ((int)fn4::kIxNi, 54);
+    CHECK_EQ((int)fn4::kDs41Arcoded, 55);
+    CHECK_EQ((int)fn4::kSwitches, 56);
+    CHECK_EQ(fn4::switch_index("ds41_arcoded"), (int)fn4::kDs41Arcoded);
+    CHECK(!fn4::sched_switch(fn4::kDs41Arcoded));
+    {   /* ds41-int10: no plugin serves ds41_arcoded here: refused (any value), and GET "arc" all 0 */
+        for (const char* b : { R"({"ds41_arcoded":1024})", R"({"ds41_arcoded":0})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "no loaded plugin serves it"));
+        }
+        const HttpResponse ga = f.get("/admin/fn4");
+        CHECK(has(ga.body, "\"arc\": {\"coded_launches\": 0, \"coded_rows\": 0, \"plain_launches\": 0, \"plain_rows\": 0, "
+                           "\"below\": 0, \"declined\": 0, \"coded_all_ranks\": 0}"));
+        int64_t v[fn4::kArcStats];
+        fn4::arc_stats(v);
+        for (int i = 0; i < fn4::kArcStats; ++i) CHECK_EQ(v[i], (int64_t)0);
+        std::string err;
+        CHECK(!fn4::check("ds41_arcoded", 1024, &err));
+        CHECK(err.find("no loaded plugin serves it") != std::string::npos);
+    }
     CHECK_EQ(fn4::switch_index("mhc_fuse"), (int)fn4::kMhcFuse);
     CHECK_EQ(fn4::switch_index("ix_lds"), (int)fn4::kIxLds);
     CHECK_EQ(fn4::switch_index("ix_ni"), (int)fn4::kIxNi);

@@ -552,7 +552,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                   dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
-                  ds41pf ds41walk ds41wsamp ds41i9b)
+                  ds41pf ds41walk ds41wsamp ds41i9b ds41arc)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -598,7 +598,8 @@ else()
                 ${R4D_EMU}/test_argts.cpp ${R4D_EMU}/test_ds41fold.cpp ${R4D_EMU}/test_ds41vram.cpp
                 ${R4D_EMU}/test_dspark.cpp ${R4D_EMU}/test_ds41fold2.cpp ${R4D_EMU}/test_ds41drk.cpp
                 ${R4D_EMU}/test_ds41kvwin.cpp ${R4D_EMU}/test_ds41pf.cpp ${R4D_EMU}/test_ds41walk.cpp
-                ${R4D_EMU}/test_ds41wsamp.cpp ${R4D_EMU}/test_ds41i9b.cpp ${R4D_EMU}/cfg_stub.cpp)
+                ${R4D_EMU}/test_ds41wsamp.cpp ${R4D_EMU}/test_ds41i9b.cpp ${R4D_EMU}/test_ds41arc.cpp
+                ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -636,7 +637,8 @@ else()
 endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
-            ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b)
+            ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
+            ds41arc)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
@@ -667,6 +669,9 @@ if(R4D_EMU_BUILT)
   # ds41-int9b: levers M1 (mhc_post_collapse_rmsnorm_mix), IX-LDSR2 (index_score's LDS form) and IX-NI (no -inf past reach,
   # candidates below reach) against the stock forms byte for byte, with mutation controls.
   set_tests_properties(r4d_emu_ds41i9b PROPERTIES LABELS "r4d_emu" TIMEOUT 1800)
+  # ds41-int10: lever ARC -- r4d_ar_arc.h's pick (threshold, grid by the ARW table, capacity) and the coded wire's codec
+  # (r4d_ar_coded.h) through put / get and the two-shot's reduce against the plain fold, byte for byte, with mutation controls.
+  set_tests_properties(r4d_emu_ds41arc PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
   foreach(k 0 1 2)

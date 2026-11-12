@@ -34489,6 +34489,7 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 }
 
 #include "r4d_selftest_i9b.inc"   /* ds41-int9b: levers M1, IX-LDSR2, IX-NI byte for byte vs the stock forms */
+#include "r4d_selftest_arc.inc"   /* ds41-int10: lever ARC, the coded wire at overlap 0 on four cards (--case ar_arcoded) */
 
 static void device_phase(const Plugin& pl) {
     int n = 0;
@@ -37697,6 +37698,9 @@ static void device_phase(const Plugin& pl) {
         std::printf("  %s\n", n);
         ar_lane_forms(pl, devs, n);
     }
+    /* ds41-int10 (r4d_selftest_arc.inc): --case ar_arcoded -- lever ARC, the four-rank two-shot at overlap 0 under fn4
+     * ds41_arcoded 0 / 1024, every rank and size == the fold, the counters proving the wire */
+    arc_cases(pl, devs);
     /* The fused write rows at both widths and both gathers. The `_host` twins take the same
      * calls; they differ only in where the mailbox lives. */
     for (const char* base : { "ar_hc_write", "ar_gather_hc_write",

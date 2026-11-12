@@ -30,14 +30,14 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_psk_l20",
                                         "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa", "stage_short",
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
-                                        "ix_lds", "ix_ni" };
+                                        "ix_lds", "ix_ni", "ds41_arcoded" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
            i == kDs41OneFill || i == kDrafterMx || i == kDrafterBf ||
            i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk ||
            i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx || i == kDs41PskCr || i == kDs41Engdd ||
-           i == kMhcFuse || i == kIxLds || i == kIxNi;
+           i == kMhcFuse || i == kIxLds || i == kIxNi || i == kDs41Arcoded;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -56,6 +56,7 @@ struct Hooks {
     int (*engdd_stats)(long long*, int) = nullptr; /* lever E1's live counters (deepseek41's rad_engdd_stats, ds41-e1) */
     int (*i9b_stats)(long long*, int) = nullptr;   /* levers M1 / IX-NI (deepseek41's rad_i9b_stats, ds41-int9b) */
     int (*ix_stats)(long long*, int) = nullptr;    /* levers IX-LDSR2 / IX-NI (libr4d's rad_ix_stats, ds41-int9b) */
+    int (*arc_stats)(long long*, int) = nullptr;   /* lever ARC (libr4d's rad_arc_stats, ds41-int10) */
 };
 
 struct State {
@@ -168,6 +169,7 @@ void find_hooks(State& s) {
             k.engdd_stats = sym<int (*)(long long*, int)>(h, "rad_engdd_stats");
             k.i9b_stats = sym<int (*)(long long*, int)>(h, "rad_i9b_stats");
             k.ix_stats = sym<int (*)(long long*, int)>(h, "rad_ix_stats");
+            k.arc_stats = sym<int (*)(long long*, int)>(h, "rad_arc_stats");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -498,6 +500,24 @@ void i9b_stats(int64_t out[kI9bStats]) {
     i9b_collect(s, out);
 }
 
+/* Under s.mu. */
+static void arc_collect(State& s, int64_t* out) {
+    for (int i = 0; i < kArcStats; ++i) out[i] = 0;
+    find_hooks(s);
+    for (const Hooks& k : s.hooks) {
+        if (!k.arc_stats) continue;
+        long long v[kArcStats] = {};
+        const int n = k.arc_stats(v, kArcStats);
+        for (int i = 0; i < n && i < kArcStats; ++i) out[i] = (int64_t)v[i];
+        if (n > 0) break;
+    }
+}
+void arc_stats(int64_t out[kArcStats]) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    arc_collect(s, out);
+}
+
 int engdd_stats(int64_t out[7]) {
     for (int i = 0; i < 7; ++i) out[i] = 0;
     State& s = st();
@@ -549,7 +569,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
-                        "stage_full_pick, mhc_fuse, ix_lds, ix_ni, epoch_bump)";
+                        "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1139,6 +1159,16 @@ std::string state_json() {
              ", \"ni_launches\": " + std::to_string((long long)v[8]) + ", \"ni_cand_launches\": " +
              std::to_string((long long)v[9]) + "}, \"ni\": {\"runs\": " + std::to_string((long long)v[4]) +
              ", \"dead_bytes\": " + std::to_string((long long)v[5]) + "}}";
+    }
+    /* Lever ARC (ds41-int10): always present, 0s where no plugin serves it (arc_stats). */
+    {
+        int64_t v[kArcStats];
+        arc_collect(s, v);
+        o += ", \"arc\": {\"coded_launches\": " + std::to_string((long long)v[0]) +
+             ", \"coded_rows\": " + std::to_string((long long)v[1]) + ", \"plain_launches\": " +
+             std::to_string((long long)v[2]) + ", \"plain_rows\": " + std::to_string((long long)v[3]) +
+             ", \"below\": " + std::to_string((long long)v[4]) + ", \"declined\": " + std::to_string((long long)v[5]) +
+             ", \"coded_all_ranks\": " + std::to_string((long long)v[6]) + "}";
     }
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {

@@ -24,7 +24,9 @@
 #include "r4d.h"
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
+#include "r4d_ar_arc.h"     /* lever ARC (ds41-int10): the coded wire at overlap 0, fn4 ds41_arcoded */
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -1047,6 +1049,45 @@ extern "C" int r4d_rad_ar_twoshot_3rank_exact(const RadArgs* a, RadStream s) {
     return RAD_OK;
 }
 
+/* Lever ARC (ds41-int10, r4d_ar_arc.h): libr4d's fn4 switch "ds41_arcoded" (r4d_ds41_ggml.hip's rad_fn4_*), 0 = off (the
+ * plain wire at overlap 0, as before) or N = the coded wire for a launch at overlap 0 of at least N rows. The start value is
+ * RADIANCE_DS41_ARCODED (0 .. R4D_ARC_MAX, a decimal integer; unset: 0; anything else: 0, named on stderr once), read at the
+ * first launch; read at every launch after (a change applies at a step release, every rank parked, and re-records every
+ * pass: fn4's epoch). Counters (rad_arc_stats; launches of the two-shot entry at overlap 0, counted when issued -- a recorded
+ * pass when it is recorded): rank 0's coded launches and rows, plain launches and rows, plain launches below the threshold
+ * and those the coded form declined at or above it; coded launches summed over every rank. */
+static std::atomic<int> g_arc{-1};
+static std::atomic<long long> g_arc_ctr[7];
+static int arc_env() {
+    const char* e = std::getenv("RADIANCE_DS41_ARCODED");
+    if (!e || !*e) return 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(e, &end, 10);
+    if (end && !*end && r4d_arc_known(v)) return (int)v;
+    std::fprintf(stderr, "[r4d] RADIANCE_DS41_ARCODED='%s' is not 0 .. %d: lever ARC starts off (ds41_arcoded 0)\n", e,
+                 (int)R4D_ARC_MAX);
+    return 0;
+}
+static int arc_on() {
+    int v = g_arc.load(std::memory_order_relaxed);
+    if (v < 0) {
+        int unread = -1;
+        g_arc.compare_exchange_strong(unread, arc_env());
+        v = g_arc.load(std::memory_order_relaxed);
+    }
+    return v;
+}
+int r4d_arc_get() { return arc_on(); }
+void r4d_arc_set(int v) { g_arc.store(r4d_arc_known(v) ? v : 0, std::memory_order_relaxed); }
+/* out[0] coded launches (rank 0), [1] their rows, [2] plain launches at overlap 0 (rank 0, any switch value), [3] their
+ * rows, [4] plain launches below the threshold (switch on), [5] plain launches at or above it (the coded form declined:
+ * not bf16, shards not whole waves, the slot, or `coded` 0), [6] coded launches over every rank. Cumulative. Returns 7. */
+extern "C" int rad_arc_stats(long long* out, int n) {
+    if (!out || n < 7) return 0;
+    for (int i = 0; i < 7; ++i) out[i] = g_arc_ctr[i].load(std::memory_order_relaxed);
+    return 7;
+}
+
 extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     ArCall c;
     int rc = ar_setup(a, &c, 1);
@@ -1076,6 +1117,40 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                                              4, 1024, c.drain, c.acq, c.pub, early,
                                              early ? in->gate_ctr : 0L, ar_chain(a, c.numel)));
         return early ? RAD_LINK_ENDED : RAD_OK;
+    }
+    /* Lever ARC (ds41-int10, fn4 ds41_arcoded, r4d_ar_arc.h): at overlap 0, a launch of at least ds41_arcoded rows takes
+     * the coded wire above at the measured grid (8 / 16 / 24 blocks of 1024 threads by the message); the same bytes. Off
+     * (0), and below the threshold, the plain launch below as before. */
+    if (!lane) {
+        const int thr = arc_on();
+        const RadTensor* x = r4d_opt(a, AR_X);
+        const long long rows = r4d_arc_rows(c.numel, x ? (int)x->rank : 1, x && x->rank >= 1 ? x->shape[x->rank - 1] : 0);
+        const int nb = thr > 0 ? r4d_arc_pick(thr, rows, c.numel,
+                                              r4d_ar_twoshot_coded_ok(c.numel, in->dtype, 4, in->slot16),
+                                              r4d_geti_or(a, "coded", 1), in->max_blocks)
+                               : 0;
+        const bool r0 = in->rank == 0;
+        if (nb > 0) {
+            if (r0) {
+                g_arc_ctr[0].fetch_add(1, std::memory_order_relaxed);
+                g_arc_ctr[1].fetch_add(rows, std::memory_order_relaxed);
+            }
+            g_arc_ctr[6].fetch_add(1, std::memory_order_relaxed);
+            const long gate = link_gate(a), early = in->host ? 0L : gate;
+            R4D_TRY("ar_twoshot_4rank_exact (coded, ds41_arcoded)",
+                r4d_ar_twoshot_4rank_exact_coded(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
+                                                 in->peer_flags[0], in->peer_flags[1], in->peer_flags[2],
+                                                 in->my_scratch, in->my_flags, in->my_seq, in->slot16,
+                                                 c.inp, c.out, c.numel, in->rank, (long)(uintptr_t)s,
+                                                 nb, R4D_ARC_THREADS, c.drain, c.acq, c.pub, early,
+                                                 early ? in->gate_ctr : 0L, ar_chain(a, c.numel)));
+            return early ? RAD_LINK_ENDED : RAD_OK;
+        }
+        if (r0) {
+            g_arc_ctr[2].fetch_add(1, std::memory_order_relaxed);
+            g_arc_ctr[3].fetch_add(rows, std::memory_order_relaxed);
+            if (thr > 0) g_arc_ctr[rows < thr ? 4 : 5].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     /* The kernel ends the hold after its second handshake (its reduce is fused with the phase-2
      * push); through the host mailbox early stays 0 and the engine releases by barrier. */

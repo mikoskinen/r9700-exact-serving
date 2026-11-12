@@ -4130,9 +4130,14 @@ int r4d_ix_lds_get();
 int r4d_ix_ni_get();
 void r4d_ix_lds_set(int v);
 void r4d_ix_ni_set(int v);
+/* Lever ARC (ds41-int10, r4d_ar_entry.hip / r4d_ar_arc.h): "ds41_arcoded" 0 (off) or N in 1 .. 1048576 -- a launch of the
+ * four-rank exact two-shot at overlap 0 of at least N rows takes the coded wire (the plain wire's bytes). */
+int r4d_arc_get();
+void r4d_arc_set(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
+    if (!std::strcmp(name, "ds41_arcoded")) return value >= 0 && value <= 1048576 ? 1 : -1;
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
@@ -4144,6 +4149,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (ok <= 0) return ok;
     if (!std::strcmp(name, "ix_lds")) { r4d_ix_lds_set(value); return 1; }
     if (!std::strcmp(name, "ix_ni")) { r4d_ix_ni_set(value); return 1; }
+    if (!std::strcmp(name, "ds41_arcoded")) { r4d_arc_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_set(value);
@@ -4160,6 +4166,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ix_lds")) { *applied = r4d_ix_lds_get(); return 1; }
     if (!std::strcmp(name, "ix_ni")) { *applied = r4d_ix_ni_get(); return 1; }
+    if (!std::strcmp(name, "ds41_arcoded")) { *applied = r4d_arc_get(); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
     if (!std::strcmp(name, "gg_pf")) { *applied = r4d_gg_pf_get(); return 1; }
