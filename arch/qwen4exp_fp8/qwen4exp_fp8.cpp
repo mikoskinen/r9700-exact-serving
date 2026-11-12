@@ -2474,6 +2474,23 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
         constexpr int tile = 48;
         const int ctx = (m.g.max_ctx > 0 && used >= m.g.max_ctx) ? (int)m.g.max_ctx : used;
         const int cap = std::min(((ctx + tile - 1) / tile) / 8, 64);
+        /* fn4 att_bi (12.11.2026, 205: "draft pass 0 at 16 tokens issued differently from its recording" -- a decode
+         * sequence dense when recorded, sparse when replayed): under att_bi each sequence of a multi-sequence ordinary pass
+         * takes the dense or sparse path by ITS OWN context against qsa_exact_to (rad_block_attn_gated_fp8.h), so the
+         * launches depend on every sequence's side of that line, which the length cap does not carry. The key takes the
+         * pattern; without host lengths the pass is not recorded. */
+        if (batch->draft_pass == 0 && batch->n_seq > 1 && rad::arch::fn4_attbi_flag().load(std::memory_order_relaxed) > 0) {
+            const int32_t* su = batch->kv[group].seqused_h;
+            int64_t ex = 0;
+            for (const Layer& layer : m.layers) if (layer.full) { ex = layer.attn.qsa_exact_to; break; }
+            if (ex > 0) {
+                if (!su) return 0;
+                uint64_t h = 1469598103934665603ull;
+                for (int64_t s = 0; s < batch->n_seq; ++s)
+                    h = (h ^ (uint64_t)((int64_t)su[s] > ex ? 2 : 1)) * 1099511628211ull;
+                return (h & ~0xffull) | (uint64_t)(3 + cap);
+            }
+        }
         return 3 + (uint64_t)cap;
     }
 
