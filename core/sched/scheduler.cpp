@@ -240,6 +240,17 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         (void)bi;
         bi_chunk_ = fn4::sched_bi_chunk();
     }
+    {   /* lever CAP48: the decode row cap (fn4 sched_row_cap; RADIANCE_DECODE_ROW_CAP its value at start), read again at
+         * every step planned; a start line only when it is on */
+        cap_now_ = fn4::sched_row_cap();
+        for (int64_t& c : cap_n_) c = 0;
+        cap_seq_noted_ = cap_over_noted_ = false;
+        if (cap_now_ > 0)
+            RAD_INFO("lever CAP48: decode row cap %d (RADIANCE_DECODE_ROW_CAP, fn4 sched_row_cap): a step's decode rows (each "
+                     "decoding sequence's own row + its drafts) are held to it by trimming drafts, the deepest first; prefill "
+                     "rows are not counted and planned as without it", cap_now_);
+        cap_seq_note(cfg.max_seqs);
+    }
 
     /* The engine resolves the geometry once, because the prefix cache needs its checkpoint
      * interval first; a caller without one (tests) resolves its own from prog and cfg. Both
@@ -762,7 +773,8 @@ int Scheduler::set_draft(uint64_t id, const int32_t* tokens, int n, const int32_
      * sequence and expect_draft() cut this one's count to its window, so a longer proposal is cut
      * to the planned count (the window may have moved at the commit since). */
     if (next_open_ && s.entry_next >= 0) {
-        if (draft_.adaptive() && n > s.draft_next) n = s.draft_next;
+        /* Lever CAP48: a step issued ahead the cap cut verifies draft_next of the drafter's proposal, its first ones. */
+        if ((draft_.adaptive() || s.cap_cut_next) && n > s.draft_next) n = s.draft_next;
         if (n != s.draft_next) {
             RAD_ERR("request %llu: %d draft(s) published for a step planned to verify %d",
                     (unsigned long long)id, n, s.draft_next);
@@ -1504,6 +1516,101 @@ int64_t Scheduler::noa_room() const {
     for (const StepEntry& e : plan_.e)
         if (e.is_prefill) return std::max<int64_t>(0, cfg_.max_tok - plan_.n_tok);
     return 0;
+}
+
+/* ---------------------------------------------------------------------------------------------------- lever CAP48 */
+/* Lever CAP48 (fn4 sched_row_cap): a step's decode rows held to cap_now_. Every decoding sequence keeps its own row; its
+ * drafts are cut to the largest common depth L the room (the cap less the sequences) holds, the rows left over going one
+ * each to the sequences deeper than L in plan order -- the plan's priority order (the decode entries keep running_'s order
+ * through the decode-first sort; the step issued ahead keeps the step's). So the deepest proposals lose first, and among
+ * equal depths the later sequence; a function of the plan alone, so the same plan is trimmed the same way.
+ * It runs after the whole step is planned, admission included: every prefill piece and every decision the budget makes
+ * (busy_cap's shares, NOA's room, the held chunk's regrowth) is the one the step makes without the cap, and the trimmed
+ * rows' budget goes unused. Their KV, reserved for 1 + the untrimmed window, is the sequence's next rows, or rolls back at
+ * the commit as a rejected draft's does. A trimmed proposal is a prefix of the drafter's -- of a tree, a tree (set_draft) --
+ * as the window caps already cut it. A step whose decoding sequences alone exceed the cap is left as planned. */
+static constexpr int64_t kCapBand = 48;   /* the decode band (gemm_nt_ggml's GEMV, attention's decode form): steps_gt48 */
+
+void Scheduler::cap_seq_note(int64_t max_seqs) {
+    if (cap_now_ <= 0 || max_seqs <= cap_now_ || cap_seq_noted_) return;
+    cap_seq_noted_ = true;
+    RAD_WARN("lever CAP48: the decode row cap %d covers up to %d decoding sequences; at --max-num-seqs %lld a step with more "
+             "than %d of them exceeds it even at depth 0 and is left as planned (counted as steps_over)",
+             cap_now_, cap_now_, (long long)max_seqs, cap_now_);
+}
+
+int64_t Scheduler::cap_rows(StepPlan& p, bool ahead) {
+    int64_t seqs = 0, drafts = 0;
+    int32_t top = 0;
+    for (const StepEntry& e : p.e) {
+        if (e.is_prefill) continue;
+        ++seqs;
+        drafts += e.n_spec;
+        top = std::max(top, e.n_spec);
+    }
+    if (seqs == 0) return 0;
+    ++cap_n_[6];
+    int64_t rows = seqs + drafts, cut = 0;
+    const int64_t cap = cap_now_;
+    if (cap > 0 && rows > cap) {
+        if (seqs > cap) {   /* even depth 0 exceeds it: left as planned */
+            ++cap_n_[3];
+            if (!cap_over_noted_) {
+                cap_over_noted_ = true;
+                RAD_WARN("lever CAP48: step %d carries %lld decoding sequences, more than the decode row cap %lld even at "
+                         "depth 0: left as planned (%lld decode rows); every such step is counted (steps_over), this note "
+                         "is once", step_, (long long)seqs, (long long)cap, (long long)rows);
+            }
+        } else {
+            const int64_t room = cap - seqs;   /* the drafts the step keeps */
+            auto kept = [&](int32_t l) {
+                int64_t k = 0;
+                for (const StepEntry& e : p.e)
+                    if (!e.is_prefill) k += std::min(e.n_spec, l);
+                return k;
+            };
+            int32_t L = top;
+            while (L > 0 && kept(L) > room) --L;
+            int64_t left = room - kept(L);   /* fewer than the entries deeper than L, as kept(L + 1) > room */
+            for (StepEntry& e : p.e) {
+                if (e.is_prefill) continue;
+                int32_t k = std::min(e.n_spec, L);
+                if (e.n_spec > L && left > 0) { ++k; --left; }
+                if (k == e.n_spec) continue;
+                cut += e.n_spec - k;
+                e.n_spec = k;
+                e.n_draft = k;
+                e.n_tokens = 1 + k;
+                if (k == 0) e.ngram = false;
+                if (e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot]) continue;
+                SchedReq& s = *reqs_[(size_t)e.slot];
+                if (ahead) {
+                    s.draft_next = k;        /* what set_draft cuts the proposal published for it to */
+                    s.cap_cut_next = true;
+                } else {
+                    /* as the running loop keeps them: the request's window equal to the entry's (Sampler::build_step) */
+                    s.n_draft = k;
+                    s.sched_tokens = 1 + k;
+                    if (s.req) {
+                        s.req->n_draft = k;
+                        s.req->draft = k ? s.draft : nullptr;
+                        s.req->draft_parent = k ? e.draft_parent : nullptr;
+                    }
+                }
+            }
+            p.n_tok -= cut;
+            rows -= cut;
+            p.n_spec = 0;
+            for (const StepEntry& e : p.e)
+                if (!e.is_prefill) p.n_spec = std::max(p.n_spec, e.n_spec);
+            ++cap_n_[0];
+            cap_n_[1] += cut;
+            if (ahead) ++cap_n_[2];
+        }
+    }
+    if (rows > kCapBand) ++cap_n_[4];
+    if (rows > cap_n_[5]) cap_n_[5] = rows;
+    return cut;
 }
 
 /* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
@@ -2672,6 +2779,9 @@ const RadBatch* Scheduler::step() {
     /* lever BI's chunking for this step's plan: the fn4 switch sched_bi_chunk as applied now (a change lands at a step
      * release, so it takes effect from the step planned after it) */
     bi_chunk_ = fn4::sched_bi_chunk();
+    /* lever CAP48: the decode row cap for this step's plan and for the step issued ahead behind it (step_next) */
+    cap_now_ = fn4::sched_row_cap();
+    cap_seq_note(cfg_.max_seqs);
     /* lever DST: the interleave and the shared budget for this step's plan, as the fn4 switches are applied now (a change
      * lands at a step release, so it acts from the step planned after it). A hold under way is cut to a smaller count. */
     {
@@ -3295,6 +3405,9 @@ const RadBatch* Scheduler::step() {
         StepEntry& e = plan_.e[i];
         if (e.slot >= 0 && (size_t)e.slot < reqs_.size()) reqs_[(size_t)e.slot]->entry = (int32_t)i;
     }
+    /* Lever CAP48: the decode rows held to the cap, after the whole step was planned (cap_rows) and before anything below
+     * reads a decode entry's rows (the phase counts, the card's acceptance rows, PSK's decode rows, the build). */
+    (void)cap_rows(plan_, /*ahead=*/false);
 
     /* Phase from what was scheduled; the run phase indexes bucket tables by it. A step with one
      * prefill chunk is MIXED, not DECODE, or it would pick the skinny-GEMM band for a large
@@ -3545,8 +3658,10 @@ const RadBatch* Scheduler::step_next() {
     const RadBatch* b = step_next_locked();
     if (!b)
         for (const StepEntry& e : plan_.e)
-            if (e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot])
+            if (e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot]) {
                 reqs_[(size_t)e.slot]->draft_next = 0;
+                reqs_[(size_t)e.slot]->cap_cut_next = false;   /* lever CAP48 */
+            }
     return b;
 }
 
@@ -3658,6 +3773,9 @@ const RadBatch* Scheduler::step_next_locked() {
         plan_next_.n_tok += want;
         if (d > plan_next_.n_spec) plan_next_.n_spec = d;
     }
+    /* Lever CAP48: the step issued ahead held to the cap in force for the step before it (cap_rows; its KV was reserved
+     * above for the drafter's count, as a rejected draft's is) */
+    (void)cap_rows(plan_next_, /*ahead=*/true);
     plan_next_.phase        = RAD_PHASE_DECODE;
     plan_next_.n_seq_decode = (int64_t)plan_next_.e.size();
     plan_next_.n_tok_decode = plan_next_.n_tok;
@@ -3695,6 +3813,7 @@ void Scheduler::promote_next() {
         s.entry      = (int32_t)i;
         s.entry_next = -1;
         s.draft_next = 0;
+        s.cap_cut_next = false;   /* lever CAP48 */
         s.sched_tokens = plan_.e[i].n_tokens;
         if (s.req) {
             s.req->n_draft = plan_.e[i].n_spec;
@@ -4083,6 +4202,8 @@ void Scheduler::step_finished() {
     fn4::note_sched_dst(n_bypassed_, n_bypass_refused_);   /* lever DST: sched_short_bypass's counts */
     static_assert(sizeof(noa_n_) / sizeof(noa_n_[0]) == fn4::kNoaCounts, "lever NOA's counts");
     fn4::note_sched_noa(noa_n_);                           /* lever NOA's counts */
+    static_assert(sizeof(cap_n_) / sizeof(cap_n_[0]) == fn4::kCapCounts, "lever CAP48's counts");
+    fn4::note_sched_cap(cap_n_);                           /* lever CAP48's counts */
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
                            hybrid_lookup_, hybrid_head_, hybrid_unahead_, draft_.occ_cycles(), draft_.occ_moves());
     fn4::note_draft_accept(acc_head_d_, acc_head_a_, acc_look_d_, acc_look_a_);

@@ -5363,7 +5363,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK(has(f.get("/admin/fn4").body,
               "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1, \"ds41_engdd\": -1, "
               "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, \"stage_full_min\": 0, "
-              "\"stage_full_pick\": 0}"));   /* ds41-int9: lever SP appended after place_hb */
+              "\"stage_full_pick\": 0, \"sched_row_cap\": 0}"));   /* ds41-int9: lever SP after place_hb; ds41-cap48: CAP48 */
     CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
     CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
     CHECK_EQ(fn4::switch_index("ds41_psk_cr"), (int)fn4::kDs41PskCr);
@@ -5375,10 +5375,14 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kStagePick + 1, (int)fn4::kPlaceHb);
     CHECK_EQ((int)fn4::kPlaceHb + 1, (int)fn4::kStageFullMin);   /* ds41-int9: lever SP, appended */
     CHECK_EQ((int)fn4::kStageFullMin + 1, (int)fn4::kStageFullPick);
-    CHECK_EQ((int)fn4::kStageFullPick + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kStageFullPick + 1, (int)fn4::kSchedRowCap);   /* ds41-cap48: lever CAP48, appended */
+    CHECK_EQ((int)fn4::kSchedRowCap + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
     CHECK_EQ((int)fn4::kPlaceHb, 49);
-    CHECK_EQ((int)fn4::kSwitches, 52);
+    CHECK_EQ((int)fn4::kSchedRowCap, 52);
+    CHECK_EQ((int)fn4::kSwitches, 53);
+    CHECK_EQ(fn4::switch_index("sched_row_cap"), (int)fn4::kSchedRowCap);
+    CHECK(!fn4::sched_switch(fn4::kSchedRowCap));   /* the scheduler reads it at every step it plans (fn4::sched_row_cap) */
     CHECK_EQ(fn4::switch_index("stage_full_min"), (int)fn4::kStageFullMin);
     CHECK_EQ(fn4::switch_index("stage_full_pick"), (int)fn4::kStageFullPick);
     CHECK(fn4::sched_switch(fn4::kStageFullMin) && fn4::sched_switch(fn4::kStageFullPick));
@@ -5411,7 +5415,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     {
         const HttpResponse g0 = f.get("/admin/fn4");
         CHECK(has(g0.body, "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, "
-                           "\"stage_full_min\": 0, \"stage_full_pick\": 0}"));   /* ds41-int8: after sched_noa; int9: SP after */
+                           "\"stage_full_min\": 0, \"stage_full_pick\": 0, \"sched_row_cap\": 0}"));   /* int9: SP after; cap48: CAP48 */
         CHECK(!has(g0.body, "\"sahb\": {"));
         const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_short":1025})");
         CHECK_EQ(s0.status, 400);
@@ -5472,7 +5476,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
      * engine at the release; pinned at the same value: no epoch. */
     {
         const HttpResponse g0 = f.get("/admin/fn4");
-        CHECK(has(g0.body, "\"place_hb\": 0, \"stage_full_min\": 0, \"stage_full_pick\": 0}"));
+        CHECK(has(g0.body, "\"place_hb\": 0, \"stage_full_min\": 0, \"stage_full_pick\": 0, \"sched_row_cap\": 0}"));
         CHECK(!has(g0.body, "\"sp\": {"));
         const HttpResponse s0 = f.post("/admin/fn4", R"({"stage_full_min":4097})");
         CHECK_EQ(s0.status, 400);
@@ -5505,7 +5509,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         const int64_t v1[fn4::kSpN] = { 3, 7400, 120, 2900, 30408704000, 2800, 410, 5, 11800 };
         fn4::note_sp(1, v1);
         const HttpResponse g1 = f.get("/admin/fn4");
-        CHECK(has(g1.body, "\"stage_full_min\": 4161, \"stage_full_pick\": 2}"));
+        CHECK(has(g1.body, "\"stage_full_min\": 4161, \"stage_full_pick\": 2, \"sched_row_cap\": 0}"));
         CHECK(has(g1.body, "\"sp\": {\"capable\": 1, \"ranks\": [{\"rank\": 0, \"full_steps\": 0"));
         CHECK(has(g1.body, "{\"rank\": 1, \"full_steps\": 3, \"full_rows\": 7400, \"full_layers\": 120, "
                            "\"full_units\": 2900, \"full_bytes\": 30408704000, \"full_pick_kept\": 2800, "
@@ -5524,6 +5528,31 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         fn4::note_sp(0, z);
         fn4::note_sp(1, z);
         fn4::sp_register(false);
+    }
+    /* Lever CAP48 (ds41-cap48): sched_row_cap 0 .. 4096, the core's, appended after stage_full_pick; RADIANCE_DECODE_ROW_CAP
+     * unset here, so 0 until set; the scheduler reads it at every step (no hand-over at the release); pinned at the same
+     * value: no epoch. GET "cap" (the value in force + the scheduler's counts) only once a scheduler registered. */
+    {
+        CHECK_EQ(fn4::sched_row_cap(), 0);
+        const HttpResponse c0 = f.post("/admin/fn4", R"({"sched_row_cap":4097})");
+        CHECK_EQ(c0.status, 400);
+        CHECK(has(c0.body, "sched_row_cap takes 0 (off) or 1 .. 4096"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":-1})").status, 400);
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":48})").status, 200);
+        CHECK(fn4::apply_pending(50, sw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(sw[fn4::kSchedRowCap], fn4::kNoChange);   /* not handed over: read at every step */
+        CHECK_EQ(fn4::sched_row_cap(), 48);
+        CHECK_EQ(fn4::value(fn4::kSchedRowCap), 48);
+        CHECK(has(f.get("/admin/fn4").body, "\"stage_full_pick\": 0, \"sched_row_cap\": 48}"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":48})").status, 200);
+        CHECK(!fn4::apply_pending(51, sw));                 /* the same value: pinned, no epoch */
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(f.post("/admin/fn4", R"({"sched_row_cap":0})").status, 200);
+        CHECK(fn4::apply_pending(52, sw));
+        CHECK_EQ(fn4::sched_row_cap(), 0);
+        CHECK(has(f.get("/admin/fn4").body, "\"stage_full_pick\": 0, \"sched_row_cap\": 0}"));
     }
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));
