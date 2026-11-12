@@ -28,13 +28,13 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "draft_lend_w", "draft_occ", "draft_occ_k", "place_lf", "sched_bi_chunk",
                                         "sched_interleave", "sched_mixed_tok", "sched_short_bypass",
                                         "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_psk_l20",
-                                        "dspark_pfctx" };
+                                        "dspark_pfctx", "ds41_psk_cr" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
            i == kDs41OneFill || i == kDrafterMx || i == kDrafterBf ||
            i == kIdxSplit || i == kDs41QnFold || i == kDs41SwFold || i == kGgPf || i == kF32Pf || i == kDsparkWalk ||
-           i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx;
+           i == kDs41Bi || i == kDs41Psk || i == kDs41PskL20 || i == kDsparkPfctx || i == kDs41PskCr;
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -46,6 +46,10 @@ struct Hooks {
     int (*psk_plan)(int, long long, int, const int32_t*, const int32_t*) = nullptr;
     int (*psk_stats)(long long*, int) = nullptr;   /* its live counters (ds41-int7-pskglue) */
     int (*pfctx_stats)(long long*, int) = nullptr; /* lever PSK-DS's (ds41-pskl20) */
+    /* lever PSK-CR (ds41-pskcr): the plan with each prefill sequence's replay flag (rad_psk_plan2), and the rows a replay
+     * reaches back from its end (rad_psk_cr_reach) */
+    int (*psk_plan2)(int, long long, int, const int32_t*, const int32_t*, const int32_t*) = nullptr;
+    int (*psk_cr_reach)(void) = nullptr;
 };
 
 struct State {
@@ -141,6 +145,8 @@ void find_hooks(State& s) {
             k.psk_plan = sym<int (*)(int, long long, int, const int32_t*, const int32_t*)>(h, "rad_psk_plan");
             k.psk_stats = sym<int (*)(long long*, int)>(h, "rad_psk_stats");
             k.pfctx_stats = sym<int (*)(long long*, int)>(h, "rad_dspark_pfctx_stats");
+            k.psk_plan2 = sym<int (*)(int, long long, int, const int32_t*, const int32_t*, const int32_t*)>(h, "rad_psk_plan2");
+            k.psk_cr_reach = sym<int (*)(void)>(h, "rad_psk_cr_reach");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -381,16 +387,16 @@ void note_psk_engine(int64_t planned, int64_t ended_early, int64_t stager_skippe
 void psk_engine(int64_t out[3]) {
     for (int i = 0; i < 3; ++i) out[i] = g_psk_eng[i].load(std::memory_order_relaxed);
 }
-int psk_stats(int64_t out[10]) {
-    for (int i = 0; i < 10; ++i) out[i] = 0;
+int psk_stats(int64_t out[kPskStats]) {
+    for (int i = 0; i < kPskStats; ++i) out[i] = 0;
     State& s = st();
     std::lock_guard<std::mutex> lk(s.mu);
     find_hooks(s);
     for (const Hooks& k : s.hooks)
         if (k.psk_stats) {
-            long long v[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-            const int n = k.psk_stats(v, 10);
-            for (int i = 0; i < n && i < 10; ++i) out[i] = (int64_t)v[i];
+            long long v[kPskStats] = {};
+            const int n = k.psk_stats(v, kPskStats);
+            for (int i = 0; i < n && i < kPskStats; ++i) out[i] = (int64_t)v[i];
             return n;
         }
     return 0;
@@ -411,12 +417,27 @@ int dspark_pfctx_stats(int64_t out[4]) {
     return 0;
 }
 
-int psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows) {
+int psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows, const int32_t* flags) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    /* lever PSK-CR: a plan with a replay entry goes to rad_psk_plan2 where the plugin has it; one without (a plugin built
+     * before it) takes the plain plan -- the replay's rows then run uncut, its global-KV stores still masked by the batch */
+    bool any = false;
+    for (int i = 0; flags && i < n; ++i) any = any || flags[i] != 0;
+    for (const Hooks& k : s.hooks) {
+        if (any && k.psk_plan2) return k.psk_plan2(step, (long long)dec_tok, n, ahead, rows, flags);
+        if (k.psk_plan) return k.psk_plan(step, (long long)dec_tok, n, ahead, rows);
+    }
+    return -1;
+}
+
+int psk_cr_reach() {
     State& s = st();
     std::lock_guard<std::mutex> lk(s.mu);
     find_hooks(s);
     for (const Hooks& k : s.hooks)
-        if (k.psk_plan) return k.psk_plan(step, (long long)dec_tok, n, ahead, rows);
+        if (k.psk_cr_reach) return k.psk_cr_reach();
     return -1;
 }
 
@@ -431,7 +452,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "dspark_conf_rows, gg_pf, f32_pf, dspark_walk, ds41_bi, draft_sample, draft_lend_hyst, arena_d0, "
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
-                        "epoch_bump)";
+                        "ds41_psk_cr, epoch_bump)";
         return false;
     }
     State& s = st();

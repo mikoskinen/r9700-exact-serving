@@ -147,6 +147,12 @@ struct SchedReq {
      * periodic checkpoint positions (0: not planned, every chunk runs as before) and the first one at or past 32768. */
     int32_t  psk_k = 0;
     bool     psk_32k = false;
+    /* Lever PSK-CR (ds41-pskcr): ds41_psk 4 latched with ds41_psk_cr 1 -- the targets are the prompt's end, its tail
+     * snapshot and checkpoint_at only (no K-th grid point); a mid-prompt hit is served by a cone replay. */
+    bool     psk_tail_only = false;
+    /* Lever PSK-CR: this admission's cone replay -- it starts at cr_from with no state restored and rebuilds the
+     * window state at Request::cr_end (both 0: none). */
+    int32_t  cr_from = 0;
 
     /* The checkpoint the linear state is seeded from on admission, handed to the sequence's first
      * entry as StepEntry::ckpt_restore. Never held across a step: nothing pins a checkpoint slot,
@@ -375,6 +381,22 @@ public:
     bool     psk_is_target(const SchedReq& s, int64_t pos, int64_t n) const;
     /* Snapshots a planned request's chunk ends did not take (not a target) since start. */
     int64_t  psk_ckpt_dropped() const { return psk_dropped_; }
+    /* Lever PSK-CR (ds41-pskcr): `on` the plugin's applied fn4 ds41_psk_cr (1 = a planned request's prefix hit with no
+     * snapshot at the grid point under its match resumes there by a cone replay), `reach` the rows before that point the
+     * replay starts from (the plugin's deepest cone, fn4::psk_cr_reach; < 1: no replay). Read by the engine with the
+     * mode. Returns the value now run (0 when the reach is unknown). */
+    int      set_psk_cr(int on, int64_t reach);
+    int      psk_cr() const { return psk_cr_; }
+    /* The plan as above, with each prefill entry's flags (kPskFlagReplay: a cone-replay chunk -- every layer cut to the
+     * replay end's cone, no global-KV store). */
+    static constexpr int32_t kPskFlagReplay = 1;
+    bool     psk_plan(int step, std::vector<int32_t>* ahead, std::vector<int32_t>* rows, int64_t* dec_tok,
+                      std::vector<int32_t>* flags) const;
+    /* Lever PSK-CR's resume for a hit (pure, for tests and admission): the deepest periodic checkpoint position
+     * (Scheduler::psk_q) `at` <= min(attn, prompt - 1), and the replay's start `from`: the deepest of them (or 0) at or
+     * below at - reach. at = -1 when no grid point lies above `snap` (the snapshot the hit resumes at anyway). */
+    struct CrResume { int64_t at = -1, from = -1; };
+    CrResume psk_cr_resume(int64_t attn, int64_t prompt, int64_t snap) const;
     /* Lever DL: the engine's view of the drafter's lend (Engine::serve, once the movers set it up):
      * `view` returns DraftController::LendSample's state over every rank (resident, transit, lent)
      * and writes the transitions so far; `capable` whether any slab can be lent. Without it the
@@ -983,7 +1005,12 @@ private:
     int64_t  psk_dropped_ = 0;
     int      psk_step_ = -1;
     int64_t  psk_dec_ = 0;
-    std::vector<int32_t> psk_ahead_, psk_rows_;
+    std::vector<int32_t> psk_ahead_, psk_rows_, psk_flags_;
+    /* Lever PSK-CR (set_psk_cr): the switch as the scheduler runs it and the replay's reach. */
+    int      psk_cr_ = 0;
+    int64_t  psk_cr_reach_ = 0;
+    /* The deepest periodic checkpoint position at or below `pos` (0 when none). */
+    int64_t  psk_floor(int64_t pos) const;
     /* The request's latch at its admission (SchedReq::psk_k / psk_32k), and the checkpoint `ckpt` a chunk of a planned
      * request takes: dropped (-1) where it is not a target. */
     void     psk_latch(SchedReq& s);

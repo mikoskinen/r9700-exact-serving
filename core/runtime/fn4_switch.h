@@ -242,6 +242,18 @@
  *                   (the form band of today's one launch), such a pass not recorded; 0 = every row (today). 1 refused
  *                   where no DSpark context pass is declared. RADIANCE_DS41_DSPARK_PFCTX=0 | 1: the start value (unset:
  *                   0). Exact for the target by construction (it reads no draft); the drafter's readable keys unchanged.
+ *   ds41_psk_cr     deepseek41 + scheduler (lever PSK-CR, ds41-pskcr): 1 = a prefix hit of a request planned under
+ *                   ds41_psk 2 / 3 / 4 that has no snapshot at the deepest grid point H under its match resumes there by
+ *                   an exact CONE REPLAY: the request adopts the cached global KV (latent + index keys, every row) up to
+ *                   H, starts at the grid point at or below H - reach (reach = 160 + 39 x 128 = 5152) with no state
+ *                   restored, and its chunks up to H -- the cold run's own grid chunks -- run every layer only over H's
+ *                   cone (layer l: the last 160 + (39 - l) x 128 rows before H) with no global-KV store (the batch maps
+ *                   their full-group slots and linear-state slots to -1); the window keys, the Engram token window and
+ *                   the DSpark taps at H come out as a cold prefill's. Then the prompt goes on from H as ever. Replay
+ *                   chunks take no snapshot. 0 = the anchor below (today). RADIANCE_DS41_PSK_CR=0 | 1: the start value
+ *                   (unset: 0). 1 refused where design 2 is not available. ds41_psk 4 = TAIL-ONLY anchors (the prompt's
+ *                   end, its tail snapshot, checkpoint_at; no K-th grid point): a request admitted under 4 with
+ *                   ds41_psk_cr 1 latches tail-only, under ds41_psk_cr 0 it plans as 2 (counted refused).
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -317,7 +329,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDsparkConf, kDsparkAlt, kDsparkConfRows, kGgPf, kF32Pf, kDsparkWalk, kDs41Bi, kDraftSample,
               kDraftLendHyst, kArenaD0, kDraftLendW, kDraftOcc, kDraftOccK, kPlaceLf, kSchedBiChunk,
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
-              kDs41PskL20, kDsparkPfctx, kSwitches };
+              kDs41PskL20, kDsparkPfctx, kDs41PskCr, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -395,7 +407,12 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
 /* Lever PSK design 2: hand the scheduler's plan for trunk pass `step` to the plugin that cuts by it (rad_psk_plan, every
  * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
  * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */
-int  psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows);
+int  psk_plan(int step, int64_t dec_tok, int n, const int32_t* ahead, const int32_t* rows, const int32_t* flags = nullptr);
+/* Lever PSK-CR (ds41-pskcr): the rows before a replay's end a cone replay runs from (the plugin's deepest cone,
+ * rad_psk_cr_reach: 160 + (n_layer - 1) x window, 5152 on the 1017), -1 when no plugin serves one. `flags` above: per
+ * prefill sequence, bit 0 = the chunk is a cone replay (rad_psk_plan2; no global-KV store, every layer cut to its end's
+ * cone). */
+int  psk_cr_reach();
 /* Lever PSK's live counters (ds41-int7-pskglue, /stats "psk"). The engine, at every step release: trunk passes it handed a
  * plan to, those that ended before the last layer, and the routed layers rank 0's stager did not stage for it. The
  * plugin's (rad_psk_stats, rank 0's): planned passes, passes with a cut, layers skipped whole, layer-rows not run at the
@@ -405,7 +422,11 @@ void psk_engine(int64_t out[3]);
 /* out[0..5] as above; lever PSK-L20 (ds41-pskl20): [6] passes whose split layer was cut, [7] its rows not run in the cone
  * part, [8] passes it ran its all-row part only, [9] planned passes told to end at it (its experts not staged) -- 0s
  * from a plugin that writes 6. Returns how many the plugin wrote. */
-int  psk_stats(int64_t out[10]);
+/* Lever PSK-CR (ds41-pskcr): [10] replay passes the plugin cut, [11] their layer-rows run, [12] their layer-rows not run
+ * below the first PSK layer, [13] kv-source compressor chains a replay pass skipped, [14] replay passes that were not
+ * all-replay (decode rows or another prefill beside them: the chain ran, its stores masked) -- 0s from an older plugin. */
+constexpr int kPskStats = 16;
+int  psk_stats(int64_t out[kPskStats]);
 /* Lever PSK-DS's live counters (ds41-pskl20, /stats "dspark_pfctx", the plugin's rad_dspark_pfctx_stats, rank 0's):
  * [0] dspark_pfctx (-1: no plugin serves it), [1] context passes cut, [2] their rows not run, [3] the rows they ran. */
 int  dspark_pfctx_stats(int64_t out[4]);

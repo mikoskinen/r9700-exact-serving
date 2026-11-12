@@ -133,6 +133,22 @@ struct SchedMetrics {
     int64_t psk_ckpt_dropped = 0;
     int64_t psk_fallback_resumes = 0;
     int64_t psk_fallback_tokens = 0;
+    /* Lever PSK-CR (ds41-pskcr), live and cumulative, counted only while ds41_psk_cr is 1: the switch as run (-1 none);
+     * hits served by a cone replay, the tokens their replay chunks covered (from - at summed) and the positions they
+     * resumed at (at summed); hits a replay would have served but did not, by reason -- the request not planned, the
+     * geometry (a trunk group the cache holds no window of, a runtime window, no reach), the adoption refused -- and
+     * hits whose snapshot was already at the grid point (no replay needed); requests latched tail-only (ds41_psk 4 with
+     * ds41_psk_cr 1) and admitted under 4 without it (planned as 2). */
+    int32_t psk_cr = -1;
+    int64_t psk_cr_hits = 0;
+    int64_t psk_cr_rows = 0;
+    int64_t psk_cr_resume_tokens = 0;
+    int64_t psk_cr_fb_unplanned = 0;
+    int64_t psk_cr_fb_geometry = 0;
+    int64_t psk_cr_fb_adopt = 0;
+    int64_t psk_cr_not_needed = 0;
+    int64_t psk_tail_only = 0;
+    int64_t psk_tail_only_refused = 0;
 
     /* Throughput: tokens over wall time in a 1-second decaying window (Scheduler::step_finished);
      * the counters beside them are exact. */

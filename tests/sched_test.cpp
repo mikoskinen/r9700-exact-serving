@@ -1319,6 +1319,253 @@ TEST(psk_a_hit_between_anchors_resumes_at_the_anchor_below) {
     (void)cold;
 }
 
+/* ================================================================== lever PSK-CR: the cone replay */
+/* The production geometry (--checkpoint-interval 2048, --prefill-span 2, --max-num-batched-tokens 4160: the grid 2048 +
+ * k x 4096) over a trunk with a full group (prefix-cached), linear and conv state and a window group (not cached), as
+ * deepseek41's: kv_compressed / kv_index, the compressor tail, the Engram tokens, kv_window. The replay's reach is the
+ * 1017's C_0 = 160 + 39 x 128 = 5152. */
+static void cr_fixture(Fixture& f) {
+    f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/60000, /*windowed=*/true, /*linear=*/true);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.prefill_span = 2;
+    f.cfg.prefix_exact = true;
+    f.pc.groups = { 0 };   /* the full group: the window is not prefix-cached */
+    f.kv.snap = { 3 };     /* the window rides in a snapshot (a hit at one resumes) */
+}
+struct CrStep { int64_t ctx = 0, n = 0, ahead = 0; int flag = -1, ckpts = 0, restore = -1, replay = 0; };
+static std::vector<CrStep> cr_run(Fixture& f, uint64_t id, int max_steps = 64) {
+    std::vector<CrStep> out;
+    for (int k = 0; k < max_steps && f.sch.find(id) && f.sch.find(id)->n_computed < (int32_t)f.sch.find(id)->prompt.size();
+         ++k) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        CrStep c;
+        c.ctx = b->ctx_lens[0];
+        c.n = b->n_tok;
+        c.ckpts = b->n_checkpoints;
+        c.restore = f.sch.plan().e[0].ckpt_restore;
+        c.replay = f.sch.plan().e[0].cr_replay ? 1 : 0;
+        std::vector<int32_t> ahead, rows, flags;
+        int64_t dec = 0;
+        if (f.sch.psk_plan(b->step, &ahead, &rows, &dec, &flags)) {
+            CHECK_EQ((int)flags.size(), 1);
+            c.ahead = ahead[0];
+            c.flag = flags.empty() ? -1 : flags[0];
+        }
+        /* lever PSK-CR's batch: a replay chunk's full-group slots and linear-state slot are -1 (nothing of them
+         * written), its window and conv slots as any prefill's; any other chunk none of that */
+        const RadKVGroupBatch& full = b->kv[0];
+        const RadKVGroupBatch& lin = b->kv[1];
+        const RadKVGroupBatch& conv = b->kv[2];
+        int full_neg = 0;   /* (the fake maps a window from position 0, so its slots say nothing here) */
+        for (int64_t t = 0; t < b->n_tok; ++t) full_neg += full.slot_mapping[t] < 0;
+        if (c.replay) {
+            CHECK_EQ(full_neg, (int)b->n_tok);
+            CHECK_EQ(lin.state_index[0], -1);
+            CHECK_EQ(lin.slot_mapping[0], -1);
+            CHECK(conv.state_index[0] >= 0);
+        } else {
+            CHECK_EQ(full_neg, 0);
+            CHECK(lin.state_index[0] >= 0);
+        }
+        out.push_back(c);
+        f.commit_plain();
+    }
+    return out;
+}
+
+/* A hit with no snapshot at the grid point under it (K4: the anchor below is 14336, the match 26000, its grid point
+ * 22528): under ds41_psk_cr 1 the request adopts the cached full group up to 22528, starts at 14336 (the grid point under
+ * 22528 - 5152) with nothing restored, runs the cold run's chunks [14336, 18432) and [18432, 22528) as replay chunks
+ * (flag 1, the target 22528, no snapshot, the batch masks), then the prompt's rest as any planned request's; under 0 it
+ * resumes at the anchor below as before and no lever PSK-CR counter moves. The batch rows of a replay chunk are its
+ * cold chunk's; its full-group slots and linear-state slot are -1 (cr_run). */
+TEST(psk_cr_a_hit_without_a_snapshot_replays_the_cold_grid_chunks_to_its_grid_point) {
+    for (int cr : { 1, 0 }) {
+        Fixture f;
+        cr_fixture(f);
+        CHECK_OK(f.start());
+        f.sch.set_span_min(16384);
+        f.sch.set_psk_mode(2);
+        f.sch.set_psk_k(4);
+        CHECK_EQ(f.sch.set_psk_cr(cr, 5152), cr);
+        f.pc.seed(26000);
+        f.pc.lin = 14336;                         /* the K4 anchor below the match */
+        f.pc.src = 5;
+        const uint64_t a = f.submit(32000, 1);
+        const std::vector<CrStep> st = cr_run(f, a);
+        REQUIRE(st.size() >= 3);
+        const SchedMetrics m = f.sch.metrics();
+        if (cr) {
+            CHECK_EQ(st[0].ctx, (int64_t)14336);
+            CHECK_EQ(st[0].n, (int64_t)4096);
+            CHECK_EQ(st[0].replay, 1);
+            CHECK_EQ(st[0].flag, 1);
+            CHECK_EQ(st[0].ahead, (int64_t)4096);     /* 22528 - 18432 */
+            CHECK_EQ(st[0].ckpts, 0);
+            CHECK_EQ(st[0].restore, -1);             /* nothing restored */
+            CHECK_EQ(st[1].ctx, (int64_t)18432);
+            CHECK_EQ(st[1].n, (int64_t)4096);
+            CHECK_EQ(st[1].flag, 1);
+            CHECK_EQ(st[1].ahead, (int64_t)0);
+            CHECK_EQ(st[1].ckpts, 0);
+            CHECK_EQ(st[2].ctx, (int64_t)22528);      /* the prompt goes on from the replay's end */
+            CHECK_EQ(st[2].replay, 0);
+            CHECK_EQ(st[2].flag, 0);
+            CHECK_EQ(st[2].ahead, (int64_t)(30720 - 26624));
+            for (size_t i = 2; i < st.size(); ++i) CHECK_EQ(st[i].flag, 0);
+            CHECK_EQ(m.psk_cr_hits, (int64_t)1);
+            CHECK_EQ(m.psk_cr_rows, (int64_t)8192);
+            CHECK_EQ(m.psk_cr_resume_tokens, (int64_t)22528);
+            CHECK_EQ(m.psk_fallback_resumes, (int64_t)0);
+            CHECK_EQ(m.psk_cr, 1);
+            CHECK((f.pc.committed == std::vector<int64_t>{ 30720 }));   /* the K4 anchor = the tail: no replay snapshot */
+        } else {
+            CHECK_EQ(st[0].ctx, (int64_t)14336);
+            CHECK_EQ(st[0].replay, 0);
+            CHECK_EQ(st[0].flag, 0);
+            CHECK_EQ(st[0].restore, 5);              /* the anchor's snapshot */
+            for (const CrStep& c : st) CHECK_EQ(c.flag, 0);
+            CHECK_EQ(m.psk_cr_hits + m.psk_cr_rows + m.psk_cr_resume_tokens + m.psk_cr_fb_unplanned + m.psk_cr_fb_geometry +
+                         m.psk_cr_fb_adopt + m.psk_cr_not_needed + m.psk_tail_only + m.psk_tail_only_refused, (int64_t)0);
+            CHECK_EQ(m.psk_fallback_resumes, (int64_t)1);
+            CHECK_EQ(m.psk_cr, 0);
+        }
+    }
+}
+
+/* The resume arithmetic itself (Scheduler::psk_cr_resume) on the production grid: the grid point under the match (and
+ * under the prompt's last token), above the snapshot; the start the grid point under it less the reach. */
+TEST(psk_cr_resume_is_the_grid_point_under_the_hit_and_its_cone) {
+    Fixture f;
+    cr_fixture(f);
+    CHECK_OK(f.start());
+    CHECK_EQ(f.sch.set_psk_cr(1, 0), 0);                /* no reach: no replay */
+    CHECK_EQ(f.sch.psk_cr_resume(26000, 32000, 0).at, (int64_t)-1);
+    CHECK_EQ(f.sch.set_psk_cr(1, 5152), 1);
+    struct W { int64_t attn, prompt, snap, at, from; };
+    for (const W w : { W{ 26000, 32000, 14336, 22528, 14336 }, W{ 26000, 32000, 0, 22528, 14336 },
+                       W{ 22528, 32000, 0, 22528, 14336 }, W{ 22527, 32000, 0, 18432, 10240 },
+                       W{ 26000, 22529, 0, 22528, 14336 }, W{ 26000, 22528, 0, 18432, 10240 },
+                       W{ 6144, 9000, 0, 6144, 0 }, W{ 2048, 9000, 0, 2048, 0 }, W{ 2047, 9000, 0, -1, -1 },
+                       W{ 26000, 32000, 22528, -1, -1 }, W{ 136000, 140000, 120832, 133120, 124928 } }) {
+        const Scheduler::CrResume c = f.sch.psk_cr_resume(w.attn, w.prompt, w.snap);
+        CHECK_EQ(c.at, w.at);
+        CHECK_EQ(c.from, w.from);
+    }
+}
+
+/* ds41_psk 4 = tail-only: with ds41_psk_cr 1 a cold prompt's only targets are its tail snapshot and its end (no K-th grid
+ * point), so the one snapshot is the tail's; with ds41_psk_cr 0 the request plans as 2 (K4) and is counted refused. */
+TEST(psk_cr_tail_only_anchors_need_the_replay) {
+    for (int cr : { 1, 0 }) {
+        Fixture f;
+        cr_fixture(f);
+        CHECK_OK(f.start());
+        f.sch.set_span_min(16384);
+        f.sch.set_psk_mode(4);
+        f.sch.set_psk_k(4);
+        f.sch.set_psk_cr(cr, 5152);
+        const uint64_t a = f.submit(30000, 1);
+        const std::vector<CrStep> st = cr_run(f, a);
+        for (const CrStep& c : st) CHECK_EQ(c.flag, 0);
+        const SchedMetrics m = f.sch.metrics();
+        if (cr) {
+            CHECK((f.pc.committed == std::vector<int64_t>{ 26624 }));      /* the tail only */
+            CHECK_EQ(m.psk_tail_only, (int64_t)1);
+            CHECK_EQ(m.psk_tail_only_refused, (int64_t)0);
+            CHECK_EQ(st[0].ahead, (int64_t)(26624 - 2048));                 /* [0, 2048)'s next target: the tail */
+        } else {
+            CHECK((f.pc.committed == std::vector<int64_t>{ 14336, 26624 }));   /* K4's q_4 and the tail */
+            CHECK_EQ(m.psk_tail_only, (int64_t)0);
+            CHECK_EQ(m.psk_tail_only_refused, (int64_t)1);
+        }
+    }
+}
+
+/* The other outcomes: a snapshot already at the grid point (no replay needed: resumed there), a request not planned
+ * (ds41_psk 0: the fallback counted), a trunk without a window group (the geometry: counted), and a shared head past the
+ * replay's end -- the request takes its snapshot there (Request::checkpoint_at) on its way after the replay. */
+TEST(psk_cr_not_needed_unplanned_geometry_and_a_shared_head) {
+    {   /* the snapshot at 22528 */
+        Fixture f;
+        cr_fixture(f);
+        CHECK_OK(f.start());
+        f.sch.set_psk_mode(2);
+        f.sch.set_psk_k(4);
+        f.sch.set_psk_cr(1, 5152);
+        f.pc.seed(26000);
+        f.pc.lin = 22528;
+        f.pc.src = 3;
+        const std::vector<CrStep> st = cr_run(f, f.submit(32000, 1));
+        REQUIRE(!st.empty());
+        CHECK_EQ(st[0].ctx, (int64_t)22528);
+        CHECK_EQ(st[0].restore, 3);
+        CHECK_EQ(f.sch.metrics().psk_cr_not_needed, (int64_t)1);
+        CHECK_EQ(f.sch.metrics().psk_cr_hits, (int64_t)0);
+    }
+    {   /* not planned */
+        Fixture f;
+        cr_fixture(f);
+        CHECK_OK(f.start());
+        f.sch.set_psk_mode(0);
+        f.sch.set_psk_cr(1, 5152);
+        f.pc.seed(26000);
+        f.pc.lin = 14336;
+        f.pc.src = 5;
+        const std::vector<CrStep> st = cr_run(f, f.submit(32000, 1));
+        REQUIRE(!st.empty());
+        CHECK_EQ(st[0].ctx, (int64_t)14336);
+        CHECK_EQ(st[0].replay, 0);
+        CHECK_EQ(f.sch.metrics().psk_cr_fb_unplanned, (int64_t)1);
+    }
+    {   /* no window group: the trunk has no state a replay rebuilds (the hit as before) */
+        Fixture f;
+        f.build(8192, 64, 4160, 60000, /*windowed=*/false, /*linear=*/true);
+        f.cfg.checkpoint_interval = 2048;
+        f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_psk_mode(2);
+        f.sch.set_psk_k(4);
+        f.sch.set_psk_cr(1, 5152);
+        f.pc.seed(26000);
+        f.pc.lin = 14336;
+        f.pc.src = 5;
+        const uint64_t a = f.submit(32000, 1);
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(b->ctx_lens[0], 14336);
+        CHECK(!f.sch.plan().e[0].cr_replay);
+        CHECK_EQ(f.sch.metrics().psk_cr_fb_geometry, (int64_t)1);
+        (void)a;
+    }
+    {   /* a head of 25600 tokens other prompts share: replayed to 22528, then a chunk split at the head, its snapshot */
+        Fixture f;
+        cr_fixture(f);
+        CHECK_OK(f.start());
+        f.sch.set_span_min(16384);
+        f.sch.set_psk_mode(4);
+        f.sch.set_psk_k(4);
+        f.sch.set_psk_cr(1, 5152);
+        f.pc.seed(25600);
+        f.pc.branch_at = 25600;
+        const uint64_t a = f.submit(32000, 1);
+        const std::vector<CrStep> st = cr_run(f, a);
+        REQUIRE(st.size() >= 4);
+        CHECK_EQ(f.sch.find(a) ? f.sch.find(a)->checkpoint_at : (int64_t)25600, (int64_t)25600);
+        CHECK_EQ(st[0].ctx, (int64_t)14336);
+        CHECK_EQ(st[0].flag, 1);
+        CHECK_EQ(st[1].flag, 1);
+        CHECK_EQ(st[2].ctx, (int64_t)22528);
+        CHECK_EQ(st[2].n, (int64_t)(25600 - 22528));    /* the head */
+        CHECK_EQ(st[2].ckpts, 1);
+        CHECK_EQ(st[2].ahead, (int64_t)0);
+        CHECK((f.pc.committed == std::vector<int64_t>{ 25600, 30720 }));   /* the head and the tail (tail-only) */
+        CHECK_EQ(f.sch.metrics().psk_cr_hits, (int64_t)1);
+    }
+}
+
 TEST(a_chunk_ending_on_a_checkpoint_carries_it_into_the_batch) {
     Fixture f;
     f.build();

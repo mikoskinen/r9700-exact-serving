@@ -133,6 +133,12 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.psk_ckpt_anchor = m.psk_ckpt_anchor;       o.psk_ckpt_dropped = m.psk_ckpt_dropped;
     o.psk_fallback_resumes = m.psk_fallback_resumes;
     o.psk_fallback_tokens = m.psk_fallback_tokens;
+    o.psk_cr = m.psk_cr;                         o.psk_cr_hits = m.psk_cr_hits;   /* lever PSK-CR */
+    o.psk_cr_rows = m.psk_cr_rows;               o.psk_cr_resume_tokens = m.psk_cr_resume_tokens;
+    o.psk_cr_fb_unplanned = m.psk_cr_fb_unplanned;
+    o.psk_cr_fb_geometry = m.psk_cr_fb_geometry;
+    o.psk_cr_fb_adopt = m.psk_cr_fb_adopt;       o.psk_cr_not_needed = m.psk_cr_not_needed;
+    o.psk_tail_only = m.psk_tail_only;           o.psk_tail_only_refused = m.psk_tail_only_refused;
     o.draft_depth_seen = m.draft_depth_seen;
     if (o.draft_depth_seen > SchedMetrics::MAX_DRAFT_POS)
         o.draft_depth_seen = SchedMetrics::MAX_DRAFT_POS;

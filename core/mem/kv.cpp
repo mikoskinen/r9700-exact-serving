@@ -1381,7 +1381,20 @@ void KVManager::trim_window(uint64_t id, int64_t keep_from) {
 int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
-    if (n_tokens <= s->n_tokens) return RAD_OK;
+    /* Below the sequence's length nothing grows -- but a window group that does not reach n_tokens yet: lever PSK-CR's
+     * cone replay (ds41-pskcr) adopts the cached groups up to its end and starts the sequence below it with no window
+     * held, and its chunks grow the window groups as any prefill's. Every other path keeps the window groups at the
+     * sequence's length (seed_window, adopt, ensure), so this changes nothing there. */
+    bool short_win = false;
+    if (n_tokens <= s->n_tokens) {
+        for (size_t g = 0; g < plans_.size() && !short_win; ++g) {
+            const auto& p = plans_[g];
+            if (p.kind != RAD_KV_WINDOW || s->win[g].set || !p.paged()) continue;
+            const int64_t first = s->first_block_pos[g] / p.block_size;
+            short_win = first + (int64_t)s->blocks[g].size() < ceil_div(n_tokens, p.block_size);
+        }
+        if (!short_win) return RAD_OK;
+    }
     if (keep_from < 0 || keep_from > s->n_tokens) keep_from = s->n_tokens;
 
     /* Pass 0: recycle what the window has slid past. It only frees, so it cannot fail, and the
@@ -1448,7 +1461,7 @@ int KVManager::ensure(uint64_t id, int64_t n_tokens, int64_t keep_from) {
             grab_state((int32_t)g, &s->state[g]);
         }
     }
-    s->n_tokens = n_tokens;
+    if (n_tokens > s->n_tokens) s->n_tokens = n_tokens;   /* a window grown below the length leaves it */
     return RAD_OK;
 }
 

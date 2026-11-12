@@ -1887,6 +1887,59 @@ TEST(kv_window_snapshot_rows_and_seed) {
     kv.free_sequence(2);
 }
 
+/* Lever PSK-CR (ds41-pskcr): a sequence that adopted its full group up to H from the prefix cache and starts below H
+ * with no window held (a cone replay) grows its window group chunk by chunk below its length -- ensure() under the
+ * length grows a window that does not reach it, and nothing else -- the length stays H, the full group's table is the
+ * adopted one; past H it grows as ever. Every other path keeps the window at the length, where ensure() under it is the
+ * no-op it was. */
+TEST(kv_window_grows_below_an_adopted_length) {
+    std::vector<KVGroupInfo> g;
+    g.push_back(null_group());
+    g.push_back(paged_group("attn", RAD_KV_FULL, 2, 16, { 0 }));
+    g.push_back(paged_group("swa", RAD_KV_WINDOW, 2, 16, { 1 }, 64));
+    Config cfg = small_config();
+    Pools p;
+    CHECK_OK(configure_pools(p, cfg));
+    KVManager kv;
+    CHECK_OK(kv.configure(g, cfg, p.kv()));
+    const int32_t GF = 1, GW = 2;
+    /* the cache's blocks: a first sequence's full-group table of 512 tokens */
+    CHECK_OK(kv.add_sequence(1));
+    CHECK_OK(kv.ensure(1, 512));
+    const std::vector<int32_t> cached = kv.block_table(1, GF);
+    CHECK_EQ((long long)cached.size(), 32ll);
+    /* the replay: adopt to 512, start at 128 with no window, chunks [128, 256), [256, 384), [384, 512) */
+    CHECK_OK(kv.add_sequence(2));
+    CHECK_OK(kv.adopt(2, GF, cached, 512));
+    CHECK_EQ(kv.seq_tokens(2), 512ll);
+    CHECK(kv.block_table(2, GW).empty());
+    for (int64_t s = 128; s < 512; s += 128) {
+        CHECK_OK(kv.ensure(2, s + 128, s));
+        CHECK_EQ(kv.seq_tokens(2), 512ll);                       /* the length stays the adopted one */
+        CHECK(kv.block_table(2, GF) == cached);                  /* the full group untouched */
+        const int64_t first = kv.first_block_pos(2, GW);
+        CHECK(first <= s - 64 + 16 || first == 0);              /* the window behind the chunk's first row */
+        CHECK_EQ(first + (int64_t)kv.block_table(2, GW).size() * 16, s + 128);   /* reaches the chunk's end */
+    }
+    /* at the length: a no-op again; past it, every group grows */
+    const std::vector<int32_t> wt = kv.block_table(2, GW);
+    CHECK_OK(kv.ensure(2, 512, 384));
+    CHECK(kv.block_table(2, GW) == wt);
+    CHECK_OK(kv.ensure(2, 640, 512));
+    CHECK_EQ(kv.seq_tokens(2), 640ll);
+    CHECK_EQ((long long)kv.block_table(2, GF).size(), 40ll);
+    CHECK_EQ(kv.first_block_pos(2, GW) + (int64_t)kv.block_table(2, GW).size() * 16, 640ll);
+    /* a sequence whose window reaches its length: ensure() under it changes nothing (today's paths) */
+    const std::vector<int32_t> w1 = kv.block_table(1, GW);
+    const int64_t f1 = kv.first_block_pos(1, GW);
+    CHECK_OK(kv.ensure(1, 300, 200));
+    CHECK(kv.block_table(1, GW) == w1);
+    CHECK_EQ(kv.first_block_pos(1, GW), f1);
+    CHECK_EQ(kv.seq_tokens(1), 512ll);
+    kv.free_sequence(1);
+    kv.free_sequence(2);
+}
+
 /* A window is snapshotted only where a hit resumes from it: the trunk's window, with or without
  * linear state beside it. A drafter's window is recomputed by draft refill, so a window section
  * there would be copied and never read. */

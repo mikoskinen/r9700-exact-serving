@@ -906,6 +906,8 @@ int Engine::prepare_release(const RadBatch* b) {
         if (fn4_changed || !psk_mode_read_) {
             psk_mode_read_ = true;
             sched_.set_psk_mode(fn4::value(fn4::kDs41Psk));
+            /* lever PSK-CR (ds41-pskcr): the plugin's ds41_psk_cr and the replay's reach, read with the mode */
+            sched_.set_psk_cr(fn4::value(fn4::kDs41PskCr), fn4::psk_cr_reach());
         }
     }
     psk_release(b);
@@ -947,8 +949,9 @@ int Engine::prepare_release(const RadBatch* b) {
 void Engine::psk_release(const RadBatch* b) {
     int32_t end = INT32_MAX;
     int64_t dec = 0;
-    if (b && b->draft_pass == 0 && sched_.psk_plan(b->step, &psk_ahead_, &psk_rows_, &dec)) {
-        const int l = fn4::psk_plan(b->step, dec, (int)psk_ahead_.size(), psk_ahead_.data(), psk_rows_.data());
+    if (b && b->draft_pass == 0 && sched_.psk_plan(b->step, &psk_ahead_, &psk_rows_, &dec, &psk_flags_)) {
+        const int l = fn4::psk_plan(b->step, dec, (int)psk_ahead_.size(), psk_ahead_.data(), psk_rows_.data(),
+                                    psk_flags_.data());
         if (l >= 0) end = l;
         ++psk_planned_;
         if (l >= 0 && l < (int)meta_.n_layers) ++psk_cut_passes_;

@@ -687,7 +687,7 @@ private:
     /* Lever PSK design 2: whether the plugin's ds41_psk has been read for the scheduler (first release, then after every
      * fn4 change), the plan's buffers, the planned passes and the ones whose layers past an end were not staged. */
     bool psk_mode_read_ = false;
-    std::vector<int32_t> psk_ahead_, psk_rows_;
+    std::vector<int32_t> psk_ahead_, psk_rows_, psk_flags_;   /* flags: lever PSK-CR's replay bit per entry */
     int64_t psk_planned_ = 0, psk_cut_passes_ = 0;
     /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own

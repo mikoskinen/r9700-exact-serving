@@ -371,7 +371,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
          * plugin's (rank 0): planned passes, passes with a cut (designs 1 and 2), layers skipped whole, layer-rows not run
          * at layers 21-29 and 30-39, plans dropped as not matching their pass. All 0 with PSK unset, 0 or not served. */
         {
-            int64_t eg[3], pl[10];
+            int64_t eg[3], pl[fn4::kPskStats];
             fn4::psk_engine(eg);
             fn4::psk_stats(pl);
             json p;
@@ -398,6 +398,29 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             p["l20_rows_skipped"] = pl[7];
             p["l20_cone_empty"] = pl[8];
             p["l20_layers_not_staged"] = pl[9];
+            /* lever PSK-CR (ds41-pskcr), counted only while ds41_psk_cr is 1: the scheduler's -- the switch as run, hits
+             * served by a cone replay, the tokens their replay chunks covered and the positions they resumed at, hits a
+             * replay would have served but did not (fallbacks: the request not planned, the geometry, the adoption),
+             * hits whose snapshot already sat at the grid point, requests latched tail-only (ds41_psk 4) and admitted
+             * under 4 without ds41_psk_cr (planned as 2); the plugin's (rank 0) -- replay passes cut, their layer-rows
+             * run and not run below the first PSK layer, kv-source compressor chains skipped, replay passes beside other
+             * rows */
+            p["cr"] = m.psk_cr;
+            p["cr_hits"] = m.psk_cr_hits;
+            p["cr_rows_replayed"] = m.psk_cr_rows;
+            p["cr_resume_tokens"] = m.psk_cr_resume_tokens;
+            p["cr_fallbacks"] = m.psk_cr_fb_unplanned + m.psk_cr_fb_geometry + m.psk_cr_fb_adopt;
+            p["cr_fallback_unplanned"] = m.psk_cr_fb_unplanned;
+            p["cr_fallback_geometry"] = m.psk_cr_fb_geometry;
+            p["cr_fallback_adopt"] = m.psk_cr_fb_adopt;
+            p["cr_not_needed"] = m.psk_cr_not_needed;
+            p["tail_only_latched"] = m.psk_tail_only;
+            p["tail_only_refused"] = m.psk_tail_only_refused;
+            p["cr_passes"] = pl[10];
+            p["cr_layer_rows_run"] = pl[11];
+            p["cr_layer_rows_skipped"] = pl[12];
+            p["cr_chains_skipped"] = pl[13];
+            p["cr_mixed_passes"] = pl[14];
             o["psk"] = std::move(p);
         }
         /* Lever PSK-DS (ds41-pskl20): the switch (-1 not served), DSpark context passes cut, their rows not run, the rows

@@ -165,12 +165,25 @@ int Scheduler::set_psk_k(int k) {   /* lever PSK design 2 */
 }
 
 bool Scheduler::psk_plan(int step, std::vector<int32_t>* ahead, std::vector<int32_t>* rows, int64_t* dec_tok) const {
+    return psk_plan(step, ahead, rows, dec_tok, nullptr);
+}
+
+bool Scheduler::psk_plan(int step, std::vector<int32_t>* ahead, std::vector<int32_t>* rows, int64_t* dec_tok,
+                         std::vector<int32_t>* flags) const {
     std::lock_guard<std::mutex> lk(mu_);
     if (psk_step_ < 0 || step != psk_step_) return false;
     *ahead = psk_ahead_;
     *rows = psk_rows_;
     *dec_tok = psk_dec_;
+    if (flags) *flags = psk_flags_;
     return true;
+}
+
+int Scheduler::set_psk_cr(int on, int64_t reach) {   /* lever PSK-CR */
+    std::lock_guard<std::mutex> lk(mu_);
+    psk_cr_reach_ = reach > 0 ? reach : 0;
+    psk_cr_ = on == 1 && psk_cr_reach_ > 0 ? 1 : 0;
+    return psk_cr_;
 }
 
 void Scheduler::set_lend_view(std::function<int(uint64_t*)> view, bool capable) {
@@ -540,6 +553,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     committed_.reserve((size_t)cfg.max_seqs);
     by_id_.reserve((size_t)cfg.max_seqs * 2);
     hit_blocks_.resize(prog.kv_groups.size());
+    /* lever PSK design 2 / PSK-CR: the per-step plan's vectors, at most one entry a sequence (no step allocates) */
+    psk_ahead_.reserve((size_t)cfg.max_seqs);
+    psk_rows_.reserve((size_t)cfg.max_seqs);
+    psk_flags_.reserve((size_t)cfg.max_seqs);
     for (auto& v : hit_blocks_) v.reserve(64);
     return RAD_OK;
 }
@@ -1271,6 +1288,8 @@ int Scheduler::debug_oracle_ids(int64_t n, int depth, int32_t* out) const {
 
 /* ------------------------------------------------------------------ chunking */
 int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
+    /* lever PSK-CR: a replay's chunks end at its end at the latest (the cold run's grid chunks below it) */
+    if (r.cr_end > r.n_computed && n_target > r.cr_end) n_target = r.cr_end;
     if (rswa_windows_.empty() || !kv_->has_runtime_window(r.id)) return n_target;
     const int64_t prompt = (int64_t)r.prompt.size();
     return std::min(n_target, r.n_computed < prompt ? prompt : r.n_computed + 1);
@@ -1712,7 +1731,7 @@ int64_t Scheduler::psk_next_target(const SchedReq& s, int64_t from, int64_t n) c
         take(tail_checkpoint(n));
         const int64_t K = s.psk_k;
         const int64_t i = (psk_i_at(from + 1) + K - 1) / K * K;
-        take(psk_q(i));
+        if (!s.psk_tail_only) take(psk_q(i));   /* lever PSK-CR: tail-only takes no grid point */
         if (s.psk_32k) take(psk_q(psk_i_at(32768)));
         if (s.req && s.req->checkpoint_at > 0) take(s.req->checkpoint_at / geo_.quantum * geo_.quantum);
     }
@@ -1725,7 +1744,7 @@ bool Scheduler::psk_is_target(const SchedReq& s, int64_t pos, int64_t n) const {
     if (!geo_.checkpoints() || s.psk_k <= 0) return false;
     if (pos == tail_checkpoint(n)) return true;
     const int64_t i = psk_i_at(pos);
-    if (psk_q(i) == pos && i % s.psk_k == 0) return true;
+    if (!s.psk_tail_only && psk_q(i) == pos && i % s.psk_k == 0) return true;
     if (s.psk_32k && pos == psk_q(psk_i_at(32768))) return true;
     return s.req && s.req->checkpoint_at > 0 && pos == s.req->checkpoint_at / geo_.quantum * geo_.quantum;
 }
@@ -1736,15 +1755,45 @@ bool Scheduler::psk_is_target(const SchedReq& s, int64_t pos, int64_t n) const {
 void Scheduler::psk_latch(SchedReq& s) {
     s.psk_k = 0;
     s.psk_32k = false;
-    if ((psk_mode_ != 2 && psk_mode_ != 3) || !s.req) return;
+    s.psk_tail_only = false;
+    if ((psk_mode_ != 2 && psk_mode_ != 3 && psk_mode_ != 4) || !s.req) return;
     const Request& r = *s.req;
     if (r.embed || r.score || r.token_scores || !r.plugin_words.empty() || r.media) return;
     if (kv_ && kv_->has_runtime_window(r.id)) return;
     s.psk_k = psk_k_;
     s.psk_32k = psk_mode_ == 3;
+    /* lever PSK-CR: ds41_psk 4 = tail-only anchors, only where a mid-prompt hit can be served by a cone replay
+     * (ds41_psk_cr 1); otherwise the request plans as 2 (every K-th grid point) */
+    if (psk_mode_ == 4) s.psk_tail_only = psk_cr_ == 1;   /* counted once an admission happens */
+}
+
+/* ------------------------------------------------------------------ lever PSK-CR: the replay's grid */
+int64_t Scheduler::psk_floor(int64_t pos) const {
+    if (pos <= 0) return 0;
+    int64_t o = 0, g = 0;
+    psk_grid(geo_, &o, &g);
+    if (g <= 0) return 0;
+    if (o > 0) return pos < o ? 0 : o + (pos - o) / g * g;
+    return pos / g * g;
+}
+
+Scheduler::CrResume Scheduler::psk_cr_resume(int64_t attn, int64_t prompt, int64_t snap) const {
+    CrResume c;
+    if (!geo_.checkpoints() || psk_cr_reach_ <= 0) return c;
+    const int64_t at = psk_floor(std::min(attn, prompt - 1));
+    if (at <= 0 || at <= snap) return c;
+    c.at = at;
+    c.from = psk_floor(std::max<int64_t>(0, at - psk_cr_reach_));
+    return c;
 }
 
 void Scheduler::psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt) {
+    /* lever PSK-CR: a replay chunk takes no snapshot -- below its end the window state is whole only in the end's cone,
+     * and its linear-state slot is not written (the batch masks it) */
+    if (ckpt && *ckpt > 0 && s.req && s.req->cr_end > s.req->n_computed) {
+        *ckpt = -1;
+        return;
+    }
     if (!ckpt || *ckpt <= 0 || s.psk_k <= 0 || psk_is_target(s, *ckpt, n)) return;
     *ckpt = -1;
     ++psk_dropped_;
@@ -1895,6 +1944,8 @@ bool Scheduler::preempt_back() {
     drop_card(s);
     r.n_computed = 0;
     r.n_cached = 0;
+    r.cr_end = 0;   /* lever PSK-CR: a recompute looks its hit up again */
+    s.cr_from = 0;
     r.n_accepted = 0;
     r.state = ReqState::Preempted;
     s.preempted_us = mono_us();
@@ -1966,7 +2017,12 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
         s.hit_attn = 0;
         s.hit_owed = true;
         s.hit_cut = SchedReq::HitCut::None;
+        r.cr_end = 0;   /* lever PSK-CR: no replay yet */
+        s.cr_from = 0;
     }
+    /* lever PSK design 2: the request's targets (latched again below on every admission path; the same values) --
+     * here first, as lever PSK-CR's decision at the hit needs them */
+    psk_latch(s);
 
     /* Check what no hit can change first (a free card index, a budget that fits a chunk): a
      * restore copies the whole context back, and an admission refused after it would repeat the
@@ -2079,11 +2135,55 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
                       (long long)h.n_attn_tokens);
         }
 
+        /* Lever PSK-CR (ds41-pskcr, fn4 ds41_psk_cr 1): a planned request whose hit has no snapshot at the deepest grid
+         * point `at` under its match (the cold run's chunk end there) resumes at `at` by an exact cone replay. The cached
+         * global KV -- every row's, the only state the trunk keeps for rows a window cannot reach -- is adopted up to
+         * `at`; the sequence starts at the grid point `from` at or below at - reach with NO state restored (its window
+         * groups start fresh, ensure() grows them chunk by chunk below the adopted length); its chunks up to `at` are the
+         * cold run's grid chunks (chunk_end stops them at `at`), flagged replay (StepEntry::cr_replay: the batch maps
+         * their full-group and linear-state slots to -1, so no global KV or compressor tail is written; the plugin cuts
+         * every layer to `at`'s cone) and take no snapshot (psk_ckpt). Every window key and the Engram token window at
+         * `at` are then a cold prefill's (deepseek41.cpp step_bi, lever PSK-CR), and the prompt goes on from `at`. */
+        int64_t cr_at = 0, cr_from = 0;
+        if (psk_cr_ == 1 && h.n_attn_tokens > 0 && geo_.checkpoints()) {
+            const int64_t at_raw = psk_floor(std::min<int64_t>(h.n_attn_tokens, (int64_t)r.prompt.size() - 1));
+            const CrResume cr = psk_cr_resume(h.n_attn_tokens, (int64_t)r.prompt.size(), reuse);
+            if (at_raw > 0 && at_raw <= reuse) {
+                ++m_.psk_cr_not_needed;
+            } else if (cr.at > 0) {
+                if (s.psk_k <= 0) ++m_.psk_cr_fb_unplanned;
+                else if (hit_holes_trunk_ || !hit_needs_window_ || kv_->has_runtime_window(r.id) || cr.from >= cr.at)
+                    ++m_.psk_cr_fb_geometry;
+                else { cr_at = cr.at; cr_from = cr.from; }
+            }
+        }
+
         /* Claim the cached blocks; otherwise the sequence would skip those tokens and attend to
          * blocks it does not own. adopt() takes a whole block multiple, which `reuse` is: a whole
          * number of blocks, or a checkpoint position (on the interval, or on a quantum boundary at
-         * a prompt's tail per plan_chunk), both block multiples by geometry.h. */
-        if (reuse > 0) {
+         * a prompt's tail per plan_chunk), both block multiples by geometry.h. A replay's `at` is a
+         * checkpoint position. */
+        if (cr_at > 0) {
+            const std::vector<int32_t>& cg = pc_->cached_groups();
+            bool ok = true;
+            for (size_t i = 0; i < cg.size() && i < hit_blocks_.size(); ++i) {
+                const int64_t nb = cr_at / kvgeom_.g[(size_t)cg[i]].block_size;
+                if ((int64_t)hit_blocks_[i].size() > nb) hit_blocks_[i].resize((size_t)nb);
+                if (kv_->adopt(r.id, cg[i], hit_blocks_[i], cr_at) < 0) { ok = false; break; }
+            }
+            if (!ok) {
+                /* the attention-only hit is not taken either: a fresh prefill (the adoption that failed here would
+                 * fail below too) */
+                kv_->preempt(r.id);
+                ++m_.psk_cr_fb_adopt;
+                cr_at = cr_from = 0;
+                reuse = 0;
+                s.hit_cut = SchedReq::HitCut::Adopt;
+            } else {
+                reuse = 0;   /* no snapshot is restored: the replay rebuilds the state */
+                s.hit_cut = SchedReq::HitCut::None;
+            }
+        } else if (reuse > 0) {
             const std::vector<int32_t>& cg = pc_->cached_groups();
             for (size_t i = 0; i < cg.size() && i < hit_blocks_.size(); ++i) {
                 int64_t nb = reuse / kvgeom_.g[(size_t)cg[i]].block_size;
@@ -2111,7 +2211,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * request with the same head skips it -- the same system prompt or instructions in front
          * of a different text, as TranslateGemma's chunks are. The interval and tail snapshots
          * miss it: the head is shorter than an interval, and each prompt's tail is its own. */
-        if (geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= kSharedHeadMin) {
+        if (geo_.checkpoints() && r.checkpoint_at == 0 &&
+            h.branch_at - std::max<int64_t>(reuse, cr_at) >= kSharedHeadMin) {
             r.checkpoint_at = h.branch_at;
             RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; a snapshot there",
                       (unsigned long long)r.id, (long long)h.branch_at);
@@ -2122,6 +2223,15 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
         s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
                       (has_linear_state_ || win_hit)) ? h.checkpoint_slot : -1;
         s.hit_attn = h.n_attn_tokens;
+        if (cr_at > 0) {   /* lever PSK-CR: from `cr_from`, nothing restored; the cache supplied up to `cr_at` */
+            r.n_computed = (int32_t)cr_from;
+            r.n_cached = (int32_t)cr_at;
+            r.cr_end = (int32_t)cr_at;
+            s.cr_from = (int32_t)cr_from;
+            s.ckpt_src = -1;
+            RAD_DEBUG("admit %llu: prefix hit of %lld tokens resumes at %lld by a cone replay from %lld (lever PSK-CR)",
+                      (unsigned long long)r.id, (long long)h.n_attn_tokens, (long long)cr_at, (long long)cr_from);
+        }
     }
 
     /* A fresh prefill is admitted only when its WHOLE prompt plus one decode position fits
@@ -2138,8 +2248,12 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
              * (spec §17) like the preempted path, rather than waiting forever. */
             if (!kv_->can_ever_fit(s.seq_len() + 1))
                 ;   /* fall through: ensure_from() reports the shortfall */
-            else
+            else {
+                /* lever PSK-CR: a replay's adopted blocks go back (its start may be 0, where a later attempt would
+                 * look the hit up again over them) */
+                if (r.cr_end > 0) undo_hit(s);
                 return kAdmitWait;
+            }
         }
     }
 
@@ -2203,6 +2317,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
         else if (cap < budget && want > 0)
             admit_full_ = plan_chunk(r.n_computed, end, budget, nullptr, r.checkpoint_at, &r);
     }
+    /* lever PSK-CR: no chunk crosses a replay's end (chunk_end already stops them there; a guard) */
+    if (r.cr_end > r.n_computed && r.n_computed + want > r.cr_end) want = r.cr_end - r.n_computed;
     int rc = RAD_OK;
     if (want <= 0)                                          rc = RAD_E_FULL;
     else if (s.card < 0 && free_cards_.empty())             rc = RAD_E_FULL;
@@ -2223,7 +2339,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * and reuse it for another sequence, so a later attempt would restore someone else's
          * recurrent state. Giving the hit back costs a lookup. An attention-only hit holds only
          * refcounted blocks and is kept. */
-        if (s.ckpt_src >= 0) undo_hit(s);
+        if (s.ckpt_src >= 0 || r.cr_end > 0) undo_hit(s);   /* lever PSK-CR: a replay is not kept across a failed attempt */
         if (bp_take) { s.bi_beg = s.bi_end = 0; s.bi_ckpt = -1; }   /* lever DST: the piece bypass_piece cut is not run */
         /* What the restore brought back stays for the next attempt (IPrefixCache::hold). */
         if (cfg_.prefix_cache) pc_->hold(r);
@@ -2246,13 +2362,18 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
                 case SchedReq::HitCut::None:       break;
             }
             /* lever PSK design 2: a planned request's hit that resumed below its attention match (at the deepest
-             * snapshot under it, the anchor below; 0 when none) */
-            if (s.psk_k > 0 && s.hit_attn > r.n_cached) {
+             * snapshot under it, the anchor below; 0 when none); lever PSK-CR: a replayed hit is counted as such */
+            if (r.cr_end > 0) {
+                ++m_.psk_cr_hits;
+                m_.psk_cr_rows += r.cr_end - s.cr_from;
+                m_.psk_cr_resume_tokens += r.cr_end;
+            } else if (s.psk_k > 0 && s.hit_attn > r.n_cached) {
                 ++m_.psk_fallback_resumes;
                 m_.psk_fallback_tokens += s.hit_attn - r.n_cached;
             }
         }
         if (s.psk_k > 0) ++m_.psk_latched;
+        if (s.psk_k > 0 && psk_mode_ == 4) ++(s.psk_tail_only ? m_.psk_tail_only : m_.psk_tail_only_refused);
         s.hit_owed = false;
     }
 
@@ -2281,6 +2402,8 @@ void Scheduler::undo_hit(SchedReq& s) {
     if (kv_->has_sequence(r.id)) kv_->preempt(r.id);
     r.n_computed = 0;
     r.n_cached = 0;
+    r.cr_end = 0;
+    s.cr_from = 0;
     s.ckpt_src = -1;
     s.hit_attn = 0;
 }
@@ -2719,6 +2842,8 @@ const RadBatch* Scheduler::step() {
             if (want > budget) want = 0;
         }
         if (want <= 0) break;   /* the budget is spent; the rest of running_ waits a step */
+        /* lever PSK-CR: no chunk crosses a replay's end (chunk_end already stops them there; a guard) */
+        if (prefill && r.cr_end > r.n_computed && r.n_computed + want > r.cr_end) want = r.cr_end - r.n_computed;
 
         /* KV first; on refusal preempt from the back (lowest priority, latest arrival), the one
          * that would be re-admitted last anyway. Reclaiming from the cache is tried first, but
@@ -2783,6 +2908,7 @@ const RadBatch* Scheduler::step() {
         e.draft = s.draft;
         e.n_draft = s.n_draft;
         e.is_prefill = prefill;
+        e.cr_replay = prefill && r.cr_end > r.n_computed;   /* lever PSK-CR */
         e.ngram = !prefill && s.draft_ngram && s.n_draft > 0;
         /* A tree drafter's parents, unless prompt lookup replaced its proposal with a chain. */
         e.draft_parent = (!prefill && s.draft_tree && !e.ngram) ? s.draft_par : nullptr;
@@ -2906,6 +3032,7 @@ const RadBatch* Scheduler::step() {
             e.draft = s.draft;
             e.n_draft = 0;
             e.is_prefill = true;
+            e.cr_replay = r.cr_end > r.n_computed;   /* lever PSK-CR */
             e.produces_token = (r.n_computed + s.sched_tokens >= s.seq_len());
             /* admit_one just set ckpt_src, and this is the entry it applies to. Consumed once:
              * restoring again on a later chunk would rewind the recurrence to the hit. */
@@ -3053,19 +3180,26 @@ const RadBatch* Scheduler::step() {
     psk_dec_ = 0;
     psk_ahead_.clear();
     psk_rows_.clear();
+    psk_flags_.clear();
     {
         bool planned = false;
         for (const StepEntry& e : plan_.e) {
             if (!e.is_prefill) { psk_dec_ += e.n_tokens; continue; }
             const SchedReq* sr = e.slot >= 0 && (size_t)e.slot < reqs_.size() ? reqs_[(size_t)e.slot].get() : nullptr;
-            int32_t a = kPskNoPlan;
+            int32_t a = kPskNoPlan, fl = 0;
             if (sr && sr->req && sr->psk_k > 0) {
                 const int64_t from = e.ctx_len, end = from + e.n_tokens;
                 a = (int32_t)(psk_next_target(*sr, from, sr->seq_len()) - end);
+                /* lever PSK-CR: a replay chunk's one target is the replay's end */
+                if (e.cr_replay && sr->req->cr_end >= end) {
+                    a = (int32_t)(sr->req->cr_end - end);
+                    fl = kPskFlagReplay;
+                }
                 planned = true;
             }
             psk_ahead_.push_back(a);
             psk_rows_.push_back(e.n_tokens);
+            psk_flags_.push_back(fl);
         }
         if (planned) { psk_step_ = step_; ++m_.psk_planned_steps; }
     }
@@ -4439,6 +4573,7 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.step = step_;
     m.psk_mode = psk_mode_;   /* lever PSK design 2 */
     m.psk_k = psk_k_;
+    m.psk_cr = psk_mode_ < 0 ? -1 : psk_cr_;   /* lever PSK-CR */
     m.running = (int64_t)running_.size();
     m.queue_depth = (int64_t)waiting_.size();
     m.preempted_waiting = 0;

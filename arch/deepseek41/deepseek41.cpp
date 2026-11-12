@@ -1212,6 +1212,8 @@ struct PskPlan {
     long long dec_tok = 0;
     std::vector<int32_t> ahead, rows;   /* per prefill sequence, in the step's order */
     bool l20 = false;            /* lever PSK-L20 (ds41_psk_l20) as the plan's layer end was found under it */
+    /* lever PSK-CR (ds41-pskcr, rad_psk_plan2): per prefill sequence bit 0 = a cone-replay chunk (empty: none) */
+    std::vector<int32_t> flags;
 };
 static PskPlan g_psk_plan;     /* written by rad_psk_plan with every rank thread parked, read by the ranks' issue */
 static int64_t psk_cone(int64_t n_layer, int64_t window, int64_t l) { return kPskBase + (n_layer - 1 - l) * window; }
@@ -1263,6 +1265,49 @@ static void psk_l20_read_env() {
         if (e && v < 0) fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PSK_L20=%s is not 0 / off or 1 / on: ignored\n", e);
     }
 }
+/* Lever PSK-CR (ds41-pskcr 12.11.2026; ARCH-AUDIT-20261112 lever 3): the exact form of the official bounded replay (tech
+ * report 3.2.2). A prefix hit with no snapshot at the deepest grid point H under its match (the cold run's chunk end
+ * there) resumes at H by a cone replay: the scheduler adopts the cached global KV (latent + index keys, every row's: the
+ * only state the decoder keeps of a row a window cannot reach) up to H, starts the sequence at the grid point at or below
+ * H - reach (reach = C_0 = kPskBase + (n_layer - 1) x window, 5152 on the 1017) with no state restored, and runs the cold
+ * run's grid chunks up to H flagged replay (rad_psk_plan2): every segment flagged runs EVERY layer, encoder layers
+ * 0..20 too, over its rows in H's cone only -- psk_rows(C_l, H - chunk end, n), at least kPskBase rows (as design 2 cuts
+ * 21..39 toward a target) -- and stores no global KV: the batch maps a replay entry's full-group slots and linear-state
+ * slots to -1 (core sched/batch.cpp), and a pass of replay chunks only skips the kv sources' compressor chain whole.
+ * Why the window state at H is a cold prefill's: layer 0's input is every row's embedding; the window store at l writes
+ * a row's key from its own layer input; a row's output at l reads the keys of its window - 1 predecessors at l, the
+ * cached global KV at positions <= its own (attention: the compressed latent of src_of[l]; the indexer: src_of[l]'s
+ * index keys -- the cache holds every row of both, so a skipped store leaves nothing a replay row reads unwritten),
+ * and, at a reindex layer, the candidate keep layer 20 wrote for the same row in the same pass (the cf7bbc7 deal: a cut
+ * layer keeps the step's uncut deal at every cut layer, 0..20 included, so the same rank reads it). So a layer's input
+ * right on [H - C_l, H) gives its keys right there and its output right on [H - C_l + window - 1, H) superset of
+ * [H - C_(l+1), H): by induction every layer's window keys of [H - window + 1, H) and the 37..39 inputs (the DSpark
+ * taps) of the last kPskBase rows are right, whatever the windows held at the replay's start. The Engram block reads
+ * token ids only (its rows' n-gram history lies inside the replay from layer 1's cone on; the conv state at H is the
+ * last ngram - 1 tokens, written by the replay's last chunk). The compressor tail (ratio 2 at 2..19) is not rebuilt:
+ * H is a multiple of every ratio, so the chunk from H reads none of it. Rows run in launches of >= kPskBase rows (the
+ * form band of the uncut 4096-row launch: fused norms > 120, decode bands 48, EXL3 16), and on the cold run's own
+ * chunks, so each step's deal is the cold step's. Switch ds41_psk_cr (fn4): 1 lets the scheduler replay, 0 = today;
+ * RADIANCE_DS41_PSK_CR=0 / 1 sets the start value (unset: 0); 1 refused where design 2 is not available. */
+static std::atomic<int> g_sw_psk_cr{0}, g_sw_psk_cr_env{-2};   /* env: -2 unread, -1 unset */
+/* Live counters (rank 0's; /stats "psk" cr_*): replay passes cut, their layer-rows run, their layer-rows not run below
+ * the first PSK layer (m.psk_first), kv-source compressor chains skipped, replay passes beside other rows (decode or
+ * another prefill: the chain ran, its stores masked by the batch). */
+static std::atomic<long long> g_cr_passes{0}, g_cr_rows_run{0}, g_cr_rows_skip{0}, g_cr_chains{0}, g_cr_mixed{0};
+static void psk_cr_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_PSK_CR");
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+    if (g_sw_psk_cr_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_psk_cr.store(v, std::memory_order_relaxed);
+        if (e && v < 0) fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PSK_CR=%s is not 0 / off or 1 / on: ignored\n", e);
+    }
+}
+static bool psk_cr_flag(const PskPlan* p, size_t i) {
+    return p && i < p->flags.size() && (p->flags[i] & 1) != 0;
+}
+
 /* Lever PSK-DS (ds41-pskl20 12.11.2026; ARCH-AUDIT-20261112 lever 2). The DSpark context pass (dsp_context, draft_pass
  * -1, one row a trunk row) writes each row's context key into the drafter's window cache; a query pass reads the last
  * c.window keys before its anchor (drf.window = c.window + 1 with the anchor), the anchor at or past its sequence's
@@ -1318,9 +1363,11 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_bi"))
         return value == 0 || (value >= 1 && value <= 4 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_psk"))
+    if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
         return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ||
-               ((value == 2 || value == 3) && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+               ((value == 2 || value == 3 || value == 4) && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_psk_cr"))
+        return value == 0 || (value == 1 && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk_l20"))
         return value == 0 || (value == 1 && g_sw_psk_l20_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_pfctx"))
@@ -1338,6 +1385,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ds41_psk")) g_sw_psk.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_psk_l20")) g_sw_psk_l20.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "dspark_pfctx")) g_sw_pfctx.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_psk_cr")) g_sw_psk_cr.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1371,6 +1419,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "dspark_pfctx")) {
         *applied = g_sw_pfctx.load(std::memory_order_relaxed);
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_psk_cr")) {
+        *applied = g_sw_psk_cr.load(std::memory_order_relaxed);
         return 1;
     }
     if (!std::strcmp(name, "dspark_walk")) {
@@ -3102,6 +3154,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     psk_read_env();
     psk_l20_read_env();
     pfctx_read_env();
+    psk_cr_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3551,6 +3604,9 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 m.bi_sub ? "window snapshots at targets only" : "NOT available: RADIANCE_DS41_BI is not declared -- starts at 1");
     if (!ctx->shape_probe && !m.bi_sub && g_sw_psk.load(std::memory_order_relaxed) >= 2)
         g_sw_psk.store(1, std::memory_order_relaxed);
+    /* lever PSK-CR rides on design 2's plan: no BI cu views, no replay */
+    if (!ctx->shape_probe && !m.bi_sub && g_sw_psk_cr.load(std::memory_order_relaxed) >= 1)
+        g_sw_psk_cr.store(0, std::memory_order_relaxed);
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41: lever PSK declared (RADIANCE_DS41_PSK, fn4 ds41_psk, now %d): a prefill "
                         "sequence's chunk runs layers %d..%lld over its last %lld + (%lld - l) x %lld rows only (layer %d: "
@@ -3559,6 +3615,13 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 (long long)c.n_layer - 1, (long long)c.window, first,
                 (long long)(kPskBase + (c.n_layer - 1 - first) * c.window), (long long)c.n_layer - 1, (long long)kPskBase,
                 last);
+    if (ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: lever PSK-CR (fn4 ds41_psk_cr, now %d; RADIANCE_DS41_PSK_CR): %s\n",
+                g_sw_psk_cr.load(std::memory_order_relaxed),
+                m.bi_sub ? ("a planned prefix hit with no snapshot at its grid point H resumes there by a cone replay "
+                            "from H - " + std::to_string(kPskBase + (c.n_layer - 1) * c.window) + ": every layer over "
+                            "H's cone, no global-KV store; ds41_psk 4 = tail-only anchors").c_str()
+                          : "NOT available: RADIANCE_DS41_BI is not declared");
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41: lever PSK-L20 (fn4 ds41_psk_l20, now %d; RADIANCE_DS41_PSK_L20): %s\n",
                 g_sw_psk_l20.load(std::memory_order_relaxed),
@@ -4042,6 +4105,23 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             g_psk_hsteps.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    /* lever PSK-CR: the prefill segments that are cone-replay chunks (the plan's flags, in the step's order), and whether
+     * the pass is replay chunks only (no decode row, every prefill segment replays): then no row of it stores global KV,
+     * and the kv sources' compressor chain is skipped whole. Beside other rows the chain runs over the step as ever and
+     * the batch's -1 slots keep the replay rows' stores off the cache. */
+    static thread_local std::vector<uint8_t> crf;
+    crf.assign((size_t)psk_pre, 0);
+    bool cr_any = false, cr_all = hint != nullptr && psk_dec == 0 && psk_pre > 0;
+    for (size_t i = 0; i < crf.size(); ++i) {
+        crf[i] = psk_cr_flag(hint, i) ? 1 : 0;
+        cr_any = cr_any || crf[i];
+        cr_all = cr_all && crf[i];
+    }
+    cr_all = cr_all && cr_any;
+    if (cr_any && rad_rank(x) == 0) {
+        g_cr_passes.fetch_add(1, std::memory_order_relaxed);
+        if (!cr_all) g_cr_mixed.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!psk_only) {   /* rank 0, every 512 segmented steps: the counts (MoE passes a layer summed over those steps: the launch cost of P) */
         const long long n = g_bi_steps.load(std::memory_order_relaxed);
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0)
@@ -4169,6 +4249,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
      * made under (rad_psk_plan: the stager's layer end), any other the switch's -- the same, read at one release */
     const bool l20_on = psk && m.psk_l20 >= 0 && m.psk_l20 < m.psk_first &&
                         (hint ? hint->l20 : g_sw_psk_l20.load(std::memory_order_relaxed) > 0);
+    /* lever PSK-CR: an all-replay pass stores no global KV, so the split layer is a plain cut layer there (no all-row
+     * part) */
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
@@ -4178,8 +4260,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
          * part (the collapse + norm here, the compressor chain and the latent / index-key stores over the step's rows
          * below) runs whatever the cone, so the layer is never skipped whole */
         bool cut = false;
-        const bool l20 = l20_on && l == m.psk_l20;
-        if (psk && (l >= m.psk_first || l20)) {
+        const bool l20 = l20_on && l == m.psk_l20 && !cr_all;
+        /* lever PSK-CR: a replay segment is cut at every layer (its rows outside the end's cone feed nothing the end
+         * reads, and it stores no global KV); any other segment from m.psk_first (or the split layer) on as before */
+        if (psk && (l >= m.psk_first || l20 || cr_any)) {
             const int64_t C = psk_cone(c.n_layer, c.window, l);
             /* the K/V store range (psk_kv_cone, today = C): the forward rows' window keys come from it */
             const int64_t CK = psk_kv_cone(c.n_layer, c.window, l);
@@ -4188,12 +4272,21 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             size_t pi = 0;
             for (const BiSeg& s0 : sg) {
                 if (s0.dec) { psk_sg.push_back(s0); continue; }
-                const int64_t n = psk_rows(C, psk_ahead(hint, pi++), s0.n);
+                const size_t ip = pi++;
+                const bool cr_seg = ip < crf.size() && crf[ip];
+                if (!(l >= m.psk_first || l20 || cr_seg)) { psk_sg.push_back(s0); continue; }   /* not cut here */
+                const int64_t n = psk_rows(C, psk_ahead(hint, ip), s0.n);
+                if (cr_seg && rad_rank(x) == 0) {
+                    g_cr_rows_run.fetch_add(std::max<int64_t>(n, 0), std::memory_order_relaxed);
+                    if (l < m.psk_first && !l20 && n < s0.n)
+                        g_cr_rows_skip.fetch_add(s0.n - std::max<int64_t>(n, 0), std::memory_order_relaxed);
+                }
                 if (n >= s0.n) { psk_sg.push_back(s0); continue; }
                 if (rad_rank(x) == 0) {
                     g_psk_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
                     if (l20) g_psk_l20_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
-                    else (l < m.psk_first + 9 ? g_psk_rows_lo : g_psk_rows_hi).fetch_add(s0.n - n, std::memory_order_relaxed);
+                    else if (l >= m.psk_first)
+                        (l < m.psk_first + 9 ? g_psk_rows_lo : g_psk_rows_hi).fetch_add(s0.n - n, std::memory_order_relaxed);
                 }
                 cut = true;
                 if (n <= 0) continue;   /* design 2: no row of this segment at this layer */
@@ -4406,23 +4499,28 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                     P(wb->slot_mapping, r0, n), kv_cache(m.win, l));
                 }
             }
-            /* B: the compressor chain over the step, as step() (per entry; no row-banded op) */
-            if (L.src)
+            /* B: the compressor chain over the step, as step() (per entry; no row-banded op). Lever PSK-CR: an
+             * all-replay pass stores no global KV (the cache holds every row's), so the chain is skipped whole; the
+             * index query rope (A2) reads the angles rope_b_step wrote for the step's positions -- c_tab writes the
+             * same rope_table bytes at the same positions (one pure function of the position, the same parameters) */
+            const bool chain = L.src && !cr_all;
+            if (L.src && cr_all && rad_rank(x) == 0) g_cr_chains.fetch_add(1, std::memory_order_relaxed);
+            if (chain)
                 RAD_ISSUE_N(x, L.c_gemm, T, brows(m.xn, T), RAD_W(L.comp_w), brows(ctail ? m.kvs : m.pooled, T));
-            if (ctail)
+            if (ctail && chain)
                 RAD_ISSUE_N(x, L.c_work, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
                             praw2(tb->state_index, RAD_I32, S, tpitch),
                             praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), RAD_NONE,
                             brows(m.stage, crows * r), brows(m.page, crows), brows(m.bpos, crows), brows(m.nc, S));
-            if (ctail)
+            if (ctail && chain)
                 RAD_ISSUE_N(x, L.c_pool, crows, brows(m.stage, crows * r), brows(m.pooled, crows), brows(m.page, crows));
-            if (ctail && L.c_tail)
+            if (ctail && chain && L.c_tail)
                 RAD_ISSUE_N(x, L.c_tail, T, brows(m.kvs, T), pos, cu, kv_cache(m.tail[r], l),
                             praw2(tb->state_index, RAD_I32, S, tpitch));
-            if (L.src) RAD_ISSUE_N(x, L.c_norm, crows, brows(m.pooled, crows), RAD_W(L.comp_norm), brows(m.lat, crows));
-            if (L.src) lin_issue(x, m, L.k_gemm, crows, brows(m.lat, crows), L.ik_w, brows(m.ik, crows));
-            if (L.src) RAD_ISSUE_N(x, L.c_tab, crows, bpos, brows(m.cs_b, g.max_ctx));
-            if (L.src) {
+            if (chain) RAD_ISSUE_N(x, L.c_norm, crows, brows(m.pooled, crows), RAD_W(L.comp_norm), brows(m.lat, crows));
+            if (chain) lin_issue(x, m, L.k_gemm, crows, brows(m.lat, crows), L.ik_w, brows(m.ik, crows));
+            if (chain) RAD_ISSUE_N(x, L.c_tab, crows, bpos, brows(m.cs_b, g.max_ctx));
+            if (chain) {
                 if (L.k_f)
                     RAD_ISSUE_N(x, L.k_f, crows, brows(m.ik, crows), RAD_W(L.ik_norm), brows(m.ikn, crows),
                                 brows(m.cs_b, g.max_ctx), bpos);
@@ -4438,7 +4536,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     if (L.i_f) RAD_ISSUE_N(x, L.i_f, s.n, R(m.iq, s.r0, s.n), brows(m.cs_b, g.max_ctx), P(batch->positions, s.r0, s.n));
                     else RAD_ISSUE_N(x, L.i_rope, s.n, R(m.iq, s.r0, s.n), brows(m.cs_b, g.max_ctx), P(batch->positions, s.r0, s.n));
                 }
-            if (L.src) {
+            if (chain) {
                 if (L.l_f) RAD_ISSUE_N(x, L.l_f, crows, brows(m.lat, crows), brows(m.cs_b, g.max_ctx), bpos);
                 else RAD_ISSUE_N(x, L.l_rope, crows, brows(m.lat, crows), brows(m.cs_b, g.max_ctx), bpos);
                 if (!L.k_f) RAD_ISSUE_N(x, L.k_rope, crows, brows(m.ikn, crows), brows(m.cs_b, g.max_ctx), bpos);
@@ -4447,10 +4545,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 RAD_ISSUE_N(x, L.i_qq, T, brows(m.iq, T));
             else if (L.src && L.i_score && L.i_qq)
                 for (const BiSeg& s : sg) RAD_ISSUE_N(x, L.i_qq, s.n, R(m.iq, s.r0, s.n));
-            if (L.src && L.l_q) RAD_ISSUE_N(x, L.l_q, crows, brows(m.lat, crows));
-            if (L.src && L.k_q) RAD_ISSUE_N(x, L.k_q, crows, brows(m.ikn, crows));
-            if (L.src) RAD_ISSUE_N(x, L.l_st, crows, brows(m.lat, crows), page, kv_cache(m.comp[r], l));
-            if (L.src) RAD_ISSUE_N(x, L.k_st, crows, brows(m.ikn, crows), page, kv_cache(m.index[r], l));
+            if (chain && L.l_q) RAD_ISSUE_N(x, L.l_q, crows, brows(m.lat, crows));
+            if (chain && L.k_q) RAD_ISSUE_N(x, L.k_q, crows, brows(m.ikn, crows));
+            if (chain) RAD_ISSUE_N(x, L.l_st, crows, brows(m.lat, crows), page, kv_cache(m.comp[r], l));
+            if (chain) RAD_ISSUE_N(x, L.k_st, crows, brows(m.ikn, crows), page, kv_cache(m.index[r], l));
             /* the indexer: score / candidates / selection by segment, each segment's runs from its own first row */
             if (L.i_score) {
                 const int src = c.src_of[(size_t)l];
@@ -5280,6 +5378,8 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
  * the first nine cut layers (21..29), [4] at the rest (30..39), [5] plans dropped as not matching their pass. Returns
  * how many it wrote (6), 0 when lever PSK is not declared here. */
 extern "C" int rad_psk_stats(long long* out, int n) {
+    /* lever PSK-CR (ds41-pskcr): [10] replay passes cut, [11] their layer-rows run, [12] their layer-rows not run below
+     * the first PSK layer, [13] kv-source compressor chains skipped, [14] replay passes beside other rows, [15] 0 */
     using namespace deepseek41;
     if (!out || n < 6 || g_psk_first.load(std::memory_order_relaxed) <= 0) return 0;
     out[0] = g_psk_hsteps.load(std::memory_order_relaxed);
@@ -5295,10 +5395,18 @@ extern "C" int rad_psk_stats(long long* out, int n) {
     out[7] = g_psk_l20_rows.load(std::memory_order_relaxed);
     out[8] = g_psk_l20_empty.load(std::memory_order_relaxed);
     out[9] = g_psk_l20_end.load(std::memory_order_relaxed);
-    return 10;
+    if (n < 16) return 10;
+    out[10] = g_cr_passes.load(std::memory_order_relaxed);
+    out[11] = g_cr_rows_run.load(std::memory_order_relaxed);
+    out[12] = g_cr_rows_skip.load(std::memory_order_relaxed);
+    out[13] = g_cr_chains.load(std::memory_order_relaxed);
+    out[14] = g_cr_mixed.load(std::memory_order_relaxed);
+    out[15] = 0;
+    return 16;
 }
 
-extern "C" int rad_psk_plan(int step, long long dec_tok, int n, const int32_t* ahead, const int32_t* rows) {
+static int psk_plan_impl(int step, long long dec_tok, int n, const int32_t* ahead, const int32_t* rows,
+                         const int32_t* flags) {
     using namespace deepseek41;
     const int first = g_psk_first.load(std::memory_order_relaxed), nl = g_psk_nlayer.load(std::memory_order_relaxed);
     const int w = g_psk_window.load(std::memory_order_relaxed);
@@ -5310,17 +5418,49 @@ extern "C" int rad_psk_plan(int step, long long dec_tok, int n, const int32_t* a
     g_psk_plan.dec_tok = dec_tok;
     g_psk_plan.ahead.assign(ahead, ahead + n);
     g_psk_plan.rows.assign(rows, rows + n);
+    /* lever PSK-CR: the replay flags (none from rad_psk_plan) */
+    g_psk_plan.flags.clear();
+    bool cr = false;
+    for (int i = 0; flags && i < n; ++i) cr = cr || (flags[i] & 1) != 0;
+    if (cr) g_psk_plan.flags.assign(flags, flags + n);
     /* lever PSK-L20: the split layer's cone part is cut as the layers past it; its all-row part stages no routed expert,
      * so the scan starts there and a pass with no row in its cone ends at it (its experts not staged) */
     const int l20 = g_psk_l20_layer.load(std::memory_order_relaxed);
     g_psk_plan.l20 = l20 >= 0 && l20 < first && g_sw_psk_l20.load(std::memory_order_relaxed) > 0;
     if (dec_tok > 0 || n == 0) return nl;
-    static std::vector<int32_t> ah;   /* the scheduler thread's, every rank parked */
+    static std::vector<int32_t> ah, from;   /* the scheduler thread's, every rank parked */
     ah.resize((size_t)n);
     for (int i = 0; i < n; ++i) ah[(size_t)i] = psk_ahead(&g_psk_plan, (size_t)i);
-    const int end = ds41cone::plan_end(nl, w, g_psk_plan.l20 ? l20 : first, n, ah.data(), rows);
-    if (g_psk_plan.l20 && end == l20) g_psk_l20_end.fetch_add(1, std::memory_order_relaxed);
-    return end;
+    const int cut0 = g_psk_plan.l20 ? l20 : first;
+    if (!cr) {
+        const int end = ds41cone::plan_end(nl, w, cut0, n, ah.data(), rows);
+        if (g_psk_plan.l20 && end == l20) g_psk_l20_end.fetch_add(1, std::memory_order_relaxed);
+        return end;
+    }
+    /* lever PSK-CR: a replay entry is cut from layer 0 (its last chunk's experts staged only where its cone reaches) */
+    from.resize((size_t)n);
+    for (int i = 0; i < n; ++i) from[(size_t)i] = (flags[i] & 1) ? 0 : cut0;
+    return ds41cone::plan_end_from(nl, w, n, ah.data(), rows, from.data());
+}
+
+extern "C" int rad_psk_plan(int step, long long dec_tok, int n, const int32_t* ahead, const int32_t* rows) {
+    return psk_plan_impl(step, dec_tok, n, ahead, rows, nullptr);
+}
+
+/* Lever PSK-CR (ds41-pskcr): rad_psk_plan with each prefill sequence's flags (bit 0: a cone-replay chunk, cut at every
+ * layer to its `ahead`'s cone, no global-KV store). */
+extern "C" int rad_psk_plan2(int step, long long dec_tok, int n, const int32_t* ahead, const int32_t* rows,
+                             const int32_t* flags) {
+    return psk_plan_impl(step, dec_tok, n, ahead, rows, flags);
+}
+
+/* Lever PSK-CR: the rows before its end a cone replay must start at or below -- layer 0's cone, kPskBase + (n_layer - 1)
+ * x window (5152 on the 1017) -- or -1 where design 2's plan (and so a replay) is not available. */
+extern "C" int rad_psk_cr_reach(void) {
+    using namespace deepseek41;
+    const int nl = g_psk_nlayer.load(std::memory_order_relaxed), w = g_psk_window.load(std::memory_order_relaxed);
+    if (!g_sw_psk2_ok.load(std::memory_order_relaxed) || nl <= 0 || w <= 0) return -1;
+    return (int)psk_cone(nl, w, 0);
 }
 
 /* Lever PSK-DS's live counters for /stats "dspark_pfctx" (ds41-pskl20), rank 0's, cumulative: out[0] the switch

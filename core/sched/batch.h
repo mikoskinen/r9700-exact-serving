@@ -57,6 +57,11 @@ struct StepEntry {
      * Set on a history-pass entry whose sequence drafts. */
     bool    draft_out = false;
     bool    is_prefill = false;
+    /* Lever PSK-CR (ds41-pskcr): a cone-replay chunk -- its rows rebuild the windowed state over global KV adopted from
+     * the prefix cache. The build maps its rows' slots in every RAD_KV_FULL group and its state slot in every
+     * RAD_KV_LINEAR group to -1, so nothing of those is written (a store skips a negative slot); its window and conv
+     * groups are written as any prefill's. */
+    bool    cr_replay = false;
     bool    produces_token = false;   /* this entry's last token is the sequence's last */
     /* The drafts came from prompt lookup, not the declared drafter. They count toward reported
      * acceptance but not the adaptive window's estimate of the draft head (DraftController,
