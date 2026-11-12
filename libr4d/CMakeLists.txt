@@ -135,6 +135,8 @@ set(R4D_UNITS
   "r4d_ar_oneshot_2rank_wht6|"
   "r4d_ar_oneshot_Nrank_exact|"
   "r4d_ar_twoshot_Nrank_exact|"
+  # fn4 SDMA-AR: the exact two-shot with the peer bytes on the copy engines (selftest entry points).
+  "r4d_ar_sdma|"
   "r4d_ar_twoshot_Nrank_ti8|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
