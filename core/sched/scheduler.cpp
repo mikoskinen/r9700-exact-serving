@@ -669,6 +669,12 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
      * release and its restore would be cut. */
     s.restore_waited = false;
     s.restore_cut = false;
+    /* Lever BI / DST's per-request state (ds41-noa): a recycled slot kept the previous request's. A stale bypass_no kept
+     * every later request of the slot off the bypass's held steps, uncounted (neither bypassed nor turned away). */
+    s.bi_beg = s.bi_end = 0;
+    s.bi_ckpt = -1;
+    s.bypass_no = false;
+    s.bypass_run = false;
     s.req->state = ReqState::Waiting;
 
     /* The step path appends to `output`, so its capacity is settled here, on the arrival thread.

@@ -9812,6 +9812,80 @@ TEST(dst_bypass_total_on_the_ds_geometry) {
     }
 }
 
+namespace {
+int64_t dst_json_num(const std::string& g, size_t from, const char* key) {
+    if (from == std::string::npos) return -1;
+    const std::string k = std::string("\"") + key + "\": ";
+    const size_t at = g.find(k, from);
+    return at == std::string::npos ? -1 : std::atoll(g.c_str() + at + k.size());
+}
+}  // namespace
+
+/* A recycled slot starts with the bypass's per-request state cleared (ds41-noa: Scheduler::add_locked): a 3000-token request the
+ * bypass turned away (sched_short_bypass 1280, one-piece only) finishes and is reaped; the 1000-token request that takes
+ * its slot is bypassed on the next held step (before the fix its stale bypass_no kept it off every held step, counted
+ * neither bypassed nor turned away). */
+TEST(dst_a_recycled_slot_starts_with_clean_bypass_state) {
+    DstSwitches restore;
+    Fixture f;
+    dst_fixture(f, 8);
+    CHECK(DstSwitches::set("sched_bi_chunk", 0));   /* today's cuts: the turned-away request runs as an ordinary prefill */
+    CHECK(DstSwitches::set("sched_short_bypass", 1280));
+    f.submit(100, 4000);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(60000 - 200, 2);
+    REQUIRE(p != 0);
+    uint64_t x = 0;
+    int slot_x = -1;
+    auto slot_of = [&](uint64_t id) {
+        std::vector<Scheduler::ReqStat> st(16);
+        const int n = f.sch.requests(st.data(), 16);
+        for (int j = 0; j < n; ++j) if (st[(size_t)j].id == id) return st[(size_t)j].slot;
+        return -1;
+    };
+    bool chunk = false;
+    for (int s = 0; s < 400; ++s) {
+        REQUIRE(f.sch.step() != nullptr);
+        chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) chunk = chunk || (e.seq == p && e.is_prefill);
+        f.commit_plain(12);
+        if (!x && chunk) { x = f.submit(3000, 2); slot_x = slot_of(x); }   /* turned away on the held steps */
+        if (x && f.sch.find(x) && f.sch.find(x)->state == ReqState::Finished) break;
+    }
+    REQUIRE(x != 0 && slot_x >= 0);
+    REQUIRE(f.sch.find(x) && f.sch.find(x)->state == ReqState::Finished);
+    CHECK_OK(f.sch.reap(x));
+    f.sch.step_finished();
+    std::string g = fn4::state_json();
+    const int64_t by0 = dst_json_num(g, g.find("\"dst\": {"), "bypassed");
+    CHECK(dst_json_num(g, g.find("\"dst\": {"), "bypass_refused") >= 1);
+    /* the next chunk step of p, then Y arrives during the hold */
+    for (int s = 0; s < 40; ++s) {
+        REQUIRE(f.sch.step() != nullptr);
+        chunk = false;
+        for (const StepEntry& e : f.sch.plan().e) chunk = chunk || (e.seq == p && e.is_prefill);
+        f.commit_plain(12);
+        if (chunk) break;
+    }
+    REQUIRE(chunk);
+    const uint64_t y = f.submit(1000, 2);
+    REQUIRE(y != 0);
+    CHECK_EQ(slot_of(y), slot_x);                                  /* the reuse this case is about */
+    REQUIRE(f.sch.step() != nullptr);
+    bool y_in = false, p_in = false;
+    for (const StepEntry& e : f.sch.plan().e) {
+        y_in = y_in || (e.seq == y && e.is_prefill && e.ctx_len == 0 && e.n_tokens == 1000);
+        p_in = p_in || (e.seq == p && e.is_prefill);
+    }
+    CHECK(y_in);                                                   /* bypassed on the held step */
+    CHECK(!p_in);
+    f.commit_plain(12);
+    f.sch.step_finished();
+    g = fn4::state_json();
+    CHECK_EQ(dst_json_num(g, g.find("\"dst\": {"), "bypassed"), by0 + 1);
+}
+
 /* ================================================== lever PSK design 2 on every admission path (ds41-int7-pskglue)
  * The DS41 line's geometry (total_run's `ds`: exact resume, interval 2048, span 2, span floor 16384, MNBT 4160): targets
  * q_i = 2048 + (i - 1) x 4096 (alone's span ends), the tail snapshot, the end, checkpoint_at. A run: four decoders, a long
