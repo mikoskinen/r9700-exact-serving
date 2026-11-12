@@ -10,7 +10,8 @@
  *          mixed-workgroup path) with padded rows. Mutation: the 8-step chain reversed must differ.
  *   IX-NI  under ix_ni 1 against 0: index_score's every row below its reach (WMMA, WMMA with keep, the scalar decode form
  *          with and without keep, padded rows), nothing written past it, index_topk's selection and index_candidates' keep
- *          words over the two planes. Mutations: the last live entry unwritten; candidates reading the full width.
+ *          over the two planes (index_candidates: the card only, r4d_selftest --case ix_ni -- its partial-wave ballot does
+ *          not run here). Mutation: the last live entry unwritten.
  *
  *   r4d_emu_ds41i9b [quick] */
 #include "rad_abi.h"
@@ -42,10 +43,11 @@ void r4d_ix_ni_set(int v);
 namespace {
 
 int g_cases = 0, g_fail = 0;
-void check(bool ok, const std::string& what, const std::string& detail = "") {
+void check(bool ok, const std::string& what, const std::string& detail = "", bool detail_always = true) {
     ++g_cases;
     if (!ok) ++g_fail;
-    std::printf("%s %s%s%s\n", ok ? "ok  " : "FAIL", what.c_str(), detail.empty() ? "" : " -- ", detail.c_str());
+    const bool d = !detail.empty() && (detail_always || !ok);
+    std::printf("%s %s%s%s\n", ok ? "ok  " : "FAIL", what.c_str(), d ? " -- " : "", d ? detail.c_str() : "");
     std::fflush(stdout);
 }
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
@@ -205,8 +207,8 @@ void m1(int64_t M, bool mutations) {
     fused(X);
     const long long m2 = ndiff(R.y, X.y);
     r4d_i9b_mutate(0);
-    check(m1 > 0, fmt("M1 mutation 1 (K1's slabs reversed) caught, M=%lld", (long long)M), "no difference");
-    check(m2 > 0, fmt("M1 mutation 2 (K2's virtual-thread count) caught, M=%lld", (long long)M), "no difference");
+    check(m1 > 0, fmt("M1 mutation 1 (K1's slabs reversed) caught, M=%lld", (long long)M), "no difference", false);
+    check(m2 > 0, fmt("M1 mutation 2 (K2's virtual-thread count) caught, M=%lld", (long long)M), "no difference", false);
 }
 
 /* ============================================================== IX */
@@ -251,11 +253,12 @@ struct Ix {
         for (int64_t e = 0; e < nblk; ++e) {
             uint8_t* p = &kb[(size_t)(e * kKeyB)];
             for (int i = 0; i < 64; ++i) p[i] = (uint8_t)rnd();
-            for (int i = 0; i < 4; ++i) p[64 + i] = (uint8_t)(122 + rnd() % 9);
+            for (int i = 0; i < 4; ++i) p[64 + i] = (uint8_t)(110 + rnd() % 31);
         }
-        static const float g[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+        /* full bf16 mantissas over a few binades and keys over 30 binades: dots that round in f32, so a reordered chain
+         * shows (the fp4 grid's q would sum exactly in any order) */
         q.resize((size_t)(T * kH * kD));
-        for (auto& x : q) x = bf((rnd() & 8 ? -1.0f : 1.0f) * g[rnd() & 7] * std::ldexp(1.0f, (int)(rnd() % 5) - 4));
+        for (auto& x : q) x = bf((float)(gauss() * std::ldexp(1.0, (int)(rnd() % 7) - 3)));
         w.resize((size_t)(T * kH));
         for (auto& x : w) x = bf((float)(gauss() * 0.5));
     }
@@ -298,7 +301,7 @@ void lds(const char* what, int64_t ratio, const std::vector<Seq>& sq, int64_t R,
         r4d_i9b_mutate(3);
         c.score(s2, nullptr, 0, 0);
         r4d_i9b_mutate(0);
-        check(ndiff(s0, s2) > 0, fmt("IX-LDS mutation 3 (the chain reversed) caught, %s", what), "no difference");
+        check(ndiff(s0, s2) > 0, fmt("IX-LDS mutation 3 (the chain reversed) caught, %s", what), "no difference", false);
     }
     r4d_ix_lds_set(0);
 }
@@ -359,8 +362,12 @@ void ni(const char* what, int64_t ratio, const std::vector<Seq>& sq, int64_t R, 
         RadArgs a = args(t, p);
         return r4d_rad_ds41_index_candidates(&a, nullptr);
     };
+    /* index_candidates does not run on the emulator: ds_emit's ballot runs on a partial wave past the last block, which the
+     * emulator takes for a wave barrier not reached (ds41idx holds a host port of it for the same reason). The card runs it
+     * (r4d_selftest --case ix_ni: its keep words over the ix_ni plane and mutation 5). */
     std::vector<int32_t> k0, k1;
-    if (cand) {
+    constexpr bool kCandOnEmu = false;
+    if (cand && kCandOnEmu) {
         r4d_ix_ni_set(0);
         const int c0 = cand_on(s0, k0);
         r4d_ix_ni_set(1);
@@ -377,14 +384,7 @@ void ni(const char* what, int64_t ratio, const std::vector<Seq>& sq, int64_t R, 
         for (int64_t m = 0; m < c.R; ++m)
             for (int64_t j = 0; j < std::min(c.reach(m), c.C); ++j)
                 ld += std::memcmp(&s0[(size_t)(m * c.C + j)], &s2[(size_t)(m * c.C + j)], 4) != 0;
-        check(ld > 0, fmt("IX-NI mutation 4 (the last live entry unwritten) caught, %s", what), "no difference");
-        std::vector<int32_t> k5;
-        r4d_i9b_mutate(5);
-        cand_on(s1, k5);
-        r4d_i9b_mutate(0);
-        r4d_ix_ni_set(0);
-        cand_on(s0, k0);
-        check(ndiff(k0, k5) > 0, fmt("IX-NI mutation 5 (candidates reading the full width) caught, %s", what), "no difference");
+        check(ld > 0, fmt("IX-NI mutation 4 (the last live entry unwritten) caught, %s", what), "no difference", false);
     }
     r4d_ix_ni_set(0);
 }

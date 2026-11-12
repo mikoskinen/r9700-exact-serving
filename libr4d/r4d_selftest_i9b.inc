@@ -255,13 +255,13 @@ struct IxCase {
         for (int64_t e = 0; e < nblk; ++e) {
             uint8_t* p = &kb[(size_t)(e * kKeyB)];
             for (int i = 0; i < 64; ++i) p[i] = (uint8_t)rnd();
-            for (int i = 0; i < 4; ++i) p[64 + i] = (uint8_t)(122 + rnd() % 9);
+            for (int i = 0; i < 4; ++i) p[64 + i] = (uint8_t)(110 + rnd() % 31);   /* 2^-17 .. 2^13: sums that round */
         }
         std::vector<uint16_t> qv((size_t)(T * kH * kD)), wv((size_t)(T * kH));
-        for (auto& x : qv) {   /* e2m1-like values times a 32-block scale (the fp4 round trip's grid) */
-            static const float g[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
-            x = bf((rnd() & 8 ? -1.0f : 1.0f) * g[rnd() & 7] * std::ldexp(1.0f, (int)(rnd() % 5) - 4));
-        }
+        /* q: full bf16 mantissas over a few binades (stress, as kbench2's: the engine's q is the fp4 round trip's grid, whose
+         * dots against MXFP4 keys are nearly always exact in f32 whatever the order -- data on which a reordered dot would
+         * pass; these round, so the mutation control below must see a reordered chain) */
+        for (auto& x : qv) x = bf((float)(gauss() * std::ldexp(1.0, (int)(rnd() % 7) - 3)));
         for (auto& x : wv) x = bf((float)(gauss() * 0.5));
         q = up(qv);
         w = up(wv);
