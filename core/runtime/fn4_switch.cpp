@@ -20,7 +20,7 @@ namespace {
 const char* const kNames[kSwitches] = { "no_route", "gather_inv", "hc_fusedown", "hc_normwave",
                                          "draft_adaptive", "hc_writevec", "hc_readv", "ar_lanethreads",
                                          "hc_upmix", "ar_laneblocks", "aql_acq", "exl3_pfprep", "exl3_mapshare", "exl3_gd",
-                                         "moe_pair", "exl3_dz", "exl3_bi", "exl3_dual", "hc_bi", "bi_seg", "att_bi", "arw_rows", "sched_bi_chunk", "hc_spprobe", "hc_sp" };
+                                         "moe_pair", "exl3_dz", "exl3_bi", "exl3_dual", "hc_bi", "bi_seg", "att_bi", "arw_rows", "sched_bi_chunk", "hc_spprobe", "hc_sp", "mtp_flat" };
 const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_GATHER_INV",
                                          "RADIANCE_FN4_HC_FUSEDOWN", "RADIANCE_FN4_HC_NORMWAVE",
                                          nullptr, "RADIANCE_FN4_HC_WRITEVEC", "RADIANCE_FN4_HC_READV",
@@ -28,7 +28,7 @@ const char* const kEnv[kSwitches]   = { "RADIANCE_FN4_NO_ROUTE", "RADIANCE_FN4_G
                                          "RADIANCE_FN4_AR_LANE_BLOCKS", nullptr, nullptr,
                                          "RADIANCE_FN4_X3MAP", "RADIANCE_FN4_X3GD",
                                          "RADIANCE_FN4_MOE_PAIR", "RADIANCE_FN4_X3DZ",
-                                         "RADIANCE_FN4_X3BI", "RADIANCE_FN4_X3DUAL", "RADIANCE_FN4_HC_BI", "RADIANCE_FN4_BI_SEG", "RADIANCE_FN4_ATT_BI", "RADIANCE_FN4_ARW_ROWS", "RADIANCE_SCHED_BI_CHUNK", "RADIANCE_FN4_SPPROBE", "RADIANCE_FN4_HC_SP" };   /* the arch reads these itself */
+                                         "RADIANCE_FN4_X3BI", "RADIANCE_FN4_X3DUAL", "RADIANCE_FN4_HC_BI", "RADIANCE_FN4_BI_SEG", "RADIANCE_FN4_ATT_BI", "RADIANCE_FN4_ARW_ROWS", "RADIANCE_SCHED_BI_CHUNK", "RADIANCE_FN4_SPPROBE", "RADIANCE_FN4_HC_SP", "RADIANCE_FN4_MTP_FLAT" };   /* the arch reads these itself */
 
 /* the value a switch starts with: unset / empty / 0 -> 0, a number > 1 as given (hc_fusedown's form,
  * hc_normwave's row floor), anything else 1 -- as the plugins read the same variables */
@@ -171,7 +171,7 @@ bool apply_pending(int step, int* draft_adaptive) {
         int handled = 1;
         if (i == kGatherInv || i == kHcFuseDown || i == kHcNormWave || i == kHcWriteVec ||
             i == kHcReadV || i == kArLaneThreads || i == kHcUpMix || i == kArLaneBlocks || i == kExl3PfPrep ||
-            i == kExl3MapShare || i == kExl3Gd || i == kMoePair || i == kExl3Dz || i == kExl3Bi || i == kExl3Dual || i == kHcBi || i == kBiSeg || i == kAttBi || i == kArwRows || i == kHcSpProbe || i == kHcSp) {
+            i == kExl3MapShare || i == kExl3Gd || i == kMoePair || i == kExl3Dz || i == kExl3Bi || i == kExl3Dual || i == kHcBi || i == kBiSeg || i == kAttBi || i == kArwRows || i == kHcSpProbe || i == kHcSp || i == kMtpFlat) {
             find_hooks(s);
             handled = 0;
             bool refused = false;
