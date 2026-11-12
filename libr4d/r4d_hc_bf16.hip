@@ -57,6 +57,8 @@
 #include <hip/hip_runtime.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <type_traits>
 #include <cstdlib>
 #include <cstring>
@@ -4169,6 +4171,56 @@ static int hc_bi() {
     }
     return v;
 }
+/* fn4 engagement counter (RADIANCE_FN4_FORMCTR=1 at start, 13.11.2026; measurement only, no byte or launch changes):
+ * the form each hc_read call took, a device, counted where the launcher issues it -- a recorded pass counts once, at
+ * its recording (its plays do not call the launcher; the tape's issue check keeps them the same launches), a
+ * profiled run issues every step live. Cumulative lines "fn4 formctr dev D readv V hc_bi B: FORM calls/rows-mean/max
+ * [bd N] ..." to stderr at most every 10 s at an issue, and before any fn4 switch lands (rad_fn4_switch). */
+enum { kFcPf2, kFcTiled, kFcFused, kFcS, kFcG16q, kFcG16pp, kFcG16p, kFcG16, kFcG, kFcRowA, kFcA2, kFcApre, kFcA, kFcN };
+static const char* const kFcName[kFcN] = {"pf2", "tiled", "fused", "S", "G16q", "G16pp", "G16p", "G16", "G", "rowA",
+                                          "A2", "Apre", "A"};
+static std::atomic<unsigned long long> g_fc_calls[16][kFcN], g_fc_rows[16][kFcN], g_fc_bd[16][kFcN];
+static std::atomic<long> g_fc_max[16][kFcN];
+static std::atomic<long long> g_fc_last{0};
+static std::mutex g_fc_m;
+static bool fc_on() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_FORMCTR"); return e && *e && *e != '0'; }();
+    return on;
+}
+static void fc_dump() {
+    std::lock_guard<std::mutex> lk(g_fc_m);
+    for (int d = 0; d < 16; ++d) {
+        char line[1024];
+        int o = std::snprintf(line, sizeof line, "fn4 formctr dev %d readv %d hc_bi %d:", d, hc_readv(), hc_bi());
+        bool any = false;
+        for (int f = 0; f < kFcN && o < (int)sizeof line - 64; ++f) {
+            const unsigned long long c = g_fc_calls[d][f].load(std::memory_order_relaxed);
+            if (!c) continue;
+            any = true;
+            o += std::snprintf(line + o, sizeof line - o, " %s %llu/%.1f/%ld bd %llu;", kFcName[f], c,
+                               (double)g_fc_rows[d][f].load(std::memory_order_relaxed) / (double)c,
+                               g_fc_max[d][f].load(std::memory_order_relaxed),
+                               g_fc_bd[d][f].load(std::memory_order_relaxed));
+        }
+        if (any) std::fprintf(stderr, "%s\n", line);
+    }
+    std::fflush(stderr);
+}
+static void fc_add(int f, long rows, bool bd) {
+    if (!fc_on()) return;
+    int d = 0;
+    if (hipGetDevice(&d) != hipSuccess || d < 0 || d >= 16) d = 15;
+    g_fc_calls[d][f].fetch_add(1, std::memory_order_relaxed);
+    g_fc_rows[d][f].fetch_add((unsigned long long)rows, std::memory_order_relaxed);
+    if (bd) g_fc_bd[d][f].fetch_add(1, std::memory_order_relaxed);
+    long m = g_fc_max[d][f].load(std::memory_order_relaxed);
+    while (rows > m && !g_fc_max[d][f].compare_exchange_weak(m, rows, std::memory_order_relaxed)) {}
+    const long long now = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long last = g_fc_last.load(std::memory_order_relaxed);
+    if (now - last < 10000 || !g_fc_last.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    fc_dump();
+}
 /* Test hook (measurement only, r4d_hc_pf2_stages): which of PF2's launches run -- 1 the prologue,
  * 2 the down product, 4 the split-K reduce, 8 the up-mix, 16 the codes. A mask other than 31
  * leaves the outputs incomplete; r4d_selftest --perfhcv times the cumulative masks. */
@@ -7349,6 +7401,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         if (pf2) {
             if (!pf2_shape) return R4D_NO(RAD_E_SHAPE);
             if (ubytes < pf2_plane_bytes(HN, lr, ntt, f8)) return R4D_NO(RAD_E_SCRATCH);
+            fc_add(kFcPf2, (long)rows, bidec);
             const int prc = hc_pf2_launch(
                 f8, i8, (const unsigned short*)h->data, (const float*)w->data, down->data,
                 (long)dld, up->data, (long)uld, fold ? (const unsigned short*)injw->data : nullptr,
@@ -7361,6 +7414,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                 (hc_readv() & 128) != 0 && kcr > rows);
             return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
         }
+        fc_add(kFcTiled, (long)rows, bidec);
 
         /* The per-s norm scales: one workgroup per (row, s). fn4 F1n (off by default): one wave per
          * (row, s) through hc_pf2_prep_kernel's scale blocks alone -- a grid of exactly nnb blocks,
@@ -7493,6 +7547,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                               && lds + kHcReadAStaticLds + 8 * kUpRows * 4 * 2 + 256 <= 65536)
                                  ? hc_mix_ctr(s) : nullptr;
         if (fctr) {
+            fc_add(kFcFused, (long)rows, bidec);
             const unsigned gxa = (unsigned)((lr + ta - 1) / ta) + 1u;
             const unsigned na  = gxa * (unsigned)rows;
             const unsigned gxb = (unsigned)(n / ipf);
@@ -7549,12 +7604,14 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,  \
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd, \
                            (int)hcg_nt, (long)rows)
+        fc_add(kFcS, (long)rows, bidec);
         HC_S_K(1);
 #undef HC_S_K
     } else if (bidec && !bidec_r && !(g_hc_pf2_stages.load(std::memory_order_relaxed) & 2)) {
         /* fn4 test hook (r4d_hc_pf2_stages, timing only): under bi_dec, mask bit 1 off skips kernel A' (G / G16 / G16p) */
     } else if (hcg && g16 && (hc_readv() & 1024) != 0 && (hcg_nt % 4) == 0 && !hcg_ch && rows >= 32) {
         /* fn4 hc_readv bit 10: G16 with FOUR tiles a block (the inject tile alone), unchained */
+        fc_add(kFcG16q, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, &hc_read_g16q_down_kernel<16>,
                            dim3((unsigned)((hcg_nt / 4 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
@@ -7564,6 +7621,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (int)hcg_nt, (long)rows);
     } else if (hcg && g16 && (hc_readv() & 768) == 768 && (hcg_nt % 2) == 0 && !hcg_ch) {
         /* fn4 hc_readv bit 9 (with 8): the norm scales once a (stream, group), then G16p reading them */
+        fc_add(kFcG16pp, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, &hc_g_scale_kernel, dim3((unsigned)hc, (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, scale, (long)hrow, eps, (long)rows);
         if (emit_rc == RAD_OK)
@@ -7577,6 +7635,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     } else if (hcg && g16 && (hc_readv() & 256) != 0 && (hcg_nt % 2) == 0 && rows >= 32) {
         /* fn4 hc_readv bit 8: G16 with two tiles a block (and the inject tile alone), from 32 rows (x19 / x21 one card:
          * 16 rows +4 % slower, 32 -6 %, 64 -7 %) */
+        fc_add(kFcG16p, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16> : &hc_read_g16p_down_kernel<16>),
                            dim3((unsigned)((hcg_nt / 2 + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
@@ -7585,6 +7644,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd,
                            (int)hcg_nt, (long)rows);
     } else if (hcg && g16) {
+        fc_add(kFcG16, (long)rows, bidec);
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16_down<16> : &hc_read_g16_down_kernel<16>),
                            dim3((unsigned)((hcg_nt + 1) * hc), (unsigned)hcg_gy), dim3(kThreads), 0,
                            (const unsigned short*)h->data, (const float*)w->data,
@@ -7602,6 +7662,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (const unsigned short*)injw->data, dbuf, (unsigned short*)inj->data,  \
                            scale, hcg_part, hcg_ctr, (long)lr, (long)hrow, (long)irow, eps, wadd, \
                            (int)hcg_nt, (long)rows)
+        fc_add(kFcG, (long)rows, bidec);
         switch (hcg_rg) {
             case 8:  HC_G_K(8); break;
             case 7:  HC_G_K(7); break;
@@ -7613,10 +7674,16 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
             default: HC_G_K(1); break;
         }
 #undef HC_G_K
-    } else if (g_hc_decode_form == 1)
+    } else if (g_hc_decode_form == 1) {
+        fc_add(bidec_r ? kFcRowA : kFcA2, (long)rows, bidec);
         emit_rc = f8 ? HC_READ_A(hc_read_a_2grid_kernel<true>) : HC_READ_A(hc_read_a_2grid_kernel<false>);
-    else if (pre) emit_rc = HC_READ_A((hc_read_a_kernel<true, 4, 10>));
-    else          emit_rc = f8 ? HC_READ_A(hc_read_a_kernel<true>) : HC_READ_A(hc_read_a_kernel<false>);
+    } else if (pre) {
+        fc_add(bidec_r ? kFcRowA : kFcApre, (long)rows, bidec);
+        emit_rc = HC_READ_A((hc_read_a_kernel<true, 4, 10>));
+    } else {
+        fc_add(bidec_r ? kFcRowA : kFcA, (long)rows, bidec);
+        emit_rc = f8 ? HC_READ_A(hc_read_a_kernel<true>) : HC_READ_A(hc_read_a_kernel<false>);
+    }
 #undef HC_READ_A
     if (emit_rc != RAD_OK) return R4D_NO(RAD_E_DEVICE);
     if (hipGetLastError() != hipSuccess) return R4D_NO(RAD_E_DEVICE);
@@ -7725,6 +7792,7 @@ extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (
  * all-reduce lane's thread count (ar_lanethreads, r4d_ar_entry.hip). 1 = applied, 0 = not a libr4d switch. */
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!name) return 0;
+    if (fc_on()) fc_dump();   /* fn4 engagement counter: the counts up to this switch */
     if (!std::strcmp(name, "hc_fusedown")) { g_hc_fuse_down.store(value < 0 ? 0 : (value > 2 ? 2 : value), std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
