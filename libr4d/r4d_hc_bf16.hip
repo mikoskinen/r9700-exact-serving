@@ -7790,6 +7790,7 @@ extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
  * parked): hc_read's two forms, hc_write's eight-wide form, hc_read's faster forms (hc_readv) and the
  * all-reduce lane's thread count (ar_lanethreads, r4d_ar_entry.hip). 1 = applied, 0 = not a libr4d switch. */
+extern "C" int r4d_ar_sdma_set(int on);   /* fn4 SDMA-AR (r4d_ar_entry.hip) */
 extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!name) return 0;
     if (fc_on()) fc_dump();   /* fn4 engagement counter: the counts up to this switch */
@@ -7809,6 +7810,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     }
     if (!std::strcmp(name, "ar_lanethreads")) return r4d_ar_lane_threads_set(value);
     if (!std::strcmp(name, "ar_xpush")) return r4d_ar_xpush_set(value);   /* fn4 RSF */
+    if (!std::strcmp(name, "ar_sdma")) return r4d_ar_sdma_set(value);   /* fn4 SDMA-AR */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
     if (!std::strcmp(name, "hc_upmix")) {
         if (value < 0 || value > 15 || (value & 7) > 5) return -1;

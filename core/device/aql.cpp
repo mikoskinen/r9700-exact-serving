@@ -4357,6 +4357,19 @@ hipError_t hipPeekAtLastError(void) {
     return real().peek ? real().peek() : hipSuccess;
 }
 
+
+/* fn4 SDMA-AR (12.11.2026): for a kernel plugin whose launches a tape cannot replay (libr4d's copy-engine collectives
+ * write SDMA packets from the host at launch). rad_tape_capturing: whether this thread's submissions are being recorded
+ * now. rad_tape_refuse: marks the open tape unplayable with `why` -- the pass, which runs live as it records, then keeps
+ * no tape and its key is issued in full every step (Ctx::record_pass) -- and returns whether one was open. The engine
+ * binary exports them (ENABLE_EXPORTS); a plugin finds them with dlsym(RTLD_DEFAULT). */
+int rad_tape_capturing(void) { return rad::aql::capturing() ? 1 : 0; }
+int rad_tape_refuse(const char* why) {
+    if (!rad::aql::capturing()) return 0;
+    if (rad::aql::t_tape->bad.empty()) rad::aql::t_tape->bad = why && *why ? why : "a kernel plugin refused the tape";
+    return 1;
+}
+
 }  // extern "C"
 
 #else
