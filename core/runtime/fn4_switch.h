@@ -134,7 +134,9 @@
  *                   is the same fold, so the bytes are the same at any value; a value past the declared bound is
  *                   refused. -1 when no loaded object serves it.
  *   ds41_shexp_lane deepseek41 (lever F4): 1 the shared expert on the second lane at decode / verify steps, 0 one
- *                   lane (RADIANCE_DS41_SHEXP_LANE at start); 1 is refused where no layer's arm is lane-safe.
+ *                   lane (RADIANCE_DS41_SHEXP_LANE at start); 1 is refused where no layer's arm is lane-safe. Lever F4G
+ *                   (ds41-int12-f4g): N in 2 .. 64 the same only at a step of at least N rows (below it the one-lane
+ *                   issue). Exact at every value: placement only, the same ops on the same operands.
  *   ds41_kvfold     deepseek41 (lever K1 fold c): 1 the window key's rmsnorm_rope_roundtrip_kv_store (norm, rope,
  *                   round trip and the cache store in one launch), 0 rmsnorm_rope_roundtrip + kv_store as before.
  *                   RADIANCE_DS41_KVFOLD=1 declares the fold beside the pair (and starts at 1); unset declares

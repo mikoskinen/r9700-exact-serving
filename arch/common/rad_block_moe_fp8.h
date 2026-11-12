@@ -448,7 +448,8 @@ struct MoeFP8 {
     const std::atomic<int>* gar_live = nullptr;
     /* Optional, set by the architecture: the shared arm on the second lane (rad_lane 1) beside the
      * routed arm at a decode or verify step of one pass (T <= kMoeShexpLaneRows), joined back before
-     * the gather; read at every pass, > 0 = on. The two arms share nothing but their read of the
+     * the gather; read at every pass, > 0 = on at steps of at least that many rows (1: every decode / verify step;
+     * lever F4G). The two arms share nothing but their read of the
      * normed input until the gather (the arm's buffers are rad_buf_concurrent, see declare), and the
      * gather combines them exactly as before, so the bytes are the same. Taken only where declare
      * found the arm lane-safe (`shexp_lane_ok`: every op of the arm reads the bf16 input or its own
@@ -2224,9 +2225,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool rfused = op_router_fused && rows <= router_fused_rows;
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
     const bool gate_done = (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate);
-    /* The shared arm on the second lane (shexp_lane): a decode or verify step of one pass. */
-    const bool want_lane1 = shared && shexp_lane_ok && shexp_lane &&
-                            shexp_lane->load(std::memory_order_relaxed) > 0 && r0 == 0 && rows == T &&
+    /* The shared arm on the second lane (shexp_lane): a decode or verify step of one pass. The switch's value is
+     * the fewest rows it applies at (lever F4G, ds41-int12-f4g): 1 every such step (F4 as built), N >= 2 only a step of
+     * at least N rows; below that the one-lane issue. Placement only: the same ops on the same operands. */
+    const int sx_lo = shexp_lane ? shexp_lane->load(std::memory_order_relaxed) : 0;
+    const bool want_lane1 = shared && shexp_lane_ok && sx_lo > 0 && r0 == 0 && rows == T && T >= (int64_t)sx_lo &&
                             T <= kMoeShexpLaneRows;
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);

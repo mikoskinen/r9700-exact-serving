@@ -1572,8 +1572,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (const int r = idx_fn4_accepts(name, value)) return r;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_shexp_lane"))
-        return value == 0 || (value == 1 && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_shexp_lane"))   /* lever F4 (1); lever F4G (2 .. 64: only steps of >= N rows) */
+        return value == 0 || (value >= 1 && value <= 64 && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (const K1Switch* k = k1_switch(name))
         return value == 0 || (value >= 1 && value <= k->max && k->ok->load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_walk"))
