@@ -295,7 +295,8 @@ static std::atomic<int>& fn4_dual_flag() {
 static std::atomic<int> g_dual_declared{0};
 /* fn4 BI: switch hc_bi's value (RADIANCE_FN4_HC_BI starts it; libr4d takes the same switch for its forms). */
 static std::atomic<int>& fn4_hcbi_flag() {
-    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_HC_BI") ? 1 : 0};
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_HC_BI");
+                                   const int v = e && *e ? std::atoi(e) : 0; return v == 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 BI: the step's read segments (Model::bi_cut) when hc_bi is on. */
@@ -2321,7 +2322,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "hc_bi") == 0) {   /* fn4 BI: the reads cut at the step's segments (libr4d takes it too) */
-        if (value < 0 || value > 1) return -1;
+        if (value < 0 || value > 2) return -1;
         qwen4exp_fp8::fn4_hcbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }

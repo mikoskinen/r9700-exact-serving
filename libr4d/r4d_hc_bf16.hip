@@ -3627,7 +3627,7 @@ static int hc_bi() {
     int v = g_hc_bi.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_BI");
-        const int on = (e && *e) ? (std::atoi(e) > 0 ? 1 : 0) : 0;
+        const int on = (e && *e) ? (std::atoi(e) == 2 ? 2 : std::atoi(e) > 0 ? 1 : 0) : 0;
         int want = -1;
         g_hc_bi.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_bi.load(std::memory_order_relaxed);
@@ -6658,8 +6658,12 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
      * workgroups on 64 CUs. Narrowing costs one extra pass over `h` per workgroup (20 KiB against
      * up to 1.3 MiB of weight). It only narrows; rows past kDecMinRows take the tiled path, so
      * `rows` here is a one-to-seven-row speculative window. */
-    /* fn4 BI (hc_bi): rows up to kHcBiRows through one family (above) */
-    const bool bi = hc_bi() > 0 && rows <= kHcBiRows;
+    /* fn4 BI (hc_bi): 1 = rows up to kHcBiRows through one family (above); 2 = the reference-keeping form -- rows up to
+     * kHcBiRows through the per-row kernels the 1..7-row reads take today (bf16 mixing; E4M3's decode forms G / S are
+     * not covered and keep today's), so a decode row's bytes are today's alone bytes at every height. */
+    const int  bim = hc_bi();
+    const bool bi  = bim == 1 && rows <= kHcBiRows;
+    const bool bi2 = bim == 2 && !f8 && rows <= kHcBiRows;
     const bool can_tile = (n % kTKT) == 0 && (HN % 8) == 0 && (lr % 8) == 0 && (hrow % 8) == 0
                           && (((uintptr_t)h->data & 15u) == 0u)
                           && (((uintptr_t)down->data & 15u) == 0u)
@@ -6698,7 +6702,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     /* Kernel B3 for forms G and S at lr 320, a single row group; else the chained up-mix. */
     const bool hcw = hcg && lr == 320 && rows <= 16 && (rows <= 8 || hcs) && (n % 128) == 0
                      && (hrow % 2) == 0 && (xrow % 2) == 0;
-    const bool tiled  = can_tile && (rows >= kDecMinRows || bi) && !hcg;
+    const bool tiled  = can_tile && ((rows >= kDecMinRows && !bi2) || bi) && !hcg;
     /* fn4 hc_readv bit 3 (W1b): the norm scales the preceding hc_write stored in `ss` (hc_ss_operand, the rule the
      * write applied), on the unchained tiled forms; there they replace this read's pass and `scale` points at them. */
     const bool chained_tiles = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* chain_arg's rule below */
@@ -7079,8 +7083,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (!std::strcmp(name, "hc_bi")) {   /* fn4 BI: hc_read's one family up to kHcBiRows rows */
-        if (value < 0 || value > 1) return -1;
+    if (!std::strcmp(name, "hc_bi")) {   /* fn4 BI: hc_read's one family (1) / the per-row forms (2) up to kHcBiRows */
+        if (value < 0 || value > 2) return -1;
         g_hc_bi.store(value, std::memory_order_relaxed);
         return 1;
     }
