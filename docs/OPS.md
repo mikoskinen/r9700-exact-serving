@@ -819,6 +819,7 @@ may not have arrived.
 | `gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` | `a`, `w`w → `y` |
 | `rmsnorm_gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` `eps`:f64 `wadd`:f64/opt `mult`:f64/opt | `x`, `w`w, `g`w → `h`, `y` (device-only: rmsnorm (x, g → h; n = K), then gemm_nt_ggml (h, w → y)) |
 | `swiglu_clamped_gemm_nt_ggml` | `M`(range) `N` `K` `type` `dtype` `limit`:f64 | `gate_up`, `w`w → `h`, `y` (device-only: swiglu_clamped (gate_up [M, 2K] → h; n = K), then gemm_nt_ggml (h, w → y)) |
+| `gemm_nt_ggml_pair` | `M`(range) `N` `N2` `K` `type` `dtype` | `a`, `w`w, `a2`?, `w2`w → `y`, `y2` (device-only: gemm_nt_ggml (a, w → y) and gemm_nt_ggml (a2, w2 → y2; N2), a2 absent = a) |
 
 `nt` is A row-major `[M,K]` times B transposed `[N,K]`, giving `[M,N]`: the layout every weight in
 a transformer already has. `gemm_nt_q`'s `dtype` names the operand combination, so one op covers
@@ -1308,6 +1309,14 @@ stores them to `h`. Every other pass (another `gg_gemv` form, prefill heights, a
 launches. The GGUF weight is operand 1, as `gemm_nt_ggml`'s, so both read one stored form. DeepSeek-V4.1 declares
 them beside the pairs under RADIANCE_DS41_QNFOLD / RADIANCE_DS41_SWFOLD (lever K1 folds a and e) and picks per step
 (the ds41_qnfold / ds41_swfold switches).
+
+**`gemm_nt_ggml_pair`** (device-only) is two `gemm_nt_ggml` over the same rows: `y = a . w^T` and `y2 = a2 . w2^T`
+(`a2` absent reads `a`), both weights of one GGUF `type` at one `K`, each stored as `gemm_nt_ggml` stores its weight
+(operands 1 and 3, one stored form for both ops). libr4d serves it in one launch in the decode band (up to 48 rows)
+while lever D2's multi-row form is on (`gg_gemv` 2): one form for the pair, each weight's rows in their own blocks of
+one grid, every output the form's own operations -- the two launches' bytes. Every other pass is the two
+`gemm_nt_ggml` launches. DeepSeek-V4.1 declares it beside a layer's `q_a` + `attn_kv` (one input, the attention norm's
+output) and beside its two `attn_output_a` groups under RADIANCE_DS41_GQ (lever 1U-GQ, the ds41_gq switch's mask).
 
 | op | params | operands |
 |---|---|---|
