@@ -225,6 +225,9 @@ set(R4D_UNITS
   # source compiled -mwavefrontsize64, reached only through its bench pin.
   "r4d_ds41_ggml_mr|"
   "r4d_ds41_ggml_mr64|-mwavefrontsize64"
+  # Lever A4 (ds41-a4): the same kernels in their XP forms (the slab's activation loads one slab ahead), the plain, pair
+  # and fold kernels at the 5-16-row heights; reached only through the gg_gemv_m16 switch's table or the bench's pin.
+  "r4d_ds41_ggml_mr2|"
   # Lever GPF: gemm_nt_ggml / logits_gemm_ggml's prefill WMMA rows in other tile geometries (the stock kernel's
   # arithmetic, the same bits), off unless switched on (gg_pf) or pinned by the bench.
   "r4d_ds41_ggml_pf|"

@@ -4193,8 +4193,12 @@ void r4d_ar_xpush_set(int v);
 bool r4d_mix_wv_known(int v);
 int r4d_mix_wv_get();
 void r4d_mix_wv_set(int v);
+/* Lever A4 (ds41-a4, r4d_ds41_ggml_mr.hip): "gg_gemv_m16" 0 / 1 -- under gg_gemv 2, the decode band's calls of M <= 16
+ * rows take the A4 table's forms (XP slabs, the grid fit, H1R2; RADIANCE_DS41_GG_M16 / _GG_M16_FORMS at load); the
+ * per-output arithmetic is D2's, so the same bytes. */
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
+    if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_arcoded")) return value >= 0 && value <= 1048576 ? 1 : -1;
@@ -4213,6 +4217,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ds41_arcoded")) { r4d_arc_set(value); return 1; }
     if (!std::strcmp(name, "ar_xpush")) { r4d_ar_xpush_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
+    if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_set(value);
@@ -4232,6 +4237,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "ds41_arcoded")) { *applied = r4d_arc_get(); return 1; }
     if (!std::strcmp(name, "ar_xpush")) { *applied = r4d_ar_xpush_get(); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { *applied = r4d_mix_wv_get(); return 1; }
+    if (!std::strcmp(name, "gg_gemv_m16")) { *applied = r4d_gg_mr_m16_get(); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { *applied = r4d_mx_mr_get(); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
     if (!std::strcmp(name, "gg_pf")) { *applied = r4d_gg_pf_get(); return 1; }

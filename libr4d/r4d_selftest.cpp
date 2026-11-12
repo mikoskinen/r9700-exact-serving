@@ -21813,6 +21813,8 @@ struct MrHooks {
     void (*pin_w64)(int) = nullptr;
     const char* (*last)() = nullptr;
     void (*gpin)(int, int) = nullptr;   /* r4d_gg_gemv_pin: the stock form's rows a wave / grid cap */
+    void (*pin_xp)(int) = nullptr;      /* lever A4 (ds41-a4): r4d_gg_mr_pin_xp, absent before it */
+    int (*m16_forms)() = nullptr;       /* lever A4: the gg_gemv_m16 table's entries */
 };
 static MrHooks mr_hooks(const Plugin& pl) {
     MrHooks h;
@@ -21820,24 +21822,38 @@ static MrHooks mr_hooks(const Plugin& pl) {
     h.pin_w64 = (void (*)(int))dlsym(pl.h, "r4d_gg_mr_pin_w64");
     h.last = (const char* (*)())dlsym(pl.h, "r4d_gg_mr_last");
     h.gpin = (void (*)(int, int))dlsym(pl.h, "r4d_gg_gemv_pin");
+    h.pin_xp = (void (*)(int))dlsym(pl.h, "r4d_gg_mr_pin_xp");
+    h.m16_forms = (int (*)())dlsym(pl.h, "r4d_gg_mr_m16_forms");
     return h;
 }
 
-/* A form of the multi-row path: (H, R, MT cap, WN, wave64); h 0 = the stock path, -1 = the form's rule. */
-struct MrPin { int h, r, mt, wn, w64; };
+/* A form of the multi-row path: (H, R, MT cap, WN, wave64); h 0 = the stock path, -1 = the form's rule. Lever A4: xp 1 the
+ * XP unit's kernels, 2 D2's kernels through A4's sizing (both: WN 1..8, -1 the grid fit); a pin with xp > 0 is skipped
+ * by a plugin without r4d_gg_mr_pin_xp. */
+struct MrPin { int h, r, mt, wn, w64; int xp; };
 static std::string mr_pin_name(const MrPin& p) {
     if (p.h == 0) return "stock";
     if (p.h < 0) return "mr-rule";
     std::string s = fmt("H%dR%d", p.h, p.r);
     if (p.mt) s += fmt("c%d", p.mt);
-    if (p.wn) s += fmt("w%d", p.wn);
+    if (p.wn > 0) s += fmt("w%d", p.wn);
+    if (p.wn < 0) s += "wfit";
     if (p.w64) s += "-w64";
+    if (p.xp == 1) s += "-xp";
+    if (p.xp == 2) s += "-a4";
     return s;
 }
 static void mr_apply(const MrHooks& h, const MrPin& p) {
     h.pin(p.h, p.r, p.mt, p.wn);
     if (h.pin_w64) h.pin_w64(p.w64);
+    if (h.pin_xp) h.pin_xp(p.xp);
 }
+/* Lever A4's pins (ds41-a4): the XP forms at every (H, R) the XP unit has, the rule's and the grid fit's WN, a split MT,
+ * odd WN; D2's kernels at the grid fit's WN. */
+static const MrPin kA4Pins[] = { { 1, 1, 0, -1, 0, 1 }, { 1, 2, 0, 0, 0, 1 }, { 1, 2, 0, -1, 0, 1 }, { 1, 2, 6, 3, 0, 1 },
+                                 { 2, 1, 0, 0, 0, 1 }, { 2, 1, 0, -1, 0, 1 }, { 2, 2, 0, -1, 0, 1 }, { 2, 2, 8, 5, 0, 1 },
+                                 { 4, 1, 0, -1, 0, 1 }, { 4, 1, 12, 0, 0, 1 }, { 4, 2, 0, 0, 0, 1 }, { 4, 2, 0, -1, 0, 1 },
+                                 { 4, 2, 4, 7, 0, 1 }, { 2, 1, 0, -1, 0, 2 }, { 4, 2, 0, -1, 0, 2 }, { 1, 1, 0, 5, 0, 2 } };
 
 /* Random native blocks with finite scales (normal, a few subnormal, a few near f16's top), the type's layout. */
 static void mr_weights(std::vector<uint8_t>& hw, const MrTy& ty, int64_t N, int64_t K, uint64_t seed) {
@@ -21910,17 +21926,37 @@ static bool mr_setup(MrLaunch& L, const Plugin& pl, const MrShape& sh, const MrT
  * form and the first differing output. Also, as information (MRINFO): whether the stock path gives row m of an
  * M-row call the bytes it gives the row alone, for every m < M <= 48 (whether a speculative verify pass's rows can
  * ever differ from plain decode's). */
-static void ds_mr_check(const Plugin& pl, const char* tlist) {
+/* a4 (--mrcheck16, lever A4, ds41-a4): M = 1..mmax, D2's forms plus kA4Pins (the XP unit's forms, the grid fit) plus
+ * the switch itself (gg_gemv 2 + gg_gemv_m16 1, no pin: the table the plugin loaded, RADIANCE_DS41_GG_M16_FORMS). */
+static void ds_mr_check(const Plugin& pl, const char* tlist, int mmax = 48, bool a4 = false) {
     const MrHooks h = mr_hooks(pl);
     if (!h.pin) { std::printf("--mrcheck: r4d_gg_mr_pin absent (a plugin without lever D2)\n"); return; }
+    auto sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
+    if (a4 && (!h.pin_xp || !sw)) { std::printf("--mrcheck16: r4d_gg_mr_pin_xp / rad_fn4_switch absent (a plugin without lever A4)\n"); ++g_fail; return; }
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
-    const MrPin pins[] = { { 1, 1, 0, 0, 0 }, { 1, 1, 4, 0, 0 }, { 2, 1, 0, 0, 0 }, { 2, 2, 0, 0, 0 }, { 2, 2, 6, 0, 0 }, { 4, 1, 0, 0, 0 },
-                           { 4, 1, 8, 0, 0 }, { 4, 2, 0, 0, 0 }, { 4, 2, 3, 0, 0 }, { 4, 1, 0, 0, 1 }, { 4, 2, 0, 0, 1 },
-                           { 2, 2, 0, 0, 1 }, { 1, 1, 0, 2, 1 }, { -1, 0, 0, 0, 0 } };
+    std::vector<MrPin> pins = { { 1, 1, 0, 0, 0 }, { 1, 1, 4, 0, 0 }, { 2, 1, 0, 0, 0 }, { 2, 2, 0, 0, 0 }, { 2, 2, 6, 0, 0 }, { 4, 1, 0, 0, 0 },
+                                { 4, 1, 8, 0, 0 }, { 4, 2, 0, 0, 0 }, { 4, 2, 3, 0, 0 }, { 4, 1, 0, 0, 1 }, { 4, 2, 0, 0, 1 },
+                                { 2, 2, 0, 0, 1 }, { 1, 1, 0, 2, 1 }, { -1, 0, 0, 0, 0 } };
+    if (a4) {
+        for (const MrPin& p : kA4Pins) pins.push_back(p);
+        pins.push_back({ 0, 0, 0, 0, 0, 16 });   /* the switch: gg_gemv 2 + gg_gemv_m16 1, no pin */
+        std::printf("lever A4: the gg_gemv_m16 table holds %d entries\n", h.m16_forms ? h.m16_forms() : -1);
+    }
+    auto mode_name = [&](const MrPin& p) { return p.xp == 16 ? std::string("gg_gemv_m16") : mr_pin_name(p); };
+    auto apply_mode = [&](const MrPin& p) {
+        if (p.xp == 16) { h.pin(0, 0, 0, 0); if (h.pin_w64) h.pin_w64(0); h.pin_xp(0); sw("gg_gemv", 2); sw("gg_gemv_m16", 1); }
+        else mr_apply(h, p);
+    };
+    auto clear_mode = [&]() {
+        h.pin(0, 0, 0, 0);
+        if (h.pin_w64) h.pin_w64(0);
+        if (h.pin_xp) h.pin_xp(0);
+        if (a4) { sw("gg_gemv_m16", 0); sw("gg_gemv", 0); }
+    };
     long long launches = 0, diffs = 0, diffs64 = 0, info_rows = 0, info_same = 0;
     int planned = 0, done = 0;   /* (type, shape) pairs; a pair that could not run makes the verdict INCOMPLETE */
-    std::printf("lever D2 byte check: the multi-row form vs the stock decode band, M = 1..48, %d forms each\n",
-                (int)(sizeof(pins) / sizeof(pins[0])));
+    std::printf("lever D2%s byte check: the multi-row form vs the stock decode band, M = 1..%d, %d forms each\n",
+                a4 ? " + A4" : "", mmax, (int)pins.size());
     for (const MrTy& ty : kMrTypes) {
         if (!mr_in(want.c_str(), ty.name)) continue;
         for (const MrShape& sh : kMrShapes) {
@@ -21952,7 +21988,7 @@ static void ds_mr_check(const Plugin& pl, const char* tlist) {
             }
             int bad_m = 0, info_m = 0;
             std::string fails;
-            for (int64_t M = 1; M <= 48; ++M) {
+            for (int64_t M = 1; M <= mmax; ++M) {
                 MrLaunch L;
                 mr_setup(L, pl, sh, ty, M);
                 const size_t mb = (size_t)(M * sh.N) * ob;
@@ -21974,32 +22010,32 @@ static void ds_mr_check(const Plugin& pl, const char* tlist) {
                 ++info_rows; info_same += same_alone ? 1 : 0;
                 bool mbad = false;
                 for (const MrPin& p : pins) {
-                    mr_apply(h, p);
+                    apply_mode(p);
                     st_memset(d_y, 0xff, mb);
                     rc = L.run(d_x, d_w, d_y);
                     const bool ok_rc = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                    clear_mode();
                     ++launches;
-                    if (!ok_rc) { fails += fmt(" M=%lld %s rc %d;", (long long)M, mr_pin_name(p).c_str(), rc); ++(p.w64 ? diffs64 : diffs); mbad = true; continue; }
+                    if (!ok_rc) { fails += fmt(" M=%lld %s rc %d;", (long long)M, mode_name(p).c_str(), rc); ++(p.w64 ? diffs64 : diffs); mbad = true; continue; }
                     st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
                     if (got != ref) {
                         size_t nb = 0, first = 0;
                         for (size_t e = 0; e < mb; e += ob)
                             if (std::memcmp(&got[e], &ref[e], ob)) { if (!nb) first = e / ob; ++nb; }
                         std::printf("  FAIL %s %s M=%lld form %s (%s): %zu of %zu outputs differ, first m=%zu n=%zu\n", ty.name,
-                                    sh.name, (long long)M, mr_pin_name(p).c_str(), h.last ? h.last() : "?", nb, mb / ob,
+                                    sh.name, (long long)M, mode_name(p).c_str(), h.last ? h.last() : "?", nb, mb / ob,
                                     first / (size_t)sh.N, first % (size_t)sh.N);
                         ++(p.w64 ? diffs64 : diffs); mbad = true;
                     }
                 }
-                h.pin(0, 0, 0, 0);
-                if (h.pin_w64) h.pin_w64(0);
+                clear_mode();
                 bad_m += mbad ? 1 : 0;
             }
             g_fail += bad_m ? 1 : 0;
             ++done;
-            std::printf("MRCHECK %s %s %lldx%lld%s M=1..48: %s (%d of 48 M with a difference)%s; MRINFO stock row alone == row in the M call at %d of 48 M\n",
-                        ty.name, sh.name, (long long)sh.N, (long long)sh.K, sh.logits ? " f32" : "",
-                        bad_m ? "DIFFERS" : "identical in every form", bad_m, fails.c_str(), info_m);
+            std::printf("MRCHECK %s %s %lldx%lld%s M=1..%d: %s (%d of %d M with a difference)%s; MRINFO stock row alone == row in the M call at %d of %d M\n",
+                        ty.name, sh.name, (long long)sh.N, (long long)sh.K, sh.logits ? " f32" : "", mmax,
+                        bad_m ? "DIFFERS" : "identical in every form", bad_m, mmax, fails.c_str(), info_m, mmax);
             std::fflush(stdout);
         }
     }
@@ -22051,21 +22087,29 @@ static void ds41_ggfold_case(const Plugin& pl, const char* row, int pro) {
     std::vector<int64_t> Ms;
     for (int64_t M = 1; M <= 48; ++M) Ms.push_back(M);
     Ms.push_back(64); Ms.push_back(130);
-    /* modes: 0 = gg_gemv 2, 1.. = a pin, last = gg_gemv 0 */
-    const MrPin pins[] = { { 1, 1, 4, 1, 0 }, { 2, 2, 6, 2, 0 }, { 4, 1, 8, 0, 0 }, { 4, 2, 3, 8, 0 }, { -1, 0, 0, 0, 0 } };
-    const int n_modes = 2 + (int)(sizeof(pins) / sizeof(pins[0]));
+    /* modes: 0 = gg_gemv 2, 1.. = a pin, last = gg_gemv 0. Lever A4 (a plugin with r4d_gg_mr_pin_xp): kA4Pins and the switch
+     * (xp 16: gg_gemv 2 + gg_gemv_m16 1, no pin) among the pins. */
+    std::vector<MrPin> pins = { { 1, 1, 4, 1, 0 }, { 2, 2, 6, 2, 0 }, { 4, 1, 8, 0, 0 }, { 4, 2, 3, 8, 0 }, { -1, 0, 0, 0, 0 } };
+    if (hk.pin_xp) {
+        for (const MrPin& p : kA4Pins) pins.push_back(p);
+        pins.push_back({ 0, 0, 0, 0, 0, 16 });
+    }
+    const int n_modes = 2 + (int)pins.size();
     long long launches = 0, bad_h = 0, bad_y = 0, rc_bad = 0;
     std::string first;
     std::mt19937 rng(pro == 1 ? 7101 : 7102);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::uniform_int_distribution<int> pct(0, 999);
     auto set_mode = [&](int k) {
+        if (hk.pin_xp) { hk.pin_xp(0); sw("gg_gemv_m16", 0); }
         if (k == 0) { hk.pin(0, 0, 0, 0); sw("gg_gemv", 2); }
         else if (k == n_modes - 1) { hk.pin(0, 0, 0, 0); sw("gg_gemv", 0); }
-        else { sw("gg_gemv", 0); mr_apply(hk, pins[k - 1]); }
+        else if (pins[(size_t)k - 1].xp == 16) { hk.pin(0, 0, 0, 0); sw("gg_gemv", 2); sw("gg_gemv_m16", 1); }
+        else { sw("gg_gemv", 0); mr_apply(hk, pins[(size_t)k - 1]); }
     };
     auto mode_name = [&](int k) {
-        return k == 0 ? std::string("gg_gemv 2") : k == n_modes - 1 ? std::string("gg_gemv 0") : mr_pin_name(pins[k - 1]);
+        return k == 0 ? std::string("gg_gemv 2") : k == n_modes - 1 ? std::string("gg_gemv 0")
+             : pins[(size_t)k - 1].xp == 16 ? std::string("gg_gemv_m16") : mr_pin_name(pins[(size_t)k - 1]);
     };
     std::string timing;
     for (const MrTy* ty : tys)
@@ -22155,6 +22199,7 @@ static void ds41_ggfold_case(const Plugin& pl, const char* row, int pro) {
                 }
         }
     hk.pin(0, 0, 0, 0);
+    if (hk.pin_xp) { hk.pin_xp(0); sw("gg_gemv_m16", 0); }
     sw("gg_gemv", 0);
     std::printf("  info  %s pair/fold us (gg_gemv 2, back to back):%s\n", row, timing.c_str());
     char msg[400];
@@ -34571,6 +34616,7 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 #include "r4d_selftest_arc.inc"   /* ds41-int10: lever ARC, the coded wire at overlap 0 on four cards (--case ar_arcoded) */
 #include "r4d_selftest_i11.inc"   /* ds41-int11: lever 1U-MX, mhc_mix's wide-wave decode form byte for byte (--case mix_wv) */
 #include "r4d_selftest_gq.inc"    /* ds41-int11: lever 1U-GQ, gemm_nt_ggml_pair vs two gemm_nt_ggml (--case gq_pair) */
+#include "r4d_selftest_a4.inc"    /* ds41-a4: lever A4, the gg_gemv_m16 forms (--mrcheck16, --perfm16) */
 
 static void device_phase(const Plugin& pl) {
     int n = 0;
@@ -37964,6 +38010,11 @@ static void usage(void) {
                 "             shapes, M 1..48, every form; MRINFO: a row alone vs inside an M-row call.\n"
                 "  --perfmr [Ms] [iters] [types]:  lever D2's timing: stock rule, pinned stock forms,\n"
                 "             multi-row forms (MRPERF / MRSUM a (type, shape, M), MRVERDICT).\n"
+                "  --mrcheck16 [types]:  lever A4: the gg_gemv_m16 forms (XP slabs, grid fit, H1R2) and the switch\n"
+                "             with the loaded table vs the stock band, byte for byte, M 1..16: plain shapes, the\n"
+                "             pair, folds a / e (A4VERDICT).\n"
+                "  --perfm16 [Ms] [iters] [types] [--m16-out FILE]:  lever A4's gate bench: D2's pick vs the A4\n"
+                "             candidates, two passes (M16PERF / M16SUM / M16GATE / M16EST), and the measured table.\n"
                 "  --gpcheck [Ms] [types]:  lever GPF: gemm_nt_ggml's prefill WMMA forms vs the stock\n"
                 "             kernel, byte for byte, every dense shape and type, M 49..4160 (GPCHECK, GPVERDICT).\n"
                 "  --perfgp [Ms] [iters] [types]:  lever GPF's timing: stock, every form and the ablations at\n"
@@ -38128,6 +38179,7 @@ int main(int argc, char** argv) {
     long long dsm_m = 0; int dsm_it = 0; const char* dsm_fmts = nullptr;   /* --perfdsmoe */
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
+    bool a4c = false, a4p = false; const char* a4_out = nullptr;   /* lever A4: --mrcheck16 / --perfm16 [--m16-out FILE] */
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
     bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
     bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
@@ -38378,6 +38430,18 @@ int main(int argc, char** argv) {
             /* lever D2: the multi-row decode-band form vs the stock path, byte for byte (ds_mr_check). */
             mrc = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--mrcheck16")) {
+            /* lever A4: the gg_gemv_m16 forms and the switch vs the stock band, byte for byte, M 1..16 (a4_check). */
+            a4c = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfm16")) {
+            /* lever A4: D2's pick vs the A4 candidates, M 5..16, and the measured table (a4st::perf). */
+            a4p = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--m16-out") && i + 1 < argc) {
+            a4_out = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfmr")) {
             /* lever D2: the multi-row form's timing vs the stock rule and pinned forms (ds_mr_perf). */
             mrp = true;
@@ -38661,11 +38725,13 @@ int main(int argc, char** argv) {
 #endif
         return g_fail ? 1 : 0;
     }
-    if (mrc || mrp) {
+    if (mrc || mrp || a4c || a4p) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
         if (mrc) ds_mr_check(pl, mr_t);
         if (mrp) ds_mr_perf(pl, mr_m, mr_it, mr_t);
+        if (a4p) a4st::perf(pl, mr_m, mr_it, mr_t, a4_out);
+        if (a4c) a4_check(pl, mr_t);
         dfree_all();
 #else
         skip("lever D2 multi-row form", "built without HIP");

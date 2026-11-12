@@ -61,4 +61,9 @@ int r4d_gg_mr_fold(RadStream s, const R4dGgMrCall& c, const R4dGgMrFold& f);
  * runtime switch: the caller does (r4d_gg_mr_on). */
 int r4d_gg_mr_pair(RadStream s, const R4dGgMrCall& a, const R4dGgMrCall& b);
 
+/* Lever A4 (ds41-a4): the fn4 switch gg_gemv_m16 (0 / 1): under D2, a decode-band call of M <= 16 rows takes the A4
+ * table's form (r4d_ds41_ggml_mr.hip, mr_choose); 0 = D2's pick everywhere. */
+void r4d_gg_mr_m16_set(int v);
+int r4d_gg_mr_m16_get();
+
 #endif

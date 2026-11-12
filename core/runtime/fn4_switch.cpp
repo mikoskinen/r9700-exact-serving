@@ -34,7 +34,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
-                                        "exl3_x3d", "ar_xpush" };
+                                        "exl3_x3d", "ar_xpush", "gg_gemv_m16" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -44,7 +44,8 @@ bool plugin_switch(int i) {
            i == kMhcFuse || i == kIxLds || i == kIxNi || i == kDs41Arcoded || i == kDs41MixWv || i == kDs41Gq ||
            i == kDs41E2 ||
            i == kExl3X3d ||   /* exl3_x3d (62 here; 57 on ds41-x3d-eng10): the ds41-x3d exl3r4d (X3D-F) */
-           i == kArXpush;     /* ar_xpush (63, ds41-int13): libr4d's XPUSH (the FN fn4 name, ported from fn4-x3-sp3) */
+           i == kArXpush ||   /* ar_xpush (63, ds41-int13): libr4d's XPUSH (the FN fn4 name, ported from fn4-x3-sp3) */
+           i == kGgGemvM16;   /* gg_gemv_m16 (64 here, 63 on ds41-a4): libr4d (lever A4) */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -681,7 +682,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
-                        "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, epoch_bump)";
+                        "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, epoch_bump)";
         return false;
     }
     State& s = st();
