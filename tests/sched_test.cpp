@@ -11039,7 +11039,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("sched_noa", -1, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
-                   "ds41_arcoded, epoch_bump)") !=
+                   "ds41_arcoded, sched_row_cap, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -11402,5 +11402,408 @@ TEST(noa_mixed_steps_carrying_draft_rows) {
                 REQUIRE(!pc[ids[k]].empty());
                 CHECK(pc[ids[k]].back().step < pc[p].back().step);
             }
+    }
+}
+
+
+/* ================================================== lever CAP48 (ds41-cap48): a cap on a step's decode rows
+ * fn4 sched_row_cap N (RADIANCE_DECODE_ROW_CAP at start): a step's decode rows -- every decoding sequence's own row + its
+ * drafts -- are held to N by trimming drafts, the deepest first (equal depths: the later sequence in plan order first),
+ * never a sequence's own row; prefill rows are not counted and every prefill piece is planned as without the cap; a step
+ * whose decoding sequences alone exceed N is left as planned (noted once); the step issued ahead is capped too. GET "cap":
+ * the value in force and the scheduler's counts. */
+namespace {
+struct CapSwitch {   /* sched_row_cap back to 0 when a case ends */
+    ~CapSwitch() { (void)DstSwitches::set("sched_row_cap", 0); }
+};
+/* The reference rule, one draft at a time: take one from the deepest proposal, the later entry among equals, until the rows
+ * fit; nothing when the sequences alone do not fit. */
+std::vector<int32_t> cap_ref(std::vector<int32_t> d, int64_t cap) {
+    int64_t rows = (int64_t)d.size();
+    for (int32_t x : d) rows += x;
+    if ((int64_t)d.size() > cap) return d;
+    while (rows > cap) {
+        int best = -1;
+        for (int i = 0; i < (int)d.size(); ++i)
+            if (d[(size_t)i] > 0 && (best < 0 || d[(size_t)i] >= d[(size_t)best])) best = i;
+        if (best < 0) break;
+        --d[(size_t)best];
+        --rows;
+    }
+    return d;
+}
+struct CapStep {
+    int64_t dec_rows = 0, n_tok = 0;
+    int     n_spec = 0;
+    std::vector<int32_t> spec;                      /* every decode entry's n_spec, plan order */
+    std::vector<uint64_t> seqs;                     /* its sequence */
+    std::vector<std::pair<int64_t, int64_t>> pf;    /* every prefill entry's (ctx_len, n_tokens) */
+};
+struct CapCfg {
+    int cap = 48, seqs = 16, depth = 5, max_seqs = 32, steps = 6;
+    std::function<int(int)> depth_of;               /* the proposal's depth by sequence index (default: depth) */
+    int64_t long_prompt = 0;                        /* > 0: a long prompt beside the decoders (the DS41 geometry, D3) */
+    bool accept_all = true;                         /* commit: every verified draft accepted (else none) */
+};
+struct CapRun {
+    std::vector<CapStep> st;
+    std::map<std::string, int64_t> cnt, pre;   /* GET "cap" at the end, and before the drafted steps (the prompts' steps) */
+    int64_t d(const char* k) const { return cnt.at(k) - pre.at(k); }
+    std::vector<uint64_t> ids;
+    std::string log;
+};
+std::map<std::string, int64_t> cap_counts() {
+    const std::string g = fn4::state_json();
+    std::map<std::string, int64_t> m;
+    const size_t at = g.find("\"cap\": {");
+    for (const char* k : { "in_force", "steps_capped", "drafts_trimmed", "ahead_capped", "steps_over", "steps_gt48", "max_rows",
+                           "decode_steps" })
+        m[k] = noa_json_num(g, at, k);
+    return m;
+}
+CapRun cap_run(const CapCfg& c) {
+    CapRun out;
+    DstSwitches restore;
+    CapSwitch restore_cap;
+    Fixture f;
+    f.build(/*blocks=*/8192, /*states=*/96, /*max_tok=*/4160, /*max_ctx=*/60000);
+    f.cfg.n_spec = c.depth;
+    f.cfg.max_seqs = c.max_seqs;
+    if (c.long_prompt > 0) {
+        f.cfg.checkpoint_interval = 2048;
+        f.cfg.prefill_span = 2;
+        f.cfg.prefill_interleave = 8;
+        f.cfg.prefix_exact = true;
+    }
+    CHECK(DstSwitches::set("sched_row_cap", c.cap));
+    out.log = info_of([&] {
+        CHECK_OK(f.start());
+        if (c.long_prompt > 0) {
+            f.sch.set_stage_rows(1024);
+            f.sch.set_span_min(16384);
+            CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        }
+        for (int i = 0; i < c.seqs; ++i) out.ids.push_back(f.submit(100, 4000));
+        /* every prompt prefilled (no drafts yet) */
+        for (int k = 0; k < 8; ++k) {
+            bool pf = false;
+            for (uint64_t id : out.ids) { const Request* r = f.sch.find(id); pf = pf || (r && r->n_computed < 100); }
+            if (!pf) break;
+            REQUIRE(f.sch.step() != nullptr);
+            f.commit_plain(11);
+        }
+        f.sch.step_finished();
+        out.pre = cap_counts();
+        const uint64_t p = c.long_prompt > 0 ? f.submit((int)c.long_prompt, 2) : 0;
+        int32_t draft[RAD_SCHED_MAX_SPEC];
+        for (int j = 0; j < RAD_SCHED_MAX_SPEC; ++j) draft[j] = 21 + j;
+        for (int s = 0; s < c.steps; ++s) {
+            for (size_t i = 0; i < out.ids.size(); ++i)
+                (void)f.sch.set_draft(out.ids[i], draft, c.depth_of ? c.depth_of((int)i) : c.depth);
+            const RadBatch* b = f.sch.step();
+            if (!b) break;
+            const StepPlan& pl = f.sch.plan();
+            CapStep cs;
+            cs.n_tok = pl.n_tok;
+            cs.n_spec = pl.n_spec;
+            CHECK_EQ((int64_t)b->n_tok, pl.n_tok);
+            CHECK_EQ((int)b->n_spec, pl.n_spec);
+            for (const StepEntry& e : pl.e) {
+                if (e.is_prefill) { cs.pf.push_back({ e.ctx_len, e.n_tokens }); continue; }
+                cs.dec_rows += e.n_tokens;
+                CHECK_EQ(e.n_tokens, 1 + e.n_spec);
+                const Request* r = f.sch.find(e.seq);
+                REQUIRE(r != nullptr);
+                CHECK_EQ(r->n_draft, e.n_spec);             /* the sampler's window = the entry's */
+                CHECK(e.n_spec == 0 ? r->draft == nullptr : r->draft != nullptr);
+                cs.spec.push_back(e.n_spec);
+                cs.seqs.push_back(e.seq);
+            }
+            CHECK_EQ(pl.n_tok_decode, cs.dec_rows);
+            out.st.push_back(cs);
+            CHECK_OK(f.commit(9, 0, [&](const StepEntry& e) { return c.accept_all ? e.n_spec : 0; }));
+            if (p && !f.sch.find(p)) break;
+        }
+        f.sch.step_finished();   /* the engine's call after a step: it reports the counts to fn4 */
+    });
+    out.cnt = cap_counts();
+    return out;
+}
+}  // namespace
+
+/* 16 sequences proposing 5 drafts each (96 rows) under sched_row_cap 48: every step carries exactly 48 decode rows, each
+ * sequence verifies the first 2 of its 5 (16 x 3), the batch / the request's window / the commit agree, and the counts say
+ * so; the switch's range and GET. */
+TEST(cap48_holds_16_sequences_at_48_decode_rows) {
+    std::string err;
+    CHECK(fn4::check("sched_row_cap", 0, &err));
+    CHECK(fn4::check("sched_row_cap", 48, &err));
+    CHECK(fn4::check("sched_row_cap", 4096, &err));
+    CHECK(!fn4::check("sched_row_cap", 4097, &err));
+    CHECK(!fn4::check("sched_row_cap", -1, &err));
+    CHECK_EQ(fn4::sched_row_cap(), 0);   /* RADIANCE_DECODE_ROW_CAP is unset here */
+    CapCfg c;
+    const CapRun r = cap_run(c);
+    REQUIRE_EQ((int)r.st.size(), c.steps);
+    for (const CapStep& s : r.st) {
+        CHECK_EQ(s.dec_rows, (int64_t)48);
+        CHECK_EQ(s.n_spec, 2);
+        CHECK_EQ((int)s.spec.size(), 16);
+        for (int32_t k : s.spec) CHECK_EQ(k, 2);
+        CHECK(s.seqs == r.ids);   /* plan order = arrival order (one priority) */
+    }
+    CHECK_EQ(r.cnt.at("in_force"), (int64_t)48);
+    CHECK_EQ(r.d("steps_capped"), (int64_t)c.steps);
+    CHECK_EQ(r.d("drafts_trimmed"), (int64_t)(c.steps * 16 * 3));
+    CHECK_EQ(r.cnt.at("ahead_capped"), (int64_t)0);
+    CHECK_EQ(r.cnt.at("steps_over"), (int64_t)0);
+    CHECK_EQ(r.cnt.at("steps_gt48"), (int64_t)0);
+    CHECK_EQ(r.cnt.at("max_rows"), (int64_t)48);
+    CHECK_EQ(r.d("decode_steps"), (int64_t)c.steps);
+    /* the start line once (the switch was set before the scheduler's init, as RADIANCE_DECODE_ROW_CAP sets it); 32 >= 16
+     * sequences and every step capped: nothing else to note */
+    {
+        int n = 0;
+        for (size_t at = r.log.find("lever CAP48: decode row cap 48 ("); at != std::string::npos;
+             at = r.log.find("lever CAP48: decode row cap 48 (", at + 1)) ++n;
+        CHECK_EQ(n, 1);
+        CHECK(r.log.find("covers up to") == std::string::npos);
+        CHECK(r.log.find("even at depth 0: left as planned") == std::string::npos);
+    }
+    /* the verified drafts are the proposal's first two, committed in order before the bonus token */
+    {
+        DstSwitches restore;
+        CapSwitch restore_cap;
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/96, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.n_spec = 5;
+        CHECK(DstSwitches::set("sched_row_cap", 48));
+        CHECK_OK(f.start());
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < 16; ++i) ids.push_back(f.submit(100, 4000));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[5] = { 21, 22, 23, 24, 25 };
+        for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, draft, 5));
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ((int)b->n_tok, 48);
+        CHECK_EQ((int)b->q_lens[0], 3);
+        CHECK_EQ(b->token_ids[0], 11);
+        CHECK_EQ(b->token_ids[1], 21);
+        CHECK_EQ(b->token_ids[2], 22);
+        CHECK_EQ(b->token_ids[3], 11);   /* the next sequence's own row */
+        CHECK_OK(f.commit(99, 0, [](const StepEntry& e) { return e.n_spec; }));
+        const Request* ra = f.sch.find(ids[0]);
+        REQUIRE(ra != nullptr);
+        CHECK_EQ((int)ra->output.size(), 4);
+        CHECK_EQ(ra->output[1], 21);
+        CHECK_EQ(ra->output[2], 22);
+        CHECK_EQ(ra->output[3], 99);
+        CHECK_EQ(ra->n_computed, (int64_t)103);
+    }
+}
+
+/* 32 sequences at depth 5 (192 rows) under 48: 16 drafts fit -- the first 16 sequences in plan order keep 1, the last 16
+ * none; proposals of uneven depth are trimmed as the one-draft-at-a-time reference (the deepest first, the later among
+ * equals); two runs of the same inputs plan the same steps (deterministic). */
+TEST(cap48_trims_32_sequences_deterministically) {
+    CapCfg c;
+    c.seqs = 32;
+    c.max_seqs = 48;
+    const CapRun a = cap_run(c), b = cap_run(c);
+    REQUIRE_EQ((int)a.st.size(), c.steps);
+    REQUIRE_EQ((int)b.st.size(), c.steps);
+    for (size_t s = 0; s < a.st.size(); ++s) {
+        CHECK_EQ(a.st[s].dec_rows, (int64_t)48);
+        REQUIRE_EQ((int)a.st[s].spec.size(), 32);
+        for (int i = 0; i < 32; ++i) CHECK_EQ(a.st[s].spec[(size_t)i], i < 16 ? 1 : 0);
+        CHECK(a.st[s].spec == b.st[s].spec);
+        CHECK(a.st[s].seqs == b.st[s].seqs);
+    }
+    CHECK_EQ(a.d("drafts_trimmed"), (int64_t)(c.steps * (32 * 5 - 16)));
+    CHECK_EQ(a.cnt.at("steps_gt48"), (int64_t)0);
+    /* uneven proposals: sequence i proposes 1 + (i * 7) % 5 drafts (never 0: an empty proposal takes prompt lookup's);
+     * 20 sequences, 60 drafts, cap 48 -> 28 kept */
+    CapCfg u;
+    u.seqs = 20;
+    u.depth = 5;
+    u.depth_of = [](int i) { return 1 + (i * 7) % 5; };
+    u.accept_all = false;   /* every sequence at the same position each step: the same proposals every step */
+    const CapRun x = cap_run(u), y = cap_run(u);
+    REQUIRE_EQ((int)x.st.size(), u.steps);
+    std::vector<int32_t> want0;
+    for (int i = 0; i < 20; ++i) want0.push_back(1 + (i * 7) % 5);
+    const std::vector<int32_t> want = cap_ref(want0, 48);
+    int64_t kept = 0;
+    for (int32_t k : want) kept += k;
+    CHECK_EQ(kept, (int64_t)28);
+    for (size_t s = 0; s < x.st.size(); ++s) {
+        CHECK(x.st[s].spec == want);
+        CHECK(x.st[s].spec == y.st[s].spec);
+        CHECK_EQ(x.st[s].dec_rows, (int64_t)48);
+    }
+    /* a depth below the room is untouched: 8 sequences at 5 = 48 rows, nothing trimmed */
+    CapCfg e8;
+    e8.seqs = 8;
+    const CapRun z = cap_run(e8);
+    for (const CapStep& s : z.st) {
+        CHECK_EQ(s.dec_rows, (int64_t)48);
+        for (int32_t k : s.spec) CHECK_EQ(k, 5);
+    }
+    CHECK_EQ(z.d("steps_capped"), (int64_t)0);
+    CHECK_EQ(z.cnt.at("max_rows"), (int64_t)48);
+}
+
+/* More sequences than the cap (56 at --max-num-seqs 64, depth 1): even depth 0 is 56 rows, so every step is left as
+ * planned and counted as steps_over; the two notes (the cap below --max-num-seqs, a step left) are said once each. */
+TEST(cap48_above_48_sequences_is_left_as_planned_and_noted_once) {
+    CapCfg c;
+    c.seqs = 56;
+    c.max_seqs = 64;
+    c.depth = 1;
+    const CapRun r = cap_run(c);
+    REQUIRE_EQ((int)r.st.size(), c.steps);
+    for (const CapStep& s : r.st) {
+        CHECK_EQ(s.dec_rows, (int64_t)112);
+        for (int32_t k : s.spec) CHECK_EQ(k, 1);
+    }
+    CHECK_EQ(r.cnt.at("steps_capped"), (int64_t)0);
+    CHECK_EQ(r.cnt.at("drafts_trimmed"), (int64_t)0);
+    CHECK_EQ(r.d("steps_over"), (int64_t)c.steps);
+    CHECK_EQ(r.d("steps_gt48"), (int64_t)c.steps);
+    auto count = [&](const char* what) {
+        int n = 0;
+        for (size_t at = r.log.find(what); at != std::string::npos; at = r.log.find(what, at + 1)) ++n;
+        return n;
+    };
+    CHECK_EQ(count("covers up to 48 decoding sequences; at --max-num-seqs 64"), 1);
+    CHECK_EQ(count("more than the decode row cap 48 even at depth 0: left as planned"), 1);
+    /* the same deployment at 48 sequences: capped, nothing noted about a step left */
+    CapCfg d = c;
+    d.seqs = 40;
+    d.depth = 5;
+    const CapRun q = cap_run(d);
+    for (const CapStep& s : q.st) CHECK_EQ(s.dec_rows, (int64_t)48);
+    CHECK_EQ(q.d("steps_over"), (int64_t)0);
+    CHECK_EQ(q.d("steps_capped"), (int64_t)d.steps);
+    CHECK(q.log.find("even at depth 0: left as planned") == std::string::npos);   /* no step left (the start's note is there) */
+    CHECK(q.log.find("covers up to 48 decoding sequences; at --max-num-seqs 64") != std::string::npos);
+}
+
+/* CONTROL: sched_row_cap 0 plans what the switch never set plans (every proposal whole, 96 rows), and counts the steps over 48
+ * rows it does not cap; the cap only ever takes drafts away. */
+TEST(cap48_off_plans_as_unset) {
+    CapCfg off;
+    off.cap = 0;
+    const CapRun r0 = cap_run(off);
+    std::vector<CapStep> unset;
+    {
+        DstSwitches restore;
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/96, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.n_spec = 5;
+        f.cfg.max_seqs = 32;
+        CHECK_OK(f.start());
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < 16; ++i) ids.push_back(f.submit(100, 4000));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[5] = { 21, 22, 23, 24, 25 };
+        for (int s = 0; s < off.steps; ++s) {
+            for (uint64_t id : ids) (void)f.sch.set_draft(id, draft, 5);
+            REQUIRE(f.sch.step() != nullptr);
+            CapStep cs;
+            for (const StepEntry& e : f.sch.plan().e) { cs.dec_rows += e.n_tokens; cs.spec.push_back(e.n_spec); cs.seqs.push_back(e.seq); }
+            cs.n_tok = f.sch.plan().n_tok;
+            unset.push_back(cs);
+            CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        }
+    }
+    REQUIRE_EQ(r0.st.size(), unset.size());
+    for (size_t s = 0; s < unset.size(); ++s) {
+        CHECK_EQ(r0.st[s].dec_rows, (int64_t)96);
+        CHECK(r0.st[s].spec == unset[s].spec);
+        CHECK_EQ(r0.st[s].n_tok, unset[s].n_tok);
+        CHECK_EQ(r0.st[s].dec_rows, unset[s].dec_rows);
+    }
+    CHECK_EQ(r0.cnt.at("in_force"), (int64_t)0);
+    CHECK_EQ(r0.cnt.at("steps_capped"), (int64_t)0);
+    CHECK_EQ(r0.cnt.at("drafts_trimmed"), (int64_t)0);
+    CHECK_EQ(r0.d("steps_gt48"), (int64_t)off.steps);
+    CHECK_EQ(r0.cnt.at("max_rows"), (int64_t)96);
+}
+
+/* A mixed step counts its decode rows only: 16 decoders at depth 5 beside a 40000-token prompt (the DS41 line's geometry,
+ * sched_bi_chunk 3): under the cap every step carries <= 48 decode rows, and the prompt's pieces -- start, rows, the step
+ * they run in -- are the uncapped run's, step for step (no draft accepted, so both runs see the same positions). */
+TEST(cap48_mixed_steps_keep_the_prefill_pieces) {
+    CapCfg on;
+    on.long_prompt = 40000;
+    on.steps = 60;
+    on.accept_all = false;
+    CapCfg off = on;
+    off.cap = 0;
+    const CapRun a = cap_run(on), b = cap_run(off);
+    REQUIRE_EQ(a.st.size(), b.st.size());
+    int mixed = 0, over = 0;
+    for (size_t s = 0; s < a.st.size(); ++s) {
+        CHECK(a.st[s].dec_rows <= 48);
+        CHECK(a.st[s].pf == b.st[s].pf);
+        CHECK_EQ(a.st[s].n_tok - a.st[s].dec_rows, b.st[s].n_tok - b.st[s].dec_rows);   /* prefill rows */
+        if (!a.st[s].pf.empty()) ++mixed;
+        if (b.st[s].dec_rows > 48) ++over;
+    }
+    CHECK(mixed >= 4);
+    CHECK(over == (int)b.st.size());
+    CHECK_EQ(a.cnt.at("steps_gt48"), (int64_t)0);
+    CHECK_EQ(b.d("steps_gt48"), b.d("decode_steps"));
+}
+
+/* The step issued ahead (step_next) is capped under the value of the step before it: 16 sequences each expecting 5 drafts
+ * verify 2; the proposals published after its commit (5 each) are cut to the 2 it verifies; promote_next keeps them. Without
+ * the cap the same flow verifies all 5. */
+TEST(cap48_the_step_issued_ahead_is_capped) {
+    for (int cap : { 48, 0 }) {
+        DstSwitches restore;
+        CapSwitch restore_cap;
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/96, /*max_tok=*/4160, /*max_ctx=*/60000);
+        f.cfg.n_spec = 5;
+        CHECK(DstSwitches::set("sched_row_cap", cap));
+        CHECK_OK(f.start());
+        std::vector<uint64_t> ids;
+        for (int i = 0; i < 16; ++i) ids.push_back(f.submit(100, 4000));
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[5] = { 21, 22, 23, 24, 25 };
+        for (uint64_t id : ids) CHECK_OK(f.sch.set_draft(id, draft, 5));
+        REQUIRE(f.sch.step() != nullptr);
+        const int k = cap ? 2 : 5;
+        for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, k);
+        for (uint64_t id : ids) {
+            f.sch.find(id)->speculation_fixed = true;
+            f.sch.expect_draft(id, 5);
+        }
+        const RadBatch* nb = f.sch.step_next();
+        REQUIRE(nb != nullptr);
+        CHECK_EQ((int)nb->n_tok, 16 * (1 + k));
+        CHECK_EQ((int)nb->n_spec, k);
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        for (uint64_t id : ids) {
+            CHECK_OK(f.sch.set_draft(id, draft, 5));
+            CHECK_EQ(f.sch.find(id)->n_draft, k);
+        }
+        f.sch.promote_next();
+        for (const StepEntry& e : f.sch.plan().e) {
+            CHECK_EQ(e.n_spec, k);
+            CHECK_EQ(e.n_tokens, 1 + k);
+        }
+        CHECK_OK(f.commit(9, 0, [](const StepEntry& e) { return e.n_spec; }));
+        f.sch.step_finished();
+        const auto m = cap_counts();
+        CHECK_EQ(m.at("steps_capped"), cap ? (int64_t)2 : (int64_t)0);
+        CHECK_EQ(m.at("ahead_capped"), cap ? (int64_t)1 : (int64_t)0);
+        CHECK_EQ(m.at("steps_gt48"), cap ? (int64_t)0 : (int64_t)2);
     }
 }

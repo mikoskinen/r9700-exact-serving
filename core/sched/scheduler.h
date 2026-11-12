@@ -102,6 +102,7 @@ struct SchedReq {
     void drafter_reset() {
         n_draft      = 0;
         draft_next   = 0;
+        cap_cut_next = false;
         conv_cursor  = 0;
         draft_filled = 0;
         draft_lo     = 0;
@@ -136,6 +137,9 @@ struct SchedReq {
      * drafts the drafter issued for it, which that step verifies. */
     int32_t  entry_next = -1;
     int32_t  draft_next = 0;
+    /* Lever CAP48 (fn4 sched_row_cap): the step issued ahead verifies fewer of this sequence's drafts than the drafter
+     * issued (draft_next was cut by the cap), so the proposal published for it is cut to draft_next (set_draft). */
+    bool     cap_cut_next = false;
 
     /* Cancelled while a step in flight or a drafter snapshot still names it; its blocks are
      * released once nothing does. Freed earlier, a kernel still writing a block would put one
@@ -733,6 +737,17 @@ private:
     /* admitted, pieces, rows, displaced, waited, steps, steps by prefill entries 1 / 2 / 3 / 4+ (fn4::kNoaCounts) */
     int64_t       noa_n_[10] = {};
     int64_t       noa_room() const;
+    /* Lever CAP48 (fn4 sched_row_cap, read at every step planned; RADIANCE_DECODE_ROW_CAP is its value at start): the cap
+     * in force (0 off), its counts (fn4 GET "cap": steps_capped, drafts_trimmed, ahead_capped, steps_over, steps_gt48,
+     * max_rows, decode_steps), and its two notes, each said once (the cap below --max-num-seqs; a step it had to leave).
+     * cap_rows(): hold plan `p`'s decode rows (its entries that are not prefill, each 1 + n_spec rows) to cap_now_ by
+     * trimming drafts, the deepest first, the later entry first among equal depths; `ahead`: p is the step issued ahead
+     * (step_next). Returns the drafts it trimmed. */
+    int           cap_now_ = 0;
+    int64_t       cap_n_[7] = {};
+    bool          cap_seq_noted_ = false, cap_over_noted_ = false;
+    int64_t       cap_rows(StepPlan& p, bool ahead);
+    void          cap_seq_note(int64_t max_seqs);   /* the cap below --max-num-seqs, said once */
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share = false);
     IKVManager*   kv_ = nullptr;

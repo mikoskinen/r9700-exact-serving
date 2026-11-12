@@ -348,6 +348,22 @@
  *                   where the coded form fits (bf16, whole-wave shards, the slot); the rest plain. Exact: the coded wire
  *                   decodes the same values, folded in the same order. RADIANCE_DS41_ARCODED=N at load starts it at N.
  *                   GET "arc" carries its counters (arc_stats).
+ *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
+ *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
+ *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
+ *                   never a sequence's own row. At N = 48 every decode piece of the step stays in the decode band's
+ *                   kernel forms (gemm_nt_ggml's <= 48-row GEMV, attention's decode band, index_score's scalar dot), whose
+ *                   rows are batch-invariant. Prefill rows are not counted, and every prefill piece is planned as
+ *                   without the cap (the trimmed rows' budget is not handed on). A step whose decoding sequences alone
+ *                   exceed N (more than N at depth 0: --max-num-seqs > N) is left as planned (noted once). Both the step
+ *                   planned after a commit and the one issued ahead are capped. Exact: only how many drafts a step
+ *                   verifies moves, and the verify keeps the output (greedy, or a seeded sample whose rows the drafter
+ *                   does not couple; under draft_sample >= 1 at T > 0 the coupled rows keep the target's law, as at
+ *                   every other depth choice). RADIANCE_DECODE_ROW_CAP=N at start is the value until the switch is set
+ *                   (unset / 0: off). Read at every step planned. GET "cap": the cap in force, steps_capped,
+ *                   drafts_trimmed, ahead_capped (of them, steps issued ahead), steps_over (left: the sequences alone
+ *                   exceed it), steps_gt48 (steps whose decode rows exceed 48, at any setting), max_rows (the most decode
+ *                   rows a step carried), decode_steps (steps with decode rows).
  *   ds41_qnfold     deepseek41 (lever K1 fold a): 1 the query's rmsnorm (q_a_norm) computed in q_b's GEMV activation
  *                   staging (rmsnorm_gemm_nt_ggml, decode band), 0 rmsnorm + gemm_nt_ggml as before.
  *                   RADIANCE_DS41_QNFOLD=1 declares the fold beside the pair (and starts at 1); unset declares nothing
@@ -425,7 +441,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedInterleave, kSchedMixedTok, kSchedShortBypass, kSchedBypassTotal, kDs41Psk, kDs41PskK,
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
-              kSwitches };
+              kSchedRowCap, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -507,6 +523,14 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
 int  sched_noa();
 static constexpr int kNoaCounts = 10;   /* admitted, pieces, rows, displaced, waited, steps, pf_steps_1 .. 4plus */
 void note_sched_noa(const int64_t* v);
+/* Lever CAP48 (sched_row_cap): the switch once set, else RADIANCE_DECODE_ROW_CAP (0 .. 4096) at start, else 0 (off). The
+ * scheduler reads it at every step it plans (step_next's step issued ahead takes the value of the step before it) and after
+ * every step reports its counts (GET "cap", kCapCounts values): steps it capped, drafts it trimmed, how many of those steps
+ * were issued ahead, steps it left because their decoding sequences alone exceed the cap, steps whose decode rows exceed 48,
+ * the most decode rows a step carried, steps with decode rows. */
+int  sched_row_cap();
+static constexpr int kCapCounts = 7;   /* steps_capped, drafts_trimmed, ahead_capped, steps_over, steps_gt48, max_rows, decode_steps */
+void note_sched_cap(const int64_t* v);
 /* Lever PSK design 2: hand the scheduler's plan for trunk pass `step` to the plugin that cuts by it (rad_psk_plan, every
  * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
  * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */

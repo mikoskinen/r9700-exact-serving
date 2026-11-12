@@ -6,6 +6,8 @@
 #include <link.h>
 
 #include <atomic>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -30,7 +32,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "sched_bypass_total", "ds41_psk", "ds41_psk_k", "ds41_psk_l20",
                                         "dspark_pfctx", "ds41_psk_cr", "ds41_engdd", "sched_noa", "stage_short",
                                         "stage_pick", "place_hb", "stage_full_min", "stage_full_pick", "mhc_fuse",
-                                        "ix_lds", "ix_ni", "ds41_arcoded" };
+                                        "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -88,6 +90,7 @@ struct State {
     std::atomic<int> max_tok{0};                            /* sched_short_bypass's ceiling */
     std::atomic<int64_t> dst[2];                            /* note_sched_dst: bypassed, turned away */
     std::atomic<int64_t> noa[kNoaCounts];                   /* note_sched_noa (lever NOA) */
+    std::atomic<int64_t> cap[kCapCounts];                   /* note_sched_cap (lever CAP48) */
     std::atomic<int> stage_capable{-1}, hb_capable{-1};     /* lever SA / HB: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> sahb[kSahbRanks][kSahbN];          /* note_sahb */
     std::atomic<int> sahb_ranks{0};
@@ -119,6 +122,7 @@ struct State {
         for (auto& c : smp) c.store(0, std::memory_order_relaxed);
         for (auto& c : dst) c.store(0, std::memory_order_relaxed);
         for (auto& c : noa) c.store(0, std::memory_order_relaxed);
+        for (auto& c : cap) c.store(0, std::memory_order_relaxed);
         for (auto& r : sahb)
             for (auto& c : r) c.store(0, std::memory_order_relaxed);
         for (auto& r : sp)
@@ -196,6 +200,22 @@ int env_sched_bi() {
     return env;
 }
 
+/* Lever CAP48: RADIANCE_DECODE_ROW_CAP at start, 0 .. 4096 (0 / unset: off); anything else is said once and means off. */
+int env_row_cap() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_DECODE_ROW_CAP");
+        if (!e || !*e) return 0;
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (!std::isdigit((unsigned char)e[0]) || (end && *end) || v < 0 || v > 4096) {
+            std::fprintf(stderr, "radiance: scheduler: RADIANCE_DECODE_ROW_CAP=%s is not 0 .. 4096: no decode row cap\n", e);
+            return 0;
+        }
+        return (int)v;
+    }();
+    return env;
+}
+
 int env_acq() {
     static const int env = [] {
         const char* e = std::getenv("RADIANCE_AQL_ACQ");
@@ -231,6 +251,10 @@ int reported(State& s, int i) {
     if (i == kSchedShortBypass || i == kSchedBypassTotal || i == kSchedNoa) {   /* lever DST / NOA: set, else 0 (off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : 0;
+    }
+    if (i == kSchedRowCap) {       /* lever CAP48: set, else RADIANCE_DECODE_ROW_CAP (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_row_cap();
     }
     return s.val[i].load(std::memory_order_acquire);
 }
@@ -305,6 +329,14 @@ int sched_noa() {
 void note_sched_noa(const int64_t* v) {
     State& s = st();
     for (int k = 0; k < kNoaCounts; ++k) s.noa[k].store(v[k], std::memory_order_relaxed);
+}
+int sched_row_cap() {
+    const int v = st().val[kSchedRowCap].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_row_cap();
+}
+void note_sched_cap(const int64_t* v) {
+    State& s = st();
+    for (int k = 0; k < kCapCounts; ++k) s.cap[k].store(v[k], std::memory_order_relaxed);
 }
 bool aql_acq_none() {
     static const bool none = [] { const char* e = std::getenv("RADIANCE_AQL_ACQ"); return e && !std::strcmp(e, "none"); }();
@@ -569,7 +601,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "draft_lend_w, draft_occ, draft_occ_k, place_lf, sched_bi_chunk, sched_interleave, sched_mixed_tok, "
                         "sched_short_bypass, sched_bypass_total, ds41_psk, ds41_psk_k, ds41_psk_l20, dspark_pfctx, "
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
-                        "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, epoch_bump)";
+                        "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -927,6 +959,14 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedRowCap) {       /* lever CAP48 */
+        if (v < 0 || v > 4096) {
+            if (err) *err = "sched_row_cap takes 0 (off) or 1 .. 4096: the most decode rows a step carries (drafts trimmed, "
+                            "the deepest first; a step whose decoding sequences alone exceed it is left as planned)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedBypassTotal) {  /* lever DST */
         const int q = s.quantum.load(std::memory_order_acquire);
         if (v != 0 && (v < 0 || v > 65536 || (q > 0 && v % q != 0))) {
@@ -1042,7 +1082,7 @@ bool apply_pending(int step, int* sched) {
         if (reported(s, i) == v) {
             if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
-                i == kStageFullMin || i == kStageFullPick)
+                i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
@@ -1211,6 +1251,15 @@ std::string state_json() {
         for (int k = 0; k < kNoaCounts; ++k)
             o += std::string(k ? ", " : "") + "\"" + kNoa[k] + "\": " +
                  std::to_string((long long)s.noa[k].load(std::memory_order_relaxed));
+        o += "}";
+    }
+    /* Lever CAP48's counts, once a scheduler registered (sched_register). */
+    if (s.max_tok.load(std::memory_order_acquire) > 0) {
+        static const char* const kCap[kCapCounts] = { "steps_capped", "drafts_trimmed", "ahead_capped", "steps_over",
+                                                      "steps_gt48", "max_rows", "decode_steps" };
+        o += ", \"cap\": {\"in_force\": " + std::to_string(reported(s, kSchedRowCap));
+        for (int k = 0; k < kCapCounts; ++k)
+            o += std::string(", \"") + kCap[k] + "\": " + std::to_string((long long)s.cap[k].load(std::memory_order_relaxed));
         o += "}";
     }
     /* The depth-0 context skip, once the engine registered it (set up or not). */
