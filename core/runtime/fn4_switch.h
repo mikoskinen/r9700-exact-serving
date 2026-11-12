@@ -45,7 +45,9 @@
  *                                                                                                    RADIANCE_FN4_HC_BI
  *   bi_seg          architecture plugin (rad_fn4_switch): fn4 BI -- every trunk linear (LinearFP8) cut at the step's
  *                   segments (decode rows, each prefill sequence): a decode row's linears at its own height (the
- *                   narrow tiles, M-invariant to 64); 0 one launch over the step                        RADIANCE_FN4_BI_SEG
+ *                   narrow tiles, M-invariant to 64); 2 also the lm_head at each output row's alone height class
+ *                   (a prompt's last row its own M = 1 launch: logits_gemm runs a matvec at M <= 2, WMMA from 3);
+ *                   0 one launch over the step                                                     RADIANCE_FN4_BI_SEG
  *   exl3_dual       architecture plugin (rad_fn4_switch): fn4 BI-dual -- every trunk MoE layer's EXL3 down takes the
  *                   step's row bands (libr4d bi_band, exl3 interface v12): a mixed step's decode rows get the decode
  *                   band's bytes in the prefill band's pass; needs RADIANCE_FN4_X3DUAL=1 at start (declares the

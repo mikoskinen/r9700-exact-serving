@@ -301,7 +301,8 @@ static std::atomic<int>& fn4_hcbi_flag() {
 }
 /* fn4 BI: switch bi_seg's value (RADIANCE_FN4_BI_SEG starts it): the trunk's linears cut at the step's segments. */
 static std::atomic<int>& fn4_biseg_flag() {
-    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_BI_SEG") ? 1 : 0};
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_BI_SEG");
+                                   const int v = e && *e ? std::atoi(e) : 0; return v == 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 BI: the step's segments (Model::bi_cut) when hc_bi or bi_seg is on; the reads take them under hc_bi
@@ -322,6 +323,36 @@ static void bi_segments(Model& m, const RadBatch* batch) {
             if (batch->positions_h[r] != batch->positions_h[r - 1] + 1) m.bi_cut.push_back(r);
     m.bi_cut.push_back(T);
     if (seg && m.bi_cut.size() > 2) bi_cuts() = BiCuts{m.bi_cut.data(), (int)m.bi_cut.size()};
+}
+/* fn4 BI (switch bi_seg 2): the lm_head at each output row's ALONE height class. logits_gemm (fp8 / i8 head) runs a
+ * matvec at M <= 2 and WMMA from M = 3; within WMMA a row's bytes do not depend on M (lm_wmma_body: each 128-column scale
+ * block's WMMA partial, then fmaf into the row's accumulator, blocks in K order whatever MT / FKB), so only the class
+ * matters. Alone, a prompt's last row is M = 1 and a decode sequence's verify rows M = 1 + n_spec. The outputs are the
+ * decode rows (core/sched/batch.cpp: a decode entry gives its 1 + n_spec rows, decode entries first) then one row a prompt
+ * that finishes this step: the decode rows go in one launch when 1 + n_spec >= 3 (else a launch a sequence, at its own
+ * M), each prompt's row in a launch of its own. Returns false (the caller issues one launch) when off, or when the step's
+ * outputs do not have that form (uneven verify blocks, scoring rows). 12.11.2026, fn4 180: the logits were the first
+ * differing op in 19 of 40 probes, every one a prompt's last row in a mixed step. */
+static bool bi_logits(RadCtx* c, const Model& m, const RadBatch* batch) {
+    if (fn4_biseg_flag().load(std::memory_order_relaxed) < 2) return false;
+    const int64_t n = batch->n_out;
+    if (n <= 1) return false;                      /* one row: already its alone class */
+    int64_t sd = 0, td = 0;
+    batch_split(batch, &sd, &td);
+    const int64_t qd = (int64_t)batch->n_spec + 1;
+    if (td < 0 || td > n || sd < 0 || td != sd * qd) return false;
+    if (n - td > batch->n_seq - sd) return false;  /* more rows than finishing prompts can give */
+    const int64_t D = m.g.n_embd, V = m.g.n_vocab;
+    auto one = [&](int64_t r0, int64_t k) {
+        RAD_ISSUE_N(c, m.op_logits, k, brow_slice(m.b_hout, r0, k, D), RAD_W(m.w_lm_head),
+                    brow_slice(m.b_logits, r0, k, V));
+    };
+    if (td > 0) {
+        if (qd >= 3) one(0, td);
+        else for (int64_t s = 0; s < sd; ++s) one(s * qd, qd);
+    }
+    for (int64_t r = td; r < n; ++r) one(r, 1);
+    return true;
 }
 /* A connection's read over rows [r0, r0 + n), cut at the step's segments under hc_bi. */
 static void bi_read(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t T, int64_t r0, int64_t n, bool ss = false) {
@@ -2197,9 +2228,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_gather, batch->n_out,
                     brows(m.a_x.x, T), praw(batch->out_ids, RAD_I32, batch->n_out),
                     brows(m.b_hout, batch->n_out));
-        RAD_ISSUE_N(c, m.op_logits, batch->n_out,
-                    brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
-                    brows(m.b_logits, batch->n_out));
+        if (!bi_logits(c, m, batch))
+            RAD_ISSUE_N(c, m.op_logits, batch->n_out,
+                        brows(m.b_hout, batch->n_out), RAD_W(m.w_lm_head),
+                        brows(m.b_logits, batch->n_out));
         bt_pt(c, m, m.b_logits, 0, batch->n_out, "logits", -1, 1);
     }
     bt_flush(c, m, batch);
@@ -2331,8 +2363,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments */
-        if (value < 0 || value > 1) return -1;
+    if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */
+        if (value < 0 || value > 2) return -1;
         qwen4exp_fp8::fn4_biseg_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
