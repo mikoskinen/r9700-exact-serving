@@ -544,6 +544,7 @@ private:
     /* fn4 lever BI chunking (switch sched_bi_chunk, RADIANCE_SCHED_BI_CHUNK at start): 0 today; 1 / 2 / 3 / 4 the
      * ds41-bi options (bi_chunk_plan) -- a prompt's chunk boundaries the same alone and beside other work. */
     int           bi_chunk_ = 0;
+    bool          bi_lone_last_ = false;   /* fn4 BI chunking 5: the last step was a lone prefill step */
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share);
     IKVManager*   kv_ = nullptr;
