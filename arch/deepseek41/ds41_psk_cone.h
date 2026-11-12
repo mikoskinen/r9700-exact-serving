@@ -9,6 +9,9 @@
  *                 its all-row part (the collapse + norm, the compressor, the latent / index-key stores) over every row,
  *                 and the all-row part touches no routed expert, so a pass with no row in layer 20's cone stages no
  *                 layer from 20 on;
+ *   plan_end_from lever PSK-CR (ds41-pskcr): plan_end with each sequence's own first cut layer -- a cone-replay chunk is
+ *                 cut from layer 0 (its every layer runs its target's cone only), any other from the first PSK layer;
+ *                 below its first cut layer a sequence runs every row;
  *   pfctx_runs    lever PSK-DS (ds41-pskl20): the rows of a DSpark context pass (draft_pass -1, one row a trunk row)
  *                 a drafter can still read -- each entry's last `keep` rows (the drafter window, c.window + 1 = 129:
  *                 a query reads the last `window` context keys before its anchor, the anchor at or past the entry's
@@ -51,6 +54,20 @@ inline int plan_end(int n_layer, int window, int from, int n, const int32_t* ahe
     for (int l = from; l < n_layer; ++l) {
         bool any = false;
         for (int i = 0; i < n && !any; ++i) any = rows(cone(n_layer, window, l), ahead[i], rws[i]) > 0;
+        if (!any) return l;
+    }
+    return n_layer;
+}
+
+/* Lever PSK-CR: the first layer at which none of the n planned prefill sequences runs a row, sequence i cut from layer
+ * from[i] on (below it every row, rws[i] > 0); n_layer when every layer runs one. */
+inline int plan_end_from(int n_layer, int window, int n, const int32_t* ahead, const int32_t* rws, const int32_t* from) {
+    int lo = n_layer;
+    for (int i = 0; i < n; ++i) lo = std::min(lo, (int)from[i]);
+    for (int l = std::max(lo, 0); l < n_layer; ++l) {
+        bool any = false;
+        for (int i = 0; i < n && !any; ++i)
+            any = l < from[i] ? rws[i] > 0 : rows(cone(n_layer, window, l), ahead[i], rws[i]) > 0;
         if (!any) return l;
     }
     return n_layer;

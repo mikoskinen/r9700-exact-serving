@@ -740,11 +740,13 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                 }
                 bt_len = (int64_t)bt.size();
                 table_end = bt_len * L.block_size;
+                /* lever PSK-CR: a replay chunk writes no full-group entry (its global KV is the cache's) */
+                const bool mask = e.cr_replay && L.kind == RAD_KV_FULL;
                 for (int32_t j = 0; j < e.n_tokens; ++j) {
                     const int64_t pos = (int64_t)e.ctx_len + j;
-                    g.h_slot[t + j] = has_win
-                        ? kvgeom_.slot_ring((int)gi, bt, first, pos, win)
-                        : kvgeom_.slot((int)gi, bt, first, pos);
+                    g.h_slot[t + j] = mask ? -1
+                        : has_win ? kvgeom_.slot_ring((int)gi, bt, first, pos, win)
+                                  : kvgeom_.slot((int)gi, bt, first, pos);
                 }
                 /* Restage relative to what the card holds (BtMirror). The same sequence in the
                  * same row keeps entries below the first changed one and below the end of both
@@ -778,6 +780,8 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                  * and the block-table row is that slot, so table-reading kernels need no second
                  * path. */
                 int32_t st = kv.state_slot(e.seq, (int32_t)gi);
+                /* lever PSK-CR: nor any linear state (the compressor tail a store would advance) */
+                if (e.cr_replay && L.kind == RAD_KV_LINEAR) st = -1;
                 for (int32_t j = 0; j < e.n_tokens; ++j) g.h_slot[t + j] = st;
                 pay[np + i] = st;
                 /* Every conv group, at its own row. Feeds only DeriveInput::conv_slot; conv
@@ -811,7 +815,7 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
             }
             if (used < 0) used = 0;
             g.h_used[i] = (int32_t)used;
-            if (L.paged) {
+            if (L.paged || (e.cr_replay && L.kind == RAD_KV_LINEAR)) {   /* lever PSK-CR: no state slot, as above */
                 for (int64_t j = 0; j < g.sidx_pitch; ++j) g.h_sidx[i * g.sidx_pitch + j] = -1;
             } else {
                 kv.state_index_row(e.seq, (int32_t)gi, g.h_sidx + i * g.sidx_pitch,

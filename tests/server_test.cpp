@@ -5017,7 +5017,8 @@ TEST(the_runtime_switches_are_checked_whole_queued_and_applied_at_a_step_release
     for (const char* b : { R"({"ds41_argather":4})", R"({"ds41_shexp_lane":1})", R"({"ds41_kvfold":1})",
                            R"({"ds41_ofold":1})", R"({"ds41_onefill":1})", R"({"dspark_walk":1})",
                            R"({"ds41_bi":1})", R"({"ds41_psk":1})", R"({"ds41_psk":2})", R"({"ds41_psk_l20":1})",
-                           R"({"ds41_psk_l20":0})", R"({"dspark_pfctx":1})", R"({"dspark_pfctx":0})" }) {
+                           R"({"ds41_psk_l20":0})", R"({"dspark_pfctx":1})", R"({"dspark_pfctx":0})",
+                           R"({"ds41_psk_cr":1})", R"({"ds41_psk_cr":0})", R"({"ds41_psk":4})" }) {
         const HttpResponse r = f.post("/admin/fn4", b);
         CHECK_EQ(r.status, 400);
         CHECK(has(r.body, "no loaded plugin serves it"));
@@ -5355,11 +5356,24 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     fn4::note_sched(fn4::kDs41PskK, 8);
     CHECK(has(f.get("/admin/fn4").body, "\"ds41_psk\": -1, \"ds41_psk_k\": 8"));
     /* levers PSK-L20 / PSK-DS (ds41-pskl20): appended after ds41_psk_k, deepseek41's (not loaded here: -1) */
-    CHECK(has(f.get("/admin/fn4").body, "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1}"));
+    /* lever PSK-CR (ds41-pskcr): ds41_psk_cr appended after dspark_pfctx, deepseek41's (-1 here) */
+    CHECK(has(f.get("/admin/fn4").body,
+              "\"ds41_psk_k\": 8, \"ds41_psk_l20\": -1, \"dspark_pfctx\": -1, \"ds41_psk_cr\": -1}"));
     CHECK_EQ(fn4::switch_index("ds41_psk_l20"), (int)fn4::kDs41PskL20);
     CHECK_EQ(fn4::switch_index("dspark_pfctx"), (int)fn4::kDsparkPfctx);
-    CHECK_EQ((int)fn4::kDsparkPfctx + 1, (int)fn4::kSwitches);
-    CHECK(!fn4::sched_switch(fn4::kDs41PskL20) && !fn4::sched_switch(fn4::kDsparkPfctx));
+    CHECK_EQ(fn4::switch_index("ds41_psk_cr"), (int)fn4::kDs41PskCr);
+    CHECK_EQ((int)fn4::kDsparkPfctx + 1, (int)fn4::kDs41PskCr);
+    CHECK_EQ((int)fn4::kDs41PskCr + 1, (int)fn4::kSwitches);
+    CHECK(!fn4::sched_switch(fn4::kDs41PskL20) && !fn4::sched_switch(fn4::kDsparkPfctx) &&
+          !fn4::sched_switch(fn4::kDs41PskCr));
+    {   /* no plugin serves a plan, a replay plan or a reach here */
+        const int32_t ah[1] = { 0 }, rw[1] = { 4096 }, fl[1] = { 1 };
+        CHECK_EQ(fn4::psk_plan(7, 0, 1, ah, rw, fl), -1);
+        CHECK_EQ(fn4::psk_cr_reach(), -1);
+        int64_t st[fn4::kPskStats];
+        CHECK_EQ(fn4::psk_stats(st), 0);
+        for (int i = 0; i < fn4::kPskStats; ++i) CHECK_EQ(st[i], (int64_t)0);
+    }
     CHECK_EQ(f.post("/admin/fn4", R"({"ds41_psk_k":4})").status, 200);
     CHECK(fn4::apply_pending(41, sw));
     CHECK_EQ(sw[fn4::kDs41PskK], 4);

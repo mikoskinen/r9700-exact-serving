@@ -820,6 +820,10 @@ struct Request {
      * quantum) and writes a checkpoint (Scheduler::plan_chunk), so following requests reuse the
      * whole head. /v1/systemone sets it on the first of several questions over one state. */
     int64_t              checkpoint_at = 0;
+    /* Lever PSK-CR (ds41-pskcr, the scheduler's): while n_computed < cr_end the prompt's chunks are a cone replay that
+     * rebuilds the windowed state at cr_end over global KV adopted from the prefix cache (no chunk crosses it, none
+     * takes a snapshot); 0 none. */
+    int32_t              cr_end = 0;
 
     /* Non-null: read the raw logits at these ids at the prompt's last position (TokenScores).
      * The request still samples the one token max_tokens allows; the caller discards it. */

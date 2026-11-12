@@ -231,10 +231,16 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     /* lever PSK's live counters (ds41-int7-pskglue): present, and 0 with no plan made and no plugin serving it */
     REQUIRE(s.contains("psk"));
     CHECK_EQ(s["psk"].value("mode", 99), -1);
+    CHECK_EQ(s["psk"].value("cr", 99), -1);
     for (const char* k : { "latched", "planned_steps", "ckpt_anchor", "ckpt_dropped", "fallback_resumes", "fallback_tokens",
                            "engine_planned_passes", "passes_ended_early", "stager_layers_skipped", "plugin_planned_passes",
                            "cut_passes", "layers_skipped", "rows_skipped_l21_29", "rows_skipped_l30_39", "plan_mismatch",
-                           "l20_cut_passes", "l20_rows_skipped", "l20_cone_empty", "l20_layers_not_staged" }) {
+                           "l20_cut_passes", "l20_rows_skipped", "l20_cone_empty", "l20_layers_not_staged",
+                           /* lever PSK-CR (ds41-pskcr) */
+                           "cr_hits", "cr_rows_replayed", "cr_resume_tokens", "cr_fallbacks", "cr_fallback_unplanned",
+                           "cr_fallback_geometry", "cr_fallback_adopt", "cr_not_needed", "tail_only_latched",
+                           "tail_only_refused", "cr_passes", "cr_layer_rows_run", "cr_layer_rows_skipped",
+                           "cr_chains_skipped", "cr_mixed_passes" }) {
         CHECK(s["psk"].contains(k));
         CHECK_EQ(s["psk"].value(k, (int64_t)-1), (int64_t)0);
     }
