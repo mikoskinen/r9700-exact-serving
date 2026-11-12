@@ -1921,6 +1921,24 @@ TEST(kv_window_grows_below_an_adopted_length) {
         CHECK(first <= s - 64 + 16 || first == 0);              /* the window behind the chunk's first row */
         CHECK_EQ(first + (int64_t)kv.block_table(2, GW).size() * 16, s + 128);   /* reaches the chunk's end */
     }
+    /* ds41-pskcr2: the replay's end H = 512 is a snapshot -- the engine's save (Engine::save_checkpoints) reads the window
+     * behind it, which the replay's last chunk holds: the rows a query at 512 reads back to (blocks 28..31, padded to
+     * window_blocks), as for the cold sequence; a third sequence is seeded from them as a restore seeds one */
+    {
+        std::vector<int32_t> rows, rows1;
+        CHECK(kv.window_rows(2, 512, &rows));
+        CHECK(kv.window_rows(1, 512, &rows1));
+        CHECK_EQ((long long)rows.size(), (long long)rows1.size());
+        const std::vector<int32_t> t2 = kv.block_table(2, GW);
+        const int64_t f2 = kv.first_block_pos(2, GW) / 16;
+        REQUIRE((long long)rows.size() >= 5ll && f2 <= 28 && (int64_t)t2.size() >= 32 - f2);
+        for (int j = 0; j < 4; ++j) CHECK_EQ(rows[(size_t)j], t2[(size_t)(28 + j - f2)]);
+        for (size_t j = 4; j < rows.size(); ++j) CHECK_EQ(rows[j], -1);
+        CHECK_OK(kv.add_sequence(3));
+        CHECK_OK(kv.seed_window(3, 512));
+        CHECK_EQ(kv.first_block_pos(3, GW), 448ll);
+        kv.free_sequence(3);
+    }
     /* at the length: a no-op again; past it, every group grows */
     const std::vector<int32_t> wt = kv.block_table(2, GW);
     CHECK_OK(kv.ensure(2, 512, 384));
