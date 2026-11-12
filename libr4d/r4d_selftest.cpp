@@ -20943,6 +20943,8 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     };
     /* fn4 (12.11.2026): R4D_SELFTEST_KC_ROWS pins the read's K split to that height (hc_read kc_rows, SP-hc's quarter read) */
     if (const char* e = std::getenv("R4D_SELFTEST_KC_ROWS"); e && std::atoll(e) > 0) ps.push_back(PI("kc_rows", std::atoll(e)));
+    /* fn4 (12.11.2026): R4D_SELFTEST_BI_DEC=1 times hc_bi 5's one-launch decode read (bi_dec: form G in 8-row groups + B3) */
+    if (const char* e = std::getenv("R4D_SELFTEST_BI_DEC"); e && std::atoi(e) > 0) ps.push_back(PI("bi_dec", 1));
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size();
