@@ -22,9 +22,42 @@
 #include "rad_fp8.h"
 
 #include <cstring>
+#include <atomic>
+#include <cstdlib>
+#include <vector>
 
 namespace rad {
 namespace arch {
+
+/* fn4 BI (12.11.2026, switch att_bi / RADIANCE_FN4_ATT_BI): 1 = a step that holds a prefill sequence beside other
+ * sequences issues each prefill sequence's dense attention in a launch of its own, shaped as its alone step's: band =
+ * its query rows, q / out sliced to its rows, its own table row and seqused (so the host bound, the split law's units
+ * and cap and the decode-band partials are its own), no cu (one sequence). The decode sequences keep one launch at their
+ * band. 0 (default) = today's launches. fn4 180: L03.att first-differing in 19 of 40 probes, every one a prompt's rows in
+ * a mixed step -- at 10 rows or fewer the alone step runs the split-KV decode row and the mixed step the query-tiled row
+ * at the top band; above, the mixed launch's query bound / split cap moved with the step. */
+inline std::atomic<int>& fn4_attbi_flag() {
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
+                                   return e && *e && std::atoi(e) > 0 ? 1 : 0; }()};
+    return f;
+}
+/* fn4 att_bi: the prefill sequences' row counts of a step, from the full-attention group's host seqused and the host
+ * positions (a sequence's rows end at position seqused - 1); false when they do not tile rows [DT, T) exactly. */
+inline bool attbi_rows(const RadBatch* b, const RadKVGroupBatch* kvb, int64_t D, int64_t DT, int64_t T,
+                       std::vector<int64_t>& q) {
+    q.clear();
+    if (!b || !kvb || !kvb->seqused_h || !b->positions_h || D < 0 || DT < 0 || DT > T) return false;
+    int64_t r = DT;
+    for (int64_t s = D; s < b->n_seq; ++s) {
+        if (r >= T) return false;
+        const int64_t n = (int64_t)kvb->seqused_h[s] - (int64_t)b->positions_h[r];
+        if (n < 1 || r + n > T) return false;
+        if (b->positions_h[r + n - 1] != kvb->seqused_h[s] - 1) return false;
+        q.push_back(n);
+        r += n;
+    }
+    return r == T;
+}
 
 /* Whether the streamed store has a row for this cache layout: libr4d's are E4M3 and bf16 only. A
  * packed cache (fp8_v4, k6_v4) must not declare it, since a weightless op with no row is a hole
@@ -811,7 +844,27 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         const int64_t pitch = kvb ? kvb->block_table_pitch : 0;
         const int32_t qp = batch->max_q_len_prefill > 0 ? batch->max_q_len_prefill
                                                         : batch->max_q_len;
-        if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
+        std::vector<int64_t> bq;
+        if (fn4_attbi_flag().load(std::memory_order_relaxed) > 0 && batch->n_seq > 1 && D < batch->n_seq &&
+            table && used && batch->draft_pass == 0 && attbi_rows(batch, kvb, D, DT, T, bq)) {
+            const int64_t qw = g.q_dim();
+            if (D > 0)
+                RAD_ISSUE_N(c, op_attn, batch->max_q_len_decode > 0 ? batch->max_q_len_decode : batch->max_q_len,
+                            brows(w.q, DT), kv_cache(kv, layer),
+                            praw2(table, RAD_I32, D, pitch), praw(used, RAD_I32, D),
+                            RAD_NONE, RAD_NONE, praw(batch->cu_seqlens, RAD_I32, D + 1),
+                            brows(w.attn.x, DT));
+            int64_t r0 = DT;
+            for (size_t j = 0; j < bq.size(); ++j) {
+                const int64_t s = D + (int64_t)j, n = bq[j];
+                RAD_ISSUE_N(c, op_attn, n,
+                            brow_slice(w.q, r0, n, qw), kv_cache(kv, layer),
+                            praw2(table + s * pitch, RAD_I32, 1, pitch), praw(used + s, RAD_I32, 1),
+                            RAD_NONE, RAD_NONE, RAD_NONE,
+                            brow_slice(w.attn.x, r0, n, qw));
+                r0 += n;
+            }
+        } else if (batch->phase == RAD_PHASE_MIXED && D > 0 && D < batch->n_seq &&
             batch->max_q_len_decode > 0 && qp > batch->max_q_len_decode) {
             const int64_t P = batch->n_seq - D;
             RAD_ISSUE_N(c, op_attn, batch->max_q_len_decode,

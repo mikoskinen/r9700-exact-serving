@@ -2363,6 +2363,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_pair_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
+        if (value < 0 || value > 1) return -1;
+        rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */
         if (value < 0 || value > 2) return -1;
         qwen4exp_fp8::fn4_biseg_flag().store(value, std::memory_order_relaxed);

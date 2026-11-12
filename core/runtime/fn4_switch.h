@@ -48,6 +48,9 @@
  *                   narrow tiles, M-invariant to 64); 2 also the lm_head at each output row's alone height class
  *                   (a prompt's last row its own M = 1 launch: logits_gemm runs a matvec at M <= 2, WMMA from 3);
  *                   0 one launch over the step                                                     RADIANCE_FN4_BI_SEG
+ *   att_bi          architecture plugin (rad_fn4_switch): fn4 BI -- a step's prefill sequences' dense attention each in
+ *                   a launch shaped as its alone step's (its rows, its band, its table row and seqused); 0 today's
+ *                   launches                                                                       RADIANCE_FN4_ATT_BI
  *   exl3_dual       architecture plugin (rad_fn4_switch): fn4 BI-dual -- every trunk MoE layer's EXL3 down takes the
  *                   step's row bands (libr4d bi_band, exl3 interface v12): a mixed step's decode rows get the decode
  *                   band's bytes in the prefill band's pass; needs RADIANCE_FN4_X3DUAL=1 at start (declares the
@@ -75,7 +78,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
