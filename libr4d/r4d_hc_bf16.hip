@@ -3807,7 +3807,7 @@ static int hc_readv() {
     int v = g_hc_readv.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_HC_READV");
-        const int on = (e && *e) ? (std::atoi(e) & 127) : 0;
+        const int on = (e && *e) ? (std::atoi(e) & 255) : 0;
         int want = -1;
         g_hc_readv.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_hc_readv.load(std::memory_order_relaxed);
@@ -5619,7 +5619,9 @@ __device__ __forceinline__ void hc_down_pf2_body(const unsigned short* __restric
 #pragma unroll
     for (int i = 0; i < NW; ++i) {
         const long nt = wave + i * kWaves;
-        live[i] = nt < ntt;
+        /* fn4 hc_readv bit 7 (the column split, grid.z = NW): workgroup z keeps only its waves' i == z n-tiles -- a
+         * third of the weight plane a workgroup; every accumulator's K order unchanged, so the same bytes */
+        live[i] = nt < ntt && (gridDim.z == 1 || i == (int)blockIdx.z);
         bp[i] = plane + ((live[i] ? nt : 0) * KS + ka / 16) * kWave + lane;
     }
     uint4 rb[KST][NW];
@@ -6386,7 +6388,8 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
                          unsigned short* inj, unsigned char* q, float* qs, unsigned char* rq,
                          float* rqs, long rows, long n, int hc, long lr, long ncol, long hrow,
                          long irow, long xrow, long qrow, long srow, long rqrow, long rsrow,
-                         long kc, int ks, float eps, float wadd, bool sc_ready, RadStream s) {
+                         long kc, int ks, float eps, float wadd, bool sc_ready, RadStream s,
+                         bool zsplit = false) {
     const long HN  = (long)hc * n;
     const long ntt = (ncol + 15) / 16;                        /* plane n-tiles */
     uint4* const          plane = (uint4*)wsp;
@@ -6418,12 +6421,12 @@ static int hc_pf2_launch(bool f8, bool i8, const unsigned short* h, const float*
                        dim3(kThreads), 0, h, w, (const uint4*)plane, (const float*)scale, dbuf, inj,
                        kpart, rows, n, hc, lr, ncol, ntt, hrow, irow, kc, wadd, scale, eps);
     else if ((stg & 2) && r32)
-        (void)R4D_EMIT(s, &hc_down_pf2_r32_kernel, dim3((unsigned)((rows + 31) / 32), (unsigned)ks),
+        (void)R4D_EMIT(s, &hc_down_pf2_r32_kernel, dim3((unsigned)((rows + 31) / 32), (unsigned)ks, zsplit ? (unsigned)kPf2NW : 1u),
                        dim3(kThreads), 0, h, w, (const uint4*)plane, (const float*)scale, dbuf, inj,
                        kpart, rows, n, hc, lr, ncol, ntt, hrow, irow, kc, wadd);
     else if (stg & 2)
         (void)R4D_EMIT(s, &hc_down_pf2_kernel,
-                       dim3((unsigned)((rows + kPf2RT - 1) / kPf2RT), (unsigned)ks),
+                       dim3((unsigned)((rows + kPf2RT - 1) / kPf2RT), (unsigned)ks, zsplit ? (unsigned)kPf2NW : 1u),
                        dim3(kThreads), 0, h, w, (const uint4*)plane, (const float*)scale, dbuf, inj,
                        kpart, rows, n, hc, lr, ncol, ntt, hrow, irow, kc, wadd);
     if (hipGetLastError() != hipSuccess) return RAD_E_DEVICE;
@@ -7047,7 +7050,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                 q ? (unsigned char*)q->data : nullptr, q ? (float*)qs->data : nullptr,
                 rq ? (unsigned char*)rq->data : nullptr, rq ? (float*)rqs->data : nullptr,
                 (long)rows, (long)n, (int)hc, (long)lr, ncol, (long)hrow, (long)irow, (long)xrow,
-                (long)qrow, (long)srow, (long)rqrow, (long)rsrow, kc, ks, eps, wadd, ssin != nullptr, s);
+                (long)qrow, (long)srow, (long)rqrow, (long)rsrow, kc, ks, eps, wadd, ssin != nullptr, s,
+                (hc_readv() & 128) != 0 && kcr > rows);
             return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
         }
 
@@ -7353,7 +7357,7 @@ extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }
 extern "C" void r4d_hc_read_fuse_down(int on) { g_hc_fuse_down.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_read_norm_wave(int on) { g_hc_norm_wave.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
 extern "C" void r4d_hc_write_vec(int on) { g_hc_write_vec.store(on < 0 ? 0 : on, std::memory_order_relaxed); }
-extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 127), std::memory_order_relaxed); }
+extern "C" void r4d_hc_readv(int v) { g_hc_readv.store(v < 0 ? 0 : (v & 255), std::memory_order_relaxed); }
 /* Test hook (r4d_selftest, fn4): frees this device's mix-counter slots. hc_mix_ctr keeps four
  * streams a device and never frees a slot, so a test that makes a stream a case runs out after four
  * and every later case takes the unfused up product (and no decode form G / S) -- the stock and the
@@ -7382,7 +7386,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "hc_normwave")) { g_hc_norm_wave.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_writevec")) { g_hc_write_vec.store(value < 0 ? 0 : value, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "hc_readv")) {
-        if (value < 0 || value > 127) return -1;   /* bit 6: hc_bi 5's 16-row form G (G16) */
+        if (value < 0 || value > 255) return -1;   /* bit 6: hc_bi 5's 16-row form G (G16); bit 7: the PF2 column split */
         g_hc_readv.store(value, std::memory_order_relaxed);
         return 1;
     }

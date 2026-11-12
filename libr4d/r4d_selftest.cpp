@@ -20957,7 +20957,8 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     }
     pl.norm_hc_wave(1);
     /* fn4 (12.11.2026): under bi_dec, G16 (hc_readv bit 6) against 8-row form G on every output byte (x, inj, both codes) */
-    if (std::getenv("R4D_SELFTEST_BI_DEC") && M > 8) {
+    const int cmp_or = std::getenv("R4D_SELFTEST_CMP_OR") ? std::atoi(std::getenv("R4D_SELFTEST_CMP_OR")) : 64;
+    if ((std::getenv("R4D_SELFTEST_BI_DEC") && M > 8) || std::getenv("R4D_SELFTEST_CMP_OR")) {
         auto grab = [&](int v, std::vector<uint8_t>& o) {
             pl.readv_hc(v);
             if (r->launch(&a, (RadStream)hs) != RAD_OK || st_stream_sync(hs) != hipSuccess) return false;
@@ -20970,12 +20971,13 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
             return true;
         };
         std::vector<uint8_t> g8, g16;
-        const bool okl = grab(0, g8) && grab(64, g16);
+        const bool okl = grab(0, g8) && grab(cmp_or, g16);
         size_t diff = 0;
         if (okl) for (size_t i = 0; i < g8.size() && i < g16.size(); ++i) diff += g8[i] != g16[i];
-        std::printf("hc_read_e4m3 M=%lld bi_dec: G16 (hc_readv 64) vs form G (8-row groups): %s\n", (long long)M,
+        std::printf("hc_read_e4m3 M=%lld: hc_readv %d vs 0 (bi_dec %s): %s\n", (long long)M, cmp_or,
+                    std::getenv("R4D_SELFTEST_BI_DEC") ? "on" : "off",
                     !okl ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical");
-        ok((nm + " G16 = form G").c_str(), okl && diff == 0);
+        ok((nm + fmt(" hc_readv %d = 0", cmp_or)).c_str(), okl && diff == 0);
     }
     double us[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     for (int v : { 0, 1, 2, 3, 7 }) {
