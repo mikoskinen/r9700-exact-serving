@@ -6966,6 +6966,12 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
      * (A': a row's norm, dots and finisher touch only that row; B3: its d row is one WMMA column). No form S, no
      * tiled form: a shape form G does not take is refused, never read in another form. */
     const bool bidec = r4d_geti_or(a, "bi_dec", 0) != 0;
+    /* fn4 BI (bi_dec without the inject gains: the final read, 13.11.2026): today's alone read of a sequence's 1 + n_spec
+     * rows is the per-row kernels (kernel A one block a (column tile, row), a wave a column, hc8_dot_down's fmaf order;
+     * the up-mix a thread's quarter a (W_up row, row)) -- no sum crosses rows, and the column tiling (`ta`) and the
+     * up-mix's row group only place them -- so every height reads through them, never tiled: one launch for all the
+     * step's decode rows, each row's bytes its alone read's. */
+    const bool bidec_r = bidec && !(injw && inj);
     constexpr long hcg_max = 16;
     const long hcg_nt = (lr + kHcGTile - 1) / kHcGTile;
     unsigned int* hcg_ctr = nullptr;
@@ -6992,8 +6998,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     /* Kernel B3 for forms G and S at lr 320, a single row group (bi_dec: 16-row groups); else the chained up-mix. */
     const bool hcw = hcg && lr == 320 && (rows <= 16 || bidec) && (rows <= 8 || hcs || bidec) && (n % 128) == 0
                      && (hrow % 2) == 0 && (xrow % 2) == 0;
-    if (bidec && !hcw) return R4D_NO(RAD_E_SHAPE);
-    const bool tiled  = can_tile && ((rows >= kDecMinRows && !bi2) || bi) && !hcg;
+    if (bidec && !bidec_r && !hcw) return R4D_NO(RAD_E_SHAPE);
+    const bool tiled  = can_tile && ((rows >= kDecMinRows && !bi2) || bi) && !hcg && !bidec_r;
     /* fn4 hc_readv bit 3 (W1b): the norm scales the preceding hc_write stored in `ss` (hc_ss_operand, the rule the
      * write applied), on the unchained tiled forms; there they replace this read's pass and `scale` points at them. */
     const bool chained_tiles = r4d_geti_or(a, "chain", 0) != 0 && rows <= 64;   /* chain_arg's rule below */
@@ -7291,7 +7297,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         mctr = hc_mix_ctr(s);
         fused = (mctr != nullptr);
     }
-    if (bidec && (!fused || (n / kUpTB) * ((rows + 15) / 16) > (long long)kMaxMixCtr)) return R4D_NO(RAD_E_SHAPE);
+    if (bidec && !bidec_r && (!fused || (n / kUpTB) * ((rows + 15) / 16) > (long long)kMaxMixCtr)) return R4D_NO(RAD_E_SHAPE);
+    if (bidec_r && !fused) return R4D_NO(RAD_E_SHAPE);
     if (hcw) {
         unsigned int* const qctr = q ? mctr : nullptr;
 #define HC_UPW_K(RG_, I8_)                                                                       \
