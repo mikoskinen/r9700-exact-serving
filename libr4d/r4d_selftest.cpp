@@ -20979,6 +20979,16 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
                     !okl ? "launch failed" : diff ? fmt("%zu bytes differ", diff).c_str() : "every output byte identical");
         ok((nm + fmt(" hc_readv %d = 0", cmp_or)).c_str(), okl && diff == 0);
     }
+    /* fn4 (12.11.2026): under bi_dec, kernel A' alone (the stage mask's bit 1 + 0) against the whole read: A' and B3 apart */
+    if (std::getenv("R4D_SELFTEST_BI_DEC") && pl.pf2_stages_hc) {
+        pl.readv_hc(3 | st_readv_or());
+        pl.pf2_stages_hc(3);
+        const double ta = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+        pl.pf2_stages_hc(31);
+        const double tt = st_time_us([&](int) { (void)r->launch(&a, (RadStream)hs); }, iters, hs);
+        std::printf("hc_read_e4m3 M=%lld bi_dec stages (hc_readv %d): A' %.2f us, B3 + rest %.2f us (total %.2f us)\n",
+                    (long long)M, 3 | st_readv_or(), ta, tt - ta, tt);
+    }
     double us[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     for (int v : { 0, 1, 2, 3, 7 }) {
         pl.readv_hc(v | st_readv_or());

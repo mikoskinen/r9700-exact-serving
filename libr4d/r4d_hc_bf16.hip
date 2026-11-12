@@ -7487,6 +7487,8 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                            (int)hcg_nt, (long)rows)
         HC_S_K(1);
 #undef HC_S_K
+    } else if (bidec && !bidec_r && !(g_hc_pf2_stages.load(std::memory_order_relaxed) & 2)) {
+        /* fn4 test hook (r4d_hc_pf2_stages, timing only): under bi_dec, mask bit 1 off skips kernel A' (G / G16 / G16p) */
     } else if (hcg && g16 && (hc_readv() & 256) != 0 && (hcg_nt % 2) == 0) {
         /* fn4 hc_readv bit 8: G16 with two tiles a block (and the inject tile alone) */
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_read_g16p_down<16> : &hc_read_g16p_down_kernel<16>),
@@ -7545,7 +7547,9 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
     }
     if (bidec && !bidec_r && (!fused || (n / kUpTB) * ((rows + 15) / 16) > (long long)kMaxMixCtr)) return R4D_NO(RAD_E_SHAPE);
     if (bidec_r && !fused) return R4D_NO(RAD_E_SHAPE);
-    if (hcw) {
+    if (hcw && bidec && !(g_hc_pf2_stages.load(std::memory_order_relaxed) & 8)) {
+        /* fn4 test hook (timing only): under bi_dec, mask bit 3 off skips kernel B3 */
+    } else if (hcw) {
         unsigned int* const qctr = q ? mctr : nullptr;
 #define HC_UPW_K(RG_, I8_)                                                                       \
         emit_rc = R4D_EMIT(s, (hcg_ch ? &r4dchain_hc_up_w<RG_, I8_> : &hc_up_w_kernel<RG_, I8_>),  \
