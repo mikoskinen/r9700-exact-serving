@@ -238,8 +238,14 @@ inline int64_t ar_exact_write_rows(const Geom& g) {
  *
  * ar_wire_is_exact stays false off two ranks: the embedding's collective uses it to ask whether
  * layer 0's fused norm absorbs the reduction, and at four ranks none does. */
+/* fn4 ARW (12.11.2026, switch arw_rows; 0 = today): the four-rank fused write / gather-write (one-shot: a rank sends 3x the
+ * message) only up to this many rows; above, the step keeps the separate gather / all-reduce (two-shot from ts_min: 1.5x)
+ * and write. Both forms are byte-identical (the same fp32 fold in ascending rank order, docs/OPS.md), so it is a cost lever
+ * only. Read between steps; the block and the write ask the same function in a step. */
+inline std::atomic<int>& fn4_arw_rows() { static std::atomic<int> v{0}; return v; }
 inline bool ar_wide_write_exact(const Geom& g, int64_t T) {
     if (g.world != 4 || T < 1 || T > ar_wide_write_rows(g)) return false;
+    { const int cap = fn4_arw_rows().load(std::memory_order_relaxed); if (cap > 0 && T > cap) return false; }
     const int64_t numel = T * g.n_embd;
     if (numel <= 0) return false;
     if (g.wire_exact) return true;
