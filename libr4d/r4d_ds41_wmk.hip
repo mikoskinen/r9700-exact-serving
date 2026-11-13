@@ -7,6 +7,13 @@
 #define R4D_GG_BLOCKS_ONLY 1
 #define R4D_GG_WM_SRC 1
 #include "r4d_ds41_ggml.hip"
+/* Lever WMK's prefill rows (stage 3, G3): lever GPF's tile forms (gg_pf_kernel, the stock WMMA arithmetic in other
+ * geometries) compiled here with the part fold -- the same part order as gg_wk_kernel's, so a row's bytes are the same in
+ * a <= 48-row launch and in a prefill launch of any height. r4d_ds41_ggml_pf.hip's own unit keeps the stock order. */
+#define R4D_GG_PF_KERNEL_ONLY 1
+#define R4D_GG_PF_PARTFOLD 1
+#include "r4d_ds41_ggml_pf.hip"
+#include "r4d_ds41_ggml_pf.h"
 #include "r4d_ds41_wmk.h"
 
 #include <atomic>
@@ -572,3 +579,56 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
 
 extern "C" long long r4d_gg_wk_count() { return g_gg_wk_count.load(std::memory_order_relaxed); }
 extern "C" int r4d_gg_wk_last() { return g_gg_wk_last.load(std::memory_order_relaxed); }
+
+/* ------------------------------------------------------------------ the prefill rows (G3)
+ * r4d_gg_wkpf_run: y[M, N] = x[M, K] . w[N, K]^T above the decode band under ds41_wmk 1, in the part order, on lever GPF's form
+ * `form` (the one gg_pf would pick, 0 = the stock geometry 322); a form not built here with the part fold runs 322. The
+ * geometry moves time, never bytes (each output's operations are the part order's in every form). */
+namespace {
+#define WKPF_FORMS(X) X(3, 2, 8, 0) X(4, 2, 8, 0) X(4, 2, 8, 1) X(3, 2, 8, 1) X(3, 2, 4, 0) X(2, 2, 8, 0)
+/* The running total in registers where the form keeps it without spilling (13.11. code object: every type at MT 2, q6_K at MT 3
+ * with 8 waves), else in the lane's scratch (ABL 8, TS). g_wkpf_ts (bench pin r4d_gg_wkpf_ts): 0 that rule, 1 always registers,
+ * 2 always scratch. */
+int g_wkpf_ts = 0;
+template <int T, int MT, int NT, int WN, int FI>
+int wkpf_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
+    const dim3 grid((unsigned)((A.M + 16 * MT - 1) / (16 * MT)), (unsigned)((A.N + 16 * NT * WN - 1) / (16 * NT * WN)));
+    if (grid.y > 65535u) return R4D_WK_DECLINE;
+    const unsigned lds = pf_lds<T>(MT);
+    const bool ts = g_wkpf_ts == 2 || (g_wkpf_ts == 0 && !(MT == 2 || (T == GG_Q6_K && MT == 3 && WN == 8)));
+    if (ts) {
+        if (f32out) return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, float, 8, FI>), grid, dim3(32 * WN), lds, A);
+        return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, uint16_t, 8, FI>), grid, dim3(32 * WN), lds, A);
+    }
+    if (f32out) return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, float, 0, FI>), grid, dim3(32 * WN), lds, A);
+    return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, uint16_t, 0, FI>), grid, dim3(32 * WN), lds, A);
+}
+template <int T>
+int wkpf_launch_t(RadStream s, int code, bool f32out, const GgTiledArgs& A) {
+#define WKPF_L(mt, nt, wn, fi) if (code == pf_code(mt, nt, wn, fi, 0)) return wkpf_launch_f<T, mt, nt, wn, fi>(s, f32out, A);
+    WKPF_FORMS(WKPF_L)
+#undef WKPF_L
+    return wkpf_launch_f<T, 3, 2, 8, 0>(s, f32out, A);   /* 322, the stock geometry */
+}
+std::atomic<int> g_wkpf_last{0};
+}  // namespace
+
+int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long long x_ld, int x_al, const uint8_t* w,
+                    long long w_ld, void* y, long long y_ld, long long M, long long N, long long K, int form) {
+    if ((ty != GG_Q5_K && ty != GG_Q6_K && ty != GG_Q8_0) || !x_al || K % (2 * kWmS) || M < 1 || M > 0x7fffffff || N > 0x7fffffff)
+        return R4D_WK_DECLINE;
+    GgTiledArgs A{};
+    A.x = x; A.x_ld = x_ld;
+    A.w = w; A.wtab = nullptr; A.w_ld = w_ld; A.w_es = 0;
+    A.y = y; A.y_ld = y_ld;
+    A.M = (int)M; A.N = (int)N; A.K = (int)K;
+    A.x_al = 1; A.tab_bytes = 0;
+    g_wkpf_last.store(form, std::memory_order_relaxed);
+    switch (ty) {
+    case GG_Q8_0: return wkpf_launch_t<GG_Q8_0>(s, form, f32out, A);
+    case GG_Q6_K: return wkpf_launch_t<GG_Q6_K>(s, form, f32out, A);
+    default: return wkpf_launch_t<GG_Q5_K>(s, form, f32out, A);
+    }
+}
+extern "C" int r4d_gg_wkpf_last() { return g_wkpf_last.load(std::memory_order_relaxed); }
+extern "C" void r4d_gg_wkpf_ts(int v) { g_wkpf_ts = v == 1 || v == 2 ? v : 0; }

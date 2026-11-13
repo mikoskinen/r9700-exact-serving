@@ -3762,6 +3762,21 @@ int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long 
         const unsigned grid = (unsigned)(nrg < gcap ? nrg : gcap);
         return gg_launch_gemv(s, ty, rpw, false, logits, A, grid, (unsigned)lds);
     }
+    /* lever WMK (stage 3): above the decode band under ds41_wmk 1 the part order too, on the GPF form gg_pf would take (one form
+     * of arithmetic at every row count); a call it declines runs today's prefill kernel, counted + logged */
+    if (!g_gg_wk && M > kGgDecodeRows && wmk_now() == 1) {
+        int form = 0;
+        if (r4d_gg_pf_on()) {
+            const R4dGgPfCall c{ ty, logits, xd, x_ld, wd, w_ld, yd, y_ld, (int)M, (int)N, (int)K };
+            form = r4d_gg_pf_code(c);
+        }
+        const int wp = r4d_gg_wkpf_run(s, ty, logits, xd, x_ld, x_al, wd, w_ld, yd, y_ld, M, N, K, form);
+        if (wp != R4D_WK_DECLINE) {
+            wmk_count(M);
+            return wp;
+        }
+        wmk_decline(logits ? "logits_gemm_ggml (prefill rows)" : "gemm_nt_ggml (prefill rows)", ty, N, K, M, x_al);
+    }
     GgTiledArgs A{};
     A.x = xd; A.x_ld = x_ld;
     A.w = wd; A.wtab = nullptr; A.w_ld = w_ld; A.w_es = 0;

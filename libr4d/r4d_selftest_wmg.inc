@@ -725,13 +725,16 @@ static void scan(const Plugin& pl, int iters, int rounds) {
 /* --wmkroute [types] (ds41-wmk2): lever WMK's engine path on the card. With int16's decode band set (gg_gemv 2 +
  * gg_gemv_m16 1) and fn4 ds41_wmk 1, every dense op row the engine issues -- gemm_nt_ggml, logits_gemm_ggml (f32 out),
  * gemm_nt_ggml_pair (a shared and a separate second activation), rmsnorm_gemm_nt_ggml (fold a), swiglu_clamped_gemm_nt_ggml
- * (fold e) -- at DeepSeek-V4.1's rank-0 / rank-1..3 shapes and M 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49:
- *   route   rad_wmk_stats: exactly one part-order launch a call at M <= 48, none at 49, no decline; ds41_wmk 0: none;
- *   bytes   every row of an M <= 48 call = the same row alone (M 1) under the switch (y, y2; h for the folds);
+ * (fold e) -- at DeepSeek-V4.1's rank-0 / rank-1..3 shapes and M 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 64, 97, 130 (row i of a
+ * call holds content i % 49):
+ *   route   rad_wmk_stats: the part-order launches a call issues -- one at every M (a pair above 48 rows: its two GEMMs;
+ *           stage 3's prefill rows count as part-order launches), no decline; ds41_wmk 0: none;
+ *   bytes   every row of every call = the same content alone (M 1) under the switch (y, y2; h for the folds) -- one
+ *           arithmetic at every row count, prefill heights included;
  *           plain / logits / pair outputs = the bench pin r4d_gg_wk_pin(70724) at the same M (the same kernel and code);
  *           the folds' h = h under ds41_wmk 0 (the producer's bytes either way), and h, y = the producer's own row
  *           (rmsnorm_bf16 / swiglu_clamped_bf16) then gemm_nt_ggml under the switch (the fold in the form's staging);
- *   info    the M 49 call (stage 1: the stock WMMA form above 48 rows): rows differing from the row alone.
+ *   info    the form gg_pf picked at M 130 (r4d_gg_wkpf_last).
  * WMKROUTE a (type, op), WMGVERDICT wmkroute. */
 static void route(const Plugin& pl, const char* tlist) {
     Hk h;
@@ -740,8 +743,11 @@ static void route(const Plugin& pl, const char* tlist) {
     if (!wst || !h.wk_pin) { std::printf("--wmkroute: rad_wmk_stats / r4d_gg_wk_pin absent (not the ds41-wmk2 plugin)\n"); ++g_fail; return; }
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
     const int kCode = 70724;
-    const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49 };
-    const int64_t R = 49;
+    const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 64, 97, 130 };
+    const int64_t R = 49, RB = 130;
+    auto wkpf_last = (int (*)())dlsym(pl.h, "r4d_gg_wkpf_last");
+    auto pf_pin = (void (*)(int))dlsym(pl.h, "r4d_gg_pf_pin");
+    auto wkpf_ts = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_ts");
     struct Op { const char* name; int kind; int64_t N, N2, K; const char* types; bool a2; };   /* kind 0 gemm, 1 logits, 2 pair, 3 fold a, 4 fold e */
     const Op ops[] = {
         { "attn_q_b(fold a)", 3, 8192, 0, 1280, "q5_K,q6_K", false },  { "attn_q_b", 0, 8192, 0, 1280, "q5_K,q6_K", false },
@@ -776,9 +782,15 @@ static void route(const Plugin& pl, const char* tlist) {
             if (N2) mr_weights(hw2, ty, N2, K, 0x57A0002ull ^ (uint64_t)(N2 * 7 + K));
             std::vector<uint16_t> hx, hx2;
             mr_acts(hx, xc, 0x57ACull ^ (uint64_t)(xc + op.kind));
-            hx.resize((size_t)(R * xc));
+            hx.resize((size_t)(RB * xc));
             std::memcpy(&hx[(size_t)(48 * xc)], &hx[(size_t)(7 * xc)], (size_t)xc * 2);   /* row 48 = row 7's content */
-            if (op.a2) { mr_acts(hx2, K, 0x57ADull ^ (uint64_t)K); hx2.resize((size_t)(R * K)); std::memcpy(&hx2[(size_t)(48 * K)], &hx2[(size_t)(11 * K)], (size_t)K * 2); }
+            for (int64_t i = R; i < RB; ++i) std::memcpy(&hx[(size_t)(i * xc)], &hx[(size_t)((i % R) * xc)], (size_t)xc * 2);
+            if (op.a2) {
+                mr_acts(hx2, K, 0x57ADull ^ (uint64_t)K);
+                hx2.resize((size_t)(RB * K));
+                std::memcpy(&hx2[(size_t)(48 * K)], &hx2[(size_t)(11 * K)], (size_t)K * 2);
+                for (int64_t i = R; i < RB; ++i) std::memcpy(&hx2[(size_t)(i * K)], &hx2[(size_t)((i % R) * K)], (size_t)K * 2);
+            }
             std::vector<float> g((size_t)K);
             for (int64_t k = 0; k < K; ++k) g[(size_t)k] = (k % 7 == 0) ? 0.0f : (k % 5 == 0) ? -0.25f : 0.8f + 0.001f * (float)(k % 97);
             const size_t ob = op.kind == 1 ? 4 : 2, yrow = (size_t)NY * ob, hrow = (size_t)hw_ * 2;
@@ -786,8 +798,8 @@ static void route(const Plugin& pl, const char* tlist) {
             void* d_x = dalloc(hx.size() * 2);
             void* d_x2 = op.a2 ? dalloc(hx2.size() * 2) : nullptr;
             void* d_g = dalloc((size_t)K * 4);
-            void* d_y = dalloc((size_t)R * yrow);
-            void* d_h = hrow ? dalloc((size_t)R * hrow) : nullptr;
+            void* d_y = dalloc((size_t)RB * yrow);
+            void* d_h = hrow ? dalloc((size_t)RB * hrow) : nullptr;
             if (!d_w || !d_x || !d_g || !d_y || (op.a2 && !d_x2) || (hrow && !d_h)) { std::printf("  WMKROUTE %s %s: alloc\n", ty.name, op.name); ++g_fail; continue; }
             st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
             if (N2) st_memcpy((uint8_t*)d_w + hw.size(), hw2.data(), hw2.size(), hipMemcpyHostToDevice);
@@ -855,7 +867,7 @@ static void route(const Plugin& pl, const char* tlist) {
                 st_memcpy(out.data() + (size_t)M * yrow, d_h, (size_t)M * hrow, hipMemcpyDeviceToHost);
                 return RAD_OK;
             };
-            long long r49 = -1;
+            int form130 = -1;
             /* the rows alone under the switch */
             wmk_on(1);
             std::vector<std::vector<uint8_t>> ay(R), ah(R);
@@ -879,21 +891,18 @@ static void route(const Plugin& pl, const char* tlist) {
                 const int rc = call(0, M, o);
                 stats(v1);
                 if (rc != RAD_OK) { ++bad; if (fails.size() < 400) fails += fmt(" M=%lld rc %d;", (long long)M, rc); continue; }
-                const long long want_l = M <= 48 ? 1 : 0;
+                const long long want_l = M > 48 && op.kind == 2 ? 2 : 1;
                 if (v1[1] - v0[1] != want_l) { ++launch_bad; if (fails.size() < 400) fails += fmt(" M=%lld launches %lld;", (long long)M, v1[1] - v0[1]); }
                 decl += v1[3] - v0[3];
                 long long nb = 0;
                 for (int64_t m = 0; m < M; ++m) {
-                    bool same = yrow_of(o, m) == ay[(size_t)m];
-                    if (hrow) same = same && hrow_of(o, M, m) == ah[(size_t)m];
+                    bool same = yrow_of(o, m) == ay[(size_t)(m % R)];
+                    if (hrow) same = same && hrow_of(o, M, m) == ah[(size_t)(m % R)];
                     if (!same) ++nb;
                 }
-                if (M <= 48) {
-                    rows_cmp += M; rows_bad += nb;
-                    if (nb && fails.size() < 400) fails += fmt(" M=%lld %lld rows differ from alone;", (long long)M, nb);
-                } else {
-                    r49 = nb;
-                }
+                rows_cmp += M; rows_bad += nb;
+                if (nb && fails.size() < 400) fails += fmt(" M=%lld %lld rows differ from alone;", (long long)M, nb);
+                if (M == 130 && wkpf_last) form130 = wkpf_last();
                 /* the bench pin's bytes (plain / logits / pair) and h under the switch off (folds) */
                 if (op.kind <= 2 && M <= 48) {
                     h.sw("ds41_wmk", 0);
@@ -902,7 +911,7 @@ static void route(const Plugin& pl, const char* tlist) {
                     if (call(0, M, op_) != RAD_OK || op_ != o) { ++pin_bad; if (fails.size() < 400) fails += fmt(" M=%lld != pin;", (long long)M); }
                     h.wk_pin(0);
                 }
-                if (hrow && M <= 48) {   /* the fold = its two launches under the switch (y and h) */
+                if (hrow) {   /* the fold = its two launches under the switch (y and h) */
                     std::vector<uint8_t> ou;
                     wmk_on(1);
                     if (unfused(M, ou) != RAD_OK || ou != o) { ++unf_bad; if (fails.size() < 400) fails += fmt(" M=%lld fold != two launches;", (long long)M); }
@@ -922,16 +931,38 @@ static void route(const Plugin& pl, const char* tlist) {
                     if (v1[1] - v0[1] != 0) ++off_bad;
                 }
             }
+            /* the prefill rows in every GPF form built with the part fold (pinned through gg_pf's bench pin): M 130 = alone */
+            long long form_bad = 0;
+            std::string forms_ok;
+            if (pf_pin && op.kind <= 1) {
+                for (int fc : { 322, 422, 426, 326, 321, 222 })
+                    for (int ts : { 1, 2 }) {   /* the running total in registers / in scratch */
+                        if (!wkpf_ts && ts == 2) continue;
+                        wmk_on(1);
+                        pf_pin(fc);
+                        if (wkpf_ts) wkpf_ts(ts);
+                        std::vector<uint8_t> of;
+                        const int rc = call(0, 130, of);
+                        const int used = wkpf_last ? wkpf_last() : -1;
+                        pf_pin(0);
+                        if (wkpf_ts) wkpf_ts(0);
+                        long long nb = 0;
+                        if (rc != RAD_OK) nb = -1;
+                        else for (int64_t m = 0; m < 130; ++m) if (yrow_of(of, m) != ay[(size_t)(m % R)]) ++nb;
+                        forms_ok += fmt(" %d%s:%s", fc, ts == 2 ? "s" : "r", nb == 0 && used == fc ? "ok" : nb < 0 ? "rc" : used != fc ? "notused" : "DIFF");
+                        if (nb != 0 || used != fc) ++form_bad;
+                    }
+            }
             wmk_on(0);
             clear(h);
-            const bool kb = bad || rows_bad || launch_bad || decl || pin_bad || hoff_bad || off_bad || unf_bad;
+            const bool kb = bad || rows_bad || launch_bad || decl || pin_bad || hoff_bad || off_bad || unf_bad || form_bad;
             ++keys;
             if (kb) { ++bad_keys; ++g_fail; }
-            std::printf("WMKROUTE %s %s %lldx%lld%s | rows vs alone (M 2..48): %lld of %lld differ | launches a call wrong %lld, declines %lld | "
-                        "== bench pin %d: %s | h == switch off: %s | fold == its two launches: %s | off: no launch %s | M 49 (stock form): %lld of 49 rows differ from alone -> %s%s\n",
+            std::printf("WMKROUTE %s %s %lldx%lld%s | rows vs alone (M 2..130): %lld of %lld differ | launches a call wrong %lld, declines %lld | "
+                        "== bench pin %d: %s | h == switch off: %s | fold == its two launches: %s | off: no launch %s | M 130 GPF form %d | pinned forms at M 130:%s -> %s%s\n",
                         ty.name, op.name, (long long)NY, (long long)K, op.kind == 1 ? " f32" : "", rows_bad, rows_cmp, launch_bad, decl, kCode,
                         op.kind <= 2 ? (pin_bad ? "NO" : "yes") : "n/a", hrow ? (hoff_bad ? "NO" : "yes") : "n/a", hrow ? (unf_bad ? "NO" : "yes") : "n/a",
-                        off_bad ? "NO" : "yes", r49,
+                        off_bad ? "NO" : "yes", form130, forms_ok.empty() ? " n/a" : forms_ok.c_str(),
                         kb ? "FAIL" : "ok", fails.c_str());
             std::fflush(stdout);
         }
@@ -940,7 +971,244 @@ static void route(const Plugin& pl, const char* tlist) {
     dfree_all();
     if (keys == 0) ++g_fail;
     std::printf("WMGVERDICT wmkroute: %lld (type, op) keys, %lld calls, %lld bad -> %s\n", keys, calls, bad_keys,
-                keys == 0 ? "NO DATA" : bad_keys ? "FAIL" : "PASS (every dense op row takes the part-order form at M 1..48, row bytes M-invariant, = the bench pin)");
+                keys == 0 ? "NO DATA" : bad_keys ? "FAIL" : "PASS (every dense op row in the part order at M 1..130, row bytes M-invariant across the decode and prefill forms, = the bench pin)");
+}
+
+/* --wmkref [types] (ds41-wmk2, FINDINGS F2): the dense ops against an f64 HOST REFERENCE, so the part-order form is held to the
+ * true value, not only to itself (rows = alone) or to the decode band. Weights: GGUF blocks with realistic scales (q6_K d
+ * 2^-11 .. 2^-8, int8 sub-scales; q5_K d / dmin 2^-11 .. 2^-8, 6-bit scales / mins; q8_0 d 2^-9 .. 2^-6; random quants);
+ * activations bf16 ~ N(0, 1). The reference dequantises with ggml's formulas on the host (f64) and sums x . w in f64; the
+ * folds' reference reads the h the device wrote (the GEMM half alone). For each (type, op, M): per output the error
+ * |y - ref| / sum_k |x_k w_k| (the sum's own scale: what any summation order may lose) -- mean and max -- for
+ *   D  int16's decode band (gg_gemv 2 + gg_gemv_m16 1, ds41_wmk 0),  W  ds41_wmk 1, and (info)  S  the stock WMMA form at the same M
+ *   (int16's prefill rows' arithmetic: the WMMA's own products and 16-term sums, the stock K order),
+ * both halves of a pair, the head's f32 logits. A wrong operand / scale / half shows as an error near 1, rounding as ~1e-3
+ * (bf16 output) or ~1e-6 (f32). WMKREF lines; WMGVERDICT wmkref: FAIL if W's max error exceeds 4x D's max + 1e-3. */
+static double r_h2d(uint16_t h) { return (double)rad_f16_to_f32(h); }
+static void r_deq(const MrTy& ty, const uint8_t* row, int64_t K, std::vector<double>& w) {
+    w.assign((size_t)K, 0.0);
+    const int64_t nb = K / ty.qk;
+    for (int64_t b = 0; b < nb; ++b) {
+        const uint8_t* q = row + b * ty.bb;
+        double* y = w.data() + b * ty.qk;
+        if (ty.qk == 32) {   /* q8_0 */
+            uint16_t d; std::memcpy(&d, q, 2);
+            for (int i = 0; i < 32; ++i) y[i] = r_h2d(d) * (double)(int8_t)q[2 + i];
+        } else if (!std::strcmp(ty.name, "q6_K")) {
+            const uint8_t* ql = q; const uint8_t* qh = q + 128; const int8_t* sc = (const int8_t*)(q + 192);
+            uint16_t dh; std::memcpy(&dh, q + 208, 2);
+            const double d = r_h2d(dh);
+            for (int n = 0; n < 256; n += 128) {
+                for (int l = 0; l < 32; ++l) {
+                    const int is = l / 16;
+                    const int q1 = (int)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    y[n + l] = d * sc[is] * q1;
+                    y[n + l + 32] = d * sc[is + 2] * q2;
+                    y[n + l + 64] = d * sc[is + 4] * q3;
+                    y[n + l + 96] = d * sc[is + 6] * q4;
+                }
+                ql += 64; qh += 32; sc += 8;
+            }
+        } else {   /* q5_K */
+            uint16_t dh, mh; std::memcpy(&dh, q, 2); std::memcpy(&mh, q + 2, 2);
+            const double d = r_h2d(dh), dmin = r_h2d(mh);
+            const uint8_t* scl = q + 4; const uint8_t* qh = q + 16; const uint8_t* ql = q + 48;
+            auto sm = [&](int j, int& sc, int& m) {
+                if (j < 4) { sc = scl[j] & 63; m = scl[j + 4] & 63; }
+                else { sc = (scl[j + 4] & 0xF) | ((scl[j - 4] >> 6) << 4); m = (scl[j + 4] >> 4) | ((scl[j] >> 6) << 4); }
+            };
+            int is = 0; uint8_t u1 = 1, u2 = 2;
+            for (int j = 0; j < 256; j += 64) {
+                int sc, m;
+                sm(is, sc, m); const double d1 = d * sc, m1 = dmin * m;
+                sm(is + 1, sc, m); const double d2 = d * sc, m2 = dmin * m;
+                for (int l = 0; l < 32; ++l) y[j + l] = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+                for (int l = 0; l < 32; ++l) y[j + 32 + l] = d2 * ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+                ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+            }
+        }
+    }
+}
+static void r_weights(std::vector<uint8_t>& hw, const MrTy& ty, int64_t N, int64_t K, uint64_t seed) {
+    uint64_t rs = seed;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    const int64_t rb = K / ty.qk * ty.bb;
+    hw.resize((size_t)(N * rb));
+    for (size_t i = 0; i < hw.size(); i += 8) { const uint64_t v = rnd(); std::memcpy(&hw[i], &v, std::min<size_t>(8, hw.size() - i)); }
+    auto f16p = [&](int e_lo, int e_hi) {   /* a positive normal f16 in [2^e_lo, 2^(e_hi+1)) */
+        const int e = e_lo + (int)(rnd() % (uint64_t)(e_hi - e_lo + 1));
+        return (uint16_t)(((e + 15) << 10) | (uint16_t)(rnd() & 0x3ff));
+    };
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t b = 0; b < K / ty.qk; ++b) {
+            uint8_t* blk = hw.data() + n * rb + b * ty.bb;
+            if (!std::strcmp(ty.name, "q6_K")) { const uint16_t d = f16p(-11, -8); std::memcpy(blk + 208, &d, 2); }
+            else if (!std::strcmp(ty.name, "q5_K")) { const uint16_t d = f16p(-11, -8), dm = f16p(-11, -8); std::memcpy(blk, &d, 2); std::memcpy(blk + 2, &dm, 2); }
+            else { const uint16_t d = f16p(-9, -6); std::memcpy(blk, &d, 2); }
+        }
+}
+static void refcheck(const Plugin& pl, const char* tlist) {
+    Hk h;
+    if (!hooks(pl, h, "--wmkref")) return;
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    struct Op { const char* name; int kind; int64_t N, N2, K; const char* types; bool a2; };   /* kind 0 gemm, 1 logits, 2 pair, 3 fold a, 4 fold e */
+    const Op ops[] = {
+        { "attn_q_b(fold a)", 3, 8192, 0, 1280, "q5_K,q6_K", false },  { "attn_q_b", 0, 8192, 0, 1280, "q5_K,q6_K", false },
+        { "q_a+attn_kv(pair)", 2, 1280, 512, 5120, "q5_K,q6_K", false }, { "attn_output_a g0+g1(pair a2)", 2, 1024, 1024, 4096, "q5_K,q6_K", true },
+        { "attn_output_b", 0, 5120, 0, 2048, "q5_K,q6_K", false },     { "shexp_gate_up", 0, 1536, 0, 5120, "q6_K,q8_0", false },
+        { "shexp_down(fold e)", 4, 5120, 0, 768, "q6_K,q8_0", false }, { "shexp_down_w512(fold e)", 4, 5120, 0, 512, "q6_K,q8_0", false },
+        { "engram_kv_e2", 0, 6400, 0, 6144, "q6_K", false },           { "head", 1, 32320, 0, 5120, "q6_K", false },
+    };
+    const int64_t Ms[] = { 1, 4, 16, 33, 48 };
+    long long keys = 0, bad = 0;
+    double worst_ratio = 0.0;
+    std::printf("WMK f64 reference check: per output |y - ref| / sum|x w|, D = int16's decode band, W = ds41_wmk 1\n");
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        const bool q32 = ty.qk == 32;
+        for (const Op& op : ops) {
+            if (!mr_in(op.types, ty.name) || op.K % ty.qk) continue;
+            const char* rn = op.kind == 0 ? (q32 ? "gemm_nt_ggml_qk32_gemv" : "gemm_nt_ggml_qk256_gemv")
+                           : op.kind == 1 ? (q32 ? "logits_gemm_ggml_qk32_gemv" : "logits_gemm_ggml_qk256_gemv")
+                           : op.kind == 2 ? (q32 ? "gemm_nt_ggml_pair_qk32" : "gemm_nt_ggml_pair_qk256")
+                           : op.kind == 3 ? (q32 ? "rmsnorm_gemm_nt_ggml_qk32" : "rmsnorm_gemm_nt_ggml_qk256")
+                                          : (q32 ? "swiglu_clamped_gemm_nt_ggml_qk32" : "swiglu_clamped_gemm_nt_ggml_qk256");
+            const RadKernelInfo* row = find(pl, rn);
+            if (!row) { std::printf("  WMKREF %s %s: row absent\n", ty.name, op.name); ++g_fail; continue; }
+            dfree_all();
+            const int64_t K = op.K, N = op.N, N2 = op.N2, NY = N + N2, rb = K / ty.qk * ty.bb, xc = op.kind == 4 ? 2 * K : K;
+            const int64_t MX = 48;
+            std::vector<uint8_t> hw, hw2;
+            r_weights(hw, ty, N, K, 0x3EF0001ull ^ (uint64_t)(N * 7 + K));
+            if (N2) r_weights(hw2, ty, N2, K, 0x3EF0002ull ^ (uint64_t)(N2 * 7 + K));
+            std::mt19937 rng(0x5EED ^ (unsigned)(K + N));
+            std::normal_distribution<float> nd(0.f, 1.f);
+            std::vector<uint16_t> hx((size_t)(MX * xc)), hx2(op.a2 ? (size_t)(MX * K) : 0);
+            for (auto& v : hx) v = rad_f32_to_bf16(nd(rng) * (op.kind == 4 ? 3.0f : 1.0f));
+            for (auto& v : hx2) v = rad_f32_to_bf16(nd(rng));
+            std::vector<float> g((size_t)K);
+            for (auto& v : g) v = 0.5f + 0.5f * std::fabs(nd(rng));
+            /* the reference's dequantised rows (f64) */
+            std::vector<std::vector<double>> wd((size_t)NY);
+            for (int64_t n = 0; n < NY; ++n) r_deq(ty, n < N ? &hw[(size_t)(n * rb)] : &hw2[(size_t)((n - N) * rb)], K, wd[(size_t)n]);
+            const size_t ob = op.kind == 1 ? 4 : 2;
+            void* d_w = dalloc(hw.size() + hw2.size());
+            void* d_x = dalloc(hx.size() * 2);
+            void* d_x2 = op.a2 ? dalloc(hx2.size() * 2) : nullptr;
+            void* d_g = dalloc((size_t)K * 4);
+            void* d_y = dalloc((size_t)MX * NY * ob);
+            void* d_h = op.kind >= 3 ? dalloc((size_t)MX * K * 2) : nullptr;
+            if (!d_w || !d_x || !d_g || !d_y || (op.a2 && !d_x2) || (op.kind >= 3 && !d_h)) { std::printf("  WMKREF %s %s: alloc\n", ty.name, op.name); ++g_fail; continue; }
+            st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
+            if (N2) st_memcpy((uint8_t*)d_w + hw.size(), hw2.data(), hw2.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            if (op.a2) st_memcpy(d_x2, hx2.data(), hx2.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_g, g.data(), (size_t)K * 4, hipMemcpyHostToDevice);
+            auto call = [&](int64_t M) -> int {
+                st_memset(d_y, 0xff, (size_t)M * NY * ob);
+                if (d_h) st_memset(d_h, 0x5a, (size_t)M * K * 2);
+                int rc;
+                if (op.kind == 0)
+                    rc = k1_launch(row, { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, rb }), T(d_y, RAD_BF16, { M, N }) },
+                                   { PI("M", M), PI("N", N), PI("K", K), PS("type", ty.name), PS("dtype", "bf16") });
+                else if (op.kind == 1)
+                    rc = k1_launch(row, { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, rb }), T(d_y, RAD_F32, { M, N }) },
+                                   { PI("M", M), PI("n_vocab", N), PI("n_embd", K), PS("type", ty.name), PS("dtype", "bf16") });
+                else if (op.kind == 2) {
+                    std::vector<RadTensor> t = { gqst::TP(d_x, RAD_BF16, M, K, K), T(d_w, RAD_U8, { N, rb }),
+                                                 gqst::TP(op.a2 ? d_x2 : d_x, RAD_BF16, M, K, K), T((uint8_t*)d_w + hw.size(), RAD_U8, { N2, rb }),
+                                                 gqst::TP(d_y, RAD_BF16, M, N, NY), gqst::TP((uint16_t*)d_y + N, RAD_BF16, M, N2, NY) };
+                    if (!op.a2) absent(t[2]);
+                    rc = k1_launch(row, t, { PI("M", M), PI("N", N), PI("N2", N2), PI("K", K), PS("type", ty.name), PS("dtype", "bf16") });
+                } else if (op.kind == 3)
+                    rc = k1_launch(row, { T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, rb }), T(d_g, RAD_F32, { K }),
+                                          T(d_h, RAD_BF16, { M, K }), T(d_y, RAD_BF16, { M, N }) },
+                                   { PI("M", M), PI("N", N), PI("K", K), PS("type", ty.name), PS("dtype", "bf16"), PF("eps", 1e-6) });
+                else
+                    rc = k1_launch(row, { T(d_x, RAD_BF16, { M, 2 * K }), T(d_w, RAD_U8, { N, rb }), T(d_h, RAD_BF16, { M, K }),
+                                          T(d_y, RAD_BF16, { M, N }) },
+                                   { PI("M", M), PI("N", N), PI("K", K), PS("type", ty.name), PS("dtype", "bf16"), PF("limit", 10.0) });
+                return rc != RAD_OK ? rc : (st_stream_sync(nullptr) != hipSuccess ? -999 : RAD_OK);
+            };
+            /* sampled outputs: every row, columns n % NSTEP == 0 (about 1024 a call) and every column of the pair's second half */
+            const int64_t NSTEP = std::max<int64_t>(1, N / 1024);
+            std::vector<int64_t> cols;
+            for (int64_t n = 0; n < NY; ++n) if (n >= N || n % NSTEP == 0) cols.push_back(n);
+            /* x . w in f64 and sum |x w| for row content xi */
+            auto refof = [&](const uint16_t* xi, int64_t n, double* mag) {
+                const std::vector<double>& w = wd[(size_t)n];
+                double ref = 0, mg = 0;
+                for (int64_t k = 0; k < K; ++k) { const double a = (double)rad_bf16_to_f32(xi[k]); ref += a * w[(size_t)k]; mg += std::fabs(a * w[(size_t)k]); }
+                *mag = mg;
+                return ref;
+            };
+            /* the plain ops' references, once for the 48 rows (a call's row i holds row i's content at every M) */
+            std::vector<double> R0, G0;
+            if (op.kind <= 2) {
+                R0.resize((size_t)(MX * cols.size())); G0.resize(R0.size());
+                for (int64_t i = 0; i < MX; ++i)
+                    for (size_t c = 0; c < cols.size(); ++c) {
+                        const int64_t n = cols[c];
+                        const uint16_t* xi = (op.a2 && n >= N) ? &hx2[(size_t)(i * K)] : &hx[(size_t)(i * xc)];
+                        R0[(size_t)i * cols.size() + c] = refof(xi, n, &G0[(size_t)i * cols.size() + c]);
+                    }
+            }
+            /* the error of one mode at M rows */
+            auto measure = [&](int64_t M, double* mean, double* mx, double* rmax) -> bool {
+                if (call(M) != RAD_OK) return false;
+                std::vector<uint8_t> yb((size_t)M * NY * ob);
+                st_memcpy(yb.data(), d_y, yb.size(), hipMemcpyDeviceToHost);
+                std::vector<uint16_t> hb;
+                if (d_h) { hb.resize((size_t)(M * K)); st_memcpy(hb.data(), d_h, hb.size() * 2, hipMemcpyDeviceToHost); }
+                double s = 0, m = 0, r = 0; long long cnt = 0;
+                for (int64_t i = 0; i < M; ++i)
+                    for (size_t c = 0; c < cols.size(); ++c) {
+                        const int64_t n = cols[c];
+                        double ref, mag;
+                        if (op.kind <= 2) { ref = R0[(size_t)i * cols.size() + c]; mag = G0[(size_t)i * cols.size() + c]; }
+                        else ref = refof(&hb[(size_t)(i * K)], n, &mag);
+                        double y;
+                        if (ob == 4) { float f; std::memcpy(&f, &yb[(size_t)((i * NY + n) * 4)], 4); y = f; }
+                        else { uint16_t u; std::memcpy(&u, &yb[(size_t)((i * NY + n) * 2)], 2); y = (double)rad_bf16_to_f32(u); }
+                        const double e = mag > 0 ? std::fabs(y - ref) / mag : 0.0;
+                        s += e; m = std::max(m, e); ++cnt;
+                        if (std::fabs(ref) > 0) r = std::max(r, std::min(1.0, std::fabs(y - ref) / std::fabs(ref)));
+                    }
+                *mean = cnt ? s / (double)cnt : 0; *mx = m; *rmax = r;
+                return true;
+            };
+            std::string line = fmt("WMKREF %s %s %lldx%lld%s |", ty.name, op.name, (long long)NY, (long long)K, ob == 4 ? " f32" : "");
+            bool kbad = false;
+            for (int64_t M : Ms) {
+                double dm = 0, dx = 0, dr = 0, wm = 0, wx = 0, wr = 0, sm_ = 0, sx = 0, sr = 0;
+                set_dec(h); h.sw("ds41_wmk", 0);
+                const bool okd = measure(M, &dm, &dx, &dr);
+                set_dec(h); h.sw("ds41_wmk", 1);
+                const bool okw = measure(M, &wm, &wx, &wr);
+                h.sw("ds41_wmk", 0);
+                set_stock_wm(h);   /* S: the stock WMMA form (int16's prefill rows' arithmetic) at the same M; the folds' GEMM half */
+                const bool oks = op.kind <= 2 || true ? measure(M, &sm_, &sx, &sr) : false;
+                clear(h);
+                const bool b = !okd || !okw || wx > 4.0 * dx + 1e-3;
+                kbad |= b;
+                if (okd && okw && dx > 0) worst_ratio = std::max(worst_ratio, wx / dx);
+                line += fmt(" M%lld D mean %.2e max %.2e | W mean %.2e max %.2e (W/D max x%.2f) | S mean %.2e max %.2e%s;", (long long)M, dm, dx, wm, wx,
+                            dx > 0 ? wx / dx : 0.0, oks ? sm_ : -1.0, oks ? sx : -1.0, b ? " BAD" : "");
+            }
+            clear(h);
+            ++keys; bad += kbad; g_fail += kbad;
+            std::printf("%s %s\n", line.c_str(), kbad ? "FAIL" : "ok");
+            std::fflush(stdout);
+        }
+    }
+    clear(h);
+    dfree_all();
+    if (keys == 0) ++g_fail;
+    std::printf("WMGVERDICT wmkref: %lld (type, op) keys, %lld bad, worst W/D max-error ratio %.2f -> %s\n", keys, bad, worst_ratio,
+                keys == 0 ? "NO DATA" : bad ? "FAIL (W further from the f64 reference than int16's band)" : "PASS (W as close to f64 as int16's band)");
 }
 
 }  // namespace wmg

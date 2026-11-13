@@ -30,4 +30,10 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
                   const int* x_al, const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld,
                   const long long* Nv, long long M, long long K, const GgWkFold* fo);
 
+/* Lever WMK's prefill rows (G3): above the decode band under ds41_wmk 1, the part order on lever GPF's tile form `form` (the one
+ * gg_pf would pick for the call; 0 or a form not built with the part fold = 322, the stock geometry). R4D_WK_DECLINE: not a
+ * dense GGUF call the forms take (the caller runs today's prefill kernel). */
+int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long long x_ld, int x_al, const uint8_t* w,
+                    long long w_ld, void* y, long long y_ld, long long M, long long N, long long K, int form);
+
 #endif  /* R4D_DS41_WMK_H */
