@@ -30525,6 +30525,10 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
         want.push_back({ "sp_rs_rows_4rank_ti8", 1, fmt("SP RS raw xpush drain %d", d), 2, cat({ PI("xpush", 1) }, dr(d)) });
     }
     want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw", 2, {} });
+    /* fn4 13.11.: the SP rows as the pipelined prefill issues them (overlap 1: the lane's block / thread knobs apply,
+     * RADIANCE_FN4_AR_LANE_BLOCKS / _THREADS at start) */
+    want.push_back({ "sp_rs_rows_4rank_ti8", 1, "SP RS raw xpush (lane)", 2, { PI("overlap", 1), PI("xpush", 1) } });
+    want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw (lane)", 2, { PI("overlap", 1) } });
     want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw drain 3", 2, dr(3) });
     want.push_back({ "sp_rs_rows_4rank_ti8", 0, "SP RS ti8", 2, {} });
     want.push_back({ "sp_ag_rows_4rank", 0, "SP AG ti8", 2, {} });
