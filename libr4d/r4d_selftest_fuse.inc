@@ -5,7 +5,9 @@
  *   --case rfuse (= the row router_gemm_f32_scored_topk_scatter_bf16): lever FUSE-R at DeepSeek-V4.1's router (K 5120, 384
  *       experts, top 6, sqrtsoftplus, norm, a 96-expert TP4 slice at bases 0 / 96 / 288): the stock chain gemm_nt_f32 ->
  *       router_scored_topk -> moe_scatter vs form 1 (gemm_nt_f32 -> router_scored_topk_scatter, no gate) vs form 2
- *       (router_gemm_f32_scored_topk_scatter, one launch) at M 1 .. 16, 24, 32, 40, 48, bf16 and f32 projections, random,
+ *       (router_gemm_f32_scored_topk_scatter, one launch) at M 1 .. 16, 24, 32, 40, 48 and form 1 alone at M 49, 64, 96,
+ *       128, 160, 169, 170 (ds41_rfuse 2's prefill fallback up to 1024 / top_k rows; form 2 must refuse there), bf16 and
+ *       f32 projections, random,
  *       tied (duplicated weight rows: equal logits, the lower expert must win) and NaN rows (no finite rank: expert 0 in
  *       every slot) -- logits, ids, weights, sorted_tok, expert_offset, expert_count, each with a guard tail; form 2
  *       launched twice in a row (the arrival counter must come back to zero); FUSEPERF lines at M 1 / 8 / 16 / 48 (warm =
@@ -120,7 +122,10 @@ static void rf_case(const Plugin& pl) {
                     std::memcpy(&wf[i], &u, 4);
                 }
             }
-            for (int64_t M : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 15, 16, 24, 32, 40, 48 }) {
+            /* M <= 48: forms 1 and 2; 49 .. 170: form 1 alone (ds41_rfuse 2's fallback for a prefill segment of 49 .. 170 rows,
+             * MoeFP8::pass; 170 = 1024 / top_k, the sort's one workgroup) and form 2 must refuse the height */
+            for (int64_t M : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 15, 16, 24, 32, 40, 48, 49, 64, 96, 128, 160, 169, 170 }) {
+                const bool f2m = M <= 48;   /* form 2's band */
                 void* dw = wbf ? up(wb) : up(wf);   /* again each M: dfree_all below frees every allocation */
                 void* db = up(bias);
                 std::vector<uint16_t> x((size_t)(M * K));
@@ -180,26 +185,28 @@ static void rf_case(const Plugin& pl) {
                         return r;
                     };
                     auto form2 = [&]() { return f2->launch(&af2, nullptr); };
-                    const int c0 = chain(), c1 = form1(), c2a = form2(), c2b = form2();   /* form 2 twice: the counter resets */
-                    const bool ran = c0 == RAD_OK && c1 == RAD_OK && c2a == RAD_OK && c2b == RAD_OK &&
+                    /* form 2 twice in its band (the counter resets); above it, one launch that must be refused */
+                    const int c0 = chain(), c1 = form1(), c2a = form2(), c2b = f2m ? form2() : c2a;
+                    const bool ran = c0 == RAD_OK && c1 == RAD_OK && (f2m ? (c2a == RAD_OK && c2b == RAD_OK) : c2a != RAD_OK) &&
                                      st_stream_sync(nullptr) == hipSuccess;
                     int first1 = -1, first2 = -1;
                     for (int j = 0; ran && j < 6; ++j) {
                         const std::vector<uint8_t> r0 = bytes((&o[0].lg)[j], sz[(size_t)j]);
                         if (first1 < 0 && r0 != bytes((&o[1].lg)[j], sz[(size_t)j])) first1 = j;
-                        if (first2 < 0 && r0 != bytes((&o[2].lg)[j], sz[(size_t)j])) first2 = j;
+                        if (f2m && first2 < 0 && r0 != bytes((&o[2].lg)[j], sz[(size_t)j])) first2 = j;
                     }
                     const bool same = ran && first1 < 0 && first2 < 0;
                     ++checks;
                     if (!same) ++bad_total;
                     /* one line a (weight, mode, M) at base 0, every failure named */
                     if (base == 0 || !same)
-                        ok(fmt("rfuse %s weights, %s, M=%lld, base %lld: form 1 and form 2 byte for byte vs the chain "
+                        ok(fmt("rfuse %s weights, %s, M=%lld, base %lld: %s byte for byte vs the chain "
                                "(logits, ids, weights, sorted, offsets, counts + tails)",
                                wbf ? "bf16" : "f32", mode == 0 ? "random" : mode == 1 ? "tied ranks" : "NaN rows",
-                               (long long)M, (long long)base).c_str(),
+                               (long long)M, (long long)base,
+                               f2m ? "form 1 and form 2" : "form 1 (form 2 refuses > 48 rows)").c_str(),
                            same,
-                           !ran ? fmt("rc chain %d form1 %d form2 %d / %d", c0, c1, c2a, c2b)
+                           !ran ? fmt("rc chain %d form1 %d form2 %d / %d%s", c0, c1, c2a, c2b, f2m ? "" : " (form 2 must refuse here)")
                                 : fmt("form 1: %s, form 2: %s", first1 < 0 ? "same" : kOut[first1],
                                       first2 < 0 ? "same" : kOut[first2]));
                     /* timing: bf16 weights (production, RADIANCE_DS41_ROUTER_BF16), random, base 96 */
