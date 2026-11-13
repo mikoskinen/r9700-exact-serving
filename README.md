@@ -19,18 +19,19 @@ output from a coding agent.
 
 ## Results
 
-All values are tok/s, summed over all concurrent users. Stock is the card default of 300 W, and
-the everyday setting caps each card at 210 W with a -50 mV voltage offset.
+All values are tok/s, summed over all concurrent users. Stock is the card default of 300 W with no
+voltage offset, and the everyday setting caps each card at 210 W with a -50 mV voltage offset.
+[Run it](#run-it) has the commands for both settings.
 
 | Measure | DeepSeek, stock 300 W | DeepSeek, 210 W | Qwen, stock 300 W | Qwen, 210 W |
 |---|---|---|---|---|
-| 1 user | 96 prose / 165 code | 91 prose / 152 code | 269 | 262 |
+| 1 user | 97 prose / 165 code | 91 prose / 152 code | 269 | 262 |
 | 4 users | 176 | 172 | 618 | 583 |
 | 8 users | 208 | 192 | 833 | 779 |
 | 16 users | 259 | 237 | 1,093 | 1,027 |
 | Prefill 16k | 3,740 | 3,700 | 9,540 | 9,100 |
 | Prefill 64k | 6,020 | 5,530 | 9,810 | 9,340 |
-| Prefill 128k | 6,140 | 5,610 | 9,710 | 9,240 |
+| Prefill 128k | 6,140 | 5,610 | 9,700 | 9,240 |
 
 ## What exact means
 
@@ -87,12 +88,114 @@ cd ~/models/flashnext-exl3
 echo "187ae8186cc1f2ba8bce96565592af7fc6f6ec91c9ece6b4d352eaf0432ee26f  qwen3.8-flash-next-exl3.rad" | sha256sum -c
 ```
 
-DeepSeek has no ready file. You convert it from two downloads:
+DeepSeek runs from [mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad)
+(272.3 GB in six parts) and two small files that the engine loads with it. The download needs about
+320 GB of free disk while the parts are joined:
 
-- the routed experts from the `2.25bpw` branch of
-  [turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3)
-- every other weight from [bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad),
-  an uncensored build of the same model
+```bash
+hf download mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad --local-dir ~/models/ds41-exl3
+cd ~/models/ds41-exl3
+for p in deepseek-v4.1-flash-1017-exl3-2.25bpw.rad.part-0[0-5]; do
+  cat "$p" >> deepseek-v4.1-flash-1017-exl3-2.25bpw.rad && rm "$p"
+done
+sha256sum -c SHA256SUMS
+```
+
+The DeepSeek file was converted from the routed experts of the `2.25bpw` branch of
+[turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3)
+and every other weight of [bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad),
+an uncensored build of the same model.
+
+## Run it
+
+Both models listen on port 8090 and use all four cards, so you run one at a time.
+
+### Host setup
+
+The results ran on Ubuntu 26.04 with the kernel's own amdgpu driver and Docker. ROCm is inside the
+images, so the host doesn't need it. The host needs:
+
+- `amdgpu.ppfeaturemask=0xffffffff ttm.pages_limit=104857600` on the kernel command line, which allows
+  the voltage offset and lets the driver pin up to 400 GiB of host memory
+- 512 GB of RAM, because Qwen pins about 166 GiB and DeepSeek about 276 GiB of host memory
+- the CPU settings in `gpu02/host/`, which turn off deep idle states, set the performance governor and
+  turn off NUMA balancing. Without them, decode on this host was 15 to 18 % slower.
+
+```bash
+git clone https://github.com/mikoskinen/r9700-exact-serving.git
+cd r9700-exact-serving
+sudo install -m 755 gpu02/host/gpu02-host-tuning /usr/local/sbin/
+sudo install -m 644 gpu02/host/gpu02-host-tuning.service /etc/systemd/system/
+sudo install -m 644 gpu02/host/90-gpu02-numa.conf /etc/sysctl.d/
+sudo systemctl daemon-reload && sudo systemctl enable --now gpu02-host-tuning.service && sudo sysctl --system
+sudo run/power.sh 300    # or 210 for the 210 W columns
+```
+
+[run/power.sh](run/power.sh) sets the power cap, the voltage offset and a flat fan curve on every card
+until the next reboot. Before each measurement, the cards cooled to 45 °C or less.
+
+### Qwen
+
+```bash
+docker run -d --name qwen --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/qwen.env \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-b9282bf7 \
+  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
+  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
+  --max-num-seqs 16 --max-model-len 262144 --max-num-batched-tokens 8192 \
+  --prefill-span 4 --prefill-interleave 0 --prefix-resume nearest \
+  --placement all_vram --gpu-headroom-mib 96 --kv-cache-dtype fp8 --ngram-placement ram \
+  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --num-speculative-tokens 3 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --thinking-token-budget 16000 --default-max-tokens 32768
+run/switches.sh run/qwen/switches.json
+```
+
+The server is ready in about two minutes. [run/switches.sh](run/switches.sh) waits for it, then sets
+the runtime switches of the batch-invariant kernel set and checks that each one took effect. The
+result runs on gpu02 also set the rank order with `ROCR_VISIBLE_DEVICES`, putting the cards at PCI
+bus 03, c3, 83 and 48 on ranks 0 to 3.
+
+### DeepSeek
+
+```bash
+mkdir -p /dev/shm/ds41ng
+docker run -d --name deepseek --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/ds41-exl3:/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
+  --env-file run/deepseek/deepseek.env \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-e231d919 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --served-model-name deepseek-v4.1-flash \
+  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact \
+  --placement expert_tiered --host-pool-mib 19456 --ngram-placement ram=/ngram \
+  --max-num-seqs 16 --max-model-len 524288 --max-num-batched-tokens 4160 \
+  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
+  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on
+run/switches.sh run/deepseek/switches.json
+```
+
+The server is ready in about five minutes, most of which goes to writing the 103 GiB n-gram table to
+`/dev/shm/ds41ng`.
+
+### Check the answer
+
+Both servers sample by default, so send `"temperature": 0` for exact output. DeepSeek answers this
+request with "The capital of Australia is Canberra, and it officially became the capital in 1913 when
+the city was founded and named." in every result run:
+
+```bash
+curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "deepseek-v4.1-flash", "temperature": 0, "max_tokens": 600, "reasoning_effort": "none",
+  "messages": [{"role": "user", "content": "What is the capital of Australia, and in which year did it officially become the capital? Answer in two sentences."}]}'
+```
+
+For Qwen, use `"model": "qwen3.8-flash-next"`.
 
 ## Where things are
 
@@ -105,10 +208,13 @@ The `main` branch has:
 - [docs/TESTING.md](docs/TESTING.md): the test method rules and the reasons for them.
 - [registry/](registry/): one row per tested change, rejected ones included.
 - [gpu02/](gpu02/): the test scripts, the host tuning scripts and the run summaries.
+- [run/](run/): the power script, the environment files and the runtime switches that
+  [Run it](#run-it) uses.
 
-The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches, and the current builds are
-`deepseek/current` (with `exl3/current`) and `qwen/current`. Every other branch is a single experiment
-or an earlier build, kept for the record.
+The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches. The DeepSeek image was built from
+`deepseek/current` with `exl3/current`, and the Qwen image from `qwen/current` with `exl3/fn4-dual`
+compiled with `-DEXL3R4D_DZ=2`. Every other branch is a single experiment or an earlier build, kept
+for the record.
 
 ## License
 
@@ -116,5 +222,5 @@ or an earlier build, kept for the record.
   `docs/`, `registry/` (except `registry/build.py`), and the run summaries and logs under
   `gpu02/exl3-test/runs/` and `gpu02/bench/runs/`.
 - **Apache 2.0** ([LICENSE](LICENSE)) covers the scripts and tools: `registry/build.py`, everything under
-  `gpu02/exl3-test/` outside `runs/`, and `gpu02/host/` and `gpu02/bench/` outside `runs/`. The engine
+  `gpu02/exl3-test/` outside `runs/`, `gpu02/host/` and `gpu02/bench/` outside `runs/`, and `run/`. The engine
   branches are forks of Apache 2.0 projects and keep their own LICENSE and NOTICE files.
