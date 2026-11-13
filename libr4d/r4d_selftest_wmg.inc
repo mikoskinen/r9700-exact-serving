@@ -722,4 +722,197 @@ static void scan(const Plugin& pl, int iters, int rounds) {
     std::printf("WMGVERDICT scan done\n");
 }
 
+/* --wmkroute [types] (ds41-wmk2): lever WMK's engine path on the card. With int16's decode band set (gg_gemv 2 +
+ * gg_gemv_m16 1) and fn4 ds41_wmk 1, every dense op row the engine issues -- gemm_nt_ggml, logits_gemm_ggml (f32 out),
+ * gemm_nt_ggml_pair (a shared and a separate second activation), rmsnorm_gemm_nt_ggml (fold a), swiglu_clamped_gemm_nt_ggml
+ * (fold e) -- at DeepSeek-V4.1's rank-0 / rank-1..3 shapes and M 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49:
+ *   route   rad_wmk_stats: exactly one part-order launch a call at M <= 48, none at 49, no decline; ds41_wmk 0: none;
+ *   bytes   every row of an M <= 48 call = the same row alone (M 1) under the switch (y, y2; h for the folds);
+ *           plain / logits / pair outputs = the bench pin r4d_gg_wk_pin(70724) at the same M (the same kernel and code);
+ *           the folds' h = h under ds41_wmk 0 (the producer's bytes either way);
+ *   info    the M 49 call (stage 1: the stock WMMA form above 48 rows): rows differing from the row alone.
+ * WMKROUTE a (type, op), WMGVERDICT wmkroute. */
+static void route(const Plugin& pl, const char* tlist) {
+    Hk h;
+    if (!hooks(pl, h, "--wmkroute")) return;
+    auto wst = (int (*)(long long*, int))dlsym(pl.h, "rad_wmk_stats");
+    if (!wst || !h.wk_pin) { std::printf("--wmkroute: rad_wmk_stats / r4d_gg_wk_pin absent (not the ds41-wmk2 plugin)\n"); ++g_fail; return; }
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    const int kCode = 70724;
+    const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49 };
+    const int64_t R = 49;
+    struct Op { const char* name; int kind; int64_t N, N2, K; const char* types; bool a2; };   /* kind 0 gemm, 1 logits, 2 pair, 3 fold a, 4 fold e */
+    const Op ops[] = {
+        { "attn_q_b(fold a)", 3, 8192, 0, 1280, "q5_K,q6_K", false },  { "attn_q_b", 0, 8192, 0, 1280, "q5_K,q6_K", false },
+        { "q_a+attn_kv(pair)", 2, 1280, 512, 5120, "q5_K,q6_K", false }, { "attn_output_a g0+g1(pair a2)", 2, 1024, 1024, 4096, "q5_K,q6_K", true },
+        { "attn_output_b", 0, 5120, 0, 2048, "q5_K,q6_K", false },     { "shexp_gate_up", 0, 1536, 0, 5120, "q6_K,q8_0", false },
+        { "shexp_gate_up_w512", 0, 1024, 0, 5120, "q6_K,q8_0", false }, { "shexp_down(fold e)", 4, 5120, 0, 768, "q6_K,q8_0", false },
+        { "shexp_down_w512(fold e)", 4, 5120, 0, 512, "q6_K,q8_0", false }, { "engram_kv_e2", 0, 6400, 0, 6144, "q6_K", false },
+        { "head", 1, 32320, 0, 5120, "q6_K", false },
+    };
+    long long keys = 0, bad_keys = 0, calls = 0;
+    std::printf("WMK route check (fn4 ds41_wmk 1 over int16's decode band; bench pin code %d as the byte reference)\n", kCode);
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        const bool q32 = ty.qk == 32;
+        for (const Op& op : ops) {
+            if (!mr_in(op.types, ty.name) || op.K % ty.qk) continue;
+            const char* rn = op.kind == 0 ? (q32 ? "gemm_nt_ggml_qk32_gemv" : "gemm_nt_ggml_qk256_gemv")
+                           : op.kind == 1 ? (q32 ? "logits_gemm_ggml_qk32_gemv" : "logits_gemm_ggml_qk256_gemv")
+                           : op.kind == 2 ? (q32 ? "gemm_nt_ggml_pair_qk32" : "gemm_nt_ggml_pair_qk256")
+                           : op.kind == 3 ? (q32 ? "rmsnorm_gemm_nt_ggml_qk32" : "rmsnorm_gemm_nt_ggml_qk256")
+                                          : (q32 ? "swiglu_clamped_gemm_nt_ggml_qk32" : "swiglu_clamped_gemm_nt_ggml_qk256");
+            const RadKernelInfo* row = find(pl, rn);
+            if (!row) { std::printf("  WMKROUTE %s %s: row %s absent\n", ty.name, op.name, rn); ++g_fail; ++bad_keys; ++keys; continue; }
+            dfree_all();
+            const int64_t K = op.K, N = op.N, N2 = op.N2, rb = K / ty.qk * ty.bb, xc = op.kind == 4 ? 2 * K : K;
+            const int64_t NY = N + N2, hw_ = op.kind >= 3 ? K : 0;
+            std::vector<uint8_t> hw, hw2;
+            mr_weights(hw, ty, N, K, 0x57A0001ull ^ (uint64_t)(N * 7 + K));
+            if (N2) mr_weights(hw2, ty, N2, K, 0x57A0002ull ^ (uint64_t)(N2 * 7 + K));
+            std::vector<uint16_t> hx, hx2;
+            mr_acts(hx, xc, 0x57ACull ^ (uint64_t)(xc + op.kind));
+            hx.resize((size_t)(R * xc));
+            std::memcpy(&hx[(size_t)(48 * xc)], &hx[(size_t)(7 * xc)], (size_t)xc * 2);   /* row 48 = row 7's content */
+            if (op.a2) { mr_acts(hx2, K, 0x57ADull ^ (uint64_t)K); hx2.resize((size_t)(R * K)); std::memcpy(&hx2[(size_t)(48 * K)], &hx2[(size_t)(11 * K)], (size_t)K * 2); }
+            std::vector<float> g((size_t)K);
+            for (int64_t k = 0; k < K; ++k) g[(size_t)k] = (k % 7 == 0) ? 0.0f : (k % 5 == 0) ? -0.25f : 0.8f + 0.001f * (float)(k % 97);
+            const size_t ob = op.kind == 1 ? 4 : 2, yrow = (size_t)NY * ob, hrow = (size_t)hw_ * 2;
+            void* d_w = dalloc(hw.size() + hw2.size());
+            void* d_x = dalloc(hx.size() * 2);
+            void* d_x2 = op.a2 ? dalloc(hx2.size() * 2) : nullptr;
+            void* d_g = dalloc((size_t)K * 4);
+            void* d_y = dalloc((size_t)R * yrow);
+            void* d_h = hrow ? dalloc((size_t)R * hrow) : nullptr;
+            if (!d_w || !d_x || !d_g || !d_y || (op.a2 && !d_x2) || (hrow && !d_h)) { std::printf("  WMKROUTE %s %s: alloc\n", ty.name, op.name); ++g_fail; continue; }
+            st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
+            if (N2) st_memcpy((uint8_t*)d_w + hw.size(), hw2.data(), hw2.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            if (op.a2) st_memcpy(d_x2, hx2.data(), hx2.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_g, g.data(), (size_t)K * 4, hipMemcpyHostToDevice);
+            /* one call of M rows from activation row r0; out = y rows (then h rows) */
+            auto call = [&](int64_t r0, int64_t M, std::vector<uint8_t>& out) -> int {
+                uint16_t* x = (uint16_t*)d_x + r0 * xc;
+                st_memset(d_y, 0xff, (size_t)M * yrow);
+                if (hrow) st_memset(d_h, 0x5a, (size_t)M * hrow);
+                int rc;
+                if (op.kind == 0) {
+                    rc = k1_launch(row, { T(x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, rb }), T(d_y, RAD_BF16, { M, N }) },
+                                   { PI("M", M), PI("N", N), PI("K", K), PS("type", ty.name), PS("dtype", "bf16") });
+                } else if (op.kind == 1) {
+                    rc = k1_launch(row, { T(x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, rb }), T(d_y, RAD_F32, { M, N }) },
+                                   { PI("M", M), PI("n_vocab", N), PI("n_embd", K), PS("type", ty.name), PS("dtype", "bf16") });
+                } else if (op.kind == 2) {
+                    std::vector<RadTensor> t = { gqst::TP(x, RAD_BF16, M, K, K), T(d_w, RAD_U8, { N, rb }),
+                                                 gqst::TP(op.a2 ? (void*)((uint16_t*)d_x2 + r0 * K) : (void*)x, RAD_BF16, M, K, K),
+                                                 T((uint8_t*)d_w + hw.size(), RAD_U8, { N2, rb }),
+                                                 gqst::TP(d_y, RAD_BF16, M, N, NY), gqst::TP((uint16_t*)d_y + N, RAD_BF16, M, N2, NY) };
+                    if (!op.a2) absent(t[2]);
+                    rc = k1_launch(row, t, { PI("M", M), PI("N", N), PI("N2", N2), PI("K", K), PS("type", ty.name), PS("dtype", "bf16") });
+                } else if (op.kind == 3) {
+                    rc = k1_launch(row, { T(x, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, rb }), T(d_g, RAD_F32, { K }),
+                                          T(d_h, RAD_BF16, { M, K }), T(d_y, RAD_BF16, { M, N }) },
+                                   { PI("M", M), PI("N", N), PI("K", K), PS("type", ty.name), PS("dtype", "bf16"), PF("eps", 1e-6) });
+                } else {
+                    rc = k1_launch(row, { T(x, RAD_BF16, { M, 2 * K }), T(d_w, RAD_U8, { N, rb }), T(d_h, RAD_BF16, { M, K }),
+                                          T(d_y, RAD_BF16, { M, N }) },
+                                   { PI("M", M), PI("N", N), PI("K", K), PS("type", ty.name), PS("dtype", "bf16"), PF("limit", 10.0) });
+                }
+                ++calls;
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return rc != RAD_OK ? rc : -999;
+                out.resize((size_t)M * (yrow + hrow));
+                st_memcpy(out.data(), d_y, (size_t)M * yrow, hipMemcpyDeviceToHost);
+                if (hrow) st_memcpy(out.data() + (size_t)M * yrow, d_h, (size_t)M * hrow, hipMemcpyDeviceToHost);
+                return RAD_OK;
+            };
+            auto yrow_of = [&](const std::vector<uint8_t>& o, int64_t m) { return std::vector<uint8_t>(o.begin() + m * yrow, o.begin() + (m + 1) * yrow); };
+            auto hrow_of = [&](const std::vector<uint8_t>& o, int64_t M, int64_t m) {
+                return std::vector<uint8_t>(o.begin() + M * yrow + m * hrow, o.begin() + M * yrow + (m + 1) * hrow);
+            };
+            auto stats = [&](long long* v) { for (int i = 0; i < 4; ++i) v[i] = 0; wst(v, 4); };
+            auto wmk_on = [&](int on) { set_dec(h); h.sw("ds41_wmk", on); };
+            std::string fails;
+            long long bad = 0, rows_cmp = 0, rows_bad = 0, launch_bad = 0, decl = 0, pin_bad = 0, hoff_bad = 0, off_bad = 0;
+            long long r49 = -1;
+            /* the rows alone under the switch */
+            wmk_on(1);
+            std::vector<std::vector<uint8_t>> ay(R), ah(R);
+            std::vector<uint8_t> o;
+            for (int64_t r = 0; r < R; ++r) {
+                long long v0[4], v1[4];
+                stats(v0);
+                const int rc = call(r, 1, o);
+                stats(v1);
+                if (rc != RAD_OK) { ++bad; if (fails.size() < 400) fails += fmt(" alone row %lld rc %d;", (long long)r, rc); continue; }
+                if (v1[1] - v0[1] != 1) ++launch_bad;
+                decl += v1[3] - v0[3];
+                ay[(size_t)r] = yrow_of(o, 0);
+                if (hrow) ah[(size_t)r] = hrow_of(o, 1, 0);
+            }
+            for (int64_t M : Ms) {
+                if (M == 1) continue;
+                wmk_on(1);
+                long long v0[4], v1[4];
+                stats(v0);
+                const int rc = call(0, M, o);
+                stats(v1);
+                if (rc != RAD_OK) { ++bad; if (fails.size() < 400) fails += fmt(" M=%lld rc %d;", (long long)M, rc); continue; }
+                const long long want_l = M <= 48 ? 1 : 0;
+                if (v1[1] - v0[1] != want_l) { ++launch_bad; if (fails.size() < 400) fails += fmt(" M=%lld launches %lld;", (long long)M, v1[1] - v0[1]); }
+                decl += v1[3] - v0[3];
+                long long nb = 0;
+                for (int64_t m = 0; m < M; ++m) {
+                    bool same = yrow_of(o, m) == ay[(size_t)m];
+                    if (hrow) same = same && hrow_of(o, M, m) == ah[(size_t)m];
+                    if (!same) ++nb;
+                }
+                if (M <= 48) {
+                    rows_cmp += M; rows_bad += nb;
+                    if (nb && fails.size() < 400) fails += fmt(" M=%lld %lld rows differ from alone;", (long long)M, nb);
+                } else {
+                    r49 = nb;
+                }
+                /* the bench pin's bytes (plain / logits / pair) and h under the switch off (folds) */
+                if (op.kind <= 2 && M <= 48) {
+                    h.sw("ds41_wmk", 0);
+                    h.wk_pin(kCode);
+                    std::vector<uint8_t> op_;
+                    if (call(0, M, op_) != RAD_OK || op_ != o) { ++pin_bad; if (fails.size() < 400) fails += fmt(" M=%lld != pin;", (long long)M); }
+                    h.wk_pin(0);
+                }
+                if (hrow && M <= 48) {
+                    wmk_on(0);
+                    std::vector<uint8_t> oo;
+                    if (call(0, M, oo) != RAD_OK) ++hoff_bad;
+                    else for (int64_t m = 0; m < M; ++m) if (hrow_of(oo, M, m) != hrow_of(o, M, m)) { ++hoff_bad; break; }
+                }
+                if (M == 16) {   /* the switch off: no part-order launch */
+                    wmk_on(0);
+                    std::vector<uint8_t> oo;
+                    stats(v0);
+                    call(0, M, oo);
+                    stats(v1);
+                    if (v1[1] - v0[1] != 0) ++off_bad;
+                }
+            }
+            wmk_on(0);
+            clear(h);
+            const bool kb = bad || rows_bad || launch_bad || decl || pin_bad || hoff_bad || off_bad;
+            ++keys;
+            if (kb) { ++bad_keys; ++g_fail; }
+            std::printf("WMKROUTE %s %s %lldx%lld%s | rows vs alone (M 2..48): %lld of %lld differ | launches a call wrong %lld, declines %lld | "
+                        "== bench pin %d: %s | h == switch off: %s | off: no launch %s | M 49 (stock form): %lld of 49 rows differ from alone -> %s%s\n",
+                        ty.name, op.name, (long long)NY, (long long)K, op.kind == 1 ? " f32" : "", rows_bad, rows_cmp, launch_bad, decl, kCode,
+                        op.kind <= 2 ? (pin_bad ? "NO" : "yes") : "n/a", hrow ? (hoff_bad ? "NO" : "yes") : "n/a", off_bad ? "NO" : "yes", r49,
+                        kb ? "FAIL" : "ok", fails.c_str());
+            std::fflush(stdout);
+        }
+    }
+    clear(h);
+    dfree_all();
+    if (keys == 0) ++g_fail;
+    std::printf("WMGVERDICT wmkroute: %lld (type, op) keys, %lld calls, %lld bad -> %s\n", keys, calls, bad_keys,
+                keys == 0 ? "NO DATA" : bad_keys ? "FAIL" : "PASS (every dense op row takes the part-order form at M 1..48, row bytes M-invariant, = the bench pin)");
+}
+
 }  // namespace wmg
