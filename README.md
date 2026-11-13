@@ -25,12 +25,12 @@ the everyday setting caps each card at 210 W with a -50 mV voltage offset.
 | Measure | DeepSeek, stock 300 W | DeepSeek, 210 W | Qwen, stock 300 W | Qwen, 210 W |
 |---|---|---|---|---|
 | 1 user, prose | 96.5 | 90.8 | _pending_ | _pending_ |
-| 1 user, code | _pending_ | _pending_ | _pending_ | _pending_ |
+| 1 user, code | 165.0 | _pending_ | _pending_ | _pending_ |
 | 4 users | 176.1 | 171.6 | _pending_ | _pending_ |
 | 8 users | 208.1 | 192.0 | _pending_ | ~790 |
 | 16 users | 259.1 | 237.0 | _pending_ | ~1,030 |
 | Prefill 16k | _pending_ | _pending_ | _pending_ | _pending_ |
-| Prefill 64k | _pending_ | _pending_ | _pending_ | ~9,330 |
+| Prefill 64k | 6,020 | _pending_ | _pending_ | ~9,330 |
 | Prefill 128k (DeepSeek 136k) | 6,130 (TTFT 22.4 s) | 5,570 (TTFT 24.6 s) | _pending_ | ~9,200 |
 
 ## What exact means
@@ -59,7 +59,7 @@ Raw values are in [docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md)
 
 ## Software changes
 
-Each of these changes passed the exactness checks above, and [registry/](registry/) lists every tested
+Each of these changes keeps the output exact, and [registry/](registry/) lists every tested
 change, the rejected ones included:
 
 - **Batch-invariant kernels:** Qwen's batch-invariant kernel set makes each answer independent of the
@@ -69,7 +69,8 @@ change, the rejected ones included:
   peer in one interleaved pass instead of one link at a time, which cut a 42 MB all-reduce from 3,436
   to 2,508 µs (-27 %).
 - **Prefill skip above the last cache source:** DeepSeek's layers 21 to 39 write almost no cache that
-  later tokens read, so a cold prefill runs them only for the end of the prompt. The time to first token for a 136k-token prompt fell from 50.5 to 33.3 s (-34 %).
+  later tokens read, so a cold prefill runs them only for the end of the prompt.
+  The time to first token for a 136k-token prompt fell from 50.5 to 33.3 s (-34 %).
 - **Expert residency:** giving DeepSeek's spare VRAM to resident expert weights instead of holding it
   back for swapping experts in and out raised 8-user throughput from 143.9 to 169.5 tok/s (+17.8 %).
 - **Sequence-parallel prefill stages:** in Qwen prefill each card runs the hyper-connection stages on a
