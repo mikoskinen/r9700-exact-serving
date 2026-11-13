@@ -5365,7 +5365,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
               "\"sched_noa\": 0, \"stage_short\": 0, \"stage_pick\": 0, \"place_hb\": 0, \"stage_full_min\": 0, "
               "\"stage_full_pick\": 0, \"mhc_fuse\": -1, \"ix_lds\": -1, \"ix_ni\": -1, \"ds41_arcoded\": -1, "
               "\"sched_row_cap\": 0, \"ds41_mix_wv\": -1, \"ds41_gq\": -1, \"ds41_e2\": -1, \"sched_cb_hold_ms\": 0, \"sched_cb_hold_k\": 2, \"exl3_x3d\": -1, "
-              "\"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, \"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1}"));
+              "\"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, \"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0}"));
     /* ds41-int9: lever SP appended after place_hb; int9b: M1, IX-LDSR2, IX-NI; int10: ARC (plugins' switches: -1 here), then
      * CAP48 (merged); int11: 1U-MX / 1U-GQ / 1U-E2 (plugins' switches: -1 here), then CBH (ds41-int10b, merged: 0 off, K 2);
      * int12: X3D-F exl3_x3d (the exl3r4d plugin's: -1 here); int13: XPUSH ar_xpush (libr4d's: -1 here); int14c: lever A4
@@ -5399,7 +5399,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kHeatMinGainX100 + 1, (int)fn4::kHeatHystX100);
     CHECK_EQ((int)fn4::kHeatHystX100 + 1, (int)fn4::kDs41Rfuse);   /* ds41-fuse: levers FUSE-R / FUSE-M, appended */
     CHECK_EQ((int)fn4::kDs41Rfuse + 1, (int)fn4::kDs41MixFin);
-    CHECK_EQ((int)fn4::kDs41MixFin + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kDs41MixFin + 1, (int)fn4::kRouteCopyOv);   /* ds41-launch: lever RCO, merged after FUSE-M */
+    CHECK_EQ((int)fn4::kRouteCopyOv + 1, (int)fn4::kSwitches);
     CHECK_EQ((int)fn4::kDs41PskK, 41);
     CHECK_EQ((int)fn4::kPlaceHb, 49);
     CHECK_EQ((int)fn4::kStageFullPick, 51);
@@ -5417,7 +5418,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kHeatHystX100, 67);
     CHECK_EQ((int)fn4::kDs41Rfuse, 68);   /* ds41-fuse: FUSE-R, deepseek41's; FUSE-M, libr4d's */
     CHECK_EQ((int)fn4::kDs41MixFin, 69);
-    CHECK_EQ((int)fn4::kSwitches, 70);
+    CHECK_EQ((int)fn4::kRouteCopyOv, 70);   /* ds41-launch: lever RCO (route_copy_ov), the core's (68 on ds41-launch) */
+    CHECK_EQ((int)fn4::kSwitches, 71);
     CHECK_EQ(fn4::switch_index("ds41_rfuse"), (int)fn4::kDs41Rfuse);
     CHECK_EQ(fn4::switch_index("ds41_mix_fin"), (int)fn4::kDs41MixFin);
     CHECK(!fn4::sched_switch(fn4::kDs41Rfuse) && !fn4::sched_switch(fn4::kDs41MixFin));
@@ -5469,7 +5471,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         fn4::note_sched(fn4::kHeatHystX100, 125);
         CHECK(has(f.get("/admin/fn4").body, "\"exl3_x3d\": -1, \"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": 0, "
                                             "\"heat_min_gain_x100\": 150, "
-                                            "\"heat_hyst_x100\": 125, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1}"));
+                                            "\"heat_hyst_x100\": 125, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0}"));
         int ssw[fn4::kSwitches];
         const uint64_t e0 = fn4::epoch();
         CHECK_EQ(f.post("/admin/fn4", R"({"place_swap_lent":0,"heat_min_gain_x100":150,"heat_hyst_x100":125})").status, 200);
@@ -5483,7 +5485,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         CHECK_EQ(ssw[fn4::kHeatHystX100], fn4::kNoChange);
         fn4::note_sched(fn4::kPlaceSwapLent, 1);
         fn4::note_sched(fn4::kHeatMinGainX100, 75);
-        CHECK(has(f.get("/admin/fn4").body, "\"place_swap_lent\": 1, \"heat_min_gain_x100\": 75, \"heat_hyst_x100\": 125, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1}"));
+        CHECK(has(f.get("/admin/fn4").body, "\"place_swap_lent\": 1, \"heat_min_gain_x100\": 75, \"heat_hyst_x100\": 125, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0}"));
         CHECK_EQ(f.post("/admin/fn4", R"({"place_swap_lent":0,"heat_min_gain_x100":150})").status, 200);
         CHECK(fn4::apply_pending(72, ssw));
         CHECK_EQ(ssw[fn4::kPlaceSwapLent], 0);
@@ -5493,6 +5495,38 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         fn4::note_sched(fn4::kHeatMinGainX100, -1);
         fn4::note_sched(fn4::kHeatHystX100, -1);
         fn4::swl_register(false);
+    }
+    {   /* ds41-launch: lever RCO, the core's (as aql_acq): 0 / 1, read at recording; a change advances the epoch (every pass
+         * re-records); GET reports the switch and "rco" the recordings' counts (note_rco). */
+        CHECK_EQ(fn4::switch_index("route_copy_ov"), (int)fn4::kRouteCopyOv);
+        CHECK_EQ((int)fn4::kRouteCopyOv, 70);   /* 68 on ds41-launch; after FUSE-R / FUSE-M here */
+        CHECK(!fn4::sched_switch(fn4::kRouteCopyOv));
+        CHECK_EQ(fn4::route_copy_ov(), 0);
+        for (const char* b : { R"({"route_copy_ov":2})", R"({"route_copy_ov":-1})" }) {
+            const HttpResponse r = f.post("/admin/fn4", b);
+            CHECK_EQ(r.status, 400);
+            CHECK(has(r.body, "route_copy_ov takes 1"));
+        }
+        CHECK(has(f.get("/admin/fn4").body, "\"rco\": {\"in_force\": 0, \"recordings\": 0, \"copies\": 0, \"freed\": 0}"));
+        int rsw[fn4::kSwitches];
+        const uint64_t e0 = fn4::epoch();
+        CHECK_EQ(f.post("/admin/fn4", R"({"route_copy_ov":0})").status, 200);
+        CHECK(!fn4::apply_pending(73, rsw));                 /* today's value: pinned, no epoch */
+        CHECK_EQ(fn4::epoch(), e0);
+        CHECK_EQ(f.post("/admin/fn4", R"({"route_copy_ov":1})").status, 200);
+        CHECK(fn4::apply_pending(74, rsw));
+        CHECK_EQ(fn4::epoch(), e0 + 1);
+        CHECK_EQ(fn4::route_copy_ov(), 1);
+        CHECK_EQ(fn4::value(fn4::kRouteCopyOv), 1);
+        fn4::note_rco(80, 79);
+        fn4::note_rco(6, 6);
+        CHECK(has(f.get("/admin/fn4").body, "\"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 1}"));
+        CHECK(has(f.get("/admin/fn4").body, "\"rco\": {\"in_force\": 1, \"recordings\": 2, \"copies\": 86, \"freed\": 85}"));
+        CHECK_EQ(f.post("/admin/fn4", R"({"route_copy_ov":0})").status, 200);
+        CHECK(fn4::apply_pending(75, rsw));
+        CHECK_EQ(fn4::epoch(), e0 + 2);
+        CHECK_EQ(fn4::route_copy_ov(), 0);
+        CHECK(has(f.get("/admin/fn4").body, "\"rco\": {\"in_force\": 0, \"recordings\": 2, \"copies\": 86, \"freed\": 85}"));
     }
     CHECK_EQ(fn4::switch_index("ds41_mix_wv"), (int)fn4::kDs41MixWv);
     CHECK_EQ(fn4::switch_index("ds41_gq"), (int)fn4::kDs41Gq);
@@ -5754,7 +5788,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         CHECK_EQ(fn4::value(fn4::kSchedCbHoldMs), 500);
         CHECK(has(f.get("/admin/fn4").body, "\"ds41_e2\": -1, \"sched_cb_hold_ms\": 500, \"sched_cb_hold_k\": 3, \"exl3_x3d\": -1, "
                                             "\"ar_xpush\": -1, \"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, "
-                                            "\"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1}"));
+                                            "\"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0}"));
         CHECK_EQ(f.post("/admin/fn4", R"({"sched_cb_hold_ms":500})").status, 200);
         CHECK(!fn4::apply_pending(54, sw));                 /* the same value: pinned, no epoch */
         CHECK_EQ(fn4::epoch(), e0 + 1);
@@ -5763,7 +5797,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
         CHECK_EQ(fn4::sched_cb_hold_ms(), 0);
         CHECK_EQ(fn4::sched_cb_hold_k(), 2);
         CHECK(has(f.get("/admin/fn4").body, "\"sched_cb_hold_ms\": 0, \"sched_cb_hold_k\": 2, \"exl3_x3d\": -1, \"ar_xpush\": -1, "
-                                            "\"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, \"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1}"));
+                                            "\"gg_gemv_m16\": -1, \"place_swap_lent\": -1, \"heat_min_gain_x100\": -1, \"heat_hyst_x100\": -1, \"ds41_rfuse\": -1, \"ds41_mix_fin\": -1, \"route_copy_ov\": 0}"));
     }
     CHECK_EQ(f.post("/admin/fn4", R"({"draft_lend":-1})").status, 200);
     CHECK(fn4::apply_pending(31, sw));

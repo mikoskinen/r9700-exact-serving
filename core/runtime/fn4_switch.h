@@ -382,6 +382,20 @@
  *                   the finish kernel's bytes, one launch fewer; not where ds41_mix_wv's wide form acts); 0 the split
  *                   and finish launches (today). RADIANCE_DS41_MIX_FIN=1 at load starts it on. GET "fuse".mixfin_*
  *                   counts its launches (every rank).
+ *   route_copy_ov   core (lever RCO, ds41-launch; 70 here (68 on ds41-launch), after ds41_mix_fin; Ctx::haz_mark at recording): 0 off (today:
+ *                   a routed layer's report copy -- the card-side copy of its expert counts into the routing row,
+ *                   Ctx::route_report_impl -- is an op-less dispatch, so haz_mark plays it ordered AND opaque, and the
+ *                   dispatch after it waits for it to finish: on deepseek41 two such copies a routed layer, before the
+ *                   routed GEMMs' prep and before the next layer's post-collapse norm, 80 a decode pass); 1 the copy is
+ *                   recorded with its two ranges (reads the counts source, writes its routing row), so it stays ordered
+ *                   behind whatever writes its source (the scatter) or anything opaque, and the next dispatch may start
+ *                   unordered beside it when it touches neither range. Nothing in a pass reads a routing row but the
+ *                   pass-end flush (route_flush: an op-less copy, ordered behind everything), and the acquire rule
+ *                   treats the copy as before (a window it cannot see into). Launch mechanics only: the same kernels on
+ *                   the same bytes; the routing rows and the heat engine's histograms are the same. A change re-records
+ *                   every pass (the epoch), as aql_acq's does. RADIANCE_AQL_ROUTE_OV=1 at start starts it on. GET "rco":
+ *                   in_force, and since start the passes recorded under it, the copies tracked and the dispatches after
+ *                   one that play unordered (each recording counts once).
  *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
  *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
  *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
@@ -525,7 +539,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
-              kSwitches };
+              kRouteCopyOv, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -538,6 +552,11 @@ uint64_t epoch();                             /* applied changes so far; 0 until
  * rule-w) at start. aql_acq_none: RADIANCE_AQL_ACQ=none (the unsafe experiment; start-time only). */
 int  aql_acq_rule();
 bool aql_acq_none();
+/* Lever RCO (ds41-launch): the route_copy_ov switch once set, else RADIANCE_AQL_ROUTE_OV (1 = on) at start; read by
+ * Ctx::route_report_impl and Ctx::haz_mark while a pass is recorded. note_rco adds one recording's counts (the
+ * routing copies tracked, the dispatches after one left unordered) to GET "rco". */
+int  route_copy_ov();
+void note_rco(int64_t copies, int64_t freed);
 
 /* The scheduler, at its init: whether its drafter can run the adaptive window, and whether it does. */
 void draft_register(bool capable, bool adaptive);

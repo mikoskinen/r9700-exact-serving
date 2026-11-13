@@ -35,7 +35,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
-                                        "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin" };
+                                        "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -106,6 +106,7 @@ struct State {
     std::atomic<int64_t> noa[kNoaCounts];                   /* note_sched_noa (lever NOA) */
     std::atomic<int64_t> cap[kCapCounts];                   /* note_sched_cap (lever CAP48) */
     std::atomic<int64_t> cbh[kCbhCounts];                   /* note_sched_cbh (lever CBH) */
+    std::atomic<int64_t> rco[3];                            /* note_rco (lever RCO): recordings, copies, freed */
     std::atomic<int> stage_capable{-1}, hb_capable{-1};     /* lever SA / HB: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> sahb[kSahbRanks][kSahbN];          /* note_sahb */
     std::atomic<int> sahb_ranks{0};
@@ -139,6 +140,7 @@ struct State {
         for (auto& c : noa) c.store(0, std::memory_order_relaxed);
         for (auto& c : cap) c.store(0, std::memory_order_relaxed);
         for (auto& c : cbh) c.store(0, std::memory_order_relaxed);
+        for (auto& c : rco) c.store(0, std::memory_order_relaxed);
         for (auto& r : sahb)
             for (auto& c : r) c.store(0, std::memory_order_relaxed);
         for (auto& r : sp)
@@ -266,12 +268,25 @@ int env_acq() {
     return env;
 }
 
+/* Lever RCO: RADIANCE_AQL_ROUTE_OV=1 at start (anything else, or unset, is 0). */
+int env_rco() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_AQL_ROUTE_OV");
+        return e && !std::strcmp(e, "1") ? 1 : 0;
+    }();
+    return env;
+}
+
 /* The reported value of switch i. Under s.mu. */
 int reported(State& s, int i) {
     if (plugin_switch(i)) return plugin_value(s, i);
     if (i == kAqlAcq) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_acq();
+    }
+    if (i == kRouteCopyOv) {
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_rco();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -339,6 +354,16 @@ uint64_t epoch() { return st().epoch.load(std::memory_order_acquire); }
 int aql_acq_rule() {
     const int v = st().val[kAqlAcq].load(std::memory_order_acquire);
     return v >= 0 ? v : env_acq();
+}
+int route_copy_ov() {
+    const int v = st().val[kRouteCopyOv].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_rco();
+}
+void note_rco(int64_t copies, int64_t freed) {
+    State& s = st();
+    s.rco[0].fetch_add(1, std::memory_order_relaxed);
+    s.rco[1].fetch_add(copies, std::memory_order_relaxed);
+    s.rco[2].fetch_add(freed, std::memory_order_relaxed);
 }
 int sched_bi_chunk() {
     const int v = st().val[kSchedBiChunk].load(std::memory_order_acquire);
@@ -719,7 +744,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1054,6 +1079,14 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kRouteCopyOv) {   /* lever RCO (ds41-launch): the core's, read at recording */
+        if (v < 0 || v > 1) {
+            if (err) *err = "route_copy_ov takes 1 (a routing copy is recorded with its ranges, so the dispatch after it may "
+                            "play unordered) or 0 (off: the copy orders what follows)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedBiChunk) {
         if (v < 0 || v > 4) {
             if (err) *err = "sched_bi_chunk takes 0 (today), 1 (alone's boundaries), 2 (the interval grid), 3 / 4 (alone's "
@@ -1232,7 +1265,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
@@ -1385,6 +1418,11 @@ std::string state_json() {
              ", \"rgs_launches\": " + std::to_string((long long)v[6]) + ", \"rgs_rows\": " +
              std::to_string((long long)v[7]) + "}";
     }
+    /* Lever RCO (ds41-launch): always present; counted at recording, so 0 until a pass is recorded under it. */
+    o += ", \"rco\": {\"in_force\": " + std::to_string(reported(s, kRouteCopyOv)) +
+         ", \"recordings\": " + std::to_string((long long)s.rco[0].load(std::memory_order_relaxed)) +
+         ", \"copies\": " + std::to_string((long long)s.rco[1].load(std::memory_order_relaxed)) +
+         ", \"freed\": " + std::to_string((long long)s.rco[2].load(std::memory_order_relaxed)) + "}";
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {
         static const char* const kLend[18] = { "lent_cycles", "lent_plain_steps", "lent_plain_ms", "lent_probe_steps",

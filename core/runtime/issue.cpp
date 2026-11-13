@@ -1250,6 +1250,26 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     haz_ops_.push_back(o);
 }
 
+/* Lever RCO (fn4 route_copy_ov): a routing report's copy as a hazard op of its own -- it reads [src, +bytes) and writes
+ * [dst, +bytes) -- so haz_mark orders it behind whatever wrote its source and lets a dispatch that touches neither range
+ * start beside it. Only a copy that is exactly one tape record: anything else stays op-less (ordered and opaque). */
+void Ctx::haz_note_route_copy(const void* src, void* dst, int64_t bytes, int rec0, int rec1) {
+    if (rec0 < 0 || rec1 != rec0 + 1 || bytes <= 0 || !src || !dst) return;
+    HazOp o;
+    o.rec0 = rec0;
+    o.rec1 = rec1;
+    o.op = UINT32_MAX;
+    o.route_copy = true;
+    const uintptr_t s = (uintptr_t)src, d = (uintptr_t)dst;
+    o.rd = (uint32_t)haz_rng_.size();
+    o.n_rd = 1;
+    haz_rng_.push_back({ s, s + (uintptr_t)bytes });
+    o.wr = (uint32_t)haz_rng_.size();
+    o.n_wr = 1;
+    haz_rng_.push_back({ d, d + (uintptr_t)bytes });
+    haz_ops_.push_back(o);
+}
+
 /* See "a host launch is a join" in Ctx::issue_body. */
 int Ctx::host_join(const RadOperand* opd, int n_opd) {
     return host_join_wait(host_join_drains(opd, n_opd));

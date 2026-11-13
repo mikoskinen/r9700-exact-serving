@@ -731,9 +731,17 @@ int Ctx::route_report_impl(int layer, const RadRouting* r, bool copy) {
                 route_bank_ = bank;
             }
             int32_t* const row = route_dev_ + (int64_t)layer * route_n_expert_;
-            if (copy && r->expert_count != row)
+            if (copy && r->expert_count != row) {
+                /* Lever RCO (fn4 route_copy_ov): while a pass is recorded, the copy is noted with its two
+                 * ranges, so haz_mark can leave the dispatch after it unordered (it stays op-less otherwise:
+                 * ordered and opaque, as before). */
+                const int m0 = rec_ && fn4::route_copy_ov() == 1 ? tape_mark() : -1;
                 RAD_TRY(rad_memcpy_async(row, r->expert_count, n * (int64_t)sizeof(int32_t),
                                          stream_));
+                if (m0 >= 0)
+                    haz_note_route_copy(r->expert_count, row, n * (int64_t)sizeof(int32_t), m0,
+                                        tape_mark());
+            }
             if (route_lo_ > route_hi_) {
                 route_lo_ = route_hi_ = layer;
             } else {
@@ -1180,6 +1188,20 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
         return 0;
     }
     const int bit = b->draft_pass + 8;
+    /* Lever RCO: what the routing copies' ranges freed in this recording (rank 0's, for GET "rco"), and one line for
+     * the first recording of each draft pass kind under the switch -- comparable with the start's "recorded pass"
+     * lines (its unordered count rises by the freed ones; the acquire rule's counts stay). */
+    if (rank_ == 0 && out->rco_copies > 0) {
+        fn4::note_rco(out->rco_copies, out->rco_freed);
+        if (bit >= 0 && bit < 64 && !(rco_told_ & (1ull << bit))) {
+            rco_told_ |= 1ull << bit;
+            RAD_INFO("route copy overlap (fn4 route_copy_ov 1): draft pass %d at %lld token(s) -- %d routing copies "
+                     "recorded with their ranges, %d dispatch(es) after one play unordered; %d of the %d dispatches "
+                     "unordered, the acquire rule plays %d (%d of them ordered) without their acquire",
+                     b->draft_pass, (long long)b->n_tok, out->rco_copies, out->rco_freed, out->unordered,
+                     out->dispatches, out->noacq, out->noacq_ordered);
+        }
+    }
     if (rank_ == 0 && bit >= 0 && bit < 64 && !(tape_told_ & (1ull << bit))) {
         tape_told_ |= 1ull << bit;
         RAD_INFO("recorded pass: draft pass %d at %lld token(s) -- %d records, %d of the %d "
@@ -1272,6 +1294,9 @@ int Ctx::haz_mark(PassTape& t) {
         return ls_merge(std::move(v));
     };
     t.noacq = t.noacq_ordered = 0;
+    t.rco_copies = t.rco_freed = 0;
+    for (const HazOp& o : haz_ops_)
+        if (o.route_copy && o.rec0 >= 0 && o.rec1 <= n) ++t.rco_copies;
     for (int i = 0; i < n; ++i) {
         int kind = 0;
         uint32_t qid = 0;
@@ -1310,7 +1335,7 @@ int Ctx::haz_mark(PassTape& t) {
         if (haz_dump_) {
             const int32_t own = part_of[(size_t)i];
             const HazOp* h = own >= 0 ? &haz_ops_[(size_t)own] : nullptr;
-            const OpPlan* pl = h ? &plans_[h->op] : nullptr;
+            const OpPlan* pl = h && !h->route_copy ? &plans_[h->op] : nullptr;   /* a routing copy names no op */
             const char* why = ok                                 ? "U"
                               : own < 0                          ? "O noop"
                               : op < 0                           ? "O cont"
@@ -1331,13 +1356,14 @@ int Ctx::haz_mark(PassTape& t) {
             }
             fprintf(stderr, "TAPEDUMP r%d %d q%u hop%d op%d decl%d %s %s %s%s%s\n", rank_, i, qid, own,
                     h ? (int)h->op : -1, pl && pl->info ? pl->info->index : -1,
-                    pl && pl->info ? pl->info->op.c_str() : "-",
+                    pl && pl->info ? pl->info->op.c_str() : h && h->route_copy ? "route_copy" : "-",
                     h && h->row && h->row->info && h->row->info->name ? h->row->info->name : "-", why,
                     clash >= 0 ? fmt(" with hop%d", clash).c_str() : "", rr.c_str());
         }
         if (aw) {
             const int32_t own = part_of[(size_t)i];
-            if (own < 0 || haz_ops_[(size_t)own].opaque) {
+            /* A routing copy (lever RCO) as every op-less dispatch: the rule does not look into it. */
+            if (own < 0 || haz_ops_[(size_t)own].opaque || haz_ops_[(size_t)own].route_copy) {
                 aw->unknown = true;
             } else {
                 const HazOp& h = haz_ops_[(size_t)own];
@@ -1370,6 +1396,8 @@ int Ctx::haz_mark(PassTape& t) {
         if (ok) {
             const int sc = tape_set_overlap(t.dev, i, true);
             if (sc < 0) return sc;
+            /* lever RCO: started beside a routing copy that would have ordered it */
+            if (i > 0 && part_of[(size_t)i - 1] >= 0 && haz_ops_[(size_t)part_of[(size_t)i - 1]].route_copy) ++t.rco_freed;
             q->infl.push_back(op);
             ++q->run;
             ++t.unordered;

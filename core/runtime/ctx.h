@@ -573,6 +573,7 @@ private:
         uint64_t used = 0;
         int32_t  dispatches = 0, unordered = 0;   /* its kernels, and those haz_mark left unordered */
         int32_t  noacq = 0, noacq_ordered = 0;    /* those the acquire rule plays without their acquire */
+        int32_t  rco_copies = 0, rco_freed = 0;   /* lever RCO: routing copies tracked, dispatches after one unordered */
     };
     /* The byte ranges each device op of a recorded pass reads and writes, so haz_mark can leave
      * dispatches that depend on nothing still running without the barrier bit. Otherwise the
@@ -587,6 +588,9 @@ private:
         int32_t  rec0 = 0, rec1 = 0;      /* its dispatches in the tape */
         uint32_t op = 0;
         bool     opaque = false;
+        /* Lever RCO (fn4 route_copy_ov): a routing report's copy, the core's own dispatch with no op (`op` names
+         * none): its ranges are known, and the acquire rule treats it as it treats every op-less dispatch. */
+        bool     route_copy = false;
         const KernelRow* row = nullptr;   /* for --debug-tape-dump only */
         uint32_t rd = 0, n_rd = 0, wr = 0, n_wr = 0;   /* into haz_rng_ */
     };
@@ -594,6 +598,9 @@ private:
     std::vector<std::pair<uintptr_t, uintptr_t>> haz_rng_;
     void haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int n_opd, int rec0,
                   int rec1);
+    /* Lever RCO: a routing report's copy of `bytes` from `src` to `dst`, recorded as tape records [rec0, rec1). */
+    void haz_note_route_copy(const void* src, void* dst, int64_t bytes, int rec0, int rec1);
+    uint64_t rco_told_ = 0;   /* draft pass kinds whose first recording under route_copy_ov was logged */
     int  haz_mark(PassTape& t);
     bool tape_dump_ = false;  /* --debug-tape-dump (CtxDesc::tape_dump) */
     bool haz_dump_ = false;   /* haz_mark lists this recording's dispatches (tape_dump_) */
