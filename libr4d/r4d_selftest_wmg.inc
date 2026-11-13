@@ -18,7 +18,15 @@
 
 namespace wmg {
 
+/* ds41-wmk: --wmk CODE[,CODE...] -- the W arm is gg_wk_kernel (the part-order WMMA form, K split across waves) under the
+ * bench pin r4d_gg_wk_pin(CODE) instead of the stock WMMA kernel; --perfwmg times the first code (the pair shapes ONE
+ * launch), --wmgcheck checks every code and the codes against each other. */
+static std::vector<int> g_wk_codes;
+static int g_wk_cur = 0;
 struct Hk {
+    void (*wk_pin)(int) = nullptr;
+    long long (*wk_count)() = nullptr;
+    int (*wk_last)() = nullptr;
     void (*wm_pin)(int) = nullptr;
     long long (*wm_count)() = nullptr;
     int (*sw)(const char*, int) = nullptr;
@@ -28,6 +36,14 @@ static bool hooks(const Plugin& pl, Hk& h, const char* who) {
     h.wm_pin = (void (*)(int))dlsym(pl.h, "r4d_gg_wm_pin");
     h.wm_count = (long long (*)())dlsym(pl.h, "r4d_gg_wm_count");
     h.sw = (int (*)(const char*, int))dlsym(pl.h, "rad_fn4_switch");
+    h.wk_pin = (void (*)(int))dlsym(pl.h, "r4d_gg_wk_pin");
+    h.wk_count = (long long (*)())dlsym(pl.h, "r4d_gg_wk_count");
+    h.wk_last = (int (*)())dlsym(pl.h, "r4d_gg_wk_last");
+    if (!g_wk_codes.empty() && (!h.wk_pin || !h.wk_count || !h.wk_last)) {
+        std::printf("%s: r4d_gg_wk_pin absent (not the ds41-wmk plugin)\n", who);
+        ++g_fail;
+        return false;
+    }
     h.mr = mr_hooks(pl);
     if (!h.wm_pin || !h.wm_count || !h.sw || !h.mr.pin || !h.mr.pin_xp) {
         std::printf("%s: r4d_gg_wm_pin / r4d_gg_wm_count / rad_fn4_switch / r4d_gg_mr_pin absent (not the ds41-wmgate plugin)\n", who);
@@ -38,12 +54,15 @@ static bool hooks(const Plugin& pl, Hk& h, const char* who) {
 }
 static void clear(const Hk& h) {
     h.wm_pin(0);
+    if (h.wk_pin) h.wk_pin(0);
     h.mr.pin(0, 0, 0, 0); h.mr.pin_xp(0);
     if (h.mr.pin_w64) h.mr.pin_w64(0);
     h.sw("gg_gemv_m16", 0); h.sw("gg_gemv", 0);
 }
 static void set_dec(const Hk& h) { clear(h); h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); }   /* int16's decode band */
-static void set_wm(const Hk& h) { clear(h); h.wm_pin(1); }
+static void set_wm(const Hk& h) { clear(h); if (g_wk_cur) h.wk_pin(g_wk_cur); else h.wm_pin(1); }
+static void set_stock_wm(const Hk& h) { clear(h); h.wm_pin(1); }
+static long long wcount(const Hk& h) { return g_wk_cur ? h.wk_count() : h.wm_count(); }
 
 static std::vector<int64_t> ilist(const char* l, const char* dflt) {
     std::vector<int64_t> v;
@@ -68,6 +87,9 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
     const std::vector<int64_t> Ms = ilist(mlist, "1,2,4,8,16,24,32,48");
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
     const char* mode = g_cold > 0 ? "cold" : "rot";
+    g_wk_cur = g_wk_codes.empty() ? 0 : g_wk_codes[0];
+    const bool wk = g_wk_cur != 0;
+    if (wk) std::printf("WMK: the W arm is gg_wk_kernel under r4d_gg_wk_pin(%d) (pair shapes ONE launch)\n", g_wk_cur);
     std::printf("WMG gate timing (%s, %d launches a reading, %d rounds of D W W D): D = int16's decode band (gg_gemv 2 + gg_gemv_m16 1, "
                 "table entries %d; pair shapes one launch), W = the WMMA form at the same M (pair shapes two launches)\n",
                 g_cold > 0 ? fmt("cold, %lld MiB read before each, median", (long long)(g_cold >> 20)).c_str()
@@ -156,10 +178,11 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                 const std::vector<uint8_t> dec = bytes(true, &rcd);
                 const std::string dform = h.mr.last ? h.mr.last() : "";
                 set_wm(h);
-                const long long c0 = h.wm_count();
-                const std::vector<uint8_t> wm = bytes(false, &rcw);
-                const long long took = h.wm_count() - c0;
-                const bool dec_same = dec == stock, wm_ran = took == (pair ? 2 : 1);
+                const long long c0 = wcount(h);
+                const std::vector<uint8_t> wm = bytes(wk, &rcw);
+                const long long took = wcount(h) - c0;
+                const int wkform = wk ? h.wk_last() : 0;
+                const bool dec_same = dec == stock, wm_ran = took == (pair && !wk ? 2 : 1);
                 size_t ndiff = 0, nout = yb / ob;
                 double maxrel = 0.0;
                 for (size_t e = 0; e < yb; e += ob) {
@@ -179,8 +202,8 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                         for (int k = 0; k < 4; ++k) {
                             const bool w = k == 1 || k == 2;   /* D W W D */
                             if (w) set_wm(h); else set_dec(h);
-                            for (int i = 0; i < 20; ++i) launch(i, !w);
-                            const double us = st_time_us([&](int i) { launch(i, !w); }, iters, nullptr);
+                            for (int i = 0; i < 20; ++i) launch(i, !w || wk);
+                            const double us = st_time_us([&](int i) { launch(i, !w || wk); }, iters, nullptr);
                             (w ? tw : td).push_back(us);
                         }
                 }
@@ -199,9 +222,9 @@ static void perf(const Plugin& pl, const char* mlist, int iters, int rounds, con
                 for (double x : td) raw_d += fmt(" %.1f", x);
                 for (double x : tw) raw_w += fmt(" %.1f", x);
                 std::printf("WMGPERF %s|%s|%s|%lld|%lld|%lld|M=%lld|calls=%d|D %.2f min %.2f max %.2f [%s]|W %.2f min %.2f max %.2f|W/D %.3f|"
-                            "dec==stock %s|wm launches %lld|wm!=dec %zu of %zu (%.2f %%) maxrel %.3g|rc %d %d %d|D:%s|W:%s\n",
+                            "dec==stock %s|wm launches %lld wk %d|wm!=dec %zu of %zu (%.2f %%) maxrel %.3g|rc %d %d %d|D:%s|W:%s\n",
                             mode, ty.name, sh.name, (long long)sh.N, (long long)sh.N2, (long long)sh.K, (long long)M, calls, dm, dmn, dmx,
-                            dform.c_str(), wmn_, wmn, wmx, dm > 0 ? wmn_ / dm : 0.0, dec_same ? "yes" : "NO", took, ndiff, nout,
+                            dform.c_str(), wmn_, wmn, wmx, dm > 0 ? wmn_ / dm : 0.0, dec_same ? "yes" : "NO", took, wkform, ndiff, nout,
                             nout ? 100.0 * (double)ndiff / (double)nout : 0.0, maxrel, rc0, rcd, rcw, raw_d.c_str(), raw_w.c_str());
                 std::fflush(stdout);
             }
@@ -334,6 +357,266 @@ static void check(const Plugin& pl, const char* tlist) {
     std::printf("WMGVERDICT check: %lld (type, shape) keys, %lld launches, %lld rows compared with the row alone, %lld differ in %lld keys -> %s\n",
                 keys, launches, rows_cmp, rows_bad, bad_keys,
                 keys == 0 ? "NO DATA" : rows_bad || bad_keys ? "FAIL (a row's WMMA bytes depend on M or its place)" : "PASS (M- and place-invariant, M 1..130)");
+}
+
+/* --wmgcheck with --wmk codes (ds41-wmk): gg_wk_kernel under every code. Per (code, type, shape): a row alone (M 1) vs the
+ * same row inside M 2..48 from row 0, windows at other starts, 49..130-row launches of permuted rows -- counted apart for
+ * the finite rows, the inf row (row 5 holds one +inf) and the near-overflow row (row 17 holds three values of
+ * 8.5e37..3.4e38). Info: the outputs of the 46 finite rows that differ from int16's decode band (the one-time reference
+ * change) and their size. WMKCROSS: the codes' bytes against each other (one part order -> one set of bytes whatever
+ * the geometry) and a P = 1 code against the stock WMMA kernel. WMKORDER: the part order itself, from the stock WMMA
+ * kernel's f32 outputs on each part's columns folded on the host in ascending part order. */
+static int wk_parts(int64_t K) { const int64_t S = K / 128; return S % 8 == 0 ? 8 : S % 4 == 0 ? 4 : S % 2 == 0 ? 2 : 1; }
+static void order(const Plugin& pl, const Hk& h, long long* keys, long long* bad_keys) {
+    const int64_t N = 328, M = 6;
+    for (const MrTy& ty : kMrTypes) {
+        const bool q32 = ty.qk == 32;
+        const RadKernelInfo* rl = find(pl, q32 ? "logits_gemm_ggml_qk32_gemv" : "logits_gemm_ggml_qk256_gemv");
+        if (!rl) { std::printf("  WMKORDER %s: logits row absent\n", ty.name); ++g_fail; continue; }
+        for (int64_t K : { 2048ll, 4096ll, 6144ll, 1024ll, 512ll }) {
+            if (K % ty.qk) continue;
+            const int P = wk_parts(K);
+            const int64_t Kp = K / P, rb = K / ty.qk * ty.bb, rbp = rb / P;
+            if (Kp % 256) continue;   /* the stock WMMA kernel does not take the part */
+            dfree_all();
+            std::vector<uint8_t> hw;
+            mr_weights(hw, ty, N, K, 0x0DE40001ull ^ (uint64_t)(N * 7 + K));
+            std::vector<uint16_t> hx;
+            mr_acts(hx, K, 0x0DEull ^ (uint64_t)K);
+            void* d_x = dalloc((size_t)(M * K) * 2);
+            void* d_w = dalloc(hw.size());
+            void* d_wp = dalloc((size_t)(N * rbp));
+            void* d_y = dalloc((size_t)(M * N) * 4);
+            if (!d_x || !d_w || !d_wp || !d_y) { std::printf("  WMKORDER %s K=%lld: alloc\n", ty.name, (long long)K); ++g_fail; continue; }
+            st_memcpy(d_x, hx.data(), (size_t)(M * K) * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
+            auto runl = [&](void* x, void* w, int64_t Kc, int64_t rbc, std::vector<float>& out) -> bool {
+                std::vector<RadTensor> t = { gqst::TP(x, RAD_BF16, M, Kc, K), T(w, RAD_U8, { N, rbc }), T(d_y, RAD_F32, { M, N }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n_vocab", N), PI("n_embd", Kc), PS("type", ty.name), PS("dtype", "bf16") };
+                RadArgs a{};
+                a.t = t.data(); a.n_t = 3; a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+                st_memset(d_y, 0xff, (size_t)(M * N) * 4);
+                const int rc = rl->launch(&a, nullptr);
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return false;
+                out.resize((size_t)(M * N));
+                st_memcpy(out.data(), d_y, (size_t)(M * N) * 4, hipMemcpyDeviceToHost);
+                return true;
+            };
+            /* the host fold of the stock kernel's per-part f32 outputs */
+            std::vector<float> tot, part;
+            bool okp = true;
+            g_wk_cur = 0;
+            set_stock_wm(h);
+            for (int p = 0; okp && p < P; ++p) {
+                std::vector<uint8_t> hp((size_t)(N * rbp));
+                for (int64_t n = 0; n < N; ++n) std::memcpy(&hp[(size_t)(n * rbp)], &hw[(size_t)(n * rb + p * rbp)], (size_t)rbp);
+                st_memcpy(d_wp, hp.data(), hp.size(), hipMemcpyHostToDevice);
+                const long long c0 = h.wm_count();
+                okp = runl((uint16_t*)d_x + p * Kp, d_wp, Kp, rbp, part) && h.wm_count() - c0 == 1;
+                if (!okp) break;
+                if (p == 0) tot = part;
+                else for (size_t i = 0; i < tot.size(); ++i) tot[i] = tot[i] + part[i];
+            }
+            std::string line = fmt("WMKORDER %s %lldx%lld M=%lld f32 | P %d parts of %lld |", ty.name, (long long)N, (long long)K, (long long)M, P, (long long)Kp);
+            bool bad = !okp;
+            if (!okp) line += " the stock part launches failed;";
+            for (int code : g_wk_codes) {
+                if (!okp) break;
+                if (code & 16) continue;
+                g_wk_cur = code;
+                set_wm(h);
+                std::vector<float> got;
+                const long long c0 = h.wk_count();
+                const bool okr = runl(d_x, d_w, K, rb, got) && h.wk_count() - c0 == 1;
+                size_t dfin = 0, dinf = 0;
+                if (okr)
+                    for (size_t i = 0; i < got.size(); ++i) {
+                        const bool same = !std::memcmp(&got[i], &tot[i], 4) || (std::isnan(got[i]) && std::isnan(tot[i]));
+                        if (!same) { if ((int64_t)(i / (size_t)N) == 5) ++dinf; else ++dfin; }
+                    }
+                line += fmt(" code %d (kp*100+P %d): %s, finite rows %zu of %lld differ, inf row %zu of %lld;", code, okr ? h.wk_last() : -1,
+                            okr ? "ran" : "LAUNCH FAILED", dfin, (long long)(5 * N), dinf, (long long)N);
+                if (!okr || dfin || dinf) bad = true;
+            }
+            clear(h);
+            ++*keys;
+            if (bad) { ++*bad_keys; ++g_fail; }
+            std::printf("%s %s\n", line.c_str(), bad ? "FAIL" : "ok");
+            std::fflush(stdout);
+        }
+    }
+    g_wk_cur = 0;
+}
+
+static void checkk(const Plugin& pl, const char* tlist) {
+    Hk h;
+    if (!hooks(pl, h, "--wmgcheck --wmk")) return;
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    const int64_t R = 48, RB = 130;
+    const std::vector<int64_t> Ms = { 2, 3, 4, 5, 7, 8, 9, 12, 15, 16, 17, 23, 24, 25, 31, 32, 33, 40, 47, 48 };
+    const int64_t wins[][2] = { { 1, 1 }, { 1, 16 }, { 5, 8 }, { 15, 2 }, { 16, 16 }, { 17, 16 }, { 7, 41 }, { 31, 17 }, { 33, 15 }, { 47, 1 }, { 40, 8 }, { 3, 45 } };
+    const int64_t bigs[] = { 49, 64, 96, 130 };
+    long long keys = 0, bad_keys = 0, launches = 0, cmpc[3] = { 0, 0, 0 }, badc[3] = { 0, 0, 0 }, xkeys = 0, xbad = 0;
+    std::printf("WMK byte check (gg_wk_kernel, codes"); for (int c : g_wk_codes) std::printf(" %d", c);
+    std::printf("): a row's bytes at M 1 vs the same row inside M 2..48 (from row 0), windows at other starts, 49..130-row launches of permuted rows\n");
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        for (const MrShape& sh : kMrShapes) {
+            if (sh.logits && std::strcmp(ty.name, "q6_K")) continue;
+            if (sh.K % ty.qk) continue;
+            if (!std::strcmp(sh.name, "engram_kv")) continue;
+            dfree_all();
+            std::vector<uint8_t> hw;
+            mr_weights(hw, ty, sh.N, sh.K, 0x9E3779B97F4A7C15ull ^ (uint64_t)(sh.N * 131 + sh.K) ^ 0x776du);
+            std::vector<uint16_t> hx;
+            mr_acts(hx, sh.K, 0x1234567ull ^ (uint64_t)sh.K ^ 0x776du);
+            std::vector<uint16_t> hb((size_t)(RB * sh.K));
+            for (int64_t i = 0; i < RB; ++i)
+                std::memcpy(&hb[(size_t)(i * sh.K)], &hx[(size_t)(((7 * i + 3) % R) * sh.K)], (size_t)sh.K * 2);
+            const size_t ob = sh.logits ? 4 : 2, rowb = (size_t)sh.N * ob;
+            void* d_w = dalloc(hw.size());
+            void* d_x = dalloc(hx.size() * 2);
+            void* d_b = dalloc(hb.size() * 2);
+            void* d_y = dalloc((size_t)RB * rowb);
+            if (!d_w || !d_x || !d_b || !d_y) { std::printf("  FAIL %s %s: alloc\n", ty.name, sh.name); ++g_fail; continue; }
+            st_memcpy(d_w, hw.data(), hw.size(), hipMemcpyHostToDevice);
+            st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+            st_memcpy(d_b, hb.data(), hb.size() * 2, hipMemcpyHostToDevice);
+            auto run = [&](void* x, int64_t M, std::vector<uint8_t>& out) -> bool {
+                MrLaunch L;
+                if (!mr_setup(L, pl, sh, ty, M)) return false;
+                st_memset(d_y, 0xff, (size_t)M * rowb);
+                const int rc = L.run(x, d_w, d_y);
+                ++launches;
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return false;
+                out.resize((size_t)M * rowb);
+                st_memcpy(out.data(), d_y, (size_t)M * rowb, hipMemcpyDeviceToHost);
+                return true;
+            };
+            /* int16's decode band on the 48 rows (a decode row's bytes do not depend on M: lever D2), the stock WMMA kernel's rows alone */
+            std::vector<uint8_t> dec48, wmalone((size_t)R * rowb), one;
+            g_wk_cur = 0;
+            set_dec(h);
+            bool okd = run(d_x, R, dec48);
+            set_stock_wm(h);
+            for (int64_t r = 0; okd && r < R; ++r) {
+                okd = run((uint16_t*)d_x + r * sh.K, 1, one);
+                if (okd) std::memcpy(&wmalone[(size_t)r * rowb], one.data(), rowb);
+            }
+            if (!okd) { std::printf("  FAIL %s %s: the decode band / stock WMMA launches\n", ty.name, sh.name); ++g_fail; continue; }
+            std::vector<std::vector<uint8_t>> alones;
+            for (int code : g_wk_codes) {
+                g_wk_cur = code;
+                set_wm(h);
+                std::vector<uint8_t> alone((size_t)R * rowb);
+                const long long c0 = h.wk_count();
+                bool okr = true;
+                for (int64_t r = 0; okr && r < R; ++r) {
+                    okr = run((uint16_t*)d_x + r * sh.K, 1, one);
+                    if (okr) std::memcpy(&alone[(size_t)r * rowb], one.data(), rowb);
+                }
+                const int form1 = h.wk_last();
+                ++keys;
+                if (!okr || h.wk_count() - c0 != R) {
+                    std::printf("  FAIL code %d %s %s: M 1 launches (wk launches %lld of %lld)\n", code, ty.name, sh.name, h.wk_count() - c0, (long long)R);
+                    ++g_fail; ++bad_keys; alones.push_back({}); continue;
+                }
+                /* info: the finite rows against the decode band */
+                size_t nd = 0, nfin = 0, nout = 0; double maxrel = 0, sumrel = 0;
+                for (int64_t r = 0; r < R; ++r) {
+                    if (r == 5 || r == 17) continue;
+                    for (size_t e = 0; e < rowb; e += ob) {
+                        const size_t o = (size_t)r * rowb + e;
+                        float a, b;
+                        if (ob == 4) { std::memcpy(&a, &alone[o], 4); std::memcpy(&b, &dec48[o], 4); }
+                        else { uint16_t ua, ub; std::memcpy(&ua, &alone[o], 2); std::memcpy(&ub, &dec48[o], 2); a = bf16f(ua); b = bf16f(ub); }
+                        ++nout;
+                        if (std::memcmp(&alone[o], &dec48[o], ob)) ++nd;
+                        if (std::isfinite(a) && std::isfinite(b)) {
+                            const double den = std::max(std::fabs((double)a), std::fabs((double)b));
+                            const double rel = den > 0 ? std::fabs((double)a - (double)b) / den : 0.0;
+                            maxrel = std::max(maxrel, rel); sumrel += rel; ++nfin;
+                        }
+                    }
+                }
+                long long kc[3] = { 0, 0, 0 }, kb[3] = { 0, 0, 0 };
+                std::string fails;
+                auto cmp = [&](const std::vector<uint8_t>& got, int64_t M, const char* what, auto rowof) {
+                    for (int64_t m = 0; m < M; ++m) {
+                        const int64_t r = rowof(m);
+                        const int cl = r == 5 ? 1 : r == 17 ? 2 : 0;
+                        ++kc[cl];
+                        if (std::memcmp(&got[(size_t)m * rowb], &alone[(size_t)r * rowb], rowb)) {
+                            ++kb[cl];
+                            size_t e = 0;
+                            while (e < rowb && got[(size_t)m * rowb + e] == alone[(size_t)r * rowb + e]) ++e;
+                            if (fails.size() < 500) fails += fmt(" %s M=%lld place %lld (row %lld) first output %zu;", what, (long long)M, (long long)m, (long long)r, e / ob);
+                        }
+                    }
+                };
+                std::vector<uint8_t> got;
+                int rcbad = 0, form16 = 0, form48 = 0;
+                for (int64_t M : Ms) {
+                    if (!run(d_x, M, got)) { ++rcbad; fails += fmt(" M=%lld rc;", (long long)M); continue; }
+                    if (M == 16) form16 = h.wk_last();
+                    if (M == 48) form48 = h.wk_last();
+                    cmp(got, M, "from0", [&](int64_t m) { return m; });
+                }
+                for (const auto& w : wins) {
+                    const int64_t st = w[0], M = w[1];
+                    if (!run((uint16_t*)d_x + st * sh.K, M, got)) { ++rcbad; fails += fmt(" win %lld+%lld rc;", (long long)st, (long long)M); continue; }
+                    cmp(got, M, "win", [&](int64_t m) { return st + m; });
+                }
+                for (int64_t M : bigs) {
+                    if (!run(d_b, M, got)) { ++rcbad; fails += fmt(" big M=%lld rc;", (long long)M); continue; }
+                    cmp(got, M, "big", [&](int64_t m) { return (7 * m + 3) % R; });
+                }
+                const bool bad = rcbad || kb[0] || kb[1] || kb[2];
+                for (int c = 0; c < 3; ++c) { cmpc[c] += kc[c]; badc[c] += kb[c]; }
+                bad_keys += bad ? 1 : 0;
+                g_fail += bad ? 1 : 0;
+                std::printf("WMKCHECK code %d %s %s %lldx%lld%s | forms kp*100+P M1 %d M16 %d M48 %d | rows differing from the row alone: finite %lld of %lld, inf row %lld of %lld, "
+                            "near-overflow row %lld of %lld -> %s | vs int16's decode band on the 46 finite rows: %zu of %zu outputs differ (%.3f %%), rel diff mean %.3g max %.3g%s\n",
+                            code, ty.name, sh.name, (long long)sh.N, (long long)sh.K, sh.logits ? " f32" : "", form1, form16, form48, kb[0], kc[0], kb[1], kc[1], kb[2], kc[2],
+                            bad ? "ROW BYTES DEPEND ON M / PLACE" : "invariant", nd, nout, nout ? 100.0 * (double)nd / (double)nout : 0.0,
+                            nfin ? sumrel / (double)nfin : 0.0, maxrel, fails.c_str());
+                std::fflush(stdout);
+                alones.push_back(std::move(alone));
+            }
+            /* the codes against each other, a P = 1 code against the stock WMMA kernel */
+            std::string xl;
+            bool xb = false;
+            int base = -1;
+            for (size_t i = 0; i < g_wk_codes.size(); ++i) {
+                if (alones[i].empty()) continue;
+                if (g_wk_codes[i] & 16) {
+                    const bool same = alones[i] == wmalone;
+                    xl += fmt(" code %d (P 1) == the stock WMMA kernel: %s;", g_wk_codes[i], same ? "yes" : "NO");
+                    xb |= !same;
+                } else if (base < 0) {
+                    base = (int)i;
+                } else {
+                    const bool same = alones[i] == alones[(size_t)base];
+                    xl += fmt(" code %d == code %d: %s;", g_wk_codes[i], g_wk_codes[(size_t)base], same ? "yes" : "NO");
+                    xb |= !same;
+                }
+            }
+            ++xkeys; xbad += xb ? 1 : 0; g_fail += xb ? 1 : 0;
+            std::printf("WMKCROSS %s %s %lldx%lld (48 rows alone):%s\n", ty.name, sh.name, (long long)sh.N, (long long)sh.K, xl.c_str());
+            std::fflush(stdout);
+            clear(h);
+        }
+    }
+    long long okeys = 0, obad = 0;
+    order(pl, h, &okeys, &obad);
+    g_wk_cur = 0;
+    clear(h);
+    dfree_all();
+    if (keys == 0) ++g_fail;
+    std::printf("WMGVERDICT wmk check: %lld (code, type, shape) keys, %lld launches; rows compared with the row alone / differing: finite %lld / %lld, inf row %lld / %lld, "
+                "near-overflow row %lld / %lld, %lld bad keys; cross-geometry %lld keys %lld bad; part order vs the host fold %lld keys %lld bad -> %s\n",
+                keys, launches, cmpc[0], badc[0], cmpc[1], badc[1], cmpc[2], badc[2], bad_keys, xkeys, xbad, okeys, obad,
+                keys == 0 ? "NO DATA" : (bad_keys || xbad || obad) ? "FAIL" : "PASS (M- and place-invariant M 1..130, geometry-invariant, the part order as defined)");
 }
 
 /* --perfwmk [iters] [rounds]: where the WMMA form's time at decode heights goes. (1) WMGSCAN: synthetic q6_K / q8_0 / q5_K shapes

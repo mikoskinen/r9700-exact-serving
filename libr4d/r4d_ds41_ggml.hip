@@ -3258,6 +3258,320 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
 #ifdef R4D_GG_BLOCKS_ONLY
 }  // namespace
 #else
+/* ================================================================== gg_wk_kernel (ds41-wmk, BENCH prototype 13.11.2026)
+ *
+ * The WMMA form for every row count with the K range split across waves -- a NEW per-output order (the "part order"),
+ * defined once and for every M, tile place and launch geometry:
+ *   S = K / 128 slabs; P = gg_wk_parts(K) = the largest of 8, 4, 2 that divides S (1 otherwise) equal consecutive parts;
+ *   part p's partial = gg_wm_kernel's arithmetic over the part's values alone (its WMMA chains a scale group, the group
+ *   scale fma chain over the part's groups in ascending K from +0.0f), an f32;
+ *   y = ((p0 + p1) + p2) + ... + p(P-1), f32 adds in ascending part order, rounded once to the output dtype.
+ * P = 1 is gg_wm_kernel's order (the bytes of the stock kernel). Rows are independent in every operation, so a row's
+ * bytes do not depend on M, on its place in a tile or on the geometry below.
+ *
+ * Geometry (a block = 8 waves, one 16-row tile of M): KP of the K range's P / KP-part runs side by side (KP = 1, 2, 4;
+ * KP divides P), each on NS = 8 / KP waves of 32 weight rows (two 16-column tiles), so a block is 32 NS weight rows and
+ * its waves walk S / KP slabs in step: the tile's 16 rows are staged at the KP runs' current slabs (the stock staging
+ * with the M tiles replaced by the K runs: KP 16-byte chunks a thread a slab, the group sums by DPP), one barrier a
+ * slab. A wave ends a part by folding it: run 0's waves keep the running total (they hold the prefix), the other
+ * runs' waves store their parts' partials in LDS, and after the last slab run 0's waves add them in part order and
+ * write the outputs. Two weights of one type and K (lever 1U-GQ's pairs) are one launch: the grid's first gy0 block
+ * rows are the first weight's. */
+struct GgWkArgs {
+    const uint16_t* x[2];
+    long long x_ld[2];
+    const uint8_t* w[2];
+    long long w_ld;
+    void* y[2];
+    long long y_ld[2];
+    int N[2];
+    int gy0;                             /* grid.y rows of weight 0 */
+    int M, K, P;
+    int S, SW, SP, PPW;                  /* slabs: of K, a wave's run, a part; parts a run */
+    int pfm, pfl;                        /* weight prefetch: 0 the stock loop, 1 none, 2 unrolled (full waves); lines */
+    long long psb;                       /* bytes a slab a weight row */
+};
+
+constexpr int gg_wk_parts(long long K) {
+    const long long S = K / kWmS;
+    return S % 8 == 0 ? 8 : S % 4 == 0 ? 4 : S % 2 == 0 ? 2 : 1;
+}
+
+template <int T, int KP, typename OT>
+__global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
+    using W = Wq<T>;
+    using Pf = typename W::Pf;
+    static_assert(W::TB == 0, "gg_wk_kernel: the table types are not built");
+    constexpr int NS = 8 / KP;
+    constexpr int BM = 16 * KP;
+    constexpr int XE = BM * kWmXP;
+    constexpr int XGE = W::XG > 0 ? kWmS / W::XG * BM : 0;
+    extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
+    const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int kp = __builtin_amdgcn_readfirstlane(wave / NS), ns = __builtin_amdgcn_readfirstlane(wave % NS);
+    const int mi = (int)blockIdx.y >= A.gy0 ? 1 : 0;
+    const int n0 = ((int)blockIdx.y - (mi ? A.gy0 : 0)) * (32 * NS);
+    const int N = A.N[mi];
+    const int r0 = (int)blockIdx.x * 16, r1 = min(r0 + 16, A.M);
+    uint16_t* Xs = (uint16_t*)(void*)gg_smem;
+    float* Xg = (float*)(void*)(gg_smem + 2 * XE * 2);
+    float* Pp = (float*)(void*)(gg_smem + 2 * XE * 2 + 2 * XGE * 4);
+    const int S = A.S, SW = A.SW, SP = A.SP, PPW = A.PPW;
+    const int sb = kp * SW;                                         /* the wave's first slab */
+    const uint8_t* wb = A.w[mi];
+    const int h = lane >> 4, c16 = lane & 15;
+    const uint8_t* wr[2];
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+        const int n = n0 + ns * 32 + nt * 16 + c16;
+        wr[nt] = wb + (long long)(n < N ? n : N - 1) * A.w_ld;
+    }
+    /* Activation staging: KP 16-byte chunks a thread a slab (the tile's row tid >> 4, values 8 (tid & 15), at run i's
+     * slab); a row past M stages the tile's last row (rows are independent; its outputs are not written). */
+    const uint16_t* xsrc[KP];
+    int xdo[KP];
+#pragma unroll
+    for (int i = 0; i < KP; ++i) {
+        const int row = tid >> 4, kc = (tid & 15) * 8;
+        xsrc[i] = A.x[mi] + (long long)min(r0 + row, r1 - 1) * A.x_ld[mi] + kc + (long long)i * SW * kWmS;
+        xdo[i] = (i * 16 + row) * kWmXP + kc;
+    }
+    r4d_u32x4 xr[KP];
+    auto xload = [&](int t) {
+#pragma unroll
+        for (int i = 0; i < KP; ++i) xr[i] = *(gg_gu128)(const void*)(xsrc[i] + t * kWmS);
+    };
+    auto xstore = [&](int b) {
+        uint16_t* xs = Xs + b * XE;
+#pragma unroll
+        for (int i = 0; i < KP; ++i) {
+            *(r4d_u32x4*)(void*)(xs + xdo[i]) = xr[i];
+            if constexpr (W::XG > 0) {
+                float sm = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) sm += bf16w_lo(xr[i][k]) + bf16w_hi(xr[i][k]);
+                sm += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sm), 0xB1, 0xF, 0xF, false));
+                if constexpr (W::XG == 32)
+                    sm += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sm), 0x4E, 0xF, 0xF, false));
+                Xg[b * XGE + ((tid & 15) * 8 / W::XG) * BM + (i * 16 + (tid >> 4))] = W::XGK * sm;
+            }
+        }
+    };
+    const uint8_t* prow = gg_sptr(wb + (long long)(n0 + ns * 32) * A.w_ld);
+    const int prmax = __builtin_amdgcn_readfirstlane(N - 1 - (n0 + ns * 32));   /* rows past N: the last */
+    const long long psb = A.psb;
+    const int pfl = A.pfl, pfm = A.pfm;
+    auto prefetch = [&](int s) {
+        if (pfm == 1) return;
+        const uint8_t* p = prow + (long long)min(s + 3, S - 1) * psb;
+        if (pfm == 2 && prmax >= 31) {
+#pragma unroll
+            for (int i = 0; i < 32; ++i) __builtin_amdgcn_s_prefetch_data(p + (long long)i * A.w_ld, pfl);
+            return;
+        }
+#pragma unroll 1
+        for (int i = 0; i < 32; ++i) {
+            __builtin_amdgcn_s_prefetch_data(p, pfl);
+            if (i < prmax) p += A.w_ld;
+        }
+    };
+    const uint16_t* xa = Xs + (kp * 16 + c16) * kWmXP;
+    const float* xgl = Xg + 8 * h + kp * 16;
+    gg_v8f acc[2], tot[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        acc[j] = (gg_v8f)(0.0f);
+        tot[j] = (gg_v8f)(0.0f);
+    }
+    uint32_t rE[2][2][W::RAW], rR[2][W::RAW];
+    xload(0);
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+        uint32_t t[W::RAW];
+        W::load(wr[nt], sb, h, t);
+#pragma unroll
+        for (int k = 0; k < W::RAW; ++k) {
+            if ((W::EARLY >> k) & 1u) rE[0][nt][k] = t[k];
+            else rR[nt][k] = t[k];
+        }
+    }
+    xstore(0);
+    xload(1 < SW ? 1 : SW - 1);
+    r4d_u32x4 bf[2][2];
+    Pf pf[2];
+    lds_barrier();
+    {
+        uint32_t rc[2][W::RAW];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[0][nt][k] : rR[nt][k];
+        if constexpr (W::PIPE) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) W::template pre<0>(rc[nt], h, gg_smem, pf[nt]);
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) bf[0][nt] = W::template bfrag<0>(rc[nt], h, pf[nt], sb);
+        }
+    }
+    int pleft = SP, pgp = kp * PPW;   /* slabs left in the wave's current part, the part's index */
+    /* Slab t of the wave's run (the K range's slab s = sb + t) from buffer / raw set PB = t & 1: gg_wm_kernel's slab. */
+    auto slab = [&](auto pc, int t) {
+        constexpr int PB = decltype(pc)::value;
+        const int s = sb + t;
+        uint32_t rc[2][W::RAW];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
+        const int sn = t + 1 < SW ? s + 1 : s;
+        if constexpr (PB == 0) prefetch(s);
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            uint32_t tw[W::RAW];
+            W::load(wr[nt], sn, h, tw);
+#pragma unroll
+            for (int k = 0; k < W::RAW; ++k)
+                if ((W::EARLY >> k) & 1u) rE[PB ^ 1][nt][k] = tw[k];
+        }
+        const uint16_t* xb = xa + PB * XE;
+        const float* xg = xgl + PB * XGE;
+        gg_v8f P[2];
+        r4d_u32x4 af[2];
+        gg_v8f ci;
+        af[0] = *(const r4d_u32x4*)(const void*)(xb + W::xoff(0, h));
+        if constexpr (W::CINIT && W::PIPE) ci = *(const gg_v8f*)(const void*)(xg);
+        gg_for<8>([&](auto jc) {
+            constexpr int J = decltype(jc)::value, C = J & 1;
+            if constexpr (!W::PIPE) {
+                if constexpr (J < 7) af[C ^ 1] = *(const r4d_u32x4*)(const void*)(xb + W::xoff(J + 1, h));
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) bf[C][nt] = W::template bfrag<J>(rc[nt], h, pf[nt], s);
+            } else if constexpr (J < 7) {
+                af[C ^ 1] = *(const r4d_u32x4*)(const void*)(xb + W::xoff(J + 1, h));
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) W::template pre<J + 1>(rc[nt], h, gg_smem, pf[nt]);
+            } else {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                    for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[PB ^ 1][nt][k] : rR[nt][k];
+                    W::template pre<0>(rc[nt], h, gg_smem, pf[nt]);
+                }
+            }
+            gg_v8f g8;
+            if constexpr (W::MINS && W::PIPE && J % W::SPG == W::SPG - 1)
+                g8 = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM);
+            if constexpr (J % W::SPG == 0) {
+                gg_v8f c0 = (gg_v8f)(0.0f);
+                if constexpr (W::CINIT && W::PIPE) c0 = ci;
+                else if constexpr (W::CINIT) c0 = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM);
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) P[nt] = gg_wmma(af[C], bf[C][nt], c0);
+            } else {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) P[nt] = gg_wmma(af[C], bf[C][nt], P[nt]);
+            }
+            if constexpr (W::CINIT && W::PIPE && J < 7 && (J + 1) % W::SPG == 0)
+                ci = *(const gg_v8f*)(const void*)(xg + ((J + 1) * 16 / W::XG) * BM);
+            if constexpr (W::PIPE) {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+                    bf[C ^ 1][nt] = W::template bfrag<(J + 1) & 7>(rc[nt], h, pf[nt], J < 7 ? s : sn);
+            }
+            if constexpr (J % W::SPG == W::SPG - 1) {
+                float sc[2], mn[2];
+                if constexpr (J < 7 || !W::PIPE) {
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+                        sc[nt] = W::scale(rc[nt], J / W::SPG, s);
+                        if constexpr (W::MINS) mn[nt] = W::mins(rc[nt], J / W::SPG, s);
+                    }
+                } else {
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+                        uint32_t ro[W::RAW];
+#pragma unroll
+                        for (int k = 0; k < W::RAW; ++k) ro[k] = ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
+                        sc[nt] = W::scale(ro, J / W::SPG, s);
+                        if constexpr (W::MINS) mn[nt] = W::mins(ro, J / W::SPG, s);
+                    }
+                }
+                if constexpr (W::MINS && !W::PIPE) g8 = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM);
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) {
+                        acc[nt][q] = __builtin_fmaf(P[nt][q], sc[nt], acc[nt][q]);
+                        if constexpr (W::MINS) acc[nt][q] = __builtin_fmaf(g8[q], mn[nt], acc[nt][q]);
+                    }
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) gg_pin8(acc[nt]);
+            }
+            if constexpr (W::ROLL) {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) W::template reload<J>(wr[nt], sn, h, rR[nt]);
+            }
+            if constexpr (J == 3) {
+                xstore(PB ^ 1);
+                xload(t + 2 < SW ? t + 2 : SW - 1);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+        });
+        lds_barrier();
+        /* A part ends with this slab: fold it (run 0 holds the prefix; the others keep their partials for run 0). */
+        if (--pleft == 0) {
+            const int gp = pgp;
+            pleft = SP;
+            ++pgp;
+            if (kp == 0) {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) tot[nt][q] = gp == 0 ? acc[nt][q] : tot[nt][q] + acc[nt][q];
+            } else if constexpr (KP > 1) {
+                float* pp = Pp + ((gp - PPW) * NS * 32 + ns * 32 + lane) * 16;
+                *(gg_v8f*)(void*)pp = acc[0];
+                *(gg_v8f*)(void*)(pp + 8) = acc[1];
+            }
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                acc[nt] = (gg_v8f)(0.0f);
+                gg_pin8(tot[nt]);
+            }
+        }
+    };
+    int t = 0;
+    for (; t + 1 < SW; t += 2) {
+        slab(std::integral_constant<int, 0>{}, t);
+        slab(std::integral_constant<int, 1>{}, t + 1);
+    }
+    if (t < SW) slab(std::integral_constant<int, 0>{}, t);
+    if constexpr (KP > 1) {
+        lds_barrier();
+        if (kp != 0) return;
+        for (int gp = PPW; gp < A.P; ++gp) {
+            const float* pp = Pp + ((gp - PPW) * NS * 32 + ns * 32 + lane) * 16;
+            const gg_v8f a0 = *(const gg_v8f*)(const void*)pp, a1 = *(const gg_v8f*)(const void*)(pp + 8);
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                tot[0][q] = tot[0][q] + a0[q];
+                tot[1][q] = tot[1][q] + a1[q];
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+        const int n = n0 + ns * 32 + nt * 16 + c16;
+        if (n >= N) continue;
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            const int row = r0 + 8 * h + q;
+            if (row >= r1) continue;
+            gg_put((OT*)A.y[mi] + (long long)row * A.y_ld[mi] + n, tot[nt][q]);
+        }
+    }
+}
+
 /* ================================================================== embed_lookup */
 template <int T>
 __global__ __launch_bounds__(kGgThreads) void gg_embed_kernel(const int32_t* tok, const uint8_t* w,
@@ -3595,6 +3909,88 @@ int gg_launch_wm(RadStream s, int ty, bool moe, bool f32out, const GgTiledArgs& 
     }
 }
 
+/* gg_wk_kernel's launch (ds41-wmk, bench). g_gg_wk, the bench pin r4d_gg_wk_pin (no engine path sets it): 0 off; else
+ * bits 0-3 the KP cap (1, 2, 4), bit 4 P = 1 (the stock kernel's order: its bytes), bit 5 KP = the cap whenever the
+ * parts allow it, bits 8-15 the block target of the rule (0: 32): the smallest KP whose grid has at least that many
+ * blocks, else the largest allowed; bit 6 no weight prefetch, bit 17 the unrolled prefetch; bit 7 the launch asks for
+ * 64 KiB of LDS (one block a WGP); bit 16 a grid of more than 64 KP = 1 blocks takes the cap (the head). */
+int g_gg_wk = 0;
+std::atomic<long long> g_gg_wk_count{0};
+std::atomic<int> g_gg_wk_last{0};
+template <int T>
+constexpr unsigned gg_wk_lds(int kp, int P) {
+    return (unsigned)(2 * 16 * kp * kWmXP * 2 + (Wq<T>::XG > 0 ? 2 * (kWmS / Wq<T>::XG) * 16 * kp * 4 : 0) +
+                      (kp > 1 ? (P - P / kp) * (8 / kp) * 32 * 64 : 0));
+}
+template <int T>
+int gg_launch_wk_t(RadStream s, int kp, bool f32out, const GgWkArgs& A, dim3 grid) {
+    const unsigned lds = (g_gg_wk & 128) ? 65536u : gg_wk_lds<T>(kp, A.P);
+#define GG_WK_X(KPV)                                                                              \
+    if (kp == KPV) {                                                                              \
+        if (f32out) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, float>), grid, dim3(256), lds, A);   \
+        return R4D_EMIT(s, (gg_wk_kernel<T, KPV, uint16_t>), grid, dim3(256), lds, A);            \
+    }
+    GG_WK_X(1)
+    GG_WK_X(2)
+    GG_WK_X(4)
+#undef GG_WK_X
+    return R4D_NO(RAD_E_SHAPE);
+}
+/* 1 or 2 weights (nm) of one type at one K over the same M rows; R4D_WK_DECLINE when the form does not take the call. */
+constexpr int R4D_WK_DECLINE = -77001;
+int gg_wk_run(RadStream s, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld, const int* x_al,
+              const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv,
+              long long M, long long K) {
+    if (!g_gg_wk || (ty != GG_Q5_K && ty != GG_Q6_K && ty != GG_Q8_0) || K % (2 * kWmS) || M > 0x7fffff)
+        return R4D_WK_DECLINE;
+    for (int i = 0; i < nm; ++i)
+        if (!x_al[i]) return R4D_WK_DECLINE;
+    const int cap = (g_gg_wk & 15) >= 4 ? 4 : (g_gg_wk & 15) >= 2 ? 2 : 1;
+    const int P = (g_gg_wk & 16) ? 1 : gg_wk_parts(K);
+    const long long target = ((g_gg_wk >> 8) & 255) ? ((g_gg_wk >> 8) & 255) : 32;
+    const long long gx = (M + 15) / 16;
+    auto blocks = [&](int kp) {
+        long long b = 0;
+        for (int i = 0; i < nm; ++i) b += (Nv[i] + 256 / kp - 1) / (256 / kp);
+        return b * gx;
+    };
+    int kp = 1;
+    if (g_gg_wk & 32) {
+        while (kp * 2 <= cap && P % (kp * 2) == 0) kp *= 2;
+    } else {
+        while (blocks(kp) < target && kp * 2 <= cap && P % (kp * 2) == 0) kp *= 2;
+    }
+    if ((g_gg_wk & 65536) && blocks(1) > 64)
+        while (kp * 2 <= cap && P % (kp * 2) == 0) kp *= 2;
+    while (kp > 1 && gg_wk_lds<GG_Q6_K>(kp, P) > 65536u) kp /= 2;
+    GgWkArgs A{};
+    long long gy = 0;
+    for (int i = 0; i < 2; ++i) {
+        const int j = i < nm ? i : 0;
+        A.x[i] = xd[j]; A.x_ld[i] = x_ld[j]; A.w[i] = wd[j]; A.y[i] = yd[j]; A.y_ld[i] = y_ld[j]; A.N[i] = (int)Nv[j];
+        if (i < nm) {
+            if (i == 1) A.gy0 = (int)gy;
+            gy += (Nv[i] + 256 / kp - 1) / (256 / kp);
+        }
+    }
+    if (nm == 1) A.gy0 = (int)gy;
+    A.w_ld = w_ld;
+    A.M = (int)M; A.K = (int)K; A.P = P;
+    A.S = (int)(K / kWmS); A.SW = A.S / kp; A.SP = A.S / P; A.PPW = P / kp;
+    A.psb = w_ld / A.S;
+    A.pfl = (int)((2 * A.psb + 127) / 128 < 31 ? (2 * A.psb + 127) / 128 : 31);
+    A.pfm = (g_gg_wk & 64) ? 1 : (g_gg_wk & 131072) ? 2 : 0;
+    if (gy > 65535 || gx > 65535) return R4D_WK_DECLINE;
+    g_gg_wk_count.fetch_add(1, std::memory_order_relaxed);
+    g_gg_wk_last.store(kp * 100 + P, std::memory_order_relaxed);
+    const dim3 grid((unsigned)gx, (unsigned)gy);
+    switch (ty) {
+    case GG_Q8_0: return gg_launch_wk_t<GG_Q8_0>(s, kp, f32out, A, grid);
+    case GG_Q6_K: return gg_launch_wk_t<GG_Q6_K>(s, kp, f32out, A, grid);
+    default: return gg_launch_wk_t<GG_Q5_K>(s, kp, f32out, A, grid);
+    }
+}
+
 int gg_launch_embed(RadStream s, int ty, const int32_t* tok, const uint8_t* w, long long w_ld,
                     uint16_t* x, long long x_ld, int M, int E, int V, long long voff, float mult) {
     const unsigned grid = (unsigned)(M < 4096 ? M : 4096);
@@ -3668,6 +4064,11 @@ int gg_gemm(const RadArgs* a, RadStream s, const char* nN, const char* nK, bool 
 /* gg_gemm's launch once its operands are resolved (also the second launch of the K1 folds' unfused passes). */
 int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long x_ld, int x_al, const uint8_t* wd,
                 long long w_ld, void* yd, long long y_ld, long long M, long long N, long long K) {
+    if (g_gg_wk) {   /* ds41-wmk bench pin: the part-order WMMA form at every M */
+        const long long Nv = N;
+        const int wk = gg_wk_run(s, ty, logits, 1, &xd, &x_ld, &x_al, &wd, w_ld, &yd, &y_ld, &Nv, M, K);
+        if (wk != R4D_WK_DECLINE) return wk;
+    }
     const long long tb = gg_r16(gg_tab_bytes(ty));
     /* Every pass of up to kGgDecodeRows rows runs the decode kernel, whichever row (gemv or tiled)
      * the engine picked: a row's outputs are then the same bits whatever else is in the pass
@@ -4107,6 +4508,15 @@ extern "C" int r4d_rad_gemm_nt_ggml_pair(const RadArgs* a, RadStream s) {
     const long long x_ld = M > 1 ? x->stride[0] : K, x2_ld = M > 1 ? x2->stride[0] : K;
     const long long y_ld = M > 1 ? y->stride[0] : N, y2_ld = M > 1 ? y2->stride[0] : N2;
     const int x_al = gg_al16(x->data, x_ld) ? 1 : 0, x2_al = gg_al16(x2->data, x2_ld) ? 1 : 0;
+    if (g_gg_wk && ty == ty2 && w_ld == w2_ld) {   /* ds41-wmk bench pin: the pair as ONE part-order WMMA launch */
+        const uint16_t* xs2[2] = { (const uint16_t*)x->data, (const uint16_t*)x2->data };
+        const long long xl2[2] = { x_ld, x2_ld }, yl2[2] = { y_ld, y2_ld }, nv2[2] = { N, N2 };
+        const int xa2[2] = { x_al, x2_al };
+        const uint8_t* ws2[2] = { (const uint8_t*)w->data, (const uint8_t*)w2->data };
+        void* ys2[2] = { y->data, y2->data };
+        const int wk = gg_wk_run(s, ty, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K);
+        if (wk != R4D_WK_DECLINE) return wk;
+    }
     if (M <= kGgDecodeRows && ty == ty2 && r4d_gg_mr_on()) {
         const R4dGgMrCall c1{ ty, false, (const uint16_t*)x->data, x_ld, x_al, (const uint8_t*)w->data, w_ld, y->data,
                               y_ld, (int)M, (int)N, (int)K };
@@ -4163,6 +4573,9 @@ extern "C" int r4d_rad_embed_lookup_ggml(const RadArgs* a, RadStream s) {
 }
 
 extern "C" void r4d_gg_wm_pin(int on) { g_gg_wm_all = on ? 1 : 0; }
+extern "C" void r4d_gg_wk_pin(int code) { g_gg_wk = code; }
+extern "C" long long r4d_gg_wk_count() { return g_gg_wk_count.load(std::memory_order_relaxed); }
+extern "C" int r4d_gg_wk_last() { return g_gg_wk_last.load(std::memory_order_relaxed); }
 extern "C" long long r4d_gg_wm_count() { return g_gg_wm_count.load(std::memory_order_relaxed); }
 extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
     g_gg_pin_rpw = (rpw == 1 || rpw == 2 || rpw == 4) ? rpw : 0;

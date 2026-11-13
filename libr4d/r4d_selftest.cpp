@@ -38457,6 +38457,9 @@ int main(int argc, char** argv) {
             wgk = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_r = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--wmk") && i + 1 < argc) {
+            /* ds41-wmk: the W arm of --perfwmg / --wmgcheck is gg_wk_kernel under these bench pin codes. */
+            for (int64_t c : wmg::ilist(argv[++i], "")) if (c > 0) wmg::g_wk_codes.push_back((int)c);
         } else if (!std::strcmp(argv[i], "--wmgcheck")) {
             /* ds41-wmgate: a row's WMMA bytes vs M and its place in the launch (wmg::check). */
             wgc = true;
@@ -38749,7 +38752,7 @@ int main(int argc, char** argv) {
     if (wgc || wgp || wgk) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        if (wgc) wmg::check(pl, wg_t);
+        if (wgc) { if (wmg::g_wk_codes.empty()) wmg::check(pl, wg_t); else wmg::checkk(pl, wg_t); }
         if (wgp) wmg::perf(pl, wg_m, wg_it, wg_r, wg_t);
         if (wgk) wmg::scan(pl, wg_it, wg_r);
         dfree_all();
