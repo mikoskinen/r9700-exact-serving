@@ -17,6 +17,7 @@
 #include "r4d_ds41_ggml_pf.h"
 #include "r4d_ds41_wmk.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -474,6 +475,302 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
  * Every code computes the same part order: the bytes do not depend on the code. */
 std::atomic<long long> g_gg_wk_count{0};
 std::atomic<int> g_gg_wk_last{0};
+/* ------------------------------------------------------------------ gg_wk3_kernel (G2: M 17..48, ds41-wmk2 stage 2)
+ * The part order (the same bytes as gg_wk_kernel) with NM 16-row tiles a block, so a weight word is decoded once for up to 48
+ * rows (gg_wk_kernel re-decodes it in every 16-row block). A block = KP runs x NS = 8 / KP column groups of waves, a wave NT
+ * column tiles x NM row tiles; the K range's P parts split over the runs, a run owning PPW = P / KP <= 2 consecutive parts.
+ * Activations staged ONE slab at a time (single buffer: 2 barriers a slab) -- KP runs x 16 NM rows, the stock staging's
+ * chunks and group sums; a run-0 wave keeps the running total (tot), a later run's wave keeps its first part's partial in
+ * registers (hold) and its last in acc; after the K loop those partials are written over the staging region, and run 0 adds
+ * them in part order. Every output: the part partials of gg_wm_kernel's arithmetic, folded ((p0 + p1) + ...) in f32, rounded once. */
+template <int T, int KP, int NM, int NT, typename OT>
+__global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
+    using W = Wq<T>;
+    using Pf = typename W::Pf;
+    static_assert(W::TB == 0 && !W::PIPE || W::TB == 0, "gg_wk3_kernel: the table types are not built");
+    constexpr int NS = 8 / KP;
+    constexpr int BMr = 16 * NM;                 /* rows a run stages */
+    constexpr int BM = KP * BMr;
+    constexpr int NX = KP * NM;                  /* 16-byte chunks a thread stages a slab */
+    constexpr int XE = BM * kWmXP;
+    constexpr int XGE = W::XG > 0 ? kWmS / W::XG * BM : 0;
+    extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
+    const int tid = (int)threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int kp = __builtin_amdgcn_readfirstlane(wave / NS), ns = __builtin_amdgcn_readfirstlane(wave % NS);
+    const int mi = (int)blockIdx.y >= A.gy0 ? 1 : 0;
+    const int n0 = ((int)blockIdx.y - (mi ? A.gy0 : 0)) * (16 * NT * NS);
+    const int N = A.N[mi];
+    const int r0 = (int)blockIdx.x * BMr, r1 = min(r0 + BMr, A.M);
+    uint16_t* Xs = (uint16_t*)(void*)gg_smem;
+    float* Xg = (float*)(void*)(gg_smem + XE * 2);
+    float* Pp = (float*)(void*)gg_smem;           /* after the K loop: the later runs' part partials, over the staging */
+    const int S = A.S, SW = A.SW, SP = A.SP, PPW = A.PPW;
+    const int sb = kp * SW;
+    const uint8_t* wb = A.w[mi];
+    const int h = lane >> 4, c16 = lane & 15;
+    const uint8_t* wr[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        const int n = n0 + (ns * NT + nt) * 16 + c16;
+        wr[nt] = wb + (long long)(n < N ? n : N - 1) * A.w_ld;
+    }
+    /* chunk i = run (i / NM) at its slab, tile row (i % NM) * 16 + (tid >> 4), values 8 (tid & 15); a row past M stages the last */
+    const uint16_t* xsrc[NX];
+    int xdo[NX], xgo[NX];
+#pragma unroll
+    for (int i = 0; i < NX; ++i) {
+        const int run = i / NM, row = (i % NM) * 16 + (tid >> 4), kc = (tid & 15) * 8;
+        xsrc[i] = A.x[mi] + (long long)min(r0 + row, r1 - 1) * A.x_ld[mi] + kc + (long long)run * SW * kWmS;
+        xdo[i] = (run * BMr + row) * kWmXP + kc;
+        xgo[i] = ((tid & 15) * 8 / (W::XG > 0 ? W::XG : 1)) * BM + run * BMr + row;
+    }
+    r4d_u32x4 xr[NX];
+    auto xload = [&](int t) {
+#pragma unroll
+        for (int i = 0; i < NX; ++i) xr[i] = *(gg_gu128)(const void*)(xsrc[i] + t * kWmS);
+    };
+    auto xstore = [&]() {
+#pragma unroll
+        for (int i = 0; i < NX; ++i) {
+            *(r4d_u32x4*)(void*)(Xs + xdo[i]) = xr[i];
+            if constexpr (W::XG > 0) {
+                float sm = 0.0f;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) sm += bf16w_lo(xr[i][k]) + bf16w_hi(xr[i][k]);
+                sm += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sm), 0xB1, 0xF, 0xF, false));
+                if constexpr (W::XG == 32)
+                    sm += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sm), 0x4E, 0xF, 0xF, false));
+                Xg[xgo[i]] = W::XGK * sm;
+            }
+        }
+    };
+    const uint16_t* xa = Xs + (kp * BMr + c16) * kWmXP;
+    const float* xgl = Xg + kp * BMr + 8 * h;
+    gg_v8f acc[NM][NT], tot[NM][NT];
+#pragma unroll
+    for (int m = 0; m < NM; ++m)
+#pragma unroll
+        for (int j = 0; j < NT; ++j) { acc[m][j] = (gg_v8f)(0.0f); tot[m][j] = (gg_v8f)(0.0f); }
+    uint32_t rE[2][NT][W::RAW], rR[NT][W::RAW];
+    xload(0);
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        uint32_t t[W::RAW];
+        W::load(wr[nt], sb, h, t);
+#pragma unroll
+        for (int k = 0; k < W::RAW; ++k) {
+            if ((W::EARLY >> k) & 1u) rE[0][nt][k] = t[k];
+            else rR[nt][k] = t[k];
+        }
+    }
+    xstore();
+    xload(1 < SW ? 1 : SW - 1);
+    r4d_u32x4 bf[2][NT];
+    Pf pf[NT];
+    lds_barrier();
+    {
+        uint32_t rc[NT][W::RAW];
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[0][nt][k] : rR[nt][k];
+        if constexpr (W::PIPE) {
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) W::template pre<0>(rc[nt], h, gg_smem, pf[nt]);
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) bf[0][nt] = W::template bfrag<0>(rc[nt], h, pf[nt], sb);
+        }
+    }
+    int pleft = SP, pgp = 0;   /* slabs left in the wave's current part; the part's index within the run */
+    auto slab = [&](auto pc, int t) {
+        constexpr int PB = decltype(pc)::value;
+        const int s = sb + t;
+        uint32_t rc[NT][W::RAW];
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
+        const int sn = t + 1 < SW ? s + 1 : s;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            uint32_t tw[W::RAW];
+            W::load(wr[nt], sn, h, tw);
+#pragma unroll
+            for (int k = 0; k < W::RAW; ++k)
+                if ((W::EARLY >> k) & 1u) rE[PB ^ 1][nt][k] = tw[k];
+        }
+        gg_v8f P[NM][NT];
+        r4d_u32x4 af[2][NM];
+        gg_v8f ci[NM];
+#pragma unroll
+        for (int mt = 0; mt < NM; ++mt) {
+            af[0][mt] = *(const r4d_u32x4*)(const void*)(xa + mt * 16 * kWmXP + W::xoff(0, h));
+            if constexpr (W::CINIT && W::PIPE) ci[mt] = *(const gg_v8f*)(const void*)(xgl + mt * 16);
+        }
+        gg_for<8>([&](auto jc) {
+            constexpr int J = decltype(jc)::value, C = J & 1;
+            if constexpr (!W::PIPE) {
+                if constexpr (J < 7) {
+#pragma unroll
+                    for (int mt = 0; mt < NM; ++mt) af[C ^ 1][mt] = *(const r4d_u32x4*)(const void*)(xa + mt * 16 * kWmXP + W::xoff(J + 1, h));
+                }
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) bf[C][nt] = W::template bfrag<J>(rc[nt], h, pf[nt], s);
+            } else if constexpr (J < 7) {
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt) af[C ^ 1][mt] = *(const r4d_u32x4*)(const void*)(xa + mt * 16 * kWmXP + W::xoff(J + 1, h));
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) W::template pre<J + 1>(rc[nt], h, gg_smem, pf[nt]);
+            } else {
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+                    for (int k = 0; k < W::RAW; ++k) rc[nt][k] = ((W::EARLY >> k) & 1u) ? rE[PB ^ 1][nt][k] : rR[nt][k];
+                    W::template pre<0>(rc[nt], h, gg_smem, pf[nt]);
+                }
+            }
+            gg_v8f g8[NM];
+            if constexpr (W::MINS && W::PIPE && J % W::SPG == W::SPG - 1) {
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt) g8[mt] = *(const gg_v8f*)(const void*)(xgl + (J * 16 / W::XG) * BM + mt * 16);
+            }
+#pragma unroll
+            for (int mt = 0; mt < NM; ++mt) {
+                if constexpr (J % W::SPG == 0) {
+                    gg_v8f c0 = (gg_v8f)(0.0f);
+                    if constexpr (W::CINIT && W::PIPE) c0 = ci[mt];
+                    else if constexpr (W::CINIT) c0 = *(const gg_v8f*)(const void*)(xgl + (J * 16 / W::XG) * BM + mt * 16);
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) P[mt][nt] = gg_wmma(af[C][mt], bf[C][nt], c0);
+                } else {
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) P[mt][nt] = gg_wmma(af[C][mt], bf[C][nt], P[mt][nt]);
+                }
+            }
+            if constexpr (W::CINIT && W::PIPE && J < 7 && (J + 1) % W::SPG == 0) {
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt) ci[mt] = *(const gg_v8f*)(const void*)(xgl + ((J + 1) * 16 / W::XG) * BM + mt * 16);
+            }
+            if constexpr (W::PIPE) {
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) bf[C ^ 1][nt] = W::template bfrag<(J + 1) & 7>(rc[nt], h, pf[nt], J < 7 ? s : sn);
+            }
+            if constexpr (J % W::SPG == W::SPG - 1) {
+                float sc[NT], mn[NT];
+                if constexpr (J < 7 || !W::PIPE) {
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        sc[nt] = W::scale(rc[nt], J / W::SPG, s);
+                        if constexpr (W::MINS) mn[nt] = W::mins(rc[nt], J / W::SPG, s);
+                    }
+                } else {
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        uint32_t ro[W::RAW];
+#pragma unroll
+                        for (int k = 0; k < W::RAW; ++k) ro[k] = ((W::EARLY >> k) & 1u) ? rE[PB][nt][k] : rR[nt][k];
+                        sc[nt] = W::scale(ro, J / W::SPG, s);
+                        if constexpr (W::MINS) mn[nt] = W::mins(ro, J / W::SPG, s);
+                    }
+                }
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt) {
+                    if constexpr (W::MINS && !W::PIPE) g8[mt] = *(const gg_v8f*)(const void*)(xgl + (J * 16 / W::XG) * BM + mt * 16);
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                        for (int q = 0; q < 8; ++q) {
+                            acc[mt][nt][q] = __builtin_fmaf(P[mt][nt][q], sc[nt], acc[mt][nt][q]);
+                            if constexpr (W::MINS) acc[mt][nt][q] = __builtin_fmaf(g8[mt][q], mn[nt], acc[mt][nt][q]);
+                        }
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) gg_pin8(acc[mt][nt]);
+                }
+            }
+            if constexpr (W::ROLL) {
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) W::template reload<J>(wr[nt], sn, h, rR[nt]);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+        });
+        /* the one buffer: every wave done reading slab t, then slab t + 1 in, then slab t + 2's loads */
+        lds_barrier();
+        xstore();
+        lds_barrier();
+        xload(t + 2 < SW ? t + 2 : SW - 1);
+        /* a part ends with this slab: run 0 folds it into its total; a later run's first part goes to hold (= tot here) */
+        if (--pleft == 0) {
+            pleft = SP;
+            const int gp = pgp++;
+            if (gp == 0 || kp == 0) {
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+                        for (int q = 0; q < 8; ++q) tot[mt][nt][q] = gp == 0 ? acc[mt][nt][q] : tot[mt][nt][q] + acc[mt][nt][q];
+                        gg_pin8(tot[mt][nt]);
+                    }
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) acc[mt][nt] = (gg_v8f)(0.0f);
+            }
+            /* a later run's second part stays in acc */
+        }
+    };
+    int t = 0;
+    for (; t + 1 < SW; t += 2) {
+        slab(std::integral_constant<int, 0>{}, t);
+        slab(std::integral_constant<int, 1>{}, t + 1);
+    }
+    if (t < SW) slab(std::integral_constant<int, 0>{}, t);
+    if constexpr (KP > 1) {
+        /* the later runs' partials (part kp PPW: tot, part kp PPW + 1: acc) over the staging region, then run 0 folds in order */
+        lds_barrier();
+        if (kp != 0) {
+            float* pp0 = Pp + ((((kp - 1) * PPW) * NS + ns) * 32 + lane) * (NM * NT * 8);
+#pragma unroll
+            for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) *(gg_v8f*)(void*)(pp0 + (mt * NT + nt) * 8) = tot[mt][nt];
+            if (PPW == 2) {
+                float* pp1 = Pp + ((((kp - 1) * PPW + 1) * NS + ns) * 32 + lane) * (NM * NT * 8);
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) *(gg_v8f*)(void*)(pp1 + (mt * NT + nt) * 8) = acc[mt][nt];
+            }
+        }
+        lds_barrier();
+        if (kp != 0) return;
+        for (int g = 0; g < (KP - 1) * PPW; ++g) {
+            const float* pp = Pp + ((g * NS + ns) * 32 + lane) * (NM * NT * 8);
+#pragma unroll
+            for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt) {
+                    const gg_v8f a = *(const gg_v8f*)(const void*)(pp + (mt * NT + nt) * 8);
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) tot[mt][nt][q] = tot[mt][nt][q] + a[q];
+                }
+        }
+    }
+#pragma unroll
+    for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int n = n0 + (ns * NT + nt) * 16 + c16;
+            if (n >= N) continue;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const int row = r0 + mt * 16 + 8 * h + q;
+                if (row >= r1) continue;
+                gg_put((OT*)A.y[mi] + (long long)row * A.y_ld[mi] + n, tot[mt][nt][q]);
+            }
+        }
+}
+
 template <int T>
 constexpr unsigned gg_wk_lds(int kp, int P, bool wl = false) {
     if (wl)   /* a region a wave, single-buffered */
@@ -517,6 +814,67 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
 
 }  // namespace
 
+/* G2's launch (code bit 21, M 17..48, no fold): NM = ceil(M / 16) row tiles in one block row, KP = P / 2 (a run owns <= 2 parts),
+ * NT = 2 column tiles a wave at NM 2 where the partials fit 64 KiB (they reuse the staging), else 1 (NM 3; bit 22: always 1). */
+template <int T>
+static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, const GgWkArgs& A, dim3 grid, unsigned lds) {
+#define GG_WK3_X(KPV, NMV, NTV)                                                                                         \
+    if (kp == KPV && nmt == NMV && nt == NTV) {                                                                         \
+        if (f32out) {                                                                                                   \
+            if constexpr (KPV == 4) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float>), grid, dim3(256), lds, A); \
+            return R4D_WK_DECLINE;                                                                                      \
+        }                                                                                                               \
+        return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t>), grid, dim3(256), lds, A);                       \
+    }
+    GG_WK3_X(1, 2, 2) GG_WK3_X(1, 3, 2) GG_WK3_X(1, 2, 1) GG_WK3_X(1, 3, 1)
+    GG_WK3_X(2, 2, 2) GG_WK3_X(2, 3, 2) GG_WK3_X(2, 2, 1) GG_WK3_X(2, 3, 1)
+    GG_WK3_X(4, 2, 2) GG_WK3_X(4, 3, 2) GG_WK3_X(4, 2, 1) GG_WK3_X(4, 3, 1)
+#undef GG_WK3_X
+    return R4D_WK_DECLINE;
+}
+static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
+               const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv, long long M,
+               long long K) {
+    const int P = gg_wk_parts(K);
+    const int kp = P >= 2 ? P / 2 : 1;
+    const int nmt = (int)((M + 15) / 16);
+    if (nmt < 2 || nmt > 3 || kp > 4) return R4D_WK_DECLINE;
+    const unsigned xg = Wq<GG_Q6_K>::XG > 0 ? (unsigned)(kWmS / 16 * 16 * nmt * kp * 4) : 0u;   /* the widest group sums (q6_K) */
+    const unsigned stage = (unsigned)(kp * 16 * nmt * kWmXP * 2) + xg;
+    auto parts_lds = [&](int nt) { return (unsigned)((kp - 1) * (P / kp) * (8 / kp) * 32 * nmt * nt * 8 * 4); };
+    /* NT 2 at two row tiles; three tiles take NT 1 (NM 3 x NT 2 spills: 24-212 B of scratch in the 14.11. code object) */
+    int nt = (code & 4194304) || nmt == 3 ? 1 : 2;
+    if (nt == 2 && std::max(stage, parts_lds(2)) > 65536u) nt = 1;
+    const unsigned lds = std::max(stage, parts_lds(nt));
+    if (lds > 65536u) return R4D_WK_DECLINE;
+    const int NS = 8 / kp;
+    GgWkArgs A{};
+    long long gy = 0;
+    for (int i = 0; i < 2; ++i) {
+        const int j = i < nm ? i : 0;
+        A.x[i] = xd[j]; A.x_ld[i] = x_ld[j]; A.w[i] = wd[j]; A.y[i] = yd[j]; A.y_ld[i] = y_ld[j]; A.N[i] = (int)Nv[j];
+        if (i < nm) {
+            if (i == 1) A.gy0 = (int)gy;
+            gy += (Nv[i] + 16 * nt * NS - 1) / (16 * nt * NS);
+        }
+    }
+    if (nm == 1) A.gy0 = (int)gy;
+    A.w_ld = w_ld;
+    A.M = (int)M; A.K = (int)K; A.P = P;
+    A.S = (int)(K / kWmS); A.SW = A.S / kp; A.SP = A.S / P; A.PPW = P / kp;
+    A.psb = w_ld / A.S;
+    A.pfm = 1; A.pfl = 0;
+    if (gy > 65535) return R4D_WK_DECLINE;
+    g_gg_wk_count.fetch_add(1, std::memory_order_relaxed);
+    g_gg_wk_last.store(kp * 100 + P + 10000 * nmt + 100000 * nt, std::memory_order_relaxed);
+    const dim3 grid(1u, (unsigned)gy);
+    switch (ty) {
+    case GG_Q8_0: return gg_launch_wk3_t<GG_Q8_0>(s, kp, nmt, nt, f32out, A, grid, lds);
+    case GG_Q6_K: return gg_launch_wk3_t<GG_Q6_K>(s, kp, nmt, nt, f32out, A, grid, lds);
+    default: return gg_launch_wk3_t<GG_Q5_K>(s, kp, nmt, nt, f32out, A, grid, lds);
+    }
+}
+
 int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
               const int* x_al, const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld,
               const long long* Nv, long long M, long long K, const GgWkFold* fo) {
@@ -526,6 +884,10 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
         return R4D_WK_DECLINE;
     for (int i = 0; i < nm; ++i)
         if (!x_al[i]) return R4D_WK_DECLINE;
+    if ((code & 2097152) && !fo && M > 16 && M <= 48) {   /* bit 21: G2 (row tiles a block) at 17..48 rows; declined -> the rule below */
+        const int g2 = gg_wk3_run(s, code, ty, f32out, nm, xd, x_ld, wd, w_ld, yd, y_ld, Nv, M, K);
+        if (g2 != R4D_WK_DECLINE) return g2;
+    }
     const bool wl = (code & 262144) != 0;   /* bit 18: G1's wave-local staging (KP up to 8) */
     const int cap = (code & 15) >= 8 && wl ? 8 : (code & 15) >= 4 ? 4 : (code & 15) >= 2 ? 2 : 1;
     const int P = (code & 16) ? 1 : gg_wk_parts(K);
