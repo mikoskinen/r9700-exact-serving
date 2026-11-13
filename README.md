@@ -3,16 +3,26 @@
 This repository documents local serving of two large mixture-of-experts models, with the measurements
 and every tested change.
 
-- **Models:** DeepSeek V4.1 Flash (EXL3, 2.25 bits per weight) and Qwen Flash-Next (EXL3, 4.05 bits per
-  weight). Only these two were optimised.
-- **GPUs:** four AMD Radeon AI PRO R9700 cards (RDNA4, 32 GB each) on PCIe 4.0.
-- **Host:** AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board with 512 GB of RAM.
-- **Engine:** a C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance) with the
-  [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, tensor parallel over the four cards.
-- **Use:** the local backend for Claude Code through a LiteLLM proxy.
-- **Exact output:** the same bytes alone and under load ([What exact means](#what-exact-means)).
-- **Who it's for:** people who run large MoE models on AMD GPUs or EPYC hosts, tune a multi-GPU PCIe box
-  without NVLink, or need reproducible output from a coding agent.
+- **Models**
+  - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight
+  - Qwen Flash-Next, EXL3 4.05 bits per weight
+  - Only these two were optimised.
+- **Hardware**
+  - 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each), PCIe 4.0 x16, one card per CPU root complex
+  - AMD EPYC 7302P (Rome)
+  - ASRock Rack ROMED8-2T
+  - 512 GB of RAM (8 x 64 GB)
+- **Software**
+  - A C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance)
+  - The [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin
+  - Tensor parallel over the four cards
+  - A LiteLLM proxy that serves it to Claude Code
+- **Output**
+  - Byte-identical greedy output alone and under load ([What exact means](#what-exact-means))
+- **Who it's for**
+  - People who run large MoE models on AMD GPUs or EPYC hosts, or tune a multi-GPU PCIe box without
+    NVLink
+  - Anyone who needs reproducible output from a coding agent
 
 ## Results
 
