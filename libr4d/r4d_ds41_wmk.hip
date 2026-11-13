@@ -6,6 +6,7 @@
  * r4d_gg_wk_last. */
 #define R4D_GG_BLOCKS_ONLY 1
 #define R4D_GG_WM_SRC 1
+#define R4D_GG_WM_PARTFOLD 1   /* the stock WMMA kernel's template here carries the part fold (r4d_ds41_ggml.hip's unit: not) */
 #include "r4d_ds41_ggml.hip"
 /* Lever WMK's prefill rows (stage 3, G3): lever GPF's tile forms (gg_pf_kernel, the stock WMMA arithmetic in other
  * geometries) compiled here with the part fold -- the same part order as gg_wk_kernel's, so a row's bytes are the same in
@@ -592,6 +593,7 @@ namespace {
  * pin r4d_gg_wkpf_follow(1) makes it follow gg_pf's pick (the form timing). */
 int g_wkpf_ts = 0;
 int g_wkpf_follow = 0;
+int g_wkpf_default = 322;   /* bench pin r4d_gg_wkpf_default: the form W's prefill rows run (0 = the stock kernel + fold) */
 template <int T, int MT, int NT, int WN, int FI>
 int wkpf_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
     const dim3 grid((unsigned)((A.M + 16 * MT - 1) / (16 * MT)), (unsigned)((A.N + 16 * NT * WN - 1) / (16 * NT * WN)));
@@ -607,6 +609,13 @@ int wkpf_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
 }
 template <int T>
 int wkpf_launch_t(RadStream s, int code, bool f32out, const GgTiledArgs& A) {
+    if (code == 0) {   /* the stock WMMA kernel (gg_wm_kernel, MT 3) with the part fold */
+        const dim3 grid((unsigned)((A.M + 47) / 48), (unsigned)((A.N + kWmBN - 1) / kWmBN));
+        if (grid.y > 65535u) return R4D_WK_DECLINE;
+        const unsigned lds = pf_lds<T>(3);
+        if (f32out) return R4D_EMIT(s, (gg_wm_kernel<T, 3, false, float>), grid, dim3(256), lds, A);
+        return R4D_EMIT(s, (gg_wm_kernel<T, 3, false, uint16_t>), grid, dim3(256), lds, A);
+    }
 #define WKPF_L(mt, nt, wn, fi) if (code == pf_code(mt, nt, wn, fi, 0)) return wkpf_launch_f<T, mt, nt, wn, fi>(s, f32out, A);
     WKPF_FORMS(WKPF_L)
 #undef WKPF_L
@@ -625,7 +634,7 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
     A.y = y; A.y_ld = y_ld;
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = 1; A.tab_bytes = 0;
-    if (!g_wkpf_follow) form = 322;
+    if (!g_wkpf_follow) form = g_wkpf_default;
     g_wkpf_last.store(form, std::memory_order_relaxed);
     switch (ty) {
     case GG_Q8_0: return wkpf_launch_t<GG_Q8_0>(s, form, f32out, A);
@@ -636,3 +645,4 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
 extern "C" int r4d_gg_wkpf_last() { return g_wkpf_last.load(std::memory_order_relaxed); }
 extern "C" void r4d_gg_wkpf_ts(int v) { g_wkpf_ts = v == 1 || v == 2 ? v : 0; }
 extern "C" void r4d_gg_wkpf_follow(int on) { g_wkpf_follow = on ? 1 : 0; }
+extern "C" void r4d_gg_wkpf_default(int form) { g_wkpf_default = form; }

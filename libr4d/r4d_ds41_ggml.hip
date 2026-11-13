@@ -3036,6 +3036,16 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
         for (int i = 0; i < NM; ++i)
 #pragma unroll
             for (int j = 0; j < 2; ++j) acc[i][j] = (gg_v8f)(0.0f);
+#ifdef R4D_GG_WM_PARTFOLD
+        /* lever WMK (r4d_ds41_wmk.hip only): the part order -- a part is SPP slabs (S / P, P = 8 / 4 / 2 / 1 by K), each part's
+         * chain from +0.0, the parts added in order into the running total tot, rounded once */
+        const int SPP = S / (S % 8 == 0 ? 8 : S % 4 == 0 ? 4 : S % 2 == 0 ? 2 : 1);
+        gg_v8f tot[NM][2];
+#pragma unroll
+        for (int i = 0; i < NM; ++i)
+#pragma unroll
+            for (int j = 0; j < 2; ++j) tot[i][j] = (gg_v8f)(0.0f);
+#endif
         /* Raw weight words: the EARLY ones in two sets (slab s computes from set s & 1 while set
          * (s + 1) & 1 loads), the ROLL types' others in one set reloaded in place. */
         uint32_t rE[2][2][W::RAW], rR[2][W::RAW];
@@ -3223,6 +3233,22 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
                 __builtin_amdgcn_sched_barrier(0);
             });
             lds_barrier();
+#ifdef R4D_GG_WM_PARTFOLD
+            if ((s + 1) % SPP == 0) {   /* a part ends with this slab: the first part as it is, then total + part */
+                const bool first = s + 1 == SPP;
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt) {
+                    if (!live(mt)) continue;
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                        for (int q = 0; q < 8; ++q) tot[mt][nt][q] = first ? acc[mt][nt][q] : tot[mt][nt][q] + acc[mt][nt][q];
+                        acc[mt][nt] = (gg_v8f)(0.0f);
+                        gg_pin8(tot[mt][nt]);
+                    }
+                }
+            }
+#endif
         };
         for (int s = 0; s < S; s += 2) {   /* S is even (K % 256 == 0) */
             slab(std::integral_constant<int, 0>{}, s);
@@ -3239,7 +3265,11 @@ __global__ __launch_bounds__(256) void gg_wm_kernel(GgTiledArgs A) {
                     const int lr = mt * 16 + 8 * h + q, row = r0 + lr;
                     if (row >= r1) continue;
                     float v = 0.0f;
+#ifdef R4D_GG_WM_PARTFOLD
+                    if constexpr (mt < NM) v = s_tok[lr] >= 0 ? tot[mt][nt][q] : 0.0f;
+#else
                     if constexpr (mt < NM) v = s_tok[lr] >= 0 ? acc[mt][nt][q] : 0.0f;
+#endif
                     gg_put((OT*)A.y + (long long)row * A.y_ld + n, v);
                 }
             }
@@ -3609,6 +3639,27 @@ int g_gg_wk = 0;
  * exactly. RADIANCE_DS41_WMK=1 at load starts it on. A call the form declines under the switch (not q5_K / q6_K / q8_0,
  * K not a multiple of 256, an unaligned activation) falls to int16's path and is counted + logged (the first 16). */
 constexpr int kWmkCode = 70724;
+/* The launch code a part-order call takes (r5, 14.11.: one card, rotated weights, the four codes 70724 / 332872 / 857160 / 595012
+ * at M 1 / 8 / 16 / 24 / 48, runs/wmk2-s5b): every code computes the same bytes, so the geometry may follow the shape and the
+ * row count. M <= 16: WL staging with KP up to 8 (332872) where it measured faster -- q6_K K 5120 shared-expert gate_up (N 1536 /
+ * 1024), the q6_K q_a + kv pair (1792), the q6_K q_b (8192 x 1280), the head (32320 x 5120 f32), q8_0 gate_up at N 1024 -- else
+ * 70724. M 17..48: the per-tile KP rule (595012) except the head and q6_K gate_up / shexp down / o_b (70724). kWmkCode when the
+ * table is off (g_wmk_tab 0, bench pin r4d_gg_wmk_tab). */
+int g_wmk_tab = 1;
+int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
+    if (!g_wmk_tab) return kWmkCode;
+    const bool head = f32out && Ntot >= 16384;
+    if (M <= 16) {
+        if (head) return 332872;
+        if (ty == GG_Q6_K && K == 5120 && (Ntot == 1536 || Ntot == 1024 || Ntot == 1792)) return 332872;
+        if (ty == GG_Q6_K && K == 1280 && Ntot == 8192) return 332872;
+        if (ty == GG_Q8_0 && K == 5120 && Ntot == 1024) return 332872;
+        return kWmkCode;
+    }
+    if (head) return kWmkCode;
+    if (ty == GG_Q6_K && ((K == 5120 && Ntot == 1536) || K == 768 || K == 512 || (K == 2048 && Ntot == 5120))) return kWmkCode;
+    return 595012;
+}
 std::atomic<int> g_wmk{-1};
 std::atomic<long long> g_wmk_launches{0}, g_wmk_rows{0}, g_wmk_declines{0};
 int wmk_now() {
@@ -3712,7 +3763,7 @@ int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long 
     /* ds41-wmk: the bench pin (every M), else lever WMK (fn4 ds41_wmk 1, <= kGgDecodeRows rows): the part-order WMMA form */
     if (g_gg_wk || wmk_take(M)) {
         const long long Nv = N;
-        const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : kWmkCode, ty, logits, 1, &xd, &x_ld, &x_al, &wd, w_ld, &yd, &y_ld,
+        const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, logits), ty, logits, 1, &xd, &x_ld, &x_al, &wd, w_ld, &yd, &y_ld,
                                  &Nv, M, K, nullptr);
         if (!g_gg_wk) {
             if (wk != R4D_WK_DECLINE) wmk_count(M);
@@ -4090,7 +4141,7 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
             const uint8_t* wp = (const uint8_t*)w->data;
             void* yp = y->data;
             const long long Nv = N;
-            const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : kWmkCode, ty, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv,
+            const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, false), ty, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv,
                                      M, K, &fo);
             if (wk != R4D_WK_DECLINE) {
                 if (!g_gg_wk) wmk_count(M);
@@ -4144,7 +4195,7 @@ extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s
             const uint8_t* wp = (const uint8_t*)w->data;
             void* yp = y->data;
             const long long Nv = N;
-            const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : kWmkCode, ty, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv,
+            const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N, K, M, false), ty, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv,
                                      M, K, &fo);
             if (wk != R4D_WK_DECLINE) {
                 if (!g_gg_wk) wmk_count(M);
@@ -4220,7 +4271,7 @@ extern "C" int r4d_rad_gemm_nt_ggml_pair(const RadArgs* a, RadStream s) {
         const int xa2[2] = { x_al, x2_al };
         const uint8_t* ws2[2] = { (const uint8_t*)w->data, (const uint8_t*)w2->data };
         void* ys2[2] = { y->data, y2->data };
-        const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : kWmkCode, ty, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K, nullptr);
+        const int wk = r4d_gg_wk_run(s, g_gg_wk ? g_gg_wk : wmk_code(ty, N + N2, K, M, false), ty, false, 2, xs2, xl2, xa2, ws2, w_ld, ys2, yl2, nv2, M, K, nullptr);
         if (wk != R4D_WK_DECLINE) {
             if (wmk) wmk_count(M);
             return wk;
@@ -4283,6 +4334,7 @@ extern "C" int r4d_rad_embed_lookup_ggml(const RadArgs* a, RadStream s) {
 
 extern "C" void r4d_gg_wm_pin(int on) { g_gg_wm_all = on ? 1 : 0; }
 extern "C" void r4d_gg_wk_pin(int code) { g_gg_wk = code; }
+extern "C" void r4d_gg_wmk_tab(int on) { g_wmk_tab = on ? 1 : 0; }
 /* Lever WMK's counters (rad_wmk_stats; GET /admin/fn4 "wmk"): [0] the switch now, [1] part-order launches it issued, [2] their
  * rows, [3] calls it declined to int16's path. Recorded passes replay without issuing: the counts are issued launches. */
 extern "C" int rad_wmk_stats(long long* out, int n) {

@@ -55,12 +55,20 @@ static bool hooks(const Plugin& pl, Hk& h, const char* who) {
 static void clear(const Hk& h) {
     h.wm_pin(0);
     if (h.wk_pin) h.wk_pin(0);
+    h.sw("ds41_wmk", 0);   /* (a libr4d without lever WMK refuses it: harmless) */
     h.mr.pin(0, 0, 0, 0); h.mr.pin_xp(0);
     if (h.mr.pin_w64) h.mr.pin_w64(0);
     h.sw("gg_gemv_m16", 0); h.sw("gg_gemv", 0);
 }
 static void set_dec(const Hk& h) { clear(h); h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); }   /* int16's decode band */
-static void set_wm(const Hk& h) { clear(h); if (g_wk_cur) h.wk_pin(g_wk_cur); else h.wm_pin(1); }
+/* --wmk 1048576: the W arm is the ENGINE's path (fn4 ds41_wmk 1 over int16's band: lever WMK's per-shape code table), not a pin */
+constexpr int kWkEngine = 1048576;
+static void set_wm(const Hk& h) {
+    clear(h);
+    if (g_wk_cur == kWkEngine) { h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1); }
+    else if (g_wk_cur) h.wk_pin(g_wk_cur);
+    else h.wm_pin(1);
+}
 static void set_stock_wm(const Hk& h) { clear(h); h.wm_pin(1); }
 static long long wcount(const Hk& h) { return g_wk_cur ? h.wk_count() : h.wm_count(); }
 
@@ -936,8 +944,8 @@ static void route(const Plugin& pl, const char* tlist) {
             long long form_bad = 0;
             std::string forms_ok;
             if (pf_pin && op.kind <= 1) {
-                for (int fc : { 322, 422, 426, 326, 321, 222 })
-                    for (int ts : { 1, 2 }) {   /* the running total in registers / in scratch */
+                for (int fc : { 0, 322, 422, 426, 326, 321, 222 })
+                    for (int ts : { 1, 2 }) {   /* the running total in registers / in scratch (form 0, the stock kernel: registers) */
                         if (!wkpf_ts && ts == 2) continue;
                         wmk_on(1);
                         pf_pin(fc);
@@ -1230,7 +1238,7 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
     if (wkpf_follow) wkpf_follow(1);   /* W takes the pinned form */
     const std::vector<int64_t> Ms = gp_list(mlist, "4096,2048");
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
-    const int forms[] = { 322, 422, 426, 326, 321, 222 };
+    const int forms[] = { 0, 322, 422, 426, 326, 321, 222 };   /* 0: int16's stock kernel / W's stock kernel + fold */
     long long keys = 0, bad = 0;
     double lsum = 0; int nl = 0;
     std::printf("WMK prefill timing (rotated weights, mean of %d): stock / GPF form F (int16) / form under ds41_wmk 1 with the total in registers (r) and scratch (s)\n", iters);
@@ -1293,6 +1301,7 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
                     const bool okr = arm(1, fc, 1, &ur, &s1, &u1);
                     const bool oks = arm(1, fc, 2, &us, &s2, &u2);
                     if (!okf || !okr || !oks || !s1 || !s2 || u1 != fc || u2 != fc) kb = true;
+                    if (fc == 0) us = -1;   /* the stock kernel has no scratch-total form */
                     if (okf && uf > 0 && uf < bestF) { bestF = uf; bF = fc; }
                     if (okr && ur > 0 && ur < bestW) { bestW = ur; bW = fc * 10 + 1; }
                     if (oks && us > 0 && us < bestW) { bestW = us; bW = fc * 10 + 2; }
