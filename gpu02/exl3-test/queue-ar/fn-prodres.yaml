@@ -1,0 +1,31 @@
+# fn-prodres.yaml (10.11.2026, queue-ar; for 168, the prefix-resume correctness check) -- ONE DP half of Flash-Next production
+# as compose/flashnext-prod-dp-a.yaml serves it (radiance-1.15.1: TP2 on 83:00 + 86:00, wht6, 16 seqs, MML 524288 yarn:2,
+# expert_tiered + host pool 16 GiB, fp8 KV, prefix cache 60 GiB ttl 8 h, checkpoint slots 512 keep-all, MTP 3, MNBT 2048,
+# the same reasoning / token flags), as a TEST container: name radiance-fntest3, loopback port 8090, no API key flag, and
+# its own n-gram directory (${NGRAMDIR}) instead of production's /dev/shm. Image ${FNIMAGE} (production's:
+# stilldeadcode/radiance:1.15.1). The production compose files are not touched.
+name: radiance-fntest-res
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${FNIMAGE:?set FNIMAGE}
+    container_name: radiance-fntest3
+    restart: "no"
+    environment:
+      ROCR_VISIBLE_DEVICES: "GPU-4d61f52cafe37588,GPU-5943fea82aeead65"
+    volumes:
+      - ${NGRAMDIR:?set NGRAMDIR}:/ngram
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/qwen3.8-next-flash-fp8-iq4r-moe.rad --served-model-name qwen3.8-flash-next
+      --host 127.0.0.1 --port 8090
+      --tp 2 --tp-wire wht6 --max-num-seqs 16 --tp-wire-min-kb 128 --max-model-len 524288 --rope-scaling yarn:2
+      --placement expert_tiered --host-pool-mib 16384 --gpu-headroom-mib 96
+      --kv-cache-dtype fp8
+      --ngram-placement ram=/ngram
+      --prefix-cache-mib 61440 --prefix-cache-ttl 28800
+      --checkpoint-slots 512 --checkpoint-policy keep-all
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048
+      --reasoning-effort medium --reasoning-effort-map high=xhigh
+      --thinking-token-budget 16000 --default-max-tokens 32768

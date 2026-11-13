@@ -1,0 +1,503 @@
+I device: AQL backend, 4 device(s) [0:gfx1201 1:gfx1201 2:gfx1201 3:gfx1201]
+I rope: YaRN factor 16 over 65536 trained positions -- the rotary reaches 1048576; --max-model-len 524288 (the container's own)
+I model: deepseek41  arch=deepseek41  quant=bf16  40 layers  1048576 ctx
+I weight sidecar: 43 entries, 572.16 MiB in place of the container's 1.05 GiB, read from /models/dspark-dlw-q8_0.rad (RADIANCE_WEIGHT_SIDECAR): 43 x i8*f16[1x32]
+I vocab: 129280 tokens, bos=0 eos=1
+I gbnf: vocabulary index built in 47 ms, 13.20 MiB
+radiance: libr4d: gemm_nt_ggml / logits_gemm_ggml's decode band takes the multi-row form (lever D2; RADIANCE_DS41_GG_GEMV=2, the fn4 switch gg_gemv)
+radiance: libr4d: gemm_nt_ggml's prefill rows take lever GPF's forms (RADIANCE_DS41_GG_PF=1, the fn4 switch gg_pf)
+radiance: libr4d: gemm_nt_f32's prefill rows take lever GPF-b's tiled form (RADIANCE_DS41_F32_PF=25, the fn4 switch f32_pf)
+I device: the 4 cards reach each other's memory directly (peer to peer)
+I chained launches: off -- no drafter whose plugin measured a gain with them decodes speculatively
+I media: off -- the checkpoint has a vision tower but this container was converted without its weights; convert again to serve images and video
+I control vectors: not loaded (no --control-vector); a request that asks for one is refused
+radiance: deepseek41: DSpark lever SD: the sampled full-vocabulary walk declared (dspark_walk_sample_step a step over 4 rank(s) + all_gather of the eight best keys, 8 sequences a pass); x ~ Q = softmax(score / (temperature x scale)) over the eight best, the maximal coupling at the verify; issued while fn4 draft_sample >= 1 (RADIANCE_DRAFT_SAMPLE at start)
+radiance: deepseek41: DSpark drafter: 3 stages, 128 experts top-3, block 5; Markov rank 256 walked over the head's top 32 (RADIANCE_DS41_DSPARK_CAND)
+radiance: deepseek41: DSpark extras (ds41-acc): confidence head from /models/dspark-conf.f32 (no bias, as the release), shadow branches 0 (switches dspark_conf / dspark_alt; neither changes a proposal)
+radiance: deepseek41: DSpark lever W1: the full-vocabulary Markov walk declared (dspark_walk_step a step + all_gather over 4 rank(s), 8 sequences a pass); fn4 dspark_walk=1 (0 the head's top 32 re-ranked, 1 the whole vocabulary, 2 the same with succ staged through LDS -- W1b, declared; RADIANCE_DS41_DSPARK_WALK)
+radiance: deepseek41: the MoE gather and its all-reduce as one kernel up to 48 tokens a step (RADIANCE_DS41_ARGATHER, RADIANCE_DS41_ARGATHER_MAX; 40 layers declare it up to 48 rows; the one-shot below the all-reduce's ts_min, the two-shot from it; switch ds41_argather)
+radiance: deepseek41: lever K1 folds: window key norm+rope+round trip+store in one launch at 40 of 40 layers (RADIANCE_DS41_KVFOLD; switch ds41_kvfold=1), attention + output rope+round trip at 40 (RADIANCE_DS41_OFOLD; ds41_ofold=1), the shared gate's ones once a step declared at 40 MoE layers (RADIANCE_DS41_ONEFILL; ds41_onefill=1), the query norm folded into q_b's GEMV staging in 40 of 40 layers (8 with the indexer; RADIANCE_DS41_QNFOLD; ds41_qnfold=1), the shared expert's clamped SwiGLU folded into its down GEMV's staging in 40 MoE layers (RADIANCE_DS41_SWFOLD; ds41_swfold=1)
+radiance: deepseek41 indexer: candidate restriction on from 32768 positions, row split on from 4096 (runs of 256 rows, 5 a rank at most; RADIANCE_DS41_INDEX, _KEEP_MIN_LIVE, _SPLIT_MIN_LIVE), keys mxfp4 (80 bytes an entry; RADIANCE_DS41_IDXKEY), latent bf16 (1024 bytes an entry; RADIANCE_DS41_LATENT), compressor tail bound (RADIANCE_DS41_CTAIL), router selection+sort separate (RADIANCE_DS41_ROUTER_FUSE), attention all-reduce + post-collapse-norm separate at 0 layers, MoE all-reduce + next collapse-norm separate at 0 layers (RADIANCE_DS41_AR_PCN)
+radiance: deepseek41 indexer deal: idx_split 0 (RADIANCE_DS41_IDX_BALANCE at start, POST /admin/fn4 idx_split): 1 = an equal block of rows a rank where 4 ranks do not divide a step's runs, within the 17 declared runs (a 2052-row step: 12 runs of 171, 3 a rank, instead of 9 runs of 228 dealt 3 a rank, the last rank 0)
+radiance: deepseek41: lever BI declared (RADIANCE_DS41_BI, fn4 ds41_bi, now 0): a step of more than one shape class runs in segments by sequence (decode rows <= 48 a dense / attention / indexer launch, <= 32 a fused norm; each prefill sequence at its own rows; the MoE a pass a segment); a pass with two or more prefill sequences is not recorded
+radiance: deepseek41: lever PSK declared (RADIANCE_DS41_PSK, fn4 ds41_psk, now 0): a prefill sequence's chunk runs layers 21..39 over its last 160 + (39 - l) x 128 rows only (layer 21: 2464, layer 39: 160); every row through layer 20 (the last kv source)
+radiance: deepseek41: lever PSK-CR (fn4 ds41_psk_cr, now 0; RADIANCE_DS41_PSK_CR): a planned prefix hit with no snapshot at its grid point H resumes there by a cone replay from H - 5152: every layer over H's cone, no global-KV store; ds41_psk 4 = tail-only anchors
+radiance: deepseek41: lever PSK-L20 (fn4 ds41_psk_l20, now 0; RADIANCE_DS41_PSK_L20): layer 20 split under lever PSK -- its collapse + norm, compressor and latent / index-key stores over every row, its query, indexer, attention, MoE and window store over its last 2592 rows
+radiance: deepseek41: lever E1 declared (RADIANCE_DS41_ENGDD, fn4 ds41_engdd, now 0): the Engram lookup / copy / kv GEMM (25600 x 6144) of a step with a prefill sequence over its unique n-gram id rows at 2 Engram layer(s), then gather_rows back; launches of <= 48 rows as today, and none when the unique rows would be <= 48 or fewer than 1/16 of the pooled rows repeat; such a pass is not recorded
+I[0] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[1] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[3] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[2] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I host-site execution: 11 of 1916 declared ops have no host kernel (mhc_collapse_rmsnorm, rmsnorm_gemm_nt_ggml, rmsnorm_rope_roundtrip, rmsnorm_rope_roundtrip_kv_store, rope_rows_roundtrip, attn_sparse_sink_rope_roundtrip, mhc_post_collapse_rmsnorm, swiglu_clamped_gemm_nt_ggml, moe_gather_all_reduce, dspark_walk_step, dspark_walk_sample_step). Their weights may still be tiered to host or SSD -- only the arithmetic is pinned to the device. --debug-graph lists the bands.
+I host-site execution: 11 of 1915 declared ops have no host kernel (mhc_collapse_rmsnorm, rmsnorm_gemm_nt_ggml, rmsnorm_rope_roundtrip, rmsnorm_rope_roundtrip_kv_store, rope_rows_roundtrip, attn_sparse_sink_rope_roundtrip, mhc_post_collapse_rmsnorm, swiglu_clamped_gemm_nt_ggml, moe_gather_all_reduce, dspark_walk_step, dspark_walk_sample_step). Their weights may still be tiered to host or SSD -- only the arithmetic is pinned to the device. --debug-graph lists the bands.
+I host-site execution: 11 of 1915 declared ops have no host kernel (mhc_collapse_rmsnorm, rmsnorm_gemm_nt_ggml, rmsnorm_rope_roundtrip, rmsnorm_rope_roundtrip_kv_store, rope_rows_roundtrip, attn_sparse_sink_rope_roundtrip, mhc_post_collapse_rmsnorm, swiglu_clamped_gemm_nt_ggml, moe_gather_all_reduce, dspark_walk_step, dspark_walk_sample_step). Their weights may still be tiered to host or SSD -- only the arithmetic is pinned to the device. --debug-graph lists the bands.
+I host-site execution: 11 of 1915 declared ops have no host kernel (mhc_collapse_rmsnorm, rmsnorm_gemm_nt_ggml, rmsnorm_rope_roundtrip, rmsnorm_rope_roundtrip_kv_store, rope_rows_roundtrip, attn_sparse_sink_rope_roundtrip, mhc_post_collapse_rmsnorm, swiglu_clamped_gemm_nt_ggml, moe_gather_all_reduce, dspark_walk_step, dspark_walk_sample_step). Their weights may still be tiered to host or SSD -- only the arithmetic is pinned to the device. --debug-graph lists the bands.
+I declare: 1916 ops, 28029 weights, 219 buffers, 9 KV groups
+I embedding: 'token_embd.weight' (129.46 MiB a rank) is read only by embed_lookup_ggml: a token embedding table --embedding-placement places (RADIANCE_DS41_EMB_RAM)
+I speculation: 'dspark' proposes 5 token(s) in ONE block pass over 5 row(s) (mask id 128799, window 129); prompt lookup fills in for any sequence it declines
+I[1] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[3] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[3] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[1] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[2] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[2] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[2] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[3] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[2] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[0] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[2] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[3] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[1] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[1] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[1] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[0] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[0] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[3] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[0] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I[0] sampler: 129280-token vocabulary (32320 this rank), 48 rows, 1010 mask words (3.95 KiB per row)
+I activation arena: 8 tokens use 369.09 MiB, 48 tokens use 467.85 MiB, 256 tokens use 992.94 MiB, 1024 tokens use 1.32 GiB, 2112 tokens use 1.81 GiB of 2.74 GiB (the fixed region is 297.55 MiB); the rest is lent to the expert slab while the steps are that small
+I expert prefetch: off (RADIANCE_XPREFETCH=0): no DMA queue, ring or stream for it
+I placement: token embedding (129.46 MiB a rank) ram (default): pinned in host memory and read over the link in place, so its VRAM goes to the KV cache and the experts
+I placement: n-gram table (103.00 GiB) ram: as asked
+I kv: the pool backs 64% of the worst case (8 sequences all at 524288 tokens), 5.1 full-length sessions; a larger --host-pool-mib gives the cache more
+I VRAM budget, per card:
+  card total          31.86 GiB
+  already held       633.23 MiB   measured: driver context, code objects, anything else resident
+  driver drift        16.00 MiB   what that moves by after it is read: kept free
+  activation arena     2.79 GiB   computed from the buffer plan
+  step staging       166.73 MiB   the step batch's block tables and media staging, and the
+                                  KV tiers' copy staging
+  hardware queues    106.07 MiB   3 a card at 35.36 MiB each, measured: the engine's streams
+  expert prefetch           0 B   the next-layer prefetch's ring of expert units and buffers
+  --gpu-headroom-mib  96.00 MiB   left unclaimed on purpose
+  ------------------------------
+  claimable           28.08 GiB
+  static weights       2.65 GiB   off the top: every rank's own shard, and not a share of anything
+  ------------------------------
+  elastic             25.42 GiB   the experts keep what the host pool cannot hold; the cache takes the rest
+                                  and lends what no live request holds to the expert slab
+    experts           17.34 GiB   68% of it
+    kv cache           7.06 GiB   28% of it -- 64% backing of the 8 x 524288 worst case: 5.1 full-length
+                                  sessions. With prefix caching a finished sequence's blocks stay held
+                                  for reuse, so the demand is live sessions, not running requests
+    prefill staging    1.02 GiB   out of the cache: two buffers of one layer's non-resident experts,
+                                  at the arena's top and lent back to the slab while steps are small
+  ==============================
+  vram_weights        20.00 GiB   static + experts
+  vram_kv              7.06 GiB   the cache's share
+  unclaimed           96.41 MiB   the headroom, the unusable above, and what MiB rounding
+                                  could not place
+
+I[0] pools:
+vram_weights    20.00 GiB budget,        0 B used,  20.00 GiB free
+vram_kv          7.06 GiB budget,        0 B used,   7.06 GiB free
+host_pool       19.13 GiB budget,        0 B used,  19.13 GiB free
+
+I[0] placement: 'token_embd.weight' (129.46 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I[1] pools:
+vram_weights    20.00 GiB budget,        0 B used,  20.00 GiB free
+vram_kv          7.06 GiB budget,        0 B used,   7.06 GiB free
+host_pool       19.13 GiB budget,        0 B used,  19.13 GiB free
+
+I[1] placement: 'token_embd.weight' (129.46 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I[2] pools:
+vram_weights    20.00 GiB budget,        0 B used,  20.00 GiB free
+vram_kv          7.06 GiB budget,        0 B used,   7.06 GiB free
+host_pool       19.13 GiB budget,        0 B used,  19.13 GiB free
+
+I[2] placement: 'token_embd.weight' (129.46 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I[3] pools:
+vram_weights    20.00 GiB budget,        0 B used,  20.00 GiB free
+vram_kv          7.06 GiB budget,        0 B used,   7.06 GiB free
+host_pool       19.13 GiB budget,        0 B used,  19.13 GiB free
+
+I[3] placement: 'token_embd.weight' (129.46 MiB) in the pinned host pool, read in place (--embedding-placement ram, the default)
+I[0] mover: 1849 slab slots (48 shadow, 0 more kept free out of a loan), 2232 pinned pool slots, 2.65 GiB static vram
+I[0] load: rank 0, mover took 20.00 GiB, weights pool 960.00 KiB free of 20.00 GiB
+I[0] heat engine: 3936 movable units, 16 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512 admit-heat 0.5
+I[0] heat engine: dual heat -- decode rows credit a decode heat, prefill rows a prefill heat (x1.00) that decays 0.700 a step; placement ranks their sum (RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN)
+I[0] heat engine: the decode-hottest 80% of each class's resident units are no promotion's victim (RADIANCE_HEAT_DECODE_PIN)
+I[0] placement: n-gram table copied into pinned memory the cards read, 91.56 GiB in 74.0 s
+I[0] placement: n-gram table copied into pinned memory the cards read, 11.44 GiB in 9.4 s
+I[0] placement: n-gram table copied into pinned memory the cards read, 16 B in 0.0 s
+I[1] mover: 1865 slab slots (48 shadow, 0 more kept free out of a loan), 2216 pinned pool slots, 2.51 GiB static vram
+I[1] load: rank 1, mover took 20.00 GiB, weights pool 1.46 MiB free of 20.00 GiB
+I[1] heat engine: 3936 movable units, 16 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512 admit-heat 0.5
+I[1] heat engine: dual heat -- decode rows credit a decode heat, prefill rows a prefill heat (x1.00) that decays 0.700 a step; placement ranks their sum (RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN)
+I[1] heat engine: the decode-hottest 80% of each class's resident units are no promotion's victim (RADIANCE_HEAT_DECODE_PIN)
+I[2] mover: 1865 slab slots (48 shadow, 0 more kept free out of a loan), 2216 pinned pool slots, 2.51 GiB static vram
+I[2] load: rank 2, mover took 20.00 GiB, weights pool 1.46 MiB free of 20.00 GiB
+I[2] heat engine: 3936 movable units, 16 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512 admit-heat 0.5
+I[2] heat engine: dual heat -- decode rows credit a decode heat, prefill rows a prefill heat (x1.00) that decays 0.700 a step; placement ranks their sum (RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN)
+I[2] heat engine: the decode-hottest 80% of each class's resident units are no promotion's victim (RADIANCE_HEAT_DECODE_PIN)
+I[3] mover: 1865 slab slots (48 shadow, 0 more kept free out of a loan), 2216 pinned pool slots, 2.51 GiB static vram
+I[3] load: rank 3, mover took 20.00 GiB, weights pool 1.46 MiB free of 20.00 GiB
+I[3] heat engine: 3936 movable units, 16 moves a step, decay 0.950 hysteresis 1.25 min-gain 1.50 credit cap 512 admit-heat 0.5
+I[3] heat engine: dual heat -- decode rows credit a decode heat, prefill rows a prefill heat (x1.00) that decays 0.700 a step; placement ranks their sum (RADIANCE_HEAT_PREFILL_DECAY, _PREFILL_GAIN)
+I[3] heat engine: the decode-hottest 80% of each class's resident units are no promotion's victim (RADIANCE_HEAT_DECODE_PIN)
+I load: 8.00 GiB of 149.43 GiB read, 2.7 GB/s, at container offset 119359950848
+I load: 16.00 GiB of 149.43 GiB read, 2.0 GB/s, at container offset 127949885440
+I load: 24.00 GiB of 149.43 GiB read, 1.9 GB/s, at container offset 136539820032
+I load: 32.00 GiB of 149.43 GiB read, 1.8 GB/s, at container offset 145129754624
+I load: 40.00 GiB of 149.43 GiB read, 1.7 GB/s, at container offset 153719689216
+I load: 48.00 GiB of 149.43 GiB read, 1.6 GB/s, at container offset 162309623808
+I load: 56.00 GiB of 149.43 GiB read, 1.6 GB/s, at container offset 170899558400
+I load: 64.00 GiB of 149.43 GiB read, 1.6 GB/s, at container offset 179489492992
+I load: 72.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 188079427584
+I load: 80.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 196669362176
+I load: 88.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 205259296768
+I load: 96.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 213849231360
+I load: 104.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 222439165952
+I load: 112.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 231029100544
+I load: 120.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 239619035136
+I load: 128.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 248208969728
+I load: 136.00 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 256798904320
+I load: 144.06 GiB of 149.43 GiB read, 1.5 GB/s, at container offset 265776336896
+I load: one pass over the container, 149.49 GiB read in 107.1 s (1.5 GB/s) for 4 rank(s); 52.1 s of that was the disk (3.1 GB/s)
+I load: 109856 weight(s), 152.32 GiB of planes, rearranged for their kernels by 16 worker(s) behind the read, 4.00 GiB held at most; done 107.7 s after the read began
+I load: 112104 weights, 153.91 GiB placed from 149.49 GiB of container read
+I load: 100 weight share(s), 894.89 MiB, read from the weight sidecar /models/dspark-dlw-q8_0.rad instead of the container (RADIANCE_WEIGHT_SIDECAR; summed over ranks)
+I chunk geometry: quantum 16 (attn block 16, state chunk 1), checkpoint interval 2048, max_tok 4160 -> prefill chunks of at most 4096 (the checkpoint interval times the span, not the budget)
+I prefix resume: exact -- a hit resumes only where an idle server's cold prefill of the same prompt starts a chunk (every 4096 tokens from 2048) and a prompt's tail snapshot is taken where its last chunk starts, so the hit recomputes the cold run's own chunks and answers bit-identically; a turn re-prefills up to one chunk more than --prefix-resume nearest
+I chunk geometry: a prefill alone in its step spans up to 2 intervals from its second interval on; every other step is planned at 2112 tokens
+W[0] this device has no virtual memory management, so the KV cache holds its whole carve and the expert slab has nothing to grow into. The experts were given the card first and the cache one full-length sequence.
+I checkpoint slots: 512 linear-state + sliding-window snapshot(s) of 25.33 MiB in pinned host memory (12.66 GiB), none of it on the card
+I kv tier transfer: 4 paged group(s), 5.39 KiB an entry in 6 blocks, batches of 3039 through gather_rows/scatter_rows at u8
+I kv tiers: a finished conversation's KV is copied to host memory at once (84.00 GiB, 4084887 entries, 8169774 tokens of context) and its VRAM is given up when the expert loan or a request wants it; a full host tier drops its least recently used entries, the end of a conversation before its start. One entry is 21.56 KiB
+kv tiers: a session's linear state is saved to host memory -- 512 snapshot slot(s) of 25.33 MiB -- and a full store retires the least recently used
+I kv: KV layer bundles 40/2/3/3/3/1/1/3 (56 real layers)
+    vLLM stock    size  1 -> 56 groups,  56 slots (0 padding)
+    least-waste   size  1 -> 56 groups,  56 slots (0 padding)
+    radiance      per state kind, own pool ->  8 groups,  56 slots (0 padding)
+    (none)         ?        0 layers  state      0 B        0 slots =       0 B
+    kv_window      window  40 layers  block   16 tok  page 640.00 KiB      348 blocks = 217.50 MiB  (5568 tokens)
+    kv_engram_tokens conv     2 layers  state     64 B        8 slots =     512 B
+    kv_comp_tail_r2 linear   3 layers  state 84.00 KiB       16 slots =  1.31 MiB
+    kv_index_r2    full     3 layers  block    2 tok  page    240 B  1328167 blocks = 303.99 MiB  (2656334 tokens)
+    kv_compressed_r2 full     3 layers  block    2 tok  page 3.00 KiB  1328167 blocks =  3.80 GiB  (2656334 tokens)
+    kv_index_r1    full     1 layers  block    1 tok  page     80 B  2656334 blocks = 202.66 MiB  (2656334 tokens)
+    kv_compressed_r1 full     1 layers  block    1 tok  page 1.00 KiB  2656334 blocks =  2.53 GiB  (2656334 tokens)
+    kv_dspark      window   3 layers  block   16 tok  page 48.00 KiB      348 blocks = 16.31 MiB  (5568 tokens)
+    pool at 0x75f138000000, 7.06 GiB; groups at +0..+7578042368
+
+I prefix cache: 4 paged group(s) in 2-token entries; checkpoints every 2048 tokens (512 slots of 6.33 MiB a rank, pinned host memory), retention 'keep-all'
+  group 'kv_index_r1' block 1: 2 blocks an entry
+  group 'kv_compressed_r1' block 1: 2 blocks an entry
+  group 'kv_window' is windowed (10 blocks): not cached; a checkpoint slot carries its window
+  group 'kv_dspark' is windowed (10 blocks): not cached
+  later publisher's bytes win where no snapshot rests on the first copy: a cached entry is replaced by a publisher whose own snapshots rest on its copy, so a hit restores what its snapshot was computed from
+
+I[0] arena: 3.76 GiB device + 46.01 MiB scratch + 0 B for the second lane = 3.81 GiB, charged to the VRAM budget before it was split
+I[0] device: card 0 copy lists go to DMA engine 0 on a queue of this process's own (1.3 ms to open)
+I[0] prefill staging: a 1.02 GiB ring at the top of the arena; a step of more than 1024 tokens copies the pooled experts of 40 routed layers onto the card up to 3 layers ahead of the layers that read them
+I[1] arena: 3.76 GiB device + 46.01 MiB scratch + 0 B for the second lane = 3.80 GiB, charged to the VRAM budget before it was split
+I[1] device: card 1 copy lists go to DMA engine 0 on a queue of this process's own (1.1 ms to open)
+I[2] arena: 3.76 GiB device + 46.01 MiB scratch + 0 B for the second lane = 3.80 GiB, charged to the VRAM budget before it was split
+I[2] device: card 2 copy lists go to DMA engine 0 on a queue of this process's own (1.1 ms to open)
+I[3] arena: 3.76 GiB device + 46.01 MiB scratch + 0 B for the second lane = 3.80 GiB, charged to the VRAM budget before it was split
+I[3] device: card 3 copy lists go to DMA engine 0 on a queue of this process's own (1.2 ms to open)
+I mover: 769 slots can be lent out of the KV cache (6.81 GiB), filled as it lends them
+I mover: 769 slots can be lent out of the KV cache (6.80 GiB), filled as it lends them
+I mover: 769 slots can be lent out of the KV cache (6.80 GiB), filled as it lends them
+I mover: 769 slots can be lent out of the KV cache (6.80 GiB), filled as it lends them
+I kv: the cache can grow to 7.06 GiB a card -- 2656334 tokens of context, 5.1 sessions at 524288 -- with every block it lends the experts taken back; 1.31 MiB of that is per-sequence state, and up to 6.81 GiB is lent to the experts while no request holds it
+I mover: 384 slots can be lent out of the activation arena (3.40 GiB), filled as it lends them
+I mover: 383 slots can be lent out of the activation arena (3.39 GiB), filled as it lends them
+I mover: 383 slots can be lent out of the activation arena (3.39 GiB), filled as it lends them
+I mover: 383 slots can be lent out of the activation arena (3.39 GiB), filled as it lends them
+I activation arena: lends 3.40 GiB while steps are at most 8 tokens, 3.31 GiB while steps are at most 48 tokens, 2.79 GiB while steps are at most 256 tokens, 2.44 GiB while steps are at most 1024 tokens, 1.95 GiB while steps are at most 2112 tokens
+I activation arena: lever Z0-A set up (fn4 arena_d0, off): decode and verify steps take the 48-token rung; under arena_d0 1 a step that verifies nothing and runs no head (depth 0) takes the smallest rung that holds its own rows
+I[0] mover: 221 slots can be lent out of the drafter's expert slab (1.96 GiB), filled as it lends them
+I[0] mover: lever DL: 96 drafter units in 1 class(es), 1.68 GiB of host copies filled (outside --host-pool-mib); the drafter's slab, 1.96 GiB, lends 221 trunk slots while the drafter does not draft
+I[1] mover: 221 slots can be lent out of the drafter's expert slab (1.96 GiB), filled as it lends them
+I[1] mover: lever DL: 96 drafter units in 1 class(es), 1.68 GiB of host copies filled (outside --host-pool-mib); the drafter's slab, 1.96 GiB, lends 221 trunk slots while the drafter does not draft
+I[2] mover: 221 slots can be lent out of the drafter's expert slab (1.96 GiB), filled as it lends them
+I[2] mover: lever DL: 96 drafter units in 1 class(es), 1.68 GiB of host copies filled (outside --host-pool-mib); the drafter's slab, 1.96 GiB, lends 221 trunk slots while the drafter does not draft
+I[3] mover: 221 slots can be lent out of the drafter's expert slab (1.96 GiB), filled as it lends them
+I[3] mover: lever DL: 96 drafter units in 1 class(es), 1.68 GiB of host copies filled (outside --host-pool-mib); the drafter's slab, 1.96 GiB, lends 221 trunk slots while the drafter does not draft
+I[0] mover: 29 slots can be lent out of the drafter's query-pass weights (262.81 MiB), filled as it lends them
+I[0] mover: lever Z0-W: 5 stretch(es) of the drafter's query-pass weights, 286.50 MiB (a pinned host copy each), lend 29 trunk slots while the drafter does not draft; 2.37 GiB of its static weights stay
+I[1] mover: 29 slots can be lent out of the drafter's query-pass weights (260.70 MiB), filled as it lends them
+I[1] mover: lever Z0-W: 5 stretch(es) of the drafter's query-pass weights, 274.55 MiB (a pinned host copy each), lend 29 trunk slots while the drafter does not draft; 2.24 GiB of its static weights stay
+I[2] mover: 29 slots can be lent out of the drafter's query-pass weights (260.70 MiB), filled as it lends them
+I[2] mover: lever Z0-W: 5 stretch(es) of the drafter's query-pass weights, 274.55 MiB (a pinned host copy each), lend 29 trunk slots while the drafter does not draft; 2.24 GiB of its static weights stay
+I[3] mover: 29 slots can be lent out of the drafter's query-pass weights (260.70 MiB), filled as it lends them
+I[3] mover: lever Z0-W: 5 stretch(es) of the drafter's query-pass weights, 274.55 MiB (a pinned host copy each), lend 29 trunk slots while the drafter does not draft; 2.24 GiB of its static weights stay
+I draft weight lend (lever Z0-W, RADIANCE_DRAFT_LEND_WEIGHTS=0, fn4 draft_lend_w): set up, off; 286.50 MiB of the drafter's query-pass weights a rank lent with its slab while depth 0 holds, recalled and copied back before its head next runs; the context pass's 2.37 GiB stay
+I lever SA / HB (ds41-sahb) set up, off: stage_short can arm the prefill stager for a step of 1025 .. 2112 tokens at the span's shared level (its ring 1.02 GiB at 1.81 GiB of the arena; such a step's loan 951.81 MiB instead of 1.95 GiB); place_hb can reserve on rank 1, 2 (long prefill heat decay 0.80)
+I device allocations: 2600 totalling 123.44 GiB, of which 108.23 GiB is the two pools -- the rest is the activation arena and the step staging. Anything on the card past this is the driver or a kernel plugin's own hipMalloc, which this cannot see.
+I DFlash coupled LIVE: 5 position(s), x~Q along the candidate walk, maximal coupling at the verify; fixed-seed tokens are NOT preserved
+I lever SD: fn4 draft_sample 0 at start (0 greedy drafts + the agreement rule, 1 sampled drafts + the maximal coupling at the request's temperature, 2..200 at temperature x v/100; POST /admin/fn4)
+I drafter 'dspark': a confidence plane (the dspark_conf gate verifies the longest confident prefix); switches dspark_conf 0, dspark_alt 0 (POST /admin/fn4)
+I draft context skip (RADIANCE_DRAFT_CTXSKIP=0, fn4 draft_ctxskip): while the head does not run, a plain decode step keeps its tapped rows instead of the drafter's context pass, in a ring of 129 steps (+1 stash) x 8 rows x 30.00 KiB = 30.47 MiB a rank on 4 of 4 ranks; the drafter's window (129 positions) is refilled from them before the head runs
+W[0] card 0 settled at 264.74 MiB free against 267.62 MiB (the 96.00 MiB --gpu-headroom-mib and 171.62 MiB kept for the step staging and for what is built on first use), which leaves 93.12 MiB for a kernel's first launch to load its code object and size its scratch in -- under the 96.00 MiB this engine allows for its own. 2.88 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count. Set --gpu-headroom-mib to at least 99: what is left here rises with it one for one.
+I[1] card 1 settled at 270.76 MiB free, against 267.62 MiB (the 96.00 MiB --gpu-headroom-mib and 171.62 MiB kept for the step staging and for what is built on first use)
+I[2] card 2 settled at 270.75 MiB free, against 267.62 MiB (the 96.00 MiB --gpu-headroom-mib and 171.62 MiB kept for the step staging and for what is built on first use)
+I[3] card 3 settled at 270.79 MiB free, against 267.62 MiB (the 96.00 MiB --gpu-headroom-mib and 171.62 MiB kept for the step staging and for what is built on first use)
+I draft floor: 6 paged group(s), 4 prefix-cached, 1 in the window snapshot -> a hit leaves a hole in a drafter's own KV
+I prefix cache: a trunk layer's windowed group is not prefix-cached -- a hit resumes from a window snapshot (a checkpoint slot)
+I scheduler: --prefill-interleave 8: after a prefill chunk that leaves its prompt unfinished while other sequences decode, the next 8 steps carry decode rows only and admit nothing
+I draft refill: a prefix hit ends 129 tokens before the prompt's end, so the drafter's window is recomputed
+I --draft-window adaptive with a block drafter: the block of 5 is proposed whole, and each sequence verifies the first min(D, its stop) of it
+I draft depth: adaptive, 1..5; a sequence stops at the first draft emitted less than 10% of the time, and the depth moves at +2% at most every 8 steps
+I step batch: 193.08 MiB pinned staging ring + 64.27 MiB device slab a rank (64.02 MiB of it block tables), 9 KV group(s), 0 derived buffer(s)
+I draft lend: set up, off (fn4 draft_lend turns it on); once depth 0 has held 32 cycles with probes at least 64 cycles apart, the drafter's expert slab is lent to the trunk's experts, and taken back when drafting resumes
+I scheduler: --busy-prefill-chunk auto: a prefill chunk sharing a step leaves decode rows and waiting requests their room and keeps at least 1024 tokens (the prefill stager's smallest pass)
+I scheduler: --prefill-span: a prefill spans when it is 16384 tokens or longer -- routed experts are read from host memory, and the arena a spanned step takes is room they lose for it
+I chat: template loaded (18177 bytes); tools=1 tool_calls=1 system=1 thinking=1
+I chat: reply format plugin:deepseek41: reasoning "<think>".."</think>"; section "<｜DSML｜ calls>".."</｜DSML｜ calls>"; calls """<｜DSML｜ invoke name=\""NAME"\">\n" "<｜DSML｜ parameter name=\""ARG"\""" string=\"true\">"|" string=\"false\">"VALUE"</｜DSML｜ parameter>" "</｜DSML｜ invoke>"""; grammar on "<｜DSML｜ calls>"
+I sampling defaults for requests that send none: temperature 1.00, top_k 0 (the 1024 most likely tokens, the sampler's candidate width), top_p 1.00, min_p 0.00 (from nothing stated it)
+W this checkpoint states no sampling of its own and none was given, so a request that sends no sampler fields is served with the whole vocabulary live at temperature 1 -- which ends a reply early often enough to notice. Pass --generation-config, or put the checkpoint's generation_config.json beside the container as /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.generation.json.
+I chat: the template takes reasoning_effort low, medium, high, xhigh, max, and none or minimal turn thinking off
+I chat: a request naming no reasoning_effort renders as 'high', the template's own default (--reasoning-effort sets another)
+I STARTUP REPORT -- radiance 1.17.0
+I CONFIGURATION -- every option not at its default, the value in force, and where it came from
+I   --model                            /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad  [command line]
+I   --kernels                          exl3r4d@0.1.0,libavx@0.1.0,libr4d@0.5.0,spechub@0.1.0,exl3ref@0.1.0,libref@0.1.0  [auto]
+I                                        every kernel library under --radiance-home, in the loader's order (a reference implementation last); architecture plugin deepseek41@0.1.0
+I   --tp                               4                                           [command line]
+I   --tp-wire                          exact                                       [command line]
+I   --p2p                              peer to peer                                [auto]
+I                                        the driver reports every pair of the ranks' cards can reach the other's memory
+I   --max-num-batched-tokens           4160                                        [command line]
+I   --prefill-interleave               8                                           [command line]
+I   --max-num-seqs                     8                                           [command line]
+I   --max-model-len                    524288                                      [command line]
+I   --kv-cache-dtype                   bf16                                        [command line]
+I   --host-pool-mib                    19456                                       [command line]
+I   --embedding-placement              ram                                         [auto]
+I                                        the table is 129.46 MiB a rank: pinned in host memory and read over the link in place, so its VRAM goes to the KV cache and the experts
+I   --vision-tower-placement           n/a                                         [auto]
+I                                        this server declares no encoder tower
+I   --ngram-placement                  ram                                         [command line]
+I                                        the table is 103.00 GiB: as asked
+I   --prefix-cache-mib                 86016                                       [command line]
+I   --prefix-cache-ttl                 28800 s                                     [command line]
+I   --placement                        expert_tiered                               [command line]
+I                                        as asked
+I   --checkpoint-interval              2048                                        [command line]
+I   --prefill-span                     2                                           [command line]
+I   --checkpoint-slots                 512                                         [command line]
+I   --checkpoint-policy                keep-all                                    [command line]
+I   --num-speculative-tokens           5                                           [command line]
+I   --draft-window                     adaptive                                    [command line]
+I   --draft-coupling                   on                                          [command line]
+I   --host                             127.0.0.1                                   [command line]
+I   --port                             8090                                        [command line]
+I   --served-model-name                deepseek-v4.1-flash                         [command line]
+I   --mm-max-patches                   0                                           [auto]
+I                                        the checkpoint has a vision tower but this container was converted without its weights
+I   --temp                             1                                           [auto]
+I                                        the model states no sampling of its own, so this is the built-in default
+I   --top-k                            0                                           [auto]
+I                                        the model states no sampling of its own, so this is the built-in default
+I   --top-p                            1                                           [auto]
+I                                        the model states no sampling of its own, so this is the built-in default
+I   --min-p                            0                                           [auto]
+I                                        the model states no sampling of its own, so this is the built-in default
+I   --max-n                            8                                           [auto]
+I                                        the larger of 8 and --max-num-seqs
+I   --max-queued-requests              64                                          [auto]
+I                                        8 x --max-num-seqs
+I   --http-threads                     32                                          [auto]
+I                                        one a hardware thread, at least 4
+I   --live                             on                                          [command line]
+I   100 options at their default (-v lists every option; /diagnostics carries them all)
+I ENVIRONMENT -- the RADIANCE_* variables set, by name; their values are not shown
+I   RADIANCE_API_KEY
+I   RADIANCE_AQL_ACQ
+I   RADIANCE_AQL_STAMP
+I   RADIANCE_AQL_STAMP_OUT
+I   RADIANCE_ARENA_LEVEL_MAX
+I   RADIANCE_DRAFT_CTXSKIP
+I   RADIANCE_DRAFT_CTXSKIP_SLOTS
+I   RADIANCE_DRAFT_LEND
+I   RADIANCE_DRAFT_LEND_BORROW
+I   RADIANCE_DRAFT_LEND_WEIGHTS
+I   RADIANCE_DRAFT_PROBE_BACKOFF
+I   RADIANCE_DRAFT_SAMPLE
+I   RADIANCE_DS41_ARENA_DECODE_ROWS
+I   RADIANCE_DS41_ARGATHER
+I   RADIANCE_DS41_ARGATHER_MAX
+I   RADIANCE_DS41_AR_PCN
+I   RADIANCE_DS41_BI
+I   RADIANCE_DS41_DSPARK_CONF
+I   RADIANCE_DS41_DSPARK_WALK
+I   RADIANCE_DS41_EMB_RAM
+I   RADIANCE_DS41_ENGDD
+I   RADIANCE_DS41_F32_PF
+I   RADIANCE_DS41_GG_GEMV
+I   RADIANCE_DS41_GG_PF
+I   RADIANCE_DS41_GG_PF_TABLE
+I   RADIANCE_DS41_IDXKEY
+I   RADIANCE_DS41_KVFOLD
+I   RADIANCE_DS41_LEVELS
+I   RADIANCE_DS41_OFOLD
+I   RADIANCE_DS41_ONEFILL
+I   RADIANCE_DS41_PSK
+I   RADIANCE_DS41_QNFOLD
+I   RADIANCE_DS41_ROUTER_BF16
+I   RADIANCE_DS41_ROUTER_FUSE
+I   RADIANCE_DS41_SWFOLD
+I   RADIANCE_HEAT_DECODE_PIN
+I   RADIANCE_HEAT_MOVES
+I   RADIANCE_HEAT_PREFILL_DECAY
+I   RADIANCE_LOG_STEPS
+I   RADIANCE_PLACE_HB_RANKS
+I   RADIANCE_PLACE_SHADOW_SLOTS
+I   RADIANCE_PLACE_TURNOVER
+I   RADIANCE_PROFILE_EVERY
+I   RADIANCE_PROFILE_SYNC
+I   RADIANCE_STAGE_SPAN
+I   RADIANCE_WEIGHT_SIDECAR
+I   RADIANCE_XPREFETCH
+I DERIVED -- what startup worked out that no single option states
+I   chained launches                   off
+I                                        no drafter whose plugin measured a gain with them decodes speculatively
+I   kernel selection                   exl3r4d 160, exl3ref (host) 160, libavx (host) 2011, libr4d 2409, libref (host) 1, spechub 1, spechub (host) 1 op bands
+I                                        attention:
+I                                        attn_sparse_sink -> avx_attn_sparse_sink
+I                                        attn_sparse_sink -> ds41_attn_sparse_sink_d512_bf16
+I                                        attn_sparse_sink_rope_roundtrip -> ds41_attn_sparse_sink_rope_rt_d512_bf16
+I                                        ds41_rope_rows -> avx_rope_rows
+I                                        ds41_rope_rows -> rope_rows_bf16
+I                                        entry_store -> avx_entry_store
+I                                        entry_store -> entry_store_bf16
+I                                        index_candidates -> avx_index_candidates
+I                                        index_score -> avx_index_score
+I                                        index_score -> ds41_index_score_d128_bf16
+I                                        index_topk -> avx_index_topk
+I                                        kv_store -> avx_kv_store
+I                                        kv_store -> kv_store_bf16
+I                                        qsa_tail_store -> avx_qsa_tail_store
+I                                        qsa_tail_store -> qsa_tail_store_f32
+I                                        qsa_work -> avx_qsa_work
+I                                        qsa_work -> qsa_work_f32
+I                                        rope_rows_roundtrip -> rope_rows_roundtrip_fp4_bf16
+I                                        rope_rows_roundtrip -> rope_rows_roundtrip_fp8_bf16
+I                                        rope_table -> avx_rope_table
+I                                        rope_table -> rope_table_f32
+I                                        softmax_pool -> avx_softmax_pool
+I                                        softmax_pool -> softmax_pool_bf16
+I   vram split                         weights 20.00 GiB (experts 17.34 GiB of it), KV cache 7.06 GiB, a card
+I                                        VRAM budget, per card:
+I                                          card total          31.86 GiB
+I                                          already held       633.23 MiB   measured: driver context, code objects, anything else resident
+I                                          driver drift        16.00 MiB   what that moves by after it is read: kept free
+I                                          activation arena     2.79 GiB   computed from the buffer plan
+I                                          step staging       166.73 MiB   the step batch's block tables and media staging, and the
+I                                                                          KV tiers' copy staging
+I                                          hardware queues    106.07 MiB   3 a card at 35.36 MiB each, measured: the engine's streams
+I                                          expert prefetch           0 B   the next-layer prefetch's ring of expert units and buffers
+I                                          --gpu-headroom-mib  96.00 MiB   left unclaimed on purpose
+I                                          ------------------------------
+I                                          claimable           28.08 GiB
+I                                          static weights       2.65 GiB   off the top: every rank's own shard, and not a share of anything
+I                                          ------------------------------
+I                                          elastic             25.42 GiB   the experts keep what the host pool cannot hold; the cache takes the rest
+I                                                                          and lends what no live request holds to the expert slab
+I                                            experts           17.34 GiB   68% of it
+I                                            kv cache           7.06 GiB   28% of it -- 64% backing of the 8 x 524288 worst case: 5.1 full-length
+I                                                                          sessions. With prefix caching a finished sequence's blocks stay held
+I                                                                          for reuse, so the demand is live sessions, not running requests
+I                                            prefill staging    1.02 GiB   out of the cache: two buffers of one layer's non-resident experts,
+I                                                                          at the arena's top and lent back to the slab while steps are small
+I                                          ==============================
+I                                          vram_weights        20.00 GiB   static + experts
+I                                          vram_kv              7.06 GiB   the cache's share
+I                                          unclaimed           96.41 MiB   the headroom, the unusable above, and what MiB rounding
+I                                                                          could not place
+I   weights by tier                    VRAM 19.42 GiB, host pool 19.02 GiB, container on disk 0 B, mapped 103.00 GiB (rank 0)
+I                                        the host pool holds the 129.46 MiB the placement flags put there (the token embedding, the encoder towers, the drafter's experts) beside the weights placed in it
+I   kv cache                           7.06 GiB a card: 2656334 tokens, 5.1 sessions at 524288
+I                                        1.31 MiB of it is per-sequence state; up to 6.81 GiB is lent to the experts while no request holds it
+I HARDWARE
+I   host      AMD EPYC 7302P 16-Core Processor | 16 cores, 32 threads | RAM 499.31 GiB, 200.76 GiB available | swap 8.00 GiB, 0 B used
+I   system    kernel 7.0.0-42-generic | unknown | in a docker container | cgroup memory unlimited | memlock unlimited
+I   memory    huge pages madvise (defrag madvise, shmem never) | ttm.pages_limit 400.00 GiB | pinned by this process 284.38 GiB
+I   iommu     off (no IOMMU is registered (/sys/class/iommu is empty))
+I   amdgpu    cwsr_enable 1 | boot parameters: amd_iommu=on iommu=pt ttm.pages_limit=104857600 amdgpu.ppfeaturemask=0xffffffff
+I   cpu       governor performance (acpi-cpufreq) | io_uring available
+I   runtime   HIP 7.16.26385 | backend device
+I   media     decoders libavformat 62.12.103
+I   card 0000:03:00.0  rank 3 (device 3)  gfx1201 "AMD Radeon AI PRO R9700"  31.86 GiB VRAM  NUMA -1  driver amdgpu card4
+I       link   00:01.1 16.0 GT/s x16 (max 16.0 GT/s x16) -> 01:00.0 16.0 GT/s x16 (max 32.0 GT/s x16) -> 02:00.0 32.0 GT/s x16 (max 32.0 GT/s x16) -> 03:00.0 32.0 GT/s x16 (max 32.0 GT/s x16)  [read at 100% busy]
+I       pcie   0: 2.5GT/s, x16 250Mhz | 1: 16.0GT/s, x16 616Mhz | *2: 16.0GT/s, x16 1143Mhz
+I       dma    copy lists on DMA engine 0, a queue of this process's own; they give way to the collectives
+I       power  cap 210 W (default 300 W, max 330 W) | voltage offset -50 mV | sclk 500-2994 MHz | mclk 96-1258 MHz | runtime pm active (control on) | iommu group none
+I   card 0000:45:00.0  not serving  0x1a03:0x2000  unknown VRAM  NUMA -1  driver ast card0
+I       link   40:01.5 5.0 GT/s x1 (max 16.0 GT/s x2) -> 44:00.0 5.0 GT/s x1 (max 5.0 GT/s x1) -> 45:00.0 ? (max ?)  [read at ?% busy]
+I       power  cap unknown (default unknown, max unknown) | voltage offset unknown | sclk unknown | mclk unknown | runtime pm active (control on) | iommu group none
+I   card 0000:83:00.0  rank 1 (device 1)  gfx1201 "AMD Radeon AI PRO R9700"  31.86 GiB VRAM  NUMA -1  driver amdgpu card2
+I       link   80:01.1 16.0 GT/s x16 (max 16.0 GT/s x16) -> 81:00.0 16.0 GT/s x16 (max 32.0 GT/s x16) -> 82:00.0 32.0 GT/s x16 (max 32.0 GT/s x16) -> 83:00.0 32.0 GT/s x16 (max 32.0 GT/s x16)  [read at 100% busy]
+I       pcie   0: 2.5GT/s, x16 250Mhz | 1: 16.0GT/s, x16 616Mhz | *2: 16.0GT/s, x16 1143Mhz
+I       dma    copy lists on DMA engine 0, a queue of this process's own; they give way to the collectives
+I       power  cap 210 W (default 300 W, max 330 W) | voltage offset -50 mV | sclk 500-3290 MHz | mclk 96-1258 MHz | runtime pm active (control on) | iommu group none
+I   card 0000:86:00.0  rank 2 (device 2)  gfx1201 "AMD Radeon AI PRO R9700"  31.86 GiB VRAM  NUMA -1  driver amdgpu card3
+I       link   80:03.1 16.0 GT/s x16 (max 16.0 GT/s x16) -> 84:00.0 16.0 GT/s x16 (max 32.0 GT/s x16) -> 85:00.0 32.0 GT/s x16 (max 32.0 GT/s x16) -> 86:00.0 32.0 GT/s x16 (max 32.0 GT/s x16)  [read at 100% busy]
+I       pcie   0: 2.5GT/s, x16 250Mhz | 1: 16.0GT/s, x16 616Mhz | *2: 16.0GT/s, x16 1143Mhz
+I       dma    copy lists on DMA engine 0, a queue of this process's own; they give way to the collectives
+I       power  cap 210 W (default 300 W, max 330 W) | voltage offset -50 mV | sclk 500-3258 MHz | mclk 96-1258 MHz | runtime pm active (control on) | iommu group none
+I   card 0000:c3:00.0  rank 0 (device 0)  gfx1201 "AMD Radeon AI PRO R9700"  31.86 GiB VRAM  NUMA -1  driver amdgpu card1
+I       link   c0:01.1 16.0 GT/s x16 (max 16.0 GT/s x16) -> c1:00.0 16.0 GT/s x16 (max 32.0 GT/s x16) -> c2:00.0 32.0 GT/s x16 (max 32.0 GT/s x16) -> c3:00.0 32.0 GT/s x16 (max 32.0 GT/s x16)  [read at 7% busy: a link at rest parks below its maximum]
+I       pcie   0: 2.5GT/s, x16 250Mhz | 1: 16.0GT/s, x16 616Mhz | *2: 16.0GT/s, x16 1143Mhz
+I       dma    copy lists on DMA engine 0, a queue of this process's own; they give way to the collectives
+I       power  cap 210 W (default 300 W, max 330 W) | voltage offset -50 mV | sclk 500-2350 MHz | mclk 96-1258 MHz | runtime pm active (control on) | iommu group none
+I FINDINGS -- 3 warnings, 9 notes
+I   WARN link-below-max: card 0000:83:00.0 (rank 1): the PCIe link at 0000:81:00.0 runs 16.0 GT/s x16 of its 32.0 GT/s x16 while the card is 100% busy
+I        why: every copy between host memory and the card -- experts streamed from the host pool, the all-reduce through host memory, the embedding read in place -- and every kernel launch's packet fetch cross this link, so the card serves at the slower link's rate and a tensor-parallel step waits for it
+I        fix: a link stuck one level down after long uptime has been cleared by a reboot; check that it recovers under load (GET /diagnostics during a long prefill), and reseat or move the card if it trains narrow
+I   WARN link-below-max: card 0000:86:00.0 (rank 2): the PCIe link at 0000:84:00.0 runs 16.0 GT/s x16 of its 32.0 GT/s x16 while the card is 100% busy
+I        why: every copy between host memory and the card -- experts streamed from the host pool, the all-reduce through host memory, the embedding read in place -- and every kernel launch's packet fetch cross this link, so the card serves at the slower link's rate and a tensor-parallel step waits for it
+I        fix: a link stuck one level down after long uptime has been cleared by a reboot; check that it recovers under load (GET /diagnostics during a long prefill), and reseat or move the card if it trains narrow
+I   WARN link-below-max: card 0000:03:00.0 (rank 3): the PCIe link at 0000:01:00.0 runs 16.0 GT/s x16 of its 32.0 GT/s x16 while the card is 100% busy
+I        why: every copy between host memory and the card -- experts streamed from the host pool, the all-reduce through host memory, the embedding read in place -- and every kernel launch's packet fetch cross this link, so the card serves at the slower link's rate and a tensor-parallel step waits for it
+I        fix: a link stuck one level down after long uptime has been cleared by a reboot; check that it recovers under load (GET /diagnostics during a long prefill), and reseat or move the card if it trains narrow
+I   note experts-from-host: 18.89 GiB of weights a rank live in the pinned host pool and cross PCIe when they are used
+I        why: a prefill step streams every routed layer's pooled experts onto the card, so its speed is bounded by the link; decode reads the ones it routes to
+I        fix: more VRAM for the experts: a shorter --max-model-len or fewer --max-num-seqs, --embedding-placement ram, --kv-cache-dtype fp8, or more cards (--tp)
+I   note link-capped: card 0000:c3:00.0 (rank 0): the card's link is 32.0 GT/s x16 at most, and 0000:c0:01.1 above it is 16.0 GT/s x16 at most
+I        why: the host side of the link bounds what the card can move to and from host memory: streamed experts, the host pool and the all-reduce when it goes through host memory
+I        fix: a slot with the card's full width and speed (the board manual says which slots share lanes), or no riser; nothing to do if the board has no faster slot
+I   note link-capped: card 0000:83:00.0 (rank 1): the card's link is 32.0 GT/s x16 at most, and 0000:80:01.1 above it is 16.0 GT/s x16 at most
+I        why: the host side of the link bounds what the card can move to and from host memory: streamed experts, the host pool and the all-reduce when it goes through host memory
+I        fix: a slot with the card's full width and speed (the board manual says which slots share lanes), or no riser; nothing to do if the board has no faster slot
+I   note link-capped: card 0000:86:00.0 (rank 2): the card's link is 32.0 GT/s x16 at most, and 0000:80:03.1 above it is 16.0 GT/s x16 at most
+I        why: the host side of the link bounds what the card can move to and from host memory: streamed experts, the host pool and the all-reduce when it goes through host memory
+I        fix: a slot with the card's full width and speed (the board manual says which slots share lanes), or no riser; nothing to do if the board has no faster slot
+I   note link-capped: card 0000:03:00.0 (rank 3): the card's link is 32.0 GT/s x16 at most, and 0000:00:01.1 above it is 16.0 GT/s x16 at most
+I        why: the host side of the link bounds what the card can move to and from host memory: streamed experts, the host pool and the all-reduce when it goes through host memory
+I        fix: a slot with the card's full width and speed (the board manual says which slots share lanes), or no riser; nothing to do if the board has no faster slot
+I   note power-cap-below-default: card 0000:c3:00.0 (rank 0): the power cap is 210 W, below the card's default of 300 W
+I        why: under a sustained load the power cap is what sets the clock on these cards (scripts/cardclock.py shows which limit binds)
+I        fix: echo 300000000 | sudo tee /sys/class/drm/card1/device/hwmon/hwmon*/power1_cap restores the default, with the server stopped; nothing to do if the cap was lowered on purpose
+I   note power-cap-below-default: card 0000:83:00.0 (rank 1): the power cap is 210 W, below the card's default of 300 W
+I        why: under a sustained load the power cap is what sets the clock on these cards (scripts/cardclock.py shows which limit binds)
+I        fix: echo 300000000 | sudo tee /sys/class/drm/card2/device/hwmon/hwmon*/power1_cap restores the default, with the server stopped; nothing to do if the cap was lowered on purpose
+I   note power-cap-below-default: card 0000:86:00.0 (rank 2): the power cap is 210 W, below the card's default of 300 W
+I        why: under a sustained load the power cap is what sets the clock on these cards (scripts/cardclock.py shows which limit binds)
+I        fix: echo 300000000 | sudo tee /sys/class/drm/card3/device/hwmon/hwmon*/power1_cap restores the default, with the server stopped; nothing to do if the cap was lowered on purpose
+I   note power-cap-below-default: card 0000:03:00.0 (rank 3): the power cap is 210 W, below the card's default of 300 W
+I        why: under a sustained load the power cap is what sets the clock on these cards (scripts/cardclock.py shows which limit binds)
+I        fix: echo 300000000 | sudo tee /sys/class/drm/card4/device/hwmon/hwmon*/power1_cap restores the default, with the server stopped; nothing to do if the cap was lowered on purpose
+W startup report: link-below-max: card 0000:83:00.0 (rank 1): the PCIe link at 0000:81:00.0 runs 16.0 GT/s x16 of its 32.0 GT/s x16 while the card is 100% busy. Fix: a link stuck one level down after long uptime has been cleared by a reboot; check that it recovers under load (GET /diagnostics during a long prefill), and reseat or move the card if it trains narrow
+W startup report: link-below-max: card 0000:86:00.0 (rank 2): the PCIe link at 0000:84:00.0 runs 16.0 GT/s x16 of its 32.0 GT/s x16 while the card is 100% busy. Fix: a link stuck one level down after long uptime has been cleared by a reboot; check that it recovers under load (GET /diagnostics during a long prefill), and reseat or move the card if it trains narrow
+W startup report: link-below-max: card 0000:03:00.0 (rank 3): the PCIe link at 0000:01:00.0 runs 16.0 GT/s x16 of its 32.0 GT/s x16 while the card is 100% busy. Fix: a link stuck one level down after long uptime has been cleared by a reboot; check that it recovers under load (GET /diagnostics during a long prefill), and reseat or move the card if it trains narrow
+I serving on http://127.0.0.1:8090  (/v1/completions; /v1/chat/completions with tools and reasoning)
+I server: listening on http://127.0.0.1:8090 (32 threads, up to 128)
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=1801 pinned=2135 host=0 ssd=0 mapped=0 resident=45.76% link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0
+live step=0 run=0 wait=0 kv=0.00 prefix_hit=0.00 prefill_tps=0.0 decode_tps=0.0 gpu0=0.00/vram:31.7Gof31.9G gpu1=0.00/vram:31.7Gof31.9G gpu2=0.00/vram:31.7Gof31.9G gpu3=0.00/vram:31.7Gof31.9G experts vram=2569 pinned=1367 host=0 ssd=0 mapped=0 resident=65.27% promo=768 demo=0 readmit=0 link ar=0 h2d=29209397760 d2h=0

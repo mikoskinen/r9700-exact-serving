@@ -1,0 +1,20 @@
+REF12 1u essay (stepprobe essay 512, T 0; 2 warm reads after one discarded): 82.24 tok/s (reads 82.34/82.14), 1.580 tok/step, 19.17 ms/step | stream 136.6 MB / h2d 88.9 MB a step, promotions 693/707 a read | step log ms by verify rows 1:16.58 2:19.69 3:22.81 4+:28.18
+REF12 1u code (stepprobe code 512, T 0; 2 warm reads after one discarded): 133.36 tok/s (reads 133.18/133.53), 3.710 tok/step, 27.76 ms/step | stream 370.5 MB / h2d 200.3 MB a step, promotions 658/645 a read | step log ms by verify rows 1:16.47 2:20.33 3:22.60 4+:30.51
+REF12 mb c1 (fixed harness, the SAME prompts each block (mbt3 --prompt-set fixed, reset per block), 2 block(s)): 124.90 tok/s (blocks 124.90/124.90), acceptance 0.777 (blocks 0.777/0.777), 3.84 tok / 27.05 ms a decode step, per-stream p50 143.00, TTFT p50 0.57 / p90 0.60 s, decode share 0.861
+REF12 c1 mix check (TESTING.md 12.11. c4 METHOD FIX: the blocks' acceptance must differ by < 1 %): acceptance 0.777/0.777, spread 0.00 % -> matched
+REF12 mb c4 (fixed harness, the SAME prompts each block (mbt3 --prompt-set fixed, reset per block), 2 block(s), after one discarded warm-up): 173.20 tok/s (blocks 174.20/172.20), acceptance 0.708 (blocks 0.710/0.705), 13.29 tok / 62.65 ms a decode step, per-stream p50 47.15, TTFT p50 0.67 / p90 0.71 s, decode share 0.807
+REF12 c4 mix check (TESTING.md 12.11. c4 METHOD FIX: the blocks' acceptance must differ by < 1 %): acceptance 0.710/0.705, spread 0.71 % -> matched
+REF12 mb c8 (fixed harness, the SAME prompts each block (mbt3 --prompt-set fixed, reset per block), 1 block(s)): 184.50 tok/s (blocks 184.50), acceptance 0.428 (blocks 0.428), 8.28 tok / 36.10 ms a decode step, per-stream p50 24.90, TTFT p50 0.60 / p90 0.66 s, decode share 0.803
+REF12 cold 64k (deepq 64000, cold after a reset): TTFT 11.93 s, prompt 65650 tok, cached 0, status 200
+REF12 cold 136k (deepq 136000, cold after a reset): TTFT 24.66 s, prompt 137135 tok, cached 0, status 200
+REF12 identity xref12-n5 warm-up IDENTICAL: 3 answers
+REF12 identity xref12-a1-vs-int11-O IDENTICAL: 20 of 20 answers
+REF12 identity xref12-gs16-vs-a1 IDENTICAL: 20 of 20 answers
+REF12 TABLE 1u essay 82.24 tok/s | target >= 90: 7.76 short (-8.6 %) | int11 O 77.69 (+5.86 %)
+REF12 TABLE 1u code 133.36 tok/s | target - | int11 O 127.76 (+4.38 %)
+REF12 TABLE c1 124.90 tok/s | target - | int11 O 110.90 (+12.62 %)
+REF12 TABLE c4 (warm, matched-mix: the same prompts each block) 173.20 tok/s | target >= 160: MET (+8.3 %) | int11 O 160.15 (+8.15 %)
+REF12 TABLE c8 184.50 tok/s | target >= 200: 15.50 short (-7.8 %) | int11 O 180.40 (+2.27 %)
+REF12 TABLE cold 64k 11.93 s | target - | int11 O - (-)
+REF12 TABLE cold 136k 24.66 s | target <= 35: MET (-29.5 %) | int11 O - (-)
+SUMMARY NEW DS REFERENCE (int12): 1u essay 82.24 tok/s | target >= 90: 7.76 short (-8.6 %) | int11 O 77.69 (+5.86 %) || 1u code 133.36 tok/s | target - | int11 O 127.76 (+4.38 %) || c1 124.90 tok/s | target - | int11 O 110.90 (+12.62 %) || c4 (warm, matched-mix: the same prompts each block) 173.20 tok/s | target >= 160: MET (+8.3 %) | int11 O 160.15 (+8.15 %) || c8 184.50 tok/s | target >= 200: 15.50 short (-7.8 %) | int11 O 180.40 (+2.27 %) || cold 64k 11.93 s | target - | int11 O - (-) || cold 136k 24.66 s | target <= 35: MET (-29.5 %) | int11 O - (-)

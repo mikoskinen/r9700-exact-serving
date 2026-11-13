@@ -1,0 +1,21 @@
+MOCKRUN REPORT r12-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12.sh | body rc 0 | 121 s | knobs: X12_SW=0 X12_EGEN=128 X12_DEPTHS=6000 12000 X12_NTOK=16 X12_C8WIN=8 X12_C8WARM=4 X12_C4WIN=6 X12_C4WARM=3 X12_C1WIN=6 X12_C1WARM=3 X12_MXCONFIRM=1 X12_BUDGET_MIN=120 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/ref12 | 68 RESULT lines, 137 mock requests | last RESULT: xref12 57-p4zyzzzzz-ds-r92zzzzzz-ref12: done (1 min) -- /tmp/mockrad/r12-m1/home/gpu/ds41/exl3-test/runs/xdsm/ref12 | 1 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x xref12 xref12-n5 read back: env MHC_FUSE=0 / GQ=3 / E2=1 / KV_REPLICATED=1 4 of 4, AQL_STAMP=0 0 of 1, KV_REPLICATED=1 1 (want 1), ARCODED / SCHED_CB_HOLD_* 0 (want 0: CBH comes by fn4), DECODE_ROW_CAP 0 (want 0) | KVR line: deepseek41: lever KVR declared (RADIANCE_DS41_KV_REPLICATED=1): kv_index_r1, kv_index_r2, kv_compressed_r1, kv_compressed_r2 hold the same bytes on all 4 ranks (rad_kv_group_replicated), so a host-tie | M1: deepseek41: lever M1 (mhc_fuse) declared (RADIANCE_DS41_MHC_FUSE, fn4 mhc_fuse, now 0): mhc_post_collapse_rmsnorm_mix beside 77 of 77 mhc_post_collapse_rmsnorm (pcn_a / pcn_f: the post, the next connection's collapse + norm and its mhc_mix in one op); 1 = launches of 
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 40276 linked real files, 3 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzz-c4lev.sh.out (size 13889 -> 17101)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 448606 -> 452054)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/c4lev/identity.txt (size 0 -> 39)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

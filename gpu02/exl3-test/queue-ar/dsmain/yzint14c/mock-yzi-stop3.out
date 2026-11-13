@@ -1,0 +1,40 @@
+2026-11-12 20:35:34 mockrun yzi-stop3: farm: FARM {"copied": 6918, "linked": 41757, "dirlinks": 45, "skipped": 2, "seconds": 2.8}
+2026-11-12 20:35:35 mockrun yzi-stop3: port 18090, sandbox /tmp/mockrad/yzi-stop3, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yzint14c.sh (sandbox copy), knobs: YZI_SW=0 YZI_EGEN=128 YZI_C8WIN=8 YZI_C8WARM=4 YZI_BUDGET_MIN=120 YZI_LDPF=2048 YZI_A11ID=1100 YZI_CDEPTHS=6000 YZI_U1N=2 YZI_C16DUR=8 YZI_C16WARM=4 NGSHARE_DIR=/tmp/mockrad/yzi-stop3/ngdir NGSHARE_RUN=/tmp/mockrad/yzi-stop3/ngrun NGSHARE_LOG=/tmp/mockrad/yzi-stop3/ngshare.log, faults: differ=ds41_shexp_lane:1, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-12 20:35:42 mockrun yzi-stop3: DRYRUN rc 0, 384 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1
+2026-11-12 20:35:42 mockrun yzi-stop3: run (timeout 3000 s)
+2026-11-12 20:39:29 mockrun yzi-stop3: body rc 0 after 237 s
+MOCKRUN REPORT yzi-stop3
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yzint14c.sh | body rc 0 | 237 s | knobs: YZI_SW=0 YZI_EGEN=128 YZI_C8WIN=8 YZI_C8WARM=4 YZI_BUDGET_MIN=120 YZI_LDPF=2048 YZI_A11ID=1100 YZI_CDEPTHS=6000 YZI_U1N=2 YZI_C16DUR=8 YZI_C16WARM=4 NGSHARE_DIR=/tmp/mockrad/yzi-stop3/ngdir NGSHARE_RUN=/tmp/mockrad/yzi-stop3/ngrun NGSHARE_LOG=/tmp/mockrad/yzi-stop3/ngshare.log | faults: differ=ds41_shexp_lane:1 | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1 | 79 RESULT lines, 233 mock requests | last RESULT: yzi 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yzint14c: done (3 min) -- /tmp/mockrad/yzi-stop3/home/gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1 | STOPPED at the identity gate (no speed block ran): NEEDS USER | 3 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (4)
+  1x ngshare yzi-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  1x yzi identity cold-1100-Z-vs-B: VIRHE yzi-cold-1100-Z-vs-B DIFFERENT at char 82 (353 vs 318 chars) (strict, T 0 greedy)
+  1x yzi IDENTITY GATE: VIRHE strict identity failed [cold-1100-Z-vs-B] -> the item STOPS before every speed block (exact = byte-identical: NEEDS USER) | Z = {"ds41_shexp_lane": 1} | the failing comparisons are in /tmp/mockrad/yzi-stop3/home/gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1/identity.txt and /tmp/mockrad/yzi-stop3/home/gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1/yzi-*-cmp-*.json
+  1x yzi YZSUM identity (strict, T 0 greedy): 7 of 8 IDENTICAL -- VIRHE differ / not compared: cold-1100-Z-vs-B
+MISSING / NOT FOUND (2)
+  2026-11-12 20:39:27 RESULT yzi YZSUM identity (strict, T 0 greedy): 7 of 8 IDENTICAL -- VIRHE differ / not compared: cold-1100-Z-vs-B
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (8)
+    2026-11-12 20:35:47 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-ar_twoshot_4rank_exact-0-2160515 --network none --device /dev/kfd --device /dev/dri --security-opt s
+    2026-11-12 20:35:47 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-ar_twoshot_4rank_exact-1-2160515 --network none --device /dev/kfd --device /dev/dri --security-opt s
+    2026-11-12 20:35:47 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-ar_oneshot_4rank_exact-0-2160515 --network none --device /dev/kfd --device /dev/dri --security-opt s
+    2026-11-12 20:35:48 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-ar_oneshot_4rank_exact-1-2160515 --network none --device /dev/kfd --device /dev/dri --security-opt s
+    2026-11-12 20:35:48 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-xpgate-2160515 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined 
+    2026-11-12 20:35:48 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-a4check-2160515 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined
+    2026-11-12 20:35:48 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-check-2160515 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -
+    2026-11-12 20:35:48 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-perf-2160515 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41755 linked real files, 4 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yzint14c/mock-yzi-stop3.out (size 0 -> 959)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yzint14c/mock-yzi-m3.out (size 0 -> 854)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 946276 -> 952959)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzz-fn-csdma4.sh.out (size 315 -> 2495)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/yzi-stop3.txt | sandbox: /tmp/mockrad/yzi-stop3

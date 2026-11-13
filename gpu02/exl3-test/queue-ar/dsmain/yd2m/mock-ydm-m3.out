@@ -1,0 +1,33 @@
+2026-11-12 19:05:21 mockrun ydm-m3: farm: FARM {"copied": 6880, "linked": 41442, "dirlinks": 45, "skipped": 2, "seconds": 2.8}
+2026-11-12 19:05:21 mockrun ydm-m3: port 18091, sandbox /tmp/mockrad/ydm-m3, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yd2m.sh (sandbox copy), knobs: YDM_SW=0 YDM_C8WIN=8 YDM_C8WARM=4 YDM_NREADS=1 YDM_C8ORDER=BCP YDM_PDEPTHS=6000 YDM_LDPF=2048 YDM_U1ORDER=CB YDM_C16ORDER=BC YDM_BUDGET_MIN=60, faults: none, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-12 19:05:27 mockrun ydm-m3: DRYRUN rc 0, 220 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/yd2m/x1
+2026-11-12 19:05:27 mockrun ydm-m3: run (timeout 1500 s)
+2026-11-12 19:09:00 mockrun ydm-m3: body rc 0 after 222 s
+MOCKRUN REPORT ydm-m3
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yd2m.sh | body rc 0 | 223 s | knobs: YDM_SW=0 YDM_C8WIN=8 YDM_C8WARM=4 YDM_NREADS=1 YDM_C8ORDER=BCP YDM_PDEPTHS=6000 YDM_LDPF=2048 YDM_U1ORDER=CB YDM_C16ORDER=BC YDM_BUDGET_MIN=60 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/yd2m/x1 | 89 RESULT lines, 438 mock requests | last RESULT: ydm summary: raw snapshots -> raw-snaps.tar.gz (1 MB); /tmp/mockrad/ydm-m3/home/gpu/ds41/exl3-test/runs/xdsm/yd2m/x1 1 MB; 254398 MB free on /
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (3)
+    2026-11-12 19:05:32 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ydm-p0-perf-1728054 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --
+    2026-11-12 19:05:32 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ydm-p0-check-1728054 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -
+    2026-11-12 19:05:33 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ydm-p0pf-1728054 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e RO
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41440 linked real files, 6 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yd2m/mock-ydm-m3.out (size 0 -> 778)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/dry-yll.txt (size 88499 -> 88493)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/mock-yll-m2.txt (size 733 -> 3216)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yswl/dry-yswl.txt (size 1405 -> 125634)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzz-fn-bi7.sh.out (size 301 -> 1124)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 791908 -> 798373)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/ydm-m3.txt | sandbox: /tmp/mockrad/ydm-m3
+mock rc 0

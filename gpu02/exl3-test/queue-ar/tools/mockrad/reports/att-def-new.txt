@@ -1,0 +1,18 @@
+MOCKRUN REPORT att-def-new
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/attach/mock/items/04-plain.sh | body rc 0 | 12 s | knobs: MOCKRAD_STARTUP_S=3 | faults: - | swaps: gpu/ds41/exl3-test/queue/lib-pr266.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/staged/lib-pr266.sh gpu/ds41/exl3-test/queue-ar/dsmain/compose-guard.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/staged/compose-guard.sh
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/attmock | 9 RESULT lines, 3 mock requests | last RESULT: xatm plain: done
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 0 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 39504 linked real files, 1 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 316081 -> 316363)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

@@ -1,0 +1,45 @@
+YDSUM c8: no C block (A4 not screened: its gate stopped A4 after P0, or the order has no C) -- B blocks c8-2-S-B c8-3-S-B: decode ms a step 35.07/35.11, newcomer ms a step 536.6/537.2, agg 184.9/184.9
+YDSUM c8 A10 arm P (exl3_x3d_pf 1, gg_gemv_m16 0) vs B: newcomer / MIXED ms a step B 536.6/537.2 (mean 536.9) -> P 533.5/534.3 (mean 533.9): -0.56 % (-3.0 ms); share B 19.9/20.0 % -> P 19.8/19.8 %; decode ms a step B 35.07/35.11 -> P 35.04/35.07 (mean 35.05): -0.10 %; agg B 184.9/184.9 -> P 185.1/185.3 (mean 185.2): +0.16 %; blocks c8-1-S-P c8-4-S-P
+YDSUM c16: no block (mb.jsonl has no c16 B / C row)
+YDSUM 1u: no read (blocks.jsonl has no U1 row)
+YDSUM A10 cold 136000 (deepq after a prefix-cache reset, prompt 137135 tok, B then P): TTFT B 24.94 s -> P 24.82 s: -0.48 % | non-decode ms a step B 426.6 -> P 425.6: -0.23 %
+YDSUM A10 verdict (A10 joins the stack if 136k TTFT >= 1.0 % faster OR newcomer step >= 15.0 ms faster): NOT -- 136k TTFT B 24.94 s -> P 24.82 s (-0.48 %); c8 newcomer step B 536.9 ms -> P 533.9 ms (-3.0 ms, -0.56 %)
+YDSUM P0 gate (bench, one card, kernel us a call, two passes): rank 0 (bench us, the 12.11. profile's calls a step; fold a / e timed as their plain GEMMs): c8 at M 8 d2 9158 us -> 9158 us a step (0 us saved); c16 at M 16 d2 15569 us -> 14821 us (748 us saved) | 95 table entries
+YDSUM P0 M16GATE q5_K attn_q_b(fold a) M=8: d2 40.0 us -> 40.0 us (no A4 win), +0.0 %; c8 calls a step 13
+YDSUM P0 M16GATE q5_K attn_q_b(fold a) M=16: d2 68.3 us -> 68.3 us (no A4 win), +0.0 %; c16 calls a step 13
+YDSUM P0 M16GATE q5_K q_a+attn_kv(pair) M=8: d2 43.5 us -> 43.5 us (no A4 win), +0.0 %; c8 calls a step 13
+YDSUM P0 M16GATE q5_K q_a+attn_kv(pair) M=16: d2 73.3 us -> 73.3 us (no A4 win), +0.0 %; c16 calls a step 13
+YDSUM P0 M16GATE q5_K attn_output_b M=8: d2 39.4 us -> 39.4 us (no A4 win), +0.0 %; c8 calls a step 13
+YDSUM P0 M16GATE q5_K attn_output_b M=16: d2 59.9 us -> 59.9 us (no A4 win), +0.0 %; c16 calls a step 13
+YDSUM P0 M16GATE q5_K attn_output_a g0+g1(pair) M=8: d2 35.9 us -> 35.9 us (no A4 win), +0.0 %; c8 calls a step 13
+YDSUM P0 M16GATE q5_K attn_output_a g0+g1(pair) M=16: d2 63.1 us -> 57.6 us (H2R2wfit-a4), -8.7 %; c16 calls a step 13
+YDSUM P0 M16GATE q6_K attn_q_b(fold a) M=8: d2 37.3 us -> 37.3 us (no A4 win), +0.0 %; c8 calls a step 27
+YDSUM P0 M16GATE q6_K attn_q_b(fold a) M=16: d2 63.9 us -> 63.9 us (no A4 win), +0.0 %; c16 calls a step 27
+YDSUM P0 M16GATE q6_K q_a+attn_kv(pair) M=8: d2 42.2 us -> 42.2 us (no A4 win), +0.0 %; c8 calls a step 27
+YDSUM P0 M16GATE q6_K q_a+attn_kv(pair) M=16: d2 92.4 us -> 73.9 us (H2R1c8wfit-xp), -20.1 %; c16 calls a step 27
+YDSUM P0 M16GATE q6_K attn_output_b M=8: d2 39.2 us -> 39.2 us (no A4 win), +0.0 %; c8 calls a step 27
+YDSUM P0 M16GATE q6_K attn_output_b M=16: d2 59.2 us -> 59.2 us (no A4 win), +0.0 %; c16 calls a step 27
+YDSUM P0 M16GATE q6_K attn_output_a g0+g1(pair) M=8: d2 35.7 us -> 35.7 us (no A4 win), +0.0 %; c8 calls a step 27
+YDSUM P0 M16GATE q6_K attn_output_a g0+g1(pair) M=16: d2 61.4 us -> 54.9 us (H2R2wfit-a4), -10.6 %; c16 calls a step 27
+YDSUM P0 M16GATE q6_K shexp_gate_up M=8: d2 34.2 us -> 34.2 us (no A4 win), +0.0 %; c8 calls a step 27
+YDSUM P0 M16GATE q6_K shexp_gate_up M=16: d2 54.4 us -> 54.4 us (no A4 win), +0.0 %; c16 calls a step 27
+YDSUM P0 M16GATE q6_K shexp_down(fold e) M=8: d2 20.3 us -> 20.3 us (no A4 win), +0.0 %; c8 calls a step 27
+YDSUM P0 M16GATE q6_K shexp_down(fold e) M=16: d2 27.0 us -> 27.0 us (no A4 win), +0.0 %; c16 calls a step 27
+YDSUM P0 M16GATE q6_K shexp_gate_up_w512 M=8: d2 26.3 us -> 23.0 us (H1R2-xp), -12.5 %; c8 calls a step 0
+YDSUM P0 M16GATE q6_K shexp_gate_up_w512 M=16: d2 43.2 us -> 38.3 us (H2R2c8wfit-xp), -11.2 %; c16 calls a step 0
+YDSUM P0 M16GATE q6_K shexp_down_w512(fold e) M=8: d2 13.8 us -> 13.8 us (no A4 win), +0.0 %; c8 calls a step 0
+YDSUM P0 M16GATE q6_K shexp_down_w512(fold e) M=16: d2 19.6 us -> 19.6 us (no A4 win), +0.0 %; c16 calls a step 0
+YDSUM P0 M16GATE q6_K engram_kv_e2 M=8: d2 142.7 us -> 142.7 us (no A4 win), +0.0 %; c8 calls a step 2
+YDSUM P0 M16GATE q6_K engram_kv_e2 M=16: d2 241.6 us -> 241.6 us (no A4 win), +0.0 %; c16 calls a step 2
+YDSUM P0 M16GATE q6_K head M=8: d2 487.9 us -> 487.9 us (no A4 win), +0.0 %; c8 calls a step 1
+YDSUM P0 M16GATE q6_K head M=16: d2 985.0 us -> 985.0 us (no A4 win), +0.0 %; c16 calls a step 1
+YDSUM P0 M16GATE q8_0 shexp_gate_up M=8: d2 31.6 us -> 31.6 us (no A4 win), +0.0 %; c8 calls a step 13
+YDSUM P0 M16GATE q8_0 shexp_gate_up M=16: d2 49.2 us -> 49.2 us (no A4 win), +0.0 %; c16 calls a step 13
+YDSUM P0 M16GATE q8_0 shexp_down(fold e) M=8: d2 20.7 us -> 20.7 us (no A4 win), +0.0 %; c8 calls a step 13
+YDSUM P0 M16GATE q8_0 shexp_down(fold e) M=16: d2 26.8 us -> 26.8 us (no A4 win), +0.0 %; c16 calls a step 13
+YDSUM P0 M16GATE q8_0 shexp_gate_up_w512 M=8: d2 25.3 us -> 23.9 us (H1R2-xp), -5.4 %; c8 calls a step 0
+YDSUM P0 M16GATE q8_0 shexp_gate_up_w512 M=16: d2 35.2 us -> 35.2 us (no A4 win), +0.0 %; c16 calls a step 0
+YDSUM P0 M16GATE q8_0 shexp_down_w512(fold e) M=8: d2 13.6 us -> 13.6 us (no A4 win), +0.0 %; c8 calls a step 0
+YDSUM P0 M16GATE q8_0 shexp_down_w512(fold e) M=16: d2 19.2 us -> 19.2 us (no A4 win), +0.0 %; c16 calls a step 0
+YDSUM identity (strict, T 0 greedy): 7 of 7 IDENTICAL
+YDSUM headline (C = A4 forms vs B = int12's D2 forms): c8 decode step - (35.09 -> - ms), c8 agg - | c16 decode step -, c16 agg - | 1u - | table 95 entries | A10 NOT | identity 7 / 7

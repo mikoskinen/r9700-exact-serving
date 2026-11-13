@@ -1,0 +1,8 @@
+selftest rc 0, 7 ok, 0 FAIL
+warm-up-wk-n5 IDENTICAL: 3 answers
+copy-B not compared ([Errno 2] No such file or directory: '/home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/walk/copy-wk-n5-iB-run1.txt')
+gs-B not compared (missing /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/draft/dsd-d0-gs-c1.jsonl or /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/walk/wk-n5-iB-gs-c1.jsonl)
+copy-A not compared ([Errno 2] No such file or directory: '/home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/walk/copy-wk-n5-iA-run1.txt')
+gs-A not compared (missing /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/draft/dsd-d0-gs-c1.jsonl or /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/walk/wk-n5-iA-gs-c1.jsonl)
+oracle-1 DIFFERENT
+oracle-2 DIFFERENT

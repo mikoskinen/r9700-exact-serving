@@ -1,0 +1,30 @@
+2026-11-13 00:39:10 mockrun lch-m1: farm: FARM {"copied": 7010, "linked": 42658, "dirlinks": 45, "skipped": 2, "seconds": 2.9}
+2026-11-13 00:39:10 mockrun lch-m1: port 18090, sandbox /tmp/mockrad/lch-m1, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzlaunch.sh (sandbox copy), knobs: LCH_SW=0 LCH_C8WARM=4 LCH_BUDGET_MIN=120 LCH_LDPF=2048 LCH_C8GN=1 LCH_U1N=1 NGSHARE_DIR=/tmp/mockrad/lch-m1/ngdir NGSHARE_RUN=/tmp/mockrad/lch-m1/ngrun NGSHARE_LOG=/tmp/mockrad/lch-m1/ngshare.log, faults: none, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-13 00:39:17 mockrun lch-m1: DRYRUN rc 0, 197 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/zzzlaunch
+2026-11-13 00:39:17 mockrun lch-m1: run (timeout 3000 s)
+2026-11-13 00:44:22 mockrun lch-m1: body rc 0 after 315 s
+MOCKRUN REPORT lch-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzlaunch.sh | body rc 0 | 316 s | knobs: LCH_SW=0 LCH_C8WARM=4 LCH_BUDGET_MIN=120 LCH_LDPF=2048 LCH_C8GN=1 LCH_U1N=1 NGSHARE_DIR=/tmp/mockrad/lch-m1/ngdir NGSHARE_RUN=/tmp/mockrad/lch-m1/ngrun NGSHARE_LOG=/tmp/mockrad/lch-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzzlaunch | 101 RESULT lines, 321 mock requests | last RESULT: xlch 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzlaunch: done (5 min) -- /tmp/mockrad/lch-m1/home/gpu/ds41/exl3-test/runs/xdsm/zzzlaunch | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x ngshare xlch-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42656 linked real files, 6 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zzzlaunch/mock-lch-m1.out (size 0 -> 838)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzz-fn-hz-tattbi3.sh.out (size 8171 -> 10061)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 16884 -> 17113)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1362770 -> 1371538)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-a3-P.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-a3-opwin.txt (size 0 -> 6323)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/lch-m1.txt | sandbox: /tmp/mockrad/lch-m1

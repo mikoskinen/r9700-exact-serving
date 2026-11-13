@@ -1,0 +1,26 @@
+MOCKRUN REPORT zc16-m2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzc-int16.sh | body rc 0 | 268 s | knobs: ZC16_SW=0 ZC16_C8WARM=4 ZC16_C4WARM=4 ZC16_BUDGET_MIN=120 ZC16_LDPF=2048 ZC16_C4GN=1 ZC16_U1N=1 ZC16_CDEPTH=16000 ZC16_COLDEST=1 NGSHARE_DIR=/tmp/mockrad/zc16-m2/ngdir NGSHARE_RUN=/tmp/mockrad/zc16-m2/ngrun NGSHARE_LOG=/tmp/mockrad/zc16-m2/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzzc16 | 85 RESULT lines, 215 mock requests | last RESULT: xzc16 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzc-int16: done (4 min) -- /tmp/mockrad/zc16-m2/home/gpu/ds41/exl3-test/runs/xdsm/zzzc16 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x ngshare xzc16-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (4)
+  2026-11-13 02:25:11 RESULT xzc16 cold 16000 F vs zzzfuse: not compared (zzzfuse ran no 16000 read: /tmp/mockrad/zc16-m2/home/gpu/ds41/exl3-test/runs/xdsm/zzzfuse/cold-136000-1-F.txt absent; ref14's is the reference)
+  2026-11-13 02:25:15 RESULT xzc16 INT16 SUMMARY: identity 5/5 IDENTICAL | pin read-back OK (fn4 every switch + 4 ranks + declare 'now 2' + rco / fuse engagement; 19 per-block checks, 19 mismatches) | 1u int16 = 236.19 tok/s (>= 90: YES) vs B (int15) 210.37 tok/s (+12.27 %; read spreads 12.54 / 15.62 %) | c4 gens F vs B: agg 492.65 -> 503.55 tok/s (+2.21 %; spreads 0.59 / 0.81 %), decode p50 20.84 -
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42999 linked real files, 6 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zzzc16/mock-zc16-m2.out (size 0 -> 898)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-fn-csdma6.sh.out (size 7884 -> 14965)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1535795 -> 1543456)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sd6-blocks.jsonl (size 44872 -> 60222)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sd6-dc8b.txt (size 0 -> 780)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-sd6-D.log (gone)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

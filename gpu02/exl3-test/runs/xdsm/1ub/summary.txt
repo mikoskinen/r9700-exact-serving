@@ -1,0 +1,8 @@
+READ code 1u (T 0, 2 B / 2 C reads): decode C 120.93 tok/s vs B 128.92 = -6.20 % (reads B [129.8, 128.03], C [120.87, 120.98]) | ms a step C 30.62 vs B 28.71 | tokens a step C 3.710 vs B 3.710
+READ essay 1u (T 0, 2 B / 2 C reads): decode C 74.12 tok/s vs B 77.98 = -4.94 % (reads B [77.04, 78.92], C [74.24, 74.01]) | ms a step C 21.27 vs B 20.22 | tokens a step C 1.580 vs B 1.580
+XP B reads: 0 planned, 0 of 0 restored copies routed (-), ~0.0 MB a step kept off the link | stream MB (heat estimate, the ring not seen) 205972 over 924 decode steps
+XP C reads: 17375 planned, 4802 of 17371 restored copies routed (27.6 %), ~50.2 MB a step kept off the link | stream MB (heat estimate, the ring not seen) 195459 over 924 decode steps
+ROWS (ms a decode step by verify rows, p50; step log): 1 row(s) C 18.15 vs B 17.04 | 2 row(s) C 21.67 vs B 20.36 | 3 row(s) C 24.73 vs B 23.55 | rows a step C 2.674 vs B 2.677
+C4 (fixed schedule 1x4, T 0, 4 blocks): agg C 145.65 vs B 147.45 tok/s = -1.22 % (INCONCLUSIVE (mix): read with the mix check) | blocks ['c4-1B 143.5', 'c4-2C 144.1', 'c4-3B 151.4', 'c4-4C 147.2'] | C: 24750 copies planned, 2302 of 24751 restored routed | B-vs-B mix: c4-3B vs c4-1B: co-batched [] + 9 single vs [2] + 6 single | agg 151.4 vs 143.5 (+5.51 %) | DIFFERS
+IDENTITY: x1ub-n5 warm-up IDENTICAL: 3 answers | x1ub-C-vs-B IDENTICAL: 20 of 20 answers
+SUMMARY code -6.20 % | essay -4.94 % | c4 -1.22 % (mix?) | identity IDENTICAL

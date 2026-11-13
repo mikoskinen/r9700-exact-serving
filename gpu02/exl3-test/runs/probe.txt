@@ -1,0 +1,2 @@
+J {"prompt": "essay", "tokens": 512, "decode_tps": 52.9, "decode_steps": 511.0, "ms_per_decode_step": 18.89, "tokens_per_step": 1.0, "acceptance": 0.0, "all_steps": 512.0, "all_step_s": 9.81}
+J {"prompt": "code", "tokens": 512, "decode_tps": 51.59, "decode_steps": 511.0, "ms_per_decode_step": 19.37, "tokens_per_step": 1.0, "acceptance": 0.0, "all_steps": 512.0, "all_step_s": 10.04}

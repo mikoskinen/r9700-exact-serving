@@ -1,0 +1,4 @@
+selftest rc 0, 25 ok, 0 FAIL
+warm-up-wk-n5 IDENTICAL: 3 answers
+copy-B IDENTICAL (2399 chars)
+gs-B IDENTICAL: 20 answers

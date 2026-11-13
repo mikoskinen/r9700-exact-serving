@@ -1,0 +1,25 @@
+s3-n0 warm-up IDENTICAL: 3 answers
+s3-n0 deep-P IDENTICAL (1877 chars)
+s3-n0 copy-P IDENTICAL (2399 chars)
+s3-n0 a1-A-vs-d0 IDENTICAL: 20 of 20 answers
+s3-n0 a1-s4-vs-d0 IDENTICAL: 20 of 20 answers
+s3-n0 a1-s4-vs-a1-A IDENTICAL: 20 of 20 answers
+s3-n0 ld-vs-a1-s4 IDENTICAL: 20 of 20 answers
+s3-n0 c4b-vs-c4a-s4 IDENTICAL: 20 of 20 answers
+s3-n0 c4a-vs-a1-s4 IDENTICAL: 20 of 20 answers
+s3-n0 a2-vs-a1-s4 IDENTICAL: 20 of 20 answers
+s3-n5 warm-up IDENTICAL: 3 answers
+s3-n5 deep-P IDENTICAL (1877 chars)
+s3-n5 copy-P IDENTICAL (2399 chars)
+s3-n5 a1-A-vs-d0 IDENTICAL: 20 of 20 answers
+s3-n5 a1-s2-vs-d0 IDENTICAL: 20 of 20 answers
+s3-n5 a1-s2-vs-a1-A IDENTICAL: 20 of 20 answers
+s3-n5 ld-vs-a1-s2 IDENTICAL: 20 of 20 answers
+s3-n5 c4b-vs-c4a-s2 IDENTICAL: 20 of 20 answers
+s3-n5 c4a-vs-a1-s2 IDENTICAL: 20 of 20 answers
+s3-n5 a1-s4-vs-d0 IDENTICAL: 20 of 20 answers
+s3-n5 a1-s4-vs-a1-A IDENTICAL: 20 of 20 answers
+s3-n5 ld-vs-a1-s4 IDENTICAL: 20 of 20 answers
+s3-n5 c4b-vs-c4a-s4 IDENTICAL: 20 of 20 answers
+s3-n5 c4a-vs-a1-s4 IDENTICAL: 20 of 20 answers
+s3-n5 a2-vs-a1-s2 IDENTICAL: 20 of 20 answers

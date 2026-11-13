@@ -1,0 +1,26 @@
+# cc_sim model=qwen3.8-flash-next urls=['http://127.0.0.1:8090'] route=hash users=16 duration=3000s warmup=120s cap=170000 start=20000-40000 preage=True tools=109 (~16920 tok) gen=reflen<=13000 tool~LN(300,1.2) think~LN(0.8,1)[0.2,90]s effort=xhigh,medium auth=no run=20261109-224411 2026-11-09 22:44:11
+[    60s] done=0 err=0 in_flight=16 open_sessions=16 | last 60s: req=0 ttft_p50=0.00s ttft_max=0.00s gen=0 prompt_p50=0k cpt=3.50
+[   120s] done=0 err=0 in_flight=16 open_sessions=16 | last 60s: req=0 ttft_p50=0.00s ttft_max=0.00s gen=0 prompt_p50=0k cpt=3.50
+[   180s] done=1 err=0 in_flight=16 open_sessions=16 | last 60s: req=1 ttft_p50=134.06s ttft_max=134.06s gen=147 prompt_p50=123k cpt=3.50
+[   240s] done=25 err=0 in_flight=15 open_sessions=16 | last 60s: req=24 ttft_p50=0.53s ttft_max=155.38s gen=9867 prompt_p50=72k cpt=3.50
+[   300s] done=61 err=0 in_flight=14 open_sessions=15 | last 60s: req=36 ttft_p50=0.51s ttft_max=195.54s gen=21259 prompt_p50=73k cpt=3.50
+[   360s] done=86 err=0 in_flight=11 open_sessions=12 | last 60s: req=25 ttft_p50=0.65s ttft_max=198.31s gen=50832 prompt_p50=85k cpt=3.50
+[   420s] done=132 err=0 in_flight=10 open_sessions=10 | last 60s: req=46 ttft_p50=0.64s ttft_max=197.96s gen=102097 prompt_p50=68k cpt=3.50
+[   480s] done=145 err=0 in_flight=7 open_sessions=7 | last 60s: req=13 ttft_p50=0.58s ttft_max=7.28s gen=13266 prompt_p50=81k cpt=3.50
+[   540s] done=175 err=0 in_flight=4 open_sessions=6 | last 60s: req=30 ttft_p50=0.41s ttft_max=5.74s gen=84268 prompt_p50=96k cpt=3.50
+[   600s] done=194 err=0 in_flight=4 open_sessions=4 | last 60s: req=19 ttft_p50=0.41s ttft_max=4.76s gen=55969 prompt_p50=121k cpt=3.50
+[   660s] done=205 err=0 in_flight=2 open_sessions=3 | last 60s: req=11 ttft_p50=0.33s ttft_max=2.45s gen=16129 prompt_p50=91k cpt=3.50
+[   720s] done=218 err=0 in_flight=2 open_sessions=2 | last 60s: req=13 ttft_p50=0.32s ttft_max=3.57s gen=28120 prompt_p50=35k cpt=3.50
+[   780s] done=220 err=0 in_flight=2 open_sessions=2 | last 60s: req=2 ttft_p50=2.45s ttft_max=2.48s gen=26000 prompt_p50=122k cpt=3.50
+[   840s] done=231 err=0 in_flight=1 open_sessions=1 | last 60s: req=11 ttft_p50=0.34s ttft_max=3.07s gen=27075 prompt_p50=42k cpt=3.50
+[   900s] done=237 err=0 in_flight=1 open_sessions=1 | last 60s: req=6 ttft_p50=0.49s ttft_max=3.62s gen=26607 prompt_p50=39k cpt=3.50
+SUMMARY window 217-908 s, users=16
+  requests 192 ok (0 err, 0 aborted), 16.67 req/min, mean in-flight 2.09, sessions 20 (cold starts 4), mean think 1.33 s
+  TTFT p50 0.43 s, p95 2.48 s, max 5.95 s | decode per stream p50 93.6 tok/s (p10 54.2) | aggregate generated 268.3 tok/s
+  prompt p50 77.0k max 169.3k, total 16.18M; cached 15.74M = 97.3 %; uncached per request p50 0.9k; server prefill p50 5358.8 tok/s
+  gen p50 215 mean 965.7 max 13000, reasoning 93.8 %; growth/turn p50 713 mean 1597 (tool part p50 381); draft acceptance 0.802
+  finish {'tool_calls': 66, 'length': 123, 'stop': 3} | per url {'http://127.0.0.1:8090': 192}
+SUMMARY_JSON {"window_s": [217.1, 908.2], "users": 16, "requests": 192, "errors": 0, "aborted": 0, "first_err": "", "req_per_min": 16.67, "ttft_p50": 0.43, "ttft_p95": 2.48, "ttft_max": 5.95, "decode_p50": 93.6, "decode_p10": 54.2, "agg_gen_tps": 268.3, "mean_inflight": 2.09, "prompt_p50": 76960, "prompt_max": 169280, "prompt_tokens": 16175846, "cached_tokens": 15737920, "cache_hit_pct": 97.3, "uncached_p50": 876, "gen_p50": 215, "gen_mean": 965.7, "gen_max": 13000, "reasoning_pct": 93.8, "growth_p50": 713, "growth_mean": 1597, "tool_tok_p50": 381, "sessions": 20, "cold_starts": 4, "think_mean": 1.33, "srv_prefill_tps_p50": 5358.8, "draft_acc_mean": 0.802, "finish": {"tool_calls": 66, "length": 123, "stop": 3}, "per_url": {"http://127.0.0.1:8090": 192}, "mode": "turns 15 a user, first 3 excluded", "makespan_s": 908.2, "server_s": 1441.0, "cpt_final": 3.5}
+REFLEN 192 kept requests: cut 113 (58.9 %), exact 10 (5.2 %), short 69 (35.9 %) | shortfall 64275 of 249683 reference tokens (25.74 %)
+# per-request lines + summary: /home/mikoskinen/gpu/ds41/exl3-test/runs/ccsim-1109-2244-fn4-k4n-rl-u16.jsonl
+cc_sim exit 0

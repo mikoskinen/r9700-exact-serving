@@ -1,0 +1,181 @@
+== TR bw
+dev 0: AMD Radeon AI PRO R9700 pci c3:00
+dev 1: AMD Radeon AI PRO R9700 pci 83:00
+can access peer 0->1 1, 1->0 1
+card 0 host->dev 27.9 GB/s
+card 0 dev->host 27.6 GB/s
+card 1 host->dev 27.7 GB/s
+card 1 dev->host 27.6 GB/s
+both host->dev concurrently 55.4 GB/s total
+both dev->host concurrently 55.2 GB/s total
+both cards h2d+d2h at once 63.9 GB/s total
+peer 0->1 25.8 GB/s
+peer 1->0 25.9 GB/s
+peer bidirectional 50.5 GB/s total
+== TR bw4
+devices 4
+dev 0 pci c3:00
+dev 1 pci 83:00
+dev 2 pci 86:00
+dev 3 pci 03:00
+card 0 h2d 27.8 d2h 27.6 GB/s
+card 1 h2d 27.7 d2h 27.6 GB/s
+card 2 h2d 27.7 d2h 27.6 GB/s
+card 3 h2d 27.7 d2h 27.6 GB/s
+all 4 cards h2d at once 61.3 GB/s total
+all 4 cards d2h at once 75.6 GB/s total
+peer matrix GB/s (row = from, col = to):
+  0:    -     25.5   26.1   25.5
+  1:   25.7    -     27.5   25.5
+  2:   25.7   27.5    -     25.8
+  3:   25.5   25.5   25.9    -  
+ring: every card -> next card at once 99.4 GB/s total
+== p2p-bw
+devices 4, 256 MiB x 20
+dev0 0000:c3:00.0  H2D 27.9 GB/s  D2H 27.7 GB/s
+dev1 0000:83:00.0  H2D 27.9 GB/s  D2H 27.7 GB/s
+dev2 0000:86:00.0  H2D 27.9 GB/s  D2H 27.7 GB/s
+dev3 0000:03:00.0  H2D 27.9 GB/s  D2H 27.7 GB/s
+P2P 0->1  access 1  atomics 1  rank 2  copy 25.9 GB/s
+P2P 0->2  access 1  atomics 1  rank 2  copy 26.2 GB/s
+P2P 0->3  access 1  atomics 1  rank 2  copy 26.0 GB/s
+P2P 1->0  access 1  atomics 1  rank 2  copy 25.9 GB/s
+P2P 1->2  access 1  atomics 1  rank 2  copy 27.6 GB/s
+P2P 1->3  access 1  atomics 1  rank 2  copy 26.0 GB/s
+P2P 2->0  access 1  atomics 1  rank 2  copy 26.0 GB/s
+P2P 2->1  access 1  atomics 1  rank 2  copy 27.6 GB/s
+P2P 2->3  access 1  atomics 1  rank 2  copy 25.7 GB/s
+P2P 3->0  access 1  atomics 1  rank 2  copy 25.9 GB/s
+P2P 3->1  access 1  atomics 1  rank 2  copy 25.6 GB/s
+P2P 3->2  access 1  atomics 1  rank 2  copy 25.7 GB/s
+ALL 4 cards at once  H2D      61.9 GB/s total (15.5 per card)
+ALL 4 cards at once  D2H      75.2 GB/s total (18.8 per card)
+ALL 4 cards at once  H2D+D2H  79.7 GB/s total (19.9 per card)
+== dma-check pinned HSA_ENABLE_SDMA=1
+mode pinned, 4 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=1
+  H2D card 0 alone   27.9 GB/s
+  H2D card 1 alone   27.9 GB/s
+  H2D card 2 alone   27.9 GB/s
+  H2D card 3 alone   27.9 GB/s
+  H2D card 0 at once 27.9 GB/s (GPU events)
+  H2D card 1 at once 15.4 GB/s (GPU events)
+  H2D card 2 at once 15.4 GB/s (GPU events)
+  H2D card 3 at once 27.6 GB/s (GPU events)
+  H2D ALL 4 cards: sum of per-card 86.4 GB/s, wall-clock aggregate 61.6 GB/s
+  D2H card 0 alone   27.6 GB/s
+  D2H card 1 alone   27.6 GB/s
+  D2H card 2 alone   27.6 GB/s
+  D2H card 3 alone   27.6 GB/s
+  D2H card 0 at once 27.6 GB/s (GPU events)
+  D2H card 1 at once 18.8 GB/s (GPU events)
+  D2H card 2 at once 19.0 GB/s (GPU events)
+  D2H card 3 at once 27.7 GB/s (GPU events)
+  D2H ALL 4 cards: sum of per-card 93.2 GB/s, wall-clock aggregate 75.3 GB/s
+== dma-check register HSA_ENABLE_SDMA=1
+mode register, 4 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=1
+  H2D card 0 alone   27.9 GB/s
+  H2D card 1 alone   27.9 GB/s
+  H2D card 2 alone   27.9 GB/s
+  H2D card 3 alone   27.9 GB/s
+  H2D card 0 at once 27.9 GB/s (GPU events)
+  H2D card 1 at once 15.4 GB/s (GPU events)
+  H2D card 2 at once 15.4 GB/s (GPU events)
+  H2D card 3 at once 27.6 GB/s (GPU events)
+  H2D ALL 4 cards: sum of per-card 86.3 GB/s, wall-clock aggregate 61.6 GB/s
+  D2H card 0 alone   27.6 GB/s
+  D2H card 1 alone   27.6 GB/s
+  D2H card 2 alone   27.6 GB/s
+  D2H card 3 alone   27.6 GB/s
+  D2H card 0 at once 27.6 GB/s (GPU events)
+  D2H card 1 at once 16.4 GB/s (GPU events)
+  D2H card 2 at once 16.5 GB/s (GPU events)
+  D2H card 3 at once 27.0 GB/s (GPU events)
+  D2H ALL 4 cards: sum of per-card 87.4 GB/s, wall-clock aggregate 65.4 GB/s
+== dma-check pinned HSA_ENABLE_SDMA=0
+mode pinned, 4 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=0
+  H2D card 0 alone   27.8 GB/s
+  H2D card 1 alone   27.9 GB/s
+  H2D card 2 alone   27.9 GB/s
+  H2D card 3 alone   27.8 GB/s
+  H2D card 0 at once 27.9 GB/s (GPU events)
+  H2D card 1 at once 16.4 GB/s (GPU events)
+  H2D card 2 at once 16.4 GB/s (GPU events)
+  H2D card 3 at once 27.9 GB/s (GPU events)
+  H2D ALL 4 cards: sum of per-card 88.5 GB/s, wall-clock aggregate 65.4 GB/s
+  D2H card 0 alone   27.9 GB/s
+  D2H card 1 alone   28.1 GB/s
+  D2H card 2 alone   27.9 GB/s
+  D2H card 3 alone   27.9 GB/s
+  D2H card 0 at once 27.9 GB/s (GPU events)
+  D2H card 1 at once 18.8 GB/s (GPU events)
+  D2H card 2 at once 19.0 GB/s (GPU events)
+  D2H card 3 at once 27.9 GB/s (GPU events)
+  D2H ALL 4 cards: sum of per-card 93.6 GB/s, wall-clock aggregate 75.2 GB/s
+== dma-check register HSA_ENABLE_SDMA=0
+mode register, 4 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=0
+  H2D card 0 alone   27.8 GB/s
+  H2D card 1 alone   27.8 GB/s
+  H2D card 2 alone   27.9 GB/s
+  H2D card 3 alone   27.8 GB/s
+  H2D card 0 at once 27.9 GB/s (GPU events)
+  H2D card 1 at once 16.4 GB/s (GPU events)
+  H2D card 2 at once 16.4 GB/s (GPU events)
+  H2D card 3 at once 27.9 GB/s (GPU events)
+  H2D ALL 4 cards: sum of per-card 88.5 GB/s, wall-clock aggregate 65.4 GB/s
+  D2H card 0 alone   27.8 GB/s
+  D2H card 1 alone   28.0 GB/s
+  D2H card 2 alone   28.0 GB/s
+  D2H card 3 alone   28.1 GB/s
+  D2H card 0 at once 27.8 GB/s (GPU events)
+  D2H card 1 at once 17.4 GB/s (GPU events)
+  D2H card 2 at once 17.6 GB/s (GPU events)
+  D2H card 3 at once 28.2 GB/s (GPU events)
+  D2H ALL 4 cards: sum of per-card 91.1 GB/s, wall-clock aggregate 69.7 GB/s
+== rocm-bandwidth-test -a
+................................................
+          RocmBandwidthTest Version: 2.6.0
+          Launch Command is: rbt/rocm-bandwidth-test -a
+          Device: 0,  AMD EPYC 7302P 16-Core Processor
+          Device: 1,  AMD Radeon AI PRO R9700,  GPU-dbba5c851cfef7b3,  c3:0.0
+          Device: 2,  AMD Radeon AI PRO R9700,  GPU-4d61f52cafe37588,  83:0.0
+          Device: 3,  AMD Radeon AI PRO R9700,  GPU-5943fea82aeead65,  86:0.0
+          Device: 4,  AMD Radeon AI PRO R9700,  GPU-27d4920317825fce,  03:0.0
+          Inter-Device Access
+          D/D       0         1         2         3         4         
+          0         1         1         1         1         1         
+          1         1         1         1         1         1         
+          2         1         1         1         1         1         
+          3         1         1         1         1         1         
+          4         1         1         1         1         1         
+          Inter-Device Numa Distance
+          D/D       0         1         2         3         4         
+          0         0         20        20        20        20        
+          1         20        0         40        40        40        
+          2         20        40        0         40        40        
+          3         20        40        40        0         40        
+          4         20        40        40        40        0         
+          Unidirectional copy peak bandwidth GB/s
+          D/D       0           1           2           3           4           
+          0         N/A         27.953      27.973      27.975      27.967      
+          1         27.691      186.975     27.687      27.677      27.674      
+          2         27.689      27.677      184.578     27.695      27.673      
+          3         27.696      27.683      27.682      212.679     27.640      
+          4         27.695      27.684      27.681      27.656      214.187     
+== rocm-bandwidth-test -A
+          0         0         20        20        20        20        
+          1         20        0         40        40        40        
+          2         20        40        0         40        40        
+          3         20        40        40        0         40        
+          4         20        40        40        40        0         
+          Bidirectional copy peak bandwidth GB/s
+          D/D       0           1           2           3           4           
+          0         N/A         49.198      48.970      48.416      48.962      
+          1         49.198      N/A         54.143      54.123      54.079      
+          2         48.970      54.143      N/A         54.156      54.106      
+          3         48.416      54.123      54.156      N/A         54.134      
+          4         48.962      54.079      54.106      54.134      N/A         
+== host STREAM
+threads 8, 2 GiB x 3 arrays: copy 78.5 GB/s, triad 86.1 GB/s (best of 10)
+threads 16, 2 GiB x 3 arrays: copy 77.0 GB/s, triad 84.2 GB/s (best of 10)
+threads 32, 2 GiB x 3 arrays: copy 75.1 GB/s, triad 82.6 GB/s (best of 10)
+BW DONE 17:08:23

@@ -1,0 +1,26 @@
+warm-up-lg-nst0 IDENTICAL: 3 answers
+lg-nst0 copy-l-s2-vs-a-s2 IDENTICAL (2399 chars)
+lg-nst0 copy-chunks-s2 DIFFERENT BOUNDARIES: 8 vs 14 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 14
+lg-nst0 deep-l-s2-vs-a-s2 DIFFERENT at char 60 (1877 vs 1842 chars)
+lg-nst0 deep-chunks-s2 DIFFERENT BOUNDARIES: 34 vs 88 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 87
+lg-nst0 copy-a-s2-vs-d0 IDENTICAL (2399 chars)
+lg-nst0 deep-a-s2-vs-dsm225 IDENTICAL (1877 chars)
+lg-nst0 copy-l-s4-vs-a-s4 IDENTICAL (2399 chars)
+lg-nst0 copy-chunks-s4 DIFFERENT BOUNDARIES: 8 vs 14 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 14
+lg-nst0 deep-l-s4-vs-a-s4 DIFFERENT at char 70 (1877 vs 1927 chars)
+lg-nst0 deep-chunks-s4 DIFFERENT BOUNDARIES: 34 vs 88 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 87
+lg-nst0 copy-a-s4-vs-d0 IDENTICAL (2399 chars)
+lg-nst0 deep-a-s4-vs-dsm225 IDENTICAL (1877 chars)
+warm-up-lg-stack IDENTICAL: 3 answers
+lg-stack copy-l-s2-vs-a-s2 IDENTICAL (2399 chars)
+lg-stack copy-chunks-s2 DIFFERENT BOUNDARIES: 8 vs 14 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 14
+lg-stack deep-l-s2-vs-a-s2 IDENTICAL (1877 chars)
+lg-stack deep-chunks-s2 DIFFERENT BOUNDARIES: 34 vs 70 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 70
+lg-stack copy-a-s2-vs-d0 IDENTICAL (2399 chars)
+lg-stack deep-a-s2-vs-dsm225 IDENTICAL (1877 chars)
+lg-stack copy-l-s4-vs-a-s4 IDENTICAL (2399 chars)
+lg-stack copy-chunks-s4 DIFFERENT BOUNDARIES: 8 vs 14 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 14
+lg-stack deep-l-s4-vs-a-s4 DIFFERENT at char 65 (1877 vs 1980 chars)
+lg-stack deep-chunks-s4 DIFFERENT BOUNDARIES: 34 vs 85 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 84
+lg-stack copy-a-s4-vs-d0 IDENTICAL (2399 chars)
+lg-stack deep-a-s4-vs-dsm225 IDENTICAL (1877 chars)

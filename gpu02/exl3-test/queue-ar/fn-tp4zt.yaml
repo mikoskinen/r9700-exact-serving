@@ -1,0 +1,98 @@
+# fn-tp4zt.yaml (11.11.2026, queue-ar; for 180) = fn-tp4zq.yaml + RADIANCE_FN4_BITRACE ${FN4BT} (fn4 BI's engine tracer: the
+# directory inside the container, e.g. /stats/bt; empty = off, every image without the tracer ignores it) + _PMAX ${FN4BTP} and
+# _PLEN ${FN4BTL} (the rows it records: positions below PMAX of requests whose first step is a query of at most PLEN rows)
+# + RADIANCE_FN4_X3DUAL ${FN4X3DUAL} (fn4 BI-dual: 1 declares the EXL3 downs' row bands and starts exl3_dual at 1).
+# fn-tp4zq.yaml (11.11.2026, queue-ar; for 173) = fn-tp4zp.yaml + RADIANCE_FN4_X3GD ${FN4X3GD} (exl3_gd's start value: E10 in the EXL3
+# base) + RADIANCE_FN4_X3DZ ${FN4X3DZ} (exl3_dz's start value; a plugin built at EXL3R4D_DZ 2).
+# fn-tp4zp.yaml (10.11.2026, queue-ar; for 165) = fn-tp4z.yaml + RADIANCE_FN4_P2X ${FN4P2X} (fn4 P2x: 1 declares the expert
+# buffers two pipelined pieces tall) + RADIANCE_FN4_MOE_PAIR ${FN4MP} (the moe_pair switch's start value; empty = 0).
+# fn-tp4z.yaml (10.11.2026, queue-ar; for 151 / 152 and the shared-map A/B) = fn-tp4y.yaml + RADIANCE_PROFILE_EVERY
+# ${PROFEVERY} (--profile-ops: a cumulative per-op table a rank every N steps; empty = the engine's 32) + RADIANCE_FN4_X3MAP
+# ${FN4XM} (fn4 v10 EXL3 shared routing map at start; empty = off; images without it ignore the variable) +
+# RADIANCE_FN4_SPHC ${FN4SPHC} (fn4 SP-hc: 1 declares the sequence-parallel gated residual's ops; switch hc_sp picks it) +
+# RADIANCE_FN4_X3CODES ${FN4X3C} (fn4 E12: the EXL3 line's connections write the int8 codes) + RADIANCE_FN4_QSADUMP
+# ${FN4QSA} (fn4 P-2 reading: the QSA selection dump directory inside the container, e.g. /stats/qsa).
+# fn-tp4y.yaml (10.11.2026, queue-ar; for 145) = fn-tp4x.yaml + RADIANCE_FN4_CHAIN ${FN4CH} (start-time: qwen4exp's chain_pays on,
+# so the core chains launches at bring-up; empty = off).
+# fn-tp4x.yaml (10.11.2026, queue-ar; for 140) = fn-tp4v.yaml + RADIANCE_FN4_HC_SS ${FN4SS} (fn4 W1b: the trunk declares the
+# hc_write -> hc_read norm-scale buffer; empty = off, every other image ignores it).
+# fn-tp4v.yaml (10.11.2026, queue-ar; for 93p / 137) = fn-tp4u.yaml + RADIANCE_FN4_HC_UPMIX ${FN4UM} (the up-mix form; empty = stock).
+# fn-tp4u.yaml (10.11.2026, queue-ar; for 93o / 132) = fn-tp4s.yaml + RADIANCE_FN4_HC_WRITEVEC ${FN4WV} (hcw), RADIANCE_FN4_HC_READV
+# ${FN4RV} (hc_readv mask) and RADIANCE_FN4_AR_LANE_THREADS ${FN4AL} (the prefill AR lane's block width), empty = off.
+# fn-tp4s.yaml (9.11.2026, queue-ar; for 121) = fn-tp4r.yaml + RADIANCE_FN4_SWITCHABLE ${FN4SW} (the c16-sw image: both
+# F2a paths declared, so POST /admin/fn4 can switch gather_inv at run time). fn-tp4r.yaml (for 93j / 118 / 119) = fn-tp4p.yaml + the four fn4 switches of the radiance-local:c16-* images,
+# empty = off (every switch reads unset, empty and 0 as off), and every other image ignores them:
+#   RADIANCE_FN4_NO_ROUTE ${FN4NR} (F2b)  RADIANCE_FN4_GATHER_INV ${FN4GI} (F2a)  RADIANCE_FN4_HC_FUSEDOWN ${FN4FD} (F1a)
+#   RADIANCE_FN4_HC_NORMWAVE ${FN4NW} (F1n)
+# fn-tp4p.yaml (9.11.2026, queue-ar; for 93d / 107 / 108; = fn-tp4w.yaml + RADIANCE_DRAFT_PMIN ${PMIN} / _BUCKET ${PMINB}:
+# read only by the fn4-pmin image; empty = off, and every other image ignores them; fn-tp4w.yaml = fn-tp4d.yaml + --tp-wire-min-kb ${WIREKB:-128}) -- Qwen3.8-Flash-Next TEST server, NOT production: its own project /
+# container (radiance-fntest3), port 127.0.0.1:8090 (the harness tools' default), restart "no", no key. The serve line =
+# flashnext-prod-dp-a.yaml's as fn-tp2.yaml carries it (wht6 min-kb 128, fp8 KV, prefix 61440 TTL 8 h, 512 keep-all
+# checkpoints, MTP 3, MNBT 2048, the reasoning flags) except: --tp ${TP} (3; 4 for the optional TP4 arm), --placement
+# ${PLACE} (all_vram: every expert resident, no host pool) instead of expert_tiered + --host-pool-mib 16384,
+# --max-model-len ${MML} with ${ROPE} (262144 without yarn; 524288 with yarn:2), --ngram-placement ram (a private table,
+# not production's shared /dev/shm file), no --api-key-env, MAXSEQS / EXTRA from the item.
+# Cards (ROCR_VISIBLE_DEVICES, ${CARDS}): 3 cards = c3:00 + 86:00 + 03:00, one per IOD root complex (c0 / 80 / 00); 83 and
+# 86 share root complex 80 (3.11. pari-dma: 17.6 GB/s H2D each when both copy at once vs 27.9 on the other pairs).
+# Rank order = the list order: rank 2 (03:00) is the attention-zero rank (TP3.md: attention on 2 ranks over the 2 KV heads).
+# Profiling (the stamp arms): RADIANCE_AQL_STAMP (every Nth played pass on card 0 timed) into /stats/stamps.csv, /stats = the
+# item's ${STATSDIR} (made by the item before up); RADIANCE_AQL_ACQ (tuned3x image only) passed when set; NST = MTP depth.
+name: radiance-fntest3
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${FNIMAGE:?set FNIMAGE}
+    container_name: radiance-fntest3
+    restart: "no"
+    volumes:
+      - ${FNMODELDIR:?set FNMODELDIR}:/models:ro
+      - ${STATSDIR:-/tmp}:/stats
+    environment:
+      ROCR_VISIBLE_DEVICES: "${CARDS:?set CARDS}"
+      RADIANCE_AQL_STAMP: ${AQLSTAMP:-}
+      RADIANCE_AQL_STAMP_OUT: /stats/stamps.csv
+      RADIANCE_AQL_STAMP_CARDS: ${AQLCARDS:-}
+      RADIANCE_AQL_ACQ:
+      RADIANCE_DRAFT_PMIN: ${PMIN:-}
+      RADIANCE_DRAFT_PMIN_BUCKET: ${PMINB:-}
+      RADIANCE_FN4_NO_ROUTE: ${FN4NR:-}
+      RADIANCE_FN4_GATHER_INV: ${FN4GI:-}
+      RADIANCE_FN4_HC_FUSEDOWN: ${FN4FD:-}
+      RADIANCE_FN4_HC_NORMWAVE: ${FN4NW:-}
+      RADIANCE_FN4_SWITCHABLE: ${FN4SW:-}
+      RADIANCE_FN4_HC_WRITEVEC: ${FN4WV:-}
+      RADIANCE_FN4_HC_READV: ${FN4RV:-}
+      RADIANCE_FN4_AR_LANE_THREADS: ${FN4AL:-}
+      RADIANCE_FN4_HC_UPMIX: ${FN4UM:-}
+      RADIANCE_FN4_HC_SS: ${FN4SS:-}
+      RADIANCE_FN4_CHAIN: ${FN4CH:-}
+      RADIANCE_PROFILE_EVERY: ${PROFEVERY:-}
+      RADIANCE_FN4_X3MAP: ${FN4XM:-}
+      RADIANCE_FN4_SPHC: ${FN4SPHC:-}
+      RADIANCE_FN4_X3CODES: ${FN4X3C:-}
+      RADIANCE_FN4_QSADUMP: ${FN4QSA:-}
+      RADIANCE_FN4_P2X: ${FN4P2X:-}
+      RADIANCE_FN4_MOE_PAIR: ${FN4MP:-}
+      RADIANCE_FN4_X3GD: ${FN4X3GD:-}
+      RADIANCE_FN4_X3DZ: ${FN4X3DZ:-}
+      RADIANCE_FN4_BITRACE: ${FN4BT:-}
+      RADIANCE_FN4_BITRACE_PMAX: ${FN4BTP:-}
+      RADIANCE_FN4_BITRACE_PLEN: ${FN4BTL:-}
+      RADIANCE_FN4_X3DUAL: ${FN4X3DUAL:-}
+      RADIANCE_FN4_MTPFLAT: ${FN4MTPF:-}
+      RADIANCE_SCHED_BI_GRID: ${SCHEDGRID:-}
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${FNMODEL:?set FNMODEL} --served-model-name qwen3.8-flash-next
+      --host 127.0.0.1 --port 8090
+      --tp ${TP:-3} --tp-wire wht6 --tp-wire-min-kb ${WIREKB:-128} --max-num-seqs ${MAXSEQS:-16} --max-model-len ${MML:-262144} ${ROPE:-}
+      --placement ${PLACE:-all_vram} --gpu-headroom-mib 96
+      --kv-cache-dtype fp8
+      --ngram-placement ram
+      --prefix-cache-mib 61440 --prefix-cache-ttl 28800
+      --checkpoint-slots 512 --checkpoint-policy keep-all
+      --num-speculative-tokens ${NST:-3} --max-num-batched-tokens ${MNBT:-2048}
+      --reasoning-effort medium --reasoning-effort-map high=xhigh
+      --thinking-token-budget 16000 --default-max-tokens 32768
+      ${EXTRA:-}

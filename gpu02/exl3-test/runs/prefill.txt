@@ -1,0 +1,6 @@
+J {"test": "prefill", "target": 16000, "rep": 1, "status": 200, "prompt_tokens": 13698, "cached": 0, "ttft": 8.524, "prefill_tps": 1607.1, "err": null}
+J {"test": "prefill", "target": 65536, "rep": 1, "status": 200, "prompt_tokens": 59726, "cached": 0, "ttft": 30.029, "prefill_tps": 1989.0, "err": null}
+J {"test": "prefill", "target": 131072, "rep": 1, "status": 200, "prompt_tokens": 142166, "cached": 0, "ttft": 72.957, "prefill_tps": 1948.6, "err": null}
+J {"test": "prefill", "target": 16000, "rep": 2, "status": 200, "prompt_tokens": 16458, "cached": 0, "ttft": 7.023, "prefill_tps": 2343.3, "err": null}
+J {"test": "prefill", "target": 65536, "rep": 2, "status": 200, "prompt_tokens": 58959, "cached": 0, "ttft": 26.543, "prefill_tps": 2221.3, "err": null}
+J {"test": "prefill", "target": 131072, "rep": 2, "status": 200, "prompt_tokens": 136672, "cached": 0, "ttft": 69.105, "prefill_tps": 1977.7, "err": null}

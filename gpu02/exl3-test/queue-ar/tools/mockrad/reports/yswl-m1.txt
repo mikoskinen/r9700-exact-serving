@@ -1,0 +1,25 @@
+MOCKRUN REPORT yswl-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yswl.sh | body rc 0 | 357 s | knobs: XSW_SW=0 XSW_EGEN=128 XSW_C8WIN=8 XSW_C8WARM=4 XSW_BUDGET_MIN=120 XSW_LDPF=2048 NGSHARE_DIR=/tmp/mockrad/yswl-m1/ngdir NGSHARE_RUN=/tmp/mockrad/yswl-m1/ngrun NGSHARE_LOG=/tmp/mockrad/yswl-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/yswl | 88 RESULT lines, 399 mock requests | last RESULT: xswl 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yswl: done (5 min) -- /tmp/mockrad/yswl-m1/home/gpu/ds41/exl3-test/runs/xdsm/yswl | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x ngshare xswl-BASE: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41441 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yd2m/mock-ydm-m3.out (size 720 -> 3617)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yd2m/dry-yd2m.txt (size 88785 -> 94840)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yd2m/mock-ydm-m4.out (size 563 -> 3438)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/FILES-MD5SUMS (size 367 -> 235)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/mock-yll-m2.txt (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzz-fn-bi7.sh.out (size 301 -> 1726)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 792469 -> 802933)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

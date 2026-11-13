@@ -1,0 +1,8 @@
+devices 2, 256 MiB x 20
+dev0 0000:c3:00.0  H2D 27.9 GB/s  D2H 27.7 GB/s
+dev1 0000:03:00.0  H2D 27.9 GB/s  D2H 27.7 GB/s
+P2P 0->1  access 1  atomics 1  rank 2  copy 26.1 GB/s
+P2P 1->0  access 1  atomics 1  rank 2  copy 26.1 GB/s
+ALL 2 cards at once  H2D      55.9 GB/s total (27.9 per card)
+ALL 2 cards at once  D2H      55.3 GB/s total (27.7 per card)
+ALL 2 cards at once  H2D+D2H  81.3 GB/s total (40.7 per card)

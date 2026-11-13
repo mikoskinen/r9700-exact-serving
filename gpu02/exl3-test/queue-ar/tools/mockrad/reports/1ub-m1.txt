@@ -1,0 +1,21 @@
+MOCKRUN REPORT 1ub-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/1ub/staged-item-1ub.sh | body rc 0 | 25 s | knobs: X1UB_SW=0 X1UB_IMAGE=radiance-local:ds41-int10-f6ef7cc3-5c13e555-l X1UB_EGEN=128 X1UB_DDUR=12 X1UB_DWARM=4 X1UB_C4GENS=1 X1UB_BUDGET_MIN=120 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/1ub | 12 RESULT lines, 5 mock requests | last RESULT: x1ub 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzzzzz-1ub: done (0 min) -- /tmp/mockrad/1ub-m1/home/gpu/ds41/exl3-test/runs/xdsm/1ub | 2 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x x1ub 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzzzzz-1ub: start IMAGE=radiance-local:ds41-int10-f6ef7cc3-5c13e555-l (583c9743aa90) | VIRHE X1UB_SW=0: NO int9 / int9b / int10 / int11 / int11b switch posted, the XP counters INFO (a mock run only) | SCREEN start: NST 5 stack5 start (stack4's + RADIANCE_LOG_STEPS=1, E1 declared off, HB ranks 1,2) + RADIANCE_DS41_MHC_FUSE=0 (M1 declared) + the 1u item's RADIANCE_DS41_GQ=3 / RADIANCE_DS41_E2=1 (declared, pinned 0) + RADIANCE_XPREFETCH=1 (the ring) + RADIANCE_DS41_XP=1 (lever 1U-XP linked) | KVR OFF (RADIANCE_DS41_KV_REPLICATED unset), SP off | base pin = stack5's S5T with draft_sample 0 + SP pinned (stage_full_min 0, stage_full_pick 0) + M1 on / IX off / d
+  1x x1ub x1ub-n5 read back: env MHC_FUSE=0 / GQ=3 / E2=1 / XP=1 / XPREFETCH=1 5 of 5, KV_REPLICATED 0 (want 0), ARCODED 0 (want 0), DECODE_ROW_CAP 0 (want 0: CAP48 comes by fn4) | KVR declare line: none (off) | M1: deepseek41: lever M1 (mhc_fuse) declared (RADIANCE_DS41_MHC_FUSE, fn4 mhc_fuse, now 0): mhc_post_collapse_rmsnorm_mix beside 77 of 77 mhc_post_collapse_rmsnorm (pcn_a / pcn_f: the post, the next connection's collapse + norm and its mhc_mix in one op); 1 = launches of >= 512 rows fused, N >= 2 = of > | XP: mock: lever 1U-XP (ds41_xp  RADIANCE_DS41_XP  now 1) linked | 'expert prefetch on' on 1 of 4 ranks -- VIRHE the start's words are not read back
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 39232 linked real files, 2 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/1u/dry-1u-int10.txt (size 98284 -> 1439)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 244547 -> 245107)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

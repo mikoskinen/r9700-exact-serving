@@ -1,0 +1,26 @@
+MOCKRUN REPORT zepbz2-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zepbz2.sh | body rc 0 | 304 s | knobs: XE2_SW=0 XE2_EGEN=128 XE2_C8WIN=8 XE2_C8WARM=4 XE2_BUDGET_MIN=120 XE2_NREADS=1 XE2_LDPF=2000 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/epb2 | 129 RESULT lines, 535 mock requests | last RESULT: xep2 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zepbz2: done (4 min) -- /tmp/mockrad/zepbz2-m1/home/gpu/ds41/exl3-test/runs/xdsm/epb2 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 240 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (2)
+    2026-11-12 18:50:03 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xep2-p0-moe_gather_all_reduce_sl-1643123 --network none --device /dev/kfd --device /dev/dri --security-opt 
+    2026-11-12 18:50:03 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xep2-p0-moe_scatter_placed_i32-1643123 --network none --device /dev/kfd --device /dev/dri --security-opt se
+  unknown endpoints: none
+  fn4 POSTs refused: 2 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41280 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yd2m/predry.txt (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/dry-pre.txt (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zepb.sh.out (size 26026 -> 34177)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 765440 -> 774402)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/epb/mb.jsonl (size 4426 -> 6212)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/epb/blocks.jsonl (size 0 -> 13173)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/epb/c8/c8-6-S-E4.txt (size 0 -> 1024)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

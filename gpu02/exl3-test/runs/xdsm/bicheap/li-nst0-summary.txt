@@ -1,0 +1,1 @@
+a1-s3-vs-d0: IDENTICAL (20 of 20) | a2-vs-a1: IDENTICAL (20 of 20) | c4a-vs-a1-s3: IDENTICAL (20 of 20) | c4b-vs-c4a-s3: IDENTICAL (20 of 20) | ld-vs-a1-s3: IDENTICAL (20 of 20) | ld-vs-d0: IDENTICAL (20 of 20) | load ld-s3: c4 28 requests (0 errors), 20 of 20 prefills cold ~31416 tok TTFT 18.39 s, in flight median 90 %, mixed steps a probe min 1 / median 7.0

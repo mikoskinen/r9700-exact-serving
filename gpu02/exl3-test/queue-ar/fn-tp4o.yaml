@@ -1,0 +1,45 @@
+# fn-tp4o.yaml (8.11.2026, queue-ar; for 94-fn-tp4noovl.sh / 95-fn-tp4pf.sh; = fn-tp4w.yaml + RADIANCE_AQL_NO_OVERLAP + RADIANCE_PROFILE_EVERY) -- Qwen3.8-Flash-Next TEST server, NOT production: its own project /
+# container (radiance-fntest3), port 127.0.0.1:8090 (the harness tools' default), restart "no", no key. The serve line =
+# flashnext-prod-dp-a.yaml's as fn-tp2.yaml carries it (wht6 min-kb 128, fp8 KV, prefix 61440 TTL 8 h, 512 keep-all
+# checkpoints, MTP 3, MNBT 2048, the reasoning flags) except: --tp ${TP} (3; 4 for the optional TP4 arm), --placement
+# ${PLACE} (all_vram: every expert resident, no host pool) instead of expert_tiered + --host-pool-mib 16384,
+# --max-model-len ${MML} with ${ROPE} (262144 without yarn; 524288 with yarn:2), --ngram-placement ram (a private table,
+# not production's shared /dev/shm file), no --api-key-env, MAXSEQS / EXTRA from the item.
+# Cards (ROCR_VISIBLE_DEVICES, ${CARDS}): 3 cards = c3:00 + 86:00 + 03:00, one per IOD root complex (c0 / 80 / 00); 83 and
+# 86 share root complex 80 (3.11. pari-dma: 17.6 GB/s H2D each when both copy at once vs 27.9 on the other pairs).
+# Rank order = the list order: rank 2 (03:00) is the attention-zero rank (TP3.md: attention on 2 ranks over the 2 KV heads).
+# Profiling (the stamp arms): RADIANCE_AQL_STAMP (every Nth played pass on card 0 timed) into /stats/stamps.csv, /stats = the
+# item's ${STATSDIR} (made by the item before up); RADIANCE_AQL_ACQ (tuned3x image only) passed when set; NST = MTP depth.
+name: radiance-fntest3
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${FNIMAGE:?set FNIMAGE}
+    container_name: radiance-fntest3
+    restart: "no"
+    volumes:
+      - ${FNMODELDIR:?set FNMODELDIR}:/models:ro
+      - ${STATSDIR:-/tmp}:/stats
+    environment:
+      ROCR_VISIBLE_DEVICES: "${CARDS:?set CARDS}"
+      RADIANCE_AQL_STAMP: ${AQLSTAMP:-}
+      RADIANCE_AQL_STAMP_OUT: /stats/stamps.csv
+      RADIANCE_AQL_STAMP_CARDS: ${AQLCARDS:-}
+      RADIANCE_AQL_NO_OVERLAP: ${NOOVL:-}
+      RADIANCE_PROFILE_EVERY: ${PROFEVERY:-}
+      RADIANCE_AQL_ACQ:
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${FNMODEL:?set FNMODEL} --served-model-name qwen3.8-flash-next
+      --host 127.0.0.1 --port 8090
+      --tp ${TP:-3} --tp-wire wht6 --tp-wire-min-kb ${WIREKB:-128} --max-num-seqs ${MAXSEQS:-16} --max-model-len ${MML:-262144} ${ROPE:-}
+      --placement ${PLACE:-all_vram} --gpu-headroom-mib 96
+      --kv-cache-dtype fp8
+      --ngram-placement ram
+      --prefix-cache-mib 61440 --prefix-cache-ttl 28800
+      --checkpoint-slots 512 --checkpoint-policy keep-all
+      --num-speculative-tokens ${NST:-3} --max-num-batched-tokens ${MNBT:-2048}
+      --reasoning-effort medium --reasoning-effort-map high=xhigh
+      --thinking-token-budget 16000 --default-max-tokens 32768
+      ${EXTRA:-}

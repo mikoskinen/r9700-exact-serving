@@ -1,0 +1,25 @@
+radiance:attn_cached_tokens_total{model_name="qwen3.8-flash-next",engine="0"}                        delta    20835260.00
+radiance:decode_tokens_total{model_name="qwen3.8-flash-next",engine="0"}                             delta      160337.00
+radiance:draft_accepted_total{model_name="qwen3.8-flash-next",engine="0"}                            delta       82093.00
+radiance:draft_tokens_total{model_name="qwen3.8-flash-next",engine="0"}                              delta      234732.00
+radiance:engine_step_seconds_decode_total{model_name="qwen3.8-flash-next",engine="0"}                delta         293.59
+radiance:engine_step_seconds_total{model_name="qwen3.8-flash-next",engine="0"}                       delta         566.79
+radiance:engine_steps_ahead_total{model_name="qwen3.8-flash-next",engine="0"}                        delta       12426.00
+radiance:engine_steps_decode_total{model_name="qwen3.8-flash-next",engine="0"}                       delta       12610.00
+radiance:engine_steps_held_total{model_name="qwen3.8-flash-next",engine="0"}                         delta           0.00
+radiance:engine_steps_mixed_total{model_name="qwen3.8-flash-next",engine="0"}                        delta        1154.00
+radiance:engine_steps_prefill_total{model_name="qwen3.8-flash-next",engine="0"}                      delta          74.00
+radiance:engine_steps_total{model_name="qwen3.8-flash-next",engine="0"}                              delta       13838.00
+radiance:kv_stream_bytes_total{model_name="qwen3.8-flash-next",engine="0",dir="in"}                  delta           0.00
+radiance:kv_stream_misses_total{model_name="qwen3.8-flash-next",engine="0"}                          delta           0.00
+radiance:num_requests_preempted{model_name="qwen3.8-flash-next",engine="0"}                          delta           0.00
+radiance:preempt_forced_total{model_name="qwen3.8-flash-next",engine="0"}                            delta           0.00
+radiance:prefill_tokens_total{model_name="qwen3.8-flash-next",engine="0"}                            delta     1788844.00
+radiance:prefix_hit_cut_tokens_total{model_name="qwen3.8-flash-next",engine="0"}                     delta      135612.00
+radiance:prefix_hit_cuts_total{model_name="qwen3.8-flash-next",engine="0",reason="adopt_failed"}     delta           0.00
+radiance:prefix_hit_cuts_total{model_name="qwen3.8-flash-next",engine="0",reason="no_snapshot"}      delta           1.00
+radiance:prefix_hit_cuts_total{model_name="qwen3.8-flash-next",engine="0",reason="resumed_below"}    delta           5.00
+radiance:prefix_hit_cuts_total{model_name="qwen3.8-flash-next",engine="0",reason="windowed_group"}   delta           0.00
+radiance:prefix_restore_cuts_total{model_name="qwen3.8-flash-next",engine="0"}                       delta           0.00
+vllm:num_preemptions_total{model_name="qwen3.8-flash-next",engine="0"}                               delta           0.00
+DERIVED decode steps 12610, 23.3 ms/decode step; all steps 13838, 41.0 ms/step, busy 567 s; decode tokens 160337 = 12.72 per decode step; draft acceptance 0.350

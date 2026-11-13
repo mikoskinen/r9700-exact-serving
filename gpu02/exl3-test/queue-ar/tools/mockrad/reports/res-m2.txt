@@ -1,0 +1,23 @@
+MOCKRUN REPORT res-m2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzz-res.sh | body rc 0 | 386 s | knobs: XRS_SW=0 XRS_EGEN=128 XRS_C8WIN=8 XRS_C8WARM=4 XRS_BUDGET_MIN=120 XRS_ARMS=BASE SHADOW32 NGSHARE_DIR=/tmp/mockrad/res-m2/ngdir NGSHARE_RUN=/tmp/mockrad/res-m2/ngrun NGSHARE_LOG=/tmp/mockrad/res-m2/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/res12 | 78 RESULT lines, 168 mock requests | last RESULT: xres 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzz-res: done (6 min) -- /tmp/mockrad/res-m2/home/gpu/ds41/exl3-test/runs/xdsm/res12 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x ngshare xres-BASE: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  1x ngshare xres-SHADOW32: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 240 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 2 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 40842 linked real files, 4 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzz-prof2.sh.out (size 20487 -> 66405)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 9505 -> 9711)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 635847 -> 646669)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/prof12/p2/p-prof.out (size 0 -> 32323)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

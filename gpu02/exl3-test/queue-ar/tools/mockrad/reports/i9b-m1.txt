@@ -1,0 +1,19 @@
+MOCKRUN REPORT i9b-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzz-i9b.sh | body rc 1 | 6 s | knobs: XI9_SW=0 XI9_SDEPTH=6000 XI9_SNTOK=32 XI9_C8DUR=12 XI9_C8WARM=4 XI9_PGEN=128 XI9_BUDGET_MIN=120 XI9_TOTAL_MIN=200 | faults: - | swaps: -
+output dirs (fresh): - | 0 RESULT lines, 0 mock requests | last RESULT: none
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (1)
+  /tmp/mockrad/i9b-m1/home/gpu/ds41/exl3-test/queue-ar/dsmain/i9b/dsm-i9b.sh: line 89: C8GENS: unbound variable
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 0 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 38176 linked real files, 1 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1106.csv (size 14818909 -> 14819061)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

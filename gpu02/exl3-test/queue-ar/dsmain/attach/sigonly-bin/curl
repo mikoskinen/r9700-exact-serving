@@ -1,0 +1,11 @@
+#!/bin/bash
+# curl (attach SIGONLY guard, 12.11.2026, queue-ar/dsmain/attach/sigonly-bin) -- first on PATH in a SIGONLY=1 DRYRUN=1 pass: GET only;
+# a POST / PUT / DELETE, a request body or an upload (a fn4 switch, a reset, a completion) is refused with exit 7.
+self=$(cd "$(dirname "$0")" && pwd)
+P=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$self" | paste -sd: -)
+real=$(PATH=$P command -v curl) || { echo "curl (sigonly guard): no curl on PATH" >&2; exit 7; }
+for a in "$@"; do
+  case $a in -X|--request|--request=*|-X?*|-d|-d?*|--data|--data*|-F|--form|--form*|-T|--upload-file*|--json*)
+    echo "curl (sigonly guard): refused in a SIGONLY pass: curl $*" | cut -c1-300 >&2; exit 7 ;; esac
+done
+exec "$real" "$@"

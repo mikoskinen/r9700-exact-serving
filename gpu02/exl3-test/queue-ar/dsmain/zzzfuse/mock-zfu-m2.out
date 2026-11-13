@@ -1,0 +1,33 @@
+2026-11-13 01:02:13 mockrun zfu-m2: farm: FARM {"copied": 7026, "linked": 42770, "dirlinks": 45, "skipped": 2, "seconds": 2.9}
+2026-11-13 01:02:14 mockrun zfu-m2: port 18091, sandbox /tmp/mockrad/zfu-m2, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzb-fuse.sh (sandbox copy), knobs: ZFU_SW=0 ZFU_C8WARM=4 ZFU_BUDGET_MIN=120 ZFU_LDPF=2048 ZFU_C8GN=1 ZFU_U1N=1 NGSHARE_DIR=/tmp/mockrad/zfu-m2/ngdir NGSHARE_RUN=/tmp/mockrad/zfu-m2/ngrun NGSHARE_LOG=/tmp/mockrad/zfu-m2/ngshare.log, faults: none, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-13 01:02:20 mockrun zfu-m2: DRYRUN rc 0, 232 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/zzzfuse
+2026-11-13 01:02:21 mockrun zfu-m2: run (timeout 3000 s)
+2026-11-13 01:08:27 mockrun zfu-m2: body rc 0 after 377 s
+MOCKRUN REPORT zfu-m2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzb-fuse.sh | body rc 0 | 377 s | knobs: ZFU_SW=0 ZFU_C8WARM=4 ZFU_BUDGET_MIN=120 ZFU_LDPF=2048 ZFU_C8GN=1 ZFU_U1N=1 NGSHARE_DIR=/tmp/mockrad/zfu-m2/ngdir NGSHARE_RUN=/tmp/mockrad/zfu-m2/ngrun NGSHARE_LOG=/tmp/mockrad/zfu-m2/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzzfuse | 120 RESULT lines, 410 mock requests | last RESULT: xzfuse 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzb-fuse: done (6 min) -- /tmp/mockrad/zfu-m2/home/gpu/ds41/exl3-test/runs/xdsm/zzzfuse | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (2)
+    2026-11-13 01:02:26 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xzfuse-p0-rfuse-3173704 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfine
+    2026-11-13 01:02:26 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xzfuse-p0-mixfin-3173704 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfin
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42768 linked real files, 8 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zzzfuse/mock-zfu-m2.out (size 0 -> 836)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzlaunch.sh.out (size 24147 -> 28729)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1401256 -> 1412339)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzzlaunch/mb.jsonl (size 0 -> 2675)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzzlaunch/identity.txt (size 240 -> 286)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzzlaunch/rco-readback.txt (size 543 -> 1003)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzzlaunch/xlch-ld-Z.txt (size 0 -> 3258)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzzlaunch/stats/stamps.csv (size 15589204 -> 73424586)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/zfu-m2.txt | sandbox: /tmp/mockrad/zfu-m2

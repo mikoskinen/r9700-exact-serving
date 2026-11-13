@@ -1,0 +1,14 @@
+K4 text 200: cold prompt 225917 tok, TTFT 56.00 s (A cold 87.52 s), snapshots 14, tail 223232
+  hit at 149144 tok (label 90000): K4 cached 145408 (want anchor 145408: OK) TTFT 1.56 s | A cached 145408 (want grid 145408: OK) TTFT 1.70 s | same resume as A (no fallback cost) | ident K-vs-coldA IDENTICAL (1586 chars), A-vs-coldA IDENTICAL (1586 chars)
+  hit at 94544 tok (label 58000): K4 cached 79872 (want anchor 79872: OK) TTFT 4.25 s | A cached 92160 (want grid 92160: OK) TTFT 1.21 s | extra +3.04 s over 3 chunks (12288 tokens) | ident K-vs-coldA IDENTICAL (1721 chars), A-vs-coldA IDENTICAL (1721 chars)
+  hit at 31344 tok (label 20000): K4 cached 30720 (want anchor 30720: OK) TTFT 0.51 s | A cached 30720 (want grid 30720: OK) TTFT 0.52 s | same resume as A (no fallback cost) | ident K-vs-coldA IDENTICAL (1795 chars), A-vs-coldA IDENTICAL (1795 chars)
+  tail hit: prompt 225917 cached 223232 (want 223232: OK) TTFT 1.56 s | ident IDENTICAL (1916 chars)
+  cold K vs A ident: IDENTICAL (1916 chars)
+  K4 fallback cost where the resume differs: +3.04 s / 3 chunks
+K8 text 400: cold prompt 129120 tok, TTFT 29.07 s (A cold 48.14 s), snapshots 4, tail 129024
+  hit at 83877 tok (label 90000): K8 cached 63488 (want anchor 63488: OK) TTFT 5.35 s | A cached 79872 (want grid 79872: OK) TTFT 1.62 s | extra +3.73 s over 4 chunks (16384 tokens) | ident K-vs-coldA IDENTICAL (1813 chars), A-vs-coldA IDENTICAL (1813 chars)
+  hit at 54912 tok (label 58000): K8 cached 30720 (want anchor 30720: OK) TTFT 5.86 s | A cached 51200 (want grid 51200: OK) TTFT 1.46 s | extra +4.40 s over 5 chunks (20480 tokens) | ident K-vs-coldA IDENTICAL (1936 chars), A-vs-coldA IDENTICAL (1936 chars)
+  hit at 19046 tok (label 20000): K8 cached 0 (want anchor 0: OK) TTFT 4.69 s | A cached 18432 (want grid 18432: OK) TTFT 0.50 s | extra +4.19 s over 4 chunks (18432 tokens) | ident K-vs-coldA IDENTICAL (1781 chars), A-vs-coldA IDENTICAL (1781 chars)
+  tail hit: prompt 129120 cached 129024 (want 129024: OK) TTFT 0.34 s | ident IDENTICAL (1900 chars)
+  cold K vs A ident: IDENTICAL (1900 chars)
+  K8 fallback cost where the resume differs: +3.73 s / 4 chunks; +4.40 s / 5 chunks; +4.19 s / 4 chunks

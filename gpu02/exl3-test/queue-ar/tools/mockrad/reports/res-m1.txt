@@ -1,0 +1,57 @@
+MOCKRUN REPORT res-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzz-res.sh | body rc 0 | 695 s | knobs: XRS_SW=0 XRS_EGEN=128 XRS_C8WIN=8 XRS_C8WARM=4 XRS_BUDGET_MIN=120 NGSHARE_DIR=/tmp/mockrad/res-m1/ngdir NGSHARE_RUN=/tmp/mockrad/res-m1/ngrun NGSHARE_LOG=/tmp/mockrad/res-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/res12 | 130 RESULT lines, 229 mock requests | last RESULT: xres 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzz-res: done (11 min) -- /tmp/mockrad/res-m1/home/gpu/ds41/exl3-test/runs/xdsm/res12 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (4)
+  1x ngshare xres-BASE: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  2x ngshare xres-GAIN2: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  1x ngshare xres-SHADOW32: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 480 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 4 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 40720 linked real files, 37 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/res12/mock-res-m1.out (size 0 -> 817)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzz-prof1.sh.out (size 2746 -> 28205)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 9001 -> 9303)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 597703 -> 617053)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/prof12/p2/identity.txt (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/prof12/p1/identity.txt (size 0 -> 126)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/prof12/p1/u1win.args (size 0 -> 976)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-bi5-engine.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sp4-T-engine.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-bicost2-engine.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-spprof-engine.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sp4-S-engine.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi2/bt-r1-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi2/bt-r3-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi2/bt-r2-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi2/bt-r0-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi/bt-r1-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi/bt-r3-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi/bt-r2-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi/bt-r0-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats198/bt-sp/bt-r1-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats198/bt-sp/bt-r1-7.names (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats198/bt-sp/bt-r0-7.names (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats198/bt-sp/bt-r3-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats198/bt-sp/bt-r2-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats198/bt-sp/bt-r3-7.names (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats198/bt-sp/bt-r0-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats198/bt-sp/bt-r2-7.names (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats203/bt-sp/bt-r1-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats203/bt-sp/bt-r1-7.names (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats203/bt-sp/bt-r0-7.names (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats203/bt-sp/bt-r3-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats203/bt-sp/bt-r2-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats203/bt-sp/bt-r3-7.names (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats203/bt-sp/bt-r0-7.bin (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats203/bt-sp/bt-r2-7.names (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue/queue-changes.log (size 174 -> 5871)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

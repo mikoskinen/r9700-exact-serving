@@ -1,0 +1,21 @@
+MOCKRUN REPORT zzk25-m3
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzk25.sh | body rc 0 | 7 s | knobs: ZZK_MOCK=1 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzk25 | 6 RESULT lines, 0 mock requests | last RESULT: zzk25: done -- /tmp/mockrad/zzk25-m3/home/gpu/ds41/exl3-test/runs/xdsm/zzk25; verdict: bytes FAIL
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x zzk25: VIRHE no 'K25 DONE ok' (rc 125: 124/137 = timeout, else a crash or a byte difference; tail: docker (mockrad shim): docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) )
+  1x zzk25: VIRHE k25probe exit 125
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 0 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (1)
+    2026-11-12 22:27:01 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name zzk25-2652580 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e ROCR_
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42227 linked real files, 1 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1136697 -> 1136849)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

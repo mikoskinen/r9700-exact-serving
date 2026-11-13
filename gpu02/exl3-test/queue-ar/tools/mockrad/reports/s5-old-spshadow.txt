@@ -1,0 +1,29 @@
+MOCKRUN REPORT s5-old-spshadow
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-uzzzz-stack5.sh | body rc 0 | 248 s | knobs: XS5_DUR=12 XS5_WARM=4 XS5_ORDER0=AS XS5_ORDER1=T XS5_PORDER=AS XS5_LORDER=A XS5_DEPTHS=12000 6000 XS5_LDEPTH=6000 XS5_GDEP=4000 XS5_CDEPTH=6000 XS5_CNTOK=48 (--decode-scale 0.3) | faults: - | swaps: gpu/ds41/exl3-test/queue-ar/dsmain/stack5/s5blocks.py=...s5blocks.py.bak-20261112-spshadow (54bc8e52)
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/stack5 | 102 RESULT lines, 530 mock requests | last RESULT: xs5 57-p4zyzzzzz-ds-r00zzz-cz-uzzzz-stack5: done (3 min) -- /tmp/mockrad/s5-old-spshadow/home/gpu/ds41/exl3-test/runs/xdsm/stack5 | no VIRHE line
+
+TRACEBACKS (3 distinct)
+  body.out: (logged line only) xs5 s5-n5 t0 Traceback (most recent call last): (+1 more place(s))
+  body.out: (logged line only) xs5 s5-n5 t1 Traceback (most recent call last): (+1 more place(s))
+  home/gpu/ds41/exl3-test/runs/xdsm/stack5/s5-n5-t1-blocks.txt: TypeError: unsupported operand type(s) for +: 'dict' and 'str' (+1 more place(s))
+      at File "/tmp/mockrad/s5-old-spshadow/home/gpu/ds41/exl3-test/queue-ar/dsmain/stack5/s5blocks.py", line 416, in main :: snap1 = fullsnap(a, sp + "-1")
+  NOTE: 2 RESULT line(s) carry a Traceback WITHOUT a VIRHE -- the body does not count a crashed helper as VIRHE: xs5 s5-n5 t0 Traceback (most recent call last): | xs5 s5-n5 t1 Traceback (most recent call last):
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 80 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 4 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 37917 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r00zzz-cz-x-kvrz-sp.sh.out (size 110550 -> 137042)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1106.csv (size 14733452 -> 14740153)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after2.out (size 45353 -> 45549)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/sp/sp-d64000-5S.out (size 0 -> 137)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/sp/guard.txt (size 11749 -> 15563)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/sp/identity.txt (size 677 -> 1197)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/sp/deep.jsonl (size 2232 -> 3345)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

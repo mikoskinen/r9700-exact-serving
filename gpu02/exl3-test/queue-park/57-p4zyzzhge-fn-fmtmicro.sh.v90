@@ -1,0 +1,244 @@
+#!/bin/bash
+# 90-fn-tp4-fmt-micro.sh (queue item, 8.11.2026, queue-ar; gpu02, ONE card, every radiance container DOWN; ~10 min) --
+# Qwen3.8-Flash-Next's routed-expert GEMMs at TP4 shapes: is production's iq4r expert GEMM (libr4d moe_gemm_w4a8_mod4,
+# w4nl64a8h: 4-bit codes expanded to E4M3 by byte permutes, fp8 activations, v_wmma_f32_16x16x16_fp8_fp8) bandwidth-,
+# latency- or issue-bound at TP4's quarter-size slices, and would the one format with better measured quality (EXL3 4.05,
+# ref64 KL 0.0467 vs production 0.0537) or EXL3 5.05 (K5) be faster there?
+# Engine readings this item explains (1.15.1, card 0): TP4 1u gate_up 29.8 us / down 17.5 us a call (synced per-op
+# profile, ~26 live experts -> ~367 / ~313 GB/s); 8 users gate_up 159.1 / down 88.9 us (stamps, ~146 live -> ~388 /
+# ~347 GB/s) where TP2 reads ~569 / ~572 GB/s on the same load. Prefill caps at ~7.7k tok/s at TP3 and TP4 alike.
+# Harness: perfmoe (gu25 build, md5 b088bd01; radiance-exl3 tools/perfmoe.cpp): 48 layers of routing draws over 2
+# real-size pools (every dispatch streams from DRAM), 500 ms clock warm-up, both libraries on the SAME routing in one
+# process, ABAB, 5 reps; RESULT = median us a layer's chain and GB/s of the chain's weight bytes. Decode routing is the
+# MTP-verify model (--group 4 --group-mix 0.53: ~26 live experts at M=4, ~146 at M=32, P4b's verify reading).
+#   A  TP4 --mod4 rank 0 chain (libr4d gate_up -> gated_had_quant_fp8 -> down; exl3r4d gate_up -> down), h_rot 1,
+#      M 1 2 4 8 16 (decode band) and 32 64 (prefill band rows, as the engine takes them past 16), K 4 and 5
+#   B  the fused exl3 gate_up_down mod4 row (--gd, byte-checked against its chain), K4, M 4 8 16
+#   C  K-sweep at M 4 and 32 (--hidden 1280 / 2560 / 5120): intercept us + slope GB/s per library -> latency share
+#   D  cache-resident control (--pools 1 --layers 1) at M 4 and 32: a DRAM-bound kernel speeds up, an issue/latency-
+#      bound one does not
+#   E  TP2 rank-0 anchor (the parity split production runs today) at M 4 and 32
+#   F  expert parallelism at TP4 (whole experts, 128 a rank, the slowest rank a layer: --tp 1 --ep 4 --ep-rank -1,
+#      --ep-param), M 4 and 32: the -fnx2 EXL3 layout, and the same layout for libr4d as a what-if
+#   G  prefill chains, independent draw: TP4 mod4 M 2048 / 4096 / 8192 at K 4 and 5, TP2 M 2048 (the P10 anchor:
+#      libr4d 1004.6 + 750.1 us), EP-4 M 4096 -> us a layer and TFLOP/s a rank against the WMMA rates (fp8 412, f16 199)
+# Result lines (RESULT fn-fmt ...): per arm both libraries' us, GB/s (% of 640) and their ratio; the K-sweep fit; the
+# hot/cold ratio; prefill TFLOP/s; two verdict lines (decode: latency share at TP4; prefill: issue- vs DRAM-bound).
+# Inputs: bin-gu25 (perfmoe b088bd01, exl3r4d-gu25c.so aa4703c9, as 83 used); IMAGE radiance-local:ds41-exl3-117-
+# abf7f9a0-f2f3c3f7 (6e63a9ccd389: ROCm runtime + its kernels/libr4d.so for --r4d, the 1.17 line's libr4d; 1.15.1's
+# libr4d is ABI 32 against perfmoe's 35 and is NOT loaded here). Every run bounded (timeout -k 15 300, --init, named,
+# rm -f), --network none, one card. A failed run is logged with its rc and the item goes on.
+# Guards: no radiance container, KFD idle (60 s wait), bins (md5) + image id.
+# DRYRUN=1 bash 90-fn-tp4-fmt-micro.sh : prints every command, runs and writes nothing.
+# X90_SUMMARY_ONLY=1 X90_OUT=<dir> bash 90-fn-tp4-fmt-micro.sh : the summary of existing outputs only (no GPU).
+set -u
+DRY=${DRYRUN:-0}
+Q=$(cd "$(dirname "$0")" && pwd)
+B=${X90_BIN:-}
+for c in "$Q/bin-gu25" "$HOME/gpu/ds41/exl3-test/queue/done/bin-gu25" "$HOME/gpu/ds41/exl3-test/queue/bin-gu25"; do
+  [ -z "$B" ] && [ -e "$c/perfmoe" ] && [ -e "$c/exl3r4d-gu25c.so" ] && B=$(cd "$c" && pwd)
+done
+B=${B:-$HOME/gpu/ds41/exl3-test/queue/done/bin-gu25}
+O=${X90_OUT:-$HOME/gpu/ds41/exl3-test/runs/fn-tp4-fmt}
+L=${X90_LOG:-$HOME/gpu/ds41/exl3-test/runs/ds41-exl3.log}
+IMAGE=${X90_IMAGE:-radiance-local:ds41-exl3-117-abf7f9a0-f2f3c3f7}
+IMGID=6e63a9ccd389
+R4D=/opt/radiance/share/radiance/kernels/libr4d.so
+CARD=${CARD:-0}
+FN="--experts 512 --topk 10 --hidden 2560 --width 640 --warm-ms 500 --iters 4 --reps 5 --pooled 0 --ceiling 640"
+VER="--group 4 --group-mix 0.53"
+T4="--tp 4 --mod4 --rank 0 --chain --h-rot 1"
+DEV="--network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e HIP_VISIBLE_DEVICES=$CARD"
+log() { if [ "$DRY" = 1 ]; then echo "[dry, not logged] $(date '+%F %T') $*"; else echo "$(date '+%F %T') $*" | tee -a "$L"; fi; }
+run() { if [ "$DRY" = 1 ]; then echo "+ $*"; else eval "$@"; fi; }
+pm() {   # pm OUTFILE perfmoe-args...  (both libraries: --exl3 and --r4d on every run)
+  local out=$1; shift
+  local cn=fnfmt-$$-$RANDOM
+  run "timeout -k 15 300 docker run --rm --init --stop-timeout 10 --name $cn $DEV -v $B:/b:ro --entrypoint /b/perfmoe $IMAGE --exl3 /b/exl3r4d-gu25c.so --r4d $R4D $* > $out 2>&1; rc=\$?; docker rm -f $cn > /dev/null 2>&1; [ \$rc = 0 ] || echo \"\$(date '+%F %T') RESULT fn-fmt: run $(basename $out) rc \$rc (kept: $out)\" | tee -a $L"
+}
+
+if [ "${X90_SUMMARY_ONLY:-0}" != 1 ]; then
+  if [ "$DRY" != 1 ]; then
+    docker ps --format '{{.Names}}' | grep -qi radiance && { log "RESULT fn-fmt: VIRHE a radiance container is running -- not now"; exit 1; }
+    for w in $(seq 1 30); do [ -z "$(ls -A /sys/class/kfd/kfd/proc 2>/dev/null)" ] && break; sleep 2; done
+    [ -z "$(ls -A /sys/class/kfd/kfd/proc 2>/dev/null)" ] || { log "RESULT fn-fmt: VIRHE a KFD client is running (after 60 s wait)"; exit 1; }
+    for f in perfmoe exl3r4d-gu25c.so; do [ -e "$B/$f" ] || { log "RESULT fn-fmt: VIRHE $B/$f missing"; exit 1; }; done
+    [ "$(md5sum "$B/exl3r4d-gu25c.so" | cut -c1-8)" = aa4703c9 ] || { log "RESULT fn-fmt: VIRHE gu25c md5 is not aa4703c9"; exit 1; }
+    [ "$(md5sum "$B/perfmoe" | cut -c1-8)" = b088bd01 ] || { log "RESULT fn-fmt: VIRHE perfmoe md5 is not b088bd01"; exit 1; }
+    id=$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null | cut -d: -f2 | cut -c1-12)
+    [ "$id" = "$IMGID" ] || { log "RESULT fn-fmt: VIRHE image $IMAGE is '$id', not $IMGID"; exit 1; }
+    mkdir -p "$O"
+  else
+    echo "+ mkdir -p $O"
+  fi
+  log "RESULT fn-fmt: start IMAGE=$IMAGE ($IMGID) card $CARD bin $B -> $O (Flash-Next: $FN; decode routing $VER)"
+  # A: TP4 mod4 decode chains, both libraries, K4 / K5 (the exl3 side; libr4d is its w4 form whatever K is)
+  for k in 4 5; do for m in 1 2 4 8 16 32 64; do
+    band=""; [ $m -gt 16 ] && band="--chain-band _pf"
+    pm $O/a-k$k-m$m.txt $T4 $band --M $m --bits $k $VER $FN
+  done; done
+  # B: exl3's fused four-class gate_up_down (interface v7) beside the chains
+  for m in 4 8 16; do pm $O/gd-k4-m$m.txt $T4 --gd --M $m --bits 4 $VER $FN; done
+  # C: K-sweep (hidden = gate_up's K and down's N): 2560 is A's run
+  for m in 4 32; do for h in 1280 5120; do
+    band=""; [ $m -gt 16 ] && band="--chain-band _pf"
+    pm $O/ks-h$h-m$m.txt $T4 $band --M $m --bits 4 $VER ${FN/--hidden 2560/--hidden $h}
+  done; done
+  # D: cache-resident control (one layer, one pool: the same experts again)
+  for m in 4 32; do
+    band=""; [ $m -gt 16 ] && band="--chain-band _pf"
+    pm $O/hot-m$m.txt $T4 $band --M $m --bits 4 $VER $FN --pools 1 --layers 1
+  done
+  # E: TP2 rank-0 anchor (parity split, production's TP2 geometry)
+  for m in 4 32; do
+    band=""; [ $m -gt 16 ] && band="--chain-band _pf"
+    pm $O/tp2-m$m.txt --tp 2 --rank 0 --chain --h-rot 1 $band --M $m --bits 4 $VER $FN
+  done
+  # F: expert parallelism at TP4: whole experts, 128 a rank, the slowest rank a layer
+  for m in 4 32; do
+    band=""; [ $m -gt 16 ] && band="--chain-band _pf"
+    pm $O/ep-m$m.txt --tp 1 --ep 4 --ep-rank -1 --ep-param --chain --h-rot 1 $band --M $m --bits 4 $VER ${FN/--experts 512/--experts 128}
+  done
+  # G: prefill chains (independent draw)
+  for k in 4 5; do for m in 2048 4096 8192; do
+    pm $O/pf-k$k-m$m.txt $T4 --chain-band _pf --M $m --bits $k $FN
+  done; done
+  pm $O/pf-tp2-k4-m2048.txt --tp 2 --rank 0 --chain --h-rot 1 --chain-band _pf --M 2048 --bits 4 $FN
+  pm $O/pf-ep-k4-m4096.txt --tp 1 --ep 4 --ep-rank -1 --ep-param --chain --h-rot 1 --chain-band _pf --M 4096 --bits 4 ${FN/--experts 512/--experts 128}
+  [ "$DRY" = 1 ] && { log "RESULT fn-fmt: dry run done (35 perfmoe runs)"; exit 0; }
+fi
+
+python3 -I - "$O" <<'PY' | while read -r line; do if [ "$DRY" = 1 ]; then echo "$line"; else log "$line"; fi; done
+import math, os, re, sys
+O = sys.argv[1]
+RX = re.compile(r"RESULT\s+(.+?)\s+(\S+)\s+tp(\d)\s+M=(\d+)\s+([\d.]+) us \[[^\]]*\]\s+([\d.]+) GB/s \[[^\]]*\]\s+([\d.]+) MB/dispatch")
+def res(name):
+    """{library: (us, GB/s, MB)} of one output file; library 'libr4d' / 'exl3r4d' / 'exl3r4d gd'."""
+    out = {}
+    try:
+        for l in open(os.path.join(O, name)):
+            m = RX.search(l)
+            if not m: continue
+            lib = m.group(1).strip()
+            key = "libr4d" if lib.startswith("libr4d") else ("exl3r4d gd" if "gd" in lib.split() else "exl3r4d")
+            out[key] = (float(m.group(5)), float(m.group(6)), float(m.group(7)))
+    except OSError:
+        pass
+    return out
+PEAK = 640.0
+def f(v, unit=" us"): return "-" if v is None else f"{v:.1f}{unit}"
+def g(r, lib):
+    v = r.get(lib)
+    return "-" if not v else f"{v[0]:.1f} us {v[1]:.0f} GB/s ({100 * v[1] / PEAK:.0f} %)"
+# A
+for k in (4, 5):
+    parts = []
+    for m in (1, 2, 4, 8, 16, 32, 64):
+        r = res(f"a-k{k}-m{m}.txt")
+        if not r: parts.append(f"M{m} -"); continue
+        a, b = r.get("libr4d"), r.get("exl3r4d")
+        ratio = f" exl3/libr4d {b[0] / a[0]:.2f}" if a and b else ""
+        parts.append(f"M{m}: libr4d {g(r, 'libr4d')} | exl3 K{k} {g(r, 'exl3r4d')}{ratio}")
+    print(f"RESULT fn-fmt A TP4 mod4 rank 0 decode chain a layer (verify routing), K{k}: " + "; ".join(parts))
+# B
+parts = []
+for m in (4, 8, 16):
+    r = res(f"gd-k4-m{m}.txt")
+    parts.append(f"M{m}: fused gd {g(r, 'exl3r4d gd')} vs exl3 chain {g(r, 'exl3r4d')} vs libr4d chain {g(r, 'libr4d')}")
+print("RESULT fn-fmt B fused exl3 gate_up_down mod4 (K4): " + "; ".join(parts))
+# C: us = a + MB / slope over the three hidden sizes
+def fit(pts):
+    if len(pts) < 2: return None
+    n = len(pts); sx = sum(p[0] for p in pts); sy = sum(p[1] for p in pts)
+    sxx = sum(p[0] ** 2 for p in pts); sxy = sum(p[0] * p[1] for p in pts)
+    d = n * sxx - sx * sx
+    if d <= 0: return None
+    b = (n * sxy - sx * sy) / d; a = (sy - b * sx) / n
+    return a, (1e3 / b if b > 0 else float("inf"))   # MB/us slope -> GB/s
+lat = {}
+for m in (4, 32):
+    parts = []
+    for lib in ("libr4d", "exl3r4d"):
+        pts = []
+        for h, fn in ((1280, f"ks-h1280-m{m}.txt"), (2560, f"a-k4-m{m}.txt"), (5120, f"ks-h5120-m{m}.txt")):
+            v = res(fn).get(lib)
+            if v: pts.append((v[2], v[0]))
+        ft = fit(pts)
+        base = res(f"a-k4-m{m}.txt").get(lib)
+        if ft and base:
+            share = 100 * ft[0] / base[0]
+            lat[(lib, m)] = share
+            parts.append(f"{lib}: intercept {ft[0]:.1f} us ({share:.0f} % of the 2560 chain {base[0]:.1f} us), slope {ft[1]:.0f} GB/s")
+        else:
+            parts.append(f"{lib}: -")
+    print(f"RESULT fn-fmt C K-sweep TP4 mod4 M{m} (hidden 1280/2560/5120): " + "; ".join(parts))
+# D
+parts = []
+for m in (4, 32):
+    hot, cold = res(f"hot-m{m}.txt"), res(f"a-k4-m{m}.txt")
+    for lib in ("libr4d", "exl3r4d"):
+        h, c = hot.get(lib), cold.get(lib)
+        parts.append(f"M{m} {lib} cold {f(c and c[0])} -> cache-resident {f(h and h[0])}" + (f" ({100 * (h[0] / c[0] - 1):+.0f} %)" if h and c else ""))
+print("RESULT fn-fmt D cache-resident control (a DRAM-bound kernel speeds up): " + "; ".join(parts))
+# E + efficiency loss TP2 -> TP4
+parts = []
+eff = {}
+for m in (4, 32):
+    t2, t4 = res(f"tp2-m{m}.txt"), res(f"a-k4-m{m}.txt")
+    for lib in ("libr4d", "exl3r4d"):
+        a, b = t2.get(lib), t4.get(lib)
+        if a and b:
+            eff[(lib, m)] = b[1] / a[1]
+            parts.append(f"M{m} {lib}: TP2 {a[0]:.1f} us {a[1]:.0f} GB/s -> TP4 {b[0]:.1f} us {b[1]:.0f} GB/s (x{b[1] / a[1]:.2f} of TP2's rate; bytes x{b[2] / a[2]:.2f}, time x{b[0] / a[0]:.2f})")
+print("RESULT fn-fmt E TP2 rank-0 anchor vs TP4 mod4: " + "; ".join(parts))
+# F
+parts = []
+for m in (4, 32):
+    ep, md = res(f"ep-m{m}.txt"), res(f"a-k4-m{m}.txt")
+    for lib in ("libr4d", "exl3r4d"):
+        e, d = ep.get(lib), md.get(lib)
+        parts.append(f"M{m} {lib}: EP-4 slowest rank {f(e and e[0])} vs mod4 {f(d and d[0])}" + (f" ({100 * (e[0] / d[0] - 1):+.0f} %)" if e and d else ""))
+print("RESULT fn-fmt F expert parallel at TP4 (whole experts, slowest rank a layer): " + "; ".join(parts))
+# G: FLOPs a layer's chain a rank: rows = M x 10; a row costs 6 x 2560 x w (gate_up 2 x 2560 x 2w + down 2 x 2560 x w)
+#    TP4 mod4 rank 0: mean w = (256 + 3 x 128) / 4 = 160; TP2 rank 0: (384 + 256) / 2 = 320; EP-4: w 640 over the
+#    mean rank's quarter of the rows (the slowest rank has more: a lower bound on its rate)
+RATE = {"libr4d": 412.0, "exl3r4d": 199.0}
+def tf(us, m, w, frac=1.0): return m * 10 * frac * 6 * 2560 * w / (us * 1e-6) / 1e12
+parts = []
+pf = {}
+for k in (4, 5):
+    for m in (2048, 4096, 8192):
+        r = res(f"pf-k{k}-m{m}.txt")
+        for lib in ("libr4d", "exl3r4d"):
+            v = r.get(lib)
+            if lib == "libr4d" and k == 5: continue
+            if v:
+                t = tf(v[0], m, 160)
+                pf[(lib, k, m)] = v[0]
+                parts.append(f"{lib if lib == 'libr4d' else 'exl3 K' + str(k)} M{m} {v[0]:.0f} us {t:.1f} TF/s ({100 * t / RATE[lib]:.0f} % of {RATE[lib]:.0f}) {v[1]:.0f} GB/s")
+r = res("pf-tp2-k4-m2048.txt")
+for lib in ("libr4d", "exl3r4d"):
+    v = r.get(lib)
+    if v: parts.append(f"TP2 {lib} M2048 {v[0]:.0f} us {tf(v[0], 2048, 320):.1f} TF/s")
+r = res("pf-ep-k4-m4096.txt")
+for lib in ("libr4d", "exl3r4d"):
+    v = r.get(lib)
+    if v: parts.append(f"EP-4 {lib} M4096 slowest rank {v[0]:.0f} us (>= {tf(v[0], 4096, 640, 0.25):.1f} TF/s)")
+print("RESULT fn-fmt G prefill chain a layer a rank: " + "; ".join(parts))
+# verdicts
+v = []
+for m in (4, 32):
+    s, e = lat.get(("libr4d", m)), eff.get(("libr4d", m))
+    if s is not None or e is not None:
+        tag = "LATENCY/FIXED-COST-BOUND" if (s or 0) >= 30 or (e or 1) <= 0.7 else "BANDWIDTH-BOUND"
+        v.append(f"M{m}: intercept {f(s, ' %')} of the chain, TP4 rate x{'-' if e is None else format(e, '.2f')} of TP2's -> {tag}")
+print("RESULT fn-fmt verdict decode (libr4d iq4r at TP4 mod4): " + ("; ".join(v) if v else "no data"))
+a, b = pf.get(("libr4d", 4, 2048)), pf.get(("libr4d", 4, 8192))
+if a and b:
+    t = tf(b, 8192, 160)
+    tag = "ISSUE-BOUND (time grows with M at fixed bytes)" if b / a >= 3.0 and t <= 0.25 * 412 else "check: neither rule holds"
+    print(f"RESULT fn-fmt verdict prefill (libr4d iq4r at TP4 mod4): M8192 / M2048 time x{b / a:.2f} for x4 rows and the same bytes, {t:.1f} TF/s = {100 * t / 412:.0f} % of the fp8 WMMA rate -> {tag}")
+else:
+    print("RESULT fn-fmt verdict prefill: no data")
+print(f"RESULT fn-fmt: done -- {O}")
+PY

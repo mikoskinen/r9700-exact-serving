@@ -1,0 +1,24 @@
+MOCKRUN REPORT att-real1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/attach/mock/sigprobe.sh | body rc 0 | 188 s | knobs: - | faults: - | swaps: gpu/ds41/exl3-test/queue/lib-pr266.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/staged/lib-pr266.sh gpu/ds41/exl3-test/queue-ar/dsmain/compose-guard.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/staged/compose-guard.sh gpu/ds41/exl3-test/queue-ar/dsmain/arc/dsm-arc.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/staged/bodies/dsm-arc.sh gpu/ds41/exl3-test/queue-ar/dsmain/spread/dsm-spread.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/staged/bodies/dsm-spread.sh
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/arc, gpu/ds41/exl3-test/runs/xdsm/spread, gpu/ds41/exl3-test/runs/xdsm/spread2 | 77 RESULT lines, 70 mock requests | last RESULT: chain-after: queue item 03-spread2.sh exit 0
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (4)
+  1x xspr 57-p4zyzzzzz-ds-r92z-spread: start IMAGE=radiance-local:ds41-int10-f6ef7cc3-5c13e555-l (583c9743aa90) | VIRHE XSPR_SW=0: NO mhc_fuse / ix_lds / ix_ni / draft_depth0 3 / stage_full_* / ds41_arcoded / sched_row_cap posted (a mock run only) | SPREAD start: NST 5 stack5 start (stack4's + RADIANCE_LOG_STEPS=1, E1 declared off, HB ranks 1,2) + RADIANCE_DS41_MHC_FUSE=0 (M1 declared) | KVR OFF (RADIANCE_DS41_KV_REPLICATED unset), SP off | base pin = stack5's S5T with draft_sample 0 + SP pinned (stage_full_min 0, stage_full_pick 0) + M1 on / IX off / draft_depth0 3 (int10: depth 0 by occupancy only) / sched_row_cap 48 (CAP48) {} + the fixed pin (ds41_psk_k 8; draft_lend 1) | NO ARMS: the pin wit
+  1x attach down: server 0008d59d (sig c9480ff2) down: 1 VIRHE line(s) since this item began (KEEP_VIRHE_OK=1 ignores them)
+  1x xspr spread2: start IMAGE=radiance-local:ds41-int10-f6ef7cc3-5c13e555-l (583c9743aa90) | VIRHE XSPR_SW=0: NO mhc_fuse / ix_lds / ix_ni / draft_depth0 3 / stage_full_* / ds41_arcoded / sched_row_cap posted (a mock run only) | SPREAD start: NST 5 stack5 start (stack4's + RADIANCE_LOG_STEPS=1, E1 declared off, HB ranks 1,2) + RADIANCE_DS41_MHC_FUSE=0 (M1 declared) | KVR OFF (RADIANCE_DS41_KV_REPLICATED unset), SP off | base pin = stack5's S5T with draft_sample 0 + SP pinned (stage_full_min 0, stage_full_pick 0) + M1 on / IX off / draft_depth0 3 (int10: depth 0 by occupancy only) / sched_row_cap 48 (CAP48) {} + the fixed pin (ds41_psk_k 8; draft_lend 1) | NO ARMS: the pin with ds41_arcoded 0 hel
+  1x attach down: server 0008e80d (sig c9480ff2) down: 1 VIRHE line(s) since this item began (KEEP_VIRHE_OK=1 ignores them)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 240 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 39504 linked real files, 3 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zz-ngreuse.sh.out (size 12989 -> 20003)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 315513 -> 320665)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/ngreuse/starts.jsonl (size 444 -> 1032)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

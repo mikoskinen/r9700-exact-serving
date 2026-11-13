@@ -1,0 +1,22 @@
+MOCKRUN REPORT p1-m3
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzz-prof1.sh | body rc 0 | 75 s | knobs: XP1_SW=0 XP1_EGEN=128 XP1_C8WIN=8 XP1_C8WARM=4 XP1_C16DUR=10 XP1_C16WARM=4 XP1_BUDGET_MIN=60 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/prof12/p1 | 31 RESULT lines, 110 mock requests | last RESULT: xp1 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzz-prof1: done (1 min) -- /tmp/mockrad/p1-m3/home/gpu/ds41/exl3-test/runs/xdsm/prof12/p1 | 1 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 40676 linked real files, 5 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/prof12/dry-prof2.txt (size 35445 -> 35560)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zz-fn-bi5.sh.out (size 1770 -> 1967)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 573937 -> 576065)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-bi5-total.txt (size 0 -> 694)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-bi5-blocks.jsonl (size 17157 -> 22878)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

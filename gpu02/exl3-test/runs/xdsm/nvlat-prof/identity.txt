@@ -1,0 +1,6 @@
+nv-aprof warm-up answers vs stock (x117-best524-warm-q.txt): IDENTICAL: 3 answers
+nv-aprof 28k copy p3A-cold vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-aprof 28k copy p3A-hit vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-bprof warm-up answers vs stock (x117-best524-warm-q.txt): IDENTICAL: 3 answers
+nv-bprof 28k copy p3B-cold vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-bprof 28k copy p3B-hit vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)

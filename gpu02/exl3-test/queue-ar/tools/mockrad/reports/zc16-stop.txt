@@ -1,0 +1,30 @@
+MOCKRUN REPORT zc16-stop
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzc-int16.sh | body rc 0 | 194 s | knobs: ZC16_SW=0 ZC16_C8WARM=4 ZC16_C4WARM=4 ZC16_BUDGET_MIN=120 ZC16_LDPF=2048 ZC16_C4GN=1 ZC16_U1N=1 ZC16_CDEPTH=16000 ZC16_COLDEST=1 NGSHARE_DIR=/tmp/mockrad/zc16-stop/ngdir NGSHARE_RUN=/tmp/mockrad/zc16-stop/ngrun NGSHARE_LOG=/tmp/mockrad/zc16-stop/ngshare.log ZC16_ZFA1=/tmp/mockrad/zc16-stop/home/gpu/ds41/exl3-test/queue-ar/dsmain/zzzc16/mock-ref/xzfuse-a1-B-altered.jsonl | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzzc16 | 49 RESULT lines, 129 mock requests | last RESULT: xzc16 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzc-int16: done (3 min) -- /tmp/mockrad/zc16-stop/home/gpu/ds41/exl3-test/runs/xdsm/zzzc16 | STOPPED at the identity gate (no speed block ran): NEEDS USER | 4 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (5)
+  1x ngshare xzc16-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  1x xzc16 identity a1-F-vs-zzzfuse-a1-B: VIRHE xzc16-a1-F-vs-zzzfuse-a1-B 1 of 20 answers differ: p3 char 40 tok 13 (strict, T 0 greedy)
+  1x xzc16 IDENTITY GATE: VIRHE strict identity failed [a1-F-vs-zzzfuse-a1-B] -> the item STOPS before every speed block (exact = byte-identical: NEEDS USER) | arm F {} on THE int16 PIN | the failing comparisons are in /tmp/mockrad/zc16-stop/home/gpu/ds41/exl3-test/runs/xdsm/zzzc16/identity.txt and /tmp/mockrad/zc16-stop/home/gpu/ds41/exl3-test/runs/xdsm/zzzc16/xzc16-*-cmp-*.json
+  1x xzc16 INT16 IDENTITY (strict, T 0 greedy, under F = THE int16 PIN): n5 warm-up IDENTICAL: 3 answers | a1-F-vs-ref12-a1 IDENTICAL: 20 of 20 answers | a1-F-vs-zzzfuse-a1-B 1 of 20 answers differ: p3 char 40 tok 13 | gs16-F-vs-a1-F IDENTICAL: 20 of 20 answers | ld-F-vs-a1-F IDENTICAL: 20 of 20 answers -> 4 of 5 IDENTICAL -- VIRHE a1-F-vs-zzzfuse-a1-B (the item STOPPED before the speed blocks)
+  1x xzc16 INT16 SUMMARY (STOPPED at the identity gate): identity 4/5 IDENTICAL (VIRHE: a1-F-vs-zzzfuse-a1-B) | pin read-back INFO (mock, ZC16_SW=0: not served) (fn4 every switch + 4 ranks + declare 'now 2' + rco / fuse engagement; 5 per-block checks, 5 mismatches) | 1 guard finding(s) -- VIRHE see the lines above
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 43021 linked real files, 8 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zzzc16/mock-zc16-stop.out (size 0 -> 1031)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-fn-q-cufewb.sh.out (size 1501 -> 2448)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 19384 -> 19618)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1554272 -> 1559988)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-cfb-lb2.txt (size 0 -> 1088)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-cfb-S-engine.log.gz (size 0 -> 42340)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-cfb-blocks.jsonl (size 3143 -> 12604)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-cfb-S.log (gone)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

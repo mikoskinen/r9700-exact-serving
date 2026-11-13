@@ -1,0 +1,30 @@
+2026-11-13 04:32:42 mockrun kv-m1: farm: FARM {"copied": 7077, "linked": 43258, "dirlinks": 45, "skipped": 2, "seconds": 2.9}
+2026-11-13 04:32:42 mockrun kv-m1: port 18090, sandbox /tmp/mockrad/kv-m1, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-zsoak16zz-kvres.sh (sandbox copy), knobs: KVR_SW=0 KVR_C8WARM=4 KVR_BUDGET_MIN=120 KVR_C8GN=1 KVR_C16GN=1 KVR_C8B=1 KVR_U1N=1 KVR_STARTEST=5 NGSHARE_DIR=/tmp/mockrad/kv-m1/ngdir NGSHARE_RUN=/tmp/mockrad/kv-m1/ngrun NGSHARE_LOG=/tmp/mockrad/kv-m1/ngshare.log, faults: none, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-13 04:32:49 mockrun kv-m1: DRYRUN rc 0, 198 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/kvres
+2026-11-13 04:32:49 mockrun kv-m1: run (timeout 3000 s)
+2026-11-13 04:39:07 mockrun kv-m1: body rc 0 after 388 s
+MOCKRUN REPORT kv-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-zsoak16zz-kvres.sh | body rc 0 | 389 s | knobs: KVR_SW=0 KVR_C8WARM=4 KVR_BUDGET_MIN=120 KVR_C8GN=1 KVR_C16GN=1 KVR_C8B=1 KVR_U1N=1 KVR_STARTEST=5 NGSHARE_DIR=/tmp/mockrad/kv-m1/ngdir NGSHARE_RUN=/tmp/mockrad/kv-m1/ngrun NGSHARE_LOG=/tmp/mockrad/kv-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/kvres | 110 RESULT lines, 190 mock requests | last RESULT: xkvr 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-zsoak16zz-kvres: done (6 min) -- /tmp/mockrad/kv-m1/home/gpu/ds41/exl3-test/runs/xdsm/kvres | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  2x ngshare xkvr-K35: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 240 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 2 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 43256 linked real files, 6 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kvres/mock-kv-m1.out (size 0 -> 860)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-fn-t-pfstack.sh.out (size 1536 -> 3112)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1758713 -> 1769439)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-ps-A1-engine.log.gz (size 0 -> 322274)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-ps-A1-dec8.txt (size 0 -> 726)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-ps-blocks.jsonl (size 13930 -> 20289)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/kv-m1.txt | sandbox: /tmp/mockrad/kv-m1

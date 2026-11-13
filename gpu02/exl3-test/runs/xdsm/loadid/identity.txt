@@ -1,0 +1,10 @@
+warm-up-li-nst0 IDENTICAL: 3 answers
+li-nst0 ld-vs-a1 6 of 20 answers differ: p1 char 126 tok 27, p8 char 88 tok 22, p11 char 185 tok 38, p13 char 129 tok 42, p14 char 90 tok 18, p16 char 338 tok 60
+li-nst0 ld-vs-d0 6 of 20 answers differ: p1 char 126 tok 27, p8 char 88 tok 22, p11 char 185 tok 38, p13 char 129 tok 42, p14 char 90 tok 18, p16 char 338 tok 60
+li-nst0 a1-vs-d0 IDENTICAL: 20 of 20 answers
+li-nst0 a2-vs-a1 IDENTICAL: 20 of 20 answers
+warm-up-li-stack IDENTICAL: 3 answers
+li-stack ld-vs-a1 11 of 20 answers differ: p1 char 126 tok 27, p5 char 57 tok 17, p7 char 27 tok 7, p8 char 14 tok 3, p9 char 10 tok 1, p10 char 61 tok 13, p11 char 57 tok 12, p13 char 129 tok 42, p14 char 504 tok 102, p16 char 529 tok 91, p19 char 0 tok 0
+li-stack ld-vs-d0 11 of 20 answers differ: p1 char 126 tok 27, p5 char 57 tok 17, p7 char 27 tok 7, p8 char 14 tok 3, p9 char 10 tok 1, p10 char 61 tok 13, p11 char 57 tok 12, p13 char 129 tok 42, p14 char 504 tok 102, p16 char 529 tok 91, p19 char 0 tok 0
+li-stack a1-vs-d0 IDENTICAL: 20 of 20 answers
+li-stack a2-vs-a1 IDENTICAL: 20 of 20 answers

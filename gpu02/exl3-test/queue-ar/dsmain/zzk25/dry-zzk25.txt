@@ -1,0 +1,13 @@
+  (check) k25probe md5 254f196b
+  (check) exl3r4d-k25u.so md5 7b2f66d6
+  (check) image radiance-local:ds41-int14c-678c176f-579d0bc2-l a7ca6bcdf07b
+  (check) K25U image radiance-local:ds41-k25u-678c176f-38b88ec6-l bc91c460c13f
+  (check) OLD plugin md5 9823cdde (the int14 exl3r4d, ds41-x3d 579d0bc)
+  (check) NEW plugin = the K25U image's exl3r4d (sha256 98048136d176)
+  (check) card GPU-dbba5c851cfef7b3: in sysfs (unique_id)
+  (check) disk: / 15924 MB free, /tmp inodes 1 %
++ mkdir -p /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzk25; chmod 777 /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzk25
++ gpurun zzk25-$$ 540 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e ROCR_VISIBLE_DEVICES=GPU-dbba5c851cfef7b3 -v /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zzk25/bin:/b:ro -v /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzk25:/o --entrypoint /b/k25probe radiance-local:ds41-int14c-678c176f-579d0bc2-l /o --new /b/exl3r4d-k25u.so > /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zzk25/probe.txt 2>&1
++ RESULT zzk25 lines: DEV / HOOKS / BYTES / BYTES96 / TIME / DONE, then 'gate 1 (bytes + hooks) PASS|FAIL; speed: ...; best gate_up value N'
+  (dry) 1 radiance container(s) up now (the run refuses while any is)
+DRYRUN: 0 MISSING (nothing started, nothing written)

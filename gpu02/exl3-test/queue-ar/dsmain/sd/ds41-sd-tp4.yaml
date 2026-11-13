@@ -1,0 +1,115 @@
+# ds41-sd-tp4.yaml (11.11.2026, queue-ar/dsmain/sd, lever SD item, body dsm-sd.sh) -- = ../ds41-stack2-tp4.yaml (copied, not changed
+# below this line): the stack2 compose file whose env_file ${XS2_ENVFILE} carries every start word (lever SD adds
+# RADIANCE_DRAFT_SAMPLE through it; --draft-coupling on rides in ARGS). Project / container radiance-ds41-exl3, MODELDIR at /models,
+# STATSDIR at /stats.
+# ds41-stack2-tp4.yaml (11.11.2026, ds-main-port, item 57-p4zyzzzzz-ds-hy-stack2, body dsm-stack2.sh) -- = ds41-stack-tp4.yaml
+# (md5 19ae7222, hx-stack's; copied, not changed) + one env_file entry: ${XS2_ENVFILE} (the body writes <tag>.env a start: every
+# int3 lever's start-time NAME=VALUE -- RADIANCE_DS41_GG_PF / _GG_PF_TABLE / _F32_PF, RADIANCE_DS41_DSPARK_WALK, the small n5 set's
+# RADIANCE_DS41_ARGATHER_MAX / _QNFOLD / _SWFOLD / RADIANCE_DRAFT_CTXSKIP / RADIANCE_DS41_DSPARK_CONF, the VRAM / lend levers when
+# switched on), so a name the list below does not carry still reaches the container. A name the list also carries comes from
+# the shell (the body exports the same value). Unset XS2_ENVFILE = /dev/null = nothing added.
+# ds41-stack-tp4.yaml (10.11.2026, ds-main-port, the DS stack) -- = ds41-k1-tp4.yaml (md5 f619735b) + RADIANCE_DRAFT_DEPTH0 /
+# RADIANCE_DRAFT_PROBE / RADIANCE_DRAFT_HYBRID / RADIANCE_DRAFT_HYBRID_MATCH (ds41-gg 4675795 / 1b8848a, the scheduler's depth 0 and
+# the lookup / head hybrid at start; each also an in-process switch: draft_depth0, draft_probe, draft_hybrid, draft_hybrid_match),
+# passed through only when set in the shell (unset = unset in the container). For dsm-stack.sh (item 57-p4zyzzzzz-ds-hx-stack).
+# ds41-k1-tp4.yaml (10.11.2026, ds41-k1 lever K1) -- = ds41-d3-tp4.yaml + RADIANCE_DS41_KVFOLD / RADIANCE_DS41_OFOLD /
+# RADIANCE_DS41_ONEFILL (1 = declare lever K1's fold beside the ops it folds and start with it on; unset = nothing declared,
+# today's issue); each has an in-process switch (ds41_kvfold, ds41_ofold, ds41_onefill, POST /admin/fn4). For dsm-attnfold.sh
+# (item 57-p4zyzzzzz-ds-n-attnfold).
+# ds41-d3-tp4.yaml (10.11.2026, ds41-d3 levers D3 / F4) -- = ds41-gg-tp4.yaml + RADIANCE_DS41_ARGATHER_MAX (the MoE gather +
+# all-reduce fusion declared up to that many rows; unset = the ARGATHER bound, 4 at on) + RADIANCE_DS41_SHEXP_LANE (1 = the shared
+# expert on the second lane at decode / verify steps at start; unset = one lane); both have in-process switches (ds41_argather,
+# ds41_shexp_lane, POST /admin/fn4) + RADIANCE_DEBUG_MISS_LOG (ds41-miss: the per (step, rank) live-expert tier log, a path under
+# /stats; unset = off). For dsm-argall.sh / dsm-shexplane.sh (items 57-p4zyzzzzz-ds-i-argall, -j-shexplane).
+# ds41-gg-tp4.yaml (10.11.2026, ds41-gg lever 1) -- = ds41-dsm-tp4.yaml + RADIANCE_DS41_GG_GEMV (libr4d's gemm_nt_ggml decode-band
+# form at start: unset / 0 the stock rule, 1 the measured form table; the fn4 switch gg_gemv changes it in process). For
+# dsm-gemv.sh / dsm-oracle.sh (items 57-p4zyzzzzz-ds-g-gemv, -h-oracle).
+# ds41-dsm-tp4.yaml (10.11.2026, ds-main-port) -- = queue-ar/ds41-shp-tp4.yaml (d661f9f5) + RADIANCE_DS41_DSPARK_CAND (the DSpark
+# Markov walk's candidates, deepseek41 d24cd1d and later; unset = 16). For dsm-ddiag.sh.
+# ds41-shp-tp4.yaml (7.11.2026, queue-ar; for 79-shp-levels.sh) -- = queue-29's ds41-tuned2-tp4.yaml (6.11., the 61b compose file)
+# plus the two switches of the -shp image, passed through only when set in the shell:
+#   RADIANCE_DS41_LEVELS          1 = deepseek41 offers the core's arena levels (needs the bounded compressor tail, i.e.
+#                                 RADIANCE_DS41_CTAIL unset); unset = refused, as every earlier image
+#   RADIANCE_ARENA_LEVEL_MAX      rows: the level ladder stops there (the span's shared level apart); unset = every rung
+#   RADIANCE_STAGE_MIXED          0 = the prefill stager stages only passes with no decode rows (-h94ececa and later); unset = any
+#   RADIANCE_ARENA_HOLD_MS        ms the arena loan floor holds after a large step (the hold image and later); unset = 2000
+#   RADIANCE_STAGE_SPAN           0 = no stager ring room at the span's shared level (lent instead); unset = kept
+#   RADIANCE_DS41_ARGATHER        on = the MoE gather + its all-reduce in one kernel up to 4 tokens (tuned3 image); unset = off
+#   RADIANCE_DS41_ROUTER_FUSE, R4D_DS41_MIX_FUSE, R4D_DS41_QLDS, RADIANCE_DS41_AR_PCN   passed so an arm can set them 0 by name
+#   RADIANCE_AQL_ACQ              (tuned3x image, core-acq) rule | rule-w = the address-based acquire rule; none = every
+#                                 played packet without its agent-scope acquire (EXPERIMENT); unset = as before
+# ds41-tuned2-tp4.yaml (6.11.2026, queue-r2; for 61b-exl3-29-tuned2.sh) -- = queue-ar's ds41-tuned-tp4.yaml (queue-29's
+# ds41-117-tp4.yaml: MODELDIR mount, the serve line in ARGS, project/container radiance-ds41-exl3, the profiling environment) with
+# EVERY switch of the tuned2 images, passed through only when set in the shell (list syntax without a value: unset in the shell =
+# unset in the container):
+#   RADIANCE_DS41_INDEX           the indexer: keep,split (default when unset) | keep | split | off
+#   RADIANCE_DS41_KEEP_MIN_LIVE, RADIANCE_DS41_SPLIT_MIN_LIVE   its thresholds (idx2b), positions
+#   RADIANCE_DS41_IDXKEY          mxfp4 = MXFP4 index keys (mx4); unset = bf16 keys
+#   RADIANCE_DS41_LATENT          nvfp4 = packed compressed latent (mx4l); unset = bf16
+#   RADIANCE_DS41_CTAIL           full = the compressor tail over the whole work plane (before ctail); unset = the step's bound
+#   RADIANCE_EXL3_SPLITK          1 = EXL3 EP split-K rules (v9 plugins only; the tuned2 images carry v8, so it does nothing)
+#   RADIANCE_HEAT_PREFILL         0..1, the heat engine's share for a step's prefill rows; unset = 1 (as before)
+#   RADIANCE_HEAT_CREDIT_CAP      the heat engine's credit cap; unset = 512
+#   RADIANCE_HEAT_MOVES, RADIANCE_PLACE_TURNOVER                 (7cecf223 and later heat binaries) move budget, turnover slots
+#   RADIANCE_HEAT_PREFILL_DECAY, RADIANCE_HEAT_PREFILL_GAIN      (bb654442 and later heat binaries) dual heat
+#   RADIANCE_HEAT_DECODE_PIN      (7e342763 and later heat binaries) the decode-hottest share of a class kept from eviction
+name: radiance-ds41-exl3
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${IMAGE:?set IMAGE}
+    container_name: radiance-ds41-exl3
+    restart: "no"
+    volumes:
+      - ${MODELDIR:?set MODELDIR}:/models:ro
+      - ${STATSDIR:?set STATSDIR}:/stats
+    environment:
+      RADIANCE_PROFILE_EVERY: ${PROFEVERY:-}
+      RADIANCE_PROFILE_SYNC: ${PROFSYNC:-}
+      RADIANCE_AQL_STAMP: ${AQLSTAMP:-}
+      RADIANCE_AQL_STAMP_OUT: /stats/stamps.csv
+      RADIANCE_DS41_INDEX:
+      RADIANCE_DS41_KEEP_MIN_LIVE:
+      RADIANCE_DS41_SPLIT_MIN_LIVE:
+      RADIANCE_DS41_IDXKEY:
+      RADIANCE_DS41_LATENT:
+      RADIANCE_DS41_CTAIL:
+      RADIANCE_EXL3_SPLITK:
+      RADIANCE_HEAT_PREFILL:
+      RADIANCE_HEAT_CREDIT_CAP:
+      RADIANCE_HEAT_MOVES:
+      RADIANCE_PLACE_TURNOVER:
+      RADIANCE_HEAT_PREFILL_DECAY:
+      RADIANCE_HEAT_PREFILL_GAIN:
+      RADIANCE_HEAT_DECODE_PIN:
+      RADIANCE_DS41_LEVELS:
+      RADIANCE_ARENA_LEVEL_MAX:
+      RADIANCE_STAGE_MIXED:
+      RADIANCE_ARENA_HOLD_MS:
+      RADIANCE_STAGE_SPAN:
+      RADIANCE_DS41_ARGATHER:
+      RADIANCE_DS41_ROUTER_FUSE:
+      R4D_DS41_MIX_FUSE:
+      R4D_DS41_QLDS:
+      RADIANCE_DS41_AR_PCN:
+      RADIANCE_AQL_ACQ:
+      RADIANCE_DS41_DSPARK_CAND:
+      RADIANCE_DS41_GG_GEMV:
+      RADIANCE_DS41_ARGATHER_MAX:
+      RADIANCE_DS41_SHEXP_LANE:
+      RADIANCE_DEBUG_MISS_LOG:
+      RADIANCE_DS41_KVFOLD:
+      RADIANCE_DS41_OFOLD:
+      RADIANCE_DS41_ONEFILL:
+      RADIANCE_DRAFT_DEPTH0:
+      RADIANCE_DRAFT_PROBE:
+      RADIANCE_DRAFT_HYBRID:
+      RADIANCE_DRAFT_HYBRID_MATCH:
+    env_file:
+      - path: ${XS2_ENVFILE:-/dev/null}
+        required: false
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${MODEL:?set MODEL} --served-model-name deepseek-v4.1-flash --host 127.0.0.1 --port 8090
+      ${ARGS:?set ARGS}

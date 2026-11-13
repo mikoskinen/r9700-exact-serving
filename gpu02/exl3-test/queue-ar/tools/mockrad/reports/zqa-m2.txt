@@ -1,0 +1,23 @@
+MOCKRUN REPORT zqa-m2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzaql.sh | body rc 0 | 189 s | knobs: ZQA_SW=0 ZQA_C8WIN=8 ZQA_C8WARM=4 ZQA_BUDGET_MIN=120 ZQA_MIN_STEPS=50 NGSHARE_DIR=/tmp/mockrad/zqa-m2/ngdir NGSHARE_RUN=/tmp/mockrad/zqa-m2/ngrun NGSHARE_LOG=/tmp/mockrad/zqa-m2/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzzaql | 58 RESULT lines, 54 mock requests | last RESULT: xzaql 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzaql: done (2 min) -- /tmp/mockrad/zqa-m2/home/gpu/ds41/exl3-test/runs/xdsm/zzzaql | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42472 linked real files, 6 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zzk25s/mock-k25s-stop2.out (size 1077 -> 3838)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1244042 -> 1249654)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zrq14.sh.out (size 27635 -> 34087)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zrq14/mb.jsonl (size 5381 -> 9886)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zrq14/blocks.jsonl (size 0 -> 4534)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zrq14/c8/c4-m16-1-S-B.txt (size 0 -> 916)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

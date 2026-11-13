@@ -1,0 +1,2 @@
+GPCHK GPVERDICT check: 31 of 31 (type, shape) pairs ran, 2728 form launches, 0 differ -> PASS (byte-identical, every form)
+GPROW none (no GPPERF lines)

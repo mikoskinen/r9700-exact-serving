@@ -1,0 +1,83 @@
+KBSUM model: Zipf exponent 1.479 fitted to EXL3 2.25's 97.9 % read hit at r 0.46; VRAM for experts 62.52 GiB (4 cards)
+KBSUM mx         | layer cold M1 90.8 us M4 294.4 us M16 822.8 us M64 1858.0 us | warm M1 64.4 us | 17.93 MiB an expert, 4.25 bpw | M1 414 GB/s M4 511 GB/s M16 571 GB/s M64 597 GB/s | model 268.9 GiB, VRAM share 23 %, read hit 95.3 % | est. expert ms a step 1u 6.5 ms (kernels 3.6 + link 2.8); 4u 23.2 ms (kernels 11.8 + link 11.4); 8u 38.3 ms (kernels 18.8 + link 19.5)
+KBSUM w4         | layer cold M1 77.4 us M4 260.4 us M16 779.3 us M64 1822.3 us | warm M1 40.9 us | 17.40 MiB an expert, 4.12 bpw | M1 471 GB/s M4 561 GB/s M16 585 GB/s M64 591 GB/s | model 261.0 GiB, VRAM share 24 %, read hit 95.4 % | est. expert ms a step 1u 5.8 ms (kernels 3.1 + link 2.7); 4u 21.1 ms (kernels 10.4 + link 10.7); 8u 35.6 ms (kernels 17.3 + link 18.3)
+KBSUM iqr4       | layer cold M1 161.2 us M4 524.7 us M16 1435.5 us M64 3634.4 us | warm M1 145.3 us | 17.04 MiB an expert, 4.04 bpw | M1 222 GB/s M4 272 GB/s M16 311 GB/s M64 290 GB/s | model 255.6 GiB, VRAM share 24 %, read hit 95.5 % | est. expert ms a step 1u 9.0 ms (kernels 6.4 + link 2.6); 4u 31.3 ms (kernels 21.0 + link 10.3); 8u 50.7 ms (kernels 33.1 + link 17.5)
+KBSUM iqr3       | layer cold M1 160.2 us M4 511.3 us M16 1371.6 us M64 3585.6 us | warm M1 144.7 us | 12.82 MiB an expert, 3.04 bpw | M1 168 GB/s M4 210 GB/s M16 245 GB/s M64 221 GB/s | model 192.3 GiB, VRAM share 33 %, read hit 96.7 % | est. expert ms a step 1u 7.8 ms (kernels 6.4 + link 1.4); 4u 26.2 ms (kernels 20.5 + link 5.7); 8u 41.7 ms (kernels 31.9 + link 9.8)
+KBSUM iqr2       | layer cold M1 159.1 us M4 498.7 us M16 1308.9 us M64 3519.4 us | warm M1 141.0 us | 8.60 MiB an expert, 2.04 bpw | M1 113 GB/s M4 145 GB/s M16 172 GB/s M64 151 GB/s | model 129.0 GiB, VRAM share 48 %, read hit 98.1 % | est. expert ms a step 1u 6.9 ms (kernels 6.4 + link 0.6); 4u 22.2 ms (kernels 19.9 + link 2.2); 8u 34.6 ms (kernels 30.8 + link 3.8)
+KBSUM exl3_2.25  | layer cold M1 111.6 us M4 234.5 us M16 681.4 us M64 1617.7 us | warm M1 - | 9.06 MiB an expert, 2.15 bpw | M1 170 GB/s M4 324 GB/s M16 349 GB/s M64 346 GB/s | model 135.9 GiB, VRAM share 46 %, read hit 97.9 % | est. expert ms a step 1u 5.1 ms (kernels 4.5 + link 0.6); 4u 11.9 ms (kernels 9.4 + link 2.6); 8u 19.7 ms (kernels 15.3 + link 4.4)
+KBSUM exl3_2.9   | layer cold M1 118.1 us M4 250.2 us M16 730.4 us M64 1689.8 us | warm M1 - | 12.17 MiB an expert, 2.89 bpw | M1 216 GB/s M4 408 GB/s M16 437 GB/s M64 446 GB/s | model 182.6 GiB, VRAM share 34 %, read hit 96.9 % | est. expert ms a step 1u 6.0 ms (kernels 4.7 + link 1.3); 4u 15.2 ms (kernels 10.0 + link 5.1); 8u 25.2 ms (kernels 16.4 + link 8.8)
+KBSUM exl3k2     | layer cold M1 108.8 us M4 227.5 us M16 659.6 us M64 1590.9 us | warm M1 105.3 us | 8.48 MiB an expert, 2.01 bpw | M1 163 GB/s M4 313 GB/s M16 337 GB/s M64 330 GB/s | model 127.2 GiB, VRAM share 49 %, read hit 98.1 % | est. expert ms a step 1u 4.9 ms (kernels 4.4 + link 0.5); 4u 11.3 ms (kernels 9.1 + link 2.2); 8u 18.5 ms (kernels 14.9 + link 3.7)
+KBSUM exl3k2h    | layer cold M1 119.0 us M4 253.0 us M16 738.7 us M64 1688.5 us | warm M1 115.5 us | 10.59 MiB an expert, 2.51 bpw | M1 187 GB/s M4 351 GB/s M16 376 GB/s M64 388 GB/s | model 158.8 GiB, VRAM share 39 %, read hit 97.4 % | est. expert ms a step 1u 5.7 ms (kernels 4.8 + link 0.9); 4u 13.9 ms (kernels 10.1 + link 3.7); 8u 23.0 ms (kernels 16.6 + link 6.4)
+KBSUM exl3k3     | layer cold M1 119.4 us M4 253.5 us M16 740.5 us M64 1703.9 us | warm M1 115.6 us | 12.70 MiB an expert, 3.01 bpw | M1 223 GB/s M4 420 GB/s M16 450 GB/s M64 461 GB/s | model 190.5 GiB, VRAM share 33 %, read hit 96.7 % | est. expert ms a step 1u 6.2 ms (kernels 4.8 + link 1.4); 4u 15.8 ms (kernels 10.1 + link 5.6); 8u 26.2 ms (kernels 16.6 + link 9.6)
+GGSUM q5_K attn_q_b 8192x1280 M=1 (6.88 MiB) | rule 31.6 us | best r1g1024 29.0 us 248 GB/s (-8.2 %) | bytes match
+GGSUM q5_K attn_q_b 8192x1280 M=4 (6.88 MiB) | rule 48.0 us | best r1g256 44.3 us 163 GB/s (-7.7 %) | bytes match
+GGSUM q5_K attn_q_b 8192x1280 M=8 (6.88 MiB) | rule 67.7 us | best rule 67.7 us 106 GB/s (+0.0 %) | bytes match
+GGSUM q5_K attn_output_b 5120x2048 M=1 (6.88 MiB) | rule 20.8 us | best rule 20.8 us 346 GB/s (+0.0 %) | bytes match
+GGSUM q5_K attn_output_b 5120x2048 M=4 (6.88 MiB) | rule 45.6 us | best r1g256 39.5 us 182 GB/s (-13.4 %) | bytes match
+GGSUM q5_K attn_output_b 5120x2048 M=8 (6.88 MiB) | rule 48.7 us | best rule 48.7 us 148 GB/s (+0.0 %) | bytes match
+GGSUM q5_K shexp_gate_up 1536x5120 M=1 (5.16 MiB) | rule 20.1 us | best r1g256 20.0 us 271 GB/s (-0.5 %) | bytes match
+GGSUM q5_K shexp_gate_up 1536x5120 M=4 (5.16 MiB) | rule 31.1 us | best r2g256 27.9 us 194 GB/s (-10.3 %) | bytes match
+GGSUM q5_K shexp_gate_up 1536x5120 M=8 (5.16 MiB) | rule 53.6 us | best r2g256 36.8 us 147 GB/s (-31.3 %) | bytes match
+GGSUM q5_K shexp_down 5120x768 M=1 (2.58 MiB) | rule 17.9 us | best r1g1024 12.2 us 222 GB/s (-31.8 %) | bytes match
+GGSUM q5_K shexp_down 5120x768 M=4 (2.58 MiB) | rule 20.1 us | best r1g1024 17.7 us 153 GB/s (-11.9 %) | bytes match
+GGSUM q5_K shexp_down 5120x768 M=8 (2.58 MiB) | rule 26.2 us | best rule 26.2 us 103 GB/s (+0.0 %) | bytes match
+GGSUM q5_K attn_q_a 1280x5120 M=1 (4.30 MiB) | rule 16.1 us | best r1g256 16.0 us 281 GB/s (-0.6 %) | bytes match
+GGSUM q5_K attn_q_a 1280x5120 M=4 (4.30 MiB) | rule 28.2 us | best r2g256 26.6 us 170 GB/s (-5.7 %) | bytes match
+GGSUM q5_K attn_q_a 1280x5120 M=8 (4.30 MiB) | rule 51.5 us | best r2g256 35.2 us 128 GB/s (-31.7 %) | bytes match
+GGSUM q5_K attn_output_a 1024x4096 M=1 (2.75 MiB) | rule 12.6 us | best rule 12.6 us 229 GB/s (+0.0 %) | bytes match
+GGSUM q5_K attn_output_a 1024x4096 M=4 (2.75 MiB) | rule 22.5 us | best r2g256 18.7 us 154 GB/s (-16.9 %) | bytes match
+GGSUM q5_K attn_output_a 1024x4096 M=8 (2.75 MiB) | rule 37.0 us | best r2g256 24.2 us 119 GB/s (-34.6 %) | bytes match
+GGSUM q5_K attn_kv 512x5120 M=1 (1.72 MiB) | rule 11.5 us | best r1g256 11.4 us 158 GB/s (-0.9 %) | bytes match
+GGSUM q5_K attn_kv 512x5120 M=4 (1.72 MiB) | rule 15.8 us | best r1g1024 15.6 us 116 GB/s (-1.3 %) | bytes match
+GGSUM q5_K attn_kv 512x5120 M=8 (1.72 MiB) | rule 23.2 us | best rule 23.2 us 78 GB/s (+0.0 %) | bytes match
+GGSUM q5_K engram_kv 25600x6144 M=1 (103.12 MiB) | rule 252.0 us | best rule 252.0 us 429 GB/s (+0.0 %) | bytes match
+GGSUM q5_K engram_kv 25600x6144 M=4 (103.12 MiB) | rule 493.8 us | best r2g1024 474.0 us 228 GB/s (-4.0 %) | bytes match
+GGSUM q5_K engram_kv 25600x6144 M=8 (103.12 MiB) | rule 731.4 us | best r4g1024 611.5 us 177 GB/s (-16.4 %) | bytes match
+GGSUM q6_K attn_q_b 8192x1280 M=1 (8.20 MiB) | rule 24.7 us | best r1g1024 23.2 us 371 GB/s (-6.1 %) | bytes match
+GGSUM q6_K attn_q_b 8192x1280 M=4 (8.20 MiB) | rule 39.1 us | best rule 39.1 us 220 GB/s (+0.0 %) | bytes match
+GGSUM q6_K attn_q_b 8192x1280 M=8 (8.20 MiB) | rule 64.1 us | best rule 64.1 us 134 GB/s (+0.0 %) | bytes match
+GGSUM q6_K attn_output_b 5120x2048 M=1 (8.20 MiB) | rule 18.9 us | best rule 18.9 us 456 GB/s (+0.0 %) | bytes match
+GGSUM q6_K attn_output_b 5120x2048 M=4 (8.20 MiB) | rule 35.7 us | best rule 35.7 us 241 GB/s (+0.0 %) | bytes match
+GGSUM q6_K attn_output_b 5120x2048 M=8 (8.20 MiB) | rule 48.9 us | best rule 48.9 us 176 GB/s (+0.0 %) | bytes match
+GGSUM q6_K shexp_gate_up 1536x5120 M=1 (6.15 MiB) | rule 17.9 us | best r1g1024 17.7 us 364 GB/s (-1.1 %) | bytes match
+GGSUM q6_K shexp_gate_up 1536x5120 M=4 (6.15 MiB) | rule 29.9 us | best r2g256 27.6 us 234 GB/s (-7.7 %) | bytes match
+GGSUM q6_K shexp_gate_up 1536x5120 M=8 (6.15 MiB) | rule 52.6 us | best r2g256 36.9 us 175 GB/s (-29.8 %) | bytes match
+GGSUM q6_K shexp_down 5120x768 M=1 (3.08 MiB) | rule 17.9 us | best r1g1024 12.5 us 259 GB/s (-30.2 %) | bytes match
+GGSUM q6_K shexp_down 5120x768 M=4 (3.08 MiB) | rule 15.3 us | best rule 15.3 us 210 GB/s (+0.0 %) | bytes match
+GGSUM q6_K shexp_down 5120x768 M=8 (3.08 MiB) | rule 22.0 us | best rule 22.0 us 147 GB/s (+0.0 %) | bytes match
+GGSUM q6_K attn_q_a 1280x5120 M=1 (5.13 MiB) | rule 14.1 us | best rule 14.1 us 381 GB/s (+0.0 %) | bytes match
+GGSUM q6_K attn_q_a 1280x5120 M=4 (5.13 MiB) | rule 27.7 us | best r2g256 25.7 us 209 GB/s (-7.2 %) | bytes match
+GGSUM q6_K attn_q_a 1280x5120 M=8 (5.13 MiB) | rule 50.2 us | best r2g256 33.7 us 159 GB/s (-32.9 %) | bytes match
+GGSUM q6_K attn_output_a 1024x4096 M=1 (3.28 MiB) | rule 10.4 us | best rule 10.4 us 330 GB/s (+0.0 %) | bytes match
+GGSUM q6_K attn_output_a 1024x4096 M=4 (3.28 MiB) | rule 22.4 us | best r2g256 19.0 us 181 GB/s (-15.2 %) | bytes match
+GGSUM q6_K attn_output_a 1024x4096 M=8 (3.28 MiB) | rule 35.5 us | best r2g256 25.1 us 137 GB/s (-29.3 %) | bytes match
+GGSUM q6_K attn_kv 512x5120 M=1 (2.05 MiB) | rule 9.4 us | best r1g256 9.3 us 230 GB/s (-1.1 %) | bytes match
+GGSUM q6_K attn_kv 512x5120 M=4 (2.05 MiB) | rule 15.2 us | best r1g1024 15.0 us 143 GB/s (-1.3 %) | bytes match
+GGSUM q6_K attn_kv 512x5120 M=8 (2.05 MiB) | rule 22.9 us | best rule 22.9 us 94 GB/s (+0.0 %) | bytes match
+GGSUM q6_K engram_kv 25600x6144 M=1 (123.05 MiB) | rule 217.8 us | best rule 217.8 us 592 GB/s (+0.0 %) | bytes match
+GGSUM q6_K engram_kv 25600x6144 M=4 (123.05 MiB) | rule 442.7 us | best r2g1024 422.8 us 305 GB/s (-4.5 %) | bytes match
+GGSUM q6_K engram_kv 25600x6144 M=8 (123.05 MiB) | rule 693.9 us | best r4g1024 562.9 us 229 GB/s (-18.9 %) | bytes match
+GGSUM q8_0 attn_q_b 8192x1280 M=1 (10.62 MiB) | rule 32.4 us | best r1g1024 22.5 us 494 GB/s (-30.6 %) | bytes match
+GGSUM q8_0 attn_q_b 8192x1280 M=4 (10.62 MiB) | rule 36.0 us | best r1g256 32.4 us 344 GB/s (-10.0 %) | bytes match
+GGSUM q8_0 attn_q_b 8192x1280 M=8 (10.62 MiB) | rule 57.4 us | best rule 57.4 us 194 GB/s (+0.0 %) | bytes match
+GGSUM q8_0 attn_output_b 5120x2048 M=1 (10.62 MiB) | rule 32.3 us | best r1g1024 22.3 us 500 GB/s (-31.0 %) | bytes match
+GGSUM q8_0 attn_output_b 5120x2048 M=4 (10.62 MiB) | rule 33.6 us | best r1g256 30.1 us 370 GB/s (-10.4 %) | bytes match
+GGSUM q8_0 attn_output_b 5120x2048 M=8 (10.62 MiB) | rule 42.2 us | best rule 42.2 us 264 GB/s (+0.0 %) | bytes match
+GGSUM q8_0 shexp_gate_up 1536x5120 M=1 (7.97 MiB) | rule 20.0 us | best rule 20.0 us 417 GB/s (+0.0 %) | bytes match
+GGSUM q8_0 shexp_gate_up 1536x5120 M=4 (7.97 MiB) | rule 27.3 us | best r2g256 24.8 us 337 GB/s (-9.2 %) | bytes match
+GGSUM q8_0 shexp_gate_up 1536x5120 M=8 (7.97 MiB) | rule 41.9 us | best r2g256 33.2 us 251 GB/s (-20.8 %) | bytes match
+GGSUM q8_0 shexp_down 5120x768 M=1 (3.98 MiB) | rule 17.8 us | best r1g1024 10.9 us 383 GB/s (-38.8 %) | bytes match
+GGSUM q8_0 shexp_down 5120x768 M=4 (3.98 MiB) | rule 14.3 us | best r1g1024 14.1 us 297 GB/s (-1.4 %) | bytes match
+GGSUM q8_0 shexp_down 5120x768 M=8 (3.98 MiB) | rule 19.9 us | best rule 19.9 us 210 GB/s (+0.0 %) | bytes match
+GGSUM q8_0 attn_q_a 1280x5120 M=1 (6.64 MiB) | rule 16.7 us | best rule 16.7 us 417 GB/s (+0.0 %) | bytes match
+GGSUM q8_0 attn_q_a 1280x5120 M=4 (6.64 MiB) | rule 26.2 us | best r2g256 23.3 us 299 GB/s (-11.1 %) | bytes match
+GGSUM q8_0 attn_q_a 1280x5120 M=8 (6.64 MiB) | rule 39.6 us | best r2g256 29.8 us 234 GB/s (-24.7 %) | bytes match
+GGSUM q8_0 attn_output_a 1024x4096 M=1 (4.25 MiB) | rule 12.6 us | best r1g1024 12.5 us 355 GB/s (-0.8 %) | bytes match
+GGSUM q8_0 attn_output_a 1024x4096 M=4 (4.25 MiB) | rule 20.4 us | best r2g256 18.7 us 239 GB/s (-8.3 %) | bytes match
+GGSUM q8_0 attn_output_a 1024x4096 M=8 (4.25 MiB) | rule 31.4 us | best r2g256 22.7 us 196 GB/s (-27.7 %) | bytes match
+GGSUM q8_0 attn_kv 512x5120 M=1 (2.66 MiB) | rule 10.5 us | best rule 10.5 us 265 GB/s (+0.0 %) | bytes match
+GGSUM q8_0 attn_kv 512x5120 M=4 (2.66 MiB) | rule 15.2 us | best r1g256 15.1 us 185 GB/s (-0.7 %) | bytes match
+GGSUM q8_0 attn_kv 512x5120 M=8 (2.66 MiB) | rule 21.6 us | best rule 21.6 us 129 GB/s (+0.0 %) | bytes match
+GGSUM q8_0 engram_kv 25600x6144 M=1 (159.38 MiB) | rule 272.4 us | best rule 272.4 us 613 GB/s (+0.0 %) | bytes match
+GGSUM q8_0 engram_kv 25600x6144 M=4 (159.38 MiB) | rule 388.2 us | best r2g1024 373.6 us 447 GB/s (-3.8 %) | bytes match
+GGSUM q8_0 engram_kv 25600x6144 M=8 (159.38 MiB) | rule 626.0 us | best r4g1024 510.6 us 327 GB/s (-18.4 %) | bytes match

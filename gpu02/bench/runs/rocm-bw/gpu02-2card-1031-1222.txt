@@ -1,0 +1,20 @@
+== 2026-10-31 12:22:59 rocm-bandwidth-test
+E: Unable to locate package rocm-bandwidth-test
+rocm-bandwidth-test not available
+== 2026-10-31 12:23:04 p2p-bw
+p2p-bw.cpp:39:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+p2p-bw.cpp:40:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+p2p-bw.cpp:39:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+p2p-bw.cpp:40:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+devices 2, 256 MiB x 20
+dev0 0000:83:00.0  H2D 28.0 GB/s  D2H 27.7 GB/s
+dev1 0000:03:00.0  H2D 28.0 GB/s  D2H 27.7 GB/s
+P2P 0->1  access 1  atomics 1  rank 2  copy 26.1 GB/s
+P2P 1->0  access 1  atomics 1  rank 2  copy 26.1 GB/s
+ALL 2 cards at once  H2D      41.2 GB/s total (20.6 per card)
+ALL 2 cards at once  D2H      41.5 GB/s total (20.8 per card)
+ALL 2 cards at once  H2D+D2H  38.9 GB/s total (19.5 per card)
+== 2026-10-31 12:23:12 host memory bandwidth
+threads 8, 2 GiB x 3 arrays: copy 25.5 GB/s, triad 28.1 GB/s (best of 10)
+threads 16, 2 GiB x 3 arrays: copy 31.9 GB/s, triad 35.3 GB/s (best of 10)
+threads 32, 2 GiB x 3 arrays: copy 39.2 GB/s, triad 43.1 GB/s (best of 10)

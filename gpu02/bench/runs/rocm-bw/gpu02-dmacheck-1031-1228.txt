@@ -1,0 +1,123 @@
+== mode pinned, HSA_ENABLE_SDMA=1
+mode pinned, 2 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=1
+  H2D card 0 alone   27.9 GB/s
+  H2D card 1 alone   27.9 GB/s
+  H2D card 0 at once 22.5 GB/s (GPU events)
+  H2D card 1 at once 22.3 GB/s (GPU events)
+  H2D ALL 2 cards: sum of per-card 44.8 GB/s, wall-clock aggregate 44.7 GB/s
+  D2H card 0 alone   27.6 GB/s
+  D2H card 1 alone   27.6 GB/s
+  D2H card 0 at once 25.6 GB/s (GPU events)
+  D2H card 1 at once 25.6 GB/s (GPU events)
+  D2H ALL 2 cards: sum of per-card 51.2 GB/s, wall-clock aggregate 51.2 GB/s
+  CPU: copying process 3.1 CPU-s in total; host busy 4.6 % of 32 threads during the run
+== mode register, HSA_ENABLE_SDMA=1
+mode register, 2 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=1
+  H2D card 0 alone   27.9 GB/s
+  H2D card 1 alone   27.9 GB/s
+  H2D card 0 at once 22.3 GB/s (GPU events)
+  H2D card 1 at once 22.1 GB/s (GPU events)
+  H2D ALL 2 cards: sum of per-card 44.3 GB/s, wall-clock aggregate 44.1 GB/s
+  D2H card 0 alone   27.6 GB/s
+  D2H card 1 alone   27.6 GB/s
+  D2H card 0 at once 21.1 GB/s (GPU events)
+  D2H card 1 at once 20.8 GB/s (GPU events)
+  D2H ALL 2 cards: sum of per-card 41.9 GB/s, wall-clock aggregate 41.6 GB/s
+  CPU: copying process 2.4 CPU-s in total; host busy 4.3 % of 32 threads during the run
+== mode malloc, HSA_ENABLE_SDMA=1
+mode malloc, 2 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=1
+  H2D card 0 alone   27.6 GB/s
+  H2D card 1 alone   27.6 GB/s
+  H2D card 0 at once 27.6 GB/s (GPU events)
+  H2D card 1 at once 13.8 GB/s (GPU events)
+  H2D ALL 2 cards: sum of per-card 41.4 GB/s, wall-clock aggregate 27.6 GB/s
+  D2H card 0 alone   27.3 GB/s
+  D2H card 1 alone   27.3 GB/s
+  D2H card 0 at once 27.3 GB/s (GPU events)
+  D2H card 1 at once 13.7 GB/s (GPU events)
+  D2H ALL 2 cards: sum of per-card 41.0 GB/s, wall-clock aggregate 27.3 GB/s
+  CPU: copying process 2.0 CPU-s in total; host busy 4.1 % of 32 threads during the run
+== mode pinned, HSA_ENABLE_SDMA=0
+mode pinned, 2 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=0
+  H2D card 0 alone   27.9 GB/s
+  H2D card 1 alone   27.9 GB/s
+  H2D card 0 at once 22.6 GB/s (GPU events)
+  H2D card 1 at once 22.1 GB/s (GPU events)
+  H2D ALL 2 cards: sum of per-card 44.7 GB/s, wall-clock aggregate 44.1 GB/s
+  D2H card 0 alone   27.9 GB/s
+  D2H card 1 alone   28.0 GB/s
+  D2H card 0 at once 27.8 GB/s (GPU events)
+  D2H card 1 at once 27.9 GB/s (GPU events)
+  D2H ALL 2 cards: sum of per-card 55.7 GB/s, wall-clock aggregate 55.5 GB/s
+  CPU: copying process 2.6 CPU-s in total; host busy 4.4 % of 32 threads during the run
+== mode register, HSA_ENABLE_SDMA=0
+mode register, 2 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=0
+  H2D card 0 alone   27.9 GB/s
+  H2D card 1 alone   27.9 GB/s
+  H2D card 0 at once 22.6 GB/s (GPU events)
+  H2D card 1 at once 22.2 GB/s (GPU events)
+  H2D ALL 2 cards: sum of per-card 44.9 GB/s, wall-clock aggregate 44.5 GB/s
+  D2H card 0 alone   27.8 GB/s
+  D2H card 1 alone   28.1 GB/s
+  D2H card 0 at once 21.4 GB/s (GPU events)
+  D2H card 1 at once 21.8 GB/s (GPU events)
+  D2H ALL 2 cards: sum of per-card 43.1 GB/s, wall-clock aggregate 42.7 GB/s
+  CPU: copying process 2.2 CPU-s in total; host busy 4.3 % of 32 threads during the run
+== mode malloc, HSA_ENABLE_SDMA=0
+mode malloc, 2 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=0
+  H2D card 0 alone   27.3 GB/s
+  H2D card 1 alone   27.3 GB/s
+  H2D card 0 at once 27.3 GB/s (GPU events)
+  H2D card 1 at once 13.7 GB/s (GPU events)
+  H2D ALL 2 cards: sum of per-card 41.0 GB/s, wall-clock aggregate 27.3 GB/s
+  D2H card 0 alone   27.4 GB/s
+  D2H card 1 alone   27.4 GB/s
+  D2H card 0 at once 27.4 GB/s (GPU events)
+  D2H card 1 at once 13.7 GB/s (GPU events)
+  D2H ALL 2 cards: sum of per-card 41.1 GB/s, wall-clock aggregate 27.4 GB/s
+  CPU: copying process 2.0 CPU-s in total; host busy 4.2 % of 32 threads during the run
+== rocm_bandwidth_test from source
+commit d7f5efe 2026-07-08 15:40:28 -0500
+AUTHORS.md
+CHANGELOG.md
+CMakeLists.txt
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+INSTALL.md
+LICENSE.md
+NOTICE.md
+PLUGINS.md
+README.md
+SECURITY.md
+VERSION
+VERSION_ROCM_PKG
+bin
+bindings
+build_packages_local.sh
+cmake
+deps
+dist
+docs
+examples
+main
+plugins
+rbt_nightly_test.sh
+releases
+tests
+build failed:
+-- >> Enabled builtin plugin: 'amd-hello'
+-- >> Enabled builtin plugin: 'builtin'
+-- >> Enabled builtin plugin: 'tb'
+-- [DEVELOPER]: >> ROCM_INSTALL_PATH_FOR_BUILD ON, returning '/opt/rocm' ...
+-- >> Project: 'rocm_bandwidth_test' v2025.06.09 ...
+CMake Error at /usr/share/cmake-3.28/Modules/FindPackageHandleStandardArgs.cmake:230 (message):
+  Could NOT find CURL (missing: CURL_LIBRARY CURL_INCLUDE_DIR)
+Call Stack (most recent call first):
+  /usr/share/cmake-3.28/Modules/FindPackageHandleStandardArgs.cmake:600 (_FPHSA_FAILURE_MESSAGE)
+  /usr/share/cmake-3.28/Modules/FindCURL.cmake:194 (find_package_handle_standard_args)
+  cmake/build_utils.cmake:967 (find_package)
+  CMakeLists.txt:206 (add_bundled_libraries)
+
+
+-- Configuring incomplete, errors occurred!
+tail: cannot open '/tmp/make.log' for reading: No such file or directory

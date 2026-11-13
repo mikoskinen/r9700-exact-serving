@@ -1,0 +1,7 @@
+1ae4076a3e27eb2b0a59482009bf48b1  blk10_attn_norm.f32
+246e06952dd3aba7c78f690e2e7c7a2e  blk10_hc_attn_base.f32
+485fac9084ca059dab2c10b325446184  blk10_hc_attn_fn.f32
+8e736584917510386911afa5eb8d1f36  blk10_hc_attn_scale.f32
+11e40834c0cf3c04a8adc1c74c1ebb3d  blk9_hc_ffn_base.f32
+2af68c45d23646f96252efff9d9a6ab1  blk9_hc_ffn_fn.f32
+4e25537efa64949f4669fc095bf0e375  blk9_hc_ffn_scale.f32

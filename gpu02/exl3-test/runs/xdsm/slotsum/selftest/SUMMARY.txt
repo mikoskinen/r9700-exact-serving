@@ -1,0 +1,6 @@
+moe_gather_all_reduce_slot_4rank: rc 0, 53 ok, 0 FAIL, 0 skip
+moe_scatter_placed_i32: rc 0, 24 ok, 0 FAIL, 0 skip
+moe_gather_all_reduce_4rank: rc 0, 54 ok, 0 FAIL, 0 skip
+ar_oneshot_4rank_exact: rc 0, 21 ok, 0 FAIL, 0 skip
+ar_twoshot_4rank_exact: rc 0, 17 ok, 0 FAIL, 0 skip
+D3S SELFTEST CLEAN

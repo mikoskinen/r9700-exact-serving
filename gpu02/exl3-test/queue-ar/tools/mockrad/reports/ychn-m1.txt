@@ -1,0 +1,22 @@
+MOCKRUN REPORT ychn-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-ychn.sh | body rc 0 | 88 s | knobs: YLL_SW=0 YLL_C8WIN=8 YLL_C8WARM=4 YLL_C8ORDER=BD YLL_BUDGET_MIN=60 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/yll/c1 | 53 RESULT lines, 139 mock requests | last RESULT: yll 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-ychn: done (1 min) -- /tmp/mockrad/ychn-m1/home/gpu/ds41/exl3-test/runs/xdsm/yll/c1 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41561 linked real files, 5 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/mock-ychn-m1.txt (size 0 -> 706)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 855303 -> 857791)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yswl.sh.out (size 6397 -> 16971)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/identity.txt (size 0 -> 39)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/ngshare/keeper.log (size 1584 -> 1790)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

@@ -1,0 +1,146 @@
+# /home/mikoskinen/gpu/ds41/exl3-test/runs/after-sweep/prof0: rank 0, 182 complete dumps, every 32 steps; marks [('start', 134934), ('1u', 335386), ('c4', 636082), ('c8', 836562), ('pf', 1037028), ('deep', 1124730)]
+
+== 1u: 1024 steps from dumps (39 s), op 26.75 ms/step (device 26.75, host-site 0.00), lane waits 5.09 ms/step; engine steps 1024 (decode 1022), profiled wall 35.3 ms/step
+   allreduce                6.260 ms/step  23.4 %
+   moe_routed               5.542 ms/step  20.7 %
+   gemm_attn_proj           4.706 ms/step  17.6 %
+   attn_core                2.905 ms/step  10.9 %
+   mhc                      2.107 ms/step   7.9 %
+   gemm_shared_expert       1.831 ms/step   6.8 %
+   elementwise_other        1.224 ms/step   4.6 %
+   gemm_router              0.801 ms/step   3.0 %
+   gemm_engram              0.439 ms/step   1.6 %
+   router                   0.422 ms/step   1.6 %
+   sampling                 0.227 ms/step   0.8 %
+   gemm_indexer             0.147 ms/step   0.5 %
+   gemm_compressor          0.138 ms/step   0.5 %
+   routed MoE split: exl3 4.941, other(moe_gather) 0.316, other(moe_scatter) 0.285
+   gemm_nt_ggml                             dev      6.783 ms/step    322.00 calls/step
+   all_reduce                               dev      6.260 ms/step     81.00 calls/step
+   moe_exl3_gate_up                         dev      3.460 ms/step     40.00 calls/step
+   moe_exl3_down                            dev      1.481 ms/step     40.00 calls/step
+   mhc_mix                                  dev      1.206 ms/step     80.00 calls/step
+   gemm_nt_f32                              dev      0.923 ms/step     43.00 calls/step
+   mhc_post_collapse_rmsnorm                dev      0.853 ms/step     78.00 calls/step
+   attn_sparse_sink                         dev      0.707 ms/step     40.00 calls/step
+   rope_rows_roundtrip                      dev      0.574 ms/step     52.00 calls/step
+   rmsnorm_rope_roundtrip                   dev      0.493 ms/step     44.00 calls/step
+   rmsnorm                                  dev      0.463 ms/step     44.00 calls/step
+   router_scored_topk                       dev      0.422 ms/step     40.00 calls/step
+PS {"steps": 1024, "op_ms_step": 26.749, "dev_ms_step": 26.749, "host_ms_step": 0.0, "wait_ms_step": 5.095, "cats": {"allreduce": 6.26, "moe_routed": 5.542, "gemm_attn_proj": 4.706, "attn_core": 2.905, "mhc": 2.107, "gemm_shared_expert": 1.831, "elementwise_other": 1.224, "gemm_router": 0.801, "gemm_engram": 0.439, "router": 0.422, "sampling": 0.227, "gemm_indexer": 0.147, "gemm_compressor": 0.138}, "moe": {"exl3": 4.941, "other(moe_gather)": 0.316, "other(moe_scatter)": 0.285}, "top": [["gemm_nt_ggml", 6.783, 322.0, "dev"], ["all_reduce", 6.26, 81.0, "dev"], ["moe_exl3_gate_up", 3.46, 40.0, "dev"], ["moe_exl3_down", 1.481, 40.0, "dev"], ["mhc_mix", 1.206, 80.0, "dev"], ["gemm_nt_f32", 0.923, 43.0, "dev"], ["mhc_post_collapse_rmsnorm", 0.853, 78.0, "dev"], ["attn_sparse_sink", 0.707, 40.0, "dev"], ["rope_rows_roundtrip", 0.574, 52.0, "dev"], ["rmsnorm_rope_roundtrip", 0.493, 44.0, "dev"], ["rmsnorm", 0.463, 44.0, "dev"], ["router_scored_topk", 0.422, 40.0, "dev"]], "phase": "1u", "secs": 39, "eng_steps": 1024.0, "eng_decode_steps": 1022.0, "wall_ms_step": 35.3, "wall_ms_decode_step": 34.87}
+
+== c4: 1536 steps from dumps (87 s), op 45.41 ms/step (device 45.41, host-site 0.00), lane waits 5.08 ms/step; engine steps 1539 (decode 1533), profiled wall 54.3 ms/step
+   moe_routed              13.103 ms/step  28.9 %
+   allreduce               12.053 ms/step  26.5 %
+   gemm_attn_proj           7.979 ms/step  17.6 %
+   attn_core                3.682 ms/step   8.1 %
+   mhc                      2.420 ms/step   5.3 %
+   gemm_shared_expert       2.159 ms/step   4.8 %
+   elementwise_other        1.262 ms/step   2.8 %
+   gemm_router              0.860 ms/step   1.9 %
+   gemm_engram              0.766 ms/step   1.7 %
+   router                   0.433 ms/step   1.0 %
+   sampling                 0.361 ms/step   0.8 %
+   gemm_compressor          0.187 ms/step   0.4 %
+   gemm_indexer             0.149 ms/step   0.3 %
+   routed MoE split: exl3 12.444, other(moe_gather) 0.374, other(moe_scatter) 0.286
+   all_reduce                               dev     12.025 ms/step     81.00 calls/step
+   gemm_nt_ggml                             dev     10.702 ms/step    322.00 calls/step
+   moe_exl3_gate_up                         dev      8.621 ms/step     40.00 calls/step
+   moe_exl3_down                            dev      3.823 ms/step     40.00 calls/step
+   mhc_mix                                  dev      1.368 ms/step     80.00 calls/step
+   attn_sparse_sink                         dev      1.236 ms/step     40.00 calls/step
+   gemm_nt_f32                              dev      1.031 ms/step     43.00 calls/step
+   mhc_post_collapse_rmsnorm                dev      0.998 ms/step     78.00 calls/step
+   rope_rows_roundtrip                      dev      0.647 ms/step     52.00 calls/step
+   rmsnorm_rope_roundtrip                   dev      0.497 ms/step     44.00 calls/step
+   rmsnorm                                  dev      0.464 ms/step     44.00 calls/step
+   router_scored_topk                       dev      0.433 ms/step     40.00 calls/step
+PS {"steps": 1536, "op_ms_step": 45.415, "dev_ms_step": 45.415, "host_ms_step": 0.0, "wait_ms_step": 5.083, "cats": {"moe_routed": 13.103, "allreduce": 12.053, "gemm_attn_proj": 7.979, "attn_core": 3.682, "mhc": 2.42, "gemm_shared_expert": 2.159, "elementwise_other": 1.262, "gemm_router": 0.86, "gemm_engram": 0.766, "router": 0.433, "sampling": 0.361, "gemm_compressor": 0.187, "gemm_indexer": 0.149}, "moe": {"exl3": 12.444, "other(moe_gather)": 0.374, "other(moe_scatter)": 0.286}, "top": [["all_reduce", 12.025, 81.0, "dev"], ["gemm_nt_ggml", 10.702, 322.0, "dev"], ["moe_exl3_gate_up", 8.621, 40.0, "dev"], ["moe_exl3_down", 3.823, 40.0, "dev"], ["mhc_mix", 1.368, 80.0, "dev"], ["attn_sparse_sink", 1.236, 40.0, "dev"], ["gemm_nt_f32", 1.031, 43.0, "dev"], ["mhc_post_collapse_rmsnorm", 0.998, 78.0, "dev"], ["rope_rows_roundtrip", 0.647, 52.0, "dev"], ["rmsnorm_rope_roundtrip", 0.497, 44.0, "dev"], ["rmsnorm", 0.464, 44.0, "dev"], ["router_scored_topk", 0.433, 40.0, "dev"]], "phase": "c4", "secs": 87, "eng_steps": 1539.0, "eng_decode_steps": 1533.0, "wall_ms_step": 54.3, "wall_ms_decode_step": 48.81}
+
+== c8: 1024 steps from dumps (83 s), op 68.21 ms/step (device 68.21, host-site 0.00), lane waits 5.21 ms/step; engine steps 1026 (decode 1022), profiled wall 77.67 ms/step
+   moe_routed              21.079 ms/step  30.9 %
+   allreduce               18.225 ms/step  26.7 %
+   gemm_attn_proj          12.111 ms/step  17.8 %
+   attn_core                5.543 ms/step   8.1 %
+   gemm_shared_expert       3.353 ms/step   4.9 %
+   mhc                      2.840 ms/step   4.2 %
+   elementwise_other        1.324 ms/step   1.9 %
+   gemm_engram              1.299 ms/step   1.9 %
+   gemm_router              0.920 ms/step   1.3 %
+   sampling                 0.602 ms/step   0.9 %
+   router                   0.459 ms/step   0.7 %
+   gemm_compressor          0.297 ms/step   0.4 %
+   gemm_indexer             0.154 ms/step   0.2 %
+   routed MoE split: exl3 20.347, other(moe_gather) 0.440, other(moe_scatter) 0.292
+   all_reduce                               dev     18.178 ms/step     81.00 calls/step
+   gemm_nt_ggml                             dev     16.550 ms/step    322.00 calls/step
+   moe_exl3_gate_up                         dev     14.035 ms/step     40.00 calls/step
+   moe_exl3_down                            dev      6.312 ms/step     40.00 calls/step
+   attn_sparse_sink                         dev      2.168 ms/step     40.00 calls/step
+   mhc_mix                                  dev      1.628 ms/step     80.00 calls/step
+   rope_rows_roundtrip                      dev      1.352 ms/step     52.00 calls/step
+   gemm_nt_f32                              dev      1.201 ms/step     43.00 calls/step
+   mhc_post_collapse_rmsnorm                dev      1.150 ms/step     78.00 calls/step
+   logits_gemm_ggml                         dev      0.602 ms/step      1.00 calls/step
+   rmsnorm_rope_roundtrip                   dev      0.516 ms/step     44.00 calls/step
+   rmsnorm                                  dev      0.481 ms/step     44.00 calls/step
+PS {"steps": 1024, "op_ms_step": 68.208, "dev_ms_step": 68.208, "host_ms_step": 0.0, "wait_ms_step": 5.213, "cats": {"moe_routed": 21.079, "allreduce": 18.225, "gemm_attn_proj": 12.111, "attn_core": 5.543, "gemm_shared_expert": 3.353, "mhc": 2.84, "elementwise_other": 1.324, "gemm_engram": 1.299, "gemm_router": 0.92, "sampling": 0.602, "router": 0.459, "gemm_compressor": 0.297, "gemm_indexer": 0.154}, "moe": {"exl3": 20.347, "other(moe_gather)": 0.44, "other(moe_scatter)": 0.292}, "top": [["all_reduce", 18.178, 81.0, "dev"], ["gemm_nt_ggml", 16.55, 322.0, "dev"], ["moe_exl3_gate_up", 14.035, 40.0, "dev"], ["moe_exl3_down", 6.312, 40.0, "dev"], ["attn_sparse_sink", 2.168, 40.0, "dev"], ["mhc_mix", 1.628, 80.0, "dev"], ["rope_rows_roundtrip", 1.352, 52.0, "dev"], ["gemm_nt_f32", 1.201, 43.0, "dev"], ["mhc_post_collapse_rmsnorm", 1.15, 78.0, "dev"], ["logits_gemm_ggml", 0.602, 1.0, "dev"], ["rmsnorm_rope_roundtrip", 0.516, 44.0, "dev"], ["rmsnorm", 0.481, 44.0, "dev"]], "phase": "c8", "secs": 83, "eng_steps": 1026.0, "eng_decode_steps": 1022.0, "wall_ms_step": 77.67, "wall_ms_decode_step": 69.41}
+
+== pf: 1024 steps from dumps (73 s), op 59.56 ms/step (device 59.56, host-site 0.00), lane waits 5.12 ms/step; engine steps 1026 (decode 1015), profiled wall 67.66 ms/step
+   moe_routed              17.496 ms/step  29.4 %
+   allreduce               15.561 ms/step  26.1 %
+   gemm_attn_proj           9.918 ms/step  16.7 %
+   attn_core                5.397 ms/step   9.1 %
+   mhc                      3.585 ms/step   6.0 %
+   gemm_shared_expert       2.727 ms/step   4.6 %
+   elementwise_other        1.398 ms/step   2.3 %
+   gemm_engram              1.139 ms/step   1.9 %
+   gemm_router              1.015 ms/step   1.7 %
+   router                   0.460 ms/step   0.8 %
+   sampling                 0.378 ms/step   0.6 %
+   gemm_compressor          0.335 ms/step   0.6 %
+   gemm_indexer             0.156 ms/step   0.3 %
+   routed MoE split: exl3 16.617, other(moe_gather) 0.587, other(moe_scatter) 0.292
+   all_reduce                               dev     15.443 ms/step     81.00 calls/step
+   gemm_nt_ggml                             dev     13.551 ms/step    322.00 calls/step
+   moe_exl3_gate_up                         dev     11.514 ms/step     40.00 calls/step
+   moe_exl3_down                            dev      5.103 ms/step     40.00 calls/step
+   mhc_mix                                  dev      2.003 ms/step     80.00 calls/step
+   attn_sparse_sink                         dev      1.708 ms/step     40.00 calls/step
+   mhc_post_collapse_rmsnorm                dev      1.507 ms/step     78.00 calls/step
+   gemm_nt_f32                              dev      1.332 ms/step     43.00 calls/step
+   rope_rows_roundtrip                      dev      0.908 ms/step     52.00 calls/step
+   index_score                              dev      0.904 ms/step      9.18 calls/step
+   moe_gather                               dev      0.587 ms/step     40.00 calls/step
+   rmsnorm_rope_roundtrip                   dev      0.525 ms/step     44.00 calls/step
+PS {"steps": 1024, "op_ms_step": 59.564, "dev_ms_step": 59.564, "host_ms_step": 0.0, "wait_ms_step": 5.124, "cats": {"moe_routed": 17.496, "allreduce": 15.561, "gemm_attn_proj": 9.918, "attn_core": 5.397, "mhc": 3.585, "gemm_shared_expert": 2.727, "elementwise_other": 1.398, "gemm_engram": 1.139, "gemm_router": 1.015, "router": 0.46, "sampling": 0.378, "gemm_compressor": 0.335, "gemm_indexer": 0.156}, "moe": {"exl3": 16.617, "other(moe_gather)": 0.587, "other(moe_scatter)": 0.292}, "top": [["all_reduce", 15.443, 81.0, "dev"], ["gemm_nt_ggml", 13.551, 322.0, "dev"], ["moe_exl3_gate_up", 11.514, 40.0, "dev"], ["moe_exl3_down", 5.103, 40.0, "dev"], ["mhc_mix", 2.003, 80.0, "dev"], ["attn_sparse_sink", 1.708, 40.0, "dev"], ["mhc_post_collapse_rmsnorm", 1.507, 78.0, "dev"], ["gemm_nt_f32", 1.332, 43.0, "dev"], ["rope_rows_roundtrip", 0.908, 52.0, "dev"], ["index_score", 0.904, 9.18, "dev"], ["moe_gather", 0.587, 40.0, "dev"], ["rmsnorm_rope_roundtrip", 0.525, 44.0, "dev"]], "phase": "pf", "secs": 73, "eng_steps": 1026.0, "eng_decode_steps": 1015.0, "wall_ms_step": 67.66, "wall_ms_decode_step": 48.57}
+
+== deep: 448 steps from dumps (202 s), op 435.83 ms/step (device 435.83, host-site 0.00), lane waits 5.37 ms/step; engine steps 424 (decode 382), profiled wall 468.75 ms/step
+   attn_core              145.832 ms/step  33.5 %
+   moe_routed              95.578 ms/step  21.9 %
+   allreduce               82.708 ms/step  19.0 %
+   gemm_attn_proj          44.026 ms/step  10.1 %
+   mhc                     29.917 ms/step   6.9 %
+   gemm_shared_expert      13.948 ms/step   3.2 %
+   gemm_engram              8.839 ms/step   2.0 %
+   elementwise_other        5.340 ms/step   1.2 %
+   gemm_router              4.506 ms/step   1.0 %
+   gemm_compressor          3.725 ms/step   0.9 %
+   router                   0.917 ms/step   0.2 %
+   gemm_indexer             0.278 ms/step   0.1 %
+   sampling                 0.217 ms/step   0.0 %
+   routed MoE split: exl3 89.703, other(moe_gather) 5.510, other(moe_scatter) 0.365
+   index_score                              dev    110.149 ms/step     30.43 calls/step
+   all_reduce                               dev     80.696 ms/step     81.00 calls/step
+   gemm_nt_ggml                             dev     65.905 ms/step    322.00 calls/step
+   moe_exl3_gate_up                         dev     62.120 ms/step     40.00 calls/step
+   moe_exl3_down                            dev     27.583 ms/step     40.00 calls/step
+   mhc_mix                                  dev     16.543 ms/step     80.00 calls/step
+   index_topk                               dev     15.224 ms/step     30.43 calls/step
+   mhc_post_collapse_rmsnorm                dev     12.839 ms/step     78.00 calls/step
+   attn_sparse_sink                         dev     11.140 ms/step     40.00 calls/step
+   gemm_nt_f32                              dev      8.174 ms/step     43.00 calls/step
+   rope_rows_roundtrip                      dev      6.381 ms/step     52.00 calls/step
+   moe_gather                               dev      5.510 ms/step     40.00 calls/step
+PS {"steps": 448, "op_ms_step": 435.831, "dev_ms_step": 435.831, "host_ms_step": 0.0, "wait_ms_step": 5.372, "cats": {"attn_core": 145.832, "moe_routed": 95.578, "allreduce": 82.708, "gemm_attn_proj": 44.026, "mhc": 29.917, "gemm_shared_expert": 13.948, "gemm_engram": 8.839, "elementwise_other": 5.34, "gemm_router": 4.506, "gemm_compressor": 3.725, "router": 0.917, "gemm_indexer": 0.278, "sampling": 0.217}, "moe": {"exl3": 89.703, "other(moe_gather)": 5.51, "other(moe_scatter)": 0.365}, "top": [["index_score", 110.149, 30.43, "dev"], ["all_reduce", 80.696, 81.0, "dev"], ["gemm_nt_ggml", 65.905, 322.0, "dev"], ["moe_exl3_gate_up", 62.12, 40.0, "dev"], ["moe_exl3_down", 27.583, 40.0, "dev"], ["mhc_mix", 16.543, 80.0, "dev"], ["index_topk", 15.224, 30.43, "dev"], ["mhc_post_collapse_rmsnorm", 12.839, 78.0, "dev"], ["attn_sparse_sink", 11.14, 40.0, "dev"], ["gemm_nt_f32", 8.174, 43.0, "dev"], ["rope_rows_roundtrip", 6.381, 52.0, "dev"], ["moe_gather", 5.51, 40.0, "dev"]], "phase": "deep", "secs": 202, "eng_steps": 424.0, "eng_decode_steps": 382.0, "wall_ms_step": 468.75, "wall_ms_decode_step": 42.5}

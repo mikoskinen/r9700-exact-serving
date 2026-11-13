@@ -1,0 +1,9 @@
+xepb-n5 warm-up IDENTICAL: 3 answers
+xepb-a2E-vs-a1E IDENTICAL: 20 of 20 answers
+xepb-gs16E-vs-a1E IDENTICAL: 20 of 20 answers
+xepb-gs8E-vs-a1E IDENTICAL: 20 of 20 answers
+xepb-a1O-vs-ref12-a1 IDENTICAL: 20 of 20 answers
+xepb-a1O-vs-prof1-a1 IDENTICAL: 20 of 20 answers
+xepb-a1E-vs-a1O-INFO 12 of 20 answers differ: p1 char 120 tok 26, p5 char 57 tok 17, p7 char 60 tok 16, p8 char 0 tok 0, p9 char 10 tok 1, p10 char 41 tok 7, p11 char 57 tok 12, p13 char 129 tok 42, p14 char 87 tok 17, p16 char 303 tok 52, p18 char 1 tok 0, p19 char 0 tok 0
+xepb-ldE-vs-a1E 1 of 20 answers differ: p0 char 189 tok 55
+xepb-a1E-vs-ref12-a1-INFO 12 of 20 answers differ: p1 char 120 tok 26, p5 char 57 tok 17, p7 char 60 tok 16, p8 char 0 tok 0, p9 char 10 tok 1, p10 char 41 tok 7, p11 char 57 tok 12, p13 char 129 tok 42, p14 char 87 tok 17, p16 char 303 tok 52, p18 char 1 tok 0, p19 char 0 tok 0

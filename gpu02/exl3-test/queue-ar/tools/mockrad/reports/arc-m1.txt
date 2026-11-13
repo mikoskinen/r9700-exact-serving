@@ -1,0 +1,23 @@
+MOCKRUN REPORT arc-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzzz-arc.sh | body rc 0 | 184 s | knobs: XARC_SW=0 XARC_COLD=12000B 12000C 6000C 6000B XARC_NTOK=32 XARC_C8DUR=12 XARC_C8WARM=4 XARC_DDUR=12 XARC_DWARM=4 XARC_EGEN=128 XARC_BUDGET_MIN=120 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/arc | 68 RESULT lines, 290 mock requests | last RESULT: xarc 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzzz-arc: done (2 min) -- /tmp/mockrad/arc-m1/home/gpu/ds41/exl3-test/runs/xdsm/arc | 2 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x xarc 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzzz-arc: start IMAGE=radiance-local:ds41-int10-f6ef7cc3-5c13e555-l (583c9743aa90) | VIRHE XARC_SW=0: NO mhc_fuse / ix_lds / ix_ni / draft_depth0 3 / stage_full_* / ds41_arcoded posted, the ARC counters INFO, P0 not fatal (a mock run only) | P0 r4d_selftest [ar_arcoded:29:420 ar_twoshot_4rank_exact:17:150 ar_twoshot_4rank_exact_lane:24:150] on 4 cards | SCREEN start: NST 5 stack5 start (stack4's + RADIANCE_LOG_STEPS=1, E1 declared off, HB ranks 1,2) + RADIANCE_DS41_MHC_FUSE=0 (M1 declared) | KVR OFF (RADIANCE_DS41_KV_REPLICATED unset), SP off | base pin = stack5's S5T with draft_sample 0 + SP pinned (stage_full_min 0, stage_full_pick 0) + M1 on / IX off /
+  1x xarc P0 ar_arcoded on 4 cards (r4d_selftest --case): VIRHE 0 ok (need 29), 0 FAIL, 0 skip, rc 125 | 
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 80 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (1)
+    2026-11-12 13:12:06 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xarc-p0-ar_arcoded-275101 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfi
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 39025 linked real files, 3 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r90zz-fn-sphc2.sh.out (size 387 -> 1505)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 3156 -> 3342)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 193230 -> 197523)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

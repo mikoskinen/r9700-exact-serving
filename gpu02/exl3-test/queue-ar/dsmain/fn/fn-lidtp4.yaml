@@ -1,0 +1,59 @@
+# fn-lidtp4.yaml (11.11.2026, queue-ar/dsmain/fn, ds-main-port; for dsm-fnloadid.sh starts x3 / s3) = fn4's fn-tp4zq.yaml (md5
+# 8f77be9f, 173 x3arm's compose; read only, untouched) line for line from "services:" on, except the project / container name
+# radiance-fnlid (so this item's down never touches another project). Flash-Next TEST server, NOT production: loopback
+# 127.0.0.1:8090, restart "no", no key flag; the serve line = flashnext-prod-dp-a.yaml's except --tp ${TP}, --placement ${PLACE},
+# MML ${MML} ${ROPE}, --ngram-placement ram (private), MAXSEQS / MNBT / NST / EXTRA from the item; the RADIANCE_FN4_* words
+# from the item's FN4* variables (empty = off). See fn-tp4zq.yaml's header for each word's history.
+name: radiance-fnlid
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${FNIMAGE:?set FNIMAGE}
+    container_name: radiance-fnlid
+    restart: "no"
+    volumes:
+      - ${FNMODELDIR:?set FNMODELDIR}:/models:ro
+      - ${STATSDIR:-/tmp}:/stats
+    environment:
+      ROCR_VISIBLE_DEVICES: "${CARDS:?set CARDS}"
+      RADIANCE_AQL_STAMP: ${AQLSTAMP:-}
+      RADIANCE_AQL_STAMP_OUT: /stats/stamps.csv
+      RADIANCE_AQL_STAMP_CARDS: ${AQLCARDS:-}
+      RADIANCE_AQL_ACQ:
+      RADIANCE_DRAFT_PMIN: ${PMIN:-}
+      RADIANCE_DRAFT_PMIN_BUCKET: ${PMINB:-}
+      RADIANCE_FN4_NO_ROUTE: ${FN4NR:-}
+      RADIANCE_FN4_GATHER_INV: ${FN4GI:-}
+      RADIANCE_FN4_HC_FUSEDOWN: ${FN4FD:-}
+      RADIANCE_FN4_HC_NORMWAVE: ${FN4NW:-}
+      RADIANCE_FN4_SWITCHABLE: ${FN4SW:-}
+      RADIANCE_FN4_HC_WRITEVEC: ${FN4WV:-}
+      RADIANCE_FN4_HC_READV: ${FN4RV:-}
+      RADIANCE_FN4_AR_LANE_THREADS: ${FN4AL:-}
+      RADIANCE_FN4_HC_UPMIX: ${FN4UM:-}
+      RADIANCE_FN4_HC_SS: ${FN4SS:-}
+      RADIANCE_FN4_CHAIN: ${FN4CH:-}
+      RADIANCE_PROFILE_EVERY: ${PROFEVERY:-}
+      RADIANCE_FN4_X3MAP: ${FN4XM:-}
+      RADIANCE_FN4_SPHC: ${FN4SPHC:-}
+      RADIANCE_FN4_X3CODES: ${FN4X3C:-}
+      RADIANCE_FN4_QSADUMP: ${FN4QSA:-}
+      RADIANCE_FN4_P2X: ${FN4P2X:-}
+      RADIANCE_FN4_MOE_PAIR: ${FN4MP:-}
+      RADIANCE_FN4_X3GD: ${FN4X3GD:-}
+      RADIANCE_FN4_X3DZ: ${FN4X3DZ:-}
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${FNMODEL:?set FNMODEL} --served-model-name qwen3.8-flash-next
+      --host 127.0.0.1 --port 8090
+      --tp ${TP:-3} --tp-wire wht6 --tp-wire-min-kb ${WIREKB:-128} --max-num-seqs ${MAXSEQS:-16} --max-model-len ${MML:-262144} ${ROPE:-}
+      --placement ${PLACE:-all_vram} --gpu-headroom-mib 96
+      --kv-cache-dtype fp8
+      --ngram-placement ram
+      --prefix-cache-mib 61440 --prefix-cache-ttl 28800
+      --checkpoint-slots 512 --checkpoint-policy keep-all
+      --num-speculative-tokens ${NST:-3} --max-num-batched-tokens ${MNBT:-2048}
+      --reasoning-effort medium --reasoning-effort-map high=xhigh
+      --thinking-token-budget 16000 --default-max-tokens 32768
+      ${EXTRA:-}

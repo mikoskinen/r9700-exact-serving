@@ -1,0 +1,4 @@
+xres-BASE warm-up IDENTICAL: 3 answers
+xres-GAIN2 warm-up IDENTICAL: 3 answers
+xres-GAIN05 warm-up IDENTICAL: 3 answers
+xres-SHADOW32 warm-up IDENTICAL: 3 answers

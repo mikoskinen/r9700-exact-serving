@@ -1,0 +1,7 @@
+YLLSUM c8: no block (mb.jsonl has no c8 row)
+YLLSUM c16: no block (mb.jsonl has no c16 row)
+YLLSUM 1u: no read (blocks.jsonl has no U1 row)
+YLLSUM cold: no read (cold.jsonl has no row)
+YLLSUM staggered (loadid: decode streams + a fresh prefill a probe, strict vs the arm's a1): not run
+YLLSUM identity (strict, T 0 greedy): 0 of 0 IDENTICAL
+YLLSUM headline (vs B = int12): c8 agg - | c8 decode step - | 1u - | c16 agg - | identity 0 / 0

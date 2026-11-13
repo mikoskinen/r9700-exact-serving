@@ -1,0 +1,27 @@
+# ds41-fix-tp4.yaml (6.11.2026) -- the queue-fix items 50-53: = ds41-117-tp4.yaml (MODELDIR mount, the serve line in ARGS,
+# project/container radiance-ds41-exl3, the profiling environment) plus the two A/B switches of the fix images, passed
+# through only when set in the shell (list syntax without a value: unset in the shell = unset in the container):
+#   RADIANCE_DS41_INDEX   deepseek41 indexer: keep,split (default when unset) | keep | split | off
+#   RADIANCE_EXL3_SPLITK  EXL3 EP split-K rules E1/E2: 1/on = on; unset = off (the default)
+name: radiance-ds41-exl3
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${IMAGE:?set IMAGE}
+    container_name: radiance-ds41-exl3
+    restart: "no"
+    volumes:
+      - ${MODELDIR:?set MODELDIR}:/models:ro
+      - ${STATSDIR:?set STATSDIR}:/stats
+    environment:
+      RADIANCE_PROFILE_EVERY: ${PROFEVERY:-}
+      RADIANCE_PROFILE_SYNC: ${PROFSYNC:-}
+      RADIANCE_AQL_STAMP: ${AQLSTAMP:-}
+      RADIANCE_AQL_STAMP_OUT: /stats/stamps.csv
+      RADIANCE_DS41_INDEX:
+      RADIANCE_EXL3_SPLITK:
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${MODEL:?set MODEL} --served-model-name deepseek-v4.1-flash --host 127.0.0.1 --port 8090
+      ${ARGS:?set ARGS}

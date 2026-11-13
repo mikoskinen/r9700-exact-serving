@@ -1,0 +1,19 @@
+S:A-warmup IDENTICAL: 3 answers
+S:th-hit-vs-cold-A IDENTICAL (1048 chars); token ids identical; logprobs equal on all 256 tokens
+S:a1-A-vs-d0 IDENTICAL: 20 of 20 answers
+S:a1-A-vs-stack4-a1S IDENTICAL: 20 of 20 answers
+S:B-warmup IDENTICAL: 3 answers
+S:th-hit-vs-cold-B IDENTICAL (1048 chars); token ids identical; logprobs equal on all 256 tokens
+S:a1-B-vs-d0 IDENTICAL: 20 of 20 answers
+S:a1-B-vs-stack4-a1S IDENTICAL: 20 of 20 answers
+S:a1-B-vs-a1-A IDENTICAL: 20 of 20 answers
+S:th-cold-B-vs-th-cold-A IDENTICAL (1048 chars); token ids identical; logprobs equal on all 256 tokens
+S:th-hit-B-vs-th-hit-A IDENTICAL (1048 chars); token ids identical; logprobs equal on all 256 tokens
+S:V-warmup IDENTICAL: 3 answers
+S:th-hit-vs-cold-V IDENTICAL (1048 chars); token ids identical; logprobs equal on all 256 tokens
+S:a1-V-vs-d0 IDENTICAL: 20 of 20 answers
+S:a1-V-vs-stack4-a1S IDENTICAL: 20 of 20 answers
+S:a1-V-vs-a1-A IDENTICAL: 20 of 20 answers
+S:a1-V-vs-a1-B IDENTICAL: 20 of 20 answers
+S:th-cold-V-vs-th-cold-A IDENTICAL (1048 chars); token ids identical; logprobs equal on all 256 tokens
+S:th-hit-V-vs-th-hit-A IDENTICAL (1048 chars); token ids identical; logprobs equal on all 256 tokens

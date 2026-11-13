@@ -1,0 +1,32 @@
+2026-11-12 19:44:32 mockrun yll-m4: farm: FARM {"copied": 6902, "linked": 41585, "dirlinks": 45, "skipped": 2, "seconds": 2.8}
+2026-11-12 19:44:32 mockrun yll-m4: port 18092, sandbox /tmp/mockrad/yll-m4, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yll.sh (sandbox copy), knobs: YLL_SW=0 YLL_C8WIN=8 YLL_C8WARM=4 YLL_C8ORDER=BCD YLL_C16ORDER=BC YLL_U1ORDER=BC YLL_NREADS=1 YLL_LDPF=2048 YLL_BUDGET_MIN=60, faults: none, swaps: none; 35 body literals echoed; replay: 23 recorded answers
+2026-11-12 19:44:38 mockrun yll-m4: DRYRUN rc 0, 203 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/yll/l1
+2026-11-12 19:44:38 mockrun yll-m4: run (timeout 1800 s)
+2026-11-12 19:48:08 mockrun yll-m4: body rc 0 after 219 s
+MOCKRUN REPORT yll-m4
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yll.sh | body rc 0 | 219 s | knobs: YLL_SW=0 YLL_C8WIN=8 YLL_C8WARM=4 YLL_C8ORDER=BCD YLL_C16ORDER=BC YLL_U1ORDER=BC YLL_NREADS=1 YLL_LDPF=2048 YLL_BUDGET_MIN=60 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/yll/l1 | 85 RESULT lines, 439 mock requests | last RESULT: yll 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yll: done (3 min) -- /tmp/mockrad/yll-m4/home/gpu/ds41/exl3-test/runs/xdsm/yll/l1 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (1)
+    2026-11-12 19:44:43 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yll-p0-arll-1906210 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41583 linked real files, 8 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/mock-yll-m4.txt (size 0 -> 759)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 858095 -> 864479)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yswl.sh.out (size 16971 -> 23675)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/mb.jsonl (size 0 -> 892)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/blocks.jsonl (size 0 -> 8918)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/identity.txt (size 39 -> 83)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/sets.jsonl (size 0 -> 175)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/xswl-ldB.txt (size 128 -> 3258)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/yll-m4.txt | sandbox: /tmp/mockrad/yll-m4

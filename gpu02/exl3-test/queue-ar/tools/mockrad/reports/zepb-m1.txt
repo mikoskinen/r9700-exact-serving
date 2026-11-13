@@ -1,0 +1,28 @@
+MOCKRUN REPORT zepb-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zepb.sh | body rc 0 | 290 s | knobs: XEP_SW=0 XEP_EGEN=128 XEP_C8WIN=8 XEP_C8WARM=4 XEP_C16DUR=10 XEP_C16WARM=4 XEP_BUDGET_MIN=120 XEP_NREADS=1 XEP_LDPF=2000 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/epb | 111 RESULT lines, 437 mock requests | last RESULT: xepb 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zepb: done (4 min) -- /tmp/mockrad/zepb-m1/home/gpu/ds41/exl3-test/runs/xdsm/epb | 2 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x xepb xepb-n5 EPB note: mock: the slot-order MoE sum (lever D3s / EPB) in the decode band | 'did not resolve' lines 0 (want 0) | VRAM at start (experts per tier, rank 0 / 1 ..; this start, then prof1's int12 start): {'vram': 2927, 'pinned': 1009, 'pageable': 0, 'ssd': 0, 'mapped': 0} | {'vram': 2921, 'pinned': 1015, 'pageable': 0, 'ssd': 0, 'mapped': 0} |  -- VIRHE the EPB declaration is not as asked
+  1x xepb xepb-p5 EPB note: mock: the slot-order MoE sum (lever D3s / EPB) in the decode band | 'did not resolve' lines 0 (want 0) | VRAM at start (experts per tier, rank 0 / 1 ..; this start, then prof1's int12 start): {'vram': 2927, 'pinned': 1009, 'pageable': 0, 'ssd': 0, 'mapped': 0} | {'vram': 2921, 'pinned': 1015, 'pageable': 0, 'ssd': 0, 'mapped': 0} |  -- VIRHE the EPB declaration is not as asked
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 260 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (2)
+    2026-11-12 18:09:43 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xepb-p0-moe_gather_all_reduce_sl-1494252 --network none --device /dev/kfd --device /dev/dri --security-opt 
+    2026-11-12 18:09:43 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xepb-p0-moe_scatter_placed_i32-1494252 --network none --device /dev/kfd --device /dev/dri --security-opt se
+  unknown endpoints: none
+  fn4 POSTs refused: 2 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41103 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzz-res.sh.out (size 56396 -> 72557)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 696965 -> 704786)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/res12/mb.jsonl (size 2689 -> 3581)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/res12/blocks.jsonl (size 48236 -> 50245)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/res12/identity.txt (size 79 -> 120)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/res12/sets.jsonl (size 340 -> 455)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/res12/c8/c8-3-S-O.txt (size 0 -> 1026)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

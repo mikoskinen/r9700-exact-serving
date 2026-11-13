@@ -1,0 +1,52 @@
+# fn-tp2s.yaml (10.11.2026, queue-ar; for 143) = fn-tp2.yaml + --max-num-batched-tokens ${MNBT:-2048} and the fn4 switches of the
+# radiance-local:c16-* images (RADIANCE_FN4_*: empty = off; every other image ignores them).
+# fn-tp2.yaml (7.11.2026, queue-ar; for 84-fn-tuned.sh) -- Qwen3.8-Flash-Next TEST server, NOT production: its own project /
+# container (radiance-fntest), port 127.0.0.1:8090 (the harness tools' default), restart "no", no key. Cards 83:00 + 86:00
+# (production A's pair: GPU-4d61f52cafe37588, GPU-5943fea82aeead65). The serve line = flashnext-prod-dp-a.yaml's (4.11.:
+# TP2 wht6 min-kb 128, MAXSEQS 16, MML 524288 yarn:2, expert_tiered host pool 16384 + headroom 96, fp8 KV, prefix 61440 TTL
+# 8 h, 512 keep-all checkpoints, MTP 3, MNBT 2048, the reasoning flags) except: --ngram-placement ram (a private table, not
+# production's shared /dev/shm file), no --api-key-env, the model file from FNMODEL in FNMODELDIR.
+# Env: FNIMAGE, FNMODELDIR, FNMODEL (required); MAXSEQS (16), HP (16384), MML (524288), EXTRA; the engine switches below are
+# passed only when set in the shell (unset in the shell = unset in the container).
+name: radiance-fntest
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${FNIMAGE:?set FNIMAGE}
+    container_name: radiance-fntest
+    restart: "no"
+    volumes:
+      - ${FNMODELDIR:?set FNMODELDIR}:/models:ro
+    environment:
+      ROCR_VISIBLE_DEVICES: "GPU-4d61f52cafe37588,GPU-5943fea82aeead65"
+      RADIANCE_HEAT_PREFILL:
+      RADIANCE_HEAT_PREFILL_DECAY:
+      RADIANCE_HEAT_PREFILL_GAIN:
+      RADIANCE_HEAT_DECODE_PIN:
+      RADIANCE_HEAT_MOVES:
+      RADIANCE_PLACE_TURNOVER:
+      RADIANCE_STAGE_MIXED:
+      RADIANCE_STAGE_SPAN:
+      RADIANCE_ARENA_LEVEL_MAX:
+      RADIANCE_ARENA_HOLD_MS:
+      RADIANCE_FN4_NO_ROUTE: ${FN4NR:-}
+      RADIANCE_FN4_GATHER_INV: ${FN4GI:-}
+      RADIANCE_FN4_HC_NORMWAVE: ${FN4NW:-}
+      RADIANCE_FN4_HC_WRITEVEC: ${FN4WV:-}
+      RADIANCE_FN4_HC_READV: ${FN4RV:-}
+      RADIANCE_FN4_HC_UPMIX: ${FN4UM:-}
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${FNMODEL:?set FNMODEL} --served-model-name qwen3.8-flash-next
+      --host 127.0.0.1 --port 8090
+      --tp 2 --tp-wire wht6 --tp-wire-min-kb 128 --max-num-seqs ${MAXSEQS:-16} --max-model-len ${MML:-524288} --rope-scaling yarn:2
+      --placement expert_tiered --host-pool-mib ${HP:-16384} --gpu-headroom-mib 96
+      --kv-cache-dtype fp8
+      --ngram-placement ram
+      --prefix-cache-mib 61440 --prefix-cache-ttl 28800
+      --checkpoint-slots 512 --checkpoint-policy keep-all
+      --num-speculative-tokens 3 --max-num-batched-tokens ${MNBT:-2048}
+      --reasoning-effort medium --reasoning-effort-map high=xhigh
+      --thinking-token-budget 16000 --default-max-tokens 32768
+      ${EXTRA:-}

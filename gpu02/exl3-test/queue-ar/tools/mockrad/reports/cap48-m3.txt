@@ -1,0 +1,27 @@
+MOCKRUN REPORT cap48-m3
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-cd-cap48.sh | body rc 0 | 262 s | knobs: XC48_CAPSW=0 XC48_DUR=12 XC48_WARM=4 XC48_MT=48 XC48_GDEP=4000 XC48_LIDPF=600 XC48_BUDGET_MIN=120 XC48_INFO85=1 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/cap48 | 91 RESULT lines, 759 mock requests | last RESULT: xc48 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-cd-cap48: done in 4 min -- /tmp/mockrad/cap48-m3/home/gpu/ds41/exl3-test/runs/xdsm/cap48 (254122 MB free) | 2 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (3)
+  1x xc48 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-cd-cap48: start IMAGE=radiance-local:ds41-cap48-e5acfbcf-5c13e555-l (e93c0cef6849) | VIRHE XC48_CAPSW=0: NO cap switch posted, no cap check (a mock run only) | lever CAP48 (RADIANCE_DECODE_ROW_CAP=48 at start, fn4 sched_row_cap in process) | one start: MAXSEQS 16 nvfp4, S5T pin | phases [a1:D:alone0 gs16:D:gs0 lid16:D:lid0 a1z:Z:set1 gs16z:Z:gs1 lid16z:Z:lid1 c16:S:mb16 c8:S:mb8 gs16o:d:gs0 lid16o:d:lid0 a2:D:alone0 lid16zo:z:lid1 a1s:D:set1 lid16s:D:lid1] | ~29 min (budget 120)
+  1x  [mock: real ref] xc48 identity S:a1-vs-d0 (dsd-d0-gs-c1.jsonl vs c16-a1.jsonl): VIRHE 10 of 20 answers differ: p0 char 185 tok 48, p1 char 231 tok 48, p3 char 138 tok 48, p5 char 144 tok 48, p6 char 407 tok 96, p8 char 186 tok 48, p10 char 278 tok 96, p11 char 239 tok 48, p14 char 252 tok 48, p16 char 274 tok 48 -- reported, not hidden
+  1x xc48 guards (item): VIRHE in 2 place(s) -- see the lines above; a reading with VIRHE is not a reading | phases done: a1 gs16 lid16 a1z gs16z lid16z c16 c8 gs16o lid16o a2 lid16zo a1s lid16s
+MISSING / NOT FOUND (4)
+  2026-11-12 09:12:56 RESULT xc48 note -- cross-start speed references not all in /tmp/mockrad/cap48-m3/home/gpu/ds41/exl3-test/runs/ds41-exl3.log (REFS MISSING ['kv4_c16', 'kv4_c16_p50', 's5t_c8'] | kv4 n16 c16 None tok/s (p50 None), kv4 n16 c8 None (p50 None) | stack5 S5T c8 None +- None (p50 None)): the speed lines print '-' for them
+  2026-11-12 09:12:56 RESULT xc48 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-cd-cap48: helpers md5: cap48probe.py 9994340b (copy of stack4/loadid.py ee7d9663 + T / seed / set), cap48sum.py 9151b2bf, ncmb.py ded624e5 (kv4's ded624e5), ncone.py a24570f8, stack5/s5ctr.py 256dfd9a, greedyset.py 0dff112f, deepq.py ade016f4, mb.py fc7fccb4, lib-29.sh c9826dce, yaml be8fb6d6 | references: REFS MISSING ['kv4_c16', 
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 38120 linked real files, 5 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/cap48/dry-cap48.txt (size 61307 -> 61361)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1106.csv (size 14767236 -> 14774835)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/ccsim-1112-0904-xcc-b8-1-u8.txt (size 1337 -> 1874)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/ccsim-1112-0904-xcc-b8-1-u8.jsonl (size 2483 -> 8072)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/cc/b8-1-samp.jsonl (size 111435 -> 167551)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

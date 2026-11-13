@@ -1,0 +1,7 @@
+#!/bin/bash
+# refuse (mockrad shim, 12.11.2026) -- installed under the names of commands a mock run must never run (sudo, power / fan /
+# clock tools, ssh, systemctl, pkill / killall, reboot, ...): one line on stderr + MOCKRAD_STATE/guard.log, exit 1.
+n=$(basename "$0")
+echo "$(date '+%F %T') refused command: $n $*" >> "${MOCKRAD_STATE:-/dev/null}/guard.log" 2>/dev/null
+echo "$n (mockrad shim): refused under the mock ($n $*)" >&2
+exit 1

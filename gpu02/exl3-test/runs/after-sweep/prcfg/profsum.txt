@@ -1,0 +1,7 @@
+# /home/mikoskinen/gpu/ds41/exl3-test/runs/after-sweep/prcfg: rank 0, 1 complete dumps, every 32 steps; marks [('start', 12077), ('1u', 13330), ('c4', 14589), ('pf16k', 15843)]
+
+== 1u: no complete dump in the window (303 s)
+
+== c4: no complete dump in the window (303 s)
+
+== pf16k: no complete dump in the window (304 s)

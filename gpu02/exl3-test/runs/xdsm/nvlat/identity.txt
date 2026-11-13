@@ -1,0 +1,14 @@
+nv-aplain warm-up answers vs stock (x117-best524-warm-q.txt): IDENTICAL: 3 answers
+nv-aplain 28k copy p1A-cold vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-aplain 28k copy p1A-hit vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-aplain greedy set c1 vs bz d0 (NST 0, stock, bf16): IDENTICAL: 20 answers
+nv-bplain warm-up answers vs stock (x117-best524-warm-q.txt): IDENTICAL: 3 answers
+nv-bplain 28k copy p1B-cold vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-bplain 28k copy p1B-hit vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-bplain greedy set c1 vs bz d0 (NST 0, stock, bf16): IDENTICAL: 20 answers
+nv-bstamp warm-up answers vs stock (x117-best524-warm-q.txt): IDENTICAL: 3 answers
+nv-bstamp 28k copy p2B-cold vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-bstamp 28k copy p2B-hit vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-astamp warm-up answers vs stock (x117-best524-warm-q.txt): IDENTICAL: 3 answers
+nv-astamp 28k copy p2A-cold vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)
+nv-astamp 28k copy p2A-hit vs bz d0 (NST 0, stock, bf16): IDENTICAL (2399 chars)

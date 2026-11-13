@@ -1,0 +1,2 @@
+RESULT xc48 IDENTITY under the cap (strict, B48: loaded vs alone, T 0 greedy and T 1 seeded with draft_sample 0): - || S: - || CONTROL cap 0 (counts, the > 48-row BI failure the cap removes): - || INFORMATION: - || verdict: no strict compare ran
+RESULT xc48 SUMMARY cap 48: identity not run | > 48-row steps under the cap: none | the cap trimmed 0 drafts in 0 steps (cap-on windows) | guards OK

@@ -1,0 +1,30 @@
+2026-11-12 23:28:30 mockrun k25s-stop2: farm: FARM {"copied": 6991, "linked": 42464, "dirlinks": 45, "skipped": 2, "swapped": ["gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1/yzi-a1-Z.jsonl <- /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/ref14/mock-stop-a1Z.jsonl"], "seconds": 2.9}
+2026-11-12 23:28:30 mockrun k25s-stop2: port 18092, sandbox /tmp/mockrad/k25s-stop2, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzk25s.sh (sandbox copy), knobs: K25S_SW=0 K25S_C8WARM=4 K25S_BUDGET_MIN=120 K25S_LDPF=2048 K25S_C8GN=1 K25S_U1N=1 NGSHARE_DIR=/tmp/mockrad/k25s-stop2/ngdir NGSHARE_RUN=/tmp/mockrad/k25s-stop2/ngrun NGSHARE_LOG=/tmp/mockrad/k25s-stop2/ngshare.log, faults: none, swaps: gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1/yzi-a1-Z.jsonl=gpu/ds41/exl3-test/queue-ar/dsmain/ref14/mock-stop-a1Z.jsonl; 34 body literals echoed; replay: 23 recorded answers
+2026-11-12 23:28:37 mockrun k25s-stop2: DRYRUN rc 0, 186 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/zzk25s
+2026-11-12 23:28:37 mockrun k25s-stop2: run (timeout 3000 s)
+2026-11-12 23:31:46 mockrun k25s-stop2: body rc 0 after 199 s
+MOCKRUN REPORT k25s-stop2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzk25s.sh | body rc 0 | 200 s | knobs: K25S_SW=0 K25S_C8WARM=4 K25S_BUDGET_MIN=120 K25S_LDPF=2048 K25S_C8GN=1 K25S_U1N=1 NGSHARE_DIR=/tmp/mockrad/k25s-stop2/ngdir NGSHARE_RUN=/tmp/mockrad/k25s-stop2/ngrun NGSHARE_LOG=/tmp/mockrad/k25s-stop2/ngshare.log | faults: - | swaps: gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1/yzi-a1-Z.jsonl=gpu/ds41/exl3-test/queue-ar/dsmain/ref14/mock-stop-a1Z.jsonl
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzk25s | 45 RESULT lines, 148 mock requests | last RESULT: xk25s 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzk25s: done (3 min) -- /tmp/mockrad/k25s-stop2/home/gpu/ds41/exl3-test/runs/xdsm/zzk25s | STOPPED at the identity gate (no speed block ran): NEEDS USER | 2 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x xk25s identity a1-B-vs-yzint14c-a1-Z: VIRHE xk25s-a1-B-vs-yzint14c-a1-Z 1 of 20 answers differ: p0 char 40 tok 12 (strict, T 0 greedy)
+  1x xk25s IDENTITY GATE: VIRHE strict identity failed [a1-B-vs-yzint14c-a1-Z] -> the item STOPS before every speed block (exact = byte-identical: NEEDS USER) | arms B {} Z {} on the int14 pin | the failing comparisons are in /tmp/mockrad/k25s-stop2/home/gpu/ds41/exl3-test/runs/xdsm/zzk25s/identity.txt and /tmp/mockrad/k25s-stop2/home/gpu/ds41/exl3-test/runs/xdsm/zzk25s/xk25s-*-cmp-*.json
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42462 linked real files, 5 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zzk25s/mock-k25s-stop2.out (size 0 -> 1139)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1242674 -> 1248592)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zrq14.sh.out (size 26773 -> 30820)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zrq14/mb.jsonl (size 4481 -> 8979)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/zrq14/c8/c4-m16-w-S-wB.txt (size 0 -> 918)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/k25s-stop2.txt | sandbox: /tmp/mockrad/k25s-stop2

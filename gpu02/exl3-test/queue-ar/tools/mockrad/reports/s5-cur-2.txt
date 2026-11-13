@@ -1,0 +1,24 @@
+MOCKRUN REPORT s5-cur-2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-uzzzz-stack5.sh | body rc 0 | 324 s | knobs: XS5_DUR=12 XS5_WARM=4 XS5_ORDER0=AS XS5_ORDER1=T XS5_PORDER=AS XS5_LORDER=A XS5_DEPTHS=12000 6000 XS5_LDEPTH=6000 XS5_GDEP=4000 XS5_CDEPTH=6000 XS5_CNTOK=48 (--decode-scale 0.3) | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/stack5 | 118 RESULT lines, 686 mock requests | last RESULT: xs5 57-p4zyzzzzz-ds-r00zzz-cz-uzzzz-stack5: done (5 min) -- /tmp/mockrad/s5-cur-2/home/gpu/ds41/exl3-test/runs/xdsm/stack5 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 80 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 4 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 37774 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r00zzz-cz-x-kvrz-sp.sh.out (size 81858 -> 137042)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1106.csv (size 14727854 -> 14737207)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after2.out (size 45353 -> 45549)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/sp/guard.txt (size 9418 -> 15563)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/sp/c8-4B.txt (size 0 -> 409)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/sp/identity.txt (size 35 -> 1197)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/sp/c8.jsonl (size 849 -> 2291)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

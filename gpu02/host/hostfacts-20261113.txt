@@ -1,0 +1,20 @@
+# gpu02 host facts, read-only reads on 2026-11-13T05:34:00Z
+## /proc/cpuinfo model name
+model name	: AMD EPYC 7302P 16-Core Processor
+## /sys/class/dmi/id/board_vendor, board_name
+ASRockRack
+ROMED8-2T
+## /proc/meminfo
+MemTotal:       523567628 kB
+## GPUs: PCI device id, mem_info_vram_total bytes
+0x7551 34208743424
+0x7551 34208743424
+0x7551 34208743424
+0x7551 34208743424
+## cpuidle states (cpu0): name latency_us disable
+POLL 0 0
+C1 1 0
+C2 400 1
+## governor, numa_balancing
+performance
+0

@@ -1,0 +1,23 @@
+# DRYRUN=1 bash queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-qkbench.sh at 2026-11-12 00:07:25 rc 0
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/bin/kb2_ix present, md5 245e80aa
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/bin/kb2_m1 present, md5 5db10dd4
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/data/blk9_hc_ffn_fn.f32 present, md5 2af68c45
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/data/blk9_hc_ffn_base.f32 present, md5 11e40834
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/data/blk9_hc_ffn_scale.f32 present, md5 4e25537e
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/data/blk10_hc_attn_fn.f32 present, md5 485fac90
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/data/blk10_hc_attn_base.f32 present, md5 246e0695
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/data/blk10_hc_attn_scale.f32 present, md5 8e736584
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/data/blk10_attn_norm.f32 present, md5 1ae4076a
+  (check) /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/kbsum2.py present
+  (check) image radiance-local:ds41-int7-0391a6ec-5c13e555-l present (b54f9224a056)
++ mkdir -p /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2
+  (dry) the item: 1 radiance container(s) up now (the run refuses while any is)
+[dry, not logged] 2026-11-12 00:07:25 RESULT xkb2: start IMAGE=radiance-local:ds41-int7-0391a6ec-5c13e555-l (b54f9224a056) card 0 kb2_ix 245e80aa kb2_m1 5db10dd4 data 7/7 real tensors -> /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2 (~3-6 min estimate, bounded 13.5 min)
++ gpurun dskb2-$$-ix136k 240 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e HIP_VISIBLE_DEVICES=0 -v /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/bin:/b:ro --entrypoint /b/kb2_ix radiance-local:ds41-int7-0391a6ec-5c13e555-l --ctx 139264 --no-stress  > /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2/ix-136k.txt 2>&1
++ gpurun dskb2-$$-ix64k 150 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e HIP_VISIBLE_DEVICES=0 -v /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/bin:/b:ro --entrypoint /b/kb2_ix radiance-local:ds41-int7-0391a6ec-5c13e555-l --ctx 65536 --no-stress  > /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2/ix-64k.txt 2>&1
++ gpurun dskb2-$$-ix16k 120 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e HIP_VISIBLE_DEVICES=0 -v /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/bin:/b:ro --entrypoint /b/kb2_ix radiance-local:ds41-int7-0391a6ec-5c13e555-l --ctx 16384 --no-stress  > /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2/ix-16k.txt 2>&1
++ gpurun dskb2-$$-ixstress 120 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e HIP_VISIBLE_DEVICES=0 -v /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/bin:/b:ro --entrypoint /b/kb2_ix radiance-local:ds41-int7-0391a6ec-5c13e555-l --ctx 65536 --stress-only  > /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2/ix-stress.txt 2>&1
++ gpurun dskb2-$$-m1 180 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e HIP_VISIBLE_DEVICES=0 -v /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/bin:/b:ro -v /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/data:/kbdata:ro --entrypoint /b/kb2_m1 radiance-local:ds41-int7-0391a6ec-5c13e555-l --weights /kbdata  > /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2/m1.txt 2>&1
++ python3 -I /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/kb/kbsum2.py /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2 > /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2/kbsum2.txt 2>&1
+DRYRUN: 0 MISSING, 0 VIRHE (nothing started, nothing written)
+[dry, not logged] 2026-11-12 00:07:25 RESULT xkb2: done -- /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/kbench2

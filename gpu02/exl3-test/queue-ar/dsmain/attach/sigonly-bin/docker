@@ -1,0 +1,25 @@
+#!/bin/bash
+# docker (attach SIGONLY guard, 12.11.2026, queue-ar/dsmain/attach/sigonly-bin) -- first on PATH in a SIGONLY=1 DRYRUN=1 pass
+# (attach.sh att_sigonly): read-only calls go to the next docker on PATH; anything that could start, stop or change a container
+# (up / down / rm / stop / kill / exec / a run with a device, a volume, a name or a network) is refused with exit 1, so a body whose
+# DRYRUN path is not dry can never touch the kept server.
+self=$(cd "$(dirname "$0")" && pwd)
+P=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$self" | paste -sd: -)
+real=$(PATH=$P command -v docker) || { echo "docker (sigonly guard): no docker on PATH" >&2; exit 1; }
+ok=0
+case "${1:-}" in
+  ps|images|version|info|inspect|logs) ok=1 ;;
+  image|container) [ "${2:-}" = inspect ] && ok=1 ;;
+  compose) for a in "$@"; do [ "$a" = config ] && ok=1; done
+           for a in "$@"; do case $a in up|down|start|stop|rm|kill|restart|create|run|exec|pull|build|pause|unpause) ok=0 ;; esac; done ;;
+  run) ok=1; rm1=0; nonet=0; prev=""
+       for a in "$@"; do
+         case $a in --device*|--gpus*|-v|--volume*|--mount*|--privileged|-d|--detach|--name*|--network=host|--ipc*|--pid*) ok=0 ;; esac
+         [ "$a" = --rm ] && rm1=1
+         if [ "$a" = --network=none ] || { [ "$prev" = --network ] && [ "$a" = none ]; }; then nonet=1; fi
+         prev=$a
+       done
+       [ $rm1 = 1 ] && [ $nonet = 1 ] || ok=0 ;;
+esac
+[ $ok = 1 ] || { echo "docker (sigonly guard): refused in a SIGONLY pass: docker $*" | cut -c1-300 >&2; exit 1; }
+exec "$real" "$@"

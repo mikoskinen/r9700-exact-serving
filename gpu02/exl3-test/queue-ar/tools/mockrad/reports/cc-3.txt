@@ -1,0 +1,22 @@
+MOCKRUN REPORT cc-3
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-cc.sh | body rc 0 | 109 s | knobs: XCC_USERS=4 XCC_MAXSEQS=4 XCC_TURNS=4 XCC_WTURNS=1 XCC_CAP=300 XCC_SAMP=5 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/cc | 55 RESULT lines, 44 mock requests | last RESULT: xcc 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-cc: done in 1 min -- /tmp/mockrad/cc-3/home/gpu/ds41/exl3-test/runs/xdsm/cc (254390 MB free)
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x xcc runs: 2 of 2 with a reading (b8-1 n8-1), 0 with a guard VIRHE; NO identity claim (natural mode: replies may differ between runs; nvfp4's exactness is KV4's identity result, not this item's)
+  1x xcc guards (item): VIRHE in 1 place(s) -- see the lines above; a reading with VIRHE is not a reading | runs done: b8-1 n8-1 of [b8-1 n8-1] (A / B once, b8 first: order and drift not cancelled)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 160 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 2 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 38110 linked real files, 3 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1106.csv (size 14759940 -> 14763132)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/ccsim-1112-0904-xcc-b8-1-u8.txt (size 817 -> 1073)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/cc/b8-1-samp.jsonl (size 57548 -> 81263)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

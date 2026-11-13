@@ -1,0 +1,17 @@
+MOCKRUN REPORT d0ab
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-ce-d0ab.sh | body rc 0 | 177 s | knobs: XS5_DUR=12 XS5_WARM=4 XD0_SETTLE=1 XS5_GDEP=4000 XS5_BUDGET_MIN=17 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/d0ab | 83 RESULT lines, 384 mock requests | last RESULT: xd0 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-ce-d0ab: done (2 min) -- /tmp/mockrad/d0ab/home/gpu/ds41/exl3-test/runs/xdsm/d0ab | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 80 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 4 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 38405 linked real files, 0 changed during the run
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

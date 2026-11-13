@@ -1,0 +1,33 @@
+BW finished 16:13:42 -> runs/rocm-bw/gpu02-4x64-1102-1612.txt
+2026-11-02 16:13:42 arm tp2-1140-s8: /home/mikoskinen/radiance-1.14.0/compose/flashnext-exact.yaml image=stilldeadcode/radiance:1.14.0 levels=[1 8] reps=2
+ Container radiance-flashnext  Starting
+ Container radiance-flashnext  Started
+2026-11-02 16:14:58 healthy after 76 s
+2026-11-02 16:15:05 c1: agg 152.2, per stream 200.0, ttft 0.41s|agg 155.3, per stream 200.1, ttft 0.37s
+2026-11-02 16:15:20 c8: agg 367.3, per stream 75.4, ttft 2.37s|agg 365.9, per stream 73.4, ttft 1.78s
+2026-11-02 16:15:46 prefill: 64063 6574.5 | 15457 6300.2 | 64063 6456.9 | 
+2026-11-02 16:15:46 E lines in engine log: 0
+ Container radiance-flashnext  Removed
+2026-11-02 16:15:49 done -> /home/mikoskinen/gpu/bench/runs/1102-1613-tp2-1140-s8
+2026-11-02 16:15:49 arm tp2-1140-s16: /home/mikoskinen/radiance-1.14.0/compose/flashnext-exact-s16.yaml image=stilldeadcode/radiance:1.14.0 levels=[16] reps=2
+ Container radiance-flashnext  Starting
+ Container radiance-flashnext  Started
+2026-11-02 16:17:05 healthy after 76 s
+2026-11-02 16:17:28 c16: agg 429.0, per stream 45.2, ttft 3.66s|agg 444.6, per stream 48.0, ttft 3.38s
+2026-11-02 16:17:55 prefill: 64063 6417.7 | 15457 5870.0 | 64063 6206.6 | 
+2026-11-02 16:17:55 E lines in engine log: 0
+ Container radiance-flashnext  Removed
+2026-11-02 16:17:58 done -> /home/mikoskinen/gpu/bench/runs/1102-1615-tp2-1140-s16
+2026-11-02 16:17:58 arm tp2-1151-s8: /home/mikoskinen/radiance-1.15.1/compose/flashnext-exact.yaml image=stilldeadcode/radiance:1.15.1 levels=[1 8] reps=2
+ Container radiance-flashnext  Starting
+ Container radiance-flashnext  Started
+2026-11-02 16:19:14 healthy after 76 s
+2026-11-02 16:19:21 c1: agg 150.8, per stream 196.2, ttft 0.40s|agg 154.7, per stream 198.9, ttft 0.37s
+2026-11-02 16:19:35 c8: agg 365.3, per stream 73.2, ttft 2.08s|agg 373.8, per stream 74.7, ttft 1.77s
+2026-11-02 16:20:01 prefill: 64063 6593.5 | 15457 6427.0 | 64063 6515.4 | 
+2026-11-02 16:20:01 E lines in engine log: 0
+ Container radiance-flashnext  Removed
+2026-11-02 16:20:04 done -> /home/mikoskinen/gpu/bench/runs/1102-1617-tp2-1151-s8
+2026-11-02 16:20:04 arm tp2-1151-s16: /home/mikoskinen/radiance-1.15.1/compose/flashnext-exact-s16.yaml image=stilldeadcode/radiance:1.15.1 levels=[16] reps=2
+ Container radiance-flashnext  Starting
+ Container radiance-flashnext  Started

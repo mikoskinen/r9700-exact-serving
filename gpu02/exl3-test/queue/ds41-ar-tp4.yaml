@@ -1,0 +1,44 @@
+# ds41-ar-tp4.yaml (6.11.2026, queue-ar) -- the queue-ar items 70-: = ds41-fix-tp4.yaml (MODELDIR mount, the serve line in ARGS,
+# project/container radiance-ds41-exl3, the profiling environment, the indexer / split-K switches) plus the heat engine's two
+# knobs (ds41-ar images and later), passed through only when set in the shell (list syntax without a value: unset in the
+# shell = unset in the container):
+#   RADIANCE_HEAT_PREFILL     0..1: a step with prefill rows counts as its decode rows + this share of its prefill rows
+#                             (decay and credit); unset = 1 (the engine as before, bit for bit)
+#   RADIANCE_HEAT_CREDIT_CAP  the most selections one histogram credits; unset = 512
+#   RADIANCE_HEAT_MOVES       (7cecf223 images) swaps a step per slab class; unset = 64. The turnover slots follow it
+#   RADIANCE_PLACE_TURNOVER   (7cecf223 images) lent slots a class keeps free for swaps, outright; unset = 3 x moves - 32
+#   RADIANCE_HEAT_PREFILL_DECAY, RADIANCE_HEAT_PREFILL_GAIN  (bb654442 images) dual heat: prefill heat decay a step (0..1) and
+#                             credit scale; unset = one heat
+#   RADIANCE_HEAT_DECODE_PIN  (7e342763 images) with dual heat: fraction of the resident set, decode-hottest first, no
+#                             promotion may demote; unset = 0
+#   RADIANCE_DS41_ARGATHER    (ea7d3423 images) the MoE gather + all-reduce as one kernel up to N rows (on = 4); unset = off
+name: radiance-ds41-exl3
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${IMAGE:?set IMAGE}
+    container_name: radiance-ds41-exl3
+    restart: "no"
+    volumes:
+      - ${MODELDIR:?set MODELDIR}:/models:ro
+      - ${STATSDIR:?set STATSDIR}:/stats
+    environment:
+      RADIANCE_PROFILE_EVERY: ${PROFEVERY:-}
+      RADIANCE_PROFILE_SYNC: ${PROFSYNC:-}
+      RADIANCE_AQL_STAMP: ${AQLSTAMP:-}
+      RADIANCE_AQL_STAMP_OUT: /stats/stamps.csv
+      RADIANCE_DS41_INDEX:
+      RADIANCE_EXL3_SPLITK:
+      RADIANCE_HEAT_PREFILL:
+      RADIANCE_HEAT_CREDIT_CAP:
+      RADIANCE_HEAT_MOVES:
+      RADIANCE_PLACE_TURNOVER:
+      RADIANCE_HEAT_PREFILL_DECAY:
+      RADIANCE_HEAT_PREFILL_GAIN:
+      RADIANCE_HEAT_DECODE_PIN:
+      RADIANCE_DS41_ARGATHER:
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${MODEL:?set MODEL} --served-model-name deepseek-v4.1-flash --host 127.0.0.1 --port 8090
+      ${ARGS:?set ARGS}

@@ -1,0 +1,53 @@
+S:b8-warmup IDENTICAL: 3 answers
+S:a1-b8-vs-d0 IDENTICAL: 20 of 20 answers
+S:gs8-b8-vs-a1-b8 IDENTICAL: 20 of 20 answers
+S:ld-b8-vs-stack4-alone64k IDENTICAL (2033 chars)
+I:ld-b8-vs-stack4-ldS DIFFERENT at char 45 (2005 vs 2033 chars)
+S:d136-b8-vs-dsm225 IDENTICAL (1877 chars)
+S:n8-warmup IDENTICAL: 3 answers
+S:a1-n8-vs-d0 IDENTICAL: 20 of 20 answers
+S:a1-n8-vs-a1-b8 IDENTICAL: 20 of 20 answers
+S:gs8-n8-vs-a1-n8 IDENTICAL: 20 of 20 answers
+S:gs8-n8-vs-gs8-b8 IDENTICAL: 20 of 20 answers
+S:ld-n8-vs-ld-b8 IDENTICAL (2033 chars)
+S:ld-n8-vs-stack4-alone64k IDENTICAL (2033 chars)
+I:ld-n8-vs-stack4-ldS DIFFERENT at char 45 (2005 vs 2033 chars)
+S:g16-n8-vs-g16-b8 IDENTICAL (2161 chars)
+S:d136-n8-vs-dsm225 IDENTICAL (1877 chars)
+S:d136-n8-vs-d136-b8 IDENTICAL (1877 chars)
+S:x8-warmup IDENTICAL: 3 answers
+S:a1-x8-vs-d0 IDENTICAL: 20 of 20 answers
+S:a1-x8-vs-a1-b8 IDENTICAL: 20 of 20 answers
+S:a1-x8-vs-a1-n8 IDENTICAL: 20 of 20 answers
+S:g16-x8-vs-g16-b8 IDENTICAL (2161 chars)
+S:d136-x8-vs-dsm225 IDENTICAL (1877 chars)
+S:d136-x8-vs-d136-b8 IDENTICAL (1877 chars)
+S:n16-warmup IDENTICAL: 3 answers
+S:a1-n16-vs-d0 IDENTICAL: 20 of 20 answers
+S:a1-n16-vs-a1-b8 IDENTICAL: 20 of 20 answers
+S:a1-n16-vs-a1-n8 IDENTICAL: 20 of 20 answers
+S:a1-n16-vs-a1-x8 IDENTICAL: 20 of 20 answers
+B48:gs16-n16-vs-a1-n16 9 of 20 answers differ: p1 char 121 tok 26, p7 char 56 tok 15, p8 char 19 tok 5, p9 char 11 tok 2, p10 char 41 tok 7, p11 char 63 tok 13, p13 char 129 tok 42, p14 char 87 tok 17, p16 char 177 tok 32
+B48:lid16-n16-vs-a1-n16 8 of 20 answers differ: p1 char 126 tok 27, p5 char 289 tok 100, p7 char 60 tok 16, p8 char 15 tok 3, p9 char 11 tok 2, p11 char 57 tok 12, p14 char 90 tok 18, p16 char 177 tok 32
+S:g16-n16-vs-g16-b8 IDENTICAL (2161 chars)
+S:b16-warmup IDENTICAL: 3 answers
+S:a1-b16-vs-d0 IDENTICAL: 20 of 20 answers
+S:a1-b16-vs-a1-b8 IDENTICAL: 20 of 20 answers
+S:a1-b16-vs-a1-n8 IDENTICAL: 20 of 20 answers
+S:a1-b16-vs-a1-x8 IDENTICAL: 20 of 20 answers
+S:a1-b16-vs-a1-n16 IDENTICAL: 20 of 20 answers
+B48:gs16-b16-vs-a1-b16 6 of 20 answers differ: p1 char 126 tok 27, p8 char 71 tok 17, p11 char 185 tok 38, p13 char 129 tok 42, p14 char 116 tok 22, p16 char 177 tok 32
+B48:lid16-b16-vs-a1-b16 8 of 20 answers differ: p1 char 126 tok 27, p5 char 289 tok 100, p7 char 60 tok 16, p8 char 15 tok 3, p9 char 11 tok 2, p11 char 57 tok 12, p14 char 90 tok 18, p16 char 177 tok 32
+B48:gs16-b16-vs-gs16-n16 8 of 20 answers differ: p1 char 121 tok 26, p7 char 56 tok 15, p8 char 19 tok 5, p9 char 11 tok 2, p10 char 41 tok 7, p11 char 63 tok 13, p14 char 87 tok 17, p16 char 197 tok 35
+B48:lid16-b16-vs-lid16-n16 IDENTICAL: 20 of 20 answers
+S:g16-b16-vs-g16-b8 IDENTICAL (2161 chars)
+S:m8-warmup IDENTICAL: 3 answers
+S:a1-m8-vs-d0 IDENTICAL: 20 of 20 answers
+S:a1-m8-vs-a1-b8 IDENTICAL: 20 of 20 answers
+S:a1-m8-vs-a1-n8 IDENTICAL: 20 of 20 answers
+S:a1-m8-vs-a1-x8 IDENTICAL: 20 of 20 answers
+S:a1-m8-vs-a1-n16 IDENTICAL: 20 of 20 answers
+S:a1-m8-vs-a1-b16 IDENTICAL: 20 of 20 answers
+S:g16-m8-vs-g16-b8 IDENTICAL (2161 chars)
+S:d136-m8-vs-dsm225 IDENTICAL (1877 chars)
+S:d136-m8-vs-d136-b8 IDENTICAL (1877 chars)

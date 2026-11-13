@@ -1,0 +1,24 @@
+warm-up-li-nst0 IDENTICAL: 3 answers
+li-nst0 ld-vs-a1-s0 7 of 20 answers differ: p1 char 120 tok 26, p5 char 57 tok 17, p8 char 71 tok 17, p11 char 185 tok 38, p13 char 129 tok 42, p14 char 90 tok 18, p16 char 338 tok 60
+li-nst0 c4b-vs-c4a-s0 5 of 20 answers differ: p0 char 28 tok 7, p1 char 277 tok 63, p3 char 47 tok 20, p14 char 504 tok 102, p16 char 177 tok 32
+li-nst0 c4a-vs-a1-s0 7 of 20 answers differ: p0 char 28 tok 7, p1 char 126 tok 27, p3 char 1 tok 0, p5 char 57 tok 17, p11 char 252 tok 57, p14 char 504 tok 102, p16 char 177 tok 32
+li-nst0 a1-s0-vs-d0 IDENTICAL: 20 of 20 answers
+li-nst0 ld-vs-a1-s1 IDENTICAL: 20 of 20 answers
+li-nst0 c4b-vs-c4a-s1 IDENTICAL: 20 of 20 answers
+li-nst0 c4a-vs-a1-s1 IDENTICAL: 20 of 20 answers
+li-nst0 a1-s1-vs-a1-s0 IDENTICAL: 20 of 20 answers
+li-nst0 a1-s1-vs-d0 IDENTICAL: 20 of 20 answers
+li-nst0 ld-vs-d0 7 of 20 answers differ: p1 char 120 tok 26, p5 char 57 tok 17, p8 char 71 tok 17, p11 char 185 tok 38, p13 char 129 tok 42, p14 char 90 tok 18, p16 char 338 tok 60
+li-nst0 a2-vs-a1 IDENTICAL: 20 of 20 answers
+warm-up-li-stack IDENTICAL: 3 answers
+li-stack ld-vs-a1-s0 9 of 20 answers differ: p1 char 121 tok 26, p3 char 1 tok 0, p5 char 254 tok 80, p8 char 14 tok 3, p11 char 63 tok 13, p13 char 129 tok 42, p14 char 105 tok 21, p16 char 529 tok 91, p19 char 0 tok 0
+li-stack c4b-vs-c4a-s0 9 of 20 answers differ: p1 char 56 tok 13, p3 char 1 tok 0, p5 char 57 tok 17, p6 char 46 tok 10, p7 char 62 tok 17, p8 char 14 tok 3, p11 char 0 tok 0, p14 char 90 tok 18, p16 char 40 tok 7
+li-stack c4a-vs-a1-s0 8 of 20 answers differ: p1 char 56 tok 13, p6 char 46 tok 10, p7 char 62 tok 17, p8 char 89 tok 23, p11 char 0 tok 0, p13 char 129 tok 42, p14 char 90 tok 18, p16 char 338 tok 60
+li-stack a1-s0-vs-d0 IDENTICAL: 20 of 20 answers
+li-stack ld-vs-a1-s1 6 of 20 answers differ: p1 char 121 tok 26, p8 char 15 tok 3, p11 char 144 tok 30, p13 char 129 tok 42, p14 char 90 tok 18, p16 char 177 tok 32
+li-stack c4b-vs-c4a-s1 2 of 20 answers differ: p7 char 341 tok 84, p11 char 232 tok 49
+li-stack c4a-vs-a1-s1 3 of 20 answers differ: p7 char 75 tok 22, p8 char 71 tok 17, p11 char 144 tok 30
+li-stack a1-s1-vs-a1-s0 IDENTICAL: 20 of 20 answers
+li-stack a1-s1-vs-d0 IDENTICAL: 20 of 20 answers
+li-stack ld-vs-d0 9 of 20 answers differ: p1 char 121 tok 26, p3 char 1 tok 0, p5 char 254 tok 80, p8 char 14 tok 3, p11 char 63 tok 13, p13 char 129 tok 42, p14 char 105 tok 21, p16 char 529 tok 91, p19 char 0 tok 0
+li-stack a2-vs-a1 IDENTICAL: 20 of 20 answers

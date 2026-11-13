@@ -1,0 +1,30 @@
+MOCKRUN REPORT i9b-m3
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzz-i9b.sh | body rc 0 | 161 s | knobs: XI9_SW=0 XI9_SDEPTH=6000 XI9_SNTOK=32 XI9_C8DUR=12 XI9_C8WARM=4 XI9_PGEN=2000 XI9_BUDGET_MIN=120 XI9_TOTAL_MIN=200 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/i9b | 88 RESULT lines, 207 mock requests | last RESULT: xi9b 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzz-i9b: done (2 min) -- /tmp/mockrad/i9b-m3/home/gpu/ds41/exl3-test/runs/xdsm/i9b | 6 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (6)
+  1x xi9b 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzz-i9b: start IMAGE=radiance-local:ds41-int9b-f119c561-5c13e555-l (0b4cb30d1ecd) | VIRHE XI9_SW=0: NO mhc_fuse / ix_lds / ix_ni and no stage_full_min / stage_full_pick posted, nothing of them checked, P0 not fatal (a mock run only) | P0 r4d_selftest [mhc_pcn_mix:7:2 ix_lds:6:1 ix_ni:6:2] on CARD 0 | SCREEN start: NST 5 stack5 start (stack4's + RADIANCE_LOG_STEPS=1, E1 declared off, HB ranks 1,2) + RADIANCE_DS41_MHC_FUSE=0 (M1 declared, off) + RADIANCE_DS41_KV_REPLICATED=1 (KVR) | base pin = stack5's S5T with draft_sample 0 + SP pinned (stage_full_min 0, stage_full_pick 0: SP off) + the fixed pin (ds41_psk_k 8) | arms B {}, M1 {}, IX-LDS {}, IX-NI {}, X {
+  1x xi9b P0 mhc_pcn_mix on one card (r4d_selftest --case): VIRHE 0 ok, 0 FAIL, 0 byte-for-byte (need 7), 0 mutation-caught (need 2), rc 125 | 
+  1x xi9b P0 ix_lds on one card (r4d_selftest --case): VIRHE 0 ok, 0 FAIL, 0 byte-for-byte (need 6), 0 mutation-caught (need 1), rc 125 | 
+  1x xi9b P0 ix_ni on one card (r4d_selftest --case): VIRHE 0 ok, 0 FAIL, 0 byte-for-byte (need 6), 0 mutation-caught (need 2), rc 125 | 
+  1x xi9b profile (PROFILED, not a speed): DSOPNC i9-p (PROFILED, not a speed; drafter ctx ops #[1719, 1736], query #[1737, 1877]):  -- VIRHE round: tables on 0 of 4 ranks
+  1x xi9b profile round: VIRHE no profile window (round: tables on 0 of 4 ranks)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (3)
+    2026-11-12 09:48:13 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xi9b-p0-mhc_pcn_mix-1666713 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=uncon
+    2026-11-12 09:48:13 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xi9b-p0-ix_lds-1666713 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined
+    2026-11-12 09:48:13 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xi9b-p0-ix_ni-1666713 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined 
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 38218 linked real files, 4 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/ccsim-1112-0936-xcc-n8-1-u8.txt (size 1735 -> 2147)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1106.csv (size 14828935 -> 14833647)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/ccsim-1112-0936-xcc-n8-1-u8.jsonl (size 3416 -> 4820)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/cc/n8-1-samp.jsonl (size 147695 -> 182131)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

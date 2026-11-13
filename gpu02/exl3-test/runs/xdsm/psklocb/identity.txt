@@ -1,0 +1,10 @@
+pl-n5 warm-up IDENTICAL: 3 answers
+tr-2B-vs-trA IDENTICAL (1922 chars)
+xB16000-vs-A IDENTICAL (2161 chars)
+xB135000-vs-A IDENTICAL (1877 chars)
+xB64000-vs-A IDENTICAL (2033 chars)
+ldA-vs-r00z-ldA IDENTICAL (2029 chars)
+ldB-vs-ldA IDENTICAL (2029 chars)
+ldB-vs-r00z-ldA IDENTICAL (2029 chars)
+ldD-vs-ldA IDENTICAL (2029 chars)
+ldD-vs-r00z-ldA IDENTICAL (2029 chars)

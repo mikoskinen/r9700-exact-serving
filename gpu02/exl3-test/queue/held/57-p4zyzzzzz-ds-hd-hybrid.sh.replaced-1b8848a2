@@ -1,0 +1,18 @@
+#!/bin/bash
+# 57-p4zyzzzzz-ds-hd-hybrid.sh (queue item, 10.11.2026, ds41-gg agent; gpu02, all 4 cards, TP4, MML 524288, every radiance
+# container DOWN; ~40-45 min) -- COMBINED DRAFTING POLICY vs NST 0 and plain DSpark, each with gg_gemv 2 + rule-w, on the
+# ds41-gg 4675795f image (body dsm-hybrid2.sh; until 10.11. ~14:20 this item ran dsm-hybrid.sh, the hybrid alone, which stays).
+#   start 1, DSpark NST 5 --draft-window adaptive, RADIANCE_DS41_GG_GEMV=2 + RADIANCE_AQL_ACQ=rule-w at start (gg_gemv 2,
+#     aql_acq 2 pinned in every block): blocks A B B A C in process -- A plain DSpark adaptive (draft_hybrid 0, draft_depth0 0),
+#     B the combined drafting policy (DSpark adaptive + D7 + hybrid: draft_hybrid 1, draft_depth0 1, match 8), C hybrid
+#     alone (one block, information) -- each stepprobe essay / code, essay by draft position, editprobe, mb c4 / c8 75 s,
+#     the draft counters; identity under B (the 28k copy, the c1 greedy set vs bz d0);
+#   start 2, NST 0, the same env: blocks N N (the same phases), identity vs bz d0;
+#   then the summary "combined drafting policy vs NST 0 and plain DSpark": c1 essay / code / edit, c4 aggregate + p50, c8
+#     aggregate + p50; tok/s (t95 over blocks), tokens a step, acceptance, ms a step.
+# IMAGE radiance-local:ds41-gg-4675795f-5c13e555-l (XGG_IMAGE); XH2_ORDER / XH2_ORDER2 / XH2_DUR / XHY_MATCH (default 8).
+# DRYRUN=1 bash 57-p4zyzzzzz-ds-hd-hybrid.sh : prints every command, runs and writes nothing.
+export XGG_IMAGE=${XGG_IMAGE:-radiance-local:ds41-gg-4675795f-5c13e555-l}
+B=$HOME/gpu/ds41/exl3-test/queue-ar/dsmain/dsm-hybrid2.sh
+[ -e $B ] || { echo "$(date '+%F %T') RESULT xh2: VIRHE $B missing" | tee -a $HOME/gpu/ds41/exl3-test/runs/ds41-exl3.log; exit 1; }
+bash $B

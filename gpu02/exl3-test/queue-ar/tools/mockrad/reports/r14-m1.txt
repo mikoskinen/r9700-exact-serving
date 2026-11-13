@@ -1,0 +1,30 @@
+MOCKRUN REPORT r14-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zref14.sh | body rc 0 | 405 s | knobs: R14_SW=0 R14_EGEN=128 R14_C8WIN=8 R14_C8WARM=4 R14_C4WIN=6 R14_C4WARM=3 R14_C1WIN=6 R14_C1WARM=3 R14_BUDGET_MIN=120 R14_LDPF=2048 R14_A11ID=1100 R14_CDEPTHS=6000 12000 R14_U1N=2 R14_SWN=1 R14_C16DUR=8 R14_C16WARM=4 R14_C8GN=1 NGSHARE_DIR=/tmp/mockrad/r14-m1/ngdir NGSHARE_RUN=/tmp/mockrad/r14-m1/ngrun NGSHARE_LOG=/tmp/mockrad/r14-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/ref14 | 112 RESULT lines, 422 mock requests | last RESULT: xref14 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zref14: done (6 min) -- /tmp/mockrad/r14-m1/home/gpu/ds41/exl3-test/runs/xdsm/ref14 | 1 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x ngshare xref14-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  1x xref14 NCMATCH c1: 2 matched prompts (newcomer step inside EVERY block's window; in-window per block 2) -- the same prompts' newcomer-step walls (next step line - its own, unclipped) | O 70.0 ms (70.0; 35.0 ms a newcomer step) -- VIRHE fewer than 4 matched prompts
+MISSING / NOT FOUND (10)
+  2026-11-12 21:41:01 RESULT xref14 identity cold-1100 vs yzint14c-Z: INFO (R14_SW=0 mock: a real-run reference, not compared)
+  2026-11-12 21:44:07 RESULT xref14 identity cold-6000: INFO no yzint14c / ref12 answer at this depth -- not compared
+  2026-11-12 21:44:08 RESULT xref14 identity cold-12000: INFO no yzint14c / ref12 answer at this depth -- not compared
+  2026-11-12 21:45:06 RESULT xref14 REF14 cold 6k (deepq after a prefix-cache reset, 6274 tok): TTFT 0.18 s (0.18), 34856 prefill tok/s, non-decode 87.2 ms a step | answers INFO (R14_SW=0 mock: real-run references not compared) | INFO int12: -
+  2026-11-12 21:45:06 RESULT xref14 REF14 cold 12k (deepq after a prefix-cache reset, 12020 tok): TTFT 0.34 s (0.34), 35353 prefill tok/s, non-decode 110.7 ms a step | answers INFO (R14_SW=0 mock: real-run references not compared) | INFO int12: -
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42010 linked real files, 6 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/ref14/mock-r14-m1.out (size 0 -> 981)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzz-fn-hg16p.sh.out (size 2107 -> 7060)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1054455 -> 1066160)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-gp-attbi2-c16.txt (size 0 -> 914)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-gp-blocks.jsonl (size 43982 -> 73288)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-gp-S.log (gone)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

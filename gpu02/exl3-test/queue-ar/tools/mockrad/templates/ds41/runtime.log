@@ -1,0 +1,9 @@
+I recorded pass: draft pass -1 at 27 token(s) -- 18 records, 3 of the 18 dispatches unordered behind the one before; 0 host op(s), 0 table refresh point(s) and 0 routing report(s) between the played stretches
+I recorded pass: draft pass -1 at 27 token(s) -- the acquire rule plays 3 of the 18 dispatches (0 of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=rule-w)
+I recorded pass: draft pass 1 at 5 token(s) -- 144 records, 25 of the 144 dispatches unordered behind the one before; 0 host op(s), 6 table refresh point(s) and 6 routing report(s) between the played stretches
+I recorded pass: draft pass 1 at 5 token(s) -- the acquire rule plays 33 of the 144 dispatches (8 of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=rule-w)
+I recorded pass: draft pass 0 at 6 token(s) -- 1200 records, 377 of the 1194 dispatches unordered behind the one before; 0 host op(s), 640 table refresh point(s) and 80 routing report(s) between the played stretches
+I recorded pass: draft pass 0 at 6 token(s) -- the acquire rule plays 381 of the 1194 dispatches (44 of them ordered) without their agent-scope acquire (RADIANCE_AQL_ACQ=rule-w)
+radiance: libr4d: lever GPF form table from RADIANCE_DS41_GG_PF_TABLE: 7 entries
+W rank 0: draft pass 1 at 5 tokens is issued in full every step: the pass cannot be recorded: a copy of 21504 bytes to or from pageable memory, which stages through the host and waits
+radiance: deepseek41 indexer deal: idx_split 1 took its first step: 1441 rows as 8 runs of 181, 2 a rank (the plain deal: 6 runs of 241, 2 a rank, the last rank 0)

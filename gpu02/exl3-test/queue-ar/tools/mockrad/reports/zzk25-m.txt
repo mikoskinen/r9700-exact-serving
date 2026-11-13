@@ -1,0 +1,20 @@
+MOCKRUN REPORT zzk25-m
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzk25.sh | body rc 1 | 6 s | knobs: - | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzk25 | 2 RESULT lines, 0 mock requests | last RESULT: zzk25: VIRHE 4 check(s) failed (binary / image / plugin hash / card / disk) -- not run
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x zzk25: VIRHE 4 check(s) failed (binary / image / plugin hash / card / disk) -- not run
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 0 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42172 linked real files, 2 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1132761 -> 1132913)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/ref14/xref14-ld-O.txt (size 1029 -> 1160)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

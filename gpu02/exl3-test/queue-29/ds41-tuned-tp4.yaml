@@ -1,0 +1,34 @@
+# ds41-tuned-tp4.yaml (6.11.2026, queue-ar; for queue-29's 61-exl3-29-tuned.sh) -- = queue-29's ds41-117-tp4.yaml (MODELDIR mount,
+# the serve line in ARGS, project/container radiance-ds41-exl3, the profiling environment) plus the tuned image's switches,
+# passed through only when set in the shell (list syntax without a value: unset in the shell = unset in the container):
+#   RADIANCE_DS41_INDEX           the indexer: keep,split (default when unset) | keep | split | off
+#   RADIANCE_DS41_KEEP_MIN_LIVE, RADIANCE_DS41_SPLIT_MIN_LIVE   its thresholds (idx2b), positions
+#   RADIANCE_DS41_IDXKEY          mxfp4 = MXFP4 index keys (mx4); unset = bf16 keys
+#   RADIANCE_HEAT_PREFILL         0..1, the heat engine's share for a step's prefill rows; unset = 1 (as before)
+#   RADIANCE_HEAT_CREDIT_CAP      the heat engine's credit cap; unset = 512
+name: radiance-ds41-exl3
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${IMAGE:?set IMAGE}
+    container_name: radiance-ds41-exl3
+    restart: "no"
+    volumes:
+      - ${MODELDIR:?set MODELDIR}:/models:ro
+      - ${STATSDIR:?set STATSDIR}:/stats
+    environment:
+      RADIANCE_PROFILE_EVERY: ${PROFEVERY:-}
+      RADIANCE_PROFILE_SYNC: ${PROFSYNC:-}
+      RADIANCE_AQL_STAMP: ${AQLSTAMP:-}
+      RADIANCE_AQL_STAMP_OUT: /stats/stamps.csv
+      RADIANCE_DS41_INDEX:
+      RADIANCE_DS41_KEEP_MIN_LIVE:
+      RADIANCE_DS41_SPLIT_MIN_LIVE:
+      RADIANCE_DS41_IDXKEY:
+      RADIANCE_HEAT_PREFILL:
+      RADIANCE_HEAT_CREDIT_CAP:
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${MODEL:?set MODEL} --served-model-name deepseek-v4.1-flash --host 127.0.0.1 --port 8090
+      ${ARGS:?set ARGS}

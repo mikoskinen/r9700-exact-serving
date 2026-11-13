@@ -1,0 +1,19 @@
+#!/bin/sh
+# /usr/local/sbin/gpu02-host-tuning apply|revert|status (9.11.2026, Claude, installed on the user's request "asenna pysyvät
+# asetukset") -- the host settings that keep gpu02's R9700s out of the TP4 slow state (item 103e: cpuidle C2 off + governor
+# performance -> fast 2/2, 751 / 759 tok/s at 8 streams; defaults slow 2/2, 629 / 631). Run at boot by
+# gpu02-host-tuning.service (enabled); `systemctl stop gpu02-host-tuning` reverts. kernel.numa_balancing=0 is kept by
+# /etc/sysctl.d/90-gpu02-numa.conf. Same lessons as the Xeon's host tuning (26.-27.10.2026).
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+deep() { for s in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state[0-9]*; do [ "$(cat $s/latency)" -ge 100 ] && echo $s; done; }
+case "${1:-status}" in
+  apply)  for s in $(deep); do echo 1 > $s/disable; done
+          for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo performance > $f; done ;;
+  revert) for s in $(deep); do echo 0 > $s/disable; done
+          for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo schedutil > $f; done ;;
+  status) ;;
+  *) echo "usage: gpu02-host-tuning apply|revert|status" >&2; exit 2 ;;
+esac
+n=$(deep | wc -l); d=0; for s in $(deep); do [ "$(cat $s/disable)" = 1 ] && d=$((d+1)); done
+echo "gpu02-host-tuning ${1:-status}: deep C-states (exit >= 100 us) disabled $d/$n | governor $(cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor | sort | uniq -c | tr -s ' ' | tr '\n' ',') | numa_balancing $(cat /proc/sys/kernel/numa_balancing)"

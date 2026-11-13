@@ -1,0 +1,27 @@
+MOCKRUN REPORT sa14-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zsa14.sh | body rc 0 | 348 s | knobs: SA14_SW=0 SA14_C8WARM=4 SA14_BUDGET_MIN=120 SA14_LDPF=2048 SA14_C8GN=1 NGSHARE_DIR=/tmp/mockrad/sa14-m1/ngdir NGSHARE_RUN=/tmp/mockrad/sa14-m1/ngrun NGSHARE_LOG=/tmp/mockrad/sa14-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zsa14 | 97 RESULT lines, 376 mock requests | last RESULT: xsa14 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zsa14: done (5 min) -- /tmp/mockrad/sa14-m1/home/gpu/ds41/exl3-test/runs/xdsm/zsa14 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x ngshare xsa14-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42081 linked real files, 9 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zsa14/mock-sa14-m1.out (size 0 -> 834)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzz-fn-hz-csdma5.sh.out (size 6611 -> 10928)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1088361 -> 1098248)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sd5-blocks.jsonl (size 18265 -> 32468)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-sd5-P.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sd5-q.txt (size 0 -> 821)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/up-fn4-sd5-P.txt (size 303 -> 150)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/up-fn4-sd5-C.txt (size 303 -> 150)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-sd5-Q.log (gone)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

@@ -1,0 +1,22 @@
+MOCKRUN REPORT cap48-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-cd-cap48.sh | body rc 1 | 12 s | knobs: XC48_CAPSW=0 XC48_DUR=12 XC48_WARM=4 XC48_MT=48 XC48_GDEP=4000 XC48_LIDPF=600 XC48_BUDGET_MIN=120 XC48_INFO85=1 | faults: - | swaps: -
+output dirs (fresh): - | 2 RESULT lines, 0 mock requests | last RESULT: xc48 VIRHE helpers / inputs do not resolve: refs:(REFS MISSING ['kv4_c16', 'kv4_c16_p50', 's5t_c8'] | kv4 n16 c16 None tok/s (p50 None), kv4 n16 c8 None (p50 None) | stack5 S5T c8 None +- None (p50 None))
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x xc48 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-cd-cap48: start IMAGE=radiance-local:ds41-cap48-e5acfbcf-5c13e555-l (e93c0cef6849) | VIRHE XC48_CAPSW=0: NO cap switch posted, no cap check (a mock run only) | lever CAP48 (RADIANCE_DECODE_ROW_CAP=48 at start, fn4 sched_row_cap in process) | one start: MAXSEQS 16 nvfp4, S5T pin | phases [a1:D:alone0 gs16:D:gs0 lid16:D:lid0 a1z:Z:set1 gs16z:Z:gs1 lid16z:Z:lid1 c16:S:mb16 c8:S:mb8 gs16o:d:gs0 lid16o:d:lid0 a2:D:alone0 lid16zo:z:lid1 a1s:D:set1 lid16s:D:lid1] | ~29 min (budget 120)
+  1x xc48 VIRHE helpers / inputs do not resolve: refs:(REFS MISSING ['kv4_c16', 'kv4_c16_p50', 's5t_c8'] | kv4 n16 c16 None tok/s (p50 None), kv4 n16 c8 None (p50 None) | stack5 S5T c8 None +- None (p50 None))
+MISSING / NOT FOUND (2)
+  2026-11-12 09:11:18 RESULT xc48 VIRHE helpers / inputs do not resolve: refs:(REFS MISSING ['kv4_c16', 'kv4_c16_p50', 's5t_c8'] | kv4 n16 c16 None tok/s (p50 None), kv4 n16 c8 None (p50 None) | stack5 S5T c8 None +- None (p50 None))
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 0 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 38120 linked real files, 2 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1106.csv (size 14764348 -> 14764804)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/cc/b8-1-samp.jsonl (size 92046 -> 94202)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

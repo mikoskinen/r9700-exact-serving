@@ -1,0 +1,29 @@
+MOCKRUN REPORT zs16-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-zsoak16.sh | body rc 0 | 279 s | knobs: ZS16_SW=0 ZS16_BUDGET_MIN=120 ZS16_CYCLES=3 ZS16_CYCLES_MIN=3 ZS16_CYCLE_S=30 ZS16_WARM=3 ZS16_WARM_MIN=2 ZS16_WARM_MAX=10 ZS16_PFTOK=2048 ZS16_TELS=2 NGSHARE_DIR=/tmp/mockrad/zs16-m1/ngdir NGSHARE_RUN=/tmp/mockrad/zs16-m1/ngrun NGSHARE_LOG=/tmp/mockrad/zs16-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zsoak16 | 64 RESULT lines, 375 mock requests | last RESULT: xzs16 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-zsoak16: done (4 min) -- /tmp/mockrad/zs16-m1/home/gpu/ds41/exl3-test/runs/xdsm/zsoak16 | VERDICT: EXACT UNDER LOAD over 3 cycles / 1.8 min: YES | MOCK RUN: NOT A READING | 1 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (2)
+  1x ngshare xzs16-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  1x xzs16 SOAK16 ENGAGEMENT (soaksum.py fuse_check + form1_expected, an epoch-bumped 64-token probe): start VIRHE VIRHE ds41_rfuse/ds41_mix_fin/route_copy_ov/exl3_x3d None/None/None/None, rco in_force None, fuse rf_declared None rf_layers None | rf_form1_passes +0, rf_form2_passes +0, rgs_launches +0, mixfin_launches +0, rco_recordings +0, rco_copies +0, rco_freed +0 | prefilled 1 -- switches [None, None, None, | end VIRHE VIRHE ds41_rfuse/ds41_mix_fin/route_copy_ov/exl3_x3d None/None/None/None, rco in_force None, fuse rf_declared None rf_layers None | rf_form1_passes +0, rf_form2_passes +0, rgs_launches +0, mixfin_launches +0, rco_recordings +0, rco_copies +0, rco_freed +0 | prefilled 1 -- swit
+MISSING / NOT FOUND (6)
+  2026-11-13 03:20:10 RESULT xzs16 SOAK PIN = int16 (MISSING the xzc16 result is missing: no 'RESULT xzc16 <item>: start' line in the log) | posted: ds41_rfuse 2, ds41_mix_fin 0, route_copy_ov 1 (+ the int15 pin: exl3_x3d 2 ...) | P0 rfuse not run | auto-choice over /tmp/mockrad/zs16-m1/home/gpu/ds41/exl3-test/runs/ds41-exl3.log (soaksum.py pick: the last xzc16 run; any identity line not IDENTICAL o
+  2026-11-13 03:24:33 RESULT xzs16 SOAK16 PIN = int16 (MISSING the xzc16 result is missing: no 'RESULT xzc16 <item>: start' line in the log) | MOCK RUN ZS16_SW=0: NOT A READING
+  2026-11-13 03:24:33 RESULT xzs16 SOAK16 TOTALS: 3 cycles x 20 probes = 60 probes under load; 60 identical, 0 differing, 0 request errors, 0 missing; pin held 3 of 3 cycles; engaged (form 2 ran, form 1 within the rule) 3 of 3; cycles not clean: none; soak window 1.8 min
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 43155 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zsoak16/mock-zs16-m1.out (size 0 -> 924)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 20071 -> 20188)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-fn-s-s9soak.sh.out (size 3091 -> 4037)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1636271 -> 1644047)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sk-c7.txt (size 1319 -> 3328)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-sk-S.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sk-S-engine.log.gz (size 524288 -> 740638)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

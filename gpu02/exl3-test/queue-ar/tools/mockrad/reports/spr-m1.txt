@@ -1,0 +1,26 @@
+MOCKRUN REPORT spr-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92z-spread.sh | body rc 0 | 138 s | knobs: XSPR_SW=0 XSPR_DUR=12 XSPR_WARM=4 XSPR_BUDGET_MIN=120 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/spread | 43 RESULT lines, 162 mock requests | last RESULT: xspr 57-p4zyzzzzz-ds-r92z-spread: done (2 min) -- /tmp/mockrad/spr-m1/home/gpu/ds41/exl3-test/runs/xdsm/spread | 1 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x xspr 57-p4zyzzzzz-ds-r92z-spread: start IMAGE=radiance-local:ds41-int10-f6ef7cc3-5c13e555-l (583c9743aa90) | VIRHE XSPR_SW=0: NO mhc_fuse / ix_lds / ix_ni / draft_depth0 3 / stage_full_* / ds41_arcoded / sched_row_cap posted (a mock run only) | SPREAD start: NST 5 stack5 start (stack4's + RADIANCE_LOG_STEPS=1, E1 declared off, HB ranks 1,2) + RADIANCE_DS41_MHC_FUSE=0 (M1 declared) | KVR OFF (RADIANCE_DS41_KV_REPLICATED unset), SP off | base pin = stack5's S5T with draft_sample 0 + SP pinned (stage_full_min 0, stage_full_pick 0) + M1 on / IX off / draft_depth0 3 (int10: depth 0 by occupancy only) / sched_row_cap 48 (CAP48) {} + the fixed pin (ds41_psk_k 8; draft_lend 1) | NO ARMS: the pin wit
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 80 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 39248 linked real files, 8 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r90zzz-fn-bicheck3.sh.out (size 2881 -> 5275)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 4251 -> 4441)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 247826 -> 251856)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-bitr-sg2-pf.txt (size 0 -> 3319)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi2/bt-r1-7.bin (size 58535708 -> 114898184)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi2/bt-r3-7.bin (size 58535708 -> 114898184)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi2/bt-r2-7.bin (size 58535708 -> 114898184)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/stats180/bt-bi2/bt-r0-7.bin (size 58535708 -> 114898184)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

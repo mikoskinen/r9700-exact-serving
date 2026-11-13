@@ -1,0 +1,19 @@
+mode pinned, 4 cards, 1.00 GiB x 10 per card, HSA_ENABLE_SDMA=(unset)
+  H2D card 0 alone   27.9 GB/s
+  H2D card 1 alone   27.9 GB/s
+  H2D card 2 alone   27.9 GB/s
+  H2D card 3 alone   27.9 GB/s
+  H2D card 0 at once 27.9 GB/s (GPU events)
+  H2D card 1 at once 15.4 GB/s (GPU events)
+  H2D card 2 at once 15.4 GB/s (GPU events)
+  H2D card 3 at once 27.6 GB/s (GPU events)
+  H2D ALL 4 cards: sum of per-card 86.3 GB/s, wall-clock aggregate 61.6 GB/s
+  D2H card 0 alone   27.6 GB/s
+  D2H card 1 alone   27.6 GB/s
+  D2H card 2 alone   27.6 GB/s
+  D2H card 3 alone   27.6 GB/s
+  D2H card 0 at once 27.6 GB/s (GPU events)
+  D2H card 1 at once 18.8 GB/s (GPU events)
+  D2H card 2 at once 19.0 GB/s (GPU events)
+  D2H card 3 at once 27.7 GB/s (GPU events)
+  D2H ALL 4 cards: sum of per-card 93.1 GB/s, wall-clock aggregate 75.3 GB/s

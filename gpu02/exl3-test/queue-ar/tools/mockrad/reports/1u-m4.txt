@@ -1,0 +1,20 @@
+MOCKRUN REPORT 1u-m4
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzzzz-1u.sh | body rc 0 | 312 s | knobs: X1U_SW=0 X1U_IMAGE=radiance-local:ds41-int10-f6ef7cc3-5c13e555-l X1U_PLAN=MX:O,MX GQ:O,GQ E2:O,E2 F4:O,F4 X1U_PLAN2=C1T:C50,C40 X1U_PLAN3=MX12:O,MX12 X1U_EGEN=128 X1U_C8PLAN=S:O S:N S:H250 C:O C:H500 X1U_C8WIN=8 X1U_C8WARM=4 X1U_C4WIN=6 X1U_C4WARM=3 X1U_C1WIN=6 X1U_C1WARM=3 X1U_BUDGET_MIN=120 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/i11u | 100 RESULT lines, 399 mock requests | last RESULT: x1u 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzzzz-1u: done (5 min) -- /tmp/mockrad/1u-m4/home/gpu/ds41/exl3-test/runs/xdsm/i11u | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (2)
+    2026-11-12 14:09:16 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name x1u-p0-mix_wv-503884 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -
+    2026-11-12 14:09:16 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name x1u-p0-gq_pair-503884 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined 
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 39445 linked real files, 1 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 289705 -> 297629)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

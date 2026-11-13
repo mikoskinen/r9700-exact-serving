@@ -1,0 +1,1147 @@
+
+per-op timing, rank 0. Not comparable with an unprofiled run:
+enabling this restores synchronisations that change the mover's slot supply.
+A row marked `host` was timed on the host clock around a host-site launch and
+includes everything that call waited on -- page faults, link reads. The rest are
+device event pairs around a kernel. `wait us` is how long, a call, the op's lane
+sat idle before it started -- stream waits and issue delays, in no op's time.
+
+       calls     total ms    us/call  site    join us    wait us  op / geometry
+          18       71.136    3952.00   dev          -      31.33  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #36 blk.0.ffn_gate_up_exps.0.weight
+          18       67.323    3740.15   dev          -       0.00  embed_lookup_ggml  n_embd=5120 n_vocab=32320 type=q6_K dtype=bf16 vocab_offset=0  #1 token_embd.weight
+          18       32.452    1802.91   dev          -       9.82  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #37 blk.0.ffn_down_exps.0.weight
+          18       27.641    1535.64   dev          -       4.13  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #45 -
+          18       25.821    1434.50   dev          -       3.55  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1676 -
+          18       24.307    1350.38   dev          -       4.16  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #88 -
+          18       21.572    1198.45   dev          -       4.10  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #195 -
+          18       21.300    1183.32   dev          -       4.29  gemm_nt_f32  N=384 K=5120 dtype=bf16  #31 blk.0.glm_router.weight
+          18       20.656    1147.54   dev          -       3.50  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1542 -
+          18       18.066    1003.65   dev          -       4.18  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #232 -
+          18       15.898     883.21   dev          -       4.09  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #158 -
+          18       15.760     875.56   dev          -      13.65  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1629 blk.37.ffn_gate_up_exps.0.weight
+          18       15.700     872.20   dev          -       3.86  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #783 -
+          18       15.133     840.70   dev          -       3.60  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #746 -
+          18       14.958     831.02   dev          -       3.76  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #820 -
+          18       14.796     822.02   dev          -       3.61  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1600 -
+          18       14.693     816.27   dev          -       4.51  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #306 -
+          18       13.537     752.03   dev          -      16.92  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1591 blk.36.ffn_gate_up_exps.0.weight
+          17       13.518     795.15   dev          -       9.56  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1763 -
+          18       13.187     732.62   dev          -      13.04  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1667 blk.38.ffn_gate_up_exps.0.weight
+          18       13.152     730.69   dev          -      13.08  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1705 blk.39.ffn_gate_up_exps.0.weight
+          18       13.144     730.24   dev          -      13.60  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #186 blk.3.ffn_gate_up_exps.0.weight
+          18       13.093     727.40   dev          -       3.94  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1714 -
+          18       13.048     724.91   dev          -       4.01  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #672 -
+          18       12.996     722.01   dev          -      13.47  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #260 blk.5.ffn_gate_up_exps.0.weight
+          18       12.988     721.55   dev          -       4.18  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #924 -
+          17       12.815     753.82   dev          -      13.60  moe_gemm_ggml  N=4608 K=5120 n_expert=32 top_k=3 a_order=token type=mxfp4 dtype=bf16  #1773 blk.40.ffn_gate_up_exps.0.weight
+          18       12.665     703.62   dev          -       5.61  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #12 blk.0.attn_q_a.weight
+          18       11.933     662.94   dev          -       4.43  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #597 -
+          18       11.923     662.37   dev          -      16.05  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #79 blk.1.ffn_gate_up_exps.0.weight
+          18       11.839     657.73   dev          -       4.36  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #343 -
+          18       11.813     656.28   dev          -       3.97  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1431 -
+          18       11.738     652.10   dev          -       4.00  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1204 -
+          18       11.353     630.74   dev          -       3.74  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1336 -
+          18       11.289     627.19   dev          -       3.60  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1638 -
+          18       11.204     622.46   dev          -       6.83  all_reduce  world_size=4 dtype=bf16 exact=1  #2 -
+          17       11.038     649.28   dev          -      12.14  moe_gemm_ggml  N=4608 K=5120 n_expert=32 top_k=3 a_order=token type=mxfp4 dtype=bf16  #1812 blk.41.ffn_gate_up_exps.0.weight
+          18       10.692     594.00   dev          -       3.56  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1130 -
+          18       10.687     593.75   dev          -       3.58  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #709 -
+          18       10.405     578.08   dev          -       3.53  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1373 -
+          18       10.266     570.36   dev          -       3.53  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #857 -
+          18        9.930     551.69   dev          -       3.75  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1299 -
+          18        9.930     551.68   dev          -       4.14  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #998 -
+          18        9.703     539.05   dev          -       5.41  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=0 topk=0 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #23 blk.0.attn_sinks.weight
+          18        9.052     502.88   dev          -      12.56  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #848 blk.19.ffn_gate_up_exps.0.weight
+          18        8.976     498.66   dev          -      14.52  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #223 blk.4.ffn_gate_up_exps.0.weight
+          18        8.843     491.30   dev          -       3.57  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1468 -
+          18        8.792     488.44   dev          -      12.59  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #551 blk.12.ffn_gate_up_exps.0.weight
+          17        8.671     510.05   dev          -       7.17  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1802 -
+          17        8.542     502.50   dev          -       8.62  moe_gemm_ggml  N=4608 K=5120 n_expert=32 top_k=3 a_order=token type=mxfp4 dtype=bf16  #1851 blk.42.ffn_gate_up_exps.0.weight
+          18        8.480     471.09   dev          -      15.06  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #149 blk.2.ffn_gate_up_exps.0.weight
+          18        8.373     465.14   dev          -       3.52  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1035 -
+          18        8.366     464.77   dev          -       3.76  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1093 -
+          18        8.275     459.74   dev          -      11.83  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #440 blk.9.ffn_gate_up_exps.0.weight
+          18        7.982     443.45   dev          -      14.29  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1290 blk.29.ffn_gate_up_exps.0.weight
+          18        7.890     438.34   dev          -       4.55  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #523 -
+          18        7.853     436.27   dev          -       8.72  gemm_nt_ggml  N=25600 K=6144 type=q6_K dtype=bf16  #50 blk.1.engram_kv.weight
+          18        7.747     430.40   dev          -       4.17  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #560 -
+          18        7.581     421.14   dev          -       4.75  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #486 -
+          18        7.546     419.22   dev          -       8.70  gemm_nt_ggml  N=25600 K=6144 type=q6_K dtype=bf16  #602 blk.14.engram_kv.weight
+          18        7.523     417.96   dev          -       3.80  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #961 -
+          18        7.504     416.90   dev          -       4.09  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #412 -
+          18        7.379     409.96   dev          -      11.86  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #514 blk.11.ffn_gate_up_exps.0.weight
+          17        7.332     431.29   dev          -       7.80  moe_gemm_ggml  N=5120 K=2304 n_expert=32 top_k=3 a_order=sorted type=mxfp4 dtype=bf16  #1814 blk.41.ffn_down_exps.0.weight
+          18        7.229     401.63   dev          -      10.45  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1026 blk.23.ffn_gate_up_exps.0.weight
+          17        7.229     425.23   dev          -      11.00  all_reduce  world_size=4 dtype=bf16 exact=1  #1738 -
+          17        7.074     416.13   dev          -       6.08  moe_gather_all_reduce  n=5120 top_k=3 world_size=4 dtype=bf16 act=none  #1860 -
+          17        6.979     410.51   dev          -       9.00  moe_gemm_ggml  N=5120 K=2304 n_expert=32 top_k=3 a_order=sorted type=mxfp4 dtype=bf16  #1775 blk.40.ffn_down_exps.0.weight
+          18        6.871     381.73   dev          -      11.06  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #700 blk.15.ffn_gate_up_exps.0.weight
+          18        6.834     379.68   dev          -      11.11  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1533 blk.35.ffn_gate_up_exps.0.weight
+          18        6.754     375.25   dev          -      13.15  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #477 blk.10.ffn_gate_up_exps.0.weight
+          17        6.721     395.34   dev          -       9.48  iota  start=4 step=-1 period=5  #1743 -
+          17        6.705     394.43   dev          -       7.56  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1841 -
+          18        6.623     367.97   dev          -      11.08  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1496 blk.34.ffn_gate_up_exps.0.weight
+          18        6.576     365.32   dev          -      13.75  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #588 blk.13.ffn_gate_up_exps.0.weight
+          18        6.455     358.63   dev          -       8.14  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1630 blk.37.ffn_down_exps.0.weight
+          18        6.424     356.88   dev          -       3.71  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1167 -
+          18        6.395     355.29   dev          -      11.74  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1422 blk.32.ffn_gate_up_exps.0.weight
+          18        6.283     349.06   dev          -       3.69  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1505 -
+          17        6.270     368.81   dev          -       7.67  moe_gather_all_reduce  n=5120 top_k=3 world_size=4 dtype=bf16 act=none  #1782 -
+          18        6.103     339.04   dev          -      10.46  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1459 blk.33.ffn_gate_up_exps.0.weight
+          18        5.984     332.46   dev          -       3.90  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #1262 -
+          18        5.962     331.23   dev          -       5.32  ngram_ids  heads=24 ngram=4 eos=2  #47 blk.1.engram_mult
+          18        5.962     331.21   dev          -      10.48  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1364 blk.31.ffn_gate_up_exps.0.weight
+          18        5.947     330.38   dev          -       4.52  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #449 -
+          17        5.873     345.48   dev          -       5.30  moe_gemm_ggml  N=5120 K=2304 n_expert=32 top_k=3 a_order=sorted type=mxfp4 dtype=bf16  #1853 blk.42.ffn_down_exps.0.weight
+          18        5.843     324.62   dev          -      11.83  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1158 blk.26.ffn_gate_up_exps.0.weight
+          18        5.733     318.48   dev          -       3.26  logits_gemm_ggml  n_vocab=32320 n_embd=5120 type=q6_K dtype=bf16  #1718 output.weight
+          17        5.704     335.53   dev          -       6.08  logits_gemm_ggml  n_vocab=32320 n_embd=5120 type=q6_K dtype=bf16  #1865 output.weight
+          18        5.694     316.33   dev          -      11.73  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #952 blk.21.ffn_gate_up_exps.0.weight
+          18        5.647     313.70   dev          -      10.32  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1592 blk.36.ffn_down_exps.0.weight
+          18        5.634     313.03   dev          -       7.87  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1668 blk.38.ffn_down_exps.0.weight
+          18        5.633     312.97   dev          -       4.11  moe_gather_all_reduce  n=5120 top_k=6 world_size=4 dtype=bf16 act=none  #269 -
+          18        5.519     306.58   dev          -       8.07  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #187 blk.3.ffn_down_exps.0.weight
+          18        5.482     304.57   dev          -       7.90  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #261 blk.5.ffn_down_exps.0.weight
+          18        5.455     303.05   dev          -       7.78  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1706 blk.39.ffn_down_exps.0.weight
+          17        5.213     306.66   dev          -       7.92  moe_gather_all_reduce  n=5120 top_k=3 world_size=4 dtype=bf16 act=none  #1821 -
+          18        5.083     282.37   dev          -       9.76  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #80 blk.1.ffn_down_exps.0.weight
+          18        5.079     282.16   dev          -       6.05  token_map  n_vocab=129280  #9 deepseek41.engram.token_map
+          18        5.046     280.31   dev          -       9.91  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #334 blk.7.ffn_gate_up_exps.0.weight
+          18        4.643     257.96   dev          -      11.14  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #989 blk.22.ffn_gate_up_exps.0.weight
+          18        4.618     256.56   dev          -      11.06  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1327 blk.30.ffn_gate_up_exps.0.weight
+          18        4.608     256.01   dev          -      11.85  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #403 blk.8.ffn_gate_up_exps.0.weight
+          18        4.531     251.73   dev          -       7.38  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #849 blk.19.ffn_down_exps.0.weight
+          18        4.526     251.42   dev          -       7.64  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #552 blk.12.ffn_down_exps.0.weight
+          18        4.347     241.53   dev          -      10.44  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1195 blk.27.ffn_gate_up_exps.0.weight
+          18        4.346     241.44   dev          -       9.84  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1253 blk.28.ffn_gate_up_exps.0.weight
+          18        4.141     230.06   dev          -      11.09  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #915 blk.20.ffn_gate_up_exps.0.weight
+          18        4.057     225.40   dev          -       7.41  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #441 blk.9.ffn_down_exps.0.weight
+          18        4.025     223.61   dev          -       4.81  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #27 -
+          18        3.949     219.38   dev          -       8.77  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #224 blk.4.ffn_down_exps.0.weight
+          18        3.929     218.30   dev          -       9.90  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1084 blk.24.ffn_gate_up_exps.0.weight
+          18        3.908     217.11   dev          -       8.54  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1291 blk.29.ffn_down_exps.0.weight
+          17        3.862     227.19   dev          -      10.26  gemm_nt_ggml  N=5120 K=15360 type=q8_0 dtype=bf16  #1720 dspark.fc.weight
+          85        3.823      44.98   dev          -       5.48  all_gather  world_size=4 numel=32 dtype=f32 row=4  #1871 -
+          18        3.737     207.63   dev          -      10.46  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #774 blk.17.ffn_gate_up_exps.0.weight
+          18        3.723     206.84   dev          -      11.57  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #663 blk.14.ffn_gate_up_exps.0.weight
+          18        3.701     205.61   dev          -       7.15  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #515 blk.11.ffn_down_exps.0.weight
+          18        3.658     203.23   dev          -       9.48  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #150 blk.2.ffn_down_exps.0.weight
+          18        3.621     201.14   dev          -       6.25  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1027 blk.23.ffn_down_exps.0.weight
+          18        3.472     192.90   dev          -       6.85  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #701 blk.15.ffn_down_exps.0.weight
+          18        3.458     192.10   dev          -      10.43  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #1121 blk.25.ffn_gate_up_exps.0.weight
+          18        3.439     191.08   dev          -       9.85  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #737 blk.16.ffn_gate_up_exps.0.weight
+          18        3.430     190.58   dev          -       6.61  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1497 blk.34.ffn_down_exps.0.weight
+          18        3.396     188.64   dev          -       8.28  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #589 blk.13.ffn_down_exps.0.weight
+          18        3.296     183.10   dev          -       8.11  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #478 blk.10.ffn_down_exps.0.weight
+          18        3.231     179.50   dev          -       7.00  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1423 blk.32.ffn_down_exps.0.weight
+          18        3.094     171.91   dev          -       6.46  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1460 blk.33.ffn_down_exps.0.weight
+          18        3.058     169.87   dev          -       6.66  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2h codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1534 blk.35.ffn_down_exps.0.weight
+          18        3.024     168.02   dev          -       6.18  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1365 blk.31.ffn_down_exps.0.weight
+          18        2.983     165.74   dev          -      11.04  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #297 blk.6.ffn_gate_up_exps.0.weight
+          18        2.906     161.44   dev          -       7.01  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1159 blk.26.ffn_down_exps.0.weight
+          18        2.873     159.60   dev          -       6.97  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #953 blk.21.ffn_down_exps.0.weight
+          18        2.616     145.31   dev          -       4.07  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #70 -
+          18        2.603     144.61   dev          -       6.03  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #335 blk.7.ffn_down_exps.0.weight
+          18        2.498     138.80   dev          -       4.29  moe_scatter  n_expert=96 top_k=6 expert_base=0  #35 -
+          18        2.352     130.66   dev          -       7.26  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #404 blk.8.ffn_down_exps.0.weight
+          18        2.327     129.27   dev          -       6.58  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #990 blk.22.ffn_down_exps.0.weight
+          18        2.317     128.73   dev          -       6.67  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1328 blk.30.ffn_down_exps.0.weight
+          18        2.313     128.49   dev          -       9.21  moe_exl3_gate_up  N=4608 K=5120 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=4608 K_odd=5120 h_rot=1 a_rot=0 limit=10  #811 blk.18.ffn_gate_up_exps.0.weight
+          18        2.184     121.32   dev          -       5.92  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1254 blk.28.ffn_down_exps.0.weight
+          18        2.135     118.60   dev          -       6.29  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1196 blk.27.ffn_down_exps.0.weight
+          18        2.083     115.73   dev          -       6.63  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #916 blk.20.ffn_down_exps.0.weight
+          18        1.966     109.23   dev          -       5.90  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1085 blk.24.ffn_down_exps.0.weight
+          18        1.890     104.99   dev          -       6.52  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #664 blk.14.ffn_down_exps.0.weight
+          18        1.871     103.92   dev          -       6.18  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #775 blk.17.ffn_down_exps.0.weight
+          18        1.809     100.52   dev          -       4.50  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #654 -
+          18        1.768      98.22   dev          -       6.28  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #1122 blk.25.ffn_down_exps.0.weight
+          18        1.738      96.54   dev          -       5.91  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #738 blk.16.ffn_down_exps.0.weight
+          18        1.556      86.45   dev          -       6.46  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #298 blk.6.ffn_down_exps.0.weight
+          18        1.456      80.89   dev          -       4.39  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #906 -
+          18        1.390      77.23   dev          -       4.34  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #394 -
+          18        1.357      75.36   dev          -       4.10  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #140 -
+          18        1.269      70.49   dev          -       5.37  rope_table  rot=64 theta=10000 scale=1 dtype=f32  #7 -
+          18        1.195      66.40   dev          -       4.11  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #210 blk.4.attn_sinks.weight
+          18        1.191      66.17   dev          -       4.10  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #173 blk.3.attn_sinks.weight
+          18        1.189      66.07   dev          -       4.08  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #538 blk.12.attn_sinks.weight
+          18        1.189      66.07   dev          -       4.18  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #501 blk.11.attn_sinks.weight
+          18        1.189      66.04   dev          -       4.10  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #464 blk.10.attn_sinks.weight
+          18        1.188      65.99   dev          -       4.20  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #321 blk.7.attn_sinks.weight
+          18        1.186      65.86   dev          -       3.55  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #939 blk.21.attn_sinks.weight
+          18        1.183      65.73   dev          -       4.14  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #136 blk.2.attn_sinks.weight
+          18        1.183      65.72   dev          -       4.14  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #427 blk.9.attn_sinks.weight
+          18        1.177      65.39   dev          -       3.53  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1654 blk.38.attn_sinks.weight
+          18        1.165      64.74   dev          -       3.54  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #902 blk.20.attn_sinks.weight
+          18        1.163      64.61   dev          -       3.54  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #835 blk.19.attn_sinks.weight
+          18        1.163      64.59   dev          -       3.52  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1616 blk.37.attn_sinks.weight
+          18        1.161      64.53   dev          -       3.52  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1483 blk.34.attn_sinks.weight
+          18        1.161      64.52   dev          -       4.12  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #247 blk.5.attn_sinks.weight
+          18        1.161      64.50   dev          -       3.55  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1520 blk.35.attn_sinks.weight
+          18        1.160      64.46   dev          -       3.54  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1446 blk.33.attn_sinks.weight
+          18        1.160      64.45   dev          -       3.55  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1578 blk.36.attn_sinks.weight
+          18        1.160      64.42   dev          -       3.59  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1145 blk.26.attn_sinks.weight
+          18        1.159      64.41   dev          -       3.63  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1277 blk.29.attn_sinks.weight
+          18        1.159      64.39   dev          -       3.50  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1071 blk.24.attn_sinks.weight
+          18        1.159      64.37   dev          -       3.67  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1314 blk.30.attn_sinks.weight
+          18        1.159      64.36   dev          -       3.59  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1182 blk.27.attn_sinks.weight
+          18        1.158      64.33   dev          -       3.57  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1108 blk.25.attn_sinks.weight
+          18        1.158      64.32   dev          -       3.50  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1409 blk.32.attn_sinks.weight
+          18        1.158      64.32   dev          -       3.57  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #798 blk.18.attn_sinks.weight
+          18        1.157      64.29   dev          -       3.53  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #687 blk.15.attn_sinks.weight
+          18        1.157      64.26   dev          -       3.53  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1240 blk.28.attn_sinks.weight
+          18        1.156      64.21   dev          -       5.53  moe_exl3_down  N=5120 K=2304 n_expert=96 top_k=6 dtype=exl3k2 codebook=mul1 N_odd=5120 K_odd=2304 h_rot=1  #812 blk.18.ffn_down_exps.0.weight
+          18        1.156      64.21   dev          -       3.50  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1351 blk.31.attn_sinks.weight
+          18        1.155      64.17   dev          -       4.10  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #390 blk.8.attn_sinks.weight
+          18        1.155      64.17   dev          -       3.58  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #761 blk.17.attn_sinks.weight
+          18        1.154      64.12   dev          -       3.48  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1692 blk.39.attn_sinks.weight
+          18        1.153      64.08   dev          -       3.56  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #724 blk.16.attn_sinks.weight
+          18        1.153      64.04   dev          -       3.56  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #976 blk.22.attn_sinks.weight
+          18        1.151      63.92   dev          -       4.11  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #284 blk.6.attn_sinks.weight
+          18        1.149      63.85   dev          -       4.10  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #575 blk.13.attn_sinks.weight
+          18        1.137      63.15   dev          -       3.55  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=2 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #650 blk.14.attn_sinks.weight
+          18        1.136      63.12   dev          -       3.60  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=1 topk=512 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #1013 blk.23.attn_sinks.weight
+          18        1.124      62.47   dev          -       3.78  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1582 -
+          18        1.124      62.46   dev          -       4.10  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1075 -
+          18        1.121      62.25   dev          -       3.86  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1413 -
+          18        1.110      61.68   dev          -       4.18  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1244 -
+          18        1.074      59.69   dev          -       3.54  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1620 -
+          18        1.071      59.52   dev          -       4.15  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #58 blk.1.attn_q_b.weight
+          18        1.007      55.97   dev          -       3.99  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1524 -
+          18        0.994      55.21   dev          -       5.38  fill  n=4 dtype=f32 value=0  #4 -
+          18        0.981      54.50   dev          -       4.06  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1355 -
+          18        0.979      54.39   dev          -       3.80  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1658 -
+          18        0.975      54.15   dev          -       3.52  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1380 blk.32.attn_q_b.weight
+          18        0.961      53.41   dev          -       4.34  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1186 -
+          18        0.959      53.30   dev          -       3.88  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1017 -
+          18        0.957      53.18   dev          -       4.02  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #980 -
+          18        0.949      52.70   dev          -       3.54  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #931 blk.21.attn_q_b.weight
+          18        0.948      52.66   dev          -       4.03  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #691 -
+          18        0.947      52.62   dev          -       4.24  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1281 -
+          18        0.946      52.53   dev          -       4.02  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #802 -
+          18        0.929      51.62   dev          -       4.70  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #15 blk.0.attn_q_b.weight
+          18        0.928      51.57   dev          -       4.22  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1318 -
+          18        0.928      51.53   dev          -       3.79  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1149 -
+          18        0.926      51.43   dev          -       3.85  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1450 -
+          18        0.925      51.40   dev          -       4.35  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #765 -
+          18        0.925      51.36   dev          -       3.85  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #728 -
+          18        0.924      51.36   dev          -       3.54  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1112 -
+          18        0.924      51.31   dev          -       4.10  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1487 -
+          18        0.921      51.16   dev          -       4.32  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #839 -
+          18        0.908      50.46   dev          -       4.11  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #943 -
+          18        0.892      49.55   dev          -       4.07  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #165 blk.3.attn_q_b.weight
+          18        0.891      49.50   dev          -       4.13  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #95 blk.2.attn_q_b.weight
+          18        0.884      49.11   dev          -       4.13  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #202 blk.4.attn_q_b.weight
+          18        0.879      48.82   dev          -       4.12  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #579 -
+          18        0.876      48.66   dev          -       4.08  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #276 blk.6.attn_q_b.weight
+          18        0.867      48.18   dev          -       3.51  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1174 blk.27.attn_q_b.weight
+          18        0.867      48.14   dev          -       4.10  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #350 blk.8.attn_q_b.weight
+          18        0.866      48.10   dev          -       3.56  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1608 blk.37.attn_q_b.weight
+          18        0.865      48.08   dev          -       4.09  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #313 blk.7.attn_q_b.weight
+          18        0.865      48.05   dev          -       3.60  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1343 blk.31.attn_q_b.weight
+          18        0.864      48.02   dev          -       3.52  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1684 blk.39.attn_q_b.weight
+          18        0.864      48.01   dev          -       4.13  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #530 blk.12.attn_q_b.weight
+          18        0.864      48.00   dev          -       3.57  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1269 blk.29.attn_q_b.weight
+          18        0.863      47.94   dev          -       4.14  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #493 blk.11.attn_q_b.weight
+          18        0.863      47.92   dev          -       4.10  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #239 blk.5.attn_q_b.weight
+          18        0.862      47.92   dev          -       4.07  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #456 blk.10.attn_q_b.weight
+          18        0.862      47.91   dev          -       3.50  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1475 blk.34.attn_q_b.weight
+          18        0.862      47.91   dev          -       3.54  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1438 blk.33.attn_q_b.weight
+          18        0.862      47.91   dev          -       3.59  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1512 blk.35.attn_q_b.weight
+          18        0.862      47.90   dev          -       3.51  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1646 blk.38.attn_q_b.weight
+          68        0.862      12.67   dev          -       8.37  cast  n=5120 from=bf16 to=bf16  #1739 -
+          18        0.862      47.86   dev          -       3.61  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1549 blk.36.attn_q_b.weight
+          18        0.860      47.80   dev          -       4.09  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #419 blk.9.attn_q_b.weight
+          18        0.858      47.69   dev          -       3.55  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1306 blk.30.attn_q_b.weight
+          18        0.858      47.64   dev          -       4.38  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #214 -
+          18        0.856      47.57   dev          -       3.55  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q5_K dtype=bf16 eps=1e-20  #1211 blk.28.attn_q_b.weight
+          18        0.855      47.52   dev          -       4.16  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #288 -
+          18        0.855      47.48   dev          -       4.35  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #505 -
+          18        0.854      47.42   dev          -       4.19  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #468 -
+          18        0.853      47.41   dev          -       4.09  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #567 blk.13.attn_q_b.weight
+          18        0.853      47.38   dev          -       4.09  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #610 blk.14.attn_q_b.weight
+          18        0.851      47.31   dev          -       4.28  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #542 -
+          18        0.844      46.87   dev          -       3.65  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #1005 blk.23.attn_q_b.weight
+          18        0.843      46.86   dev          -       4.10  gemm_nt_f32  N=1024 K=5120 dtype=bf16  #101 blk.2.attn_compressor_kvg.weight
+          17        0.842      49.55   dev          -       5.72  dspark_walk_step  step=0 steps=5 rank=256 n_vocab=129280 N=32320 vocab_off=0 world=4 anchor_stride=5 dtype=f32  #1872 dspark.markov_w1.weight
+          18        0.842      46.78   dev          -       3.58  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #827 blk.19.attn_q_b.weight
+          18        0.842      46.77   dev          -       3.52  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #864 blk.20.attn_q_b.weight
+          18        0.841      46.74   dev          -       4.13  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #431 -
+          18        0.838      46.57   dev          -       4.77  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #26 blk.0.attn_output_b.weight
+          18        0.838      46.55   dev          -       3.54  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #968 blk.22.attn_q_b.weight
+          18        0.838      46.54   dev          -       3.54  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #1100 blk.25.attn_q_b.weight
+          18        0.837      46.50   dev          -       3.58  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #790 blk.18.attn_q_b.weight
+          18        0.836      46.45   dev          -       3.58  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #716 blk.16.attn_q_b.weight
+          18        0.835      46.39   dev          -       3.48  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #1042 blk.24.attn_q_b.weight
+          18        0.834      46.32   dev          -       3.53  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #1137 blk.26.attn_q_b.weight
+          18        0.834      46.32   dev          -       3.52  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #753 blk.17.attn_q_b.weight
+          18        0.834      46.31   dev          -       3.54  rmsnorm_gemm_nt_ggml  N=8192 K=1280 type=q6_K dtype=bf16 eps=1e-20  #679 blk.15.attn_q_b.weight
+          18        0.831      46.17   dev          -       4.33  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #325 -
+          18        0.818      45.44   dev          -       4.18  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #69 blk.1.attn_output_b.weight
+          18        0.817      45.39   dev          -       4.08  gemm_nt_f32  N=1024 K=5120 dtype=bf16  #356 blk.8.attn_compressor_kvg.weight
+          18        0.817      45.39   dev          -       4.10  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #139 blk.2.attn_output_b.weight
+          18        0.810      44.98   dev          -       4.10  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #176 blk.3.attn_output_b.weight
+          18        0.809      44.95   dev          -       4.07  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #213 blk.4.attn_output_b.weight
+          18        0.808      44.91   dev          -       4.08  gemm_nt_f32  N=1024 K=5120 dtype=bf16  #616 blk.14.attn_compressor_kvg.weight
+          18        0.808      44.88   dev          -       5.04  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #251 -
+          18        0.804      44.65   dev          -       4.04  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #393 blk.8.attn_output_b.weight
+          18        0.800      44.45   dev          -       4.08  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #287 blk.6.attn_output_b.weight
+          18        0.798      44.32   dev          -       4.10  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #504 blk.11.attn_output_b.weight
+          18        0.797      44.30   dev          -       4.06  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #250 blk.5.attn_output_b.weight
+          18        0.796      44.23   dev          -       4.50  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #177 -
+          18        0.793      44.07   dev          -       4.06  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #324 blk.7.attn_output_b.weight
+          18        0.793      44.04   dev          -       4.09  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #541 blk.12.attn_output_b.weight
+          18        0.792      43.97   dev          -       4.18  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #467 blk.10.attn_output_b.weight
+          18        0.790      43.90   dev          -       4.13  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #430 blk.9.attn_output_b.weight
+          18        0.787      43.72   dev          -       3.56  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #653 blk.14.attn_output_b.weight
+          18        0.781      43.37   dev          -       4.15  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #578 blk.13.attn_output_b.weight
+          18        0.779      43.29   dev          -       3.50  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #1111 blk.25.attn_output_b.weight
+          18        0.778      43.22   dev          -       3.54  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #838 blk.19.attn_output_b.weight
+          18        0.776      43.13   dev          -       3.58  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #905 blk.20.attn_output_b.weight
+          18        0.773      42.92   dev          -       3.51  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #979 blk.22.attn_output_b.weight
+          18        0.772      42.91   dev          -       3.64  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #1016 blk.23.attn_output_b.weight
+          18        0.772      42.88   dev          -       3.58  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #690 blk.15.attn_output_b.weight
+          18        0.771      42.82   dev          -       3.55  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #727 blk.16.attn_output_b.weight
+          18        0.770      42.80   dev          -       3.60  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #942 blk.21.attn_output_b.weight
+          18        0.770      42.76   dev          -       3.61  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #1148 blk.26.attn_output_b.weight
+          18        0.767      42.58   dev          -       3.55  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #764 blk.17.attn_output_b.weight
+          18        0.766      42.57   dev          -       3.63  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #801 blk.18.attn_output_b.weight
+          18        0.765      42.47   dev          -       3.53  gemm_nt_ggml  N=5120 K=2048 type=q6_K dtype=bf16  #1074 blk.24.attn_output_b.weight
+          18        0.759      42.18   dev          -       3.58  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1581 blk.36.attn_output_b.weight
+          18        0.756      42.01   dev          -       3.58  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1449 blk.33.attn_output_b.weight
+          18        0.756      41.98   dev          -       3.50  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1486 blk.34.attn_output_b.weight
+          18        0.755      41.92   dev          -       3.59  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1185 blk.27.attn_output_b.weight
+          18        0.755      41.92   dev          -       3.58  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1354 blk.31.attn_output_b.weight
+          18        0.753      41.85   dev          -       3.56  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1243 blk.28.attn_output_b.weight
+          18        0.753      41.84   dev          -       3.55  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1317 blk.30.attn_output_b.weight
+          18        0.752      41.80   dev          -       3.53  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1412 blk.32.attn_output_b.weight
+          18        0.752      41.76   dev          -       3.51  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1619 blk.37.attn_output_b.weight
+          18        0.751      41.74   dev          -       3.57  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1523 blk.35.attn_output_b.weight
+          18        0.751      41.73   dev          -       3.52  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1695 blk.39.attn_output_b.weight
+          18        0.749      41.64   dev          -       3.61  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1280 blk.29.attn_output_b.weight
+          18        0.749      41.59   dev          -       3.58  gemm_nt_ggml  N=5120 K=2048 type=q5_K dtype=bf16  #1657 blk.38.attn_output_b.weight
+          18        0.744      41.32   dev          -       4.11  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #92 blk.2.attn_q_a.weight
+          18        0.743      41.29   dev          -       4.02  all_reduce  world_size=4 dtype=bf16 exact=1 min_bytes=0  #1696 -
+          18        0.733      40.72   dev          -       4.12  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #189 blk.3.ffn_gate_up_shexp.weight
+          18        0.732      40.64   dev          -       4.11  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #39 blk.0.ffn_gate_up_shexp.weight
+          18        0.729      40.48   dev          -       4.10  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #152 blk.2.ffn_gate_up_shexp.weight
+          18        0.724      40.21   dev          -       4.15  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #82 blk.1.ffn_gate_up_shexp.weight
+          18        0.724      40.21   dev          -       4.15  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #300 blk.6.ffn_gate_up_shexp.weight
+          18        0.719      39.97   dev          -       4.14  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #337 blk.7.ffn_gate_up_shexp.weight
+          18        0.719      39.95   dev          -       4.11  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #226 blk.4.ffn_gate_up_shexp.weight
+          18        0.716      39.80   dev          -       4.10  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #263 blk.5.ffn_gate_up_shexp.weight
+          18        0.714      39.66   dev          -       4.12  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #347 blk.8.attn_q_a.weight
+          18        0.713      39.61   dev          -       4.16  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #480 blk.10.ffn_gate_up_shexp.weight
+          18        0.713      39.59   dev          -       4.16  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #406 blk.8.ffn_gate_up_shexp.weight
+          18        0.711      39.52   dev          -       4.18  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #517 blk.11.ffn_gate_up_shexp.weight
+          18        0.709      39.38   dev          -       4.17  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #55 blk.1.attn_q_a.weight
+          18        0.707      39.26   dev          -       4.10  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #443 blk.9.ffn_gate_up_shexp.weight
+          18        0.705      39.19   dev          -       4.11  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #554 blk.12.ffn_gate_up_shexp.weight
+          18        0.704      39.11   dev          -       4.13  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #199 blk.4.attn_q_a.weight
+          18        0.703      39.07   dev          -       4.42  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #591 blk.13.ffn_gate_up_shexp.weight
+          18        0.699      38.86   dev          -       4.09  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #607 blk.14.attn_q_a.weight
+          18        0.699      38.81   dev          -       4.09  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #162 blk.3.attn_q_a.weight
+          18        0.696      38.67   dev          -       3.59  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #861 blk.20.attn_q_a.weight
+          18        0.694      38.58   dev          -       3.57  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1330 blk.30.ffn_gate_up_shexp.weight
+          17        0.693      40.79   dev          -       9.93  gemm_nt_ggml  N=512 K=5120 type=q8_0 dtype=bf16  #1752 blk.40.attn_kv.weight
+          18        0.690      38.36   dev          -       3.80  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1462 blk.33.ffn_gate_up_shexp.weight
+          18        0.690      38.35   dev          -       3.62  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1670 blk.38.ffn_gate_up_shexp.weight
+          18        0.690      38.35   dev          -       3.56  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1632 blk.37.ffn_gate_up_shexp.weight
+          18        0.689      38.30   dev          -       3.57  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1367 blk.31.ffn_gate_up_shexp.weight
+          18        0.689      38.29   dev          -       3.65  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1256 blk.28.ffn_gate_up_shexp.weight
+          18        0.688      38.20   dev          -       3.57  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1425 blk.32.ffn_gate_up_shexp.weight
+          17        0.687      40.44   dev          -       9.15  gemm_nt_ggml  N=512 K=5120 type=q8_0 dtype=bf16  #1727 blk.41.attn_kv.weight
+          18        0.687      38.19   dev          -       3.56  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1708 blk.39.ffn_gate_up_shexp.weight
+          18        0.687      38.18   dev          -       3.55  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1198 blk.27.ffn_gate_up_shexp.weight
+          18        0.687      38.16   dev          -       4.05  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #273 blk.6.attn_q_a.weight
+          18        0.687      38.14   dev          -       3.52  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1499 blk.34.ffn_gate_up_shexp.weight
+          18        0.686      38.14   dev          -       4.07  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #310 blk.7.attn_q_a.weight
+          18        0.685      38.08   dev          -       3.56  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1594 blk.36.ffn_gate_up_shexp.weight
+          18        0.685      38.06   dev          -       4.03  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #236 blk.5.attn_q_a.weight
+          18        0.685      38.04   dev          -       3.55  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1293 blk.29.ffn_gate_up_shexp.weight
+          18        0.684      38.03   dev          -       3.56  gemm_nt_ggml  N=1536 K=5120 type=q6_K dtype=bf16  #1536 blk.35.ffn_gate_up_shexp.weight
+          18        0.684      38.02   dev          -       4.08  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #416 blk.9.attn_q_a.weight
+          18        0.684      38.02   dev          -       4.11  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #527 blk.12.attn_q_a.weight
+          17        0.683      40.19   dev          -      11.06  gemm_nt_ggml  N=5120 K=2048 type=q8_0 dtype=bf16  #1762 blk.40.attn_output_b.weight
+          18        0.682      37.88   dev          -       4.21  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #453 blk.10.attn_q_a.weight
+          18        0.681      37.82   dev          -       4.11  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #490 blk.11.attn_q_a.weight
+          17        0.676      39.77   dev          -      11.09  gemm_nt_ggml  N=512 K=5120 type=q8_0 dtype=bf16  #1732 blk.42.attn_kv.weight
+          18        0.675      37.52   dev          -       4.12  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #564 blk.13.attn_q_a.weight
+          18        0.674      37.46   dev          -       3.56  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1171 blk.27.attn_q_a.weight
+          18        0.673      37.40   dev          -       3.59  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1509 blk.35.attn_q_a.weight
+          18        0.672      37.33   dev          -       3.50  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1546 blk.36.attn_q_a.weight
+          18        0.672      37.31   dev          -       3.58  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1472 blk.34.attn_q_a.weight
+          18        0.672      37.31   dev          -       3.54  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1643 blk.38.attn_q_a.weight
+          18        0.671      37.30   dev          -       3.58  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1605 blk.37.attn_q_a.weight
+          18        0.671      37.30   dev          -       3.57  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1681 blk.39.attn_q_a.weight
+          18        0.671      37.29   dev          -       3.56  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1435 blk.33.attn_q_a.weight
+          18        0.671      37.28   dev          -       3.52  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1266 blk.29.attn_q_a.weight
+          18        0.671      37.26   dev          -       3.58  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1208 blk.28.attn_q_a.weight
+          18        0.670      37.23   dev          -       3.53  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1377 blk.32.attn_q_a.weight
+          18        0.669      37.18   dev          -       3.48  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1303 blk.30.attn_q_a.weight
+          18        0.669      37.16   dev          -       3.52  gemm_nt_ggml  N=1280 K=5120 type=q5_K dtype=bf16  #1340 blk.31.attn_q_a.weight
+          17        0.662      38.95   dev          -      10.16  gemm_nt_ggml  N=1280 K=5120 type=q8_0 dtype=bf16  #1748 blk.40.attn_q_a.weight
+          18        0.661      36.72   dev          -       3.60  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #1002 blk.23.attn_q_a.weight
+          18        0.659      36.63   dev          -       3.56  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #928 blk.21.attn_q_a.weight
+          18        0.659      36.63   dev          -       3.54  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #824 blk.19.attn_q_a.weight
+          17        0.659      38.77   dev          -       9.42  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #1777 blk.40.ffn_gate_up_shexp.weight
+          17        0.659      38.75   dev          -      10.35  gemm_nt_ggml  N=8192 K=1280 type=q8_0 dtype=bf16  #1750 blk.40.attn_q_b.weight
+          18        0.658      36.56   dev          -       3.55  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #965 blk.22.attn_q_a.weight
+          18        0.657      36.53   dev          -       3.60  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #787 blk.18.attn_q_a.weight
+          18        0.657      36.50   dev          -       3.57  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #1097 blk.25.attn_q_a.weight
+          17        0.657      38.65   dev          -       8.03  gemm_nt_ggml  N=512 K=5120 type=q8_0 dtype=bf16  #1722 blk.40.attn_kv.weight
+          18        0.657      36.50   dev          -       3.52  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #1134 blk.26.attn_q_a.weight
+          18        0.657      36.49   dev          -       3.53  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #1039 blk.24.attn_q_a.weight
+          18        0.657      36.47   dev          -       3.53  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #676 blk.15.attn_q_a.weight
+          18        0.655      36.38   dev          -       3.58  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #750 blk.17.attn_q_a.weight
+          18        0.653      36.28   dev          -       3.54  gemm_nt_ggml  N=1280 K=5120 type=q6_K dtype=bf16  #713 blk.16.attn_q_a.weight
+          17        0.650      38.24   dev          -       8.90  gemm_nt_ggml  N=512 K=5120 type=q8_0 dtype=bf16  #1791 blk.41.attn_kv.weight
+          72        0.648       9.00   dev          -       5.84  cast  n=5120 from=bf16 to=bf16  #3 -
+          17        0.641      37.73   dev          -       7.86  gemm_nt_ggml  N=5120 K=2048 type=q8_0 dtype=bf16  #1801 blk.41.attn_output_b.weight
+          17        0.635      37.36   dev          -       7.56  gemm_nt_ggml  N=5120 K=2048 type=q8_0 dtype=bf16  #1840 blk.42.attn_output_b.weight
+          17        0.633      37.25   dev          -       8.38  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #1816 blk.41.ffn_gate_up_shexp.weight
+          17        0.632      37.16   dev          -       6.72  gemm_nt_ggml  N=512 K=5120 type=q8_0 dtype=bf16  #1830 blk.42.attn_kv.weight
+          17        0.631      37.09   dev          -       8.73  gemm_nt_ggml  N=8192 K=1280 type=q8_0 dtype=bf16  #1789 blk.41.attn_q_b.weight
+          18        0.630      35.02   dev          -       3.59  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #740 blk.16.ffn_gate_up_shexp.weight
+          18        0.628      34.89   dev          -       3.63  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #777 blk.17.ffn_gate_up_shexp.weight
+          18        0.627      34.81   dev          -       3.72  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #955 blk.21.ffn_gate_up_shexp.weight
+          18        0.625      34.72   dev          -       3.58  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #666 blk.14.ffn_gate_up_shexp.weight
+          18        0.622      34.58   dev          -       3.53  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #918 blk.20.ffn_gate_up_shexp.weight
+          18        0.622      34.58   dev          -       3.56  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #814 blk.18.ffn_gate_up_shexp.weight
+          18        0.622      34.55   dev          -       3.58  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #1161 blk.26.ffn_gate_up_shexp.weight
+          18        0.621      34.51   dev          -       3.62  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #703 blk.15.ffn_gate_up_shexp.weight
+          18        0.621      34.47   dev          -       3.61  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #851 blk.19.ffn_gate_up_shexp.weight
+          18        0.619      34.41   dev          -       3.59  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #1029 blk.23.ffn_gate_up_shexp.weight
+          18        0.619      34.39   dev          -       3.54  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #992 blk.22.ffn_gate_up_shexp.weight
+          18        0.619      34.38   dev          -       3.62  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #1124 blk.25.ffn_gate_up_shexp.weight
+          17        0.617      36.30   dev          -       8.28  gemm_nt_ggml  N=1280 K=5120 type=q8_0 dtype=bf16  #1787 blk.41.attn_q_a.weight
+          18        0.617      34.26   dev          -       3.54  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #1087 blk.24.ffn_gate_up_shexp.weight
+          17        0.602      35.38   dev          -       5.60  dspark_walk_step  step=2 steps=5 rank=256 n_vocab=129280 N=32320 vocab_off=0 world=4 anchor_stride=5 dtype=f32  #1874 dspark.markov_w1.weight
+          17        0.601      35.35   dev          -       5.78  dspark_walk_step  step=1 steps=5 rank=256 n_vocab=129280 N=32320 vocab_off=0 world=4 anchor_stride=5 dtype=f32  #1873 dspark.markov_w1.weight
+          17        0.600      35.32   dev          -       5.46  dspark_walk_step  step=3 steps=5 rank=256 n_vocab=129280 N=32320 vocab_off=0 world=4 anchor_stride=5 dtype=f32  #1875 dspark.markov_w1.weight
+          17        0.595      34.98   dev          -       6.52  gemm_nt_ggml  N=8192 K=1280 type=q8_0 dtype=bf16  #1828 blk.42.attn_q_b.weight
+          17        0.584      34.35   dev          -       5.14  gemm_nt_ggml  N=1536 K=5120 type=q8_0 dtype=bf16  #1855 blk.42.ffn_gate_up_shexp.weight
+          17        0.582      34.21   dev          -       4.88  dspark_walk_step  step=4 steps=5 rank=256 n_vocab=129280 N=32320 vocab_off=0 world=4 anchor_stride=5 dtype=f32  #1876 dspark.markov_w1.weight
+          17        0.580      34.13   dev          -       6.40  gemm_nt_ggml  N=1280 K=5120 type=q8_0 dtype=bf16  #1826 blk.42.attn_q_a.weight
+          18        0.509      28.28   dev          -       4.76  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #24 blk.0.attn_output_a.g0.weight
+          17        0.508      29.87   dev          -       9.42  gemm_nt_ggml  N=1024 K=4096 type=q8_0 dtype=bf16  #1761 blk.40.attn_output_a.g1.weight
+          18        0.506      28.13   dev          -       4.82  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #25 blk.0.attn_output_a.g1.weight
+          18        0.498      27.69   dev          -       4.10  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #174 blk.3.attn_output_a.g0.weight
+          17        0.497      29.25   dev          -       9.45  gemm_nt_ggml  N=1024 K=4096 type=q8_0 dtype=bf16  #1760 blk.40.attn_output_a.g0.weight
+          18        0.495      27.52   dev          -       4.06  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #68 blk.1.attn_output_a.g1.weight
+          18        0.495      27.47   dev          -       4.11  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #175 blk.3.attn_output_a.g1.weight
+          18        0.493      27.38   dev          -       4.12  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #67 blk.1.attn_output_a.g0.weight
+          18        0.492      27.35   dev          -       4.15  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #137 blk.2.attn_output_a.g0.weight
+          18        0.491      27.30   dev          -       4.15  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #138 blk.2.attn_output_a.g1.weight
+          18        0.491      27.26   dev          -       4.11  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #212 blk.4.attn_output_a.g1.weight
+          17        0.490      28.81   dev          -       8.60  gemm_nt_ggml  N=1024 K=4096 type=q8_0 dtype=bf16  #1799 blk.41.attn_output_a.g0.weight
+          18        0.487      27.04   dev          -       4.13  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #248 blk.5.attn_output_a.g0.weight
+          18        0.486      27.01   dev          -       4.12  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #211 blk.4.attn_output_a.g0.weight
+          17        0.486      28.59   dev          -       8.40  gemm_nt_ggml  N=1024 K=4096 type=q8_0 dtype=bf16  #1800 blk.41.attn_output_a.g1.weight
+          18        0.484      26.92   dev          -       4.11  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #85 blk.1.ffn_down_shexp.weight
+          18        0.483      26.86   dev          -       4.15  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #286 blk.6.attn_output_a.g1.weight
+          18        0.482      26.80   dev          -       4.34  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #42 blk.0.ffn_down_shexp.weight
+          18        0.481      26.70   dev          -       4.12  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #466 blk.10.attn_output_a.g1.weight
+          18        0.480      26.69   dev          -       4.11  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #249 blk.5.attn_output_a.g1.weight
+          18        0.480      26.69   dev          -       4.14  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #392 blk.8.attn_output_a.g1.weight
+          18        0.480      26.68   dev          -       4.06  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #323 blk.7.attn_output_a.g1.weight
+          18        0.480      26.68   dev          -       4.16  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #340 blk.7.ffn_down_shexp.weight
+          18        0.480      26.67   dev          -       4.09  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #285 blk.6.attn_output_a.g0.weight
+          18        0.480      26.66   dev          -       4.15  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #409 blk.8.ffn_down_shexp.weight
+          18        0.480      26.65   dev          -       4.13  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #192 blk.3.ffn_down_shexp.weight
+          18        0.479      26.64   dev          -       4.11  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #429 blk.9.attn_output_a.g1.weight
+          18        0.479      26.61   dev          -       4.13  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #465 blk.10.attn_output_a.g0.weight
+          18        0.479      26.59   dev          -       4.10  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #503 blk.11.attn_output_a.g1.weight
+          18        0.478      26.58   dev          -       4.13  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #540 blk.12.attn_output_a.g1.weight
+          18        0.478      26.55   dev          -       4.12  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #322 blk.7.attn_output_a.g0.weight
+          18        0.478      26.54   dev          -       4.16  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #428 blk.9.attn_output_a.g0.weight
+          18        0.478      26.53   dev          -       4.13  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #391 blk.8.attn_output_a.g0.weight
+          18        0.477      26.51   dev          -       4.26  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #539 blk.12.attn_output_a.g0.weight
+          18        0.476      26.42   dev          -       4.14  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #502 blk.11.attn_output_a.g0.weight
+          17        0.474      27.89   dev          -       7.76  gemm_nt_ggml  N=1024 K=4096 type=q8_0 dtype=bf16  #1839 blk.42.attn_output_a.g1.weight
+          18        0.474      26.34   dev          -       4.30  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #557 blk.12.ffn_down_shexp.weight
+          18        0.474      26.31   dev          -       4.16  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #155 blk.2.ffn_down_shexp.weight
+          18        0.473      26.30   dev          -       4.76  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #17 blk.0.attn_kv.weight
+          18        0.472      26.24   dev          -       4.14  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #577 blk.13.attn_output_a.g1.weight
+          18        0.472      26.22   dev          -       4.14  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #303 blk.6.ffn_down_shexp.weight
+          18        0.472      26.20   dev          -       4.13  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #60 blk.1.attn_kv.weight
+          18        0.469      26.08   dev          -       4.13  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #576 blk.13.attn_output_a.g0.weight
+          18        0.469      26.03   dev          -       3.60  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1259 blk.28.ffn_down_shexp.weight
+          18        0.468      25.99   dev          -       4.06  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #483 blk.10.ffn_down_shexp.weight
+          18        0.468      25.98   dev          -       4.11  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #266 blk.5.ffn_down_shexp.weight
+          18        0.467      25.95   dev          -       4.15  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #229 blk.4.ffn_down_shexp.weight
+          17        0.467      27.47   dev          -       7.71  gemm_nt_ggml  N=1024 K=4096 type=q8_0 dtype=bf16  #1838 blk.42.attn_output_a.g0.weight
+          18        0.467      25.92   dev          -       4.31  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #594 blk.13.ffn_down_shexp.weight
+          18        0.466      25.89   dev          -       4.07  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #446 blk.9.ffn_down_shexp.weight
+          18        0.466      25.88   dev          -       4.35  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #520 blk.11.ffn_down_shexp.weight
+          18        0.463      25.75   dev          -       3.63  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1521 blk.35.attn_output_a.g0.weight
+          18        0.463      25.73   dev          -       3.49  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1694 blk.39.attn_output_a.g1.weight
+          18        0.463      25.72   dev          -       3.59  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1352 blk.31.attn_output_a.g0.weight
+          18        0.463      25.72   dev          -       4.10  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #167 blk.3.attn_kv.weight
+          18        0.463      25.72   dev          -       3.54  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1447 blk.33.attn_output_a.g0.weight
+          18        0.463      25.71   dev          -       3.54  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1502 blk.34.ffn_down_shexp.weight
+          18        0.463      25.70   dev          -       3.56  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #904 blk.20.attn_output_a.g1.weight
+          18        0.462      25.68   dev          -       4.12  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #97 blk.2.attn_kv.weight
+          18        0.462      25.67   dev          -       3.62  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1484 blk.34.attn_output_a.g0.weight
+          18        0.462      25.67   dev          -       3.58  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1580 blk.36.attn_output_a.g1.weight
+          18        0.462      25.67   dev          -       3.53  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1693 blk.39.attn_output_a.g0.weight
+          18        0.462      25.66   dev          -       3.57  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1448 blk.33.attn_output_a.g1.weight
+          18        0.462      25.66   dev          -       3.58  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1522 blk.35.attn_output_a.g1.weight
+          18        0.462      25.65   dev          -       3.53  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #652 blk.14.attn_output_a.g1.weight
+          18        0.462      25.65   dev          -       3.48  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1635 blk.37.ffn_down_shexp.weight
+          18        0.462      25.65   dev          -       3.57  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1485 blk.34.attn_output_a.g1.weight
+          18        0.462      25.65   dev          -       3.58  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #800 blk.18.attn_output_a.g1.weight
+          18        0.461      25.63   dev          -       3.59  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1655 blk.38.attn_output_a.g0.weight
+          18        0.461      25.63   dev          -       3.53  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1370 blk.31.ffn_down_shexp.weight
+          18        0.461      25.62   dev          -       3.56  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1315 blk.30.attn_output_a.g0.weight
+          18        0.461      25.62   dev          -       3.60  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1241 blk.28.attn_output_a.g0.weight
+          18        0.461      25.61   dev          -       3.62  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1183 blk.27.attn_output_a.g0.weight
+          18        0.461      25.61   dev          -       3.61  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1279 blk.29.attn_output_a.g1.weight
+          18        0.461      25.60   dev          -       3.62  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1579 blk.36.attn_output_a.g0.weight
+          18        0.461      25.60   dev          -       3.60  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #978 blk.22.attn_output_a.g1.weight
+          18        0.461      25.60   dev          -       3.55  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #1073 blk.24.attn_output_a.g1.weight
+          18        0.461      25.59   dev          -       3.54  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #903 blk.20.attn_output_a.g0.weight
+          18        0.461      25.59   dev          -       3.61  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1617 blk.37.attn_output_a.g0.weight
+          18        0.461      25.59   dev          -       4.13  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #315 blk.7.attn_kv.weight
+          18        0.461      25.58   dev          -       3.75  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1278 blk.29.attn_output_a.g0.weight
+          18        0.460      25.58   dev          -       3.57  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1353 blk.31.attn_output_a.g1.weight
+          18        0.460      25.58   dev          -       3.72  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1410 blk.32.attn_output_a.g0.weight
+          18        0.460      25.58   dev          -       3.52  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #1015 blk.23.attn_output_a.g1.weight
+          18        0.460      25.58   dev          -       3.57  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1184 blk.27.attn_output_a.g1.weight
+          18        0.460      25.57   dev          -       3.55  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #837 blk.19.attn_output_a.g1.weight
+          18        0.460      25.54   dev          -       3.56  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1242 blk.28.attn_output_a.g1.weight
+          18        0.460      25.54   dev          -       3.58  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1618 blk.37.attn_output_a.g1.weight
+          18        0.460      25.54   dev          -       3.59  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1673 blk.38.ffn_down_shexp.weight
+          18        0.460      25.54   dev          -       3.64  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #1014 blk.23.attn_output_a.g0.weight
+          18        0.460      25.54   dev          -       3.86  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #836 blk.19.attn_output_a.g0.weight
+          18        0.460      25.53   dev          -       3.54  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #763 blk.17.attn_output_a.g1.weight
+          18        0.459      25.52   dev          -       3.56  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1411 blk.32.attn_output_a.g1.weight
+          18        0.459      25.52   dev          -       3.59  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #1110 blk.25.attn_output_a.g1.weight
+          18        0.459      25.52   dev          -       3.55  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1656 blk.38.attn_output_a.g1.weight
+          18        0.459      25.52   dev          -       3.50  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1333 blk.30.ffn_down_shexp.weight
+          18        0.459      25.50   dev          -       4.15  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #204 blk.4.attn_kv.weight
+          18        0.459      25.50   dev          -       3.52  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #1147 blk.26.attn_output_a.g1.weight
+          18        0.459      25.50   dev          -       3.55  gemm_nt_ggml  N=1024 K=4096 type=q5_K dtype=bf16  #1316 blk.30.attn_output_a.g1.weight
+          18        0.459      25.49   dev          -       3.73  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #799 blk.18.attn_output_a.g0.weight
+          18        0.459      25.48   dev          -       3.61  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #940 blk.21.attn_output_a.g0.weight
+          17        0.458      26.96   dev          -      10.20  attn_sparse_sink  heads=16 dim=512 window=133 ratio=0 topk=0 scale=0.0441942 dtype=bf16  #1757 blk.40.attn_sinks.weight
+          18        0.458      25.46   dev          -       3.58  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #689 blk.15.attn_output_a.g1.weight
+          18        0.458      25.46   dev          -       3.59  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #762 blk.17.attn_output_a.g0.weight
+          18        0.458      25.44   dev          -       4.09  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #241 blk.5.attn_kv.weight
+          18        0.458      25.43   dev          -       3.55  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #941 blk.21.attn_output_a.g1.weight
+          18        0.458      25.43   dev          -       3.51  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1597 blk.36.ffn_down_shexp.weight
+          18        0.457      25.40   dev          -       3.62  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #1109 blk.25.attn_output_a.g0.weight
+          18        0.457      25.40   dev          -       3.56  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1465 blk.33.ffn_down_shexp.weight
+          18        0.457      25.39   dev          -       3.56  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #651 blk.14.attn_output_a.g0.weight
+          18        0.457      25.38   dev          -       3.66  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #977 blk.22.attn_output_a.g0.weight
+          18        0.457      25.38   dev          -       3.58  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #688 blk.15.attn_output_a.g0.weight
+          18        0.457      25.38   dev          -       3.53  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #1072 blk.24.attn_output_a.g0.weight
+          18        0.457      25.38   dev          -       3.52  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #726 blk.16.attn_output_a.g1.weight
+          18        0.456      25.36   dev          -       3.55  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1711 blk.39.ffn_down_shexp.weight
+          18        0.456      25.34   dev          -       3.73  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1201 blk.27.ffn_down_shexp.weight
+          18        0.456      25.32   dev          -       4.13  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #278 blk.6.attn_kv.weight
+          18        0.455      25.25   dev          -       3.57  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #1146 blk.26.attn_output_a.g0.weight
+          18        0.454      25.25   dev          -       3.58  gemm_nt_ggml  N=1024 K=4096 type=q6_K dtype=bf16  #725 blk.16.attn_output_a.g0.weight
+          18        0.453      25.14   dev          -       4.24  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #421 blk.9.attn_kv.weight
+          18        0.452      25.12   dev          -       4.15  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #458 blk.10.attn_kv.weight
+          18        0.452      25.10   dev          -       3.57  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1428 blk.32.ffn_down_shexp.weight
+          18        0.451      25.08   dev          -       4.12  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #532 blk.12.attn_kv.weight
+          18        0.451      25.08   dev          -       3.51  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #854 blk.19.ffn_down_shexp.weight
+          18        0.451      25.07   dev          -       3.63  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #995 blk.22.ffn_down_shexp.weight
+          18        0.451      25.04   dev          -       3.56  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #780 blk.17.ffn_down_shexp.weight
+          18        0.450      25.02   dev          -       3.54  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #1032 blk.23.ffn_down_shexp.weight
+          18        0.450      25.02   dev          -       3.57  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #1164 blk.26.ffn_down_shexp.weight
+          18        0.450      24.99   dev          -       3.55  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1539 blk.35.ffn_down_shexp.weight
+          18        0.450      24.99   dev          -       4.05  gemm_nt  N=4096 K=1280 dtype=bf16  #112 blk.2.indexer.attn_q_b.weight
+          18        0.449      24.97   dev          -       4.24  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #495 blk.11.attn_kv.weight
+          18        0.449      24.92   dev          -       3.79  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q6_K dtype=bf16 limit=10  #1296 blk.29.ffn_down_shexp.weight
+          17        0.448      26.38   dev          -       7.58  gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16  #1779 blk.40.ffn_down_shexp.weight
+          18        0.447      24.86   dev          -       4.08  gemm_nt  N=4096 K=1280 dtype=bf16  #367 blk.8.indexer.attn_q_b.weight
+          18        0.447      24.83   dev          -       3.77  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #1127 blk.25.ffn_down_shexp.weight
+          18        0.446      24.80   dev          -       4.15  gemm_nt  N=4096 K=1280 dtype=bf16  #627 blk.14.indexer.attn_q_b.weight
+          18        0.445      24.70   dev          -       4.18  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #352 blk.8.attn_kv.weight
+          18        0.442      24.58   dev          -       4.15  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #569 blk.13.attn_kv.weight
+          18        0.439      24.40   dev          -       3.61  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1176 blk.27.attn_kv.weight
+          18        0.438      24.35   dev          -       3.65  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1686 blk.39.attn_kv.weight
+          17        0.438      25.77   dev          -       8.08  gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16  #1818 blk.41.ffn_down_shexp.weight
+          18        0.438      24.32   dev          -       3.57  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1648 blk.38.attn_kv.weight
+          18        0.438      24.31   dev          -       3.55  gemm_nt  N=4096 K=1280 dtype=bf16  #1555 blk.36.indexer.attn_q_b.weight
+          18        0.437      24.30   dev          -       3.52  gemm_nt  N=4096 K=1280 dtype=bf16  #1217 blk.28.indexer.attn_q_b.weight
+          18        0.437      24.30   dev          -       3.62  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1551 blk.36.attn_kv.weight
+          18        0.437      24.28   dev          -       3.66  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1308 blk.30.attn_kv.weight
+          18        0.437      24.28   dev          -       3.54  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1382 blk.32.attn_kv.weight
+          18        0.437      24.27   dev          -       3.59  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1345 blk.31.attn_kv.weight
+          18        0.436      24.24   dev          -       4.08  attn_sparse_sink_rope_roundtrip  heads=16 dim=512 window=128 ratio=0 topk=0 scale=0.0441942 dtype=bf16 rot=64 off=448 mode=gptj inverse=1 block=32 format=fp8_e4m3 block_scale=ue8m0  #66 blk.1.attn_sinks.weight
+          18        0.436      24.23   dev          -       3.53  gemm_nt  N=4096 K=1280 dtype=bf16  #1048 blk.24.indexer.attn_q_b.weight
+          18        0.436      24.22   dev          -       3.59  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1610 blk.37.attn_kv.weight
+          18        0.436      24.22   dev          -       3.64  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1213 blk.28.attn_kv.weight
+          18        0.436      24.21   dev          -       3.71  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1440 blk.33.attn_kv.weight
+          18        0.436      24.21   dev          -       3.67  gemm_nt  N=4096 K=1280 dtype=bf16  #1386 blk.32.indexer.attn_q_b.weight
+          18        0.436      24.20   dev          -       3.67  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1514 blk.35.attn_kv.weight
+          17        0.435      25.60   dev          -       8.41  attn_sparse_sink  heads=16 dim=512 window=133 ratio=0 topk=0 scale=0.0441942 dtype=bf16  #1796 blk.41.attn_sinks.weight
+          18        0.435      24.17   dev          -       3.60  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1477 blk.34.attn_kv.weight
+          18        0.434      24.13   dev          -       3.54  gemm_nt  N=4096 K=1280 dtype=bf16  #878 blk.20.indexer.attn_q_b.weight
+          18        0.434      24.13   dev          -       3.64  gemm_nt_ggml  N=512 K=5120 type=q5_K dtype=bf16  #1271 blk.29.attn_kv.weight
+          18        0.432      24.01   dev          -       4.08  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #612 blk.14.attn_kv.weight
+          18        0.430      23.91   dev          -       3.58  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #669 blk.14.ffn_down_shexp.weight
+          18        0.430      23.90   dev          -       4.11  gemm_nt_f32  N=384 K=5120 dtype=bf16  #74 blk.1.glm_router.weight
+          18        0.430      23.89   dev          -       3.66  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #1007 blk.23.attn_kv.weight
+          18        0.430      23.88   dev          -       3.69  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #933 blk.21.attn_kv.weight
+          18        0.429      23.85   dev          -       3.64  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #1102 blk.25.attn_kv.weight
+          18        0.429      23.84   dev          -       3.62  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #970 blk.22.attn_kv.weight
+          18        0.429      23.83   dev          -       3.63  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #1044 blk.24.attn_kv.weight
+          18        0.428      23.80   dev          -       3.58  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #681 blk.15.attn_kv.weight
+          18        0.428      23.80   dev          -       3.57  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #718 blk.16.attn_kv.weight
+          18        0.428      23.80   dev          -       3.56  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #921 blk.20.ffn_down_shexp.weight
+          18        0.428      23.80   dev          -       3.57  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #1139 blk.26.attn_kv.weight
+          18        0.428      23.79   dev          -       3.56  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #706 blk.15.ffn_down_shexp.weight
+          18        0.428      23.77   dev          -       3.60  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #755 blk.17.attn_kv.weight
+          18        0.428      23.75   dev          -       3.62  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #829 blk.19.attn_kv.weight
+          17        0.427      25.14   dev          -       7.37  attn_sparse_sink  heads=16 dim=512 window=133 ratio=0 topk=0 scale=0.0441942 dtype=bf16  #1835 blk.42.attn_sinks.weight
+          18        0.427      23.74   dev          -       3.62  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #792 blk.18.attn_kv.weight
+          18        0.427      23.70   dev          -       3.56  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #958 blk.21.ffn_down_shexp.weight
+          18        0.426      23.69   dev          -       4.10  gemm_nt_f32  N=384 K=5120 dtype=bf16  #144 blk.2.glm_router.weight
+          18        0.421      23.41   dev          -       3.61  gemm_nt_ggml  N=512 K=5120 type=q6_K dtype=bf16  #866 blk.20.attn_kv.weight
+          18        0.421      23.40   dev          -       3.54  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #1090 blk.24.ffn_down_shexp.weight
+          18        0.419      23.30   dev          -       3.58  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #743 blk.16.ffn_down_shexp.weight
+          18        0.419      23.27   dev          -       4.12  gemm_nt_f32  N=384 K=5120 dtype=bf16  #218 blk.4.glm_router.weight
+          18        0.418      23.25   dev          -       3.63  swiglu_clamped_gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16 limit=10  #817 blk.18.ffn_down_shexp.weight
+          18        0.412      22.90   dev          -       4.08  gemm_nt_f32  N=384 K=5120 dtype=bf16  #181 blk.3.glm_router.weight
+          17        0.411      24.17   dev          -       6.06  gemm_nt_ggml  N=5120 K=768 type=q8_0 dtype=bf16  #1857 blk.42.ffn_down_shexp.weight
+          18        0.410      22.76   dev          -       4.17  index_score  heads=32 dim=128 ratio=2 width=262145 wscale=0.015625 dtype=bf16 row_part=0 key_format=mxfp4  #115 -
+          18        0.409      22.70   dev          -       4.10  index_score  heads=32 dim=128 ratio=2 width=262145 wscale=0.015625 dtype=bf16 row_part=0 key_format=mxfp4  #370 -
+          18        0.408      22.64   dev          -       4.06  gemm_nt_f32  N=384 K=5120 dtype=bf16  #398 blk.8.glm_router.weight
+          18        0.404      22.47   dev          -       4.06  gemm_nt_f32  N=384 K=5120 dtype=bf16  #292 blk.6.glm_router.weight
+          17        0.404      23.78   dev          -       9.47  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1745 blk.40.hc_attn_fn.weight
+          18        0.403      22.36   dev          -       4.07  gemm_nt_f32  N=384 K=5120 dtype=bf16  #329 blk.7.glm_router.weight
+          18        0.402      22.32   dev          -       4.14  gemm_nt_f32  N=384 K=5120 dtype=bf16  #255 blk.5.glm_router.weight
+          18        0.401      22.30   dev          -       4.18  gemm_nt_f32  N=384 K=5120 dtype=bf16  #435 blk.9.glm_router.weight
+          18        0.400      22.23   dev          -       4.15  gemm_nt_f32  N=384 K=5120 dtype=bf16  #509 blk.11.glm_router.weight
+          18        0.400      22.21   dev          -       4.10  gemm_nt_f32  N=384 K=5120 dtype=bf16  #472 blk.10.glm_router.weight
+          18        0.399      22.16   dev          -       3.52  index_score  heads=32 dim=128 ratio=2 width=262145 wscale=0.015625 dtype=bf16 row_part=0 key_format=mxfp4  #630 -
+          18        0.398      22.12   dev          -       4.11  gemm_nt_f32  N=384 K=5120 dtype=bf16  #546 blk.12.glm_router.weight
+          18        0.396      21.98   dev          -       3.49  index_score  heads=32 dim=128 ratio=1 width=524289 wscale=0.015625 dtype=bf16 row_part=0 key_format=mxfp4  #881 -
+          18        0.393      21.86   dev          -       3.49  index_score  heads=32 dim=128 ratio=1 width=524289 wscale=0.015625 dtype=bf16 row_part=0 block=8 key_format=mxfp4  #1051 -
+          18        0.393      21.85   dev          -       3.54  index_score  heads=32 dim=128 ratio=1 width=524289 wscale=0.015625 dtype=bf16 row_part=0 block=8 key_format=mxfp4  #1220 -
+          18        0.392      21.78   dev          -       3.49  index_score  heads=32 dim=128 ratio=1 width=524289 wscale=0.015625 dtype=bf16 row_part=0 block=8 key_format=mxfp4  #1389 -
+          18        0.391      21.72   dev          -       3.58  index_score  heads=32 dim=128 ratio=1 width=524289 wscale=0.015625 dtype=bf16 row_part=0 block=8 key_format=mxfp4  #1558 -
+          18        0.389      21.62   dev          -       4.12  gemm_nt_f32  N=384 K=5120 dtype=bf16  #583 blk.13.glm_router.weight
+          18        0.383      21.27   dev          -       3.63  gemm_nt_f32  N=384 K=5120 dtype=bf16  #947 blk.21.glm_router.weight
+          18        0.380      21.09   dev          -       3.61  gemm_nt_f32  N=384 K=5120 dtype=bf16  #658 blk.14.glm_router.weight
+          18        0.379      21.07   dev          -       3.51  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1528 blk.35.glm_router.weight
+          18        0.379      21.05   dev          -       3.51  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1624 blk.37.glm_router.weight
+          18        0.379      21.04   dev          -       3.56  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1491 blk.34.glm_router.weight
+          18        0.378      21.00   dev          -       3.60  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1454 blk.33.glm_router.weight
+          18        0.378      21.00   dev          -       3.53  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1586 blk.36.glm_router.weight
+          18        0.378      21.00   dev          -       3.56  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1662 blk.38.glm_router.weight
+          18        0.378      20.98   dev          -       3.57  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1079 blk.24.glm_router.weight
+          18        0.378      20.98   dev          -       3.60  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1700 blk.39.glm_router.weight
+          18        0.378      20.97   dev          -       3.63  gemm_nt_f32  N=384 K=5120 dtype=bf16  #843 blk.19.glm_router.weight
+          18        0.377      20.97   dev          -       3.57  gemm_nt_f32  N=384 K=5120 dtype=bf16  #806 blk.18.glm_router.weight
+          18        0.377      20.96   dev          -       3.55  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1322 blk.30.glm_router.weight
+          18        0.377      20.95   dev          -       3.52  gemm_nt_f32  N=384 K=5120 dtype=bf16  #695 blk.15.glm_router.weight
+          18        0.377      20.94   dev          -       3.51  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1116 blk.25.glm_router.weight
+          18        0.377      20.93   dev          -       3.50  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1417 blk.32.glm_router.weight
+          18        0.377      20.92   dev          -       3.57  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1285 blk.29.glm_router.weight
+          18        0.377      20.92   dev          -       3.52  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1248 blk.28.glm_router.weight
+          18        0.376      20.91   dev          -       3.54  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1359 blk.31.glm_router.weight
+          18        0.376      20.91   dev          -       3.56  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1190 blk.27.glm_router.weight
+          18        0.376      20.90   dev          -       3.52  gemm_nt_f32  N=384 K=5120 dtype=bf16  #910 blk.20.glm_router.weight
+          18        0.376      20.89   dev          -       3.52  gemm_nt_f32  N=384 K=5120 dtype=bf16  #769 blk.17.glm_router.weight
+          18        0.376      20.89   dev          -       3.59  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1021 blk.23.glm_router.weight
+          18        0.376      20.88   dev          -       3.61  gemm_nt_f32  N=384 K=5120 dtype=bf16  #1153 blk.26.glm_router.weight
+          18        0.376      20.88   dev          -       3.52  gemm_nt_f32  N=384 K=5120 dtype=bf16  #732 blk.16.glm_router.weight
+          18        0.376      20.88   dev          -       3.53  gemm_nt_f32  N=384 K=5120 dtype=bf16  #984 blk.22.glm_router.weight
+          17        0.361      21.22   dev          -       8.72  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1765 blk.40.hc_ffn_fn.weight
+          17        0.360      21.19   dev          -       9.06  add  n=1 dtype=i32  #1744 -
+          17        0.357      21.03   dev          -       7.75  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1784 blk.41.hc_attn_fn.weight
+          17        0.351      20.67   dev          -       8.35  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1804 blk.41.hc_ffn_fn.weight
+          18        0.316      17.57   dev          -       4.07  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #160 blk.3.hc_attn_fn.weight
+          18        0.316      17.54   dev          -       4.72  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #10 blk.0.hc_attn_fn.weight
+          17        0.312      18.37   dev          -       6.56  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1823 blk.42.hc_attn_fn.weight
+          18        0.309      17.19   dev          -       4.12  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #53 blk.1.hc_attn_fn.weight
+          18        0.306      17.00   dev          -       4.10  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #234 blk.5.hc_attn_fn.weight
+          18        0.303      16.84   dev          -       4.33  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #290 blk.6.hc_ffn_fn.weight
+          18        0.299      16.63   dev          -       4.14  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #29 blk.0.hc_ffn_fn.weight
+          18        0.299      16.60   dev          -       4.14  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #216 blk.4.hc_ffn_fn.weight
+          17        0.298      17.53   dev          -       6.01  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1843 blk.42.hc_ffn_fn.weight
+          18        0.298      16.54   dev          -       4.14  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #142 blk.2.hc_ffn_fn.weight
+          18        0.297      16.53   dev          -       4.14  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #90 blk.2.hc_attn_fn.weight
+          18        0.297      16.50   dev          -       4.10  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #308 blk.7.hc_attn_fn.weight
+          18        0.294      16.33   dev          -       4.62  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #327 blk.7.hc_ffn_fn.weight
+          18        0.293      16.29   dev          -       4.13  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #253 blk.5.hc_ffn_fn.weight
+          18        0.293      16.25   dev          -       4.15  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #507 blk.11.hc_ffn_fn.weight
+          18        0.292      16.23   dev          -       4.14  stream_gate_add  n=5120 hc=4 eps=1e-20 gate_eps=1e-06 dtype=bf16  #51 blk.1.engram_gate.weight
+          18        0.292      16.22   dev          -       4.13  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #197 blk.4.hc_attn_fn.weight
+          18        0.292      16.22   dev          -       4.12  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #72 blk.1.hc_ffn_fn.weight
+          18        0.291      16.16   dev          -       4.07  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #581 blk.13.hc_ffn_fn.weight
+          18        0.291      16.16   dev          -       4.09  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #179 blk.3.hc_ffn_fn.weight
+          18        0.291      16.14   dev          -       4.11  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #525 blk.12.hc_attn_fn.weight
+          18        0.290      16.13   dev          -       4.08  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #451 blk.10.hc_attn_fn.weight
+          18        0.290      16.13   dev          -      10.89  ngram_ids  heads=24 ngram=4 eos=2  #599 blk.14.engram_mult
+          18        0.290      16.12   dev          -       4.12  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #396 blk.8.hc_ffn_fn.weight
+          18        0.290      16.11   dev          -       4.11  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #271 blk.6.hc_attn_fn.weight
+          18        0.290      16.09   dev          -       4.11  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #345 blk.8.hc_attn_fn.weight
+          18        0.289      16.04   dev          -       4.12  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #488 blk.11.hc_attn_fn.weight
+          18        0.289      16.03   dev          -       4.18  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #414 blk.9.hc_attn_fn.weight
+          17        0.288      16.94   dev          -      10.39  gemm_nt_f32  N=128 K=5120 dtype=bf16  #1768 blk.40.glm_router.weight
+          18        0.288      15.98   dev          -       4.16  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #562 blk.13.hc_attn_fn.weight
+          18        0.287      15.94   dev          -       4.28  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #544 blk.12.hc_ffn_fn.weight
+          18        0.287      15.92   dev          -       4.54  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #470 blk.10.hc_ffn_fn.weight
+          18        0.286      15.91   dev          -       4.11  stream_gate_add  n=5120 hc=4 eps=1e-20 gate_eps=1e-06 dtype=bf16  #603 blk.14.engram_gate.weight
+          18        0.286      15.89   dev          -       4.12  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #433 blk.9.hc_ffn_fn.weight
+          18        0.285      15.85   dev          -       3.54  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #605 blk.14.hc_attn_fn.weight
+          17        0.285      16.77   dev          -      11.01  rmsnorm  n=5120 eps=1e-20 dtype=bf16  #1747 blk.40.attn_norm.weight
+          17        0.285      16.76   dev          -       0.00  embed_lookup_ggml  n_embd=5120 n_vocab=32320 type=q6_K dtype=bf16 vocab_offset=0  #1737 token_embd.weight
+          18        0.282      15.68   dev          -       3.55  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #841 blk.19.hc_ffn_fn.weight
+          18        0.282      15.64   dev          -       3.54  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1660 blk.38.hc_ffn_fn.weight
+          18        0.280      15.57   dev          -       3.55  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1151 blk.26.hc_ffn_fn.weight
+          18        0.280      15.53   dev          -       3.64  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1000 blk.23.hc_attn_fn.weight
+          18        0.279      15.49   dev          -       3.56  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #767 blk.17.hc_ffn_fn.weight
+          18        0.279      15.48   dev          -       3.51  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1544 blk.36.hc_attn_fn.weight
+          18        0.278      15.46   dev          -       3.62  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1698 blk.39.hc_ffn_fn.weight
+          18        0.278      15.45   dev          -       3.50  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1375 blk.32.hc_attn_fn.weight
+          18        0.278      15.43   dev          -       3.52  gemm_nt  N=512 K=5120 dtype=bf16  #870 blk.20.attn_compressor_kv.weight
+          18        0.278      15.43   dev          -       3.56  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #859 blk.20.hc_attn_fn.weight
+          18        0.278      15.42   dev          -       3.55  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1433 blk.33.hc_attn_fn.weight
+          18        0.278      15.42   dev          -       3.67  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1357 blk.31.hc_ffn_fn.weight
+          18        0.277      15.41   dev          -       3.54  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #785 blk.18.hc_attn_fn.weight
+          18        0.277      15.41   dev          -       3.52  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1246 blk.28.hc_ffn_fn.weight
+          18        0.277      15.41   dev          -       3.61  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1338 blk.31.hc_attn_fn.weight
+          18        0.277      15.39   dev          -       3.62  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1679 blk.39.hc_attn_fn.weight
+          18        0.277      15.39   dev          -       3.62  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1095 blk.25.hc_attn_fn.weight
+          18        0.277      15.39   dev          -       3.66  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1470 blk.34.hc_attn_fn.weight
+          18        0.277      15.38   dev          -       3.48  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #674 blk.15.hc_attn_fn.weight
+          18        0.277      15.38   dev          -       3.55  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #926 blk.21.hc_attn_fn.weight
+          18        0.277      15.38   dev          -       3.54  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #822 blk.19.hc_attn_fn.weight
+          18        0.277      15.38   dev          -       3.54  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1169 blk.27.hc_attn_fn.weight
+          18        0.277      15.37   dev          -       3.65  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1206 blk.28.hc_attn_fn.weight
+          18        0.277      15.37   dev          -       3.50  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1264 blk.29.hc_attn_fn.weight
+          18        0.277      15.37   dev          -       3.57  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #804 blk.18.hc_ffn_fn.weight
+          18        0.276      15.36   dev          -       3.53  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1301 blk.30.hc_attn_fn.weight
+          18        0.276      15.35   dev          -       3.55  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1507 blk.35.hc_attn_fn.weight
+          18        0.276      15.35   dev          -       3.56  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #908 blk.20.hc_ffn_fn.weight
+          18        0.276      15.35   dev          -       3.53  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #656 blk.14.hc_ffn_fn.weight
+          18        0.276      15.34   dev          -       3.60  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1037 blk.24.hc_attn_fn.weight
+          18        0.276      15.33   dev          -       3.56  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1415 blk.32.hc_ffn_fn.weight
+          18        0.276      15.33   dev          -       3.57  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1641 blk.38.hc_attn_fn.weight
+          18        0.276      15.33   dev          -       3.51  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1603 blk.37.hc_attn_fn.weight
+          18        0.276      15.32   dev          -       3.50  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #730 blk.16.hc_ffn_fn.weight
+          18        0.276      15.31   dev          -       3.53  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1452 blk.33.hc_ffn_fn.weight
+          18        0.276      15.31   dev          -       3.54  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #945 blk.21.hc_ffn_fn.weight
+          18        0.275      15.30   dev          -       3.50  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #963 blk.22.hc_attn_fn.weight
+          18        0.275      15.30   dev          -       3.53  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #748 blk.17.hc_attn_fn.weight
+          18        0.275      15.30   dev          -       3.60  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #711 blk.16.hc_attn_fn.weight
+          18        0.275      15.28   dev          -       3.51  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1320 blk.30.hc_ffn_fn.weight
+          18        0.275      15.27   dev          -       3.52  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1622 blk.37.hc_ffn_fn.weight
+          18        0.275      15.27   dev          -       3.57  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #693 blk.15.hc_ffn_fn.weight
+          18        0.275      15.27   dev          -       3.57  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1132 blk.26.hc_attn_fn.weight
+          18        0.275      15.26   dev          -       3.55  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #982 blk.22.hc_ffn_fn.weight
+          18        0.275      15.26   dev          -       3.58  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1077 blk.24.hc_ffn_fn.weight
+          18        0.275      15.25   dev          -       3.55  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1019 blk.23.hc_ffn_fn.weight
+          18        0.274      15.22   dev          -       3.51  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1526 blk.35.hc_ffn_fn.weight
+          18        0.274      15.21   dev          -       3.60  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1489 blk.34.hc_ffn_fn.weight
+          18        0.274      15.21   dev          -       3.59  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1283 blk.29.hc_ffn_fn.weight
+          18        0.273      15.19   dev          -       3.56  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1188 blk.27.hc_ffn_fn.weight
+          18        0.273      15.17   dev          -       3.55  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1584 blk.36.hc_ffn_fn.weight
+          18        0.272      15.12   dev          -       3.52  mhc_mix  n=5120 hc=4 iterations=20 eps=1e-20 hc_eps=1e-06 dtype=bf16  #1114 blk.25.hc_ffn_fn.weight
+          17        0.267      15.68   dev          -       0.00  rope_table  rot=64 theta=10000 scale=1 dtype=f32  #1719 -
+          17        0.259      15.26   dev          -       9.48  rmsnorm  n=512 eps=1e-20 dtype=bf16  #1753 blk.40.attn_kv_a_norm.weight
+          17        0.258      15.17   dev          -      10.08  rmsnorm  n=5120 eps=1e-20 dtype=bf16  #1767 blk.40.ffn_norm.weight
+          18        0.258      14.31   dev          -       4.08  embed_lookup_planes  n_embd=256 n_vocab=768022850 group=32 dtype=bf16  #48 per_layer_token_embd.weight
+          17        0.257      15.09   dev          -       9.84  mhc_collapse  n=5120 hc=4 dtype=bf16  #1746 -
+          17        0.255      14.97   dev          -       9.88  ds41_rope_rows  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1754 -
+          17        0.254      14.94   dev          -       9.41  rmsnorm  n=1280 eps=1e-20 dtype=bf16  #1749 blk.40.attn_q_a_norm.weight
+          17        0.254      14.94   dev          -      10.34  quant_roundtrip  n=512 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1730 -
+          17        0.250      14.70   dev          -      10.61  kv_store  head_dim=256 n_head_kv=1 block_size=16 kv_dtype=bf16  #1731 -
+          18        0.248      13.79   dev          -       4.10  embed_lookup_planes  n_embd=256 n_vocab=768022850 group=32 dtype=bf16  #600 per_layer_token_embd.weight
+          17        0.248      14.58   dev          -       9.75  quant_roundtrip  n=512 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1755 -
+          17        0.247      14.51   dev          -       8.54  rmsnorm  n=5120 eps=1e-20 dtype=bf16  #1721 dspark.enc.output_norm.weight
+          17        0.244      14.36   dev          -       7.98  gemm_nt_f32  N=128 K=5120 dtype=bf16  #1807 blk.41.glm_router.weight
+          17        0.244      14.34   dev          -      10.23  rmsnorm  n=512 eps=1e-20 dtype=bf16  #1728 blk.41.attn_kv_a_norm.weight
+          17        0.243      14.31   dev          -      10.47  ds41_rope_rows  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1729 -
+          18        0.242      13.44   dev          -       3.53  gemm_nt  N=128 K=512 dtype=bf16  #873 blk.20.indexer.attn_k.weight
+live step=16 run=1 wait=0 kv=0.01 prefix_hit=0.05 prefill_tps=19.4 decode_tps=29.5 draft_accept=0.44 gpu0=0.00/vram:31.8Gof31.9G gpu1=0.00/vram:31.8Gof31.9G gpu2=0.00/vram:31.8Gof31.9G gpu3=0.00/vram:31.8Gof31.9G experts vram=2919 pinned=1017 host=0 ssd=0 mapped=0 resident=74.16% hit=86.62% promo=1288 demo=170 readmit=13 link ar=62259200 h2d=49230861312 d2h=5921190912 stream=42897183744
+          17        0.240      14.11   dev          -       9.16  moe_scatter  n_expert=32 top_k=3 expert_base=0  #1772 -
+          17        0.239      14.08   dev          -       9.31  rmsnorm  n=5120 eps=1e-20 dtype=bf16  #1786 blk.41.attn_norm.weight
+          17        0.239      14.06   dev          -       9.36  mhc_collapse  n=5120 hc=4 dtype=bf16  #1766 -
+          17        0.237      13.95   dev          -       9.00  router_scored_topk  n_expert=128 top_k=3 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1771 blk.40.glm_router.correction
+          17        0.237      13.92   dev          -       9.61  mhc_post  n=5120 hc=4 dtype=bf16  #1764 -
+          17        0.236      13.91   dev          -      15.99  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=1 dtype=bf16  #1758 -
+          17        0.236      13.89   dev          -      10.42  kv_store  head_dim=256 n_head_kv=1 block_size=16 kv_dtype=bf16  #1756 -
+          17        0.234      13.77   dev          -       9.66  quant_roundtrip  n=8192 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1759 -
+          17        0.234      13.76   dev          -      13.74  mhc_post  n=5120 hc=4 dtype=bf16  #1783 -
+          17        0.233      13.73   dev          -       8.00  rmsnorm  n=5120 eps=1e-20 dtype=bf16  #1806 blk.41.ffn_norm.weight
+          17        0.231      13.62   dev          -       9.30  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1751 -
+          17        0.231      13.60   dev          -       8.62  rope_table  rot=64 theta=10000 scale=1 dtype=f32  #1742 -
+          17        0.229      13.47   dev          -       7.79  kv_store  head_dim=256 n_head_kv=1 block_size=16 kv_dtype=bf16  #1726 -
+          17        0.229      13.44   dev          -       8.36  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1790 -
+          17        0.227      13.34   dev          -       9.27  rmsnorm  n=1280 eps=1e-20 dtype=bf16  #1788 blk.41.attn_q_a_norm.weight
+          17        0.227      13.32   dev          -       8.91  swiglu_clamped  n=768 limit=10 dtype=bf16  #1778 -
+          17        0.224      13.16   dev          -       8.31  fill  n=1 dtype=bf16 value=1  #1819 -
+          17        0.223      13.11   dev          -       8.06  rmsnorm  n=512 eps=1e-20 dtype=bf16  #1723 blk.40.attn_kv_a_norm.weight
+          17        0.222      13.03   dev          -       9.08  swiglu_clamped  n=2304 limit=10 dtype=bf16  #1774 -
+          17        0.219      12.88   dev          -       8.02  kv_store  head_dim=256 n_head_kv=1 block_size=16 kv_dtype=bf16  #1795 -
+          17        0.218      12.81   dev          -       8.23  rmsnorm  n=512 eps=1e-20 dtype=bf16  #1792 blk.41.attn_kv_a_norm.weight
+          17        0.216      12.73   dev          -       7.23  router_scored_topk  n_expert=128 top_k=3 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1810 blk.41.glm_router.correction
+          17        0.216      12.70   dev          -       9.41  fill  n=1 dtype=bf16 value=1  #1780 -
+          17        0.216      12.69   dev          -       8.66  mhc_collapse  n=5120 hc=4 dtype=bf16  #1805 -
+          17        0.214      12.61   dev          -       8.78  mhc_collapse  n=5120 hc=4 dtype=bf16  #1785 -
+          17        0.213      12.54   dev          -       8.35  fill  n=4 dtype=f32 value=0  #1740 -
+          17        0.212      12.50   dev          -       8.38  quant_roundtrip  n=8192 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1798 -
+          17        0.212      12.45   dev          -       8.14  quant_roundtrip  n=512 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1725 -
+          17        0.211      12.42   dev          -       8.51  ds41_rope_rows  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1724 -
+          17        0.211      12.42   dev          -       8.65  mhc_post  n=5120 hc=4 dtype=bf16  #1803 -
+          17        0.211      12.41   dev          -       8.26  fill  n=1 dtype=f32 value=1  #1741 -
+          17        0.211      12.40   dev          -       5.43  gemm_nt_f32  N=128 K=5120 dtype=bf16  #1846 blk.42.glm_router.weight
+          18        0.210      11.67   dev          -       4.07  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #77 blk.1.glm_router.correction
+          18        0.210      11.64   dev          -       4.20  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #30 blk.0.ffn_norm.weight
+          18        0.209      11.60   dev          -       4.12  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #73 blk.1.ffn_norm.weight
+          18        0.208      11.56   dev          -       6.64  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #161 blk.3.attn_norm.weight
+          17        0.207      12.20   dev          -       9.39  rmsnorm  n=512 eps=1e-20 dtype=bf16  #1733 blk.42.attn_kv_a_norm.weight
+          18        0.207      11.51   dev          -       6.67  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #415 blk.9.attn_norm.weight
+          18        0.207      11.50   dev          -       6.71  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #91 blk.2.attn_norm.weight
+          18        0.207      11.49   dev          -      13.44  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #489 blk.11.attn_norm.weight
+          18        0.206      11.44   dev          -       6.68  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #452 blk.10.attn_norm.weight
+          18        0.206      11.44   dev          -       6.62  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #198 blk.4.attn_norm.weight
+          18        0.206      11.42   dev          -       4.14  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #217 blk.4.ffn_norm.weight
+          18        0.205      11.39   dev          -       4.12  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #254 blk.5.ffn_norm.weight
+          18        0.205      11.38   dev          -       4.16  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #434 blk.9.ffn_norm.weight
+          18        0.205      11.38   dev          -       4.09  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #291 blk.6.ffn_norm.weight
+          18        0.205      11.38   dev          -       6.79  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #346 blk.8.attn_norm.weight
+          18        0.205      11.37   dev          -       4.12  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #397 blk.8.ffn_norm.weight
+          17        0.204      12.02   dev          -       8.19  quant_roundtrip  n=512 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1794 -
+          18        0.204      11.34   dev          -       4.10  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #143 blk.2.ffn_norm.weight
+          18        0.204      11.34   dev          -       4.07  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #180 blk.3.ffn_norm.weight
+          18        0.204      11.34   dev          -       4.24  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #582 blk.13.ffn_norm.weight
+          18        0.204      11.33   dev          -       4.14  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #471 blk.10.ffn_norm.weight
+          18        0.204      11.33   dev          -       6.71  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #563 blk.13.attn_norm.weight
+          18        0.204      11.33   dev          -       6.72  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #235 blk.5.attn_norm.weight
+          18        0.204      11.32   dev          -       6.66  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #272 blk.6.attn_norm.weight
+          18        0.204      11.32   dev          -       6.76  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #526 blk.12.attn_norm.weight
+          17        0.204      11.98   dev          -       9.42  quant_roundtrip  n=512 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1735 -
+          18        0.204      11.31   dev          -       4.10  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #147 blk.2.glm_router.correction
+          18        0.203      11.30   dev          -       6.68  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #309 blk.7.attn_norm.weight
+          18        0.203      11.29   dev          -       4.12  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #34 blk.0.glm_router.correction
+          18        0.203      11.28   dev          -       4.11  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #508 blk.11.ffn_norm.weight
+          17        0.203      11.94   dev          -       7.76  moe_scatter  n_expert=32 top_k=3 expert_base=0  #1811 -
+          18        0.203      11.26   dev          -       4.10  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #545 blk.12.ffn_norm.weight
+          17        0.202      11.90   dev          -       8.18  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=1 dtype=bf16  #1797 -
+          18        0.202      11.23   dev          -       4.20  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #328 blk.7.ffn_norm.weight
+          17        0.202      11.89   dev          -       6.66  rmsnorm  n=5120 eps=1e-20 dtype=bf16  #1825 blk.42.attn_norm.weight
+          18        0.202      11.22   dev          -       4.10  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #221 blk.4.glm_router.correction
+          18        0.201      11.14   dev          -       4.05  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #295 blk.6.glm_router.correction
+          17        0.200      11.79   dev          -       9.10  ds41_rope_rows  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1734 -
+          18        0.200      11.12   dev          -       4.06  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #184 blk.3.glm_router.correction
+          18        0.198      11.00   dev          -       3.59  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #657 blk.14.ffn_norm.weight
+          18        0.198      10.98   dev          -      12.08  cast  n=6144 from=bf16 to=bf16  #49 -
+          17        0.197      11.59   dev          -       7.99  ds41_rope_rows  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1793 -
+          18        0.197      10.94   dev          -       4.10  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #586 blk.13.glm_router.correction
+          18        0.197      10.94   dev          -       4.19  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #475 blk.10.glm_router.correction
+          18        0.197      10.93   dev          -      12.07  cast  n=6144 from=bf16 to=bf16  #601 -
+          18        0.196      10.90   dev          -       4.17  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #332 blk.7.glm_router.correction
+          18        0.195      10.83   dev          -       3.56  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1416 blk.32.ffn_norm.weight
+          17        0.195      11.46   dev          -       7.67  quant_roundtrip  n=8192 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1837 -
+          18        0.195      10.81   dev          -       3.56  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1247 blk.28.ffn_norm.weight
+          18        0.194      10.79   dev          -       4.12  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #258 blk.5.glm_router.correction
+          18        0.194      10.79   dev          -       6.05  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1001 blk.23.attn_norm.weight
+          18        0.194      10.78   dev          -       3.60  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #983 blk.22.ffn_norm.weight
+          18        0.194      10.78   dev          -       5.96  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1545 blk.36.attn_norm.weight
+          18        0.194      10.77   dev          -       4.07  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #549 blk.12.glm_router.correction
+          17        0.194      11.41   dev          -       6.18  rmsnorm  n=5120 eps=1e-20 dtype=bf16  #1863 dspark.output_norm.weight
+          18        0.194      10.77   dev          -       3.66  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #842 blk.19.ffn_norm.weight
+          18        0.194      10.76   dev          -       3.56  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1284 blk.29.ffn_norm.weight
+          18        0.194      10.76   dev          -       4.14  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #438 blk.9.glm_router.correction
+          18        0.194      10.76   dev          -       5.89  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #927 blk.21.attn_norm.weight
+          18        0.194      10.76   dev          -       4.10  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #512 blk.11.glm_router.correction
+          18        0.194      10.76   dev          -       5.98  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #712 blk.16.attn_norm.weight
+          18        0.194      10.76   dev          -       6.02  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1133 blk.26.attn_norm.weight
+          18        0.194      10.75   dev          -       6.01  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1339 blk.31.attn_norm.weight
+          18        0.193      10.75   dev          -       3.53  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1115 blk.25.ffn_norm.weight
+          18        0.193      10.75   dev          -       5.96  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #675 blk.15.attn_norm.weight
+          18        0.193      10.74   dev          -       6.07  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #749 blk.17.attn_norm.weight
+          18        0.193      10.74   dev          -       6.12  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1207 blk.28.attn_norm.weight
+          17        0.193      11.37   dev          -       6.61  rmsnorm  n=1280 eps=1e-20 dtype=bf16  #1827 blk.42.attn_q_a_norm.weight
+          18        0.193      10.74   dev          -       5.91  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #964 blk.22.attn_norm.weight
+          18        0.193      10.74   dev          -       5.97  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1508 blk.35.attn_norm.weight
+          18        0.193      10.73   dev          -       5.95  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1265 blk.29.attn_norm.weight
+          17        0.193      11.35   dev          -       7.41  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1829 -
+          18        0.193      10.72   dev          -       6.00  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1642 blk.38.attn_norm.weight
+          18        0.193      10.71   dev          -       6.05  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #860 blk.20.attn_norm.weight
+          18        0.193      10.71   dev          -       3.72  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1020 blk.23.ffn_norm.weight
+          18        0.193      10.70   dev          -       3.70  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #909 blk.20.ffn_norm.weight
+          18        0.193      10.70   dev          -       4.11  qsa_work  n=1024 ratio=2 ring=7 seqs=8 work=4168 dtype=f32  #102 -
+          18        0.193      10.70   dev          -       5.93  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1096 blk.25.attn_norm.weight
+          18        0.193      10.70   dev          -       3.52  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #946 blk.21.ffn_norm.weight
+          18        0.192      10.69   dev          -       5.97  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1604 blk.37.attn_norm.weight
+          17        0.192      11.32   dev          -       7.85  swiglu_clamped  n=768 limit=10 dtype=bf16  #1817 -
+          17        0.192      11.31   dev          -       7.83  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=1 dtype=bf16  #1836 -
+          18        0.192      10.68   dev          -       6.01  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1471 blk.34.attn_norm.weight
+          18        0.192      10.68   dev          -       6.07  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1302 blk.30.attn_norm.weight
+          18        0.192      10.68   dev          -       3.53  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #694 blk.15.ffn_norm.weight
+          18        0.192      10.68   dev          -       5.92  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1680 blk.39.attn_norm.weight
+          18        0.192      10.68   dev          -       4.12  qsa_work  n=1024 ratio=2 ring=7 seqs=8 work=4168 dtype=f32  #617 -
+          18        0.192      10.67   dev          -       6.03  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1038 blk.24.attn_norm.weight
+          18        0.192      10.67   dev          -       5.86  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #786 blk.18.attn_norm.weight
+          18        0.192      10.66   dev          -       3.62  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1152 blk.26.ffn_norm.weight
+          18        0.192      10.66   dev          -       3.56  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1189 blk.27.ffn_norm.weight
+          18        0.192      10.66   dev          -       6.08  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #823 blk.19.attn_norm.weight
+          18        0.192      10.65   dev          -       3.55  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1358 blk.31.ffn_norm.weight
+          18        0.192      10.65   dev          -       5.99  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1170 blk.27.attn_norm.weight
+          18        0.192      10.65   dev          -       6.00  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1376 blk.32.attn_norm.weight
+          18        0.192      10.64   dev          -       3.50  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1321 blk.30.ffn_norm.weight
+          18        0.192      10.64   dev          -       3.63  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #805 blk.18.ffn_norm.weight
+          18        0.191      10.64   dev          -       4.12  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #401 blk.8.glm_router.correction
+          18        0.191      10.64   dev          -       3.60  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1699 blk.39.ffn_norm.weight
+          18        0.191      10.63   dev          -       3.58  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1585 blk.36.ffn_norm.weight
+          18        0.191      10.62   dev          -       3.63  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #768 blk.17.ffn_norm.weight
+          18        0.191      10.62   dev          -       3.56  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1078 blk.24.ffn_norm.weight
+          18        0.191      10.62   dev          -       3.65  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1623 blk.37.ffn_norm.weight
+          18        0.191      10.61   dev          -       3.61  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1453 blk.33.ffn_norm.weight
+          18        0.191      10.61   dev          -       5.90  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1434 blk.33.attn_norm.weight
+          18        0.191      10.61   dev          -       3.67  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1490 blk.34.ffn_norm.weight
+          18        0.191      10.61   dev          -       3.57  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #731 blk.16.ffn_norm.weight
+          18        0.191      10.60   dev          -      10.07  mhc_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #11 blk.0.attn_norm.weight
+          18        0.191      10.60   dev          -       3.55  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1527 blk.35.ffn_norm.weight
+          17        0.190      11.20   dev          -       6.31  rmsnorm  n=5120 eps=1e-20 dtype=bf16  #1845 blk.42.ffn_norm.weight
+          18        0.190      10.58   dev          -       3.72  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1661 blk.38.ffn_norm.weight
+          18        0.189      10.48   dev          -       4.06  qsa_work  n=1024 ratio=2 ring=7 seqs=8 work=4168 dtype=f32  #357 -
+          18        0.188      10.47   dev          -       3.55  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #661 blk.14.glm_router.correction
+          17        0.188      11.04   dev          -       7.33  swiglu_clamped  n=2304 limit=10 dtype=bf16  #1813 -
+          18        0.188      10.42   dev          -       3.54  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1251 blk.28.glm_router.correction
+          18        0.187      10.41   dev          -       5.72  mhc_post_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #1716 output_norm.weight
+          18        0.187      10.40   dev          -       3.52  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #950 blk.21.glm_router.correction
+          18        0.187      10.37   dev          -       3.56  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #698 blk.15.glm_router.correction
+          17        0.186      10.97   dev          -       7.28  rmsnorm  n=512 eps=1e-20 dtype=bf16  #1831 blk.42.attn_kv_a_norm.weight
+          17        0.186      10.92   dev          -       8.17  kv_store  head_dim=256 n_head_kv=1 block_size=16 kv_dtype=bf16  #1736 -
+          18        0.186      10.31   dev          -       3.54  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1494 blk.34.glm_router.correction
+          18        0.186      10.31   dev          -       3.61  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1193 blk.27.glm_router.correction
+          18        0.186      10.31   dev          -       3.49  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1362 blk.31.glm_router.correction
+          18        0.185      10.30   dev          -       3.54  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #913 blk.20.glm_router.correction
+          18        0.185      10.28   dev          -       3.56  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #987 blk.22.glm_router.correction
+          18        0.185      10.26   dev          -       3.61  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1325 blk.30.glm_router.correction
+          18        0.184      10.23   dev          -       3.56  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1082 blk.24.glm_router.correction
+          18        0.184      10.22   dev          -       3.52  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1156 blk.26.glm_router.correction
+          18        0.184      10.21   dev          -       3.56  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1457 blk.33.glm_router.correction
+          18        0.184      10.20   dev          -       3.53  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #809 blk.18.glm_router.correction
+          18        0.183      10.19   dev          -       3.51  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1420 blk.32.glm_router.correction
+          18        0.183      10.18   dev          -       3.63  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1531 blk.35.glm_router.correction
+          18        0.183      10.18   dev          -       3.53  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #735 blk.16.glm_router.correction
+          18        0.182      10.12   dev          -       3.54  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1589 blk.36.glm_router.correction
+          18        0.182      10.11   dev          -       3.54  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1627 blk.37.glm_router.correction
+          17        0.182      10.69   dev          -       6.92  mhc_collapse  n=5120 hc=4 dtype=bf16  #1824 -
+          18        0.182      10.09   dev          -       3.54  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1703 blk.39.glm_router.correction
+          18        0.181      10.08   dev          -       3.62  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1024 blk.23.glm_router.correction
+          18        0.181      10.07   dev          -       3.54  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1665 blk.38.glm_router.correction
+          18        0.181      10.06   dev          -       3.56  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1288 blk.29.glm_router.correction
+          17        0.180      10.60   dev          -       7.04  kv_store  head_dim=256 n_head_kv=1 block_size=16 kv_dtype=bf16  #1834 -
+          18        0.180      10.00   dev          -       3.59  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #846 blk.19.glm_router.correction
+          18        0.180      10.00   dev          -       3.56  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1119 blk.25.glm_router.correction
+          18        0.180       9.99   dev          -       4.14  mhc_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #54 blk.1.attn_norm.weight
+          17        0.180      10.57   dev          -       6.91  quant_roundtrip  n=512 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16  #1833 -
+          18        0.179       9.96   dev          -       3.56  router_scored_topk  n_expert=384 top_k=6 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #772 blk.17.glm_router.correction
+          17        0.178      10.47   dev          -      10.42  mhc_post  n=5120 hc=4 dtype=bf16  #1822 -
+          18        0.174       9.69   dev          -       4.12  mhc_collapse_rmsnorm  n=5120 hc=4 eps=1e-20 dtype=bf16  #606 blk.14.attn_norm.weight
+          17        0.173      10.20   dev          -       7.04  ds41_rope_rows  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1832 -
+          18        0.171       9.52   dev          -       4.77  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #20 blk.0.attn_kv_a_norm.weight
+          18        0.171       9.51   dev          -       4.08  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #63 blk.1.attn_kv_a_norm.weight
+          17        0.169       9.92   dev          -       6.14  mhc_collapse  n=5120 hc=4 dtype=bf16  #1862 -
+          17        0.168       9.88   dev          -       6.31  gather_rows  n=5120 dtype=bf16  #1864 -
+          17        0.167       9.84   dev          -       9.42  mhc_post  n=5120 hc=4 dtype=bf16  #1861 -
+          17        0.167       9.82   dev          -       6.21  mhc_post  n=5120 hc=4 dtype=bf16  #1842 -
+          18        0.166       9.24   dev          -       4.11  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #100 blk.2.attn_kv_a_norm.weight
+          17        0.166       9.78   dev          -       5.49  router_scored_topk  n_expert=128 top_k=3 norm=1 route_scale=1.5 score=sqrtsoftplus dtype=f32  #1849 blk.42.glm_router.correction
+          18        0.164       9.11   dev          -       4.10  softmax_pool  n=512 ratio=2 dtype=bf16  #103 -
+          18        0.164       9.09   dev          -       4.13  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #615 blk.14.attn_kv_a_norm.weight
+          17        0.163       9.61   dev          -       5.64  moe_scatter  n_expert=32 top_k=3 expert_base=0  #1850 -
+          18        0.162       8.98   dev          -       4.14  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #281 blk.6.attn_kv_a_norm.weight
+          18        0.162       8.98   dev          -       4.12  gemm_nt  N=32 K=5120 dtype=bf16  #114 blk.2.indexer.proj.weight
+          18        0.160       8.91   dev          -       4.13  rmsnorm_rope_roundtrip  n=128 eps=1e-20 n_head=1 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #107 blk.2.indexer.k_norm.weight
+          18        0.160       8.90   dev          -       4.15  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #355 blk.8.attn_kv_a_norm.weight
+          18        0.160       8.89   dev          -       4.16  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #244 blk.5.attn_kv_a_norm.weight
+          17        0.160       9.41   dev          -       6.11  mhc_collapse  n=5120 hc=4 dtype=bf16  #1844 -
+          18        0.159       8.83   dev          -       4.09  index_topk  width=262145 topk=512 ratio=2  #133 -
+          18        0.159       8.81   dev          -       4.14  gemm_nt  N=32 K=5120 dtype=bf16  #369 blk.8.indexer.proj.weight
+          18        0.158       8.79   dev          -       4.10  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #170 blk.3.attn_kv_a_norm.weight
+          18        0.158       8.78   dev          -       4.15  gemm_nt  N=32 K=5120 dtype=bf16  #629 blk.14.indexer.proj.weight
+          18        0.157       8.70   dev          -       4.13  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #424 blk.9.attn_kv_a_norm.weight
+          18        0.156       8.65   dev          -       4.14  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #207 blk.4.attn_kv_a_norm.weight
+          18        0.155       8.61   dev          -       4.18  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #461 blk.10.attn_kv_a_norm.weight
+          18        0.155       8.59   dev          -       4.18  rmsnorm_rope_roundtrip  n=128 eps=1e-20 n_head=1 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #362 blk.8.indexer.k_norm.weight
+          18        0.155       8.59   dev          -       5.20  rope_table  rot=64 theta=160000 scale=1 dtype=f32 yarn_factor=16 yarn_low=15 yarn_high=25 yarn_magnitude=1  #8 -
+          18        0.154       8.58   dev          -       4.12  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #498 blk.11.attn_kv_a_norm.weight
+          18        0.154       8.56   dev          -       4.15  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #572 blk.13.attn_kv_a_norm.weight
+          18        0.154       8.56   dev          -       4.11  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #318 blk.7.attn_kv_a_norm.weight
+          18        0.154       8.55   dev          -       4.14  softmax_pool  n=512 ratio=2 dtype=bf16  #358 -
+          18        0.153       8.53   dev          -       3.53  index_topk  width=524289 topk=512 ratio=1 block=8  #1068 -
+          18        0.153       8.51   dev          -       4.16  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #535 blk.12.attn_kv_a_norm.weight
+          18        0.153       8.51   dev          -       5.23  fill  n=1 dtype=bf16 value=1  #6 -
+          18        0.153       8.50   dev          -       4.14  softmax_pool  n=512 ratio=2 dtype=bf16  #618 -
+          18        0.152       8.44   dev          -       3.54  index_topk  width=524289 topk=512 ratio=1 block=8  #1237 -
+          18        0.151       8.41   dev          -       3.50  index_topk  width=524289 topk=512 ratio=1 block=8  #1575 -
+          18        0.150       8.32   dev          -       4.70  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #16 -
+          18        0.150       8.31   dev          -       3.57  index_topk  width=524289 topk=512 ratio=1 block=8  #1406 -
+          18        0.149       8.29   dev          -       4.07  index_topk  width=262145 topk=512 ratio=2  #387 -
+          18        0.149       8.29   dev          -       3.61  gemm_nt  N=32 K=5120 dtype=bf16  #1219 blk.28.indexer.proj.weight
+          18        0.149       8.29   dev          -       3.55  gemm_nt  N=32 K=5120 dtype=bf16  #1050 blk.24.indexer.proj.weight
+          18        0.149       8.28   dev          -       4.10  rmsnorm_rope_roundtrip  n=128 eps=1e-20 n_head=1 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #622 blk.14.indexer.k_norm.weight
+          18        0.149       8.26   dev          -       4.08  qsa_tail_store  n=1024 ratio=2 ring=7 seqs=8 dtype=f32  #111 -
+          17        0.147       8.67   dev          -       5.69  fill  n=4 dtype=f32 value=0  #1870 -
+          18        0.147       8.17   dev          -       3.56  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #684 blk.15.attn_kv_a_norm.weight
+          18        0.147       8.15   dev          -       3.68  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1047 blk.24.attn_kv_a_norm.weight
+          18        0.146       8.11   dev          -       3.54  gemm_nt  N=32 K=5120 dtype=bf16  #1557 blk.36.indexer.proj.weight
+          18        0.146       8.10   dev          -       3.64  gemm_nt  N=32 K=5120 dtype=bf16  #1388 blk.32.indexer.proj.weight
+          18        0.145       8.08   dev          -       3.64  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1010 blk.23.attn_kv_a_norm.weight
+          18        0.145       8.07   dev          -       3.76  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #869 blk.20.attn_kv_a_norm.weight
+          18        0.145       8.06   dev          -       3.58  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #758 blk.17.attn_kv_a_norm.weight
+          18        0.145       8.04   dev          -       3.59  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1142 blk.26.attn_kv_a_norm.weight
+          18        0.145       8.03   dev          -       3.58  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #832 blk.19.attn_kv_a_norm.weight
+          18        0.145       8.03   dev          -       5.27  fill  n=1 dtype=f32 value=1  #5 -
+          18        0.144       8.02   dev          -       3.58  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1216 blk.28.attn_kv_a_norm.weight
+          18        0.144       8.02   dev          -       4.10  rope_rows_roundtrip  n_head=32 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #113 -
+          18        0.144       7.99   dev          -       3.60  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1348 blk.31.attn_kv_a_norm.weight
+          18        0.144       7.99   dev          -       3.52  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1274 blk.29.attn_kv_a_norm.weight
+          18        0.144       7.99   dev          -       3.56  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1311 blk.30.attn_kv_a_norm.weight
+          18        0.144       7.97   dev          -       3.56  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1613 blk.37.attn_kv_a_norm.weight
+          18        0.143       7.97   dev          -       3.56  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #795 blk.18.attn_kv_a_norm.weight
+          18        0.143       7.96   dev          -       4.18  rmsnorm  n=512 eps=1e-20 dtype=bf16  #104 blk.2.attn_compressor_norm.weight
+          18        0.143       7.96   dev          -       3.59  gemm_nt  N=32 K=5120 dtype=bf16  #880 blk.20.indexer.proj.weight
+          18        0.143       7.96   dev          -       3.61  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1517 blk.35.attn_kv_a_norm.weight
+          18        0.143       7.96   dev          -       3.58  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1651 blk.38.attn_kv_a_norm.weight
+          18        0.143       7.96   dev          -       3.58  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1554 blk.36.attn_kv_a_norm.weight
+          18        0.143       7.95   dev          -       3.49  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1689 blk.39.attn_kv_a_norm.weight
+          18        0.143       7.95   dev          -       3.60  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #973 blk.22.attn_kv_a_norm.weight
+          18        0.143       7.95   dev          -       3.52  index_candidates  width=524289 block=8 topk_blocks=2048 ratio=1  #898 -
+          18        0.143       7.94   dev          -       3.59  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1385 blk.32.attn_kv_a_norm.weight
+          18        0.143       7.94   dev          -       6.72  mhc_post  n=5120 hc=4 dtype=bf16  #46 -
+          17        0.143       8.40   dev          -       5.49  swiglu_clamped  n=768 limit=10 dtype=bf16  #1856 -
+          18        0.143       7.93   dev          -       3.58  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #721 blk.16.attn_kv_a_norm.weight
+          18        0.143       7.93   dev          -       3.55  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1443 blk.33.attn_kv_a_norm.weight
+          18        0.143       7.92   dev          -       3.51  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1105 blk.25.attn_kv_a_norm.weight
+          18        0.143       7.92   dev          -       4.08  qsa_tail_store  n=1024 ratio=2 ring=7 seqs=8 dtype=f32  #366 -
+          18        0.142       7.91   dev          -       3.61  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #936 blk.21.attn_kv_a_norm.weight
+          18        0.142       7.91   dev          -       4.06  qsa_tail_store  n=1024 ratio=2 ring=7 seqs=8 dtype=f32  #626 -
+          18        0.142       7.89   dev          -       3.56  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1480 blk.34.attn_kv_a_norm.weight
+          18        0.141       7.83   dev          -       3.57  rmsnorm_rope_roundtrip_kv_store  n=512 eps=1e-20 n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=32 format=fp8_e4m3 scale=ue8m0 dtype=bf16 block_size=16 kv_dtype=bf16  #1179 blk.27.attn_kv_a_norm.weight
+          17        0.141       8.29   dev          -       5.84  fill  n=1 dtype=bf16 value=1  #1858 -
+          17        0.140       8.26   dev          -       5.33  swiglu_clamped  n=2304 limit=10 dtype=bf16  #1852 -
+          18        0.140       7.79   dev          -       4.09  moe_scatter  n_expert=96 top_k=6 expert_base=0  #78 -
+          18        0.140       7.79   dev          -       4.12  rmsnorm  n=512 eps=1e-20 dtype=bf16  #619 blk.14.attn_compressor_norm.weight
+          18        0.139       7.70   dev          -       4.07  moe_scatter  n_expert=96 top_k=6 expert_base=0  #185 -
+          18        0.138       7.68   dev          -       4.16  entry_store  n=128 block_size=2 dtype=bf16 format=mxfp4  #108 -
+          18        0.138       7.66   dev          -       4.12  rope_rows_roundtrip  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=16 format=fp4_e2m1 scale=e4m3 dtype=bf16  #364 -
+          18        0.138       7.65   dev          -       4.17  gemm_nt  N=128 K=512 dtype=bf16  #106 blk.2.indexer.attn_k.weight
+          18        0.138       7.65   dev          -       3.56  index_topk  width=262145 topk=512 ratio=2  #647 -
+          18        0.137       7.62   dev          -       4.12  rmsnorm  n=512 eps=1e-20 dtype=bf16  #359 blk.8.attn_compressor_norm.weight
+          18        0.137       7.61   dev          -       4.12  moe_scatter  n_expert=96 top_k=6 expert_base=0  #148 -
+          18        0.137       7.60   dev          -       4.22  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #59 -
+          18        0.137       7.60   dev          -       3.55  rmsnorm_rope_roundtrip  n=128 eps=1e-20 n_head=1 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #874 blk.20.indexer.k_norm.weight
+          18        0.137       7.59   dev          -       4.08  moe_scatter  n_expert=96 top_k=6 expert_base=0  #333 -
+          18        0.136       7.58   dev          -       4.10  moe_scatter  n_expert=96 top_k=6 expert_base=0  #402 -
+          18        0.136       7.58   dev          -       4.06  rope_rows_roundtrip  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=16 format=fp4_e2m1 scale=e4m3 dtype=bf16  #109 -
+          18        0.136       7.54   dev          -       4.09  rope_rows_roundtrip  n_head=32 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #368 -
+          18        0.135       7.52   dev          -       4.09  gemm_nt  N=128 K=512 dtype=bf16  #621 blk.14.indexer.attn_k.weight
+          18        0.135       7.51   dev          -       6.69  mhc_post  n=5120 hc=4 dtype=bf16  #598 -
+          18        0.135       7.51   dev          -       4.10  gemm_nt  N=128 K=512 dtype=bf16  #361 blk.8.indexer.attn_k.weight
+          18        0.135       7.50   dev          -       4.12  moe_scatter  n_expert=96 top_k=6 expert_base=0  #513 -
+          18        0.134       7.47   dev          -       4.10  moe_scatter  n_expert=96 top_k=6 expert_base=0  #259 -
+          18        0.134       7.46   dev          -       4.21  moe_scatter  n_expert=96 top_k=6 expert_base=0  #439 -
+          18        0.134       7.45   dev          -       4.11  rope_table  rot=64 theta=160000 scale=1 dtype=f32 yarn_factor=16 yarn_low=15 yarn_high=25 yarn_magnitude=1  #620 -
+          18        0.134       7.43   dev          -       4.14  moe_scatter  n_expert=96 top_k=6 expert_base=0  #222 -
+          18        0.134       7.43   dev          -       4.10  moe_scatter  n_expert=96 top_k=6 expert_base=0  #476 -
+          18        0.134       7.42   dev          -       3.49  index_topk  width=524289 topk=512 ratio=1  #899 -
+          18        0.133       7.41   dev          -       4.13  moe_scatter  n_expert=96 top_k=6 expert_base=0  #296 -
+          18        0.133       7.40   dev          -       4.14  rope_table  rot=64 theta=160000 scale=1 dtype=f32 yarn_factor=16 yarn_low=15 yarn_high=25 yarn_magnitude=1  #105 -
+          18        0.133       7.40   dev          -       4.14  moe_scatter  n_expert=96 top_k=6 expert_base=0  #587 -
+          18        0.133       7.40   dev          -       4.06  moe_scatter  n_expert=96 top_k=6 expert_base=0  #550 -
+          18        0.132       7.33   dev          -       4.09  rope_table  rot=64 theta=160000 scale=1 dtype=f32 yarn_factor=16 yarn_low=15 yarn_high=25 yarn_magnitude=1  #360 -
+          17        0.132       7.75   dev          -       4.97  dspark_walk_step  step=5 steps=5 rank=256 n_vocab=129280 N=32320 vocab_off=0 world=4 anchor_stride=5 dtype=f32  #1877 dspark.markov_w1.weight
+          18        0.132       7.32   dev          -       4.23  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #277 -
+          18        0.132       7.32   dev          -       4.12  entry_store  n=128 block_size=2 dtype=bf16 format=mxfp4  #363 -
+          18        0.131       7.28   dev          -       4.11  rope_rows_roundtrip  n_head=32 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #628 -
+          18        0.130       7.24   dev          -       4.07  entry_store  n=512 block_size=2 dtype=bf16  #110 -
+          18        0.130       7.23   dev          -       4.13  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #166 -
+          18        0.130       7.23   dev          -       4.09  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #611 -
+          18        0.130       7.23   dev          -       4.08  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #240 -
+          18        0.129       7.19   dev          -       4.20  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #494 -
+          18        0.129       7.16   dev          -       4.17  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #203 -
+          18        0.129       7.16   dev          -       4.26  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #457 -
+          18        0.129       7.16   dev          -       4.13  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #531 -
+          18        0.128       7.11   dev          -       4.11  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #96 -
+          18        0.128       7.10   dev          -       4.12  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #420 -
+          18        0.128       7.10   dev          -       3.56  moe_scatter  n_expert=96 top_k=6 expert_base=0  #662 -
+          18        0.128       7.08   dev          -       4.21  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #314 -
+          18        0.126       7.03   dev          -       4.11  cast  n=20480 from=bf16 to=bf16  #52 -
+          18        0.126       7.02   dev          -       4.21  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #568 -
+          18        0.126       7.00   dev          -       4.12  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #351 -
+          18        0.126       6.98   dev          -       3.61  rmsnorm  n=512 eps=1e-20 dtype=bf16  #871 blk.20.attn_compressor_norm.weight
+          18        0.126       6.98   dev          -       3.60  rope_rows_roundtrip  n_head=32 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #1218 -
+          18        0.124       6.92   dev          -       3.55  rope_rows_roundtrip  n_head=32 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #1387 -
+          18        0.124       6.90   dev          -       3.57  rope_rows_roundtrip  n_head=32 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #1049 -
+          18        0.124       6.89   dev          -       3.56  rope_rows_roundtrip  n_head=32 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #1556 -
+          18        0.124       6.88   dev          -       4.14  entry_store  n=512 block_size=2 dtype=bf16  #365 -
+          18        0.123       6.84   dev          -       3.54  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1083 -
+          18        0.123       6.82   dev          -       3.50  rope_rows_roundtrip  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=16 format=fp4_e2m1 scale=e4m3 dtype=bf16  #624 -
+          18        0.123       6.81   dev          -       3.57  rope_rows_roundtrip  n_head=32 head_dim=128 rot=64 off=64 mode=gptj inverse=0 block=32 format=fp4_e2m1 scale=ue8m0 dtype=bf16  #879 -
+          18        0.123       6.81   dev          -       3.52  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1458 -
+          18        0.122       6.79   dev          -       3.56  moe_scatter  n_expert=96 top_k=6 expert_base=0  #951 -
+          18        0.122       6.77   dev          -       3.60  moe_scatter  n_expert=96 top_k=6 expert_base=0  #847 -
+          18        0.122       6.77   dev          -       3.58  moe_scatter  n_expert=96 top_k=6 expert_base=0  #988 -
+          18        0.122       6.77   dev          -       3.50  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1289 -
+          18        0.122       6.77   dev          -       3.62  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1252 -
+          18        0.122       6.77   dev          -       3.61  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1120 -
+          18        0.122       6.76   dev          -       3.60  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1157 -
+          18        0.121       6.75   dev          -       3.52  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1495 -
+          18        0.121       6.74   dev          -       3.53  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1421 -
+          18        0.121       6.74   dev          -       4.14  cast  n=20480 from=bf16 to=bf16  #604 -
+          18        0.121       6.74   dev          -       3.50  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1666 -
+          18        0.121       6.74   dev          -       3.53  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1628 -
+          18        0.121       6.72   dev          -       3.60  rope_rows_roundtrip  n_head=1 head_dim=512 rot=64 off=448 mode=gptj inverse=0 block=16 format=fp4_e2m1 scale=e4m3 dtype=bf16  #876 -
+          18        0.121       6.72   dev          -       3.59  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1025 -
+          18        0.121       6.72   dev          -       3.56  entry_store  n=128 block_size=2 dtype=bf16 format=mxfp4  #623 -
+          18        0.121       6.71   dev          -       3.59  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1590 -
+          18        0.121       6.70   dev          -       3.56  moe_scatter  n_expert=96 top_k=6 expert_base=0  #773 -
+          18        0.121       6.70   dev          -       3.51  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1363 -
+          18        0.121       6.70   dev          -       3.56  moe_scatter  n_expert=96 top_k=6 expert_base=0  #914 -
+          18        0.120       6.69   dev          -       3.55  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1532 -
+          18        0.120       6.69   dev          -       3.50  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1194 -
+          18        0.120       6.69   dev          -       3.62  moe_scatter  n_expert=96 top_k=6 expert_base=0  #699 -
+          18        0.120       6.69   dev          -       3.53  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1704 -
+          18        0.120       6.66   dev          -       3.55  moe_scatter  n_expert=96 top_k=6 expert_base=0  #736 -
+          18        0.120       6.66   dev          -       3.50  moe_scatter  n_expert=96 top_k=6 expert_base=0  #1326 -
+          18        0.120       6.65   dev          -       3.59  entry_store  n=128 block_size=1 dtype=bf16 format=mxfp4  #875 -
+          18        0.120       6.65   dev          -       3.53  moe_scatter  n_expert=96 top_k=6 expert_base=0  #810 -
+          18        0.119       6.62   dev          -       3.53  mhc_contract  n=5120 hc=4 dtype=bf16  #1602 -
+          18        0.119       6.60   dev          -       3.31  gather_rows  n=5120 dtype=bf16  #1717 -
+          18        0.117       6.52   dev          -       3.53  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1138 -
+          18        0.117       6.52   dev          -       3.59  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #791 -
+          18        0.117       6.52   dev          -       3.57  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #754 -
+          18        0.117       6.49   dev          -       3.50  entry_store  n=512 block_size=1 dtype=bf16  #877 -
+          18        0.117       6.48   dev          -       3.56  rope_table  rot=64 theta=160000 scale=1 dtype=f32 yarn_factor=16 yarn_low=15 yarn_high=25 yarn_magnitude=1  #872 -
+          18        0.116       6.45   dev          -       3.60  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #828 -
+          18        0.116       6.44   dev          -       3.68  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #932 -
+          18        0.116       6.43   dev          -       3.64  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #969 -
+          18        0.116       6.43   dev          -       3.68  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #717 -
+          18        0.115       6.41   dev          -       3.57  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1101 -
+          18        0.115       6.40   dev          -       3.56  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1212 -
+          18        0.115       6.40   dev          -       3.56  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1006 -
+          18        0.115       6.38   dev          -       3.52  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #680 -
+          18        0.115       6.38   dev          -       3.54  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #865 -
+          18        0.115       6.36   dev          -       3.66  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1270 -
+          18        0.114       6.35   dev          -       3.56  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1381 -
+          18        0.114       6.33   dev          -       3.60  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1043 -
+          18        0.114       6.32   dev          -       3.60  mhc_contract  n=5120 hc=4 dtype=bf16  #1640 -
+          18        0.113       6.30   dev          -       3.65  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1175 -
+          18        0.113       6.30   dev          -       3.54  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1609 -
+          18        0.113       6.30   dev          -       3.53  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1550 -
+          18        0.113       6.26   dev          -       3.60  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1685 -
+          18        0.113       6.26   dev          -       3.51  mhc_contract  n=5120 hc=4 dtype=bf16  #1678 -
+          18        0.112       6.24   dev          -       3.58  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1647 -
+          18        0.112       6.24   dev          -       3.51  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1344 -
+          18        0.112       6.23   dev          -       3.63  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1476 -
+          18        0.112       6.23   dev          -       3.72  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1513 -
+          18        0.112       6.20   dev          -       3.54  entry_store  n=512 block_size=2 dtype=bf16  #625 -
+          18        0.111       6.19   dev          -       3.60  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1307 -
+          18        0.111       6.19   dev          -       3.64  ds41_rope_rows  n_head=16 head_dim=512 rot=64 off=448 mode=gptj inverse=0 dtype=bf16  #1439 -
+       total     1716.372   (waited 100.491 ms besides)
+
+

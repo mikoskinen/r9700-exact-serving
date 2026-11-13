@@ -1,0 +1,12 @@
+[Unit]
+Description=gpu02 host tuning for the R9700 TP4 slow state (cpuidle C2 off, governor performance)
+After=systemd-sysctl.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gpu02-host-tuning apply
+ExecStop=/usr/local/sbin/gpu02-host-tuning revert
+
+[Install]
+WantedBy=multi-user.target

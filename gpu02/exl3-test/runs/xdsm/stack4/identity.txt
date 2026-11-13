@@ -1,0 +1,26 @@
+s4-n5 warm-up IDENTICAL: 3 answers
+deep136-1A-vs-dsm225 IDENTICAL (1877 chars)
+deep136-2S-vs-dsm225 IDENTICAL (1877 chars)
+d135000-2S-vs-A IDENTICAL (1877 chars)
+deep136-3S-vs-dsm225 IDENTICAL (1877 chars)
+d135000-3S-vs-A IDENTICAL (1877 chars)
+deep136-4A-vs-dsm225 IDENTICAL (1877 chars)
+d135000-4A-vs-A IDENTICAL (1877 chars)
+d64000-2S-vs-A IDENTICAL (2033 chars)
+d64000-3S-vs-A IDENTICAL (2033 chars)
+d64000-4A-vs-A IDENTICAL (2033 chars)
+ld-1A-vs-aloneA DIFFERENT at char 74 (2033 vs 1999 chars)
+ld-2S-vs-aloneS DIFFERENT at char 45 (2033 vs 2005 chars)
+ld-2S-vs-ldA DIFFERENT at char 45 (1999 vs 2005 chars)
+ld-3S-vs-aloneS DIFFERENT at char 45 (2033 vs 2029 chars)
+ld-3S-vs-ldA DIFFERENT at char 45 (1999 vs 2029 chars)
+ld-4A-vs-aloneA DIFFERENT at char 45 (2033 vs 2033 chars)
+ld-4A-vs-ldA DIFFERENT at char 45 (1999 vs 2033 chars)
+copy-S-vs-d0 IDENTICAL (2399 chars)
+s4-n5-a1-A-vs-d0 IDENTICAL: 20 of 20 answers
+s4-n5-a1-S-vs-d0 IDENTICAL: 20 of 20 answers
+s4-n5-a1-S-vs-a1-A IDENTICAL: 20 of 20 answers
+s4-n5-lid-S-vs-a1-S IDENTICAL: 20 of 20 answers
+s4-n5-c4b-vs-c4a-S IDENTICAL: 20 of 20 answers
+s4-n5-c4a-vs-a1-S IDENTICAL: 20 of 20 answers
+s4-n5-a2-vs-a1-S IDENTICAL: 20 of 20 answers

@@ -1,0 +1,43 @@
+s5-n5 warm-up IDENTICAL: 3 answers
+deep135-1A-vs-dsm225 IDENTICAL (1877 chars)
+deep135-2S-vs-dsm225 IDENTICAL (1877 chars)
+d135000-2S-vs-A IDENTICAL (1877 chars)
+deep135-3T-vs-dsm225 IDENTICAL (1877 chars)
+d135000-3T-vs-A IDENTICAL (1877 chars)
+deep135-4T-vs-dsm225 IDENTICAL (1877 chars)
+d135000-4T-vs-A IDENTICAL (1877 chars)
+deep135-5S-vs-dsm225 IDENTICAL (1877 chars)
+d135000-5S-vs-A IDENTICAL (1877 chars)
+deep135-6A-vs-dsm225 IDENTICAL (1877 chars)
+d135000-6A-vs-A IDENTICAL (1877 chars)
+d64000-2S-vs-A IDENTICAL (2033 chars)
+d64000-3T-vs-A IDENTICAL (2033 chars)
+d64000-4T-vs-A IDENTICAL (2033 chars)
+d64000-5S-vs-A IDENTICAL (2033 chars)
+d64000-6A-vs-A IDENTICAL (2033 chars)
+ld-1A-vs-aloneA DIFFERENT at char 45 (2033 vs 1920 chars)
+ld-2S-vs-aloneS IDENTICAL (2033 chars)
+ld-2S-vs-ldA DIFFERENT at char 45 (1920 vs 2033 chars)
+ld-3T-vs-aloneT IDENTICAL (2033 chars)
+ld-3T-vs-ldA DIFFERENT at char 45 (1920 vs 2033 chars)
+ld-4T-vs-aloneT IDENTICAL (2033 chars)
+ld-4T-vs-ldA DIFFERENT at char 45 (1920 vs 2033 chars)
+ld-5S-vs-aloneS IDENTICAL (2033 chars)
+ld-5S-vs-ldA DIFFERENT at char 45 (1920 vs 2033 chars)
+ld-6A-vs-aloneA DIFFERENT at char 45 (2033 vs 1882 chars)
+ld-6A-vs-ldA DIFFERENT at char 526 (1920 vs 1882 chars)
+hit-A-t2-vs-coldA IDENTICAL (879 chars)
+hit-A-t3-vs-coldA IDENTICAL (959 chars)
+hit-S-t2-vs-coldA IDENTICAL (962 chars)
+hit-S-t3-vs-coldA IDENTICAL (968 chars)
+hit-T-t2-vs-coldA IDENTICAL (948 chars)
+hit-T-t3-vs-coldA IDENTICAL (1057 chars)
+copy-S-vs-d0 IDENTICAL (2399 chars)
+s5-n5-a1-A-vs-d0 IDENTICAL: 20 of 20 answers
+s5-n5-a1-S-vs-d0 IDENTICAL: 20 of 20 answers
+s5-n5-a1-S-vs-a1-A IDENTICAL: 20 of 20 answers
+s5-n5-a1-T-vs-a1-A IDENTICAL: 20 of 20 answers
+s5-n5-lid-S-vs-a1-S IDENTICAL: 20 of 20 answers
+s5-n5-c4b-vs-c4a-S IDENTICAL: 20 of 20 answers
+s5-n5-c4a-vs-a1-S IDENTICAL: 20 of 20 answers
+s5-n5-a2-vs-a1-S IDENTICAL: 20 of 20 answers

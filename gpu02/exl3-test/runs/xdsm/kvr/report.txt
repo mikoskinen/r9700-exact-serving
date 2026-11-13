@@ -1,0 +1,13 @@
+RESULT xkvr capacity A (KVR off): transfer entry 5.39 KiB | tier 84.00 GiB, 4084887 entries, 8169774 tokens, slot 21.56 KiB (4.0 rank entries) | OK
+RESULT xkvr capacity B (KVR on): transfer entry 5.39 KiB (5.39 KiB replicated) | tier 84.00 GiB, 16339549 entries, 32679098 tokens, slot 5.39 KiB (1.0 rank entries) | held once: kv_index_r2, kv_compressed_r2, kv_index_r1, kv_compressed_r1, 5.39 KiB a slot rather than 21.56 KiB, 32679098 tokens rather than 8169774 | KVR declared on 4 ranks: kv_index_r1, kv_index_r2, kv_compressed_r1, kv_compressed_r2 | OK
+RESULT xkvr capacity V (KVR on + TIER_VERIFY): transfer entry 5.39 KiB (5.39 KiB replicated) | tier 84.00 GiB, 16339549 entries, 32679098 tokens, slot 5.39 KiB (1.0 rank entries) | held once: kv_index_r2, kv_compressed_r2, kv_index_r1, kv_compressed_r1, 5.39 KiB a slot rather than 21.56 KiB, 32679098 tokens rather than 8169774 | KVR declared on 4 ranks: kv_index_r1, kv_index_r2, kv_compressed_r1, kv_compressed_r2 | OK
+RESULT xkvr capacity B vs A: host-tier tokens 32679098 vs 8169774 (x4.0000), slot 5.39 KiB vs 21.56 KiB, entries 16339549 vs 4084887
+RESULT xkvr capacity V vs A: host-tier tokens 32679098 vs 8169774 (x4.0000), slot 5.39 KiB vs 21.56 KiB, entries 16339549 vs 4084887
+RESULT xkvr tier hit A: OK | cold 32254 tok, 16254 entries to host at 25348.0 B an entry | hit cached 30720, promoted 16126 (share 1.05), restores 1, 25.5 ms, TTFT 0.85 s (cold 7.88 s) | md5 cold a29d67e3 hit a29d67e3
+RESULT xkvr tier hit B: OK | cold 32254 tok, 16254 entries to host at 8788.0 B an entry | hit cached 30720, promoted 16126 (share 1.05), restores 1, 24.1 ms, TTFT 0.85 s (cold 7.89 s) | md5 cold a29d67e3 hit a29d67e3
+RESULT xkvr tier hit V: OK | cold 32254 tok, 16254 entries to host at 8788.0 B an entry | hit cached 30720, promoted 16126 (share 1.05), restores 1, 137.8 ms, TTFT 0.96 s (cold 7.88 s) | md5 cold a29d67e3 hit a29d67e3
+RESULT xkvr speed A (2 of 2 blocks ok, T 0, stack4 S pins): 1u essay 75.00 +- 17.47, code 120.82 +- 3.68 tok/s | mb c8 177.3 +- 14.6 tok/s (per-stream p50 23.45)
+RESULT xkvr speed B (2 of 2 blocks ok, T 0, stack4 S pins): 1u essay 74.59 +- 22.62, code 120.95 +- 2.22 tok/s | mb c8 175.2 +- 38.1 tok/s (per-stream p50 23.55)
+RESULT xkvr speed B vs A (CROSS-START: two starts, not in-process; A's spread above is the noise floor): 1u essay -0.6 %, code +0.1 %, mb c8 -1.2 %
+RESULT xkvr identity: IDENTICAL at every strict compare (19)
+RESULT xkvr guards: OK (10 checks: env read back, tier lines, hit from the host tier, TIER_VERIFY clean)

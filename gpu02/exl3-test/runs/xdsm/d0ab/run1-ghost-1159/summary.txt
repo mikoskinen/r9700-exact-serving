@@ -1,0 +1,12 @@
+D0AB c4 agg tok/s: B vs A - | C vs A - | baseline base1113 S5T 139.0 (dur 60 warm 15) | vs pre-move stack5 S5T 150.6: A -, B -, C -
+D0AB c4 per-stream p50: B vs A - | C vs A - | baseline base1113 S5T 37.8 (dur 60 warm 15)
+D0AB ms/decode step: B vs A - | C vs A - | baseline base1113 S5T 25.8 (dur 60 warm 15)
+D0AB tok/decode step: B vs A - | C vs A - | baseline base1113 S5T 4.33 (dur 60 warm 15)
+D0AB acceptance: B vs A - | C vs A - | baseline base1113 S5T 0.676 (dur 60 warm 15)
+D0AB decode_share: B vs A - | C vs A - | baseline base1113 S5T 0.829 (dur 60 warm 15)
+D0AB zero_cycles: B vs A - | C vs A - | baseline base1113 S5T 2290 (dur 60 warm 15)
+D0AB zero_moves: B vs A - | C vs A - | baseline base1113 S5T 12 (dur 60 warm 15)
+D0AB probe_cycles: B vs A - | C vs A - | baseline base1113 S5T 57 (dur 60 warm 15)
+D0AB d0_share: B vs A - | C vs A - | baseline base1113 S5T 0.960 (dur 60 warm 15)
+D0AB lent_cycles: B vs A - | C vs A - | baseline base1113 S5T 2068 (dur 60 warm 15)
+SUMMARY 0 c4 blocks (0 flagged) | identity: none

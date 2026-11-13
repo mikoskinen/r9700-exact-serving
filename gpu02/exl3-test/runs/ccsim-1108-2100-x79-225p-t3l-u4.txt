@@ -1,0 +1,20 @@
+# cc_sim model=deepseek-v4.1-flash urls=['http://127.0.0.1:8090'] route=hash users=4 duration=2700s warmup=120s cap=170000 start=20000-40000 preage=True tools=109 (~16920 tok) gen=forced~LN(350,1)<=13000 tool~LN(300,1.2) think~LN(0.8,1)[0.2,90]s effort=xhigh,medium auth=no run=20261108-210046 2026-11-08 21:00:46
+[    60s] done=1 err=0 in_flight=4 open_sessions=4 | last 60s: req=1 ttft_p50=18.57s ttft_max=18.57s gen=231 prompt_p50=37k cpt=3.50
+[   120s] done=3 err=0 in_flight=3 open_sessions=4 | last 60s: req=2 ttft_p50=47.91s ttft_max=50.44s gen=249 prompt_p50=34k cpt=3.50
+[   180s] done=9 err=0 in_flight=3 open_sessions=4 | last 60s: req=6 ttft_p50=5.44s ttft_max=113.67s gen=1815 prompt_p50=38k cpt=3.50
+[   240s] done=17 err=0 in_flight=4 open_sessions=4 | last 60s: req=8 ttft_p50=3.80s ttft_max=105.16s gen=6563 prompt_p50=71k cpt=3.50
+[   300s] done=27 err=0 in_flight=4 open_sessions=4 | last 60s: req=10 ttft_p50=2.21s ttft_max=3.37s gen=2877 prompt_p50=73k cpt=3.50
+[   360s] done=35 err=0 in_flight=4 open_sessions=4 | last 60s: req=8 ttft_p50=3.50s ttft_max=4.25s gen=5549 prompt_p50=78k cpt=3.50
+[   420s] done=44 err=0 in_flight=3 open_sessions=3 | last 60s: req=9 ttft_p50=1.98s ttft_max=3.12s gen=3532 prompt_p50=80k cpt=3.50
+[   480s] done=50 err=0 in_flight=3 open_sessions=3 | last 60s: req=6 ttft_p50=2.90s ttft_max=3.79s gen=8788 prompt_p50=58k cpt=3.50
+[   540s] done=57 err=0 in_flight=1 open_sessions=1 | last 60s: req=7 ttft_p50=2.80s ttft_max=3.43s gen=3469 prompt_p50=50k cpt=3.50
+[   600s] done=59 err=0 in_flight=1 open_sessions=1 | last 60s: req=2 ttft_p50=1.65s ttft_max=2.18s gen=1853 prompt_p50=50k cpt=3.50
+SUMMARY window 155-630 s, users=4
+  requests 48 ok (0 err, 0 aborted), 6.06 req/min, mean in-flight 2.63, sessions 4 (cold starts 0), mean think 1.52 s
+  TTFT p50 2.62 s, p95 4.25 s, max 4.5 s | decode per stream p50 28.0 tok/s (p10 22.9) | aggregate generated 68.1 tok/s
+  prompt p50 70.6k max 96.8k, total 3.22M; cached 3.07M = 95.2 %; uncached per request p50 3.3k; server prefill p50 1683.6 tok/s
+  gen p50 431 mean 674.7 max 5103, reasoning 59.5 %; growth/turn p50 759 mean 1050 (tool part p50 330); draft acceptance None
+  finish {'length': 48} | per url {'http://127.0.0.1:8090': 48}
+SUMMARY_JSON {"window_s": [155.1, 630.3], "users": 4, "requests": 48, "errors": 0, "aborted": 0, "first_err": "", "req_per_min": 6.06, "ttft_p50": 2.62, "ttft_p95": 4.25, "ttft_max": 4.5, "decode_p50": 28.0, "decode_p10": 22.9, "agg_gen_tps": 68.1, "mean_inflight": 2.63, "prompt_p50": 70615, "prompt_max": 96832, "prompt_tokens": 3220951, "cached_tokens": 3067904, "cache_hit_pct": 95.2, "uncached_p50": 3304, "gen_p50": 431, "gen_mean": 674.7, "gen_max": 5103, "reasoning_pct": 59.5, "growth_p50": 759, "growth_mean": 1050, "tool_tok_p50": 330, "sessions": 4, "cold_starts": 0, "think_mean": 1.52, "srv_prefill_tps_p50": 1683.6, "draft_acc_mean": null, "finish": {"length": 48}, "per_url": {"http://127.0.0.1:8090": 48}, "mode": "turns 15 a user, first 3 excluded", "makespan_s": 630.3, "server_s": 1248.1, "cpt_final": 3.5}
+# per-request lines + summary: /home/mikoskinen/gpu/ds41/exl3-test/runs/ccsim-1108-2100-x79-225p-t3l-u4.jsonl
+cc_sim exit 0

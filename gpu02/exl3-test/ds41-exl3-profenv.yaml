@@ -1,0 +1,7 @@
+# 6.11.2026 override for ds41-exl3-tp4.yaml (= ~/radiance-1.15.1/compose/ds41-profenv.yaml of 3.11.): --profile-ops dump cadence
+# (engine default every 32 steps). Used by after-sweep.sh's profiled restarts:
+#   PROFEVERY=1 docker compose --project-directory ~/radiance-1.15.1/compose -f ds41-exl3-tp4.yaml -f ds41-exl3-profenv.yaml up -d
+services:
+  radiance:
+    environment:
+      RADIANCE_PROFILE_EVERY: ${PROFEVERY:-32}

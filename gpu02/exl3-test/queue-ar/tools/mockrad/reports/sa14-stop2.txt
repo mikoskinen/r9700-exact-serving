@@ -1,0 +1,31 @@
+MOCKRUN REPORT sa14-stop2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zsa14.sh | body rc 0 | 258 s | knobs: SA14_SW=0 SA14_C8WARM=4 SA14_BUDGET_MIN=120 SA14_LDPF=2048 SA14_C8GN=1 NGSHARE_DIR=/tmp/mockrad/sa14-stop2/ngdir NGSHARE_RUN=/tmp/mockrad/sa14-stop2/ngrun NGSHARE_LOG=/tmp/mockrad/sa14-stop2/ngshare.log | faults: differ=stage_pick:2 | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zsa14 | 55 RESULT lines, 195 mock requests | last RESULT: xsa14 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zsa14: done (4 min) -- /tmp/mockrad/sa14-stop2/home/gpu/ds41/exl3-test/runs/xdsm/zsa14 | STOPPED at the identity gate (no speed block ran): NEEDS USER | 7 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (8)
+  1x ngshare xsa14-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  1x  [mock: real ref] xsa14 xsa14-n5 warm-up answers vs stock: VIRHE DIFFERENT: factual, factual2, code
+  1x xsa14 identity n5: VIRHE xsa14-n5 warm-up DIFFERENT: factual, factual2, code (strict, T 0 greedy)
+  1x xsa14 identity a1-B-vs-ref12-a1: VIRHE xsa14-a1-B-vs-ref12-a1 20 of 20 answers differ: p0 char 0 tok 0, p1 char 0 tok 0, p2 char 0 tok 0, p3 char 0 tok 0, p4 char 0 tok 0, p5 char 0 tok 0, p6 char 0 tok 0, p7 char 0 tok 0, p8 char 0 tok 0, p9 char 0 tok 0, p10 char 0 tok 0, p11 char 0 tok 0, p12 char 0 tok 0, p13 char 0 tok 0, p14 char 0 tok 0, p15 char 0 tok 0, p16 char 0 tok 0, p17 char 0 tok 0, p18 char 0 tok 0, p19 char 0 tok 0 (strict, T 0 greedy)
+  2x xsa14 identity a1-S1-vs-ref12-a1: VIRHE xsa14-a1-S1-vs-ref12-a1 20 of 20 answers differ: p0 char 0 tok 0, p1 char 0 tok 0, p2 char 0 tok 0, p3 char 0 tok 0, p4 char 0 tok 0, p5 char 0 tok 0, p6 char 0 tok 0, p7 char 0 tok 0, p8 char 0 tok 0, p9 char 0 tok 0, p10 char 0 tok 0, p11 char 0 tok 0, p12 char 0 tok 0, p13 char 0 tok 0, p14 char 0 tok 0, p15 char 0 tok 0, p16 char 0 tok 0, p17 char 0 tok 0, p18 char 0 tok 0, p19 char 0 tok 0 (strict, T 0 greedy)
+  1x xsa14 identity a1-B-vs-yzint14c-a1-Z: VIRHE xsa14-a1-B-vs-yzint14c-a1-Z 20 of 20 answers differ: p0 char 0 tok 0, p1 char 0 tok 0, p2 char 0 tok 0, p3 char 0 tok 0, p4 char 0 tok 0, p5 char 0 tok 0, p6 char 0 tok 0, p7 char 0 tok 0, p8 char 0 tok 0, p9 char 0 tok 0, p10 char 0 tok 0, p11 char 0 tok 0, p12 char 0 tok 0, p13 char 0 tok 0, p14 char 0 tok 0, p15 char 0 tok 0, p16 char 0 tok 0, p17 char 0 tok 0, p18 char 0 tok 0, p19 char 0 tok 0 (strict, T 0 greedy)
+  1x xsa14 IDENTITY GATE: VIRHE strict identity failed [n5 a1-B-vs-ref12-a1 a1-S1-vs-ref12-a1 a1-S2-vs-ref12-a1 a1-B-vs-yzint14c-a1-Z] -> the item STOPS before every speed block (exact = byte-identical: NEEDS USER) | arms B {} S1 {"stage_short": 1025, "stage_pick": 1} S2 {"stage_short": 1025, "stage_pick": 2} on the int14 pin | the failing comparisons are in /tmp/mockrad/sa14-stop2/home/gpu/ds41/exl3-test/runs/xdsm/zsa14/identity.txt and /tmp/mockrad/sa14-stop2/home/gpu/ds41/exl3-test/runs/xdsm/zsa14/xsa14-*-cmp-*.json
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42099 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zsa14/mock-sa14-stop2.out (size 0 -> 849)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzz-fn-hz-csdma5.sh.out (size 17368 -> 20727)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1110182 -> 1117588)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-sd5-QX.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sd5-blocks.jsonl (size 48699 -> 64966)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-sd5-qx1.txt (size 0 -> 817)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/up-fn4-sd5-U2.txt (size 303 -> 150)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

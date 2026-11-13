@@ -1,0 +1,19 @@
+MOCKRUN REPORT rfst-mf
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzzzzz-zsoak16z-rfst.sh | body rc 0 | 6 s | knobs: RFST_MOCK=1 RFST_MOCK_OUT=/home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/rfst/mock/fail.txt | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/rfst | 16 RESULT lines, 0 mock requests | last RESULT: rfst: done -- /tmp/mockrad/rfst-mf/home/gpu/ds41/exl3-test/runs/xdsm/rfst/selftest.txt
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 0 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 43166 linked real files, 2 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zsoak16/dry-zsoak16.txt (size 49805 -> 769)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1646687 -> 1646819)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

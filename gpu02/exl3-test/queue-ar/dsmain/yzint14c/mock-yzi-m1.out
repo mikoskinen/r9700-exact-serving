@@ -1,0 +1,38 @@
+2026-11-12 20:14:45 mockrun yzi-m1: farm: FARM {"copied": 6909, "linked": 41706, "dirlinks": 45, "skipped": 2, "seconds": 2.8}
+2026-11-12 20:14:45 mockrun yzi-m1: port 18090, sandbox /tmp/mockrad/yzi-m1, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yzint14c.sh (sandbox copy), knobs: YZI_SW=0 YZI_EGEN=128 YZI_C8WIN=8 YZI_C8WARM=4 YZI_BUDGET_MIN=120 YZI_LDPF=2048 YZI_A11ID=1100 YZI_CDEPTHS=6000 YZI_U1N=2 YZI_C16DUR=8 YZI_C16WARM=4 NGSHARE_DIR=/tmp/mockrad/yzi-m1/ngdir NGSHARE_RUN=/tmp/mockrad/yzi-m1/ngrun NGSHARE_LOG=/tmp/mockrad/yzi-m1/ngshare.log, faults: none, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-12 20:14:52 mockrun yzi-m1: DRYRUN rc 0, 381 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1
+2026-11-12 20:14:52 mockrun yzi-m1: run (timeout 3000 s)
+2026-11-12 20:22:41 mockrun yzi-m1: body rc 0 after 479 s
+MOCKRUN REPORT yzi-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yzint14c.sh | body rc 0 | 479 s | knobs: YZI_SW=0 YZI_EGEN=128 YZI_C8WIN=8 YZI_C8WARM=4 YZI_BUDGET_MIN=120 YZI_LDPF=2048 YZI_A11ID=1100 YZI_CDEPTHS=6000 YZI_U1N=2 YZI_C16DUR=8 YZI_C16WARM=4 NGSHARE_DIR=/tmp/mockrad/yzi-m1/ngdir NGSHARE_RUN=/tmp/mockrad/yzi-m1/ngrun NGSHARE_LOG=/tmp/mockrad/yzi-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1 | 123 RESULT lines, 621 mock requests | last RESULT: yzi 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yzint14c: done (7 min) -- /tmp/mockrad/yzi-m1/home/gpu/ds41/exl3-test/runs/xdsm/yzint14c/x1 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x ngshare yzi-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (7)
+    2026-11-12 20:14:57 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-ar_twoshot_4rank_exact-0-2036984 --network none --device /dev/kfd --device /dev/dri --security-opt s
+    2026-11-12 20:14:57 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-ar_twoshot_4rank_exact-1-2036984 --network none --device /dev/kfd --device /dev/dri --security-opt s
+    2026-11-12 20:14:58 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-ar_oneshot_4rank_exact-0-2036984 --network none --device /dev/kfd --device /dev/dri --security-opt s
+    2026-11-12 20:14:58 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-ar_oneshot_4rank_exact-1-2036984 --network none --device /dev/kfd --device /dev/dri --security-opt s
+    2026-11-12 20:14:58 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-a4check-2036984 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined
+    2026-11-12 20:14:58 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-check-2036984 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -
+    2026-11-12 20:14:58 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name yzi-p0-perf-2036984 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41704 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yzint14c/mock-yzi-m1.out (size 0 -> 912)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzz-fn-bc3.sh.out (size 4523 -> 5069)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 12029 -> 12472)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 910808 -> 924063)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-bc3-c4-no-arw_rows.txt (size 0 -> 734)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-bc3-S.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-bc3-blocks.jsonl (size 63602 -> 68593)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/yzi-m1.txt | sandbox: /tmp/mockrad/yzi-m1

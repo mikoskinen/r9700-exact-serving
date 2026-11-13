@@ -1,0 +1,21 @@
+depth-0 share c1 A: blocks 4 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000 0.000 0.000]
+depth-0 share c1 B: blocks 4 mean 0.021 sd 0.025 min 0.000 max 0.046 [0.000 0.046 0.000 0.038]
+depth-0 share c1 N: blocks 2 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000]
+depth-0 share essaypos A: blocks 4 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000 0.000 0.000]
+depth-0 share essaypos B: blocks 4 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000 0.000 0.000]
+depth-0 share essaypos N: blocks 2 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000]
+depth-0 share edit A: blocks 4 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000 0.000 0.000]
+depth-0 share edit B: blocks 4 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000 0.000 0.000]
+depth-0 share edit N: blocks 2 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000]
+depth-0 share c4 A: blocks 4 mean 0.956 sd 0.025 min 0.929 max 0.978 [0.929 0.940 0.977 0.978] | tok/s 135.4 138.3 136.3 137.0 (sd 1.2)
+depth-0 share c4 B: blocks 4 mean 0.949 sd 0.030 min 0.930 max 0.993 [0.993 0.934 0.939 0.930] | tok/s 138.6 139.2 138.4 139.4 (sd 0.5)
+depth-0 share c4 N: blocks 2 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000] | tok/s 138.9 138.4 (sd 0.4)
+depth-0 share c8 A: blocks 4 mean 0.932 sd 0.112 min 0.765 max 0.992 [0.765 0.990 0.992 0.983] | tok/s 168.9 171.8 172.9 173.4 (sd 2.0)
+depth-0 share c8 B: blocks 4 mean 1.011 sd 0.000 min 1.010 max 1.011 [1.011 1.011 1.010 1.011] | tok/s 173.0 173.6 172.9 173.3 (sd 0.3)
+depth-0 share c8 N: blocks 2 mean 0.000 sd 0.000 min 0.000 max 0.000 [0.000 0.000] | tok/s 184.2 179.8 (sd 3.1)
+per rank c4 A: r0 hit 97.61 % miss 11.67/step stream 116.70 MB/step units 2960.72 (trunk 2944.25, lent 152.05) | r1 hit 97.53 % miss 12.24/step stream 122.35 MB/step units 2976.43 (trunk 2960.60, lent 152.30) | r2 hit 97.64 % miss 11.64/step stream 116.95 MB/step units 2976.82 (trunk 2960.97, lent 152.38) | r3 hit 97.64 % miss 11.87/step stream 119.60 MB/step units 2976.62 (trunk 2960.18, lent 152.10)
+per rank c4 B: r0 hit 97.91 % miss 9.55/step stream 92.03 MB/step units 2982.65 (trunk 2971.78, lent 167.93) | r1 hit 97.84 % miss 10.03/step stream 97.05 MB/step units 2997.88 (trunk 2987.00, lent 167.30) | r2 hit 97.91 % miss 9.64/step stream 93.70 MB/step units 2998.25 (trunk 2987.40, lent 167.35) | r3 hit 97.95 % miss 9.66/step stream 94.15 MB/step units 2997.58 (trunk 2986.70, lent 167.78)
+per rank c4 N: r0 hit 98.44 % miss 7.17/step stream 69.00 MB/step units 3079.40 (trunk 3079.40, lent 0.00) | r1 hit 98.34 % miss 7.79/step stream 75.15 MB/step units 3093.25 (trunk 3093.25, lent 0.00) | r2 hit 98.42 % miss 7.31/step stream 70.95 MB/step units 3093.75 (trunk 3093.75, lent 0.00) | r3 hit 98.44 % miss 7.37/step stream 71.55 MB/step units 3092.85 (trunk 3092.85, lent 0.00)
+per rank c8 A: r0 hit 97.63 % miss 20.40/step stream 202.32 MB/step units 2960.25 (trunk 2943.85, lent 154.53) | r1 hit 97.48 % miss 21.88/step stream 216.95 MB/step units 2974.45 (trunk 2958.05, lent 154.22) | r2 hit 97.62 % miss 20.54/step stream 205.20 MB/step units 2975.80 (trunk 2959.38, lent 154.38) | r3 hit 97.61 % miss 21.01/step stream 210.68 MB/step units 2975.07 (trunk 2958.68, lent 154.05)
+per rank c8 B: r0 hit 97.85 % miss 17.59/step stream 169.18 MB/step units 2975.67 (trunk 2969.55, lent 174.57) | r1 hit 97.75 % miss 18.57/step stream 179.00 MB/step units 2990.60 (trunk 2985.00, lent 174.35) | r2 hit 97.87 % miss 17.53/step stream 169.82 MB/step units 2992.15 (trunk 2986.53, lent 174.90) | r3 hit 97.87 % miss 17.86/step stream 173.57 MB/step units 2992.50 (trunk 2986.38, lent 174.55)
+per rank c8 N: r0 hit 98.43 % miss 12.79/step stream 122.65 MB/step units 3071.15 (trunk 3071.15, lent 0.00) | r1 hit 98.31 % miss 13.82/step stream 133.45 MB/step units 3082.85 (trunk 3082.85, lent 0.00) | r2 hit 98.41 % miss 13.00/step stream 126.20 MB/step units 3084.65 (trunk 3084.65, lent 0.00) | r3 hit 98.42 % miss 13.16/step stream 128.25 MB/step units 3083.75 (trunk 3083.75, lent 0.00)

@@ -1,0 +1,11 @@
+xpu-n5 warm-up IDENTICAL: 3 answers
+xpu-a1-C-vs-a1-B IDENTICAL: 20 of 20 answers
+xpu-gs16-C-vs-gs16-B IDENTICAL: 20 of 20 answers
+xpu-gs16-B-vs-a1-B IDENTICAL: 20 of 20 answers
+xpu-a1-B-vs-ref12-a1 IDENTICAL: 20 of 20 answers
+cold-64000-2-C-vs-cold-64000-1-B IDENTICAL (343 chars)
+cold-64000-3-C-vs-cold-64000-1-B IDENTICAL (343 chars)
+cold-64000-4-B-vs-cold-64000-1-B IDENTICAL (343 chars)
+cold-136000-2-C-vs-cold-136000-1-B IDENTICAL (293 chars)
+cold-136000-3-C-vs-cold-136000-1-B IDENTICAL (293 chars)
+cold-136000-4-B-vs-cold-136000-1-B IDENTICAL (293 chars)

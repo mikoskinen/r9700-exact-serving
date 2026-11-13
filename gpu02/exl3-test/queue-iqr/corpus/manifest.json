@@ -1,0 +1,46 @@
+{
+ "stats": {
+  "agent-oh": {
+   "calib_tokens": 314486,
+   "calib_docs": 19,
+   "kl_tokens": 83814,
+   "kl_docs": 6
+  },
+  "agent-swe": {
+   "calib_tokens": 247340,
+   "calib_docs": 23,
+   "kl_tokens": 70736,
+   "kl_docs": 6
+  },
+  "chat": {
+   "calib_tokens": 240807,
+   "calib_docs": 218,
+   "kl_tokens": 61905,
+   "kl_docs": 47
+  },
+  "wiki-en": {
+   "calib_tokens": 120098,
+   "calib_docs": 57,
+   "kl_tokens": 31852,
+   "kl_docs": 20
+  },
+  "wiki-fi": {
+   "calib_tokens": 123703,
+   "calib_docs": 57,
+   "kl_tokens": 30591,
+   "kl_docs": 16
+  },
+  "code": {
+   "calib_tokens": 192440,
+   "calib_docs": 17,
+   "kl_tokens": 51003,
+   "kl_docs": 8
+  }
+ },
+ "calib_tokens": 1238874,
+ "kl_tokens": 329901,
+ "doc_cap": 24576,
+ "seed": 20261106,
+ "tokenizer": "/home/mikoskinen/models/ds41-skeleton/hf-src/DeepSeek-V4.1-Flash-1017/tokenizer.json",
+ "template": "/home/mikoskinen/models/ds41-exl3-work/chat_template.jinja"
+}

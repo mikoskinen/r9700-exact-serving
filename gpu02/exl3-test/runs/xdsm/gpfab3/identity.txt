@@ -1,0 +1,7 @@
+warm-up-gq3-n0 IDENTICAL: 3 answers
+deep-gq3-n0-dA IDENTICAL (1877 chars)
+deep-gq3-n0-dB IDENTICAL (1877 chars)
+copy-gq3-n0-iA IDENTICAL (2399 chars)
+gs-gq3-n0-iA IDENTICAL: 20 answers
+copy-gq3-n0-iB IDENTICAL (2399 chars)
+gs-gq3-n0-iB IDENTICAL: 20 answers

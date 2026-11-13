@@ -1,0 +1,14 @@
+warm-up-e10-nst0 IDENTICAL: 3 answers
+e10-nst0 28k copy B (e10_gd 1) vs A (e10_gd 0), both cold IDENTICAL (2399 chars)
+e10-nst0 greedy set c1 B vs A IDENTICAL: 20 answers
+e10-nst0 28k copy B vs bz d0 (NST 0, stock) IDENTICAL (2399 chars)
+e10-nst0 28k copy A vs bz d0 (NST 0, stock) IDENTICAL (2399 chars)
+e10-nst0 greedy set c1 B vs bz d0 IDENTICAL: 20 answers
+e10-nst0 greedy set c1 A vs bz d0 IDENTICAL: 20 answers
+warm-up-e10-nst5 IDENTICAL: 3 answers
+e10-nst5 28k copy B (e10_gd 1) vs A (e10_gd 0), both cold IDENTICAL (2399 chars)
+e10-nst5 greedy set c1 B vs A IDENTICAL: 20 answers
+e10-nst5 28k copy B vs bz d0 (NST 0, stock) IDENTICAL (2399 chars)
+e10-nst5 28k copy A vs bz d0 (NST 0, stock) IDENTICAL (2399 chars)
+e10-nst5 greedy set c1 B vs bz d0 IDENTICAL: 20 answers
+e10-nst5 greedy set c1 A vs bz d0 IDENTICAL: 20 answers

@@ -1,0 +1,1 @@
+2026-11-07 05:00:55 coordinator: skipped 58-idx-chunk 62-fix-idx2 67-ctail-ab 67-mx4-keys 69-idx-decode-stamps (covered by tuned2/x79, review 7.11.); parked 68-mx4l-latent 69-idx-16k-ab for rebase onto tuned3

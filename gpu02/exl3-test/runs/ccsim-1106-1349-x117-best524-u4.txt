@@ -1,0 +1,6 @@
+# cc_sim model=deepseek-v4.1-flash urls=['http://127.0.0.1:8090'] route=hash users=4 duration=660s warmup=300s cap=170000 start=20000-40000 preage=True tools=109 (~16920 tok) gen=natural<=13000 tool~LN(300,1.2) think~LN(0.8,1)[0.2,90]s effort=xhigh,medium auth=no run=20261106-134916 2026-11-06 13:49:16
+[    60s] done=1 err=0 in_flight=4 open_sessions=4 | last 60s: req=1 ttft_p50=23.83s ttft_max=23.83s gen=70 prompt_p50=37k cpt=3.52
+[   120s] done=2 err=0 in_flight=4 open_sessions=4 | last 60s: req=1 ttft_p50=7.12s ttft_max=7.12s gen=212 prompt_p50=38k cpt=3.54
+[   180s] done=3 err=0 in_flight=4 open_sessions=4 | last 60s: req=1 ttft_p50=7.00s ttft_max=7.00s gen=424 prompt_p50=39k cpt=3.56
+[   240s] done=11 err=0 in_flight=4 open_sessions=4 | last 60s: req=8 ttft_p50=5.98s ttft_max=156.93s gen=3606 prompt_p50=46k cpt=3.68
+[   300s] done=23 err=0 in_flight=4 open_sessions=4 | last 60s: req=12 ttft_p50=4.50s ttft_max=7.60s gen=3660 prompt_p50=48k cpt=3.71

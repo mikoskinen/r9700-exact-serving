@@ -1,0 +1,36 @@
+2026-11-13 00:55:14 mockrun zfu-m1: farm: FARM {"copied": 7023, "linked": 42712, "dirlinks": 45, "skipped": 2, "seconds": 2.9}
+2026-11-13 00:55:14 mockrun zfu-m1: port 18090, sandbox /tmp/mockrad/zfu-m1, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzb-fuse.sh (sandbox copy), knobs: ZFU_SW=0 ZFU_C8WARM=4 ZFU_BUDGET_MIN=120 ZFU_LDPF=2048 ZFU_C8GN=1 ZFU_U1N=1 NGSHARE_DIR=/tmp/mockrad/zfu-m1/ngdir NGSHARE_RUN=/tmp/mockrad/zfu-m1/ngrun NGSHARE_LOG=/tmp/mockrad/zfu-m1/ngshare.log, faults: none, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-13 00:55:21 mockrun zfu-m1: DRYRUN rc 0, 232 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/zzzfuse
+2026-11-13 00:55:21 mockrun zfu-m1: run (timeout 3000 s)
+2026-11-13 01:01:32 mockrun zfu-m1: body rc 0 after 381 s
+MOCKRUN REPORT zfu-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzb-fuse.sh | body rc 0 | 381 s | knobs: ZFU_SW=0 ZFU_C8WARM=4 ZFU_BUDGET_MIN=120 ZFU_LDPF=2048 ZFU_C8GN=1 ZFU_U1N=1 NGSHARE_DIR=/tmp/mockrad/zfu-m1/ngdir NGSHARE_RUN=/tmp/mockrad/zfu-m1/ngrun NGSHARE_LOG=/tmp/mockrad/zfu-m1/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/zzzfuse | 120 RESULT lines, 410 mock requests | last RESULT: xzfuse 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzb-fuse: done (6 min) -- /tmp/mockrad/zfu-m1/home/gpu/ds41/exl3-test/runs/xdsm/zzzfuse | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x ngshare xzfuse-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (2)
+    2026-11-13 00:55:27 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xzfuse-p0-rfuse-3147538 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfine
+    2026-11-13 00:55:27 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name xzfuse-p0-mixfin-3147538 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfin
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 3 other
+    unknown switch ds41_rfuse (known: draft_adaptive, gg_gemv, aql_acq, ds41_argather, ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, dspark_conf_rows, gg_pf, f32_pf, dspark_walk, d
+    unknown switch ds41_mix_fin (known: draft_adaptive, gg_gemv, aql_acq, ds41_argather, ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, dspark_conf_rows, gg_pf, f32_pf, dspark_walk,
+    unknown switch route_copy_ov (known: draft_adaptive, gg_gemv, aql_acq, ds41_argather, ds41_shexp_lane, ds41_kvfold, ds41_ofold, ds41_onefill, draft_depth0, draft_probe, draft_hybrid, draft_hybrid_match, draft_probe_backoff, draft_lend, draft_lend_borrow, drafter_mx, drafter_bf, idx_split, ds41_qnfold, ds41_swfold, draft_ctxskip, dspark_conf, dspark_alt, dspark_conf_rows, gg_pf, f32_pf, dspark_walk
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42710 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zzzfuse/mock-zfu-m1.out (size 0 -> 836)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzz-fn-pfprof2.sh.out (size 1660 -> 16589)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 17339 -> 17560)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1389733 -> 1400040)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/ngshare/keeper.log (size 4384 -> 4590)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-pfp2.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-pfp2-A2-pf.txt (size 0 -> 152)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/zfu-m1.txt | sandbox: /tmp/mockrad/zfu-m1

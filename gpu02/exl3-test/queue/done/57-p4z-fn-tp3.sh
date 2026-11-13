@@ -1,0 +1,324 @@
+#!/bin/bash
+# 87-fn-tp3.sh (queue item, 8.11.2026 v3, queue-ar; gpu02, 2 / 3 / 4 cards by arm, every radiance container DOWN; ~3 h 45
+# min for all twelve arms: perf 4 x ~23 min + BetterBench on a262 / t4 2 x ~10, p2 ~17, stamp 3 x ~12, acquire 4 x ~14) -- Qwen3.8-Flash-Next (the production iq4r
+# .rad) on three cards with every expert resident, on the production engine (stilldeadcode/radiance:1.15.1, the image the
+# production yamls run through .env), so it compares with production directly; TP4 on the same line; each card count's
+# 1- and 8-stream decode pass split by AQL stamps into all-reduce / attention / experts / linear / other / gaps; and the
+# acquire rule (core, tuned3x) on Flash-Next TP4.
+# WHY. A Reddit report (untrusted): Flash-Next Q4 on 3x R9700, 256k fp8 context, 150-220 tok/s decode, 24k tok/s prefill;
+# 2 -> 3 cards was the big step because the experts then fit in VRAM (n-gram table in RAM). gpu02 production is DP2 (2 cards
+# a server, expert_tiered host pool 16 GiB, prefill ~5k tok/s); the 3.11. TP4 all_vram run gave 11.09 ms/step at 1 user but
+# only ~1.3M tokens of KV, too little for 16 long agents.
+# TP3 ON 1.15.1 (source: v1.15.1 docs/TP3.md, arch/qwen4exp_fp8/qwen4exp_fp8.cpp): supported. Attention runs on an
+# attention world of 2 (the 2 KV heads; rank 2 is attention-zero: no projections, a zeroed output, its KV pool re-sized to
+# the common token count); the delta net splits 16 K / 48 V heads unevenly (6/5/5, 18/15/15, the extra head on rank 2); a
+# routed expert's five 128-column blocks split by whole blocks with the parity rotation (640 is not divisible by 3); the
+# exact all-reduce is the one-shot up to 1 MiB (every decode step) and the uneven two-shot above; --tp-wire wht6 is the
+# tiered-int8 wire over that two-shot from --tp-wire-min-kb (128) up, exact below. No expert parallelism in 1.15.1 for
+# qwen4exp (the plugin splits every expert over all ranks on purpose; whole experts per rank only for calibration / bf16).
+# CARDS. One per IOD root complex (EPYC 7302P, 1 NUMA node): c3:00 (c0), 86:00 (80), 03:00 (00); 83 and 86 share root complex
+# 80 and halve each other's host DMA (3.11. pari-dma: 17.6 GB/s H2D each at once vs 27.9). All links Gen4 x16 (the root
+# ports cap the cards' Gen5). X87_CARDS overrides (three ROCR UUIDs, comma-separated).
+# PERF ARMS (ARMS default "a262 a524 a262p t4 p2 s2 s3 s4 q4o q4r q4o0 q4r0"; perf = fn-tp3.yaml = production's line at --tp 3
+# --placement all_vram, no host pool):
+#   a262   MML 262144 (the trained length, no rope flag), MAXSEQS 16 (X87_SEQS; a start that fails at 16 retries at 8)
+#   a524   MML 524288 --rope-scaling yarn:2 (production's), MAXSEQS 16 (-> 8)
+#   a262p  a262 + MNBT 8192 --prefill-span 2 --checkpoint-interval 4096 (the 3.11. TP4 sweep's prefill line;
+#          for the 24k tok/s prefill claim)
+#   t4     TP4 all_vram on all four cards, MML 524288 yarn:2, the same production line (the 3.11. TP4 run used the exact
+#          wire, MNBT 8192, span 2, MML 262144: it covers the prefill, not this line)
+#   p2     production's TP2 line on c3+03 (expert_tiered, host pool 16384, MML 524288 yarn:2), unstamped: gate, produp pair,
+#          BetterBench only (production's mb numbers exist: stock396)
+# BETTERBENCH (X87_BB_ARMS, default "a262 t4", + p2 always): BetterBench 0.6.1 (GGZ14/BetterBench f72bb9011a83, corpus 1.0,
+# read before use: it talks to --endpoint only; --no-update-check on every run) through tools/bb_run.py from ~/gpu/ext/
+# betterbench + numpy from ~/gpu/ext/bb-deps under python3 -I, after the arm's own phases: --quick (5 passes a category
+# after 1 warm-up, temperature 0.7 -- the Radiance docs' GLM-5.3 table's settings), its prefill sweep (2k/8k/16k/32k/64k, 4
+# runs + 1 warm-up) and concurrency 1/2/4/8/16 (32 requests a level), thinking off as the docs ran it: "reasoning_effort":
+# "none" on every request (Radiance's chat endpoint: none turns thinking off; the item checks no answer carried reasoning
+# text). --out $O/bb-<tag>/results.json (+ .html), --note image/engine/tp/cards/placement/mml/mtp/wire/arm. ~10 min an arm.
+# STAMP ARMS (1.15.1: it records and replays Flash-Next's MTP verify + draft passes, so RADIANCE_AQL_STAMP times them;
+# 1.17 no longer records them -- qwen4exp pass_key 0 for MTP passes -- so the stamps come from 1.15.1): every
+# X87_STAMP_EVERY-th (20) played pass on card 0 into $O/stats-<arm>/stamps.csv; loads: 1 stream (prodfc x2 + stepprobe),
+# then 8 streams (mb c8), each phase its own CLOCK_MONOTONIC window (the stamps' clock: checked on gpu02, 0.4 s apart);
+# tools/stampcat.py splits each pass kind (tape length: the verify pass vs the 1-token draft passes) into the union time of
+# all-reduce (count, median, sum -- the sum above count x median is waiting for the slowest rank), attention, experts,
+# linear, other, and the gaps (wall - busy). Card 0 only.
+#   s2     TP2 c3+03, the production line (expert_tiered, host pool 16384, MML 524288 yarn:2) -- production's own shape
+#   s3     TP3 c3+86+03 all_vram, MML 262144
+#   s4     TP4 all four all_vram, MML 262144
+# ACQUIRE ARMS (tuned3x = 1.17 + core-acq; the rule is core, so it can act on any model's played passes): TP4 all_vram MML
+# 262144, gate / produp pair / probe / c4 / c8, the recorded-pass and acquire-rule lines of the log, warm-up answers rule
+# vs off (must be IDENTICAL). q4r* run only after 86b (57-p6b) logged the rule exact on DeepSeek-V4.1 (X87_ACQ_FORCE=1).
+#   q4o / q4r    MTP 3 (production's): EXPECTED no change -- 1.17 issues the MTP passes live, unrecorded, and the rule only
+#                rewrites played packets (it shows what the rule reaches today)
+#   q4o0 / q4r0  NST 0: every decode pass recorded, so the rule's reach on Flash-Next's decode (what a recorded-verify patch
+#                would give it)
+# PER ARM: restart (health <= 20 min, start log: the kv / placement / TP3 geometry / rank 2 re-split lines logged); gate =
+# warm-up (correct --only-q + one 16k prefill) + prodfc.py 1-user decode, 21 ms limit, one restart on a slow check (the qgate
+# method); then prodfc.py twice more (the produp method's pair: production's 14.8-15.22 ms gates are its second run);
+# probe (essay, code, 512 tok); mb c4, c8, c16 (c16 only at MAXSEQS 16), pf (31k beside 4 decoders), turns (cold 57k +
+# hits); one cold 128k prefill (ds41_tests prefill --depths 131072, fresh); engine log; down. Warm-up answers vs the 1.15.1
+# TP2 wht6 set for information (another world: the sums' order differs). Then a524 / a262p / t4 against a262.
+# REFERENCES (no reruns; gpu02 ~/gpu/ds41/runs/qwen-tp4-1103.log = QL):
+#   1 user, qgate method (this item's gate): stock 1.15.1 TP2 83+86 17.71-17.82 ms (fXYB24-A, QL:411,544,586), c3+03
+#     16.60-16.74; produp method (prodfc twice, the second kept): prod A 19.54/19.59 -> 15.11/14.80 ms, gates 14.8-15.22
+#   stock396 (5.11., c3+03, exact, MML 262144, HP 16384, MAXSEQS 16): c4 381.7 tok/s 25.6 ms, c8 523.6 34.8 ms, pf 4923.7
+#     tok/s TTFT 6.52 s kept 0.164, turns cold 9.24 s hit 0.71 s
+#   FN-A stock (7.11., tuned3 image, TP2 83+86, the production line): guard 17.83, c4 337.2, c8 447.6, c16 558.6, pf 3575
+#     tok/s, turns cold 11.49 s (83+86 vs c3+03 on stock 1.15.1: guard +7.1 %, 16k prefill -24.7 %)
+#   TP4 all_vram sweep b-s16 (3.11., exact, MNBT 8192, span 2, MML 262144; QL:30-35): 1-user 11.09 ms, probe essay 10.99 /
+#     code 11.13 ms, c16 861.7 tok/s 41.9 ms, pf 7049.6 tok/s beside 4 decoders, turns cold 7.2 s, warm-up 16k prefill 7883
+#     tok/s; KV 10.88 GiB a rank = 45 % of 16 x 200000 (7.2 full sessions)
+# EXPECTED (from the TP4 split: experts 14.83 GiB a rank at TP4 -> ~19.8 at TP3, static ~3-3.5): ~6 GiB of KV a rank,
+# ~0.8M tokens (16 x 262144: ~20 % backed, ~3 full sessions; 16 x 524288: ~10 %, ~1.6). If all_vram does not fit at all
+# the start says so (VIRHE, start log kept); the closest then is TP3 expert_tiered with a small host pool (PLACE / EXTRA).
+# Bounded: compose up/down of this item's own project (radiance-fntest3), health wait capped, every client under timeout,
+# curl -m, the engine log kept on a failed / slow start. Never touches radiance-prod-* or /dev/shm/ngram-*.
+# DRYRUN=1 bash 87-fn-tp3.sh : prints every command, runs and writes nothing.
+set -u
+DRY=${DRYRUN:-0}
+H=$(cd "$(dirname "$0")" && pwd)
+C=$HOME/radiance-1.15.1/compose; R=$HOME/gpu/ds41/exl3-test/runs; O=$R/fn3; L=$R/ds41-exl3.log; D=$HOME/gpu/ds41; Q=$HOME/gpu/ds41/runs/q
+for Y in "$H/fn-tp3.yaml" "$H/../fn-tp3.yaml" "$HOME/gpu/ds41/exl3-test/queue-ar/fn-tp3.yaml"; do [ -e "$Y" ] && break; done
+CN=radiance-fntest3; URL=http://127.0.0.1:8090; export DS41_URL=$URL
+FN15=${FN_IMAGE:-stilldeadcode/radiance:1.15.1}; export FNIMAGE=$FN15
+T3X=${X87_T3X:-radiance-local:ds41-exl3-117-67c9cc3d-fa0e9580-tuned3x-h4c9e6c27}
+export FNMODELDIR=$HOME/models/flashnext-iq4r FNMODEL=qwen3.8-next-flash-fp8-iq4r-moe.rad
+C3=GPU-dbba5c851cfef7b3; C83=GPU-4d61f52cafe37588; C86=GPU-5943fea82aeead65; C03=GPU-27d4920317825fce
+CARDS3=${X87_CARDS:-$C3,$C86,$C03}; CARDS4=$C3,$C83,$C86,$C03; CARDS2=$C3,$C03
+BBROOT=${BB_ROOT:-$HOME/gpu/ext/betterbench}; BBDEPS=${BB_DEPS:-$HOME/gpu/ext/bb-deps}
+BBRUN=; for f in "$H/tools/bb_run.py" "$H/../tools/bb_run.py" "$HOME/gpu/ds41/exl3-test/queue-ar/tools/bb_run.py"; do [ -e "$f" ] && { BBRUN=$f; break; }; done
+SC=; for f in "$H/tools/stampcat.py" "$H/../tools/stampcat.py" "$HOME/gpu/ds41/exl3-test/queue-ar/tools/stampcat.py"; do [ -e "$f" ] && { SC=$f; break; }; done
+ARMS=${ARMS:-"a262 a524 a262p t4 p2 s2 s3 s4"}   # 57-p4z v3 (8.11. coordinator): perf + BetterBench + stamps; q arms = 57-p6c
+LIM=${FN_GATE_MS:-21}
+WREF=$Q/guard/dp2w6-A-warm-q1.txt
+log() { if [ "$DRY" = 1 ]; then echo "[dry, not logged] $(date '+%F %T') $*"; else echo "$(date '+%F %T') $*" | tee -a $L; fi; }
+run() { if [ "$DRY" = 1 ]; then echo "+ $*"; else eval "$@"; fi; }
+compose() { docker compose --project-directory $C -f $Y "$@"; }
+down() { run "compose down > /dev/null 2>&1; docker rm -f $CN > /dev/null 2>&1"; }
+keeplog() { [ "$DRY" = 1 ] && { echo "+ docker logs $CN > $O/engine-$1.log"; return 0; }; docker logs $CN > $O/engine-$1.log 2>&1 || true; }
+restart() {   # restart TAG
+  local tag=$1 ok=0 t0 t1 i S=$O/start-$1.log
+  [ "$DRY" = 1 ] && { echo "+ FNIMAGE=$FNIMAGE TP=$TP CARDS=$CARDS PLACE=$PLACE MML=$MML ROPE='$ROPE' MAXSEQS=$MAXSEQS MNBT=$MNBT EXTRA='${EXTRA:-}' compose -f $Y up -d; health <= 1200 s; docker logs > $S"; return 0; }
+  down; t0=$(date +%s)
+  compose up -d > $O/up-$tag.txt 2>&1
+  for i in $(seq 1 240); do
+    [ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' $URL/health)" = 200 ] && { ok=1; break; }
+    [ "$(docker inspect -f '{{.State.Status}}' $CN 2>/dev/null)" != running ] && break
+    sleep 5
+  done
+  t1=$(date +%s); docker logs $CN > $S 2>&1
+  [ $ok = 1 ] || { log "RESULT fn3 restart-$tag: VIRHE not healthy after $((t1-t0)) s: $(grep -E '^E ' $S | head -3 | tr '\n' ' ' | cut -c1-500)"; down; return 1; }
+  log "RESULT fn3 restart-$tag: healthy in $((t1-t0)) s (IMAGE=$FNIMAGE TP=$TP cards $CARDS PLACE=$PLACE MML=$MML ${ROPE:-no rope flag} MAXSEQS=$MAXSEQS MNBT=$MNBT); $(grep -m1 -E '^I kv: ' $S | cut -c3-200); VRAM experts $(grep -m1 -E '^ +experts +[0-9.]+ GiB' $S | awk '{print $2, $3, $4, $5}'), KV $(grep -m1 -E '^ +kv cache +[0-9.]+ GiB' $S | awk '{print $3, $4}'); $(grep -m1 -oE 'pinned by this process [0-9.]* GiB' $S); E lines $(grep -cE '^E ' $S)"
+}
+check() {   # check TAG N -> ms/step of prodfc.py (999 when it fails)
+  local tag=$1 n=$2
+  [ "$DRY" = 1 ] && { echo "+ warm-up (correct --only-q, prefill 16384) + prodfc.py $URL 384 -> $O/guard/$tag-fc$n.txt" >&2; echo 0; return; }
+  mkdir -p $O/guard
+  (cd $D && timeout 600 python3 ds41_tests.py correct --only-q --effort none --outdir $O/guard > $O/guard/$tag-warm-q.txt 2>&1)
+  (cd $D && timeout 600 python3 ds41_tests.py prefill --depths 16384 --cpt 3.6 --calibrate 0 > $O/guard/$tag-warm-pf.txt 2>&1)
+  timeout 300 python3 $Q/prodfc.py $URL 384 > $O/guard/$tag-fc$n.txt 2>&1
+  grep '^FC ' $O/guard/$tag-fc$n.txt | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()[3:])["ms_per_step"])' 2>/dev/null || echo 999
+}
+gate() {   # gate TAG: 0 fast / 1 not healthy / 2 slow twice
+  local tag=$1 ms ms1 st=fast
+  restart $tag || return 1
+  ms=$(check $tag 1)
+  [ "$DRY" = 1 ] && return 0
+  if awk -v m=$ms -v g=$LIM 'BEGIN{exit !(m > g)}'; then
+    keeplog $tag-try1; ms1=$ms
+    restart $tag || return 1; ms=$(check $tag 2); st="fast-after-retry (first $ms1)"
+    awk -v m=$ms -v g=$LIM 'BEGIN{exit !(m > g)}' && { st="SLOW-after-retry (first $ms1)"; keeplog $tag-try2; }
+  fi
+  echo "$st $ms" > $O/guard-$tag.txt
+  log "RESULT fn3 guard $tag: $st, 1-user ${ms} ms/step (limit $LIM; qgate method: correct --only-q + 16k prefill + one fastcheck; same method stock 1.15.1 TP2 83+86 17.71-17.82, c3+03 16.60-16.74; produp-method prod gates 14.8-15.22 are not comparable)"
+  case $st in SLOW*) return 2 ;; esac
+}
+probe() { run "(cd $D && timeout 900 python3 stepprobe.py essay,code 512 > $O/$1-probe.txt 2>&1)"
+  [ "$DRY" = 1 ] || log "RESULT fn3 $1 probe (1 user, greedy, thinking off, 512 tok): $(python3 $D/sweepfmt.py probe $O/$1-probe.txt 2>&1 | cut -c1-300)"; }
+mbp() { run "(cd $D && timeout 1200 python3 mb.py --tag fn3-$1 --phases $2 > $O/$1-$2.txt 2>&1)"
+  [ "$DRY" = 1 ] || log "RESULT fn3 $1 mb $2: $(grep '^MB ' $O/$1-$2.txt 2>/dev/null | cut -c4- | cut -c1-600 || tail -1 $O/$1-$2.txt)"; }
+copyt() { run "(cd $D && timeout 1200 python3 ds41_tests.py copy --prefix-chars 120000 --chars 2400 --max-tokens 900 --runs 1 --offset $2 --tag=-$1 --outdir $O > $O/$1-copy.txt 2>&1)"
+  [ "$DRY" = 1 ] || log "RESULT fn3 $1 copy after a cold prompt: $(grep '^J ' $O/$1-copy.txt | head -1 | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()[2:]); u=d.get("usage") or {}; print("prompt %s tok, cached %s, TTFT %s s, exact %s" % (u.get("prompt_tokens"), d.get("cached"), d.get("ttft"), d.get("exact")))' 2>&1 | cut -c1-200)"; }
+warmcmp() {   # warmcmp FILE_A FILE_B LABEL
+  [ "$DRY" = 1 ] && { echo "+ warm-up answers $1 vs $2"; return 0; }
+  [ -s $1 ] && [ -s $2 ] || { log "RESULT fn3 warm-up $3: not compared (missing $1 or $2)"; return 0; }
+  log "RESULT fn3 warm-up $3: $(python3 -c 'import json,sys
+def rd(f):
+    try: return {d.get("test"): d for d in (json.loads(l[2:]) for l in open(f) if l.startswith("J "))}
+    except OSError: return {}
+a, b = rd(sys.argv[1]), rd(sys.argv[2])
+bad = [t for t in b if t in a and ((a[t].get("content") or "") != (b[t].get("content") or "") or a[t].get("finish") != b[t].get("finish"))]
+n = len([t for t in b if t in a])
+print(("IDENTICAL: %d answers" % n) if n and not bad else ("DIFFERENT: " + ", ".join(bad) if n else "no common answers"))' $1 $2 2>&1 | cut -c1-300)"
+}
+cmparm() {   # cmparm A B: arm B against arm A
+  [ "$DRY" = 1 ] && { echo "+ RESULT fn3 $2 vs $1"; return 0; }
+  log "RESULT fn3 $2 vs $1: $(python3 - $O fn3-$1 fn3-$2 <<'PY' 2>&1 | cut -c1-1500
+import json, re, sys
+O, a, b = sys.argv[1:4]
+def mb(tag, p):
+    try:
+        for l in open(f"{O}/{tag}-{p}.txt"):
+            if l.startswith("MB "): return json.loads(l[3:])
+    except OSError: pass
+    return {}
+def gd(tag):
+    try: return float(open(f"{O}/guard-{tag}.txt").read().split()[-1])
+    except Exception: return None
+def pr(tag):
+    try: t = open(f"{O}/{tag}-probe.txt").read()
+    except OSError: return {}
+    out = {}
+    for name in ("essay", "code"):
+        m = re.search(name + r".*?([\d.]+) ms/step", t)
+        if m: out[name] = float(m.group(1))
+    return out
+pa, pb = pr(a), pr(b)
+rows = [("guard ms", gd(a), gd(b)), ("essay ms", pa.get("essay"), pb.get("essay")), ("code ms", pa.get("code"), pb.get("code"))]
+for c in ("c4", "c8", "c16"):
+    rows += [(f"{c} tok/s", mb(a, c).get("agg_dec_tps"), mb(b, c).get("agg_dec_tps")), (f"{c} ms", mb(a, c).get("ms_decode_step"), mb(b, c).get("ms_decode_step"))]
+rows += [("pf tok/s", mb(a, "pf").get("prefill_tps"), mb(b, "pf").get("prefill_tps")), ("pf TTFT", mb(a, "pf").get("prefill_ttft"), mb(b, "pf").get("prefill_ttft")),
+         ("pf kept", mb(a, "pf").get("decode_kept"), mb(b, "pf").get("decode_kept")),
+         ("turns cold s", mb(a, "turns").get("cold_ttft"), mb(b, "turns").get("cold_ttft")), ("turns hit s", mb(a, "turns").get("ttft_hit_mean"), mb(b, "turns").get("ttft_hit_mean"))]
+out = []
+for n, x, y in rows:
+    out.append(f"{n} {x} -> {y} ({(y / x - 1) * 100:+.1f} %)" if x and y else f"{n} {x} -> {y}")
+print("; ".join(out))
+PY
+)"
+}
+cold128() {   # cold128 TAG: one fresh 128k prefill (nonce first)
+  run "(cd $D && timeout 1200 python3 ds41_tests.py prefill --depths 131072 --cpt 3.6 --calibrate 0 --reps 1 > $O/$1-cold128.txt 2>&1)"
+  [ "$DRY" = 1 ] || log "RESULT fn3 $1 cold 128k prefill: $(python3 -c 'import json,sys; print("; ".join("%s tok %s tok/s TTFT %s s" % (d.get("prompt_tokens"), d.get("prefill_tps"), d.get("ttft")) for d in (json.loads(l[2:]) for l in open(sys.argv[1]) if l.startswith("J "))))' $O/$1-cold128.txt 2>&1 | cut -c1-300)"
+}
+pupair() {   # pupair TAG: prodfc.py twice back to back (the produp method's pair; production's gates are its second run)
+  run "timeout 300 python3 $Q/prodfc.py $URL 384 > $O/guard/$1-pu1.txt 2>&1; timeout 300 python3 $Q/prodfc.py $URL 384 > $O/guard/$1-pu2.txt 2>&1"
+  [ "$DRY" = 1 ] || log "RESULT fn3 $1 produp-method pair: $(for n in 1 2; do grep '^FC ' $O/guard/$1-pu$n.txt | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()[3:]); print(d.get("ms_per_step"), end=" ")' 2>/dev/null || echo -n "n/a "; done)ms/step (prod A: 19.54 / 19.59 -> 15.11 / 14.80; gates 14.8-15.22)"
+}
+geom() {   # geom TAG: the start log's TP3 geometry, KV and placement lines
+  [ "$DRY" = 1 ] && { echo "+ RESULT fn3 $1 geometry / kv / placement lines from $O/start-$1.log"; return 0; }
+  local S=$O/start-$1.log
+  log "RESULT fn3 $1 kv/placement: $(grep -m1 -E '^I kv: the pool' $S | cut -c3-240) | $(grep -m1 -E '^ +kv cache +[0-9.]+ GiB' $S | tr -s ' ' | cut -c1-200) | $(grep -m1 -E '^ +experts +[0-9.]+ GiB' $S | tr -s ' ' | cut -c1-160) | $(grep -m1 -E '^ +static weights' $S | tr -s ' ' | cut -c1-120) | $(grep -m1 -E '^I placement: n-gram' $S | cut -c3-160)"
+  log "RESULT fn3 $1 TP geometry: $(grep -m1 -oE 'world_size = [0-9]+ over n_head_kv = [0-9]+: .*' $S | cut -c1-200) | $(grep -m1 -oE "kv: rank [0-9]+'s cache costs.*" $S | cut -c1-300) | $(grep -m3 -oE 'rank [0-9] takes delta-net K heads.*' $S | tr '\n' ';' | cut -c1-300) | $(grep -m1 -oE 'tp wire: .*' $S | cut -c1-200)"
+}
+now() { python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))'; }   # the stamps' clock
+bbph() {   # bbph TAG NOTE...: BetterBench --quick + its prefill sweep + concurrency 1/2/4/8/16, thinking off (tools/bb_run.py)
+  local tag=$1 nt="" n; shift
+  for n in "$@"; do nt="$nt --note $n"; done
+  run "(BETTERBENCH_HOME=$O/bbhome timeout 1800 python3 -I $BBRUN --bb-root $BBROOT --deps $BBDEPS -- run --endpoint $URL/v1 --model qwen3.8-flash-next --quick --config $O/bb-config.json --name $tag --out $O/bb-$tag/results.json$nt > $O/$tag-bb.txt 2>&1)"
+  [ "$DRY" = 1 ] && return 0
+  log "RESULT fn3 $tag BetterBench: $(python3 -I $BBRUN --summary $O/bb-$tag/results.json 2>&1 | cut -c1-1400)"
+  python3 -I $BBRUN --check $O/bb-$tag/results.json > /dev/null 2>&1 || log "RESULT fn3 $tag BetterBench: VIRHE single-stream answers carried reasoning text -- thinking was not off ($O/bb-$tag/results.json)"
+}
+stampcat() {   # stampcat TAG LOAD FROM TO: the stamped passes of one load phase, split by class
+  [ "$DRY" = 1 ] && { echo "+ python3 $SC $STATSDIR/stamps.csv $1-$2 --from $3 --to $4 --json $O/$1-$2-stamps.json > $O/$1-$2-stamps.txt"; return 0; }
+  python3 $SC $STATSDIR/stamps.csv $1-$2 --from $3 --to $4 --json $O/$1-$2-stamps.json > $O/$1-$2-stamps.txt 2>&1
+  log "RESULT fn3 $1 stamps $2 (card 0, image $FNIMAGE): $(grep -E 'window|kind records' $O/$1-$2-stamps.txt | head -4 | tr '\n' '|' | cut -c1-1400)"
+}
+cardnames() { case $CARDS in $CARDS2) echo c3+03 ;; $CARDS3) echo c3+86+03 ;; $CARDS4) echo c3+83+86+03 ;; *) echo custom ;; esac; }
+acqok() {   # acqok: 86b (57-p6b) passed the acquire rule's exactness on DeepSeek-V4.1 (copy, deep, greedy c1/c4 vs t3x0, no VIRHE)
+  [ "${X87_ACQ_FORCE:-0}" = 1 ] && return 0
+  [ "$DRY" = 1 ] && { echo "+ grep $L: 'RESULT x79 225x t3qr vs t3x0 greedy: c1 IDENTICAL' and no t3qr VIRHE line" >&2; return 0; }
+  grep -q 'RESULT x79 225x t3qr vs t3x0 greedy: c1 IDENTICAL' $L || return 1
+  grep -E 'x79-225x-t3qr|225x t3qr' $L | grep -q VIRHE && return 1
+  return 0
+}
+arm() {   # arm NAME
+  local a=$1 tag=fn3-$1 rc t0 t1 t2 t3
+  export FNIMAGE=$FN15 TP=3 CARDS=$CARDS3 PLACE=all_vram MML=262144 ROPE="" MAXSEQS=${X87_SEQS:-16} MNBT=2048 EXTRA="" NST=3 AQLSTAMP="" STATSDIR=/tmp
+  unset RADIANCE_AQL_ACQ
+  case $a in
+    a262)  ;;
+    a524)  export MML=524288 ROPE="--rope-scaling yarn:2" ;;
+    a262p) export MNBT=8192 EXTRA="--prefill-span 2 --checkpoint-interval 4096" ;;
+    t4)    export TP=4 CARDS=$CARDS4 MML=524288 ROPE="--rope-scaling yarn:2" ;;
+    s2|p2) export TP=2 CARDS=$CARDS2 PLACE=expert_tiered EXTRA="--host-pool-mib 16384" MML=524288 ROPE="--rope-scaling yarn:2" ;;
+    s3)    ;;
+    s4)    export TP=4 CARDS=$CARDS4 ;;
+    q4o|q4r|q4o0|q4r0)
+           export FNIMAGE=$T3X TP=4 CARDS=$CARDS4
+           case $a in q4o0|q4r0) export NST=0 ;; esac
+           case $a in q4r|q4r0)
+             acqok || { log "RESULT fn3 $tag: skipped -- 86b (57-p6b) has not shown the acquire rule exact on DeepSeek-V4.1 (no 'c1 IDENTICAL' for t3qr, or a t3qr VIRHE line); X87_ACQ_FORCE=1 overrides"; return 1; }
+             export RADIANCE_AQL_ACQ=rule ;;
+           esac ;;
+    *)     log "RESULT fn3: VIRHE unknown arm '$a'"; return 1 ;;
+  esac
+  case $a in s*) export AQLSTAMP=${X87_STAMP_EVERY:-20} STATSDIR=$O/stats-$a; run "rm -rf $STATSDIR; mkdir -p $STATSDIR" ;; esac
+  log "RESULT fn3 $tag: start IMAGE=$FNIMAGE TP=$TP cards $CARDS PLACE=$PLACE MML=$MML ${ROPE:-} MAXSEQS=$MAXSEQS MNBT=$MNBT NST=$NST ${EXTRA:-}${AQLSTAMP:+ AQL_STAMP=$AQLSTAMP}${RADIANCE_AQL_ACQ:+ AQL_ACQ=$RADIANCE_AQL_ACQ}"
+  gate $tag; rc=$?
+  if [ $rc = 1 ] && [ "$MAXSEQS" -gt 8 ]; then
+    keeplog $tag-fail16
+    log "RESULT fn3 $tag: MAXSEQS $MAXSEQS did not start ($(grep -E '^E ' $O/start-$tag.log 2>/dev/null | head -2 | tr '\n' ' ' | cut -c1-300)) -> MAXSEQS 8"
+    export MAXSEQS=8; gate $tag; rc=$?
+  fi
+  [ $rc = 1 ] && { keeplog $tag-fail; log "RESULT fn3 $tag: VIRHE not healthy -- $O/start-$tag.log, $O/engine-$tag-fail.log: $(grep -E '^E ' $O/start-$tag.log 2>/dev/null | head -3 | tr '\n' ' ' | cut -c1-500)"; down; return 1; }
+  [ $rc = 2 ] && { log "RESULT fn3 $tag: VIRHE slow state after one restart -> arm skipped (engine logs $O/engine-$tag-try1.log / -try2.log)"; down; return 1; }
+  geom $tag
+  case $a in
+  s*)   # the stamp arms: 1 stream (prodfc x2 + probe), then 8 streams (mb c8), each its own window of the stamps file
+    t0=$(now); pupair $tag; probe $tag; t1=$(now)
+    t2=$(now); mbp $tag c8; t3=$(now)
+    run "docker logs $CN > $O/$tag-engine.log 2>&1"
+    down   # exit writes the stamps still pending
+    stampcat $tag 1u $t0 $t1; stampcat $tag 8u $t2 $t3
+    [ "$DRY" = 1 ] || log "RESULT fn3 $tag recorded passes: $(grep -oE 'recorded pass: draft pass [0-9]+ at [0-9]+ token\(s\) -- [0-9]+ records' $O/$tag-engine.log | sort | uniq -c | sort -rn | head -6 | tr -s ' ' | tr '\n' ';' | cut -c1-500)" ;;
+  p2)   # production's TP2 line on c3+03, unstamped: the produp pair and BetterBench only (its mb numbers exist: stock396)
+    pupair $tag
+    bbph $tag image=$FNIMAGE engine=1.15.1-stock tp=2 cards=c3+03 placement=expert_tiered hp=16384 mml=524288-yarn2 mtp=3 wire=wht6 arm=p2
+    run "docker logs $CN > $O/$tag-engine.log 2>&1"
+    down ;;
+  q*)   # the acquire-rule pairs on tuned3x (1.17): which passes are recorded (the rule acts on played passes only), 1 user, c4, c8
+    pupair $tag; probe $tag
+    for p in c4 c8; do [ -e $R/sweep.stop ] && break; mbp $tag $p; done
+    run "docker logs $CN > $O/$tag-engine.log 2>&1"
+    [ "$DRY" = 1 ] || log "RESULT fn3 $tag passes: recorded $(grep -oE 'recorded pass: draft pass [0-9]+ at [0-9]+ token' $O/$tag-engine.log | sort | uniq -c | tr -s ' ' | tr '\n' ';' | cut -c1-300) | acquire rule $(grep -oE 'the acquire rule plays [0-9]+ of the [0-9]+ dispatches \([0-9]+ of them ordered\)' $O/$tag-engine.log | sort | uniq -c | sort -rn | head -4 | tr -s ' ' | tr '\n' ';' | cut -c1-400)"
+    down ;;
+  *)
+    pupair $tag
+    probe $tag
+    for p in c4 c8 c16 pf turns; do
+      [ -e $R/sweep.stop ] && break
+      [ $p = c16 ] && [ "$MAXSEQS" -lt 16 ] && { log "RESULT fn3 $tag: c16 skipped (MAXSEQS $MAXSEQS)"; continue; }
+      mbp $tag $p
+    done
+    [ -e $R/sweep.stop ] || cold128 $tag
+    case " ${X87_BB_ARMS:-a262 t4} " in *" $a "*) [ -e $R/sweep.stop ] || bbph $tag image=$FNIMAGE engine=1.15.1-stock tp=$TP cards=$(cardnames) placement=$PLACE mml=$MML${ROPE:+-yarn2} mtp=$NST wire=wht6 arm=$a ;; esac
+    run "docker logs $CN > $O/$tag-engine.log 2>&1"
+    down ;;
+  esac
+  log "RESULT fn3 $tag: done"
+}
+log "RESULT fn3 87-fn-tp3: start ARMS [$ARMS] IMAGE=$FNIMAGE ($(docker image inspect -f '{{.Id}}' $FNIMAGE 2>/dev/null | cut -c8-19)), q arms $T3X ($(docker image inspect -f '{{.Id}}' $T3X 2>/dev/null | cut -c8-19)) model $FNMODELDIR/$FNMODEL compose $Y cards3 $CARDS3"
+if [ "$DRY" != 1 ]; then
+  [ -e "$Y" ] || { log "RESULT fn3: VIRHE fn-tp3.yaml not found"; exit 1; }
+  docker ps --format '{{.Names}}' | grep -qiE '^radiance' && { log "RESULT fn3: VIRHE a radiance container is running ($(docker ps --format '{{.Names}}' | grep -iE '^radiance' | tr '\n' ' ')) -- the cards are not free"; exit 1; }
+  docker image inspect $FNIMAGE > /dev/null 2>&1 || { log "RESULT fn3: VIRHE image $FNIMAGE missing"; exit 1; }
+  [ -f $FNMODELDIR/$FNMODEL ] || { log "RESULT fn3: VIRHE $FNMODELDIR/$FNMODEL missing"; exit 1; }
+  ls $FNMODELDIR/$FNMODEL.sha*ok > /dev/null 2>&1 || { log "RESULT fn3: VIRHE $FNMODELDIR/$FNMODEL has no .shaok / .sha256ok (copy not verified)"; exit 1; }
+  [ -e $Q/prodfc.py ] || { log "RESULT fn3: VIRHE $Q/prodfc.py missing"; exit 1; }
+  case " $ARMS " in *" s"*) [ -e "$SC" ] || { log "RESULT fn3: VIRHE tools/stampcat.py missing ($SC)"; exit 1; } ;; esac
+  if [ -n "$(for x in $ARMS; do case " ${X87_BB_ARMS:-a262 t4} p2 " in *" $x "*) echo y ;; esac; done)" ]; then
+    [ -e "$BBRUN" ] && [ -d "$BBROOT/betterbench" ] && [ -d "$BBDEPS/numpy" ] || { log "RESULT fn3: VIRHE BetterBench not ready (bb_run.py '$BBRUN', $BBROOT/betterbench, $BBDEPS/numpy)"; exit 1; }
+    mkdir -p $O; printf '%s\n' '{"concurrency_levels": [1, 2, 4, 8, 16], "concurrency_requests": 32, "prefill_runs": 4, "prefill_warmup": 1}' > $O/bb-config.json
+    log "RESULT fn3: BetterBench $(git -C $BBROOT rev-parse --short=12 HEAD 2>/dev/null || cat $BBROOT/COMMIT 2>/dev/null) ($(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import betterbench as b; print(b.__version__, "corpus", b.CORPUS_VERSION)' $BBROOT 2>&1)), config $(cat $O/bb-config.json), thinking off (reasoning_effort none per request), --quick, temperature 0.7"
+  fi
+  case " $ARMS " in *" q"*) docker image inspect $T3X > /dev/null 2>&1 || { log "RESULT fn3: VIRHE image $T3X missing (the acquire-rule arms)"; exit 1; } ;; esac
+  for u in ${CARDS3//,/ } ${CARDS4//,/ }; do grep -qi "${u#GPU-}" /sys/class/drm/card*/device/unique_id 2>/dev/null || { log "RESULT fn3: VIRHE card $u not found on this host"; exit 1; }; done
+  mkdir -p $O $O/guard
+else
+  echo "+ mkdir -p $O $O/guard"
+fi
+done_arms=""; first=""
+for a in $ARMS; do
+  [ -e $R/sweep.stop ] && break
+  arm $a && { done_arms="$done_arms $a"; [ -z "$first" ] && first=$a; }
+  case $a in a524|a262p|t4) rf=a262 ;; q4r) rf=q4o ;; q4r0) rf=q4o0 ;; *) rf="" ;; esac
+  if [ -n "$rf" ] && [[ " $done_arms " == *" $a "* ]] && [[ " $done_arms " == *" $rf "* ]]; then cmparm $rf $a; fi
+  case $a in q4r|q4r0) [[ " $done_arms " == *" $a "* ]] && [[ " $done_arms " == *" $rf "* ]] && \
+      warmcmp $O/guard/fn3-$rf-warm-q.txt $O/guard/fn3-$a-warm-q.txt "$a vs $rf (the acquire rule must leave every answer IDENTICAL)" ;; esac
+  case $a in a*|t4) [[ " $done_arms " == *" $a "* ]] && warmcmp $WREF $O/guard/fn3-$a-warm-q.txt "$a vs 1.15.1 TP2 wht6 (q/guard/dp2w6-A-warm-q1.txt; another world: information only)" ;; esac
+done
+down
+log "RESULT fn3 87-fn-tp3: done --$done_arms | refs: qgate stock 1.15.1 TP2 83+86 17.71-17.82 ms, c3+03 16.60-16.74; produp prod A 15.11/14.80 (gates 14.8-15.22); stock396 (TP2 c3+03 exact MML 262144) c4 381.7 tok/s 25.6 ms, c8 523.6 34.8 ms, pf 4923.7 tok/s, turns cold 9.24 s; FN-A stock (tuned3, TP2 83+86) guard 17.83, c4 337.2, c8 447.6, c16 558.6, pf 3575, turns cold 11.49 s; TP4 all_vram b-s16 (3.11., exact, MNBT 8192) 11.09 ms, c16 861.7 tok/s, pf 7049.6 tok/s, turns cold 7.2 s, KV 10.88 GiB a rank"

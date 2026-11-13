@@ -1,0 +1,29 @@
+MOCKRUN REPORT ync-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yync.sh | body rc 0 | 265 s | knobs: YNC_SW=0 YNC_C8WIN=8 YNC_C8WARM=4 YNC_C8ORDER=BAGNB YNC_CDEPTHS=6000 YNC_A11ID=1100 YNC_LDPF=2048 YNC_C16ORDER=BX YNC_BUDGET_MIN=80 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/ync/x1 | 95 RESULT lines, 526 mock requests | last RESULT: ync summary: raw snapshots -> raw-snaps.tar.gz (1 MB); /tmp/mockrad/ync-m1/home/gpu/ds41/exl3-test/runs/xdsm/ync/x1 2 MB; 253975 MB free on /
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (2)
+    2026-11-12 19:44:32 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ync-p0-check-1904650 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -
+    2026-11-12 19:44:32 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ync-p0-perf-1904650 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41582 linked real files, 10 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/ync/mock-ync-m1.out (size 0 -> 766)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/mock-ychn-m1.txt (size 648 -> 2414)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/FILES-MD5SUMS (size 235 -> 375)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 857791 -> 865541)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yswl.sh.out (size 16971 -> 25077)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/mb.jsonl (size 0 -> 892)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/blocks.jsonl (size 0 -> 11136)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/identity.txt (size 39 -> 83)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/sets.jsonl (size 0 -> 352)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/yswl/xswl-ldB.txt (size 0 -> 3258)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

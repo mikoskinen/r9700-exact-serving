@@ -1,0 +1,24 @@
+MOCKRUN REPORT ydm-m4
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-yd2m.sh | body rc 0 | 121 s | knobs: YDM_SW=0 YDM_C8WIN=8 YDM_C8WARM=4 YDM_NREADS=1 YDM_C8ORDER=BCP YDM_PDEPTHS=6000 YDM_LDPF=2048 YDM_U1ORDER=CB YDM_C16ORDER=BC YDM_BUDGET_MIN=60 YDM_MOCK_GATE=1 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/yd2m/x1 | 59 RESULT lines, 223 mock requests | last RESULT: ydm summary: raw snapshots -> raw-snaps.tar.gz (1 MB); /tmp/mockrad/ydm-m4/home/gpu/ds41/exl3-test/runs/xdsm/yd2m/x1 1 MB; 254450 MB free on /
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (3)
+    2026-11-12 19:05:52 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ydm-p0-perf-1732774 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --
+    2026-11-12 19:05:52 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ydm-p0-check-1732774 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -
+    2026-11-12 19:05:52 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ydm-p0pf-1732774 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e RO
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41441 linked real files, 4 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yd2m/mock-ydm-m4.out (size 0 -> 794)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yll/mock-yll-m2.txt (size 733 -> 3216)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzz-fn-bi7.sh.out (size 301 -> 835)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 792329 -> 795941)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE

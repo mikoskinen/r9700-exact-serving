@@ -1,0 +1,45 @@
+warm-up-lg-trace IDENTICAL: 3 answers
+lg-trace deep-l-s0-vs-a-s0 DIFFERENT at char 65 (1877 vs 1856 chars)
+lg-trace deep-chunks-s0 DIFFERENT BOUNDARIES: 34 vs 85 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 84
+lg-trace deep-a-s0-vs-dsm225 IDENTICAL (1877 chars)
+warm-up-lg-multi IDENTICAL: 3 answers
+lg-multi copy-l-s0-vs-a-s0 IDENTICAL (2399 chars)
+lg-multi copy-chunks-s0 DIFFERENT BOUNDARIES: 8 vs 14 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 14
+lg-multi deep-l-s0-vs-a-s0 DIFFERENT at char 60 (1877 vs 1842 chars)
+lg-multi deep-chunks-s0 DIFFERENT BOUNDARIES: 34 vs 88 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 87
+lg-multi copy-a-s0-vs-d0 IDENTICAL (2399 chars)
+lg-multi deep-a-s0-vs-dsm225 IDENTICAL (1877 chars)
+lg-multi copy-l-s1-vs-a-s1 IDENTICAL (2399 chars)
+lg-multi copy-chunks-s1 SAME BOUNDARIES (8 chunks)
+lg-multi deep-l-s1-vs-a-s1 IDENTICAL (1877 chars)
+lg-multi deep-chunks-s1 SAME BOUNDARIES (34 chunks)
+lg-multi copy-a-s1-vs-d0 IDENTICAL (2399 chars)
+lg-multi deep-a-s1-vs-dsm225 IDENTICAL (1877 chars)
+lg-multi copy-l-s2-vs-a-s2 IDENTICAL (2399 chars)
+lg-multi copy-chunks-s2 SAME BOUNDARIES (14 chunks)
+lg-multi deep-l-s2-vs-a-s2 IDENTICAL (1877 chars)
+lg-multi deep-chunks-s2 SAME BOUNDARIES (67 chunks)
+lg-multi copy-a-s2-vs-d0 IDENTICAL (2399 chars)
+lg-multi deep-a-s2-vs-dsm225 IDENTICAL (1877 chars)
+lg-multi copy-l-s3-vs-a-s3 IDENTICAL (2399 chars)
+lg-multi copy-chunks-s3 DIFFERENT BOUNDARIES: 8 vs 14 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 14
+lg-multi deep-l-s3-vs-a-s3 IDENTICAL (1877 chars)
+lg-multi deep-chunks-s3 DIFFERENT BOUNDARIES: 34 vs 67 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 22
+lg-multi copy-a-s3-vs-d0 IDENTICAL (2399 chars)
+lg-multi deep-a-s3-vs-dsm225 IDENTICAL (1877 chars)
+lg-multi copy-l-s4-vs-a-s4 IDENTICAL (2399 chars)
+lg-multi copy-chunks-s4 DIFFERENT BOUNDARIES: 8 vs 27 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 1024); B's chunks in MIXED steps 26
+lg-multi deep-l-s4-vs-a-s4 IDENTICAL (1877 chars)
+lg-multi deep-chunks-s4 DIFFERENT BOUNDARIES: 34 vs 132 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 1024); B's chunks in MIXED steps 82
+lg-multi copy-a-s4-vs-d0 IDENTICAL (2399 chars)
+lg-multi deep-a-s4-vs-dsm225 IDENTICAL (1877 chars)
+lg-multi copy-l-s0b-vs-a-s0b IDENTICAL (2399 chars)
+lg-multi copy-chunks-s0b DIFFERENT BOUNDARIES: 8 vs 14 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 14
+lg-multi deep-l-s0b-vs-a-s0b DIFFERENT at char 170 (1877 vs 1878 chars)
+lg-multi deep-chunks-s0b DIFFERENT BOUNDARIES: 34 vs 88 chunks, first difference at chunk 1 (start, q): (2048, 4096) vs (2048, 2048); B's chunks in MIXED steps 87
+lg-multi copy-a-s0b-vs-d0 IDENTICAL (2399 chars)
+lg-multi deep-a-s0b-vs-dsm225 IDENTICAL (1877 chars)
+lg-multi control-copy-a-s0b-vs-s0 IDENTICAL (2399 chars)
+lg-multi control-copy-l-s0b-vs-s0 IDENTICAL (2399 chars)
+lg-multi control-deep-a-s0b-vs-s0 IDENTICAL (1877 chars)
+lg-multi control-deep-l-s0b-vs-s0 DIFFERENT at char 60 (1842 vs 1878 chars)

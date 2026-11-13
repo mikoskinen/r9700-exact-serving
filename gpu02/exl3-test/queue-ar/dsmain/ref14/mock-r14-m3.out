@@ -1,0 +1,37 @@
+2026-11-12 21:50:57 mockrun r14-m3: farm: FARM {"copied": 6936, "linked": 42070, "dirlinks": 45, "skipped": 2, "seconds": 2.8}
+2026-11-12 21:50:57 mockrun r14-m3: port 18091, sandbox /tmp/mockrad/r14-m3, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zref14.sh (sandbox copy), knobs: R14_SW=0 R14_EGEN=128 R14_C8WIN=8 R14_C8WARM=4 R14_C4WIN=6 R14_C4WARM=3 R14_C1WIN=6 R14_C1WARM=3 R14_BUDGET_MIN=120 R14_LDPF=2048 R14_A11ID=1100 R14_CDEPTHS=6000 12000 R14_U1N=2 R14_SWN=1 R14_C16DUR=8 R14_C16WARM=4 R14_C8GN=1 NGSHARE_DIR=/tmp/mockrad/r14-m3/ngdir NGSHARE_RUN=/tmp/mockrad/r14-m3/ngrun NGSHARE_LOG=/tmp/mockrad/r14-m3/ngshare.log, faults: none, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-12 21:51:04 mockrun r14-m3: DRYRUN rc 0, 260 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/ref14
+2026-11-12 21:51:04 mockrun r14-m3: run (timeout 3000 s)
+2026-11-12 21:57:36 mockrun r14-m3: body rc 0 after 402 s
+MOCKRUN REPORT r14-m3
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zref14.sh | body rc 0 | 403 s | knobs: R14_SW=0 R14_EGEN=128 R14_C8WIN=8 R14_C8WARM=4 R14_C4WIN=6 R14_C4WARM=3 R14_C1WIN=6 R14_C1WARM=3 R14_BUDGET_MIN=120 R14_LDPF=2048 R14_A11ID=1100 R14_CDEPTHS=6000 12000 R14_U1N=2 R14_SWN=1 R14_C16DUR=8 R14_C16WARM=4 R14_C8GN=1 NGSHARE_DIR=/tmp/mockrad/r14-m3/ngdir NGSHARE_RUN=/tmp/mockrad/r14-m3/ngrun NGSHARE_LOG=/tmp/mockrad/r14-m3/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/ref14 | 112 RESULT lines, 419 mock requests | last RESULT: xref14 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zref14: done (6 min) -- /tmp/mockrad/r14-m3/home/gpu/ds41/exl3-test/runs/xdsm/ref14 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (1)
+  1x ngshare xref14-n5: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (10)
+  2026-11-12 21:53:33 RESULT xref14 identity cold-1100 vs yzint14c-Z: INFO (R14_SW=0 mock: a real-run reference, not compared)
+  2026-11-12 21:56:35 RESULT xref14 identity cold-6000: INFO no yzint14c / ref12 answer at this depth -- not compared
+  2026-11-12 21:56:37 RESULT xref14 identity cold-12000: INFO no yzint14c / ref12 answer at this depth -- not compared
+  2026-11-12 21:57:34 RESULT xref14 REF14 cold 6k (deepq after a prefix-cache reset, 6274 tok): TTFT 0.18 s (0.18), 34856 prefill tok/s, non-decode 87.2 ms a step | answers INFO (R14_SW=0 mock: real-run references not compared) | INFO int12: -
+  2026-11-12 21:57:34 RESULT xref14 REF14 cold 12k (deepq after a prefix-cache reset, 12020 tok): TTFT 0.34 s (0.34), 35353 prefill tok/s, non-decode 110.7 ms a step | answers INFO (R14_SW=0 mock: real-run references not compared) | INFO int12: -
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 42068 linked real files, 8 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/ref14/mock-r14-m3.out (size 0 -> 981)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/ref14/mock-r14-stop3.out (size 1212 -> 4616)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzzzzz-fn-hz-csdma5.sh.out (size 272 -> 5564)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 1075672 -> 1087041)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/up-fn4-sd5-F.txt (size 303 -> 150)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-sd5-U1.log (gone)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/up-fn4-sd5-Q.txt (size 301 -> 150)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-fn4-sd5-F.log (gone)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/r14-m3.txt | sandbox: /tmp/mockrad/r14-m3

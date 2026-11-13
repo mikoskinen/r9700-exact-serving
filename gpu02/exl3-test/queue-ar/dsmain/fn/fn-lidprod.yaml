@@ -1,0 +1,34 @@
+# fn-lidprod.yaml (11.11.2026, queue-ar/dsmain/fn, ds-main-port; for dsm-fnloadid.sh start prod) = fn4's fn-prodres.yaml (md5
+# 02cecbe0, 168 / 170; read only, untouched) line for line from "services:" on, except the project / container name
+# radiance-fnlid-prod / radiance-fnlid. ONE DP half of Flash-Next production as compose/flashnext-prod-dp-a.yaml serves it
+# (radiance-1.15.1: TP2 on 83:00 + 86:00, wht6 min-kb 128, 16 seqs, MML 524288 yarn:2, expert_tiered + host pool 16 GiB, fp8 KV,
+# prefix cache 60 GiB ttl 8 h, checkpoint slots 512 keep-all, MTP 3, MNBT 2048, the same reasoning / token flags; models from
+# compose/.env RADIANCE_MODELS through common.yaml), as a TEST container: loopback port 8090, no --api-key-env, its own n-gram
+# directory ${NGRAMDIR} (a tmpfs dir the item makes and removes) instead of production's /dev/shm. Image ${FNIMAGE}
+# (production's: stilldeadcode/radiance:1.15.1). dsm-fnloadid.sh checks this serve line token for token against the
+# production file (read as text) before the start. The production compose files are not touched.
+name: radiance-fnlid-prod
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${FNIMAGE:?set FNIMAGE}
+    container_name: radiance-fnlid
+    restart: "no"
+    environment:
+      ROCR_VISIBLE_DEVICES: "GPU-4d61f52cafe37588,GPU-5943fea82aeead65"
+    volumes:
+      - ${NGRAMDIR:?set NGRAMDIR}:/ngram
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/qwen3.8-next-flash-fp8-iq4r-moe.rad --served-model-name qwen3.8-flash-next
+      --host 127.0.0.1 --port 8090
+      --tp 2 --tp-wire wht6 --max-num-seqs 16 --tp-wire-min-kb 128 --max-model-len 524288 --rope-scaling yarn:2
+      --placement expert_tiered --host-pool-mib 16384 --gpu-headroom-mib 96
+      --kv-cache-dtype fp8
+      --ngram-placement ram=/ngram
+      --prefix-cache-mib 61440 --prefix-cache-ttl 28800
+      --checkpoint-slots 512 --checkpoint-policy keep-all
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048
+      --reasoning-effort medium --reasoning-effort-map high=xhigh
+      --thinking-token-budget 16000 --default-max-tokens 32768

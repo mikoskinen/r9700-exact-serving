@@ -1,0 +1,26 @@
+# DeepSeek-V4.1-Flash-1017 with turboderp's EXL3 routed experts (Stage A: layers 6-34 EXL3 2-bit, layers 0-5 / 35-39, trunk,
+# DSpark and Engram byte-copied from the UD-IQ1_S .rad) on gpu02 TP4. Prepared 4.11.2026 night; NOT production: up for a test
+# window, down after. Image = radiance-local:ds41-acc9ae58 + rebuilt deepseek41.so + EXL3 plugins in the engine's own home.
+# Flags = ds41-tp4.yaml (3.11. window); window.sh passes the 3.11. confirm config through the environment.
+# No --api-key-env in this engine build, so it binds 127.0.0.1 without a key (bench tools run on gpu02). Port 8090.
+# Run from the compose project dir so .env (RENDER_GID, VIDEO_GID, RADIANCE_MODELS, ...) is read:
+#   IMAGE=... MODEL=... docker compose --project-directory ~/radiance-1.15.1/compose -f ~/gpu/ds41/exl3-test/ds41-exl3-tp4.yaml up -d
+name: radiance-ds41-exl3
+services:
+  radiance:
+    extends: { file: /home/mikoskinen/radiance-1.15.1/compose/common.yaml, service: radiance }
+    image: ${IMAGE:?set IMAGE (radiance-local:ds41-exl3-<sha>)}
+    container_name: radiance-ds41-exl3
+    restart: "no"
+    volumes:
+      - /home/mikoskinen/models/ds41-exl3:/models:ro
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+    command: >
+      --model /models/${MODEL:?set MODEL (file name in ~/models/ds41-exl3)} --served-model-name deepseek-v4.1-flash
+      --host 127.0.0.1 --port 8090
+      --tp 4 --tp-wire ${WIRE:-exact} --placement expert_tiered --host-pool-mib ${HOSTPOOL:-19456}
+      --max-num-batched-tokens ${MNBT:-8192} --checkpoint-interval ${CKINT:-2048} --kv-cache-dtype ${KVD:-bf16}
+      --num-speculative-tokens ${NST:-0} --ngram-placement ram
+      --max-num-seqs ${MAXSEQS:-8} --max-model-len ${MML:-262144}
+      ${EXTRA:-} ${EXTRA2:-}

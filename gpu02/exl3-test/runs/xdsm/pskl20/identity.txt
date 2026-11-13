@@ -1,0 +1,31 @@
+info-warm IDENTICAL: 3 answers
+a1-L-vs-B IDENTICAL: 20 of 20 answers
+a1-D-vs-B IDENTICAL: 20 of 20 answers
+a1-LD-vs-B IDENTICAL: 20 of 20 answers
+info-a1-B-vs-d0 IDENTICAL: 20 of 20 answers
+f136-B-vs-dsm225 IDENTICAL (1877 chars)
+f136-L-vs-dsm225 IDENTICAL (1877 chars)
+f136-D-vs-dsm225 IDENTICAL (1877 chars)
+f136-LD-vs-dsm225 IDENTICAL (1877 chars)
+f136-L-vs-B IDENTICAL (1877 chars)
+f136-D-vs-B IDENTICAL (1877 chars)
+f136-LD-vs-B IDENTICAL (1877 chars)
+c8-B-vs-a1B IDENTICAL: 20 of 20 answers
+c8-L-vs-a1B IDENTICAL: 20 of 20 answers
+c8-D-vs-a1B IDENTICAL: 20 of 20 answers
+c8-LD-vs-a1B IDENTICAL: 20 of 20 answers
+ld-L-vs-loadB IDENTICAL (602 chars)
+ld-D-vs-loadB IDENTICAL (602 chars)
+ld-LD-vs-loadB IDENTICAL (602 chars)
+hit-L-cold64000-vs-B IDENTICAL (219 chars)
+hit-L-40000-vs-B IDENTICAL (239 chars)
+hit-L-20000-vs-B IDENTICAL (238 chars)
+hit-L-tail-vs-B IDENTICAL (219 chars)
+hit-D-cold64000-vs-B IDENTICAL (248 chars)
+hit-D-40000-vs-B IDENTICAL (255 chars)
+hit-D-20000-vs-B IDENTICAL (221 chars)
+hit-D-tail-vs-B IDENTICAL (248 chars)
+hit-LD-cold64000-vs-B IDENTICAL (244 chars)
+hit-LD-40000-vs-B IDENTICAL (280 chars)
+hit-LD-20000-vs-B IDENTICAL (228 chars)
+hit-LD-tail-vs-B IDENTICAL (244 chars)

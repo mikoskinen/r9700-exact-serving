@@ -1,0 +1,10 @@
+xref14-n5 warm-up IDENTICAL: 3 answers
+xref14-a1-O-vs-yzint14c-a1-Z IDENTICAL: 20 of 20 answers
+xref14-a1-O-vs-ref12-a1 IDENTICAL: 20 of 20 answers
+xref14-gs16-O-vs-a1-O IDENTICAL: 20 of 20 answers
+xref14-cold-1100-vs-yzint14c-Z IDENTICAL (259 chars)
+xref14-cold-1300-vs-yzint14c-Z IDENTICAL (263 chars)
+xref14-ld-O-vs-a1-O IDENTICAL: 20 of 20 answers
+xref14-cold-64000-vs-ref12 IDENTICAL (343 chars)
+xref14-cold-136000-vs-yzint14c-Z IDENTICAL (293 chars)
+xref14-cold-136000-vs-ref12 IDENTICAL (293 chars)

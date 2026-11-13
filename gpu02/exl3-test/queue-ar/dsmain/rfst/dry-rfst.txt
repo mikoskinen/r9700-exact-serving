@@ -1,0 +1,9 @@
+  (check) image radiance-local:ds41-fuse-e231d919-38b88ec6-st2 be78eec84ba0
+  (check) r4d_selftest in the image has the M 49..170 rows ('form 2 refuses > 48 rows')
+  (check) card GPU-dbba5c851cfef7b3: in sysfs (unique_id)
+  (check) disk: / 14545 MB free, /tmp inodes 6 %
++ mkdir -p /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/rfst; chmod 777 /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/rfst
++ gpurun rfst-$$ 300 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined --ulimit memlock=-1 --ipc=host -e ROCR_VISIBLE_DEVICES=GPU-dbba5c851cfef7b3 --entrypoint /opt/radiance/bin/r4d_selftest radiance-local:ds41-fuse-e231d919-38b88ec6-st2 /opt/radiance/share/radiance/kernels/libr4d.so --case rfuse > /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/rfst/selftest.txt 2>&1
++ RESULT rfst lines: 'RFST M 49..170: PASS|FAIL (rc, ok n/151, FAIL n, '450 of 450', new rows n/42)', on FAIL 'int16 soak result VOID: fall back to int15' + every FAIL line; FUSEPERF / FUSEGATE / info
+  (dry) 0 radiance container(s) up now, 0 KFD client(s) (the run refuses while any is)
+DRYRUN: 0 MISSING (nothing started, nothing written)

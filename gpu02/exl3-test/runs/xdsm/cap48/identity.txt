@@ -1,0 +1,5 @@
+S:c16-warmup IDENTICAL: 3 answers
+S:a1-vs-d0 IDENTICAL: 20 of 20 answers
+I:a1-vs-kv4-n16-a1 IDENTICAL: 20 of 20 answers
+B48:gs16-vs-a1 IDENTICAL: 20 of 20 answers
+C:gs16o-vs-a1 8 of 20 answers differ: p1 char 126 tok 27, p5 char 289 tok 100, p7 char 60 tok 16, p8 char 15 tok 3, p9 char 11 tok 2, p11 char 57 tok 12, p14 char 90 tok 18, p16 char 177 tok 32

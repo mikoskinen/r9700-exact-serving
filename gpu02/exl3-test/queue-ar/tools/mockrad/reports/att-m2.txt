@@ -1,0 +1,24 @@
+MOCKRUN REPORT att-m2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/attach/mock/mockchain.sh | body rc 0 | 176 s | knobs: MOCKRAD_STARTUP_S=8 | faults: - | swaps: gpu/ds41/exl3-test/queue/lib-pr266.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/staged/lib-pr266.sh gpu/ds41/exl3-test/queue-ar/dsmain/compose-guard.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/staged/compose-guard.sh gpu/ds41/exl3-test/queue-ar/tools/ngramshare/ngram-keeper.sh=gpu/ds41/exl3-test/queue-ar/dsmain/attach/mock/ngkeeper-stub.sh
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/attmock | 186 RESULT lines, 40 mock requests | last RESULT: chain-after: queue item 13-copy.sh exit 0
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (4)
+  1x ngshare ngA: no shared-table placement line (VIRHE?) keeper: mock keeper: 2 of 2 tables held (stub)
+  1x attach down: server 0009b051 (sig 9d0d61b0) down: 1 VIRHE line(s) since this item began (KEEP_VIRHE_OK=1 ignores them)
+  1x ngshare ngB: no shared-table placement line (VIRHE?) keeper: mock keeper: 2 of 2 tables held (stub)
+  1x attach down: server 0009b41b (sig 9d0d61b0) down: 1 VIRHE line(s) since this item began (KEEP_VIRHE_OK=1 ignores them)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 0 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 39598 linked real files, 3 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzzzz-1u.sh.out (size 11550 -> 24177)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 335729 -> 340667)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/i11u/identity.txt (size 0 -> 36)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

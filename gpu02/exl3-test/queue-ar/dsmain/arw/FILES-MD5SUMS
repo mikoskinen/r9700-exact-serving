@@ -1,0 +1,9 @@
+0bb82c33af8287c247f89c5917168a12  dsm-arw.sh
+9b90ccabca6804bbfc80fb583f8a624c  arwsum.py
+7ddd2876d9614bffa7f62b46cbeb95da  build.sh
+74302d5d74b3afc4f0cb99a916d1e598  bench/arw.hip
+fbf915a7422b4d12e9b606b0d9b63913  bin/arw
+784f039fab996ad18f369f7c70880cf4  src/abi/rad_abi.h
+d648e1bc9846c65a87bd3c2a23c1c260  src/abi/rad_encoding.h
+fab3252dcf6ded9581a14c36c7dd15bf  src/abi/rad_types.h
+97d63cdac06e7e8a16c2525aa4cdc03e  src/ORIGIN.txt

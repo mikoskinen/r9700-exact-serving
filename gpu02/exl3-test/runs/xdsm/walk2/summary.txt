@@ -1,0 +1,15 @@
+ARMS c1 essay: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A -
+ARMS c1 code: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A -
+ARMS edit: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A -
+ARMS c4: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A -, p50 B - vs A - (-)
+ARMS c8: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A -, p50 B - vs A - (-)
+ARMS fixed5 essay tok/step (diagnostic, fixed window 5): B - vs A - (-)
+ARMS fixed5 code tok/step (diagnostic, fixed window 5): B - vs A - (-)
+POS essay: A - | B -
+POS code: A - | B -
+POS edit: A - | B -
+POS c4: A - | B -
+POS c8: A - | B -
+POS essay5: A - | B -
+POS code5: A - | B -
+SUMMARY c1 essay: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A - || c1 code: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A - || edit: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A - || c4: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A -, p50 B - vs A - (-) || c8: tok/s B - vs A - (-; ), tokens a step B - vs A - (-), ms a round B - vs A - (-), acc B - vs A -, p50 B - vs A - (-) || fixed5 essay tok/step (diagnostic, fixed window 5): B - vs A - (-) || fixed5 code tok/step (diagnostic, fixed window 5): B - vs A - (-) || accepted / reached by draft position (conditional acceptance): essay: A - | B - ;; code: A - | B - ;; edit: A - | B - ;; c4: A - | B - ;; c8: A - | B - ;; essay5: A - | B - ;; code5: A - | B - || blocks 4 (4 flagged), order ABBA || identity / oracle / selftest: selftest rc 0, 13 ok, 0 FAIL, warm-up-wk-n5 IDENTICAL: 3 answers, copy-B IDENTICAL (2399 chars), gs-B IDENTICAL: 20 answers, copy-A IDENTICAL (2399 chars), gs-A IDENTICAL: 20 answers, oracle-1 IDENTICAL, oracle-2 IDENTICAL

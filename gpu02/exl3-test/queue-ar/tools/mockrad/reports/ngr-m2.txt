@@ -1,0 +1,28 @@
+MOCKRUN REPORT ngr-m2
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zz-ngreuse.sh | body rc 0 | 385 s | knobs: XNGR_SW=0 XNGR_C8DUR=16 XNGR_C8WARM=4 XNGR_DUR=12 XNGR_WARM=4 XNGR_DEPTH=6000 XNGR_BUDGET_MIN=120 NGSHARE_DIR=/tmp/mockrad/ngr-m2/ngdir NGSHARE_RUN=/tmp/mockrad/ngr-m2/ngrun NGSHARE_LOG=/tmp/mockrad/ngr-m2/ngshare.log | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/ngreuse | 57 RESULT lines, 165 mock requests | last RESULT: xngr 57-p4zyzzzzz-ds-r92zz-ngreuse: done (6 min) -- /tmp/mockrad/ngr-m2/home/gpu/ds41/exl3-test/runs/xdsm/ngreuse | 1 VIRHE line(s): see above
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (3)
+  1x xngr 57-p4zyzzzzz-ds-r92zz-ngreuse: start IMAGE=radiance-local:ds41-int10-f6ef7cc3-5c13e555-l (583c9743aa90) | VIRHE XNGR_SW=0: NO mhc_fuse / ix_lds / ix_ni / draft_depth0 3 / stage_full_* / ds41_arcoded / sched_row_cap posted (a mock run only) | starts A (copy: ds41-stack2-tp4.yaml, NGRAM=ram) / B (ngshare FIRST FILL: ds41-ngshare-tp4.yaml, NGRAM=ram=/ngram, keeper) / C (ngshare REUSE)  on NST 5 stack5 start (stack4's + RADIANCE_LOG_STEPS=1, E1 declared off, HB ranks 1,2) + RADIANCE_DS41_MHC_FUSE=0 (M1 declared) | KVR OFF (RADIANCE_DS41_KV_REPLICATED unset), SP off | base pin = stack5's S5T with draft_sample 0 + SP pinned (stage_full_min 0, stage_full_pick 0) + M1 on / IX off / draft_depth0
+  1x ngshare ngr-b: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+  1x ngshare ngr-c: no shared-table placement line (VIRHE?) keeper: start: 0 ready (expected 2), 0 held, 0 failed, 0 not ready, 0 other
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 160 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (0)
+  unknown endpoints: none
+  fn4 POSTs refused: 0 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 39437 linked real files, 8 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/1u/dry-1u-int10.txt (size 120562 -> 126155)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzz-fn-dp2b.sh.out (size 363 -> 1335)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/chain-after-11121147.out (size 5172 -> 5264)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 285782 -> 295913)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-dp2-b-engine.log (size 31278 -> 43509)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-radiance-fndp2a.log (size 31315 -> 33966)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/start-radiance-fndp2b.log (size 31278 -> 33963)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/fn4/fn4-dp2-a-engine.log (size 31315 -> 45764)
+
+VERDICT: FINDINGS -- see above (a VIRHE labelled 'mock: real ref' compares with a real-run reference and is expected under the mock)

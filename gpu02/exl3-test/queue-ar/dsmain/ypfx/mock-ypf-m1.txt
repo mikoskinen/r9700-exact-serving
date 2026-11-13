@@ -1,0 +1,32 @@
+2026-11-12 18:13:18 mockrun ypf-m1: farm: FARM {"copied": 6849, "linked": 41120, "dirlinks": 45, "skipped": 2, "seconds": 3.5}
+2026-11-12 18:13:19 mockrun ypf-m1: port 18091, sandbox /tmp/mockrad/ypf-m1, target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-ypfx.sh (sandbox copy), knobs: YPF_SW=0 YPF_C8WIN=8 YPF_C8WARM=4 YPF_DEPTHS=12000 6000 YPF_CORDER=BC YPF_C8ORDER=BC YPF_C16ORDER=BC YPF_BUDGET_MIN=60, faults: none, swaps: none; 34 body literals echoed; replay: 23 recorded answers
+2026-11-12 18:13:25 mockrun ypf-m1: DRYRUN rc 0, 163 lines; fresh output dirs: gpu/ds41/exl3-test/runs/xdsm/ypfx/y1
+2026-11-12 18:13:26 mockrun ypf-m1: run (timeout 1500 s)
+2026-11-12 18:15:26 mockrun ypf-m1: body rc 0 after 131 s
+MOCKRUN REPORT ypf-m1
+target ~/gpu/ds41/exl3-test/queue-ar/dsmain/items/57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-ypfx.sh | body rc 0 | 131 s | knobs: YPF_SW=0 YPF_C8WIN=8 YPF_C8WARM=4 YPF_DEPTHS=12000 6000 YPF_CORDER=BC YPF_C8ORDER=BC YPF_C16ORDER=BC YPF_BUDGET_MIN=60 | faults: - | swaps: -
+output dirs (fresh): gpu/ds41/exl3-test/runs/xdsm/ypfx/y1 | 68 RESULT lines, 213 mock requests | last RESULT: ypf 57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-ypfx: done (1 min) -- /tmp/mockrad/ypf-m1/home/gpu/ds41/exl3-test/runs/xdsm/ypfx/y1 | no VIRHE line
+
+TRACEBACKS (0 distinct)
+BASH ERRORS (0)
+VIRHE LINES (0)
+MISSING / NOT FOUND (0)
+MOCK SIDE
+  GPU sysfs telemetry reads refused: 120 (fastcheck / thermal / keepawake readers; expected, the real cards are not polled)
+  other guard refusals (0)
+  docker calls not emulated (1)
+    2026-11-12 18:13:31 NOT-EMULATED rc=125 docker run with a GPU device is never emulated (the item's GPU selftest / bench does not run under the mock) :: run --rm --init --stop-timeout 10 --name ypf-p0-1512819 --network none --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -e ROCR
+  unknown endpoints: none
+  fn4 POSTs refused: 1 by the body's own range probes, 0 other
+  leak check (real files behind the farm's symlinks; the real queue and loggers write some of them too): VERIFY 41118 linked real files, 7 changed during the run
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/zepb/dry-zepb.txt (size 94544 -> 96796)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/ypfx/mock-ypf-m1.txt (size 0 -> 754)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/queue-57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzz-res.sh.out (size 61762 -> 78661)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/temps-exl3-1112.csv (size 703062 -> 706758)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/res12/blocks.jsonl (size 48236 -> 64305)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/res12/identity.txt (size 79 -> 120)
+      CHANGED /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/res12/sets.jsonl (size 340 -> 455)
+
+VERDICT: CLEAN: no traceback, no bash error, no VIRHE
+report: /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/tools/mockrad/reports/ypf-m1.txt | sandbox: /tmp/mockrad/ypf-m1
+rc 0

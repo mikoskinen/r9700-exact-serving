@@ -1,0 +1,6 @@
+IDLE: production :8000/:8001 idle for 30 s (waited 30 s; reachable [True, True])
+IDLE: production :8000/:8001 idle for 30 s (waited 30 s; reachable [True, True])
+IDLE: production :8000/:8001 idle for 30 s (waited 30 s; reachable [True, True])
+IDLE: production :8000/:8001 idle for 30 s (waited 30 s; reachable [True, True])
+IDLE: production :8000/:8001 idle for 30 s (waited 30 s; reachable [False, False])
+IDLE: production :8000/:8001 idle for 30 s (waited 30 s; reachable [False, False])

@@ -1,0 +1,19 @@
+#!/bin/bash
+# curl (mockrad shim, 12.11.2026) -- rewrites the real server's address (127.0.0.1 / localhost :8090, MOCKRAD_REDIRECT) to the mock
+# on MOCKRAD_PORT and refuses every other http(s) / host:port target (logged in MOCKRAD_STATE/guard.log). Never reaches :8090.
+[ -n "${MOCKRAD_PORT:-}" ] && [ "$MOCKRAD_PORT" != 8090 ] || { echo "curl (mockrad shim): MOCKRAD_PORT unset or 8090 -- refused" >&2; exit 7; }
+RED=${MOCKRAD_REDIRECT:-8090}
+args=()
+for a in "$@"; do
+  for p in ${RED//,/ }; do a=${a//127.0.0.1:$p/127.0.0.1:$MOCKRAD_PORT}; a=${a//localhost:$p/127.0.0.1:$MOCKRAD_PORT}; done
+  args+=("$a")
+done
+for a in "${args[@]}"; do
+  case "$a" in
+    http://127.0.0.1:$MOCKRAD_PORT|http://127.0.0.1:$MOCKRAD_PORT/*|127.0.0.1:$MOCKRAD_PORT|127.0.0.1:$MOCKRAD_PORT/*) ;;
+    *://*|*127.0.0.1:*|*localhost:*|*:8090*)
+      echo "$(date '+%F %T') curl refused: $a" >> "${MOCKRAD_STATE:-/dev/null}/guard.log" 2>/dev/null
+      echo "curl: (7) mockrad shim: $a refused (only the mock on :$MOCKRAD_PORT)" >&2; exit 7 ;;
+  esac
+done
+exec /usr/bin/curl --noproxy '*' "${args[@]}"
