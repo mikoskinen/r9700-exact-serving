@@ -298,7 +298,9 @@ int main(int argc, char** argv) {
     auto setup = [&](const char* name, bool gu, int64_t Mtop) {
         Op o;
         o.row = row_of(name);
-        if (exl3_op_of(o.row->op) != (gu ? EXL3_GATE_UP : EXL3_DOWN)) die(std::string(name) + " is not the op asked for");
+        const bool is_gu = !std::strcmp(o.row->op, EXL3_OP_GATE_UP) || !std::strcmp(o.row->op, EXL3_OP_GATE_UP_DK);
+        const bool is_dn = !std::strcmp(o.row->op, EXL3_OP_DOWN) || !std::strcmp(o.row->op, EXL3_OP_DOWN_DK);
+        if (gu ? !is_gu : !is_dn) die(std::string(name) + " is not the op asked for");
         std::vector<RadParam> p = params(gu, Mtop);
         if (o.row->init && o.row->init(p.data(), (int)p.size(), 0, 1, &o.instance) != RAD_OK) die(std::string(name) + ": init failed");
         std::vector<RadTensor> t = operands(gu, 0, Mtop);
