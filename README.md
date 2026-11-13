@@ -1,16 +1,18 @@
-# Exact local LLM serving on 4x AMD Radeon AI PRO R9700
+# DeepSeek V4.1 Flash and Qwen Flash-Next (EXL3) on 4x AMD Radeon AI PRO R9700
 
-This repository documents how two large mixture-of-experts models run locally with exact output on four
-AMD Radeon AI PRO R9700 cards (RDNA4, 32 GB each). The models are DeepSeek V4.1 Flash (EXL3, 2.25 bits
-per weight) and Qwen Flash-Next (EXL3, 4.05 bits per weight), and only these two were optimised. The
-host has an AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board with 512 GB of RAM. The engine is a
-C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance) with the
-[radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, and it runs tensor parallel over the
-four cards. Claude Code uses it as its local backend through a LiteLLM proxy.
+This repository documents local serving of two large mixture-of-experts models, with the measurements
+and every tested change.
 
-The notes are written for people who run large MoE models on AMD consumer or workstation GPUs or on EPYC
-hosts, and for anyone tuning a multi-GPU PCIe box without NVLink. The exactness method matters if you
-need a coding agent to give the same answer to the same context every time.
+- **Models:** DeepSeek V4.1 Flash (EXL3, 2.25 bits per weight) and Qwen Flash-Next (EXL3, 4.05 bits per
+  weight). Only these two were optimised.
+- **GPUs:** four AMD Radeon AI PRO R9700 cards (RDNA4, 32 GB each) on PCIe 4.0.
+- **Host:** AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board with 512 GB of RAM.
+- **Engine:** a C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance) with the
+  [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, tensor parallel over the four cards.
+- **Use:** the local backend for Claude Code through a LiteLLM proxy.
+- **Exact output:** the same bytes alone and under load ([What exact means](#what-exact-means)).
+- **Who it's for:** people who run large MoE models on AMD GPUs or EPYC hosts, tune a multi-GPU PCIe box
+  without NVLink, or need reproducible output from a coding agent.
 
 ## Results
 
@@ -19,12 +21,12 @@ the everyday setting caps each card at 210 W with a -50 mV voltage offset.
 
 | Measure | DeepSeek, stock 300 W | DeepSeek, 210 W | Qwen, stock 300 W | Qwen, 210 W |
 |---|---|---|---|---|
-| 1 user, essay prompt | 96.5 | 90.8 | _pending_ | ~9,200 tok/s |
-| 1 user, code prompt | _pending_ | _pending_ | _pending_ | ~9,200 tok/s |
-| 4 users | 176.1 | 171.6 | _pending_ | ~9,200 tok/s |
+| 1 user, essay prompt | 96.5 | 90.8 | _pending_ | _pending_ |
+| 1 user, code prompt | _pending_ | _pending_ | _pending_ | _pending_ |
+| 4 users | 176.1 | 171.6 | _pending_ | _pending_ |
 | 8 users | 208.1 | 192.0 | _pending_ | ~790 |
 | 16 users | 259.1 | 237.0 | _pending_ | ~1,030 |
-| 16k cold prefill | _pending_ | _pending_ | _pending_ | ~9,200 tok/s |
+| 16k cold prefill | _pending_ | _pending_ | _pending_ | _pending_ |
 | 64k cold prefill | _pending_ | _pending_ | _pending_ | ~9,330 tok/s |
 | 128k (Qwen) or 136k (DeepSeek) cold prefill | 6,130 tok/s (TTFT 22.4 s) | 5,570 tok/s (TTFT 24.6 s) | _pending_ | ~9,200 tok/s |
 
