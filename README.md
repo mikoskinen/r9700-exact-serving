@@ -29,9 +29,9 @@ the everyday setting caps each card at 210 W with a -50 mV voltage offset.
 | 4 users | 176.1 | 171.6 | _pending_ | _pending_ |
 | 8 users | 208.1 | 192.0 | _pending_ | ~790 |
 | 16 users | 259.1 | 237.0 | _pending_ | ~1,030 |
-| Prefill 16k | _pending_ | _pending_ | _pending_ | _pending_ |
+| Prefill 16k | 3,740 | _pending_ | _pending_ | _pending_ |
 | Prefill 64k | 6,020 | _pending_ | _pending_ | ~9,330 |
-| Prefill 128k | _pending_ | – | _pending_ | ~9,200 |
+| Prefill 128k | 6,140 | – | _pending_ | ~9,200 |
 
 ## What exact means
 
