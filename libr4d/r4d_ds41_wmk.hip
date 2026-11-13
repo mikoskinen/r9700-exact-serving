@@ -586,14 +586,25 @@ extern "C" int r4d_gg_wk_last() { return g_gg_wk_last.load(std::memory_order_rel
  * `form` (the one gg_pf would pick, 0 = the stock geometry 322); a form not built here with the part fold runs 322. The
  * geometry moves time, never bytes (each output's operations are the part order's in every form). */
 namespace {
-#define WKPF_FORMS(X) X(3, 2, 8, 0) X(4, 2, 8, 0) X(4, 2, 8, 1) X(3, 2, 8, 1) X(3, 2, 4, 0) X(2, 2, 8, 0)
+#define WKPF_FORMS(X) X(3, 2, 8, 0) X(4, 2, 8, 0) X(4, 2, 8, 1) X(3, 2, 8, 1) X(3, 2, 4, 0) X(2, 2, 8, 0) \
+    X(4, 1, 16, 0) X(4, 1, 16, 1) X(2, 1, 16, 0)   /* one column tile a wave, 16 waves: half the accumulators a lane (the fold's total fits) */
 /* The running total in registers (measured 14.11., --perfwkpf, one card: the scratch-held total TS costs +30..110 % a launch,
  * more than the registers' spills). g_wkpf_ts (bench pin r4d_gg_wkpf_ts): 0 / 1 registers, 2 scratch.
  * The form: 322 (the stock geometry; the fastest part-order form at most dense shapes, 14.11.), whatever gg_pf picks; the bench
  * pin r4d_gg_wkpf_follow(1) makes it follow gg_pf's pick (the form timing). */
 int g_wkpf_ts = 0;
 int g_wkpf_follow = 0;
-int g_wkpf_default = 322;   /* bench pin r4d_gg_wkpf_default: the form W's prefill rows run (0 = the stock kernel + fold) */
+int g_wkpf_default = -1;   /* bench pin r4d_gg_wkpf_default: the form W's prefill rows run (0 = the stock kernel + fold; -1 the table) */
+/* W's prefill form by (type, N, K) (the table below; every form computes the same bytes). Filled from --perfwkpf (one card, M 2048 /
+ * 4096); a shape not listed runs DEFAULT_FORM. */
+constexpr int kWkpfDefault = 322;
+struct WkpfEnt { int ty, N, K, form; };
+const WkpfEnt kWkpfTab[] = { { -1, 0, 0, 0 } };
+int wkpf_form_tab(int ty, long long N, long long K) {
+    for (const WkpfEnt& e : kWkpfTab)
+        if (e.ty == ty && e.N == N && e.K == K) return e.form;
+    return kWkpfDefault;
+}
 template <int T, int MT, int NT, int WN, int FI>
 int wkpf_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
     const dim3 grid((unsigned)((A.M + 16 * MT - 1) / (16 * MT)), (unsigned)((A.N + 16 * NT * WN - 1) / (16 * NT * WN)));
@@ -634,7 +645,7 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
     A.y = y; A.y_ld = y_ld;
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = 1; A.tab_bytes = 0;
-    if (!g_wkpf_follow) form = g_wkpf_default;
+    if (!g_wkpf_follow) form = g_wkpf_default >= 0 ? g_wkpf_default : wkpf_form_tab(ty, N, K);
     g_wkpf_last.store(form, std::memory_order_relaxed);
     switch (ty) {
     case GG_Q8_0: return wkpf_launch_t<GG_Q8_0>(s, form, f32out, A);

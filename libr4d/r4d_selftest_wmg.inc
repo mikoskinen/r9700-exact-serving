@@ -1238,7 +1238,9 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
     if (wkpf_follow) wkpf_follow(1);   /* W takes the pinned form */
     const std::vector<int64_t> Ms = gp_list(mlist, "4096,2048");
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
-    const int forms[] = { 0, 322, 422, 426, 326, 321, 222 };   /* 0: int16's stock kernel / W's stock kernel + fold */
+    const int forms[] = { 0, 322, 422, 426, 326, 321, 222, 414, 418, 214 };   /* 0: int16's stock kernel / W's stock kernel + fold; 414 / 418 / 214:
+                                                                                  one column tile a wave, 16 waves (W only: int16's GPF has no such form) */
+    auto wkpf_default = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_default");
     long long keys = 0, bad = 0;
     double lsum = 0; int nl = 0;
     std::printf("WMK prefill timing (rotated weights, mean of %d): stock / GPF form F (int16) / form under ds41_wmk 1 with the total in registers (r) and scratch (s)\n", iters);
@@ -1269,7 +1271,8 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
                 auto arm = [&](int wmk, int form, int ts, double* us, bool* same, int* used) -> bool {
                     clear(h);
                     h.sw("ds41_wmk", wmk);
-                    gp.pin(form);
+                    if (wmk && wkpf_default) { wkpf_default(form); if (wkpf_follow) wkpf_follow(0); }   /* W: exactly this form */
+                    else { gp.pin(form); if (wkpf_follow) wkpf_follow(1); }
                     wkpf_ts(ts);
                     st_memset(d_y, 0xff, mb);
                     const int rc = L.run(d_x, d_w, d_y);
@@ -1285,6 +1288,7 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
                     }
                     if (ok) *us = st_time_us([&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); }, iters, nullptr);
                     gp.pin(0); wkpf_ts(0); h.sw("ds41_wmk", 0);
+                    if (wkpf_default) wkpf_default(-1);
                     return ok;
                 };
                 double st = 0; bool sm; int u;
@@ -1297,7 +1301,8 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
                 bool kb = false;
                 for (int fc : forms) {
                     double uf = -1, ur = -1, us = -1; bool s1 = true, s2 = true; int u1 = 0, u2 = 0;
-                    const bool okf = arm(0, fc, 0, &uf, &sm, &u);
+                    const bool w_only = fc == 414 || fc == 418 || fc == 214;
+                    const bool okf = w_only ? true : arm(0, fc, 0, &uf, &sm, &u);
                     const bool okr = arm(1, fc, 1, &ur, &s1, &u1);
                     const bool oks = arm(1, fc, 2, &us, &s2, &u2);
                     if (!okf || !okr || !oks || !s1 || !s2 || u1 != fc || u2 != fc) kb = true;
