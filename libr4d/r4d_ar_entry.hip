@@ -1269,7 +1269,7 @@ static int ar_lane_blocks() {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_AR_LANE_BLOCKS");
         int b = (e && *e) ? std::atoi(e) : 0;
-        if (b < 0 || b > 24 || (b % 4)) b = 0;
+        if (b < 0 || b > 24 || (b > 2 && (b % 4))) b = 0;   /* 13.11.: 1 / 2 too (227: more lane blocks cost prefill) */
         int want = -1;
         g_ar_lane_blocks.compare_exchange_strong(want, b, std::memory_order_relaxed);
         v = g_ar_lane_blocks.load(std::memory_order_relaxed);
@@ -1277,7 +1277,7 @@ static int ar_lane_blocks() {
     return v;
 }
 extern "C" int r4d_ar_lane_blocks_set(int blocks) {
-    if (blocks < 0 || blocks > 24 || (blocks % 4)) return -1;
+    if (blocks < 0 || blocks > 24 || (blocks > 2 && (blocks % 4))) return -1;   /* 1 / 2: below the tunable's 4 (227) */
     g_ar_lane_blocks.store(blocks, std::memory_order_relaxed);
     return 1;
 }
