@@ -2,9 +2,9 @@
 
 This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
 AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
-whether it runs alone or beside other requests. The notes are written for people who run large MoE models on AMD GPUs or EPYC hosts or
-tune a multi-GPU PCIe box, and for anyone who needs reproducible output from a coding
-agent.
+whether it runs alone or beside other requests. The notes are written for people who run large MoE
+models on AMD GPUs or EPYC hosts or tune a multi-GPU PCIe box, and for anyone who needs reproducible
+output from a coding agent.
 
 - **Models** (only these two were optimised)
   - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight
@@ -19,40 +19,30 @@ agent.
 
 ## Results
 
-Decode rows give the aggregate tok/s of all concurrent users. Stock is the card default of 300 W, and
+All values are tok/s, summed over all concurrent users. Stock is the card default of 300 W, and
 the everyday setting caps each card at 210 W with a -50 mV voltage offset.
 
 | Measure | DeepSeek, stock 300 W | DeepSeek, 210 W | Qwen, stock 300 W | Qwen, 210 W |
 |---|---|---|---|---|
-| 1 user, essay prompt | 96.5 | 90.8 | _pending_ | _pending_ |
-| 1 user, code prompt | _pending_ | _pending_ | _pending_ | _pending_ |
+| 1 user, prose | 96.5 | 90.8 | _pending_ | _pending_ |
+| 1 user, code | _pending_ | _pending_ | _pending_ | _pending_ |
 | 4 users | 176.1 | 171.6 | _pending_ | _pending_ |
 | 8 users | 208.1 | 192.0 | _pending_ | ~790 |
 | 16 users | 259.1 | 237.0 | _pending_ | ~1,030 |
-| 16k cold prefill | _pending_ | _pending_ | _pending_ | _pending_ |
-| 64k cold prefill | _pending_ | _pending_ | _pending_ | ~9,330 tok/s |
-| 128k (Qwen) or 136k (DeepSeek) cold prefill | 6,130 tok/s (TTFT 22.4 s) | 5,570 tok/s (TTFT 24.6 s) | _pending_ | ~9,200 tok/s |
-
-Decoding is greedy at temperature 0. Each prefill is a single cold prompt after a prefix-cache reset,
-and the cards were cooled before each 300 W run. Qwen's output is exact up to 16 concurrent sequences,
-which is where the table stops. The sources and the measurement details are in
-[docs/DETAILS.md](docs/DETAILS.md).
+| Prefill 16k | _pending_ | _pending_ | _pending_ | _pending_ |
+| Prefill 64k | _pending_ | _pending_ | _pending_ | ~9,330 |
+| Prefill 128k (DeepSeek 136k) | 6,130 (TTFT 22.4 s) | 5,570 (TTFT 24.6 s) | _pending_ | ~9,200 |
 
 ## What exact means
 
-Exact means byte-identical greedy output compared with each model's reference engine. A prompt has to
-get the same answer after a speed change and when other requests share the cards, which is why the
-kernels are batch-invariant and an answer that changes under load counts as a bug. Before a change is
-adopted, it passes identity sets of 20 short and 10 long prompts (plus a cold 136k-token answer for
-DeepSeek) and a run beside 16 concurrent sequences, and the test confirms from the switch values and
-kernel call counters that the change ran. Soak tests on 13.11.2026 ran 8 cycles of 20 probes under 12
-concurrent streams with long prompts arriving (36 minutes for DeepSeek), and both models gave 160 of
-160 identical answers.
+Exact means the output is byte-identical to each model's reference engine, and a prompt gets the same
+answer alone or next to other requests. This matters for a coding agent, whose answer to the same
+context shouldn't change because other sessions are running on the same cards. In a 36-minute run
+under load, all 160 of DeepSeek's answers stayed identical.
 
 ## Hardware changes
 
-These host changes are measured with DMA tests and short serving runs, and
-[docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md) has every raw value:
+Raw values are in [docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md).
 
 - **Same-size DIMMs:** replacing mixed 4 x 32 GB and 4 x 64 GB DIMMs with 8 x 64 GB put all eight
   memory channels in one interleave set, which raised CPU read bandwidth from 35.9 to 104 GB/s and
@@ -61,8 +51,8 @@ These host changes are measured with DMA tests and short serving runs, and
   card raised four-card host-to-GPU copies from 61.3 to 105.3 GB/s, because two cards in one quadrant
   share a root port of about 36 GB/s.
 - **CPU idle states and governor:** disabling every idle state with an exit latency of 100 µs or more
-  and setting the `performance` governor at boot ended the random slow engine starts, and Qwen at 8
-  users went from ~630 to ~750 tok/s.
+  and setting the `performance` governor at boot removed a random ~16 % slowdown (Qwen at 8 users went
+  from ~630 to ~750 tok/s).
 - **The CPU swap that didn't help:** an EPYC 7302P in place of the 7282 on the mixed DIMMs moved
   two-card copies from 44.2 to 45.1 GB/s and made a two-card Qwen server 5.7 % slower at 16 users,
   because the 2-channel memory regions were the limit.
@@ -79,10 +69,9 @@ change, the rejected ones included:
   peer in one interleaved pass instead of one link at a time, which cut a 42 MB all-reduce from 3,436
   to 2,508 µs (-27 %).
 - **Prefill skip above the last cache source:** DeepSeek's layers 21 to 39 write almost no cache that
-  later tokens read, so a cold prefill runs them only for the end of the prompt and at an anchor every
-  fourth chunk. The time to first token for a 136k-token prompt fell from 50.5 to 33.3 s (-34 %).
-- **Expert residency:** giving DeepSeek's spare VRAM to resident expert weights instead of an expert
-  turnover reserve raised 8-user throughput from 143.9 to 169.5 tok/s (+17.8 %).
+  later tokens read, so a cold prefill runs them only for the end of the prompt. The time to first token for a 136k-token prompt fell from 50.5 to 33.3 s (-34 %).
+- **Expert residency:** giving DeepSeek's spare VRAM to resident expert weights instead of holding it
+  back for swapping experts in and out raised 8-user throughput from 143.9 to 169.5 tok/s (+17.8 %).
 - **Sequence-parallel prefill stages:** in Qwen prefill each card runs the hyper-connection stages on a
   quarter of the rows between a reduce-scatter and an all-gather, which raised 64k prefill from 8,293
   to 8,754 tok/s (+5.7 %).
@@ -99,8 +88,9 @@ The `main` branch has:
 - [registry/](registry/): one row per tested change, rejected ones included.
 - [gpu02/](gpu02/): the test scripts, the host tuning scripts and the run summaries.
 
-The engine code is on the `deepseek/*`, `qwen/*` and `exl3/*` branches. The current DeepSeek build is
-`deepseek/ds41-fuse` with `exl3/ds41-k25u`, and the current Qwen build is `qwen/fn4-x3-stack`.
+The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches, and the current builds are
+`deepseek/current` (with `exl3/current`) and `qwen/current`. Every other branch is a single experiment
+or an earlier build, kept for the record.
 
 ## License
 
