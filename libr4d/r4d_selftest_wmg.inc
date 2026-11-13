@@ -1211,4 +1211,101 @@ static void refcheck(const Plugin& pl, const char* tlist) {
                 keys == 0 ? "NO DATA" : bad ? "FAIL (W further from the f64 reference than int16's band)" : "PASS (W as close to f64 as int16's band)");
 }
 
+/* --perfwkpf [Ms] [iters] [types] (ds41-wmk2, stage 3 G3): the prefill rows' time, int16 vs lever WMK. Per (type, shape, M) at the
+ * 2.25 .rad's dense shapes, rotated weights past 256 MiB, mean of `iters`: the stock WMMA kernel, each GPF form F (int16's arithmetic,
+ * gg_pf pinned) and the same form under ds41_wmk 1 (the part order, r4d_gg_wkpf_run) with the running total in registers (r) and in
+ * scratch (s). Bytes: every W arm = W on form 322 (one arithmetic whatever the form). GPWMK lines, WMGVERDICT wkpf. */
+static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char* tlist) {
+    if (iters <= 0) iters = 20;
+    Hk h;
+    if (!hooks(pl, h, "--perfwkpf")) return;
+    const GpHooks gp = gp_hooks(pl);
+    auto wkpf_ts = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_ts");
+    auto wkpf_last = (int (*)())dlsym(pl.h, "r4d_gg_wkpf_last");
+    if (!gp.pin || !wkpf_ts || !wkpf_last) { std::printf("--perfwkpf: r4d_gg_pf_pin / r4d_gg_wkpf_ts absent\n"); ++g_fail; return; }
+    const std::vector<int64_t> Ms = gp_list(mlist, "4096,2048");
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    const int forms[] = { 322, 422, 426, 326, 321, 222 };
+    long long keys = 0, bad = 0;
+    double lsum = 0; int nl = 0;
+    std::printf("WMK prefill timing (rotated weights, mean of %d): stock / GPF form F (int16) / form under ds41_wmk 1 with the total in registers (r) and scratch (s)\n", iters);
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        for (const MrShape& sh : kMrShapes) {
+            if (sh.logits || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
+            const int64_t rb = sh.K / ty.qk * ty.bb, wbytes = sh.N * rb;
+            std::vector<uint8_t> hw;
+            mr_weights(hw, ty, sh.N, sh.K, 0x51ED2701ull ^ (uint64_t)(sh.N * 7 + sh.K));
+            const int copies = (int)std::max<int64_t>(2, (256ll << 20) / wbytes + 1);
+            for (int64_t M : Ms) {
+                if (M <= 48) continue;
+                dfree_all();
+                std::vector<uint16_t> hx;
+                gp_acts(hx, M, sh.K, 0xABCDEFull ^ (uint64_t)M);
+                const size_t mb = (size_t)(M * sh.N) * 2;
+                void* d_x = dalloc((size_t)(M * sh.K) * 2);
+                void* d_w = dalloc((size_t)wbytes * (size_t)copies);
+                void* d_y = dalloc(mb);
+                if (!d_x || !d_w || !d_y) { std::printf("  %s %s M=%lld: alloc failed\n", ty.name, sh.name, (long long)M); ++g_fail; continue; }
+                st_memcpy(d_x, hx.data(), (size_t)(M * sh.K) * 2, hipMemcpyHostToDevice);
+                for (int c = 0; c < copies; ++c) st_memcpy((uint8_t*)d_w + (size_t)c * (size_t)wbytes, hw.data(), (size_t)wbytes, hipMemcpyHostToDevice);
+                MrLaunch L;
+                if (!mr_setup(L, pl, sh, ty, M)) { std::printf("  %s %s: row absent\n", ty.name, sh.name); ++g_fail; continue; }
+                std::vector<uint8_t> wref;
+                /* arm: wmk 0 / 1, pf form (0 = stock), ts */
+                auto arm = [&](int wmk, int form, int ts, double* us, bool* same, int* used) -> bool {
+                    clear(h);
+                    h.sw("ds41_wmk", wmk);
+                    gp.pin(form);
+                    wkpf_ts(ts);
+                    st_memset(d_y, 0xff, mb);
+                    const int rc = L.run(d_x, d_w, d_y);
+                    bool ok = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                    *used = wmk ? wkpf_last() : form;
+                    if (ok && wmk) {
+                        std::vector<uint8_t> got(mb);
+                        st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
+                        if (wref.empty()) wref = got;
+                        *same = got == wref;
+                    } else {
+                        *same = true;
+                    }
+                    if (ok) *us = st_time_us([&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); }, iters, nullptr);
+                    gp.pin(0); wkpf_ts(0); h.sw("ds41_wmk", 0);
+                    return ok;
+                };
+                double st = 0; bool sm; int u;
+                arm(0, 0, 0, &st, &sm, &u);
+                const double fl = 2.0 * (double)M * (double)sh.N * (double)sh.K;
+                std::string line = fmt("GPWMK %s %s %lldx%lld M=%lld: stock %.1f us (%.1f TF) |", ty.name, sh.name, (long long)sh.N, (long long)sh.K, (long long)M,
+                                       st, st > 0 ? fl / (st * 1e6) : 0.0);
+                double bestF = st, bestW = 1e30;
+                int bF = 0, bW = 0;
+                bool kb = false;
+                for (int fc : forms) {
+                    double uf = -1, ur = -1, us = -1; bool s1 = true, s2 = true; int u1 = 0, u2 = 0;
+                    const bool okf = arm(0, fc, 0, &uf, &sm, &u);
+                    const bool okr = arm(1, fc, 1, &ur, &s1, &u1);
+                    const bool oks = arm(1, fc, 2, &us, &s2, &u2);
+                    if (!okf || !okr || !oks || !s1 || !s2 || u1 != fc || u2 != fc) kb = true;
+                    if (okf && uf > 0 && uf < bestF) { bestF = uf; bF = fc; }
+                    if (okr && ur > 0 && ur < bestW) { bestW = ur; bW = fc * 10 + 1; }
+                    if (oks && us > 0 && us < bestW) { bestW = us; bW = fc * 10 + 2; }
+                    line += fmt(" %d F %.1f W r %.1f s %.1f%s;", fc, uf, ur, us, (!s1 || !s2) ? " W BYTES DIFFER" : "");
+                }
+                ++keys; bad += kb; g_fail += kb;
+                if (bestF > 0 && bestW < 1e29) { lsum += std::log(bestW / bestF); ++nl; }
+                std::printf("%s | best int16 %d %.1f us, best W %d%s %.1f us, W/int16 x%.3f%s\n", line.c_str(), bF, bestF, bW / 10, bW % 10 == 1 ? "r" : "s", bestW,
+                            bestF > 0 ? bestW / bestF : 0.0, kb ? " BAD" : "");
+                std::fflush(stdout);
+            }
+        }
+    }
+    clear(h);
+    dfree_all();
+    if (keys == 0) ++g_fail;
+    std::printf("WMGVERDICT wkpf: %lld (type, shape, M) keys, %lld bad (a launch failed, a W form unused, or W bytes differ across forms); best W vs best int16 geomean x%.3f\n",
+                keys, bad, nl ? std::exp(lsum / nl) : 0.0);
+}
+
 }  // namespace wmg
