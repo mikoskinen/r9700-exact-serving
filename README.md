@@ -78,20 +78,21 @@ change, the rejected ones included:
 
 ## Model weights
 
-Each model runs from one Radiance container (`.rad`):
+Qwen runs from a ready file, [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3)
+(120.5 GB):
 
-- **Qwen Flash-Next, EXL3 4.05:** [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3),
-  used as downloaded (120.5 GB, sha256 `187ae8186cc1f2ba8bce96565592af7fc6f6ec91c9ece6b4d352eaf0432ee26f`).
-  Its routed experts and MTP head come from the `4.05bpw_h6_ng6` branch of
-  [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), and every
-  other weight is byte-identical to Radiance's own iq4r container of the same model.
-- **DeepSeek V4.1 Flash, EXL3 2.25:** one 272.3 GB container converted on the host from two sources:
-  - the routed experts from the `2.25bpw` branch of
-    [turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3)
-  - every other weight, the Engram table and the DSpark drafter included, from
-    [bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad),
-    an uncensored build with the refusal direction removed from the attention output projections of
-    layers 11 to 28
+```bash
+hf download Dyluhn/qwen3.8-flash-next-exl3 qwen3.8-flash-next-exl3.rad --local-dir ~/models/flashnext-exl3
+cd ~/models/flashnext-exl3
+echo "187ae8186cc1f2ba8bce96565592af7fc6f6ec91c9ece6b4d352eaf0432ee26f  qwen3.8-flash-next-exl3.rad" | sha256sum -c
+```
+
+DeepSeek has no ready file. You convert it from two downloads:
+
+- the routed experts from the `2.25bpw` branch of
+  [turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3)
+- every other weight from [bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad),
+  an uncensored build of the same model
 
 ## Where things are
 
