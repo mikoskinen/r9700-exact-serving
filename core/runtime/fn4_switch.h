@@ -403,6 +403,27 @@
  *                   every pass (the epoch), as aql_acq's does. RADIANCE_AQL_ROUTE_OV=1 at start starts it on. GET "rco":
  *                   in_force, and since start the passes recorded under it, the copies tracked and the dispatches after
  *                   one that play unordered (each recording counts once).
+ *   sched_tail_grid scheduler (lever G, ds41-tailgrid; 72 here, after ds41_moe1; Scheduler::tail_checkpoint): 0 off (today:
+ *                   under --prefix-resume exact a prompt's tail snapshot is where its last chunk starts on the resume
+ *                   grid -- every 4096 tokens from 2048 on the DS line -- so a follow-up turn re-prefills up to one grid
+ *                   step of rows the cache already holds); F = 256 / 512 / 1024 / 2048: the tail snapshot of a plain
+ *                   prompt of N tokens is at the deepest multiple of F at or below N - 128, when that lies past the grid
+ *                   point (so the prompt's last chunk is cut there, each part >= 128 rows: the row count above which no
+ *                   kernel form of the line depends on a piece's rows, option D's floor, sched_bi_chunk 3 / 4), and the
+ *                   next turn resumes there: it re-prefills 128 .. 128 + F - 1 old rows instead of 1 .. 4096. The
+ *                   snapshot is a chunk's end like every other (linear state, window and n-gram state as its last row
+ *                   leaves them) and one of lever PSK's targets (its cone is run), so the hit restores what a cold run
+ *                   holds there; from it the request runs to the end of the cold piece that holds it (cut where option D
+ *                   cuts) and goes on on the cold run's grid. A request latches the value at its admission (a change
+ *                   never moves the targets of a prompt in flight); inert (counted) where F is not a multiple of the
+ *                   quantum and a divisor of the interval and the grid, or the resume is not exact. Not on a cone replay,
+ *                   a media / embedding / scored request or a runtime window. RADIANCE_SCHED_TAIL_GRID=F at start.
+ *                   GET "tailgrid": in_force, latched (requests), tails / tail_rows (fine tail snapshots planned and the
+ *                   rows between each and its prompt's end), resumes / resume_rows_saved (hits resumed off the grid and
+ *                   the rows below them the grid point would have re-prefilled), rejoins (plans from an interval
+ *                   boundary off the grid kept inside the cold piece; counted a plan, not a step), inert (admissions
+ *                   where F does not fit the geometry), declined (a fine snapshot within 128 rows of a prompt's end not
+ *                   resumed at, or a request's fine tail dropped beside a shared head's snapshot).
  *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
  *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
  *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
@@ -546,7 +567,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
-              kRouteCopyOv, kDs41Moe1, kSwitches };
+              kRouteCopyOv, kDs41Moe1, kSchedTailGrid, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -631,6 +652,13 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
  * (admissions and running prefills) and their rows, chunks it displaced, prefills that did not fit even so, steps that
  * carried a NOA piece, and the steps with prefill rows by how many prefill entries they carried (1, 2, 3, 4 or more). */
 int  sched_noa();
+/* Lever G (ds41-tailgrid, sched_tail_grid): the switch once set, else RADIANCE_SCHED_TAIL_GRID at start (0 = off). The
+ * scheduler reads it when it admits a request (Request::tail_grid) and reports its counts every step (GET "tailgrid",
+ * kTailGridCounts values: latched, tails, tail_rows, resumes, resume_rows_saved, rejoins, inert, declined). */
+static constexpr int kTailGridCounts = 8;
+inline bool tail_grid_ok(int v) { return v == 0 || v == 256 || v == 512 || v == 1024 || v == 2048; }
+int  sched_tail_grid();
+void note_sched_tail_grid(const int64_t* v);
 static constexpr int kNoaCounts = 10;   /* admitted, pieces, rows, displaced, waited, steps, pf_steps_1 .. 4plus */
 void note_sched_noa(const int64_t* v);
 /* Lever CAP48 (sched_row_cap): the switch once set, else RADIANCE_DECODE_ROW_CAP (0 .. 4096) at start, else 0 (off). The

@@ -11040,7 +11040,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_moe1, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_moe1, sched_tail_grid, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -11949,7 +11949,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_moe1, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_moe1, sched_tail_grid, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
@@ -12174,5 +12174,311 @@ TEST(cbh_off_plans_as_unset) {
         CHECK_EQ(one0.issued, one5.issued);
         CHECK_EQ(one5.cbh["holds"], (int64_t)0);
         if (ahead) CHECK(unset.issued.find('A') != std::string::npos);
+    }
+}
+
+/* ================================================================== lever G: the tail grid (ds41-tailgrid) */
+/* fn4 sched_tail_grid F (0 off = today; 256 / 512 / 1024 / 2048) under --prefix-resume exact on the DS41 line's geometry
+ * (interval 2048, span 2 from 16384 tokens, MNBT 4160: the resume grid 2048 + k x 4096; ds41_psk 4 + ds41_psk_cr 1 as the
+ * line's pin: tail-only anchors). A plain prompt's tail snapshot moves from the grid point under its end to the deepest
+ * multiple of F at or below N - 128, cutting the prompt's last cold chunk in two pieces of >= 128 rows; the next turn
+ * resumes there. What the tests hold the scheduler to is option D's rule against the LEVER-OFF cold plan of the same
+ * prompt: every piece lies inside one cold piece, and each of its ends is that piece's end or at least 128 rows from both
+ * of the cold piece's ends -- the rule under which sched_bi_chunk 3 cuts beside other work today. */
+namespace {
+struct TgSwitch {
+    explicit TgSwitch(int v) { CHECK(DstSwitches::set("sched_tail_grid", v)); }
+    ~TgSwitch() { DstSwitches::set("sched_tail_grid", 0); }
+};
+using TgPieces = std::vector<std::pair<int64_t, int64_t>>;   /* [begin, end) */
+TgPieces tg_pieces(const CrTurn& t) {
+    TgPieces p;
+    for (const CrStep& s : t.st) p.push_back({ s.ctx, s.ctx + s.n });
+    return p;
+}
+/* "" when `on` keeps option D's rule against the cold plan `cold` (contiguous from its first piece's start to the end). */
+std::string tg_rule(const TgPieces& on, const TgPieces& cold, int64_t N) {
+    char why[200];
+    if (on.empty() || cold.empty()) return "no pieces";
+    for (size_t i = 0; i < on.size(); ++i) {
+        const int64_t a = on[i].first, b = on[i].second;
+        if (i > 0 && a != on[i - 1].second) return "not contiguous";
+        const std::pair<int64_t, int64_t>* c = nullptr;
+        for (const auto& k : cold)
+            if (k.first <= a && a < k.second) c = &k;
+        if (!c) { std::snprintf(why, sizeof why, "[%lld, %lld) starts in no cold piece", (long long)a, (long long)b); return why; }
+        const int64_t A = c->first, B = c->second;
+        const bool ok = b <= B && (a == A || a - A >= 128) && (b == B || B - b >= 128) && (b - a >= 128 || (a == A && b == B));
+        if (!ok) {
+            std::snprintf(why, sizeof why, "[%lld, %lld) in the cold piece [%lld, %lld)", (long long)a, (long long)b,
+                          (long long)A, (long long)B);
+            return why;
+        }
+    }
+    if (on.back().second != N) return "does not reach the prompt's end";
+    return "";
+}
+int64_t tg_json(const char* key) {
+    const std::string g = fn4::state_json();
+    return noa_json_num(g, g.find("\"tailgrid\": {"), key);
+}
+}  // namespace
+
+TEST(lever_g_the_switch_takes_its_grids_and_starts_off) {
+    std::string err;
+    for (int v : { 0, 256, 512, 1024, 2048 }) CHECK(fn4::check("sched_tail_grid", v, &err));
+    for (int v : { -1, 1, 16, 128, 100, 384, 768, 4096 }) {
+        CHECK(!fn4::check("sched_tail_grid", v, &err));
+        CHECK(err.find("sched_tail_grid takes 0") != std::string::npos);
+    }
+    CHECK_EQ(fn4::sched_tail_grid(), 0);
+    CHECK_EQ(fn4::switch_index("sched_tail_grid"), (int)fn4::kSchedTailGrid);
+    CHECK(!fn4::sched_switch(fn4::kSchedTailGrid));
+    {
+        TgSwitch on(512);
+        CHECK_EQ(fn4::sched_tail_grid(), 512);
+        CHECK(fn4::state_json().find("\"sched_tail_grid\": 512") != std::string::npos);
+        CHECK_EQ(tg_json("in_force"), (int64_t)512);
+    }
+    CHECK_EQ(fn4::sched_tail_grid(), 0);
+    CHECK_EQ(tg_json("in_force"), (int64_t)0);
+}
+
+/* The rule itself: tail_checkpoint(N, F) over every F and many lengths -- today's point where F gains nothing (the end
+ * within 128 rows of it, or below the first interval), else the deepest multiple of F at or below N - 128, at least F
+ * past the grid point; and 0 = today's for every N. */
+TEST(lever_g_the_tail_is_the_deepest_grid_multiple_that_leaves_128_rows) {
+    Fixture f;
+    cr_fixture(f);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    const ChunkGeometry& g = f.sch.geometry();
+    REQUIRE_EQ(g.grid, (int64_t)4096);
+    REQUIRE_EQ(g.grid_origin, (int64_t)2048);
+    int moved = 0;
+    for (int64_t N = 100; N <= 30000; N += 61) {
+        const int64_t base = f.sch.tail_checkpoint(N);
+        CHECK_EQ(f.sch.tail_checkpoint(N, 0), base);
+        for (int64_t F : { 256, 512, 1024, 2048 }) {
+            const int64_t t = f.sch.tail_checkpoint(N, F);
+            if (t == base) {
+                /* nothing deeper is admissible: no multiple of F in (base, N - 128] past the first interval */
+                const int64_t d = (N - 128) / F * F;
+                CHECK(N <= 128 || d <= std::max<int64_t>(base, 0) || d <= 2048);
+                continue;
+            }
+            ++moved;
+            CHECK(t > base);
+            CHECK_EQ(t % F, (int64_t)0);
+            CHECK(N - t >= 128 && N - t < 128 + F);
+            CHECK(t > 2048);
+            if (base > 0) CHECK(t - base >= F);
+        }
+    }
+    CHECK(moved > 1000);
+    CHECK_EQ(f.sch.tail_checkpoint(52000, 512), (int64_t)51712);
+    CHECK_EQ(f.sch.tail_checkpoint(52000), (int64_t)51200);
+    CHECK_EQ(f.sch.tail_checkpoint(51300, 512), (int64_t)51200);     /* 100 rows past the grid point: today's */
+    CHECK_EQ(f.sch.tail_checkpoint(51840, 512), (int64_t)51712);     /* exactly 128 rows left */
+    CHECK_EQ(f.sch.tail_checkpoint(51839, 512), (int64_t)51200);
+}
+
+/* A Claude Code conversation alone in the engine: a cold text, then turns that each extend the previous prompt by its
+ * answer and a new message. Under F every request -- cold or resumed -- keeps option D's rule against the lever-off cold
+ * plan of its own prompt; it takes exactly one snapshot, its fine tail; the next turn restores it and re-prefills
+ * 128 .. 127 + F old rows where today's grid costs it up to 4096; no turn replays; every PSK target lies at or past its
+ * chunk's end. With the switch at 0 the same conversation is today's (grid tails), also after fine snapshots exist. */
+TEST(lever_g_a_conversation_resumes_at_its_fine_tail_inside_the_cold_runs_pieces) {
+    const int64_t cold = 52000;
+    const std::vector<std::pair<int64_t, int64_t>> turns = { { 52600, 51990 }, { 57000, 52590 }, { 57300, 56990 },
+                                                             { 61500, 57290 }, { 61700, 61490 }, { 64000, 61690 } };
+    std::vector<TgPieces> cold_off;   /* the lever-off cold plan of every prompt */
+    std::vector<int64_t> tail_off;
+    {
+        TgSwitch off(0);
+        const CrTurn c0 = cr_turn('T', cold, 0, {});
+        cold_off.push_back(tg_pieces(c0));
+        REQUIRE(c0.snaps.size() == 1);
+        tail_off.push_back(c0.snaps[0]);
+        for (const auto& tn : turns) {
+            const CrTurn c = cr_turn('T', tn.first, 0, {});
+            cold_off.push_back(tg_pieces(c));
+            REQUIRE(c.snaps.size() == 1);
+            tail_off.push_back(c.snaps[0]);
+        }
+        CHECK_EQ(tail_off[0], (int64_t)51200);
+    }
+    for (int F : { 256, 512, 1024, 2048 }) {
+        TgSwitch on(F);
+        /* the cold text under the lever: the same pieces but the last, cut at the fine tail */
+        const CrTurn c0 = cr_turn('T', cold, 0, {});
+        CHECK_EQ(tg_rule(tg_pieces(c0), cold_off[0], cold), std::string(""));
+        const int64_t f0 = (cold - 128) / F * F;
+        CHECK((c0.snaps == std::vector<int64_t>{ f0 }));
+        std::vector<int64_t> avail = c0.snaps;
+        int64_t prev_n = cold, prev_tail = f0, saved = 0;
+        for (size_t k = 0; k < turns.size(); ++k) {
+            const int64_t N = turns[k].first, match = turns[k].second;
+            avail = cr_path(avail, match);
+            const CrTurn t = cr_turn('T', N, match, avail);
+            REQUIRE(!t.st.empty());
+            /* resumed at the previous prompt's fine tail, restored, never by a replay */
+            CHECK_EQ(t.st[0].ctx, prev_tail);
+            CHECK(t.st[0].restore >= 0);
+            CHECK_EQ(t.m.psk_cr_hits, (int64_t)0);
+            for (const CrStep& s : t.st) { CHECK_EQ(s.replay, 0); CHECK(s.ahead >= 0); }
+            /* the old rows it re-prefills: 128 .. 127 + F (today: prev_n - the grid point under it) */
+            CHECK(prev_n - prev_tail >= 128 && prev_n - prev_tail < 128 + F);
+            saved += prev_tail - (prev_tail < 2048 ? 0 : 2048 + (prev_tail - 2048) / 4096 * 4096);
+            /* option D's rule against this prompt's lever-off cold plan */
+            CHECK_EQ(tg_rule(tg_pieces(t), cold_off[k + 1], N), std::string(""));
+            /* one snapshot: the fine tail, a chunk's end, with its target 0 rows ahead of that chunk */
+            const int64_t fk = std::max<int64_t>((N - 128) / F * F, tail_off[k + 1]);
+            if (fk > t.st[0].ctx) CHECK((t.snaps == std::vector<int64_t>{ fk }));
+            else                  CHECK(t.snaps.empty());   /* the prompt grew less than a grid step: the snapshot it resumed at */
+            bool at_end = false;
+            for (const CrStep& s : t.st)
+                if (s.ctx + s.n == fk) { at_end = true; CHECK_EQ(s.ahead, (int64_t)0); CHECK_EQ(s.ckpts, 1); }
+            CHECK(at_end || fk == t.st[0].ctx);
+            for (int64_t p : t.snaps) avail.push_back(p);
+            std::sort(avail.begin(), avail.end());
+            prev_n = N;
+            prev_tail = fk;
+        }
+        (void)saved;
+    }
+    /* back at 0 with the fine snapshots still cached: every prompt's cold plan is today's */
+    TgSwitch off(0);
+    for (size_t k = 0; k < turns.size(); ++k) {
+        const CrTurn c = cr_turn('T', turns[k].first, 0, {});
+        CHECK(tg_pieces(c) == cold_off[k + 1]);
+        CHECK((c.snaps == std::vector<int64_t>{ tail_off[k + 1] }));
+    }
+}
+
+/* Many conversations, every F: random cold lengths and turn growths (an answer of 50 .. 3000 tokens + a message of
+ * 20 .. 2500), the match a few tokens short of the previous prompt (the re-rendered generation prompt). Every turn keeps
+ * option D's rule against its own lever-off cold plan, resumes at the previous fine tail and never replays. */
+TEST(lever_g_random_conversations_keep_the_cold_runs_pieces) {
+    uint32_t rng = 20261113u;
+    auto rnd = [&](int lo, int hi) { rng = rng * 1664525u + 1013904223u; return lo + (int)((rng >> 8) % (uint32_t)(hi - lo + 1)); };
+    int turns_checked = 0;
+    for (int conv = 0; conv < 10; ++conv) {
+        const int F = (int[]){ 256, 512, 1024, 2048 }[conv % 4];
+        int64_t N = rnd(3000, 30000);   /* (the fixture's prompts end below 64536 tokens) */
+        std::vector<int64_t> lens = { N };
+        for (int k = 0; k < 5; ++k) { N += rnd(50, 3000) + rnd(20, 2500); lens.push_back(N); }
+        std::vector<TgPieces> cold_off;
+        {
+            TgSwitch off(0);
+            for (int64_t L : lens) cold_off.push_back(tg_pieces(cr_turn('T', L, 0, {})));
+        }
+        TgSwitch on(F);
+        const CrTurn c0 = cr_turn('T', lens[0], 0, {});
+        CHECK_EQ(tg_rule(tg_pieces(c0), cold_off[0], lens[0]), std::string(""));
+        std::vector<int64_t> avail = c0.snaps;
+        for (size_t k = 1; k < lens.size(); ++k) {
+            const int64_t match = lens[k - 1] - rnd(1, 12);
+            avail = cr_path(avail, match);
+            const int64_t deepest = avail.empty() ? 0 : avail.back();
+            const CrTurn t = cr_turn('T', lens[k], match, avail);
+            REQUIRE(!t.st.empty());
+            const std::string why = tg_rule(tg_pieces(t), cold_off[k], lens[k]);
+            if (!why.empty()) std::fprintf(stderr, "conv %d F %d turn %zu N %lld: %s\n", conv, F, k, (long long)lens[k], why.c_str());
+            CHECK_EQ(why, std::string(""));
+            if (deepest > 0) { CHECK_EQ(t.st[0].ctx, deepest); CHECK(t.st[0].restore >= 0); }
+            CHECK_EQ(t.m.psk_cr_hits, (int64_t)0);
+            for (const CrStep& s : t.st) CHECK(s.ahead >= 0);
+            for (int64_t p : t.snaps) avail.push_back(p);
+            std::sort(avail.begin(), avail.end());
+            ++turns_checked;
+        }
+    }
+    CHECK_EQ(turns_checked, 50);
+}
+
+/* A prompt cut short of a cached one, ending within 128 rows past that one's fine tail: resuming there would run its last
+ * rows in a piece of another form band than its cold run's, so the snapshot is declined (counted) and the request is
+ * served as a hit with no snapshot -- here by lever PSK-CR's replay to the grid point -- and its pieces from there are its
+ * cold run's own. From 128 rows on it resumes at the fine tail. */
+TEST(lever_g_a_fine_snapshot_within_128_rows_of_a_prompts_end_is_not_resumed_at) {
+    TgPieces cold_near, cold_far;
+    {
+        TgSwitch off(0);
+        cold_near = tg_pieces(cr_turn('T', 51784, 0, {}));
+        cold_far = tg_pieces(cr_turn('T', 51840, 0, {}));
+    }
+    TgSwitch on(512);
+    const CrTurn near = cr_turn('T', 51784, 51780, { 51712 });     /* 72 rows past the fine tail of a 52000-token prompt */
+    REQUIRE(!near.st.empty());
+    CHECK(near.st[0].ctx != 51712);
+    CHECK_EQ(near.st[0].restore, -1);
+    CHECK_EQ(near.m.psk_cr_hits, (int64_t)1);                      /* the grid point 51200 by a replay */
+    TgPieces rest;
+    for (const CrStep& s : near.st)
+        if (!s.replay) rest.push_back({ s.ctx, s.ctx + s.n });
+    CHECK((rest == TgPieces{ { 51200, 51784 } }));
+    CHECK(rest.back() == cold_near.back());
+    const CrTurn far = cr_turn('T', 51840, 51836, { 51712 });      /* 128 rows: one piece [51712, 51840) */
+    REQUIRE(!far.st.empty());
+    CHECK_EQ(far.st[0].ctx, (int64_t)51712);
+    CHECK(far.st[0].restore >= 0);
+    CHECK((tg_pieces(far) == TgPieces{ { 51712, 51840 } }));
+    CHECK_EQ(tg_rule(tg_pieces(far), cold_far, 51840), std::string(""));
+}
+
+/* Beside decode rows under the line's chunking (sched_bi_chunk 3, sched_noa 2, six decoders): a turn resumed at a fine
+ * tail (a hit at 56990 of a 57000-token prompt's cache, its snapshot at 56832) keeps option D's rule against its lever-off
+ * cold plan in every piece, takes its own fine tail and is counted; the long answer case crosses the cold run's next
+ * chunk start and goes on on the cold grid. GET "tailgrid". */
+TEST(lever_g_a_resumed_turn_beside_decode_rows_keeps_option_d) {
+    struct Case { int64_t N, match, lin; };
+    /* 57300: grown less than a grid step past the snapshot (one piece, no new snapshot); 58000: its own fine tail at 57856;
+     * 57000 from 52224: the cold piece [51200, 55296) left over, cut by option D at 53248, then the grid chunk to the tail */
+    for (const Case& c : { Case{ 57300, 56990, 56832 }, Case{ 58000, 56990, 56832 }, Case{ 57000, 52590, 52224 } }) {
+        TgPieces cold;
+        {
+            TgSwitch off(0);
+            cold = tg_pieces(cr_turn('T', c.N, 0, {}));
+        }
+        TgSwitch on(512);
+        NoaCfg n;
+        n.decoders = 6;
+        n.L = 0;
+        n.lens = { (int)c.N };
+        n.after_chunks = 0;
+        n.steps = 60;
+        n.hit = c.match;
+        n.hit_lin = c.lin;
+        n.psk = 2;
+        n.psk_k = 4;
+        const NoaRun r = noa_run(n);
+        REQUIRE(r.ids.size() == 1);
+        const auto it = r.pieces.find(r.ids[0]);
+        REQUIRE(it != r.pieces.end());
+        TgPieces on_p;
+        int64_t fine_ck = -1;
+        const int64_t fk = (c.N - 128) / 512 * 512;
+        for (const PskPiece& p : it->second) {
+            on_p.push_back({ p.at, p.at + p.n });
+            if (p.ck == fk) fine_ck = p.ck;
+            if (p.ahead != Scheduler::kPskNoPlan) CHECK(p.ahead >= 0);
+        }
+        REQUIRE(!on_p.empty());
+        CHECK_EQ(on_p[0].first, c.lin);
+        const std::string why = tg_rule(on_p, cold, c.N);
+        if (!why.empty()) std::fprintf(stderr, "N %lld: %s\n", (long long)c.N, why.c_str());
+        CHECK_EQ(why, std::string(""));
+        CHECK_EQ(fine_ck, fk > c.lin ? fk : (int64_t)-1);
+        if (c.N == 57000)
+            CHECK((on_p == TgPieces{ { 52224, 53248 }, { 53248, 55296 }, { 55296, 56832 }, { 56832, 57000 } }));
+        if (c.N == 58000) CHECK((on_p == TgPieces{ { 56832, 57856 }, { 57856, 58000 } }));
+        if (c.N == 57300) CHECK((on_p == TgPieces{ { 56832, 57300 } }));
+        CHECK(r.max_step_tok <= 4160);
+        CHECK(tg_json("latched") >= 1);
+        CHECK_EQ(tg_json("resumes"), (int64_t)1);
+        CHECK_EQ(tg_json("resume_rows_saved"), (int64_t)(c.lin - (2048 + (c.lin - 2048) / 4096 * 4096)));
+        CHECK_EQ(tg_json("tails"), (int64_t)(fk > c.lin ? 1 : 0));
+        CHECK_EQ(tg_json("tail_rows"), fk > c.lin ? c.N - fk : (int64_t)0);
+        CHECK_EQ(tg_json("inert"), (int64_t)0);
     }
 }

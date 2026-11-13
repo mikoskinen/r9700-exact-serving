@@ -386,6 +386,26 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     }
     if (pc) pc->set_drafter_floor(draft_refill_);
 
+    /* Lever G (fn4 sched_tail_grid; RADIANCE_SCHED_TAIL_GRID at start): said once where it starts on. */
+    if (const int tg = fn4::sched_tail_grid(); tg > 0) {
+        tail_grid_sw_ = tg;
+        const int64_t F = tail_grid_now();
+        tg_n_[6] = 0;   /* the probe above is no admission */
+        if (F > 0)
+            RAD_INFO("scheduler: lever G (fn4 sched_tail_grid %lld, RADIANCE_SCHED_TAIL_GRID): a plain prompt's tail snapshot "
+                     "at the deepest multiple of %lld that leaves its last piece at least %lld rows, where that lies past "
+                     "the resume grid's point (every %lld tokens%s) -- a follow-up turn re-prefills %lld .. %lld cached rows "
+                     "instead of up to %lld; each piece inside the cold run's own, cut as option D cuts",
+                     (long long)F, (long long)F, (long long)kTailMinPiece, (long long)geo_.grid,
+                     geo_.grid_origin > 0 ? fmt(" from %lld", (long long)geo_.grid_origin).c_str() : "",
+                     (long long)kTailMinPiece, (long long)(kTailMinPiece + F - 1), (long long)geo_.grid);
+        else
+            RAD_WARN("scheduler: lever G (fn4 sched_tail_grid %d) is inert here: it needs --prefix-resume exact with "
+                     "checkpoints and a grid the value divides (interval %lld, grid %lld from %lld, quantum %lld)", tg,
+                     (long long)geo_.checkpoint_interval, (long long)geo_.grid, (long long)geo_.grid_origin,
+                     (long long)geo_.quantum);
+    }
+
     /* A tree drafter (rad_drafter_tree): every trunk step verifies its proposals as trees. */
     tree_ = cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter_tree;
     serial_shared_    = cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_SERIAL &&
@@ -1031,6 +1051,12 @@ void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_
     if (e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] && reqs_[(size_t)e.slot]->psk_k > 0)
         ++m_.psk_ckpt_anchor;
     if (e.cr_replay && pos == r.cr_end) ++m_.psk_cr_end_ckpts;   /* ds41-pskcr2: the snapshot at a replay's end */
+    /* lever G: a fine tail snapshot (off the resume grid), and the rows between it and the prompt's end */
+    if (r.tail_grid > 0 && !e.cr_replay && !geo_.on_grid(pos) && e.slot >= 0 && (size_t)e.slot < reqs_.size() &&
+        reqs_[(size_t)e.slot] && pos == tail_checkpoint(reqs_[(size_t)e.slot]->seq_len(), r.tail_grid)) {
+        ++tg_n_[1];
+        tg_n_[2] += reqs_[(size_t)e.slot]->seq_len() - pos;
+    }
 }
 
 int Scheduler::fail_prefilling(const char* why) {
@@ -1713,14 +1739,35 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
         const int64_t I = geo_.checkpoint_interval;
         const bool periodic = !geo_.window_ckpt || geo_.window_periodic;
         const int64_t next = periodic ? ((n_computed / I) + 1) * I : INT64_MAX;
+        /* Lever G (Request::tail_grid; never on a cone replay, whose chunks are the cold run's own up to its end): a
+         * request resumed at a fine tail snapshot starts off the resume grid, inside one of the cold run's pieces. */
+        const bool replay = r && r->cr_end > r->n_computed;
+        const int64_t fine = r && !replay ? r->tail_grid : 0;
+        /* Keyed on the lever having latched once in this process (fine snapshots may exist), not on this request's
+         * latch: a request that declined its own fine tail may still have resumed at another prompt's. Never before
+         * the lever is used, so the switch at 0 from start plans exactly as before. */
+        const bool off_grid = tg_seen_ && !replay && periodic && n_computed > 0 && !geo_.on_grid(n_computed);
         int64_t far = next;
-        if (geo_.span > 1 && span_now_ && n_computed >= I && n_computed % I == 0)
+        if (off_grid) {
+            /* It runs to the end of the cold piece that holds it -- where the request would span alone the cold
+             * run's span piece [grid point, + grid), else the interval's end -- so its rows stay inside the cold
+             * run's own pieces (cut where option D cuts beside other work) and the next chunk starts on the cold
+             * grid again. In particular an interval boundary off the grid starts no span of its own, which would
+             * straddle the cold run's next chunk start. */
+            if (geo_.span > 1 && span_now_ && n_computed >= I) {
+                far = geo_.grid_floor(n_computed) + geo_.grid;
+                if (n_computed % I == 0) ++tg_n_[5];
+            }
+        } else if (geo_.span > 1 && span_now_ && n_computed >= I && n_computed % I == 0) {
             far = n_computed + geo_.span * I;
+        }
         if (n_computed + want > far)
             want = far - n_computed;
-        else if (n_computed + want > next && n_computed + want < n_target)
+        else if (!off_grid && n_computed + want > next && n_computed + want < n_target)
             want = (n_computed + want) / I * I - n_computed;
-        const int64_t tail = tail_checkpoint(n_target);
+        else if (off_grid && n_computed + want < far && n_computed + want > next && n_computed + want < n_target)
+            want = (n_computed + want) / I * I - n_computed;   /* a budget cut inside the piece: the last boundary */
+        const int64_t tail = tail_checkpoint(n_target, fine);
         if (tail > n_computed && n_computed + want >= tail) {
             want = tail - n_computed;
             if (checkpoint_pos) *checkpoint_pos = tail;
@@ -1868,9 +1915,33 @@ int64_t Scheduler::bidi_fit(const Request& r, int64_t n_computed, int64_t n_targ
  * interval (a shorter prompt is cheap to redo) and only where it gains at least a quarter
  * interval over the interval checkpoint below it, which pays for the extra step; a window
  * snapshot follows its own rule (below). */
-int64_t Scheduler::tail_checkpoint(int64_t target) const {
+int64_t Scheduler::tail_grid_now() const {
+    const int64_t F = tail_grid_sw_, I = geo_.checkpoint_interval, Q = geo_.quantum;
+    if (F <= 0) return 0;
+    if (!geo_.exact || I <= 0 || Q <= 0 || geo_.grid <= 0 || F < kTailMinPiece || F % Q != 0 || I % F != 0 ||
+        geo_.grid % F != 0 || geo_.grid_origin % F != 0) {
+        ++tg_n_[6];
+        return 0;
+    }
+    return F;
+}
+
+int64_t Scheduler::tail_checkpoint(int64_t target, int64_t fine) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
+    if (geo_.exact && fine > 0) {
+        /* Lever G (fn4 sched_tail_grid, Request::tail_grid): the deepest multiple of F that leaves the prompt's last
+         * piece at least kTailMinPiece rows, where it lies past the resume grid's own tail point g (below; then at
+         * least F >= kTailMinPiece rows past it: g is a multiple of F, tail_grid_now). The prompt's last cold chunk
+         * [g, target) is cut there into two pieces of the form band of the whole (option D's premise, bi_chunk_plan:
+         * no kernel form depends on a piece's rows from kBiMinPiece = 128 on), the snapshot is the first piece's end
+         * -- every state as its last row leaves it, and one of lever PSK's targets -- and the next turn re-prefills
+         * 128 .. 127 + F old rows instead of 1 .. grid. From the first interval on, as the rule below. Else that rule. */
+        const int64_t margin = geo_.window_ckpt ? std::max<int64_t>(Q, 16) : 1;
+        const int64_t g = geo_.grid_floor(target - margin);
+        const int64_t f = target > kTailMinPiece ? (target - kTailMinPiece) / fine * fine : 0;
+        if (f > std::max<int64_t>(g, 0) && (geo_.window_ckpt ? f >= I : f > I)) return f;
+    }
     if (geo_.exact) {
         /* --prefix-resume exact: where the prompt's last chunk starts on the resume grid, so an
          * exact repeat re-prefills that chunk as the cold run did, and an appended turn that chunk
@@ -1936,7 +2007,7 @@ int64_t Scheduler::psk_next_target(const SchedReq& s, int64_t from, int64_t n) c
     int64_t t = n;
     const auto take = [&](int64_t p) { if (p > from && p < t) t = p; };
     if (geo_.checkpoints() && s.psk_k > 0) {
-        take(tail_checkpoint(n));
+        take(tail_checkpoint(n, s.req ? s.req->tail_grid : 0));
         const int64_t K = s.psk_k;
         const int64_t i = (psk_i_at(from + 1) + K - 1) / K * K;
         if (!s.psk_tail_only) take(psk_q(i));   /* lever PSK-CR: tail-only takes no grid point */
@@ -1950,7 +2021,7 @@ bool Scheduler::psk_is_target(const SchedReq& s, int64_t pos, int64_t n) const {
     if (pos <= 0) return false;
     if (pos == n) return true;
     if (!geo_.checkpoints() || s.psk_k <= 0) return false;
-    if (pos == tail_checkpoint(n)) return true;
+    if (pos == tail_checkpoint(n, s.req ? s.req->tail_grid : 0)) return true;
     const int64_t i = psk_i_at(pos);
     if (!s.psk_tail_only && psk_q(i) == pos && i % s.psk_k == 0) return true;
     if (s.psk_32k && pos == psk_q(psk_i_at(32768))) return true;
@@ -2242,6 +2313,15 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
         s.hit_cut = SchedReq::HitCut::None;
         r.cr_end = 0;   /* lever PSK-CR: no replay yet */
         s.cr_from = 0;
+        /* Lever G (fn4 sched_tail_grid): latched at a fresh attempt for a plain trunk prompt (as lever PSK plans one:
+         * no embedding, scored rows, words for the plugin, media or runtime window) and fixed while it is prefilled,
+         * so every chunk of the prompt plans the same tail and the same targets. */
+        r.tail_grid = 0;
+        if (tail_grid_sw_ > 0 && !r.embed && !r.score && !r.token_scores && r.plugin_words.empty() && !r.media &&
+            !(kv_ && kv_->has_runtime_window(r.id))) {
+            r.tail_grid = (int32_t)tail_grid_now();
+            if (r.tail_grid > 0) { ++tg_n_[0]; tg_seen_ = true; }
+        }
     }
     /* lever PSK design 2: the request's targets (latched again below on every admission path; the same values) --
      * here first, as lever PSK-CR's decision at the hit needs them */
@@ -2281,7 +2361,21 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
             cap.max_give_back = 2 * draft_refill_;
         }
-        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        /* Lever G: a snapshot off the resume grid (another prompt's fine tail) is a resume point of THIS prompt only
+         * where it leaves the prompt's last piece at least kTailMinPiece rows -- a cut option D could make in this
+         * prompt's cold plan. Nearer its end the rows behind it would run in a piece of another form band than the
+         * cold run's, so the snapshot is not taken: the hit goes on as one with no snapshot (the grid point under it
+         * by a cone replay where lever PSK-CR serves it, else from its start). A conversation's own next turn never
+         * comes here (its tail lies at least kTailMinPiece below the prompt it extends); a prompt cut short of a
+         * cached one can. Only once the lever has latched in this process. */
+        if (tg_seen_ && geo_.exact && h.checkpoint_slot >= 0 && h.n_linear_tokens > 0 &&
+            !geo_.on_grid(h.n_linear_tokens) &&
+            (int64_t)r.prompt.size() - h.n_linear_tokens < kTailMinPiece) {
+            h.n_linear_tokens = 0;
+            h.checkpoint_slot = -1;
+            ++tg_n_[7];
+        }
         if (h.given_back > 0) {
             m_.draft_refill_tokens += h.given_back;
             ++m_.draft_refills;
@@ -2449,6 +2543,30 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
                       (unsigned long long)r.id, (long long)h.branch_at);
         }
 
+        /* Lever G: the request's own fine tail must leave every piece around it at least kTailMinPiece rows. The
+         * resume grid, other fine tails and option D's cuts are multiples of the tail grid's base (256), so only a
+         * position on the quantum alone can come nearer: a shared head's snapshot this request resumed at or takes on
+         * its way (Request::checkpoint_at). Then the request keeps the resume grid's own tail (counted declined). */
+        if (r.tail_grid > 0) {
+            const int64_t N = s.seq_len();
+            const int64_t f = tail_checkpoint(N, r.tail_grid);
+            if (f != tail_checkpoint(N, 0)) {
+                const int64_t start = cr_at > 0 ? cr_at : reuse;
+                const int64_t keep = r.checkpoint_at > 0 ? r.checkpoint_at / geo_.quantum * geo_.quantum : 0;
+                const bool near_start = start < f && f - start < kTailMinPiece;
+                const bool near_keep = keep > 0 && keep != f && keep < N &&
+                                       (keep > f ? keep - f : f - keep) < kTailMinPiece;
+                if (near_start || near_keep) {
+                    r.tail_grid = 0;
+                    ++tg_n_[7];
+                }
+            }
+        }
+        /* lever G: a hit resumed at a snapshot off the resume grid, and the rows the grid point under it would re-prefill */
+        if (tg_seen_ && cr_at == 0 && reuse > 0 && !geo_.on_grid(reuse)) {
+            ++tg_n_[3];
+            tg_n_[4] += reuse - geo_.grid_floor(reuse);
+        }
         r.n_computed = reuse;
         r.n_cached = reuse;
         s.ckpt_src = (reuse > 0 && reuse == h.n_linear_tokens &&
@@ -2875,6 +2993,7 @@ const RadBatch* Scheduler::step() {
         bypass_now_ = fn4::sched_short_bypass();
         bypass_total_ = bypass_now_ > 0 ? fn4::sched_bypass_total() : 0;
         noa_mode_ = fn4::sched_noa();   /* lever NOA */
+        tail_grid_sw_ = fn4::sched_tail_grid();   /* lever G: latched by the requests this step admits */
     }
     /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
      * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
@@ -4303,6 +4422,8 @@ void Scheduler::step_finished() {
     fn4::note_sched_dst(n_bypassed_, n_bypass_refused_);   /* lever DST: sched_short_bypass's counts */
     static_assert(sizeof(noa_n_) / sizeof(noa_n_[0]) == fn4::kNoaCounts, "lever NOA's counts");
     fn4::note_sched_noa(noa_n_);                           /* lever NOA's counts */
+    static_assert(sizeof(tg_n_) / sizeof(tg_n_[0]) == fn4::kTailGridCounts, "lever G's counts");
+    fn4::note_sched_tail_grid(tg_n_);                      /* lever G's counts */
     static_assert(sizeof(cap_n_) / sizeof(cap_n_[0]) == fn4::kCapCounts, "lever CAP48's counts");
     fn4::note_sched_cap(cap_n_);                           /* lever CAP48's counts */
     static_assert(sizeof(cbh_n_) / sizeof(cbh_n_[0]) == fn4::kCbhCounts, "lever CBH's counts");

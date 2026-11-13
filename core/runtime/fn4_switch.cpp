@@ -35,7 +35,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
-                                        "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov", "ds41_moe1" };
+                                        "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov", "ds41_moe1",
+                                        "sched_tail_grid" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -108,6 +109,7 @@ struct State {
     std::atomic<int64_t> cap[kCapCounts];                   /* note_sched_cap (lever CAP48) */
     std::atomic<int64_t> cbh[kCbhCounts];                   /* note_sched_cbh (lever CBH) */
     std::atomic<int64_t> rco[3];                            /* note_rco (lever RCO): recordings, copies, freed */
+    std::atomic<int64_t> tg[kTailGridCounts];               /* note_sched_tail_grid (lever G) */
     std::atomic<int> stage_capable{-1}, hb_capable{-1};     /* lever SA / HB: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> sahb[kSahbRanks][kSahbN];          /* note_sahb */
     std::atomic<int> sahb_ranks{0};
@@ -142,6 +144,7 @@ struct State {
         for (auto& c : cap) c.store(0, std::memory_order_relaxed);
         for (auto& c : cbh) c.store(0, std::memory_order_relaxed);
         for (auto& c : rco) c.store(0, std::memory_order_relaxed);
+        for (auto& c : tg) c.store(0, std::memory_order_relaxed);
         for (auto& r : sahb)
             for (auto& c : r) c.store(0, std::memory_order_relaxed);
         for (auto& r : sp)
@@ -278,6 +281,16 @@ int env_rco() {
     return env;
 }
 
+/* Lever G (ds41-tailgrid): RADIANCE_SCHED_TAIL_GRID=256 / 512 / 1024 / 2048 at start (anything else, or unset, is 0). */
+int env_tail_grid() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_SCHED_TAIL_GRID");
+        const long v = e && *e ? std::strtol(e, nullptr, 10) : 0;
+        return tail_grid_ok((int)v) ? (int)v : 0;
+    }();
+    return env;
+}
+
 /* The reported value of switch i. Under s.mu. */
 int reported(State& s, int i) {
     if (plugin_switch(i)) return plugin_value(s, i);
@@ -288,6 +301,10 @@ int reported(State& s, int i) {
     if (i == kRouteCopyOv) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_rco();
+    }
+    if (i == kSchedTailGrid) {     /* lever G: set, else RADIANCE_SCHED_TAIL_GRID (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_tail_grid();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -398,6 +415,14 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused) {
     State& s = st();
     s.dst[0].store(bypassed, std::memory_order_relaxed);
     s.dst[1].store(bypass_refused, std::memory_order_relaxed);
+}
+int sched_tail_grid() {
+    const int v = st().val[kSchedTailGrid].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_tail_grid();
+}
+void note_sched_tail_grid(const int64_t* v) {
+    State& s = st();
+    for (int k = 0; k < kTailGridCounts; ++k) s.tg[k].store(v[k], std::memory_order_relaxed);
 }
 int sched_noa() {
     const int v = st().val[kSchedNoa].load(std::memory_order_acquire);
@@ -745,7 +770,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_moe1, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_moe1, sched_tail_grid, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1115,6 +1140,15 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedTailGrid) {     /* lever G (ds41-tailgrid): the scheduler's, latched by a request at its admission */
+        if (!tail_grid_ok(v)) {
+            if (err) *err = "sched_tail_grid takes 0 (off: a prompt's tail snapshot on the resume grid, where its last chunk "
+                            "starts) or 256 / 512 / 1024 / 2048 (the tail snapshot at the deepest multiple of it that leaves "
+                            "the prompt's last piece at least 128 rows, under --prefix-resume exact)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedNoa) {          /* lever NOA */
         const int cap = s.mixed_capable.load(std::memory_order_acquire);
         if (v != 0 && (v < 1 || v > 2 || cap != 1)) {
@@ -1266,7 +1300,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
@@ -1424,6 +1458,15 @@ std::string state_json() {
          ", \"recordings\": " + std::to_string((long long)s.rco[0].load(std::memory_order_relaxed)) +
          ", \"copies\": " + std::to_string((long long)s.rco[1].load(std::memory_order_relaxed)) +
          ", \"freed\": " + std::to_string((long long)s.rco[2].load(std::memory_order_relaxed)) + "}";
+    /* Lever G (ds41-tailgrid): always present; the scheduler's counts since start (0 until it reports a step). */
+    {
+        static const char* const kTg[kTailGridCounts] = { "latched", "tails", "tail_rows", "resumes", "resume_rows_saved",
+                                                           "rejoins", "inert", "declined" };
+        o += ", \"tailgrid\": {\"in_force\": " + std::to_string(reported(s, kSchedTailGrid));
+        for (int k = 0; k < kTailGridCounts; ++k)
+            o += std::string(", \"") + kTg[k] + "\": " + std::to_string((long long)s.tg[k].load(std::memory_order_relaxed));
+        o += "}";
+    }
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {
         static const char* const kLend[18] = { "lent_cycles", "lent_plain_steps", "lent_plain_ms", "lent_probe_steps",
