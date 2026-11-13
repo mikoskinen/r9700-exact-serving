@@ -2,8 +2,7 @@
 
 This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
 AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
-whether it runs alone or beside other requests, and [What exact means](#what-exact-means) explains how
-that is checked. The notes are written for people who run large MoE models on AMD GPUs or EPYC hosts or
+whether it runs alone or beside other requests. The notes are written for people who run large MoE models on AMD GPUs or EPYC hosts or
 tune a multi-GPU PCIe box without NVLink, and for anyone who needs reproducible output from a coding
 agent.
 
