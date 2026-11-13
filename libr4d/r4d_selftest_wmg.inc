@@ -748,6 +748,7 @@ static void route(const Plugin& pl, const char* tlist) {
     auto wkpf_last = (int (*)())dlsym(pl.h, "r4d_gg_wkpf_last");
     auto pf_pin = (void (*)(int))dlsym(pl.h, "r4d_gg_pf_pin");
     auto wkpf_ts = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_ts");
+    auto wkpf_follow = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_follow");
     struct Op { const char* name; int kind; int64_t N, N2, K; const char* types; bool a2; };   /* kind 0 gemm, 1 logits, 2 pair, 3 fold a, 4 fold e */
     const Op ops[] = {
         { "attn_q_b(fold a)", 3, 8192, 0, 1280, "q5_K,q6_K", false },  { "attn_q_b", 0, 8192, 0, 1280, "q5_K,q6_K", false },
@@ -940,11 +941,13 @@ static void route(const Plugin& pl, const char* tlist) {
                         if (!wkpf_ts && ts == 2) continue;
                         wmk_on(1);
                         pf_pin(fc);
+                        if (wkpf_follow) wkpf_follow(1);
                         if (wkpf_ts) wkpf_ts(ts);
                         std::vector<uint8_t> of;
                         const int rc = call(0, 130, of);
                         const int used = wkpf_last ? wkpf_last() : -1;
                         pf_pin(0);
+                        if (wkpf_follow) wkpf_follow(0);
                         if (wkpf_ts) wkpf_ts(0);
                         long long nb = 0;
                         if (rc != RAD_OK) nb = -1;
@@ -1223,6 +1226,8 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
     auto wkpf_ts = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_ts");
     auto wkpf_last = (int (*)())dlsym(pl.h, "r4d_gg_wkpf_last");
     if (!gp.pin || !wkpf_ts || !wkpf_last) { std::printf("--perfwkpf: r4d_gg_pf_pin / r4d_gg_wkpf_ts absent\n"); ++g_fail; return; }
+    auto wkpf_follow = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_follow");
+    if (wkpf_follow) wkpf_follow(1);   /* W takes the pinned form */
     const std::vector<int64_t> Ms = gp_list(mlist, "4096,2048");
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
     const int forms[] = { 322, 422, 426, 326, 321, 222 };
@@ -1304,6 +1309,7 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
     clear(h);
     dfree_all();
     if (keys == 0) ++g_fail;
+    if (wkpf_follow) wkpf_follow(0);
     std::printf("WMGVERDICT wkpf: %lld (type, shape, M) keys, %lld bad (a launch failed, a W form unused, or W bytes differ across forms); best W vs best int16 geomean x%.3f\n",
                 keys, bad, nl ? std::exp(lsum / nl) : 0.0);
 }

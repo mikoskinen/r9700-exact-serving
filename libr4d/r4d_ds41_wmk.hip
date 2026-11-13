@@ -586,16 +586,18 @@ extern "C" int r4d_gg_wk_last() { return g_gg_wk_last.load(std::memory_order_rel
  * geometry moves time, never bytes (each output's operations are the part order's in every form). */
 namespace {
 #define WKPF_FORMS(X) X(3, 2, 8, 0) X(4, 2, 8, 0) X(4, 2, 8, 1) X(3, 2, 8, 1) X(3, 2, 4, 0) X(2, 2, 8, 0)
-/* The running total in registers where the form keeps it without spilling (13.11. code object: every type at MT 2, q6_K at MT 3
- * with 8 waves), else in the lane's scratch (ABL 8, TS). g_wkpf_ts (bench pin r4d_gg_wkpf_ts): 0 that rule, 1 always registers,
- * 2 always scratch. */
+/* The running total in registers (measured 14.11., --perfwkpf, one card: the scratch-held total TS costs +30..110 % a launch,
+ * more than the registers' spills). g_wkpf_ts (bench pin r4d_gg_wkpf_ts): 0 / 1 registers, 2 scratch.
+ * The form: 322 (the stock geometry; the fastest part-order form at most dense shapes, 14.11.), whatever gg_pf picks; the bench
+ * pin r4d_gg_wkpf_follow(1) makes it follow gg_pf's pick (the form timing). */
 int g_wkpf_ts = 0;
+int g_wkpf_follow = 0;
 template <int T, int MT, int NT, int WN, int FI>
 int wkpf_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
     const dim3 grid((unsigned)((A.M + 16 * MT - 1) / (16 * MT)), (unsigned)((A.N + 16 * NT * WN - 1) / (16 * NT * WN)));
     if (grid.y > 65535u) return R4D_WK_DECLINE;
     const unsigned lds = pf_lds<T>(MT);
-    const bool ts = g_wkpf_ts == 2 || (g_wkpf_ts == 0 && !(MT == 2 || (T == GG_Q6_K && MT == 3 && WN == 8)));
+    const bool ts = g_wkpf_ts == 2;
     if (ts) {
         if (f32out) return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, float, 8, FI>), grid, dim3(32 * WN), lds, A);
         return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, uint16_t, 8, FI>), grid, dim3(32 * WN), lds, A);
@@ -623,6 +625,7 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
     A.y = y; A.y_ld = y_ld;
     A.M = (int)M; A.N = (int)N; A.K = (int)K;
     A.x_al = 1; A.tab_bytes = 0;
+    if (!g_wkpf_follow) form = 322;
     g_wkpf_last.store(form, std::memory_order_relaxed);
     switch (ty) {
     case GG_Q8_0: return wkpf_launch_t<GG_Q8_0>(s, form, f32out, A);
@@ -632,3 +635,4 @@ int r4d_gg_wkpf_run(RadStream s, int ty, bool f32out, const uint16_t* x, long lo
 }
 extern "C" int r4d_gg_wkpf_last() { return g_wkpf_last.load(std::memory_order_relaxed); }
 extern "C" void r4d_gg_wkpf_ts(int v) { g_wkpf_ts = v == 1 || v == 2 ? v : 0; }
+extern "C" void r4d_gg_wkpf_follow(int on) { g_wkpf_follow = on ? 1 : 0; }
