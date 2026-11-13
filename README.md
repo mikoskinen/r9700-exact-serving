@@ -1,28 +1,22 @@
 # DeepSeek V4.1 Flash and Qwen Flash-Next (EXL3) on 4x AMD Radeon AI PRO R9700
 
-This repository documents local serving of two large mixture-of-experts models, with the measurements
-and every tested change.
+This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
+AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
+whether it runs alone or beside other requests, and [What exact means](#what-exact-means) explains how
+that is checked. The notes are written for people who run large MoE models on AMD GPUs or EPYC hosts or
+tune a multi-GPU PCIe box without NVLink, and for anyone who needs reproducible output from a coding
+agent.
 
-- **Models**
+- **Models** (only these two were optimised)
   - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight
   - Qwen Flash-Next, EXL3 4.05 bits per weight
-  - Only these two were optimised.
-- **Hardware**
-  - 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each), PCIe 4.0 x16, one card per CPU root complex
-  - AMD EPYC 7302P (Rome)
-  - ASRock Rack ROMED8-2T
+- **Hardware and software**
+  - 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each) on PCIe 4.0 x16, one card per CPU root complex
+  - AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board
   - 512 GB of RAM (8 x 64 GB)
-- **Software**
-  - A C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance)
-  - The [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin
-  - Tensor parallel over the four cards
-  - A LiteLLM proxy that serves it to Claude Code
-- **Output**
-  - Byte-identical greedy output alone and under load ([What exact means](#what-exact-means))
-- **Who it's for**
-  - People who run large MoE models on AMD GPUs or EPYC hosts, or tune a multi-GPU PCIe box without
-    NVLink
-  - Anyone who needs reproducible output from a coding agent
+  - A C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance) with the
+    [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, tensor parallel over the four cards
+  - A LiteLLM proxy between Claude Code and the engine
 
 ## Results
 
