@@ -729,7 +729,8 @@ static void scan(const Plugin& pl, int iters, int rounds) {
  *   route   rad_wmk_stats: exactly one part-order launch a call at M <= 48, none at 49, no decline; ds41_wmk 0: none;
  *   bytes   every row of an M <= 48 call = the same row alone (M 1) under the switch (y, y2; h for the folds);
  *           plain / logits / pair outputs = the bench pin r4d_gg_wk_pin(70724) at the same M (the same kernel and code);
- *           the folds' h = h under ds41_wmk 0 (the producer's bytes either way);
+ *           the folds' h = h under ds41_wmk 0 (the producer's bytes either way), and h, y = the producer's own row
+ *           (rmsnorm_bf16 / swiglu_clamped_bf16) then gemm_nt_ggml under the switch (the fold in the form's staging);
  *   info    the M 49 call (stage 1: the stock WMMA form above 48 rows): rows differing from the row alone.
  * WMKROUTE a (type, op), WMGVERDICT wmkroute. */
 static void route(const Plugin& pl, const char* tlist) {
@@ -764,6 +765,9 @@ static void route(const Plugin& pl, const char* tlist) {
                                           : (q32 ? "swiglu_clamped_gemm_nt_ggml_qk32" : "swiglu_clamped_gemm_nt_ggml_qk256");
             const RadKernelInfo* row = find(pl, rn);
             if (!row) { std::printf("  WMKROUTE %s %s: row %s absent\n", ty.name, op.name, rn); ++g_fail; ++bad_keys; ++keys; continue; }
+            const RadKernelInfo* rprod = op.kind == 3 ? find(pl, "rmsnorm_bf16") : op.kind == 4 ? find(pl, "swiglu_clamped_bf16") : nullptr;
+            const RadKernelInfo* rgem = find(pl, q32 ? "gemm_nt_ggml_qk32_gemv" : "gemm_nt_ggml_qk256_gemv");
+            if (op.kind >= 3 && (!rprod || !rgem)) { std::printf("  WMKROUTE %s %s: producer / gemm row absent\n", ty.name, op.name); ++g_fail; ++bad_keys; ++keys; continue; }
             dfree_all();
             const int64_t K = op.K, N = op.N, N2 = op.N2, rb = K / ty.qk * ty.bb, xc = op.kind == 4 ? 2 * K : K;
             const int64_t NY = N + N2, hw_ = op.kind >= 3 ? K : 0;
@@ -832,7 +836,25 @@ static void route(const Plugin& pl, const char* tlist) {
             auto stats = [&](long long* v) { for (int i = 0; i < 4; ++i) v[i] = 0; wst(v, 4); };
             auto wmk_on = [&](int on) { set_dec(h); h.sw("ds41_wmk", on); };
             std::string fails;
-            long long bad = 0, rows_cmp = 0, rows_bad = 0, launch_bad = 0, decl = 0, pin_bad = 0, hoff_bad = 0, off_bad = 0;
+            long long bad = 0, rows_cmp = 0, rows_bad = 0, launch_bad = 0, decl = 0, pin_bad = 0, hoff_bad = 0, off_bad = 0, unf_bad = 0;
+            /* a fold's two launches (the producer's row, then the gemm row on its h) under the current switch state */
+            auto unfused = [&](int64_t M, std::vector<uint8_t>& out) -> int {
+                st_memset(d_y, 0xff, (size_t)M * yrow);
+                st_memset(d_h, 0x5a, (size_t)M * hrow);
+                int rc = op.kind == 3
+                             ? k1_launch(rprod, { T(d_x, RAD_BF16, { M, K }), T(d_g, RAD_F32, { K }), T(d_h, RAD_BF16, { M, K }) },
+                                         { PI("M", M), PI("n", K), PF("eps", 1e-6), PS("dtype", "bf16") })
+                             : k1_launch(rprod, { T(d_x, RAD_BF16, { M, 2 * K }), T(d_h, RAD_BF16, { M, K }) },
+                                         { PI("M", M), PI("n", K), PF("limit", 10.0), PS("dtype", "bf16") });
+                if (rc == RAD_OK)
+                    rc = k1_launch(rgem, { T(d_h, RAD_BF16, { M, K }), T(d_w, RAD_U8, { N, rb }), T(d_y, RAD_BF16, { M, N }) },
+                                   { PI("M", M), PI("N", N), PI("K", K), PS("type", ty.name), PS("dtype", "bf16") });
+                if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return rc != RAD_OK ? rc : -999;
+                out.resize((size_t)M * (yrow + hrow));
+                st_memcpy(out.data(), d_y, (size_t)M * yrow, hipMemcpyDeviceToHost);
+                st_memcpy(out.data() + (size_t)M * yrow, d_h, (size_t)M * hrow, hipMemcpyDeviceToHost);
+                return RAD_OK;
+            };
             long long r49 = -1;
             /* the rows alone under the switch */
             wmk_on(1);
@@ -880,6 +902,11 @@ static void route(const Plugin& pl, const char* tlist) {
                     if (call(0, M, op_) != RAD_OK || op_ != o) { ++pin_bad; if (fails.size() < 400) fails += fmt(" M=%lld != pin;", (long long)M); }
                     h.wk_pin(0);
                 }
+                if (hrow && M <= 48) {   /* the fold = its two launches under the switch (y and h) */
+                    std::vector<uint8_t> ou;
+                    wmk_on(1);
+                    if (unfused(M, ou) != RAD_OK || ou != o) { ++unf_bad; if (fails.size() < 400) fails += fmt(" M=%lld fold != two launches;", (long long)M); }
+                }
                 if (hrow && M <= 48) {
                     wmk_on(0);
                     std::vector<uint8_t> oo;
@@ -897,13 +924,14 @@ static void route(const Plugin& pl, const char* tlist) {
             }
             wmk_on(0);
             clear(h);
-            const bool kb = bad || rows_bad || launch_bad || decl || pin_bad || hoff_bad || off_bad;
+            const bool kb = bad || rows_bad || launch_bad || decl || pin_bad || hoff_bad || off_bad || unf_bad;
             ++keys;
             if (kb) { ++bad_keys; ++g_fail; }
             std::printf("WMKROUTE %s %s %lldx%lld%s | rows vs alone (M 2..48): %lld of %lld differ | launches a call wrong %lld, declines %lld | "
-                        "== bench pin %d: %s | h == switch off: %s | off: no launch %s | M 49 (stock form): %lld of 49 rows differ from alone -> %s%s\n",
+                        "== bench pin %d: %s | h == switch off: %s | fold == its two launches: %s | off: no launch %s | M 49 (stock form): %lld of 49 rows differ from alone -> %s%s\n",
                         ty.name, op.name, (long long)NY, (long long)K, op.kind == 1 ? " f32" : "", rows_bad, rows_cmp, launch_bad, decl, kCode,
-                        op.kind <= 2 ? (pin_bad ? "NO" : "yes") : "n/a", hrow ? (hoff_bad ? "NO" : "yes") : "n/a", off_bad ? "NO" : "yes", r49,
+                        op.kind <= 2 ? (pin_bad ? "NO" : "yes") : "n/a", hrow ? (hoff_bad ? "NO" : "yes") : "n/a", hrow ? (unf_bad ? "NO" : "yes") : "n/a",
+                        off_bad ? "NO" : "yes", r49,
                         kb ? "FAIL" : "ok", fails.c_str());
             std::fflush(stdout);
         }

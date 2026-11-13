@@ -3290,6 +3290,28 @@ struct GgWkArgs {
     int S, SW, SP, PPW;                  /* slabs: of K, a wave's run, a part; parts a run */
     int pfm, pfl;                        /* weight prefetch: 0 the stock loop, 1 none, 2 unrolled (full waves); lines */
     long long psb;                       /* bytes a slab a weight row */
+    /* Lever K1 folds a / e in the part-order form (PRO > 0, ds41-wmk2): the activation's producer computed in the
+     * staging, from its own input in x[0] (PRO 1: rmsnorm's x [M, K]; PRO 2: swiglu_clamped's gate_up [M, 2K], the up
+     * half at x + K), each value the producer's expression rounded to bf16 as the producer stores it (the bytes of
+     * rmsnorm / swiglu_clamped then gemm_nt_ggml); grid column 0 also stores them to h, the producer's own output. */
+    const float* g;                      /* PRO 1: the f32 gain [K] */
+    float eps, wadd, mult;               /* PRO 1: rmsnorm's scalars as its launch reads them */
+    int nw;                              /* PRO 1: the waves of rmsnorm's workgroup a row (r4d_act_threads(M, K) / 32) */
+    float limit;                         /* PRO 2 */
+    uint16_t* h;
+    long long h_ld;
+    int h_al;
+};
+/* The fold operands gg_wk_run takes for PRO 1 / 2 (lever WMK's folds). */
+struct GgWkFold {
+    int pro;
+    const float* g;
+    float eps, wadd, mult;
+    int nw;
+    float limit;
+    uint16_t* h;
+    long long h_ld;
+    int h_al;
 };
 
 constexpr int gg_wk_parts(long long K) {
@@ -3297,13 +3319,19 @@ constexpr int gg_wk_parts(long long K) {
     return S % 8 == 0 ? 8 : S % 4 == 0 ? 4 : S % 2 == 0 ? 2 : 1;
 }
 
-template <int T, int KP, typename OT>
+/* WL (lever WMK stage 2, G1): each wave stages ITS OWN run's 16 rows a slab into its own LDS region, single-buffered, so the
+ * K loop has no block barrier (a wave-scope fence a slab); the staged values, the group sums (the same lanes, the same
+ * DPP partners, the same order) and every operation after them are the block-staged form's, so the bytes are the same. */
+template <int T, int KP, bool WL, typename OT, int PRO = 0>
 __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
     using W = Wq<T>;
     using Pf = typename W::Pf;
     static_assert(W::TB == 0, "gg_wk_kernel: the table types are not built");
     constexpr int NS = 8 / KP;
-    constexpr int BM = 16 * KP;
+    constexpr int BM = WL ? 16 : 16 * KP;      /* rows of a staged region (WL: a wave's own) */
+    constexpr int NX = WL ? 8 : KP;            /* 16-byte chunks a thread stages a slab */
+    constexpr int NB = WL ? 1 : 2;             /* staging buffers */
+    constexpr int NR = WL ? 8 : 1;             /* staged regions (WL: one a wave) */
     constexpr int XE = BM * kWmXP;
     constexpr int XGE = W::XG > 0 ? kWmS / W::XG * BM : 0;
     extern __shared__ __attribute__((aligned(16))) uint8_t gg_smem[];
@@ -3313,9 +3341,19 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
     const int n0 = ((int)blockIdx.y - (mi ? A.gy0 : 0)) * (32 * NS);
     const int N = A.N[mi];
     const int r0 = (int)blockIdx.x * 16, r1 = min(r0 + 16, A.M);
-    uint16_t* Xs = (uint16_t*)(void*)gg_smem;
-    float* Xg = (float*)(void*)(gg_smem + 2 * XE * 2);
-    float* Pp = (float*)(void*)(gg_smem + 2 * XE * 2 + 2 * XGE * 4);
+    const int wreg = WL ? __builtin_amdgcn_readfirstlane(wave) : 0;
+    uint16_t* Xs = (uint16_t*)(void*)gg_smem + wreg * XE;
+    float* Xg = (float*)(void*)(gg_smem + NR * NB * XE * 2) + wreg * XGE;
+    float* Pp = (float*)(void*)(gg_smem + NR * NB * XE * 2 + NR * NB * XGE * 4);
+    auto sync = [&]() {
+        if constexpr (WL) {
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+            __builtin_amdgcn_wave_barrier();
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+        } else {
+            lds_barrier();
+        }
+    };
     const int S = A.S, SW = A.SW, SP = A.SP, PPW = A.PPW;
     const int sb = kp * SW;                                         /* the wave's first slab */
     const uint8_t* wb = A.w[mi];
@@ -3327,24 +3365,116 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
         wr[nt] = wb + (long long)(n < N ? n : N - 1) * A.w_ld;
     }
     /* Activation staging: KP 16-byte chunks a thread a slab (the tile's row tid >> 4, values 8 (tid & 15), at run i's
-     * slab); a row past M stages the tile's last row (rows are independent; its outputs are not written). */
-    const uint16_t* xsrc[KP];
-    int xdo[KP];
+     * slab); a row past M stages the tile's last row (rows are independent; its outputs are not written). WL: 8 chunks a
+     * lane of the wave's own run (row (lane >> 4) + 2 i, values 8 (lane & 15)): a chunk's DPP partners (lane ^ 1, ^ 2) are
+     * the same row's neighbouring chunks, as in the block staging. */
+    const uint16_t* xsrc[NX];
+    int xdo[NX], xgo[NX];
 #pragma unroll
-    for (int i = 0; i < KP; ++i) {
-        const int row = tid >> 4, kc = (tid & 15) * 8;
-        xsrc[i] = A.x[mi] + (long long)min(r0 + row, r1 - 1) * A.x_ld[mi] + kc + (long long)i * SW * kWmS;
-        xdo[i] = (i * 16 + row) * kWmXP + kc;
+    for (int i = 0; i < NX; ++i) {
+        const int row = WL ? (lane >> 4) + 2 * i : tid >> 4, kc = (tid & 15) * 8;
+        const int run = WL ? kp : i, srow = WL ? row : i * 16 + row;
+        xsrc[i] = A.x[mi] + (long long)min(r0 + row, r1 - 1) * A.x_ld[mi] + kc + (long long)run * SW * kWmS;
+        xdo[i] = srow * kWmXP + kc;
+        xgo[i] = ((tid & 15) * 8 / (W::XG > 0 ? W::XG : 1)) * BM + srow;
     }
-    r4d_u32x4 xr[KP];
-    auto xload = [&](int t) {
+    r4d_u32x4 xr[NX];
+    /* PRO 1: the norm scale of each live row of the tile (mr_norm_scales' arithmetic = rmsnorm_body's: virtual wave vw's
+     * lane sums columns 32 vw + lane, + 256, ... in order from 0, r4d_wave_sum, the eight sums in order, then nw - 8
+     * zeros, rsqrtf(sum / K + eps)); the gain's 8 values of a chunk (the same columns in every WL chunk of a lane). */
+    __shared__ float s_ws[PRO == 1 ? 16 : 1][8], s_sc[PRO == 1 ? 16 : 1];
+    constexpr int NGQ = PRO == 1 ? (WL ? 1 : NX) : 1;
+    float4 gq[NGQ][2];
+    r4d_u32x4 xu[PRO == 2 ? NX : 1];   /* PRO 2: the up half's chunks */
+    const bool hw = PRO > 0 && blockIdx.y == 0 && (!WL || ns == 0);   /* this thread's staged chunks go to h too */
+    if constexpr (PRO == 1) {
+        const int mc = r1 - r0;
+        for (int pv = wave; pv < mc * 8; pv += 8) {
+            const int m = pv >> 3, vw = pv & 7;
+            const uint16_t* xr0 = A.x[0] + (long long)(r0 + m) * A.x_ld[0];
+            float ss = 0.0f;
+            for (int c = vw * 32 + lane; c < A.K; c += 256) {
+                const float v = bf16_to_f32(xr0[c]);
+                ss += v * v;
+            }
+            ss = r4d_wave_sum(ss);
+            if (lane == 0) s_ws[m][vw] = ss;
+        }
+        lds_barrier();
+        if (tid < mc) {
+            float tt = 0.0f;
 #pragma unroll
-        for (int i = 0; i < KP; ++i) xr[i] = *(gg_gu128)(const void*)(xsrc[i] + t * kWmS);
+            for (int w = 0; w < 8; ++w) tt += s_ws[tid][w];
+            for (int w = 8; w < A.nw; ++w) tt += 0.0f;
+            s_sc[tid] = rsqrtf(tt / (float)A.K + A.eps);
+        }
+        lds_barrier();
+    }
+    int xt = 0;   /* the run slab xr holds (the h column of a fold's chunk) */
+    auto xload = [&](int t) {
+        xt = t;
+#pragma unroll
+        for (int i = 0; i < NX; ++i) xr[i] = *(gg_gu128)(const void*)(xsrc[i] + t * kWmS);
+        if constexpr (PRO == 2) {
+#pragma unroll
+            for (int i = 0; i < NX; ++i) xu[i] = *(gg_gu128)(const void*)(xsrc[i] + A.K + t * kWmS);
+        }
+        if constexpr (PRO == 1) {
+#pragma unroll
+            for (int i = 0; i < NGQ; ++i) {
+                const int k = (WL ? kp : i) * SW * kWmS + t * kWmS + (tid & 15) * 8;
+                gq[i][0] = *(const float4*)(const void*)(A.g + k);
+                gq[i][1] = *(const float4*)(const void*)(A.g + k + 4);
+            }
+        }
+    };
+    /* the producer's bf16 octet of chunk i (row lr of the tile, columns k .. k + 7) in place of the raw chunk */
+    auto produce = [&](int i, int lr) {
+        if constexpr (PRO > 0) {
+            uint16_t hb[8];
+            if constexpr (PRO == 1) {
+                const float sc = s_sc[lr];
+                const float gv[8] = { gq[WL ? 0 : i][0].x, gq[WL ? 0 : i][0].y, gq[WL ? 0 : i][0].z, gq[WL ? 0 : i][0].w,
+                                      gq[WL ? 0 : i][1].x, gq[WL ? 0 : i][1].y, gq[WL ? 0 : i][1].z, gq[WL ? 0 : i][1].w };
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const float x = (t & 1) ? bf16w_hi(xr[i][t >> 1]) : bf16w_lo(xr[i][t >> 1]);
+                    hb[t] = f32_to_bf16(x * sc * (gv[t] + A.wadd) * A.mult);
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const float gg = fminf((t & 1) ? bf16w_hi(xr[i][t >> 1]) : bf16w_lo(xr[i][t >> 1]), A.limit);
+                    const float uu = fminf(fmaxf((t & 1) ? bf16w_hi(xu[i][t >> 1]) : bf16w_lo(xu[i][t >> 1]), -A.limit), A.limit);
+                    hb[t] = f32_to_bf16((gg / (1.0f + expf(-gg))) * uu);
+                }
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q) xr[i][q] = (uint32_t)hb[2 * q] | ((uint32_t)hb[2 * q + 1] << 16);
+        }
     };
     auto xstore = [&](int b) {
         uint16_t* xs = Xs + b * XE;
 #pragma unroll
-        for (int i = 0; i < KP; ++i) {
+        for (int i = 0; i < NX; ++i) {
+            if constexpr (PRO > 0) {
+                const int row = WL ? (lane >> 4) + 2 * i : tid >> 4;   /* the tile row this chunk stages */
+                const int lr = min(row, r1 - r0 - 1);
+                produce(i, lr);
+                if (hw && row < r1 - r0) {   /* a live row's octet to h (a re-staged last slab writes the same bytes again) */
+                    const int k = (WL ? kp : i) * SW * kWmS + xt * kWmS + (tid & 15) * 8;
+                    uint16_t* d = A.h + (long long)(r0 + row) * A.h_ld + k;
+                    if (A.h_al) {
+                        *(r4d_u32x4*)(void*)d = xr[i];
+                    } else {
+#pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            d[2 * q] = (uint16_t)(xr[i][q] & 0xffffu);
+                            d[2 * q + 1] = (uint16_t)(xr[i][q] >> 16);
+                        }
+                    }
+                }
+            }
             *(r4d_u32x4*)(void*)(xs + xdo[i]) = xr[i];
             if constexpr (W::XG > 0) {
                 float sm = 0.0f;
@@ -3353,7 +3483,7 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
                 sm += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sm), 0xB1, 0xF, 0xF, false));
                 if constexpr (W::XG == 32)
                     sm += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sm), 0x4E, 0xF, 0xF, false));
-                Xg[b * XGE + ((tid & 15) * 8 / W::XG) * BM + (i * 16 + (tid >> 4))] = W::XGK * sm;
+                Xg[b * XGE + xgo[i]] = W::XGK * sm;
             }
         }
     };
@@ -3375,8 +3505,8 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
             if (i < prmax) p += A.w_ld;
         }
     };
-    const uint16_t* xa = Xs + (kp * 16 + c16) * kWmXP;
-    const float* xgl = Xg + 8 * h + kp * 16;
+    const uint16_t* xa = Xs + ((WL ? 0 : kp * 16) + c16) * kWmXP;
+    const float* xgl = Xg + 8 * h + (WL ? 0 : kp * 16);
     gg_v8f acc[2], tot[2];
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
@@ -3399,7 +3529,7 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
     xload(1 < SW ? 1 : SW - 1);
     r4d_u32x4 bf[2][2];
     Pf pf[2];
-    lds_barrier();
+    sync();
     {
         uint32_t rc[2][W::RAW];
 #pragma unroll
@@ -3433,8 +3563,8 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
             for (int k = 0; k < W::RAW; ++k)
                 if ((W::EARLY >> k) & 1u) rE[PB ^ 1][nt][k] = tw[k];
         }
-        const uint16_t* xb = xa + PB * XE;
-        const float* xg = xgl + PB * XGE;
+        const uint16_t* xb = xa + (WL ? 0 : PB * XE);
+        const float* xg = xgl + (WL ? 0 : PB * XGE);
         gg_v8f P[2];
         r4d_u32x4 af[2];
         gg_v8f ci;
@@ -3511,13 +3641,20 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) W::template reload<J>(wr[nt], sn, h, rR[nt]);
             }
-            if constexpr (J == 3) {
+            if constexpr (J == 3 && !WL) {
                 xstore(PB ^ 1);
                 xload(t + 2 < SW ? t + 2 : SW - 1);
             }
             __builtin_amdgcn_sched_barrier(0);
         });
-        lds_barrier();
+        if constexpr (WL) {   /* the one buffer: slab t + 1 in once slab t's reads are issued (a wave's LDS ops run in order) */
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+            xstore(0);
+            sync();
+            xload(t + 2 < SW ? t + 2 : SW - 1);
+        } else {
+            lds_barrier();
+        }
         /* A part ends with this slab: fold it (run 0 holds the prefix; the others keep their partials for run 0). */
         if (--pleft == 0) {
             const int gp = pgp;
@@ -3913,7 +4050,10 @@ int gg_launch_wm(RadStream s, int ty, bool moe, bool f32out, const GgTiledArgs& 
  * bits 0-3 the KP cap (1, 2, 4), bit 4 P = 1 (the stock kernel's order: its bytes), bit 5 KP = the cap whenever the
  * parts allow it, bits 8-15 the block target of the rule (0: 32): the smallest KP whose grid has at least that many
  * blocks, else the largest allowed; bit 6 no weight prefetch, bit 17 the unrolled prefetch; bit 7 the launch asks for
- * 64 KiB of LDS (one block a WGP); bit 16 a grid of more than 64 KP = 1 blocks takes the cap (the head). */
+ * 64 KiB of LDS (one block a WGP); bit 16 a grid of more than 64 KP = 1 blocks takes the cap (the head). Stage 2 (ds41-wmk2):
+ * bit 18 WL -- each wave stages its own run's slab (no block barrier in the K loop), and a cap of 8 (bits 0-3 >= 8) allows
+ * KP 8; bit 19 the rule counts the blocks of ONE 16-row tile (so M 17..48 keep M <= 16's KP instead of dropping to KP 1).
+ * Every code computes the same part order: the bytes do not depend on the code. */
 int g_gg_wk = 0;
 std::atomic<long long> g_gg_wk_count{0};
 std::atomic<int> g_gg_wk_last{0};
@@ -3956,42 +4096,65 @@ void wmk_decline(const char* op, int ty, long long N, long long K, long long M, 
                              "(decline %lld)\n", op, ty, N, K, M, x_al, n + 1);
 }
 template <int T>
-constexpr unsigned gg_wk_lds(int kp, int P) {
+constexpr unsigned gg_wk_lds(int kp, int P, bool wl = false) {
+    if (wl)   /* a region a wave, single-buffered */
+        return (unsigned)(8 * (16 * kWmXP * 2 + (Wq<T>::XG > 0 ? (kWmS / Wq<T>::XG) * 16 * 4 : 0)) +
+                          (kp > 1 ? (P - P / kp) * (8 / kp) * 32 * 64 : 0));
     return (unsigned)(2 * 16 * kp * kWmXP * 2 + (Wq<T>::XG > 0 ? 2 * (kWmS / Wq<T>::XG) * 16 * kp * 4 : 0) +
                       (kp > 1 ? (P - P / kp) * (8 / kp) * 32 * 64 : 0));
 }
+constexpr int R4D_WK_DECLINE = -77001;
 template <int T>
-int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, const GgWkArgs& A, dim3 grid) {
-    const unsigned lds = (code & 128) ? 65536u : gg_wk_lds<T>(kp, A.P);
-#define GG_WK_X(KPV)                                                                              \
-    if (kp == KPV) {                                                                              \
-        if (f32out) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, float>), grid, dim3(256), lds, A);   \
-        return R4D_EMIT(s, (gg_wk_kernel<T, KPV, uint16_t>), grid, dim3(256), lds, A);            \
+int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const GgWkArgs& A, dim3 grid) {
+    const bool wl = (code & 262144) != 0;
+    const unsigned lds = (code & 128) ? 65536u : gg_wk_lds<T>(kp, A.P, wl);
+    if (pro) {   /* the folds (bf16 out): the (KP, WL) their K allows (q_b K 1280: P 2; shexp down 768 / 512: P 2 / 4) */
+        if (f32out) return R4D_WK_DECLINE;
+#define GG_WK_F(KPV, WLV, PV)                                                                                     \
+        if (kp == KPV && wl == WLV && pro == PV) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, WLV, uint16_t, PV>), grid, dim3(256), lds, A);
+        GG_WK_F(1, false, 1) GG_WK_F(2, false, 1) GG_WK_F(1, true, 1) GG_WK_F(2, true, 1)
+        GG_WK_F(1, false, 2) GG_WK_F(2, false, 2) GG_WK_F(4, false, 2) GG_WK_F(1, true, 2) GG_WK_F(2, true, 2) GG_WK_F(4, true, 2)
+#undef GG_WK_F
+        return R4D_WK_DECLINE;
     }
-    GG_WK_X(1)
-    GG_WK_X(2)
-    GG_WK_X(4)
+#define GG_WK_X(KPV, WLV)                                                                              \
+    if (kp == KPV && wl == WLV) {                                                                      \
+        if (f32out) return R4D_EMIT(s, (gg_wk_kernel<T, KPV, WLV, float>), grid, dim3(256), lds, A);   \
+        return R4D_EMIT(s, (gg_wk_kernel<T, KPV, WLV, uint16_t>), grid, dim3(256), lds, A);            \
+    }
+    GG_WK_X(1, false)
+    GG_WK_X(2, false)
+    GG_WK_X(4, false)
+    GG_WK_X(1, true)
+    GG_WK_X(2, true)
+    GG_WK_X(4, true)
+    GG_WK_X(8, true)
 #undef GG_WK_X
     return R4D_NO(RAD_E_SHAPE);
 }
 /* 1 or 2 weights (nm) of one type at one K over the same M rows under the launch code `code` (g_gg_wk's bits: the bench
- * pin's value, or kWmkCode for the engine's lever WMK); R4D_WK_DECLINE when the form does not take the call. */
-constexpr int R4D_WK_DECLINE = -77001;
+ * pin's value, or kWmkCode for the engine's lever WMK); R4D_WK_DECLINE when the form does not take the call. fo (nm 1
+ * only): a fold's producer in the staging (lever WMK's folds a / e); a fold it declines runs as its two launches, the
+ * same bytes. */
 int gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
               const int* x_al, const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld,
-              const long long* Nv, long long M, long long K) {
+              const long long* Nv, long long M, long long K, const GgWkFold* fo = nullptr) {
     if (!code || (ty != GG_Q5_K && ty != GG_Q6_K && ty != GG_Q8_0) || K % (2 * kWmS) || M > 0x7fffff)
+        return R4D_WK_DECLINE;
+    if (fo && (nm != 1 || f32out || (fo->pro == 1 && (!fo->g || ((uintptr_t)fo->g & 15u))) || !fo->h))
         return R4D_WK_DECLINE;
     for (int i = 0; i < nm; ++i)
         if (!x_al[i]) return R4D_WK_DECLINE;
-    const int cap = (code & 15) >= 4 ? 4 : (code & 15) >= 2 ? 2 : 1;
+    const bool wl = (code & 262144) != 0;   /* bit 18: G1's wave-local staging (KP up to 8) */
+    const int cap = (code & 15) >= 8 && wl ? 8 : (code & 15) >= 4 ? 4 : (code & 15) >= 2 ? 2 : 1;
     const int P = (code & 16) ? 1 : gg_wk_parts(K);
     const long long target = ((code >> 8) & 255) ? ((code >> 8) & 255) : 32;
     const long long gx = (M + 15) / 16;
+    const long long gxr = (code & 524288) ? 1 : gx;   /* bit 19: the rule counts a 16-row tile's blocks (KP as at M <= 16) */
     auto blocks = [&](int kp) {
         long long b = 0;
         for (int i = 0; i < nm; ++i) b += (Nv[i] + 256 / kp - 1) / (256 / kp);
-        return b * gx;
+        return b * gxr;
     };
     int kp = 1;
     if (code & 32) {
@@ -4001,7 +4164,7 @@ int gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t
     }
     if ((code & 65536) && blocks(1) > 64)
         while (kp * 2 <= cap && P % (kp * 2) == 0) kp *= 2;
-    while (kp > 1 && gg_wk_lds<GG_Q6_K>(kp, P) > 65536u) kp /= 2;
+    while (kp > 1 && gg_wk_lds<GG_Q6_K>(kp, P, wl) > 65536u) kp /= 2;
     GgWkArgs A{};
     long long gy = 0;
     for (int i = 0; i < 2; ++i) {
@@ -4019,14 +4182,18 @@ int gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t
     A.psb = w_ld / A.S;
     A.pfl = (int)((2 * A.psb + 127) / 128 < 31 ? (2 * A.psb + 127) / 128 : 31);
     A.pfm = (code & 64) ? 1 : (code & 131072) ? 2 : 0;
+    if (fo) {
+        A.g = fo->g; A.eps = fo->eps; A.wadd = fo->wadd; A.mult = fo->mult; A.nw = fo->nw; A.limit = fo->limit;
+        A.h = fo->h; A.h_ld = fo->h_ld; A.h_al = fo->h_al;
+    }
     if (gy > 65535 || gx > 65535) return R4D_WK_DECLINE;
     g_gg_wk_count.fetch_add(1, std::memory_order_relaxed);
     g_gg_wk_last.store(kp * 100 + P, std::memory_order_relaxed);
     const dim3 grid((unsigned)gx, (unsigned)gy);
     switch (ty) {
-    case GG_Q8_0: return gg_launch_wk_t<GG_Q8_0>(s, code, kp, f32out, A, grid);
-    case GG_Q6_K: return gg_launch_wk_t<GG_Q6_K>(s, code, kp, f32out, A, grid);
-    default: return gg_launch_wk_t<GG_Q5_K>(s, code, kp, f32out, A, grid);
+    case GG_Q8_0: return gg_launch_wk_t<GG_Q8_0>(s, code, kp, f32out, fo ? fo->pro : 0, A, grid);
+    case GG_Q6_K: return gg_launch_wk_t<GG_Q6_K>(s, code, kp, f32out, fo ? fo->pro : 0, A, grid);
+    default: return gg_launch_wk_t<GG_Q5_K>(s, code, kp, f32out, fo ? fo->pro : 0, A, grid);
     }
 }
 
@@ -4456,8 +4623,27 @@ extern "C" int r4d_rad_rmsnorm_gemm_nt_ggml(const RadArgs* a, RadStream s) {
     const float eps = (float)r4d_getf(a, "eps", 1e-6), wadd = (float)r4d_getf(a, "wadd", 0.0),
                 mult = (float)r4d_getf(a, "mult", 1.0);
     const int h_al = gg_al16(h->data, h_ld) ? 1 : 0;
-    /* lever WMK: the GEMM in the part-order form after rmsnorm's own launch (D2's in-staging fold is the decode band's) */
-    if (M <= kGgDecodeRows && g->dtype == RAD_F32 && r4d_gg_mr_on() && !g_gg_wk && !wmk_take(M)) {
+    /* lever WMK (or the bench pin): the part-order form with rmsnorm in its staging (an f32 gain); declined, rmsnorm's own
+     * launch and then gg_gemm_run's part-order GEMM -- the same bytes. D2's in-staging fold is the decode band's. */
+    if (g_gg_wk || wmk_take(M)) {
+        if (g->dtype == RAD_F32) {
+            GgWkFold fo{};
+            fo.pro = 1; fo.g = (const float*)g->data; fo.eps = eps; fo.wadd = wadd; fo.mult = mult;
+            fo.nw = r4d_act_threads((int)M, (int)K) / 32;
+            fo.h = (uint16_t*)h->data; fo.h_ld = h_ld; fo.h_al = h_al;
+            const uint16_t* xp = (const uint16_t*)x->data;
+            const int xa = gg_al16(xp, x_ld) ? 1 : 0;
+            const uint8_t* wp = (const uint8_t*)w->data;
+            void* yp = y->data;
+            const long long Nv = N;
+            const int wk = gg_wk_run(s, g_gg_wk ? g_gg_wk : kWmkCode, ty, false, 1, &xp, &x_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv,
+                                     M, K, &fo);
+            if (wk != R4D_WK_DECLINE) {
+                if (!g_gg_wk) wmk_count(M);
+                return wk;
+            }
+        }
+    } else if (M <= kGgDecodeRows && g->dtype == RAD_F32 && r4d_gg_mr_on()) {
         const R4dGgMrCall c{ ty, false, (const uint16_t*)x->data, x_ld, gg_al16(x->data, x_ld) ? 1 : 0,
                              (const uint8_t*)w->data, w_ld, y->data, y_ld, (int)M, (int)N, (int)K };
         R4dGgMrFold f{};
@@ -4494,7 +4680,24 @@ extern "C" int r4d_rad_swiglu_clamped_gemm_nt_ggml(const RadArgs* a, RadStream s
     const long long g_ld = M > 1 ? gu->stride[0] : 2 * K;
     if (g_ld < 2 * K || h_ld < K) return R4D_NO(RAD_E_SHAPE);
     const int h_al = gg_al16(h->data, h_ld) ? 1 : 0;
-    if (M <= kGgDecodeRows && r4d_gg_mr_on() && !g_gg_wk && !wmk_take(M)) {   /* lever WMK: as fold a */
+    if (g_gg_wk || wmk_take(M)) {   /* lever WMK (or the bench pin): as fold a, swiglu_clamped in the staging */
+        const uint16_t* gp = (const uint16_t*)gu->data;
+        if (gg_al16(gp, g_ld) && gg_al16(gp + K, g_ld)) {
+            GgWkFold fo{};
+            fo.pro = 2; fo.limit = limit;
+            fo.h = (uint16_t*)h->data; fo.h_ld = h_ld; fo.h_al = h_al;
+            const int xa = 1;
+            const uint8_t* wp = (const uint8_t*)w->data;
+            void* yp = y->data;
+            const long long Nv = N;
+            const int wk = gg_wk_run(s, g_gg_wk ? g_gg_wk : kWmkCode, ty, false, 1, &gp, &g_ld, &xa, &wp, w_ld, &yp, &y_ld, &Nv,
+                                     M, K, &fo);
+            if (wk != R4D_WK_DECLINE) {
+                if (!g_gg_wk) wmk_count(M);
+                return wk;
+            }
+        }
+    } else if (M <= kGgDecodeRows && r4d_gg_mr_on()) {
         const uint16_t* gp = (const uint16_t*)gu->data;
         const R4dGgMrCall c{ ty, false, gp, g_ld, gg_al16(gp, g_ld) ? 1 : 0, (const uint8_t*)w->data, w_ld, y->data,
                              y_ld, (int)M, (int)N, (int)K };
