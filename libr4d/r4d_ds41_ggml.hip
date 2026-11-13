@@ -3343,6 +3343,11 @@ bool gg_al16(const void* p, long long ld) { return ((uintptr_t)p & 15u) == 0 && 
  * rows-a-wave (1, 2 or 4) and grid cap, 0 = the rule. Every form keeps lane = unit mod 32, a lane's units in order and
  * the same butterfly, so the bits are the rule's whatever is pinned. */
 int g_gg_pin_rpw = 0, g_gg_pin_grid = 0;
+/* r4d_gg_wm_pin (BENCH hook, ds41-wmgate, r4d_selftest --perfwmg / --wmgcheck; no engine path sets it): 1 sends gemm_nt_ggml /
+ * logits_gemm_ggml to the WMMA branch at every M (the decode band M <= kGgDecodeRows included); r4d_gg_wm_count counts the
+ * stock WMMA launches gg_gemm_run made. */
+int g_gg_wm_all = 0;
+std::atomic<long long> g_gg_wm_count{0};
 
 /* ------------------------------------------------------------------ the decode band's form (gg_gemv)
  *
@@ -3668,7 +3673,7 @@ int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long 
      * the engine picked: a row's outputs are then the same bits whatever else is in the pass
      * (decode, a speculative verify pass and a short prefill agree); the tiled kernel sums in
      * another order. */
-    if (M <= kGgDecodeRows) {
+    if (M <= kGgDecodeRows && !g_gg_wm_all) {
         /* lever D2 (r4d_ds41_ggml_mr.hip): the multi-row form when it is switched on or pinned, for the block types
          * and widths it takes (it declines the rest to the stock kernel below); the same bits as the stock form. */
         if (r4d_gg_mr_on()) {
@@ -3722,6 +3727,7 @@ int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long 
         }
         const int bmw = 16 * gg_wm_mt(ty);
         const long long gx = (M + bmw - 1) / bmw, gyw = (N + kWmBN - 1) / kWmBN;
+        g_gg_wm_count.fetch_add(1, std::memory_order_relaxed);
         return gg_launch_wm(s, ty, false, logits, A, dim3((unsigned)gx, (unsigned)gyw));
     }
     const long long gy = (N + kTN - 1) / kTN;
@@ -4156,6 +4162,8 @@ extern "C" int r4d_rad_embed_lookup_ggml(const RadArgs* a, RadStream s) {
                            (uint16_t*)x->data, x_ld, (int)M, (int)E, (int)V, voff, mult);
 }
 
+extern "C" void r4d_gg_wm_pin(int on) { g_gg_wm_all = on ? 1 : 0; }
+extern "C" long long r4d_gg_wm_count() { return g_gg_wm_count.load(std::memory_order_relaxed); }
 extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
     g_gg_pin_rpw = (rpw == 1 || rpw == 2 || rpw == 4) ? rpw : 0;
     g_gg_pin_grid = grid > 0 ? grid : 0;

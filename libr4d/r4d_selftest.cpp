@@ -34619,6 +34619,7 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 #include "r4d_selftest_gq.inc"    /* ds41-int11: lever 1U-GQ, gemm_nt_ggml_pair vs two gemm_nt_ggml (--case gq_pair) */
 #include "r4d_selftest_fuse.inc"  /* ds41-fuse: levers FUSE-R / FUSE-M byte for byte vs the stock launches + per-call times (--case rfuse / mixfin) */
 #include "r4d_selftest_a4.inc"    /* ds41-a4: lever A4, the gg_gemv_m16 forms (--mrcheck16, --perfm16) */
+#include "r4d_selftest_wmg.inc"   /* ds41-wmgate (bench): the WMMA form at decode heights (--perfwmg, --wmgcheck) */
 
 static void device_phase(const Plugin& pl) {
     int n = 0;
@@ -38183,6 +38184,7 @@ int main(int argc, char** argv) {
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
     bool a4c = false, a4p = false; const char* a4_out = nullptr;   /* lever A4: --mrcheck16 / --perfm16 [--m16-out FILE] */
+    bool wgc = false, wgp = false; const char* wg_m = nullptr; int wg_it = 0, wg_r = 0; const char* wg_t = nullptr;   /* ds41-wmgate: --wmgcheck / --perfwmg */
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
     bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
     bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
@@ -38443,6 +38445,17 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_m = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfwmg")) {
+            /* ds41-wmgate: the WMMA form vs int16's decode band at M 1..48, D W W D rounds (wmg::perf). */
+            wgp = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_r = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--wmgcheck")) {
+            /* ds41-wmgate: a row's WMMA bytes vs M and its place in the launch (wmg::check). */
+            wgc = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
         } else if (!std::strcmp(argv[i], "--m16-out") && i + 1 < argc) {
             a4_out = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfmr")) {
@@ -38725,6 +38738,17 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("lever BI per-op check", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
+    }
+    if (wgc || wgp) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        if (wgc) wmg::check(pl, wg_t);
+        if (wgp) wmg::perf(pl, wg_m, wg_it, wg_r, wg_t);
+        dfree_all();
+#else
+        skip("ds41-wmgate bench", "built without HIP");
 #endif
         return g_fail ? 1 : 0;
     }
