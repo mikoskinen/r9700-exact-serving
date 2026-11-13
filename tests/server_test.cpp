@@ -5423,7 +5423,7 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kDs41Rfuse, 68);   /* ds41-fuse: FUSE-R, deepseek41's; FUSE-M, libr4d's */
     CHECK_EQ((int)fn4::kDs41MixFin, 69);
     CHECK_EQ((int)fn4::kRouteCopyOv, 70);   /* ds41-launch: lever RCO (route_copy_ov), the core's (68 on ds41-launch) */
-    CHECK_EQ((int)fn4::kSwitches, 71);
+    CHECK_EQ((int)fn4::kSwitches, 72);   /* ds41-p1pass: + ds41_moe1 (lever P), appended after route_copy_ov */
     CHECK_EQ(fn4::switch_index("ds41_rfuse"), (int)fn4::kDs41Rfuse);
     CHECK_EQ(fn4::switch_index("ds41_mix_fin"), (int)fn4::kDs41MixFin);
     CHECK(!fn4::sched_switch(fn4::kDs41Rfuse) && !fn4::sched_switch(fn4::kDs41MixFin));

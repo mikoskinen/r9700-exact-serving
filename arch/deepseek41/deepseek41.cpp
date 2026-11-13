@@ -5615,7 +5615,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     if (rad_rank(x) == 0) {
                         g_p1_rows.fetch_add(T, std::memory_order_relaxed);
                         const long long n = g_p1_steps.fetch_add(1, std::memory_order_relaxed) + 1;
-                        if (n == 1 || n % 4096 == 0)
+                        if (n == 1 || n % 256 == 0)   /* a c24 block is ~500 such steps: two lines a block show it engaged */
                             fprintf(stderr, "radiance: deepseek41: lever P (ds41_moe1 1): %lld decode steps of 17 .. %lld "
                                             "rows issued their MoE as ONE pass (%lld rows in all; this one %lld rows)\n",
                                     n, (long long)kMoe1Max, g_p1_rows.load(std::memory_order_relaxed), (long long)T);
