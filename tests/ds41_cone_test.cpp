@@ -875,3 +875,121 @@ TEST(pfctx_runs_keep_each_entrys_last_window_in_runs_of_160) {
     CHECK(cut > 1000);
 }
 RAD_TEST_MAIN()
+
+/* ================================================================== lever G: the tail grid (ds41-tailgrid) */
+/* fn4 sched_tail_grid F under tail-only anchors (ds41_psk 4 + ds41_psk_cr 1, the line's pin): a prompt's targets are its
+ * end and its FINE tail f = the deepest multiple of F at or below N - 128 (where that lies past the grid point under the
+ * end; Scheduler::tail_checkpoint), the last cold chunk is cut at f, the snapshot is taken at that chunk end, and the
+ * next turn starts at f from the snapshot's CONTENT (CrSnap: nothing assumed whole), runs to the end of the cold piece
+ * that holds f (plan_chunk's off-grid start) and on on the grid, cut again at its own fine tail. Beside other work
+ * option D cuts a piece at multiples of 2048 inside it (>= 128 rows a side). Checked by the row model for every turn of
+ * fixed and random conversations, every F, PSK-L20 on / off: every target's window state whole, every row's layer-20
+ * input right, the end's output and taps right, the snapshot whole. Controls that must fail: the fine snapshot taken at
+ * a chunk end that is NOT a target (the cone of the prompt's end does not reach its window), and a turn resumed at the
+ * fine point with nothing restored. */
+namespace {
+int64_t tg_tail(int64_t N, int64_t F) {
+    const int64_t g = gfloor(N - 1), f = N > 128 ? (N - 128) / F * F : 0;
+    return f > g && f > kGO ? f : (g > kGO ? g : -1);
+}
+/* the scheduler's chunks of [a, N) under the lever: the cold pieces from a (a fine tail starts inside one), the tail's
+ * cut, and -- `mixed` -- option D's cuts at multiples of 2048 inside a piece, >= 128 rows a side */
+std::vector<std::pair<int64_t, int64_t>> tg_chunks(int64_t a, int64_t N, int64_t tail, bool mixed) {
+    std::vector<std::pair<int64_t, int64_t>> c = grid_chunks(a, N);
+    if (tail > a) c = split_at(c, tail);
+    if (!mixed) return c;
+    std::vector<std::pair<int64_t, int64_t>> o;
+    for (const auto& p : c) {
+        int64_t s = p.first;
+        for (int64_t e = (s / 2048 + 1) * 2048; e < p.second; e += 2048)
+            if (e - s >= 128 && p.second - e >= 128) { o.push_back({ s, e }); s = e; }
+        o.push_back({ s, p.second });
+    }
+    return o;
+}
+struct TgConv { std::string err; int turns = 0; int64_t old_rows = 0, grid_rows = 0; };
+/* `lens`: the prompts of a conversation (each extends the previous). `no_target`: a control -- the fine tail is cut and
+ * snapshotted but is not a target. `no_restore`: a control -- a turn starts at the fine tail with nothing restored. */
+TgConv tg_conv(const std::vector<int64_t>& lens, int64_t F, bool l20, bool mixed, bool no_target = false,
+               bool no_restore = false) {
+    TgConv out;
+    std::vector<CrSnap> snaps;   /* the conversation's snapshots, by position */
+    int64_t prev_n = 0;
+    for (size_t k = 0; k < lens.size(); ++k) {
+        const int64_t N = lens[k];
+        const CrSnap* rs = nullptr;
+        if (k > 0)
+            for (const CrSnap& s : snaps)
+                if (s.pos < prev_n && (s.pos == gfloor(s.pos) || N - s.pos >= 128) && (!rs || s.pos > rs->pos))
+                    rs = &s;   /* the deepest under the match that admit_one takes (off the grid: >= 128 rows left) */
+        CrRun R;
+        R.N = N;
+        R.l20 = l20;
+        const int64_t rs_pos = rs ? rs->pos : -1;   /* (rs points into `snaps`, which grows below) */
+        R.from = R.at = rs ? rs->pos : 0;
+        if (rs && !no_restore) R.rsnap = rs;
+        const int64_t tail = tg_tail(N, F);
+        R.rest = tg_chunks(R.from, N, tail, mixed);
+        R.tg = { N };
+        if (tail > R.from && !no_target) R.tg.insert(R.tg.begin(), tail);
+        std::vector<CrSnap> got;
+        if (tail > R.from) R.snap_at = { tail };
+        R.snaps = &got;
+        const std::string why = cr_model(R);
+        if (!why.empty()) { out.err = "turn " + std::to_string(k) + " (N " + std::to_string(N) + "): " + why; return out; }
+        for (const auto& c : R.rest)
+            if (c.second - c.first < 128 && !(c.first == gfloor(c.first) && c.second == N)) {
+                out.err = "turn " + std::to_string(k) + ": a piece of " + std::to_string(c.second - c.first) + " rows";
+                return out;
+            }
+        if (rs_pos >= 0) { out.old_rows += prev_n - rs_pos; out.grid_rows += prev_n - gfloor(prev_n - 1); }
+        for (CrSnap& s : got) {
+            if (!s.whole()) { out.err = "turn " + std::to_string(k) + ": the snapshot at " + std::to_string(s.pos) + " is not whole"; return out; }
+            snaps.push_back(std::move(s));
+        }
+        prev_n = N;
+        ++out.turns;
+    }
+    return out;
+}
+}  // namespace
+
+TEST(tail_grid_conversations_resume_whole_at_the_fine_tail) {
+    const std::vector<int64_t> fixed = { 52000, 52600, 57000, 57300, 61500, 61700, 66000 };
+    for (int64_t F : { 256, 512, 1024, 2048 })
+        for (int l20 = 0; l20 < 2; ++l20)
+            for (int mixed = 0; mixed < 2; ++mixed) {
+                const TgConv c = tg_conv(fixed, F, l20 != 0, mixed != 0);
+                CHECK_EQ(c.err, std::string(""));
+                CHECK_EQ(c.turns, 7);
+                CHECK(c.old_rows >= 6 * 128 && c.old_rows < 6 * (128 + F));
+            }
+    std::mt19937 rng(20261113u);
+    int64_t old_rows = 0, grid_rows = 0;
+    int turns = 0;
+    for (int conv = 0; conv < 40; ++conv) {
+        std::vector<int64_t> lens = { 2200 + (int64_t)(rng() % 60000u) };
+        for (int k = 0; k < 6; ++k) lens.push_back(lens.back() + 70 + (int64_t)(rng() % 5500u));
+        const int64_t F = (int64_t[]){ 256, 512, 1024, 2048 }[conv % 4];
+        const TgConv c = tg_conv(lens, F, (conv / 4) % 2 != 0, (conv / 8) % 2 != 0);
+        if (!c.err.empty()) std::fprintf(stderr, "conv %d F %lld: %s\n", conv, (long long)F, c.err.c_str());
+        CHECK_EQ(c.err, std::string(""));
+        old_rows += c.old_rows;
+        grid_rows += c.grid_rows;
+        turns += c.turns;
+    }
+    CHECK_EQ(turns, 40 * 7);
+    CHECK(old_rows * 2 < grid_rows);   /* the rows a turn re-prefills below its previous prompt's end: under half the grid's */
+}
+
+TEST(tail_grid_controls_fail) {
+    const std::vector<int64_t> fixed = { 52000, 52600, 57000, 57300 };
+    /* the fine tail cut and snapshotted but not a target: the cone of the prompt's end does not reach its window */
+    int failed = 0;
+    for (int64_t F : { 256, 512, 1024 })
+        failed += !tg_conv(fixed, F, true, false, /*no_target=*/true).err.empty();
+    CHECK_EQ(failed, 3);
+    /* a turn started at the fine tail with nothing restored: its first rows read windows nobody wrote */
+    CHECK(!tg_conv(fixed, 512, true, false, false, /*no_restore=*/true).err.empty());
+    CHECK(!tg_conv(fixed, 512, false, true, false, /*no_restore=*/true).err.empty());
+}
