@@ -305,6 +305,10 @@ struct MoeFP8 {
          * (exl3/exl3_abi.h), which take the bf16 activation and do the rotations and silu(gate) * up
          * (with swiglu_limit) themselves. K and the codebook are each layer's and projection's own. */
         int     expert_exl3  = 0;
+        /* Lever P (ds41-p1pass): with expert_exl3, also declare moe_exl3_gate_up_dk / moe_exl3_down_dk (exl3/exl3_abi.h:
+         * the decode band's bytes per (token, slot) at more than 16 tokens) over 17 .. this many tokens a pass, where a
+         * loaded library serves them; 0 declares nothing. pass(..., dk = true) issues them. */
+        int64_t exl3_dk_rows = 0;
         /* The layer and global expert whose gate_up probe() read the format from (and so mapped);
          * declare() maps the rest. Layer -1: none. */
         int64_t probed_layer = -1;
@@ -443,6 +447,11 @@ struct MoeFP8 {
      * no quantiser for it. Set before declare. */
     bool   hr_in = false;
     rad_op op_gu = 0, op_dn = 0, op_gather = 0;
+    /* Config::exl3_dk_rows (lever P): the decode-band-bytes ops over 17 .. dk_rows tokens, 0 where not declared or not
+     * served. dk_takes: a pass of `rows` tokens may be issued with them (pass's `dk`). */
+    rad_op op_gu_dk = 0, op_dn_dk = 0;
+    int64_t dk_rows = 0;
+    bool dk_takes(int64_t rows) const { return op_gu_dk && op_dn_dk && rows > 16 && rows <= dk_rows; }
     /* Config::gather_ar_rows: moe_gather_all_reduce over at most `gar_rows` tokens, or 0. */
     rad_op op_gar = 0;
     int64_t gar_rows = 0;
@@ -601,9 +610,10 @@ struct MoeFP8 {
      * batch (the MTP head's history pass reads its output only at drafting rows). */
     void step_rows(RadCtx* c, int64_t T, const Beside* beside = nullptr) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
-     * all-reduce itself (issue_ar), as GdnFP8::step describes. */
+     * all-reduce itself (issue_ar), as GdnFP8::step describes. `dk` (lever P; only where dk_takes(rows)): the routed
+     * EXL3 experts through moe_exl3_gate_up_dk / moe_exl3_down_dk, the decode band's bytes per row. */
     void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
-              const Beside* beside = nullptr) const;
+              const Beside* beside = nullptr, bool dk = false) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -2213,11 +2223,31 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
                {w.h.x, w.sorted, w.eoff}, {b_x3h});
+    /* Lever P (Config::exl3_dk_rows): the decode-band-bytes pair over 17 .. dk tokens, on the same tables and buffers.
+     * Declared BETWEEN gate_up and down so the layer's expert units keep [gate_up, down] as their op span: the prefill
+     * stager keys a layer on its first expert op (gate_up) and frees its copies behind its last (down), and a pass that
+     * issues the dk pair (a decode step, never armed for staging) issues neither. A library that does not export the
+     * names leaves both handles 0. */
+    const int64_t dk = std::min<int64_t>(c.exl3_dk_rows, c.rows);
+    const bool dk_decl = dk > 16 && rad_op_declared(b, EXL3_OP_GATE_UP_DK) && rad_op_declared(b, EXL3_OP_DOWN_DK);
+    if (dk_decl) {
+        std::vector<RadParam> gk = gp;
+        gk[0] = RAD_RANGE("M", 17, dk);
+        op_gu_dk = rad_decl_op(b, EXL3_OP_GATE_UP_DK, gk.data(), (int)gk.size(), tab.data(), (int)tab.size());
+        if (op_gu_dk) rw(b, op_gu_dk, {w.h.x, w.sorted, w.eoff}, {b_x3h});
+    }
     tables(false);
     std::vector<RadParam> dp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", D), RAD_INT("K", F),
                                  RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                  RAD_STR("dtype", x3_dtype[1]), RAD_STR("codebook", x3_cb[1]),
                                  RAD_INT("N_odd", D), RAD_INT("K_odd", F), RAD_INT("h_rot", 1) };
+    if (dk_decl && op_gu_dk) {
+        std::vector<RadParam> dq = dp;
+        dq[0] = RAD_RANGE("M", 17, dk);
+        op_dn_dk = rad_decl_op(b, EXL3_OP_DOWN_DK, dq.data(), (int)dq.size(), tab.data(), (int)tab.size());
+        if (op_dn_dk) rw(b, op_dn_dk, {b_x3h, w.sorted, w.eoff}, {w.edn});
+        if (op_dn_dk) dk_rows = dk;
+    }
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
                {b_x3h, w.sorted, w.eoff}, {w.edn});
     if (!op_gu || !op_dn) return RAD_E_INVAL;
@@ -2274,7 +2304,9 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
 inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
-                          const Beside* beside) const {
+                          const Beside* beside, bool dk) const {
+    /* lever P: the decode-band-bytes ops only where they are declared for this many rows */
+    const bool xdk = dk && c.expert_exl3 && dk_takes(rows);
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -2422,7 +2454,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brow_slice(iqr_a.q8, r0, rows, g.n_embd),
                     brow_slice(iqr_a.s8, r0, rows, g.n_embd / RAD_FP8_BLOCK));
     if (c.expert_exl3)
-        issue_exl3(c_, op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
+        issue_exl3(c_, xdk ? op_gu_dk : op_gu, EXL3_GATE_UP, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                    brows(b_x3h, rows * k));
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(iqr_a.q8, r0, rows, g.n_embd),
@@ -2460,7 +2492,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !lane1 && !swf) gq_sh.step(c_, w.sgu, T, r0, rows);
     if (c.expert_exl3)
-        issue_exl3(c_, op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
+        issue_exl3(c_, xdk ? op_dn_dk : op_dn, EXL3_DOWN, rows, brows(b_x3h, rows * k), brows(w.edn, rows * k));
     else if (c.expert_iqr)
         RAD_ISSUE_N(c_, op_dn, rows, brows(iqr_d.q8, rows * k), brows(iqr_d.s8, rows * k),
                     RAD_WTAB(w_dn[0], ne), RAD_WTAB(w_dns[0], ne),
