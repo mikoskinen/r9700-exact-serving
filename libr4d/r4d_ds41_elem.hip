@@ -22,6 +22,7 @@
 #include "r4d_emit.h"
 #include "r4d_ds41_pcn.h"
 #include "r4d_ds41_qrt.h"
+#include "r4d_gemm_f32_tile.h"
 #include "r4d_moe_sort.h"
 #include "r4d_plugin.h"
 
@@ -1034,6 +1035,26 @@ bool ds_mix_fuse_on() {
     static const bool on = [] { const char* e = std::getenv("R4D_DS41_MIX_FUSE"); return e && e[0] == '1' && !e[1]; }();
     return on;
 }
+/* Lever FUSE-M (ds41-fuse, 13.11.2026; zzzaql's AQL-stamped c8 on int14: dep mix_split_kernel -> mix_finish_kernel 346 us a
+ * decode step, ~80 calls): libr4d's fn4 switch "ds41_mix_fin" 0 / 1 -- 1 = a launch of at most kMixFinRows rows takes mhc_mix's
+ * one-launch FIN form (mix_split_kernel<.., FIN>: the last workgroup of each row group runs mix_finish_kernel's row,
+ * mix_finish_row, over the same partials in the same chunk order -- the finish kernel's bits, one launch fewer; the R 1 split
+ * at WV 8, so not with ds41_mix_wv's wide forms, which keep their two launches). 0 = today's two launches (R4D_DS41_MIX_FUSE=1
+ * still takes FIN at every height, as before). RADIANCE_DS41_MIX_FIN=1 at load starts it on. Counters (rad_fuse_stats, every
+ * rank's launches summed; a recorded pass counts when it is recorded): FIN launches the switch took and their rows. */
+constexpr long kMixFinRows = 48;
+std::atomic<int> g_mix_fin{-1};
+std::atomic<long long> g_mf_launch{0}, g_mf_rows{0};
+int mix_fin_now() {
+    int v = g_mix_fin.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_DS41_MIX_FIN");
+        int unread = -1;
+        g_mix_fin.compare_exchange_strong(unread, e && e[0] == '1' && !e[1] ? 1 : 0);
+        v = g_mix_fin.load(std::memory_order_relaxed);
+    }
+    return v;
+}
 /* Lever 1U-MX (ds41-int11): libr4d's fn4 switch "ds41_mix_wv" (rad_fn4_* in r4d_ds41_ggml.hip) -- the waves a chunk of the
  * split launch at decode heights (rows <= 8, R 1), 0 = the stock 8; 12 / 16 / 24 that many (hc 4 only: 24 dots, so two /
  * two / one a wave). The start value is RADIANCE_DS41_MIX_WV (12 / 16 / 24; anything else or unset: 0), read at the first
@@ -1088,7 +1109,11 @@ int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const Mi
         // finish kernel -- the same bits)
         const long RSel = rows <= 8 ? 1 : rows <= 24 ? RM : RB;
         const long groups = (rows + RSel - 1) / RSel, gy = grid_rows(groups);
-        unsigned* const ctr = ds_mix_fuse_on() && gy <= (long)kDsMixCtr ? ds_mix_ctr(stream, o.pre) : nullptr;
+        /* lever FUSE-M: ds41_mix_fin 1 takes FIN at decode heights (rows <= kMixFinRows) where mix_wv's wide form is not
+         * asked for */
+        const bool fin_sw = !ds_mix_fuse_on() && rows <= kMixFinRows && mix_fin_now() > 0 &&
+                            !(HC == 4 && rows <= 8 && mix_wv_now() != 0);
+        unsigned* const ctr = (ds_mix_fuse_on() || fin_sw) && gy <= (long)kDsMixCtr ? ds_mix_ctr(stream, o.pre) : nullptr;
 #define MIX_SPLIT(RS, TS)                                                                          \
     (ctr ? R4D_EMIT(stream, (mix_split_kernel<HC, RS, 8, TS, true>),                               \
                     dim3((unsigned)chunks, grid_rows((rows + (RS) - 1) / (RS))), dim3(256), 0,     \
@@ -1118,6 +1143,10 @@ int mix_emit(RadStream stream, const RadTensor& h, const RadTensor& fn, const Mi
         }
 #undef MIX_WIDE
 #undef MIX_SPLIT
+        if (rc >= 0 && ctr && fin_sw) {
+            g_mf_launch.fetch_add(1, std::memory_order_relaxed);
+            g_mf_rows.fetch_add(rows, std::memory_order_relaxed);
+        }
         if (rc < 0 || ctr) return rc;
         return R4D_EMIT(stream, mix_finish_kernel<HC>, dim3(fin), dim3(128), 0, (const float*)part,
                         (int)chunks, o, rows);
@@ -1687,6 +1716,156 @@ int router_scored_scatter_body(const RadArgs* a, RadStream stream) {
                                                         gate, gp, inv, (int)m, (int)ne, (int)nl,
                                                         (int)k, norm, factor, (int)base, prot);
     }
+}
+
+/* ==================================================================== router_gemm_f32_scored_topk_scatter
+ * Lever FUSE-R (ds41-fuse, 13.11.2026; zzzaql's AQL-stamped c8 on int14: the router chain's two dependent launch gaps,
+ * gemm_nt_f32_tile -> router_scored 173 us and router_scored -> scatter_small 172 us a decode step): DeepSeek-V4.1's
+ * router projection (gemm_nt_f32), its selection (router_scored_topk) and the sort (moe_scatter) in ONE launch, every
+ * stage the stock code, only the launch boundaries removed:
+ *   - the GEMM: r4d_gemm_f32_tile.h's tile_wave, gemm_nt_f32_tile_kernel's own body (moved there unchanged), a wave a
+ *     C-column tile of R rows as there, NW waves a workgroup instead of 4 -- which wave of which workgroup forms a
+ *     column changes none of its arithmetic (each logit: lane-strided fmaf over k ascending, the fixed butterfly);
+ *   - the last arriver (router_gemm_topk_scatter's pattern, r4d_moe.hip): every workgroup publishes its logits
+ *     (release fence) and adds one to its op instance's arrival counter; the workgroup that completes the count resets
+ *     it, acquires the others' logits (fence) and runs router_scored_scatter_kernel's body -- router_scored_row a row a
+ *     wave (the stock selection's function, so the ids and weights are router_scored_kernel's bytes) into the sort's
+ *     LDS slot list, then scatter_small_place (the stock small sort, whose result does not depend on the wave count).
+ * So every output -- logits, ids, weights, sorted_tok, expert_offset, expert_count (and the inverse) -- is the bytes the
+ * three launches write, at any M: each row's logits and selection are its own (batch-invariant as the stock chain).
+ * Decode band only (M <= 48: the forms below), DeepSeek's sqrtsoftplus score, <= 384 experts. */
+constexpr int kRgsMaxRows = 48;
+
+template <int R, int C, int U, typename WT, int OWN, int SCORE, uint32_t NW, bool INV>
+__global__ __launch_bounds__(NW * 32) void router_gemm_scored_scatter_kernel(
+    const uint16_t* x, long xp, const WT* wt, long wtp, float* lg, long lp, int m, int ne, int K,
+    const float* bias, long bp, int32_t* ids, long ip, float* weights, long wp, int32_t* sorted,
+    int32_t* off, int32_t* cnt, int32_t* inv, int n_local, int k, int norm, float factor, int base,
+    r4d_moesort::Protect prot, unsigned* ctr) {
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int c0 = ((int)blockIdx.x * (int)NW + wave) * C, r0 = (int)blockIdx.y * R;
+    if (c0 < ne) r4d_gf32::tile_wave<R, C, U, WT>(x, wt, lg, xp, wtp, lp, m, ne, K, c0, r0, lane);
+    __shared__ unsigned s_last;
+    __threadfence();   // this workgroup's logits, device-wide, before its arrival
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned old = __hip_atomic_fetch_add(ctr, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+        s_last = old + 1u == gridDim.x * gridDim.y ? 1u : 0u;
+        if (s_last) __hip_atomic_store(ctr, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();   // every other workgroup's logits: no stale line
+    /* router_scored_scatter_kernel's body from here (no gate) */
+    __shared__ r4d_moesort::ScatterLds<NW> sl;
+    for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
+    for (int r = wave; r < m; r += (int)NW) {
+        const int e = router_scored_row<OWN, SCORE>(lg, lp, bias, bp, ids, ip, weights, wp, r, ne, k,
+                                                    norm, factor, lane) -
+                      base;
+        if (lane < k)
+            sl.e[r * k + lane] =
+                e >= 0 && e < n_local ? r4d_moesort::sort_place(e, (uint32_t)n_local, prot) : -1;
+    }
+    lds_barrier();
+    r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k), (uint32_t)n_local,
+                                              sl, inv);
+}
+
+/* The op instance's arrival counter (router_gemm_topk_scatter's rule, r4d_moe.hip): taken at init -- once per resolved
+ * instance during declare, before the engine measures free VRAM -- never on the launch path; zeroed, and zeroed again by
+ * each launch's last arriver. One 64-byte slot an instance (op, band, domain, rank); each routed layer declares its own
+ * op, and an instance's launches are ordered (they write the same declared outputs). Never reused while its block lives. */
+constexpr uint32_t kRgsCtrStride = 16, kRgsCtrSlots = 4096;
+struct RgsInst {
+    int dev = 0;
+    unsigned* ctr = nullptr;
+};
+#ifndef R4D_EMU_HOST
+struct RgsBlock {
+    unsigned* base = nullptr;
+    uint32_t next = 0, live = 0;
+};
+std::mutex g_rgs_mu;
+std::map<int, RgsBlock> g_rgs_blocks;
+#endif
+std::atomic<long long> g_rgs_launch{0}, g_rgs_rows{0};
+
+template <typename WT, int SCORE>
+int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& lg, const RadTensor& bias,
+             const RadTensor& ids, const RadTensor& wts, const RadTensor& sorted, const RadTensor& off,
+             const RadTensor& cnt, const RadTensor* inv, int m, int ne, int K, int nl, int k, int norm, float factor,
+             int base, const r4d_moesort::Protect& prot, unsigned* ctr) {
+#define RGS_L(R, C, U, NW, INV)                                                                                   \
+    R4D_EMIT(stream, (router_gemm_scored_scatter_kernel<R, C, U, WT, 12, SCORE, NW, INV>),                       \
+             dim3((unsigned)((ne + (NW) * (C) - 1) / ((NW) * (C))), (unsigned)((m + (R) - 1) / (R))),             \
+             dim3((NW) * 32), 0, (const uint16_t*)x.data, (long)x.stride[0], (const WT*)w.data, (long)w.stride[0],  \
+             (float*)lg.data, (long)lg.stride[0], m, ne, K, (const float*)bias.data, (long)bias.stride[0],         \
+             (int32_t*)ids.data, (long)ids.stride[0], (float*)wts.data, (long)wts.stride[0], (int32_t*)sorted.data, \
+             (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
+             factor, base, prot, ctr)
+#define RGS_I(R, C, U, NW) (inv ? RGS_L(R, C, U, NW, true) : RGS_L(R, C, U, NW, false))
+    /* the stock gemm_f32_body's tile form for the height (2x2 with 16 steps up to 16 rows, 8x1 with 8 steps below
+     * 64); the waves a workgroup router_scored_scatter_emit's (a wave a row up to 16 rows; 16 waves above, the rows
+     * wrapping -- 32 would cap the GEMM's registers) */
+    return m <= 8 ? RGS_I(2, 2, 16, 8u) : m <= 16 ? RGS_I(2, 2, 16, 16u) : RGS_I(8, 1, 8, 16u);
+#undef RGS_I
+#undef RGS_L
+}
+
+/* Operands: a [M, K] bf16, b [n_expert, K] f32 / bf16 (the router projection), bias [n_expert] f32 -> logits [M,
+ * n_expert] f32, ids [M, top_k] i32, weights [M, top_k] f32, sorted_tok, expert_offset, expert_count i32, inverse? i32.
+ * Every shim check of gemm_nt_f32 (the decode band's), router_scored_topk and moe_scatter's small form. */
+int router_gemm_scored_scatter_body(const RadArgs* a, RadStream stream) {
+    if (!a || a->n_t < 9) return RAD_E_INVAL;
+    const char* sc = r4d_gets(a, "score");
+    if (!sc || std::strcmp(sc, "sqrtsoftplus")) return R4D_NO(RAD_E_UNSUPPORTED);
+    const RadTensor &x = a->t[0], &w = a->t[1], &bias = a->t[2], &lg = a->t[3], &ids = a->t[4], &wts = a->t[5];
+    const RadTensor &sorted = a->t[6], &off = a->t[7], &cnt = a->t[8];
+    const RadTensor* inv = a->n_t > 9 ? r4d_opt(a, 9) : nullptr;
+    const long ne = (long)r4d_geti_or(a, "n_expert", 0), k = (long)r4d_geti_or(a, "top_k", 0);
+    const long K = (long)r4d_geti_or(a, "K", 0);
+    const long nl = (long)r4d_geti_or(a, "n_local", ne), base = (long)r4d_geti_or(a, "expert_base", 0);
+    const float factor = (float)r4d_getf(a, "route_scale", 0);
+    const int norm = r4d_geti_or(a, "norm", 0) != 0 ? 1 : 0;
+    if (x.dtype != RAD_BF16 || (w.dtype != RAD_F32 && w.dtype != RAD_BF16) || bias.dtype != RAD_F32 ||
+        lg.dtype != RAD_F32 || ids.dtype != RAD_I32 || wts.dtype != RAD_F32 || sorted.dtype != RAD_I32 ||
+        off.dtype != RAD_I32 || cnt.dtype != RAD_I32 || (inv && inv->dtype != RAD_I32))
+        return R4D_NO(RAD_E_DTYPE);
+    if (!x.data || !w.data || !bias.data || !lg.data || !ids.data || !wts.data || !sorted.data || !off.data ||
+        !cnt.data)
+        return R4D_NO(RAD_E_INVAL);
+    if (ne < 1 || ne > 384 || k < 1 || k > 32 || k > ne || K < 1 || K > 16384 || !std::isfinite(factor) ||
+        factor <= 0 || x.rank != 2 || w.rank != 2 || lg.rank != 2 || ids.rank != 2 || wts.rank != 2 ||
+        bias.rank != 1 || x.shape[0] < 1 || x.shape[0] > kRgsMaxRows || x.shape[1] != K || x.stride[1] != 1 ||
+        x.stride[0] < K || w.shape[0] != ne || w.shape[1] != K || w.stride[1] != 1 || w.stride[0] < K ||
+        bias.shape[0] != ne || bias.stride[0] < 1 || lg.shape[0] != x.shape[0] || lg.shape[1] != ne ||
+        lg.stride[1] != 1 || lg.stride[0] < ne || ids.shape[0] != x.shape[0] || ids.shape[1] != k ||
+        ids.stride[1] != 1 || ids.stride[0] < k || wts.shape[0] != x.shape[0] || wts.shape[1] != k ||
+        wts.stride[1] != 1 || wts.stride[0] < k)
+        return R4D_NO(RAD_E_SHAPE);
+    const long m = x.shape[0], T = m * k;
+    if (T > (long)r4d_moesort::kScatterSmall || nl < 1 || nl > ne || base < 0 || base + nl > ne ||
+        !r4d_contig(&sorted) || !r4d_contig(&off) || !r4d_contig(&cnt) || r4d_numel(&sorted) < T ||
+        r4d_numel(&off) < nl + 1 || r4d_numel(&cnt) < nl || (inv && (!r4d_contig(inv) || r4d_numel(inv) < T)))
+        return R4D_NO(RAD_E_SHAPE);
+    r4d_moesort::Protect prot;
+    const int prc = r4d_moesort::protect_of(a, nl, &prot);
+    if (prc != RAD_OK) return prc;
+    const RgsInst* const in = (const RgsInst*)a->instance;
+    if (!in || !in->ctr) return R4D_NO(RAD_E_STATE);
+    const int rc = w.dtype == RAD_BF16
+                       ? rgs_emit<uint16_t, kSqrtSoftplus>(stream, x, w, lg, bias, ids, wts, sorted, off, cnt, inv,
+                                                           (int)m, (int)ne, (int)K, (int)nl, (int)k, norm, factor,
+                                                           (int)base, prot, in->ctr)
+                       : rgs_emit<float, kSqrtSoftplus>(stream, x, w, lg, bias, ids, wts, sorted, off, cnt, inv,
+                                                        (int)m, (int)ne, (int)K, (int)nl, (int)k, norm, factor,
+                                                        (int)base, prot, in->ctr);
+    if (rc >= 0) {
+        g_rgs_launch.fetch_add(1, std::memory_order_relaxed);
+        g_rgs_rows.fetch_add(m, std::memory_order_relaxed);
+    }
+    return rc;
 }
 
 /* ==================================================================== embed_lookup_planes
@@ -2798,6 +2977,80 @@ extern "C" int r4d_rad_router_scored_topk(const RadArgs* a, RadStream s) {
 }
 extern "C" int r4d_rad_router_scored_topk_scatter(const RadArgs* a, RadStream s) {
     return router_scored_scatter_body(a, s);
+}
+/* lever FUSE-R (ds41-fuse): router_gemm_f32_scored_topk_scatter and its instance's arrival counter */
+extern "C" int r4d_rad_router_gemm_scored_scatter(const RadArgs* a, RadStream s) {
+    return router_gemm_scored_scatter_body(a, s);
+}
+extern "C" int r4d_rad_router_gemm_scored_scatter_init(const RadParam*, int, int, int, void** out) {
+    if (!out) return RAD_E_INVAL;
+    *out = nullptr;
+#ifdef R4D_EMU_HOST
+    /* tests/r4d_emu: device memory is host memory; a zeroed slot an instance */
+    RgsInst* in = new RgsInst;
+    in->ctr = (unsigned*)std::calloc(kRgsCtrStride, sizeof(unsigned));
+    if (!in->ctr) { delete in; return RAD_E_NOMEM; }
+    *out = in;
+    return RAD_OK;
+#else
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return RAD_E_DEVICE;
+    std::lock_guard<std::mutex> lk(g_rgs_mu);
+    RgsBlock& blk = g_rgs_blocks[dev];
+    if (!blk.base) {
+        const size_t bytes = (size_t)kRgsCtrSlots * kRgsCtrStride * sizeof(unsigned);
+        void* p = nullptr;
+        if (hipMalloc(&p, bytes) != hipSuccess) return RAD_E_NOMEM;
+        /* zeroed before any launch reads it (r4d_moe.hip's note: the engine's hipMemset has finished when it returns;
+         * under HIP's own runtime, r4d_selftest, the null stream is waited for here) */
+        if (hipMemset(p, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
+            (void)hipFree(p);
+            return RAD_E_DEVICE;
+        }
+        blk.base = (unsigned*)p;
+        blk.next = 0;
+    }
+    if (blk.next >= kRgsCtrSlots) return RAD_E_FULL;
+    RgsInst* in = new RgsInst;
+    in->dev = dev;
+    in->ctr = blk.base + (size_t)blk.next * kRgsCtrStride;
+    ++blk.next;
+    ++blk.live;
+    *out = in;
+    return RAD_OK;
+#endif
+}
+extern "C" void r4d_rad_router_gemm_scored_scatter_fini(void* inst) {
+    RgsInst* in = (RgsInst*)inst;
+    if (!in) return;
+#ifdef R4D_EMU_HOST
+    std::free(in->ctr);
+#else
+    std::lock_guard<std::mutex> lk(g_rgs_mu);
+    auto it = g_rgs_blocks.find(in->dev);
+    if (it != g_rgs_blocks.end() && it->second.live > 0 && --it->second.live == 0) {
+        int prev = 0;
+        const bool moved = hipGetDevice(&prev) == hipSuccess && prev != in->dev && hipSetDevice(in->dev) == hipSuccess;
+        (void)hipFree(it->second.base);
+        if (moved) (void)hipSetDevice(prev);
+        g_rgs_blocks.erase(it);
+    }
+#endif
+    delete in;
+}
+/* lever FUSE-M (ds41-fuse): the fn4 switch ds41_mix_fin (r4d_ds41_ggml.hip's rad_fn4_*) */
+int r4d_mix_fin_get() { return mix_fin_now(); }
+void r4d_mix_fin_set(int v) { g_mix_fin.store(v == 1 ? 1 : 0, std::memory_order_relaxed); }
+/* Levers FUSE-M / FUSE-R's libr4d counters, every rank's launches summed, cumulative (a recorded pass counts when it is
+ * recorded): out[0] mhc_mix launches in the FIN form under ds41_mix_fin, [1] their rows, [2] router_gemm_f32_scored_topk_
+ * scatter launches, [3] their rows. Returns 4. */
+extern "C" int rad_fuse_stats(long long* out, int n) {
+    if (!out || n < 4) return 0;
+    out[0] = g_mf_launch.load(std::memory_order_relaxed);
+    out[1] = g_mf_rows.load(std::memory_order_relaxed);
+    out[2] = g_rgs_launch.load(std::memory_order_relaxed);
+    out[3] = g_rgs_rows.load(std::memory_order_relaxed);
+    return 4;
 }
 extern "C" int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream s) {
     return embed_planes_body(a, s);

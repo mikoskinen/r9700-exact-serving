@@ -21,6 +21,11 @@ int r4d_rad_entry_store(const RadArgs* a, RadStream stream);
 int r4d_rad_window_store(const RadArgs* a, RadStream stream);
 int r4d_rad_router_scored_topk(const RadArgs* a, RadStream stream);
 int r4d_rad_router_scored_topk_scatter(const RadArgs* a, RadStream stream);
+/* lever FUSE-R (ds41-fuse): gemm_nt_f32 + router_scored_topk + moe_scatter in one launch (the GEMM's last arriver ranks and
+ * sorts), its op instance's arrival counter taken at init */
+int r4d_rad_router_gemm_scored_scatter(const RadArgs* a, RadStream stream);
+int r4d_rad_router_gemm_scored_scatter_init(const RadParam*, int, int rank, int world, void** out);
+void r4d_rad_router_gemm_scored_scatter_fini(void* inst);
 int r4d_rad_embed_lookup_planes(const RadArgs* a, RadStream stream);
 /* The fused chains (one launch each, byte-identical to the chain r4d_fuse.cpp declares). */
 int r4d_rad_rmsnorm_rope_roundtrip(const RadArgs* a, RadStream stream);
@@ -47,6 +52,7 @@ int r4d_shape_entry_store(const RadParam* p, int n_p, int operand, RadOpdDesc* o
 int r4d_shape_window_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_router_scored_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_router_scored_topk_scatter(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r4d_shape_router_gemm_f32_scored_topk_scatter(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_rmsnorm_rope_roundtrip(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r4d_shape_rmsnorm_rope_roundtrip_kv_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
@@ -61,5 +67,6 @@ int r4d_fuse_rope_rows_roundtrip(const RadParam*, int, uint64_t, int, RadFuseSte
 int r4d_fuse_mhc_collapse_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_mhc_post_collapse_rmsnorm(const RadParam*, int, uint64_t, int, RadFuseStep*);
 int r4d_fuse_router_scored_topk_scatter(const RadParam*, int, uint64_t, int, RadFuseStep*);
+int r4d_fuse_router_gemm_f32_scored_topk_scatter(const RadParam*, int, uint64_t, int, RadFuseStep*);
 
 #endif

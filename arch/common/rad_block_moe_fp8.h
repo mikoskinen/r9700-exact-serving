@@ -222,6 +222,11 @@ struct MoeFP8 {
          * also as one op (swiglu_clamped_gemm_nt_ggml, `op_swfold`) where a library serves it, issued in their
          * place while `swfold_live` > 0. 0 (every other caller): nothing more declared. */
         int     shared_swfold = 0;
+        /* DeepSeek-V4.1's lever FUSE-R (ds41-fuse): with `sigmoid_router` and a named score, declare the router chain's
+         * fused forms beside the separate ops -- router_scored_topk_scatter without a gate (the selection and the sort,
+         * `op_rs_fused`) and router_gemm_f32_scored_topk_scatter (the projection too, `op_rgs_fused`) -- where a library
+         * serves them, picked per pass by `rfuse_live` (1 / 2). 0 (every other caller): nothing more declared. */
+        int     rfuse_decl = 0;
         /* At four ranks, exact: the gather and the block's all-reduce as one kernel
          * (moe_gather_all_reduce) for a single-pass step of at most this many tokens; 0 is the two
          * kernels. Its transport is the one-shot, so keep it to decode heights (the unfused
@@ -465,6 +470,15 @@ struct MoeFP8 {
      * separate activation; null or 0 = the two ops). The fused op writes the activation plane too, with its bytes. */
     rad_op op_swfold = 0;
     const std::atomic<int>* swfold_live = nullptr;
+    /* Config::rfuse_decl (lever FUSE-R): the fused router forms (0 where not declared or not served), their row bounds,
+     * and the architecture's in-process switch (read at every pass: 1 = the selection and the sort as op_rs_fused, 2 =
+     * the projection, the selection and the sort as op_rgs_fused where the pass fits it, else op_rs_fused; null or 0 =
+     * the separate ops). Every form writes the separate ops' bytes. `rf_count` (optional, rank 0 counts): [0] passes
+     * issued as op_rs_fused, [1] as op_rgs_fused. */
+    rad_op  op_rs_fused = 0, op_rgs_fused = 0;
+    int64_t rs_fused_rows = 0, rgs_fused_rows = 0;
+    const std::atomic<int>* rfuse_live = nullptr;
+    std::atomic<long long>* rf_count = nullptr;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -1977,6 +1991,52 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
     }
 
+    /* Lever FUSE-R (Config::rfuse_decl): the router chain's fused forms beside the separate ops, no gate (the gate keeps
+     * its own fill or the caller's ones plane, so `gate_done` is untouched). Each writes what the ops it replaces write
+     * (those ops declare the same buffers earlier, so their planned lifetimes cover it). */
+    if (c.rfuse_decl && c.sigmoid_router && c.router_score && c.n_group <= 1 && op_router && op_topk && op_scatter) {
+        const int64_t sort_rows = (int64_t)c.rows * c.top_k <= kMoeSortRows ? c.rows : kMoeSortRows / c.top_k;
+        if (rad_op_declared(b, "router_scored_topk_scatter")) {
+            rs_fused_rows = sort_rows;
+            const RadParam sp[] = {
+                RAD_RANGE("M", 1, rs_fused_rows), RAD_INT("n_expert", c.n_expert_all), RAD_INT("n_local", c.n_expert),
+                RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm_topk), RAD_F64("route_scale", c.route_scale),
+                RAD_STR("dtype", "f32"), RAD_INT("expert_base", c.expert_base), RAD_STR("score", c.router_score),
+                RAD_STR("protect", prot_list),
+            };
+            const int n_sp = (int)(sizeof(sp) / sizeof(sp[0])) - (prot_list ? 0 : 1);
+            op_rs_fused = rad_decl_op(b, "router_scored_topk_scatter", sp, n_sp, &glm_router.correction, 1);
+            if (op_rs_fused) {
+                const rad_buf rd[1] = { w.logits };
+                rad_buf wr[6] = { w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
+                int n_wr = 5;
+                if (scatter_inv) wr[n_wr++] = w.inv;
+                rad_op_reads (b, op_rs_fused, rd, 1);
+                rad_op_writes(b, op_rs_fused, wr, n_wr);
+            }
+        }
+        if (rad_op_declared(b, "router_gemm_f32_scored_topk_scatter")) {
+            rgs_fused_rows = sort_rows < 48 ? sort_rows : 48;
+            const RadParam fp[] = {
+                RAD_RANGE("M", 1, rgs_fused_rows), RAD_INT("K", glm_router.g.n_embd), RAD_INT("n_expert", c.n_expert_all),
+                RAD_INT("n_local", c.n_expert), RAD_INT("top_k", c.top_k), RAD_INT("norm", c.norm_topk),
+                RAD_F64("route_scale", c.route_scale), RAD_STR("score", c.router_score), RAD_STR("dtype", "bf16"),
+                RAD_INT("expert_base", c.expert_base), RAD_STR("protect", prot_list),
+            };
+            const int n_fp = (int)(sizeof(fp) / sizeof(fp[0])) - (prot_list ? 0 : 1);
+            const rad_weight fw[2] = { glm_router.projection, glm_router.correction };
+            op_rgs_fused = rad_decl_op(b, "router_gemm_f32_scored_topk_scatter", fp, n_fp, fw, 2);
+            if (op_rgs_fused) {
+                const rad_buf rd[1] = { glm_router.w.input };
+                rad_buf wr[7] = { w.logits, w.ids, w.ew, w.sorted, w.eoff, w.ecnt };
+                int n_wr = 6;
+                if (scatter_inv) wr[n_wr++] = w.inv;
+                rad_op_reads (b, op_rgs_fused, rd, 1);
+                rad_op_writes(b, op_rgs_fused, wr, n_wr);
+            }
+        }
+    }
+
     if (g.world > 1 && !c.no_reduce) {
         const auto all_reduce = [&](const char* dtype, rad_buf buffer) {
             return rw(b, RAD_OP(b, "all_reduce",
@@ -2223,6 +2283,11 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
     const bool rfused = op_router_fused && rows <= router_fused_rows;
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
+    /* lever FUSE-R (rfuse_live): 2 = the projection, the selection and the sort in one launch where the pass fits it (and
+     * the projection is not column-split), else 1 = the selection and the sort in one; the separate ops otherwise */
+    const int rfl = rfuse_live && !rfused && !sfused ? rfuse_live->load(std::memory_order_relaxed) : 0;
+    const bool rgsf = rfl >= 2 && op_rgs_fused && rows <= rgs_fused_rows && !glm_router.split.takes(rows);
+    const bool rsf = !rgsf && rfl >= 1 && op_rs_fused && rows <= rs_fused_rows;
     const bool gate_done = (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate);
     /* The shared arm on the second lane (shexp_lane): a decode or verify step of one pass. */
     const bool want_lane1 = shared && shexp_lane_ok && shexp_lane &&
@@ -2274,7 +2339,22 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * weights. The declared buffer is stable across record and replay, and route_report hands
      * the same buffer on, so the stager's stream-ordered read sees this pass's counts. */
     const RadOperand ecnt = brows(w.ecnt, ne);
-    if (sfused) {
+    if (rgsf) {
+        RAD_ISSUE_N(c_, op_rgs_fused, rows, brow_slice(glm_router.w.input, r0, rows, glm_router.g.n_embd),
+                    RAD_W(glm_router.projection), RAD_W(glm_router.correction),
+                    brow_slice(w.logits, r0, rows, ne_all), brow_slice(w.ids, r0, rows, k),
+                    brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
+                    scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
+        if (rf_count && g.rank == 0) rf_count[1].fetch_add(1, std::memory_order_relaxed);
+    } else if (rsf) {
+        glm_router.project(c_, r0, rows, r0);
+        RAD_ISSUE_N(c_, op_rs_fused, rows, brow_slice(w.logits, r0, rows, ne_all),
+                    RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
+                    brow_slice(w.ew, r0, rows, k), brows(w.sorted, rows * k),
+                    brows(w.eoff, ne + 1), ecnt, RAD_NONE,
+                    scatter_inv ? brows(w.inv, rows * k) : RAD_NONE);
+        if (rf_count && g.rank == 0) rf_count[0].fetch_add(1, std::memory_order_relaxed);
+    } else if (sfused) {
         glm_router.project(c_, r0, rows, r0);
         RAD_ISSUE_N(c_, op_sigmoid_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),
                     RAD_W(glm_router.correction), brow_slice(w.ids, r0, rows, k),
@@ -2295,7 +2375,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
                     brow_slice(w.logits, r0, rows, ne_all));
     /* topk + scatter fused, or the pair. In the fused op `w.ids` is an output. */
-    if (rfused || sfused) {
+    if (rfused || sfused || rgsf || rsf) {
         /* the fused router wrote all five */
     } else if (op_topk_scatter && rows <= topk_scatter_rows) {
         RAD_ISSUE_N(c_, op_topk_scatter, rows, brow_slice(w.logits, r0, rows, ne_all),

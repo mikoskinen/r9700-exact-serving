@@ -369,6 +369,19 @@
  *   heat_hyst_x100  engine (lever L2, ds41-swl; 67 here): the guard's ratio, HeatParams::hysteresis x 100, 100 .. 1000; starts
  *                   at RADIANCE_HEAT_HYSTERESIS x 100 or the shipped 125. As heat_min_gain_x100 otherwise. /stats
  *                   experts.ranks[].heat_min_gain_x100 / heat_hyst_x100 read each rank's engine back.
+ *   ds41_rfuse      deepseek41 (lever FUSE-R, ds41-fuse; 68 here, after heat_hyst_x100): the trunk MoE layers' router chain
+ *                   (gemm_nt_f32 -> router_scored_topk -> moe_scatter: two dependent launch gaps a layer) in fewer launches,
+ *                   each form the stock code with only the launch boundaries removed: 1 the selection and the sort as one
+ *                   launch (router_scored_topk_scatter, no gate); 2 the projection too (router_gemm_f32_scored_topk_scatter:
+ *                   the GEMM's last workgroup ranks and sorts) at a pass of <= 48 rows, else 1; 0 the separate ops (today).
+ *                   RADIANCE_DS41_RFUSE=0 / 1 / 2 declares the forms beside every trunk router and starts at that value;
+ *                   unset declares nothing and >= 1 is refused. Exact: every form writes the separate ops' bytes at any
+ *                   row count. GET "fuse".rf_* counts the passes issued in each form (rank 0).
+ *   ds41_mix_fin    libr4d (lever FUSE-M, ds41-fuse; 69 here): 1 mhc_mix at <= 48 rows in its one-launch FIN form (the
+ *                   split launch's last workgroup of a row group runs mix_finish_kernel's row over the same partials:
+ *                   the finish kernel's bytes, one launch fewer; not where ds41_mix_wv's wide form acts); 0 the split
+ *                   and finish launches (today). RADIANCE_DS41_MIX_FIN=1 at load starts it on. GET "fuse".mixfin_*
+ *                   counts its launches (every rank).
  *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
  *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
  *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
@@ -511,7 +524,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kDs41PskL20, kDsparkPfctx, kDs41PskCr, kDs41Engdd, kSchedNoa,
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
-              kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kSwitches };
+              kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
+              kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -655,6 +669,11 @@ void arc_stats(int64_t out[kArcStats]);
  * mhc_mix launches in a wide-wave form, their rows. 0s where no plugin serves them. */
 constexpr int kI11Stats = 8;
 void i11_stats(int64_t out[kI11Stats]);
+/* Levers FUSE-R / FUSE-M (ds41-fuse): deepseek41's rad_rfuse_stats [0..3] (forms declared, layers, passes in form 1, in
+ * form 2; rank 0) then libr4d's rad_fuse_stats [4..7] (mhc_mix FIN launches under ds41_mix_fin, their rows, the fused
+ * router's launches, their rows; every rank); 0s where no plugin serves them. */
+constexpr int kFuseStats = 8;
+void fuse_stats(int64_t out[kFuseStats]);
 /* Lever E1's live counters (ds41-e1, /stats "engdd"; the plugin's rad_engdd_stats, rank 0's, cumulative): Engram layer
  * passes deduplicated, rows not computed in them, rows pooled in them, layer passes kept whole by the 48-row guard, layer
  * passes below the repeat share, steps with a deduplicated layer, layer passes with no launch above the band -- 0s and a

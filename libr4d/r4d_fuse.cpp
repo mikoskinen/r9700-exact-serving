@@ -416,6 +416,40 @@ extern "C" int r4d_fuse_router_scored_topk_scatter(const RadParam* p, int n_p, u
 }
 
 /* ==========================================================================================
+ * router_gemm_f32_scored_topk_scatter -- lever FUSE-R (ds41-fuse): the router's projection, then
+ * router_scored_topk_scatter's chain (no gate). (kernel: libr4d/r4d_ds41_elem.hip,
+ * router_gemm_scored_scatter_kernel)
+ *
+ * Operands: [0] a  [1] b  [2] bias  [3] logits  [4] ids  [5] weights  [6] sorted_tok
+ *           [7] expert_offset  [8] expert_count  [9] inverse?
+ */
+extern "C" int r4d_fuse_router_gemm_f32_scored_topk_scatter(const RadParam* p, int n_p, uint64_t present,
+                                                            int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    if (step == 0) {
+        Step s(out, "gemm_nt_f32");
+        s.mirror(p, n_p, "M").pint("N", pi(p, n_p, "n_expert")).mirror(p, n_p, "K").pstr("dtype", "bf16");
+        return s.wire({ 0, 1, 3 });                 /* x, w, y */
+    }
+    if (step == 1) {
+        Step s(out, "router_scored_topk");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n_expert").mirror(p, n_p, "top_k")
+         .mirror(p, n_p, "norm").mirror(p, n_p, "route_scale").mirror(p, n_p, "score")
+         .pstr("dtype", "f32");
+        return s.wire({ 3, 2, 4, 5 });              /* logits, bias, ids, weights */
+    }
+    if (step == 2) {
+        const bool inv = RAD_FUSE_HAS(present, 9);
+        Step s(out, inv ? "moe_scatter_inv" : "moe_scatter");
+        s.mirror(p, n_p, "M").pint("n_expert", pi(p, n_p, "n_local", pi(p, n_p, "n_expert")))
+         .mirror(p, n_p, "top_k").mirror_opt(p, n_p, "expert_base").mirror_opt(p, n_p, "protect");
+        if (inv) return s.wire({ 4, 6, 7, 8, 9 });
+        return s.wire({ 4, 6, 7, 8 });
+    }
+    return RAD_E_NOTFOUND;
+}
+
+/* ==========================================================================================
  * gate_quant_fp8 -- the same epilogue with the gate in its own operand.
  * (kernel: libr4d/r4d_fused_quant_fp8.hip, gate_quant_fp8_kernel)
  *

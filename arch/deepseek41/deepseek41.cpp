@@ -1502,6 +1502,41 @@ static bool e2_declared() { return g_sw_e2_env.load(std::memory_order_relaxed) >
 /* the live mask / flag, 0 where nothing was declared */
 static int gq_now() { return g_sw_gq_ok.load(std::memory_order_relaxed) ? g_sw_gq.load(std::memory_order_relaxed) : 0; }
 static bool e2_now() { return g_sw_e2_ok.load(std::memory_order_relaxed) && g_sw_e2.load(std::memory_order_relaxed) > 0; }
+/* Lever FUSE-R (ds41-fuse, 13.11.2026; zzzaql's AQL-stamped c8 on int14: gemm_nt_f32_tile -> router_scored 173 us and
+ * router_scored -> scatter_small 172 us of dependent-launch gaps a decode step, both on the critical path): the trunk MoE
+ * layers' router chain in fewer launches, each form the stock code with only the launch boundaries removed (libr4d
+ * r4d_ds41_elem.hip):
+ *   ds41_rfuse 1   the selection and the sort as router_scored_topk_scatter (no gate): router_scored_row a row a wave and
+ *                  the stock small sort, in one workgroup (the op ROUTER_FUSE took, there with the gate);
+ *   ds41_rfuse 2   the projection too, as router_gemm_f32_scored_topk_scatter: gemm_nt_f32's tile body, the GEMM's last
+ *                  workgroup (arrival counter, an op instance's) runs 1's body -- at a pass of <= 48 rows (the decode
+ *                  band; a larger pass takes 1's form where it fits the sort, else the separate ops);
+ *   0              the separate ops (gemm_nt_f32, router_scored_topk, moe_scatter), today's issue.
+ * Every form writes the separate ops' bytes at any row count (each row's logits, selection and its slots' places are its
+ * own; the sort is stable and its result does not depend on the workgroup's wave count). RADIANCE_DS41_RFUSE=0 / 1 / 2
+ * declares the fused forms beside every trunk MoE layer's router (MoeFP8 Config::rfuse_decl) and starts at that value;
+ * unset declares nothing (>= 1 refused; the program and the issue today's). Counters (rank 0, at issue: a recorded pass
+ * counts when it is recorded) for GET /admin/fn4 "fuse": passes issued in form 1 / form 2 (rad_rfuse_stats). */
+static std::atomic<int> g_sw_rf{0}, g_sw_rf_ok{0}, g_sw_rf_env{-2}, g_rf_noted{0};   /* ok: bit 0 form 1, bit 1 form 2 */
+static std::atomic<long long> g_rf_count[2] = { {0}, {0} };
+static std::atomic<int> g_rf_layers{0};
+static void rf_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_RFUSE");
+    int v = -1;
+    if (e) {
+        if (!std::strcmp(e, "0") || !std::strcmp(e, "off")) v = 0;
+        else if (!std::strcmp(e, "1")) v = 1;
+        else if (!std::strcmp(e, "2") || !std::strcmp(e, "on")) v = 2;
+    }
+    if (g_sw_rf_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_rf.store(v, std::memory_order_relaxed);
+        if (e && v < 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_RFUSE=%s is not 0 / 1 / 2 (or off / on): lever FUSE-R is "
+                            "not declared\n", e);
+    }
+}
+static bool rf_declared() { return g_sw_rf_env.load(std::memory_order_relaxed) >= 0; }
 /* The fewest rows a pcn_a launch is fused at under the switch; 0 = none. */
 static int64_t mhc_fuse_min() {
     if (!g_sw_mhc_ok.load(std::memory_order_relaxed)) return 0;
@@ -1608,6 +1643,9 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value >= 1 && value <= 3 && g_sw_gq_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 */
         return value == 0 || (value == 1 && g_sw_e2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_rfuse"))   /* lever FUSE-R: 1 needs form 1 declared somewhere, 2 form 2 */
+        return value == 0 || (value == 1 && (g_sw_rf_ok.load(std::memory_order_relaxed) & 1)) ||
+               (value == 2 && (g_sw_rf_ok.load(std::memory_order_relaxed) & 2)) ? 1 : -1;
     return 0;
 }
 extern "C" int rad_fn4_switch(const char* name, int value) {
@@ -1627,6 +1665,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ix_ni")) g_sw_ixni.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_gq")) g_sw_gq.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_e2")) g_sw_e2.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_rfuse")) g_sw_rf.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1688,6 +1727,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_e2")) {
         *applied = e2_now() ? 1 : 0;
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_rfuse")) {   /* what the issue reads: 0 where nothing was declared */
+        *applied = g_sw_rf_ok.load(std::memory_order_relaxed) ? g_sw_rf.load(std::memory_order_relaxed) : 0;
         return 1;
     }
     return 0;
@@ -2790,6 +2833,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.shared_one_external = m.sone && g.n_ff > 0 ? 1 : 0;
     /* Lever K1 fold e: the shared arm's clamped SwiGLU + GGUF down as one op beside the pair (RADIANCE_DS41_SWFOLD). */
     s.cfg.shared_swfold = g_sw_swf_env.load(std::memory_order_relaxed) > 0 && g.n_ff > 0 ? 1 : 0;
+    /* Lever FUSE-R: the router chain's fused forms beside the separate ops (RADIANCE_DS41_RFUSE set) */
+    s.cfg.rfuse_decl = rf_declared() ? 1 : 0;
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
     /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane */
@@ -2801,6 +2846,12 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     }
     L.moe.swfold_live = &g_sw_swf;
     if (L.moe.op_swfold) g_sw_swf_ok.store(1, std::memory_order_relaxed);
+    if (rf_declared()) {
+        L.moe.rfuse_live = &g_sw_rf;
+        L.moe.rf_count = g_rf_count;
+        if (L.moe.op_rs_fused) g_sw_rf_ok.fetch_or(1, std::memory_order_relaxed);
+        if (L.moe.op_rgs_fused) g_sw_rf_ok.fetch_or(2, std::memory_order_relaxed);
+    }
     sw_note_decl(L.moe.gar_rows);
     if (L.moe.shexp_lane_ok) g_sw_shexp_ok.store(1, std::memory_order_relaxed);
     L.post_f = op(b, "mhc_post", hcp, {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
@@ -3562,6 +3613,7 @@ static void engdd_declare(Model& m, const RadBuildCtx* ctx);               /* le
 static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lever KVR, below */
 static void mhc_declare(Model& m, const RadBuildCtx* ctx);                  /* lever M1, below */
 static void i11_declare(Model& m, const RadBuildCtx* ctx);                  /* levers 1U-GQ / 1U-E2, below */
+static void rf_declare(Model& m, const RadBuildCtx* ctx);                   /* lever FUSE-R, below */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -3596,6 +3648,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     engdd_read_env();
     mhc_read_env();
     i11_read_env();
+    rf_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3950,6 +4003,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     engdd_declare(m, ctx);
     mhc_declare(m, ctx);
     i11_declare(m, ctx);
+    rf_declare(m, ctx);
     DS_TRY(bt_declare(b, m, ctx));
     DS_TRY(kvr_declare(b, m, ctx));
     return RAD_OK;
@@ -4132,6 +4186,31 @@ static void mhc_declare(Model& m, const RadBuildCtx* ctx) {
                         "post, the next connection's collapse + norm and its mhc_mix in one op); 1 = launches of >= %lld "
                         "rows fused, N >= 2 = of >= N rows\n",
                 g_sw_mhc.load(std::memory_order_relaxed), n, want, (long long)kMhcFuseRows);
+}
+
+/* Lever FUSE-R at the end of a declare (RADIANCE_DS41_RFUSE set): the trunk MoE layers that declared each form; a form no
+ * layer declared (no library serves the op) is refused, and the switch falls back to the highest form declared. */
+static void rf_declare(Model& m, const RadBuildCtx* ctx) {
+    if (ctx->shape_probe || !rf_declared()) return;
+    int moe = 0, rs = 0, rgs = 0;
+    for (const Layer& L : m.layers) {
+        if (!L.moe.op_router) continue;
+        ++moe;
+        rs += L.moe.op_rs_fused ? 1 : 0;
+        rgs += L.moe.op_rgs_fused ? 1 : 0;
+    }
+    const int ok = (rs > 0 ? 1 : 0) | (rgs > 0 ? 2 : 0);
+    g_sw_rf_ok.store(ok, std::memory_order_relaxed);
+    const int v = g_sw_rf.load(std::memory_order_relaxed);
+    if ((v == 2 && !(ok & 2)) || (v >= 1 && !ok)) g_sw_rf.store(ok & 2 ? 2 : ok & 1 ? 1 : 0, std::memory_order_relaxed);
+    if (ctx->rank != 0) return;
+    g_rf_layers.store(rgs > rs ? rgs : rs, std::memory_order_relaxed);
+    if (g_rf_noted.exchange(1, std::memory_order_relaxed)) return;
+    fprintf(stderr, "radiance: deepseek41: lever FUSE-R (ds41_rfuse, RADIANCE_DS41_RFUSE, now %d) %s: beside the router of %d "
+                    "MoE layers -- router_scored_topk_scatter (form 1, the selection + the sort) at %d, "
+                    "router_gemm_f32_scored_topk_scatter (form 2, the projection too, <= 48 rows) at %d\n",
+            g_sw_rf.load(std::memory_order_relaxed), ok ? "declared" : "not declared (no library serves the forms)", moe,
+            rs, rgs);
 }
 
 /* Levers 1U-GQ / 1U-E2 at the end of a declare (their environment set): the layers that declared them; none (no library
@@ -6257,6 +6336,18 @@ extern "C" int rad_i9b_stats(long long* out, int n) {
 /* Levers 1U-GQ / 1U-E2's live counters for GET /admin/fn4 "i11" (ds41-int11), rank 0's, cumulative, counted at issue (a
  * recorded pass when it is recorded): out[0] layers that declared GQ, [1] q_a + kv pair launches, [2] attention_output_a
  * pair launches, [3] layers that declared E2, [4] E2 split launches (part GEMV + gather), [5] their rows. Returns 6. */
+/* Lever FUSE-R's live counters for GET /admin/fn4 "fuse" (ds41-fuse), rank 0's, cumulative, counted at issue (a recorded pass
+ * when it is recorded): out[0] the forms declared (bit 0 form 1, bit 1 form 2), [1] MoE layers that declared one, [2] passes
+ * issued in form 1, [3] in form 2. Returns 4. */
+extern "C" int rad_rfuse_stats(long long* out, int n) {
+    using namespace deepseek41;
+    if (!out || n < 4) return 0;
+    out[0] = g_sw_rf_ok.load(std::memory_order_relaxed);
+    out[1] = g_rf_layers.load(std::memory_order_relaxed);
+    out[2] = g_rf_count[0].load(std::memory_order_relaxed);
+    out[3] = g_rf_count[1].load(std::memory_order_relaxed);
+    return 4;
+}
 extern "C" int rad_i11_stats(long long* out, int n) {
     using namespace deepseek41;
     if (!out || n < 6) return 0;

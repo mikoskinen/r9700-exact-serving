@@ -35,7 +35,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
-                                        "heat_hyst_x100" };
+                                        "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -46,7 +46,9 @@ bool plugin_switch(int i) {
            i == kDs41E2 ||
            i == kExl3X3d ||   /* exl3_x3d (62 here; 57 on ds41-x3d-eng10): the ds41-x3d exl3r4d (X3D-F) */
            i == kArXpush ||   /* ar_xpush (63, ds41-int13): libr4d's XPUSH (the FN fn4 name, ported from fn4-x3-sp3) */
-           i == kGgGemvM16;   /* gg_gemv_m16 (64 here, 63 on ds41-a4): libr4d (lever A4) */
+           i == kGgGemvM16 ||   /* gg_gemv_m16 (64 here, 63 on ds41-a4): libr4d (lever A4) */
+           i == kDs41Rfuse ||   /* ds41_rfuse (68, ds41-fuse): deepseek41 (lever FUSE-R) */
+           i == kDs41MixFin;    /* ds41_mix_fin (69, ds41-fuse): libr4d (lever FUSE-M) */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -68,6 +70,8 @@ struct Hooks {
     int (*arc_stats)(long long*, int) = nullptr;   /* lever ARC (libr4d's rad_arc_stats, ds41-int10) */
     int (*i11_stats)(long long*, int) = nullptr;   /* levers 1U-GQ / 1U-E2 (deepseek41's rad_i11_stats, ds41-int11) */
     int (*mx_stats)(long long*, int) = nullptr;    /* lever 1U-MX (libr4d's rad_mx_stats, ds41-int11) */
+    int (*rfuse_stats)(long long*, int) = nullptr; /* lever FUSE-R (deepseek41's rad_rfuse_stats, ds41-fuse) */
+    int (*fuse_stats)(long long*, int) = nullptr;  /* levers FUSE-M / FUSE-R (libr4d's rad_fuse_stats, ds41-fuse) */
 };
 
 struct State {
@@ -188,6 +192,8 @@ void find_hooks(State& s) {
             k.arc_stats = sym<int (*)(long long*, int)>(h, "rad_arc_stats");
             k.i11_stats = sym<int (*)(long long*, int)>(h, "rad_i11_stats");
             k.mx_stats = sym<int (*)(long long*, int)>(h, "rad_mx_stats");
+            k.rfuse_stats = sym<int (*)(long long*, int)>(h, "rad_rfuse_stats");
+            k.fuse_stats = sym<int (*)(long long*, int)>(h, "rad_fuse_stats");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -634,6 +640,32 @@ void i11_stats(int64_t out[kI11Stats]) {
     i11_collect(s, out);
 }
 
+/* Under s.mu. */
+static void fuse_collect(State& s, int64_t* out) {
+    for (int i = 0; i < kFuseStats; ++i) out[i] = 0;
+    find_hooks(s);
+    bool got_a = false, got_b = false;
+    for (const Hooks& k : s.hooks) {
+        if (k.rfuse_stats && !got_a) {
+            long long v[4] = { 0, 0, 0, 0 };
+            const int n = k.rfuse_stats(v, 4);
+            for (int i = 0; i < n && i < 4; ++i) out[i] = (int64_t)v[i];
+            got_a = n > 0;
+        }
+        if (k.fuse_stats && !got_b) {
+            long long v[4] = { 0, 0, 0, 0 };
+            const int n = k.fuse_stats(v, 4);
+            for (int i = 0; i < n && i < 4; ++i) out[4 + i] = (int64_t)v[i];
+            got_b = n > 0;
+        }
+    }
+}
+void fuse_stats(int64_t out[kFuseStats]) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    fuse_collect(s, out);
+}
+
 int engdd_stats(int64_t out[7]) {
     for (int i = 0; i < 7; ++i) out[i] = 0;
     State& s = st();
@@ -687,7 +719,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1341,6 +1373,17 @@ std::string state_json() {
              std::to_string((long long)v[4]) + ", \"rows\": " + std::to_string((long long)v[5]) +
              "}, \"mx\": {\"wide_launches\": " + std::to_string((long long)v[6]) + ", \"wide_rows\": " +
              std::to_string((long long)v[7]) + "}}";
+    }
+    /* Levers FUSE-R / FUSE-M (ds41-fuse): always present, 0s where no plugin serves them (fuse_stats). */
+    {
+        int64_t v[kFuseStats];
+        fuse_collect(s, v);
+        o += ", \"fuse\": {\"rf_declared\": " + std::to_string((long long)v[0]) + ", \"rf_layers\": " +
+             std::to_string((long long)v[1]) + ", \"rf_form1_passes\": " + std::to_string((long long)v[2]) +
+             ", \"rf_form2_passes\": " + std::to_string((long long)v[3]) + ", \"mixfin_launches\": " +
+             std::to_string((long long)v[4]) + ", \"mixfin_rows\": " + std::to_string((long long)v[5]) +
+             ", \"rgs_launches\": " + std::to_string((long long)v[6]) + ", \"rgs_rows\": " +
+             std::to_string((long long)v[7]) + "}";
     }
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {

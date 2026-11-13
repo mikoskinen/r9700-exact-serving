@@ -136,6 +136,31 @@ extern "C" int r4d_shape_router_scored_topk_scatter(const RadParam* p, int n_p, 
     return r4d_shape_router_sigmoid_topk_scatter(p, n_p, operand, out);
 }
 
+/* lever FUSE-R (ds41-fuse): gemm_nt_f32's operands (a bf16, b f32 -- or bf16 under RADIANCE_DS41_ROUTER_BF16 -- , logits
+ * f32) around router_scored_topk_scatter's, `logits` named once: a, b, bias -> logits, ids, weights, sorted_tok,
+ * expert_offset, expert_count, inverse?. The decode band (M <= 48), <= 384 experts. */
+extern "C" int r4d_shape_router_gemm_f32_scored_topk_scatter(const RadParam* p, int n_p, int operand,
+                                                            RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), K = pi(p, n_p, "K"), ne = pi(p, n_p, "n_expert"), k = pi(p, n_p, "top_k");
+    const int64_t nl = pi(p, n_p, "n_local", ne);
+    if (M < 1 || M > 48 || K < 1 || ne < 1 || ne > 384 || k < 1 || k > ne || k > 32 || M * k > 1024 || nl < 1 ||
+        nl > ne)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, K),          /* a */
+        opd((uint32_t)RAD_F32, ne, K),          /* b, the projection */
+        opd((uint32_t)RAD_F32, ne),             /* bias */
+        opd((uint32_t)RAD_F32, M, ne),          /* logits */
+        opd_idx(M, k, ne),                      /* ids */
+        opd((uint32_t)RAD_F32, M, k),           /* weights */
+        opd((uint32_t)RAD_I32, M * k),          /* sorted_tok */
+        opd((uint32_t)RAD_I32, nl + 1),         /* expert_offset */
+        opd((uint32_t)RAD_I32, nl),             /* expert_count */
+        opd_none(),                             /* inverse: optional */
+    };
+    R4D_PICK(l);
+}
+
 /* The planes as a host tool draws them: i8 codes (no table), a scale per `group` of a row. */
 extern "C" int r4d_shape_embed_lookup_planes(const RadParam* p, int n_p, int operand,
                                              RadOpdDesc* out) {

@@ -58,6 +58,7 @@ extern "C" {
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cerrno>
 #include <cstdarg>
@@ -34616,6 +34617,7 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 #include "r4d_selftest_arc.inc"   /* ds41-int10: lever ARC, the coded wire at overlap 0 on four cards (--case ar_arcoded) */
 #include "r4d_selftest_i11.inc"   /* ds41-int11: lever 1U-MX, mhc_mix's wide-wave decode form byte for byte (--case mix_wv) */
 #include "r4d_selftest_gq.inc"    /* ds41-int11: lever 1U-GQ, gemm_nt_ggml_pair vs two gemm_nt_ggml (--case gq_pair) */
+#include "r4d_selftest_fuse.inc"  /* ds41-fuse: levers FUSE-R / FUSE-M byte for byte vs the stock launches + per-call times (--case rfuse / mixfin) */
 #include "r4d_selftest_a4.inc"    /* ds41-a4: lever A4, the gg_gemv_m16 forms (--mrcheck16, --perfm16) */
 
 static void device_phase(const Plugin& pl) {
@@ -35902,6 +35904,7 @@ static void device_phase(const Plugin& pl) {
     i9b_cases(pl);
     i11_cases(pl);   /* ds41-int11 (r4d_selftest_i11.inc / _gq.inc): levers 1U-MX and 1U-GQ */
     gq_cases(pl);
+    fuse_cases(pl);   /* ds41-fuse (r4d_selftest_fuse.inc): levers FUSE-R and FUSE-M */
     /* --- byte rows: the KV tier's transfer pair --- */
     /* Pack and unpack a pool, the real layout in miniature: a "layer" is `rows` blocks of `n`
      * bytes, a session's blocks are scattered through it, and exactly those blocks must come back.

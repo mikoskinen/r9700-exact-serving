@@ -140,6 +140,22 @@ static const RadConstraint cDs41RouterScoredScatter[] = {
     C_IN("dtype", "f32"),
 };
 
+/* lever FUSE-R (ds41-fuse): gemm_nt_f32 (the router's projection), router_scored_topk and moe_scatter in one launch, no
+ * gate. The decode band: M <= 48 (the sort's one workgroup and the GEMM's decode tile forms), <= 384 experts,
+ * DeepSeek's sqrtsoftplus. */
+static const RadParamSpec pDs41RouterGemmScored[] = {
+    P_INT("M"),     P_INT("K"),           P_INT("n_expert"), P_INTO("n_local"), P_INT("top_k"), P_INT("norm"),
+    P_F64("route_scale"), P_STR("score"), P_STR("dtype"),    P_INTO("expert_base"), P_STRO("protect") };
+static const RadOperandSpec oDs41RouterGemmScored[] = {
+    { "a", RAD_OPD_IN, 0 },             { "b", RAD_OPD_WEIGHT, 0 },        { "bias", RAD_OPD_WEIGHT, 0 },
+    { "logits", RAD_OPD_OUT, 0 },       { "ids", RAD_OPD_OUT, 0 },         { "weights", RAD_OPD_OUT, 0 },
+    { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 }, { "expert_count", RAD_OPD_OUT, 0 },
+    { "inverse", RAD_OPD_OUT, 1 } };
+static const RadConstraint cDs41RouterGemmScored[] = {
+    C_GE("M", 1),     C_LE("M", 48),     C_GE("K", 1),   C_LE("K", 16384), C_GE("n_expert", 1), C_LE("n_expert", 384),
+    C_GE("top_k", 1), C_LE("top_k", 32), C_IN("score", "sqrtsoftplus"),    C_IN("dtype", "bf16"),
+};
+
 static const RadParamSpec pDs41EmbedPlanes[] = { P_INT("M"),     P_INT("n_embd"),
                                                  P_INT("n_vocab"), P_INT("group"),
                                                  P_STR("dtype"), P_INTO("vocab_offset"),
@@ -309,6 +325,11 @@ static const RadConstraint cDs41PcnMix[] = {
            "`moe_scatter_inv` (router_sigmoid_topk_scatter with the score named). Every output is the "
            "bytes the separate launches write, including a row with fewer finite ranks than top_k. "
            "Bounded by the sort's single-workgroup form: M * top_k <= 1024, refused above."),
+    SCHEMA("router_gemm_f32_scored_topk_scatter", pDs41RouterGemmScored, oDs41RouterGemmScored,
+           "`gemm_nt_f32` (a [M, K] bf16 x b [n_expert, K] f32 -> logits f32, the router's projection), then "
+           "`router_scored_topk_scatter` over its logits (no gate), in one launch: the GEMM's last workgroup to "
+           "finish ranks and sorts. Every output is the bytes the separate launches write. Device-only; "
+           "M <= 48, n_expert <= 384, score sqrtsoftplus."),
     SCHEMA("embed_lookup_planes", pDs41EmbedPlanes, oDs41EmbedPlanes,
            "A gather from a table stored as single-level affine planes, read in place: x[m, i] = v * "
            "scale[id, i / group] * mult, v = table[code] when a table is given, else the code. Codes are i8, "
@@ -417,6 +438,17 @@ static const RadConstraint cDs41PcnMix[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41RouterScoredScatter), NOTUNE, nullptr, nullptr,
   r4d_rad_router_scored_topk_scatter, nullptr, nullptr, nullptr,
   r4d_shape_router_scored_topk_scatter, nullptr, r4d_fuse_router_scored_topk_scatter },
+{ "router_gemm_f32_scored_topk_scatter_bf16", "router_gemm_f32_scored_topk_scatter", "moe",
+  "the router's f32 projection, router_scored_topk and the stable counting sort in one launch -- the GEMM's last "
+  "workgroup ranks and sorts (lever FUSE-R)",
+  "M <= 48, M*top_k <= 1024, n_expert <= 384, top_k <= 32, K <= 16384; the GEMM a wave a tile (8 / 16 waves a "
+  "workgroup), the selection a wave a row",
+  "bf16 activation, f32 or bf16 projection, f32 bias; f32 logits and weights, i32 ids, sorted slots, offsets and "
+  "counts",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41RouterGemmScored), NOTUNE,
+  r4d_rad_router_gemm_scored_scatter_init, r4d_rad_router_gemm_scored_scatter_fini,
+  r4d_rad_router_gemm_scored_scatter, nullptr, nullptr, nullptr,
+  r4d_shape_router_gemm_f32_scored_topk_scatter, nullptr, r4d_fuse_router_gemm_f32_scored_topk_scatter },
 { "embed_lookup_planes_bf16", "embed_lookup_planes", "vocab",
   "embedding gather from a table's affine planes, read in place (no layout hook)",
   "any M, n_embd a multiple of group; one thread an element of a gathered row",
