@@ -310,9 +310,10 @@ struct MoeFP8 {
          * loaded library serves them; 0 declares nothing. pass(..., dk = true) issues them. */
         int64_t exl3_dk_rows = 0;
         /* A sizing declare (RadBuildCtx::shape_probe, the arena's levels): exl3_dk_rows is what the REAL declare's layer
-         * holds (its dk_rows, 0 where it declared no pair) and the pair is declared exactly there, whatever this
-         * declare's rows -- a level of fewer than 17 rows (the 8-row decode rung) must declare the same ops at the same
-         * positions as the real program (Builder::set_reference), or the level is refused. It is never issued there. */
+         * asked the pair for (its dk_asked, 0 where it asked for none) and the pair is asked for exactly there, whatever
+         * this declare's rows -- a level of fewer than 17 rows (the 8-row decode rung) must declare the same ops at the
+         * same positions as the real program (Builder::set_reference; an unresolved op is in the list by name too), or
+         * the level is refused. It is never issued there. */
         int     exl3_dk_probe = 0;
         /* The layer and global expert whose gate_up probe() read the format from (and so mapped);
          * declare() maps the rest. Layer -1: none. */
@@ -456,6 +457,7 @@ struct MoeFP8 {
      * served. dk_takes: a pass of `rows` tokens may be issued with them (pass's `dk`). */
     rad_op op_gu_dk = 0, op_dn_dk = 0;
     int64_t dk_rows = 0;
+    int64_t dk_asked = 0;   /* the rows the pair was declared over (resolved or not): what a sizing declare repeats */
     bool dk_takes(int64_t rows) const { return op_gu_dk && op_dn_dk && rows > 16 && rows <= dk_rows; }
     /* Config::gather_ar_rows: moe_gather_all_reduce over at most `gar_rows` tokens, or 0. */
     rad_op op_gar = 0;
@@ -2236,6 +2238,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     const int64_t dk = c.exl3_dk_probe ? c.exl3_dk_rows : std::min<int64_t>(c.exl3_dk_rows, c.rows);
     const bool dk_decl = dk > 16 && rad_op_declared(b, EXL3_OP_GATE_UP_DK) && rad_op_declared(b, EXL3_OP_DOWN_DK);
     if (dk_decl) {
+        dk_asked = dk;
         std::vector<RadParam> gk = gp;
         gk[0] = RAD_RANGE("M", 17, dk);
         op_gu_dk = rad_decl_op(b, EXL3_OP_GATE_UP_DK, gk.data(), (int)gk.size(), tab.data(), (int)tab.size());

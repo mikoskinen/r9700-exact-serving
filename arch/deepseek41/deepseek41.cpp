@@ -2880,7 +2880,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.exl3_dk_rows = p1_declared() ? kMoe1Max : 0;
     if (m.sized_against) {   /* a sizing declare: the pair exactly where the real declare's layer has it (also at an 8-row level) */
         const Model& full = *m.sized_against;
-        s.cfg.exl3_dk_rows = (size_t)l < full.layers.size() ? full.layers[(size_t)l].moe.dk_rows : 0;
+        s.cfg.exl3_dk_rows = (size_t)l < full.layers.size() ? full.layers[(size_t)l].moe.dk_asked : 0;
         s.cfg.exl3_dk_probe = 1;
     }
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
