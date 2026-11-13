@@ -24,14 +24,15 @@ the everyday setting caps each card at 210 W with a -50 mV voltage offset.
 
 | Measure | DeepSeek, stock 300 W | DeepSeek, 210 W | Qwen, stock 300 W | Qwen, 210 W |
 |---|---|---|---|---|
-| 1 user, prose | 96.5 | 90.8 | _pending_ | _pending_ |
-| 1 user, code | 165.0 | _pending_ | _pending_ | _pending_ |
-| 4 users | 176.1 | 171.6 | _pending_ | _pending_ |
-| 8 users | 208.1 | 192.0 | _pending_ | ~790 |
-| 16 users | 259.1 | 237.0 | _pending_ | ~1,030 |
-| Prefill 16k | 3,740 | _pending_ | _pending_ | _pending_ |
-| Prefill 64k | 6,020 | _pending_ | _pending_ | ~9,330 |
-| Prefill 128k | 6,140 | – | _pending_ | ~9,200 |
+| 1 user | 96 prose / 165 code | 91 prose | 269 | – |
+| 4 users | 176 | 172 | 619 | – |
+| 8 users | 208 | 192 | 831 | ~790 |
+| 16 users | 259 | 237 | 1,094 | ~1,030 |
+| Prefill 16k | 3,740 | – | 9,470 | – |
+| Prefill 64k | 6,020 | – | 9,716 | ~9,330 |
+| Prefill 128k | 6,140 | – | 9,620 | ~9,200 |
+
+A dash means the value wasn't measured at that setting.
 
 ## What exact means
 
