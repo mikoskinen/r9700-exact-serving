@@ -1591,7 +1591,8 @@ int a_stream_create(RadStream* out, int high_priority) {
     }
     s->mask = s->q->size - 1;
     hsa_amd_profiling_set_profiler_enabled(s->q, 1);
-    if (high_priority) hsa_amd_queue_set_priority(s->q, HSA_AMD_QUEUE_PRIORITY_HIGH);
+    if (high_priority > 0) hsa_amd_queue_set_priority(s->q, HSA_AMD_QUEUE_PRIORITY_HIGH);
+    else if (high_priority < 0) hsa_amd_queue_set_priority(s->q, HSA_AMD_QUEUE_PRIORITY_LOW);   /* fn4: a lane below compute */
     void* ka = nullptr;
     hsa_amd_memory_pool_t kpool = d.host_kargs ? G().host_fine : d.vram;
     hsa_agent_t kpeer = d.host_kargs ? d.agent : G().cpu;

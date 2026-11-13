@@ -978,7 +978,10 @@ void Ctx::dump_profile() const {
 int Ctx::lane_init() {
     if (lane1_) return RAD_OK;
     RAD_TRY(rad_dev_set(device_));
-    RAD_TRY(rad_stream_create(&lane1_, 0));
+    /* fn4 (13.11.2026, 227: the prefill comm lane's waves slow the compute beside them): RADIANCE_FN4_LANE_LOWPRIO=1 at start
+     * creates the second lane at the device's low queue priority (scheduling only; the same launches and bytes). */
+    static const int lane_prio = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_LOWPRIO"); return e && *e && *e != '0' ? -1 : 0; }();
+    RAD_TRY(rad_stream_create(&lane1_, lane_prio));
     own_lane1_ = true;
     /* Local scope: a lane join only orders this card's two queues. */
     for (int i = 0; i < 2; ++i)
