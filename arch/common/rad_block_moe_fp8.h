@@ -309,6 +309,11 @@ struct MoeFP8 {
          * the decode band's bytes per (token, slot) at more than 16 tokens) over 17 .. this many tokens a pass, where a
          * loaded library serves them; 0 declares nothing. pass(..., dk = true) issues them. */
         int64_t exl3_dk_rows = 0;
+        /* A sizing declare (RadBuildCtx::shape_probe, the arena's levels): exl3_dk_rows is what the REAL declare's layer
+         * holds (its dk_rows, 0 where it declared no pair) and the pair is declared exactly there, whatever this
+         * declare's rows -- a level of fewer than 17 rows (the 8-row decode rung) must declare the same ops at the same
+         * positions as the real program (Builder::set_reference), or the level is refused. It is never issued there. */
+        int     exl3_dk_probe = 0;
         /* The layer and global expert whose gate_up probe() read the format from (and so mapped);
          * declare() maps the rest. Layer -1: none. */
         int64_t probed_layer = -1;
@@ -2228,7 +2233,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
      * stager keys a layer on its first expert op (gate_up) and frees its copies behind its last (down), and a pass that
      * issues the dk pair (a decode step, never armed for staging) issues neither. A library that does not export the
      * names leaves both handles 0. */
-    const int64_t dk = std::min<int64_t>(c.exl3_dk_rows, c.rows);
+    const int64_t dk = c.exl3_dk_probe ? c.exl3_dk_rows : std::min<int64_t>(c.exl3_dk_rows, c.rows);
     const bool dk_decl = dk > 16 && rad_op_declared(b, EXL3_OP_GATE_UP_DK) && rad_op_declared(b, EXL3_OP_DOWN_DK);
     if (dk_decl) {
         std::vector<RadParam> gk = gp;
@@ -2246,7 +2251,7 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
         dq[0] = RAD_RANGE("M", 17, dk);
         op_dn_dk = rad_decl_op(b, EXL3_OP_DOWN_DK, dq.data(), (int)dq.size(), tab.data(), (int)tab.size());
         if (op_dn_dk) rw(b, op_dn_dk, {b_x3h, w.sorted, w.eoff}, {w.edn});
-        if (op_dn_dk) dk_rows = dk;
+        if (op_dn_dk) dk_rows = c.exl3_dk_probe ? std::min<int64_t>(dk, c.rows) : dk;   /* a level never takes more than its rows */
     }
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
                {b_x3h, w.sorted, w.eoff}, {w.edn});

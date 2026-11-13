@@ -612,6 +612,8 @@ struct Model {
      * the row pitch of every buffer step_bi slices. */
     rad_buf bi_cu = 0;
     rad_op bi_sub = 0;
+    /* A sizing declare (RadBuildCtx::shape_probe): the real declare's model of this rank; null in the real declare. */
+    const Model* sized_against = nullptr;
     std::map<rad_buf, int64_t> bp;
     /* Lever PSK: the first layer a prefill segment is cut at (the last kv source + 1); 0 where PSK is not declared. */
     int psk_first = 0;
@@ -2876,6 +2878,11 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.rfuse_decl = rf_declared() ? 1 : 0;
     /* Lever P: the decode-band-bytes EXL3 pair over 17 .. kMoe1Max rows beside gate_up / down (RADIANCE_DS41_MOE1 set) */
     s.cfg.exl3_dk_rows = p1_declared() ? kMoe1Max : 0;
+    if (m.sized_against) {   /* a sizing declare: the pair exactly where the real declare's layer has it (also at an 8-row level) */
+        const Model& full = *m.sized_against;
+        s.cfg.exl3_dk_rows = (size_t)l < full.layers.size() ? full.layers[(size_t)l].moe.dk_rows : 0;
+        s.cfg.exl3_dk_probe = 1;
+    }
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
     if (p1_declared() && L.moe.dk_takes(kBiMoe + 1)) g_sw_p1_ok.store(1, std::memory_order_relaxed);
@@ -3711,6 +3718,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     index_runs(m);
     index_mode(m);
     if (ctx->shape_probe) {
+        m.sized_against = models[ctx->rank].get();   /* lever P: a level declares the dk pair where the real declare did */
         /* A level shrinks only what the step indexes by its own rows T. Everything the step
          * addresses by a capacity of the real declare keeps the real size: the work plane m.work
          * (comp_stage is written rows x r > T at a small step: at r 128 and 8 sequences a decode
