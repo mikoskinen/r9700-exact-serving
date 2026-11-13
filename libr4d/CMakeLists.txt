@@ -231,6 +231,9 @@ set(R4D_UNITS
   # Lever GPF: gemm_nt_ggml / logits_gemm_ggml's prefill WMMA rows in other tile geometries (the stock kernel's
   # arithmetic, the same bits), off unless switched on (gg_pf) or pinned by the bench.
   "r4d_ds41_ggml_pf|"
+  # Lever WMK (ds41-wmk2): the part-order WMMA form (gg_wk_kernel) of the dense GGUF GEMMs, its own code object, reached
+  # only under fn4 ds41_wmk 1 (<= 48 rows) or the bench pin r4d_gg_wk_pin.
+  "r4d_ds41_wmk|"
   # Lever GPF-b: gemm_nt_f32's prefill rows (router, compressor kv | gate) in a tiled form, the stock bits; off unless switched.
   "r4d_ds41_f32pf|"
   # GGUF MXFP4 blocks (type=mxfp4) for gemm_nt_ggml and moe_gemm_ggml: the DSpark drafter's experts.
