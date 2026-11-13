@@ -336,4 +336,107 @@ static void check(const Plugin& pl, const char* tlist) {
                 keys == 0 ? "NO DATA" : rows_bad || bad_keys ? "FAIL (a row's WMMA bytes depend on M or its place)" : "PASS (M- and place-invariant, M 1..130)");
 }
 
+/* --perfwmk [iters] [rounds]: where the WMMA form's time at decode heights goes. (1) WMGSCAN: synthetic q6_K / q8_0 / q5_K shapes
+ * N x K at M 1 / 16 / 48, W (the stock WMMA kernel) and D (int16's decode band), D W W D: the K -> 0 intercept (a launch's fixed
+ * cost) and the slope a 128-value slab. (2) WMGFORM: lever GPF's tile geometries (r4d_gg_pf_pin codes, the prefill forms) at
+ * M 1 / 16 on the real dense shapes, against the stock WMMA kernel, with their bytes. */
+static void scan(const Plugin& pl, int iters, int rounds) {
+    if (iters <= 0) iters = 100;
+    if (rounds <= 0) rounds = 2;
+    Hk h;
+    if (!hooks(pl, h, "--perfwmk")) return;
+    const GpHooks gp = gp_hooks(pl);
+    const char* mode = g_cold > 0 ? "cold" : "rot";
+    auto one = [&](const MrTy& ty, const char* name, int64_t N, int64_t K, int64_t M, bool forms) {
+        MrShape sh{ name, N, K, ty.name, false };
+        dfree_all();
+        const int64_t rb = K / ty.qk * ty.bb, wbytes = N * rb;
+        const int copies = (int)std::max<int64_t>(2, (256ll << 20) / wbytes + 1);
+        std::vector<uint8_t> hw;
+        mr_weights(hw, ty, N, K, 0x5CA40001ull ^ (uint64_t)(N * 7 + K));
+        std::vector<uint16_t> hx;
+        mr_acts(hx, K, 0x5CAull ^ (uint64_t)M);
+        const size_t yb = (size_t)(M * N) * 2;
+        void* d_x = dalloc((size_t)(M * K) * 2);
+        void* d_w = dalloc((size_t)wbytes * (size_t)copies);
+        void* d_y = dalloc(yb);
+        if (!d_x || !d_w || !d_y) { std::printf("  %s %s: alloc failed\n", ty.name, name); ++g_fail; return; }
+        st_memcpy(d_x, hx.data(), (size_t)(M * K) * 2, hipMemcpyHostToDevice);
+        for (int c = 0; c < copies; ++c) st_memcpy((uint8_t*)d_w + (size_t)c * (size_t)wbytes, hw.data(), (size_t)wbytes, hipMemcpyHostToDevice);
+        MrLaunch L;
+        if (!mr_setup(L, pl, sh, ty, M)) { std::printf("  %s %s: row absent\n", ty.name, name); ++g_fail; return; }
+        auto launch = [&](int i) { return L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); };
+        auto bytes = [&]() {
+            st_memset(d_y, 0xff, yb);
+            const int rc = L.run(d_x, d_w, d_y);
+            std::vector<uint8_t> got(yb);
+            if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { got.clear(); return got; }
+            st_memcpy(got.data(), d_y, yb, hipMemcpyDeviceToHost);
+            return got;
+        };
+        auto tm = [&]() { for (int i = 0; i < 20; ++i) launch(i); return st_time_us([&](int i) { launch(i); }, iters, nullptr); };
+        if (!forms) {
+            set_wm(h);
+            const long long c0 = h.wm_count();
+            const bool okw = !bytes().empty() && h.wm_count() - c0 == 1;
+            double d = 0, w = 0;
+            if (okw)
+                for (int r = 0; r < rounds; ++r) {
+                    set_dec(h); d += tm();
+                    set_wm(h); w += tm(); w += tm();
+                    set_dec(h); d += tm();
+                }
+            clear(h);
+            if (!okw) ++g_fail;
+            std::printf("WMGSCAN %s|%s|N=%lld|K=%lld|M=%lld|slabs=%lld|blocks=%lld|D %.2f|W %.2f|%s\n", mode, ty.name, (long long)N, (long long)K,
+                        (long long)M, (long long)(K / 128), (long long)((N + 255) / 256), d / (2 * rounds), w / (2 * rounds), okw ? "ok" : "W DID NOT RUN");
+        } else {
+            if (!gp.pin || !gp.forms) { std::printf("  WMGFORM: r4d_gg_pf_pin absent\n"); ++g_fail; return; }
+            set_wm(h);
+            gp.pin(0);
+            const std::vector<uint8_t> ref = bytes();
+            std::string line = fmt("WMGFORM %s|%s|%s|%lldx%lld|M=%lld|", mode, ty.name, name, (long long)N, (long long)K, (long long)M);
+            std::vector<int> codes = gp_forms(gp, false);
+            codes.insert(codes.begin(), 0);
+            std::vector<double> t(codes.size(), 0.0);
+            std::vector<int> same(codes.size(), 0), ran(codes.size(), 0);
+            for (size_t j = 0; j < codes.size(); ++j) {
+                gp.pin(codes[j]);
+                const std::vector<uint8_t> got = bytes();
+                ran[j] = !got.empty();
+                same[j] = ran[j] && got == ref;
+            }
+            for (int r = 0; r < rounds; ++r)
+                for (size_t j0 = 0; j0 < codes.size(); ++j0) {
+                    const size_t j = (r & 1) ? codes.size() - 1 - j0 : j0;
+                    if (!ran[j]) continue;
+                    gp.pin(codes[j]);
+                    t[j] += tm();
+                }
+            gp.pin(0);
+            clear(h);
+            for (size_t j = 0; j < codes.size(); ++j)
+                line += fmt(" %s %.1f%s;", gp_name(codes[j]).c_str(), ran[j] ? t[j] / rounds : -1.0, !ran[j] ? " (rc)" : same[j] ? "" : " (bytes differ)");
+            std::printf("%s\n", line.c_str());
+        }
+        std::fflush(stdout);
+    };
+    std::printf("WMG scan (%s, %d launches a reading, %d rounds): the stock WMMA kernel W and int16's decode band D on synthetic shapes; then lever GPF's geometries at M 1 / 16\n", mode, iters, rounds);
+    for (const MrTy& ty : kMrTypes)
+        for (int64_t N : { 256ll, 1024ll, 4096ll })
+            for (int64_t K : { 256ll, 512ll, 1280ll, 2560ll, 5120ll })
+                for (int64_t M : { 1ll, 16ll, 48ll }) {
+                    if (std::strcmp(ty.name, "q6_K") && (N != 1024 || M == 48)) continue;   /* the other types: one N, M 1 / 16 */
+                    one(ty, "syn", N, K, M, false);
+                }
+    for (const MrTy& ty : kMrTypes)
+        for (const MrShape& sh : kMrShapes) {
+            if (sh.logits || !std::strcmp(sh.name, "engram_kv") || !mr_in(sh.types, ty.name)) continue;
+            for (int64_t M : { 1ll, 16ll }) one(ty, sh.name, sh.N, sh.K, M, true);
+        }
+    clear(h);
+    dfree_all();
+    std::printf("WMGVERDICT scan done\n");
+}
+
 }  // namespace wmg

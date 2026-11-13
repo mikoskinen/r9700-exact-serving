@@ -38184,7 +38184,7 @@ int main(int argc, char** argv) {
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
     bool a4c = false, a4p = false; const char* a4_out = nullptr;   /* lever A4: --mrcheck16 / --perfm16 [--m16-out FILE] */
-    bool wgc = false, wgp = false; const char* wg_m = nullptr; int wg_it = 0, wg_r = 0; const char* wg_t = nullptr;   /* ds41-wmgate: --wmgcheck / --perfwmg */
+    bool wgc = false, wgp = false, wgk = false; const char* wg_m = nullptr; int wg_it = 0, wg_r = 0; const char* wg_t = nullptr;   /* ds41-wmgate: --wmgcheck / --perfwmg */
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
     bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
     bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
@@ -38452,6 +38452,11 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_r = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfwmk")) {
+            /* ds41-wmgate: the WMMA kernel's fixed and per-slab time on synthetic shapes + lever GPF's geometries at M 1 / 16 (wmg::scan). */
+            wgk = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_r = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--wmgcheck")) {
             /* ds41-wmgate: a row's WMMA bytes vs M and its place in the launch (wmg::check). */
             wgc = true;
@@ -38741,11 +38746,12 @@ int main(int argc, char** argv) {
 #endif
         return g_fail ? 1 : 0;
     }
-    if (wgc || wgp) {
+    if (wgc || wgp || wgk) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
         if (wgc) wmg::check(pl, wg_t);
         if (wgp) wmg::perf(pl, wg_m, wg_it, wg_r, wg_t);
+        if (wgk) wmg::scan(pl, wg_it, wg_r);
         dfree_all();
 #else
         skip("ds41-wmgate bench", "built without HIP");
