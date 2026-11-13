@@ -76,6 +76,23 @@ change, the rejected ones included:
   quarter of the rows between a reduce-scatter and an all-gather, which raised 64k prefill from 8,293
   to 8,754 tok/s (+5.7 %).
 
+## Model weights
+
+Each model runs from one Radiance container (`.rad`):
+
+- **Qwen Flash-Next, EXL3 4.05:** [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3),
+  used as downloaded (120.5 GB, sha256 `187ae8186cc1f2ba8bce96565592af7fc6f6ec91c9ece6b4d352eaf0432ee26f`).
+  Its routed experts and MTP head come from the `4.05bpw_h6_ng6` branch of
+  [turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), and every
+  other weight is byte-identical to Radiance's own iq4r container of the same model.
+- **DeepSeek V4.1 Flash, EXL3 2.25:** one 272.3 GB container converted on the host from two sources:
+  - the routed experts from the `2.25bpw` branch of
+    [turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3)
+  - every other weight, the Engram table and the DSpark drafter included, from
+    [bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad),
+    an uncensored build with the refusal direction removed from the attention output projections of
+    layers 11 to 28
+
 ## Where things are
 
 The `main` branch has:
