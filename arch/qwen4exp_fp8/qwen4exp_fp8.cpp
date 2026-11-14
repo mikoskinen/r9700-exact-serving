@@ -2496,6 +2496,7 @@ static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
     sp.mine.clear();
     for (int r = 0; r < g.world; ++r) {
         const int64_t lo = std::min<int64_t>((int64_t)r * q, T), hi = std::min<int64_t>((int64_t)(r + 1) * q, T);
+        if (hi <= lo) return false;   /* every rank has rows (decided alike on every rank) */
         if (r == g.rank) { sp.lo = lo; sp.hi = hi; }
         for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i) {
             const int64_t c0 = m.bi_cut[i], c1 = m.bi_cut[i + 1];
@@ -2511,7 +2512,7 @@ static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
             if (r == g.rank) { SpSer::Part p; p.a = a; p.n = b - a; p.seg = seg; p.dec = dec; sp.mine.push_back(p); }
         }
     }
-    return any_pf && sp.hi > sp.lo;
+    return any_pf;
 }
 
 static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu, const SpSer& sp) {
