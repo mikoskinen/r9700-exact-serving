@@ -26,22 +26,30 @@
  * 0 / 1 are what they were (no K = 2.5 launch changes). */
 static volatile int g_fn4_x3d = 0;
 int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
+/* SPB-G (ds41-etp-spb-plug, 14.11.2026): fn4 switch "exl3_dng" 0 / 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U) down
+ * kernels take that many 128-column blocks a workgroup (exl3r4d.hip spb_cb; launch.c fill() -> Exl3r4dGemm::dng). Every
+ * output byte is the one-block grid's: the same code on the same data a block. 0 at start = today's grid. */
+static volatile int g_fn4_dng = 0;
+int exl3r4d_fn4_dng(void) { return g_fn4_dng; }
 /* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
  * with that prefill.c is a union of the name lists in one set of the three functions. */
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 4 ? 1 : -1;   /* K25U: 2 .. 4 */
+    if (!strcmp(name, "exl3_dng")) return value == 0 || value == 2 || value == 4 || value == 8 ? 1 : -1;   /* SPB-G */
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
     if (!strcmp(name, "exl3_x3d")) g_fn4_x3d = value;
+    if (!strcmp(name, "exl3_dng")) g_fn4_dng = value;
     return 1;
 }
 __attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* applied) {
     if (!name || !applied) return 0;
     if (!strcmp(name, "exl3_x3d")) { *applied = g_fn4_x3d; return 1; }
+    if (!strcmp(name, "exl3_dng")) { *applied = g_fn4_dng; return 1; }
     return 0;
 }
 #if EXL3R4D_ROUTEDUMP
