@@ -382,6 +382,13 @@
  *                   the finish kernel's bytes, one launch fewer; not where ds41_mix_wv's wide form acts); 0 the split
  *                   and finish launches (today). RADIANCE_DS41_MIX_FIN=1 at load starts it on. GET "fuse".mixfin_*
  *                   counts its launches (every rank).
+ *   ds41_moe1       deepseek41 (lever P, ds41-p1pass; 72 here after ds41_wmk, 71 on ds41-p1pass): 1 a step that is ONE decode segment of
+ *                   17 .. 48 rows runs its MoE as ONE pass -- the router, the shared arm, the gather and the all-reduce
+ *                   once, the routed EXL3 experts through moe_exl3_gate_up_dk / moe_exl3_down_dk (the decode kernels over
+ *                   the whole pass: an expert decoded once), which write per (token, slot) the bytes of the <= 16-row
+ *                   pieces ds41_bi 2 / 4 / 6 issue; 0 the pieces (today). A step with a prefill segment keeps the pieces.
+ *                   RADIANCE_DS41_MOE1=0 / 1 declares the two ops beside every trunk layer's EXL3 pair and starts at
+ *                   that value; unset declares nothing and 1 is refused. Exact (a decode row keeps its alone bytes).
  *   route_copy_ov   core (lever RCO, ds41-launch; 70 here (68 on ds41-launch), after ds41_mix_fin; Ctx::haz_mark at recording): 0 off (today:
  *                   a routed layer's report copy -- the card-side copy of its expert counts into the routing row,
  *                   Ctx::route_report_impl -- is an op-less dispatch, so haz_mark plays it ordered AND opaque, and the
@@ -548,7 +555,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
-              kRouteCopyOv, kDs41Wmk, kSwitches };
+              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

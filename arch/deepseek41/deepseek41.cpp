@@ -612,6 +612,8 @@ struct Model {
      * the row pitch of every buffer step_bi slices. */
     rad_buf bi_cu = 0;
     rad_op bi_sub = 0;
+    /* A sizing declare (RadBuildCtx::shape_probe): the real declare's model of this rank; null in the real declare. */
+    const Model* sized_against = nullptr;
     std::map<rad_buf, int64_t> bp;
     /* Lever PSK: the first layer a prefill segment is cut at (the last kv source + 1); 0 where PSK is not declared. */
     int psk_first = 0;
@@ -1537,6 +1539,38 @@ static void rf_read_env() {
     }
 }
 static bool rf_declared() { return g_sw_rf_env.load(std::memory_order_relaxed) >= 0; }
+/* Lever P (ds41-p1pass, 13.11.2026; SCAL32 on int16: a decode step of 17 .. 32 rows pays a second <= 16-row MoE piece,
+ * +10.6 .. 11 ms a step at 24 / 32 rows -- c24 231.8 tok/s against c16's 236.0). Under ds41_bi 2 / 4 / 6 a decode segment
+ * above kBiMoe rows is cut into MoE passes of <= 16 rows because the EXL3 experts' M > 16 form (the MTX GEMM) rounds
+ * differently from the decode band, and every piece repeats the router, the shared arm, the gather and (bi < 5) the
+ * all-reduce, decodes again every expert two pieces share, and loses the fused gather + all-reduce. Switch "ds41_moe1"
+ * (fn4): 1 = a step that is ONE decode segment of 17 .. kMoe1Max rows runs its MoE as ONE pass whose routed experts go
+ * through moe_exl3_gate_up_dk / moe_exl3_down_dk (exl3/exl3_abi.h; exl3r4d ds41-p1pass: the decode kernels over the whole
+ * pass, an expert decoded once, a run 16 rows at a time) -- per (token, slot) the bytes of the <= 16-row pieces (on the
+ * card: tools/dkcheck, M 17 .. 48, K 2 / 2.5, 608 cases, 0 rows differ). Everything else in the pass is per row and is
+ * what a prefill segment of that height already runs: the router's projection, selection and stable sort (FUSE-R's forms
+ * are the stock chain's bytes at any row count), the shared arm's decode-band GEMVs (M-invariant to kBiBand, as the
+ * attention's), the gather (a token's slots folded in ascending slot order, which is ascending expert order in either
+ * sort) and the exact all-reduce. So a decode row keeps its alone bytes. 0 = the pieces (today).
+ * NOT taken, the pieces instead: a step with a prefill segment (a newcomer step: above 1024 tokens the prefill stager is
+ * armed and keys a layer on gate_up, which this pass does not issue), a segment above kMoe1Max, a PSK-cut layer, a layer
+ * whose library does not serve the ops. RADIANCE_DS41_MOE1=0 / off declares the ops beside every trunk layer's EXL3
+ * pair and starts at 0, 1 / on at 1; unset declares nothing (1 refused; the program and the issue are today's). */
+static constexpr int64_t kMoe1Max = 48;
+static std::atomic<int> g_sw_p1{0}, g_sw_p1_ok{0}, g_sw_p1_env{-2}, g_p1_noted{0};
+static std::atomic<long long> g_p1_steps{0}, g_p1_rows{0};
+static void p1_read_env() {
+    int unread = -2;
+    const char* e = std::getenv("RADIANCE_DS41_MOE1");
+    const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
+                          : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
+    if (g_sw_p1_env.compare_exchange_strong(unread, v)) {
+        if (v >= 0) g_sw_p1.store(v, std::memory_order_relaxed);
+        if (e && v < 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_MOE1=%s is not 0 / off or 1 / on: lever P is not declared\n", e);
+    }
+}
+static bool p1_declared() { return g_sw_p1_env.load(std::memory_order_relaxed) >= 0; }
 /* The fewest rows a pcn_a launch is fused at under the switch; 0 = none. */
 static int64_t mhc_fuse_min() {
     if (!g_sw_mhc_ok.load(std::memory_order_relaxed)) return 0;
@@ -1643,6 +1677,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value >= 1 && value <= 3 && g_sw_gq_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_e2"))   /* lever 1U-E2 */
         return value == 0 || (value == 1 && g_sw_e2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_moe1"))   /* lever P: 1 needs the dk ops declared at some trunk layer */
+        return value == 0 || (value == 1 && g_sw_p1_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_rfuse"))   /* lever FUSE-R: 1 needs form 1 declared somewhere, 2 form 2 */
         return value == 0 || (value == 1 && (g_sw_rf_ok.load(std::memory_order_relaxed) & 1)) ||
                (value == 2 && (g_sw_rf_ok.load(std::memory_order_relaxed) & 2)) ? 1 : -1;
@@ -1666,6 +1702,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     else if (!std::strcmp(name, "ds41_gq")) g_sw_gq.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_e2")) g_sw_e2.store(value, std::memory_order_relaxed);
     else if (!std::strcmp(name, "ds41_rfuse")) g_sw_rf.store(value, std::memory_order_relaxed);
+    else if (!std::strcmp(name, "ds41_moe1")) g_sw_p1.store(value, std::memory_order_relaxed);
     else g_sw_shexp.store(value, std::memory_order_relaxed);
     return 1;
 }
@@ -1727,6 +1764,10 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     }
     if (!std::strcmp(name, "ds41_e2")) {
         *applied = e2_now() ? 1 : 0;
+        return 1;
+    }
+    if (!std::strcmp(name, "ds41_moe1")) {   /* what the issue reads: 0 where nothing was declared */
+        *applied = g_sw_p1_ok.load(std::memory_order_relaxed) ? g_sw_p1.load(std::memory_order_relaxed) : 0;
         return 1;
     }
     if (!std::strcmp(name, "ds41_rfuse")) {   /* what the issue reads: 0 where nothing was declared */
@@ -2835,8 +2876,16 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.shared_swfold = g_sw_swf_env.load(std::memory_order_relaxed) > 0 && g.n_ff > 0 ? 1 : 0;
     /* Lever FUSE-R: the router chain's fused forms beside the separate ops (RADIANCE_DS41_RFUSE set) */
     s.cfg.rfuse_decl = rf_declared() ? 1 : 0;
+    /* Lever P: the decode-band-bytes EXL3 pair over 17 .. kMoe1Max rows beside gate_up / down (RADIANCE_DS41_MOE1 set) */
+    s.cfg.exl3_dk_rows = p1_declared() ? kMoe1Max : 0;
+    if (m.sized_against) {   /* a sizing declare: the pair exactly where the real declare's layer has it (also at an 8-row level) */
+        const Model& full = *m.sized_against;
+        s.cfg.exl3_dk_rows = (size_t)l < full.layers.size() ? full.layers[(size_t)l].moe.dk_asked : 0;
+        s.cfg.exl3_dk_probe = 1;
+    }
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
+    if (p1_declared() && L.moe.dk_takes(kBiMoe + 1)) g_sw_p1_ok.store(1, std::memory_order_relaxed);
     /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane */
     L.moe.gar_live = &g_sw_gar;
     L.moe.shexp_lane = &g_sw_shexp;
@@ -3614,6 +3663,7 @@ static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);  /* lev
 static void mhc_declare(Model& m, const RadBuildCtx* ctx);                  /* lever M1, below */
 static void i11_declare(Model& m, const RadBuildCtx* ctx);                  /* levers 1U-GQ / 1U-E2, below */
 static void rf_declare(Model& m, const RadBuildCtx* ctx);                   /* lever FUSE-R, below */
+static void p1_declare(Model& m, const RadBuildCtx* ctx);                   /* lever P, below */
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -3649,6 +3699,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mhc_read_env();
     i11_read_env();
     rf_read_env();
+    p1_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -3667,6 +3718,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     index_runs(m);
     index_mode(m);
     if (ctx->shape_probe) {
+        m.sized_against = models[ctx->rank].get();   /* lever P: a level declares the dk pair where the real declare did */
         /* A level shrinks only what the step indexes by its own rows T. Everything the step
          * addresses by a capacity of the real declare keeps the real size: the work plane m.work
          * (comp_stage is written rows x r > T at a small step: at r 128 and 8 sequences a decode
@@ -4004,6 +4056,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mhc_declare(m, ctx);
     i11_declare(m, ctx);
     rf_declare(m, ctx);
+    p1_declare(m, ctx);
     DS_TRY(bt_declare(b, m, ctx));
     DS_TRY(kvr_declare(b, m, ctx));
     return RAD_OK;
@@ -4186,6 +4239,31 @@ static void mhc_declare(Model& m, const RadBuildCtx* ctx) {
                         "post, the next connection's collapse + norm and its mhc_mix in one op); 1 = launches of >= %lld "
                         "rows fused, N >= 2 = of >= N rows\n",
                 g_sw_mhc.load(std::memory_order_relaxed), n, want, (long long)kMhcFuseRows);
+}
+
+/* Lever P at the end of a declare (RADIANCE_DS41_MOE1 set): the trunk MoE layers that declared the dk pair. Taken only
+ * where EVERY trunk MoE layer has it (a step is one pass at every layer or at none: one rule for the whole step), else
+ * the switch stays 0 and 1 is refused. */
+static void p1_declare(Model& m, const RadBuildCtx* ctx) {
+    if (ctx->shape_probe || !p1_declared()) return;
+    int moe = 0, dk = 0;
+    int64_t rows = 0;
+    for (const Layer& L : m.layers) {
+        if (!L.moe.op_router) continue;
+        ++moe;
+        if (L.moe.dk_takes(kBiMoe + 1)) { ++dk; rows = L.moe.dk_rows; }
+    }
+    const int ok = moe > 0 && dk == moe ? 1 : 0;
+    g_sw_p1_ok.store(ok, std::memory_order_relaxed);
+    if (!ok) g_sw_p1.store(0, std::memory_order_relaxed);
+    if (ctx->rank != 0 || g_p1_noted.exchange(1, std::memory_order_relaxed)) return;
+    fprintf(stderr, "radiance: deepseek41: lever P (ds41_moe1, RADIANCE_DS41_MOE1, now %d) %s: moe_exl3_gate_up_dk / "
+                    "moe_exl3_down_dk beside the EXL3 pair of %d of %d trunk MoE layers, 17 .. %lld rows -- a step that "
+                    "is one decode segment of that height runs ONE MoE pass (the decode band's bytes per row) instead of "
+                    "<= %lld-row pieces\n",
+            g_sw_p1.load(std::memory_order_relaxed),
+            ok ? "declared" : "not declared (no library serves the ops at every layer)", dk, moe, (long long)rows,
+            (long long)kBiMoe);
 }
 
 /* Lever FUSE-R at the end of a declare (RADIANCE_DS41_RFUSE set): the trunk MoE layers that declared each form; a form no
@@ -5598,7 +5676,27 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         {   /* ds41_bi 2 / 4 / 6: the decode segment in pieces within the EXL3 decode band; 5 / 6 (lever A9): one all-reduce */
             const int biv = g_sw_bi.load(std::memory_order_relaxed);
             const int64_t piece = bi_pieces(biv) ? kBiMoe : ((int64_t)1 << 40);
-            if (!bi_onear(biv)) {   /* ds41_bi 1 .. 4: int12's issue, unchanged */
+            /* lever P (ds41_moe1 1): the step is ONE decode segment above a piece and within the dk ops' rows -- its MoE
+             * as one pass, the routed experts through the decode-band-bytes ops (the pieces' bytes per row); the pass
+             * is the whole step (r0 0, T rows), so it takes the fused gather + all-reduce and reports its routing as a
+             * one-pass decode step does */
+            const bool p1 = g_sw_p1.load(std::memory_order_relaxed) > 0 && g_sw_p1_ok.load(std::memory_order_relaxed) &&
+                            sg.size() == 1 && sg[0].dec && sg[0].r0 == 0 && sg[0].n == T && sg[0].n > piece &&
+                            sg[0].n <= kMoe1Max && !cut && L.moe.dk_takes(sg[0].n);
+            if (p1) {
+                L.moe.pass(x, T, 0, T, true, bsp, true);
+                if (l == 0) {
+                    g_bi_moe.fetch_add(1, std::memory_order_relaxed);
+                    if (rad_rank(x) == 0) {
+                        g_p1_rows.fetch_add(T, std::memory_order_relaxed);
+                        const long long n = g_p1_steps.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (n == 1 || n % 256 == 0)   /* a c24 block is ~500 such steps: two lines a block show it engaged */
+                            fprintf(stderr, "radiance: deepseek41: lever P (ds41_moe1 1): %lld decode steps of 17 .. %lld "
+                                            "rows issued their MoE as ONE pass (%lld rows in all; this one %lld rows)\n",
+                                    n, (long long)kMoe1Max, g_p1_rows.load(std::memory_order_relaxed), (long long)T);
+                    }
+                }
+            } else if (!bi_onear(biv)) {   /* ds41_bi 1 .. 4: int12's issue, unchanged */
                 for (const BiSeg& s : sg) {
                     if (!s.dec || s.n <= piece) {
                         L.moe.pass(x, T, s.r0, s.n, true, bsp);
