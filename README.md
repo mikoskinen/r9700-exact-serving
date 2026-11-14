@@ -41,7 +41,9 @@ voltage offset, and the everyday setting caps each card at 210 W with a -50 mV v
 Exact means the output is byte-identical to each model's reference engine, and a prompt gets the same
 answer alone or next to other requests. This matters for a coding agent, whose answer to the same
 context shouldn't change because other sessions are running on the same cards. In a 38-minute run
-under load, all 160 of DeepSeek's answers stay identical.
+under load, all 160 of DeepSeek's answers stay identical. The DeepSeek matrix kernel sums the dense
+layers in a different order than the builds before 14.11.2026, so its answers to some prompts differ
+from theirs, and this build is DeepSeek's reference from here on.
 
 ## Hardware changes
 

@@ -83,6 +83,11 @@ answer to a prompt must not change because of a speed change, and it must not ch
 requests are running at the same time. An answer that changes under load counts as a bug, not noise
 [S7].
 
+The DeepSeek matrix kernel of 14.11.2026 is the one change that moves the reference. It sums the dense
+layers in a different order than the earlier builds, and 13 of the 20 probe answers differ from theirs
+(gpu02/exl3-test/runs/xdsm/soak-ds-1114/identity.txt:4). This build is DeepSeek's reference from here
+on, and the checks below compare against its own answers.
+
 Each candidate change goes through the following checks:
 
 1. **Identity sets:** a 20-prompt short greedy set and a 10-prompt long set, plus a cold 136k-token
