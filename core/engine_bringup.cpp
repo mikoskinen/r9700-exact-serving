@@ -4629,6 +4629,24 @@ int Engine::start() {
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
         }
+    /* Lever XR (ds41-etp-xr): every rank's pinned host pools, to the kernel plugins that place by them (exl3r4d's
+     * gate_up map form reads them only under the fn4 switch exl3_xr; 0, the default, runs as before). The pools are
+     * fixed from here on (Mover: allocated at load). Placement information only: no op changes what it computes. */
+    {
+        int told = 0, pools = 0;
+        for (auto& r : ranks_) {
+            if (!r->heat.enabled()) continue;
+            RAD_TRY(rad_dev_set(r->device));
+            uint64_t lo[16], hi[16], st[16];
+            const int n = r->mover.pool_ranges(lo, hi, st, 16);
+            if (n <= 0) continue;
+            pools = n;
+            told += fn4::host_pools(r->index, n, lo, hi) > 0 ? 1 : 0;
+        }
+        if (pools > 0)
+            RAD_INFO("host pools: %d a rank named to the kernel plugins on %d of %zu ranks (lever XR's residency test)",
+                     pools, told, ranks_.size());
+    }
     (void)rad_dev_set(ranks_[0]->device);
 
     /* The most the cache can hold: the whole carve, including lent blocks (a request reclaims them

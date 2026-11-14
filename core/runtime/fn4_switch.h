@@ -555,7 +555,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
-              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSwitches };
+              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kExl3Xr, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -658,6 +658,10 @@ int  sched_cb_hold_k();
 static constexpr int kCbhCounts = 10;   /* holds, by_k, by_timeout, by_idle, by_other, hold_ms, held_steps, cob_steps,
                                           cob_newcomers, single_steps */
 void note_sched_cbh(const int64_t* v);
+/* Lever XR (ds41-etp-xr): hand rank `rank`'s pinned host pools ([lo, hi) as its card addresses them, Mover::pool_ranges)
+ * to every loaded plugin that takes them (rad_host_pool_ranges; exl3r4d's gate_up map form tests its experts' codes
+ * against them). Call with the rank's card current. Returns the plugins that took them. */
+int  host_pools(int rank, int n, const uint64_t* lo, const uint64_t* hi);
 /* Lever PSK design 2: hand the scheduler's plan for trunk pass `step` to the plugin that cuts by it (rad_psk_plan, every
  * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
  * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */
