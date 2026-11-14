@@ -245,6 +245,27 @@ hidden argument block and its 704 explicit bytes — gate_up's four class record
 table that cannot travel in the four-class block (a stacked table whose stride does not fit 32 bits)
 takes the separate `_mod4` kernels, the same bits.
 
+## The decode band's bytes above the decode band (lever P, ds41-p1pass)
+
+`moe_exl3_gate_up_dk` and `moe_exl3_down_dk` take `moe_exl3_gate_up`'s / `moe_exl3_down`'s parameters and operands
+(two-class form, `h_rot = 1`, `a_rot = 0`) and compute the same op. What the names add is a promise about the BYTES:
+for every (token, slot) a row of these ops writes exactly what the library's decode-band row of the plain op writes
+for that token in a pass of at most 16 tokens, whatever the pass's other tokens. `exl3r4d` serves them at
+17 <= M <= 48 with the decode kernels as one launch (`exl3r4d_moe_gate_up_dk` / `exl3r4d_moe_down_dk`: an expert is
+decoded once however many of the pass's tokens route to it, a run longer than 16 rows is taken 16 at a time).
+
+They exist for an architecture that must give a decode row the same bytes at every step height (batch invariance)
+and would otherwise cut a decode segment into passes of <= 16 tokens: `exl3r4d`'s plain M > 16 rows (the run-aligned
+MTX GEMM) round `down` differently from the decode band -- on gfx1201, DeepSeek-V4.1's geometry, K = 2.5: 1349 of
+5885 (token, slot) rows of `y` differ, `h` none -- so a decode pass may not take them. Issue the `_dk` ops for decode
+rows only; a prefill segment keeps the plain ops. They are names of their own, not a parameter of the plain ops, so the
+eight shared schemas stay what every library exports; `exl3ref` does not serve them (no host row).
+
+Checked on the card by `tools/dkcheck.cpp` (not a CMake target; built by the engine tree's
+`build/p1pass/build-dkcheck.sh`): M 17 .. 48, K = 2 and 2.5, `exl3_x3d` 0 and 2, ranks 0 and 1 of four, drawn /
+grouped / one-run-of-M routings, each (token, slot) of the one launch against the same slot of its <= 16-token piece
+through the `_m16` rows -- 608 cases, 35 914 rows of `h` and of `y`, 0 differ (13.11.2026).
+
 ## The two weight classes
 
 The even experts at `[N, K]` and the odd ones at `[N_odd, K_odd]`, expert `e` at entry `e / 2` of

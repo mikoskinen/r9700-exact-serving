@@ -313,6 +313,40 @@ static const RadConstraint c_prefill_gu[] = {
     RAD_CLE("n_expert", 4096),
 };
 #define N_PREFILL_GU (int)(sizeof c_prefill_gu / sizeof c_prefill_gu[0])
+/* Lever P (ds41-p1pass): moe_exl3_gate_up_dk / moe_exl3_down_dk (include/exl3_abi.h) -- the DECODE kernels (launch.c
+ * exl3r4d_launch, the _m16 rows' hooks) over 17 .. EXL3R4D_DK_MAX tokens as one launch. Their bytes per (token, slot)
+ * are the _m16 rows' in passes of <= 16 tokens: a workgroup owns one expert's run and takes it 16 rows a pass (chunk 16),
+ * each row its own WMMA row, and nothing a launch decides from its height changes a row above 2 tokens (split-K at few
+ * tokens is the only height-keyed form). MEASURED on gfx1201 (tools/dkcheck.cpp, 13.11.2026): M 17 .. 48, K = 2 and
+ * 2.5, fn4 exl3_x3d 0 and 2, ranks 0 and 1, drawn / grouped / one-run-of-M routings -- 608 cases, 0 rows differ; the
+ * same check against the _pf rows (the MTX form) differs in 23 % of down's rows, which is why these are rows of their
+ * own op names and not the _pf rows' XN arm. h_rot 1 and a_rot 0 only (what the in-tree block issues). */
+#ifndef EXL3R4D_DK_MAX
+#define EXL3R4D_DK_MAX 48
+#endif
+static const RadConstraint c_dk[] = {
+    RAD_CGE("M", EXL3R4D_M_MAX + 1),
+    RAD_CLE("M", EXL3R4D_DK_MAX),
+    RAD_CEQ("h_rot", 1),
+    RAD_CIN("dtype", EXL3R4D_DECODE_DTYPES),
+    RAD_CIN("codebook", "mul1"),
+    RAD_CDIV("K", 128),
+    RAD_CDIV("N", 128),
+    RAD_CLE("n_expert", 4096),
+};
+#define N_DK (int)(sizeof c_dk / sizeof c_dk[0])
+static const RadConstraint c_dk_gu[] = {
+    RAD_CGE("M", EXL3R4D_M_MAX + 1),
+    RAD_CLE("M", EXL3R4D_DK_MAX),
+    RAD_CEQ("h_rot", 1),
+    RAD_CEQ("a_rot", 0),
+    RAD_CIN("dtype", EXL3R4D_DECODE_DTYPES),
+    RAD_CIN("codebook", "mul1"),
+    RAD_CDIV("K", 128),
+    RAD_CDIV("N", 128),
+    RAD_CLE("n_expert", 4096),
+};
+#define N_DK_GU (int)(sizeof c_dk_gu / sizeof c_dk_gu[0])
 /* v4: moe_exl3_prep_gu, the decode band's (prep kernel as an op). */
 static const RadConstraint c_prep[] = {
     RAD_CLE("M", EXL3R4D_M_MAX),
@@ -449,6 +483,33 @@ static const RadKernelInfo k_rows[] = {
         .launch = dn_pf_launch, .scratch = dn_pf_scratch,
         .layout = dn_layout, .relayout = dn_relayout, .opd_shape = dn_shape, .unrelayout = dn_unrelayout,
     },
+    /* ---------------------------------------------------- lever P: the decode kernels above the decode band, as ops
+     * of their own names (include/exl3_abi.h EXL3_OP_GATE_UP_DK / EXL3_OP_DOWN_DK). The _m16 rows' hooks throughout. */
+    {
+        .name = "exl3r4d_moe_gate_up_dk", .op = EXL3_OP_GATE_UP_DK, .family = "moe",
+        .computes = "EXL3 routed experts, gate and up, f16 h, 17 .. 48 tokens with the decode band's bytes: the _m16 "
+                    "row's kernels as one launch (prep kernel into scratch, trellis decode in registers once a live "
+                    "expert, a run 16 rows a pass)",
+        .shape = "17 <= M <= 48; K % 128, N % 256 (each class); two parity classes in one grid; h_rot 1, a_rot 0",
+        .dtypes = "exl3k2 .. exl3k6, mul1; a f16 or bf16; h f16",
+        .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+        .constraints = c_dk_gu, .n_constraints = N_DK_GU,
+        .init = gu_init, .fini = exl3r4d_ctr_fini,
+        .launch = gu_launch, .scratch = gu_scratch,
+        .layout = gu_layout, .relayout = gu_relayout, .opd_shape = gu_shape, .unrelayout = gu_unrelayout,
+    },
+    {
+        .name = "exl3r4d_moe_down_dk", .op = EXL3_OP_DOWN_DK, .family = "moe",
+        .computes = "EXL3 routed experts, down, bf16 y, 17 .. 48 tokens with the decode band's bytes: the _m16 row's "
+                    "kernels as one launch",
+        .shape = "17 <= M <= 48; K % 128, N % 128 (each class); two parity classes in one grid; h_rot 1",
+        .dtypes = "exl3k2 .. exl3k6, mul1; h f16; y bf16",
+        .domain = RAD_DOMAIN_DEVICE, .priority = 10,
+        .constraints = c_dk, .n_constraints = N_DK,
+        .init = EXL3R4D_PDN ? dn_init : NULL, .fini = EXL3R4D_PDN ? exl3r4d_ctr_fini : NULL,
+        .launch = dn_launch, .scratch = dn_scratch,
+        .layout = dn_layout, .relayout = dn_relayout, .opd_shape = dn_shape, .unrelayout = dn_unrelayout,
+    },
     /* ---------------------------------------------------- v6: the four-class forms (tp4's rotation by number mod 4)
      * The rows above over four class tables a plane: the same kernels compiled with four class records in the
      * argument block (exl3r4d_mod4.hip, exl3r4d_prefill_mod4.hip), the same constraints, stored forms and bands. No
@@ -542,8 +603,11 @@ uint32_t             rad_plugin_abi_version(void) { return RAD_ABI_VERSION; }
 RAD_PLUGIN_ABI_LAYOUT_EXPORT   /* ABI 32+: the layout fingerprint the loader checks */
 const RadPluginInfo* rad_plugin_info(void) { return &k_info; }
 
-int                rad_kernel_schema_count(void) { return exl3_schema_count(); }
-const RadOpSchema* rad_kernel_schema_at(int i) { return exl3_schema_at(i); }
+/* the eight shared schemas, then lever P's two (exl3r4d alone exports them: include/exl3_abi.h) */
+int                rad_kernel_schema_count(void) { return exl3_schema_count() + exl3_dk_schema_count(); }
+const RadOpSchema* rad_kernel_schema_at(int i) {
+    return i < exl3_schema_count() ? exl3_schema_at(i) : exl3_dk_schema_at(i - exl3_schema_count());
+}
 int                rad_kernel_count(void) { return (int)(sizeof k_rows / sizeof k_rows[0]); }
 const RadKernelInfo* rad_kernel_at(int i) {
     return i >= 0 && i < rad_kernel_count() ? &k_rows[i] : 0;
