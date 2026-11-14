@@ -3606,10 +3606,12 @@ constexpr unsigned gg_wm_lds(int bm) {
  * VGPRs) and at 3 runs 3 (1.15x in the uniform-routing bench), but the real serve's skewed routing
  * splits more heavy experts into extra tiles, each re-reading the expert's weights. */
 int gg_wm_mt(int ty) { return ty == GG_IQ1_S ? 4 : 3; }
+int g_gg_wm_ldsx = 0;
 template <int T>
 int gg_launch_wm_t(bool moe, bool f32out, RadStream s, const GgTiledArgs& A, dim3 grid) {
     constexpr int MT = T == GG_IQ1_S ? 4 : 3;
-    const unsigned lds = gg_wm_lds<T>(16 * MT);
+    /* g_gg_wm_ldsx (bench pin r4d_gg_wm_ldsx, ds41-wmk2 s18): at least this much LDS a block -- fewer blocks a WGP, the same code */
+    const unsigned lds = std::max(gg_wm_lds<T>(16 * MT), (unsigned)g_gg_wm_ldsx);
     if (moe) return R4D_EMIT(s, (gg_wm_kernel<T, MT, true, uint16_t>), grid, dim3(256), lds, A);
     if (f32out) return R4D_EMIT(s, (gg_wm_kernel<T, MT, false, float>), grid, dim3(256), lds, A);
     return R4D_EMIT(s, (gg_wm_kernel<T, MT, false, uint16_t>), grid, dim3(256), lds, A);
@@ -4373,6 +4375,7 @@ extern "C" int r4d_rad_embed_lookup_ggml(const RadArgs* a, RadStream s) {
 extern "C" void r4d_gg_wm_pin(int on) { g_gg_wm_all = on ? 1 : 0; }
 extern "C" void r4d_gg_wk_pin(int code) { g_gg_wk = code; }
 extern "C" void r4d_gg_wmk_tab(int on) { g_wmk_tab = on ? 1 : 0; }
+extern "C" void r4d_gg_wm_ldsx(int bytes) { g_gg_wm_ldsx = bytes > 0 && bytes <= 65536 ? bytes : 0; }
 extern "C" void r4d_gg_wmk_g2(int v) { g_wmk_g2 = v == 0 || v == 2 ? v : 1; }
 /* Lever WMK's counters (rad_wmk_stats; GET /admin/fn4 "wmk"): [0] the switch now, [1] part-order launches it issued, [2] their
  * rows, [3] calls it declined to int16's path. Recorded passes replay without issuing: the counts are issued launches. */

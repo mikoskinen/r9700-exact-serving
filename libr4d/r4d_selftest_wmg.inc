@@ -1296,6 +1296,16 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
                 const double fl = 2.0 * (double)M * (double)sh.N * (double)sh.K;
                 std::string line = fmt("GPWMK %s %s %lldx%lld M=%lld: stock %.1f us (%.1f TF) |", ty.name, sh.name, (long long)sh.N, (long long)sh.K, (long long)M,
                                        st, st > 0 ? fl / (st * 1e6) : 0.0);
+                /* s18: the same stock kernel held to fewer blocks a WGP by LDS alone (r4d_gg_wm_ldsx): the occupancy price */
+                if (auto ldsx = (void (*)(int))dlsym(pl.h, "r4d_gg_wm_ldsx")) {
+                    for (int lb : { 33000, 43776 }) {   /* LDS caps of 3 and 2 blocks a WGP (128 KiB) */
+                        double sl = 0;
+                        ldsx(lb);
+                        arm(0, 0, 0, &sl, &sm, &u);
+                        ldsx(0);
+                        line += fmt(" stockL%d %.1f;", lb / 1024, sl);
+                    }
+                }
                 double bestF = st, bestW = 1e30;
                 int bF = 0, bW = 0;
                 bool kb = false;
