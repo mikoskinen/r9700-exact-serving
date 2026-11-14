@@ -1162,8 +1162,12 @@ extern "C" int r4d_gg_wk_last() { return g_gg_wk_last.load(std::memory_order_rel
  * WN 16 keeps a block 256 weight rows (the stock staging per weight row; waves 8..15 stage nothing), WN 8 at NT 1 makes it 128.
  * Every output's operations are gg_wm_kernel's (PARTFOLD) whatever NT / WN: the bytes are W's (rows = row alone, any M). */
 namespace {
-template <int T, int MT, int NT, int WN, typename OT>
-__global__ __launch_bounds__(32 * WN) void gg_wq_kernel(GgTiledArgs A) {
+/* FI 1 (one-step chains only, SPG 1 = Q6_K): a K step's WMMA for tile t is followed by tile t - 1's scale fma (the same fma, the same
+ * order per output), so two tiles' partials are live instead of NM x NT -- the registers the fold's total needs at NT 2. */
+/* FI 2 (bit 1): the stock occupancy asked of the compiler (amdgpu_waves_per_eu 6 = <= 240 VGPRs at 1536 a lane, granule 24, i.e. 3
+ * blocks of 8 waves a WGP): what does not fit spills -- the running total, touched once a part (every S / P slabs), is the cheapest. */
+template <int T, int MT, int NT, int WN, typename OT, int FI = 0>
+__global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2) ? 6 : 1))) void gg_wq_kernel(GgTiledArgs A) {
     using W = Wq<T>;
     using Pf = typename W::Pf;
     constexpr int BM = 16 * MT, BN = 16 * NT * WN;
@@ -1355,6 +1359,36 @@ __global__ __launch_bounds__(32 * WN) void gg_wq_kernel(GgTiledArgs A) {
                     for (int mt = 0; mt < NM; ++mt)
                         if (live(mt)) g8[mt] = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
                 }
+                constexpr bool FIS = (FI & 1) && W::SPG == 1 && !W::MINS && !W::PIPE;   /* the interleaved step (Q6_K) */
+                if constexpr (FIS) {
+                    float scf[NT];
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) scf[nt] = W::scale(rc[nt], J, s);
+                    gg_v8f pp = (gg_v8f)(0.0f);
+                    gg_v8f c0 = (gg_v8f)(0.0f);
+                    /* tile t = (mt, nt) in mt-major order, compile-time indices: WMMA t, then tile t - 1's fma */
+                    gg_for<NM * NT>([&](auto tc) {
+                        constexpr int t = decltype(tc)::value, mt = t / NT, nt = t % NT;
+                        if constexpr (W::CINIT && nt == 0) c0 = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
+                        const gg_v8f pc = gg_wmma(af[C][mt], bf[C][nt], c0);
+                        if constexpr (t > 0) {
+                            constexpr int qm = (t - 1) / NT, qn = (t - 1) % NT;
+#pragma unroll
+                            for (int q = 0; q < 8; ++q) acc[qm][qn][q] = __builtin_fmaf(pp[q], scf[qn], acc[qm][qn][q]);
+                        }
+                        pp = pc;
+                    });
+                    {
+                        constexpr int qm = (NM * NT - 1) / NT, qn = (NM * NT - 1) % NT;
+#pragma unroll
+                        for (int q = 0; q < 8; ++q) acc[qm][qn][q] = __builtin_fmaf(pp[q], scf[qn], acc[qm][qn][q]);
+                    }
+#pragma unroll
+                    for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+                        for (int nt = 0; nt < NT; ++nt) gg_pin8(acc[mt][nt]);
+                } else
+                {
 #pragma unroll
                 for (int mt = 0; mt < NM; ++mt) {
                     if (live(mt)) {
@@ -1370,6 +1404,7 @@ __global__ __launch_bounds__(32 * WN) void gg_wq_kernel(GgTiledArgs A) {
                         }
                     }
                 }
+                }
                 if constexpr (W::CINIT && W::PIPE && J < 7 && (J + 1) % W::SPG == 0) {
 #pragma unroll
                     for (int mt = 0; mt < NM; ++mt)
@@ -1380,7 +1415,7 @@ __global__ __launch_bounds__(32 * WN) void gg_wq_kernel(GgTiledArgs A) {
                     for (int nt = 0; nt < NT; ++nt)
                         bf[C ^ 1][nt] = W::template bfrag<(J + 1) & 7>(rc[nt], h, pf[nt], J < 7 ? s : sn);
                 }
-                if constexpr (J % W::SPG == W::SPG - 1) {
+                if constexpr (J % W::SPG == W::SPG - 1 && !((FI & 1) && W::SPG == 1 && !W::MINS && !W::PIPE)) {
                     float sc[NT], mn[NT];
                     if constexpr (J < 7 || !W::PIPE) {
 #pragma unroll
@@ -1473,26 +1508,30 @@ __global__ __launch_bounds__(32 * WN) void gg_wq_kernel(GgTiledArgs A) {
     }
 }
 /* gg_wq form codes: 9000 + 100 MT + 10 NT + WN / 8 (e.g. 9312 = MT 3, NT 1, 16 waves; 9321 = the stock geometry + fold, = form 0). */
-constexpr int wq_code(int mt, int nt, int wn) { return 9000 + 100 * mt + 10 * nt + wn / 8; }
-#define WQ_FORMS(X) X(3, 1, 16) X(3, 1, 8) X(4, 1, 16) X(4, 1, 8) X(3, 2, 8) X(2, 2, 8)
-template <int T, int MT, int NT, int WN>
+/* + 4 for FI bit 0 (the interleaved step), + 50 for FI bit 1 (the stock occupancy asked: 9371 = 9321 at <= 240 VGPRs) */
+constexpr int wq_code(int mt, int nt, int wn, int fi = 0) { return 9000 + 100 * mt + 10 * nt + wn / 8 + 4 * (fi & 1) + 50 * (fi >> 1); }
+#define WQ_FORMS(X) X(3, 1, 16, 0) X(3, 1, 8, 0) X(4, 1, 16, 0) X(4, 1, 8, 0) X(3, 2, 8, 0) X(2, 2, 8, 0) \
+    X(3, 2, 8, 1) X(3, 1, 16, 1) X(4, 1, 8, 1) X(4, 2, 8, 1)   /* FI 1: the interleaved step (Q6_K; the other types run it as FI 0) */ \
+    X(3, 2, 8, 2) X(3, 2, 8, 3) X(4, 1, 8, 2) X(4, 2, 8, 3)   /* FI 2 / 3: <= 240 VGPRs asked (spills allowed) */
+template <int T, int MT, int NT, int WN, int FI>
 int wq_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
     constexpr int BM = 16 * MT, BN = 16 * NT * WN;
     const dim3 grid((unsigned)((A.M + BM - 1) / BM), (unsigned)((A.N + BN - 1) / BN));
     if (grid.y > 65535u) return R4D_WK_DECLINE;
     const unsigned lds = pf_lds<T>(MT);   /* = gg_wm_lds at BM 16 MT */
-    if (f32out) return R4D_EMIT(s, (gg_wq_kernel<T, MT, NT, WN, float>), grid, dim3(32 * WN), lds, A);
-    return R4D_EMIT(s, (gg_wq_kernel<T, MT, NT, WN, uint16_t>), grid, dim3(32 * WN), lds, A);
+    constexpr int F = T == GG_Q6_K ? FI : (FI & 2);   /* FI bit 0 acts on Q6_K only: the others share the bit-0-clear kernel */
+    if (f32out) return R4D_EMIT(s, (gg_wq_kernel<T, MT, NT, WN, float, F>), grid, dim3(32 * WN), lds, A);
+    return R4D_EMIT(s, (gg_wq_kernel<T, MT, NT, WN, uint16_t, F>), grid, dim3(32 * WN), lds, A);
 }
 template <int T>
 int wq_launch_t(RadStream s, int code, bool f32out, const GgTiledArgs& A) {
-#define WQ_L(mt, nt, wn) if (code == wq_code(mt, nt, wn)) return wq_launch_f<T, mt, nt, wn>(s, f32out, A);
+#define WQ_L(mt, nt, wn, fi) if (code == wq_code(mt, nt, wn, fi)) return wq_launch_f<T, mt, nt, wn, fi>(s, f32out, A);
     WQ_FORMS(WQ_L)
 #undef WQ_L
     return R4D_WK_DECLINE;
 }
 bool wq_known(int code) {
-#define WQ_K(mt, nt, wn) if (code == wq_code(mt, nt, wn)) return true;
+#define WQ_K(mt, nt, wn, fi) if (code == wq_code(mt, nt, wn, fi)) return true;
     WQ_FORMS(WQ_K)
 #undef WQ_K
     return false;
