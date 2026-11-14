@@ -21161,7 +21161,7 @@ static void hc_spq_check(const Plugin& pl, int mask) {
     if (hipStreamCreate(&hs) != hipSuccess) { ok("SP-serial part reads", false, "stream"); return; }
     /* scratch for the widest band any launch below declares */
     void* scr = nullptr; int64_t scr_b = 0;
-    auto launch = [&](int which, int64_t r0, int64_t rows, int64_t band, int64_t kcr, bool ss) {
+    auto launch = [&](int which, int64_t r0, int64_t rows, int64_t band, int64_t kcr, bool ss, bool sync = true) {
         auto off = [&](void* p, int64_t pitch_bytes) { return (void*)((char*)p + r0 * pitch_bytes); };
         const Out& e = o[which];
         std::vector<RadTensor> ts = {
@@ -21188,6 +21188,7 @@ static void hc_spq_check(const Plugin& pl, int mask) {
             if (need > scr_b) { scr = dalloc((size_t)need); scr_b = scr ? need : 0; }
             a.scratch = scr; a.scratch_bytes = scr_b;
         }
+        if (!sync) return r->launch(&a, (RadStream)hs) == RAD_OK;
         return r->launch(&a, (RadStream)hs) == RAD_OK && st_stream_sync(hs) == hipSuccess;
     };
     auto diff_rows = [&](int64_t h) {
@@ -21248,6 +21249,40 @@ static void hc_spq_check(const Plugin& pl, int mask) {
                     arm == 0 ? "engine (hc_readv 331, F1n, hc_upmix 5)" : arm == 1 ? "engine + ss (hc_readv 339)" : "stock",
                     same, cases, bad.empty() ? "" : (" -- differ:" + bad).c_str(), ctl_diff, ctl_cases);
         ok(fmt("SP-serial part reads, arm %d", arm).c_str(), cases > 0 && same == cases, bad);
+    }
+    /* Timing at the newcomer step's heights (warm, the engine's switches): the segment read whole against its parts (each part
+     * alone; the step's critical path is the slowest rank's part), the parts in each prefill form a pin allows (1 the tiled
+     * 128-row down + unfused up, 2 wide, 3 PF2), each form's bytes against the whole read. */
+    if (mask & 8) {
+        pl.readv_hc(331); pl.norm_hc_wave(1); pl.upmix_hc(5);
+        for (int64_t h : { (int64_t)1073, (int64_t)1135, (int64_t)2048 - 64 }) {
+            const int64_t td = 64, T = td + h, q = (T + 3) / 4, kcr = 128 * ((h + 127) / 128);
+            std::vector<std::pair<int64_t, int64_t>> parts;
+            for (int rk = 0; rk < 4; ++rk) {
+                const int64_t lo = std::max(std::min(rk * q, T), td), hi = std::min((rk + 1) * q, T);
+                if (hi > lo) parts.push_back({ lo - td, hi - lo });
+            }
+            if (pl.pin_hc) pl.pin_hc(0);
+            (void)launch(0, 0, h, MB, 0, false);
+            const double tw = st_time_us([&](int) { (void)launch(0, 0, h, MB, 0, false, false); }, 20, hs);
+            std::string line = fmt("SPQTIME h %lld (td %lld, q %lld): whole %.1f us |", (long long)h, (long long)td, (long long)q, tw);
+            for (int form : { 0, 1, 2, 3 }) {
+                if (form && !pl.pin_hc) break;
+                if (pl.pin_hc) pl.pin_hc(form);
+                double mx = 0, sum = 0; bool okf = true;
+                for (auto [a, k] : parts) {
+                    okf = okf && launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, false);
+                    const double t = st_time_us([&](int) { (void)launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, false, false); }, 20, hs);
+                    mx = std::max(mx, t); sum += t;
+                }
+                if (pl.pin_hc) pl.pin_hc(0);
+                const size_t d = okf ? diff_rows(h) : (size_t)-1;
+                line += fmt(" form %d: parts max %.1f / sum %.1f us, %s |", form, mx, sum,
+                            !okf ? "refused" : d == 0 ? "bytes = whole" : fmt("%zu bytes differ", d).c_str());
+            }
+            std::printf("%s\n", line.c_str());
+        }
+        if (pl.pin_hc) pl.pin_hc(0);
     }
     pl.readv_hc(0); pl.norm_hc_wave(0); pl.upmix_hc(0);
     (void)hipStreamDestroy(hs);
