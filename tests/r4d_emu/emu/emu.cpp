@@ -244,9 +244,30 @@ emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c) {
     std::memcpy(pb.v, &b, 8);
     return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return rad_fp8e4m3_to_f32(v); });
 }
-emu_v8i emu_wmma_iu8(bool, emu_v2i, bool, emu_v2i, emu_v8i, bool) {
-    std::fprintf(stderr, "emu: v_wmma_i32_16x16x16_iu8 is not emulated\n");
-    std::abort();
+/* v_wmma_i32_16x16x16_iu8 (gfx12, wave32): the fp8 form's layout, eight int8 (sa / sb: signed) or uint8 a lane;
+ * each output is c plus its 16 products, exact in int32 (no order to model). The clamp is not modelled: the libr4d
+ * callers pass false and sum at most 128 * 127 * 127 a block. */
+static uint8_t g_ia[64][2][32][8], g_ib[64][2][32][8];
+emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool) {
+    const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
+    const unsigned par = S.xparity[t]++ & 1u;
+    std::memcpy(g_ia[w][par][l], &a, 8);
+    std::memcpy(g_ib[w][par][l], &b, 8);
+    wmma_whole_wave(w);
+    wave_barrier(w);
+    const int N = l & 15, h = l >> 4;
+    emu_v8i d;
+    for (int e = 0; e < 8; ++e) {
+        const int M = 8 * h + e;
+        int acc = c[e];
+        for (int k = 0; k < 16; ++k) {
+            const uint8_t av = g_ia[w][par][M + 16 * (k >> 3)][k & 7];
+            const uint8_t bv = g_ib[w][par][N + 16 * (k >> 3)][k & 7];
+            acc += (sa ? (int)(int8_t)av : (int)av) * (sb ? (int)(int8_t)bv : (int)bv);
+        }
+        d[e] = acc;
+    }
+    return d;
 }
 unsigned emu_ballot(bool p) {
     int l;

@@ -74,6 +74,13 @@
  *                   same bytes); needs RADIANCE_FN4_AR_SDMA set at start (0 / 1: builds the copy-engine contexts; such
  *                   passes stay untaped)                                                          RADIANCE_FN4_AR_SDMA
  *
+ *   bi_wide         architecture plugin (rad_fn4_switch): fn4 BI wide (14.11.2026) -- the forms a step above 64 decode
+ *                   rows takes, a mask: 1 the trunk's int8 linears over the decode rows in libr4d's gemm_nt_q_dec (the
+ *                   narrow tile in 64-token groups: each row its alone bytes), 2 the hc reads' decode rows in one bi_dec
+ *                   launch up to 128 rows, 4 the fused router up to 128 rows, 8 the fused attention / QSA prologues up to
+ *                   128 rows; RADIANCE_FN4_BI_WIDE at start declares the forms (its value the start value); 0 today
+ *                                                                                                  RADIANCE_FN4_BI_WIDE
+ *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
  *
@@ -93,7 +100,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

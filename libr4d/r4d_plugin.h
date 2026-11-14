@@ -648,6 +648,9 @@ int64_t r4d_rad_gemm_fp8a8_m16_scratch(const RadArgs*);
 int r4d_rad_gemm_fp8a8_tiled(const RadArgs*, RadStream);
 int r4d_rad_gemm_i8a8_m16  (const RadArgs*, RadStream);
 int64_t r4d_rad_gemm_i8a8_m16_scratch(const RadArgs*);
+/* fn4 BI wide: gemm_nt_q_dec, the narrow tile over decode heights above 64 (64-token groups on grid.y). */
+int r4d_rad_gemm_i8a8_m16_dec(const RadArgs*, RadStream);
+int64_t r4d_rad_gemm_i8a8_m16_dec_scratch(const RadArgs*);
 int r4d_rad_logits_gemm_i8(const RadArgs*, RadStream);
 int r4d_rad_logits_gemm_iqr(const RadArgs*, RadStream);
 /* `logits_gemm_vocab`: the head as width classes of the vocabulary's rows (r4d_logits_vocab.hip). */

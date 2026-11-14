@@ -63,6 +63,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (std::strcmp(name, "bi_wide") == 0) {   /* fn4 BI wide: the forms above 64 decode rows (mask; RADIANCE_FN4_BI_WIDE declares) */
+        if (value < 0 || value > 15) return -1;
+        if (value && !rad::arch::fn4_bi_wide_declared()) return -1;
+        rad::arch::fn4_biwide_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */
         if (value < 0 || value > 2) return -1;
         qwen4exp_fp8::fn4_biseg_flag().store(value, std::memory_order_relaxed);

@@ -39,6 +39,9 @@
 
 #include "rad_arch.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -751,9 +754,28 @@ struct RowParts {
 };
 
 /* ================================================================== one block-scaled linear */
+/* fn4 BI wide (14.11.2026, Qwen row 1): a step's decode rows above 64 through libr4d's gemm_nt_q_dec (the narrow tile in
+ * 64-token groups, every row its alone bytes) instead of gemm_nt_q's tiled band. Declared when RADIANCE_FN4_BI_WIDE is set
+ * at start (non-zero) and libr4d declares the op; taken by a step whose architecture set bi_wide_rows() (this rank thread's
+ * decode rows when the bi_wide switch's bit 1 is on and they exceed 64; 0 otherwise, cleared with the cuts). */
+inline bool fn4_bi_wide_declared() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_BI_WIDE"); return e && *e && *e != '0'; }();
+    return on;
+}
+inline int64_t& bi_wide_rows() { static thread_local int64_t r = 0; return r; }
+/* The bi_wide switch's value (mask, see core/runtime/fn4_switch.h), RADIANCE_FN4_BI_WIDE's at start. */
+inline std::atomic<int>& fn4_biwide_flag() {
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_BI_WIDE");
+                                   return e && *e ? (std::atoi(e) & 15) : 0; }()};
+    return f;
+}
+inline bool fn4_biwide(int bit) { return fn4_bi_wide_declared() && (fn4_biwide_flag().load(std::memory_order_relaxed) & bit) != 0; }
+constexpr int64_t kBiNarrowRows = 64;   /* libr4d's narrow tiles' band (gemm_nt_q m16 rows) */
+
 struct LinearFP8 {
     rad_weight w = 0, ws = 0;
     rad_op     op = 0;
+    rad_op     op_dec = 0;   /* fn4 BI wide: gemm_nt_q_dec over decode rows > 64 (int8 weights only); 0 otherwise */
     int64_t    N = 0, K = 0;
     /* Weight rows per scale-plane row: RAD_FP8_BLOCK for block fp8, 1 otherwise. Row spans on `ws`
      * are converted with it (declare, span_parts). */
@@ -1405,6 +1427,17 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                                      RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", qdt)),
                           RAD_WEIGHTS(w, ws)),
                       { a.q8, a.s8 }, { y });
+        /* fn4 BI wide: the decode twin over the same weight views (the same stored form: the narrow and tiled rows share
+         * libr4d's i8 block layout), up to the most decode rows a step carries. */
+        if (op && !trb && !asym && fn4_bi_wide_declared() && rad_op_declared(b, "gemm_nt_q_dec")) {
+            const int64_t dh = std::min<int64_t>(ar_wide_write_rows(g), hi);
+            if (dh > kBiNarrowRows)
+                op_dec = rw(b, RAD_OP(b, "gemm_nt_q_dec",
+                                RAD_PARAMS(RAD_RANGE("M", 1, dh), RAD_INT("N", N), RAD_INT("K", K),
+                                           RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", qdt)),
+                                RAD_WEIGHTS(w, ws)),
+                            { a.q8, a.s8 }, { y });
+        }
         return (op_q || a.q8_fed) && op ? RAD_OK : RAD_E_INVAL;
     }
 
@@ -1740,7 +1773,9 @@ inline void LinearFP8::step_rows(RadCtx* c, const ActFP8& a, rad_buf y, int64_t 
         if (op_q)
             RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
                         brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK));
-        RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),
+        /* fn4 BI wide: a launch of decode rows only ([r0, r0 + rows) inside [0, bi_wide_rows())) above the narrow band */
+        const bool dec = op_dec && rows > kBiNarrowRows && r0 + rows <= bi_wide_rows();
+        RAD_ISSUE_N(c, dec ? op_dec : op, rows, brow_slice(a.q8, r0, rows, K),
                     brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK),
                     RAD_W(w), RAD_W(ws), brow_slice(y, yr, rows, N), RAD_NONE, RAD_NONE);
         return;

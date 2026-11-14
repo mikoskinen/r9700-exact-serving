@@ -324,12 +324,15 @@ static void bi_segments(Model& m, const RadBatch* batch) {
     const bool seg = fn4_biseg_flag().load(std::memory_order_relaxed) > 0;
     m.bi_cut.clear();
     bi_cuts() = BiCuts{};
+    bi_wide_rows() = 0;
     if (!m.bi_on && !seg) return;
     const int64_t T = batch->n_tok;
     int64_t sd = 0, td = 0;
     batch_split(batch, &sd, &td);
     m.bi_td = td;
     m.bi_qd = sd > 0 && td % sd == 0 ? td / sd : 1;   /* a decode sequence's rows (1 + n_spec) */
+    /* fn4 BI wide (bi_wide bit 1): the decode rows above the narrow band through the linears' gemm_nt_q_dec */
+    if (seg && td > kBiNarrowRows && fn4_biwide(1)) bi_wide_rows() = td;
     m.bi_cut.push_back(0);
     if (td > 0 && td < T) m.bi_cut.push_back(td);
     if (batch->positions_h)
@@ -2440,6 +2443,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
     bt_flush(c, m, batch);
     bi_cuts() = BiCuts{};   /* fn4 BI: the cuts are this trunk step's only */
+    bi_wide_rows() = 0;
 }
 
 /* The default draft depth, used by `--num-speculative-tokens auto` and by rad-convert.
@@ -2592,6 +2596,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
         if (value < 0 || value > 3) return -1;   /* 3: + the dense decode sequences in one pinned launch */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "bi_wide") == 0) {   /* fn4 BI wide: the forms above 64 decode rows (mask; RADIANCE_FN4_BI_WIDE declares) */
+        if (value < 0 || value > 15) return -1;
+        if (value && !rad::arch::fn4_bi_wide_declared()) return -1;
+        rad::arch::fn4_biwide_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */
