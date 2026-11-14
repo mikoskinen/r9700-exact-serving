@@ -1308,7 +1308,10 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
     kx = k;
     const uint4 ent = ((const uint4*)a.map)[1 + k];
     r0 = (int)ent.y, r1 = (int)ent.z;
-    PF_STAMP_INFO(a.chunk_c, blockIdx.x, r1 - r0, ent.x == EXL3R4D_PF_ZERO ? 3u : ent.x % (unsigned)EXL3R4D_NCLS);
+    // SPEED-C reading (the stamp build only): + 8 in the class field when the entry's codes sit in a host pool
+    PF_STAMP_INFO(a.chunk_c, blockIdx.x, r1 - r0,
+                  (ent.x == EXL3R4D_PF_ZERO ? 3u : ent.x % (unsigned)EXL3R4D_NCLS) |
+                      (EXL3R4D_PF_WGS_ON && ent.x != EXL3R4D_PF_ZERO && xr_host_codes(a, planes_of(p, (int)ent.x).codes) ? 8u : 0u));
     constexpr int GD = MATS == 1 && AM == 0 ? EXL3R4D_PF_DN_G : 1;
     if (ent.x == EXL3R4D_PF_ZERO) {
       if constexpr (GD == 1)

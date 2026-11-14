@@ -263,7 +263,11 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
             mode = (v & 4) && xrb > 0 ? 5 : (v & 7) == 3 ? 3 | (v & 0x18) : (v & 3) == 3 ? 0 : (v & 3);
         const int ring = mode & 4 ? (int)xmb : 0;
         d.xr = (int32_t)((uint32_t)mode | ((uint32_t)exl3_k2(g.bits) << 8) | ((uint32_t)ring << 16));
-        if (mode && a->rank >= 0 && a->rank < XR_RANKS) {
+#ifndef EXL3R4D_PF_WGSTAMP
+#define EXL3R4D_PF_WGSTAMP 0
+#endif
+        /* the stamp build (a reading, never shipped) names the pools at every launch, so its stamps can mark host-read entries */
+        if ((mode || EXL3R4D_PF_WGSTAMP) && a->rank >= 0 && a->rank < XR_RANKS) {
             const int r = a->rank;
             for (int i = 0; i < g_xr_pn[r]; ++i) d.xr_lo[i] = g_xr_plo[r][i], d.xr_hi[i] = g_xr_phi[r][i];
             d.xr_n = g_xr_pn[r];
