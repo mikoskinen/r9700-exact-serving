@@ -576,6 +576,8 @@ static void* dalloc(size_t bytes) {
  * buffers live outside dalloc because dfree_all runs between shapes. */
 constexpr int64_t kColdChunk = 4ll << 20;
 
+/* --warm MS: st_time_us holds the card at its power cap for MS before each timed loop (0: off, today's timing) */
+static double g_warm_ms = 0.0;
 template <class F>
 static double st_time_us(F&& launch, int iters, hipStream_t s) {
     if (iters <= 0) return 0.0;
@@ -583,6 +585,14 @@ static double st_time_us(F&& launch, int iters, hipStream_t s) {
         hipEvent_t e0, e1;
         st_ev_create(&e0); st_ev_create(&e1);
         for (int i = 0; i < iters; ++i) launch(i);   /* untimed: the clocks ramp up from idle */
+        if (g_warm_ms > 0) {   /* --warm MS (ds41-wmk2, 14.11.): hold the card at its power cap this long before the timed loop */
+            st_ev_record(e0, s); launch(0); launch(1); st_ev_record(e1, s); st_ev_sync(e1);
+            float m2 = 0.0f;
+            st_ev_elapsed(&m2, e0, e1);
+            const double per = std::max(0.001, (double)m2 / 2.0);
+            const long long nw = std::min(200000LL, (long long)std::ceil(g_warm_ms / per));
+            for (long long i = 0; i < nw; ++i) launch((int)(i % 1000003));
+        }
         st_ev_record(e0, s);
         for (int i = 0; i < iters; ++i) launch(i);
         st_ev_record(e1, s);
@@ -38458,6 +38468,9 @@ int main(int argc, char** argv) {
             wgk = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_r = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--warm") && i + 1 < argc) {
+            /* ds41-wmk2: a warm burst of this many ms before every st_time_us timed loop (the power-capped steady state) */
+            g_warm_ms = std::strtod(argv[++i], nullptr);
         } else if (!std::strcmp(argv[i], "--wmk") && i + 1 < argc) {
             /* ds41-wmk: the W arm of --perfwmg / --wmgcheck is gg_wk_kernel under these bench pin codes. */
             for (int64_t c : wmg::ilist(argv[++i], "")) if (c > 0) wmg::g_wk_codes.push_back((int)c);

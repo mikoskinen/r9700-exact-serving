@@ -65,7 +65,8 @@ static void set_dec(const Hk& h) { clear(h); h.sw("gg_gemv", 2); h.sw("gg_gemv_m
 constexpr int kWkEngine = 1048576;
 static void set_wm(const Hk& h) {
     clear(h);
-    if (g_wk_cur == kWkEngine) { h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1); }
+    /* 1048576 / 1048577 / 1048578: the engine's path under ds41_wmk 1 / 2 / 3 (FINDINGS F7: the r6 table / 70724 / r5's table) */
+    if (g_wk_cur >= kWkEngine && g_wk_cur <= kWkEngine + 2) { h.sw("gg_gemv", 2); h.sw("gg_gemv_m16", 1); h.sw("ds41_wmk", 1 + (g_wk_cur - kWkEngine)); }
     else if (g_wk_cur) h.wk_pin(g_wk_cur);
     else h.wm_pin(1);
 }
@@ -967,7 +968,7 @@ static void route(const Plugin& pl, const char* tlist) {
             /* stage 3: W's own prefill forms (gg_wq_kernel 9xxx, W form 0 and the engine's table -1) at M 130 and 2048 = alone */
             auto wkpf_def = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_default");
             if (wkpf_def && op.kind <= 1) {
-                for (int fc : { 9312, 9311, 9412, 9411, 9321, 9221, 9325, 9316, 9415, 9425, 9371, 9375, 9461, 9475, 0, -1 })
+                for (int fc : { 9312, 9311, 9412, 9411, 9321, 9221, 9325, 9316, 9415, 9425, 9371, 9375, 9461, 9475, 9821, 9871, 0, -1 })
                     for (int64_t MM : { (int64_t)130, (int64_t)2048 }) {
                         wmk_on(1);
                         if (wkpf_follow) wkpf_follow(0);

@@ -1329,6 +1329,43 @@ __global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2
             }
             gg_for<8>([&](auto jc) {
                 constexpr int J = decltype(jc)::value, C = J & 1;
+                /* FI bit 2 (two-step chains, SPG 2 = Q8_0 / Q5_K): a scale group's two K steps run at its second step, tile by tile --
+                 * the chain wmma(A1, B1, wmma(A0, B0, c0)), then its fma(s), the same operations per output -- so one or two tiles'
+                 * chains are live instead of NM x NT across the two steps. The first step only stages its fragments (both A / B
+                 * fragment sets are double-buffered already). */
+                constexpr bool FG = (FI & 4) && W::SPG == 2 && !W::CINIT;
+                if constexpr (FG && (J & 1)) {
+                    if constexpr (!W::PIPE) {
+#pragma unroll
+                        for (int nt = 0; nt < NT; ++nt) bf[C][nt] = W::template bfrag<J>(rc[nt], h, pf[nt], s);
+                    }
+                    float sg[NT], mg[NT];
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        sg[nt] = W::scale(rc[nt], J / 2, s);
+                        if constexpr (W::MINS) mg[nt] = W::mins(rc[nt], J / 2, s);
+                    }
+#pragma unroll
+                    for (int mt = 0; mt < NM; ++mt) {
+                        if (!live(mt)) continue;
+                        gg_v8f gm = (gg_v8f)(0.0f);
+                        if constexpr (W::MINS) gm = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
+#pragma unroll
+                        for (int nt = 0; nt < NT; ++nt) {
+                            gg_v8f pc = gg_wmma(af[C ^ 1][mt], bf[C ^ 1][nt], (gg_v8f)(0.0f));
+                            pc = gg_wmma(af[C][mt], bf[C][nt], pc);
+#pragma unroll
+                            for (int q = 0; q < 8; ++q) {
+                                acc[mt][nt][q] = __builtin_fmaf(pc[q], sg[nt], acc[mt][nt][q]);
+                                if constexpr (W::MINS) acc[mt][nt][q] = __builtin_fmaf(gm[q], mg[nt], acc[mt][nt][q]);
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int mt = 0; mt < NM; ++mt)
+#pragma unroll
+                        for (int nt = 0; nt < NT; ++nt) gg_pin8(acc[mt][nt]);
+                }
                 if constexpr (!W::PIPE) {
                     if constexpr (J < 7) {
 #pragma unroll
@@ -1336,8 +1373,10 @@ __global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2
                             if (live(mt))
                                 af[C ^ 1][mt] = *(const r4d_u32x4*)(const void*)(xb + mt * 16 * kWmXP + W::xoff(J + 1, h));
                     }
+                    if constexpr (!(FG && (J & 1))) {
 #pragma unroll
-                    for (int nt = 0; nt < NT; ++nt) bf[C][nt] = W::template bfrag<J>(rc[nt], h, pf[nt], s);
+                        for (int nt = 0; nt < NT; ++nt) bf[C][nt] = W::template bfrag<J>(rc[nt], h, pf[nt], s);
+                    }
                 } else if constexpr (J < 7) {
 #pragma unroll
                     for (int mt = 0; mt < NM; ++mt)
@@ -1387,7 +1426,7 @@ __global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2
                     for (int mt = 0; mt < NM; ++mt)
 #pragma unroll
                         for (int nt = 0; nt < NT; ++nt) gg_pin8(acc[mt][nt]);
-                } else
+                } else if constexpr (!FG)
                 {
 #pragma unroll
                 for (int mt = 0; mt < NM; ++mt) {
@@ -1415,7 +1454,7 @@ __global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2
                     for (int nt = 0; nt < NT; ++nt)
                         bf[C ^ 1][nt] = W::template bfrag<(J + 1) & 7>(rc[nt], h, pf[nt], J < 7 ? s : sn);
                 }
-                if constexpr (J % W::SPG == W::SPG - 1 && !((FI & 1) && W::SPG == 1 && !W::MINS && !W::PIPE)) {
+                if constexpr (J % W::SPG == W::SPG - 1 && !((FI & 1) && W::SPG == 1 && !W::MINS && !W::PIPE) && !FG) {
                     float sc[NT], mn[NT];
                     if constexpr (J < 7 || !W::PIPE) {
 #pragma unroll
@@ -1509,17 +1548,18 @@ __global__ __launch_bounds__(32 * WN) __attribute__((amdgpu_waves_per_eu((FI & 2
 }
 /* gg_wq form codes: 9000 + 100 MT + 10 NT + WN / 8 (e.g. 9312 = MT 3, NT 1, 16 waves; 9321 = the stock geometry + fold, = form 0). */
 /* + 4 for FI bit 0 (the interleaved step), + 50 for FI bit 1 (the stock occupancy asked: 9371 = 9321 at <= 240 VGPRs) */
-constexpr int wq_code(int mt, int nt, int wn, int fi = 0) { return 9000 + 100 * mt + 10 * nt + wn / 8 + 4 * (fi & 1) + 50 * (fi >> 1); }
+constexpr int wq_code(int mt, int nt, int wn, int fi = 0) { return 9000 + 100 * mt + 10 * nt + wn / 8 + 4 * (fi & 1) + 50 * ((fi >> 1) & 1) + 500 * ((fi >> 2) & 1); }
 #define WQ_FORMS(X) X(3, 1, 16, 0) X(3, 1, 8, 0) X(4, 1, 16, 0) X(4, 1, 8, 0) X(3, 2, 8, 0) X(2, 2, 8, 0) \
     X(3, 2, 8, 1) X(3, 1, 16, 1) X(4, 1, 8, 1) X(4, 2, 8, 1)   /* FI 1: the interleaved step (Q6_K; the other types run it as FI 0) */ \
-    X(3, 2, 8, 2) X(3, 2, 8, 3) X(4, 1, 8, 2) X(4, 2, 8, 3)   /* FI 2 / 3: <= 240 VGPRs asked (spills allowed) */
+    X(3, 2, 8, 2) X(3, 2, 8, 3) X(4, 1, 8, 2) X(4, 2, 8, 3)   /* FI 2 / 3: <= 240 VGPRs asked (spills allowed) */ \
+    X(3, 2, 8, 4) X(3, 2, 8, 6)   /* FI 4 / 6: the group-interleaved step (Q8_0 / Q5_K), without / with the occupancy ask: 9821 / 9871 */
 template <int T, int MT, int NT, int WN, int FI>
 int wq_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
     constexpr int BM = 16 * MT, BN = 16 * NT * WN;
     const dim3 grid((unsigned)((A.M + BM - 1) / BM), (unsigned)((A.N + BN - 1) / BN));
     if (grid.y > 65535u) return R4D_WK_DECLINE;
     const unsigned lds = pf_lds<T>(MT);   /* = gg_wm_lds at BM 16 MT */
-    constexpr int F = T == GG_Q6_K ? FI : (FI & 2);   /* FI bit 0 acts on Q6_K only: the others share the bit-0-clear kernel */
+    constexpr int F = T == GG_Q6_K ? (FI & 3) : (FI & 6);   /* bit 0 acts on Q6_K only, bit 2 on Q8_0 / Q5_K only */
     if (f32out) return R4D_EMIT(s, (gg_wq_kernel<T, MT, NT, WN, float, F>), grid, dim3(32 * WN), lds, A);
     return R4D_EMIT(s, (gg_wq_kernel<T, MT, NT, WN, uint16_t, F>), grid, dim3(32 * WN), lds, A);
 }
@@ -1554,19 +1594,22 @@ int g_wkpf_follow = 0;
 int g_wkpf_default = -1;   /* bench pin r4d_gg_wkpf_default: the form W's prefill rows run (0 = the stock kernel + fold; -1 the table) */
 /* W's prefill form by (type, N, K) (the table below; every form computes the same bytes). Filled from --perfwkpf (one card, M 2048 /
  * 4096); a shape not listed runs DEFAULT_FORM. */
-constexpr int kWkpfDefault = 322;
+constexpr int kWkpfDefault = 326;
 struct WkpfEnt { int ty, N, K, form; };
-/* r5 (14.11., one card, runs/wmk2-s11/perfwkpf.txt, M 2048 / 4096, tools/wkpfbest.py: a form listed beats 322 by >= 2 % at both Ms):
- * geomean W / best int16 x1.269 (all 322) -> x1.164. Form 0 = the stock kernel + the part fold; 326 / 222 / 414 / 418 GPF forms. */
+/* r8 (14.11., one card, ONE session per type group, the steady state: each arm timed after a >= 120 ms warm burst, median of 3 alternating rounds; runs/wmk2-s24/wq6 + wq58, tools/wqbest.py over M 2048 + 4096): Q6_K GPF 326 with the part fold at x0.98-1.04 of the stock kernel on every shape; Q8_0 GPF 414 at x0.89-0.93; Q5_K the gg_wq forms 9221 (MT 2 NT 2) / 9411 (MT 4 NT 1) or 326 at x1.05-1.13. Rank-0 weighted dense prefill vs int16's production forms (stock + its P0 table's 426 / 422): x1.063 (M 2048) / x1.064 (M 4096); r5-r7's table x1.16 (another harness). A shape not listed: kWkpfType (by type). */
 const WkpfEnt kWkpfTab[] = {
-    { GG_Q5_K, 1024, 4096, 0 }, { GG_Q5_K, 5120, 2048, 0 }, { GG_Q6_K, 512, 5120, 0 }, { GG_Q6_K, 1024, 4096, 0 },
-    { GG_Q6_K, 5120, 2048, 0 }, { GG_Q6_K, 8192, 1280, 326 }, { GG_Q6_K, 25600, 6144, 326 }, { GG_Q6_K, 5120, 768, 326 },
-    { GG_Q6_K, 5120, 512, 222 }, { GG_Q6_K, 1024, 5120, 0 }, { GG_Q8_0, 5120, 768, 414 }, { GG_Q8_0, 5120, 512, 418 },
-    { GG_Q8_0, 1536, 5120, 414 }, { GG_Q8_0, 1024, 5120, 418 } };
+    { GG_Q5_K, 512, 5120, 9221 }, { GG_Q5_K, 1024, 4096, 9221 }, { GG_Q5_K, 1280, 5120, 9411 }, { GG_Q5_K, 5120, 2048, 9411 },
+    { GG_Q5_K, 8192, 1280, 326 }, { GG_Q6_K, 512, 5120, 326 }, { GG_Q6_K, 1024, 4096, 326 }, { GG_Q6_K, 1024, 5120, 326 },
+    { GG_Q6_K, 1280, 5120, 326 }, { GG_Q6_K, 1536, 5120, 326 }, { GG_Q6_K, 5120, 512, 326 }, { GG_Q6_K, 5120, 768, 326 },
+    { GG_Q6_K, 5120, 2048, 326 }, { GG_Q6_K, 8192, 1280, 326 }, { GG_Q6_K, 25600, 6144, 326 }, { GG_Q8_0, 1024, 5120, 414 },
+    { GG_Q8_0, 1536, 5120, 414 }, { GG_Q8_0, 5120, 512, 414 }, { GG_Q8_0, 5120, 768, 414 }
+};
+/* a shape the table does not list (e.g. the drafter's q8_0 sidecar linears): the type's best form over the bench's shapes */
+int kWkpfType(int ty) { return ty == GG_Q8_0 ? 414 : ty == GG_Q5_K ? 9411 : kWkpfDefault; }
 int wkpf_form_tab(int ty, long long N, long long K) {
     for (const WkpfEnt& e : kWkpfTab)
         if (e.ty == ty && e.N == N && e.K == K) return e.form;
-    return kWkpfDefault;
+    return kWkpfType(ty);
 }
 template <int T, int MT, int NT, int WN, int FI>
 int wkpf_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
