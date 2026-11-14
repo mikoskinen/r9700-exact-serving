@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <array>
+#include <tuple>
 #include <cmath>
 #include <cerrno>
 #include <cstdarg>
@@ -21106,6 +21107,152 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     ok(nm.c_str(), true);
 }
 
+/* fn4 SP-serial (14.11.2026, --spqcheck [mask]): Qwen3.8-Flash-Next's serial-step sequence-parallel read. A prefill segment of
+ * h rows read whole (hc_read_e4m3 as the trunk declares it: M band 2048, no pin) against its parts on their own row slices
+ * with kc_rows = 128 ceil(h / 128) (HyperConn::read_kt) -- the parts a rank's rows of a step of td decode rows + h (q =
+ * ceil((td + h) / 4) rows a rank, the decode rows first), at td 0 / 32 / 64 / 128; a partial part of <= 64 rows is not
+ * taken (the engine then keeps step_serial). Every output byte compared: x, inj, codes + scales, rotated codes + scales.
+ * Arms (mask, default 7): 1 the engine's switches (hc_readv 331, F1n, hc_upmix 5), 2 the same with the norm scales handed
+ * in (`ss`, hc_readv bit 3: the write's scales), 4 stock forms (hc_readv 0, F1n off). A control per arm: the parts at their
+ * own split (no pin) -- expected to differ wherever the part's row-tile count gives another split. */
+static void hc_spq_check(const Plugin& pl, int mask) {
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r || !pl.readv_hc || !pl.norm_hc_wave || !pl.upmix_hc) { skip("SP-serial part reads", "row absent or no hc hooks"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp, MB = 2048;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x5DEECE66Dull;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(MB * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    std::vector<float> ssv((size_t)(MB * 8));
+    for (auto& v : ssv) v = 0.25f + (float)(rnd() % 1000) / 1000.0f;
+    const size_t xb = (size_t)(MB * n * 2), ib = (size_t)(MB * hc * 2), qb = (size_t)(MB * n), sb = (size_t)(MB * nkb * 4);
+    void* d_h = dalloc(hh.size() * 2);  void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());   void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2); void* d_ss = dalloc(ssv.size() * 4);
+    struct Out { void *x, *inj, *q, *qs, *rq, *rs; };
+    Out o[2];
+    for (Out& e : o) { e.x = dalloc(xb); e.inj = dalloc(ib); e.q = dalloc(qb); e.qs = dalloc(sb); e.rq = dalloc(qb); e.rs = dalloc(sb); }
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_ss || !o[0].x || !o[1].rs) { ok("SP-serial part reads", false, "hipMalloc failed"); return; }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_ss, ssv.data(), ssv.size() * 4, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok("SP-serial part reads", false, "stream"); return; }
+    /* scratch for the widest band any launch below declares */
+    void* scr = nullptr; int64_t scr_b = 0;
+    auto launch = [&](int which, int64_t r0, int64_t rows, int64_t band, int64_t kcr, bool ss) {
+        auto off = [&](void* p, int64_t pitch_bytes) { return (void*)((char*)p + r0 * pitch_bytes); };
+        const Out& e = o[which];
+        std::vector<RadTensor> ts = {
+            T(off(d_h, HN * 2), RAD_BF16, { rows, HN }),  T(d_w, RAD_F32, { HN }),
+            T(d_dn, RAD_F8E4M3, { lr, HN }),               T(d_up, RAD_F8E4M3, { HN, lr }),
+            T(d_iw, RAD_BF16, { hc, HN }),                 T(off(e.x, n * 2), RAD_BF16, { rows, n }),
+            T(off(e.inj, hc * 2), RAD_BF16, { rows, hc }), T(off(e.q, n), RAD_I8, { rows, n }),
+            T(off(e.qs, nkb * 4), RAD_F32, { rows, nkb }), T(off(e.rq, n), RAD_F8E4M3, { rows, n }),
+            T(off(e.rs, nkb * 4), RAD_F32, { rows, nkb }),
+        };
+        if (ss) ts.push_back(T(off(d_ss, 32), RAD_F32, { rows, 8 }));
+        std::vector<RadParam> ps = {
+            PI("M", band), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+            PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+            PI("rotate", 1), PS("mix", "e4m3"),
+        };
+        if (kcr > 0) ps.push_back(PI("kc_rows", kcr));
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        if (r->scratch) {
+            const int64_t need = r->scratch(&a);
+            if (need > scr_b) { scr = dalloc((size_t)need); scr_b = scr ? need : 0; }
+            a.scratch = scr; a.scratch_bytes = scr_b;
+        }
+        return r->launch(&a, (RadStream)hs) == RAD_OK && st_stream_sync(hs) == hipSuccess;
+    };
+    auto diff_rows = [&](int64_t h) {
+        size_t d = 0;
+        for (auto [pa, pb, b] : { std::tuple<void*, void*, size_t>{ o[0].x, o[1].x, (size_t)(h * n * 2) },
+                                   { o[0].inj, o[1].inj, (size_t)(h * hc * 2) }, { o[0].q, o[1].q, (size_t)(h * n) },
+                                   { o[0].qs, o[1].qs, (size_t)(h * nkb * 4) }, { o[0].rq, o[1].rq, (size_t)(h * n) },
+                                   { o[0].rs, o[1].rs, (size_t)(h * nkb * 4) } }) {
+            std::vector<uint8_t> A(b), B(b);
+            st_memcpy(A.data(), pa, b, hipMemcpyDeviceToHost);
+            st_memcpy(B.data(), pb, b, hipMemcpyDeviceToHost);
+            for (size_t i = 0; i < b; ++i) d += A[i] != B[i];
+        }
+        return d;
+    };
+    static const int64_t kH[] = { 200, 257, 300, 383, 384, 385, 450, 511, 512, 513, 600, 640, 641, 700, 768, 769, 900, 1000, 1024,
+                                  1025, 1073, 1080, 1100, 1135, 1144, 1162, 1200, 1300, 1400, 1536, 1537, 1700, 1900, 1920, 1921,
+                                  2000, 2048 };
+    static const int64_t kTd[] = { 0, 32, 64, 128 };
+    for (int arm = 0; arm < 3; ++arm) {
+        if (!(mask & (1 << arm))) continue;
+        const bool ss = arm == 1;
+        const int rv = arm == 2 ? 0 : (331 | (ss ? 8 : 0));
+        pl.readv_hc(rv);
+        pl.norm_hc_wave(arm == 2 ? 0 : 1);
+        pl.upmix_hc(arm == 2 ? 0 : 5);
+        int cases = 0, same = 0, ctl_cases = 0, ctl_diff = 0;
+        std::string bad;
+        for (int64_t h : kH) for (int64_t td : kTd) {
+            const int64_t T = td + h, q = (T + 3) / 4;
+            if (T > MB) continue;
+            /* the parts of [td, T) on the four ranks, segment-relative */
+            std::vector<std::pair<int64_t, int64_t>> parts;
+            bool take = true;
+            for (int rk = 0; rk < 4; ++rk) {
+                const int64_t lo = std::max(std::min(rk * q, T), td), hi = std::min((rk + 1) * q, T);
+                if (hi <= lo) continue;
+                if (hi - lo < h && hi - lo <= 64) take = false;
+                parts.push_back({ lo - td, hi - lo });
+            }
+            if (!take || parts.size() < 2) continue;
+            const int64_t kcr = 128 * ((h + 127) / 128);
+            for (Out& e : o) { st_memset(e.x, 0xa5, xb); st_memset(e.inj, 0xa5, ib); st_memset(e.q, 0xa5, qb);
+                               st_memset(e.qs, 0xa5, sb); st_memset(e.rq, 0xa5, qb); st_memset(e.rs, 0xa5, sb); }
+            bool okl = launch(0, 0, h, MB, 0, ss);
+            for (auto [a, k] : parts) okl = okl && launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, ss);
+            ++cases;
+            const size_t d = okl ? diff_rows(h) : (size_t)-1;
+            if (d == 0) ++same;
+            else if (bad.size() < 400) bad += fmt(" h%lld/td%lld:%s", (long long)h, (long long)td, okl ? fmt("%zu", d).c_str() : "launch");
+            /* control: the same parts at their own split */
+            for (auto [a, k] : parts) (void)launch(1, a, k, MB, 0, ss);
+            ++ctl_cases;
+            if (diff_rows(h) != 0) ++ctl_diff;
+        }
+        std::printf("SPQCHECK arm %s: %d / %d cases every output byte identical (pinned parts vs the segment read whole)%s; "
+                    "control (parts unpinned): %d / %d cases differ\n",
+                    arm == 0 ? "engine (hc_readv 331, F1n, hc_upmix 5)" : arm == 1 ? "engine + ss (hc_readv 339)" : "stock",
+                    same, cases, bad.empty() ? "" : (" -- differ:" + bad).c_str(), ctl_diff, ctl_cases);
+        ok(fmt("SP-serial part reads, arm %d", arm).c_str(), cases > 0 && same == cases, bad);
+    }
+    pl.readv_hc(0); pl.norm_hc_wave(0); pl.upmix_hc(0);
+    (void)hipStreamDestroy(hs);
+}
+
 /* fn4 hc_readv bit 3 (W1b): a write and the read after it at Qwen3.8-Flash-Next's shape, the pair as the trunk
  * issues it -- hc_write_bf16 (y, inj, h, ss; eps) then hc_read_e4m3 (..., ss) -- on device buffers the case and
  * the timing share. `ss` is [M][8] f32. */
@@ -37123,6 +37270,7 @@ int main(int argc, char** argv) {
     long long hcw_m = 0;
     int hcw_it = 50;
     long long hcv_m = 0;
+    int spq = 0;   /* fn4 SP-serial --spqcheck */
     int hcv_it = 50;
     long long hcs_m = 0;
     int hcs_it = 50;
@@ -37427,6 +37575,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hcu_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcu_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--spqcheck")) {
+            /* fn4 SP-serial: a prefill segment's parts read with the K split pinned vs the segment read whole */
+            spq = 7;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) spq = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhcv")) {
             /* hc_read's faster forms (fn4 hc_readv) against the stock ones at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -37566,6 +37718,16 @@ int main(int argc, char** argv) {
         skip("gated residual read timing (hc_upmix)", "built without HIP");
 #endif
         return 0;
+    }
+    if (spq) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_spq_check(pl, spq);
+        dfree_all();
+#else
+        skip("SP-serial part reads", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (hcv_m) {
         if (!load(&pl, path)) return 1;

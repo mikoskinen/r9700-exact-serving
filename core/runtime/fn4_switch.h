@@ -81,6 +81,12 @@
  *                   128 rows; RADIANCE_FN4_BI_WIDE at start declares the forms (its value the start value); 0 today
  *                                                                                                  RADIANCE_FN4_BI_WIDE
  *
+ *   sp_serial       architecture plugin (rad_fn4_switch): fn4 SP-serial (14.11.2026) -- a serial step's prefill rows (the
+ *                   newcomer step, a lone prompt of up to a pass) take the sequence-parallel gated residual: the block's
+ *                   reduce-scatter, the write and read on this rank's quarter of the rows (a prefill segment's part with the
+ *                   segment's K split pinned), the all-gather and the codes on every row; the same bytes; needs
+ *                   RADIANCE_FN4_SPSERIAL set at start (declares; its value the start value); 0 today  RADIANCE_FN4_SPSERIAL
+ *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
  *
@@ -100,7 +106,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
