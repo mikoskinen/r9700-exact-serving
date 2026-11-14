@@ -31,6 +31,11 @@ typedef struct Exl3r4dPrefill4 {
 #include "exl3r4d_prefill_fields.h"
 } Exl3r4dPrefill4;
 
+/* LEVER XR's word (exl3r4d_prefill_fields.h `xr`). */
+#define xr_mode_of(a) ((int)((a).xr & 0xff))
+#define xr_k2_of(a) ((int)(((a).xr >> 8) & 0xff))
+#define xr_ring_of(a) ((int)((unsigned)(a).xr >> 16))
+
 /* A map entry that owns no expert: rows [r0, r1) no run covers ([0, off[0]) and [off[n_expert], T)), zeroed. */
 #define EXL3R4D_PF_ZERO 0xffffffffu
 

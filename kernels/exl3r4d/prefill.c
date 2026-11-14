@@ -26,22 +26,47 @@
  * 0 / 1 are what they were (no K = 2.5 launch changes). */
 static volatile int g_fn4_x3d = 0;
 int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
+/* LEVER XR (ds41-etp-xr-plug, 14.11.2026): fn4 switch "exl3_xr" 0 .. 7 -- gate_up's map form (exl3r4d_prefill.hip, lever XR):
+ * bits 0-1 the order of a chunk's groups (0 longest first as before, 1 VRAM-read first, 2 host-read first), bit 2 the
+ * ring copy (with order 1; only where the op was declared with `xring` MiB of ring). 0 at start = today's launches. */
+static volatile int g_fn4_xr = 0;
+#if !defined(EXL3R4D_NO_XR)
+int exl3r4d_xr_pools(int n, const unsigned long long* lo, const unsigned long long* hi);   /* exl3r4d_prefill.hip */
+#endif
+/* The engine's host pools, per rank (radiance core: Mover::pool_ranges, called once a rank at start): [lo, hi) as the
+ * cards address them. exl3r4d_xr_pools keeps the union and writes it to every card's copy of the kernels' globals.
+ * Returns the ranges kept so far (at most 32), or a negative RAD_E_*. */
+static volatile int g_xr_pools_n[64];
+__attribute__((visibility("default"))) int rad_host_pool_ranges(int rank, int n, const unsigned long long* lo,
+                                                                const unsigned long long* hi) {
+#if !defined(EXL3R4D_NO_XR)
+    const int k = exl3r4d_xr_pools(n, lo, hi);
+    if (rank >= 0 && rank < 64) g_xr_pools_n[rank] = k;
+    return k;
+#else
+    (void)rank; (void)n; (void)lo; (void)hi;
+    return 0;
+#endif
+}
 /* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
  * with that prefill.c is a union of the name lists in one set of the three functions. */
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 4 ? 1 : -1;   /* K25U: 2 .. 4 */
+    if (!strcmp(name, "exl3_xr")) return value >= 0 && value <= 7 ? 1 : -1;    /* lever XR */
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
     const int ok = rad_fn4_accepts(name, value);
     if (ok <= 0) return ok;
     if (!strcmp(name, "exl3_x3d")) g_fn4_x3d = value;
+    if (!strcmp(name, "exl3_xr")) g_fn4_xr = value;
     return 1;
 }
 __attribute__((visibility("default"))) int rad_fn4_value(const char* name, int* applied) {
     if (!name || !applied) return 0;
     if (!strcmp(name, "exl3_x3d")) { *applied = g_fn4_x3d; return 1; }
+    if (!strcmp(name, "exl3_xr")) { *applied = g_fn4_xr; return 1; }
     return 0;
 }
 #if EXL3R4D_ROUTEDUMP
@@ -163,9 +188,21 @@ static int64_t map_bytes(const Exl3Geom* g, int64_t T, int run) {
     if (run) return 0;
     return map_only_bytes(g, T) + ctab_bytes(g, T, run) + (lpt(g, run) ? round256(4 * map_entries(g, T)) : 0);
 }
-static int64_t pf_bytes(const Exl3Geom* g, int64_t T) {
+/* LEVER XR: the op's `xring` MiB (v10), gate_up of two classes only; 0 = none. */
+static int64_t xring_mb(const RadArgs* a, const Exl3Geom* g) {
+    if (!g->gate_up || g->n_class != 2) return 0;
+    const int64_t v = rad_param_geti(a->p, a->n_p, "xring", 0);
+    return v > 0 && v <= 1024 ? v : 0;
+}
+/* XR's tables (xoff, xhead, xflag, xlist: an entry each; xcnt: 64 chunks) then the ring, after the order array -- the
+ * layout exl3r4d_prefill.hip's xr_tab / xr_ring read. Only where the map form keeps an order array. */
+static int64_t xr_bytes(const Exl3Geom* g, int64_t T, int run, int64_t mb) {
+    if (run || !lpt(g, run) || mb <= 0) return 0;
+    return round256(4 * (4 * map_entries(g, T) + 64)) + (mb << 20);
+}
+static int64_t pf_bytes(const Exl3Geom* g, int64_t T, int64_t mb) {
     const int run = run_form(g, T);
-    return rows_bytes(g, T, run) + map_bytes(g, T, run);
+    return rows_bytes(g, T, run) + map_bytes(g, T, run) + xr_bytes(g, T, run, mb);
 }
 
 /* `op`: EXL3_GATE_UP or EXL3_DOWN, or its _mod4 form (v6). */
@@ -199,7 +236,8 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
         const int64_t R = chunk_rmax(&g, T, run), xrows = R ? R + fm_of(&g, run) : T;
         if (!rot_am(am) && xrows * xr_pitch * 2 >= ((int64_t)1 << 32)) return RAD_E_SHAPE;
     }
-    const int64_t need = rows_bytes(&g, T, run) + map_bytes(&g, T, run);
+    const int64_t xmb = xring_mb(a, &g), xrb = xr_bytes(&g, T, run, xmb);
+    const int64_t need = rows_bytes(&g, T, run) + map_bytes(&g, T, run) + xrb;
     if (need > 0 && (!a->scratch || a->scratch_bytes < need)) return RAD_E_SCRATCH;
     if (need > 0 && !rad_ptr_aligned(a->scratch, 16)) return RAD_E_ALIGN;   /* the map's 16-byte entries */
     d.g.xr = dn_prerot(&g) ? (void*)d.g.x : rot_am(am) ? 0 : a->scratch;
@@ -213,6 +251,15 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     d.ystream = ystream(&g, T, d.g.y_cols, run, am);
     d.order = lpt(&g, run) && !rot_am(am) && am == 0
                   ? (uint32_t*)((char*)d.map + map_only_bytes(&g, T) + ctab_bytes(&g, T, run)) : 0;
+    /* LEVER XR (fn4 exl3_xr): the order (bits 0-1) wherever the order array is; the ring (bit 2, order 1) where the op
+     * carries one. 0: the launch as before. */
+    {
+        const int v = g_fn4_xr;
+        int mode = 0;
+        if (v && d.order && g.n_class == 2) mode = (v & 4) && xrb > 0 ? 5 : (v & 3) == 3 ? 0 : (v & 3);
+        const int ring = mode & 4 ? (int)xmb : 0;
+        d.xr = (int32_t)((uint32_t)mode | ((uint32_t)exl3_k2(g.bits) << 8) | ((uint32_t)ring << 16));
+    }
     {
         const int64_t R = chunk_rows(&g, T, run);
         if (R) {   /* the scratch cap: chunks by row; a chunk's entries <= R / fm + 1 whole-or-partial entries of the
@@ -260,7 +307,7 @@ int64_t exl3r4d_pf_scratch(const RadArgs* a, int op) {
     if (decode_like(gate_up, T, g.n_expert)) return dec;
     /* Every form a launch in the band can take, at its largest T: the run form up to the crossover, the map form
      * above it; both grow with T. */
-    int64_t need = pf_bytes(&g, T);
+    int64_t need = pf_bytes(&g, T, xring_mb(a, &g));
     const int64_t Tr = run_rn(gate_up, g.bits) * g.n_expert / EXL3R4D_PF_RD;   /* the run form's largest T */
     if (Tr < T) {
         const int64_t r = rows_bytes(&g, Tr, 1);
