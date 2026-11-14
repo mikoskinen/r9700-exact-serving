@@ -2474,9 +2474,9 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
  *   - hc_codes is hc_read's own codes stage over the gathered x (hc_quant_group: the same amax, scale and packing as the
  *     read's finisher and the decode form's B3).
  * So a step takes it only when every rank's part of every prefill segment is whole or more than 64 rows, every segment is
- * within the pinned reads' band, and nothing between the layers reads other rows of the wide stream (the PLE at a later
- * layer would: its convolution mixes rows; Flash-Next's PLE is at layer 0, before the first read). Steps without a prefill
- * segment (decode) and everything else keep step_serial. */
+ * within the pinned reads' band. The PLE reads every row of the wide stream and its convolution mixes rows, so the layers
+ * before it (Flash-Next's PLE is blk.1: layer 0) run replicated as step_serial runs them and the split starts at its layer's
+ * read. Steps without a prefill segment (decode) and everything else keep step_serial. */
 struct SpSer {
     struct Part { int64_t a = 0, n = 0, seg = 0; bool dec = false; };
     /* a run of rows [r0, r0 + n) the collectives shard whole (q = ceil(n / 4) rows a rank): this rank's rows and parts */
@@ -2517,7 +2517,10 @@ static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
     const int64_t T = batch->n_tok;
     const int mode = fn4_spser_flag().load(std::memory_order_relaxed);
     if (!m.spser_ok || g.world != 4 || mode <= 0) return false;
-    if (m.bt.on || dbg_resid_on() || m.moecfg.calib || m.ple_layer > 0 || m.media || !m.op_embed_ar) return false;
+    if (m.bt.on || dbg_resid_on() || m.moecfg.calib || m.media || !m.op_embed_ar) return false;
+    /* the PLE's convolution mixes rows of the stream: the layers up to it run replicated (step_serial_sp), so it must leave
+     * some to split */
+    if (m.ple_layer + 1 >= (int64_t)m.layers.size()) return false;
     if (!m.bi_on || m.bi_mode < 3 || m.bi_cut.size() < 2) return false;   /* the reads cut at the step's segments */
     if (T < 4 * 65 || T > m.spser_rows) return false;
     for (const Layer& l : m.layers) {
@@ -2616,11 +2619,37 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     };
     auto none = [](const SpSer::Run&) { return false; };
     const int64_t nl = (int64_t)m.layers.size();
+    /* The layers before the PLE's (Flash-Next: blk.1) run replicated as step_serial runs them: the PLE reads every row of the
+     * wide stream and its dilated convolution mixes rows, so the stream must be whole on every rank when it runs. Their
+     * all-reduces: the block's own (one run), or reduce-scatter + all-gather of the whole step on the second lane (two runs:
+     * every collective there; the raw halves fold as the exact all-reduce does). */
+    const int64_t spl0 = m.ple_layer > 0 ? m.ple_layer : 0;
+    const SpSer::Run all = [&] { SpSer::Run r; r.r0 = 0; r.n = T; return r; }();
+    auto ar_all = [&] { on1(true, [&] { rs(all); }); on1(false, [&] { ag(all); }); wait1(); };
     /* The first read on every row: nothing is reduced before it, every rank holds the whole embedding. */
     if (m.ple_layer == 0) m.ple.step(c, batch);
     bi_read_pieces(c, m, m.layers[0].hc_mix, T, false);
     for (int64_t li = 0; li < nl; ++li) {
         const Layer& l = m.layers[(size_t)li];
+        if (li < spl0) {
+            if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, !l2); }
+            else        l.gdn.step(c, batch, !l2);
+            if (l2) ar_all();
+            const bool ss_mix = l.hc_mix.write(c, T, 0, T);
+            bi_read_pieces(c, m, l.hc_ffn, T, ss_mix);
+            if (!l2) l.mlp.step(c, batch);
+            else {
+                for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows)
+                    l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
+                l.mlp.route_report(c);
+                ar_all();
+            }
+            bool ss = l.hc_ffn.write(c, T, 0, T);
+            if (l.proj.step(c, batch, 0, T)) ss = false;
+            if (li + 1 == m.ple_layer) { m.ple.step(c, batch); ss = false; }
+            bi_read_pieces(c, m, m.layers[(size_t)li + 1].hc_mix, T, ss);
+            continue;
+        }
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false); }
         else        l.gdn.step(c, batch, false);
         conn(l.hc_mix, &l.hc_ffn, none);
