@@ -523,6 +523,15 @@ int main(int argc, char** argv) {
             std::printf("perfmoe: pooled class %d: %lld of %lld experts in mapped host memory, %.2f%% of routed rows on them\n",
                         c, (long long)np, (long long)nec[c], all ? 100.0 * (double)rows / (double)all : 0.0);
         }
+        // SPEED-C: the live (routed) pooled experts a dispatch, by class -- what the GEMMs read over the link
+        double lp[EXL3_MAX_CLS] = {0}, lv[EXL3_MAX_CLS] = {0};
+        for (const Route& r : route)
+            for (int c = 0; c < nc; ++c)
+                for (int64_t x = 0; x < nec[c]; ++x)
+                    if (r.rows[(size_t)(nc * x + c)] > 0) (g_pooled[c][(size_t)x] ? lp[c] : lv[c]) += 1.0;
+        for (int c = 0; c < nc; ++c)
+            std::printf("perfmoe: POOLED-LIVE class %d: %.2f host-read and %.2f VRAM-read live experts a dispatch\n", c,
+                        lp[c] / (double)route.size(), lv[c] / (double)route.size());
     }
 
     std::vector<Lib> libs;
