@@ -58,6 +58,7 @@
 #include <hip/hip_runtime_api.h>
 
 #include <dlfcn.h>
+#include <sys/mman.h>
 
 #include <algorithm>
 #include <array>
@@ -231,9 +232,34 @@ std::vector<char> g_pooled[EXL3_MAX_CLS];   // [class][entry]: read from host me
 // --pool-block MiB (SPEED-C, 14.11.2026): every pooled entry carved from ONE pinned, mapped block of that size (256-byte
 // aligned), so the block is one host pool the library can be told about (rad_host_pool_ranges, as the engine's core does
 // at start); 0 = an allocation an entry (as before).
+// --pool-kind K: how that block is made (the link's rate from a kernel can depend on it): 0 hipHostMallocMapped (as the
+// per-entry path), 1 + hipHostMallocNonCoherent (coarse-grained), 2 + hipHostMallocCoherent (fine-grained), 3 the engine's
+// way as far as HIP goes -- private anonymous memory, MADV_HUGEPAGE, touched, then hipHostRegister(Mapped) (core/device/
+// aql.cpp: huge pages, fine-grained lock), 4 as 3 without MADV_HUGEPAGE (4 KiB pages).
+int g_pblk_kind = 0;
 size_t g_pblk_cap = 0, g_pblk_used = 0;
 char* g_pblk_h = nullptr;
 char* g_pblk_d = nullptr;
+void pblk_alloc() {
+    const unsigned fl[3] = { hipHostMallocMapped, hipHostMallocMapped | hipHostMallocNonCoherent,
+                             hipHostMallocMapped | hipHostMallocCoherent };
+    if (g_pblk_kind >= 0 && g_pblk_kind <= 2) {
+        ck(hipHostMalloc((void**)&g_pblk_h, g_pblk_cap, fl[g_pblk_kind]), "hipHostMalloc (pool block)");
+    } else if (g_pblk_kind == 3 || g_pblk_kind == 4) {
+        void* p = mmap(nullptr, g_pblk_cap + (2u << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) die("mmap (pool block)");
+        char* q = (char*)(((uintptr_t)p + (2u << 20) - 1) & ~(uintptr_t)((2u << 20) - 1));
+        if (g_pblk_kind == 3 && madvise(q, g_pblk_cap, MADV_HUGEPAGE) != 0) std::printf("perfmoe: MADV_HUGEPAGE refused\n");
+        std::memset(q, 0, g_pblk_cap);
+        ck(hipHostRegister(q, g_pblk_cap, hipHostRegisterMapped), "hipHostRegister (pool block)");
+        g_pblk_h = q;
+    } else {
+        die("--pool-kind is 0 .. 4");
+    }
+    ck(hipHostGetDevicePointer((void**)&g_pblk_d, g_pblk_h, 0), "hipHostGetDevicePointer (pool block)");
+    std::printf("perfmoe: pool block %.0f MiB, kind %d, host %p, card %p\n", g_pblk_cap / 1048576.0, g_pblk_kind,
+                (void*)g_pblk_h, (void*)g_pblk_d);
+}
 void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
     std::vector<void*> p((size_t)n);
     for (int64_t i = 0; i < n; ++i) {
@@ -242,10 +268,7 @@ void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
         void* h = nullptr;
         void* hd = nullptr;
         if (g_pblk_cap) {
-            if (!g_pblk_h) {
-                ck(hipHostMalloc((void**)&g_pblk_h, g_pblk_cap, hipHostMallocMapped), "hipHostMalloc (pool block)");
-                ck(hipHostGetDevicePointer((void**)&g_pblk_d, g_pblk_h, 0), "hipHostGetDevicePointer (pool block)");
-            }
+            if (!g_pblk_h) pblk_alloc();
             const size_t sz = (stride + 255) / 256 * 256;
             if (g_pblk_used + sz > g_pblk_cap) die("--pool-block is too small for the pooled entries");
             h = g_pblk_h + g_pblk_used;
@@ -351,6 +374,7 @@ int main(int argc, char** argv) {
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
         else if (a == "--pool-block") g_pblk_cap = (size_t)std::atoll(nx()) << 20;
+        else if (a == "--pool-kind") g_pblk_kind = std::atoi(nx());
         else if (a == "--fn4") {
             const std::string v = nx();
             const size_t eq = v.find('=');
