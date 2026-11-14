@@ -382,6 +382,13 @@
  *                   the finish kernel's bytes, one launch fewer; not where ds41_mix_wv's wide form acts); 0 the split
  *                   and finish launches (today). RADIANCE_DS41_MIX_FIN=1 at load starts it on. GET "fuse".mixfin_*
  *                   counts its launches (every rank).
+ *   ds41_moe1       deepseek41 (lever P, ds41-p1pass; 72 here after ds41_wmk, 71 on ds41-p1pass): 1 a step that is ONE decode segment of
+ *                   17 .. 48 rows runs its MoE as ONE pass -- the router, the shared arm, the gather and the all-reduce
+ *                   once, the routed EXL3 experts through moe_exl3_gate_up_dk / moe_exl3_down_dk (the decode kernels over
+ *                   the whole pass: an expert decoded once), which write per (token, slot) the bytes of the <= 16-row
+ *                   pieces ds41_bi 2 / 4 / 6 issue; 0 the pieces (today). A step with a prefill segment keeps the pieces.
+ *                   RADIANCE_DS41_MOE1=0 / 1 declares the two ops beside every trunk layer's EXL3 pair and starts at
+ *                   that value; unset declares nothing and 1 is refused. Exact (a decode row keeps its alone bytes).
  *   route_copy_ov   core (lever RCO, ds41-launch; 70 here (68 on ds41-launch), after ds41_mix_fin; Ctx::haz_mark at recording): 0 off (today:
  *                   a routed layer's report copy -- the card-side copy of its expert counts into the routing row,
  *                   Ctx::route_report_impl -- is an op-less dispatch, so haz_mark plays it ordered AND opaque, and the
@@ -396,6 +403,15 @@
  *                   every pass (the epoch), as aql_acq's does. RADIANCE_AQL_ROUTE_OV=1 at start starts it on. GET "rco":
  *                   in_force, and since start the passes recorded under it, the copies tracked and the dispatches after
  *                   one that play unordered (each recording counts once).
+ *   ds41_wmk        libr4d (lever WMK, ds41-wmk2; 71 here, after route_copy_ov): 1 every dense GGUF GEMM of <= 48 rows
+ *                   (gemm_nt_ggml, logits_gemm_ggml, gemm_nt_ggml_pair as one launch, the K1 folds a / e after their
+ *                   producer's own launch) in the part-order WMMA form (gg_wk_kernel: K split into P = 8 / 4 / 2 / 1 parts
+ *                   by K alone, each part the WMMA form's arithmetic, the parts' f32 partials added in part order and
+ *                   rounded once). A ONE-TIME REFERENCE CHANGE (user OK 13.11.2026): the bytes are not the decode band's;
+ *                   a row's bytes do not depend on M, its place or the launch geometry. Above 48 rows the stock WMMA /
+ *                   GPF forms run as before. 0 = today's paths. RADIANCE_DS41_WMK=1 at load starts it on. GET "wmk":
+ *                   in_force, launches / rows issued in the form, calls declined to today's path (every rank; recorded
+ *                   passes replay without issuing).
  *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
  *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
  *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
@@ -539,7 +555,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
-              kRouteCopyOv, kSwitches };
+              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -693,6 +709,10 @@ void i11_stats(int64_t out[kI11Stats]);
  * router's launches, their rows; every rank); 0s where no plugin serves them. */
 constexpr int kFuseStats = 8;
 void fuse_stats(int64_t out[kFuseStats]);
+/* Lever WMK (ds41-wmk2): libr4d's rad_wmk_stats [0..3] (ds41_wmk now, part-order launches issued, their rows, calls declined
+ * to today's path); 0s where no plugin serves it. */
+constexpr int kWmkStats = 4;
+void wmk_stats(int64_t out[kWmkStats]);
 /* Lever E1's live counters (ds41-e1, /stats "engdd"; the plugin's rad_engdd_stats, rank 0's, cumulative): Engram layer
  * passes deduplicated, rows not computed in them, rows pooled in them, layer passes kept whole by the 48-row guard, layer
  * passes below the repeat share, steps with a deduplicated layer, layer passes with no launch above the band -- 0s and a

@@ -42,10 +42,16 @@
  *
  *  ABL != 0 (bench only, never a rule): timing ablations whose outputs DIFFER -- 1 no chain-init / min group-sum
  *  LDS reads (c0 = 0, min term 0), 2 no B decode (raw words as fragments), 4 no per-group fma (one chain a slab). */
+#ifndef R4D_GG_PF_KERNEL_ONLY
 #define R4D_GG_BLOCKS_ONLY 1
 #define R4D_GG_WM_SRC 1
 #include "r4d_ds41_ggml.hip"
 #include "r4d_ds41_ggml_pf.h"
+#endif
+/* R4D_GG_PF_KERNEL_ONLY (lever WMK, r4d_ds41_wmk.hip): this file's kernel template and its LDS / form helpers only, in a unit
+ * that already includes r4d_ds41_ggml.hip's sections; R4D_GG_PF_PARTFOLD there compiles the template with the part fold
+ * (lever WMK's part order: K's P parts by K alone, each part's chain from +0.0, the parts added in order into a running
+ * total, rounded once). Neither is defined in this unit, whose kernels keep the stock order. */
 
 #include <atomic>
 #include <cstdio>
@@ -146,6 +152,21 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
         for (int i = 0; i < NM; ++i)
 #pragma unroll
             for (int j = 0; j < NT; ++j) acc[i][j] = (gg_v8f)(0.0f);
+#ifdef R4D_GG_PF_PARTFOLD
+        /* the part order: a part is SPP slabs (S / P, P = 8 / 4 / 2 / 1 by K); the running total of the parts done, in
+         * registers, or (ABL bit 8, TS) in the lane's private scratch -- touched only at a part's end, so the K loop keeps
+         * the stock registers */
+        constexpr bool TS = (ABL & 8) != 0;
+        const int SPP = S / (S % 8 == 0 ? 8 : S % 4 == 0 ? 4 : S % 2 == 0 ? 2 : 1);
+        gg_v8f tot[TS ? 1 : NM][NT];
+        volatile float tots[TS ? NM * NT * 8 : 1];
+        if constexpr (!TS) {
+#pragma unroll
+            for (int i = 0; i < NM; ++i)
+#pragma unroll
+                for (int j = 0; j < NT; ++j) tot[i][j] = (gg_v8f)(0.0f);
+        }
+#endif
         uint32_t rE[2][NT][W::RAW], rR[NT][W::RAW];
         xload(0);
 #pragma unroll
@@ -386,6 +407,30 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
                 __builtin_amdgcn_sched_barrier(0);
             });
             lds_barrier();
+#ifdef R4D_GG_PF_PARTFOLD
+            if ((s + 1) % SPP == 0) {   /* a part ends with this slab: the first part as it is, then total + part */
+                const bool first = s + 1 == SPP;
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt) {
+                    if (!live(mt)) continue;
+#pragma unroll
+                    for (int nt = 0; nt < NT; ++nt) {
+                        if constexpr (TS) {
+#pragma unroll
+                            for (int q = 0; q < 8; ++q) {
+                                const int i = (mt * NT + nt) * 8 + q;
+                                tots[i] = first ? acc[mt][nt][q] : tots[i] + acc[mt][nt][q];
+                            }
+                        } else {
+#pragma unroll
+                            for (int q = 0; q < 8; ++q) tot[mt][nt][q] = first ? acc[mt][nt][q] : tot[mt][nt][q] + acc[mt][nt][q];
+                            gg_pin8(tot[mt][nt]);
+                        }
+                        acc[mt][nt] = (gg_v8f)(0.0f);
+                    }
+                }
+            }
+#endif
         };
         for (int s = 0; s < S; s += 2) {   /* S is even (K % 256 == 0) */
             slab(std::integral_constant<int, 0>{}, s);
@@ -402,7 +447,14 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
                     const int lr = mt * 16 + 8 * h + q, row = r0 + lr;
                     if (row >= r1) continue;
                     float v = 0.0f;
+#ifdef R4D_GG_PF_PARTFOLD
+                    if constexpr (mt < NM) {
+                        if constexpr (TS) v = tots[(mt * NT + nt) * 8 + q];
+                        else v = tot[mt][nt][q];
+                    }
+#else
                     if constexpr (mt < NM) v = acc[mt][nt][q];
+#endif
                     gg_put((OT*)A.y + (long long)row * A.y_ld + n, v);
                 }
             }
@@ -433,6 +485,9 @@ constexpr unsigned pf_lds(int mt) {
 
 constexpr int pf_code(int mt, int nt, int wn, int fi, int abl) { return 1000 * abl + 100 * mt + 10 * nt + wn / 4 + 4 * fi; }
 
+#ifdef R4D_GG_PF_KERNEL_ONLY
+}  // namespace
+#else
 bool pf_form_known(int code) {
     const int abl = code / 1000, g = code % 1000;
 #define PF_K(mt, nt, wn, fi) if (abl == 0 && g == pf_code(mt, nt, wn, fi, 0)) return true;
@@ -591,6 +646,17 @@ int r4d_gg_pf_gemm(RadStream s, const R4dGgPfCall& c) {
     return pf_launch(s, c.ty, code, c.f32out, A);
 }
 
+/* Lever WMK (r4d_ds41_wmk.hip): the form r4d_gg_pf_gemm would launch for the call (0: none, the stock kernel), without
+ * launching -- the part-order prefill rows run the same geometry. */
+int r4d_gg_pf_code(const R4dGgPfCall& c) {
+    if (c.ty != GG_Q5_K && c.ty != GG_Q6_K && c.ty != GG_Q8_0) return 0;
+    if (c.M < 1 || c.N < 1 || c.K < 2 * kWmS || c.K % (2 * kWmS)) return 0;
+    int code = g_pf_pin != 0 ? g_pf_pin : g_pf_on.load(std::memory_order_relaxed);
+    if (code == -1 || code == 1 || code == 2 || code == -2) code = pf_rule(c.ty, c.N, c.K, c.M, code == 2 || code == -2);
+    if (code == 0 || !pf_form_known(code) || code >= 1000) return 0;
+    return code;
+}
+
 /* r4d_gg_pf_pin (bench / test hook, r4d_selftest --gpcheck / --perfgp): 0 clears the pin (the runtime switch decides,
  * off by default), -1 forces the rule, -2 the rule with the row-ranged entries (lever A11), a form code (ablations
  * included) pins that form for every shape. */
@@ -637,3 +703,5 @@ int r4d_gg_pf_emu_stock(const R4dGgPfCall& c) {
     }
 }
 #endif
+
+#endif  /* R4D_GG_PF_KERNEL_ONLY */

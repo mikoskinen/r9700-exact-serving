@@ -35,7 +35,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ix_lds", "ix_ni", "ds41_arcoded", "sched_row_cap",
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
-                                        "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov" };
+                                        "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
+                                        "ds41_wmk", "ds41_moe1" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -48,7 +49,9 @@ bool plugin_switch(int i) {
            i == kArXpush ||   /* ar_xpush (63, ds41-int13): libr4d's XPUSH (the FN fn4 name, ported from fn4-x3-sp3) */
            i == kGgGemvM16 ||   /* gg_gemv_m16 (64 here, 63 on ds41-a4): libr4d (lever A4) */
            i == kDs41Rfuse ||   /* ds41_rfuse (68, ds41-fuse): deepseek41 (lever FUSE-R) */
-           i == kDs41MixFin;    /* ds41_mix_fin (69, ds41-fuse): libr4d (lever FUSE-M) */
+           i == kDs41MixFin ||  /* ds41_mix_fin (69, ds41-fuse): libr4d (lever FUSE-M) */
+           i == kDs41Wmk ||     /* ds41_wmk (71, ds41-wmk2): libr4d (lever WMK) */
+           i == kDs41Moe1;      /* ds41_moe1 (72 here, 71 on ds41-p1pass): deepseek41 (lever P) */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -72,6 +75,7 @@ struct Hooks {
     int (*mx_stats)(long long*, int) = nullptr;    /* lever 1U-MX (libr4d's rad_mx_stats, ds41-int11) */
     int (*rfuse_stats)(long long*, int) = nullptr; /* lever FUSE-R (deepseek41's rad_rfuse_stats, ds41-fuse) */
     int (*fuse_stats)(long long*, int) = nullptr;  /* levers FUSE-M / FUSE-R (libr4d's rad_fuse_stats, ds41-fuse) */
+    int (*wmk_stats)(long long*, int) = nullptr;   /* lever WMK (libr4d's rad_wmk_stats, ds41-wmk2) */
 };
 
 struct State {
@@ -196,6 +200,7 @@ void find_hooks(State& s) {
             k.mx_stats = sym<int (*)(long long*, int)>(h, "rad_mx_stats");
             k.rfuse_stats = sym<int (*)(long long*, int)>(h, "rad_rfuse_stats");
             k.fuse_stats = sym<int (*)(long long*, int)>(h, "rad_fuse_stats");
+            k.wmk_stats = sym<int (*)(long long*, int)>(h, "rad_wmk_stats");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -691,6 +696,24 @@ void fuse_stats(int64_t out[kFuseStats]) {
     fuse_collect(s, out);
 }
 
+/* Under s.mu. */
+static void wmk_collect(State& s, int64_t* out) {
+    for (int i = 0; i < kWmkStats; ++i) out[i] = 0;
+    find_hooks(s);
+    for (const Hooks& k : s.hooks) {
+        if (!k.wmk_stats) continue;
+        long long v[kWmkStats] = { 0, 0, 0, 0 };
+        const int n = k.wmk_stats(v, kWmkStats);
+        for (int i = 0; i < n && i < kWmkStats; ++i) out[i] = (int64_t)v[i];
+        if (n > 0) break;
+    }
+}
+void wmk_stats(int64_t out[kWmkStats]) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    wmk_collect(s, out);
+}
+
 int engdd_stats(int64_t out[7]) {
     for (int i = 0; i < 7; ++i) out[i] = 0;
     State& s = st();
@@ -744,7 +767,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1417,6 +1440,14 @@ std::string state_json() {
              std::to_string((long long)v[4]) + ", \"mixfin_rows\": " + std::to_string((long long)v[5]) +
              ", \"rgs_launches\": " + std::to_string((long long)v[6]) + ", \"rgs_rows\": " +
              std::to_string((long long)v[7]) + "}";
+    }
+    /* Lever WMK (ds41-wmk2): always present, 0s where no plugin serves it (wmk_stats). */
+    {
+        int64_t v[kWmkStats];
+        wmk_collect(s, v);
+        o += ", \"wmk\": {\"in_force\": " + std::to_string((long long)v[0]) + ", \"launches\": " +
+             std::to_string((long long)v[1]) + ", \"rows\": " + std::to_string((long long)v[2]) + ", \"declines\": " +
+             std::to_string((long long)v[3]) + "}";
     }
     /* Lever RCO (ds41-launch): always present; counted at recording, so 0 until a pass is recorded under it. */
     o += ", \"rco\": {\"in_force\": " + std::to_string(reported(s, kRouteCopyOv)) +

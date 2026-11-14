@@ -576,6 +576,8 @@ static void* dalloc(size_t bytes) {
  * buffers live outside dalloc because dfree_all runs between shapes. */
 constexpr int64_t kColdChunk = 4ll << 20;
 
+/* --warm MS: st_time_us holds the card at its power cap for MS before each timed loop (0: off, today's timing) */
+static double g_warm_ms = 0.0;
 template <class F>
 static double st_time_us(F&& launch, int iters, hipStream_t s) {
     if (iters <= 0) return 0.0;
@@ -583,6 +585,14 @@ static double st_time_us(F&& launch, int iters, hipStream_t s) {
         hipEvent_t e0, e1;
         st_ev_create(&e0); st_ev_create(&e1);
         for (int i = 0; i < iters; ++i) launch(i);   /* untimed: the clocks ramp up from idle */
+        if (g_warm_ms > 0) {   /* --warm MS (ds41-wmk2, 14.11.): hold the card at its power cap this long before the timed loop */
+            st_ev_record(e0, s); launch(0); launch(1); st_ev_record(e1, s); st_ev_sync(e1);
+            float m2 = 0.0f;
+            st_ev_elapsed(&m2, e0, e1);
+            const double per = std::max(0.001, (double)m2 / 2.0);
+            const long long nw = std::min(200000LL, (long long)std::ceil(g_warm_ms / per));
+            for (long long i = 0; i < nw; ++i) launch((int)(i % 1000003));
+        }
         st_ev_record(e0, s);
         for (int i = 0; i < iters; ++i) launch(i);
         st_ev_record(e1, s);
@@ -34619,6 +34629,7 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 #include "r4d_selftest_gq.inc"    /* ds41-int11: lever 1U-GQ, gemm_nt_ggml_pair vs two gemm_nt_ggml (--case gq_pair) */
 #include "r4d_selftest_fuse.inc"  /* ds41-fuse: levers FUSE-R / FUSE-M byte for byte vs the stock launches + per-call times (--case rfuse / mixfin) */
 #include "r4d_selftest_a4.inc"    /* ds41-a4: lever A4, the gg_gemv_m16 forms (--mrcheck16, --perfm16) */
+#include "r4d_selftest_wmg.inc"   /* ds41-wmgate (bench): the WMMA form at decode heights (--perfwmg, --wmgcheck) */
 
 static void device_phase(const Plugin& pl) {
     int n = 0;
@@ -38183,6 +38194,8 @@ int main(int argc, char** argv) {
     bool dsg = false; const char* dsg_m = nullptr; int dsg_it = 0; const char* dsg_t = nullptr;   /* --perfgg */
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
     bool a4c = false, a4p = false; const char* a4_out = nullptr;   /* lever A4: --mrcheck16 / --perfm16 [--m16-out FILE] */
+    bool wgc = false, wgp = false, wgk = false, wgr = false, wgf = false, wgq = false; const char* wg_m = nullptr; int wg_it = 0, wg_r = 0; const char* wg_t = nullptr;   /* ds41-wmgate: --wmgcheck / --perfwmg */
+    bool wgw = false; const char* wg_f = nullptr;   /* ds41-wmk2 stage 3: --perfwq */
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
     bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
     bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
@@ -38443,6 +38456,49 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_m = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mr_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfwmg")) {
+            /* ds41-wmgate: the WMMA form vs int16's decode band at M 1..48, D W W D rounds (wmg::perf). */
+            wgp = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_r = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfwmk")) {
+            /* ds41-wmgate: the WMMA kernel's fixed and per-slab time on synthetic shapes + lever GPF's geometries at M 1 / 16 (wmg::scan). */
+            wgk = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_r = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--warm") && i + 1 < argc) {
+            /* ds41-wmk2: a warm burst of this many ms before every st_time_us timed loop (the power-capped steady state) */
+            g_warm_ms = std::strtod(argv[++i], nullptr);
+        } else if (!std::strcmp(argv[i], "--wmk") && i + 1 < argc) {
+            /* ds41-wmk: the W arm of --perfwmg / --wmgcheck is gg_wk_kernel under these bench pin codes. */
+            for (int64_t c : wmg::ilist(argv[++i], "")) if (c > 0) wmg::g_wk_codes.push_back((int)c);
+        } else if (!std::strcmp(argv[i], "--perfwkpf")) {
+            /* ds41-wmk2 stage 3: the prefill rows, int16's forms vs the part order (wmg::wkpf_perf). */
+            wgq = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfwq")) {
+            /* ds41-wmk2 stage 3: W's prefill forms (gg_wq_kernel) vs int16's stock WMMA kernel, one session (wmg::wq_perf). */
+            wgw = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_f = argv[++i];
+        } else if (!std::strcmp(argv[i], "--wmkref")) {
+            /* ds41-wmk2 (FINDINGS F2): D and W against an f64 host reference (wmg::refcheck). */
+            wgf = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--wmkroute")) {
+            /* ds41-wmk2: lever WMK's engine path (fn4 ds41_wmk 1) on every dense op row, M 1..49 (wmg::route). */
+            wgr = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--wmgcheck")) {
+            /* ds41-wmgate: a row's WMMA bytes vs M and its place in the launch (wmg::check). */
+            wgc = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
         } else if (!std::strcmp(argv[i], "--m16-out") && i + 1 < argc) {
             a4_out = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfmr")) {
@@ -38725,6 +38781,22 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("lever BI per-op check", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
+    }
+    if (wgc || wgp || wgk || wgr || wgf || wgq || wgw) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        if (wgc) { if (wmg::g_wk_codes.empty()) wmg::check(pl, wg_t); else wmg::checkk(pl, wg_t); }
+        if (wgp) wmg::perf(pl, wg_m, wg_it, wg_r, wg_t);
+        if (wgk) wmg::scan(pl, wg_it, wg_r);
+        if (wgr) wmg::route(pl, wg_t);
+        if (wgf) wmg::refcheck(pl, wg_t);
+        if (wgq) wmg::wkpf_perf(pl, wg_m, wg_it, wg_t);
+        if (wgw) wmg::wq_perf(pl, wg_m, wg_it, wg_t, wg_f);
+        dfree_all();
+#else
+        skip("ds41-wmgate bench", "built without HIP");
 #endif
         return g_fail ? 1 : 0;
     }

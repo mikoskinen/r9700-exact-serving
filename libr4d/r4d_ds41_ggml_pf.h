@@ -42,4 +42,7 @@ int r4d_gg_pf_get();
 /* Whether `v` is a value gg_pf takes. */
 int r4d_gg_pf_known(int v);
 
+/* Lever WMK (ds41-wmk2): the form r4d_gg_pf_gemm would launch for c (the switch / pin / rule as they stand; 0 = none). */
+int r4d_gg_pf_code(const R4dGgPfCall& c);
+
 #endif
