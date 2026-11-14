@@ -320,13 +320,32 @@ static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
   constexpr int NB = 64;
   __shared__ int s_n[2][NB], s_o[2][NB];   // entries a bucket, then the bucket's next free position; [1]: host-read (XR)
   __shared__ int s_hs;                     // XR: the chunk's first host-read position
+  __shared__ int s_nv, s_nh;               // SPEED-C (order 3): the chunk's VRAM-read / host-read entries
   const int E = (int)a.map[0], nch = a.chunk_n > 1 ? a.chunk_n : 1;
   const uint4* ent = (const uint4*)a.map + 1;
 #if EXL3R4D_XR_ON
   const int mode = xr_mode_of(a) & 3, ring = (xr_mode_of(a) & 4) != 0 && xr_ring_of(a) > 0 && mode == 1 && nch <= 64;
+  const long long f4 = 4 - ((xr_mode_of(a) >> 3) & 3);   // order 3's span: the host-read entries over f4 / 4 of the chunk
 #else
   const int mode = 0, ring = 0;
+  const long long f4 = 4;
 #endif
+  // SPEED-C ORDER 3 (interleave): each set longest first as in orders 1 / 2, then the two merged so the host-read entries
+  // sit evenly over the first f4 / 4 of the chunk's positions -- VRAM-read entry i (of nv) at key (i + 1/2) / nv, host-read
+  // entry j (of nh) at f4 / 4 x (j + 1/2) / nh, a tie host first; an entry's position = its rank in the merge. A
+  // permutation of the same entries (each computes its rows alone: the order changes no byte, LPT's argument), so the
+  // GEMM's workgroups that stream a host pool's codes run beside the resident ones instead of after them.
+  auto merged = [&](int h, int q) -> int {
+    const long long nv = s_nv, nh = s_nh;
+    if (mode != 3 || !nv || !nh) return q;
+    if (!h) {   // + host entries with key <= v_q: (2j + 1) nv f4 <= (2q + 1) nh 4
+      const long long x = (2LL * q + 1) * nh * 4, r = x / (nv * f4);
+      return q + (int)min(nh, (r + 1) / 2);
+    }
+    // + VRAM entries with key < h_q: (2i + 1) nh 4 < (2q + 1) nv f4
+    const long long y = (2LL * q + 1) * nv * f4, r = (y - 1) / (nh * 4);
+    return q + (int)min(nv, (r + 1) / 2);
+  };
   auto blocks = [&](int i) { return ((int)(ent[i].z - ent[i].y) + 15) / 16; };
   // XR: whether entry i's expert is read from a host pool (its codes in a pool the engine named); mode 0: never asked
   auto host = [&](int i) {
@@ -365,7 +384,9 @@ static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
       for (int k = 0; k < 2; k++) {
         const int h = k ? 1 - first : first;
         if (k == 1) s_hs = o;
+        if (mode == 3) o = 0;   // order 3: positions in each set from 0, merged below
         for (int b = NB - 1; b >= 0; b--) { s_o[h][b] = o; o += s_n[h][b]; }
+        if (mode == 3) (h ? s_nh : s_nv) = o;
       }
     }
     __syncthreads();
@@ -373,8 +394,13 @@ static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
       int n;
       const int b = group(i, n);
       if (!n) continue;
-      const int o = atomicAdd(&s_o[host(i)][b], n);
-      for (int j = 0; j < n; j++) a.order[o + j] = (unsigned)(i + j);
+      const int h = host(i);
+      const int o = atomicAdd(&s_o[h][b], n);
+      if (mode == 3) {
+        for (int j = 0; j < n; j++) a.order[lo + merged(h, o + j)] = (unsigned)(i + j);
+      } else {
+        for (int j = 0; j < n; j++) a.order[o + j] = (unsigned)(i + j);
+      }
     }
     __syncthreads();
     if (ring) {

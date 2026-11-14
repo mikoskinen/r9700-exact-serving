@@ -28,7 +28,11 @@ static volatile int g_fn4_x3d = 0;
 int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
 /* LEVER XR (ds41-etp-xr-plug, 14.11.2026): fn4 switch "exl3_xr" 0 .. 7 -- gate_up's map form (exl3r4d_prefill.hip, lever XR):
  * bits 0-1 the order of a chunk's groups (0 longest first as before, 1 VRAM-read first, 2 host-read first), bit 2 the
- * ring copy (with order 1; only where the op was declared with `xring` MiB of ring). 0 at start = today's launches. */
+ * ring copy (with order 1; only where the op was declared with `xring` MiB of ring). 0 at start = today's launches.
+ * SPEED-C (ds41-etp-spc-plug, 15.11.2026): values 0 .. 31. Order 3 (bits 0-1 = 3, bit 2 clear; XR read 3 as 0) = INTERLEAVE:
+ * each set longest first, the host-read entries spread evenly over the first (4 - s) / 4 of the chunk's positions, s =
+ * bits 3-4 (3 = even over the whole chunk, 11 = the first 3/4, 19 = the first half, 27 = the first quarter). The same
+ * entries in another order: the same bytes. Values with bits 3-4 and another order act as their bits 0-2. */
 static volatile int g_fn4_xr = 0;
 unsigned long long* exl3r4d_xr_rank_init(int rank);   /* exl3r4d_prefill.hip: the rank's device counters */
 void exl3r4d_xr_note(int rank, void* stream);        /* exl3r4d_prefill.hip: the counters' print, now and then */
@@ -52,7 +56,7 @@ __attribute__((visibility("default"))) int rad_host_pool_ranges(int rank, int n,
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 4 ? 1 : -1;   /* K25U: 2 .. 4 */
-    if (!strcmp(name, "exl3_xr")) return value >= 0 && value <= 7 ? 1 : -1;    /* lever XR */
+    if (!strcmp(name, "exl3_xr")) return value >= 0 && value <= 31 ? 1 : -1;   /* lever XR; SPEED-C 8 .. 31 */
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
@@ -255,7 +259,8 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     {
         const int v = g_fn4_xr;
         int mode = 0;
-        if (v && d.order && g.n_class == 2) mode = (v & 4) && xrb > 0 ? 5 : (v & 3) == 3 ? 0 : (v & 3);
+        if (v && d.order && g.n_class == 2)
+            mode = (v & 4) && xrb > 0 ? 5 : (v & 7) == 3 ? 3 | (v & 0x18) : (v & 3) == 3 ? 0 : (v & 3);
         const int ring = mode & 4 ? (int)xmb : 0;
         d.xr = (int32_t)((uint32_t)mode | ((uint32_t)exl3_k2(g.bits) << 8) | ((uint32_t)ring << 16));
         if (mode && a->rank >= 0 && a->rank < XR_RANKS) {
