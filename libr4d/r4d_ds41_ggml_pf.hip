@@ -62,8 +62,16 @@
 
 namespace {
 
+/* Lever WMK's part-fold build only (R4D_GG_PF_PARTFOLD, r4d_ds41_wmk.hip): ABL bit 16 asks the compiler for the stock occupancy
+ * (amdgpu_waves_per_eu 6: <= 240 VGPRs) -- the fold's running total otherwise costs a block a WGP. This unit's own kernels carry no
+ * attribute (int16's code objects unchanged). */
+#ifdef R4D_GG_PF_PARTFOLD
+#define R4D_PF_OCC(ABL) __attribute__((amdgpu_waves_per_eu(((ABL) & 16) ? 6 : 1)))
+#else
+#define R4D_PF_OCC(ABL)
+#endif
 template <int T, int MT, int NT, int WN, typename OT, int ABL, int FI>
-__global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
+__global__ __launch_bounds__(WN * 32) R4D_PF_OCC(ABL) void gg_pf_kernel(GgTiledArgs A) {
     using W = Wq<T>;
     using Pf = typename W::Pf;
     constexpr int NTH = WN * 32;

@@ -1583,6 +1583,7 @@ bool wq_known(int code) {
  * `form` (the one gg_pf would pick, 0 = the stock geometry 322); a form not built here with the part fold runs 322. The
  * geometry moves time, never bytes (each output's operations are the part order's in every form). */
 namespace {
+#define WKPF_OCC_FORMS(X) X(4, 2, 8, 1) X(4, 2, 8, 0) X(3, 2, 8, 1) X(3, 2, 8, 0)   /* 5426 / 5422 / 5326 / 5322 */
 #define WKPF_FORMS(X) X(3, 2, 8, 0) X(4, 2, 8, 0) X(4, 2, 8, 1) X(3, 2, 8, 1) X(3, 2, 4, 0) X(2, 2, 8, 0) \
     X(4, 1, 16, 0) X(4, 1, 16, 1) X(2, 1, 16, 0)   /* one column tile a wave, 16 waves: half the accumulators a lane (the fold's total fits) */
 /* The running total in registers (measured 14.11., --perfwkpf, one card: the scratch-held total TS costs +30..110 % a launch,
@@ -1612,10 +1613,14 @@ int wkpf_form_tab(int ty, long long N, long long K) {
     return kWkpfType(ty);
 }
 template <int T, int MT, int NT, int WN, int FI>
-int wkpf_launch_f(RadStream s, bool f32out, const GgTiledArgs& A) {
+int wkpf_launch_f(RadStream s, bool f32out, const GgTiledArgs& A, bool occ = false) {
     const dim3 grid((unsigned)((A.M + 16 * MT - 1) / (16 * MT)), (unsigned)((A.N + 16 * NT * WN - 1) / (16 * NT * WN)));
     if (grid.y > 65535u) return R4D_WK_DECLINE;
     const unsigned lds = pf_lds<T>(MT);
+    if (occ) {   /* 5000 + form: the GPF form with the stock occupancy asked (ABL 16) */
+        if (f32out) return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, float, 16, FI>), grid, dim3(32 * WN), lds, A);
+        return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, uint16_t, 16, FI>), grid, dim3(32 * WN), lds, A);
+    }
     const bool ts = g_wkpf_ts == 2;
     if (ts) {
         if (f32out) return R4D_EMIT(s, (gg_pf_kernel<T, MT, NT, WN, float, 8, FI>), grid, dim3(32 * WN), lds, A);
@@ -1637,6 +1642,10 @@ int wkpf_launch_t(RadStream s, int code, bool f32out, const GgTiledArgs& A) {
 #define WKPF_L(mt, nt, wn, fi) if (code == pf_code(mt, nt, wn, fi, 0)) return wkpf_launch_f<T, mt, nt, wn, fi>(s, f32out, A);
     WKPF_FORMS(WKPF_L)
 #undef WKPF_L
+    /* 5000 + a GPF form: the same form compiled with the stock occupancy asked (stage 3; the fold's total at <= 240 VGPRs) */
+#define WKPF_O(mt, nt, wn, fi) if (code == 5000 + pf_code(mt, nt, wn, fi, 0)) return wkpf_launch_f<T, mt, nt, wn, fi>(s, f32out, A, true);
+    WKPF_OCC_FORMS(WKPF_O)
+#undef WKPF_O
     return wkpf_launch_f<T, 3, 2, 8, 0>(s, f32out, A);   /* 322, the stock geometry */
 }
 std::atomic<int> g_wkpf_last{0};
