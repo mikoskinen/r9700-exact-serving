@@ -260,6 +260,40 @@ int main(int argc, char** argv) {
     rad_f32dec_stats(s1, 2);
     check(s1[0] == s0[0] && s1[1] == s0[1], "SPD-F ds41_f32dec 0, unpinned: no call takes a non-stock form",
           fmt("router %lld -> %lld, gemm %lld -> %lld", s0[0], s1[0], s0[1], s1[1]));
+    /* the built-in table under ds41_f32dec 1 (unpinned): 17+ rows take a non-stock form of both kinds (router 8, gemm 4), <= 8 rows
+     * the stock forms; the bytes are the stock form's */
+    {
+        long long a0[2] = { 0, 0 }, a1[2] = { 0, 0 }, a2[2] = { 0, 0 };
+        rad_f32dec_stats(a0, 2);
+        r4d_f32dec_set(1);
+        gemm(33, 264, 1280, 1);   /* pins 0 (stock) then each form: the counter moves on the pinned forms only */
+        rad_f32dec_stats(a1, 2);
+        const int64_t M = 33, N = 264, K = 1280;
+        std::vector<uint16_t> x = rows_x(M, K, false), w((size_t)(N * K));
+        for (auto& v : w) v = bf((float)(gauss() * 0.02));
+        std::vector<float> y0((size_t)(M * N)), y1((size_t)(M * N)), y8((size_t)(8 * N));
+        std::vector<RadParam> pg = { pint("M", M), pint("N", N), pint("K", K), pstr("dtype", "bf16") };
+        auto go = [&](std::vector<float>& y, int64_t m, int pin) {
+            std::vector<RadParam> p = { pint("M", m), pint("N", N), pint("K", K), pstr("dtype", "bf16") };
+            std::vector<RadTensor> t = { tens(x.data(), RAD_BF16, { m, K }), tens(w.data(), RAD_BF16, { N, K }), tens(y.data(), RAD_F32, { m, N }) };
+            RadArgs a = mkargs(t, p);
+            r4d_f32dec_pin(-1, pin);
+            const int rc = r4d_rad_gemm_nt_f32(&a, nullptr);
+            r4d_f32dec_pin(-1, -1);
+            return rc;
+        };
+        rad_f32dec_stats(a1, 2);
+        const int rs = go(y0, M, 0), rr = go(y1, M, -1);   /* stock, then the switch's rule */
+        long long b1[2] = { 0, 0 };
+        rad_f32dec_stats(b1, 2);
+        const int r8 = go(y8, 8, -1);                      /* 8 rows: the rule's stock band */
+        rad_f32dec_stats(a2, 2);
+        r4d_f32dec_set(0);
+        check(rs == RAD_OK && rr == RAD_OK && r8 == RAD_OK && ndiff(y0, y1) == 0 && b1[1] == a1[1] + 1 && a2[1] == b1[1],
+              "SPD-F ds41_f32dec 1, the built-in table: gemm_nt_f32 at 33 rows takes a non-stock form, the stock bytes; 8 rows the stock form",
+              fmt("rc %d %d %d, %lld differing words, gemm counter %lld -> %lld -> %lld", rs, rr, r8, ndiff(y0, y1), a1[1], b1[1], a2[1]));
+        (void)a0;
+    }
     std::printf("%d cases, %d failed\n", g_cases, g_fail);
     return g_fail ? 1 : 0;
 }

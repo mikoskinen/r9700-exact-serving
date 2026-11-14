@@ -312,9 +312,15 @@ int r4d_f32dec_set(int v) {
 int r4d_f32dec_get() { return g_f32dec.load(std::memory_order_relaxed); }
 
 /* The rule (switch 1 / 2 / 3): a form per height band -- rows <= 8, 9 .. 16, 17 .. 48 (the router) / 63 (gemm_nt_f32) -- by the
- * one-card bench (SPEED-D, r4d_selftest --case spdf32). RADIANCE_DS41_F32DEC_FORMS=r1,r2,r3,g1,g2,g3 at load replaces the table
- * (an A/B knob; 0 = the stock form in that band; a code the band's kind does not have = the stock form there). */
-static int g_f32dec_rule[6] = { 0, 0, 0, 0, 0, 0 };
+ * one-card bench (SPEED-D b1, 15.11.2026, r4d_selftest --case spdf32 on gpu02 03:00, us a call warm / cold):
+ *   router (K 5120, 384 experts): <= 8 the stock 2x2 (no form beats it warm and cold); 9-16 form 3, 4x4 U8 16 waves (16 rows
+ *     26.0 / 30.1 -> 22.4 / 28.8); 17-48 form 8, 4x8 U8 16 waves (32 rows 47.8 / 51.6 -> 33.8 / 41.0, 47 rows 96.2 / 100.0 ->
+ *     51.8 / 54.6);
+ *   gemm_nt_f32 (the compressor, N 1024): <= 8 the stock; 9-16 form 30, tiled 8x4 a wave, 2x4 waves (16 rows 40.4 / 50.0 ->
+ *     25.9 / 32.2); 17-63 form 4, 4x8 U8 (32 rows 204.6 / 292.7 -> 41.0 / 51.5, 47 rows 304.8 / 420.2 -> 59.5 / 60.3).
+ * RADIANCE_DS41_F32DEC_FORMS=r1,r2,r3,g1,g2,g3 at load replaces the table (an A/B knob; 0 = the stock form in that band; a code the
+ * band's kind does not have = the stock form there). */
+static int g_f32dec_rule[6] = { 0, 3, 8, 0, 30, 4 };
 static bool f32dec_rule_load() {
     const char* e = std::getenv("RADIANCE_DS41_F32DEC_FORMS");
     if (!e || !*e) return true;
