@@ -89,6 +89,10 @@
  *                   one half's collectives on the second lane beside the other half's write and read; 0 today
  *                                                                                                 RADIANCE_FN4_SPSERIAL
  *
+ *   hc_pinpf2       libr4d (rad_fn4_switch): fn4 SP-serial (14.11.2026) -- a read whose K split is pinned to a taller height
+ *                   (SP's part reads) takes the PF2 form below 512 rows too, where its band holds the planes; the same bytes
+ *                   (PF2 = the wide form at one split); 0 today                                   RADIANCE_FN4_HC_PINPF2
+ *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
  *
@@ -108,7 +112,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

@@ -156,6 +156,7 @@ struct Plugin {
     void (*readv_hc)(int) = nullptr;       /* optional (fn4 hc_readv) */
     void (*pf2_stages_hc)(int) = nullptr;  /* optional (fn4 hc_readv timing) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
+    void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
@@ -236,6 +237,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->readv_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_readv");
     pl->pf2_stages_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_pf2_stages");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
+    pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
@@ -21208,13 +21210,15 @@ static void hc_spq_check(const Plugin& pl, int mask) {
                                   1025, 1073, 1080, 1100, 1135, 1144, 1162, 1200, 1300, 1400, 1536, 1537, 1700, 1900, 1920, 1921,
                                   2000, 2048 };
     static const int64_t kTd[] = { 0, 32, 64, 128 };
-    for (int arm = 0; arm < 3; ++arm) {
-        if (!(mask & (1 << arm))) continue;
+    for (int arm = 0; arm < 4; ++arm) {
+        if (!(mask & (arm == 3 ? 16 : (1 << arm)))) continue;
+        if (arm == 3 && !pl.pinpf2_hc) { skip("SP-serial part reads, arm 3", "no r4d_hc_read_pinpf2"); continue; }
         const bool ss = arm == 1;
         const int rv = arm == 2 ? 0 : (331 | (ss ? 8 : 0));
         pl.readv_hc(rv);
         pl.norm_hc_wave(arm == 2 ? 0 : 1);
         pl.upmix_hc(arm == 2 ? 0 : 5);
+        if (pl.pinpf2_hc) pl.pinpf2_hc(arm == 3 ? 1 : 0);
         int cases = 0, same = 0, ctl_cases = 0, ctl_diff = 0;
         std::string bad;
         for (int64_t h : kH) for (int64_t td : kTd) {
@@ -21246,7 +21250,8 @@ static void hc_spq_check(const Plugin& pl, int mask) {
         }
         std::printf("SPQCHECK arm %s: %d / %d cases every output byte identical (pinned parts vs the segment read whole)%s; "
                     "control (parts unpinned): %d / %d cases differ\n",
-                    arm == 0 ? "engine (hc_readv 331, F1n, hc_upmix 5)" : arm == 1 ? "engine + ss (hc_readv 339)" : "stock",
+                    arm == 0 ? "engine (hc_readv 331, F1n, hc_upmix 5)" : arm == 1 ? "engine + ss (hc_readv 339)"
+                    : arm == 3 ? "engine + hc_pinpf2 (pinned parts below 512 rows through PF2)" : "stock",
                     same, cases, bad.empty() ? "" : (" -- differ:" + bad).c_str(), ctl_diff, ctl_cases);
         ok(fmt("SP-serial part reads, arm %d", arm).c_str(), cases > 0 && same == cases, bad);
     }
@@ -21266,9 +21271,11 @@ static void hc_spq_check(const Plugin& pl, int mask) {
             (void)launch(0, 0, h, MB, 0, false);
             const double tw = st_time_us([&](int) { (void)launch(0, 0, h, MB, 0, false, false); }, 20, hs);
             std::string line = fmt("SPQTIME h %lld (td %lld, q %lld): whole %.1f us |", (long long)h, (long long)td, (long long)q, tw);
-            for (int form : { 0, 1, 2, 3 }) {
-                if (form && !pl.pin_hc) break;
-                if (pl.pin_hc) pl.pin_hc(form);
+            for (int form : { 0, 1, 2, 3, 4 }) {
+                if (form && form < 4 && !pl.pin_hc) break;
+                if (form == 4 && !pl.pinpf2_hc) break;
+                if (pl.pin_hc) pl.pin_hc(form == 4 ? 0 : form);
+                if (form == 4) pl.pinpf2_hc(1);   /* 4: the launcher's rule + hc_pinpf2 */
                 double mx = 0, sum = 0; bool okf = true;
                 for (auto [a, k] : parts) {
                     okf = okf && launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, false);
@@ -21276,6 +21283,7 @@ static void hc_spq_check(const Plugin& pl, int mask) {
                     mx = std::max(mx, t); sum += t;
                 }
                 if (pl.pin_hc) pl.pin_hc(0);
+                if (form == 4) pl.pinpf2_hc(0);
                 const size_t d = okf ? diff_rows(h) : (size_t)-1;
                 line += fmt(" form %d: parts max %.1f / sum %.1f us, %s |", form, mx, sum,
                             !okf ? "refused" : d == 0 ? "bytes = whole" : fmt("%zu bytes differ", d).c_str());
@@ -21284,6 +21292,7 @@ static void hc_spq_check(const Plugin& pl, int mask) {
         }
         if (pl.pin_hc) pl.pin_hc(0);
     }
+    if (pl.pinpf2_hc) pl.pinpf2_hc(0);
     pl.readv_hc(0); pl.norm_hc_wave(0); pl.upmix_hc(0);
     (void)hipStreamDestroy(hs);
 }

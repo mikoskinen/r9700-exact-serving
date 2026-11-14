@@ -4117,6 +4117,23 @@ static int hc_readv() {
     }
     return v;
 }
+/* fn4 SP-serial (14.11.2026, switch hc_pinpf2, RADIANCE_FN4_HC_PINPF2 at start): 1 = a read whose K split is pinned to a
+ * taller height (kc_rows > rows: SP's part reads) takes the PF2 form below kPf2MinRows too, where its band's `u` holds the
+ * planes (a band of at least kPf2MinRows rows; else the wide form as today). The same bytes: PF2 and the wide form are one
+ * chain of WMMAs at one split (Q1 14.11.: --spqcheck form 3 parts = the segment read whole at h 1073 / 1135 / 1984, 155 vs
+ * 189 us at 285 rows cold). 0 = today's rule. -1 until the environment is read. */
+static std::atomic<int> g_hc_pinpf2{-1};
+static int hc_pinpf2() {
+    int v = g_hc_pinpf2.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_HC_PINPF2");
+        const int on = (e && *e && *e != '0') ? 1 : 0;
+        int want = -1;
+        g_hc_pinpf2.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_hc_pinpf2.load(std::memory_order_relaxed);
+    }
+    return v;
+}
 /* fn4 hc_readv bit 3 (W1b): from this many rows an hc_write handed an `ss` operand stores the next read's norm
  * scales there, and an hc_read handed the same operand takes them instead of its own pass. Both sides decide by
  * the same rule (the bit, these rows, an f32 [rows][kHcMax] operand), and the architecture hands the operand to
@@ -7397,7 +7414,10 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
         const bool pf2_shape = rt == kWideRT && hc == 4 && (n % kThreads) == 0
                                && ntt <= (long)kPf2MaxNT;
         const bool pf2       = g_hc_prefill_form == 3
-                               || (g_hc_prefill_form == 0 && rows >= kPf2MinRows && pf2_shape);
+                               || (g_hc_prefill_form == 0 && rows >= kPf2MinRows && pf2_shape)
+                               /* fn4 hc_pinpf2: a pinned part below kPf2MinRows, where the band's `u` holds the planes */
+                               || (g_hc_prefill_form == 0 && pf2_shape && kcr > rows && hc_pinpf2() > 0
+                                   && ubytes >= pf2_plane_bytes(HN, lr, ntt, f8));
         if (pf2) {
             if (!pf2_shape) return R4D_NO(RAD_E_SHAPE);
             if (ubytes < pf2_plane_bytes(HN, lr, ntt, f8)) return R4D_NO(RAD_E_SCRATCH);
@@ -7785,6 +7805,7 @@ extern "C" void r4d_hc_mix_ctr_release() {
         if (p) (void)hipFree(p);
     }
 }
+extern "C" void r4d_hc_read_pinpf2(int on) { g_hc_pinpf2.store(on > 0 ? 1 : 0, std::memory_order_relaxed); }
 extern "C" void r4d_hc_upmix(int v) { g_hc_upmix.store((v < 0 || v > 15 || (v & 7) > 5) ? 0 : v, std::memory_order_relaxed); }
 extern "C" void r4d_hc_pf2_stages(int m) { g_hc_pf2_stages.store(m <= 0 ? 31 : (m & 31), std::memory_order_relaxed); }
 /* fn4 runtime switches (the core's runtime/fn4_switch.h calls this between steps, every rank thread
@@ -7812,6 +7833,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ar_xpush")) return r4d_ar_xpush_set(value);   /* fn4 RSF */
     if (!std::strcmp(name, "ar_sdma")) return r4d_ar_sdma_set(value);   /* fn4 SDMA-AR */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);
+    if (!std::strcmp(name, "hc_pinpf2")) {   /* fn4 SP-serial: pinned parts below kPf2MinRows through PF2 */
+        if (value < 0 || value > 1) return -1;
+        g_hc_pinpf2.store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (!std::strcmp(name, "hc_upmix")) {
         if (value < 0 || value > 15 || (value & 7) > 5) return -1;
         g_hc_upmix.store(value, std::memory_order_relaxed);
