@@ -1,0 +1,977 @@
+{
+ "run": "hero-ds-300w-stock",
+ "cells": [
+  {
+   "cell": "1 user, prose",
+   "value": 104.91,
+   "unit": "tok/s",
+   "reads": [
+    105.01,
+    105.01,
+    105.02,
+    104.87,
+    104.79,
+    104.78
+   ],
+   "n": 6,
+   "spread_pct": 0.23,
+   "ms_per_step": 16.07,
+   "tok_per_step": 1.69,
+   "acceptance": 0.751,
+   "text_md5": [
+    "525f62164a3d"
+   ],
+   "discarded": [
+    90.31,
+    104.74
+   ],
+   "source": "u1.jsonl labels essay-b1-r1, essay-b1-r2, essay-b1-r3, essay-b2-r1, essay-b2-r2, essay-b2-r3 (raw: u1/<label>.txt J line, u1/<label>-text.json)",
+   "temps": {
+    "03:00": {
+     "n": 17,
+     "power_mean_w": 257.3,
+     "power_max_w": 274,
+     "junction_max_c": 60,
+     "memory_max_c": 50,
+     "fan_rpm_max": 4686,
+     "sclk_mhz_median": 3330
+    },
+    "48:00": {
+     "n": 17,
+     "power_mean_w": 258.5,
+     "power_max_w": 284,
+     "junction_max_c": 61,
+     "memory_max_c": 52,
+     "fan_rpm_max": 4568,
+     "sclk_mhz_median": 3386
+    },
+    "83:00": {
+     "n": 17,
+     "power_mean_w": 257.4,
+     "power_max_w": 313,
+     "junction_max_c": 56,
+     "memory_max_c": 46,
+     "fan_rpm_max": 4503,
+     "sclk_mhz_median": 3347
+    },
+    "c3:00": {
+     "n": 17,
+     "power_mean_w": 256.9,
+     "power_max_w": 276,
+     "junction_max_c": 59,
+     "memory_max_c": 50,
+     "fan_rpm_max": 4526,
+     "sclk_mhz_median": 3289
+    }
+   }
+  },
+  {
+   "cell": "1 user, code",
+   "value": 181.98,
+   "unit": "tok/s",
+   "reads": [
+    181.72,
+    181.94,
+    182.28
+   ],
+   "n": 3,
+   "spread_pct": 0.31,
+   "ms_per_step": 20.34,
+   "tok_per_step": 3.71,
+   "acceptance": 0.774,
+   "text_md5": [
+    "4483fed4e8f7"
+   ],
+   "discarded": [
+    146.06
+   ],
+   "source": "u1.jsonl labels code-r1, code-r2, code-r3 (raw: u1/<label>.txt J line, u1/<label>-text.json)",
+   "temps": {
+    "03:00": {
+     "n": 4,
+     "power_mean_w": 270.2,
+     "power_max_w": 294,
+     "junction_max_c": 59,
+     "memory_max_c": 48,
+     "fan_rpm_max": 4675,
+     "sclk_mhz_median": 3316.5
+    },
+    "48:00": {
+     "n": 4,
+     "power_mean_w": 267.2,
+     "power_max_w": 283,
+     "junction_max_c": 60,
+     "memory_max_c": 50,
+     "fan_rpm_max": 4568,
+     "sclk_mhz_median": 3343.0
+    },
+    "83:00": {
+     "n": 4,
+     "power_mean_w": 273,
+     "power_max_w": 293,
+     "junction_max_c": 56,
+     "memory_max_c": 44,
+     "fan_rpm_max": 4488,
+     "sclk_mhz_median": 3298.0
+    },
+    "c3:00": {
+     "n": 4,
+     "power_mean_w": 272.5,
+     "power_max_w": 296,
+     "junction_max_c": 58,
+     "memory_max_c": 48,
+     "fan_rpm_max": 4512,
+     "sclk_mhz_median": 3270.0
+    }
+   }
+  },
+  {
+   "cell": "4 users",
+   "value": 201.15,
+   "unit": "tok/s",
+   "blocks": [
+    200.9,
+    201.4
+   ],
+   "n": 2,
+   "spread_pct": 0.25,
+   "gens": 3,
+   "ms_decode_step": [
+    51.2,
+    54.2
+   ],
+   "tok_per_decode_step": [
+    14.04,
+    14.72
+   ],
+   "acceptance": [
+    0.612,
+    0.556
+   ],
+   "ttft_p50_s": [
+    0.69,
+    0.69
+   ],
+   "ttft_p90_s": [
+    0.7057313919067383,
+    0.8551208972930908
+   ],
+   "per_stream_p50": [
+    57.7,
+    58.2
+   ],
+   "requests": [
+    12,
+    12
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "source": "mb.jsonl names c4-b1, c4-b2 (raw: mb/<name>.txt MB line, mb/<name>-reqs.jsonl)",
+   "temps": {
+    "03:00": {
+     "n": 44,
+     "power_mean_w": 290.0,
+     "power_max_w": 311,
+     "junction_max_c": 72,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4682,
+     "sclk_mhz_median": 3154.0
+    },
+    "48:00": {
+     "n": 44,
+     "power_mean_w": 285.5,
+     "power_max_w": 309,
+     "junction_max_c": 74,
+     "memory_max_c": 62,
+     "fan_rpm_max": 4568,
+     "sclk_mhz_median": 3178.5
+    },
+    "83:00": {
+     "n": 44,
+     "power_mean_w": 289.6,
+     "power_max_w": 330,
+     "junction_max_c": 69,
+     "memory_max_c": 54,
+     "fan_rpm_max": 4491,
+     "sclk_mhz_median": 3172.0
+    },
+    "c3:00": {
+     "n": 44,
+     "power_mean_w": 288.2,
+     "power_max_w": 300,
+     "junction_max_c": 71,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4528,
+     "sclk_mhz_median": 3117.0
+    }
+   }
+  },
+  {
+   "cell": "8 users",
+   "value": 246.35,
+   "unit": "tok/s",
+   "blocks": [
+    247.5,
+    245.2
+   ],
+   "n": 2,
+   "spread_pct": 0.93,
+   "gens": 2,
+   "ms_decode_step": [
+    82.9,
+    82.9
+   ],
+   "tok_per_decode_step": [
+    28.83,
+    28.91
+   ],
+   "acceptance": [
+    0.508,
+    0.51
+   ],
+   "ttft_p50_s": [
+    0.76,
+    0.79
+   ],
+   "ttft_p90_s": [
+    1.186852216720581,
+    0.9237475395202637
+   ],
+   "per_stream_p50": [
+    34.3,
+    34.5
+   ],
+   "requests": [
+    17,
+    17
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "source": "mb.jsonl names c8-b1, c8-b2 (raw: mb/<name>.txt MB line, mb/<name>-reqs.jsonl)",
+   "temps": {
+    "03:00": {
+     "n": 53,
+     "power_mean_w": 286.5,
+     "power_max_w": 336,
+     "junction_max_c": 73,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4688,
+     "sclk_mhz_median": 3086
+    },
+    "48:00": {
+     "n": 53,
+     "power_mean_w": 286.6,
+     "power_max_w": 326,
+     "junction_max_c": 75,
+     "memory_max_c": 62,
+     "fan_rpm_max": 4575,
+     "sclk_mhz_median": 3134
+    },
+    "83:00": {
+     "n": 53,
+     "power_mean_w": 287.0,
+     "power_max_w": 326,
+     "junction_max_c": 68,
+     "memory_max_c": 54,
+     "fan_rpm_max": 4490,
+     "sclk_mhz_median": 3127
+    },
+    "c3:00": {
+     "n": 53,
+     "power_mean_w": 286.5,
+     "power_max_w": 378,
+     "junction_max_c": 71,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4537,
+     "sclk_mhz_median": 3057
+    }
+   }
+  },
+  {
+   "cell": "16 users",
+   "value": 293.85,
+   "unit": "tok/s",
+   "blocks": [
+    294.1,
+    293.6
+   ],
+   "n": 2,
+   "spread_pct": 0.17,
+   "gens": 1,
+   "ms_decode_step": [
+    39.5,
+    39.6
+   ],
+   "tok_per_decode_step": [
+    17.0,
+    17.0
+   ],
+   "acceptance": [
+    0.732,
+    0.729
+   ],
+   "ttft_p50_s": [
+    0.58,
+    0.58
+   ],
+   "ttft_p90_s": [
+    0.6497321128845215,
+    0.6527299880981445
+   ],
+   "per_stream_p50": [
+    22.5,
+    22.9
+   ],
+   "requests": [
+    16,
+    16
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "source": "mb.jsonl names c16-b1, c16-b2 (raw: mb/<name>.txt MB line, mb/<name>-reqs.jsonl)",
+   "temps": {
+    "03:00": {
+     "n": 49,
+     "power_mean_w": 288.0,
+     "power_max_w": 300,
+     "junction_max_c": 72,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4684,
+     "sclk_mhz_median": 3087
+    },
+    "48:00": {
+     "n": 49,
+     "power_mean_w": 287.0,
+     "power_max_w": 303,
+     "junction_max_c": 73,
+     "memory_max_c": 62,
+     "fan_rpm_max": 4574,
+     "sclk_mhz_median": 3124
+    },
+    "83:00": {
+     "n": 49,
+     "power_mean_w": 287.8,
+     "power_max_w": 303,
+     "junction_max_c": 67,
+     "memory_max_c": 54,
+     "fan_rpm_max": 4497,
+     "sclk_mhz_median": 3128
+    },
+    "c3:00": {
+     "n": 49,
+     "power_mean_w": 288.4,
+     "power_max_w": 303,
+     "junction_max_c": 71,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4532,
+     "sclk_mhz_median": 3087
+    }
+   }
+  },
+  {
+   "cell": "24 users",
+   "value": 312.4,
+   "unit": "tok/s",
+   "blocks": [
+    312.0,
+    312.8
+   ],
+   "n": 2,
+   "spread_pct": 0.26,
+   "gens": 1,
+   "ms_decode_step": [
+    52.1,
+    52.1
+   ],
+   "tok_per_decode_step": [
+    25.08,
+    25.08
+   ],
+   "acceptance": [
+    0.0,
+    0.0
+   ],
+   "ttft_p50_s": [
+    0.61,
+    0.6
+   ],
+   "ttft_p90_s": [
+    0.7089436054229736,
+    0.7155101299285889
+   ],
+   "per_stream_p50": [
+    16.6,
+    16.7
+   ],
+   "requests": [
+    24,
+    24
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "source": "mb.jsonl names c24-b1, c24-b2 (raw: mb/<name>.txt MB line, mb/<name>-reqs.jsonl)",
+   "temps": {
+    "03:00": {
+     "n": 70,
+     "power_mean_w": 285.1,
+     "power_max_w": 306,
+     "junction_max_c": 72,
+     "memory_max_c": 62,
+     "fan_rpm_max": 4679,
+     "sclk_mhz_median": 3061.5
+    },
+    "48:00": {
+     "n": 70,
+     "power_mean_w": 284.7,
+     "power_max_w": 304,
+     "junction_max_c": 76,
+     "memory_max_c": 62,
+     "fan_rpm_max": 4576,
+     "sclk_mhz_median": 3111.5
+    },
+    "83:00": {
+     "n": 70,
+     "power_mean_w": 285.3,
+     "power_max_w": 304,
+     "junction_max_c": 68,
+     "memory_max_c": 56,
+     "fan_rpm_max": 4490,
+     "sclk_mhz_median": 3087.5
+    },
+    "c3:00": {
+     "n": 70,
+     "power_mean_w": 285.5,
+     "power_max_w": 301,
+     "junction_max_c": 71,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4530,
+     "sclk_mhz_median": 3059.5
+    }
+   }
+  },
+  {
+   "cell": "32 users",
+   "value": 344.5,
+   "unit": "tok/s",
+   "blocks": [
+    345.1,
+    343.9
+   ],
+   "n": 2,
+   "spread_pct": 0.35,
+   "gens": 1,
+   "ms_decode_step": [
+    59.7,
+    60.3
+   ],
+   "tok_per_decode_step": [
+    33.94,
+    33.86
+   ],
+   "acceptance": [
+    0.0,
+    0.0
+   ],
+   "ttft_p50_s": [
+    0.68,
+    0.69
+   ],
+   "ttft_p90_s": [
+    0.804682731628418,
+    0.8039600849151611
+   ],
+   "per_stream_p50": [
+    13.9,
+    13.8
+   ],
+   "requests": [
+    32,
+    32
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "source": "mb.jsonl names c32-b1, c32-b2 (raw: mb/<name>.txt MB line, mb/<name>-reqs.jsonl)",
+   "temps": {
+    "03:00": {
+     "n": 84,
+     "power_mean_w": 285.5,
+     "power_max_w": 330,
+     "junction_max_c": 73,
+     "memory_max_c": 62,
+     "fan_rpm_max": 4684,
+     "sclk_mhz_median": 3038.0
+    },
+    "48:00": {
+     "n": 84,
+     "power_mean_w": 285.7,
+     "power_max_w": 326,
+     "junction_max_c": 75,
+     "memory_max_c": 64,
+     "fan_rpm_max": 4578,
+     "sclk_mhz_median": 3080.5
+    },
+    "83:00": {
+     "n": 84,
+     "power_mean_w": 287.0,
+     "power_max_w": 310,
+     "junction_max_c": 70,
+     "memory_max_c": 56,
+     "fan_rpm_max": 4495,
+     "sclk_mhz_median": 3069.0
+    },
+    "c3:00": {
+     "n": 84,
+     "power_mean_w": 286.4,
+     "power_max_w": 306,
+     "junction_max_c": 72,
+     "memory_max_c": 62,
+     "fan_rpm_max": 4530,
+     "sclk_mhz_median": 3032.5
+    }
+   }
+  },
+  {
+   "cell": "prefill 16k",
+   "value": 4035.0,
+   "unit": "prefill tok/s",
+   "ttft_s": 3.91,
+   "prompt_tokens": 15777,
+   "cached": 0,
+   "status": 200,
+   "depth_arg": 16000,
+   "source": "cold.jsonl depth 16000 (raw: cold/cold-16000.out DEEPQ line, cold/cold-16000.txt.json)",
+   "temps": {
+    "03:00": {
+     "n": 2,
+     "power_mean_w": 274,
+     "power_max_w": 291,
+     "junction_max_c": 58,
+     "memory_max_c": 44,
+     "fan_rpm_max": 4667,
+     "sclk_mhz_median": 3077.5
+    },
+    "48:00": {
+     "n": 2,
+     "power_mean_w": 274.5,
+     "power_max_w": 291,
+     "junction_max_c": 60,
+     "memory_max_c": 46,
+     "fan_rpm_max": 4553,
+     "sclk_mhz_median": 3247.0
+    },
+    "83:00": {
+     "n": 2,
+     "power_mean_w": 276,
+     "power_max_w": 293,
+     "junction_max_c": 56,
+     "memory_max_c": 40,
+     "fan_rpm_max": 4489,
+     "sclk_mhz_median": 3208.0
+    },
+    "c3:00": {
+     "n": 2,
+     "power_mean_w": 274,
+     "power_max_w": 288,
+     "junction_max_c": 55,
+     "memory_max_c": 44,
+     "fan_rpm_max": 4512,
+     "sclk_mhz_median": 3086.5
+    }
+   }
+  },
+  {
+   "cell": "prefill 64k",
+   "value": 6124.1,
+   "unit": "prefill tok/s",
+   "ttft_s": 10.72,
+   "prompt_tokens": 65650,
+   "cached": 0,
+   "status": 200,
+   "depth_arg": 64000,
+   "source": "cold.jsonl depth 64000 (raw: cold/cold-64000.out DEEPQ line, cold/cold-64000.txt.json)",
+   "temps": {
+    "03:00": {
+     "n": 6,
+     "power_mean_w": 280.3,
+     "power_max_w": 300,
+     "junction_max_c": 64,
+     "memory_max_c": 50,
+     "fan_rpm_max": 4691,
+     "sclk_mhz_median": 2743.5
+    },
+    "48:00": {
+     "n": 6,
+     "power_mean_w": 279.7,
+     "power_max_w": 303,
+     "junction_max_c": 64,
+     "memory_max_c": 52,
+     "fan_rpm_max": 4560,
+     "sclk_mhz_median": 2867.0
+    },
+    "83:00": {
+     "n": 6,
+     "power_mean_w": 280.2,
+     "power_max_w": 302,
+     "junction_max_c": 59,
+     "memory_max_c": 44,
+     "fan_rpm_max": 4495,
+     "sclk_mhz_median": 2828.0
+    },
+    "c3:00": {
+     "n": 6,
+     "power_mean_w": 278.3,
+     "power_max_w": 299,
+     "junction_max_c": 60,
+     "memory_max_c": 48,
+     "fan_rpm_max": 4521,
+     "sclk_mhz_median": 2752.5
+    }
+   }
+  },
+  {
+   "cell": "prefill 128k",
+   "value": 6387.6,
+   "unit": "prefill tok/s",
+   "ttft_s": 20.53,
+   "prompt_tokens": 131137,
+   "cached": 0,
+   "status": 200,
+   "depth_arg": 130000,
+   "source": "cold.jsonl depth 130000 (raw: cold/cold-130000.out DEEPQ line, cold/cold-130000.txt.json)",
+   "temps": {
+    "03:00": {
+     "n": 11,
+     "power_mean_w": 286.9,
+     "power_max_w": 388,
+     "junction_max_c": 65,
+     "memory_max_c": 52,
+     "fan_rpm_max": 4691,
+     "sclk_mhz_median": 2780
+    },
+    "48:00": {
+     "n": 11,
+     "power_mean_w": 279.4,
+     "power_max_w": 301,
+     "junction_max_c": 67,
+     "memory_max_c": 54,
+     "fan_rpm_max": 4564,
+     "sclk_mhz_median": 2788
+    },
+    "83:00": {
+     "n": 11,
+     "power_mean_w": 278.1,
+     "power_max_w": 300,
+     "junction_max_c": 63,
+     "memory_max_c": 48,
+     "fan_rpm_max": 4498,
+     "sclk_mhz_median": 2723
+    },
+    "c3:00": {
+     "n": 11,
+     "power_mean_w": 276.9,
+     "power_max_w": 300,
+     "junction_max_c": 63,
+     "memory_max_c": 52,
+     "fan_rpm_max": 4541,
+     "sclk_mhz_median": 2740
+    }
+   }
+  },
+  {
+   "cell": "prefill 136k",
+   "value": 6290.6,
+   "unit": "prefill tok/s",
+   "ttft_s": 21.8,
+   "prompt_tokens": 137135,
+   "cached": 0,
+   "status": 200,
+   "depth_arg": 136000,
+   "source": "cold.jsonl depth 136000 (raw: cold/cold-136000.out DEEPQ line, cold/cold-136000.txt.json)",
+   "temps": {
+    "03:00": {
+     "n": 10,
+     "power_mean_w": 292.8,
+     "power_max_w": 308,
+     "junction_max_c": 65,
+     "memory_max_c": 52,
+     "fan_rpm_max": 4676,
+     "sclk_mhz_median": 2681.5
+    },
+    "48:00": {
+     "n": 10,
+     "power_mean_w": 293.7,
+     "power_max_w": 310,
+     "junction_max_c": 66,
+     "memory_max_c": 54,
+     "fan_rpm_max": 4564,
+     "sclk_mhz_median": 2681.5
+    },
+    "83:00": {
+     "n": 10,
+     "power_mean_w": 293.2,
+     "power_max_w": 306,
+     "junction_max_c": 62,
+     "memory_max_c": 48,
+     "fan_rpm_max": 4481,
+     "sclk_mhz_median": 2654.0
+    },
+    "c3:00": {
+     "n": 10,
+     "power_mean_w": 293.4,
+     "power_max_w": 301,
+     "junction_max_c": 64,
+     "memory_max_c": 52,
+     "fan_rpm_max": 4512,
+     "sclk_mhz_median": 2744.5
+    }
+   }
+  }
+ ],
+ "info": [
+  {
+   "cell": "1 stream, mb gens 1 (comparison only)",
+   "value": 136.7,
+   "unit": "tok/s",
+   "blocks": [
+    136.7
+   ],
+   "n": 1,
+   "spread_pct": 0.0,
+   "gens": 1,
+   "ms_decode_step": [
+    23.3
+   ],
+   "tok_per_decode_step": [
+    3.77
+   ],
+   "acceptance": [
+    0.766
+   ],
+   "ttft_p50_s": [
+    0.61
+   ],
+   "ttft_p90_s": [
+    0.6077682971954346
+   ],
+   "per_stream_p50": [
+    162.2
+   ],
+   "requests": [
+    1
+   ],
+   "errors": [
+    0
+   ],
+   "source": "mb.jsonl names c1-g1 (raw: mb/<name>.txt MB line, mb/<name>-reqs.jsonl)",
+   "temps": {
+    "03:00": {
+     "n": 8,
+     "power_mean_w": 254.8,
+     "power_max_w": 281,
+     "junction_max_c": 61,
+     "memory_max_c": 48,
+     "fan_rpm_max": 4668,
+     "sclk_mhz_median": 3323.0
+    },
+    "48:00": {
+     "n": 8,
+     "power_mean_w": 255.1,
+     "power_max_w": 282,
+     "junction_max_c": 62,
+     "memory_max_c": 48,
+     "fan_rpm_max": 4558,
+     "sclk_mhz_median": 3346.0
+    },
+    "83:00": {
+     "n": 8,
+     "power_mean_w": 252.5,
+     "power_max_w": 274,
+     "junction_max_c": 58,
+     "memory_max_c": 42,
+     "fan_rpm_max": 4492,
+     "sclk_mhz_median": 3337.5
+    },
+    "c3:00": {
+     "n": 8,
+     "power_mean_w": 251.1,
+     "power_max_w": 271,
+     "junction_max_c": 60,
+     "memory_max_c": 48,
+     "fan_rpm_max": 4522,
+     "sclk_mhz_median": 3208.5
+    }
+   }
+  },
+  {
+   "cell": "4 users, mb gens 1 (comparison only)",
+   "value": 213.7,
+   "unit": "tok/s",
+   "blocks": [
+    213.7
+   ],
+   "n": 1,
+   "spread_pct": 0.0,
+   "gens": 1,
+   "ms_decode_step": [
+    53.9
+   ],
+   "tok_per_decode_step": [
+    15.7
+   ],
+   "acceptance": [
+    0.596
+   ],
+   "ttft_p50_s": [
+    0.68
+   ],
+   "ttft_p90_s": [
+    0.7168803215026855
+   ],
+   "per_stream_p50": [
+    66.4
+   ],
+   "requests": [
+    4
+   ],
+   "errors": [
+    0
+   ],
+   "source": "mb.jsonl names c4-g1 (raw: mb/<name>.txt MB line, mb/<name>-reqs.jsonl)",
+   "temps": {
+    "03:00": {
+     "n": 12,
+     "power_mean_w": 286.9,
+     "power_max_w": 300,
+     "junction_max_c": 72,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4686,
+     "sclk_mhz_median": 3053.0
+    },
+    "48:00": {
+     "n": 12,
+     "power_mean_w": 286.2,
+     "power_max_w": 301,
+     "junction_max_c": 73,
+     "memory_max_c": 62,
+     "fan_rpm_max": 4569,
+     "sclk_mhz_median": 3255.5
+    },
+    "83:00": {
+     "n": 12,
+     "power_mean_w": 286.5,
+     "power_max_w": 299,
+     "junction_max_c": 68,
+     "memory_max_c": 54,
+     "fan_rpm_max": 4488,
+     "sclk_mhz_median": 3144.0
+    },
+    "c3:00": {
+     "n": 12,
+     "power_mean_w": 285.8,
+     "power_max_w": 299,
+     "junction_max_c": 70,
+     "memory_max_c": 60,
+     "fan_rpm_max": 4519,
+     "sclk_mhz_median": 3057.5
+    }
+   }
+  }
+ ],
+ "identity": [
+  "a1-vs-stored: IDENTICAL: 20 of 20 answers (ref-alone.jsonl vs a1.jsonl)",
+  "gs20-vs-a1: IDENTICAL: 20 of 20 answers (a1.jsonl vs gs20.jsonl)",
+  "gs20-vs-stored: IDENTICAL: 20 of 20 answers (ref-alone.jsonl vs gs20.jsonl)",
+  "ld16-vs-a1: IDENTICAL: 20 of 20 answers (a1.jsonl vs ld16.jsonl)",
+  "ld16-vs-stored: IDENTICAL: 20 of 20 answers (ref-alone.jsonl vs ld16.jsonl)",
+  "a1b-vs-a1: IDENTICAL: 20 of 20 answers (a1.jsonl vs a1b.jsonl)"
+ ],
+ "switches": {
+  "at start (before switches.sh)": "46 of 73 switches = want -- DIFFERENT (want, got): {\"draft_depth0\": [3, 0], \"draft_hybrid\": [1, 0], \"draft_probe_backoff\": [3, 0], \"draft_lend\": [1, 0], \"drafter_mx\": [1, 0], \"idx_split\": [1, 0], \"draft_ctxskip\": [1, 0], \"dspark_conf\": [1, 0], \"dspark_conf_rows\": [1, 0], \"gg_pf\": [2, 1], \"ds41_bi\": [6, 0], \"draft_occ\": [13, 0], \"sched_bi_chunk\": [3, 0], \"ds41_psk\": [4, 0], \"ds41_psk_l20\": [1, 0], \"dspark_pfctx\": [1, 0], \"ds41_psk_cr\": [1, 0], \"ds41_engdd\": [1, 0], \"sched_noa\": [2, 0], \"mhc_fuse\": [1, 0], \"sched_row_cap\": [48, 0], \"exl3_x3d\": [2, 0], \"ar_xpush\": [1, 0], \"gg_gemv_m16\": [1, 0], \"place_swap_lent\": [1, 0], \"heat_min_gain_x100\": [75, 150], \"route_copy_ov\": [1, 0]}",
+  "after switches.sh": "73 of 73 switches = want",
+  "at the end": "73 of 73 switches = want"
+ },
+ "sections": [
+  "COOL pre-start: <= 45 C after 0 s (junction/memory C) c3:00:21/18 83:00:19/16 48:00:20/20 03:00:21/20",
+  "COOL cold-130000: <= 45 C after 21 s (junction/memory C) c3:00:36/40 83:00:35/36 48:00:36/42 03:00:36/40",
+  "COOL cold-136000: <= 45 C after 10 s (junction/memory C) c3:00:38/38 83:00:36/36 48:00:38/40 03:00:37/40",
+  "COOL cold-64000: <= 45 C after 10 s (junction/memory C) c3:00:38/38 83:00:36/36 48:00:38/40 03:00:37/40",
+  "COOL cold-16000: <= 45 C after 11 s (junction/memory C) c3:00:36/38 83:00:34/34 48:00:36/40 03:00:36/38",
+  "COOL u1-essay: <= 45 C after 10 s (junction/memory C) c3:00:34/34 83:00:32/32 48:00:34/36 03:00:33/36",
+  "COOL u1-code: <= 45 C after 10 s (junction/memory C) c3:00:37/38 83:00:36/34 48:00:37/40 03:00:37/38",
+  "COOL c1: <= 45 C after 10 s (junction/memory C) c3:00:36/36 83:00:35/34 48:00:36/38 03:00:35/38",
+  "COOL c4: <= 45 C after 10 s (junction/memory C) c3:00:36/36 83:00:34/32 48:00:36/38 03:00:35/36",
+  "COOL c8: <= 45 C after 20 s (junction/memory C) c3:00:37/40 83:00:35/36 48:00:37/42 03:00:36/40",
+  "COOL c16: <= 45 C after 20 s (junction/memory C) c3:00:37/40 83:00:35/36 48:00:37/42 03:00:36/40",
+  "COOL c24: <= 45 C after 20 s (junction/memory C) c3:00:37/40 83:00:35/36 48:00:37/42 03:00:36/40",
+  "COOL c32: <= 45 C after 20 s (junction/memory C) c3:00:37/40 83:00:35/36 48:00:37/42 03:00:36/40"
+ ],
+ "notes": [
+  "POWER set (13.11. stock hero): 300 W, 0 mV, fanflat 90 % TOP 100 read back on all four cards | c3:00:cap=300W,vo=0mV,j=21C,m=18C 83:00:cap=300W,vo=0mV,j=19C,m=16C 48:00:cap=300W,vo=0mV,j=20C,m=20C 03:00:cap=300W,vo=0mV,j=21C,m=20C | c3:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3735rpm 83:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3595rpm 48:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3941rpm 03:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3937rpm",
+  "HEALTHY after 303 s",
+  "run/switches.sh exit 0: all 65 switches set from run/deepseek/switches.json ",
+  "start lines: radiance: deepseek41: lever P (ds41_moe1, RADIANCE_DS41_MOE1, now 1) declared: moe_exl3_gate_up_dk / moe_exl3_down_dk beside the EXL3 pair of 40 of 40 trunk MoE layers, 17 .. 48 rows -- a step that is one decode segment of that height runs ONE MoE pass (the decode band's bytes per row) instead of <= 16-row pieces|  --gpu-headroom-mib 256.00 MiB   left unclaimed on purpose|  unclaimed          256.94 MiB   the headroom, the unusable above, and what MiB rounding|I[0] card 0 settled at 481.84 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 139.83 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 116.17 MiB is left for first launches|I[1] card 1 settled at 487.80 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.88 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 122.12 MiB is left for first launches|I[2] card 2 settled at 487.86 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.82 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 122.18 MiB is left f",
+  "check answer: \"The capital of Australia is Canberra, and it officially became the capital in 1913 when the city was founded and named.\"",
+  "ld16: {\"answered\": 20, \"of\": 20, \"max_tokens\": 192, \"offset_s\": 0.5, \"pf_tok_asked\": 8192, \"conc\": 16, \"pf_prompt_mean\": 7772, \"pf_cold\": 20, \"pf_ttft_mean\": 3.84, \"pf_ttft_min\": 3.21, \"pf_ttft_max\": 7.12, \"ov_frac_min\": 0.0, \"ov_frac_median\": 0.548, \"mixed_total\": 97, \"mixed_min\": 1, \"mixed_median\": 5.0, \"probes_without_mixed\": [], \"probe_s_mean\": 6.47, \"c4_requests_done\": 64, \"c4_errors\": 0, \"c4_err_first\": null, \"window_s\": 155.8, \"window\": {\"ms_decode_step\": 45.4, \"tok_per_decode_step\": 17.97, \"acceptance\": 0.601, \"decode_share\": 0.533, \"steps\": 1827, \"busy_s\": 145.7, \"prefill_tok\": 20748",
+  "engine log: error lines 0",
+  "POWER restored (try 1): 210 W, -50 mV, fanflat 03:00=29 48:00=35 83:00=28 c3:00=30 TOP=50 read back on all four cards | c3:00:cap=210W,vo=-50mV,j=29C,m=34C 83:00:cap=210W,vo=-50mV,j=27C,m=30C 48:00:cap=210W,vo=-50mV,j=29C,m=36C 03:00:cap=210W,vo=-50mV,j=28C,m=34C | c3:00:fan=25C/30%,50C/30%,70C/30%,85C/30%,100C/50%,2555rpm 83:00:fan=25C/28%,50C/28%,70C/28%,85C/28%,100C/50%,2464rpm 48:00:fan=25C/35%,50C/35%,70C/35%,85C/35%,100C/50%,2681rpm 03:00:fan=25C/29%,50C/29%,70C/29%,85C/29%,100C/50%,2602rpm"
+ ],
+ "engine": {
+  "lines": 40616,
+  "settle": [
+   "I[0] card 0 settled at 481.84 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 139.83 MiB of the headroom was taken after the budget read the card, by another process on it or a",
+   "I[1] card 1 settled at 487.80 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.88 MiB of the headroom was taken after the budget read the card, by another process on it or a",
+   "I[2] card 2 settled at 487.86 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.82 MiB of the headroom was taken after the budget read the card, by another process on it or a",
+   "I[3] card 3 settled at 487.85 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.83 MiB of the headroom was taken after the budget read the card, by another process on it or a"
+  ],
+  "headroom_warn": [],
+  "errors": 0
+ },
+ "whole_run_temps": {
+  "03:00": {
+   "n": 716,
+   "power_mean_w": 201.1,
+   "power_max_w": 388,
+   "junction_max_c": 73,
+   "memory_max_c": 62,
+   "fan_rpm_max": 4818,
+   "sclk_mhz_median": 3005.5
+  },
+  "48:00": {
+   "n": 716,
+   "power_mean_w": 201.1,
+   "power_max_w": 326,
+   "junction_max_c": 76,
+   "memory_max_c": 64,
+   "fan_rpm_max": 4688,
+   "sclk_mhz_median": 3051.5
+  },
+  "83:00": {
+   "n": 716,
+   "power_mean_w": 201.0,
+   "power_max_w": 330,
+   "junction_max_c": 70,
+   "memory_max_c": 56,
+   "fan_rpm_max": 4626,
+   "sclk_mhz_median": 3026.5
+  },
+  "c3:00": {
+   "n": 716,
+   "power_mean_w": 200.8,
+   "power_max_w": 378,
+   "junction_max_c": 72,
+   "memory_max_c": 62,
+   "fan_rpm_max": 4644,
+   "sclk_mhz_median": 2981.5
+  }
+ }
+}

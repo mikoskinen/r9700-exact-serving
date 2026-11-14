@@ -1,0 +1,5 @@
+# Technical Review: CPython Standard Library Source Bundle
+
+## 1. Overview of the Bundle
+
+This bundle is a slice of CPython's standard library, mostly the "bootstrap-adjacent" modules that are imported very early during interpreter startup, plus a handful of pure-Python fallbacks for modules that normally

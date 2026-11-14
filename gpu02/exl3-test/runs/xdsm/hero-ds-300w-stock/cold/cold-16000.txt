@@ -1,0 +1,8 @@
+# Technical Review: CPython Standard Library Support Modules
+
+## Overview
+
+The files above are a cross-section of CPython's standard library, spanning four distinct concerns:
+
+1. **Language evolution bookkeeping** (`__future__.py`)
+2. **Frozen bootstrap modules** (`__hello__.py`, `__init

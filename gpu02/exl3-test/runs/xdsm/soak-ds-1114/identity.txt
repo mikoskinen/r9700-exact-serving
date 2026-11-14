@@ -1,0 +1,15 @@
+xp1-U32 warm-up IDENTICAL: 3 answers
+xp1-U32-a1-F-vs-ref12-a1 IDENTICAL: 20 of 20 answers
+xp1-U32-a1-F-vs-zzzc16-a1-F IDENTICAL: 20 of 20 answers
+xp1-U32-a1-W-vs-a1-F-INFO 13 of 20 answers differ: p1 char 121 tok 26, p4 char 36 tok 23, p7 char 4 tok 1, p8 char 10 tok 2, p9 char 10 tok 1, p10 char 10 tok 2, p11 char 0 tok 0, p12 char 1 tok 0, p13 char 129 tok 42, p14 char 90 tok 18, p16 char 399 tok 71, p18 char 1 tok 0, p19 char 0 tok 0
+xp1-U32-gs20-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-ld16-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-s1-ld24-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-s2-ld32-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-s3-ld12-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-s4-ld16-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-s5-ld32-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-s6-ld8-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-s7-ld24-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-s8-ld12-WPO13-vs-a1-W IDENTICAL: 20 of 20 answers
+xp1-U32-a1b-W-vs-a1-W IDENTICAL: 20 of 20 answers

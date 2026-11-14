@@ -1,0 +1,11 @@
+radiance: deepseek41: lever P (ds41_moe1, RADIANCE_DS41_MOE1, now 1) declared: moe_exl3_gate_up_dk / moe_exl3_down_dk beside the EXL3 pair of 40 of 40 trunk MoE layers, 17 .. 48 rows -- a step that is one decode segment of that height runs ONE MoE pass (the decode band's bytes per row) instead of <= 16-row pieces
+  --gpu-headroom-mib 256.00 MiB   left unclaimed on purpose
+  unclaimed          256.94 MiB   the headroom, the unusable above, and what MiB rounding
+I[0] card 0 settled at 481.84 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 139.83 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 116.17 MiB is left for first launches
+I[1] card 1 settled at 487.80 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.88 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 122.12 MiB is left for first launches
+I[2] card 2 settled at 487.86 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.82 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 122.18 MiB is left for first launches
+I[3] card 3 settled at 487.85 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.83 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 122.17 MiB is left for first launches
+I   --gpu-headroom-mib                 256                                         [command line]
+I                                          --gpu-headroom-mib 256.00 MiB   left unclaimed on purpose
+I                                          unclaimed          256.94 MiB   the headroom, the unusable above, and what MiB rounding
+radiance: libr4d: lever WMK (ds41_wmk 2, RADIANCE_DS41_WMK): dense GGUF GEMMs at every row count in the part-order WMMA form from load

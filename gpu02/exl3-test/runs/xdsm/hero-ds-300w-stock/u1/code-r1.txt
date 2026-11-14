@@ -1,0 +1,1 @@
+J {"prompt": "code", "tokens": 512, "decode_tps": 181.72, "decode_steps": 138.0, "ms_per_decode_step": 20.37, "tokens_per_step": 3.71, "acceptance": 0.774, "all_steps": 139.0, "all_step_s": 2.93, "status": 200, "finish": "length", "text_chars": 2063, "text_md5": "4483fed4e8f7"}

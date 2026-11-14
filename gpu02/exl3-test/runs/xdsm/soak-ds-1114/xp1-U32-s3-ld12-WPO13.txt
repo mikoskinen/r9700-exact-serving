@@ -1,0 +1,21 @@
+PROBE p0: 91 tok stop, 6.0 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 5.41 s, in flight 90 % of the probe | steps 35, mixed 5
+PROBE p1: 80 tok stop, 5.9 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.75 s, in flight 63 % of the probe | steps 81, mixed 5
+PROBE p2: 26 tok stop, 2.2 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.5 s, in flight 77 % of the probe | steps 27, mixed 3
+PROBE p3: 192 tok length, 13.5 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.49 s, in flight 26 % of the probe | steps 193, mixed 11
+PROBE p4: 67 tok stop, 7.4 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 5.48 s, in flight 74 % of the probe | steps 68, mixed 6
+PROBE p5: 102 tok stop, 6.3 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.43 s, in flight 54 % of the probe | steps 103, mixed 5
+PROBE p6: 192 tok length, 10.0 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.46 s, in flight 35 % of the probe | steps 193, mixed 5
+PROBE p7: 192 tok length, 16.5 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.56 s, in flight 22 % of the probe | steps 193, mixed 15
+PROBE p8: 13 tok stop, 0.6 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.29 s, in flight 11 % of the probe | steps 14, mixed 1
+PROBE p9: 3 tok stop, 0.2 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.98 s, in flight 0 % of the probe | steps 12, mixed 1
+PROBE p10: 49 tok stop, 3.2 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 5.37 s, in flight 85 % of the probe | steps 21, mixed 4
+PROBE p11: 1 tok stop, 0.3 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 5.45 s, in flight 0 % of the probe | steps 4, mixed 2
+PROBE p12: 103 tok stop, 7.2 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 5.68 s, in flight 79 % of the probe | steps 55, mixed 6
+PROBE p13: 44 tok stop, 5.5 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 4.34 s, in flight 79 % of the probe | steps 45, mixed 6
+PROBE p14: 192 tok length, 14.6 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 4.15 s, in flight 28 % of the probe | steps 193, mixed 12
+PROBE p15: 30 tok stop, 2.2 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.43 s, in flight 77 % of the probe | steps 31, mixed 3
+PROBE p16: 192 tok length, 10.1 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.45 s, in flight 34 % of the probe | steps 193, mixed 5
+PROBE p17: 21 tok stop, 1.4 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.46 s, in flight 64 % of the probe | steps 22, mixed 2
+PROBE p18: 20 tok stop, 2.5 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.99 s, in flight 80 % of the probe | steps 21, mixed 3
+PROBE p19: 53 tok stop, 6.6 s | prefill +0.5 s, 7772 tok, cached 0, TTFT 3.63 s, in flight 55 % of the probe | steps 55, mixed 8
+LOADID {"answered": 20, "of": 20, "max_tokens": 192, "offset_s": 0.5, "pf_tok_asked": 8192, "conc": 12, "pf_prompt_mean": 7772, "pf_cold": 20, "pf_ttft_mean": 4.12, "pf_ttft_min": 3.29, "pf_ttft_max": 5.68, "ov_frac_min": 0.0, "ov_frac_median": 0.59, "mixed_total": 108, "mixed_min": 1, "mixed_median": 5.0, "probes_without_mixed": [], "probe_s_mean": 6.1, "c4_requests_done": 54, "c4_errors": 0, "c4_err_first": null, "window_s": 156.1, "window": {"ms_decode_step": 46.0, "tok_per_decode_step": 15.54, "acceptance": 0.541, "decode_share": 0.499, "steps": 1710, "busy_s": 145.9, "prefill_tok": 200957, "cut_tok": 1476, "gen_tok": 23187, "dec_tok": 24593, "preempt": 0}, "errors": []}

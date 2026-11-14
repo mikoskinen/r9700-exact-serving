@@ -1,0 +1,89 @@
+2026-11-14 11:11:57 START hero-ds-300w-stock: PW 300s, image radiance-local:ds41-wmk2-ac0bf129-df1105a6-l (4c779f21d4ea), repo /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/hero/repo | power before: c3:00:cap=210W,vo=-50mV,j=21C,m=18C 83:00:cap=210W,vo=-50mV,j=19C,m=16C 48:00:cap=210W,vo=-50mV,j=20C,m=20C 03:00:cap=210W,vo=-50mV,j=21C,m=20C
+2026-11-14 11:11:57 fans before: c3:00:fan=25C/30%,50C/30%,70C/30%,85C/30%,100C/50%,2555rpm 83:00:fan=25C/28%,50C/28%,70C/28%,85C/28%,100C/50%,2468rpm 48:00:fan=25C/35%,50C/35%,70C/35%,85C/35%,100C/50%,2689rpm 03:00:fan=25C/29%,50C/29%,70C/29%,85C/29%,100C/50%,2615rpm
+2026-11-14 11:12:00 POWER set (13.11. stock hero): 300 W, 0 mV, fanflat 90 % TOP 100 read back on all four cards | c3:00:cap=300W,vo=0mV,j=21C,m=18C 83:00:cap=300W,vo=0mV,j=19C,m=16C 48:00:cap=300W,vo=0mV,j=20C,m=20C 03:00:cap=300W,vo=0mV,j=21C,m=20C | c3:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3735rpm 83:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3595rpm 48:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3941rpm 03:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3937rpm
+2026-11-14 11:12:00 COOL pre-start: <= 45 C after 0 s (junction/memory C) c3:00:21/18 83:00:19/16 48:00:20/20 03:00:21/20
+2026-11-14 11:12:00 docker run (README form) from /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/hero/repo
+2026-11-14 11:12:00 container 4fa5bb8f9016 started; waiting for /health
+2026-11-14 11:17:03 HEALTHY after 303 s
+2026-11-14 11:17:03 switches at start (before switches.sh): 46 of 73 switches = want -- DIFFERENT (want, got): {"draft_depth0": [3, 0], "draft_hybrid": [1, 0], "draft_probe_backoff": [3, 0], "draft_lend": [1, 0], "drafter_mx": [1, 0], "idx_split": [1, 0], "draft_ctxskip": [1, 0], "dspark_conf": [1, 0], "dspark_conf_rows": [1, 0], "gg_pf": [2, 1], "ds41_bi": [6, 0], "draft_occ": [13, 0], "sched_bi_chunk": [3, 0], "ds41_psk": [4, 0], "ds41_psk_l20": [1, 0], "dspark_pfctx": [1, 0], "ds41_psk_cr": [1, 0], "ds41_engdd": [1, 0], "sched_noa": [2, 0], "mhc_fuse": [1, 0], "sched_row_cap": [48, 0], "exl3_x3d": [2, 0], "ar_xpush": [1, 0], "gg_gemv_m16": [1, 0], "place_swap_lent": [1, 0], "heat_min_gain_x100": [75, 150], "route_copy_ov": [1, 0]}
+2026-11-14 11:17:03 run/switches.sh exit 0: all 65 switches set from run/deepseek/switches.json 
+2026-11-14 11:17:03 switches after switches.sh: 73 of 73 switches = want
+2026-11-14 11:17:04 start lines: radiance: deepseek41: lever P (ds41_moe1, RADIANCE_DS41_MOE1, now 1) declared: moe_exl3_gate_up_dk / moe_exl3_down_dk beside the EXL3 pair of 40 of 40 trunk MoE layers, 17 .. 48 rows -- a step that is one decode segment of that height runs ONE MoE pass (the decode band's bytes per row) instead of <= 16-row pieces|  --gpu-headroom-mib 256.00 MiB   left unclaimed on purpose|  unclaimed          256.94 MiB   the headroom, the unusable above, and what MiB rounding|I[0] card 0 settled at 481.84 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 139.83 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 116.17 MiB is left for first launches|I[1] card 1 settled at 487.80 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.88 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 122.12 MiB is left for first launches|I[2] card 2 settled at 487.86 MiB free against 621.68 MiB (the 256.00 MiB --gpu-headroom-mib and 365.68 MiB kept for the step staging and for what is built on first use): 133.82 MiB of the headroom was taken after the budget read the card, by another process on it or an allocation the budget does not count, and 122.18 MiB is left f
+2026-11-14 11:17:04 check answer: "The capital of Australia is Canberra, and it officially became the capital in 1913 when the city was founded and named."
+2026-11-14 11:17:04 identity: switches 73 of 73 switches = want
+a1-vs-stored: IDENTICAL: 20 of 20 answers (ref-alone.jsonl vs a1.jsonl)
+gs20-vs-a1: IDENTICAL: 20 of 20 answers (a1.jsonl vs gs20.jsonl)
+gs20-vs-stored: IDENTICAL: 20 of 20 answers (ref-alone.jsonl vs gs20.jsonl)
+2026-11-14 11:20:08 ld16: {"answered": 20, "of": 20, "max_tokens": 192, "offset_s": 0.5, "pf_tok_asked": 8192, "conc": 16, "pf_prompt_mean": 7772, "pf_cold": 20, "pf_ttft_mean": 3.84, "pf_ttft_min": 3.21, "pf_ttft_max": 7.12, "ov_frac_min": 0.0, "ov_frac_median": 0.548, "mixed_total": 97, "mixed_min": 1, "mixed_median": 5.0, "probes_without_mixed": [], "probe_s_mean": 6.47, "c4_requests_done": 64, "c4_errors": 0, "c4_err_first": null, "window_s": 155.8, "window": {"ms_decode_step": 45.4, "tok_per_decode_step": 17.97, "acceptance": 0.601, "decode_share": 0.533, "steps": 1827, "busy_s": 145.7, "prefill_tok": 20748
+ld16-vs-a1: IDENTICAL: 20 of 20 answers (a1.jsonl vs ld16.jsonl)
+ld16-vs-stored: IDENTICAL: 20 of 20 answers (ref-alone.jsonl vs ld16.jsonl)
+2026-11-14 11:20:29 COOL cold-130000: <= 45 C after 21 s (junction/memory C) c3:00:36/40 83:00:35/36 48:00:36/42 03:00:36/40
+2026-11-14 11:20:29 cold 130000: switches 73 of 73 switches = want
+2026-11-14 11:20:51 cold 130000 (reset HTTP 200): {"status": 200, "prompt_tokens": 131137, "cached": 0, "ttft": 20.53, "tokens": 64, "finish": "length", "chars": 324, "err": null}
+2026-11-14 11:21:01 COOL cold-136000: <= 45 C after 10 s (junction/memory C) c3:00:38/38 83:00:36/36 48:00:38/40 03:00:37/40
+2026-11-14 11:21:01 cold 136000: switches 73 of 73 switches = want
+2026-11-14 11:21:24 cold 136000 (reset HTTP 200): {"status": 200, "prompt_tokens": 137135, "cached": 0, "ttft": 21.8, "tokens": 64, "finish": "length", "chars": 306, "err": null}
+2026-11-14 11:21:34 COOL cold-64000: <= 45 C after 10 s (junction/memory C) c3:00:38/38 83:00:36/36 48:00:38/40 03:00:37/40
+2026-11-14 11:21:34 cold 64000: switches 73 of 73 switches = want
+2026-11-14 11:21:45 cold 64000 (reset HTTP 200): {"status": 200, "prompt_tokens": 65650, "cached": 0, "ttft": 10.72, "tokens": 64, "finish": "length", "chars": 279, "err": null}
+2026-11-14 11:21:56 COOL cold-16000: <= 45 C after 11 s (junction/memory C) c3:00:36/38 83:00:34/34 48:00:36/40 03:00:36/38
+2026-11-14 11:21:56 cold 16000: switches 73 of 73 switches = want
+2026-11-14 11:22:00 cold 16000 (reset HTTP 200): {"status": 200, "prompt_tokens": 15777, "cached": 0, "ttft": 3.91, "tokens": 64, "finish": "length", "chars": 288, "err": null}
+2026-11-14 11:22:10 COOL u1-essay: <= 45 C after 10 s (junction/memory C) c3:00:34/34 83:00:32/32 48:00:34/36 03:00:33/36
+2026-11-14 11:22:10 1u essay: switches 73 of 73 switches = want
+2026-11-14 11:22:16 1u essay-b1-w: {"prompt": "essay", "tokens": 512, "decode_tps": 90.31, "decode_steps": 303.0, "ms_per_decode_step": 18.66, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 5.79, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}
+2026-11-14 11:22:21 1u essay-b1-r1: {"prompt": "essay", "tokens": 512, "decode_tps": 105.01, "decode_steps": 303.0, "ms_per_decode_step": 16.05, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 4.96, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}
+2026-11-14 11:22:27 1u essay-b1-r2: {"prompt": "essay", "tokens": 512, "decode_tps": 105.01, "decode_steps": 303.0, "ms_per_decode_step": 16.05, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 4.93, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}
+2026-11-14 11:22:32 1u essay-b1-r3: {"prompt": "essay", "tokens": 512, "decode_tps": 105.02, "decode_steps": 303.0, "ms_per_decode_step": 16.05, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 4.92, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}
+2026-11-14 11:22:37 1u essay-b2-w: {"prompt": "essay", "tokens": 512, "decode_tps": 104.74, "decode_steps": 303.0, "ms_per_decode_step": 16.09, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 4.93, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}
+2026-11-14 11:22:42 1u essay-b2-r1: {"prompt": "essay", "tokens": 512, "decode_tps": 104.87, "decode_steps": 303.0, "ms_per_decode_step": 16.07, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 4.93, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}
+2026-11-14 11:22:47 1u essay-b2-r2: {"prompt": "essay", "tokens": 512, "decode_tps": 104.79, "decode_steps": 303.0, "ms_per_decode_step": 16.09, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 4.93, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}
+2026-11-14 11:22:52 1u essay-b2-r3: {"prompt": "essay", "tokens": 512, "decode_tps": 104.78, "decode_steps": 303.0, "ms_per_decode_step": 16.09, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 4.93, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}
+2026-11-14 11:23:02 COOL u1-code: <= 45 C after 10 s (junction/memory C) c3:00:37/38 83:00:36/34 48:00:37/40 03:00:37/38
+2026-11-14 11:23:02 1u code: switches 73 of 73 switches = want
+2026-11-14 11:23:06 1u code-w: {"prompt": "code", "tokens": 512, "decode_tps": 146.06, "decode_steps": 138.0, "ms_per_decode_step": 25.34, "tokens_per_step": 3.71, "acceptance": 0.774, "all_steps": 139.0, "all_step_s": 3.61, "status": 200, "finish": "length", "text_chars": 2063, "text_md5": "4483fed4e8f7"}
+2026-11-14 11:23:09 1u code-r1: {"prompt": "code", "tokens": 512, "decode_tps": 181.72, "decode_steps": 138.0, "ms_per_decode_step": 20.37, "tokens_per_step": 3.71, "acceptance": 0.774, "all_steps": 139.0, "all_step_s": 2.93, "status": 200, "finish": "length", "text_chars": 2063, "text_md5": "4483fed4e8f7"}
+2026-11-14 11:23:12 1u code-r2: {"prompt": "code", "tokens": 512, "decode_tps": 181.94, "decode_steps": 138.0, "ms_per_decode_step": 20.35, "tokens_per_step": 3.71, "acceptance": 0.774, "all_steps": 139.0, "all_step_s": 2.92, "status": 200, "finish": "length", "text_chars": 2063, "text_md5": "4483fed4e8f7"}
+2026-11-14 11:23:15 1u code-r3: {"prompt": "code", "tokens": 512, "decode_tps": 182.28, "decode_steps": 138.0, "ms_per_decode_step": 20.31, "tokens_per_step": 3.71, "acceptance": 0.774, "all_steps": 139.0, "all_step_s": 2.91, "status": 200, "finish": "length", "text_chars": 2063, "text_md5": "4483fed4e8f7"}
+2026-11-14 11:23:25 COOL c1: <= 45 C after 10 s (junction/memory C) c3:00:36/36 83:00:35/34 48:00:36/38 03:00:35/38
+2026-11-14 11:23:25 mb c1-g1: switches 73 of 73 switches = want
+2026-11-14 11:23:42 mb c1-g1 (c1, gens 1): agg 136.7 tok/s, 3.77 tok / 23.3 ms a decode step, acceptance 0.766, TTFT p50 0.61 s, per-stream p50 162.2, 1 requests, 0 errors
+2026-11-14 11:23:52 COOL c4: <= 45 C after 10 s (junction/memory C) c3:00:36/36 83:00:34/32 48:00:36/38 03:00:35/36
+2026-11-14 11:23:52 mb c4-w: switches 73 of 73 switches = want
+2026-11-14 11:24:38 mb c4-w (c4, gens 3): agg 201.2 tok/s, 14.04 tok / 51.0 ms a decode step, acceptance 0.612, TTFT p50 0.69 s, per-stream p50 57.8, 12 requests, 0 errors
+2026-11-14 11:24:38 mb c4-b1: switches 73 of 73 switches = want
+2026-11-14 11:25:24 mb c4-b1 (c4, gens 3): agg 200.9 tok/s, 14.04 tok / 51.2 ms a decode step, acceptance 0.612, TTFT p50 0.69 s, per-stream p50 57.7, 12 requests, 0 errors
+2026-11-14 11:25:24 mb c4-b2: switches 73 of 73 switches = want
+2026-11-14 11:26:10 mb c4-b2 (c4, gens 3): agg 201.4 tok/s, 14.72 tok / 54.2 ms a decode step, acceptance 0.556, TTFT p50 0.69 s, per-stream p50 58.2, 12 requests, 0 errors
+2026-11-14 11:26:10 mb c4-g1: switches 73 of 73 switches = want
+2026-11-14 11:26:35 mb c4-g1 (c4, gens 1): agg 213.7 tok/s, 15.7 tok / 53.9 ms a decode step, acceptance 0.596, TTFT p50 0.68 s, per-stream p50 66.4, 4 requests, 0 errors
+2026-11-14 11:26:55 COOL c8: <= 45 C after 20 s (junction/memory C) c3:00:37/40 83:00:35/36 48:00:37/42 03:00:36/40
+2026-11-14 11:26:55 mb c8-b1: switches 73 of 73 switches = want
+2026-11-14 11:27:51 mb c8-b1 (c8, gens 2): agg 247.5 tok/s, 28.83 tok / 82.9 ms a decode step, acceptance 0.508, TTFT p50 0.76 s, per-stream p50 34.3, 17 requests, 0 errors
+2026-11-14 11:27:51 mb c8-b2: switches 73 of 73 switches = want
+2026-11-14 11:28:46 mb c8-b2 (c8, gens 2): agg 245.2 tok/s, 28.91 tok / 82.9 ms a decode step, acceptance 0.51, TTFT p50 0.79 s, per-stream p50 34.5, 17 requests, 0 errors
+2026-11-14 11:29:06 COOL c16: <= 45 C after 20 s (junction/memory C) c3:00:37/40 83:00:35/36 48:00:37/42 03:00:36/40
+2026-11-14 11:29:06 mb c16-b1: switches 73 of 73 switches = want
+2026-11-14 11:29:59 mb c16-b1 (c16, gens 1): agg 294.1 tok/s, 17.0 tok / 39.5 ms a decode step, acceptance 0.732, TTFT p50 0.58 s, per-stream p50 22.5, 16 requests, 0 errors
+2026-11-14 11:29:59 mb c16-b2: switches 73 of 73 switches = want
+2026-11-14 11:30:51 mb c16-b2 (c16, gens 1): agg 293.6 tok/s, 17.0 tok / 39.6 ms a decode step, acceptance 0.729, TTFT p50 0.58 s, per-stream p50 22.9, 16 requests, 0 errors
+2026-11-14 11:31:11 COOL c24: <= 45 C after 20 s (junction/memory C) c3:00:37/40 83:00:35/36 48:00:37/42 03:00:36/40
+2026-11-14 11:31:11 mb c24-b1: switches 73 of 73 switches = want
+2026-11-14 11:32:25 mb c24-b1 (c24, gens 1): agg 312.0 tok/s, 25.08 tok / 52.1 ms a decode step, acceptance 0.0, TTFT p50 0.61 s, per-stream p50 16.6, 24 requests, 0 errors
+2026-11-14 11:32:25 mb c24-b2: switches 73 of 73 switches = want
+2026-11-14 11:33:38 mb c24-b2 (c24, gens 1): agg 312.8 tok/s, 25.08 tok / 52.1 ms a decode step, acceptance 0.0, TTFT p50 0.6 s, per-stream p50 16.7, 24 requests, 0 errors
+2026-11-14 11:33:58 COOL c32: <= 45 C after 20 s (junction/memory C) c3:00:37/40 83:00:35/36 48:00:37/42 03:00:36/40
+2026-11-14 11:33:58 mb c32-b1: switches 73 of 73 switches = want
+2026-11-14 11:35:25 mb c32-b1 (c32, gens 1): agg 345.1 tok/s, 33.94 tok / 59.7 ms a decode step, acceptance 0.0, TTFT p50 0.68 s, per-stream p50 13.9, 32 requests, 0 errors
+2026-11-14 11:35:25 mb c32-b2: switches 73 of 73 switches = want
+2026-11-14 11:36:53 mb c32-b2 (c32, gens 1): agg 343.9 tok/s, 33.86 tok / 60.3 ms a decode step, acceptance 0.0, TTFT p50 0.69 s, per-stream p50 13.8, 32 requests, 0 errors
+2026-11-14 11:36:53 a1b: switches 73 of 73 switches = want
+a1b-vs-a1: IDENTICAL: 20 of 20 answers (a1.jsonl vs a1b.jsonl)
+2026-11-14 11:37:07 engine log: error lines 0
+2026-11-14 11:37:07 switches at the end: 73 of 73 switches = want
+2026-11-14 11:37:07 END (exit 0): stopping the server
+2026-11-14 11:37:52 containers now: [] | /dev/shm/ds41ng: 0 file(s), 0
+2026-11-14 11:38:07 POWER restored (try 1): 210 W, -50 mV, fanflat 03:00=29 48:00=35 83:00=28 c3:00=30 TOP=50 read back on all four cards | c3:00:cap=210W,vo=-50mV,j=29C,m=34C 83:00:cap=210W,vo=-50mV,j=27C,m=30C 48:00:cap=210W,vo=-50mV,j=29C,m=36C 03:00:cap=210W,vo=-50mV,j=28C,m=34C | c3:00:fan=25C/30%,50C/30%,70C/30%,85C/30%,100C/50%,2555rpm 83:00:fan=25C/28%,50C/28%,70C/28%,85C/28%,100C/50%,2464rpm 48:00:fan=25C/35%,50C/35%,70C/35%,85C/35%,100C/50%,2681rpm 03:00:fan=25C/29%,50C/29%,70C/29%,85C/29%,100C/50%,2602rpm
+2026-11-14 11:38:07 power now: c3:00:cap=210W,vo=-50mV,j=29C,m=34C 83:00:cap=210W,vo=-50mV,j=27C,m=30C 48:00:cap=210W,vo=-50mV,j=29C,m=36C 03:00:cap=210W,vo=-50mV,j=28C,m=34C
+2026-11-14 11:38:07 fans now: c3:00:fan=25C/30%,50C/30%,70C/30%,85C/30%,100C/50%,2555rpm 83:00:fan=25C/28%,50C/28%,70C/28%,85C/28%,100C/50%,2465rpm 48:00:fan=25C/35%,50C/35%,70C/35%,85C/35%,100C/50%,2685rpm 03:00:fan=25C/29%,50C/29%,70C/29%,85C/29%,100C/50%,2603rpm
+2026-11-14 11:38:07 DONE hero-ds-300w-stock

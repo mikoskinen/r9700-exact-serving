@@ -1,0 +1,12 @@
+2026-11-14 11:11:59 fanflat 03:00=90 48:00=90 83:00=90 c3:00=90 TOP=100 (flat <=85C hotspot, TOP @100C) live (user 3.11.: tasainen, rauhallinen ~2500-2700 rpm)
+2026-11-14 11:12:00 HERO DS SET stock (user 14.11.: a new hero run like 13.11.'s; the DeepSeek 300 W column at the 13.11. hero setting, run hero-ds-300w-stock): power1_cap 300 W, VDDGFX 0 mV, fanflat 90 % TOP 100 on all four cards | c3:00:cap=300W,vo=0mV,j=21C,m=18C 83:00:cap=300W,vo=0mV,j=19C,m=16C 48:00:cap=300W,vo=0mV,j=20C,m=20C 03:00:cap=300W,vo=0mV,j=21C,m=20C | c3:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3581rpm 83:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3434rpm 48:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3783rpm 03:00:fan=25C/90%,50C/90%,70C/90%,85C/90%,100C/100%,3771rpm
+2026-11-14 11:12:03 fanflat 03:00=88 TOP=100 (flat <=85C hotspot, TOP @100C) live (user 3.11.: tasainen, rauhallinen ~2500-2700 rpm)
+2026-11-14 11:12:03 fanguard 03:00: mem 20 C hotspot 21 C, <= 85 C for 30 min -> flat 90 -> 88 % (base 29, 4817 rpm before)
+2026-11-14 11:12:03 fanflat 48:00=88 TOP=100 (flat <=85C hotspot, TOP @100C) live (user 3.11.: tasainen, rauhallinen ~2500-2700 rpm)
+2026-11-14 11:12:03 fanguard 48:00: mem 20 C hotspot 20 C, <= 85 C for 30 min -> flat 90 -> 88 % (base 35, 4694 rpm before)
+2026-11-14 11:12:03 fanflat 83:00=88 TOP=100 (flat <=85C hotspot, TOP @100C) live (user 3.11.: tasainen, rauhallinen ~2500-2700 rpm)
+2026-11-14 11:12:03 fanguard 83:00: mem 18 C hotspot 20 C, <= 85 C for 30 min -> flat 90 -> 88 % (base 28, 4630 rpm before)
+2026-11-14 11:12:03 fanflat c3:00=88 TOP=100 (flat <=85C hotspot, TOP @100C) live (user 3.11.: tasainen, rauhallinen ~2500-2700 rpm)
+2026-11-14 11:12:03 fanguard c3:00: mem 20 C hotspot 21 C, <= 85 C for 30 min -> flat 90 -> 88 % (base 30, 4641 rpm before)
+2026-11-14 11:37:54 fanflat 03:00=29 48:00=35 83:00=28 c3:00=30 TOP=50 (flat <=85C hotspot, TOP @100C) live (user 3.11.: tasainen, rauhallinen ~2500-2700 rpm)
+2026-11-14 11:38:07 HERO DS RESTORE (14.11. DeepSeek stock hero run hero-ds-300w-stock ended, exit 0): power1_cap 210 W, VDDGFX -50 mV, fanflat 03:00=29 48:00=35 83:00=28 c3:00=30 TOP=50 on all four cards; read back OK | c3:00:cap=210W,vo=-50mV,j=29C,m=34C 83:00:cap=210W,vo=-50mV,j=27C,m=30C 48:00:cap=210W,vo=-50mV,j=29C,m=36C 03:00:cap=210W,vo=-50mV,j=28C,m=34C | c3:00:fan=25C/30%,50C/30%,70C/30%,85C/30%,100C/50%,2555rpm 83:00:fan=25C/28%,50C/28%,70C/28%,85C/28%,100C/50%,2462rpm 48:00:fan=25C/35%,50C/35%,70C/35%,85C/35%,100C/50%,2686rpm 03:00:fan=25C/29%,50C/29%,70C/29%,85C/29%,100C/50%,2602rpm

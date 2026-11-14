@@ -1,0 +1,1 @@
+J {"prompt": "essay", "tokens": 512, "decode_tps": 104.78, "decode_steps": 303.0, "ms_per_decode_step": 16.09, "tokens_per_step": 1.69, "acceptance": 0.751, "all_steps": 304.0, "all_step_s": 4.93, "status": 200, "finish": "length", "text_chars": 2670, "text_md5": "525f62164a3d"}

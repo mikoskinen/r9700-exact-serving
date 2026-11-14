@@ -1,0 +1,1 @@
+{"label": "gs20-vs-a1", "a": "/home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero-ds-300w-stock/id/a1.jsonl", "b": "/home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero-ds-300w-stock/id/gs20.jsonl", "n_a": 20, "n_b": 20, "n": 20, "missing": [], "n_diff": 0, "identical": true, "diff": []}

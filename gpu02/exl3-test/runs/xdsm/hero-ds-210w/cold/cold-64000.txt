@@ -1,0 +1,3 @@
+# Technical Review: CPython Standard Library Support Modules
+
+This is a review of a slice of CPython's standard library — mostly "support" modules that sit underneath the public API. They fall into a few families: bootstrap/startup helpers (`__future__`, `__hello__`, `__init__`,
