@@ -2571,8 +2571,8 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : g.max_tok;
     auto rs = [&](const SpSer::Run& r) { RAD_ISSUE_N(c, m.sp_rs, r.n * D, brow_slice(m.a_x.x, r.r0, r.n, D), RAD_NONE); };
     auto ag = [&](const SpSer::Run& r) { RAD_ISSUE_N(c, m.sp_ag, r.n * D, brow_slice(m.a_x.x, r.r0, r.n, D), RAD_NONE); };
-    auto codes = [&](const HyperConn& h) {
-        for (int64_t r0 = 0; r0 < T; r0 += band) h.codes(c, r0, std::min(band, T - r0));
+    auto codes = [&](const HyperConn& h, int64_t a, int64_t n) {
+        for (int64_t r0 = a; r0 < a + n; r0 += band) h.codes(c, r0, std::min(band, a + n - r0));
     };
     /* a connection's read on this rank's rows of a run: the decode rows and whole segments as step_serial reads them, a
      * segment's part through the K-pinned twin */
@@ -2592,7 +2592,7 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             rs(r);
             bool ss = wr.write(c, T, r.lo, r.hi - r.lo);
             if (after(r)) ss = false;
-            if (nx) { rd(*nx, r, ss); ag(r); codes(*nx); }
+            if (nx) { rd(*nx, r, ss); ag(r); codes(*nx, 0, T); }
             return;
         }
         auto half = [&](const SpSer::Run& r) {
@@ -2607,9 +2607,12 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
         wait1();                                       /* run 1 reduced: lane 1 holds nothing else yet */
         if (nx) on1(true, [&] { ag(sp.run[0]); });     /* run 0's gather beside run 1's write + read */
         half(sp.run[1]);
-        if (nx) on1(true, [&] { ag(sp.run[1]); });
+        wait1();                                       /* run 0 gathered (lane 1 holds nothing after it) */
+        if (!nx) return;
+        on1(true, [&] { ag(sp.run[1]); });
+        codes(*nx, sp.run[0].r0, sp.run[0].n);         /* run 0's codes beside run 1's gather */
         wait1();
-        if (nx) codes(*nx);
+        codes(*nx, sp.run[1].r0, sp.run[1].n);
     };
     auto none = [](const SpSer::Run&) { return false; };
     const int64_t nl = (int64_t)m.layers.size();
