@@ -1309,6 +1309,146 @@ static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::ve
        nb == 0, nb ? fmt("%lld elements differ, first at row %lld", (long long)nb, (long long)fb) : std::string());
 }
 
+/* fn4 long-prompt identity (15.11.2026, qwen/build2/LONGPROMPT.md): one Flash-Next TP4 decode step's attention for ONE
+ * sequence of 1 + n_spec = 4 rows ending at context `ctx` (head 256, gqa 6, one KV head, 4-token pages, fp8 cache, max_ctx
+ * 262144), in the launch forms the engine issues it:
+ *   A    alone, dense (rad_block_attn_gated_fp8.h, the step's last branch): the decode row over one sequence at its alone
+ *        table width (core/sched/batch.cpp: bound_bucket(ctx_len, 1024) + 4 rows + 2 draft windows, 256-block steps) with
+ *        cu_seqlens {0, 4};
+ *   B    beside a 3k-key sequence under att_bi 3 (op_attn_bi): attn_paged_pin, split_rows 1, the step's width (1024 blocks),
+ *        no cu; B16 the same launch over 16 copies of the sequence (a run of dense decode sequences);
+ *   C    alone, sparse (a step whose bound passes qsa_exact_to): the decode row over the 4 rows as 4 one-row sequences, each
+ *        its selection as qsa_select emits it below the budget (every complete page in order, the partial page last) and
+ *        its sequ ((nsel - 1) * 4 + pos % 4 + 1);
+ *   D    the loaded sparse form (att_bi 2 / 4, op_attn_gq_bi's law): attn_paged_pin over 16 copies of C's rows, split_rows 4.
+ * Prints per ctx the elements of A that differ in B, B16 and C (and C's rows that differ), and of C in D. A = B = B16 and
+ * C = D must hold; A vs C is the reading under test. --case attn_lp. */
+static int64_t lp_bound(int64_t v) {   /* core/sched/batch.cpp bound_bucket(v, 1024) */
+    if (v <= 0) return v;
+    int64_t q = 1024;
+    if (v > 64) {
+        const int lg = 63 - __builtin_clzll((unsigned long long)v);
+        if (((int64_t)1 << (lg - 5)) > q) q = (int64_t)1 << (lg - 5);
+    }
+    return (v + q - 1) / q * q;
+}
+static void attn_lp_case(const Plugin& pl, const std::vector<int32_t>& ctxs) {
+    if (!sel("attn_lp")) return;
+    const RadKernelInfo* r = find(pl, "attn_decode_h256_gqa6_bs4_fp8kv");
+    const RadKernelInfo* rp = find(pl, "attn_decode_pin_h256_gqa6_bs4_fp8kv");
+    if (!r || !rp) { skip("attn_lp", "row absent"); return; }
+    const int64_t hd = 256, gqa = 6, kvh = 1, bs = 4, qh = kvh * gqa, qd = 4, rowq = qh * hd, topk = 512, cop = 16;
+    int32_t cmax = 0;
+    for (int32_t c : ctxs) cmax = std::max(cmax, c);
+    const int64_t nblk = (cmax + bs - 1) / bs + 1, kvn = nblk * kvh * bs * 2 * hd, qn = qd * rowq;
+    std::vector<uint8_t> hkv((size_t)kvn);
+    for (int64_t i = 0; i < kvn; ++i) hkv[(size_t)i] = st_rand_e4m3((uint32_t)i + 11u);
+    std::vector<uint16_t> hq((size_t)(qn * cop));
+    for (int64_t i = 0; i < qn; ++i) hq[(size_t)i] = st_rand_bf16((uint32_t)i * 5u + 3u);
+    for (int64_t k = 1; k < cop; ++k) std::copy(hq.begin(), hq.begin() + qn, hq.begin() + k * qn);
+    void* d_kv = dalloc((size_t)kvn);
+    void* d_q = dalloc((size_t)(qn * cop) * 2);
+    void* d_oa = dalloc((size_t)qn * 2);
+    void* d_ob = dalloc((size_t)qn * 2);
+    void* d_oc = dalloc((size_t)qn * 2);
+    void* d_o16 = dalloc((size_t)(qn * cop) * 2);
+    void* d_od = dalloc((size_t)(qn * cop) * 2);
+    if (!d_kv || !d_q || !d_oa || !d_ob || !d_oc || !d_o16 || !d_od) { ok("attn_lp", false, "hipMalloc failed"); return; }
+    st_memcpy(d_kv, hkv.data(), hkv.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    auto base_ps = [&](int64_t q_len) {
+        return std::vector<RadParam>{ PI("q_len", q_len), PI("head_dim", hd), PI("gqa", gqa), PI("block_size", bs),
+                                      PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "fp8_e4m3"),
+                                      PI("max_ctx", 262144) };
+    };
+    auto rd = [&](void* d, int64_t n) { std::vector<uint16_t> h((size_t)n); st_memcpy(h.data(), d, (size_t)n * 2, hipMemcpyDeviceToHost); return h; };
+    int bad = 0;
+    for (int32_t c : ctxs) {
+        const int64_t nb = (c + bs - 1) / bs;
+        const int64_t wa = ((lp_bound(c - qd) + qd + 8 + bs - 1) / bs + 255) / 256 * 256, wb = 1024;
+        auto table = [&](int64_t w) { std::vector<int32_t> t((size_t)w, 0); for (int64_t b = 0; b < nb && b < w; ++b) t[(size_t)b] = (int32_t)b; return t; };
+        const std::vector<int32_t> ta = table(wa), tb = table(wb);
+        st_memset(d_oa, 0, (size_t)qn * 2); st_memset(d_ob, 0, (size_t)qn * 2); st_memset(d_oc, 0, (size_t)qn * 2);
+        st_memset(d_o16, 0, (size_t)(qn * cop) * 2); st_memset(d_od, 0, (size_t)(qn * cop) * 2);
+        {   /* A */
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ 1, wa }, ta), TI32({ 1 }, { c }), TF32({ 1, kvh }, 1.0f), TF32({ 1, kvh }, 1.0f),
+                TI32({ 2 }, { 0, (int32_t)qd }), T(d_oa, RAD_BF16, { qd, qh, hd }) };
+            absent(ts[4]); absent(ts[5]);
+            std::vector<RadParam> ps = base_ps(qd);
+            run_case(r, ts, ps);
+        }
+        {   /* B, B16 */
+            for (int64_t k : { (int64_t)1, cop }) {
+                std::vector<int32_t> tk; for (int64_t s = 0; s < k; ++s) tk.insert(tk.end(), tb.begin(), tb.end());
+                std::vector<RadTensor> ts = {
+                    T(d_q, RAD_BF16, { k * qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                    TI32({ k, wb }, tk), TI32({ k }, rep_i32(k, c)), TF32({ k, kvh }, 1.0f), TF32({ k, kvh }, 1.0f),
+                    T(nullptr, RAD_I32, { k + 1 }), T(k == 1 ? d_ob : d_o16, RAD_BF16, { k * qd, qh, hd }) };
+                absent(ts[4]); absent(ts[5]); absent(ts[6]);
+                std::vector<RadParam> ps = base_ps(qd);
+                ps.push_back(PI("split_rows", 1));
+                run_case(rp, ts, ps);
+            }
+        }
+        /* C, D: each row its selection */
+        std::vector<int32_t> sel1, su1;
+        for (int64_t j = 0; j < qd; ++j) {
+            const int64_t p = c - qd + j, own = (p + 1) / bs;
+            std::vector<int32_t> row((size_t)(topk + 1), -1);
+            int64_t out = 0;
+            for (int64_t b = 0; b < own && out < topk; ++b) row[(size_t)out++] = (int32_t)b;
+            if ((p + 1) % bs != 0 && own < nb) row[(size_t)out++] = (int32_t)own;
+            sel1.insert(sel1.end(), row.begin(), row.end());
+            su1.push_back(out == 0 ? 0 : (int32_t)((out - 1) * bs + p % bs + 1));
+        }
+        {   /* C */
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ qd, topk + 1 }, sel1), TI32({ qd }, su1), TF32({ qd, kvh }, 1.0f), TF32({ qd, kvh }, 1.0f),
+                T(nullptr, RAD_I32, { qd + 1 }), T(d_oc, RAD_BF16, { qd, qh, hd }) };
+            absent(ts[4]); absent(ts[5]); absent(ts[6]);
+            std::vector<RadParam> ps = base_ps(1);
+            run_case(r, ts, ps);
+        }
+        {   /* D */
+            std::vector<int32_t> sk, uk;
+            for (int64_t k = 0; k < cop; ++k) { sk.insert(sk.end(), sel1.begin(), sel1.end()); uk.insert(uk.end(), su1.begin(), su1.end()); }
+            const int64_t rows = cop * qd;
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { rows, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ rows, topk + 1 }, sk), TI32({ rows }, uk), TF32({ rows, kvh }, 1.0f), TF32({ rows, kvh }, 1.0f),
+                T(nullptr, RAD_I32, { rows + 1 }), T(d_od, RAD_BF16, { rows, qh, hd }) };
+            absent(ts[4]); absent(ts[5]); absent(ts[6]);
+            std::vector<RadParam> ps = base_ps(1);
+            ps.push_back(PI("split_rows", qd));
+            run_case(rp, ts, ps);
+        }
+        const std::vector<uint16_t> oa = rd(d_oa, qn), ob = rd(d_ob, qn), oc = rd(d_oc, qn), o16 = rd(d_o16, qn * cop),
+                                    od = rd(d_od, qn * cop);
+        int64_t nab = 0, na16 = 0, nac = 0, ncd = 0;
+        std::string rows_ac;
+        for (int64_t i = 0; i < qn; ++i) { nab += oa[(size_t)i] != ob[(size_t)i]; nac += oa[(size_t)i] != oc[(size_t)i]; }
+        for (int64_t k = 0; k < cop; ++k)
+            for (int64_t i = 0; i < qn; ++i) {
+                na16 += oa[(size_t)i] != o16[(size_t)(k * qn + i)];
+                ncd += oc[(size_t)i] != od[(size_t)(k * qn + i)];
+            }
+        for (int64_t j = 0; j < qd; ++j) {
+            int64_t d = 0;
+            for (int64_t i = j * rowq; i < (j + 1) * rowq; ++i) d += oa[(size_t)i] != oc[(size_t)i];
+            rows_ac += fmt(" %lld:%lld keys %s", (long long)j, (long long)(c - qd + j + 1), d ? "DIFF" : "same");
+        }
+        std::printf("ATTNLP ctx %d (alone width %lld blocks, loaded 1024): A vs B %lld, A vs B16 %lld, A vs C %lld of %lld "
+                    "elements differ [rows%s]; C vs D %lld of %lld\n", c, (long long)wa, (long long)nab, (long long)na16,
+                    (long long)nac, (long long)qn, rows_ac.c_str(), (long long)ncd, (long long)(qn * cop));
+        if (nab || na16 || ncd) ++bad;
+    }
+    ok("attn_lp: the dense alone launch = the pinned dense launch (B, B16); the sparse alone launch = the pinned sparse launch (D)",
+       bad == 0, bad ? fmt("%d contexts differ", bad) : std::string());
+}
+
 /* A token's bytes in a (block, head) page of an 8-bit cache: kvq 0 fp8 (K then V), 1 fp8_v4, 2
  * k6_v4 (attn_oracle_one has the layouts). */
 static int64_t kvq_row_bytes(int64_t head_dim, int kvq) {
@@ -34003,6 +34143,9 @@ static void device_phase(const Plugin& pl) {
                        { 5, 64, 255, 256, 257, 1000, 1500, 2047, 2048, 2049, 4096, 6000, 9000, 12345, 16384, 20000 }, 4);
     attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 700, 900, 1100, 1300 }, 1);
     attn_bi_batch_case(pl, "attn_decode_h256_gqa12_fp8kv", { 37, 129, 400, 777, 1024, 2049, 3000, 8191 }, 4, 12);
+    /* fn4 long prompts (15.11.2026): the dense / sparse alone launches of a 4-row decode step vs the loaded forms */
+    attn_lp_case(pl, { 376, 600, 799, 1000, 1020, 1024, 1025, 1026, 1027, 1028, 1029, 1040, 1051, 1100, 1301, 1435, 1703,
+                       2000, 2051 });
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 64,  "k6_v4",  0, 256);
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);

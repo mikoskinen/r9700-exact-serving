@@ -2772,15 +2772,24 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
          * takes the dense or sparse path by ITS OWN context against qsa_exact_to (rad_block_attn_gated_fp8.h), so the
          * launches depend on every sequence's side of that line, which the length cap does not carry. The key takes the
          * pattern; without host lengths the pass is not recorded. */
-        if (batch->draft_pass == 0 && batch->n_seq > 1 && rad::arch::fn4_attbi_flag().load(std::memory_order_relaxed) > 0) {
+        const int abf = rad::arch::fn4_attbi_flag().load(std::memory_order_relaxed);
+        if (batch->draft_pass == 0 && batch->n_seq > 1 && abf > 0) {
             const int32_t* su = batch->kv[group].seqused_h;
             int64_t ex = 0;
             for (const Layer& layer : m.layers) if (layer.full) { ex = layer.attn.qsa_exact_to; break; }
             if (ex > 0) {
                 if (!su) return 0;
+                /* att_bi 4: the pattern by each sequence's alone bound (fn4_attbi_sparse), its rows the pass's uniform
+                 * decode / verify rows; a pass whose rows do not split evenly is not recorded */
+                const int64_t rows = batch->n_tok % batch->n_seq == 0 ? batch->n_tok / batch->n_seq : 0;
+                if (abf >= 4 && rows <= 0) return 0;
                 uint64_t h = 1469598103934665603ull;
-                for (int64_t s = 0; s < batch->n_seq; ++s)
-                    h = (h ^ (uint64_t)((int64_t)su[s] > ex ? 2 : 1)) * 1099511628211ull;
+                for (int64_t s = 0; s < batch->n_seq; ++s) {
+                    const bool sp = abf >= 4 ? rad::arch::fn4_attbi_sparse(abf, (int64_t)su[s], rows, ex, m.g.max_ctx)
+                                             : (int64_t)su[s] > ex;
+                    h = (h ^ (uint64_t)(sp ? 2 : 1)) * 1099511628211ull;
+                }
+                if (abf >= 4) h ^= 0x9e3779b97f4a7c15ull;   /* not a 1..3 pattern's key */
                 return (h & ~0xffull) | (uint64_t)(3 + cap);
             }
         }
@@ -2880,7 +2889,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
-        if (value < 0 || value > 3) return -1;   /* 3: + the dense decode sequences in one pinned launch */
+        if (value < 0 || value > 4) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
