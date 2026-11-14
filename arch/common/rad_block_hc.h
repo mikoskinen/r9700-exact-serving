@@ -126,6 +126,10 @@ struct HyperConn {
      * as hc_bi 3). */
     static constexpr int64_t kBiDecRowsMax = 64;
     rad_op     op_read_bd = 0;
+    /* fn4 BI wide bit 2 at start: op_read_bd declared up to kBiWideRows (a step's decode rows above 64 in one launch, each
+     * row's bytes as in a 64-row piece: form G16 / G16p and B3 in row groups on grid.y); bd_rows its declared ceiling. */
+    int64_t    bd_rows = kBiDecRowsMax;
+    int64_t    bd_piece() const { return bd_rows > kBiDecRowsMax && fn4_biwide(2) ? bd_rows : kBiDecRowsMax; }
     void read_bd(RadCtx* c_, int64_t r0, int64_t rows, bool ss_in) const;
     /* fn4 SP-hc (RADIANCE_FN4_SPHC=1 at start, four ranks, a piece height): the read a rank's quarter of a pipelined piece
      * takes -- op_read with kc_rows = the piece's rows, so its K split is the whole piece's (libr4d hc_read). */
@@ -299,7 +303,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
         const char* e = std::getenv("RADIANCE_FN4_BIDEC");
         if (!e || !*e) e = std::getenv("RADIANCE_FN4_X3DUAL");
         if (e && *e && *e != '0' && mix_e4m3) {
-            const int64_t hi = g.max_tok < kBiDecRowsMax ? g.max_tok : kBiDecRowsMax;
+            const int64_t bdm = (fn4_biwide_start() & 2) ? kBiWideRows : kBiDecRowsMax;
+            const int64_t hi = g.max_tok < bdm ? g.max_tok : bdm;
+            bd_rows = hi;
             op_read_bd = RAD_OP(b, "hc_read",
                              RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", g.n_embd),
                                         RAD_INT("hc", c.hc), RAD_INT("lowrank", c.lowrank),

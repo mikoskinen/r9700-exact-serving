@@ -336,6 +336,24 @@ std::vector<Case> cases() {
         v.push_back({ fmt("gemm_nt_q i8a8 %s %lldx%lld", q.lbl, q.N, q.K), "gemm_nt_q", "gemm",
                       { PI("N", q.N), PI("K", q.K), PI("group", 128), PS("dtype", "i8a8") }, "" });
     v.push_back({ "gemm_nt bf16 router 512x2560", "gemm_nt", "gemm", { PI("N", 512), PI("K", 2560), PS("dtype", "bf16") }, "" });
+    v.push_back({ "gemm_nt bf16 shared gate 1x2560", "gemm_nt", "gemm", { PI("N", 1), PI("K", 2560), PS("dtype", "bf16") }, "" });
+    /* fn4 BI wide (14.11.2026): the trunk's int8 linears through gemm_nt_q_dec (the narrow tile, 64-token groups on grid.y)
+     * -- the form a step above 64 decode rows takes under bi_wide bit 1; class "wide" (M up to 512) */
+    for (const Gq& q : { Gq{ "attn q|gate", 3072, 2560 }, Gq{ "attn k / v", 256, 2560 }, Gq{ "attn o", 2560, 1536 },
+                         Gq{ "gdn in_proj qkvz", 4096, 2560 }, Gq{ "gdn out_proj", 2560, 1536 },
+                         Gq{ "shared gate_up", 1280, 2560 }, Gq{ "shared down", 2560, 640 } })
+        v.push_back({ fmt("gemm_nt_q_dec i8a8h %s %lldx%lld", q.lbl, q.N, q.K), "gemm_nt_q_dec", "wide",
+                      { PI("N", q.N), PI("K", q.K), PI("group", 128), PS("dtype", "i8a8h") }, "" });
+    /* the hc reads' bi_dec twin (hc_bi 5's one launch over a step's decode rows; up to 128 rows under bi_wide bit 2) --
+     * run under the line's RADIANCE_FN4_HC_READV (331: G16p) */
+    v.push_back({ "hc_read bi_dec block input (inject, codes) mix e4m3", "hc_read", "wide",
+                  { PI("n", 2560), PI("hc", 4), PI("lowrank", 320), PF("eps", 1e-6), PS("dtype", "bf16"),
+                    PF("wadd", 1.0), PI("inject", 1), PI("group", 128), PI("rotate", 0), PS("mix", "e4m3"),
+                    PI("bi_dec", 1) }, "" });
+    v.push_back({ "hc_read bi_dec final mixer (no inject, no codes) mix e4m3", "hc_read", "wide",
+                  { PI("n", 2560), PI("hc", 4), PI("lowrank", 320), PF("eps", 1e-6), PS("dtype", "bf16"),
+                    PF("wadd", 1.0), PI("inject", 0), PI("group", 0), PI("rotate", 0), PS("mix", "e4m3"),
+                    PI("bi_dec", 1) }, "" });
     return v;
 }
 
@@ -344,6 +362,125 @@ std::vector<long long> default_sweep() {
     for (long long i = 1; i <= 64; ++i) m.push_back(i);
     for (long long i : { 65LL, 80LL, 96LL, 127LL, 128LL, 129LL, 192LL, 256LL, 512LL, 1024LL, 2112LL, 4160LL }) m.push_back(i);
     return m;
+}
+
+/* fn4 BI wide (14.11.2026): router_gemm_topk_scatter_inv (the fused router, an init hook, batch-wide sort outputs: not
+ * run() material) at Flash-Next's TP4 rank-0 shape (K 2560, 512 experts, 128 local, top 10, shared gate). For each M:
+ *   (a) every row's logits, ids, weights and gate against the same rows in 4-row launches (a sequence alone at depth 3);
+ *   (b) logits and gate against the separate ops the engine issues above the fused band (gemm_nt at M, the engine's row);
+ *   (c) sorted / offsets / counts / inverse against a host stable sort of the launch's own ids.
+ * Returns the number of failing M. */
+int router_wide(const Plugin& pl, const std::vector<long long>& sweep) {
+    const RadKernelInfo* r = nullptr;
+    for (int k = 0; k < pl.kernel_count() && !r; ++k)
+        if (!std::strcmp(pl.kernel_at(k)->name, "router_gemm_topk_scatter_inv_bf16")) r = pl.kernel_at(k);
+    if (!r || !r->init) { std::printf("BICHECK router fused: SKIP (row absent)\n"); return 0; }
+    const long long K = 2560, NE = 512, NL = 128, TK = 10, BASE = 0;
+    long long Mmax = 4;
+    for (long long M : sweep) Mmax = std::max(Mmax, M);
+    Mmax = (Mmax + 3) / 4 * 4;
+    auto bf = [](uint64_t h) { return h_to_bf16(normalish(h) * 0.05f); };
+    std::vector<uint16_t> hx((size_t)(Mmax * K)), hw((size_t)(NE * K)), hg((size_t)K);
+    for (size_t i = 0; i < hx.size(); ++i) hx[i] = bf(key(11, 0, i / K, i % K));
+    for (size_t i = 0; i < hw.size(); ++i) hw[i] = bf(key(12, 1, i / K, i % K));
+    for (size_t i = 0; i < hg.size(); ++i) hg[i] = bf(key(13, 2, 0, i));
+    void* dx = dalloc(hx.size() * 2); void* dw = dalloc(hw.size() * 2); void* dg = dalloc(hg.size() * 2);
+    st_memcpy(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(dw, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(dg, hg.data(), hg.size() * 2, hipMemcpyHostToDevice);
+    void* dlg = dalloc((size_t)(Mmax * NE * 2)); void* did = dalloc((size_t)(Mmax * TK * 4));
+    void* dew = dalloc((size_t)(Mmax * TK * 2)); void* dso = dalloc((size_t)(Mmax * TK * 4));
+    void* dof = dalloc((size_t)(NL + 1) * 4); void* dct = dalloc((size_t)NL * 4);
+    void* dgt = dalloc((size_t)Mmax * 2); void* dinv = dalloc((size_t)(Mmax * TK * 4));
+    struct Out { std::vector<uint16_t> lg, ew, gt; std::vector<int32_t> ids, so, of, ct, inv; };
+    /* one fused launch over rows [r0, r0 + M) of x, outputs at row r0 of each per-row buffer (batch outputs at 0) */
+    auto fused = [&](long long r0, long long M) -> int {
+        const std::vector<RadParam> ps = { PI("M", M), PI("K", K), PI("n_expert", NE), PI("n_local", NL), PI("top_k", TK),
+                                           PI("norm", 1), PS("dtype", "bf16"), PI("expert_base", BASE) };
+        void* inst = nullptr;
+        int rc = r->init(ps.data(), (int)ps.size(), 0, 1, &inst);
+        if (rc != RAD_OK) return rc;
+        std::vector<RadTensor> ts = {
+            T((uint16_t*)dx + r0 * K, RAD_BF16, { M, K }), T(dw, RAD_BF16, { NE, K }), T(dg, RAD_BF16, { 1, K }),
+            T((uint16_t*)dlg + r0 * NE, RAD_BF16, { M, NE }), T((int32_t*)did + r0 * TK, RAD_I32, { M, TK }),
+            T((uint16_t*)dew + r0 * TK, RAD_BF16, { M, TK }), T(dso, RAD_I32, { M * TK }), T(dof, RAD_I32, { NL + 1 }),
+            T(dct, RAD_I32, { NL }), T((uint16_t*)dgt + r0, RAD_BF16, { M, 1 }), T(dinv, RAD_I32, { M * TK }) };
+        RadArgs a; std::memset(&a, 0, sizeof a);
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
+        a.instance = inst;
+        rc = r->launch(&a, (RadStream)nullptr);
+        if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_STATE;
+        if (r->fini) r->fini(inst);
+        return rc;
+    };
+    auto rd = [&](long long M, Out& o) {
+        o.lg.resize((size_t)(M * NE)); o.ew.resize((size_t)(M * TK)); o.gt.resize((size_t)M);
+        o.ids.resize((size_t)(M * TK)); o.so.resize((size_t)(M * TK)); o.of.resize((size_t)NL + 1); o.ct.resize((size_t)NL);
+        o.inv.resize((size_t)(M * TK));
+        st_memcpy(o.lg.data(), dlg, o.lg.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(o.ew.data(), dew, o.ew.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(o.gt.data(), dgt, o.gt.size() * 2, hipMemcpyDeviceToHost);
+        st_memcpy(o.ids.data(), did, o.ids.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(o.so.data(), dso, o.so.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(o.of.data(), dof, o.of.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(o.ct.data(), dct, o.ct.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(o.inv.data(), dinv, o.inv.size() * 4, hipMemcpyDeviceToHost);
+    };
+    /* (a)'s reference: every row in 4-row launches (per-row outputs only) */
+    Out ref;
+    for (long long r0 = 0; r0 < Mmax; r0 += 4)
+        if (fused(r0, 4) != RAD_OK) { std::printf("BICHECK router fused: FAIL (4-row launch at %lld)\n", r0); return 1; }
+    rd(Mmax, ref);
+    int bad = 0;
+    for (long long M : sweep) {
+        const int rc = fused(0, M);
+        if (rc != RAD_OK) { std::printf("  BIFAIL router fused M=%lld launch rc %d\n", M, rc); ++bad; continue; }
+        Out o; rd(M, o);
+        size_t dl = 0, di = 0, dwt = 0, dgg = 0;
+        for (size_t i = 0; i < (size_t)(M * NE); ++i) dl += o.lg[i] != ref.lg[i];
+        for (size_t i = 0; i < (size_t)(M * TK); ++i) { di += o.ids[i] != ref.ids[i]; dwt += o.ew[i] != ref.ew[i]; }
+        for (size_t i = 0; i < (size_t)M; ++i) dgg += o.gt[i] != ref.gt[i];
+        /* (c) host stable sort of this launch's ids */
+        std::vector<int32_t> cnt((size_t)NL, 0), off((size_t)NL + 1, 0), so((size_t)(M * TK), -1), inv((size_t)(M * TK), -1);
+        for (long long i = 0; i < M * TK; ++i) { const long long e = o.ids[(size_t)i] - BASE; if (e >= 0 && e < NL) ++cnt[(size_t)e]; }
+        for (long long e = 0; e < NL; ++e) off[(size_t)e + 1] = off[(size_t)e] + cnt[(size_t)e];
+        std::vector<int32_t> fillp(off.begin(), off.end() - 1);
+        for (long long i = 0; i < M * TK; ++i) {
+            const long long e = o.ids[(size_t)i] - BASE;
+            if (e < 0 || e >= NL) continue;
+            so[(size_t)fillp[(size_t)e]] = (int32_t)i; inv[(size_t)i] = fillp[(size_t)e]++;
+        }
+        size_t ds = 0;
+        for (long long e = 0; e < NL; ++e) ds += (o.of[(size_t)e] != off[(size_t)e]) + (o.ct[(size_t)e] != cnt[(size_t)e]);
+        ds += o.of[(size_t)NL] != off[(size_t)NL];
+        for (long long i = 0; i < M * TK; ++i) ds += (o.so[(size_t)i] != so[(size_t)i]) + (o.inv[(size_t)i] != inv[(size_t)i]);
+        /* (b) the separate ops' logits and gate at M (the engine's gemm_nt rows at this M) */
+        size_t dsl = 0, dsg = 0; std::string rows;
+        {
+            const std::vector<RadParam> pr = { PI("M", M), PI("N", NE), PI("K", K), PS("dtype", "bf16") };
+            const std::vector<RadParam> pg = { PI("M", M), PI("N", 1), PI("K", K), PS("dtype", "bf16") };
+            const RadKernelInfo* rr = pick(pl, "gemm_nt", pr); const RadKernelInfo* rg = pick(pl, "gemm_nt", pg);
+            void* yl = dalloc((size_t)(M * NE * 2)); void* yg = dalloc((size_t)M * 2);
+            int e1 = rr ? launch_row(rr, { T(dx, RAD_BF16, { M, K }), T(dw, RAD_BF16, { NE, K }), T(yl, RAD_BF16, { M, NE }) }, pr) : -1;
+            int e2 = rg ? launch_row(rg, { T(dx, RAD_BF16, { M, K }), T(dg, RAD_BF16, { 1, K }), T(yg, RAD_BF16, { M, 1 }) }, pg) : -1;
+            rows = fmt("%s / %s", rr ? rr->name : "-", rg ? rg->name : "-");
+            if (e1 || e2) { dsl = dsg = (size_t)-1; }
+            else {
+                std::vector<uint16_t> hl((size_t)(M * NE)), hgg((size_t)M);
+                st_memcpy(hl.data(), yl, hl.size() * 2, hipMemcpyDeviceToHost);
+                st_memcpy(hgg.data(), yg, hgg.size() * 2, hipMemcpyDeviceToHost);
+                for (size_t i = 0; i < hl.size(); ++i) dsl += hl[i] != o.lg[i];
+                for (size_t i = 0; i < hgg.size(); ++i) dsg += hgg[i] != o.gt[i];
+            }
+        }
+        const bool good = dl == 0 && di == 0 && dwt == 0 && dgg == 0 && ds == 0 && dsl == 0 && dsg == 0;
+        if (!good) ++bad;
+        std::printf("BICHECK router fused M=%lld: %s | vs 4-row launches: logits %zu, ids %zu, weights %zu, gate %zu differ; "
+                    "sort vs host %zu; vs separate gemm_nt (%s): logits %zu, gate %zu\n", M, good ? "INVARIANT" : "FLIPS",
+                    dl, di, dwt, dgg, ds, rows.c_str(), dsl, dsg);
+        std::fflush(stdout);
+    }
+    return bad;
 }
 
 }  // namespace bi
@@ -398,6 +535,15 @@ static void fn_bi_check(const Plugin& pl, const char* classes, const char* mlist
         std::fflush(stdout);
     }
     dfree_all();
+    if (("," + want + ",").find(",router,") != std::string::npos || want == "all") {
+        std::vector<long long> rs;
+        for (long long M : sweep) if (M <= 128) rs.push_back(M);
+        if (rs.empty()) rs = { 1, 4, 16, 64, 65, 96, 128 };
+        ++n;
+        const int rb = bi::router_wide(pl, rs);
+        if (rb) { ++flip; ++g_fail; } else ++inv;
+        dfree_all();
+    }
     std::printf("BICHECK summary: %d cases, %d invariant, %d flip, %d skipped\n", n, inv, flip, sk);
 }
 

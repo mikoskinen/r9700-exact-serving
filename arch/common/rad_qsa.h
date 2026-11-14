@@ -330,7 +330,7 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * row pitch and writes the query heads contiguous and rotated. `n_head` 0 is the k-only form:
      * no q_gate, q_w or q_out, and `gate_out` absent. `T <= qprep_rows` is a correctness bound
      * (see declare()). */
-    if (op_qprep && T <= qprep_rows && !rope_mixed(batch)) {
+    if (op_qprep && T <= qk_fuse_now(qprep_rows) && !rope_mixed(batch)) {
         RAD_ISSUE_N(c_, op_qprep, T,
                     RAD_NONE, brows(w.qk, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
                     RAD_NONE, RAD_W(w_qn),

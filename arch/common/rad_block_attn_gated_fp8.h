@@ -244,7 +244,7 @@ struct AttnGatedFP8 {
         return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) &&
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
-               !(T <= fused_rows) && batch->positions && !rope_mixed(batch) &&
+               !(T <= qk_fuse_now(fused_rows)) && batch->positions && !rope_mixed(batch) &&
                kvb && !kvb->stream && kvb->slot_mapping && kvb->block_table && kvb->seqused;
     }
 };
@@ -741,7 +741,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per
      * token, so a pass with media tokens (differing components) takes the unfused path with the
      * full [3, T] positions. */
-    const bool fuse_ok = T <= fused_rows && !rope_mixed(batch);
+    const bool fuse_ok = T <= qk_fuse_now(fused_rows) && !rope_mixed(batch);   /* fn4 BI wide bit 8: the band now */
     /* A streamed group folds the streamed store into the prologue instead (op_fused_stream); one
      * whose layer has no mirror row leaves the store to store_cache, which fails the step. */
     const bool streamed = kvb && kvb->stream;

@@ -384,8 +384,9 @@ static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t
     /* hc_bi 5 (12.11.2026, 199: hc_bi 3's 8-row reads cost 15.7 % at c16): the decode rows in one launch through the
      * twin (libr4d bi_dec: form G in 8-row groups, B3 in 16-row groups; each row's bytes as at 3). */
     if (m.bi_mode == 5 && hcx.op_read_bd) {
-        for (int64_t p = a; p < b; p += HyperConn::kBiDecRowsMax)
-            hcx.read_bd(c, p, std::min<int64_t>(HyperConn::kBiDecRowsMax, b - p), ss);
+        const int64_t pc = hcx.bd_piece();   /* 64, or bd_rows under bi_wide bit 2 */
+        for (int64_t p = a; p < b; p += pc)
+            hcx.read_bd(c, p, std::min<int64_t>(pc, b - p), ss);
         return;
     }
     /* A connection without the inject gains (the final read: libr4d's form G wants them) takes the per-row kernels
@@ -2144,7 +2145,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     if (m.ple_layer >= 0) m.ple.ids(c, batch);
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
-    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+    if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
     /* The delta net runs a piece at a time over the bounds (ArPieces::cu) in a step of one
@@ -2346,7 +2347,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
 
-    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+    if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
     /* fn4 W1b: whether the stream's last change was a write that stored the norm scales for its rows. */
@@ -2408,7 +2409,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
          * because the indexer reads the same table, the head's QSA selection and so the accepted
          * text shift at tie level at long context. A row depends only on its position, so
          * re-filling is idempotent. */
-        if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+        if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
             RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
         m.mtp.qsa_win_cu = pipe_bounds(c, batch, m);
         m.mtp.step(c, batch);
@@ -2600,7 +2601,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     }
     if (name && std::strcmp(name, "bi_wide") == 0) {   /* fn4 BI wide: the forms above 64 decode rows (mask; RADIANCE_FN4_BI_WIDE declares) */
         if (value < 0 || value > 15) return -1;
-        if (value && !rad::arch::fn4_bi_wide_declared()) return -1;
+        if (value & ~rad::arch::fn4_biwide_start()) return -1;   /* only the forms the start value declared */
         rad::arch::fn4_biwide_flag().store(value, std::memory_order_relaxed);
         return 1;
     }

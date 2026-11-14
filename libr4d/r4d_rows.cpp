@@ -5213,7 +5213,7 @@ static const RadConstraint cRouterSigmoidScatter[] = { C_GE("M", 1),        C_LE
                                                        C_IN("dtype", "f32") };
 /* The selection's bounds and the skinny GEMM's decode band: four 16-row tiles. */
 static const RadConstraint cRouterGemmTopkScatter[] = {
-    C_GE("M", 1), C_LE("M", 64), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("M", 1), C_LE("M", 128), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
     C_GE("top_k", 1), C_LE("top_k", 32), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cMoeScatter[] = {
@@ -9298,7 +9298,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
   "the router GEMM, its top-k and the stable counting sort in one launch -- the last workgroup "
   "of the GEMM ranks -- and optionally the shared expert's one-column gate beside it",
-  "M <= 64 and M*top_k <= 1024; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
+  "M <= 128 and M*top_k <= 2048; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
   "16 times the split the bf16 skinny GEMM's law picks",
   "bf16 activation and weights, fp32 accumulate; bf16 logits, gate and weights, i32 ids, "
   "sorted slots, offsets and counts out",
@@ -9311,7 +9311,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "router_gemm_topk_scatter_inv_bf16", "router_gemm_topk_scatter_inv", "moe",
   "router_gemm_topk_scatter's one launch, its sort also writing every slot's row in the sort "
   "(the inverse moe_gather_inv reads)",
-  "M <= 64 and M*top_k <= 1024; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
+  "M <= 128 and M*top_k <= 2048; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
   "16 times the split the bf16 skinny GEMM's law picks",
   "bf16 activation and weights, fp32 accumulate; bf16 logits, gate and weights, i32 ids, "
   "sorted slots, offsets, counts and inverse out",

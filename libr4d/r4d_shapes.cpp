@@ -1623,7 +1623,7 @@ extern "C" int r4d_shape_router_gemm_topk_scatter(const RadParam* p, int n_p, in
     /* At most 512 experts: the selection keeps sixteen logits per lane (kMaxExpert in
      * r4d_moe.hip), the shim's bound and the row's constraint. */
     if (ne <= 0 || ne > 512 || k <= 0 || k > ne || K <= 0) return RAD_E_UNSUPPORTED;
-    if (M > 64 || M * k > 1024) return RAD_E_UNSUPPORTED;
+    if (M > 128 || M * k > 2048) return RAD_E_UNSUPPORTED;   /* kRgMaxM, kScatterCap (fn4 BI wide) */
     const int64_t nl = pi(p, n_p, "n_local", ne);
     if (nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;
     const uint32_t D = dt_act(p, n_p, "dtype");
