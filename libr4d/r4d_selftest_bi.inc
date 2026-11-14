@@ -160,6 +160,29 @@ struct Result {
     int fails = 0;
 };
 
+/* launch_row on a stream of its own (fn4 BI wide, 14.11.2026): hc_read's form G counters (hc_mix_ctr) are keyed on the
+ * stream and the null stream gets none, so the bi_dec forms refused every launch from the null stream (RAD_E_SHAPE). */
+int launch_stream(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+    static hipStream_t s = [] { hipStream_t x = nullptr; return hipStreamCreateWithFlags(&x, hipStreamNonBlocking) == hipSuccess ? x : nullptr; }();
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    if (r->scratch) {
+        const int64_t need = r->scratch(&a);
+        if (need < 0) return (int)need;
+        if (need > 0) {
+            a.scratch = dalloc((size_t)need);
+            a.scratch_bytes = need;
+            if (!a.scratch) return RAD_E_NOMEM;
+        }
+    }
+    const int rc = r->launch(&a, (RadStream)s);
+    if (rc != RAD_OK) return rc;
+    return hipStreamSynchronize(s) == hipSuccess ? RAD_OK : RAD_E_STATE;
+}
+
 /* Run one case over the sweep. */
 Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep) {
     Result R;
@@ -176,6 +199,9 @@ Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep)
     RadShapeFn sh = nullptr;
     for (int k = 0; k < pl.kernel_count() && !sh; ++k)
         if (!std::strcmp(pl.kernel_at(k)->op, c.op.c_str()) && pl.kernel_at(k)->opd_shape) sh = pl.kernel_at(k)->opd_shape;
+    /* fn4 BI wide: gemm_nt_q_dec is gemm_nt_q's schema under its own name; its operands are gemm_nt_q's */
+    for (int k = 0; k < pl.kernel_count() && !sh && c.op == "gemm_nt_q_dec"; ++k)
+        if (!std::strcmp(pl.kernel_at(k)->op, "gemm_nt_q") && pl.kernel_at(k)->opd_shape) sh = pl.kernel_at(k)->opd_shape;
     if (!sh) { R.skip = "no shape hook"; return R; }
     std::vector<Opd> od((size_t)sc->n_operands);
     const uint64_t seed = std::hash<std::string>{}(c.label);
@@ -252,7 +278,7 @@ Result run(const Plugin& pl, const Case& c, const std::vector<long long>& sweep)
             }
             ts.push_back(T(base, o.da.dtype, shp));
         }
-        return launch_row(r, ts, ps);
+        return launch_stream(r, ts, ps);
     };
     /* output bytes of row `row` of the last launch (in the OUT / INOUT row operands) */
     auto outrow = [&](long long first, long long row, std::vector<uint8_t>& v) {
