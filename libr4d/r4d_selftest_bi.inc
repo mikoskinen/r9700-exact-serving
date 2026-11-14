@@ -163,7 +163,8 @@ struct Result {
 /* launch_row on a stream of its own (fn4 BI wide, 14.11.2026): hc_read's form G counters (hc_mix_ctr) are keyed on the
  * stream and the null stream gets none, so the bi_dec forms refused every launch from the null stream (RAD_E_SHAPE). */
 int launch_stream(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
-    static hipStream_t s = [] { hipStream_t x = nullptr; return hipStreamCreateWithFlags(&x, hipStreamNonBlocking) == hipSuccess ? x : nullptr; }();
+    /* blocking (the harness's hipMemset / hipMemcpy run on the null stream; a non-blocking stream raced them: B2 17:19) */
+    static hipStream_t s = [] { hipStream_t x = nullptr; return hipStreamCreate(&x) == hipSuccess ? x : nullptr; }();
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size();
@@ -178,9 +179,10 @@ int launch_stream(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector
             if (!a.scratch) return RAD_E_NOMEM;
         }
     }
+    if (hipDeviceSynchronize() != hipSuccess) return RAD_E_STATE;   /* the operands' fills done before the launch */
     const int rc = r->launch(&a, (RadStream)s);
     if (rc != RAD_OK) return rc;
-    return hipStreamSynchronize(s) == hipSuccess ? RAD_OK : RAD_E_STATE;
+    return hipDeviceSynchronize() == hipSuccess ? RAD_OK : RAD_E_STATE;
 }
 
 /* Run one case over the sweep. */
