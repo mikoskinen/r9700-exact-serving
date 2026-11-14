@@ -329,6 +329,21 @@ public:
     }
     int  occ_k() const { return occ_k_; }
     void set_occ_k(int k) { occ_k_ = k < 1 ? 1 : k > 4096 ? 4096 : k; }
+    /* SPB, the depth cap by occupancy (fn4 draft_dcap / draft_dcap_n; ds41-etp-spb): 0 off (D7 as it was). D > 0: a
+     * cycle that plans at least dcap_n() decode rows chooses its head depth over kMinDepth .. D only, and a depth above
+     * D in force moves down to that choice at once (no hold, no hysteresis); a cycle under dcap_n() rows chooses as
+     * before, so a move back above D waits kHold cycles and kHyst. On the ETP build at 8 sequences D7 settled at depth 4
+     * in some starts (40 rows at 2.66 ms a token) where depth 3 ran 32 rows at 2.48 ms (etp/FOLLOWUP.md STEP 1): the
+     * other depth's step time is measured only while it runs, so a start can stay on the slower one. Exact: it moves
+     * only which depth a step verifies. */
+    static constexpr int kDcapN = 8;
+    int  dcap() const { return dcap_d_; }
+    void set_dcap(int d) { dcap_d_ = d < 0 ? 0 : d > 64 ? 64 : d; }
+    int  dcap_n() const { return dcap_n_; }
+    void set_dcap_n(int n) { dcap_n_ = n < 1 ? 1 : n > 64 ? 64 : n; }
+    /* Cycles whose choice the cap bounded (the deepest stop above D), and moves down it forced. For tests and the report. */
+    int64_t dcap_cycles() const { return n_dcap_; }
+    int64_t dcap_moves() const { return n_dcap_moves_; }
     /* Whether occupancy holds depth 0 now; the cycles it held, and its moves (on and off). For tests and the report. */
     bool    occ_held() const { return occ_on_; }
     int64_t occ_cycles() const { return n_occ_; }
@@ -481,6 +496,11 @@ private:
     bool    occ_on_ = false;
     int32_t occ_hi_ = 0, occ_lo_ = 0;
     int64_t n_occ_ = 0, n_occ_moves_ = 0;
+    /* SPB (dcap()): the switch, its row threshold, the counters. */
+    int32_t dcap_d_ = 0;
+    int32_t dcap_n_ = kDcapN;
+    int32_t dcap_free_ = 0;                       /* cycles since the cap last bounded a choice */
+    int64_t n_dcap_ = 0, n_dcap_moves_ = 0;
     /* The ratio class `c` borrows (kBorrowMin, kBorrowDamp), or 0 when no neighbour has one. */
     double  borrowed_ratio(int c) const;
     bool    zero_now() const {

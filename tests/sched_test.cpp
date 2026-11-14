@@ -5368,6 +5368,58 @@ DraftController c4_controller(bool borrow, int lent8, DraftAdapt* u, DraftAdapt*
 }
 }  /* namespace */
 
+/* SPB, the depth cap by occupancy (draft_dcap / draft_dcap_n): eight sequences whose estimates (0.9 a position) and step
+ * times (a flat 40 ms at every depth) put D7 at depth 5. With draft_dcap 3 (from the default 8 rows) the same cycles choose
+ * depth 3 at once -- a controller already at 5 moves down at the first capped cycle, with no hold -- and every capped
+ * cycle is counted; under 8 rows the cap does not hold, and the move back up waits D7's hold. draft_dcap 0 is D7's own
+ * choice, cycle for cycle. */
+TEST(the_depth_cap_holds_the_head_depth_from_its_rows_and_hands_back_below_them) {
+    DraftController d7 = adaptive_controller(5);
+    CHECK_EQ(d7.dcap(), 0);
+    CHECK_EQ(d7.dcap_n(), DraftController::kDcapN);
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    for (int i = 0; i < 8; ++i) { u[i] = estimate(d7, 0.9, 0.9); uf[i] = &u[i]; }
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) {
+            d7.step_time(d, 8, 40.0);
+            d7.step_time(d, 6, 30.0);
+        }
+    DraftController off = d7, cap = d7;
+    off.set_dcap(0);
+    cap.set_dcap(65);
+    CHECK_EQ(cap.dcap(), 64);   /* clamped (fn4 refuses 65) */
+    cap.set_dcap(3);
+    cap.set_dcap_n(0);
+    CHECK_EQ(cap.dcap_n(), 1);  /* clamped (fn4 refuses 0) */
+    cap.set_dcap_n(8);
+    for (int t = 0; t < 20; ++t) {
+        CHECK_EQ(d7.plan_step(uf, 8, 8), off.plan_step(uf, 8, 8));
+        CHECK_EQ(cap.plan_step(uf, 8, 8), 3);
+    }
+    CHECK_EQ(d7.step_depth(), 5);
+    CHECK_EQ(cap.step_window(), 3);
+    CHECK_EQ(cap.dcap_cycles(), (int64_t)20);
+    CHECK_EQ(cap.dcap_moves(), (int64_t)0);   /* chose 3 outright: no depth above it was in force */
+    CHECK_EQ(off.dcap_cycles(), (int64_t)0);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(cap.window_for(u[i]), 3);
+    /* Under 8 rows the cap does not hold: D7's choice comes back only past its hold (kHold cycles). */
+    int at3 = 0;
+    for (int t = 0; t < DraftController::kHold + 4; ++t) at3 += cap.plan_step(uf, 6, 6) == 3 ? 1 : 0;
+    CHECK(at3 >= DraftController::kHold - 1);
+    CHECK_EQ(cap.step_depth(), 5);
+    CHECK_EQ(cap.dcap_cycles(), (int64_t)20);
+    /* Back at 8 rows: down to 3 at the first cycle (a forced move), however recently the depth moved. */
+    CHECK_EQ(cap.plan_step(uf, 8, 8), 3);
+    CHECK_EQ(cap.dcap_moves(), (int64_t)1);
+    /* Off between steps: D7's own choice again (back to 5 past its hold). */
+    cap.set_dcap(0);
+    int at5 = 0;
+    for (int t = 0; t < 40; ++t) at5 += cap.plan_step(uf, 8, 8) == 5 ? 1 : 0;
+    CHECK(at5 > 0);
+    CHECK_EQ(cap.dcap_cycles(), (int64_t)21);
+}
+
 TEST(the_borrow_prices_a_class_never_lent_with_its_nearest_neighbours_lent_ratio) {
     DraftAdapt u[8];
     DraftAdapt* uf[8];

@@ -375,6 +375,10 @@ public:
      * the rows N (1 .. 64); the cycles K (1 .. 4096, default 32). Return the values the scheduler now runs. */
     int      set_draft_occ(int v);
     int      set_draft_occ_k(int v);
+    /* fn4 draft_dcap / draft_dcap_n (SPB, DraftController::dcap / dcap_n): the head depth held to at most D (1 .. 64, 0 off)
+     * once a cycle plans at least N decode rows (1 .. 64, default 8). Return the values the scheduler now runs. */
+    int      set_draft_dcap(int v);
+    int      set_draft_dcap_n(int v);
     /* Lever PSK design 2 (ds41-psk2): `mode` the deepseek41 plugin's applied fn4 ds41_psk (2 / 3 = anchors; anything
      * else plans nothing), read by the engine at its first release and after every fn4 change; fn4 ds41_psk_k (the
      * scheduler's: 1 .. 4096, default kPskK) the anchor stride over the periodic checkpoint positions. A request takes
