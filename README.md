@@ -1,5 +1,8 @@
 # DeepSeek V4.1 Flash and Qwen Flash-Next (EXL3) on 4x AMD Radeon AI PRO R9700
 
+Update 14.11.2026: a new matrix kernel runs DeepSeek's dense layers on the RDNA4 matrix cores, and MTP
+drafting stays on with up to 12 concurrent requests, which raises the DeepSeek results considerably.
+
 This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
 AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
 whether it runs alone or beside other requests. The notes are written for people who run large MoE
@@ -25,20 +28,20 @@ voltage offset, and the everyday setting caps each card at 210 W with a -50 mV v
 
 | Measure | DeepSeek, stock 300 W | DeepSeek, 210 W | Qwen, stock 300 W | Qwen, 210 W |
 |---|---|---|---|---|
-| 1 user | 97 prose / 165 code | 91 prose / 152 code | 269 | 262 |
-| 4 users | 176 | 172 | 618 | 583 |
-| 8 users | 208 | 192 | 833 | 779 |
-| 16 users | 259 | 237 | 1,093 | 1,027 |
-| Prefill 16k | 3,740 | 3,700 | 9,540 | 9,100 |
-| Prefill 64k | 6,020 | 5,530 | 9,810 | 9,340 |
-| Prefill 128k | 6,140 | 5,610 | 9,700 | 9,240 |
+| 1 user | 105 prose / 182 code | 101 prose / 173 code | 269 | 262 |
+| 4 users | 201 | 192 | 618 | 583 |
+| 8 users | 246 | 234 | 833 | 779 |
+| 16 users | 294 | 277 | 1,093 | 1,027 |
+| Prefill 16k | 4,040 | 3,910 | 9,540 | 9,100 |
+| Prefill 64k | 6,120 | 5,600 | 9,810 | 9,340 |
+| Prefill 128k | 6,390 | 5,800 | 9,700 | 9,240 |
 
 ## What exact means
 
 Exact means the output is byte-identical to each model's reference engine, and a prompt gets the same
 answer alone or next to other requests. This matters for a coding agent, whose answer to the same
-context shouldn't change because other sessions are running on the same cards. In a 36-minute run
-under load, all 160 of DeepSeek's answers stayed identical.
+context shouldn't change because other sessions are running on the same cards. In a 38-minute run
+under load, all 160 of DeepSeek's answers stay identical.
 
 ## Hardware changes
 
@@ -169,14 +172,15 @@ docker run -d --name deepseek --init --network host \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/ds41-exl3:/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
   --env-file run/deepseek/deepseek.env \
-  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-e231d919 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-ac0bf129 \
   --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --served-model-name deepseek-v4.1-flash \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact \
   --placement expert_tiered --host-pool-mib 19456 --ngram-placement ram=/ngram \
-  --max-num-seqs 16 --max-model-len 524288 --max-num-batched-tokens 4160 \
+  --max-num-seqs 32 --max-model-len 524288 --max-num-batched-tokens 4160 \
   --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
   --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
-  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
+  --gpu-headroom-mib 256
 run/switches.sh run/deepseek/switches.json
 ```
 

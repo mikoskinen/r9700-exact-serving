@@ -24,25 +24,41 @@ Only two model lines were optimised:
 Other models and quantisations weren't tuned. The numbers, levers and kernel forms here apply to
 these two lines on this hardware.
 
-## Results (13.11.2026)
+## Results
 
-Every card runs at a 210 W cap with a -50 mV voltage offset, the four cards run tensor parallel, and
+Every card runs at a 210 W cap with a -50 mV voltage offset unless a column says stock 300 W, which is
+the card default of 300 W with no voltage offset. The four cards run tensor parallel, and
 decoding is greedy (temperature 0). In "mb cN", a microbenchmark runs N concurrent streams and the
 aggregate tok/s counts their generated tokens. Per-user tok/s is the aggregate divided by N, computed
 here rather than measured.
 
-### DeepSeek V4.1 Flash (EXL3 2.25 bpw), stack "int16"
+### DeepSeek V4.1 Flash (EXL3 2.25 bpw), 14.11.2026
 
-| load point | result | per user | target | vs target | how it was measured |
-|---|---|---|---|---|---|
-| 1 user decode | 90.77 tok/s | 90.77 | >= 90 | +0.9 % | int16 vs int15, in-process A B B A, mean of 6 readings (spread 0.07 %) [S1] |
-| mb c4 | 171.55 tok/s | ~42.9 | >= 160 | +7.2 % | int16, in-process, fixed prompts, gens window [S1] |
-| mb c8 | 191.95 tok/s | ~24.0 | >= 200 | **-4.0 %** | int15 image with the int16 switches, in-process screen [S2] |
-| mb c16 | 237.0 tok/s | ~14.8 | (none) | | same screen [S2] |
-| 136k-token cold prefill | TTFT 24.64 s (137,135 prompt tokens, ~5,570 tok/s) | | TTFT <= 35 s | -29.6 % (better) | int16, after a prefix-cache reset [S1] |
+| load point | stock 300 W [S1] | 210 W [S2] | target | how it was measured |
+|---|---|---|---|---|
+| 1 user, prose | 104.91 tok/s | 101.30 tok/s | >= 90 | 512-token greedy answer to an essay prompt, mean of 6 readings in two blocks of 3, each block after one discarded reading |
+| 1 user, code | 181.98 tok/s | 173.29 tok/s | >= 90 | the same with a code prompt, mean of 3 readings after one discarded reading |
+| mb c4 | 201.15 tok/s | 191.60 tok/s | >= 160 | fixed prompts, gens window of 3, mean of 2 blocks after one discarded block |
+| mb c8 | 246.35 tok/s | 234.15 tok/s | >= 200 | fixed prompts, gens window of 2, mean of 2 blocks |
+| mb c16 | 293.85 tok/s | 276.90 tok/s | (none) | fixed prompts, gens window of 1, mean of 2 blocks |
+| prefill 16k (15,777 tokens) | 4,035 tok/s, TTFT 3.91 s | 3,915 tok/s, TTFT 4.03 s | (none) | one request after a prefix-cache reset, prompt tokens divided by the TTFT |
+| prefill 64k (65,650 tokens) | 6,124 tok/s, TTFT 10.72 s | 5,597 tok/s, TTFT 11.73 s | (none) | the same |
+| prefill 128k (131,137 tokens) | 6,388 tok/s, TTFT 20.53 s | 5,797 tok/s, TTFT 22.62 s | (none) | the same |
+| 136k-token cold prefill (137,135 tokens) | 6,291 tok/s, TTFT 21.80 s | 5,714 tok/s, TTFT 24.00 s | >= 4000 tok/s, TTFT <= 35 s | the same |
 
-The c8 target isn't met yet. The c4 reading uses a different measurement window from the earlier
-c4 readings, and the two aren't directly comparable [S1].
+Every target in the table is met at both settings [S16]. The README rounds decode to whole tok/s and
+prefill to the nearest 10 tok/s.
+
+Each column comes from one server start of the image 4c779f21d4ea
+(`ghcr.io/mikoskinen/r9700-exact-serving:deepseek-ac0bf129`) with the README's `docker run` command
+and `run/switches.sh`. The cards cool to 45 °C or less before the start and before each speed
+section. The stock start sets every card to the values of `run/power.sh 300` and checks that every
+card reports them. Three seconds later the fan guard in `gpu02/host/fanguard.sh` lowers the flat fan
+value from 90 to 88 %, where it stays until the end of the run [S1][S17]. In both starts the 73
+runtime switches read back as expected before each section and at the end. The 20 identity probes
+give the same answers alone, all at once, one at a time beside 16 decode streams with a fresh
+7,772-token prefill 0.5 s into each probe, and alone again at the end. At both settings these answers
+equal the stored alone answers of this build (`ref-alone.jsonl`) [S1][S2].
 
 ### Qwen Flash-Next (EXL3 4.05 bpw), batch-invariant set "S9"
 
@@ -74,9 +90,11 @@ Each candidate change goes through the following checks:
 2. **Under load (batch invariance):** the same prompts are run beside other decoders, with staggered
    prefill arrivals and 16 concurrent sequences. The answers must still match the answers given
    alone [S7].
-3. **Soaks:** long windows of loaded cycles, compared strictly each cycle. On 13.11.2026:
-   - DeepSeek int16: 8 cycles x 20 probes under c12 load plus ~8k-token arrivals. 160 of 160
-     identical, 0 errors, over 36.3 minutes [S8].
+3. **Soaks:** long windows of loaded cycles, compared strictly each cycle:
+   - DeepSeek, 14.11.2026: 8 cycles x 20 probes beside 8 to 32 decode streams, with a fresh
+     7,772-token prefill 0.5 s into every probe. 160 of 160 identical, 0 errors, over 37.9 minutes
+     of load windows. The soak start runs the same image, and its switches read back the same 73
+     values, at `--gpu-headroom-mib 245` [S18].
    - Qwen S9: 8 cycles x 20 probes under c12 load plus a staggered ~16k-token prefill, with about 62 %
      of probes in flight. 160 of 160 identical, and the control run afterwards was also identical.
      Every card stayed at its 210 W cap [S5][S9].
@@ -270,9 +288,9 @@ its own history.
 
 | branch prefix | upstream | contents |
 |---|---|---|
-| `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 113 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. int16 is `deepseek/ds41-fuse` (engine e231d919). |
+| `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 120 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit ac0bf129, which `deepseek/current` contains. |
 | `qwen/` | radiance main (451b136) | 17 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. |
-| `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 23 branches of EXL3 kernel work for both lines. int16 uses `exl3/ds41-k25u` (38b88ec6). |
+| `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 24 branches of EXL3 kernel work for both lines. The README's DeepSeek image uses EXL3 commit df1105a6, which `exl3/current` contains. |
 
 Upstream release tags carry the same prefixes, for example `radiance/v1.15.1` and `exl3/v1.3.0`. The registry
 names branches without the prefix. A branch name alone doesn't tell whether its lever was adopted.
@@ -314,8 +332,8 @@ ZFUSE BLOCK c8-1-G-B (B, c8 gens): agg 191.7 tok/s, window 42.6 s, 16 requests, 
 
 Line numbers refer to the copies in this repository (`docs/`), as of 13.11.2026.
 
-- [S1] gpu02/exl3-test/runs/xdsm/zzzc16/zc16sum.txt:8-21 (int16 1u / c4 / 136k), docs/LEVERS.md:249, targets docs/LEVERS.md:150.
-- [S2] docs/LEVERS.md:249 (ZZZB-FUSE screen: c8 191.70 -> 191.95, c16 236.8 -> 237.0), gpu02/exl3-test/runs/xdsm/zzzfuse/fusesum.txt.
+- [S1] gpu02/exl3-test/runs/xdsm/hero-ds-300w-stock/ (the stock 300 W start): u1.jsonl:2-4 and :6-8 (1 user, prose), :10-12 (1 user, code), mb.jsonl:3-4 (c4), :6-7 (c8), :8-9 (c16), cold.jsonl:4, :3, :1 and :2 (prefill 16k, 64k, 128k and 136k: prompt_tokens and ttft), run.log:3 (the power setting read back on every card) and its COOL lines, fn/ (the switch read-backs), identity.txt (the six identity compares), docker-inspect.json and ../hero-ds-300w-stock.out (the start command and image), hero-sum.txt (every value with the lines it comes from, written by gpu02/exl3-test/queue-ar/hero/hero-sum.py, except its engine-log line, which comes from the server log that isn't in this repository), targets docs/LEVERS.md:150.
+- [S2] gpu02/exl3-test/runs/xdsm/hero-ds-210w/ (the 210 W start), with the same files and line numbers as [S1], except that run.log:1 has the caps and offsets read back before the start.
 - [S3] docs/LEVERS.md:374 (item 223 S9 vs S8, BI cost, item 225 identity sets), target docs/LEVERS.md:14.
 - [S4] docs/LEVERS.md:384 (item 230), base S9 + hc_sp 2 + xpush per docs/LEVERS.md:382 (item 227).
 - [S5] docs/LEVERS.md:387 (S9 scope 232, soak 231, prefill stack 233), docs/TESTING.md:133, :135.
@@ -330,6 +348,8 @@ Line numbers refer to the copies in this repository (`docs/`), as of 13.11.2026.
 - [S14] docs/LEVERS.md:341-349 (production DP2 = 2 x TP2, Flash-Next line).
 - [S15] registry DS-L172, docs/LEVERS.md:172.
 - [S16] docs/LEVERS.md:150 (DeepSeek targets, context 1M).
+- [S17] gpu02/exl3-test/runs/log-extract/od-changes-lines-245-256.txt (lines 245-256 of the gpu02 power and fan change log: the stock setting, the fan guard's step from 90 to 88 % on every card and the restore after the run), gpu02/host/fanguard.sh:5-6 (the 2 % step down).
+- [S18] gpu02/exl3-test/runs/xdsm/soak-ds-1114/: identity.txt:7-14 (the eight soak cycles, 20 of 20 each), the eight `*.win` files (start and end of each load window, 37.9 minutes in total), the cycle summaries beside them (streams, prefill offset and tokens, errors), the switch read-back and the start environment. gpu02/exl3-test/runs/log-extract/soak-ds-1114-queue-log-line-21755.txt (the image and its ID) and soak-ds-1114-start-lines.txt (the `--gpu-headroom-mib 245` lines, with their line numbers in the server log).
 - [H0] gpu02/host/hostfacts-20261113.txt (CPU, board, RAM, cards), gpu02/bench/runs/rocm-bw/gpu02-8x64-1102-1632.txt (the 8 x 64 GB set).
 - [H1] docs/hardware-tuning-gpu02.md, which cites every number in the hardware table to a raw file in gpu02/bench/runs/, a script in gpu02/host/, LEVERS.md or R9700-CAPABILITIES-20261112.md. A few numbers (CPU read, the address map, the TP2 c16 for the CPU swap, the fan tests, the 8-agent pair replay, the Threadripper link-width lesson) come only from the original Finnish results logs, which aren't published, and the doc says so per number.
 - [M1] docs/TESTING.md:119. [M2] docs/TESTING.md:120. [M3] docs/TESTING.md:121. [M4] docs/TESTING.md:59, :119.
