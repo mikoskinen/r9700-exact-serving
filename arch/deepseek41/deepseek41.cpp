@@ -1660,6 +1660,19 @@ struct DkvHeld {
 };
 static thread_local std::vector<DkvHeld> t_dkv_lu;
 static thread_local DkvHeld t_dkv_g;
+/* this rank thread's counts: unpacks, plan hits, gathers, gather hits; rank 0 notes them at its 1st, 10th, 100th ... launch */
+static thread_local long long t_dkv_ct[4] = { 0, 0, 0, 0 };
+static void dkv_note(RadCtx* x, const char* what, int l, int64_t n, int64_t hr0, int64_t hn) {
+    if (rad_rank(x) != 0) return;
+    const long long k = t_dkv_ct[0] + t_dkv_ct[2];
+    long long p = 1;
+    while (p < k) p *= 10;
+    if (p != k) return;
+    fprintf(stderr, "radiance: deepseek41: lever DKV (rank 0, launch %lld: %s at layer %d, %lld rows, plan rows [%lld, %lld)): "
+                    "latent_unpack %lld (plan hits %lld), latent_gather %lld (hits %lld)\n",
+            k, what, l, (long long)n, (long long)hr0, (long long)(hr0 + hn), t_dkv_ct[0], t_dkv_ct[1], t_dkv_ct[2],
+            t_dkv_ct[3]);
+}
 static void dkv_pass_reset() {
     t_dkv_lu.clear();
     t_dkv_g = DkvHeld{};
@@ -5025,6 +5038,7 @@ static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, 
         const RadOperand gv = brows(m.selkv, n);
         if (h.src == src && h.idx == idx && h.s0 == s0 && h.s1 == s1 && h.r0 == hr0 && h.n == n) {
             g_dkv_g_hit.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[3];
         } else {
             const RadOperand go[] = { a[4], a[5], a[6], a[8], gv };
             rad_issue(x, L.lgath, go, 5, n);
@@ -5034,9 +5048,9 @@ static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, 
             h.s1 = s1;
             h.r0 = hr0;
             h.n = n;
-            if (g_dkv_g_n.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0)
-                fprintf(stderr, "radiance: deepseek41: lever DKV-G: first gathered pass (layer %d, %lld rows)\n", l,
-                        (long long)n);
+            g_dkv_g_n.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[2];
+            dkv_note(x, "gather", l, n, 0, 0);
         }
         a.push_back(gv);
         rad_issue(x, ofold ? L.attn_rtg : L.attn_g, a.data(), (int)a.size(), n);
@@ -5049,6 +5063,7 @@ static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, 
             held = held || (h.src == src && h.s0 == s0 && h.s1 == s1 && h.r0 == hr0 && h.n == hn);
         if (held) {
             g_dkv_lu_hit.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[1];
         } else {
             /* a plan over other rows of m.lu that overlap these no longer holds its rows */
             t_dkv_lu.erase(std::remove_if(t_dkv_lu.begin(), t_dkv_lu.end(),
@@ -5063,10 +5078,9 @@ static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, 
             h.r0 = hr0;
             h.n = hn;
             t_dkv_lu.push_back(h);
-            if (g_dkv_lu_n.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0)
-                fprintf(stderr, "radiance: deepseek41: lever DKV-U: first unpacked pass (layer %d, %lld rows, plan rows "
-                                "[%lld, %lld) x %lld entries)\n",
-                        l, (long long)n, (long long)hr0, (long long)(hr0 + hn), (long long)m.lu_e);
+            g_dkv_lu_n.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[0];
+            dkv_note(x, "unpack", l, n, hr0, hn);
         }
         a.push_back(uv);
         rad_issue(x, ofold ? L.attn_rtlu : L.attn_lu, a.data(), (int)a.size(), n);
