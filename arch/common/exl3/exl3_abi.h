@@ -630,6 +630,39 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
     return i >= 0 && i < 8 ? &s[i] : 0;
 }
 
+/* Lever P (ds41-p1pass, 13.11.2026): THE DECODE BAND'S ARITHMETIC ABOVE THE DECODE BAND. Two more op names,
+ * moe_exl3_gate_up_dk / moe_exl3_down_dk, with moe_exl3_gate_up's / moe_exl3_down's parameters, operands and result
+ * definition to the letter -- what they add is a PROMISE about the bytes: a library's row for them writes, for every
+ * (token, slot), exactly the bytes its DECODE-BAND row of moe_exl3_gate_up / moe_exl3_down writes for that token in a
+ * pass of at most 16 tokens, whatever the pass's other tokens (the decode band is M-invariant per row, and a run longer
+ * than a pass's 16 rows is taken 16 at a time). An architecture that must give a decode row the same bytes at any
+ * step height (batch invariance) and today cuts a decode segment into passes of <= 16 tokens declares them over the
+ * heights above 16 it wants as ONE pass and issues them for decode rows only; a prefill segment of the same height keeps
+ * moe_exl3_gate_up / moe_exl3_down (whose M > 16 rows are free to round differently: exl3r4d's MTX form does). Names of
+ * their own, not a parameter of the old ops, so the eight schemas above stay what every other library exports (a
+ * loader refuses a library whose schema for a shared name differs). Two-class form only. exl3_dk_schema_at(0 / 1). */
+#define EXL3_OP_GATE_UP_DK "moe_exl3_gate_up_dk"
+#define EXL3_OP_DOWN_DK    "moe_exl3_down_dk"
+static inline int exl3_dk_schema_count(void) { return 2; }
+static inline const RadOpSchema* exl3_dk_schema_at(int i) {
+    static RadOpSchema s[2];
+    static int made = 0;
+    if (!made) {
+        s[0] = *exl3_schema_at(0);
+        s[0].op = EXL3_OP_GATE_UP_DK;
+        s[0].doc = "moe_exl3_gate_up at more than 16 tokens with the decode band's bytes: every (token, slot) row is "
+                   "what the library's decode-band moe_exl3_gate_up writes for that token in a pass of <= 16 tokens "
+                   "(lever P; a_rot 0, h_rot 1). docs/OPS-exl3.md.";
+        s[1] = *exl3_schema_at(1);
+        s[1].op = EXL3_OP_DOWN_DK;
+        s[1].doc = "moe_exl3_down at more than 16 tokens with the decode band's bytes: every (token, slot) row is "
+                   "what the library's decode-band moe_exl3_down writes for that token in a pass of <= 16 tokens "
+                   "(lever P; h_rot 1). docs/OPS-exl3.md.";
+        made = 1;
+    }
+    return i >= 0 && i < 2 ? &s[i] : 0;
+}
+
 /* ===================================================================== THE PLANES
  *
  * A table's entry e is one plane of one expert, exactly as the container holds it (the canonical

@@ -343,6 +343,10 @@ std::vector<Case> cases() {
     gg("attn_kv", 512, 5120, "q5_K");        gg("attn_kv", 512, 5120, "q6_K");
     gg("shexp_gate_up", 1536, 5120, "q6_K"); gg("shexp_gate_up", 1536, 5120, "q8_0");
     gg("shexp_down", 5120, 768, "q6_K");     gg("shexp_down", 5120, 768, "q8_0");
+    /* lever P (ds41-p1pass): the shared arm at ranks 1-3's widths (kSharedBlock: 768 / 512 / 512 / 512 of 2304), which a
+     * one-pass decode step of 17 .. 48 rows runs at the step's height */
+    gg("shexp_gate_up r1-3", 1024, 5120, "q6_K"); gg("shexp_gate_up r1-3", 1024, 5120, "q8_0");
+    gg("shexp_down r1-3", 5120, 512, "q6_K");     gg("shexp_down r1-3", 5120, 512, "q8_0");
     gg("engram_kv", 25600, 6144, "q6_K");
     v.push_back({ "logits_gemm_ggml head q6_K 32320x5120", "logits_gemm_ggml", "gg",
                   { PI("n_vocab", 32320), PI("n_embd", 5120), PS("type", "q6_K"), PS("dtype", "bf16") }, "q6_K" });
@@ -353,6 +357,10 @@ std::vector<Case> cases() {
         v.push_back({ fmt("swiglu_clamped_gemm_nt_ggml shexp_down %s 5120x768 (K1 fold e)", ty),
                       "swiglu_clamped_gemm_nt_ggml", "gg",
                       { PI("N", 5120), PI("K", 768), PS("type", ty), PS("dtype", "bf16"), PF("limit", 10) }, ty });
+    for (const char* ty : { "q6_K", "q8_0" })
+        v.push_back({ fmt("swiglu_clamped_gemm_nt_ggml shexp_down r1-3 %s 5120x512 (K1 fold e)", ty),
+                      "swiglu_clamped_gemm_nt_ggml", "gg",
+                      { PI("N", 5120), PI("K", 512), PS("type", ty), PS("dtype", "bf16"), PF("limit", 10) }, ty });
     for (long long N : { 384LL, 96LL, 1024LL, 128LL, 32LL })
         v.push_back({ fmt("gemm_nt_f32 %lldx5120 (%s)", N, N == 384 || N == 96 ? "router" : "compressor kvg / score"),
                       "gemm_nt_f32", "f32", { PI("N", N), PI("K", 5120), PS("dtype", "bf16") }, "" });
