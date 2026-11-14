@@ -2265,6 +2265,12 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
                                  RAD_INT("N_odd", 2 * wq[1]), RAD_INT("K_odd", D), RAD_INT("h_rot", 1),
                                  RAD_INT("a_rot", 0) };
     if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
+    /* Expert tensor parallel: interface v9's `bi` -- the decode band's gate_up takes one form at every token count. A slice
+     * is narrow enough (640 columns: 5 blocks x 6 or 12 rows at 1 / 2 tokens) that exl3r4d's few-token rule would sum
+     * those launches in split-K 2's order and larger ones in split-K 1's, so a decode row's bytes would depend on how
+     * many tokens its step carries (measured: 9 of 20 probes at 8 concurrent differed from alone without it). The whole
+     * expert never takes that form (18 blocks x 6 rows > the 64 units that fit), so expert parallel needs nothing. */
+    if (etp) gp.push_back(RAD_INT("bi", 1));
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
                {w.h.x, w.sorted, w.eoff}, {b_x3h});
     /* Lever P (Config::exl3_dk_rows): the decode-band-bytes pair over 17 .. dk tokens, on the same tables and buffers.
