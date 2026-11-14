@@ -1673,7 +1673,21 @@ static void dkv_note(RadCtx* x, const char* what, int l, int64_t n, int64_t hr0,
             k, what, l, (long long)n, (long long)hr0, (long long)(hr0 + hn), t_dkv_ct[0], t_dkv_ct[1], t_dkv_ct[2],
             t_dkv_ct[3]);
 }
-static void dkv_pass_reset() {
+/* RADIANCE_DS41_DKV_LOG=1 (read once): rank 0 notes every pass of at least 2048 rows when the next one starts -- the
+ * attentions it ran over the plan's / the gathered rows, the taller ones it left to today's op, the unpacks and gathers */
+static thread_local long long t_dkv_pass[6] = { 0, 0, 0, 0, 0, 0 };   /* plan, gathered, tall today, unpacks, gathers, rows */
+static bool dkv_log_on() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_DKV_LOG"); return e && *e && *e != '0'; }();
+    return on;
+}
+static void dkv_pass_reset(RadCtx* x = nullptr, int64_t rows = 0) {
+    if (x && rad_rank(x) == 0 && dkv_log_on() && t_dkv_pass[5] >= 2048 &&
+        t_dkv_pass[0] + t_dkv_pass[1] + t_dkv_pass[2] + t_dkv_pass[3] + t_dkv_pass[4] > 0)
+        fprintf(stderr, "radiance: deepseek41: lever DKV pass of %lld rows: %lld attentions over the plan's rows, %lld over "
+                        "gathered rows, %lld taller ones by today's op; %lld latent_unpack, %lld latent_gather\n",
+                t_dkv_pass[5], t_dkv_pass[0], t_dkv_pass[1], t_dkv_pass[2], t_dkv_pass[3], t_dkv_pass[4]);
+    for (long long& v : t_dkv_pass) v = 0;
+    t_dkv_pass[5] = rows;
     t_dkv_lu.clear();
     t_dkv_g = DkvHeld{};
 }
@@ -5050,10 +5064,12 @@ static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, 
             h.n = n;
             g_dkv_g_n.fetch_add(1, std::memory_order_relaxed);
             ++t_dkv_ct[2];
+            ++t_dkv_pass[4];
             dkv_note(x, "gather", l, n, 0, 0);
         }
         a.push_back(gv);
         rad_issue(x, ofold ? L.attn_rtg : L.attn_g, a.data(), (int)a.size(), n);
+        ++t_dkv_pass[1];
         return true;
     }
     if (!dec && m.lu && L.lu_unpack && (ofold ? L.attn_rtlu : L.attn_lu) && n > kBiBand && hn >= n) {
@@ -5080,12 +5096,15 @@ static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, 
             t_dkv_lu.push_back(h);
             g_dkv_lu_n.fetch_add(1, std::memory_order_relaxed);
             ++t_dkv_ct[0];
+            ++t_dkv_pass[3];
             dkv_note(x, "unpack", l, n, hr0, hn);
         }
         a.push_back(uv);
         rad_issue(x, ofold ? L.attn_rtlu : L.attn_lu, a.data(), (int)a.size(), n);
+        ++t_dkv_pass[0];
         return true;
     }
+    if (n > kBiBand) ++t_dkv_pass[2];
     return false;
 }
 
@@ -5221,7 +5240,7 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
 
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
-    dkv_pass_reset();   /* lever DKV: nothing held at a pass's start */
+    dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start */
     const auto& c = m.c;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
@@ -6114,7 +6133,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
 
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
-    dkv_pass_reset();   /* lever DKV: nothing held at a pass's start */
+    dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start */
     /* A drafter pass: the sign gives the kind (rad_runtime.h); zero is a trunk step. */
     if (batch->draft_pass != 0) {
         if (!m.dsp.on) {
