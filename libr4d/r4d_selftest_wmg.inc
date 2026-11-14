@@ -1520,4 +1520,138 @@ static void wq_perf(const Plugin& pl, const char* mlist, int iters, const char* 
     std::printf("WMGVERDICT wq: %lld (type, shape, M) keys, %lld bad (a launch failed, a W form unused, or W bytes differ from W form 0)\n", keys, bad);
 }
 
+
+/* --perfstep [Ms] [iters] [rounds] [flushMB] (ds41-wmk2, FINDINGS F7: the one-card per-shape tables did not carry to the server): a whole
+ * rank-0 decode step's dense launches in the engine's order -- 40 layers of q_a + kv (pair, one launch), q_b, o_a g0 + g1 (pair), o_b,
+ * shared gate_up, shared down (attention q5_K on layers 0, 3, .., 36 and q6_K else; shared q8_0 on 1, 4, .., 37 and q6_K else), the
+ * Engram kv twice, the head once -- each layer with its OWN weights (1.85 GB streamed a step, as on the server), optionally a device copy
+ * of flushMB between layers (a stand-in for the MoE expert stream between the dense ops: it evicts L2 / MALL and holds the CUs), timed
+ * whole. Arms: D = int16's decode band (gg_gemv 2 + gg_gemv_m16 1), W1 / W2 / W3 = ds41_wmk 1 / 2 / 3 (the r6 table / 70724 / the r5
+ * table; the same bytes), rounds of D W1 W2 W3 W3 W2 W1 D after one warm step each. STEPPERF lines (ms a step). */
+static void step_perf(const Plugin& pl, const char* mlist, int iters, int rounds, int flush_mb) {
+    if (iters <= 0) iters = 10;
+    if (rounds <= 0) rounds = 2;
+    Hk h;
+    if (!hooks(pl, h, "--perfstep")) return;
+    const std::vector<int64_t> Ms = ilist(mlist, "8,16,24,32");
+    auto ty_of = [](const char* n) -> const MrTy* { for (const MrTy& t : kMrTypes) if (!std::strcmp(t.name, n)) return &t; return nullptr; };
+    auto sh_of = [](const char* n) -> const a4st::Shape* { for (const a4st::Shape& x : a4st::kShapes) if (!std::strcmp(x.name, n)) return &x; return nullptr; };
+    const char* six[] = { "q_a+attn_kv(pair)", "attn_q_b(fold a)", "attn_output_a g0+g1(pair)", "attn_output_b", "shexp_gate_up", "shexp_down(fold e)" };
+    struct Item { const a4st::Shape* sh; const MrTy* ty; void* w; int64_t rb, wa; const RadKernelInfo* rg; const RadKernelInfo* rp; };
+    std::vector<Item> items;
+    dfree_all();
+    std::map<std::string, std::vector<uint8_t>> hws;   /* (shape, type) host weights, uploaded once a layer */
+    int64_t maxK = 0, maxNY = 0;
+    double gb = 0;
+    auto add = [&](const char* shn, const char* tyn, int layer) -> bool {
+        const a4st::Shape* sh = sh_of(shn); const MrTy* ty = ty_of(tyn);
+        if (!sh || !ty) return false;
+        const bool q32 = ty->qk == 32, pair = sh->N2 > 0;
+        Item it{ sh, ty, nullptr, sh->K / ty->qk * ty->bb, 0, nullptr, nullptr };
+        it.wa = sh->N * it.rb;
+        const int64_t wbytes = it.wa + sh->N2 * it.rb;
+        it.rg = find(pl, sh->logits ? (q32 ? "logits_gemm_ggml_qk32_gemv" : "logits_gemm_ggml_qk256_gemv") : (q32 ? "gemm_nt_ggml_qk32_gemv" : "gemm_nt_ggml_qk256_gemv"));
+        it.rp = pair ? find(pl, q32 ? "gemm_nt_ggml_pair_qk32" : "gemm_nt_ggml_pair_qk256") : nullptr;
+        if (!it.rg || (pair && !it.rp)) return false;
+        const std::string key = std::string(shn) + "/" + tyn;
+        auto& hw = hws[key];
+        if (hw.empty()) {
+            std::vector<uint8_t> a, b;
+            mr_weights(a, *ty, sh->N, sh->K, 0x5EE0001ull ^ (uint64_t)(sh->N * 7 + sh->K));
+            if (pair) mr_weights(b, *ty, sh->N2, sh->K, 0x5EE0002ull ^ (uint64_t)(sh->N2 * 7 + sh->K));
+            hw = a; hw.insert(hw.end(), b.begin(), b.end());
+        }
+        it.w = dalloc((size_t)wbytes);
+        if (!it.w) return false;
+        st_memcpy(it.w, hw.data(), (size_t)wbytes, hipMemcpyHostToDevice);
+        maxK = std::max(maxK, sh->K); maxNY = std::max(maxNY, (sh->N + sh->N2) * (sh->logits ? 2 : 1));
+        gb += (double)wbytes / 1e9;
+        (void)layer;
+        items.push_back(it);
+        return true;
+    };
+    bool ok = true;
+    for (int l = 0; l < 40 && ok; ++l) {
+        const char* ta = l % 3 == 0 ? "q5_K" : "q6_K";
+        const char* ts = l % 3 == 1 ? "q8_0" : "q6_K";
+        for (int k = 0; k < 6 && ok; ++k) ok = add(six[k], k < 4 ? ta : ts, l);
+        if ((l == 2 || l == 22) && ok) ok = add("engram_kv_e2", "q6_K", l);
+    }
+    if (ok) ok = add("head", "q6_K", 40);
+    if (!ok) { std::printf("--perfstep: a row or an allocation is missing\n"); ++g_fail; dfree_all(); return; }
+    const int64_t MMAX = 48;
+    std::vector<uint16_t> hx;
+    mr_acts(hx, maxK, 0x5EEACull);
+    void* d_x = dalloc((size_t)(MMAX * maxK) * 2);
+    void* d_y = dalloc((size_t)(MMAX * maxNY) * 2);
+    const size_t fb = (size_t)std::max(0, flush_mb) << 20;
+    void* d_fa = fb ? dalloc(fb) : nullptr;
+    void* d_fb = fb ? dalloc(fb) : nullptr;
+    if (!d_x || !d_y || (fb && (!d_fa || !d_fb))) { std::printf("--perfstep: allocation failed\n"); ++g_fail; dfree_all(); return; }
+    st_memcpy(d_x, hx.data(), (size_t)(48 * maxK) * 2, hipMemcpyHostToDevice);
+    std::printf("WMK step replay: %zu dense launches a rank-0 decode step (pairs one launch), %.2f GB of weights a step, flush %d MiB a layer, "
+                "%d steps timed a reading, %d rounds of D W1 W2 W3 W3 W2 W1 D\n", items.size(), gb, flush_mb, iters, rounds);
+    for (int64_t M : Ms) {
+        if (M < 1 || M > MMAX) continue;
+        auto one = [&](const Item& it) -> int {
+            const a4st::Shape& sh = *it.sh;
+            const int64_t yw = sh.N + sh.N2;
+            if (sh.N2 > 0) {
+                std::vector<RadParam> pp = { PI("M", M), PI("N", sh.N), PI("N2", sh.N2), PI("K", sh.K), PS("type", it.ty->name), PS("dtype", "bf16") };
+                std::vector<RadTensor> t = { gqst::TP(d_x, RAD_BF16, M, sh.K, sh.K), T(it.w, RAD_U8, { sh.N, it.rb }),
+                                             gqst::TP(d_x, RAD_BF16, M, sh.K, sh.K), T((uint8_t*)it.w + it.wa, RAD_U8, { sh.N2, it.rb }),
+                                             gqst::TP(d_y, RAD_BF16, M, sh.N, yw), gqst::TP((uint16_t*)d_y + sh.N, RAD_BF16, M, sh.N2, yw) };
+                absent(t[2]);
+                RadArgs a{};
+                a.t = t.data(); a.n_t = (int)t.size(); a.p = pp.data(); a.n_p = (int)pp.size(); a.world_size = 1;
+                return it.rp->launch(&a, nullptr);
+            }
+            std::vector<RadParam> pg;
+            if (sh.logits) pg = { PI("M", M), PI("n_vocab", sh.N), PI("n_embd", sh.K), PS("type", it.ty->name), PS("dtype", "bf16") };
+            else pg = { PI("M", M), PI("N", sh.N), PI("K", sh.K), PS("type", it.ty->name), PS("dtype", "bf16") };
+            std::vector<RadTensor> t = { T(d_x, RAD_BF16, { M, sh.K }), T(it.w, RAD_U8, { sh.N, it.rb }), T(d_y, sh.logits ? RAD_F32 : RAD_BF16, { M, sh.N }) };
+            RadArgs a{};
+            a.t = t.data(); a.n_t = 3; a.p = pg.data(); a.n_p = (int)pg.size(); a.world_size = 1;
+            return it.rg->launch(&a, nullptr);
+        };
+        int rc = RAD_OK;
+        auto step = [&]() {
+            int n = 0;
+            for (const Item& it : items) {
+                const int r = one(it);
+                if (r != RAD_OK) rc = r;
+                if (fb && ++n % 6 == 0) (void)hipMemcpyAsync(d_fb, d_fa, fb, hipMemcpyDeviceToDevice, nullptr);
+            }
+        };
+        auto arm = [&](int a) { set_dec(h); if (a > 0) h.sw("ds41_wmk", a); };
+        std::map<int, std::vector<double>> t;
+        const int order[] = { 0, 1, 2, 3, 3, 2, 1, 0 };
+        for (int r = 0; r < rounds; ++r)
+            for (int a : order) {
+                arm(a);
+                step();   /* warm (first-use loads, clocks) */
+                hipEvent_t e0, e1;
+                st_ev_create(&e0); st_ev_create(&e1);
+                st_ev_record(e0, nullptr);
+                for (int i = 0; i < iters; ++i) step();
+                st_ev_record(e1, nullptr);
+                st_ev_sync(e1);
+                float ms = 0.0f;
+                st_ev_elapsed(&ms, e0, e1);
+                st_ev_destroy(e0); st_ev_destroy(e1);
+                t[a].push_back((double)ms / iters);
+            }
+        clear(h);
+        auto mean = [](const std::vector<double>& v) { double s = 0; for (double x : v) s += x; return v.empty() ? -1.0 : s / (double)v.size(); };
+        std::string raw;
+        for (int a = 0; a <= 3; ++a) { raw += fmt(" %s:", a ? fmt("W%d", a).c_str() : "D"); for (double x : t[a]) raw += fmt(" %.3f", x); }
+        const double d = mean(t[0]), w1 = mean(t[1]), w2 = mean(t[2]), w3 = mean(t[3]);
+        std::printf("STEPPERF M=%lld flush=%d: D %.3f ms | W1 %.3f | W2 %.3f | W3 %.3f a step | W2-W1 %+.3f ms (%+.2f %%), W3-W1 %+.3f ms, W1-D %+.3f ms | rc %d |%s\n",
+                    (long long)M, flush_mb, d, w1, w2, w3, w2 - w1, w1 > 0 ? 100.0 * (w2 / w1 - 1) : 0.0, w3 - w1, w1 - d, rc, raw.c_str());
+        std::fflush(stdout);
+        if (rc != RAD_OK) ++g_fail;
+    }
+    clear(h);
+    dfree_all();
+}
 }  // namespace wmg
