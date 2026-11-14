@@ -67,35 +67,28 @@
 // ring, or whose flag does not come within EXL3R4D_XR_SPIN polls, is read in place as before. The order of entries
 // does not change a row's bytes (every entry computes the same rows whatever order the workgroups run in: LPT's
 // argument), and a copy is the pool slot's bytes, so the output is identical to the launch without the lever.
-// The residency test is the codes pointer against the host pools the engine named (rad_host_pool_ranges, at start: the
-// union of every rank's pools on every card). Two-class build only (the _mod4 forms keep xr_mode 0).
+// The residency test is the codes pointer against this rank's host pools (rad_host_pool_ranges at start; the launch
+// carries them in its arguments). Two-class build only (the _mod4 forms keep xr_mode 0).
 #define EXL3R4D_XR_ON (EXL3R4D_NCLS == 2)
-#ifndef EXL3R4D_XR_POOLS   // pool ranges kept: every rank's (one a slab class), the union on every card
-#define EXL3R4D_XR_POOLS 32
-#endif
 #ifndef EXL3R4D_XR_SPIN   // flag polls of ~0.2 us (s_sleep 8) before a workgroup reads its group in place
 #define EXL3R4D_XR_SPIN 200000
 #endif
 #if EXL3R4D_XR_ON
-static __device__ unsigned long long g_xr_lo[EXL3R4D_XR_POOLS], g_xr_hi[EXL3R4D_XR_POOLS];
-static __device__ int g_xr_n;
-// XR's counters (a reading; exl3r4d_launch_prefill prints them now and then): [0] chunks with a ring, [1] host-read heads
-// in them, [2] heads copied, [3] 256-byte units copied, [4] workgroups that read a copy, [5] workgroups past the spin (read
-// in place), [6] host-read groups the order saw (modes 1 / 2 / 5), [7] groups it saw
-static __device__ unsigned long long g_xr_cnt[8];
-#define XR_CNT(i, v) atomicAdd(&g_xr_cnt[i], (unsigned long long)(v))
-static void xr_note(hipStream_t st);   // the counters' print (host, below)
+// XR's counters (a reading; prefill.c prints them now and then): [0] chunks with a ring, [1] host-read heads in them, [2] heads
+// copied, [3] 256-byte units copied, [4] workgroups that read a copy, [5] workgroups past the spin (read in place), [6]
+// host-read groups the order saw (modes 1 / 2 / 5), [7] groups it saw. In the rank's device buffer (a.xr_cnt).
+#define XR_CNT(i, v) do { if (a.xr_cnt) atomicAdd(&a.xr_cnt[i], (unsigned long long)(v)); } while (0)
 #else
 #define XR_CNT(i, v) ((void)0)
 #endif
-static __device__ __forceinline__ bool xr_host_codes(const void* c) {
+static __device__ __forceinline__ bool xr_host_codes(const Exl3r4dPrefill& a, const void* c) {
 #if EXL3R4D_XR_ON
   const unsigned long long v = (unsigned long long)c;
-  const int n = g_xr_n;
-  for (int i = 0; i < n && i < EXL3R4D_XR_POOLS; i++)
-    if (v >= g_xr_lo[i] && v < g_xr_hi[i]) return true;
+  const int n = a.xr_n < EXL3R4D_XR_ARGPOOLS ? a.xr_n : EXL3R4D_XR_ARGPOOLS;
+  for (int i = 0; i < n; i++)
+    if (v >= a.xr_lo[i] && v < a.xr_hi[i]) return true;
 #endif
-  (void)c;
+  (void)a, (void)c;
   return false;
 }
 // The XR tables, after the order array: xoff[cap] (ring offset in 256-byte units + 1, or 0), xhead[cap] (the entry's
@@ -337,7 +330,7 @@ static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
   auto blocks = [&](int i) { return ((int)(ent[i].z - ent[i].y) + 15) / 16; };
   // XR: whether entry i's expert is read from a host pool (its codes in a pool the engine named); mode 0: never asked
   auto host = [&](int i) {
-    return mode != 0 && ent[i].x != EXL3R4D_PF_ZERO && xr_host_codes(planes_of(a.g, (int)ent[i].x).codes) ? 1 : 0;
+    return mode != 0 && ent[i].x != EXL3R4D_PF_ZERO && xr_host_codes(a, planes_of(a.g, (int)ent[i].x).codes) ? 1 : 0;
   };
   for (int c = 0; c < nch; c++) {
     const int lo = a.chunk_n > 1 ? (int)((const uint4*)a.ctab)[c].x : 0;
@@ -2312,9 +2305,6 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
                  : fxr     ? fxr
                            : pf_gemm_select(bits, gate_up, run, am, ys);
   const unsigned xrow = fxr ? 1u : 0u;   // the copy row
-#if EXL3R4D_XR_ON
-  if (xr_mode_of(*a)) xr_note((hipStream_t)stream);   // XR's counters, now and then (a reading)
-#endif
   if (!fn) return (bits < 2 || bits > 6) && bits != EXL3R4D_K25 ? RAD_E_DTYPE : RAD_E_UNSUPPORTED;
   (void)xr;
   int64_t smem = pf_lds(mats, mtx, am);
@@ -2385,49 +2375,41 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   return RAD_OK;
 }
 
-// XR's counters as a reading: every 256th launch with an XR mode on a card copies that card's counters (async, on the
-// launch's stream) into a pinned slot allocated with the pools (exl3r4d_xr_pools, at start), and prints the slot's last
-// copy to stderr. No synchronisation and no allocation on the launch path.
+// XR's counters as a reading (prefill.c calls exl3r4d_xr_note on every launch with an XR mode): every 256th such launch of a
+// rank prints the rank's pinned slot (its last copy) and copies the rank's device counters into it on the launch's stream
+// (the engine's queue takes the async copy). exl3r4d_xr_rank_init (prefill.c's rad_host_pool_ranges, at start, with the
+// rank's card current) allocates the device counters and the pinned slots. No allocation or synchronisation on the
+// launch path.
 #if EXL3R4D_XR_ON
-static unsigned long long* g_xr_host = nullptr;   // [64 devices][8]
+static unsigned long long* g_xr_hslot = nullptr;   // pinned [64 ranks][8]
+static unsigned long long* g_xr_dcnt[64];
 static unsigned long long g_xr_launch[64];
-static void xr_note(hipStream_t st) {
-  int dev = 0;
-  if (!g_xr_host || hipStreamGetDevice(st, &dev) != hipSuccess || dev < 0 || dev >= 64) return;
-  if (g_xr_launch[dev]++ % 256 != 0) return;
-  const unsigned long long* c = g_xr_host + 8 * dev;
-  fprintf(stderr, "exl3r4d XR (reading): card %d after %llu XR launches: chunks with a ring %llu, host-read heads %llu, copied %llu "
-          "(%.1f MiB), workgroups reading a copy %llu, past the spin %llu; host-read groups %llu of %llu ordered\n", dev,
-          g_xr_launch[dev] - 1, c[0], c[1], c[2], (double)c[3] * 256.0 / 1048576.0, c[4], c[5], c[6], c[7]);
-  (void)hipMemcpyFromSymbolAsync(g_xr_host + 8 * dev, HIP_SYMBOL(g_xr_cnt), 8 * sizeof(unsigned long long), 0,
-                                 hipMemcpyDeviceToHost, st);
+extern "C" unsigned long long* exl3r4d_xr_rank_init(int rank) {
+  if (rank < 0 || rank >= 64) return nullptr;
+  if (!g_xr_hslot) {
+    if (hipHostMalloc((void**)&g_xr_hslot, 64 * 8 * sizeof(unsigned long long), hipHostMallocDefault) != hipSuccess) {
+      g_xr_hslot = nullptr;
+      return nullptr;
+    }
+    memset(g_xr_hslot, 0, 64 * 8 * sizeof(unsigned long long));
+  }
+  if (!g_xr_dcnt[rank]) {
+    void* p = nullptr;
+    if (hipMalloc(&p, 8 * sizeof(unsigned long long)) != hipSuccess) return nullptr;
+    if (hipMemset(p, 0, 8 * sizeof(unsigned long long)) != hipSuccess) return nullptr;
+    g_xr_dcnt[rank] = (unsigned long long*)p;
+  }
+  return g_xr_dcnt[rank];
 }
-#endif
-// XR: the host pools (prefill.c's rad_host_pool_ranges, once a rank at start). The cards address one virtual space, so a
-// rank's VRAM never falls in another rank's pool: every card gets the UNION of the ranks' pools, written to each HIP
-// device's copy of the globals (the current device is restored). Returns the ranges kept, or RAD_E_DEVICE.
-#if EXL3R4D_XR_ON
-extern "C" int exl3r4d_xr_pools(int n, const unsigned long long* lo, const unsigned long long* hi) {
-  static unsigned long long l[EXL3R4D_XR_POOLS], h[EXL3R4D_XR_POOLS];
-  static int m = 0;
-  for (int i = 0; lo && hi && i < n; i++) {
-    bool dup = false;
-    for (int j = 0; j < m; j++) dup = dup || (l[j] == lo[i] && h[j] == hi[i]);
-    if (!dup && m < EXL3R4D_XR_POOLS && hi[i] > lo[i]) l[m] = lo[i], h[m] = hi[i], m++;
-  }
-  int cur = 0, nd = 0;
-  if (hipGetDevice(&cur) != hipSuccess || hipGetDeviceCount(&nd) != hipSuccess) return RAD_E_DEVICE;
-  if (!g_xr_host && hipHostMalloc((void**)&g_xr_host, 64 * 8 * sizeof(unsigned long long), hipHostMallocDefault) == hipSuccess)
-    memset(g_xr_host, 0, 64 * 8 * sizeof(unsigned long long));
-  int rc = m;
-  for (int d = 0; d < nd; d++) {
-    if (hipSetDevice(d) != hipSuccess || hipMemcpyToSymbol(HIP_SYMBOL(g_xr_lo), l, sizeof l) != hipSuccess ||
-        hipMemcpyToSymbol(HIP_SYMBOL(g_xr_hi), h, sizeof h) != hipSuccess ||
-        hipMemcpyToSymbol(HIP_SYMBOL(g_xr_n), &m, sizeof m) != hipSuccess)
-      rc = RAD_E_DEVICE;
-  }
-  (void)hipSetDevice(cur);
-  return rc;
+extern "C" void exl3r4d_xr_note(int rank, void* stream) {
+  if (rank < 0 || rank >= 64 || !g_xr_hslot || !g_xr_dcnt[rank]) return;
+  if (g_xr_launch[rank]++ % 256 != 0) return;
+  const unsigned long long* c = g_xr_hslot + 8 * rank;
+  fprintf(stderr, "exl3r4d XR (reading): rank %d after %llu XR launches: chunks with a ring %llu, host-read heads %llu, copied %llu "
+          "(%.1f MiB), workgroups reading a copy %llu, past the spin %llu; host-read groups %llu of %llu ordered\n", rank,
+          g_xr_launch[rank] - 1, c[0], c[1], c[2], (double)c[3] * 256.0 / 1048576.0, c[4], c[5], c[6], c[7]);
+  (void)hipMemcpyAsync(g_xr_hslot + 8 * rank, g_xr_dcnt[rank], 8 * sizeof(unsigned long long), hipMemcpyDeviceToHost,
+                       (hipStream_t)stream);
 }
 #endif
 

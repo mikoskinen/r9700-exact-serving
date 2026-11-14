@@ -30,26 +30,25 @@ int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
  * bits 0-1 the order of a chunk's groups (0 longest first as before, 1 VRAM-read first, 2 host-read first), bit 2 the
  * ring copy (with order 1; only where the op was declared with `xring` MiB of ring). 0 at start = today's launches. */
 static volatile int g_fn4_xr = 0;
-#if !defined(EXL3R4D_NO_XR)
-int exl3r4d_xr_pools(int n, const unsigned long long* lo, const unsigned long long* hi);   /* exl3r4d_prefill.hip */
-#endif
-/* The engine's host pools, per rank (radiance core: Mover::pool_ranges, called once a rank at start): [lo, hi) as the
- * cards address them. exl3r4d_xr_pools keeps the union and writes it to every card's copy of the kernels' globals.
- * Returns the ranges kept so far (at most 32), or a negative RAD_E_*. */
-static volatile int g_xr_pools_n[64];
+unsigned long long* exl3r4d_xr_rank_init(int rank);   /* exl3r4d_prefill.hip: the rank's device counters */
+void exl3r4d_xr_note(int rank, void* stream);        /* exl3r4d_prefill.hip: the counters' print, now and then */
+/* The engine's host pools, per rank (radiance core: Mover::pool_ranges, called once a rank at start with the rank's card
+ * current): [lo, hi) as the cards address them, kept here and copied into every two-class prefill launch of that rank
+ * (Exl3r4dPrefill.xr_lo / xr_hi). Returns the ranges kept (at most EXL3R4D_XR_ARGPOOLS), or a negative RAD_E_*. */
+#define XR_RANKS 64
+static unsigned long long g_xr_plo[XR_RANKS][EXL3R4D_XR_ARGPOOLS], g_xr_phi[XR_RANKS][EXL3R4D_XR_ARGPOOLS];
+static int g_xr_pn[XR_RANKS];
+static unsigned long long* g_xr_cnt[XR_RANKS];
 __attribute__((visibility("default"))) int rad_host_pool_ranges(int rank, int n, const unsigned long long* lo,
                                                                 const unsigned long long* hi) {
-#if !defined(EXL3R4D_NO_XR)
-    const int k = exl3r4d_xr_pools(n, lo, hi);
-    if (rank >= 0 && rank < 64) g_xr_pools_n[rank] = k;
-    return k;
-#else
-    (void)rank; (void)n; (void)lo; (void)hi;
-    return 0;
-#endif
+    if (rank < 0 || rank >= XR_RANKS || n < 0 || (n && (!lo || !hi))) return RAD_E_INVAL;
+    int m = 0;
+    for (int i = 0; i < n && m < EXL3R4D_XR_ARGPOOLS; ++i)
+        if (hi[i] > lo[i]) g_xr_plo[rank][m] = lo[i], g_xr_phi[rank][m] = hi[i], ++m;
+    g_xr_cnt[rank] = exl3r4d_xr_rank_init(rank);
+    g_xr_pn[rank] = m;
+    return m;
 }
-/* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
- * with that prefill.c is a union of the name lists in one set of the three functions. */
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 4 ? 1 : -1;   /* K25U: 2 .. 4 */
@@ -259,6 +258,13 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
         if (v && d.order && g.n_class == 2) mode = (v & 4) && xrb > 0 ? 5 : (v & 3) == 3 ? 0 : (v & 3);
         const int ring = mode & 4 ? (int)xmb : 0;
         d.xr = (int32_t)((uint32_t)mode | ((uint32_t)exl3_k2(g.bits) << 8) | ((uint32_t)ring << 16));
+        if (mode && a->rank >= 0 && a->rank < XR_RANKS) {
+            const int r = a->rank;
+            for (int i = 0; i < g_xr_pn[r]; ++i) d.xr_lo[i] = g_xr_plo[r][i], d.xr_hi[i] = g_xr_phi[r][i];
+            d.xr_n = g_xr_pn[r];
+            d.xr_cnt = g_xr_cnt[r];
+            exl3r4d_xr_note(r, s);
+        }
     }
     {
         const int64_t R = chunk_rows(&g, T, run);
@@ -287,12 +293,12 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
     /* v6: the four-class block -- the same fields after the decode-band block (exl3r4d_prefill_fields.h) */
     Exl3r4dPrefill4 d4;
     if ((rc = exl3r4d_gemm4(&d.g, hi, &d4.g)) != RAD_OK) return rc;
-    memcpy(&d4.map, &d.map, sizeof d - offsetof(Exl3r4dPrefill, map));
+    memcpy(&d4.map, &d.map, offsetof(Exl3r4dPrefill, xr_lo) - offsetof(Exl3r4dPrefill, map));
     return exl3r4d_launch_prefill4(&d4, gate_up, g.bits, am, prep, run, s);
 }
-_Static_assert(sizeof(Exl3r4dPrefill) - offsetof(Exl3r4dPrefill, map) ==
+_Static_assert(offsetof(Exl3r4dPrefill, xr_lo) - offsetof(Exl3r4dPrefill, map) ==
                    sizeof(Exl3r4dPrefill4) - offsetof(Exl3r4dPrefill4, map),
-               "the two prefill blocks share every field after their decode-band blocks");
+               "the two prefill blocks share every field after their decode-band blocks (XR's pools: two-class only)");
 
 /* Sized at declare for the band's top (M = its upper bound, T = M * top_k), from the parameters alone: the larger of
  * the two forms' needs, because a launch anywhere in the band may take either -- the decode form below the

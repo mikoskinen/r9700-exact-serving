@@ -21,9 +21,20 @@ extern "C" {
 /* The prefill form's argument block: the decode band's (operands, routing, the prep's rows in g.xr) plus the
  * run map. Passed by value to every kernel of the form; ~260 bytes, under the 768-byte kernel-argument limit
  * (docs/PLUGIN.md §5). */
+/* LEVER XR's pool ranges in the two-class block (the four-class block has no room: 504 of 512 explicit bytes). */
+#ifndef EXL3R4D_XR_ARGPOOLS
+#define EXL3R4D_XR_ARGPOOLS 6
+#endif
 typedef struct Exl3r4dPrefill {
     Exl3r4dGemm g;      /* g.xr: the prep kernel's rotated rows (scratch); g.sk is 1 */
 #include "exl3r4d_prefill_fields.h"
+    /* LEVER XR (two-class block only, after the shared fields; prefill.c copies the shared part into the four-class
+     * block): this rank's host pools [lo, hi) as the cards address them (rad_host_pool_ranges), and the rank's device
+     * counters (a reading; null: none). The kernels run on the engine's own AQL queues, which load the code objects
+     * themselves, so the pools travel in the arguments rather than in device globals HIP would write. */
+    unsigned long long  xr_lo[EXL3R4D_XR_ARGPOOLS], xr_hi[EXL3R4D_XR_ARGPOOLS];
+    unsigned long long* xr_cnt;
+    int32_t             xr_n, xr_pad2;
 } Exl3r4dPrefill;
 /* The four-class form's (interface v6; exl3r4d_dev.h, Exl3r4dGemm4): ~470 bytes. */
 typedef struct Exl3r4dPrefill4 {
