@@ -2517,7 +2517,8 @@ static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
     const int64_t T = batch->n_tok;
     const int mode = fn4_spser_flag().load(std::memory_order_relaxed);
     if (!m.spser_ok || g.world != 4 || mode <= 0) return false;
-    if (m.bt.on || dbg_resid_on() || m.moecfg.calib || m.media || !m.op_embed_ar) return false;
+    /* (media rows are scattered into the embedding before the first read, which every rank still holds whole) */
+    if (m.bt.on || dbg_resid_on() || m.moecfg.calib || !m.op_embed_ar) return false;
     /* the PLE's convolution mixes rows of the stream: the layers up to it run replicated (step_serial_sp), so it must leave
      * some to split */
     if (m.ple_layer + 1 >= (int64_t)m.layers.size()) return false;
