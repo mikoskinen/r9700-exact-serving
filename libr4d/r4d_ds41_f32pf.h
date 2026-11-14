@@ -30,4 +30,21 @@ int r4d_f32pf_set(int v);
 int r4d_f32pf_get();
 int r4d_f32pf_known(int v);
 
+/* Lever SPD-F (ds41-etp-spd, 15.11.2026; SPEED-D, the AQL stamps of fu2-s1: at 17-48 rows the decode band's f32 projections
+ * run the 8x1 tile -- every wave re-reads its 8 rows of x for ONE column: the router (router_gemm_f32_scored_topk_scatter,
+ * N 384) 58 / 85 us a call at 32 / 47 rows, the compressor's kv | gate (gemm_nt_f32, N 1024) 268 / 375 us, both on card 0's
+ * chain). The runtime switch "ds41_f32dec" (libr4d's rad_fn4_*, RADIANCE_DS41_F32DEC at load): 0 the stock rule (today),
+ * 1 the decode band (rows <= 63) of both in the forms r4d_f32dec_*_form picks, 2 the router's only, 3 gemm_nt_f32's only.
+ * Every form keeps the stock per-output arithmetic (lane l folds k = l, l + 32, .. ascending with fmaf, then the xor
+ * butterfly: r4d_gemm_f32_tile.h / the GPF-b note above), so the bytes are the stock rule's at every form. */
+int r4d_f32dec_get();
+int r4d_f32dec_set(int v);    /* 1 applied, -1 an unknown value */
+int r4d_f32dec_known(int v);
+/* the form for a call: 0 = the stock rule; gemm forms 1..15 tile_wave (R, C, U) forms, 20.. the tiled forms above
+ * (code = 20 + index into kF32Forms, any M); router forms 1.. (R, C, U, NW) of the fused launch */
+int r4d_f32dec_gemm_form(int rows, int n);
+int r4d_f32dec_rgs_form(int rows);
+/* a tiled form (code 20..) at any M (the decode band's entry): RAD_OK, a launch failure or R4D_F32PF_DECLINE */
+int r4d_f32pf_gemm_code(RadStream s, const R4dF32PfCall& c, int code);
+
 #endif

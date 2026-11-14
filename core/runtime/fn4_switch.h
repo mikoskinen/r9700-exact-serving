@@ -403,6 +403,10 @@
  *                   every pass (the epoch), as aql_acq's does. RADIANCE_AQL_ROUTE_OV=1 at start starts it on. GET "rco":
  *                   in_force, and since start the passes recorded under it, the copies tracked and the dispatches after
  *                   one that play unordered (each recording counts once).
+ *   ds41_f32dec     libr4d (lever SPD-F, ds41-etp-spd; 73 here, after ds41_moe1): the decode band's (<= 63 rows) f32
+ *                   projections in wider tile forms -- 1 the router's fused launch (router_gemm_f32_scored_topk_scatter) and
+ *                   gemm_nt_f32 (the compressor's kv | gate), 2 the router only, 3 gemm_nt_f32 only; 0 the stock rule (today).
+ *                   Every form keeps each output's stock arithmetic: the same bytes. RADIANCE_DS41_F32DEC at load.
  *   ds41_wmk        libr4d (lever WMK, ds41-wmk2; 71 here, after route_copy_ov): 1 every dense GGUF GEMM of <= 48 rows
  *                   (gemm_nt_ggml, logits_gemm_ggml, gemm_nt_ggml_pair as one launch, the K1 folds a / e after their
  *                   producer's own launch) in the part-order WMMA form (gg_wk_kernel: K split into P = 8 / 4 / 2 / 1 parts
@@ -555,7 +559,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
-              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSwitches };
+              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kDs41F32Dec, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

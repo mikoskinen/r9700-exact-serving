@@ -183,10 +183,13 @@ __global__ __launch_bounds__(32 * WM * WN) void f32pf_kernel(const uint16_t* x, 
         }
 }
 
-/* ---- the forms (code = 20 + index): (TM, TN, WM, WN, S). */
+/* ---- the forms (code = 20 + index): (TM, TN, WM, WN, S). Codes 26.. (lever SPD-F, ds41-etp-spd) are row blocks of 8 / 16
+ * for the decode band (a pinned or ds41_f32dec call at any M); the prefill rule never takes them. */
 struct F32Form { int tm, tn, wm, wn, s; };
 constexpr F32Form kF32Forms[] = { { 8, 8, 4, 2, 8 }, { 8, 8, 2, 4, 8 }, { 8, 4, 4, 2, 8 }, { 4, 8, 8, 1, 8 }, { 16, 4, 2, 4, 8 },
-                                  { 8, 8, 4, 2, 4 } };
+                                  { 8, 8, 4, 2, 4 },
+                                  { 8, 4, 1, 4, 8 }, { 8, 8, 1, 4, 8 }, { 4, 8, 2, 4, 8 }, { 16, 4, 1, 4, 8 }, { 8, 4, 2, 4, 8 },
+                                  { 4, 4, 2, 4, 8 } };
 constexpr int kF32NForms = (int)(sizeof(kF32Forms) / sizeof(kF32Forms[0]));
 
 template <int TM, int TN, int WM, int WN, int S>
@@ -210,6 +213,13 @@ int f32pf_launch(RadStream s, int form, const R4dF32PfCall& c) {
     case 3: return f32pf_launch_f<4, 8, 8, 1, 8>(s, c);
     case 4: return f32pf_launch_f<16, 4, 2, 4, 8>(s, c);
     case 5: return f32pf_launch_f<8, 8, 4, 2, 4>(s, c);
+    /* lever SPD-F's decode-band row blocks (26..31) */
+    case 6: return f32pf_launch_f<8, 4, 1, 4, 8>(s, c);
+    case 7: return f32pf_launch_f<8, 8, 1, 4, 8>(s, c);
+    case 8: return f32pf_launch_f<4, 8, 2, 4, 8>(s, c);
+    case 9: return f32pf_launch_f<16, 4, 1, 4, 8>(s, c);
+    case 10: return f32pf_launch_f<8, 4, 2, 4, 8>(s, c);
+    case 11: return f32pf_launch_f<4, 4, 2, 4, 8>(s, c);
     default: return R4D_F32PF_DECLINE;
     }
 }
@@ -262,4 +272,128 @@ extern "C" const char* r4d_f32pf_last() { return g_f32pf_last; }
 extern "C" int r4d_f32pf_forms(int* out, int cap) {
     for (int i = 0; i < kF32NForms && i < cap; ++i) out[i] = 20 + i;
     return kF32NForms;
+}
+
+/* ==================================================================== lever SPD-F (ds41-etp-spd, 15.11.2026)
+ * The decode band's (rows <= 63) f32 projections in wider forms (r4d_ds41_f32pf.h). The switch: 0 the stock rule,
+ * 1 both, 2 the router's fused launch only, 3 gemm_nt_f32 only; RADIANCE_DS41_F32DEC at load. The bench / test pin
+ * (r4d_f32dec_pin) names a form for every decode-band call of each kind (0 = the stock form there, -1 = not pinned: the
+ * switch's rule), whatever the switch. Every form keeps each output's stock arithmetic: the same bytes. */
+namespace {
+int f32dec_env() {
+    const char* v = std::getenv("RADIANCE_DS41_F32DEC");
+    if (!v || !*v) return 0;
+    const int x = std::atoi(v);
+    return x >= 0 && x <= 3 ? x : 0;
+}
+std::atomic<int> g_f32dec{ f32dec_env() };
+std::atomic<int> g_f32dec_pin_rgs{ -1 }, g_f32dec_pin_gemm{ -1 };
+std::atomic<long long> g_f32dec_n[2] = { { 0 }, { 0 } };   /* calls a form other than the stock took: router, gemm */
+}  // namespace
+
+/* one stderr line the first time each (kind, height band) takes a non-stock form after a switch change (the engine log shows
+ * the forms ran); band 0 <= 8 rows, 1 <= 16, 2 above */
+static std::atomic<unsigned> g_f32dec_noted{ 0 };
+static void f32dec_note(int kind, int rows, int form) {
+    const unsigned bit = 1u << (kind * 3 + (rows <= 8 ? 0 : rows <= 16 ? 1 : 2));
+    if (g_f32dec_noted.fetch_or(bit, std::memory_order_relaxed) & bit) return;
+    std::fprintf(stderr, "radiance: libr4d: lever SPD-F (ds41_f32dec %d): %s takes form %d at %d rows (first such call)\n",
+                 g_f32dec.load(std::memory_order_relaxed), kind ? "gemm_nt_f32" : "router_gemm_f32_scored_topk_scatter", form,
+                 rows);
+}
+
+int r4d_f32dec_known(int v) { return v >= 0 && v <= 3 ? 1 : 0; }
+int r4d_f32dec_set(int v) {
+    if (!r4d_f32dec_known(v)) return -1;
+    g_f32dec.store(v, std::memory_order_relaxed);
+    g_f32dec_noted.store(0, std::memory_order_relaxed);
+    return 1;
+}
+int r4d_f32dec_get() { return g_f32dec.load(std::memory_order_relaxed); }
+
+/* The rule (switch 1 / 2 / 3): a form per height band -- rows <= 8, 9 .. 16, 17 .. 48 (the router) / 63 (gemm_nt_f32) -- by the
+ * one-card bench (SPEED-D, r4d_selftest --case spdf32). RADIANCE_DS41_F32DEC_FORMS=r1,r2,r3,g1,g2,g3 at load replaces the table
+ * (an A/B knob; 0 = the stock form in that band; a code the band's kind does not have = the stock form there). */
+static int g_f32dec_rule[6] = { 0, 0, 0, 0, 0, 0 };
+static bool f32dec_rule_load() {
+    const char* e = std::getenv("RADIANCE_DS41_F32DEC_FORMS");
+    if (!e || !*e) return true;
+    int v[6], n = 0;
+    const char* p = e;
+    while (n < 6 && *p) {
+        char* end = nullptr;
+        const long x = std::strtol(p, &end, 10);
+        if (end == p || x < 0 || x > 99) break;
+        v[n++] = (int)x;
+        p = end;
+        if (*p == ',') ++p;
+    }
+    if (n != 6 || *p) {
+        std::fprintf(stderr, "radiance: libr4d: RADIANCE_DS41_F32DEC_FORMS=%s is not six form codes: the built-in table\n", e);
+        return true;
+    }
+    for (int i = 0; i < 6; ++i) g_f32dec_rule[i] = v[i];
+    std::fprintf(stderr, "radiance: libr4d: lever SPD-F's table from RADIANCE_DS41_F32DEC_FORMS: router %d / %d / %d, gemm_nt_f32 %d / %d / %d\n",
+                 v[0], v[1], v[2], v[3], v[4], v[5]);
+    return true;
+}
+static const bool g_f32dec_rule_loaded = f32dec_rule_load();
+static int f32dec_band(int rows) { return rows <= 8 ? 0 : rows <= 16 ? 1 : 2; }
+static bool f32dec_rgs_code(int f) { return f >= 0 && f <= 14; }
+static bool f32dec_gemm_code(int f) { return (f >= 0 && f <= 12) || (f >= 20 && f < 20 + kF32NForms); }
+static int r4d_f32dec_rule_gemm(int rows, int n) {
+    (void)n;
+    (void)g_f32dec_rule_loaded;
+    const int f = g_f32dec_rule[3 + f32dec_band(rows)];
+    return f32dec_gemm_code(f) ? f : 0;
+}
+static int r4d_f32dec_rule_rgs(int rows) {
+    const int f = g_f32dec_rule[f32dec_band(rows)];
+    return f32dec_rgs_code(f) ? f : 0;
+}
+int r4d_f32dec_gemm_form(int rows, int n) {
+    if (rows > 63) return 0;
+    const int p = g_f32dec_pin_gemm.load(std::memory_order_relaxed);
+    int f = 0;
+    if (p >= 0) f = p;
+    else {
+        const int v = g_f32dec.load(std::memory_order_relaxed);
+        if (v == 1 || v == 3) f = r4d_f32dec_rule_gemm(rows, n);
+    }
+    if (f > 0) {
+        g_f32dec_n[1].fetch_add(1, std::memory_order_relaxed);
+        if (p < 0) f32dec_note(1, rows, f);
+    }
+    return f;
+}
+int r4d_f32dec_rgs_form(int rows) {
+    if (rows > 48) return 0;
+    const int p = g_f32dec_pin_rgs.load(std::memory_order_relaxed);
+    int f = 0;
+    if (p >= 0) f = p;
+    else {
+        const int v = g_f32dec.load(std::memory_order_relaxed);
+        if (v == 1 || v == 2) f = r4d_f32dec_rule_rgs(rows);
+    }
+    if (f > 0) {
+        g_f32dec_n[0].fetch_add(1, std::memory_order_relaxed);
+        if (p < 0) f32dec_note(0, rows, f);
+    }
+    return f;
+}
+int r4d_f32pf_gemm_code(RadStream s, const R4dF32PfCall& c, int code) {
+    if (c.M < 1 || c.N < 1 || c.K < 1 || code < 20 || code >= 20 + kF32NForms) return R4D_F32PF_DECLINE;
+    return f32pf_launch(s, code - 20, c);
+}
+/* bench / test hooks: pin the router's and gemm_nt_f32's decode-band forms (-1 = the switch's rule, 0 = the stock form);
+ * the counts of calls that took a non-stock form (router, gemm), for GET /admin/fn4 and the tests */
+extern "C" void r4d_f32dec_pin(int rgs_form, int gemm_form) {
+    g_f32dec_pin_rgs.store(rgs_form, std::memory_order_relaxed);
+    g_f32dec_pin_gemm.store(gemm_form, std::memory_order_relaxed);
+}
+extern "C" int rad_f32dec_stats(long long* out, int n) {
+    if (!out || n < 1) return 2;
+    out[0] = g_f32dec_n[0].load(std::memory_order_relaxed);
+    if (n > 1) out[1] = g_f32dec_n[1].load(std::memory_order_relaxed);
+    return 2;
 }
