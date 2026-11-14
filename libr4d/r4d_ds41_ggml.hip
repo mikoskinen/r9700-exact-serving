@@ -3656,6 +3656,29 @@ bool wmk_g2(int ty, long long Ntot, long long K, long long M, bool head) {
     if (M > 32) return !((K == 2048 && Ntot == 5120) || K == 768 || K == 512);
     return head || (ty == GG_Q6_K && K == 1280 && Ntot == 8192) || (ty == GG_Q8_0 && K == 768);
 }
+/* Stage 2 (r6, 14.11.): 17..48 rows by (type, N, K, band) from one session of six codes (runs/wmk2-s17, tools/bandbest.py: a code
+ * replaces r5's choice only where it beats it by > 2 % summed over the band's Ms 24 + 32 / 48): G2 NT 1 + DP 2 (15175044), gg_wk_kernel
+ * 70724 + DP 2 (8459332), G2 KP 1 (19469380), G2 KP 1 + DP 2 (27857988). 0 = r5's table. Predicted rank-0 dense step: M 24 6.904 ->
+ * 6.576 ms, M 32 7.017 -> 6.691, M 48 8.420 -> 8.299; <= 16 rows unchanged (DP 2 lost there: M 1 4.912 -> 5.241). */
+int wmk_code_r6(int ty, long long Ntot, long long K, long long M) {
+    constexpr int G2NT1DP2 = 15175044, WKDP2 = 8459332, G2KP1 = 19469380, G2KP1DP2 = 27857988;
+    if (M <= 16 || M > 48) return 0;
+    if (M <= 32) {
+        if (ty == GG_Q5_K && ((K == 4096 && Ntot == 2048) || (K == 2048 && Ntot == 5120) || (K == 1280 && Ntot == 8192) ||
+                              (K == 5120 && Ntot == 1792)))
+            return G2NT1DP2;
+        if (ty == GG_Q6_K && K == 4096 && Ntot == 2048) return WKDP2;
+        if (ty == GG_Q6_K && K == 1280 && Ntot == 8192) return G2NT1DP2;
+        if (ty == GG_Q6_K && K == 6144 && Ntot == 6400) return G2KP1DP2;
+        if (ty == GG_Q6_K && K == 5120 && (Ntot == 1792 || Ntot == 1536 || Ntot == 1024)) return WKDP2;
+        if (ty == GG_Q8_0 && ((K == 512 && Ntot == 5120) || (K == 5120 && (Ntot == 1536 || Ntot == 1024)))) return G2NT1DP2;
+        return 0;
+    }
+    if (ty == GG_Q5_K && K == 4096 && Ntot == 2048) return G2NT1DP2;
+    if (ty == GG_Q5_K && K == 2048 && Ntot == 5120) return G2KP1;
+    if (ty == GG_Q6_K && K == 6144 && Ntot == 6400) return G2KP1;
+    return 0;
+}
 int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     if (!g_wmk_tab) return kWmkCode;
     const bool head = f32out && Ntot >= 16384;
@@ -3665,6 +3688,10 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
         if (ty == GG_Q6_K && K == 1280 && Ntot == 8192) return 332872;
         if (ty == GG_Q8_0 && K == 5120 && Ntot == 1024) return 332872;
         return kWmkCode;
+    }
+    if (g_wmk_g2 == 1 && !head) {
+        const int c6 = wmk_code_r6(ty, Ntot, K, M);
+        if (c6) return c6;
     }
     const int g2 = wmk_g2(ty, Ntot, K, M, head) ? 2097152 : 0;
     if (head) return kWmkCode | g2;
