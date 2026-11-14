@@ -42,8 +42,8 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (std::strcmp(name, "sp_serial") == 0) {   /* fn4 SP-serial: a serial step's prefill rows sequence-parallel (RADIANCE_FN4_SPSERIAL declares) */
-        if (value < 0 || value > 1) return -1;
+    if (std::strcmp(name, "sp_serial") == 0) {   /* fn4 SP-serial: a serial step's prefill rows sequence-parallel (RADIANCE_FN4_SPSERIAL declares; 2 halves on lane 1) */
+        if (value < 0 || value > 2) return -1;
         if (value && !qwen4exp_fp8::fn4_spser_env()) return -1;
         qwen4exp_fp8::fn4_spser_flag().store(value, std::memory_order_relaxed);
         return 1;

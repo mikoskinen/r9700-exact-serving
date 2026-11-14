@@ -85,7 +85,9 @@
  *                   newcomer step, a lone prompt of up to a pass) take the sequence-parallel gated residual: the block's
  *                   reduce-scatter, the write and read on this rank's quarter of the rows (a prefill segment's part with the
  *                   segment's K split pinned), the all-gather and the codes on every row; the same bytes; needs
- *                   RADIANCE_FN4_SPSERIAL set at start (declares; its value the start value); 0 today  RADIANCE_FN4_SPSERIAL
+ *                   RADIANCE_FN4_SPSERIAL set at start (declares; its value the start value); 2 the step in two halves,
+ *                   one half's collectives on the second lane beside the other half's write and read; 0 today
+ *                                                                                                 RADIANCE_FN4_SPSERIAL
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
