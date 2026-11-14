@@ -855,6 +855,22 @@ void PrefixCache::clear() {
     map_.clear();
     lru_.clear();
     drop_wait_.clear();
+    /* STALESNAP (14.11.2026): the snapshots go with the entries they rest on. A snapshot kept
+     * through a reset is still found by its chain key, and a later chain over the same tokens
+     * resumes there on whatever rows it now holds: an earlier reply's decode rows, which round
+     * differently from the prefill the snapshot was taken after. As release_session: a snapshot
+     * handed out or reserved this step stays (its request restores from / saves into the slot). */
+    std::vector<BlockHash> keys;
+    keys.reserve(ck_by_prefix_.size());
+    for (const auto& kvp : ck_by_prefix_)
+        if (kvp.second.valid && !handed(kvp.first) && !reserved(kvp.first)) keys.push_back(kvp.first);
+    for (const BlockHash& h : keys) {
+        auto ck = ck_by_prefix_.find(h);
+        const uint64_t session = ck->second.session;
+        retire_ckpt(ck);
+        unindex_ckpt(session, h);
+        ++stats_.ckpt_released;
+    }
 }
 
 std::vector<BlockHash> PrefixCache::lru_order() const {
