@@ -246,15 +246,21 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
-    if (gate_up && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = EXL3R4D_SK_SMALL_V;
-    if (gate_up && EXL3R4D_SK_ONE_V > 0 && (T + g->top_k - 1) / g->top_k <= 1) d->sk = EXL3R4D_SK_ONE_V;
+    /* v9 `bi` (gate_up; DeepSeek's lever 1U-ETP): no token-count rule below -- every launch of the geometry takes the
+     * split-K above, so a row's bytes do not depend on how many tokens the launch carries. Without it the few-token
+     * rules stand (at DeepSeek's whole-expert width they never fire: 18 column blocks x 6 rows > the 64 units that fit,
+     * so that line is batch-invariant by the fit rule; a 640-wide expert slice is 5 x 6 / 5 x 12 units at 1 / 2 tokens
+     * and fits, so its 1-2-token launches would sum in split-K 2's order and its larger ones in split-K 1's). */
+    const int bi = gate_up && rad_param_geti(a->p, a->n_p, "bi", 0) != 0;
+    if (gate_up && !bi && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = EXL3R4D_SK_SMALL_V;
+    if (gate_up && !bi && EXL3R4D_SK_ONE_V > 0 && (T + g->top_k - 1) / g->top_k <= 1) d->sk = EXL3R4D_SK_ONE_V;
     if (gate_up && EXL3R4D_SK_FIT && d->sk > 1) {
         const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
         const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, d->sk, g->h_rot);
         if (fit > 0 && units > fit) d->sk = 1;
     }
 #if EXL3R4D_SK4_M > 0   /* (a preprocessor branch: off, fill compiles as it did) */
-    if (gate_up && g->n_class == 4 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
+    if (gate_up && !bi && g->n_class == 4 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
         const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
         const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, 4, g->h_rot);
         if (fit > 0 && units <= fit) d->sk = 4;
