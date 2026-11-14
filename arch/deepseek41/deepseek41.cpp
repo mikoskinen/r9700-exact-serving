@@ -343,6 +343,9 @@ struct Layer {
      * (rmsnorm_rope_roundtrip_kv_store), attn_rt = attn + o_f, or attn + o_rope + o_q
      * (attn_sparse_sink_rope_roundtrip). Issued for those when their switch is 1. */
     rad_op kv_fs = 0, attn_rt = 0;
+    /* Lever DKV (dkv_read_env), 0 where not declared: lu_unpack = latent_unpack into Model::lu, attn_lu / attn_rtlu = attn /
+     * attn_rt reading it; lgath = latent_gather into Model::selkv, attn_g / attn_rtg = attn / attn_rt reading that. */
+    rad_op lu_unpack = 0, attn_lu = 0, attn_rtlu = 0, lgath = 0, attn_g = 0, attn_rtg = 0;
     /* Lever K1 fold a (RADIANCE_DS41_QNFOLD): q_an + q_b as rmsnorm_gemm_nt_ggml (the norm in q_b's staging; it also
      * writes qrn, which the indexer's i_q reads), declared beside the pair where q_b is a GGUF weight. */
     rad_op q_bf = 0;
@@ -541,6 +544,10 @@ struct Model {
      * attn_sparse_sink latent_format nvfp4). Lossless: the latent is quant_roundtrip(fp4_e2m1, e4m3, 16)
      * output, which the packing reproduces bit for bit (docs/OPS.md "Packed compressed latent"). */
     bool lnv = false;
+    /* Lever DKV (dkv_read_env): lu [T][lu_e hd] (the plan's rows of a prefill pass), selkv [selkv_rows][itopk hd] (a decode
+     * pass's gathered selections); 0: not declared. */
+    rad_buf lu = 0, selkv = 0;
+    int64_t lu_e = 0, selkv_rows = 0;
     /* RADIANCE_DS41_KVWIN_FP8=1 (lever KVWIN; "trunk": the trunk's window only): the window caches -- the trunk's
      * kv_window (w8) and the DSpark drafter's kv_dspark (w8d) -- hold each 512-value key packed (528 bytes instead
      * of 1024: e4m3 codes, a scale byte a block of 32; window_store / rmsnorm_rope_roundtrip_kv_store kv_dtype /
@@ -1611,6 +1618,52 @@ static void p1_read_env() {
     }
 }
 static bool p1_declared() { return g_sw_p1_env.load(std::memory_order_relaxed) >= 0; }
+
+/* Lever DKV (14.11.2026, the dense (nvfp4) latent without its slowdown; RADIANCE_DS41_LATENT=nvfp4 only, read once at the
+ * first declare; unset: nothing declared or issued differently):
+ *   RADIANCE_DS41_LATUNPACK=<E> (1..256): Model::lu ([T][E hd] bf16, E entries a row of the step: 32 KiB a row at 32) holds
+ *     a prefill pass's packed compressed entries unpacked once a kv source and segment (latent_unpack, issued before the
+ *     first attention over that source's cache: the attentions of layers 2-7 / 8-13 / 14-19 / 20-39 each read one cache),
+ *     and those attentions take them (attn_sparse_sink(_rope_roundtrip)_unpacked: the WMMA form reads a 16-key tile the
+ *     plan holds as plain bf16 rows -- instead of every row's workgroup unpacking its 512 selections itself, in every
+ *     layer -- and a tile with an entry the plan lacks unpacks itself as before);
+ *   RADIANCE_DS41_LATGATHER=1: Model::selkv ([min(T, 48)][itopk hd] bf16, 24 MiB) holds the decode pass's selected entries
+ *     unpacked once an index source group (latent_gather = lever NVG's gather kernel, before the first attention of the
+ *     group: the attentions of [index source x, next index source) read x's selection over one kv source), and those
+ *     attentions take them (attn_sparse_sink(_rope_roundtrip)_gathered: lever NVG's plain-kernel pass) -- 8 gathers a step
+ *     instead of NVG's 38.
+ * Exact: the rows hold the entries' stored bf16 bits (the v3 decode, NVG's), each written after its kv source's store and
+ * before every attention that reads it, under a key (kv source, index source, segment rows) checked at every issue -- a
+ * miss unpacks again -- and the attentions run the same WMMAs / the same plain kernel over the same values. */
+static std::atomic<int> g_dkv_lu{-1}, g_dkv_g{-1};
+static std::atomic<long long> g_dkv_lu_n{0}, g_dkv_lu_hit{0}, g_dkv_g_n{0}, g_dkv_g_hit{0};
+static void dkv_read_env() {
+    int unread = -1;
+    const char* e = std::getenv("RADIANCE_DS41_LATUNPACK");
+    char* end = nullptr;
+    const long v = e && *e ? std::strtol(e, &end, 10) : 0;
+    const int lu = end && !*end && v >= 1 && v <= 256 ? (int)v : 0;
+    if (g_dkv_lu.compare_exchange_strong(unread, lu) && e && *e && !lu)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LATUNPACK=%s is not 1..256: lever DKV-U is not declared\n", e);
+    unread = -1;
+    const char* g = std::getenv("RADIANCE_DS41_LATGATHER");
+    const int gv = g && (!std::strcmp(g, "1") || !std::strcmp(g, "on")) ? 1 : 0;
+    g_dkv_g.compare_exchange_strong(unread, gv);
+}
+/* The pass's held rows (one rank thread a ctx): which segment's plan m.lu holds for which kv source (latent_unpack issued
+ * this pass), which pass's selections m.selkv holds for which (index source, kv source). The issue order is the stream's,
+ * so a held entry is valid from its launch to the end of the pass (the caches it reads are written only at their source,
+ * before it); every pass starts empty. */
+struct DkvHeld {
+    int src = -1, idx = -1;
+    int64_t s0 = -1, s1 = -1, r0 = -1, n = 0;
+};
+static thread_local std::vector<DkvHeld> t_dkv_lu;
+static thread_local DkvHeld t_dkv_g;
+static void dkv_pass_reset() {
+    t_dkv_lu.clear();
+    t_dkv_g = DkvHeld{};
+}
 /* The fewest rows a pcn_a launch is fused at under the switch; 0 = none. */
 static int64_t mhc_fuse_min() {
     if (!g_sw_mhc_ok.load(std::memory_order_relaxed)) return 0;
@@ -2297,6 +2350,21 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.sout = bf("shared_out", { T, D });
     mw.sgate = bf("shared_one", { T, 1 });
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, D }, RAD_BUF_PERSIST);
+    /* Lever DKV (dkv_read_env): the plan's rows of a prefill pass (E entries a row of the step) and a decode pass's
+     * gathered selections, over the packed latent only */
+    m.lu = m.selkv = 0;
+    m.lu_e = m.selkv_rows = 0;
+    if (m.lnv && c.head_dim == 512 && c.itopk > 0) {
+        if (const int e = g_dkv_lu.load(std::memory_order_relaxed); e > 0) {
+            m.lu_e = e;
+            m.lu = bf("comp_latent_unpacked", { T, (int64_t)e * c.head_dim });
+            if (m.lu) m.bp[m.lu] = (int64_t)e * c.head_dim;
+        }
+        if (g_dkv_g.load(std::memory_order_relaxed) > 0) {
+            m.selkv_rows = std::min<int64_t>(T, kBiBand);
+            m.selkv = bf("comp_latent_gathered", { m.selkv_rows, c.itopk * c.head_dim });
+        }
+    }
     {   /* lever BI: the row pitch of each per-token buffer step_bi slices (its declared width) */
         const std::pair<rad_buf, int64_t> bp[] = {
             { m.h0, HN }, { m.h1, HN }, { m.xcol, D }, { m.xn, D }, { m.pre_a, c.hc }, { m.pre_f, c.hc }, { m.post, c.hc },
@@ -2846,6 +2914,34 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             else
                 L.attn_rt = fused(b, "attn_sparse_sink_rope_roundtrip", fp, { L.sinks }, { m.q, cs }, { m.o });
             if (L.attn_rt) g_sw_of_ok.store(1, std::memory_order_relaxed);
+            /* Lever DKV: the fold d form over the plan's / the gathered rows (beside it) */
+            if (r > 0 && L.attn_rt && m.lu)
+                L.attn_rtlu = fused(b, "attn_sparse_sink_rope_roundtrip_unpacked", fp, { L.sinks }, { m.q, m.sel, cs, m.lu },
+                                    { m.o });
+            if (r > 0 && L.attn_rt && m.selkv) {
+                std::vector<RadParam> gf = fp;
+                gf[0] = RAD_RANGE("M", 1, m.selkv_rows);
+                L.attn_rtg = fused(b, "attn_sparse_sink_rope_roundtrip_gathered", gf, { L.sinks },
+                                   { m.q, m.sel, cs, m.selkv }, { m.o });
+            }
+        }
+        /* Lever DKV (dkv_read_env): latent_unpack / latent_gather over this layer's kv source's packed cache, and the
+         * attention over their rows, beside today's (issued where dkv_attn finds them) */
+        if (r > 0 && m.lu) {
+            L.lu_unpack = fused(b, "latent_unpack",
+                                { RAD_RANGE("M", 1, T), RAD_INT("dim", hd), RAD_INT("ratio", r),
+                                  RAD_STR("latent_format", "nvfp4") },
+                                {}, {}, { m.lu });
+            L.attn_lu = fused(b, "attn_sparse_sink_unpacked", ap, { L.sinks }, { m.q, m.sel, m.lu }, { m.o });
+        }
+        if (r > 0 && m.selkv) {
+            L.lgath = fused(b, "latent_gather",
+                            { RAD_RANGE("M", 1, m.selkv_rows), RAD_INT("dim", hd), RAD_INT("ratio", r),
+                              RAD_INT("topk", c.itopk), RAD_STR("latent_format", "nvfp4") },
+                            {}, { m.sel }, { m.selkv });
+            std::vector<RadParam> gp = ap;
+            gp[0] = RAD_RANGE("M", 1, m.selkv_rows);
+            L.attn_g = fused(b, "attn_sparse_sink_gathered", gp, { L.sinks }, { m.q, m.sel, m.selkv }, { m.o });
         }
         /* This rank's output groups, each a block of the block-diagonal wo_a. */
         const int64_t gd = HD / m.gr;
@@ -3772,6 +3868,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     i11_read_env();
     rf_read_env();
     p1_read_env();
+    dkv_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -4084,6 +4181,30 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     (size_t)std::count_if(m.layers.begin(), m.layers.end(), [](const Layer& L) { return L.kv_st != 0; }),
                     !m.dsp.on ? "not declared" : m.w8d ? "packed" : "bf16", wx,
                     (long long)c.window, (long long)c.head_dim);
+    }
+    /* Lever DKV: what the declare took (rank 0's real declare) */
+    if (ctx->rank == 0 && !ctx->shape_probe && (g_dkv_lu.load(std::memory_order_relaxed) > 0 ||
+                                                g_dkv_g.load(std::memory_order_relaxed) > 0)) {
+        int nu = 0, nl = 0, nlr = 0, ng = 0, nga = 0, ngr = 0, nc = 0;
+        for (const Layer& L : m.layers) {
+            nu += L.lu_unpack != 0;
+            nl += L.attn_lu != 0;
+            nlr += L.attn_rtlu != 0;
+            ng += L.lgath != 0;
+            nga += L.attn_g != 0;
+            ngr += L.attn_rtg != 0;
+            nc += L.r > 0;
+        }
+        if (!m.lnv)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LATUNPACK / RADIANCE_DS41_LATGATHER need the packed latent "
+                            "(RADIANCE_DS41_LATENT=nvfp4): lever DKV is not declared\n");
+        else
+            fprintf(stderr, "radiance: deepseek41: lever DKV: of %d compressing layers, latent_unpack %d, "
+                            "attn_sparse_sink_unpacked %d, its fold d form %d (%lld entries a row: %.2f MiB at %lld rows); "
+                            "latent_gather %d, attn_sparse_sink_gathered %d, its fold d form %d (%lld rows: %.2f MiB)\n",
+                    nc, nu, nl, nlr, (long long)m.lu_e,
+                    (double)(T * m.lu_e * c.head_dim * 2) / (1024.0 * 1024.0), (long long)T, ng, nga, ngr,
+                    (long long)m.selkv_rows, (double)(m.selkv_rows * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0));
     }
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
@@ -4886,6 +5007,74 @@ static bool gguf_dense(const Model& m, rad_weight w) { return m.wty.count(w) && 
  * segment, decode rows within the norms' width): step() then runs today's issue. Prefill sequences' bounds from the
  * host mirror of positions (each sequence's rows are consecutive positions; a jump starts the next); when that does not
  * give the step's prefill sequence count (two sequences whose positions continue), cu_seqlens is read back (a sync). */
+/* Lever DKV (dkv_read_env): layer L's attention over a pass's rows through the DKV ops where they serve it; false =
+ * nothing issued (the caller issues today's op). `a`: the attention's operands as today's issue hands them -- q, window
+ * cache, window table, window used, compressed cache, its table, sel, positions, cu_seqlens, sinks, out (then cos_sin
+ * for the fold d form, `ofold`). `dec`: a decode pass or segment (the gathered rows, at most selkv_rows rows); else a
+ * prefill one (the plan's rows, more than the decode band's rows). s0 / s1: its sequences; n: its rows at this layer;
+ * hr0 / hn: the rows of m.lu its plan may own (the segment's rows before a PSK cut: the cut keeps its last rows, so the
+ * plan's last positions -- the only rows it reads -- are the same). */
+static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, int64_t s0, int64_t s1, int64_t n,
+                     int64_t hr0, int64_t hn, std::vector<RadOperand> a) {
+    const auto& c = m.c;
+    const int l = L.l;
+    if (L.r <= 0 || !m.lnv || a.size() < 11 || (ofold && a.size() < 12)) return false;
+    const int src = c.src_of[(size_t)l], idx = c.idx_of[(size_t)l];
+    if (dec && m.selkv && L.lgath && (ofold ? L.attn_rtg : L.attn_g) && n >= 1 && n <= m.selkv_rows) {
+        DkvHeld& h = t_dkv_g;
+        const RadOperand gv = brows(m.selkv, n);
+        if (h.src == src && h.idx == idx && h.s0 == s0 && h.s1 == s1 && h.r0 == hr0 && h.n == n) {
+            g_dkv_g_hit.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const RadOperand go[] = { a[4], a[5], a[6], a[8], gv };
+            rad_issue(x, L.lgath, go, 5, n);
+            h.src = src;
+            h.idx = idx;
+            h.s0 = s0;
+            h.s1 = s1;
+            h.r0 = hr0;
+            h.n = n;
+            if (g_dkv_g_n.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0)
+                fprintf(stderr, "radiance: deepseek41: lever DKV-G: first gathered pass (layer %d, %lld rows)\n", l,
+                        (long long)n);
+        }
+        a.push_back(gv);
+        rad_issue(x, ofold ? L.attn_rtg : L.attn_g, a.data(), (int)a.size(), n);
+        return true;
+    }
+    if (!dec && m.lu && L.lu_unpack && (ofold ? L.attn_rtlu : L.attn_lu) && n > kBiBand && hn >= n) {
+        const RadOperand uv = hr0 == 0 ? brows(m.lu, hn) : brow_slice(m.lu, hr0, hn, m.bp.at(m.lu));
+        bool held = false;
+        for (const DkvHeld& h : t_dkv_lu)
+            held = held || (h.src == src && h.s0 == s0 && h.s1 == s1 && h.r0 == hr0 && h.n == hn);
+        if (held) {
+            g_dkv_lu_hit.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            /* a plan over other rows of m.lu that overlap these no longer holds its rows */
+            t_dkv_lu.erase(std::remove_if(t_dkv_lu.begin(), t_dkv_lu.end(),
+                                          [&](const DkvHeld& h) { return h.r0 < hr0 + hn && hr0 < h.r0 + h.n; }),
+                           t_dkv_lu.end());
+            const RadOperand uo[] = { a[4], a[5], a[7], a[8], uv };
+            rad_issue(x, L.lu_unpack, uo, 5, n);
+            DkvHeld h;
+            h.src = src;
+            h.s0 = s0;
+            h.s1 = s1;
+            h.r0 = hr0;
+            h.n = hn;
+            t_dkv_lu.push_back(h);
+            if (g_dkv_lu_n.fetch_add(1, std::memory_order_relaxed) == 0 && rad_rank(x) == 0)
+                fprintf(stderr, "radiance: deepseek41: lever DKV-U: first unpacked pass (layer %d, %lld rows, plan rows "
+                                "[%lld, %lld) x %lld entries)\n",
+                        l, (long long)n, (long long)hr0, (long long)(hr0 + hn), (long long)m.lu_e);
+        }
+        a.push_back(uv);
+        rad_issue(x, ofold ? L.attn_rtlu : L.attn_lu, a.data(), (int)a.size(), n);
+        return true;
+    }
+    return false;
+}
+
 static bool bi_segments(RadCtx* x, const Model& m, const RadBatch* b, std::vector<BiSeg>& sg) {
     sg.clear();
     const int64_t T = b->n_tok, S = b->n_seq;
@@ -5018,6 +5207,7 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
 
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
+    dkv_pass_reset();   /* lever DKV: nothing held at a pass's start */
     const auto& c = m.c;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
@@ -5639,6 +5829,24 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     const auto* cbb = kv_batch(batch, m.comp[r]);
                     const RadOperand cbt = praw2(cbb->block_table + s.s0 * cbb->block_table_pitch, RAD_I32, ns,
                                                  cbb->block_table_pitch);
+                    /* lever DKV: a prefill segment's plan rows are its uncut rows (sg_step's segment of the same
+                     * sequences, when this one is its last rows) */
+                    if (m.lu || m.selkv) {
+                        int64_t hr0 = s.r0, hn = s.n;
+                        if (!s.dec)
+                            for (const BiSeg& u : sg_step)
+                                if (!u.dec && u.s0 == s.s0 && u.s1 == s.s1 && u.r0 <= s.r0 && u.r0 + u.n == s.r0 + s.n) {
+                                    hr0 = u.r0;
+                                    hn = u.n;
+                                    break;
+                                }
+                        std::vector<RadOperand> da = { R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused,
+                                                       kv_cache(m.comp[r], src), cbt, R(m.sel, s.r0, s.n),
+                                                       P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks),
+                                                       R(m.o, s.r0, s.n) };
+                        if (ofold) da.push_back(acs);
+                        if (dkv_attn(x, m, L, ofold, s.dec, s.s0, s.s1, s.n, hr0, hn, std::move(da))) continue;
+                    }
                     if (ofold)
                         RAD_ISSUE_N(x, ah, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
                                     cbt, R(m.sel, s.r0, s.n), P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks),
@@ -5892,6 +6100,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
 
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
+    dkv_pass_reset();   /* lever DKV: nothing held at a pass's start */
     /* A drafter pass: the sign gives the kind (rad_runtime.h); zero is a trunk step. */
     if (batch->draft_pass != 0) {
         if (!m.dsp.on) {
@@ -6310,7 +6519,18 @@ static void step(RadCtx* x, const RadBatch* batch) {
             const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
             const rad_op ah = ofold ? L.attn_rt : L.attn;
             const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
-            if (r > 0) {
+            /* lever DKV: the whole pass as one segment (decode-band rows: the gathered rows; taller: the plan's) */
+            std::vector<RadOperand> da;
+            if (r > 0 && (m.lu || m.selkv)) {
+                const int src = c.src_of[(size_t)l];
+                const auto* cb = kv_batch(batch, m.comp[r]);
+                da = { brows(m.q, T), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
+                       praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T), pos, cu,
+                       RAD_W(L.sinks), brows(m.o, T) };
+                if (ofold) da.push_back(acs);
+            }
+            if (!da.empty() && dkv_attn(x, m, L, ofold, T <= kBiBand, 0, S, T, 0, T, std::move(da))) {
+            } else if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
                 if (ofold)
