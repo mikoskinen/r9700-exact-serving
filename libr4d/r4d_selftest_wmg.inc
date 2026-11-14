@@ -967,7 +967,7 @@ static void route(const Plugin& pl, const char* tlist) {
             /* stage 3: W's own prefill forms (gg_wq_kernel 9xxx, W form 0 and the engine's table -1) at M 130 and 2048 = alone */
             auto wkpf_def = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_default");
             if (wkpf_def && op.kind <= 1) {
-                for (int fc : { 9312, 9311, 9412, 9411, 9321, 0, -1 })
+                for (int fc : { 9312, 9311, 9412, 9411, 9321, 9221, 9325, 9316, 9415, 9425, 9371, 9375, 9461, 9475, 0, -1 })
                     for (int64_t MM : { (int64_t)130, (int64_t)2048 }) {
                         wmk_on(1);
                         if (wkpf_follow) wkpf_follow(0);
@@ -1378,7 +1378,7 @@ static void wq_perf(const Plugin& pl, const char* mlist, int iters, const char* 
     const std::vector<int64_t> forms = gp_list(flist, "9312,9311,9411,9412");
     long long keys = 0, bad = 0;
     std::map<int64_t, std::map<int64_t, double>> wsum;   /* M -> form (-1 stock, -2 int16 best, 0 W0, f) -> rank-0 weighted us */
-    std::printf("WMK gg_wq prefill timing (rotated weights, mean of %d): stock (int16) | W form 0 (stock + fold) | W forms | stock again\n", iters);
+    std::printf("WMK gg_wq prefill timing (rotated weights, %d timed after a >= 120 ms warm burst, the median of 3 alternating rounds): stock (int16) | W form 0 (stock + fold) | W forms\n", iters);
     for (const MrTy& ty : kMrTypes) {
         if (!mr_in(want.c_str(), ty.name)) continue;
         for (const MrShape& sh : kMrShapes) {
@@ -1410,45 +1410,85 @@ static void wq_perf(const Plugin& pl, const char* mlist, int iters, const char* 
                 MrLaunch L;
                 if (!mr_setup(L, pl, sh, ty, M)) { std::printf("  %s %s: row absent\n", ty.name, sh.name); ++g_fail; continue; }
                 std::vector<uint8_t> wref;
-                /* wmk 0: int16 (form = gg_pf pin, 0 = the stock kernel); wmk 1: W on exactly `form` */
-                auto arm = [&](int wmk, int form, double* us, bool* same, int* used) -> bool {
+                /* the arms: wmk 0 = int16 (form = gg_pf pin, 0 = the stock kernel); wmk 1 = W on exactly `form` */
+                struct Arm { int wmk, form; std::vector<double> t; bool ok = true; };
+                std::vector<Arm> arms;
+                const bool q6 = std::string(ty.name) == "q6_K", q8 = std::string(ty.name) == "q8_0";
+                arms.push_back({ 0, 0, {} });
+                if (q6) arms.push_back({ 0, 426, {} });
+                if (q8) arms.push_back({ 0, 422, {} });
+                arms.push_back({ 1, 0, {} });
+                for (int64_t f : forms) arms.push_back({ 1, (int)f, {} });
+                auto set_arm = [&](const Arm& a) {
                     clear(h);
-                    h.sw("ds41_wmk", wmk);
-                    if (wmk) { wkpf_default(form); if (wkpf_follow) wkpf_follow(0); }
-                    else gp.pin(form);
+                    h.sw("ds41_wmk", a.wmk);
+                    if (a.wmk) { wkpf_default(a.form); if (wkpf_follow) wkpf_follow(0); }
+                    else gp.pin(a.form);
                     wkpf_ts(1);
+                };
+                auto unset_arm = [&]() { gp.pin(0); wkpf_ts(0); h.sw("ds41_wmk", 0); wkpf_default(-1); };
+                bool kb = false;
+                /* bytes and the form used, once an arm */
+                for (Arm& a : arms) {
+                    set_arm(a);
                     st_memset(d_y, 0xff, mb);
                     const int rc = L.run(d_x, d_w, d_y);
-                    bool ok = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
-                    *used = wmk ? wkpf_last() : form;
-                    *same = true;
-                    if (ok && wmk) {
+                    a.ok = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                    const int used = a.wmk ? wkpf_last() : a.form;
+                    if (a.ok && a.wmk) {
                         std::vector<uint8_t> got(mb);
                         st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
                         if (wref.empty()) wref = got;
-                        *same = got == wref;
+                        if (got != wref) { a.ok = false; std::printf("  %s %s M=%lld: W form %d BYTES DIFFER from W form 0\n", ty.name, sh.name, (long long)M, a.form); }
                     }
-                    if (ok) *us = st_time_us([&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); }, iters, nullptr);
-                    gp.pin(0); wkpf_ts(0); h.sw("ds41_wmk", 0); wkpf_default(-1);
-                    return ok;
+                    if (a.wmk && used != a.form) { a.ok = false; std::printf("  %s %s M=%lld: W form %d NOT USED (%d)\n", ty.name, sh.name, (long long)M, a.form, used); }
+                    kb |= !a.ok;
+                    unset_arm();
+                }
+                /* the timing: the card held at its power cap (a warm burst of >= kWarmMs of the arm untimed, then `iters` timed), the
+                 * arms in alternating order over kRounds rounds (forward, back, forward), the median a arm: a later arm no longer pays the
+                 * clock drop of the ones before it (the first run of this mode read the same stock kernel 20-28 % apart within a key) */
+                constexpr int kRounds = 3;
+                constexpr double kWarmMs = 120.0;
+                auto run_i = [&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); };
+                auto timed = [&]() -> double {
+                    hipEvent_t e0, e1;
+                    st_ev_create(&e0); st_ev_create(&e1);
+                    st_ev_record(e0, nullptr); run_i(0); run_i(1); st_ev_record(e1, nullptr); st_ev_sync(e1);
+                    float ms = 0.0f;
+                    st_ev_elapsed(&ms, e0, e1);
+                    const int nw = (int)std::min(20000.0, std::ceil(kWarmMs / std::max(0.002, (double)ms / 2.0)));
+                    for (int i = 0; i < nw; ++i) run_i(i);
+                    st_ev_record(e0, nullptr);
+                    for (int i = 0; i < iters; ++i) run_i(i);
+                    st_ev_record(e1, nullptr);
+                    st_ev_sync(e1);
+                    st_ev_elapsed(&ms, e0, e1);
+                    st_ev_destroy(e0); st_ev_destroy(e1);
+                    return (double)ms * 1000.0 / iters;
                 };
-                double s1 = -1, s2 = -1, w0 = -1, g426 = -1, g422 = -1; bool sm; int u;
-                bool kb = false;
-                kb |= !arm(0, 0, &s1, &sm, &u);
-                const bool q6 = std::string(ty.name) == "q6_K", q8 = std::string(ty.name) == "q8_0";
-                if (q6) arm(0, 426, &g426, &sm, &u);
-                if (q8) arm(0, 422, &g422, &sm, &u);
-                kb |= !arm(1, 0, &w0, &sm, &u) || !sm || u != 0;
+                for (int r = 0; r < kRounds; ++r)
+                    for (size_t k = 0; k < arms.size(); ++k) {
+                        Arm& a = arms[r % 2 ? arms.size() - 1 - k : k];
+                        if (!a.ok) continue;
+                        set_arm(a);
+                        a.t.push_back(timed());
+                        unset_arm();
+                    }
+                auto med = [](std::vector<double> v) { if (v.empty()) return -1.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+                double st = med(arms[0].t), g426 = -1, g422 = -1, w0 = -1;
+                const double s1 = arms[0].t.empty() ? -1 : *std::min_element(arms[0].t.begin(), arms[0].t.end());
+                const double s2 = arms[0].t.empty() ? -1 : *std::max_element(arms[0].t.begin(), arms[0].t.end());
                 std::vector<double> wf(forms.size(), -1);
                 std::string fl;
-                for (size_t i = 0; i < forms.size(); ++i) {
-                    bool same = true; int used = -1;
-                    const bool ok = arm(1, (int)forms[i], &wf[i], &same, &used);
-                    if (!ok || !same || used != (int)forms[i]) kb = true;
-                    fl += fmt(" %lld %.1f%s%s;", (long long)forms[i], wf[i], !same ? " BYTES DIFFER" : "", used != (int)forms[i] ? " NOT USED" : "");
+                size_t ai = 1;
+                if (q6) g426 = med(arms[ai++].t);
+                if (q8) g422 = med(arms[ai++].t);
+                w0 = med(arms[ai++].t);
+                for (size_t i = 0; i < forms.size(); ++i, ++ai) {
+                    wf[i] = med(arms[ai].t);
+                    fl += fmt(" %lld %.1f;", (long long)forms[i], wf[i]);
                 }
-                kb |= !arm(0, 0, &s2, &sm, &u);
-                const double st = 0.5 * (s1 + s2);
                 double ib = st;   /* int16's best of stock / its P0 table's GPF form */
                 if (g426 > 0) ib = std::min(ib, g426);
                 if (g422 > 0) ib = std::min(ib, g422);
@@ -1457,8 +1497,8 @@ static void wq_perf(const Plugin& pl, const char* mlist, int iters, const char* 
                 wsum[M][-1] += wt * st; wsum[M][-2] += wt * ib; wsum[M][0] += wt * w0; wsum[M][-3] += wt * bw;
                 for (size_t i = 0; i < forms.size(); ++i) wsum[M][forms[i]] += wt * wf[i];
                 ++keys; bad += kb; g_fail += kb;
-                std::printf("GPWQ %s %s %lldx%lld M=%lld w%g: stock %.1f / %.1f us%s%s | W0 %.1f |%s | best W %lld %.1f = x%.3f of stock, x%.3f of int16 best%s\n",
-                            ty.name, sh.name, (long long)sh.N, (long long)sh.K, (long long)M, wt, s1, s2,
+                std::printf("GPWQ %s %s %lldx%lld M=%lld w%g: stock %.1f us (min %.1f max %.1f)%s%s | W0 %.1f |%s | best W %lld %.1f = x%.3f of stock, x%.3f of int16 best%s\n",
+                            ty.name, sh.name, (long long)sh.N, (long long)sh.K, (long long)M, wt, st, s1, s2,
                             g426 > 0 ? fmt(" | 426F %.1f", g426).c_str() : "", g422 > 0 ? fmt(" | 422F %.1f", g422).c_str() : "", w0, fl.c_str(),
                             (long long)bf, bw, st > 0 ? bw / st : 0.0, ib > 0 ? bw / ib : 0.0, kb ? " BAD" : "");
                 std::fflush(stdout);

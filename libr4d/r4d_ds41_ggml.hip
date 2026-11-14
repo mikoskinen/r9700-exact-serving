@@ -3681,8 +3681,14 @@ int wmk_code_r6(int ty, long long Ntot, long long K, long long M) {
     if (ty == GG_Q6_K && K == 6144 && Ntot == 6400) return G2KP1;
     return 0;
 }
+std::atomic<int> g_wmk{-1};
+/* FINDINGS F7 (14.11.): the one-card launch-code tables did not carry to the server (r5 / r6 vs r1-r4's 70724). ds41_wmk 2 / 3 select
+ * the decode-band launch code at issue with the SAME bytes as 1 (every code computes the part order), so one start can A/B them in
+ * process: 1 = the r6 table (r5's <= 16 rows + r6's 17..48), 2 = r1-r4's code 70724 at every decode row count, 3 = r5's table (r6's
+ * 17..48-row codes off). Prefill rows (> 48) take the W prefill table in every mode. */
 int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
-    if (!g_wmk_tab) return kWmkCode;
+    const int mode = g_wmk.load(std::memory_order_relaxed);
+    if (!g_wmk_tab || mode == 2) return kWmkCode;
     const bool head = f32out && Ntot >= 16384;
     if (M <= 16) {
         if (head) return 332872;
@@ -3691,7 +3697,7 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
         if (ty == GG_Q8_0 && K == 5120 && Ntot == 1024) return 332872;
         return kWmkCode;
     }
-    if (g_wmk_g2 == 1 && !head) {
+    if (g_wmk_g2 == 1 && !head && mode != 3) {
         const int c6 = wmk_code_r6(ty, Ntot, K, M);
         if (c6) return c6;
     }
@@ -3700,23 +3706,22 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     if (ty == GG_Q6_K && ((K == 5120 && Ntot == 1536) || K == 768 || K == 512 || (K == 2048 && Ntot == 5120))) return kWmkCode | g2;
     return 595012 | g2;
 }
-std::atomic<int> g_wmk{-1};
 std::atomic<long long> g_wmk_launches{0}, g_wmk_rows{0}, g_wmk_declines{0};
 int wmk_now() {
     int v = g_wmk.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_WMK");
         int unread = -1;
-        const int want = e && e[0] == '1' && !e[1] ? 1 : 0;
+        const int want = e && e[0] >= '1' && e[0] <= '3' && !e[1] ? e[0] - '0' : 0;   /* 1, or the F7 A/B codes 2 / 3 */
         const bool first = g_wmk.compare_exchange_strong(unread, want);
         v = g_wmk.load(std::memory_order_relaxed);
-        if (first && want == 1) std::fprintf(stderr, "radiance: libr4d: lever WMK (ds41_wmk, RADIANCE_DS41_WMK=1): dense GGUF GEMMs of <= %d rows "
-                                         "in the part-order WMMA form (code %d) from load\n", kGgDecodeRows, kWmkCode);
+        if (first && want >= 1) std::fprintf(stderr, "radiance: libr4d: lever WMK (ds41_wmk %d, RADIANCE_DS41_WMK): dense GGUF GEMMs at every row "
+                                         "count in the part-order WMMA form from load\n", want);
     }
     return v;
 }
 /* the switch takes a call of M rows (the bench pin r4d_gg_wk_pin, when set, runs ahead of it at every M) */
-bool wmk_take(long long M) { return M <= kGgDecodeRows && wmk_now() == 1; }
+bool wmk_take(long long M) { return M <= kGgDecodeRows && wmk_now() >= 1; }
 void wmk_count(long long M) {
     g_wmk_launches.fetch_add(1, std::memory_order_relaxed);
     g_wmk_rows.fetch_add(M, std::memory_order_relaxed);
@@ -3855,7 +3860,7 @@ int gg_gemm_run(RadStream s, int ty, bool logits, const uint16_t* xd, long long 
     }
     /* lever WMK (stage 3): above the decode band under ds41_wmk 1 the part order too, on the GPF form gg_pf would take (one form
      * of arithmetic at every row count); a call it declines runs today's prefill kernel, counted + logged */
-    if (!g_gg_wk && M > kGgDecodeRows && wmk_now() == 1) {
+    if (!g_gg_wk && M > kGgDecodeRows && wmk_now() >= 1) {
         int form = 0;
         if (r4d_gg_pf_on()) {
             const R4dGgPfCall c{ ty, logits, xd, x_ld, wd, w_ld, yd, y_ld, (int)M, (int)N, (int)K };
@@ -4439,7 +4444,7 @@ void r4d_mix_fin_set(int v);
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!std::strcmp(name, "ds41_mix_fin")) return value == 0 || value == 1 ? 1 : -1;
-    if (!std::strcmp(name, "ds41_wmk")) return value == 0 || value == 1 ? 1 : -1;
+    if (!std::strcmp(name, "ds41_wmk")) return value >= 0 && value <= 3 ? 1 : -1;   /* 2 / 3: F7's in-process A/B codes */
     if (!std::strcmp(name, "gg_gemv_m16")) return value == 0 || value == 1 ? 1 : -1;
     if (!std::strcmp(name, "ds41_mix_wv")) return r4d_mix_wv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "ix_lds") || !std::strcmp(name, "ix_ni")) return value == 0 || value == 1 ? 1 : -1;
@@ -4460,7 +4465,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "ar_xpush")) { r4d_ar_xpush_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_wv")) { r4d_mix_wv_set(value); return 1; }
     if (!std::strcmp(name, "ds41_mix_fin")) { r4d_mix_fin_set(value); return 1; }
-    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value == 1 ? 1 : 0, std::memory_order_relaxed); return 1; }
+    if (!std::strcmp(name, "ds41_wmk")) { g_wmk.store(value >= 1 && value <= 3 ? value : 0, std::memory_order_relaxed); return 1; }
     if (!std::strcmp(name, "gg_gemv_m16")) { r4d_gg_mr_m16_set(value); return 1; }
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }

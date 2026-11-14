@@ -4729,7 +4729,7 @@ static std::atomic<long long> g_bi_onear{0};   /* lever A9: segmented steps whos
  * only keeps today's pieces (rows(kBiBand), the decode forms: the faster geometry there; the same bytes). Read at issue: a
  * flip of the switch bumps the epoch, so recorded passes re-record. Off (or libr4d without the switch): today's issue. */
 static std::atomic<long long> g_wmkw_steps{0}, g_wmkw_runs{0}, g_wmkw_rows{0};
-static bool wmk_whole_on() { return ds41_switch("ds41_wmk") == 1; }
+static bool wmk_whole_on() { return ds41_switch("ds41_wmk") >= 1; }   /* 1, or F7's A/B codes 2 / 3 (the same bytes) */
 /* the weight is a GGUF block weight served by gemm_nt_ggml (not IQR, not bf16 gemm_nt) */
 static bool gguf_dense(const Model& m, rad_weight w) { return m.wty.count(w) && !m.wsc.count(w); }
 /* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
