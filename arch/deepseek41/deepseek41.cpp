@@ -4721,6 +4721,17 @@ struct BiSeg {
 };
 static std::atomic<long long> g_bi_steps{0}, g_bi_sync{0}, g_bi_wide{0}, g_bi_moe{0};
 static std::atomic<long long> g_bi_onear{0};   /* lever A9: segmented steps whose MoE took one all-reduce (layer 0) */
+/* Lever WMK in the engine (ds41-wmk2 stage 3, 14.11.2026): libr4d's fn4 ds41_wmk 1 runs every dense GGUF GEMM (gemm_nt_ggml,
+ * its pairs and folds) in ONE part-order arithmetic at every row count, so a row's bytes no longer depend on the launch's
+ * other rows or on the row count (the 48 / 49 decode-band flip is gone for these ops). step_bi then issues a layer's dense GGUF
+ * GEMMs once over each run of consecutive rows that holds a prefill segment -- the decode rows of a MIXED step ride the prefill
+ * launch instead of a decode-segment launch of their own (one weight read fewer a layer and op) -- and a run of decode rows
+ * only keeps today's pieces (rows(kBiBand), the decode forms: the faster geometry there; the same bytes). Read at issue: a
+ * flip of the switch bumps the epoch, so recorded passes re-record. Off (or libr4d without the switch): today's issue. */
+static std::atomic<long long> g_wmkw_steps{0}, g_wmkw_runs{0}, g_wmkw_rows{0};
+static bool wmk_whole_on() { return ds41_switch("ds41_wmk") == 1; }
+/* the weight is a GGUF block weight served by gemm_nt_ggml (not IQR, not bf16 gemm_nt) */
+static bool gguf_dense(const Model& m, rad_weight w) { return m.wty.count(w) && !m.wsc.count(w); }
 /* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
  * segment, decode rows within the norms' width): step() then runs today's issue. Prefill sequences' bounds from the
  * host mirror of positions (each sequence's rows are consecutive positions; a jump starts the next); when that does not
@@ -4966,6 +4977,46 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             for (int64_t a = 0; a < s.n; a += cap) fn(s.r0 + a, std::min(cap, s.n - a));
         }
     };
+    /* lever WMK (ds41_wmk 1, wmk_whole_on): a dense GGUF GEMM over each run of consecutive rows that holds a prefill segment in
+     * ONE launch (the decode rows ride it), a decode-only run as rows(kBiBand); off: rows(kBiBand) (`wmkw` false) or the caller's
+     * own by-segment issue. `seg`: the caller's per-segment form (q_a / kv / q_b / the indexer's linears: by segment, uncut). */
+    const bool wmkw = wmk_whole_on();
+    auto dense = [&](bool gg, bool seg, const auto& fn) {
+        const auto by_seg = [&](int64_t a0, int64_t a1) {
+            for (const BiSeg& s : *cur) {
+                if (s.r0 < a0 || s.r0 >= a1) continue;
+                if (seg || !s.dec || s.n <= kBiBand) { fn(s.r0, s.n); continue; }
+                for (int64_t a = 0; a < s.n; a += kBiBand) fn(s.r0 + a, std::min(kBiBand, s.n - a));
+            }
+        };
+        if (!wmkw || !gg) { by_seg(0, T); return; }
+        for (const auto& u : runs) {
+            bool pre = false, dec = false;
+            for (const BiSeg& s : *cur)
+                if (s.r0 >= u.first && s.r0 < u.first + u.second) (s.dec ? dec : pre) = true;
+            if (pre && dec) {   /* a mixed run: one launch */
+                fn(u.first, u.second);
+                if (rad_rank(x) == 0) {
+                    g_wmkw_runs.fetch_add(1, std::memory_order_relaxed);
+                    g_wmkw_rows.fetch_add(u.second, std::memory_order_relaxed);
+                }
+                continue;
+            }
+            by_seg(u.first, u.first + u.second);
+        }
+    };
+    if (wmkw && rad_rank(x) == 0) {
+        bool pre = false, dec = false;
+        for (const BiSeg& s : sg) (s.dec ? dec : pre) = true;
+        if (pre && dec) {
+            const long long n = g_wmkw_steps.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1 || n % 256 == 0)
+                fprintf(stderr, "radiance: deepseek41: lever WMK (ds41_wmk 1): %lld mixed steps issued their dense GGUF GEMMs over "
+                                "whole runs (%lld run launches a layer-op, %lld rows); this step %lld rows\n",
+                        n, g_wmkw_runs.load(std::memory_order_relaxed), g_wmkw_rows.load(std::memory_order_relaxed),
+                        (long long)T);
+        }
+    }
     /* a segment's cu view and per-sequence slices */
     auto segcu = [&](const BiSeg& s) {
         if (s.k < 0) return praw(batch->cu_seqlens + s.s0, RAD_I32, s.s1 - s.s0 + 1);
@@ -5107,7 +5158,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             /* lever E1: the lookup, copy and GEMM over the unique id rows of the launches below that are wider than the
              * band (the decode segment's pieces and a short prefill segment keep their own launch) */
             m.edd_ls.clear();
-            rows(kBiBand, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); });
+            const bool e_gg = gguf_dense(m, L.e_kv);   /* lever WMK: a mixed run's Engram rows in one launch (dense()) */
+            dense(e_gg, false, [&](int64_t r0, int64_t n) { m.edd_ls.push_back({ r0, n }); });
             if (!engdd_issue(x, m, L, batch, T, m.edd_ls)) {
                 if (m.ple_group > 0)
                     RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_codes), RAD_W(m.ple_scale),
@@ -5116,7 +5168,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     RAD_ISSUE_N(x, L.e_emb, T * H, brows(L.ids, T), RAD_W(m.ple_table), brows(m.emb, T));
                 RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
                 /* the Engram GEMM (gemm_nt_ggml, banded) by segment */
-                rows(kBiBand, [&](int64_t r0, int64_t n) { e2_gemm(x, m, L, n, R(m.embd, r0, n), R(m.ekv, r0, n)); });
+                dense(e_gg, false, [&](int64_t r0, int64_t n) { e2_gemm(x, m, L, n, R(m.embd, r0, n), R(m.ekv, r0, n)); });
             }
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
@@ -5210,20 +5262,25 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     kvn(s.r0, s.n);
             };
             if (cheap) {   /* C: op by op across the segments; the never-flipping per-row ops once over the step */
-                for (const BiSeg& s : sg) {   /* lever 1U-GQ: q_a + kv_g as one launch where the switch takes them */
-                    if (gq_qkv_on(L, s.n))
-                        gq_qkv_issue(x, m, L, s.n, R(m.xn, s.r0, s.n), R(m.qr, s.r0, s.n), R(m.kv, s.r0, s.n));
+                /* lever WMK (dense(), ds41_wmk 1): the dense GGUF linears once over a mixed run; off: by segment, as before */
+                const bool qkv_gg = gguf_dense(m, L.wq_a) && gguf_dense(m, L.wkv);
+                dense(qkv_gg, true, [&](int64_t r0, int64_t n) {   /* lever 1U-GQ: q_a + kv_g as one launch where the switch takes them */
+                    if (gq_qkv_on(L, n))
+                        gq_qkv_issue(x, m, L, n, R(m.xn, r0, n), R(m.qr, r0, n), R(m.kv, r0, n));
                     else
-                        lin_issue(x, m, L.q_a, s.n, R(m.xn, s.r0, s.n), L.wq_a, R(m.qr, s.r0, s.n));
-                }
-                for (const BiSeg& s : sg)
-                    if (!gq_qkv_on(L, s.n)) lin_issue(x, m, L.kv_g, s.n, R(m.xn, s.r0, s.n), L.wkv, R(m.kv, s.r0, s.n));
+                        lin_issue(x, m, L.q_a, n, R(m.xn, r0, n), L.wq_a, R(m.qr, r0, n));
+                });
+                dense(qkv_gg, true, [&](int64_t r0, int64_t n) {
+                    if (!gq_qkv_on(L, n)) lin_issue(x, m, L.kv_g, n, R(m.xn, r0, n), L.wkv, R(m.kv, r0, n));
+                });
                 if (L.i_score)
-                    for (const BiSeg& s : sg) lin_issue(x, m, L.i_w, s.n, R(m.xn, s.r0, s.n), L.iproj, R(m.iw, s.r0, s.n));
-                if (qfold)
-                    for (const BiSeg& s : sg)
-                        RAD_ISSUE_N(x, L.q_bf, s.n, R(m.qr, s.r0, s.n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, s.r0, s.n),
-                                    R(m.q, s.r0, s.n));
+                    dense(gguf_dense(m, L.iproj), true, [&](int64_t r0, int64_t n) {
+                        lin_issue(x, m, L.i_w, n, R(m.xn, r0, n), L.iproj, R(m.iw, r0, n));
+                    });
+                if (qfold)   /* rmsnorm_gemm_nt_ggml: rmsnorm's row arithmetic is the row's at any width (kR4dSumLanes) */
+                    dense(gguf_dense(m, L.wq_b), true, [&](int64_t r0, int64_t n) {
+                        RAD_ISSUE_N(x, L.q_bf, n, R(m.qr, r0, n), RAD_W(L.wq_b), RAD_W(L.q_norm), R(m.qrn, r0, n), R(m.q, r0, n));
+                    });
                 else
                     whole([&](int64_t r0, int64_t n) {
                         RAD_ISSUE_N(x, L.q_an, n, R(m.qr, r0, n), RAD_W(L.q_norm), R(m.qrn, r0, n));
@@ -5235,9 +5292,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         RAD_ISSUE_N(x, L.kv_n, n, R(m.kv, r0, n), RAD_W(L.kv_norm), R(m.kvn, r0, n));
                     });
                 if (L.i_score)
-                    for (const BiSeg& s : sg) lin_issue(x, m, L.i_q, s.n, R(m.qrn, s.r0, s.n), L.iq_w, R(m.iq, s.r0, s.n));
+                    dense(gguf_dense(m, L.iq_w), true, [&](int64_t r0, int64_t n) {
+                        lin_issue(x, m, L.i_q, n, R(m.qrn, r0, n), L.iq_w, R(m.iq, r0, n));
+                    });
                 if (!qfold)
-                    for (const BiSeg& s : sg) lin_issue(x, m, L.q_b, s.n, R(m.qrn, s.r0, s.n), L.wq_b, R(m.q, s.r0, s.n));
+                    dense(gguf_dense(m, L.wq_b), true, [&](int64_t r0, int64_t n) {
+                        lin_issue(x, m, L.q_b, n, R(m.qrn, r0, n), L.wq_b, R(m.q, r0, n));
+                    });
                 whole([&](int64_t r0, int64_t n) {
                     const RadOperand pn = P(batch->positions, r0, n);
                     if (!L.kv_f) RAD_ISSUE_N(x, L.kv_rope, n, R(m.kvn, r0, n), brows(cs, g.max_ctx), pn);
@@ -5453,7 +5514,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             }
             bt_pt(x, m, m.o, T, "o", l);
             const int64_t gd = HD / m.gr;
-            rows(kBiBand, [&](int64_t r0, int64_t n) {
+            bool oa_gg = true;
+            for (int j = 0; j < m.gr; ++j) oa_gg = oa_gg && gguf_dense(m, L.wo_a[(size_t)j]);
+            dense(oa_gg, false, [&](int64_t r0, int64_t n) {
                 if (gq_oa_on(L, n)) {   /* lever 1U-GQ: the two groups as one launch */
                     gq_oa_issue(x, m, L, n, C(m.o, 0, gd, r0, n), C(m.o, gd, gd, r0, n), C(m.oa, 0, c.o_rank, r0, n),
                                 C(m.oa, c.o_rank, c.o_rank, r0, n));
@@ -5465,7 +5528,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             });
             bt_pt(x, m, m.oa, T, "oa", l);
             if (late) mix_a();
-            rows(kBiBand, [&](int64_t r0, int64_t n) {
+            dense(gguf_dense(m, L.wo_b), false, [&](int64_t r0, int64_t n) {
                 lin_issue(x, m, L.o_b, n, R(m.oa, r0, n), L.wo_b, R(m.attn_out, r0, n));
             });
             bt_pt(x, m, m.attn_out, T, "attn_out", l);
