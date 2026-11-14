@@ -3848,4 +3848,77 @@ TEST(lever_dlw_weight_sidecar) {
     CHECK(has(s4.log, "it does not reshape it"));
 }
 
+/* ================================================================== lever G: the tail grid (ds41-tailgrid) */
+/* fn4 sched_tail_grid (RADIANCE_SCHED_TAIL_GRID at start) on the tiny hybrid (gated delta net: linear state, its conv
+ * state and attention; the reference kernels), in the DS line's geometry scaled by four: --checkpoint-interval 512,
+ * --prefill-span 2, --max-num-batched-tokens 1088 -- the resume grid 512 + k x 1024 -- and F = 256. A conversation: a
+ * cold text, then two turns that each extend the previous prompt, then a repeat. Under the lever every request resumes
+ * at the previous prompt's FINE tail (the deepest multiple of 256 at or below N - 128), off the resume grid, from the
+ * snapshot the earlier request took there in the middle of its last cold chunk; with the switch at 0 at the grid point.
+ * Every reply and every probability in it equals a cold run's of the same prompt (a server without a prefix cache), under
+ * the lever and without it -- the cold text under the lever too (its last chunk is cut at the tail). The reference
+ * kernels round a row the same in any chunk, so this proves the STATE a fine snapshot restores (linear, conv, the blocks
+ * adopted below it), not the cards' form bands. */
+TEST(lever_g_a_turn_resumed_at_a_fine_tail_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    std::vector<int32_t> a = prompt_ids(61, 2000), b = a, c;
+    for (int32_t t : prompt_ids(62, 500)) b.push_back(t);
+    c = b;
+    for (int32_t t : prompt_ids(63, 700)) c.push_back(t);
+    const std::vector<std::string> geo = { "--num-speculative-tokens", "0", "--checkpoint-interval", "512",
+                                           "--prefill-span", "2", "--max-num-batched-tokens", "1088",
+                                           "--max-num-seqs", "2" };
+    const auto grid = [](int64_t p) { return p < 512 ? (int64_t)0 : 512 + (p - 512) / 1024 * 1024; };
+    const auto tail = [&](int64_t N, int64_t F) {
+        const int64_t g = grid(N - 1), f = F > 0 && N > 128 ? (N - 128) / F * F : 0;
+        return f > g && f > 512 ? f : g;
+    };
+    const int64_t Na = (int64_t)a.size(), Nb = (int64_t)b.size(), Nc = (int64_t)c.size();
+    /* the lengths this test is about: each prompt's fine tail off the grid, each turn past the previous tail */
+    REQUIRE(tail(Na, 256) > tail(Na, 0) && tail(Nb, 256) > tail(Nb, 0) && tail(Nc, 256) > tail(Nc, 0));
+    REQUIRE(tail(Na, 256) % 1024 != 512 && tail(Nb, 256) > tail(Na, 256) && tail(Nc, 256) > tail(Nb, 256));
+    std::vector<json> cold;
+    for (const std::vector<int32_t>* p : { &a, &b, &c }) {
+        Server s;
+        std::vector<std::string> args = geo;
+        args.push_back("--no-prefix-cache");
+        REQUIRE(s.start(world().qwen35, args));
+        cold.push_back(post(s.port, "/completion", completion(*p, 24, 0.0, 0, 3)));
+        CHECK_EQ(s.stop(), 0);
+        REQUIRE(cold.back().contains("completion_probabilities"));
+        CHECK_EQ(tokens_of(cold.back()).size(), (size_t)24);
+    }
+    for (int F : { 256, 0 }) {
+        Server s;
+        REQUIRE(s.start(world().qwen35, geo,
+                        F ? std::vector<std::string>{ "RADIANCE_SCHED_TAIL_GRID=" + std::to_string(F) }
+                          : std::vector<std::string>{}));
+        const json ra = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+        const json rb = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+        const json rc = post(s.port, "/completion", completion(c, 24, 0.0, 0, 3));
+        const json again = post(s.port, "/completion", completion(c, 24, 0.0, 0, 3));
+        const int64_t ca = timing(ra, "cache_n"), cb = timing(rb, "cache_n"), cc = timing(rc, "cache_n"),
+                      c2 = timing(again, "cache_n");
+        const bool same = tokens_of(ra) == tokens_of(cold[0]) && tokens_of(rb) == tokens_of(cold[1]) &&
+                          tokens_of(rc) == tokens_of(cold[2]) && tokens_of(again) == tokens_of(cold[2]) &&
+                          ra["completion_probabilities"] == cold[0]["completion_probabilities"] &&
+                          rb["completion_probabilities"] == cold[1]["completion_probabilities"] &&
+                          rc["completion_probabilities"] == cold[2]["completion_probabilities"] &&
+                          again["completion_probabilities"] == cold[2]["completion_probabilities"];
+        if (!(same && cb == tail(Na, F) && cc == tail(Nb, F) && c2 == tail(Nc, F)))
+            fprintf(stderr, "    sched_tail_grid %d: prompts %lld / %lld / %lld, cached %lld / %lld / %lld / %lld (want 0 / %lld / "
+                            "%lld / %lld), %s a cold run's\n", F, (long long)Na, (long long)Nb, (long long)Nc, (long long)ca,
+                    (long long)cb, (long long)cc, (long long)c2, (long long)tail(Na, F), (long long)tail(Nb, F),
+                    (long long)tail(Nc, F), same ? "equal to" : "NOT equal to");
+        CHECK(ca <= 0);
+        CHECK_EQ(cb, tail(Na, F));      /* the previous prompt's tail: fine under the lever, the grid point without */
+        CHECK_EQ(cc, tail(Nb, F));
+        CHECK_EQ(c2, tail(Nc, F));
+        CHECK(same);
+        CHECK_EQ(s.stop(), 0);
+        if (F) CHECK(s.log.find("lever G (fn4 sched_tail_grid 256") != std::string::npos);
+        else   CHECK(s.log.find("lever G") == std::string::npos);
+    }
+}
+
 RAD_TEST_MAIN()

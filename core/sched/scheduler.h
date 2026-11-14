@@ -629,7 +629,15 @@ public:
     int                  observed_requests(ReqStat* out, int max) const;
 
     /* plan_chunk's tail-checkpoint rule for each --prefix-resume mode (see the definition). */
-    int64_t tail_checkpoint(int64_t target) const;
+    /* `fine`: lever G's tail grid for the request (Request::tail_grid), 0 = the resume grid's own tail. */
+    int64_t tail_checkpoint(int64_t target, int64_t fine = 0) const;
+    /* Lever G (fn4 sched_tail_grid): the tail grid a request admitted now latches -- the switch's F where the resume is
+     * exact with checkpoints and F is a multiple of the quantum, at least kTailMinPiece, and divides the interval, the
+     * grid and its origin (so a fine tail lies at least F past the grid point under it); else 0 (counted inert). */
+    int64_t tail_grid_now() const;
+    /* The fewest rows lever G leaves in a prompt's last piece and in the piece before it: option D's floor (kBiMinPiece
+     * in scheduler.cpp), the row count above which no kernel form of the line depends on a piece's rows. */
+    static constexpr int64_t kTailMinPiece = 128;
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;
@@ -738,6 +746,14 @@ private:
      * another prefill already planned, 0 when NOA does not act, no prefill is planned yet, or (sched_noa 1) the step
      * already carries a NOA piece. */
     int           noa_mode_ = 0;           /* sched_noa in force: 0 off, 1 one piece a step, 2 as many as fit */
+    /* Lever G (fn4 sched_tail_grid, read at every step planned; a request latches it at admission): the switch in force
+     * and GET "tailgrid"'s counts -- latched, tails, tail_rows, resumes, resume_rows_saved, rejoins, inert,
+     * declined. */
+    int           tail_grid_sw_ = 0;
+    mutable int64_t tg_n_[8] = {};
+    /* A request has latched the lever in this process: snapshots off the resume grid may exist (admit_one's short-resume
+     * rule and plan_chunk's off-grid start act only then, so the switch at 0 from start is today's scheduler). */
+    bool          tg_seen_ = false;
     bool          noa_step_ = false, noa_disp_ = false;
     int64_t       noa_pieces_now_ = 0;     /* NOA pieces planned in the step being planned */
     std::vector<int32_t> noa_held_;
