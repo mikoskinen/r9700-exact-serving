@@ -4991,10 +4991,14 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         };
         if (!wmkw || !gg) { by_seg(0, T); return; }
         for (const auto& u : runs) {
-            bool pre = false, dec = false;
+            int64_t dn = 0, pn = 0;
             for (const BiSeg& s : *cur)
-                if (s.r0 >= u.first && s.r0 < u.first + u.second) (s.dec ? dec : pre) = true;
-            if (pre && dec) {   /* a mixed run: one launch */
+                if (s.r0 >= u.first && s.r0 < u.first + u.second) (s.dec ? dn : pn) += s.n;
+            /* a mixed run in one launch where that is the faster geometry: the run fits the decode band (one <= 48-row launch for
+             * both), or its prefill rows are past the band already (they run a prefill form anyway; the decode rows add <= their
+             * share of it). A short prefill tail next to decode rows (pn <= 48 < dn + pn) keeps two decode-band launches: one
+             * prefill-form launch of 49..96 rows is slower than both (K-serial tiles). */
+            if (dn > 0 && pn > 0 && (pn > kBiBand || dn + pn <= kBiBand)) {   /* a mixed run: one launch */
                 fn(u.first, u.second);
                 if (rad_rank(x) == 0) {
                     g_wmkw_runs.fetch_add(1, std::memory_order_relaxed);

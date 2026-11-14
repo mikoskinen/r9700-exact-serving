@@ -38185,6 +38185,7 @@ int main(int argc, char** argv) {
     bool mrc = false, mrp = false; const char* mr_m = nullptr; int mr_it = 0; const char* mr_t = nullptr;   /* --mrcheck / --perfmr */
     bool a4c = false, a4p = false; const char* a4_out = nullptr;   /* lever A4: --mrcheck16 / --perfm16 [--m16-out FILE] */
     bool wgc = false, wgp = false, wgk = false, wgr = false, wgf = false, wgq = false; const char* wg_m = nullptr; int wg_it = 0, wg_r = 0; const char* wg_t = nullptr;   /* ds41-wmgate: --wmgcheck / --perfwmg */
+    bool wgw = false; const char* wg_f = nullptr;   /* ds41-wmk2 stage 3: --perfwq */
     bool bic = false; const char* bi_c = nullptr; const char* bi_m = nullptr;   /* --bicheck (lever BI) */
     bool gpc = false, gpp = false; const char* gp_m = nullptr; int gp_it = 0; const char* gp_t = nullptr;   /* --gpcheck / --perfgp */
     bool mxc = false, mxp = false, bfc = false, bfp = false; const char* drk_l = nullptr; int drk_it = 0;   /* ds41-drk */
@@ -38466,6 +38467,13 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_m = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfwq")) {
+            /* ds41-wmk2 stage 3: W's prefill forms (gg_wq_kernel) vs int16's stock WMMA kernel, one session (wmg::wq_perf). */
+            wgw = true;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_m = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_t = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) wg_f = argv[++i];
         } else if (!std::strcmp(argv[i], "--wmkref")) {
             /* ds41-wmk2 (FINDINGS F2): D and W against an f64 host reference (wmg::refcheck). */
             wgf = true;
@@ -38763,7 +38771,7 @@ int main(int argc, char** argv) {
 #endif
         return g_fail ? 1 : 0;
     }
-    if (wgc || wgp || wgk || wgr || wgf || wgq) {
+    if (wgc || wgp || wgk || wgr || wgf || wgq || wgw) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
         if (wgc) { if (wmg::g_wk_codes.empty()) wmg::check(pl, wg_t); else wmg::checkk(pl, wg_t); }
@@ -38772,6 +38780,7 @@ int main(int argc, char** argv) {
         if (wgr) wmg::route(pl, wg_t);
         if (wgf) wmg::refcheck(pl, wg_t);
         if (wgq) wmg::wkpf_perf(pl, wg_m, wg_it, wg_t);
+        if (wgw) wmg::wq_perf(pl, wg_m, wg_it, wg_t, wg_f);
         dfree_all();
 #else
         skip("ds41-wmgate bench", "built without HIP");

@@ -752,7 +752,7 @@ static void route(const Plugin& pl, const char* tlist) {
     const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
     const int kCode = 70724;
     const std::vector<int64_t> Ms = { 1, 2, 5, 8, 16, 17, 24, 33, 47, 48, 49, 64, 97, 130 };
-    const int64_t R = 49, RB = 130;
+    const int64_t R = 49, RB = 2048;   /* RB: the prefill-height check of gg_wq (stage 3) runs a 2048-row call */
     auto wkpf_last = (int (*)())dlsym(pl.h, "r4d_gg_wkpf_last");
     auto pf_pin = (void (*)(int))dlsym(pl.h, "r4d_gg_pf_pin");
     auto wkpf_ts = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_ts");
@@ -962,6 +962,26 @@ static void route(const Plugin& pl, const char* tlist) {
                         else for (int64_t m = 0; m < 130; ++m) if (yrow_of(of, m) != ay[(size_t)(m % R)]) ++nb;
                         forms_ok += fmt(" %d%s:%s", fc, ts == 2 ? "s" : "r", nb == 0 && used == fc ? "ok" : nb < 0 ? "rc" : used != fc ? "notused" : "DIFF");
                         if (nb != 0 || used != fc) ++form_bad;
+                    }
+            }
+            /* stage 3: W's own prefill forms (gg_wq_kernel 9xxx, W form 0 and the engine's table -1) at M 130 and 2048 = alone */
+            auto wkpf_def = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_default");
+            if (wkpf_def && op.kind <= 1) {
+                for (int fc : { 9312, 9311, 9412, 9411, 9321, 0, -1 })
+                    for (int64_t MM : { (int64_t)130, (int64_t)2048 }) {
+                        wmk_on(1);
+                        if (wkpf_follow) wkpf_follow(0);
+                        wkpf_def(fc);
+                        std::vector<uint8_t> of;
+                        const int rc = call(0, MM, of);
+                        const int used = wkpf_last ? wkpf_last() : -1;
+                        wkpf_def(-1);
+                        long long nb = 0;
+                        if (rc != RAD_OK) nb = -1;
+                        else for (int64_t m = 0; m < MM; ++m) if (yrow_of(of, m) != ay[(size_t)(m % R)]) ++nb;
+                        const bool uok = fc < 0 || used == fc;
+                        forms_ok += fmt(" %d@%lld:%s", fc, (long long)MM, nb == 0 && uok ? "ok" : nb < 0 ? "rc" : !uok ? "notused" : "DIFF");
+                        if (nb != 0 || !uok) ++form_bad;
                     }
             }
             wmk_on(0);
@@ -1336,6 +1356,127 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
     if (wkpf_follow) wkpf_follow(0);
     std::printf("WMGVERDICT wkpf: %lld (type, shape, M) keys, %lld bad (a launch failed, a W form unused, or W bytes differ across forms); best W vs best int16 geomean x%.3f\n",
                 keys, bad, nl ? std::exp(lsum / nl) : 0.0);
+}
+
+/* --perfwq [Ms] [iters] [types] [forms] (ds41-wmk2 stage 3, 14.11.2026): W's prefill forms against int16's stock WMMA kernel in ONE
+ * session, per (type, shape, M) in the order stock, W form 0, the listed W forms (gg_wq_kernel 9xxx codes or GPF codes), stock again
+ * (drift), rotated weights past 256 MiB, mean of `iters`. int16 also: GPF 426 / 422 (int16's P0 table forms for the q6_K / q8_0
+ * shapes). Bytes: every W form == W form 0 (the part order). GPWQ lines (us, and x of the stock kernel's mean), WMGVERDICT wq with
+ * the rank-0 weighted sums (q5_K attention x13 + q6_K attention x27, q6_K shared x27 + q8_0 shared x13, engram x2 a step). */
+static void wq_perf(const Plugin& pl, const char* mlist, int iters, const char* tlist, const char* flist) {
+    if (iters <= 0) iters = 20;
+    Hk h;
+    if (!hooks(pl, h, "--perfwq")) return;
+    const GpHooks gp = gp_hooks(pl);
+    auto wkpf_last = (int (*)())dlsym(pl.h, "r4d_gg_wkpf_last");
+    auto wkpf_follow = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_follow");
+    auto wkpf_default = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_default");
+    auto wkpf_ts = (void (*)(int))dlsym(pl.h, "r4d_gg_wkpf_ts");
+    if (!gp.pin || !wkpf_last || !wkpf_default || !wkpf_ts) { std::printf("--perfwq: r4d_gg_pf_pin / r4d_gg_wkpf_default absent\n"); ++g_fail; return; }
+    const std::vector<int64_t> Ms = gp_list(mlist, "2048,4096");
+    const std::string want = tlist && *tlist ? tlist : "q5_K,q6_K,q8_0";
+    const std::vector<int64_t> forms = gp_list(flist, "9312,9311,9411,9412");
+    long long keys = 0, bad = 0;
+    std::map<int64_t, std::map<int64_t, double>> wsum;   /* M -> form (-1 stock, -2 int16 best, 0 W0, f) -> rank-0 weighted us */
+    std::printf("WMK gg_wq prefill timing (rotated weights, mean of %d): stock (int16) | W form 0 (stock + fold) | W forms | stock again\n", iters);
+    for (const MrTy& ty : kMrTypes) {
+        if (!mr_in(want.c_str(), ty.name)) continue;
+        for (const MrShape& sh : kMrShapes) {
+            if (sh.logits || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
+            /* rank-0 weight of this (type, shape) a step: attention q5_K 13 / q6_K 27 layers, shared q6_K 27 / q8_0 13, engram 2 */
+            const std::string nm = sh.name;
+            const bool shexp = nm.rfind("shexp", 0) == 0, w512 = nm.find("w512") != std::string::npos, eng = nm.rfind("engram", 0) == 0;
+            double wt = 0;
+            if (eng) wt = 2;
+            else if (shexp) wt = w512 ? 0 : (std::string(ty.name) == "q6_K" ? 27 : std::string(ty.name) == "q8_0" ? 13 : 0);
+            else wt = std::string(ty.name) == "q5_K" ? 13 : std::string(ty.name) == "q6_K" ? 27 : 0;
+            if (nm.find("attn_output_a") != std::string::npos) wt *= 2;   /* two groups a layer */
+            const int64_t rb = sh.K / ty.qk * ty.bb, wbytes = sh.N * rb;
+            std::vector<uint8_t> hw;
+            mr_weights(hw, ty, sh.N, sh.K, 0x51ED2701ull ^ (uint64_t)(sh.N * 7 + sh.K));
+            const int copies = (int)std::max<int64_t>(2, (256ll << 20) / wbytes + 1);
+            for (int64_t M : Ms) {
+                if (M <= 48) continue;
+                dfree_all();
+                std::vector<uint16_t> hx;
+                gp_acts(hx, M, sh.K, 0xABCDEFull ^ (uint64_t)M);
+                const size_t mb = (size_t)(M * sh.N) * 2;
+                void* d_x = dalloc((size_t)(M * sh.K) * 2);
+                void* d_w = dalloc((size_t)wbytes * (size_t)copies);
+                void* d_y = dalloc(mb);
+                if (!d_x || !d_w || !d_y) { std::printf("  %s %s M=%lld: alloc failed\n", ty.name, sh.name, (long long)M); ++g_fail; continue; }
+                st_memcpy(d_x, hx.data(), (size_t)(M * sh.K) * 2, hipMemcpyHostToDevice);
+                for (int c = 0; c < copies; ++c) st_memcpy((uint8_t*)d_w + (size_t)c * (size_t)wbytes, hw.data(), (size_t)wbytes, hipMemcpyHostToDevice);
+                MrLaunch L;
+                if (!mr_setup(L, pl, sh, ty, M)) { std::printf("  %s %s: row absent\n", ty.name, sh.name); ++g_fail; continue; }
+                std::vector<uint8_t> wref;
+                /* wmk 0: int16 (form = gg_pf pin, 0 = the stock kernel); wmk 1: W on exactly `form` */
+                auto arm = [&](int wmk, int form, double* us, bool* same, int* used) -> bool {
+                    clear(h);
+                    h.sw("ds41_wmk", wmk);
+                    if (wmk) { wkpf_default(form); if (wkpf_follow) wkpf_follow(0); }
+                    else gp.pin(form);
+                    wkpf_ts(1);
+                    st_memset(d_y, 0xff, mb);
+                    const int rc = L.run(d_x, d_w, d_y);
+                    bool ok = rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
+                    *used = wmk ? wkpf_last() : form;
+                    *same = true;
+                    if (ok && wmk) {
+                        std::vector<uint8_t> got(mb);
+                        st_memcpy(got.data(), d_y, mb, hipMemcpyDeviceToHost);
+                        if (wref.empty()) wref = got;
+                        *same = got == wref;
+                    }
+                    if (ok) *us = st_time_us([&](int i) { L.run(d_x, (uint8_t*)d_w + (size_t)(i % copies) * (size_t)wbytes, d_y); }, iters, nullptr);
+                    gp.pin(0); wkpf_ts(0); h.sw("ds41_wmk", 0); wkpf_default(-1);
+                    return ok;
+                };
+                double s1 = -1, s2 = -1, w0 = -1, g426 = -1, g422 = -1; bool sm; int u;
+                bool kb = false;
+                kb |= !arm(0, 0, &s1, &sm, &u);
+                const bool q6 = std::string(ty.name) == "q6_K", q8 = std::string(ty.name) == "q8_0";
+                if (q6) arm(0, 426, &g426, &sm, &u);
+                if (q8) arm(0, 422, &g422, &sm, &u);
+                kb |= !arm(1, 0, &w0, &sm, &u) || !sm || u != 0;
+                std::vector<double> wf(forms.size(), -1);
+                std::string fl;
+                for (size_t i = 0; i < forms.size(); ++i) {
+                    bool same = true; int used = -1;
+                    const bool ok = arm(1, (int)forms[i], &wf[i], &same, &used);
+                    if (!ok || !same || used != (int)forms[i]) kb = true;
+                    fl += fmt(" %lld %.1f%s%s;", (long long)forms[i], wf[i], !same ? " BYTES DIFFER" : "", used != (int)forms[i] ? " NOT USED" : "");
+                }
+                kb |= !arm(0, 0, &s2, &sm, &u);
+                const double st = 0.5 * (s1 + s2);
+                double ib = st;   /* int16's best of stock / its P0 table's GPF form */
+                if (g426 > 0) ib = std::min(ib, g426);
+                if (g422 > 0) ib = std::min(ib, g422);
+                double bw = w0; int64_t bf = 0;
+                for (size_t i = 0; i < forms.size(); ++i) if (wf[i] > 0 && wf[i] < bw) { bw = wf[i]; bf = forms[i]; }
+                wsum[M][-1] += wt * st; wsum[M][-2] += wt * ib; wsum[M][0] += wt * w0; wsum[M][-3] += wt * bw;
+                for (size_t i = 0; i < forms.size(); ++i) wsum[M][forms[i]] += wt * wf[i];
+                ++keys; bad += kb; g_fail += kb;
+                std::printf("GPWQ %s %s %lldx%lld M=%lld w%g: stock %.1f / %.1f us%s%s | W0 %.1f |%s | best W %lld %.1f = x%.3f of stock, x%.3f of int16 best%s\n",
+                            ty.name, sh.name, (long long)sh.N, (long long)sh.K, (long long)M, wt, s1, s2,
+                            g426 > 0 ? fmt(" | 426F %.1f", g426).c_str() : "", g422 > 0 ? fmt(" | 422F %.1f", g422).c_str() : "", w0, fl.c_str(),
+                            (long long)bf, bw, st > 0 ? bw / st : 0.0, ib > 0 ? bw / ib : 0.0, kb ? " BAD" : "");
+                std::fflush(stdout);
+            }
+        }
+    }
+    clear(h);
+    dfree_all();
+    if (keys == 0) ++g_fail;
+    for (auto& mk : wsum) {
+        auto& w = mk.second;
+        std::string fl;
+        for (int64_t f : forms) fl += fmt(" %lld %.2f ms (x%.3f);", (long long)f, w[f] / 1000.0, w[-1] > 0 ? w[f] / w[-1] : 0.0);
+        std::printf("WQSUM M=%lld rank-0 dense prefill a step (weighted): stock %.2f ms | int16 best %.2f | W0 %.2f (x%.3f) |%s | best-per-shape W %.2f ms = x%.3f of stock, x%.3f of int16 best\n",
+                    (long long)mk.first, w[-1] / 1000.0, w[-2] / 1000.0, w[0] / 1000.0, w[-1] > 0 ? w[0] / w[-1] : 0.0, fl.c_str(), w[-3] / 1000.0,
+                    w[-1] > 0 ? w[-3] / w[-1] : 0.0, w[-2] > 0 ? w[-3] / w[-2] : 0.0);
+    }
+    std::printf("WMGVERDICT wq: %lld (type, shape, M) keys, %lld bad (a launch failed, a W form unused, or W bytes differ from W form 0)\n", keys, bad);
 }
 
 }  // namespace wmg
