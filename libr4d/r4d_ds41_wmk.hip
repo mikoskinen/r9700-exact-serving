@@ -505,6 +505,7 @@ __global__ __launch_bounds__(256) void gg_wk_kernel(GgWkArgs A) {
  * bit 18 WL -- each wave stages its own run's slab (no block barrier in the K loop), and a cap of 8 (bits 0-3 >= 8) allows
  * KP 8; bit 19 the rule counts the blocks of ONE 16-row tile (so M 17..48 keep M <= 16's KP instead of dropping to KP 1).
  * Stage 2 (r6 bench): bit 23 DP 2 (gg_wk_kernel's raw words two slabs ahead in a ring of three register sets; not with WL).
+ * bit 24: G2 (bit 21) with KP 1 instead of P / 2 (o_b / engram ran fastest at KP 1 in gg_wk_kernel's rule).
  * Every code computes the same part order: the bytes do not depend on the code. */
 std::atomic<long long> g_gg_wk_count{0};
 std::atomic<int> g_gg_wk_last{0};
@@ -1032,7 +1033,7 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
                const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv, long long M,
                long long K, const GgWkFold* fo) {
     const int P = gg_wk_parts(K);
-    const int kp = P >= 2 ? P / 2 : 1;
+    const int kp = (code & 16777216) || P < 2 ? 1 : P / 2;   /* bit 24: KP 1 (one run holds the running total; no LDS partials) */
     const int nmt = (int)((M + 15) / 16);
     if (nmt < 2 || nmt > 3 || kp > 4) return R4D_WK_DECLINE;
     const unsigned xg = Wq<GG_Q6_K>::XG > 0 ? (unsigned)(kWmS / 16 * 16 * nmt * kp * 4) : 0u;   /* the widest group sums (q6_K) */
