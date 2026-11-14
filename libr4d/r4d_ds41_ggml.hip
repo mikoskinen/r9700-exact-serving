@@ -3644,8 +3644,18 @@ constexpr int kWmkCode = 70724;
  * row count. M <= 16: WL staging with KP up to 8 (332872) where it measured faster -- q6_K K 5120 shared-expert gate_up (N 1536 /
  * 1024), the q6_K q_a + kv pair (1792), the q6_K q_b (8192 x 1280), the head (32320 x 5120 f32), q8_0 gate_up at N 1024 -- else
  * 70724. M 17..48: the per-tile KP rule (595012) except the head and q6_K gate_up / shexp down / o_b (70724). kWmkCode when the
- * table is off (g_wmk_tab 0, bench pin r4d_gg_wmk_tab). */
+ * table is off (g_wmk_tab 0, bench pin r4d_gg_wmk_tab).
+ * Stage 2 (r5, 14.11.): bit 21 (G2, gg_wk3_kernel: every row tile in one block, folds a / e included) where it measured faster (one
+ * card, runs/wmk2-s11, codes 1048576 vs 2692164): at 33..48 rows every shape but o_b (5120 x 2048) and shexp down (K 768 / 512);
+ * at 17..32 rows the head, the q6_K q_b (8192 x 1280) and the q8_0 shexp down (K 768). A call G2 declines runs the code's other
+ * bits (the same bytes). g_wmk_g2 (bench pin r4d_gg_wmk_g2): 1 the table, 0 no G2, 2 G2 at every 17..48-row call. */
 int g_wmk_tab = 1;
+int g_wmk_g2 = 1;
+bool wmk_g2(int ty, long long Ntot, long long K, long long M, bool head) {
+    if (g_wmk_g2 != 1) return g_wmk_g2 == 2;
+    if (M > 32) return !((K == 2048 && Ntot == 5120) || K == 768 || K == 512);
+    return head || (ty == GG_Q6_K && K == 1280 && Ntot == 8192) || (ty == GG_Q8_0 && K == 768);
+}
 int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     if (!g_wmk_tab) return kWmkCode;
     const bool head = f32out && Ntot >= 16384;
@@ -3656,9 +3666,10 @@ int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
         if (ty == GG_Q8_0 && K == 5120 && Ntot == 1024) return 332872;
         return kWmkCode;
     }
-    if (head) return kWmkCode;
-    if (ty == GG_Q6_K && ((K == 5120 && Ntot == 1536) || K == 768 || K == 512 || (K == 2048 && Ntot == 5120))) return kWmkCode;
-    return 595012;
+    const int g2 = wmk_g2(ty, Ntot, K, M, head) ? 2097152 : 0;
+    if (head) return kWmkCode | g2;
+    if (ty == GG_Q6_K && ((K == 5120 && Ntot == 1536) || K == 768 || K == 512 || (K == 2048 && Ntot == 5120))) return kWmkCode | g2;
+    return 595012 | g2;
 }
 std::atomic<int> g_wmk{-1};
 std::atomic<long long> g_wmk_launches{0}, g_wmk_rows{0}, g_wmk_declines{0};
@@ -4335,6 +4346,7 @@ extern "C" int r4d_rad_embed_lookup_ggml(const RadArgs* a, RadStream s) {
 extern "C" void r4d_gg_wm_pin(int on) { g_gg_wm_all = on ? 1 : 0; }
 extern "C" void r4d_gg_wk_pin(int code) { g_gg_wk = code; }
 extern "C" void r4d_gg_wmk_tab(int on) { g_wmk_tab = on ? 1 : 0; }
+extern "C" void r4d_gg_wmk_g2(int v) { g_wmk_g2 = v == 0 || v == 2 ? v : 1; }
 /* Lever WMK's counters (rad_wmk_stats; GET /admin/fn4 "wmk"): [0] the switch now, [1] part-order launches it issued, [2] their
  * rows, [3] calls it declined to int16's path. Recorded passes replay without issuing: the counts are issued launches. */
 extern "C" int rad_wmk_stats(long long* out, int n) {

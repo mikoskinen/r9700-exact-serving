@@ -482,8 +482,11 @@ std::atomic<int> g_gg_wk_last{0};
  * Activations staged ONE slab at a time (single buffer: 2 barriers a slab) -- KP runs x 16 NM rows, the stock staging's
  * chunks and group sums; a run-0 wave keeps the running total (tot), a later run's wave keeps its first part's partial in
  * registers (hold) and its last in acc; after the K loop those partials are written over the staging region, and run 0 adds
- * them in part order. Every output: the part partials of gg_wm_kernel's arithmetic, folded ((p0 + p1) + ...) in f32, rounded once. */
-template <int T, int KP, int NM, int NT, typename OT>
+ * them in part order. Every output: the part partials of gg_wm_kernel's arithmetic, folded ((p0 + p1) + ...) in f32, rounded once.
+ * PRO 1 / 2 (stage 2, r5): lever K1's folds a / e in the staging exactly as gg_wk_kernel's (the producer's bf16 octet of each staged
+ * chunk, rmsnorm's row scales from a block prologue in mr_norm_scales' order; grid row 0 also stores h) -- the same bytes as the
+ * producer's launch then the GEMM. */
+template <int T, int KP, int NM, int NT, typename OT, int PRO = 0>
 __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
     using W = Wq<T>;
     using Pf = typename W::Pf;
@@ -525,13 +528,98 @@ __global__ __launch_bounds__(256) void gg_wk3_kernel(GgWkArgs A) {
         xgo[i] = ((tid & 15) * 8 / (W::XG > 0 ? W::XG : 1)) * BM + run * BMr + row;
     }
     r4d_u32x4 xr[NX];
+    /* PRO 1: the norm scale of each live row (gg_wk_kernel's prologue over up to 16 NM rows); the gain's octets a run */
+    __shared__ float s_ws[PRO == 1 ? 16 * NM : 1][8], s_sc[PRO == 1 ? 16 * NM : 1];
+    float4 gq[PRO == 1 ? KP : 1][2];
+    r4d_u32x4 xu[PRO == 2 ? NX : 1];   /* PRO 2: the up half's chunks */
+    const bool hw = PRO > 0 && blockIdx.y == 0;   /* grid row 0's staged chunks (every live chunk once) go to h too */
+    if constexpr (PRO == 1) {
+        const int mc = r1 - r0;
+        for (int pv = wave; pv < mc * 8; pv += 8) {
+            const int m = pv >> 3, vw = pv & 7;
+            const uint16_t* xr0 = A.x[0] + (long long)(r0 + m) * A.x_ld[0];
+            float ss = 0.0f;
+            for (int c = vw * 32 + lane; c < A.K; c += 256) {
+                const float v = bf16_to_f32(xr0[c]);
+                ss += v * v;
+            }
+            ss = r4d_wave_sum(ss);
+            if (lane == 0) s_ws[m][vw] = ss;
+        }
+        lds_barrier();
+        if (tid < mc) {
+            float tt = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) tt += s_ws[tid][w];
+            for (int w = 8; w < A.nw; ++w) tt += 0.0f;
+            s_sc[tid] = rsqrtf(tt / (float)A.K + A.eps);
+        }
+        lds_barrier();
+    }
+    int xt = 0;   /* the run slab xr holds (the h column of a fold's chunk) */
     auto xload = [&](int t) {
+        xt = t;
 #pragma unroll
         for (int i = 0; i < NX; ++i) xr[i] = *(gg_gu128)(const void*)(xsrc[i] + t * kWmS);
+        if constexpr (PRO == 2) {
+#pragma unroll
+            for (int i = 0; i < NX; ++i) xu[i] = *(gg_gu128)(const void*)(xsrc[i] + A.K + t * kWmS);
+        }
+        if constexpr (PRO == 1) {
+#pragma unroll
+            for (int r = 0; r < KP; ++r) {
+                const int k = r * SW * kWmS + t * kWmS + (tid & 15) * 8;
+                gq[r][0] = *(const float4*)(const void*)(A.g + k);
+                gq[r][1] = *(const float4*)(const void*)(A.g + k + 4);
+            }
+        }
+    };
+    /* the producer's bf16 octet of chunk i (row lr of the tile, run i / NM) in place of the raw chunk: gg_wk_kernel's produce */
+    auto produce = [&](int i, int lr) {
+        if constexpr (PRO > 0) {
+            uint16_t hb[8];
+            if constexpr (PRO == 1) {
+                const int r = i / NM;
+                const float sc = s_sc[lr];
+                const float gv[8] = { gq[r][0].x, gq[r][0].y, gq[r][0].z, gq[r][0].w, gq[r][1].x, gq[r][1].y, gq[r][1].z, gq[r][1].w };
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const float x = (t & 1) ? bf16w_hi(xr[i][t >> 1]) : bf16w_lo(xr[i][t >> 1]);
+                    hb[t] = f32_to_bf16(x * sc * (gv[t] + A.wadd) * A.mult);
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const float gg = fminf((t & 1) ? bf16w_hi(xr[i][t >> 1]) : bf16w_lo(xr[i][t >> 1]), A.limit);
+                    const float uu = fminf(fmaxf((t & 1) ? bf16w_hi(xu[i][t >> 1]) : bf16w_lo(xu[i][t >> 1]), -A.limit), A.limit);
+                    hb[t] = f32_to_bf16((gg / (1.0f + expf(-gg))) * uu);
+                }
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q) xr[i][q] = (uint32_t)hb[2 * q] | ((uint32_t)hb[2 * q + 1] << 16);
+        }
     };
     auto xstore = [&]() {
 #pragma unroll
         for (int i = 0; i < NX; ++i) {
+            if constexpr (PRO > 0) {
+                const int run = i / NM, row = (i % NM) * 16 + (tid >> 4);   /* the chunk's run and tile row */
+                const int lr = min(row, r1 - r0 - 1);
+                produce(i, lr);
+                if (hw && row < r1 - r0) {   /* a live row's octet to h (a re-staged last slab writes the same bytes again) */
+                    const int k = run * SW * kWmS + xt * kWmS + (tid & 15) * 8;
+                    uint16_t* d = A.h + (long long)(r0 + row) * A.h_ld + k;
+                    if (A.h_al) {
+                        *(r4d_u32x4*)(void*)d = xr[i];
+                    } else {
+#pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            d[2 * q] = (uint16_t)(xr[i][q] & 0xffffu);
+                            d[2 * q + 1] = (uint16_t)(xr[i][q] >> 16);
+                        }
+                    }
+                }
+            }
             *(r4d_u32x4*)(void*)(Xs + xdo[i]) = xr[i];
             if constexpr (W::XG > 0) {
                 float sm = 0.0f;
@@ -817,8 +905,20 @@ int gg_launch_wk_t(RadStream s, int code, int kp, bool f32out, int pro, const Gg
 /* G2's launch (code bit 21, M 17..48, no fold): NM = ceil(M / 16) row tiles in one block row, KP = P / 2 (a run owns <= 2 parts),
  * NT = 2 column tiles a wave at NM 2 where the partials fit 64 KiB (they reuse the staging), else 1 (NM 3; bit 22: always 1). */
 template <int T>
-static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, const GgWkArgs& A, dim3 grid, unsigned lds) {
-#define GG_WK3_X(KPV, NMV, NTV)                                                                                         \
+static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, int pro, const GgWkArgs& A, dim3 grid, unsigned lds) {
+    if (pro) {   /* the folds (bf16 out) at the K their shapes have: q_b K 1280 (P 2: KP 1, q5_K / q6_K), shexp down 768 / 512 (KP 1 / 2) */
+        if (f32out) return R4D_WK_DECLINE;
+#define GG_WK3_F(KPV, NMV, NTV, PV)                                                                                     \
+        if (kp == KPV && nmt == NMV && nt == NTV && pro == PV) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, uint16_t, PV>), grid, dim3(256), lds, A);
+        if constexpr (T != GG_Q8_0) { GG_WK3_F(1, 2, 2, 1) GG_WK3_F(1, 3, 1, 1) GG_WK3_F(1, 2, 1, 1) }
+        if constexpr (T != GG_Q5_K) {
+            GG_WK3_F(1, 2, 2, 2) GG_WK3_F(1, 3, 1, 2) GG_WK3_F(1, 2, 1, 2)
+            GG_WK3_F(2, 2, 2, 2) GG_WK3_F(2, 3, 1, 2) GG_WK3_F(2, 2, 1, 2)
+        }
+#undef GG_WK3_F
+        return R4D_WK_DECLINE;
+    }
+#define GG_WK3_X(KPV, NMV, NTV)                                                                                       \
     if (kp == KPV && nmt == NMV && nt == NTV) {                                                                         \
         if (f32out) {                                                                                                   \
             if constexpr (KPV == 4) return R4D_EMIT(s, (gg_wk3_kernel<T, KPV, NMV, NTV, float>), grid, dim3(256), lds, A); \
@@ -834,7 +934,7 @@ static int gg_launch_wk3_t(RadStream s, int kp, int nmt, int nt, bool f32out, co
 }
 static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
                const uint8_t* const* wd, long long w_ld, void* const* yd, const long long* y_ld, const long long* Nv, long long M,
-               long long K) {
+               long long K, const GgWkFold* fo) {
     const int P = gg_wk_parts(K);
     const int kp = P >= 2 ? P / 2 : 1;
     const int nmt = (int)((M + 15) / 16);
@@ -864,15 +964,24 @@ static int gg_wk3_run(RadStream s, int code, int ty, bool f32out, int nm, const 
     A.S = (int)(K / kWmS); A.SW = A.S / kp; A.SP = A.S / P; A.PPW = P / kp;
     A.psb = w_ld / A.S;
     A.pfm = 1; A.pfl = 0;
+    if (fo) {
+        A.g = fo->g; A.eps = fo->eps; A.wadd = fo->wadd; A.mult = fo->mult; A.nw = fo->nw; A.limit = fo->limit;
+        A.h = fo->h; A.h_ld = fo->h_ld; A.h_al = fo->h_al;
+    }
     if (gy > 65535) return R4D_WK_DECLINE;
-    g_gg_wk_count.fetch_add(1, std::memory_order_relaxed);
-    g_gg_wk_last.store(kp * 100 + P + 10000 * nmt + 100000 * nt, std::memory_order_relaxed);
+    const int pro = fo ? fo->pro : 0;
+    int rc;
     const dim3 grid(1u, (unsigned)gy);
     switch (ty) {
-    case GG_Q8_0: return gg_launch_wk3_t<GG_Q8_0>(s, kp, nmt, nt, f32out, A, grid, lds);
-    case GG_Q6_K: return gg_launch_wk3_t<GG_Q6_K>(s, kp, nmt, nt, f32out, A, grid, lds);
-    default: return gg_launch_wk3_t<GG_Q5_K>(s, kp, nmt, nt, f32out, A, grid, lds);
+    case GG_Q8_0: rc = gg_launch_wk3_t<GG_Q8_0>(s, kp, nmt, nt, f32out, pro, A, grid, lds); break;
+    case GG_Q6_K: rc = gg_launch_wk3_t<GG_Q6_K>(s, kp, nmt, nt, f32out, pro, A, grid, lds); break;
+    default: rc = gg_launch_wk3_t<GG_Q5_K>(s, kp, nmt, nt, f32out, pro, A, grid, lds); break;
     }
+    if (rc != R4D_WK_DECLINE) {
+        g_gg_wk_count.fetch_add(1, std::memory_order_relaxed);
+        g_gg_wk_last.store(kp * 100 + P + 10000 * nmt + 100000 * nt, std::memory_order_relaxed);
+    }
+    return rc;
 }
 
 int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint16_t* const* xd, const long long* x_ld,
@@ -884,8 +993,8 @@ int r4d_gg_wk_run(RadStream s, int code, int ty, bool f32out, int nm, const uint
         return R4D_WK_DECLINE;
     for (int i = 0; i < nm; ++i)
         if (!x_al[i]) return R4D_WK_DECLINE;
-    if ((code & 2097152) && !fo && M > 16 && M <= 48) {   /* bit 21: G2 (row tiles a block) at 17..48 rows; declined -> the rule below */
-        const int g2 = gg_wk3_run(s, code, ty, f32out, nm, xd, x_ld, wd, w_ld, yd, y_ld, Nv, M, K);
+    if ((code & 2097152) && M > 16 && M <= 48) {   /* bit 21: G2 (row tiles a block) at 17..48 rows, folds included; declined -> the rule below */
+        const int g2 = gg_wk3_run(s, code, ty, f32out, nm, xd, x_ld, wd, w_ld, yd, y_ld, Nv, M, K, fo);
         if (g2 != R4D_WK_DECLINE) return g2;
     }
     const bool wl = (code & 262144) != 0;   /* bit 18: G1's wave-local staging (KP up to 8) */
@@ -961,7 +1070,13 @@ int g_wkpf_default = -1;   /* bench pin r4d_gg_wkpf_default: the form W's prefil
  * 4096); a shape not listed runs DEFAULT_FORM. */
 constexpr int kWkpfDefault = 322;
 struct WkpfEnt { int ty, N, K, form; };
-const WkpfEnt kWkpfTab[] = { { -1, 0, 0, 0 } };
+/* r5 (14.11., one card, runs/wmk2-s11/perfwkpf.txt, M 2048 / 4096, tools/wkpfbest.py: a form listed beats 322 by >= 2 % at both Ms):
+ * geomean W / best int16 x1.269 (all 322) -> x1.164. Form 0 = the stock kernel + the part fold; 326 / 222 / 414 / 418 GPF forms. */
+const WkpfEnt kWkpfTab[] = {
+    { GG_Q5_K, 1024, 4096, 0 }, { GG_Q5_K, 5120, 2048, 0 }, { GG_Q6_K, 512, 5120, 0 }, { GG_Q6_K, 1024, 4096, 0 },
+    { GG_Q6_K, 5120, 2048, 0 }, { GG_Q6_K, 8192, 1280, 326 }, { GG_Q6_K, 25600, 6144, 326 }, { GG_Q6_K, 5120, 768, 326 },
+    { GG_Q6_K, 5120, 512, 222 }, { GG_Q6_K, 1024, 5120, 0 }, { GG_Q8_0, 5120, 768, 414 }, { GG_Q8_0, 5120, 512, 418 },
+    { GG_Q8_0, 1536, 5120, 414 }, { GG_Q8_0, 1024, 5120, 418 } };
 int wkpf_form_tab(int ty, long long N, long long K) {
     for (const WkpfEnt& e : kWkpfTab)
         if (e.ty == ty && e.N == N && e.K == K) return e.form;
