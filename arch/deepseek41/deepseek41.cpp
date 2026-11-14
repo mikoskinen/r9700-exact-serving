@@ -29,6 +29,7 @@
 #include "ds41_engram_dedup.h"
 #include "ds41_index_split.h"
 #include "ds41_psk_cone.h"
+#include "ds41_etp.h"
 #include "ds41_walk_geom.h"
 #include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
 
@@ -556,6 +557,8 @@ struct Model {
     /* This rank's columns [sh_lo, sh_hi) of the shared expert when its width does not split
      * evenly into whole blocks (shared_slice); 0, 0 is the even split. */
     int64_t sh_lo = 0, sh_hi = 0;
+    /* Lever 1U-ETP (etp_env, geometry()): the trunk's routed experts as width slices of every expert on every rank */
+    bool etp = false;
     /* buffers */
     rad_buf h0 = 0, h1 = 0, xcol = 0, xn = 0, pre_a = 0, pre_f = 0, post = 0, comb = 0;
     rad_buf qr = 0, qrn = 0, q = 0, kv = 0, kvn = 0, o = 0, oa = 0, attn_out = 0;
@@ -1015,6 +1018,43 @@ static int64_t gather_ar_max() {
     const long n = std::strtol(e, nullptr, 10);
     return n > 0 ? std::min<long>(n, 256) : 0;
 }
+/* Lever 1U-ETP (ds41-etp, 14.11.2026): RADIANCE_DS41_ETP=1 (or on) at start puts the trunk's routed EXL3 experts in
+ * EXPERT TENSOR PARALLEL form instead of expert parallel: every rank holds a width slice of ALL n_expert experts of a
+ * layer (gate_up by its intermediate 128-blocks, the gate rows and the same up rows; down by the same K 128-blocks)
+ * instead of n_expert / world whole ones, and runs every routed slot of every token on its slice. Each rank's routed
+ * partial is then a K slice of every slot's down, folded by the existing gather (a token's slots in ascending slot
+ * order, f32, rounded to bf16 with the shared arm's) and summed by the existing exact all-reduce (four rank partials in
+ * fp32, ascending rank order, one rounding). No collective is added and the all-reduce keeps its size.
+ *
+ * Slices (etp_slice): the intermediate width's nb 128-blocks (DeepSeek-V4.1-Flash: 2304 = 18) split by parity class
+ * as the two-class expert ops take them (expert e at entry e / 2 of class e % 2): the even experts give the first
+ * nb % world ranks one block more, the odd experts the last nb % world ranks -- at four ranks 5/5/4/4 blocks (640 /
+ * 512 wide) for the even experts and 4/4/5/5 for the odd ones, 4.5 blocks a rank on average. So ranks 0-1 hold even
+ * experts 640 wide and odd ones 512 wide, ranks 2-3 the other way round.
+ *
+ * Prefill, newcomer and mixed steps run on the same placement through the same op pair at slice width (the M > 16
+ * forms take the same per-class widths as the decode band), so there is one stored form and nothing to switch.
+ *
+ * Exactness: a reference change against expert parallel, once. gate_up's outputs are whole dot products over K 5120
+ * on one rank (an output 128-block's workgroup is the same code over the same codes), so h is the same; down's K
+ * 2304 becomes four partial dot products (K 512..640) whose f16 / output-rotation / svh / bf16 roundings happen per
+ * rank, the gather folds every slot's partial on every rank (EP: only the slots whose expert is the rank's own) and
+ * the all-reduce sums four partials that each hold a quarter of all six slots (EP: each the whole of its own slots).
+ * Then deterministic and batch-invariant like EP: every row's arithmetic is its own (per (token, slot) decode rows,
+ * a token's slots in a fixed order, the rank fold in a fixed order).
+ *
+ * Unset / 0 / off: expert parallel, today's program and bytes. Anything else is refused at start. The DSpark drafter's
+ * MoE stays expert parallel either way. */
+static int etp_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_ETP");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
+using ds41etp::etp_slice;   /* ds41_etp.h: this rank's slice of an expert of each parity class */
 static int64_t gather_ar_rows() {
     const char* e = std::getenv("RADIANCE_DS41_ARGATHER");
     if (!e || !*e) return 0;
@@ -1827,6 +1867,25 @@ static int geometry(Model& m, const RadBuildCtx* ctx) {
                         "(an even count of whole experts each, and the shared expert's width)\n",
                 (long long)c.n_expert, (long long)c.n_ff, world);
         return RAD_E_UNSUPPORTED;
+    }
+    /* Lever 1U-ETP: refused where the width does not cut into a slice a rank (etp_slice) */
+    if (etp_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_ETP=%s is not 0 / off or 1 / on\n", std::getenv("RADIANCE_DS41_ETP"));
+        return RAD_E_INVAL;
+    }
+    m.etp = etp_env() > 0 && world > 1;
+    if (m.etp) {
+        int64_t lo[2], hi[2];
+        if (!etp_slice(c.n_ff, world, ctx->rank, lo, hi)) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_ETP: an expert of width %lld does not cut into whole 128-column "
+                            "blocks for %d ranks\n", (long long)c.n_ff, world);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever 1U-ETP (RADIANCE_DS41_ETP): every routed expert on every rank as a width "
+                            "slice -- rank 0 even experts [%lld, %lld), odd [%lld, %lld) of %lld; the gather folds every slot on every "
+                            "rank and the exact all-reduce sums the four partials (a reference change against expert parallel)\n",
+                    (long long)lo[0], (long long)hi[0], (long long)lo[1], (long long)hi[1], (long long)c.n_ff);
     }
     g.n_ff_all = c.n_ff;
     /* This rank's width of the shared expert (its buffers and the MoE block's n_ff_shared). */
@@ -2855,6 +2914,19 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.probed_expert = s.cfg.expert_base;
     s.cfg.top_k = c.top_k;
     s.cfg.n_ff_exp = c.n_ff;
+    /* Lever 1U-ETP (etp_env): every expert on every rank, as this rank's width slice by parity class */
+    if (m.etp) {
+        int64_t lo[2], hi[2];
+        if (!etp_slice(c.n_ff, g.world, g.rank, lo, hi)) return RAD_E_UNSUPPORTED;
+        s.cfg.n_expert = c.n_expert;
+        s.cfg.expert_base = 0;
+        s.cfg.probed_expert = 0;
+        for (int q = 0; q < 2; ++q) {
+            s.cfg.ff_lo[q] = lo[q];
+            s.cfg.ff_hi[q] = hi[q];
+        }
+        s.cfg.n_ff_exp = std::max(hi[0] - lo[0], hi[1] - lo[1]);
+    }
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;
     s.cfg.shared_hi = m.sh_hi;
