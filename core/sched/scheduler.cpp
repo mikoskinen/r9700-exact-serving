@@ -155,6 +155,18 @@ int Scheduler::set_draft_occ_k(int v) {   /* lever Z0-O */
     return draft_.occ_k();
 }
 
+int Scheduler::set_draft_dcap(int v) {   /* SPB */
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v >= 0 && v <= 64) draft_.set_dcap(v);
+    return draft_.dcap();
+}
+
+int Scheduler::set_draft_dcap_n(int v) {   /* SPB */
+    std::lock_guard<std::mutex> lk(mu_);
+    if (v >= 1 && v <= 64) draft_.set_dcap_n(v);
+    return draft_.dcap_n();
+}
+
 int Scheduler::set_psk_mode(int mode) {   /* lever PSK design 2 */
     std::lock_guard<std::mutex> lk(mu_);
     psk_mode_ = mode;
@@ -547,6 +559,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     fn4::note_sched(fn4::kDraftLendHyst, draft_.lend_hyst());
     fn4::note_sched(fn4::kDraftOcc, draft_.occ());       /* lever Z0-O */
     fn4::note_sched(fn4::kDraftOccK, draft_.occ_k());
+    fn4::note_sched(fn4::kDraftDcap, draft_.dcap());     /* SPB */
+    fn4::note_sched(fn4::kDraftDcapN, draft_.dcap_n());
     fn4::note_sched(fn4::kDs41PskK, psk_k_);            /* lever PSK design 2 */
     /* Prompt lookup as the deployment's only drafter verifies a proposal only when it pays
      * (lookup.h). Not configurable: the one deployment property it needs, the cost of a verify
@@ -4432,6 +4446,7 @@ void Scheduler::step_finished() {
     fn4::note_draft_counts(draft_.zero_cycles(), draft_.probe_cycles(), draft_.zero_moves(),
                            hybrid_lookup_, hybrid_head_, hybrid_unahead_, draft_.occ_cycles(), draft_.occ_moves());
     fn4::note_draft_accept(acc_head_d_, acc_head_a_, acc_look_d_, acc_look_a_);
+    fn4::note_draft_dcap(draft_.dcap_cycles(), draft_.dcap_moves());   /* SPB */
     if (lend_view_)
         fn4::note_lend_sched(lent_cycles_, lent_plain_steps_, (int64_t)(lent_plain_ms_ + 0.5), lent_probe_steps_,
                              (int64_t)(lent_probe_ms_ + 0.5), transit_steps_, (int64_t)(transit_ms_ + 0.5),

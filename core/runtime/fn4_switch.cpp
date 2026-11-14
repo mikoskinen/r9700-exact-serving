@@ -36,7 +36,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
                                         "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
-                                        "ds41_wmk", "ds41_moe1", "sched_tail_grid" };
+                                        "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -51,7 +51,8 @@ bool plugin_switch(int i) {
            i == kDs41Rfuse ||   /* ds41_rfuse (68, ds41-fuse): deepseek41 (lever FUSE-R) */
            i == kDs41MixFin ||  /* ds41_mix_fin (69, ds41-fuse): libr4d (lever FUSE-M) */
            i == kDs41Wmk ||     /* ds41_wmk (71, ds41-wmk2): libr4d (lever WMK) */
-           i == kDs41Moe1;      /* ds41_moe1 (72 here, 71 on ds41-p1pass): deepseek41 (lever P) */
+           i == kDs41Moe1 ||    /* ds41_moe1 (72 here, 71 on ds41-p1pass): deepseek41 (lever P) */
+           i == kExl3Dng;       /* exl3_dng (75 on ds41-etp-spb, 76 here after lever G): exl3r4d (SPB-G) */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -89,6 +90,7 @@ struct State {
     std::atomic<uint64_t> epoch{0};
     std::atomic<int> applied_step{-1};
     std::atomic<int64_t> cnt[8];   /* note_draft_counts */
+    std::atomic<int64_t> dcap[2];  /* note_draft_dcap (SPB) */
     std::atomic<int> lend_capable{-1};   /* -1 no scheduler registered, 0 / 1 */
     std::atomic<int64_t> lend[18];       /* note_lend_sched [0, 9), 16 and 17, note_lend_engine [9, 16) */
     std::atomic<int64_t> acc[4];         /* note_draft_accept */
@@ -137,6 +139,7 @@ struct State {
             pend[i] = false;
         }
         for (auto& c : cnt) c.store(0, std::memory_order_relaxed);
+        for (auto& c : dcap) c.store(0, std::memory_order_relaxed);
         for (auto& c : lend) c.store(0, std::memory_order_relaxed);
         for (auto& c : acc) c.store(0, std::memory_order_relaxed);
         for (auto& c : ctxs) c.store(0, std::memory_order_relaxed);
@@ -353,7 +356,8 @@ bool sched_switch(int i) {
            i == kDraftCtxSkip || i == kDraftLendHyst || i == kArenaD0 || i == kDraftLendW ||
            i == kDraftOcc || i == kDraftOccK || i == kPlaceLf || i == kDs41PskK || i == kStageShort ||
            i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick ||
-           i == kPlaceSwapLent || i == kHeatMinGainX100 || i == kHeatHystX100;   /* ds41-swl: the engine's, as place_lf */
+           i == kPlaceSwapLent || i == kHeatMinGainX100 || i == kHeatHystX100 ||   /* ds41-swl: the engine's, as place_lf */
+           i == kDraftDcap || i == kDraftDcapN;   /* SPB */
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -484,6 +488,12 @@ void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_l
     State& s = st();
     const int64_t v[8] = { zero, probe, moves, hyb_lookup, hyb_head, hyb_unahead, occ_cycles, occ_moves };
     for (int k = 0; k < 8; ++k) s.cnt[k].store(v[k], std::memory_order_relaxed);
+}
+
+void note_draft_dcap(int64_t cycles, int64_t moves) {   /* SPB */
+    State& s = st();
+    s.dcap[0].store(cycles, std::memory_order_relaxed);
+    s.dcap[1].store(moves, std::memory_order_relaxed);
 }
 
 void lend_register(bool capable) { st().lend_capable.store(capable ? 1 : 0, std::memory_order_release); }
@@ -791,7 +801,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -822,6 +832,25 @@ bool check(const std::string& name, int v, std::string* err) {
         if (v > 0 && cap != 1) {
             if (err)
                 *err = std::string("draft_probe_backoff=") + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "no scheduler has registered a drafter"
+                                : "this deployment's drafter cannot run the adaptive window");
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftDcap || i == kDraftDcapN) {   /* SPB */
+        if (i == kDraftDcap && (v < 0 || v > 64)) {
+            if (err) *err = "draft_dcap takes 0 (off) .. 64 (the most head depth from draft_dcap_n decode rows)";
+            return false;
+        }
+        if (i == kDraftDcapN && (v < 1 || v > 64)) {
+            if (err) *err = "draft_dcap_n takes 1 .. 64 (decode rows from which draft_dcap holds)";
+            return false;
+        }
+        const int cap = s.draft_capable.load(std::memory_order_acquire);
+        if (i == kDraftDcap && v > 0 && cap != 1) {
+            if (err)
+                *err = std::string("draft_dcap=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no scheduler has registered a drafter"
                                 : "this deployment's drafter cannot run the adaptive window");
             return false;
@@ -1567,6 +1596,13 @@ std::string state_json() {
                  std::to_string((long long)s.ctxs[k].load(std::memory_order_relaxed));
         o += "}";
     }
+    /* SPB (draft_dcap): the cap in force, the cycles it bounded the depth choice, the moves down it forced; once a
+     * scheduler registered. */
+    if (s.max_tok.load(std::memory_order_acquire) > 0)
+        o += ", \"dcap\": {\"in_force\": " + std::to_string(reported(s, kDraftDcap)) +
+             ", \"from_rows\": " + std::to_string(reported(s, kDraftDcapN)) +
+             ", \"cycles\": " + std::to_string((long long)s.dcap[0].load(std::memory_order_relaxed)) +
+             ", \"moves\": " + std::to_string((long long)s.dcap[1].load(std::memory_order_relaxed)) + "}";
     o += "}";
     return o;
 }

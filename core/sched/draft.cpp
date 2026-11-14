@@ -360,10 +360,20 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
     }
     const double plain = (double)(n_rows - n_seq);
     if (top > M) top = M;
+    /* SPB (dcap()): from dcap_n() decode rows the choice is made over kMinDepth .. D only. */
+    int lim = top;
+    const bool capped = dcap_d_ > 0 && n_rows >= dcap_n_ && top > std::max(dcap_d_, (int32_t)kMinDepth);
+    if (capped) {
+        lim = std::max(dcap_d_, (int32_t)kMinDepth);
+        ++n_dcap_;
+        dcap_free_ = 0;
+    } else if (dcap_free_ < INT32_MAX) {
+        ++dcap_free_;
+    }
 
     int best = kMinDepth;
     double best_g = -1.0;
-    for (int d = kMinDepth; d <= top; ++d) {
+    for (int d = kMinDepth; d <= lim; ++d) {
         const double g = (tok[d] + plain) / step_cost(d, n_rows);
         if (g > best_g) { best_g = g; best = d; }
     }
@@ -373,11 +383,20 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
     if (step_d_ <= 0) {
         step_d_ = best;
         step_held_ = 0;
+    } else if (capped && step_d_ > lim) {
+        /* SPB: a depth above the cap in force moves down to the capped choice at once. */
+        RAD_DEBUG("draft window: head depth %d -> %d over %d drafting of %d rows (draft_dcap %d from %d rows)", step_d_,
+                  best, n_seq, n_rows, dcap_d_, dcap_n_);
+        step_d_ = best;
+        step_held_ = 0;
+        ++n_dcap_moves_;
     } else {
         if (step_held_ < INT32_MAX) ++step_held_;
         const int cur = step_d_ < top ? step_d_ : top;
         const double cur_g = (tok[cur] + plain) / step_cost(cur, n_rows);
-        if (best != cur && step_held_ >= kHold && best_g > cur_g * (1.0 + kHyst)) {
+        /* SPB: above the cap only kHold cycles after it last held (with the cap off, always) */
+        const bool rise_ok = dcap_d_ <= 0 || best <= dcap_d_ || dcap_free_ >= kHold;
+        if (best != cur && step_held_ >= kHold && best_g > cur_g * (1.0 + kHyst) && rise_ok) {
             RAD_DEBUG("draft window: head depth %d -> %d over %d drafting of %d rows (%.3f -> "
                       "%.3f tokens per unit of step cost)", step_d_, best, n_seq, n_rows, cur_g,
                       best_g);

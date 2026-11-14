@@ -5368,6 +5368,58 @@ DraftController c4_controller(bool borrow, int lent8, DraftAdapt* u, DraftAdapt*
 }
 }  /* namespace */
 
+/* SPB, the depth cap by occupancy (draft_dcap / draft_dcap_n): eight sequences whose estimates (0.9 a position) and step
+ * times (a flat 40 ms at every depth) put D7 at depth 5. With draft_dcap 3 (from the default 8 rows) the same cycles choose
+ * depth 3 at once -- a controller already at 5 moves down at the first capped cycle, with no hold -- and every capped
+ * cycle is counted; under 8 rows the cap does not hold, and the move back up waits D7's hold. draft_dcap 0 is D7's own
+ * choice, cycle for cycle. */
+TEST(the_depth_cap_holds_the_head_depth_from_its_rows_and_hands_back_below_them) {
+    DraftController d7 = adaptive_controller(5);
+    CHECK_EQ(d7.dcap(), 0);
+    CHECK_EQ(d7.dcap_n(), DraftController::kDcapN);
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    for (int i = 0; i < 8; ++i) { u[i] = estimate(d7, 0.9, 0.9); uf[i] = &u[i]; }
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) {
+            d7.step_time(d, 8, 40.0);
+            d7.step_time(d, 6, 30.0);
+        }
+    DraftController off = d7, cap = d7;
+    off.set_dcap(0);
+    cap.set_dcap(65);
+    CHECK_EQ(cap.dcap(), 64);   /* clamped (fn4 refuses 65) */
+    cap.set_dcap(3);
+    cap.set_dcap_n(0);
+    CHECK_EQ(cap.dcap_n(), 1);  /* clamped (fn4 refuses 0) */
+    cap.set_dcap_n(8);
+    for (int t = 0; t < 20; ++t) {
+        CHECK_EQ(d7.plan_step(uf, 8, 8), off.plan_step(uf, 8, 8));
+        CHECK_EQ(cap.plan_step(uf, 8, 8), 3);
+    }
+    CHECK_EQ(d7.step_depth(), 5);
+    CHECK_EQ(cap.step_window(), 3);
+    CHECK_EQ(cap.dcap_cycles(), (int64_t)20);
+    CHECK_EQ(cap.dcap_moves(), (int64_t)0);   /* chose 3 outright: no depth above it was in force */
+    CHECK_EQ(off.dcap_cycles(), (int64_t)0);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(cap.window_for(u[i]), 3);
+    /* Under 8 rows the cap does not hold: D7's choice comes back only past its hold (kHold cycles). */
+    int at3 = 0;
+    for (int t = 0; t < DraftController::kHold + 4; ++t) at3 += cap.plan_step(uf, 6, 6) == 3 ? 1 : 0;
+    CHECK(at3 >= DraftController::kHold - 1);
+    CHECK_EQ(cap.step_depth(), 5);
+    CHECK_EQ(cap.dcap_cycles(), (int64_t)20);
+    /* Back at 8 rows: down to 3 at the first cycle (a forced move), however recently the depth moved. */
+    CHECK_EQ(cap.plan_step(uf, 8, 8), 3);
+    CHECK_EQ(cap.dcap_moves(), (int64_t)1);
+    /* Off between steps: D7's own choice again (back to 5 past its hold). */
+    cap.set_dcap(0);
+    int at5 = 0;
+    for (int t = 0; t < 40; ++t) at5 += cap.plan_step(uf, 8, 8) == 5 ? 1 : 0;
+    CHECK(at5 > 0);
+    CHECK_EQ(cap.dcap_cycles(), (int64_t)21);
+}
+
 TEST(the_borrow_prices_a_class_never_lent_with_its_nearest_neighbours_lent_ratio) {
     DraftAdapt u[8];
     DraftAdapt* uf[8];
@@ -11040,7 +11092,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -11949,7 +12001,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);

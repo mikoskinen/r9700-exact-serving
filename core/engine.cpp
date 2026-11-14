@@ -908,6 +908,10 @@ int Engine::prepare_release(const RadBatch* b) {
                 fn4::note_sched(fn4::kDraftOcc, sched_.set_draft_occ(sw[fn4::kDraftOcc]));
             if (sw[fn4::kDraftOccK] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftOccK, sched_.set_draft_occ_k(sw[fn4::kDraftOccK]));
+            if (sw[fn4::kDraftDcap] != fn4::kNoChange)       /* SPB */
+                fn4::note_sched(fn4::kDraftDcap, sched_.set_draft_dcap(sw[fn4::kDraftDcap]));
+            if (sw[fn4::kDraftDcapN] != fn4::kNoChange)
+                fn4::note_sched(fn4::kDraftDcapN, sched_.set_draft_dcap_n(sw[fn4::kDraftDcapN]));
             /* The depth-0 context skip: the engine's own (block_context_pass); 1 only where set up (fn4 refuses
              * it otherwise). */
             if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {

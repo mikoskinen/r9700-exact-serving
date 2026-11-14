@@ -382,6 +382,20 @@
  *                   the finish kernel's bytes, one launch fewer; not where ds41_mix_wv's wide form acts); 0 the split
  *                   and finish launches (today). RADIANCE_DS41_MIX_FIN=1 at load starts it on. GET "fuse".mixfin_*
  *                   counts its launches (every rank).
+ *   draft_dcap      scheduler (SPB, ds41-etp-spb; 74 here after sched_tail_grid, 73 on ds41-etp-spb; sched/draft.h DraftController::dcap): 0 off
+ *                   (today); D = 1 .. 64: once a cycle plans at least draft_dcap_n decode rows, the adaptive window's head
+ *                   depth is held to at most D -- the choice is made over depths 1 .. D only, and a depth above D in force
+ *                   moves down to that choice at once (no hold); under draft_dcap_n rows the window chooses as before (its
+ *                   hold and hysteresis, so a move back up waits kHold cycles). On the ETP build at 8 sequences the window
+ *                   chose depth 4 in some starts (40 rows, 2.66 ms a token) where depth 3 runs 32 rows at 2.48 ms a token
+ *                   (etp/FOLLOWUP.md STEP 1). Starts 0. Above 0 refused without a drafter that runs the adaptive window.
+ *                   Exact: it moves only which depth a step verifies. GET "dcap": cycles it bounded the choice, moves it
+ *                   forced.
+ *   draft_dcap_n    scheduler (SPB; 75 here, 74 on ds41-etp-spb): the decode rows from which draft_dcap holds, 1 .. 64; starts 8.
+ *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
+ *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
+ *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
+ *                   today's. -1 when no loaded object serves it.
  *   ds41_moe1       deepseek41 (lever P, ds41-p1pass; 72 here after ds41_wmk, 71 on ds41-p1pass): 1 a step that is ONE decode segment of
  *                   17 .. 48 rows runs its MoE as ONE pass -- the router, the shared arm, the gather and the all-reduce
  *                   once, the routed EXL3 experts through moe_exl3_gate_up_dk / moe_exl3_down_dk (the decode kernels over
@@ -576,7 +590,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
-              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kSwitches };
+              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -607,6 +621,8 @@ void note_sched(int i, int value);
  * the drafting depth, hybrid proposals taken from the lookup and left to the head, steps not issued ahead for it. */
 void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_lookup, int64_t hyb_head,
                        int64_t hyb_unahead, int64_t occ_cycles = 0, int64_t occ_moves = 0);
+/* SPB (draft_dcap): the cycles whose depth choice the cap bounded, and the moves down it forced (GET "dcap"). */
+void note_draft_dcap(int64_t cycles, int64_t moves);
 /* Lever DL. The scheduler, once the engine set the lend up: whether a slab can be lent (draft_lend=1 is
  * refused otherwise). */
 void lend_register(bool capable);
