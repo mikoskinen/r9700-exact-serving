@@ -28,7 +28,9 @@ static volatile int g_fn4_x3d = 0;
 int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
 /* SPB-G (ds41-etp-spb-plug, 14.11.2026): fn4 switch "exl3_dng" 0 / 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U) down
  * kernels take that many 128-column blocks a workgroup (exl3r4d.hip spb_cb; launch.c fill() -> Exl3r4dGemm::dng). Every
- * output byte is the one-block grid's: the same code on the same data a block. 0 at start = today's grid. */
+ * output byte is the one-block grid's: the same code on the same data a block. 0 at start = today's grid.
+ * SPB-P: 101 / 102 / 104 / 108 = the same kernels as a persistent grid over the launch's live units only, G = value - 100
+ * column blocks a unit (exl3r4d.hip exl3r4d_gemm_pdx_kernel); the same bytes. */
 static volatile int g_fn4_dng = 0;
 int exl3r4d_fn4_dng(void) { return g_fn4_dng; }
 /* The fn4 hooks in exl3-main37's form (0 = not mine, -1 = refused value, 1 = taken; rad_fn4_value reports it), so a merge
@@ -36,7 +38,9 @@ int exl3r4d_fn4_dng(void) { return g_fn4_dng; }
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 4 ? 1 : -1;   /* K25U: 2 .. 4 */
-    if (!strcmp(name, "exl3_dng")) return value == 0 || value == 2 || value == 4 || value == 8 ? 1 : -1;   /* SPB-G */
+    if (!strcmp(name, "exl3_dng"))   /* SPB-G 2 / 4 / 8; SPB-P 101 / 102 / 104 / 108 (the persistent live-units form) */
+        return value == 0 || value == 2 || value == 4 || value == 8 || value == 101 || value == 102 || value == 104 ||
+               value == 108 ? 1 : -1;
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
