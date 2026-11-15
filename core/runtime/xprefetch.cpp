@@ -305,6 +305,16 @@ int Ctx::xp_predict(const RadPrefetchNext* nx, rad_buf h, int64_t r0, int64_t ro
 }
 
 int Ctx::xp_mark() {
+    /* lever XPF: a deferred plan's copies start behind the last routed down issued before its RAD_XPF_GO */
+    if (xpf_ && !rec_ && xpf_->pend.valid) {
+        XpfState& x = *xpf_;
+        void* mark = nullptr;
+        if (rad_ride(cur_stream(), &mark) == RAD_OK) {
+            if (x.pend.mark) rad_ride_release(x.pend.mark, x.pend.ms, kXpMarkHold);
+            x.pend.mark = mark;
+            x.pend.ms = cur_stream();
+        }
+    }
     if (!xp_) return RAD_OK;
     if (!rec_) return xp_mark_run();
     TapeStep st;
@@ -314,7 +324,7 @@ int Ctx::xp_mark() {
 
 int Ctx::xp_step(int layer) {
     /* lever XPF: a layer an xpf plan was made for this pass (live passes only: a pass that plans is never recorded) */
-    if (xpf_ && !rec_ && xpf_->want_layer == layer) {
+    if (xpf_ && !rec_ && layer >= 0 && (xpf_->wl[0] == layer || xpf_->wl[1] == layer)) {
         const int rc = xpf_step_run(layer);
         if (rc < 0) return rc;
     }
@@ -474,7 +484,9 @@ void Ctx::xpf_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* strid
                  (long long)x->slot);
         return;
     }
-    x->ring_bytes = 2 * (int64_t)x->slots_max * (int64_t)x->slot;
+    x->ring_bytes = ring / 2 / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT * 2;
+    x->group_bytes = x->ring_bytes / 2;
+    x->slots_max = kXpfMaxSlots;   /* the bytes bound the copies (packed by slot size); this only bounds the records */
     const int64_t nl = (int64_t)route_.size();
     if (rad_dev_set(device_) < 0) return;
     x->ring    = (char*)rad_dev_alloc_uncached(x->ring_bytes);
@@ -503,8 +515,9 @@ void Ctx::xpf_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* strid
     x->layers.resize((size_t)nl);
     XpfState* xs = x.get();
     x->thr = std::thread([this, xs] { xpf_serve(*xs); });
-    RAD_INFO("rank %d: lever XPF on: the prefill prefetch's ring %s (2 groups of %d copies of %lld B), DMA lists of %d "
-             "copies", rank_, humanb(x->ring_bytes).c_str(), x->slots_max, (long long)x->slot, kXpfChunk);
+    RAD_INFO("rank %d: lever XPF on: the prefill prefetch's ring %s (2 groups of %s: copies packed by their pool slot, "
+             "the largest %lld B), DMA lists of %d copies", rank_, humanb(x->ring_bytes).c_str(),
+             humanb(x->group_bytes).c_str(), (long long)x->slot, kXpfChunk);
     xpf_ = std::move(x);
 }
 
@@ -543,6 +556,19 @@ void Ctx::xpf_serve(XpfState& x) {
             r = x.q.front();
             x.q.pop_front();
         }
+        /* return the marks of finished lists to the pool */
+        {
+            const int64_t behind = rad_xp_behind(x.device);
+            while (!x.marks.empty() && x.marks.front().second <= x.lists.load() - behind) {
+                rad_ride_release(x.marks.front().first, nullptr, 0);
+                x.marks.pop_front();
+            }
+        }
+        void* mark = r.mark;   /* the first list polls it; returned once a list holds it, or here */
+        const auto drop_mark = [&] {
+            if (mark) rad_ride_release(mark, r.ms, kXpMarkHold);
+            mark = nullptr;
+        };
         volatile XpfBox* b = x.box + r.g;
         const auto t0 = std::chrono::steady_clock::now();
         bool got = true;
@@ -550,7 +576,7 @@ void Ctx::xpf_serve(XpfState& x) {
             _mm_pause();
             if (x.stop || std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) { got = false; break; }
         }
-        if (!got || b->seq != r.seq) { ++x.late; continue; }
+        if (!got || b->seq != r.seq) { ++x.late; drop_mark(); continue; }
         std::atomic_thread_fence(std::memory_order_acquire);
         const int n = std::min<int>((int)b->n, kXpfMaxSlots);
         for (int c0 = 0; c0 < n; c0 += kXpfChunk) {
@@ -571,13 +597,18 @@ void Ctx::xpf_serve(XpfState& x) {
                 ++m;
             }
             if (!ok || m == 0) { ++x.late; break; }
-            if (rad_xp_list(x.device, nullptr, m, src, dst, bytes, x.done + r.g * kXpfChunks + c0 / kXpfChunk, r.seq, 0) !=
+            if (rad_xp_list(x.device, mark, m, src, dst, bytes, x.done + r.g * kXpfChunks + c0 / kXpfChunk, r.seq, 0) !=
                 RAD_OK) {
                 RAD_WARN("rank %d: lever XPF: the prefetch DMA queue refused a list", rank_);
                 break;
             }
             ++x.lists;
+            if (mark) {
+                x.marks.emplace_back(mark, x.lists.load());
+                mark = nullptr;   /* later lists queue behind the first on the same engine */
+            }
         }
+        drop_mark();
     }
 }
 
@@ -621,19 +652,34 @@ bool Ctx::xpf_bind(XpfLayer& L, const RadPrefetchNext& nx, int layer) {
 }
 
 int Ctx::xpf_plan(const RadPrefetchNext* nx, const void* logits, int64_t rows, int64_t ld, const void* bias, int kp,
-                  int slots) {
+                  int slots, unsigned flags) {
     if (!xpf_) return RAD_E_UNSUPPORTED;
     if (rec_) return RAD_OK;   /* never in a recorded pass (the architecture keys planning passes 0) */
     XpfState& x = *xpf_;
     const RadStream cs = cur_stream();
+    if (!nx && (flags & RAD_XPF_GO)) {   /* the deferred plan's copies may go once the last down marked has run */
+        if (x.pend.valid) {
+            {
+                std::lock_guard<std::mutex> lk(x.mu);
+                x.q.push_back(x.pend);
+            }
+            x.cv.notify_one();
+            x.pend = XpfReq{};
+        }
+        return RAD_OK;
+    }
     if (!nx) {   /* the pass's end: both groups back to the pool */
+        if (x.pend.valid) {   /* a deferred plan never let go: its copies are not needed any more */
+            if (x.pend.mark) rad_ride_release(x.pend.mark, x.pend.ms, kXpMarkHold);
+            x.pend = XpfReq{};
+        }
         for (int g = 0; g < 2; ++g)
             if (x.dirty[g]) {
                 if (rad_xpf_restore_launch(x.rec + (size_t)g * kXpfMaxSlots, x.nrec + g, x.stats, (void*)cs))
                     return RAD_E_DEVICE;
                 x.dirty[g] = false;
             }
-        x.want_layer = -1;
+        x.wl[0] = x.wl[1] = -1;
         return RAD_OK;
     }
     const int layer = nx->layer;
@@ -654,23 +700,34 @@ int Ctx::xpf_plan(const RadPrefetchNext* nx, const void* logits, int64_t rows, i
     const int sl = std::max(0, std::min(slots, x.slots_max));
     const int32_t* rcnt = route_n_expert_ > 0 && nx->n_expert <= route_n_expert_
                               ? route_dev_ + (int64_t)layer * route_n_expert_ : nullptr;
-    const uint64_t ring = (uint64_t)(uintptr_t)(x.ring + (size_t)g * (size_t)x.slots_max * x.slot);
+    const uint64_t ring = (uint64_t)(uintptr_t)(x.ring + (size_t)g * (size_t)x.group_bytes);
     if (rad_xpf_count_launch((const uint16_t*)logits, (uint32_t)rows, (uint32_t)ld, (uint32_t)nx->n_expert, (uint32_t)kp,
                              (const float*)bias, x.cnt, (void*)cs) ||
-        rad_xpf_plan_launch(x.cnt, (uint32_t)nx->n_expert, (void** const*)L.map, L.place, rcnt, x.pools, ring, x.slot,
-                            (uint32_t)sl, x.rec + (size_t)g * kXpfMaxSlots, x.nrec + g,
+        rad_xpf_plan_launch(x.cnt, (uint32_t)nx->n_expert, (void** const*)L.map, L.place, rcnt, x.pools, ring,
+                            (uint64_t)x.group_bytes, (uint32_t)sl, x.rec + (size_t)g * kXpfMaxSlots, x.nrec + g,
                             (XpfBox*)rad_dev_device_ptr(x.box + g), seq, x.stats, (void*)cs))
         return RAD_E_DEVICE;
-    {
-        std::lock_guard<std::mutex> lk(x.mu);
-        x.q.push_back({ g, seq });
+    XpfReq rq;
+    rq.g = g;
+    rq.seq = seq;
+    rq.valid = true;
+    if (flags & RAD_XPF_DEFER) {
+        if (x.pend.valid) {   /* an older deferred plan nobody let go: dropped */
+            if (x.pend.mark) rad_ride_release(x.pend.mark, x.pend.ms, kXpMarkHold);
+            ++x.dropped;
+        }
+        x.pend = rq;
+    } else {
+        {
+            std::lock_guard<std::mutex> lk(x.mu);
+            x.q.push_back(rq);
+        }
+        x.cv.notify_one();
     }
-    x.cv.notify_one();
     x.g = g;
     x.dirty[g] = true;
-    x.want_layer = layer;
-    x.want_g = g;
-    x.want_seq = seq;
+    x.wl[g] = layer;
+    x.wseq[g] = seq;
     /* every 2048 plans: the counters the last snapshot brought (one window late), then the next snapshot, behind the plan */
     if (++x.plans % 2048 == 0) {
         XpfStats h;
@@ -688,13 +745,12 @@ int Ctx::xpf_plan(const RadPrefetchNext* nx, const void* logits, int64_t rows, i
 
 int Ctx::xpf_step_run(int layer) {
     XpfState& x = *xpf_;
-    (void)layer;
-    const int g = x.want_g;
+    const int g = x.wl[0] == layer ? 0 : 1;
     if (rad_xpf_step_launch(x.rec + (size_t)g * kXpfMaxSlots, x.nrec + g,
-                            (const uint32_t*)rad_dev_device_ptr(x.done + g * kXpfChunks), x.want_seq, x.stats,
+                            (const uint32_t*)rad_dev_device_ptr(x.done + g * kXpfChunks), x.wseq[g], x.stats,
                             (void*)cur_stream()))
         return RAD_E_DEVICE;
-    x.want_layer = -1;
+    x.wl[g] = -1;
     return RAD_OK;
 }
 

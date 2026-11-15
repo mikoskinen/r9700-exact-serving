@@ -1012,7 +1012,13 @@ int rad_expert_prefetch_step(RadCtx* c, int layer);
  * null: what the last plans redirected goes back (a pass's end). Placement only: the GEMMs read the same bytes. Only in a
  * pass that is not recorded (rad_arch_pass_key 0). RAD_E_UNSUPPORTED: no prefill ring (RADIANCE_XPF_MIB unset). */
 int rad_xpf_plan(RadCtx* c, const RadPrefetchNext* next, const void* logits, int64_t rows, int64_t ld, const void* bias,
-                 int kp, int slots);
+                 int kp, int slots, unsigned flags);
+/* rad_xpf_plan's flags: RAD_XPF_DEFER -- the plan's copies wait for a RAD_XPF_GO call (next null), whose DMA lists then
+ * start once the routed down GEMM issued last before it (rad_expert_prefetch_mark) has run: a plan made from layer l's
+ * router input for layer l + 1 copies under l + 1's attention, not under l's own streamed experts. next null, no flag:
+ * the pass's end (everything redirected goes back). */
+#define RAD_XPF_DEFER 1u
+#define RAD_XPF_GO    2u
 
 /* A weight's pointer, for the rare plugin-private kernel invoked outside the op vocabulary. Waits
  * on the mover. The weight may move afterwards, so the pointer is valid only within one issue. */

@@ -1849,7 +1849,10 @@ static void sw_note_decl(int64_t rows) {
     while ((int64_t)cur < rows && !g_sw_gar_decl.compare_exchange_weak(cur, (int)rows)) {}
 }
 
-/* Lever XPF (ds41-xpf, SPEED-E; core/runtime/xprefetch.h): RADIANCE_DS41_XPF=1 declares, at every trunk MoE layer, its router
+/* Lever XPF (ds41-xpf, SPEED-E; core/runtime/xprefetch.h): RADIANCE_DS41_XPF=3 (the measured best: SPEED-E measurement 2)
+ * predicts layer l + 1 from layer l's ffn input (act.x, right before l's MoE block: 1U-XP's predictor) and defers the copies
+ * until l's last routed down ran (RAD_XPF_DEFER, then RAD_XPF_GO after the block), so they cross under l's gather / all-reduce
+ * and l + 1's attention block. RADIANCE_DS41_XPF=1 declares, at every trunk MoE layer, its router
  * as a bf16 gemm_nt over the layer's attention input (xn; 2: over ffn_norm(collapse(h0, pre_a)), the ffn input without the
  * layer's attention update) and starts fn4 ds41_xpf at 1: a pass of RADIANCE_DS41_XPF_MIN (256) .. _MAX (2112) rows then,
  * at the end of each layer, predicts the next layer's experts (each row's top RADIANCE_DS41_XPF_KP (6) by sqrt(softplus) +
@@ -1861,7 +1864,7 @@ static int xpf_env() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_DS41_XPF");
         const int x = e && *e ? std::atoi(e) : 0;
-        return x == 1 || x == 2 ? x : 0;
+        return x >= 1 && x <= 3 ? x : 0;
     }();
     return v;
 }
@@ -1872,7 +1875,7 @@ static int64_t xpf_knob(const char* name, int64_t dflt, int64_t lo, int64_t hi) 
 }
 static std::atomic<int> g_sw_xpf{0}, g_sw_xpf_ok{0};
 extern "C" int rad_xpf_plan(RadCtx* c, const RadPrefetchNext* next, const void* logits, int64_t rows, int64_t ld,
-                            const void* bias, int kp, int slots) __attribute__((weak));
+                            const void* bias, int kp, int slots, unsigned flags) __attribute__((weak));
 
 /* idx_split: the indexer's balanced deal (lever I1), below index_runs(). */
 static int idx_fn4_accepts(const char* name, int value);
@@ -5104,11 +5107,11 @@ static int xpf_layer_declare(RadBuilder* b, Model& m, Layer& L, int64_t T) {
     const int64_t D = c.n_embd;
     /* the arena buffers they read, declared (the core refuses an operand outside its planned lifetime); the outputs are
      * rank-local raw buffers */
-    if (xpf_env() == 1)
+    if (xpf_env() == 1 || xpf_env() == 3)
         L.xpf_pred = op(b, "gemm_nt",
                         { RAD_RANGE("M", 1, T), RAD_INT("N", L.moe.glm_router.c.experts), RAD_INT("K", D),
                           RAD_STR("dtype", "bf16") },
-                        { L.moe.glm_router.projection }, { m.xn }, {});
+                        { L.moe.glm_router.projection }, { xpf_env() == 3 ? m.act.x : m.xn }, {});
     else {
         L.xpf_pred = op(b, "gemm_nt",
                         { RAD_RANGE("M", 1, T), RAD_INT("N", L.moe.glm_router.c.experts), RAD_INT("K", D),
@@ -5119,7 +5122,7 @@ static int xpf_layer_declare(RadBuilder* b, Model& m, Layer& L, int64_t T) {
                            RAD_STR("dtype", "bf16") },
                          { L.ffn_norm }, { m.h0, m.pre_a }, {});
     }
-    if (L.xpf_pred && (xpf_env() == 1 || L.xpf_cn)) {
+    if (L.xpf_pred && (xpf_env() != 2 || L.xpf_cn)) {
         g_sw_xpf_ok.store(1, std::memory_order_relaxed);
         g_sw_xpf.store(1, std::memory_order_relaxed);
     } else {
@@ -5135,7 +5138,8 @@ static bool xpf_pass_on(int64_t n_tok) {
 }
 /* At the end of layer l (its post / the next layer's pcn_a issued): the next layer's prediction and its plan. `mixed`:
  * the rows whose pre_a the fused pcn_a already wrote (XPF=2 reads them only). */
-static void xpf_next(RadCtx* x, Model& m, const Layer& nx, int64_t T, const std::vector<std::pair<int64_t, int64_t>>& mixed) {
+static void xpf_next(RadCtx* x, Model& m, const Layer& nx, int64_t T, const std::vector<std::pair<int64_t, int64_t>>& mixed,
+                     bool from_ffn = false) {
     if (m.xpf_failed || !nx.xpf_pred || nx.moe.xp.n_parts <= 0) return;
     const int64_t D = m.c.n_embd, NE = nx.moe.glm_router.c.experts;
     static const int64_t maxr = xpf_knob("RADIANCE_DS41_XPF_MAX", 2112, 1, 1 << 20);
@@ -5154,7 +5158,7 @@ static void xpf_next(RadCtx* x, Model& m, const Layer& nx, int64_t T, const std:
         }
     }
     int64_t r0 = 0, n = T;
-    RadOperand in = brows(m.xn, T);
+    RadOperand in = brows(from_ffn ? m.act.x : m.xn, T);
     if (xpf_env() == 2) {
         /* the largest run the fused pcn_a mixed: the prefill rows (a MIXED step's decode rows mix later) */
         n = 0;
@@ -5169,7 +5173,8 @@ static void xpf_next(RadCtx* x, Model& m, const Layer& nx, int64_t T, const std:
     static const int kp = (int)xpf_knob("RADIANCE_DS41_XPF_KP", 6, 1, 16);
     static const int sl = (int)xpf_knob("RADIANCE_DS41_XPF_SLOTS", 64, 0, 128);
     const void* bias = rad_weight_ptr(x, nx.moe.glm_router.correction);
-    const int rc = rad_xpf_plan(x, &nx.moe.xp, (const char*)m.xpf_lg + r0 * NE * 2, n, NE, bias, kp, sl);
+    const int rc = rad_xpf_plan(x, &nx.moe.xp, (const char*)m.xpf_lg + r0 * NE * 2, n, NE, bias, kp, sl,
+                                from_ffn ? RAD_XPF_DEFER : 0u);
     if (rc == RAD_E_UNSUPPORTED) {
         if (rad_rank(x) == 0)
             fprintf(stderr, "radiance: deepseek41: lever XPF: the core has no prefill ring (RADIANCE_XPF_MIB unset, or no "
@@ -5188,7 +5193,11 @@ static void xpf_next(RadCtx* x, Model& m, const Layer& nx, int64_t T, const std:
 static void xpf_end(RadCtx* x, Model& m) {
     if (!m.xpf_planned) return;
     m.xpf_planned = false;
-    if (rad_xpf_plan) (void)rad_xpf_plan(x, nullptr, nullptr, 0, 0, nullptr, 0, 0);
+    if (rad_xpf_plan) (void)rad_xpf_plan(x, nullptr, nullptr, 0, 0, nullptr, 0, 0, 0u);
+}
+/* XPF=3: after layer l's MoE block, the deferred plan for l + 1 may go (behind l's last routed down). */
+static void xpf_go(RadCtx* x, Model& m) {
+    if (m.xpf_planned && rad_xpf_plan) (void)rad_xpf_plan(x, nullptr, nullptr, 0, 0, nullptr, 0, 0, RAD_XPF_GO);
 }
 
 /* ------------------------------------------------------------------ step */
@@ -6432,6 +6441,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
          * the all-reduce over its rows); the ffn mix beside the first (r0 = 0) */
         xpm_mark(x, m, l, 3);
         if (L.l + 1 < c.n_layer) xpm_pred(x, m, m.layers[(size_t)L.l + 1], 0, brows(m.act.x, T));
+        if (xpf_on_pass && xpf_env() == 3 && L.l + 1 < c.n_layer)   /* lever XPF=3: predict l + 1 from l's ffn input */
+            xpf_next(x, m, m.layers[(size_t)L.l + 1], T, {}, true);
         MixBeside mb{ &L, &m, T };
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
@@ -6511,6 +6522,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (!l20_none) L.moe.route_report(x);
         xpm_mark(x, m, l, 4);
         xpm_after_moe(x, m, L);
+        if (xpf_on_pass && xpf_env() == 3) xpf_go(x, m);   /* lever XPF=3: its copies go behind l's last routed down */
         bt_pt(x, m, m.mw.logits, T, "router", l);
         bt_pt(x, m, m.mw.ids, T, "ids", l);
         bt_pt(x, m, m.mw.ew, T, "ew", l);
@@ -6549,7 +6561,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             });
         xpm_mark(x, m, l, 5);
         if (nx) xpm_at_start(x, m, *nx, t_mhc_a_l == nx->l ? t_mhc_a : std::vector<std::pair<int64_t, int64_t>>{});
-        if (nx && xpf_on_pass) xpf_next(x, m, *nx, T, t_mhc_a_l == nx->l ? t_mhc_a : std::vector<std::pair<int64_t, int64_t>>{});
+        if (nx && xpf_on_pass && xpf_env() != 3)
+            xpf_next(x, m, *nx, T, t_mhc_a_l == nx->l ? t_mhc_a : std::vector<std::pair<int64_t, int64_t>>{});
     }
     if (psk && cur != &sg && rad_rank(x) == 0) {   /* lever PSK: a cut step (stats; the first one's cut rows) */
         g_psk_cut_passes.fetch_add(1, std::memory_order_relaxed);

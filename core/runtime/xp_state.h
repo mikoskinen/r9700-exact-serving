@@ -87,8 +87,11 @@ struct XpfLayer {
     bool     bound = false, tried = false;
 };
 struct XpfReq {
-    int      g   = 0;
-    uint32_t seq = 0;
+    int       g    = 0;
+    uint32_t  seq  = 0;
+    void*     mark = nullptr;     /* a ride the first list polls (RAD_XPF_DEFER), or null */
+    RadStream ms   = nullptr;
+    bool      valid = false;
 };
 struct XpfState {
     int          device = 0;
@@ -109,8 +112,13 @@ struct XpfState {
     std::vector<XpfLayer> layers;
     uint32_t     seq[2] = {};
     int          g = 1;                /* the group the last plan took */
-    int          want_layer = -1, want_g = 0;
+    int          want_layer = -1, want_g = 0;   /* (unused since e3: wl / wseq) */
     uint32_t     want_seq = 0;
+    int          wl[2] = { -1, -1 };          /* the layer each group's last plan is for, -1 once patched */
+    uint32_t     wseq[2] = {};
+    int64_t      group_bytes = 0;             /* a group's ring bytes (copies packed by their slot size) */
+    XpfReq       pend;                        /* a deferred plan, waiting for RAD_XPF_GO */
+    std::deque<std::pair<void*, int64_t>> marks;   /* thread only: a mark and the list that polls it */
     bool         dirty[2] = { false, false };
     int64_t      plans = 0;
     std::thread              thr;

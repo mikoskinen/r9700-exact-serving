@@ -338,7 +338,7 @@ public:
     void xpf_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride, int n, int64_t ring);
     void xpf_close();
     int  xpf_plan(const RadPrefetchNext* next, const void* logits, int64_t rows, int64_t ld, const void* bias, int kp,
-                  int slots);
+                  int slots, unsigned flags);
     bool xpf_on() const { return xpf_ != nullptr; }
     int  xp_predict(const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark();

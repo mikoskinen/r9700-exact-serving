@@ -123,7 +123,7 @@ struct XpfStats {
 extern "C" int rad_xpf_count_launch(const uint16_t* lg, uint32_t rows, uint32_t ld, uint32_t ne, uint32_t kp,
                                     const float* bias, int32_t* cnt, void* stream);
 extern "C" int rad_xpf_plan_launch(int32_t* cnt, uint32_t ne, void** const* map, const int32_t* place,
-                                   const int32_t* rcnt, rad::XpPools pools, uint64_t ring, uint64_t rs, uint32_t slots,
+                                   const int32_t* rcnt, rad::XpPools pools, uint64_t ring, uint64_t cap, uint32_t slots,
                                    rad::XpfRec* rec, int32_t* nrec, rad::XpfBox* box, uint32_t seq,
                                    rad::XpfStats* stats, void* stream);
 extern "C" int rad_xpf_step_launch(const rad::XpfRec* rec, const int32_t* nrec, const uint32_t* done, uint32_t seq,

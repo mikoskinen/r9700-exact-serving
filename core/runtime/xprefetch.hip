@@ -333,13 +333,14 @@ __global__ __launch_bounds__(256) void xpf_count(const uint16_t* __restrict__ lg
  * their jobs to the mailbox (tags last) and their records, zeroes cnt, and publishes the mailbox number. */
 __global__ __launch_bounds__(512) void xpf_plan(int32_t* cnt, uint32_t ne, void** const* __restrict__ map,
                                                 const int32_t* __restrict__ place, const int32_t* rcnt, rad::XpPools pools,
-                                                uint64_t ring, uint64_t rs, uint32_t slots, rad::XpfRec* rec,
+                                                uint64_t ring, uint64_t cap, uint32_t slots, rad::XpfRec* rec,
                                                 int32_t* nrec, rad::XpfBox* box, uint32_t seq, rad::XpfStats* stats) {
     constexpr int P = rad::kXpfParts;
     __shared__ int      s_c[512];
     __shared__ uint64_t s_base[512];
     __shared__ uint64_t s_st[512];
     __shared__ int      s_sel[rad::kXpfMaxSlots];
+    __shared__ uint64_t s_off[rad::kXpfMaxSlots];
     __shared__ int      s_n;
     const int tid = (int)threadIdx.x;
     const int nr = *nrec;
@@ -375,7 +376,7 @@ __global__ __launch_bounds__(512) void xpf_plan(int32_t* cnt, uint32_t ne, void*
                         const uint64_t v = (uint64_t)*(void* volatile*)eq;
                         if (v < base || v >= base + st) pi = -1;
                     }
-                    if (st > rs) pi = -1;
+                    if (st > cap) pi = -1;
                 }
             }
             if (pi < 0) c = 0;
@@ -395,10 +396,23 @@ __global__ __launch_bounds__(512) void xpf_plan(int32_t* cnt, uint32_t ne, void*
         if (rank < slots) { s_sel[rank] = tid; atomicAdd(&s_n, 1); }
     }
     __syncthreads();
+    /* packed by their slot sizes, in rank order, as many as the group's bytes hold */
+    if (tid == 0) {
+        uint64_t o = 0;
+        int k = 0;
+        for (; k < s_n; ++k) {
+            const uint64_t b = s_st[s_sel[k]];
+            if (o + b > cap) break;
+            s_off[k] = o;
+            o += b;
+        }
+        s_n = k;
+    }
+    __syncthreads();
     const int n = s_n;
     for (int t = tid; t < n * P; t += (int)blockDim.x) {
         const int j = t / P, q = t % P, e = s_sel[j];
-        const uint64_t b = s_base[e], dst = ring + (uint64_t)j * rs;
+        const uint64_t b = s_base[e], dst = ring + s_off[j];
         if (q == 0) {
             __hip_atomic_store(&box->jobs[j].src, b, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
             __hip_atomic_store(&box->jobs[j].dst, dst, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -478,11 +492,11 @@ extern "C" int rad_xpf_count_launch(const uint16_t* lg, uint32_t rows, uint32_t 
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 extern "C" int rad_xpf_plan_launch(int32_t* cnt, uint32_t ne, void** const* map, const int32_t* place,
-                                   const int32_t* rcnt, rad::XpPools pools, uint64_t ring, uint64_t rs, uint32_t slots,
+                                   const int32_t* rcnt, rad::XpPools pools, uint64_t ring, uint64_t cap, uint32_t slots,
                                    rad::XpfRec* rec, int32_t* nrec, rad::XpfBox* box, uint32_t seq,
                                    rad::XpfStats* stats, void* stream) {
     if (ne > 512u || slots > (uint32_t)rad::kXpfMaxSlots) return -1;
-    hipLaunchKernelGGL(xpf_plan, dim3(1), dim3(512), 0, (hipStream_t)stream, cnt, ne, map, place, rcnt, pools, ring, rs,
+    hipLaunchKernelGGL(xpf_plan, dim3(1), dim3(512), 0, (hipStream_t)stream, cnt, ne, map, place, rcnt, pools, ring, cap,
                        slots, rec, nrec, box, seq, stats);
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }
