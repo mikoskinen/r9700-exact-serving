@@ -3586,7 +3586,8 @@ int Engine::run_server() {
          * are refused by name: LFM2-VL takes pictures only, and a token-budget processor (Gemma
          * 4's) sizes by soft tokens (--image-tokens, --video-max-frame-tokens), not pixel
          * bands. */
-        if ((vc.family == mm::Family::Lfm2 || vc.family == mm::Family::Glm5Next) &&
+        if ((vc.family == mm::Family::Lfm2 || vc.family == mm::Family::Glm5Next ||
+             vc.family == mm::Family::DeepSeek41) &&
             (cfg_.video_min_pixels || cfg_.video_max_pixels || cfg_.video_min_frames ||
              cfg_.video_max_frames || cfg_.video_fps || cfg_.video_max_frame_tokens)) {
             RAD_ERR("media: this model's processor takes pictures, not video, so the --video-* "
@@ -3604,9 +3605,9 @@ int Engine::run_server() {
             }
             if (cfg_.image_tokens)           vc.image_soft_tokens = *cfg_.image_tokens;
             if (cfg_.video_max_frame_tokens) vc.video_soft_tokens = *cfg_.video_max_frame_tokens;
-        } else if (vc.family == mm::Family::Glm5Next) {
-            /* GLM-5.3 budgets an image in tokens (max_image_tokens), so --image-tokens is its
-             * ceiling and the pixel bands do not apply. */
+        } else if (vc.family == mm::Family::Glm5Next || vc.family == mm::Family::DeepSeek41) {
+            /* GLM-5.3 and DeepSeek-V4.1 budget an image in tokens (max_image_tokens), so
+             * --image-tokens is its ceiling and the pixel bands do not apply. */
             if (cfg_.image_min_pixels || cfg_.image_max_pixels) {
                 RAD_ERR("media: this model's processor sizes images by a token budget, so "
                         "--image-min-pixels and --image-max-pixels do nothing; use "
@@ -3718,6 +3719,12 @@ int Engine::run_server() {
                          vc.max_image_tokens, mm_proc->config().max_image_tokens,
                          (long long)vc.max_image_tokens * vc.merge * vc.merge);
         }
+        else if (mm_proc->config().family == mm::Family::DeepSeek41)
+            RAD_INFO("media: images through '%s'; an image becomes a span of at most %d tokens "
+                     "(start, rows of up to %d x %d patches each ending in a newline, end), "
+                     "padded to its canvas rather than stretched; %lld patches a pass",
+                     ranks_[0]->program.encoder_name.c_str(), mm_proc->config().max_image_tokens,
+                     mm_proc->config().merge, mm_proc->config().merge, (long long)encd.max_patches);
         else if (mm_proc->config().family == mm::Family::Gemma4)
             RAD_INFO("media: %s%s through '%s'; an image becomes at most %d soft tokens (a "
                      "request's image_tokens may ask for 70..1120), a video %d a frame at %.3g "

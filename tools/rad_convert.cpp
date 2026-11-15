@@ -1429,6 +1429,25 @@ int main(int argc, char** argv) {
             for (uint32_t i = 0; same && i < RAD_MAX_RANK; ++i)
                 if (re->shape[i] != ww.shape[i]) same = false;
             if (in_place) {
+                /* The same bytes under another extent of the same element count (an entry an
+                 * earlier plugin declared [4, 5120] that this one declares [20480]): the entry is
+                 * kept exactly as it is, extent included (add_existing copies it), which is what
+                 * the engine already serves from this container. */
+                if (!same && rad_enc_equal(&reuse.encoding(*re), &ww.enc) &&
+                    ww.quantizer == reuse.str(re->quantizer) &&
+                    ww.options == reuse.str(re->options) &&
+                    (!expert || (re->layer == ww.layer && re->expert == ww.expert &&
+                                 re->slot == ww.slot))) {
+                    int64_t na = 1, nb = 1;
+                    for (uint32_t i = 0; i < re->rank && i < RAD_MAX_RANK; ++i) na *= (int64_t)re->shape[i];
+                    for (uint32_t i = 0; i < ww.rank && i < RAD_MAX_RANK; ++i) nb *= (int64_t)ww.shape[i];
+                    if (na == nb && na > 0) {
+                        RAD_INFO("--in-place: '%s' kept as stored (%u dims, %lld elements); this "
+                                 "run declares the same elements as %u dims", ww.name.c_str(),
+                                 re->rank, (long long)na, ww.rank);
+                        same = true;
+                    }
+                }
                 if (!same) {
                     RAD_ERR("--in-place: '%s' is in %s as %s by '%s %s', and this run would write "
                             "it as %s by '%s %s'. A weight cannot be replaced in place; convert "

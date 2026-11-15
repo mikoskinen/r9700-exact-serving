@@ -93,7 +93,21 @@ enum class Kind { Image, Video, Audio };
  *           tokens. Pictures are spelled <img> placeholders </img>; a video one such run a
  *           tubelet, each after its "Frame i sampled at T seconds and frame i+1 ...: " label,
  *           runs joined by a newline. Tokens at their positions (NoPE). */
-enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio };
+/*   DeepSeek41  DeepSeek-V4.1's (inference/image_processor.py): a picture under min_pixels is
+ *           grown to it (sides truncated), the sides rounded up to whole patches, and one past the
+ *           max_image_tokens budget fitted by the reference's solve_resize_ratio; it is then
+ *           ImageOps.pad-ed (PIL's bicubic, centred on 127 grey) to that canvas, never stretched.
+ *           Patches (channel, y, x), (u / 255 - 0.5) / 0.5 in f32, rounded to bf16, raster order.
+ *           The 3 x 3 aligner pads the patch grid to multiples of 3 with zeros, so a picture of
+ *           n_vit_h x n_vit_w patches is h = ceil(n_vit_h / 3) by w = ceil(n_vit_w / 3) tokens,
+ *           spelled [start] ([image] * w + [newline]) * h [end]: h (w + 1) + 2 placeholders, every
+ *           one the image token id, each taking an encoder row (the start, newline and end rows
+ *           are the checkpoint's learned rows). The item is one segment of 9 patches an output
+ *           row: the real patches first (raster order), then zero patches the tower never
+ *           attends to; `Item::aux` carries the tower's gather indices and the span's
+ *           learned-row slots (ds41_span_planes). Images only; the tokens rotate at their
+ *           positions. */
+enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio, DeepSeek41 };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -105,8 +119,11 @@ struct VisionConfig {
     bool    unit_pixels = false;
     int64_t image_min_pixels = 0, image_max_pixels = 0;
     int64_t video_min_pixels = 0, video_max_pixels = 0;
-    /* Glm5Next: the band an image's canvas falls in, in output rows (tokens). */
+    /* Glm5Next: the band an image's canvas falls in, in output rows (tokens). DeepSeek41: the
+     * span's budget (vision_config.max_image_tokens), start, newlines and end included. */
     int32_t min_image_tokens = 0, max_image_tokens = 0;
+    /* DeepSeek41: vision_config.max_wh_ratio, 0 for none (the release states none). */
+    double  max_wh_ratio = 0.0;
     double  fps = 2.0;
     int32_t min_frames = 4, max_frames = 768;
     /* Per-frame ceiling on a video's resolution, in output rows (the reference processor's
@@ -316,6 +333,12 @@ struct Item {
      * language embedding. Empty preserves the existing contiguous per-segment representation. */
     std::vector<int32_t> row_tokens;
 
+    /* Planes 2 and 3 of the encoder's coordinates (RadBatch::enc_coord), [2, n_patch], when the
+     * processor states them itself rather than the segment's size (Family::DeepSeek41: the
+     * tower's gather indices and the span's learned-row slots, ds41_span_planes). Empty: the
+     * segment's height and width, as everywhere else. */
+    std::vector<int32_t> aux;
+
     /* Content key over the patches and the grid, taken before the encoder runs, so a prefix-cache
      * hit over this item skips the encoder as well as the prefill. The patches already reflect
      * every preprocessing choice, and the encoder is a function of them alone. */
@@ -456,6 +479,7 @@ private:
     int image_glm5next(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int image_radio(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_deepseek41(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int video_radio(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
     /* Lfm2's markers: <|img_thumbnail|>, and <|img_row_R_col_C|> at (R-1) * max_tiles + C-1. */
     int32_t              tok_thumbnail_ = -1;
@@ -549,6 +573,28 @@ int uocr_mode(const VisionConfig& c, const ImageMode& mode, bool* crop, int32_t*
 /* Runs the resample and patch staging on their scalar path even where AVX2 is available, for a
  * test that compares the two; process-wide. */
 void mm_force_scalar(bool on);
+/* DeepSeek-V4.1's plan_image_grid for a w x h picture (inference/image_processor.py, Python's
+ * float arithmetic step for step): the patch grid n_vit_h x n_vit_w the picture is padded to and
+ * the token grid n_llm_h x n_llm_w the aligner makes of it. RAD_E_INVAL when the budget cannot
+ * hold a picture of that shape. */
+int ds41_plan(int64_t w, int64_t h, int32_t patch, int32_t ratio, int64_t min_pixels,
+              int32_t max_tokens, double max_wh_ratio, int32_t* n_vit_h, int32_t* n_vit_w,
+              int32_t* n_llm_h, int32_t* n_llm_w, std::string* why);
+/* The span's placeholders for a token grid: h (w + 1) + 2. */
+inline int64_t ds41_span_tokens(int64_t h, int64_t w) { return h * (w + 1) + 2; }
+/* Planes 2 and 3 of a DeepSeek-V4.1 picture's 9 * span patches (Item::aux), for the tower
+ * (arch/common/rad_block_ds41_vision.h). Patch slot j belongs to span row j / 9 and is that
+ * row's 3 x 3 tap k = j % 9, (k / 3, k % 3):
+ *   plane 2  the ViT row (in the segment, raster order) the aligner reads at that tap: patch
+ *            (3 y + k / 3, 3 x + k % 3) of an image row at token (y, x), -1 where that falls in
+ *            the zero padding and for the start, newline and end rows;
+ *   plane 3  [0, n_sp) the learned row each of the n_sp = h + 2 start / newline / end rows takes
+ *            (0 start, 1 newline, 2 end), [n_sp, 2 n_sp) those rows' places in the span, then
+ *            {0, n_vit_h * n_vit_w}: the tower's attention bounds; zero after.
+ * `planes` holds 2 * 9 * span entries, plane 2 first. */
+void ds41_span_planes(int32_t n_vit_h, int32_t n_vit_w, int32_t n_llm_h, int32_t n_llm_w,
+                      int32_t* planes);
+
 /* PIL's ImageOps.pad: `in` fitted inside w x h keeping its aspect (its bicubic), centred on `fill`
  * in the channels' order (127 127 127 for the reference's 0.5 mean). */
 void pad_bicubic(const Frame& in, int32_t w, int32_t h, uint8_t fill, Frame* out);
