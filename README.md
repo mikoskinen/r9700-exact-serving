@@ -1,7 +1,8 @@
 # DeepSeek V4.1 Flash and Qwen Flash-Next (EXL3) on 4x AMD Radeon AI PRO R9700
 
-Update 14.11.2026: a new matrix kernel runs DeepSeek's dense layers on the RDNA4 matrix cores, and MTP
-drafting stays on with up to 12 concurrent requests, which raises the DeepSeek results considerably.
+Update 15.11.2026: DeepSeek splits every routed expert across the four cards and keeps 4.2 full
+1M-token sessions in its KV cache, and Qwen gives identical answers under load up to 32 concurrent
+requests, long prompts included.
 
 This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
 AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
@@ -22,28 +23,30 @@ output from a coding agent.
 
 ## Results
 
-All values are tok/s, summed over all concurrent users. Stock is the card default of 300 W with no
+All values are tok/s, summed over all concurrent requests. Stock is the card default of 300 W with no
 voltage offset, and the everyday setting caps each card at 210 W with a -50 mV voltage offset.
 [Run it](#run-it) has the commands for both settings.
 
 | Measure | DeepSeek, stock 300 W | DeepSeek, 210 W | Qwen, stock 300 W | Qwen, 210 W |
 |---|---|---|---|---|
-| 1 user | 105 prose / 182 code | 101 prose / 173 code | 269 | 262 |
-| 4 users | 201 | 192 | 618 | 583 |
-| 8 users | 246 | 234 | 833 | 779 |
-| 16 users | 294 | 277 | 1,093 | 1,027 |
-| Prefill 16k | 4,040 | 3,910 | 9,540 | 9,100 |
-| Prefill 64k | 6,120 | 5,600 | 9,810 | 9,340 |
-| Prefill 128k | 6,390 | 5,800 | 9,700 | 9,240 |
+| 1 request | 107 prose / 187 code | 103 prose / 177 code | 269 | 265 |
+| 4 requests | 247 | 227 | 635 | 607 |
+| 8 requests | 305 | 282 | 849 | 810 |
+| 16 requests | 346 | 319 | 1,123 | 1,075 |
+| 24 requests | 375 | 342 | 1,249 | 1,183 |
+| 32 requests | 415 | 378 | 1,345 | 1,284 |
+| Prefill 16k | 4,480 | 4,290 | 9,420 | 9,090 |
+| Prefill 64k | 5,980 | 5,480 | 9,540 | 9,220 |
+| Prefill 128k | 6,330 | 5,640 | 9,400 | 9,090 |
 
 ## What exact means
 
 Exact means the output is byte-identical to each model's reference engine, and a prompt gets the same
 answer alone or next to other requests. This matters for a coding agent, whose answer to the same
-context shouldn't change because other sessions are running on the same cards. In a 38-minute run
-under load, all 160 of DeepSeek's answers stay identical. The DeepSeek matrix kernel sums the dense
-layers in a different order than the builds before 14.11.2026, so its answers to some prompts differ
-from theirs, and this build is DeepSeek's reference from here on.
+context shouldn't change because other sessions are running on the same cards. DeepSeek's reference
+is the build of 15.11.2026, and in a 33-minute run under load all 160 of its answers stay identical.
+Qwen's answers to 20 short prompts and to 12 long prompts of up to 5,934 tokens stay identical beside
+up to 31 other requests.
 
 ## Hardware changes
 
@@ -137,7 +140,7 @@ sudo run/power.sh 300    # or 210 for the 210 W columns
 ```
 
 [run/power.sh](run/power.sh) sets the power cap, the voltage offset and a flat fan curve on every card
-until the next reboot. Before each measurement, the cards cooled to 45 °C or less.
+until the next reboot. The cards cooled to 45 °C or less before each DeepSeek section and before each Qwen column.
 
 ### Qwen
 
@@ -147,12 +150,12 @@ docker run -d --name qwen --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/qwen.env \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-b9282bf7 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-4f74a8fa \
   --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
-  --max-num-seqs 16 --max-model-len 262144 --max-num-batched-tokens 8192 \
+  --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 8192 \
   --prefill-span 4 --prefill-interleave 0 --prefix-resume nearest \
-  --placement all_vram --gpu-headroom-mib 96 --kv-cache-dtype fp8 --ngram-placement ram \
+  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
   --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
   --num-speculative-tokens 3 --reasoning-effort medium --reasoning-effort-map high=xhigh \
   --thinking-token-budget 16000 --default-max-tokens 32768
@@ -162,7 +165,7 @@ run/switches.sh run/qwen/switches.json
 The server is ready in about two minutes. [run/switches.sh](run/switches.sh) waits for it, then sets
 the runtime switches of the batch-invariant kernel set and checks that each one took effect. The
 result runs on gpu02 also set the rank order with `ROCR_VISIBLE_DEVICES`, putting the cards at PCI
-bus 03, c3, 83 and 48 on ranks 0 to 3.
+bus 03, c3, 84 and 48 on ranks 0 to 3.
 
 ### DeepSeek
 
@@ -174,11 +177,11 @@ docker run -d --name deepseek --init --network host \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/ds41-exl3:/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
   --env-file run/deepseek/deepseek.env \
-  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-ac0bf129 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-5e86593e \
   --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --served-model-name deepseek-v4.1-flash \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact \
   --placement expert_tiered --host-pool-mib 19456 --ngram-placement ram=/ngram \
-  --max-num-seqs 32 --max-model-len 524288 --max-num-batched-tokens 4160 \
+  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
   --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
   --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
   --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
@@ -187,13 +190,14 @@ run/switches.sh run/deepseek/switches.json
 ```
 
 The server is ready in about five minutes, most of which goes to writing the 103 GiB n-gram table to
-`/dev/shm/ds41ng`.
+`/dev/shm/ds41ng`. A request can use up to 1,048,576 tokens of context, and the KV cache has room
+for 4,427,562 tokens, which is 4.2 full-length sessions at once.
 
 ### Check the answer
 
 Both servers sample by default, so send `"temperature": 0` for exact output. DeepSeek answers this
 request with "The capital of Australia is Canberra, and it officially became the capital in 1913 when
-the city was founded and named." in every result run:
+the city was formally named and construction began." in every result run:
 
 ```bash
 curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -201,7 +205,8 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
   "messages": [{"role": "user", "content": "What is the capital of Australia, and in which year did it officially become the capital? Answer in two sentences."}]}'
 ```
 
-For Qwen, use `"model": "qwen3.8-flash-next"`.
+For Qwen, use `"model": "qwen3.8-flash-next"`, and the answer is "The capital of Australia is
+Canberra. It officially became the capital in 1913 when the city was formally named and established."
 
 ## Where things are
 
