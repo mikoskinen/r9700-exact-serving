@@ -1200,7 +1200,16 @@ inline rad_op kv_resolve_declare(RadBuilder* b, const Geom& g, rad_kvgroup kv, r
     if (!rad_op_declared(b, "kv_resolve") || !sel || !nsel || sel_pitch <= 0) return 0;
     const int64_t bs     = rad_kv_block_size(b, kv);
     const int64_t bbytes = rad_kv_layer_bytes(b, kv);
-    const int64_t blocks = bs > 0 ? g.max_seqs * ((g.max_ctx + bs - 1) / bs) : 0;
+    int64_t blocks = bs > 0 ? g.max_seqs * ((g.max_ctx + bs - 1) / bs) : 0;
+    /* fn4 kvs_ctx (qwen/CC-SETS.md): the id space core/kvstream/plan.h's kv_context_blocks carves -- min(max_seqs full
+     * contexts, RADIANCE_FN4_KVS_CTX's blocks), at least one full context; read from the same variable at start, so the
+     * residency map and the host mirror the step hands the kernel hold exactly `blocks` (libr4d refuses a smaller map). */
+    if (bs > 0) {
+        static const int64_t kvs_ctx = [] { const char* e = std::getenv("RADIANCE_FN4_KVS_CTX");
+                                            const long long t = e && *e ? std::atoll(e) : 0; return t > 0 ? (int64_t)t : (int64_t)0; }();
+        const int64_t one = (g.max_ctx + bs - 1) / bs;
+        if (kvs_ctx > 0) { int64_t c = (kvs_ctx + bs - 1) / bs; if (c < one) c = one; if (c < blocks) blocks = c; }
+    }
     if (bs <= 0 || bbytes <= 0 || blocks <= 0) return 0;
     const int64_t ring  = g.kv_resident > 0 ? (g.kv_resident + bs - 1) / bs : 0;
     const int64_t step  = g.max_seqs * (1 + (g.max_spec > 0 ? g.max_spec : 0)) * sel_pitch;
