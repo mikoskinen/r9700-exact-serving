@@ -9,6 +9,7 @@ int64_t kv_pool_bytes(const KVGroupPlan& p, int64_t slots, int64_t context_block
     if (!p.paged()) return p.n_states * p.bytes_per_state;
     const int64_t ring = kv_ring_bytes(p, slots);
     if (slots <= 0 || slots >= context_blocks) return ring;
+    if (kvstream_stage_apart()) return ring + context_blocks * p.layer_bytes_per_block();   /* fn4 kvs_apart */
     return std::max(ring, context_blocks * p.layer_bytes_per_block());
 }
 

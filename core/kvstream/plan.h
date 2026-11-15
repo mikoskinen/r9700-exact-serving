@@ -15,7 +15,20 @@
 #pragma once
 #include "mem/kv.h"
 
+#include <cstdlib>
+
 namespace rad {
+
+/* fn4 kvs_apart (15.11.2026, qwen/KV-STREAM-EXACT.md; RADIANCE_FN4_KVS_APART=1 at start, a start-time knob since it
+ * changes the allocation): the stage is funded beside the ring, pool = ring + stage, instead of max(ring, stage). A staged
+ * pass then never overwrites the ring, so the residency maps are not reset after it and the next decode step resolves
+ * only what it has not seen (today every staged pass empties the ring and the next decode step re-reads every selected
+ * block of every sequence from the mirror). The stores keep the ring current in staged passes too (the cache operand's
+ * ring view, RAD_KV with cols -1). */
+inline bool kvstream_stage_apart() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_KVS_APART"); return e && *e && *e != '0'; }();
+    return on;
+}
 
 /* Bytes of the ring view: `slots` blocks, every layer. Inline so that a caller that only lays out a
  * view (kvstream/bind.cpp, linked by tests with weak device fakes) need not link KVManager. */

@@ -154,6 +154,7 @@ struct KVViewState {
     int64_t bytes = 0;
     int64_t depth = 0;             /* 0: n_layers; 1: every layer at offset 0 */
     int64_t shape0 = 0;            /* the operand's [blocks] extent for this view */
+    int64_t base_off = 0;          /* fn4 kvs_apart: the view's offset from the pool's base (the stage past the ring) */
 };
 
 /* A byte range of one layer's row in a streamed group's mirror and stage (kvstream/stage.h,
@@ -181,6 +182,11 @@ struct KVPoolBinding {
     KVViewState ring;
     KVViewState stage;
     bool        has_stage = false;
+    /* fn4 kvs_apart (RADIANCE_FN4_KVS_APART=1 at start, qwen/KV-STREAM-EXACT.md): the stage is funded beside the ring
+     * (pool = ring + stage, the stage at pool_base + ring bytes) instead of aliasing it, so a staged pass leaves the ring's
+     * bytes and maps valid; pool_base is the allocation's start, `base` the active view's. */
+    bool        stage_apart = false;
+    void*       pool_base = nullptr;
     /* The ranges of a layer's mirror row a staged pass copies (kvstream/stage.h, "Volume"), set
      * each step. Empty copies the whole row. */
     std::vector<KVStageRun> stage_runs;

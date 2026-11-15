@@ -82,7 +82,9 @@ void kvstream_enter(Ctx* c, const RadBatch* b) {
          * holds that id. With the maps reset at the stage's start the store writes the mirror (and the stage at
          * identity) only; the ring is overwritten by the stage either way and resolves from the mirror afterwards. */
         const bool kvs_reset_in = !was_stage && kb->depth == 1 && (fn4::kvs_bi() & 2) != 0;
-        if ((was_stage && kb->depth == 0) || kvs_reset_in) {
+        /* fn4 kvs_apart: a stage funded beside the ring never overwrites it, and the staged pass's stores keep the ring
+         * current (the cache operand's ring view), so the maps stay valid: no reset either way, the ring stays warm. */
+        if (!kb->stage_apart && ((was_stage && kb->depth == 0) || kvs_reset_in)) {
             const RadKVStream* st = b->kv[i].stream;
             const int64_t bb     = st->block_bytes;
             const int64_t blocks = bb > 0 ? st->host_layer_stride / bb : 0;
@@ -443,7 +445,13 @@ extern "C" int rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGroup
                                   int layer) {
     using namespace rad;
     if (!c || !kvb || !kvb->stream) return 0;
-    return kvstage_wait(static_cast<Ctx*>(c), group, kvb, layer);
+    const int r = kvstage_wait(static_cast<Ctx*>(c), group, kvb, layer);
+    /* fn4 kvs_apart: 2 = staged on a stage funded beside the ring (the store then also keeps the ring current) */
+    if (r == 1) {
+        const KVPoolBinding* b = static_cast<Ctx*>(c)->kv_binding(group);
+        if (b && b->stage_apart) return 2;
+    }
+    return r;
 }
 
 extern "C" int rad_kv_stage_next(RadCtx* c, rad_kvgroup group, int layer) {

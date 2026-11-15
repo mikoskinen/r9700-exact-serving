@@ -689,15 +689,18 @@ inline void AttnGatedFP8::store_cache(RadCtx* c, const RadKVGroupBatch* kvb,
     /* A streamed group writes its host mirror, and the ring slot only where the block is resident
      * (docs/OPS.md "kv_store_streamed"). kv_store alone would treat a block id as a ring slot, so
      * a build without the streamed store fails the step. */
-    const bool staged = kv_stage_wait(c, kv, kvb, layer);
+    const int sv = kv_stage_wait_view(c, kv, kvb, layer);
+    const bool staged = sv != 0;
     const KVStreamLayer L = kv_stream_layer(c, kv, layer, kvb);
     if (!op_kv_stream || !L.host || L.blocks <= 0) {
         rad_step_fail(c, "kv streaming: this layer's KV group streams but the build has no "
                          "kv_store_streamed row to write its host mirror with");
         return;
     }
+    /* fn4 kvs_apart: on a stage funded beside the ring the streamed store writes the RING (resident blocks) and the
+     * mirror; the stage takes this step's tokens at identity below. Aliased (sv 1), the operand is the active view. */
     RAD_ISSUE(c, op_kv_stream,
-              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer),
+              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), sv == 2 ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
               praw(L.res, RAD_I32, L.blocks), praw2(L.host, RAD_U8, L.blocks, L.bbytes));
     if (staged) store_stage_identity(c, slot, T);
 }
@@ -796,12 +799,13 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
     const bool folded_stream = L.host && L.blocks > 0;
     if (folded_stream) {
         /* The prologue is the store, so the stage copy must land before it (kv_stage_wait). */
-        const bool staged = kv_stage_wait(c, kv, kvb, layer);
+        const int sv = kv_stage_wait_view(c, kv, kvb, layer);
+        const bool staged = sv != 0;
         RAD_ISSUE_N(c, op_fused_stream, T,
                     brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
                     RAD_W(w_q_norm), RAD_W(w_k_norm),
                     brows(w.q, T), brows(w.k, T), RAD_NONE,
-                    brows(w.v, T), praw(slot, RAD_I32, T), kv_cache(kv, layer),
+                    brows(w.v, T), praw(slot, RAD_I32, T), sv == 2 ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
                     praw(L.res, RAD_I32, L.blocks), praw2(L.host, RAD_U8, L.blocks, L.bbytes));
         if (staged) store_stage_identity(c, slot, T);
     } else if (fused_kv) {

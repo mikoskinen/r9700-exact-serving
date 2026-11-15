@@ -1116,6 +1116,14 @@ inline int64_t vocab_head_rows(const Geom& g) {
  * the batch, so the operand names the group and layer and the core resolves it like a weight
  * handle. */
 inline RadOperand kv_cache(rad_kvgroup group, int layer) { return RAD_KV(group, layer); }
+/* fn4 kvs_apart (qwen/KV-STREAM-EXACT.md): a streamed group's RING whatever view the pass is on -- `cols` -1 on a KV operand
+ * (core/runtime/issue.cpp); meaningful only in a pass staged on a stage funded beside the ring (kv_stage_apart_wait 2),
+ * where a store keeps the ring current; elsewhere it resolves as kv_cache. */
+inline RadOperand kv_cache_ring(rad_kvgroup group, int layer) {
+    RadOperand o = RAD_KV(group, layer);
+    o.cols = -1;
+    return o;
+}
 
 /* One layer of a streamed group (RadKVStream): its rows of the host mirror and the ring's maps.
  * The mirror is layer-major over the group's bound layers in KVPoolBinding::layer_slot order, not
@@ -1163,6 +1171,10 @@ inline bool kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* 
 }
 inline bool kv_stage_wait(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb, int layer) {
     return rad_kv_stage_layer(c, group, kvb, layer) != 0;
+}
+/* kv_stage_wait's value: 0 not staged, 1 staged, 2 staged on a stage funded beside the ring (fn4 kvs_apart). */
+inline int kv_stage_wait_view(RadCtx* c, rad_kvgroup group, const RadKVGroupBatch* kvb, int layer) {
+    return rad_kv_stage_layer(c, group, kvb, layer);
 }
 inline void kv_stage_next(RadCtx* c, rad_kvgroup group, int layer) {
     (void)rad_kv_stage_next(c, group, layer);
