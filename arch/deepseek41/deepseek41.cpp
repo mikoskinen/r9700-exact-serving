@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -1065,6 +1066,23 @@ static int etp_env() {
     return v;
 }
 using ds41etp::etp_slice;   /* ds41_etp.h: this rank's slice of an expert of each parity class */
+/* Lever XR (ds41-etp-xr, 14.11.2026): RADIANCE_DS41_XRING=<MiB> (1 .. 1024) at start, with RADIANCE_DS41_ETP, declares
+ * each trunk layer's EXL3 gate_up with interface v10's `xring` -- that much copy ring in its prefill scratch. exl3r4d's
+ * map form then can (fn4 exl3_xr bit 2) copy the routed experts whose slices sit in the pinned host pool onto the card
+ * inside the launch while the resident ones compute, and read the copies: the same bytes, a placement. The ring is
+ * charged to the arena like the rest of the scratch (fewer expert slots). Unset / 0: nothing declared (today's ops);
+ * anything else is refused at start. */
+static int64_t xring_env() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_XRING");
+        if (!e || !*e) return (int64_t)0;
+        char* end = nullptr;
+        const long n = std::strtol(e, &end, 10);
+        if (!std::isdigit((unsigned char)e[0]) || (end && *end) || n < 0 || n > 1024) return (int64_t)-1;
+        return (int64_t)n;
+    }();
+    return v;
+}
 static int64_t gather_ar_rows() {
     const char* e = std::getenv("RADIANCE_DS41_ARGATHER");
     if (!e || !*e) return 0;
@@ -1960,6 +1978,13 @@ static int geometry(Model& m, const RadBuildCtx* ctx) {
         return RAD_E_INVAL;
     }
     m.etp = etp_env() > 0 && world > 1;
+    if (xring_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_XRING=%s is not 0 .. 1024 (MiB)\n", std::getenv("RADIANCE_DS41_XRING"));
+        return RAD_E_INVAL;
+    }
+    if (xring_env() > 0 && m.etp && ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: lever XR (RADIANCE_DS41_XRING): %lld MiB of copy ring in each trunk gate_up's prefill "
+                        "scratch (exl3r4d fn4 exl3_xr; the same bytes either way)\n", (long long)xring_env());
     if (m.etp) {
         int64_t lo[2], hi[2];
         if (!etp_slice(c.n_ff, world, ctx->rank, lo, hi)) {
@@ -3063,6 +3088,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             s.cfg.ff_hi[q] = hi[q];
         }
         s.cfg.n_ff_exp = std::max(hi[0] - lo[0], hi[1] - lo[1]);
+        s.cfg.exl3_xring = xring_env() > 0 ? xring_env() : 0;   /* lever XR */
     }
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;

@@ -70,7 +70,7 @@
 extern "C" {
 #endif
 
-#define EXL3_IFACE_VERSION 9
+#define EXL3_IFACE_VERSION 10
 
 /* THE FEWEST TOKENS a pass issues moe_exl3_gate_up_down for, and exl3r4d fuses it from -- one build-time value for
  * the architecture's issue band (QWEN4EXP_EXL3_GD) and the library's fused launch (EXL3R4D_GD_MIN_TOK's default), so
@@ -393,6 +393,11 @@ static inline const RadOpSchema* exl3_schema_at(int i) {
          * fits, split-K 1 above) takes the one form at every count; absent or 0 is the library's own rule. The
          * result is defined as without it (a summation order, not a different product). */
         { "bi",       RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
+        /* v10 (DeepSeek's lever XR, ds41-etp-xr-plug): MiB of the prefill band's scratch for a copy ring -- in the map
+         * form the launch may copy the routed experts whose codes sit in a host pool (rad_host_pool_ranges) onto the
+         * card inside the GEMM launch, while the resident experts compute, and read the copies (the same bytes);
+         * absent or 0 is no ring. A placement of the same bytes, not a different product. */
+        { "xring",    RAD_P_INT, RAD_OPTIONAL, RAD_PROLE_NONE },
     };
     static const RadParamSpec p_dn[] = { EXL3_GEMM_PARAMS };
 #undef EXL3_GEMM_PARAMS

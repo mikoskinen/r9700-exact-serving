@@ -36,7 +36,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
                                         "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
-                                        "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng", "ds41_f32dec" };
+                                        "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng", "ds41_f32dec",
+                                        "exl3_xr" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -53,7 +54,8 @@ bool plugin_switch(int i) {
            i == kDs41Wmk ||     /* ds41_wmk (71, ds41-wmk2): libr4d (lever WMK) */
            i == kDs41Moe1 ||    /* ds41_moe1 (72 here, 71 on ds41-p1pass): deepseek41 (lever P) */
            i == kExl3Dng ||     /* exl3_dng (75 on ds41-etp-spb, 76 here after lever G): exl3r4d (SPB-G) */
-           i == kDs41F32Dec;    /* ds41_f32dec (73 on ds41-etp-spd, 77 here after the night stack): libr4d (lever SPD-F) */
+           i == kDs41F32Dec ||  /* ds41_f32dec (73 on ds41-etp-spd, 77 here after the night stack): libr4d (lever SPD-F) */
+           i == kExl3Xr;        /* exl3_xr (73 on ds41-etp-xr, 78 here after night stack 2): exl3r4d (lever XR / SPC order 3) */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -78,6 +80,8 @@ struct Hooks {
     int (*rfuse_stats)(long long*, int) = nullptr; /* lever FUSE-R (deepseek41's rad_rfuse_stats, ds41-fuse) */
     int (*fuse_stats)(long long*, int) = nullptr;  /* levers FUSE-M / FUSE-R (libr4d's rad_fuse_stats, ds41-fuse) */
     int (*wmk_stats)(long long*, int) = nullptr;   /* lever WMK (libr4d's rad_wmk_stats, ds41-wmk2) */
+    /* lever XR (exl3r4d's rad_host_pool_ranges, ds41-etp-xr): a rank's pinned host pools */
+    int (*host_pools)(int, int, const unsigned long long*, const unsigned long long*) = nullptr;
 };
 
 struct State {
@@ -207,6 +211,7 @@ void find_hooks(State& s) {
             k.rfuse_stats = sym<int (*)(long long*, int)>(h, "rad_rfuse_stats");
             k.fuse_stats = sym<int (*)(long long*, int)>(h, "rad_fuse_stats");
             k.wmk_stats = sym<int (*)(long long*, int)>(h, "rad_wmk_stats");
+            k.host_pools = sym<int (*)(int, int, const unsigned long long*, const unsigned long long*)>(h, "rad_host_pool_ranges");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -605,6 +610,18 @@ void note_psk_engine(int64_t planned, int64_t ended_early, int64_t stager_skippe
 void psk_engine(int64_t out[3]) {
     for (int i = 0; i < 3; ++i) out[i] = g_psk_eng[i].load(std::memory_order_relaxed);
 }
+int host_pools(int rank, int n, const uint64_t* lo, const uint64_t* hi) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    unsigned long long l[16] = {}, h[16] = {};
+    const int m = n < 0 ? 0 : n > 16 ? 16 : n;
+    for (int i = 0; i < m; ++i) l[i] = (unsigned long long)lo[i], h[i] = (unsigned long long)hi[i];
+    int took = 0;
+    for (const Hooks& k : s.hooks)
+        if (k.host_pools && k.host_pools(rank, m, l, h) >= 0) ++took;
+    return took;
+}
 int psk_stats(int64_t out[kPskStats]) {
     for (int i = 0; i < kPskStats; ++i) out[i] = 0;
     State& s = st();
@@ -802,7 +819,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, epoch_bump)";
         return false;
     }
     State& s = st();

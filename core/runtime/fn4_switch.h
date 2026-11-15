@@ -421,6 +421,11 @@
  *                   projections in wider tile forms -- 1 the router's fused launch (router_gemm_f32_scored_topk_scatter) and
  *                   gemm_nt_f32 (the compressor's kv | gate), 2 the router only, 3 gemm_nt_f32 only; 0 the stock rule (today).
  *                   Every form keeps each output's stock arithmetic: the same bytes. RADIANCE_DS41_F32DEC at load.
+ *   exl3_xr         exl3r4d (lever XR, ds41-etp-xr, 73 there; SPEED-C order 3, ds41-etp-spc-plug; 78 here after ds41_f32dec):
+ *                   gate_up's map form: the order of a chunk's groups -- 0 longest first (today), 1 VRAM-read first, 2 host-read
+ *                   first, 3 INTERLEAVE (SPEED-C: the host-read entries spread evenly over the chunk; 11 / 19 / 27 over its first
+ *                   3/4 / 1/2 / 1/4); bit 2 XR's ring copy (only with RADIANCE_DS41_XRING). The same entries in another order:
+ *                   the same bytes. Needs the host pools at bringup (host_pools / rad_host_pool_ranges).
  *   ds41_wmk        libr4d (lever WMK, ds41-wmk2; 71 here, after route_copy_ov): 1 every dense GGUF GEMM of <= 48 rows
  *                   (gemm_nt_ggml, logits_gemm_ggml, gemm_nt_ggml_pair as one launch, the K1 folds a / e after their
  *                   producer's own launch) in the part-order WMMA form (gg_wk_kernel: K split into P = 8 / 4 / 2 / 1 parts
@@ -595,7 +600,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kSwitches };
+              kExl3Xr, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -707,6 +712,10 @@ int  sched_cb_hold_k();
 static constexpr int kCbhCounts = 10;   /* holds, by_k, by_timeout, by_idle, by_other, hold_ms, held_steps, cob_steps,
                                           cob_newcomers, single_steps */
 void note_sched_cbh(const int64_t* v);
+/* Lever XR (ds41-etp-xr): hand rank `rank`'s pinned host pools ([lo, hi) as its card addresses them, Mover::pool_ranges)
+ * to every loaded plugin that takes them (rad_host_pool_ranges; exl3r4d's gate_up map form tests its experts' codes
+ * against them). Call with the rank's card current. Returns the plugins that took them. */
+int  host_pools(int rank, int n, const uint64_t* lo, const uint64_t* hi);
 /* Lever PSK design 2: hand the scheduler's plan for trunk pass `step` to the plugin that cuts by it (rad_psk_plan, every
  * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
  * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */

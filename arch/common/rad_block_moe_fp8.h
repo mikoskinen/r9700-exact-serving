@@ -154,6 +154,9 @@ struct MoeFP8 {
          * routing weight scales each partial and the all-reduce sums them. Rounding differs (two
          * partial sums), so this is checked by agreement, not bytes. */
         int64_t ff_lo[2] = { 0, 0 }, ff_hi[2] = { 0, 0 };
+        /* Lever XR (DeepSeek-V4.1 ds41-etp-xr, with the ETP slices above): MiB of copy ring the EXL3 gate_up declares in
+         * its prefill scratch (interface v10's `xring`); 0 declares none (today's op). */
+        int64_t exl3_xring = 0;
         /* Or by number mod 4 when four ranks split each expert: expert e's columns
          * [ff_lo4[e % 4], ff_hi4[e % 4]), served by `moe_gemm_q_mod4`, taking precedence over the
          * parity slices. hi 0 offers none.
@@ -2271,6 +2274,10 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
      * many tokens its step carries (measured: 9 of 20 probes at 8 concurrent differed from alone without it). The whole
      * expert never takes that form (18 blocks x 6 rows > the 64 units that fit), so expert parallel needs nothing. */
     if (etp) gp.push_back(RAD_INT("bi", 1));
+    /* Lever XR (interface v10's `xring`, expert tensor parallel only): the MiB of ring the prefill form's scratch keeps
+     * for copying host-pool experts' codes onto the card inside the launch (exl3r4d, fn4 exl3_xr). The same bytes are
+     * read either way; absent, the op is today's. */
+    if (etp && c.exl3_xring > 0) gp.push_back(RAD_INT("xring", c.exl3_xring));
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
                {w.h.x, w.sorted, w.eoff}, {b_x3h});
     /* Lever P (Config::exl3_dk_rows): the decode-band-bytes pair over 17 .. dk tokens, on the same tables and buffers.
