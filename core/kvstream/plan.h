@@ -36,14 +36,37 @@ inline int64_t kv_ring_bytes(const KVGroupPlan& p, int64_t slots) {
     return slots > 0 ? slots * p.bytes_per_block : 0;
 }
 
+/* fn4 kvs_ctx (15.11.2026, qwen/CC-SETS.md; RADIANCE_FN4_KVS_CTX=<tokens> at start, a start-time knob since it sizes
+ * allocations; unset or 0 = today): a token budget for a streamed group's id space, shared by every sequence, instead of
+ * `max_seqs` full contexts. The id space sizes the host mirror (6.5 KiB a token a rank on Flash-Next), the one-layer stage
+ * and the dense-read floor (kv_qsa_bkey, 0.8125 KiB a token a card), so `--max-num-seqs 32 --max-model-len 524288`
+ * (16.8 M tokens: a 104 GiB mirror a rank and a 13 GiB floor a card) does not fit, while 32 Claude Code sessions hold
+ * ~5 M. With the budget the blocks are handed out from the free lists as in a resident pool: a sequence still reaches
+ * --max-model-len (the budget is raised to one full context at least), and when the sum of the sequences' contexts and
+ * the cached prefixes reaches the budget the scheduler evicts and preempts as it does for a full resident pool. Nothing
+ * reads a block id as sequence x pitch: the block tables keep their --max-model-len pitch. */
+inline int64_t kvstream_ctx_budget_tokens() {
+    static const int64_t v = [] { const char* e = std::getenv("RADIANCE_FN4_KVS_CTX");
+                                  const long long t = e && *e ? std::atoll(e) : 0; return t > 0 ? (int64_t)t : (int64_t)0; }();
+    return v;
+}
+
 /* Blocks the group's context addresses: `max_seqs` sequences of `max_ctx` tokens, each rounded up
- * to whole blocks. The one definition of the id space, for the mirror's size and the ring decision
- * alike. */
+ * to whole blocks (fn4 kvs_ctx: at most the budget's blocks, at least one full context). The one
+ * definition of the id space, for the mirror's size and the ring decision alike. */
 inline int64_t kv_context_blocks(int64_t block_size, int64_t max_ctx, int64_t max_seqs) {
     if (block_size <= 0) return 0;
     const int64_t seqs = max_seqs > 0 ? max_seqs : 1;
     const int64_t ctx  = max_ctx > 0 ? max_ctx : 0;
-    return seqs * ((ctx + block_size - 1) / block_size);
+    const int64_t one  = (ctx + block_size - 1) / block_size;
+    int64_t blocks = seqs * one;
+    const int64_t bud = kvstream_ctx_budget_tokens();
+    if (bud > 0) {
+        int64_t b = (bud + block_size - 1) / block_size;
+        if (b < one) b = one;
+        if (b < blocks) blocks = b;
+    }
+    return blocks;
 }
 
 /* The group's one allocation: max(ring, stage) for `slots` resident blocks of `context_blocks`.

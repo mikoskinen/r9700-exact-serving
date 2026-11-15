@@ -317,6 +317,11 @@ int64_t KVManager::ceiling(int64_t ctx) const {
         int64_t blocks = max_seqs_ * ((ctx + p.block_size - 1) / p.block_size);
         if (p.kind == RAD_KV_WINDOW && !p.runtime_win && p.window_blocks > 0)
             blocks = std::min(blocks, window_pool_cap(p));
+        /* fn4 kvs_ctx: a streamed group and its dense-read sibling address the id space kv_context_blocks gives (the
+         * budget when RADIANCE_FN4_KVS_CTX is set; the carve takes the same), so the probe prices that, not
+         * max_seqs full contexts. A resident pool (nothing streams) is never capped by the budget. */
+        if (stream_.windowed(p.index) || kvstream_dense(p, plans_, stream_))
+            blocks = std::min(blocks, kv_context_blocks(p.block_size, ctx, max_seqs_));
         need += kv_ceiling_bytes(p, blocks, stream_.resident_blocks(p));
     }
     /* The streamed groups' maps come out of this pool too (kvstream/carve.h). */
