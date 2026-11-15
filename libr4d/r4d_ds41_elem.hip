@@ -20,6 +20,7 @@
 #include "r4d_args.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
+#include "r4d_ds41_f32pf.h"   /* lever SPD-F: ds41_f32dec's router form (rgs_emit) */
 #include "r4d_ds41_pcn.h"
 #include "r4d_ds41_qrt.h"
 #include "r4d_gemm_f32_tile.h"
@@ -1805,6 +1806,26 @@ int rgs_emit(RadStream stream, const RadTensor& x, const RadTensor& w, const Rad
              (int32_t*)off.data, (int32_t*)cnt.data, inv ? (int32_t*)inv->data : (int32_t*)nullptr, nl, k, norm,   \
              factor, base, prot, ctr)
 #define RGS_I(R, C, U, NW) (inv ? RGS_L(R, C, U, NW, true) : RGS_L(R, C, U, NW, false))
+    /* lever SPD-F (ds41-etp-spd, r4d_ds41_f32pf.h): ds41_f32dec's form -- the tile R x C a wave (U steps of k) and the
+     * waves a workgroup NW (the tail's waves too: a row a wave, wrapping; the sort's result does not depend on NW).
+     * Which wave of which workgroup forms a logit changes none of its arithmetic: the stock bytes at every form. */
+    switch (r4d_f32dec_rgs_form(m)) {
+        case 1: return RGS_I(8, 2, 8, 16u);
+        case 2: return RGS_I(8, 4, 8, 16u);
+        case 3: return RGS_I(4, 4, 8, 16u);
+        case 4: return RGS_I(4, 2, 8, 16u);
+        case 5: return RGS_I(2, 4, 16, 16u);
+        case 6: return RGS_I(4, 4, 8, 8u);
+        case 7: return RGS_I(2, 4, 16, 8u);
+        case 8: return RGS_I(4, 8, 8, 16u);
+        case 9: return RGS_I(2, 2, 16, 8u);    /* the stock forms, for the bench */
+        case 10: return RGS_I(2, 2, 16, 16u);
+        case 11: return RGS_I(8, 1, 8, 16u);
+        case 12: return RGS_I(4, 2, 16, 8u);
+        case 13: return RGS_I(1, 4, 16, 8u);
+        case 14: return RGS_I(2, 8, 16, 8u);
+        default: break;
+    }
     /* the stock gemm_f32_body's tile form for the height (2x2 with 16 steps up to 16 rows, 8x1 with 8 steps below
      * 64); the waves a workgroup router_scored_scatter_emit's (a wave a row up to 16 rows; 16 waves above, the rows
      * wrapping -- 32 would cap the GEMM's registers) */

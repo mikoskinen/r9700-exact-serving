@@ -34628,6 +34628,7 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
 #include "r4d_selftest_i11.inc"   /* ds41-int11: lever 1U-MX, mhc_mix's wide-wave decode form byte for byte (--case mix_wv) */
 #include "r4d_selftest_gq.inc"    /* ds41-int11: lever 1U-GQ, gemm_nt_ggml_pair vs two gemm_nt_ggml (--case gq_pair) */
 #include "r4d_selftest_fuse.inc"  /* ds41-fuse: levers FUSE-R / FUSE-M byte for byte vs the stock launches + per-call times (--case rfuse / mixfin) */
+#include "r4d_selftest_spd.inc"   /* ds41-etp-spd: lever SPD-F, the decode band's f32 projection forms byte for byte + per-call times (--case spdf32) */
 #include "r4d_selftest_a4.inc"    /* ds41-a4: lever A4, the gg_gemv_m16 forms (--mrcheck16, --perfm16) */
 #include "r4d_selftest_wmg.inc"   /* ds41-wmgate (bench): the WMMA form at decode heights (--perfwmg, --wmgcheck) */
 
@@ -35916,6 +35917,7 @@ static void device_phase(const Plugin& pl) {
     i11_cases(pl);   /* ds41-int11 (r4d_selftest_i11.inc / _gq.inc): levers 1U-MX and 1U-GQ */
     gq_cases(pl);
     fuse_cases(pl);   /* ds41-fuse (r4d_selftest_fuse.inc): levers FUSE-R and FUSE-M */
+    spd_cases(pl);    /* ds41-etp-spd (r4d_selftest_spd.inc): lever SPD-F (only when named: --case spdf32) */
     /* --- byte rows: the KV tier's transfer pair --- */
     /* Pack and unpack a pool, the real layout in miniature: a "layer" is `rows` blocks of `n`
      * bytes, a session's blocks are scattered through it, and exactly those blocks must come back.

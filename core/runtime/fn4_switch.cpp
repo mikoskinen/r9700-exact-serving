@@ -36,7 +36,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
                                         "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
-                                        "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng" };
+                                        "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng", "ds41_f32dec" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -52,7 +52,8 @@ bool plugin_switch(int i) {
            i == kDs41MixFin ||  /* ds41_mix_fin (69, ds41-fuse): libr4d (lever FUSE-M) */
            i == kDs41Wmk ||     /* ds41_wmk (71, ds41-wmk2): libr4d (lever WMK) */
            i == kDs41Moe1 ||    /* ds41_moe1 (72 here, 71 on ds41-p1pass): deepseek41 (lever P) */
-           i == kExl3Dng;       /* exl3_dng (75 on ds41-etp-spb, 76 here after lever G): exl3r4d (SPB-G) */
+           i == kExl3Dng ||     /* exl3_dng (75 on ds41-etp-spb, 76 here after lever G): exl3r4d (SPB-G) */
+           i == kDs41F32Dec;    /* ds41_f32dec (73 on ds41-etp-spd, 77 here after the night stack): libr4d (lever SPD-F) */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -801,7 +802,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, epoch_bump)";
         return false;
     }
     State& s = st();

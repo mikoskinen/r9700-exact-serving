@@ -553,7 +553,7 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
 # this build: cfg_stub.cpp defines them at their axis defaults, in both arms below.
 set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres
                   dsa m2xfp4 lili ds41idx ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin
-                  ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv)
+                  ds41pf ds41walk ds41wsamp ds41i9b ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
@@ -603,6 +603,7 @@ else()
                 ${R4D_EMU}/test_ds41i11.cpp ${R4D_EMU}/test_ds41gq.cpp ${R4D_EMU}/test_ds41xpush.cpp
                 ${R4D_EMU}/test_ds41a4.cpp ${R4D_EMU}/test_ds41fuse.cpp ${R4D_EMU}/test_ds41p1.cpp
                 ${R4D_EMU}/test_ds41dkv.cpp
+                ${R4D_EMU}/test_ds41spd.cpp
                 ${R4D_EMU}/cfg_stub.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
@@ -642,7 +643,7 @@ endif()
 if(R4D_EMU_BUILT)
   foreach(t pick norm escale qsa lora f32 mhc fp8f32 kda moemx mla moefuse kvres dsa m2xfp4 lili ds41idx
             ds41attn ds41mr argts ds41fold ds41vram dspark ds41fold2 ds41drk ds41kvwin ds41pf ds41walk ds41wsamp ds41i9b
-            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv)
+            ds41arc ds41i11 ds41gq ds41xpush ds41a4 ds41fuse ds41p1 ds41dkv ds41spd)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
   # DeepSeek-V4.1's indexer: the candidate restriction and the row split, held to libref too.
@@ -695,6 +696,9 @@ if(R4D_EMU_BUILT)
   # ds41-p1pass: lever P -- the MoE gather of a 17 .. 48-row decode step as ONE pass (the two-shot list words, moe_gather)
   # against today's pieces of <= 16 rows, byte for byte per token and rank.
   set_tests_properties(r4d_emu_ds41p1 PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
+  # ds41-etp-spd: lever SPD-F -- the decode band's f32 projection forms (the router's fused launch, gemm_nt_f32) pinned by
+  # r4d_f32dec_pin against the stock forms, byte for byte.
+  set_tests_properties(r4d_emu_ds41spd PROPERTIES LABELS "r4d_emu" TIMEOUT 3000)
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
   foreach(k 0 1 2)

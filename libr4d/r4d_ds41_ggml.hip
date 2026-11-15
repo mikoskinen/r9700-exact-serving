@@ -4411,6 +4411,9 @@ extern "C" void r4d_gg_gemv_pin(int rpw, int grid) {
  * load); the stock WMMA kernel's bits. Lever GPF-b:
  * "f32_pf" 0 / 1 / a form code 20.., gemm_nt_f32's prefill rows in r4d_ds41_f32pf.hip's tiled form (RADIANCE_DS41_F32_PF
  * at load); the stock gemm_nt_f32's bits for f32 and bf16 weights. */
+/* Lever SPD-F (ds41-etp-spd, r4d_ds41_f32pf.h): "ds41_f32dec" 0 / 1 / 2 / 3 -- the decode band's f32 projections (the router's
+ * fused launch, gemm_nt_f32) in wider forms: 1 both, 2 the router only, 3 gemm_nt_f32 only (RADIANCE_DS41_F32DEC at load);
+ * the stock bytes. */
 /* Levers IX-LDSR2 / IX-NI (ds41-int9b, r4d_ds41_sparse.hip): "ix_lds" 0 / 1, index_score's LDS form (keys unpacked once a
  * workgroup, two rows a wave; the stock form's bits); "ix_ni" 0 / 1, no -inf past a row's reach in index_score's plane and
  * index_candidates reading below it only (the selection's bits). */
@@ -4453,6 +4456,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "gg_gemv")) return gg_gemv_known(value) ? 1 : -1;
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_known(value) ? 1 : -1;
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_known(value) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_f32dec")) return r4d_f32dec_known(value) ? 1 : -1;   /* lever SPD-F */
     if (!std::strcmp(name, "drafter_mx") || !std::strcmp(name, "drafter_bf")) return value == 0 || value == 1 ? 1 : -1;
     return 0;
 }
@@ -4470,6 +4474,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (!std::strcmp(name, "drafter_mx")) { r4d_mx_mr_set(value); return 1; }
     if (!std::strcmp(name, "drafter_bf")) { r4d_bf_pf_set(value); return 1; }
     if (!std::strcmp(name, "gg_pf")) return r4d_gg_pf_set(value);
+    if (!std::strcmp(name, "ds41_f32dec")) return r4d_f32dec_set(value);
     if (!std::strcmp(name, "f32_pf")) return r4d_f32pf_set(value);
     g_gg_gemv.store(value, std::memory_order_relaxed);
     r4d_gg_mr_set(value == 2);   /* lever D2's form runs ahead of gg_gemm's stock launch while on */
@@ -4493,6 +4498,7 @@ extern "C" int rad_fn4_value(const char* name, int* applied) {
     if (!std::strcmp(name, "drafter_bf")) { *applied = r4d_bf_pf_get(); return 1; }
     if (!std::strcmp(name, "gg_pf")) { *applied = r4d_gg_pf_get(); return 1; }
     if (!std::strcmp(name, "f32_pf")) { *applied = r4d_f32pf_get(); return 1; }
+    if (!std::strcmp(name, "ds41_f32dec")) { *applied = r4d_f32dec_get(); return 1; }
     return 0;
 }
 
