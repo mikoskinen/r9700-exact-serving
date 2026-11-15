@@ -106,9 +106,9 @@ docker run -d --name deepseek --init --network host \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/ds41-exl3:/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
   --env-file run/deepseek/deepseek.env \
-  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-5e86593e \
-  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --served-model-name deepseek-v4.1-flash \
-  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-5f60dee1 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --vision-tower-placement ram \
+  --served-model-name deepseek-v4.1-flash --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact \
   --placement expert_tiered --host-pool-mib 19456 --ngram-placement ram=/ngram \
   --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
   --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
@@ -120,7 +120,9 @@ run/switches.sh run/deepseek/switches.json
 
 The server is ready in about five minutes, most of which goes to writing the 103 GiB n-gram table to
 `/dev/shm/ds41ng`. A request can use up to 1,048,576 tokens of context, and the KV cache has room
-for 4,427,562 tokens, which is 4.2 full-length sessions at once.
+for 4,380,530 tokens, which is 4.2 full-length sessions at once. The server also accepts pictures as
+`image_url` parts with a data URL, and `--vision-tower-placement ram` keeps the vision tower in host
+memory.
 
 ### Check the answer
 
@@ -195,8 +197,8 @@ echo "187ae8186cc1f2ba8bce96565592af7fc6f6ec91c9ece6b4d352eaf0432ee26f  qwen3.8-
 ```
 
 DeepSeek runs from [mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad)
-(272.3 GB in six parts) and two small files that the engine loads with it. The download needs about
-320 GB of free disk while the parts are joined:
+(273.2 GB in six parts) and two small files that the engine loads with it. The download needs about
+322 GB of free disk while the parts are joined:
 
 ```bash
 hf download mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad --local-dir ~/models/ds41-exl3
@@ -207,10 +209,13 @@ done
 sha256sum -c SHA256SUMS
 ```
 
-The DeepSeek file was converted from the routed experts of the `2.25bpw` branch of
-[turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3)
-and every other weight of [bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad),
-an uncensored build of the same model.
+The DeepSeek file has the routed experts of the `2.25bpw` branch of
+[turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3),
+and every other weight, the vision tower included, is converted from the official release
+[deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017).
+To build the file yourself, follow
+[Build it yourself](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad#build-it-yourself)
+on the model card, which uses the scripts and inputs in [run/deepseek/build/](run/deepseek/build/).
 
 ## Where things are
 

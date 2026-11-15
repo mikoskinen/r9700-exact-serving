@@ -51,7 +51,7 @@ Every target in the table is met at both settings [S16]. The README rounds decod
 prefill to the nearest 10 tok/s.
 
 Each column comes from one server start of the image cbea3b0178df
-(`ghcr.io/mikoskinen/r9700-exact-serving:deepseek-5e86593e`) with the README's `docker run` command
+(`ghcr.io/mikoskinen/r9700-exact-serving:deepseek-5e86593e`) with the start command in its run folder
 and `run/switches.sh`. The start log reports a KV cache of 6.01 GiB a card with room for 4,427,562
 tokens, 4.2 sessions of 1,048,576 tokens. The cards cool to 45 °C or less before the start and before
 each speed section. The stock start sets every card to the values of `run/power.sh 300` and checks
@@ -306,7 +306,7 @@ its own history.
 
 | branch prefix | upstream | contents |
 |---|---|---|
-| `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 134 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit 5e86593e, which `deepseek/current` contains. |
+| `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 135 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit 5f60dee1, which `deepseek/current` contains. |
 | `qwen/` | radiance main (451b136) | 21 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. The README's Qwen image is built from engine commit 4f74a8fa, which `qwen/current` contains. |
 | `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 29 branches of EXL3 kernel work for both lines. The README's DeepSeek image uses EXL3 commit 4a67be32, which `exl3/current` contains, and the Qwen image uses `exl3/fn4-dual`. |
 

@@ -1,0 +1,13 @@
+# dlw-q8_0.recipe (11.11.2026, lever DLW, ds41-dlw) -- rad-sidecar's rules for the DSpark drafter's dense linears of
+# deepseek-v4.1-flash-1017-exl3-2.25bpw.rad (plain bf16 there) as llama.cpp's q8_0 (libquant's ggml quantiser, no imatrix):
+# the context pass's fc and, per stage blk.40-42, the query pass's attention (q_a, q_b, kv, o_a groups, o_b) and the shared
+# expert (gate_up, down). Not here: the routed experts (MXFP4 already), the router and hc mixes (f32), the norms, the Markov
+# tables (bf16 gather tables the walk reads by row). Only proposals change; verify keeps the output.
+dspark.fc.weight                  ggml  type=q8_0
+blk.4?.attn_q_a.weight            ggml  type=q8_0
+blk.4?.attn_q_b.weight            ggml  type=q8_0
+blk.4?.attn_kv.weight             ggml  type=q8_0
+blk.4?.attn_output_a.g?.weight    ggml  type=q8_0
+blk.4?.attn_output_b.weight       ggml  type=q8_0
+blk.4?.ffn_gate_up_shexp.weight   ggml  type=q8_0
+blk.4?.ffn_down_shexp.weight      ggml  type=q8_0
