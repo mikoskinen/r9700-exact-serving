@@ -2460,10 +2460,14 @@ __device__ __forceinline__ void ds_w8_unpack64(const DsW8Raw& r, uint4 (&o)[8]) 
  * DsAttnArgsU): a selection tile whose valid keys the latent_unpack plan all holds reads those rows of a.lu as plain
  * bf16 (the window tiles' loads); bit 16 of the tile's vmask word marks one that does not (packed, as before). The
  * same bf16 values reach the same WMMAs either way, so the same bits. */
-template <bool LO, bool NV, bool W8 = false, bool FU = false, bool UX = false>
+/* NL (lever DKV-U, UX only): no transposing LDS (the launch gives none: the plain form's occupancy) -- a packed tile's
+ * transposed rows kt are decoded lane by lane straight from the entries' code and scale bytes (each value's v3 decode,
+ * the same bf16 bits the LDS transpose hands over); slower a packed tile, for passes the plan holds wholly. */
+template <bool LO, bool NV, bool W8 = false, bool FU = false, bool UX = false, bool NL = false>
 __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::conditional_t<UX, DsAttnArgsU, DsAttnArgs> a,
                                                                        float sl2) {
     static_assert(!UX || (NV && !W8), "the unpacked plan reads the packed latent beside a bf16 window");
+    static_assert(!NL || UX, "the LDS-free packed tile is the unpacked plan's fallback");
     constexpr int D = kDsAttnD;
     constexpr float kL2e = 1.4426950408889634f;
     const int nkt = (a.nk + 15) >> 4, nkk = nkt * 16;
@@ -2581,6 +2585,31 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 if (W8 && t < wtk) ds_w8_unpack64(kw8, kn);
                 else if constexpr (FU) ds_nv4_unpack64_fast(kr, kn);
                 else ds_nv4_unpack64(kr, kn);
+              if constexpr (NL) {
+                /* kt[j] of lane L: keys 8 (L / 16) + e at column c0 + 8 ((L / 8) & 1) + 16 j + L % 8, each decoded from its
+                 * entry: code byte col / 2 (nibble col & 1), scale byte 256 + col / 16 (the 8 j's scales are 8 bytes in a row) */
+                const int off = 8 * ((lane >> 3) & 1) + (lane & 7);
+                uint32_t kw[8][4];
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) kw[j][q] = 0u;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned char* b = (const unsigned char*)kp[t * 16 + 8 * hf + e];
+                    const uint2 sc = *(const uint2*)(b + kDsAttnD / 2 + c0 / 16);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int col = c0 + off + 16 * j;
+                        const uint32_t code = ((uint32_t)b[col / 2] >> (4 * (col & 1))) & 15u;
+                        const uint32_t sb = ((j < 4 ? sc.x : sc.y) >> (8 * (j & 3))) & 0xffu;
+                        const uint32_t v = __builtin_bit_cast(uint32_t, ds_nv4_val(code, ds_e4m3_half(sb))) >> 16;
+                        kw[j][e >> 1] |= (e & 1) ? (v << 16) : v;
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) kt[j] = make_uint4(kw[j][0], kw[j][1], kw[j][2], kw[j][3]);
+              } else {
                 /* key kq's columns c0 + 64 hf + 8 i + e -> T[64 hf + 8 i + e][kq] */
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
@@ -2599,6 +2628,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                     kt[j] = *(const uint4*)(tw + (col * 16 + 8 * hf) * 2);
                 }
                 ds_wave_sync();                      /* the reads before the next tile's writes */
+              }
             } else {
                 const uint16_t* pt = kp[t * 16 + ktr] + dtr;
 #pragma unroll
@@ -3443,6 +3473,16 @@ int ds_nvfast() {
     return n;
 }
 
+/* Lever DKV-U's LDS knob: RADIANCE_DS41_DKV_NOLDS=1 (read once; unset: 0): the unpacked attention's WMMA form without the
+ * transposing LDS (NL: the plain form's LDS and occupancy; a packed tile decoded lane by lane). */
+int ds_dkv_nolds() {
+    static const int n = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DKV_NOLDS");
+        return e && *e ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+
 /* Lever DKV-U: the `unpacked` operand as the plan's rows -- [rows][k D] bf16, rows packed one after another (the plan
  * indexes them as one run of rows x k entries), 16-byte aligned; false: not a plan (the op runs without it). */
 bool lu_operand(const RadTensor* u, long* cap) {
@@ -3667,6 +3707,9 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
                 static_cast<DsAttnArgs&>(u) = s;
                 u.lu = (uint16_t*)lu->data;
                 u.lucap = cap;
+                if (ds_dkv_nolds() > 0)   /* the LDS-free packed tiles: the plain form's LDS */
+                    return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true, true>), grid,
+                                    dim3(128), (uint32_t)(ds_wm_sbuf_off(nkt) + kWmSbufBytes), u, sl2);
                 return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true>), grid, dim3(128),
                                 (uint32_t)lds, u, sl2);
             }
