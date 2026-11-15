@@ -43,84 +43,10 @@ voltage offset, and the everyday setting caps each card at 210 W with a -50 mV v
 | Prefill 64k | 5,980 | 5,480 | 9,540 | 9,220 |
 | Prefill 128k | 6,330 | 5,640 | 9,400 | 9,090 |
 
-## What exact means
-
-Exact means the output is byte-identical to each model's reference engine, and a prompt gets the same
-answer alone or next to other requests. This matters for a coding agent, whose answer to the same
-context shouldn't change because other sessions are running on the same cards. DeepSeek's reference
-is the build of 15.11.2026, and in a 33-minute run under load all 160 of its answers stay identical.
-Qwen's answers to 20 short prompts and to 12 long prompts of up to 5,934 tokens stay identical beside
-up to 31 other requests.
-
-## Hardware changes
-
-Raw values are in [docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md).
-
-- **Same-size DIMMs:** replacing mixed 4 x 32 GB and 4 x 64 GB DIMMs with 8 x 64 GB put all eight
-  memory channels in one interleave set, which raised CPU read bandwidth from 35.9 to 104 GB/s and
-  two-card host-to-GPU copies from 45.1 to 55.4 GB/s.
-- **One card per IO-die quadrant:** moving three cards onto risers so that every quadrant has its own
-  card raised four-card host-to-GPU copies from 61.3 to 105.3 GB/s, because two cards in one quadrant
-  share a root port of about 36 GB/s.
-- **CPU idle states and governor:** disabling every idle state with an exit latency of 100 µs or more
-  and setting the `performance` governor at boot removed a random ~16 % slowdown (Qwen at 8 users went
-  from ~630 to ~750 tok/s).
-- **The CPU swap that didn't help:** an EPYC 7302P in place of the 7282 on the mixed DIMMs moved
-  two-card copies from 44.2 to 45.1 GB/s and made a two-card Qwen server 5.7 % slower at 16 users,
-  because the 2-channel memory regions were the limit.
-
-## Software changes
-
-Each of these changes keeps the output exact, and [registry/](registry/) lists every tested
-change, the rejected ones included:
-
-- **Batch-invariant kernels:** Qwen's batch-invariant kernel set makes each answer independent of the
-  other requests in a step and also cuts the 16-user step time from 37.95 to 35.70 ms (-5.9 %) against
-  the kernels it replaced.
-- **Interleaved all-reduce push:** the exact four-card all-reduce now pushes each card's data to every
-  peer in one interleaved pass instead of one link at a time, which cut a 42 MB all-reduce from 3,436
-  to 2,508 µs (-27 %).
-- **Prefill skip above the last cache source:** DeepSeek's layers 21 to 39 write almost no cache that
-  later tokens read, so a cold prefill runs them only for the end of the prompt.
-  The time to first token for a 136k-token prompt fell from 50.5 to 33.3 s (-34 %).
-- **Expert residency:** giving DeepSeek's spare VRAM to resident expert weights instead of holding it
-  back for swapping experts in and out raised 8-user throughput from 143.9 to 169.5 tok/s (+17.8 %).
-- **Sequence-parallel prefill stages:** in Qwen prefill each card runs the hyper-connection stages on a
-  quarter of the rows between a reduce-scatter and an all-gather, which raised 64k prefill from 8,293
-  to 8,754 tok/s (+5.7 %).
-
-## Model weights
-
-Qwen runs from a ready file, [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3)
-(120.5 GB):
-
-```bash
-hf download Dyluhn/qwen3.8-flash-next-exl3 qwen3.8-flash-next-exl3.rad --local-dir ~/models/flashnext-exl3
-cd ~/models/flashnext-exl3
-echo "187ae8186cc1f2ba8bce96565592af7fc6f6ec91c9ece6b4d352eaf0432ee26f  qwen3.8-flash-next-exl3.rad" | sha256sum -c
-```
-
-DeepSeek runs from [mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad)
-(272.3 GB in six parts) and two small files that the engine loads with it. The download needs about
-320 GB of free disk while the parts are joined:
-
-```bash
-hf download mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad --local-dir ~/models/ds41-exl3
-cd ~/models/ds41-exl3
-for p in deepseek-v4.1-flash-1017-exl3-2.25bpw.rad.part-0[0-5]; do
-  cat "$p" >> deepseek-v4.1-flash-1017-exl3-2.25bpw.rad && rm "$p"
-done
-sha256sum -c SHA256SUMS
-```
-
-The DeepSeek file was converted from the routed experts of the `2.25bpw` branch of
-[turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3)
-and every other weight of [bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad),
-an uncensored build of the same model.
-
 ## Run it
 
 Both models listen on port 8090 and use all four cards, so you run one at a time.
+[Model weights](#model-weights) has the download commands for the files the commands below mount.
 
 ### Host setup
 
@@ -211,6 +137,81 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 
 For Qwen, use `"model": "qwen3.8-flash-next"`, and the answer is "The capital of Australia is
 Canberra. It officially became the capital in 1913 when the city was formally named and established."
+
+## What exact means
+
+Exact means the output is byte-identical to each model's reference engine, and a prompt gets the same
+answer alone or next to other requests. This matters for a coding agent, whose answer to the same
+context shouldn't change because other sessions are running on the same cards. DeepSeek's reference
+is the build of 15.11.2026, and in a 33-minute run under load all 160 of its answers stay identical.
+Qwen's answers to 20 short prompts and to 12 long prompts of up to 5,934 tokens stay identical beside
+up to 31 other requests.
+
+## Hardware changes
+
+Raw values are in [docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md).
+
+- **Same-size DIMMs:** replacing mixed 4 x 32 GB and 4 x 64 GB DIMMs with 8 x 64 GB put all eight
+  memory channels in one interleave set, which raised CPU read bandwidth from 35.9 to 104 GB/s and
+  two-card host-to-GPU copies from 45.1 to 55.4 GB/s.
+- **One card per IO-die quadrant:** moving three cards onto risers so that every quadrant has its own
+  card raised four-card host-to-GPU copies from 61.3 to 105.3 GB/s, because two cards in one quadrant
+  share a root port of about 36 GB/s.
+- **CPU idle states and governor:** disabling every idle state with an exit latency of 100 µs or more
+  and setting the `performance` governor at boot removed a random ~16 % slowdown (Qwen at 8 users went
+  from ~630 to ~750 tok/s).
+- **The CPU swap that didn't help:** an EPYC 7302P in place of the 7282 on the mixed DIMMs moved
+  two-card copies from 44.2 to 45.1 GB/s and made a two-card Qwen server 5.7 % slower at 16 users,
+  because the 2-channel memory regions were the limit.
+
+## Software changes
+
+Each of these changes keeps the output exact, and [registry/](registry/) lists every tested
+change, the rejected ones included:
+
+- **Batch-invariant kernels:** Qwen's batch-invariant kernel set makes each answer independent of the
+  other requests in a step and also cuts the 16-user step time from 37.95 to 35.70 ms (-5.9 %) against
+  the kernels it replaced.
+- **Interleaved all-reduce push:** the exact four-card all-reduce now pushes each card's data to every
+  peer in one interleaved pass instead of one link at a time, which cut a 42 MB all-reduce from 3,436
+  to 2,508 µs (-27 %).
+- **Prefill skip above the last cache source:** DeepSeek's layers 21 to 39 write almost no cache that
+  later tokens read, so a cold prefill runs them only for the end of the prompt.
+  The time to first token for a 136k-token prompt fell from 50.5 to 33.3 s (-34 %).
+- **Expert residency:** giving DeepSeek's spare VRAM to resident expert weights instead of holding it
+  back for swapping experts in and out raised 8-user throughput from 143.9 to 169.5 tok/s (+17.8 %).
+- **Sequence-parallel prefill stages:** in Qwen prefill each card runs the hyper-connection stages on a
+  quarter of the rows between a reduce-scatter and an all-gather, which raised 64k prefill from 8,293
+  to 8,754 tok/s (+5.7 %).
+
+## Model weights
+
+Qwen runs from a ready file, [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3)
+(120.5 GB):
+
+```bash
+hf download Dyluhn/qwen3.8-flash-next-exl3 qwen3.8-flash-next-exl3.rad --local-dir ~/models/flashnext-exl3
+cd ~/models/flashnext-exl3
+echo "187ae8186cc1f2ba8bce96565592af7fc6f6ec91c9ece6b4d352eaf0432ee26f  qwen3.8-flash-next-exl3.rad" | sha256sum -c
+```
+
+DeepSeek runs from [mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad)
+(272.3 GB in six parts) and two small files that the engine loads with it. The download needs about
+320 GB of free disk while the parts are joined:
+
+```bash
+hf download mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad --local-dir ~/models/ds41-exl3
+cd ~/models/ds41-exl3
+for p in deepseek-v4.1-flash-1017-exl3-2.25bpw.rad.part-0[0-5]; do
+  cat "$p" >> deepseek-v4.1-flash-1017-exl3-2.25bpw.rad && rm "$p"
+done
+sha256sum -c SHA256SUMS
+```
+
+The DeepSeek file was converted from the routed experts of the `2.25bpw` branch of
+[turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3)
+and every other weight of [bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad),
+an uncensored build of the same model.
 
 ## Where things are
 
