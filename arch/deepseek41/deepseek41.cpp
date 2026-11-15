@@ -533,7 +533,7 @@ struct XpmRec {
 };
 struct Xpm {
     bool on = false;
-    std::string path;
+    std::string path, ctl;
     FILE* fb = nullptr;
     FILE* ft = nullptr;
     int64_t min_rows = 256, max_rows = 2112, tsteps = 6, dsteps = 12, real_layers = 2;
@@ -4879,6 +4879,7 @@ static int xpm_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     t.tsteps = std::max<int64_t>(0, xpm_env("RADIANCE_DS41_XPM_TSTEPS", 6));
     t.dsteps = std::max<int64_t>(0, xpm_env("RADIANCE_DS41_XPM_STEPS", 12));
     t.real_layers = std::max<int64_t>(0, xpm_env("RADIANCE_DS41_XPM_REAL", 2));
+    if (const char* e = std::getenv("RADIANCE_DS41_XPM_CTL")) t.ctl = e;
     t.plane = decl_b(b, m.nm.f("xpm_plane"), RAD_I32, { m.g.max_tok, 2 }, RAD_BUF_PERSIST);
     if (!t.plane) return RAD_E_INVAL;
     t.trace = fused(b, "bi_rowhash", { RAD_RANGE("M", 1, m.g.max_tok) }, {}, { m.mw.ids }, { t.plane });
@@ -4912,7 +4913,18 @@ static void xpm_begin(RadCtx* x, Model& m, const RadBatch* b) {
     t.marks.clear();
     t.pool_used = 0;
     if (!t.on || rad_rank(x) != 0 || b->draft_pass != 0 || b->n_tok < t.min_rows || b->n_tok > t.max_rows) return;
-    if (t.tdone < t.tsteps) t.mode = 1;
+    /* RADIANCE_DS41_XPM_CTL=<file> (optional): its first character picks the mode of every eligible step -- 't' timing,
+     * 'd' dump (still at most XPM_STEPS dumps in all), anything else or no file: none; unset, the counts above decide */
+    if (!t.ctl.empty()) {
+        char ch = 0;
+        if (FILE* f = fopen(t.ctl.c_str(), "r")) {
+            ch = (char)fgetc(f);
+            fclose(f);
+        }
+        if (ch == 't') t.mode = 1;
+        else if (ch == 'd' && t.ddone < t.dsteps) t.mode = 2;
+        else return;
+    } else if (t.tdone < t.tsteps) t.mode = 1;
     else if (t.ddone < t.dsteps) t.mode = 2;
     else return;
     if (t.mode == 2 && !t.dx) {
