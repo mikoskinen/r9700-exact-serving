@@ -60,15 +60,17 @@
 #include "r4d_launch.h"
 
 #include <hip/hip_runtime.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 
 namespace {
 
 constexpr int kThreads = 1024;
 /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md): the free list is built when more slots than this are occupied (below it the
- * serial scan skips little); CLOCK runs in rotations (4b) when kVicClock. */
+ * serial scan skips little). The switch (rad_fn4_switch("kvs_vic"), RADIANCE_FN4_KVS_VIC at start; 0 = today's serial
+ * victim search) is the launch's `vic`. */
 constexpr int kVicListMin = 256;
-constexpr bool kVicClock = true;
 
 /* A 16-byte vector as a builtin type: `uint4` copies through a memcpy call, which keeps a load and
  * its store adjacent, and the miss copy needs its four loads issued first (step 6). */
@@ -186,7 +188,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     int32_t* __restrict__ slot_state, int32_t* __restrict__ ctl,
     const uint8_t* __restrict__ host, uint8_t* __restrict__ cache,
     int32_t* __restrict__ miss_block, int32_t* __restrict__ miss_slot,
-    int M, int blocks, int slots, int pitch, int bbytes, int sst_ld, int cap, int ecache) {
+    int M, int blocks, int slots, int pitch, int bbytes, int sst_ld, int cap, int ecache, int vic) {
 
     __shared__ int s_epoch, s_lookups, s_nmiss, s_distinct, s_placed, s_overflow, s_claims, s_hits;
     __shared__ int s_free;
@@ -398,7 +400,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
      * consistent maps: it needs a free unstamped slot), or fewer unstamped slots than misses. */
     int* const vlist = miss_slot + slots;   /* the row scratch's third part: `slots` slot ids */
     const int nmiss0 = claims > 0 ? s_nmiss : 0;
-    const bool vlist_on = claims > 0 && !s_overflow && s_free > 0 && slots - s_free > kVicListMin;
+    const bool vlist_on = vic && claims > 0 && !s_overflow && s_free > 0 && slots - s_free > kVicListMin;
     if (vlist_on) {
         const int nfree = kv_compact_rot(hand0, slots, vlist, slots, tid, s_cnt, s_off,
             [&](int q) { return slot_block[q] < 0 && slot_state[(size_t)q * sst_ld] != epoch; });
@@ -457,7 +459,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
                 }
                 if (victim < 0) free_left = 0;
             }
-            if (victim < 0 && !overflow && kVicClock) {
+            if (victim < 0 && !overflow && vic) {
                 /* kvs_vic 4b takes this miss and the rest (all threads, below) */
                 kc = k;
                 break;
@@ -735,7 +737,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
 static int r4d_kv_resolve_emit(long sel, long nsel, long res, long slot_block, long slot_state,
                                long ctl, long host, long cache, long miss_block, long miss_slot,
                                int M, int blocks, int slots, int pitch, int bbytes, int sst_ld,
-                               RadStream stream) {
+                               int vic, RadStream stream) {
     if (!sel || !nsel || !res || !slot_block || !slot_state || !ctl || !host || !cache ||
         !miss_block || !miss_slot)
         return R4D_NO(RAD_E_INVAL);
@@ -755,7 +757,7 @@ static int r4d_kv_resolve_emit(long sel, long nsel, long res, long slot_block, l
                     (int32_t*)sel, (const int32_t*)nsel, (int32_t*)res, (int32_t*)slot_block,
                     (int32_t*)slot_state, (int32_t*)ctl, (const uint8_t*)host, (uint8_t*)cache,
                     (int32_t*)miss_block, (int32_t*)miss_slot, M, blocks, slots, pitch,
-                    bbytes, sst_ld, cap, ecache);
+                    bbytes, sst_ld, cap, ecache, vic);
 }
 
 /* ============================================================== the plugin ABI entry point */
@@ -770,6 +772,27 @@ static int r4d_kv_block_row_bytes(const RadTensor* t, long long* out) {
     for (unsigned d = 1; d < t->rank; ++d) acc *= t->shape[d];
     *out = acc * (long long)rad_dtype_bytes(t->dtype, 1);
     return t->stride[0] * (long long)rad_dtype_bytes(t->dtype, 1) == *out ? RAD_OK : RAD_E_STRIDE;
+}
+
+/* fn4 kvs_vic (16.11.2026, qwen/KV-STREAM-EXACT.md; RADIANCE_FN4_KVS_VIC, rad_fn4_switch("kvs_vic")): 1 = step 4's victims
+ * by compaction (4a / 4b), 0 = thread 0's serial scan and sweep. The same victims either way (the placement is libref's).
+ * A launch parameter `vic` overrides it (r4d_selftest). -1 until the environment is read. */
+static std::atomic<int> g_kv_vic{-1};
+static int kv_vic(const RadArgs* a) {
+    int v = g_kv_vic.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_KVS_VIC");
+        const int on = (e && *e && std::atoi(e) > 0) ? 1 : 0;
+        int want = -1;
+        g_kv_vic.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_kv_vic.load(std::memory_order_relaxed);
+    }
+    return (int)r4d_geti_or(a, "vic", v) ? 1 : 0;
+}
+extern "C" int r4d_kv_vic_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    g_kv_vic.store(on, std::memory_order_relaxed);
+    return 1;
 }
 
 extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
@@ -845,7 +868,7 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
                                r4d_addr(st), r4d_addr(ct), r4d_addr(ho), r4d_addr(ca),
                                (long)(uintptr_t)miss_block, (long)(uintptr_t)miss_slot,
                                (int)M, (int)blocks, (int)slots, (int)pitch, (int)bbytes,
-                               (int)st->stride[0], stream);
+                               (int)st->stride[0], kv_vic(a), stream);
 }
 
 /* `next_pow2(slots)` block ids (a wide launch sorts its claims here), then `slots` slots, then `slots` ids of victim
