@@ -1,0 +1,87 @@
+2026-11-15 08:22:57 START q210c: PW 210, image radiance-local:c16-x3lpstall (25d00d1e8131), max-num-seqs 32, gpu-headroom-mib 108, 2 starts | power before: c3:00:cap=210W,vo=-50mV,j=30C,m=34C 84:00:cap=210W,vo=-50mV,j=27C,m=30C 48:00:cap=210W,vo=-50mV,j=27C,m=30C 03:00:cap=210W,vo=-50mV,j=28C,m=36C | fans before: c3:00:fan=25C/30%,50C/30%,70C/30%,85C/30%,100C/50%,2564rpm,pwm76 84:00:fan=25C/28%,50C/28%,70C/28%,85C/28%,100C/50%,2482rpm,pwm71 48:00:fan=25C/35%,50C/35%,70C/35%,85C/35%,100C/50%,2696rpm,pwm89 03:00:fan=25C/29%,50C/29%,70C/29%,85C/29%,100C/50%,2628rpm,pwm73 | env diff vs the repo: 34a35,36 > RADIANCE_FN4_BI_WIDE=15 > RADIANCE_FN4_SPSERIAL=1  | switches {"exl3_bi": 0, "exl3_dual": 1, "hc_bi": 5, "bi_seg": 2, "att_bi": 4, "arw_rows": 16, "sched_bi_chunk": 6, "hc_readv": 331, "hc_sp": 2, "ar_xpush": 1, "ar_sdma": 0, "bi_wide": 15, "sp_serial": 1}
+2026-11-15 08:22:57 POWER (everyday, read back only): 210 W, -50 mV, day fans on all four cards, fan PWM at the day curve | c3:00:cap=210W,vo=-50mV,j=30C,m=34C 84:00:cap=210W,vo=-50mV,j=27C,m=30C 48:00:cap=210W,vo=-50mV,j=27C,m=30C 03:00:cap=210W,vo=-50mV,j=28C,m=36C | c3:00:fan=25C/30%,50C/30%,70C/30%,85C/30%,100C/50%,2569rpm,pwm76 84:00:fan=25C/28%,50C/28%,70C/28%,85C/28%,100C/50%,2478rpm,pwm71 48:00:fan=25C/35%,50C/35%,70C/35%,85C/35%,100C/50%,2698rpm,pwm89 03:00:fan=25C/29%,50C/29%,70C/29%,85C/29%,100C/50%,2627rpm,pwm73
+2026-11-15 08:22:57 COOL pre-column: <= 45 C after 0 s (junction/memory C) c3:00:30/34 84:00:27/30 48:00:27/30 03:00:28/36
+2026-11-15 08:22:57 start 1: docker run (README form) from /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2q/q210c/repo
+2026-11-15 08:22:57 start 1: container 546f867d8426 | env in the container: RADIANCE_FN4_LANE_LOWPRIO= RADIANCE_FN4_AR_SDMA=0 RADIANCE_FN4_BI_WIDE=15 RADIANCE_FN4_SPSERIAL=1 ROCR_VISIBLE_DEVICES=GPU-dbba5c851cfef7b3,GPU-4d61f52cafe37588,GPU-5943fea82aeead65,GPU-27d4920317825fce
+2026-11-15 08:24:33 start 1: HEALTHY after 96 s | I[0] second lane: its stream built at start (12.3 ms on rank 0), adopted by the first step that takes lane 1 (RADIANCE_FN4_LANE_EAGER=0 builds it there instead)
+2026-11-15 08:24:33 start 1: settle: 4 settle warning lines (W 'settled at ... under the 96.00 MiB'); 
+2026-11-15 08:24:34 start 1: run/switches.sh exit 0: all 13 switches set from /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2q/q210c/switches-run.json  | read back: 13 of 13 switches = want
+2026-11-15 08:24:34 start 1: README check answer: "The capital of Australia is Canberra. It officially became the capital in 1913 when the city was formally named and established." | finish stop | reasoning "" | usage {"prompt_tokens": 35, "completion_tokens": 28, "total_tokens": 63, "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 0}}
+2026-11-15 08:24:40 start 1: warm-up 64k (the first long prefill): {"test": "prefill", "target": 65536, "rep": 1, "status": 200, "prompt_tokens": 53800, "cached": 0, "ttft": 5.823, "prefill_tps": 9239.8, "err": null}
+2026-11-15 08:26:05 start 1 cold prefill (4 blocks): 16384: A 9093 9019 | B 9062 9039 tok/s; 65536: A 9224 9136 | B 9187 9154 tok/s; 131072: A 9081 9022 | B 9060 9042 tok/s; 4 blocks, 0 flagged, 84.4 s
+2026-11-15 08:26:08 IDENTITY start 1 long greedy (greedylong 4 x 64 tok) vs the published line's (13.11. heroq LP1, fc42ad9f): IDENTICAL: 4 of 4 answers
+2026-11-15 08:26:08 start 1: decode switches before the blocks: 13 of 13 switches = want
+2026-11-15 08:28:03 start 1 decode c16 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 1090.0 1068.9 | B 1078.0 1069.2) mean 1076.5 tok/s, 4 blocks, 0 flagged, 114.6 s
+2026-11-15 08:29:33 start 1 decode c8 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 809.3 807.7 | B 819.5 803.1) mean 809.9 tok/s, 4 blocks, 0 flagged, 89.5 s
+2026-11-15 08:30:44 start 1 decode c4 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 606.4 600.7 | B 604.2 616.3) mean 606.9 tok/s, 4 blocks, 0 flagged, 71.3 s
+2026-11-15 08:31:41 start 1 decode c1 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 263.7 261.0 | B 260.5 267.8) mean 263.2 tok/s, 4 blocks, 0 flagged, 56.6 s
+2026-11-15 08:33:58 start 1 decode c24 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 1179.5 1182.9 | B 1196.9 1172.8) mean 1183.0 tok/s, 4 blocks, 0 flagged, 137.0 s
+2026-11-15 08:36:36 start 1 decode c32 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 1291.8 1287.2 | B 1297.0 1274.3) mean 1287.6 tok/s, 4 blocks, 0 flagged, 157.8 s
+2026-11-15 08:36:36 start 1: switches after the decode blocks: 13 of 13 switches = want
+2026-11-15 08:36:49 greedy a1 (conc 1): greedyset: 20 of 20 answered (conc 1, max_tokens 192, endpoint completions)
+2026-11-15 08:36:49 IDENTITY start 1 a1 vs the published line's a1 (232 ec9ffe885ac5): IDENTICAL: 20 of 20 answers
+2026-11-15 08:36:55 longid lA (beside 0 streams): {"probes": 12, "ptok": [372, 417, 592, 795, 1047, 1297, 1431, 1699, 2128, 2659, 3481, 5934], "secs": 5.9, "bg": 0, "only": "", "bg_done": 0, "bg_errors": 0, "lp": true}
+2026-11-15 08:36:55 IDENTITY start 1 long alone vs the published line's alone: start 1 long alone vs the published line's alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+2026-11-15 08:36:57 start 1: engine error lines: 0
+2026-11-15 08:36:57 start 1: switches at the end: 13 of 13 switches = want
+2026-11-15 08:37:04 start 1: down | power now: c3:00:cap=210W,vo=-50mV,j=56C,m=60C 84:00:cap=210W,vo=-50mV,j=53C,m=52C 48:00:cap=210W,vo=-50mV,j=52C,m=56C 03:00:cap=210W,vo=-50mV,j=54C,m=56C
+2026-11-15 08:37:04 start 2: docker run (README form) from /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2q/q210c/repo
+2026-11-15 08:37:04 start 2: container 3aa6bde00027 | env in the container: RADIANCE_FN4_LANE_LOWPRIO= RADIANCE_FN4_AR_SDMA=0 RADIANCE_FN4_BI_WIDE=15 RADIANCE_FN4_SPSERIAL=1 ROCR_VISIBLE_DEVICES=GPU-dbba5c851cfef7b3,GPU-4d61f52cafe37588,GPU-5943fea82aeead65,GPU-27d4920317825fce
+2026-11-15 08:38:45 start 2: HEALTHY after 101 s | I[0] second lane: its stream built at start (10.9 ms on rank 0), adopted by the first step that takes lane 1 (RADIANCE_FN4_LANE_EAGER=0 builds it there instead)
+2026-11-15 08:38:45 start 2: settle: 4 settle warning lines (W 'settled at ... under the 96.00 MiB'); 
+2026-11-15 08:38:46 start 2: run/switches.sh exit 0: all 13 switches set from /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2q/q210c/switches-run.json  | read back: 13 of 13 switches = want
+2026-11-15 08:38:46 start 2: README check answer: "The capital of Australia is Canberra. It officially became the capital in 1913 when the city was formally named and established." | finish stop | reasoning "" | usage {"prompt_tokens": 35, "completion_tokens": 28, "total_tokens": 63, "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": 0}}
+2026-11-15 08:38:52 start 2: warm-up 64k (the first long prefill): {"test": "prefill", "target": 65536, "rep": 1, "status": 200, "prompt_tokens": 53800, "cached": 0, "ttft": 5.816, "prefill_tps": 9250.9, "err": null}
+2026-11-15 08:40:17 start 2 cold prefill (4 blocks): 16384: A 9089 9031 | B 9074 9032 tok/s; 65536: A 9217 9142 | B 9181 9163 tok/s; 131072: A 9094 9033 | B 9074 9045 tok/s; 4 blocks, 0 flagged, 84.3 s
+2026-11-15 08:40:20 IDENTITY start 2 long greedy (greedylong 4 x 64 tok) vs the published line's (13.11. heroq LP1, fc42ad9f): IDENTICAL: 4 of 4 answers
+2026-11-15 08:40:20 IDENTITY start 2 long greedy vs start 1's: IDENTICAL: 4 of 4 answers
+2026-11-15 08:40:20 start 2: decode switches before the blocks: 13 of 13 switches = want
+2026-11-15 08:42:16 start 2 decode c16 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 1070.9 1081.2 | B 1079.0 1066.3) mean 1074.3 tok/s, 4 blocks, 0 flagged, 115.4 s
+2026-11-15 08:43:46 start 2 decode c8 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 810.9 813.4 | B 809.2 806.5) mean 810.0 tok/s, 4 blocks, 0 flagged, 89.6 s
+2026-11-15 08:44:55 start 2 decode c4 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 611.4 606.9 | B 604.9 605.9) mean 607.3 tok/s, 4 blocks, 0 flagged, 68.9 s
+2026-11-15 08:45:52 start 2 decode c1 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 265.2 266.6 | B 268.6 266.3) mean 266.7 tok/s, 4 blocks, 0 flagged, 56.7 s
+2026-11-15 08:48:12 start 2 decode c24 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 1185.0 1192.0 | B 1185.7 1166.3) mean 1182.2 tok/s, 4 blocks, 0 flagged, 140.0 s
+2026-11-15 08:50:51 start 2 decode c32 (4 blocks, gens 2): blocks (A1 B1 B2 A2 order: A 1283.5 1277.6 | B 1273.6 1289.9) mean 1281.2 tok/s, 4 blocks, 0 flagged, 158.6 s
+2026-11-15 08:50:51 start 2: switches after the decode blocks: 13 of 13 switches = want
+2026-11-15 08:51:04 greedy a1 (conc 1): greedyset: 20 of 20 answered (conc 1, max_tokens 192, endpoint completions)
+2026-11-15 08:51:04 IDENTITY start 2 a1 vs the published line's a1 (232 ec9ffe885ac5): IDENTICAL: 20 of 20 answers
+2026-11-15 08:51:04 IDENTITY start 2 a1 vs start 1's a1: IDENTICAL: 20 of 20 answers
+2026-11-15 08:51:10 longid lA (beside 0 streams): {"probes": 12, "ptok": [372, 417, 592, 795, 1047, 1297, 1431, 1699, 2128, 2659, 3481, 5934], "secs": 5.9, "bg": 0, "only": "", "bg_done": 0, "bg_errors": 0, "lp": true}
+2026-11-15 08:51:10 IDENTITY start 2 long alone vs the published line's alone: start 2 long alone vs the published line's alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+2026-11-15 08:51:10 IDENTITY start 2 long alone vs start 1's: start 2 long alone vs start 1's: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+2026-11-15 08:51:10 soak cycle 1: 8 requests
+2026-11-15 08:51:32 mb k1-c8 (c8, gens 2): agg 811.4 tok/s, 25.5 ms a decode step, acceptance 0.754, TTFT p50 0.16 s, 16 requests, 0 errors
+2026-11-15 08:52:46 loadid K1-r8-p8192 (beside 7 streams, prefill 8192 a probe): {"answered": 20, "of": 20, "max_tokens": 192, "offset_s": 0.5, "pf_tok_asked": 8192, "conc": 7, "pf_prompt_mean": 8038, "pf_cold": 20, "pf_ttft_mean": 1.08, "pf_ttft_min": 1.02, "pf_ttft_max": 1.24, "ov_frac_min": 0.0, "ov_frac_median": 0.375, "mixed_total": 78, "mixed_min": 1, "mixed_median": 4.0, "probes_without_mixed": [], "probe_s_mean": 2.43, "c4_requests_done": 71, "c4_errors": 0, "c4_err_fi
+2026-11-15 08:52:46 IDENTITY start 2 cycle 1: short set beside 7 streams + a fresh 8192-token prefill a probe vs a1: IDENTICAL: 20 of 20 answers
+2026-11-15 08:53:14 longid lK1-r8 (beside 7 streams): {"probes": 12, "ptok": [372, 417, 592, 795, 1047, 1297, 1431, 1699, 2128, 2659, 3481, 5934], "secs": 12.8, "bg": 7, "only": "", "bg_done": 55, "bg_errors": 0, "lp": true}
+2026-11-15 08:53:14 IDENTITY start 2 cycle 1: long prompts beside 7 streams vs alone: start 2 cycle 1: long prompts beside 7 streams vs alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+2026-11-15 08:53:14 soak cycle 2: 16 requests
+2026-11-15 08:53:43 mb k2-c16 (c16, gens 2): agg 1065.8 tok/s, 36.0 ms a decode step, acceptance 0.743, TTFT p50 0.18 s, 32 requests, 0 errors
+2026-11-15 08:55:31 loadid K2-r16-p16384 (beside 15 streams, prefill 16384 a probe): {"answered": 20, "of": 20, "max_tokens": 192, "offset_s": 0.5, "pf_tok_asked": 16384, "conc": 15, "pf_prompt_mean": 16264, "pf_cold": 20, "pf_ttft_mean": 2.06, "pf_ttft_min": 1.99, "pf_ttft_max": 2.32, "ov_frac_min": 0.0, "ov_frac_median": 0.474, "mixed_total": 118, "mixed_min": 1, "mixed_median": 4.5, "probes_without_mixed": [], "probe_s_mean": 4.09, "c4_requests_done": 135, "c4_errors": 0, "c4_e
+2026-11-15 08:55:32 IDENTITY start 2 cycle 2: short set beside 15 streams + a fresh 16384-token prefill a probe vs a1: IDENTICAL: 20 of 20 answers
+2026-11-15 08:56:06 longid lK2-r16 (beside 15 streams): {"probes": 12, "ptok": [372, 417, 592, 795, 1047, 1297, 1431, 1699, 2128, 2659, 3481, 5934], "secs": 19.3, "bg": 15, "only": "", "bg_done": 90, "bg_errors": 0, "lp": true}
+2026-11-15 08:56:06 IDENTITY start 2 cycle 2: long prompts beside 15 streams vs alone: start 2 cycle 2: long prompts beside 15 streams vs alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+2026-11-15 08:56:06 soak cycle 3: 24 requests
+2026-11-15 08:56:41 mb k3-c24 (c24, gens 2): agg 1189.0 tok/s, 46.0 ms a decode step, acceptance 0.739, TTFT p50 0.21 s, 47 requests, 0 errors
+2026-11-15 08:58:39 loadid K3-r24-p12288 (beside 23 streams, prefill 12288 a probe): {"answered": 20, "of": 20, "max_tokens": 192, "offset_s": 0.5, "pf_tok_asked": 12288, "conc": 23, "pf_prompt_mean": 12126, "pf_cold": 20, "pf_ttft_mean": 1.68, "pf_ttft_min": 1.55, "pf_ttft_max": 1.99, "ov_frac_min": 0.11, "ov_frac_median": 0.32, "mixed_total": 164, "mixed_min": 1, "mixed_median": 8.0, "probes_without_mixed": [], "probe_s_mean": 4.51, "c4_requests_done": 190, "c4_errors": 0, "c4_e
+2026-11-15 08:58:40 IDENTITY start 2 cycle 3: short set beside 23 streams + a fresh 12288-token prefill a probe vs a1: IDENTICAL: 20 of 20 answers
+2026-11-15 08:59:19 longid lK3-r24 (beside 23 streams): {"probes": 12, "ptok": [372, 417, 592, 795, 1047, 1297, 1431, 1699, 2128, 2659, 3481, 5934], "secs": 24.8, "bg": 23, "only": "", "bg_done": 114, "bg_errors": 0, "lp": true}
+2026-11-15 08:59:20 IDENTITY start 2 cycle 3: long prompts beside 23 streams vs alone: start 2 cycle 3: long prompts beside 23 streams vs alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+2026-11-15 08:59:20 soak cycle 4: 32 requests
+2026-11-15 08:59:59 mb k4-c32 (c32, gens 2): agg 1284.3 tok/s, 53.7 ms a decode step, acceptance 0.736, TTFT p50 0.25 s, 65 requests, 0 errors
+2026-11-15 09:02:23 loadid K4-r32-p16384 (beside 31 streams, prefill 16384 a probe): {"answered": 20, "of": 20, "max_tokens": 192, "offset_s": 0.5, "pf_tok_asked": 16384, "conc": 31, "pf_prompt_mean": 16264, "pf_cold": 20, "pf_ttft_mean": 2.9, "pf_ttft_min": 2.05, "pf_ttft_max": 5.14, "ov_frac_min": 0.0, "ov_frac_median": 0.452, "mixed_total": 163, "mixed_min": 1, "mixed_median": 5.0, "probes_without_mixed": [], "probe_s_mean": 5.41, "c4_requests_done": 247, "c4_errors": 0, "c4_er
+2026-11-15 09:02:23 IDENTITY start 2 cycle 4: short set beside 31 streams + a fresh 16384-token prefill a probe vs a1: IDENTICAL: 20 of 20 answers
+2026-11-15 09:03:08 longid lK4-r32 (beside 31 streams): {"probes": 12, "ptok": [372, 417, 592, 795, 1047, 1297, 1431, 1699, 2128, 2659, 3481, 5934], "secs": 30.1, "bg": 31, "only": "", "bg_done": 136, "bg_errors": 0, "lp": true}
+2026-11-15 09:03:08 IDENTITY start 2 cycle 4: long prompts beside 31 streams vs alone: start 2 cycle 4: long prompts beside 31 streams vs alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+2026-11-15 09:03:08 soak: 4 cycles in 718 s
+2026-11-15 09:03:20 greedy a2 (conc 1): greedyset: 20 of 20 answered (conc 1, max_tokens 192, endpoint completions)
+2026-11-15 09:03:20 IDENTITY start 2 a2 (after the soak) vs a1: IDENTICAL: 20 of 20 answers
+2026-11-15 09:03:22 start 2: engine error lines: 0
+2026-11-15 09:03:22 start 2: switches at the end: 13 of 13 switches = want
+2026-11-15 09:03:31 start 2: down | power now: c3:00:cap=210W,vo=-50mV,j=55C,m=60C 84:00:cap=210W,vo=-50mV,j=53C,m=52C 48:00:cap=210W,vo=-50mV,j=52C,m=56C 03:00:cap=210W,vo=-50mV,j=53C,m=56C
+2026-11-15 09:03:31 END (exit 0): stopping the server
+2026-11-15 09:03:34 kernel log in the column's window: 390 lines, 0 amdgpu / kfd / svm
+2026-11-15 09:03:34 containers now: []
+2026-11-15 09:03:34 power now (all four cards): c3:00:cap=210W,vo=-50mV,j=54C,m=60C 84:00:cap=210W,vo=-50mV,j=51C,m=52C 48:00:cap=210W,vo=-50mV,j=50C,m=56C 03:00:cap=210W,vo=-50mV,j=52C,m=56C
+2026-11-15 09:03:34 fans now (all four cards): c3:00:fan=25C/30%,50C/30%,70C/30%,85C/30%,100C/50%,2598rpm,pwm76 84:00:fan=25C/28%,50C/28%,70C/28%,85C/28%,100C/50%,2498rpm,pwm71 48:00:fan=25C/35%,50C/35%,70C/35%,85C/35%,100C/50%,2714rpm,pwm89 03:00:fan=25C/29%,50C/29%,70C/29%,85C/29%,100C/50%,2627rpm,pwm73 | day setting read back: yes
+2026-11-15 09:03:34 DONE q210c (exit 0)

@@ -1,0 +1,7 @@
+# Technical Review: CPython Standard Library Bootstrap Modules
+
+## Overview
+
+The files above are a representative slice of CPython's standard library, chosen because they are imported very early during interpreter startup or are foundational to the runtime. They fall into four rough categories:
+
+1. **`__future__.py`** — a

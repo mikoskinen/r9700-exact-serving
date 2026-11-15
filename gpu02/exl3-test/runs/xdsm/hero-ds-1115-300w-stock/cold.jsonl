@@ -1,0 +1,4 @@
+{"status": 200, "prompt_tokens": 131137, "cached": 0, "ttft": 20.72, "tokens": 64, "finish": "length", "chars": 306, "err": null, "depth": 130000}
+{"status": 200, "prompt_tokens": 137135, "cached": 0, "ttft": 21.87, "tokens": 64, "finish": "length", "chars": 345, "err": null, "depth": 136000}
+{"status": 200, "prompt_tokens": 65650, "cached": 0, "ttft": 10.97, "tokens": 64, "finish": "length", "chars": 330, "err": null, "depth": 64000}
+{"status": 200, "prompt_tokens": 15777, "cached": 0, "ttft": 3.52, "tokens": 64, "finish": "length", "chars": 323, "err": null, "depth": 16000}

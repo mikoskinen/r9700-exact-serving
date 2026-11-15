@@ -1,0 +1,1 @@
+all 70 switches set from run/deepseek/switches.json

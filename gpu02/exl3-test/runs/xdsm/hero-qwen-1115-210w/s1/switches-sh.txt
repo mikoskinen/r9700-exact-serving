@@ -1,0 +1,1 @@
+all 13 switches set from /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2q/q210c/switches-run.json

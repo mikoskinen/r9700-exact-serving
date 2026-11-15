@@ -1,0 +1,7 @@
+# Technical Review: CPython Standard Library Bootstrap Modules
+
+## Overview
+
+The files above are a representative slice of CPython's standard library, chosen mostly because they are imported very early during interpreter startup or are foundational to the rest of the library. They fall into several clusters:
+
+1. **Bootstrap / startup modules**

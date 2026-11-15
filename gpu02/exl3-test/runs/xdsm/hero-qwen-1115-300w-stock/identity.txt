@@ -1,0 +1,18 @@
+start 1 | start 1 long greedy (greedylong 4 x 64 tok) vs the published line's (13.11. heroq LP1, fc42ad9f): IDENTICAL: 4 of 4 answers
+start 1 | start 1 a1 vs the published line's a1 (232 ec9ffe885ac5): IDENTICAL: 20 of 20 answers
+start 1 | start 1 long alone vs the published line's alone: start 1 long alone vs the published line's alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+start 2 | start 2 long greedy (greedylong 4 x 64 tok) vs the published line's (13.11. heroq LP1, fc42ad9f): IDENTICAL: 4 of 4 answers
+start 2 | start 2 long greedy vs start 1's: IDENTICAL: 4 of 4 answers
+start 2 | start 2 a1 vs the published line's a1 (232 ec9ffe885ac5): IDENTICAL: 20 of 20 answers
+start 2 | start 2 a1 vs start 1's a1: IDENTICAL: 20 of 20 answers
+start 2 | start 2 long alone vs the published line's alone: start 2 long alone vs the published line's alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+start 2 | start 2 long alone vs start 1's: start 2 long alone vs start 1's: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+start 2 | start 2 cycle 1: short set beside 7 streams + a fresh 8192-token prefill a probe vs a1: IDENTICAL: 20 of 20 answers
+start 2 | start 2 cycle 1: long prompts beside 7 streams vs alone: start 2 cycle 1: long prompts beside 7 streams vs alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+start 2 | start 2 cycle 2: short set beside 15 streams + a fresh 16384-token prefill a probe vs a1: IDENTICAL: 20 of 20 answers
+start 2 | start 2 cycle 2: long prompts beside 15 streams vs alone: start 2 cycle 2: long prompts beside 15 streams vs alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+start 2 | start 2 cycle 3: short set beside 23 streams + a fresh 12288-token prefill a probe vs a1: IDENTICAL: 20 of 20 answers
+start 2 | start 2 cycle 3: long prompts beside 23 streams vs alone: start 2 cycle 3: long prompts beside 23 streams vs alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+start 2 | start 2 cycle 4: short set beside 31 streams + a fresh 16384-token prefill a probe vs a1: IDENTICAL: 20 of 20 answers
+start 2 | start 2 cycle 4: long prompts beside 31 streams vs alone: start 2 cycle 4: long prompts beside 31 streams vs alone: IDENTICAL 12 / 12 (texts + finish + logprobs; prompts 372/417/592/795/1047/1297/1431/1699/2128/2659/3481/5934 tokens)
+start 2 | start 2 a2 (after the soak) vs a1: IDENTICAL: 20 of 20 answers

@@ -1,0 +1,3 @@
+# Technical Review: CPython Standard Library Bootstrap Modules
+
+This is a review of a slice of CPython's standard library — specifically the "bootstrap" modules that are imported very early during interpreter startup, plus a handful of platform-support modules. The set is heterogeneous: some files are pure-Python fallbacks for C

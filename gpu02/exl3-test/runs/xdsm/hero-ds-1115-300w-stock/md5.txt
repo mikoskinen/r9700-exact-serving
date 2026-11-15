@@ -1,0 +1,14 @@
+4454b0e5c93e4303b377b580e85578c5  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/hero2-ds/hero2-ds.sh
+0dff112f9ee5dfb7002e8e528432032e  /home/mikoskinen/gpu/ds41/exl3-test/queue/tools/greedyset.py
+ee7d9663e3cd7a228a08db682ae98479  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/stack4/loadid.py
+fc7fccb49c47641ec6f6abe4463668cc  /home/mikoskinen/gpu/ds41/mb.py
+dd1f4857fad608bdc950d0b7ca6b96cf  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/harness/ncmb3.py
+41f859adc5f64cd6682b65f2b69a8b18  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/dsmain/yswl/resprobe.py
+ade016f496b370192a4771af77e1a97f  /home/mikoskinen/gpu/ds41/exl3-test/queue-ar/deepq.py
+8ef84cf7652b07937dc430d6721201b3  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2-ds/ds-h300s/run-used/switches.sh
+5d6d1e8ceec6e1b557df4359b37ed819  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2-ds/ds-h300s/run-used/deepseek/deepseek.env
+d55ad35454abc28d71f9253450809d6f  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2-ds/ds-h300s/run-used/deepseek/m16-forms.txt
+873400cfdbe2a264eacdb9220fbdd5bb  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2-ds/ds-h300s/run-used/deepseek/switches.json
+07cfc03870a0ce94a4d40ee6b471fd20  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2-ds/ds-h300s/want-switches.json
+db01a681a0cdade070bec269ea236a65  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2-ds/ds-h300s/ref-alone.jsonl
+8ac9ed479c621e57376eac5de2d835de  /home/mikoskinen/gpu/ds41/exl3-test/runs/xdsm/hero2-ds/ds-h300s/ref-published.jsonl
