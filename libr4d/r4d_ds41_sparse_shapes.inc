@@ -113,3 +113,72 @@ extern "C" int r4d_shape_index_topk(const RadParam* p, int n_p, int operand, Rad
     };
     R4D_PICK(l);
 }
+
+/* Levers DKV-U / DKV-G (RADIANCE_DS41_LATUNPACK / RADIANCE_DS41_LATGATHER; device-only, no libref description), over
+ * attn_sparse_sink's description's packed cache (an entry a block, M + 1 of them): latent_unpack is the cache, its
+ * block table, positions, cu_seqlens (one sequence) and the plan's rows [M][2 dim] (two entries a row: room for the
+ * M + 1 entries); latent_gather the cache, its table, sel [M][topk], cu_seqlens and the gathered rows [M][topk dim];
+ * the four attentions are theirs, then the unpacked / gathered rows. */
+static int64_t dkv_cslots(int64_t Dm) { return (Dm / 2 + Dm / 16 + 15) / 16 * 16 / 2; }
+extern "C" int r4d_shape_latent_unpack(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), ratio = pi(p, n_p, "ratio"), Dm = pi(p, n_p, "dim");
+    if (M <= 0 || ratio < 1 || Dm < 16 || dkv_cslots(Dm) % ratio) return RAD_E_UNSUPPORTED;
+    const int64_t ncb = M + 1;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, ncb, 1, ratio, dkv_cslots(Dm) / ratio),   /* packed compressed cache: an entry a block */
+        opd_idx(1, ncb, ncb),                                             /* its block table */
+        opd_idx(M, 0, M),                                                 /* positions */
+        opd_idx(2, 0, M, -1, (uint32_t)RAD_OPD_F_IDX_CU),                 /* cu_seqlens */
+        opd((uint32_t)RAD_BF16, M, 2 * Dm),                               /* the plan's rows */
+    };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_latent_gather(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), ratio = pi(p, n_p, "ratio"), Dm = pi(p, n_p, "dim"), k = pi(p, n_p, "topk");
+    if (M <= 0 || ratio < 1 || Dm < 16 || k < 1 || dkv_cslots(Dm) % ratio) return RAD_E_UNSUPPORTED;
+    const int64_t ncb = M + 1;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, ncb, 1, ratio, dkv_cslots(Dm) / ratio),
+        opd_idx(1, ncb, ncb),
+        opd_idx(M, k, ncb),                                               /* sel */
+        opd_idx(2, 0, M, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+        opd((uint32_t)RAD_BF16, M, k * Dm),                               /* gathered */
+    };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_attn_sparse_sink_unpacked(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 11) return r4d_shape_attn_sparse_sink(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), Dm = pi(p, n_p, "dim");
+    if (M <= 0 || Dm < 16) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = { opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+                             opd_none(), opd_none(), opd_none(), opd_none(), opd((uint32_t)RAD_BF16, M, 2 * Dm) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_attn_sparse_sink_rope_roundtrip_unpacked(const RadParam* p, int n_p, int operand,
+                                                                   RadOpdDesc* out) {
+    if (operand < 12) return r4d_shape_attn_sparse_sink_rope_roundtrip(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), Dm = pi(p, n_p, "dim");
+    if (M <= 0 || Dm < 16) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = { opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+                             opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+                             opd((uint32_t)RAD_BF16, M, 2 * Dm) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_attn_sparse_sink_gathered(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    if (operand < 11) return r4d_shape_attn_sparse_sink(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), Dm = pi(p, n_p, "dim"), k = pi(p, n_p, "topk");
+    if (M <= 0 || Dm < 16 || k < 1) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = { opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+                             opd_none(), opd_none(), opd_none(), opd_none(), opd((uint32_t)RAD_BF16, M, k * Dm) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_attn_sparse_sink_rope_roundtrip_gathered(const RadParam* p, int n_p, int operand,
+                                                                   RadOpdDesc* out) {
+    if (operand < 12) return r4d_shape_attn_sparse_sink_rope_roundtrip(p, n_p, operand, out);
+    const int64_t M = pi(p, n_p, "M"), Dm = pi(p, n_p, "dim"), k = pi(p, n_p, "topk");
+    if (M <= 0 || Dm < 16 || k < 1) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = { opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+                             opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+                             opd((uint32_t)RAD_BF16, M, k * Dm) };
+    R4D_PICK(l);
+}
