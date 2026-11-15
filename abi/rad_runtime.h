@@ -1004,6 +1004,15 @@ int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64
 int rad_expert_prefetch_mark(RadCtx* c);
 /* Ahead of `layer`'s routed GEMMs, on every routed layer of every pass. */
 int rad_expert_prefetch_step(RadCtx* c, int layer);
+/* Lever XPF (ds41-xpf; core/runtime/xprefetch.h): a newcomer pass's cross-layer expert prefetch. On the compute stream,
+ * before layer next->layer's routed GEMMs: `logits` [rows, ld] bf16 (device) is that layer's router over a proxy input,
+ * `bias` (f32 [n_expert], device, or null) its correction; each row's top `kp` by sqrt(softplus) + bias is counted, the
+ * most-picked experts whose unit sits in the pinned host pool (at most `slots`) are copied by the prefetch DMA queue into
+ * the prefill ring, and the layer's rad_expert_prefetch_step points its table entries at the copies that landed. `next`
+ * null: what the last plans redirected goes back (a pass's end). Placement only: the GEMMs read the same bytes. Only in a
+ * pass that is not recorded (rad_arch_pass_key 0). RAD_E_UNSUPPORTED: no prefill ring (RADIANCE_XPF_MIB unset). */
+int rad_xpf_plan(RadCtx* c, const RadPrefetchNext* next, const void* logits, int64_t rows, int64_t ld, const void* bias,
+                 int kp, int slots);
 
 /* A weight's pointer, for the rare plugin-private kernel invoked outside the op vocabulary. Waits
  * on the mover. The weight may move afterwards, so the pointer is valid only within one issue. */

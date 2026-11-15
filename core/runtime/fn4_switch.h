@@ -426,6 +426,11 @@
  *                   first, 3 INTERLEAVE (SPEED-C: the host-read entries spread evenly over the chunk; 11 / 19 / 27 over its first
  *                   3/4 / 1/2 / 1/4); bit 2 XR's ring copy (only with RADIANCE_DS41_XRING). The same entries in another order:
  *                   the same bytes. Needs the host pools at bringup (host_pools / rad_host_pool_ranges).
+ *   ds41_xpf        deepseek41 (lever XPF, ds41-xpf, SPEED-E; 79 here after exl3_xr): 1 a newcomer / MIXED pass (at least
+ *                   RADIANCE_DS41_XPF_MIN rows) predicts each trunk MoE layer's experts before its router (the router over
+ *                   its attention input) and the core's prefill prefetch copies the most-picked pinned-pool units onto the
+ *                   card under the layer's attention block (rad_xpf_plan; RADIANCE_XPF_MIB ring); 0 none (today). Placement
+ *                   only: the GEMMs read the same bytes. Needs RADIANCE_DS41_XPF at start (else 1 is refused).
  *   ds41_wmk        libr4d (lever WMK, ds41-wmk2; 71 here, after route_copy_ov): 1 every dense GGUF GEMM of <= 48 rows
  *                   (gemm_nt_ggml, logits_gemm_ggml, gemm_nt_ggml_pair as one launch, the K1 folds a / e after their
  *                   producer's own launch) in the part-order WMMA form (gg_wk_kernel: K split into P = 8 / 4 / 2 / 1 parts
@@ -600,7 +605,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSwitches };
+              kExl3Xr, kDs41Xpf, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);

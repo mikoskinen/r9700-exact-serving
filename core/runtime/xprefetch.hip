@@ -283,7 +283,218 @@ __global__ __launch_bounds__(128) void xp_step(const rad::XpRec* __restrict__ rr
         atomicCAS((unsigned long long*)r.ent[q], (unsigned long long)r.oldv[q], (unsigned long long)r.newv[q]);
 }
 
+/* ---- lever XPF (xprefetch.h) ------------------------------------------------------------------------------------
+ * xpf_count: a wave a row of the proxy logits [rows, ld] bf16; each row's top kp by DeepSeek-V4's selection key
+ * sqrt(softplus(logit)) + bias (router_scored_topk's; the lower expert on a tie), counted into cnt[ne]. A prediction
+ * only. */
+__global__ __launch_bounds__(256) void xpf_count(const uint16_t* __restrict__ lg, uint32_t rows, uint32_t ld, uint32_t ne,
+                                                 uint32_t kp, const float* __restrict__ bias, int32_t* cnt) {
+    const uint32_t lane = threadIdx.x % 32u, wave = threadIdx.x / 32u;
+    const uint32_t r = blockIdx.x * 8u + wave;
+    if (r >= rows) return;
+    float v[16];
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) {
+        const uint32_t e = lane + i * 32u;
+        float k = -INFINITY;
+        if (e < ne) {
+            const float x = xp_bf(lg[(size_t)r * ld + e]);
+            const float sp = x > 20.f ? x : log1pf(__expf(x));
+            k = sqrtf(sp) + (bias ? bias[e] : 0.f);
+            if (!(k > -INFINITY)) k = -INFINITY;   /* NaN never taken */
+        }
+        v[i] = k;
+    }
+    for (uint32_t j = 0; j < kp; ++j) {
+        float bv = -INFINITY;
+        int bi = -1;
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+            if (v[i] > bv) { bv = v[i]; bi = i; }
+        const int be = bi >= 0 ? (int)(lane + (uint32_t)bi * 32u) : 0x7fffffff;
+        float rv = bv;
+        int re = be;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor(rv, o, 32);
+            const int oe = __shfl_xor(re, o, 32);
+            if (ov > rv || (ov == rv && oe < re)) { rv = ov; re = oe; }
+        }
+        if (!(rv > -INFINITY)) break;
+        if (lane == 0) atomicAdd(&cnt[re], 1);
+#pragma unroll
+        for (int i = 0; i < 16; ++i)
+            if (i == bi && re == be) v[i] = -INFINITY;
+    }
+}
+
+/* xpf_plan, one block of 512 (ne <= 512): restores the group's previous records (the layer two back: its GEMMs ran
+ * before this in stream order; counts the patched ones the layer routed), then takes the experts with a pick whose
+ * every entry sits in one pinned-pool slot, the most-picked first (the lower expert on a tie), at most `slots`, writes
+ * their jobs to the mailbox (tags last) and their records, zeroes cnt, and publishes the mailbox number. */
+__global__ __launch_bounds__(512) void xpf_plan(int32_t* cnt, uint32_t ne, void** const* __restrict__ map,
+                                                const int32_t* __restrict__ place, const int32_t* rcnt, rad::XpPools pools,
+                                                uint64_t ring, uint64_t rs, uint32_t slots, rad::XpfRec* rec,
+                                                int32_t* nrec, rad::XpfBox* box, uint32_t seq, rad::XpfStats* stats) {
+    constexpr int P = rad::kXpfParts;
+    __shared__ int      s_c[512];
+    __shared__ uint64_t s_base[512];
+    __shared__ uint64_t s_st[512];
+    __shared__ int      s_sel[rad::kXpfMaxSlots];
+    __shared__ int      s_n;
+    const int tid = (int)threadIdx.x;
+    const int nr = *nrec;
+    for (int t = tid; t < nr * P; t += (int)blockDim.x) {
+        rad::XpfRec& r = rec[t / P];
+        const int q = t % P;
+        if (r.ent[q])
+            atomicCAS((unsigned long long*)r.ent[q], (unsigned long long)r.newv[q], (unsigned long long)r.oldv[q]);
+        if (q == 0 && r.pad && r.cnt && r.place >= 0 && r.cnt[r.place] > 0) atomicAdd(&stats->used, 1u);
+    }
+    if (tid == 0) {
+        s_n = 0;
+        if (nr > 0) atomicAdd(&stats->restores, 1u);
+    }
+    int c = 0;
+    uint64_t base = 0, st = 0;
+    if (tid < (int)ne) {
+        c = cnt[tid];
+        cnt[tid] = 0;
+        if (c > 0) {
+            void** ent = map[(size_t)tid * P];
+            int pi = -1;
+            if (ent) {
+                const uint64_t p = (uint64_t)*(void* volatile*)ent;
+                for (int i = 0; i < pools.n; ++i)
+                    if (p >= pools.lo[i] && p < pools.hi[i]) { pi = i; break; }
+                if (pi >= 0) {
+                    st = pools.stride[pi];
+                    base = pools.lo[pi] + ((p - pools.lo[pi]) / st) * st;
+                    for (int q = 1; q < P && pi >= 0; ++q) {
+                        void** eq = map[(size_t)tid * P + q];
+                        if (!eq) continue;
+                        const uint64_t v = (uint64_t)*(void* volatile*)eq;
+                        if (v < base || v >= base + st) pi = -1;
+                    }
+                    if (st > rs) pi = -1;
+                }
+            }
+            if (pi < 0) c = 0;
+        }
+    }
+    s_c[tid] = c;
+    s_base[tid] = base;
+    s_st[tid] = st;
+    __syncthreads();
+    if (c > 0) {
+        atomicAdd(&stats->cands, 1u);
+        uint32_t rank = 0;
+        for (int u = 0; u < (int)ne; ++u) {
+            const int cu = s_c[u];
+            if (cu > c || (cu == c && u < tid)) ++rank;
+        }
+        if (rank < slots) { s_sel[rank] = tid; atomicAdd(&s_n, 1); }
+    }
+    __syncthreads();
+    const int n = s_n;
+    for (int t = tid; t < n * P; t += (int)blockDim.x) {
+        const int j = t / P, q = t % P, e = s_sel[j];
+        const uint64_t b = s_base[e], dst = ring + (uint64_t)j * rs;
+        if (q == 0) {
+            __hip_atomic_store(&box->jobs[j].src, b, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&box->jobs[j].dst, dst, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(&box->jobs[j].bytes, s_st[e], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            rec[j].cnt = rcnt;
+            rec[j].place = place ? place[e] : e;
+            rec[j].pad = 0;
+        }
+        void** ent = map[(size_t)e * P + q];
+        rec[j].ent[q] = ent;
+        if (ent) {
+            const uint64_t old = (uint64_t)*(void* volatile*)ent;
+            rec[j].oldv[q] = (void*)old;
+            rec[j].newv[q] = (void*)(dst + (old - b));
+        }
+        if (q == 0) {
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+            __hip_atomic_store(&box->jobs[j].tag, (uint64_t)seq, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        *nrec = n;
+        __hip_atomic_store(&box->n, n, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        atomicAdd(&stats->planned, (unsigned)n);
+        atomicAdd(&stats->plans, 1u);
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        __hip_atomic_store((uint32_t*)&box->seq, seq, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+/* xpf_step, compute stream, right before the layer's routed GEMMs: each chunk whose DMA list wrote `seq` to its done
+ * word has its records' entries pointed at the ring, only where an entry still holds what the plan read. */
+__global__ __launch_bounds__(256) void xpf_step(rad::XpfRec* rec, const int32_t* __restrict__ nrec, const uint32_t* done,
+                                                uint32_t seq, rad::XpfStats* stats) {
+    constexpr int P = rad::kXpfParts;
+    const int n = *nrec;
+    for (int t = (int)threadIdx.x; t < n * P; t += (int)blockDim.x) {
+        const int j = t / P, q = t % P;
+        if (__hip_atomic_load((uint32_t*)(done + j / rad::kXpfChunk), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != seq)
+            continue;
+        rad::XpfRec& r = rec[j];
+        if (r.ent[q])
+            atomicCAS((unsigned long long*)r.ent[q], (unsigned long long)r.oldv[q], (unsigned long long)r.newv[q]);
+        if (q == 0) {
+            r.pad = 1;
+            atomicAdd(&stats->patched, 1u);
+        }
+    }
+}
+
+/* xpf_restore: a group's records back to the pool slots (a pass's end), then none. */
+__global__ __launch_bounds__(256) void xpf_restore(rad::XpfRec* rec, int32_t* nrec, rad::XpfStats* stats) {
+    constexpr int P = rad::kXpfParts;
+    const int n = *nrec;
+    for (int t = (int)threadIdx.x; t < n * P; t += (int)blockDim.x) {
+        rad::XpfRec& r = rec[t / P];
+        const int q = t % P;
+        if (r.ent[q])
+            atomicCAS((unsigned long long*)r.ent[q], (unsigned long long)r.newv[q], (unsigned long long)r.oldv[q]);
+        if (q == 0 && r.pad && r.cnt && r.place >= 0 && r.cnt[r.place] > 0) atomicAdd(&stats->used, 1u);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        if (n > 0) atomicAdd(&stats->restores, 1u);
+        *nrec = 0;
+    }
+}
+
 }  // namespace
+
+extern "C" int rad_xpf_count_launch(const uint16_t* lg, uint32_t rows, uint32_t ld, uint32_t ne, uint32_t kp,
+                                    const float* bias, int32_t* cnt, void* stream) {
+    if (rows == 0 || ne > 512u || kp == 0 || kp > (uint32_t)rad::kXpfMaxK) return -1;
+    hipLaunchKernelGGL(xpf_count, dim3((rows + 7u) / 8u), dim3(256), 0, (hipStream_t)stream, lg, rows, ld, ne, kp, bias,
+                       cnt);
+    return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+extern "C" int rad_xpf_plan_launch(int32_t* cnt, uint32_t ne, void** const* map, const int32_t* place,
+                                   const int32_t* rcnt, rad::XpPools pools, uint64_t ring, uint64_t rs, uint32_t slots,
+                                   rad::XpfRec* rec, int32_t* nrec, rad::XpfBox* box, uint32_t seq,
+                                   rad::XpfStats* stats, void* stream) {
+    if (ne > 512u || slots > (uint32_t)rad::kXpfMaxSlots) return -1;
+    hipLaunchKernelGGL(xpf_plan, dim3(1), dim3(512), 0, (hipStream_t)stream, cnt, ne, map, place, rcnt, pools, ring, rs,
+                       slots, rec, nrec, box, seq, stats);
+    return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+extern "C" int rad_xpf_step_launch(const rad::XpfRec* rec, const int32_t* nrec, const uint32_t* done, uint32_t seq,
+                                   rad::XpfStats* stats, void* stream) {
+    hipLaunchKernelGGL(xpf_step, dim3(1), dim3(256), 0, (hipStream_t)stream, (rad::XpfRec*)rec, nrec, done, seq, stats);
+    return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+extern "C" int rad_xpf_restore_launch(rad::XpfRec* rec, int32_t* nrec, rad::XpfStats* stats, void* stream) {
+    hipLaunchKernelGGL(xpf_restore, dim3(1), dim3(256), 0, (hipStream_t)stream, rec, nrec, stats);
+    return hipGetLastError() == hipSuccess ? 0 : -1;
+}
 
 extern "C" int rad_xp_logits_launch(const uint16_t* h, const uint16_t* w, float* logits, uint32_t rows,
                                     uint32_t n_embd, uint32_t ne, void* stream) {

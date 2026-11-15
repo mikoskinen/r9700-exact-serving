@@ -1084,6 +1084,17 @@ int Engine::apply_rope_scaling() {
  * a ring the step may read them from instead of the pool. On DeepSeek-V4.1 it predicts nothing anyway
  * (Ctx::xp_predict_run takes a router input of at most 4096 columns; the model's is 5120). Unset: as
  * before. */
+/* Lever XPF (ds41-xpf, SPEED-E; core/runtime/xprefetch.h): RADIANCE_XPF_MIB=<MiB> (1 .. 1024) reserves the prefill
+ * prefetch's ring (two groups of pool-slot copies) in the VRAM budget and opens it on every rank with pinned expert pools
+ * and a spare DMA engine, beside or without the decode prefetch (RADIANCE_XPREFETCH). Unset or 0: nothing (today). */
+static int64_t xpf_ring_bytes() {
+    static const int64_t b = [] {
+        const char* e = getenv("RADIANCE_XPF_MIB");
+        const long long v = e && *e ? atoll(e) : 0;
+        return v > 0 && v <= 1024 ? (int64_t)v << 20 : (int64_t)0;
+    }();
+    return b;
+}
 static bool xprefetch_env_off() {
     static const bool off = [] {
         const char* e = getenv("RADIANCE_XPREFETCH");
@@ -2139,6 +2150,19 @@ int Engine::plan() {
                     if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
                 f.n_queues += 1;
                 f.prefetch = xp_device_bytes(wf.expert_unit_max, nl);
+            }
+            /* lever XPF: the prefill prefetch's ring and buffers (RADIANCE_XPF_MIB), and the DMA queue if the decode
+             * prefetch did not count it */
+            if (xpf_ring_bytes() > 0 && wf.routed && wf.expert_unit_max > 0 && !cfg_.deterministic &&
+                (cfg_.placement == "auto" || cfg_.placement == "expert_tiered") && rad_xp_supported(r->device)) {
+                int64_t nl = r->program.meta.n_layers;
+                for (const WeightInfo& w : r->program.weights)
+                    if (w.decl.group.expert >= 0) nl = std::max(nl, (int64_t)w.decl.group.layer + 1);
+                if (f.prefetch == 0) f.n_queues += 1;
+                constexpr int64_t kGrain = (int64_t)2 << 20;
+                const int64_t small = (int64_t)sizeof(XpfRec) * 2 * kXpfMaxSlots + 8 + 4 * kXpMaxNe + (int64_t)sizeof(XpfStats) +
+                                      nl * kXpMaxNe * kXpfParts * 8 + nl * kXpMaxNe * 4;
+                f.prefetch += (xpf_ring_bytes() + kGrain - 1) / kGrain * kGrain + (small + kGrain - 1) / kGrain * kGrain;
             }
             RadDeviceProps props{};
             rad_dev_props(r->device, &props);
@@ -4628,6 +4652,14 @@ int Engine::start() {
             uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
+        }
+    /* Lever XPF (RADIANCE_XPF_MIB): the prefill prefetch, in the budget above (Engine::plan) */
+    if (!cfg_.deterministic && xpf_ring_bytes() > 0 && (cfg_.placement == "auto" || cfg_.placement == "expert_tiered"))
+        for (auto& r : ranks_) {
+            RAD_TRY(rad_dev_set(r->device));
+            uint64_t lo[kXpMaxPools], hi[kXpMaxPools], st[kXpMaxPools];
+            const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
+            if (n > 0) r->ctx.xpf_open(lo, hi, st, n, xpf_ring_bytes());
         }
     /* Lever XR (ds41-etp-xr): every rank's pinned host pools, to the kernel plugins that place by them (exl3r4d's
      * gate_up map form reads them only under the fn4 switch exl3_xr; 0, the default, runs as before). The pools are

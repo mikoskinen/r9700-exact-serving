@@ -77,7 +77,58 @@ inline int64_t xp_device_bytes(int64_t unit, int64_t layers) {
     return grains(ring) + grains(small);
 }
 
+/* ---- lever XPF (ds41-xpf, SPEED-E): a newcomer pass's cross-layer expert prefetch -------------------------------
+ *
+ * A newcomer / MIXED pass (hundreds of prefill rows) reads ~64 host-pool units a routed layer a rank (about a third of
+ * the layer's pooled units), in place, inside its routed GEMMs, where the link is already the bound; between two layers'
+ * routed GEMMs (the attention block, the collectives, the router) the link carries only the all-reduces. Here, at a
+ * point the architecture picks before layer l's router (deepseek41: l's attention input, the ffn proxy), the layer's
+ * router over a proxy input gives each row's likely experts; the most-picked pinned-pool units are copied by the
+ * prefetch DMA queue into the prefill ring while the attention block runs, in chunks that each write their own done
+ * word, and l's routed GEMMs read the copies that landed (rad_expert_prefetch_step patches the entries chunk by chunk,
+ * compare-and-swap: a heat-engine move wins). Late chunks stay unused; nothing waits for them.
+ *
+ * Results never change: a copy holds the pool slot's bytes, the kernels and operands are the same; the prediction (its
+ * input, width, budget) only picks which bytes cross the link before the GEMMs instead of inside them.
+ *
+ * The ring is two groups of slots; layers alternate. A group's patches are restored by the next plan into that group
+ * (the layer two back, whose GEMMs ran before it in stream order) and by the pass-end call (rad_xpf_plan with next
+ * null). Sized by RADIANCE_XPF_MIB (VRAM budget term); unset: no ring, no queue, nothing runs. */
+constexpr int kXpfParts     = 8;     /* table entries an EXL3 unit is redirected through (7 planes, down's suh twice) */
+constexpr int kXpfMaxSlots  = 128;   /* copies a layer at most */
+constexpr int kXpfChunk     = 8;     /* copies a DMA list (its own done word) */
+constexpr int kXpfChunks    = kXpfMaxSlots / kXpfChunk;
+constexpr int kXpfMaxK      = 16;
+struct XpfRec {
+    void**         ent[kXpfParts];
+    void*          oldv[kXpfParts];
+    void*          newv[kXpfParts];
+    const int32_t* cnt;
+    int32_t        place;
+    int32_t        pad;
+};
+struct XpfBox {
+    XpJob             jobs[kXpfMaxSlots];
+    int32_t           n;
+    volatile uint32_t seq;
+};
+/* [0] planned (copies asked), [1] patched (copies that landed in time, units), [2] used (patched units the layer
+ * routed, counted at the restore), [3] plans, [4] candidates seen (pooled units with a pick), [5] restores. */
+struct XpfStats {
+    unsigned int planned, patched, used, plans, cands, restores, pad[2];
+};
+
 }  /* namespace rad */
+
+extern "C" int rad_xpf_count_launch(const uint16_t* lg, uint32_t rows, uint32_t ld, uint32_t ne, uint32_t kp,
+                                    const float* bias, int32_t* cnt, void* stream);
+extern "C" int rad_xpf_plan_launch(int32_t* cnt, uint32_t ne, void** const* map, const int32_t* place,
+                                   const int32_t* rcnt, rad::XpPools pools, uint64_t ring, uint64_t rs, uint32_t slots,
+                                   rad::XpfRec* rec, int32_t* nrec, rad::XpfBox* box, uint32_t seq,
+                                   rad::XpfStats* stats, void* stream);
+extern "C" int rad_xpf_step_launch(const rad::XpfRec* rec, const int32_t* nrec, const uint32_t* done, uint32_t seq,
+                                   rad::XpfStats* stats, void* stream);
+extern "C" int rad_xpf_restore_launch(rad::XpfRec* rec, int32_t* nrec, rad::XpfStats* stats, void* stream);
 
 extern "C" int rad_xp_logits_launch(const uint16_t* h, const uint16_t* w, float* logits, uint32_t rows,
                                     uint32_t n_embd, uint32_t ne, void* stream);

@@ -2150,6 +2150,30 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         xp.n_parts = 4;
         xp.parts = xp_parts.data();
         xp.count_at = xp_count_at.data();
+    } else if (c.sigmoid_router && c.expert_exl3 && c.router_bf16 && glm_router.projection && glm_router.correction &&
+               c.n_expert_all > 0 && c.n_expert > 0 && c.n_expert % 2 == 0 && !x3_gu[0].empty()) {
+        /* Lever XPF (ds41-xpf; the 1U-XP description of ds41-int11b ec852d2): an EXL3 layer under the bf16 GLM router, its
+         * unit's seven planes -- gate_up's codes, suh, suh.1, svh and down's codes, suh, svh -- each at the expert's place in
+         * its run (class-major: the even local experts, then the odd), the routing counts at the local index, the router's
+         * projection. Read only by the core's prefetch (rad_xpf_plan); nothing is issued from it. */
+        const int64_t na = c.n_expert_all, ne = c.n_expert, half = ne / 2;
+        constexpr int64_t P = 7;
+        xp_parts.assign((size_t)(na * P), 0);
+        xp_count_at.assign((size_t)na, -1);
+        for (int64_t e = 0; e < ne; ++e) {
+            const int64_t me = c.expert_base + e, ri = (e % 2) * half + e / 2;
+            if (me < 0 || me >= na || (size_t)ri >= x3_gu[0].size()) continue;
+            for (int p = 0; p < 4; ++p) xp_parts[(size_t)(me * P + p)] = x3_gu[p][(size_t)ri];
+            for (int p = 0; p < 3; ++p) xp_parts[(size_t)(me * P + 4 + p)] = x3_dn[p][(size_t)ri];
+            xp_count_at[(size_t)me] = (int32_t)e;
+        }
+        xp.layer = layer;
+        xp.router = glm_router.projection;
+        xp.n_expert = na;
+        xp.top_k = c.top_k;
+        xp.n_parts = P;
+        xp.parts = xp_parts.data();
+        xp.count_at = xp_count_at.data();
     }
     return RAD_OK;
 }

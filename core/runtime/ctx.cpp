@@ -112,6 +112,7 @@ int Ctx::init(const CtxDesc& d) {
 void Ctx::shutdown() {
     oracle_close();
     xp_close();
+    xpf_close();   /* lever XPF */
     row_prefetch_done();
     rowpf_worker_.reset();   /* joins the read-ahead helper, if one started */
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the

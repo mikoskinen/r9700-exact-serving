@@ -5408,7 +5408,10 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kDraftDcapN + 1, (int)fn4::kExl3Dng);
     CHECK_EQ((int)fn4::kExl3Dng + 1, (int)fn4::kDs41F32Dec);   /* ds41-etp-spd: lever SPD-F, libr4d's (ds41-nst2: after the night stack) */
     CHECK_EQ((int)fn4::kDs41F32Dec + 1, (int)fn4::kExl3Xr);   /* ds41-etp-xr: lever XR / SPC order 3, exl3r4d's (ds41-nst3: after night stack 2) */
-    CHECK_EQ((int)fn4::kExl3Xr + 1, (int)fn4::kSwitches);
+    CHECK_EQ((int)fn4::kExl3Xr + 1, (int)fn4::kDs41Xpf);   /* ds41-xpf: lever XPF, deepseek41's, after XR / SPC */
+    CHECK_EQ((int)fn4::kDs41Xpf + 1, (int)fn4::kSwitches);
+    CHECK_EQ(fn4::switch_index("ds41_xpf"), (int)fn4::kDs41Xpf);
+    CHECK(!fn4::sched_switch(fn4::kDs41Xpf));
     CHECK_EQ(fn4::switch_index("ds41_f32dec"), (int)fn4::kDs41F32Dec);
     CHECK(!fn4::sched_switch(fn4::kDs41F32Dec));
     CHECK_EQ(fn4::switch_index("exl3_xr"), (int)fn4::kExl3Xr);
@@ -5445,7 +5448,8 @@ TEST(the_drafters_lend_and_probe_back_off_switches_are_checked_and_reported) {
     CHECK_EQ((int)fn4::kExl3Dng, 76);
     CHECK_EQ((int)fn4::kDs41F32Dec, 77);   /* ds41-nst2: SPD-F after the night stack */
     CHECK_EQ((int)fn4::kExl3Xr, 78);   /* ds41-nst3: XR / SPC after night stack 2 */
-    CHECK_EQ((int)fn4::kSwitches, 79);
+    CHECK_EQ((int)fn4::kDs41Xpf, 79);   /* ds41-xpf: XPF after XR / SPC */
+    CHECK_EQ((int)fn4::kSwitches, 80);
     CHECK_EQ(fn4::switch_index("sched_tail_grid"), (int)fn4::kSchedTailGrid);
     CHECK_EQ(fn4::switch_index("ds41_wmk"), (int)fn4::kDs41Wmk);
     CHECK(!fn4::sched_switch(fn4::kDs41Wmk));

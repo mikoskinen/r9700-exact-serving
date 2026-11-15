@@ -39,6 +39,8 @@ namespace rad {
 
 class Registry;
 struct XpState;
+struct XpfState;
+struct XpfLayer;
 struct XpLayer;
 
 typedef void (*ArchStepFn)(RadCtx*, const RadBatch*);
@@ -331,6 +333,13 @@ public:
      * calls are no-ops. */
     void xp_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride, int n);
     void xp_close();
+    /* Lever XPF (xprefetch.h): the prefill prefetch, opened at bringup with the pinned pools and `ring` bytes
+     * (RADIANCE_XPF_MIB); xpf_plan is rad_xpf_plan; xp_step also patches the layer an xpf plan was made for. */
+    void xpf_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* stride, int n, int64_t ring);
+    void xpf_close();
+    int  xpf_plan(const RadPrefetchNext* next, const void* logits, int64_t rows, int64_t ld, const void* bias, int kp,
+                  int slots);
+    bool xpf_on() const { return xpf_ != nullptr; }
     int  xp_predict(const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark();
     int  xp_step(int layer);
@@ -712,6 +721,11 @@ private:
 
     /* The expert prefetch's state (xp_state.h), null while it is off. */
     std::unique_ptr<XpState> xp_;
+    std::unique_ptr<XpfState> xpf_;   /* lever XPF, null while off */
+    void xpf_free(XpfState& x);
+    void xpf_serve(XpfState& x);
+    bool xpf_bind(XpfLayer& L, const RadPrefetchNext& nx, int layer);
+    int  xpf_step_run(int layer);
     void xp_free(XpState& x);
     void xp_serve(XpState& x);
     void xp_judge(XpState& x);

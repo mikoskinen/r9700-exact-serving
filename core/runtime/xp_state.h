@@ -80,4 +80,45 @@ struct XpState {
     std::atomic<int64_t>     dropped{0};           /* requests the queue was too far behind for */
 };
 
+/* Lever XPF (xprefetch.h): the prefill prefetch's host state (Ctx::xpf_), opened at bringup under RADIANCE_XPF_MIB. */
+struct XpfLayer {
+    void**   map   = nullptr;    /* device [kXpMaxNe][kXpfParts] */
+    int32_t* place = nullptr;    /* device [kXpMaxNe] */
+    bool     bound = false, tried = false;
+};
+struct XpfReq {
+    int      g   = 0;
+    uint32_t seq = 0;
+};
+struct XpfState {
+    int          device = 0;
+    char*        ring   = nullptr;     /* uncached: 2 groups x slots_max slots of `slot` bytes */
+    uint64_t     slot   = 0;
+    int          slots_max = 0;        /* a group's */
+    int64_t      ring_bytes = 0;
+    XpPools      pools{};
+    XpfRec*      rec    = nullptr;     /* [2][kXpfMaxSlots] */
+    int32_t*     nrec   = nullptr;     /* [2] */
+    int32_t*     cnt    = nullptr;     /* [kXpMaxNe], zero between plans */
+    XpfBox*      box    = nullptr;     /* [2], pinned host */
+    uint32_t*    done   = nullptr;     /* [2][kXpfChunks], pinned host */
+    XpfStats*    stats  = nullptr;     /* device */
+    XpfStats*    stats_h = nullptr;    /* pinned host */
+    void**       maps   = nullptr;     /* [layers][kXpMaxNe][kXpfParts] */
+    int32_t*     places = nullptr;     /* [layers][kXpMaxNe] */
+    std::vector<XpfLayer> layers;
+    uint32_t     seq[2] = {};
+    int          g = 1;                /* the group the last plan took */
+    int          want_layer = -1, want_g = 0;
+    uint32_t     want_seq = 0;
+    bool         dirty[2] = { false, false };
+    int64_t      plans = 0;
+    std::thread              thr;
+    std::mutex               mu;
+    std::condition_variable  cv;
+    std::deque<XpfReq>       q;
+    std::atomic<bool>        stop{false};
+    std::atomic<int64_t>     lists{0}, dropped{0}, late{0};
+};
+
 }  /* namespace rad */
