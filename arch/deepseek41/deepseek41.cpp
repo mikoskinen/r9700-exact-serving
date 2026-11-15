@@ -4881,8 +4881,10 @@ static int xpm_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     t.real_layers = std::max<int64_t>(0, xpm_env("RADIANCE_DS41_XPM_REAL", 2));
     t.plane = decl_b(b, m.nm.f("xpm_plane"), RAD_I32, { m.g.max_tok, 2 }, RAD_BUF_PERSIST);
     if (!t.plane) return RAD_E_INVAL;
-    t.trace = op(b, "bi_rowhash", { RAD_RANGE("M", 1, m.g.max_tok) }, {}, { m.mw.ids }, { t.plane });
-    if (!t.trace) return RAD_E_UNSUPPORTED;
+    t.trace = fused(b, "bi_rowhash", { RAD_RANGE("M", 1, m.g.max_tok) }, {}, { m.mw.ids }, { t.plane });
+    /* without it a pass may be recorded and played (the arch step is not called then): no dumps (their copies must see
+     * every issue), timing steps only (a played pass leaves no marks, and its line says so) */
+    if (!t.trace) t.dsteps = 0;
     int np = 0, nc = 0;
     for (const Layer& L : m.layers) {
         np += L.xpm_pred ? 1 : 0;
@@ -4891,8 +4893,8 @@ static int xpm_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41: lever XPF's reading ON (RADIANCE_DS41_XPM=%s): %d router projections, %d "
                         "collapse + norm, steps of %lld..%lld rows: %lld timed, then %lld dumped (rank 0); passes not "
-                        "recorded\n", t.path.c_str(), np, nc, (long long)t.min_rows, (long long)t.max_rows,
-                (long long)t.tsteps, (long long)t.dsteps);
+                        "recorded%s\n", t.path.c_str(), np, nc, (long long)t.min_rows, (long long)t.max_rows,
+                (long long)t.tsteps, (long long)t.dsteps, t.trace ? "" : " (NO: bi_rowhash is not served, so no dumps)");
     return RAD_OK;
 }
 static RadEvent xpm_event(Xpm& t) {
