@@ -220,6 +220,13 @@ struct AttnGatedFP8 {
     /* fn4 att_bi 3: op_attn as attn_paged_pin with split_rows = 1 (a dense decode sequence's alone launch is one sequence),
      * declared beside op_attn_gq_bi where a plugin declares attn_paged_pin (libr4d); 0 otherwise. */
     rad_op     op_attn_bi = 0;
+    /* fn4 KVCAP C2 (15.11.2026, qwen/KV-BOUNDS.md): the most sequences one op_attn_bi launch carries, its declared
+     * max_seqs. A launch is a run of the step's DENSE decode sequences (at most the step's n_seq <= g.max_seqs), each at
+     * 1 + n_spec rows; the sparse path's row budget (qsa_rows(), 256: one row per query) never applies to it. libr4d sizes
+     * its split-KV partials at declare as max_seqs x q_len band x n_head x the pinned split count (256 at max_ctx 262144)
+     * x 520 B: 780 MiB a card at 256, 97.5 MiB at 32 -- the arena's scratch is the largest op's. step() checks every run
+     * against it and fails the step loudly past it. */
+    int64_t    bi_seqs = 0;
     /* kv_store_streamed: the host mirror always, the ring slot when `res` says the block is resident
      * (docs/OPS.md). Zero when no row serves it; a streamed group then fails the step. */
     rad_op     op_kv_stream = 0;
@@ -462,12 +469,13 @@ inline int AttnGatedFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int
                                         RAD_INT("window", 0),
                                         RAD_INT("n_head", g.n_head),
                                         RAD_INT("block_size", kv_block > 0 ? kv_block : (int64_t)RAD_KV_BLOCK),
-                                        RAD_INT("max_seqs", (qsa_sel && qsa_sequ) ? qsa_rows() : g.max_seqs),
+                                        RAD_INT("max_seqs", g.max_seqs),   /* fn4 KVCAP C2: a run of decode sequences */
                                         RAD_INT("max_ctx", g.max_ctx),
                                         RAD_STR("q_dtype", g.dtype), RAD_STR("kv_dtype", g.kv_dtype),
                                         RAD_INT("split_rows", 1)),
                              RAD_NOWEIGHTS);
             if (op_attn_bi) {
+                bi_seqs = g.max_seqs;
                 const rad_buf rd[4] = { w.q, qsa_sel, qsa_sequ, qsa_nsel };
                 rad_op_reads(b, op_attn_bi, rd,
                              (qsa_sel && qsa_sequ) ? (qsa_nsel ? 4 : 3) : 1);
@@ -914,6 +922,15 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         int64_t e2 = s2 + 1;
                         while (e2 < D && !sp[e2]) ++e2;
                         const int64_t k = e2 - s2, rows = k * qd;
+                        if (k > bi_seqs) {   /* fn4 KVCAP C2: the run fits the partials op_attn_bi was declared for */
+                            char why[320];
+                            snprintf(why, sizeof why,
+                                     "attention (gated fp8): fn4 KVCAP C2: a run of %lld dense decode sequences for the "
+                                     "batch-invariant decode attention (op_attn_bi), past the %lld its split-KV partials "
+                                     "are declared for (max_seqs)", (long long)k, (long long)bi_seqs);
+                            rad_step_fail(c, why);
+                            return;
+                        }
                         RAD_ISSUE_N(c, op_attn_bi, qd,
                                     brow_slice(w.q, a0, rows, qw), kv_cache(kv, layer),
                                     praw2(table + s2 * pitch, RAD_I32, k, pitch), praw(used + s2, RAD_I32, k),
