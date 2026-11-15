@@ -3,6 +3,7 @@
 
 #include "device/device.h"
 #include "kvstream/bind.h"
+#include "runtime/fn4_switch.h"
 #include "runtime/wtab.h"
 
 #include <algorithm>
@@ -72,7 +73,16 @@ void kvstream_enter(Ctx* c, const RadBatch* b) {
          * live block from the mirror as a request's first pass does. `slots < blocks` holds for
          * every stream with a stage: bringup gives a stream whose ring covers its context no
          * mirror, no resolve and no stage. */
-        if (was_stage && kb->depth == 0) {
+        /* fn4 kvs_bi bit 2 (15.11.2026, qwen/KV-STREAM-EXACT.md): also when a staged pass BEGINS. On the stage the
+         * cache operand is the stage, and the streamed store writes kv_cache[res[block]] for every block the maps call
+         * resident: a ring slot's index used as a block id inside the stage, i.e. this step's token written into
+         * another block's row of the layer the attention reads next (store_stage_identity then writes the right row,
+         * but the wrong one stays). The maps of the ring passes before are still set, so a MIXED step after decode
+         * steps wrote its decode sequences' new tokens over block ids = their slots -- a block of whichever sequence
+         * holds that id. With the maps reset at the stage's start the store writes the mirror (and the stage at
+         * identity) only; the ring is overwritten by the stage either way and resolves from the mirror afterwards. */
+        const bool kvs_reset_in = !was_stage && kb->depth == 1 && (fn4::kvs_bi() & 2) != 0;
+        if ((was_stage && kb->depth == 0) || kvs_reset_in) {
             const RadKVStream* st = b->kv[i].stream;
             const int64_t bb     = st->block_bytes;
             const int64_t blocks = bb > 0 ? st->host_layer_stride / bb : 0;

@@ -109,6 +109,12 @@
  *                   once the pool holds its next verify (rejoin_kept: the cache's hit puts the whole blocks back, nothing
  *                   is prefilled); a hit the cache can no longer give falls back to today's recompute (counted); 0 today
  *                                                                                                   RADIANCE_FN4_PREEMPT_KEEP
+ *   kvs_bi          arch + core (15.11.2026, qwen/KV-STREAM-EXACT.md): KV streaming (--kv-resident) exact under load, a mask
+ *                   0..3 -- 1: a streamed group's decode sequences take their alone step's attention in every pass
+ *                   (sparse, launches of their own rows through att_bi's per-sequence path, on the ring and on the stage;
+ *                   rad_block_attn_gated_fp8.h); 2: the residency maps are reset when a staged pass begins on the aliased
+ *                   stage, so its streamed store never writes a ring slot's offset inside the stage (core/kvstream/
+ *                   stage.cpp); 0 today                                                              RADIANCE_FN4_KVS_BI
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -129,7 +135,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kResumeCold, kPreemptKeep, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kResumeCold, kPreemptKeep, kKvsBi, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
@@ -151,6 +157,12 @@ int  resume_cold();
  * its partial last blocks and its card, and rejoins at the same position with nothing replayed (Scheduler::preempt_back,
  * rejoin_kept); 0 today (preemption by recompute) -- RADIANCE_FN4_PREEMPT_KEEP at start. */
 int  preempt_keep();
+/* fn4 kvs_bi (15.11.2026, qwen/KV-STREAM-EXACT.md): KV streaming exact under load, a mask -- bit 1 the arch's (a streamed
+ * group's decode sequences in their alone attention form in every pass), bit 2 the core's (core/kvstream/stage.cpp: the
+ * residency maps reset when a staged pass begins on the stage that aliases the ring, so a staged pass's streamed store
+ * writes the mirror and the stage at identity only, never a ring slot's offset inside the stage); 0 today --
+ * RADIANCE_FN4_KVS_BI at start. */
+int  kvs_bi();
 bool aql_acq_none();
 
 /* Server thread: queue a value; false (with the reason) for an unknown switch or a bad value. */
