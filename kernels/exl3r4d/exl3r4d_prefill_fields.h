@@ -13,3 +13,11 @@
     uint32_t*   order;              /* scratch, after the chunk table: gate_up's entries longest first a chunk, or null
                                      * (EXL3R4D_PF_LPT; written by the map kernel) */
     int32_t     ystream;            /* down's map form: 1 = the streamed y (EXL3R4D_PF_YNT_MB, prefill.c) */
+    /* LEVER XR (ds41-etp-xr-plug, fn4 exl3_xr; gate_up's map form, two-class build), appended so no earlier field moves.
+     * xr_mode bits 0-1: the order of a chunk's groups (0: longest first as before; 1: the groups whose codes the card
+     * reads from VRAM longest first, then those it reads from a host pool (rad_host_pool_ranges) longest first;
+     * 2: host-read first); bit 2: the ring copy (order 1, needs xr_ring_mb). 0 = the launch as before. */
+    /* One word, in ystream's old padding (the four-class block stays within the 512 explicit kernarg bytes): bits 0-7
+     * xr_mode, bits 8-15 the codes' 2 K (an expert's codes record = rows x cols x 2K / 16 bytes), bits 16-31 the MiB of
+     * ring after the XR tables in scratch (the op's xring; 0: none). Read through xr_mode_of / xr_k2_of / xr_ring_of. */
+    int32_t     xr;
