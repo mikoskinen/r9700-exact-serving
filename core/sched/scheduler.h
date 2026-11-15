@@ -545,6 +545,11 @@ private:
      * ds41-bi options (bi_chunk_plan) -- a prompt's chunk boundaries the same alone and beside other work. */
     int           bi_chunk_ = 0;
     bool          bi_lone_last_ = false;   /* fn4 BI chunking 5: the last step was a lone prefill step */
+    /* fn4 BI chunking 6 (15.11.2026, qwen/build2/LONGPROMPT.md): the request whose alone piece did not fit beside the
+     * last step's other work (0 none) -- it takes the next step alone -- and whether the last step was such a lone step
+     * beside decoding sequences (the decode rows then get the next one). */
+    uint64_t      bi6_wait_ = 0;
+    bool          bi6_lone_last_ = false;
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share);
     IKVManager*   kv_ = nullptr;

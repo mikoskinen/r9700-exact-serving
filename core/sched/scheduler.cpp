@@ -1027,9 +1027,9 @@ int64_t Scheduler::chunk_end(const Request& r, int64_t n_target) const {
  * prefix another request starts from) still splits where it falls, as alone. */
 static int bi_chunk_env() {
     const char* v = std::getenv("RADIANCE_SCHED_BI_CHUNK");
-    const int m = (v && v[0] >= '1' && v[0] <= '5' && !v[1]) ? v[0] - '0' : 0;
+    const int m = (v && v[0] >= '1' && v[0] <= '6' && !v[1]) ? v[0] - '0' : 0;
     if (v && *v && !(m || (v[0] == '0' && !v[1])))
-        std::fprintf(stderr, "radiance: scheduler: RADIANCE_SCHED_BI_CHUNK=%s is not 0 / 1 / 2 / 3 / 4: today's chunking\n", v);
+        std::fprintf(stderr, "radiance: scheduler: RADIANCE_SCHED_BI_CHUNK=%s is not 0 .. 6: today's chunking\n", v);
     if (m)
         std::fprintf(stderr, "radiance: scheduler: lever BI chunking %d (RADIANCE_SCHED_BI_CHUNK): %s; a chunk that does "
                              "not fit the step waits\n", m,
@@ -1037,6 +1037,7 @@ static int bi_chunk_env() {
                      : m == 2 ? "every prefill chunk on the checkpoint-interval grid or the prompt's end, no span"
                      : m == 3 ? "beside other work a chunk ends on the checkpoint-interval grid inside alone's piece (each "
                                 "part >= 128 rows) or at the piece's end"
+                     : m == 6 ? "alone's piece whole beside other work where it fits, else in a step of its own (no cut)"
                               : "beside other work a chunk ends on the RADIANCE_SCHED_BI_GRID grid (default 1024) inside alone's "
                                 "piece (each part >= 128 rows) or at the piece's end");
     return m;
@@ -1080,6 +1081,16 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
         return pe - n;
     };
     if (bi_chunk_ <= 2 || span_now_) return pe - n <= room ? whole() : 0;   /* 1 / 2, or a lone prefill: the piece */
+    /* 6 (15.11.2026, Qwen, qwen/build2/LONGPROMPT.md): never cut. A cut piece's rows take other forms than alone's piece
+     * gives them -- Flash-Next's dense prefill attention splits the KV by the launch's rows (abi/rad_prefill_split.h: 1024
+     * rows of one KV head split in 2, 1345 rows and up not), kBiMinPiece's premise -- and a step wider than the shared
+     * budget beside other sequences is refused (QSA's score plane) or pipelined. The piece runs whole where it fits;
+     * else the request takes the next step alone (bi6_wait_; option 5's lone step for this one request). */
+    if (bi_chunk_ == 6) {
+        if (pe - n <= room) return whole();
+        if (!bi6_wait_) bi6_wait_ = r.id;
+        return 0;
+    }
     /* 3 / 4 beside other work (option D): an end on the grid G (3: the interval, 4: RADIANCE_SCHED_BI_GRID) inside the
      * piece leaving at least kBiMinPiece rows on both sides, or the piece's end; the largest that fits the room. A piece
      * that cannot be cut and does not fit the shared budget runs whole over it when it is the step's first prefill
@@ -2028,6 +2039,44 @@ const RadBatch* Scheduler::step() {
             bi_lone_last_ = false;
         }
     }
+    /* fn4 lever BI chunking 6: the request whose alone piece did not fit beside the last step's other work takes this
+     * step alone (its alone step: the span where it would span alone, nothing beside it), unless the last step was such
+     * a lone step beside decoding sequences -- then their rows go first and it waits one more step. */
+    bool bi6_lone = false;
+    if (bi_chunk_ == 6) {
+        bool any_dec = false;
+        for (int32_t sl : running_) {
+            const SchedReq& q = *reqs_[(size_t)sl];
+            if (!q.req || !q.running) continue;
+            const Request& rr = *q.req;
+            if (!(rr.n_computed < (int64_t)rr.prompt.size() || rr.n_computed + 1 < q.seq_len())) any_dec = true;
+        }
+        const uint64_t want = bi6_wait_;
+        bi6_wait_ = 0;
+        if (want && any_dec && bi6_lone_last_) {
+            bi6_wait_ = want;                  /* the decode rows' turn */
+        } else if (want) {
+            for (int32_t sl : running_) {
+                const SchedReq& q = *reqs_[(size_t)sl];
+                if (q.req && q.running && q.req->id == want &&
+                    q.req->n_computed < (int64_t)q.req->prompt.size()) { bi_lone_slot = sl; break; }
+            }
+            if (bi_lone_slot < 0 && !waiting_.empty() && !free_cards_.empty() &&
+                (int64_t)running_.size() < cfg_.max_seqs) {
+                const SchedReq& w = *reqs_[(size_t)waiting_[0]];
+                if (w.req && w.req->id == want) bi_lone_admit = true;
+            }
+            if (bi_lone_slot >= 0 || bi_lone_admit) {
+                bi6_lone = true;
+                const Request* pr = bi_lone_slot >= 0 ? reqs_[(size_t)bi_lone_slot]->req.get()
+                                                      : reqs_[(size_t)waiting_[0]]->req.get();
+                const int64_t plen = pr ? (int64_t)pr->prompt.size() : 0;
+                span_now_ = cfg_.prefill_span > 1 && (span_min_ == 0 || plen >= span_min_);
+                budget = span_now_ ? cfg_.max_tok : geo_.shared_tok;
+            }
+        }
+        bi6_lone_last_ = bi6_lone && any_dec;
+    }
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
      * decode rows and the chunked path over its prefill rows, so a verifying row rolls back as in
@@ -2094,7 +2143,7 @@ const RadBatch* Scheduler::step() {
         int64_t ckpt = -1;
         int64_t want;
         if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
-        if (bi_chunk_ == 5 && (bi_lone_admit || (bi_lone_slot >= 0 && slot != bi_lone_slot))) { ++i; continue; }
+        if ((bi_chunk_ == 5 || bi6_lone) && (bi_lone_admit || (bi_lone_slot >= 0 && slot != bi_lone_slot))) { ++i; continue; }
         if (prefill && bi_chunk_ == 5) {
             want = plan_chunk(r.n_computed, chunk_end(r, target), budget, &ckpt, r.checkpoint_at, &r);
             if (want <= 0) { ++i; continue; }
@@ -2258,7 +2307,7 @@ const RadBatch* Scheduler::step() {
     /* ---------------------------------------------------------- admission */
     /* Skipped in a step that preempted: the pool just refused a request that already had blocks,
      * so it would refuse a new one, and the queue's front is now the preempted request. */
-    if (!preempted_here && !hold_prefill && !(bi_chunk_ == 5 && !bi_lone_admit)) {
+    if (!preempted_here && !hold_prefill && !((bi_chunk_ == 5 || bi6_lone) && !bi_lone_admit)) {
         /* `at` walks the queue and `took_` is what it admitted: a request whose media is not
          * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
          * after the walk rather than cut at its front. */
@@ -2268,7 +2317,7 @@ const RadBatch* Scheduler::step() {
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
             /* A step planned for one prefill holds that one (span_now_ above). */
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
-            if (bi_chunk_ == 5 && !plan_.e.empty()) break;   /* fn4 BI 5: one admission, alone in its step */
+            if ((bi_chunk_ == 5 || bi6_lone) && !plan_.e.empty()) break;   /* fn4 BI 5 / 6: one admission, alone in its step */
             int32_t slot = waiting_[at];
             SchedReq& s = *reqs_[(size_t)slot];
             /* Generation reserves one position after the prompt. An embedding consumes just

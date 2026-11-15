@@ -63,7 +63,9 @@
  *                   byte-identical; 0 = today                                                      RADIANCE_FN4_ARW_ROWS
  *   sched_bi_chunk  core scheduler: fn4 BI -- a prompt's prefill chunk boundaries the same alone and beside other work
  *                   (ported from ds41-bi: 1 alone's boundaries, 2 the interval grid, 3 / 4 alone's pieces cut on the
- *                   interval / RADIANCE_SCHED_BI_GRID grid, >= 128 rows a side); 0 today          RADIANCE_SCHED_BI_CHUNK
+ *                   interval / RADIANCE_SCHED_BI_GRID grid, >= 128 rows a side; 5 every prefill piece alone in its
+ *                   step; 6 (15.11.) alone's piece whole where it fits beside other work, else alone in its step, never
+ *                   cut); 0 today                                                                  RADIANCE_SCHED_BI_CHUNK
  *   exl3_dual       architecture plugin (rad_fn4_switch): fn4 BI-dual -- every trunk MoE layer's EXL3 down takes the
  *                   step's row bands (libr4d bi_band, exl3 interface v12): a mixed step's decode rows get the decode
  *                   band's bytes in the prefill band's pass; needs RADIANCE_FN4_X3DUAL=1 at start (declares the
