@@ -376,6 +376,9 @@ struct Layer {
     rad_weight ffn_norm = 0;
     rad_op mix_f = 0, col_f = 0, norm_f = 0, post_f = 0;
     MoeFP8 moe{};
+    /* Lever XPF's reading (RADIANCE_DS41_XPM, struct Xpm): this layer's router as a bf16 gemm_nt over a proxy input, and
+     * collapse + ffn_norm over the attention connection's streams (h0, pre_a); 0 where not declared. */
+    rad_op xpm_pred = 0, xpm_cn = 0;
     /* A DSpark target layer: the hc mean of its input streams (after its Engram) into column slice
      * `tap_col` of the drafter's source rows. */
     rad_op tap = 0;
@@ -505,6 +508,54 @@ struct BiTr {
     std::vector<uint32_t> host;
 };
 
+/* Lever XPF's reading (RADIANCE_DS41_XPM=<file>, ds41-xpf 15.11.2026; SPEED-E): how much of a newcomer step's host link
+ * a cross-layer expert prefetch could take, measured before anything is built. Rank 0 only; every other rank declares the
+ * same ops and issues none of them.
+ *   timing steps (the first XPM_TSTEPS, default 6, trunk steps of XPM_MIN..XPM_MAX rows, default 256..2112): an event at
+ *     each trunk layer's start, before its MoE block, before its routed gate_up and after its routed down (MoeFP8::dbg_mark,
+ *     every pass), after its MoE block; read after one synchronisation at the step's end, one text line a step to
+ *     <file>.txt: where the link is busy (the routed GEMMs) and where it idles (everything else).
+ *   dump steps (the next XPM_STEPS, default 12): binary records to <file>.bin (struct XpmRec): kind 0 layer l's router
+ *     over layer l-1's ffn input (act.x before l-1's MoE: 1U-XP's predictor); kind 1 over ffn_norm_l(collapse(h0, pre_a))
+ *     at layer l's start (the ffn input without l's attention update; only where pre_a is already mixed, the fused pcn_a
+ *     of lever M1); kind 2 over xn at l's start (l's attention input); kind 3 layer l's routed ids [T, top_k] i32 and the
+ *     row runs its MoE passes covered; kind 4 layer l's router correction f32 [n_expert] (once); kind 5 layer l's real
+ *     logits f32 [T, n_expert] (layers below XPM_REAL, default 2). The projections are bf16 [T, n_expert] (gemm_nt, bf16
+ *     in, f32 accumulate). Each dump synchronises rank 0's stream right after its copy, so nothing issued later can
+ *     overwrite what it reads.
+ * Declared only when set: per trunk MoE layer one gemm_nt and one mhc_collapse_rmsnorm, and one never-issued bi_rowhash so
+ * passes are not recorded (ctx.cpp's rule for the tracer). Unset: nothing declared, nothing issued, no hook. A measurement
+ * aid: the timing steps are unperturbed only up to the events; the dump steps are slow by design. */
+struct XpmRec {
+    uint32_t magic;   /* 'XPM1' */
+    int32_t  step, T, layer, kind, cols, dtype, nseg;   /* dtype 0 bf16, 1 i32, 2 f32 */
+    int64_t  bytes;
+};
+struct Xpm {
+    bool on = false;
+    std::string path;
+    FILE* fb = nullptr;
+    FILE* ft = nullptr;
+    int64_t min_rows = 256, max_rows = 2112, tsteps = 6, dsteps = 12, real_layers = 2;
+    int64_t tdone = 0, ddone = 0;
+    rad_buf plane = 0;
+    rad_op trace = 0;
+    void* dcol = nullptr;   /* [max_rows, D] bf16 */
+    void* dx = nullptr;     /* [max_rows, D] bf16 */
+    void* dl = nullptr;     /* [max_rows, ne] f32 (the real logits) or bf16 (a projection) */
+    void* hb = nullptr;     /* pinned staging, max_rows * ne * 4 bytes */
+    bool alloc_failed = false;
+    std::vector<uint8_t> bias_done;
+    /* this step */
+    int mode = 0;           /* 0 none, 1 timing, 2 dump */
+    int32_t step = -1;
+    int64_t T = 0;
+    struct Mark { int layer, which; int64_t r0, rows; RadEvent ev; };
+    std::vector<Mark> marks;
+    std::vector<RadEvent> pool;
+    size_t pool_used = 0;
+};
+
 struct Model {
     Names nm{};
     Geom g{};
@@ -622,6 +673,7 @@ struct Model {
     /* The last layer's MoE all-reduce + pcn_fin as one collective (RADIANCE_DS41_AR_PCN=2), or 0. */
     rad_op ar_pcn_fin = 0;
     BiTr bt{};
+    Xpm xpm{};
     /* Lever BI (step_bi): each prefill segment's cu view {0, rows} (sub_i32 of cu at its sequence), a row a segment;
      * the row pitch of every buffer step_bi slices. */
     rad_buf bi_cu = 0;
@@ -641,6 +693,8 @@ struct Model {
     int n_stage = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
+static int xpm_layer_declare(RadBuilder* b, Model& m, Layer& L, int64_t T);   /* lever XPF's reading */
+static int xpm_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx);
 /* The model whose name map is being declared (declare() on this thread). */
 static thread_local Model* naming = nullptr;
 
@@ -3120,6 +3174,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     }
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
+    DS_TRY(xpm_layer_declare(b, m, L, T));   /* lever XPF's reading (RADIANCE_DS41_XPM): unset, nothing */
     if (p1_declared() && L.moe.dk_takes(kBiMoe + 1)) g_sw_p1_ok.store(1, std::memory_order_relaxed);
     /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane */
     L.moe.gar_live = &g_sw_gar;
@@ -4318,6 +4373,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     rf_declare(m, ctx);
     p1_declare(m, ctx);
     DS_TRY(bt_declare(b, m, ctx));
+    DS_TRY(xpm_declare(b, m, ctx));   /* lever XPF's reading (RADIANCE_DS41_XPM) */
     DS_TRY(kvr_declare(b, m, ctx));
     return RAD_OK;
 }
@@ -4779,6 +4835,207 @@ static void bt_flush(RadCtx* x, Model& m, const RadBatch* batch) {
         fwrite(rec.data(), 4, rec.size(), t.f);
     }
     fflush(t.f);
+}
+
+/* ------------------------------------------------------------------ lever XPF's reading (struct Xpm) */
+static const char* xpm_path() {
+    static const char* d = [] {
+        const char* e = std::getenv("RADIANCE_DS41_XPM");
+        return e && *e && std::strcmp(e, "0") ? e : (const char*)nullptr;
+    }();
+    return d;
+}
+static int64_t xpm_env(const char* name, int64_t dflt) {
+    const char* e = std::getenv(name);
+    return e && *e ? std::atoll(e) : dflt;
+}
+static void xpm_cb(RadCtx* c, int layer, int which, int64_t r0, int64_t rows, void* arg);
+/* Per trunk MoE layer, after its MoeFP8 declared: the router projection as a bf16 gemm_nt and the ffn collapse + norm over
+ * the attention connection's streams, both over raw rank-0 buffers (nothing in the arena), and the block's hook. */
+static int xpm_layer_declare(RadBuilder* b, Model& m, Layer& L, int64_t T) {
+    if (!xpm_path() || !L.moe.glm_router.projection) return RAD_OK;
+    const auto& c = m.c;
+    const int64_t D = c.n_embd;
+    L.xpm_pred = op(b, "gemm_nt",
+                    { RAD_RANGE("M", 1, T), RAD_INT("N", L.moe.glm_router.c.experts), RAD_INT("K", D),
+                      RAD_STR("dtype", "bf16") },
+                    { L.moe.glm_router.projection }, {}, {});
+    L.xpm_cn = fused(b, "mhc_collapse_rmsnorm",
+                     { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_F64("eps", c.eps),
+                       RAD_STR("dtype", "bf16") },
+                     { L.ffn_norm }, {}, {});
+    L.moe.dbg_mark = xpm_cb;
+    L.moe.dbg_arg = &m;
+    return RAD_OK;
+}
+/* At the end of a declare: the settings, and one never-issued bi_rowhash (passes are not recorded: ctx.cpp). */
+static int xpm_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    if (!xpm_path()) return RAD_OK;
+    auto& t = m.xpm;
+    t.on = true;
+    t.path = xpm_path();
+    t.min_rows = std::max<int64_t>(1, xpm_env("RADIANCE_DS41_XPM_MIN", 256));
+    t.max_rows = std::min<int64_t>(m.g.max_tok, std::max<int64_t>(t.min_rows, xpm_env("RADIANCE_DS41_XPM_MAX", 2112)));
+    t.tsteps = std::max<int64_t>(0, xpm_env("RADIANCE_DS41_XPM_TSTEPS", 6));
+    t.dsteps = std::max<int64_t>(0, xpm_env("RADIANCE_DS41_XPM_STEPS", 12));
+    t.real_layers = std::max<int64_t>(0, xpm_env("RADIANCE_DS41_XPM_REAL", 2));
+    t.plane = decl_b(b, m.nm.f("xpm_plane"), RAD_I32, { m.g.max_tok, 2 }, RAD_BUF_PERSIST);
+    if (!t.plane) return RAD_E_INVAL;
+    t.trace = op(b, "bi_rowhash", { RAD_RANGE("M", 1, m.g.max_tok) }, {}, { m.mw.ids }, { t.plane });
+    if (!t.trace) return RAD_E_UNSUPPORTED;
+    int np = 0, nc = 0;
+    for (const Layer& L : m.layers) {
+        np += L.xpm_pred ? 1 : 0;
+        nc += L.xpm_cn ? 1 : 0;
+    }
+    if (ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: lever XPF's reading ON (RADIANCE_DS41_XPM=%s): %d router projections, %d "
+                        "collapse + norm, steps of %lld..%lld rows: %lld timed, then %lld dumped (rank 0); passes not "
+                        "recorded\n", t.path.c_str(), np, nc, (long long)t.min_rows, (long long)t.max_rows,
+                (long long)t.tsteps, (long long)t.dsteps);
+    return RAD_OK;
+}
+static RadEvent xpm_event(Xpm& t) {
+    if (t.pool_used == t.pool.size()) {
+        RadEvent e = nullptr;
+        if (rad_event_create(&e) < 0 || !e) return nullptr;
+        t.pool.push_back(e);
+    }
+    return t.pool[t.pool_used++];
+}
+/* At a trunk step's start (step_bi): this step's mode. */
+static void xpm_begin(RadCtx* x, Model& m, const RadBatch* b) {
+    auto& t = m.xpm;
+    t.mode = 0;
+    t.marks.clear();
+    t.pool_used = 0;
+    if (!t.on || rad_rank(x) != 0 || b->draft_pass != 0 || b->n_tok < t.min_rows || b->n_tok > t.max_rows) return;
+    if (t.tdone < t.tsteps) t.mode = 1;
+    else if (t.ddone < t.dsteps) t.mode = 2;
+    else return;
+    if (t.mode == 2 && !t.dx) {
+        if (t.alloc_failed) { t.mode = 0; return; }
+        const int64_t D = m.c.n_embd, MR = t.max_rows, NE = m.c.n_expert;
+        t.dcol = rad_dev_alloc(MR * D * 2, RAD_MEM_DEVICE);
+        t.dx = rad_dev_alloc(MR * D * 2, RAD_MEM_DEVICE);
+        t.dl = rad_dev_alloc(MR * NE * 4, RAD_MEM_DEVICE);
+        t.hb = rad_dev_alloc(MR * NE * 4, RAD_MEM_HOST_PINNED);
+        if (!t.dcol || !t.dx || !t.dl || !t.hb) {
+            fprintf(stderr, "radiance: deepseek41: lever XPF's reading: no memory for its dump buffers; dumps off\n");
+            t.alloc_failed = true;
+            t.mode = 0;
+            return;
+        }
+        t.bias_done.assign(m.layers.size(), 0);
+    }
+    if (!t.fb && t.mode == 2) {
+        const std::string p = t.path + ".bin";
+        t.fb = fopen(p.c_str(), "ab");
+        if (!t.fb) { fprintf(stderr, "radiance: deepseek41: lever XPF's reading cannot open %s\n", p.c_str()); t.on = false; t.mode = 0; return; }
+    }
+    if (!t.ft && t.mode == 1) {
+        const std::string p = t.path + ".txt";
+        t.ft = fopen(p.c_str(), "a");
+        if (!t.ft) { fprintf(stderr, "radiance: deepseek41: lever XPF's reading cannot open %s\n", p.c_str()); t.on = false; t.mode = 0; return; }
+    }
+    t.step = b->step;
+    t.T = b->n_tok;
+}
+/* A mark: an event in timing steps; the row runs of the passes in both. */
+static void xpm_mark(RadCtx* x, Model& m, int layer, int which, int64_t r0 = 0, int64_t rows = 0) {
+    auto& t = m.xpm;
+    if (t.mode == 0) return;
+    RadEvent e = nullptr;
+    if (t.mode == 1) {
+        e = xpm_event(t);
+        if (e && rad_event_record(e, rad_stream(x)) < 0) e = nullptr;
+    }
+    t.marks.push_back({ layer, which, r0, rows, e });
+}
+static void xpm_cb(RadCtx* c, int layer, int which, int64_t r0, int64_t rows, void* arg) {
+    xpm_mark(c, *(Model*)arg, layer, which, r0, rows);
+}
+static void xpm_write(Model& m, int layer, int kind, int cols, int dtype, const std::vector<int32_t>& seg, const void* p,
+                      int64_t bytes) {
+    auto& t = m.xpm;
+    const XpmRec h{ 0x314d5058u, t.step, (int32_t)t.T, layer, kind, cols, dtype, (int32_t)(seg.size() / 2), bytes };
+    fwrite(&h, sizeof h, 1, t.fb);
+    if (!seg.empty()) fwrite(seg.data(), 4, seg.size(), t.fb);
+    if (bytes > 0) fwrite(p, 1, (size_t)bytes, t.fb);
+}
+/* A device range to the file, in stream order: copy, synchronise, write. */
+static void xpm_dump(RadCtx* x, Model& m, int layer, int kind, int cols, int dtype, const void* src, int64_t bytes,
+                     const std::vector<int32_t>& seg = {}) {
+    auto& t = m.xpm;
+    if (!src || bytes <= 0 || bytes > t.max_rows * m.c.n_expert * 4) return;
+    const RadStream st = rad_stream(x);
+    if (rad_memcpy_async(t.hb, src, bytes, st) < 0 || rad_stream_sync(st) < 0) return;
+    xpm_write(m, layer, kind, cols, dtype, seg, t.hb, bytes);
+}
+/* Layer `L`'s router over `in` ([T, D] bf16 rows) into the logits buffer, then to the file as `kind`. */
+static void xpm_pred(RadCtx* x, Model& m, const Layer& L, int kind, RadOperand in, const std::vector<int32_t>& seg = {}) {
+    auto& t = m.xpm;
+    if (t.mode != 2 || !L.xpm_pred) return;
+    const int64_t T = t.T, NE = L.moe.glm_router.c.experts;
+    RAD_ISSUE_N(x, L.xpm_pred, T, in, RAD_W(L.moe.glm_router.projection), praw2(t.dl, RAD_BF16, T, NE));
+    xpm_dump(x, m, L.l, kind, (int)NE, 0, t.dl, T * NE * 2, seg);
+}
+/* Layer `L` at its start (after the previous layer's pcn_a): kind 1 over the rows whose attention mix (pre_a) the fused
+ * pcn_a already wrote (`mixed`, its runs: the record's segments), and kind 2. */
+static void xpm_at_start(RadCtx* x, Model& m, const Layer& L, const std::vector<std::pair<int64_t, int64_t>>& mixed) {
+    auto& t = m.xpm;
+    if (t.mode != 2 || !L.xpm_pred) return;
+    const int64_t T = t.T, D = m.c.n_embd;
+    if (!mixed.empty() && L.xpm_cn) {
+        std::vector<int32_t> seg;
+        for (const auto& r : mixed) { seg.push_back((int32_t)r.first); seg.push_back((int32_t)r.second); }
+        RAD_ISSUE_N(x, L.xpm_cn, T, brows(m.h0, T), brows(m.pre_a, T), praw2(t.dcol, RAD_BF16, T, D), RAD_W(L.ffn_norm),
+                    praw2(t.dx, RAD_BF16, T, D));
+        xpm_pred(x, m, L, 1, praw2(t.dx, RAD_BF16, T, D), seg);
+    }
+    xpm_pred(x, m, L, 2, brows(m.xn, T));
+}
+/* Layer `L` after its MoE block: kind 3 (ids + the passes' row runs), 4 (once) and 5 (the first layers). */
+static void xpm_after_moe(RadCtx* x, Model& m, const Layer& L) {
+    auto& t = m.xpm;
+    if (t.mode != 2) return;
+    std::vector<int32_t> seg;
+    for (const Xpm::Mark& k : t.marks)
+        if (k.layer == L.l && k.which == 1) { seg.push_back((int32_t)k.r0); seg.push_back((int32_t)k.rows); }
+    const int64_t T = t.T, K = m.c.top_k, NE = m.c.n_expert;
+    xpm_dump(x, m, L.l, 3, (int)K, 1, rad_buf_ptr(x, m.mw.ids), T * K * 4, seg);
+    if ((size_t)L.l < t.bias_done.size() && !t.bias_done[(size_t)L.l] && L.moe.glm_router.correction) {
+        t.bias_done[(size_t)L.l] = 1;
+        xpm_dump(x, m, L.l, 4, (int)NE, 2, rad_weight_ptr(x, L.moe.glm_router.correction), NE * 4);
+    }
+    if (L.l < t.real_layers) xpm_dump(x, m, L.l, 5, (int)NE, 2, rad_buf_ptr(x, m.mw.logits), T * NE * 4);
+}
+/* At the step's end: the timing line (one synchronisation), or the dump's end mark. */
+static void xpm_end(RadCtx* x, Model& m) {
+    auto& t = m.xpm;
+    if (t.mode == 0) return;
+    if (t.mode == 2) {
+        xpm_write(m, -1, 9, 0, 0, {}, nullptr, 0);
+        fflush(t.fb);
+        ++t.ddone;
+        t.mode = 0;
+        return;
+    }
+    xpm_mark(x, m, -1, 9);
+    rad_stream_sync(rad_stream(x));
+    RadEvent e0 = nullptr;
+    for (const Xpm::Mark& k : t.marks)
+        if (k.ev) { e0 = k.ev; break; }
+    fprintf(t.ft, "T %d %lld %zu", t.step, (long long)t.T, t.marks.size());
+    for (const Xpm::Mark& k : t.marks) {
+        float ms = -1.0f;
+        if (e0 && k.ev && rad_event_elapsed_ms(e0, k.ev, &ms) < 0) ms = -1.0f;
+        fprintf(t.ft, " %d:%d:%lld:%lld:%.4f", k.layer, k.which, (long long)k.r0, (long long)k.rows, ms);
+    }
+    fprintf(t.ft, "\n");
+    fflush(t.ft);
+    ++t.tdone;
+    t.mode = 0;
 }
 
 /* ------------------------------------------------------------------ step */
@@ -5351,6 +5608,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 g_sw_bi.load(std::memory_order_relaxed), (long long)T, seg.c_str());
     }
     bt_begin(m);
+    xpm_begin(x, m, batch);   /* lever XPF's reading (RADIANCE_DS41_XPM): unset, nothing */
     const RadOperand pos = praw(batch->positions, RAD_I32, T);
     const RadOperand cu = praw(batch->cu_seqlens, RAD_I32, S + 1);
     const auto* wb = kv_batch(batch, m.win);
@@ -5575,6 +5833,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             continue;
         }
         const std::vector<BiSeg>& sg = *cur;   /* the layer's segments, below */
+        xpm_mark(x, m, l, 0);
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
             /* lever E1: the lookup, copy and GEMM over the unique id rows of the launches below that are wider than the
@@ -6017,6 +6276,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bt_pt(x, m, m.act.x, T, "ffn_in", l);
         /* the MoE: one pass a segment (the router, the experts at the segment's rows, the shared arm, the gather and
          * the all-reduce over its rows); the ffn mix beside the first (r0 = 0) */
+        xpm_mark(x, m, l, 3);
+        if (L.l + 1 < c.n_layer) xpm_pred(x, m, m.layers[(size_t)L.l + 1], 0, brows(m.act.x, T));
         MixBeside mb{ &L, &m, T };
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
@@ -6094,6 +6355,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         /* lever PSK-L20: a split layer that ran no MoE pass reports nothing (as a layer skipped whole: the router's
          * counts are another layer's) */
         if (!l20_none) L.moe.route_report(x);
+        xpm_mark(x, m, l, 4);
+        xpm_after_moe(x, m, L);
         bt_pt(x, m, m.mw.logits, T, "router", l);
         bt_pt(x, m, m.mw.ids, T, "ids", l);
         bt_pt(x, m, m.mw.ew, T, "ew", l);
@@ -6130,6 +6393,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 RAD_ISSUE_N(x, L.post_f, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                             R(m.h0, r0, n));
             });
+        xpm_mark(x, m, l, 5);
+        if (nx) xpm_at_start(x, m, *nx, t_mhc_a_l == nx->l ? t_mhc_a : std::vector<std::pair<int64_t, int64_t>>{});
     }
     if (psk && cur != &sg && rad_rank(x) == 0) {   /* lever PSK: a cut step (stats; the first one's cut rows) */
         g_psk_cut_passes.fetch_add(1, std::memory_order_relaxed);
@@ -6174,6 +6439,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         bt_pt(x, m, m.logits, batch->n_out, "logits", -1, 1);
     }
+    xpm_end(x, m);
     bt_flush(x, m, batch);
 }
 

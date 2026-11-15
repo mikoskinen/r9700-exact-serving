@@ -511,6 +511,11 @@ struct MoeFP8 {
      * handles its table entries hold and its place in the routing counts. Quantised experts only;
      * a layer without a description gets no prediction. */
     const MoeFP8*           xp_next = nullptr;
+    /* A measurement aid (deepseek41's RADIANCE_DS41_XPM, lever XPF's reading): called on the issuing thread right before
+     * the routed gate_up (which 1) and right after the routed down (which 2) of every pass, with the pass's rows. Null:
+     * nothing is called (every other architecture, and deepseek41 unless it is set). Issues nothing itself. */
+    void (*dbg_mark)(RadCtx* c, int layer, int which, int64_t r0, int64_t rows, void* arg) = nullptr;
+    void*                   dbg_arg = nullptr;
     RadPrefetchNext         xp{};
     std::vector<rad_weight> xp_parts;
     std::vector<int32_t>    xp_count_at;
@@ -2513,6 +2518,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
+    if (dbg_mark) dbg_mark(c_, layer, 1, r0, rows, dbg_arg);
     if (c.expert_iqr && op_aq)
         RAD_ISSUE_N(c_, op_aq, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     brow_slice(iqr_a.q8, r0, rows, g.n_embd),
@@ -2582,6 +2588,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brows(w.edn, rows * k));
     /* This layer's streamed experts are consumed; the next layer's copies may start. */
     (void)rad_expert_prefetch_mark(c_);
+    if (dbg_mark) dbg_mark(c_, layer, 2, r0, rows, dbg_arg);
     /* The protected experts, over the trailing offsets: the quantised down GEMM zeroed their
      * sorted rows as past its live count, and this down GEMM writes them afterwards (ordered by
      * the shared `edn`). */
