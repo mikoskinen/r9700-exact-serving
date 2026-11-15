@@ -426,7 +426,8 @@
  *                   first, 3 INTERLEAVE (SPEED-C: the host-read entries spread evenly over the chunk; 11 / 19 / 27 over its first
  *                   3/4 / 1/2 / 1/4); bit 2 XR's ring copy (only with RADIANCE_DS41_XRING). The same entries in another order:
  *                   the same bytes. Needs the host pools at bringup (host_pools / rad_host_pool_ranges).
- *   ds41_xpf        deepseek41 (lever XPF, ds41-xpf, SPEED-E; 79 here after exl3_xr): 1 a newcomer / MIXED pass (at least
+ *   ds41_xpf        deepseek41 (lever XPF, ds41-xpf, SPEED-E; 79 here after exl3_xr; 2 .. 128 = 1 with that many copies a
+ *                   layer at most instead of RADIANCE_DS41_XPF_SLOTS): 1 a newcomer / MIXED pass (at least
  *                   RADIANCE_DS41_XPF_MIN rows) predicts each trunk MoE layer's experts before its router (the router over
  *                   its attention input) and the core's prefill prefetch copies the most-picked pinned-pool units onto the
  *                   card under the layer's attention block (rad_xpf_plan; RADIANCE_XPF_MIB ring); 0 none (today). Placement

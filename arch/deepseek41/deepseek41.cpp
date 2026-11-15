@@ -1916,8 +1916,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
         return value == 0 || (value == 1 && g_sw_e2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_moe1"))   /* lever P: 1 needs the dk ops declared at some trunk layer */
         return value == 0 || (value == 1 && g_sw_p1_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_xpf"))   /* lever XPF: 1 needs RADIANCE_DS41_XPF's ops declared */
-        return value == 0 || (value == 1 && g_sw_xpf_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_xpf"))   /* lever XPF: 1 (RADIANCE_DS41_XPF_SLOTS copies a layer) or 2 .. 128 (that many) */
+        return value == 0 || (value >= 1 && value <= 128 && g_sw_xpf_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_rfuse"))   /* lever FUSE-R: 1 needs form 1 declared somewhere, 2 form 2 */
         return value == 0 || (value == 1 && (g_sw_rf_ok.load(std::memory_order_relaxed) & 1)) ||
                (value == 2 && (g_sw_rf_ok.load(std::memory_order_relaxed) & 2)) ? 1 : -1;
@@ -5171,7 +5171,9 @@ static void xpf_next(RadCtx* x, Model& m, const Layer& nx, int64_t T, const std:
     }
     RAD_ISSUE_N(x, nx.xpf_pred, T, in, RAD_W(nx.moe.glm_router.projection), praw2(m.xpf_lg, RAD_BF16, T, NE));
     static const int kp = (int)xpf_knob("RADIANCE_DS41_XPF_KP", 6, 1, 16);
-    static const int sl = (int)xpf_knob("RADIANCE_DS41_XPF_SLOTS", 64, 0, 128);
+    static const int sl_env = (int)xpf_knob("RADIANCE_DS41_XPF_SLOTS", 64, 0, 128);
+    const int swv = g_sw_xpf.load(std::memory_order_relaxed);
+    const int sl = swv > 1 ? swv : sl_env;   /* ds41_xpf 2 .. 128: that many copies a layer at most */
     const void* bias = rad_weight_ptr(x, nx.moe.glm_router.correction);
     const int rc = rad_xpf_plan(x, &nx.moe.xp, (const char*)m.xpf_lg + r0 * NE * 2, n, NE, bias, kp, sl,
                                 from_ffn ? RAD_XPF_DEFER : 0u);
