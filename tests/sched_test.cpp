@@ -1862,6 +1862,62 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
     CHECK_EQ(f.sch.metrics().preempted_waiting, 1);
 }
 
+/* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md): the same squeeze as above, with the switch on. The victim (A)
+ * is preempted while decoding: it keeps its position, its state slot and its card, gives its whole blocks to the cache
+ * (published), and once the pool holds its next step it rejoins from the cache's hit and decodes on from the same
+ * position -- no prefill entry for it after the preemption, nothing replayed. */
+TEST(fn4_preempt_keep_rejoins_a_decoder_at_its_own_position) {
+    std::string err;
+    int da = -1;
+    CHECK(rad::fn4::request("preempt_keep", 1, &err));
+    rad::fn4::apply_pending(0, &da);
+    CHECK_EQ(rad::fn4::preempt_keep(), 1);
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 24, /*priority=*/0);
+    const uint64_t b = f.submit(160, 8, /*priority=*/5);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    const int32_t slot_a = f.sch.find(a)->state_slot;
+    const RadBatch* s2 = f.sch.step();
+    CHECK(s2 != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+    CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)160);      /* kept, not reset to zero */
+    CHECK(f.kv.kept.count(a) == 1);
+    CHECK_EQ(f.kv.kept[a], (int64_t)160);
+    CHECK(f.pc.published.size() >= 1);                      /* its prefix went to the cache first */
+    f.commit_plain();
+    /* b decodes to its end; the cache then holds a's 160 tokens (FakePC: the seeded blocks are the hit) */
+    bool rejoined = false, a_prefill = false, a_decode_at_160 = false;
+    for (int k = 0; k < 60; ++k) {
+        /* the step a rejoins in plans nothing for it (it decodes from the next one): an empty step, as an idle engine
+         * takes it and steps again */
+        if (f.sch.step()) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a) {
+                    if (e.is_prefill) a_prefill = true;
+                    if (!rejoined && !e.is_prefill && e.ctx_len == 160) a_decode_at_160 = true;
+                    rejoined = true;
+                }
+            f.commit_plain();
+        }
+        if (!f.sch.find(a)) break;
+        /* once b is done, the cache holds a's 160 tokens again (FakePC: the seeded blocks are the hit) */
+        const Request* rb = f.sch.find(b);
+        if ((!rb || rb->state != ReqState::Running) && !rejoined && f.pc.attn == 0) f.pc.seed(160);
+    }
+    CHECK(rejoined);
+    CHECK(a_decode_at_160);                                  /* it decodes on from where it was */
+    CHECK(!a_prefill);                                       /* nothing replayed */
+    CHECK(f.kv.kept.count(a) == 0);
+    CHECK_EQ(f.sch.preempt_keep_counts()[0], (int64_t)1);
+    CHECK_EQ(f.sch.preempt_keep_counts()[1], (int64_t)1);
+    (void)slot_a;
+    CHECK(rad::fn4::request("preempt_keep", 0, &err));
+    rad::fn4::apply_pending(1, &da);
+}
+
 /* ================================================================== the step batch */
 /* A PREEMPTED PREFILL WAITS FOR ROOM FOR THE WHOLE RECOMPUTE plus one block per running
  * sequence. Admitting it on a shortfall is what makes the prefill loop: the next decode takes

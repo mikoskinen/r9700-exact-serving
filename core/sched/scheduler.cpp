@@ -1491,6 +1491,45 @@ bool Scheduler::preempt_back() {
      * is published first: the recompute adopts it from the cache, and under pressure the cache gives
      * the blocks back (the newest entries last). */
     const bool published = publish_prefix(s);
+    /* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md; condition 2 of hero2/QWEN-LP-IDENTITY.md): a recompute replays
+     * the generated tokens as prefill rows -- other arithmetic than the verify steps that computed them (D2: u10
+     * preempted after 581 tokens, 576 + 14 rows replayed, the answer differs from char 11,421). A decoding request
+     * instead gives up its whole blocks (the cache holds them: published above) and keeps its state slots, partial
+     * blocks, card and drafter state; it rejoins at this position (rejoin_kept) with nothing replayed. */
+    if (fn4::preempt_keep() > 0) {
+        const char* no = !published ? "its prefix was not published"
+                       : r.embed ? "an embedding input"
+                       : r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len() ? "it is prefilling"
+                       : kv_->has_runtime_window(r.id) ? "a runtime window"
+                       : !keep_possible() ? "inert here" : nullptr;
+        if (no && pk_n_[2] < 1000) {
+            ++pk_n_[2];
+            RAD_INFO("fn4 preempt_keep: request %llu preempted by recompute (%s; %lld of %lld tokens computed)",
+                     (unsigned long long)r.id, no, (long long)r.n_computed, (long long)s.seq_len());
+        }
+    }
+    if (fn4::preempt_keep() > 0 && published && !r.embed && r.n_computed >= (int64_t)r.prompt.size() &&
+        r.n_computed + 1 >= s.seq_len() && !kv_->has_runtime_window(r.id) && keep_possible()) {
+        const int64_t whole = kv_->preempt_keep(r.id);
+        if (whole >= 0) {
+            s.keep_whole = whole;
+            r.state = ReqState::Preempted;
+            s.preempted_us = mono_us();
+            /* the step's window only (Sampler::build_step); the proposal in s.draft is the next verify's */
+            r.n_draft = 0;
+            r.draft = nullptr;
+            r.draft_parent = nullptr;
+            s.running = false;
+            running_.pop_back();
+            queue_insert(waiting_, slot);
+            ++m_.preemptions;
+            ++pk_n_[0];
+            RAD_INFO("fn4 preempt_keep: request %llu kept at %lld tokens (%lld in whole blocks to the cache, the rest "
+                     "and its states kept; card %d)", (unsigned long long)r.id, (long long)r.n_computed,
+                     (long long)whole, (int)s.card);
+            return published;
+        }
+    }
     kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;
@@ -1511,6 +1550,94 @@ bool Scheduler::preempt_back() {
     queue_insert(waiting_, slot);   /* original arrival -> the front of its priority class */
     ++m_.preemptions;
     return published;
+}
+
+/* fn4 preempt_keep: a rejoin puts every paged group back from the cache, so every paged group must be one the cache
+ * indexes (a drafter's own uncached group would come back empty). */
+bool Scheduler::keep_possible() {
+    if (pk_ok_ < 0) {
+        pk_ok_ = cfg_.prefix_cache && pc_ ? 1 : 0;
+        if (pk_ok_) {
+            const std::vector<int32_t>& cg = pc_->cached_groups();
+            for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+                if (!kvgeom_.g[g].paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+                if (std::find(cg.begin(), cg.end(), (int32_t)g) == cg.end()) pk_ok_ = 0;
+            }
+        }
+        if (!pk_ok_) RAD_WARN("fn4 preempt_keep: inert here (no prefix cache, or a paged group it does not index)");
+    }
+    return pk_ok_ > 0;
+}
+
+/* fn4 preempt_keep: a kept request back into the running set at its own position. 1 rejoined (it decodes from the next
+ * step), -1 the cache no longer holds its whole blocks (it is now an ordinary preempted request at zero: recomputed). */
+int Scheduler::rejoin_kept(SchedReq& s) {
+    Request& r = *s.req;
+    /* the publish indexed prompt ++ output: the rejoin restores and looks that up (the prompt alone would stop at the
+     * first generated token) */
+    std::vector<int32_t> toks;
+    toks.reserve(r.prompt.size() + r.output.size());
+    toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
+    toks.insert(toks.end(), r.output.begin(), r.output.end());
+    pc_->whole_sequence(&toks);
+    const RestoreResult rr = pc_->restore(r, /*whole_only=*/true);
+    /* no snapshot: the sequence's own states are its position */
+    static const std::vector<int64_t> kNoSnapshot;
+    HitCap cap;
+    cap.tokens = -1;
+    cap.resume_at = &kNoSnapshot;
+    const CacheHit h = pc_->lookup(r, &hit_blocks_, &cap);
+    pc_->whole_sequence(nullptr);
+    const std::vector<int32_t>& cg = pc_->cached_groups();
+    /* A chain the pool cannot take back whole yet (Declined), or one whose host copies are still landing (Cut): wait,
+     * as a preempted request waits for room -- up to kKeepTries attempts, then today's recompute. */
+    if (h.n_attn_tokens < s.keep_whole && rr != RestoreResult::Whole && ++s.keep_tries < kKeepTries) {
+        if (s.keep_tries == 1 || s.keep_tries % 16 == 0)
+            RAD_INFO("fn4 preempt_keep: request %llu waits to rejoin (restore %s, %lld of %lld tokens in VRAM, try %d)",
+                     (unsigned long long)r.id, rr == RestoreResult::Cut ? "cut" : "declined",
+                     (long long)h.n_attn_tokens, (long long)s.keep_whole, s.keep_tries);
+        return 0;
+    }
+    bool ok = h.n_attn_tokens >= s.keep_whole && hit_blocks_.size() >= cg.size();
+    for (size_t i = 0; ok && i < cg.size(); ++i) {
+        std::vector<int32_t> w = hit_blocks_[i];
+        const int64_t nb = s.keep_whole / kvgeom_.g[(size_t)cg[i]].block_size;
+        if ((int64_t)w.size() < nb) { ok = false; break; }
+        w.resize((size_t)nb);
+        if (kv_->rejoin(r.id, cg[i], w) < 0) ok = false;
+    }
+    if (!ok) {
+        RAD_WARN("fn4 preempt_keep: request %llu cannot rejoin (the cache gives back %lld of %lld tokens, restore %s, "
+                 "try %d): recomputed", (unsigned long long)r.id, (long long)h.n_attn_tokens, (long long)s.keep_whole,
+                 rr == RestoreResult::Whole ? "whole" : rr == RestoreResult::Cut ? "cut" : "declined", s.keep_tries);
+        ++pk_n_[2];
+        unkeep(s);
+        return -1;
+    }
+    s.keep_whole = -1;
+    s.keep_tries = 0;
+    r.state = ReqState::Running;
+    s.preempted_us = 0;
+    s.running = true;
+    ++pk_n_[1];
+    RAD_INFO("fn4 preempt_keep: request %llu rejoined at %lld tokens (card %d), nothing replayed",
+             (unsigned long long)r.id, (long long)r.n_computed, (int)s.card);
+    return 1;
+}
+
+void Scheduler::unkeep(SchedReq& s) {
+    Request& r = *s.req;
+    if (kv_->has_sequence(r.id)) kv_->preempt(r.id);
+    drop_card(s);
+    r.n_computed = 0;
+    r.n_cached = 0;
+    r.n_accepted = 0;
+    s.drafter_reset();
+    r.n_draft = 0;
+    r.draft = nullptr;
+    r.draft_parent = nullptr;
+    s.keep_whole = -1;
+    s.keep_tries = 0;
 }
 
 /* ------------------------------------------------------------------ admission */
@@ -1849,10 +1976,24 @@ void Scheduler::undo_hit(SchedReq& s) {
  * which is the loop. */
 bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     const Request& r = *s.req;
-    const int64_t target = s.seq_len();
+    /* fn4 preempt_keep: a kept request needs its next verify's rows, not a recompute (its states are kept) */
+    const bool kept = s.keep_whole >= 0;
+    const int64_t target = kept ? r.n_computed + 1 + std::max<int64_t>(s.n_draft, 0) + 4 : s.seq_len();
     /* What the recompute adopts from the cache (its own prefix, published at the preemption) needs
      * no new block. */
-    const int64_t hit = (cfg_.prefix_cache && pc_) ? pc_->lookup(r, nullptr, nullptr).n_attn_tokens : 0;
+    int64_t hit = 0;
+    if (cfg_.prefix_cache && pc_) {
+        /* a kept request's publish indexed prompt ++ output (rejoin_kept) */
+        std::vector<int32_t> toks;
+        if (kept) {
+            toks.reserve(r.prompt.size() + r.output.size());
+            toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
+            toks.insert(toks.end(), r.output.begin(), r.output.end());
+            pc_->whole_sequence(&toks);
+        }
+        hit = pc_->lookup(r, nullptr, nullptr).n_attn_tokens;
+        if (kept) pc_->whole_sequence(nullptr);
+    }
 
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
         const KVGeom::G& gg = kvgeom_.g[g];
@@ -1880,7 +2021,7 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     /* Stateful groups: the recompute needs its state slots back, and every running sequence must
      * keep the slot it already holds. A sequence the manager does not know is not a refusal:
      * admit_one adds it, and can_grow on a missing id is false forever. */
-    if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
+    if (!kept && kv_->has_sequence(r.id) && !kv_->can_grow(r.id, target)) return false;
     for (int32_t slot : running_) {
         const SchedReq& rs = *reqs_[(size_t)slot];
         if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
@@ -2389,6 +2530,27 @@ const RadBatch* Scheduler::step() {
                 share_step && !s.req->embed && at + 1 < waiting_.size() &&
                 (int64_t)plan_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
                     ? share_tok : 0;
+            /* fn4 preempt_keep: a kept request rejoins at its own position once the pool holds its next verify; it waits
+             * as a preempted request does (an overdue one holds the queue behind it) */
+            if (s.keep_whole >= 0) {
+                if (!preempted_can_prefill(s)) {
+                    if (preempt_wait_overdue(s)) break;
+                    ++at;
+                    continue;
+                }
+                const int kr = rejoin_kept(s);
+                if (kr > 0) {
+                    took_.push_back(at);   /* into running_ below; it decodes from the next step */
+                    ++at;
+                    continue;
+                }
+                if (kr == 0) {             /* its blocks are coming back: wait as a preempted request does */
+                    if (preempt_wait_overdue(s)) break;
+                    ++at;
+                    continue;
+                }
+                /* the cache lost its blocks: an ordinary preempted request now (n_computed 0), admitted below */
+            }
             admit_full_ = 0;
             admit_next_step_ = false;
             const int as = admit_one(s, budget, areserve);

@@ -102,6 +102,13 @@
  *                   its own pieces from 0 with the alone span, keep_at 0), the deepest such at or below the hit
  *                   (HitCap::resume_at), and a head other prompts share (CacheHit::branch_at) takes no snapshot cut
  *                   (Request::checkpoint_at stays 0); 0 today                                       RADIANCE_FN4_RESUME_COLD
+ *   preempt_keep    core scheduler + KV manager (15.11.2026, qwen/EXACT-PRESSURE.md): a decoding request preempted for
+ *                   KV is not recomputed -- 1: it publishes its prefix as today, gives up its whole blocks only
+ *                   (KVManager::preempt_keep), keeps its state slots (linear with the replay copies, conv, QSA tail, PLE),
+ *                   its partial last blocks, its card's StepSlot and its drafter state, and rejoins at the same position
+ *                   once the pool holds its next verify (rejoin_kept: the cache's hit puts the whole blocks back, nothing
+ *                   is prefilled); a hit the cache can no longer give falls back to today's recompute (counted); 0 today
+ *                                                                                                   RADIANCE_FN4_PREEMPT_KEEP
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -122,7 +129,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kResumeCold, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kResumeCold, kPreemptKeep, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
@@ -140,6 +147,10 @@ int  sched_bi_chunk();
  * (RADIANCE_FN4_RESUME_COLD at start): 0 today, 1 a hit resumes only where this prompt's idle cold prefill starts a chunk
  * and no prompt is cut at a head other prompts share (core/sched/scheduler.cpp cold_starts). */
 int  resume_cold();
+/* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md): 1 a decoding request preempted for KV keeps its state slots,
+ * its partial last blocks and its card, and rejoins at the same position with nothing replayed (Scheduler::preempt_back,
+ * rejoin_kept); 0 today (preemption by recompute) -- RADIANCE_FN4_PREEMPT_KEEP at start. */
+int  preempt_keep();
 bool aql_acq_none();
 
 /* Server thread: queue a value; false (with the reason) for an unknown switch or a bad value. */

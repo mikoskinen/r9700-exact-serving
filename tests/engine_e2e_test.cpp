@@ -2207,6 +2207,94 @@ TEST(preemption_by_recompute_continues_each_stream_exactly) {
     CHECK_EQ(s.stop(), 0);
 }
 
+/* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md) on the host backend: a request preempted while decoding keeps
+ * its states, partial blocks and card and gives its whole blocks to the prefix cache. Here the cache has no host tier
+ * (no device gather / scatter on the host backend: "the tiers are off"), so under the pressure that preempted it the
+ * cache gives those blocks back to the pool, the rejoin cannot get them, and the request falls back to today's
+ * recompute. The fallback must be clean: every stream returns its whole length, the run preempted, the log says
+ * kept and recomputed. (A decoded token replayed by prefill rounds differently on a GDN model, so the streams are not
+ * compared to alone here; with tiers -- the cards -- the rejoin is the path, and qwen/EXACT-PRESSURE.md reads it.) */
+TEST(fn4_preempt_keep_without_a_host_tier_falls_back_to_recompute_cleanly) {
+    REQUIRE(world().ok);
+    for (const bool spec : { false, true }) {
+        std::vector<std::vector<int32_t>> prompts;
+        for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(300 + i, 200 + 20 * i));
+        std::vector<std::string> base = { "--num-speculative-tokens", spec ? "4" : "0" };
+        std::vector<std::vector<int32_t>> alone;
+        {
+            Server s;
+            REQUIRE(s.start(world().qwen35_kv, base));
+            for (const auto& p : prompts)
+                alone.push_back(tokens_of(post(s.port, "/completion", completion(p, 64))));
+            CHECK_EQ(s.stop(), 0);
+        }
+        std::vector<std::string> args = base;
+        for (const std::string& a : small_pool_args()) args.push_back(a);
+        /* a host tier, as the served line has: the pool gives the cache's blocks back under this pressure, and the
+         * victim's whole blocks must still be there when it rejoins */
+        args.push_back("--prefix-cache-mib");
+        args.push_back("16");
+        int64_t longest = 0, together = 0;
+        for (const auto& p : prompts) {
+            longest = std::max<int64_t>(longest, (int64_t)p.size() + 64);
+            together += (int64_t)p.size() + 64;
+        }
+        auto pool_at = [&](int mib) -> int64_t {
+            Server probe;
+            probe.quiet = true;
+            if (!probe.start(world().qwen35_kv, args, device_env(mib))) return -1;
+            return pool_tokens(probe.output());
+        };
+        int64_t pool = 0;
+        std::string why;
+        /* decoding: the largest pool under what the four reach together, so the growth preempts a decoder */
+        const int mib = small_device(pool_at, longest, together - 40, true, &pool, &why);
+        if (!mib) fprintf(stderr, "    no small pool: %s\n", why.c_str());
+        REQUIRE(mib > 0);
+        std::vector<std::string> env = device_env(mib);
+        env.push_back("RADIANCE_FN4_PREEMPT_KEEP=1");
+        env.push_back("RADIANCE_LOG=info");
+        Server s;
+        REQUIRE(s.start(world().qwen35_kv, args, env));
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[i], 64).dump()));
+        int same = 0;
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+            if (t != alone[(size_t)i])
+                fprintf(stderr, "    spec %d prompt %d\n    alone    %s\n    together %s\n", (int)spec, i,
+                        show(alone[(size_t)i]).c_str(), show(t).c_str());
+            same += t == alone[(size_t)i];
+            CHECK_EQ(t.size(), alone[(size_t)i].size());
+        }
+        const double n = metric(s.port, "vllm:num_preemptions_total");
+        CHECK_EQ(s.stop(), 0);
+        const std::string log = s.output();
+        const bool kept = log.find("fn4 preempt_keep: request") != std::string::npos &&
+                          (log.find("rejoined at") != std::string::npos || log.find("recomputed") != std::string::npos);
+        fprintf(stderr, "    spec %d: %d MiB, a pool of %lld tokens, preempted %g times, kept + rejoined %s, %d / 4 "
+                        "streams = alone\n", (int)spec, mib, (long long)pool, n, kept ? "yes" : "NO", same);
+        if (!kept || same < 4) {
+            size_t a = 0;
+            for (int k = 0; k < 400 && a < log.size(); ++k) {
+                const size_t b = log.find('\n', a);
+                const std::string line = log.substr(a, b == std::string::npos ? std::string::npos : b - a);
+                if (line.find("preempt") != std::string::npos || line.find("prefix cache") != std::string::npos ||
+                    line.find("kv tiers") != std::string::npos || line.find("restore") != std::string::npos)
+                    fprintf(stderr, "      | %s\n", line.c_str());
+                if (b == std::string::npos) break;
+                a = b + 1;
+            }
+        }
+        CHECK(n > 0);
+        CHECK(kept);
+        CHECK(same >= 2);
+    }
+}
+
 /* ================================================================== image generation */
 
 namespace {

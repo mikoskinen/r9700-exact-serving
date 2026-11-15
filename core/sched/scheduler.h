@@ -142,6 +142,11 @@ struct SchedReq {
      * admission happens). */
     bool     restore_cut = false;
 
+    /* fn4 preempt_keep: preempted while decoding with its states, partial blocks and card kept (KVManager::preempt_keep);
+     * the tokens its whole blocks covered, which the rejoin's hit must give back; -1 when not kept. */
+    int64_t  keep_whole = -1;
+    int32_t  keep_tries = 0;   /* rejoin attempts that waited for the cache to give the whole blocks back */
+
     /* The whole sequence is prompt ++ output; n_computed indexes into it. */
     int64_t  seq_len() const {
         return (int64_t)req->prompt.size() + (int64_t)req->output.size();
@@ -559,8 +564,17 @@ private:
     std::vector<int64_t> cold_starts_;
     void          cold_starts(const Request& r, int64_t target, std::vector<int64_t>* out);
     int64_t       rc_n_[4] = {0, 0, 0, 0};   /* resume_cold: hits looked up, stepped back, rows stepped back, heads not cut */
+    /* fn4 preempt_keep: kept, rejoined, fallen back to a recompute; whether every paged group is prefix-cached (-1 not
+     * known yet), the condition for a rejoin to put every block back */
+    int64_t       pk_n_[3] = {0, 0, 0};
+    int           pk_ok_ = -1;
+    static constexpr int32_t kKeepTries = 256;
+    bool          keep_possible();
+    int           rejoin_kept(SchedReq& s);
+    void          unkeep(SchedReq& s);
 public:
     const int64_t* resume_cold_counts() const { return rc_n_; }
+    const int64_t* preempt_keep_counts() const { return pk_n_; }
 private:
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share);

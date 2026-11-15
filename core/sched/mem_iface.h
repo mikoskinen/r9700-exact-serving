@@ -74,6 +74,14 @@ struct IKVManager {
 
     /* Free the blocks and mark the sequence for re-prefill. */
     virtual int  preempt(uint64_t seq) = 0;
+    /* fn4 preempt_keep (KVManager::preempt_keep / rejoin): give up the whole blocks only, keep the partial last blocks
+     * and the state slots; the tokens the whole blocks covered, < 0 unsupported. rejoin puts a hit's whole blocks back
+     * in front of the kept ones. */
+    virtual int64_t preempt_keep(uint64_t seq) { (void)seq; return RAD_E_UNSUPPORTED; }
+    virtual int  rejoin(uint64_t seq, int32_t group, const std::vector<int32_t>& whole) {
+        (void)seq; (void)group; (void)whole;
+        return RAD_E_UNSUPPORTED;
+    }
 
     /* Whether a sequence of this length fits an empty pool. If not, the request fails at once
      * instead of deadlocking the engine (spec §17). */
@@ -189,6 +197,9 @@ struct IPrefixCache {
      * null, ends the hit early (HitCap, core/mem/prefix.h). */
     virtual CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
                             const HitCap* cap) const = 0;
+    /* fn4 preempt_keep (Scheduler::rejoin_kept): while set, lookup and restore key on these tokens -- a kept request's
+     * prompt ++ output, which its publish indexed -- instead of the prompt; nullptr goes back to the prompt. */
+    virtual void whole_sequence(const std::vector<int32_t>* tokens) { (void)tokens; }
     virtual const std::vector<int32_t>& cached_groups() const = 0;
     /* The drafter's refill window (Scheduler::init): retention keeps a snapshot that deep below a
      * session's tip, so a refill-capped hit has one to end on (PrefixCache::set_drafter_floor). */
@@ -347,6 +358,8 @@ struct KVBinding final : IKVManager {
         return m->adopt(s, g, b, n);
     }
     int  preempt(uint64_t s) override               { return m->preempt(s); }
+    int64_t preempt_keep(uint64_t s) override       { return m->preempt_keep(s); }
+    int  rejoin(uint64_t s, int32_t g, const std::vector<int32_t>& w) override { return m->rejoin(s, g, w); }
     bool can_ever_fit(int64_t n) const override     { return m->can_ever_fit(n); }
     bool can_grow(uint64_t s, int64_t n) const override { return m->can_grow(s, n); }
     int  release_idle_states() override                 { return m->release_idle_states(); }
@@ -449,8 +462,10 @@ struct PCBinding final : IPrefixCache {
                     const HitCap* cap) const override {
         media_keys(r, &mm_, salt_id);
         /* r.id: the admission takes its conversation's snapshots over. */
-        return m->lookup(r.prompt, mm_, out, cap, r.id);
+        return m->lookup(seq_ ? *seq_ : r.prompt, mm_, out, cap, r.id);
     }
+    const std::vector<int32_t>* seq_ = nullptr;
+    void whole_sequence(const std::vector<int32_t>* tokens) override { seq_ = tokens; }
 
     /* Installed by the engine when the idle tiers are on; empty otherwise. */
     std::function<RestoreResult(const Request&, bool whole_only)> restore_fn;
@@ -468,20 +483,21 @@ struct PCBinding final : IPrefixCache {
                                         RestoreResult* res = nullptr) {
         if (res) *res = RestoreResult::Whole;
         media_keys(r, &mm_, salt);
-        std::vector<BlockHash> want = m->restorable_from(r.prompt, mm_);
+        const std::vector<int32_t>& P = seq_ ? *seq_ : r.prompt;   /* fn4 preempt_keep: prompt ++ output */
+        std::vector<BlockHash> want = m->restorable_from(P, mm_);
         const int64_t need = (int64_t)want.size() - m->restore_room();
         if (need <= 0) return want;
-        const int64_t k = m->trim_for(r.prompt, mm_, need);
-        if (k < need && flush_fn && flush_fn()) (void)m->trim_for(r.prompt, mm_, need - k);
+        const int64_t k = m->trim_for(P, mm_, need);
+        if (k < need && flush_fn && flush_fn()) (void)m->trim_for(P, mm_, need - k);
         /* Landing copies may have moved records; take the chain again against the room made. */
         if (whole_only) {
-            want = m->restorable_from(r.prompt, mm_);
+            want = m->restorable_from(P, mm_);
             if ((int64_t)want.size() <= m->restore_room()) return want;
             if (res) *res = RestoreResult::Declined;
             return {};
         }
         bool cut = false;
-        want = m->restorable_from(r.prompt, mm_, m->restore_room(), &cut);
+        want = m->restorable_from(P, mm_, m->restore_room(), &cut);
         if (cut && res) *res = RestoreResult::Cut;
         return want;
     }
