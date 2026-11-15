@@ -94,7 +94,10 @@ inline int64_t xp_device_bytes(int64_t unit, int64_t layers) {
  * The ring is two groups of slots; layers alternate. A group's patches are restored by the next plan into that group
  * (the layer two back, whose GEMMs ran before it in stream order) and by the pass-end call (rad_xpf_plan with next
  * null). Sized by RADIANCE_XPF_MIB (VRAM budget term); unset: no ring, no queue, nothing runs. */
-constexpr int kXpfParts     = 8;     /* table entries an EXL3 unit is redirected through (7 planes, down's suh twice) */
+/* Table entries an EXL3 unit is redirected through: its 7 planes in every op's table that names them -- a table is per
+ * (op, operand), so gate_up, down and their decode-band twins (lever P's _dk ops) each hold their own (16 on DeepSeek-V4.1:
+ * x3 run e3 planned nothing at 8, every expert left out). */
+constexpr int kXpfParts     = 24;
 constexpr int kXpfMaxSlots  = 128;   /* copies a layer at most */
 constexpr int kXpfChunk     = 8;     /* copies a DMA list (its own done word) */
 constexpr int kXpfChunks    = kXpfMaxSlots / kXpfChunk;
@@ -113,9 +116,10 @@ struct XpfBox {
     volatile uint32_t seq;
 };
 /* [0] planned (copies asked), [1] patched (copies that landed in time, units), [2] used (patched units the layer
- * routed, counted at the restore), [3] plans, [4] candidates seen (pooled units with a pick), [5] restores. */
+ * routed, counted at the restore), [3] plans, [4] candidates seen (pooled units with a pick), [5] restores, [6] experts
+ * with a pick, [7] of them with no mapped entry. */
 struct XpfStats {
-    unsigned int planned, patched, used, plans, cands, restores, pad[2];
+    unsigned int planned, patched, used, plans, cands, restores, picked, unmapped;
 };
 
 }  /* namespace rad */

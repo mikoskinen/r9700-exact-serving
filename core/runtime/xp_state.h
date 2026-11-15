@@ -85,6 +85,7 @@ struct XpfLayer {
     void**   map   = nullptr;    /* device [kXpMaxNe][kXpfParts] */
     int32_t* place = nullptr;    /* device [kXpMaxNe] */
     bool     bound = false, tried = false;
+    int      mapped = 0, entries_max = 0;
 };
 struct XpfReq {
     int       g    = 0;
@@ -122,6 +123,7 @@ struct XpfState {
     std::deque<std::pair<void*, int64_t>> marks;   /* thread only: a mark and the list that polls it */
     bool         dirty[2] = { false, false };
     int64_t      plans = 0;
+    bool         said_bind = false;
     std::thread              thr;
     std::mutex               mu;
     std::condition_variable  cv;

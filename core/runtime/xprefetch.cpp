@@ -539,10 +539,11 @@ void Ctx::xpf_close() {
     while (rad_xp_behind(x.device) > 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (stream_ && rad_memcpy_async(x.stats_h, x.stats, sizeof(XpfStats), stream_) >= 0 && rad_stream_sync(stream_) >= 0)
-        RAD_INFO("rank %d: lever XPF: %u plans, %u copies planned of %u candidates, %u landed in time and patched, %u of "
-                 "those routed; %lld DMA lists, %lld requests dropped (queue behind), %lld late mailboxes", rank_,
-                 x.stats_h->plans, x.stats_h->planned, x.stats_h->cands, x.stats_h->patched, x.stats_h->used,
-                 (long long)x.lists.load(), (long long)x.dropped.load(), (long long)x.late.load());
+        RAD_INFO("rank %d: lever XPF at the end: %u plans, %u copies planned of %u candidates (%u experts picked, %u "
+                 "unmapped), %u landed in time and patched, %u of those routed; %lld DMA lists, %lld requests dropped (queue "
+                 "behind), %lld late mailboxes", rank_, x.stats_h->plans, x.stats_h->planned, x.stats_h->cands,
+                 x.stats_h->picked, x.stats_h->unmapped, x.stats_h->patched, x.stats_h->used, (long long)x.lists.load(),
+                 (long long)x.dropped.load(), (long long)x.late.load());
     xpf_free(x);
     xpf_.reset();
 }
@@ -649,9 +650,17 @@ bool Ctx::xpf_bind(XpfLayer& L, const RadPrefetchNext& nx, int layer) {
                 ent[k++] = (void**)t.dev + m.entry;
             }
         }
-        if (usable)
+        if (usable) {
             for (int q = 0; q < kXpfParts; ++q) hm[(size_t)(e * kXpfParts + q)] = (void**)ent[q];
+            ++L.mapped;
+            L.entries_max = std::max(L.entries_max, k);
+        }
         hp[(size_t)e] = nx.count_at ? nx.count_at[e] : (int32_t)e;
+    }
+    if (rank_ == 0 && !xpf_->said_bind) {
+        xpf_->said_bind = true;
+        RAD_INFO("rank 0: lever XPF: layer %d's units mapped to their table entries: %d of %lld experts, at most %d entries "
+                 "a unit (of %d)", layer, L.mapped, (long long)nx.n_expert, L.entries_max, kXpfParts);
     }
     XpfState& x = *xpf_;
     void** map = x.maps + (size_t)layer * kXpMaxNe * kXpfParts;
@@ -747,11 +756,11 @@ int Ctx::xpf_plan(const RadPrefetchNext* nx, const void* logits, int64_t rows, i
         XpfStats h;
         std::memcpy(&h, (const void*)x.stats_h, sizeof h);
         if (x.plans > 2048)
-            RAD_INFO("rank %d: lever XPF: %u plans, %u copies planned of %u candidates, %u landed in time (%.1f%%), %u of "
-                     "those routed (%.1f%%); %lld DMA lists, %lld plans dropped behind the queue, %lld late mailboxes", rank_,
-                     h.plans, h.planned, h.cands, h.patched, h.planned ? 100.0 * h.patched / h.planned : 0.0, h.used,
-                     h.patched ? 100.0 * h.used / h.patched : 0.0, (long long)x.lists.load(), (long long)x.dropped.load(),
-                     (long long)x.late.load());
+            RAD_INFO("rank %d: lever XPF: %u plans, %u copies planned of %u candidates (%u experts picked, %u unmapped), %u "
+                     "landed in time (%.1f%%), %u of those routed (%.1f%%); %lld DMA lists, %lld plans dropped behind the "
+                     "queue, %lld late mailboxes", rank_, h.plans, h.planned, h.cands, h.picked, h.unmapped, h.patched,
+                     h.planned ? 100.0 * h.patched / h.planned : 0.0, h.used, h.patched ? 100.0 * h.used / h.patched : 0.0,
+                     (long long)x.lists.load(), (long long)x.dropped.load(), (long long)x.late.load());
         (void)rad_memcpy_async(x.stats_h, x.stats, sizeof(XpfStats), cs);
     }
     return RAD_OK;

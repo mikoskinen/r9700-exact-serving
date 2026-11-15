@@ -363,6 +363,8 @@ __global__ __launch_bounds__(512) void xpf_plan(int32_t* cnt, uint32_t ne, void*
         if (c > 0) {
             void** ent = map[(size_t)tid * P];
             int pi = -1;
+            atomicAdd(&stats->picked, 1u);
+            if (!ent) atomicAdd(&stats->unmapped, 1u);
             if (ent) {
                 const uint64_t p = (uint64_t)*(void* volatile*)ent;
                 for (int i = 0; i < pools.n; ++i)
