@@ -3485,7 +3485,8 @@ int ds_nvfast() {
 }
 
 /* Lever DKV-U's LDS knob: RADIANCE_DS41_DKV_NOLDS=1 (read once; unset: 0): the unpacked attention's WMMA form without the
- * transposing LDS (NL: the plain form's LDS and occupancy; a packed tile decoded lane by lane). */
+ * transposing LDS (NL: the plain form's LDS and occupancy; a packed tile decoded lane by lane) at every pass; the ops'
+ * plan_full 1 (the caller knows the plan holds the pass) takes it for that pass. */
 int ds_dkv_nolds() {
     static const int n = [] {
         const char* e = std::getenv("RADIANCE_DS41_DKV_NOLDS");
@@ -3689,7 +3690,8 @@ int attn_setup(const RadArgs* a, DsAttnArgs* res) {
 /* lu (lever DKV-U, attn_sparse_sink_unpacked's operand): a WMMA pass over the packed latent reads the plan's rows;
  * gth (lever DKV-G, attn_sparse_sink_gathered's): a decode-band pass over the packed latent reads latent_gather's rows.
  * Either absent, or not usable for the pass: today's launches. */
-int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr, const RadTensor* gth = nullptr) {
+int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr, const RadTensor* gth = nullptr,
+              bool lu_full = false) {
     DsAttnArgs s{};
     {
         const int rc = attn_setup(a, &s);
@@ -3718,7 +3720,7 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
                 static_cast<DsAttnArgs&>(u) = s;
                 u.lu = (uint16_t*)lu->data;
                 u.lucap = cap;
-                if (ds_dkv_nolds() > 0)   /* the LDS-free packed tiles: the plain form's LDS */
+                if (lu_full || ds_dkv_nolds() > 0)   /* the LDS-free packed tiles: the plain form's LDS */
                     return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true, true>), grid,
                                     dim3(128), (uint32_t)(ds_wm_sbuf_off(nkt) + kWmSbufBytes), u, sl2);
                 return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true>), grid, dim3(128),
@@ -3779,7 +3781,8 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
  * attn_sparse_sink's launch and then rope_rows_roundtrip's, the two ops themselves. Parameters: the
  * attention's, then rope_rows' rot / off / mode / inverse (n_head = heads, head_dim = dim) and
  * quant_roundtrip's block / format, its scale as `block_scale` (`scale` is the attention's). */
-int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr, const RadTensor* gth = nullptr) {
+int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr, const RadTensor* gth = nullptr,
+                  bool lu_full = false) {
     namespace q = r4d_ds41q;
     if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
     const RadTensor &pos = a->t[7], &out = a->t[10], &cs = a->t[11];
@@ -3838,7 +3841,7 @@ int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = null
     }
     /* the two launches: attn_sparse_sink, then rope_rows_roundtrip over out at its own parameters */
     {
-        const int rc = attn_body(a, stream, lu, gth);
+        const int rc = attn_body(a, stream, lu, gth, lu_full);
         if (rc != RAD_OK) return rc;
     }
     auto pint = [](const char* k, long long v) { RadParam r{}; r.key = k; r.kind = RAD_P_INT; r.ival = v; return r; };
@@ -4045,11 +4048,11 @@ extern "C" int r4d_rad_ds41_latent_unpack(const RadArgs* a, RadStream stream) { 
 extern "C" int r4d_rad_ds41_latent_gather(const RadArgs* a, RadStream stream) { return lg_body(a, stream); }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_unpacked(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
-    return attn_body(a, stream, &a->t[11], nullptr);
+    return attn_body(a, stream, &a->t[11], nullptr, r4d_geti_or(a, "plan_full", 0) == 1);
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 13 || !a->t) return RAD_E_INVAL;
-    return attn_ort_body(a, stream, &a->t[12], nullptr);
+    return attn_ort_body(a, stream, &a->t[12], nullptr, r4d_geti_or(a, "plan_full", 0) == 1);
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_gathered(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
