@@ -3680,6 +3680,9 @@ static const RadOpSchema kSchemas[] = {
            "The split COUNT changes, so a row here is not bit-identical to the same row split; "
            "both are exact. An op name of its own so every other caller keeps the split and "
            "its bits."),
+    SCHEMA("gemm_nt_q_dec", pGemmNtQ, oGemmNtQ,
+           "fn4 BI wide: `gemm_nt_q` over a step's decode rows above 64, every row in the narrow tile's arithmetic "
+           "(the bytes it has in a launch of <= 64 rows). libr4d's own op, so gemm_nt_q keeps its bands."),
     SCHEMA("gemm_nt_q_bias", pGemmNtQBias, oGemmNtQBias,
            "gemm_nt_q with a per-column bias added to the f32 product before its one rounding."),
     SCHEMA("dequant_w4", pDequantW4, oDequantW4,
@@ -5210,7 +5213,7 @@ static const RadConstraint cRouterSigmoidScatter[] = { C_GE("M", 1),        C_LE
                                                        C_IN("dtype", "f32") };
 /* The selection's bounds and the skinny GEMM's decode band: four 16-row tiles. */
 static const RadConstraint cRouterGemmTopkScatter[] = {
-    C_GE("M", 1), C_LE("M", 64), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
+    C_GE("M", 1), C_LE("M", 128), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
     C_GE("top_k", 1), C_LE("top_k", 32), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cMoeScatter[] = {
@@ -5352,6 +5355,11 @@ static const RadConstraint cGemmNtQBiasFp8A8M16[] = {
  * tag and its activation (had_quant_act_i8g) differ. */
 static const RadConstraint cGemmNtI8A8M16[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "i8a8 i8a8h"),
+};
+/* fn4 BI wide: gemm_nt_q_dec's band (libr4d r4d_gemm_fp8a8.hip kDecMaxM). */
+static const RadConstraint cGemmNtI8A8Dec[] = {
+    C_LE("M", 512), C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "i8a8 i8a8h"),
 };
 static const RadConstraint cGemmNtI8A8Tiled[] = {
@@ -8930,6 +8938,17 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_rad_layout_i8_block, r4d_rad_relayout_i8_block,
   nullptr, r4d_rad_unrelayout_i8_block },
 
+{ "gemm_i8a8_nt_m16_dec", "gemm_nt_q_dec", "gemm",
+  "fn4 BI wide: gemm_i8a8_nt_m16 over any decode height up to 512 rows, 64-token groups on grid.y, so every row "
+  "keeps the narrow tile's arithmetic (the bytes it has alone)",
+  "M <= 512; K a multiple of 128; N a multiple of 16",
+  "as gemm_i8a8_nt_m16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_M16,
+  ROW(cGemmNtI8A8Dec), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_i8a8_m16_dec, r4d_rad_gemm_i8a8_m16_dec_scratch,
+  r4d_rad_layout_i8_block, r4d_rad_relayout_i8_block,
+  nullptr, r4d_rad_unrelayout_i8_block },
+
 { "gemm_i8a8_tiled", "gemm_nt_q", "gemm",
   "gemm_fp8a8_tiled at INT8 codes: the same 128x128 prefill tile, the iu8 WMMA for the fp8 one and "
   "the weight's scale per row, eight a lane a tile in the fold",
@@ -9279,7 +9298,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
   "the router GEMM, its top-k and the stable counting sort in one launch -- the last workgroup "
   "of the GEMM ranks -- and optionally the shared expert's one-column gate beside it",
-  "M <= 64 and M*top_k <= 1024; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
+  "M <= 128 and M*top_k <= 2048; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
   "16 times the split the bf16 skinny GEMM's law picks",
   "bf16 activation and weights, fp32 accumulate; bf16 logits, gate and weights, i32 ids, "
   "sorted slots, offsets and counts out",
@@ -9292,7 +9311,7 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
 { "router_gemm_topk_scatter_inv_bf16", "router_gemm_topk_scatter_inv", "moe",
   "router_gemm_topk_scatter's one launch, its sort also writing every slot's row in the sort "
   "(the inverse moe_gather_inv reads)",
-  "M <= 64 and M*top_k <= 1024; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
+  "M <= 128 and M*top_k <= 2048; n_expert <= 512, top_k <= min(n_expert, 32); K a multiple of "
   "16 times the split the bf16 skinny GEMM's law picks",
   "bf16 activation and weights, fp32 accumulate; bf16 logits, gate and weights, i32 ids, "
   "sorted slots, offsets, counts and inverse out",

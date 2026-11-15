@@ -3391,7 +3391,7 @@ extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
  *
  * A tuned point for the unfused router would break the first, so this row is NOTUNE. Decode only:
  * at most kRgMaxM rows (four 16-row tiles); beyond that the architecture issues the pair. */
-constexpr long long kRgMaxM = 64;
+constexpr long long kRgMaxM = 128;   /* fn4 BI wide: 64 before 14.11.2026 (the architecture declares the band) */
 
 namespace {
 
@@ -3704,7 +3704,7 @@ static int router_gemm_topk_scatter_body(const RadArgs* a, RadStream stream, con
     if (gate && (!r4d_contig(gate) || r4d_numel(gate) < M)) return R4D_NO(RAD_E_STRIDE);
 
     const long long T = M * top_k;
-    if (T > (long long)kScatterSmall) return R4D_NO(RAD_E_SHAPE);
+    if (T > (long long)r4d_moesort::kScatterCap) return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(ids) || !r4d_contig(w) || !r4d_contig(sorted) || !r4d_contig(off) ||
         !r4d_contig(cnt)) return R4D_NO(RAD_E_STRIDE);
     if (r4d_numel(ids) < T || r4d_numel(w) < T) return R4D_NO(RAD_E_SHAPE);

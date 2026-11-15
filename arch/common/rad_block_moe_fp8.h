@@ -425,6 +425,11 @@ struct MoeFP8 {
     bool    inv_switchable = false, inv_ok = false;
     rad_op  op_scatter_inv2 = 0, op_gather_inv2 = 0, op_router_fused_inv2 = 0;
     int64_t router_fused_rows = 0;
+    /* fn4 BI wide bit 4 at start: router_fused_rows up to kBiWideRows (libr4d's sort capacity kScatterCap 2048 slots);
+     * router_fused_std the band today's declaration has (the pair's sort bound and the skinny GEMM's 64). The step takes
+     * the wide band while the switch's bit 4 is on (the fused op is the separate ops' bytes at any height). */
+    int64_t router_fused_std = 0;
+    int64_t router_fused_now() const { return router_fused_rows > router_fused_std && !fn4_biwide(4) ? router_fused_std : router_fused_rows; }
     bool    router_fused_gate = false;
     /* `router_sigmoid_topk_scatter` (Config::router_fuse), up to `sigmoid_scatter_rows` tokens,
      * writing the shared gate's fill too when `sigmoid_scatter_gate`. */
@@ -1643,6 +1648,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rad_op_declared(b, inv_router ? "router_gemm_topk_scatter_inv" : "router_gemm_topk_scatter")) {
         router_fused_rows = topk_scatter_rows < kMoeRouterFusedRows ? topk_scatter_rows
                                                                     : kMoeRouterFusedRows;
+        router_fused_std = router_fused_rows;
+        if (fn4_biwide_start() & 4) {   /* fn4 BI wide: to kBiWideRows, within libr4d's sort capacity (2048 slots) */
+            const int64_t wr = std::min<int64_t>(std::min<int64_t>(kBiWideRows, c.rows), 2048 / c.top_k);
+            if (wr > router_fused_rows) router_fused_rows = wr;
+        }
         const bool gate = op_sgate != 0;
         if (gate && !sgate_concurrent) {
             fprintf(stderr, "radiance: layer %d: the fused router writes the shared gate ahead of "
@@ -2011,7 +2021,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const RadOperand ecnt = brows(w.ecnt, ne);
     /* The fused router when it resolved and the pass fits: router, topk + scatter and (with
      * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
-    const bool rfused = op_router_fused && rows <= router_fused_rows;
+    const bool rfused = op_router_fused && rows <= router_fused_now();   /* fn4 BI wide bit 4: up to 128 rows */
     /* fn4 F2a switchable: the inverse twins this issue (all of them, or none) */
     const bool inv_now = inv_ok && fn4_gather_inv_flag().load(std::memory_order_relaxed) == 1;
     const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;

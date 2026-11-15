@@ -6,6 +6,7 @@
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
 #include "sched/scheduler.h"
+#include "runtime/fn4_switch.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
 #include "server/sink.h"
@@ -707,6 +708,85 @@ TEST(a_span_is_taken_only_by_a_prefill_alone_in_its_step) {
     CHECK(with_b >= 3);
     CHECK_EQ(wide_with_b, 0);
     CHECK(spans_after >= 1);
+}
+
+/* fn4 lever BI chunking 6 (15.11.2026, qwen/build2/LONGPROMPT.md): a long prompt beside a decoding request runs in alone's
+ * pieces, never cut: a piece that fits what the decode rows leave of the shared budget shares their step, one that does not
+ * takes a step of its own (no other entry), and the decode rows the step after it. The pieces are the ones the prompt
+ * takes in an idle engine. */
+TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone) {
+    std::string err;
+    CHECK(rad::fn4::request("sched_bi_chunk", 6, &err));
+    int da = -1;
+    rad::fn4::apply_pending(0, &da);
+    CHECK_EQ(rad::fn4::sched_bi_chunk(), 6);
+    auto pieces_alone = [&]() {
+        Fixture f;
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(1000, 2);
+        std::vector<int32_t> pc;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) pc.push_back(e.n_tokens);
+            f.commit_plain();
+        }
+        return pc;
+    };
+    const std::vector<int32_t> ref = pieces_alone();
+    CHECK(ref.size() >= 2);
+    Fixture f;
+    f.build();
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    auto rd = f.request(100, 300);
+    for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;   /* no prefix shared with `a` */
+    rd->ignore_eos = true;
+    const uint64_t d = f.add(std::move(rd));
+    for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
+    const uint64_t a = f.submit(1000, 2);
+    std::vector<int32_t> got;
+    int lone = 0, shared = 0, d_steps = 0, after_lone_d = 0, mixed_wide = 0;
+    bool last_lone = false;
+    for (int k = 0; k < 60 && f.sch.step(); ++k) {
+        const StepPlan& p = f.sch.plan();
+        int32_t a_tok = 0;
+        bool has_d = false;
+        for (const StepEntry& e : p.e) {
+            if (e.seq == a && e.is_prefill) a_tok = e.n_tokens;
+            if (e.seq == d) has_d = true;
+        }
+        if (a_tok > 0) {
+            got.push_back(a_tok);
+            if (p.e.size() == 1) ++lone; else ++shared;
+            if (p.e.size() > 1 && p.n_tok > f.sch.geometry().shared_tok) ++mixed_wide;
+        }
+        if (has_d) { ++d_steps; if (last_lone) ++after_lone_d; }
+        last_lone = a_tok > 0 && p.e.size() == 1;
+        f.commit_plain();
+    }
+    CHECK(got == ref);                    /* alone's pieces, none cut */
+    CHECK(lone >= 1);                     /* a piece that did not fit ran alone */
+    CHECK(shared >= 1);                   /* one that fit shared the decode rows' step */
+    CHECK_EQ(mixed_wide, 0);              /* no shared step past the shared budget */
+    CHECK_EQ(after_lone_d, lone);         /* every lone step is followed by the decode rows' */
+    CHECK(d_steps >= 10);
+    /* A prompt that is one piece and does not fit (256 > 256 - d's row): its lone step ends its prefill, and no step is
+     * issued ahead of it -- that step would carry on with it alone, leaving d out. */
+    const uint64_t c = f.submit(256, 4);
+    bool c_lone = false, ahead_after_lone = false;
+    for (int k = 0; k < 6 && f.sch.step(); ++k) {
+        const StepPlan& p = f.sch.plan();
+        const bool lone_c = p.e.size() == 1 && p.e[0].seq == c && p.e[0].is_prefill;
+        if (lone_c) { c_lone = true; ahead_after_lone = f.sch.step_next() != nullptr; }
+        f.commit_plain();
+        if (lone_c) break;
+    }
+    CHECK(c_lone);
+    CHECK(!ahead_after_lone);
+    CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
+    rad::fn4::apply_pending(1, &da);
 }
 
 /* With a shortest spanning prefill set (set_span_min), a shorter prompt alone in the engine takes

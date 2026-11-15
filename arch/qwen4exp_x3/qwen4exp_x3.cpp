@@ -42,6 +42,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (std::strcmp(name, "sp_serial") == 0) {   /* fn4 SP-serial: a serial step's prefill rows sequence-parallel (RADIANCE_FN4_SPSERIAL declares; 2 halves on lane 1) */
+        if (value < 0 || value > 2) return -1;
+        if (value && !qwen4exp_fp8::fn4_spser_env()) return -1;
+        qwen4exp_fp8::fn4_spser_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (std::strcmp(name, "hc_spprobe") == 0) {   /* fn4 SP-hc speed probe (measurement only) */
         if (value < 0 || value > 1) return -1;
         qwen4exp_fp8::fn4_spprobe_flag().store(value, std::memory_order_relaxed);
@@ -59,8 +65,14 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
-        if (value < 0 || value > 3) return -1;   /* 3: + the dense decode sequences in one pinned launch */
+        if (value < 0 || value > 4) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (std::strcmp(name, "bi_wide") == 0) {   /* fn4 BI wide: the forms above 64 decode rows (mask; RADIANCE_FN4_BI_WIDE declares) */
+        if (value < 0 || value > 15) return -1;
+        if (value & ~rad::arch::fn4_biwide_start()) return -1;   /* only the forms the start value declared */
+        rad::arch::fn4_biwide_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */

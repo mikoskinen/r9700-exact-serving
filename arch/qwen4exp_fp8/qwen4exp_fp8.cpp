@@ -112,6 +112,17 @@ static bool fn4_env_on(const char* k) {
 
 using namespace rad::arch;
 
+/* fn4 SP-serial (14.11.2026, Qwen's newcomer step): RADIANCE_FN4_SPSERIAL set at start declares the sequence-parallel gated
+ * residual for a serial step's prefill rows (Model::spser_ok; the start value is the switch's), switch "sp_serial" picks it a
+ * step: 1 one run over the step, 2 two halves whose collectives run on the second lane beside the other half's write and read
+ * (falls back to 1 where the halves do not shard). Unset: nothing declared, today's ops and bytes. */
+static bool fn4_spser_env() { return fn4_env_on("RADIANCE_FN4_SPSERIAL"); }
+static std::atomic<int>& fn4_spser_flag() {
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_SPSERIAL");
+                                   const int v = e && *e ? std::atoi(e) : 0; return v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+    return f;
+}
+
 struct Layer {
     int          full = 0;
     HyperConn    hc_mix;     /* in front of the attention or the delta net */
@@ -258,6 +269,11 @@ struct Model {
      * wide stream gathered raw after the last layer (sp_agh). */
     rad_op    sp_rs = 0, sp_ag = 0, sp_agh = 0;
     bool      sp_on = false;
+    /* fn4 SP-serial (RADIANCE_FN4_SPSERIAL at start): sp_rs / sp_ag / sp_agh, every trunk connection's codes op and its
+     * K-pinned part reads (HyperConn::op_read_kt) for segments up to spser_rows rows; spser_noted: said once. */
+    bool      spser_ok = false;
+    int64_t   spser_rows = 0;
+    int       spser_noted = 0;
     /* {0, pass, T} for a step wider than a pass (pipe_bounds): the windows of the indexer's score
      * plane and the delta net's pieces. A transient (declare), uploaded by every step that reads
      * it -- the first two from the pinned host copy `pipe_cu_h`, made once. */
@@ -324,12 +340,15 @@ static void bi_segments(Model& m, const RadBatch* batch) {
     const bool seg = fn4_biseg_flag().load(std::memory_order_relaxed) > 0;
     m.bi_cut.clear();
     bi_cuts() = BiCuts{};
+    bi_wide_rows() = 0;
     if (!m.bi_on && !seg) return;
     const int64_t T = batch->n_tok;
     int64_t sd = 0, td = 0;
     batch_split(batch, &sd, &td);
     m.bi_td = td;
     m.bi_qd = sd > 0 && td % sd == 0 ? td / sd : 1;   /* a decode sequence's rows (1 + n_spec) */
+    /* fn4 BI wide (bi_wide bit 1): the decode rows above the narrow band through the linears' gemm_nt_q_dec */
+    if (seg && td > kBiNarrowRows && fn4_biwide(1)) bi_wide_rows() = td;
     m.bi_cut.push_back(0);
     if (td > 0 && td < T) m.bi_cut.push_back(td);
     if (batch->positions_h)
@@ -381,8 +400,9 @@ static void bi_read_seg(RadCtx* c, const Model& m, const HyperConn& hcx, int64_t
     /* hc_bi 5 (12.11.2026, 199: hc_bi 3's 8-row reads cost 15.7 % at c16): the decode rows in one launch through the
      * twin (libr4d bi_dec: form G in 8-row groups, B3 in 16-row groups; each row's bytes as at 3). */
     if (m.bi_mode == 5 && hcx.op_read_bd) {
-        for (int64_t p = a; p < b; p += HyperConn::kBiDecRowsMax)
-            hcx.read_bd(c, p, std::min<int64_t>(HyperConn::kBiDecRowsMax, b - p), ss);
+        const int64_t pc = hcx.bd_piece();   /* 64, or bd_rows under bi_wide bit 2 */
+        for (int64_t p = a; p < b; p += pc)
+            hcx.read_bd(c, p, std::min<int64_t>(pc, b - p), ss);
         return;
     }
     /* A connection without the inject gains (the final read: libr4d's form G wants them) takes the per-row kernels
@@ -1533,8 +1553,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 pre, (long long)l);
         mixs.inject_w = nm.ckpt("%s.%lld.attn_hyper_connection.block_inject_weight.weight",
                                 pre, (long long)l);
+        HyperConn::Config mcfg = m.hccfg;
+        mcfg.sp_twins = fn4_spser_env() && g.world == 4 ? 1 : 0;   /* fn4 SP-serial: the K-pinned part reads */
         RAD_ARCH_TRY(lay.hc_mix.declare(b, nm, g, nm.f("blk.%lld.attn_hc", (long long)l),
-                                        m.hccfg, hw, mixs));
+                                        mcfg, hw, mixs));
 
         /* `Src::norm = nullptr` is the blocks' "input already normed and quantised" mode, and
          * `add_out = false` stops them adding into the stream; the connection's write half does
@@ -1624,6 +1646,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         /* The rotated expert plane's input codes come out of this read, beside the plain ones
          * the shared arm takes, so the routed arm declares no quantiser of its own. */
         HyperConn::Config fcfg = m.hccfg;
+        fcfg.sp_twins = fn4_spser_env() && g.world == 4 ? 1 : 0;   /* fn4 SP-serial */
         HyperConn::Wire   fw   = hw;
         if (m.moecfg.expert_rot) { fcfg.rotate = 1; fw.rq = m.a_hr.q; fw.rs = m.a_hr.s; }
         RAD_ARCH_TRY(lay.hc_ffn.declare(b, nm, g, nm.f("blk.%lld.ffn_hc", (long long)l),
@@ -1702,6 +1725,53 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             fprintf(stderr, "radiance: qwen4exp: fn4 SP-hc %s (RADIANCE_FN4_SPHC; switch hc_sp picks it a pipelined "
                             "prefill step)\n", ok ? "declared" : "NOT served -- reduce_scatter_rows / all_gather_rows / "
                             "hc_codes missing");
+    }
+
+    /* fn4 SP-serial (14.11.2026): the same collectives and codes as SP-hc (declared here when SP-hc is not), and on every
+     * trunk connection the part reads pinned to a segment's row-tile count (HyperConn::op_read_kt, declared with the
+     * connections). A serial step's prefill rows then take the sequence-parallel residual (step_serial_sp). */
+    if (fn4_spser_env() && g.world == 4) {
+        const int64_t HN = m.hccfg.hc * g.n_embd;
+        if (!m.sp_rs)
+            m.sp_rs = rw(b, RAD_OP(b, "reduce_scatter_rows",
+                             RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * g.n_embd, T * g.n_embd),
+                                        RAD_STR("dtype", g.dtype), RAD_INT("row", g.n_embd), RAD_INT("raw", g.wire_exact ? 1 : 0),
+                                        RAD_INT("overlap", 1)),
+                             RAD_NOWEIGHTS),
+                         {m.a_x.x}, {m.a_x.x});
+        if (!m.sp_ag)
+            m.sp_ag = rw(b, RAD_OP(b, "all_gather_rows",
+                             RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * g.n_embd, T * g.n_embd),
+                                        RAD_STR("dtype", g.dtype), RAD_INT("row", g.n_embd), RAD_INT("raw", g.wire_exact ? 1 : 0),
+                                        RAD_INT("overlap", 1)),
+                             RAD_NOWEIGHTS),
+                         {m.a_x.x}, {m.a_x.x});
+        if (!m.sp_agh)
+            m.sp_agh = rw(b, RAD_OP(b, "all_gather_rows",
+                              RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * HN, T * HN),
+                                         RAD_STR("dtype", g.dtype), RAD_INT("row", HN), RAD_INT("raw", 1),
+                                         RAD_INT("overlap", 1)),
+                              RAD_NOWEIGHTS),
+                          {m.b_h}, {m.b_h});
+        bool ok = m.sp_rs && m.sp_ag && m.sp_agh && g.wire_exact;
+        const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : T;
+        /* the longest segment every connection has a twin for */
+        int tmax = HyperConn::kSpTiles;
+        for (Layer& lay : m.layers) {
+            for (HyperConn* h : { &lay.hc_mix, &lay.hc_ffn }) {
+                if (h->c.quant && !h->op_codes) ok = ok && h->declare_codes(b, band) == RAD_OK;
+                int t = 1;
+                while (t + 1 <= HyperConn::kSpTiles && h->op_read_kt[t + 1]) ++t;
+                tmax = std::min(tmax, t);
+            }
+        }
+        m.spser_rows = 128LL * tmax;
+        m.spser_ok = ok && tmax >= 2 && !m.layers.empty();
+        if (g.rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: qwen4exp: fn4 SP-serial %s (RADIANCE_FN4_SPSERIAL; switch sp_serial picks it a serial "
+                            "step: prefill segments up to %lld rows, K split pinned to the segment's row tiles)\n",
+                    m.spser_ok ? "declared" : "NOT served -- a collective, the codes or the pinned reads did not resolve "
+                                              "(or the wire is not exact)", (long long)m.spser_rows);
     }
 
     /* ---- the 97th connection: no write half, no fp8 copy. It produces the bf16 hidden state the
@@ -2141,7 +2211,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     if (m.ple_layer >= 0) m.ple.ids(c, batch);
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
-    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+    if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
     /* The delta net runs a piece at a time over the bounds (ArPieces::cu) in a step of one
@@ -2343,7 +2413,7 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     m.enter.step(c, T);
     bt_pt(c, m, m.b_h, 0, T, "enter", -1);
 
-    if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+    if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
         RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
 
     /* fn4 W1b: whether the stream's last change was a write that stored the norm scales for its rows. */
@@ -2379,6 +2449,223 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
     }
 }
 
+/* ============================== fn4 SP-serial (14.11.2026) ==============================
+ *
+ * The newcomer step (MIXED: a ~1.1k-row prompt beside the decode rows) and a lone short prefill run step_serial, where every
+ * rank reduces every row (one all-reduce a connection) and then writes and reads the gated residual on ALL rows: 43.0 of a
+ * c16 newcomer step's 170 ms on rank 0 (P1, qwen/build2/STAGES.md). SP-hc (step_pipelined, hc_sp) already splits that work
+ * for prompts wider than a pass. Here the same split for a serial step, connection by connection:
+ *
+ *   all-reduce of the block's partials            ->  reduce-scatter (sp_rs: whole-row shards of q = ceil(T / 4) rows)
+ *   write + read on all T rows                    ->  write + read on this rank's q rows
+ *   (the read's outputs on every rank)            ->  all-gather of the block input (sp_ag), its codes redone on every row
+ *
+ * and once after the last layer the wide stream's all-gather (sp_agh: the output mixer and the MTP head read every row).
+ *
+ * The same bytes as step_serial, op by op:
+ *   - reduce-scatter + all-gather on the exact wire fold each element as the exact all-reduce does (fp32 from 0, ascending
+ *     rank, one rounding; r4d_ar_sp_rows.hip), and the gather copies;
+ *   - hc_write is per row;
+ *   - a rank's rows of the decode segment are read as step_serial reads them (bi_read_seg: the bi_dec twin, each row its own
+ *     sequence's alone read at any launch height); a whole prefill segment inside the rank's rows reads whole, as today;
+ *     a PART of a prefill segment of h rows reads through HyperConn::read_kt: kc_rows = 128 ceil(h / 128) pins the down
+ *     product's K split to the one the segment's read whole takes (a part of > 64 rows is at the same 128-row tile), the
+ *     wide / PF2 forms are the same bytes at one split, the norm scales one sum in every form (or the write's `ss`);
+ *   - hc_codes is hc_read's own codes stage over the gathered x (hc_quant_group: the same amax, scale and packing as the
+ *     read's finisher and the decode form's B3).
+ * So a step takes it only when every rank's part of every prefill segment is whole or more than 64 rows, every segment is
+ * within the pinned reads' band. The PLE reads every row of the wide stream and its convolution mixes rows, so the layers
+ * before it (Flash-Next's PLE is blk.1: layer 0) run replicated as step_serial runs them and the split starts at its layer's
+ * read. Steps without a prefill segment (decode) and everything else keep step_serial. */
+struct SpSer {
+    struct Part { int64_t a = 0, n = 0, seg = 0; bool dec = false; };
+    /* a run of rows [r0, r0 + n) the collectives shard whole (q = ceil(n / 4) rows a rank): this rank's rows and parts */
+    struct Run { int64_t r0 = 0, n = 0, lo = 0, hi = 0; std::vector<Part> mine; };
+    int  nrun = 0;      /* 1: the step as one run (sp_serial 1); 2: two halves, pipelined on the second lane (sp_serial 2) */
+    Run  run[2];
+};
+/* The parts of run [r0, r0 + n) on every rank: false (the caller keeps step_serial, or one run) when a rank would have no rows
+ * or a prefill segment's part on any rank is neither whole nor more than 64 rows (or past the pinned twins). Decided alike on
+ * every rank. */
+static bool spser_run(const Model& m, int64_t r0, int64_t n, SpSer::Run& run, bool* any_pf) {
+    const Geom& g = m.g;
+    const int64_t q = (n + g.world - 1) / g.world;
+    run = SpSer::Run{};
+    run.r0 = r0; run.n = n;
+    for (int r = 0; r < g.world; ++r) {
+        const int64_t lo = r0 + std::min<int64_t>((int64_t)r * q, n), hi = r0 + std::min<int64_t>((int64_t)(r + 1) * q, n);
+        if (hi <= lo) return false;
+        if (r == g.rank) { run.lo = lo; run.hi = hi; }
+        for (size_t i = 0; i + 1 < m.bi_cut.size(); ++i) {
+            const int64_t c0 = m.bi_cut[i], c1 = m.bi_cut[i + 1];
+            const int64_t a = std::max(c0, lo), b = std::min(c1, hi);
+            if (b <= a) continue;
+            const bool dec = m.bi_mode >= 3 && a < m.bi_td;   /* bi_read_seg's own rule */
+            const int64_t seg = c1 - c0;
+            if (!dec) {
+                *any_pf = true;
+                if (seg > m.spser_rows) return false;
+                if (b - a < seg && (b - a <= 64 || !m.layers[0].hc_mix.read_kt_op(seg))) return false;
+            }
+            if (r == g.rank) { SpSer::Part p; p.a = a; p.n = b - a; p.seg = seg; p.dec = dec; run.mine.push_back(p); }
+        }
+    }
+    return true;
+}
+static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
+    const Geom& g = m.g;
+    const int64_t T = batch->n_tok;
+    const int mode = fn4_spser_flag().load(std::memory_order_relaxed);
+    if (!m.spser_ok || g.world != 4 || mode <= 0) return false;
+    /* (media rows are scattered into the embedding before the first read, which every rank still holds whole) */
+    if (m.bt.on || dbg_resid_on() || m.moecfg.calib || !m.op_embed_ar) return false;
+    /* the PLE's convolution mixes rows of the stream: the layers up to it run replicated (step_serial_sp), so it must leave
+     * some to split */
+    if (m.ple_layer + 1 >= (int64_t)m.layers.size()) return false;
+    if (!m.bi_on || m.bi_mode < 3 || m.bi_cut.size() < 2) return false;   /* the reads cut at the step's segments */
+    if (T < 4 * 65 || T > m.spser_rows) return false;
+    for (const Layer& l : m.layers) {
+        if (!(l.full ? l.attn.issues_ar(T) : l.gdn.issues_ar(T))) return false;
+        if (!l.mlp.issues_ar(T, std::min<int64_t>(T, l.mlp.c.rows))) return false;
+    }
+    /* sp_serial 2: two halves (the first a multiple of 4 rows, at least half), when both shard; else one run */
+    if (mode == 2 && m.pipe_on) {
+        bool pf0 = false, pf1 = false;
+        const int64_t T1 = ((T / 2 + 3) / 4) * 4;
+        if (T1 < T && spser_run(m, 0, T1, sp.run[0], &pf0) && spser_run(m, T1, T - T1, sp.run[1], &pf1) && (pf0 || pf1)) {
+            sp.nrun = 2;
+            return true;
+        }
+    }
+    bool pf = false;
+    if (!spser_run(m, 0, T, sp.run[0], &pf) || !pf) return false;
+    sp.nrun = 1;
+    return true;
+}
+
+static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu, const SpSer& sp) {
+    const Geom& g = m.g;
+    const int64_t T = batch->n_tok, D = g.n_embd, HN = m.hccfg.hc * g.n_embd;
+    if (m.spser_noted != sp.nrun) {
+        m.spser_noted = sp.nrun;
+        if (g.rank == 0)
+            fprintf(stderr, "radiance: qwen4exp: fn4 SP-serial: a serial step's prefill rows take the sequence-parallel gated "
+                            "residual (%s; first at %lld rows, %zu part(s) on rank 0)\n",
+                    sp.nrun == 2 ? "two halves, collectives on the second lane" : "one run", (long long)T, sp.run[0].mine.size());
+    }
+    const bool l2 = sp.nrun == 2;   /* sp_serial 2: every collective of the step on the second lane (Ctx::lane1_'s rule) */
+    auto on1 = [&](bool behind0, auto&& issue) {
+        if (!l2) { issue(); return; }
+        rad_lane(c, 1);
+        if (behind0) rad_lane_join(c, 0, 1);
+        issue();
+        rad_lane(c, 0);
+    };
+    auto wait1 = [&] { if (l2) rad_lane_join(c, 1, 0); };
+    RAD_ISSUE(c, m.op_embed,
+              praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
+    m.mrows.step(c, batch, m.a_x.x, T);
+    on1(true, [&] { RAD_ISSUE_N(c, m.op_embed_ar, T * D, brows(m.a_x.x, T), RAD_NONE); });
+    wait1();
+    if (m.ple_layer >= 0) m.ple.ids(c, batch);
+    m.enter.step(c, T);
+    if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
+        RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
+
+    const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : g.max_tok;
+    auto rs = [&](const SpSer::Run& r) { RAD_ISSUE_N(c, m.sp_rs, r.n * D, brow_slice(m.a_x.x, r.r0, r.n, D), RAD_NONE); };
+    auto ag = [&](const SpSer::Run& r) { RAD_ISSUE_N(c, m.sp_ag, r.n * D, brow_slice(m.a_x.x, r.r0, r.n, D), RAD_NONE); };
+    auto codes = [&](const HyperConn& h, int64_t a, int64_t n) {
+        for (int64_t r0 = a; r0 < a + n; r0 += band) h.codes(c, r0, std::min(band, a + n - r0));
+    };
+    /* a connection's read on this rank's rows of a run: the decode rows and whole segments as step_serial reads them, a
+     * segment's part through the K-pinned twin */
+    auto rd = [&](const HyperConn& h, const SpSer::Run& r, bool ss) {
+        for (const SpSer::Part& p : r.mine) {
+            if (p.dec)             bi_read_seg(c, m, h, T, p.a, p.a + p.n, ss);
+            else if (p.n == p.seg) h.read(c, T, p.a, p.n, ss);
+            else                   h.read_kt(c, p.a, p.n, p.seg, ss);
+        }
+    };
+    /* One connection between two blocks: reduce-scatter the block's partials, this rank's rows written (+ `after`, e.g. the
+     * control vector) and read by the next connection `nx` (none after the last layer), the block input gathered and coded.
+     * Two runs: run 1's reduce-scatter beside run 0's write + read, run 0's gather beside run 1's. */
+    auto conn = [&](const HyperConn& wr, const HyperConn* nx, auto&& after) {
+        if (sp.nrun == 1) {
+            const SpSer::Run& r = sp.run[0];
+            rs(r);
+            bool ss = wr.write(c, T, r.lo, r.hi - r.lo);
+            if (after(r)) ss = false;
+            if (nx) { rd(*nx, r, ss); ag(r); codes(*nx, 0, T); }
+            return;
+        }
+        auto half = [&](const SpSer::Run& r) {
+            bool ss = wr.write(c, T, r.lo, r.hi - r.lo);
+            if (after(r)) ss = false;
+            if (nx) rd(*nx, r, ss);
+        };
+        on1(true, [&] { rs(sp.run[0]); });
+        wait1();                                       /* run 0 reduced */
+        on1(false, [&] { rs(sp.run[1]); });            /* run 1's reduce-scatter beside run 0's write + read */
+        half(sp.run[0]);
+        wait1();                                       /* run 1 reduced: lane 1 holds nothing else yet */
+        if (nx) on1(true, [&] { ag(sp.run[0]); });     /* run 0's gather beside run 1's write + read */
+        half(sp.run[1]);
+        wait1();                                       /* run 0 gathered (lane 1 holds nothing after it) */
+        if (!nx) return;
+        on1(true, [&] { ag(sp.run[1]); });
+        codes(*nx, sp.run[0].r0, sp.run[0].n);         /* run 0's codes beside run 1's gather */
+        wait1();
+        codes(*nx, sp.run[1].r0, sp.run[1].n);
+    };
+    auto none = [](const SpSer::Run&) { return false; };
+    const int64_t nl = (int64_t)m.layers.size();
+    /* The layers before the PLE's (Flash-Next: blk.1) run replicated as step_serial runs them: the PLE reads every row of the
+     * wide stream and its dilated convolution mixes rows, so the stream must be whole on every rank when it runs. Their
+     * all-reduces: the block's own (one run), or reduce-scatter + all-gather of the whole step on the second lane (two runs:
+     * every collective there; the raw halves fold as the exact all-reduce does). */
+    const int64_t spl0 = m.ple_layer > 0 ? m.ple_layer : 0;
+    const SpSer::Run all = [&] { SpSer::Run r; r.r0 = 0; r.n = T; return r; }();
+    auto ar_all = [&] { on1(true, [&] { rs(all); }); on1(false, [&] { ag(all); }); wait1(); };
+    /* The first read on every row: nothing is reduced before it, every rank holds the whole embedding. */
+    if (m.ple_layer == 0) m.ple.step(c, batch);
+    bi_read_pieces(c, m, m.layers[0].hc_mix, T, false);
+    for (int64_t li = 0; li < nl; ++li) {
+        const Layer& l = m.layers[(size_t)li];
+        if (li < spl0) {
+            if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, !l2); }
+            else        l.gdn.step(c, batch, !l2);
+            if (l2) ar_all();
+            const bool ss_mix = l.hc_mix.write(c, T, 0, T);
+            bi_read_pieces(c, m, l.hc_ffn, T, ss_mix);
+            if (!l2) l.mlp.step(c, batch);
+            else {
+                for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows)
+                    l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
+                l.mlp.route_report(c);
+                ar_all();
+            }
+            bool ss = l.hc_ffn.write(c, T, 0, T);
+            if (l.proj.step(c, batch, 0, T)) ss = false;
+            if (li + 1 == m.ple_layer) { m.ple.step(c, batch); ss = false; }
+            bi_read_pieces(c, m, m.layers[(size_t)li + 1].hc_mix, T, ss);
+            continue;
+        }
+        if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false); }
+        else        l.gdn.step(c, batch, false);
+        conn(l.hc_mix, &l.hc_ffn, none);
+        for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows)
+            l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
+        l.mlp.route_report(c);
+        conn(l.hc_ffn, li + 1 < nl ? &m.layers[(size_t)li + 1].hc_mix : nullptr,
+             [&](const SpSer::Run& r) { return l.proj.step(c, batch, r.r0, r.n); });
+    }
+    /* the output mixer and the MTP head read every row of the wide stream */
+    for (int k = 0; k < sp.nrun; ++k)
+        on1(true, [&] { RAD_ISSUE_N(c, m.sp_agh, sp.run[k].n * HN, brow_slice(m.b_h, sp.run[k].r0, sp.run[k].n, HN), RAD_NONE); });
+    wait1();
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
     const Geom& g = m.g;
@@ -2405,7 +2692,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
          * because the indexer reads the same table, the head's QSA selection and so the accepted
          * text shift at tie level at long context. A row depends only on its position, so
          * re-filling is idempotent. */
-        if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
+        if (m.op_rope_cs && T <= qk_fuse_now(qk_fuse_rows(g)) && !rope_mixed(batch))
             RAD_ISSUE_N(c, m.op_rope_cs, T, rope_pos1(batch, T), RAD_B(m.b_rope_cs));
         m.mtp.qsa_win_cu = pipe_bounds(c, batch, m);
         m.mtp.step(c, batch);
@@ -2422,8 +2709,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
             for (const Layer& l : m.layers) l.mlp.set_band(dual ? m.b_band : 0);
     }
     const int32_t* pcu = pipe_bounds(c, batch, m);
-    if (pipelined(m, T)) step_pipelined(c, batch, m, pcu);
-    else                 step_serial(c, batch, m, pcu);
+    SpSer sp;
+    if (pipelined(m, T))               step_pipelined(c, batch, m, pcu);
+    else if (spser_plan(m, batch, sp)) step_serial_sp(c, batch, m, pcu, sp);   /* fn4 SP-serial */
+    else                               step_serial(c, batch, m, pcu);
 
     bi_read_pieces(c, m, m.mixer, T);
     bt_pt(c, m, m.a_x.x, 0, T, "final", -1);
@@ -2440,6 +2729,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
     bt_flush(c, m, batch);
     bi_cuts() = BiCuts{};   /* fn4 BI: the cuts are this trunk step's only */
+    bi_wide_rows() = 0;
 }
 
 /* The default draft depth, used by `--num-speculative-tokens auto` and by rad-convert.
@@ -2482,15 +2772,24 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
          * takes the dense or sparse path by ITS OWN context against qsa_exact_to (rad_block_attn_gated_fp8.h), so the
          * launches depend on every sequence's side of that line, which the length cap does not carry. The key takes the
          * pattern; without host lengths the pass is not recorded. */
-        if (batch->draft_pass == 0 && batch->n_seq > 1 && rad::arch::fn4_attbi_flag().load(std::memory_order_relaxed) > 0) {
+        const int abf = rad::arch::fn4_attbi_flag().load(std::memory_order_relaxed);
+        if (batch->draft_pass == 0 && batch->n_seq > 1 && abf > 0) {
             const int32_t* su = batch->kv[group].seqused_h;
             int64_t ex = 0;
             for (const Layer& layer : m.layers) if (layer.full) { ex = layer.attn.qsa_exact_to; break; }
             if (ex > 0) {
                 if (!su) return 0;
+                /* att_bi 4: the pattern by each sequence's alone bound (fn4_attbi_sparse), its rows the pass's uniform
+                 * decode / verify rows; a pass whose rows do not split evenly is not recorded */
+                const int64_t rows = batch->n_tok % batch->n_seq == 0 ? batch->n_tok / batch->n_seq : 0;
+                if (abf >= 4 && rows <= 0) return 0;
                 uint64_t h = 1469598103934665603ull;
-                for (int64_t s = 0; s < batch->n_seq; ++s)
-                    h = (h ^ (uint64_t)((int64_t)su[s] > ex ? 2 : 1)) * 1099511628211ull;
+                for (int64_t s = 0; s < batch->n_seq; ++s) {
+                    const bool sp = abf >= 4 ? rad::arch::fn4_attbi_sparse(abf, (int64_t)su[s], rows, ex, m.g.max_ctx)
+                                             : (int64_t)su[s] > ex;
+                    h = (h ^ (uint64_t)(sp ? 2 : 1)) * 1099511628211ull;
+                }
+                if (abf >= 4) h ^= 0x9e3779b97f4a7c15ull;   /* not a 1..3 pattern's key */
                 return (h & ~0xffull) | (uint64_t)(3 + cap);
             }
         }
@@ -2590,8 +2889,14 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
-        if (value < 0 || value > 3) return -1;   /* 3: + the dense decode sequences in one pinned launch */
+        if (value < 0 || value > 4) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "bi_wide") == 0) {   /* fn4 BI wide: the forms above 64 decode rows (mask; RADIANCE_FN4_BI_WIDE declares) */
+        if (value < 0 || value > 15) return -1;
+        if (value & ~rad::arch::fn4_biwide_start()) return -1;   /* only the forms the start value declared */
+        rad::arch::fn4_biwide_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "bi_seg") == 0) {   /* fn4 BI: the trunk's linears cut at the step's segments (2: + the lm_head) */
@@ -2602,6 +2907,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "hc_bi") == 0) {   /* fn4 BI: the reads cut at the step's segments (libr4d takes it too) */
         if (value < 0 || value > 5 || value == 4) return -1;
         qwen4exp_fp8::fn4_hcbi_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "sp_serial") == 0) {   /* fn4 SP-serial (RADIANCE_FN4_SPSERIAL declares; 2 two halves on the second lane) */
+        if (value < 0 || value > 2) return -1;
+        if (value && !qwen4exp_fp8::fn4_spser_env()) return -1;
+        qwen4exp_fp8::fn4_spser_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "hc_spprobe") == 0) {   /* fn4 SP-hc speed probe (step_pipelined) */

@@ -44,10 +44,40 @@ namespace arch {
  * law reads one sequence (split_rows 1: each sequence's alone launch is one sequence at its q_len), plus ONE gate_quant
  * over the run's rows (a row's quantisation is its own). Above q_len x gqa 32 the law reads the block table's depth (the
  * step's pitch), as the per-sequence launches of 1 / 2 do. */
+/* 4 (15.11.2026, qwen/build2/LONGPROMPT.md: prompts of 1047-1699 tokens answered beside any longer sequence differ from
+ * alone from their first decode step, L03.att): as 3, and a sequence of a sparse step takes the dense or sparse path its
+ * ALONE step takes. That step's choice reads the step's context BOUND, not the context: core/sched/batch.cpp hands a step
+ * max_ctx_len = bound_bucket(its longest ctx_len, 1024) (fn4_alone_ctx_bound below), so a sequence alone at ctx_len
+ * 1025..2048 with 4 rows has reach 2048 + 4 > qsa_exact_to 2051 and decodes SPARSE, while 1..3 read its exact seqused
+ * (<= 2051: dense). The two launches agree while a row's keys fit the sparse 4-row launch's 64 one-tile segments
+ * (1024 keys) and part beyond. 4 reads the bound (fn4_attbi_sparse); 0..3 keep today's choice and bytes. */
 inline std::atomic<int>& fn4_attbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
-                                   const int v = e && *e ? std::atoi(e) : 0; return v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   const int v = e && *e ? std::atoi(e) : 0;
+                                   return v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
+}
+/* fn4 att_bi 4: the max_ctx_len a step of this one sequence would carry -- core/sched/batch.cpp's
+ * `min(bound_bucket(ctx_len, k_bound_tokens), max_ctx_)`, k_bound_tokens 1024, copied (keep the two in step): rounded up
+ * to a multiple of 1024, or above 64 to 1/32..1/64 of its power of two where that is coarser; 0 stays 0. */
+inline int64_t fn4_alone_ctx_bound(int64_t ctx_len, int64_t max_ctx) {
+    if (ctx_len <= 0) return ctx_len;
+    int64_t q = 1024;
+    if (ctx_len > 64) {
+        const int lg = 63 - __builtin_clzll((unsigned long long)ctx_len);
+        if (((int64_t)1 << (lg - 5)) > q) q = (int64_t)1 << (lg - 5);
+    }
+    int64_t b = (ctx_len + q - 1) / q * q;
+    if (max_ctx > 0 && b > max_ctx) b = max_ctx;
+    return b;
+}
+/* fn4 att_bi: whether a sequence of `rows` query rows ending at seqused `used` takes the sparse path under att_bi `mode`:
+ * one row (its alone step has T == n_seq), else 1..3 its exact context past `ex` (qsa_exact_to), 4 its alone step's reach
+ * (the bound of its ctx_len = used - rows, plus its rows) past `ex`, as step() decides that step. */
+inline bool fn4_attbi_sparse(int mode, int64_t used, int64_t rows, int64_t ex, int64_t max_ctx) {
+    if (rows == 1) return true;
+    if (mode < 4) return used > ex;
+    return fn4_alone_ctx_bound(used - rows, max_ctx) + rows > ex;
 }
 /* fn4 att_bi: the prefill sequences' row counts of a step, from the full-attention group's host seqused and the host
  * positions (a sequence's rows end at position seqused - 1); false when they do not tile rows [DT, T) exactly. */
@@ -244,7 +274,7 @@ struct AttnGatedFP8 {
         return pieces && pieces->in_ready && pieces->cu && pieces->cuts(T) &&
                T <= 2 * pieces->rows && !op_add && !op_fill && op_gq && !op_sig && !qsa_sel &&
                batch->n_seq == 1 && batch->phase == RAD_PHASE_PREFILL &&
-               !(T <= fused_rows) && batch->positions && !rope_mixed(batch) &&
+               !(T <= qk_fuse_now(fused_rows)) && batch->positions && !rope_mixed(batch) &&
                kvb && !kvb->stream && kvb->slot_mapping && kvb->block_table && kvb->seqused;
     }
 };
@@ -741,7 +771,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * itself, and rotates k in place like the unfused ops. It reads one rotary component per
      * token, so a pass with media tokens (differing components) takes the unfused path with the
      * full [3, T] positions. */
-    const bool fuse_ok = T <= fused_rows && !rope_mixed(batch);
+    const bool fuse_ok = T <= qk_fuse_now(fused_rows) && !rope_mixed(batch);   /* fn4 BI wide bit 8: the band now */
     /* A streamed group folds the streamed store into the prologue instead (op_fused_stream); one
      * whose layer has no mirror row leaves the store to store_cache, which fails the step. */
     const bool streamed = kvb && kvb->stream;
@@ -823,7 +853,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * the dense one. Under att_bi each sequence takes the path its alone step would: sparse (gated, per row, its rows only)
      * when its own context passes qsa_exact_to or it has one row, else dense in a launch shaped as its alone step's, with
      * the gate over its rows. Only when the step mixes both; a pipelined piece pass and a ring-bound pass keep today's. */
-    if (gated && fn4_attbi_flag().load(std::memory_order_relaxed) > 0 && batch->n_seq > 1 && batch->draft_pass == 0 &&
+    const int abf0 = fn4_attbi_flag().load(std::memory_order_relaxed);
+    if (gated && abf0 > 0 && batch->n_seq > 1 && batch->draft_pass == 0 &&
         table && used && kvb && kvb->seqused_h && !ring_bound && qsa_exact_to > 0 && op_attn && op_gq &&
         !(pieces && pieces->cuts(T))) {
         int64_t D = 0, DT = 0;
@@ -837,7 +868,8 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
             int64_t at = 0;
             for (int64_t s2 = 0; s2 < ns; ++s2) {
                 r0[s2] = at; nr[s2] = s2 < D ? qd : bq[(size_t)(s2 - D)]; at += nr[s2];
-                sp[s2] = nr[s2] == 1 || (int64_t)kvb->seqused_h[s2] > qsa_exact_to;
+                /* att_bi 4: the path of the sequence's alone step (its bound, fn4_attbi_sparse); 1..3 its exact context */
+                sp[s2] = fn4_attbi_sparse(abf0, (int64_t)kvb->seqused_h[s2], nr[s2], qsa_exact_to, g.max_ctx);
             }
             /* every sequence in launches of its own (12.11. x04c: long prompts): a sparse launch's split law reads its
              * row count as the sequence count (r4d_decode_splits: units = kv_heads x rows), so a sequence's rows inside a
@@ -846,7 +878,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 const int64_t qw = g.q_dim(), hd = g.head_dim, chunk = qsa_gq_rows();
                 const int64_t pitch = kvb->block_table_pitch;
                 /* att_bi 2: a run of sparse decode sequences in launches of up to kGqBiRows rows (whole sequences) */
-                const int abf = fn4_attbi_flag().load(std::memory_order_relaxed);
+                const int abf = abf0;
                 const bool one = abf >= 2 && op_attn_gq_bi &&
                                  qd == gq_bi_qd && qd > 0 && qd <= kGqBiRows;
                 /* att_bi 3: a run of dense decode sequences in one op_attn_bi launch + one gate_quant (fn4_attbi_flag's note) */

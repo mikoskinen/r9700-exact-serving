@@ -619,18 +619,22 @@ __device__ __forceinline__ void gemm_fp8a8_body(
         __threadfence();
         __syncthreads();
         __shared__ unsigned int s_arrived;
+        /* fn4 BI wide (gemm_nt_q_dec): a counter per (column, token group) when grid.y carries token groups of FN;
+         * at grid.y 1 this is ctr[blockIdx.x], as before. */
+        const uint32_t ci = blockIdx.y * gridDim.x + blockIdx.x;
         if (tid == 0)
-            s_arrived = __hip_atomic_fetch_add(&Ctr[blockIdx.x], 1u, __ATOMIC_ACQ_REL,
+            s_arrived = __hip_atomic_fetch_add(&Ctr[ci], 1u, __ATOMIC_ACQ_REL,
                                                __HIP_MEMORY_SCOPE_AGENT);
         __syncthreads();
         if (s_arrived + 1u == gridDim.z) {
             if (tid == 0)
-                __hip_atomic_store(&Ctr[blockIdx.x], 0u, __ATOMIC_RELAXED,
+                __hip_atomic_store(&Ctr[ci], 0u, __ATOMIC_RELAXED,
                                    __HIP_MEMORY_SCOPE_AGENT);
             __threadfence();                       // acquire the other slices' partials
-            // This block owns A rows [m0, m0+FM) and all nb output columns, exactly what the stores
-            // above wrote.
+            // This block owns A rows [m0, m0+FM) and the output columns [n0, n0+FN) of its token
+            // group, exactly what the stores above wrote (all nb columns at grid.y 1: n0 0, FN >= nb).
             const uint32_t rlo = m0, rhi = min(m0 + FM, rows);
+            const uint32_t tlo = n0, ntk = min(n0 + FN, nb) - n0;
             const float* const w0 = (const float*)Y;
             uint16_t* const cy = (uint16_t*)C;
             /* Consecutive threads take consecutive weight rows, which are adjacent in a
@@ -643,14 +647,14 @@ __device__ __forceinline__ void gemm_fp8a8_body(
             if ((rows & 3u) == 0u && (nr & 3u) == 0u && ((uintptr_t)C & 7u) == 0u
                 && ((uintptr_t)Y & 15u) == 0u) {
                 constexpr uint32_t kFinU = 4;
-                const uint32_t nq = nr / 4u, total = nq * nb;
+                const uint32_t nq = nr / 4u, total = nq * ntk;
                 for (uint32_t b = tid; b < total; b += kFinU * MW * kWave) {
                     size_t o[kFinU];
                     float4 acc[kFinU];
 #pragma unroll
                     for (uint32_t u = 0; u < kFinU; ++u) {
                         const uint32_t idx = b + u * MW * kWave;
-                        o[u] = idx < total ? (size_t)(idx / nq) * rows + rlo + (idx % nq) * 4u : 0u;
+                        o[u] = idx < total ? (size_t)(tlo + idx / nq) * rows + rlo + (idx % nq) * 4u : 0u;
                         acc[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                     }
                     for (uint32_t z = 0; z < gridDim.z; ++z) {
@@ -673,8 +677,8 @@ __device__ __forceinline__ void gemm_fp8a8_body(
                     }
                 }
             } else {
-                for (uint32_t idx = tid; idx < nr * nb; idx += MW * kWave) {
-                    const size_t o = (size_t)(idx / nr) * rows + rlo + idx % nr;
+                for (uint32_t idx = tid; idx < nr * ntk; idx += MW * kWave) {
+                    const size_t o = (size_t)(tlo + idx / nr) * rows + rlo + idx % nr;
                     float acc = 0.0f;
                     for (uint32_t z = 0; z < gridDim.z; ++z) acc += w0[z * zs + o];
                     cy[o] = f32_to_bf16(acc);
@@ -1191,13 +1195,18 @@ static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
     const long need = ksplit > 1 ? (long)ksplit * M * N * (long)sizeof(float) : 0;
     if (need && (!scratch || scratch_bytes < need)) { ksplit = 1; ck = 0; }
 
-    const dim3 grid(gx, 1, ksplit);
+    /* fn4 BI wide (gemm_nt_q_dec, M > 64): grid.y carries 64-token groups (NT 4), each block the narrow tile's
+     * arithmetic over its group's tokens -- a token's bytes are those of a launch of <= 64 rows (the split depends on N
+     * alone, MW and NT change no bit). At M <= 64 one group, the launch as before. */
+    const uint32_t gy = M > 64 ? ((uint32_t)M + 63u) / 64u : 1u;
+    const dim3 grid(gx, gy, ksplit);
     void* const dst = ksplit > 1 ? (void*)scratch : (void*)c;
     /* Token tiles per wave: the activation is the B operand, so NT tiles cover NT*16 tokens with
      * one weight read. NT = ceil(M/16), including 3 (see the note above narrow_mw). The gate stash
      * scales with NT on both sides (4096*NT bytes against FN * (256+8) = 4224*NT), so it fits. */
     uint32_t nt = (M > 48) ? 4u : ((M > 32) ? 3u : ((M > 16) ? 2u : 1u));
     if (const uint32_t f = g_nt_force.load(std::memory_order_relaxed)) { if ((uint32_t)M <= f * 16u) nt = f; }
+    if (gy > 1) { nt = 4u; chain = false; }
     /* `Full` drops the column guard, so it must mean all NT tiles are live, not just M % 16 == 0.
      * Otherwise (e.g. M = 48, NT = 4) the epilogue writes past a split-K scratch sized for M, over
      * the arrival counter, and the finisher hangs. */
@@ -1206,7 +1215,7 @@ static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
     // The finisher needs one counter per column; beyond kMaxCtr or on allocation failure, the
     // separate reduce kernel computes the same bytes.
     unsigned int* const ctr =
-        (ksplit > 1 && gx <= kMaxCtr) ? split_ctr(stream, (const void*)c) : nullptr;
+        (ksplit > 1 && gx * gy <= kMaxCtr) ? split_ctr(stream, (const void*)c) : nullptr;
 
 #define R4D_F8D(f, mw_, nt_, fk_, i8_)                                                         \
     emit_rc = R4D_EMIT(stream,                                                                 \
@@ -1667,6 +1676,34 @@ extern "C" int r4d_rad_gemm_i8a8_m16(const RadArgs* a, RadStream stream) {
     int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
     if (rc != RAD_OK) return rc;
     if (g.M > r4d_gemm_fp8a8_nt_m16_max_m()) return R4D_NO(RAD_E_SHAPE);
+    if (g.a->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    const int e = gemm_fp8a8_nt_m16_emit(
+        r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),
+        (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
+        (long)(uintptr_t)a->scratch, (long)a->scratch_bytes, stream, true,
+        (int)r4d_geti_or(a, "split_n", 0), r4d_geti_or(a, "chain", 0) != 0);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* ---- fn4 BI wide: gemm_nt_q_dec, the narrow tile over any decode height up to kDecMaxM (grid.y over 64-token
+ * groups). A row's bytes are the narrow tile's at <= 64 rows, so a decode step above 64 rows (17+ sequences at depth 3)
+ * gives each row its alone bytes; gemm_nt_q keeps the tiled form there (prefill bytes untouched). libr4d's own op. */
+static constexpr long long kDecMaxM = 512;
+static long dec_scratch(long long M, long long K, long long N, long long split_n) {
+    if (M < 1 || N < 1 || K < 1 || M > kDecMaxM) return 0;
+    uint32_t ck = 0;
+    const uint32_t k2 = narrow_ksplit((uint32_t)(split_n > 0 ? split_n : N), (uint32_t)K, (uint32_t)M, &ck);
+    return k2 > 1 ? (long)k2 * (long)M * (long)N * (long)sizeof(float) : 0;
+}
+extern "C" int64_t r4d_rad_gemm_i8a8_m16_dec_scratch(const RadArgs* a) {
+    return (int64_t)dec_scratch(r4d_geti_or(a, "M", 0), r4d_geti_or(a, "K", 0), r4d_geti_or(a, "N", 0),
+                                r4d_geti_or(a, "split_n", 0));
+}
+extern "C" int r4d_rad_gemm_i8a8_m16_dec(const RadArgs* a, RadStream stream) {
+    Fp8Ops g;
+    int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
+    if (rc != RAD_OK) return rc;
+    if (g.M > kDecMaxM) return R4D_NO(RAD_E_SHAPE);
     if (g.a->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
     const int e = gemm_fp8a8_nt_m16_emit(
         r4d_addr(g.a), r4d_addr(g.ascale), r4d_addr(g.b), r4d_addr(g.bscale), r4d_addr(g.y),

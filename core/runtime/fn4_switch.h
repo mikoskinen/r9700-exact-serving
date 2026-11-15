@@ -54,14 +54,18 @@
  *   att_bi          architecture plugin (rad_fn4_switch): fn4 BI -- a step's prefill sequences' dense attention each in
  *                   a launch shaped as its alone step's (its rows, its band, its table row and seqused), every sparse
  *                   sequence in launches of its own; 2 as 1, the sparse decode sequences in one launch whose split law
- *                   counts 1 + n_spec rows (libr4d split_rows; RADIANCE_FN4_BIDEC / X3DUAL declare it); 0 today's
+ *                   counts 1 + n_spec rows (libr4d split_rows; RADIANCE_FN4_BIDEC / X3DUAL declare it); 3 + a run of
+ *                   dense decode sequences in one pinned launch; 4 (15.11.) + each sequence of a sparse step on the
+ *                   path of its alone step's context bound (qwen/build2/LONGPROMPT.md); 0 today's
  *                   launches                                                                       RADIANCE_FN4_ATT_BI
  *   arw_rows        architecture plugin (rad_fn4_switch): fn4 ARW -- the four-rank fused exact write / gather-write
  *                   (one-shot) only up to this many rows, above them the separate all-reduce (two-shot) and write;
  *                   byte-identical; 0 = today                                                      RADIANCE_FN4_ARW_ROWS
  *   sched_bi_chunk  core scheduler: fn4 BI -- a prompt's prefill chunk boundaries the same alone and beside other work
  *                   (ported from ds41-bi: 1 alone's boundaries, 2 the interval grid, 3 / 4 alone's pieces cut on the
- *                   interval / RADIANCE_SCHED_BI_GRID grid, >= 128 rows a side); 0 today          RADIANCE_SCHED_BI_CHUNK
+ *                   interval / RADIANCE_SCHED_BI_GRID grid, >= 128 rows a side; 5 every prefill piece alone in its
+ *                   step; 6 (15.11.) alone's piece whole where it fits beside other work, else alone in its step, never
+ *                   cut); 0 today                                                                  RADIANCE_SCHED_BI_CHUNK
  *   exl3_dual       architecture plugin (rad_fn4_switch): fn4 BI-dual -- every trunk MoE layer's EXL3 down takes the
  *                   step's row bands (libr4d bi_band, exl3 interface v12): a mixed step's decode rows get the decode
  *                   band's bytes in the prefill band's pass; needs RADIANCE_FN4_X3DUAL=1 at start (declares the
@@ -73,6 +77,25 @@
  *                   reduce-scatter / all-gather move their peer bytes on the SDMA copy engines (the same fold, the
  *                   same bytes); needs RADIANCE_FN4_AR_SDMA set at start (0 / 1: builds the copy-engine contexts; such
  *                   passes stay untaped)                                                          RADIANCE_FN4_AR_SDMA
+ *
+ *   bi_wide         architecture plugin (rad_fn4_switch): fn4 BI wide (14.11.2026) -- the forms a step above 64 decode
+ *                   rows takes, a mask: 1 the trunk's int8 linears over the decode rows in libr4d's gemm_nt_q_dec (the
+ *                   narrow tile in 64-token groups: each row its alone bytes), 2 the hc reads' decode rows in one bi_dec
+ *                   launch up to 128 rows, 4 the fused router up to 128 rows, 8 the fused attention / QSA prologues up to
+ *                   128 rows; RADIANCE_FN4_BI_WIDE at start declares the forms (its value the start value); 0 today
+ *                                                                                                  RADIANCE_FN4_BI_WIDE
+ *
+ *   sp_serial       architecture plugin (rad_fn4_switch): fn4 SP-serial (14.11.2026) -- a serial step's prefill rows (the
+ *                   newcomer step, a lone prompt of up to a pass) take the sequence-parallel gated residual: the block's
+ *                   reduce-scatter, the write and read on this rank's quarter of the rows (a prefill segment's part with the
+ *                   segment's K split pinned), the all-gather and the codes on every row; the same bytes; needs
+ *                   RADIANCE_FN4_SPSERIAL set at start (declares; its value the start value); 2 the step in two halves,
+ *                   one half's collectives on the second lane beside the other half's write and read; 0 today
+ *                                                                                                 RADIANCE_FN4_SPSERIAL
+ *
+ *   hc_pinpf2       libr4d (rad_fn4_switch): fn4 SP-serial (14.11.2026) -- a read whose K split is pinned to a taller height
+ *                   (SP's part reads) takes the PF2 form below 512 rows too, where its band holds the planes; the same bytes
+ *                   (PF2 = the wide form at one split); 0 today                                   RADIANCE_FN4_HC_PINPF2
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -93,7 +116,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */

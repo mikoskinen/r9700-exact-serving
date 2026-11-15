@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <array>
+#include <tuple>
 #include <cmath>
 #include <cerrno>
 #include <cstdarg>
@@ -155,6 +156,7 @@ struct Plugin {
     void (*readv_hc)(int) = nullptr;       /* optional (fn4 hc_readv) */
     void (*pf2_stages_hc)(int) = nullptr;  /* optional (fn4 hc_readv timing) */
     void (*upmix_hc)(int) = nullptr;       /* optional (fn4 hc_upmix) */
+    void (*pinpf2_hc)(int) = nullptr;      /* optional (fn4 SP-serial hc_pinpf2) */
     void (*release_hc_ctr)() = nullptr;     /* optional (fn4): free the mix-counter slots */
     void (*pin_qsel)(int) = nullptr;
     void (*pin_mla)(int) = nullptr;
@@ -235,6 +237,7 @@ static bool load(Plugin* pl, const char* path) {
     pl->readv_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_readv");
     pl->pf2_stages_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_pf2_stages");
     pl->upmix_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_upmix");
+    pl->pinpf2_hc = (void (*)(int))dlsym(pl->h, "r4d_hc_read_pinpf2");
     pl->release_hc_ctr = (void (*)())dlsym(pl->h, "r4d_hc_mix_ctr_release");
     okall &= sym(pl->h, "r4d_qsa_select_pin_form", &pl->pin_qsel);
     okall &= sym(pl->h, "r4d_mla_matrix_pin_form", &pl->pin_mla);
@@ -1304,6 +1307,146 @@ static void attn_bi_batch_case(const Plugin& pl, const char* name, const std::ve
                 fb >= 0 ? fmt(" (first at row %lld)", (long long)fb).c_str() : "", (long long)nc);
     ok(fmt("%s: att_bi 3 one pinned launch = alone launches, k %lld ctx [%s]", name, (long long)k, cs.c_str()).c_str(),
        nb == 0, nb ? fmt("%lld elements differ, first at row %lld", (long long)nb, (long long)fb) : std::string());
+}
+
+/* fn4 long-prompt identity (15.11.2026, qwen/build2/LONGPROMPT.md): one Flash-Next TP4 decode step's attention for ONE
+ * sequence of 1 + n_spec = 4 rows ending at context `ctx` (head 256, gqa 6, one KV head, 4-token pages, fp8 cache, max_ctx
+ * 262144), in the launch forms the engine issues it:
+ *   A    alone, dense (rad_block_attn_gated_fp8.h, the step's last branch): the decode row over one sequence at its alone
+ *        table width (core/sched/batch.cpp: bound_bucket(ctx_len, 1024) + 4 rows + 2 draft windows, 256-block steps) with
+ *        cu_seqlens {0, 4};
+ *   B    beside a 3k-key sequence under att_bi 3 (op_attn_bi): attn_paged_pin, split_rows 1, the step's width (1024 blocks),
+ *        no cu; B16 the same launch over 16 copies of the sequence (a run of dense decode sequences);
+ *   C    alone, sparse (a step whose bound passes qsa_exact_to): the decode row over the 4 rows as 4 one-row sequences, each
+ *        its selection as qsa_select emits it below the budget (every complete page in order, the partial page last) and
+ *        its sequ ((nsel - 1) * 4 + pos % 4 + 1);
+ *   D    the loaded sparse form (att_bi 2 / 4, op_attn_gq_bi's law): attn_paged_pin over 16 copies of C's rows, split_rows 4.
+ * Prints per ctx the elements of A that differ in B, B16 and C (and C's rows that differ), and of C in D. A = B = B16 and
+ * C = D must hold; A vs C is the reading under test. --case attn_lp. */
+static int64_t lp_bound(int64_t v) {   /* core/sched/batch.cpp bound_bucket(v, 1024) */
+    if (v <= 0) return v;
+    int64_t q = 1024;
+    if (v > 64) {
+        const int lg = 63 - __builtin_clzll((unsigned long long)v);
+        if (((int64_t)1 << (lg - 5)) > q) q = (int64_t)1 << (lg - 5);
+    }
+    return (v + q - 1) / q * q;
+}
+static void attn_lp_case(const Plugin& pl, const std::vector<int32_t>& ctxs) {
+    if (!sel("attn_lp")) return;
+    const RadKernelInfo* r = find(pl, "attn_decode_h256_gqa6_bs4_fp8kv");
+    const RadKernelInfo* rp = find(pl, "attn_decode_pin_h256_gqa6_bs4_fp8kv");
+    if (!r || !rp) { skip("attn_lp", "row absent"); return; }
+    const int64_t hd = 256, gqa = 6, kvh = 1, bs = 4, qh = kvh * gqa, qd = 4, rowq = qh * hd, topk = 512, cop = 16;
+    int32_t cmax = 0;
+    for (int32_t c : ctxs) cmax = std::max(cmax, c);
+    const int64_t nblk = (cmax + bs - 1) / bs + 1, kvn = nblk * kvh * bs * 2 * hd, qn = qd * rowq;
+    std::vector<uint8_t> hkv((size_t)kvn);
+    for (int64_t i = 0; i < kvn; ++i) hkv[(size_t)i] = st_rand_e4m3((uint32_t)i + 11u);
+    std::vector<uint16_t> hq((size_t)(qn * cop));
+    for (int64_t i = 0; i < qn; ++i) hq[(size_t)i] = st_rand_bf16((uint32_t)i * 5u + 3u);
+    for (int64_t k = 1; k < cop; ++k) std::copy(hq.begin(), hq.begin() + qn, hq.begin() + k * qn);
+    void* d_kv = dalloc((size_t)kvn);
+    void* d_q = dalloc((size_t)(qn * cop) * 2);
+    void* d_oa = dalloc((size_t)qn * 2);
+    void* d_ob = dalloc((size_t)qn * 2);
+    void* d_oc = dalloc((size_t)qn * 2);
+    void* d_o16 = dalloc((size_t)(qn * cop) * 2);
+    void* d_od = dalloc((size_t)(qn * cop) * 2);
+    if (!d_kv || !d_q || !d_oa || !d_ob || !d_oc || !d_o16 || !d_od) { ok("attn_lp", false, "hipMalloc failed"); return; }
+    st_memcpy(d_kv, hkv.data(), hkv.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_q, hq.data(), hq.size() * 2, hipMemcpyHostToDevice);
+    auto base_ps = [&](int64_t q_len) {
+        return std::vector<RadParam>{ PI("q_len", q_len), PI("head_dim", hd), PI("gqa", gqa), PI("block_size", bs),
+                                      PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "fp8_e4m3"),
+                                      PI("max_ctx", 262144) };
+    };
+    auto rd = [&](void* d, int64_t n) { std::vector<uint16_t> h((size_t)n); st_memcpy(h.data(), d, (size_t)n * 2, hipMemcpyDeviceToHost); return h; };
+    int bad = 0;
+    for (int32_t c : ctxs) {
+        const int64_t nb = (c + bs - 1) / bs;
+        const int64_t wa = ((lp_bound(c - qd) + qd + 8 + bs - 1) / bs + 255) / 256 * 256, wb = 1024;
+        auto table = [&](int64_t w) { std::vector<int32_t> t((size_t)w, 0); for (int64_t b = 0; b < nb && b < w; ++b) t[(size_t)b] = (int32_t)b; return t; };
+        const std::vector<int32_t> ta = table(wa), tb = table(wb);
+        st_memset(d_oa, 0, (size_t)qn * 2); st_memset(d_ob, 0, (size_t)qn * 2); st_memset(d_oc, 0, (size_t)qn * 2);
+        st_memset(d_o16, 0, (size_t)(qn * cop) * 2); st_memset(d_od, 0, (size_t)(qn * cop) * 2);
+        {   /* A */
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ 1, wa }, ta), TI32({ 1 }, { c }), TF32({ 1, kvh }, 1.0f), TF32({ 1, kvh }, 1.0f),
+                TI32({ 2 }, { 0, (int32_t)qd }), T(d_oa, RAD_BF16, { qd, qh, hd }) };
+            absent(ts[4]); absent(ts[5]);
+            std::vector<RadParam> ps = base_ps(qd);
+            run_case(r, ts, ps);
+        }
+        {   /* B, B16 */
+            for (int64_t k : { (int64_t)1, cop }) {
+                std::vector<int32_t> tk; for (int64_t s = 0; s < k; ++s) tk.insert(tk.end(), tb.begin(), tb.end());
+                std::vector<RadTensor> ts = {
+                    T(d_q, RAD_BF16, { k * qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                    TI32({ k, wb }, tk), TI32({ k }, rep_i32(k, c)), TF32({ k, kvh }, 1.0f), TF32({ k, kvh }, 1.0f),
+                    T(nullptr, RAD_I32, { k + 1 }), T(k == 1 ? d_ob : d_o16, RAD_BF16, { k * qd, qh, hd }) };
+                absent(ts[4]); absent(ts[5]); absent(ts[6]);
+                std::vector<RadParam> ps = base_ps(qd);
+                ps.push_back(PI("split_rows", 1));
+                run_case(rp, ts, ps);
+            }
+        }
+        /* C, D: each row its selection */
+        std::vector<int32_t> sel1, su1;
+        for (int64_t j = 0; j < qd; ++j) {
+            const int64_t p = c - qd + j, own = (p + 1) / bs;
+            std::vector<int32_t> row((size_t)(topk + 1), -1);
+            int64_t out = 0;
+            for (int64_t b = 0; b < own && out < topk; ++b) row[(size_t)out++] = (int32_t)b;
+            if ((p + 1) % bs != 0 && own < nb) row[(size_t)out++] = (int32_t)own;
+            sel1.insert(sel1.end(), row.begin(), row.end());
+            su1.push_back(out == 0 ? 0 : (int32_t)((out - 1) * bs + p % bs + 1));
+        }
+        {   /* C */
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { qd, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ qd, topk + 1 }, sel1), TI32({ qd }, su1), TF32({ qd, kvh }, 1.0f), TF32({ qd, kvh }, 1.0f),
+                T(nullptr, RAD_I32, { qd + 1 }), T(d_oc, RAD_BF16, { qd, qh, hd }) };
+            absent(ts[4]); absent(ts[5]); absent(ts[6]);
+            std::vector<RadParam> ps = base_ps(1);
+            run_case(r, ts, ps);
+        }
+        {   /* D */
+            std::vector<int32_t> sk, uk;
+            for (int64_t k = 0; k < cop; ++k) { sk.insert(sk.end(), sel1.begin(), sel1.end()); uk.insert(uk.end(), su1.begin(), su1.end()); }
+            const int64_t rows = cop * qd;
+            std::vector<RadTensor> ts = {
+                T(d_q, RAD_BF16, { rows, qh, hd }), T(d_kv, RAD_F8E4M3, { nblk, kvh, bs, 2 * hd }),
+                TI32({ rows, topk + 1 }, sk), TI32({ rows }, uk), TF32({ rows, kvh }, 1.0f), TF32({ rows, kvh }, 1.0f),
+                T(nullptr, RAD_I32, { rows + 1 }), T(d_od, RAD_BF16, { rows, qh, hd }) };
+            absent(ts[4]); absent(ts[5]); absent(ts[6]);
+            std::vector<RadParam> ps = base_ps(1);
+            ps.push_back(PI("split_rows", qd));
+            run_case(rp, ts, ps);
+        }
+        const std::vector<uint16_t> oa = rd(d_oa, qn), ob = rd(d_ob, qn), oc = rd(d_oc, qn), o16 = rd(d_o16, qn * cop),
+                                    od = rd(d_od, qn * cop);
+        int64_t nab = 0, na16 = 0, nac = 0, ncd = 0;
+        std::string rows_ac;
+        for (int64_t i = 0; i < qn; ++i) { nab += oa[(size_t)i] != ob[(size_t)i]; nac += oa[(size_t)i] != oc[(size_t)i]; }
+        for (int64_t k = 0; k < cop; ++k)
+            for (int64_t i = 0; i < qn; ++i) {
+                na16 += oa[(size_t)i] != o16[(size_t)(k * qn + i)];
+                ncd += oc[(size_t)i] != od[(size_t)(k * qn + i)];
+            }
+        for (int64_t j = 0; j < qd; ++j) {
+            int64_t d = 0;
+            for (int64_t i = j * rowq; i < (j + 1) * rowq; ++i) d += oa[(size_t)i] != oc[(size_t)i];
+            rows_ac += fmt(" %lld:%lld keys %s", (long long)j, (long long)(c - qd + j + 1), d ? "DIFF" : "same");
+        }
+        std::printf("ATTNLP ctx %d (alone width %lld blocks, loaded 1024): A vs B %lld, A vs B16 %lld, A vs C %lld of %lld "
+                    "elements differ [rows%s]; C vs D %lld of %lld\n", c, (long long)wa, (long long)nab, (long long)na16,
+                    (long long)nac, (long long)qn, rows_ac.c_str(), (long long)ncd, (long long)(qn * cop));
+        if (nab || na16 || ncd) ++bad;
+    }
+    ok("attn_lp: the dense alone launch = the pinned dense launch (B, B16); the sparse alone launch = the pinned sparse launch (D)",
+       bad == 0, bad ? fmt("%d contexts differ", bad) : std::string());
 }
 
 /* A token's bytes in a (block, head) page of an 8-bit cache: kvq 0 fp8 (K then V), 1 fp8_v4, 2
@@ -21106,6 +21249,194 @@ static void hc_readv_perf(const Plugin& pl, int64_t M, int iters, bool i8) {
     ok(nm.c_str(), true);
 }
 
+/* fn4 SP-serial (14.11.2026, --spqcheck [mask]): Qwen3.8-Flash-Next's serial-step sequence-parallel read. A prefill segment of
+ * h rows read whole (hc_read_e4m3 as the trunk declares it: M band 2048, no pin) against its parts on their own row slices
+ * with kc_rows = 128 ceil(h / 128) (HyperConn::read_kt) -- the parts a rank's rows of a step of td decode rows + h (q =
+ * ceil((td + h) / 4) rows a rank, the decode rows first), at td 0 / 32 / 64 / 128; a partial part of <= 64 rows is not
+ * taken (the engine then keeps step_serial). Every output byte compared: x, inj, codes + scales, rotated codes + scales.
+ * Arms (mask, default 7): 1 the engine's switches (hc_readv 331, F1n, hc_upmix 5), 2 the same with the norm scales handed
+ * in (`ss`, hc_readv bit 3: the write's scales), 4 stock forms (hc_readv 0, F1n off). A control per arm: the parts at their
+ * own split (no pin) -- expected to differ wherever the part's row-tile count gives another split. */
+static void hc_spq_check(const Plugin& pl, int mask) {
+    const RadKernelInfo* r = find(pl, "hc_read_e4m3");
+    if (!r || !pl.readv_hc || !pl.norm_hc_wave || !pl.upmix_hc) { skip("SP-serial part reads", "row absent or no hc hooks"); return; }
+    const int64_t n = 2560, hc = 4, lr = 320, HN = hc * n, grp = 128, nkb = n / grp, MB = 2048;
+    const int64_t dld = r4d_hc8::row_bytes(HN, r4d_hc8::down_group(HN));
+    const int64_t uld = r4d_hc8::row_bytes(lr, r4d_hc8::up_group(lr));
+    uint64_t rs = 0x5DEECE66Dull;
+    auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
+    std::vector<uint16_t> hh((size_t)(MB * HN));
+    for (auto& v : hh) v = h_to_bf16((float)((int)(rnd() % 2001) - 1000) / 400.0f);
+    std::vector<float> wg((size_t)HN);
+    for (auto& v : wg) v = (float)((int)(rnd() % 201) - 100) / 1000.0f;
+    auto plane = [&](int64_t rows, int64_t K, int64_t G, int64_t ld) {
+        std::vector<uint8_t> b((size_t)(rows * ld), 0);
+        for (int64_t r0 = 0; r0 < rows; ++r0) {
+            uint8_t* row = b.data() + r0 * ld;
+            for (int64_t k = 0; k < K; ++k) row[k] = (uint8_t)(8 + rnd() % 111) | ((rnd() & 1) ? 0x80u : 0u);
+            float* sc = (float*)(row + K);
+            for (int64_t g = 0; g < K / G; ++g) sc[g] = 0.002f + 0.004f * (float)(rnd() % 1000) / 1000.0f;
+        }
+        return b;
+    };
+    std::vector<uint8_t> down = plane(lr, HN, r4d_hc8::down_group(HN), dld);
+    std::vector<uint8_t> up   = plane(HN, lr, r4d_hc8::up_group(lr), uld);
+    std::vector<uint16_t> injw((size_t)(hc * HN));
+    for (auto& v : injw) v = h_to_bf16((float)((int)(rnd() % 201) - 100) / 50000.0f);
+    std::vector<float> ssv((size_t)(MB * 8));
+    for (auto& v : ssv) v = 0.25f + (float)(rnd() % 1000) / 1000.0f;
+    const size_t xb = (size_t)(MB * n * 2), ib = (size_t)(MB * hc * 2), qb = (size_t)(MB * n), sb = (size_t)(MB * nkb * 4);
+    void* d_h = dalloc(hh.size() * 2);  void* d_w = dalloc(wg.size() * 4);
+    void* d_dn = dalloc(down.size());   void* d_up = dalloc(up.size());
+    void* d_iw = dalloc(injw.size() * 2); void* d_ss = dalloc(ssv.size() * 4);
+    struct Out { void *x, *inj, *q, *qs, *rq, *rs; };
+    Out o[2];
+    for (Out& e : o) { e.x = dalloc(xb); e.inj = dalloc(ib); e.q = dalloc(qb); e.qs = dalloc(sb); e.rq = dalloc(qb); e.rs = dalloc(sb); }
+    if (!d_h || !d_w || !d_dn || !d_up || !d_iw || !d_ss || !o[0].x || !o[1].rs) { ok("SP-serial part reads", false, "hipMalloc failed"); return; }
+    st_memcpy(d_h, hh.data(), hh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, wg.data(), wg.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_dn, down.data(), down.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_up, up.data(), up.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_iw, injw.data(), injw.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_ss, ssv.data(), ssv.size() * 4, hipMemcpyHostToDevice);
+    hipStream_t hs = nullptr;
+    if (hipStreamCreate(&hs) != hipSuccess) { ok("SP-serial part reads", false, "stream"); return; }
+    /* scratch for the widest band any launch below declares */
+    void* scr = nullptr; int64_t scr_b = 0;
+    auto launch = [&](int which, int64_t r0, int64_t rows, int64_t band, int64_t kcr, bool ss, bool sync = true) {
+        auto off = [&](void* p, int64_t pitch_bytes) { return (void*)((char*)p + r0 * pitch_bytes); };
+        const Out& e = o[which];
+        std::vector<RadTensor> ts = {
+            T(off(d_h, HN * 2), RAD_BF16, { rows, HN }),  T(d_w, RAD_F32, { HN }),
+            T(d_dn, RAD_F8E4M3, { lr, HN }),               T(d_up, RAD_F8E4M3, { HN, lr }),
+            T(d_iw, RAD_BF16, { hc, HN }),                 T(off(e.x, n * 2), RAD_BF16, { rows, n }),
+            T(off(e.inj, hc * 2), RAD_BF16, { rows, hc }), T(off(e.q, n), RAD_I8, { rows, n }),
+            T(off(e.qs, nkb * 4), RAD_F32, { rows, nkb }), T(off(e.rq, n), RAD_F8E4M3, { rows, n }),
+            T(off(e.rs, nkb * 4), RAD_F32, { rows, nkb }),
+        };
+        if (ss) ts.push_back(T(off(d_ss, 32), RAD_F32, { rows, 8 }));
+        std::vector<RadParam> ps = {
+            PI("M", band), PI("n", n), PI("hc", hc), PI("lowrank", lr), PF("eps", 1e-6),
+            PS("dtype", "bf16"), PF("wadd", 1.0), PI("inject", 1), PI("group", grp),
+            PI("rotate", 1), PS("mix", "e4m3"),
+        };
+        if (kcr > 0) ps.push_back(PI("kc_rows", kcr));
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        if (r->scratch) {
+            const int64_t need = r->scratch(&a);
+            if (need > scr_b) { scr = dalloc((size_t)need); scr_b = scr ? need : 0; }
+            a.scratch = scr; a.scratch_bytes = scr_b;
+        }
+        if (!sync) return r->launch(&a, (RadStream)hs) == RAD_OK;
+        return r->launch(&a, (RadStream)hs) == RAD_OK && st_stream_sync(hs) == hipSuccess;
+    };
+    auto diff_rows = [&](int64_t h) {
+        size_t d = 0;
+        for (auto [pa, pb, b] : { std::tuple<void*, void*, size_t>{ o[0].x, o[1].x, (size_t)(h * n * 2) },
+                                   { o[0].inj, o[1].inj, (size_t)(h * hc * 2) }, { o[0].q, o[1].q, (size_t)(h * n) },
+                                   { o[0].qs, o[1].qs, (size_t)(h * nkb * 4) }, { o[0].rq, o[1].rq, (size_t)(h * n) },
+                                   { o[0].rs, o[1].rs, (size_t)(h * nkb * 4) } }) {
+            std::vector<uint8_t> A(b), B(b);
+            st_memcpy(A.data(), pa, b, hipMemcpyDeviceToHost);
+            st_memcpy(B.data(), pb, b, hipMemcpyDeviceToHost);
+            for (size_t i = 0; i < b; ++i) d += A[i] != B[i];
+        }
+        return d;
+    };
+    static const int64_t kH[] = { 200, 257, 300, 383, 384, 385, 450, 511, 512, 513, 600, 640, 641, 700, 768, 769, 900, 1000, 1024,
+                                  1025, 1073, 1080, 1100, 1135, 1144, 1162, 1200, 1300, 1400, 1536, 1537, 1700, 1900, 1920, 1921,
+                                  2000, 2048 };
+    static const int64_t kTd[] = { 0, 32, 64, 128 };
+    for (int arm = 0; arm < 4; ++arm) {
+        if (!(mask & (arm == 3 ? 16 : (1 << arm)))) continue;
+        if (arm == 3 && !pl.pinpf2_hc) { skip("SP-serial part reads, arm 3", "no r4d_hc_read_pinpf2"); continue; }
+        const bool ss = arm == 1;
+        const int rv = arm == 2 ? 0 : (331 | (ss ? 8 : 0));
+        pl.readv_hc(rv);
+        pl.norm_hc_wave(arm == 2 ? 0 : 1);
+        pl.upmix_hc(arm == 2 ? 0 : 5);
+        if (pl.pinpf2_hc) pl.pinpf2_hc(arm == 3 ? 1 : 0);
+        int cases = 0, same = 0, ctl_cases = 0, ctl_diff = 0;
+        std::string bad;
+        for (int64_t h : kH) for (int64_t td : kTd) {
+            const int64_t T = td + h, q = (T + 3) / 4;
+            if (T > MB) continue;
+            /* the parts of [td, T) on the four ranks, segment-relative */
+            std::vector<std::pair<int64_t, int64_t>> parts;
+            bool take = true;
+            for (int rk = 0; rk < 4; ++rk) {
+                const int64_t lo = std::max(std::min(rk * q, T), td), hi = std::min((rk + 1) * q, T);
+                if (hi <= lo) continue;
+                if (hi - lo < h && hi - lo <= 64) take = false;
+                parts.push_back({ lo - td, hi - lo });
+            }
+            if (!take || parts.size() < 2) continue;
+            const int64_t kcr = 128 * ((h + 127) / 128);
+            for (Out& e : o) { st_memset(e.x, 0xa5, xb); st_memset(e.inj, 0xa5, ib); st_memset(e.q, 0xa5, qb);
+                               st_memset(e.qs, 0xa5, sb); st_memset(e.rq, 0xa5, qb); st_memset(e.rs, 0xa5, sb); }
+            bool okl = launch(0, 0, h, MB, 0, ss);
+            for (auto [a, k] : parts) okl = okl && launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, ss);
+            ++cases;
+            const size_t d = okl ? diff_rows(h) : (size_t)-1;
+            if (d == 0) ++same;
+            else if (bad.size() < 400) bad += fmt(" h%lld/td%lld:%s", (long long)h, (long long)td, okl ? fmt("%zu", d).c_str() : "launch");
+            /* control: the same parts at their own split */
+            for (auto [a, k] : parts) (void)launch(1, a, k, MB, 0, ss);
+            ++ctl_cases;
+            if (diff_rows(h) != 0) ++ctl_diff;
+        }
+        std::printf("SPQCHECK arm %s: %d / %d cases every output byte identical (pinned parts vs the segment read whole)%s; "
+                    "control (parts unpinned): %d / %d cases differ\n",
+                    arm == 0 ? "engine (hc_readv 331, F1n, hc_upmix 5)" : arm == 1 ? "engine + ss (hc_readv 339)"
+                    : arm == 3 ? "engine + hc_pinpf2 (pinned parts below 512 rows through PF2)" : "stock",
+                    same, cases, bad.empty() ? "" : (" -- differ:" + bad).c_str(), ctl_diff, ctl_cases);
+        ok(fmt("SP-serial part reads, arm %d", arm).c_str(), cases > 0 && same == cases, bad);
+    }
+    /* Timing at the newcomer step's heights (warm, the engine's switches): the segment read whole against its parts (each part
+     * alone; the step's critical path is the slowest rank's part), the parts in each prefill form a pin allows (1 the tiled
+     * 128-row down + unfused up, 2 wide, 3 PF2), each form's bytes against the whole read. */
+    if (mask & 8) {
+        pl.readv_hc(331); pl.norm_hc_wave(1); pl.upmix_hc(5);
+        for (int64_t h : { (int64_t)1073, (int64_t)1135, (int64_t)2048 - 64 }) {
+            const int64_t td = 64, T = td + h, q = (T + 3) / 4, kcr = 128 * ((h + 127) / 128);
+            std::vector<std::pair<int64_t, int64_t>> parts;
+            for (int rk = 0; rk < 4; ++rk) {
+                const int64_t lo = std::max(std::min(rk * q, T), td), hi = std::min((rk + 1) * q, T);
+                if (hi > lo) parts.push_back({ lo - td, hi - lo });
+            }
+            if (pl.pin_hc) pl.pin_hc(0);
+            (void)launch(0, 0, h, MB, 0, false);
+            const double tw = st_time_us([&](int) { (void)launch(0, 0, h, MB, 0, false, false); }, 20, hs);
+            std::string line = fmt("SPQTIME h %lld (td %lld, q %lld): whole %.1f us |", (long long)h, (long long)td, (long long)q, tw);
+            for (int form : { 0, 1, 2, 3, 4 }) {
+                if (form && form < 4 && !pl.pin_hc) break;
+                if (form == 4 && !pl.pinpf2_hc) break;
+                if (pl.pin_hc) pl.pin_hc(form == 4 ? 0 : form);
+                if (form == 4) pl.pinpf2_hc(1);   /* 4: the launcher's rule + hc_pinpf2 */
+                double mx = 0, sum = 0; bool okf = true;
+                for (auto [a, k] : parts) {
+                    okf = okf && launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, false);
+                    const double t = st_time_us([&](int) { (void)launch(1, a, k, std::min<int64_t>(kcr, MB), kcr, false, false); }, 20, hs);
+                    mx = std::max(mx, t); sum += t;
+                }
+                if (pl.pin_hc) pl.pin_hc(0);
+                if (form == 4) pl.pinpf2_hc(0);
+                const size_t d = okf ? diff_rows(h) : (size_t)-1;
+                line += fmt(" form %d: parts max %.1f / sum %.1f us, %s |", form, mx, sum,
+                            !okf ? "refused" : d == 0 ? "bytes = whole" : fmt("%zu bytes differ", d).c_str());
+            }
+            std::printf("%s\n", line.c_str());
+        }
+        if (pl.pin_hc) pl.pin_hc(0);
+    }
+    if (pl.pinpf2_hc) pl.pinpf2_hc(0);
+    pl.readv_hc(0); pl.norm_hc_wave(0); pl.upmix_hc(0);
+    (void)hipStreamDestroy(hs);
+}
+
 /* fn4 hc_readv bit 3 (W1b): a write and the read after it at Qwen3.8-Flash-Next's shape, the pair as the trunk
  * issues it -- hc_write_bf16 (y, inj, h, ss; eps) then hc_read_e4m3 (..., ss) -- on device buffers the case and
  * the timing share. `ss` is [M][8] f32. */
@@ -33812,6 +34143,9 @@ static void device_phase(const Plugin& pl) {
                        { 5, 64, 255, 256, 257, 1000, 1500, 2047, 2048, 2049, 4096, 6000, 9000, 12345, 16384, 20000 }, 4);
     attn_bi_batch_case(pl, "attn_decode_h256_gqa6_bs4_fp8kv", { 700, 900, 1100, 1300 }, 1);
     attn_bi_batch_case(pl, "attn_decode_h256_gqa12_fp8kv", { 37, 129, 400, 777, 1024, 2049, 3000, 8191 }, 4, 12);
+    /* fn4 long prompts (15.11.2026): the dense / sparse alone launches of a 4-row decode step vs the loaded forms */
+    attn_lp_case(pl, { 376, 600, 799, 1000, 1020, 1024, 1025, 1026, 1027, 1028, 1029, 1040, 1051, 1100, 1301, 1435, 1703,
+                       2000, 2051 });
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 64,  "k6_v4",  0, 256);
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);
@@ -37123,6 +37457,7 @@ int main(int argc, char** argv) {
     long long hcw_m = 0;
     int hcw_it = 50;
     long long hcv_m = 0;
+    int spq = 0;   /* fn4 SP-serial --spqcheck */
     int hcv_it = 50;
     long long hcs_m = 0;
     int hcs_it = 50;
@@ -37427,6 +37762,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { usage(); return 2; }
             hcu_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hcu_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--spqcheck")) {
+            /* fn4 SP-serial: a prefill segment's parts read with the K split pinned vs the segment read whole */
+            spq = 7;
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) spq = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhcv")) {
             /* hc_read's faster forms (fn4 hc_readv) against the stock ones at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -37566,6 +37905,16 @@ int main(int argc, char** argv) {
         skip("gated residual read timing (hc_upmix)", "built without HIP");
 #endif
         return 0;
+    }
+    if (spq) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        hc_spq_check(pl, spq);
+        dfree_all();
+#else
+        skip("SP-serial part reads", "built without HIP");
+#endif
+        return g_fail ? 1 : 0;
     }
     if (hcv_m) {
         if (!load(&pl, path)) return 1;
