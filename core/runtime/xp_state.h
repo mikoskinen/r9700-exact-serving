@@ -105,6 +105,7 @@ struct XpfState {
     int32_t*     cnt    = nullptr;     /* [kXpMaxNe], zero between plans */
     XpfBox*      box    = nullptr;     /* [2], pinned host */
     uint32_t*    done   = nullptr;     /* [2][kXpfChunks], pinned host */
+    uint32_t*    started = nullptr;    /* [2], pinned host: the request whose layer's routed GEMMs began (xpf_step) */
     XpfStats*    stats  = nullptr;     /* device */
     XpfStats*    stats_h = nullptr;    /* pinned host */
     void**       maps   = nullptr;     /* [layers][kXpMaxNe][kXpfParts] */

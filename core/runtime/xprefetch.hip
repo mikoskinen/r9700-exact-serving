@@ -447,9 +447,11 @@ __global__ __launch_bounds__(512) void xpf_plan(int32_t* cnt, uint32_t ne, void*
 /* xpf_step, compute stream, right before the layer's routed GEMMs: each chunk whose DMA list wrote `seq` to its done
  * word has its records' entries pointed at the ring, only where an entry still holds what the plan read. */
 __global__ __launch_bounds__(256) void xpf_step(rad::XpfRec* rec, const int32_t* __restrict__ nrec, const uint32_t* done,
-                                                uint32_t seq, rad::XpfStats* stats) {
+                                                uint32_t seq, rad::XpfStats* stats, uint32_t* started) {
     constexpr int P = rad::kXpfParts;
     const int n = *nrec;
+    /* the layer's GEMMs start now: the host thread hands no more of this plan's lists to the queue */
+    if (threadIdx.x == 0 && started) __hip_atomic_store(started, seq, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     for (int t = (int)threadIdx.x; t < n * P; t += (int)blockDim.x) {
         const int j = t / P, q = t % P;
         if (__hip_atomic_load((uint32_t*)(done + j / rad::kXpfChunk), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != seq)
@@ -501,8 +503,9 @@ extern "C" int rad_xpf_plan_launch(int32_t* cnt, uint32_t ne, void** const* map,
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 extern "C" int rad_xpf_step_launch(const rad::XpfRec* rec, const int32_t* nrec, const uint32_t* done, uint32_t seq,
-                                   rad::XpfStats* stats, void* stream) {
-    hipLaunchKernelGGL(xpf_step, dim3(1), dim3(256), 0, (hipStream_t)stream, (rad::XpfRec*)rec, nrec, done, seq, stats);
+                                   rad::XpfStats* stats, uint32_t* started, void* stream) {
+    hipLaunchKernelGGL(xpf_step, dim3(1), dim3(256), 0, (hipStream_t)stream, (rad::XpfRec*)rec, nrec, done, seq, stats,
+                       started);
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 extern "C" int rad_xpf_restore_launch(rad::XpfRec* rec, int32_t* nrec, rad::XpfStats* stats, void* stream) {

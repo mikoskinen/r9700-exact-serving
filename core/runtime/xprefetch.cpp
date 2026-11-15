@@ -31,7 +31,8 @@ extern "C" int rad_xpf_plan_launch(int32_t*, uint32_t, void** const*, const int3
                                    rad::XpfStats*, void*) {
     return -1;
 }
-extern "C" int rad_xpf_step_launch(const rad::XpfRec*, const int32_t*, const uint32_t*, uint32_t, rad::XpfStats*, void*) {
+extern "C" int rad_xpf_step_launch(const rad::XpfRec*, const int32_t*, const uint32_t*, uint32_t, rad::XpfStats*, uint32_t*,
+                                   void*) {
     return -1;
 }
 extern "C" int rad_xpf_restore_launch(rad::XpfRec*, int32_t*, rad::XpfStats*, void*) { return -1; }
@@ -457,7 +458,7 @@ void Ctx::xpf_free(XpfState& x) {
     if (x.ring) rad_dev_free_uncached(x.ring);
     for (void* p : {(void*)x.rec, (void*)x.nrec, (void*)x.cnt, (void*)x.stats, (void*)x.maps, (void*)x.places})
         if (p) rad_dev_free(p, RAD_MEM_DEVICE);
-    for (void* p : {(void*)x.box, (void*)x.done, (void*)x.stats_h})
+    for (void* p : {(void*)x.box, (void*)x.done, (void*)x.started, (void*)x.stats_h})
         if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
 }
 
@@ -498,9 +499,10 @@ void Ctx::xpf_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* strid
     x->places  = (int32_t*)rad_dev_alloc(nl * kXpMaxNe * 4, RAD_MEM_DEVICE);
     x->box     = (XpfBox*)rad_dev_alloc((int64_t)sizeof(XpfBox) * 2, RAD_MEM_HOST_PINNED);
     x->done    = (uint32_t*)rad_dev_alloc(4 * 2 * kXpfChunks, RAD_MEM_HOST_PINNED);
+    x->started = (uint32_t*)rad_dev_alloc(4 * 2, RAD_MEM_HOST_PINNED);
     x->stats_h = (XpfStats*)rad_dev_alloc((int64_t)sizeof(XpfStats), RAD_MEM_HOST_PINNED);
     const bool ok = x->ring && x->rec && x->nrec && x->cnt && x->stats && x->maps && x->places && x->box && x->done &&
-                    x->stats_h && rad_memset_async(x->nrec, 0, 4 * 2, stream_) >= 0 &&
+                    x->started && x->stats_h && rad_memset_async(x->nrec, 0, 4 * 2, stream_) >= 0 &&
                     rad_memset_async(x->cnt, 0, 4 * kXpMaxNe, stream_) >= 0 &&
                     rad_memset_async(x->stats, 0, sizeof(XpfStats), stream_) >= 0 && rad_stream_sync(stream_) >= 0;
     if (!ok) {
@@ -511,6 +513,7 @@ void Ctx::xpf_open(const uint64_t* lo, const uint64_t* hi, const uint64_t* strid
     }
     std::memset((void*)x->box, 0, sizeof(XpfBox) * 2);
     std::memset(x->done, 0, 4 * 2 * kXpfChunks);
+    std::memset(x->started, 0, 4 * 2);
     std::memset((void*)x->stats_h, 0, sizeof(XpfStats));
     x->layers.resize((size_t)nl);
     XpfState* xs = x.get();
@@ -579,7 +582,18 @@ void Ctx::xpf_serve(XpfState& x) {
         if (!got || b->seq != r.seq) { ++x.late; drop_mark(); continue; }
         std::atomic_thread_fence(std::memory_order_acquire);
         const int n = std::min<int>((int)b->n, kXpfMaxSlots);
+        volatile uint32_t* st = x.started + r.g;
         for (int c0 = 0; c0 < n; c0 += kXpfChunk) {
+            /* at most two of this plan's lists in the queue, and none once its layer's routed GEMMs began: a copy that
+             * lands after that is never read and its bytes share the link with the GEMMs' own reads */
+            const auto t2 = std::chrono::steady_clock::now();
+            bool late = false;
+            while (c0 >= 2 * kXpfChunk && rad_xp_behind(x.device) >= 2) {
+                if (*st == r.seq) { late = true; break; }
+                if (x.stop || std::chrono::steady_clock::now() - t2 > std::chrono::milliseconds(200)) { late = true; break; }
+                _mm_pause();
+            }
+            if (late || *st == r.seq) { ++x.late; break; }
             /* a queue still busy with older lists: the rest of this plan would land too late */
             if (rad_xp_behind(x.device) > 2 * kXpfChunks) { ++x.dropped; break; }
             uint64_t src[kXpfChunk], dst[kXpfChunk], bytes[kXpfChunk];
@@ -748,7 +762,7 @@ int Ctx::xpf_step_run(int layer) {
     const int g = x.wl[0] == layer ? 0 : 1;
     if (rad_xpf_step_launch(x.rec + (size_t)g * kXpfMaxSlots, x.nrec + g,
                             (const uint32_t*)rad_dev_device_ptr(x.done + g * kXpfChunks), x.wseq[g], x.stats,
-                            (void*)cur_stream()))
+                            (uint32_t*)rad_dev_device_ptr(x.started + g), (void*)cur_stream()))
         return RAD_E_DEVICE;
     x.wl[g] = -1;
     return RAD_OK;

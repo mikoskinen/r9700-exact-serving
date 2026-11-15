@@ -127,7 +127,7 @@ extern "C" int rad_xpf_plan_launch(int32_t* cnt, uint32_t ne, void** const* map,
                                    rad::XpfRec* rec, int32_t* nrec, rad::XpfBox* box, uint32_t seq,
                                    rad::XpfStats* stats, void* stream);
 extern "C" int rad_xpf_step_launch(const rad::XpfRec* rec, const int32_t* nrec, const uint32_t* done, uint32_t seq,
-                                   rad::XpfStats* stats, void* stream);
+                                   rad::XpfStats* stats, uint32_t* started, void* stream);
 extern "C" int rad_xpf_restore_launch(rad::XpfRec* rec, int32_t* nrec, rad::XpfStats* stats, void* stream);
 
 extern "C" int rad_xp_logits_launch(const uint16_t* h, const uint16_t* w, float* logits, uint32_t rows,
