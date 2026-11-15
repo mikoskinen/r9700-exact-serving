@@ -230,13 +230,14 @@ struct FakeKV : IKVManager {
     /* fn4 preempt_keep, as KVManager::preempt_keep / rejoin: the whole blocks go, the partial last block and the states
      * stay; rejoin puts a hit's whole blocks back in front */
     std::unordered_map<uint64_t, int64_t> kept;
-    int64_t preempt_keep(uint64_t id) override {
+    int64_t preempt_keep(uint64_t id, int64_t n_valid) override {
         auto it = seqs.find(id);
         if (it == seqs.end()) return RAD_E_NOTFOUND;
+        const int64_t nv = std::min<int64_t>(it->second.n, n_valid);
         int64_t whole = -1;
         for (size_t i = 0; i < gs.size(); ++i)
             if (geom.g[i].paged) {
-                const int64_t bs = geom.g[i].block_size, w = it->second.n / bs * bs;
+                const int64_t bs = geom.g[i].block_size, w = nv / bs * bs;
                 whole = whole < 0 ? w : std::min(whole, w);
             }
         if (whole < 0) whole = 0;

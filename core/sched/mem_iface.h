@@ -77,7 +77,7 @@ struct IKVManager {
     /* fn4 preempt_keep (KVManager::preempt_keep / rejoin): give up the whole blocks only, keep the partial last blocks
      * and the state slots; the tokens the whole blocks covered, < 0 unsupported. rejoin puts a hit's whole blocks back
      * in front of the kept ones. */
-    virtual int64_t preempt_keep(uint64_t seq) { (void)seq; return RAD_E_UNSUPPORTED; }
+    virtual int64_t preempt_keep(uint64_t seq, int64_t n_valid) { (void)seq; (void)n_valid; return RAD_E_UNSUPPORTED; }
     virtual int  rejoin(uint64_t seq, int32_t group, const std::vector<int32_t>& whole) {
         (void)seq; (void)group; (void)whole;
         return RAD_E_UNSUPPORTED;
@@ -358,7 +358,7 @@ struct KVBinding final : IKVManager {
         return m->adopt(s, g, b, n);
     }
     int  preempt(uint64_t s) override               { return m->preempt(s); }
-    int64_t preempt_keep(uint64_t s) override       { return m->preempt_keep(s); }
+    int64_t preempt_keep(uint64_t s, int64_t n) override { return m->preempt_keep(s, n); }
     int  rejoin(uint64_t s, int32_t g, const std::vector<int32_t>& w) override { return m->rejoin(s, g, w); }
     bool can_ever_fit(int64_t n) const override     { return m->can_ever_fit(n); }
     bool can_grow(uint64_t s, int64_t n) const override { return m->can_grow(s, n); }

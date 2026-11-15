@@ -519,8 +519,10 @@ public:
     /* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md; condition 2 of hero2/QWEN-LP-IDENTITY.md): a decoding
      * sequence gives up its whole blocks only -- the prefix cache holds what preempt's caller published -- and keeps its
      * partial last block of every paged group and every state slot (linear with its replay copies, conv, the QSA tail).
-     * Returns the tokens its whole blocks covered (the rejoin's hit must reach them), < 0 when it cannot (a window). */
-    int64_t preempt_keep(uint64_t seq);
+     * `n_valid` is the scheduler's n_computed: the table may run past it (a verify's rejected rows stay allocated until
+     * the next ensure), and only rows below it were published. Returns the tokens its whole blocks below n_valid covered
+     * (the rejoin's hit must reach them), < 0 when it cannot (a window). */
+    int64_t preempt_keep(uint64_t seq, int64_t n_valid);
     /* The kept sequence takes `whole` (a prefix hit's blocks, whole_tokens / block_size of them) in front of its kept
      * partial block; nothing is recomputed. RAD_E_STATE when the sequence was not kept. */
     int  rejoin(uint64_t seq, int32_t group, const std::vector<int32_t>& whole);

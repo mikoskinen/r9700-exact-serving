@@ -1510,7 +1510,7 @@ bool Scheduler::preempt_back() {
     }
     if (fn4::preempt_keep() > 0 && published && !r.embed && r.n_computed >= (int64_t)r.prompt.size() &&
         r.n_computed + 1 >= s.seq_len() && !kv_->has_runtime_window(r.id) && keep_possible()) {
-        const int64_t whole = kv_->preempt_keep(r.id);
+        const int64_t whole = kv_->preempt_keep(r.id, r.n_computed);
         if (whole >= 0) {
             s.keep_whole = whole;
             r.state = ReqState::Preempted;

@@ -1105,15 +1105,16 @@ int KVManager::preempt(uint64_t id) {
     return RAD_OK;
 }
 
-int64_t KVManager::preempt_keep(uint64_t id) {
+int64_t KVManager::preempt_keep(uint64_t id, int64_t n_valid) {
     Seq* s = find(id);
     if (!s) return RAD_E_NOTFOUND;
+    const int64_t n = std::min<int64_t>(s->n_tokens, std::max<int64_t>(0, n_valid));
     int64_t whole = -1;
     for (size_t g = 0; g < plans_.size(); ++g) {
         const auto& p = plans_[g];
         if (!p.paged()) continue;
         if (s->win[g].set || s->first_block_pos[g] != 0) return RAD_E_UNSUPPORTED;
-        const int64_t w = s->n_tokens / p.block_size * p.block_size;
+        const int64_t w = n / p.block_size * p.block_size;
         whole = whole < 0 ? w : std::min(whole, w);
     }
     if (whole < 0) whole = 0;
