@@ -2493,6 +2493,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
         const long first = last + 1 - (long)a.wused[(long)s * a.wus];
         [[maybe_unused]] long ulo = 0, uhi = 0, uoff = 0;   /* UX: the plan's entries of s at rows uoff .. of a.lu */
         if constexpr (UX) ds_lu_span(a, a.lucap, s, &ulo, &uhi, &uoff);
+        [[maybe_unused]] uint32_t wpk = 0u;                  /* UX: this wave marked a packed tile */
         for (int k0 = 0; k0 < nkk; k0 += 128) {
             const int k = k0 + tid;
             const uint16_t* ptr = nullptr;
@@ -2522,6 +2523,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 const bool tun = ((lane < 16) ? (un & 0xffffu) : (un >> 16)) != 0u;
                 if (uptr && !tun) ptr = uptr;
                 pkt = ((un & 0xffffu) ? 1u : 0u) | ((un >> 16) ? 2u : 0u);
+                wpk |= pkt;
             }
             if (k < nkk) kp[k] = ptr ? ptr : kDsZeroKey;
             const uint32_t b = (uint32_t)__builtin_amdgcn_ballot_w32(ptr != nullptr);
@@ -2531,7 +2533,16 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 if (t0 + 1 < nkt) vmask[t0 + 1] = (b >> 16) | ((pkt & 2u) << 15);
             }
         }
+        /* UX: each wave's "a packed tile" word in score buffer 1 (first written at tile 1, after tile 0's barrier; the
+         * previous row ended at a barrier) -> `allpl`, the row's every tile plain: no tile word read in the loop */
+        if constexpr (UX)
+            if (lane == 0) ((uint32_t*)(sbuf + kWmWaves * 64))[wave] = wpk;
         __syncthreads();
+        [[maybe_unused]] bool allpl = false;
+        if constexpr (UX) {
+            const uint32_t* f = (const uint32_t*)(sbuf + kWmWaves * 64);
+            allpl = __builtin_amdgcn_readfirstlane((int)(f[0] | f[1] | f[2] | f[3])) == 0;
+        }
 
         /* ---- Q^T for this lane's head and the wave's columns: step i, half hf = columns
          * c0 + 64 hf + 8 i .. + 7 (the same split as the key rows below) */
@@ -2556,7 +2567,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
         [[maybe_unused]] const int wtk = W8 ? (a.nk > a.win ? a.win / 16 : nkt) : 0;   /* tiles [0, wtk) W8 */
         /* tile tt holds packed keys: [ptk, nkt), or (UX) the tiles the key setup marked (bit 16, workgroup-uniform) */
         auto nvt = [&](int tt) -> bool {
-            if constexpr (UX) return ((uint32_t)__builtin_amdgcn_readfirstlane((int)vmask[tt]) >> 16) & 1u;
+            if constexpr (UX) return !allpl && (((uint32_t)__builtin_amdgcn_readfirstlane((int)vmask[tt]) >> 16) & 1u);
             else return NV && tt >= ptk;
         };
         auto ldk = [&](int tt) {                     /* tile tt's K row: kn, or (packed) kr / kw8 */
