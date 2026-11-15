@@ -1135,6 +1135,31 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
     return emin - n;
 }
 
+/* fn4 resume_cold (15.11.2026, qwen/EXACT-PRESSURE.md; hero2/QWEN-LP-IDENTITY.md condition 1): the positions where this
+ * prompt's idle cold prefill starts a chunk -- the pieces bi_chunk_plan gives it alone (plan_chunk from 0 at
+ * --max-num-batched-tokens with the alone span, no Request::checkpoint_at). A hit that resumes at one of them computes the
+ * rest in the cold run's own pieces (plan_chunk depends on the position and the target only), so it answers as the cold
+ * run; one that resumes anywhere else (another prompt's tail, a shared head's cut) runs every later piece off the cold
+ * grid -- a 896-row piece and 8192-row spans from 16384 instead of from 10240 -- and the rows take other arithmetic. */
+void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_t>* out) {
+    out->clear();
+    out->push_back(0);
+    if (!geo_.checkpoints() || target <= 0) return;
+    const bool keep = span_now_;
+    span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+                (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+    const int64_t end = chunk_end(r, target);
+    int64_t n = 0;
+    for (int guard = 0; n < end && guard < 1 << 20; ++guard) {
+        int64_t ck = -1;
+        const int64_t w = plan_chunk(n, end, cfg_.max_tok, &ck, 0, &r);
+        if (w <= 0) break;
+        n += w;
+        if (n < end) out->push_back(n);
+    }
+    span_now_ = keep;
+}
+
 /* A prefill chunk splits at the linear-state checkpoint interval so a checkpoint is always
  * written (spec §7.3; see scheduler.h).
  *
@@ -1574,7 +1599,21 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
             cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
             cap.max_give_back = 2 * draft_refill_;
         }
-        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        /* fn4 resume_cold: a snapshot only where this prompt's cold prefill starts a chunk (cold_starts) */
+        const bool rcold = fn4::resume_cold() > 0 && geo_.checkpoints() && has_linear_state_;
+        if (rcold) {
+            cold_starts(r, s.seq_len(), &cold_starts_);
+            cap.resume_at = &cold_starts_;
+            if (draft_refill_ <= 0) cap.tokens = -1;   /* no token cap: the resume rule only */
+        }
+        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 || rcold ? &cap : nullptr);
+        if (rcold && h.n_attn_tokens > 0) {
+            ++rc_n_[0];
+            /* what the unfiltered rule would have resumed at is not known here; the rows between the hit and the
+             * resume are what the rule costs (a hit at a grid point costs none) */
+            const int64_t at = h.checkpoint_slot >= 0 ? h.n_linear_tokens : 0;
+            if (at < h.n_attn_tokens) { ++rc_n_[1]; rc_n_[2] += h.n_attn_tokens - at; }
+        }
         if (h.given_back > 0) {
             m_.draft_refill_tokens += h.given_back;
             ++m_.draft_refills;
@@ -1686,7 +1725,14 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * request with the same head skips it -- the same system prompt or instructions in front
          * of a different text, as TranslateGemma's chunks are. The interval and tail snapshots
          * miss it: the head is shorter than an interval, and each prompt's tail is its own. */
-        if (geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= kSharedHeadMin) {
+        /* fn4 resume_cold: no cut there -- a snapshot off this prompt's cold chunk starts would run its later pieces
+         * off its cold grid (and the requests that resume there off theirs); the cold run's own chunk ends carry the
+         * snapshots a later request with the same head resumes at */
+        if (rcold && geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= kSharedHeadMin) {
+            ++rc_n_[3];
+            RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; no snapshot cut there (fn4 resume_cold)",
+                      (unsigned long long)r.id, (long long)h.branch_at);
+        } else if (geo_.checkpoints() && r.checkpoint_at == 0 && h.branch_at - reuse >= kSharedHeadMin) {
             r.checkpoint_at = h.branch_at;
             RAD_DEBUG("admit %llu: a head other prompts share ends at %lld; a snapshot there",
                       (unsigned long long)r.id, (long long)h.branch_at);

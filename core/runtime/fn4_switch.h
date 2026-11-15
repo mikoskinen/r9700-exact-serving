@@ -97,6 +97,12 @@
  *                   (SP's part reads) takes the PF2 form below 512 rows too, where its band holds the planes; the same bytes
  *                   (PF2 = the wide form at one split); 0 today                                   RADIANCE_FN4_HC_PINPF2
  *
+ *   resume_cold     core scheduler (15.11.2026, qwen/EXACT-PRESSURE.md): a prefix hit answers as a cold run -- 1: the hit
+ *                   resumes only at a snapshot where this prompt's idle cold prefill starts a chunk (Scheduler::cold_starts:
+ *                   its own pieces from 0 with the alone span, keep_at 0), the deepest such at or below the hit
+ *                   (HitCap::resume_at), and a head other prompts share (CacheHit::branch_at) takes no snapshot cut
+ *                   (Request::checkpoint_at stays 0); 0 today                                       RADIANCE_FN4_RESUME_COLD
+ *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
  *
@@ -116,7 +122,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kResumeCold, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
@@ -130,6 +136,10 @@ int  aql_acq_rule();
 /* fn4 lever BI chunking (ported from ds41-bi): the scheduler's chunk option, the sched_bi_chunk switch's applied value
  * (RADIANCE_SCHED_BI_CHUNK at start): 0 today, 1..4 (core/sched/scheduler.cpp bi_chunk_plan). */
 int  sched_bi_chunk();
+/* fn4 resume_cold (15.11.2026, qwen/EXACT-PRESSURE.md): the scheduler's prefix-hit rule, the switch's applied value
+ * (RADIANCE_FN4_RESUME_COLD at start): 0 today, 1 a hit resumes only where this prompt's idle cold prefill starts a chunk
+ * and no prompt is cut at a head other prompts share (core/sched/scheduler.cpp cold_starts). */
+int  resume_cold();
 bool aql_acq_none();
 
 /* Server thread: queue a value; false (with the reason) for an unknown switch or a bad value. */

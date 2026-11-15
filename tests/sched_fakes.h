@@ -456,8 +456,17 @@ struct FakePC : IPrefixCache {
         }
         CacheHit h{ attn, lin, src };
         h.branch_at = branch_at;
+        /* fn4 resume_cold (HitCap::resume_at): the deepest allowed position at or below the snapshot where one is held
+         * -- this fake holds one at `lin` and at every multiple of `interval` below it (from ckpt_lo) */
+        if (cap && cap->resume_at && src >= 0) {
+            int64_t l = 0;
+            for (int64_t p : *cap->resume_at)
+                if (p > 0 && p <= lin && (p == lin || (p % interval == 0 && p >= ckpt_lo))) l = p;
+            h.n_linear_tokens = (int32_t)l;
+            h.checkpoint_slot = l > 0 ? src : -1;
+        }
         const int64_t whole = src >= 0 ? lin : 0;
-        if (cap && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
+        if (cap && cap->tokens >= 0 && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
             const int64_t a = cap->tokens / 16 * 16;
             int64_t l = std::min<int64_t>(lin, a) / interval * interval;
             if (l < ckpt_lo) l = 0;

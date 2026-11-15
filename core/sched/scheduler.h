@@ -553,6 +553,15 @@ private:
     /* fn4 BI chunking 6: the current plan is a lone step (other running sequences left out of it); no step is issued
      * ahead of it (step_next would carry on with the lone sequence only), nor while a request waits for its lone step */
     bool          bi6_plan_lone_ = false;
+    /* fn4 resume_cold (15.11.2026): where this prompt's idle cold prefill starts a chunk -- 0 and the end of every chunk
+     * but the last, from plan_chunk with the alone span and no checkpoint_at (the pieces bi_chunk_plan gives it alone),
+     * ascending. A hit that resumes at one of them recomputes the rest of the prompt in the cold run's own pieces. */
+    std::vector<int64_t> cold_starts_;
+    void          cold_starts(const Request& r, int64_t target, std::vector<int64_t>* out);
+    int64_t       rc_n_[4] = {0, 0, 0, 0};   /* resume_cold: hits looked up, stepped back, rows stepped back, heads not cut */
+public:
+    const int64_t* resume_cold_counts() const { return rc_n_; }
+private:
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share);
     IKVManager*   kv_ = nullptr;
