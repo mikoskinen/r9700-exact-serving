@@ -56,8 +56,19 @@ bool ls_meet(const LineSet& a, const LineSet& b) {
  * acquire. 0 off, 1 rule (a store leaves no stale line behind on its own CU), 2 rule-w (it may:
  * every line written in the window is risky). */
 int acq_rule_mode() { return rad::fn4::aql_acq_rule(); }   /* fn4: the aql_acq switch, else the env at start */
+/* fn4 (13.11.2026, 227: the prefill comm lane's waves slow the compute beside them): RADIANCE_FN4_LANE_LOWPRIO=1 at start
+ * creates the second lane at the device's low queue priority (scheduling only; the same launches and bytes). */
+int lane1_prio() {
+    static const int p = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_LOWPRIO"); return e && *e && *e != '0' ? -1 : 0; }();
+    return p;
+}
 bool acq_rule_on() { return acq_rule_mode() != 0; }
 }  // namespace
+
+bool ctx_lane_eager() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_EAGER"); return !(e && *e == '0'); }();
+    return on;
+}
 
 /* ================================================================== lifecycle */
 
@@ -95,7 +106,21 @@ int Ctx::init(const CtxDesc& d) {
         own_stream_ = true;
     }
 
-    /* The second lane is created lazily; see lane_init(). */
+    /* The second lane's stream: built here, while the card still has the room the VRAM budget kept for it, where the
+     * program declares a second lane (its own scratch region, Program::scratch_regions); lane_init() adopts it at the
+     * first rad_lane(1). Built on first use instead (today's) where it is not declared or RADIANCE_FN4_LANE_EAGER=0.
+     * fn4 (15.11.2026, qwen/build2/STALL.md): built mid-run, on a card full to its headroom, the queue's VRAM came from
+     * the driver evicting this process's SVM buffers (kernel: svm_range_evict_svm_bo_worker / svm_range_restore_work),
+     * and the first prefill step that took lane 1 stalled 46-231 s on 6 of 7 starts. */
+    if (program_->scratch_regions > 1 && ctx_lane_eager()) {
+        const uint64_t t0 = rad_mono_ns();
+        RAD_TRY(rad_stream_create(&lane1_spare_, lane1_prio()));
+        for (int i = 0; i < 2; ++i)
+            if (!lane_ev_[i]) RAD_TRY(rad_event_create_local(&lane_ev_[i]));
+        if (rank_ == 0)
+            RAD_INFO("second lane: its stream built at start (%.1f ms on rank 0), adopted by the first step that takes "
+                     "lane 1 (RADIANCE_FN4_LANE_EAGER=0 builds it there instead)", (double)(rad_mono_ns() - t0) / 1e6);
+    }
 
     int s = prepare();
     if (s < 0) { shutdown(); return s; }
@@ -138,6 +163,8 @@ void Ctx::shutdown() {
         host_touch_pending_[i] = false;
     }
     if (own_lane1_ && lane1_) rad_stream_destroy(lane1_);
+    if (lane1_spare_) rad_stream_destroy(lane1_spare_);   /* built at init, never taken: nothing was issued on it */
+    lane1_spare_ = nullptr;
     lane1_      = nullptr;
     own_lane1_  = false;
     lane_       = 0;
@@ -978,10 +1005,18 @@ void Ctx::dump_profile() const {
 int Ctx::lane_init() {
     if (lane1_) return RAD_OK;
     RAD_TRY(rad_dev_set(device_));
-    /* fn4 (13.11.2026, 227: the prefill comm lane's waves slow the compute beside them): RADIANCE_FN4_LANE_LOWPRIO=1 at start
-     * creates the second lane at the device's low queue priority (scheduling only; the same launches and bytes). */
-    static const int lane_prio = [] { const char* e = std::getenv("RADIANCE_FN4_LANE_LOWPRIO"); return e && *e && *e != '0' ? -1 : 0; }();
-    RAD_TRY(rad_stream_create(&lane1_, lane_prio));
+    if (lane1_spare_) {
+        /* Built at init (ctx_lane_eager): the same stream kind and priority, nothing issued on it yet. */
+        lane1_ = lane1_spare_;
+        lane1_spare_ = nullptr;
+    } else {
+        /* fn4 (15.11.2026, qwen/build2/STALL.md): timed, since a hardware queue built mid-run on a full card is where the
+         * first-use stall waited; said once a rank. */
+        const uint64_t t0 = rad_mono_ns();
+        RAD_TRY(rad_stream_create(&lane1_, lane1_prio()));
+        RAD_INFO("second lane: rank %d built its stream on first use in %.1f ms (RADIANCE_FN4_LANE_EAGER=0 or no "
+                 "second lane declared)", rank_, (double)(rad_mono_ns() - t0) / 1e6);
+    }
     own_lane1_ = true;
     /* Local scope: a lane join only orders this card's two queues. */
     for (int i = 0; i < 2; ++i)

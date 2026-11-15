@@ -1584,11 +1584,15 @@ int a_stream_create(RadStream* out, int high_priority) {
     auto s = std::make_unique<Stream>();
     s->ord = ord;
     s->agent = d.agent;
+    /* fn4 (15.11.2026, qwen/build2/STALL.md): the build's phases timed; one built mid-run on a full card waited in the
+     * driver for tens of seconds, so a build over a second names where. */
+    const uint64_t t_q0 = steady_ns();
     if (hsa_queue_create(d.agent, kQueuePackets, HSA_QUEUE_TYPE_SINGLE, on_queue_error, s.get(),
                          UINT32_MAX, UINT32_MAX, &s->q) != HSA_STATUS_SUCCESS) {
         device_set_error("rad_stream_create: hsa_queue_create failed on device %d", ord);
         return RAD_E_DEVICE;
     }
+    const uint64_t t_q1 = steady_ns();
     s->mask = s->q->size - 1;
     hsa_amd_profiling_set_profiler_enabled(s->q, 1);
     if (high_priority > 0) hsa_amd_queue_set_priority(s->q, HSA_AMD_QUEUE_PRIORITY_HIGH);
@@ -1605,6 +1609,7 @@ int a_stream_create(RadStream* out, int high_priority) {
                          d.host_kargs ? "pinned host memory" : "VRAM the host can write");
         return RAD_E_DEVICE;
     }
+    const uint64_t t_q2 = steady_ns();
     s->karg = static_cast<char*>(ka);
     s->chain_ctr = reinterpret_cast<uint64_t*>(s->karg + (size_t)(s->mask + 1) * kKargSlot);
     *reinterpret_cast<volatile uint64_t*>(s->chain_ctr) = 0;
@@ -1618,6 +1623,14 @@ int a_stream_create(RadStream* out, int high_priority) {
         return RAD_E_NOMEM;
     }
     s->bounce = static_cast<char*>(bb);
+    {
+        const uint64_t t_q3 = steady_ns();
+        if (t_q3 - t_q0 > 1000000000ull)
+            RAD_WARN("device: building a stream on device %d took %.1f s: the hardware queue %.1f s, its kernel-argument "
+                     "ring (%s) %.1f s, its pinned bounce buffer %.1f s", ord, (double)(t_q3 - t_q0) / 1e9,
+                     (double)(t_q1 - t_q0) / 1e9, d.host_kargs ? "pinned host memory" : "VRAM",
+                     (double)(t_q2 - t_q1) / 1e9, (double)(t_q3 - t_q2) / 1e9);
+    }
     note_alloc(ka, (int64_t)(s->mask + 2) * kKargSlot, -1);
     note_alloc(bb, kBounceBytes, -1);
     uint32_t slot = kMaxQueues;

@@ -45,6 +45,11 @@ typedef void (*ArchStepFn)(RadCtx*, const RadBatch*);
 /* "[shape]/[stride]" of a tensor's live dimensions, for diagnostics. */
 std::string tensor_shape_str(const RadTensor& t);
 
+/* fn4 (15.11.2026, qwen/build2/STALL.md): whether a program that declares a second lane (Program::scratch_regions > 1)
+ * gets that lane's stream at Ctx::init instead of on its first use mid-run. On unless RADIANCE_FN4_LANE_EAGER=0 at start
+ * (today's lazy build, for comparison). Read once; the VRAM budget's settle check reads it too. */
+bool ctx_lane_eager();
+
 /* ------------------------------------------------------------------ the issue plan */
 /* One resolved (op, band, domain) with everything that does not change per issue filled in: the
  * geometry view, the scratch pointer, the instance init() returned, rank and world size. Per issue
@@ -712,6 +717,12 @@ private:
      * and a spinner plus a large copy on two streams cost the max of the two, not the sum. */
     RadStream lane1_      = nullptr;
     bool      own_lane1_  = false;
+    /* fn4 (15.11.2026, qwen/build2/STALL.md): the second lane's stream built at init (ctx_lane_eager()), kept aside until
+     * lane_init adopts it. Building a hardware queue later, mid-run, needs ~35 MiB of VRAM (its context save area and
+     * kernel-argument ring) when the card is full to its headroom, and the driver makes that room by evicting the
+     * process's SVM buffers: 46-231 s on the first prefill step that takes lane 1. Until adopted it is not lane1_, so
+     * every step that does not ask for lane 1 runs exactly the single-lane path (lane_join, pass_key). */
+    RadStream lane1_spare_ = nullptr;
     int       lane_       = 0;
     RadEvent  lane_ev_[2] = { nullptr, nullptr };
     /* An op was issued on lane 1 since lane 1 was last joined into lane 0; lane 0 joins it before

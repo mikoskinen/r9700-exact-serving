@@ -1885,7 +1885,9 @@ int Engine::plan() {
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
-            int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
+            /* A second lane's queue is kept free for its build on first use; built at Ctx::init (ctx_lane_eager, fn4
+             * 15.11.2026) it is allocated before the settle check below and not kept again. */
+            int64_t lazy = r->program.scratch_regions > 1 && !ctx_lane_eager() ? f.queue_bytes : 0;
             /* The KV tiers' copy staging, built by TierExec::device_init on the first copy out.
              * The cached groups are settled later, so every paged group is counted (an upper
              * bound), each with the blocks an entry at the lcm of their block sizes holds
@@ -4199,7 +4201,8 @@ int Engine::start() {
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
 
         /* Both the headroom and the later allocations are still free here: serve() allocates
-         * the step staging; the KV tiers' staging and a second lane are built on first use. */
+         * the step staging; the KV tiers' staging and a second lane are built on first use (the lane at Ctx::init
+         * where ctx_lane_eager()). */
         const int64_t late = late_step_bytes_ + late_lazy_bytes_;
         const int64_t want = headroom + late;
         const int64_t got  = props.vram_free;
