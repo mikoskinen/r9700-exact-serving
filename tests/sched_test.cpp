@@ -772,6 +772,19 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
     CHECK_EQ(mixed_wide, 0);              /* no shared step past the shared budget */
     CHECK_EQ(after_lone_d, lone);         /* every lone step is followed by the decode rows' */
     CHECK(d_steps >= 10);
+    /* A prompt that is one piece and does not fit (256 > 256 - d's row): its lone step ends its prefill, and no step is
+     * issued ahead of it -- that step would carry on with it alone, leaving d out. */
+    const uint64_t c = f.submit(256, 4);
+    bool c_lone = false, ahead_after_lone = false;
+    for (int k = 0; k < 6 && f.sch.step(); ++k) {
+        const StepPlan& p = f.sch.plan();
+        const bool lone_c = p.e.size() == 1 && p.e[0].seq == c && p.e[0].is_prefill;
+        if (lone_c) { c_lone = true; ahead_after_lone = f.sch.step_next() != nullptr; }
+        f.commit_plain();
+        if (lone_c) break;
+    }
+    CHECK(c_lone);
+    CHECK(!ahead_after_lone);
     CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
     rad::fn4::apply_pending(1, &da);
 }

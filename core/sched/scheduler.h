@@ -550,6 +550,9 @@ private:
      * beside decoding sequences (the decode rows then get the next one). */
     uint64_t      bi6_wait_ = 0;
     bool          bi6_lone_last_ = false;
+    /* fn4 BI chunking 6: the current plan is a lone step (other running sequences left out of it); no step is issued
+     * ahead of it (step_next would carry on with the lone sequence only), nor while a request waits for its lone step */
+    bool          bi6_plan_lone_ = false;
     int64_t       bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, int64_t room, int64_t* checkpoint_pos,
                                 bool share);
     IKVManager*   kv_ = nullptr;

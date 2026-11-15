@@ -2077,6 +2077,7 @@ const RadBatch* Scheduler::step() {
         }
         bi6_lone_last_ = bi6_lone && any_dec;
     }
+    bi6_plan_lone_ = bi6_lone;
 
     /* A mixed step takes drafts like any other: the linear blocks run the recurrent path over its
      * decode rows and the chunked path over its prefill rows, so a verifying row rolls back as in
@@ -2694,6 +2695,10 @@ const RadBatch* Scheduler::step_next_locked() {
     /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
      * behind decode steps issued ahead. */
     if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
+    /* fn4 BI chunking 6: a lone step holds one request and leaves every other running sequence out; a step issued
+     * ahead of it would carry on with that one alone (F2 15.11.: 150-170 single-sequence steps after each lone step at
+     * 32 requests). A request waiting for its lone step needs the full step too. */
+    if (bi_chunk_ == 6 && (bi6_plan_lone_ || bi6_wait_)) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
 
@@ -2776,6 +2781,7 @@ void Scheduler::promote_next() {
     draft_cycle();
     std::swap(plan_, plan_next_);
     plan_next_.reset();
+    bi6_plan_lone_ = false;   /* a step issued ahead is never a lone step */
     step_prefill_tok_ = 0;
     step_decode_tok_  = 0;
     for (size_t i = 0; i < plan_.e.size(); ++i) {
