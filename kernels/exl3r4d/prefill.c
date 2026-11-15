@@ -32,7 +32,9 @@ int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
  * SPEED-C (ds41-etp-spc-plug, 15.11.2026): values 0 .. 31. Order 3 (bits 0-1 = 3, bit 2 clear; XR read 3 as 0) = INTERLEAVE:
  * each set longest first, the host-read entries spread evenly over the first (4 - s) / 4 of the chunk's positions, s =
  * bits 3-4 (3 = even over the whole chunk, 11 = the first 3/4, 19 = the first half, 27 = the first quarter). The same
- * entries in another order: the same bytes. Values with bits 3-4 and another order act as their bits 0-2. */
+ * entries in another order: the same bytes. Values with bits 3-4 and another order act as their bits 0-2.
+ * Bit 5 (32 + any of the above) = DEEP: the map form's one-block entries (<= 16 rows) of gate_up AND down keep
+ * EXL3R4D_PF_DEEP_GU / _DN k steps of weights in flight (exl3r4d_prefill.hip); the same loads and WMMAs in the same order. */
 static volatile int g_fn4_xr = 0;
 unsigned long long* exl3r4d_xr_rank_init(int rank);   /* exl3r4d_prefill.hip: the rank's device counters */
 void exl3r4d_xr_note(int rank, void* stream);        /* exl3r4d_prefill.hip: the counters' print, now and then */
@@ -56,7 +58,7 @@ __attribute__((visibility("default"))) int rad_host_pool_ranges(int rank, int n,
 __attribute__((visibility("default"))) int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
     if (!strcmp(name, "exl3_x3d")) return value >= 0 && value <= 4 ? 1 : -1;   /* K25U: 2 .. 4 */
-    if (!strcmp(name, "exl3_xr")) return value >= 0 && value <= 31 ? 1 : -1;   /* lever XR; SPEED-C 8 .. 31 */
+    if (!strcmp(name, "exl3_xr")) return value >= 0 && value <= 63 ? 1 : -1;   /* lever XR; SPEED-C 8 .. 63 */
     return 0;
 }
 __attribute__((visibility("default"))) int rad_fn4_switch(const char* name, int value) {
@@ -261,6 +263,8 @@ int exl3r4d_pf_launch(const RadArgs* a, RadStream s, int op) {
         int mode = 0;
         if (v && d.order && g.n_class == 2)
             mode = (v & 4) && xrb > 0 ? 5 : (v & 7) == 3 ? 3 | (v & 0x18) : (v & 3) == 3 ? 0 : (v & 3);
+        /* SPEED-C DEEP (bit 5): the map form's one-block entries take the deeper weight pipeline, gate_up and down */
+        if ((v & 32) && g.n_class == 2 && !run && am == 0) mode |= 0x80;
         const int ring = mode & 4 ? (int)xmb : 0;
         d.xr = (int32_t)((uint32_t)mode | ((uint32_t)exl3_k2(g.bits) << 8) | ((uint32_t)ring << 16));
 #ifndef EXL3R4D_PF_WGSTAMP

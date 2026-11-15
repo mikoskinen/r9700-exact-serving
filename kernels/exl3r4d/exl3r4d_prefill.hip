@@ -645,7 +645,17 @@ static __device__ __forceinline__ v2u pf_dn_suh(const Exl3r4dGemm& p, const Plan
 // matrix. WV = 8 MATS / NPW waves, wave w owns local tiles [w NPW, w NPW + NPW) of the block's 8 MATS tiles (matrix
 // w NPW / 8). The A fragment of block i, lane l is row r0 + 16 i + l % 16 of the prep's rows (clamped into the entry;
 // rows past it are computed and not stored).
-template <int BITS, int MT, int NPW, int MATS, int AM, bool YS = false>
+// SPEED-C DEEP (template DEEP, fn4 exl3_xr bit 5 -> the launch word's bit 7): a one-block entry (<= 16 rows: the cold experts,
+// the ones a host pool holds) takes EXL3R4D_PF_DEEP_GU / _DN k steps of weights in flight instead of the op's PW -- the
+// workgroup's bytes in flight over the link 2x (b1: the in-place GEMM read runs 25.1 GB/s with ~120-180 KB in flight a card,
+// the link 26.5-28 with 320 KB-1.3 MB). The same loads in the same k order, the same WMMAs in the same order: the same bytes.
+#ifndef EXL3R4D_PF_DEEP_GU
+#define EXL3R4D_PF_DEEP_GU 8
+#endif
+#ifndef EXL3R4D_PF_DEEP_DN
+#define EXL3R4D_PF_DEEP_DN 4
+#endif
+template <int BITS, int MT, int NPW, int MATS, int AM, bool YS = false, bool DEEP = false>
 static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Planes& w, int r0, int r1, float* lds,
                                                int rbase) {
   using P = Plan<BITS>;   // R23: any K the shared decode serves (2..6 at mul1); the buffer form below is K = 4's
@@ -714,7 +724,9 @@ static __device__ __forceinline__ void pf_body(const Exl3r4dGemm& p, const Plane
     svh_early<NPW, MATS>(w, wave, lane, cb, svp);
   if constexpr (EXL3R4D_PF_EPI_PRE && MATS == 2) dsr = pf_dn_suh(p, w, cb, lane);
 
-  constexpr int PF = EXL3R4D_PF_STAGES, PW = MATS == 2 ? EXL3R4D_PF_WSTAGES_GU : EXL3R4D_PF_WSTAGES_DN;
+  constexpr int PF = EXL3R4D_PF_STAGES,
+                PW = DEEP ? (MATS == 2 ? EXL3R4D_PF_DEEP_GU : EXL3R4D_PF_DEEP_DN)
+                          : (MATS == 2 ? EXL3R4D_PF_WSTAGES_GU : EXL3R4D_PF_WSTAGES_DN);
   static_assert(PW >= PF && PW % PF == 0, "the weights' depth is a multiple of the activations'");
   unsigned wb[PW][NPW][2][NW];
   v8h ab[PF][MT];
@@ -1338,6 +1350,14 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
     return;
   }
   if constexpr (XR && !RUN) pf_xr_redirect(a, kx, w);   // the copy, once it landed
+#if EXL3R4D_XR_ON
+  if constexpr (!RUN && AM == 0 && !XR) {   // SPEED-C DEEP: a one-block entry with the deeper weight pipeline
+    if ((xr_mode_of(a) & 0x80) && r1 - r0 <= 16) {
+      pf_body<BITS, 1, NPW, MATS, AM, YS, true>(p, w, r0, r1, lds, rbase);
+      return;
+    }
+  }
+#endif
   for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
     const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
     pf_dispatch<BITS, 1, MTX, NPW, MATS, AM, YS>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
