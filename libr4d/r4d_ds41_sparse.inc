@@ -29,6 +29,16 @@ static const RadOperandSpec oDs41AttnSparseSinkRt[] = {
 /* Levers DKV-U / DKV-G (RADIANCE_DS41_LATUNPACK / RADIANCE_DS41_LATGATHER; device-only, no libref schema): the packed
  * latent's entries unpacked (latent_unpack: the plan's rows of a pass; latent_gather: a decode-band pass's selections),
  * and the two attentions with the rows they read appended. */
+/* the unpacked attentions' parameters: attn_sparse_sink's (resp. the fold's), then plan_full (optional; 1: the caller knows
+ * the plan holds every entry the pass may select -- the LDS-free form, the plain form's occupancy; any value gives the
+ * same output) */
+static const RadParamSpec pDs41AttnSparseSinkLu[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format"), P_INTO("plan_full") };
+static const RadParamSpec pDs41AttnSparseSinkRtLu[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format"), P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_INT("block"),
+    P_STR("format"), P_STR("block_scale"), P_INTO("plan_full") };
 static const RadParamSpec pDs41LatUnpack[] = { P_INT("M"), P_INT("dim"), P_INT("ratio"), P_STR("latent_format") };
 static const RadOperandSpec oDs41LatUnpack[] = {
     { "comp_cache", RAD_OPD_IN, 0 }, { "comp_bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 },
@@ -199,11 +209,12 @@ SCHEMA("latent_gather", pDs41LatGather, oDs41LatGather,
        "Each row's selection j that attn_sparse_sink's key setup finds in the packed compressed cache (latent_format "
        "nvfp4, dim 512; comp_cache / comp_bt / cu_seqlens as that op's) unpacked to bf16 at gathered[row][j dim .. "
        "j dim + dim); the other selections' rows are not written. Lever DKV-G (device-only)."),
-SCHEMA("attn_sparse_sink_unpacked", pDs41AttnSparseSink, oDs41AttnSparseSinkLu,
+SCHEMA("attn_sparse_sink_unpacked", pDs41AttnSparseSinkLu, oDs41AttnSparseSinkLu,
        "attn_sparse_sink (operands q .. out, its parameters; latent_format nvfp4) whose WMMA passes read a selected "
        "entry from `unpacked` (latent_unpack's rows for the same cache, block table, positions' last rows and "
-       "cu_seqlens) where its 16-key tile is held there: the same out. Lever DKV-U (device-only)."),
-SCHEMA("attn_sparse_sink_rope_roundtrip_unpacked", pDs41AttnSparseSinkRt, oDs41AttnSparseSinkRtLu,
+       "cu_seqlens) where its 16-key tile is held there: the same out. plan_full 1: the caller knows the plan holds every "
+       "entry the pass may select (the LDS-free form; any value the same out). Lever DKV-U (device-only)."),
+SCHEMA("attn_sparse_sink_rope_roundtrip_unpacked", pDs41AttnSparseSinkRtLu, oDs41AttnSparseSinkRtLu,
        "attn_sparse_sink_rope_roundtrip (operands q .. cos_sin, its parameters) with the attention's WMMA passes "
        "reading `unpacked` as attn_sparse_sink_unpacked: the same out. Lever DKV-U (device-only)."),
 SCHEMA("attn_sparse_sink_gathered", pDs41AttnSparseSink, oDs41AttnSparseSinkGth,

@@ -60,6 +60,7 @@ RadParam pf64(const char* k, double v) { return { k, RAD_P_F64, 0, 0, nullptr, v
 RadParam pstr(const char* k, const char* v) { return { k, RAD_P_STR, 0, 0, v, 0.0 }; }
 
 int g_fail = 0, g_check = 0;
+int g_plan_full = 0;   /* > 0: the unpacked attentions get plan_full 1 (the LDS-free form, right or wrong about the plan) */
 void expect(bool ok, const char* name, const char* what, long long a = 0, long long b = 0) {
     ++g_check;
     if (ok) return;
@@ -227,6 +228,9 @@ int attn(RadLaunchFn fn, const Fix& f, const View& v, bool packed, bool fold, ui
         p.push_back(pstr("block_scale", "ue8m0"));
     }
     if (extra) t.push_back(*extra);
+    if (extra && g_plan_full > 0 && (fn == r4d_rad_ds41_attn_sparse_sink_unpacked ||
+                                     fn == r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked))
+        p.push_back(pint("plan_full", 1));
     RadArgs a{};
     a.t = t.data();
     a.n_t = (int)t.size();
@@ -496,6 +500,15 @@ int main() {
         const Fix f = make(53, 16, 1, { { 30, 1500 }, { 40, 2600 } });
         case_u("U: 70 rows, two sequences, plan holds all", f, { 0, 70, {} }, 70, 64, false);
         case_u("U: 70 rows, two sequences, second only partly held", f, { 0, 70, {} }, 70, 24, false);
+    }
+    /* plan_full 1 (the LDS-free form): with the plan holding all, and wrongly with a plan holding 64 (exact either way) */
+    {
+        g_plan_full = 1;
+        const Fix f = make(57, 16, 1, { { 64, 2047 } });
+        case_u("U plan_full: 64 rows, plan holds all", f, { 0, 64, {} }, 64, 32, false, nullptr, true);
+        case_u("U plan_full (wrong): plan holds 64", f, { 0, 64, {} }, 64, 1, false);
+        case_u("U+fold d plan_full: plan holds all", f, { 0, 64, {} }, 64, 32, true);
+        g_plan_full = 0;
     }
     /* DKV-G, the decode band */
     {

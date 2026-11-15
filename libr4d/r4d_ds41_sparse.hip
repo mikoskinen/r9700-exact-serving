@@ -2460,10 +2460,14 @@ __device__ __forceinline__ void ds_w8_unpack64(const DsW8Raw& r, uint4 (&o)[8]) 
  * DsAttnArgsU): a selection tile whose valid keys the latent_unpack plan all holds reads those rows of a.lu as plain
  * bf16 (the window tiles' loads); bit 16 of the tile's vmask word marks one that does not (packed, as before). The
  * same bf16 values reach the same WMMAs either way, so the same bits. */
-template <bool LO, bool NV, bool W8 = false, bool FU = false, bool UX = false>
+/* NL (lever DKV-U, UX only): no transposing LDS (the launch gives none: the plain form's occupancy) -- a packed tile's
+ * transposed rows kt are decoded lane by lane straight from the entries' code and scale bytes (each value's v3 decode,
+ * the same bf16 bits the LDS transpose hands over); slower a packed tile, for passes the plan holds wholly. */
+template <bool LO, bool NV, bool W8 = false, bool FU = false, bool UX = false, bool NL = false>
 __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::conditional_t<UX, DsAttnArgsU, DsAttnArgs> a,
                                                                        float sl2) {
     static_assert(!UX || (NV && !W8), "the unpacked plan reads the packed latent beside a bf16 window");
+    static_assert(!NL || UX, "the LDS-free packed tile is the unpacked plan's fallback");
     constexpr int D = kDsAttnD;
     constexpr float kL2e = 1.4426950408889634f;
     const int nkt = (a.nk + 15) >> 4, nkk = nkt * 16;
@@ -2489,6 +2493,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
         const long first = last + 1 - (long)a.wused[(long)s * a.wus];
         [[maybe_unused]] long ulo = 0, uhi = 0, uoff = 0;   /* UX: the plan's entries of s at rows uoff .. of a.lu */
         if constexpr (UX) ds_lu_span(a, a.lucap, s, &ulo, &uhi, &uoff);
+        [[maybe_unused]] uint32_t wpk = 0u;                  /* UX: this wave marked a packed tile */
         for (int k0 = 0; k0 < nkk; k0 += 128) {
             const int k = k0 + tid;
             const uint16_t* ptr = nullptr;
@@ -2518,6 +2523,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 const bool tun = ((lane < 16) ? (un & 0xffffu) : (un >> 16)) != 0u;
                 if (uptr && !tun) ptr = uptr;
                 pkt = ((un & 0xffffu) ? 1u : 0u) | ((un >> 16) ? 2u : 0u);
+                wpk |= pkt;
             }
             if (k < nkk) kp[k] = ptr ? ptr : kDsZeroKey;
             const uint32_t b = (uint32_t)__builtin_amdgcn_ballot_w32(ptr != nullptr);
@@ -2527,7 +2533,16 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 if (t0 + 1 < nkt) vmask[t0 + 1] = (b >> 16) | ((pkt & 2u) << 15);
             }
         }
+        /* UX: each wave's "a packed tile" word in score buffer 1 (first written at tile 1, after tile 0's barrier; the
+         * previous row ended at a barrier) -> `allpl`, the row's every tile plain: no tile word read in the loop */
+        if constexpr (UX)
+            if (lane == 0) ((uint32_t*)(sbuf + kWmWaves * 64))[wave] = wpk;
         __syncthreads();
+        [[maybe_unused]] bool allpl = false;
+        if constexpr (UX) {
+            const uint32_t* f = (const uint32_t*)(sbuf + kWmWaves * 64);
+            allpl = __builtin_amdgcn_readfirstlane((int)(f[0] | f[1] | f[2] | f[3])) == 0;
+        }
 
         /* ---- Q^T for this lane's head and the wave's columns: step i, half hf = columns
          * c0 + 64 hf + 8 i .. + 7 (the same split as the key rows below) */
@@ -2552,7 +2567,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
         [[maybe_unused]] const int wtk = W8 ? (a.nk > a.win ? a.win / 16 : nkt) : 0;   /* tiles [0, wtk) W8 */
         /* tile tt holds packed keys: [ptk, nkt), or (UX) the tiles the key setup marked (bit 16, workgroup-uniform) */
         auto nvt = [&](int tt) -> bool {
-            if constexpr (UX) return ((uint32_t)__builtin_amdgcn_readfirstlane((int)vmask[tt]) >> 16) & 1u;
+            if constexpr (UX) return !allpl && (((uint32_t)__builtin_amdgcn_readfirstlane((int)vmask[tt]) >> 16) & 1u);
             else return NV && tt >= ptk;
         };
         auto ldk = [&](int tt) {                     /* tile tt's K row: kn, or (packed) kr / kw8 */
@@ -2581,6 +2596,31 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                 if (W8 && t < wtk) ds_w8_unpack64(kw8, kn);
                 else if constexpr (FU) ds_nv4_unpack64_fast(kr, kn);
                 else ds_nv4_unpack64(kr, kn);
+              if constexpr (NL) {
+                /* kt[j] of lane L: keys 8 (L / 16) + e at column c0 + 8 ((L / 8) & 1) + 16 j + L % 8, each decoded from its
+                 * entry: code byte col / 2 (nibble col & 1), scale byte 256 + col / 16 (the 8 j's scales are 8 bytes in a row) */
+                const int off = 8 * ((lane >> 3) & 1) + (lane & 7);
+                uint32_t kw[8][4];
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) kw[j][q] = 0u;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned char* b = (const unsigned char*)kp[t * 16 + 8 * hf + e];
+                    const uint2 sc = *(const uint2*)(b + kDsAttnD / 2 + c0 / 16);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int col = c0 + off + 16 * j;
+                        const uint32_t code = ((uint32_t)b[col / 2] >> (4 * (col & 1))) & 15u;
+                        const uint32_t sb = ((j < 4 ? sc.x : sc.y) >> (8 * (j & 3))) & 0xffu;
+                        const uint32_t v = __builtin_bit_cast(uint32_t, ds_nv4_val(code, ds_e4m3_half(sb))) >> 16;
+                        kw[j][e >> 1] |= (e & 1) ? (v << 16) : v;
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) kt[j] = make_uint4(kw[j][0], kw[j][1], kw[j][2], kw[j][3]);
+              } else {
                 /* key kq's columns c0 + 64 hf + 8 i + e -> T[64 hf + 8 i + e][kq] */
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
@@ -2599,6 +2639,7 @@ __global__ __launch_bounds__(128) void ds41_attn_sparse_sink_wm_kernel(std::cond
                     kt[j] = *(const uint4*)(tw + (col * 16 + 8 * hf) * 2);
                 }
                 ds_wave_sync();                      /* the reads before the next tile's writes */
+              }
             } else {
                 const uint16_t* pt = kp[t * 16 + ktr] + dtr;
 #pragma unroll
@@ -3443,6 +3484,17 @@ int ds_nvfast() {
     return n;
 }
 
+/* Lever DKV-U's LDS knob: RADIANCE_DS41_DKV_NOLDS=1 (read once; unset: 0): the unpacked attention's WMMA form without the
+ * transposing LDS (NL: the plain form's LDS and occupancy; a packed tile decoded lane by lane) at every pass; the ops'
+ * plan_full 1 (the caller knows the plan holds the pass) takes it for that pass. */
+int ds_dkv_nolds() {
+    static const int n = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DKV_NOLDS");
+        return e && *e ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+
 /* Lever DKV-U: the `unpacked` operand as the plan's rows -- [rows][k D] bf16, rows packed one after another (the plan
  * indexes them as one run of rows x k entries), 16-byte aligned; false: not a plan (the op runs without it). */
 bool lu_operand(const RadTensor* u, long* cap) {
@@ -3638,7 +3690,8 @@ int attn_setup(const RadArgs* a, DsAttnArgs* res) {
 /* lu (lever DKV-U, attn_sparse_sink_unpacked's operand): a WMMA pass over the packed latent reads the plan's rows;
  * gth (lever DKV-G, attn_sparse_sink_gathered's): a decode-band pass over the packed latent reads latent_gather's rows.
  * Either absent, or not usable for the pass: today's launches. */
-int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr, const RadTensor* gth = nullptr) {
+int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr, const RadTensor* gth = nullptr,
+              bool lu_full = false) {
     DsAttnArgs s{};
     {
         const int rc = attn_setup(a, &s);
@@ -3667,6 +3720,9 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
                 static_cast<DsAttnArgs&>(u) = s;
                 u.lu = (uint16_t*)lu->data;
                 u.lucap = cap;
+                if (lu_full || ds_dkv_nolds() > 0)   /* the LDS-free packed tiles: the plain form's LDS */
+                    return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true, true>), grid,
+                                    dim3(128), (uint32_t)(ds_wm_sbuf_off(nkt) + kWmSbufBytes), u, sl2);
                 return R4D_EMIT(stream, (ds41_attn_sparse_sink_wm_kernel<true, true, false, true, true>), grid, dim3(128),
                                 (uint32_t)lds, u, sl2);
             }
@@ -3725,7 +3781,8 @@ int attn_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr,
  * attn_sparse_sink's launch and then rope_rows_roundtrip's, the two ops themselves. Parameters: the
  * attention's, then rope_rows' rot / off / mode / inverse (n_head = heads, head_dim = dim) and
  * quant_roundtrip's block / format, its scale as `block_scale` (`scale` is the attention's). */
-int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr, const RadTensor* gth = nullptr) {
+int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = nullptr, const RadTensor* gth = nullptr,
+                  bool lu_full = false) {
     namespace q = r4d_ds41q;
     if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
     const RadTensor &pos = a->t[7], &out = a->t[10], &cs = a->t[11];
@@ -3784,7 +3841,7 @@ int attn_ort_body(const RadArgs* a, RadStream stream, const RadTensor* lu = null
     }
     /* the two launches: attn_sparse_sink, then rope_rows_roundtrip over out at its own parameters */
     {
-        const int rc = attn_body(a, stream, lu, gth);
+        const int rc = attn_body(a, stream, lu, gth, lu_full);
         if (rc != RAD_OK) return rc;
     }
     auto pint = [](const char* k, long long v) { RadParam r{}; r.key = k; r.kind = RAD_P_INT; r.ival = v; return r; };
@@ -3991,11 +4048,11 @@ extern "C" int r4d_rad_ds41_latent_unpack(const RadArgs* a, RadStream stream) { 
 extern "C" int r4d_rad_ds41_latent_gather(const RadArgs* a, RadStream stream) { return lg_body(a, stream); }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_unpacked(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
-    return attn_body(a, stream, &a->t[11], nullptr);
+    return attn_body(a, stream, &a->t[11], nullptr, r4d_geti_or(a, "plan_full", 0) == 1);
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 13 || !a->t) return RAD_E_INVAL;
-    return attn_ort_body(a, stream, &a->t[12], nullptr);
+    return attn_ort_body(a, stream, &a->t[12], nullptr, r4d_geti_or(a, "plan_full", 0) == 1);
 }
 extern "C" int r4d_rad_ds41_attn_sparse_sink_gathered(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 12 || !a->t) return RAD_E_INVAL;
