@@ -215,6 +215,30 @@ void MissRank::render(Rec& r, int group, std::string* out) {
         out->append(cb, (size_t)std::max(m, 0));
     }
     out->push_back('\n');
+    /* RADIANCE_DEBUG_MISS_PLACE=N (a measurement aid, SPEED-E): after a trunk line of rank 0 with at least N rows whose
+     * pass left its snapshot, "#P step rank tok first:" and, per layer, the experts the pass read from the host pool as
+     * a hex bitmap (expert e is bit e % 4 of hex digit e / 4) -- the placement the kernels of that pass read, every
+     * expert of the layer, routed or not. Unset: nothing. */
+    static const int64_t place_min = [] {
+        const char* e = std::getenv("RADIANCE_DEBUG_MISS_PLACE");
+        return e && *e ? std::max<int64_t>(1, std::atoll(e)) : (int64_t)0;
+    }();
+    if (place_min > 0 && group == 0 && rank_ == 0 && snapped && tok >= place_min && n_expert_ > 0) {
+        const int pn = std::snprintf(head, sizeof head, "#P %d %d %lld %d:", r.step, rank_, (long long)tok, first);
+        out->append(head, (size_t)std::max(pn, 0));
+        static const char hx[] = "0123456789abcdef";
+        for (int l = first; l <= last; ++l) {
+            if (l > first) out->push_back(',');
+            const uint8_t* sn = r.snap.data() + (size_t)l * (size_t)n_expert_;
+            for (int64_t e0 = 0; e0 < n_expert_; e0 += 4) {
+                int d = 0;
+                for (int64_t k = 0; k < 4 && e0 + k < n_expert_; ++k)
+                    if (sn[e0 + k] == kMlHost) d |= 1 << k;
+                out->push_back(hx[d]);
+            }
+        }
+        out->push_back('\n');
+    }
 
     Tot& t = tot_[kind];
     ++t.lines;
