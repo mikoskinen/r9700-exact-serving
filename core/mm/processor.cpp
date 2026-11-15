@@ -185,6 +185,42 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
         return RAD_OK;
     }
     const char* mt = rad_meta_gets(&m, "vision_config.model_type", "");
+    /* DeepSeek-V4.1 states its processor in config.json's vision_config alone (the release ships no
+     * preprocessor config): patch_size, downsample_ratio (the aligner's 3 x 3), max_image_tokens,
+     * min_pixels, max_wh_ratio (null). Values are (u / 255 - 0.5) / 0.5, the reference's. */
+    if (mt && !std::strcmp(mt, "deepseek_v41_vision")) {
+        family     = Family::DeepSeek41;
+        patch      = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 0);
+        downsample = (int32_t)rad_meta_geti(&m, "vision_config.downsample_ratio", 0);
+        merge      = downsample;
+        temporal   = 1;
+        max_image_tokens = (int32_t)rad_meta_geti(&m, "vision_config.max_image_tokens", 0);
+        min_image_tokens = 4;   /* the smallest span: one token, its newline, start and end */
+        max_wh_ratio = rad_meta_getf(&m, "vision_config.max_wh_ratio", 0.0);
+        tok_image  = (int32_t)rad_meta_geti(&m, "image_token_id", -1);
+        if (patch <= 0 || downsample <= 0 || max_image_tokens < 4 || tok_image < 0) {
+            if (why) *why = "the container states no DeepSeek-V4.1 processor (vision_config."
+                            "patch_size, downsample_ratio, max_image_tokens, image_token_id)";
+            return RAD_E_NOTFOUND;
+        }
+        mean[0] = mean[1] = mean[2] = 0.5f;
+        stdv[0] = stdv[1] = stdv[2] = 0.5f;
+        image_min_pixels = rad_meta_geti(&m, "vision_config.min_pixels", 0);
+        if (image_min_pixels <= 0) image_min_pixels = 1;
+        /* The token budget sizes a picture; the bands only have to be consistent for check(). */
+        image_max_pixels = std::max<int64_t>(image_min_pixels,
+                                             (int64_t)max_image_tokens * factor() * factor());
+        video_min_pixels = 1;
+        video_max_pixels = image_max_pixels;
+        min_frames = 1;
+        std::string bad;
+        if (check(&bad) < 0) {
+            if (why) *why = "the container's DeepSeek-V4.1 processor configuration is "
+                            "inconsistent: " + bad;
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     /* GLM-5.3 states its processor only in processor_config.json's image_processor, with a token
      * budget and no pixel band; the tower's geometry is the fallback, as the processor class
      * defaults to it. */
@@ -444,6 +480,12 @@ int VisionConfig::check(std::string* why) const {
                       std::to_string(max_tiles) + ", tile_size " + std::to_string(tile) +
                       ") is not a range of whole merged patches");
     }
+    if (family == Family::DeepSeek41 &&
+        (patch <= 0 || merge != downsample || downsample <= 0 || temporal != 1 ||
+         max_image_tokens < min_image_tokens || min_image_tokens < 4 || !(max_wh_ratio >= 0.0)))
+        return no("the DeepSeek-V4.1 picture geometry (patch_size " + std::to_string(patch) +
+                  ", downsample_ratio " + std::to_string(downsample) + ", max_image_tokens " +
+                  std::to_string(max_image_tokens) + ") is not one this processor stages");
     if (family == Family::Glm5Next && (min_image_tokens < 1 || max_image_tokens < min_image_tokens))
         return no("the image token band [" + std::to_string(min_image_tokens) + ", " +
                   std::to_string(max_image_tokens) + "] is empty");
@@ -1416,6 +1458,15 @@ int Processor::init(const VisionConfig& cfg,
         encode_text_ = std::move(encode_text);
         return RAD_OK;
     }
+    if (cfg.family == Family::DeepSeek41) {
+        /* A span placeholder is merge^2 patches and a picture is one segment of one pass, so the
+         * budget is lowered to what a pass holds (16380 patches hold 1820 of the 1024). */
+        const int64_t pass_tok = cfg.max_patches / ((int64_t)cfg.merge * cfg.merge);
+        if (pass_tok < cfg.min_image_tokens) return RAD_E_INVAL;
+        if (cfg_.max_image_tokens > pass_tok) cfg_.max_image_tokens = (int32_t)pass_tok;
+        encode_text_ = std::move(encode_text);
+        return RAD_OK;
+    }
     if (cfg.family == Family::Glm5Next) {
         /* A token is merge^2 patches and an image is one segment of one pass, so the budget is
          * lowered to what a pass holds. */
@@ -1975,6 +2026,146 @@ int Processor::image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::st
     return RAD_OK;
 }
 
+/* ================================================================== DeepSeek-V4.1 */
+
+int ds41_plan(int64_t w, int64_t h, int32_t patch, int32_t ratio, int64_t min_pixels,
+              int32_t max_tokens, double max_wh_ratio, int32_t* n_vit_h, int32_t* n_vit_w,
+              int32_t* n_llm_h, int32_t* n_llm_w, std::string* why) {
+    auto no = [why](const char* w0) { if (why) *why = w0; return RAD_E_INVAL; };
+    if (w <= 0 || h <= 0 || patch <= 0 || ratio <= 0 || max_tokens < 4) return no("an empty picture");
+    /* plan_image_grid: width and height are Python ints; a ratio cap leaves width an int too. */
+    int64_t width = w, height = h;
+    if (max_wh_ratio > 0.0 && (double)width > (double)height * max_wh_ratio)
+        width = (int64_t)((double)height * max_wh_ratio);
+    if (width * height > 0 && width * height < min_pixels) {
+        const double r = std::pow((double)min_pixels / (double)(width * height), 0.5);
+        width = (int64_t)((double)width * r);
+        height = (int64_t)((double)height * r);
+    }
+    int64_t bw = (int64_t)std::ceil((double)width / (double)patch) * patch;
+    int64_t bh = (int64_t)std::ceil((double)height / (double)patch) * patch;
+    /* llm_grid: ceil((best // patch) / ratio), a true division. */
+    auto grid = [&](int64_t b) { return (int64_t)std::ceil((double)(b / patch) / (double)ratio); };
+    int64_t lh = grid(bh), lw = grid(bw);
+    if (ds41_span_tokens(lh, lw) > max_tokens) {
+        /* solve_resize_ratio(height, width, ...), Python's float arithmetic in order. */
+        const double rr = (double)height / (double)width;
+        const double max_w = std::sqrt((double)(max_tokens - 2) / rr + 0.25) - 0.5;
+        const double max_h = max_w * rr;
+        const int64_t cell = (int64_t)patch * ratio;
+        if (max_w < 1.0) {
+            bh = (int64_t)((max_tokens - 2) / 2) * cell;
+            bw = cell;
+        } else if (max_h < 1.0) {
+            bh = cell;
+            bw = (int64_t)(max_tokens - 3) * cell;
+        } else {
+            const double beta = std::min((double)((int64_t)std::floor(max_w) * cell) / (double)width,
+                                         (double)((int64_t)std::floor(max_h) * cell) / (double)height);
+            bh = (int64_t)std::floor((double)height * beta / (double)patch) * patch;
+            bw = (int64_t)std::floor((double)width * beta / (double)patch) * patch;
+        }
+        lh = grid(bh);
+        lw = grid(bw);
+        if (ds41_span_tokens(lh, lw) > max_tokens) return no("the picture's span does not fit the budget");
+    }
+    if (bh <= 0 || bw <= 0 || lh <= 0 || lw <= 0) return no("the picture plans to no patches");
+    *n_vit_h = (int32_t)(bh / patch);
+    *n_vit_w = (int32_t)(bw / patch);
+    *n_llm_h = (int32_t)lh;
+    *n_llm_w = (int32_t)lw;
+    return RAD_OK;
+}
+
+void ds41_span_planes(int32_t n_vit_h, int32_t n_vit_w, int32_t n_llm_h, int32_t n_llm_w,
+                      int32_t* planes) {
+    const int64_t h = n_llm_h, w = n_llm_w, n_tok = ds41_span_tokens(h, w), P = 9 * n_tok;
+    int32_t* p2 = planes;
+    int32_t* p3 = planes + P;
+    for (int64_t j = 0; j < P; ++j) {
+        const int64_t r = j / 9, k = j % 9;
+        int32_t v = -1;
+        if (r > 0 && r < n_tok - 1) {
+            const int64_t rr = r - 1, y = rr / (w + 1), x = rr % (w + 1);
+            if (x < w) {
+                const int64_t vy = 3 * y + k / 3, vx = 3 * x + k % 3;
+                if (vy < n_vit_h && vx < n_vit_w) v = (int32_t)(vy * n_vit_w + vx);
+            }
+        }
+        p2[j] = v;
+        p3[j] = 0;
+    }
+    const int64_t n_sp = h + 2;
+    int64_t at = 0;
+    auto special = [&](int32_t type, int64_t row) {
+        p3[at] = type;
+        p3[n_sp + at] = (int32_t)row;
+        ++at;
+    };
+    special(0, 0);
+    for (int64_t y = 0; y < h; ++y) special(1, 1 + y * (w + 1) + w);
+    special(2, n_tok - 1);
+    p3[2 * n_sp] = 0;
+    p3[2 * n_sp + 1] = n_vit_h * n_vit_w;
+}
+
+/* DeepSeek-V4.1's load_image: plan the canvas, ImageOps.pad the picture onto it (127 grey), cut
+ * it into raster patches (channel, y, x), and lay the span out for the tower: one segment of
+ * 9 * span patches, the real patches first. */
+int Processor::image_deepseek41(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    const int32_t P = c.patch;
+    int32_t nvh = 0, nvw = 0, nlh = 0, nlw = 0;
+    RAD_TRY(ds41_plan(f.w, f.h, P, c.downsample, c.image_min_pixels, c.max_image_tokens,
+                      c.max_wh_ratio, &nvh, &nvw, &nlh, &nlw, why));
+    const int64_t n_tok = ds41_span_tokens(nlh, nlw), n_real = (int64_t)nvh * nvw;
+    const int64_t n_patch = 9 * n_tok;
+    if (n_patch > c.max_patches) {
+        if (why) *why = "the picture's span is more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    Frame canvas;
+    pad_bicubic(f, nvw * P, nvh * P, 127, &canvas);
+    /* ToTensor's / 255 and the reference's (x - 0.5) / 0.5, in f32, rounded to bf16. */
+    uint16_t lut[256];
+    for (int v = 0; v < 256; ++v) lut[v] = rad_f32_to_bf16(((float)v / 255.0f - 0.5f) / 0.5f);
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Image;
+    it->patch_dim = c.patch_dim();
+    it->rope_1d = true;
+    it->patch_raster = true;
+    it->grid_t = 1;
+    it->grid_h = 3 * nlh;
+    it->grid_w = 3 * nlw;
+    it->rows_h = nlh;
+    it->rows_w = nlw;
+    it->seg_rows = (int32_t)n_tok;
+    it->n_seg = 1;
+    it->n_patch = n_patch;
+    it->segments.push_back({ nvh, nvw, 0, false });
+    it->pixels.assign((size_t)n_patch * (size_t)it->patch_dim, 0);
+    const size_t W = (size_t)canvas.w;
+    run_rows(nvh, [&](int32_t py) {
+        for (int32_t px = 0; px < nvw; ++px) {
+            uint16_t* pp = it->pixels.data() + ((size_t)py * nvw + px) * (size_t)it->patch_dim;
+            for (int ch = 0; ch < 3; ++ch)
+                for (int y = 0; y < P; ++y) {
+                    const uint8_t* row = canvas.rgb.data() + (((size_t)py * P + y) * W + (size_t)px * P) * 3 + ch;
+                    uint16_t* q = pp + ((size_t)ch * P + y) * P;
+                    for (int x = 0; x < P; ++x) q[x] = lut[row[(size_t)x * 3]];
+                }
+        }
+    });
+    it->aux.assign((size_t)(2 * n_patch), 0);
+    ds41_span_planes(nvh, nvw, nlh, nlw, it->aux.data());
+    (void)n_real;
+    it->seg_at.push_back(0);
+    it->expand.assign((size_t)n_tok, c.tok_image);
+    content_key(*it, &it->key_hi, &it->key_lo);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
 /* NVIDIA's Nemotron-H Omni image processor: one tile, sized by radio_size, resized with torch's
  * antialiased bicubic on float pixels (none when the size already fits). */
 int Processor::image_radio(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
@@ -2081,6 +2272,7 @@ int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::strin
     if (c.family == Family::Glm5Next) return image_glm5next(f, out, why);
     if (c.family == Family::Radio) return image_radio(f, out, why);
     if (c.family == Family::UnlimitedOcr) return image_unlimitedocr(f, mode, out, why);
+    if (c.family == Family::DeepSeek41) return image_deepseek41(f, out, why);
     int64_t h = 0, w = 0;
     RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
                                &h, &w, why));
@@ -2264,7 +2456,7 @@ int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
         return RAD_E_UNSUPPORTED;
     }
     if (image_tokens != 0) {
-        if (cfg_.family == Family::Glm5Next) {
+        if (cfg_.family == Family::Glm5Next || cfg_.family == Family::DeepSeek41) {
             if (why) *why = "this model's image token budget is the server's (--image-tokens), "
                             "not a request's";
             return RAD_E_UNSUPPORTED;
@@ -2426,7 +2618,7 @@ std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
 int Processor::video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
                      std::string* why) const {
     if (cfg_.family == Family::Lfm2 || cfg_.family == Family::Glm5Next ||
-        cfg_.family == Family::Pixtral) {
+        cfg_.family == Family::Pixtral || cfg_.family == Family::DeepSeek41) {
         if (why) *why = "this model's processor takes pictures, not video";
         return RAD_E_UNSUPPORTED;
     }

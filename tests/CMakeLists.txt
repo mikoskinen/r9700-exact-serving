@@ -15,7 +15,7 @@
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
 # single undefined reference.
-set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test spark25_arch_test nemotronh_test)
+set(RAD_TESTS_NO_CORE arch_test glm5next_test nemotron35_test spark25_arch_test nemotronh_test ds41_vision_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -170,6 +170,18 @@ foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/core/util/rad_util.cpp)
+    if(n STREQUAL "ds41_vision_test")
+      # DeepSeek-V4.1's picture processor and vision tower against the release's own code (the reference dumps
+      # DS41_VIS_REF, the release DS41_VIS_RELEASE); the tower runs op by op on libref, opened with dlopen.
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core/mm/processor.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/item.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/media.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/resample.cpp
+                                 ${CMAKE_SOURCE_DIR}/core/mm/imaging.cpp)
+      target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+      target_link_libraries(${n} PRIVATE ${CMAKE_DL_LIBS})
+      add_dependencies(${n} libref)
+    endif()
     if(n STREQUAL "nemotron35_test")
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/core/mm/processor.cpp
                                  ${CMAKE_SOURCE_DIR}/core/mm/item.cpp

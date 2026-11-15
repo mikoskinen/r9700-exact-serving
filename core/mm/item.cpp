@@ -59,6 +59,12 @@ void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
         planes[2 * count + k] = seg_h(s);
         planes[3 * count + k] = seg_w(s);
     }
+    /* Planes 2 and 3 the processor stated (Item::aux) replace the segment's size. */
+    if (!aux.empty() && (int64_t)aux.size() == 2 * n_patch && first >= 0 && first + count <= n_patch)
+        for (int64_t k = 0; k < count; ++k) {
+            planes[2 * count + k] = aux[(size_t)(first + k)];
+            planes[3 * count + k] = aux[(size_t)(n_patch + first + k)];
+        }
 }
 
 /* The rotary layout of one prompt: a run a segment, the text in front of a run counting up and a

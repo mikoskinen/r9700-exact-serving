@@ -24,6 +24,8 @@
  * The checkpoint's DSpark drafter (mtp.0 .. mtp.{n-1}, when the container carries its stages as
  * blk.{n_layer}.. with `nextn_predict_layers`) runs on the block-drafter protocol: see struct Dsp. */
 #include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_block_ds41_vision.h>
+#include <arch/rad_block_vit.h>   /* MediaRows */
 #include <arch/rad_deepseek41_chat.h>
 
 #include "ds41_engram_dedup.h"
@@ -312,6 +314,8 @@ struct Layer {
     rad_weight e_mult = 0, e_vsz = 0, e_off = 0, e_kv = 0, e_gate = 0;
     /* ops, in issue order */
     rad_op e_ids = 0, e_emb = 0, e_copy = 0, e_gemm = 0, e_gate_op = 0, e_back = 0;
+    /* Pictures (Model::media): an Engram layer's value rows zeroed at the media rows before its gate */
+    rad_op mm_fill = 0, mm_put = 0;
     /* This Engram layer's row ids [T, heads]: one buffer a layer, since step() writes every
      * layer's ids before the first block runs (see there). */
     rad_buf ids = 0;
@@ -510,6 +514,21 @@ struct Model {
     Geom g{};
     Cfg c{};
     std::vector<Layer> layers;
+    /* Pictures (rad_block_ds41_vision.h), when the container carries the tower and the engine asked
+     * for an encoder budget. The tower runs on encoder passes; a trunk step with media rows writes
+     * them over the token embeddings (MediaRows, before the vocabulary all-reduce), gives those rows
+     * DeepSeek-V4.1's image routing bias (MoeFP8::Vl, each MoE layer's bias_vl) and keeps them out of
+     * the Engram (model.py: image tokens take no part in an n-gram and get no Engram contribution):
+     * their compressed token is the pad the n-gram look-back stops at (`mm_eos` scattered into
+     * engram_tokens), and their Engram value rows are zero (`mm_zero` scattered into engram_kv's
+     * value columns), so the gate adds nothing. A step without media rows issues none of it. */
+    bool media = false;
+    Ds41Vision vit{};
+    MediaRows mrows{};
+    rad_op mm_iota = 0, mm_tok_put = 0, mm_zero_fill = 0, mm_kv_put = 0;
+    rad_buf mm_eos = 0, mm_zero = 0;
+    rad_op vl_gather = 0, vl_scatter = 0;
+    rad_buf vl_ids = 0, vl_ew = 0, vl_tid = 0, vl_tew = 0;
     int64_t work = 0, cmax = 0;
     /* --calib-layers, hi exclusive. Both 0: the tap is off. */
     int calib_lo = 0, calib_hi = 0;
@@ -1007,6 +1026,8 @@ static rad_op post_collapse_norm(RadBuilder* b, const Model& m, int64_t rows, ra
  * the even 576 would cut a superblock. Each rank computes its gate/up columns and K slice of down,
  * and the all-reduce sums the partials (MoeFP8::Config::shared_lo). */
 static constexpr int64_t kSharedBlock = 256;
+/* Pictures: the zero rows an Engram layer's media rows take their value columns from, a scatter at a time. */
+static constexpr int64_t kMmZeroRows = 64;
 
 /* RADIANCE_DS41_ARGATHER: the MoE gather and its all-reduce as one kernel (moe_gather_all_reduce,
  * MoeFP8::Config::gather_ar_rows) for a step of at most this many tokens at four ranks; unset, empty,
@@ -2678,6 +2699,16 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.e_scat = op(b, "gather_rows", { RAD_RANGE("M", 1, T), RAD_INT("n", (c.hc + 1) * D), RAD_STR("dtype", "bf16") },
                           {}, { m.ekv_u, L.edd_map }, { m.ekv });
         }
+        /* Pictures: the media rows' value columns zeroed in front of the gate, so it adds nothing there
+         * (model.py Engram's token_mask); fill and scatter at this layer, so their liveness is the layer's. */
+        if (m.media) {
+            L.mm_fill = op(b, "fill", { RAD_RANGE("M", 1, kMmZeroRows), RAD_INT("n", D), RAD_STR("dtype", "bf16"),
+                                        RAD_F64("value", 0.0) },
+                           {}, {}, { m.mm_zero });
+            L.mm_put = op(b, "scatter_rows", { RAD_RANGE("M", 1, kMmZeroRows), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
+                          {}, { m.mm_zero, m.ekv }, { m.ekv });
+            if (!L.mm_fill || !L.mm_put) return RAD_E_INVAL;
+        }
         L.e_gate_op = op(b, "stream_gate_add",
                          { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc),
                            RAD_F64("eps", c.eps), RAD_F64("gate_eps", 1e-6),
@@ -3147,6 +3178,29 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     }
     DS_TRY(MoeFP8::probe(b, nm, l, s, &s.cfg));
     DS_TRY(L.moe.declare(b, nm, g, l, m.mw, s, false, false));
+    /* Pictures: the image rows' routing bias (model.py Gate.bias_vl), its selection and the byte copies over the
+     * router's picks (MoeFP8::Vl), declared at this layer so their liveness is the layer's */
+    if (m.media) {
+        auto& v = L.moe.vl;
+        const char* bn = nm.f("blk.%d.exp_probs_b.bias_vl", l);
+        DS_TRY(map_copy(b, bn, nm.ckpt("layers.%d.ffn.gate.bias_vl", l)));
+        v.bias = decl_w(b, bn, RAD_F32, { c.n_expert }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(l));
+        if (!v.bias) return RAD_E_INVAL;
+        v.select = op(b, "router_scored_topk",
+                      { RAD_RANGE("M", 1, T), RAD_INT("n_expert", c.n_expert), RAD_INT("top_k", c.top_k),
+                        RAD_INT("norm", c.norm_topk), RAD_F64("route_scale", c.route_scale),
+                        RAD_STR("score", "sqrtsoftplus"), RAD_STR("dtype", "f32") },
+                      { v.bias }, { m.mw.logits }, { m.vl_ids, m.vl_ew });
+        v.gather = op(b, "gather_rows", { RAD_RANGE("M", 1, T), RAD_INT("n", 4 * c.top_k), RAD_STR("dtype", "u8") },
+                      {}, { m.vl_ids, m.vl_ew }, { m.vl_tid, m.vl_tew });
+        v.scatter = op(b, "scatter_rows", { RAD_RANGE("M", 1, T), RAD_INT("n", 4 * c.top_k), RAD_STR("dtype", "u8") },
+                       {}, { m.vl_tid, m.vl_tew, m.mw.ids, m.mw.ew }, { m.mw.ids, m.mw.ew });
+        v.ids = m.vl_ids;
+        v.ew = m.vl_ew;
+        v.tid = m.vl_tid;
+        v.tew = m.vl_tew;
+        if (!v.select || !v.gather || !v.scatter) return RAD_E_INVAL;
+    }
     if (p1_declared() && L.moe.dk_takes(kBiMoe + 1)) g_sw_p1_ok.store(1, std::memory_order_relaxed);
     /* the in-process switches (rad_fn4_*): the fused gather's live bound, the shared arm's lane */
     L.moe.gar_live = &g_sw_gar;
@@ -4007,6 +4061,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (ds41_arena_decode_rows() > 0 && g.max_tok < m.irows) m.score_rows = g.max_tok;
     }
     DS_TRY(buffers(b, m));
+    /* Pictures: the container's tower with an encoder budget (rad_block_ds41_vision.h; Model::media). */
+    m.media = Ds41Vision::present(meta) && ctx->max_enc_patches > 0;
+    if (m.media) {
+        const int64_t Tm = g.max_tok, K = c.top_k;
+        m.vl_ids = decl_b(b, nm.f("vl_ids"), RAD_I32, { Tm, K });
+        m.vl_ew  = decl_b(b, nm.f("vl_ew"), RAD_F32, { Tm, K });
+        m.vl_tid = decl_b(b, nm.f("vl_tid"), RAD_U8, { Tm, 4 * K });
+        m.vl_tew = decl_b(b, nm.f("vl_tew"), RAD_U8, { Tm, 4 * K });
+        if (!m.vl_ids || !m.vl_ew || !m.vl_tid || !m.vl_tew) return RAD_E_INVAL;
+        if (!c.ple.empty()) {
+            m.mm_eos  = decl_b(b, nm.f("mm_eos"), RAD_I32, { Tm });
+            m.mm_zero = decl_b(b, nm.f("mm_zero"), RAD_BF16, { kMmZeroRows, c.n_embd });
+            if (!m.mm_eos || !m.mm_zero) return RAD_E_INVAL;
+        }
+    }
     /* The drafter's source rows, one hc-mean row a target layer, written by the trunk step. */
     if (m.dsp.on && !m.zero &&
         !(m.dsp.src = decl_b(b, nm.f("dspark_src"), RAD_BF16, { g.max_tok, (int64_t)m.dsp.taps.size() * c.n_embd })))
@@ -4048,6 +4117,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                      { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
                        RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
                      { m.token }, {}, { m.xcol });
+    /* Pictures: the encoder's rows over the lookup, before the vocabulary all-reduce completes it (rank 0 holds the
+     * rows, every other rank zeros: RadBatch::mm_embd). */
+    if (m.media) DS_TRY(m.mrows.declare(b, T, D, m.xcol));
     if (g.world > 1)
         m.embed_ar = op(b, "all_reduce",
                         { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
@@ -4139,6 +4211,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         m.tok_map = op(b, "token_map", { RAD_RANGE("M", 1, T), RAD_INT("n_vocab", c.n_vocab) },
                        { m.tmap }, {}, { m.ctok });
+        /* Pictures: the media rows' compressed token is the pad the n-gram look-back stops at (engram.py's DEAD,
+         * read as `eos` by ngram_ids), written over token_map's ids before any ngram_ids reads them. */
+        if (m.media) {
+            m.mm_iota = op(b, "iota", { RAD_RANGE("M", 1, T), RAD_INT("start", c.pad), RAD_INT("step", 0) },
+                           {}, {}, { m.mm_eos });
+            m.mm_tok_put = op(b, "scatter_rows", { RAD_RANGE("M", 1, T), RAD_INT("n", 4), RAD_STR("dtype", "u8") },
+                              {}, { m.mm_eos, m.ctok }, { m.ctok });
+            if (!m.mm_iota || !m.mm_tok_put) return RAD_E_INVAL;
+        }
     }
     m.layers.resize((size_t)c.n_layer);
     if (ctx->calib_dir && ctx->calib_dir[0]) {
@@ -4188,6 +4269,14 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The drafter after everything the trunk step issues (llama_fp8's rule: declaration order is
      * liveness, and its passes run behind the step). */
     if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
+    /* The vision tower last, its weight groups past the drafter's stages; an encoder pass issues it alone. */
+    if (m.media) {
+        DS_TRY(m.vit.declare(b, meta, ctx, nm, D, (int)c.n_layer + std::max(m.n_stage, 0)));
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: pictures: the vision tower (%lld blocks, %lld patches a pass), the "
+                            "image rows' routing bias at %lld MoE layers, Engram masked at the image rows\n",
+                    (long long)m.vit.depth, (long long)m.vit.P, (long long)c.n_layer);
+    }
     rad_note(b, "DeepSeek-V4.1: %lld layers, hc %lld, window %lld, %zu kv sources, %zu index "
                 "sources, %lld experts top-%lld, Engram at %zu layers",
              (long long)c.n_layer, (long long)c.hc, (long long)c.window, c.kv_src.size(),
@@ -5320,6 +5409,43 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
     return true;
 }
 
+/* ------------------------------------------------------------------ pictures in a trunk step (Model::media) */
+/* Every MoE layer's image rows for this step (MoeFP8::Vl): the media rows, or none. Set at every trunk step, so a step
+ * without media rows leaves the routing exactly as before. */
+static void media_route(Model& m, const RadBatch* batch) {
+    if (!m.media) return;
+    const bool on = batch->n_mm_rows > 0 && batch->mm_rows;
+    for (auto& L : m.layers) {
+        L.moe.vl_rows = on ? batch->mm_rows : nullptr;
+        L.moe.vl_n = on ? batch->n_mm_rows : 0;
+    }
+}
+/* The media rows' compressed tokens: the n-gram pad (engram.py's DEAD), over token_map's ids. */
+static void media_tokens(RadCtx* x, Model& m, const RadBatch* batch, int64_t T) {
+    if (!m.mm_tok_put || batch->n_mm_rows <= 0 || !batch->mm_rows) return;
+    const int64_t n = batch->n_mm_rows;
+    void* eos = rad_buf_ptr(x, m.mm_eos);
+    void* tok = rad_buf_ptr(x, m.ctok);
+    if (!eos || !tok) {
+        rad_step_fail(x, "deepseek41: the media rows' token buffers have no address");
+        return;
+    }
+    RAD_ISSUE_N(x, m.mm_iota, n, brows(m.mm_eos, n));
+    RAD_ISSUE_N(x, m.mm_tok_put, n, praw2(eos, RAD_U8, n, 4), praw(batch->mm_rows, RAD_I32, n),
+                praw2(tok, RAD_U8, T, 4));
+}
+/* An Engram layer's value rows at the media rows: zero, so its gate adds nothing there. */
+static void media_engram(RadCtx* x, Model& m, const Layer& L, const RadBatch* batch, int64_t T) {
+    if (!L.mm_put || batch->n_mm_rows <= 0 || !batch->mm_rows) return;
+    const int64_t n = batch->n_mm_rows, D = m.c.n_embd, hc = m.c.hc;
+    RAD_ISSUE_N(x, L.mm_fill, kMmZeroRows, brows(m.mm_zero, kMmZeroRows));
+    for (int64_t a = 0; a < n; a += kMmZeroRows) {
+        const int64_t k = std::min<int64_t>(kMmZeroRows, n - a);
+        RAD_ISSUE_N(x, L.mm_put, k, brows(m.mm_zero, k), praw(batch->mm_rows + a, RAD_I32, k),
+                    bcol(m.ekv, hc * D, D, T));
+    }
+}
+
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
     dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start */
@@ -5488,7 +5614,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         praw(batch->cu_seqlens + s.s0, RAD_I32, 1), brow_slice(m.bi_cu, s.k, 1, 2));
 
     /* the step's head ops: as step() (per-token, over the step) */
+    media_route(m, batch);
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
+    m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
@@ -5499,6 +5627,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     RAD_ISSUE_N(x, m.rope_b_step, T, pos, brows(m.cs_b, g.max_ctx));
     if (m.tok_map)
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap), brows(m.ctok, T));
+    media_tokens(x, m, batch, T);
     for (auto& L : m.layers) {
         if (!L.e_ids) continue;
         const int l = L.l;
@@ -5629,6 +5758,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 /* the Engram GEMM (gemm_nt_ggml, banded) by segment */
                 dense(e_gg, false, [&](int64_t r0, int64_t n) { e2_gemm(x, m, L, n, R(m.embd, r0, n), R(m.ekv, r0, n)); });
             }
+            media_engram(x, m, L, batch, T);
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
@@ -6216,6 +6346,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
 
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
+    /* An encoder pass runs only the vision tower (RadBatch::enc). */
+    if (batch->enc) {
+        m.vit.step(x, batch);
+        return;
+    }
     dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start */
     /* A drafter pass: the sign gives the kind (rad_runtime.h); zero is a trunk step. */
     if (batch->draft_pass != 0) {
@@ -6270,7 +6405,9 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * from there, and attn_sparse_sink recovers the base from it (docs/OPS.md). */
     const RadOperand wused = praw(wb->seqused, RAD_I32, S);
 
+    media_route(m, batch);
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
+    m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
@@ -6282,6 +6419,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
     if (m.tok_map)
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap),
                     brows(m.ctok, T));
+    media_tokens(x, m, batch, T);
 
     /* The Engram's row ids are a function of the batch's tokens alone (token_map, each Engram
      * layer's token history), never of an activation, so every Engram layer's ngram_ids is issued
@@ -6335,6 +6473,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                 RAD_ISSUE_N(x, L.e_copy, T, brows(m.emb, T), brows(m.embd, T));
                 e2_gemm(x, m, L, T, brows(m.embd, T), brows(m.ekv, T));
             }
+            media_engram(x, m, L, batch, T);
             RAD_ISSUE_N(x, L.e_gate_op, T, brows(m.h0, T), bcol(m.ekv, 0, c.hc * D, T),
                         bcol(m.ekv, c.hc * D, D, T), RAD_W(L.e_gate), brows(m.h1, T));
             RAD_ISSUE_N(x, L.e_back, T, brows(m.h1, T), brows(m.h0, T));
@@ -6817,6 +6956,8 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
         out->draft_depth = (int)blk;
         out->draft_depth_fixed = 1;
     }
+    /* The tower's span row, so a pass size the core picks itself is whole rows (16380 of 16384). */
+    if (Ds41Vision::present(meta)) out->enc_merge = Ds41Vision::merge_of(meta);
     return RAD_OK;
 }
 

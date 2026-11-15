@@ -498,6 +498,23 @@ struct MoeFP8 {
     int64_t rs_fused_rows = 0, rgs_fused_rows = 0;
     const std::atomic<int>* rfuse_live = nullptr;
     std::atomic<long long>* rf_count = nullptr;
+    /* A second correction bias for some rows (DeepSeek-V4.1's `bias_vl`, model.py Gate: the rows of an image span pick
+     * their experts with it; the weights still come from the raw scores). The architecture declares `select` (the
+     * sigmoid router's selection with `bias` as its correction) and three byte copies (gather_rows / scatter_rows u8)
+     * and sets `rows` / `n` for each step that has such rows (`n` 0 otherwise). A pass with them runs the separate
+     * router ops: the projection and the selection as always, then the selection again over the step's rows with the
+     * second bias into `ids` / `ew`, those rows' picks copied over the router's (`tid` / `tew` the gathered rows), and
+     * only then the sort. Every row's logits are its own and each selection is per row, so the rows a pass covers get
+     * exactly the picks the model makes; rows another pass covers are written again with the same values (passed) or
+     * overwritten by their own pass (to come). Steps without such rows issue nothing new. */
+    struct Vl {
+        rad_weight bias = 0;
+        rad_op select = 0, gather = 0, scatter = 0;
+        rad_buf ids = 0, ew = 0, tid = 0, tew = 0;
+    } vl{};
+    mutable const int32_t* vl_rows = nullptr;
+    mutable int64_t vl_n = 0;
+    void vl_fix(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
     /* Protected experts: local experts a quantised layer keeps bf16, the few whose output dwarfs
      * the rest (docs/MOE-W4.md). The scatter sorts them last (`protect`, `prot_list`), the
      * quantised GEMMs serve the other `n_reg`, and a bf16 grouped GEMM pair serves these over the
@@ -2377,11 +2394,14 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool shared = op_sgate != 0;
     /* The fused router when it resolved and the pass fits: router, topk + scatter and (with
      * `router_fused_gate`) the shared gate in one launch. Otherwise the separate ops. */
+    /* rows with the second correction bias this step (Vl): the separate router ops, so the picks can be fixed before
+     * the sort */
+    const bool vlp = vl.select && vl_n > 0 && vl_rows && c.sigmoid_router;
     const bool rfused = op_router_fused && rows <= router_fused_rows;
-    const bool sfused = op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
+    const bool sfused = !vlp && op_sigmoid_scatter && rows <= sigmoid_scatter_rows;
     /* lever FUSE-R (rfuse_live): 2 = the projection, the selection and the sort in one launch where the pass fits it (and
      * the projection is not column-split), else 1 = the selection and the sort in one; the separate ops otherwise */
-    const int rfl = rfuse_live && !rfused && !sfused ? rfuse_live->load(std::memory_order_relaxed) : 0;
+    const int rfl = rfuse_live && !rfused && !sfused && !vlp ? rfuse_live->load(std::memory_order_relaxed) : 0;
     const bool rgsf = rfl >= 2 && op_rgs_fused && rows <= rgs_fused_rows && !glm_router.split.takes(rows);
     const bool rsf = !rgsf && rfl >= 1 && op_rs_fused && rows <= rs_fused_rows;
     const bool gate_done = (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate);
@@ -2481,6 +2501,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         if (!c.sigmoid_router)
         RAD_ISSUE_N(c_, op_topk, rows, brow_slice(w.logits, r0, rows, ne_all),
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k));
+        if (vlp) vl_fix(c_, T, r0, rows);
         if (scatter_inv)
             RAD_ISSUE_N(c_, op_scatter, rows, brow_slice(w.ids, r0, rows, k),
                         brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
@@ -2737,6 +2758,29 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
     rad_memcpy_async(staging, scratch, bytes, s);
     rad_stream_sync(s);
     calib_dne.add(staging);
+}
+
+/* The rows with the second correction bias (Vl): the selection over this pass's rows with it, then those rows' picks
+ * gathered and written over the router's. `w.ids` / `w.ew` are i32 / f32 rows of top_k, copied as bytes. */
+inline void MoeFP8::vl_fix(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
+    const int64_t k = c.top_k, ne_all = c.n_expert_all, n = vl_n;
+    RAD_ISSUE_N(c_, vl.select, rows, brow_slice(w.logits, r0, rows, ne_all), RAD_W(vl.bias),
+                brow_slice(vl.ids, r0, rows, k), brow_slice(vl.ew, r0, rows, k));
+    void* ids  = rad_buf_ptr(c_, w.ids);
+    void* ew   = rad_buf_ptr(c_, w.ew);
+    void* vids = rad_buf_ptr(c_, vl.ids);
+    void* vew  = rad_buf_ptr(c_, vl.ew);
+    void* tid  = rad_buf_ptr(c_, vl.tid);
+    void* tew  = rad_buf_ptr(c_, vl.tew);
+    if (!ids || !ew || !vids || !vew || !tid || !tew) {
+        rad_step_fail(c_, "moe: the second correction bias's rows have no buffers");
+        return;
+    }
+    const RadOperand idx = praw(vl_rows, RAD_I32, n);
+    RAD_ISSUE_N(c_, vl.gather, n, praw2(vids, RAD_U8, T, 4 * k), idx, praw2(tid, RAD_U8, n, 4 * k));
+    RAD_ISSUE_N(c_, vl.gather, n, praw2(vew, RAD_U8, T, 4 * k), idx, praw2(tew, RAD_U8, n, 4 * k));
+    RAD_ISSUE_N(c_, vl.scatter, n, praw2(tid, RAD_U8, n, 4 * k), idx, praw2(ids, RAD_U8, T, 4 * k));
+    RAD_ISSUE_N(c_, vl.scatter, n, praw2(tew, RAD_U8, n, 4 * k), idx, praw2(ew, RAD_U8, T, 4 * k));
 }
 
 inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
