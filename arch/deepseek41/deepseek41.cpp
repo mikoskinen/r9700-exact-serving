@@ -2041,10 +2041,37 @@ static int64_t keep_words(int64_t width, int64_t block) {
  * rows is one run, the op as before. */
 static constexpr int64_t kScorePlane = 256ll << 20;
 static constexpr int64_t kScoreRunMin = 256;
+/* Lever SPF-IR (RADIANCE_DS41_IROWS_MIN=<rows>, read once at the first declare): the runs' floor instead of
+ * kScoreRunMin. This model's index layers run at ratio 1, so cmax = max_ctx + 1 and the plane is 4 bytes x max_ctx a
+ * row: at --max-model-len 1048576 the 256-row floor makes it 1 GiB a card (512 MiB at 524288), and the arena's every
+ * level from 256 rows up carries it. The plane only has to hold one run, so a lower floor is placement only, provided
+ * each run keeps the kernel form the unsplit step takes: a split step (T > irows rows, n = ceil(T / irows) >= 2 runs)
+ * has runs of R = ceil(T / n) > T irows / (T + irows) > irows / 2 rows, so a floor >= 2 kDs41IdxFormRows (96) keeps
+ * every run above the decode form's 48 rows, in the WMMA form the unsplit step (T > irows >= 96 rows) takes; index_score
+ * computes each row alone in that form (ds41_index_split.h), index_candidates / index_topk select a row exactly
+ * whatever rows share a launch, and the selections land at the same rows (the split's own argument). Accepted: 96 ..
+ * 256 (a number outside, or junk: warned, kScoreRunMin). Unset: kScoreRunMin, every declare as before. */
+static constexpr int64_t kScoreRunFloorMin = 2 * kDs41IdxFormRows;
+static int64_t ds41_irows_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_IROWS_MIN");
+        if (!e || !*e) return kScoreRunMin;
+        char* end = nullptr;
+        const long long r = std::strtoll(e, &end, 10);
+        if (!end || *end || r < kScoreRunFloorMin || r > kScoreRunMin) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_IROWS_MIN=%s is not a row count in %lld .. %lld; "
+                            "the indexer's runs keep their %lld-row floor\n",
+                    e, (long long)kScoreRunFloorMin, (long long)kScoreRunMin, (long long)kScoreRunMin);
+            return kScoreRunMin;
+        }
+        return (int64_t)r;
+    }();
+    return v;
+}
 static void index_runs(Model& m) {
     const auto& g = m.g;
     const auto& c = m.c;
-    m.irows = std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax)));
+    m.irows = std::min(g.max_tok, std::max(ds41_irows_min(), kScorePlane / (4 * m.cmax)));
     m.iparts = (g.max_tok + m.irows - 1) / m.irows;
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
@@ -4273,6 +4300,16 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     (double)(T * m.lu_e * c.head_dim * 2) / (1024.0 * 1024.0), (long long)T, ng, nga, ngr,
                     (long long)m.selkv_rows, (double)(m.selkv_rows * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0));
     }
+    /* Lever SPF-IR, only where RADIANCE_DS41_IROWS_MIN moved the floor (unset: no line, as before). */
+    if (ctx->rank == 0 && !ctx->shape_probe && ds41_irows_min() != kScoreRunMin)
+        fprintf(stderr, "radiance: deepseek41: lever SPF-IR (RADIANCE_DS41_IROWS_MIN=%lld): the indexer scores in runs of "
+                        "at most %lld rows (the %lld-row floor would give %lld), %lld runs declared: score plane %.2f MiB "
+                        "a card instead of %.2f\n",
+                (long long)ds41_irows_min(), (long long)m.irows, (long long)kScoreRunMin,
+                (long long)std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax))), (long long)m.iparts,
+                (double)(m.irows * m.cmax * 4) / (1024.0 * 1024.0),
+                (double)(std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax))) * m.cmax * 4) /
+                    (1024.0 * 1024.0));
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
