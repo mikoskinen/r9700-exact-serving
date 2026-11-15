@@ -1340,9 +1340,19 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_kern
 static_assert(offsetof(Exl3r4dGemm, x3d) == offsetof(Exl3r4dGemm, raw_pitch) + sizeof(int64_t), "x3d right after raw_pitch");
 static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 8, "x3d pads the block by 8");
 #endif
-template <int MATS>
+// SPB-G (ds41-etp-spb-plug, 14.11.2026; fn4 exl3_dng): the down kernel (MATS 1) with G 128-column blocks a workgroup,
+// blocks G blockIdx.x .. G blockIdx.x + G - 1 of the same run one after the other (the generic kernel's E2 loop, ported):
+// each block is the G = 1 workgroup's code on the same data at its own column block (moe_pass's cbx), so every output
+// byte is the G = 1 grid's. What moves: the grid is ceil(ncb / G) x nslot workgroups instead of ncb x nslot, so the run
+// search, the plane pointers and the launch are paid once a G blocks -- and once a G blocks for every spare slot of the
+// grid (under expert tensor parallelism the down's slot grid is min(6 M, 384) + 1 for ~M x 2.2 live slices).
+// G = 1 is the kernel as it was (cbx -1: blockIdx.x).
+template <int G>
+static __device__ __forceinline__ int spb_cb(int g) { return G == 1 ? (int)blockIdx.x : (int)blockIdx.x * G + g; }
+template <int MATS, int G = 1>
 __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_kernel(Exl3r4dGemm p) {
   static_assert(EXL3R4D_DNG == 1 || MATS == 2, "X3D-F: down's E2 grouping is not ported");
+  static_assert(G == 1 || MATS == 1, "SPB-G: the down's column grouping only");
   EXL3R4D_KARG_PREFETCH();
   inject_delay<MATS == 2 ? EXL3R4D_DLY_GU : EXL3R4D_DLY_DN>(EXL3R4D_WG0);
   extern __shared__ float lds[];
@@ -1351,27 +1361,37 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_
   Planes wpre = {};
   const bool frp = EXL3R4D_FRP && p.n_expert <= 8 * (int)blockDim.x;
   const Run run = frp ? find_run_planes(p, blockIdx.y, s_find, wpre) : find_run_any(p, blockIdx.y, s_find);
+  const int ncb = (p.y_cols + 127) / 128;
   if (run.e < 0) {
-    zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, blockIdx.x);
+#pragma unroll
+    for (int g = 0; g < G; ++g)
+      if (G == 1 || spb_cb<G>(g) < ncb)
+        zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, spb_cb<G>(g));
     return;
   }
   const Planes w = frp ? wpre : planes_of(p, run.e);
   const int width = MATS == 2 ? w.rows / 2 : w.rows;
-  if ((int)blockIdx.x * 128 >= width) {
-    zero_rows(p, run.r0, run.r1, blockIdx.x);
-    return;
+  for (int g = 0; g < G; ++g) {
+    const int cb = spb_cb<G>(g);
+    if (G > 1 && cb >= ncb) break;
+    if (cb * 128 >= width) {
+      zero_rows(p, run.r0, run.r1, cb);
+      if (G == 1) return;
+      continue;
+    }
+    for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+      moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true>(p, w, rc, run.r1, lds, tk0, G == 1 ? -1 : cb);
   }
-  for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
-    moe_pass<2, 2, MATS, false, false, 0, false, 0, false, true>(p, w, rc, run.r1, lds, tk0);
 }
 
 // K25U (ds41-k25u): the K = 2.5 decode kernels with unpacked states -- exl3r4d_gemm_kernel<EXL3R4D_K25, 2, MATS, false>
 // exactly (prep kernel rows, no DNW, EXL3R4D_DNG 1) except moe_pass's K25 mode (gate_up K25_G3 / K25_G2D / K25_UB96, down
 // K25_U4). exl3r4d_launch_gemm takes them only when the argument block's x3d is 2 .. 4 (fill(): bits 2.5 and the fn4
 // switch exl3_x3d at 2 / 3 / 4), so with the switch at 0 or 1 no launch reaches them.
-template <int MATS, int MODE>
+template <int MATS, int MODE, int G = 1>   // G: SPB-G (above exl3r4d_gemm_x3d_kernel), the down only
 __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_kernel(Exl3r4dGemm p) {
   static_assert(EXL3R4D_DNG == 1 || MATS == 2, "K25U: down's E2 grouping is not ported");
+  static_assert(G == 1 || MATS == 1, "SPB-G: the down's column grouping only");
   EXL3R4D_KARG_PREFETCH();
   inject_delay<MATS == 2 ? EXL3R4D_DLY_GU : EXL3R4D_DLY_DN>(EXL3R4D_WG0);
   extern __shared__ float lds[];
@@ -1380,18 +1400,96 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_
   Planes wpre = {};
   const bool frp = EXL3R4D_FRP && p.n_expert <= 8 * (int)blockDim.x;
   const Run run = frp ? find_run_planes(p, blockIdx.y, s_find, wpre) : find_run_any(p, blockIdx.y, s_find);
+  const int ncb = (p.y_cols + 127) / 128;
   if (run.e < 0) {
-    zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, blockIdx.x);
+#pragma unroll
+    for (int g = 0; g < G; ++g)
+      if (G == 1 || spb_cb<G>(g) < ncb)
+        zero_dead_rows(p, (int)blockIdx.y - run.nlive, (int)gridDim.y - run.nlive, spb_cb<G>(g));
     return;
   }
   const Planes w = frp ? wpre : planes_of(p, run.e);
   const int width = MATS == 2 ? w.rows / 2 : w.rows;
-  if ((int)blockIdx.x * 128 >= width) {
-    zero_rows(p, run.r0, run.r1, blockIdx.x);
-    return;
+  for (int g = 0; g < G; ++g) {
+    const int cb = spb_cb<G>(g);
+    if (G > 1 && cb >= ncb) break;
+    if (cb * 128 >= width) {
+      zero_rows(p, run.r0, run.r1, cb);
+      if (G == 1) return;
+      continue;
+    }
+    for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
+      moe_pass<EXL3R4D_K25, 2, MATS, false, false, 0, false, 0, false, false, MODE>(p, w, rc, run.r1, lds, tk0,
+                                                                                   G == 1 ? -1 : cb);
   }
-  for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
-    moe_pass<EXL3R4D_K25, 2, MATS, false, false, 0, false, 0, false, false, MODE>(p, w, rc, run.r1, lds, tk0);
+}
+
+// SPB-P (ds41-etp-spb-plug, 14.11.2026; fn4 exl3_dng 101 / 102 / 104 / 108): the x3d (MODE 0) / k25 U4 (MODE 1) down as a
+// PERSISTENT grid over its LIVE units only. Every workgroup lists the launch's live experts once (find_run's count and
+// prefix, the ids written in id order), zeroes its share of the rows no run owns, then takes the units u = blockIdx.x,
+// blockIdx.x + gridDim.x, ... of nlive x ceil(ncb / G) -- unit (slot, column group) = the grid kernel's G-block workgroup
+// at that slot: the same moe_pass code on the same data a column block (cbx), so every output byte is the grid's. What
+// it removes: the dead slots of the grid (under ETP min(6 M, 384) + 1 slots for ~2.2 M live slices) and the run search
+// a unit. The stride is static (no counter: no state between launches); the grid is the resident capacity.
+constexpr int kSpbMaxLive = 512;
+static __device__ __forceinline__ const void* uniform_ptr(const void* q);   // (the WGB section below)
+static __device__ int spb_live_list(const Exl3r4dGemm& p, int* sh, int* s_live) {
+  const int tid = threadIdx.x, nt = EXL3R4D_BDIM, lane = tid % WAVE32, wave = tid / WAVE32, nw = nt / WAVE32;
+  const int per = (p.n_expert + nt - 1) / nt, e0 = tid * per;
+  int cnt = 0;
+  for (int e = e0; e < e0 + per && e < p.n_expert; e++) cnt += clamp_row(p.off[e + 1], p.T) > clamp_row(p.off[e], p.T);
+  int incl = cnt;
+#pragma unroll
+  for (int o = 1; o < WAVE32; o <<= 1) {
+    const int v = __shfl_up(incl, o, WAVE32);
+    if (lane >= o) incl += v;
+  }
+  if (lane == WAVE32 - 1) sh[wave] = incl;
+  __syncthreads();
+  int base = 0, total = 0;
+  for (int w = 0; w < nw; w++) {
+    const int c = sh[w];
+    base += w < wave ? c : 0;
+    total += c;
+  }
+  int k = base + incl - cnt;
+  for (int e = e0; e < e0 + per && e < p.n_expert; e++)
+    if (clamp_row(p.off[e + 1], p.T) > clamp_row(p.off[e], p.T) && k < kSpbMaxLive) s_live[k++] = e;
+  __syncthreads();
+  return __builtin_amdgcn_readfirstlane(total);
+}
+template <int MODE, int G>
+__global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_pdx_kernel(Exl3r4dGemm p) {
+  static_assert(EXL3R4D_DNG == 1, "SPB-P: down's E2 grouping is not ported");
+  EXL3R4D_KARG_PREFETCH();
+  extern __shared__ float lds[];
+  __shared__ int s_find[35];
+  __shared__ int s_live[kSpbMaxLive];
+  const int nlive = spb_live_list(p, s_find, s_live);
+  const int ncb = (p.y_cols + 127) / 128, ncbg = (ncb + G - 1) / G;
+  for (int cb = 0; cb < ncb; ++cb) zero_dead_rows(p, (int)blockIdx.x, (int)gridDim.x, cb);
+  const int units = nlive * ncbg;
+  for (int u = (int)blockIdx.x; u < units; u += (int)gridDim.x) {
+    const int slot = u / ncbg, cg = u - slot * ncbg;
+    const int e = __builtin_amdgcn_readfirstlane(s_live[slot]);
+    const int r0 = clamp_row(p.off[e], p.T), r1 = clamp_row(p.off[e + 1], p.T);
+    Planes w = planes_of(p, e);
+    w.codes = (const unsigned*)uniform_ptr(w.codes);
+    w.suh = (const _Float16*)uniform_ptr(w.suh);
+    w.suh1 = (const _Float16*)uniform_ptr(w.suh1);
+    w.svh = (const _Float16*)uniform_ptr(w.svh);
+    w.dn_suh = (const _Float16*)uniform_ptr(w.dn_suh);
+    const int width = w.rows;
+    for (int g = 0; g < G; ++g) {
+      const int cb = cg * G + g;
+      if (cb >= ncb) break;
+      if (cb * 128 >= width) { zero_rows(p, r0, r1, cb); continue; }
+      for (int rc = r0; rc < r1; rc += EXL3_BLOCK) {
+        if constexpr (MODE == 0) moe_pass<2, 2, 1, false, false, 0, false, 0, false, true>(p, w, rc, r1, lds, 0, cb);
+        else moe_pass<EXL3R4D_K25, 2, 1, false, false, 0, false, 0, false, false, K25_U4>(p, w, rc, r1, lds, 0, cb);
+      }
+    }
+  }
 }
 
 // ----------------------------------------------------------------------------- WGB: the persistent decode grid
@@ -3782,14 +3880,53 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
     const void* kf = bits == 2 ? kx_fn<2>(gate_up, gscr) : bits == 3 ? kx_fn<3>(gate_up, gscr)
                    : bits == 5 ? kx_fn<5>(gate_up, gscr) : bits == EXL3R4D_K25 ? kx_fn<EXL3R4D_K25>(gate_up, gscr)
                    : kx_fn<6>(gate_up, gscr);
-    if (bits == 2 && a->x3d && !gscr && dngk == 1)   // X3D-F (fn4 exl3_x3d): K = 2's one-word-pair decode
-      kf = gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2> : (const void*)exl3r4d_gemm_x3d_kernel<1>;
-    if (bits == EXL3R4D_K25 && a->x3d >= 2 && a->x3d <= 4 && !gscr && dngk == 1)   // K25U (fn4 exl3_x3d 2 / 3 / 4)
-      kf = !gate_up ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4>
+    // SPB-G (fn4 exl3_dng 2 / 4 / 8, fill()'s a->dng): the x3d / k25 down with that many column blocks a workgroup
+    const int sg = !gate_up && !gscr && dngk == 1 && (a->dng == 2 || a->dng == 4 || a->dng == 8) ? a->dng : 1;
+    dim3 gks = gk;
+    // SPB-P (fn4 exl3_dng 101 / 102 / 104 / 108): the persistent live-units form of the same down kernels
+    const int pg = !gate_up && !gscr && dngk == 1 && a->n_expert <= kSpbMaxLive &&
+                   (a->dng == 101 || a->dng == 102 || a->dng == 104 || a->dng == 108) ? a->dng - 100 : 0;
+    const bool px = pg > 0 && ((bits == 2 && a->x3d) || (bits == EXL3R4D_K25 && a->x3d >= 2 && a->x3d <= 4));
+    if (px) {
+      const bool k2 = bits == 2;
+      const void* pf = pg == 1 ? (k2 ? (const void*)exl3r4d_gemm_pdx_kernel<0, 1> : (const void*)exl3r4d_gemm_pdx_kernel<1, 1>)
+                     : pg == 2 ? (k2 ? (const void*)exl3r4d_gemm_pdx_kernel<0, 2> : (const void*)exl3r4d_gemm_pdx_kernel<1, 2>)
+                     : pg == 4 ? (k2 ? (const void*)exl3r4d_gemm_pdx_kernel<0, 4> : (const void*)exl3r4d_gemm_pdx_kernel<1, 4>)
+                               : (k2 ? (const void*)exl3r4d_gemm_pdx_kernel<0, 8> : (const void*)exl3r4d_gemm_pdx_kernel<1, 8>);
+      const int threads = wv * a->sk * WAVE32;
+      static int nwgp_dev[16];   // per device, once (WGPs: multiprocessors in WGP mode)
+      int dev = 0;
+      if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) dev = 0;
+      if (nwgp_dev[dev] <= 0) {
+        int n = 0;
+        (void)hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev);
+        nwgp_dev[dev] = n > 0 ? n : 1;
+      }
+      const int cap = wq_capacity(pf, threads, (size_t)smem, nwgp_dev[dev]);
+      const int64_t ncbg = (a->y_cols / 128 + pg - 1) / pg, most = ncbg * (int64_t)(a->nslot - 1);
+      const int wgs = (int)(cap > 0 && most > cap ? cap : most > 0 ? most : 1);
+      if (hipLaunchKernel(pf, dim3((unsigned)wgs), dim3((unsigned)threads), args, (size_t)smem, st) != hipSuccess)
+        return RAD_E_DEVICE;
+      return RAD_OK;
+    }
+    if (bits == 2 && a->x3d && !gscr && dngk == 1) {  // X3D-F (fn4 exl3_x3d): K = 2's one-word-pair decode
+      kf = gate_up ? (const void*)exl3r4d_gemm_x3d_kernel<2>
+         : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2>
+         : sg == 4 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 4>
+         : sg == 8 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 8> : (const void*)exl3r4d_gemm_x3d_kernel<1>;
+      if (!gate_up && sg > 1) gks.x = (unsigned)((a->y_cols / 128 + sg - 1) / sg);
+    }
+    if (bits == EXL3R4D_K25 && a->x3d >= 2 && a->x3d <= 4 && !gscr && dngk == 1) {  // K25U (fn4 exl3_x3d 2 / 3 / 4)
+      kf = !gate_up ? (sg == 2 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 2>
+                     : sg == 4 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 4>
+                     : sg == 8 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 8>
+                               : (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4>)
          : a->x3d == 2 ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G3>
          : a->x3d == 3 ? (const void*)exl3r4d_gemm_k25_kernel<2, K25_G2D>
                        : (const void*)exl3r4d_gemm_k25_kernel<2, K25_UB96>;
-    if (hipLaunchKernel(kf, gk, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
+      if (!gate_up && sg > 1) gks.x = (unsigned)((a->y_cols / 128 + sg - 1) / sg);
+    }
+    if (hipLaunchKernel(kf, gks, dim3((unsigned)(wv * a->sk * WAVE32)), args, (size_t)smem, st) != hipSuccess)
       return RAD_E_DEVICE;
     return RAD_OK;
   }

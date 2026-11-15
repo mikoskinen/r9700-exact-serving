@@ -34,6 +34,9 @@
 #define EXL3R4D_SK 1  /* adopted (round 2, OCC-gu): gate_up split-K 1 -- tp2 M=4 -6.8%, M=1 +3.9% */
 #endif
 /* Per op (round 2, D.8 retune): down's own column tiles a wave and split-K; default the shared ones. */
+#ifndef EXL3R4D_BENCH_LIVE /* BENCH builds (SPB pre-check): fill() honours a `live_max` parameter (never shipped) */
+#define EXL3R4D_BENCH_LIVE 0
+#endif
 #ifndef EXL3R4D_CTR_LAZY   /* TEST builds: a lazily allocated counter pool for tools that skip init (never shipped) */
 #define EXL3R4D_CTR_LAZY 0
 #endif
@@ -109,6 +112,7 @@
 #if !EXL3R4D_SUHC && !EXL3R4D_WGQ
 _Static_assert(offsetof(Exl3r4dGemm, x3d) == offsetof(Exl3r4dGemm, raw_pitch) + sizeof(int64_t), "x3d right after raw_pitch");
 _Static_assert(sizeof(Exl3r4dGemm) == offsetof(Exl3r4dGemm, x3d) + 8, "x3d pads the block by 8");
+_Static_assert(offsetof(Exl3r4dGemm, dng) == offsetof(Exl3r4dGemm, x3d) + 4, "SPB-G: dng in x3d's tail padding");
 #endif
 
 /* Tokens a run can hold at most: an expert takes each token once (top-k picks distinct experts). */
@@ -243,18 +247,27 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
         const int sw = exl3r4d_fn4_x3d();
         d->x3d = g->bits == 2 ? (sw >= 1 ? 1 : 0) : (g->bits == EXL3R4D_BITS_H25 && sw >= 2 && sw <= 4) ? sw : 0;
     }
+    /* SPB-G (fn4 exl3_dng, prefill.c): the x3d / k25 down's column blocks a workgroup; exl3r4d_launch_gemm takes 2 / 4 / 8
+     * there and ignores it everywhere else. Every output byte is the one-block grid's (exl3r4d.hip, spb_cb). */
+    d->dng = gate_up ? 1 : exl3r4d_fn4_dng();
     d->y_cols = (int32_t)g->y_cols;
     d->x_bf16 = x->dtype == RAD_BF16;
     d->sk = gate_up ? EXL3R4D_SK : EXL3R4D_SK_DN;
-    if (gate_up && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = EXL3R4D_SK_SMALL_V;
-    if (gate_up && EXL3R4D_SK_ONE_V > 0 && (T + g->top_k - 1) / g->top_k <= 1) d->sk = EXL3R4D_SK_ONE_V;
+    /* v9 `bi` (gate_up; DeepSeek's lever 1U-ETP): no token-count rule below -- every launch of the geometry takes the
+     * split-K above, so a row's bytes do not depend on how many tokens the launch carries. Without it the few-token
+     * rules stand (at DeepSeek's whole-expert width they never fire: 18 column blocks x 6 rows > the 64 units that fit,
+     * so that line is batch-invariant by the fit rule; a 640-wide expert slice is 5 x 6 / 5 x 12 units at 1 / 2 tokens
+     * and fits, so its 1-2-token launches would sum in split-K 2's order and its larger ones in split-K 1's). */
+    const int bi = gate_up && rad_param_geti(a->p, a->n_p, "bi", 0) != 0;
+    if (gate_up && !bi && EXL3R4D_SK_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_SMALL_M) d->sk = EXL3R4D_SK_SMALL_V;
+    if (gate_up && !bi && EXL3R4D_SK_ONE_V > 0 && (T + g->top_k - 1) / g->top_k <= 1) d->sk = EXL3R4D_SK_ONE_V;
     if (gate_up && EXL3R4D_SK_FIT && d->sk > 1) {
         const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
         const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, d->sk, g->h_rot);
         if (fit > 0 && units > fit) d->sk = 1;
     }
 #if EXL3R4D_SK4_M > 0   /* (a preprocessor branch: off, fill compiles as it did) */
-    if (gate_up && g->n_class == 4 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
+    if (gate_up && !bi && g->n_class == 4 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK4_M) {
         const int64_t units = (g->y_cols + 127) / 128 * (T < g->n_expert ? T : g->n_expert);
         const int fit = exl3r4d_gu_resident(g->bits, EXL3R4D_NPW, 4, g->h_rot);
         if (fit > 0 && units <= fit) d->sk = 4;
@@ -263,6 +276,14 @@ static int fill(const RadArgs* a, int op, Exl3Geom* g, Exl3r4dGemm* d, Exl3r4dCl
     if (!gate_up && EXL3R4D_SK_DN_SMALL_M > 0 && (T + g->top_k - 1) / g->top_k <= EXL3R4D_SK_DN_SMALL_M) d->sk = 2;
     /* grid.y: every live expert (at most one a sorted row) and one spare that zeroes the rows no run owns */
     d->nslot = (int32_t)((T < g->n_expert ? T : g->n_expert) + 1);
+#if EXL3R4D_BENCH_LIVE
+    /* BENCH BUILDS ONLY (never shipped): `live_max` = the caller's count of live experts, so the grid is that many slots
+     * plus the spare -- the dead-slot-free grid a measurement compares against. A wrong count drops live experts. */
+    {
+        const int64_t lm = rad_param_geti(a->p, a->n_p, "live_max", -1);
+        if (lm >= 0 && lm + 1 < d->nslot) d->nslot = (int32_t)(lm + 1);
+    }
+#endif
     return RAD_OK;
 }
 

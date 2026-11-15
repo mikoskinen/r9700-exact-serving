@@ -172,6 +172,7 @@ struct Opts {
                               // -- a persistent launch sized to the whole card then cannot have every workgroup resident,
                               // as in the engine when other kernels hold slots; a launch that needs co-residency stalls
     int pooled = 0;
+    std::vector<std::pair<std::string, int>> fn4;   // --fn4 NAME=V (repeatable): rad_fn4_switch(NAME, V) in the exl3 library
     bool chain = false;
     double skew = -1;         // --skew S: one popularity for every layer, log-normal spread S (see draw)
     int bits = 4;             // --bits K (R23): the EXL3 experts' K, 2..6 (libr4d's side is its w4 form whatever K is)
@@ -227,6 +228,12 @@ Route draw(int64_t M, int64_t E, int64_t topk) {
 void* g_fu_h = nullptr; void* g_fu_y = nullptr; size_t g_fu_hb = 0, g_fu_yb = 0;   // --fused: the chain's h and y
 void* g_gd_y = nullptr;                                                               // --gd: the v5 row's y
 std::vector<char> g_pooled[EXL3_MAX_CLS];   // [class][entry]: read from host memory
+// --pool-block MiB (SPEED-C, 14.11.2026): every pooled entry carved from ONE pinned, mapped block of that size (256-byte
+// aligned), so the block is one host pool the library can be told about (rad_host_pool_ranges, as the engine's core does
+// at start); 0 = an allocation an entry (as before).
+size_t g_pblk_cap = 0, g_pblk_used = 0;
+char* g_pblk_h = nullptr;
+char* g_pblk_d = nullptr;
 void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
     std::vector<void*> p((size_t)n);
     for (int64_t i = 0; i < n; ++i) {
@@ -234,6 +241,20 @@ void* table_of(void* base, int64_t n, size_t stride, int cls = -1) {
         if (cls < 0 || g_pooled[cls].empty() || !g_pooled[cls][(size_t)i]) continue;
         void* h = nullptr;
         void* hd = nullptr;
+        if (g_pblk_cap) {
+            if (!g_pblk_h) {
+                ck(hipHostMalloc((void**)&g_pblk_h, g_pblk_cap, hipHostMallocMapped), "hipHostMalloc (pool block)");
+                ck(hipHostGetDevicePointer((void**)&g_pblk_d, g_pblk_h, 0), "hipHostGetDevicePointer (pool block)");
+            }
+            const size_t sz = (stride + 255) / 256 * 256;
+            if (g_pblk_used + sz > g_pblk_cap) die("--pool-block is too small for the pooled entries");
+            h = g_pblk_h + g_pblk_used;
+            hd = g_pblk_d + g_pblk_used;
+            g_pblk_used += sz;
+            ck(hipMemcpy(h, p[(size_t)i], stride, hipMemcpyDeviceToHost), "copy (pooled entry)");
+            p[(size_t)i] = hd;
+            continue;
+        }
         ck(hipHostMalloc(&h, stride, hipHostMallocMapped), "hipHostMalloc (pooled entry)");
         ck(hipMemcpy(h, p[(size_t)i], stride, hipMemcpyDeviceToHost), "copy (pooled entry)");
         ck(hipHostGetDevicePointer(&hd, h, 0), "hipHostGetDevicePointer");
@@ -329,6 +350,13 @@ int main(int argc, char** argv) {
         else if (a == "--probe-dirty") o.probe_dirty = std::atof(nx());
         else if (a == "--h-rot") o.h_rot = std::atoi(nx());
         else if (a == "--pooled") o.pooled = std::atoi(nx());
+        else if (a == "--pool-block") g_pblk_cap = (size_t)std::atoll(nx()) << 20;
+        else if (a == "--fn4") {
+            const std::string v = nx();
+            const size_t eq = v.find('=');
+            if (eq == std::string::npos) die("--fn4 is NAME=VALUE");
+            o.fn4.push_back({ v.substr(0, eq), std::atoi(v.c_str() + eq + 1) });
+        }
         else if (a == "--chain") o.chain = true;
         else if (a == "--gd") o.gd = true;
         else if (a == "--gd-nocheck") o.gd_nocheck = true;
@@ -861,6 +889,26 @@ int main(int argc, char** argv) {
         if (!o.chain) die("--overlap needs --chain");
         for (auto& x : ov_st) ck(hipStreamCreateWithFlags(&x, hipStreamNonBlocking), "stream");
         for (auto& x : ov_ev) ck(hipEventCreateWithFlags(&x, hipEventDisableTiming), "event");
+    }
+    {   // SPEED-C: the pool block to the library (the engine core's rad_host_pool_ranges at start), then the --fn4 switches
+        void* hl = dlopen(o.exl3.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+        if (g_pblk_d && g_pblk_used) {
+            auto pr = hl ? (int (*)(int, int, const unsigned long long*, const unsigned long long*))dlsym(hl, "rad_host_pool_ranges")
+                         : nullptr;
+            const unsigned long long lo = (unsigned long long)(uintptr_t)g_pblk_d, hi = lo + g_pblk_used;
+            const int rc = pr ? pr(0, 1, &lo, &hi) : -999;
+            std::printf("perfmoe: pool block %.1f MiB of %.1f used, rad_host_pool_ranges rc %d\n", g_pblk_used / 1048576.0,
+                        g_pblk_cap / 1048576.0, rc);
+        }
+        for (const auto& f : o.fn4) {
+            auto sw = hl ? (int (*)(const char*, int))dlsym(hl, "rad_fn4_switch") : nullptr;
+            auto val = hl ? (int (*)(const char*, int*))dlsym(hl, "rad_fn4_value") : nullptr;
+            int ap = -1;
+            const int rc = sw ? sw(f.first.c_str(), f.second) : -999;
+            if (val) (void)val(f.first.c_str(), &ap);
+            std::printf("perfmoe: fn4 %s = %d: rc %d, applied %d\n", f.first.c_str(), f.second, rc, ap);
+            if (rc != 1) die("--fn4 refused");
+        }
     }
     auto setup = [&](Lib& L) {
         if (L.row->init) {

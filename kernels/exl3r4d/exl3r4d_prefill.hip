@@ -50,6 +50,56 @@
 #define EXL3R4D_STH_Y EXL3R4D_PF_STH_Y
 #include "exl3r4d_common.hip.h"
 #include "exl3r4d_prefill.h"
+#include <stdio.h>
+#include <string.h>
+
+// ----------------------------------------------------------------------------- lever XR (ds41-etp-xr-plug)
+// DeepSeek V4.1 under expert tensor parallel: a newcomer's prefill step streams ~5 GiB a rank of expert slices that sit in
+// the engine's pinned host pool, read in place by this GEMM over the link. Measured per layer (fu2-p1, profiled, 32
+// newcomers of ~1.3k rows, the 29 K = 2 layers): gate_up us = ~750 + 5.9 x (slices read from VRAM) + 48.3 x (slices
+// read from the host), i.e. the host part (~2.7 ms of ~4.7) adds to the resident part instead of overlapping it: the
+// longest-first order (EXL3R4D_PF_LPT) puts the host-read experts -- the cold, short ones -- at the end of each launch,
+// where the link runs alone.
+// THE LEVER, all inside the launch and the same bytes: (1) the map kernel orders each chunk's groups VRAM-read first
+// (longest first), then host-read (longest first); (2) the first grid row of the GEMM launch copies the host-read
+// groups' codes, in that order, into a ring in this op's scratch while the rest of the grid computes the resident
+// ones; (3) a host-read group's workgroups wait for their copy's flag and read the copy. A copy that does not fit the
+// ring, or whose flag does not come within EXL3R4D_XR_SPIN polls, is read in place as before. The order of entries
+// does not change a row's bytes (every entry computes the same rows whatever order the workgroups run in: LPT's
+// argument), and a copy is the pool slot's bytes, so the output is identical to the launch without the lever.
+// The residency test is the codes pointer against this rank's host pools (rad_host_pool_ranges at start; the launch
+// carries them in its arguments). Two-class build only (the _mod4 forms keep xr_mode 0).
+#define EXL3R4D_XR_ON (EXL3R4D_NCLS == 2)
+#ifndef EXL3R4D_XR_SPIN   // flag polls of ~0.2 us (s_sleep 8) before a workgroup reads its group in place
+#define EXL3R4D_XR_SPIN 200000
+#endif
+#if EXL3R4D_XR_ON
+// XR's counters (a reading; prefill.c prints them now and then): [0] chunks with a ring, [1] host-read heads in them, [2] heads
+// copied, [3] 256-byte units copied, [4] workgroups that read a copy, [5] workgroups past the spin (read in place), [6]
+// host-read groups the order saw (modes 1 / 2 / 5), [7] groups it saw. In the rank's device buffer (a.xr_cnt).
+#define XR_CNT(i, v) do { if (a.xr_cnt) atomicAdd(&a.xr_cnt[i], (unsigned long long)(v)); } while (0)
+#else
+#define XR_CNT(i, v) ((void)0)
+#endif
+static __device__ __forceinline__ bool xr_host_codes(const Exl3r4dPrefill& a, const void* c) {
+#if EXL3R4D_XR_ON
+  const unsigned long long v = (unsigned long long)c;
+  const int n = a.xr_n < EXL3R4D_XR_ARGPOOLS ? a.xr_n : EXL3R4D_XR_ARGPOOLS;
+  for (int i = 0; i < n; i++)
+    if (v >= a.xr_lo[i] && v < a.xr_hi[i]) return true;
+#endif
+  (void)a, (void)c;
+  return false;
+}
+// The XR tables, after the order array: xoff[cap] (ring offset in 256-byte units + 1, or 0), xhead[cap] (the entry's
+// group head), xflag[cap] (copy workgroups done, by head), xlist[cap] (a chunk's copied heads in copy order, at the
+// chunk's first entry), xcnt[64] (heads copied, by chunk); the ring after them. prefill.c sizes the same layout.
+static __device__ __forceinline__ uint32_t* xr_tab(const Exl3r4dPrefill& a) {
+  return (uint32_t*)((char*)a.order + (((size_t)4 * (size_t)a.cap + 255) / 256) * 256);
+}
+static __device__ __forceinline__ char* xr_ring(const Exl3r4dPrefill& a) {
+  return (char*)xr_tab(a) + ((((size_t)4 * (size_t)a.cap + 64) * 4 + 255) / 256) * 256;
+}
 
 #ifndef EXL3R4D_PF_STAGES
 #define EXL3R4D_PF_STAGES 2  // k steps of weights and activations in flight a wave (2 = double buffering, as decode)
@@ -185,12 +235,122 @@ static __device__ void pf_map_build(const Exl3r4dPrefill& a, int* s_w) {
 // LPT 1: entries by their own 16-row blocks. LPT 2: GROUPS (an expert's consecutive entries, or a zero range's) by the
 // group's 16-row blocks (capped at 63), the group's entries kept together in map order -- an expert's entries share its
 // weight tile, which a remainder entry then finds in cache.
+// XR's ring for chunk c (xr_mode 5: order 1 + ring): the host-read groups at order positions [hs, hi), heads first in
+// each group; a head's copy takes the next ring bytes while they fit (a prefix of the heads: offsets only grow). Every
+// entry of [lo, hi) gets its xoff (0: read in place) and xhead; the flags start at 0; xlist / xcnt name the copies.
+static __device__ void pf_xr_assign(const Exl3r4dPrefill& a, int c, int lo, int hs, int hi) {
+  __shared__ unsigned s_u[1024], s_h[1024];
+  __shared__ unsigned s_cu, s_ch;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  const uint4* ent = (const uint4*)a.map + 1;
+  uint32_t* const xt = xr_tab(a);
+  uint32_t *const xoff = xt, *const xhead = xt + a.cap, *const xflag = xt + 2 * a.cap, *const xlist = xt + 3 * a.cap,
+                  *const xcnt = xt + 4 * a.cap;
+  const unsigned cap_u = (unsigned)(((long long)xr_ring_of(a) << 20) / 256);
+  for (int i = lo + tid; i < hi; i += nt) xoff[i] = 0u, xhead[i] = (unsigned)i, xflag[i] = 0u;
+  if (tid == 0) s_cu = 0u, s_ch = 0u;
+  __syncthreads();
+  for (int t0 = hs; t0 < hi; t0 += nt) {   // pass 1: the heads' ring offsets (two block scans: 256-byte units, heads)
+    const int q = t0 + tid;
+    int idx = -1;
+    bool head = false;
+    unsigned u = 0u;
+    if (q < hi) {
+      idx = (int)a.order[q];
+      head = idx == lo || ent[idx - 1].x != ent[idx].x;
+      if (head) {
+        const Planes w = planes_of(a.g, (int)ent[idx].x);
+        u = (unsigned)((((long long)w.rows * w.cols * xr_k2_of(a) / 16) + 255) / 256);
+      }
+    }
+    s_u[tid] = u;
+    s_h[tid] = head ? 1u : 0u;
+    __syncthreads();
+    for (int o = 1; o < nt; o <<= 1) {
+      const unsigned vu = tid >= o ? s_u[tid - o] : 0u, vh = tid >= o ? s_h[tid - o] : 0u;
+      __syncthreads();
+      s_u[tid] += vu;
+      s_h[tid] += vh;
+      __syncthreads();
+    }
+    const unsigned ex_u = s_cu + s_u[tid] - u, ex_h = s_ch + s_h[tid] - (head ? 1u : 0u);
+    if (head && ex_u + u <= cap_u) {
+      xoff[idx] = ex_u + 1u;
+      xlist[lo + (int)ex_h] = (unsigned)idx;
+    }
+    __syncthreads();
+    if (tid == nt - 1) s_cu += s_u[tid], s_ch += s_h[tid];
+    __syncthreads();
+  }
+  for (int t0 = hs; t0 < hi; t0 += nt) {   // pass 2: a group's other entries take their head's copy
+    const int q = t0 + tid;
+    if (q < hi) {
+      const int idx = (int)a.order[q];
+      if (!(idx == lo || ent[idx - 1].x != ent[idx].x)) {
+        int h = idx;
+        while (h > lo && ent[h - 1].x == ent[h].x) h--;
+        xoff[idx] = xoff[h];
+        xhead[idx] = (unsigned)h;
+      }
+    }
+  }
+  // heads copied: the count of heads whose xoff is set (a prefix, so the first unset one ends it)
+  __shared__ unsigned s_n;
+  if (tid == 0) s_n = 0u;
+  __syncthreads();
+  for (int t0 = hs; t0 < hi; t0 += nt) {
+    const int q = t0 + tid;
+    if (q < hi) {
+      const int idx = (int)a.order[q];
+      if ((idx == lo || ent[idx - 1].x != ent[idx].x) && xoff[idx]) atomicAdd(&s_n, 1u);
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    xcnt[c] = s_n;
+    XR_CNT(0, 1);
+    XR_CNT(1, s_ch);
+    XR_CNT(2, s_n);
+    XR_CNT(3, s_n ? min(s_cu, cap_u) : 0u);
+  }
+  __syncthreads();
+}
+
 static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
   constexpr int NB = 64;
-  __shared__ int s_n[NB], s_o[NB];   // entries a bucket, then the bucket's next free position
+  __shared__ int s_n[2][NB], s_o[2][NB];   // entries a bucket, then the bucket's next free position; [1]: host-read (XR)
+  __shared__ int s_hs;                     // XR: the chunk's first host-read position
+  __shared__ int s_nv, s_nh;               // SPEED-C (order 3): the chunk's VRAM-read / host-read entries
   const int E = (int)a.map[0], nch = a.chunk_n > 1 ? a.chunk_n : 1;
   const uint4* ent = (const uint4*)a.map + 1;
+#if EXL3R4D_XR_ON
+  const int mode = xr_mode_of(a) & 3, ring = (xr_mode_of(a) & 4) != 0 && xr_ring_of(a) > 0 && mode == 1 && nch <= 64;
+  const long long f4 = 4 - ((xr_mode_of(a) >> 3) & 3);   // order 3's span: the host-read entries over f4 / 4 of the chunk
+#else
+  const int mode = 0, ring = 0;
+  const long long f4 = 4;
+#endif
+  // SPEED-C ORDER 3 (interleave): each set longest first as in orders 1 / 2, then the two merged so the host-read entries
+  // sit evenly over the first f4 / 4 of the chunk's positions -- VRAM-read entry i (of nv) at key (i + 1/2) / nv, host-read
+  // entry j (of nh) at f4 / 4 x (j + 1/2) / nh, a tie host first; an entry's position = its rank in the merge. A
+  // permutation of the same entries (each computes its rows alone: the order changes no byte, LPT's argument), so the
+  // GEMM's workgroups that stream a host pool's codes run beside the resident ones instead of after them.
+  auto merged = [&](int h, int q) -> int {
+    const long long nv = s_nv, nh = s_nh;
+    if (mode != 3 || !nv || !nh) return q;
+    if (!h) {   // + host entries with key <= v_q: (2j + 1) nv f4 <= (2q + 1) nh 4
+      const long long x = (2LL * q + 1) * nh * 4, r = x / (nv * f4);
+      return q + (int)min(nh, (r + 1) / 2);
+    }
+    // + VRAM entries with key < h_q: (2i + 1) nh 4 < (2q + 1) nv f4
+    const long long y = (2LL * q + 1) * nv * f4, r = (y - 1) / (nh * 4);
+    return q + (int)min(nv, (r + 1) / 2);
+  };
   auto blocks = [&](int i) { return ((int)(ent[i].z - ent[i].y) + 15) / 16; };
+  // XR: whether entry i's expert is read from a host pool (its codes in a pool the engine named); mode 0: never asked
+  auto host = [&](int i) {
+    return mode != 0 && ent[i].x != EXL3R4D_PF_ZERO && xr_host_codes(a, planes_of(a.g, (int)ent[i].x).codes) ? 1 : 0;
+  };
   for (int c = 0; c < nch; c++) {
     const int lo = a.chunk_n > 1 ? (int)((const uint4*)a.ctab)[c].x : 0;
     const int hi = a.chunk_n > 1 ? (int)((const uint4*)a.ctab)[c].y : E;
@@ -203,27 +363,50 @@ static __device__ void pf_order_build(const Exl3r4dPrefill& a) {
       while (i + n < hi && ent[i + n].x == ent[i].x) b += blocks(i + n++);
       return min(b, NB - 1);
     };
-    for (int t = threadIdx.x; t < NB; t += blockDim.x) s_n[t] = 0;
+    for (int t = threadIdx.x; t < 2 * NB; t += blockDim.x) s_n[t / NB][t % NB] = 0;
     __syncthreads();
     for (int i = lo + (int)threadIdx.x; i < hi; i += blockDim.x) {
       int n;
       const int b = group(i, n);
-      if (n) atomicAdd(&s_n[b], n);
+      if (n) {
+        const int h = host(i);
+        atomicAdd(&s_n[h][b], n);
+        if (mode) {
+          XR_CNT(7, 1);
+          if (h) XR_CNT(6, 1);
+        }
+      }
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0) {   // set 0 (all of mode 0) first, or set 1 first (mode 2: host-read first)
       int o = lo;
-      for (int b = NB - 1; b >= 0; b--) { s_o[b] = o; o += s_n[b]; }
+      const int first = mode == 2 ? 1 : 0;
+      for (int k = 0; k < 2; k++) {
+        const int h = k ? 1 - first : first;
+        if (k == 1) s_hs = o;
+        if (mode == 3) o = 0;   // order 3: positions in each set from 0, merged below
+        for (int b = NB - 1; b >= 0; b--) { s_o[h][b] = o; o += s_n[h][b]; }
+        if (mode == 3) (h ? s_nh : s_nv) = o;
+      }
     }
     __syncthreads();
     for (int i = lo + (int)threadIdx.x; i < hi; i += blockDim.x) {
       int n;
       const int b = group(i, n);
       if (!n) continue;
-      const int o = atomicAdd(&s_o[b], n);
-      for (int j = 0; j < n; j++) a.order[o + j] = (unsigned)(i + j);
+      const int h = host(i);
+      const int o = atomicAdd(&s_o[h][b], n);
+      if (mode == 3) {
+        for (int j = 0; j < n; j++) a.order[lo + merged(h, o + j)] = (unsigned)(i + j);
+      } else {
+        for (int j = 0; j < n; j++) a.order[o + j] = (unsigned)(i + j);
+      }
     }
     __syncthreads();
+    if (ring) {
+      __threadfence_block();
+      pf_xr_assign(a, c, lo, s_hs, hi);
+    }
   }
 }
 
@@ -1024,8 +1207,73 @@ struct PfStamp {   // entry in the constructor, exit (every return path: workgro
 #define PF_STAMP_INFO(c, cb, rows, cls) ((void)0)
 #endif
 
+// XR (lever XR; gate_up's map form): grid row 0 is the copy row. Its gridDim.x workgroups walk chunk c's copy list in
+// order (the host-read groups as the GEMM rows will reach them, after every resident group); each copies its share of
+// the head's codes record (16-byte loads, 8 a thread in flight) into the ring, then fences and adds 1 to the head's
+// flag. Nothing here waits, so a copy row that started always finishes.
+static __device__ void pf_xr_copy(const Exl3r4dPrefill& a, int lo) {
+  const Exl3r4dGemm& p = a.g;
+  const uint32_t* const xt = xr_tab(a);
+  const uint32_t *const xoff = xt, *const xlist = xt + 3 * a.cap, *const xcnt = xt + 4 * a.cap;
+  uint32_t* const xflag = (uint32_t*)xt + 2 * a.cap;
+  char* const ring = xr_ring(a);
+  const uint4* ent = (const uint4*)a.map + 1;
+  const int n = (int)xcnt[a.chunk_c], ncw = (int)gridDim.x, me = (int)blockIdx.x;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  constexpr int U = 8;
+  for (int j = 0; j < n; j++) {
+    const int idx = (int)xlist[lo + j];
+    const Planes w = planes_of(p, (int)ent[idx].x);
+    const long long units = (long long)w.rows * w.cols * xr_k2_of(a) / 16 / 16;   // 16-byte units (rows: a multiple of 256)
+    const long long per = (units + ncw - 1) / ncw, u0 = (long long)me * per, u1 = min(units, u0 + per);
+    const uint4* src = (const uint4*)w.codes;
+    uint4* dst = (uint4*)(ring + (size_t)(xoff[idx] - 1u) * 256);
+    for (long long u = u0 + tid; u < u1; u += (long long)nt * U) {
+      uint4 v[U];
+#pragma unroll
+      for (int k = 0; k < U; k++) {
+        const long long q = u + (long long)k * nt;
+        if (q < u1) v[k] = src[q];
+      }
+#pragma unroll
+      for (int k = 0; k < U; k++) {
+        const long long q = u + (long long)k * nt;
+        if (q < u1) dst[q] = v[k];
+      }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) atomicAdd(&xflag[idx], 1u);
+  }
+}
+// XR: a workgroup of entry k whose group has a copy waits for the copy row's flag (gridDim.x workgroups done), then reads
+// the copy; past EXL3R4D_XR_SPIN polls it reads its codes in place (the same bytes). Every wave takes the flag with an
+// agent-scope acquire itself (a workgroup's waves may sit on both CUs of a WGP).
+static __device__ __forceinline__ void pf_xr_redirect(const Exl3r4dPrefill& a, int k, Planes& w) {
+  const uint32_t* const xt = xr_tab(a);
+  const unsigned xo = xt[k];
+  if (!xo) return;
+  const uint32_t* f = xt + 2 * a.cap + xt[a.cap + k];
+  __shared__ int s_xok;
+  if (threadIdx.x == 0) {
+    int ok = 0;
+    for (int it = 0; it < EXL3R4D_XR_SPIN; it++) {
+      if (__hip_atomic_load(f, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) >= gridDim.x) { ok = 1; break; }
+      __builtin_amdgcn_s_sleep(8);
+    }
+    s_xok = ok;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) XR_CNT(s_xok ? 4 : 5, 1);
+  if (__builtin_amdgcn_readfirstlane(s_xok)) {
+    (void)__hip_atomic_load(f, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    w.codes = (const unsigned*)(xr_ring(a) + (size_t)(__builtin_amdgcn_readfirstlane(xo) - 1u) * 256);
+  }
+}
+
 // YS: down's map form with the streamed y (pf_epi_dn_ys; prefill.c's EXL3R4D_PF_YNT_MB decides a launch's form).
-template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN, bool YS = false>
+// XR: gate_up's map form with lever XR's copy row (grid row 0) and redirect (above).
+template <int BITS, int MTX, int NPW, int MATS, int AM, bool RUN, bool YS = false, bool XR = false>
 __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gemm_kernel(Exl3r4dPrefill a) {
   EXL3R4D_KARG_PREFETCH();
   extern __shared__ float lds[];
@@ -1034,6 +1282,7 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
 #endif
   const Exl3r4dGemm& p = a.g;
   int e, r0, r1, rbase = 0;
+  [[maybe_unused]] int kx = -1;   // XR: the entry (map index)
   if constexpr (RUN) {
     __shared__ int s_find[33];
     const Run run = find_run(p, blockIdx.y, s_find);
@@ -1045,9 +1294,18 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
   } else {
     int lo, hi;
     pf_chunk(a, a.chunk_c, lo, hi, rbase);
-    int k = lo + (int)blockIdx.y;
+    int y = (int)blockIdx.y;
+    if constexpr (XR) {   // grid row 0: the copy row
+      if (y == 0) {
+        pf_xr_copy(a, lo);
+        return;
+      }
+      y -= 1;
+    }
+    int k = lo + y;
     if (k >= hi) return;
     if (EXL3R4D_PF_LPT && MATS == 2 && a.order) k = (int)a.order[k];   // longest entries first (EXL3R4D_PF_LPT)
+    kx = k;
     const uint4 ent = ((const uint4*)a.map)[1 + k];
     r0 = (int)ent.y, r1 = (int)ent.z;
     PF_STAMP_INFO(a.chunk_c, blockIdx.x, r1 - r0, ent.x == EXL3R4D_PF_ZERO ? 3u : ent.x % (unsigned)EXL3R4D_NCLS);
@@ -1069,13 +1327,14 @@ __global__ void __launch_bounds__(512) PF_WPE_ATTR PF_WPE_DN_ATTR exl3r4d_pf_gem
       return;
     }
   }
-  const Planes w = planes_of(p, e);
+  Planes w = planes_of(p, e);
   const int width = MATS == 2 ? w.rows / 2 : w.rows;
   if ((int)blockIdx.x * 128 >= width) {  // the narrower parity class: zeros past its own width
     PF_STAMP_INFO(a.chunk_c, blockIdx.x, r1 - r0, 2u);
     zero_rows(p, r0, r1, blockIdx.x);
     return;
   }
+  if constexpr (XR && !RUN) pf_xr_redirect(a, kx, w);   // the copy, once it landed
   for (int rc = r0; rc < r1; rc += 16 * MTX) {   // one pass in the map form (an entry is at most 16 MTX rows)
     const int re = rc + 16 * MTX < r1 ? rc + 16 * MTX : r1;
     pf_dispatch<BITS, 1, MTX, NPW, MATS, AM, YS>((re - rc + 15) / 16, p, w, rc, re, lds, rbase);
@@ -1993,6 +2252,19 @@ static const void* pf_gemm_fn_k(int gate_up, int run, int am, bool ys) {
   return run ? (gate_up ? pf_gemm_fn<BITS, 2, true>(am, ys) : pf_gemm_fn<BITS, 1, true>(am, ys))
              : (gate_up ? pf_gemm_fn<BITS, 2, false>(am, ys) : pf_gemm_fn<BITS, 1, false>(am, ys));
 }
+// XR: gate_up's map form with the copy row, AM 0 (the shipped A form).
+#if EXL3R4D_XR_ON
+static const void* pf_gemm_select_xr(int bits) {
+  constexpr int X = EXL3R4D_PF_MTX, N = EXL3R4D_PF_NPW;
+  switch (bits) {
+    case 2: return (const void*)exl3r4d_pf_gemm_kernel<2, X, N, 2, 0, false, false, true>;
+    case 3: return (const void*)exl3r4d_pf_gemm_kernel<3, X, N, 2, 0, false, false, true>;
+    case 4: return (const void*)exl3r4d_pf_gemm_kernel<4, X, N, 2, 0, false, false, true>;
+    case EXL3R4D_K25: return (const void*)exl3r4d_pf_gemm_kernel<EXL3R4D_K25, X, N, 2, 0, false, false, true>;
+    default: return nullptr;
+  }
+}
+#endif
 static const void* pf_gemm_select(int bits, int gate_up, int run, int am, bool ys) {
   switch (bits) {
     case 2: return pf_gemm_fn_k<2>(gate_up, run, am, ys);
@@ -2046,8 +2318,21 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   if (am >= 4 && (!gate_up || run || a->chunk_n > 1)) return RAD_E_UNSUPPORTED;   // the fused GEMMs: gate_up's map form
   const bool ys = a->ystream != 0;
   if (ys && (gate_up || run || am != 0)) return RAD_E_INVAL;   // the streamed y: down's map form only
-  const void* fn = am == 5 ? (const void*)exl3r4d_pf_map_kernel : pf_gemm_select(bits, gate_up, run, am, ys);
+  // XR: the copy row's kernel when the launch carries a ring (prefill.c sets xr_mode 5 only with one); else as before
+#if EXL3R4D_XR_ON
+  const bool xr = gate_up && !run && am == 0 && !pair && (xr_mode_of(*a) & 4) && xr_ring_of(*a) > 0 && a->order &&
+                  (a->chunk_n <= 1 ? 1 : a->chunk_n) <= 64;
+  const void* fxr = xr ? pf_gemm_select_xr(bits) : nullptr;
+#else
+  const bool xr = false;
+  const void* fxr = nullptr;
+#endif
+  const void* fn = am == 5 ? (const void*)exl3r4d_pf_map_kernel
+                 : fxr     ? fxr
+                           : pf_gemm_select(bits, gate_up, run, am, ys);
+  const unsigned xrow = fxr ? 1u : 0u;   // the copy row
   if (!fn) return (bits < 2 || bits > 6) && bits != EXL3R4D_K25 ? RAD_E_DTYPE : RAD_E_UNSUPPORTED;
+  (void)xr;
   int64_t smem = pf_lds(mats, mtx, am);
   if (!gate_up && EXL3R4D_PF_EPI_DN2 && smem < 2 * 8 * 256 * 4) smem = 2 * 8 * 256 * 4;   // two epilogue regions
   if (gate_up && a->g.h_rot && smem < kHrotStage + 4096) smem = kHrotStage + 4096;   // v3 EPI 1's staged h block
@@ -2075,8 +2360,8 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
       p.chunk_c = c;
       if (hipLaunchKernel(pk, dim3((unsigned)((units + 7) / 8), (unsigned)EXL3R4D_PF_PGY), dim3(256), args, 0, st) !=
               hipSuccess ||
-          hipLaunchKernel(fn, dim3((unsigned)(a->g.y_cols / 128), (unsigned)a->chunk_gy), dim3((unsigned)(wv * WAVE32)),
-                          args, (size_t)smem, st) != hipSuccess)
+          hipLaunchKernel(fn, dim3((unsigned)(a->g.y_cols / 128), (unsigned)a->chunk_gy + xrow),
+                          dim3((unsigned)(wv * WAVE32)), args, (size_t)smem, st) != hipSuccess)
         return RAD_E_DEVICE;
       if (pair && hipLaunchKernel(pf_pair_fn(bits), dim3((unsigned)(a->g.y_cols / 128), (unsigned)a->chunk_gy),
                                   dim3(512u), args, (size_t)(16384 + 2 * kGrpEpi), st) != hipSuccess)
@@ -2110,11 +2395,49 @@ extern "C" int exl3r4d_launch_prefill(const Exl3r4dPrefill* a, int gate_up, int 
   if (pair && hipLaunchKernel(pf_pair_fn(bits), dim3((unsigned)(a->g.y_cols / 128), gy), dim3(512u), args,
                               (size_t)(16384 + 2 * kGrpEpi), st) != hipSuccess)
     return RAD_E_DEVICE;
-  if (hipLaunchKernel(fn, dim3(am == 4 ? 1u : (unsigned)((a->g.y_cols / 128 + gdn - 1) / gdn), gy), dim3((unsigned)(wv * WAVE32)), args, (size_t)smem,
+  if (hipLaunchKernel(fn, dim3(am == 4 ? 1u : (unsigned)((a->g.y_cols / 128 + gdn - 1) / gdn), gy + xrow), dim3((unsigned)(wv * WAVE32)), args, (size_t)smem,
                       st) != hipSuccess)
     return RAD_E_DEVICE;
   return RAD_OK;
 }
+
+// XR's counters as a reading (prefill.c calls exl3r4d_xr_note on every launch with an XR mode): every 256th such launch of a
+// rank prints the rank's pinned slot (its last copy) and copies the rank's device counters into it on the launch's stream
+// (the engine's queue takes the async copy). exl3r4d_xr_rank_init (prefill.c's rad_host_pool_ranges, at start, with the
+// rank's card current) allocates the device counters and the pinned slots. No allocation or synchronisation on the
+// launch path.
+#if EXL3R4D_XR_ON
+static unsigned long long* g_xr_hslot = nullptr;   // pinned [64 ranks][8]
+static unsigned long long* g_xr_dcnt[64];
+static unsigned long long g_xr_launch[64];
+extern "C" unsigned long long* exl3r4d_xr_rank_init(int rank) {
+  if (rank < 0 || rank >= 64) return nullptr;
+  if (!g_xr_hslot) {
+    if (hipHostMalloc((void**)&g_xr_hslot, 64 * 8 * sizeof(unsigned long long), hipHostMallocDefault) != hipSuccess) {
+      g_xr_hslot = nullptr;
+      return nullptr;
+    }
+    memset(g_xr_hslot, 0, 64 * 8 * sizeof(unsigned long long));
+  }
+  if (!g_xr_dcnt[rank]) {
+    void* p = nullptr;
+    if (hipMalloc(&p, 8 * sizeof(unsigned long long)) != hipSuccess) return nullptr;
+    if (hipMemset(p, 0, 8 * sizeof(unsigned long long)) != hipSuccess) return nullptr;
+    g_xr_dcnt[rank] = (unsigned long long*)p;
+  }
+  return g_xr_dcnt[rank];
+}
+extern "C" void exl3r4d_xr_note(int rank, void* stream) {
+  if (rank < 0 || rank >= 64 || !g_xr_hslot || !g_xr_dcnt[rank]) return;
+  if (g_xr_launch[rank]++ % 256 != 0) return;
+  const unsigned long long* c = g_xr_hslot + 8 * rank;
+  fprintf(stderr, "exl3r4d XR (reading): rank %d after %llu XR launches: chunks with a ring %llu, host-read heads %llu, copied %llu "
+          "(%.1f MiB), workgroups reading a copy %llu, past the spin %llu; host-read groups %llu of %llu ordered\n", rank,
+          g_xr_launch[rank] - 1, c[0], c[1], c[2], (double)c[3] * 256.0 / 1048576.0, c[4], c[5], c[6], c[7]);
+  (void)hipMemcpyAsync(g_xr_hslot + 8 * rank, g_xr_dcnt[rank], 8 * sizeof(unsigned long long), hipMemcpyDeviceToHost,
+                       (hipStream_t)stream);
+}
+#endif
 
 // ============================================================================= lab notes
 //
