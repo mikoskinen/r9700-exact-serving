@@ -150,7 +150,7 @@ struct Layer {
 struct BiTr {
     bool on = false;
     std::string dir;
-    int64_t pmax = 256, plen = 128;
+    int64_t pmax = 256, plen = 128, pmin = 0;   /* pmin: RADIANCE_FN4_BITRACE_PMIN (15.11.2026), rows at positions >= it */
     rad_buf plane = 0;              /* [max_tok, 2 * cap] i32: row r's point i at columns 2i, 2i + 1 */
     int64_t cap = 0;                /* points a step */
     struct Tb {
@@ -445,6 +445,7 @@ static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     t.dir = bt_dir();
     if (const char* e = std::getenv("RADIANCE_FN4_BITRACE_PMAX")) t.pmax = std::max<int64_t>(1, std::atoll(e));
     if (const char* e = std::getenv("RADIANCE_FN4_BITRACE_PLEN")) t.plen = std::max<int64_t>(1, std::atoll(e));
+    if (const char* e = std::getenv("RADIANCE_FN4_BITRACE_PMIN")) t.pmin = std::max<int64_t>(0, std::atoll(e));
     t.cap = 64 + 24 * (int64_t)m.layers.size();
     const int64_t MT = g.max_tok;
     t.plane = decl_b(b, m.nm.f("bi_trace_plane"), RAD_I32, {MT, 2 * t.cap}, RAD_BUF_PERSIST);
@@ -487,9 +488,9 @@ static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         }
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: qwen4exp: fn4 BI's tracer ON (RADIANCE_FN4_BITRACE=%s): %zu traced buffers, %lld points a "
-                        "step at most, rows at positions below %lld of sequences first seen at 0 with at most %lld query "
+                        "step at most, rows at positions %lld .. %lld of sequences first seen at 0 with at most %lld query "
                         "rows; passes not recorded\n",
-                t.dir.c_str(), t.tb.size(), (long long)t.cap, (long long)t.pmax, (long long)t.plen);
+                t.dir.c_str(), t.tb.size(), (long long)t.cap, (long long)t.pmin, (long long)t.pmax, (long long)t.plen);
     return RAD_OK;
 }
 /* This step's point `name` (layer l, -1 for none): its index, allocated on first use, or -1 when the plane is full. */
@@ -598,7 +599,7 @@ static void bt_flush(RadCtx* c, Model& m, const RadBatch* batch) {
     std::vector<int32_t> sel, selq;
     for (int64_t r = 0, sq = 0; r < T; ++r) {
         while (sq + 1 < S && cu[(size_t)sq + 1] <= r) ++sq;
-        if (fol[(size_t)sq] && pos[(size_t)r] >= 0 && pos[(size_t)r] < t.pmax) {
+        if (fol[(size_t)sq] && pos[(size_t)r] >= t.pmin && pos[(size_t)r] < t.pmax) {
             sel.push_back((int32_t)r);
             selq.push_back((int32_t)sq);
         }
