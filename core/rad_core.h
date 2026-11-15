@@ -824,6 +824,10 @@ struct Request {
      * rebuilds the windowed state at cr_end over global KV adopted from the prefix cache (no chunk crosses it, none
      * takes a snapshot); 0 none. */
     int32_t              cr_end = 0;
+    /* Lever G (ds41-tailgrid, fn4 sched_tail_grid; the scheduler's): the tail grid F this request latched at its admission,
+     * 0 none -- its tail snapshot is at the deepest multiple of F that leaves its last piece >= 128 rows
+     * (Scheduler::tail_checkpoint), fixed while it is prefilled so every chunk plans the same targets. */
+    int32_t              tail_grid = 0;
 
     /* Non-null: read the raw logits at these ids at the prompt's last position (TokenScores).
      * The request still samples the one token max_tokens allows; the caller discards it. */

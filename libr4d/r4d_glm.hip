@@ -78,6 +78,36 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
         const int rc = r4d_f32pf_gemm(stream, c);
         if (rc != R4D_F32PF_DECLINE) return rc;
     }
+    /* lever SPD-F (ds41-etp-spd, r4d_ds41_f32pf.h): ds41_f32dec's form for the decode band (rows <= 63, n > 8); 0 = the
+     * stock rule below. tile_wave forms 1..15 (R x C a wave, U steps of k in flight), tiled forms 20.. (K whole chunks, else
+     * the stock rule). Every form the stock bytes. */
+    if (n > 8 && rows < 64) {
+        const int f = r4d_f32dec_gemm_form((int)rows, (int)n);
+        int rc = R4D_F32PF_DECLINE;
+        switch (f) {
+            case 1: rc = gemm_f32_tile<8, 2, 8>(stream, x, w, y, n, k); break;
+            case 2: rc = gemm_f32_tile<8, 4, 8>(stream, x, w, y, n, k); break;
+            case 3: rc = gemm_f32_tile<4, 4, 8>(stream, x, w, y, n, k); break;
+            case 4: rc = gemm_f32_tile<4, 8, 8>(stream, x, w, y, n, k); break;
+            case 5: rc = gemm_f32_tile<2, 4, 16>(stream, x, w, y, n, k); break;
+            case 6: rc = gemm_f32_tile<2, 8, 16>(stream, x, w, y, n, k); break;
+            case 7: rc = gemm_f32_tile<4, 2, 16>(stream, x, w, y, n, k); break;
+            case 8: rc = gemm_f32_tile<8, 4, 4>(stream, x, w, y, n, k); break;
+            case 9: rc = gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k); break;   /* the stock forms, for the bench */
+            case 10: rc = gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k); break;
+            case 11: rc = gemm_f32_tile<4, 4, 16>(stream, x, w, y, n, k); break;
+            case 12: rc = gemm_f32_tile<1, 8, 16>(stream, x, w, y, n, k); break;
+            default:
+                if (f >= 20) {
+                    const R4dF32PfCall c{ (const uint16_t*)x.data, w.data, (float*)y.data, (long)x.stride[0],
+                                          (long)w.stride[0], (long)y.stride[0], (int)rows, (int)n, (int)k,
+                                          w.dtype == RAD_BF16 };
+                    rc = r4d_f32pf_gemm_code(stream, c, f);
+                }
+                break;
+        }
+        if (rc != R4D_F32PF_DECLINE) return rc;
+    }
     if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);
     if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k);
     if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k);

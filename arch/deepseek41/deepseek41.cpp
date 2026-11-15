@@ -29,11 +29,13 @@
 #include "ds41_engram_dedup.h"
 #include "ds41_index_split.h"
 #include "ds41_psk_cone.h"
+#include "ds41_etp.h"
 #include "ds41_walk_geom.h"
 #include "rad_spechub.h"   /* lever SD: the coupling wire (RAD_MTP_COUPLE_*), --draft-coupling */
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -342,6 +344,12 @@ struct Layer {
      * (rmsnorm_rope_roundtrip_kv_store), attn_rt = attn + o_f, or attn + o_rope + o_q
      * (attn_sparse_sink_rope_roundtrip). Issued for those when their switch is 1. */
     rad_op kv_fs = 0, attn_rt = 0;
+    /* Lever DKV (dkv_read_env), 0 where not declared: lu_unpack = latent_unpack into Model::lu, attn_lu / attn_rtlu = attn /
+     * attn_rt reading it; lgath = latent_gather into Model::selkv, attn_g / attn_rtg = attn / attn_rt reading that. */
+    rad_op lu_unpack = 0, attn_lu = 0, attn_rtlu = 0, lgath = 0, attn_g = 0, attn_rtg = 0;
+    /* attn_lu / attn_rtlu with plan_full 1 (the plan holds the whole pass: the LDS-free form), issued where the host's
+     * positions say so */
+    rad_op attn_luf = 0, attn_rtluf = 0;
     /* Lever K1 fold a (RADIANCE_DS41_QNFOLD): q_an + q_b as rmsnorm_gemm_nt_ggml (the norm in q_b's staging; it also
      * writes qrn, which the indexer's i_q reads), declared beside the pair where q_b is a GGUF weight. */
     rad_op q_bf = 0;
@@ -540,6 +548,10 @@ struct Model {
      * attn_sparse_sink latent_format nvfp4). Lossless: the latent is quant_roundtrip(fp4_e2m1, e4m3, 16)
      * output, which the packing reproduces bit for bit (docs/OPS.md "Packed compressed latent"). */
     bool lnv = false;
+    /* Lever DKV (dkv_read_env): lu [T][lu_e hd] (the plan's rows of a prefill pass), selkv [selkv_rows][itopk hd] (a decode
+     * pass's gathered selections); 0: not declared. */
+    rad_buf lu = 0, selkv = 0;
+    int64_t lu_e = 0, selkv_rows = 0;
     /* RADIANCE_DS41_KVWIN_FP8=1 (lever KVWIN; "trunk": the trunk's window only): the window caches -- the trunk's
      * kv_window (w8) and the DSpark drafter's kv_dspark (w8d) -- hold each 512-value key packed (528 bytes instead
      * of 1024: e4m3 codes, a scale byte a block of 32; window_store / rmsnorm_rope_roundtrip_kv_store kv_dtype /
@@ -556,6 +568,8 @@ struct Model {
     /* This rank's columns [sh_lo, sh_hi) of the shared expert when its width does not split
      * evenly into whole blocks (shared_slice); 0, 0 is the even split. */
     int64_t sh_lo = 0, sh_hi = 0;
+    /* Lever 1U-ETP (etp_env, geometry()): the trunk's routed experts as width slices of every expert on every rank */
+    bool etp = false;
     /* buffers */
     rad_buf h0 = 0, h1 = 0, xcol = 0, xn = 0, pre_a = 0, pre_f = 0, post = 0, comb = 0;
     rad_buf qr = 0, qrn = 0, q = 0, kv = 0, kvn = 0, o = 0, oa = 0, attn_out = 0;
@@ -1014,6 +1028,60 @@ static int64_t gather_ar_max() {
     if (!e || !*e) return 0;
     const long n = std::strtol(e, nullptr, 10);
     return n > 0 ? std::min<long>(n, 256) : 0;
+}
+/* Lever 1U-ETP (ds41-etp, 14.11.2026): RADIANCE_DS41_ETP=1 (or on) at start puts the trunk's routed EXL3 experts in
+ * EXPERT TENSOR PARALLEL form instead of expert parallel: every rank holds a width slice of ALL n_expert experts of a
+ * layer (gate_up by its intermediate 128-blocks, the gate rows and the same up rows; down by the same K 128-blocks)
+ * instead of n_expert / world whole ones, and runs every routed slot of every token on its slice. Each rank's routed
+ * partial is then a K slice of every slot's down, folded by the existing gather (a token's slots in ascending slot
+ * order, f32, rounded to bf16 with the shared arm's) and summed by the existing exact all-reduce (four rank partials in
+ * fp32, ascending rank order, one rounding). No collective is added and the all-reduce keeps its size.
+ *
+ * Slices (etp_slice): the intermediate width's nb 128-blocks (DeepSeek-V4.1-Flash: 2304 = 18) split by parity class
+ * as the two-class expert ops take them (expert e at entry e / 2 of class e % 2): the even experts give the first
+ * nb % world ranks one block more, the odd experts the last nb % world ranks -- at four ranks 5/5/4/4 blocks (640 /
+ * 512 wide) for the even experts and 4/4/5/5 for the odd ones, 4.5 blocks a rank on average. So ranks 0-1 hold even
+ * experts 640 wide and odd ones 512 wide, ranks 2-3 the other way round.
+ *
+ * Prefill, newcomer and mixed steps run on the same placement through the same op pair at slice width (the M > 16
+ * forms take the same per-class widths as the decode band), so there is one stored form and nothing to switch.
+ *
+ * Exactness: a reference change against expert parallel, once. gate_up's outputs are whole dot products over K 5120
+ * on one rank (an output 128-block's workgroup is the same code over the same codes), so h is the same; down's K
+ * 2304 becomes four partial dot products (K 512..640) whose f16 / output-rotation / svh / bf16 roundings happen per
+ * rank, the gather folds every slot's partial on every rank (EP: only the slots whose expert is the rank's own) and
+ * the all-reduce sums four partials that each hold a quarter of all six slots (EP: each the whole of its own slots).
+ * Then deterministic and batch-invariant like EP: every row's arithmetic is its own (per (token, slot) decode rows,
+ * a token's slots in a fixed order, the rank fold in a fixed order).
+ *
+ * Unset / 0 / off: expert parallel, today's program and bytes. Anything else is refused at start. The DSpark drafter's
+ * MoE stays expert parallel either way. */
+static int etp_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_ETP");
+        if (!e || !*e || !std::strcmp(e, "0") || !std::strcmp(e, "off")) return 0;
+        if (!std::strcmp(e, "1") || !std::strcmp(e, "on")) return 1;
+        return -1;
+    }();
+    return v;
+}
+using ds41etp::etp_slice;   /* ds41_etp.h: this rank's slice of an expert of each parity class */
+/* Lever XR (ds41-etp-xr, 14.11.2026): RADIANCE_DS41_XRING=<MiB> (1 .. 1024) at start, with RADIANCE_DS41_ETP, declares
+ * each trunk layer's EXL3 gate_up with interface v10's `xring` -- that much copy ring in its prefill scratch. exl3r4d's
+ * map form then can (fn4 exl3_xr bit 2) copy the routed experts whose slices sit in the pinned host pool onto the card
+ * inside the launch while the resident ones compute, and read the copies: the same bytes, a placement. The ring is
+ * charged to the arena like the rest of the scratch (fewer expert slots). Unset / 0: nothing declared (today's ops);
+ * anything else is refused at start. */
+static int64_t xring_env() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_XRING");
+        if (!e || !*e) return (int64_t)0;
+        char* end = nullptr;
+        const long n = std::strtol(e, &end, 10);
+        if (!std::isdigit((unsigned char)e[0]) || (end && *end) || n < 0 || n > 1024) return (int64_t)-1;
+        return (int64_t)n;
+    }();
+    return v;
 }
 static int64_t gather_ar_rows() {
     const char* e = std::getenv("RADIANCE_DS41_ARGATHER");
@@ -1571,6 +1639,82 @@ static void p1_read_env() {
     }
 }
 static bool p1_declared() { return g_sw_p1_env.load(std::memory_order_relaxed) >= 0; }
+
+/* Lever DKV (14.11.2026, the dense (nvfp4) latent without its slowdown; RADIANCE_DS41_LATENT=nvfp4 only, read once at the
+ * first declare; unset: nothing declared or issued differently):
+ *   RADIANCE_DS41_LATUNPACK=<E> (1..256): Model::lu ([T][E hd] bf16, E entries a row of the step: 32 KiB a row at 32) holds
+ *     a prefill pass's packed compressed entries unpacked once a kv source and segment (latent_unpack, issued before the
+ *     first attention over that source's cache: the attentions of layers 2-7 / 8-13 / 14-19 / 20-39 each read one cache),
+ *     and those attentions take them (attn_sparse_sink(_rope_roundtrip)_unpacked: the WMMA form reads a 16-key tile the
+ *     plan holds as plain bf16 rows -- instead of every row's workgroup unpacking its 512 selections itself, in every
+ *     layer -- and a tile with an entry the plan lacks unpacks itself as before);
+ *   RADIANCE_DS41_LATGATHER=1: Model::selkv ([min(T, 48)][itopk hd] bf16, 24 MiB) holds the decode pass's selected entries
+ *     unpacked once an index source group (latent_gather = lever NVG's gather kernel, before the first attention of the
+ *     group: the attentions of [index source x, next index source) read x's selection over one kv source), and those
+ *     attentions take them (attn_sparse_sink(_rope_roundtrip)_gathered: lever NVG's plain-kernel pass) -- 8 gathers a step
+ *     instead of NVG's 38.
+ * Exact: the rows hold the entries' stored bf16 bits (the v3 decode, NVG's), each written after its kv source's store and
+ * before every attention that reads it, under a key (kv source, index source, segment rows) checked at every issue -- a
+ * miss unpacks again -- and the attentions run the same WMMAs / the same plain kernel over the same values. */
+static std::atomic<int> g_dkv_lu{-1}, g_dkv_g{-1};
+static std::atomic<long long> g_dkv_lu_n{0}, g_dkv_lu_hit{0}, g_dkv_g_n{0}, g_dkv_g_hit{0};
+static void dkv_read_env() {
+    int unread = -1;
+    const char* e = std::getenv("RADIANCE_DS41_LATUNPACK");
+    char* end = nullptr;
+    const long v = e && *e ? std::strtol(e, &end, 10) : 0;
+    const int lu = end && !*end && v >= 1 && v <= 256 ? (int)v : 0;
+    if (g_dkv_lu.compare_exchange_strong(unread, lu) && e && *e && !lu)
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LATUNPACK=%s is not 1..256: lever DKV-U is not declared\n", e);
+    unread = -1;
+    const char* g = std::getenv("RADIANCE_DS41_LATGATHER");
+    const int gv = g && (!std::strcmp(g, "1") || !std::strcmp(g, "on")) ? 1 : 0;
+    g_dkv_g.compare_exchange_strong(unread, gv);
+}
+/* The pass's held rows (one rank thread a ctx): which segment's plan m.lu holds for which kv source (latent_unpack issued
+ * this pass), which pass's selections m.selkv holds for which (index source, kv source). The issue order is the stream's,
+ * so a held entry is valid from its launch to the end of the pass (the caches it reads are written only at their source,
+ * before it); every pass starts empty. */
+struct DkvHeld {
+    int src = -1, idx = -1;
+    int64_t s0 = -1, s1 = -1, r0 = -1, n = 0;
+};
+static thread_local std::vector<DkvHeld> t_dkv_lu;
+static thread_local DkvHeld t_dkv_g;
+/* this rank thread's counts: unpacks, plan hits, gathers, gather hits; rank 0 notes them at its 1st, 10th, 100th ... launch */
+static thread_local long long t_dkv_ct[4] = { 0, 0, 0, 0 };
+static void dkv_note(RadCtx* x, const char* what, int l, int64_t n, int64_t hr0, int64_t hn) {
+    if (rad_rank(x) != 0) return;
+    const long long k = t_dkv_ct[0] + t_dkv_ct[2];
+    long long p = 1;
+    while (p < k) p *= 10;
+    if (p != k) return;
+    fprintf(stderr, "radiance: deepseek41: lever DKV (rank 0, launch %lld: %s at layer %d, %lld rows, plan rows [%lld, %lld)): "
+                    "latent_unpack %lld (plan hits %lld), latent_gather %lld (hits %lld)\n",
+            k, what, l, (long long)n, (long long)hr0, (long long)(hr0 + hn), t_dkv_ct[0], t_dkv_ct[1], t_dkv_ct[2],
+            t_dkv_ct[3]);
+}
+/* RADIANCE_DS41_DKV_LOG=1 (read once): rank 0 notes every pass of at least 2048 rows when the next one starts -- the
+ * attentions it ran over the plan's / the gathered rows, the taller ones it left to today's op, the unpacks and gathers */
+static thread_local long long t_dkv_pass[6] = { 0, 0, 0, 0, 0, 0 };   /* plan, gathered, tall today, unpacks, gathers, rows */
+static thread_local long long t_dkv_full = 0;                          /* plan attentions in the LDS-free form (plan_full) */
+static bool dkv_log_on() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_DKV_LOG"); return e && *e && *e != '0'; }();
+    return on;
+}
+static void dkv_pass_reset(RadCtx* x = nullptr, int64_t rows = 0) {
+    if (x && rad_rank(x) == 0 && dkv_log_on() && t_dkv_pass[5] >= 2048 &&
+        t_dkv_pass[0] + t_dkv_pass[1] + t_dkv_pass[2] + t_dkv_pass[3] + t_dkv_pass[4] > 0)
+        fprintf(stderr, "radiance: deepseek41: lever DKV pass of %lld rows: %lld attentions over the plan's rows (%lld of them "
+                        "plan_full), %lld over gathered rows, %lld taller ones by today's op; %lld latent_unpack, %lld "
+                        "latent_gather\n",
+                t_dkv_pass[5], t_dkv_pass[0], t_dkv_full, t_dkv_pass[1], t_dkv_pass[2], t_dkv_pass[3], t_dkv_pass[4]);
+    for (long long& v : t_dkv_pass) v = 0;
+    t_dkv_full = 0;
+    t_dkv_pass[5] = rows;
+    t_dkv_lu.clear();
+    t_dkv_g = DkvHeld{};
+}
 /* The fewest rows a pcn_a launch is fused at under the switch; 0 = none. */
 static int64_t mhc_fuse_min() {
     if (!g_sw_mhc_ok.load(std::memory_order_relaxed)) return 0;
@@ -1828,6 +1972,32 @@ static int geometry(Model& m, const RadBuildCtx* ctx) {
                 (long long)c.n_expert, (long long)c.n_ff, world);
         return RAD_E_UNSUPPORTED;
     }
+    /* Lever 1U-ETP: refused where the width does not cut into a slice a rank (etp_slice) */
+    if (etp_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_ETP=%s is not 0 / off or 1 / on\n", std::getenv("RADIANCE_DS41_ETP"));
+        return RAD_E_INVAL;
+    }
+    m.etp = etp_env() > 0 && world > 1;
+    if (xring_env() < 0) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_XRING=%s is not 0 .. 1024 (MiB)\n", std::getenv("RADIANCE_DS41_XRING"));
+        return RAD_E_INVAL;
+    }
+    if (xring_env() > 0 && m.etp && ctx->rank == 0 && !ctx->shape_probe)
+        fprintf(stderr, "radiance: deepseek41: lever XR (RADIANCE_DS41_XRING): %lld MiB of copy ring in each trunk gate_up's prefill "
+                        "scratch (exl3r4d fn4 exl3_xr; the same bytes either way)\n", (long long)xring_env());
+    if (m.etp) {
+        int64_t lo[2], hi[2];
+        if (!etp_slice(c.n_ff, world, ctx->rank, lo, hi)) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_ETP: an expert of width %lld does not cut into whole 128-column "
+                            "blocks for %d ranks\n", (long long)c.n_ff, world);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: lever 1U-ETP (RADIANCE_DS41_ETP): every routed expert on every rank as a width "
+                            "slice -- rank 0 even experts [%lld, %lld), odd [%lld, %lld) of %lld; the gather folds every slot on every "
+                            "rank and the exact all-reduce sums the four partials (a reference change against expert parallel)\n",
+                    (long long)lo[0], (long long)hi[0], (long long)lo[1], (long long)hi[1], (long long)c.n_ff);
+    }
     g.n_ff_all = c.n_ff;
     /* This rank's width of the shared expert (its buffers and the MoE block's n_ff_shared). */
     g.n_ff = sh_hi ? sh_hi - sh_lo : c.n_ff / world;
@@ -1871,10 +2041,37 @@ static int64_t keep_words(int64_t width, int64_t block) {
  * rows is one run, the op as before. */
 static constexpr int64_t kScorePlane = 256ll << 20;
 static constexpr int64_t kScoreRunMin = 256;
+/* Lever SPF-IR (RADIANCE_DS41_IROWS_MIN=<rows>, read once at the first declare): the runs' floor instead of
+ * kScoreRunMin. This model's index layers run at ratio 1, so cmax = max_ctx + 1 and the plane is 4 bytes x max_ctx a
+ * row: at --max-model-len 1048576 the 256-row floor makes it 1 GiB a card (512 MiB at 524288), and the arena's every
+ * level from 256 rows up carries it. The plane only has to hold one run, so a lower floor is placement only, provided
+ * each run keeps the kernel form the unsplit step takes: a split step (T > irows rows, n = ceil(T / irows) >= 2 runs)
+ * has runs of R = ceil(T / n) > T irows / (T + irows) > irows / 2 rows, so a floor >= 2 kDs41IdxFormRows (96) keeps
+ * every run above the decode form's 48 rows, in the WMMA form the unsplit step (T > irows >= 96 rows) takes; index_score
+ * computes each row alone in that form (ds41_index_split.h), index_candidates / index_topk select a row exactly
+ * whatever rows share a launch, and the selections land at the same rows (the split's own argument). Accepted: 96 ..
+ * 256 (a number outside, or junk: warned, kScoreRunMin). Unset: kScoreRunMin, every declare as before. */
+static constexpr int64_t kScoreRunFloorMin = 2 * kDs41IdxFormRows;
+static int64_t ds41_irows_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_IROWS_MIN");
+        if (!e || !*e) return kScoreRunMin;
+        char* end = nullptr;
+        const long long r = std::strtoll(e, &end, 10);
+        if (!end || *end || r < kScoreRunFloorMin || r > kScoreRunMin) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_IROWS_MIN=%s is not a row count in %lld .. %lld; "
+                            "the indexer's runs keep their %lld-row floor\n",
+                    e, (long long)kScoreRunFloorMin, (long long)kScoreRunMin, (long long)kScoreRunMin);
+            return kScoreRunMin;
+        }
+        return (int64_t)r;
+    }();
+    return v;
+}
 static void index_runs(Model& m) {
     const auto& g = m.g;
     const auto& c = m.c;
-    m.irows = std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax)));
+    m.irows = std::min(g.max_tok, std::max(ds41_irows_min(), kScorePlane / (4 * m.cmax)));
     m.iparts = (g.max_tok + m.irows - 1) / m.irows;
     m.kwords = 0;
     if (c.cand >= 0 && c.cand < c.n_layer && c.cand_block > 0 && c.ratio[(size_t)c.cand] > 0)
@@ -2238,6 +2435,21 @@ static int buffers(RadBuilder* b, Model& m) {
     mw.sout = bf("shared_out", { T, D });
     mw.sgate = bf("shared_one", { T, 1 });
     m.final_hidden = decl_b(b, nm.f("final_hidden"), RAD_BF16, { T, D }, RAD_BUF_PERSIST);
+    /* Lever DKV (dkv_read_env): the plan's rows of a prefill pass (E entries a row of the step) and a decode pass's
+     * gathered selections, over the packed latent only */
+    m.lu = m.selkv = 0;
+    m.lu_e = m.selkv_rows = 0;
+    if (m.lnv && c.head_dim == 512 && c.itopk > 0) {
+        if (const int e = g_dkv_lu.load(std::memory_order_relaxed); e > 0) {
+            m.lu_e = e;
+            m.lu = bf("comp_latent_unpacked", { T, (int64_t)e * c.head_dim });
+            if (m.lu) m.bp[m.lu] = (int64_t)e * c.head_dim;
+        }
+        if (g_dkv_g.load(std::memory_order_relaxed) > 0) {
+            m.selkv_rows = std::min<int64_t>(T, kBiBand);
+            m.selkv = bf("comp_latent_gathered", { m.selkv_rows, c.itopk * c.head_dim });
+        }
+    }
     {   /* lever BI: the row pitch of each per-token buffer step_bi slices (its declared width) */
         const std::pair<rad_buf, int64_t> bp[] = {
             { m.h0, HN }, { m.h1, HN }, { m.xcol, D }, { m.xn, D }, { m.pre_a, c.hc }, { m.pre_f, c.hc }, { m.post, c.hc },
@@ -2787,6 +2999,42 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             else
                 L.attn_rt = fused(b, "attn_sparse_sink_rope_roundtrip", fp, { L.sinks }, { m.q, cs }, { m.o });
             if (L.attn_rt) g_sw_of_ok.store(1, std::memory_order_relaxed);
+            /* Lever DKV: the fold d form over the plan's / the gathered rows (beside it) */
+            if (r > 0 && L.attn_rt && m.lu) {
+                L.attn_rtlu = fused(b, "attn_sparse_sink_rope_roundtrip_unpacked", fp, { L.sinks }, { m.q, m.sel, cs, m.lu },
+                                    { m.o });
+                std::vector<RadParam> ff = fp;
+                ff.push_back(RAD_INT("plan_full", 1));
+                L.attn_rtluf = fused(b, "attn_sparse_sink_rope_roundtrip_unpacked", ff, { L.sinks }, { m.q, m.sel, cs, m.lu },
+                                     { m.o });
+            }
+            if (r > 0 && L.attn_rt && m.selkv) {
+                std::vector<RadParam> gf = fp;
+                gf[0] = RAD_RANGE("M", 1, m.selkv_rows);
+                L.attn_rtg = fused(b, "attn_sparse_sink_rope_roundtrip_gathered", gf, { L.sinks },
+                                   { m.q, m.sel, cs, m.selkv }, { m.o });
+            }
+        }
+        /* Lever DKV (dkv_read_env): latent_unpack / latent_gather over this layer's kv source's packed cache, and the
+         * attention over their rows, beside today's (issued where dkv_attn finds them) */
+        if (r > 0 && m.lu) {
+            L.lu_unpack = fused(b, "latent_unpack",
+                                { RAD_RANGE("M", 1, T), RAD_INT("dim", hd), RAD_INT("ratio", r),
+                                  RAD_STR("latent_format", "nvfp4") },
+                                {}, {}, { m.lu });
+            L.attn_lu = fused(b, "attn_sparse_sink_unpacked", ap, { L.sinks }, { m.q, m.sel, m.lu }, { m.o });
+            std::vector<RadParam> af = ap;
+            af.push_back(RAD_INT("plan_full", 1));
+            L.attn_luf = fused(b, "attn_sparse_sink_unpacked", af, { L.sinks }, { m.q, m.sel, m.lu }, { m.o });
+        }
+        if (r > 0 && m.selkv) {
+            L.lgath = fused(b, "latent_gather",
+                            { RAD_RANGE("M", 1, m.selkv_rows), RAD_INT("dim", hd), RAD_INT("ratio", r),
+                              RAD_INT("topk", c.itopk), RAD_STR("latent_format", "nvfp4") },
+                            {}, { m.sel }, { m.selkv });
+            std::vector<RadParam> gp = ap;
+            gp[0] = RAD_RANGE("M", 1, m.selkv_rows);
+            L.attn_g = fused(b, "attn_sparse_sink_gathered", gp, { L.sinks }, { m.q, m.sel, m.selkv }, { m.o });
         }
         /* This rank's output groups, each a block of the block-diagonal wo_a. */
         const int64_t gd = HD / m.gr;
@@ -2855,6 +3103,20 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     s.cfg.probed_expert = s.cfg.expert_base;
     s.cfg.top_k = c.top_k;
     s.cfg.n_ff_exp = c.n_ff;
+    /* Lever 1U-ETP (etp_env): every expert on every rank, as this rank's width slice by parity class */
+    if (m.etp) {
+        int64_t lo[2], hi[2];
+        if (!etp_slice(c.n_ff, g.world, g.rank, lo, hi)) return RAD_E_UNSUPPORTED;
+        s.cfg.n_expert = c.n_expert;
+        s.cfg.expert_base = 0;
+        s.cfg.probed_expert = 0;
+        for (int q = 0; q < 2; ++q) {
+            s.cfg.ff_lo[q] = lo[q];
+            s.cfg.ff_hi[q] = hi[q];
+        }
+        s.cfg.n_ff_exp = std::max(hi[0] - lo[0], hi[1] - lo[1]);
+        s.cfg.exl3_xring = xring_env() > 0 ? xring_env() : 0;   /* lever XR */
+    }
     s.cfg.n_ff_shared = g.n_ff;
     s.cfg.shared_lo = m.sh_lo;
     s.cfg.shared_hi = m.sh_hi;
@@ -3700,6 +3962,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     i11_read_env();
     rf_read_env();
     p1_read_env();
+    dkv_read_env();
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
@@ -4013,6 +4276,40 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     !m.dsp.on ? "not declared" : m.w8d ? "packed" : "bf16", wx,
                     (long long)c.window, (long long)c.head_dim);
     }
+    /* Lever DKV: what the declare took (rank 0's real declare) */
+    if (ctx->rank == 0 && !ctx->shape_probe && (g_dkv_lu.load(std::memory_order_relaxed) > 0 ||
+                                                g_dkv_g.load(std::memory_order_relaxed) > 0)) {
+        int nu = 0, nl = 0, nlr = 0, ng = 0, nga = 0, ngr = 0, nc = 0;
+        for (const Layer& L : m.layers) {
+            nu += L.lu_unpack != 0;
+            nl += L.attn_lu != 0;
+            nlr += L.attn_rtlu != 0;
+            ng += L.lgath != 0;
+            nga += L.attn_g != 0;
+            ngr += L.attn_rtg != 0;
+            nc += L.r > 0;
+        }
+        if (!m.lnv)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LATUNPACK / RADIANCE_DS41_LATGATHER need the packed latent "
+                            "(RADIANCE_DS41_LATENT=nvfp4): lever DKV is not declared\n");
+        else
+            fprintf(stderr, "radiance: deepseek41: lever DKV: of %d compressing layers, latent_unpack %d, "
+                            "attn_sparse_sink_unpacked %d, its fold d form %d (%lld entries a row: %.2f MiB at %lld rows); "
+                            "latent_gather %d, attn_sparse_sink_gathered %d, its fold d form %d (%lld rows: %.2f MiB)\n",
+                    nc, nu, nl, nlr, (long long)m.lu_e,
+                    (double)(T * m.lu_e * c.head_dim * 2) / (1024.0 * 1024.0), (long long)T, ng, nga, ngr,
+                    (long long)m.selkv_rows, (double)(m.selkv_rows * c.itopk * c.head_dim * 2) / (1024.0 * 1024.0));
+    }
+    /* Lever SPF-IR, only where RADIANCE_DS41_IROWS_MIN moved the floor (unset: no line, as before). */
+    if (ctx->rank == 0 && !ctx->shape_probe && ds41_irows_min() != kScoreRunMin)
+        fprintf(stderr, "radiance: deepseek41: lever SPF-IR (RADIANCE_DS41_IROWS_MIN=%lld): the indexer scores in runs of "
+                        "at most %lld rows (the %lld-row floor would give %lld), %lld runs declared: score plane %.2f MiB "
+                        "a card instead of %.2f\n",
+                (long long)ds41_irows_min(), (long long)m.irows, (long long)kScoreRunMin,
+                (long long)std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax))), (long long)m.iparts,
+                (double)(m.irows * m.cmax * 4) / (1024.0 * 1024.0),
+                (double)(std::min(g.max_tok, std::max(kScoreRunMin, kScorePlane / (4 * m.cmax))) * m.cmax * 4) /
+                    (1024.0 * 1024.0));
     /* The same on stderr once (rank 0's real declare), so a serve log says which indexer ran. */
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41 indexer: candidate restriction %s from %lld positions, row split %s "
@@ -4814,6 +5111,85 @@ static bool gguf_dense(const Model& m, rad_weight w) { return m.wty.count(w) && 
  * segment, decode rows within the norms' width): step() then runs today's issue. Prefill sequences' bounds from the
  * host mirror of positions (each sequence's rows are consecutive positions; a jump starts the next); when that does not
  * give the step's prefill sequence count (two sequences whose positions continue), cu_seqlens is read back (a sync). */
+/* Lever DKV (dkv_read_env): layer L's attention over a pass's rows through the DKV ops where they serve it; false =
+ * nothing issued (the caller issues today's op). `a`: the attention's operands as today's issue hands them -- q, window
+ * cache, window table, window used, compressed cache, its table, sel, positions, cu_seqlens, sinks, out (then cos_sin
+ * for the fold d form, `ofold`). `dec`: a decode pass or segment (the gathered rows, at most selkv_rows rows); else a
+ * prefill one (the plan's rows, more than the decode band's rows). s0 / s1: its sequences; n: its rows at this layer;
+ * hr0 / hn: the rows of m.lu its plan may own (the segment's rows before a PSK cut: the cut keeps its last rows, so the
+ * plan's last positions -- the only rows it reads -- are the same). */
+static bool dkv_attn(RadCtx* x, Model& m, const Layer& L, bool ofold, bool dec, int64_t s0, int64_t s1, int64_t n,
+                     int64_t hr0, int64_t hn, std::vector<RadOperand> a, int64_t last_pos = -1) {
+    const auto& c = m.c;
+    const int l = L.l;
+    if (L.r <= 0 || !m.lnv || a.size() < 11 || (ofold && a.size() < 12)) return false;
+    const int src = c.src_of[(size_t)l], idx = c.idx_of[(size_t)l];
+    if (dec && m.selkv && L.lgath && (ofold ? L.attn_rtg : L.attn_g) && n >= 1 && n <= m.selkv_rows) {
+        DkvHeld& h = t_dkv_g;
+        const RadOperand gv = brows(m.selkv, n);
+        if (h.src == src && h.idx == idx && h.s0 == s0 && h.s1 == s1 && h.r0 == hr0 && h.n == n) {
+            g_dkv_g_hit.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[3];
+        } else {
+            const RadOperand go[] = { a[4], a[5], a[6], a[8], gv };
+            rad_issue(x, L.lgath, go, 5, n);
+            h.src = src;
+            h.idx = idx;
+            h.s0 = s0;
+            h.s1 = s1;
+            h.r0 = hr0;
+            h.n = n;
+            g_dkv_g_n.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[2];
+            ++t_dkv_pass[4];
+            dkv_note(x, "gather", l, n, 0, 0);
+        }
+        a.push_back(gv);
+        rad_issue(x, ofold ? L.attn_rtg : L.attn_g, a.data(), (int)a.size(), n);
+        ++t_dkv_pass[1];
+        return true;
+    }
+    if (!dec && m.lu && L.lu_unpack && (ofold ? L.attn_rtlu : L.attn_lu) && n > kBiBand && hn >= n) {
+        const RadOperand uv = hr0 == 0 ? brows(m.lu, hn) : brow_slice(m.lu, hr0, hn, m.bp.at(m.lu));
+        bool held = false;
+        for (const DkvHeld& h : t_dkv_lu)
+            held = held || (h.src == src && h.s0 == s0 && h.s1 == s1 && h.r0 == hr0 && h.n == hn);
+        if (held) {
+            g_dkv_lu_hit.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[1];
+        } else {
+            /* a plan over other rows of m.lu that overlap these no longer holds its rows */
+            t_dkv_lu.erase(std::remove_if(t_dkv_lu.begin(), t_dkv_lu.end(),
+                                          [&](const DkvHeld& h) { return h.r0 < hr0 + hn && hr0 < h.r0 + h.n; }),
+                           t_dkv_lu.end());
+            const RadOperand uo[] = { a[4], a[5], a[7], a[8], uv };
+            rad_issue(x, L.lu_unpack, uo, 5, n);
+            DkvHeld h;
+            h.src = src;
+            h.s0 = s0;
+            h.s1 = s1;
+            h.r0 = hr0;
+            h.n = hn;
+            t_dkv_lu.push_back(h);
+            g_dkv_lu_n.fetch_add(1, std::memory_order_relaxed);
+            ++t_dkv_ct[0];
+            ++t_dkv_pass[3];
+            dkv_note(x, "unpack", l, n, hr0, hn);
+        }
+        a.push_back(uv);
+        /* one sequence whose last position the host holds: the plan holds every entry it may select when (last + 1) /
+         * ratio fits the plan's rows (the device plan's reach is at most that) -> the LDS-free form */
+        const bool full = last_pos >= 0 && s1 - s0 == 1 && (last_pos + 1) / L.r <= m.lu_e * hn;
+        const rad_op fo = ofold ? L.attn_rtluf : L.attn_luf;
+        rad_issue(x, full && fo ? fo : (ofold ? L.attn_rtlu : L.attn_lu), a.data(), (int)a.size(), n);
+        ++t_dkv_pass[0];
+        if (full && fo) ++t_dkv_full;
+        return true;
+    }
+    if (n > kBiBand) ++t_dkv_pass[2];
+    return false;
+}
+
 static bool bi_segments(RadCtx* x, const Model& m, const RadBatch* b, std::vector<BiSeg>& sg) {
     sg.clear();
     const int64_t T = b->n_tok, S = b->n_seq;
@@ -4946,6 +5322,7 @@ static bool engdd_issue(RadCtx* x, Model& m, Layer& L, const RadBatch* batch, in
 
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
+    dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start */
     const auto& c = m.c;
     const auto& g = m.g;
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
@@ -5567,6 +5944,25 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     const auto* cbb = kv_batch(batch, m.comp[r]);
                     const RadOperand cbt = praw2(cbb->block_table + s.s0 * cbb->block_table_pitch, RAD_I32, ns,
                                                  cbb->block_table_pitch);
+                    /* lever DKV: a prefill segment's plan rows are its uncut rows (sg_step's segment of the same
+                     * sequences, when this one is its last rows) */
+                    if (m.lu || m.selkv) {
+                        int64_t hr0 = s.r0, hn = s.n;
+                        if (!s.dec)
+                            for (const BiSeg& u : sg_step)
+                                if (!u.dec && u.s0 == s.s0 && u.s1 == s.s1 && u.r0 <= s.r0 && u.r0 + u.n == s.r0 + s.n) {
+                                    hr0 = u.r0;
+                                    hn = u.n;
+                                    break;
+                                }
+                        std::vector<RadOperand> da = { R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused,
+                                                       kv_cache(m.comp[r], src), cbt, R(m.sel, s.r0, s.n),
+                                                       P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks),
+                                                       R(m.o, s.r0, s.n) };
+                        if (ofold) da.push_back(acs);
+                        const int64_t lp = batch->positions_h && s.n > 0 ? (int64_t)batch->positions_h[s.r0 + s.n - 1] : -1;
+                        if (dkv_attn(x, m, L, ofold, s.dec, s.s0, s.s1, s.n, hr0, hn, std::move(da), lp)) continue;
+                    }
                     if (ofold)
                         RAD_ISSUE_N(x, ah, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
                                     cbt, R(m.sel, s.r0, s.n), P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks),
@@ -5820,6 +6216,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
 
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
+    dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start */
     /* A drafter pass: the sign gives the kind (rad_runtime.h); zero is a trunk step. */
     if (batch->draft_pass != 0) {
         if (!m.dsp.on) {
@@ -6238,7 +6635,19 @@ static void step(RadCtx* x, const RadBatch* batch) {
             const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
             const rad_op ah = ofold ? L.attn_rt : L.attn;
             const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
-            if (r > 0) {
+            /* lever DKV: the whole pass as one segment (decode-band rows: the gathered rows; taller: the plan's) */
+            std::vector<RadOperand> da;
+            if (r > 0 && (m.lu || m.selkv)) {
+                const int src = c.src_of[(size_t)l];
+                const auto* cb = kv_batch(batch, m.comp[r]);
+                da = { brows(m.q, T), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
+                       praw2(cb->block_table, RAD_I32, S, cb->block_table_pitch), brows(m.sel, T), pos, cu,
+                       RAD_W(L.sinks), brows(m.o, T) };
+                if (ofold) da.push_back(acs);
+            }
+            const int64_t lp = batch->positions_h && S == 1 && T > 0 ? (int64_t)batch->positions_h[T - 1] : -1;
+            if (!da.empty() && dkv_attn(x, m, L, ofold, T <= kBiBand, 0, S, T, 0, T, std::move(da), lp)) {
+            } else if (r > 0) {
                 const int src = c.src_of[(size_t)l];
                 const auto* cb = kv_batch(batch, m.comp[r]);
                 if (ofold)

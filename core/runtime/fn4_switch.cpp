@@ -36,7 +36,8 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "ds41_mix_wv", "ds41_gq", "ds41_e2", "sched_cb_hold_ms", "sched_cb_hold_k",
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
                                         "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
-                                        "ds41_wmk", "ds41_moe1" };
+                                        "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng", "ds41_f32dec",
+                                        "exl3_xr" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -51,7 +52,10 @@ bool plugin_switch(int i) {
            i == kDs41Rfuse ||   /* ds41_rfuse (68, ds41-fuse): deepseek41 (lever FUSE-R) */
            i == kDs41MixFin ||  /* ds41_mix_fin (69, ds41-fuse): libr4d (lever FUSE-M) */
            i == kDs41Wmk ||     /* ds41_wmk (71, ds41-wmk2): libr4d (lever WMK) */
-           i == kDs41Moe1;      /* ds41_moe1 (72 here, 71 on ds41-p1pass): deepseek41 (lever P) */
+           i == kDs41Moe1 ||    /* ds41_moe1 (72 here, 71 on ds41-p1pass): deepseek41 (lever P) */
+           i == kExl3Dng ||     /* exl3_dng (75 on ds41-etp-spb, 76 here after lever G): exl3r4d (SPB-G) */
+           i == kDs41F32Dec ||  /* ds41_f32dec (73 on ds41-etp-spd, 77 here after the night stack): libr4d (lever SPD-F) */
+           i == kExl3Xr;        /* exl3_xr (73 on ds41-etp-xr, 78 here after night stack 2): exl3r4d (lever XR / SPC order 3) */
 }
 
 /* One loaded object's hooks; accepts and value may be absent (a plugin built before them). */
@@ -76,6 +80,8 @@ struct Hooks {
     int (*rfuse_stats)(long long*, int) = nullptr; /* lever FUSE-R (deepseek41's rad_rfuse_stats, ds41-fuse) */
     int (*fuse_stats)(long long*, int) = nullptr;  /* levers FUSE-M / FUSE-R (libr4d's rad_fuse_stats, ds41-fuse) */
     int (*wmk_stats)(long long*, int) = nullptr;   /* lever WMK (libr4d's rad_wmk_stats, ds41-wmk2) */
+    /* lever XR (exl3r4d's rad_host_pool_ranges, ds41-etp-xr): a rank's pinned host pools */
+    int (*host_pools)(int, int, const unsigned long long*, const unsigned long long*) = nullptr;
 };
 
 struct State {
@@ -89,6 +95,7 @@ struct State {
     std::atomic<uint64_t> epoch{0};
     std::atomic<int> applied_step{-1};
     std::atomic<int64_t> cnt[8];   /* note_draft_counts */
+    std::atomic<int64_t> dcap[2];  /* note_draft_dcap (SPB) */
     std::atomic<int> lend_capable{-1};   /* -1 no scheduler registered, 0 / 1 */
     std::atomic<int64_t> lend[18];       /* note_lend_sched [0, 9), 16 and 17, note_lend_engine [9, 16) */
     std::atomic<int64_t> acc[4];         /* note_draft_accept */
@@ -111,6 +118,7 @@ struct State {
     std::atomic<int64_t> cap[kCapCounts];                   /* note_sched_cap (lever CAP48) */
     std::atomic<int64_t> cbh[kCbhCounts];                   /* note_sched_cbh (lever CBH) */
     std::atomic<int64_t> rco[3];                            /* note_rco (lever RCO): recordings, copies, freed */
+    std::atomic<int64_t> tg[kTailGridCounts];               /* note_sched_tail_grid (lever G) */
     std::atomic<int> stage_capable{-1}, hb_capable{-1};     /* lever SA / HB: -1 no engine registered, 0 / 1 */
     std::atomic<int64_t> sahb[kSahbRanks][kSahbN];          /* note_sahb */
     std::atomic<int> sahb_ranks{0};
@@ -136,6 +144,7 @@ struct State {
             pend[i] = false;
         }
         for (auto& c : cnt) c.store(0, std::memory_order_relaxed);
+        for (auto& c : dcap) c.store(0, std::memory_order_relaxed);
         for (auto& c : lend) c.store(0, std::memory_order_relaxed);
         for (auto& c : acc) c.store(0, std::memory_order_relaxed);
         for (auto& c : ctxs) c.store(0, std::memory_order_relaxed);
@@ -145,6 +154,7 @@ struct State {
         for (auto& c : cap) c.store(0, std::memory_order_relaxed);
         for (auto& c : cbh) c.store(0, std::memory_order_relaxed);
         for (auto& c : rco) c.store(0, std::memory_order_relaxed);
+        for (auto& c : tg) c.store(0, std::memory_order_relaxed);
         for (auto& r : sahb)
             for (auto& c : r) c.store(0, std::memory_order_relaxed);
         for (auto& r : sp)
@@ -201,6 +211,7 @@ void find_hooks(State& s) {
             k.rfuse_stats = sym<int (*)(long long*, int)>(h, "rad_rfuse_stats");
             k.fuse_stats = sym<int (*)(long long*, int)>(h, "rad_fuse_stats");
             k.wmk_stats = sym<int (*)(long long*, int)>(h, "rad_wmk_stats");
+            k.host_pools = sym<int (*)(int, int, const unsigned long long*, const unsigned long long*)>(h, "rad_host_pool_ranges");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -282,6 +293,16 @@ int env_rco() {
     return env;
 }
 
+/* Lever G (ds41-tailgrid): RADIANCE_SCHED_TAIL_GRID=256 / 512 / 1024 / 2048 at start (anything else, or unset, is 0). */
+int env_tail_grid() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_SCHED_TAIL_GRID");
+        const long v = e && *e ? std::strtol(e, nullptr, 10) : 0;
+        return tail_grid_ok((int)v) ? (int)v : 0;
+    }();
+    return env;
+}
+
 /* The reported value of switch i. Under s.mu. */
 int reported(State& s, int i) {
     if (plugin_switch(i)) return plugin_value(s, i);
@@ -292,6 +313,10 @@ int reported(State& s, int i) {
     if (i == kRouteCopyOv) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_rco();
+    }
+    if (i == kSchedTailGrid) {     /* lever G: set, else RADIANCE_SCHED_TAIL_GRID (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_tail_grid();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -337,7 +362,8 @@ bool sched_switch(int i) {
            i == kDraftCtxSkip || i == kDraftLendHyst || i == kArenaD0 || i == kDraftLendW ||
            i == kDraftOcc || i == kDraftOccK || i == kPlaceLf || i == kDs41PskK || i == kStageShort ||
            i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick ||
-           i == kPlaceSwapLent || i == kHeatMinGainX100 || i == kHeatHystX100;   /* ds41-swl: the engine's, as place_lf */
+           i == kPlaceSwapLent || i == kHeatMinGainX100 || i == kHeatHystX100 ||   /* ds41-swl: the engine's, as place_lf */
+           i == kDraftDcap || i == kDraftDcapN;   /* SPB */
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -403,6 +429,14 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused) {
     s.dst[0].store(bypassed, std::memory_order_relaxed);
     s.dst[1].store(bypass_refused, std::memory_order_relaxed);
 }
+int sched_tail_grid() {
+    const int v = st().val[kSchedTailGrid].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_tail_grid();
+}
+void note_sched_tail_grid(const int64_t* v) {
+    State& s = st();
+    for (int k = 0; k < kTailGridCounts; ++k) s.tg[k].store(v[k], std::memory_order_relaxed);
+}
 int sched_noa() {
     const int v = st().val[kSchedNoa].load(std::memory_order_acquire);
     return v > 0 ? v : 0;
@@ -460,6 +494,12 @@ void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_l
     State& s = st();
     const int64_t v[8] = { zero, probe, moves, hyb_lookup, hyb_head, hyb_unahead, occ_cycles, occ_moves };
     for (int k = 0; k < 8; ++k) s.cnt[k].store(v[k], std::memory_order_relaxed);
+}
+
+void note_draft_dcap(int64_t cycles, int64_t moves) {   /* SPB */
+    State& s = st();
+    s.dcap[0].store(cycles, std::memory_order_relaxed);
+    s.dcap[1].store(moves, std::memory_order_relaxed);
 }
 
 void lend_register(bool capable) { st().lend_capable.store(capable ? 1 : 0, std::memory_order_release); }
@@ -569,6 +609,18 @@ void note_psk_engine(int64_t planned, int64_t ended_early, int64_t stager_skippe
 }
 void psk_engine(int64_t out[3]) {
     for (int i = 0; i < 3; ++i) out[i] = g_psk_eng[i].load(std::memory_order_relaxed);
+}
+int host_pools(int rank, int n, const uint64_t* lo, const uint64_t* hi) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    unsigned long long l[16] = {}, h[16] = {};
+    const int m = n < 0 ? 0 : n > 16 ? 16 : n;
+    for (int i = 0; i < m; ++i) l[i] = (unsigned long long)lo[i], h[i] = (unsigned long long)hi[i];
+    int took = 0;
+    for (const Hooks& k : s.hooks)
+        if (k.host_pools && k.host_pools(rank, m, l, h) >= 0) ++took;
+    return took;
 }
 int psk_stats(int64_t out[kPskStats]) {
     for (int i = 0; i < kPskStats; ++i) out[i] = 0;
@@ -767,7 +819,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -798,6 +850,25 @@ bool check(const std::string& name, int v, std::string* err) {
         if (v > 0 && cap != 1) {
             if (err)
                 *err = std::string("draft_probe_backoff=") + std::to_string(v) + " refused: " +
+                       (cap < 0 ? "no scheduler has registered a drafter"
+                                : "this deployment's drafter cannot run the adaptive window");
+            return false;
+        }
+        return true;
+    }
+    if (i == kDraftDcap || i == kDraftDcapN) {   /* SPB */
+        if (i == kDraftDcap && (v < 0 || v > 64)) {
+            if (err) *err = "draft_dcap takes 0 (off) .. 64 (the most head depth from draft_dcap_n decode rows)";
+            return false;
+        }
+        if (i == kDraftDcapN && (v < 1 || v > 64)) {
+            if (err) *err = "draft_dcap_n takes 1 .. 64 (decode rows from which draft_dcap holds)";
+            return false;
+        }
+        const int cap = s.draft_capable.load(std::memory_order_acquire);
+        if (i == kDraftDcap && v > 0 && cap != 1) {
+            if (err)
+                *err = std::string("draft_dcap=") + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no scheduler has registered a drafter"
                                 : "this deployment's drafter cannot run the adaptive window");
             return false;
@@ -1137,6 +1208,15 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedTailGrid) {     /* lever G (ds41-tailgrid): the scheduler's, latched by a request at its admission */
+        if (!tail_grid_ok(v)) {
+            if (err) *err = "sched_tail_grid takes 0 (off: a prompt's tail snapshot on the resume grid, where its last chunk "
+                            "starts) or 256 / 512 / 1024 / 2048 (the tail snapshot at the deepest multiple of it that leaves "
+                            "the prompt's last piece at least 128 rows, under --prefix-resume exact)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedNoa) {          /* lever NOA */
         const int cap = s.mixed_capable.load(std::memory_order_acquire);
         if (v != 0 && (v < 1 || v > 2 || cap != 1)) {
@@ -1288,7 +1368,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
@@ -1454,6 +1534,15 @@ std::string state_json() {
          ", \"recordings\": " + std::to_string((long long)s.rco[0].load(std::memory_order_relaxed)) +
          ", \"copies\": " + std::to_string((long long)s.rco[1].load(std::memory_order_relaxed)) +
          ", \"freed\": " + std::to_string((long long)s.rco[2].load(std::memory_order_relaxed)) + "}";
+    /* Lever G (ds41-tailgrid): always present; the scheduler's counts since start (0 until it reports a step). */
+    {
+        static const char* const kTg[kTailGridCounts] = { "latched", "tails", "tail_rows", "resumes", "resume_rows_saved",
+                                                           "rejoins", "inert", "declined" };
+        o += ", \"tailgrid\": {\"in_force\": " + std::to_string(reported(s, kSchedTailGrid));
+        for (int k = 0; k < kTailGridCounts; ++k)
+            o += std::string(", \"") + kTg[k] + "\": " + std::to_string((long long)s.tg[k].load(std::memory_order_relaxed));
+        o += "}";
+    }
     /* Lever DL, once a scheduler registered its lend (set up or not). */
     if (const int cap = s.lend_capable.load(std::memory_order_acquire); cap >= 0) {
         static const char* const kLend[18] = { "lent_cycles", "lent_plain_steps", "lent_plain_ms", "lent_probe_steps",
@@ -1525,6 +1614,13 @@ std::string state_json() {
                  std::to_string((long long)s.ctxs[k].load(std::memory_order_relaxed));
         o += "}";
     }
+    /* SPB (draft_dcap): the cap in force, the cycles it bounded the depth choice, the moves down it forced; once a
+     * scheduler registered. */
+    if (s.max_tok.load(std::memory_order_acquire) > 0)
+        o += ", \"dcap\": {\"in_force\": " + std::to_string(reported(s, kDraftDcap)) +
+             ", \"from_rows\": " + std::to_string(reported(s, kDraftDcapN)) +
+             ", \"cycles\": " + std::to_string((long long)s.dcap[0].load(std::memory_order_relaxed)) +
+             ", \"moves\": " + std::to_string((long long)s.dcap[1].load(std::memory_order_relaxed)) + "}";
     o += "}";
     return o;
 }

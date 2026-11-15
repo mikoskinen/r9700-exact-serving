@@ -382,6 +382,20 @@
  *                   the finish kernel's bytes, one launch fewer; not where ds41_mix_wv's wide form acts); 0 the split
  *                   and finish launches (today). RADIANCE_DS41_MIX_FIN=1 at load starts it on. GET "fuse".mixfin_*
  *                   counts its launches (every rank).
+ *   draft_dcap      scheduler (SPB, ds41-etp-spb; 74 here after sched_tail_grid, 73 on ds41-etp-spb; sched/draft.h DraftController::dcap): 0 off
+ *                   (today); D = 1 .. 64: once a cycle plans at least draft_dcap_n decode rows, the adaptive window's head
+ *                   depth is held to at most D -- the choice is made over depths 1 .. D only, and a depth above D in force
+ *                   moves down to that choice at once (no hold); under draft_dcap_n rows the window chooses as before (its
+ *                   hold and hysteresis, so a move back up waits kHold cycles). On the ETP build at 8 sequences the window
+ *                   chose depth 4 in some starts (40 rows, 2.66 ms a token) where depth 3 runs 32 rows at 2.48 ms a token
+ *                   (etp/FOLLOWUP.md STEP 1). Starts 0. Above 0 refused without a drafter that runs the adaptive window.
+ *                   Exact: it moves only which depth a step verifies. GET "dcap": cycles it bounded the choice, moves it
+ *                   forced.
+ *   draft_dcap_n    scheduler (SPB; 75 here, 74 on ds41-etp-spb): the decode rows from which draft_dcap holds, 1 .. 64; starts 8.
+ *   exl3_dng        exl3r4d (SPB-G, ds41-etp-spb-plug; 76 here, 75 on ds41-etp-spb): 0 (today) or 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U)
+ *                   down kernels take that many 128-column blocks a workgroup (ceil(40 / G) x slots workgroups instead of
+ *                   40 x slots), each block the one-block workgroup's code on the same data: every output byte is
+ *                   today's. -1 when no loaded object serves it.
  *   ds41_moe1       deepseek41 (lever P, ds41-p1pass; 72 here after ds41_wmk, 71 on ds41-p1pass): 1 a step that is ONE decode segment of
  *                   17 .. 48 rows runs its MoE as ONE pass -- the router, the shared arm, the gather and the all-reduce
  *                   once, the routed EXL3 experts through moe_exl3_gate_up_dk / moe_exl3_down_dk (the decode kernels over
@@ -403,6 +417,15 @@
  *                   every pass (the epoch), as aql_acq's does. RADIANCE_AQL_ROUTE_OV=1 at start starts it on. GET "rco":
  *                   in_force, and since start the passes recorded under it, the copies tracked and the dispatches after
  *                   one that play unordered (each recording counts once).
+ *   ds41_f32dec     libr4d (lever SPD-F, ds41-etp-spd; 77 here after exl3_dng, 73 on ds41-etp-spd): the decode band's (<= 63 rows) f32
+ *                   projections in wider tile forms -- 1 the router's fused launch (router_gemm_f32_scored_topk_scatter) and
+ *                   gemm_nt_f32 (the compressor's kv | gate), 2 the router only, 3 gemm_nt_f32 only; 0 the stock rule (today).
+ *                   Every form keeps each output's stock arithmetic: the same bytes. RADIANCE_DS41_F32DEC at load.
+ *   exl3_xr         exl3r4d (lever XR, ds41-etp-xr, 73 there; SPEED-C order 3, ds41-etp-spc-plug; 78 here after ds41_f32dec):
+ *                   gate_up's map form: the order of a chunk's groups -- 0 longest first (today), 1 VRAM-read first, 2 host-read
+ *                   first, 3 INTERLEAVE (SPEED-C: the host-read entries spread evenly over the chunk; 11 / 19 / 27 over its first
+ *                   3/4 / 1/2 / 1/4); bit 2 XR's ring copy (only with RADIANCE_DS41_XRING). The same entries in another order:
+ *                   the same bytes. Needs the host pools at bringup (host_pools / rad_host_pool_ranges).
  *   ds41_wmk        libr4d (lever WMK, ds41-wmk2; 71 here, after route_copy_ov): 1 every dense GGUF GEMM of <= 48 rows
  *                   (gemm_nt_ggml, logits_gemm_ggml, gemm_nt_ggml_pair as one launch, the K1 folds a / e after their
  *                   producer's own launch) in the part-order WMMA form (gg_wk_kernel: K split into P = 8 / 4 / 2 / 1 parts
@@ -412,6 +435,27 @@
  *                   GPF forms run as before. 0 = today's paths. RADIANCE_DS41_WMK=1 at load starts it on. GET "wmk":
  *                   in_force, launches / rows issued in the form, calls declined to today's path (every rank; recorded
  *                   passes replay without issuing).
+ *   sched_tail_grid scheduler (lever G, ds41-tailgrid; 73 here, after ds41_moe1; Scheduler::tail_checkpoint): 0 off (today:
+ *                   under --prefix-resume exact a prompt's tail snapshot is where its last chunk starts on the resume
+ *                   grid -- every 4096 tokens from 2048 on the DS line -- so a follow-up turn re-prefills up to one grid
+ *                   step of rows the cache already holds); F = 256 / 512 / 1024 / 2048: the tail snapshot of a plain
+ *                   prompt of N tokens is at the deepest multiple of F at or below N - 128, when that lies past the grid
+ *                   point (so the prompt's last chunk is cut there, each part >= 128 rows: the row count above which no
+ *                   kernel form of the line depends on a piece's rows, option D's floor, sched_bi_chunk 3 / 4), and the
+ *                   next turn resumes there: it re-prefills 128 .. 128 + F - 1 old rows instead of 1 .. 4096. The
+ *                   snapshot is a chunk's end like every other (linear state, window and n-gram state as its last row
+ *                   leaves them) and one of lever PSK's targets (its cone is run), so the hit restores what a cold run
+ *                   holds there; from it the request runs to the end of the cold piece that holds it (cut where option D
+ *                   cuts) and goes on on the cold run's grid. A request latches the value at its admission (a change
+ *                   never moves the targets of a prompt in flight); inert (counted) where F is not a multiple of the
+ *                   quantum and a divisor of the interval and the grid, or the resume is not exact. Not on a cone replay,
+ *                   a media / embedding / scored request or a runtime window. RADIANCE_SCHED_TAIL_GRID=F at start.
+ *                   GET "tailgrid": in_force, latched (requests), tails / tail_rows (fine tail snapshots planned and the
+ *                   rows between each and its prompt's end), resumes / resume_rows_saved (hits resumed off the grid and
+ *                   the rows below them the grid point would have re-prefilled), rejoins (plans from an interval
+ *                   boundary off the grid kept inside the cold piece; counted a plan, not a step), inert (admissions
+ *                   where F does not fit the geometry), declined (a fine snapshot within 128 rows of a prompt's end not
+ *                   resumed at, or a request's fine tail dropped beside a shared head's snapshot).
  *   sched_row_cap   scheduler (lever CAP48, ds41-cap48, merged into ds41-int10 after ds41_arcoded: a cap on a step's decode rows): 0 off (today); N = 1 .. 4096 a
  *                   step's decode rows (every decoding sequence's own row + its drafts) are held to N by trimming drafts,
  *                   the deepest proposals first (equal depths: the later sequence in the plan's priority order first),
@@ -555,7 +599,8 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kStageShort, kStagePick, kPlaceHb, kStageFullMin, kStageFullPick, kMhcFuse, kIxLds, kIxNi, kDs41Arcoded,
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
-              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSwitches };
+              kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
+              kExl3Xr, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -586,6 +631,8 @@ void note_sched(int i, int value);
  * the drafting depth, hybrid proposals taken from the lookup and left to the head, steps not issued ahead for it. */
 void note_draft_counts(int64_t zero, int64_t probe, int64_t moves, int64_t hyb_lookup, int64_t hyb_head,
                        int64_t hyb_unahead, int64_t occ_cycles = 0, int64_t occ_moves = 0);
+/* SPB (draft_dcap): the cycles whose depth choice the cap bounded, and the moves down it forced (GET "dcap"). */
+void note_draft_dcap(int64_t cycles, int64_t moves);
 /* Lever DL. The scheduler, once the engine set the lend up: whether a slab can be lent (draft_lend=1 is
  * refused otherwise). */
 void lend_register(bool capable);
@@ -640,6 +687,13 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused);
  * (admissions and running prefills) and their rows, chunks it displaced, prefills that did not fit even so, steps that
  * carried a NOA piece, and the steps with prefill rows by how many prefill entries they carried (1, 2, 3, 4 or more). */
 int  sched_noa();
+/* Lever G (ds41-tailgrid, sched_tail_grid): the switch once set, else RADIANCE_SCHED_TAIL_GRID at start (0 = off). The
+ * scheduler reads it when it admits a request (Request::tail_grid) and reports its counts every step (GET "tailgrid",
+ * kTailGridCounts values: latched, tails, tail_rows, resumes, resume_rows_saved, rejoins, inert, declined). */
+static constexpr int kTailGridCounts = 8;
+inline bool tail_grid_ok(int v) { return v == 0 || v == 256 || v == 512 || v == 1024 || v == 2048; }
+int  sched_tail_grid();
+void note_sched_tail_grid(const int64_t* v);
 static constexpr int kNoaCounts = 10;   /* admitted, pieces, rows, displaced, waited, steps, pf_steps_1 .. 4plus */
 void note_sched_noa(const int64_t* v);
 /* Lever CAP48 (sched_row_cap): the switch once set, else RADIANCE_DECODE_ROW_CAP (0 .. 4096) at start, else 0 (off). The
@@ -658,6 +712,10 @@ int  sched_cb_hold_k();
 static constexpr int kCbhCounts = 10;   /* holds, by_k, by_timeout, by_idle, by_other, hold_ms, held_steps, cob_steps,
                                           cob_newcomers, single_steps */
 void note_sched_cbh(const int64_t* v);
+/* Lever XR (ds41-etp-xr): hand rank `rank`'s pinned host pools ([lo, hi) as its card addresses them, Mover::pool_ranges)
+ * to every loaded plugin that takes them (rad_host_pool_ranges; exl3r4d's gate_up map form tests its experts' codes
+ * against them). Call with the rank's card current. Returns the plugins that took them. */
+int  host_pools(int rank, int n, const uint64_t* lo, const uint64_t* hi);
 /* Lever PSK design 2: hand the scheduler's plan for trunk pass `step` to the plugin that cuts by it (rad_psk_plan, every
  * rank thread parked): per prefill sequence `ahead` and chunk rows, and the step's decode rows. Returns the first layer
  * the pass issues nothing from (the plugin's n_layer when every layer runs), -1 when no plugin takes a plan. */

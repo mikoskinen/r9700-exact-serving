@@ -154,6 +154,9 @@ struct MoeFP8 {
          * routing weight scales each partial and the all-reduce sums them. Rounding differs (two
          * partial sums), so this is checked by agreement, not bytes. */
         int64_t ff_lo[2] = { 0, 0 }, ff_hi[2] = { 0, 0 };
+        /* Lever XR (DeepSeek-V4.1 ds41-etp-xr, with the ETP slices above): MiB of copy ring the EXL3 gate_up declares in
+         * its prefill scratch (interface v10's `xring`); 0 declares none (today's op). */
+        int64_t exl3_xring = 0;
         /* Or by number mod 4 when four ranks split each expert: expert e's columns
          * [ff_lo4[e % 4], ff_hi4[e % 4]), served by `moe_gemm_q_mod4`, taking precedence over the
          * parity slices. hi 0 offers none.
@@ -2156,13 +2159,23 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
  * (one row per token), writes f16 h already rotated for down (h_rot 1, with down's suh run as its dn_suh
  * table), applies silu(gate) * up with the model's swiglu_limit (interface v8 `limit`); down reads h in the
  * scatter's order and writes the bf16 `edn` rows the gather sums. The prefill stager keys a layer on its first
- * declared expert op: gate_up, declared first. */
+ * declared expert op: gate_up, declared first.
+ *
+ * Expert tensor parallel (DeepSeek-V4.1's lever 1U-ETP, ds41-etp): with Config::ff_lo / ff_hi set and every expert on
+ * every rank (n_expert == n_expert_all, more than one rank), each rank holds class q's slice [ff_lo[q], ff_hi[q]) of
+ * every expert of that parity: gate_up's gate rows and the same up rows of it (RAD_SHARD_ROW over the two stacked
+ * halves, with svh), down's K columns of it (RAD_SHARD_COL, with its suh); gate_up's suh / suh.1 and down's svh stay
+ * whole. The core cuts the canonical planes on load (core/format/share.cpp: whole 128-column blocks fall on whole
+ * bytes at every K, half-integer K's pair symbols too); the ops take the two classes' widths as N / N_odd (gate_up)
+ * and K / K_odd (down), the form the decode, lever P and prefill rows all serve. h is the widest class's width. */
 inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     const int64_t ne = c.n_expert;
     const bool ep = c.n_expert != c.n_expert_all;
-    if (c.ff_hi[0] > 0 || c.ff_hi4[0] > 0 || (!ep && g.world > 1)) {
+    const bool etp = c.ff_hi[0] > 0;
+    if (c.ff_hi4[0] > 0 || (etp && (ep || g.world < 2)) || (!etp && !ep && g.world > 1)) {
         fprintf(stderr, "radiance: layer %d's EXL3 experts are served whole on their rank (expert parallel, or "
-                        "one rank); this configuration slices every expert\n", l);
+                        "one rank) or as a parity-class width slice of every expert on every rank (expert tensor "
+                        "parallel); this configuration is neither\n", l);
         return RAD_E_UNSUPPORTED;
     }
     if (!prot.empty() || c.calib || c.expert_rot || c.expert_w4) {
@@ -2182,32 +2195,59 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     }
     if (g.n_embd % EXL3_HAD || c.n_ff_exp % EXL3_HAD || (2 * c.n_ff_exp) % 256) return RAD_E_SHAPE;
     const int64_t half = ne / 2, D = g.n_embd, F = c.n_ff_exp;
+    /* each class's width and (expert tensor parallel) its span in the model's intermediate columns */
+    int64_t wq[2] = { F, F }, qlo[2] = { 0, 0 }, qhi[2] = { F, F };
+    if (etp)
+        for (int q = 0; q < 2; ++q) {
+            qlo[q] = c.ff_lo[q];
+            qhi[q] = c.ff_hi[q];
+            wq[q] = qhi[q] - qlo[q];
+            if (wq[q] <= 0 || wq[q] > F || wq[q] % EXL3_HAD || qlo[q] % EXL3_HAD || (2 * wq[q]) % 256 ||
+                qlo[q] % x3_cpe[1] || qhi[q] % x3_cpe[1]) {
+                fprintf(stderr, "radiance: layer %d's EXL3 expert slice [%lld, %lld) of class %d is not whole %d-column "
+                                "blocks\n", l, (long long)qlo[q], (long long)qhi[q], q, (int)EXL3_HAD);
+                return RAD_E_SHAPE;
+            }
+        }
+    if (etp && std::max(wq[0], wq[1]) != F) {
+        fprintf(stderr, "radiance: layer %d's EXL3 expert slices are %lld and %lld wide and the block's width is %lld\n", l,
+                (long long)wq[0], (long long)wq[1], (long long)F);
+        return RAD_E_INVAL;
+    }
     static const char* const gu_role[4] = { "codes", "suh", "suh.1", "svh" };
     static const char* const dn_role[3] = { "codes", "suh", "svh" };
     for (int proj = 0; proj < 2; ++proj) {
         const int np = proj == 0 ? 4 : 3;
         const char* stem = proj == 0 ? "ffn_gate_up_exps" : "ffn_down_exps";
-        const int64_t R = proj == 0 ? 2 * F : D, C = proj == 0 ? D : F;
         for (int p = 0; p < np; ++p) {
             const char* role = proj == 0 ? gu_role[p] : dn_role[p];
             const bool codes = p == 0, per_row = std::strcmp(role, "svh") == 0, per_col = !codes && !per_row;
-            const int64_t rows = per_col ? 1 : R;
-            const int64_t cols = per_row ? 1 : codes ? C / x3_cpe[proj] : C;
             std::vector<rad_weight>& run = proj == 0 ? x3_gu[p] : x3_dn[p];
             run.clear();
             run.reserve((size_t)ne);
-            for (int q = 0; q < 2; ++q)
+            for (int q = 0; q < 2; ++q) {
+                const int64_t R = proj == 0 ? 2 * wq[q] : D, C = proj == 0 ? D : wq[q];
+                const int64_t rows = per_col ? 1 : R;
+                const int64_t cols = per_row ? 1 : codes ? C / x3_cpe[proj] : C;
+                /* expert tensor parallel: what this rank takes of the plane (gate_up: rows of both halves; down: K) */
+                const bool cut = etp && (proj == 0 ? !per_col : !per_row);
+                const int shard = !cut ? RAD_SHARD_NONE : proj == 0 ? RAD_SHARD_ROW : RAD_SHARD_COL;
+                const int64_t parts[2] = { wq[q], wq[q] };
+                const int64_t unit = proj == 1 && codes ? x3_cpe[proj] : 1;   /* down's codes: pair symbols at K x.5 */
                 for (int64_t e = q; e < ne; e += 2) {
                     const long long ge = (long long)(c.expert_base + e);
                     const char* weight = nm.f("blk.%d.%s.%lld.weight", l, stem, ge);
                     const rad_weight h =
                         decl_view(b, codes ? weight : nm.f("blk.%d.%s.%lld.%s", l, stem, ge, role),
                                   codes ? nullptr : weight, role, codes ? x3_cdt[proj] : (uint32_t)RAD_F16,
-                                  {rows, cols}, RAD_ACCESS_CONDITIONAL, RAD_SHARD_NONE,
-                                  grp_expert_slot(l, (int)e, proj));
+                                  {rows, cols}, RAD_ACCESS_CONDITIONAL, shard,
+                                  grp_expert_slot(l, (int)e, proj), cut && proj == 0 ? parts : nullptr,
+                                  cut && proj == 0 ? 2 : 0);
                     if (!h) return RAD_E_INVAL;
+                    if (cut) RAD_ARCH_TRY(rad_weight_shard_span(b, h, qlo[q] / unit, qhi[q] / unit));
                     run.push_back(h);
                 }
+            }
         }
     }
     b_x3h = decl_b(b, nm.f("blk.%d.moe_exl3_h", l), RAD_F16, {c.rows * c.top_k, F});
@@ -2222,12 +2262,22 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
             }
     };
     tables(true);
-    std::vector<RadParam> gp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * F), RAD_INT("K", D),
+    std::vector<RadParam> gp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", 2 * wq[0]), RAD_INT("K", D),
                                  RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                  RAD_STR("dtype", x3_dtype[0]), RAD_STR("codebook", x3_cb[0]),
-                                 RAD_INT("N_odd", 2 * F), RAD_INT("K_odd", D), RAD_INT("h_rot", 1),
+                                 RAD_INT("N_odd", 2 * wq[1]), RAD_INT("K_odd", D), RAD_INT("h_rot", 1),
                                  RAD_INT("a_rot", 0) };
     if (c.swiglu_limit > 0) gp.push_back(RAD_F64("limit", c.swiglu_limit));
+    /* Expert tensor parallel: interface v9's `bi` -- the decode band's gate_up takes one form at every token count. A slice
+     * is narrow enough (640 columns: 5 blocks x 6 or 12 rows at 1 / 2 tokens) that exl3r4d's few-token rule would sum
+     * those launches in split-K 2's order and larger ones in split-K 1's, so a decode row's bytes would depend on how
+     * many tokens its step carries (measured: 9 of 20 probes at 8 concurrent differed from alone without it). The whole
+     * expert never takes that form (18 blocks x 6 rows > the 64 units that fit), so expert parallel needs nothing. */
+    if (etp) gp.push_back(RAD_INT("bi", 1));
+    /* Lever XR (interface v10's `xring`, expert tensor parallel only): the MiB of ring the prefill form's scratch keeps
+     * for copying host-pool experts' codes onto the card inside the launch (exl3r4d, fn4 exl3_xr). The same bytes are
+     * read either way; absent, the op is today's. */
+    if (etp && c.exl3_xring > 0) gp.push_back(RAD_INT("xring", c.exl3_xring));
     op_gu = rw(b, rad_decl_op(b, "moe_exl3_gate_up", gp.data(), (int)gp.size(), tab.data(), (int)tab.size()),
                {w.h.x, w.sorted, w.eoff}, {b_x3h});
     /* Lever P (Config::exl3_dk_rows): the decode-band-bytes pair over 17 .. dk tokens, on the same tables and buffers.
@@ -2245,10 +2295,10 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
         if (op_gu_dk) rw(b, op_gu_dk, {w.h.x, w.sorted, w.eoff}, {b_x3h});
     }
     tables(false);
-    std::vector<RadParam> dp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", D), RAD_INT("K", F),
+    std::vector<RadParam> dp = { RAD_RANGE("M", 1, c.rows), RAD_INT("N", D), RAD_INT("K", wq[0]),
                                  RAD_INT("n_expert", ne), RAD_INT("top_k", c.top_k),
                                  RAD_STR("dtype", x3_dtype[1]), RAD_STR("codebook", x3_cb[1]),
-                                 RAD_INT("N_odd", D), RAD_INT("K_odd", F), RAD_INT("h_rot", 1) };
+                                 RAD_INT("N_odd", D), RAD_INT("K_odd", wq[1]), RAD_INT("h_rot", 1) };
     if (dk_decl && op_gu_dk) {
         std::vector<RadParam> dq = dp;
         dq[0] = RAD_RANGE("M", 17, dk);
@@ -2259,8 +2309,14 @@ inline int MoeFP8::declare_exl3(RadBuilder* b, Names& nm, int l) {
     op_dn = rw(b, rad_decl_op(b, "moe_exl3_down", dp.data(), (int)dp.size(), tab.data(), (int)tab.size()),
                {b_x3h, w.sorted, w.eoff}, {w.edn});
     if (!op_gu || !op_dn) return RAD_E_INVAL;
-    rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank, swiglu limit %g", l,
-             x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, c.swiglu_limit);
+    if (etp)
+        rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), all %lld a rank as slices [%lld, %lld) even / [%lld, %lld) "
+                    "odd of %lld (expert tensor parallel), swiglu limit %g", l, x3_dtype[0], x3_dtype[1], x3_cb[0],
+                 (long long)ne, (long long)qlo[0], (long long)qhi[0], (long long)qlo[1], (long long)qhi[1],
+                 (long long)c.n_ff_exp, c.swiglu_limit);
+    else
+        rad_note(b, "layer %d: EXL3 experts gate_up %s / down %s (%s), %lld a rank, swiglu limit %g", l,
+                 x3_dtype[0], x3_dtype[1], x3_cb[0], (long long)ne, c.swiglu_limit);
     return RAD_OK;
 }
 

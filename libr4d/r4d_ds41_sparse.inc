@@ -26,6 +26,56 @@ static const RadOperandSpec oDs41AttnSparseSinkRt[] = {
     { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
     { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "cos_sin", RAD_OPD_IN, 0 },
 };
+/* Levers DKV-U / DKV-G (RADIANCE_DS41_LATUNPACK / RADIANCE_DS41_LATGATHER; device-only, no libref schema): the packed
+ * latent's entries unpacked (latent_unpack: the plan's rows of a pass; latent_gather: a decode-band pass's selections),
+ * and the two attentions with the rows they read appended. */
+/* the unpacked attentions' parameters: attn_sparse_sink's (resp. the fold's), then plan_full (optional; 1: the caller knows
+ * the plan holds every entry the pass may select -- the LDS-free form, the plain form's occupancy; any value gives the
+ * same output) */
+static const RadParamSpec pDs41AttnSparseSinkLu[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format"), P_INTO("plan_full") };
+static const RadParamSpec pDs41AttnSparseSinkRtLu[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"), P_STRO("latent_format"),
+    P_STRO("window_format"), P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_INT("block"),
+    P_STR("format"), P_STR("block_scale"), P_INTO("plan_full") };
+static const RadParamSpec pDs41LatUnpack[] = { P_INT("M"), P_INT("dim"), P_INT("ratio"), P_STR("latent_format") };
+static const RadOperandSpec oDs41LatUnpack[] = {
+    { "comp_cache", RAD_OPD_IN, 0 }, { "comp_bt", RAD_OPD_IN, 0 }, { "positions", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "unpacked", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pDs41LatGather[] = { P_INT("M"), P_INT("dim"), P_INT("ratio"), P_INT("topk"),
+    P_STR("latent_format") };
+static const RadOperandSpec oDs41LatGather[] = {
+    { "comp_cache", RAD_OPD_IN, 0 }, { "comp_bt", RAD_OPD_IN, 0 }, { "sel", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "gathered", RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oDs41AttnSparseSinkLu[] = {
+    { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
+    { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
+    { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "unpacked", RAD_OPD_IN, 0 },
+};
+static const RadOperandSpec oDs41AttnSparseSinkRtLu[] = {
+    { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
+    { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
+    { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "cos_sin", RAD_OPD_IN, 0 },
+    { "unpacked", RAD_OPD_IN, 0 },
+};
+static const RadOperandSpec oDs41AttnSparseSinkGth[] = {
+    { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
+    { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
+    { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "gathered", RAD_OPD_IN, 0 },
+};
+static const RadOperandSpec oDs41AttnSparseSinkRtGth[] = {
+    { "q", RAD_OPD_IN, 0 },         { "window_cache", RAD_OPD_IN, 0 }, { "window_bt", RAD_OPD_IN, 0 },
+    { "window_used", RAD_OPD_IN, 0 }, { "comp_cache", RAD_OPD_IN, 1 }, { "comp_bt", RAD_OPD_IN, 1 },
+    { "sel", RAD_OPD_IN, 1 },       { "positions", RAD_OPD_IN, 0 },  { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "sinks", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },       { "cos_sin", RAD_OPD_IN, 0 },
+    { "gathered", RAD_OPD_IN, 0 },
+};
 static const RadParamSpec pDs41IndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
     P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
     P_INTO("block"), P_STRO("key_format") };
@@ -74,6 +124,39 @@ static const RadConstraint cDs41IndexTopk[] = {
     C_GE("M", 1), C_GE("width", 1), C_LE("width", 1073741823), C_GE("topk", 1),
     C_LE("topk", 1073741823), C_GE("ratio", 1),
 };
+/* Levers DKV-U / DKV-G: the packed 512-wide latent (ratio dividing its 144 slots); the gathered attentions are the
+ * decode band's (<= 48 rows), the unpacked ones any height (the plan serves the WMMA form's). */
+static const RadConstraint cDs41LatUnpack[] = {
+    C_GE("M", 1), C_EQ("dim", 512), C_GE("ratio", 1), C_LE("ratio", 64), C_IN("latent_format", "nvfp4"),
+};
+static const RadConstraint cDs41LatGather[] = {
+    C_GE("M", 1), C_LE("M", 48), C_EQ("dim", 512), C_GE("ratio", 1), C_LE("ratio", 64), C_GE("topk", 1),
+    C_LE("topk", 2048), C_IN("latent_format", "nvfp4"),
+};
+static const RadConstraint cDs41AttnSparseSinkLu[] = {
+    C_GE("M", 1),       C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_GE("ratio", 1),   C_LE("ratio", 64), C_GE("topk", 1),  C_LE("topk", 2048),
+    C_IN("dtype", "bf16"), C_IN("latent_format", "nvfp4"),
+};
+static const RadConstraint cDs41AttnSparseSinkRtLu[] = {
+    C_GE("M", 1),       C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_GE("ratio", 1),   C_LE("ratio", 64), C_GE("topk", 1),  C_LE("topk", 2048),
+    C_IN("dtype", "bf16"), C_IN("latent_format", "nvfp4"), C_GE("rot", 2), C_DIV("rot", 2), C_GE("off", 0),
+    C_GE("inverse", 0), C_LE("inverse", 1), C_IN("mode", "gptj neox"), C_GE("block", 1),
+    C_IN("format", "fp8_e4m3 fp4_e2m1"), C_IN("block_scale", "ue8m0 e4m3 f32"),
+};
+static const RadConstraint cDs41AttnSparseSinkGth[] = {
+    C_GE("M", 1),       C_LE("M", 48),    C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_GE("ratio", 1),   C_LE("ratio", 64), C_GE("topk", 1),  C_LE("topk", 2048),
+    C_IN("dtype", "bf16"), C_IN("latent_format", "nvfp4"),
+};
+static const RadConstraint cDs41AttnSparseSinkRtGth[] = {
+    C_GE("M", 1),       C_LE("M", 48),    C_GE("heads", 1), C_EQ("dim", 512), C_GE("window", 1), C_LE("window", 1024),
+    C_GE("ratio", 1),   C_LE("ratio", 64), C_GE("topk", 1),  C_LE("topk", 2048),
+    C_IN("dtype", "bf16"), C_IN("latent_format", "nvfp4"), C_GE("rot", 2), C_DIV("rot", 2), C_GE("off", 0),
+    C_GE("inverse", 0), C_LE("inverse", 1), C_IN("mode", "gptj neox"), C_GE("block", 1),
+    C_IN("format", "fp8_e4m3 fp4_e2m1"), C_IN("block_scale", "ue8m0 e4m3 f32"),
+};
 
 #elif defined(R4D_DS41_SCHEMAS)
 
@@ -116,6 +199,31 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
        "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given "
        "(index_candidates' bits over blocks of `block`), never -inf, ties to the lower position, in "
        "ascending order, then -1."),
+SCHEMA("latent_unpack", pDs41LatUnpack, oDs41LatUnpack,
+       "The packed compressed cache's entries a pass may select (latent_format nvfp4, dim 512): for each sequence s "
+       "in cu order, entries [n_s - t_s, n_s) where n_s = (pos(last row of s) + 1) / ratio (at most the block "
+       "table's reach) and t_s = min(n_s, what the earlier sequences left of the operand's rows x (width / dim) "
+       "entries), unpacked to bf16 at consecutive dim-wide rows of `unpacked`; an unmapped entry's row is not "
+       "written. A pass of more than 256 sequences writes nothing. Lever DKV-U (device-only)."),
+SCHEMA("latent_gather", pDs41LatGather, oDs41LatGather,
+       "Each row's selection j that attn_sparse_sink's key setup finds in the packed compressed cache (latent_format "
+       "nvfp4, dim 512; comp_cache / comp_bt / cu_seqlens as that op's) unpacked to bf16 at gathered[row][j dim .. "
+       "j dim + dim); the other selections' rows are not written. Lever DKV-G (device-only)."),
+SCHEMA("attn_sparse_sink_unpacked", pDs41AttnSparseSinkLu, oDs41AttnSparseSinkLu,
+       "attn_sparse_sink (operands q .. out, its parameters; latent_format nvfp4) whose WMMA passes read a selected "
+       "entry from `unpacked` (latent_unpack's rows for the same cache, block table, positions' last rows and "
+       "cu_seqlens) where its 16-key tile is held there: the same out. plan_full 1: the caller knows the plan holds every "
+       "entry the pass may select (the LDS-free form; any value the same out). Lever DKV-U (device-only)."),
+SCHEMA("attn_sparse_sink_rope_roundtrip_unpacked", pDs41AttnSparseSinkRtLu, oDs41AttnSparseSinkRtLu,
+       "attn_sparse_sink_rope_roundtrip (operands q .. cos_sin, its parameters) with the attention's WMMA passes "
+       "reading `unpacked` as attn_sparse_sink_unpacked: the same out. Lever DKV-U (device-only)."),
+SCHEMA("attn_sparse_sink_gathered", pDs41AttnSparseSink, oDs41AttnSparseSinkGth,
+       "attn_sparse_sink (operands q .. out, its parameters; latent_format nvfp4) whose decode-band pass reads the "
+       "selected entries from `gathered` (latent_gather's rows for the same sel, cache, block table and "
+       "cu_seqlens) instead of unpacking the cache: the same out. Lever DKV-G (device-only)."),
+SCHEMA("attn_sparse_sink_rope_roundtrip_gathered", pDs41AttnSparseSinkRt, oDs41AttnSparseSinkRtGth,
+       "attn_sparse_sink_rope_roundtrip (operands q .. cos_sin, its parameters) with the selected entries read from "
+       "`gathered`, as attn_sparse_sink_gathered: the same out. Lever DKV-G (device-only)."),
 
 #elif defined(R4D_DS41_ROWS)
 
@@ -165,5 +273,52 @@ SCHEMA("index_topk", pDs41IndexTopk, oDs41IndexTopk,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41IndexTopk), NOTUNE,
   nullptr, nullptr, r4d_rad_ds41_index_topk, r4d_rad_ds41_index_topk_scratch, nullptr, nullptr,
   r4d_shape_index_topk },
+{ "ds41_latent_unpack_d512", "latent_unpack", "attn",
+  "the packed latent's entries a pass may select, unpacked once into the plan's rows (lever DKV-U): a wave an "
+  "entry, lane L its block L (lever NVG's gather expressions), grid stride",
+  "dim 512 nvfp4, ratio <= 64, <= 256 sequences a pass",
+  "packed bf16-slot cache; i32 tables, positions, cu_seqlens; bf16 unpacked",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41LatUnpack), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_latent_unpack, nullptr, nullptr, nullptr,
+  r4d_shape_latent_unpack },
+{ "ds41_latent_gather_d512", "latent_gather", "attn",
+  "a decode-band pass's selected packed entries unpacked once (lever DKV-G): lever NVG's gather kernel as an op",
+  "dim 512 nvfp4, <= 48 rows, topk <= 2048; a wave an entry, lane L its block L",
+  "packed bf16-slot cache; i32 tables, selections, cu_seqlens; bf16 gathered",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41LatGather), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_latent_gather, nullptr, nullptr, nullptr,
+  r4d_shape_latent_gather },
+{ "ds41_attn_sparse_sink_unpacked_d512_bf16", "attn_sparse_sink_unpacked", "attn",
+  "attn_sparse_sink over the packed latent whose WMMA passes read the latent_unpack plan's rows as plain bf16 tiles "
+  "(a tile with an entry the plan lacks unpacks itself, by the v3 decode); the decode band as attn_sparse_sink",
+  "attn_sparse_sink's, latent_format nvfp4; <= 256 sequences a pass for the plan",
+  "bf16 q, caches, unpacked and out; f32 sinks; i32 tables, positions, selections",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSinkLu), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_unpacked, r4d_rad_ds41_attn_sparse_sink_scratch, nullptr, nullptr,
+  r4d_shape_attn_sparse_sink_unpacked },
+{ "ds41_attn_sparse_sink_rope_rt_unpacked_d512_bf16", "attn_sparse_sink_rope_roundtrip_unpacked", "attn",
+  "attn_sparse_sink_rope_roundtrip whose taller passes' attention reads the latent_unpack plan's rows as "
+  "attn_sparse_sink_unpacked, then rope_rows_roundtrip's launch; the decode band as the fold",
+  "attn_sparse_sink_rope_roundtrip's, latent_format nvfp4",
+  "bf16 q, caches, unpacked and out; f32 sinks and cos_sin; i32 tables, positions, selections",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSinkRtLu), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_unpacked, r4d_rad_ds41_attn_sparse_sink_scratch,
+  nullptr, nullptr, r4d_shape_attn_sparse_sink_rope_roundtrip_unpacked },
+{ "ds41_attn_sparse_sink_gathered_d512_bf16", "attn_sparse_sink_gathered", "attn",
+  "attn_sparse_sink over the packed latent with its selections already unpacked (latent_gather): the decode band's "
+  "plain kernel over the gathered rows, no gather launch; libref's bits as attn_sparse_sink's",
+  "attn_sparse_sink's decode band (<= 48 rows), latent_format nvfp4",
+  "bf16 q, caches, gathered and out; f32 sinks; i32 tables, positions, selections",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSinkGth), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_gathered, r4d_rad_ds41_attn_sparse_sink_scratch, nullptr, nullptr,
+  r4d_shape_attn_sparse_sink_gathered },
+{ "ds41_attn_sparse_sink_rope_rt_gathered_d512_bf16", "attn_sparse_sink_rope_roundtrip_gathered", "attn",
+  "attn_sparse_sink_rope_roundtrip over the packed latent with its selections already unpacked (latent_gather): the "
+  "decode band's plain kernel with the fused epilogue over the gathered rows, no gather launch",
+  "attn_sparse_sink_rope_roundtrip's decode band (<= 48 rows), latent_format nvfp4",
+  "bf16 q, caches, gathered and out; f32 sinks and cos_sin; i32 tables, positions, selections",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDs41AttnSparseSinkRtGth), NOTUNE,
+  nullptr, nullptr, r4d_rad_ds41_attn_sparse_sink_rope_roundtrip_gathered, r4d_rad_ds41_attn_sparse_sink_scratch,
+  nullptr, nullptr, r4d_shape_attn_sparse_sink_rope_roundtrip_gathered },
 
 #endif
