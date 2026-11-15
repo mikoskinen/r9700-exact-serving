@@ -1,5 +1,9 @@
 # DeepSeek V4.1 Flash and Qwen Flash-Next (EXL3) on 4x AMD Radeon AI PRO R9700
 
+This repository is written mainly for AI coding agents to read. A person gets the overview from this
+README. The detailed notes, the test history and the engine branches are long, and they are meant to
+be handed to an agent that is setting up or tuning a similar system.
+
 Update 15.11.2026: DeepSeek splits every routed expert across the four cards and keeps 4.2 full
 1M-token sessions in its KV cache, and Qwen gives identical answers under load up to 32 concurrent
 requests, long prompts included.
