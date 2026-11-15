@@ -671,7 +671,18 @@ int Ctx::xpf_plan(const RadPrefetchNext* nx, const void* logits, int64_t rows, i
     x.want_layer = layer;
     x.want_g = g;
     x.want_seq = seq;
-    ++x.plans;
+    /* every 2048 plans: the counters the last snapshot brought (one window late), then the next snapshot, behind the plan */
+    if (++x.plans % 2048 == 0) {
+        XpfStats h;
+        std::memcpy(&h, (const void*)x.stats_h, sizeof h);
+        if (x.plans > 2048)
+            RAD_INFO("rank %d: lever XPF: %u plans, %u copies planned of %u candidates, %u landed in time (%.1f%%), %u of "
+                     "those routed (%.1f%%); %lld DMA lists, %lld plans dropped behind the queue, %lld late mailboxes", rank_,
+                     h.plans, h.planned, h.cands, h.patched, h.planned ? 100.0 * h.patched / h.planned : 0.0, h.used,
+                     h.patched ? 100.0 * h.used / h.patched : 0.0, (long long)x.lists.load(), (long long)x.dropped.load(),
+                     (long long)x.late.load());
+        (void)rad_memcpy_async(x.stats_h, x.stats, sizeof(XpfStats), cs);
+    }
     return RAD_OK;
 }
 
