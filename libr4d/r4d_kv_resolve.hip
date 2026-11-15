@@ -65,6 +65,10 @@
 namespace {
 
 constexpr int kThreads = 1024;
+/* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md): the free list is built when more slots than this are occupied (below it the
+ * serial scan skips little); CLOCK runs in rotations (4b) when kVicClock. */
+constexpr int kVicListMin = 256;
+constexpr bool kVicClock = true;
 
 /* A 16-byte vector as a builtin type: `uint4` copies through a memcpy call, which keeps a load and
  * its store adjacent, and the miss copy needs its four loads issued first (step 6). */
@@ -136,6 +140,46 @@ __device__ __forceinline__ void kv_sort_claims(int* list, int n, int tid) {
     }
 }
 
+
+/* fn4 kvs_vic: an order-keeping compaction of the ring in the hand's rotated order -- slot q = (h0 + r) mod slots for
+ * r = 0 .. slots-1 -- of the slots `pred` accepts, into out[0 .. cap); returns how many it accepts (all of them, also
+ * past cap), the same in every thread. Thread t owns the rotated positions [t * ch, (t + 1) * ch), so the list keeps the
+ * sweep's order. `pred` must read state nothing writes during the call. s_cnt / s_off: kThreads ints each. */
+template <class P>
+__device__ __forceinline__ int kv_compact_rot(int h0, int slots, int* out, int cap, int tid, int* s_cnt, int* s_off,
+                                              P pred) {
+    const int ch = (slots + kThreads - 1) / kThreads;
+    const long long lo0 = (long long)tid * ch;
+    const int lo = lo0 < slots ? (int)lo0 : slots;
+    const int hi = lo + ch < slots ? lo + ch : slots;
+    int c = 0;
+    for (int r = lo; r < hi; ++r) {
+        int q = h0 + r;
+        if (q >= slots) q -= slots;
+        if (pred(q)) ++c;
+    }
+    s_cnt[tid] = c;
+    s_off[tid] = c;
+    __syncthreads();
+    for (int step = 1; step < kThreads; step <<= 1) {
+        const int v = tid >= step ? s_off[tid - step] : 0;
+        __syncthreads();
+        s_off[tid] += v;
+        __syncthreads();
+    }
+    int pos = s_off[tid] - c;
+    const int total = s_off[kThreads - 1];
+    if (pos < cap) {
+        for (int r = lo; r < hi && pos < cap; ++r) {
+            int q = h0 + r;
+            if (q >= slots) q -= slots;
+            if (pred(q)) out[pos++] = q;
+        }
+    }
+    __syncthreads();
+    return total;
+}
+
 __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     int32_t* __restrict__ sel, const int32_t* __restrict__ nsel,
     int32_t* __restrict__ res, int32_t* __restrict__ slot_block,
@@ -146,6 +190,8 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
 
     __shared__ int s_epoch, s_lookups, s_nmiss, s_distinct, s_placed, s_overflow, s_claims, s_hits;
     __shared__ int s_free;
+    /* fn4 kvs_vic: step 4's hand-off to 4b */
+    __shared__ int s_kc, s_hand, s_vovf, s_vser, s_vavail, s_vheat;
     __shared__ int s_cnt[kThreads], s_off[kThreads];
     /* The claim list, `cap` ids of dynamic LDS (kv_claim_cap), in LDS because the sort reads every
      * element from every thread; the placed miss list stays in the row's scratch. The entry cache
@@ -324,6 +370,9 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     /* Free slots are taken before any resident block is evicted (step 4). One coalesced pass over
      * the slot maps counts them, so a full ring goes straight to CLOCK instead of scanning a turn
      * per miss. A slot this call stamped is not free: it is the call's own. */
+    /* fn4 kvs_vic: every thread's copy of the hand, read before the barrier below (thread 0 rewrites ctl[1]) */
+    int hand0 = ctl[1];
+    if (hand0 < 0 || hand0 >= slots) hand0 = 0;
     if (claims > 0) {
         int nf = 0;
         for (int s = tid; s < slots; s += kThreads)
@@ -332,21 +381,45 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     }
     __syncthreads();
 
+    /* fn4 kvs_vic (16.11.2026, qwen/KV-STREAM-EXACT.md): the victims of step 4 without thread 0
+     * walking the ring. Thread 0 alone scanned for a free slot (skipping every occupied one) and swept
+     * CLOCK one slot at a time, a global load or two a slot: a ring that is kept warm (fn4 kvs_apart)
+     * and fills paid hundreds of serial loads a miss. Here the same victims, in the same order, come
+     * out of order-keeping compactions of the ring in the hand's rotated order:
+     *   4a  the free slots after the hand (one list, built when more than kVicListMin slots are
+     *       occupied; below that the serial scan skips little), taken in list order by thread 0, an
+     *       entry stamped or filled meanwhile (an identity placement) skipped -- the scan's choice;
+     *   4b  the misses left when no free slot remains go to CLOCK in at most three rotations, each one
+     *       compaction of the slots a sweep would take on this pass (unstamped, heat 0 or no block);
+     *       a full rotation halves every other unstamped slot's heat, the last one only the slots
+     *       before its last victim -- what the serial sweep halves on its way.
+     * The serial code below stays for what 4b does not model: a call with more claims than slots
+     * (overflow), a heat above 3, an identity placement left at the CLOCK phase (unreachable with
+     * consistent maps: it needs a free unstamped slot), or fewer unstamped slots than misses. */
+    int* const vlist = miss_slot + slots;   /* the row scratch's third part: `slots` slot ids */
+    const int nmiss0 = claims > 0 ? s_nmiss : 0;
+    const bool vlist_on = claims > 0 && !s_overflow && s_free > 0 && slots - s_free > kVicListMin;
+    if (vlist_on) {
+        const int nfree = kv_compact_rot(hand0, slots, vlist, slots, tid, s_cnt, s_off,
+            [&](int q) { return slot_block[q] < 0 && slot_state[(size_t)q * sst_ld] != epoch; });
+        (void)nfree;   /* = s_free: the same predicate over the same state */
+    }
+
     /* ---- 4. one victim per miss: the block's own slot first, else a free slot, else CLOCK ---- */
     /* Identity first: a block whose id fits the ring and whose own slot is free goes there, so a
      * context shorter than the ring has res[b] = b and the attention's run of adjacent ids walks
      * one stripe in order. It never evicts and leaves the hand alone, so the fallback (free slot,
      * then CLOCK) is unchanged. The free scan changes nothing when it finds nothing, and
-     * `free_left` (step 3b) only falls during the call, so a full ring pays the count once. */
+     * `free_left` (step 3b) only falls during the call, so a full ring pays the count once.
+     * kvs_vic: thread 0 stops at the first miss that needs CLOCK (s_kc) when 4b can take the rest. */
     if (tid == 0 && claims > 0) {
-        int hand = ctl[1];
-        /* A hand outside the ring is a state fault libref refuses; start at 0 rather than address
-         * outside it. */
-        if (hand < 0 || hand >= slots) hand = 0;
+        int hand = hand0;
         int placed = 0;
         bool overflow = s_overflow;
         int free_left = s_free;
         const int nmiss = s_nmiss;
+        int fp = 0;
+        int kc = nmiss;
         for (int k = 0; k < nmiss; ++k) {
             const int b = miss_block[k];
             int victim = -1;
@@ -359,17 +432,35 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             }
             /* Free slots first, in CLOCK's hand order; a slot stamped this call is never taken. */
             if (victim < 0 && free_left > 0) {
-                int h = hand;
-                for (int scanned = 0; scanned < slots; ++scanned) {
-                    const int s = h;
-                    h = h + 1 == slots ? 0 : h + 1;
-                    if (slot_state[(size_t)s * sst_ld] == epoch) continue;  /* used by this call */
-                    if (slot_block[s] >= 0) continue;                       /* holds a block */
-                    victim = s;
-                    hand = h;
-                    break;
+                if (vlist_on) {
+                    /* kvs_vic 4a: the scan's first free unstamped slot from the hand is the list's
+                     * next entry that is still free and unstamped */
+                    while (fp < s_free) {
+                        const int s = vlist[fp++];
+                        if (slot_state[(size_t)s * sst_ld] == epoch) continue;
+                        if (slot_block[s] >= 0) continue;
+                        victim = s;
+                        hand = s + 1 == slots ? 0 : s + 1;
+                        break;
+                    }
+                } else {
+                    int h = hand;
+                    for (int scanned = 0; scanned < slots; ++scanned) {
+                        const int s = h;
+                        h = h + 1 == slots ? 0 : h + 1;
+                        if (slot_state[(size_t)s * sst_ld] == epoch) continue;  /* used by this call */
+                        if (slot_block[s] >= 0) continue;                       /* holds a block */
+                        victim = s;
+                        hand = h;
+                        break;
+                    }
                 }
                 if (victim < 0) free_left = 0;
+            }
+            if (victim < 0 && !overflow && kVicClock) {
+                /* kvs_vic 4b takes this miss and the rest (all threads, below) */
+                kc = k;
+                break;
             }
             if (victim < 0) {
                 for (long long scanned = 0; scanned < 3LL * slots; ++scanned) {
@@ -401,10 +492,134 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             miss_slot[k] = s;
             ++placed;
         }
-        ctl[1] = hand;
-        ctl[2] = placed;
-        if (overflow) ctl[3] = 1;
+        s_kc = kc;
+        s_hand = hand;
         s_placed = placed;
+        s_vovf = overflow ? 1 : 0;
+        if (kc == nmiss) {
+            ctl[1] = hand;
+            ctl[2] = placed;
+            if (overflow) ctl[3] = 1;
+        }
+    }
+    __syncthreads();
+
+    /* ---- 4b. kvs_vic: CLOCK for misses kc .. nmiss-1, in rotations of the ring from the hand ---- */
+    if (claims > 0 && s_kc < nmiss0) {
+        const int kc = s_kc, nc = nmiss0 - kc, hc = s_hand;
+        /* What the model needs: every remaining miss non-identity (consistent maps), heats in 0..3,
+         * and at least nc unstamped slots. Else thread 0 runs the serial sweep (s_vser). */
+        if (tid == 0) { s_vser = 0; s_vavail = 0; s_vheat = 0; }
+        __syncthreads();
+        {
+            int av = 0, hm = 0;
+            for (int q = tid; q < slots; q += kThreads) {
+                if (slot_state[(size_t)q * sst_ld] == epoch) continue;
+                ++av;
+                const int hq = slot_state[(size_t)q * sst_ld + 1];
+                if (hq > hm) hm = hq;
+            }
+            if (av) atomicAdd(&s_vavail, av);
+            if (hm) atomicMax(&s_vheat, hm);
+            for (int k = kc + tid; k < nmiss0; k += kThreads) {
+                const int b = miss_block[k];
+                if (b < slots && slot_state[(size_t)b * sst_ld] != epoch &&
+                    (slot_block[b] < 0 || slot_block[b] == b))
+                    atomicExch(&s_vser, 1);
+            }
+        }
+        __syncthreads();
+        if (s_vavail < nc || s_vheat > 3) { if (tid == 0) s_vser = 1; }
+        __syncthreads();
+        if (!s_vser) {
+            int got = 0, hand = hc;
+            for (int rot = 0; rot < 3 && got < nc; ++rot) {
+                const int want_n = nc - got;
+                int* const out = miss_slot + kc + got;
+                const int n = kv_compact_rot(hc, slots, out, want_n, tid, s_cnt, s_off, [&](int q) {
+                    if (slot_state[(size_t)q * sst_ld] == epoch) return false;
+                    const int old = slot_block[q];
+                    return !(old >= 0 && old < blocks && slot_state[(size_t)q * sst_ld + 1] > 0);
+                });
+                const int take = n < want_n ? n : want_n;
+                /* the sweep's reach this rotation: all of it, or up to (not including) its last victim */
+                const int lim = n >= want_n ? (out[take - 1] - hc + slots) % slots : slots;
+                for (int r = tid; r < lim; r += kThreads) {
+                    int q = hc + r;
+                    if (q >= slots) q -= slots;
+                    if (slot_state[(size_t)q * sst_ld] == epoch) continue;
+                    const int old = slot_block[q];
+                    const int hq = slot_state[(size_t)q * sst_ld + 1];
+                    if (old >= 0 && old < blocks && hq > 0)
+                        slot_state[(size_t)q * sst_ld + 1] = kv_heat_down(hq);
+                }
+                __syncthreads();
+                /* this rotation's victims are the call's now: a later rotation skips them */
+                for (int i = tid; i < take; i += kThreads) slot_state[(size_t)out[i] * sst_ld] = epoch;
+                __syncthreads();
+                if (n >= want_n) hand = out[take - 1] + 1 == slots ? 0 : out[take - 1] + 1;
+                got += take;
+            }
+            /* ---- 5. re-point both maps, every CLOCK victim at once (distinct slots and blocks) ---- */
+            for (int i = tid; i < nc; i += kThreads) {
+                const int k = kc + i, q = miss_slot[k], b = miss_block[k];
+                const int old = slot_block[q];
+                if (old >= 0 && old < blocks) res[old] = -1;
+                slot_block[q] = b;
+                slot_state[(size_t)q * sst_ld] = epoch;
+                slot_state[(size_t)q * sst_ld + 1] = kv_heat_up(slot_state[(size_t)q * sst_ld + 1]);
+                res[b] = q;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                const int placed = s_placed + nc;
+                ctl[1] = hand;
+                ctl[2] = placed;
+                if (s_vovf) ctl[3] = 1;
+                s_placed = placed;
+            }
+        } else if (tid == 0) {
+            /* the serial sweep, as step 4 runs it, for misses kc .. nmiss-1 */
+            int hand = hc, placed = s_placed;
+            bool overflow = s_vovf != 0;
+            for (int k = kc; k < nmiss0; ++k) {
+                const int b = miss_block[k];
+                int victim = -1;
+                if (b < slots) {
+                    if (slot_state[(size_t)b * sst_ld] != epoch &&
+                        (slot_block[b] < 0 || slot_block[b] == b))
+                        victim = b;
+                }
+                if (victim < 0) {
+                    for (long long scanned = 0; scanned < 3LL * slots; ++scanned) {
+                        const int q = hand;
+                        hand = hand + 1 == slots ? 0 : hand + 1;
+                        if (slot_state[(size_t)q * sst_ld] == epoch) continue;
+                        const int old = slot_block[q];
+                        if (old >= 0 && old < blocks && slot_state[(size_t)q * sst_ld + 1] > 0) {
+                            slot_state[(size_t)q * sst_ld + 1] = kv_heat_down(slot_state[(size_t)q * sst_ld + 1]);
+                            continue;
+                        }
+                        victim = q;
+                        break;
+                    }
+                }
+                if (victim < 0) { overflow = true; break; }
+                const int q = victim;
+                const int old = slot_block[q];
+                if (old >= 0 && old < blocks) res[old] = -1;
+                slot_block[q] = b;
+                slot_state[(size_t)q * sst_ld] = epoch;
+                slot_state[(size_t)q * sst_ld + 1] = kv_heat_up(slot_state[(size_t)q * sst_ld + 1]);
+                res[b] = q;
+                miss_slot[k] = q;
+                ++placed;
+            }
+            ctl[1] = hand;
+            ctl[2] = placed;
+            if (overflow) ctl[3] = 1;
+            s_placed = placed;
+        }
     }
     __syncthreads();
 
@@ -620,7 +835,8 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
     /* The row's scratch: `nlist` ids (the miss list, a power of two when a wide launch sorts there),
      * then `slots` slots. */
     const int64_t nlist = kv_pow2ceil(slots);
-    const long long need = (nlist + slots) * 4;
+    /* + `slots` ids for fn4 kvs_vic's victim lists (the third part, after miss_slot) */
+    const long long need = (nlist + 2LL * slots) * 4;
     if (!a->scratch || a->scratch_bytes < need) return R4D_NO(RAD_E_INVAL);
     int32_t* const miss_block = (int32_t*)a->scratch;
     int32_t* const miss_slot = (int32_t*)((char*)a->scratch + nlist * 4);
@@ -632,9 +848,10 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
                                (int)st->stride[0], stream);
 }
 
-/* `next_pow2(slots)` block ids (a wide launch sorts its claims here), then `slots` slots. */
+/* `next_pow2(slots)` block ids (a wide launch sorts its claims here), then `slots` slots, then `slots` ids of victim
+ * list (fn4 kvs_vic). */
 extern "C" int64_t r4d_rad_kv_resolve_scratch(const RadArgs* a) {
     const long long slots = r4d_geti_or(a, "slots", 0);
     if (slots <= 0 || slots > INT32_MAX) return 0;
-    return (kv_pow2ceil(slots) + slots) * 4;
+    return (kv_pow2ceil(slots) + 2LL * slots) * 4;   /* + fn4 kvs_vic's victim list */
 }
