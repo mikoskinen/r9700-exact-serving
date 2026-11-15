@@ -2245,12 +2245,16 @@ int Mover::draft_w_setup(const std::function<bool(const std::string&, int32_t)>&
         const UnitState& us = unit_[u];
         if (us.tier != Tier::VRAM || us.static_off < 0 || us.slab_slot >= 0) continue;
         const MoveUnit& mu = plan_->units[u];
+        /* An encoder tower's unit (read once a request: Planner::pin_towers' test) is never the drafter's, whatever
+         * its layer: a tower declared past the drafter's stages (deepseek41's vision blocks) has layers the
+         * caller's `layer >= first` would take, and an encoder pass reads it while depth 0 holds. */
+        const bool tower = mu.access == RAD_ACCESS_PER_REQUEST && mu.expert < 0;
         for (size_t k = 0; k < mu.weights.size() && k < mu.offset.size(); ++k) {
             const int64_t a = us.static_off + mu.offset[k];
             const int64_t b = us.static_off + (k + 1 < mu.offset.size() ? mu.offset[k + 1] : mu.bytes);
             if (b <= a) continue;
             const WeightInfo& w = prog_->weights[(size_t)mu.weights[k]];
-            iv.push_back(Iv{ a, b, lendable(w.name, mu.layer) });
+            iv.push_back(Iv{ a, b, !tower && lendable(w.name, mu.layer) });
         }
     }
     std::sort(iv.begin(), iv.end(), [](const Iv& x, const Iv& y) { return x.lo < y.lo; });
