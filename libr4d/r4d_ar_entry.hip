@@ -1111,9 +1111,12 @@ extern "C" int r4d_ar_xpush_set(int on) {
  * elements every thread's __threadfence_system() before the flag, drain 1, and every wave's system-scope invalidate after
  * it, acq 0 -- per launch of 4 x 1024 threads 128 L2 writebacks and 256 L2 invalidates on the card while the compute lane
  * runs beside it). The forms (drain, acq), for the four-rank exact two-shot (lane and wide) and SP's rows halves:
- *   1  (5, 0)  every wave's release half only (global_wb SYS + store wait), the system invalidate a wave after the flag;
- *   2  (5, 3)  as 1, the acquire as ONE system invalidate a block + every wave's device-scope invalidate;
- *   3  (5, 4)  as 1, every wave's device-scope invalidate only;
+ *   1  (3, 0)  every wave's store wait (s_wait_storecnt 0) and ONE system writeback a block (the publisher's release,
+ *              pub 1), the system invalidate a wave after the flag -- the form before the drain-1 rule (16.11. 23:40
+ *              qwen/prefill s1c: global_wb scope:SYS is the costly instruction, 2-14 us a wave beside compute, an
+ *              L2-resident kernel +60 % at 128 of them a ms; the invalidates cost nothing measurable);
+ *   2  (3, 4)  as 1 with every wave's device-scope invalidate;
+ *   3  (5, 4)  every wave's release half (global_wb SYS + store wait), device-scope invalidates;
  *   4  (7, 4)  SP's raw rows: the pushes as system-scope stores, every wave's store wait, device-scope invalidates
  *              (other kernels: form 3);
  *   5  (7, 3)  as 4 with form 2's acquire (other kernels: form 2).
@@ -1136,8 +1139,8 @@ static int ar_fence(const RadArgs* a) {
 static void ar_fence_apply(const RadArgs* a, ArCall* c, bool sys_push) {
     if (c->drain != 1 || c->numel < 131072) return;
     switch (ar_fence(a)) {
-        case 1: c->drain = 5; break;
-        case 2: c->drain = 5; c->acq = 3; break;
+        case 1: c->drain = 3; break;
+        case 2: c->drain = 3; c->acq = 4; break;
         case 3: c->drain = 5; c->acq = 4; break;
         case 4: c->drain = sys_push ? 7 : 5; c->acq = 4; break;
         case 5: c->drain = sys_push ? 7 : 5; c->acq = 3; break;

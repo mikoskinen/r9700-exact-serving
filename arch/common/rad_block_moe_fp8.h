@@ -2002,10 +2002,20 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
 inline bool MoeFP8::route_rows(RadCtx* c_, int64_t pass_rows, int64_t r0, int64_t rows) const {
-    if (!op_router || c.sigmoid_router || rows <= 0 || !ext_in) return false;
-    if (op_sigmoid_scatter && pass_rows <= sigmoid_scatter_rows) return false;
-    if (op_router_fused && pass_rows <= router_fused_now()) return false;
-    if (xp_next && xp_next->xp.n_parts > 0) return false;
+    /* fn4 SP-route: why a call refuses, printed once a reason (rank 0) */
+    const char* why = !op_router ? "no separate router op" : c.sigmoid_router ? "sigmoid router" : rows <= 0 ? "no rows"
+                    : !ext_in ? "the block norms its own input" : (op_sigmoid_scatter && pass_rows <= sigmoid_scatter_rows) ? "fused sigmoid scatter"
+                    : (op_router_fused && pass_rows <= router_fused_now()) ? "fused router at this height"
+                    : (xp_next && xp_next->xp.n_parts > 0) ? "expert prefetch reads the router input" : nullptr;
+    static std::atomic<int> said{0};
+    if (why) {
+        if (g.rank == 0 && !(said.fetch_or(1) & 1))
+            fprintf(stderr, "radiance: fn4 SP-route: not taken (layer %d, %lld rows): %s\n", layer, (long long)pass_rows, why);
+        return false;
+    }
+    if (g.rank == 0 && !(said.fetch_or(2) & 2))
+        fprintf(stderr, "radiance: fn4 SP-route: taken (layer %d, a pass of %lld rows, this rank's rows %lld..%lld)\n", layer,
+                (long long)pass_rows, (long long)r0, (long long)(r0 + rows));
     RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
                 brow_slice(w.logits, r0, rows, c.n_expert_all));
     return true;
