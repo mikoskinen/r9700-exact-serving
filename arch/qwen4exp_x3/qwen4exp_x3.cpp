@@ -48,6 +48,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_spser_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (std::strcmp(name, "sp_ple") == 0) {   /* fn4 SP-PLE: a pipelined SP-hc step keeps the layers before the PLE's replicated (qwen/SP-SERIAL-EXACT.md) */
+        if (value < 0 || value > 1) return -1;
+        qwen4exp_fp8::fn4_spple_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (std::strcmp(name, "hc_spprobe") == 0) {   /* fn4 SP-hc speed probe (measurement only) */
         if (value < 0 || value > 1) return -1;
         qwen4exp_fp8::fn4_spprobe_flag().store(value, std::memory_order_relaxed);
