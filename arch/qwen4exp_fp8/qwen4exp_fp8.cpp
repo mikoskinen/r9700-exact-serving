@@ -2556,7 +2556,10 @@ static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
     const int mode = fn4_spser_flag().load(std::memory_order_relaxed);
     if (!m.spser_ok || g.world != 4 || mode <= 0) return false;
     /* (media rows are scattered into the embedding before the first read, which every rank still holds whole) */
-    if (m.bt.on || dbg_resid_on() || m.moecfg.calib || !m.op_embed_ar) return false;
+    /* fn4 BI tracer + SP-serial (16.11.2026, qwen/KV-STREAM-EXACT.md 5d): RADIANCE_FN4_BITRACE_SP=1 keeps SP-serial on under the
+     * tracer (a rank's hc rows outside its part are then not this step's: compare a part's rows on its own rank only) */
+    static const bool bt_sp = [] { const char* e = std::getenv("RADIANCE_FN4_BITRACE_SP"); return e && *e && *e != '0'; }();
+    if ((m.bt.on && !bt_sp) || dbg_resid_on() || m.moecfg.calib || !m.op_embed_ar) return false;
     /* the PLE's convolution mixes rows of the stream: the layers up to it run replicated (step_serial_sp), so it must leave
      * some to split */
     if (m.ple_layer + 1 >= (int64_t)m.layers.size()) return false;
