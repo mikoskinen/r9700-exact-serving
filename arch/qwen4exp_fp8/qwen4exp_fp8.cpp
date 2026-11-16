@@ -102,6 +102,9 @@
 #include <arch/rad_qsa.h>
 #include <arch/rad_block_vit.h>
 
+#include <chrono>
+#include <thread>
+
 namespace qwen4exp_fp8 {
 
 /* fn4 (9.11.2026): an environment switch set and not 0. */
@@ -2680,6 +2683,8 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
                 ag(r);
                 dumpx("post_ag");
                 codes(*nx, 0, T);
+                dumpx("post_codes");
+                if (sdump) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); dumpx("post_codes_100ms"); }
                 if (tnm) bt_rd(c, m, 0, T, fnx ? "rdg_ffn" : "rdg_mix", lnx, fnx);
             }
             return;
