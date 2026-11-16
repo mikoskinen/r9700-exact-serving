@@ -2405,10 +2405,13 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     const bool rgsf = rfl >= 2 && op_rgs_fused && rows <= rgs_fused_rows && !glm_router.split.takes(rows);
     const bool rsf = !rgsf && rfl >= 1 && op_rs_fused && rows <= rs_fused_rows;
     const bool gate_done = (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate);
-    /* The shared arm on the second lane (shexp_lane): a decode or verify step of one pass. */
-    const bool want_lane1 = shared && shexp_lane_ok && shexp_lane &&
-                            shexp_lane->load(std::memory_order_relaxed) > 0 && r0 == 0 && rows == T &&
-                            T <= kMoeShexpLaneRows;
+    /* The shared arm on the second lane (shexp_lane): 1 = a decode or verify step of one pass; 2 (lever F4P, ds41-pf2) =
+     * a prefill-height pass of one segment (more than kMoeShexpLaneRows rows, all of the step's), where the arm runs
+     * beside the router, the sort and the routed experts instead of after each routed stage (a live prefill pass is not
+     * recorded, so nothing overlaps them there today). Same ops, same operands, joined in front of the gather as at 1. */
+    const int sl_v = shexp_lane ? shexp_lane->load(std::memory_order_relaxed) : 0;
+    const bool want_lane1 = shared && shexp_lane_ok && shexp_lane && r0 == 0 && rows == T &&
+                            ((sl_v == 1 && T <= kMoeShexpLaneRows) || (sl_v == 2 && T > kMoeShexpLaneRows));
 
     if (!ext_in) nq_h.step(c_, T, r0, rows);
 
