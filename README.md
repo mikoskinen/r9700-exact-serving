@@ -99,8 +99,8 @@ bus 03, c3, 84 and 48 on ranks 0 to 3.
 ### Qwen for Claude Code
 
 Pick the command by the number of concurrent Claude Code sessions and the context length you want. At
-24 to 32 concurrent requests the KV cache is kept in host memory (`--kv-resident`), which takes about
-40 GiB of RAM a card.
+24 to 32 concurrent requests and at 524,288 tokens the KV cache is kept in host memory
+(`--kv-resident`), which takes about 40 GiB of RAM a card.
 
 **16 concurrent requests, 262,144-token context** (KV cache of 1,746,316 tokens a card):
 
@@ -148,6 +148,30 @@ docker run -d --name qwen --init --network host \
 run/switches.sh run/qwen/switches.json
 ```
 
+**16 concurrent requests, 524,288-token context:**
+
+```bash
+docker run -d --name qwen --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/claude-code.env \
+  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 \
+  -e RADIANCE_FN4_KVS_BI=3 -e RADIANCE_FN4_KVS_APART=1 -e RADIANCE_FN4_KVS_VIC=1 \
+  -e RADIANCE_FN4_KVS_CTX=7077888 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-db846ee1 \
+  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
+  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
+  --max-num-seqs 16 --max-model-len 524288 --max-num-batched-tokens 8192 \
+  --prefill-span 4 --prefill-interleave 0 --prefix-resume nearest \
+  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
+  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --num-speculative-tokens 3 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --thinking-token-budget 16000 --default-max-tokens 32768 \
+  --vision-tower-placement ram --kv-resident 262144 --rope-scaling yarn:2
+run/switches.sh run/qwen/switches.json
+```
+
 **24 to 32 concurrent requests, 524,288-token context:**
 
 ```bash
@@ -177,8 +201,10 @@ temperature 0. The times are for the turns after a session's first.
 
 | Command | KV tokens a card | Sessions | Preemptions | Follow-up TTFT p50 / p90 | Decode a stream |
 |---|---|---|---|---|---|
+| 16 requests, 262,144 tokens | 1,746,316 | 16 | 0 | 1.07 / 2.60 s | 69.2 tok/s |
 | 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 24 | 0 | 1.70 / 5.11 s | 53.0 tok/s |
 | 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 32 | 0 | 2.07 / 8.92 s | 35.1 tok/s |
+| 16 requests, 524,288 tokens | 7,077,888, streamed | 16 | 0 | 2.91 / 5.15 s | 72.6 tok/s |
 | 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 24 | 0 | 3.07 / 6.86 s | 55.7 tok/s |
 | 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 32 | 0 | 3.99 / 26.75 s | 29.9 tok/s |
 
