@@ -1333,6 +1333,27 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             !m.qsaw.bpos || !m.qsaw.nc || !m.qsaw.score || !m.qsaw.sel || !m.qsaw.nsel ||
             !m.qsaw.sequ)
             return RAD_E_INVAL;
+        /* fn4 qsa_split (arch/common/rad_qsa.h, qwen/QSA-SPLIT.md): the candidate lists, declared only when the start asks
+         * for the split. A split step has at most one row a verify position a sequence. */
+        if (fn4_qsasplit_declared() && m.qsacfg.topk > 0) {
+            const int64_t lw = 4 + 2 * m.qsacfg.topk;
+            const int64_t rows = g.max_seqs * (1 + (int64_t)g.max_spec);
+            m.qsacfg.split      = fn4_qsasplit_declared();
+            m.qsacfg.split_rows = rows;
+            m.qsacfg.split_min  = fn4_qsasplit_min();
+            m.qsaw.qlist = decl_b(b, nm.f("qsa_lists"), RAD_I32, { rows, 8 * lw });
+            if (g.world > 1) {
+                m.qsaw.qpart = decl_b(b, nm.f("qsa_part"), RAD_I32, { rows, lw });
+                m.qsaw.qgath = decl_b(b, nm.f("qsa_gath"), RAD_I32, { rows, (int64_t)g.world * lw });
+            }
+            if (!m.qsaw.qlist || (g.world > 1 && (!m.qsaw.qpart || !m.qsaw.qgath))) return RAD_E_INVAL;
+            if (g.rank == 0)
+                fprintf(stderr, "radiance: qwen4exp: fn4 qsa_split declared (start value %d): steps of <= %lld rows from %lld "
+                                "live blocks; lists %lld + %lld + %lld KiB a card\n",
+                        fn4_qsasplit_flag().load(), (long long)rows, (long long)m.qsacfg.split_min,
+                        (long long)(rows * 8 * lw * 4 / 1024), (long long)(g.world > 1 ? rows * lw * 4 / 1024 : 0),
+                        (long long)(g.world > 1 ? rows * g.world * lw * 4 / 1024 : 0));
+        }
     }
 
     m.a_in.x = decl_b(b, nm.f("gdn_in"), g.act_dtype, {T, conv_dim + v_dim});
@@ -2932,6 +2953,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "kvs_bi") == 0) {   /* fn4 kvs_bi: KV streaming exact under load (bit 1 here, bit 2 the core's) */
         if (value < 0 || value > 3) return -1;
         rad::arch::fn4_kvsbi_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "qsa_split") == 0) {   /* fn4 qsa_split (rad_qsa.h; RADIANCE_FN4_QSA_SPLIT declares) */
+        if (value < 0 || value > 3) return -1;
+        if (value & ~rad::arch::fn4_qsasplit_declared()) return -1;
+        rad::arch::fn4_qsasplit_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */

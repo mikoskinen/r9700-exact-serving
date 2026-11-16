@@ -2080,6 +2080,51 @@ extern "C" int r4d_shape_qsa_select(const RadParam* p, int n_p, int operand, Rad
     R4D_PICK(l);
 }
 
+/* fn4 qsa_split: the part's lists are one chunk a query (4 + 2 topk words) and the slab the same; the merge reads one list
+ * a query. A described list is not a selection (its head words are drawn), so cases are built by hand. */
+extern "C" int r4d_shape_qsa_select_part(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t nb = pi(p, n_p, "blocks");
+    const int64_t k  = pi(p, n_p, "topk");
+    if (nb <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t r = pi(p, n_p, "ratio", 4);
+    const int64_t s = pi(p, n_p, "seqs", 1);
+    if (s <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F32, M, nb),
+        opd_idx(s, nb, nb),
+        opd_idx(s, 1, nb + 1),
+        opd_idx(M, 1, nb * r),
+        opd_idx(s + 1, 1, M + 1, -1, RAD_OPD_F_IDX_CU),
+        opd((uint32_t)RAD_I32, M, 4 + 2 * k),
+        opd((uint32_t)RAD_I32, M, 4 + 2 * k),
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_qsa_select_merge(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t nb = pi(p, n_p, "blocks");
+    const int64_t k  = pi(p, n_p, "topk");
+    if (nb <= 0 || k <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t r = pi(p, n_p, "ratio", 4);
+    const int64_t s = pi(p, n_p, "seqs", 1);
+    if (s <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_I32, M, 4 + 2 * k),
+        opd_idx(s, nb, nb),
+        opd_idx(s, 1, nb + 1),
+        opd_idx(M, 1, nb * r),
+        opd_idx(s + 1, 1, M + 1, -1, RAD_OPD_F_IDX_CU),
+        opd((uint32_t)RAD_I32, M, k + 1),
+        opd((uint32_t)RAD_I32, M),
+        opd((uint32_t)RAD_I32, M),
+    };
+    R4D_PICK(l);
+}
+
 /* The residency map and the two byte planes: `sel` is block ids, -1 past `nsel`. A described map
  * is all-resident (no draw expresses -1), so a cold call never misses; the service-shaped cases
  * are built by hand in tests/ref_test.cpp and this plugin's selftest. */
