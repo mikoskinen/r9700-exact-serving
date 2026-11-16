@@ -1137,7 +1137,9 @@ static int ar_fence(const RadArgs* a) {
     return (int)r4d_geti_or(a, "fence", v);
 }
 static void ar_fence_apply(const RadArgs* a, ArCall* c, bool sys_push) {
-    if (c->drain != 1 || c->numel < 131072) return;
+    /* prefill messages only: from 1048576 elements (XPUSH's gate: above every decode / verify height -- Qwen's c32 verify
+     * is 128 x 2560 = 327680, which the drain-1 rule also catches; d1 16.11.: fence 1 there +0.2..0.3 % a c32 step) */
+    if (c->drain != 1 || c->numel < 1048576) return;
     switch (ar_fence(a)) {
         case 1: c->drain = 3; break;
         case 2: c->drain = 3; c->acq = 4; break;

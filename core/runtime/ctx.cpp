@@ -162,6 +162,10 @@ void Ctx::shutdown() {
         if (host_touch_ev_[i]) { rad_event_destroy(host_touch_ev_[i]); host_touch_ev_[i] = nullptr; }
         host_touch_pending_[i] = false;
     }
+    for (int i = 0; i < kLaneMarks; ++i) {   /* fn4 PF marks */
+        if (mark_ev_[i]) { rad_event_destroy(mark_ev_[i]); mark_ev_[i] = nullptr; }
+        mark_on_[i] = false;
+    }
     if (own_lane1_ && lane1_) rad_stream_destroy(lane1_);
     if (lane1_spare_) rad_stream_destroy(lane1_spare_);   /* built at init, never taken: nothing was issued on it */
     lane1_spare_ = nullptr;
@@ -1038,6 +1042,26 @@ int Ctx::set_lane(int lane) {
 }
 
 int Ctx::lane_join(int from, int to) {
+    /* fn4 PF marks (qwen/prefill; see ctx.h). Recording a mark changes no order; waiting on one orders `to` behind that
+     * point of the other lane only, so the caller names what it depends on. */
+    if (to >= 0x100 && to < 0x100 + kLaneMarks) {
+        if (from < 0 || from > 1) return RAD_E_INVAL;
+        const int k = to - 0x100;
+        if (!lane1_) { mark_on_[k] = false; return RAD_OK; }
+        if (!mark_ev_[k]) RAD_TRY(rad_event_create_local(&mark_ev_[k]));
+        RAD_TRY(rad_event_record(mark_ev_[k], from ? lane1_ : stream_));
+        mark_on_[k] = true;
+        mark_lane_[k] = from;
+        return RAD_OK;
+    }
+    if (from >= 0x200 && from < 0x200 + kLaneMarks) {
+        if (to < 0 || to > 1) return RAD_E_INVAL;
+        const int k = from - 0x200;
+        if (!lane1_) return RAD_OK;
+        if (!mark_on_[k] || mark_lane_[k] == to) return lane_join(to ^ 1, to);
+        mark_on_[k] = false;   /* one wait a recording */
+        return rad_event_wait(to ? lane1_ : stream_, mark_ev_[k]);
+    }
     if (from == to) return RAD_OK;
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
     /* No lane 1 yet: nothing to order, and a later lane 1 starts behind lane 0 (lane_init). Every

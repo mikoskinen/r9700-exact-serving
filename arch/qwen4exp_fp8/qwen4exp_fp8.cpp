@@ -2131,6 +2131,10 @@ struct MixAr {
     rad_op       rs = 0;
     rad_buf      x = 0;
     int64_t      n_embd = 0, sp_min = 0;
+    /* fn4 PF marks (qwen/prefill; sp_route bit 8): record lane-1 mark (r0 / rows) behind each handed piece's reduction,
+     * and the bit in *mk, so the step waits for that piece alone (Ctx::lane_join 0x100 / 0x200) */
+    uint32_t*    mk = nullptr;
+    int64_t      rows = 0;
 };
 static void mix_ar_piece(void* u, int64_t r0, int64_t n) {
     const MixAr& s = *(const MixAr*)u;
@@ -2139,6 +2143,10 @@ static void mix_ar_piece(void* u, int64_t r0, int64_t n) {
     if (s.rs && n >= s.sp_min) RAD_ISSUE_N(s.c, s.rs, n * s.n_embd, brow_slice(s.x, r0, n, s.n_embd), RAD_NONE);
     else if (s.l->full) s.l->attn.issue_ar(s.c, r0, n);
     else           s.l->gdn.issue_ar(s.c, r0, n);
+    if (s.mk && s.rows > 0 && r0 / s.rows < 8) {
+        const int k = (int)(r0 / s.rows);
+        if (rad_lane_join(s.c, 1, 0x100 + k) == RAD_OK) *s.mk |= 1u << k;
+    }
     rad_lane(s.c, 0);
 }
 
@@ -2261,6 +2269,10 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * of four a layer on lane 0's path at two pieces). The same ops on the same rows: only the order of issue moves. */
     const bool spo = sp && spv == 2;
     const bool spp = !sp && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
+    /* fn4 PF marks (16.11.2026, qwen/prefill; sp_route bit 8): in the hc_sp 2 order, lane 0 waits for the one collective
+     * an op reads (piece p's mixer reduction before its connection write; piece p's gathers before its codes) instead of
+     * everything the second lane holds. The same ops on the same rows; only where lane 0 waits moves. */
+    const bool pmk = (fn4_sproute_flag().load(std::memory_order_relaxed) & 8) != 0;
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
     /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
@@ -2350,6 +2362,11 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
          * first piece's all-reduce runs beside the next piece's attention or out projection. */
         MixAr ms{c, &l};
         if (spL) { ms.rs = m.sp_rs; ms.x = m.a_x.x; ms.n_embd = g.n_embd; ms.sp_min = kSpMinRows; }
+        /* fn4 PF marks: this layer runs the hc_sp 2 order (every piece SP) and the switch asks for the precise waits */
+        uint32_t mk = 0;
+        const bool pmk_l = pmk && spo && !pair_on && K >= 2 && K <= 8 &&
+                           [&] { for (int64_t q = 0; q < K; ++q) if (!sp_p(q)) return false; return true; }();
+        if (pmk_l) { ms.mk = &mk; ms.rows = R; }
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
@@ -2362,7 +2379,10 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         };
         /* A block that handed nothing leaves the first piece's all-reduce to be issued here. */
         if (pc.handed == 0) on1(true, [&] { ar_mix(0); });
-        wait1();
+        auto mark1 = [&](int k) { if (k < 16 && rad_lane_join(c, 1, 0x100 + k) == RAD_OK) mk |= 1u << k; };
+        auto waitm = [&](int k) { if (k < 16 && (mk & (1u << k))) { rad_lane_join(c, 0x200 + k, 0); mk &= ~(1u << k); } else wait1(); };
+        if (pmk_l && pc.handed == 0) mark1(0);
+        if (!pmk_l) wait1();   /* fn4 PF marks: the spo branch below waits piece by piece */
         int64_t issued = pc.handed > 0 ? pc.handed : 1;
         int64_t sp_pend = -1;   /* fn4 SP-hc: a piece whose MoE reduce-scatter is still to be issued */
         bool behind = pc.handed == 0;     /* lane 1 already behind the whole mixer */
@@ -2404,7 +2424,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
              * both reduce-scatters (hw of piece 1 reads piece 1's), then per piece p: piece p + 1's connections beside piece
              * p's gather, the wait, piece p + 1's gather and piece p - 1's MoE reduce-scatter beside piece p's codes + MoE.
              * Piece p + 2's mixer reduce-scatter goes out before piece p + 1's write, so the wait at p covers it. */
-            if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; }
+            if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; if (pmk_l) mark1(1); }
             /* fn4 SP-route: the router on this rank's quarter right after its read (lane 0), its logits gathered behind the
              * piece's block-input gather (lane 1), the pass without its GEMM */
             /* fn4 PF probe (qwen/prefill, measurement of where the pipelined step's time goes; exact: the repeats rewrite the
@@ -2421,6 +2441,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                     on1(true, [&] { RAD_ISSUE_N(c, m.sp_agl, rn(p) * NE, brow_slice(m.b_rlogits, r0(p), rn(p), NE), RAD_NONE); });
             };
             {
+                if (pmk_l) waitm(0);   /* fn4 PF marks: piece 0's mixer reduction only */
                 const bool ss0 = hw(l.hc_mix, 0);
                 bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
                 hr(l.hc_ffn, 0, ss0);
@@ -2428,13 +2449,18 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
                 rq(0);
             }
-            wait1();
+            if (!pmk_l) wait1();
             on1(true, [&] { ag_p(0); });
             if (prb_ag) on1(true, [&] { ag_p(0); });
             agl(0);
+            if (pmk_l) mark1(8);
             for (int64_t p = 0; p < K; ++p) {
                 if (p + 1 < K) {
-                    if (p + 2 < K && p + 2 >= issued) { on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3; }
+                    if (p + 2 < K && p + 2 >= issued) {
+                        on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3;
+                        if (pmk_l) mark1((int)p + 2);
+                    }
+                    if (pmk_l) waitm((int)p + 1);   /* fn4 PF marks: piece p + 1's mixer reduction */
                     const bool ss = hw(l.hc_mix, p + 1);
                     bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
                     hr(l.hc_ffn, p + 1, ss);
@@ -2442,11 +2468,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                     bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
                     rq(p + 1);
                 }
-                wait1();
+                if (pmk_l) waitm(8 + (int)p); else wait1();   /* fn4 PF marks: piece p's gathers only */
                 if (p + 1 < K) {
                     on1(true, [&] { ag_p(p + 1); });
                     if (prb_ag) on1(true, [&] { ag_p(p + 1); });
                     agl(p + 1);
+                    if (pmk_l) mark1(8 + (int)p + 1);
                 }
                 if (sp_pend >= 0) { const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
                 l.hc_ffn.codes(c, r0(p), rn(p));
@@ -3172,7 +3199,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 7) return -1;
+        if (value < 0 || value > 15) return -1;
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         return 1;

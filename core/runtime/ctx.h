@@ -731,6 +731,13 @@ private:
     RadStream lane1_spare_ = nullptr;
     int       lane_       = 0;
     RadEvent  lane_ev_[2] = { nullptr, nullptr };
+    /* fn4 PF marks (16.11.2026, qwen/prefill): lane_join(from, 0x100 + k) records mark k on lane `from`'s stream at its
+     * current tail; lane_join(0x200 + k, to) makes lane `to` wait for that point only (not for everything issued on the
+     * other lane since). A wait on a mark never recorded joins the whole other lane instead. */
+    static constexpr int kLaneMarks = 16;
+    RadEvent  mark_ev_[kLaneMarks] = {};
+    int       mark_lane_[kLaneMarks] = {};
+    bool      mark_on_[kLaneMarks] = {};
     /* An op was issued on lane 1 since lane 1 was last joined into lane 0; lane 0 joins it before
      * an op outside the second lane's window (Ctx::issue_body). */
     bool      lane1_pending_ = false;
