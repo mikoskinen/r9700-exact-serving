@@ -2656,12 +2656,30 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             if (tnm) bt_pt(c, m, m.b_h, r.lo, r.hi - r.lo, tnm, tli);
             if (nx) {
                 rd(*nx, r, ss);
+                /* diagnostic only (RADIANCE_FN4_SPDUMP=<dir>, RADIANCE_FN4_SPDUMP_T=<rows>): the block input of every row
+                 * before and after the gather, bytes to <dir>/r<rank>-s<step>-<point>.bin (qwen/SP-SERIAL-EXACT.md) */
+                static const char* sdd = [] { const char* e = std::getenv("RADIANCE_FN4_SPDUMP"); return e && *e ? e : (const char*)nullptr; }();
+                static const int64_t sdt = [] { const char* e = std::getenv("RADIANCE_FN4_SPDUMP_T"); return e && *e ? (int64_t)std::atoll(e) : (int64_t)0; }();
+                const bool sdump = sdd && T == sdt && tli == 1;
+                auto dumpx = [&](const char* what) {
+                    if (!sdump) return;
+                    std::vector<uint16_t> hb((size_t)(T * D));
+                    const RadStream st = rad_stream(c);
+                    rad_memcpy_async(hb.data(), rad_buf_ptr(c, m.a_x.x), (size_t)(T * D * 2), st);
+                    rad_stream_sync(st);
+                    char fn[600];
+                    snprintf(fn, sizeof fn, "%s/r%d-s%lld-L%02d-%s-%s.bin", sdd, g.rank, (long long)batch->step, tli, tnm ? tnm : "x", what);
+                    if (FILE* f = fopen(fn, "wb")) { fwrite(hb.data(), 2, hb.size(), f); fclose(f); }
+                };
+                dumpx("pre_ag");
                 /* the read's outputs on this rank's rows (step_serial's rd_ffn / rd_mix), then the gathered + coded block
                  * input on every row (rdg_*: compare with step_serial's rd_* on all rows) */
                 const bool fnx = tnm && tnm[2] == 'm';
                 const int  lnx = fnx ? tli : tli + 1;
                 if (tnm) bt_rd(c, m, r.lo, r.hi - r.lo, fnx ? "rd_ffn" : "rd_mix", lnx, fnx);
-                ag(r); codes(*nx, 0, T);
+                ag(r);
+                dumpx("post_ag");
+                codes(*nx, 0, T);
                 if (tnm) bt_rd(c, m, 0, T, fnx ? "rdg_ffn" : "rdg_mix", lnx, fnx);
             }
             return;
