@@ -2476,6 +2476,19 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
         bi_read_pieces(c, m, l.hc_ffn, T, ss_mix);
         bt_rd(c, m, 0, T, "rd_ffn", (int)li, true);
+        static const bool bt_sp_ser = [] { const char* e = std::getenv("RADIANCE_FN4_BITRACE_SP"); return e && *e && *e != '0'; }();
+        if (m.bt.on && bt_sp_ser && !l.mlp.op_add) {
+            /* tracer only (RADIANCE_FN4_BITRACE_SP, qwen/SP-SERIAL-EXACT.md): the same passes and all-reduces as mlp.step,
+             * the block's partial traced before its all-reduce (step_serial_sp's moe_part) */
+            for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows)
+                l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
+            bt_pt(c, m, m.a_x.x, 0, T, "moe_part", (int)li);
+            for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows) {
+                const int64_t n = std::min<int64_t>(l.mlp.c.rows, T - r0);
+                if (l.mlp.issues_ar(T, n)) l.mlp.issue_ar(c, r0, n, false);
+            }
+            l.mlp.route_report(c);
+        } else
         l.mlp.step(c, batch);
         bt_moe(c, m, T, (int)li);
         bt_pt(c, m, m.a_x.x, 0, T, l.hc_ffn.takes_ar(T) ? "moep" : "moe", (int)li);
@@ -2641,7 +2654,16 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             bool ss = wr.write(c, T, r.lo, r.hi - r.lo);
             if (after(r)) ss = false;
             if (tnm) bt_pt(c, m, m.b_h, r.lo, r.hi - r.lo, tnm, tli);
-            if (nx) { rd(*nx, r, ss); ag(r); codes(*nx, 0, T); }
+            if (nx) {
+                rd(*nx, r, ss);
+                /* the read's outputs on this rank's rows (step_serial's rd_ffn / rd_mix), then the gathered + coded block
+                 * input on every row (rdg_*: compare with step_serial's rd_* on all rows) */
+                const bool fnx = tnm && tnm[2] == 'm';
+                const int  lnx = fnx ? tli : tli + 1;
+                if (tnm) bt_rd(c, m, r.lo, r.hi - r.lo, fnx ? "rd_ffn" : "rd_mix", lnx, fnx);
+                ag(r); codes(*nx, 0, T);
+                if (tnm) bt_rd(c, m, 0, T, fnx ? "rdg_ffn" : "rdg_mix", lnx, fnx);
+            }
             return;
         }
         auto half = [&](const SpSer::Run& r) {
@@ -2704,6 +2726,7 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
         for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows)
             l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
         l.mlp.route_report(c);
+        if (m.bt.on) { bt_moe(c, m, T, (int)li); bt_pt(c, m, m.a_x.x, 0, T, "moe_part", (int)li); }   /* routing, shared arm, partial */
         conn(l.hc_ffn, li + 1 < nl ? &m.layers[(size_t)li + 1].hc_mix : nullptr,
              [&](const SpSer::Run& r) { return l.proj.step(c, batch, r.r0, r.n); }, m.bt.on ? "h_ffn" : nullptr, (int)li);
     }
