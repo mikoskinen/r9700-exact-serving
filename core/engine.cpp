@@ -1802,6 +1802,26 @@ int Engine::save_checkpoints() {
                             (unsigned long long)e.seq, (int)(e.ctx_len + e.ckpt_tok + 1));
                     return RAD_E_STATE;
                 }
+                /* Lever TI (ds41-pf2, fn4 sched_tail_inner): a snapshot at a row inside the entry (lever G's fine tail
+                 * taken inside the prompt's last chunk). Its window rows are held through the chunk (above); a CONV
+                 * window is the chunk end's after the save, so it is patched with the plugin's mapped ids of the rows
+                 * ending at the snapshot (rad_ckpt_conv_src: this step's, overwritten only by the next step, which the
+                 * stream orders behind these copies); a LINEAR state stays the chunk end's, which a resume at the tail
+                 * grid never reads (the plugin's declaration: the export exists only where that holds). */
+                const bool inside = e.ckpt_tok < e.n_tokens - 1;
+                int64_t row0 = 0;
+                if (inside) {
+                    if (!ti_capable_ && ranks_[0]->kv.has_conv_state()) {
+                        RAD_ERR("sequence %llu: a snapshot inside its chunk (row %d of %d) and no source of its CONV "
+                                "window there", (unsigned long long)e.seq, (int)e.ckpt_tok, (int)e.n_tokens);
+                        return RAD_E_STATE;
+                    }
+                    for (const StepEntry& o : plan.e) {
+                        if (&o == &e) break;
+                        row0 += o.n_tokens;
+                    }
+                    ++ti_saves_;
+                }
                 for (auto& rk : ranks_) {
                     if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                     const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
@@ -1814,6 +1834,23 @@ int Engine::save_checkpoints() {
                                 (int)e.ckpt_slot, rad_strerror(s));
                         if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
                         return s;
+                    }
+                    if (inside && rk->kv.has_conv_state()) {
+                        const void* ids = nullptr;
+                        int ctx = 0;
+                        const int64_t first = row0 + e.ckpt_tok + 1;
+                        if (fn4::ckpt_conv_src(rk->index, &ids, &ctx) <= 0 || !ids || ctx <= 0 || first < ctx) {
+                            RAD_ERR("rank %d: no source of sequence %llu's CONV window at row %lld for its snapshot "
+                                    "inside the chunk", rk->index, (unsigned long long)e.seq, (long long)first);
+                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                            return RAD_E_STATE;
+                        }
+                        const int ps = rk->kv.checkpoint_patch_conv(
+                            e.ckpt_slot, (const char*)ids + (first - ctx) * 4, ctx, rk->ctx.stream());
+                        if (ps < 0) {
+                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                            return ps;
+                        }
                     }
                 }
                 if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
@@ -2804,6 +2841,15 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * the card there is no such cost and every lone prefill spans. */
         sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+    }
+    /* Lever TI (ds41-pf2): a plugin serving rad_ckpt_conv_src declares that a snapshot inside a step can be saved whole --
+     * its LINEAR states at lever G's tail grid are never read by the chunk a resume starts there, and its CONV window is
+     * read back from the step's mapped ids (save_checkpoints). Without it fn4 sched_tail_inner acts as 0. */
+    {
+        const void* ids = nullptr;
+        int ctx = 0;
+        ti_capable_ = fn4::ckpt_conv_src(-1, &ids, &ctx) > 0;
+        sched_.set_tail_inner_capable(ti_capable_);
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());

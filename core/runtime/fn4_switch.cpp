@@ -37,7 +37,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
                                         "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
                                         "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng", "ds41_f32dec",
-                                        "exl3_xr" };
+                                        "exl3_xr", "sched_tail_inner" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -82,6 +82,7 @@ struct Hooks {
     int (*wmk_stats)(long long*, int) = nullptr;   /* lever WMK (libr4d's rad_wmk_stats, ds41-wmk2) */
     /* lever XR (exl3r4d's rad_host_pool_ranges, ds41-etp-xr): a rank's pinned host pools */
     int (*host_pools)(int, int, const unsigned long long*, const unsigned long long*) = nullptr;
+    int (*ckpt_conv)(int, const void**, int*) = nullptr;   /* lever TI (ds41-pf2): rad_ckpt_conv_src */
 };
 
 struct State {
@@ -212,6 +213,7 @@ void find_hooks(State& s) {
             k.fuse_stats = sym<int (*)(long long*, int)>(h, "rad_fuse_stats");
             k.wmk_stats = sym<int (*)(long long*, int)>(h, "rad_wmk_stats");
             k.host_pools = sym<int (*)(int, int, const unsigned long long*, const unsigned long long*)>(h, "rad_host_pool_ranges");
+            k.ckpt_conv = sym<int (*)(int, const void**, int*)>(h, "rad_ckpt_conv_src");
             bool dup = false;
             for (const Hooks& g : s.hooks) dup = dup || g.sw == k.sw;
             if (!dup) s.hooks.push_back(k);
@@ -303,6 +305,15 @@ int env_tail_grid() {
     return env;
 }
 
+/* Lever TI (ds41-pf2): RADIANCE_SCHED_TAIL_INNER=1 at start (anything else, or unset, is 0). */
+int env_tail_inner() {
+    static const int env = [] {
+        const char* e = std::getenv("RADIANCE_SCHED_TAIL_INNER");
+        return e && !std::strcmp(e, "1") ? 1 : 0;
+    }();
+    return env;
+}
+
 /* The reported value of switch i. Under s.mu. */
 int reported(State& s, int i) {
     if (plugin_switch(i)) return plugin_value(s, i);
@@ -317,6 +328,10 @@ int reported(State& s, int i) {
     if (i == kSchedTailGrid) {     /* lever G: set, else RADIANCE_SCHED_TAIL_GRID (0 = off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v >= 0 ? v : env_tail_grid();
+    }
+    if (i == kSchedTailInner) {    /* lever TI: set, else RADIANCE_SCHED_TAIL_INNER (0 = off) */
+        const int v = s.val[i].load(std::memory_order_acquire);
+        return v >= 0 ? v : env_tail_inner();
     }
     if (i == kSchedBiChunk) {
         const int v = s.val[i].load(std::memory_order_acquire);
@@ -432,6 +447,18 @@ void note_sched_dst(int64_t bypassed, int64_t bypass_refused) {
 int sched_tail_grid() {
     const int v = st().val[kSchedTailGrid].load(std::memory_order_acquire);
     return v >= 0 ? v : env_tail_grid();
+}
+int sched_tail_inner() {
+    const int v = st().val[kSchedTailInner].load(std::memory_order_acquire);
+    return v >= 0 ? v : env_tail_inner();
+}
+int ckpt_conv_src(int rank, const void** ids, int* ctx) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    find_hooks(s);
+    for (const Hooks& k : s.hooks)
+        if (k.ckpt_conv) return k.ckpt_conv(rank, ids, ctx) > 0 ? 1 : 0;
+    return 0;
 }
 void note_sched_tail_grid(const int64_t* v) {
     State& s = st();
@@ -819,7 +846,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -1208,6 +1235,15 @@ bool check(const std::string& name, int v, std::string* err) {
         }
         return true;
     }
+    if (i == kSchedTailInner) {    /* lever TI (ds41-pf2): the scheduler's, read at every step it plans */
+        if (v != 0 && v != 1) {
+            if (err) *err = "sched_tail_inner takes 0 (off: lever G's fine tail snapshot cuts the prompt's last chunk there) or 1 "
+                            "(the snapshot is taken inside the last chunk, which runs whole; needs a plugin serving "
+                            "rad_ckpt_conv_src where the model keeps a CONV window)";
+            return false;
+        }
+        return true;
+    }
     if (i == kSchedTailGrid) {     /* lever G (ds41-tailgrid): the scheduler's, latched by a request at its admission */
         if (!tail_grid_ok(v)) {
             if (err) *err = "sched_tail_grid takes 0 (off: a prompt's tail snapshot on the resume grid, where its last chunk "
@@ -1368,7 +1404,7 @@ bool apply_pending(int step, int* sched) {
             continue;
         }
         if (reported(s, i) == v) {
-            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
+            if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
                 i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */

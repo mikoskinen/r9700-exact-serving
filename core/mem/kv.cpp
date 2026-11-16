@@ -1718,6 +1718,44 @@ int KVManager::checkpoint_copy(const int32_t* state_slots, int n_slots, int32_t 
     return RAD_OK;
 }
 
+bool KVManager::has_conv_state() const {
+    for (const auto& p : plans_) if (p.kind == RAD_KV_CONV && p.n_layers > 0) return true;
+    return false;
+}
+
+int KVManager::checkpoint_patch_conv(int32_t ck_slot, const void* ids, int64_t ctx, RadStream s) {
+    if (!ck_store_ || !ck_store_->in_use(ck_slot)) {
+        RAD_ERR("checkpoint patch of slot %d: the store does not hold that slot", (int)ck_slot);
+        return RAD_E_INVAL;
+    }
+    char* ck = (char*)checkpoint_ptr(ck_slot);
+    if (!ck || !ids || ctx <= 0) return RAD_E_INVAL;
+    /* the blob's walk (checkpoint_copy): every stateful group in plans_ order, n_layers rows of layer_bytes_per_state */
+    int64_t off = 0;
+    for (size_t g = 0; g < plans_.size(); ++g) {
+        const KVGroupPlan& p = plans_[g];
+        if (!p.stateful()) continue;
+        const int64_t nbytes = p.layer_bytes_per_state();
+        if (p.kind == RAD_KV_CONV && p.n_layers > 0) {
+            if (nbytes < ctx * 4 || p.conv_slots <= 0 || nbytes % p.conv_slots != 0 || nbytes / p.conv_slots != 4) {
+                RAD_ERR("checkpoint patch of slot %d: CONV group %d rows of %lld bytes (%lld slots) do not hold %lld "
+                        "4-byte ids", (int)ck_slot, (int)g, (long long)nbytes, (long long)p.conv_slots, (long long)ctx);
+                return RAD_E_INVAL;
+            }
+            for (int64_t j = 0; j < p.n_layers; ++j) {
+                const int cs = rad_memcpy_async(ck + off + j * nbytes, ids, ctx * 4, s);
+                if (cs < 0) {
+                    RAD_ERR("checkpoint patch of slot %d: the device refused group %d layer row %lld: %s", (int)ck_slot,
+                            (int)g, (long long)j, rad_strerror(cs));
+                    return cs;
+                }
+            }
+        }
+        off += nbytes * p.n_layers;
+    }
+    return RAD_OK;
+}
+
 int KVManager::checkpoint_save(const int32_t* slots, int n, int32_t ck, RadStream s,
                                const std::vector<int32_t>* win) {
     return checkpoint_copy(slots, n, ck, /*save=*/true, s, win);

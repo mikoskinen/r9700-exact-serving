@@ -1449,6 +1449,18 @@ static bool psk_cr_flag(const PskPlan* p, size_t i) {
  * WMMA (> 48), rmsnorm's fixed partition, per-row rope / round trip / window store). Target output never reads a draft,
  * so the target is exact by construction; the drafter's readable window is byte-for-byte today's. 0 = every row (today).
  * RADIANCE_DS41_DSPARK_PFCTX=0 / 1 sets the start value (unset: 0). `_ok`: a declare has the context pass's ops. */
+/* Lever TI (ds41-pf2, fn4 sched_tail_inner): each rank's mapped Engram ids of the trunk step it issued last (m.ctok, one i32
+ * a row in the batch's row order: token_map's output, media rows written over it) and the Engram window's ids (ngram - 1),
+ * for the engine's snapshot inside a step (rad_ckpt_conv_src below). */
+static constexpr int kTiRanks = 16;
+static std::atomic<const void*> g_ti_ctok[kTiRanks];
+static std::atomic<int> g_ti_ctx{0};
+static void ti_note(RadCtx* x, const Model& m) {
+    const int rk = rad_rank(x);
+    if (!m.ctok || rk < 0 || rk >= kTiRanks) return;
+    g_ti_ctok[rk].store(rad_buf_ptr(x, m.ctok), std::memory_order_release);
+    g_ti_ctx.store((int)m.c.ngram - 1, std::memory_order_release);
+}
 static std::atomic<int> g_sw_pfctx{0}, g_sw_pfctx_ok{0}, g_sw_pfctx_env{-2};   /* env: -2 unread, -1 unset */
 /* Live counters (rank 0's; /stats "dspark_pfctx"): context passes cut, their rows not run, the rows they ran. */
 static std::atomic<long long> g_pfctx_passes{0}, g_pfctx_skipped{0}, g_pfctx_run{0};
@@ -5628,6 +5640,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     if (m.tok_map)
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap), brows(m.ctok, T));
     media_tokens(x, m, batch, T);
+    ti_note(x, m);   /* lever TI */
     for (auto& L : m.layers) {
         if (!L.e_ids) continue;
         const int l = L.l;
@@ -6420,6 +6433,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap),
                     brows(m.ctok, T));
     media_tokens(x, m, batch, T);
+    ti_note(x, m);   /* lever TI */
 
     /* The Engram's row ids are a function of the batch's tokens alone (token_map, each Engram
      * layer's token history), never of an activation, so every Engram layer's ngram_ids is issued
@@ -7161,6 +7175,24 @@ extern "C" int rad_dspark_pfctx_stats(long long* out, int n) {
     out[2] = g_pfctx_skipped.load(std::memory_order_relaxed);
     out[3] = g_pfctx_run.load(std::memory_order_relaxed);
     return 4;
+}
+
+/* Lever TI (ds41-pf2, fn4 sched_tail_inner): the source of the Engram CONV window at a row inside a trunk step, for a
+ * snapshot the engine saves there (Engine::save_checkpoints). rank -1 is the engine's probe: 1 = a snapshot inside a step
+ * is whole here -- the compressor tails (the LINEAR groups, kv_comp_tail_r*) at lever G's tail grid are never read by the
+ * chunk a resume starts there (the grid is a multiple of every compress ratio: the chunk from there compresses its own
+ * rows only, as lever PSK-CR's replay relies on), and the Engram window (kv_engram_tokens, CONV: ngram_ids leaves a
+ * prefill's last ngram - 1 mapped ids at offset zero) is read back from the step's mapped ids. rank >= 0: that rank's
+ * mapped ids of its last issued trunk step (device, one i32 a row) and the window's ids; 0 when none is known. */
+extern "C" int rad_ckpt_conv_src(int rank, const void** ids, int* ctx) {
+    using namespace deepseek41;
+    if (ids) *ids = nullptr;
+    if (ctx) *ctx = 0;
+    if (rank < 0) return 1;
+    if (rank >= kTiRanks || !ids || !ctx) return 0;
+    *ids = g_ti_ctok[rank].load(std::memory_order_acquire);
+    *ctx = g_ti_ctx.load(std::memory_order_acquire);
+    return *ids && *ctx > 0 ? 1 : 0;
 }
 
 RAD_ARCH_PROBE(deepseek41)

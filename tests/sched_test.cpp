@@ -1589,7 +1589,7 @@ TEST(psk_cr_not_needed_unplanned_geometry_and_a_shared_head) {
  * n - 1), with a slot -- the real cache's (prefix.cpp: the deepest snapshot under the match). The turn's steps (cr_run:
  * the batch masks every step), the snapshots it committed and its counters. */
 struct CrTurn { std::vector<CrStep> st; std::vector<int64_t> snaps; SchedMetrics m; int64_t lin = 0; };
-static CrTurn cr_turn(char arm, int64_t n, int64_t match, const std::vector<int64_t>& avail) {
+static CrTurn cr_turn(char arm, int64_t n, int64_t match, const std::vector<int64_t>& avail, bool ti = false) {
     Fixture f;
     f.build(/*blocks=*/16384, /*states=*/64, /*max_tok=*/4160, /*max_ctx=*/70000, /*windowed=*/true, /*linear=*/true);
     f.cfg.checkpoint_interval = 2048;
@@ -1602,6 +1602,7 @@ static CrTurn cr_turn(char arm, int64_t n, int64_t match, const std::vector<int6
     f.sch.set_psk_mode(arm == 'T' ? 4 : 2);
     f.sch.set_psk_k(4);
     CHECK_EQ(f.sch.set_psk_cr(arm == 'B' ? 0 : 1, 5152), arm == 'B' ? 0 : 1);
+    if (ti) f.sch.set_tail_inner_capable(true);   /* lever TI (ds41-pf2): the engine's probe found a plugin serving it */
     CrTurn t;
     if (match > 0) {
         f.pc.seed((int32_t)match);
@@ -11092,7 +11093,7 @@ TEST(noa_switch_check_and_report) {
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_noa, stage_short, stage_pick, place_hb, stage_full_min, stage_full_pick, mhc_fuse, ix_lds, ix_ni, "
                    "ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, "
-                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, epoch_bump)") !=
+                   "gg_gemv_m16, place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, epoch_bump)") !=
           std::string::npos);   /* ds41-int8: SA / HB after NOA; ds41-int9: SP after HB; int12: X3D-F exl3_x3d; int13: XPUSH ar_xpush; int14c: A4 gg_gemv_m16, then SWL / L2 last */
     CHECK(DstSwitches::set("sched_noa", 2));
     CHECK_EQ(fn4::value(fn4::kSchedNoa), 2);
@@ -12001,7 +12002,7 @@ TEST(cbh_switch_check_and_report) {
     CHECK(!fn4::check("sched_cb_hold_k", 65, &err));
     CHECK(!fn4::check("no_such_switch", 1, &err));
     CHECK(err.find("sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, "
-                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, epoch_bump)") != std::string::npos);
+                   "place_swap_lent, heat_min_gain_x100, heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, epoch_bump)") != std::string::npos);
     CHECK(DstSwitches::set("sched_cb_hold_ms", 250));
     CHECK(DstSwitches::set("sched_cb_hold_k", 3));
     CHECK_EQ(fn4::sched_cb_hold_ms(), 250);
@@ -12532,5 +12533,99 @@ TEST(lever_g_a_resumed_turn_beside_decode_rows_keeps_option_d) {
         CHECK_EQ(tg_json("tails"), (int64_t)(fk > c.lin ? 1 : 0));
         CHECK_EQ(tg_json("tail_rows"), fk > c.lin ? c.N - fk : (int64_t)0);
         CHECK_EQ(tg_json("inert"), (int64_t)0);
+    }
+}
+
+
+/* Lever TI (ds41-pf2, fn4 sched_tail_inner 1 beside sched_tail_grid F): lever G's fine tail is taken INSIDE the prompt's last
+ * chunk, which runs whole. Against lever G alone (the same conversation, the same snapshots): every prompt's pieces are G's
+ * with the two pieces around the fine tail joined into one -- exactly the lever-off cold plan's last piece --, its snapshot
+ * positions are G's (the fine tail), the snapshot sits inside that chunk (one checkpoint in the step, PSK's next target
+ * tail - end < 0 rows ahead: its cone covered), and every next turn resumes at the same fine tail. At 0, or where the engine
+ * found no plugin serving it (not capable), lever G's plan exactly. */
+namespace {
+struct TiSwitch {
+    explicit TiSwitch(int v) { CHECK(DstSwitches::set("sched_tail_inner", v)); }
+    ~TiSwitch() { DstSwitches::set("sched_tail_inner", 0); }
+};
+}  // namespace
+
+TEST(lever_ti_the_switch_takes_0_and_1_and_starts_off) {
+    std::string err;
+    for (int v : { 0, 1 }) CHECK(fn4::check("sched_tail_inner", v, &err));
+    for (int v : { -1, 2, 512 }) {
+        CHECK(!fn4::check("sched_tail_inner", v, &err));
+        CHECK(err.find("sched_tail_inner takes 0") != std::string::npos);
+    }
+    CHECK_EQ(fn4::sched_tail_inner(), 0);
+    CHECK_EQ(fn4::switch_index("sched_tail_inner"), (int)fn4::kSchedTailInner);
+    CHECK(!fn4::sched_switch(fn4::kSchedTailInner));
+    {
+        TiSwitch on(1);
+        CHECK_EQ(fn4::sched_tail_inner(), 1);
+        CHECK(fn4::state_json().find("\"sched_tail_inner\": 1") != std::string::npos);
+    }
+    CHECK_EQ(fn4::sched_tail_inner(), 0);
+}
+
+TEST(lever_ti_a_conversation_takes_its_fine_tails_inside_one_last_chunk) {
+    const int64_t cold = 52000;
+    const std::vector<std::pair<int64_t, int64_t>> turns = { { 52600, 51990 }, { 57000, 52590 }, { 57300, 56990 },
+                                                             { 61500, 57290 }, { 61700, 61490 }, { 64000, 61690 } };
+    std::vector<TgPieces> cold_off;
+    {
+        TgSwitch off(0);
+        cold_off.push_back(tg_pieces(cr_turn('T', cold, 0, {})));
+        for (const auto& tn : turns) cold_off.push_back(tg_pieces(cr_turn('T', tn.first, 0, {})));
+    }
+    for (int F : { 256, 512, 1024, 2048 }) {
+        TgSwitch g(F);
+        TiSwitch on(1);
+        std::vector<int64_t> avail_g, avail_t;
+        int joined = 0;
+        for (size_t k = 0; k <= turns.size(); ++k) {
+            const int64_t N = k == 0 ? cold : turns[k - 1].first, match = k == 0 ? 0 : turns[k - 1].second;
+            avail_g = cr_path(avail_g, match);
+            avail_t = cr_path(avail_t, match);
+            const CrTurn tg = cr_turn('T', N, match, avail_g, /*ti=*/false);
+            const CrTurn tt = cr_turn('T', N, match, avail_t, /*ti=*/true);
+            REQUIRE(!tg.st.empty() && !tt.st.empty());
+            /* the same snapshots, the same resume point */
+            CHECK(tt.snaps == tg.snaps);
+            CHECK_EQ(tt.st[0].ctx, tg.st[0].ctx);
+            CHECK_EQ(tt.st[0].restore >= 0, tg.st[0].restore >= 0);
+            const TgPieces pg = tg_pieces(tg), pt = tg_pieces(tt);
+            const int64_t fsn = tg.snaps.empty() ? -1 : tg.snaps.back();
+            const bool on_grid = fsn >= 2048 && (fsn - 2048) % 4096 == 0;   /* the resume grid (2048 + k x 4096): a chunk's start */
+            if (fsn > 0 && !on_grid && pg.size() >= 2 && pg.back().first == fsn && pg.back().second == N) {
+                /* G cut the last chunk at its fine tail: TI joins the two pieces around it */
+                TgPieces want(pg.begin(), pg.end() - 2);
+                want.push_back({ pg[pg.size() - 2].first, N });
+                CHECK(pt == want);
+                const CrStep& s = tt.st.back();
+                CHECK_EQ(s.ctx + s.n, N);
+                CHECK_EQ(s.ckpts, 1);
+                CHECK_EQ(s.ahead, tg.snaps.back() - N);   /* the next target inside the chunk */
+                CHECK(s.ahead < 0);
+                ++joined;
+            } else {
+                CHECK(pt == pg);
+            }
+            /* option D's rule against the lever-off cold plan still holds (the joined piece is that plan's own) */
+            CHECK_EQ(tg_rule(pt, cold_off[k], N), std::string(""));
+            for (int64_t p : tg.snaps) avail_g.push_back(p);
+            for (int64_t p : tt.snaps) avail_t.push_back(p);
+            std::sort(avail_g.begin(), avail_g.end());
+            std::sort(avail_t.begin(), avail_t.end());
+        }
+        CHECK(joined >= (F <= 512 ? 3 : 1));
+    }
+    /* not capable (no plugin serving it): lever G's plan exactly */
+    {
+        TgSwitch g(512);
+        TiSwitch on(1);
+        const CrTurn tg = cr_turn('T', cold, 0, {}, /*ti=*/false);
+        CHECK(tg_pieces(tg).size() >= 2);
+        CHECK_EQ(tg.st.back().ckpts, 0);
     }
 }

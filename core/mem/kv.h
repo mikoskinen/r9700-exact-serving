@@ -591,6 +591,14 @@ public:
                         const std::vector<int32_t>* win = nullptr);
     int checkpoint_restore(const int32_t* state_slots, int n_slots, int32_t ck_slot, RadStream s,
                            const std::vector<int32_t>* win = nullptr);
+    /* Lever TI (ds41-pf2): after checkpoint_save of a snapshot whose position lies inside the step that wrote the state,
+     * overwrite each CONV group's window in slot `ck_slot` -- the first `ctx` 4-byte ids of every layer's row, the
+     * layout a prefill leaves (ngram_ids / ple_conv: the last conv_width - 1 ids at offset zero) -- with the `ctx` ids at
+     * `ids` (device: the mapped ids of the snapshot's last ctx rows), enqueued on `s` behind the save. The rest of each
+     * row is the save's (a prefill writes none of it). RAD_E_INVAL on a bad slot, a CONV group whose rows hold fewer
+     * than `ctx` ids or are not 4-byte ids; RAD_OK with no CONV group. */
+    int checkpoint_patch_conv(int32_t ck_slot, const void* ids, int64_t ctx, RadStream s);
+    bool has_conv_state() const;
 
     /* ---------------- window snapshots (the sliding-window half of a prefix hit) ----------------
      * A WINDOW group keeps only the blocks its window can still read, so the prefix cache's block

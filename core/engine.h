@@ -710,6 +710,10 @@ private:
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
      * (stager.h); 0 without one. */
     int64_t  arena_span_rows_ = 0;
+    /* Lever TI (ds41-pf2): a plugin serves a CONV window at a row inside a step (fn4::ckpt_conv_src), and the snapshots
+     * saved inside a step so far (save_checkpoints). */
+    bool     ti_capable_ = false;
+    uint64_t ti_saves_ = 0;
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;
