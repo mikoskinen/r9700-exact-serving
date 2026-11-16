@@ -2407,7 +2407,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; }
             /* fn4 SP-route: the router on this rank's quarter right after its read (lane 0), its logits gathered behind the
              * piece's block-input gather (lane 1), the pass without its GEMM */
-            const bool rsp = m.sp_agl && fn4_sproute_flag().load(std::memory_order_relaxed) > 0;
+            /* fn4 PF probe (qwen/prefill, measurement of where the pipelined step's time goes; exact: the repeats rewrite the
+             * same bytes): sp_route bit 2 = every block-input gather issued twice on lane 1 (+1 AG a piece and layer), bit 4 =
+             * every quarter connection read issued twice on lane 0 (+1 hc read a piece and layer). */
+            const int sprv = fn4_sproute_flag().load(std::memory_order_relaxed);
+            const bool rsp = m.sp_agl && (sprv & 1);
+            const bool prb_ag = (sprv & 2) != 0, prb_hr = (sprv & 4) != 0;
             const int64_t NE = m.moecfg.n_expert_all;
             bool routed[8] = { false, false, false, false, false, false, false, false };
             auto rq = [&](int64_t p) { if (rsp && p < 8) routed[p] = l.mlp.route_rows(c, rn(p), hq0(p), hqn(p)); };
@@ -2419,11 +2424,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 const bool ss0 = hw(l.hc_mix, 0);
                 bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
                 hr(l.hc_ffn, 0, ss0);
+                if (prb_hr) hr(l.hc_ffn, 0, ss0);
                 bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
                 rq(0);
             }
             wait1();
             on1(true, [&] { ag_p(0); });
+            if (prb_ag) on1(true, [&] { ag_p(0); });
             agl(0);
             for (int64_t p = 0; p < K; ++p) {
                 if (p + 1 < K) {
@@ -2431,11 +2438,16 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                     const bool ss = hw(l.hc_mix, p + 1);
                     bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
                     hr(l.hc_ffn, p + 1, ss);
+                    if (prb_hr) hr(l.hc_ffn, p + 1, ss);
                     bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
                     rq(p + 1);
                 }
                 wait1();
-                if (p + 1 < K) { on1(true, [&] { ag_p(p + 1); }); agl(p + 1); }
+                if (p + 1 < K) {
+                    on1(true, [&] { ag_p(p + 1); });
+                    if (prb_ag) on1(true, [&] { ag_p(p + 1); });
+                    agl(p + 1);
+                }
                 if (sp_pend >= 0) { const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
                 l.hc_ffn.codes(c, r0(p), rn(p));
                 l.mlp.pass(c, T, r0(p), rn(p), false, p < 8 && routed[p]);
@@ -3159,9 +3171,9 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         qwen4exp_fp8::fn4_spple_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
-    if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares) */
-        if (value < 0 || value > 1) return -1;
-        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
+    if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
+        if (value < 0 || value > 7) return -1;
+        if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         return 1;
     }

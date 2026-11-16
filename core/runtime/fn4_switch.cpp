@@ -145,7 +145,7 @@ bool request(const std::string& name, int v, std::string* err) {
     const int lo = i == kDraftAdaptive ? -1 : 0;
     const int hi = i == kHcFuseDown ? 2 : (i == kHcNormWave || i == kHcWriteVec) ? 4096
                  : i == kHcReadV ? 2047 : i == kArLaneThreads ? 1024 : i == kHcUpMix ? 15 : i == kArLaneBlocks ? 24
-                 : i == kAqlAcq ? 2 : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 5 : i == kHcSp ? 2 : i == kAttBi ? 4 : i == kBiSeg ? 2 : i == kArwRows ? 4096 : i == kSchedBiChunk ? 6 : i == kBiWide ? 15 : i == kSpSerial ? 2 : i == kKvsBi ? 3 : i == kQsaSplit ? 3 : i == kArFence ? 5 : 1;
+                 : i == kAqlAcq ? 2 : i == kExl3PfPrep ? 2 : i == kMoePair ? 2 : i == kHcBi ? 5 : i == kHcSp ? 2 : i == kAttBi ? 4 : i == kBiSeg ? 2 : i == kArwRows ? 4096 : i == kSchedBiChunk ? 6 : i == kBiWide ? 15 : i == kSpSerial ? 2 : i == kKvsBi ? 3 : i == kQsaSplit ? 3 : i == kArFence ? 5 : i == kSpRoute ? 7 : 1;
     if (v < lo || v > hi) {
         if (err) *err = std::string(kNames[i]) + " takes " + std::to_string(lo) + ".." + std::to_string(hi);
         return false;
