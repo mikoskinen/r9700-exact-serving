@@ -110,8 +110,8 @@ docker run -d --name qwen --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/claude-code.env \
-  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-db846ee1 \
+  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 -e RADIANCE_FN4_SP_PLE=1 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-30903db6 \
   --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
   --max-num-seqs 16 --max-model-len 262144 --max-num-batched-tokens 8192 \
@@ -132,10 +132,11 @@ docker run -d --name qwen --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/claude-code.env \
-  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 \
+  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 -e RADIANCE_FN4_SP_PLE=1 \
   -e RADIANCE_FN4_KVS_BI=3 -e RADIANCE_FN4_KVS_APART=1 -e RADIANCE_FN4_KVS_VIC=1 \
   -e RADIANCE_FN4_KVS_CTX=6291456 \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-db846ee1 \
+  -e RADIANCE_FN4_QSA_SPLIT=1 -e RADIANCE_FN4_QSA_SPLIT_MIN=8192 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-30903db6 \
   --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
   --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 8192 \
@@ -156,10 +157,10 @@ docker run -d --name qwen --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/claude-code.env \
-  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 \
+  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 -e RADIANCE_FN4_SP_PLE=1 \
   -e RADIANCE_FN4_KVS_BI=3 -e RADIANCE_FN4_KVS_APART=1 -e RADIANCE_FN4_KVS_VIC=1 \
   -e RADIANCE_FN4_KVS_CTX=7077888 \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-db846ee1 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-30903db6 \
   --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
   --max-num-seqs 16 --max-model-len 524288 --max-num-batched-tokens 8192 \
@@ -180,10 +181,10 @@ docker run -d --name qwen --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/claude-code.env \
-  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 \
+  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 -e RADIANCE_FN4_SP_PLE=1 \
   -e RADIANCE_FN4_KVS_BI=3 -e RADIANCE_FN4_KVS_APART=1 -e RADIANCE_FN4_KVS_VIC=1 \
   -e RADIANCE_FN4_KVS_CTX=7077888 \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-db846ee1 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-30903db6 \
   --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
   --max-num-seqs 32 --max-model-len 524288 --max-num-batched-tokens 8192 \
@@ -203,7 +204,7 @@ temperature 0. The times are for the turns after a session's first.
 |---|---|---|---|---|---|
 | 16 requests, 262,144 tokens | 1,746,316 | 16 | 0 | 1.07 / 2.60 s | 69.2 tok/s |
 | 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 24 | 0 | 1.70 / 5.11 s | 53.0 tok/s |
-| 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 32 | 0 | 2.07 / 8.92 s | 35.1 tok/s |
+| 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 32 | 0 | 1.99 / 4.61 s | 41.9 tok/s |
 | 16 requests, 524,288 tokens | 7,077,888, streamed | 16 | 0 | 2.91 / 5.15 s | 72.6 tok/s |
 | 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 24 | 0 | 3.07 / 6.86 s | 55.7 tok/s |
 | 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 32 | 0 | 3.99 / 26.75 s | 29.9 tok/s |
