@@ -206,9 +206,7 @@ run/switches.sh run/deepseek/switches.json
 
 The server is ready in about five minutes, most of which goes to writing the 103 GiB n-gram table to
 `/dev/shm/ds41ng`. A request can use up to 1,048,576 tokens of context, and the KV cache has room
-for 4,380,530 tokens, which is 4.2 full-length sessions at once. The server also accepts pictures as
-`image_url` parts with a data URL, and `--vision-tower-placement ram` keeps the vision tower in host
-memory.
+for 4,380,530 tokens, which is 4.2 full-length sessions at once.
 
 ### Check the answer
 
