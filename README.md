@@ -96,6 +96,115 @@ the runtime switches of the batch-invariant kernel set and checks that each one 
 result runs on gpu02 also set the rank order with `ROCR_VISIBLE_DEVICES`, putting the cards at PCI
 bus 03, c3, 84 and 48 on ranks 0 to 3.
 
+### Qwen for Claude Code
+
+These commands size the Qwen server for a number of concurrent Claude Code requests and a context
+length. They read `run/qwen/claude-code.env`, which is `run/qwen/qwen.env` without its
+`RADIANCE_FN4_AR_SDMA` line, and their result runs set the same rank order as above.
+`RADIANCE_FN4_RESUME_COLD=1` resumes a cached prefix only where a cold prefill of the prompt starts a
+chunk, and `RADIANCE_FN4_PREEMPT_KEEP=1` keeps a decoding request's state when it gives up KV. With
+both, a prefix hit or a preemption leaves the answer unchanged.
+
+At 24 and 32 concurrent requests the server streams the KV cache with `--kv-resident`. The cache lives
+in pinned host memory, 39.0 GiB a card at 6,291,456 tokens and 43.9 GiB a card at 7,077,888 tokens,
+and a ring of the blocks each decode step selects stays on the card. `RADIANCE_FN4_KVS_CTX` sets how
+many tokens of context the server keeps for all requests together, and one request can still use the
+whole `--max-model-len`. `RADIANCE_FN4_KVS_BI=3` gives a streamed request the same answer alone and
+beside other requests, `RADIANCE_FN4_KVS_APART=1` keeps the prefill stage apart from the ring, and
+`RADIANCE_FN4_KVS_VIC=1` picks the ring slots to replace in parallel.
+
+**16 concurrent requests, 262,144-token context** (KV cache of 1,746,316 tokens a card):
+
+```bash
+docker run -d --name qwen --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/claude-code.env \
+  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-db846ee1 \
+  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
+  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
+  --max-num-seqs 16 --max-model-len 262144 --max-num-batched-tokens 8192 \
+  --prefill-span 4 --prefill-interleave 0 --prefix-resume nearest \
+  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
+  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --num-speculative-tokens 3 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --thinking-token-budget 16000 --default-max-tokens 32768 \
+  --vision-tower-placement ram
+run/switches.sh run/qwen/switches.json
+```
+
+**24 to 32 concurrent requests, 262,144-token context:**
+
+```bash
+docker run -d --name qwen --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/claude-code.env \
+  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 \
+  -e RADIANCE_FN4_KVS_BI=3 -e RADIANCE_FN4_KVS_APART=1 -e RADIANCE_FN4_KVS_VIC=1 \
+  -e RADIANCE_FN4_KVS_CTX=6291456 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-db846ee1 \
+  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
+  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
+  --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 8192 \
+  --prefill-span 4 --prefill-interleave 0 --prefix-resume nearest \
+  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
+  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --num-speculative-tokens 3 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --thinking-token-budget 16000 --default-max-tokens 32768 \
+  --vision-tower-placement ram --kv-resident 32768
+run/switches.sh run/qwen/switches.json
+```
+
+**24 to 32 concurrent requests, 524,288-token context:**
+
+```bash
+docker run -d --name qwen --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/claude-code.env \
+  -e RADIANCE_FN4_RESUME_COLD=1 -e RADIANCE_FN4_PREEMPT_KEEP=1 \
+  -e RADIANCE_FN4_KVS_BI=3 -e RADIANCE_FN4_KVS_APART=1 -e RADIANCE_FN4_KVS_VIC=1 \
+  -e RADIANCE_FN4_KVS_CTX=7077888 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-db846ee1 \
+  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
+  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
+  --max-num-seqs 32 --max-model-len 524288 --max-num-batched-tokens 8192 \
+  --prefill-span 4 --prefill-interleave 0 --prefix-resume nearest \
+  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
+  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --num-speculative-tokens 3 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --thinking-token-budget 16000 --default-max-tokens 32768 \
+  --vision-tower-placement ram --kv-resident 32768 --rope-scaling yarn:2
+run/switches.sh run/qwen/switches.json
+```
+
+`--rope-scaling yarn:2` extends the rotary positions to 524,288 with static YaRN, so a 524,288-token
+server answers a prompt differently from a 262,144-token server. Each of them gives the same answer
+alone and beside other requests.
+
+The table comes from a Claude Code simulation of the streaming commands, in which every session
+starts at the same time and runs 15 turns at temperature 0, with contexts of up to 170,000 tokens on
+the 262,144-token servers and up to 340,000 tokens on the 524,288-token servers. A follow-up is every
+turn after a session's first, and the time to first token and the decode speed of a request's stream
+are taken over the follow-ups.
+
+| Command | KV tokens a card | Sessions | Requests done | Preemptions | Follow-up TTFT p50 / p90 | Decode a stream |
+|---|---|---|---|---|---|---|
+| 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 24 | 360 of 360 | 0 | 1.70 / 5.11 s | 53.0 tok/s |
+| 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 32 | 480 of 480 | 0 | 2.07 / 8.92 s | 35.1 tok/s |
+| 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 24 | 345 of 360 | 0 | 3.07 / 6.86 s | 55.7 tok/s |
+| 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 32 | 322 of 480 | 0 | 3.99 / 26.75 s | 29.9 tok/s |
+
+The simulation sends no new turn after 3,000 s, which ends both 524,288-token runs before every
+session has sent its 15 turns, and no request fails in any run. The 32-session run at 262,144 tokens
+used `--max-model-len 196608 --max-num-batched-tokens 4096 --prefill-span 2` and no
+`RADIANCE_FN4_KVS_CTX`, a setting that also streams 6,291,456 tokens.
+
 ### DeepSeek
 
 ```bash
@@ -138,6 +247,8 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 
 For Qwen, use `"model": "qwen3.8-flash-next"`, and the answer is "The capital of Australia is
 Canberra. It officially became the capital in 1913 when the city was formally named and established."
+With `--rope-scaling yarn:2` at 524,288 tokens, Qwen answers "The capital of Australia is Canberra. It
+officially became the capital in 1913 when the city was named and construction began."
 
 ## What exact means
 
@@ -232,7 +343,7 @@ The `main` branch has:
   [Run it](#run-it) uses.
 
 The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches. The DeepSeek image was built from
-`deepseek/current` with `exl3/current`, and the Qwen image from `qwen/current` with `exl3/fn4-dual`
+`deepseek/current` with `exl3/current`, and both Qwen images from `qwen/current` with `exl3/fn4-dual`
 compiled with `-DEXL3R4D_DZ=2`. Every other branch is a single experiment or an earlier build, kept
 for the record.
 

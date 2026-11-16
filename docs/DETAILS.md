@@ -307,8 +307,8 @@ its own history.
 | branch prefix | upstream | contents |
 |---|---|---|
 | `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 135 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit 5f60dee1, which `deepseek/current` contains. |
-| `qwen/` | radiance main (451b136) | 21 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. The README's Qwen image is built from engine commit 4f74a8fa, which `qwen/current` contains. |
-| `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 29 branches of EXL3 kernel work for both lines. The README's DeepSeek image uses EXL3 commit 4a67be32, which `exl3/current` contains, and the Qwen image uses `exl3/fn4-dual`. |
+| `qwen/` | radiance main (451b136) | 25 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. The README's Qwen images are built from engine commits 4f74a8fa (the results) and db846ee1 (the Claude Code commands), which `qwen/current` contains. |
+| `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 29 branches of EXL3 kernel work for both lines. The README's DeepSeek image uses EXL3 commit 4a67be32, which `exl3/current` contains, and both Qwen images use `exl3/fn4-dual`. |
 
 Upstream release tags carry the same prefixes, for example `radiance/v1.15.1` and `exl3/v1.3.0`. The registry
 names branches without the prefix. A branch name alone doesn't tell whether its lever was adopted.
