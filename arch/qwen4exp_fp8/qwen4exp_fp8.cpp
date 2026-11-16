@@ -271,6 +271,9 @@ struct Model {
      * read on this rank's quarter of each piece between them, the codes redone on every row (HyperConn::codes), and the
      * wide stream gathered raw after the last layer (sp_agh). */
     rad_op    sp_rs = 0, sp_ag = 0, sp_agh = 0;
+    /* fn4 SP-route (16.11.2026, qwen/prefill; RADIANCE_FN4_SP_ROUTE declares, switch sp_route): the router logits' all-gather
+     * of an SP-hc piece (raw rows of n_expert_all), declared beside SP-hc */
+    rad_op    sp_agl = 0;
     bool      sp_on = false;
     /* fn4 KVCAP C1 (15.11.2026, qwen/KV-BOUNDS.md): the most rows one sp_agh launch carries, its declared bound. Both issue
      * sites carry at most a pass or an SP-serial segment (a pipelined piece <= pass_rows; an SP-serial run's T <=
@@ -1749,6 +1752,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           RAD_NOWEIGHTS),
                       {m.b_h}, {m.b_h});
         m.sp_agh_rows = agh_rows;
+        if (fn4_env_on("RADIANCE_FN4_SP_ROUTE") && g.wire_exact && m.b_rlogits) {   /* fn4 SP-route */
+            const int64_t NE = m.moecfg.n_expert_all;
+            if (NE % 32 == 0) {
+                m.sp_agl = rw(b, RAD_OP(b, "all_gather_rows",
+                                  RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * NE, T * NE),
+                                             RAD_STR("dtype", g.dtype), RAD_INT("row", NE), RAD_INT("raw", 1),
+                                             RAD_INT("overlap", 1)),
+                                  RAD_NOWEIGHTS),
+                              {m.b_rlogits}, {m.b_rlogits});
+                if (m.sp_agl) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_rlogits));
+            }
+            if (g.rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: qwen4exp: fn4 SP-route %s (RADIANCE_FN4_SP_ROUTE; switch sp_route: the router GEMM on "
+                                "each rank's quarter of an SP-hc piece, the logits gathered raw)\n",
+                        m.sp_agl ? "declared" : "NOT served -- all_gather_rows over the logits did not resolve");
+        }
         bool ok = m.sp_rs && m.sp_ag && m.sp_agh;
         const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : T;
         for (Layer& lay : m.layers) {
@@ -2195,6 +2214,17 @@ static std::atomic<int>& fn4_spple_flag() {
     static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_SP_PLE") ? 1 : 0};
     return f;
 }
+/* fn4 SP-route (16.11.2026, qwen/prefill; switch "sp_route", RADIANCE_FN4_SP_ROUTE at start declares it and gives its value;
+ * 0 = today): in a pipelined hc_sp 2 step whose pieces all take SP, each rank runs the router GEMM on its own quarter of a
+ * piece right after the quarter's connection read (MoeFP8::route_rows), the logits rows go to every rank with a raw
+ * all-gather on the second lane beside it (sp_agl, after the piece's block-input gather), and the piece's MoE pass skips its
+ * GEMM (pass(..., routed)): the router's 2048-row GEMM, replicated on all four ranks today, becomes one 512-row GEMM a rank.
+ * The logits bytes are the same (a row's logits do not depend on the launch's other rows), so the top-k, the scatter and
+ * everything after them are today's. */
+static std::atomic<int>& fn4_sproute_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_SP_ROUTE") ? 1 : 0};
+    return f;
+}
 constexpr int64_t kSpMinRows = 64;
 /* fn4 KVCAP C1: an sp_agh launch of `rows` rows fits the bound its peer scratch was declared for (Model::sp_agh_rows);
  * past it the step fails with the reason, before the launch (the core would refuse the count as outside the op's bucket
@@ -2375,14 +2405,26 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
              * p's gather, the wait, piece p + 1's gather and piece p - 1's MoE reduce-scatter beside piece p's codes + MoE.
              * Piece p + 2's mixer reduce-scatter goes out before piece p + 1's write, so the wait at p covers it. */
             if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; }
+            /* fn4 SP-route: the router on this rank's quarter right after its read (lane 0), its logits gathered behind the
+             * piece's block-input gather (lane 1), the pass without its GEMM */
+            const bool rsp = m.sp_agl && fn4_sproute_flag().load(std::memory_order_relaxed) > 0;
+            const int64_t NE = m.moecfg.n_expert_all;
+            bool routed[8] = { false, false, false, false, false, false, false, false };
+            auto rq = [&](int64_t p) { if (rsp && p < 8) routed[p] = l.mlp.route_rows(c, rn(p), hq0(p), hqn(p)); };
+            auto agl = [&](int64_t p) {
+                if (p < 8 && routed[p])
+                    on1(true, [&] { RAD_ISSUE_N(c, m.sp_agl, rn(p) * NE, brow_slice(m.b_rlogits, r0(p), rn(p), NE), RAD_NONE); });
+            };
             {
                 const bool ss0 = hw(l.hc_mix, 0);
                 bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
                 hr(l.hc_ffn, 0, ss0);
                 bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
+                rq(0);
             }
             wait1();
             on1(true, [&] { ag_p(0); });
+            agl(0);
             for (int64_t p = 0; p < K; ++p) {
                 if (p + 1 < K) {
                     if (p + 2 < K && p + 2 >= issued) { on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3; }
@@ -2390,12 +2432,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                     bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
                     hr(l.hc_ffn, p + 1, ss);
                     bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
+                    rq(p + 1);
                 }
                 wait1();
-                if (p + 1 < K) on1(true, [&] { ag_p(p + 1); });
+                if (p + 1 < K) { on1(true, [&] { ag_p(p + 1); }); agl(p + 1); }
                 if (sp_pend >= 0) { const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
                 l.hc_ffn.codes(c, r0(p), rn(p));
-                l.mlp.pass(c, T, r0(p), rn(p), false);
+                l.mlp.pass(c, T, r0(p), rn(p), false, p < 8 && routed[p]);
                 sp_pend = p;
             }
         } else
@@ -3114,6 +3157,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "sp_ple") == 0) {   /* fn4 SP-PLE (qwen/SP-SERIAL-EXACT.md): SP-hc keeps the layers before the PLE's replicated */
         if (value < 0 || value > 1) return -1;
         qwen4exp_fp8::fn4_spple_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares) */
+        if (value < 0 || value > 1) return -1;
+        if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
+        qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */

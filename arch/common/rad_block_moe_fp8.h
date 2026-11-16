@@ -564,7 +564,16 @@ struct MoeFP8 {
     void step_rows(RadCtx* c, int64_t T) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
      * all-reduce itself (issue_ar), as GdnFP8::step describes. */
-    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true) const;
+    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true, bool routed = false) const;
+    /* fn4 SP-route (16.11.2026, qwen/prefill; switch sp_route): the router GEMM alone over rows [r0, r0 + rows) of a pass of
+     * `pass_rows` rows -- an SP-hc piece's quarter on its rank, before the piece's all-gather -- where pass() at that height
+     * issues the separate router (no fused router, no sigmoid form, an external norm, no expert prefetch); the caller then
+     * gathers the logits rows to every rank (raw) and calls pass(..., routed = true), which skips the GEMM and runs the
+     * top-k and everything after it over the whole piece. A row's logits do not depend on the launch's other rows
+     * (gemm_bf16_nt_tiled: the same WMMA chain and split count at every M, BYTE-IDENTICAL to the skinny row), so the
+     * gathered rows are the bytes today's whole-piece GEMM writes. False when the form does not apply. */
+    bool route_rows(RadCtx* c, int64_t pass_rows, int64_t r0, int64_t rows) const;
+    rad_buf logits_buf() const { return w.logits; }
     /* fn4 P2x (10.11.2026; ported from fn4-c16 3b88be82 with the EXL3 and protected-expert forms): the routed experts
      * of a pipelined step's pieces [0, R) and [R, T) in ONE pass (every touched expert read and decoded once for both),
      * the rest a piece at a time as pass() issues it. pair_routed: per piece the router and the top-k (pass()'s forms
@@ -1992,7 +2001,17 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  *
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
-inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar) const {
+inline bool MoeFP8::route_rows(RadCtx* c_, int64_t pass_rows, int64_t r0, int64_t rows) const {
+    if (!op_router || c.sigmoid_router || rows <= 0 || !ext_in) return false;
+    if (op_sigmoid_scatter && pass_rows <= sigmoid_scatter_rows) return false;
+    if (op_router_fused && pass_rows <= router_fused_now()) return false;
+    if (xp_next && xp_next->xp.n_parts > 0) return false;
+    RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
+                brow_slice(w.logits, r0, rows, c.n_expert_all));
+    return true;
+}
+
+inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar, bool routed) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -2050,7 +2069,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     brow_slice(w.ids, r0, rows, k), brow_slice(w.ew, r0, rows, k),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), ecnt,
                     router_fused_gate ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE);
-    else
+    else if (!routed)   /* fn4 SP-route: the caller issued the GEMM on every rank's quarter and gathered the logits */
         RAD_ISSUE_N(c_, op_router, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_W(w_router),
                     brow_slice(w.logits, r0, rows, ne_all));
     /* topk + scatter fused, or the pair. In the fused op `w.ids` is an output. */
