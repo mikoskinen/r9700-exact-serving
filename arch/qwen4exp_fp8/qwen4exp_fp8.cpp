@@ -2161,6 +2161,19 @@ static std::atomic<int>& fn4_sp_flag() {
     static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_HC_SP") ? 1 : 0};
     return f;
 }
+/* fn4 SP-PLE (16.11.2026, qwen/SP-SERIAL-EXACT.md; switch "sp_ple", RADIANCE_FN4_SP_PLE at start; 0 = today): in a pipelined
+ * SP-hc step the layers before the PLE's (Flash-Next: blk.0) run replicated, as step_serial_sp runs them. Today SP-hc
+ * splits blk.0 too, so when the PLE runs (over every row: its gate reads the wide stream, its dilated convolution reads the
+ * nine rows before each one) a rank holds blk.0's update only on its own quarters: every other row of `h` is still the
+ * step's entry stream. Two things then take those stale rows: the convolution of the first nine rows of each quarter
+ * (their taps reach into the previous rank's quarter), and the window the step leaves for the next one (the chunk's
+ * last nine rows' conv input, which only the rank owning them computes from the real stream -- every other rank keeps a
+ * different window, and the next step's first nine rows read it). 1: blk.0 with its all-reduces and whole-row reads /
+ * writes, so the PLE sees the whole stream on every rank; SP from blk.1's read on. */
+static std::atomic<int>& fn4_spple_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_SP_PLE") ? 1 : 0};
+    return f;
+}
 constexpr int64_t kSpMinRows = 64;
 /* fn4 KVCAP C1: an sp_agh launch of `rows` rows fits the bound its peer scratch was declared for (Model::sp_agh_rows);
  * past it the step fails with the reason, before the launch (the core would refuse the count as outside the op's bucket
@@ -2199,25 +2212,34 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     const bool spp = !sp && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
-    auto sp_p = [&](int64_t p) { return sp && rn(p) == R && rn(p) >= kSpMinRows; };
-    auto hq0 = [&](int64_t p) {
-        if (!(spp || sp_p(p))) return r0(p);
+    /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
+     * every rank. spL: the layer being issued; a connection read for the next layer takes that layer's (spN below). */
+    const int64_t spl0 = sp && fn4_spple_flag().load(std::memory_order_relaxed) > 0 && m.ple_layer > 0 ? m.ple_layer : 0;
+    auto lsp = [&](int64_t li) { return sp && li >= spl0; };
+    bool spL = sp;
+    auto sp_pm = [&](int64_t p, bool on) { return on && rn(p) == R && rn(p) >= kSpMinRows; };
+    auto sp_p = [&](int64_t p) { return sp_pm(p, spL); };
+    auto hq0m = [&](int64_t p, bool on) {
+        if (!(spp || sp_pm(p, on))) return r0(p);
         const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
         return r0(p) + (lo < rn(p) ? lo : rn(p) - 1);
     };
-    auto hqn = [&](int64_t p) {
-        if (!(spp || sp_p(p))) return rn(p);
+    auto hqnm = [&](int64_t p, bool on) {
+        if (!(spp || sp_pm(p, on))) return rn(p);
         const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
         const int64_t n = rn(p) - lo < q ? rn(p) - lo : q;
         return n > 0 ? n : (int64_t)0;
     };
+    auto hq0 = [&](int64_t p) { return hq0m(p, spL); };
+    auto hqn = [&](int64_t p) { return hqnm(p, spL); };
     /* a connection's write / read on piece p's rows of this rank (none when the quarter is empty: SP only) */
     auto hw = [&](const HyperConn& h, int64_t p) { return hqn(p) > 0 ? h.write(c, T, hq0(p), hqn(p)) : false; };
-    auto hr = [&](const HyperConn& h, int64_t p, bool ss) {
-        if (hqn(p) <= 0) return;
-        if (sp_p(p) && h.op_read_sp) h.read_sp(c, T, hq0(p), hqn(p), ss);
-        else h.read(c, T, hq0(p), hqn(p), ss);
+    auto hrm = [&](const HyperConn& h, int64_t p, bool ss, bool on) {
+        if (hqnm(p, on) <= 0) return;
+        if (sp_pm(p, on) && h.op_read_sp) h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss);
+        else h.read(c, T, hq0m(p, on), hqnm(p, on), ss);
     };
+    auto hr = [&](const HyperConn& h, int64_t p, bool ss) { hrm(h, p, ss, spL); };
     /* SP's collectives on piece p of a_x (the block output; the next block input) and of the wide stream */
     auto rs_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_rs, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
     auto ag_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_ag, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
@@ -2270,11 +2292,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     }
     for (int64_t li = 0; li < n; ++li) {
         const Layer& l = m.layers[(size_t)li];
+        spL = lsp(li);
+        const bool spN = lsp(li + 1);   /* the next layer's connection read (fn4 SP-PLE) */
         /* The mixer finishes its output a piece at a time where its last stages are per row and
          * hands the first pieces' reductions to the second lane as it goes (ArPieces), so the
          * first piece's all-reduce runs beside the next piece's attention or out projection. */
         MixAr ms{c, &l};
-        if (sp) { ms.rs = m.sp_rs; ms.x = m.a_x.x; ms.n_embd = g.n_embd; ms.sp_min = kSpMinRows; }
+        if (spL) { ms.rs = m.sp_rs; ms.x = m.a_x.x; ms.n_embd = g.n_embd; ms.sp_min = kSpMinRows; }
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
@@ -2398,32 +2422,32 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             const bool projected = l.proj.step(c, batch, r0(p), rn(p));
             bt_pt(c, m, m.b_h, r0(p), rn(p), "h_ffn", (int)li);
             if (nx && !ple_next) {
-                if (sp_p(p)) hr(nx->hc_mix, p, ss_ffn && !projected);
-                else bi_read(c, m, nx->hc_mix, T, hq0(p), hqn(p), ss_ffn && !projected);
+                if (sp_pm(p, spN)) hrm(nx->hc_mix, p, ss_ffn && !projected, spN);
+                else bi_read(c, m, nx->hc_mix, T, hq0m(p, spN), hqnm(p, spN), ss_ffn && !projected);
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)li + 1, false);   /* lane 1 holds the last piece's rows only */
-                if (sp_p(p)) on1(true, [&] { ag_p(p); });   /* fn4 SP-hc: the next block's input, every quarter */
+                if (sp_pm(p, spN)) on1(true, [&] { ag_p(p); });   /* fn4 SP-hc: the next block's input, every quarter */
             }
         }
         if (ple_next) {
             m.ple.step(c, batch);
             bt_pt(c, m, m.b_h, 0, T, "ple", (int)li + 1);
             for (int64_t p = 0; p < K; ++p) {
-                if (sp_p(p)) hr(nx->hc_mix, p, false); else bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
+                if (sp_pm(p, spN)) hrm(nx->hc_mix, p, false, spN); else bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)li + 1, false);
-                if (sp_p(p)) on1(true, [&] { ag_p(p); });
+                if (sp_pm(p, spN)) on1(true, [&] { ag_p(p); });
             }
         }
         /* fn4 SP-hc: the gathered inputs' codes on every row, before the next block reads them */
-        if (sp && nx && spo && !ple_next) {
+        if (spN && nx && spo && !ple_next) {
             /* hc_sp 2: the writes' last-piece wait already joined every gather but the last piece's: their codes beside it */
             for (int64_t p = 0; p + 1 < K; ++p)
-                if (sp_p(p)) nx->hc_mix.codes(c, r0(p), rn(p));
+                if (sp_pm(p, spN)) nx->hc_mix.codes(c, r0(p), rn(p));
             wait1();
-            if (sp_p(K - 1)) nx->hc_mix.codes(c, r0(K - 1), rn(K - 1));
-        } else if (sp && nx) {
+            if (sp_pm(K - 1, spN)) nx->hc_mix.codes(c, r0(K - 1), rn(K - 1));
+        } else if (spN && nx) {
             wait1();
             for (int64_t p = 0; p < K; ++p)
-                if (sp_p(p)) nx->hc_mix.codes(c, r0(p), rn(p));
+                if (sp_pm(p, spN)) nx->hc_mix.codes(c, r0(p), rn(p));
         }
     }
     /* fn4 SP-hc: after the last layer every rank holds only its quarters of the wide stream; the output mixer and the
@@ -3058,6 +3082,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         if (value < 0 || value > 1) return -1;
         if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_MTPFLAT")) return -1;
         rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "sp_ple") == 0) {   /* fn4 SP-PLE (qwen/SP-SERIAL-EXACT.md): SP-hc keeps the layers before the PLE's replicated */
+        if (value < 0 || value > 1) return -1;
+        qwen4exp_fp8::fn4_spple_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */
