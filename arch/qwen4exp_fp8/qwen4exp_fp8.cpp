@@ -102,6 +102,9 @@
 #include <arch/rad_qsa.h>
 #include <arch/rad_block_vit.h>
 
+#include <chrono>
+#include <thread>
+
 namespace qwen4exp_fp8 {
 
 /* fn4 (9.11.2026): an environment switch set and not 0. */
@@ -2179,6 +2182,19 @@ static std::atomic<int>& fn4_sp_flag() {
     static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_HC_SP") ? 1 : 0};
     return f;
 }
+/* fn4 SP-PLE (16.11.2026, qwen/SP-SERIAL-EXACT.md; switch "sp_ple", RADIANCE_FN4_SP_PLE at start; 0 = today): in a pipelined
+ * SP-hc step the layers before the PLE's (Flash-Next: blk.0) run replicated, as step_serial_sp runs them. Today SP-hc
+ * splits blk.0 too, so when the PLE runs (over every row: its gate reads the wide stream, its dilated convolution reads the
+ * nine rows before each one) a rank holds blk.0's update only on its own quarters: every other row of `h` is still the
+ * step's entry stream. Two things then take those stale rows: the convolution of the first nine rows of each quarter
+ * (their taps reach into the previous rank's quarter), and the window the step leaves for the next one (the chunk's
+ * last nine rows' conv input, which only the rank owning them computes from the real stream -- every other rank keeps a
+ * different window, and the next step's first nine rows read it). 1: blk.0 with its all-reduces and whole-row reads /
+ * writes, so the PLE sees the whole stream on every rank; SP from blk.1's read on. */
+static std::atomic<int>& fn4_spple_flag() {
+    static std::atomic<int> f{fn4_env_on("RADIANCE_FN4_SP_PLE") ? 1 : 0};
+    return f;
+}
 constexpr int64_t kSpMinRows = 64;
 /* fn4 KVCAP C1: an sp_agh launch of `rows` rows fits the bound its peer scratch was declared for (Model::sp_agh_rows);
  * past it the step fails with the reason, before the launch (the core would refuse the count as outside the op's bucket
@@ -2217,25 +2233,34 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     const bool spp = !sp && g.world > 1 && fn4_spprobe_flag().load(std::memory_order_relaxed);
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
-    auto sp_p = [&](int64_t p) { return sp && rn(p) == R && rn(p) >= kSpMinRows; };
-    auto hq0 = [&](int64_t p) {
-        if (!(spp || sp_p(p))) return r0(p);
+    /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
+     * every rank. spL: the layer being issued; a connection read for the next layer takes that layer's (spN below). */
+    const int64_t spl0 = sp && fn4_spple_flag().load(std::memory_order_relaxed) > 0 && m.ple_layer > 0 ? m.ple_layer : 0;
+    auto lsp = [&](int64_t li) { return sp && li >= spl0; };
+    bool spL = sp;
+    auto sp_pm = [&](int64_t p, bool on) { return on && rn(p) == R && rn(p) >= kSpMinRows; };
+    auto sp_p = [&](int64_t p) { return sp_pm(p, spL); };
+    auto hq0m = [&](int64_t p, bool on) {
+        if (!(spp || sp_pm(p, on))) return r0(p);
         const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
         return r0(p) + (lo < rn(p) ? lo : rn(p) - 1);
     };
-    auto hqn = [&](int64_t p) {
-        if (!(spp || sp_p(p))) return rn(p);
+    auto hqnm = [&](int64_t p, bool on) {
+        if (!(spp || sp_pm(p, on))) return rn(p);
         const int64_t q = (rn(p) + g.world - 1) / g.world, lo = (int64_t)g.rank * q;
         const int64_t n = rn(p) - lo < q ? rn(p) - lo : q;
         return n > 0 ? n : (int64_t)0;
     };
+    auto hq0 = [&](int64_t p) { return hq0m(p, spL); };
+    auto hqn = [&](int64_t p) { return hqnm(p, spL); };
     /* a connection's write / read on piece p's rows of this rank (none when the quarter is empty: SP only) */
     auto hw = [&](const HyperConn& h, int64_t p) { return hqn(p) > 0 ? h.write(c, T, hq0(p), hqn(p)) : false; };
-    auto hr = [&](const HyperConn& h, int64_t p, bool ss) {
-        if (hqn(p) <= 0) return;
-        if (sp_p(p) && h.op_read_sp) h.read_sp(c, T, hq0(p), hqn(p), ss);
-        else h.read(c, T, hq0(p), hqn(p), ss);
+    auto hrm = [&](const HyperConn& h, int64_t p, bool ss, bool on) {
+        if (hqnm(p, on) <= 0) return;
+        if (sp_pm(p, on) && h.op_read_sp) h.read_sp(c, T, hq0m(p, on), hqnm(p, on), ss);
+        else h.read(c, T, hq0m(p, on), hqnm(p, on), ss);
     };
+    auto hr = [&](const HyperConn& h, int64_t p, bool ss) { hrm(h, p, ss, spL); };
     /* SP's collectives on piece p of a_x (the block output; the next block input) and of the wide stream */
     auto rs_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_rs, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
     auto ag_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_ag, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
@@ -2288,11 +2313,13 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     }
     for (int64_t li = 0; li < n; ++li) {
         const Layer& l = m.layers[(size_t)li];
+        spL = lsp(li);
+        const bool spN = lsp(li + 1);   /* the next layer's connection read (fn4 SP-PLE) */
         /* The mixer finishes its output a piece at a time where its last stages are per row and
          * hands the first pieces' reductions to the second lane as it goes (ArPieces), so the
          * first piece's all-reduce runs beside the next piece's attention or out projection. */
         MixAr ms{c, &l};
-        if (sp) { ms.rs = m.sp_rs; ms.x = m.a_x.x; ms.n_embd = g.n_embd; ms.sp_min = kSpMinRows; }
+        if (spL) { ms.rs = m.sp_rs; ms.x = m.a_x.x; ms.n_embd = g.n_embd; ms.sp_min = kSpMinRows; }
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
@@ -2416,32 +2443,32 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             const bool projected = l.proj.step(c, batch, r0(p), rn(p));
             bt_pt(c, m, m.b_h, r0(p), rn(p), "h_ffn", (int)li);
             if (nx && !ple_next) {
-                if (sp_p(p)) hr(nx->hc_mix, p, ss_ffn && !projected);
-                else bi_read(c, m, nx->hc_mix, T, hq0(p), hqn(p), ss_ffn && !projected);
+                if (sp_pm(p, spN)) hrm(nx->hc_mix, p, ss_ffn && !projected, spN);
+                else bi_read(c, m, nx->hc_mix, T, hq0m(p, spN), hqnm(p, spN), ss_ffn && !projected);
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)li + 1, false);   /* lane 1 holds the last piece's rows only */
-                if (sp_p(p)) on1(true, [&] { ag_p(p); });   /* fn4 SP-hc: the next block's input, every quarter */
+                if (sp_pm(p, spN)) on1(true, [&] { ag_p(p); });   /* fn4 SP-hc: the next block's input, every quarter */
             }
         }
         if (ple_next) {
             m.ple.step(c, batch);
             bt_pt(c, m, m.b_h, 0, T, "ple", (int)li + 1);
             for (int64_t p = 0; p < K; ++p) {
-                if (sp_p(p)) hr(nx->hc_mix, p, false); else bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
+                if (sp_pm(p, spN)) hrm(nx->hc_mix, p, false, spN); else bi_read(c, m, nx->hc_mix, T, r0(p), rn(p));
                 bt_rd(c, m, r0(p), rn(p), "rd_mix", (int)li + 1, false);
-                if (sp_p(p)) on1(true, [&] { ag_p(p); });
+                if (sp_pm(p, spN)) on1(true, [&] { ag_p(p); });
             }
         }
         /* fn4 SP-hc: the gathered inputs' codes on every row, before the next block reads them */
-        if (sp && nx && spo && !ple_next) {
+        if (spN && nx && spo && !ple_next) {
             /* hc_sp 2: the writes' last-piece wait already joined every gather but the last piece's: their codes beside it */
             for (int64_t p = 0; p + 1 < K; ++p)
-                if (sp_p(p)) nx->hc_mix.codes(c, r0(p), rn(p));
+                if (sp_pm(p, spN)) nx->hc_mix.codes(c, r0(p), rn(p));
             wait1();
-            if (sp_p(K - 1)) nx->hc_mix.codes(c, r0(K - 1), rn(K - 1));
-        } else if (sp && nx) {
+            if (sp_pm(K - 1, spN)) nx->hc_mix.codes(c, r0(K - 1), rn(K - 1));
+        } else if (spN && nx) {
             wait1();
             for (int64_t p = 0; p < K; ++p)
-                if (sp_p(p)) nx->hc_mix.codes(c, r0(p), rn(p));
+                if (sp_pm(p, spN)) nx->hc_mix.codes(c, r0(p), rn(p));
         }
     }
     /* fn4 SP-hc: after the last layer every rank holds only its quarters of the wide stream; the output mixer and the
@@ -2497,6 +2524,19 @@ static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_
         dbg_resid(c, (int)li, "mix", g.n_embd, m.b_h, m.a_x.x);
         bi_read_pieces(c, m, l.hc_ffn, T, ss_mix);
         bt_rd(c, m, 0, T, "rd_ffn", (int)li, true);
+        static const bool bt_sp_ser = [] { const char* e = std::getenv("RADIANCE_FN4_BITRACE_SP"); return e && *e && *e != '0'; }();
+        if (m.bt.on && bt_sp_ser && !l.mlp.op_add) {
+            /* tracer only (RADIANCE_FN4_BITRACE_SP, qwen/SP-SERIAL-EXACT.md): the same passes and all-reduces as mlp.step,
+             * the block's partial traced before its all-reduce (step_serial_sp's moe_part) */
+            for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows)
+                l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
+            bt_pt(c, m, m.a_x.x, 0, T, "moe_part", (int)li);
+            for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows) {
+                const int64_t n = std::min<int64_t>(l.mlp.c.rows, T - r0);
+                if (l.mlp.issues_ar(T, n)) l.mlp.issue_ar(c, r0, n, false);
+            }
+            l.mlp.route_report(c);
+        } else
         l.mlp.step(c, batch);
         bt_moe(c, m, T, (int)li);
         bt_pt(c, m, m.a_x.x, 0, T, l.hc_ffn.takes_ar(T) ? "moep" : "moe", (int)li);
@@ -2577,7 +2617,10 @@ static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
     const int mode = fn4_spser_flag().load(std::memory_order_relaxed);
     if (!m.spser_ok || g.world != 4 || mode <= 0) return false;
     /* (media rows are scattered into the embedding before the first read, which every rank still holds whole) */
-    if (m.bt.on || dbg_resid_on() || m.moecfg.calib || !m.op_embed_ar) return false;
+    /* fn4 BI tracer + SP-serial (16.11.2026, qwen/KV-STREAM-EXACT.md 5d): RADIANCE_FN4_BITRACE_SP=1 keeps SP-serial on under the
+     * tracer (a rank's hc rows outside its part are then not this step's: compare a part's rows on its own rank only) */
+    static const bool bt_sp = [] { const char* e = std::getenv("RADIANCE_FN4_BITRACE_SP"); return e && *e && *e != '0'; }();
+    if ((m.bt.on && !bt_sp) || dbg_resid_on() || m.moecfg.calib || !m.op_embed_ar) return false;
     /* the PLE's convolution mixes rows of the stream: the layers up to it run replicated (step_serial_sp), so it must leave
      * some to split */
     if (m.ple_layer + 1 >= (int64_t)m.layers.size()) return false;
@@ -2602,6 +2645,11 @@ static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
     return true;
 }
 
+/* diagnostic only (qwen/SP-SERIAL-EXACT.md): RADIANCE_FN4_SPDIAG bit mask, tracer starts only (host syncs) */
+static int spdiag() {
+    static const int v = [] { const char* e = std::getenv("RADIANCE_FN4_SPDIAG"); return e && *e ? std::atoi(e) : 0; }();
+    return v;
+}
 static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu, const SpSer& sp) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, D = g.n_embd, HN = m.hccfg.hc * g.n_embd;
@@ -2621,10 +2669,20 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
         rad_lane(c, 0);
     };
     auto wait1 = [&] { if (l2) rad_lane_join(c, 1, 0); };
+    if (spdiag() & 1) {   /* diagnostic: both lanes drained on the host before the step */
+        rad_lane(c, 1); rad_stream_sync(rad_stream(c)); rad_lane(c, 0); rad_stream_sync(rad_stream(c));
+    }
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
     on1(true, [&] { RAD_ISSUE_N(c, m.op_embed_ar, T * D, brows(m.a_x.x, T), RAD_NONE); });
+    if (spdiag() & 16) {   /* diagnostic: one more all-reduce on the instance (the embedding's again, of zeros added:
+                            * a_x.x unchanged in value? no -- the embedding AR sums disjoint rows, so a second AR would
+                            * multiply; use the gather of the whole step instead, which copies every rank's own rows) */
+        const SpSer::Run allr = [&] { SpSer::Run r; r.r0 = 0; r.n = T; return r; }();
+        (void)allr;
+        RAD_ISSUE_N(c, m.sp_ag, T * D, brow_slice(m.a_x.x, 0, T, D), RAD_NONE);   /* after the AR every rank holds every row: a no-op copy */
+    }
     wait1();
     if (m.ple_layer >= 0) m.ple.ids(c, batch);
     m.enter.step(c, T);
@@ -2649,13 +2707,62 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     /* One connection between two blocks: reduce-scatter the block's partials, this rank's rows written (+ `after`, e.g. the
      * control vector) and read by the next connection `nx` (none after the last layer), the block input gathered and coded.
      * Two runs: run 1's reduce-scatter beside run 0's write + read, run 0's gather beside run 1's. */
-    auto conn = [&](const HyperConn& wr, const HyperConn* nx, auto&& after) {
+    /* tnm / tli: the BI tracer's point for the write's output on this rank's rows (step_serial's "h_mix" / "h_ffn"; only
+     * under RADIANCE_FN4_BITRACE_SP, qwen/KV-STREAM-EXACT.md 5d) and, after the gather, the block input on every row */
+    auto conn = [&](const HyperConn& wr, const HyperConn* nx, auto&& after, const char* tnm = nullptr, int tli = -1) {
         if (sp.nrun == 1) {
             const SpSer::Run& r = sp.run[0];
             rs(r);
+            if (tnm) bt_pt(c, m, m.a_x.x, r.lo, r.hi - r.lo, tli >= 0 && tnm[2] == 'm' ? "blk" : "moe", tli);
             bool ss = wr.write(c, T, r.lo, r.hi - r.lo);
             if (after(r)) ss = false;
-            if (nx) { rd(*nx, r, ss); ag(r); codes(*nx, 0, T); }
+            if (tnm) bt_pt(c, m, m.b_h, r.lo, r.hi - r.lo, tnm, tli);
+            if (nx) {
+                rd(*nx, r, ss);
+                /* diagnostic only (RADIANCE_FN4_SPDUMP=<dir>, RADIANCE_FN4_SPDUMP_T=<rows>): the block input of every row
+                 * before and after the gather, bytes to <dir>/r<rank>-s<step>-<point>.bin (qwen/SP-SERIAL-EXACT.md) */
+                static const char* sdd = [] { const char* e = std::getenv("RADIANCE_FN4_SPDUMP"); return e && *e ? e : (const char*)nullptr; }();
+                static const int64_t sdt = [] { const char* e = std::getenv("RADIANCE_FN4_SPDUMP_T"); return e && *e ? (int64_t)std::atoll(e) : (int64_t)0; }();
+                const bool sdump = sdd && T == sdt && tli == 1;
+                auto dumpx = [&](const char* what) {
+                    if (!sdump) return;
+                    std::vector<uint16_t> hb((size_t)(T * D));
+                    const RadStream st = rad_stream(c);
+                    rad_memcpy_async(hb.data(), rad_buf_ptr(c, m.a_x.x), (size_t)(T * D * 2), st);
+                    rad_stream_sync(st);
+                    char fn[600];
+                    snprintf(fn, sizeof fn, "%s/r%d-s%lld-L%02d-%s-%s.bin", sdd, g.rank, (long long)batch->step, tli, tnm ? tnm : "x", what);
+                    if (FILE* f = fopen(fn, "wb")) { fwrite(hb.data(), 2, hb.size(), f); fclose(f); }
+                };
+                dumpx("pre_ag");
+                /* the read's outputs on this rank's rows (step_serial's rd_ffn / rd_mix), then the gathered + coded block
+                 * input on every row (rdg_*: compare with step_serial's rd_* on all rows) */
+                const bool fnx = tnm && tnm[2] == 'm';
+                const int  lnx = fnx ? tli : tli + 1;
+                if (tnm) bt_rd(c, m, r.lo, r.hi - r.lo, fnx ? "rd_ffn" : "rd_mix", lnx, fnx);
+                ag(r);
+                if (spdiag() & 2) ag(r);   /* diagnostic: the same gather a second time */
+                dumpx("post_ag");
+                codes(*nx, 0, T);
+                dumpx("post_codes");
+                if (sdump) {
+                    /* the codes the shaders wrote from the gathered rows (their view of x), rows [0, T) */
+                    const rad_buf qb = nx->c.codes_i8 ? m.a_x.q8 : m.a_x.q, sb = nx->c.codes_i8 ? m.a_x.s8 : m.a_x.s;
+                    std::vector<uint8_t> hq((size_t)(T * D));
+                    std::vector<float> hs((size_t)(T * (D / 128)));
+                    const RadStream st = rad_stream(c);
+                    rad_memcpy_async(hq.data(), rad_buf_ptr(c, qb), (size_t)(T * D), st);
+                    rad_memcpy_async(hs.data(), rad_buf_ptr(c, sb), hs.size() * 4, st);
+                    rad_stream_sync(st);
+                    char fn[600];
+                    snprintf(fn, sizeof fn, "%s/r%d-s%lld-L%02d-%s-codes%s.bin", sdd, g.rank, (long long)batch->step, tli, tnm ? tnm : "x",
+                             nx->c.codes_i8 ? "i8" : "f8");
+                    if (FILE* f = fopen(fn, "wb")) { fwrite(hq.data(), 1, hq.size(), f); fwrite(hs.data(), 4, hs.size(), f); fclose(f); }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    dumpx("post_codes_100ms");
+                }
+                if (tnm) bt_rd(c, m, 0, T, fnx ? "rdg_ffn" : "rdg_mix", lnx, fnx);
+            }
             return;
         }
         auto half = [&](const SpSer::Run& r) {
@@ -2696,6 +2803,7 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             else        l.gdn.step(c, batch, !l2);
             if (l2) ar_all();
             const bool ss_mix = l.hc_mix.write(c, T, 0, T);
+            bt_pt(c, m, m.b_h, 0, T, "h_mix", (int)li);
             bi_read_pieces(c, m, l.hc_ffn, T, ss_mix);
             if (!l2) l.mlp.step(c, batch);
             else {
@@ -2706,18 +2814,20 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             }
             bool ss = l.hc_ffn.write(c, T, 0, T);
             if (l.proj.step(c, batch, 0, T)) ss = false;
+            bt_pt(c, m, m.b_h, 0, T, "h_ffn", (int)li);
             if (li + 1 == m.ple_layer) { m.ple.step(c, batch); ss = false; }
             bi_read_pieces(c, m, m.layers[(size_t)li + 1].hc_mix, T, ss);
             continue;
         }
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false); }
         else        l.gdn.step(c, batch, false);
-        conn(l.hc_mix, &l.hc_ffn, none);
+        conn(l.hc_mix, &l.hc_ffn, none, m.bt.on ? "h_mix" : nullptr, (int)li);
         for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows)
             l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
         l.mlp.route_report(c);
+        if (m.bt.on) { bt_moe(c, m, T, (int)li); bt_pt(c, m, m.a_x.x, 0, T, "moe_part", (int)li); }   /* routing, shared arm, partial */
         conn(l.hc_ffn, li + 1 < nl ? &m.layers[(size_t)li + 1].hc_mix : nullptr,
-             [&](const SpSer::Run& r) { return l.proj.step(c, batch, r.r0, r.n); });
+             [&](const SpSer::Run& r) { return l.proj.step(c, batch, r.r0, r.n); }, m.bt.on ? "h_ffn" : nullptr, (int)li);
     }
     /* the output mixer and the MTP head read every row of the wide stream */
     for (int k = 0; k < sp.nrun; ++k)
@@ -2726,6 +2836,7 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             RAD_ISSUE_N(c, m.sp_agh, sp.run[k].n * HN, brow_slice(m.b_h, sp.run[k].r0, sp.run[k].n, HN), RAD_NONE);
         });
     wait1();
+    bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* the gathered wide stream (BI tracer under RADIANCE_FN4_BITRACE_SP) */
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
@@ -2776,6 +2887,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     else if (spser_plan(m, batch, sp)) step_serial_sp(c, batch, m, pcu, sp);   /* fn4 SP-serial */
     else                               step_serial(c, batch, m, pcu);
 
+    if (!pipelined(m, T) && !sp.nrun) bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* step_serial's wide stream (step_serial_sp: its own) */
     bi_read_pieces(c, m, m.mixer, T);
     bt_pt(c, m, m.a_x.x, 0, T, "final", -1);
 
@@ -2997,6 +3109,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         if (value < 0 || value > 1) return -1;
         if (value && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_MTPFLAT")) return -1;
         rad::arch::fn4_mtpflat_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "sp_ple") == 0) {   /* fn4 SP-PLE (qwen/SP-SERIAL-EXACT.md): SP-hc keeps the layers before the PLE's replicated */
+        if (value < 0 || value > 1) return -1;
+        qwen4exp_fp8::fn4_spple_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "hc_sp") == 0) {   /* fn4 SP-hc proper (step_pipelined; RADIANCE_FN4_SPHC=1 declares; 2 pipelined order) */

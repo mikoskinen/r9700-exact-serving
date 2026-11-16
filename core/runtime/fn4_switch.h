@@ -122,6 +122,9 @@
  *                   bit 1 across the ranks by block range (all_gather + exact merge), bit 2 in chunks on one card at any
  *                   decode height; the same table byte for byte; RADIANCE_FN4_QSA_SPLIT at start declares; 0 today
  *                                                                                                    RADIANCE_FN4_QSA_SPLIT
+ *   sp_ple          qwen4exp (16.11.2026, qwen/SP-SERIAL-EXACT.md): a pipelined SP-hc step keeps the layers before the
+ *                   PLE's replicated (their all-reduces, whole-row reads and writes), so the PLE reads the whole stream
+ *                   on every rank and every rank leaves the same convolution window; 0 today            RADIANCE_FN4_SP_PLE
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -142,7 +145,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kResumeCold, kPreemptKeep, kKvsBi, kKvsVic, kQsaSplit, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kResumeCold, kPreemptKeep, kKvsBi, kKvsVic, kQsaSplit, kSpPle, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
