@@ -28256,6 +28256,229 @@ static void qsa_select_split_one(const Plugin& pl, const char* what, int64_t S, 
                    " same=" + (same ? "1" : "0") + " det=" + (det ? "1" : "0"));
 }
 
+/* fn4 qsa_split (16.11.2026, qwen/QSA-SPLIT.md): the selection split across `parts` ranks -- each rank's qsa_select_part
+ * over its block range of each sequence (r4d_qsa_part.h cuts of nc), its slab of the range's own top-k, the slabs placed
+ * as the all_gather leaves them ([M][parts][LW]), then qsa_select_merge -- against qsa_select_i32's single-workgroup /
+ * wide form (no scratch), byte for byte: table, nsel, seqused. Each rank's score plane is POISONED outside its range (a
+ * score above every live one), so a part that read past its range would take those blocks. parts 1 is the one-card form
+ * (chunks, no slab, the merge over the chunk lists). Few distinct scores, so ties decide most slots. */
+static int qsa_cut_h(int nc, int parts, int r) {
+    if (r <= 0 || nc <= 0) return 0;
+    if (r >= parts) return nc;
+    return (int)(((long long)nc * r / parts) & ~15LL);
+}
+static void qsa_select_part_one(const Plugin& pl, const char* what, int64_t S, int64_t per, int64_t nb, int64_t n0,
+                                int64_t dstep, int distinct, int parts) {
+    const RadKernelInfo* rs = find(pl, "qsa_select_i32");
+    const RadKernelInfo* rp = find(pl, "qsa_select_part_i32");
+    const RadKernelInfo* rm = find(pl, "qsa_select_merge_i32");
+    if (!rs || !rp || !rm) { ok(what, false, "row absent"); return; }
+    const int64_t M = S * per, topk = 512, ratio = 4, pages = 1 << 20, lw = 4 + 2 * topk;
+    std::vector<float>   sc((size_t)(M * nb));
+    std::vector<int32_t> bt((size_t)(S * nb)), nc((size_t)S), pos((size_t)M), cuh((size_t)(S + 1));
+    for (int64_t s = 0; s < S; ++s) {
+        int64_t ns = n0 - s * dstep; if (ns < 1) ns = 1; if (ns > nb - 1) ns = nb - 1;
+        nc[(size_t)s] = (int32_t)ns;
+        for (int64_t b = 0; b < nb; ++b)
+            bt[(size_t)(s * nb + b)] = b > ns ? -1 : ((b % 64) == 37 ? -1 : (int32_t)((b * 4099 + 11 + s * 71) % pages));
+        cuh[(size_t)s] = (int32_t)(s * per);
+        for (int64_t j = 0; j < per; ++j) pos[(size_t)(s * per + j)] = (int32_t)(ns * ratio + j - 2);
+    }
+    cuh[(size_t)S] = (int32_t)M;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t b = 0; b < nb; ++b)
+            sc[(size_t)(m * nb + b)] = (float)(((b * 31 + m * 17) % distinct)) * 0.125f;
+    void* d_sc = dalloc(sc.size() * 4);
+    void* d_bt = dalloc(bt.size() * 4);
+    void* d_nc = dalloc(nc.size() * 4);
+    void* d_po = dalloc(pos.size() * 4);
+    void* d_cu = dalloc(cuh.size() * 4);
+    void* d_se = dalloc((size_t)(M * (topk + 1)) * 4);
+    void* d_ns = dalloc((size_t)M * 4);
+    void* d_su = dalloc((size_t)M * 4);
+    void* d_li = dalloc((size_t)(M * 8 * lw) * 4);
+    void* d_sb = dalloc((size_t)(M * lw) * 4);
+    void* d_ga = dalloc((size_t)(M * parts * lw) * 4);
+    if (!d_sc || !d_bt || !d_nc || !d_po || !d_cu || !d_se || !d_ns || !d_su || !d_li || !d_sb || !d_ga) {
+        ok(what, false, "alloc failed"); return;
+    }
+    st_memcpy(d_bt, bt.data(), bt.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_nc, nc.data(), nc.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_po, pos.data(), pos.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), cuh.size() * 4, hipMemcpyHostToDevice);
+    auto run_ref = [&](std::vector<int32_t>& se, std::vector<int32_t>& ns, std::vector<int32_t>& su) {
+        st_memcpy(d_sc, sc.data(), sc.size() * 4, hipMemcpyHostToDevice);
+        std::vector<RadTensor> ts = { T(d_sc, RAD_F32, { M, nb }), T(d_bt, RAD_I32, { S, nb }), T(d_nc, RAD_I32, { S }),
+                                      T(d_po, RAD_I32, { M }), T(d_cu, RAD_I32, { S + 1 }),
+                                      T(d_se, RAD_I32, { M, topk + 1 }), T(d_ns, RAD_I32, { M }), T(d_su, RAD_I32, { M }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", S) };
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        st_memset(d_se, 0xAA, (size_t)(M * (topk + 1)) * 4);
+        const int rc = rs->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        se.assign((size_t)(M * (topk + 1)), 0); ns.assign((size_t)M, 0); su.assign((size_t)M, 0);
+        st_memcpy(se.data(), d_se, se.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(ns.data(), d_ns, ns.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(su.data(), d_su, su.size() * 4, hipMemcpyDeviceToHost);
+        return rc;
+    };
+    std::vector<int32_t> rse, rns, rsu;
+    int rc = run_ref(rse, rns, rsu);
+    if (rc != RAD_OK) { ok(what, false, "reference launch rc=" + std::to_string(rc)); return; }
+
+    auto merge = [&](void* lists, int64_t nlist, int64_t lpitch, std::vector<int32_t>& se, std::vector<int32_t>& ns,
+                     std::vector<int32_t>& su) {
+        RadTensor tl = T(lists, RAD_I32, { M, nlist * lw });
+        tl.stride[0] = lpitch;
+        std::vector<RadTensor> ts = { tl, T(d_bt, RAD_I32, { S, nb }), T(d_nc, RAD_I32, { S }), T(d_po, RAD_I32, { M }),
+                                      T(d_cu, RAD_I32, { S + 1 }), T(d_se, RAD_I32, { M, topk + 1 }),
+                                      T(d_ns, RAD_I32, { M }), T(d_su, RAD_I32, { M }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", S) };
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        st_memset(d_se, 0x55, (size_t)(M * (topk + 1)) * 4);
+        st_memset(d_ns, 0x55, (size_t)M * 4); st_memset(d_su, 0x55, (size_t)M * 4);
+        const int r = rm->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        se.assign((size_t)(M * (topk + 1)), 0); ns.assign((size_t)M, 0); su.assign((size_t)M, 0);
+        st_memcpy(se.data(), d_se, se.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(ns.data(), d_ns, ns.size() * 4, hipMemcpyDeviceToHost);
+        st_memcpy(su.data(), d_su, su.size() * 4, hipMemcpyDeviceToHost);
+        return r;
+    };
+    auto part = [&](int64_t P, int64_t r, int64_t nlist, bool slab) {
+        /* the rank's plane: poisoned outside its range of each sequence */
+        std::vector<float> pl_sc(sc);
+        if (P > 1)
+            for (int64_t m = 0; m < M; ++m) {
+                int64_t s = 0; while (s + 1 < S && m >= cuh[(size_t)(s + 1)]) ++s;
+                const int lo = qsa_cut_h(nc[(size_t)s], (int)P, (int)r), hi = qsa_cut_h(nc[(size_t)s], (int)P, (int)r + 1);
+                for (int64_t b = 0; b < nb; ++b) if (b < lo || b >= hi) pl_sc[(size_t)(m * nb + b)] = 1e9f;
+            }
+        st_memcpy(d_sc, pl_sc.data(), pl_sc.size() * 4, hipMemcpyHostToDevice);
+        RadTensor tl = T(d_li, RAD_I32, { M, nlist * lw });
+        tl.stride[0] = 8 * lw;
+        std::vector<RadTensor> ts = { T(d_sc, RAD_F32, { M, nb }), T(d_bt, RAD_I32, { S, nb }), T(d_nc, RAD_I32, { S }),
+                                      T(d_po, RAD_I32, { M }), T(d_cu, RAD_I32, { S + 1 }), tl,
+                                      T(d_sb, RAD_I32, { M, lw }) };
+        if (!slab) absent(ts[6]);
+        std::vector<RadParam> ps = { PI("M", M), PI("blocks", nb), PI("topk", topk), PI("ratio", ratio), PI("seqs", S),
+                                     PI("parts", P), PI("part", r) };
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        st_memset(d_sb, 0x33, (size_t)(M * lw) * 4);
+        const int rr = rp->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        return rr;
+    };
+    auto nl_of = [&](int64_t width) { int64_t x = (width + 4095) / 4096; return x < 1 ? 1 : x > 8 ? 8 : x; };
+    /* the split across `parts` ranks */
+    const int64_t nl = nl_of((nb + parts - 1) / parts + 15);
+    std::vector<int32_t> gh((size_t)(M * parts * lw), 0), sb((size_t)(M * lw));
+    for (int64_t r = 0; r < parts && rc == RAD_OK; ++r) {
+        rc = part(parts, r, nl, true);
+        st_memcpy(sb.data(), d_sb, sb.size() * 4, hipMemcpyDeviceToHost);
+        for (int64_t m = 0; m < M; ++m)
+            std::memcpy(&gh[(size_t)((m * parts + r) * lw)], &sb[(size_t)(m * lw)], (size_t)lw * 4);
+    }
+    if (rc != RAD_OK) { ok(what, false, "part launch rc=" + std::to_string(rc)); return; }
+    st_memcpy(d_ga, gh.data(), gh.size() * 4, hipMemcpyHostToDevice);
+    std::vector<int32_t> xse, xns, xsu;
+    rc = merge(d_ga, parts, parts * lw, xse, xns, xsu);
+    if (rc != RAD_OK) { ok(what, false, "merge launch rc=" + std::to_string(rc)); return; }
+    /* one card, chunks */
+    const int64_t nl1 = nl_of(nb);
+    rc = nb <= 8 * 8192 ? part(1, 0, nl1, false) : RAD_OK;
+    std::vector<int32_t> cse, cns, csu;
+    if (rc == RAD_OK && nb <= 8 * 8192) rc = merge(d_li, nl1, 8 * lw, cse, cns, csu);
+    if (rc != RAD_OK) { ok(what, false, "one-card launch rc=" + std::to_string(rc)); return; }
+    long dx = 0, dc = 0; long long fx = -1;
+    for (size_t i = 0; i < rse.size(); ++i) {
+        if (xse[i] != rse[i]) { ++dx; if (fx < 0) fx = (long long)i; }
+        if (nb <= 8 * 8192 && cse[i] != rse[i]) ++dc;
+    }
+    const bool xok = dx == 0 && xns == rns && xsu == rsu;
+    const bool cok = nb > 8 * 8192 || (dc == 0 && cns == rns && csu == rsu);
+    long full = 0; for (int32_t v : rns) full += v >= (int32_t)topk ? 1 : 0;
+    std::printf("        %lld seq x %lld rows, %lld blocks (nc %lld..%lld), %d distinct scores, %d parts x %lld chunks: "
+                "%ld of %lld slots differ (first %lld), nsel %s, seqused %s; one card (%lld chunks): %ld differ, nsel %s; "
+                "rows with a full table %ld\n",
+                (long long)S, (long long)per, (long long)nb, (long long)nc[(size_t)S - 1], (long long)nc[0], distinct, parts,
+                (long long)nl, dx, (long long)rse.size(), fx, xns == rns ? "ok" : "DIFFERS", xsu == rsu ? "ok" : "DIFFERS",
+                (long long)nl1, dc, (nb > 8 * 8192 || cns == rns) ? "ok" : "DIFFERS", full);
+    ok(what, xok && cok, std::string("split=") + (xok ? "1" : "0") + " onecard=" + (cok ? "1" : "0"));
+}
+
+/* qsa_score's `parts` form: a rank writes exactly the whole launch's scores over its range of each sequence, bit for bit,
+ * and nothing outside it (the plane is filled with a sentinel first). */
+static void qsa_score_part_case(const Plugin& pl, int parts) {
+    const char* what = "qsa_score parts form vs the whole launch, inside and outside each rank's range";
+    const RadKernelInfo* r = find(pl, "qsa_score_bf16");
+    const RadKernelInfo* rp = find(pl, "qsa_score_part_bf16");
+    if (!r || !rp) { ok(what, false, "row absent"); return; }
+    const int64_t S = 5, per = 4, M = S * per, n = 128, heads = 4, nb = 9001, pages = 12000;
+    std::vector<uint16_t> qh((size_t)(M * heads * n)), bkh((size_t)(pages * n));
+    for (int64_t i = 0; i < M * heads * n; ++i) qh[(size_t)i] = h_to_bf16((float)(((i * 29 + 7) % 83) - 41) / 47.0f);
+    for (int64_t i = 0; i < pages * n; ++i) bkh[(size_t)i] = h_to_bf16((float)(((i * 41 + 13) % 71) - 35) / 39.0f);
+    std::vector<int32_t> bth((size_t)(S * nb)), cuh((size_t)(S + 1)), nch((size_t)S);
+    for (int64_t s = 0; s < S; ++s) {
+        const int64_t live = nb - 1 - s * 1777;
+        nch[(size_t)s] = (int32_t)live;
+        for (int64_t b = 0; b < nb; ++b)
+            bth[(size_t)(s * nb + b)] = b < live ? ((b % 97) == 5 ? -1 : (int32_t)((b * 13 + s * 5) % pages)) : -1;
+        cuh[(size_t)s] = (int32_t)(s * per);
+    }
+    cuh[(size_t)S] = (int32_t)M;
+    void* d_q  = dalloc(qh.size() * 2);
+    void* d_bk = dalloc(bkh.size() * 2);
+    void* d_bt = dalloc(bth.size() * 4);
+    void* d_cu = dalloc(cuh.size() * 4);
+    void* d_nc = dalloc(nch.size() * 4);
+    void* d_o  = dalloc((size_t)(M * nb) * 4);
+    st_memcpy(d_q,  qh.data(),  qh.size() * 2,  hipMemcpyHostToDevice);
+    st_memcpy(d_bk, bkh.data(), bkh.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_bt, bth.data(), bth.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_cu, cuh.data(), cuh.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_nc, nch.data(), nch.size() * 4, hipMemcpyHostToDevice);
+    auto go = [&](int64_t P, int64_t rk, std::vector<uint32_t>& out) {
+        std::vector<RadTensor> ts = { T(d_q, RAD_BF16, { M, heads * n }), T(d_bk, RAD_BF16, { pages, n }),
+                                      T(d_bt, RAD_I32, { S, nb }), T(d_cu, RAD_I32, { S + 1 }), T(d_nc, RAD_I32, { S }),
+                                      T(d_o, RAD_F32, { M, nb }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("heads", heads), PI("blocks", nb), PI("seqs", S),
+                                     PS("dtype", "bf16") };
+        if (P > 1) { ps.push_back(PI("parts", P)); ps.push_back(PI("part", rk)); }
+        RadArgs a; std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
+        st_memset(d_o, 0x7F, (size_t)(M * nb) * 4);
+        const int rc = (P > 1 ? rp : r)->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        out.assign((size_t)(M * nb), 0);
+        st_memcpy(out.data(), d_o, out.size() * 4, hipMemcpyDeviceToHost);
+        return rc;
+    };
+    std::vector<uint32_t> ref, got;
+    int rc = go(1, 0, ref);
+    if (rc != RAD_OK) { ok(what, false, "whole launch rc=" + std::to_string(rc)); return; }
+    long bad_in = 0, bad_out = 0, cells = 0;
+    for (int64_t rk = 0; rk < parts; ++rk) {
+        rc = go(parts, rk, got);
+        if (rc != RAD_OK) { ok(what, false, "part launch rc=" + std::to_string(rc)); return; }
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t s = m / per;
+            const int lo = qsa_cut_h(nch[(size_t)s], parts, (int)rk), hi = qsa_cut_h(nch[(size_t)s], parts, (int)rk + 1);
+            for (int64_t b = 0; b < nb; ++b) {
+                const size_t i = (size_t)(m * nb + b);
+                if (b >= lo && b < hi && b < nch[(size_t)s]) { ++cells; if (got[i] != ref[i]) ++bad_in; }
+                else if (got[i] != 0x7F7F7F7Fu) ++bad_out;
+            }
+        }
+    }
+    std::printf("        %d parts, %lld rows, %lld blocks: %ld scores inside the ranges, %ld differ from the whole launch; "
+                "%ld written outside\n", parts, (long long)M, (long long)nb, cells, bad_in, bad_out);
+    ok(what, bad_in == 0 && bad_out == 0 && cells > 0, "in " + std::to_string(bad_in) + " out " + std::to_string(bad_out));
+}
+
 /* qsa_select over more than topk blocks with topk or fewer live, in every form, against libref's
  * rule byte for byte: the table (sentinel-filled before each launch, so a slot the kernel leaves
  * alone shows), the count and seqused.
@@ -36125,6 +36348,23 @@ static void device_phase(const Plugin& pl) {
                              1, 4);
         qsa_select_split_one(pl, "qsa_select split, two sequences of four draft rows", 2, 4);
         qsa_select_few_live_case(pl);
+    }
+
+    if (sel("qsa_select_part_i32")) {
+        if (!g_case) std::printf("\nfn4 qsa_split: the selection split across ranks, against qsa_select\n");
+        qsa_select_part_one(pl, "qsa_split: 16 seq x 4 rows, ~24k-token contexts, 4 parts", 16, 4, 6600, 6200, 37, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 13 seq x 4 rows, mixed contexts, 4 parts", 13, 4, 20500, 20001, 1530, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 2 seq x 4 rows, 80k contexts, 4 parts, 7 distinct", 2, 4, 20500, 20001, 3, 7, 4);
+        qsa_select_part_one(pl, "qsa_split: 32 seq x 4 rows, short to 24k contexts, 4 parts", 32, 4, 6600, 6200, 190, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 4 seq x 1 row, 512k contexts, 4 parts", 4, 1, 131080, 131000, 9000, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 16 seq x 4 rows, 3 parts", 16, 4, 6600, 6200, 37, 96, 3);
+        qsa_select_part_one(pl, "qsa_split: 8 seq x 4 rows, few live (<= topk), 4 parts", 8, 4, 2400, 700, 60, 96, 4);
+        qsa_select_part_one(pl, "qsa_split: 3 seq x 4 rows, every score equal, 4 parts", 3, 4, 9000, 8800, 1000, 1, 4);
+    }
+    if (sel("qsa_score_part_bf16")) {
+        if (!g_case) std::printf("\nfn4 qsa_split: the score over a rank's range, against the whole launch\n");
+        qsa_score_part_case(pl, 4);
+        qsa_score_part_case(pl, 3);
     }
 
     if (sel("kv_resolve_i32")) {

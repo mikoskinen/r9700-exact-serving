@@ -22,6 +22,35 @@
 namespace rad {
 namespace arch {
 
+/* fn4 qsa_split (16.11.2026, qwen/QSA-SPLIT.md; switch qsa_split / RADIANCE_FN4_QSA_SPLIT, a mask; 0 = today). Every rank
+ * holds the whole projection, the block keys and the score plane, and today runs the score and the selection over every
+ * sequence's whole history. Bit 1: rank r of the group scores and selects over its own block range of each sequence
+ * (libr4d r4d_qsa_part.h: cuts of the sequence's complete-block count, so a row's range never depends on the other rows),
+ * an all_gather moves each rank's block-ordered top-k list to every rank, and one merge a query rebuilds qsa_select's table
+ * byte for byte (a block in the global top-k is in its range's top-k; the merge keeps qsa_select's threshold, tie rule and
+ * table order). Bit 2: the same chunked selection on one card (parts 1) at any decode height, for steps bit 1 does not
+ * take. Steps of at most `split_rows` rows from `split_min` live blocks (RADIANCE_FN4_QSA_SPLIT_MIN, blocks; 0) take it;
+ * the choice reads host values only (rows, the context bound, the switch), the same on every rank, and every path gives
+ * the same bytes, so a sequence's selection is the same alone and beside any batch. RADIANCE_FN4_QSA_SPLIT set at start
+ * (any value above 0) declares both forms and starts at that value. */
+inline std::atomic<int>& fn4_qsasplit_flag() {
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_QSA_SPLIT");
+                                   const int v = e && *e ? std::atoi(e) : 0;
+                                   return v < 0 ? 0 : v > 3 ? 3 : v; }()};
+    return f;
+}
+inline int fn4_qsasplit_declared() {
+    static const int d = [] { const char* e = std::getenv("RADIANCE_FN4_QSA_SPLIT");
+                              return (e && *e && std::atoi(e) > 0) ? 3 : 0; }();
+    return d;
+}
+inline int64_t fn4_qsasplit_min() {
+    static const int64_t v = [] { const char* e = std::getenv("RADIANCE_FN4_QSA_SPLIT_MIN");
+                                  const long long x = e && *e ? std::atoll(e) : 0;
+                                  return (int64_t)(x < 0 ? 0 : x); }();
+    return v;
+}
+
 struct QsaIndexer {
     struct Config {
         int64_t     heads    = 0;   /* indexer_n_heads      -- 4 */
@@ -60,6 +89,11 @@ struct QsaIndexer {
          * wider than them is one sequence (RadBuildCtx::max_mixed_tok); such a step scores and
          * selects in windows of this many rows (step()). */
         int64_t     plane_rows = 0;
+        /* fn4 qsa_split: the forms declared (a mask, fn4_qsasplit_declared), the most query rows a split step has (the
+         * lists' height) and the fewest live blocks it splits from. 0 = not declared. */
+        int         split      = 0;
+        int64_t     split_rows = 0;
+        int64_t     split_min  = 0;
     };
 
     /* `qk` is the whole projection (`heads` query heads, then one raw key head); `q` is the query
@@ -98,6 +132,9 @@ struct QsaIndexer {
          * step by `rope_table` for the attention block; the indexer rotates at the same `rot`,
          * `theta` and `scale`. Without it the unfused per-head norms run. */
         rad_buf cos_sin = 0;
+        /* fn4 qsa_split: candidate lists (r4d_qsa_part.h, LW = 4 + 2 topk words): `qlist` [split_rows, 8 LW] a query's
+         * chunks, `qpart` [split_rows, LW] this rank's list, `qgath` [split_rows, world LW] every rank's after the gather. */
+        rad_buf qlist = 0, qpart = 0, qgath = 0;
     };
 
     Geom       g{};
@@ -112,6 +149,8 @@ struct QsaIndexer {
      * bound, since the cos/sin table is filled only for steps at or under it. */
     int64_t     qprep_rows = 0;
     rad_op      op_work = 0, op_bkey = 0, op_tail = 0, op_score = 0, op_select = 0;
+    /* fn4 qsa_split: the rank's score and part, the gather, the one-card part, the merge */
+    rad_op      op_score_part = 0, op_selp = 0, op_qgath = 0, op_selp1 = 0, op_selm = 0;
 
     bool on() const { return op_rope != 0; }
 
@@ -259,6 +298,55 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                       RAD_NOWEIGHTS),
                   {w.score, w.nc}, {w.sel, w.nsel, w.sequ});
 
+    /* fn4 qsa_split: both forms, declared only when the start asked for them (the graph and buffers otherwise today's). */
+    if (c.split && c.split_rows > 0 && w.qlist) {
+        const int64_t lw = 4 + 2 * c.topk;
+        op_selp1 = rw(b, RAD_OP(b, "qsa_select_part",
+                         RAD_PARAMS(RAD_RANGE("M", 1, c.split_rows),
+                                    RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                    RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs),
+                                    RAD_INT("parts", 1), RAD_INT("part", 0)),
+                         RAD_NOWEIGHTS),
+                     {w.score, w.nc}, {w.qlist});
+        if (!op_selp1) return RAD_E_INVAL;
+        if (g.world > 1 && w.qpart && w.qgath && c.head_dim == 128 && c.heads <= 4) {
+            op_score_part = rw(b, RAD_OP(b, "qsa_score_part",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, c.split_rows), RAD_INT("n", c.head_dim),
+                                             RAD_INT("heads", c.heads), RAD_INT("blocks", c.max_blocks),
+                                             RAD_INT("seqs", g.max_seqs), RAD_STR("dtype", g.dtype),
+                                             RAD_INT("parts", g.world), RAD_INT("part", g.rank)),
+                                  RAD_NOWEIGHTS),
+                              {w.q, w.nc}, {w.score});
+            op_selp = rw(b, RAD_OP(b, "qsa_select_part",
+                            RAD_PARAMS(RAD_RANGE("M", 1, c.split_rows),
+                                       RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                       RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs),
+                                       RAD_INT("parts", g.world), RAD_INT("part", g.rank)),
+                            RAD_NOWEIGHTS),
+                        {w.score, w.nc}, {w.qlist, w.qpart});
+            op_qgath = rw(b, RAD_OP(b, "all_gather",
+                             RAD_PARAMS(RAD_INT("world_size", g.world),
+                                        RAD_INT("numel", c.split_rows * lw),
+                                        RAD_STR("dtype", "f32"), RAD_INT("row", lw)),
+                             RAD_NOWEIGHTS),
+                         {w.qpart}, {w.qgath});
+            if (!op_score_part || !op_selp || !op_qgath) return RAD_E_INVAL;
+        }
+        op_selm = RAD_OP(b, "qsa_select_merge",
+                         RAD_PARAMS(RAD_RANGE("M", 1, c.split_rows),
+                                    RAD_INT("blocks", c.max_blocks), RAD_INT("topk", c.topk),
+                                    RAD_INT("ratio", c.ratio), RAD_INT("seqs", g.max_seqs)),
+                         RAD_NOWEIGHTS);
+        if (!op_selm) return RAD_E_INVAL;
+        {
+            /* Arrays rather than rw(): the read set depends on which lists exist (rad_fp8.h: NormQuantFP8). */
+            rad_buf rd[3] = { w.qlist, w.nc, w.qgath };
+            rad_buf wr[3] = { w.sel, w.nsel, w.sequ };
+            rad_op_reads (b, op_selm, rd, w.qgath && op_qgath ? 3 : 2);
+            rad_op_writes(b, op_selm, wr, 3);
+        }
+    }
+
     /* When the attention group streams, the attention block resolves `sel` to ring slots after its
      * layer's store (AttnGatedFP8::step); prefill runs on the stage and never resolves. */
     return RAD_OK;
@@ -375,6 +463,54 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * in one pass over the step, and a row two windows share is written twice with the same
      * bytes. */
     const int64_t PR = c.plane_rows > 0 ? c.plane_rows : T;
+
+    /* fn4 qsa_split (see fn4_qsasplit_flag). Host values only: every rank takes the same path. */
+    const int sf = c.split ? (fn4_qsasplit_flag().load(std::memory_order_relaxed) & c.split) : 0;
+    if (sf && T <= c.split_rows && T <= PR && live >= c.split_min && op_selm) {
+        const int64_t lw = 4 + 2 * c.topk;
+        const RadOperand sco  = bcol_at(w.score, 0, c.max_blocks, 0, live, T);
+        const RadOperand atbt = praw2(atb->block_table, RAD_I32, S, atb->block_table_pitch);
+        if ((sf & 1) && op_score_part && op_selp && op_qgath) {
+            /* The widest range a rank owns, in chunks of at most ~4096 blocks (8 at most: <= 4099 at 524,288 tokens). */
+            const int64_t width = (live + g.world - 1) / g.world + 15;
+            int64_t nl = (width + 4095) / 4096;
+            if (nl < 1) nl = 1;
+            if (nl > 8) nl = 8;
+            RAD_ISSUE_N(c_, op_score_part, T,
+                        brows(w.q, T), kv_cache(kv_bk, layer),
+                        praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                        praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S), sco);
+            RAD_ISSUE_N(c_, op_selp, T,
+                        sco, atbt, brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                        praw(batch->cu_seqlens, RAD_I32, S + 1),
+                        bcol_at(w.qlist, 0, 8 * lw, 0, nl * lw, T), brows(w.qpart, T));
+            RAD_ISSUE(c_, op_qgath, brows(w.qpart, T), brows(w.qgath, T));
+            RAD_ISSUE_N(c_, op_selm, T,
+                        brows(w.qgath, T), atbt, brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                        praw(batch->cu_seqlens, RAD_I32, S + 1),
+                        brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+            return;
+        }
+        if ((sf & 2) && op_selp1 && live <= 8 * 8192) {
+            int64_t nl = (live + 4095) / 4096;
+            if (nl < 1) nl = 1;
+            if (nl > 8) nl = 8;
+            const RadOperand lists = bcol_at(w.qlist, 0, 8 * lw, 0, nl * lw, T);
+            RAD_ISSUE_N(c_, op_score, T,
+                        brows(w.q, T), kv_cache(kv_bk, layer),
+                        praw2(bkb->block_table, RAD_I32, S, bkb->block_table_pitch),
+                        praw(batch->cu_seqlens, RAD_I32, S + 1), brows(w.nc, S), sco);
+            RAD_ISSUE_N(c_, op_selp1, T,
+                        sco, atbt, brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                        praw(batch->cu_seqlens, RAD_I32, S + 1), lists, RAD_NONE);
+            RAD_ISSUE_N(c_, op_selm, T,
+                        lists, atbt, brows(w.nc, S), praw(batch->positions, RAD_I32, T),
+                        praw(batch->cu_seqlens, RAD_I32, S + 1),
+                        brows(w.sel, T), brows(w.nsel, T), brows(w.sequ, T));
+            return;
+        }
+    }
+
     if (T > PR) {
         if (S != 1 || !win_cu) {
             rad_step_fail(c_, "qsa: a step wider than the score plane must be one sequence with "

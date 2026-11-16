@@ -1544,6 +1544,19 @@ static const RadParamSpec pQsaScore[] = {
     { "seqs",   RAD_P_INT, RAD_REQUIRED },
     { "dtype",  RAD_P_STR, RAD_REQUIRED },
 };
+/* fn4 qsa_split (qwen/QSA-SPLIT.md): `qsa_score` over rank `part` of `parts`' block range of each sequence only
+ * (r4d_qsa_part.h), the same scores at the same columns; an op of its own because every plugin that serves qsa_score fixes
+ * the same schema. Operands are qsa_score's. */
+static const RadParamSpec pQsaScorePart[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n",      RAD_P_INT, RAD_REQUIRED },
+    { "heads",  RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "parts",  RAD_P_INT, RAD_REQUIRED },
+    { "part",   RAD_P_INT, RAD_REQUIRED },
+};
 static const RadOperandSpec oQsaScore[] = {
     { "q",     RAD_OPD_IN,  0 },
     { "bk",    RAD_OPD_IN,  0 },
@@ -1555,6 +1568,47 @@ static const RadOperandSpec oQsaScore[] = {
      * bound for every query in the chunk, which `qsa_select` narrows per query. */
     { "nc",    RAD_OPD_IN,  0 },
     { "score", RAD_OPD_OUT, 0 },
+};
+
+/* fn4 qsa_split (16.11.2026, qwen/QSA-SPLIT.md): `qsa_select` split across the ranks of a tensor-parallel group.
+ * `qsa_select_part` selects over rank `part` of `parts`' block range of each sequence (the range qsa_score's `parts` form
+ * scored) and writes candidate lists (r4d_qsa_part.h: [M, nlist * LW], nlist chunks of the range a query, LW = 4 + 2 topk
+ * words), and with `slab` the range's own list [M, LW]; `qsa_select_merge` reads a query's lists in order (the gathered
+ * ranks' slabs, or one card's chunks with parts 1) and writes qsa_select's three outputs byte for byte. */
+static const RadParamSpec pQsaSelectPart[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "topk",   RAD_P_INT, RAD_REQUIRED },
+    { "ratio",  RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    { "parts",  RAD_P_INT, RAD_REQUIRED },
+    { "part",   RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaSelectPart[] = {
+    { "score", RAD_OPD_IN,  0 },
+    { "bt",    RAD_OPD_IN,  0 },
+    { "nc",    RAD_OPD_IN,  0 },
+    { "pos",   RAD_OPD_IN,  0 },
+    { "cu",    RAD_OPD_IN,  0 },
+    { "lists", RAD_OPD_OUT, 0 },
+    { "slab",  RAD_OPD_OUT, 1 },
+};
+static const RadParamSpec pQsaSelectMerge[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "topk",   RAD_P_INT, RAD_REQUIRED },
+    { "ratio",  RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+};
+static const RadOperandSpec oQsaSelectMerge[] = {
+    { "lists",   RAD_OPD_IN,  0 },
+    { "bt",      RAD_OPD_IN,  0 },
+    { "nc",      RAD_OPD_IN,  0 },
+    { "pos",     RAD_OPD_IN,  0 },
+    { "cu",      RAD_OPD_IN,  0 },
+    { "sel",     RAD_OPD_OUT, 0 },
+    { "nsel",    RAD_OPD_OUT, 0 },
+    { "seqused", RAD_OPD_OUT, 0 },
 };
 
 /* `rmsnorm_quant_fp8` and `gated_quant_fp8`, new ops whose schemas this plugin fixes. Each is its
@@ -3947,6 +4001,18 @@ static const RadOpSchema kSchemas[] = {
            "negative cancel another's positive. `bt` holds PAGE IDS, and a negative entry scores "
            "-inf rather than zero, because a real score can be zero and padding must not outrank "
            "a block the model chose to ignore."),
+    SCHEMA("qsa_score_part", pQsaScorePart, oQsaScore,
+           "fn4 qsa_split: qsa_score over rank `part` of `parts`' block range of each sequence only -- the cuts of the "
+           "sequence's complete-block count at multiples of 16 (r4d_qsa_part.h) -- the same scores at the same columns, "
+           "nothing written outside the range."),
+    SCHEMA("qsa_select_part", pQsaSelectPart, oQsaSelectPart,
+           "fn4 qsa_split: rank `part` of `parts`' share of qsa_select -- over its block range of each sequence, in chunks, "
+           "each chunk's own top-k as (key, page) lists in ASCENDING BLOCK ORDER, and with `slab` the range's own top-k "
+           "list; lists carry count | over-topk flag and the selection's block bound (r4d_qsa_part.h)."),
+    SCHEMA("qsa_select_merge", pQsaSelectMerge, oQsaSelectMerge,
+           "fn4 qsa_split: a query's candidate lists, read in order as one block-ordered list, to qsa_select's table, "
+           "length and seqused BYTE FOR BYTE: above the threshold first in block order, ties last lowest block first, "
+           "the partial page appended."),
     SCHEMA("qsa_block_key", pQsaBlockKey, oQsaBlockKey,
            "the QSA indexer's compressed key: out[b] = rope(rmsnorm(mean of the `ratio` raw keys "
            "of block b), at the position of the block's FIRST token). The mean is accumulated in "
@@ -9610,6 +9676,32 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   ROW(cQsaSelect), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_select, r4d_rad_qsa_select_scratch, nullptr, nullptr,
   r4d_shape_qsa_select },
+
+/* fn4 qsa_split (qwen/QSA-SPLIT.md): qsa_select across the ranks (or in chunks on one card) and its merge. */
+{ "qsa_score_part_bf16", "qsa_score_part", "attn",
+  "the QSA block score over a rank's block range of each sequence (fn4 qsa_split)",
+  "n 128, at most 4 heads (the matrix form), any block count and any M",
+  "bf16 queries and block keys, an i32 page-id table, f32 scores at the whole launch's columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaScore), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_score, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_score },
+{ "qsa_select_part_i32", "qsa_select_part", "attn",
+  "a rank's part of the QSA selection: its block range's top-k as block-ordered candidate lists",
+  "any M, any block count; the range in chunks of at most 8192 blocks that fit the key cache; unsigned order",
+  "f32 scores and an i32 page table in; i32 candidate lists out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaSelect), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_select_part, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_select_part },
+{ "qsa_select_merge_i32", "qsa_select_merge", "attn",
+  "the merge of a query's candidate lists into qsa_select's page-id table",
+  "any M, at most 16 lists a query, topk x lists within the key cache",
+  "i32 candidate lists and page table in; an i32 [M, topk+1] table and a live count out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaSelect), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_select_merge, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_select_merge },
 
 /* The residency map of a streamed KV group, in one workgroup: the CLOCK hand is serial state and
  * the phases are barriers. The copies run in the same launch. */

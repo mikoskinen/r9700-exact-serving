@@ -69,6 +69,12 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         rad::arch::fn4_kvsbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
+    if (std::strcmp(name, "qsa_split") == 0) {   /* fn4 qsa_split (rad_qsa.h; RADIANCE_FN4_QSA_SPLIT declares) */
+        if (value < 0 || value > 3) return -1;
+        if (value & ~rad::arch::fn4_qsasplit_declared()) return -1;
+        rad::arch::fn4_qsasplit_flag().store(value, std::memory_order_relaxed);
+        return 1;
+    }
     if (std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
         if (value < 0 || value > 4) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
