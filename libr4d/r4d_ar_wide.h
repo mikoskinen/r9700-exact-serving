@@ -50,15 +50,44 @@ __device__ __forceinline__ void r4d_ar_from_f(float v, __hip_bfloat16& o) { o = 
 
 // drain: 0 none, 1 all-thread threadfence_system, 2 single-thread (applied by the publisher
 // inside the handshake), 3 s_wait_storecnt 0.
+// fn4 PFF (16.11.2026, qwen/prefill; libr4d switch ar_fence, r4d_ar_entry.hip): 5 = every wave's release half only
+// (global_wb scope:SCOPE_SYS + its store wait: drain 1 without the global_inv scope:SCOPE_SYS that drain 1 adds a wave);
+// 7 = the push went out as system-scope stores (r4d_ar_push16 with drain 7: written past this card's caches, so no
+// writeback is needed for them), so every wave only waits for its stores to complete (s_wait_storecnt 0). drain 7 is
+// passed only to kernels whose pushes go through r4d_ar_push16 (the SP rows' raw reduce-scatter and all-gather).
 __device__ __forceinline__ void r4d_ar_drain(int drain) {
   if (drain == 1) __threadfence_system();
-  else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  else if (drain == 3 || drain == 7) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+  else if (drain == 5) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
 }
 // acq: 0 acquire-only fence (global_inv, no writeback half), 1 full threadfence_system,
 // 2 none -- fine-grained scratch only.
+// fn4 PFF: 3 = ONE system-scope invalidate a block (wave 0, waited for, then a barrier) and every wave's device-scope
+// invalidate (global_inv scope:SCOPE_DEV: its CU's vector caches) -- the L2 is the card's, so one system invalidate covers
+// every wave of the block; 4 = every wave's device-scope invalidate only (the slots are fine-grained: this rank reads them
+// past L2, r4d_ar_entry.hip's allocation note, so only the vector caches can hold an older copy). Every thread calls it.
 __device__ __forceinline__ void r4d_ar_acquire(int acq) {
   if (acq == 1) __threadfence_system();
+  else if (acq == 3) {
+    if (threadIdx.x < 32u) {
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+      asm volatile("s_wait_loadcnt 0x0" ::: "memory");
+    }
+    __syncthreads();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  } else if (acq == 4) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
   else if (acq != 2) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+}
+// fn4 PFF: one 16-byte push word into a peer's slot. drain 7: as two relaxed system-scope 64-bit stores (global_store_b64
+// scope:SCOPE_SYS, written past this card's caches; r4d_ar_drain(7) then waits for them); otherwise the plain store.
+__device__ __forceinline__ void r4d_ar_push16(void* dst, const uint4& v, int drain) {
+  if (drain == 7) {
+    unsigned long long* d = reinterpret_cast<unsigned long long*>(dst);
+    __hip_atomic_store(d, ((unsigned long long)v.y << 32) | v.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(d + 1, ((unsigned long long)v.w << 32) | v.z, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  } else {
+    *reinterpret_cast<uint4*>(dst) = v;
+  }
 }
 
 // Publish `val` to every peer's flag word [b][rank], then wait until each of this block's own

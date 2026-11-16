@@ -1106,6 +1106,50 @@ extern "C" int r4d_ar_xpush_set(int on) {
     return 1;
 }
 
+/* fn4 PFF (16.11.2026, qwen/prefill; RADIANCE_FN4_AR_FENCE at start, rad_fn4_switch("ar_fence"); 0 = today): the cache
+ * maintenance of a four-rank prefill-sized collective (the rule in r4d_rows.cpp r4d_cfg_ar: from kArFenceFromElems
+ * elements every thread's __threadfence_system() before the flag, drain 1, and every wave's system-scope invalidate after
+ * it, acq 0 -- per launch of 4 x 1024 threads 128 L2 writebacks and 256 L2 invalidates on the card while the compute lane
+ * runs beside it). The forms (drain, acq), for the four-rank exact two-shot (lane and wide) and SP's rows halves:
+ *   1  (5, 0)  every wave's release half only (global_wb SYS + store wait), the system invalidate a wave after the flag;
+ *   2  (5, 3)  as 1, the acquire as ONE system invalidate a block + every wave's device-scope invalidate;
+ *   3  (5, 4)  as 1, every wave's device-scope invalidate only;
+ *   4  (7, 4)  SP's raw rows: the pushes as system-scope stores, every wave's store wait, device-scope invalidates
+ *              (other kernels: form 3);
+ *   5  (7, 3)  as 4 with form 2's acquire (other kernels: form 2).
+ * The bytes each launch moves and folds are the same in every form; what changes is when the flag may go out and what an
+ * acquire drops. A launch parameter `fence` overrides it (r4d_selftest's stress / contention arms). Only messages that
+ * the drain-1 rule caught (drain 1 at >= 131072 elements) move. -1 until the environment is read. */
+static std::atomic<int> g_ar_fence{-1};
+static int ar_fence(const RadArgs* a) {
+    int v = g_ar_fence.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_AR_FENCE");
+        int on = (e && *e) ? std::atoi(e) : 0;
+        if (on < 0 || on > 5) on = 0;
+        int want = -1;
+        g_ar_fence.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_ar_fence.load(std::memory_order_relaxed);
+    }
+    return (int)r4d_geti_or(a, "fence", v);
+}
+static void ar_fence_apply(const RadArgs* a, ArCall* c, bool sys_push) {
+    if (c->drain != 1 || c->numel < 131072) return;
+    switch (ar_fence(a)) {
+        case 1: c->drain = 5; break;
+        case 2: c->drain = 5; c->acq = 3; break;
+        case 3: c->drain = 5; c->acq = 4; break;
+        case 4: c->drain = sys_push ? 7 : 5; c->acq = 4; break;
+        case 5: c->drain = sys_push ? 7 : 5; c->acq = 3; break;
+        default: break;
+    }
+}
+extern "C" int r4d_ar_fence_set(int v) {
+    if (v < 0 || v > 5) return -1;
+    g_ar_fence.store(v, std::memory_order_relaxed);
+    return 1;
+}
+
 /* r4d_selftest --sdmaeng4: whether an instance got a copy-engine context at build. */
 extern "C" int r4d_ar_inst_sdma(const void* inst) { return inst && ((const ArInst*)inst)->sdma ? 1 : 0; }
 
@@ -1223,6 +1267,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
     int rc = ar_setup(a, &c, 1);
     if (rc != RAD_OK) return rc;
     if (c.in->world != 4) return RAD_E_SHAPE;
+    ar_fence_apply(a, &c, false);   /* fn4 PFF */
     if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
     /* The message must shard evenly in whole 16-byte words and 2*shard must fit the slot. */
     const long words16 = c.numel * c.in->esize / 16;
@@ -1455,6 +1500,7 @@ static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
     long long raw = 0;
     (void)rad_args_geti(a, "raw", &raw);
     const int op = op_kind == 0 ? (raw ? 3 : 0) : raw ? 2 : 1;   /* fn4 12.11.: raw 1 = the exact reduce-scatter */
+    ar_fence_apply(a, &c, op == 2 || op == 3);   /* fn4 PFF: the raw halves push through r4d_ar_push16 */
     if (r4d_geti_or(a, "overlap", 0) == 1) {
         const int lt = ar_lane_threads();
         if (lt > 0) c.nthreads = lt;

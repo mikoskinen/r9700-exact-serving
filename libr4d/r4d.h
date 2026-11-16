@@ -763,6 +763,8 @@ void r4d_hc_mix_ctr_release(void);
 int r4d_ar_lane_threads_set(int threads);
 /* fn4 RSF: the four-rank exact two-shot's first hop and SP's raw reduce-scatter pushes interleaved over the peers (0 / 1) */
 int r4d_ar_xpush_set(int on);
+/* fn4 PFF (qwen/prefill): the four-rank prefill collectives' cache maintenance form 0..5 (r4d_ar_entry.hip ar_fence) */
+int r4d_ar_fence_set(int v);
 int r4d_kv_vic_set(int on);   /* fn4 kvs_vic: kv_resolve victims by compaction (1) or serially (0) */
 // fn4 ar_laneblocks: that lane's block count -- 0 the resolved tunable (4), else 4..24 in steps of 4
 // (RADIANCE_FN4_AR_LANE_BLOCKS at start). The sums do not depend on it. 1 applied, -1 refused.

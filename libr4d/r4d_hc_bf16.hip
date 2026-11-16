@@ -7831,6 +7831,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     }
     if (!std::strcmp(name, "ar_lanethreads")) return r4d_ar_lane_threads_set(value);
     if (!std::strcmp(name, "ar_xpush")) return r4d_ar_xpush_set(value);   /* fn4 RSF */
+    if (!std::strcmp(name, "ar_fence")) return r4d_ar_fence_set(value);   /* fn4 PFF (qwen/prefill) */
     if (!std::strcmp(name, "kvs_vic")) return r4d_kv_vic_set(value);   /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md) */
     if (!std::strcmp(name, "ar_sdma")) return r4d_ar_sdma_set(value);   /* fn4 SDMA-AR */
     if (!std::strcmp(name, "ar_laneblocks")) return r4d_ar_lane_blocks_set(value);

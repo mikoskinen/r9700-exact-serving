@@ -30984,6 +30984,7 @@ struct Ar4Stress {
     const RadKernelInfo* row = nullptr;
     std::vector<RadParam> extra;
     bool rs = false;
+    bool ag = false;   /* fn4 PFF: SP's raw all-gather in place (every rank's buffer = each owner's shard rows) */
     int64_t n = 0, width = 0;
     StBarrier* bar = nullptr;
     int rc = RAD_OK;
@@ -31010,6 +31011,7 @@ static void ar4_stress_worker(Ar4Stress* t) {
         for (int r = 0; r < t->world; ++r) acc += h_bf16(h_to_bf16(ar_rough_value(r, i)));
         h[(size_t)i] = h_to_bf16(ar_rough_value(t->rank, i));
         want[(size_t)i] = h_to_bf16(acc);
+        if (t->ag) want[(size_t)i] = h_to_bf16(ar_rough_value((int)std::min<int64_t>(i / t->width / q, t->world - 1), i));
     }
     if (t->rc == RAD_OK) {
         st_memcpy(pristine, h.data(), (size_t)n * 2, hipMemcpyHostToDevice);
@@ -31019,7 +31021,7 @@ static void ar4_stress_worker(Ar4Stress* t) {
     if (t->rc != RAD_OK) { t->bar->wait(); return; }
     std::vector<RadParam> ps = ip;
     for (const RadParam& x : t->extra) ps.push_back(x);
-    if (t->rs) { ps.push_back(PI("raw", 1)); ps.push_back(PI("row", t->width)); }
+    if (t->rs || t->ag) { ps.push_back(PI("raw", 1)); ps.push_back(PI("row", t->width)); }
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.p = ps.data(); a.n_p = (int)ps.size(); a.instance = inst; a.rank = t->rank; a.world_size = t->world;
@@ -31027,7 +31029,7 @@ static void ar4_stress_worker(Ar4Stress* t) {
         const int nb = std::min(NB, t->launches - L);
         for (int j = 0; j < nb && t->rc == RAD_OK; ++j) {
             RadTensor ts[2];
-            if (t->rs) {
+            if (t->rs || t->ag) {
                 hip_ck(hipMemcpyAsync(in, pristine, (size_t)n * 2, hipMemcpyDeviceToDevice, nullptr), "hipMemcpyAsync", __LINE__);
                 ts[0] = T(in, RAD_BF16, { n }); ts[1] = T(in, RAD_BF16, { n });
             } else {
@@ -31039,6 +31041,8 @@ static void ar4_stress_worker(Ar4Stress* t) {
             if (t->rs)
                 hip_ck(hipMemcpyAsync(outs[j], (const uint16_t*)in + lo, (size_t)(hi - lo) * 2, hipMemcpyDeviceToDevice, nullptr),
                        "hipMemcpyAsync", __LINE__);
+            else if (t->ag)
+                hip_ck(hipMemcpyAsync(outs[j], in, (size_t)n * 2, hipMemcpyDeviceToDevice, nullptr), "hipMemcpyAsync", __LINE__);
         }
         if (st_stream_sync(nullptr) != hipSuccess && t->rc == RAD_OK) t->rc = RAD_E_DEVICE;
         for (int j = 0; j < nb && t->rc == RAD_OK; ++j) {
@@ -31187,6 +31191,50 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
     if (nst <= 0) return;
     const RadKernelInfo* two = find(pl, "ar_twoshot_4rank_exact");
     const RadKernelInfo* rsr = find(pl, "sp_rs_rows_4rank_ti8");
+    /* fn4 PFF (16.11.2026, qwen/prefill): R4D_SELFTEST_AR4_FENCE=list (e.g. 0,1,2,3,4,5) runs the stale-read stress over the
+     * ar_fence forms instead (r4d_ar_entry.hip; launch parameter `fence`, no drain_force: the drain-1 rule fires and the form
+     * replaces it), on the four ops a pipelined prefill step issues: the exact two-shot (wide) and its lane twin (overlap 1,
+     * the coded wire), SP's raw reduce-scatter and SP's raw all-gather, with xpush 1 (the published setting). */
+    if (const char* fe = std::getenv("R4D_SELFTEST_AR4_FENCE")) {
+        std::vector<int> forms;
+        for (const char* q = fe; *q;) { forms.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
+        const RadKernelInfo* agr = find(pl, "sp_ag_rows_4rank");
+        for (size_t si = 0; si < sizes.size(); ++si) {
+            if (sizes[si] / widths[si] < 64) continue;
+            for (int op = 0; op < 4; ++op)
+                for (int f : forms) {
+                    const RadKernelInfo* row = op == 2 ? rsr : op == 3 ? agr : two;
+                    if (!row) continue;
+                    StBarrier b2(W);
+                    std::vector<Ar4Stress> st((size_t)W);
+                    std::vector<std::thread> th2;
+                    for (int r = 0; r < W; ++r) {
+                        Ar4Stress& x = st[(size_t)r];
+                        x.rank = r; x.dev = devs[(size_t)r]; x.launches = nst; x.row = row; x.rs = op == 2; x.ag = op == 3;
+                        x.n = sizes[si]; x.width = widths[si]; x.bar = &b2;
+                        x.extra = { PI("fence", f), PI("xpush", 1) };
+                        if (op == 1) x.extra.push_back(PI("overlap", 1));
+                        th2.emplace_back(ar4_stress_worker, &x);
+                    }
+                    for (std::thread& x : th2) x.join();
+                    int64_t bad = 0, bl = 0, fb = -1;
+                    int rc = RAD_OK;
+                    for (const Ar4Stress& x : st) {
+                        bad += x.bad; bl += x.bad_launches;
+                        if (x.first_bad >= 0 && (fb < 0 || x.first_bad < fb)) fb = x.first_bad;
+                        if (x.rc != RAD_OK) rc = x.rc;
+                    }
+                    const char* on[4] = { "AR two-shot exact", "AR lane coded exact", "SP RS raw", "SP AG raw" };
+                    std::printf("FSTRESS {\"rows\": %lld, \"width\": %lld, \"op\": \"%s\", \"fence\": %d, \"launches\": %d, "
+                                "\"rc\": %d, \"bad\": %lld, \"bad_launches\": %lld, \"first_bad\": %lld}\n",
+                                (long long)(sizes[si] / widths[si]), (long long)widths[si], on[op], f, nst, rc, (long long)bad,
+                                (long long)bl, (long long)fb);
+                    std::fflush(stdout);
+                    if (bad) ++g_fail;
+                }
+        }
+        return;
+    }
     for (size_t si = 0; si < sizes.size(); ++si) {
         if (sizes[si] / widths[si] < 64) continue;   /* the prefill sizes: the fence rule's (>= 131072 elements) */
         for (int rs = 0; rs <= 1; ++rs)

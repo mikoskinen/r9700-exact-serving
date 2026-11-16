@@ -153,7 +153,7 @@ __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<ch
 #pragma unroll
       for (int p = 0; p < NPEERS; ++p) if (k < kE[p]) v[p] = *reinterpret_cast<const uint4*>(src[p] + (long)k * TI8_EPL);
 #pragma unroll
-      for (int p = 0; p < NPEERS; ++p) if (k < kE[p]) ((uint4*)pslot[p])[k] = v[p];
+      for (int p = 0; p < NPEERS; ++p) if (k < kE[p]) r4d_ar_push16((uint4*)pslot[p] + k, v[p], drain);   /* fn4 PFF */
     }
   } else
   for (int p = 0; p < NPEERS; ++p) {
@@ -162,7 +162,7 @@ __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<ch
     const T* src = buf + g0 * TI8_GROUP;
     const int gE = gB < ng ? gB : ng;
     for (int k = 4 * gA + tid; k < 4 * gE; k += nt)
-      ((uint4*)pslot[p])[k] = *reinterpret_cast<const uint4*>(src + (long)k * TI8_EPL);
+      r4d_ar_push16((uint4*)pslot[p] + k, *reinterpret_cast<const uint4*>(src + (long)k * TI8_EPL), drain);   /* fn4 PFF */
   }
   r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
   r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
@@ -222,7 +222,7 @@ __global__ void r4d_ar_ag_rows_kernel(T* __restrict__ buf, R4DArWidePeers<char, 
       if constexpr (RAW) {
         const uint4 w = *reinterpret_cast<const uint4*>(mine + (long)k * TI8_EPL);
 #pragma unroll
-        for (int p = 0; p < NPEERS; ++p) ((uint4*)pslot[p])[k] = w;
+        for (int p = 0; p < NPEERS; ++p) r4d_ar_push16((uint4*)pslot[p] + k, w, drain);   /* fn4 PFF */
       } else {
         const int lig = k & 3, g = k >> 2;
         uint2 codes;
