@@ -98,8 +98,8 @@ bus 03, c3, 84 and 48 on ranks 0 to 3.
 
 ### Qwen for Claude Code
 
-Pick the command by how many Claude Code requests run at once and how much context they need. At 24
-to 32 concurrent requests the KV cache is kept in host memory (`--kv-resident`), which takes about
+Pick the command by the number of concurrent Claude Code sessions and the context length you want. At
+24 to 32 concurrent requests the KV cache is kept in host memory (`--kv-resident`), which takes about
 40 GiB of RAM a card.
 
 **16 concurrent requests, 262,144-token context** (KV cache of 1,746,316 tokens a card):
