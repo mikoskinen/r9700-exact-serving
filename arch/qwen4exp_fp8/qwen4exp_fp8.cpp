@@ -2600,6 +2600,11 @@ static bool spser_plan(const Model& m, const RadBatch* batch, SpSer& sp) {
     return true;
 }
 
+/* diagnostic only (qwen/SP-SERIAL-EXACT.md): RADIANCE_FN4_SPDIAG bit mask, tracer starts only (host syncs) */
+static int spdiag() {
+    static const int v = [] { const char* e = std::getenv("RADIANCE_FN4_SPDIAG"); return e && *e ? std::atoi(e) : 0; }();
+    return v;
+}
 static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu, const SpSer& sp) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, D = g.n_embd, HN = m.hccfg.hc * g.n_embd;
@@ -2619,10 +2624,20 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
         rad_lane(c, 0);
     };
     auto wait1 = [&] { if (l2) rad_lane_join(c, 1, 0); };
+    if (spdiag() & 1) {   /* diagnostic: both lanes drained on the host before the step */
+        rad_lane(c, 1); rad_stream_sync(rad_stream(c)); rad_lane(c, 0); rad_stream_sync(rad_stream(c));
+    }
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
     on1(true, [&] { RAD_ISSUE_N(c, m.op_embed_ar, T * D, brows(m.a_x.x, T), RAD_NONE); });
+    if (spdiag() & 16) {   /* diagnostic: one more all-reduce on the instance (the embedding's again, of zeros added:
+                            * a_x.x unchanged in value? no -- the embedding AR sums disjoint rows, so a second AR would
+                            * multiply; use the gather of the whole step instead, which copies every rank's own rows) */
+        const SpSer::Run allr = [&] { SpSer::Run r; r.r0 = 0; r.n = T; return r; }();
+        (void)allr;
+        RAD_ISSUE_N(c, m.sp_ag, T * D, brow_slice(m.a_x.x, 0, T, D), RAD_NONE);   /* after the AR every rank holds every row: a no-op copy */
+    }
     wait1();
     if (m.ple_layer >= 0) m.ple.ids(c, batch);
     m.enter.step(c, T);
@@ -2681,10 +2696,26 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
                 const int  lnx = fnx ? tli : tli + 1;
                 if (tnm) bt_rd(c, m, r.lo, r.hi - r.lo, fnx ? "rd_ffn" : "rd_mix", lnx, fnx);
                 ag(r);
+                if (spdiag() & 2) ag(r);   /* diagnostic: the same gather a second time */
                 dumpx("post_ag");
                 codes(*nx, 0, T);
                 dumpx("post_codes");
-                if (sdump) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); dumpx("post_codes_100ms"); }
+                if (sdump) {
+                    /* the codes the shaders wrote from the gathered rows (their view of x), rows [0, T) */
+                    const rad_buf qb = nx->c.codes_i8 ? m.a_x.q8 : m.a_x.q, sb = nx->c.codes_i8 ? m.a_x.s8 : m.a_x.s;
+                    std::vector<uint8_t> hq((size_t)(T * D));
+                    std::vector<float> hs((size_t)(T * (D / 128)));
+                    const RadStream st = rad_stream(c);
+                    rad_memcpy_async(hq.data(), rad_buf_ptr(c, qb), (size_t)(T * D), st);
+                    rad_memcpy_async(hs.data(), rad_buf_ptr(c, sb), hs.size() * 4, st);
+                    rad_stream_sync(st);
+                    char fn[600];
+                    snprintf(fn, sizeof fn, "%s/r%d-s%lld-L%02d-%s-codes%s.bin", sdd, g.rank, (long long)batch->step, tli, tnm ? tnm : "x",
+                             nx->c.codes_i8 ? "i8" : "f8");
+                    if (FILE* f = fopen(fn, "wb")) { fwrite(hq.data(), 1, hq.size(), f); fwrite(hs.data(), 4, hs.size(), f); fclose(f); }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    dumpx("post_codes_100ms");
+                }
                 if (tnm) bt_rd(c, m, 0, T, fnx ? "rdg_ffn" : "rdg_mix", lnx, fnx);
             }
             return;
