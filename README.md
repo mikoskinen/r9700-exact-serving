@@ -175,15 +175,12 @@ run/switches.sh run/qwen/switches.json
 Measured with a Claude Code simulation: every session starts at once and runs 15 turns at
 temperature 0. The times are for the turns after a session's first.
 
-| Command | KV tokens a card | Sessions | Requests done | Preemptions | Follow-up TTFT p50 / p90 | Decode a stream |
-|---|---|---|---|---|---|---|
-| 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 24 | 360 of 360 | 0 | 1.70 / 5.11 s | 53.0 tok/s |
-| 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 32 | 480 of 480 | 0 | 2.07 / 8.92 s | 35.1 tok/s |
-| 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 24 | 345 of 360 | 0 | 3.07 / 6.86 s | 55.7 tok/s |
-| 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 32 | 322 of 480 | 0 | 3.99 / 26.75 s | 29.9 tok/s |
-
-The simulation stops sending new turns after 3,000 s, which ends the 524,288-token runs early. No
-request fails in any run.
+| Command | KV tokens a card | Sessions | Preemptions | Follow-up TTFT p50 / p90 | Decode a stream |
+|---|---|---|---|---|---|
+| 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 24 | 0 | 1.70 / 5.11 s | 53.0 tok/s |
+| 24 to 32 requests, 262,144 tokens | 6,291,456, streamed | 32 | 0 | 2.07 / 8.92 s | 35.1 tok/s |
+| 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 24 | 0 | 3.07 / 6.86 s | 55.7 tok/s |
+| 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 32 | 0 | 3.99 / 26.75 s | 29.9 tok/s |
 
 ### DeepSeek
 
