@@ -174,7 +174,7 @@ bool apply_pending(int step, int* draft_adaptive) {
         int handled = 1;
         if (i == kGatherInv || i == kHcFuseDown || i == kHcNormWave || i == kHcWriteVec ||
             i == kHcReadV || i == kArLaneThreads || i == kHcUpMix || i == kArLaneBlocks || i == kExl3PfPrep ||
-            i == kExl3MapShare || i == kExl3Gd || i == kMoePair || i == kExl3Dz || i == kExl3Bi || i == kExl3Dual || i == kHcBi || i == kBiSeg || i == kAttBi || i == kArwRows || i == kHcSpProbe || i == kHcSp || i == kMtpFlat || i == kArXpush || i == kArSdma || i == kBiWide || i == kSpSerial || i == kHcPinPf2 || i == kKvsBi || i == kKvsVic) {
+            i == kExl3MapShare || i == kExl3Gd || i == kMoePair || i == kExl3Dz || i == kExl3Bi || i == kExl3Dual || i == kHcBi || i == kBiSeg || i == kAttBi || i == kArwRows || i == kHcSpProbe || i == kHcSp || i == kMtpFlat || i == kArXpush || i == kArSdma || i == kBiWide || i == kSpSerial || i == kHcPinPf2 || i == kKvsBi || i == kKvsVic || i == kSpPle) {
             find_hooks(s);
             handled = 0;
             bool refused = false;
