@@ -1796,8 +1796,11 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
          * from kBiMinPiece on); the snapshot is the same state (Engine::save_checkpoints: the window rows are held
          * through the chunk, a CONV window is patched from the plugin's mapped ids at that row, a LINEAR state is the
          * chunk end's, which a resume at a multiple of every compress ratio never reads -- deepseek41's tails). */
+        /* (beside a spanned lone prefill at any size its plan takes; else at most the span's shared level, so the joined
+         * chunk never takes the full plan -- an arena recall -- that its two pieces would not) */
         const bool ti = fine > 0 && tail_inner_sw_ > 0 && tail > n_computed && tail < n_target &&
-                        n_computed + want == n_target && n_target - n_computed <= ti_limit_ && !geo_.on_grid(tail);
+                        n_computed + want == n_target && n_target - n_computed <= ti_limit_ && !geo_.on_grid(tail) &&
+                        (span_now_ || geo_.shared_tok <= 0 || n_target - n_computed <= geo_.shared_tok);
         if (ti) {
             if (checkpoint_pos) *checkpoint_pos = tail;
         } else if (tail > n_computed && n_computed + want >= tail) {
