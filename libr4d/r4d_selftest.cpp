@@ -28415,7 +28415,8 @@ static void qsa_select_part_one(const Plugin& pl, const char* what, int64_t S, i
 static void qsa_score_part_case(const Plugin& pl, int parts) {
     const char* what = "qsa_score parts form vs the whole launch, inside and outside each rank's range";
     const RadKernelInfo* r = find(pl, "qsa_score_bf16");
-    if (!r) { ok(what, false, "row absent"); return; }
+    const RadKernelInfo* rp = find(pl, "qsa_score_part_bf16");
+    if (!r || !rp) { ok(what, false, "row absent"); return; }
     const int64_t S = 5, per = 4, M = S * per, n = 128, heads = 4, nb = 9001, pages = 12000;
     std::vector<uint16_t> qh((size_t)(M * heads * n)), bkh((size_t)(pages * n));
     for (int64_t i = 0; i < M * heads * n; ++i) qh[(size_t)i] = h_to_bf16((float)(((i * 29 + 7) % 83) - 41) / 47.0f);
@@ -28450,7 +28451,7 @@ static void qsa_score_part_case(const Plugin& pl, int parts) {
         RadArgs a; std::memset(&a, 0, sizeof(a));
         a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size();
         st_memset(d_o, 0x7F, (size_t)(M * nb) * 4);
-        const int rc = r->launch(&a, nullptr);
+        const int rc = (P > 1 ? rp : r)->launch(&a, nullptr);
         st_stream_sync(nullptr);
         out.assign((size_t)(M * nb), 0);
         st_memcpy(out.data(), d_o, out.size() * 4, hipMemcpyDeviceToHost);
@@ -36360,7 +36361,8 @@ static void device_phase(const Plugin& pl) {
         qsa_select_part_one(pl, "qsa_split: 8 seq x 4 rows, few live (<= topk), 4 parts", 8, 4, 2400, 700, 60, 96, 4);
         qsa_select_part_one(pl, "qsa_split: 3 seq x 4 rows, every score equal, 4 parts", 3, 4, 9000, 8800, 1000, 1, 4);
     }
-    if (sel("qsa_score_bf16")) {
+    if (sel("qsa_score_part_bf16")) {
+        if (!g_case) std::printf("\nfn4 qsa_split: the score over a rank's range, against the whole launch\n");
         qsa_score_part_case(pl, 4);
         qsa_score_part_case(pl, 3);
     }

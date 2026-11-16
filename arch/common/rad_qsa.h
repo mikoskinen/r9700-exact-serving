@@ -310,7 +310,7 @@ inline int QsaIndexer::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
                      {w.score, w.nc}, {w.qlist});
         if (!op_selp1) return RAD_E_INVAL;
         if (g.world > 1 && w.qpart && w.qgath && c.head_dim == 128 && c.heads <= 4) {
-            op_score_part = rw(b, RAD_OP(b, "qsa_score",
+            op_score_part = rw(b, RAD_OP(b, "qsa_score_part",
                                   RAD_PARAMS(RAD_RANGE("M", 1, c.split_rows), RAD_INT("n", c.head_dim),
                                              RAD_INT("heads", c.heads), RAD_INT("blocks", c.max_blocks),
                                              RAD_INT("seqs", g.max_seqs), RAD_STR("dtype", g.dtype),

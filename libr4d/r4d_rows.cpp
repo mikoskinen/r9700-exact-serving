@@ -1543,10 +1543,19 @@ static const RadParamSpec pQsaScore[] = {
     { "blocks", RAD_P_INT, RAD_REQUIRED },
     { "seqs",   RAD_P_INT, RAD_REQUIRED },
     { "dtype",  RAD_P_STR, RAD_REQUIRED },
-    /* fn4 qsa_split (qwen/QSA-SPLIT.md): score only rank `part` of `parts`' block range of each sequence
-     * (r4d_qsa_part.h); absent = the whole history */
-    { "parts",  RAD_P_INT, RAD_OPTIONAL },
-    { "part",   RAD_P_INT, RAD_OPTIONAL },
+};
+/* fn4 qsa_split (qwen/QSA-SPLIT.md): `qsa_score` over rank `part` of `parts`' block range of each sequence only
+ * (r4d_qsa_part.h), the same scores at the same columns; an op of its own because every plugin that serves qsa_score fixes
+ * the same schema. Operands are qsa_score's. */
+static const RadParamSpec pQsaScorePart[] = {
+    { "M",      RAD_P_INT, RAD_REQUIRED },
+    { "n",      RAD_P_INT, RAD_REQUIRED },
+    { "heads",  RAD_P_INT, RAD_REQUIRED },
+    { "blocks", RAD_P_INT, RAD_REQUIRED },
+    { "seqs",   RAD_P_INT, RAD_REQUIRED },
+    { "dtype",  RAD_P_STR, RAD_REQUIRED },
+    { "parts",  RAD_P_INT, RAD_REQUIRED },
+    { "part",   RAD_P_INT, RAD_REQUIRED },
 };
 static const RadOperandSpec oQsaScore[] = {
     { "q",     RAD_OPD_IN,  0 },
@@ -3992,6 +4001,10 @@ static const RadOpSchema kSchemas[] = {
            "negative cancel another's positive. `bt` holds PAGE IDS, and a negative entry scores "
            "-inf rather than zero, because a real score can be zero and padding must not outrank "
            "a block the model chose to ignore."),
+    SCHEMA("qsa_score_part", pQsaScorePart, oQsaScore,
+           "fn4 qsa_split: qsa_score over rank `part` of `parts`' block range of each sequence only -- the cuts of the "
+           "sequence's complete-block count at multiples of 16 (r4d_qsa_part.h) -- the same scores at the same columns, "
+           "nothing written outside the range."),
     SCHEMA("qsa_select_part", pQsaSelectPart, oQsaSelectPart,
            "fn4 qsa_split: rank `part` of `parts`' share of qsa_select -- over its block range of each sequence, in chunks, "
            "each chunk's own top-k as (key, page) lists in ASCENDING BLOCK ORDER, and with `slab` the range's own top-k "
@@ -9665,6 +9678,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   r4d_shape_qsa_select },
 
 /* fn4 qsa_split (qwen/QSA-SPLIT.md): qsa_select across the ranks (or in chunks on one card) and its merge. */
+{ "qsa_score_part_bf16", "qsa_score_part", "attn",
+  "the QSA block score over a rank's block range of each sequence (fn4 qsa_split)",
+  "n 128, at most 4 heads (the matrix form), any block count and any M",
+  "bf16 queries and block keys, an i32 page-id table, f32 scores at the whole launch's columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaScore), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_score, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_score },
 { "qsa_select_part_i32", "qsa_select_part", "attn",
   "a rank's part of the QSA selection: its block range's top-k as block-ordered candidate lists",
   "any M, any block count; the range in chunks of at most 8192 blocks that fit the key cache; unsigned order",
