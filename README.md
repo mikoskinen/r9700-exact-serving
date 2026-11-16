@@ -234,42 +234,37 @@ is the build of 15.11.2026, and in a 33-minute run under load all 160 of its ans
 Qwen's answers to 20 short prompts and to 12 long prompts of up to 5,934 tokens stay identical beside
 up to 31 other requests.
 
-## Hardware changes
+## Host tuning
 
-Raw values are in [docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md).
+Measurements are in [docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md).
 
-- **Same-size DIMMs:** replacing mixed 4 x 32 GB and 4 x 64 GB DIMMs with 8 x 64 GB put all eight
-  memory channels in one interleave set, which raised CPU read bandwidth from 35.9 to 104 GB/s and
-  two-card host-to-GPU copies from 45.1 to 55.4 GB/s.
-- **One card per IO-die quadrant:** moving three cards onto risers so that every quadrant has its own
-  card raised four-card host-to-GPU copies from 61.3 to 105.3 GB/s, because two cards in one quadrant
-  share a root port of about 36 GB/s.
-- **CPU idle states and governor:** disabling every idle state with an exit latency of 100 µs or more
-  and setting the `performance` governor at boot removed a random ~16 % slowdown (Qwen at 8 users went
-  from ~630 to ~750 tok/s).
-- **The CPU swap that didn't help:** an EPYC 7302P in place of the 7282 on the mixed DIMMs moved
-  two-card copies from 44.2 to 45.1 GB/s and made a two-card Qwen server 5.7 % slower at 16 users,
-  because the 2-channel memory regions were the limit.
+- The machine had 4 x 32 GB and 4 x 64 GB DIMMs, which split the eight memory channels into two sets.
+  With 8 x 64 GB all channels are in one interleave set, and CPU read bandwidth went from 35.9 to
+  104 GB/s.
+- Two cards in the same IO-die quadrant share a root port of about 36 GB/s. Three cards were moved onto
+  risers so that each quadrant has one card, and four-card host-to-GPU copies went from 61.3 to
+  105.3 GB/s.
+- The CPU sometimes stayed in a deep idle state, and the server then ran about 16 % slower. Idle states
+  with an exit latency of 100 µs or more are now disabled at boot, and the governor is set to
+  `performance`.
 
-## Software changes
+## Engine changes
 
-Each of these changes keeps the output exact, and [registry/](registry/) lists every tested
-change, the rejected ones included:
+Each change leaves the output exact. [registry/](registry/) lists every tested change, including the
+rejected ones.
 
-- **Batch-invariant kernels:** Qwen's batch-invariant kernel set makes each answer independent of the
-  other requests in a step and also cuts the 16-user step time from 37.95 to 35.70 ms (-5.9 %) against
-  the kernels it replaced.
-- **Interleaved all-reduce push:** the exact four-card all-reduce now pushes each card's data to every
-  peer in one interleaved pass instead of one link at a time, which cut a 42 MB all-reduce from 3,436
-  to 2,508 µs (-27 %).
-- **Prefill skip above the last cache source:** DeepSeek's layers 21 to 39 write almost no cache that
-  later tokens read, so a cold prefill runs them only for the end of the prompt.
-  The time to first token for a 136k-token prompt fell from 50.5 to 33.3 s (-34 %).
-- **Expert residency:** giving DeepSeek's spare VRAM to resident expert weights instead of holding it
-  back for swapping experts in and out raised 8-user throughput from 143.9 to 169.5 tok/s (+17.8 %).
-- **Sequence-parallel prefill stages:** in Qwen prefill each card runs the hyper-connection stages on a
-  quarter of the rows between a reduce-scatter and an all-gather, which raised 64k prefill from 8,293
-  to 8,754 tok/s (+5.7 %).
+- Qwen's kernels compute a request's rows the same way whatever else is in the step, which is what
+  makes an answer independent of load. They are also 5.9 % faster per step at 16 concurrent requests
+  than the kernels they replaced.
+- The four-card all-reduce sends each card's data to all peers in one interleaved pass instead of one
+  link at a time, and a 42 MB all-reduce takes 2,508 µs instead of 3,436.
+- In Qwen prefill each card runs the hyper-connection stages on a quarter of the rows, which raised
+  64k prefill from 8,293 to 8,754 tok/s.
+- DeepSeek's layers 21 to 39 write almost no cache that later tokens read, so a cold prefill runs them
+  only for the end of the prompt. The time to first token for a 136k-token prompt went from 50.5 to
+  33.3 s.
+- DeepSeek's spare VRAM holds expert weights instead of being kept free for swapping experts in and
+  out, which raised throughput at 8 concurrent requests from 143.9 to 169.5 tok/s.
 
 ## Model weights
 
