@@ -227,7 +227,52 @@ struct FakeKV : IKVManager {
         return RAD_OK;
     }
 
+    /* fn4 preempt_keep, as KVManager::preempt_keep / rejoin: the whole blocks go, the partial last block and the states
+     * stay; rejoin puts a hit's whole blocks back in front */
+    std::unordered_map<uint64_t, int64_t> kept;
+    int64_t preempt_keep(uint64_t id, int64_t n_valid) override {
+        auto it = seqs.find(id);
+        if (it == seqs.end()) return RAD_E_NOTFOUND;
+        const int64_t nv = std::min<int64_t>(it->second.n, n_valid);
+        int64_t whole = -1;
+        for (size_t i = 0; i < gs.size(); ++i)
+            if (geom.g[i].paged) {
+                const int64_t bs = geom.g[i].block_size, w = nv / bs * bs;
+                whole = whole < 0 ? w : std::min(whole, w);
+            }
+        if (whole < 0) whole = 0;
+        for (size_t i = 0; i < gs.size(); ++i) {
+            if (!geom.g[i].paged) continue;
+            auto& bt = it->second.blocks[i];
+            const int64_t nb = std::min<int64_t>(whole / geom.g[i].block_size, (int64_t)bt.size());
+            for (int64_t b = 0; b < nb; ++b) release((int32_t)i, bt[(size_t)b]);
+            bt.erase(bt.begin(), bt.begin() + nb);
+            it->second.dirty[i] = 0;
+        }
+        kept[id] = whole;
+        return whole;
+    }
+    int rejoin(uint64_t id, int32_t g, const std::vector<int32_t>& whole) override {
+        auto it = seqs.find(id);
+        auto k = kept.find(id);
+        if (it == seqs.end() || k == kept.end()) return RAD_E_STATE;
+        if ((int64_t)whole.size() != k->second / geom.g[(size_t)g].block_size) return RAD_E_INVAL;
+        for (int32_t b : whole) retain(g, b);
+        auto& bt = it->second.blocks[(size_t)g];
+        bt.insert(bt.begin(), whole.begin(), whole.end());
+        it->second.dirty[(size_t)g] = 0;
+        bool all = true;
+        for (size_t i = 0; i < gs.size(); ++i)
+            if (geom.g[i].paged) {
+                const int64_t bs = geom.g[i].block_size;
+                if ((int64_t)it->second.blocks[i].size() != (it->second.n + bs - 1) / bs) all = false;
+            }
+        if (all) kept.erase(k);
+        return RAD_OK;
+    }
+
     int preempt(uint64_t id) override {
+        kept.erase(id);
         auto it = seqs.find(id);
         if (it == seqs.end()) return RAD_E_NOTFOUND;
         for (size_t i = 0; i < gs.size(); ++i) {
@@ -456,8 +501,17 @@ struct FakePC : IPrefixCache {
         }
         CacheHit h{ attn, lin, src };
         h.branch_at = branch_at;
+        /* fn4 resume_cold (HitCap::resume_at): the deepest allowed position at or below the snapshot where one is held
+         * -- this fake holds one at `lin` and at every multiple of `interval` below it (from ckpt_lo) */
+        if (cap && cap->resume_at && src >= 0) {
+            int64_t l = 0;
+            for (int64_t p : *cap->resume_at)
+                if (p > 0 && p <= lin && (p == lin || (p % interval == 0 && p >= ckpt_lo))) l = p;
+            h.n_linear_tokens = (int32_t)l;
+            h.checkpoint_slot = l > 0 ? src : -1;
+        }
         const int64_t whole = src >= 0 ? lin : 0;
-        if (cap && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
+        if (cap && cap->tokens >= 0 && attn > cap->tokens / 16 * 16 && whole > cap->tokens) {
             const int64_t a = cap->tokens / 16 * 16;
             int64_t l = std::min<int64_t>(lin, a) / interval * interval;
             if (l < ckpt_lo) l = 0;

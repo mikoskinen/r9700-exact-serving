@@ -26919,6 +26919,36 @@ static void kv_resolve_case(const Plugin& pl) {
             { { 3, 2 }, { 3, 2 }, { 3, 2 } });
     }
 
+    /* fn4 kvs_vic (qwen/KV-STREAM-EXACT.md): a ring that fills and stays warm, many calls -- the free list (more than
+     * kVicListMin = 256 slots occupied) and CLOCK in rotations (4b) against libref's serial sweep. 1024 slots, 8 rows
+     * of up to 96 entries over a drifting window of the id space (some rows overlapping, some ids below the ring for
+     * the identity path), 48 calls: the ring goes from empty through partly full (free list) to full (CLOCK, heats 1-3
+     * from repeated hits), and the last calls claim near the ring's size. */
+    {
+        const int64_t M = 8, pitch = 96, slots = 1024, blocks = 16384;   /* union <= 768 < slots: no overflow */
+        State c; seed(c, M, blocks, slots, pitch, 16);
+        std::vector<std::vector<int32_t>> sels, nsels;
+        uint32_t rng = 12345u;
+        auto nx = [&rng]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+        for (int call = 0; call < 48; ++call) {
+            std::vector<int32_t> sel((size_t)(M * pitch), -1), ns((size_t)M, 0);
+            const int64_t base = (int64_t)(call * 211) % (blocks - 4096);
+            const int64_t win = call < 40 ? 1536 : 3072;
+            for (int64_t q = 0; q < M; ++q) {
+                const int64_t n = call >= 44 ? pitch : 24 + (int64_t)(nx() % (pitch - 24));
+                std::vector<int32_t> row;
+                while ((int64_t)row.size() < n) {
+                    int32_t b = (int32_t)((q % 3 == 0 && nx() % 4 == 0) ? nx() % 900
+                                                                        : base + (int64_t)(nx() % win));
+                    if (std::find(row.begin(), row.end(), b) == row.end()) row.push_back(b);
+                }
+                for (int64_t i = 0; i < n; ++i) sel[(size_t)(q * pitch + i)] = row[(size_t)i];
+                ns[(size_t)q] = (int32_t)n;
+            }
+            sels.push_back(sel); nsels.push_back(ns);
+        }
+        run("kv_resolve kvs_vic: a warm ring over 48 calls (free list, CLOCK rotations) = libref", c, sels, nsels);
+    }
     /* The deployment's own block: 2 KiB across 32 lanes is 128 vectors, one full four-wide group per
      * thread with nothing left over, and 2064 bytes is that group plus one vector of tail. Both are
      * the copy phase 6 exists for -- four loads in flight -- and both are compared against libref's

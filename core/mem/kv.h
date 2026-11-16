@@ -516,6 +516,17 @@ public:
      * checkpoint or from zero. No "needs re-prefill" flag is kept: the scheduler's
      * `r.n_computed = 0` (preempt_back) drives the replay, and seq_tokens() == 0 reflects it. */
     int  preempt(uint64_t seq);
+    /* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md; condition 2 of hero2/QWEN-LP-IDENTITY.md): a decoding
+     * sequence gives up its whole blocks only -- the prefix cache holds what preempt's caller published -- and keeps its
+     * partial last block of every paged group and every state slot (linear with its replay copies, conv, the QSA tail).
+     * `n_valid` is the scheduler's n_computed: the table may run past it (a verify's rejected rows stay allocated until
+     * the next ensure), and only rows below it were published. Returns the tokens its whole blocks below n_valid covered
+     * (the rejoin's hit must reach them), < 0 when it cannot (a window). */
+    int64_t preempt_keep(uint64_t seq, int64_t n_valid);
+    /* The kept sequence takes `whole` (a prefix hit's blocks, whole_tokens / block_size of them) in front of its kept
+     * partial block; nothing is recomputed. RAD_E_STATE when the sequence was not kept. */
+    int  rejoin(uint64_t seq, int32_t group, const std::vector<int32_t>& whole);
+    bool kept(uint64_t seq) const { const Seq* s = find(seq); return s && s->kept; }
 
     /* ---------------- speculative rejection (spec §10) ---------------- */
     /* Shrinks the sequence to `n_tokens` and frees the paged blocks past it. A verify writes KV
@@ -653,6 +664,10 @@ private:
          * sequence. An append or truncation lowers it to where it touched; a shift lowers it to
          * zero; kNoDirty is unchanged. Mutable because take_table_changes() clears it. */
         mutable std::vector<int64_t> dirty_from;
+        /* fn4 preempt_keep: preempted with its states and partial blocks kept, its whole blocks given to the cache;
+         * kept_whole the tokens they covered */
+        bool     kept = false;
+        int64_t  kept_whole = 0;
     };
 
     int  grab_block(int32_t g, int32_t* out);

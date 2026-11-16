@@ -109,6 +109,10 @@ struct CacheHit {
 struct HitCap {
     int64_t tokens = 0;
     int64_t max_give_back = 0;
+    /* fn4 resume_cold (Scheduler::cold_starts): when not null, the positions (ascending) a snapshot may resume this
+     * prompt at -- where its idle cold prefill starts a chunk; the linear state's split takes the deepest snapshot
+     * at one of them. Null: any snapshot (today). */
+    const std::vector<int64_t>* resume_at = nullptr;
 };
 
 /* ------------------------------------------------------------------ retention policy */
@@ -314,7 +318,8 @@ public:
      * eviction would actually free. The entry count overstates this, because entries share blocks
      * with every live sequence that hit them. */
     int64_t unshared_tokens() const;
-    /* Forget every entry, in VRAM or off it, and give back whatever the tiers held for them. */
+    /* Forget every entry, in VRAM or off it, and give back whatever the tiers held for them; every
+     * snapshot not handed out or reserved this step goes too (STALESNAP, the DeepSeek line's 23ee31a). */
     void    clear();
     /* Diagnostic: the LRU order, oldest first. */
     std::vector<BlockHash> lru_order() const;
@@ -541,7 +546,8 @@ private:
      * Checkpoints sit on any block boundary (the interval or a prompt's tail), so this walks the
      * snapshots, a few hundred, rather than the chain's blocks. */
     std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator
-    deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit) const;
+    deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit,
+                 const std::vector<int64_t>* at = nullptr) const;
     static double idle_s(uint64_t used_ns);
 
     KVManager*  kv_ = nullptr;

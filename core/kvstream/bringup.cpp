@@ -43,8 +43,14 @@ int kvstream_configure(const Config& cfg, int64_t ctx, const std::vector<KVGroup
     /* A ring that covers the context is not a refusal: the group stays a resident pool. */
     const KVStreamRing shape = kvstream_ring_shape(cfg, ctx, bs);
     out->asked_tokens   = cfg.kv_resident;
-    out->context_tokens = ctx * cfg.max_seqs;
+    out->context_tokens = shape.ctx_blocks * bs;   /* fn4 kvs_ctx: the id space (the budget when it binds) */
     out->group_name     = gi.name;
+    if (kvstream_ctx_budget_tokens() > 0 && shape.ctx_blocks * bs < ctx * (cfg.max_seqs > 0 ? cfg.max_seqs : 1))
+        RAD_INFO("kv streaming: fn4 kvs_ctx: group '%s' addresses %lld tokens (RADIANCE_FN4_KVS_CTX %lld) shared by every "
+                 "sequence, instead of %lld sequences x %lld tokens = %lld; one sequence still reaches %lld",
+                 gi.name.c_str(), (long long)(shape.ctx_blocks * bs), (long long)kvstream_ctx_budget_tokens(),
+                 (long long)(cfg.max_seqs > 0 ? cfg.max_seqs : 1), (long long)ctx,
+                 (long long)(ctx * (cfg.max_seqs > 0 ? cfg.max_seqs : 1)), (long long)ctx);
     out->ring_blocks    = shape.ring_blocks;
     out->ring_tokens    = shape.ring_blocks * bs;
     out->block_size     = bs;

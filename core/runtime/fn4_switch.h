@@ -97,6 +97,28 @@
  *                   (SP's part reads) takes the PF2 form below 512 rows too, where its band holds the planes; the same bytes
  *                   (PF2 = the wide form at one split); 0 today                                   RADIANCE_FN4_HC_PINPF2
  *
+ *   resume_cold     core scheduler (15.11.2026, qwen/EXACT-PRESSURE.md): a prefix hit answers as a cold run -- 1: the hit
+ *                   resumes only at a snapshot where this prompt's idle cold prefill starts a chunk (Scheduler::cold_starts:
+ *                   its own pieces from 0 with the alone span, keep_at 0), the deepest such at or below the hit
+ *                   (HitCap::resume_at), and a head other prompts share (CacheHit::branch_at) takes no snapshot cut
+ *                   (Request::checkpoint_at stays 0); 0 today                                       RADIANCE_FN4_RESUME_COLD
+ *   preempt_keep    core scheduler + KV manager (15.11.2026, qwen/EXACT-PRESSURE.md): a decoding request preempted for
+ *                   KV is not recomputed -- 1: it publishes its prefix as today, gives up its whole blocks only
+ *                   (KVManager::preempt_keep), keeps its state slots (linear with the replay copies, conv, QSA tail, PLE),
+ *                   its partial last blocks, its card's StepSlot and its drafter state, and rejoins at the same position
+ *                   once the pool holds its next verify (rejoin_kept: the cache's hit puts the whole blocks back, nothing
+ *                   is prefilled); a hit the cache can no longer give falls back to today's recompute (counted); 0 today
+ *                                                                                                   RADIANCE_FN4_PREEMPT_KEEP
+ *   kvs_bi          arch + core (15.11.2026, qwen/KV-STREAM-EXACT.md): KV streaming (--kv-resident) exact under load, a mask
+ *                   0..3 -- 1: a streamed group's decode sequences take their alone step's attention in every pass
+ *                   (sparse, launches of their own rows through att_bi's per-sequence path, on the ring and on the stage;
+ *                   rad_block_attn_gated_fp8.h); 2: the residency maps are reset when a staged pass begins on the aliased
+ *                   stage, so its streamed store never writes a ring slot's offset inside the stage (core/kvstream/
+ *                   stage.cpp); 0 today                                                              RADIANCE_FN4_KVS_BI
+ *   kvs_vic         libr4d (16.11.2026, qwen/KV-STREAM-EXACT.md): kv_resolve's victims by order-keeping compactions of
+ *                   the ring (a free list, CLOCK in rotations) instead of thread 0 walking it slot by slot; the same
+ *                   placement (libref's); 0 today                                                    RADIANCE_FN4_KVS_VIC
+ *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
  *
@@ -116,7 +138,7 @@ namespace fn4 {
 
 enum Switch { kNoRoute = 0, kGatherInv, kHcFuseDown, kHcNormWave, kDraftAdaptive, kHcWriteVec,
               kHcReadV, kArLaneThreads, kHcUpMix, kArLaneBlocks, kAqlAcq, kExl3PfPrep, kExl3MapShare, kExl3Gd, kMoePair, kExl3Dz, kExl3Bi,
-              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kSwitches };
+              kExl3Dual, kHcBi, kBiSeg, kAttBi, kArwRows, kSchedBiChunk, kHcSpProbe, kHcSp, kMtpFlat, kArXpush, kArSdma, kBiWide, kSpSerial, kHcPinPf2, kResumeCold, kPreemptKeep, kKvsBi, kKvsVic, kSwitches };
 
 const char* switch_name(int i);
 int  switch_index(const std::string& name);   /* -1 when unknown */
@@ -130,6 +152,20 @@ int  aql_acq_rule();
 /* fn4 lever BI chunking (ported from ds41-bi): the scheduler's chunk option, the sched_bi_chunk switch's applied value
  * (RADIANCE_SCHED_BI_CHUNK at start): 0 today, 1..4 (core/sched/scheduler.cpp bi_chunk_plan). */
 int  sched_bi_chunk();
+/* fn4 resume_cold (15.11.2026, qwen/EXACT-PRESSURE.md): the scheduler's prefix-hit rule, the switch's applied value
+ * (RADIANCE_FN4_RESUME_COLD at start): 0 today, 1 a hit resumes only where this prompt's idle cold prefill starts a chunk
+ * and no prompt is cut at a head other prompts share (core/sched/scheduler.cpp cold_starts). */
+int  resume_cold();
+/* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md): 1 a decoding request preempted for KV keeps its state slots,
+ * its partial last blocks and its card, and rejoins at the same position with nothing replayed (Scheduler::preempt_back,
+ * rejoin_kept); 0 today (preemption by recompute) -- RADIANCE_FN4_PREEMPT_KEEP at start. */
+int  preempt_keep();
+/* fn4 kvs_bi (15.11.2026, qwen/KV-STREAM-EXACT.md): KV streaming exact under load, a mask -- bit 1 the arch's (a streamed
+ * group's decode sequences in their alone attention form in every pass), bit 2 the core's (core/kvstream/stage.cpp: the
+ * residency maps reset when a staged pass begins on the stage that aliases the ring, so a staged pass's streamed store
+ * writes the mirror and the stage at identity only, never a ring slot's offset inside the stage); 0 today --
+ * RADIANCE_FN4_KVS_BI at start. */
+int  kvs_bi();
 bool aql_acq_none();
 
 /* Server thread: queue a value; false (with the reason) for an unknown switch or a bad value. */

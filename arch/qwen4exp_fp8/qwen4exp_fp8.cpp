@@ -150,7 +150,7 @@ struct Layer {
 struct BiTr {
     bool on = false;
     std::string dir;
-    int64_t pmax = 256, plen = 128;
+    int64_t pmax = 256, plen = 128, pmin = 0;   /* pmin: RADIANCE_FN4_BITRACE_PMIN (15.11.2026), rows at positions >= it */
     rad_buf plane = 0;              /* [max_tok, 2 * cap] i32: row r's point i at columns 2i, 2i + 1 */
     int64_t cap = 0;                /* points a step */
     struct Tb {
@@ -269,6 +269,13 @@ struct Model {
      * wide stream gathered raw after the last layer (sp_agh). */
     rad_op    sp_rs = 0, sp_ag = 0, sp_agh = 0;
     bool      sp_on = false;
+    /* fn4 KVCAP C1 (15.11.2026, qwen/KV-BOUNDS.md): the most rows one sp_agh launch carries, its declared bound. Both issue
+     * sites carry at most a pass or an SP-serial segment (a pipelined piece <= pass_rows; an SP-serial run's T <=
+     * spser_rows <= 128 kSpTiles), so the bound is min(T, max(pass_rows, 128 kSpTiles)) rows of the wide stream, not the
+     * whole step's T: libr4d sizes the gather's peer scratch (8 slots + locpack, hipMalloc outside the VRAM budget) by the
+     * declared numel bound, 1,370 MiB a card at T = 8192. Every issue checks it (sp_agh_fits) and fails the step loudly
+     * past it. */
+    int64_t   sp_agh_rows = 0;
     /* fn4 SP-serial (RADIANCE_FN4_SPSERIAL at start): sp_rs / sp_ag / sp_agh, every trunk connection's codes op and its
      * K-pinned part reads (HyperConn::op_read_kt) for segments up to spser_rows rows; spser_noted: said once. */
     bool      spser_ok = false;
@@ -445,6 +452,7 @@ static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     t.dir = bt_dir();
     if (const char* e = std::getenv("RADIANCE_FN4_BITRACE_PMAX")) t.pmax = std::max<int64_t>(1, std::atoll(e));
     if (const char* e = std::getenv("RADIANCE_FN4_BITRACE_PLEN")) t.plen = std::max<int64_t>(1, std::atoll(e));
+    if (const char* e = std::getenv("RADIANCE_FN4_BITRACE_PMIN")) t.pmin = std::max<int64_t>(0, std::atoll(e));
     t.cap = 64 + 24 * (int64_t)m.layers.size();
     const int64_t MT = g.max_tok;
     t.plane = decl_b(b, m.nm.f("bi_trace_plane"), RAD_I32, {MT, 2 * t.cap}, RAD_BUF_PERSIST);
@@ -487,9 +495,9 @@ static int bt_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         }
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: qwen4exp: fn4 BI's tracer ON (RADIANCE_FN4_BITRACE=%s): %zu traced buffers, %lld points a "
-                        "step at most, rows at positions below %lld of sequences first seen at 0 with at most %lld query "
+                        "step at most, rows at positions %lld .. %lld of sequences first seen at 0 with at most %lld query "
                         "rows; passes not recorded\n",
-                t.dir.c_str(), t.tb.size(), (long long)t.cap, (long long)t.pmax, (long long)t.plen);
+                t.dir.c_str(), t.tb.size(), (long long)t.cap, (long long)t.pmin, (long long)t.pmax, (long long)t.plen);
     return RAD_OK;
 }
 /* This step's point `name` (layer l, -1 for none): its index, allocated on first use, or -1 when the plane is full. */
@@ -598,7 +606,7 @@ static void bt_flush(RadCtx* c, Model& m, const RadBatch* batch) {
     std::vector<int32_t> sel, selq;
     for (int64_t r = 0, sq = 0; r < T; ++r) {
         while (sq + 1 < S && cu[(size_t)sq + 1] <= r) ++sq;
-        if (fol[(size_t)sq] && pos[(size_t)r] >= 0 && pos[(size_t)r] < t.pmax) {
+        if (fol[(size_t)sq] && pos[(size_t)r] >= t.pmin && pos[(size_t)r] < t.pmax) {
             sel.push_back((int32_t)r);
             selq.push_back((int32_t)sq);
         }
@@ -1693,6 +1701,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     for (size_t l = 0; l + 1 < m.layers.size(); ++l) m.layers[l].mlp.xp_next = &m.layers[l + 1].mlp;
 
     /* fn4 SP-hc (test builds): declared only on request, at four ranks under the pipelined prefill. */
+    /* fn4 KVCAP C1: the wide stream's all-gather bounded by the rows one launch carries (Model::sp_agh_rows) */
+    const int64_t agh_rows = std::max<int64_t>(4, std::min<int64_t>(T, std::max<int64_t>(m.pass_rows,
+                                                                                          128LL * HyperConn::kSpTiles)));
     if (fn4_env_on("RADIANCE_FN4_SPHC") && g.world == 4 && m.pipe_on) {
         const int64_t HN = m.hccfg.hc * g.n_embd;
         m.sp_rs = rw(b, RAD_OP(b, "reduce_scatter_rows",
@@ -1708,11 +1719,12 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_NOWEIGHTS),
                      {m.a_x.x}, {m.a_x.x});
         m.sp_agh = rw(b, RAD_OP(b, "all_gather_rows",
-                          RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * HN, T * HN),
+                          RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * HN, agh_rows * HN),
                                      RAD_STR("dtype", g.dtype), RAD_INT("row", HN), RAD_INT("raw", 1),
                                      RAD_INT("overlap", 1)),
                           RAD_NOWEIGHTS),
                       {m.b_h}, {m.b_h});
+        m.sp_agh_rows = agh_rows;
         bool ok = m.sp_rs && m.sp_ag && m.sp_agh;
         const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : T;
         for (Layer& lay : m.layers) {
@@ -1720,7 +1732,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             /* the exact form: every connection has its K-split-pinned quarter read (HyperConn::op_read_sp) */
             ok = ok && lay.hc_mix.op_read_sp && lay.hc_ffn.op_read_sp;
         }
-        m.sp_on = ok;
+        m.sp_on = ok && m.sp_agh_rows >= std::min<int64_t>(T, m.pass_rows);   /* fn4 KVCAP C1: a piece fits the gather */
         if (g.rank == 0)
             fprintf(stderr, "radiance: qwen4exp: fn4 SP-hc %s (RADIANCE_FN4_SPHC; switch hc_sp picks it a pipelined "
                             "prefill step)\n", ok ? "declared" : "NOT served -- reduce_scatter_rows / all_gather_rows / "
@@ -1746,13 +1758,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                         RAD_INT("overlap", 1)),
                              RAD_NOWEIGHTS),
                          {m.a_x.x}, {m.a_x.x});
-        if (!m.sp_agh)
+        if (!m.sp_agh) {
             m.sp_agh = rw(b, RAD_OP(b, "all_gather_rows",
-                              RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * HN, T * HN),
+                              RAD_PARAMS(RAD_INT("world_size", g.world), RAD_RANGE("numel", 4 * HN, agh_rows * HN),
                                          RAD_STR("dtype", g.dtype), RAD_INT("row", HN), RAD_INT("raw", 1),
                                          RAD_INT("overlap", 1)),
                               RAD_NOWEIGHTS),
                           {m.b_h}, {m.b_h});
+            m.sp_agh_rows = agh_rows;
+        }
         bool ok = m.sp_rs && m.sp_ag && m.sp_agh && g.wire_exact;
         const int64_t band = m.hccfg.read_rows > 0 ? m.hccfg.read_rows : T;
         /* the longest segment every connection has a twin for */
@@ -1766,12 +1780,21 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
         }
         m.spser_rows = 128LL * tmax;
-        m.spser_ok = ok && tmax >= 2 && !m.layers.empty();
+        m.spser_ok = ok && tmax >= 2 && !m.layers.empty() &&
+                     m.sp_agh_rows >= std::min<int64_t>(T, m.spser_rows);   /* fn4 KVCAP C1: a run fits the gather */
         if (g.rank == 0 && !ctx->shape_probe)
             fprintf(stderr, "radiance: qwen4exp: fn4 SP-serial %s (RADIANCE_FN4_SPSERIAL; switch sp_serial picks it a serial "
                             "step: prefill segments up to %lld rows, K split pinned to the segment's row tiles)\n",
                     m.spser_ok ? "declared" : "NOT served -- a collective, the codes or the pinned reads did not resolve "
                                               "(or the wire is not exact)", (long long)m.spser_rows);
+    }
+    if (m.sp_agh && g.rank == 0 && !ctx->shape_probe) {
+        const int64_t HN = m.hccfg.hc * g.n_embd;
+        fprintf(stderr, "radiance: qwen4exp: fn4 KVCAP C1: the wide stream's all-gather (sp_agh) is declared for %lld rows "
+                        "(%lld elements; the step is %lld rows)%s\n", (long long)m.sp_agh_rows,
+                (long long)(m.sp_agh_rows * HN), (long long)T,
+                m.sp_agh_rows * HN == T * g.n_embd ? ": the same bound as the trunk's all-reduces, so libr4d serves it from "
+                                                     "their peer scratch instance" : "");
     }
 
     /* ---- the 97th connection: no write half, no fp8 copy. It produces the bf16 hidden state the
@@ -2136,6 +2159,20 @@ static std::atomic<int>& fn4_sp_flag() {
     return f;
 }
 constexpr int64_t kSpMinRows = 64;
+/* fn4 KVCAP C1: an sp_agh launch of `rows` rows fits the bound its peer scratch was declared for (Model::sp_agh_rows);
+ * past it the step fails with the reason, before the launch (the core would refuse the count as outside the op's bucket
+ * table, and the AR entry as larger than the instance's max_numel). */
+static bool sp_agh_fits(RadCtx* c, const Model& m, int64_t rows) {
+    if (rows <= m.sp_agh_rows) return true;
+    char why[384];
+    snprintf(why, sizeof why,
+             "qwen4exp: fn4 KVCAP C1: the wide stream's all-gather (sp_agh) was asked for %lld rows, past the %lld rows "
+             "its peer scratch is declared for (min(max_tok, max(pass rows %lld, SP-serial segment %lld))): a step shape "
+             "the bound does not cover",
+             (long long)rows, (long long)m.sp_agh_rows, (long long)m.pass_rows, 128LL * HyperConn::kSpTiles);
+    rad_step_fail(c, why);
+    return false;
+}
 
 static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
@@ -2183,6 +2220,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     auto ag_p  = [&](int64_t p) { RAD_ISSUE_N(c, m.sp_ag, rn(p) * g.n_embd, brow_slice(m.a_x.x, r0(p), rn(p), g.n_embd), RAD_NONE); };
     auto agh_p = [&](int64_t p) {
         const int64_t HN = m.hccfg.hc * g.n_embd;
+        if (!sp_agh_fits(c, m, rn(p))) return;   /* fn4 KVCAP C1 */
         RAD_ISSUE_N(c, m.sp_agh, rn(p) * HN, brow_slice(m.b_h, r0(p), rn(p), HN), RAD_NONE);
     };
     /* A collective on the second lane, ordered behind lane 0 where it reads what lane 0 just
@@ -2662,7 +2700,10 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     }
     /* the output mixer and the MTP head read every row of the wide stream */
     for (int k = 0; k < sp.nrun; ++k)
-        on1(true, [&] { RAD_ISSUE_N(c, m.sp_agh, sp.run[k].n * HN, brow_slice(m.b_h, sp.run[k].r0, sp.run[k].n, HN), RAD_NONE); });
+        on1(true, [&] {
+            if (!sp_agh_fits(c, m, sp.run[k].n)) return;   /* fn4 KVCAP C1 */
+            RAD_ISSUE_N(c, m.sp_agh, sp.run[k].n * HN, brow_slice(m.b_h, sp.run[k].r0, sp.run[k].n, HN), RAD_NONE);
+        });
     wait1();
 }
 
@@ -2886,6 +2927,11 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
     if (name && std::strcmp(name, "arw_rows") == 0) {   /* fn4 ARW: the fused exact write's row cap (0 = none) */
         if (value < 0 || value > 4096) return -1;
         rad::arch::fn4_arw_rows().store(value, std::memory_order_relaxed);
+        return 1;
+    }
+    if (name && std::strcmp(name, "kvs_bi") == 0) {   /* fn4 kvs_bi: KV streaming exact under load (bit 1 here, bit 2 the core's) */
+        if (value < 0 || value > 3) return -1;
+        rad::arch::fn4_kvsbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }
     if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */

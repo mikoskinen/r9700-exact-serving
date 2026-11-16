@@ -789,6 +789,67 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
     rad::fn4::apply_pending(1, &da);
 }
 
+/* fn4 resume_cold (15.11.2026, qwen/EXACT-PRESSURE.md): a hit resumes only where the prompt's idle cold prefill starts a
+ * chunk, and a head other prompts share takes no snapshot cut -- so every piece after the resume is one the cold run
+ * prefills. Off (today): the hit resumes at the snapshot (640, inside the cold run's [256, 768) span) and the pieces
+ * from there are other ones. */
+TEST(fn4_resume_cold_resumes_on_the_cold_plan_and_cuts_no_shared_head) {
+    std::string err;
+    int da = -1;
+    auto pieces = [&](int rc, int lin, int branch, int64_t* resumed, int64_t* ck_at) {
+        CHECK(rad::fn4::request("resume_cold", rc, &err));
+        rad::fn4::apply_pending(0, &da);
+        CHECK_EQ(rad::fn4::resume_cold(), rc);
+        Fixture f;
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        CHECK_OK(f.start());
+        if (lin > 0) {
+            f.pc.seed(lin + 64);          /* attention cached a little past the snapshot */
+            f.pc.lin = lin;
+            f.pc.src = 3;
+            f.pc.branch_at = branch;
+        }
+        const uint64_t a = f.submit(1500, 2);
+        std::vector<std::pair<int64_t, int32_t>> pc;
+        *resumed = -1;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) {
+                    if (*resumed < 0) { *resumed = e.ctx_len; *ck_at = f.sch.find(a)->checkpoint_at; }
+                    pc.push_back({ (int64_t)e.ctx_len, e.n_tokens });
+                }
+            f.commit_plain();
+        }
+        return pc;
+    };
+    int64_t r0 = -1, c0 = -1, r1 = -1, c1 = -1, r2 = -1, c2 = -1, r3 = -1, c3 = -1;
+    const auto cold = pieces(0, 0, 0, &r0, &c0);                     /* the cold run's pieces */
+    CHECK_EQ(r0, (int64_t)0);
+    CHECK(cold.size() >= 3);
+    const auto off = pieces(0, 640, 0, &r1, &c1);                    /* today: resumes at 640 */
+    CHECK_EQ(r1, (int64_t)640);
+    bool off_on_cold = true;
+    for (const auto& p : off) off_on_cold = off_on_cold && std::find(cold.begin(), cold.end(), p) != cold.end();
+    CHECK(!off_on_cold);                                               /* some piece is not the cold run's */
+    const auto on = pieces(1, 640, 0, &r2, &c2);                     /* resume_cold: steps back to 256 */
+    CHECK_EQ(r2, (int64_t)256);
+    for (const auto& p : on) CHECK(std::find(cold.begin(), cold.end(), p) != cold.end());
+    CHECK_EQ(on.back().first + on.back().second, (int64_t)1500);
+    /* a shared head at 1100 past a resume at 768 (a cold start): today a cut there; resume_cold none */
+    const auto hd0 = pieces(0, 768, 1100, &r3, &c3);
+    CHECK_EQ(r3, (int64_t)768);
+    CHECK_EQ(c3, (int64_t)1100);
+    int64_t r4 = -1, c4 = -1;
+    const auto hd1 = pieces(1, 768, 1100, &r4, &c4);
+    CHECK_EQ(r4, (int64_t)768);
+    CHECK_EQ(c4, (int64_t)0);
+    for (const auto& p : hd1) CHECK(std::find(cold.begin(), cold.end(), p) != cold.end());
+    (void)hd0;
+    CHECK(rad::fn4::request("resume_cold", 0, &err));
+    rad::fn4::apply_pending(1, &da);
+}
+
 /* With a shortest spanning prefill set (set_span_min), a shorter prompt alone in the engine takes
  * one interval a step, and a longer one spans through to its last intervals. */
 TEST(a_span_min_keeps_a_short_prompt_at_one_interval) {
@@ -1799,6 +1860,62 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
 
     CHECK_EQ(f.sch.metrics().preemptions, 1);
     CHECK_EQ(f.sch.metrics().preempted_waiting, 1);
+}
+
+/* fn4 preempt_keep (15.11.2026, qwen/EXACT-PRESSURE.md): the same squeeze as above, with the switch on. The victim (A)
+ * is preempted while decoding: it keeps its position, its state slot and its card, gives its whole blocks to the cache
+ * (published), and once the pool holds its next step it rejoins from the cache's hit and decodes on from the same
+ * position -- no prefill entry for it after the preemption, nothing replayed. */
+TEST(fn4_preempt_keep_rejoins_a_decoder_at_its_own_position) {
+    std::string err;
+    int da = -1;
+    CHECK(rad::fn4::request("preempt_keep", 1, &err));
+    rad::fn4::apply_pending(0, &da);
+    CHECK_EQ(rad::fn4::preempt_keep(), 1);
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(160, 24, /*priority=*/0);
+    const uint64_t b = f.submit(160, 8, /*priority=*/5);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    const int32_t slot_a = f.sch.find(a)->state_slot;
+    const RadBatch* s2 = f.sch.step();
+    CHECK(s2 != nullptr);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+    CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)160);      /* kept, not reset to zero */
+    CHECK(f.kv.kept.count(a) == 1);
+    CHECK_EQ(f.kv.kept[a], (int64_t)160);
+    CHECK(f.pc.published.size() >= 1);                      /* its prefix went to the cache first */
+    f.commit_plain();
+    /* b decodes to its end; the cache then holds a's 160 tokens (FakePC: the seeded blocks are the hit) */
+    bool rejoined = false, a_prefill = false, a_decode_at_160 = false;
+    for (int k = 0; k < 60; ++k) {
+        /* the step a rejoins in plans nothing for it (it decodes from the next one): an empty step, as an idle engine
+         * takes it and steps again */
+        if (f.sch.step()) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a) {
+                    if (e.is_prefill) a_prefill = true;
+                    if (!rejoined && !e.is_prefill && e.ctx_len == 160) a_decode_at_160 = true;
+                    rejoined = true;
+                }
+            f.commit_plain();
+        }
+        if (!f.sch.find(a)) break;
+        /* once b is done, the cache holds a's 160 tokens again (FakePC: the seeded blocks are the hit) */
+        const Request* rb = f.sch.find(b);
+        if ((!rb || rb->state != ReqState::Running) && !rejoined && f.pc.attn == 0) f.pc.seed(160);
+    }
+    CHECK(rejoined);
+    CHECK(a_decode_at_160);                                  /* it decodes on from where it was */
+    CHECK(!a_prefill);                                       /* nothing replayed */
+    CHECK(f.kv.kept.count(a) == 0);
+    CHECK_EQ(f.sch.preempt_keep_counts()[0], (int64_t)1);
+    CHECK_EQ(f.sch.preempt_keep_counts()[1], (int64_t)1);
+    (void)slot_a;
+    CHECK(rad::fn4::request("preempt_keep", 0, &err));
+    rad::fn4::apply_pending(1, &da);
 }
 
 /* ================================================================== the step batch */
