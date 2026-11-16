@@ -2631,12 +2631,16 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
     /* One connection between two blocks: reduce-scatter the block's partials, this rank's rows written (+ `after`, e.g. the
      * control vector) and read by the next connection `nx` (none after the last layer), the block input gathered and coded.
      * Two runs: run 1's reduce-scatter beside run 0's write + read, run 0's gather beside run 1's. */
-    auto conn = [&](const HyperConn& wr, const HyperConn* nx, auto&& after) {
+    /* tnm / tli: the BI tracer's point for the write's output on this rank's rows (step_serial's "h_mix" / "h_ffn"; only
+     * under RADIANCE_FN4_BITRACE_SP, qwen/KV-STREAM-EXACT.md 5d) and, after the gather, the block input on every row */
+    auto conn = [&](const HyperConn& wr, const HyperConn* nx, auto&& after, const char* tnm = nullptr, int tli = -1) {
         if (sp.nrun == 1) {
             const SpSer::Run& r = sp.run[0];
             rs(r);
+            if (tnm) bt_pt(c, m, m.a_x.x, r.lo, r.hi - r.lo, tli >= 0 && tnm[2] == 'm' ? "blk" : "moe", tli);
             bool ss = wr.write(c, T, r.lo, r.hi - r.lo);
             if (after(r)) ss = false;
+            if (tnm) bt_pt(c, m, m.b_h, r.lo, r.hi - r.lo, tnm, tli);
             if (nx) { rd(*nx, r, ss); ag(r); codes(*nx, 0, T); }
             return;
         }
@@ -2678,6 +2682,7 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             else        l.gdn.step(c, batch, !l2);
             if (l2) ar_all();
             const bool ss_mix = l.hc_mix.write(c, T, 0, T);
+            bt_pt(c, m, m.b_h, 0, T, "h_mix", (int)li);
             bi_read_pieces(c, m, l.hc_ffn, T, ss_mix);
             if (!l2) l.mlp.step(c, batch);
             else {
@@ -2688,18 +2693,19 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             }
             bool ss = l.hc_ffn.write(c, T, 0, T);
             if (l.proj.step(c, batch, 0, T)) ss = false;
+            bt_pt(c, m, m.b_h, 0, T, "h_ffn", (int)li);
             if (li + 1 == m.ple_layer) { m.ple.step(c, batch); ss = false; }
             bi_read_pieces(c, m, m.layers[(size_t)li + 1].hc_mix, T, ss);
             continue;
         }
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false); }
         else        l.gdn.step(c, batch, false);
-        conn(l.hc_mix, &l.hc_ffn, none);
+        conn(l.hc_mix, &l.hc_ffn, none, m.bt.on ? "h_mix" : nullptr, (int)li);
         for (int64_t r0 = 0; r0 < T; r0 += l.mlp.c.rows)
             l.mlp.pass(c, T, r0, std::min<int64_t>(l.mlp.c.rows, T - r0), false);
         l.mlp.route_report(c);
         conn(l.hc_ffn, li + 1 < nl ? &m.layers[(size_t)li + 1].hc_mix : nullptr,
-             [&](const SpSer::Run& r) { return l.proj.step(c, batch, r.r0, r.n); });
+             [&](const SpSer::Run& r) { return l.proj.step(c, batch, r.r0, r.n); }, m.bt.on ? "h_ffn" : nullptr, (int)li);
     }
     /* the output mixer and the MTP head read every row of the wide stream */
     for (int k = 0; k < sp.nrun; ++k)
@@ -2708,6 +2714,7 @@ static void step_serial_sp(RadCtx* c, const RadBatch* batch, Model& m, const int
             RAD_ISSUE_N(c, m.sp_agh, sp.run[k].n * HN, brow_slice(m.b_h, sp.run[k].r0, sp.run[k].n, HN), RAD_NONE);
         });
     wait1();
+    bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* the gathered wide stream (BI tracer under RADIANCE_FN4_BITRACE_SP) */
 }
 
 static void step(RadCtx* c, const RadBatch* batch) {
@@ -2758,6 +2765,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     else if (spser_plan(m, batch, sp)) step_serial_sp(c, batch, m, pcu, sp);   /* fn4 SP-serial */
     else                               step_serial(c, batch, m, pcu);
 
+    if (!pipelined(m, T) && !sp.nrun) bt_pt(c, m, m.b_h, 0, T, "h_end", -1);   /* step_serial's wide stream (step_serial_sp: its own) */
     bi_read_pieces(c, m, m.mixer, T);
     bt_pt(c, m, m.a_x.x, 0, T, "final", -1);
 
