@@ -98,20 +98,9 @@ bus 03, c3, 84 and 48 on ranks 0 to 3.
 
 ### Qwen for Claude Code
 
-These commands size the Qwen server for a number of concurrent Claude Code requests and a context
-length. They read `run/qwen/claude-code.env`, which is `run/qwen/qwen.env` without its
-`RADIANCE_FN4_AR_SDMA` line, and their result runs set the same rank order as above.
-`RADIANCE_FN4_RESUME_COLD=1` resumes a cached prefix only where a cold prefill of the prompt starts a
-chunk, and `RADIANCE_FN4_PREEMPT_KEEP=1` keeps a decoding request's state when it gives up KV. With
-both, a prefix hit or a preemption leaves the answer unchanged.
-
-At 24 and 32 concurrent requests the server streams the KV cache with `--kv-resident`. The cache lives
-in pinned host memory, 39.0 GiB a card at 6,291,456 tokens and 43.9 GiB a card at 7,077,888 tokens,
-and a ring of the blocks each decode step selects stays on the card. `RADIANCE_FN4_KVS_CTX` sets how
-many tokens of context the server keeps for all requests together, and one request can still use the
-whole `--max-model-len`. `RADIANCE_FN4_KVS_BI=3` gives a streamed request the same answer alone and
-beside other requests, `RADIANCE_FN4_KVS_APART=1` keeps the prefill stage apart from the ring, and
-`RADIANCE_FN4_KVS_VIC=1` picks the ring slots to replace in parallel.
+Pick the command by how many Claude Code requests run at once and how much context they need. At 24
+to 32 concurrent requests the KV cache is kept in host memory (`--kv-resident`), which takes about
+40 GiB of RAM a card.
 
 **16 concurrent requests, 262,144-token context** (KV cache of 1,746,316 tokens a card):
 
@@ -183,15 +172,8 @@ docker run -d --name qwen --init --network host \
 run/switches.sh run/qwen/switches.json
 ```
 
-`--rope-scaling yarn:2` extends the rotary positions to 524,288 with static YaRN, so a 524,288-token
-server answers a prompt differently from a 262,144-token server. Each of them gives the same answer
-alone and beside other requests.
-
-The table comes from a Claude Code simulation of the streaming commands, in which every session
-starts at the same time and runs 15 turns at temperature 0, with contexts of up to 170,000 tokens on
-the 262,144-token servers and up to 340,000 tokens on the 524,288-token servers. A follow-up is every
-turn after a session's first, and the time to first token and the decode speed of a request's stream
-are taken over the follow-ups.
+Measured with a Claude Code simulation: every session starts at once and runs 15 turns at
+temperature 0. The times are for the turns after a session's first.
 
 | Command | KV tokens a card | Sessions | Requests done | Preemptions | Follow-up TTFT p50 / p90 | Decode a stream |
 |---|---|---|---|---|---|---|
@@ -200,10 +182,8 @@ are taken over the follow-ups.
 | 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 24 | 345 of 360 | 0 | 3.07 / 6.86 s | 55.7 tok/s |
 | 24 to 32 requests, 524,288 tokens | 7,077,888, streamed | 32 | 322 of 480 | 0 | 3.99 / 26.75 s | 29.9 tok/s |
 
-The simulation sends no new turn after 3,000 s, which ends both 524,288-token runs before every
-session has sent its 15 turns, and no request fails in any run. The 32-session run at 262,144 tokens
-used `--max-model-len 196608 --max-num-batched-tokens 4096 --prefill-span 2` and no
-`RADIANCE_FN4_KVS_CTX`, a setting that also streams 6,291,456 tokens.
+The simulation stops sending new turns after 3,000 s, which ends the 524,288-token runs early. No
+request fails in any run.
 
 ### DeepSeek
 
