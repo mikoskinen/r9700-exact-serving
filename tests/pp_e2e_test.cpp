@@ -1461,4 +1461,66 @@ TEST(follower_segments_serve_and_record_what_one_process_does) {
     }
 }
 
+/* ------------------------------------------------------------------ tp8 dev M5b */
+/* RADIANCE_PP_LEND_MIXED=2: a newcomer planned whole beside running decoders is cut at the 512-grid point nearest its middle and
+ * its rest lent to the other lane; every request's tokens are one process's (the host backend's kernels are chunking-invariant
+ * on this model, so this checks the split's plumbing: the shrunk home entry, the lent token piece, the commit) at 2 / 3 lanes. */
+std::vector<std::vector<int32_t>> split_set(int port) {
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (uint64_t s : { 41, 42, 43, 44 })
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 12), 200); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    for (uint64_t s : { 51, 52, 53 }) {
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 680 + 40 * (s - 51)), 12); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    std::vector<std::vector<int32_t>> out;
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+
+TEST(lend_split_newcomers_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    for (const int lanes : { 2, 3 }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_LEND_MIXED=2");
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(lanes));
+        Serving pp;
+        REQUIRE(pp.start("0,2", ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long split = -1;
+        if (const size_t at = llog.rfind(" newcomers split on the 512 grid beside decode rows"); at != std::string::npos) {
+            const size_t b = llog.rfind("; ", at);
+            split = std::atoll(llog.c_str() + b + 2);
+        }
+        fprintf(stderr, "    lend split, %d lanes W(0,2): %d of %zu requests differ; newcomers split %lld, pieces lent %lld\n", lanes,
+                differ, ref.size(), split, log_count(llog, "newcomer split: "));
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+        CHECK(llog.find("(RADIANCE_PP_LEND_MIXED=2, tp8 dev M5b)") != std::string::npos);
+        CHECK(split > 0);
+    }
+}
+
 RAD_TEST_MAIN()
