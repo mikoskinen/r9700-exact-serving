@@ -31,6 +31,7 @@
 #include "ds41_engram_dedup.h"
 #include "ds41_index_split.h"
 #include "ds41_layers.h"
+#include "rad_pp.h"        /* tp8 S4: the two-node pipeline (rad_pp_info, the stage crossings) */
 #include "ds41_psk_cone.h"
 #include "ds41_etp.h"
 #include "ds41_walk_geom.h"
@@ -39,6 +40,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdarg>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -663,6 +665,18 @@ struct Model {
      * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
     ds41layers::Spec lr{};
     std::vector<ds41layers::Dep> lr_deps;
+    /* tp8 S4: a node of a two-node pipeline (rad_pp_info): `lr` is then the node's strict part of W(pp_h, pp_t) (the
+     * leader layers [0, h) and [t, n) with the embedding, the head and the drafter; the follower [h, t)), and the step
+     * runs it with the crossings: X1 = the embedding's output (xcol) into the follower's prologue, X2 = the inputs of the
+     * boundary op at layer t (ds41_cut_liveset: act.x, h1, post, comb, pre_f) back to the leader, which issues that op
+     * as one process does. Off (pp false) on one machine. */
+    bool pp = false;
+    int  pp_rank = 0, pp_h = 0, pp_t = 0;
+    rad_op pp_x1 = 0, pp_x2 = 0;          /* this node's stage op of each crossing */
+    rad_op pp_post = 0;                   /* the leader: layer t-1's mhc_post where no fused pcn_a resolves */
+    RadPpRing* pp_ring[RAD_PP_N_RINGS] = {};
+    Dsp  pp_dsp{};                        /* the follower: the drafter it does not declare (its KV group is zeroed) */
+    std::vector<int64_t> pp_zero_r;       /* the ratios whose index / latent groups this node zeroed (pp_copy_layer) */
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -670,6 +684,16 @@ static thread_local Model* naming = nullptr;
 
 /* ------------------------------------------------------------------ tp8 S3: the node's layer ranges (ds41_layers.h) */
 /* The layer the step runs after `l`: l + 1, or (layer ranges) the next layer this node holds; null after the last. */
+/* A formatted std::string (the node lines). */
+static std::string fmt_s(const char* f, ...) __attribute__((format(printf, 1, 2)));
+static std::string fmt_s(const char* f, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, f);
+    std::vsnprintf(buf, sizeof buf, f, ap);
+    va_end(ap);
+    return buf;
+}
 static const Layer* next_layer(const Model& m, int l) {
     if (!m.lr.on) return l + 1 < m.c.n_layer ? &m.layers[(size_t)l + 1] : nullptr;
     const int n = m.lr.next[(size_t)l];
@@ -4039,7 +4063,36 @@ static void p1_declare(Model& m, const RadBuildCtx* ctx);                   /* l
  * every layer (the AR_PCN collectives pair a layer with the one before it; --calib-layers is the calibration's own range). */
 static int lr_read(Model& m, const RadBuildCtx* ctx) {
     std::string err;
-    if (ds41layers::parse(std::getenv("RADIANCE_DS41_LAYERS"), std::getenv("RADIANCE_DS41_LAYERS_MODE"), (int)m.c.n_layer,
+    /* tp8 S4: a pipeline node's ranges come from its cut (--pp-cut), strict. */
+    const RadPpInfo pp = rad_pp_query();
+    if (pp.nodes == 2) {
+        const int n = (int)m.c.n_layer;
+        if (std::getenv("RADIANCE_DS41_LAYERS") && *std::getenv("RADIANCE_DS41_LAYERS")) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LAYERS and --pp-nodes 2 both name the layers; unset the former\n");
+            return RAD_E_INVAL;
+        }
+        /* The leader holds the head, so it must hold the last layer (the S3 leader rule). */
+        if (pp.cut_h < 0 || pp.cut_t <= pp.cut_h || pp.cut_t >= n) {
+            fprintf(stderr, "radiance: deepseek41: --pp-cut %d,%d: the follower's layers must lie inside [0, %d) and leave "
+                            "the leader the last one\n", pp.cut_h, pp.cut_t, n);
+            return RAD_E_INVAL;
+        }
+        std::string spec;
+        if (pp.rank == 1) spec = std::to_string(pp.cut_h) + ":" + std::to_string(pp.cut_t);
+        else {
+            if (pp.cut_h > 0) spec = "0:" + std::to_string(pp.cut_h) + ",";
+            spec += std::to_string(pp.cut_t) + ":" + std::to_string(n);
+        }
+        if (ds41layers::parse(spec.c_str(), "strict", n, &m.lr, &err) < 0) {
+            fprintf(stderr, "radiance: deepseek41: --pp-cut %d,%d: %s\n", pp.cut_h, pp.cut_t, err.c_str());
+            return RAD_E_INVAL;
+        }
+        m.pp = true;
+        m.pp_rank = pp.rank;
+        m.pp_h = pp.cut_h;
+        m.pp_t = pp.cut_t;
+        if (m.lr.leader != (pp.rank == 0)) return RAD_E_STATE;
+    } else if (ds41layers::parse(std::getenv("RADIANCE_DS41_LAYERS"), std::getenv("RADIANCE_DS41_LAYERS_MODE"), (int)m.c.n_layer,
                           &m.lr, &err) < 0) {
         fprintf(stderr, "radiance: deepseek41: %s\n", err.c_str());
         return RAD_E_INVAL;
@@ -4052,6 +4105,7 @@ static int lr_read(Model& m, const RadBuildCtx* ctx) {
     }
     const char* why = ds41_ar_pcn_mode() != 0                  ? "RADIANCE_DS41_AR_PCN's collectives pair a layer with the one before it"
                       : (ctx->calib_dir && ctx->calib_dir[0]) ? "calibration records its own layers (--calib-layers)"
+                      : (m.pp && m.media)                     ? "pictures (the encoder's rows are not shipped to the follower)"
                                                               : nullptr;
     if (why) {
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LAYERS=%s is not built with this: %s\n", m.lr.text.c_str(), why);
@@ -4070,9 +4124,18 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (m.dsp.on && !want) {
         rad_note(b, "DSpark drafter NOT declared on this node (RADIANCE_DS41_LAYERS=%s): %s", m.lr.text.c_str(),
                  m.lr.strict ? "the leader's (the node that holds the last layer)" : "its taps are another node's layers");
+        if (m.pp) m.pp_dsp = m.dsp;   /* tp8 S4: its KV group is declared and zeroed here (pp_dspark_zero) */
         m.dsp = Dsp{};
     }
     m.lr_deps = ds41layers::needs(lr_geo(m), m.lr, m.dsp.on || (m.lr.strict && m.lr.leader && !m.dsp.taps.empty()));
+    /* tp8 S4: the pipeline carries the residual stream only; a cut whose layers read another node's KV, selections or
+     * keep words (W(h > 0, t)) needs the copies S6 builds. */
+    if (m.pp && !m.lr_deps.empty()) {
+        fprintf(stderr, "radiance: deepseek41: --pp-cut %d,%d: %s -- the crossings of this build carry the residual stream "
+                        "only (tp8 S6 carries KV copies, selections and keep words); W(0,t) is a clean cut\n",
+                m.pp_h, m.pp_t, ds41layers::describe(m.lr_deps).c_str());
+        return RAD_E_UNSUPPORTED;
+    }
     if (!m.lr.strict && !m.lr_deps.empty()) {
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LAYERS=%s (proxy, this node alone): %s -- another node computes "
                         "these (tp8 S6: the KV copies, selections and keep words across the nodes). A proxy runs only a node "
@@ -4088,9 +4151,11 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
 /* A strict node's copy of a foreign kv source's caches at that source's layer `l`: the group (shared with the node's own
  * sources of that ratio), the entry store that fixes its block size (declared, never issued here: S6's import fills it),
  * the layer's binding. Nothing for any other layer the node does not hold. */
+static int pp_copy_layer(RadBuilder* b, Model& m, Layer& L, int l);
 static int lr_copy_layer(RadBuilder* b, Model& m, Layer& L, int l) {
     L.l = l;
     if (!m.lr.on || !m.lr.strict) return RAD_OK;
+    if (m.pp) return pp_copy_layer(b, m, L, l);
     const auto& c = m.c;
     for (const ds41layers::Copy& cp : ds41layers::copies(m.lr_deps)) {
         if (cp.layer != l) continue;
@@ -4112,6 +4177,115 @@ static int lr_copy_layer(RadBuilder* b, Model& m, Layer& L, int l) {
         }
     }
     return RAD_OK;
+}
+
+/* tp8 S4: a pipeline node declares every KV group of the published declare, in its order, so the leader's block tables
+ * (its scheduler's, the only one) serve both nodes and the step batch is laid out alike (the rendezvous compares the
+ * layout's hash). At a layer this node does not hold: the groups the published declare makes there, in its order (the
+ * Engram tokens, the window, the source's tail, index and latent), each paged one with the store that fixes its block size
+ * (declared, never issued), bound at that layer and zeroed: no pool is carved for it here. The per-sequence groups (the
+ * Engram tokens, a tail) cannot be zeroed and are bound there, a few KiB a sequence. */
+static int pp_copy_layer(RadBuilder* b, Model& m, Layer& L, int l) {
+    const auto& c = m.c;
+    const int64_t T = m.g.max_tok, hd = c.head_dim;
+    if (std::find(c.ple.begin(), c.ple.end(), (int64_t)l) != c.ple.end() && !m.tok) {
+        RadKVGroupDecl d{};
+        d.kind = RAD_KV_CONV;
+        d.dtype = RAD_I32;
+        d.conv_width = c.ngram;
+        d.n_head_kv = 1;
+        d.head_dim = 1;
+        if (!(m.tok = rad_decl_kv_group(b, m.nm.f("kv_engram_tokens"), &d))) return RAD_E_INVAL;
+        DS_TRY(rad_bind_layer_kv(b, l, m.tok));
+    }
+    if (!m.win) {
+        if (!(m.win = win_group(b, m))) return RAD_E_INVAL;
+        L.kv_st = window_key_store(b, T, hd, m.w8, m.kvn);   /* fixes the block size; never issued here */
+        if ((m.win_bs = rad_kv_block_size(b, m.win)) < 1) return RAD_E_INVAL;
+        /* The window group is this node's too: its own layers bind it below; no layer of another node is bound. */
+    }
+    if (!c.is_src(l)) return RAD_OK;
+    const int64_t r = c.ratio[(size_t)l], rows = r > 1 ? m.work : T;
+    if (r <= 0) return RAD_E_INVAL;
+    L.r = r;
+    if (r > 1 && !m.tail.count(r)) {
+        if (!(m.tail[r] = tail_group(b, m, r))) return RAD_E_INVAL;
+        DS_TRY(rad_bind_layer_kv(b, l, m.tail[r]));
+    }
+    const bool new_index = !m.index.count(r), new_comp = !m.comp.count(r);
+    if (new_index && !(m.index[r] = full_group(b, m, "kv_index_r%lld", index_slots(m), r))) return RAD_E_INVAL;
+    if (new_index) {
+        L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ikmx ? "mxfp4" : nullptr);
+        if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
+        DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
+    }
+    if (new_comp && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", latent_slots(m, hd), r))) return RAD_E_INVAL;
+    if (new_comp) {
+        L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lnv ? "nvfp4" : nullptr);
+        if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
+        DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
+    }
+    /* Zero what no held layer reads (W(0,t) is a clean cut: the other ratio's groups). */
+    bool used = false;
+    for (int k = 0; k < (int)c.n_layer; ++k)
+        if (m.lr.held(k) && c.ratio[(size_t)k] == r) used = true;
+    if (!used) {
+        if (new_index) DS_TRY(rad_kv_group_zero(b, m.index[r]));
+        if (new_comp) DS_TRY(rad_kv_group_zero(b, m.comp[r]));
+        m.pp_zero_r.push_back(r);
+    }
+    return RAD_OK;
+}
+
+/* tp8 S4: the follower's copy of the drafter's KV group (the leader's drafter declares it last; same geometry, same
+ * stage layers), zeroed. */
+static int pp_dspark_zero(RadBuilder* b, Model& m) {
+    if (!m.pp || m.pp_rank != 1 || !m.pp_dsp.on) return RAD_OK;
+    const auto& c = m.c;
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_WINDOW;
+    kd.dtype = RAD_BF16;
+    kd.window = c.window + m.pp_dsp.block + m.g.max_spec;
+    kd.n_head_kv = 1;
+    kd.head_dim = window_slots(c.head_dim, m.w8d) / 2;
+    const rad_kvgroup kv = rad_decl_kv_group(b, m.nm.f("kv_dspark"), &kd);
+    if (!kv) return RAD_E_INVAL;
+    if (!window_key_store(b, m.g.max_tok, c.head_dim, m.w8d, m.kvn)) return RAD_E_INVAL;   /* the block size; never issued */
+    if (rad_kv_block_size(b, kv) < 1) return RAD_E_INVAL;
+    for (int s = 0; s < m.pp_dsp.n_stage; ++s) DS_TRY(rad_bind_layer_kv(b, m.pp_dsp.base + s, kv));
+    return rad_kv_group_zero(b, kv);
+}
+
+/* tp8 S4 (the plan's ds41_cut_liveset): the buffers a crossing carries. X1: the embedding's output (xcol, after its
+ * all-reduce), which the follower's prologue expands into the streams as one process does. X2: what the op at the
+ * leader's layer t reads that the follower's layers wrote -- the inputs of the boundary op, mhc_post_collapse_rmsnorm
+ * (layer t-1's post + layer t's collapse + norm: act.x, h1, post, comb, pre_f), which also covers the unfused form
+ * (mhc_post over act.x, h1, post, comb, then the collapse over h0 and pre_f). Every part [rows, width], dense. */
+struct CutPart { rad_buf b; const char* name; int64_t row_bytes; };
+static std::vector<CutPart> ds41_cut_liveset(const Model& m, int ring) {
+    const auto& c = m.c;
+    const int64_t D = c.n_embd, H = c.hc;
+    if (ring == RAD_PP_X1) return { { m.xcol, "xcol", D * 2 } };
+    return { { m.act.x, "act.x", D * 2 }, { m.h1, "h1", H * D * 2 }, { m.post, "post", H * 4 },
+             { m.comb, "comb", H * H * 4 }, { m.pre_f, "pre_f", H * 4 } };
+}
+static int64_t cut_row_bytes(const std::vector<CutPart>& v) {
+    int64_t n = 0;
+    for (const CutPart& p : v) n += p.row_bytes;
+    return n;
+}
+/* The stage op of crossing `ring` on this node, its liveness against the parts. */
+static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring) {
+    const bool sends = (ring == RAD_PP_X1) == (m.pp_rank == 0);
+    const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
+    rad_op h = op(b, sends ? "stage_send" : "stage_recv",
+                  { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()) }, {}, {}, {});
+    if (!h) return h;
+    std::vector<rad_buf> bufs;
+    for (const CutPart& p : v) bufs.push_back(p.b);
+    if (sends) rad_op_reads(b, h, bufs.data(), (int)bufs.size());
+    else       rad_op_writes(b, h, bufs.data(), (int)bufs.size());
+    return h;
 }
 
 /* The node's line (rank 0's real declare, and a note in the graph): its layers, roles, expert units a rank (what the S3
@@ -4149,6 +4323,21 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
                   m.lr_deps.empty() ? "" : ds41layers::describe(m.lr_deps).c_str());
     rad_note(b, "%s", line);
     if (ctx->rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: deepseek41: %s\n", line);
+    if (m.pp) {
+        std::string x1, x2;
+        for (const CutPart& p : ds41_cut_liveset(m, RAD_PP_X1)) x1 += fmt_s("%s%s %lld B", x1.empty() ? "" : ", ", p.name, (long long)p.row_bytes);
+        for (const CutPart& p : ds41_cut_liveset(m, RAD_PP_X2)) x2 += fmt_s("%s%s %lld B", x2.empty() ? "" : ", ", p.name, (long long)p.row_bytes);
+        std::snprintf(line, sizeof line,
+                      "two-node pipeline (tp8 S4): the %s of W(%d,%d); X1 = %s (%lld B a row), X2 = %s (%lld B a row, the "
+                      "inputs of layer %d's mhc_post_collapse_rmsnorm); every KV group of the published declare in its "
+                      "order, the ones no held layer reads zeroed%s",
+                      m.pp_rank == 0 ? "leader" : "follower", m.pp_h, m.pp_t, x1.c_str(),
+                      (long long)cut_row_bytes(ds41_cut_liveset(m, RAD_PP_X1)), x2.c_str(),
+                      (long long)cut_row_bytes(ds41_cut_liveset(m, RAD_PP_X2)), m.pp_t,
+                      m.pp_rank == 1 && m.pp_dsp.on ? "; the leader's drafter KV group zeroed here" : "");
+        rad_note(b, "%s", line);
+        if (ctx->rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: deepseek41: %s\n", line);
+    }
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
@@ -4303,6 +4492,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                               RAD_STR("dtype", "bf16"), RAD_INT("exact", 1) },
                             {}, { m.xcol }, { m.xcol });
     }
+    /* tp8 S4: X1, the embedding's output: the leader sends it after its all-reduce, the follower's prologue starts from
+     * it where one process's starts from the lookup. Both nodes name both crossings' rows (rad_pp_crossing). */
+    if (m.pp) {
+        if (!(m.pp_x1 = pp_stage_op(b, m, RAD_PP_X1))) return RAD_E_INVAL;
+        for (int ring : { (int)RAD_PP_X1, (int)RAD_PP_X2 }) {
+            const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
+            rad_pp_declare_crossing(ring, cut_row_bytes(v), (int)v.size());
+        }
+    }
     m.expand = op(b, "cast",
                   { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("from", "bf16"),
                     RAD_STR("to", "bf16") },
@@ -4407,8 +4605,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* tp8 S3: only the layers this node holds (every layer when RADIANCE_DS41_LAYERS is unset); strict, a copy of a
      * foreign kv source's caches at its layer (lr_copy_layer) */
     for (int l = 0; l < c.n_layer; ++l) {
+        /* tp8 S4: the leader takes X2 in before layer t (and, where no fused pcn_a resolves, issues layer t-1's mhc_post
+         * itself); the follower sends it after layer t-1. */
+        if (m.pp && m.pp_rank == 0 && l == m.pp_t) {
+            if (!(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
+            m.pp_post = op(b, "mhc_post", { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
+                           {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
+            if (!m.pp_post) return RAD_E_INVAL;
+        }
         if (m.lr.held(l)) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
         else DS_TRY(lr_copy_layer(b, m, m.layers[(size_t)l], l));
+        if (m.pp && m.pp_rank == 1 && l == m.pp_t - 1 && !(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
     }
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
      * proxy's shell); none on a strict follower, whose last layer's output is the boundary */
@@ -4456,6 +4663,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The drafter after everything the trunk step issues (llama_fp8's rule: declaration order is
      * liveness, and its passes run behind the step). */
     if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
+    DS_TRY(pp_dspark_zero(b, m));   /* tp8 S4: the follower's zeroed copy of the leader's drafter KV group */
     /* The vision tower last, its weight groups past the drafter's stages; an encoder pass issues it alone. */
     if (m.media) {
         DS_TRY(m.vit.declare(b, meta, ctx, nm, D, (int)c.n_layer + std::max(m.n_stage, 0)));
@@ -4946,6 +5154,8 @@ static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     std::string names;
     for (const auto* groups : { &m.index, &m.comp })
         for (const auto& kv : *groups) {
+            /* tp8 S4: a group this pipeline node zeroed holds nothing here to replicate */
+            if (std::find(m.pp_zero_r.begin(), m.pp_zero_r.end(), kv.first) != m.pp_zero_r.end()) continue;
             DS_TRY(rad_kv_group_replicated(b, kv.second));
             names += (names.empty() ? "" : ", ") +
                      std::string(m.nm.f(groups == &m.index ? "kv_index_r%lld" : "kv_compressed_r%lld", (long long)kv.first));
@@ -6535,8 +6745,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
 
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
-    /* tp8 S3: a strict node is this node's part of a two-node engine; this build has no node link to run it */
-    if (m.lr.on && m.lr.strict) {
+    /* tp8 S3: a strict node is this node's part of a two-node engine; run as one only by the pipeline (tp8 S4) */
+    if (m.lr.on && m.lr.strict && !m.pp) {
         rad_step_fail(x, "deepseek41: RADIANCE_DS41_LAYERS_MODE=strict declares this node's part of a two-node engine "
                          "only; this build has no node link (tp8 S4) -- run the stage alone with the proxy mode");
         return;
@@ -6561,6 +6771,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
     /* lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is always cut, so a step of more than one segment
      * runs in BI's segments even under ds41_bi 0 (then as ds41_bi 1: segments, no pieces) */
     const bool psk_plan = m.psk_first > 0 && psk_hint(batch) != nullptr;
+    /* tp8 S4: a pipeline node runs the plain step: BI's segments and PSK's cut passes carry no crossings yet (S5 / S6) */
+    if (m.pp && (psk_plan || (m.bi_sub && g_sw_bi.load(std::memory_order_relaxed) > 0) ||
+                 (m.psk_first > 0 && g_sw_psk.load(std::memory_order_relaxed) > 0))) {
+        rad_step_fail(x, "deepseek41: a two-node pipeline node runs no BI segments or PSK passes in this build (tp8 S4): "
+                         "start both nodes with fn4 ds41_bi 0 and ds41_psk 0 (switches.json)");
+        return;
+    }
     /* lever BI (ds41_bi 1): a step of more than one shape class runs in segments (step_bi) */
     if (m.bi_sub && (g_sw_bi.load(std::memory_order_relaxed) > 0 || psk_plan)) {
         static thread_local std::vector<BiSeg> sg;
@@ -6600,10 +6817,28 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * from there, and attn_sparse_sink recovers the base from it (docs/OPS.md). */
     const RadOperand wused = praw(wb->seqused, RAD_I32, S);
 
+    /* tp8 S4: a crossing's issue: the core's ring, then its parts over the step's rows */
+    const auto cross = [&](rad_op op_, int ring) -> bool {
+        if (!m.pp_ring[ring]) m.pp_ring[ring] = rad_pp_query().ring[ring];
+        if (!m.pp_ring[ring] || !op_) {
+            rad_step_fail(x, "deepseek41: two-node pipeline: the core set up no ring for a crossing");
+            return false;
+        }
+        const RadOperand rg = praw(m.pp_ring[ring], RAD_U8, 1);
+        if (ring == RAD_PP_X1) RAD_ISSUE_N(x, op_, T, rg, brows(m.xcol, T));
+        else
+            RAD_ISSUE_N(x, op_, T, rg, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T), brows(m.comb, T),
+                        brows(m.pre_f, T));
+        return true;
+    };
     media_route(m, batch);
+    if (!m.pp || m.pp_rank == 0) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
     m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
+    }
+    /* X1: the leader's lookup out, the follower's in, where one process's lookup was */
+    if (m.pp && !cross(m.pp_x1, RAD_PP_X1)) return;
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
@@ -6654,6 +6889,33 @@ static void step(RadCtx* x, const RadBatch* batch) {
         if (!m.lr.held(L.l)) continue;   /* tp8 S3: another node's layer */
         const int l = L.l;
         const int64_t r = L.r;
+        /* tp8 S4: the leader's layer t starts from the follower's X2 with the op that ends layer t-1 in one process:
+         * the fused post + collapse + norm (its M1 form where that is what one process takes), else mhc_post, after
+         * which this layer's own collapse runs as below. The same choice as the end of a layer (below). */
+        if (m.pp && m.pp_rank == 0 && l == m.pp_t) {
+            if (!cross(m.pp_x2, RAD_PP_X2)) return;
+            if (L.pcn_a) {
+                const int64_t fmin = L.pcn_mix ? mhc_fuse_min() : 0;
+                t_mhc_a.clear();
+                t_mhc_a_l = L.l;
+                if (fmin > 0 && T >= fmin) {
+                    RAD_ISSUE_N(x, L.pcn_mix, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                                brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                                RAD_W(L.attn_norm), brows(m.xn, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale),
+                                RAD_W(L.hc_a_base), brows(m.pre_a, T));
+                    t_mhc_a.push_back({ 0, T });
+                    mhc_note(x, T);
+                } else {
+                    if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
+                    RAD_ISSUE_N(x, L.pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                                brows(m.comb, T), brows(m.h0, T), brows(m.pre_f, T), brows(m.xcol, T),
+                                RAD_W(L.attn_norm), brows(m.xn, T));
+                }
+            } else {
+                RAD_ISSUE_N(x, m.pp_post, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                            brows(m.comb, T), brows(m.h0, T));
+            }
+        }
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
             /* lever E1: the step's rows are one kv GEMM launch below; deduplicated when its plan says so */
@@ -7078,6 +7340,12 @@ static void step(RadCtx* x, const RadBatch* batch) {
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin); under
          * RADIANCE_DS41_AR_PCN=2 with the block's all-reduce in front (the block left it to us: ar_out). */
         const Layer* nx = next_layer(m, L.l);   /* tp8 S3: the next layer this node holds (a gap passes the streams on) */
+        /* tp8 S4: the follower's last layer ends at the boundary op's inputs, which X2 carries to the leader */
+        if (m.pp && m.pp_rank == 1 && L.l == m.pp_t - 1) {
+            (void)cross(m.pp_x2, RAD_PP_X2);
+            bt_flush(x, m, batch);
+            return;
+        }
         const bool arw = ar_wide_write_exact(m.g, T);
         if (nx && nx->ar_pcn_a && arw)
             RAD_ISSUE_N(x, nx->ar_pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
