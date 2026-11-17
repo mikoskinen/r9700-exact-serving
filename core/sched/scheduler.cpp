@@ -619,8 +619,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* tp8 S5: a pipeline lane takes its own run of the cards (lanes.h): every lane's sequences have
      * StepSlots of their own, and the lane holds at most that many sequences. */
     if (n_lanes_ > 1) {
-        const int64_t per = (cfg.max_seqs + n_lanes_ - 1) / n_lanes_;
-        const int64_t lo = (int64_t)lane_ * per, hi = std::min<int64_t>(cfg.max_seqs, lo + per);
+        /* tp8 S5 review: an even split (lane l takes [l * S / N, (l + 1) * S / N)), so every lane has a card
+         * whenever --max-num-seqs >= --pp-lanes, as pp_check promises; ceil(S / N) a lane left the last
+         * lanes none at e.g. 6 sequences over 4 lanes, refused at start with a misleading reason. */
+        const int64_t lo = (int64_t)lane_ * cfg.max_seqs / n_lanes_, hi = ((int64_t)lane_ + 1) * cfg.max_seqs / n_lanes_;
         if (lo >= hi) {
             RAD_ERR("scheduler: lane %d of %d has no card: --max-num-seqs %lld is below --pp-lanes", lane_, n_lanes_,
                     (long long)cfg.max_seqs);
@@ -3804,7 +3806,10 @@ const RadBatch* Scheduler::step() {
          * hit back and returns to the queue for a fresh lookup. */
         /* tp8 S5: another lane's pieces go back to this lane's inbox, their home lane holding their
          * sequences (lent_pending) until this lane plans them again: never run out of position order. */
-        if (lanes_) lane_return_pieces();
+        if (lanes_) {
+            lane_return_pieces();
+            lane_unsplit_own();   /* tp8 S5 review: and this lane's own cut */
+        }
         for (StepEntry& e : plan_.e) {
             if (e.home >= 0) continue;
             SchedReq& s = *reqs_[(size_t)e.slot];

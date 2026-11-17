@@ -74,10 +74,11 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     lanes_.init(all);
     /* Every lane's batch is its own set of recordings (Ctx::pass_key reads its slab's pointers). */
     for (auto& rk : ranks_) rk->ctx.set_tape_lanes(n_lanes_);
-    const int64_t per = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_;
+    /* lane l holds cards [l * S / N, (l + 1) * S / N) (Scheduler::init) */
+    const int64_t per = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_, least = cfg_.max_seqs / n_lanes_;
     RAD_INFO("two-node pipeline: %d lanes, each a scheduler with its own step slab on every card and at most %lld "
-             "sequences (cards %lld a lane); the newcomer split %s (pieces of at least %lld rows on the %lld-row "
-             "grid; RADIANCE_PP_SPLIT, RADIANCE_PP_SPLIT_MIN)", n_lanes_, (long long)per, (long long)per,
+             "sequences (cards %lld-%lld a lane); the newcomer split %s (pieces of at least %lld rows on the %lld-row "
+             "grid; RADIANCE_PP_SPLIT, RADIANCE_PP_SPLIT_MIN)", n_lanes_, (long long)per, (long long)least, (long long)per,
              lanes_.split_on() ? "on" : "off", (long long)lanes_.split_min(), (long long)std::max<int64_t>(geo_.quantum, 1));
     return RAD_OK;
 }

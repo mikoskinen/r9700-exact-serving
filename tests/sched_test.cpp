@@ -12948,3 +12948,65 @@ TEST(a_cancel_while_a_piece_runs_elsewhere_waits_for_it) {
     CHECK_OK(L.commit(1, 7));
     CHECK(!L.kv.has_sequence(s));                   /* returned once it committed */
 }
+
+/* tp8 S5 review: a lane step whose build fails after its own chunk was cut takes back the pieces it
+ * lent. Nothing of the step ran, so a piece left in another lane's inbox would run [c0 + base, ...)
+ * over rows [c0, c0 + base) that were never computed, and its commit would count rows that are not
+ * there. The next plan re-plans the chunk whole from the committed end, as on one lane. */
+TEST(lanes_a_failed_build_takes_back_the_pieces_its_split_lent) {
+    Lanes L;
+    L.prog.plugin_words = 4;                         /* a request's words past this fail its build */
+    REQUIRE_EQ(L.start(2), RAD_OK);
+    const uint64_t y = L.submit(0, 8, 3, 5000);      /* a short prompt sampled this step, with words */
+    const uint64_t x = L.submit(0, 100, 3);          /* the newcomer whose chunk is cut */
+    REQUIRE(y != 0 && x != 0);
+    L.at(0).find(y)->plugin_words.assign(9, 1);
+    CHECK(L.plan(0, { 1 }) == nullptr);              /* the build fails: nothing of the step ran */
+    CHECK_EQ((int64_t)L.set.inbox_n_locked(1), (int64_t)0);
+    CHECK_EQ(L.req(0, x)->n_computed, 0);
+    CHECK_EQ(L.set.counts().pieces, 0);
+    /* the words fixed, lane 0 plans x's chunk again from 0 and cuts it anew */
+    L.at(0).find(y)->plugin_words.assign(2, 1);
+    REQUIRE(L.plan(0, { 1 }) != nullptr);
+    const StepEntry* e0 = L.entry_of(0, x);
+    REQUIRE(e0 != nullptr);
+    CHECK_EQ(e0->ctx_len, 0);
+    REQUIRE_EQ((int64_t)L.set.inbox_n_locked(1), (int64_t)1);
+    REQUIRE(L.plan(1, { 0 }) != nullptr);
+    const StepEntry* e1 = L.entry_of(1, x);
+    REQUIRE(e1 != nullptr);
+    CHECK_EQ(e1->ctx_len, e0->ctx_len + e0->n_tokens);  /* the piece starts where the home's ends */
+    CHECK(L.set.broken().empty());
+    CHECK_OK(L.commit(0, 7));
+    CHECK_OK(L.commit(1, 7));
+    CHECK_EQ(L.req(0, x)->n_computed, (int64_t)(e1->ctx_len + e1->n_tokens));
+}
+
+/* tp8 S5 review: a step carrying another lane's piece is a shared step, and a step wider than the
+ * shared budget must be one sequence (RadBuildCtx::max_mixed_tok). With three or more lanes two
+ * lenders may lend into one borrower before it plans; the room check bounds the borrower's inbox by
+ * the shared budget, not by max_tok, so its step never holds more than shared_tok rows of several
+ * sequences. (Two lanes: one lender a borrower, at most one shared step's rows: never reached.) */
+TEST(lanes_an_inbox_stays_within_the_shared_budget) {
+    Lanes L;
+    L.cfg.prefill_span = 2;
+    L.cfg.checkpoint_interval = 32;                  /* shared budget max(min(64, 32), 64 - 32) = 32 */
+    REQUIRE_EQ(L.start(3), RAD_OK);
+    const uint64_t p = L.submit(0, 200, 2);
+    const uint64_t q = L.submit(1, 200, 2, 3000);
+    REQUIRE(p != 0 && q != 0);
+    REQUIRE(L.plan(0, { 2 }) != nullptr);            /* a prefill alone takes the whole 64: cut over 0 and 2 */
+    REQUIRE(L.plan(1, { 2 }) != nullptr);            /* and another lane's, into the same borrower */
+    for (int to : { 2 }) {
+        CHECK(L.set.inbox_rows_locked(to) <= 32);
+        const RadBatch* rb = L.plan(to, { 0, 1 });
+        if (!rb) continue;
+        int nseq = 0;
+        for (const StepEntry& e : L.at(to).plan().e) nseq += e.n_tokens > 0;
+        CHECK(L.at(to).plan().n_tok <= 32 || nseq == 1);
+        if (!(L.at(to).plan().n_tok <= 32 || nseq == 1))
+            fprintf(stderr, "    lane %d: %lld rows of %d sequences in a shared step\n", to,
+                    (long long)L.at(to).plan().n_tok, nseq);
+    }
+    CHECK(L.set.broken().empty());
+}

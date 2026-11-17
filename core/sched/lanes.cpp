@@ -142,6 +142,18 @@ void LaneSet::take_locked(int lane, std::vector<Piece>* out) {
     out->swap(inbox_[(size_t)lane]);
 }
 
+bool LaneSet::unlend_locked(int to, int home, uint64_t seq, int32_t ctx_len) {
+    if (to < 0 || to >= (int)inbox_.size()) return false;
+    std::vector<Piece>& in = inbox_[(size_t)to];
+    for (size_t k = 0; k < in.size(); ++k)
+        if (in[k].home == home && in[k].e.seq == seq && in[k].e.ctx_len == ctx_len) {
+            in.erase(in.begin() + (ptrdiff_t)k);
+            --lent_;
+            return true;
+        }
+    return false;
+}
+
 /* ================================================================== the scheduler's halves */
 /* At step()'s start: a sequence with a piece still waiting in another lane's inbox, or whose first
  * token is to come from one, is left out of this step's plan (out of running_ while step() plans; put
@@ -150,6 +162,7 @@ void LaneSet::take_locked(int lane, std::vector<Piece>* out) {
 void Scheduler::lane_plan_begin() {
     lane_bump_.clear();
     lane_out_.clear();
+    lane_lent_now_.clear();
     if (!lanes_ || n_lanes_ <= 1) return;
     for (size_t i = 0; i < running_.size();) {
         const int32_t slot = running_[i];
@@ -260,6 +273,11 @@ void Scheduler::lane_split_own() {
     if (order.empty()) return;
     const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
     const int64_t minp = (std::max<int64_t>(lanes_->split_min(), Q) + Q - 1) / Q * Q;
+    /* A borrower's rows: the shared budget under a span (a step carrying another lane's piece is a
+     * shared step), else the step's; its entries: its own cards' beside the inbox. */
+    const int64_t rows_cap = cfg_.prefill_span > 1 && geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok)
+                                                                         : cfg_.max_tok;
+    const int64_t lane_cards = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_;
     for (StepEntry& e : plan_.e) {
         if (e.home >= 0 || !e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
         if (e.ckpt_slot >= 0 || e.ckpt_restore >= 0 || e.cr_replay || e.n_spec != 0) continue;
@@ -281,8 +299,11 @@ void Scheduler::lane_split_own() {
             bool room = true;
             for (int64_t j = 1; j < k && room; ++j) {
                 const int to = order[(size_t)(j - 1)];
-                room = lanes_->inbox_rows_locked(to) + (j == k - 1 ? last : base) <= cfg_.max_tok &&
-                       (int64_t)lanes_->inbox_n_locked(to) + 1 < cfg_.max_seqs;
+                /* tp8 S5 review: the borrower's step is a shared step (lane_reserve), and a step wider than
+                 * the shared budget must be one sequence (RadBuildCtx::max_mixed_tok); its own plan counts
+                 * its entries without the inbox, so the inbox leaves room for every card of the lane. */
+                room = lanes_->inbox_rows_locked(to) + (j == k - 1 ? last : base) <= rows_cap &&
+                       (int64_t)lanes_->inbox_n_locked(to) + 1 + lane_cards <= cfg_.max_seqs;
             }
             if (room) break;
         }
@@ -293,6 +314,16 @@ void Scheduler::lane_split_own() {
         int64_t real = r.n_computed;
         for (const auto& [slot, rows] : lane_bump_)
             if (slot == e.slot) real -= rows;
+        /* tp8 S5 review: what this cut changes, for lane_unsplit_own should the step's build fail */
+        LaneLent undo;
+        undo.slot = e.slot;
+        undo.seq = e.seq;
+        undo.lent = s.lent;
+        undo.lent_pending = s.lent_pending;
+        undo.lent_tok = s.lent_tok;
+        undo.lent_next = s.lent_next;
+        undo.rows = n - base;
+        undo.tok = tok;
         for (int64_t j = 1; j < k; ++j) {
             LaneSet::Piece p;
             p.home = lane_;
@@ -302,9 +333,11 @@ void Scheduler::lane_split_own() {
             p.e.produces_token = tok && j == k - 1;
             p.e.dev = false;
             lanes_->lend_locked(order[(size_t)(j - 1)], p);
+            undo.to.emplace_back(order[(size_t)(j - 1)], p.e.ctx_len);
             s.lent += p.e.n_tokens;
             ++s.lent_pending;
         }
+        lane_lent_now_.push_back(std::move(undo));
         lanes_->note_lent_locked(n - base, tok);
         s.lent_tok = s.lent_tok || tok;
         s.lent_next = (int64_t)c0 + base;
@@ -314,6 +347,30 @@ void Scheduler::lane_split_own() {
         plan_.n_tok -= n - base;
         kv_->set_keep_floor(r.id, real);
     }
+}
+
+/* A build that failed after lane_split_own cut this lane's chunks: nothing of the step ran, so the
+ * pieces it lent come back out of the borrowers' inboxes and each request's lane fields are what they
+ * were before the cut; the next step re-plans the chunk whole from the committed end (as on one lane,
+ * "the next step re-schedules the same chunks"). Left lent, a borrower would run [c0 + base, ...) over
+ * rows [c0, c0 + base) never computed and count them committed. The lock is held. */
+void Scheduler::lane_unsplit_own() {
+    if (!lanes_) return;
+    for (const LaneLent& u : lane_lent_now_) {
+        for (const auto& [to, at] : u.to)
+            if (!lanes_->unlend_locked(to, lane_, u.seq, at))
+                lanes_->note_broken_locked(fmt("lane %d: a failed build could not take back its piece at %d from lane %d's "
+                                               "inbox", lane_, (int)at, to));
+        lanes_->unnote_lent_locked(u.rows, u.tok);
+        if (u.slot < 0 || (size_t)u.slot >= reqs_.size() || !reqs_[(size_t)u.slot]) continue;
+        SchedReq& s = *reqs_[(size_t)u.slot];
+        s.lent = u.lent;
+        s.lent_pending = u.lent_pending;
+        s.lent_tok = u.lent_tok;
+        s.lent_next = u.lent_next;
+        if (s.req && s.lent == 0) kv_->set_keep_floor(s.req->id, -1);
+    }
+    lane_lent_now_.clear();
 }
 
 /* One of this lane's sequences' pieces, committed in the lane that ran it (its StepResult row
