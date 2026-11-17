@@ -3417,6 +3417,8 @@ const RadBatch* Scheduler::step() {
                 if (noa_pieces_now_ == 0) { ++noa_n_[4]; s.noa_starved = true; }
                 continue;
             }
+            /* lever PSK-CR: no piece crosses a replay's end, as the running loop's (chunk_end stops them there; a guard) */
+            if (r.cr_end > r.n_computed && r.n_computed + want > r.cr_end) want = r.cr_end - r.n_computed;
             int rounds = 0;
             bool got = true;
             while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
@@ -3443,6 +3445,12 @@ const RadBatch* Scheduler::step() {
             e.draft = s.draft;
             e.n_draft = s.n_draft;
             e.is_prefill = true;
+            /* lever PSK-CR: a NOA piece of a cone replay is a replay chunk, as the running loop's and the admission's are --
+             * the batch maps its full-group and linear-state slots to -1 and the plugin cuts it to the replay end's cone. Unset,
+             * the piece ran as an ordinary chunk: it wrote its recomputed global KV and compressor tail over the cached rows
+             * of the sequence and ran uncut, so a replay that took a NOA piece beside another prefill answered differently
+             * from the same request alone (etp/PREFILL-LOADFIX.md: the first differing tensor its layer-2 index selection). */
+            e.cr_replay = r.cr_end > r.n_computed;
             e.ngram = false;
             e.draft_parent = nullptr;
             r.draft_parent = nullptr;
