@@ -196,7 +196,12 @@ int Engine::step_loop_lanes() {
      * lane-step heads while a step was in flight; a gap over 100 ms is a stall, named with the tail committed last before
      * it (its lane, phase and rows). One line a minute while lane steps run, and the run's at stop. */
     struct Gaps {
-        struct Win { uint64_t t0 = 0; int64_t steps0 = 0, n = 0; double ms = 0, max_ms = 0; std::string worst; };
+        struct Win {
+            uint64_t t0 = 0; int64_t steps0 = 0, n = 0; double ms = 0, max_ms = 0; std::string worst;
+            /* tp8 loop P6: the leader's host time in prefill / MIXED lane steps (a non-token chunk's collect waits for
+             * nothing, so a host that blocks here is what keeps two chunks from overlapping): plan, head issue, tail */
+            int64_t nh = 0, nt = 0; double plan_ms = 0, head_ms = 0, tail_ms = 0, tail_max = 0, head_max = 0;
+        };
         Win win, run;
         uint64_t last = 0;
         int tl = -1, tphase = -1;
@@ -222,13 +227,32 @@ int Engine::step_loop_lanes() {
             last = now;
         }
         void tail(int lane, const RadBatch* b) { tl = lane; tphase = b->phase; ttok = b->n_tok; }
+        void host_head(const RadBatch* b, uint64_t p0, uint64_t p1, uint64_t h1) {
+            if (b->phase == RAD_PHASE_DECODE) return;
+            for (Win* w : { &win, &run }) {
+                ++w->nh; w->plan_ms += (double)(p1 - p0) / 1e6; w->head_ms += (double)(h1 - p1) / 1e6;
+                w->head_max = std::max(w->head_max, (double)(h1 - p1) / 1e6);
+            }
+        }
+        void host_tail(const RadBatch* b, uint64_t t0, uint64_t t1) {
+            if (b->phase == RAD_PHASE_DECODE) return;
+            for (Win* w : { &win, &run }) {
+                ++w->nt; w->tail_ms += (double)(t1 - t0) / 1e6;
+                w->tail_max = std::max(w->tail_max, (double)(t1 - t0) / 1e6);
+            }
+        }
         static void note(const Win& w, const char* what, int64_t steps) {
             if (!w.t0) return;
             const double wall = (double)(rad_mono_ns() - w.t0) / 1e9;
+            const std::string host = w.nh || w.nt
+                ? fmt("; host in %lld prefill / MIXED lane step(s): plan %.1f + head issue %.1f ms a step (longest %.1f), "
+                      "tail %.1f ms a step (longest %.1f)", (long long)std::max(w.nh, w.nt), w.nh ? w.plan_ms / w.nh : 0.0,
+                      w.nh ? w.head_ms / w.nh : 0.0, w.head_max, w.nt ? w.tail_ms / w.nt : 0.0, w.tail_max)
+                : std::string();
             RAD_INFO("two-node pipeline: lane-step stalls over %s (%.1f s, %lld lane steps): %lld head gaps > 100 ms with a "
-                     "step in flight, %.0f ms in all (%.1f %% of the wall)%s%s", what, wall, (long long)(steps - w.steps0),
+                     "step in flight, %.0f ms in all (%.1f %% of the wall)%s%s%s", what, wall, (long long)(steps - w.steps0),
                      (long long)w.n, w.ms, wall > 0 ? w.ms / 10.0 / wall : 0.0, w.worst.empty() ? "" : "; the longest ",
-                     w.worst.c_str());
+                     w.worst.c_str(), host.c_str());
         }
         void minute(int64_t steps) {
             if (!win.t0 || rad_mono_ns() - win.t0 < 60ull * 1000000000ull) return;
@@ -288,7 +312,9 @@ int Engine::step_loop_lanes() {
                 lanes_.set_planners(std::move(order));
             }
             lane_select(l);
+            const uint64_t p0 = rad_mono_ns();
             const RadBatch* b = lsched().step();
+            const uint64_t p1 = rad_mono_ns();
             if (const std::string why = lanes_.broken(); !why.empty()) {
                 RAD_ERR("two-node pipeline: %s -- the engine stops", why.c_str());
                 return fail_loop(RAD_E_STATE);
@@ -296,6 +322,7 @@ int Engine::step_loop_lanes() {
             if (!b) continue;
             if (t_on) phase_mark(PH_PLAN);
             if (const int hs = lane_head(l, b); hs < 0) return fail_loop(hs);
+            gaps.host_head(b, p0, p1, rad_mono_ns());
             gaps.head(fifo.empty(), lane_steps);
             busy[(size_t)l] = 1;
             fifo.emplace_back(l, b);
@@ -327,6 +354,7 @@ int Engine::step_loop_lanes() {
         /* 2. the oldest lane step's tail, its drafter, its commit */
         const auto [lane, b] = fifo.front();
         fifo.pop_front();
+        const uint64_t tt0 = rad_mono_ns();
         if (!tail_ahead_) {
             if (const int ts = lane_tail(lane, b, so, cancel, t_on); ts < 0) return fail_loop(ts);
         } else {
@@ -343,6 +371,7 @@ int Engine::step_loop_lanes() {
             m_out[(size_t)lane] = s_out[(size_t)lane] = 0;
         }
         busy[(size_t)lane] = 0;
+        gaps.host_tail(b, tt0, rad_mono_ns());
         gaps.tail(lane, b);
         if (++lane_steps == 1 || lane_steps % 4096 == 0) lanes_note(lane_steps, rounds_two);
         gaps.minute(lane_steps);
