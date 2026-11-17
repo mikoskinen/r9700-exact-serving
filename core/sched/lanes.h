@@ -91,6 +91,10 @@ public:
     size_t  inbox_n_locked(int lane) const { return inbox_[(size_t)lane].size(); }
     /* Moves lane `lane`'s pieces into `out`. */
     void    take_locked(int lane, std::vector<Piece>* out);
+    /* Takes back lane `home`'s piece of request `seq` at `ctx_len` from lane `to`'s inbox (a lender's
+     * step whose build failed: Scheduler::lane_unsplit_own); false when it is not there. */
+    bool    unlend_locked(int to, int home, uint64_t seq, int32_t ctx_len);
+    void    unnote_lent_locked(int64_t rows, bool tok) { rows_ -= rows; if (tok) --tok_; }
 
     /* Counters (any thread, under the lock): pieces lent, pieces committed, rows lent. */
     struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; };

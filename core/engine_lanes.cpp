@@ -82,13 +82,17 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     lanes_.init(all);
     /* tp8 M56: at W(h > 0, t) the leader's head part runs layers [0, h) and writes their state (lanes.h) */
     lanes_.set_head_state(cfg_.pp_cut_h > 0);
+    /* tp8 S5 review: draft_ctxskip=1 refused by name under lanes (fn4), not accepted and left off: a run kit
+     * that reads its switches back drops it instead of stopping on a value that differs */
+    fn4::ctxskip_refuse_lanes();
     /* Every lane's batch is its own set of recordings (Ctx::pass_key reads its slab's pointers). */
     for (auto& rk : ranks_) rk->ctx.set_tape_lanes(n_lanes_);
-    const int64_t per = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_;
+    /* lane l holds cards [l * S / N, (l + 1) * S / N) (Scheduler::init) */
+    const int64_t per = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_, least = cfg_.max_seqs / n_lanes_;
     RAD_INFO("two-node pipeline: %d lanes, each a scheduler with its own step slab on every card and at most %lld "
-             "sequences (cards %lld a lane); the newcomer's chunks over the lanes %s (whole chunks of the one-process "
-             "grid: the chunks an idle engine plans, one a lane in turn; RADIANCE_PP_SPLIT=0 off)%s", n_lanes_,
-             (long long)per, (long long)per, lanes_.split_on() ? "on" : "off",
+             "sequences (cards %lld-%lld a lane); the newcomer's chunks over the lanes %s (whole chunks of the "
+             "one-process grid: the chunks an idle engine plans, one a lane in turn; RADIANCE_PP_SPLIT=0 off)%s", n_lanes_,
+             (long long)per, (long long)least, (long long)per, lanes_.split_on() ? "on" : "off",
              cfg_.pp_cut_h > 0 ? "; a chunk that takes a snapshot is followed by its next chunk only after its commit "
                                  "(the head part writes layers [0, h)'s state)" : "");
     return RAD_OK;
@@ -351,7 +355,13 @@ int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint
     /* The drafter's passes behind the tail cross nothing: a whole pass of the lane. */
     pp_set_pass(lane, RAD_PP_PART_WHOLE);
     if (t_on) phase_mark(PH_RANKS);
-    for (uint64_t id : cancel) lsched().cancel(id);
+    /* tp8 S5 review: a row the sampler refused may be another lane's (a newcomer's last piece, which
+     * samples its first token here): the cancel goes to the lane holding the request, or the request
+     * would commit a token its sampler never staged. */
+    for (uint64_t id : cancel) {
+        Scheduler* o = lanes_.owner(id);
+        (o ? *o : lsched()).cancel(id);
+    }
     cancel.clear();
     if (bst < 0) return bst;
     int st = step_status_.load(std::memory_order_acquire);

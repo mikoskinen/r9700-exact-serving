@@ -1157,6 +1157,21 @@ private:
      * end takes (as bi_chunk_plan's alone piece; lever PSK design 2's targets applied): the one-process grid */
     int64_t lane_alone_chunk(const SchedReq& s, Request& r, int64_t target, int64_t n, int64_t* ckpt);
     void    lane_return_pieces();
+    /* What lane_split_own lent this step, so a step whose build fails takes it back (lane_unsplit_own):
+     * nothing of that step ran, so a piece left in another lane would run past rows never computed. */
+    struct LaneLent {
+        int32_t slot = -1;
+        uint64_t seq = 0;
+        int32_t lent = 0, lent_pending = 0;   /* the request's lane fields before the cut */
+        bool    lent_tok = false, lent_hold = false;
+        int64_t lent_next = -1;
+        int64_t rows = 0;                     /* rows lent (the whole chunks after the home's) */
+        bool    tok = false;
+        std::vector<std::pair<int, int32_t>> to;   /* (borrower, piece's first position) */
+    };
+    std::vector<LaneLent> lane_lent_now_;
+    void    lane_unsplit_own();
+    bool    lane_others_hold() const;
     friend class LaneSet;
     /* A piece of one of this lane's sequences, run in lane `by`'s step, committed there: called by
      * the LaneSet with the lock held. `i` is the entry in that step's StepResult. */

@@ -798,6 +798,9 @@ void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t look
 /* The depth-0 context skip (draft_ctxskip). The engine, at bring-up: whether it set the skip up (draft_ctxskip=1 is
  * refused otherwise; GET "ctxskip" only once registered). */
 void ctxskip_register(bool capable);
+/* tp8 S5 review: a two-node pipeline leader with lanes, whose steps interleave in the ring the skip keeps:
+ * draft_ctxskip=1 is refused naming that (GET "ctxskip" capable 2), so a run's switch probe drops it by name. */
+void ctxskip_refuse_lanes();
 /* The engine, at bring-up (lever Z0-A): whether arena_d0 can act (a decode rung below the largest declared). */
 void arena_d0_register(bool capable);
 /* The engine, at bring-up (lever Z0-W): whether draft_lend_w can act (declared and set up on every rank). */

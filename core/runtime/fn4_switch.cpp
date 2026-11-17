@@ -101,7 +101,7 @@ struct State {
     std::atomic<int> lend_capable{-1};   /* -1 no scheduler registered, 0 / 1 */
     std::atomic<int64_t> lend[18];       /* note_lend_sched [0, 9), 16 and 17, note_lend_engine [9, 16) */
     std::atomic<int64_t> acc[4];         /* note_draft_accept */
-    std::atomic<int> ctxskip_capable{-1};   /* -1 no engine registered, 0 / 1 */
+    std::atomic<int> ctxskip_capable{-1};   /* -1 no engine registered, 0 / 1, 2 refused under lanes (tp8 S5) */
     std::atomic<int> arena_d0_capable{-1};  /* lever Z0-A: -1 no engine registered, 0 / 1 */
     std::atomic<int> draft_w_capable{-1};   /* lever Z0-W: -1 no engine registered, 0 / 1 */
     std::atomic<int> place_lf_capable{-1};  /* lever LF: -1 no engine registered, 0 / 1 */
@@ -546,6 +546,7 @@ void note_draft_accept(int64_t head_drafted, int64_t head_accepted, int64_t look
 }
 
 void ctxskip_register(bool capable) { st().ctxskip_capable.store(capable ? 1 : 0, std::memory_order_release); }
+void ctxskip_refuse_lanes() { st().ctxskip_capable.store(2, std::memory_order_release); }
 void arena_d0_register(bool capable) { st().arena_d0_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void draft_w_register(bool capable) { st().draft_w_capable.store(capable ? 1 : 0, std::memory_order_release); }
 void place_lf_register(bool capable) { st().place_lf_capable.store(capable ? 1 : 0, std::memory_order_release); }
@@ -1111,9 +1112,11 @@ static bool check_here(const std::string& name, int v, std::string* err) {
         if (v == 1 && cap != 1) {
             if (err)
                 *err = std::string("draft_ctxskip=1 refused: ") +
-                       (cap < 0 ? "the context skip is not set up: RADIANCE_DRAFT_CTXSKIP was not set at start"
-                                : "the context skip is not set up here: no windowed block drafter drafting, or no "
-                                  "tapped rows the engine can keep");
+                       (cap < 0    ? "the context skip is not set up: RADIANCE_DRAFT_CTXSKIP was not set at start"
+                        : cap == 2 ? "a two-node pipeline with lanes interleaves the steps the skip's ring keeps "
+                                     "(tp8 S5); start with --pp-lanes 1 for it"
+                                   : "the context skip is not set up here: no windowed block drafter drafting, or no "
+                                     "tapped rows the engine can keep");
             return false;
         }
         return true;

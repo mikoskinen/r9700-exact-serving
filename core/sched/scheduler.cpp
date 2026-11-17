@@ -619,8 +619,10 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     /* tp8 S5: a pipeline lane takes its own run of the cards (lanes.h): every lane's sequences have
      * StepSlots of their own, and the lane holds at most that many sequences. */
     if (n_lanes_ > 1) {
-        const int64_t per = (cfg.max_seqs + n_lanes_ - 1) / n_lanes_;
-        const int64_t lo = (int64_t)lane_ * per, hi = std::min<int64_t>(cfg.max_seqs, lo + per);
+        /* tp8 S5 review: an even split (lane l takes [l * S / N, (l + 1) * S / N)), so every lane has a card
+         * whenever --max-num-seqs >= --pp-lanes, as pp_check promises; ceil(S / N) a lane left the last
+         * lanes none at e.g. 6 sequences over 4 lanes, refused at start with a misleading reason. */
+        const int64_t lo = (int64_t)lane_ * cfg.max_seqs / n_lanes_, hi = ((int64_t)lane_ + 1) * cfg.max_seqs / n_lanes_;
         if (lo >= hi) {
             RAD_ERR("scheduler: lane %d of %d has no card: --max-num-seqs %lld is below --pp-lanes", lane_, n_lanes_,
                     (long long)cfg.max_seqs);
@@ -3333,6 +3335,10 @@ const RadBatch* Scheduler::step() {
          * only kEvictRounds times; past that the shortfall is preemption's to fix. */
         int evict_rounds = 0;
         bool failed = false, yielded = false;
+        /* tp8 S5 review: a request that waits this step still in running_ (a preemption refused because
+         * a piece of the victim runs in another lane): the loop steps past it, or it would retry the
+         * same refused ensure forever with the step lock held. Never set on one lane. */
+        bool stays = false;
         while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
             /* The cache gives blocks back before a running request does: a cached prefix saves
              * work done once, a running request is work in flight. Nothing else releases the
@@ -3341,6 +3347,21 @@ const RadBatch* Scheduler::step() {
                 pc_->evict(kEvictBlocks) > 0)
                 continue;
             const bool last = running_.size() - 1 <= i;
+            /* tp8 S5 review: under lanes the pool is shared but a lane preempts only its own requests;
+             * the request alone in its lane's running set is crowded out by another lane's (or by its
+             * own lane's sequences whose pieces run elsewhere), which one lane would preempt behind it.
+             * It is preempted by recompute and waits for them, as the back of one lane's set does. */
+            if (last && i == 0 && kv_->can_ever_fit(r.n_computed + want) && lane_others_hold()) {
+                (void)preempt_back();
+                if (lane_preempt_refused_) {   /* a piece of it runs elsewhere: it waits a step with its blocks */
+                    lane_preempt_refused_ = false;
+                    stays = true;
+                } else {
+                    preempted_here = true;
+                }
+                yielded = true;
+                break;
+            }
             if (!kv_->can_ever_fit(r.n_computed + want) || (last && i == 0)) {
                 /* §17: either no pool could serve this length, or the request runs alone and
                  * still cannot grow. Fail the request rather than deadlock. */
@@ -3361,12 +3382,15 @@ const RadBatch* Scheduler::step() {
              * back, so they are reclaimed before anyone else is preempted. */
             if (preempt_back()) evict_rounds = 0;
             /* tp8 S5: the back has a piece in flight in another lane: this request waits a step instead */
-            if (lane_preempt_refused_) { lane_preempt_refused_ = false; yielded = true; break; }
+            if (lane_preempt_refused_) { lane_preempt_refused_ = false; yielded = true; stays = true; break; }
             preempted_here = true;
             if (last) { yielded = true; break; }
         }
         /* close_request or preempt_back removed it from running_; i now indexes the next. */
-        if (failed || yielded) continue;
+        if (failed || yielded) {
+            if (stays) ++i;
+            continue;
+        }
 
         StepEntry e;
         e.req = &r;
@@ -3805,7 +3829,10 @@ const RadBatch* Scheduler::step() {
          * hit back and returns to the queue for a fresh lookup. */
         /* tp8 S5: another lane's pieces go back to this lane's inbox, their home lane holding their
          * sequences (lent_pending) until this lane plans them again: never run out of position order. */
-        if (lanes_) lane_return_pieces();
+        if (lanes_) {
+            lane_return_pieces();
+            lane_unsplit_own();   /* tp8 S5 review: and this lane's own cut */
+        }
         for (StepEntry& e : plan_.e) {
             if (e.home >= 0) continue;
             SchedReq& s = *reqs_[(size_t)e.slot];
