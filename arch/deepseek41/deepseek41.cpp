@@ -1446,7 +1446,14 @@ struct PskPlan {
     /* lever PSK-CR (ds41-pskcr, rad_psk_plan2): per prefill sequence bit 0 = a cone-replay chunk (empty: none) */
     std::vector<int32_t> flags;
 };
-static PskPlan g_psk_plan;     /* written by rad_psk_plan with every rank thread parked, read by the ranks' issue */
+/* written by rad_psk_plan with every rank thread parked, read by the ranks' issue. (Review of tp8 S6, for S5's lanes:) one
+ * plan a step in flight, by step number -- with lanes a lane step's leader tail is issued after other lanes' heads have
+ * registered their steps' plans, and the one global plan then named another step: the tail found no plan and cut its
+ * prefill segments otherwise than the follower, which had the step's plan in its frame. One step in flight (one machine,
+ * one lane): the latest step's, as the one plan was. */
+static constexpr int kPskPlans = 8;
+static PskPlan g_psk_plans[kPskPlans];
+static PskPlan& psk_slot(int step) { return g_psk_plans[(unsigned)step % (unsigned)kPskPlans]; }
 static int64_t psk_cone(int64_t n_layer, int64_t window, int64_t l) { return kPskBase + (n_layer - 1 - l) * window; }
 static int64_t psk_kv_cone(int64_t n_layer, int64_t window, int64_t l) { return psk_cone(n_layer, window, l); }
 /* The rows a prefill segment of `n` rows runs at a layer of cone C, its next target `ahead` rows past its end. */
@@ -1457,7 +1464,9 @@ static int64_t psk_rows(int64_t C, int32_t ahead, int64_t n) {
 }
 /* The plan for this trunk pass, or null. */
 static const PskPlan* psk_hint(const RadBatch* b) {
-    return b && b->draft_pass == 0 && g_psk_plan.step >= 0 && g_psk_plan.step == b->step ? &g_psk_plan : nullptr;
+    if (!b || b->draft_pass != 0 || b->step < 0) return nullptr;
+    const PskPlan& p = psk_slot(b->step);
+    return p.step >= 0 && p.step == b->step ? &p : nullptr;
 }
 /* A prefill sequence's `ahead`: the plan's, else design 1's (0) under ds41_psk >= 1, else no cut. */
 static int32_t psk_ahead(const PskPlan* p, size_t i) {
@@ -7884,6 +7893,8 @@ static int psk_plan_impl(int step, long long dec_tok, int n, const int32_t* ahea
     using namespace deepseek41;
     const int first = g_psk_first.load(std::memory_order_relaxed), nl = g_psk_nlayer.load(std::memory_order_relaxed);
     const int w = g_psk_window.load(std::memory_order_relaxed);
+    if (step < 0) return -1;
+    PskPlan& g_psk_plan = psk_slot(step);   /* (this step's slot) */
     if (first <= 0 || nl <= first || n < 0 || (n > 0 && (!ahead || !rows))) {
         g_psk_plan.step = -1;
         return -1;
