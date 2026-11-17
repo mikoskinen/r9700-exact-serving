@@ -94,6 +94,12 @@ public:
      * beside decode rows, whatever their count). Default 1: lent within the borrower's room, as before. */
     bool lend_busy() const { return lend_busy_; }
     void set_lend_busy(bool on) { lend_busy_ = on; }
+    /* tp8 dev M5 (RADIANCE_PP_LEND_MIXED=1): a newcomer that lever BI's option D (sched_bi_chunk 3) cuts beside decode rows
+     * lends the pieces one process cuts after this step's piece (its grid, >= 128 rows a side, the room one process plans
+     * them at) one a lane to the lanes that plan next, as a cold prompt's chunks go: piece k's follower pass then runs beside
+     * piece k - 1's leader tail, and the borrower's decoders keep a decode room beside the piece. Default off. */
+    bool lend_mixed() const { return lend_mixed_; }
+    void set_lend_mixed(bool on) { lend_mixed_ = on; }
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
     void set_split(bool on, int64_t min_rows) { split_on_ = on; split_min_ = min_rows > 0 ? min_rows : split_min_; }
@@ -139,7 +145,7 @@ public:
     void note_why_locked(int k) { if (k >= 0 && k < kWhyN) ++why_[k]; }
 
     /* Counters (any thread, under the lock): pieces lent, pieces committed, rows lent. */
-    struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; int64_t why[kWhyN] = {}; };
+    struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; int64_t why[kWhyN] = {}; int64_t dpieces = 0; };
     Counts counts() const {
         std::lock_guard<std::mutex> lk(*mu_);
         Counts c;
@@ -147,10 +153,13 @@ public:
         c.done = done_;
         c.rows = rows_;
         c.token_pieces = tok_;
+        c.dpieces = dpiece_;
         for (int k = 0; k < kWhyN; ++k) c.why[k] = why_[k];
         return c;
     }
     void note_lent_locked(int64_t rows, bool tok) { rows_ += rows; if (tok) ++tok_; }
+    /* tp8 dev M5: a newcomer option D cut beside decode rows lent its next pieces this step */
+    void note_dpiece_locked() { ++dpiece_; }
     /* A piece was taken out of position order (the planning order the engine promised was not
      * kept): the pipeline's answers would be wrong, so the engine stops on it. */
     void note_broken_locked(const std::string& why) { if (broken_.empty()) broken_ = why; }
@@ -170,9 +179,10 @@ private:
     bool    split_on_ = true;
     bool    span_on_ = true;                /* RADIANCE_PP_SPAN (span_on) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
+    bool    lend_mixed_ = false;            /* RADIANCE_PP_LEND_MIXED (lend_mixed, tp8 dev M5) */
     int64_t split_min_ = 128;
     bool    head_state_ = false;
-    int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0;
+    int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0, dpiece_ = 0;
     int64_t why_[kWhyN] = {};
     std::string broken_;
 };

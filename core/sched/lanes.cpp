@@ -33,6 +33,8 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     span_on_ = !(sp && !std::strcmp(sp, "0"));
     const char* lb = std::getenv("RADIANCE_PP_LEND_BUSY");
     lend_busy_ = !(lb && !std::strcmp(lb, "0"));
+    const char* lm = std::getenv("RADIANCE_PP_LEND_MIXED");
+    lend_mixed_ = lm && !std::strcmp(lm, "1");
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
@@ -239,6 +241,10 @@ int64_t Scheduler::lane_reserve(int64_t budget) {
         span_now_ = false;
         if (budget > mixed_now_ && mixed_now_ > 0) budget = mixed_now_;
     }
+    /* tp8 dev M5: a lent newcomer piece beside this lane's decoders keeps them a decode room (one process plans the piece
+     * after the decode rows, over the budget where it must: bi_chunk_plan's last rule), within the shared budget */
+    if (lanes_->lend_mixed() && budget <= rows && geo_.shared_tok > 0 && rows + lane_decode_room() <= geo_.shared_tok)
+        return lane_decode_room();
     return budget > rows ? budget - rows : 0;
 }
 
@@ -358,10 +364,17 @@ void Scheduler::lane_split_own() {
         Request& r = *s.req;
         if (r.embed || r.media || r.token_scores || r.n_draft != 0 || s.lent_hold) continue;
         const int64_t target = s.seq_len();
-        /* only an entry on the one-process grid: its own chunk is the one an idle engine plans from its start */
+        /* only an entry on the one-process grid: its own chunk is the one an idle engine plans from its start (tp8 dev M5:
+         * or, under RADIANCE_PP_LEND_MIXED=1, a piece option D cut inside its alone piece [bi_beg, bi_end) beside decode
+         * rows: the pieces lent after it are the ones one process cuts next, up to that alone piece's end) */
+        bool dpiece = false;
         if (lane_alone_chunk(s, r, target, e.ctx_len, nullptr) != e.n_tokens) {
-            lane_why(s, LaneSet::kOffGrid);
-            continue;
+            dpiece = lanes_->lend_mixed() && bi_chunk_ == 3 && s.bi_beg <= e.ctx_len &&
+                     (int64_t)e.ctx_len + e.n_tokens < s.bi_end && s.bi_end <= target;
+            if (!dpiece) {
+                lane_why(s, LaneSet::kOffGrid);
+                continue;
+            }
         }
         /* The committed end, below which no piece in flight reads: this step's bump undone. */
         int64_t real = r.n_computed;
@@ -386,10 +399,10 @@ void Scheduler::lane_split_own() {
         undo.lent_hold = s.lent_hold;
         int why = -1;   /* tp8 prefill P0: why the walk stopped short of the prompt's end */
         size_t j = 0;
-        for (; j < order.size() && p < target; ++j) {
+        for (; j < order.size() && p < (dpiece ? s.bi_end : target); ++j) {
             const int to = order[j];
             int64_t ck = -1;
-            const int64_t n = lane_alone_chunk(s, r, target, p, &ck);
+            const int64_t n = dpiece ? lane_d_piece(s, p, &ck) : lane_alone_chunk(s, r, target, p, &ck);
             if (n <= 0) break;
             const Scheduler* b = lanes_->lane(to);
             if (!lanes_->lend_busy() && (!b || !b->running_.empty() || !b->waiting_.empty())) {
@@ -434,7 +447,8 @@ void Scheduler::lane_split_own() {
             if (pc.e.produces_token) { tok = true; break; }
             if (hold && pc.e.ckpt_slot >= 0) { s.lent_hold = true; why = LaneSet::kSnap; break; }
         }
-        if (why < 0 && !tok && p < target && j >= order.size()) why = LaneSet::kNoLane;
+        if (why < 0 && !tok && p < (dpiece ? s.bi_end : target) && j >= order.size()) why = LaneSet::kNoLane;
+        if (dpiece && rows > 0) lanes_->note_dpiece_locked();
         if (why >= 0) lane_why(s, why);
         s.lst.lent += (int32_t)undo.to.size();
         if (!any) {
