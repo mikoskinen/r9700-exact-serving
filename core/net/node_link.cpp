@@ -651,6 +651,17 @@ void NodeLink::proxy_loop() {
                          (unsigned long long)rd, (unsigned long long)sent_[id]));
                 return;
             }
+            /* A stage op on this node that gave up (its deadline, a payload not of its step) set
+             * its ring's abort word before this payload was published, in stream order: the pass
+             * computed nothing to send, so the link goes down instead. */
+            for (int k = 0; k < RAD_PP_N_RINGS; ++k)
+                for (RadPpRing* q : { send_[k], recv_[k] })
+                    if (q && __atomic_load_n(&q->abort, __ATOMIC_ACQUIRE)) {
+                        fail(fmt("crossing %d's stage op on this node gave up (abort word %llu: 3 a "
+                                 "deadline, 4 a payload of another step): payload %llu of crossing %d "
+                                 "is not sent", k, (unsigned long long)q->abort, (unsigned long long)rd, id));
+                        return;
+                    }
             if (send_data(id, r) < 0) return;
             sent_[id] = rd;
             /* The ring is free again: stage_send waits for this before it writes the next one. */

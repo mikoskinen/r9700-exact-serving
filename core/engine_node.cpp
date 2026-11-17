@@ -525,7 +525,7 @@ int Engine::follower_loop() {
             if (l >= 0) end = l;
         }
         for (auto& r : ranks_) r->stager.set_layer_end(end);
-        issue_what_.store(kIssueModel, std::memory_order_release);
+        issue_what_.store(kIssueFollower, std::memory_order_release);
         step_batch_.store(b, std::memory_order_release);
         barrier_->arrive_and_wait();      /* release the ranks */
         barrier_->arrive_and_wait();      /* and wait for them */

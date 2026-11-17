@@ -843,7 +843,7 @@ void Engine::rank_loop(int index) {
             if (s < 0) {
                 RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
                 step_status_.store(s, std::memory_order_release);
-            } else if (b->n_out > 0 && what != kIssueModel) {
+            } else if (b->n_out > 0 && what != kIssueModel && what != kIssueFollower) {
                 /* Wait for the scheduler's sampler staging, which runs while the device executes
                  * the forward pass enqueued above, so the wait is hidden behind device work. */
                 int bst = RAD_OK;
@@ -1478,6 +1478,17 @@ int Engine::step_loop() {
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        /* tp8 S4: a card's stage op that gave up leaves its ring's abort word set and its pass
+         * computed from nothing; the step's tokens are not read. */
+        if (pp_link_)
+            for (int k = 0; k < RAD_PP_N_RINGS; ++k)
+                for (RadPpRing* q : { pp_send_[k], pp_recv_[k] })
+                    if (q && __atomic_load_n(&q->abort, __ATOMIC_ACQUIRE)) {
+                        RAD_ERR("two-node pipeline: step %d: crossing X%d was aborted (%s): the step's "
+                                "tokens are not used", b->step, k + 1, pp_link_->alive() ? "a stage op gave up"
+                                                                                         : pp_link_->why().c_str());
+                        return fail_loop(RAD_E_IO);
+                    }
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);

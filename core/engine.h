@@ -334,7 +334,9 @@ private:
      * forward pass alone (kIssueModel: the next step's, issued before this one is read back), or
      * that pass's sampler alone (kIssueSampler, once the host has committed its inputs). Every
      * release must set it; a stale value would make a draft pass issue only its sampler. */
-    enum { kIssueAll = 0, kIssueModel = 1, kIssueSampler = 2 };
+    enum { kIssueAll = 0, kIssueModel = 1, kIssueSampler = 2,
+           /* tp8 S4: a pipeline follower's pass: the model and the tiering behind it, no sampler */
+           kIssueFollower = 3 };
     std::atomic<int>              issue_what_{kIssueAll};
     std::atomic<int>              step_status_{RAD_OK};
     std::atomic<bool>             stopping_{false};

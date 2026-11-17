@@ -441,6 +441,20 @@ TEST(nodes_whose_options_differ_both_refuse_to_start) {
     CHECK(pc.llog.find("cut: this node '0,2', the peer '0,3'") != std::string::npos);
 }
 
+/* --node-link verbs on a host without an RDMA device (or without libibverbs): both nodes refuse at the second rendezvous's
+ * end, naming why, instead of serving over another link. */
+TEST(the_verbs_link_without_a_device_is_refused_by_name) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_verbs");
+    const PipeRun pr = record_pipeline(d / "rec", "0,2", {}, { "--node-link", "verbs" }, { "--node-link", "verbs" });
+    CHECK(pr.leader != 0);
+    CHECK(pr.follower != 0);
+    const bool named = pr.llog.find("--node-link verbs: ") != std::string::npos &&
+                       (pr.llog.find("libibverbs") != std::string::npos || pr.llog.find("no RDMA device") != std::string::npos);
+    if (!named) fprintf(stderr, "    leader:\n%s\n", tail(pr.llog).c_str());
+    CHECK(named);
+}
+
 TEST(a_follower_with_a_smaller_cache_caps_the_leaders_and_the_recording_holds) {
     REQUIRE(world().ok);
     tiny::TempDir d("pp_cap");
