@@ -1175,8 +1175,14 @@ int Ctx::record_pass(const RadBatch* b, uint64_t key, PassTape* out) {
         /* --debug-tape-dump: the first recording of each draft pass kind lists its dispatches
          * (TAPEDUMP lines on stderr, every rank): a diagnostic for issue-order work. */
         const int db = b->draft_pass + 8;
-        haz_dump_ = tape_dump_ && db >= 0 && db < 64 && !(tape_told_ & (1ull << db));
-        if (haz_dump_)
+        /* RADIANCE_DEBUG_TAPE_DUMP=2 (tp8 S4 hw): every recording of rank 0, audits included, with its step, so a
+         * pass "issued differently from its recording" can be read dispatch by dispatch */
+        static const bool every = [] { const char* e = std::getenv("RADIANCE_DEBUG_TAPE_DUMP"); return e && !std::strcmp(e, "2"); }();
+        haz_dump_ = tape_dump_ && db >= 0 && db < 64 && (every ? rank_ == 0 : !(tape_told_ & (1ull << db)));
+        if (haz_dump_ && every)
+            fprintf(stderr, "TAPEDUMP r%d begin draft %d tok %lld step %d key %llx\n", rank_, b->draft_pass,
+                    (long long)b->n_tok, b->step, (unsigned long long)key);
+        else if (haz_dump_)
             fprintf(stderr, "TAPEDUMP r%d begin draft %d tok %lld\n", rank_, b->draft_pass,
                     (long long)b->n_tok);
     }
