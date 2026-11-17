@@ -33,7 +33,9 @@ uint64_t mono_ms() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-/* The parts after the ring: [1, 1 + parts). Bytes of each, from its own extent. */
+/* The parts after the ring: [1, 1 + parts). Bytes of each, from its own extent. `rows` is part 0's:
+ * tp8 S6 lets each part carry its own rows (a kv source's entries over the compressor's work rows
+ * beside the residual stream over the step's), and the receiver checks every part's bytes. */
 int parts_of(const RadArgs* a, int* n, uint64_t bytes[RAD_PP_MAX_PARTS], int64_t* rows) {
     *n = 0;
     *rows = -1;
@@ -42,7 +44,6 @@ int parts_of(const RadArgs* a, int* n, uint64_t bytes[RAD_PP_MAX_PARTS], int64_t
         if (!t.data) break;
         if (t.rank < 1) return RAD_E_SHAPE;
         if (*rows < 0) *rows = t.shape[0];
-        else if (t.shape[0] != *rows) return RAD_E_SHAPE;   /* every part carries the step's rows */
         const int64_t el = rad_tensor_numel(&t);
         bytes[*n] = (uint64_t)rad_dtype_bytes(t.dtype, el);
         ++*n;
@@ -96,6 +97,7 @@ int ref_stage_send(const RadArgs* a, RadStream) {
     /* review F6: the payload's number in its trailer */
     const uint64_t seq = r->ready + 1;
     std::memset(dst + total, 0, RAD_PP_TRAILER);
+    *reinterpret_cast<uint64_t*>(dst + total + 8) = rad_pp_layout(bytes, n);   /* tp8 S6 */
     __atomic_store_n(reinterpret_cast<uint64_t*>(dst + total), seq, __ATOMIC_RELEASE);
     r->rows = (uint64_t)rows;
     r->parts = (uint64_t)n;
@@ -130,9 +132,12 @@ int ref_stage_recv(const RadArgs* a, RadStream) {
     /* The sender's rows and layout must be this step's: a mismatch is a schedule bug (the two
      * nodes are not running the same step), never something to copy past. */
     if (r->rows != (uint64_t)rows || r->bytes != total + RAD_PP_TRAILER || r->parts != (uint64_t)n) return RAD_E_SHAPE;
+
     const char* src = reinterpret_cast<const char*>(r) + RAD_PP_RING_HDR;
     /* review F6: the payload waited for, not a stale one of the same shape */
     if (__atomic_load_n(reinterpret_cast<const uint64_t*>(src + total), __ATOMIC_ACQUIRE) != want) return RAD_E_STATE;
+    /* tp8 S6: every part this step's size (parts carry their own rows) */
+    if (*reinterpret_cast<const uint64_t*>(src + total + 8) != rad_pp_layout(bytes, n)) return RAD_E_SHAPE;
     uint64_t off = 0;
     for (int i = 0; i < n; ++i) {
         std::memcpy(a->t[1 + i].data, src + off, (size_t)bytes[i]);

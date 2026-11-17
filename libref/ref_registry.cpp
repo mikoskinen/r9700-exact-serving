@@ -1211,14 +1211,17 @@ static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
 /* ================================================================== the schema table */
 /* ---- the two-node pipeline's crossings (ref_stage.cpp, abi/rad_pp.h) ----------------------
  * `ring` is the core's ring for this crossing on this node (RadPpInfo::ring), a raw pointer the
- * plugin passes; x0..x7 / y0..y7 are the parts, each [M, ...] at its own dtype, packed verbatim. */
+ * plugin passes; x0..x11 / y0..y11 are the parts, each [rows, ...] at its own dtype, packed verbatim
+ * (tp8 S6: a part's rows are its own; part 0's are the header's). */
 static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender") };
 static const RadOperandSpec oStageSend[] = { OPD("ring"), OPD("x0"), OPD_O("x1"), OPD_O("x2"),
                                              OPD_O("x3"), OPD_O("x4"), OPD_O("x5"), OPD_O("x6"),
-                                             OPD_O("x7") };
+                                             OPD_O("x7"), OPD_O("x8"), OPD_O("x9"), OPD_O("x10"),
+                                             OPD_O("x11") };
 static const RadOperandSpec oStageRecv[] = { OPD("ring"), OUT("y0"), OUT_O("y1"), OUT_O("y2"),
                                              OUT_O("y3"), OUT_O("y4"), OUT_O("y5"), OUT_O("y6"),
-                                             OUT_O("y7") };
+                                             OUT_O("y7"), OUT_O("y8"), OUT_O("y9"), OUT_O("y10"),
+                                             OUT_O("y11") };
 
 static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),

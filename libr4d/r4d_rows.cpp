@@ -2226,12 +2226,14 @@ static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts")
 static const RadOperandSpec oStageSend[] = {
     { "ring", RAD_OPD_IN, 0 }, { "x0", RAD_OPD_IN, 0 }, { "x1", RAD_OPD_IN, 1 }, { "x2", RAD_OPD_IN, 1 },
     { "x3", RAD_OPD_IN, 1 }, { "x4", RAD_OPD_IN, 1 }, { "x5", RAD_OPD_IN, 1 }, { "x6", RAD_OPD_IN, 1 },
-    { "x7", RAD_OPD_IN, 1 },
+    { "x7", RAD_OPD_IN, 1 }, { "x8", RAD_OPD_IN, 1 }, { "x9", RAD_OPD_IN, 1 }, { "x10", RAD_OPD_IN, 1 },
+    { "x11", RAD_OPD_IN, 1 },
 };
 static const RadOperandSpec oStageRecv[] = {
     { "ring", RAD_OPD_IN, 0 }, { "y0", RAD_OPD_OUT, 0 }, { "y1", RAD_OPD_OUT, 1 }, { "y2", RAD_OPD_OUT, 1 },
     { "y3", RAD_OPD_OUT, 1 }, { "y4", RAD_OPD_OUT, 1 }, { "y5", RAD_OPD_OUT, 1 }, { "y6", RAD_OPD_OUT, 1 },
-    { "y7", RAD_OPD_OUT, 1 },
+    { "y7", RAD_OPD_OUT, 1 }, { "y8", RAD_OPD_OUT, 1 }, { "y9", RAD_OPD_OUT, 1 }, { "y10", RAD_OPD_OUT, 1 },
+    { "y11", RAD_OPD_OUT, 1 },
 };
 
 static const RadOperandSpec oScatterRows[] = {
