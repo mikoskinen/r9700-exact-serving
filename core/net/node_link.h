@@ -51,6 +51,10 @@ enum FrameKind : uint16_t {
     kBye       = 7,   /* a clean stop */
     kVerbs     = 8,   /* the verbs data path's endpoint (QP, GID, ring addresses and keys) */
     kReady     = 9,   /* rendezvous done on this side; the payload names the side */
+    kKvCap     = 10,  /* before the KV carve: the tokens this node can page (both cap at the least) */
+    kFn4Ask    = 11,  /* leader -> follower: would this node take switch name=value? (seq = ask id) */
+    kFn4Ans    = 12,  /* follower -> leader: the answer to kFn4Ask (aux: 1 takes, 0 serves none, -1 refuses) */
+    kFn4State  = 13,  /* follower -> leader: the switch values the follower applies (after a change) */
     kUser      = 32,  /* first kind a test may use */
 };
 
@@ -100,8 +104,13 @@ struct LinkOpts {
     int  connect_ms    = 600000;  /* how long the leader retries the follower, the follower waits */
     bool crc_data      = false;   /* RADIANCE_PP_CRC_DATA */
     int  poll_us       = 20;      /* the proxy's sleep between scans of idle send rings; 0 spins */
+    /* Robustness 2: the longest this node's own stage may run once its input is there (the
+     * follower: X1 landed -> its X2 published; the leader: a step released -> its X1 published)
+     * before the link goes down naming the stuck stage. 0 = no limit (the rings' device deadline,
+     * RADIANCE_PP_RECV_DEADLINE_MS, alone). RADIANCE_PP_STAGE_MS. */
+    int  stage_ms      = 180000;
     /* The environment's settings over the defaults (RADIANCE_PP_DEAD_MS, _HEARTBEAT_MS,
-     * _CRC_DATA, _POLL_US). */
+     * _CRC_DATA, _POLL_US, _STAGE_MS). */
     static LinkOpts from_env();
 };
 
@@ -111,8 +120,11 @@ class NodeLink {
 public:
     /* The follower listens, the leader connects; both return a link whose threads are not yet
      * running (start()). Null with the reason in `err`. */
+    /* `expect` (robustness 4): the addresses the leader may connect from (--pp-peer resolved); a
+     * connection from any other is closed and the wait goes on. Empty: the first connection. */
     static std::unique_ptr<NodeLink> listen(const std::string& bind_host, int port,
-                                            const LinkOpts& o, std::string* err);
+                                            const LinkOpts& o, std::string* err,
+                                            const std::string& expect = std::string());
     static std::unique_ptr<NodeLink> connect(const std::string& host, int port,
                                              const LinkOpts& o, std::string* err);
     /* For tests: a link over an already connected stream socket. */
@@ -164,6 +176,13 @@ public:
 
     /* Called on the receive thread for every kData frame landed (ring id, seq); tests hook it. */
     std::function<void(int, uint64_t)> on_landed;
+    /* Called on the receive thread for every control frame once started; true consumes it (it is
+     * not queued for recv()). Set before start(). The leader takes the follower's switch answers
+     * and state here (engine_node.cpp). */
+    std::function<bool(Msg&)> on_control;
+    /* The leader: trunk steps released so far. Its X1 for step k is due from then (the stage
+     * watchdog, LinkOpts::stage_ms). */
+    void note_released(uint64_t k) { released_.store(k, std::memory_order_release); }
 
     /* The data path's hand-off: a payload of ring `id` written in full by the NIC (verbs) or the
      * receive thread (TCP); publishes it to the local consumers. Checks order and overrun. */
@@ -175,7 +194,13 @@ public:
 
 private:
     explicit NodeLink(int fd, const LinkOpts& o);
-    int  write_frame(WireHdr& h, const void* a, int64_t na, const void* b, int64_t nb);
+    /* `try_only`: give up (RAD_E_FULL) when another writer holds the socket (the heartbeat). */
+    int  write_frame(WireHdr& h, const void* a, int64_t na, const void* b, int64_t nb, bool try_only = false);
+    /* A frame of at most a few hundred bytes written with a deadline, the socket taken only if it is
+     * free within `lock_ms` (close()'s kBye, fail()'s kAbort): never blocks behind a stuck writer. */
+    void write_bounded(uint16_t kind, const std::string& body, int lock_ms, int send_ms);
+    /* The stage watchdog, from the proxy thread. */
+    void stage_watch();
     int  read_exact(void* p, int64_t n, int idle_ms);
     int  read_frame(Msg* m, bool* is_data, int idle_ms);
     void rx_loop();
@@ -203,6 +228,12 @@ private:
     std::deque<Msg>         q_;
 
     std::atomic<uint64_t>   last_rx_ns_{ 0 }, last_tx_ns_{ 0 };
+    /* Robustness 1: a writer in a frame (holding tx_mu_) and when it last moved a byte. */
+    std::atomic<bool>       tx_busy_{ false };
+    std::atomic<bool>       tx_torn_{ false };   /* a writer gave up mid-frame: no frame may follow */
+    std::atomic<uint64_t>   tx_progress_ns_{ 0 };
+    std::atomic<uint64_t>   released_{ 0 };
+    uint64_t                due_k_ = 0, due_ns_ = 0, watch_ns_ = 0;   /* the proxy thread's */
     std::thread             rx_, proxy_, hb_;
     mutable std::mutex      st_mu_;
     Stats                   st_;
@@ -234,6 +265,10 @@ std::unique_ptr<DataPath> verbs_open(NodeLink& link, const std::string& dev,
 /* Whether this build carries the verbs path, and whether libibverbs loads here. */
 bool verbs_built();
 bool verbs_loadable(std::string* why);
+
+/* Robustness 4: the local address the kernel would send from to reach `host` (no packet sent), ""
+ * when it cannot tell; the follower binds it so it listens only where the leader can reach it. */
+std::string local_address_for(const std::string& host, int port);
 
 /* ------------------------------------------------------------------ rings */
 /* A ring set up over `mem` (at least RAD_PP_RING_HDR + cap bytes, 64-byte aligned). */

@@ -42,6 +42,11 @@ std::vector<std::string> differences(const Facts& mine, const Facts& theirs,
  * cannot be read; `head` > 0 hashes only the first `head` bytes. */
 std::string file_identity(const std::string& path, int64_t head = 0);
 
+/* A file's identity for one too large to read whole at every start (the model, a sidecar): its
+ * size and a CRC-32C of the whole file up to 68 MiB, else of 17 pieces of 4 MiB (the head, the
+ * tail and 15 evenly between); "" when it cannot be read. */
+std::string sampled_identity(const std::string& path);
+
 /* The shared objects loaded from a radiance home (kernels/, architectures/, quantizers/), each
  * "name=identity", sorted by name. */
 std::vector<std::string> loaded_plugin_identities();

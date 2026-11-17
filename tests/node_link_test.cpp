@@ -17,6 +17,9 @@
 #include "net/node_link.h"
 
 #include <signal.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -24,6 +27,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <cstring>
 #include <random>
 #include <string>
@@ -47,14 +51,16 @@ Pair socket_pair(const LinkOpts& o = LinkOpts{}) {
     return p;
 }
 
-/* A ring in plain host memory (the host backend's pinned memory is plain memory too). */
+/* A ring in plain host memory (the host backend's pinned memory is plain memory too), sized as the
+ * engine sizes one: `cap` payload bytes + a part's alignment + the payload's trailer. */
 struct Ring {
     std::vector<uint64_t> mem;
     RadPpRing* r = nullptr;
     Ring(int id, uint64_t cap, int readers, uint64_t deadline_ms = 10000) {
-        mem.assign((RAD_PP_RING_HDR + cap) / 8 + 1, 0);
+        const uint64_t room = cap + RAD_PP_PART_ALIGN + RAD_PP_TRAILER;
+        mem.assign((RAD_PP_RING_HDR + room) / 8 + 1, 0);
         r = reinterpret_cast<RadPpRing*>(mem.data());
-        ring_init(r, id, cap, readers, deadline_ms);
+        ring_init(r, id, room, readers, deadline_ms);
     }
 };
 
@@ -364,6 +370,194 @@ TEST(a_frozen_peer_is_declared_down_after_dead_ms) {
     check_reader_released(c, SIGSTOP, 400, "no frame from the peer");
 }
 
+/* Robustness review finding 1: the peer freezes (SIGSTOP: it stops reading, its kernel keeps the
+ * connection open) while this node writes a crossing larger than both socket buffers (~16 MiB with
+ * gpu02 / gpu03's 4 MiB wmem_max / rmem_max; X1 at 4,160 rows is 42.6 MB). Before the fix the writer
+ * blocked in sendmsg holding the socket, the heartbeat queued behind it and the reader waited out the
+ * ring's deadline (6,003 ms here), a control send and close() blocked. Now: the reader is released
+ * with RAD_E_IO within dead_ms + 1.5 s, a control send fails at once, close() returns. */
+TEST(a_peer_frozen_under_a_crossing_larger_than_the_socket_buffers_is_declared_down) {
+    const int dead_ms = 400;
+    const uint64_t bytes = 42598400ull, cap = 64ull << 20;
+    const int port = 30000 + (int)(getpid() % 15000);
+    pid_t pid = fork();
+    if (pid == 0) {
+        std::string err;
+        std::unique_ptr<NodeLink> f = NodeLink::listen("127.0.0.1", port, fast_opts(dead_ms), &err, "127.0.0.1");
+        if (!f) _exit(3);
+        Ring x1(RAD_PP_X1, cap, 1, 0), x2(RAD_PP_X2, 4096, 0, 0);
+        RadPpRing* fs[RAD_PP_N_RINGS] = { nullptr, x2.r };
+        RadPpRing* fr[RAD_PP_N_RINGS] = { x1.r, nullptr };
+        f->attach(fs, fr);
+        f->start();
+        std::vector<uint8_t> in(cap), out(64, 0x5a);
+        for (uint64_t k = 1;; ++k) {
+            while (__atomic_load_n(&x1.r->landed, __ATOMIC_ACQUIRE) < k) {
+                if (!f->alive()) _exit(0);
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            const uint64_t n = x1.r->bytes - RAD_PP_TRAILER, rows = x1.r->rows;   /* aligned sizes here */
+            if (ring_take(x1.r, 0, in.data(), n, rows) != RAD_OK) _exit(4);
+            if (ring_put(x2.r, out.data(), 64, 1) != RAD_OK) _exit(5);
+        }
+    }
+    REQUIRE(pid > 0);
+    std::string err;
+    std::unique_ptr<NodeLink> L = NodeLink::connect("127.0.0.1", port, fast_opts(dead_ms), &err);
+    if (!L) { kill(pid, SIGKILL); waitpid(pid, nullptr, 0); }
+    REQUIRE(L);
+    Ring x1(RAD_PP_X1, cap, 0, 0), x2(RAD_PP_X2, 4096, 1, 6000);
+    RadPpRing* ls[RAD_PP_N_RINGS] = { x1.r, nullptr };
+    RadPpRing* lr[RAD_PP_N_RINGS] = { nullptr, x2.r };
+    L->attach(ls, lr);
+    L->start();
+    std::vector<uint8_t> big(bytes, 0xab), back(64);
+    CHECK_OK(ring_put(x1.r, big.data(), 1024, 1));   /* one good round */
+    CHECK_OK(ring_take(x2.r, 0, back.data(), 64, 1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    kill(pid, SIGSTOP);
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_OK(ring_put(x1.r, big.data(), bytes, 1));
+    const int take = ring_take(x2.r, 0, back.data(), 64, 1);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr, "    42.6 MB crossing, peer frozen: the reader released after %.0f ms -> %d (%s)\n", ms, take,
+            L->why().c_str());
+    CHECK_EQ(take, RAD_E_IO);
+    CHECK(ms < dead_ms + 1500);
+    CHECK(!L->alive());
+    auto ctl = std::async(std::launch::async, [&] { return L->send(kStep, 9, 0, "x", 1); });
+    CHECK(ctl.wait_for(std::chrono::milliseconds(1500)) == std::future_status::ready);
+    auto cl = std::async(std::launch::async, [&] { L->close("the leader is stopping"); return 0; });
+    CHECK(cl.wait_for(std::chrono::milliseconds(1500)) == std::future_status::ready);
+    kill(pid, SIGKILL);
+    waitpid(pid, nullptr, 0);
+    if (ctl.valid()) CHECK_EQ(ctl.get(), RAD_E_IO);
+    if (cl.valid()) (void)cl.get();
+    /* The writer's own limit, without the heartbeat (a link not started): a peer that never reads
+     * fails a 64 MiB frame dead_ms after the last byte it accepted, instead of blocking for ever. */
+    Pair p = socket_pair(fast_opts(300));
+    REQUIRE(p.a && p.b);
+    std::vector<uint8_t> blob(64ull << 20, 1);
+    const auto t1 = std::chrono::steady_clock::now();
+    CHECK_EQ(p.a->send(kUser, 1, 0, blob.data(), (int64_t)blob.size()), RAD_E_IO);
+    const double ms1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    fprintf(stderr, "    a 64 MiB frame to a peer that never reads: failed after %.0f ms: %s\n", ms1, p.a->why().c_str());
+    CHECK(ms1 < 300 + 1000);
+    CHECK(p.a->why().find("accepted no byte") != std::string::npos);
+}
+
+/* Robustness review finding 2: a node whose own stage never finishes while its host still sends
+ * heartbeats (a hung kernel) takes the link down after RADIANCE_PP_STAGE_MS, naming it, instead of the
+ * peer's cards waiting out the rings' deadline. The follower owes X2 once X1 landed; the leader owes X1
+ * once it released a step. */
+TEST(a_stage_that_never_finishes_takes_the_link_down_after_stage_ms) {
+    LinkOpts o = fast_opts(2000);
+    o.stage_ms = 300;
+    {
+        Pair p = socket_pair(o);
+        REQUIRE(p.a && p.b);
+        Ring a_x1(RAD_PP_X1, 4096, 0, 0), b_x1(RAD_PP_X1, 4096, 1, 0), b_x2(RAD_PP_X2, 4096, 0, 0),
+            a_x2(RAD_PP_X2, 4096, 1, 0);
+        RadPpRing* as[RAD_PP_N_RINGS] = { a_x1.r, nullptr };
+        RadPpRing* ar[RAD_PP_N_RINGS] = { nullptr, a_x2.r };
+        RadPpRing* bs[RAD_PP_N_RINGS] = { nullptr, b_x2.r };
+        RadPpRing* br[RAD_PP_N_RINGS] = { b_x1.r, nullptr };
+        p.a->attach(as, ar);
+        p.b->attach(bs, br);
+        p.a->start();
+        p.b->start();
+        uint8_t buf[64] = {};
+        p.a->note_released(1);
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK_OK(ring_put(a_x1.r, buf, 64, 1));   /* the leader's X1: it lands on the follower */
+        /* The follower's stage never publishes its X2. */
+        Msg m;
+        CHECK_EQ(p.b->recv(&m, 3000), RAD_E_IO);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "    follower stage stuck: down after %.0f ms: %s\n", ms, p.b->why().c_str());
+        CHECK(p.b->why().find("RADIANCE_PP_STAGE_MS") != std::string::npos);
+        CHECK(p.b->why().find("X2") != std::string::npos);
+        CHECK(ms >= 290 && ms < 1500);
+        CHECK_EQ(p.a->recv(&m, 3000), RAD_E_IO);   /* the leader is told */
+        CHECK(p.a->why().find("RADIANCE_PP_STAGE_MS") != std::string::npos);
+    }
+    {
+        Pair p = socket_pair(o);
+        REQUIRE(p.a && p.b);
+        Ring a_x1(RAD_PP_X1, 4096, 0, 0), a_x2(RAD_PP_X2, 4096, 1, 0);
+        RadPpRing* as[RAD_PP_N_RINGS] = { a_x1.r, nullptr };
+        RadPpRing* ar[RAD_PP_N_RINGS] = { nullptr, a_x2.r };
+        p.a->attach(as, ar);
+        p.a->start();
+        p.b->start();
+        p.a->note_released(1);   /* a released step whose X1 never comes */
+        Msg m;
+        CHECK_EQ(p.a->recv(&m, 3000), RAD_E_IO);
+        CHECK(p.a->why().find("X1 for a step it released") != std::string::npos);
+    }
+    {
+        /* A stage that finishes within the limit: nothing happens. */
+        Pair p = socket_pair(o);
+        REQUIRE(p.a && p.b);
+        Ring a_x1(RAD_PP_X1, 4096, 0, 0), b_x1(RAD_PP_X1, 4096, 0, 0);   /* no local reader on b */
+        RadPpRing* as[RAD_PP_N_RINGS] = { a_x1.r, nullptr };
+        RadPpRing* br[RAD_PP_N_RINGS] = { b_x1.r, nullptr };
+        RadPpRing* none[RAD_PP_N_RINGS] = { nullptr, nullptr };
+        p.a->attach(as, none);
+        p.b->attach(none, br);
+        p.a->start();
+        p.b->start();
+        uint8_t buf[64] = {};
+        for (uint64_t k = 1; k <= 5; ++k) {
+            p.a->note_released(k);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            CHECK_OK(ring_put(a_x1.r, buf, 64, 1));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        CHECK(p.a->alive() && p.b->alive());
+        CHECK_EQ(b_x1.r->landed, 5ull);
+    }
+}
+
+/* Robustness review finding 4: the follower takes the leader's connection only from --pp-peer's
+ * address; any other is closed and the wait goes on. */
+TEST(the_follower_takes_a_connection_only_from_its_peer_address) {
+    const int port = 20000 + (int)((getpid() * 7) % 20000);
+    std::unique_ptr<NodeLink> fol;
+    std::string ferr;
+    std::thread t([&] { fol = NodeLink::listen("127.0.0.1", port, fast_opts(2000), &ferr, "127.0.0.2"); });
+    auto dial = [&](const char* from) {
+        const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_in src{};
+        src.sin_family = AF_INET;
+        inet_pton(AF_INET, from, &src.sin_addr);
+        (void)bind(fd, (sockaddr*)&src, sizeof src);
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons((uint16_t)port);
+        inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
+        for (int i = 0; i < 100 && ::connect(fd, (sockaddr*)&dst, sizeof dst) != 0; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return fd;
+    };
+    const int stranger = dial("127.0.0.1");
+    char c = 0;
+    pollfd pf{ stranger, POLLIN, 0 };
+    CHECK(poll(&pf, 1, 3000) == 1);
+    CHECK_EQ(read(stranger, &c, 1), (ssize_t)0);   /* closed by the follower */
+    close(stranger);
+    const int leader = dial("127.0.0.2");
+    t.join();
+    REQUIRE(fol);
+    WireHdr h{};
+    h.kind = kHello;
+    raw_frame(leader, h, "the leader");
+    Msg m;
+    CHECK_OK(fol->recv(&m, 2000));
+    CHECK(std::string(m.body.begin(), m.body.end()) == "the leader");
+    close(leader);
+}
+
 TEST(a_clean_close_says_so_and_an_abort_carries_its_reason) {
     {
         Pair p = socket_pair(fast_opts());
@@ -439,10 +633,11 @@ TEST(an_overrun_a_skipped_payload_and_a_foreign_ring_take_the_link_down) {
 }
 
 TEST(a_ring_refuses_a_payload_past_its_capacity_and_a_reader_of_the_wrong_shape) {
-    Ring s(RAD_PP_X1, 128, 1);
-    uint8_t buf[256] = {};
-    CHECK_EQ(ring_put(s.r, buf, 256, 1), RAD_E_FULL);
+    Ring s(RAD_PP_X1, 128, 1);   /* 128 + 256 + 64 bytes: one aligned part of up to 384 B and its trailer */
+    uint8_t buf[1024] = {};
+    CHECK_EQ(ring_put(s.r, buf, 1024, 1), RAD_E_FULL);
     CHECK_OK(ring_put(s.r, buf, 64, 3));
+    CHECK_EQ(s.r->bytes, (uint64_t)(RAD_PP_PART_ALIGN + RAD_PP_TRAILER));   /* the trailer travels with it */
     /* A host-only loop-back: the reader of the same ring sees it as landed once copied over. */
     __atomic_store_n(&s.r->landed, 1ull, __ATOMIC_RELEASE);
     CHECK_EQ(ring_take(s.r, 0, buf, 64, 4), RAD_E_SHAPE);   /* rows 3, not 4 */
@@ -450,6 +645,25 @@ TEST(a_ring_refuses_a_payload_past_its_capacity_and_a_reader_of_the_wrong_shape)
     /* The next take waits for payload 2 and runs into the deadline. */
     s.r->deadline_ms = 30;
     CHECK_EQ(ring_take(s.r, 0, buf, 64, 3), RAD_E_NOTFOUND);
+}
+
+/* Review F6: a payload whose header is this step's (rows, bytes) but whose trailer is not the number
+ * waited for -- stale bytes, or a ring written over -- is refused, never copied. */
+TEST(a_stale_payload_of_the_same_shape_is_refused_by_its_trailer) {
+    Ring s(RAD_PP_X1, 4096, 1);
+    std::vector<uint8_t> a(1000, 0x11), b(1000, 0);
+    CHECK_OK(ring_put(s.r, a.data(), a.size(), 7));
+    __atomic_store_n(&s.r->sent, 1ull, __ATOMIC_RELEASE);
+    __atomic_store_n(&s.r->landed, 1ull, __ATOMIC_RELEASE);
+    CHECK_OK(ring_take(s.r, 0, b.data(), b.size(), 7));
+    CHECK(a == b);
+    /* Payload 2 "lands" (the counter) while the ring still holds payload 1's bytes and trailer. */
+    __atomic_store_n(&s.r->landed, 2ull, __ATOMIC_RELEASE);
+    CHECK_EQ(ring_take(s.r, 0, b.data(), b.size(), 7), RAD_E_STATE);
+    CHECK_EQ(s.r->taken[0], 1ull);   /* not counted as taken */
+    /* The real payload 2 is taken. */
+    CHECK_OK(ring_put(s.r, a.data(), a.size(), 7));
+    CHECK_OK(ring_take(s.r, 0, b.data(), b.size(), 7));
 }
 
 TEST(the_verbs_path_is_absent_or_loads_by_name) {

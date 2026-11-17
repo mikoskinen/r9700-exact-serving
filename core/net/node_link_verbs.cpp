@@ -363,13 +363,26 @@ public:
                            (unsigned long long)seq, strerror(errno)));
             return RAD_E_IO;
         }
-        /* Wait for the payload's completion: the send ring is then free for the next stage_send. */
+        /* Wait for the payload's completion: the send ring is then free for the next stage_send. A
+         * completion that never comes (a local HCA that stopped; RC retries give an error completion
+         * for a silent remote, ~0.54 s) takes the link down after dead_ms (robustness 2). */
+        const uint64_t t0 = rad_mono_ns();
+        const uint64_t limit = (uint64_t)link_.opts().dead_ms * 1000000ull;
+        uint32_t spins = 0;
         for (;;) {
             if (stop_.load(std::memory_order_acquire)) return RAD_E_IO;
             ibv_wc wc{};
             const int n = ibv_poll_cq(scq_, 1, &wc);
             if (n < 0) { link_.fail("verbs: polling the send completions failed"); return RAD_E_IO; }
-            if (n == 0) { __builtin_ia32_pause(); continue; }
+            if (n == 0) {
+                if ((++spins & 1023u) == 0 && rad_mono_ns() - t0 > limit) {
+                    link_.fail(fmt("verbs: crossing %d payload %llu has no send completion after %d ms", id,
+                                   (unsigned long long)seq, link_.opts().dead_ms));
+                    return RAD_E_IO;
+                }
+                __builtin_ia32_pause();
+                continue;
+            }
             if (wc.status != IBV_WC_SUCCESS) {
                 link_.fail(fmt("verbs: crossing %d payload %llu completed with %s", id,
                                (unsigned long long)seq, ibv().wc_status_str(wc.status)));
@@ -430,6 +443,17 @@ private:
                                    (unsigned long long)mb[0], (unsigned long long)landed));
                     return;
                 }
+                /* Robustness 7 / review F6: the NIC wrote this payload over the last one; every local
+                 * reader must have taken that one already (the one-lane schedule guarantees it). A
+                 * reader still behind means a torn payload: loud, never silent. S5's lanes need a real
+                 * receive credit instead. */
+                for (uint64_t k = 0; k < r->n_ranks && k < RAD_PP_MAX_RANKS; ++k)
+                    if (__atomic_load_n(&r->taken[k], __ATOMIC_ACQUIRE) < landed) {
+                        link_.fail(fmt("verbs: crossing %d: payload %llu landed while local rank %llu had not taken "
+                                       "payload %llu (a ring overrun)", id, (unsigned long long)mb[0],
+                                       (unsigned long long)k, (unsigned long long)landed));
+                        return;
+                    }
                 if (link_.land(id, mb[0], mb[1], mb[2], mb[3]) < 0) return;
                 if (post_recvs(1) < 0) { link_.fail("verbs: re-posting a receive failed"); return; }
             }

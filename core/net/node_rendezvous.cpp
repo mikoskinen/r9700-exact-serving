@@ -119,6 +119,34 @@ std::string file_identity(const std::string& path, int64_t head) {
     return fmt("%08x-%llu", c, (unsigned long long)size);
 }
 
+std::string sampled_identity(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return "";
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return ""; }
+    const int64_t size = (int64_t)std::ftell(f);
+    const int64_t piece = int64_t(4) << 20;
+    const int kPieces = 17;
+    std::vector<char> buf(1 << 20);
+    uint32_t c = 0;
+    auto hash = [&](int64_t at, int64_t n) {
+        if (std::fseek(f, (long)at, SEEK_SET) != 0) return;
+        while (n > 0) {
+            const size_t got = std::fread(buf.data(), 1, (size_t)std::min<int64_t>(n, (int64_t)buf.size()), f);
+            if (got == 0) break;
+            c = crc32c(buf.data(), got, c);
+            n -= (int64_t)got;
+        }
+    };
+    if (size <= piece * kPieces) {
+        hash(0, size);
+    } else {
+        /* the head, the tail and 15 pieces evenly between, each 4 MiB */
+        for (int k = 0; k < kPieces; ++k) hash((size - piece) / (kPieces - 1) * k, piece);
+    }
+    std::fclose(f);
+    return fmt("%08x-%llu%s", c, (unsigned long long)size, size <= piece * kPieces ? "" : "-s17x4M");
+}
+
 std::vector<std::string> loaded_plugin_identities() {
     std::map<std::string, std::string> found;
     dl_iterate_phdr([](dl_phdr_info* info, size_t, void* ud) -> int {

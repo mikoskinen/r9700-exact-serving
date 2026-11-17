@@ -11,6 +11,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -99,6 +100,10 @@ const char* frame_name(uint16_t k) {
         case kBye: return "bye";
         case kVerbs: return "verbs";
         case kReady: return "ready";
+        case kKvCap: return "kv-cap";
+        case kFn4Ask: return "fn4-ask";
+        case kFn4Ans: return "fn4-answer";
+        case kFn4State: return "fn4-state";
         default: return k >= kUser ? "user" : "unknown";
     }
 }
@@ -124,6 +129,7 @@ LinkOpts LinkOpts::from_env() {
     o.crc_data = env_int("RADIANCE_PP_CRC_DATA", 0, 0, 1) == 1;
     o.poll_us = env_int("RADIANCE_PP_POLL_US", o.poll_us, 0, 100000);
     o.connect_ms = env_int("RADIANCE_PP_CONNECT_MS", o.connect_ms, 100, 86400000);
+    o.stage_ms = env_int("RADIANCE_PP_STAGE_MS", o.stage_ms, 0, 86400000);
     return o;
 }
 
@@ -174,8 +180,55 @@ static std::string addr_str(const sockaddr_storage& a) {
     return fmt("%s:%d", h, port);
 }
 
+static std::string ip_str(const sockaddr_storage& a) {
+    char h[INET6_ADDRSTRLEN] = "";
+    if (a.ss_family == AF_INET) inet_ntop(AF_INET, &((const sockaddr_in*)&a)->sin_addr, h, sizeof h);
+    else if (a.ss_family == AF_INET6) inet_ntop(AF_INET6, &((const sockaddr_in6*)&a)->sin6_addr, h, sizeof h);
+    return h;
+}
+
+/* Every address `host` resolves to, as text. */
+static std::vector<std::string> ips_of(const std::string& host) {
+    std::vector<std::string> out;
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return out;
+    for (addrinfo* r = res; r; r = r->ai_next) {
+        sockaddr_storage a{};
+        std::memcpy(&a, r->ai_addr, std::min<size_t>(r->ai_addrlen, sizeof a));
+        const std::string ip = ip_str(a);
+        if (!ip.empty() && std::find(out.begin(), out.end(), ip) == out.end()) out.push_back(ip);
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
+std::string local_address_for(const std::string& host, int port) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* res = nullptr;
+    const std::string ps = std::to_string(port > 0 ? port : 9);
+    if (host.empty() || getaddrinfo(host.c_str(), ps.c_str(), &hints, &res) != 0 || !res) return "";
+    std::string out;
+    const int fd = socket(res->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+        /* A datagram socket's connect sends nothing: it only picks the route and the source address. */
+        if (::connect(fd, res->ai_addr, res->ai_addrlen) == 0) {
+            sockaddr_storage a{};
+            socklen_t l = sizeof a;
+            if (getsockname(fd, (sockaddr*)&a, &l) == 0) out = ip_str(a);
+        }
+        ::close(fd);
+    }
+    freeaddrinfo(res);
+    return out;
+}
+
 std::unique_ptr<NodeLink> NodeLink::listen(const std::string& bind_host, int port,
-                                           const LinkOpts& o, std::string* err) {
+                                           const LinkOpts& o, std::string* err, const std::string& expect) {
     sockaddr_storage a{};
     socklen_t al = 0;
     if (!resolve(bind_host.empty() ? "0.0.0.0" : bind_host, port, &a, &al, err)) return nullptr;
@@ -193,8 +246,14 @@ std::unique_ptr<NodeLink> NodeLink::listen(const std::string& bind_host, int por
         ::close(ls);
         return nullptr;
     }
-    RAD_INFO("node link: waiting on %s for the leader (up to %d s)", addr_str(a).c_str(),
-             o.connect_ms / 1000);
+    const std::vector<std::string> allowed = expect.empty() ? std::vector<std::string>() : ips_of(expect);
+    if (!expect.empty() && allowed.empty()) {
+        *err = fmt("cannot resolve the leader's address %s (--pp-peer)", expect.c_str());
+        ::close(ls);
+        return nullptr;
+    }
+    RAD_INFO("node link: waiting on %s for the leader%s%s (up to %d s)", addr_str(a).c_str(),
+             expect.empty() ? "" : " from ", expect.c_str(), o.connect_ms / 1000);
     const uint64_t end = now_ns() + (uint64_t)o.connect_ms * 1000000ull;
     int fd = -1;
     while (fd < 0) {
@@ -217,6 +276,15 @@ std::unique_ptr<NodeLink> NodeLink::listen(const std::string& bind_host, int por
             *err = fmt("accept: %s", strerror(errno));
             ::close(ls);
             return nullptr;
+        }
+        /* Robustness 4: only the leader named by --pp-peer; a probe, a scan or a stale container of
+         * another run is turned away and the wait goes on. */
+        if (!allowed.empty() && std::find(allowed.begin(), allowed.end(), ip_str(pa)) == allowed.end()) {
+            RAD_WARN("node link: a connection from %s is not the leader (--pp-peer %s): closed, still waiting",
+                     addr_str(pa).c_str(), expect.c_str());
+            ::close(fd);
+            fd = -1;
+            continue;
         }
         RAD_INFO("node link: the leader connected from %s", addr_str(pa).c_str());
     }
@@ -263,6 +331,11 @@ std::unique_ptr<NodeLink> NodeLink::adopt(int fd, const LinkOpts& o) {
 
 NodeLink::NodeLink(int fd, const LinkOpts& o) : fd_(fd), o_(o) {
     last_rx_ns_ = last_tx_ns_ = now_ns();
+    /* Robustness 1(c): unacknowledged data to a host that is gone, or a zero window that never
+     * opens, closes the connection a second after dead_ms (the writer's own check comes first). Not a
+     * TCP socket (a test's socket pair): refused, harmless. */
+    const unsigned int ut = (unsigned int)o_.dead_ms + 1000u;
+    (void)setsockopt(fd_, IPPROTO_TCP, TCP_USER_TIMEOUT, &ut, sizeof ut);
 }
 
 NodeLink::~NodeLink() {
@@ -318,21 +391,10 @@ void NodeLink::fail(const std::string& why, bool from_peer) {
         if (recv_[i]) __atomic_store_n(&recv_[i]->abort, 1ull, __ATOMIC_RELEASE);
     }
     /* Tell the peer, unless it told us or a writer holds the socket (it then fails on the
-     * shutdown below, and the peer sees the connection close). */
-    if (!from_peer && !stopping_.load(std::memory_order_acquire) && fd_ >= 0 && tx_mu_.try_lock()) {
-        WireHdr h{};
-        h.kind = kAbort;
-        h.bytes = why.size();
-        h.flags = kFlagCrc;
-        h.crc_payload = crc32c(why.data(), why.size());
-        seal(&h);
-        iovec v[2] = { { &h, sizeof h }, { (void*)why.data(), why.size() } };
-        msghdr mh{};
-        mh.msg_iov = v;
-        mh.msg_iovlen = why.empty() ? 1 : 2;
-        (void)sendmsg(fd_, &mh, MSG_NOSIGNAL | MSG_DONTWAIT);
-        tx_mu_.unlock();
-    }
+     * shutdown below, and the peer sees the connection close). The frame goes out whole or not at
+     * all within 100 ms (robustness 6: a partial one loses the reason). */
+    if (!from_peer && !stopping_.load(std::memory_order_acquire) && fd_ >= 0)
+        write_bounded(kAbort, why, 0, 100);
     if (fd_ >= 0) (void)shutdown(fd_, SHUT_RDWR);
     if (dp_) dp_->stop();
     q_cv_.notify_all();
@@ -343,11 +405,9 @@ void NodeLink::fail(const std::string& why, bool from_peer) {
 
 void NodeLink::close(const char* reason) {
     if (!stopping_.exchange(true)) {
-        if (alive() && fd_ >= 0) {
-            WireHdr h{};
-            h.kind = kBye;
-            (void)write_frame(h, reason, (int64_t)std::strlen(reason), nullptr, 0);
-        }
+        /* Robustness 1(d): the kBye never waits behind a stuck writer: the socket is taken if free
+         * within 200 ms and the frame written within 500 ms, else the peer sees the close. */
+        if (alive() && fd_ >= 0) write_bounded(kBye, reason, 200, 500);
         {
             std::lock_guard<std::mutex> lk(why_mu_);
             if (why_.empty()) why_ = reason;
@@ -367,7 +427,7 @@ void NodeLink::close(const char* reason) {
 }
 
 /* ------------------------------------------------------------------ writing */
-int NodeLink::write_frame(WireHdr& h, const void* a, int64_t na, const void* b, int64_t nb) {
+int NodeLink::write_frame(WireHdr& h, const void* a, int64_t na, const void* b, int64_t nb, bool try_only) {
     if (na < 0 || nb < 0) return RAD_E_INVAL;
     h.bytes = (uint64_t)(na + nb);
     if (h.flags & kFlagCrc) {
@@ -376,38 +436,106 @@ int NodeLink::write_frame(WireHdr& h, const void* a, int64_t na, const void* b, 
         h.crc_payload = c;
     }
     seal(&h);
-    std::unique_lock<std::mutex> lk(tx_mu_);
+    std::unique_lock<std::mutex> lk(tx_mu_, std::defer_lock);
+    if (try_only) {
+        if (!lk.try_lock()) return RAD_E_FULL;
+    } else {
+        lk.lock();
+    }
     if (down_.load(std::memory_order_acquire) && h.kind != kBye) return RAD_E_IO;
+    if (tx_torn_.load(std::memory_order_acquire)) return RAD_E_IO;
     iovec v[3] = { { &h, sizeof h }, { const_cast<void*>(a), (size_t)na },
                    { const_cast<void*>(b), (size_t)nb } };
     int iv = 0, niv = 1 + (na > 0 ? 1 : 0) + (nb > 0 ? 1 : 0);
     if (na <= 0 && nb > 0) v[1] = v[2];
-    int64_t left = (int64_t)sizeof h + na + nb;
+    const int64_t total = (int64_t)sizeof h + na + nb;
+    int64_t left = total;
+    /* Robustness 1(a): never block in the socket. A peer that stopped reading but keeps its
+     * connection (a frozen process, a paused container, a host that hangs) fills both socket
+     * buffers (~16 MiB on gpu02 / gpu03) and then accepts nothing: after dead_ms without a byte
+     * accepted the link goes down here, whatever the frame's size. */
+    const uint64_t stall_ns = (uint64_t)o_.dead_ms * 1000000ull;
+    uint64_t moved = now_ns();
+    tx_progress_ns_.store(moved, std::memory_order_relaxed);
+    tx_busy_.store(true, std::memory_order_release);
+    auto give_up = [&](const std::string& why) {
+        if (left < total) tx_torn_.store(true, std::memory_order_release);
+        tx_busy_.store(false, std::memory_order_release);
+        lk.unlock();
+        if (h.kind != kBye) fail(why);
+        return RAD_E_IO;
+    };
     while (left > 0) {
         msghdr mh{};
         mh.msg_iov = v + iv;
         mh.msg_iovlen = (size_t)(niv - iv);
-        const ssize_t n = sendmsg(fd_, &mh, MSG_NOSIGNAL);
+        const ssize_t n = sendmsg(fd_, &mh, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN) { std::this_thread::yield(); continue; }
-            const std::string why = fmt("sending a %s frame: %s", frame_name(h.kind), strerror(errno));
-            lk.unlock();
-            if (h.kind != kBye) fail(why);
-            return RAD_E_IO;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                const uint64_t t = now_ns();
+                if (t - moved > stall_ns)
+                    return give_up(fmt("sending a %s frame: the peer accepted no byte for %d ms with %lld of %lld "
+                                       "bytes left (dead after %d ms): it stopped reading", frame_name(h.kind),
+                                       (int)((t - moved) / 1000000ull), (long long)left, (long long)total,
+                                       o_.dead_ms));
+                if (stopping_.load(std::memory_order_acquire) || (down_.load(std::memory_order_acquire) && h.kind != kBye))
+                    return give_up("the link went down during a send");
+                pollfd pf{ fd_, POLLOUT, 0 };
+                (void)poll(&pf, 1, 20);
+                continue;
+            }
+            return give_up(fmt("sending a %s frame: %s", frame_name(h.kind), strerror(errno)));
         }
         left -= n;
         size_t k = (size_t)n;
         while (iv < niv && k >= v[iv].iov_len) { k -= v[iv].iov_len; ++iv; }
         if (iv < niv) { v[iv].iov_base = (char*)v[iv].iov_base + k; v[iv].iov_len -= k; }
-        last_tx_ns_.store(now_ns(), std::memory_order_relaxed);
+        moved = now_ns();
+        last_tx_ns_.store(moved, std::memory_order_relaxed);
+        tx_progress_ns_.store(moved, std::memory_order_relaxed);
     }
+    tx_busy_.store(false, std::memory_order_release);
     lk.unlock();
     std::lock_guard<std::mutex> sl(st_mu_);
     ++st_.frames_out;
     st_.bytes_out += sizeof h + (uint64_t)(na + nb);
     if (h.kind == kData) ++st_.data_out;
     return RAD_OK;
+}
+
+void NodeLink::write_bounded(uint16_t kind, const std::string& body, int lock_ms, int send_ms) {
+    std::unique_lock<std::mutex> lk(tx_mu_, std::defer_lock);
+    const uint64_t t0 = now_ns();
+    while (!lk.try_lock()) {
+        if (now_ns() - t0 >= (uint64_t)lock_ms * 1000000ull) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (tx_torn_.load(std::memory_order_acquire)) return;   /* mid-frame: a frame now would be garbage */
+    WireHdr h{};
+    h.kind = kind;
+    h.bytes = body.size();
+    h.flags = kFlagCrc;
+    h.crc_payload = crc32c(body.data(), body.size());
+    seal(&h);
+    std::string fr((const char*)&h, sizeof h);
+    fr += body;
+    size_t off = 0;
+    const uint64_t t1 = now_ns();
+    while (off < fr.size()) {
+        const ssize_t n = ::send(fd_, fr.data() + off, fr.size() - off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (now_ns() - t1 >= (uint64_t)send_ms * 1000000ull) break;
+            pollfd pf{ fd_, POLLOUT, 0 };
+            (void)poll(&pf, 1, 10);
+            continue;
+        }
+        break;
+    }
+    if (off > 0 && off < fr.size()) tx_torn_.store(true, std::memory_order_release);
+    if (off > 0) last_tx_ns_.store(now_ns(), std::memory_order_relaxed);
 }
 
 int NodeLink::send(uint16_t kind, uint64_t seq, uint64_t aux, const void* p, int64_t n) {
@@ -585,6 +713,7 @@ void NodeLink::rx_loop() {
             fail("the peer stopped: " + std::string(m.body.begin(), m.body.end()), true);
             return;
         }
+        if (on_control && on_control(m)) continue;
         {
             std::lock_guard<std::mutex> lk(q_mu_);
             q_.push_back(std::move(m));
@@ -639,6 +768,7 @@ int NodeLink::recv(Msg* m, int timeout_ms) {
 void NodeLink::proxy_loop() {
     uint32_t idle = 0;
     while (!stopping_.load(std::memory_order_acquire) && alive()) {
+        stage_watch();
         bool moved = false;
         for (int id = 0; id < RAD_PP_N_RINGS; ++id) {
             RadPpRing* r = send_[id];
@@ -658,8 +788,9 @@ void NodeLink::proxy_loop() {
                 for (RadPpRing* q : { send_[k], recv_[k] })
                     if (q && __atomic_load_n(&q->abort, __ATOMIC_ACQUIRE)) {
                         fail(fmt("crossing %d's stage op on this node gave up (abort word %llu: 3 a "
-                                 "deadline, 4 a payload of another step): payload %llu of crossing %d "
-                                 "is not sent", k, (unsigned long long)q->abort, (unsigned long long)rd, id));
+                                 "deadline, 4 a payload of another step, 5 a stale payload): payload %llu "
+                                 "of crossing %d is not sent", k, (unsigned long long)q->abort,
+                                 (unsigned long long)rd, id));
                         return;
                     }
             if (send_data(id, r) < 0) return;
@@ -685,11 +816,7 @@ void NodeLink::hb_loop() {
     while (!stopping_.load(std::memory_order_acquire) && alive()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1, o_.heartbeat_ms / 2)));
         const uint64_t t = now_ns();
-        if (t - last_tx_ns_.load(std::memory_order_relaxed) >= hb) {
-            WireHdr h{};
-            h.kind = kHeartbeat;
-            if (write_frame(h, nullptr, 0, nullptr, 0) < 0) return;
-        }
+        /* Robustness 1(b): the silence check first, never behind the socket's lock. */
         const uint64_t rx = last_rx_ns_.load(std::memory_order_relaxed);
         if (t > rx && t - rx > dead) {
             fail(fmt("no frame from the peer for %llu ms (heartbeat every %d ms, dead after %d ms): "
@@ -697,7 +824,52 @@ void NodeLink::hb_loop() {
                      o_.heartbeat_ms, o_.dead_ms));
             return;
         }
+        /* A writer that moved no byte for dead_ms (+ 1 s slack: it checks itself first). */
+        const uint64_t tp = tx_progress_ns_.load(std::memory_order_relaxed);
+        if (tx_busy_.load(std::memory_order_acquire) && t > tp && t - tp > dead + 1000000000ull) {
+            fail(fmt("a frame write moved no byte for %llu ms: the peer stopped reading",
+                     (unsigned long long)((t - tp) / 1000000ull)));
+            return;
+        }
+        if (t - last_tx_ns_.load(std::memory_order_relaxed) >= hb) {
+            WireHdr h{};
+            h.kind = kHeartbeat;
+            /* Only when the socket is free: a writer holding it sends bytes, which are this node's
+             * heartbeat to the peer's receive thread. */
+            if (write_frame(h, nullptr, 0, nullptr, 0, true) == RAD_E_IO) return;
+        }
     }
+}
+
+/* Robustness 2: this node's own stage owes a crossing payload -- the follower an X2 for an X1 that
+ * landed, the leader an X1 for a step it released -- for longer than stage_ms: its cards (a kernel
+ * that never ends) or its host are stuck while the heartbeats still flow. The link goes down
+ * naming it, instead of the peer's cards waiting out the rings' device deadline (600 s). */
+void NodeLink::stage_watch() {
+    if (o_.stage_ms <= 0) return;
+    const uint64_t t = now_ns();
+    if (t - watch_ns_ < 10000000ull) return;   /* every 10 ms */
+    watch_ns_ = t;
+    uint64_t due = 0, done = 0;
+    const char* what = nullptr;
+    if (send_[RAD_PP_X2] && recv_[RAD_PP_X1]) {
+        due = __atomic_load_n(&recv_[RAD_PP_X1]->landed, __ATOMIC_ACQUIRE);
+        done = __atomic_load_n(&send_[RAD_PP_X2]->ready, __ATOMIC_ACQUIRE);
+        what = "X2 for an X1 that landed";
+    } else if (send_[RAD_PP_X1]) {
+        due = released_.load(std::memory_order_acquire);
+        done = __atomic_load_n(&send_[RAD_PP_X1]->ready, __ATOMIC_ACQUIRE);
+        what = "X1 for a step it released";
+    } else {
+        return;
+    }
+    const uint64_t want = done + 1;
+    if (due < want) { due_k_ = 0; return; }
+    if (due_k_ != want) { due_k_ = want; due_ns_ = t; return; }
+    if (t - due_ns_ > (uint64_t)o_.stage_ms * 1000000ull)
+        fail(fmt("this node's stage has owed its %s (payload %llu) for %llu ms, past RADIANCE_PP_STAGE_MS=%d: "
+                 "its cards or its host are stuck", what, (unsigned long long)want,
+                 (unsigned long long)((t - due_ns_) / 1000000ull), o_.stage_ms));
 }
 
 /* ================================================================== rings */
@@ -712,7 +884,7 @@ void ring_init(RadPpRing* r, int id, uint64_t cap, int n_ranks, uint64_t deadlin
 
 int ring_put(RadPpRing* r, const void* p, uint64_t bytes, uint64_t rows) {
     if (!r || r->magic != RAD_PP_RING_MAGIC) return RAD_E_STATE;
-    if (bytes > r->cap) return RAD_E_FULL;
+    if (rad_pp_align(bytes) + RAD_PP_TRAILER > r->cap) return RAD_E_FULL;
     /* One slot: the link must have sent the last payload before this one overwrites it. */
     const uint64_t t0 = now_ns();
     while (__atomic_load_n(&r->sent, __ATOMIC_ACQUIRE) < r->ready) {
@@ -721,12 +893,17 @@ int ring_put(RadPpRing* r, const void* p, uint64_t bytes, uint64_t rows) {
         std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
     if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
-    std::memcpy((char*)r + RAD_PP_RING_HDR, p, (size_t)bytes);
+    char* const dst = (char*)r + RAD_PP_RING_HDR;
+    std::memcpy(dst, p, (size_t)bytes);
+    /* review F6: the payload's number in the trailer at its aligned end, as the stage ops write it */
+    const uint64_t at = rad_pp_align(bytes), seq = r->ready + 1;
+    std::memset(dst + at, 0, RAD_PP_TRAILER);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(dst + at), seq, __ATOMIC_RELEASE);
     r->rows = rows;
-    r->bytes = bytes;
+    r->bytes = at + RAD_PP_TRAILER;
     r->parts = 1;
     r->part_bytes[0] = bytes;
-    __atomic_store_n(&r->ready, r->ready + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&r->ready, seq, __ATOMIC_RELEASE);
     return RAD_OK;
 }
 
@@ -741,8 +918,11 @@ int ring_take(RadPpRing* r, int rank, void* p, uint64_t bytes, uint64_t rows) {
         if (now_ns() - t0 > dl) return RAD_E_NOTFOUND;
         if (++spins > 256) std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
-    if (r->rows != rows || r->bytes != bytes) return RAD_E_SHAPE;
-    std::memcpy(p, (const char*)r + RAD_PP_RING_HDR, (size_t)bytes);
+    const uint64_t at = rad_pp_align(bytes);
+    if (r->rows != rows || r->bytes != at + RAD_PP_TRAILER) return RAD_E_SHAPE;
+    const char* const src = (const char*)r + RAD_PP_RING_HDR;
+    if (__atomic_load_n(reinterpret_cast<const uint64_t*>(src + at), __ATOMIC_ACQUIRE) != want) return RAD_E_STATE;
+    std::memcpy(p, src, (size_t)bytes);
     __atomic_store_n(&r->taken[rank], want, __ATOMIC_RELEASE);
     return RAD_OK;
 }
