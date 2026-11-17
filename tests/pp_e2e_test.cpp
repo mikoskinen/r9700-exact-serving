@@ -1033,6 +1033,54 @@ TEST(a_cold_prompt_at_two_lanes_is_one_processes_tokens_and_chunk_plan) {
     }
 }
 
+/* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1 on the leader): a cold multi-chunk prompt at 2 and 3 lanes with the prefill
+ * timeline on serves one process's tokens and plan, and the leader prints the prompt's timeline line once its first
+ * token is in -- as many chunks as the plan has, every head after the first read from its events (the host backend's
+ * events carry host stamps), nothing dropped -- and its per-chunk lines. */
+TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(977, 1000);
+    std::vector<int32_t> ref;
+    std::vector<std::pair<int, int>> ref_plan;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        ref = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    CHECK(ref_plan.size() >= 4);
+    for (const char* lanes : { "2", "3" })
+    for (const char* cut : { "0,2", "1,3" }) {
+        Serving sv;
+        REQUIRE(sv.start(cut, { "--max-num-seqs", "6", "--pp-lanes", lanes },
+                         cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_PP_PF_TIMELINE=1" })));
+        const std::vector<int32_t> got = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        const std::string llog = sv.lead.output();
+        CHECK(chunks_of(llog) == ref_plan);
+        CHECK(!ref.empty());
+        CHECK(got == ref);
+        CHECK(llog.find("RADIANCE_PP_PF_TIMELINE=1 -- a lone prefill's chunks are timed") != std::string::npos);
+        const size_t tl = llog.find("prefill timeline (RADIANCE_PP_PF_TIMELINE=1");
+        CHECK(tl != std::string::npos);
+        if (tl == std::string::npos) continue;
+        const std::string line = llog.substr(tl, llog.find('\n', tl) - tl);
+        char want_n[96], want_h[48];
+        std::snprintf(want_n, sizeof want_n, ", %zu chunks, %zu rows;", ref_plan.size(), p.size());
+        std::snprintf(want_h, sizeof want_h, "(%zu; ", ref_plan.size());
+        CHECK(line.find(want_n) != std::string::npos);
+        CHECK(line.find(want_h) != std::string::npos);   /* every head read */
+        CHECK(line.find("events dropped 0, unread 0") != std::string::npos);
+        CHECK(llog.find("prefill timeline request ") != std::string::npos);   /* the per-chunk lines */
+        fprintf(stderr, "    %s lanes W(%s): tokens %s, plan %s\n    %s\n", lanes, cut, got == ref ? "identical" : "DIFFERENT",
+                chunks_of(llog) == ref_plan ? "identical" : "DIFFERENT", line.c_str());
+    }
+}
+
 /* (review of S6) The prefix hit across the cut with the KV copy on (RADIANCE_LLAMA_PP_KVCOPY + RADIANCE_PP_KV_CHECK=1):
  * the second request's hit reuses blocks whose copied layer the follower wrote in the first request's steps, and every
  * check over the handed-out blocks finds the copy = the owner's; and RADIANCE_PP_PREFIX_CACHE=0 (S4's rule, both nodes):
