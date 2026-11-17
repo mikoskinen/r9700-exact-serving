@@ -630,3 +630,32 @@ TEST(rswa_flat_kv_bytes_after_prefill_plus_128) {
 }
 
 RAD_TEST_MAIN()
+
+/* tp8 S5 review: a pipeline lane lends its newcomer's next chunk [p, p + n) while its own chunk
+ * [c, p) of this step has not run, and ensures the lent chunk's KV at lend time
+ * (Scheduler::lane_split_own: ensure_from(seq, p + n, p)). That ensure recycles a fixed window
+ * group below p - window. Without a keep floor (the sequence's first lend) it dropped the blocks of
+ * [c, p): the home chunk's keys and its queries' window, gone before it runs. With the floor at the
+ * committed end set first (set_keep_floor(seq, c)), the blocks the home chunk needs stay. */
+TEST(a_lend_time_ensure_keeps_the_home_chunk_window_under_the_keep_floor) {
+    const KVGroupInfo grp = window_group(16, 64);
+    const std::vector<KVGroupInfo> g = groups_of(grp);
+    Config cfg = window_config();
+    cfg.max_tok = 256;
+    for (int floor_first = 0; floor_first < 2; ++floor_first) {
+        Pools pools;
+        CHECK_OK(configure_pools(pools, cfg));
+        KVManager kv;
+        CHECK_OK(kv.configure(g, cfg, pools.kv()));
+        CHECK_OK(kv.add_sequence(1));
+        CHECK_OK(kv.ensure(1, 256, 0));                 /* the home's own chunk [0, 256), planned */
+        CHECK_EQ(kv.first_block_pos(1, G_WIN), 0ll);
+        if (floor_first) kv.set_keep_floor(1, 0);       /* the committed end: nothing ran yet */
+        CHECK_OK(kv.ensure(1, 512, 256));               /* the lent chunk [256, 512), at lend time */
+        fprintf(stderr, "    keep floor %s the lend-time ensure: the window group's table starts at %lld\n",
+                floor_first ? "before" : "after", (long long)kv.first_block_pos(1, G_WIN));
+        if (floor_first) CHECK_EQ(kv.first_block_pos(1, G_WIN), 0ll);   /* [0, 256) keeps every block */
+        else             CHECK(kv.first_block_pos(1, G_WIN) > 0);         /* the bug this order avoids */
+        kv.free_sequence(1);
+    }
+}

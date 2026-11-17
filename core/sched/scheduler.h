@@ -1165,7 +1165,7 @@ private:
         int32_t lent = 0, lent_pending = 0;   /* the request's lane fields before the cut */
         bool    lent_tok = false, lent_hold = false;
         int64_t lent_next = -1;
-        int64_t rows = 0;                     /* rows lent (the whole chunks after the home's) */
+        int64_t rows = 0;                     /* rows lent */
         bool    tok = false;
         std::vector<std::pair<int, int32_t>> to;   /* (borrower, piece's first position) */
     };
