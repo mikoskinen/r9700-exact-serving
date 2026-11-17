@@ -1720,10 +1720,11 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { int lanes; const char* cut; };
-    for (const Arm a : { Arm{ 3, "0,2" }, Arm{ 2, "0,2" }, Arm{ 3, "1,3" } }) {
+    struct Arm { int lanes; const char* cut; int k; };
+    for (const Arm a : { Arm{ 3, "0,2", 1 }, Arm{ 2, "0,2", 1 }, Arm{ 3, "1,3", 1 }, Arm{ 4, "0,2", 2 }, Arm{ 4, "1,3", 2 } }) {
         std::vector<std::string> env = kSplitEnv;
-        for (const char* v : { "RADIANCE_PP_BG_LANE=1", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        for (const char* v : { "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
         std::vector<std::string> ex = ext;
@@ -1743,19 +1744,19 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
             if (ref[i] != got[i]) ++differ;
         }
         long long bg = -1, passes = -1, parts = -1, between = -1, held = -1;
-        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE=1, tp8 dev M8): "); at != std::string::npos)
-            bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE=1, tp8 dev M8): "));
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE, tp8 dev M8): "));
         if (const size_t at = flog.rfind(" passes ran in "); at != std::string::npos)
             if (const size_t b = flog.rfind("follower: ", at); b != std::string::npos)
                 (void)std::sscanf(flog.c_str() + b, "follower: %lld passes ran in %lld segments, %lld other passes between their "
                                                     "segments, %lld held", &passes, &parts, &between, &held);
-        fprintf(stderr, "    BG lane, %d lanes W(%s): %d of %zu requests differ; %lld newcomers lent whole; follower %lld passes in "
-                        "%lld segments, %lld passes between; pieces lent %lld\n", a.lanes, a.cut, differ, ref.size(), bg, passes,
+        fprintf(stderr, "    BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld newcomers lent whole; follower %lld passes in "
+                        "%lld segments, %lld passes between; pieces lent %lld\n", a.k, a.lanes, a.cut, differ, ref.size(), bg, passes,
                 parts, between, log_count(llog, "newcomer split: "));
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
-        CHECK(llog.find("is a background prefill lane (RADIANCE_PP_BG_LANE=1, tp8 dev M8)") != std::string::npos);
-        CHECK(flog.find("and every pass of the BG lane") != std::string::npos);
+        CHECK(llog.find("are background prefill lanes (RADIANCE_PP_BG_LANE=") != std::string::npos);
+        CHECK(flog.find("and every pass of the BG lane(s)") != std::string::npos);
         CHECK(bg > 0);
         CHECK(passes > 0);
     }

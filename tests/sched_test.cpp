@@ -13886,13 +13886,14 @@ TEST(lanes_lend_split_cuts_a_whole_mixed_newcomer_on_the_512_grid_and_lends_its_
  * (each lane's idle followers planned right behind it). */
 TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
     struct Env {
-        Env() { setenv("RADIANCE_PP_BG_LANE", "1", 1); }
         ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); }
     } env;
     struct Arm { int64_t len; bool head; };
+    for (const int k : { 1, 2 })
     for (const Arm a : { Arm{ 1100, false }, Arm{ 700, false }, Arm{ 2266, false }, Arm{ 1100, true } }) {
+        setenv("RADIANCE_PP_BG_LANE", k == 1 ? "1" : "2", 1);
         std::vector<int64_t> ends_1;
-        for (int lanes : { 1, 2, 3 }) {
+        for (int lanes : { 1, k + 1, k + 2 }) {
             DstSwitches restore;
             Lanes L;
             L.grid = 2048;
@@ -13904,9 +13905,9 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
             REQUIRE_EQ(L.start(lanes), RAD_OK);
             L.set.set_head_state(a.head);
             CHECK(DstSwitches::set("sched_bi_chunk", 3));
-            const int bg = L.set.bg_lane(), nd = bg >= 0 ? lanes - 1 : lanes;
-            CHECK_EQ(bg, lanes >= 2 ? lanes - 1 : -1);
-            for (int k = 0; k < 8; ++k) CHECK(L.set.pick() != bg || bg < 0);
+            const int bg = L.set.bg_lane(), nd = lanes - L.set.bg_n();
+            CHECK_EQ(bg, lanes > k ? lanes - k : -1);
+            for (int q = 0; q < 8; ++q) CHECK(!L.set.is_bg(L.set.pick()));
             std::vector<uint64_t> dec[3];
             for (int i = 0; i < 8; ++i) {
                 const int l = i % nd;
@@ -13936,12 +13937,12 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                     for (const StepEntry& e : pl.e) {
                         if (p && e.seq == p && e.is_prefill) {
                             ends.push_back((int64_t)e.ctx_len + e.n_tokens);
-                            if (l != bg && pl.phase == RAD_PHASE_MIXED && e.produces_token) ++home_mixed_with_p;
+                            if (!L.set.is_bg(l) && pl.phase == RAD_PHASE_MIXED && e.produces_token) ++home_mixed_with_p;
                         }
                         if (p && e.seq == p && !e.is_prefill && l == 0) ++p_decoded;
-                        if (l == bg && e.home < 0) ++bg_own;
+                        if (L.set.is_bg(l) && e.home < 0) ++bg_own;
                     }
-                    if (l == bg) {
+                    if (L.set.is_bg(l)) {
                         ++bg_steps;
                         bg_not_prefill += pl.phase != RAD_PHASE_PREFILL;
                     } else if (p && rp && rp->n_computed < a.len) {
@@ -13975,8 +13976,8 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                 /* the BG lane's steps are lone prefill steps of lent pieces only; its own requests: none */
                 CHECK_EQ(bg_not_prefill, 0);
                 CHECK_EQ(bg_own, 0);
-                /* (2266 at three lanes: the cold path lends its 218-row rest to the other decode lane in D's 2048 step) */
-                if (a.len <= 2048 || lanes == 2) {
+                /* (2266 beside a second decode lane: the cold path lends its 218-row rest to it in D's 2048 step) */
+                if (a.len <= 2048 || nd == 1) {
                     CHECK(bg_steps > 0);
                     CHECK(c.bg > 0);
                 }
@@ -13987,9 +13988,9 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                 }
             }
             CHECK_EQ(short_steps, 0);
-            fprintf(stderr, "    BG lane, a %lld-token newcomer%s, %d lane(s): ends%s (one lane:%s); %lld lent whole to the BG lane "
+            fprintf(stderr, "    BG lanes %d, a %lld-token newcomer%s, %d lane(s): ends%s (one lane:%s); %lld lent whole to a BG lane "
                             "(%lld rows), BG steps %d; home MIXED steps with its token %d; decoders in every step: %s; decoded %d\n",
-                    (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
+                    k, (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
                     [&] { std::string s; for (int64_t x : ends_1) s += fmt(" %lld", (long long)x); return s; }().c_str(),
                     (long long)c.bg, (long long)c.bg_rows, bg_steps, home_mixed_with_p, short_steps ? "NO" : "yes", p_decoded);
         }
