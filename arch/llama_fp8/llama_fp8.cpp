@@ -45,6 +45,8 @@
 #include <cstring>
 #include <vector>
 
+#include "rad_pp.h"
+
 #include <arch/rad_arch.h>
 #include <arch/rad_block_attn_fp8.h>
 #include <arch/rad_block_dspark.h>
@@ -99,6 +101,19 @@ struct Model {
     rad_op op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_gather = 0, op_logits = 0;
 
     std::vector<Layer> layers;
+
+    /* tp8 S4: a node of a two-node pipeline (abi/rad_pp.h), W(h, t): the leader (rank 0) holds
+     * the embedding, layers [0, h) and [t, n) and the head, the follower layers [h, t). Off (pp
+     * false) on one machine, and then nothing below is declared or issued. A crossing carries what
+     * the receiving side's next op reads: the residual stream, and where that op folds the
+     * previous block's delta into it (layer_fold's mix_fold) the delta too, so the receiving
+     * layer's norm adds them as it does in one process. */
+    bool     pp = false;
+    int      pp_rank = 0, pp_h = 0, pp_t = 0;
+    std::vector<char> held;              /* per trunk layer: declared and run on this node */
+    rad_op   op_x1 = 0, op_x2 = 0;       /* stage_send / stage_recv of each crossing */
+    int      parts_x1 = 0, parts_x2 = 0; /* 1: the stream; 2: the stream and the pending delta */
+    RadPpRing* ring[RAD_PP_N_RINGS] = {};
 };
 
 static Model g_model[MAX_RANKS];
@@ -322,6 +337,40 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     Geom&  g  = m.g;
     Names& nm = m.nm;
     m.n_main  = g.n_layer;
+    m.held.assign((size_t)m.n_main, 1);
+    {
+        const RadPpInfo pp = rad_pp_query();
+        if (pp.nodes == 2) {
+            if (pp.cut_h < 0 || pp.cut_t <= pp.cut_h || pp.cut_t > m.n_main) {
+                fprintf(stderr, "radiance: llama: --pp-cut %d,%d is not a range of this model's %lld "
+                                "layers\n", pp.cut_h, pp.cut_t, (long long)m.n_main);
+                return RAD_E_INVAL;
+            }
+            /* World 2 defers each block's all-reduce into the next block's norm (layer_fold), so the
+             * delta at the cut would be each rank's own partial: not yet carried. */
+            if (g.world == 2) {
+                fprintf(stderr, "radiance: llama: a two-node pipeline at --tp 2 is not supported (the "
+                                "cut would carry each rank's partial sum); use --tp 1 or 4\n");
+                return RAD_E_UNSUPPORTED;
+            }
+            m.pp = true;
+            m.pp_rank = pp.rank;
+            m.pp_h = pp.cut_h;
+            m.pp_t = pp.cut_t;
+            int64_t n_held = 0;
+            for (int64_t l = 0; l < m.n_main; ++l) {
+                m.held[(size_t)l] = ((l >= m.pp_h && l < m.pp_t) == (m.pp_rank == 1)) ? 1 : 0;
+                n_held += m.held[(size_t)l];
+            }
+            /* Every node binds a layer to the KV group, whose block size comes off its attention
+             * op (rad_kv_block_size): a leader of W(0, n) would hold none. */
+            if (n_held == 0) {
+                fprintf(stderr, "radiance: llama: --pp-cut %d,%d leaves the %s no trunk layer; each node "
+                                "holds at least one\n", m.pp_h, m.pp_t, m.pp_rank == 0 ? "leader" : "follower");
+                return RAD_E_UNSUPPORTED;
+            }
+        }
+    }
 
     /* The rotary width is the whole head unless `partial_rotary_factor` says otherwise (Phi-style
      * models set it). A config that states nothing means the full head. */
@@ -391,6 +440,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
+    if (m.pp && m.n_taps > 0) {
+        fprintf(stderr, "radiance: llama: a drafter's taps in a two-node pipeline are not supported in "
+                        "this build; serve without --num-speculative-tokens or the drafter\n");
+        return RAD_E_UNSUPPORTED;
+    }
+    const bool shell = !m.pp || m.pp_rank == 0;   /* embedding, head and logits: the leader's */
+    if (shell) {
     m.b_logits = decl_b(b, nm.f("logits"),   RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
 
@@ -425,6 +481,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                           RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
                                RAD_NOWEIGHTS),
                            {m.b_x}, {m.b_x});
+    }
 
     AttnFP8::Wire aw{};
     aw.x = m.b_x; aw.h = m.a_h; aw.qkv = m.b_qkv; aw.q = m.b_q; aw.attn = m.a_attn;
@@ -433,6 +490,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     m.layers.resize((size_t)m.n_main);
     for (int64_t l = 0; l < m.n_main; ++l) {
+        if (!m.held[(size_t)l]) continue;
         Layer& lay = m.layers[(size_t)l];
         /* Residual fold and collective placement: rad_fp8.h, layer_fold. */
         const LayerFold f = layer_fold(g, l, m.n_main, m.tap_layer, m.n_taps, m.op_embed_ar != 0);
@@ -457,6 +515,41 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                      f.mlp_ar_in, f.mlp_ar_out));
     }
 
+    /* tp8 S4: the crossings. X1 enters the follower's first layer h, X2 the leader's layer t;
+     * each carries the stream and, where that layer's norm folds the previous block's delta in,
+     * the delta (a_h.x) -- the layer is declared with the same fold as in one process, so it adds
+     * the same two operands. Declared on both nodes in the same shape, so the rendezvous can
+     * compare them. */
+    if (m.pp) {
+        auto parts_at = [&](int64_t first) {
+            if (first <= 0 || first >= m.n_main) return 1;
+            return layer_fold(g, first, m.n_main, m.tap_layer, m.n_taps, m.op_embed_ar != 0).mix_fold ? 2 : 1;
+        };
+        m.parts_x1 = parts_at(m.pp_h);
+        m.parts_x2 = parts_at(m.pp_t);
+        const int64_t row = g.n_embd * (int64_t)rad_dtype_bytes(rad_dtype_parse(g.dtype), 1);
+        rad_pp_declare_crossing(RAD_PP_X1, row * m.parts_x1, m.parts_x1);
+        rad_pp_declare_crossing(RAD_PP_X2, row * m.parts_x2, m.parts_x2);
+        const rad_buf p2[2] = { m.b_x, m.a_h.x };
+        auto stage = [&](const char* op, int ring, int parts, bool send) {
+            rad_op h = RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", ring),
+                                                RAD_INT("parts", parts)),
+                              RAD_NOWEIGHTS);
+            if (h == RAD_NULL_HANDLE) return h;
+            if (send) rad_op_reads(b, h, p2, parts);
+            else      rad_op_writes(b, h, p2, parts);
+            return h;
+        };
+        const bool lead = m.pp_rank == 0;
+        m.op_x1 = stage(lead ? "stage_send" : "stage_recv", RAD_PP_X1, m.parts_x1, lead);
+        m.op_x2 = stage(lead ? "stage_recv" : "stage_send", RAD_PP_X2, m.parts_x2, !lead);
+        rad_note(b, "two-node pipeline (tp8 S4): the %s of W(%d,%d) holds layers %s; X1 carries %d and "
+                    "X2 %d part(s) of [rows, %lld] %s", lead ? "leader" : "follower", m.pp_h, m.pp_t,
+                 lead ? "outside the cut, the embedding and the head" : "inside the cut", m.parts_x1,
+                 m.parts_x2, (long long)g.n_embd, g.dtype);
+    }
+
+    if (shell) {
     m.op_final_norm = rw(b, RAD_OP(b, "rmsnorm",
                              RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
                                         RAD_F64("eps", g.eps), RAD_F64("wadd", 0.0),
@@ -474,6 +567,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                     RAD_INT("n_embd", g.n_embd), RAD_STR("dtype", g.dtype)),
                          RAD_WEIGHTS(m.w_lm_head)),
                      {m.b_hout}, {m.b_logits});
+    }
 
     /* The drafter is declared last, after `op_logits`. Do not move it.
      *
@@ -538,14 +632,43 @@ static void step(RadCtx* c, const RadBatch* batch) {
         return;
     }
 
+    const int64_t T = batch->n_tok;
+    /* tp8 S4: a crossing's issue: the core's ring, then the stream and, folded, the delta. */
+    auto cross = [&](rad_op op, int ring, int parts) {
+        if (!m.ring[ring]) {
+            const RadPpInfo pp = rad_pp_query();
+            m.ring[ring] = pp.ring[ring];
+        }
+        if (!m.ring[ring]) {
+            rad_step_fail(c, "two-node pipeline: the core set up no ring for this crossing");
+            return;
+        }
+        if (parts == 2)
+            RAD_ISSUE(c, op, praw(m.ring[ring], RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T));
+        else
+            RAD_ISSUE(c, op, praw(m.ring[ring], RAD_U8, 1), brows(m.b_x, T));
+    };
+    if (!m.pp || m.pp_rank == 0) {
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
               brows(m.b_x, batch->n_tok));
     if (m.op_embed_ar && !ar_wire_is_exact(m.g, batch->n_tok))
         RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
                     brows(m.b_x, batch->n_tok), RAD_NONE);
+    }
+    /* The follower starts at its first layer from the leader's X1. */
+    if (m.pp && m.pp_rank == 1) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
 
     for (size_t li = 0; li < m.layers.size(); ++li) {
+        if (m.pp) {
+            /* The leader hands over before layer h and takes the follower's result back at t; the
+             * follower's last layer hands its result back. */
+            if (m.pp_rank == 0 && (int64_t)li == m.pp_h) {
+                cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+                cross(m.op_x2, RAD_PP_X2, m.parts_x2);
+            }
+            if (!m.held[li]) continue;
+        }
         m.layers[li].attn.step(c, batch);
         m.layers[li].mlp.step(c, batch);
         /* The tap, into its column slice. Runs on prefill and decode alike: the drafter
@@ -557,6 +680,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
         }
     }
 
+    if (m.pp && m.pp_rank == 1) {
+        cross(m.op_x2, RAD_PP_X2, m.parts_x2);
+        return;
+    }
+    /* A cut at the last layer: the leader's X2 arrives after the loop. */
+    if (m.pp && m.pp_rank == 0 && m.pp_h >= (int)m.layers.size()) {
+        cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+        cross(m.op_x2, RAD_PP_X2, m.parts_x2);
+    }
     RAD_ISSUE(c, m.op_final_norm,
               brows(m.b_x, batch->n_tok), RAD_W(m.w_out_norm), brows(m.a_h.x, batch->n_tok));
     if (batch->n_out > 0) {

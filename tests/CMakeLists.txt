@@ -358,7 +358,7 @@ set(RAD_E2E_DEPS radiance rad-convert rad-sidecar libref libquant nemotron35_emb
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test)
+foreach(t engine_e2e_test pp_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
@@ -385,6 +385,10 @@ endforeach()
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+# tp8 S4: the two-node pipeline as two processes over localhost TCP (tests/pp_e2e_test.cpp).
+if(TARGET pp_e2e_test)
+  set_tests_properties(pp_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 600)
 endif()
 if(TARGET clef_decision_test)
   set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
