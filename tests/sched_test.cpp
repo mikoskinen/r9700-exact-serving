@@ -12730,6 +12730,8 @@ struct Lanes {
      * slide), its pool `win_pool` blocks (0: the fake's default); `seqs` the cards (--max-num-seqs) */
     int64_t win = 0, win_pool = 0, seqs = 6;
     int win_g = -1;
+    /* tp8 loop M2: the step budget, context and stager floor (the DS line's 4160 / 1024 for lever DST's cases) */
+    int64_t max_tok = 64, max_ctx = 1024, stage_rows = 0;
     ~Lanes() { for (auto& s : more) s->fini(); s0.fini(); }
     Scheduler& at(int l) { return l == 0 ? s0 : *more[(size_t)(l - 1)]; }
     int start(int n, int64_t split_min = 16) {
@@ -12759,9 +12761,9 @@ struct Lanes {
             win_g = (int)prog.kv_groups.size();
             prog.kv_groups.push_back(w);
         }
-        cfg.max_tok = 64;
+        cfg.max_tok = max_tok;
         cfg.max_seqs = seqs;
-        cfg.max_ctx = 1024;
+        cfg.max_ctx = max_ctx;
         cfg.prefix_cache = false;
         cfg.prefill_room_gate = false;
         cfg.n_spec = 0;
@@ -12783,6 +12785,8 @@ struct Lanes {
         }
         set.init(all);
         set.set_split(true, split_min);
+        if (stage_rows > 0)
+            for (Scheduler* l : all) l->set_stage_rows(stage_rows);
         return RAD_OK;
     }
     uint64_t submit(int lane, int n_prompt, int max_tokens, int base = 1000) {
@@ -13392,5 +13396,100 @@ TEST(lanes_span_off_runs_a_lone_prompt_in_interval_chunks_over_the_lanes) {
                                           "%lld lent\n", n_prompt, ref_s.size(), ref_i.size(), got.size(), (long long)c.pieces);
         }
         CHECK(ref_i.size() > ref_s.size());
+    }
+}
+
+/* tp8 loop M2 (the 20:58 PROFILE: no lane step for 320-430 ms after every MIXED step): lever DST under lanes. A newcomer
+ * that joins a lane beside decode rows is cut by option D on sched_mixed_tok's grid (576 -> 512-row pieces), one piece a
+ * home-lane step, the same boundaries one lane plans (the plan is a function of the switches, not of the decode rows
+ * beside it); the other lane plans a decode step with every one of its decoders every round meanwhile, so on the cards its
+ * passes run between the newcomer's pieces instead of behind one whole-prompt MIXED pass. D's pieces are not the alone
+ * chunk: never lent (counted off the one-process grid). */
+TEST(lanes_dst_cuts_a_newcomer_beside_decode_rows_on_its_grid_while_the_other_lane_decodes) {
+    std::vector<int64_t> ref;
+    for (int lanes : { 1, 2 }) {
+        DstSwitches restore;
+        Lanes L;
+        L.grid = 2048;
+        L.cfg.prefill_span = 2;
+        L.max_tok = 4160;
+        L.max_ctx = 60000;
+        L.stage_rows = 1024;
+        L.seqs = 12;
+        REQUIRE_EQ(L.start(lanes), RAD_OK);
+        L.set.set_lend_busy(false);                  /* RADIANCE_PP_LEND_BUSY=0 */
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        CHECK(DstSwitches::set("sched_mixed_tok", 576));
+        std::vector<uint64_t> dec[2];
+        for (int i = 0; i < 8; ++i) {
+            const int l = lanes == 1 ? 0 : i % 2;
+            dec[l].push_back(L.submit(l, 100, 4000, 2000 + 100 * i));
+        }
+        uint64_t p = 0;
+        std::vector<int64_t> ends;
+        int other_steps = 0, other_short = 0;
+        std::vector<int> fifo;
+        std::vector<char> busy((size_t)lanes, 0);
+        int next = 0;
+        for (int round = 0; round < 3000; ++round) {
+            if (round == 4) p = L.submit(0, 20000, 4);
+            const Request* rp = p ? L.req(0, p) : nullptr;
+            if (rp && rp->n_computed >= 20000) break;
+            std::vector<int> todo;
+            for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+            for (size_t at = 0; at < todo.size(); ++at) {
+                const int l = todo[at];
+                if (busy[(size_t)l]) continue;
+                std::vector<int> order;
+                for (int j = 1; j < lanes; ++j)
+                    if (!busy[(size_t)((l + j) % lanes)]) order.push_back((l + j) % lanes);
+                for (int f : fifo) order.push_back(f);
+                if (!L.plan(l, order)) continue;
+                for (const StepEntry& e : L.at(l).plan().e)
+                    if (p && e.seq == p && e.is_prefill) ends.push_back((int64_t)e.ctx_len + e.n_tokens);
+                if (l == 1 && p && rp && rp->n_computed < 20000) {
+                    ++other_steps;
+                    int rows = 0;
+                    for (const StepEntry& e : L.at(1).plan().e)
+                        for (uint64_t d : dec[1]) rows += e.seq == d && !e.is_prefill;
+                    other_short += rows != (int)dec[1].size();
+                }
+                busy[(size_t)l] = 1;
+                fifo.push_back(l);
+                next = (l + 1) % lanes;
+            }
+            if (fifo.empty()) break;
+            const int l = fifo.front();
+            fifo.erase(fifo.begin());
+            CHECK_OK(L.commit(l, 5));
+            busy[(size_t)l] = 0;
+        }
+        REQUIRE(p != 0);
+        REQUIRE(L.req(0, p) != nullptr);
+        CHECK_EQ(L.req(0, p)->n_computed, (int64_t)20000);
+        int off = 0;
+        for (size_t i = 0; i < ends.size(); ++i) {
+            const int64_t n = ends[i] - (i ? ends[i - 1] : 0);
+            /* every end on the 512 grid; the last piece whole where a cut would leave < 128 rows (D's rule) */
+            off += ends[i] == 20000 ? !(n < 512 + 128) : !(n <= 512 && ends[i] % 512 == 0);
+        }
+        if (off) {
+            std::string t;
+            for (size_t i = 0; i < ends.size(); ++i) t += fmt(" %lld", (long long)ends[i]);
+            fprintf(stderr, "    %d lane(s) ends:%s\n", lanes, t.c_str());
+        }
+        CHECK_EQ(off, 0);
+        CHECK(ends.size() >= 20000 / 512);
+        if (lanes == 1) ref = ends;
+        else {
+            CHECK(ends == ref);
+            CHECK(other_steps >= (int)ends.size() - 1);   /* lane 1 decodes every round the newcomer's pieces run */
+            CHECK_EQ(other_short, 0);
+            CHECK_EQ(L.set.counts().pieces, 0);
+            fprintf(stderr, "    2 lanes, sched_mixed_tok 576: the 20000-token newcomer in %zu pieces (one lane's %zu), lane 1 "
+                            "planned %d decode steps meanwhile with all %zu of its decoders each, %lld off-grid (not lent)\n",
+                    ends.size(), ref.size(), other_steps, dec[1].size(),
+                    (long long)L.set.counts().why[LaneSet::kOffGrid]);
+        }
     }
 }

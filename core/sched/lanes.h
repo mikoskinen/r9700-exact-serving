@@ -79,6 +79,13 @@ public:
      * boundary, the plan the one-process grid's (Scheduler::alone_spans). */
     bool span_on() const { return span_on_; }
     void set_span(bool on) { span_on_ = on; }
+    /* tp8 loop M2 (RADIANCE_PP_LEND_BUSY=0): a chunk is lent only to a lane with no request of its own running or
+     * waiting. Lent into a lane that decodes, a whole chunk is planned first in that lane's step (lane_reserve) and its
+     * decoders ride a MIXED step of up to 2,048 rows: the stall the 20:58 PROFILE measured, now in the lane that had
+     * none; and the prompt's plan is no longer the one a lane of decoders plans (lever DST / option D cut it on its grid
+     * beside decode rows, whatever their count). Default 1: lent within the borrower's room, as before. */
+    bool lend_busy() const { return lend_busy_; }
+    void set_lend_busy(bool on) { lend_busy_ = on; }
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
     void set_split(bool on, int64_t min_rows) { split_on_ = on; split_min_ = min_rows > 0 ? min_rows : split_min_; }
@@ -112,12 +119,13 @@ public:
      *   kKv        its KV (the window group from the keep floor) was refused (lends never preempt);
      *   kNoLane    every lane that plans before the home plans again has a chunk of it already;
      *   kHold      a plan that left the sequence out, waiting for a lent snapshot's commit (lent_hold);
-     *   kWinWait   a plan in which its next home chunk waited for its lent chunks (KV refused while they hold it). */
-    enum { kOffGrid, kSnap, kWideBusy, kRoom, kKv, kNoLane, kHold, kWinWait, kWhyN };
+     *   kWinWait   a plan in which its next home chunk waited for its lent chunks (KV refused while they hold it);
+     *   kBusy      the next planner runs requests of its own and RADIANCE_PP_LEND_BUSY=0 (lend_busy). */
+    enum { kOffGrid, kSnap, kWideBusy, kRoom, kKv, kNoLane, kHold, kWinWait, kBusy, kWhyN };
     static const char* why_name(int k) {
         static const char* const n[kWhyN] = { "off the one-process grid", "a snapshot at h > 0", "wide vs a busy lane",
                                               "borrower room", "KV refused", "no lane left", "held for a snapshot's commit",
-                                              "waited for its lent chunks' window" };
+                                              "waited for its lent chunks' window", "a borrower with requests of its own" };
         return k >= 0 && k < kWhyN ? n[k] : "?";
     }
     void note_why_locked(int k) { if (k >= 0 && k < kWhyN) ++why_[k]; }
@@ -153,6 +161,7 @@ private:
     mutable std::atomic<uint64_t> rr_{ 0 };
     bool    split_on_ = true;
     bool    span_on_ = true;                /* RADIANCE_PP_SPAN (span_on) */
+    bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
     int64_t split_min_ = 128;
     bool    head_state_ = false;
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0;
