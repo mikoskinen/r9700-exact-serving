@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <string>
 #include <utility>
+#include <tuple>
 #include <vector>
 
 namespace rad {
@@ -298,6 +299,46 @@ inline int crossings(const Geo& g, int h, int t, Crossing out[2], std::string* e
             return -1;
         }
     }
+    return 0;
+}
+
+/* tp8 dev M4 (loop FINDINGS F12): a follower segment boundary s of W(h, t), h < s < t. The follower's pass runs [h, s), then
+ * other lanes' passes, then [s, t) -- and those passes rewrite the step's activations. The segment before s saves (and the
+ * one from s restores) on this node what is read at or after s of what [h, s) computed:
+ *   - what a cut W(s, t)'s X1 would carry into layer s -- the residual (the boundary op's inputs), the selections, the keep
+ *     words layers [s, t) read -- without its kv source: this node holds its caches and its copies;
+ *   - what this pass's X2 (at t) ships that a layer below s computed: its kv source's new entries (the latent / index-key /
+ *     page planes keep the last source the follower computed until X2's send: no source lies in [s, t) then), its
+ *     selections and keep words when their layer is below s.
+ * Missing the second half is F12: at W(10,32) X2 ships layer 20's entries, a decode pass between segments after 20 rewrote
+ * the planes, and the leader's copy of source 20 took that pass's rows. 0 with *out, or -1 with the reason. */
+inline int segment_crossing(const Geo& g, int h, int s, int t, Crossing* out, std::string* err) {
+    if (s <= h || s >= t) {
+        *err = "a segment boundary " + std::to_string(s) + " outside (" + std::to_string(h) + ", " + std::to_string(t) + ")";
+        return -1;
+    }
+    Crossing whole[2], at_s[2];
+    if (crossings(g, h, t, whole, err) < 0 || crossings(g, s, t, at_s, err) < 0) return -1;
+    Crossing c = at_s[0];
+    c.src = -1;
+    c.latent = c.index = false;
+    const Crossing& x2 = whole[1];
+    if (x2.src >= 0 && x2.src < s) {
+        c.src = x2.src;
+        c.latent = x2.latent;
+        c.index = x2.index;
+    }
+    for (const auto& [mine, theirs, what] : { std::tuple<int*, int, const char*>{ &c.sel, x2.sel, "selections" },
+                                              std::tuple<int*, int, const char*>{ &c.keep, x2.keep, "keep words" } }) {
+        if (theirs < 0 || theirs >= s) continue;
+        if (*mine >= 0 && *mine != theirs) {   /* one plane holds the last one below s: both are it on every cut that parses */
+            *err = "segment boundary " + std::to_string(s) + " of W(" + std::to_string(h) + "," + std::to_string(t) +
+                   ") would save the " + what + " of layers " + std::to_string(*mine) + " and " + std::to_string(theirs);
+            return -1;
+        }
+        *mine = theirs;
+    }
+    *out = c;
     return 0;
 }
 

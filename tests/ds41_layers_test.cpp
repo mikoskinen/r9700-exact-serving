@@ -399,4 +399,77 @@ TEST(layers_m56_lanes_head_tail_reads) {
     CHECK(clean > 0);
 }
 
+/* tp8 dev M4 (loop FINDINGS F12): a follower segment boundary s of W(h, t) saves what [s, t) reads of [h, s) -- X1 of
+ * W(s, t) without its kv source (the follower holds its caches) -- AND what the pass's X2 ships that a layer below s
+ * computed: its source's entries, its selections / keep words. The card defect: W(10,32)'s X2 ships source 20's latent and
+ * index keys, the boundaries at 22 .. 30 dropped them, a decode pass between the segments rewrote the planes, and the
+ * leader's copy of source 20 took that pass's rows. Every cut, every boundary. */
+TEST(layers_m4_segment_boundaries_keep_what_x2_ships) {
+    const Geo g = flash1017();
+    /* the card cut first: W(10,32) at k 2 / 4 (lq28 / lq29: boundaries 12 .. 30 / 14 .. 30) */
+    for (int s = 11; s < 32; ++s) {
+        Crossing c;
+        std::string err;
+        CHECK_EQ(segment_crossing(g, 10, s, 32, &c, &err), 0);
+        CHECK(c.residual);
+        CHECK_EQ(c.src, s > 20 ? 20 : -1);
+        CHECK_EQ(c.latent, s > 20);
+        CHECK_EQ(c.index, s > 20);
+        CHECK_EQ(c.keep, s > 20 ? 20 : -1);
+    }
+    int pairs = 0, x2_src = 0, x2_keep = 0, x2_sel = 0;
+    for (int t = 2; t <= 37; ++t)
+        for (int h = 0; h < t; ++h) {
+            Crossing whole[2];
+            std::string err;
+            REQUIRE(crossings(g, h, t, whole, &err) == 0);
+            const Crossing& x2 = whole[1];
+            for (int s = h + 1; s < t; ++s) {
+                Crossing c, at_s[2];
+                REQUIRE(segment_crossing(g, h, s, t, &c, &err) == 0);
+                REQUIRE(crossings(g, s, t, at_s, &err) == 0);
+                ++pairs;
+                CHECK(c.residual);
+                CHECK_EQ(c.at, s);
+                /* the kv source: X2's when its layer is below s, never X1-of-W(s, t)'s (the node's own caches) */
+                if (x2.src >= 0 && x2.src < s) {
+                    ++x2_src;
+                    CHECK_EQ(c.src, x2.src);
+                    CHECK_EQ(c.latent, x2.latent);
+                    CHECK_EQ(c.index, x2.index);
+                    /* no source in [s, t): the planes keep it from the save to X2's send */
+                    for (int l = s; l < t; ++l) CHECK(!g.is_src[(size_t)l]);
+                } else {
+                    CHECK_EQ(c.src, -1);
+                    CHECK(!c.latent && !c.index);
+                }
+                /* the selections / keep words: what [s, t) reads below s, and what X2 ships below s -- one layer each */
+                if (at_s[0].sel >= 0) CHECK_EQ(c.sel, at_s[0].sel);
+                if (x2.sel >= 0 && x2.sel < s) { ++x2_sel; CHECK_EQ(c.sel, x2.sel); }
+                if (at_s[0].sel < 0 && !(x2.sel >= 0 && x2.sel < s)) CHECK_EQ(c.sel, -1);
+                if (at_s[0].keep >= 0) CHECK_EQ(c.keep, at_s[0].keep);
+                if (x2.keep >= 0 && x2.keep < s) { ++x2_keep; CHECK_EQ(c.keep, x2.keep); }
+                if (at_s[0].keep < 0 && !(x2.keep >= 0 && x2.keep < s)) CHECK_EQ(c.keep, -1);
+                /* every read at or after s of a plane a layer in [h, s) wrote is saved: [s, t)'s selections / keep words,
+                 * X2's three */
+                for (int l = s; l < t; ++l) {
+                    if (g.ratio[(size_t)l] <= 0) continue;
+                    const int ix = g.idx_of[(size_t)l];
+                    if (!g.is_idx[(size_t)l] && ix >= h && ix < s) CHECK_EQ(c.sel, ix);
+                    if (g.is_idx[(size_t)l] && g.cand >= h && g.cand < s && g.cand < l &&
+                        g.ratio[(size_t)g.cand] == g.ratio[(size_t)l])
+                        CHECK_EQ(c.keep, g.cand);
+                }
+            }
+        }
+    std::fprintf(stderr, "  %d (cut, boundary) pairs: X2's source entries saved at %d, its selections at %d, its keep at %d\n",
+                 pairs, x2_src, x2_sel, x2_keep);
+    CHECK(x2_src > 0 && x2_keep > 0);
+    /* outside (h, t) is refused */
+    Crossing c;
+    std::string err;
+    CHECK(segment_crossing(g, 10, 10, 32, &c, &err) < 0);
+    CHECK(segment_crossing(g, 10, 32, 32, &c, &err) < 0);
+}
+
 RAD_TEST_MAIN()
