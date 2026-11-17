@@ -46,14 +46,34 @@ extern "C" {
 
 enum { RAD_PP_X1 = 0, RAD_PP_X2 = 1, RAD_PP_N_RINGS = 2 };
 
+/* tp8 S5: lanes (--pp-lanes). The leader's scheduler runs up to this many independent step streams; a
+ * sequence is bound to one for life and each lane has at most one step in flight, so the two nodes
+ * work at once on different lanes. Every lane has its own pair of rings (X1, X2), so each ring keeps
+ * the one-payload-in-flight invariant of a single lane. The core addresses a lane's ring as
+ * ring index lane * RAD_PP_N_RINGS + crossing. */
+#define RAD_PP_MAX_LANES  4
+#define RAD_PP_MAX_RING_IX (RAD_PP_MAX_LANES * RAD_PP_N_RINGS)
+
+/* tp8 S5: which part of the leader's pass a step issues. A lane's step flows leader -> follower ->
+ * leader, so the leader's pass is issued in two parts with other lanes' parts between them:
+ *   RAD_PP_PART_WHOLE  the pass as one (one machine; a pipeline of one lane; the follower always)
+ *   RAD_PP_PART_HEAD   the leader's part up to and including stage_send X1
+ *   RAD_PP_PART_TAIL   the leader's part from stage_recv X2 on (the head and sampler follow it)
+ * A plugin reads it at issue (RadPpInfo::part); the core keys recorded passes by it. */
+enum { RAD_PP_PART_WHOLE = 0, RAD_PP_PART_HEAD = 1, RAD_PP_PART_TAIL = 2 };
+
 /* One crossing's ring on one node. `ready` is the sender's, `landed` and `taken` the receiver's;
  * a node holds each ring in one role. Every counter is the count of payloads, starting at 0. */
 typedef struct RadPpRing {
     volatile uint64_t ready;          /* send ring: payloads stage_send has published */
     volatile uint64_t sent;           /* send ring: payloads the link has taken off the ring */
-    uint64_t          pad0[6];
+    /* tp8 S5: the host backend's stage ops note when they published / took the last payload
+     * (CLOCK_MONOTONIC ns; 0 where no op notes it, as on a card), for the stage busy stamps. */
+    volatile uint64_t ready_ns;       /* send ring: when the sender published `ready` */
+    uint64_t          pad0[5];
     volatile uint64_t landed;         /* receive ring: payloads the link has written in full */
-    uint64_t          pad1[7];
+    volatile uint64_t taken_ns;       /* receive ring: when rank 0 took the last payload */
+    uint64_t          pad1[6];
     volatile uint64_t abort;          /* nonzero: the link is down; stage_recv fails the pass. A stage
                                        * op that gives up stores 2 (abort seen), 3 (its deadline), 4 (a
                                        * payload of another step's shape), 5 (a stale payload: its
@@ -82,9 +102,14 @@ typedef struct RadPpInfo {
     int32_t cut_h;        /* W(h, t): the leader holds layers [0, h) and [t, n_layer), */
     int32_t cut_t;        /* the follower [h, t); bring-up is W(0, 20) */
     int32_t link;         /* 0 kernel TCP, 1 RDMA verbs */
-    int32_t reserved[11];
-    /* This node's ring of each crossing (its send ring or its receive ring), null until the core
-     * has allocated them, which is after declare and before the first step. */
+    /* tp8 S5 (zero from an engine before lanes: one lane, the whole pass): */
+    int32_t lanes;        /* --pp-lanes: the leader's step streams (1 = one step in flight) */
+    int32_t lane;         /* the lane of the pass being issued now (every rank of a node issues one at a time) */
+    int32_t part;         /* RAD_PP_PART_*: which part of the leader's pass is being issued */
+    int32_t reserved[8];
+    /* This node's ring of each crossing (its send ring or its receive ring) for the lane of the pass
+     * being issued, null until the core has allocated them, which is after declare and before the
+     * first step. A plugin reads it at every issue: each lane has its own rings. */
     RadPpRing* ring[RAD_PP_N_RINGS];
 } RadPpInfo;
 

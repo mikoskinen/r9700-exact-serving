@@ -23,6 +23,7 @@
 #include "rad_plugin.h"
 
 #include <chrono>
+#include <ctime>
 #include <cstring>
 #include <thread>
 
@@ -31,6 +32,13 @@ namespace {
 uint64_t mono_ms() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* CLOCK_MONOTONIC, as the core's stamps read it (tp8 S5's stage busy stamps). */
+uint64_t mono_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 /* The parts after the ring: [1, 1 + parts). Bytes of each, from its own extent. */
@@ -101,6 +109,7 @@ int ref_stage_send(const RadArgs* a, RadStream) {
     r->parts = (uint64_t)n;
     r->bytes = total + RAD_PP_TRAILER;
     __atomic_store_n(&r->ready, seq, __ATOMIC_RELEASE);
+    r->ready_ns = mono_ns();   /* tp8 S5: the stage busy stamps (read after the pass) */
     return RAD_OK;
 }
 
@@ -139,6 +148,7 @@ int ref_stage_recv(const RadArgs* a, RadStream) {
         off += rad_pp_align(bytes[i]);
     }
     __atomic_store_n(&r->taken[rank], want, __ATOMIC_RELEASE);
+    if (rank == 0) r->taken_ns = mono_ns();   /* tp8 S5: the stage busy stamps */
     return RAD_OK;
 }
 
