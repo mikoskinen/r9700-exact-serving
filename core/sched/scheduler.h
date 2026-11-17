@@ -242,6 +242,9 @@ public:
         return builder_.wire_replay(w, span, n, run);
     }
     uint64_t wire_layout() const { return builder_.layout_hash(); }
+    void set_wire_limits(std::vector<int64_t> ids, std::vector<int64_t> slots) {
+        builder_.set_wire_limits(std::move(ids), std::move(slots));
+    }
     /* See BatchBuilder::step_seqs. */
     const std::vector<uint64_t>* step_seqs(const RadBatch* b) const { return builder_.step_seqs(b); }
     /* The advance's view of that build on one rank; see BatchBuilder::advance_args. Also carries

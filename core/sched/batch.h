@@ -180,6 +180,14 @@ public:
     /* What a span means: every carve offset, group geometry and derivation slot. Two builders with
      * one hash read each other's spans byte for byte (the rendezvous compares it). */
     uint64_t layout_hash() const;
+    /* The follower's own carve, by group index (-1: no check): the block ids (a paged group's
+     * n_blocks, a state group's n_states) and slots (n_blocks x block_size, n_states) a replayed
+     * table or slot mapping may name. wire_replay refuses a span naming one past them -- a broken
+     * KV cap is then a loud refusal, not a write outside the pool. Unset (one machine): no check. */
+    void set_wire_limits(std::vector<int64_t> ids, std::vector<int64_t> slots) {
+        wire_id_lim_ = std::move(ids);
+        wire_slot_lim_ = std::move(slots);
+    }
     /* Called at the end of every build() (not build_encoder) with its rank-0 batch: the leader
      * ships it from here. Empty on one machine. */
     std::function<void(const RadBatch*)> on_build;
@@ -387,6 +395,9 @@ private:
     /* Where the last build's span sits in the ring, for wire_last (tp8 S4). */
     int64_t last_off_ = -1, last_used_ = 0, last_rng_at_ = 0, last_n_rng_ = 0;
     bool    last_enc_ = false;
+    std::vector<int64_t> wire_id_lim_, wire_slot_lim_;   /* set_wire_limits (the follower) */
+    /* wire_replay's check of a replayed span against them; false with the reason logged. */
+    bool wire_in_carve(const Wire& w, const char* span_base) const;
 
     int64_t               derived_bytes_ = 0;
     std::vector<Derived>  derived_;

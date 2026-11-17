@@ -108,6 +108,52 @@ bool BatchBuilder::wire_last(Wire* w, const char** span) const {
     return true;
 }
 
+/* Review F1's guard: every slot a replayed step writes (each group's slot mapping) and every block
+ * id or state slot its table payload names lies inside this node's carve. The cap both nodes agree
+ * on before the carve keeps it so; this makes a broken cap a refused step, never a store past the
+ * pool. One pass over the step's rows a group and over the restaged table words (a decode step
+ * restages a few, a new sequence its row). */
+bool BatchBuilder::wire_in_carve(const Wire& w, const char* base) const {
+    const Set& s = set_;
+    const size_t G = s.groups.size();
+    auto lim = [](const std::vector<int64_t>& v, size_t gi) { return gi < v.size() ? v[gi] : (int64_t)-1; };
+    for (size_t gi = 0; gi < G; ++gi) {
+        const int64_t sl = lim(wire_slot_lim_, gi);
+        const int32_t* hs = s.groups[gi].h_slot;
+        if (sl < 0 || !hs) continue;
+        for (int64_t t = 0; t < w.n_tok; ++t)
+            if ((int64_t)hs[t] >= sl) {
+                RAD_ERR("step wire: step %d writes slot %d of KV group %zu, past this node's %lld: the "
+                        "two nodes' KV carves differ (a broken cap), the step is refused", w.step, hs[t], gi,
+                        (long long)sl);
+                return false;
+            }
+    }
+    const RadCopyRange* rng = reinterpret_cast<const RadCopyRange*>(base + w.rng_at);
+    for (int64_t i = 0; i < w.n_rng; ++i) {
+        const RadCopyRange& c = rng[i];
+        if (c.dst < s.bt_base) continue;
+        const int32_t* v = reinterpret_cast<const int32_t*>(base + c.src);
+        const int64_t w0 = (c.dst - s.bt_base) / (int64_t)sizeof(int32_t);
+        const int64_t n = c.bytes / (int64_t)sizeof(int32_t);
+        size_t gi = 0;
+        for (int64_t k = 0; k < n; ++k) {
+            const int64_t word = w0 + k;
+            while (gi < G && word >= s.groups[gi].bt_fix + max_seqs_ * s.groups[gi].max_blocks) ++gi;
+            if (gi >= G) break;
+            if (word < s.groups[gi].bt_fix) continue;   /* the alignment between two groups' tables */
+            const int64_t il = lim(wire_id_lim_, gi);
+            if (il >= 0 && (int64_t)v[k] >= il) {
+                RAD_ERR("step wire: step %d's block table names id %d in KV group %zu, past this node's %lld: "
+                        "the two nodes' KV carves differ (a broken cap), the step is refused", w.step, v[k], gi,
+                        (long long)il);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* The same fill as build()'s, from the leader's scalars: kept beside it rather than shared, so the
  * one-machine path stays exactly the code it was. */
 const RadBatch* BatchBuilder::wire_replay(const Wire& w, const char* span, int64_t bytes, bool run) {
@@ -150,6 +196,7 @@ const RadBatch* BatchBuilder::wire_replay(const Wire& w, const char* span, int64
             return nullptr;
         }
     }
+    if (!wire_id_lim_.empty() && !wire_in_carve(w, ring_.host + off)) return nullptr;
     for (size_t r = 0; r < ranks_.size(); ++r) {
         const int st = rad_memcpy_ranges_async(s.dev[r], ring_.host + off, s.bt_base, rng,
                                                (int)w.n_rng, ranks_[r].stream);
