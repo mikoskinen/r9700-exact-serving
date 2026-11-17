@@ -75,6 +75,11 @@ public:
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
     void set_split(bool on, int64_t min_rows) { split_on_ = on; split_min_ = min_rows > 0 ? min_rows : split_min_; }
+    /* tp8 S5 + S6: the leader's head part writes sequence state (a cut W(h, t) with h > 0: layers [0, h) are the
+     * head's). Then a chunk that takes a snapshot is never followed by another chunk of its sequence before its commit
+     * (the next chunk's head would rewrite the layers [0, h) state the snapshot copies behind the tail). */
+    void set_head_state(bool on) { head_state_ = on; }
+    bool head_state() const { return head_state_; }
 
     struct Piece {
         int       home = -1;
@@ -121,6 +126,7 @@ private:
     mutable std::atomic<uint64_t> rr_{ 0 };
     bool    split_on_ = true;
     int64_t split_min_ = 128;
+    bool    head_state_ = false;
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0;
     std::string broken_;
 };

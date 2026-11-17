@@ -12835,57 +12835,58 @@ TEST(the_lane_set_routes_to_the_least_loaded_lane) {
     CHECK(p1 != 1 && p2 != 1 && p1 != p2);   /* lane 1 holds a request: the other two in turn */
 }
 
-/* The newcomer split: a 100-token prompt planned by lane 0 in 64-token steps is cut into one piece
- * a lane, the second run by lane 1, which plans it first; the home lane plans the next chunk behind
- * the piece in flight, the last piece (lent) carries the first token, and every commit lands in
- * position order on the home lane's request. */
-TEST(a_newcomer_chunk_is_cut_over_the_lanes_and_committed_in_position_order) {
+/* The newcomer's chunks over the lanes (tp8 M56: the one-process grid): a 200-token prompt that one
+ * process plans as [0, 64) [64, 128) [128, 192) [192, 200) runs those chunks whole, alternating over
+ * two lanes: lane 0 keeps its chunk and lends the next to lane 1, which plans it first; the home lane
+ * plans the chunk after behind the one in flight and lends the last (the first token's) again; every
+ * commit lands in position order on the home lane's request. */
+TEST(a_newcomers_one_process_chunks_alternate_over_the_lanes_in_position_order) {
     Lanes L;
     REQUIRE_EQ(L.start(2), RAD_OK);
-    const uint64_t s = L.submit(0, 100, 3);
+    const uint64_t s = L.submit(0, 200, 3);
     REQUIRE(s != 0);
-    /* lane 0, step 1: [0, 64) -> its own [0, 32), lane 1's [32, 64) */
+    /* lane 0, step 1: its own [0, 64), lane 1's [64, 128) */
     REQUIRE(L.plan(0, { 1 }) != nullptr);
     const StepEntry* e0 = L.entry_of(0, s);
     REQUIRE(e0 != nullptr);
     CHECK_EQ(e0->ctx_len, 0);
-    CHECK_EQ(e0->n_tokens, 32);
+    CHECK_EQ(e0->n_tokens, 64);
     CHECK(!e0->produces_token);
-    CHECK_EQ(L.at(0).plan().n_tok, 32);
-    /* lane 1 plans next: the piece, first, as lane 0's */
+    CHECK_EQ(L.at(0).plan().n_tok, 64);
+    /* lane 1 plans next: the chunk, first, as lane 0's */
     REQUIRE(L.plan(1, { 0 }) != nullptr);
     const StepEntry* e1 = L.entry_of(1, s);
     REQUIRE(e1 != nullptr);
     CHECK_EQ(e1->home, 0);
     CHECK_EQ(e1->slot, -1);
-    CHECK_EQ(e1->ctx_len, 32);
-    CHECK_EQ(e1->n_tokens, 32);
-    /* lane 0 commits first (its step went first), then plans behind lane 1's piece: [64, 100) cut
-     * into its own [64, 80) and lane 1's [80, 100), which produces the first token */
+    CHECK_EQ(e1->ctx_len, 64);
+    CHECK_EQ(e1->n_tokens, 64);
+    /* lane 0 commits first (its step went first), then plans behind lane 1's chunk: its own [128, 192),
+     * lane 1's [192, 200), which produces the first token */
     CHECK_OK(L.commit(0, 7));
-    CHECK_EQ(L.req(0, s)->n_computed, 32);
+    CHECK_EQ(L.req(0, s)->n_computed, 64);
     REQUIRE(L.plan(0, { 1 }) != nullptr);
     e0 = L.entry_of(0, s);
     REQUIRE(e0 != nullptr);
-    CHECK_EQ(e0->ctx_len, 64);
-    CHECK_EQ(e0->n_tokens, 16);
+    CHECK_EQ(e0->ctx_len, 128);
+    CHECK_EQ(e0->n_tokens, 64);
     CHECK(!e0->produces_token);
-    CHECK_EQ(L.req(0, s)->n_computed, 32);   /* the planning view is undone after step() */
-    CHECK_OK(L.commit(1, 7));                /* lane 1's piece [32, 64) */
-    CHECK_EQ(L.req(0, s)->n_computed, 64);
+    CHECK_EQ(L.req(0, s)->n_computed, 64);   /* the planning view is undone after step() */
+    CHECK_OK(L.commit(1, 7));                /* lane 1's [64, 128) */
+    CHECK_EQ(L.req(0, s)->n_computed, 128);
     REQUIRE(L.plan(1, { 0 }) != nullptr);
     e1 = L.entry_of(1, s);
     REQUIRE(e1 != nullptr);
-    CHECK_EQ(e1->ctx_len, 80);
-    CHECK_EQ(e1->n_tokens, 20);
+    CHECK_EQ(e1->ctx_len, 192);
+    CHECK_EQ(e1->n_tokens, 8);
     CHECK(e1->produces_token);
-    CHECK_OK(L.commit(0, 7));                /* lane 0's [64, 80) */
-    CHECK_EQ(L.req(0, s)->n_computed, 80);
+    CHECK_OK(L.commit(0, 7));                /* lane 0's [128, 192) */
+    CHECK_EQ(L.req(0, s)->n_computed, 192);
     CHECK(L.req(0, s)->output.empty());
     /* the home lane leaves the sequence out while its first token is to come from lane 1 */
     CHECK(L.plan(0, { 1 }) == nullptr);
-    CHECK_OK(L.commit(1, 42));               /* lane 1's [80, 100): the first token */
-    CHECK_EQ(L.req(0, s)->n_computed, 100);
+    CHECK_OK(L.commit(1, 42));               /* lane 1's [192, 200): the first token */
+    CHECK_EQ(L.req(0, s)->n_computed, 200);
     REQUIRE_EQ(L.req(0, s)->output.size(), (size_t)1);
     CHECK_EQ(L.req(0, s)->output[0], 42);
     /* and decodes it at home */
@@ -12893,42 +12894,100 @@ TEST(a_newcomer_chunk_is_cut_over_the_lanes_and_committed_in_position_order) {
     e0 = L.entry_of(0, s);
     REQUIRE(e0 != nullptr);
     CHECK(!e0->is_prefill);
-    CHECK_EQ(e0->ctx_len, 100);
+    CHECK_EQ(e0->ctx_len, 200);
     CHECK_EQ(e0->n_tokens, 1);
     const LaneSet::Counts c = L.set.counts();
     CHECK_EQ(c.pieces, 2);
     CHECK_EQ(c.done, 2);
-    CHECK_EQ(c.rows, 52);
+    CHECK_EQ(c.rows, 72);
     CHECK_EQ(c.token_pieces, 1);
     CHECK(L.set.broken().empty());
 }
 
-/* A lane plans the pieces lent to it first, within its step: its own chunk takes what is left. */
+/* The engine's lane loop over cold prompts of several lengths, 1 / 2 / 3 lanes: every lane plans when it
+ * has no step in flight (idle lanes after the one planning, then those in flight, oldest first), tails
+ * commit in head order. The prompt's chunk plan -- every [start, end) any lane ran of it -- is one
+ * lane's (one process's), and its chunks ran in position order. */
+TEST(a_cold_prompts_chunks_over_lanes_are_one_process_chunks) {
+    for (int n_prompt : { 40, 64, 100, 200, 333, 700 }) {
+        std::vector<std::pair<int, int>> ref;
+        for (int lanes : { 1, 2, 3 }) {
+            Lanes L;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            const uint64_t s = L.submit(0, n_prompt, 2);
+            REQUIRE(s != 0);
+            std::vector<std::pair<int, int>> got;
+            std::vector<int> fifo;
+            std::vector<char> busy((size_t)lanes, 0);
+            int next = 0;
+            for (int round = 0; round < 200 && !(L.req(0, s) && !L.req(0, s)->output.empty()); ++round) {
+                /* as Engine::step_loop_lanes: the lanes in turn from `next`, the idle ones after a lane that
+                 * planned right behind it */
+                std::vector<int> todo;
+                for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+                for (size_t at = 0; at < todo.size(); ++at) {
+                    const int l = todo[at];
+                    if (busy[(size_t)l]) continue;
+                    std::vector<int> order, idle_after;
+                    for (int j = 1; j < lanes; ++j)
+                        if (!busy[(size_t)((l + j) % lanes)]) {
+                            order.push_back((l + j) % lanes);
+                            idle_after.push_back((l + j) % lanes);
+                        }
+                    for (int f : fifo) order.push_back(f);
+                    if (!L.plan(l, order)) continue;
+                    for (const StepEntry& e : L.at(l).plan().e)
+                        if (e.seq == s && e.is_prefill) got.emplace_back(e.ctx_len, e.ctx_len + e.n_tokens);
+                    busy[(size_t)l] = 1;
+                    fifo.push_back(l);
+                    next = (l + 1) % lanes;
+                    todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+                }
+                if (fifo.empty()) break;
+                const int l = fifo.front();
+                fifo.erase(fifo.begin());
+                CHECK_OK(L.commit(l, 5));
+                busy[(size_t)l] = 0;
+            }
+            CHECK(L.set.broken().empty());
+            REQUIRE(L.req(0, s) != nullptr);
+            CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
+            for (size_t i = 1; i < got.size(); ++i) CHECK_EQ(got[i].first, got[i - 1].second);   /* position order */
+            if (lanes == 1) ref = got;
+            else CHECK(got == ref);
+            if (lanes == 2 && n_prompt > 64) CHECK(L.set.counts().pieces > 0);
+        }
+    }
+}
+
+/* A lane plans the chunks lent to it first, within its step: its own requests take what is left (a
+ * whole 64-token chunk fills this lane's 64-token step, so its own prompt waits a step). */
 TEST(a_borrower_plans_its_inbox_first_within_its_budget) {
     Lanes L;
     REQUIRE_EQ(L.start(2), RAD_OK);
     const uint64_t a = L.submit(0, 200, 2);
     const uint64_t b = L.submit(1, 200, 2, 3000);
-    REQUIRE(L.plan(0, { 1 }) != nullptr);           /* a: [0, 32) here, [32, 64) to lane 1 */
+    REQUIRE(L.plan(0, { 1 }) != nullptr);           /* a: [0, 64) here, [64, 128) to lane 1 */
     REQUIRE(L.plan(1, { 0 }) != nullptr);
     int64_t own = 0, lent = 0;
     for (const StepEntry& e : L.at(1).plan().e) (e.home >= 0 ? lent : own) += e.n_tokens;
-    CHECK_EQ(lent, 32);
-    CHECK(own > 0);
+    CHECK_EQ(lent, 64);
+    CHECK_EQ(own, 0);
     CHECK(L.at(1).plan().n_tok <= L.cfg.max_tok);
     CHECK_EQ(L.at(1).plan().n_tok, own + lent);
-    CHECK(L.entry_of(1, a) != nullptr && L.entry_of(1, b) != nullptr);
+    CHECK(L.entry_of(1, a) != nullptr);
+    CHECK(L.entry_of(1, b) == nullptr);
 }
 
-/* The engine names the lanes in the order they plan; a piece taken out of that order (piece two
- * before piece one) would run out of position order, and the set names it. */
+/* The engine names the lanes in the order they plan; a chunk taken out of that order (the third
+ * before the second) would run out of position order, and the set names it. */
 TEST(a_piece_taken_out_of_position_order_is_named) {
     Lanes L;
     REQUIRE_EQ(L.start(3), RAD_OK);
     const uint64_t s = L.submit(0, 200, 2);
     REQUIRE(s != 0);
-    REQUIRE(L.plan(0, { 1, 2 }) != nullptr);        /* [0, 64) in three: [0,16) here, [16,32) to 1, [32,64) to 2 */
-    CHECK_EQ(L.entry_of(0, s)->n_tokens, 16);
+    REQUIRE(L.plan(0, { 1, 2 }) != nullptr);        /* [0, 64) here, [64, 128) to 1, [128, 192) to 2 */
+    CHECK_EQ(L.entry_of(0, s)->n_tokens, 64);
     CHECK(L.set.broken().empty());
     REQUIRE(L.plan(2, { 1, 0 }) != nullptr);        /* lane 2 before lane 1: out of order */
     CHECK(!L.set.broken().empty());

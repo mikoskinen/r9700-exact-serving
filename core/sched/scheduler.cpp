@@ -756,6 +756,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.slot = slot;
     s.card = -1;
     s.running = false;
+    s.lent_hold = false;   /* tp8 M56 (lanes): a recycled slot holds nothing back */
     s.drafter_reset();
     /* A new request's text, so a new estimate. */
     s.adapt.depth = 0;

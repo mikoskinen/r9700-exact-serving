@@ -164,6 +164,9 @@ struct SchedReq {
     int32_t  lent = 0;
     int32_t  lent_pending = 0;
     bool     lent_tok = false;
+    /* tp8 S5 + S6: a lent chunk takes a snapshot while the leader's head writes state (LaneSet::head_state): the
+     * sequence's next chunk waits for its commit */
+    bool     lent_hold = false;
     /* The first position of the next piece another lane must take from its inbox: pieces are taken
      * (and so issued) in position order, which LaneSet checks loudly (-1: none waiting). */
     int64_t  lent_next = -1;
@@ -1150,6 +1153,9 @@ private:
     int64_t lane_reserve(int64_t budget);
     void    lane_take_inbox();
     void    lane_split_own();
+    /* The chunk an idle engine (one process, this prompt alone) plans from position `n` of `r`, and the snapshot its
+     * end takes (as bi_chunk_plan's alone piece; lever PSK design 2's targets applied): the one-process grid */
+    int64_t lane_alone_chunk(const SchedReq& s, Request& r, int64_t target, int64_t n, int64_t* ckpt);
     void    lane_return_pieces();
     /* What lane_split_own lent this step, so a step whose build fails takes it back (lane_unsplit_own):
      * nothing of that step ran, so a piece left in another lane would run past rows never computed. */

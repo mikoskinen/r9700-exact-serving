@@ -167,7 +167,7 @@ void Scheduler::lane_plan_begin() {
     for (size_t i = 0; i < running_.size();) {
         const int32_t slot = running_[i];
         SchedReq& s = *reqs_[(size_t)slot];
-        if (s.req && (s.lent_pending > 0 || s.lent_tok)) {
+        if (s.req && (s.lent_pending > 0 || s.lent_tok || s.lent_hold)) {
             lane_out_.push_back(slot);
             running_.erase(running_.begin() + (ptrdiff_t)i);
             continue;
@@ -212,6 +212,8 @@ int64_t Scheduler::lane_reserve(int64_t budget) {
     const int64_t rows = lanes_->inbox_rows_locked(lane_);
     lane_reserved_ = rows;
     if (rows <= 0) return budget;
+    /* a chunk wider than the shared budget is lent only to a lane with nothing else: its step is that one sequence */
+    if (geo_.shared_tok > 0 && rows > geo_.shared_tok) return 0;
     if (cfg_.prefill_span > 1) {
         span_now_ = false;
         if (budget > mixed_now_ && mixed_now_ > 0) budget = mixed_now_;
@@ -275,89 +277,99 @@ void Scheduler::lane_return_pieces() {
     }
 }
 
-/* This lane's own prefill entries, each cut into one piece a lane in queue order: the first stays
- * here, the others go to the lanes that plan next (LaneSet::set_planners), the last of them taking
- * the entry's token if it produces one. Not cut: a chunk shorter than two pieces, one with a
- * checkpoint, a restore or a cone replay on it, an embedding, a media or a scored request. The
- * pieces after the first keep to the quantum grid and the minimum; the last takes the remainder. */
+/* The chunk an idle engine plans from position n (bi_chunk_plan's alone piece: the span where the request would span
+ * alone, the interval grid, the tail, the prompt's end; lever TI's tail inside the chunk where the whole chunk fits a
+ * step), with r's n_computed seen at n while it plans. */
+int64_t Scheduler::lane_alone_chunk(const SchedReq& s, Request& r, int64_t target, int64_t n, int64_t* ckpt) {
+    const int64_t had = r.n_computed;
+    r.n_computed = n;
+    const bool keep = span_now_;
+    span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+                (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+    const int64_t keep_ti = ti_limit_;
+    ti_limit_ = cfg_.max_tok;
+    int64_t ck = -1;
+    const int64_t want = plan_chunk(n, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
+    ti_limit_ = keep_ti;
+    span_now_ = keep;
+    psk_ckpt(s, target, &ck);   /* lever PSK design 2: a snapshot at a target only */
+    r.n_computed = had;
+    if (ckpt) *ckpt = ck;
+    return want;
+}
+
+/* The newcomer's chunks over the lanes (tp8 S5; the one-process grid, tp8 M56): a prefill entry of this lane that is
+ * exactly the chunk an idle engine plans from its start keeps its rows here, and the chunks an idle engine plans after
+ * it -- whole, at the boundaries one process cuts the prompt at -- go one a lane to the lanes that plan next
+ * (LaneSet::set_planners), in queue order, the one reaching the prompt's end taking its first token. So a cold prompt's
+ * chunks alternate over the lanes and every boundary is one process's: no piece invents a cut (S4 hardware: cold
+ * 16k / 64k / 130k texts differed with pieces cut inside one process's chunks). Not lent: a chunk past the prompt's end,
+ * a cone replay, an embedding, a media or a scored request, a drafted entry; a chunk wider than the shared budget only
+ * to a lane with nothing else to run (a step wider than it is one sequence); a chunk whose KV does not fit without
+ * preempting. Where the leader's head writes state (LaneSet::head_state: a cut W(h > 0, t)), a chunk that takes a
+ * snapshot is never followed by its sequence's next chunk before its commit (its home's own: nothing lent behind it;
+ * a lent one: the last lent, its home holds the sequence until it commits). */
 void Scheduler::lane_split_own() {
     if (!lanes_ || n_lanes_ <= 1 || !lanes_->split_on()) return;
     const std::vector<int>& order = lanes_->planners_locked();
     if (order.empty()) return;
-    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
-    const int64_t minp = (std::max<int64_t>(lanes_->split_min(), Q) + Q - 1) / Q * Q;
-    /* A borrower's rows: the shared budget under a span (a step carrying another lane's piece is a
-     * shared step), else the step's; its entries: its own cards' beside the inbox. */
-    const int64_t rows_cap = cfg_.prefill_span > 1 && geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok)
-                                                                         : cfg_.max_tok;
-    const int64_t lane_cards = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_;
+    const bool hold = lanes_->head_state();
     for (StepEntry& e : plan_.e) {
-        if (e.home >= 0 || !e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
-        if (e.ckpt_slot >= 0 || e.ckpt_restore >= 0 || e.cr_replay || e.n_spec != 0) continue;
+        if (e.home >= 0 || !e.is_prefill || e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
+        if (e.cr_replay || e.n_spec != 0) continue;
+        if (hold && e.ckpt_slot >= 0 && e.ckpt_tok >= 0) continue;
         SchedReq& s = *reqs_[(size_t)e.slot];
         if (!s.req) continue;
-        const Request& r = *s.req;
-        if (r.embed || r.media || r.token_scores || r.n_draft != 0) continue;
-        const int64_t n = e.n_tokens;
-        /* The most pieces whose every borrower has room for its piece beside what it was lent already:
-         * a lane's step holds max_tok rows, its inbox first (lane_reserve), and a step carrying another
-         * lane's piece is a shared step, so no piece is wider than the shared budget either. */
-        int64_t k = std::min<int64_t>((int64_t)order.size() + 1, std::min<int64_t>(n_lanes_, n / minp));
-        int64_t base = 0, last = 0;
-        for (; k >= 2; --k) {
-            base = n / k / Q * Q;
-            if (base < minp) continue;
-            last = n - (k - 1) * base;
-            if (geo_.shared_tok > 0 && last > geo_.shared_tok) continue;
-            bool room = true;
-            for (int64_t j = 1; j < k && room; ++j) {
-                const int to = order[(size_t)(j - 1)];
-                /* tp8 S5 review: the borrower's step is a shared step (lane_reserve), and a step wider than
-                 * the shared budget must be one sequence (RadBuildCtx::max_mixed_tok); its own plan counts
-                 * its entries without the inbox, so the inbox leaves room for every card of the lane. */
-                room = lanes_->inbox_rows_locked(to) + (j == k - 1 ? last : base) <= rows_cap &&
-                       (int64_t)lanes_->inbox_n_locked(to) + 1 + lane_cards <= cfg_.max_seqs;
-            }
-            if (room) break;
-        }
-        if (k < 2) continue;
-        const bool tok = e.produces_token;
-        const int32_t c0 = e.ctx_len;
+        Request& r = *s.req;
+        if (r.embed || r.media || r.token_scores || r.n_draft != 0 || s.lent_hold) continue;
+        const int64_t target = s.seq_len();
+        /* only an entry on the one-process grid: its own chunk is the one an idle engine plans from its start */
+        if (lane_alone_chunk(s, r, target, e.ctx_len, nullptr) != e.n_tokens) continue;
         /* The committed end, below which no piece in flight reads: this step's bump undone. */
         int64_t real = r.n_computed;
         for (const auto& [slot, rows] : lane_bump_)
             if (slot == e.slot) real -= rows;
-        /* tp8 S5 review: what this cut changes, for lane_unsplit_own should the step's build fail */
-        LaneLent undo;
-        undo.slot = e.slot;
-        undo.seq = e.seq;
-        undo.lent = s.lent;
-        undo.lent_pending = s.lent_pending;
-        undo.lent_tok = s.lent_tok;
-        undo.lent_next = s.lent_next;
-        undo.rows = n - base;
-        undo.tok = tok;
-        for (int64_t j = 1; j < k; ++j) {
-            LaneSet::Piece p;
-            p.home = lane_;
-            p.e = e;
-            p.e.ctx_len = (int32_t)(c0 + j * base);
-            p.e.n_tokens = (int32_t)(j == k - 1 ? last : base);
-            p.e.produces_token = tok && j == k - 1;
-            p.e.dev = false;
-            lanes_->lend_locked(order[(size_t)(j - 1)], p);
-            undo.to.emplace_back(order[(size_t)(j - 1)], p.e.ctx_len);
-            s.lent += p.e.n_tokens;
+        int64_t p = (int64_t)e.ctx_len + e.n_tokens, rows = 0;
+        bool tok = false, any = false;
+        for (size_t j = 0; j < order.size() && p < target; ++j) {
+            const int to = order[j];
+            int64_t ck = -1;
+            const int64_t n = lane_alone_chunk(s, r, target, p, &ck);
+            if (n <= 0) break;
+            const Scheduler* b = lanes_->lane(to);
+            const bool wide = geo_.shared_tok > 0 && n > geo_.shared_tok;
+            if (wide && (!b || !b->running_.empty() || !b->waiting_.empty() || lanes_->inbox_n_locked(to) > 0)) break;
+            /* the borrower's entries: its own cards' beside the inbox (the S5 review's rule) */
+            if (lanes_->inbox_rows_locked(to) + n > cfg_.max_tok ||
+                (int64_t)lanes_->inbox_n_locked(to) + 1 + (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_ > cfg_.max_seqs)
+                break;
+            if (kv_->ensure_from(r.id, p + n, p) < 0) break;   /* never preempt for a lent chunk */
+            LaneSet::Piece pc;
+            pc.home = lane_;
+            pc.e = e;
+            pc.e.ctx_len = (int32_t)p;
+            pc.e.n_tokens = (int32_t)n;
+            pc.e.produces_token = p + n >= target;
+            pc.e.dev = false;
+            pc.e.ckpt_restore = -1;
+            pc.e.ckpt_slot = -1;
+            pc.e.ckpt_tok = -1;
+            pc.e.n_accepted = 1;
+            /* its snapshot, reserved as the home's plan reserves one; commit_checkpoint at its commit (lane_piece_done) */
+            if (ck > 0) reserve_ckpt(pc.e, r, ck, (int32_t)(ck - p - 1));
+            lanes_->lend_locked(to, pc);
+            s.lent += (int32_t)n;
             ++s.lent_pending;
+            rows += n;
+            any = true;
+            p += n;
+            if (pc.e.produces_token) { tok = true; break; }
+            if (hold && pc.e.ckpt_slot >= 0) { s.lent_hold = true; break; }
         }
-        lane_lent_now_.push_back(std::move(undo));
-        lanes_->note_lent_locked(n - base, tok);
+        if (!any) continue;
+        lanes_->note_lent_locked(rows, tok);
         s.lent_tok = s.lent_tok || tok;
-        s.lent_next = (int64_t)c0 + base;
-        e.n_tokens = (int32_t)base;
-        e.produces_token = false;
-        s.sched_tokens = (int32_t)base;
-        plan_.n_tok -= n - base;
+        s.lent_next = (int64_t)e.ctx_len + e.n_tokens;
         kv_->set_keep_floor(r.id, real);
     }
 }
@@ -398,6 +410,11 @@ void Scheduler::lane_piece_done(const StepEntry& e, int i, const StepResult& res
     Request& r = *s.req;
     s.lent = std::max<int32_t>(0, s.lent - e.n_tokens);
     if (e.produces_token) s.lent_tok = false;
+    /* tp8 M56: a lent chunk's snapshot (lane_split_own), readable from its commit on, as commit() marks the home's */
+    if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) {
+        if (pc_ && r.state == ReqState::Running) pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
+        s.lent_hold = false;
+    }
     if (r.state != ReqState::Running) {
         /* Cancelled or failed while the piece ran: its blocks waited for it (in_step). */
         if (s.lent == 0) kv_->set_keep_floor(r.id, -1);
