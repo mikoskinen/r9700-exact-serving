@@ -676,7 +676,19 @@ struct Model {
     rad_op pp_post = 0;                   /* the leader: layer t-1's mhc_post where no fused pcn_a resolves */
     RadPpRing* pp_ring[RAD_PP_N_RINGS] = {};
     Dsp  pp_dsp{};                        /* the follower: the drafter it does not declare (its KV group is zeroed) */
-    std::vector<int64_t> pp_zero_r;       /* the ratios whose index / latent groups this node zeroed (pp_copy_layer) */
+    std::vector<int64_t> pp_zero_r;       /* the ratios whose index groups this node zeroed (pp_copy_layer) */
+    std::vector<int64_t> pp_zero_cr;      /* ... whose latent groups this node zeroed */
+    /* tp8 S6: a general cut W(h, t) (ds41_layers.h crossings(): both nodes hold both crossings' descriptions). X1 enters
+     * the follower's layer h, X2 the leader's layer t; each carries the boundary op's inputs (X1 at h = 0: xcol) and what
+     * the receiving layers read of the sending node: one kv source's new entries, which the receiver stores into its copy
+     * of that source's cache with the same entry_store at the same pages (pp_cp_*), the selections of the last index layer
+     * before the boundary, the candidate layer's keep words. `pp_binds`: the source layers this node binds (held or
+     * copied). `pp_unsplit_cand`: the candidate layer's indexer runs unsplit on its node when its keep words cross, so
+     * the one sending rank holds every row's (the split keeps a run's keep rows on the rank that ran it). */
+    ds41layers::Crossing pp_cx[2]{};
+    ds41layers::Binds pp_binds{};
+    rad_op pp_cp_lat = 0, pp_cp_idx = 0;  /* the receiver's copy stores (the crossing into this node) */
+    bool pp_unsplit_cand = false;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -735,7 +747,8 @@ static ds41layers::Geo lr_geo(const Model& m) {
     }
     g.cand = (int)c.cand;
     for (int64_t l : c.ple) g.ple.push_back((int)l);
-    for (int64_t t : m.dsp.taps) g.taps.push_back((int)t);
+    /* (a pipeline follower keeps the leader's drafter in pp_dsp: the taps are the model's either way) */
+    for (int64_t t : (m.dsp.taps.empty() ? m.pp_dsp.taps : m.dsp.taps)) g.taps.push_back((int)t);
     return g;
 }
 
@@ -1913,13 +1926,8 @@ static int idx_fn4_value(const char* name, int* applied);
 
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
-    /* tp8 S4 (review robustness 3): a two-node pipeline node runs no BI segment or PSK pass in this
-     * build (their passes carry no crossings; the step refuses them, below): a request for one is
-     * refused here, with the pair serving on, not at the next step with both nodes going down. */
-    if (value != 0 && rad_pp_query().nodes == 2 &&
-        (!std::strcmp(name, "ds41_bi") || !std::strcmp(name, "ds41_psk") || !std::strcmp(name, "ds41_psk_cr") ||
-         !std::strcmp(name, "ds41_psk_l20")))
-        return -1;
+    /* tp8 S6: a two-node pipeline node runs BI segments and PSK passes (step_bi crosses at the cut, per node; S4 refused
+     * them here) */
     if (const int r = idx_fn4_accepts(name, value)) return r;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
@@ -4170,13 +4178,20 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         m.dsp = Dsp{};
     }
     m.lr_deps = ds41layers::needs(lr_geo(m), m.lr, m.dsp.on || (m.lr.strict && m.lr.leader && !m.dsp.taps.empty()));
-    /* tp8 S4: the pipeline carries the residual stream only; a cut whose layers read another node's KV, selections or
-     * keep words (W(h > 0, t)) needs the copies S6 builds. */
-    if (m.pp && !m.lr_deps.empty()) {
-        fprintf(stderr, "radiance: deepseek41: --pp-cut %d,%d: %s -- the crossings of this build carry the residual stream "
-                        "only (tp8 S6 carries KV copies, selections and keep words); W(0,t) is a clean cut\n",
-                m.pp_h, m.pp_t, ds41layers::describe(m.lr_deps).c_str());
-        return RAD_E_UNSUPPORTED;
+    /* tp8 S6: the crossings of W(h, t) carry what each node's layers read of the other (crossings(): a source's new
+     * entries for the receiver's copy, the selections, the keep words); a cut the geometry does not allow is refused */
+    if (m.pp) {
+        std::string err;
+        if (ds41layers::crossings(lr_geo(m), m.pp_h, m.pp_t, m.pp_cx, &err) < 0) {
+            fprintf(stderr, "radiance: deepseek41: --pp-cut %d,%d: %s\n", m.pp_h, m.pp_t, err.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        const ds41layers::Crossing& in = m.pp_cx[m.pp_rank == 1 ? RAD_PP_X1 : RAD_PP_X2];
+        m.pp_binds = ds41layers::binds(lr_geo(m), m.lr, &in);
+        /* the candidate layer's keep words cross: it is this node's, and its indexer runs unsplit here (every rank then
+         * holds every row's keep, so rank 0's crossing carries them all; the split is exact either way) */
+        for (const ds41layers::Crossing& cx : m.pp_cx)
+            if (cx.keep >= 0 && m.lr.held(cx.keep)) m.pp_unsplit_cand = true;
     }
     if (!m.lr.strict && !m.lr_deps.empty()) {
         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LAYERS=%s (proxy, this node alone): %s -- another node computes "
@@ -4254,27 +4269,33 @@ static int pp_copy_layer(RadBuilder* b, Model& m, Layer& L, int l) {
         if (!(m.tail[r] = tail_group(b, m, r))) return RAD_E_INVAL;
         DS_TRY(rad_bind_layer_kv(b, l, m.tail[r]));
     }
+    /* tp8 S6 (ds41layers::binds): this unheld source is bound to a group when a crossing into this node copies it (its
+     * entries land here at the owner's pages); a group none of this node's layers reads or writes is bound at its first
+     * source and zeroed (S4's rule; W(0,t)'s other ratio). A group that is read here but neither held nor copied at this
+     * source is declared here (the published order) and bound where a held or copied source of it is. */
+    const auto& pb = m.pp_binds;
+    const bool zi = (size_t)r < pb.index_zero_r.size() && pb.index_zero_r[(size_t)r];
+    const bool zc = (size_t)r < pb.comp_zero_r.size() && pb.comp_zero_r[(size_t)r];
     const bool new_index = !m.index.count(r), new_comp = !m.comp.count(r);
     if (new_index && !(m.index[r] = full_group(b, m, "kv_index_r%lld", index_slots(m), r))) return RAD_E_INVAL;
     if (new_index) {
-        L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ikmx ? "mxfp4" : nullptr);
+        L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ikmx ? "mxfp4" : nullptr);   /* the block size; never issued */
         if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
-        DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
+    }
+    if ((new_index && zi) || pb.index[(size_t)l]) DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
+    if (new_index && zi) {
+        DS_TRY(rad_kv_group_zero(b, m.index[r]));
+        m.pp_zero_r.push_back(r);
     }
     if (new_comp && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", latent_slots(m, hd), r))) return RAD_E_INVAL;
     if (new_comp) {
-        L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lnv ? "nvfp4" : nullptr);
+        L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lnv ? "nvfp4" : nullptr);   /* the block size; never issued */
         if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
-        DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
     }
-    /* Zero what no held layer reads (W(0,t) is a clean cut: the other ratio's groups). */
-    bool used = false;
-    for (int k = 0; k < (int)c.n_layer; ++k)
-        if (m.lr.held(k) && c.ratio[(size_t)k] == r) used = true;
-    if (!used) {
-        if (new_index) DS_TRY(rad_kv_group_zero(b, m.index[r]));
-        if (new_comp) DS_TRY(rad_kv_group_zero(b, m.comp[r]));
-        m.pp_zero_r.push_back(r);
+    if ((new_comp && zc) || pb.comp[(size_t)l]) DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
+    if (new_comp && zc) {
+        DS_TRY(rad_kv_group_zero(b, m.comp[r]));
+        m.pp_zero_cr.push_back(r);
     }
     return RAD_OK;
 }
@@ -4303,20 +4324,52 @@ static int pp_dspark_zero(RadBuilder* b, Model& m) {
  * leader's layer t reads that the follower's layers wrote -- the inputs of the boundary op, mhc_post_collapse_rmsnorm
  * (layer t-1's post + layer t's collapse + norm: act.x, h1, post, comb, pre_f), which also covers the unfused form
  * (mhc_post over act.x, h1, post, comb, then the collapse over h0 and pre_f). Every part [rows, width], dense. */
-struct CutPart { rad_buf b; const char* name; int64_t row_bytes; };
+/* tp8 S6: a general cut's crossing adds what the receiving layers read of the sending node (Model::pp_cx): the
+ * selections of the crossing's index layer (sel, itopk i32 a row), the candidate layer's keep words (keep, kwords i32 a
+ * row), and one kv source's new entries -- the inputs of its entry stores, the compressed latent (lat) and / or the
+ * index keys (ikn) over the compressor's work rows, with their pages (page, ratio > 1: the compressor tail's; ratio 1
+ * stores at the batch's slot mapping, which both nodes have). The receiver issues the same entry_store into its copy of
+ * that source's cache at the same pages, so the copy is the owner's bytes (ds41_layers.h crossings()). `kind` says
+ * which rows a part has at issue: the step's (or, under BI / PSK, the boundary's live rows [lo, T)), or the work rows. */
+enum class CutRows { Step, Live, Work };
+struct CutPart { rad_buf b; const char* name; int64_t row_bytes; CutRows rows; int64_t pitch; /* elements a row */ };
 static std::vector<CutPart> ds41_cut_liveset(const Model& m, int ring) {
     const auto& c = m.c;
     const int64_t D = c.n_embd, H = c.hc;
-    if (ring == RAD_PP_X1) return { { m.xcol, "xcol", D * 2 } };
-    return { { m.act.x, "act.x", D * 2 }, { m.h1, "h1", H * D * 2 }, { m.post, "post", H * 4 },
-             { m.comb, "comb", H * H * 4 }, { m.pre_f, "pre_f", H * 4 } };
+    std::vector<CutPart> v;
+    const ds41layers::Crossing& cx = m.pp_cx[ring];
+    if (!cx.residual) v.push_back({ m.xcol, "xcol", D * 2, CutRows::Step, D });
+    else
+        v = { { m.act.x, "act.x", D * 2, CutRows::Live, D }, { m.h1, "h1", H * D * 2, CutRows::Live, H * D },
+              { m.post, "post", H * 4, CutRows::Live, H }, { m.comb, "comb", H * H * 4, CutRows::Live, H * H },
+              { m.pre_f, "pre_f", H * 4, CutRows::Live, H } };
+    if (cx.sel >= 0) v.push_back({ m.sel, "sel", c.itopk * 4, CutRows::Live, c.itopk });
+    if (cx.keep >= 0) v.push_back({ m.keep, "keep", m.kwords * 4, CutRows::Live, m.kwords });
+    if (cx.src >= 0) {
+        if (cx.latent) v.push_back({ m.lat, "lat", c.head_dim * 2, CutRows::Work, c.head_dim });
+        if (cx.index) v.push_back({ m.ikn, "ikn", c.idim * 2, CutRows::Work, c.idim });
+        if (c.ratio[(size_t)cx.src] > 1) v.push_back({ m.page, "page", 4, CutRows::Work, 1 });
+    }
+    return v;
 }
-static int64_t cut_row_bytes(const std::vector<CutPart>& v) {
-    int64_t n = 0;
-    for (const CutPart& p : v) n += p.row_bytes;
-    return n;
+/* The rows a kv source's entry stores run over in a step of T rows and S sequences (the compressor chain's: ratio > 1
+ * the bound on its completed blocks, step()'s `rows`; ratio 1 every row). */
+static int64_t pp_work_rows(const Model& m, int64_t r, int64_t T, int64_t S) {
+    if (r <= 1) return T;
+    return m.ctail_full ? m.work : std::min<int64_t>(m.work, std::max<int64_t>((T + r - 1) / r + S, m.g.max_seqs));
 }
-/* The stage op of crossing `ring` on this node, its liveness against the parts. */
+/* A crossing's bytes a row for the core's ring (rad_pp_crossing: capacity = this x --max-num-batched-tokens): the work
+ * rows' parts at their largest count, spread over the step's rows. */
+static int64_t cut_row_bytes(const Model& m, const std::vector<CutPart>& v, int ring) {
+    const int64_t T = std::max<int64_t>(m.g.max_tok, 1);
+    const ds41layers::Crossing& cx = m.pp_cx[ring];
+    const int64_t wr = cx.src >= 0 ? pp_work_rows(m, m.c.ratio[(size_t)cx.src], T, m.g.max_seqs) : T;
+    int64_t n = 0, w = 0;
+    for (const CutPart& p : v) (p.rows == CutRows::Work ? w : n) += p.row_bytes;
+    return n + (w * wr + T - 1) / T;
+}
+/* The stage op of crossing `ring` on this node, its liveness against the parts (declared where it is issued: the sender
+ * after its last layer before the crossing, the receiver before its first layer after it). */
 static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring) {
     const bool sends = (ring == RAD_PP_X1) == (m.pp_rank == 0);
     const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
@@ -4328,6 +4381,22 @@ static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring) {
     if (sends) rad_op_reads(b, h, bufs.data(), (int)bufs.size());
     else       rad_op_writes(b, h, bufs.data(), (int)bufs.size());
     return h;
+}
+
+/* tp8 S6: the receiver's copy stores -- the entry_store of the copied source (the owner's l_st / k_st: same op, same
+ * parameters), declared after the crossing that carries their inputs, issued right after it into this node's copy of
+ * that source's cache (bound at the source layer by pp_copy_layer). */
+static int pp_copy_declare(RadBuilder* b, Model& m, int ring) {
+    const ds41layers::Crossing& cx = m.pp_cx[ring];
+    if (cx.src < 0) return RAD_OK;
+    const auto& c = m.c;
+    const int64_t r = c.ratio[(size_t)cx.src], rows = r > 1 ? m.work : m.g.max_tok;
+    if (r <= 0) return RAD_E_INVAL;
+    if (cx.latent && !(m.pp_cp_lat = entry_store(b, rows, c.head_dim, r, m.lat, m.page, m.lnv ? "nvfp4" : nullptr)))
+        return RAD_E_INVAL;
+    if (cx.index && !(m.pp_cp_idx = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ikmx ? "mxfp4" : nullptr)))
+        return RAD_E_INVAL;
+    return RAD_OK;
 }
 
 /* The node's line (rank 0's real declare, and a note in the graph): its layers, roles, expert units a rank (what the S3
@@ -4369,16 +4438,52 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
         std::string x1, x2;
         for (const CutPart& p : ds41_cut_liveset(m, RAD_PP_X1)) x1 += fmt_s("%s%s %lld B", x1.empty() ? "" : ", ", p.name, (long long)p.row_bytes);
         for (const CutPart& p : ds41_cut_liveset(m, RAD_PP_X2)) x2 += fmt_s("%s%s %lld B", x2.empty() ? "" : ", ", p.name, (long long)p.row_bytes);
-        std::snprintf(line, sizeof line,
-                      "two-node pipeline (tp8 S4): the %s of W(%d,%d); X1 = %s (%lld B a row), X2 = %s (%lld B a row, the "
-                      "inputs of layer %d's mhc_post_collapse_rmsnorm); every KV group of the published declare in its "
-                      "order, the ones no held layer reads zeroed%s",
-                      m.pp_rank == 0 ? "leader" : "follower", m.pp_h, m.pp_t, x1.c_str(),
-                      (long long)cut_row_bytes(ds41_cut_liveset(m, RAD_PP_X1)), x2.c_str(),
-                      (long long)cut_row_bytes(ds41_cut_liveset(m, RAD_PP_X2)), m.pp_t,
-                      m.pp_rank == 1 && m.pp_dsp.on ? "; the leader's drafter KV group zeroed here" : "");
+        /* tp8 S6: what the copies bind here (sources held or copied) */
+        std::string cp;
+        const ds41layers::Crossing& in = m.pp_cx[m.pp_rank == 1 ? RAD_PP_X1 : RAD_PP_X2];
+        if (in.src >= 0)
+            cp = fmt_s("; a copy of source %d's %s (stored here from X%d at the owner's pages)", in.src,
+                       in.latent && in.index ? "latent + index keys" : in.latent ? "latent" : "index keys", in.at == m.pp_h ? 1 : 2);
+        if (m.pp_unsplit_cand) cp += fmt_s("; layer %lld's indexer unsplit (its keep words cross)", (long long)c.cand);
+        const bool clean = m.pp_h == 0 && m.pp_cx[RAD_PP_X2].sel < 0 && m.pp_cx[RAD_PP_X2].keep < 0 &&
+                           m.pp_cx[RAD_PP_X2].src < 0;
+        if (clean)   /* W(0,t), a clean cut: S4's line, byte for byte (its declare is S4's) */
+            std::snprintf(line, sizeof line,
+                          "two-node pipeline (tp8 S4): the %s of W(%d,%d); X1 = %s (%lld B a row), X2 = %s (%lld B a row, the "
+                          "inputs of layer %d's mhc_post_collapse_rmsnorm); every KV group of the published declare in its "
+                          "order, the ones no held layer reads zeroed%s",
+                          m.pp_rank == 0 ? "leader" : "follower", m.pp_h, m.pp_t, x1.c_str(),
+                          (long long)cut_row_bytes(m, ds41_cut_liveset(m, RAD_PP_X1), RAD_PP_X1), x2.c_str(),
+                          (long long)cut_row_bytes(m, ds41_cut_liveset(m, RAD_PP_X2), RAD_PP_X2), m.pp_t,
+                          m.pp_rank == 1 && m.pp_dsp.on ? "; the leader's drafter KV group zeroed here" : "");
+        else
+            std::snprintf(line, sizeof line,
+                          "two-node pipeline (tp8 S6): the %s of W(%d,%d); X1 = %s (%lld B a row), X2 = %s (%lld B a row); the "
+                          "residual parts are the inputs of the boundary layer's mhc_post_collapse_rmsnorm (layers %d and %d); "
+                          "every KV group of the published declare in its order, the ones no held layer reads zeroed%s%s",
+                          m.pp_rank == 0 ? "leader" : "follower", m.pp_h, m.pp_t, x1.c_str(),
+                          (long long)cut_row_bytes(m, ds41_cut_liveset(m, RAD_PP_X1), RAD_PP_X1), x2.c_str(),
+                          (long long)cut_row_bytes(m, ds41_cut_liveset(m, RAD_PP_X2), RAD_PP_X2), m.pp_h, m.pp_t,
+                          m.pp_rank == 1 && m.pp_dsp.on ? "; the leader's drafter KV group zeroed here" : "", cp.c_str());
         rad_note(b, "%s", line);
         if (ctx->rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: deepseek41: %s\n", line);
+        /* tp8 S6: the copied sources' layers both nodes hold, for the core's KV-copy check (RADIANCE_PP_KV_CHECK): the
+         * group, the layer's place among this node's bound layers of it (ascending: the held sources and the copy), the
+         * layer */
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            for (const ds41layers::Crossing& cx : m.pp_cx) {
+                if (cx.src < 0) continue;
+                const int64_t r = c.ratio[(size_t)cx.src];
+                for (int which = 0; which < 2; ++which) {
+                    if (which == 0 ? !cx.latent : !cx.index) continue;
+                    const std::vector<char>& bd = which == 0 ? m.pp_binds.comp : m.pp_binds.index;
+                    int slot = 0;
+                    for (int l = 0; l < cx.src; ++l) slot += bd[(size_t)l] && c.ratio[(size_t)l] == r;
+                    const auto it = which == 0 ? m.comp.find(r) : m.index.find(r);
+                    if (it != (which == 0 ? m.comp.end() : m.index.end()))
+                        rad_pp_declare_kv_copy((int32_t)it->second, slot, cx.src);
+                }
+            }
     }
 }
 
@@ -4537,10 +4642,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* tp8 S4: X1, the embedding's output: the leader sends it after its all-reduce, the follower's prologue starts from
      * it where one process's starts from the lookup. Both nodes name both crossings' rows (rad_pp_crossing). */
     if (m.pp) {
-        if (!(m.pp_x1 = pp_stage_op(b, m, RAD_PP_X1))) return RAD_E_INVAL;
+        /* tp8 S6: at h > 0 X1 is the residual after layer h - 1, declared there (the layer loop below) */
+        if (m.pp_h == 0 && !(m.pp_x1 = pp_stage_op(b, m, RAD_PP_X1))) return RAD_E_INVAL;
         for (int ring : { (int)RAD_PP_X1, (int)RAD_PP_X2 }) {
             const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
-            rad_pp_declare_crossing(ring, cut_row_bytes(v), (int)v.size());
+            rad_pp_declare_crossing(ring, cut_row_bytes(m, v, ring), (int)v.size());
         }
     }
     m.expand = op(b, "cast",
@@ -4647,10 +4753,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* tp8 S3: only the layers this node holds (every layer when RADIANCE_DS41_LAYERS is unset); strict, a copy of a
      * foreign kv source's caches at its layer (lr_copy_layer) */
     for (int l = 0; l < c.n_layer; ++l) {
-        /* tp8 S4: the leader takes X2 in before layer t (and, where no fused pcn_a resolves, issues layer t-1's mhc_post
-         * itself); the follower sends it after layer t-1. */
-        if (m.pp && m.pp_rank == 0 && l == m.pp_t) {
-            if (!(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
+        /* tp8 S4 / S6: a node takes its crossing in before its first layer after the cut -- the leader X2 before layer t,
+         * the follower X1 before layer h (h > 0) -- then stores the copied source's entries into its copy and, where the
+         * boundary layer has no fused pcn_a (an Engram layer, or no library serves it), issues the previous layer's
+         * mhc_post itself (pp_post). The sender sends after its last layer before the cut: the leader X1 after layer h - 1
+         * (h > 0), the follower X2 after layer t - 1. */
+        const bool recv_here = m.pp && ((m.pp_rank == 0 && l == m.pp_t) || (m.pp_rank == 1 && m.pp_h > 0 && l == m.pp_h));
+        if (recv_here) {
+            const int ring = m.pp_rank == 0 ? RAD_PP_X2 : RAD_PP_X1;
+            rad_op& xo = ring == RAD_PP_X2 ? m.pp_x2 : m.pp_x1;
+            if (!(xo = pp_stage_op(b, m, ring))) return RAD_E_INVAL;
+            DS_TRY(pp_copy_declare(b, m, ring));
             m.pp_post = op(b, "mhc_post", { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
                            {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
             if (!m.pp_post) return RAD_E_INVAL;
@@ -4658,6 +4771,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.lr.held(l)) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
         else DS_TRY(lr_copy_layer(b, m, m.layers[(size_t)l], l));
         if (m.pp && m.pp_rank == 1 && l == m.pp_t - 1 && !(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
+        if (m.pp && m.pp_rank == 0 && m.pp_h > 0 && l == m.pp_h - 1 && !(m.pp_x1 = pp_stage_op(b, m, RAD_PP_X1)))
+            return RAD_E_INVAL;
     }
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
      * proxy's shell); none on a strict follower, whose last layer's output is the boundary */
@@ -4955,6 +5070,14 @@ static int psk_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     {
         const Layer& L = m.layers[(size_t)last];
         if (L.l == last && L.src && !L.e_ids && !L.tap && c.cand <= last) m.psk_l20 = last;
+        /* tp8 S6: a pipeline node takes the model's split layer whichever node holds it, so both nodes accept
+         * ds41_psk_l20 alike and cut every layer as one process does (the leader of W(10,t) does not hold 20) */
+        if (m.pp && m.psk_l20 < 0) {
+            bool tap = false;
+            for (int64_t t : m.dsp.taps.empty() ? m.pp_dsp.taps : m.dsp.taps) tap = tap || t == last;
+            const bool eng = std::find(c.ple.begin(), c.ple.end(), (int64_t)last) != c.ple.end();
+            if (c.is_src(last) && !eng && !tap && c.cand <= last) m.psk_l20 = last;
+        }
     }
     if (!ctx->shape_probe) {
         if (m.psk_l20 >= 0) {
@@ -5196,8 +5319,9 @@ static int kvr_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     std::string names;
     for (const auto* groups : { &m.index, &m.comp })
         for (const auto& kv : *groups) {
-            /* tp8 S4: a group this pipeline node zeroed holds nothing here to replicate */
-            if (std::find(m.pp_zero_r.begin(), m.pp_zero_r.end(), kv.first) != m.pp_zero_r.end()) continue;
+            /* tp8 S4: a group this pipeline node zeroed holds nothing here to replicate (S6: index / latent apart) */
+            const auto& zr = groups == &m.index ? m.pp_zero_r : m.pp_zero_cr;
+            if (std::find(zr.begin(), zr.end(), kv.first) != zr.end()) continue;
             DS_TRY(rad_kv_group_replicated(b, kv.second));
             names += (names.empty() ? "" : ", ") +
                      std::string(m.nm.f(groups == &m.index ? "kv_index_r%lld" : "kv_compressed_r%lld", (long long)kv.first));
@@ -5886,6 +6010,74 @@ static void media_engram(RadCtx* x, Model& m, const Layer& L, const RadBatch* ba
     }
 }
 
+/* ------------------------------------------------------------------ tp8 S4 / S6: the crossings in a step */
+/* Crossing `ring`'s issue on this node: the core's ring, then the parts (ds41_cut_liveset) -- the residual stream, the
+ * selections and the keep words over the boundary's live rows [lo, hi) (step(): the whole step; step_bi: the rows of the
+ * boundary layer's segments, which every layer after it runs a subset of), the copied source's entries over its work
+ * rows. Both nodes compute lo / hi and the work rows from the same batch, so the two ops agree (the trailer's layout
+ * word checks it). */
+static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64_t lo, int64_t hi) {
+    const int64_t T = batch->n_tok, S = batch->n_seq;
+    const rad_op op_ = ring == RAD_PP_X1 ? m.pp_x1 : m.pp_x2;
+    if (!m.pp_ring[ring]) m.pp_ring[ring] = rad_pp_query().ring[ring];
+    if (!m.pp_ring[ring] || !op_) {
+        rad_step_fail(x, "deepseek41: two-node pipeline: the core set up no ring for a crossing");
+        return false;
+    }
+    const ds41layers::Crossing& cx = m.pp_cx[ring];
+    const int64_t wr = cx.src >= 0 ? pp_work_rows(m, m.c.ratio[(size_t)cx.src], T, S) : T;
+    if (hi > T || hi <= lo) {   /* no live row: one row crosses (the op's range starts at 1; the receiver reads none) */
+        lo = std::max<int64_t>(0, std::min(lo, T - 1));
+        hi = lo + 1;
+    }
+    lo = std::max<int64_t>(0, lo);
+    static thread_local std::vector<RadOperand> o;
+    o.clear();
+    o.push_back(praw(m.pp_ring[ring], RAD_U8, 1));
+    for (const CutPart& p : ds41_cut_liveset(m, ring)) {
+        if (p.rows == CutRows::Step) o.push_back(brows(p.b, T));
+        else if (p.rows == CutRows::Work) o.push_back(brows(p.b, wr));
+        else o.push_back(lo == 0 ? brows(p.b, hi) : brow_slice(p.b, lo, hi - lo, p.pitch));
+    }
+    rad_issue(x, op_, o.data(), (int)o.size(), T);
+    return true;
+}
+/* The receiver's copy stores of the crossing into it (pp_copy_declare): the owner's entry stores over the same rows at
+ * the same pages (ratio > 1: the shipped tail pages; ratio 1: the batch's slot mapping), into this node's copy. `store`:
+ * the owner stored this pass (step_bi: not an all-replay pass, lever PSK-CR). */
+static bool pp_copy_issue(RadCtx* x, Model& m, const RadBatch* batch, int ring, bool store) {
+    const ds41layers::Crossing& cx = m.pp_cx[ring];
+    if (cx.src < 0 || !store) return true;
+    const int64_t T = batch->n_tok, S = batch->n_seq, r = m.c.ratio[(size_t)cx.src];
+    const int64_t wr = pp_work_rows(m, r, T, S);
+    RadOperand page = brows(m.page, wr);
+    if (r <= 1) {
+        const auto* cb = kv_batch(batch, m.comp[r]);
+        if (!cb || !cb->slot_mapping) {
+            rad_step_fail(x, "deepseek41: two-node pipeline: the copied source's group has no slot mapping");
+            return false;
+        }
+        page = praw(cb->slot_mapping, RAD_I32, T);
+    }
+    if (m.pp_cp_lat) RAD_ISSUE_N(x, m.pp_cp_lat, wr, brows(m.lat, wr), page, kv_cache(m.comp[r], cx.src));
+    if (m.pp_cp_idx) RAD_ISSUE_N(x, m.pp_cp_idx, wr, brows(m.ikn, wr), page, kv_cache(m.index[r], cx.src));
+    return true;
+}
+/* This node's crossing in at layer l (the leader X2 at t, the follower X1 at h > 0), or -1 */
+static int pp_recv_at(const Model& m, int l) {
+    if (!m.pp) return -1;
+    if (m.pp_rank == 0 && l == m.pp_t) return RAD_PP_X2;
+    if (m.pp_rank == 1 && m.pp_h > 0 && l == m.pp_h) return RAD_PP_X1;
+    return -1;
+}
+/* ... and out after layer l (the follower X2 after t - 1, the leader X1 after h - 1 when h > 0), or -1 */
+static int pp_send_after(const Model& m, int l) {
+    if (!m.pp) return -1;
+    if (m.pp_rank == 1 && l == m.pp_t - 1) return RAD_PP_X2;
+    if (m.pp_rank == 0 && m.pp_h > 0 && l == m.pp_h - 1) return RAD_PP_X1;
+    return -1;
+}
+
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
 static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vector<BiSeg>& sg, bool psk_only = false) {
     dkv_pass_reset(x, batch->n_tok);   /* lever DKV: nothing held at a pass's start */
@@ -6053,15 +6245,21 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             RAD_ISSUE_N(x, m.bi_sub, 2, praw(batch->cu_seqlens + s.s0, RAD_I32, 2),
                         praw(batch->cu_seqlens + s.s0, RAD_I32, 1), brow_slice(m.bi_cu, s.k, 1, 2));
 
-    /* the step's head ops: as step() (per-token, over the step) */
+    /* the step's head ops: as step() (per-token, over the step); tp8 S6: on a pipeline node as step() does them -- the
+     * leader's lookup, X1 at W(0, t), the streams where the node's first layer is layer 0's successor of the lookup */
     media_route(m, batch);
-    RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
-    m.mrows.step(x, batch, m.xcol, T);
-    if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
-    for (int64_t i = 0; i < c.hc; ++i)
-        RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
-    RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
-    RAD_ISSUE_N(x, m.pre1, T, bcol(m.pre_f, 0, 1, T));
+    if (!m.pp || m.pp_rank == 0) {
+        RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
+        m.mrows.step(x, batch, m.xcol, T);
+        if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
+    }
+    if (m.pp && m.pp_h == 0 && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
+    if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
+        for (int64_t i = 0; i < c.hc; ++i)
+            RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
+        RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
+        RAD_ISSUE_N(x, m.pre1, T, bcol(m.pre_f, 0, 1, T));
+    }
     if (m.sone && g_sw_one.load(std::memory_order_relaxed) > 0) RAD_ISSUE_N(x, m.sone, T, brows(m.mw.sgate, T));
     RAD_ISSUE_N(x, m.rope_a, T, pos, brows(m.cs_a, g.max_ctx));
     RAD_ISSUE_N(x, m.rope_b_step, T, pos, brows(m.cs_b, g.max_ctx));
@@ -6117,10 +6315,55 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         (hint ? hint->l20 : g_sw_psk_l20.load(std::memory_order_relaxed) > 0);
     /* lever PSK-CR: an all-replay pass stores no global KV, so the split layer is a plain cut layer there (no all-row
      * part) */
+    /* tp8 S6: the live rows [lo, hi) of the segments `cur` names (a crossing's residual / selection / keep rows) */
+    const auto live_span = [&](int64_t* lo, int64_t* hi) {
+        *lo = T;
+        *hi = 0;
+        for (const BiSeg& s : *cur) {
+            if (s.n <= 0) continue;
+            *lo = std::min(*lo, s.r0);
+            *hi = std::max(*hi, s.r0 + s.n);
+        }
+    };
     for (auto& L : m.layers) {
-        if (!m.lr.held(L.l)) continue;   /* tp8 S3: another node's layer */
-        const int l = L.l;
-        const int64_t r = L.r;
+        /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
+         * next held layer carries are the previous layer's) */
+        const bool held = m.lr.held(L.l);
+        const int l = held ? L.l : (int)(&L - m.layers.data());
+        const int64_t r = held ? L.r : c.ratio[(size_t)l];
+        /* tp8 S6: the receiver's first layer after the cut starts from the crossing: its live rows are the previous
+         * layer's segments (`cur`, not yet this layer's), over which one process issues the boundary op at the end of the
+         * previous layer -- issued the same here (rows(kBiNorm) as below), after this node's copy of the source's
+         * entries (stored unless the pass is all replay chunks, which store none: lever PSK-CR). */
+        if (const int ring = held ? pp_recv_at(m, l) : -1; ring >= 0) {
+            int64_t lo = 0, hi = 0;
+            live_span(&lo, &hi);
+            if (!pp_cross(x, m, batch, ring, lo, hi)) return;
+            if (!pp_copy_issue(x, m, batch, ring, !cr_all)) return;
+            if (L.pcn_a) {
+                const int64_t fmin = L.pcn_mix ? mhc_fuse_min() : 0;
+                t_mhc_a.clear();
+                t_mhc_a_l = L.l;
+                rows(kBiNorm, [&](int64_t r0, int64_t n) {
+                    if (fmin > 0 && n >= fmin) {
+                        RAD_ISSUE_N(x, L.pcn_mix, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                                    R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n),
+                                    RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base), R(m.pre_a, r0, n));
+                        t_mhc_a.push_back({ r0, n });
+                        mhc_note(x, n);
+                        return;
+                    }
+                    if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
+                    RAD_ISSUE_N(x, L.pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                                R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(L.attn_norm), R(m.xn, r0, n));
+                });
+            } else {
+                whole([&](int64_t r0, int64_t n) {
+                    RAD_ISSUE_N(x, m.pp_post, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                                R(m.h0, r0, n));
+                });
+            }
+        }
         /* lever PSK: from m.psk_first on, each prefill segment runs its last psk_rows(C_l, ahead, n) rows -- design 1
          * (ahead 0): its last C_l; design 2: the cone of its next target, none when that does not reach the chunk.
          * Lever PSK-L20: the last kv source too, as the split layer (`l20`): the cut below is its cone part's; its all-row
@@ -6143,13 +6386,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 const bool cr_seg = ip < crf.size() && crf[ip];
                 if (!(l >= m.psk_first || l20 || cr_seg)) { psk_sg.push_back(s0); continue; }   /* not cut here */
                 const int64_t n = psk_rows(C, psk_ahead(hint, ip), s0.n);
-                if (cr_seg && rad_rank(x) == 0) {
+                if (cr_seg && held && rad_rank(x) == 0) {
                     g_cr_rows_run.fetch_add(std::max<int64_t>(n, 0), std::memory_order_relaxed);
                     if (l < m.psk_first && !l20 && n < s0.n)
                         g_cr_rows_skip.fetch_add(s0.n - std::max<int64_t>(n, 0), std::memory_order_relaxed);
                 }
                 if (n >= s0.n) { psk_sg.push_back(s0); continue; }
-                if (rad_rank(x) == 0) {
+                if (held && rad_rank(x) == 0) {
                     g_psk_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
                     if (l20) g_psk_l20_rows.fetch_add(s0.n - n, std::memory_order_relaxed);
                     else if (l >= m.psk_first)
@@ -6172,16 +6415,26 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         /* lever PSK-L20: the split layer cut (its cone part over fewer rows); none of its cone part when no segment has a
          * row there -- the all-row part still runs, every cone-part op below issues over the empty segments / runs */
         const bool l20_none = l20 && cut && cur->empty();
-        if (l20 && cut && rad_rank(x) == 0) {
+        if (l20 && cut && held && rad_rank(x) == 0) {
             g_psk_l20_passes.fetch_add(1, std::memory_order_relaxed);
             if (l20_none) g_psk_l20_empty.fetch_add(1, std::memory_order_relaxed);
         }
         /* design 2: a layer no segment runs a row of is skipped whole (and so is every layer after it: the cones shrink
          * with l) -- no op, no collective; the runs stay empty for the final norm */
         if (cut && cur->empty() && !l20) {
-            if (rad_rank(x) == 0) g_psk_skips.fetch_add(1, std::memory_order_relaxed);
+            if (held && rad_rank(x) == 0) g_psk_skips.fetch_add(1, std::memory_order_relaxed);
+            /* tp8 S6: the sender's last layer before the cut sends its crossing whatever rows it ran (none here: the
+             * receiver's layers run none either, and the copied source's entries cross all the same) */
+            if (const int ring = held ? pp_send_after(m, l) : -1; ring >= 0) {
+                if (!pp_cross(x, m, batch, ring, T, 0)) return;
+                if (ring == RAD_PP_X2) {
+                    bt_flush(x, m, batch);
+                    return;
+                }
+            }
             continue;
         }
+        if (!held) continue;   /* tp8 S3 / S6: another node's layer: its cut only */
         const std::vector<BiSeg>& sg = *cur;   /* the layer's segments, below */
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
@@ -6455,7 +6708,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     g.max_ctx / r + 1, ((int64_t)batch->max_ctx_len + batch->max_q_len) / r + 1);
                 const int64_t kw = keep_words(live, c.cand_block);
                 const bool uses = c.cand >= 0 && c.cand < l;
-                const bool split = m.isplit && m.sel_gather;
+                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) */
+                const bool split = m.isplit && m.sel_gather && !(m.pp_unsplit_cand && l == c.cand);
                 const bool rkeep = L.i_keep && live >= m.keep_min_live;
                 size_t sj = 0;
                 for (size_t si = 0; si < sg.size(); ++si) {
@@ -6728,6 +6982,17 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bt_pt(x, m, m.mw.ew, T, "ew", l);
         bt_pt(x, m, m.mw.sout, T, "sout", l);
         bt_pt(x, m, m.act.x, T, "moe_out", l);
+        /* tp8 S6: the sender's last layer before the cut ends at the boundary op's inputs, which the crossing carries over
+         * this layer's live rows (the follower's t - 1: X2, then its pass ends; the leader's h - 1: X1, then its next
+         * layer is t) */
+        if (const int ring = pp_send_after(m, L.l); ring >= 0) {
+            int64_t lo = 0, hi = 0;
+            live_span(&lo, &hi);
+            if (!pp_cross(x, m, batch, ring, lo, hi)) return;
+            if (ring == RAD_PP_X1) continue;
+            bt_flush(x, m, batch);
+            return;
+        }
         /* post_f, or post_f with the next collapse + norm (a fused norm, by segment); never the AR_PCN forms here */
         const Layer* nx = next_layer(m, L.l);   /* tp8 S3: the next layer this node holds (a gap passes the streams on) */
         if (nx && nx->pcn_a) {
@@ -6834,13 +7099,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
     /* lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is always cut, so a step of more than one segment
      * runs in BI's segments even under ds41_bi 0 (then as ds41_bi 1: segments, no pieces) */
     const bool psk_plan = m.psk_first > 0 && psk_hint(batch) != nullptr;
-    /* tp8 S4: a pipeline node runs the plain step: BI's segments and PSK's cut passes carry no crossings yet (S5 / S6) */
-    if (m.pp && (psk_plan || (m.bi_sub && g_sw_bi.load(std::memory_order_relaxed) > 0) ||
-                 (m.psk_first > 0 && g_sw_psk.load(std::memory_order_relaxed) > 0))) {
-        rad_step_fail(x, "deepseek41: a two-node pipeline node runs no BI segments or PSK passes in this build (tp8 S4): "
-                         "start both nodes with fn4 ds41_bi 0 and ds41_psk 0 (switches.json)");
-        return;
-    }
+    /* tp8 S6: a pipeline node runs BI's segments and PSK's cut passes too (step_bi crosses at the cut, per node) */
     /* lever BI (ds41_bi 1): a step of more than one shape class runs in segments (step_bi) */
     if (m.bi_sub && (g_sw_bi.load(std::memory_order_relaxed) > 0 || psk_plan)) {
         static thread_local std::vector<BiSeg> sg;
@@ -6880,32 +7139,21 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * from there, and attn_sparse_sink recovers the base from it (docs/OPS.md). */
     const RadOperand wused = praw(wb->seqused, RAD_I32, S);
 
-    /* tp8 S4: a crossing's issue: the core's ring, then its parts over the step's rows */
-    const auto cross = [&](rad_op op_, int ring) -> bool {
-        if (!m.pp_ring[ring]) m.pp_ring[ring] = rad_pp_query().ring[ring];
-        if (!m.pp_ring[ring] || !op_) {
-            rad_step_fail(x, "deepseek41: two-node pipeline: the core set up no ring for a crossing");
-            return false;
-        }
-        const RadOperand rg = praw(m.pp_ring[ring], RAD_U8, 1);
-        if (ring == RAD_PP_X1) RAD_ISSUE_N(x, op_, T, rg, brows(m.xcol, T));
-        else
-            RAD_ISSUE_N(x, op_, T, rg, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T), brows(m.comb, T),
-                        brows(m.pre_f, T));
-        return true;
-    };
     media_route(m, batch);
     if (!m.pp || m.pp_rank == 0) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
     m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     }
-    /* X1: the leader's lookup out, the follower's in, where one process's lookup was */
-    if (m.pp && !cross(m.pp_x1, RAD_PP_X1)) return;
+    /* X1 at W(0, t): the leader's lookup out, the follower's in, where one process's lookup was (tp8 S6: at h > 0 X1 is
+     * the residual after layer h - 1, below, and the follower's layer h starts from it: no streams of its own here) */
+    if (m.pp && m.pp_h == 0 && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
+    if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));
     RAD_ISSUE_N(x, m.pre1, T, bcol(m.pre_f, 0, 1, T));
+    }
     if (m.sone && g_sw_one.load(std::memory_order_relaxed) > 0) RAD_ISSUE_N(x, m.sone, T, brows(m.mw.sgate, T));
     RAD_ISSUE_N(x, m.rope_a, T, pos, brows(m.cs_a, g.max_ctx));
     RAD_ISSUE_N(x, m.rope_b_step, T, pos, brows(m.cs_b, g.max_ctx));
@@ -6953,11 +7201,13 @@ static void step(RadCtx* x, const RadBatch* batch) {
         if (!m.lr.held(L.l)) continue;   /* tp8 S3: another node's layer */
         const int l = L.l;
         const int64_t r = L.r;
-        /* tp8 S4: the leader's layer t starts from the follower's X2 with the op that ends layer t-1 in one process:
-         * the fused post + collapse + norm (its M1 form where that is what one process takes), else mhc_post, after
-         * which this layer's own collapse runs as below. The same choice as the end of a layer (below). */
-        if (m.pp && m.pp_rank == 0 && l == m.pp_t) {
-            if (!cross(m.pp_x2, RAD_PP_X2)) return;
+        /* tp8 S4 / S6: the receiver's first layer after the cut (the leader's t, the follower's h > 0) starts from the
+         * crossing with the op that ends the layer before it in one process: the fused post + collapse + norm (its M1 form
+         * where that is what one process takes), else mhc_post, after which this layer's own collapse runs as below. The
+         * same choice as the end of a layer (below). The copied source's entries are stored into this node's copy first. */
+        if (const int ring = pp_recv_at(m, l); ring >= 0) {
+            if (!pp_cross(x, m, batch, ring, 0, T)) return;
+            if (!pp_copy_issue(x, m, batch, ring, true)) return;
             if (L.pcn_a) {
                 const int64_t fmin = L.pcn_mix ? mhc_fuse_min() : 0;
                 t_mhc_a.clear();
@@ -7226,7 +7476,8 @@ static void step(RadCtx* x, const RadBatch* batch) {
                  * idx_split switch (idx_balance()) a split step whose runs the ranks do not divide
                  * takes the balanced deal: an equal block of rows a rank, in runs within the
                  * declared ones -- the same loop and gather below, only R, q and the runs' bounds move. */
-                const bool split = m.isplit && m.sel_gather;
+                /* tp8 S6: the candidate layer unsplit where its keep words cross (Model::pp_unsplit_cand) */
+                const bool split = m.isplit && m.sel_gather && !(m.pp_unsplit_cand && l == c.cand);
                 const Ds41IdxRuns ru = ds41_idx_runs(T, m.irows, live, m.aw, m.ar, split, m.split_min_live,
                                                      split && idx_balance(), (int64_t)L.i_runs.size());
                 if (ru.balanced && m.ar == 0 && !g_idx_bal_noted.exchange(1, std::memory_order_relaxed)) {
@@ -7404,9 +7655,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin); under
          * RADIANCE_DS41_AR_PCN=2 with the block's all-reduce in front (the block left it to us: ar_out). */
         const Layer* nx = next_layer(m, L.l);   /* tp8 S3: the next layer this node holds (a gap passes the streams on) */
-        /* tp8 S4: the follower's last layer ends at the boundary op's inputs, which X2 carries to the leader */
-        if (m.pp && m.pp_rank == 1 && L.l == m.pp_t - 1) {
-            (void)cross(m.pp_x2, RAD_PP_X2);
+        /* tp8 S4 / S6: the sender's last layer before the cut ends at the boundary op's inputs, which the crossing carries
+         * (the follower's t - 1: X2, then its pass ends; the leader's h - 1: X1, then its next layer is t) */
+        if (const int ring = pp_send_after(m, L.l); ring >= 0) {
+            if (!pp_cross(x, m, batch, ring, 0, T)) return;
+            if (ring == RAD_PP_X1) continue;
             bt_flush(x, m, batch);
             return;
         }
