@@ -278,4 +278,39 @@ TEST(layers_s6_binds_hold_or_copy) {
     CHECK(b1.comp_zero_r[2] && b1.index_zero_r[2] && !b1.comp_zero_r[1]);
 }
 
+/* tp8 M56: lanes issue the leader's pass as a head ([0, h), X1) and a tail (X2, [t, 40)) with other lanes' parts
+ * between them, so a leader layer >= t must not read the selections / keep words of a leader layer < h. The plan's
+ * cuts read none; W(22,30) does (index layers 32 / 36 read the candidate layer 20's keep words), and so does W(22,23)
+ * (layer 23 reads index layer 20's selections). */
+TEST(layers_m56_lanes_head_tail_reads) {
+    const Geo g = flash1017();
+    for (const auto& c : std::vector<std::pair<int, int>>{ { 0, 20 }, { 10, 32 }, { 10, 33 }, { 10, 34 }, { 8, 34 },
+                                                           { 9, 32 }, { 0, 37 } })
+        CHECK(head_tail_reads(g, c.first, c.second).empty());
+    const std::vector<Dep> a = head_tail_reads(g, 22, 30);
+    REQUIRE(!a.empty());
+    bool keep32 = false, keep36 = false;
+    for (const Dep& d : a) {
+        CHECK(d.from < 22);
+        keep32 = keep32 || (d.layer == 32 && d.from == 20 && d.kind == Need::Keep);
+        keep36 = keep36 || (d.layer == 36 && d.from == 20 && d.kind == Need::Keep);
+    }
+    CHECK(keep32 && keep36);
+    const std::vector<Dep> b = head_tail_reads(g, 22, 23);
+    REQUIRE(!b.empty());
+    CHECK_EQ(b[0].layer, 23);
+    CHECK_EQ(b[0].from, 20);
+    CHECK(b[0].kind == Need::Sel);
+    /* every cut the geometry allows: a read is always of a leader layer below h by a leader layer at or past t */
+    int clean = 0;
+    for (int t = 1; t <= 37; ++t)
+        for (int h = 0; h < t; ++h) {
+            const std::vector<Dep> v = head_tail_reads(g, h, t);
+            for (const Dep& d : v) CHECK(d.from < h && d.layer >= t);
+            if (v.empty()) ++clean;
+        }
+    fprintf(stderr, "    %d of %d cuts W(h, t <= 37) can run lanes\n", clean, 37 * 38 / 2);
+    CHECK(clean > 0);
+}
+
 RAD_TEST_MAIN()
