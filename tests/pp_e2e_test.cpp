@@ -339,17 +339,17 @@ std::vector<int32_t> prompt_ids(uint64_t seed, size_t n) {
 struct Serving {
     Proc fol, lead;
     int port = 0, pp_port = 0;
-    bool start(const std::string& cut, const std::vector<std::string>& extra = {}) {
+    bool start(const std::string& cut, const std::vector<std::string>& extra = {}, const std::vector<std::string>& env = {}) {
         World& w = world();
         std::vector<std::string> a = cat({ "--host", "127.0.0.1", "--port", "0", "--http-threads", "4" }, shape());
         a = cat(a, extra);
         if (!cut.empty()) {
             pp_port = free_port();
-            if (!fol.start(engine_argv(w.llama_rad, cat(a, pp_args(1, pp_port, cut))), engine_env())) return false;
+            if (!fol.start(engine_argv(w.llama_rad, cat(a, pp_args(1, pp_port, cut))), engine_env(env))) return false;
             if (!fol.wait_for("waiting on", 60)) return false;
             a = cat(a, pp_args(0, pp_port, cut));
         }
-        if (!lead.start(engine_argv(w.llama_rad, a), engine_env())) return false;
+        if (!lead.start(engine_argv(w.llama_rad, a), engine_env(env))) return false;
         static const std::string kTag = "listening on http://127.0.0.1:";
         if (!lead.wait_for(kTag, 120)) {
             fprintf(stderr, "    the leader did not start:\n%s\n    follower:\n%s\n", tail(lead.output()).c_str(),
@@ -675,6 +675,60 @@ TEST(a_prefix_hit_across_the_cut_serves_one_process_tokens) {
         CHECK(!ref[i].empty());
         if (ref[i] != got[i]) fprintf(stderr, "    request %zu: the pipeline's tokens differ\n", i);
         CHECK(ref[i] == got[i]);
+    }
+}
+
+/* (review of S6) The prefix hit across the cut with the KV copy on (RADIANCE_LLAMA_PP_KVCOPY + RADIANCE_PP_KV_CHECK=1):
+ * the second request's hit reuses blocks whose copied layer the follower wrote in the first request's steps, and every
+ * check over the handed-out blocks finds the copy = the owner's; and RADIANCE_PP_PREFIX_CACHE=0 (S4's rule, both nodes):
+ * no hit at all, the same tokens (the chunk plan is the cache's either way). */
+TEST(a_prefix_hit_with_the_kv_copy_and_the_cache_off_switch) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> base = prompt_ids(41, 300);
+    std::vector<int32_t> longer = base;
+    const std::vector<int32_t> more = prompt_ids(42, 40);
+    longer.insert(longer.end(), more.begin(), more.end());
+    struct Arm { const char* cut; std::vector<std::string> env; };
+    const Arm arms[] = { { "", {} },
+                         { "1,3", { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" } },
+                         { "1,3", { "RADIANCE_PP_PREFIX_CACHE=0" } } };
+    std::vector<std::vector<int32_t>> out[3];
+    double hits[3] = { -1, -1, -1 };
+    std::string flog[3], llog[3];
+    for (int k = 0; k < 3; ++k) {
+        Serving sv;
+        REQUIRE(sv.start(arms[k].cut, {}, arms[k].env));
+        out[k].push_back(complete(sv.port, base, 16));
+        out[k].push_back(complete(sv.port, longer, 16));
+        out[k].push_back(complete(sv.port, base, 8));
+        hits[k] = metric(get(sv.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        llog[k] = sv.lead.output();
+        if (*arms[k].cut) {
+            CHECK_EQ(sv.fol.finish(30), 0);
+            flog[k] = sv.fol.output();
+        }
+    }
+    fprintf(stderr, "    attention-cached prompt tokens: one process %.0f, W(1,3) + KV copy %.0f, W(1,3) cache off %.0f\n",
+            hits[0], hits[1], hits[2]);
+    CHECK(hits[0] > 0);
+    CHECK_EQ(hits[1], hits[0]);
+    CHECK_EQ(hits[2], 0.0);
+    size_t eq = 0, at = 0;
+    while ((at = flog[1].find("on both nodes (", at)) != std::string::npos) { ++eq; ++at; }
+    fprintf(stderr, "    W(1,3) + KV copy: %zu KV-copy checks equal\n", eq);
+    CHECK(eq >= 4);
+    CHECK(flog[1].find("NOT the owner's bytes") == std::string::npos);
+    CHECK(llog[2].find("RADIANCE_PP_PREFIX_CACHE=0") != std::string::npos);
+    CHECK(flog[2].find("RADIANCE_PP_PREFIX_CACHE=0") != std::string::npos);
+    for (int k = 1; k < 3; ++k) {
+        REQUIRE_EQ(out[k].size(), out[0].size());
+        for (size_t i = 0; i < out[0].size(); ++i) {
+            CHECK(!out[0][i].empty());
+            if (out[k][i] != out[0][i]) fprintf(stderr, "    arm %d request %zu: the pipeline's tokens differ\n", k, i);
+            CHECK(out[k][i] == out[0][i]);
+        }
     }
 }
 
