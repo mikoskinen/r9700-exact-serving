@@ -30,6 +30,7 @@
 
 #include "ds41_engram_dedup.h"
 #include "ds41_index_split.h"
+#include "ds41_layers.h"
 #include "ds41_psk_cone.h"
 #include "ds41_etp.h"
 #include "ds41_walk_geom.h"
@@ -658,10 +659,61 @@ struct Model {
      * inference/model.py's names (ckpt_name), `n_stage` DSpark stages (mtp.*) after the trunk. */
     bool release = false;
     int n_stage = 0;
+    /* tp8 S3 (ds41_layers.h): this node's layer ranges (RADIANCE_DS41_LAYERS, _MODE); lr.on false = every layer, the
+     * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
+    ds41layers::Spec lr{};
+    std::vector<ds41layers::Dep> lr_deps;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
 static thread_local Model* naming = nullptr;
+
+/* ------------------------------------------------------------------ tp8 S3: the node's layer ranges (ds41_layers.h) */
+/* The layer the step runs after `l`: l + 1, or (layer ranges) the next layer this node holds; null after the last. */
+static const Layer* next_layer(const Model& m, int l) {
+    if (!m.lr.on) return l + 1 < m.c.n_layer ? &m.layers[(size_t)l + 1] : nullptr;
+    const int n = m.lr.next[(size_t)l];
+    return n >= 0 ? &m.layers[(size_t)n] : nullptr;
+}
+/* The embedding, the final norm and the head (and the logits the engine samples): every layer, a proxy node (it runs
+ * alone), or the leader of a strict one. */
+static bool lr_shell(const Model& m) { return !m.lr.on || !m.lr.strict || m.lr.leader; }
+/* The Engram tables and token map: every layer, or a node that holds an Engram layer. */
+static bool lr_engram(const Model& m) {
+    if (!m.lr.on) return true;
+    for (int64_t l : m.c.ple)
+        if (m.lr.held((int)l)) return true;
+    return false;
+}
+/* Proxy: the node's first layer past 0 starts as layer 0 does (the embedding over the streams, one-hot gates), so its
+ * attention connection is the plain collapse + norm, not the post of a layer the node does not run. */
+static bool lr_synth_start(const Model& m, int l) { return m.lr.on && !m.lr.strict && l > 0 && l == m.lr.first; }
+/* The index plane's keep words: some held layer is the candidate layer or an index layer past it. */
+static bool lr_keep_used(const Model& m) {
+    if (!m.lr.on) return true;
+    const auto& c = m.c;
+    for (int l = 0; l < (int)c.n_layer; ++l)
+        if (m.lr.held(l) && c.cand >= 0 && (l == c.cand || (c.is_idx(l) && l > c.cand))) return true;
+    return false;
+}
+static ds41layers::Geo lr_geo(const Model& m) {
+    const auto& c = m.c;
+    ds41layers::Geo g;
+    g.n_layer = (int)c.n_layer;
+    g.ratio = c.ratio;
+    g.src_of = c.src_of;
+    g.idx_of = c.idx_of;
+    g.is_src.assign((size_t)c.n_layer, 0);
+    g.is_idx.assign((size_t)c.n_layer, 0);
+    for (int l = 0; l < (int)c.n_layer; ++l) {
+        g.is_src[(size_t)l] = c.is_src(l) ? 1 : 0;
+        g.is_idx[(size_t)l] = c.is_idx(l) ? 1 : 0;
+    }
+    g.cand = (int)c.cand;
+    for (int64_t l : c.ple) g.ple.push_back((int)l);
+    for (int64_t t : m.dsp.taps) g.taps.push_back((int)t);
+    return g;
+}
 
 /* The checkpoint tensor a declared weight is read from. The declared names are llama.cpp's GGUF
  * names (`blk.N.attn_q_a.weight`, the drafter's stages as blk.{n_layer + s}), which a GGUF ships as
@@ -2395,7 +2447,8 @@ static int buffers(RadBuilder* b, Model& m) {
     /* score_rows (lever VA "arena", a sizing declare below irows): no split at such a step, so the
      * selections are its rows too. */
     m.score = decl_b(b, nm.f("index_score"), RAD_F32, { m.score_rows ? m.score_rows : m.irows, m.cmax });
-    if (m.kwords > 0) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
+    /* (layer ranges: only where a held layer writes or reads it) */
+    if (m.kwords > 0 && lr_keep_used(m)) m.keep = decl_b(b, nm.f("index_keep"), RAD_I32, { T, m.kwords });
     /* Split: the gather lays aw parts of qmax runs of at most irows rows, rank r's at r qmax R. */
     /* lever BI: a prefill segment's split runs are laid from its first row, so up to a decode segment's rows (48)
      * past the unsplit plane; lever PSK: a cut segment's runs from its cut row, up to the ranks' runs past the step */
@@ -2407,7 +2460,7 @@ static int buffers(RadBuilder* b, Model& m) {
                             { m.score_rows ? std::min(m.score_rows, m.qmax * m.irows) : m.qmax * m.irows, c.itopk });
     m.cs_a = decl_b(b, nm.f("rope_window"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
     m.cs_b = decl_b(b, nm.f("rope_compressed"), RAD_F32, { g.max_ctx, c.rope }, RAD_BUF_PERSIST);
-    if (!c.ple.empty()) {
+    if (!c.ple.empty() && lr_engram(m)) {   /* (layer ranges: a node that holds an Engram layer) */
         m.ctok = decl_b(b, nm.f("engram_tokens"), RAD_I32, { T });
         /* The gathered rows are host domain, as rad_block_ple.h's: a host gather (the table on the
          * disk or RAM tier) whose operands are all host-arena buffers joins on the last device op
@@ -2746,8 +2799,8 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     if (!m.zero) {
         L.attn_norm = w("blk.%d.attn_norm.weight", RAD_F32, { D });
         /* The previous layer's post_f writes h0 straight into this collapse unless an Engram
-         * block (above) rewrites h0 between them. */
-        if (l > 0 && !L.e_ids)
+         * block (above) rewrites h0 between them (or, a proxy node's first layer, nothing ran before it here). */
+        if (l > 0 && !L.e_ids && !lr_synth_start(m, l))
             L.pcn_a = post_collapse_norm(b, m, T, L.attn_norm, m.act.x, m.h1, m.h0, m.pre_f,
                                          m.xcol, m.xn);
         /* lever M1 (RADIANCE_DS41_MHC_FUSE): pcn_a + mix_a as one op, beside the pair (fused(): 0 where no library
@@ -3981,6 +4034,123 @@ static void i11_declare(Model& m, const RadBuildCtx* ctx);                  /* l
 static void rf_declare(Model& m, const RadBuildCtx* ctx);                   /* lever FUSE-R, below */
 static void p1_declare(Model& m, const RadBuildCtx* ctx);                   /* lever P, below */
 
+/* tp8 S3 (ds41_layers.h): RADIANCE_DS41_LAYERS / _MODE read against the model (read_cfg has run). Unset, or every layer:
+ * m.lr.on stays false and nothing below this differs from the published declare. Refused where a lever's shape assumes
+ * every layer (the AR_PCN collectives pair a layer with the one before it; --calib-layers is the calibration's own range). */
+static int lr_read(Model& m, const RadBuildCtx* ctx) {
+    std::string err;
+    if (ds41layers::parse(std::getenv("RADIANCE_DS41_LAYERS"), std::getenv("RADIANCE_DS41_LAYERS_MODE"), (int)m.c.n_layer,
+                          &m.lr, &err) < 0) {
+        fprintf(stderr, "radiance: deepseek41: %s\n", err.c_str());
+        return RAD_E_INVAL;
+    }
+    if (!m.lr.on) {
+        if (!m.lr.text.empty() && ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LAYERS=%s holds every layer: the published engine\n",
+                    m.lr.text.c_str());
+        return RAD_OK;
+    }
+    const char* why = ds41_ar_pcn_mode() != 0                  ? "RADIANCE_DS41_AR_PCN's collectives pair a layer with the one before it"
+                      : (ctx->calib_dir && ctx->calib_dir[0]) ? "calibration records its own layers (--calib-layers)"
+                                                              : nullptr;
+    if (why) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LAYERS=%s is not built with this: %s\n", m.lr.text.c_str(), why);
+        return RAD_E_UNSUPPORTED;
+    }
+    return RAD_OK;
+}
+
+/* After dsp_config: the drafter only where its taps are held (and, strict, on the leader), then what the node's layers
+ * read from another node. A proxy runs alone, so it is refused when that is anything (S6 builds the copies). */
+static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
+    if (!m.lr.on) return RAD_OK;
+    bool taps = !m.dsp.taps.empty();
+    for (int64_t t : m.dsp.taps) taps = taps && m.lr.held((int)t);
+    const bool want = m.lr.strict ? m.lr.leader : taps;   /* strict: the leader's drafter, whatever it needs */
+    if (m.dsp.on && !want) {
+        rad_note(b, "DSpark drafter NOT declared on this node (RADIANCE_DS41_LAYERS=%s): %s", m.lr.text.c_str(),
+                 m.lr.strict ? "the leader's (the node that holds the last layer)" : "its taps are another node's layers");
+        m.dsp = Dsp{};
+    }
+    m.lr_deps = ds41layers::needs(lr_geo(m), m.lr, m.dsp.on || (m.lr.strict && m.lr.leader && !m.dsp.taps.empty()));
+    if (!m.lr.strict && !m.lr_deps.empty()) {
+        fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_LAYERS=%s (proxy, this node alone): %s -- another node computes "
+                        "these (tp8 S6: the KV copies, selections and keep words across the nodes). A proxy runs only a node "
+                        "whose layers read none of them (W(0,20)'s 0:20 and 20:40); RADIANCE_DS41_LAYERS_MODE=strict declares "
+                        "this node's part with copies of the foreign kv sources (declare only)\n",
+                m.lr.text.c_str(), ds41layers::describe(m.lr_deps).c_str());
+        return RAD_E_UNSUPPORTED;
+    }
+    (void)ctx;
+    return RAD_OK;
+}
+
+/* A strict node's copy of a foreign kv source's caches at that source's layer `l`: the group (shared with the node's own
+ * sources of that ratio), the entry store that fixes its block size (declared, never issued here: S6's import fills it),
+ * the layer's binding. Nothing for any other layer the node does not hold. */
+static int lr_copy_layer(RadBuilder* b, Model& m, Layer& L, int l) {
+    L.l = l;
+    if (!m.lr.on || !m.lr.strict) return RAD_OK;
+    const auto& c = m.c;
+    for (const ds41layers::Copy& cp : ds41layers::copies(m.lr_deps)) {
+        if (cp.layer != l) continue;
+        const int64_t r = c.ratio[(size_t)l], rows = r > 1 ? m.work : m.g.max_tok, hd = c.head_dim;
+        L.r = r;
+        if (r <= 0) return RAD_E_INVAL;
+        if (cp.index) {
+            if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", index_slots(m), r))) return RAD_E_INVAL;
+            L.k_st = entry_store(b, rows, c.idim, r, m.ikn, m.page, m.ikmx ? "mxfp4" : nullptr);
+            if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
+            DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
+        }
+        if (cp.latent) {
+            if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", latent_slots(m, hd), r)))
+                return RAD_E_INVAL;
+            L.l_st = entry_store(b, rows, hd, r, m.lat, m.page, m.lnv ? "nvfp4" : nullptr);
+            if (rad_kv_block_size(b, m.comp[r]) != r) return RAD_E_INVAL;
+            DS_TRY(rad_bind_layer_kv(b, l, m.comp[r]));
+        }
+    }
+    return RAD_OK;
+}
+
+/* The node's line (rank 0's real declare, and a note in the graph): its layers, roles, expert units a rank (what the S3
+ * pass criterion checks resident: the mover's slab slots against it, no pinned pool slot), its kv sources and copies. */
+static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
+    if (!m.lr.on) return;
+    const auto& c = m.c;
+    int moe = 0, eng = 0;
+    std::string own_src;
+    for (const Layer& L : m.layers) {
+        if (!m.lr.held(L.l)) continue;
+        moe += L.moe.op_router ? 1 : 0;
+        if (L.src) own_src += (own_src.empty() ? "" : " ") + std::to_string(L.l);
+        eng += L.e_ids ? 1 : 0;
+    }
+    const int64_t per = m.etp ? c.n_expert : c.n_expert / std::max(m.g.world, 1);
+    const int64_t trunk = (int64_t)moe * per, draft = m.dsp.on ? (int64_t)m.dsp.n_stage * m.dsp.ne_rank : 0;
+    std::string cps;
+    for (const ds41layers::Copy& cp : ds41layers::copies(m.lr_deps))
+        cps += (cps.empty() ? "" : ", ") + std::to_string(cp.layer) + (cp.latent && cp.index ? " (latent + index keys)"
+                                                                       : cp.latent           ? " (latent)"
+                                                                                             : " (index keys)");
+    char line[2048];
+    std::snprintf(line, sizeof line,
+                  "layer ranges RADIANCE_DS41_LAYERS=%s (%s): %d of %lld trunk layers, %s; embedding + final norm "
+                  "+ head %s; DSpark drafter %s; Engram layers %d; kv sources held [%s]%s%s; routed expert units a rank "
+                  "%lld trunk (%d MoE layers x %lld) + %lld drafter = %lld -- all resident iff the mover's slab slots >= "
+                  "%lld and its pinned pool slots are 0 (--host-pool-mib 0)%s%s",
+                  m.lr.text.c_str(), m.lr.strict ? "strict: this node's part only, declare only" : "proxy: the stage alone",
+                  m.lr.n_own, (long long)c.n_layer, m.lr.leader ? "the leader" : "a follower",
+                  m.lr.leader ? "held (the leader's)" : lr_shell(m) ? "declared as the proxy's shell (the leader's)" : "not declared",
+                  m.dsp.on ? "declared" : "not declared", eng, own_src.c_str(), cps.empty() ? "" : "; copies of foreign sources ",
+                  cps.c_str(), (long long)trunk, moe, (long long)per, (long long)draft, (long long)(trunk + draft),
+                  (long long)(trunk + draft), m.lr_deps.empty() ? "" : "; reads from another node: ",
+                  m.lr_deps.empty() ? "" : ds41layers::describe(m.lr_deps).c_str());
+    rad_note(b, "%s", line);
+    if (ctx->rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: deepseek41: %s\n", line);
+}
+
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
         return RAD_E_INVAL;
@@ -4020,11 +4190,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.nm = Names(ctx->scope);
     auto& nm = m.nm;
     DS_TRY(read_cfg(m.c, meta));
+    DS_TRY(lr_read(m, ctx));   /* tp8 S3: the node's layer ranges (unset: every layer) */
     m.release = is_release(meta);
     m.n_stage = (int)gi(meta, "nextn_predict_layers", 0);
     naming = &m;
     DS_TRY(geometry(m, ctx));
     DS_TRY(dsp_config(b, m, meta, ctx));
+    DS_TRY(lr_settle(b, m, ctx));
     const auto& c = m.c;
     auto& g = m.g;
     int64_t rmin = 0;
@@ -4061,8 +4233,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (ds41_arena_decode_rows() > 0 && g.max_tok < m.irows) m.score_rows = g.max_tok;
     }
     DS_TRY(buffers(b, m));
-    /* Pictures: the container's tower with an encoder budget (rad_block_ds41_vision.h; Model::media). */
-    m.media = Ds41Vision::present(meta) && ctx->max_enc_patches > 0;
+    /* Pictures: the container's tower with an encoder budget (rad_block_ds41_vision.h; Model::media). Not on a node with
+     * layer ranges (tp8 S3: the tower is the leader's, and its rows' Engram masks are another node's layers). */
+    m.media = Ds41Vision::present(meta) && ctx->max_enc_patches > 0 && !m.lr.on;
+    if (m.lr.on && Ds41Vision::present(meta) && ctx->max_enc_patches > 0)
+        rad_note(b, "pictures: off on a node with layer ranges (RADIANCE_DS41_LAYERS=%s)", m.lr.text.c_str());
     if (m.media) {
         const int64_t Tm = g.max_tok, K = c.top_k;
         m.vl_ids = decl_b(b, nm.f("vl_ids"), RAD_I32, { Tm, K });
@@ -4085,46 +4260,49 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The vocabulary is split over the ranks (shard_extent): the lookup gives zeros outside this
      * rank's rows and an all-reduce completes it; the head's logits stay sharded for the sampler. */
     const int64_t v0 = g.vocab_off, v1 = g.vocab_off + g.n_vocab;
-    m.token = lw(b, m, nm.f("token_embd.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1,
-                 false, RAD_ACCESS_VOCAB);
-    m.head = lw(b, m, nm.f("output.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1, false,
-                RAD_ACCESS_VOCAB);
-    if (!m.token || !m.head) return RAD_E_INVAL;
-    m.final_gain = wt(b, nm.f("output_norm.weight"), RAD_F32, { D }, grp_model());
-    /* A GGUF's table in llama.cpp's blocks is gathered from them (embed_lookup_ggml). */
-    const auto tt = m.wty.find(m.token);
-    const auto ts = m.wsc.find(m.token);
-    const auto tc = m.wcod.find(m.token);
-    if (ts != m.wsc.end() && tc != m.wcod.end() && tc->second != RAD_F8E4M3)
-        m.embed = op(b, "embed_lookup_iqr",
-                     { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
-                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
-                     { m.token, ts->second }, {}, { m.xcol });
-    else if (ts != m.wsc.end() && tc != m.wcod.end() && tc->second == RAD_F8E4M3)
-        m.embed = op(b, "embed_lookup_q",
-                     { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
-                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off),
-                       RAD_F64("wscale", 1.0) },
-                     { m.token, ts->second }, {}, { m.xcol });
-    else if (tt != m.wty.end())
-        m.embed = op(b, "embed_lookup_ggml",
-                     { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
-                       RAD_STR("type", tt->second), RAD_STR("dtype", "bf16"),
-                       RAD_INT("vocab_offset", g.vocab_off) },
-                     { m.token }, {}, { m.xcol });
-    else
-        m.embed = op(b, "embed_lookup",
-                     { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
-                       RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
-                     { m.token }, {}, { m.xcol });
-    /* Pictures: the encoder's rows over the lookup, before the vocabulary all-reduce completes it (rank 0 holds the
-     * rows, every other rank zeros: RadBatch::mm_embd). */
-    if (m.media) DS_TRY(m.mrows.declare(b, T, D, m.xcol));
-    if (g.world > 1)
-        m.embed_ar = op(b, "all_reduce",
-                        { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
-                          RAD_STR("dtype", "bf16"), RAD_INT("exact", 1) },
-                        {}, { m.xcol }, { m.xcol });
+    /* tp8 S3: the embedding, the head and the final norm's gain where lr_shell() (not on a strict follower) */
+    if (lr_shell(m)) {
+        m.token = lw(b, m, nm.f("token_embd.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1,
+                     false, RAD_ACCESS_VOCAB);
+        m.head = lw(b, m, nm.f("output.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1, false,
+                    RAD_ACCESS_VOCAB);
+        if (!m.token || !m.head) return RAD_E_INVAL;
+        m.final_gain = wt(b, nm.f("output_norm.weight"), RAD_F32, { D }, grp_model());
+        /* A GGUF's table in llama.cpp's blocks is gathered from them (embed_lookup_ggml). */
+        const auto tt = m.wty.find(m.token);
+        const auto ts = m.wsc.find(m.token);
+        const auto tc = m.wcod.find(m.token);
+        if (ts != m.wsc.end() && tc != m.wcod.end() && tc->second != RAD_F8E4M3)
+            m.embed = op(b, "embed_lookup_iqr",
+                         { RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                           RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
+                         { m.token, ts->second }, {}, { m.xcol });
+        else if (ts != m.wsc.end() && tc != m.wcod.end() && tc->second == RAD_F8E4M3)
+            m.embed = op(b, "embed_lookup_q",
+                         { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                           RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off),
+                           RAD_F64("wscale", 1.0) },
+                         { m.token, ts->second }, {}, { m.xcol });
+        else if (tt != m.wty.end())
+            m.embed = op(b, "embed_lookup_ggml",
+                         { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                           RAD_STR("type", tt->second), RAD_STR("dtype", "bf16"),
+                           RAD_INT("vocab_offset", g.vocab_off) },
+                         { m.token }, {}, { m.xcol });
+        else
+            m.embed = op(b, "embed_lookup",
+                         { RAD_RANGE("M", 1, T), RAD_INT("n_embd", D), RAD_INT("n_vocab", g.n_vocab),
+                           RAD_STR("dtype", "bf16"), RAD_INT("vocab_offset", g.vocab_off) },
+                         { m.token }, {}, { m.xcol });
+        /* Pictures: the encoder's rows over the lookup, before the vocabulary all-reduce completes it (rank 0 holds the
+         * rows, every other rank zeros: RadBatch::mm_embd). */
+        if (m.media) DS_TRY(m.mrows.declare(b, T, D, m.xcol));
+        if (g.world > 1)
+            m.embed_ar = op(b, "all_reduce",
+                            { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
+                              RAD_STR("dtype", "bf16"), RAD_INT("exact", 1) },
+                            {}, { m.xcol }, { m.xcol });
+    }
     m.expand = op(b, "cast",
                   { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("from", "bf16"),
                     RAD_STR("to", "bf16") },
@@ -4156,7 +4334,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          RAD_F64("yarn_low", c.yarn_low), RAD_F64("yarn_high", c.yarn_high),
                          RAD_F64("yarn_magnitude", 1.0) },
                        {}, {}, { m.cs_b });
-    if (!c.ple.empty()) {
+    if (!c.ple.empty() && lr_engram(m)) {   /* (layer ranges: a node that holds an Engram layer) */
         m.tmap = wt(b, "deepseek41.engram.token_map", RAD_I32, { c.n_vocab }, grp_model());
         /* Bf16, or a single-level affine encoding (codes, a scale per group, an optional
          * codebook: a GGUF's IQ4_NL, Q8_0, Q4_0) read in place from its stored planes, since the
@@ -4226,46 +4404,55 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.calib_lo = ctx->calib_layer_lo;
         m.calib_hi = ctx->calib_layer_hi > ctx->calib_layer_lo ? ctx->calib_layer_hi : (int)c.n_layer;
     }
-    for (int l = 0; l < c.n_layer; ++l) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
-    m.pcn_fin = post_collapse_norm(b, m, T, m.final_gain, m.act.x, m.h1, m.h0, m.pre_f, m.xcol,
-                                   m.final_hidden);
-    if (m.pcn_fin && c.n_layer > 0)
-        DS_TRY(ar_pcn_moe_declare(b, m, m.layers[(size_t)c.n_layer - 1], T, m.final_gain, m.final_hidden,
-                                  &m.ar_pcn_fin));
-    if (!m.pcn_fin)
-        m.cn_fin = collapse_norm(b, m, T, m.final_gain, m.h0, m.pre_f, m.xcol, m.final_hidden);
-    if (!m.pcn_fin && !m.cn_fin) {
-        m.contract = op(b, "mhc_collapse",
-                        { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
-                        {}, { m.h0, m.pre_f }, { m.xcol });
-        m.fnorm = rmsnorm(b, m, T, m.final_gain, D, m.xcol, m.final_hidden);
+    /* tp8 S3: only the layers this node holds (every layer when RADIANCE_DS41_LAYERS is unset); strict, a copy of a
+     * foreign kv source's caches at its layer (lr_copy_layer) */
+    for (int l = 0; l < c.n_layer; ++l) {
+        if (m.lr.held(l)) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
+        else DS_TRY(lr_copy_layer(b, m, m.layers[(size_t)l], l));
     }
-    m.gather = op(b, "gather_rows",
-                  { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
-                  {}, { m.final_hidden }, { m.logit_input });
-    const auto ht = m.wty.find(m.head);
-    const auto hs = m.wsc.find(m.head);
-    const auto hc = m.wcod.find(m.head);
-    if (hs != m.wsc.end() && hc != m.wcod.end() && hc->second == RAD_I8)
-        m.head_op = op(b, "logits_gemm_iqr",
-                       { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
-                         RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
-                       { m.head, hs->second }, { m.logit_input }, { m.logits });
-    else if (hs != m.wsc.end() && hc != m.wcod.end())
-        m.head_op = op(b, "logits_gemm",
-                       { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
-                         RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
-                       { m.head }, { m.logit_input }, { m.logits });
-    else if (ht != m.wty.end())
-        m.head_op = op(b, "logits_gemm_ggml",
-                       { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
-                         RAD_INT("n_embd", D), RAD_STR("type", ht->second), RAD_STR("dtype", "bf16") },
-                       { m.head }, { m.logit_input }, { m.logits });
-    else
-        m.head_op = op(b, "logits_gemm",
-                       { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
-                         RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
-                       { m.head }, { m.logit_input }, { m.logits });
+    /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
+     * proxy's shell); none on a strict follower, whose last layer's output is the boundary */
+    if (lr_shell(m)) {
+        m.pcn_fin = post_collapse_norm(b, m, T, m.final_gain, m.act.x, m.h1, m.h0, m.pre_f, m.xcol,
+                                       m.final_hidden);
+        if (m.pcn_fin && c.n_layer > 0)
+            DS_TRY(ar_pcn_moe_declare(b, m, m.layers[(size_t)(m.lr.on ? m.lr.last : c.n_layer - 1)], T, m.final_gain,
+                                      m.final_hidden, &m.ar_pcn_fin));
+        if (!m.pcn_fin)
+            m.cn_fin = collapse_norm(b, m, T, m.final_gain, m.h0, m.pre_f, m.xcol, m.final_hidden);
+        if (!m.pcn_fin && !m.cn_fin) {
+            m.contract = op(b, "mhc_collapse",
+                            { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
+                            {}, { m.h0, m.pre_f }, { m.xcol });
+            m.fnorm = rmsnorm(b, m, T, m.final_gain, D, m.xcol, m.final_hidden);
+        }
+        m.gather = op(b, "gather_rows",
+                      { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n", D), RAD_STR("dtype", "bf16") },
+                      {}, { m.final_hidden }, { m.logit_input });
+        const auto ht = m.wty.find(m.head);
+        const auto hs = m.wsc.find(m.head);
+        const auto hc = m.wcod.find(m.head);
+        if (hs != m.wsc.end() && hc != m.wcod.end() && hc->second == RAD_I8)
+            m.head_op = op(b, "logits_gemm_iqr",
+                           { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                             RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
+                           { m.head, hs->second }, { m.logit_input }, { m.logits });
+        else if (hs != m.wsc.end() && hc != m.wcod.end())
+            m.head_op = op(b, "logits_gemm",
+                           { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                             RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
+                           { m.head }, { m.logit_input }, { m.logits });
+        else if (ht != m.wty.end())
+            m.head_op = op(b, "logits_gemm_ggml",
+                           { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                             RAD_INT("n_embd", D), RAD_STR("type", ht->second), RAD_STR("dtype", "bf16") },
+                           { m.head }, { m.logit_input }, { m.logits });
+        else
+            m.head_op = op(b, "logits_gemm",
+                           { RAD_RANGE("M", 1, g.max_logit_rows), RAD_INT("n_vocab", g.n_vocab),
+                             RAD_INT("n_embd", D), RAD_STR("dtype", "bf16") },
+                           { m.head }, { m.logit_input }, { m.logits });
+    }
     /* The drafter after everything the trunk step issues (llama_fp8's rule: declaration order is
      * liveness, and its passes run behind the step). */
     if (m.dsp.on) DS_TRY(dsp_declare(b, m, ctx));
@@ -4445,6 +4632,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     p1_declare(m, ctx);
     DS_TRY(bt_declare(b, m, ctx));
     DS_TRY(kvr_declare(b, m, ctx));
+    lr_note(b, m, ctx);   /* tp8 S3: the node's line (nothing when RADIANCE_DS41_LAYERS is unset) */
     return RAD_OK;
 }
 
@@ -5677,6 +5865,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     /* lever PSK-CR: an all-replay pass stores no global KV, so the split layer is a plain cut layer there (no all-row
      * part) */
     for (auto& L : m.layers) {
+        if (!m.lr.held(L.l)) continue;   /* tp8 S3: another node's layer */
         const int l = L.l;
         const int64_t r = L.r;
         /* lever PSK: from m.psk_first on, each prefill segment runs its last psk_rows(C_l, ahead, n) rows -- design 1
@@ -6267,7 +6456,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bt_pt(x, m, m.mw.sout, T, "sout", l);
         bt_pt(x, m, m.act.x, T, "moe_out", l);
         /* post_f, or post_f with the next collapse + norm (a fused norm, by segment); never the AR_PCN forms here */
-        const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
+        const Layer* nx = next_layer(m, L.l);   /* tp8 S3: the next layer this node holds (a gap passes the streams on) */
         if (nx && nx->pcn_a) {
             /* lever M1: a launch of >= mhc_fuse_min() rows as pcn_a + the next layer's mix_a in one op */
             const int64_t fmin = nx->pcn_mix ? mhc_fuse_min() : 0;
@@ -6346,6 +6535,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
 
 static void step(RadCtx* x, const RadBatch* batch) {
     auto& m = *models[rad_rank(x)];
+    /* tp8 S3: a strict node is this node's part of a two-node engine; this build has no node link to run it */
+    if (m.lr.on && m.lr.strict) {
+        rad_step_fail(x, "deepseek41: RADIANCE_DS41_LAYERS_MODE=strict declares this node's part of a two-node engine "
+                         "only; this build has no node link (tp8 S4) -- run the stage alone with the proxy mode");
+        return;
+    }
     /* An encoder pass runs only the vision tower (RadBatch::enc). */
     if (batch->enc) {
         m.vit.step(x, batch);
@@ -6456,6 +6651,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
     t_mhc_a_l = -1;
 
     for (auto& L : m.layers) {
+        if (!m.lr.held(L.l)) continue;   /* tp8 S3: another node's layer */
         const int l = L.l;
         const int64_t r = L.r;
         if (L.e_ids) {
@@ -6881,7 +7077,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         bt_pt(x, m, m.act.x, T, "moe_out", l);
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin); under
          * RADIANCE_DS41_AR_PCN=2 with the block's all-reduce in front (the block left it to us: ar_out). */
-        const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
+        const Layer* nx = next_layer(m, L.l);   /* tp8 S3: the next layer this node holds (a gap passes the streams on) */
         const bool arw = ar_wide_write_exact(m.g, T);
         if (nx && nx->ar_pcn_a && arw)
             RAD_ISSUE_N(x, nx->ar_pcn_a, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
