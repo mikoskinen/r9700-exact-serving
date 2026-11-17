@@ -121,16 +121,20 @@ public:
      * waiting -- else the entry stays whole. */
     bool lend_split() const { return lend_mixed_ == 2; }
     void set_lend_split(bool on) { lend_mixed_ = on ? 2 : 0; }
-    /* tp8 dev M8 (RADIANCE_PP_BG_LANE=1, at --pp-lanes >= 2): the LAST lane is a background prefill lane. It holds no sequence
-     * (pick() and Scheduler::init's card split skip it: the other lanes split --max-num-seqs), and a newcomer that a lane plans
-     * whole beside its decoders (a MIXED step's prompt entry that produces its first token, no prefix restore) is lent WHOLE to
-     * it (Scheduler::lane_split_bg): its chunk is the home's own plan -- no new cut -- and the home's step goes out with its
-     * decode rows alone. Cold prompts' chunks keep to the other lanes. The follower runs the BG lane's passes in layer segments
-     * (RADIANCE_PP_SEG_LAYERS, without RADIANCE_PP_SEG_PREFILL) with the decode lanes' passes between them; the leader's
-     * RADIANCE_PP_READY_FIRST=1 lets decode tails go before it. Default off. */
-    static bool bg_env();
-    int  bg_lane() const { return bg_ && lanes_.size() >= 2 ? (int)lanes_.size() - 1 : -1; }
-    void set_bg(bool on) { bg_ = on; }
+    /* tp8 dev M8 (RADIANCE_PP_BG_LANE=k, 1 <= k < --pp-lanes): the LAST k lanes are background prefill lanes. They hold no
+     * sequence (pick() and Scheduler::init's card split skip them: the other lanes split --max-num-seqs), and a newcomer that a
+     * lane plans whole beside its decoders (a MIXED step's prompt entry that produces its first token, no prefix restore) is
+     * lent WHOLE to one of them (Scheduler::lane_split_bg: the first in the planning order with room): its chunk is the home's
+     * own plan -- no new cut -- and the home's step goes out with its decode rows alone. With k = 2 two newcomers are in flight
+     * at once (one's leader tail beside the next one's follower segments). Cold prompts' chunks keep to the other lanes. The
+     * follower runs the BG lanes' passes in layer segments (RADIANCE_PP_SEG_LAYERS, without RADIANCE_PP_SEG_PREFILL) with the
+     * decode lanes' passes between them; the leader's RADIANCE_PP_READY_FIRST=1 lets decode tails go before them. Default 0. */
+    static int bg_env();   /* k from the environment (0: off) */
+    /* the first BG lane, or -1 */
+    int  bg_lane() const { return bg_ > 0 && (int)lanes_.size() > bg_ ? (int)lanes_.size() - bg_ : -1; }
+    int  bg_n() const { return bg_lane() >= 0 ? bg_ : 0; }
+    bool is_bg(int l) const { return bg_lane() >= 0 && l >= bg_lane() && l < (int)lanes_.size(); }
+    void set_bg(int k) { bg_ = k > 0 ? k : 0; }
     /* M8's counts: newcomers lent whole to the BG lane, their rows, and why one stayed home (a prefix restore, the BG lane's
      * room, the BG lane not among this plan's planners) */
     enum { kBgRestore, kBgRoom, kBgOrder, kBgWhyN };
@@ -224,7 +228,7 @@ private:
     int64_t span_short_ = 0;                /* RADIANCE_PP_SPAN_SHORT (span_short) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
     int     lend_mixed_ = 0;                /* RADIANCE_PP_LEND_MIXED 1 (lend_mixed, tp8 dev M5) / 2 (lend_split, M5b) */
-    bool    bg_ = false;                    /* RADIANCE_PP_BG_LANE=1 (bg_lane, tp8 dev M8) */
+    int     bg_ = 0;                        /* RADIANCE_PP_BG_LANE=k (bg_lane, tp8 dev M8) */
     int64_t bg_lent_ = 0, bg_rows_ = 0, bg_skip_[kBgWhyN] = {};
     int64_t split_min_ = 128;
     bool    head_state_ = false;

@@ -45,16 +45,19 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     lend_busy_ = !(lb && !std::strcmp(lb, "0"));
     const char* lm = std::getenv("RADIANCE_PP_LEND_MIXED");
     lend_mixed_ = lm && !std::strcmp(lm, "1") ? 1 : lm && !std::strcmp(lm, "2") ? 2 : 0;
-    bg_ = bg_env() && lanes_.size() >= 2;
+    bg_ = bg_env();
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
     }
 }
 
-bool LaneSet::bg_env() {
+int LaneSet::bg_env() {
     const char* v = std::getenv("RADIANCE_PP_BG_LANE");
-    return v && !std::strcmp(v, "1");
+    if (!v || !*v) return 0;
+    char* end = nullptr;
+    const long k = std::strtol(v, &end, 10);
+    return end && !*end && k > 0 && k <= 3 ? (int)k : 0;
 }
 
 int LaneSet::pick() const {
@@ -62,7 +65,7 @@ int LaneSet::pick() const {
     std::lock_guard<std::mutex> lk(*mu_);
     struct Load { int64_t live = 0, drafted = 0, free_cards = 0; };
     /* tp8 dev M8: the BG lane takes no request of its own */
-    const size_t nl = bg_lane() >= 0 ? lanes_.size() - 1 : lanes_.size();
+    const size_t nl = lanes_.size() - (size_t)bg_n();
     if (nl <= 1) return 0;
     std::vector<Load> ld(nl);
     for (size_t l = 0; l < nl; ++l) {
@@ -364,8 +367,8 @@ void Scheduler::lane_split_own() {
      * lenders lending non-wide chunks into one borrower (three lanes or more) would pass max_tok alone */
     const int64_t rows_cap = cfg_.prefill_span > 1 && geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok)
                                                                          : cfg_.max_tok;
-    /* tp8 dev M8: the BG lane (RADIANCE_PP_BG_LANE=1) -- whole newcomers beside decode rows go to it; it lends nothing of its own */
-    const int bg = lanes_->bg_lane();
+    /* tp8 dev M8: the BG lanes (RADIANCE_PP_BG_LANE=k) -- whole newcomers beside decode rows go to them; they lend nothing */
+    const bool bg = lanes_->bg_lane() >= 0;
     std::vector<size_t> bg_out;   /* this plan's entries lent whole to the BG lane, taken out after the walk */
     for (size_t ei = 0; ei < plan_.e.size(); ++ei) {
         StepEntry& e = plan_.e[ei];
@@ -378,7 +381,7 @@ void Scheduler::lane_split_own() {
         }
         /* tp8 dev M8 (RADIANCE_PP_BG_LANE=1): a newcomer's whole rest beside decode rows, lent whole to the BG lane (an inner
          * tail snapshot -- lever TI -- goes with it and commits there, as a lent cold chunk's does) */
-        if (bg >= 0 && lane_ != bg && plan_.phase == RAD_PHASE_MIXED && e.home < 0 && e.is_prefill && e.produces_token &&
+        if (bg && !lanes_->is_bg(lane_) && plan_.phase == RAD_PHASE_MIXED && e.home < 0 && e.is_prefill && e.produces_token &&
             e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] && reqs_[(size_t)e.slot]->req &&
             !e.cr_replay && e.n_spec == 0 && (e.ckpt_slot < 0 || e.ckpt_tok >= 0)) {
             if (lane_split_bg(e)) bg_out.push_back(ei);
@@ -439,7 +442,7 @@ void Scheduler::lane_split_own() {
         size_t j = 0;
         for (; j < order.size() && p < (dpiece ? s.bi_end : target); ++j) {
             const int to = order[j];
-            if (to == bg) continue;   /* tp8 dev M8: a cold prompt's chunks keep to the decode lanes */
+            if (lanes_->is_bg(to)) continue;   /* tp8 dev M8: a cold prompt's chunks keep to the decode lanes */
             int64_t ck = -1;
             const int64_t n = dpiece ? lane_d_piece(s, p, &ck) : lane_alone_chunk(s, r, target, p, &ck);
             if (n <= 0) break;
@@ -505,12 +508,11 @@ void Scheduler::lane_split_own() {
     if (!bg_out.empty()) lane_bg_drop(bg_out);
 }
 
-/* tp8 dev M8: entry e (a newcomer's whole rest beside this lane's decoders) lent whole to the BG lane, when that lane plans
- * before this one plans again and has room; else e stays (today's MIXED step). True when lent: the caller takes e out of the
+/* tp8 dev M8: entry e (a newcomer's whole rest beside this lane's decoders) lent whole to a BG lane -- the first one in this
+ * plan's planning order (idle ones first) with room; else e stays (today's MIXED step). True when lent: the caller takes e out of the
  * plan (lane_bg_drop). The piece is e itself -- the rows, the snapshot (lever TI's inner tail: committed by lane_piece_done) --
  * so every boundary is the one this lane's own plan cut. */
 bool Scheduler::lane_split_bg(StepEntry& e) {
-    const int to = lanes_->bg_lane();
     SchedReq& s = *reqs_[(size_t)e.slot];
     Request& r = *s.req;
     if (r.embed || r.media || r.token_scores || r.n_draft != 0 || s.lent_hold || s.lent_pending > 0 || s.lent > 0) return false;
@@ -519,14 +521,17 @@ bool Scheduler::lane_split_bg(StepEntry& e) {
         return false;
     }
     const std::vector<int>& order = lanes_->planners_locked();
-    if (std::find(order.begin(), order.end(), to) == order.end()) {
-        lanes_->note_bg_skip_locked(LaneSet::kBgOrder);
-        return false;
-    }
     const int64_t n = e.n_tokens;
     const int64_t cap = geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok;
-    if (lanes_->inbox_rows_locked(to) + n > cap || (int64_t)lanes_->inbox_n_locked(to) + 1 > cfg_.max_seqs) {
-        lanes_->note_bg_skip_locked(LaneSet::kBgRoom);
+    int to = -1;
+    bool any = false;
+    for (int l : order) {
+        if (!lanes_->is_bg(l)) continue;
+        any = true;
+        if (lanes_->inbox_rows_locked(l) + n <= cap && (int64_t)lanes_->inbox_n_locked(l) + 1 <= cfg_.max_seqs) { to = l; break; }
+    }
+    if (to < 0) {
+        lanes_->note_bg_skip_locked(any ? LaneSet::kBgRoom : LaneSet::kBgOrder);
         return false;
     }
     /* The committed end, below which nothing in flight reads (this step's bump undone): the keep floor, as a lend's */
