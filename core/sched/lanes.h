@@ -87,6 +87,14 @@ public:
      * FINDINGS F3 21:38 it dropped the span: 64k's tail became 512 + 114 rows, its text moved.) Default on (1): spans. */
     bool span_on() const { return span_on_; }
     void set_span(bool on) { span_on_ = on; }
+    /* tp8 loop P7 (RADIANCE_PP_SPAN_TAIL=X rows, 0 = off): the same cut as RADIANCE_PP_SPAN=0, but only for a span piece
+     * that starts within the last X rows of its prompt (Scheduler::lane_span_cut): the span plan's 4,096-row chunks for
+     * the body (half the chunks of the interval plan: each chunk costs the leader a fixed ~13-23 ms, lq18 / lq19) and
+     * whole intervals at the end, where the follower's lag behind the leader is the drain (C' lq19: drain 609 / 771 /
+     * 834 ms vs the span plan's 765 / 928 / 1003). Every boundary is one of the span plan's or an interval boundary,
+     * as RADIANCE_PP_SPAN=0's (cold texts identical at 16k / 64k / 128k, lq19). Default 0: today's plan. */
+    int64_t span_tail() const { return span_tail_; }
+    void set_span_tail(int64_t rows) { span_tail_ = rows > 0 ? rows : 0; }
     /* tp8 loop M2 (RADIANCE_PP_LEND_BUSY=0): a chunk is lent only to a lane with no request of its own running or
      * waiting. Lent into a lane that decodes, a whole chunk is planned first in that lane's step (lane_reserve) and its
      * decoders ride a MIXED step of up to 2,048 rows: the stall the 20:58 PROFILE measured, now in the lane that had
@@ -169,6 +177,7 @@ private:
     mutable std::atomic<uint64_t> rr_{ 0 };
     bool    split_on_ = true;
     bool    span_on_ = true;                /* RADIANCE_PP_SPAN (span_on) */
+    int64_t span_tail_ = 0;                 /* RADIANCE_PP_SPAN_TAIL (span_tail) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
     int64_t split_min_ = 128;
     bool    head_state_ = false;

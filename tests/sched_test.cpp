@@ -13414,6 +13414,68 @@ TEST(lanes_span_off_cuts_the_span_plan_only_at_interior_interval_boundaries) {
     }
 }
 
+/* tp8 loop P7 (RADIANCE_PP_SPAN_TAIL=X, LaneSet::set_span_tail): the span plan for the body and RADIANCE_PP_SPAN=0's cut only
+ * for a span piece that starts within the prompt's last X rows -- every boundary one of the span plan's or an interval
+ * boundary (the two plans the cards ran identical, lq18 / lq19), at 2 and 3 lanes, the chunks over the lanes, the window
+ * keys read right; X past the prompt = RADIANCE_PP_SPAN=0's plan, X = 0 = the span plan. */
+TEST(lanes_span_tail_cuts_only_the_span_pieces_in_a_prompts_last_rows) {
+    for (int ex : { 0, 1 })
+    for (int n_prompt : { 8500, 15777, 65650 }) {
+        std::vector<std::pair<int, int>> ref_s;
+        for (int arm = 0; arm < 5; ++arm) {
+            /* 0: one lane (the span plan); 1 / 2: 2 / 3 lanes, X = 8192; 3: 2 lanes, X = 1 << 20 (all pieces); 4: 2 lanes, X = 0 */
+            const int lanes = arm == 0 ? 1 : arm == 2 ? 3 : 2;
+            const int64_t X = arm == 1 || arm == 2 ? 8192 : arm == 3 ? (1 << 20) : 0;
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
+            L.cfg.pp_plan_prefix = ex == 1;
+            L.max_tok = 4160;
+            L.max_ctx = 70000;
+            L.kv_blocks = 8192;
+            L.stage_rows = 1024;
+            L.win = 16;
+            L.seqs = 6;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            L.set.set_span_tail(X);
+            const uint64_t s = L.submit(0, n_prompt, 2);
+            REQUIRE(s != 0);
+            int64_t misses = 0;
+            int failed = 0;
+            const std::vector<std::pair<int, int>> got = run_cold(L, lanes, s, &misses, &failed);
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(misses, (int64_t)0);
+            REQUIRE(L.req(0, s) != nullptr);
+            CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
+            if (arm == 0) { ref_s = got; continue; }
+            if (arm == 4) { CHECK(got == ref_s); continue; }
+            /* the span plan, each piece that starts within the last X rows cut at its interior interval boundaries */
+            std::vector<std::pair<int, int>> want;
+            for (const auto& [a, b] : ref_s) {
+                int at = a;
+                if (n_prompt - a <= X)
+                    for (int e = (at / 2048 + 1) * 2048; e < b; e += 2048)
+                        if (e - at >= 128 && b - e >= 128) { want.emplace_back(at, e); at = e; }
+                want.emplace_back(at, b);
+            }
+            CHECK(got == want);
+            for (const auto& [a, b] : got) {        /* every boundary the span plan's or an interval boundary */
+                bool span_b = false;
+                for (const auto& [c, d] : ref_s) span_b = span_b || d == b;
+                CHECK(span_b || b % 2048 == 0);
+            }
+            CHECK(L.set.counts().pieces > 0);
+            std::string t;
+            for (size_t k = got.size() >= 4 ? got.size() - 4 : 0; k < got.size(); ++k)
+                t += fmt(" [%d, %d)", got[k].first, got[k].second);
+            fprintf(stderr, "    %s%d tokens, %d lanes, X %lld: span plan %zu chunks, span tail %zu (%s), tail%s, %lld lent\n",
+                    ex ? "exact, " : "", n_prompt, lanes, (long long)X, ref_s.size(), got.size(),
+                    got == want ? "= the span plan cut in its last X rows" : "DIFFERENT", t.c_str(),
+                    (long long)L.set.counts().pieces);
+        }
+    }
+}
+
 /* tp8 loop M2 (the 20:58 PROFILE: no lane step for 320-430 ms after every MIXED step): lever DST under lanes. A newcomer
  * that joins a lane beside decode rows is cut by option D on sched_mixed_tok's grid (576 -> 512-row pieces), one piece a
  * home-lane step, the same boundaries one lane plans (the plan is a function of the switches, not of the decode rows
