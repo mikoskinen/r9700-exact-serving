@@ -1478,8 +1478,7 @@ int64_t Scheduler::bypass_piece(SchedReq& s, const Request& r, int64_t target, i
         ck = s.bi_ckpt;
     } else {
         const bool keep = span_now_;
-        span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
-                    (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+        span_now_ = alone_spans(r, target);
         /* lever TI: only a piece the bypass takes whole (below) */
         ti_limit_ = std::min<int64_t>(bypass_now_ > 0 ? bypass_now_ : cfg_.max_tok, room);
         const int64_t full = plan_chunk(n, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
@@ -1529,8 +1528,7 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
         ck = s.bi_ckpt;
     } else {
         const bool keep = span_now_;
-        span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
-                    (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+        span_now_ = alone_spans(r, target);
         /* lever TI: a tail taken inside the piece only where the whole piece fits this step's room (whole() below), so a
          * piece cut further keeps its snapshot at an end (bi_ckpt is a piece end); option 4's give is never taken from it */
         ti_limit_ = (bi_chunk_ == 4 && share) ? 0 : room;
@@ -2150,6 +2148,14 @@ void Scheduler::psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt) {
 }
 
 /* ------------------------------------------------------------------ a prefill sharing a step */
+/* Whether the chunk an idle engine plans for r (the alone piece) spans: --prefill-span's rule for a lone prefill, and
+ * under lanes RADIANCE_PP_SPAN=0 (LaneSet::span_on) none -- the same rule step() takes for its lone prefill. */
+bool Scheduler::alone_spans(const Request& r, int64_t target) const {
+    if (lanes_ && n_lanes_ > 1 && !lanes_->span_on()) return false;
+    return bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
+           (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+}
+
 void Scheduler::set_span_min(int64_t tokens) {
     span_min_ = tokens > 0 ? tokens : 0;
     if (span_min_ > 0 && geo_.span > 1)
@@ -2710,8 +2716,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             s.bypass_no = true;
         } else {
             const bool keep = span_now_;
-            span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
-                        (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+            span_now_ = alone_spans(r, target);
             int64_t ck = -1;
             const int64_t alone = plan_chunk(r.n_computed, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
             span_now_ = keep;
@@ -3115,6 +3120,9 @@ const RadBatch* Scheduler::step() {
             lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
         }
         span_now_ = bi_chunk_ == 2 ? false : lone;
+        /* tp8 prefill P1 (RADIANCE_PP_SPAN=0, LaneSet::span_on): under lanes a lone prefill plans one interval a chunk;
+         * its budget stays the lone step's */
+        if (span_now_ && lanes_ && n_lanes_ > 1 && !lanes_->span_on()) span_now_ = false;
         /* lever DST: the shared budget in force (sched_mixed_tok); B (2) keeps whole intervals on the geometry's own */
         if (!lone && bi_chunk_ != 1) budget = bi_chunk_ == 2 ? geo_.shared_tok : mixed_now_;
     }

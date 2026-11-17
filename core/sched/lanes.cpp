@@ -29,6 +29,8 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     pick_rr_ = rr && !std::strcmp(rr, "rr");
     const char* on = std::getenv("RADIANCE_PP_SPLIT");
     split_on_ = !(on && !std::strcmp(on, "0"));
+    const char* sp = std::getenv("RADIANCE_PP_SPAN");
+    span_on_ = !(sp && !std::strcmp(sp, "0"));
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
@@ -289,8 +291,7 @@ int64_t Scheduler::lane_alone_chunk(const SchedReq& s, Request& r, int64_t targe
     const int64_t had = r.n_computed;
     r.n_computed = n;
     const bool keep = span_now_;
-    span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
-                (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+    span_now_ = alone_spans(r, target);
     const int64_t keep_ti = ti_limit_;
     ti_limit_ = cfg_.max_tok;
     int64_t ck = -1;

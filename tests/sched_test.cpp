@@ -13353,3 +13353,44 @@ TEST(lanes_a_home_chunk_waits_for_its_lent_chunk_when_the_window_pool_is_short) 
         }
     }
 }
+
+/* tp8 prefill P1 (RADIANCE_PP_SPAN=0, LaneSet::set_span): under lanes a lone cold prompt plans one checkpoint interval a
+ * chunk instead of --prefill-span 2's span -- exactly the plan one lane makes at --prefill-span 1 (every boundary an
+ * interval boundary, the published host-staged build's grid) -- and its chunks alternate over the lanes with two in
+ * flight, the window keys read right; with the span on the lanes run one lane's span plan, as before. */
+TEST(lanes_span_off_runs_a_lone_prompt_in_interval_chunks_over_the_lanes) {
+    for (int n_prompt : { 100, 200, 333 }) {
+        std::vector<std::pair<int, int>> ref_i, ref_s;
+        for (int arm = 0; arm < 6; ++arm) {
+            /* 0: one lane span 1 (the interval plan), 1: one lane span 2 (the span plan), 2 / 3: 2 / 3 lanes span 2 with
+             * the span off under lanes, 4: 2 lanes span 2 with it on, 5: 2 lanes span 1 */
+            const int lanes = arm == 2 || arm == 4 || arm == 5 ? 2 : arm == 3 ? 3 : 1;
+            Lanes L;
+            L.cfg.prefill_span = arm == 0 || arm == 5 ? 1 : 2;
+            L.grid = 32;                             /* a linear group: chunks on a 32-token interval grid */
+            L.win = 16;
+            L.seqs = 6;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            if (arm == 2 || arm == 3) L.set.set_span(false);
+            const uint64_t s = L.submit(0, n_prompt, 2);
+            REQUIRE(s != 0);
+            int64_t misses = 0;
+            int failed = 0;
+            const std::vector<std::pair<int, int>> got = run_cold(L, lanes, s, &misses, &failed);
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(misses, (int64_t)0);
+            REQUIRE(L.req(0, s) != nullptr);
+            CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
+            for (size_t i = 0; i + 1 < got.size(); ++i) CHECK_EQ(got[i].second % 32, 0);   /* interval boundaries */
+            if (arm == 0) ref_i = got;
+            else if (arm == 1) ref_s = got;
+            else if (arm == 4) CHECK(got == ref_s);
+            else CHECK(got == ref_i);
+            const LaneSet::Counts c = L.set.counts();
+            if (lanes > 1) CHECK(c.pieces > 0);
+            if (arm == 2) fprintf(stderr, "    %d tokens: span plan %zu chunks, interval plan %zu; 2 lanes span off: %zu chunks, "
+                                          "%lld lent\n", n_prompt, ref_s.size(), ref_i.size(), got.size(), (long long)c.pieces);
+        }
+        CHECK(ref_i.size() > ref_s.size());
+    }
+}

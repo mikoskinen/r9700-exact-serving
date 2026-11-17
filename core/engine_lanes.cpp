@@ -95,6 +95,9 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
              (long long)per, (long long)least, (long long)per, lanes_.split_on() ? "on" : "off",
              cfg_.pp_cut_h > 0 ? "; a chunk that takes a snapshot is followed by its next chunk only after its commit "
                                  "(the head part writes layers [0, h)'s state)" : "");
+    if (!lanes_.span_on())
+        RAD_INFO("two-node pipeline: a lone prefill plans one checkpoint interval a chunk, not --prefill-span %d's span "
+                 "(RADIANCE_PP_SPAN=0): the lanes run two of its chunks at once", cfg_.prefill_span);
     return RAD_OK;
 }
 
