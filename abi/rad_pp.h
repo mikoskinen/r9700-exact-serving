@@ -139,6 +139,16 @@ typedef struct RadPpRing {
     uint64_t stage_dev;
     uint64_t stage_cap;
     volatile uint64_t async_sends;             /* payloads sent the async way (the sender's host thread counts) */
+    /* tp8 loop P10b (RADIANCE_PP_RECV_ASYNC=N, a receive ring only; 0 from an engine before it): a payload of at least
+     * `recv_rows` rows is copied from the ring into rank r's card staging buffer `recv_stage[r]` (`recv_cap` bytes, the
+     * core's) by a launch on the card's side stream issued with the pass -- it waits on the card for the payload to
+     * land, checks it as stage_recv does and counts `taken[r]` -- and the pass's stream only unpacks it (D2D) when the
+     * side stream is done; so a payload that lands while the card still runs the previous pass crosses PCIe beside it.
+     * The parts get the same bytes. The core issues every pass of >= recv_rows rows live (never recorded). */
+    uint64_t recv_rows;
+    uint64_t recv_stage[RAD_PP_MAX_RANKS];
+    uint64_t recv_cap;
+    volatile uint64_t recv_async[RAD_PP_MAX_RANKS];   /* payloads rank r took the async way (its host thread counts) */
 } RadPpRing;
 
 #if defined(__cplusplus)

@@ -524,6 +524,49 @@ int Engine::pp_serve_setup() {
                  "recorded (tp8 loop P10)", (long long)arows, pp_leader() ? "X1" : "X2", (long long)arows,
                  humanb(sb).c_str(), ranks_[0]->device, rings, (long long)arows);
     }
+    /* ---- tp8 loop P10b: RADIANCE_PP_RECV_ASYNC -- a card staging buffer on every rank of this node, kept by the budget
+     * beside the step staging; every receive ring names them */
+    if (const int64_t rrows = pp_recv_async_rows(); rrows > 0) {
+        const int64_t rb = pp_recv_async_bytes();
+        if (rb <= 0) {
+            RAD_ERR("two-node pipeline: RADIANCE_PP_RECV_ASYNC=%lld but this node's crossing has no row bytes", (long long)rrows);
+            return RAD_E_STATE;
+        }
+        if ((int)ranks_.size() > RAD_PP_MAX_RANKS) {
+            RAD_ERR("two-node pipeline: RADIANCE_PP_RECV_ASYNC: more ranks than a ring names (%d)", RAD_PP_MAX_RANKS);
+            return RAD_E_UNSUPPORTED;
+        }
+        std::vector<void*> st(ranks_.size(), nullptr);
+        for (size_t q = 0; q < ranks_.size(); ++q) {
+            RAD_TRY(rad_dev_set(ranks_[q]->device));
+            st[q] = rad_dev_alloc(rb, RAD_MEM_DEVICE);
+            if (!st[q]) {
+                RAD_ERR("two-node pipeline: RADIANCE_PP_RECV_ASYNC: no device memory for the %s staging buffer on card %d "
+                        "(raise --gpu-headroom-mib by %lld, or unset the switch)", humanb(rb).c_str(), ranks_[q]->device,
+                        (long long)((rb + (1 << 20) - 1) >> 20));
+                (void)rad_dev_set(ranks_[0]->device);
+                return RAD_E_NOMEM;
+            }
+        }
+        (void)rad_dev_set(ranks_[0]->device);
+        int rings = 0;
+        for (int ix = 0; ix < RAD_PP_MAX_RING_IX; ++ix) {
+            RadPpRing* r = pp_recv_[ix];
+            if (!r) continue;
+            for (size_t q = 0; q < st.size(); ++q) r->recv_stage[q] = (uint64_t)(uintptr_t)st[q];
+            r->recv_cap = (uint64_t)rb;
+            r->recv_rows = (uint64_t)rrows;
+            ++rings;
+        }
+        const int64_t prev = g_pp_live_rows.load(std::memory_order_relaxed);
+        g_pp_live_rows.store(prev > 0 ? std::min(prev, rrows) : rrows, std::memory_order_relaxed);
+        RAD_INFO("two-node pipeline: RADIANCE_PP_RECV_ASYNC=%lld -- a %s payload of >= %lld rows is copied from the ring into "
+                 "a %s staging buffer on each of the %zu cards by a side stream issued with the pass (it waits on the card "
+                 "for the payload to land, beside the previous pass) and unpacked on the pass's stream (%d receive ring(s)); "
+                 "passes of >= %lld rows are issued live, never recorded (tp8 loop P10b)", (long long)rrows,
+                 pp_leader() ? "X2" : "X1", (long long)rrows, humanb(rb).c_str(), st.size(), rings,
+                 (long long)g_pp_live_rows.load(std::memory_order_relaxed));
+    }
     /* ---- rendezvous 2: what both carved and laid out */
     net::Facts f;
     {
@@ -946,6 +989,35 @@ int64_t Engine::pp_send_async_bytes() const {
     return rb * cfg_.max_tok + (int64_t)parts * RAD_PP_PART_ALIGN + RAD_PP_TRAILER;
 }
 
+/* tp8 loop P10b: RADIANCE_PP_RECV_ASYNC=N (rows; unset / 0 = off): a payload of >= N rows is copied from the receive ring
+ * into the rank's card staging buffer from a side stream issued with the pass, and unpacked on the pass's stream; every
+ * pass of >= N rows is issued live. Read once. */
+int64_t Engine::pp_recv_async_rows() {
+    static const int64_t rows = [] {
+        const char* v = std::getenv("RADIANCE_PP_RECV_ASYNC");
+        if (!v || !*v) return (int64_t)0;
+        char* end = nullptr;
+        const long long n = std::strtoll(v, &end, 10);
+        if (!end || *end || n < 0) {
+            RAD_WARN("two-node pipeline: RADIANCE_PP_RECV_ASYNC=%s is not a row count: every payload on the pass's stream", v);
+            return (int64_t)0;
+        }
+        return (int64_t)n;
+    }();
+    return rows;
+}
+
+/* The staging buffer RADIANCE_PP_RECV_ASYNC needs on every rank of this node: the receive ring's capacity. */
+int64_t Engine::pp_recv_async_bytes() const {
+    if (!pp_on() || pp_recv_async_rows() <= 0) return 0;
+    const PpGlobal& g = pp_g();
+    const int id = pp_leader() ? RAD_PP_X2 : RAD_PP_X1;
+    const int64_t rb = g.row_bytes[id].load();
+    const int parts = std::max(1, g.parts[id].load());
+    if (rb <= 0) return 0;
+    return rb * cfg_.max_tok + (int64_t)parts * RAD_PP_PART_ALIGN + RAD_PP_TRAILER;
+}
+
 /* tp8 loop P8: what RADIANCE_PP_SEND_SPLIT=2's other ranks compared, summed over the lanes' send rings, a line a crossing. */
 void Engine::pp_split_note() {
     /* tp8 loop P10: how many payloads crossed from the side stream */
@@ -960,6 +1032,21 @@ void Engine::pp_split_note() {
         RAD_INFO("two-node pipeline: RADIANCE_PP_SEND_ASYNC=%lld -- %llu of this node's %llu %s payloads crossed from the "
                  "side stream (tp8 loop P10)", (long long)pp_send_async_rows(), (unsigned long long)async,
                  (unsigned long long)all, pp_leader() ? "X1" : "X2");
+    }
+    /* tp8 loop P10b: how many payloads every rank took through its staging buffer */
+    if (pp_recv_async_rows() > 0) {
+        uint64_t all = 0, async = 0;
+        for (int ix = 0; ix < RAD_PP_MAX_RING_IX; ++ix) {
+            const RadPpRing* r = pp_recv_[ix];
+            if (!r) continue;
+            for (int q = 0; q < RAD_PP_MAX_RANKS && (uint64_t)q < r->n_ranks; ++q) {
+                all += __atomic_load_n(&r->taken[q], __ATOMIC_ACQUIRE);
+                async += __atomic_load_n(&r->recv_async[q], __ATOMIC_ACQUIRE);
+            }
+        }
+        RAD_INFO("two-node pipeline: RADIANCE_PP_RECV_ASYNC=%lld -- %llu of this node's %llu %s receives (all ranks) came "
+                 "through the staging buffers from the side stream (tp8 loop P10b)", (long long)pp_recv_async_rows(),
+                 (unsigned long long)async, (unsigned long long)all, pp_leader() ? "X2" : "X1");
     }
     for (int id = 0; id < RAD_PP_N_RINGS; ++id) {
         uint64_t payloads = 0, cmp = 0, diff = 0, mode = 0, by[RAD_PP_MAX_RANKS] = {}, part[RAD_PP_MAX_PARTS] = {};
