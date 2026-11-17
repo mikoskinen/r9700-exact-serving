@@ -2956,6 +2956,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         int ctx = 0;
         ti_capable_ = fn4::ckpt_conv_src(-1, &ids, &ctx) > 0;
         sched_.set_tail_inner_capable(ti_capable_);
+        for (auto& ls : lane_sched_) ls->set_tail_inner_capable(ti_capable_);   /* tp8 S5 */
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
