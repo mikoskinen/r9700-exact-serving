@@ -2273,6 +2273,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
      * an op reads (piece p's mixer reduction before its connection write; piece p's gathers before its codes) instead of
      * everything the second lane holds. The same ops on the same rows; only where lane 0 waits moves. */
     const bool pmk = (fn4_sproute_flag().load(std::memory_order_relaxed) & 8) != 0;
+    /* fn4 SPO-tail (sp_route bit 16): the hc_sp 2 order also where only the last piece is partial */
+    const bool spo_tail = spo && (fn4_sproute_flag().load(std::memory_order_relaxed) & 16) != 0;
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
     /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
@@ -2479,6 +2481,43 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                 l.hc_ffn.codes(c, r0(p), rn(p));
                 l.mlp.pass(c, T, r0(p), rn(p), false, p < 8 && routed[p]);
                 sp_pend = p;
+            }
+        } else if (spo_tail && K >= 2 && !sp_p(K - 1) && [&] { for (int64_t q = 0; q + 1 < K; ++q) if (!sp_p(q)) return false; return true; }()) {
+            /* fn4 SPO-tail (16.11.2026, qwen/prefill; sp_route bit 16): the hc_sp 2 order for a step whose last piece is
+             * shorter than a pass (every prompt's last step; a Claude Code follow-up's 2-8k chunk): the full pieces as the
+             * branch above runs them, the partial piece's connections (whole-piece forms, no SP) beside the last full
+             * piece's gather, its pass and MoE all-reduce after the full pieces' passes. The same ops on the same rows as
+             * the loop below; only the issue order of the full pieces' gathers and the partial piece's reads moves. */
+            if (1 >= issued) { on1(!behind, [&] { ar_mix(1); }); behind = true; issued = 2; }
+            {
+                const bool ss0 = hw(l.hc_mix, 0);
+                bt_pt(c, m, m.b_h, r0(0), rn(0), "h_mix", (int)li);
+                hr(l.hc_ffn, 0, ss0);
+                bt_rd(c, m, r0(0), rn(0), "rd_ffn", (int)li, true);
+            }
+            wait1();
+            on1(true, [&] { ag_p(0); });
+            for (int64_t p = 0; p < K; ++p) {
+                if (p + 1 < K) {
+                    if (p + 2 < K && p + 2 >= issued) { on1(!behind, [&] { ar_mix(p + 2); }); behind = true; issued = p + 3; }
+                    const bool ss = hw(l.hc_mix, p + 1);
+                    bt_pt(c, m, m.b_h, r0(p + 1), rn(p + 1), "h_mix", (int)li);
+                    if (sp_p(p + 1)) hr(l.hc_ffn, p + 1, ss);
+                    else bi_read(c, m, l.hc_ffn, T, hq0(p + 1), hqn(p + 1), ss);
+                    bt_rd(c, m, r0(p + 1), rn(p + 1), "rd_ffn", (int)li, true);
+                }
+                wait1();
+                if (p + 1 < K && sp_p(p + 1)) on1(true, [&] { ag_p(p + 1); });
+                if (sp_pend >= 0) { const int64_t q = sp_pend; on1(true, [&] { rs_p(q); }); sp_pend = -1; }
+                if (sp_p(p)) {
+                    l.hc_ffn.codes(c, r0(p), rn(p));
+                    l.mlp.pass(c, T, r0(p), rn(p), false);
+                    sp_pend = p;
+                } else {
+                    l.mlp.pass(c, T, r0(p), rn(p), false);
+                    wait1();
+                    on1(true, [&] { l.mlp.issue_ar(c, r0(p), rn(p)); });
+                }
             }
         } else
         for (int64_t p = 0; p < K; ++p) {
@@ -3199,7 +3238,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 15) return -1;
+        if (value < 0 || value > 31) return -1;   /* bit 16: SPO-tail */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         return 1;
