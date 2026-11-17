@@ -981,7 +981,8 @@ void Engine::fn4_apply_changes(const int* sw) {
             /* The depth-0 context skip: the engine's own (block_context_pass); 1 only where set up (fn4 refuses
              * it otherwise). */
             if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {
-                if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 ? 1 : 0;
+                /* tp8 S5: not under lanes, which interleave the steps its ring keeps (engine_lanes.cpp) */
+                if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 && lane_sched_.empty() ? 1 : 0;
                 fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.ready ? ctxs_.on : 0);
             }
             /* Lever Z0-W: the engine's own, acted on at the next release (draft_w_step; fn4 refuses 1 unless set up). */
