@@ -155,6 +155,18 @@ struct SchedReq {
      * client's tokens into a re-admitted slot. */
     bool     reap_pending = false;
     int64_t  pending_ckpt = -1;  /* absolute position this step's chunk checkpoints at */
+    /* tp8 S5 (lanes, core/sched/lanes.h): rows of this sequence's prompt planned into other lanes'
+     * steps and not yet committed there (a newcomer's chunk split over the lanes), how many of those
+     * pieces still wait in a lane's inbox, unplanned, and whether one of them produces its first
+     * token. While any is in flight the request is in a step (in_step), its window keys stay held
+     * (IKVManager::set_keep_floor), and its home lane plans its next piece behind them. Always 0 on
+     * one lane. */
+    int32_t  lent = 0;
+    int32_t  lent_pending = 0;
+    bool     lent_tok = false;
+    /* The first position of the next piece another lane must take from its inbox: pieces are taken
+     * (and so issued) in position order, which LaneSet checks loudly (-1: none waiting). */
+    int64_t  lent_next = -1;
     /* Lever PSK design 2 (fn4 ds41_psk 2 / 3, ds41-psk2): latched when the request is admitted (Scheduler::psk_latch) and
      * fixed while it is prefilled, so every chunk of its prompt computes the same targets -- the anchor stride K over the
      * periodic checkpoint positions (0: not planned, every chunk runs as before) and the first one at or past 32768. */
@@ -195,8 +207,22 @@ struct SchedReq {
     }
 };
 
+class LaneSet;   /* lanes.h */
+
 class Scheduler {
 public:
+    Scheduler() : mu_(own_mu_), step_(own_step_) {}
+    /* tp8 S5: a lane of a two-node pipeline (lanes.h): the scheduler of lane `lane` of `n_lanes`, its
+     * lock and step counter lane 0's, so one lock covers the KV pool every lane allocates from and
+     * the steps of all lanes are numbered in one sequence. */
+    Scheduler(Scheduler& lane0, int lane, int n_lanes, LaneSet* set)
+        : mu_(lane0.mu_), step_(lane0.step_), lane_(lane), n_lanes_(n_lanes), lanes_(set) {}
+    Scheduler(const Scheduler&) = delete;
+    Scheduler& operator=(const Scheduler&) = delete;
+    /* Lane 0 of a pipeline with lanes: before init. */
+    void set_lanes(int n_lanes, LaneSet* set) { n_lanes_ = n_lanes; lanes_ = set; lane_ = 0; }
+    int  lane() const { return lane_; }
+    int  n_lanes() const { return n_lanes_; }
     /* What the sampler hands back after a step: per sequence, how many drafts survived, the token
      * sampled at the accepted position, and whether the sequence ended. No logits. commit() fills
      * in the two counts. */
@@ -456,6 +482,8 @@ public:
     /* The end-of-generation ids the card's acceptance reads, for ends_every_request. Set once at
      * start; without them only max_tokens ends are predicted. */
     void     set_eog(std::vector<int32_t> ids);
+    /* tp8 S5: the ids set_eog took, for a pipeline lane built after it */
+    std::vector<int32_t> eog_ids() const { return eog_; }
     /* Forget one stored conversation, by label or engine id, keeping its first `keep_tokens`
      * (IPrefixCache::release_session). Refused with RAD_E_STATE while a request of that
      * conversation is queued or running: its blocks would be skipped as live and its close
@@ -967,7 +995,9 @@ private:
      * under kDebugMiss. Returns how many it wrote to `out`. */
     int debug_oracle_ids(int64_t n, int depth, int32_t* out) const;
 
-    mutable std::mutex mu_;
+    /* The step lock: this scheduler's own, or lane 0's for a pipeline lane (the constructors). */
+    std::mutex  own_mu_;
+    std::mutex& mu_;
 
     SchedMetrics metrics_locked() const;
     int          requests_locked(ReqStat* out, int max) const;
@@ -1034,7 +1064,8 @@ private:
     bool     next_open_ = false;
     /* Is a step the card may still be running holding this request? */
     bool in_step(const SchedReq& s) const {
-        return (step_open_ && s.entry >= 0) || (next_open_ && s.entry_next >= 0);
+        /* tp8 S5: or a piece of its prompt rides in another lane's step (SchedReq::lent; 0 on one lane) */
+        return (step_open_ && s.entry >= 0) || (next_open_ && s.entry_next >= 0) || s.lent > 0;
     }
 
     /* The serial drafter's rows, valid between serial_begin() and serial_end(). */
@@ -1100,7 +1131,30 @@ private:
      * token_at() walks prompt ++ output ++ draft, so the mask positions come from the accessor
      * every other pass uses. */
     std::vector<int32_t> block_mask_;
-    int      step_ = 0;
+    /* The step counter: this scheduler's own, or lane 0's for a pipeline lane. */
+    int      own_step_ = 0;
+    int&     step_;
+    /* tp8 S5: this scheduler's lane and the set it belongs to (null: one lane, the published path). */
+    int      lane_ = 0;
+    int      n_lanes_ = 1;
+    LaneSet* lanes_ = nullptr;
+    /* Lanes: the sequences whose plans this step() bumped past their lent rows (restored on its way
+     * out), and the cross-lane halves of step() (lanes.cpp). */
+    std::vector<std::pair<int32_t, int32_t>> lane_bump_;
+    std::vector<int32_t> lane_out_;
+    /* preempt_back() left the back alone: a piece of its prompt is in flight in another lane */
+    bool     lane_preempt_refused_ = false;
+    int64_t  lane_reserved_ = 0;   /* the inbox rows lane_reserve set aside this step */
+    void    lane_plan_begin();
+    void    lane_plan_end();
+    int64_t lane_reserve(int64_t budget);
+    void    lane_take_inbox();
+    void    lane_split_own();
+    void    lane_return_pieces();
+    friend class LaneSet;
+    /* A piece of one of this lane's sequences, run in lane `by`'s step, committed there: called by
+     * the LaneSet with the lock held. `i` is the entry in that step's StepResult. */
+    void lane_piece_done(const StepEntry& e, int i, const StepResult& res);
     uint64_t arrival_ = 0;
     /* Lever PSK design 2 (set_psk_mode / set_psk_k, psk_plan). */
     int      psk_mode_ = -1;

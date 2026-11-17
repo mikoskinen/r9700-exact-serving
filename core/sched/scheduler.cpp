@@ -1,6 +1,7 @@
 /* scheduler.cpp -- one decision per step. See scheduler.h for the shape and spec §7.1 for why.
  */
 #include "scheduler.h"
+#include "lanes.h"
 #include "mm/processor.h"
 
 #include "server/sink.h"
@@ -615,6 +616,21 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     free_cards_.resize((size_t)cfg.max_seqs);
     for (int64_t c = 0; c < cfg.max_seqs; ++c)
         free_cards_[(size_t)c] = (int32_t)(cfg.max_seqs - 1 - c);   /* 0 is taken first */
+    /* tp8 S5: a pipeline lane takes its own run of the cards (lanes.h): every lane's sequences have
+     * StepSlots of their own, and the lane holds at most that many sequences. */
+    if (n_lanes_ > 1) {
+        const int64_t per = (cfg.max_seqs + n_lanes_ - 1) / n_lanes_;
+        const int64_t lo = (int64_t)lane_ * per, hi = std::min<int64_t>(cfg.max_seqs, lo + per);
+        if (lo >= hi) {
+            RAD_ERR("scheduler: lane %d of %d has no card: --max-num-seqs %lld is below --pp-lanes", lane_, n_lanes_,
+                    (long long)cfg.max_seqs);
+            return RAD_E_INVAL;
+        }
+        size_t w = 0;
+        for (size_t k = 0; k < free_cards_.size(); ++k)
+            if (free_cards_[k] >= lo && free_cards_[k] < hi) free_cards_[w++] = free_cards_[k];
+        free_cards_.resize(w);
+    }
     reqs_.reserve((size_t)cfg.max_seqs);
     completed_.reserve((size_t)cfg.max_seqs);
     committed_.reserve((size_t)cfg.max_seqs);
@@ -2268,6 +2284,9 @@ bool Scheduler::preempt_back() {
     int32_t slot = running_.back();
     SchedReq& s = *reqs_[(size_t)slot];
     Request& r = *s.req;
+    /* tp8 S5: a piece of its prompt runs in another lane's step: its blocks stay (the callers then
+     * wait a step); never on one lane */
+    if (s.lent > 0) { lane_preempt_refused_ = true; return false; }
 
     /* Preemption by recompute: the blocks go back and the request restarts from zero. Its output
      * is the tail of its token sequence, so it simply re-prefills prompt ++ output. What it computed
@@ -2923,6 +2942,9 @@ const RadBatch* Scheduler::step() {
     serial_.clear();
     /* The last step's admissions have read their snapshots: its forward committed before this. */
     if (pc_) pc_->begin_step();
+    /* tp8 S5: a pipeline lane's sequences with pieces in other lanes (lanes.cpp); nothing on one lane */
+    struct LaneEnd { Scheduler* s; ~LaneEnd() { if (s) s->lane_plan_end(); } } lane_end{ lanes_ ? this : nullptr };
+    if (lanes_) lane_plan_begin();
 
     plan_.reset();
     plan_.spec_is_tree = tree_;
@@ -3007,6 +3029,7 @@ const RadBatch* Scheduler::step() {
                 running_.push_back(victim);
             }
             if (preempt_back()) evict_rounds = 0;   /* its blocks stay in the cache: evict them first */
+            if (lane_preempt_refused_) { lane_preempt_refused_ = false; break; }   /* tp8 S5 */
         }
     }
 
@@ -3089,6 +3112,8 @@ const RadBatch* Scheduler::step() {
         /* lever DST: the shared budget in force (sched_mixed_tok); B (2) keeps whole intervals on the geometry's own */
         if (!lone && bi_chunk_ != 1) budget = bi_chunk_ == 2 ? geo_.shared_tok : mixed_now_;
     }
+    /* tp8 S5: the pieces other lanes lent this one run first (lanes.cpp) */
+    if (lanes_) budget = lane_reserve(budget);
 
     /* Lever NOA (fn4 sched_noa): acts on a shared step under option D -- not a lone prefill's span step (one prefill by
      * design), not a step the interleave holds (decode rows only, and the bypass's admissions). */
@@ -3334,6 +3359,8 @@ const RadBatch* Scheduler::step() {
             /* A victim that published keeps its blocks in the cache: eviction gets its rounds
              * back, so they are reclaimed before anyone else is preempted. */
             if (preempt_back()) evict_rounds = 0;
+            /* tp8 S5: the back has a piece in flight in another lane: this request waits a step instead */
+            if (lane_preempt_refused_) { lane_preempt_refused_ = false; yielded = true; break; }
             preempted_here = true;
             if (last) { yielded = true; break; }
         }
@@ -3643,6 +3670,8 @@ const RadBatch* Scheduler::step() {
         if (e.n_tokens < capped_full) ++m_.prefill_chunks_capped;
     }
 
+    /* tp8 S5: the pieces other lanes lent this one (lanes.cpp) */
+    if (lanes_) lane_take_inbox();
     if (plan_.e.empty()) { interleave_left_ = 0; held_prefill_ = 0; return nullptr; }
 
     /* Decode rows first, so each half is contiguous. The running loop walks `running_` in
@@ -3692,12 +3721,14 @@ const RadBatch* Scheduler::step() {
          * to interleave, and holding would only keep the next request out. */
         bool continues = false;
         for (const StepEntry& e : plan_.e)
-            if (e.is_prefill && !e.produces_token) continues = true;
+            if (e.is_prefill && !e.produces_token && e.home < 0) continues = true;
         /* lever DST: a held step that admitted a short request (sched_short_bypass) is still one of the hold's steps */
         if (any_pf && !hold_prefill) interleave_left_ = any_decoding && continues ? interleave_steps() : 0;
         else if (interleave_left_ > 0) --interleave_left_;
         if (held_prefill_ > 0) ++m_.steps_held;
     }
+    /* tp8 S5: this lane's chunks cut into one piece a lane (lanes.cpp), after the interleave read them whole */
+    if (lanes_) lane_split_own();
     for (const StepEntry& e : plan_.e)
         if (!e.is_prefill && e.n_spec == 0) ++m_.decode_rows_unspeculated;
     plan_.n_seq_decode = n_dec;
@@ -3771,7 +3802,11 @@ const RadBatch* Scheduler::step() {
          * A restore cannot be re-scheduled: the entry consumed its checkpoint slot, and the next
          * step would run on as if the recurrent state were in place. Such a request gives its
          * hit back and returns to the queue for a fresh lookup. */
+        /* tp8 S5: another lane's pieces go back to this lane's inbox, their home lane holding their
+         * sequences (lent_pending) until this lane plans them again: never run out of position order. */
+        if (lanes_) lane_return_pieces();
         for (StepEntry& e : plan_.e) {
+            if (e.home >= 0) continue;
             SchedReq& s = *reqs_[(size_t)e.slot];
             s.entry = -1;
             if (e.ckpt_restore < 0 || !s.req) continue;
@@ -4136,6 +4171,12 @@ int Scheduler::commit(StepResult& res) {
      * sorted into the prefill half would take the chunked path and leave stale factors. */
     for (int i = 0; i < res.n_seq; ++i) {
         const StepEntry& e = plan_.e[(size_t)i];
+        /* tp8 S5: another lane's piece in this step: its home lane commits it (lanes.cpp) */
+        if (e.home >= 0) {
+            if (Scheduler* home = lanes_ ? lanes_->lane(e.home) : nullptr) home->lane_piece_done(e, i, res);
+            step_prefill_tok_ += e.n_tokens;
+            continue;
+        }
         SchedReq& s = *reqs_[(size_t)e.slot];
         Request& r = *s.req;
         if (r.state != ReqState::Running) {
