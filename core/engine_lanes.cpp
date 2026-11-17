@@ -53,6 +53,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <thread>
 
@@ -158,6 +159,24 @@ int Engine::step_loop_lanes() {
         ctxs_.on = 0;
     }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
+    /* tp8 dev 1b: RADIANCE_PP_TAIL_AHEAD=1 (both nodes; the follower does nothing with it) -- the next lane's model part
+     * goes out before this lane's collect, so the leader's cards run it while the host commits, plans and ships. Only
+     * where the leader's head part issues no work the follower waits on (RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t)):
+     * otherwise the next head would queue behind both tails and the follower would start it late. */
+    tail_ahead_ = false;
+    tail_ahead_n_ = 0;
+    if (const char* ta = std::getenv("RADIANCE_PP_TAIL_AHEAD"); ta && !std::strcmp(ta, "1")) {
+        const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
+        const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
+        tail_ahead_ = fe_on && !embedding_;
+        RAD_INFO("two-node pipeline: RADIANCE_PP_TAIL_AHEAD=1 %s", tail_ahead_
+                     ? "-- a lane step's model part is issued while the lane before it is collected and committed; its "
+                       "sampler and drafter after that commit (tp8 dev 1b)"
+                     : "is not taken: it needs RADIANCE_PP_FOLLOWER_EMBED=1 at a cut W(0, t) (the leader's head part then "
+                       "issues nothing the follower waits on)");
+    }
+    /* tp8 dev 1b: per lane, whether its step in flight has its model part / its sampler part released */
+    std::vector<char> m_out((size_t)n_lanes_, 0), s_out((size_t)n_lanes_, 0);
     rad::StallWatch step_watch("step", 20000);
     /* The lanes with a head issued, oldest first; their tails go in this order (the order of their
      * X2 on the follower's stream). */
@@ -175,6 +194,15 @@ int Engine::step_loop_lanes() {
         }
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
+        /* tp8 dev 1b: the oldest lane step's model part went ahead: its sampler and drafter now, before any other release
+         * (a head's would change the arena level its sampler reads the logits at) */
+        if (tail_ahead_ && !fifo.empty()) {
+            const auto [fl, fb] = fifo.front();
+            if (m_out[(size_t)fl] && !s_out[(size_t)fl]) {
+                if (const int ts = lane_tail_issue(fl, fb, so, cancel, t_on, true); ts < 0) return fail_loop(ts);
+                s_out[(size_t)fl] = 1;
+            }
+        }
         /* 1. every lane with no step in flight plans, in turn; each one's head goes out at once. The lanes
          * that plan before `l` plans again, in that order, are the idle ones after it -- planned right
          * behind it, before anything else -- then those in flight, oldest first (their commits come
@@ -242,11 +270,28 @@ int Engine::step_loop_lanes() {
         /* 2. the oldest lane step's tail, its drafter, its commit */
         const auto [lane, b] = fifo.front();
         fifo.pop_front();
-        if (const int ts = lane_tail(lane, b, so, cancel, t_on); ts < 0) return fail_loop(ts);
+        if (!tail_ahead_) {
+            if (const int ts = lane_tail(lane, b, so, cancel, t_on); ts < 0) return fail_loop(ts);
+        } else {
+            if (!s_out[(size_t)lane])
+                if (const int ts = lane_tail_issue(lane, b, so, cancel, t_on, m_out[(size_t)lane] != 0); ts < 0)
+                    return fail_loop(ts);
+            /* tp8 dev 1b: the next lane step's model part, in head order, behind this one's drafter and step end; its
+             * sampler goes out at the top of the next round, with nothing released between */
+            if (!fifo.empty() && !m_out[(size_t)fifo.front().first]) {
+                if (const int ms = lane_tail_model(fifo.front().first, fifo.front().second); ms < 0) return fail_loop(ms);
+                m_out[(size_t)fifo.front().first] = 1;
+            }
+            if (const int fs = lane_tail_finish(lane, b, so, t_on); fs < 0) return fail_loop(fs);
+            m_out[(size_t)lane] = s_out[(size_t)lane] = 0;
+        }
         busy[(size_t)lane] = 0;
         if (++lane_steps == 1 || lane_steps % 4096 == 0) lanes_note(lane_steps, rounds_two);
     }
     lanes_note(lane_steps, rounds_two);
+    if (tail_ahead_)
+        RAD_INFO("two-node pipeline: %lld lane steps' model parts were issued ahead of the lane before them's collect "
+                 "(RADIANCE_PP_TAIL_AHEAD=1)", (long long)tail_ahead_n_);
     return RAD_OK;
 }
 
@@ -254,6 +299,38 @@ int Engine::step_loop_lanes() {
  * staging on, released as the leader's part from stage_recv X2 (kIssueAll), then its drafter, its
  * collect and commit -- with lsched() this lane's scheduler throughout. */
 int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on) {
+    if (const int is = lane_tail_issue(lane, b, so, cancel, t_on, false); is < 0) return is;
+    return lane_tail_finish(lane, b, so, t_on);
+}
+
+/* tp8 dev 1b: the tail's model part alone (kIssueModel: X2's receive, layers t.., the head's logits; no sampler), issued
+ * ahead of its sampler as Engine::issue_ahead issues one machine's next step. Nothing is released between it and its
+ * sampler part (step_loop_lanes): the arena level and every buffer the model part wrote are the sampler's. */
+int Engine::lane_tail_model(int lane, const RadBatch* b) {
+    lane_select(lane);
+    if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) return ps;
+    pp_set_pass(lane, RAD_PP_PART_TAIL);
+    issue_what_.store(kIssueModel, std::memory_order_release);
+    step_batch_.store(b, std::memory_order_release);
+    const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
+    barrier_->arrive_and_wait();      /* release the ranks */
+    barrier_->arrive_and_wait();      /* and wait for them */
+    if (pp_stamps_) {
+        const RadPpRing* x2 = pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X2];
+        const uint64_t t1 = rad_mono_ns();
+        pp_stamp("tail", lane, b->step, x2 && x2->taken_ns > t0 ? x2->taken_ns : t0, t1);
+    }
+    pp_set_pass(lane, RAD_PP_PART_WHOLE);
+    ++tail_ahead_n_;
+    const int st = step_status_.load(std::memory_order_acquire);
+    if (st < 0) RAD_ERR("lane %d step %d's model part, issued ahead, failed: %s -- the engine cannot continue", lane, b->step,
+                        rad_strerror(st));
+    return st;
+}
+
+/* The tail's release (its model part too unless `model_done`), its drafter's passes and its step end. */
+int Engine::lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on,
+                            bool model_done) {
     lane_select(lane);
     const StepPlan& plan = lsched().plan();
     so.reqs.clear();
@@ -328,10 +405,15 @@ int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint
         build_ready_  = false;
         build_status_ = RAD_OK;
     }
-    /* The tail's release: the arena level and the follower pools for its rows, no switch change. */
-    if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) return ps;
-    pp_set_pass(lane, RAD_PP_PART_TAIL);
-    issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
+    /* The tail's release: the arena level and the follower pools for its rows, no switch change. tp8 dev 1b: its model
+     * part went ahead (lane_tail_model), so this release issues the sampler alone, at the level that part set. */
+    if (!model_done) {
+        if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) return ps;
+        pp_set_pass(lane, RAD_PP_PART_TAIL);
+        issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
+    } else {
+        issue_what_.store(kIssueSampler, std::memory_order_release);
+    }
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
     barrier_->arrive_and_wait();      /* release the ranks */
@@ -347,7 +429,7 @@ int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint
     }
     barrier_->arrive_and_wait();      /* wait for them */
     /* busy from X2's arrival (rank 0 took it) to the join; the wait for X2 before it is not */
-    if (pp_stamps_) {
+    if (pp_stamps_ && !model_done) {
         const RadPpRing* x2 = pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X2];
         const uint64_t t1 = rad_mono_ns();
         pp_stamp("tail", lane, b->step, x2 && x2->taken_ns > t0 ? x2->taken_ns : t0, t1);
@@ -375,7 +457,18 @@ int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint
     if (st < 0) return st;
     RAD_TRY(stream_probe_issue(b));
     RAD_TRY(mark_step_end(b, so));
-    st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
+    /* tp8 dev 1b: the scored rows' copies here, before another lane's model part can follow on the stream (a no-op
+     * outside --kld-record; with nothing between, the copies sit where collect's score_rows put them) */
+    if (cfg_.kld()) RAD_TRY(score_rows_issue(b, so));
+    return RAD_OK;
+}
+
+/* The tail's collect, commit and drafter finish (lane_tail_issue ran; tp8 dev 1b: another lane's model part may have
+ * been released since, so this lane is selected again). */
+int Engine::lane_tail_finish(int lane, const RadBatch* b, StepOut& so, bool t_on) {
+    lane_select(lane);
+    const StepPlan& plan = lsched().plan();
+    int st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
     if (t_on) phase_mark(PH_COLLECT);
     if (st < 0) return st;
     if (pp_link_)
@@ -387,7 +480,7 @@ int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint
                     return RAD_E_IO;
                 }
     couple_verify_evidence(b->step);
-    if (cfg_.kld()) RAD_TRY(score_rows(b, so));
+    if (cfg_.kld()) RAD_TRY(score_rows_take(b, so));
     dump_buffers(ranks_[0]->ctx, b->step);
     static const int prof_every = [] {
         const char* v = std::getenv("RADIANCE_PROFILE_EVERY");

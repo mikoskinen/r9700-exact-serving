@@ -468,6 +468,16 @@ private:
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);
     int  lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on);
+    /* tp8 dev 1b (RADIANCE_PP_TAIL_AHEAD=1 with RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t)): a lane step's tail in three
+     * releases -- its model part (X2's receive .. the head's logits, kIssueModel), issued while the lane before it is
+     * still being collected; its sampler + drafter + step end (kIssueSampler once the model went ahead); its collect,
+     * commit and drafter finish. lane_tail is the issue and the finish back to back, as before. */
+    int  lane_tail_model(int lane, const RadBatch* b);
+    int  lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on,
+                         bool model_done);
+    int  lane_tail_finish(int lane, const RadBatch* b, StepOut& so, bool t_on);
+    bool tail_ahead_ = false;
+    int64_t tail_ahead_n_ = 0;   /* model parts issued ahead */
     int  lanes_init(const std::vector<BatchBuilder::RankIO>& rio);
     void lanes_note(int64_t lane_steps, int64_t rounds_two);
     /* Stage busy stamps (RADIANCE_PP_STAMPS=path): every pass's host issue-to-done interval on this
@@ -843,6 +853,8 @@ private:
                   const char* tag, int every_s,
                   const std::function<void(size_t, double)>& progress, int* bad);
     int  score_rows(const RadBatch* b, const StepOut& so);
+    int  score_rows_issue(const RadBatch* b, const StepOut& so);   /* tp8 dev 1b: score_rows' copies ... */
+    int  score_rows_take(const RadBatch* b, const StepOut& so);    /* ... and its wait + scoring */
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
     std::vector<int64_t> kld_vocab0_, kld_width_;   /* per rank read: its logits columns */
