@@ -912,6 +912,11 @@ struct Config {
     int   pp_cut_h = 0;               /* --pp-cut H,T or T (= 0,T): the follower's layers [H, T) */
     int   pp_cut_t = 0;
     int   node_link = 0;              /* --node-link tcp (0) | verbs (1) */
+    /* A pipeline node turns its prefix cache off (engine_node.cpp pp_check) but plans its prefill chunks as the
+     * cache it was started with would (chunk_geometry_resolve: the --prefix-resume exact grid, lever G's tail):
+     * a chunk plan moves a near-tie's bits (the prompt's last row alone in a decode-shaped step is not the
+     * same arithmetic as inside its chunk), so the pipeline's answers are the one-machine start's. tp8 S4 hw. */
+    bool  pp_plan_prefix = false;
     int64_t max_tok = 2048;            /* --max-num-batched-tokens */
     /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
      * pending in it (decode rows, another prefill, a request waiting for admission). -1 = auto:

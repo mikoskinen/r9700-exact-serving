@@ -144,7 +144,10 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
      * Without linear state there are no checkpoints, except for a trunk window under a prefix
      * cache, which snapshots the window at interval boundaries and the prompt's tail
      * (window_ckpt). */
-    if ((has_linear || (has_window && cfg.prefix_cache)) && cfg.checkpoint_interval > 0)
+    /* A two-node pipeline node plans as the prefix cache it was started with (Config::pp_plan_prefix; its own
+     * cache is off): unset on one machine, so this reads cfg.prefix_cache as before. */
+    const bool plan_pc = cfg.prefix_cache || cfg.pp_plan_prefix;
+    if ((has_linear || (has_window && plan_pc)) && cfg.checkpoint_interval > 0)
         g.checkpoint_interval = align_up(cfg.checkpoint_interval, g.quantum);
     else
         g.checkpoint_interval = 0;
@@ -177,7 +180,7 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
     const int64_t I0 = g.checkpoint_interval;
     const bool splits = I0 > 0 && (!g.window_ckpt || g.window_periodic);
     const int64_t budget_chunk = cfg.max_tok / g.quantum * g.quantum;
-    g.exact = cfg.prefix_exact && cfg.prefix_cache;
+    g.exact = cfg.prefix_exact && plan_pc;
     if (g.exact && splits && I0 > budget_chunk && I0 % budget_chunk != 0) {
         g.checkpoint_interval = align_up(I0, budget_chunk);
         RAD_WARN("--checkpoint-interval %lld resolves to %lld: --prefix-resume exact needs it a "

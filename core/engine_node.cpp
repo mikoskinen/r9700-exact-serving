@@ -186,11 +186,16 @@ int Engine::pp_check() {
     /* The prefix cache adopts blocks and restores snapshots on the leader's say; the follower's
      * half of that (its KV tier, its snapshot slots) is S8's. */
     if (cfg_.prefix_cache || cfg_.prefix_cache_mib > 0) {
+        /* tp8 S4 hw (17.11. gpu02 + gpu03): planned without the cache, the leader cut the 16k / 64k cold prompts
+         * 2048 + 4096 ... + 1440 + 1 (the last row alone, a decode-shaped step) where one machine cuts 2048 ... + 1024
+         * + 417, and the texts parted from the published start's at a near tie; the chunk plan stays the cache's. */
+        cfg_.pp_plan_prefix = cfg_.prefix_cache;
         cfg_.prefix_cache = false;
         cfg_.prefix_cache_mib = 0;
         decide("--no-prefix-cache", "prefix caching off",
                "a two-node pipeline node (tp8 S4): a prefix hit, its tier copies and snapshot restores "
-               "are not yet carried to the follower");
+               "are not yet carried to the follower; its prefill chunks are planned as the cache's "
+               "(--prefix-resume exact grid), so a cold prompt is cut as on one machine");
     }
     PpGlobal& g = pp_g();
     g.nodes = 2;
