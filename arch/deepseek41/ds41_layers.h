@@ -274,6 +274,29 @@ inline int crossings(const Geo& g, int h, int t, Crossing out[2], std::string* e
             if (d.kind == Need::Latent) c.latent = true;
             if (d.kind == Need::IndexKeys) c.index = true;
         }
+        /* (review of S6) The crossing ships the sender's buffers as they are after its last layer before the boundary:
+         * the latent / index-key / page planes hold the LAST kv source the sender computed, the selection plane its LAST
+         * index layer's. So the source / index layer that crosses must be the sender's last one below the boundary, or
+         * the receiver would store another source's entries into its copy (or read another layer's selections). True of
+         * every cut on DeepSeek-V4.1-Flash (sources and index layers of one ratio are consecutive); refused by name on a
+         * geometry where it is not. */
+        const Spec& snd = k == 0 ? lead : fol;
+        const auto last_below = [&](const std::vector<char>& is, int from) {
+            for (int l = c.at - 1; l > from; --l)
+                if (snd.held(l) && is[(size_t)l]) return l;
+            return -1;
+        };
+        const int ls = c.src >= 0 ? last_below(g.is_src, c.src) : -1, li = c.sel >= 0 ? last_below(g.is_idx, c.sel) : -1;
+        if ((c.src >= 0 && !snd.held(c.src)) || (c.sel >= 0 && !snd.held(c.sel)) || (c.keep >= 0 && !snd.held(c.keep)) ||
+            ls >= 0 || li >= 0) {
+            *err = "X" + std::to_string(k + 1) + " of W(" + std::to_string(h) + "," + std::to_string(t) + ") would carry " +
+                   (ls >= 0 ? "kv source " + std::to_string(c.src) + "'s entries, but the sending node computes kv source " +
+                                  std::to_string(ls) + " after it (its latent planes then hold " + std::to_string(ls) + "'s)"
+                    : li >= 0 ? "index layer " + std::to_string(c.sel) + "'s selections, but the sending node runs index layer " +
+                                    std::to_string(li) + " after it"
+                              : std::string("a layer's entries the sending node does not hold"));
+            return -1;
+        }
     }
     return 0;
 }
