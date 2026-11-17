@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <link.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -128,6 +129,12 @@ struct State {
     std::mutex mu;
     int  want[kSwitches];
     bool pend[kSwitches];
+    /* tp8 S4: requests applied (apply_pending), each switch's count and last value -- what a
+     * pipeline's leader ships; and the follower's applied values as it last reported them. */
+    uint32_t req_n[kSwitches] = {};
+    int32_t  req_v[kSwitches] = {};
+    int      peer_n = 0;
+    int32_t  peer_v[kSwitches] = {};
     bool any_pending = false;
     /* any_pending as seen without the lock: the scheduler thread tests it every step release and
      * takes the lock only when a request queued something. */
@@ -805,7 +812,8 @@ int psk_cr_reach() {
     return -1;
 }
 
-bool check(const std::string& name, int v, std::string* err) {
+/* This node's own verdict (check() adds a pipeline peer's for a plugin switch). */
+static bool check_here(const std::string& name, int v, std::string* err) {
     if (name == "epoch_bump") return true;
     const int i = switch_index(name);
     if (i < 0) {
@@ -1308,6 +1316,83 @@ bool check(const std::string& name, int v, std::string* err) {
     return true;
 }
 
+/* ---- tp8 S4: the two-node pipeline (review F2 / F3) ---------------------------------------------- */
+namespace {
+std::mutex& peer_mu() { static std::mutex m; return m; }
+PeerCheck& peer_fn() { static PeerCheck f; return f; }
+}  // namespace
+
+bool follower_switch(int i) {
+    if (i < 0 || i >= kSwitches) return false;
+    return plugin_switch(i) || i == kAqlAcq || i == kRouteCopyOv || i == kPlaceLf || i == kPlaceSwapLent ||
+           i == kHeatMinGainX100 || i == kHeatHystX100 || i == kPlaceHb;
+}
+
+void set_peer_check(PeerCheck f) {
+    std::lock_guard<std::mutex> lk(peer_mu());
+    peer_fn() = std::move(f);
+}
+
+int check_node(const std::string& name, int v, std::string* err) { return check_here(name, v, err) ? 1 : -1; }
+
+bool check(const std::string& name, int v, std::string* err) {
+    std::string here_err;
+    const bool here = check_here(name, v, &here_err);
+    PeerCheck peer;
+    {
+        std::lock_guard<std::mutex> lk(peer_mu());
+        peer = peer_fn();
+    }
+    const int i = switch_index(name);
+    /* One machine (no peer), the leader's own verdict on a switch only it acts on, or a plugin
+     * switch it takes itself: as before. */
+    if (!peer || i < 0 || !plugin_switch(i) || here) {
+        if (!here && err) *err = here_err;
+        return here;
+    }
+    /* A plugin switch this node refuses -- a lever whose layers the other node holds (ds41_e2 on a
+     * leader with no Engram layer) -- is the pipeline's if the other node takes it; each node then
+     * applies what its own plugins take (apply_pending refuses the rest, named in its log). */
+    std::string why;
+    const int r = peer(name, v, &why);
+    if (r > 0) return true;
+    if (err) *err = here_err + (r < 0 ? "; the pipeline's other node refuses it too: " + why
+                                      : "; the pipeline's other node did not answer: " + why);
+    return false;
+}
+
+void requests(uint32_t* count, int32_t* value) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    for (int i = 0; i < kSwitches; ++i) {
+        count[i] = s.req_n[i];
+        value[i] = s.req_v[i];
+    }
+}
+
+int follow(const uint32_t* count, const int32_t* value, int n, uint32_t* taken, std::vector<std::string>* skipped) {
+    int asked = 0;
+    for (int i = 0; i < n && i < kSwitches; ++i) {
+        if (count[i] == taken[i]) continue;
+        taken[i] = count[i];
+        if (!follower_switch(i)) continue;   /* the scheduler's or the drafter's: the leader's alone */
+        std::string e;
+        if (!request(kNames[i], value[i], &e)) {
+            if (skipped) skipped->push_back(std::string(kNames[i]) + "=" + std::to_string(value[i]) + ": " + e);
+            continue;
+        }
+        ++asked;
+    }
+    return asked;
+}
+
+void note_peer(const int32_t* v, int n) {
+    State& s = st();
+    std::lock_guard<std::mutex> lk(s.mu);
+    s.peer_n = std::min(n, (int)kSwitches);
+    for (int i = 0; i < s.peer_n; ++i) s.peer_v[i] = v[i];
+}
+
 bool request(const std::string& name, int v, std::string* err) {
     if (!check(name, v, err)) return false;
     if (name == "epoch_bump") {
@@ -1341,6 +1426,8 @@ bool apply_pending(int step, int* sched) {
         if (!s.pend[i]) continue;
         s.pend[i] = false;
         int v = s.want[i];
+        ++s.req_n[i];       /* tp8 S4: the request as asked, whatever this node makes of it */
+        s.req_v[i] = v;
         if (i == kDraftAdaptive) {
             if (v < 0) v = s.draft_configured.load(std::memory_order_acquire);
             if (v == 1 && s.draft_capable.load(std::memory_order_acquire) != 1) {
@@ -1427,6 +1514,20 @@ std::string state_json() {
         first = false;
     }
     if (s.bump) o += std::string(first ? "" : ", ") + "\"epoch_bump\": 1";
+    /* tp8 S4: a pipeline leader also reports what its follower applies (a lever whose layers the
+     * follower holds shows its value there); absent on one machine. */
+    if (s.peer_n > 0) {
+        /* only the switches the follower takes from the leader (follower_switch): its scheduler and
+         * drafter switches are idle there and say nothing about the pipeline */
+        o += "}, \"peer\": {\"role\": \"follower\", \"switches\": {";
+        bool pf = true;
+        for (int i = 0; i < s.peer_n; ++i) {
+            if (!follower_switch(i)) continue;
+            o += std::string(pf ? "" : ", ") + "\"" + kNames[i] + "\": " + std::to_string(s.peer_v[i]);
+            pf = false;
+        }
+        o += "}";
+    }
     o += "}, \"epoch\": " + std::to_string(s.epoch.load(std::memory_order_acquire)) +
          ", \"applied_step\": " + std::to_string(s.applied_step.load(std::memory_order_acquire)) +
          ", \"plugins\": " + std::to_string((int)s.hooks.size()) +

@@ -583,7 +583,9 @@
 #define RAD_RUNTIME_FN4_SWITCH_H
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace rad {
 namespace fn4 {
@@ -809,8 +811,32 @@ void note_sahb(int rank, const int64_t* v);
 void sp_register(bool capable);
 constexpr int kSpN = 9;
 void note_sp(int rank, const int64_t* v);
-/* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. */
+/* Whether a request may set `name` to `value` (epoch_bump included); false with the reason. On a
+ * two-node pipeline's leader (set_peer_check) a plugin switch this node refuses is taken when the
+ * other node takes it. */
 bool check(const std::string& name, int value, std::string* err);
+
+/* ---- tp8 S4: the two-node pipeline (review F2 / F3). Unused on one machine: no peer is set, the
+ * request counts are only counted and no "peer" object is reported. ---- */
+/* The switches a pipeline's follower takes from its leader: those that act on a node's own passes
+ * or placement -- every plugin switch, aql_acq, route_copy_ov, place_lf, place_swap_lent,
+ * heat_min_gain_x100, heat_hyst_x100, place_hb. The scheduler's and the drafter's are the leader's. */
+bool follower_switch(int i);
+/* Every request this node applied (apply_pending) per switch: how many so far, and the last value
+ * asked (as asked, not as applied: a leader that holds no layer of a lever reports it 0). */
+void requests(uint32_t* count, int32_t* value);
+/* The follower: request every follower_switch whose count advanced past `taken` (updated); a value
+ * this node refuses is skipped with its reason in `skipped` (a lever it does not declare), never a
+ * failure. Returns how many were requested; apply_pending applies them. */
+int  follow(const uint32_t* count, const int32_t* value, int n, uint32_t* taken, std::vector<std::string>* skipped);
+/* The leader, once the link serves: asks the follower for its verdict on name = value (1 takes, -1
+ * refuses with the reason, 0 no answer). */
+using PeerCheck = std::function<int(const std::string&, int, std::string*)>;
+void set_peer_check(PeerCheck f);
+/* This node's own verdict, 1 or -1 (the follower's answer to the leader's ask). */
+int  check_node(const std::string& name, int value, std::string* err);
+/* The leader: the follower's applied values as it reported them (GET's "peer" object). */
+void note_peer(const int32_t* v, int n);
 /* Server thread: queue a value; false (with the reason) for anything check() refuses. */
 bool request(const std::string& name, int value, std::string* err);
 /* Scheduler thread, every rank thread parked: apply what is queued. Returns true when anything

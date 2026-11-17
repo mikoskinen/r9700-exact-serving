@@ -1,0 +1,185 @@
+/* tests/pp_switch_test.cpp -- the two-node pipeline's runtime switches (tp8 S4, review F2 / F3;
+ * core/runtime/fn4_switch.h): what the leader ships, what the follower takes, and how a request for a
+ * lever only the other node declares is judged.
+ *
+ *   follow     the follower requests only the switches that act on its own passes or placement, each
+ *              once per leader request; a value it refuses (a lever it does not declare) is skipped
+ *              and named, never a failure -- the published switch file's 49 non-zero values included,
+ *              in a drafter-less node's registration state (the review's pp_fn4_follower_test scenario)
+ *   requests   apply_pending counts every request with its value as asked
+ *   peer       on the leader, a plugin switch it refuses is taken when the follower takes it (the
+ *              leader holds no Engram layer: ds41_e2 is the follower's); both refusing is a refusal
+ *              naming both; a core switch is never asked about
+ * The process loads no plugin, so every plugin switch is "no loaded plugin serves it" here. */
+#include "rad_test.h"
+
+#include "runtime/fn4_switch.h"
+
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace {
+
+using namespace rad;
+
+/* The published DeepSeek switches.json's non-zero values (hero2/raw/ds-h210/run-used/deepseek, the 49
+ * the review counted; ds41_psk / ds41_bi as s4-run.sh sets them, 0). */
+const std::map<std::string, int>& published() {
+    static const std::map<std::string, int> m = {
+        { "gg_gemv", 2 }, { "aql_acq", 2 }, { "ds41_kvfold", 1 }, { "ds41_ofold", 1 }, { "ds41_onefill", 1 },
+        { "draft_adaptive", 1 }, { "draft_depth0", 3 }, { "draft_hybrid_match", 8 }, { "drafter_mx", 1 },
+        { "gg_pf", 2 }, { "f32_pf", 25 }, { "dspark_walk", 1 }, { "ds41_argather", 48 }, { "idx_split", 1 },
+        { "ds41_qnfold", 1 }, { "ds41_swfold", 1 }, { "draft_ctxskip", 1 }, { "dspark_conf", 1 },
+        { "dspark_conf_rows", 1 }, { "draft_lend", 1 }, { "draft_probe_backoff", 3 }, { "draft_hybrid", 1 },
+        { "draft_occ_k", 32 }, { "ds41_psk_k", 8 }, { "draft_occ", 13 }, { "sched_bi_chunk", 3 },
+        { "sched_noa", 2 }, { "dspark_pfctx", 1 }, { "ds41_engdd", 1 }, { "mhc_fuse", 1 },
+        { "sched_row_cap", 48 }, { "ds41_gq", 3 }, { "ds41_e2", 1 }, { "sched_cb_hold_k", 2 },
+        { "exl3_x3d", 2 }, { "ar_xpush", 1 }, { "gg_gemv_m16", 1 }, { "place_swap_lent", 1 },
+        { "heat_min_gain_x100", 75 }, { "heat_hyst_x100", 125 }, { "ds41_rfuse", 2 }, { "route_copy_ov", 1 },
+        { "ds41_wmk", 2 }, { "ds41_moe1", 1 }, { "sched_tail_grid", 512 }, { "draft_dcap", 3 },
+        { "exl3_dng", 2 }, { "ds41_f32dec", 1 }, { "exl3_xr", 3 },
+    };
+    return m;
+}
+
+bool scheduler_or_drafter(const std::string& n) {
+    return n.rfind("draft_", 0) == 0 || n.rfind("dspark_conf", 0) == 0 || n.rfind("sched_", 0) == 0 ||
+           n == "arena_d0" || n == "ds41_psk_k" || n == "stage_short" || n == "stage_pick" ||
+           n == "stage_full_min" || n == "stage_full_pick" || n == "dspark_alt";
+}
+
+TEST(the_follower_takes_only_its_own_switches_and_never_fails_on_a_refusal) {
+    /* A drafter-less node, as a follower registers itself (scheduler.cpp, engine_draft.cpp). */
+    fn4::draft_register(false, false);
+    fn4::hybrid_register(false);
+    fn4::dspark_register(false, false, 0, 0);
+    /* The leader's request record: one request each of the published values. */
+    std::vector<uint32_t> count(fn4::kSwitches, 0), taken(fn4::kSwitches, 0);
+    std::vector<int32_t> value(fn4::kSwitches, 0);
+    for (const auto& [n, v] : published()) {
+        const int i = fn4::switch_index(n);
+        REQUIRE(i >= 0);
+        count[(size_t)i] = 1;
+        value[(size_t)i] = v;
+    }
+    std::vector<std::string> skipped;
+    const int asked = fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped);
+    /* Every request is marked taken, whether or not this node acts on it. */
+    for (int i = 0; i < fn4::kSwitches; ++i) CHECK_EQ(taken[(size_t)i], count[(size_t)i]);
+    /* No scheduler or drafter switch is requested on the follower -- in particular none of the review's
+     * refused draft_hybrid / dspark_conf / dspark_conf_rows -- and none is even named as skipped. */
+    for (const std::string& s : skipped) {
+        const std::string n = s.substr(0, s.find('='));
+        if (scheduler_or_drafter(n)) fprintf(stderr, "    asked for a leader-only switch: %s\n", s.c_str());
+        CHECK(!scheduler_or_drafter(n));
+    }
+    int follower_kind = 0;
+    for (const auto& [n, v] : published()) follower_kind += fn4::follower_switch(fn4::switch_index(n)) ? 1 : 0;
+    fprintf(stderr, "    %zu published values: %d act on a follower's passes / placement; %d requested, %zu skipped "
+            "(no plugin in this process; placement unregistered)\n", published().size(), follower_kind, asked,
+            skipped.size());
+    CHECK_EQ(asked + (int)skipped.size(), follower_kind);
+    CHECK(fn4::follower_switch(fn4::switch_index("ds41_e2")));
+    CHECK(fn4::follower_switch(fn4::switch_index("aql_acq")));
+    CHECK(!fn4::follower_switch(fn4::switch_index("draft_hybrid")));
+    CHECK(!fn4::follower_switch(fn4::switch_index("dspark_conf")));
+    CHECK(!fn4::follower_switch(fn4::switch_index("sched_noa")));
+    /* aql_acq is the core's and acts on every pass: requested and applied. */
+    int sw[fn4::kSwitches];
+    (void)fn4::apply_pending(1, sw);
+    CHECK_EQ(fn4::value(fn4::kAqlAcq), 2);
+    /* The same record again: nothing new is requested. */
+    skipped.clear();
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 0);
+    CHECK(skipped.empty());
+    /* A second request of the same switch (the count advances) is taken again. */
+    const int acq = fn4::kAqlAcq;
+    count[(size_t)acq] = 2;
+    value[(size_t)acq] = 1;
+    CHECK_EQ(fn4::follow(count.data(), value.data(), fn4::kSwitches, taken.data(), &skipped), 1);
+    (void)fn4::apply_pending(2, sw);
+    CHECK_EQ(fn4::value(acq), 1);
+}
+
+TEST(apply_pending_records_each_request_as_asked) {
+    std::vector<uint32_t> n0(fn4::kSwitches), n1(fn4::kSwitches);
+    std::vector<int32_t> v0(fn4::kSwitches), v1(fn4::kSwitches);
+    fn4::requests(n0.data(), v0.data());
+    std::string why;
+    CHECK(fn4::request("aql_acq", 2, &why));
+    CHECK(fn4::request("route_copy_ov", 1, &why));
+    int sw[fn4::kSwitches];
+    (void)fn4::apply_pending(3, sw);
+    fn4::requests(n1.data(), v1.data());
+    CHECK_EQ(n1[(size_t)fn4::kAqlAcq], n0[(size_t)fn4::kAqlAcq] + 1);
+    CHECK_EQ(v1[(size_t)fn4::kAqlAcq], 2);
+    CHECK_EQ(n1[(size_t)fn4::kRouteCopyOv], n0[(size_t)fn4::kRouteCopyOv] + 1);
+    for (int i = 0; i < fn4::kSwitches; ++i)
+        if (i != fn4::kAqlAcq && i != fn4::kRouteCopyOv) CHECK_EQ(n1[(size_t)i], n0[(size_t)i]);
+    /* A plugin switch nothing here serves is refused before it is queued: not counted. */
+    CHECK(!fn4::request("ds41_e2", 1, &why));
+    fn4::requests(n0.data(), v0.data());
+    CHECK_EQ(n0[(size_t)fn4::kDs41E2], n1[(size_t)fn4::kDs41E2]);
+}
+
+TEST(the_leader_takes_a_plugin_switch_the_follower_serves_and_refuses_one_neither_takes) {
+    int asks = 0;
+    std::string last;
+    fn4::set_peer_check([&](const std::string& n, int v, std::string* why) {
+        ++asks;
+        last = n + "=" + std::to_string(v);
+        if (n == "ds41_e2" && v == 1) return 1;          /* the follower holds the Engram layers */
+        *why = n + "=" + std::to_string(v) + " refused: the plugin that serves it does not know that value";
+        return -1;
+    });
+    std::string why;
+    /* This node (no plugin) refuses ds41_e2; the follower takes it: the pipeline does. */
+    CHECK(fn4::check("ds41_e2", 1, &why));
+    CHECK_EQ(asks, 1);
+    CHECK(last == "ds41_e2=1");
+    /* Neither takes it: refused, both reasons named. */
+    CHECK(!fn4::check("gg_gemv", 7, &why));
+    CHECK(why.find("no loaded plugin serves it") != std::string::npos);
+    CHECK(why.find("the pipeline's other node refuses it too") != std::string::npos);
+    CHECK_EQ(asks, 2);
+    /* A core switch is the leader's own verdict: no ask. */
+    CHECK(fn4::check("aql_acq", 1, &why));
+    CHECK(!fn4::check("aql_acq", 9, &why));
+    CHECK_EQ(asks, 2);
+    /* A follower that does not answer (the link down, a timeout): refused, saying so. */
+    fn4::set_peer_check([&](const std::string&, int, std::string* why) { *why = "no answer"; return 0; });
+    CHECK(!fn4::check("ds41_e2", 1, &why));
+    CHECK(why.find("did not answer") != std::string::npos);
+    /* Requested through the pipeline: queued and counted on the leader, whose plugin then refuses
+     * it at apply (named in its log); the follower takes it from the request record. */
+    fn4::set_peer_check([&](const std::string&, int, std::string*) { return 1; });
+    std::vector<uint32_t> n0(fn4::kSwitches), n1(fn4::kSwitches);
+    std::vector<int32_t> v0(fn4::kSwitches), v1(fn4::kSwitches);
+    fn4::requests(n0.data(), v0.data());
+    CHECK(fn4::request("ds41_e2", 1, &why));
+    int sw[fn4::kSwitches];
+    (void)fn4::apply_pending(4, sw);
+    fn4::requests(n1.data(), v1.data());
+    CHECK_EQ(n1[(size_t)fn4::kDs41E2], n0[(size_t)fn4::kDs41E2] + 1);
+    CHECK_EQ(v1[(size_t)fn4::kDs41E2], 1);
+    /* The leader reports the follower's values (GET's "peer"), only the follower's own switches. */
+    std::vector<int32_t> fol(fn4::kSwitches, 0);
+    fol[(size_t)fn4::kDs41E2] = 1;
+    fol[(size_t)fn4::kDraftOcc] = 0;
+    fn4::note_peer(fol.data(), fn4::kSwitches);
+    const std::string js = fn4::state_json();
+    const size_t at = js.find("\"peer\": {\"role\": \"follower\", \"switches\": {");
+    CHECK(at != std::string::npos);
+    const std::string peer = at == std::string::npos ? "" : js.substr(at, js.find('}', at) - at);
+    CHECK(peer.find("\"ds41_e2\": 1") != std::string::npos);
+    CHECK(peer.find("draft_occ") == std::string::npos);
+    fn4::set_peer_check(nullptr);
+    /* One machine again (no peer): the plugin switch is this node's verdict alone. */
+    CHECK(!fn4::check("ds41_e2", 1, &why));
+}
+
+}  /* namespace */
+
+RAD_TEST_MAIN()
