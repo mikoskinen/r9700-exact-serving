@@ -119,6 +119,9 @@ int ref_logit_softcap      (const RadArgs*, RadStream);
 int ref_scale              (const RadArgs*, RadStream);
 int ref_fill               (const RadArgs*, RadStream);
 int ref_gather_rows        (const RadArgs*, RadStream);
+/* The two-node pipeline's crossings (ref_stage.cpp, abi/rad_pp.h). */
+int ref_stage_send         (const RadArgs*, RadStream);
+int ref_stage_recv         (const RadArgs*, RadStream);
 int ref_scatter_rows       (const RadArgs*, RadStream);
 int ref_ngram_ids          (const RadArgs*, RadStream);
 int ref_ple_gate           (const RadArgs*, RadStream);
@@ -378,6 +381,8 @@ int ref_sample_logprobs    (const RadArgs*, RadStream);
     int fn##_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 
 REF_SHAPE_FN(ref_rmsnorm);
+REF_SHAPE_FN(ref_stage_send);
+REF_SHAPE_FN(ref_stage_recv);
 REF_SHAPE_FN(ref_rmsnorm_p);
 REF_SHAPE_FN(ref_rmsnorm_add);
 REF_SHAPE_FN(ref_hc_enter);

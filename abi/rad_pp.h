@@ -45,7 +45,8 @@ enum { RAD_PP_X1 = 0, RAD_PP_X2 = 1, RAD_PP_N_RINGS = 2 };
  * a node holds each ring in one role. Every counter is the count of payloads, starting at 0. */
 typedef struct RadPpRing {
     volatile uint64_t ready;          /* send ring: payloads stage_send has published */
-    uint64_t          pad0[7];
+    volatile uint64_t sent;           /* send ring: payloads the link has taken off the ring */
+    uint64_t          pad0[6];
     volatile uint64_t landed;         /* receive ring: payloads the link has written in full */
     uint64_t          pad1[7];
     volatile uint64_t abort;          /* nonzero: the link is down; stage_recv fails the pass */
@@ -87,6 +88,16 @@ __attribute__((weak))
 #endif
 int rad_pp_info(RadPpInfo* out);
 
+/* The plugin names, at declare (every rank, every sizing declare; the largest wins), the bytes one
+ * row of crossing `ring` carries: the sum of its parts' row bytes, before the 256-byte alignment
+ * of each part. The core sizes each ring for --max-num-batched-tokens such rows and the
+ * rendezvous compares the two nodes' numbers. A pipeline whose plugin names none refuses to
+ * start. Weak, like rad_pp_info. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_crossing(int ring, int64_t row_bytes, int parts);
+
 /* The node's pipeline as the plugin should act on it: nodes 1 when the engine has no pipeline or
  * predates it. */
 static inline RadPpInfo rad_pp_query(void) {
@@ -97,6 +108,11 @@ static inline RadPpInfo rad_pp_query(void) {
     if (rad_pp_info && rad_pp_info(&p) != 0) p.nodes = 1;
     if (p.nodes < 1) p.nodes = 1;
     return p;
+}
+
+/* rad_pp_crossing where the engine has it. */
+static inline void rad_pp_declare_crossing(int ring, int64_t row_bytes, int parts) {
+    if (rad_pp_crossing) rad_pp_crossing(ring, row_bytes, parts);
 }
 
 #ifdef __cplusplus

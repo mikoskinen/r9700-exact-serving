@@ -1209,6 +1209,17 @@ static const RadOperandSpec oSubI32[] = { OPD("x"), OPD("s"), OUT("y") };
 static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
 
 /* ================================================================== the schema table */
+/* ---- the two-node pipeline's crossings (ref_stage.cpp, abi/rad_pp.h) ----------------------
+ * `ring` is the core's ring for this crossing on this node (RadPpInfo::ring), a raw pointer the
+ * plugin passes; x0..x7 / y0..y7 are the parts, each [M, ...] at its own dtype, packed verbatim. */
+static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender") };
+static const RadOperandSpec oStageSend[] = { OPD("ring"), OPD("x0"), OPD_O("x1"), OPD_O("x2"),
+                                             OPD_O("x3"), OPD_O("x4"), OPD_O("x5"), OPD_O("x6"),
+                                             OPD_O("x7") };
+static const RadOperandSpec oStageRecv[] = { OPD("ring"), OUT("y0"), OUT_O("y1"), OUT_O("y2"),
+                                             OUT_O("y3"), OUT_O("y4"), OUT_O("y5"), OUT_O("y6"),
+                                             OUT_O("y7") };
+
 static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is not in docs/OPS.md's elementwise table: "
@@ -1960,6 +1971,17 @@ static const RadOpSchema kSchemas[] = {
 { "gdn_gated_rmsnorm", ARR(pGatedNorm), ARR(oGatedNorm),
   "o = x * rsqrt(mean_channels(x^2) + eps) * w * act(z). `act` is \"silu\" or \"sigmoid\"." },
 
+{ "stage_send", ARR(pStage), ARR(oStageSend),
+  "The two-node pipeline's crossing out of this node (abi/rad_pp.h): x0..x(parts-1), each [M, ...] "
+  "at its own dtype and dense, packed verbatim into `ring` (part i at the 256-byte-aligned sum of "
+  "the parts before it), then published (`ready`). Only rank `sender` (default 0) writes; on the "
+  "other ranks the launch does nothing. Waits for the core's link to have taken the last payload "
+  "off the ring; fails on the ring's abort word." },
+{ "stage_recv", ARR(pStage), ARR(oStageRecv),
+  "The two-node pipeline's crossing into this node: waits until the other node's payload has "
+  "landed in `ring` (`landed` past this rank's `taken`), checks its rows, parts and bytes against "
+  "y0..y(parts-1), copies it into them verbatim and counts this rank in `taken`. Every rank "
+  "receives. Fails on the ring's abort word (the peer is gone) or past the ring's deadline." },
 { "all_reduce", ARR(pAllReduce), ARR(oAllReduce),
   "Sum across ranks, f32, IN ASCENDING RANK ORDER so every rank gets the same bits. world_size 1 "
   "is a no-op. On the host backend the ranks are threads in one address space, so this is a "
@@ -2903,6 +2925,10 @@ SIMPLE("ref_gdn_conv_recurrent_update", "gdn_conv_recurrent_update", "gdn",
 SIMPLE("ref_gdn_gated_rmsnorm", "gdn_gated_rmsnorm", "gdn", "gated RMS norm over a head", DT_FLOAT,
        ref_gdn_gated_rmsnorm),
 
+ROW_OWN("ref_stage_send", "stage_send", "stage", "a crossing's parts into the core's ring, verbatim",
+        DT_ANY, ref_stage_send),
+ROW_OWN("ref_stage_recv", "stage_recv", "stage", "a crossing's parts out of the core's ring, verbatim",
+        DT_ANY, ref_stage_recv),
 ROW("ref_all_reduce", "all_reduce", "ar", "sum across ranks, f32, ascending rank order", DT_FLOAT,
     nullptr, 0, ref_collective_init, ref_collective_fini, ref_all_reduce, ref_all_reduce_scratch),
 ROW("ref_all_gather", "all_gather", "ar", "gather every rank's shard", DT_FLOAT,

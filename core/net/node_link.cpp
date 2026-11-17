@@ -653,6 +653,8 @@ void NodeLink::proxy_loop() {
             }
             if (send_data(id, r) < 0) return;
             sent_[id] = rd;
+            /* The ring is free again: stage_send waits for this before it writes the next one. */
+            __atomic_store_n(&r->sent, rd, __ATOMIC_RELEASE);
             moved = true;
         }
         if (moved) { idle = 0; continue; }
@@ -700,6 +702,13 @@ void ring_init(RadPpRing* r, int id, uint64_t cap, int n_ranks, uint64_t deadlin
 int ring_put(RadPpRing* r, const void* p, uint64_t bytes, uint64_t rows) {
     if (!r || r->magic != RAD_PP_RING_MAGIC) return RAD_E_STATE;
     if (bytes > r->cap) return RAD_E_FULL;
+    /* One slot: the link must have sent the last payload before this one overwrites it. */
+    const uint64_t t0 = now_ns();
+    while (__atomic_load_n(&r->sent, __ATOMIC_ACQUIRE) < r->ready) {
+        if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
+        if (r->deadline_ms && now_ns() - t0 > r->deadline_ms * 1000000ull) return RAD_E_NOTFOUND;
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
     if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
     std::memcpy((char*)r + RAD_PP_RING_HDR, p, (size_t)bytes);
     r->rows = rows;
