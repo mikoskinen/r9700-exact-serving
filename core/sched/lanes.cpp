@@ -31,6 +31,11 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     split_on_ = !(on && !std::strcmp(on, "0"));
     const char* sp = std::getenv("RADIANCE_PP_SPAN");
     span_on_ = !(sp && !std::strcmp(sp, "0"));
+    if (const char* st = std::getenv("RADIANCE_PP_SPAN_TAIL"); st && *st) {
+        char* end = nullptr;
+        const long long v = std::strtoll(st, &end, 10);
+        span_tail_ = end && !*end && v > 0 ? (int64_t)v : 0;
+    }
     const char* lb = std::getenv("RADIANCE_PP_LEND_BUSY");
     lend_busy_ = !(lb && !std::strcmp(lb, "0"));
     const char* lm = std::getenv("RADIANCE_PP_LEND_MIXED");

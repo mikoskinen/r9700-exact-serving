@@ -1934,7 +1934,7 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
      * moved S4's near tie), and the pieces between are whole intervals (exact: S4 hw's tracer, 2048- vs 4096-row chunks
      * row-identical), so two lanes carry two of its intervals at once. A chunk with a snapshot inside it (lever TI) is not
      * cut; the cut chunk's own snapshot is the one a chunk ending there takes (a periodic one on the resume grid). */
-    if (span_now_ && lane_span_cut() && geo_.checkpoints() && geo_.checkpoint_interval > 0 &&
+    if (span_now_ && lane_span_cut(n_computed, n_target) && geo_.checkpoints() && geo_.checkpoint_interval > 0 &&
         !(checkpoint_pos && *checkpoint_pos > n_computed && *checkpoint_pos < n_computed + want)) {
         const int64_t I = geo_.checkpoint_interval, end = n_computed + want;
         for (int64_t e = (n_computed / I + 1) * I; e < end; e += I)
@@ -2195,7 +2195,13 @@ void Scheduler::psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt) {
 /* Whether the chunk an idle engine plans for r (the alone piece) spans: --prefill-span's rule for a lone prefill (the
  * same rule step() takes for its lone prefill). Under lanes RADIANCE_PP_SPAN=0 a span piece is still planned as the span
  * and then cut at its interior interval boundaries (plan_chunk, lane_span_cut). */
-bool Scheduler::lane_span_cut() const { return lanes_ && n_lanes_ > 1 && !lanes_->span_on(); }
+bool Scheduler::lane_span_cut(int64_t n_computed, int64_t n_target) const {
+    if (!lanes_ || n_lanes_ <= 1) return false;
+    if (!lanes_->span_on()) return true;
+    /* tp8 loop P7 (RADIANCE_PP_SPAN_TAIL=X): only a piece that starts within the prompt's last X rows */
+    const int64_t x = lanes_->span_tail();
+    return x > 0 && n_target - n_computed <= x;
+}
 
 bool Scheduler::alone_spans(const Request& r, int64_t target) const {
     return bi_chunk_ != 2 && cfg_.prefill_span > 1 &&

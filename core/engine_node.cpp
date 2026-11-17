@@ -479,6 +479,11 @@ int Engine::pp_serve_setup() {
             const bool sends = (id == RAD_PP_X1) == pp_leader();
             net::ring_init(r, id, (uint64_t)cap, sends ? 0 : cfg_.tp,
                            (uint64_t)env_ms("RADIANCE_PP_RECV_DEADLINE_MS", 600000));
+            /* tp8 loop P8: RADIANCE_PP_SEND_SPLIT -- who copies this node's payloads into its send ring */
+            if (sends && cfg_.tp >= 2) {
+                r->send_split = (uint64_t)pp_send_split();
+                r->send_ranks = (uint64_t)cfg_.tp;
+            }
             (sends ? pp_send_ : pp_recv_)[ix] = r;
         }
     }
@@ -850,10 +855,60 @@ int Engine::pp_peer_check(const std::string& name, int v, std::string* why) {
     return pp_ans_verdict_ > 0 ? 1 : -1;
 }
 
+/* tp8 loop P8: RADIANCE_PP_SEND_SPLIT=0 (default: rank 0 copies a payload into the send ring), 1 (every rank its share), 2
+ * (rank 0 copies it, every other rank compares its share of its own parts: a check of 1's premise, the parts replicated
+ * over the ranks); read once, said once. */
+int Engine::pp_send_split() {
+    static const int mode = [] {
+        const char* v = std::getenv("RADIANCE_PP_SEND_SPLIT");
+        const int m = v && (v[0] == '1' || v[0] == '2') && !v[1] ? v[0] - '0' : 0;
+        if (v && *v && !m && std::strcmp(v, "0"))
+            RAD_WARN("two-node pipeline: RADIANCE_PP_SEND_SPLIT=%s is not 0 / 1 / 2: rank 0 copies each payload", v);
+        return m;
+    }();
+    static bool said = false;
+    if (mode && !said) {
+        said = true;
+        RAD_INFO("two-node pipeline: RADIANCE_PP_SEND_SPLIT=%d -- %s (tp8 loop P8)", mode,
+                 mode == 1 ? "every rank copies its share of a crossing's payload into this node's send ring, rank 0 "
+                             "publishes it (X1 on the leader, X2 on the follower)"
+                           : "rank 0 copies each payload, every other rank compares its share of its own parts with "
+                             "the ring's bytes (the check of RADIANCE_PP_SEND_SPLIT=1); the sums at stop");
+    }
+    return mode;
+}
+
+/* tp8 loop P8: what RADIANCE_PP_SEND_SPLIT=2's other ranks compared, summed over the lanes' send rings, a line a crossing. */
+void Engine::pp_split_note() {
+    for (int id = 0; id < RAD_PP_N_RINGS; ++id) {
+        uint64_t payloads = 0, cmp = 0, diff = 0, mode = 0, by[RAD_PP_MAX_RANKS] = {};
+        for (int lane = 0; lane < n_lanes_; ++lane) {
+            const RadPpRing* r = pp_send_[lane * RAD_PP_N_RINGS + id];
+            if (!r || !r->send_split) continue;
+            mode = r->send_split;
+            payloads += __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE);
+            for (int q = 0; q < RAD_PP_MAX_RANKS && (uint64_t)q < r->send_ranks; ++q) {
+                cmp += __atomic_load_n(&r->cmp_words[q], __ATOMIC_ACQUIRE);
+                by[q] += __atomic_load_n(&r->diff_words[q], __ATOMIC_ACQUIRE);
+                diff += by[q];
+            }
+        }
+        if (mode != 2) continue;
+        std::string per;
+        for (int q = 1; q < cfg_.tp && q < RAD_PP_MAX_RANKS; ++q) per += fmt("%srank %d %llu", q > 1 ? ", " : "", q,
+                                                                          (unsigned long long)by[q]);
+        RAD_INFO("two-node pipeline: RADIANCE_PP_SEND_SPLIT=2 check of X%d's %llu payloads: %llu 4-byte words compared, "
+                 "%llu differ (%s)%s", id + 1, (unsigned long long)payloads, (unsigned long long)cmp,
+                 (unsigned long long)diff, per.c_str(), diff ? " -- the parts are NOT replicated: do not use "
+                 "RADIANCE_PP_SEND_SPLIT=1" : " -- every share = rank 0's bytes");
+    }
+}
+
 void Engine::pp_close(const char* why) {
     if (pp_stamps_) { std::fclose(pp_stamps_); pp_stamps_ = nullptr; }
     if (!pp_link_ || pp_closed_) return;
     pp_closed_ = true;
+    pp_split_note();
     if (pp_leader()) fn4::set_peer_check(nullptr);
     pp_link_->close(why);
     RAD_INFO("two-node pipeline: link closed (%s); %lld steps and %lld builds shipped", why,

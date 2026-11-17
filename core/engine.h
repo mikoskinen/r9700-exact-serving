@@ -486,10 +486,17 @@ private:
     FILE* pp_stamps_ = nullptr;
     uint64_t pp_stamp_n_ = 0;
     void  pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_t t1);
+    /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1, the leader): a lone prefill's chunks on rank 0's card -- card-local event
+     * times around every head and tail part, the host's time a chunk -- one line a prompt at its first token
+     * (engine_lanes.cpp). Owned by step_loop_lanes; null when off. */
+    struct PfTimeline* pf_tl_ = nullptr;
     /* The follower's step loop: replay the leader's builds, run the trunk steps, until the leader
      * stops (0) or the link fails (negative). */
     int  follower_loop();
     void pp_close(const char* why);
+    /* tp8 loop P8: RADIANCE_PP_SEND_SPLIT's mode (0 / 1 / 2) and, at close, mode 2's check of the shares */
+    static int pp_send_split();
+    void pp_split_note();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy
      * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */

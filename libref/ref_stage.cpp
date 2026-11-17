@@ -22,6 +22,7 @@
 #include "rad_pp.h"
 #include "rad_plugin.h"
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <cstring>
@@ -77,6 +78,76 @@ bool dense(const RadTensor& t) {
 bool loop_of(const RadArgs* a) { return rad_param_geti(a->p, a->n_p, "loop", 0) == 1; }
 uint64_t loop_cap(const RadTensor& t) { return (uint64_t)rad_dtype_bytes(t.dtype, rad_tensor_numel(&t)); }
 
+/* tp8 loop P8 (RADIANCE_PP_SEND_SPLIT=1 / 2), as r4d_stage.hip's stage_send_split_kernel on a rank's thread: wait for the
+ * ring (1, and 2's publisher) or for the publisher's full copy (2's other ranks); copy (1) or compare (2) this rank's share
+ * [lo, hi) of the payload's 256-byte units of every part from its own buffers; a rank other than `sender` counts the
+ * payload in its `done`; `sender` waits for every other rank's, then publishes. */
+static int wait_for(RadPpRing* r, const volatile uint64_t* w, uint64_t at_least) {
+    const uint64_t t0 = mono_ms();
+    while (__atomic_load_n(w, __ATOMIC_ACQUIRE) < at_least) {
+        if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
+        if (r->deadline_ms && mono_ms() - t0 > r->deadline_ms) return RAD_E_IO;
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    return __atomic_load_n(&r->abort, __ATOMIC_ACQUIRE) ? RAD_E_IO : RAD_OK;
+}
+
+static int send_split(const RadArgs* a, RadPpRing* r, int split, int sender, int n, const uint64_t* bytes, uint64_t total,
+                      int64_t rows) {
+    const int rank = a->rank;
+    const bool pub = rank == sender;
+    const uint64_t d = __atomic_load_n(&r->done[rank], __ATOMIC_ACQUIRE), mine = d + 1;
+    RAD_REF_TRY(split == 1 || pub ? wait_for(r, &r->sent, d) : wait_for(r, &r->staged, mine));
+    const uint64_t nr = r->send_ranks, U = total / RAD_PP_PART_ALIGN;
+    const bool all = split == 2 && pub;
+    const uint64_t lo = all ? 0 : (uint64_t)rank * U / nr * RAD_PP_PART_ALIGN;
+    const uint64_t hi = all ? total : ((uint64_t)rank + 1) * U / nr * RAD_PP_PART_ALIGN;
+    char* ring = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
+    uint64_t off = 0, bad = 0, cmp = 0;
+    for (int i = 0; i < n; ++i) {
+        const uint64_t s = std::max(lo, off), e = std::min(hi, off + bytes[i]);
+        if (s < e) {
+            const char* src = static_cast<const char*>(a->t[1 + i].data) + (s - off);
+            if (split == 2 && !pub) {
+                for (uint64_t w = 0; w < (e - s) / 4; ++w) {
+                    uint32_t x, y;
+                    std::memcpy(&x, src + 4 * w, 4);
+                    std::memcpy(&y, ring + s + 4 * w, 4);
+                    bad += x != y ? 1 : 0;
+                }
+                cmp += (e - s) / 4;
+            } else {
+                std::memcpy(ring + s, src, (size_t)(e - s));
+            }
+        }
+        off += rad_pp_align(bytes[i]);
+    }
+    if (!pub) {
+        if (split == 2) {
+            __atomic_store_n(&r->diff_words[rank], __atomic_load_n(&r->diff_words[rank], __ATOMIC_RELAXED) + bad,
+                             __ATOMIC_RELAXED);
+            __atomic_store_n(&r->cmp_words[rank], __atomic_load_n(&r->cmp_words[rank], __ATOMIC_RELAXED) + cmp,
+                             __ATOMIC_RELAXED);
+        }
+        __atomic_store_n(&r->done[rank], mine, __ATOMIC_RELEASE);
+        return RAD_OK;
+    }
+    if (split == 2) __atomic_store_n(&r->staged, mine, __ATOMIC_RELEASE);
+    for (uint64_t q = 0; q < nr; ++q)
+        if ((int)q != sender) RAD_REF_TRY(wait_for(r, &r->done[q], mine));
+    for (int i = 0; i < n; ++i) r->part_bytes[i] = bytes[i];
+    std::memset(ring + total, 0, RAD_PP_TRAILER);
+    *reinterpret_cast<uint64_t*>(ring + total + 8) = rad_pp_layout(bytes, n);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(ring + total), mine, __ATOMIC_RELEASE);
+    r->rows = (uint64_t)rows;
+    r->parts = (uint64_t)n;
+    r->bytes = total + RAD_PP_TRAILER;
+    __atomic_store_n(&r->done[rank], mine, __ATOMIC_RELEASE);
+    __atomic_store_n(&r->ready, mine, __ATOMIC_RELEASE);
+    r->ready_ns = mono_ns();
+    return RAD_OK;
+}
+
 int ref_stage_send(const RadArgs* a, RadStream) {
     if (!a || a->n_t < 2) return RAD_E_INVAL;
     RadPpRing* r = static_cast<RadPpRing*>(a->t[0].data);
@@ -84,7 +155,12 @@ int ref_stage_send(const RadArgs* a, RadStream) {
     if (!r || (!loop && r->magic != RAD_PP_RING_MAGIC)) return RAD_E_STATE;
     if (loop && loop_cap(a->t[0]) < RAD_PP_RING_HDR) return RAD_E_FULL;
     const int sender = (int)rad_param_geti(a->p, a->n_p, "sender", 0);
-    if (!loop && a->rank != sender) return RAD_OK;
+    /* tp8 loop P8 (RadPpRing::send_split): every rank of the node takes part (1 its share, 2 a check of it) */
+    const int split = !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 && sender >= 0 &&
+                              (uint64_t)sender < r->send_ranks
+                          ? (int)r->send_split : 0;
+    if (split && (a->rank < 0 || (uint64_t)a->rank >= r->send_ranks)) return RAD_E_STATE;
+    if (!loop && !split && a->rank != sender) return RAD_OK;
     int n = 0;
     int64_t rows = 0;
     uint64_t bytes[RAD_PP_MAX_PARTS] = {};
@@ -95,6 +171,7 @@ int ref_stage_send(const RadArgs* a, RadStream) {
         total += rad_pp_align(bytes[i]);
     }
     if (total + RAD_PP_TRAILER > (loop ? loop_cap(a->t[0]) - RAD_PP_RING_HDR : r->cap)) return RAD_E_FULL;
+    if (split) return send_split(a, r, split, sender, n, bytes, total, rows);
     if (loop) {   /* tp8 dev M4: a fresh header; the receive on this rank takes payload 1 */
         r->abort = 0;
         r->ready = 0;

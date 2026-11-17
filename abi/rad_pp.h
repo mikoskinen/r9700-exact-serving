@@ -114,7 +114,24 @@ typedef struct RadPpRing {
     uint64_t id;                      /* RAD_PP_X1 or RAD_PP_X2 */
     uint64_t parts;                   /* parts of the last payload, for the receiver's check */
     uint64_t part_bytes[RAD_PP_MAX_PARTS]; /* each part's bytes in the last payload */
+    /* tp8 loop P8 (RADIANCE_PP_SEND_SPLIT, a send ring only; 0 from an engine before it): who copies a payload into the
+     * ring. 0: rank `sender` alone (as before). 1: every rank of the node its share -- the payload's 256-byte units split
+     * evenly over `send_ranks`, each rank from its own copy of the parts (the residual stream and what a crossing carries
+     * are replicated over the ranks) -- and rank `sender` publishes once every rank's `done` names the payload. 2 (a
+     * check of 1): rank `sender` copies the whole payload, then every other rank compares its share of its own parts
+     * with the ring's bytes before the publish, and sums the 4-byte words that differ. The payload's bytes are rank
+     * `sender`'s under 0 and 2. */
+    uint64_t send_split;
+    uint64_t send_ranks;                       /* the ranks of this node (1 and 2) */
+    volatile uint64_t done[RAD_PP_MAX_RANKS];  /* payloads rank r has copied (1) or compared (2) its share of */
+    volatile uint64_t staged;                  /* (2) payloads rank `sender` has copied in full, not yet published */
+    volatile uint64_t diff_words[RAD_PP_MAX_RANKS]; /* (2) 4-byte words of rank r's share that differed, summed */
+    volatile uint64_t cmp_words[RAD_PP_MAX_RANKS];  /* (2) 4-byte words rank r compared, summed */
 } RadPpRing;
+
+#if defined(__cplusplus)
+static_assert(sizeof(RadPpRing) <= RAD_PP_RING_HDR, "the ring's header fits before its payload");
+#endif
 
 /* A payload's layout: part i at RAD_PP_RING_HDR + the aligned sum of the parts before it. */
 static inline uint64_t rad_pp_align(uint64_t n) {
