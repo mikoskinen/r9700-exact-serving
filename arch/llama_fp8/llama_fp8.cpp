@@ -114,6 +114,14 @@ struct Model {
     rad_op   op_x1 = 0, op_x2 = 0;       /* stage_send / stage_recv of each crossing */
     int      parts_x1 = 0, parts_x2 = 0; /* 1: the stream; 2: the stream and the pending delta */
     RadPpRing* ring[RAD_PP_N_RINGS] = {};
+    /* tp8 S6, a host test of the KV copies (RADIANCE_LLAMA_PP_KVCOPY=1, W(h > 0, t); unset: nothing here): X1 also
+     * carries layer h - 1's fused q|k|v rows (the inputs of its kv_store) and the follower stores them into a copy of
+     * that layer's cache with the same op at the same slots, as deepseek41's copied sources are (a llama layer reads
+     * no other layer's cache, so nothing reads the copy: the core's RADIANCE_PP_KV_CHECK compares it with the owner's).
+     * RADIANCE_PP_TEST_KVCOPY_SKIP=N (follower) leaves the copy out at its N-th trunk pass, for the check's own test. */
+    bool     kvcopy = false;
+    rad_op   op_kvcopy = 0;
+    int64_t  kvcopy_skip = -1, kvcopy_pass = 0;
 };
 
 static Model g_model[MAX_RANKS];
@@ -527,22 +535,47 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         };
         m.parts_x1 = parts_at(m.pp_h);
         m.parts_x2 = parts_at(m.pp_t);
+        const char* kc = std::getenv("RADIANCE_LLAMA_PP_KVCOPY");
+        m.kvcopy = kc && !std::strcmp(kc, "1") && m.pp_h > 0;
         const int64_t row = g.n_embd * (int64_t)rad_dtype_bytes(rad_dtype_parse(g.dtype), 1);
-        rad_pp_declare_crossing(RAD_PP_X1, row * m.parts_x1, m.parts_x1);
+        const int64_t qkv_row = (g.q_dim() + 2 * g.kv_dim()) * (int64_t)rad_dtype_bytes(g.act_dtype, 1);
+        rad_pp_declare_crossing(RAD_PP_X1, row * m.parts_x1 + (m.kvcopy ? qkv_row : 0), m.parts_x1 + (m.kvcopy ? 1 : 0));
         rad_pp_declare_crossing(RAD_PP_X2, row * m.parts_x2, m.parts_x2);
-        const rad_buf p2[2] = { m.b_x, m.a_h.x };
         auto stage = [&](const char* op, int ring, int parts, bool send) {
+            const bool kv = ring == RAD_PP_X1 && m.kvcopy;
+            std::vector<rad_buf> pb = { m.b_x };
+            if (parts == 2) pb.push_back(m.a_h.x);
+            if (kv) pb.push_back(m.b_qkv);   /* tp8 S6 test: layer h - 1's q|k|v rows */
+            const int np = (int)pb.size();
             rad_op h = RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", ring),
-                                                RAD_INT("parts", parts)),
+                                                RAD_INT("parts", np)),
                               RAD_NOWEIGHTS);
             if (h == RAD_NULL_HANDLE) return h;
-            if (send) rad_op_reads(b, h, p2, parts);
-            else      rad_op_writes(b, h, p2, parts);
+            if (send) rad_op_reads(b, h, pb.data(), np);
+            else      rad_op_writes(b, h, pb.data(), np);
             return h;
         };
         const bool lead = m.pp_rank == 0;
         m.op_x1 = stage(lead ? "stage_send" : "stage_recv", RAD_PP_X1, m.parts_x1, lead);
         m.op_x2 = stage(lead ? "stage_recv" : "stage_send", RAD_PP_X2, m.parts_x2, !lead);
+        if (m.kvcopy) {
+            /* the follower's copy of layer h - 1's cache; a group's bound layers are sorted at the end of declare
+             * (rad_builder), so the copy is the follower's slot 0 and the leader's own its slot h - 1 */
+            if (!lead) {
+                RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)m.pp_h - 1, m.kv_full));
+                m.op_kvcopy = rw(b, RAD_OP(b, "kv_store",
+                                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("head_dim", g.head_dim),
+                                                RAD_INT("n_head_kv", g.n_head_kv),
+                                                RAD_INT("block_size", rad_kv_block_size(b, m.kv_full)),
+                                                RAD_STR("kv_dtype", g.kv_dtype)),
+                                     RAD_NOWEIGHTS),
+                                 {m.b_qkv}, {});
+                if (m.op_kvcopy == RAD_NULL_HANDLE) return RAD_E_INVAL;
+                const char* sk = std::getenv("RADIANCE_PP_TEST_KVCOPY_SKIP");
+                m.kvcopy_skip = sk && *sk ? std::atoll(sk) : -1;
+            }
+            rad_pp_declare_kv_copy((int32_t)m.kv_full, lead ? m.pp_h - 1 : 0, m.pp_h - 1);
+        }
         rad_note(b, "two-node pipeline (tp8 S4): the %s of W(%d,%d) holds layers %s; X1 carries %d and "
                     "X2 %d part(s) of [rows, %lld] %s", lead ? "leader" : "follower", m.pp_h, m.pp_t,
                  lead ? "outside the cut, the embedding and the head" : "inside the cut", m.parts_x1,
@@ -643,8 +676,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
             rad_step_fail(c, "two-node pipeline: the core set up no ring for this crossing");
             return;
         }
-        if (parts == 2)
+        const bool kv = ring == RAD_PP_X1 && m.kvcopy;   /* tp8 S6 test: + layer h - 1's q|k|v rows */
+        if (parts == 2 && kv)
+            RAD_ISSUE(c, op, praw(m.ring[ring], RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T), brows(m.b_qkv, T));
+        else if (parts == 2)
             RAD_ISSUE(c, op, praw(m.ring[ring], RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T));
+        else if (kv)
+            RAD_ISSUE(c, op, praw(m.ring[ring], RAD_U8, 1), brows(m.b_x, T), brows(m.b_qkv, T));
         else
             RAD_ISSUE(c, op, praw(m.ring[ring], RAD_U8, 1), brows(m.b_x, T));
     };
@@ -656,8 +694,17 @@ static void step(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
                     brows(m.b_x, batch->n_tok), RAD_NONE);
     }
-    /* The follower starts at its first layer from the leader's X1. */
-    if (m.pp && m.pp_rank == 1) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+    /* The follower starts at its first layer from the leader's X1 (tp8 S6 test: then stores layer h - 1's k / v
+     * into its copy, as the leader's layer stored them, at the same slots). */
+    if (m.pp && m.pp_rank == 1) {
+        cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+        if (m.op_kvcopy && m.kvcopy_pass++ != m.kvcopy_skip) {
+            const RadKVGroupBatch* kvb = kv_batch(batch, m.kv_full);
+            const int64_t q_dim = m.g.q_dim(), kv_dim = m.g.kv_dim();
+            RAD_ISSUE(c, m.op_kvcopy, bcol(m.b_qkv, q_dim, kv_dim, T), bcol(m.b_qkv, q_dim + kv_dim, kv_dim, T),
+                      praw(kvb ? kvb->slot_mapping : nullptr, RAD_I32, T), kv_cache(m.kv_full, (int)m.pp_h - 1));
+        }
+    }
 
     for (size_t li = 0; li < m.layers.size(); ++li) {
         if (m.pp) {

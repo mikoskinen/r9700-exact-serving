@@ -222,7 +222,7 @@ std::string record_single(const std::string& out, const std::vector<std::string>
 struct PipeRun { int leader = -1, follower = -1; std::string llog, flog; };
 PipeRun record_pipeline(const std::string& out, const std::string& cut,
                         const std::vector<std::string>& fenv = {}, const std::vector<std::string>& fextra = {},
-                        const std::vector<std::string>& lextra = {}) {
+                        const std::vector<std::string>& lextra = {}, const std::vector<std::string>& lenv = {}) {
     World& w = world();
     const int port = free_port();
     PipeRun pr;
@@ -234,7 +234,7 @@ PipeRun record_pipeline(const std::string& out, const std::string& cut,
     fol.wait_for("waiting on", 60);
     pr.leader = tiny::run(engine_argv(w.llama_rad, cat(cat(cat({ "--kld-record", out, "--kld-corpus", w.corpus }, shape()),
                                                            pp_args(0, port, cut)), lextra)),
-                          engine_env(), &pr.llog, 240);
+                          engine_env(lenv), &pr.llog, 240);
     pr.follower = fol.finish(60);
     pr.flog = fol.output();
     return pr;
@@ -290,6 +290,44 @@ std::vector<int32_t> complete(int port, const std::vector<int32_t>& prompt, int 
     const json j = json::parse(out, nullptr, false);
     if (!j.is_object() || !j.contains("tokens")) return {};
     return j["tokens"].get<std::vector<int32_t>>();
+}
+
+/* GET `path` (tp8 S6: /metrics) */
+std::string get(int port, const std::string& path) {
+    const int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return "";
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    std::string raw;
+    if (connect(fd, (sockaddr*)&a, sizeof a) == 0) {
+        const std::string req = "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        if (::send(fd, req.data(), req.size(), MSG_NOSIGNAL) == (ssize_t)req.size()) {
+            char buf[16384];
+            for (;;) {
+                const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                raw.append(buf, (size_t)n);
+            }
+        }
+    }
+    close(fd);
+    const size_t h = raw.find("\r\n\r\n");
+    return h == std::string::npos ? "" : raw.substr(h + 4);
+}
+/* A Prometheus counter's value in a /metrics body (the first sample of the name), -1 when absent. */
+double metric(const std::string& body, const std::string& name) {
+    size_t at = 0;
+    while ((at = body.find(name, at)) != std::string::npos) {
+        if (at == 0 || body[at - 1] == '\n') {
+            const size_t sp = body.find(' ', at);
+            if (sp != std::string::npos) return std::atof(body.c_str() + sp + 1);
+        }
+        at += name.size();
+    }
+    return -1;
 }
 
 std::vector<int32_t> prompt_ids(uint64_t seed, size_t n) {
@@ -555,5 +593,89 @@ TEST(a_stopped_follower_tells_the_leader_and_exits_cleanly) {
 }
 
 }  /* namespace */
+
+/* ------------------------------------------------------------------ tp8 S6 */
+/* A wrap-around cut whose X1 carries a KV layer's entries: the follower stores them into its copy of the leader's
+ * layer h - 1 cache with the same kv_store at the same slots (RADIANCE_LLAMA_PP_KVCOPY, the host stand-in for
+ * deepseek41's copied sources), and the core's KV-copy check (RADIANCE_PP_KV_CHECK=1: every trunk step) finds the copy
+ * byte-equal to the owner's every time; the answers stay one process's. */
+TEST(a_wrap_around_cut_keeps_its_kv_copy_byte_equal_to_the_owners) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_kvc");
+    const std::string ref = record_single(d / "single");
+    REQUIRE(!ref.empty());
+    for (const char* cut : { "1,3", "2,4", "1,4" }) {
+        std::vector<std::string> env = { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" };
+        if (const char* dd = std::getenv("PP_E2E_KVDUMP")) env.push_back(std::string("RADIANCE_PP_KV_CHECK_DUMP=") + dd);
+        const std::string out = d / (std::string("kvc-") + cut);
+        const PipeRun pr = record_pipeline(out, cut, env, {}, {}, env);
+        if (pr.leader != 0 || pr.follower != 0)
+            fprintf(stderr, "    W(%s): leader %d, follower %d\n    leader:\n%s\n    follower:\n%s\n", cut, pr.leader,
+                    pr.follower, tail(pr.llog).c_str(), tail(pr.flog).c_str());
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(ref, out, &why);
+        if (!same) fprintf(stderr, "    W(%s): %s\n", cut, why.c_str());
+        CHECK(same);
+        size_t eq = 0, at = 0;
+        while ((at = pr.flog.find("on both nodes (", at)) != std::string::npos) { ++eq; ++at; }
+        fprintf(stderr, "    W(%s): %zu KV-copy checks equal on both nodes\n", cut, eq);
+        CHECK(eq >= 4);
+        const size_t bad = pr.flog.find("NOT the owner's bytes");
+        if (bad != std::string::npos) {
+            const size_t a0 = pr.flog.rfind('\n', bad);
+            fprintf(stderr, "    W(%s): %s\n", cut, pr.flog.substr(a0 + 1, pr.flog.find('\n', bad) - a0 - 1).c_str());
+        }
+        CHECK(bad == std::string::npos);
+        CHECK(pr.llog.find("RADIANCE_PP_KV_CHECK=1: the copied KV layers (kv_attn layer") != std::string::npos);
+    }
+}
+
+/* The check's own test: the follower leaves its copy store out at one pass; the next check says so. */
+TEST(a_left_out_copy_store_is_caught_by_the_kv_check) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_kvbad");
+    const std::vector<std::string> env = { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" };
+    const PipeRun pr = record_pipeline(d / "bad", "1,3", cat(env, { "RADIANCE_PP_TEST_KVCOPY_SKIP=2" }), {}, {}, env);
+    CHECK_EQ(pr.leader, 0);
+    const bool caught = pr.flog.find("NOT the owner's bytes") != std::string::npos;
+    if (!caught) fprintf(stderr, "    follower:\n%s\n", tail(pr.flog, 30).c_str());
+    CHECK(caught);
+}
+
+/* A prefix hit across the cut: the second request reuses the first one's cached blocks (the attention-cached
+ * counter moves on the leader), and a wrap-around pipeline answers both with one process's greedy tokens -- the
+ * follower's layers read the same block ids, which its own earlier steps wrote. */
+TEST(a_prefix_hit_across_the_cut_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> base = prompt_ids(31, 300);
+    std::vector<int32_t> longer = base;
+    const std::vector<int32_t> more = prompt_ids(32, 40);
+    longer.insert(longer.end(), more.begin(), more.end());
+    std::vector<std::vector<int32_t>> ref, got;
+    double hit_ref = -1, hit_pp = -1;
+    for (const char* cut : { "", "1,3" }) {
+        Serving sv;
+        REQUIRE(sv.start(cut));
+        std::vector<std::vector<int32_t>>& out = *cut ? got : ref;
+        out.push_back(complete(sv.port, base, 16));
+        out.push_back(complete(sv.port, longer, 16));
+        out.push_back(complete(sv.port, base, 8));
+        (*cut ? hit_pp : hit_ref) = metric(get(sv.port, "/metrics"), "radiance:attn_cached_tokens_total");
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        if (*cut) CHECK_EQ(sv.fol.finish(30), 0);
+    }
+    fprintf(stderr, "    attention-cached prompt tokens: one process %.0f, W(1,3) %.0f\n", hit_ref, hit_pp);
+    CHECK(hit_ref > 0);
+    CHECK_EQ(hit_pp, hit_ref);
+    REQUIRE_EQ(ref.size(), got.size());
+    for (size_t i = 0; i < ref.size(); ++i) {
+        CHECK(!ref[i].empty());
+        if (ref[i] != got[i]) fprintf(stderr, "    request %zu: the pipeline's tokens differ\n", i);
+        CHECK(ref[i] == got[i]);
+    }
+}
 
 RAD_TEST_MAIN()
