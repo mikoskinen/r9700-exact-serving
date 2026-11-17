@@ -127,6 +127,7 @@ typedef struct RadPpRing {
     volatile uint64_t staged;                  /* (2) payloads rank `sender` has copied in full, not yet published */
     volatile uint64_t diff_words[RAD_PP_MAX_RANKS]; /* (2) 4-byte words of rank r's share that differed, summed */
     volatile uint64_t cmp_words[RAD_PP_MAX_RANKS];  /* (2) 4-byte words rank r compared, summed */
+    volatile uint64_t diff_part[RAD_PP_MAX_RANKS][RAD_PP_MAX_PARTS]; /* (2) rank r's differing words by part, summed */
 } RadPpRing;
 
 #if defined(__cplusplus)

@@ -881,26 +881,34 @@ int Engine::pp_send_split() {
 /* tp8 loop P8: what RADIANCE_PP_SEND_SPLIT=2's other ranks compared, summed over the lanes' send rings, a line a crossing. */
 void Engine::pp_split_note() {
     for (int id = 0; id < RAD_PP_N_RINGS; ++id) {
-        uint64_t payloads = 0, cmp = 0, diff = 0, mode = 0, by[RAD_PP_MAX_RANKS] = {};
+        uint64_t payloads = 0, cmp = 0, diff = 0, mode = 0, by[RAD_PP_MAX_RANKS] = {}, part[RAD_PP_MAX_PARTS] = {};
+        uint64_t pbytes[RAD_PP_MAX_PARTS] = {}, nparts = 0;
         for (int lane = 0; lane < n_lanes_; ++lane) {
             const RadPpRing* r = pp_send_[lane * RAD_PP_N_RINGS + id];
             if (!r || !r->send_split) continue;
             mode = r->send_split;
             payloads += __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE);
+            nparts = std::max<uint64_t>(nparts, std::min<uint64_t>(r->parts, RAD_PP_MAX_PARTS));
+            for (int k = 0; k < RAD_PP_MAX_PARTS; ++k) pbytes[k] = std::max<uint64_t>(pbytes[k], r->part_bytes[k]);
             for (int q = 0; q < RAD_PP_MAX_RANKS && (uint64_t)q < r->send_ranks; ++q) {
                 cmp += __atomic_load_n(&r->cmp_words[q], __ATOMIC_ACQUIRE);
-                by[q] += __atomic_load_n(&r->diff_words[q], __ATOMIC_ACQUIRE);
-                diff += by[q];
+                const uint64_t d = __atomic_load_n(&r->diff_words[q], __ATOMIC_ACQUIRE);
+                by[q] += d;
+                diff += d;
+                for (int k = 0; k < RAD_PP_MAX_PARTS; ++k) part[k] += __atomic_load_n(&r->diff_part[q][k], __ATOMIC_ACQUIRE);
             }
         }
         if (mode != 2) continue;
-        std::string per;
+        std::string per, parts;
         for (int q = 1; q < cfg_.tp && q < RAD_PP_MAX_RANKS; ++q) per += fmt("%srank %d %llu", q > 1 ? ", " : "", q,
                                                                           (unsigned long long)by[q]);
+        for (uint64_t k = 0; k < nparts; ++k)
+            parts += fmt("%spart %llu (%llu B in the last payload) %llu", k ? ", " : "", (unsigned long long)k,
+                         (unsigned long long)pbytes[k], (unsigned long long)part[k]);
         RAD_INFO("two-node pipeline: RADIANCE_PP_SEND_SPLIT=2 check of X%d's %llu payloads: %llu 4-byte words compared, "
-                 "%llu differ (%s)%s", id + 1, (unsigned long long)payloads, (unsigned long long)cmp,
-                 (unsigned long long)diff, per.c_str(), diff ? " -- the parts are NOT replicated: do not use "
-                 "RADIANCE_PP_SEND_SPLIT=1" : " -- every share = rank 0's bytes");
+                 "%llu differ (%s; by part, in this node's crossing line's order: %s)%s", id + 1, (unsigned long long)payloads,
+                 (unsigned long long)cmp, (unsigned long long)diff, per.c_str(), parts.c_str(),
+                 diff ? " -- the parts are NOT replicated: do not use RADIANCE_PP_SEND_SPLIT=1" : " -- every share = rank 0's bytes");
     }
 }
 

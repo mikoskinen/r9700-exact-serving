@@ -109,12 +109,16 @@ static int send_split(const RadArgs* a, RadPpRing* r, int split, int sender, int
         if (s < e) {
             const char* src = static_cast<const char*>(a->t[1 + i].data) + (s - off);
             if (split == 2 && !pub) {
+                uint64_t bk = 0;
                 for (uint64_t w = 0; w < (e - s) / 4; ++w) {
                     uint32_t x, y;
                     std::memcpy(&x, src + 4 * w, 4);
                     std::memcpy(&y, ring + s + 4 * w, 4);
-                    bad += x != y ? 1 : 0;
+                    bk += x != y ? 1 : 0;
                 }
+                bad += bk;
+                if (bk) __atomic_store_n(&r->diff_part[rank][i], __atomic_load_n(&r->diff_part[rank][i], __ATOMIC_RELAXED) + bk,
+                                         __ATOMIC_RELAXED);
                 cmp += (e - s) / 4;
             } else {
                 std::memcpy(ring + s, src, (size_t)(e - s));

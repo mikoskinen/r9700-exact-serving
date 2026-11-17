@@ -139,7 +139,6 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
         else                     ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->staged) >= d + 1; }) ? 1 : 0;
     }
     __syncthreads();
-    uint32_t bad = 0;
     if (ok) {
         char* ring = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
         const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
@@ -150,11 +149,14 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
             const uint64_t e = hi < P.off[k] + P.bytes[k] ? hi : P.off[k] + P.bytes[k];
             if (a >= e) continue;
             const char* src = reinterpret_cast<const char*>(P.p[k]) + (a - P.off[k]);
-            if (P.split == 2 && !pub) bad += cmp_part(src, ring + a, e - a, stride);
-            else copy_part(src, ring + a, e - a, (P.w16 >> k) & 1u, stride);
+            if (P.split == 2 && !pub) {
+                const uint32_t bad = cmp_part(src, ring + a, e - a, stride);
+                if (bad) atomicAdd(diff + k, bad);   /* one counter a part (counter_for's 64 bytes: 16 words) */
+            } else {
+                copy_part(src, ring + a, e - a, (P.w16 >> k) & 1u, stride);
+            }
         }
     }
-    if (bad) atomicAdd(diff, bad);
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -163,7 +165,12 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
             *counter = 0u;
             if (ok && !pub) {
                 if (P.split == 2) {
-                    const uint32_t dw = atomicExch(diff, 0u);
+                    uint64_t dw = 0;
+                    for (int k = 0; k < P.n; ++k) {
+                        const uint32_t d = atomicExch(diff + k, 0u);
+                        dw += d;
+                        if (d) st_sys(&r->diff_part[P.rank][k], ld_sys(&r->diff_part[P.rank][k]) + d);
+                    }
                     st_sys(&r->diff_words[P.rank], ld_sys(&r->diff_words[P.rank]) + dw);
                     st_sys(&r->cmp_words[P.rank], ld_sys(&r->cmp_words[P.rank]) + P.cmp);
                 }
