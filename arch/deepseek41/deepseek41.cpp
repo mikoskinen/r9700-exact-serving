@@ -1888,6 +1888,13 @@ static int idx_fn4_value(const char* name, int* applied);
 
 extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!name) return 0;
+    /* tp8 S4 (review robustness 3): a two-node pipeline node runs no BI segment or PSK pass in this
+     * build (their passes carry no crossings; the step refuses them, below): a request for one is
+     * refused here, with the pair serving on, not at the next step with both nodes going down. */
+    if (value != 0 && rad_pp_query().nodes == 2 &&
+        (!std::strcmp(name, "ds41_bi") || !std::strcmp(name, "ds41_psk") || !std::strcmp(name, "ds41_psk_cr") ||
+         !std::strcmp(name, "ds41_psk_l20")))
+        return -1;
     if (const int r = idx_fn4_accepts(name, value)) return r;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
