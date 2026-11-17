@@ -20,6 +20,7 @@
 #pragma once
 #include "rad_core.h"
 #include "rad_spechub.h"   /* RadMtpCoupleDraw/State: the coupled MTP wire rows */
+#include "rad_pp.h"       /* tp8 S4: the two-node pipeline */
 #include "cvec.h"
 #include <map>
 #include <set>
@@ -52,6 +53,7 @@ class Kld;
 class StallWatch;
 namespace gen { class Driver; class AudioDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
 namespace server { class Sink; }
+namespace net { class NodeLink; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
@@ -379,6 +381,38 @@ private:
     RadBuildCtx build_ctx(int rank, int64_t max_tok) const;
     void probe_arena_levels();
     int  step_loop();
+
+    /* ---- tp8 S4: the two-node pipeline (engine_node.cpp, abi/rad_pp.h). Unused on one machine
+     * (Config::pp_nodes 1): every member is null or zero and no line below runs. */
+    std::unique_ptr<net::NodeLink> pp_link_;
+    RadPpRing* pp_send_[RAD_PP_N_RINGS] = {};   /* this node's rings, by crossing and role */
+    RadPpRing* pp_recv_[RAD_PP_N_RINGS] = {};
+    int64_t    pp_ring_cap_[RAD_PP_N_RINGS] = {};
+    /* The leader: a trunk build made and not yet shipped (it crosses at its release, with the
+     * switches and the PSK plan prepare_release applied). */
+    bool       pp_trunk_pending_ = false;
+    int64_t    pp_steps_shipped_ = 0, pp_builds_shipped_ = 0;
+    /* The PSK plan psk_release handed the plugin for the step being released, for the follower. */
+    bool       psk_last_valid_ = false;
+    int64_t    psk_last_dec_ = 0;
+    bool pp_on() const { return cfg_.pp_nodes == 2; }
+    bool pp_leader() const { return cfg_.pp_nodes == 2 && cfg_.pp_rank == 0; }
+    bool pp_follower() const { return cfg_.pp_nodes == 2 && cfg_.pp_rank == 1; }
+    /* The options a two-node node refuses or changes, before the devices are opened. */
+    int  pp_check();
+    /* The link and the first rendezvous, after the plugins load and before declare. */
+    int  pp_connect();
+    /* After the scheduler's init in serve(): the rings, the second rendezvous (KV, the step
+     * batch's layout, the crossings), the verbs path, the link's threads, the leader's build hook. */
+    int  pp_serve_setup();
+    /* The leader: every build crosses (BatchBuilder::Wire); a trunk step with `run`, at its
+     * release. */
+    int  pp_ship(const RadBatch* b, bool run);
+    void pp_on_build(const RadBatch* b);
+    /* The follower's step loop: replay the leader's builds, run the trunk steps, until the leader
+     * stops (0) or the link fails (negative). */
+    int  follower_loop();
+    void pp_close(const char* why);
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy
      * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */

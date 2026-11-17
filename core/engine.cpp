@@ -1038,7 +1038,11 @@ int Engine::prepare_release(const RadBatch* b) {
 void Engine::psk_release(const RadBatch* b) {
     int32_t end = INT32_MAX;
     int64_t dec = 0;
+    psk_last_valid_ = false;
     if (b && b->draft_pass == 0 && sched_.psk_plan(b->step, &psk_ahead_, &psk_rows_, &dec, &psk_flags_)) {
+        /* tp8 S4: the follower of a two-node pipeline hands its plugin the same plan. */
+        psk_last_valid_ = true;
+        psk_last_dec_ = dec;
         const int l = fn4::psk_plan(b->step, dec, (int)psk_ahead_.size(), psk_ahead_.data(), psk_rows_.data(),
                                     psk_flags_.data());
         if (l >= 0) end = l;
@@ -1122,6 +1126,10 @@ void Engine::phase_mark(int p) {
  *   - sets `loop_status_`, which run_server watches to stop HTTP, so the process exits with the
  *     error instead of queueing requests nothing will drain (spec §17). */
 int Engine::fail_loop(int st) {
+    /* tp8 S4: the other node of a pipeline goes down with this one (node_link.h). */
+    if (pp_link_ && pp_link_->alive())
+        pp_link_->fail(fmt("the %s stopped on an error: %s", pp_leader() ? "leader" : "follower",
+                           rad_strerror(st < 0 ? st : RAD_E_STATE)));
     stopping_.store(true, std::memory_order_release);
     if (barrier_) barrier_->abort();
     sched_.shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
@@ -1150,6 +1158,10 @@ int Engine::step_loop() {
     const bool oracle_head = sched_.debug_oracle_on() && (serial_drafting() || block_drafting());
     pipelining_ = !cfg_.kld() && !cfg_.calib() && !embedding_ && !oracle_head &&
                   (serial_drafting() || block_drafting() || cfg_.n_spec <= 0);
+    /* tp8 S4: the leader of a two-node pipeline builds every step on the host after the previous
+     * one committed: a step issued ahead takes its rows from the leader's cards, which the follower
+     * does not have (engine_node.cpp). */
+    if (pp_on()) pipelining_ = false;
     if (oracle_head)
         RAD_WARN("--debug-draft-oracle beside the draft head '%s': no step is issued ahead of its "
                  "commit, so the harness's ids replace the head's proposals before each verify is "
@@ -1181,6 +1193,11 @@ int Engine::step_loop() {
     rad::StallWatch step_watch("step", 20000);
     while (!stopping_.load(std::memory_order_acquire)) {
         step_watch.progress();
+        if (pp_link_ && !pp_link_->alive()) {
+            RAD_ERR("two-node pipeline: the link to the follower is down (%s): failing every request",
+                    pp_link_->why().c_str());
+            return fail_loop(RAD_E_IO);
+        }
         lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
         /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
@@ -1377,6 +1394,15 @@ int Engine::step_loop() {
                 build_status_ = RAD_OK;
             }
             if (const int ps = prepare_release(b); ps < 0) return fail_loop(ps);
+            /* tp8 S4: the follower runs this step's other layers from the same staging. */
+            if (pp_link_) {
+                if (!pp_trunk_pending_) {
+                    RAD_ERR("two-node pipeline: step %d was released without its build", b->step);
+                    return fail_loop(RAD_E_STATE);
+                }
+                pp_trunk_pending_ = false;
+                if (const int ss = pp_ship(b, true); ss < 0) return fail_loop(ss);
+            }
             /* An embedding program has no sampler to issue behind its pass. */
             issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
@@ -2554,7 +2580,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     const bool video_gen = ranks_[0]->program.is_video_generator();
     const bool shape_gen = ranks_[0]->program.is_shape_generator();
     const bool generator = ranks_[0]->program.is_pass_driven();
-    if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
+    if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator && !pp_follower()) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
                 "(rad_declare_pooled) and no generator (rad_declare_generator, "
                 "rad_declare_audio_generator, rad_declare_video_generator, "
@@ -2783,6 +2809,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else {
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    /* tp8 S4: the rings, the second rendezvous and the link's threads. */
+    if (pp_on()) {
+        if (embedding_ || generator) {
+            RAD_ERR("two-node pipeline (tp8 S4): a text model only, not an embedding model or a generator");
+            return RAD_E_UNSUPPORTED;
+        }
+        RAD_TRY(pp_serve_setup());
+    }
     /* Lever DL: the scheduler sees the drafter's lend once it was declared (start()). */
     if (dl_declared_)
         sched_.set_lend_view([this](uint64_t* ch) { return draft_lend_state(ch); }, dl_capable_);
@@ -2819,13 +2853,20 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
-    std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
+    std::thread stepper([this] {
+        if (gen_) gen_loop();
+        else if (pp_follower()) (void)follower_loop();
+        else step_loop();
+    });
 
-    if (cfg_.kld() || cfg_.calib()) {
+    if (cfg_.kld() || cfg_.calib() || pp_follower()) {
         print_startup_report(RAD_OK);
         startup_watch_.reset();
     }
-    int s = cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
+    /* A pipeline's follower serves only the leader: no HTTP, no requests; it runs until the leader
+     * stops or the link fails (follower_loop). */
+    int s = pp_follower() ? RAD_OK : cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
+    if (pp_follower() && stepper.joinable()) stepper.join();
     startup_watch_.reset();
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
@@ -2835,6 +2876,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     if (stepper.joinable()) stepper.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
+    pp_close(pp_follower() ? "the follower is stopping" : "the leader is stopping");
     missl_close();
     xstats_close();
     /* A step-loop error takes precedence over the transport's status. */

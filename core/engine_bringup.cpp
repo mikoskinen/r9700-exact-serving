@@ -4357,6 +4357,8 @@ int Engine::configure_kv() {
 /* ================================================================== start */
 int Engine::start() {
     startup_begin_ns_ = rad_mono_ns();
+    /* tp8 S4: a node of a two-node pipeline; nothing on one machine (--pp-nodes 1). */
+    RAD_TRY(pp_check());
     std::vector<int> devs;
     std::string inventory;
     std::string devnote;
@@ -4403,6 +4405,9 @@ int Engine::start() {
                    : "the libraries named, in that order; architecture plugin " + plugins_.arch_plugin +
                          (plugins_.arch_version.empty() ? "" : "@" + plugins_.arch_version));
     }
+
+    /* tp8 S4: the other node, and the first rendezvous, before any weight is declared. */
+    RAD_TRY(pp_connect());
 
     ranks_.clear();
     for (int i = 0; i < cfg_.tp; ++i) {
@@ -4601,7 +4606,8 @@ int Engine::start() {
      * plan that moves units borrows. A strip is one layer's stripe of one lendable group, lent
      * from the top, since a group's top blocks are the top of every layer's stripe. */
     for (auto& r : ranks_) {
-        if (!r->heat.enabled()) continue;
+        /* tp8 S4: a pipeline node lends no KV: its block ids are the leader's (engine_node.cpp). */
+        if (!r->heat.enabled() || pp_on()) continue;
         RAD_TRY(rad_dev_set(r->device));
         std::vector<LoanStrip> strips;
         for (const KVGroupPlan& p : r->kv.plans()) {

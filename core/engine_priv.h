@@ -12,6 +12,7 @@
 #include "engine.h"
 
 #include "mem/pools.h"
+#include "net/node_link.h"
 #include "mem/kv.h"
 #include "mem/prefix.h"
 #include "mem/kvtier.h"
