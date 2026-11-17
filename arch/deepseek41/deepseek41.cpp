@@ -699,7 +699,10 @@ struct Model {
      * segments of k layers. A boundary s is a cut on this node: the segment before it saves what X1 of W(s, t) would carry
      * into layer s -- the boundary op's inputs, the selections, the keep words; no kv entries, the node holds its caches and
      * copies -- into this rank's ring buffer (the stage ops' loop mode: each rank its own bytes back), and the segment from s
-     * takes them back and issues the boundary op as a receiving node does. `seg_cx`: X1 of W(s, t) without its source. */
+     * takes them back and issues the boundary op as a receiving node does. `seg_cx`: X1 of W(s, t) without its source, plus
+     * what this pass's X2 ships that layers below s computed -- its kv source's entries over the work rows, its selections /
+     * keep words below s (ds41layers::segment_crossing; loop FINDINGS F12: without them a pass between the segments rewrote
+     * the source planes X2 reads at t). */
     std::vector<int32_t> seg_b;
     std::vector<ds41layers::Crossing> seg_cx;
     std::vector<rad_op> seg_send, seg_recv, seg_post;
@@ -4225,16 +4228,15 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         if (const char* sk = std::getenv("RADIANCE_PP_SEG_LAYERS"); sk && *sk && m.pp_rank == 1 && rad_pp_query().lanes > 1) {
             const int k = std::atoi(sk);
             for (int x = m.pp_h + std::max(k, 1); k > 0 && x < m.pp_t && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += k) {
-                ds41layers::Crossing cx2[2];
+                /* loop FINDINGS F12: X1 of W(x, t) without its source, plus what this pass's X2 ships that layers below x
+                 * computed (ds41layers::segment_crossing) */
+                ds41layers::Crossing sc;
                 std::string e2;
-                if (ds41layers::crossings(lr_geo(m), x, m.pp_t, cx2, &e2) < 0) {
+                if (ds41layers::segment_crossing(lr_geo(m), m.pp_h, x, m.pp_t, &sc, &e2) < 0) {
                     fprintf(stderr, "radiance: deepseek41: RADIANCE_PP_SEG_LAYERS=%d: no segment boundary at layer %d (%s)\n", k,
                             x, e2.c_str());
                     continue;
                 }
-                ds41layers::Crossing sc = cx2[RAD_PP_X1];
-                sc.src = -1;
-                sc.latent = sc.index = false;
                 m.seg_b.push_back(x);
                 m.seg_cx.push_back(sc);
             }
@@ -4860,7 +4862,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         int64_t widest = 0;
         for (const ds41layers::Crossing& cx : m.seg_cx) {
             int64_t n = 0;
-            for (const CutPart& p : ds41_cut_liveset_cx(m, cx)) n += rad_pp_align((uint64_t)(T * p.row_bytes));
+            /* loop FINDINGS F12: X2's source entries over the work rows (at most m.work) */
+            for (const CutPart& p : ds41_cut_liveset_cx(m, cx))
+                n += rad_pp_align((uint64_t)((p.rows == CutRows::Work ? std::max<int64_t>(T, m.work) : T) * p.row_bytes));
             widest = std::max(widest, n);
         }
         m.seg_ring_bytes = RAD_PP_RING_HDR + widest + RAD_PP_TRAILER;
@@ -6161,8 +6165,12 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
         static thread_local std::vector<RadOperand> so;
         so.clear();
         so.push_back(brows(m.seg_ring, m.seg_ring_bytes));
-        for (const CutPart& p : ds41_cut_liveset_cx(m, m.seg_cx[k])) {
+        /* loop FINDINGS F12: X2's source entries below the boundary over their work rows, as X2 ships them */
+        const ds41layers::Crossing& sc = m.seg_cx[k];
+        const int64_t swr = sc.src >= 0 ? pp_work_rows(m, m.c.ratio[(size_t)sc.src], T, S) : T;
+        for (const CutPart& p : ds41_cut_liveset_cx(m, sc)) {
             if (p.rows == CutRows::Step) so.push_back(brows(p.b, T));
+            else if (p.rows == CutRows::Work) so.push_back(brows(p.b, swr));
             else so.push_back(lo == 0 ? brows(p.b, hi) : brow_slice(p.b, lo, hi - lo, p.pitch));
         }
         rad_issue(x, send ? m.seg_send[k] : m.seg_recv[k], so.data(), (int)so.size(), T);
