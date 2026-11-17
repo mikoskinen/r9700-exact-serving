@@ -33,11 +33,13 @@
 #include "r4d_emit.h"
 #include "r4d_plugin.h"
 
+#include "rad_device.h"
 #include "rad_pp.h"
 
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <dlfcn.h>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -382,20 +384,46 @@ int collect(const RadArgs* a, const RadPpRing* r, uint64_t ring_bytes, Parts* P)
 }
 
 /* tp8 loop P10 (RadPpRing::async_rows; the core issues such passes live, so nothing here is recorded): a card's side
- * stream and its two events -- `packed` (the pack on the pass's stream is done: the side stream may read the staging
- * buffer) and `copied` (the side stream's copy into the ring is done: the next pack may write it). One staging buffer a
- * node, so consecutive async payloads of either lane take turns on it. */
+ * streams and events. The engine's streams are its own AQL queues (core/device/aql.cpp): a kernel launched on one goes
+ * through the engine's hipLaunchKernel, but HIP's events and stream waits are refused there (lq35 on cards: "hipEventRecord
+ * on an engine stream: use rad_event_record") and a HIP stream would be a queue the engine does not own. So the side
+ * streams and events are the engine's (abi/rad_device.h rad_stream_create / rad_event_*), looked up in the process at
+ * first use (RTLD_DEFAULT: the engine binary exports them; a tool that loads libr4d without them never reaches here).
+ * `packed` (the pack on the pass's stream is done: the side stream may read the staging buffer), `copied` (the side
+ * stream's copy into the ring is done: the next pack may write it); one staging buffer a node, so consecutive async
+ * payloads of either lane take turns on it. */
+struct RadDev {
+    int (*stream_create)(RadStream*, int) = nullptr;
+    int (*event_create)(RadEvent*) = nullptr;
+    int (*event_record)(RadEvent, RadStream) = nullptr;
+    int (*event_wait)(RadStream, RadEvent) = nullptr;
+    bool ok = false;
+};
+const RadDev& rad_dev_api() {
+    static const RadDev d = [] {
+        RadDev x;
+        x.stream_create = reinterpret_cast<int (*)(RadStream*, int)>(dlsym(RTLD_DEFAULT, "rad_stream_create"));
+        x.event_create = reinterpret_cast<int (*)(RadEvent*)>(dlsym(RTLD_DEFAULT, "rad_event_create"));
+        x.event_record = reinterpret_cast<int (*)(RadEvent, RadStream)>(dlsym(RTLD_DEFAULT, "rad_event_record"));
+        x.event_wait = reinterpret_cast<int (*)(RadStream, RadEvent)>(dlsym(RTLD_DEFAULT, "rad_event_wait"));
+        x.ok = x.stream_create && x.event_create && x.event_record && x.event_wait;
+        return x;
+    }();
+    return d;
+}
+
 struct AsyncCard {
-    hipStream_t side = nullptr;
-    hipEvent_t packed = nullptr, copied = nullptr;
+    RadStream side = nullptr;
+    RadEvent packed = nullptr, copied = nullptr;
     bool copied_once = false;
     /* tp8 loop P10b: `staged` (the side stream's ring copy is done: the pass's stream may unpack), `unpacked` (the
      * unpack is done: the next side-stream copy may write the staging buffer) */
-    hipEvent_t staged = nullptr, unpacked = nullptr;
+    RadEvent staged = nullptr, unpacked = nullptr;
     bool unpacked_once = false;
     /* its own side stream: a receive queued there waits on the card for a payload to land, which must never hold up a
      * send behind it (the peer may be waiting for that send) */
-    hipStream_t side_rx = nullptr;
+    RadStream side_rx = nullptr;
+    bool tried = false;
 };
 
 AsyncCard* async_card(int dev) {
@@ -403,25 +431,25 @@ AsyncCard* async_card(int dev) {
     static std::map<int, AsyncCard> cards;
     std::lock_guard<std::mutex> lk(mu);
     AsyncCard& c = cards[dev];
-    if (!c.side) {
-        if (hipStreamCreateWithFlags(&c.side, hipStreamNonBlocking) != hipSuccess) { c.side = nullptr; return nullptr; }
-        if (hipEventCreateWithFlags(&c.packed, hipEventDisableTiming) != hipSuccess ||
-            hipEventCreateWithFlags(&c.copied, hipEventDisableTiming) != hipSuccess ||
-            hipEventCreateWithFlags(&c.staged, hipEventDisableTiming) != hipSuccess ||
-            hipEventCreateWithFlags(&c.unpacked, hipEventDisableTiming) != hipSuccess)
+    if (!c.tried) {
+        c.tried = true;
+        const RadDev& d = rad_dev_api();
+        if (!d.ok || d.stream_create(&c.side, 0) < 0 || d.stream_create(&c.side_rx, 0) < 0 || d.event_create(&c.packed) < 0 ||
+            d.event_create(&c.copied) < 0 || d.event_create(&c.staged) < 0 || d.event_create(&c.unpacked) < 0) {
+            c.side = c.side_rx = nullptr;
             return nullptr;
-        if (hipStreamCreateWithFlags(&c.side_rx, hipStreamNonBlocking) != hipSuccess) { c.side_rx = nullptr; return nullptr; }
+        }
     }
-    return &c;
+    return c.side && c.side_rx ? &c : nullptr;
 }
 
 /* Side-stream blocks: the copy is PCIe-bound (~27 GB/s a card), so a few blocks keep up with it and leave the CUs to the
- * next pass (RADIANCE_PP_SEND_ASYNC_BLOCKS, default 64). */
+ * next pass; a receive's blocks also spin until the payload lands (RADIANCE_PP_SEND_ASYNC_BLOCKS, default 32). */
 uint32_t async_blocks() {
     static const uint32_t b = [] {
         const char* v = std::getenv("RADIANCE_PP_SEND_ASYNC_BLOCKS");
-        const long n = v && *v ? std::strtol(v, nullptr, 10) : 64;
-        return (uint32_t)(n >= 1 && n <= kMaxBlocks ? n : 64);
+        const long n = v && *v ? std::strtol(v, nullptr, 10) : 32;
+        return (uint32_t)(n >= 1 && n <= kMaxBlocks ? n : 32);
     }();
     return b;
 }
@@ -429,20 +457,20 @@ uint32_t async_blocks() {
 int send_async(RadPpRing* r, const Parts& P, int dev, RadStream stream) {
     AsyncCard* c = async_card(dev);
     if (!c) return R4D_NO(RAD_E_DEVICE);
+    const RadDev& d = rad_dev_api();
     char* stage = reinterpret_cast<char*>((uintptr_t)r->stage_dev);
     uint32_t* counter = counter_for(dev, r, 3);   /* the side stream's own: never shared with a launch on the pass's */
     if (!counter) return R4D_NO(RAD_E_NOMEM);
-    hipStream_t s = (hipStream_t)stream;
     /* the staging buffer is free once the last async copy on this card is done */
-    if (c->copied_once && hipStreamWaitEvent(s, c->copied, 0) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (c->copied_once && d.event_wait(stream, c->copied) < 0) return R4D_NO(RAD_E_DEVICE);
     const uint64_t words = P.total / (P.w16 == (1u << P.n) - 1u ? 16 : 4);
     uint32_t blocks = (uint32_t)((words + kThreads * 4 - 1) / (kThreads * 4));
     if (blocks < 1) blocks = 1;
     if (blocks > kMaxBlocks) blocks = kMaxBlocks;
     int rc = R4D_EMIT(stream, stage_pack_kernel, dim3(blocks), dim3(kThreads), 0, P, stage);
     if (rc < 0) return rc;
-    if (hipEventRecord(c->packed, s) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
-    if (hipStreamWaitEvent(c->side, c->packed, 0) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (d.event_record(c->packed, stream) < 0) return R4D_NO(RAD_E_DEVICE);
+    if (d.event_wait(c->side, c->packed) < 0) return R4D_NO(RAD_E_DEVICE);
     /* the same send, its parts now the staging buffer's (256-byte aligned offsets: 16-byte words where the bytes are) */
     Parts Q = P;
     Q.w16 = 0;
@@ -452,25 +480,25 @@ int send_async(RadPpRing* r, const Parts& P, int dev, RadStream stream) {
     }
     uint32_t sb = async_blocks();
     if (sb > blocks) sb = blocks;
-    rc = R4D_EMIT((RadStream)c->side, stage_send_kernel, dim3(sb), dim3(kThreads), 0, r, Q, counter);
+    rc = R4D_EMIT(c->side, stage_send_kernel, dim3(sb), dim3(kThreads), 0, r, Q, counter);
     if (rc < 0) return rc;
-    if (hipEventRecord(c->copied, c->side) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (d.event_record(c->copied, c->side) < 0) return R4D_NO(RAD_E_DEVICE);
     c->copied_once = true;
     r->async_sends = r->async_sends + 1;   /* host memory, this rank's thread only */
     return RAD_OK;
 }
 
 /* tp8 loop P10b: the receive through rank `rank`'s staging buffer: the ring copy (stage_recv_kernel with the staging
- * buffer as its parts: the same wait, checks and `taken` count) on the side stream, the unpack on the pass's stream */
+ * buffer as its parts: the same wait, checks and `taken` count) on the receive side stream, the unpack on the pass's */
 int recv_async(RadPpRing* r, const Parts& P, int dev, RadStream stream, int rank) {
     AsyncCard* c = async_card(dev);
     if (!c) return R4D_NO(RAD_E_DEVICE);
+    const RadDev& d = rad_dev_api();
     char* stage = reinterpret_cast<char*>((uintptr_t)r->recv_stage[rank]);
     uint32_t* counter = counter_for(dev, r, 4);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
-    hipStream_t s = (hipStream_t)stream;
     /* the staging buffer is free once this card's last unpack is done */
-    if (c->unpacked_once && hipStreamWaitEvent(c->side_rx, c->unpacked, 0) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (c->unpacked_once && d.event_wait(c->side_rx, c->unpacked) < 0) return R4D_NO(RAD_E_DEVICE);
     Parts Q = P;
     Q.w16 = 0;
     for (int k = 0; k < Q.n; ++k) {
@@ -483,13 +511,13 @@ int recv_async(RadPpRing* r, const Parts& P, int dev, RadStream stream, int rank
     if (blocks > kMaxBlocks) blocks = kMaxBlocks;
     uint32_t sb = async_blocks();
     if (sb > blocks) sb = blocks;
-    int rc = R4D_EMIT((RadStream)c->side_rx, stage_recv_kernel, dim3(sb), dim3(kThreads), 0, r, Q, counter);
+    int rc = R4D_EMIT(c->side_rx, stage_recv_kernel, dim3(sb), dim3(kThreads), 0, r, Q, counter);
     if (rc < 0) return rc;
-    if (hipEventRecord(c->staged, c->side_rx) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
-    if (hipStreamWaitEvent(s, c->staged, 0) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (d.event_record(c->staged, c->side_rx) < 0) return R4D_NO(RAD_E_DEVICE);
+    if (d.event_wait(stream, c->staged) < 0) return R4D_NO(RAD_E_DEVICE);
     rc = R4D_EMIT(stream, stage_unpack_kernel, dim3(blocks), dim3(kThreads), 0, P, (const char*)stage);
     if (rc < 0) return rc;
-    if (hipEventRecord(c->unpacked, s) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (d.event_record(c->unpacked, stream) < 0) return R4D_NO(RAD_E_DEVICE);
     c->unpacked_once = true;
     r->recv_async[rank] = r->recv_async[rank] + 1;   /* host memory, this rank's thread only */
     return RAD_OK;
