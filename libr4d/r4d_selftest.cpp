@@ -31178,7 +31178,7 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
     want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw (lane)", 2, { PI("overlap", 1) } });
     want.push_back({ "sp_ag_rows_4rank", 1, "SP AG raw drain 3", 2, dr(3) });
     /* fn4 PFF (qwen/prefill): the lane forms under the ar_fence forms (launch parameter `fence`) */
-    for (int f : { 1, 2, 3 }) {
+    for (int f : { 1, 2, 3, 6 }) {
         want.push_back({ "sp_rs_rows_4rank_ti8", 1, fmt("SP RS raw xpush (lane) fence %d", f), 2, { PI("overlap", 1), PI("xpush", 1), PI("fence", f) } });
         want.push_back({ "sp_ag_rows_4rank", 1, fmt("SP AG raw (lane) fence %d", f), 2, { PI("overlap", 1), PI("fence", f) } });
         want.push_back({ "ar_twoshot_4rank_exact_lane", -1, fmt("AR coded exact (lane) xpush fence %d", f), 1,

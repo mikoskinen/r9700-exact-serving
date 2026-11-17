@@ -43,6 +43,7 @@ __global__ void r4d_ar_rs_rows_ti8_kernel(T* __restrict__ buf, R4DArWidePeers<ch
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  r4d_ar_prio(acq);   /* fn4 PF prio */
   r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
   const unsigned int s = s_seq;
   const int parity = (int)s_slot;
@@ -121,6 +122,7 @@ __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<ch
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  r4d_ar_prio(acq);   /* fn4 PF prio */
   r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
   const unsigned int s = s_seq;
   const int parity = (int)s_slot;
@@ -201,6 +203,7 @@ __global__ void r4d_ar_ag_rows_kernel(T* __restrict__ buf, R4DArWidePeers<char, 
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
   const long long gate_word = r4d_ar_link_word(gate, (unsigned int)tid);
+  r4d_ar_prio(acq);   /* fn4 PF prio */
   r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
   const unsigned int s = s_seq;
   const int parity = (int)s_slot;

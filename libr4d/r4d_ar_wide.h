@@ -66,7 +66,13 @@ __device__ __forceinline__ void r4d_ar_drain(int drain) {
 // invalidate (global_inv scope:SCOPE_DEV: its CU's vector caches) -- the L2 is the card's, so one system invalidate covers
 // every wave of the block; 4 = every wave's device-scope invalidate only (the slots are fine-grained: this rank reads them
 // past L2, r4d_ar_entry.hip's allocation note, so only the vector caches can hold an older copy). Every thread calls it.
+/* fn4 PF prio (qwen/prefill; ar_fence forms 6 / 7): acq bit 8 raises the collective's waves to the top scheduling priority
+ * (s_setprio 3) for the kernel's life, so its pushes issue ahead of the compute waves sharing a SIMD; no byte changes */
+__device__ __forceinline__ void r4d_ar_prio(int acq) {
+  if (acq & 8) __builtin_amdgcn_s_setprio(3);
+}
 __device__ __forceinline__ void r4d_ar_acquire(int acq) {
+  acq &= 7;
   if (acq == 1) __threadfence_system();
   else if (acq == 3) {
     if (threadIdx.x < 32u) {

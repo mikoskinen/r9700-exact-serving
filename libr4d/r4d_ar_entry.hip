@@ -1129,7 +1129,7 @@ static int ar_fence(const RadArgs* a) {
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_AR_FENCE");
         int on = (e && *e) ? std::atoi(e) : 0;
-        if (on < 0 || on > 5) on = 0;
+        if (on < 0 || on > 7) on = 0;
         int want = -1;
         g_ar_fence.compare_exchange_strong(want, on, std::memory_order_relaxed);
         v = g_ar_fence.load(std::memory_order_relaxed);
@@ -1146,11 +1146,13 @@ static void ar_fence_apply(const RadArgs* a, ArCall* c, bool sys_push) {
         case 3: c->drain = 5; c->acq = 4; break;
         case 4: c->drain = sys_push ? 7 : 5; c->acq = 4; break;
         case 5: c->drain = sys_push ? 7 : 5; c->acq = 3; break;
+        case 6: c->drain = 3; c->acq = 0 | 8; break;   /* fn4 PF prio: form 1 + the waves at s_setprio 3 */
+        case 7: c->drain = 3; c->acq = 4 | 8; break;   /* form 2 + s_setprio 3 */
         default: break;
     }
 }
 extern "C" int r4d_ar_fence_set(int v) {
-    if (v < 0 || v > 5) return -1;
+    if (v < 0 || v > 7) return -1;
     g_ar_fence.store(v, std::memory_order_relaxed);
     return 1;
 }
