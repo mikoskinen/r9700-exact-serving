@@ -1239,4 +1239,74 @@ TEST(tails_issued_ahead_serve_and_record_what_one_process_does) {
     }
 }
 
+/* ------------------------------------------------------------------ tp8 dev D7 */
+/* RADIANCE_PP_DECODE_FIRST=1: each planning round puts the lanes with decode rows alone before those with prompt rows. Tokens
+ * at two and three lanes (alone, every lane in turn, and beside other requests, newcomers' chunks lent), with and without the
+ * follower's own embedding + tails ahead, and the KL recordings at two and three lanes are one process's; the leader counts
+ * the rounds it reordered. */
+TEST(decode_lanes_first_serve_and_record_what_one_process_does) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_df");
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", { "--max-num-seqs", "6" }));
+        ref = lane_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; bool ta; };
+    for (const Arm a : { Arm{ 2, "0,2", false }, Arm{ 3, "0,2", false }, Arm{ 2, "1,3", false }, Arm{ 2, "0,2", true },
+                         Arm{ 3, "0,3", true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_DECODE_FIRST=1");
+        if (a.ta) {
+            env.push_back("RADIANCE_PP_FOLLOWER_EMBED=1");
+            env.push_back("RADIANCE_PP_TAIL_AHEAD=1");
+        }
+        Serving pp;
+        REQUIRE(pp.start(a.cut, lane_shape(a.lanes), env));
+        const std::vector<std::vector<int32_t>> got = lane_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long rounds = -1;
+        if (const size_t at = llog.rfind(" planning rounds put a decode lane"); at != std::string::npos) {
+            const size_t b = llog.rfind("two-node pipeline: ", at);
+            rounds = b == std::string::npos ? -1 : std::atoll(llog.c_str() + b + 19);
+        }
+        const long long held = log_count(llog, "lane with prompt rows, ");
+        fprintf(stderr, "    decode first, %d lane(s) W(%s)%s: %d of %zu prompts differ; rounds reordered %lld, prompt lanes held %lld; "
+                        "pieces lent %lld\n", a.lanes, a.cut, a.ta ? " + follower embeds + tails ahead" : "", differ, ref.size(),
+                rounds, held, log_count(llog, "newcomer split: "));
+        CHECK(held > 0);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+        CHECK(llog.find("RADIANCE_PP_DECODE_FIRST=1 -- each round plans") != std::string::npos);
+        CHECK(rounds > 0);
+    }
+    const std::string rec = record_single(d / "single", { "--max-num-seqs", "6" });
+    REQUIRE(!rec.empty());
+    for (const int lanes : { 2, 3 }) {
+        const std::string out = d / ("pp-" + std::to_string(lanes));
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_DECODE_FIRST=1");
+        const PipeRun pr = record_pipeline(out, "0,2", env, lane_shape(lanes), lane_shape(lanes), env);
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(rec, out, &why);
+        fprintf(stderr, "    decode first, %d lane(s) W(0,2): recording %s; pieces lent %lld\n", lanes,
+                same ? "identical" : why.c_str(), log_count(pr.llog, "newcomer split: "));
+        CHECK(same);
+    }
+}
+
 RAD_TEST_MAIN()
