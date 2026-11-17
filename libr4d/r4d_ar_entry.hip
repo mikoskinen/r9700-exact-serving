@@ -1535,7 +1535,8 @@ static int sp_rows(const RadArgs* a, RadStream s, int op_kind) {
                              in->my_scratch, in->my_flags, in->my_seq, in->slot_bytes,
                              c.inp, rows, (long)row, in->dtype, in->rank,
                              (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                             c.pub, early, early ? in->gate_ctr : 0L, op == 3 && ar_xpush(a, c.numel) ? 1L : 0L));
+                             c.pub, early, early ? in->gate_ctr : 0L, op == 3 && ar_xpush(a, c.numel) ? 1L : 0L,
+                             (op == 2 || op == 3) ? (long)r4d_geti_or(a, "timeline", 0) : 0L));
     return early ? RAD_LINK_ENDED : RAD_OK;
 }
 extern "C" int r4d_rad_ar_rs_rows_4rank(const RadArgs* a, RadStream s) { return sp_rows(a, s, 0); }

@@ -38,7 +38,7 @@ __global__ void r4d_ar_rs_rows_ti8_kernel(T* __restrict__ buf, R4DArWidePeers<ch
                                           char* __restrict__ my_base, unsigned int* __restrict__ my_flags,
                                           unsigned int* __restrict__ seq_ctrs, int n_rows, int rg,
                                           long slot_stride_bytes, int rank, int drain, int acq, int pub,
-                                          long long* gate, unsigned int* gate_ctr) {
+                                          long long* gate, unsigned int* gate_ctr, long long* tl_all = nullptr) {
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
@@ -116,7 +116,7 @@ __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<ch
                                           char* __restrict__ my_base, unsigned int* __restrict__ my_flags,
                                           unsigned int* __restrict__ seq_ctrs, int n_rows, int rg,
                                           long slot_stride_bytes, int rank, int drain, int acq, int pub,
-                                          long long* gate, unsigned int* gate_ctr) {
+                                          long long* gate, unsigned int* gate_ctr, long long* tl_all = nullptr) {
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
@@ -124,6 +124,9 @@ __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<ch
   r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
   const unsigned int s = s_seq;
   const int parity = (int)s_slot;
+  /* fn4 PF timeline (qwen/prefill): a block's stamps -- start, push done (the handshake's drain), flag seen, end */
+  long long* const tl = tl_all ? tl_all + (size_t)b * R4D_AR_TL_WORDS : nullptr;
+  r4d_ar_tl_stamp(tl, 0);
   const int q = (n_rows + WS - 1) / WS;
   const int sg = q * rg;
   const int gpb = (sg + nb - 1) / nb;
@@ -164,7 +167,7 @@ __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<ch
     for (int k = 4 * gA + tid; k < 4 * gE; k += nt)
       r4d_ar_push16((uint4*)pslot[p] + k, *reinterpret_cast<const uint4*>(src + (long)k * TI8_EPL), drain);   /* fn4 PFF */
   }
-  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub, tl ? tl + 1 : nullptr);
   r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   // ---- my shard: every rank's words, fp32 fold in ascending source rank, one rounding
@@ -185,6 +188,7 @@ __global__ void r4d_ar_rs_rows_raw_kernel(T* __restrict__ buf, R4DArWidePeers<ch
     }
     ti8_store8(mine + (long)k * TI8_EPL, acc);
   }
+  if (tl) { __syncthreads(); r4d_ar_tl_stamp(tl, 3); }
 }
 
 template <typename T, int WS, bool RAW>
@@ -192,7 +196,7 @@ __global__ void r4d_ar_ag_rows_kernel(T* __restrict__ buf, R4DArWidePeers<char, 
                                       char* __restrict__ my_base, unsigned int* __restrict__ my_flags,
                                       unsigned int* __restrict__ seq_ctrs, int n_rows, int rg,
                                       long slot_stride_bytes, int rank, int drain, int acq, int pub,
-                                      long long* gate, unsigned int* gate_ctr) {
+                                      long long* gate, unsigned int* gate_ctr, long long* tl_all = nullptr) {
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq, s_slot;
@@ -200,6 +204,8 @@ __global__ void r4d_ar_ag_rows_kernel(T* __restrict__ buf, R4DArWidePeers<char, 
   r4d_ar_seq_take(seq_ctrs, R4D_AR_WIDE_MAX_BLOCKS, s_seq, s_slot);
   const unsigned int s = s_seq;
   const int parity = (int)s_slot;
+  long long* const tl = tl_all ? tl_all + (size_t)b * R4D_AR_TL_WORDS : nullptr;   /* fn4 PF timeline */
+  r4d_ar_tl_stamp(tl, 0);
   const int q = (n_rows + WS - 1) / WS;
   const int sg = q * rg;
   const int rec_off = TI8_REC_OFF * sg, sc_off = TI8_SC_OFF * sg;
@@ -243,7 +249,7 @@ __global__ void r4d_ar_ag_rows_kernel(T* __restrict__ buf, R4DArWidePeers<char, 
       }
     }
   }
-  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub);
+  r4d_ar_handshake<WS>(peers, my_flags, b, rank, 2u * s, drain, acq, pub, tl ? tl + 1 : nullptr);
   r4d_ar_link_landed(gate, gate_word, gate_ctr, (unsigned int)nb, (unsigned int)tid);
 
   // ---- every peer's shard from the slot it pushed into mine
@@ -268,6 +274,7 @@ __global__ void r4d_ar_ag_rows_kernel(T* __restrict__ buf, R4DArWidePeers<char, 
       }
     }
   }
+  if (tl) { __syncthreads(); r4d_ar_tl_stamp(tl, 3); }
 }
 
 // ---------------------------------------------------------------------------------- host side
@@ -276,7 +283,7 @@ template <int WS>
 static void sp_rows_launch(int op, const long* peer_scratch, const long* peer_flags, long my_scratch, long my_flags,
                            long seq_ctrs, long slot_stride_bytes, long buf, long n_rows, long row, long dtype,
                            long rank, long stream_i, long nblocks, long nthreads, long drain, long acq, long pub,
-                           long gate, long gate_ctr, bool xpush = false) {
+                           long gate, long gate_ctr, bool xpush = false, long tlp = 0) {
   constexpr int NPEERS = WS - 1;
   const char* who = (op == 0 || op == 3) ? "sp rs" : "sp ag";
   if (rank < 0 || rank >= WS) throw std::runtime_error(std::string(who) + ": rank out of range");
@@ -316,7 +323,8 @@ static void sp_rows_launch(int op, const long* peer_scratch, const long* peer_fl
   hipStream_t st = (hipStream_t)stream_i;
 #define R4D_SP_ARGS(T)                                                                                     \
   (T*)buf, peers, (char*)my_scratch, (unsigned int*)my_flags, (unsigned int*)seq_ctrs, (int)n_rows, (int)rg, \
-      (long)slot_stride_bytes, (int)rank, (int)drain, (int)acq, (int)pub, (long long*)gate, (unsigned int*)gate_ctr
+      (long)slot_stride_bytes, (int)rank, (int)drain, (int)acq, (int)pub, (long long*)gate, (unsigned int*)gate_ctr, \
+      (long long*)tlp
   if (dtype == 0) {
     if (op == 0) r4d_ar_rs_rows_ti8_kernel<__hip_bfloat16, WS><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__hip_bfloat16));
     else if (op == 3 && xpush) r4d_ar_rs_rows_raw_kernel<__hip_bfloat16, WS, true><<<nb, nt, 0, st>>>(R4D_SP_ARGS(__hip_bfloat16));
@@ -337,9 +345,9 @@ void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long p
                           long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
                           long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
                           long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr,
-                          long xpush) {
+                          long xpush, long tl) {
   const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
   const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   sp_rows_launch<4>(op, ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride_bytes, buf, n_rows, row, dtype, rank, stream,
-                    nblocks, nthreads, drain, acq, pub, gate, gate_ctr, xpush != 0);
+                    nblocks, nthreads, drain, acq, pub, gate, gate_ctr, xpush != 0, tl);
 }

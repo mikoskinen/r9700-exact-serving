@@ -506,7 +506,8 @@ void r4d_ar_sp_rows_4rank(int op, long peer_scratch0, long peer_scratch1, long p
                           long peer_flags1, long peer_flags2, long my_scratch, long my_flags, long seq_ctrs,
                           long slot_stride_bytes, long buf, long n_rows, long row, long dtype, long rank, long stream,
                           long nblocks, long nthreads, long drain, long acq, long pub, long gate, long gate_ctr,
-                          long xpush = 0);   /* fn4 RSF: the raw reduce-scatter's pushes interleaved over the peers */
+                          long xpush = 0,    /* fn4 RSF: the raw reduce-scatter's pushes interleaved over the peers */
+                          long tl = 0);      /* fn4 PF timeline (qwen/prefill): a block's stamps, R4D_AR_TL_WORDS a block */
 void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
                               long peer_flags0, long peer_flags1, long peer_flags2,
                               long my_scratch, long my_flags, long seq_ctrs,

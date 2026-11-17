@@ -30715,6 +30715,14 @@ struct Ar8Perf {
     std::vector<std::vector<float>> cold;
     /* --timeline: per config, the two-shot's stamps (nblocks x R4D_AR_TL_WORDS, -1 unset). */
     std::vector<std::vector<long long>> tl;
+    /* fn4 PF (qwen/prefill): R4D_SELFTEST_AR4_BESIDE=N -- N launches of a bf16 GEMM (gemm_bf16_nt_tiled, 2048 x 2560 x 2560,
+     * the size of a prefill piece's projection) queued on a second stream of every card while a config is timed (and before
+     * its timeline launch), so the collective runs beside compute as in a pipelined prefill step; per config the GEMM's us a
+     * launch beside it, and alone once. */
+    const RadKernelInfo* gemm = nullptr;
+    int beside = 0;
+    double gemm_alone_us = 0;
+    std::vector<double> gemm_with_us;
 };
 
 static void ar8_perf_worker(Ar8Perf* t) {
@@ -30751,6 +30759,44 @@ static void ar8_perf_worker(Ar8Perf* t) {
     std::vector<uint8_t> h((size_t)most * esz), want((size_t)most * esz), got((size_t)most * esz);
     std::vector<hipEvent_t> ev(2 * (size_t)std::max(t->iters, 1));
     for (hipEvent_t& e : ev) st_ev_create(&e);
+    /* fn4 PF beside-compute mode */
+    t->gemm_with_us.assign(ncfg, 0.0);
+    hipStream_t sb = nullptr;
+    hipEvent_t gb0 = nullptr, gb1 = nullptr;
+    void *ga = nullptr, *gw = nullptr, *gc = nullptr;
+    const int64_t GM = 2048, GN = 2560, GK = 2560;
+    std::vector<RadTensor> gts;
+    std::vector<RadParam> gps = { PI("M", GM), PI("N", GN), PI("K", GK), PS("dtype", "bf16") };
+    RadArgs ga_args;
+    std::memset(&ga_args, 0, sizeof(ga_args));
+    const bool bes = t->beside > 0 && t->gemm && t->rc_init == RAD_OK;
+    if (bes) {
+        if (hipStreamCreateWithFlags(&sb, hipStreamNonBlocking) != hipSuccess || hipMalloc(&ga, (size_t)(GM * GK) * 2) != hipSuccess ||
+            hipMalloc(&gw, (size_t)(GN * GK) * 2) != hipSuccess || hipMalloc(&gc, (size_t)(GM * GN) * 2) != hipSuccess)
+            t->rc_init = RAD_E_NOMEM;
+        else {
+            hip_ck(hipMemset(ga, 0x3c, (size_t)(GM * GK) * 2), "hipMemset", __LINE__);
+            hip_ck(hipMemset(gw, 0x3b, (size_t)(GN * GK) * 2), "hipMemset", __LINE__);
+            gts = { T(ga, RAD_BF16, { GM, GK }), T(gw, RAD_BF16, { GN, GK }), T(gc, RAD_BF16, { GM, GN }) };
+            ga_args.t = gts.data(); ga_args.n_t = (int)gts.size();
+            ga_args.p = gps.data(); ga_args.n_p = (int)gps.size(); ga_args.world_size = 1;
+            st_ev_create(&gb0); st_ev_create(&gb1);
+            for (int i = 0; i < 20; ++i) t->gemm->launch(&ga_args, (RadStream)sb);
+            st_stream_sync(sb);
+            st_ev_record(gb0, sb);
+            for (int i = 0; i < 100; ++i) t->gemm->launch(&ga_args, (RadStream)sb);
+            st_ev_record(gb1, sb);
+            st_ev_sync(gb1);
+            float ms = 0; st_ev_elapsed(&ms, gb0, gb1);
+            t->gemm_alone_us = 10.0 * ms;
+        }
+    }
+    auto bg = [&](int nl) {
+        if (!bes || t->rc_init != RAD_OK) return;
+        st_ev_record(gb0, sb);
+        for (int i = 0; i < nl; ++i) t->gemm->launch(&ga_args, (RadStream)sb);
+        st_ev_record(gb1, sb);
+    };
     size_t cfg = 0;
     for (size_t si = 0; si < t->sizes.size(); ++si) {
         const int64_t n = t->sizes[si];
@@ -30820,6 +30866,7 @@ static void ar8_perf_worker(Ar8Perf* t) {
                 t->bar->wait();
                 if (timed) {
                     if (g_cold <= 0) {
+                        bg(t->beside);
                         st_ev_record(ev[0], t->st);
                         for (int i = 0; i < t->iters; ++i) t->rows[j]->launch(&a, t->st);
                         st_ev_record(ev[1], t->st);
@@ -30827,6 +30874,11 @@ static void ar8_perf_worker(Ar8Perf* t) {
                         float ms = 0.0f;
                         st_ev_elapsed(&ms, ev[0], ev[1]);
                         t->period[cfg] = ms / (float)t->iters;
+                        if (bes) {
+                            st_ev_sync(gb1);
+                            float gms = 0.0f; st_ev_elapsed(&gms, gb0, gb1);
+                            t->gemm_with_us[cfg] = 1000.0 * gms / t->beside;
+                        }
                     } else {
                         for (int i = 0; i < t->iters; ++i) {
                             for (int64_t off = 0; off < g_cold; off += kColdChunk)
@@ -30854,9 +30906,12 @@ static void ar8_perf_worker(Ar8Perf* t) {
                     a.p = pt.data(); a.n_p = (int)pt.size();
                     hip_ck(hipMemsetAsync(tlbuf, 0xff, tl_words * sizeof(long long), t->st),
                            "hipMemsetAsync", __LINE__);
+                    st_stream_sync(t->st);
                     t->bar->wait();
+                    if (bes) { bg(8); std::this_thread::sleep_for(std::chrono::microseconds(300)); }
                     t->rows[j]->launch(&a, t->st);
                     st_stream_sync(t->st);
+                    if (bes) st_stream_sync(sb);
                     t->tl[cfg].resize(tl_words);
                     st_memcpy(t->tl[cfg].data(), tlbuf, tl_words * sizeof(long long),
                               hipMemcpyDeviceToHost);
@@ -30874,6 +30929,7 @@ static void ar8_perf_worker(Ar8Perf* t) {
         if (inst[j] && t->rows[j]->fini) t->rows[j]->fini(inst[j]);
     for (void* p : { in, out, csrc, cdst, tlbuf }) if (p) st_free(p);
     if (t->st) hip_ck(hipStreamDestroy(t->st), "hipStreamDestroy", __LINE__);
+    if (sb) { st_stream_sync(sb); for (void* p : { ga, gw, gc }) if (p) st_free(p); st_ev_destroy(gb0); st_ev_destroy(gb1); (void)hipStreamDestroy(sb); }
 }
 
 /* The two-shot's stamps for one config as each rank's phases, in microseconds. A rank's event is
@@ -31154,6 +31210,7 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
     for (int r = 0; r < W; ++r) {
         Ar8Perf& x = t[(size_t)r];
         x.rank = r; x.dev = devs[(size_t)r]; x.world = W; x.iters = iters; x.dtype = "bf16";
+        if (const char* be = std::getenv("R4D_SELFTEST_AR4_BESIDE")) { x.beside = std::atoi(be); x.gemm = find(pl, "gemm_bf16_nt_tiled"); }
         x.sizes = sizes; x.rows = rows; x.ks = ks; x.forms = forms; x.nbs = { 0 }; x.bar = &bar;
         x.sp_raw = raws; x.widths = widths; x.extra = extras;
         th.emplace_back(ar8_perf_worker, &x);
@@ -31184,12 +31241,15 @@ static void ar4_perf(const Plugin& pl, const char* spec, int iters) {
                         labels[j].c_str(), us, us > 0 ? bytes / (us * 1e3) : 0.0, us > 0 ? sent / (us * 1e3) : 0.0,
                         kinds[j] == 2 ? "(timed only)" : bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()
                                                              : "= fold on every rank", per.c_str());
-            if (g_timeline && kinds[j] == 1) ar8_print_timeline(t, cfg, (double)wall_khz_i);
+            if (g_timeline && (kinds[j] == 1 || kinds[j] == 2)) ar8_print_timeline(t, cfg, (double)wall_khz_i);
+            double gw = 0.0;
+            for (const Ar8Perf& x : t) gw = std::max(gw, x.gemm_with_us.size() > cfg ? x.gemm_with_us[cfg] : 0.0);
             std::printf("AR4 %s\n", fmt("{\"rows\": %lld, \"width\": %lld, \"mb\": %.3f, \"op\": \"%s\", \"us\": %.1f, "
-                                        "\"gbs_dir\": %.2f, \"bad\": %lld, \"checked\": %s}", (long long)(sizes[si] / widths[si]),
+                                        "\"gbs_dir\": %.2f, \"bad\": %lld, \"checked\": %s, \"beside\": %d, \"gemm_alone_us\": %.1f, "
+                                        "\"gemm_with_us\": %.1f}", (long long)(sizes[si] / widths[si]),
                                         (long long)widths[si], bytes / 1e6, labels[j].c_str(), us,
                                         us > 0 ? sent / (us * 1e3) : 0.0, (long long)bad,
-                                        kinds[j] == 2 ? "false" : "true").c_str());
+                                        kinds[j] == 2 ? "false" : "true", t[0].beside, t[0].gemm_alone_us, gw).c_str());
         }
     }
     /* the stale-read stress (R4D_SELFTEST_AR4_STRESS launches a point): fresh instances, every launch checked */
