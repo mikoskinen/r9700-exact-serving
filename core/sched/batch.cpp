@@ -1321,9 +1321,15 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     last_n_seq_ = n_seq;
     last_n_tok_ = n_tok;
     last_tree_  = plan.spec_is_tree;
+    last_off_ = off;
+    last_used_ = used;
+    last_rng_at_ = rng_at;
+    last_n_rng_ = n_rng;
+    last_enc_ = false;
     ring_.head = off + used;
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;
+    if (on_build) on_build(&o.batch[0]);
     return &o.batch[0];
 }
 
@@ -1457,6 +1463,7 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         B.enc_seg_h = enc_seg_h_host_.data();
         B.enc_seg_w = enc_seg_w_host_.data();
     }
+    last_enc_ = true;
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;
     return &o.batch[0];

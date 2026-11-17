@@ -14,6 +14,8 @@
 #include "mem_iface.h"
 #include "metrics.h"
 
+#include <functional>
+
 namespace rad {
 
 /* One sequence's participation in one step. The scheduler fills these; the builder turns them
@@ -144,6 +146,43 @@ public:
     /* The last build's slab and offsets on one rank, for the advance. The caller supplies mode,
      * round, slot state and inputs (advance.h). */
     AdvanceArgs advance_args(int rank) const;
+
+    /* ---- tp8 S4: the two-node pipeline (abi/rad_pp.h). The leader ships every build's staging
+     * span with the scalars beside it (Wire); the follower uploads the same bytes to its own ranks'
+     * slabs and fills its batches from them, so both nodes' cards hold the same step arrays and
+     * block tables without the follower running a scheduler. Every build crosses, a drafter's too
+     * (`run` false on the follower: only its uploads are applied), because the block-table region
+     * of the slab is staged only where it changed (BtMirror) and so must see every build in order.
+     * Unused on one machine: build() only records where its span was. */
+    enum { kWireMaxDerived = 32 };
+    struct Wire {
+        uint32_t magic = 0x31525742u;   /* "BWR1" */
+        uint32_t version = 1;
+        uint64_t layout = 0;            /* layout_hash() of the leader's builder */
+        int32_t  phase = 0, step = 0;
+        int64_t  n_tok = 0, n_seq = 0, n_out = 0, n_draft_out = 0, n_seq_decode = 0, n_tok_decode = 0;
+        int64_t  n_ahead = 0, n_bidi = 0, n_pw = 0, n_mm = 0;
+        int32_t  max_q = 0, ctx_bound = 0, max_q_dec = 0, max_q_pf = 0;
+        int32_t  draft_pass = 0, n_spec = 0, n_ck = 0, rope_mixed = 0, cvec_rows = 0, score_only = 0;
+        int32_t  tree = 0, lora_rows = 0, n_groups = 0, n_derived = 0;
+        int64_t  bt_base = 0, used = 0, rng_at = 0, n_rng = 0;
+        int64_t  pitch[RAD_SCHED_MAX_KV_GROUPS] = {};
+        int32_t  used_max[RAD_SCHED_MAX_KV_GROUPS] = {};
+        int64_t  derived_n[kWireMaxDerived] = {};
+    };
+    /* The last build (not an encoder pass) as it crosses: its scalars and its span in the ring.
+     * False when there is none. */
+    bool wire_last(Wire* w, const char** span) const;
+    /* The follower's side: uploads `span` (w.used bytes) to every rank's slab and, with `run`,
+     * copies the derivations and fills every rank's batch; returns rank 0's batch (batch_for()
+     * serves the rest) or null with the reason logged. */
+    const RadBatch* wire_replay(const Wire& w, const char* span, int64_t bytes, bool run);
+    /* What a span means: every carve offset, group geometry and derivation slot. Two builders with
+     * one hash read each other's spans byte for byte (the rendezvous compares it). */
+    uint64_t layout_hash() const;
+    /* Called at the end of every build() (not build_encoder) with its rank-0 batch: the leader
+     * ships it from here. Empty on one machine. */
+    std::function<void(const RadBatch*)> on_build;
 
     /* The sequences of `b`, a batch build() returned that is still valid (any rank's), in row
      * order; null for another batch (an encoder pass). What a streamed group's prefill stage
@@ -345,6 +384,9 @@ private:
     void forget_tables();
     int64_t last_n_seq_ = 0;
     bool    last_tree_  = false;   /* the last build staged spec_parent (advance_args' parent_off) */
+    /* Where the last build's span sits in the ring, for wire_last (tp8 S4). */
+    int64_t last_off_ = -1, last_used_ = 0, last_rng_at_ = 0, last_n_rng_ = 0;
+    bool    last_enc_ = false;
 
     int64_t               derived_bytes_ = 0;
     std::vector<Derived>  derived_;

@@ -234,6 +234,14 @@ public:
 
     /* The batch the last build produced for one rank; see BatchBuilder::batch_for. */
     const RadBatch* batch_for(int rank) const { return builder_.batch_for(rank); }
+    /* tp8 S4, the two-node pipeline: the step batch's wire (BatchBuilder::Wire). The leader reads
+     * every build as it is made (set_build_hook) and ships it; the follower replays it. */
+    void set_build_hook(std::function<void(const RadBatch*)> f) { builder_.on_build = std::move(f); }
+    bool wire_last(BatchBuilder::Wire* w, const char** span) const { return builder_.wire_last(w, span); }
+    const RadBatch* wire_replay(const BatchBuilder::Wire& w, const char* span, int64_t n, bool run) {
+        return builder_.wire_replay(w, span, n, run);
+    }
+    uint64_t wire_layout() const { return builder_.layout_hash(); }
     /* See BatchBuilder::step_seqs. */
     const std::vector<uint64_t>* step_seqs(const RadBatch* b) const { return builder_.step_seqs(b); }
     /* The advance's view of that build on one rank; see BatchBuilder::advance_args. Also carries
