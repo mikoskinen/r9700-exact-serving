@@ -30816,6 +30816,10 @@ static void ar8_perf_worker(Ar8Perf* t) {
         }
         if (t->rc_init == RAD_OK) st_memcpy(in, h.data(), (size_t)n * esz, hipMemcpyHostToDevice);
         const uint32_t dt = bf ? RAD_BF16 : RAD_F32;
+        /* SP's raw rows run in place on `in` (their timed launches rewrite it), so a checked config after one
+         * reloads the input first (fn4 PF, 17.11.: the coded lane rows listed after the SP fence rows read "every
+         * element differs" from a rewritten input, while the stale-read stress over the same forms read 0). */
+        bool dirty = false;
         for (size_t j = 0; j < t->rows.size(); ++j) {
             for (int nb : t->nbs) {
                 std::vector<RadParam> ps = ip;
@@ -30828,6 +30832,8 @@ static void ar8_perf_worker(Ar8Perf* t) {
                     ps.push_back(PI("raw", t->sp_raw[j]));
                     ps.push_back(PI("row", si < t->widths.size() ? t->widths[si] : n));
                 }
+                if (dirty && t->rc_init == RAD_OK) st_memcpy(in, h.data(), (size_t)n * esz, hipMemcpyHostToDevice);
+                dirty = spr;
                 RadTensor ts[2] = { T(in, dt, { n }), T(spr ? in : out, dt, { n }) };
                 RadArgs a;
                 std::memset(&a, 0, sizeof(a));
