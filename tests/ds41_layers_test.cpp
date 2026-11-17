@@ -185,4 +185,97 @@ TEST(layers_every_split_partitions_the_layers) {
     }
 }
 
+/* tp8 S6: the crossings of a general cut (PLAN.md section 3: X1 + layer 8's selections + new source-8 latent entries; X2 +
+ * the last index layer's selections, the keep words, new source-20 entries) */
+namespace {
+struct Want {
+    int h, t;
+    bool r1;
+    int sel1, keep1, src1;
+    bool lat1, idx1;
+    int sel2, keep2, src2;
+    bool lat2, idx2;
+};
+}  // namespace
+
+TEST(layers_s6_crossings_of_the_plan_cuts) {
+    const Geo g = flash1017();
+    const Want ws[] = {
+        /* W(0,20): the clean cut, nothing but the embedding's output and the residual */
+        { 0, 20, false, -1, -1, -1, false, false, -1, -1, -1, false, false },
+        /* W(10,32): X1 source 8's latent (layers 10..13 attend over it) + index 8's selections; X2 source 20's latent and
+         * index keys (index layers 32, 36) + the candidate layer's keep words; layer 32 selects for itself */
+        { 10, 32, true, 8, -1, 8, true, false, -1, 20, 20, true, true },
+        /* W(10,33) / W(10,34): + index 32's selections into the leader's 33.. */
+        { 10, 33, true, 8, -1, 8, true, false, 32, 20, 20, true, true },
+        { 10, 34, true, 8, -1, 8, true, false, 32, 20, 20, true, true },
+        /* W(8,34): layer 8 is its own source and index layer, so X1 is the residual alone */
+        { 8, 34, true, -1, -1, -1, false, false, 32, 20, 20, true, true },
+        /* W(9,32): layer 9 reads source 8's latent and index 8's selections */
+        { 9, 32, true, 8, -1, 8, true, false, -1, 20, 20, true, true },
+        /* W(22,30): the follower's index layers 24, 28 read source 20's index keys and keep; X2 index 28's selections */
+        { 22, 30, true, 20, 20, 20, true, true, 28, -1, -1, false, false },
+        /* W(1,20): an Engram layer as the follower's first (its boundary is mhc_post alone, S4's form) */
+        { 1, 20, true, -1, -1, -1, false, false, -1, -1, -1, false, false },
+    };
+    for (const Want& w : ws) {
+        Crossing x[2];
+        std::string err;
+        CHECK_EQ(crossings(g, w.h, w.t, x, &err), 0);
+        if (!err.empty()) std::fprintf(stderr, "  W(%d,%d): %s\n", w.h, w.t, err.c_str());
+        CHECK_EQ(x[0].at, w.h);
+        CHECK_EQ(x[1].at, w.t);
+        CHECK_EQ(x[0].residual, w.r1);
+        CHECK(x[1].residual);
+        CHECK_EQ(x[0].sel, w.sel1);
+        CHECK_EQ(x[0].keep, w.keep1);
+        CHECK_EQ(x[0].src, w.src1);
+        CHECK_EQ(x[0].latent, w.lat1);
+        CHECK_EQ(x[0].index, w.idx1);
+        CHECK_EQ(x[1].sel, w.sel2);
+        CHECK_EQ(x[1].keep, w.keep2);
+        CHECK_EQ(x[1].src, w.src2);
+        CHECK_EQ(x[1].latent, w.lat2);
+        CHECK_EQ(x[1].index, w.idx2);
+    }
+}
+
+TEST(layers_s6_cuts_the_geometry_refuses) {
+    const Geo g = flash1017();
+    Crossing x[2];
+    std::string err;
+    CHECK(crossings(g, 0, 38, x, &err) < 0 && err.find("DSpark") != std::string::npos);   /* tap 37 on the follower */
+    CHECK(crossings(g, 10, 40, x, &err) < 0);   /* the leader must hold the last layer */
+    CHECK(crossings(g, 12, 12, x, &err) < 0);
+    CHECK(crossings(g, -1, 20, x, &err) < 0);
+    /* every cut 0 <= h < t <= 37 is allowed (one source, one selection layer, one keep a crossing on this geometry) */
+    int ok = 0;
+    for (int h = 0; h < 40; ++h)
+        for (int t = h + 1; t < 40; ++t) ok += crossings(g, h, t, x, &err) == 0;
+    CHECK_EQ(ok, 37 * 38 / 2);   /* t = 1 .. 37, h = 0 .. t - 1 */
+}
+
+TEST(layers_s6_binds_hold_or_copy) {
+    const Geo g = flash1017();
+    Crossing x[2];
+    std::string err;
+    CHECK_EQ(crossings(g, 10, 32, x, &err), 0);
+    const Spec f = spec("10:32", "strict"), a = spec("0:10,32:40", "strict");
+    const Binds bf = binds(g, f, &x[0]), ba = binds(g, a, &x[1]);
+    /* the follower: source 8's latent copy (not its index keys), 14 and 20 its own; source 2 unbound */
+    CHECK(!bf.comp[2] && bf.comp[8] && bf.comp[14] && bf.comp[20]);
+    CHECK(!bf.index[2] && !bf.index[8] && bf.index[14] && bf.index[20]);
+    CHECK(!bf.tail[2] && !bf.tail[8] && bf.tail[14] && !bf.tail[20]);
+    CHECK(!bf.comp_zero_r[2] && !bf.comp_zero_r[1] && !bf.index_zero_r[2] && !bf.index_zero_r[1]);
+    /* the leader: 2 and 8 its own, source 20's latent + index keys copied, 14 unbound */
+    CHECK(ba.comp[2] && ba.comp[8] && !ba.comp[14] && ba.comp[20]);
+    CHECK(ba.index[2] && ba.index[8] && !ba.index[14] && ba.index[20]);
+    CHECK(ba.tail[2] && ba.tail[8] && !ba.tail[14] && !ba.tail[20]);
+    /* W(0,20): the clean cut zeroes the other ratio on each node (S4's groups) */
+    CHECK_EQ(crossings(g, 0, 20, x, &err), 0);
+    const Binds b0 = binds(g, spec("0:20", "strict"), &x[0]), b1 = binds(g, spec("20:40", "strict"), &x[1]);
+    CHECK(b0.comp_zero_r[1] && b0.index_zero_r[1] && !b0.comp_zero_r[2]);
+    CHECK(b1.comp_zero_r[2] && b1.index_zero_r[2] && !b1.comp_zero_r[1]);
+}
+
 RAD_TEST_MAIN()

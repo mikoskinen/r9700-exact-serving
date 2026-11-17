@@ -2796,30 +2796,34 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 
 | op | params | operands |
 |---|---|---|
-| `stage_send` | `M`(range) `ring` `parts` `sender`/opt | `ring`, `x0`, `x1`?, `x2`?, `x3`?, `x4`?, `x5`?, `x6`?, `x7`? |
-| `stage_recv` | `M`(range) `ring` `parts` `sender`/opt | `ring` → `y0`, `y1`?, `y2`?, `y3`?, `y4`?, `y5`?, `y6`?, `y7`? |
+| `stage_send` | `M`(range) `ring` `parts` `sender`/opt | `ring`, `x0`, `x1`?, `x2`?, `x3`?, `x4`?, `x5`?, `x6`?, `x7`?, `x8`?, `x9`?, `x10`?, `x11`? |
+| `stage_recv` | `M`(range) `ring` `parts` `sender`/opt | `ring` → `y0`, `y1`?, `y2`?, `y3`?, `y4`?, `y5`?, `y6`?, `y7`?, `y8`?, `y9`?, `y10`?, `y11`? |
 
 A two-node pipeline's step crosses the machine boundary twice (`abi/rad_pp.h`, tp8 S4): `X1` from the
 leader into the follower's first layer, `X2` from the follower back into the leader's next layer.
 The plugin places both ops, because only it knows what is live at its cut: the inputs of the op the
 receiving layer starts with, so that op computes in the other process what it would have computed
 in one. `ring` is the core's ring for that crossing on this node, a raw pointer the plugin passes
-from `rad_pp_info`; `x0`..`x7` / `y0`..`y7` are the crossing's parts, each `[M, ...]` at its own dtype
-and dense, packed verbatim at 256-byte-aligned offsets (no conversion, so the crossing moves no
-number).
+from `rad_pp_info`; `x0`..`x11` / `y0`..`y11` are the crossing's parts, each `[rows, ...]` at its own
+dtype and dense, packed verbatim at 256-byte-aligned offsets (no conversion, so the crossing moves no
+number). A part's rows are its own (tp8 S6: a general cut's crossing carries the residual stream over
+the step's rows and a kv source's new entries over the compressor's work rows); the ring's `rows` is
+part 0's, and the receiver checks every part's bytes. A part need not be a multiple of 16 bytes: the
+card copies a part that is in 16-byte words, any other in 4-byte words.
 
 - `stage_send` publishes the payload with the ring's `ready` counter once the core's link has taken
   the last one off (`sent`). Only rank `sender` (default 0) writes; the residual stream is
   replicated over the tensor-parallel ranks (spec §9), so one copy crosses.
-- `stage_recv` waits until the other node's payload has `landed`, checks that its rows, parts and
-  bytes are this step's (a mismatch is two nodes out of step, a failure, never a copy) and that its
+- `stage_recv` waits until the other node's payload has `landed`, checks that its rows, parts, each
+  part's bytes and the total are this step's (a mismatch is two nodes out of step, a failure, never a copy) and that its
   trailer holds the number of the payload it waits for (a stale or overwritten payload of the same
   shape, a failure), copies it out and counts the rank in `taken`. Every rank receives. It fails on
   the ring's `abort` word, which the link sets when the peer is gone, and past the ring's deadline.
 - A payload ends in a `RAD_PP_TRAILER` (64-byte) trailer at the aligned end of its parts, whose
-  first word is the payload's number (`ready` + 1); the ring's `bytes` counts it. A card that gives
-  up stores `abort` 2 (the abort seen), 3 (the deadline), 4 (another step's shape) or 5 (a stale
-  trailer).
+  first word is the payload's number (`ready` + 1) and whose second is its layout word
+  (`rad_pp_layout` over the parts' bytes, which the receiver computes from its own parts); the
+  ring's `bytes` counts it. A card that gives up stores `abort` 2 (the abort seen), 3 (the
+  deadline), 4 (another step's shape, the layout word included) or 5 (a stale trailer).
 
 The counters are read and written by the kernels themselves at run time, so a recorded pass
 replays. Neither op has a cold form (its ring belongs to a running core): the shape hooks answer

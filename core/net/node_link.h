@@ -55,6 +55,7 @@ enum FrameKind : uint16_t {
     kFn4Ask    = 11,  /* leader -> follower: would this node take switch name=value? (seq = ask id) */
     kFn4Ans    = 12,  /* follower -> leader: the answer to kFn4Ask (aux: 1 takes, 0 serves none, -1 refuses) */
     kFn4State  = 13,  /* follower -> leader: the switch values the follower applies (after a change) */
+    kKvCheck   = 14,  /* leader -> follower (debug, tp8 S6): the CRCs of the copied KV layers after step seq */
     kUser      = 32,  /* first kind a test may use */
 };
 

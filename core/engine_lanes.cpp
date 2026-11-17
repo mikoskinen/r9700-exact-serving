@@ -29,7 +29,15 @@
  *     already in flight then runs its tail under the new setting (its head and the follower's pass ran
  *     under the old): exact levers only change speed; one that changes arithmetic is changed with
  *     the pipeline idle;
- *   - the prefix cache, its tiers and checkpoints stay off (tp8 S4's rule), so no restore crosses;
+ *   - the prefix cache's host tier stays off (tp8 S6); a prefix hit's restores go before its head (on the
+ *     follower before its pass, from the step frame: pp_ck_list), its saves behind its tail (on the follower
+ *     behind its pass). A chunk with a checkpoint or a restore is never lent in pieces (lanes.cpp), and the
+ *     sequence's next chunk is planned only after its commit, so no other lane's part writes the state a
+ *     save copies between the head and the save; a snapshot is the prefix cache's only from its step's
+ *     commit (commit_checkpoint), so a restore from it is planned behind the save on both nodes;
+ *   - the KV-copy check (RADIANCE_PP_KV_CHECK) compares the copies with no lane step in flight: when one is
+ *     due, the loop stops planning until every tail is in, then sends it (two lanes' copies would otherwise
+ *     differ by the step whose head ran and whose tail has not);
  *   - the depth-0 context skip (draft_ctxskip) keeps the trunk's rows of consecutive steps in one
  *     ring on the card; lanes interleave their steps, so the skip is refused (fn4 and at start).
  * Every lane's step numbers come from one counter (lanes.h): a step number names one build on both
@@ -93,6 +101,9 @@ int Engine::lane_head(int lane, const RadBatch* b) {
         return RAD_E_STATE;
     }
     pp_trunk_pending_[lane] = false;
+    /* tp8 S6: a prefix hit's snapshot restores, on this node's streams before the head (the follower runs them from
+     * the frame before its pass); the tail reads the restored state on the same stream */
+    RAD_TRY(restore_checkpoints());
     RAD_TRY(pp_ship(b, true, lane));
     pp_set_pass(lane, RAD_PP_PART_HEAD);
     issue_what_.store(kIssueModel, std::memory_order_release);
@@ -146,6 +157,7 @@ int Engine::step_loop_lanes() {
     std::vector<char> busy((size_t)n_lanes_, 0);
     int next = 0;   /* the lane planned first on the next round */
     int64_t lane_steps = 0, rounds_two = 0;
+    int64_t kv_check_at = 0;   /* tp8 S6: trunk steps shipped at the last KV-copy check */
     while (!stopping_.load(std::memory_order_acquire)) {
         step_watch.progress();
         if (pp_link_ && !pp_link_->alive()) {
@@ -160,8 +172,16 @@ int Engine::step_loop_lanes() {
          * behind it, before anything else -- then those in flight, oldest first (their commits come
          * before l's). A newcomer's chunk planned by `l` lends its pieces to them in that order
          * (lanes.h), so on both nodes the pieces run in position order. */
+        /* tp8 S6: a KV-copy check due waits for every lane step in flight (the head comment), then goes out
+         * before the next build */
+        const bool kv_due = pp_kv_check_every_ > 0 && pp_steps_shipped_ - kv_check_at >= pp_kv_check_every_;
+        if (kv_due && fifo.empty()) {
+            pp_kv_check_send();
+            kv_check_at = pp_steps_shipped_;
+        }
         std::vector<int> todo;
-        for (int k = 0; k < n_lanes_; ++k) todo.push_back((next + k) % n_lanes_);
+        if (!(kv_due && !fifo.empty()))
+            for (int k = 0; k < n_lanes_; ++k) todo.push_back((next + k) % n_lanes_);
         for (size_t at = 0; at < todo.size(); ++at) {
             const int l = todo[at];
             if (busy[(size_t)l]) continue;
@@ -240,12 +260,6 @@ int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint
     }
     so.n_rows = logit_row;
     if (const int ss = stage_scored_rows(plan, so, cancel); ss < 0) return ss;
-    for (const StepEntry& e : plan.e)
-        if (e.ckpt_restore >= 0) {
-            RAD_ERR("two-node pipeline: step %d restores a snapshot (a prefix hit), which the pipeline does not carry",
-                    b->step);
-            return RAD_E_STATE;
-        }
 
     /* As step_loop's stage_sampler. */
     auto stage_sampler = [&]() -> int {

@@ -39,7 +39,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <mutex>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -54,9 +56,20 @@ struct PpGlobal {
      * lane and part of the pass the ranks issue now (Engine::pp_set_pass, with every rank parked). */
     std::atomic<RadPpRing*> ring[RAD_PP_MAX_RING_IX] = {};
     std::atomic<int>     lanes{ 1 }, lane{ 0 }, part{ RAD_PP_PART_WHOLE };
+    /* tp8 S6: the KV layers both nodes hold of one source (rad_pp_kv_copy): group, slot here, model layer */
+    std::mutex kv_mu;
+    std::vector<std::array<int32_t, 3>> kv_copies;
 };
 PpGlobal& pp_g() { static PpGlobal g; return g; }
 }  /* namespace */
+
+extern "C" void rad_pp_kv_copy(int32_t group, int32_t slot, int32_t layer) {
+    PpGlobal& g = pp_g();
+    std::lock_guard<std::mutex> lk(g.kv_mu);
+    for (const auto& c : g.kv_copies)
+        if (c[0] == group && c[2] == layer) return;
+    g.kv_copies.push_back({ group, slot, layer });
+}
 
 extern "C" int rad_pp_info(RadPpInfo* out) {
     if (!out) return RAD_E_INVAL;
@@ -96,7 +109,7 @@ namespace {
 
 /* The step's extras beside its batch: what prepare_release decided on the leader that the
  * follower's plugin reads. */
-constexpr uint32_t kStepMagic = 0x32535050u;   /* "PPS2" (review F2 / F4: requests + clears) */
+constexpr uint32_t kStepMagic = 0x34535050u;   /* "PPS4" (review F2 / F4: requests + clears; tp8 S5: lane; tp8 S6: checkpoints) */
 constexpr int      kMaxFn4 = 256;
 static_assert(fn4::kSwitches <= kMaxFn4, "every fn4 switch fits the step header");
 constexpr int      kMaxClears = 1 << 16;
@@ -110,6 +123,7 @@ struct StepHdr {
     int64_t  psk_dec = 0;
     int32_t  n_clears = 0;      /* (group, slot) pairs after the PSK plan: state slots to zero first */
     int32_t  lane = 0;          /* tp8 S5: the lane whose builder and rings the step is (0 on one lane) */
+    int32_t  n_ck = 0;          /* tp8 S6: int32 words of checkpoint restores / saves after the clears (pp_ck_list) */
     /* Review F2 / F3: the leader's switch REQUESTS (fn4::requests), not its applied values: a lever
      * the leader does not declare reads 0 there and must not turn the follower's off. */
     uint32_t fn4_n[kMaxFn4] = {};
@@ -196,19 +210,21 @@ int Engine::pp_check() {
                     "start without it", r.what);
             return RAD_E_UNSUPPORTED;
         }
-    /* The prefix cache adopts blocks and restores snapshots on the leader's say; the follower's
-     * half of that (its KV tier, its snapshot slots) is S8's. */
-    if (cfg_.prefix_cache || cfg_.prefix_cache_mib > 0) {
-        /* tp8 S4 hw (17.11. gpu02 + gpu03): planned without the cache, the leader cut the 16k / 64k cold prompts
-         * 2048 + 4096 ... + 1440 + 1 (the last row alone, a decode-shaped step) where one machine cuts 2048 ... + 1024
-         * + 417, and the texts parted from the published start's at a near tie; the chunk plan stays the cache's. */
-        cfg_.pp_plan_prefix = cfg_.prefix_cache;
-        cfg_.prefix_cache = false;
+    /* tp8 S6: the prefix cache adopts blocks and restores snapshots on the leader's say. A hit's
+     * blocks are the same ids on both nodes (one block table, the leader's), written there by the
+     * steps that wrote them, the copied sources' entries included; each step frame carries the
+     * step's checkpoint restores and saves, which the follower runs on its own state groups and
+     * window pages (pp_ck_list / pp_ck_apply). The host KV tier's copies are not carried: the tier
+     * is off on a pipeline node, so a cached prefix lives in VRAM only. With the cache on, the
+     * prefill chunks are the one-machine start's plan (the --prefix-resume exact grid); S4 hw's
+     * pp_plan_prefix (defect 3: a cache turned off moved the plan and a near tie's bits) still
+     * records the start's value and plans the same. */
+    cfg_.pp_plan_prefix = cfg_.prefix_cache;
+    if (cfg_.prefix_cache_mib > 0) {
         cfg_.prefix_cache_mib = 0;
-        decide("--no-prefix-cache", "prefix caching off",
-               "a two-node pipeline node (tp8 S4): a prefix hit, its tier copies and snapshot restores "
-               "are not yet carried to the follower; its prefill chunks are planned as the cache's "
-               "(--prefix-resume exact grid), so a cold prompt is cut as on one machine");
+        decide("--prefix-cache-mib 0", "the prefix cache's host KV tier off",
+               "a two-node pipeline node (tp8 S6): the tier's block copies are not carried to the "
+               "follower; prefix hits on VRAM blocks and checkpoint restores are");
     }
     PpGlobal& g = pp_g();
     g.nodes = 2;
@@ -428,6 +444,9 @@ int Engine::pp_serve_setup() {
             }
         }
         f.add("kv tokens", std::to_string(tokens));
+        /* tp8 S6: the leader's checkpoint slot ids must exist on the follower (its snapshots of its own
+         * state groups land in the same slots) */
+        f.add("checkpoint slots", std::to_string((long long)kv.checkpoint_slots()));
     }
     f.add("step batch layout", fmt("%016llx", (unsigned long long)sched_.wire_layout()));
     f.add("lanes", std::to_string(n_lanes_));
@@ -440,7 +459,7 @@ int Engine::pp_serve_setup() {
         RAD_ERR("two-node pipeline: the second rendezvous failed: %s", err.c_str());
         return RAD_E_IO;
     }
-    std::vector<std::string> own2 = { "kv tokens" };
+    std::vector<std::string> own2 = { "kv tokens", "checkpoint slots" };
     for (const KVGroupPlan& p : ranks_[0]->kv.plans()) own2.push_back(fmt("kv blocks %d", p.index));
     std::vector<std::string> diff = net::differences(f, theirs, own2);
     /* The carve rule (review F1), the same verdict on both nodes: wherever the follower holds a
@@ -466,6 +485,15 @@ int Engine::pp_serve_setup() {
         else if (lead_n != fol_n)
             RAD_INFO("two-node pipeline: KV group '%s' holds %lld blocks on the leader, %lld on the follower, which "
                      "%s", p.name.c_str(), lead_n, fol_n, fol_holds ? "holds it (more than enough)" : "zeroes it");
+    }
+    {
+        const std::string* a = f.find("checkpoint slots");
+        const std::string* t = theirs.find("checkpoint slots");
+        const long long me = a ? std::atoll(a->c_str()) : 0, them = t ? std::atoll(t->c_str()) : 0;
+        const long long lead_ck = pp_leader() ? me : them, fol_ck = pp_leader() ? them : me;
+        if (cfg_.prefix_cache && fol_ck < lead_ck)
+            diff.push_back(fmt("checkpoint slots: the leader hands out %lld, the follower holds %lld (give both nodes "
+                               "the same --checkpoint-slots)", lead_ck, fol_ck));
     }
     if (!diff.empty()) {
         for (const std::string& d : diff) RAD_ERR("two-node pipeline: the nodes differ: %s", d.c_str());
@@ -564,6 +592,33 @@ int Engine::pp_serve_setup() {
          * layers are the follower's) is taken when the follower takes it (fn4::check). */
         fn4::set_peer_check([this](const std::string& n, int v, std::string* why) { return pp_peer_check(n, v, why); });
     }
+    /* tp8 S6: the KV-copy check (debug). Each copied layer's pool starts zeroed on both nodes, so a
+     * block neither node has written compares equal and the CRC is over the blocks the leader has
+     * handed out. */
+    pp_kv_check_every_ = env_ms("RADIANCE_PP_KV_CHECK", 0);
+    if (pp_kv_check_every_ > 0) {
+        std::vector<std::array<int32_t, 3>> regs;
+        {
+            std::lock_guard<std::mutex> lk(g.kv_mu);
+            regs = g.kv_copies;
+        }
+        std::string names;
+        for (const auto& c : regs)
+            for (auto& rk : ranks_) {
+                const KVGroupPlan* p = rk->kv.plan(c[0]);
+                if (!p || !p->base || p->zero || !p->paged() || c[1] < 0 || c[1] >= p->n_layers) continue;
+                if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                (void)rad_memset_async((char*)p->base + (int64_t)c[1] * p->layer_stride(), 0, p->layer_stride(),
+                                       rk->ctx.stream());
+                (void)rad_stream_sync(rk->ctx.stream());
+                if (rk.get() == ranks_[0].get())
+                    names += fmt("%s%s layer %d", names.empty() ? "" : ", ", p->name.c_str(), (int)c[2]);
+            }
+        if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+        RAD_INFO("two-node pipeline: RADIANCE_PP_KV_CHECK=%d: the copied KV layers (%s) zeroed on every rank; the "
+                 "leader sends their CRC-32C every %d trunk steps and the follower compares its own",
+                 pp_kv_check_every_, names.empty() ? "none on this cut" : names.c_str(), pp_kv_check_every_);
+    }
     RAD_INFO("two-node pipeline: the %s of W(%d,%d) is ready; link %s:%d (%s), crossings X1 %lld / X2 %lld "
              "bytes a row (rings %s / %s, %d lane%s), KV %lld tokens here, %lld on the peer",
              role(cfg_.pp_rank), cfg_.pp_cut_h, cfg_.pp_cut_t, cfg_.pp_peer.c_str(), cfg_.pp_port,
@@ -627,8 +682,17 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
         }
         h.n_clears = (int32_t)pp_clears_.size();
     }
+    static thread_local std::vector<int32_t> ck;
+    ck.clear();
+    if (run) {
+        if (const int cs = pp_ck_list(&ck, lane); cs < 0) {
+            pp_link_->fail(fmt("step %d: its checkpoint restores / saves could not be listed", b->step));
+            return cs;
+        }
+        h.n_ck = (int32_t)ck.size();
+    }
     out->assign(sizeof h + (size_t)h.psk_n * 3 * sizeof(int32_t) + (size_t)h.n_clears * 2 * sizeof(int32_t) +
-                    sizeof w, 0);
+                    (size_t)h.n_ck * sizeof(int32_t) + sizeof w, 0);
     uint8_t* q = out->data();
     std::memcpy(q, &h, sizeof h);
     q += sizeof h;
@@ -644,6 +708,10 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
         const int32_t gs[2] = { pp_clears_[(size_t)i].first, pp_clears_[(size_t)i].second };
         std::memcpy(q, gs, sizeof gs);
         q += sizeof gs;
+    }
+    if (h.n_ck > 0) {
+        std::memcpy(q, ck.data(), (size_t)h.n_ck * sizeof(int32_t));
+        q += (size_t)h.n_ck * sizeof(int32_t);
     }
     std::memcpy(q, &w, sizeof w);
     if (run) pp_clears_.clear();
@@ -665,6 +733,11 @@ int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
         ++pp_builds_shipped_;
     }
     pp_draft_q_.clear();
+    /* tp8 S6 (RADIANCE_PP_KV_CHECK=N): every N trunk steps, the copied KV layers' CRCs after the last
+     * one, before this step's frame (the follower compares them after its own last step) */
+    if (run && pp_kv_check_every_ > 0 && pp_steps_shipped_ > 0 && pp_steps_shipped_ % pp_kv_check_every_ == 0 &&
+        n_lanes_ <= 1)
+        pp_kv_check_send();
     std::vector<uint8_t> head;
     const char* span = nullptr;
     int64_t n = 0;
@@ -724,6 +797,196 @@ void Engine::pp_close(const char* why) {
              (long long)pp_steps_shipped_, (long long)pp_builds_shipped_);
 }
 
+/* ================================================================== tp8 S6: checkpoints, the KV-copy check */
+/* The step's checkpoint restores (kind 0: before the pass) and saves (kind 1: behind it), as the leader's step
+ * loop and save_checkpoints run them: each [kind, checkpoint slot, n state slots, n window rows, lever TI's first
+ * row (-1: none), the sequence's state slots (per stateful group, plans() order), the window block ids], from the
+ * leader's tables. The follower's
+ * groups are the leader's in the same order, so the ids address its own pools and checkpoint store. */
+int Engine::pp_ck_list(std::vector<int32_t>* out, int lane) {
+    out->clear();
+    /* tp8 S5 + S6: the lane's plan (its scheduler's lock is lane 0's: one lock for every lane) */
+    Scheduler& ls = sched_of(lane);
+    const StepPlan& plan = ls.plan();
+    bool any = false;
+    for (const StepEntry& e : plan.e) any = any || e.ckpt_restore >= 0 || (e.ckpt_slot >= 0 && e.ckpt_tok >= 0);
+    if (!any) return RAD_OK;
+    return ls.locked([&]() -> int {
+        std::vector<int32_t> slots, win;
+        for (const StepEntry& e : plan.e)
+            for (int kind = 0; kind < 2; ++kind) {
+                int32_t ck = -1;
+                int64_t pos = 0;
+                if (kind == 0) {
+                    if (e.ckpt_restore < 0) continue;
+                    ck = e.ckpt_restore;
+                    pos = e.ctx_len;
+                } else {
+                    if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
+                    ck = e.ckpt_slot;
+                    pos = e.ctx_len + e.ckpt_tok + 1;
+                }
+                if (!state_slots_of(e.seq, &slots)) continue;
+                win.clear();
+                if (ranks_[0]->kv.has_window_snapshot() && !ranks_[0]->kv.window_rows(e.seq, pos, &win)) return RAD_E_STATE;
+                /* lever TI (save_checkpoints): a snapshot inside the entry's chunk patches the CONV window with the
+                 * plugin's mapped ids of the rows ending at it -- the step row after the snapshot, or -1 */
+                int32_t first = -1;
+                if (kind == 1 && e.ckpt_tok < e.n_tokens - 1) {
+                    int64_t row0 = 0;
+                    for (const StepEntry& o : plan.e) {
+                        if (&o == &e) break;
+                        row0 += o.n_tokens;
+                    }
+                    first = (int32_t)(row0 + e.ckpt_tok + 1);
+                }
+                out->push_back(kind);
+                out->push_back(ck);
+                out->push_back((int32_t)slots.size());
+                out->push_back((int32_t)win.size());
+                out->push_back(first);
+                out->insert(out->end(), slots.begin(), slots.end());
+                out->insert(out->end(), win.begin(), win.end());
+            }
+        return RAD_OK;
+    });
+}
+
+int Engine::pp_ck_apply(const int32_t* q, int32_t n, bool save) {
+    int32_t i = 0;
+    std::vector<int32_t> win;
+    constexpr int32_t H = 5;   /* kind, slot, n state slots, n window rows, the TI patch's first row */
+    while (i + H <= n) {
+        const int32_t kind = q[i], ck = q[i + 1], ns = q[i + 2], nw = q[i + 3], first = q[i + 4];
+        if (ns < 0 || nw < 0 || (int64_t)i + H + ns + nw > n) return RAD_E_STATE;
+        if ((kind == 1) == save) {
+            win.assign(q + i + H + ns, q + i + H + ns + nw);
+            for (auto& rk : ranks_) {
+                if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                int st = save ? rk->kv.checkpoint_save(q + i + H, ns, ck, rk->ctx.stream(), &win)
+                              : rk->kv.checkpoint_restore(q + i + H, ns, ck, rk->ctx.stream(), &win);
+                /* lever TI: the CONV window of a snapshot inside the chunk, from this node's mapped ids */
+                if (st >= 0 && save && first >= 0 && rk->kv.has_conv_state()) {
+                    const void* ids = nullptr;
+                    int ctx = 0;
+                    if (fn4::ckpt_conv_src(rk->index, &ids, &ctx) <= 0 || !ids || ctx <= 0 || first < ctx) {
+                        RAD_ERR("follower: rank %d has no source of the CONV window at row %d for a snapshot inside "
+                                "the chunk", rk->index, (int)first);
+                        st = RAD_E_STATE;
+                    } else {
+                        st = rk->kv.checkpoint_patch_conv(ck, (const char*)ids + (int64_t)(first - ctx) * 4, ctx,
+                                                          rk->ctx.stream());
+                    }
+                }
+                if (st < 0) {
+                    RAD_ERR("follower: rank %d could not %s checkpoint slot %d: %s", rk->index,
+                            save ? "save into" : "restore from", (int)ck, rad_strerror(st));
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                    return st;
+                }
+            }
+            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+        }
+        i += H + ns + nw;
+    }
+    return i == n ? RAD_OK : RAD_E_STATE;
+}
+
+/* CRC-32C of a copied layer's first `top` blocks on rank 0 (its stream drained first). */
+int Engine::pp_kv_crc(int32_t group, int32_t slot, int64_t top, uint32_t* crc, int64_t* bytes) {
+    const KVGroupPlan* p = ranks_[0]->kv.plan(group);
+    if (!p || !p->base || p->zero || !p->paged() || slot < 0 || slot >= p->n_layers) return RAD_E_STATE;
+    const int64_t per = p->layer_bytes_per_block(), nb = std::max<int64_t>(0, std::min<int64_t>(top, p->pool_blocks()));
+    const char* base = (const char*)p->base + (int64_t)slot * p->layer_stride();
+    *bytes = nb * per;
+    RadStream s = ranks_[0]->ctx.stream();
+    if (rad_stream_sync(s) < 0) return RAD_E_DEVICE;
+    std::vector<char> buf((size_t)std::min<int64_t>(std::max<int64_t>(*bytes, 1), 64ll << 20));
+    uint32_t c = 0;
+    /* RADIANCE_PP_KV_CHECK_DUMP=dir: each node also writes the bytes it hashed (debug of the debug) */
+    const char* dd = std::getenv("RADIANCE_PP_KV_CHECK_DUMP");
+    FILE* df = nullptr;
+    if (dd && *dd) df = std::fopen(fmt("%s/kvcheck-%s-g%d-s%d-%lld.bin", dd, role(cfg_.pp_rank), (int)group, (int)slot,
+                                       (long long)pp_kv_checks_).c_str(), "wb");
+    for (int64_t off = 0; off < *bytes; off += (int64_t)buf.size()) {
+        const int64_t k = std::min<int64_t>((int64_t)buf.size(), *bytes - off);
+        if (rad_memcpy_async(buf.data(), base + off, k, s) < 0 || rad_stream_sync(s) < 0) {
+            if (df) std::fclose(df);
+            return RAD_E_DEVICE;
+        }
+        c = net::crc32c(buf.data(), (size_t)k, c);
+        if (df) std::fwrite(buf.data(), 1, (size_t)k, df);
+    }
+    if (df) std::fclose(df);
+    *crc = c;
+    return RAD_OK;
+}
+
+/* The leader: [n, then per copied layer: group, layer, blocks, crc, bytes] after trunk step pp_steps_shipped_. */
+void Engine::pp_kv_check_send() {
+    std::vector<std::array<int32_t, 3>> regs;
+    {
+        PpGlobal& g = pp_g();
+        std::lock_guard<std::mutex> lk(g.kv_mu);
+        regs = g.kv_copies;
+    }
+    std::vector<int64_t> body(1, 0);
+    for (const auto& c : regs) {
+        const int64_t top = ranks_[0]->kv.held_top_blocks(c[0]);
+        uint32_t crc = 0;
+        int64_t bytes = 0;
+        if (pp_kv_crc(c[0], c[1], top, &crc, &bytes) < 0) continue;
+        body.insert(body.end(), { (int64_t)c[0], (int64_t)c[2], top, (int64_t)crc, bytes });
+        ++body[0];
+    }
+    if (pp_link_->send(net::kKvCheck, (uint64_t)pp_steps_shipped_, 0, body.data(), (int64_t)(body.size() * 8)) < 0)
+        RAD_WARN("two-node pipeline: the KV-copy check after step %lld did not go out", (long long)pp_steps_shipped_);
+    ++pp_kv_checks_;
+}
+
+/* The follower: its own CRC of each layer the leader named, over the same blocks, after its own last step. */
+int Engine::pp_kv_check_recv(const std::vector<uint8_t>& body, uint64_t step) {
+    if (body.size() < 8 || body.size() % 8) return RAD_OK;
+    std::vector<int64_t> v(body.size() / 8);
+    std::memcpy(v.data(), body.data(), body.size());
+    std::vector<std::array<int32_t, 3>> regs;
+    {
+        PpGlobal& g = pp_g();
+        std::lock_guard<std::mutex> lk(g.kv_mu);
+        regs = g.kv_copies;
+    }
+    const int64_t n = v[0];
+    for (int64_t k = 0; k < n && (size_t)(1 + 5 * k + 4) < v.size(); ++k) {
+        const int64_t* e = &v[(size_t)(1 + 5 * k)];
+        const int32_t grp = (int32_t)e[0], layer = (int32_t)e[1];
+        int32_t slot = -1;
+        for (const auto& c : regs)
+            if (c[0] == grp && c[2] == layer) slot = c[1];
+        uint32_t crc = 0;
+        int64_t bytes = 0;
+        const KVGroupPlan* p = ranks_[0]->kv.plan(grp);
+        if (slot < 0 || pp_kv_crc(grp, slot, e[2], &crc, &bytes) < 0) {
+            ++pp_kv_bad_;
+            RAD_ERR("follower: KV-copy check after trunk step %llu: %s layer %d is not held here",
+                    (unsigned long long)step, p ? p->name.c_str() : "?", (int)layer);
+            continue;
+        }
+        ++pp_kv_checks_;
+        if ((uint32_t)e[3] == crc && e[4] == bytes) {
+            RAD_INFO("follower: KV-copy check after trunk step %llu: %s layer %d, %lld blocks (%s): CRC-32C %08x on "
+                     "both nodes (%lld checks, %lld differ)", (unsigned long long)step, p->name.c_str(), (int)layer,
+                     (long long)e[2], humanb(bytes).c_str(), crc, (long long)pp_kv_checks_, (long long)pp_kv_bad_);
+        } else {
+            ++pp_kv_bad_;
+            RAD_ERR("follower: KV-copy check after trunk step %llu: %s layer %d, %lld blocks: the leader's CRC-32C %08x "
+                    "(%lld bytes), this node's %08x (%lld bytes) -- the copy is NOT the owner's bytes (%lld checks, %lld "
+                    "differ)", (unsigned long long)step, p->name.c_str(), (int)layer, (long long)e[2], (unsigned)e[3],
+                    (long long)e[4], crc, (long long)bytes, (long long)pp_kv_checks_, (long long)pp_kv_bad_);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== the follower */
 /* Its applied switch values, to the leader (GET /admin/fn4's "peer"). */
 void Engine::pp_send_fn4_state() {
@@ -737,7 +1000,7 @@ int Engine::follower_loop() {
     if (rad_dev_set(ranks_[0]->device) < 0) RAD_ERR("follower loop: could not bind rank 0's device");
     rad::StallWatch watch("follower", 20000);
     int64_t steps = 0, builds = 0;
-    std::vector<int32_t> ahead, rows, flags, clears;
+    std::vector<int32_t> ahead, rows, flags, clears, ckw;
     pp_send_fn4_state();
     while (!stopping_.load(std::memory_order_acquire)) {
         watch.progress();
@@ -777,6 +1040,10 @@ int Engine::follower_loop() {
                 return fail_loop(RAD_E_IO);
             continue;
         }
+        if (m.h.kind == net::kKvCheck) {   /* tp8 S6 (debug): the leader's CRCs after its last trunk step */
+            if (pp_kv_check_recv(m.body, m.h.seq) < 0) return fail_loop(RAD_E_STATE);
+            continue;
+        }
         if (m.h.kind != net::kStep) {
             pp_link_->fail(fmt("the follower got a %s frame while serving", net::frame_name(m.h.kind)));
             return fail_loop(RAD_E_IO);
@@ -787,8 +1054,10 @@ int Engine::follower_loop() {
         std::memcpy(&h, m.body.data(), sizeof h);
         const size_t psk_bytes = (size_t)std::max(0, h.psk_n) * 3 * sizeof(int32_t);
         const size_t clr_bytes = (size_t)std::max(0, h.n_clears) * 2 * sizeof(int32_t);
+        const size_t ck_bytes = (size_t)std::max(0, h.n_ck) * sizeof(int32_t);
         if (h.magic != kStepMagic || h.psk_n < 0 || h.n_fn4 < 0 || h.n_fn4 > kMaxFn4 || h.n_clears < 0 ||
-            h.n_clears > kMaxClears || m.body.size() < sizeof h + psk_bytes + clr_bytes + sizeof w) {
+            h.n_clears > kMaxClears || h.n_ck < 0 ||
+            m.body.size() < sizeof h + psk_bytes + clr_bytes + ck_bytes + sizeof w) {
             pp_link_->fail(fmt("step frame %llu: a damaged header", (unsigned long long)m.h.seq));
             return fail_loop(RAD_E_IO);
         }
@@ -803,6 +1072,8 @@ int Engine::follower_loop() {
         }
         clears.resize((size_t)h.n_clears * 2);
         if (h.n_clears > 0) { std::memcpy(clears.data(), q, clr_bytes); q += clr_bytes; }
+        ckw.resize((size_t)h.n_ck);
+        if (h.n_ck > 0) { std::memcpy(ckw.data(), q, ck_bytes); q += ck_bytes; }
         std::memcpy(&w, q, sizeof w);
         q += sizeof w;
         const int64_t span_bytes = (int64_t)(m.body.size() - (size_t)(q - m.body.data()));
@@ -856,6 +1127,12 @@ int Engine::follower_loop() {
             if (l >= 0) end = l;
         }
         for (auto& r : ranks_) r->stager.set_layer_end(end);
+        /* tp8 S6: the prefix hits' restores into this node's state groups and window pages, before the
+         * pass, as the leader's step loop does on its own */
+        if (h.n_ck > 0 && (st = pp_ck_apply(ckw.data(), h.n_ck, false)) < 0) {
+            pp_link_->fail(fmt("the follower could not restore step %d's checkpoints: %s", h.step, rad_strerror(st)));
+            return fail_loop(st);
+        }
         issue_sched_.store(&ls, std::memory_order_release);
         pp_set_pass(h.lane, RAD_PP_PART_WHOLE);
         issue_what_.store(kIssueFollower, std::memory_order_release);
@@ -872,6 +1149,11 @@ int Engine::follower_loop() {
         if (st < 0) {
             RAD_ERR("follower step %d failed: %s -- the pipeline cannot continue", h.step, rad_strerror(st));
             pp_link_->fail(fmt("the follower's step %d failed: %s", h.step, rad_strerror(st)));
+            return fail_loop(st);
+        }
+        /* tp8 S6: the step's checkpoint saves, behind its pass on every rank's stream (save_checkpoints) */
+        if (h.n_ck > 0 && (st = pp_ck_apply(ckw.data(), h.n_ck, true)) < 0) {
+            pp_link_->fail(fmt("the follower could not save step %d's checkpoints: %s", h.step, rad_strerror(st)));
             return fail_loop(st);
         }
         /* The host backend runs every launch on this thread's rank; a card's stream is drained by the

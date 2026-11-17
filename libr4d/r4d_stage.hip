@@ -49,7 +49,9 @@ constexpr int kMaxBlocks = 512;
 
 struct Parts {
     uint64_t p[RAD_PP_MAX_PARTS];      /* device addresses of the parts */
-    uint64_t bytes[RAD_PP_MAX_PARTS];  /* each a multiple of 16 (checked on the host) */
+    uint64_t bytes[RAD_PP_MAX_PARTS];  /* each a multiple of 4 (checked on the host) */
+    uint32_t w16;                      /* bit k: part k is 16-byte words at a 16-byte address (else 4-byte words) */
+    uint64_t layout;                   /* rad_pp_layout of the parts' bytes: the trailer's second word */
     uint64_t off[RAD_PP_MAX_PARTS];    /* each part's offset in the payload */
     uint64_t total;                    /* aligned payload bytes */
     int32_t  n;
@@ -84,6 +86,23 @@ __device__ bool wait_ring(RadPpRing* r, uint64_t ticks, Cond cond) {
     }
 }
 
+/* One part, grid-strided: 16-byte words where the part is in them at a 16-byte address (the residual stream's bf16 /
+ * f32 rows), else 4-byte words (tp8 S6: a compressor's i32 pages, the keep words, rows of any count). The ring side is
+ * always 256-byte aligned. */
+__device__ inline void copy_part(const char* src, char* dst, uint64_t bytes, uint32_t w16, uint64_t stride) {
+    if (w16) {
+        const uint4* s = reinterpret_cast<const uint4*>(src);
+        uint4* d = reinterpret_cast<uint4*>(dst);
+        const uint64_t words = bytes / 16;
+        for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < words; i += stride) d[i] = s[i];
+        return;
+    }
+    const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
+    uint32_t* d = reinterpret_cast<uint32_t*>(dst);
+    const uint64_t words = bytes / 4;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < words; i += stride) d[i] = s[i];
+}
+
 __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Parts P, uint32_t* counter) {
     __shared__ int ok;
     if (threadIdx.x == 0) {
@@ -94,13 +113,8 @@ __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Part
     if (ok) {
         char* dst = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
         const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
-        for (int k = 0; k < P.n; ++k) {
-            const uint4* s = reinterpret_cast<const uint4*>(P.p[k]);
-            uint4* d = reinterpret_cast<uint4*>(dst + P.off[k]);
-            const uint64_t words = P.bytes[k] / 16;
-            for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < words; i += stride)
-                d[i] = s[i];
-        }
+        for (int k = 0; k < P.n; ++k) copy_part(reinterpret_cast<const char*>(P.p[k]), dst + P.off[k], P.bytes[k],
+                                                (P.w16 >> k) & 1u, stride);
     }
     __threadfence_system();
     __syncthreads();
@@ -111,6 +125,8 @@ __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Part
             if (ok) {
                 /* review F6: the payload's number in its trailer, before `ready` */
                 const uint64_t seq = ld_sys(&r->ready) + 1;
+                st_sys(reinterpret_cast<volatile uint64_t*>(reinterpret_cast<char*>(r) + RAD_PP_RING_HDR + P.total + 8),
+                       P.layout);   /* tp8 S6: the layout word, before the number */
                 st_sys(reinterpret_cast<volatile uint64_t*>(reinterpret_cast<char*>(r) + RAD_PP_RING_HDR + P.total), seq);
                 r->rows = P.rows;
                 r->parts = (uint64_t)P.n;
@@ -133,6 +149,7 @@ __global__ void __launch_bounds__(kThreads) stage_recv_kernel(RadPpRing* r, Part
             st_sys(&r->abort, 4ull);
             ok = 0;
         }
+
         /* review F6: the payload waited for, not a stale one of the same shape (its trailer, one
          * system-scope load after the acquire of `landed`) */
         if (ok && ld_sys(reinterpret_cast<const volatile uint64_t*>(reinterpret_cast<const char*>(r) + RAD_PP_RING_HDR +
@@ -140,18 +157,19 @@ __global__ void __launch_bounds__(kThreads) stage_recv_kernel(RadPpRing* r, Part
             st_sys(&r->abort, 5ull);
             ok = 0;
         }
+        /* tp8 S6: parts carry their own rows, so the sender's layout word (each part's bytes) must be this node's */
+        if (ok && ld_sys(reinterpret_cast<const volatile uint64_t*>(reinterpret_cast<const char*>(r) + RAD_PP_RING_HDR +
+                                                                     P.total + 8)) != P.layout) {
+            st_sys(&r->abort, 4ull);
+            ok = 0;
+        }
     }
     __syncthreads();
     if (ok) {
         const char* src = reinterpret_cast<const char*>(r) + RAD_PP_RING_HDR;
         const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
-        for (int k = 0; k < P.n; ++k) {
-            const uint4* s = reinterpret_cast<const uint4*>(src + P.off[k]);
-            uint4* d = reinterpret_cast<uint4*>(P.p[k]);
-            const uint64_t words = P.bytes[k] / 16;
-            for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < words; i += stride)
-                d[i] = s[i];
-        }
+        for (int k = 0; k < P.n; ++k) copy_part(src + P.off[k], reinterpret_cast<char*>(P.p[k]), P.bytes[k],
+                                                (P.w16 >> k) & 1u, stride);
     }
     __threadfence();
     __syncthreads();
@@ -200,15 +218,16 @@ uint64_t ticks_per_ms(int dev) {
 int collect(const RadArgs* a, const RadPpRing* r, Parts* P) {
     P->n = 0;
     P->total = 0;
+    P->w16 = 0;
     int64_t rows = -1;
     for (int i = 1; i < a->n_t && i <= RAD_PP_MAX_PARTS; ++i) {
         const RadTensor* t = r4d_opt(a, i);
         if (!t) break;
         if (t->rank < 1 || !r4d_contig(t)) return RAD_E_STRIDE;
-        if (rows < 0) rows = t->shape[0];
-        else if (t->shape[0] != rows) return RAD_E_SHAPE;
+        if (rows < 0) rows = t->shape[0];   /* part 0's: tp8 S6 parts carry their own rows */
         const uint64_t b = (uint64_t)rad_dtype_bytes(t->dtype, r4d_numel(t));
-        if (b % 16 || (r4d_addr(t) & 15)) return RAD_E_ALIGN;
+        if (b % 4 || (r4d_addr(t) & 3)) return RAD_E_ALIGN;
+        if (b % 16 == 0 && (r4d_addr(t) & 15) == 0) P->w16 |= 1u << P->n;
         P->p[P->n] = (uint64_t)r4d_addr(t);
         P->bytes[P->n] = b;
         P->off[P->n] = P->total;
@@ -216,6 +235,7 @@ int collect(const RadArgs* a, const RadPpRing* r, Parts* P) {
         ++P->n;
     }
     if (P->n == 0 || rows < 0) return RAD_E_SHAPE;
+    P->layout = rad_pp_layout(P->bytes, P->n);
     if (P->total + RAD_PP_TRAILER > r->cap) return RAD_E_FULL;
     P->rows = (uint64_t)rows;
     return RAD_OK;
@@ -237,7 +257,7 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     P.ticks = r->deadline_ms ? r->deadline_ms * ticks_per_ms(dev) : 0;
     uint32_t* counter = counter_for(dev, r, send ? 0 : 1);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
-    const uint64_t words = P.total / 16;
+    const uint64_t words = P.total / (P.w16 == (1u << P.n) - 1u ? 16 : 4);
     uint32_t blocks = (uint32_t)((words + kThreads * 4 - 1) / (kThreads * 4));
     if (blocks < 1) blocks = 1;
     if (blocks > kMaxBlocks) blocks = kMaxBlocks;

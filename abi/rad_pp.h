@@ -34,8 +34,12 @@ extern "C" {
 /* The payload starts this far into the ring, so the header's counters own their cache lines. */
 #define RAD_PP_RING_HDR   4096
 #define RAD_PP_MAX_RANKS  8
-/* The most buffers one crossing carries (stage_send's x0..x7). */
-#define RAD_PP_MAX_PARTS  8
+/* The most buffers one crossing carries (stage_send's x0..x11). tp8 S6: a crossing of a general cut
+ * W(h, t) carries the residual stream's five parts and the receiving layers' reads of the other node
+ * (a kv source's new entries and their pages, the selections, the keep words): up to ten. Each part
+ * has its own rows (the residual's are the step's, a compressor's entries its work rows); the
+ * header's `rows` is part 0's. */
+#define RAD_PP_MAX_PARTS  12
 /* Each part of a payload starts on this boundary. */
 #define RAD_PP_PART_ALIGN 256
 /* A payload ends in a trailer of this many bytes at the aligned end of its parts: its first word is
@@ -43,6 +47,15 @@ extern "C" {
  * waits for, so a stale or torn payload whose header happens to match is refused (review F6).
  * `bytes` counts it; a ring holds it (the core sizes rings for it). */
 #define RAD_PP_TRAILER    64
+/* The trailer's second word (tp8 S6): the payload's layout, rad_pp_layout over its parts' bytes, so a
+ * receiver whose parts differ in size from the sender's (two nodes out of step) is refused even where
+ * the totals agree. The link moves the trailer with the payload; it carries no per-part sizes. */
+static inline uint64_t rad_pp_layout(const uint64_t* bytes, int n) {
+    uint64_t h = 1469598103934665603ull;
+    int k;
+    for (k = 0; k < n; ++k) h = (h ^ bytes[k]) * 1099511628211ull;
+    return h ^ (uint64_t)n;
+}
 
 enum { RAD_PP_X1 = 0, RAD_PP_X2 = 1, RAD_PP_N_RINGS = 2 };
 
@@ -130,6 +143,22 @@ int rad_pp_info(RadPpInfo* out);
 __attribute__((weak))
 #endif
 void rad_pp_crossing(int ring, int64_t row_bytes, int parts);
+
+/* tp8 S6: the plugin names, at declare (rank 0's real declare; repeats are ignored), each KV cache
+ * layer both nodes hold of one source -- the owner its own, the receiver the copy a crossing fills:
+ * `group` (the rad_kvgroup), `slot` (the layer's place among the group's bound layers on THIS node, in
+ * ascending layer order: the builder sorts them)
+ * and `layer` (the model layer, which names it on both). RADIANCE_PP_KV_CHECK=N then has the two
+ * nodes compare a CRC-32C of that layer's blocks every N trunk steps (debug). Weak, like
+ * rad_pp_info. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_kv_copy(int32_t group, int32_t slot, int32_t layer);
+
+static inline void rad_pp_declare_kv_copy(int32_t group, int32_t slot, int32_t layer) {
+    if (rad_pp_kv_copy) rad_pp_kv_copy(group, slot, layer);
+}
 
 /* The node's pipeline as the plugin should act on it: nodes 1 when the engine has no pipeline or
  * predates it. */

@@ -211,6 +211,130 @@ inline std::vector<Copy> copies(const std::vector<Dep>& deps) {
     return c;
 }
 
+/* ---------------------------------------------------------------- tp8 S6: the crossings of a general cut W(h, t)
+ *
+ * The leader holds [0, h) and [t, n), the follower [h, t). X1 (leader -> follower) enters the follower's layer h, X2
+ * (follower -> leader) the leader's layer t. A crossing carries what the receiving node's layers read that the sending
+ * node computed: the residual stream at the boundary (the inputs of the boundary op, as S4's X2; at h = 0 X1 carries the
+ * embedding's output instead), and the receiver's needs() -- a kv source's new entries (the receiver keeps a copy of that
+ * source's cache, written at the same pages with the same store op), the selections of the last index layer before the
+ * boundary, the candidate layer's keep words. Each compressing layer reads the latest kv / index source at or below it, so
+ * a crossing carries at most one source's entries, one layer's selections and one keep: the receiving layers past the
+ * boundary read the latest ones below it until the receiver's own next source / index layer. The DSpark taps must be the
+ * leader's own (t at or below the first tap): the drafter is the leader's. */
+struct Crossing {
+    int ring = 0;            /* 0 X1, 1 X2 */
+    int at = -1;             /* the receiver's first layer after the crossing: h (X1) or t (X2) */
+    bool residual = true;    /* the boundary op's inputs; false only for X1 at h == 0 (the embedding's output) */
+    int sel = -1;            /* the index layer whose selections cross, -1 none */
+    int keep = -1;           /* the candidate layer whose keep words cross, -1 none */
+    int src = -1;            /* the kv source whose new entries cross (the receiver's copy), -1 none */
+    bool latent = false;     /* ... its compressed latent */
+    bool index = false;      /* ... its index keys */
+};
+
+/* The two crossings of W(h, t) on a model of g.n_layer layers; 0, or -1 with the reason in *err (a cut the geometry does
+ * not allow: outside the model, the leader without the last layer, a tap on the follower, a crossing that would carry two
+ * sources' entries / two layers' selections). */
+inline int crossings(const Geo& g, int h, int t, Crossing out[2], std::string* err) {
+    const int n = g.n_layer;
+    if (h < 0 || t <= h || t >= n) {
+        *err = "W(" + std::to_string(h) + "," + std::to_string(t) + ") is not 0 <= h < t < " + std::to_string(n) +
+               " (the follower holds [h, t), the leader every other layer and the last one)";
+        return -1;
+    }
+    Spec fol, lead;
+    std::string e;
+    const std::string fs = std::to_string(h) + ":" + std::to_string(t);
+    const std::string ls = (h > 0 ? "0:" + std::to_string(h) + "," : std::string()) + std::to_string(t) + ":" + std::to_string(n);
+    if (parse(fs.c_str(), "strict", n, &fol, &e) < 0 || parse(ls.c_str(), "strict", n, &lead, &e) < 0) {
+        *err = e;
+        return -1;
+    }
+    const std::vector<Dep> df = needs(g, fol, false), dl = needs(g, lead, true);
+    for (int k = 0; k < 2; ++k) {
+        Crossing& c = out[k];
+        c = Crossing{};
+        c.ring = k;
+        c.at = k == 0 ? h : t;
+        c.residual = !(k == 0 && h == 0);
+        for (const Dep& d : k == 0 ? df : dl) {
+            if (d.kind == Need::Tap) {
+                *err = "the DSpark drafter reads layer " + std::to_string(d.from) + "'s input, which W(" + std::to_string(h) +
+                       "," + std::to_string(t) + ") puts on the follower (the drafter is the leader's: t <= the first tap)";
+                return -1;
+            }
+            int* slot = d.kind == Need::Sel ? &c.sel : d.kind == Need::Keep ? &c.keep : &c.src;
+            if (*slot >= 0 && *slot != d.from) {
+                *err = "X" + std::to_string(k + 1) + " of W(" + std::to_string(h) + "," + std::to_string(t) + ") would carry " +
+                       need_name(d.kind) + " of layers " + std::to_string(*slot) + " and " + std::to_string(d.from);
+                return -1;
+            }
+            *slot = d.from;
+            if (d.kind == Need::Latent) c.latent = true;
+            if (d.kind == Need::IndexKeys) c.index = true;
+        }
+    }
+    return 0;
+}
+
+/* tp8 S5 + S6: with lanes the leader issues a lane step's pass in two parts -- its head (layers [0, h), X1) and its tail
+ * (X2, layers [t, n)) -- with other lanes' parts between them, which rewrite the step's activations. What its tail reads
+ * of its head must then be kv / state (paged per sequence) or cross in X2: a layer >= t that reads the selections of an
+ * index layer < h, or an index layer >= t that reads the keep words of a candidate layer < h, would read another lane's.
+ * Those reads, in layer order (empty: lanes may run W(h, t)); at h = 0 there are none. */
+inline std::vector<Dep> head_tail_reads(const Geo& g, int h, int t) {
+    std::vector<Dep> v;
+    if (h <= 0) return v;
+    for (int l = std::max(t, 0); l < g.n_layer; ++l) {
+        if (g.ratio[(size_t)l] <= 0) continue;
+        if (g.is_idx[(size_t)l]) {
+            if (g.cand >= 0 && g.cand < h && g.cand < l && g.ratio[(size_t)g.cand] == g.ratio[(size_t)l])
+                v.push_back({ l, g.cand, Need::Keep });
+        } else if (g.idx_of[(size_t)l] >= 0 && g.idx_of[(size_t)l] < h) {
+            v.push_back({ l, g.idx_of[(size_t)l], Need::Sel });
+        }
+    }
+    return v;
+}
+
+/* Which source layers a node binds to its compressed / index / tail groups (S6): a source it holds (its own stores), or
+ * the source a crossing into it copies (the copy store, latent and / or index keys). A group none of the node's layers
+ * reads is bound at its first source and zeroed (no pool carved: S4's rule). `bytes_*`: the bytes a token of one bound
+ * layer (deepseek41: latent / index entry bytes over the ratio). */
+struct Binds {
+    std::vector<char> comp, index, tail;   /* per layer: bound */
+    std::vector<char> comp_zero_r, index_zero_r;   /* per ratio (index = ratio): every bound layer of it is unread here */
+};
+inline Binds binds(const Geo& g, const Spec& s, const Crossing* into /* the crossing into this node, or null */) {
+    const int n = g.n_layer;
+    Binds b;
+    b.comp.assign((size_t)n, 0);
+    b.index.assign((size_t)n, 0);
+    b.tail.assign((size_t)n, 0);
+    int64_t rmax = 0;
+    for (int l = 0; l < n; ++l) rmax = std::max<int64_t>(rmax, g.ratio[(size_t)l]);
+    b.comp_zero_r.assign((size_t)rmax + 1, 1);
+    b.index_zero_r.assign((size_t)rmax + 1, 1);
+    for (int l = 0; l < n; ++l) {
+        if (!g.is_src[(size_t)l] || g.ratio[(size_t)l] <= 0) continue;
+        const bool own = s.held(l);
+        const bool cpl = into && into->src == l && into->latent, cpi = into && into->src == l && into->index;
+        b.comp[(size_t)l] = own || cpl;
+        b.index[(size_t)l] = own || cpi;
+        b.tail[(size_t)l] = own && g.ratio[(size_t)l] > 1;
+    }
+    /* a ratio's group is read here iff a held compressing layer of that ratio exists (every compressing layer reads its
+     * source's latent; an index layer its source's index keys) */
+    for (int l = 0; l < n; ++l) {
+        if (!s.held(l) || g.ratio[(size_t)l] <= 0) continue;
+        b.comp_zero_r[(size_t)g.ratio[(size_t)l]] = 0;
+        /* read by a held index layer, or written by a held source's index-key store */
+        if (g.is_idx[(size_t)l] || g.is_src[(size_t)l]) b.index_zero_r[(size_t)g.ratio[(size_t)l]] = 0;
+    }
+    return b;
+}
+
 /* "layers 10..13 read layer 8's compressed latent; ..." -- one clause a (kind, from) pair, in first-seen order, with the
  * span of the held layers that read it. */
 inline std::string describe(const std::vector<Dep>& deps) {
