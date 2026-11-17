@@ -57,6 +57,14 @@ public:
     void set_pick_rr(bool on) { pick_rr_ = on; }
     /* The lane holding request `id`, or null. */
     Scheduler* owner(uint64_t id) const;
+    /* tp8 dev D7: whether lane `l` has prompt rows to plan (a waiting request, or a running one whose prompt is not all
+     * computed or lent): its next step would carry prefill rows (MIXED / prefill), not decode rows alone. Takes the lock. */
+    bool prefill_pending(int l) const;
+    /* ... and how many pieces other lanes lent it wait in its inbox (it must plan them in the promised order). */
+    size_t inbox_n(int l) const {
+        std::lock_guard<std::mutex> lk(*mu_);
+        return l >= 0 && l < (int)inbox_.size() ? inbox_[(size_t)l].size() : 0;
+    }
     /* Every lane's published copy (Scheduler::observed_metrics), summed: counters, queues and rates
      * add (the lanes run at once); the KV pool is one, so its groups are lane 0's. */
     SchedMetrics observed_metrics() const;
