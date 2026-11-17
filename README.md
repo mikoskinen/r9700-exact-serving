@@ -38,9 +38,9 @@ voltage offset, and the everyday setting caps each card at 210 W with a -50 mV v
 | 16 requests | 346 | 319 | 1,123 | 1,075 |
 | 24 requests | 375 | 342 | 1,249 | 1,183 |
 | 32 requests | 415 | 378 | 1,345 | 1,284 |
-| Prefill 16k | 4,480 | 4,290 | 9,420 | 9,090 |
-| Prefill 64k | 5,980 | 5,480 | 9,540 | 9,220 |
-| Prefill 128k | 6,330 | 5,640 | 9,400 | 9,090 |
+| Prefill 16k | 4,480 | 4,640 | 9,420 | 9,090 |
+| Prefill 64k | 5,980 | 5,800 | 9,540 | 9,220 |
+| Prefill 128k | 6,330 | 5,810 | 9,400 | 9,090 |
 
 ## Run it
 
@@ -219,7 +219,7 @@ docker run -d --name deepseek --init --network host \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/ds41-exl3:/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
   --env-file run/deepseek/deepseek.env \
-  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-5f60dee1 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-d3874235 \
   --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --vision-tower-placement ram \
   --served-model-name deepseek-v4.1-flash --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact \
   --placement expert_tiered --host-pool-mib 19456 --ngram-placement ram=/ngram \

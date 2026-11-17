@@ -42,10 +42,10 @@ aggregate tok/s counts their generated tokens.
 | mb c16 | 345.60 tok/s | 318.70 tok/s | (none) | fixed prompts, gens window of 1, mean of 2 blocks |
 | mb c24 | 374.75 tok/s | 342.45 tok/s | (none) | the same |
 | mb c32 | 414.70 tok/s | 378.05 tok/s | (none) | the same |
-| prefill 16k (15,777 tokens) | 4,482 tok/s, TTFT 3.52 s | 4,287 tok/s, TTFT 3.68 s | (none) | one request after a prefix-cache reset, prompt tokens divided by the TTFT |
-| prefill 64k (65,650 tokens) | 5,985 tok/s, TTFT 10.97 s | 5,485 tok/s, TTFT 11.97 s | (none) | the same |
-| prefill 128k (131,137 tokens) | 6,329 tok/s, TTFT 20.72 s | 5,635 tok/s, TTFT 23.27 s | (none) | the same |
-| 136k-token cold prefill (137,135 tokens) | 6,270 tok/s, TTFT 21.87 s | 5,728 tok/s, TTFT 23.94 s | >= 4000 tok/s, TTFT <= 35 s | the same |
+| prefill 16k (15,777 tokens) | 4,482 tok/s, TTFT 3.52 s | 4,640 tok/s, TTFT 3.40 s | (none) | one request after a prefix-cache reset, prompt tokens divided by the TTFT |
+| prefill 64k (65,650 tokens) | 5,985 tok/s, TTFT 10.97 s | 5,799 tok/s, TTFT 11.32 s | (none) | the same |
+| prefill 128k (131,137 tokens) | 6,329 tok/s, TTFT 20.72 s | 5,808 tok/s, TTFT 22.58 s | (none) | the same |
+| 136k-token cold prefill (137,135 tokens) | 6,270 tok/s, TTFT 21.87 s | 5,860 tok/s, TTFT 23.40 s | >= 4000 tok/s, TTFT <= 35 s | the same |
 
 Every target in the table is met at both settings [S16]. The README rounds decode to whole tok/s and
 prefill to the nearest 10 tok/s.
@@ -306,7 +306,7 @@ its own history.
 
 | branch prefix | upstream | contents |
 |---|---|---|
-| `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 135 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit 5f60dee1, which `deepseek/current` contains. |
+| `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 136 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit d3874235, which `deepseek/current` contains. |
 | `qwen/` | radiance main (451b136) | 28 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. The README's Qwen images are built from engine commits 4f74a8fa (the results) and 30903db6 (the Claude Code commands), which `qwen/current` contains. |
 | `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 29 branches of EXL3 kernel work for both lines. The README's DeepSeek image uses EXL3 commit 4a67be32, which `exl3/current` contains, and both Qwen images use `exl3/fn4-dual`. |
 
