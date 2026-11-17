@@ -1616,12 +1616,24 @@ TEST(async_crossings_serve_one_process_tokens_and_plan) {
         if (all) *all = n;
         return a;
     };
-    const std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_PP_SEND_ASYNC=32" });
-    struct Arm { const char* lanes; const char* cut; };
-    for (const Arm a : { Arm{ "2", "0,2" }, Arm{ "2", "1,3" }, Arm{ "3", "1,3" } }) {
+    /* tp8 loop P10b: "RADIANCE_PP_RECV_ASYNC=32 -- A of this node's B X1 receives (all ranks) came through" */
+    auto recv_of = [](const std::string& log) {
+        const size_t at = log.rfind("receives (all ranks) came through the staging buffers");
+        if (at == std::string::npos) return -1ll;
+        const size_t b = log.rfind(" -- ", at);
+        long long a = -1, n = -1;
+        if (b == std::string::npos || std::sscanf(log.c_str() + b, " -- %lld of this node's %lld", &a, &n) != 2) return -1ll;
+        return a;
+    };
+    struct Arm { const char* lanes; const char* cut; bool send, recv; };
+    for (const Arm a : { Arm{ "2", "0,2", true, false }, Arm{ "2", "1,3", true, true }, Arm{ "3", "1,3", false, true },
+                         Arm{ "3", "0,3", true, true } }) {
+        std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1" });
+        if (a.send) env.push_back("RADIANCE_PP_SEND_ASYNC=32");
+        if (a.recv) env.push_back("RADIANCE_PP_RECV_ASYNC=32");
         const std::vector<std::string> shape = { "--max-num-seqs", "6", "--pp-lanes", a.lanes };
         std::vector<int32_t> got;
-        long long lall = 0, fall = 0, la = -1, fa = -1;
+        long long lall = 0, fall = 0, la = -1, fa = -1, lr = -1, fr = -1;
         bool plan_ok = false;
         {
             Serving sv;
@@ -1634,8 +1646,12 @@ TEST(async_crossings_serve_one_process_tokens_and_plan) {
             plan_ok = chunks_of(llog) == ref_plan;
             la = async_of(llog, &lall);
             fa = async_of(flog, &fall);
-            CHECK(llog.find("RADIANCE_PP_SEND_ASYNC=32 -- a X1 payload of >= 32 rows") != std::string::npos);
-            CHECK(flog.find("RADIANCE_PP_SEND_ASYNC=32 -- a X2 payload of >= 32 rows") != std::string::npos);
+            lr = recv_of(llog);
+            fr = recv_of(flog);
+            CHECK((llog.find("RADIANCE_PP_SEND_ASYNC=32 -- a X1 payload of >= 32 rows") != std::string::npos) == a.send);
+            CHECK((flog.find("RADIANCE_PP_SEND_ASYNC=32 -- a X2 payload of >= 32 rows") != std::string::npos) == a.send);
+            CHECK((llog.find("RADIANCE_PP_RECV_ASYNC=32 -- a X2 payload of >= 32 rows") != std::string::npos) == a.recv);
+            CHECK((flog.find("RADIANCE_PP_RECV_ASYNC=32 -- a X1 payload of >= 32 rows") != std::string::npos) == a.recv);
             if (got != ref || !plan_ok) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(),
                                                 tail(flog, 30).c_str());
         }
@@ -1656,18 +1672,25 @@ TEST(async_crossings_serve_one_process_tokens_and_plan) {
             }
             sla = async_of(sv.lead.output(), &slall);
         }
-        fprintf(stderr, "    async crossings, %s lanes W(%s): cold tokens %s, plan %s (%zu chunks); leader X1 %lld of %lld "
-                        "from the side stream, follower X2 %lld of %lld; lane set %d of %zu differ, X1 %lld of %lld async\n",
+        fprintf(stderr, "    async crossings (send %d, receive %d), %s lanes W(%s): cold tokens %s, plan %s (%zu chunks); "
+                        "leader X1 %lld of %lld from the side stream, follower X2 %lld of %lld; receives through staging: "
+                        "follower %lld, leader %lld; lane set %d of %zu differ, X1 %lld of %lld async\n", a.send, a.recv,
                 a.lanes, a.cut, got == ref ? "identical" : "DIFFERENT", plan_ok ? "identical" : "DIFFERENT", ref_plan.size(),
-                la, lall, fa, fall, differ, ref_set.size(), sla, slall);
+                la, lall, fa, fall, fr, lr, differ, ref_set.size(), sla, slall);
         CHECK(!ref.empty());
         CHECK(got == ref);
         CHECK(plan_ok);
         CHECK_EQ(differ, 0);
-        CHECK(la > 0);          /* the cold prompt's chunks of >= 32 rows */
-        CHECK(la < lall);       /* the decode steps' small payloads on the pass's stream */
-        CHECK(fa >= 0);
-        CHECK(sla > 0);
+        if (a.send) {
+            CHECK(la > 0);          /* the cold prompt's chunks of >= 32 rows */
+            CHECK(la < lall);       /* the decode steps' small payloads on the pass's stream */
+            CHECK(fa >= 0);
+            CHECK(sla > 0);
+        }
+        if (a.recv) {
+            CHECK(fr > 0);          /* X1 of the cold prompt's chunks, every follower rank */
+            CHECK(lr >= 0);
+        }
     }
     {   /* off: no line, nothing from a side stream */
         Serving sv;

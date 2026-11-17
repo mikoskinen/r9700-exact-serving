@@ -13518,6 +13518,73 @@ TEST(lanes_span_short_cuts_a_short_prompts_span_pieces_and_leaves_a_long_ones) {
     }
 }
 
+/* tp8 loop P10 / FINDINGS F14 (the ~22 ms every pass costs on both nodes): --prefill-span 4 with --max-num-batched-tokens
+ * 8256 under lanes -- the cold prompt's body in 8,192-row span pieces (one interval first, then 4 intervals a piece), at 2 /
+ * 3 lanes the one-lane plan to the row, every boundary on the interval grid or the prompt's end, the window keys read
+ * right, the pieces lent; with SPAN_TAIL 8192 the last 8,192 rows in intervals; SPAN_SHORT 24576 gives 15,777 the cut
+ * plan. Exact geometry (the cards'): 16k [0, 2048) [2048, 10240) [10240, 15777), 64k 9 chunks (7 of 8,192) ending [59392, 65650),
+ * 128k 17 (15 of 8,192); so span 4 needs SPAN_TAIL / SHORT, or its last chunk runs 5.5-6.3k rows into the drain. (A
+ * setting for the cards: whether an 8,192-row pass is answer-neutral is the cards' text check.) */
+TEST(lanes_span_four_plans_eight_k_bodies_as_one_lane_does) {
+    for (int ex : { 0, 1 })
+    for (int n_prompt : { 15777, 65650, 131137 }) {
+        std::vector<std::pair<int, int>> ref_s;
+        for (int arm = 0; arm < 4; ++arm) {
+            /* 0: one lane; 1 / 2: 2 / 3 lanes; 3: 2 lanes + SPAN_TAIL 8192 + SPAN_SHORT 24576 */
+            const int lanes = arm == 0 ? 1 : arm == 2 ? 3 : 2;
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 4;
+            L.cfg.pp_plan_prefix = ex == 1;
+            L.max_tok = 8256;
+            L.max_ctx = 140000;
+            L.kv_blocks = 16384;
+            L.stage_rows = 1024;
+            L.win = 16;
+            L.seqs = 6;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            if (arm == 3) { L.set.set_span_tail(8192); L.set.set_span_short(24576); }
+            const uint64_t s = L.submit(0, n_prompt, 2);
+            REQUIRE(s != 0);
+            int64_t misses = 0;
+            int failed = 0;
+            const std::vector<std::pair<int, int>> got = run_cold(L, lanes, s, &misses, &failed);
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(misses, (int64_t)0);
+            REQUIRE(L.req(0, s) != nullptr);
+            CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
+            int big = 0;
+            for (const auto& [a, b] : got) {
+                /* the cards' geometry (exact prefix resume): interval boundaries or the end, >= 128 rows; nearest's tail
+                 * snapshot a block short of the end cuts a short last piece there at any span (one lane's plan too) */
+                if (ex) CHECK(b % 2048 == 0 || b == n_prompt);
+                if (ex) CHECK(b - a >= 128);
+                CHECK(b - a <= 8192);
+                big += b - a == 8192;
+            }
+            if (arm == 0) {
+                ref_s = got;
+                if (n_prompt > 20000) CHECK(big > 0);
+            } else if (arm < 3) {
+                CHECK(got == ref_s);
+                CHECK(L.set.counts().pieces > 0);
+            } else {
+                /* SPAN_TAIL 8192: no piece starting in the last 8,192 rows spans an interval boundary; SHORT: 15,777 all intervals */
+                for (const auto& [a, b] : got)
+                    if (ex && (n_prompt - a <= 8192 || n_prompt <= 24576)) CHECK(b - a <= 2048 + 128 || b == n_prompt);
+            }
+            std::string t;
+            for (size_t k = 0; k < got.size() && k < 3; ++k) t += fmt(" [%d, %d)", got[k].first, got[k].second);
+            t += " ..";
+            for (size_t k = got.size() >= 3 ? got.size() - 3 : 0; k < got.size(); ++k) t += fmt(" [%d, %d)", got[k].first, got[k].second);
+            fprintf(stderr, "    %sspan 4, %d tokens, %d lanes%s: %zu chunks (%d of 8192 rows)%s, %lld lent:%s\n", ex ? "exact, " : "",
+                    n_prompt, lanes, arm == 3 ? " + SPAN_TAIL 8192 + SHORT 24576" : "", got.size(), big,
+                    arm == 1 || arm == 2 ? (got == ref_s ? " = one lane's" : " DIFFERENT") : "", (long long)L.set.counts().pieces,
+                    t.c_str());
+        }
+    }
+}
+
 /* tp8 loop M2 (the 20:58 PROFILE: no lane step for 320-430 ms after every MIXED step): lever DST under lanes. A newcomer
  * that joins a lane beside decode rows is cut by option D on sched_mixed_tok's grid (576 -> 512-row pieces), one piece a
  * home-lane step, the same boundaries one lane plans (the plan is a function of the switches, not of the decode rows

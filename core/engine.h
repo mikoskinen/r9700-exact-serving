@@ -505,6 +505,10 @@ private:
     static int64_t pp_send_async_rows();
     int64_t pp_send_async_bytes() const;
     void* pp_stage_dev_ = nullptr;
+    /* tp8 loop P10b (RADIANCE_PP_RECV_ASYNC): the row floor of a payload taken through a card staging buffer from a side
+     * stream (0 = off), and the staging buffer every rank of this node needs for it (0 when off) */
+    static int64_t pp_recv_async_rows();
+    int64_t pp_recv_async_bytes() const;
     void pp_split_note();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy

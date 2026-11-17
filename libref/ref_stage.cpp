@@ -331,6 +331,21 @@ int ref_stage_recv(const RadArgs* a, RadStream) {
     if (__atomic_load_n(reinterpret_cast<const uint64_t*>(src + total), __ATOMIC_ACQUIRE) != want) return RAD_E_STATE;
     /* tp8 S6: every part this step's size (parts carry their own rows) */
     if (*reinterpret_cast<const uint64_t*>(src + total + 8) != rad_pp_layout(bytes, n)) return RAD_E_SHAPE;
+    /* tp8 loop P10b (RadPpRing::recv_rows), as r4d_stage.hip's recv_async: the payload into the rank's staging buffer, the
+     * ring counted free, then the parts out of the staging buffer (on the host one thread does both, in that order) */
+    if (!loop && r->recv_rows && (uint64_t)rows >= r->recv_rows && r->recv_stage[rank] && total <= r->recv_cap) {
+        char* stage = reinterpret_cast<char*>((uintptr_t)r->recv_stage[rank]);
+        std::memcpy(stage, src, (size_t)total);
+        __atomic_store_n(&r->taken[rank], want, __ATOMIC_RELEASE);
+        if (rank == 0) r->taken_ns = mono_ns();
+        uint64_t off = 0;
+        for (int i = 0; i < n; ++i) {
+            std::memcpy(a->t[1 + i].data, stage + off, (size_t)bytes[i]);
+            off += rad_pp_align(bytes[i]);
+        }
+        r->recv_async[rank] = r->recv_async[rank] + 1;
+        return RAD_OK;
+    }
     uint64_t off = 0;
     for (int i = 0; i < n; ++i) {
         std::memcpy(a->t[1 + i].data, src + off, (size_t)bytes[i]);
