@@ -490,6 +490,10 @@ private:
      * times around every head and tail part, the host's time a chunk -- one line a prompt at its first token
      * (engine_lanes.cpp). Owned by step_loop_lanes; null when off. */
     struct PfTimeline* pf_tl_ = nullptr;
+    /* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1, either node): rank 0's card in parts / between parts / waiting for the other
+     * node's crossing, a line a minute (core/pp_nodeidle.h). Owned by the node's step loop; null when off. */
+    struct PpNodeIdle* pp_ni_ = nullptr;
+    int  pp_node_idle_open(std::unique_ptr<struct PpNodeIdle>* own);
     /* The follower's step loop: replay the leader's builds, run the trunk steps, until the leader
      * stops (0) or the link fails (negative). */
     int  follower_loop();

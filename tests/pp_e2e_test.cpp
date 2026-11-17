@@ -1081,6 +1081,59 @@ TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tok
     }
 }
 
+/* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1 on both nodes): a cold multi-chunk prompt and its decode at 2 lanes, W(0,2) and
+ * W(1,3), serve one process's tokens, and each node prints its node-idle line for the run at stop -- parts read from
+ * their events (none dropped or unread), rank 0's receives of the other node's crossing counted (the leader's X2, the
+ * follower's X1: at W(0,2) the embedding's output), parts + gaps within the wall. */
+TEST(the_node_idle_line_times_both_nodes_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(978, 700);
+    std::vector<int32_t> ref;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, {}));
+        ref = complete(sv.port, p, 32);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+    }
+    CHECK(!ref.empty());
+    for (const char* cut : { "0,2", "1,3" }) {
+        Serving sv;
+        REQUIRE(sv.start(cut, { "--max-num-seqs", "6", "--pp-lanes", "2" }, cat(kSplitEnv, { "RADIANCE_PP_NODE_IDLE=1" })));
+        const std::vector<int32_t> got = complete(sv.port, p, 32);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        CHECK(got == ref);
+        for (const auto& [log, who] : { std::pair<std::string, const char*>{ sv.lead.output(), "leader" },
+                                        std::pair<std::string, const char*>{ sv.fol.output(), "follower" } }) {
+            CHECK(log.find("RADIANCE_PP_NODE_IDLE=1 -- rank 0's card time") != std::string::npos);
+            const std::string key = std::string("two-node pipeline, ") + who + " node idle (RADIANCE_PP_NODE_IDLE=1";
+            const size_t at = log.find(key);
+            CHECK(at != std::string::npos);
+            if (at == std::string::npos) continue;
+            const size_t run = log.find("over the run (", at);
+            CHECK(run != std::string::npos);
+            if (run == std::string::npos) continue;
+            const std::string line = log.substr(run, log.find('\n', run) - run);
+            double wall = -1, cov = -1, left = -1, part = -1, ppct = -1, wait = -1, wpct = -1, gap = -1;
+            long long idles = -1, parts = -1, recvs = -1;
+            const int got_n = std::sscanf(line.c_str(), "over the run (%lf s wall, %lf s covered; %lld gaps > %*s s left out, %lf s): "
+                                          "in parts %lf s (%lf %%, %lld parts), of which waiting on the card for the other node's "
+                                          "%*s %lf s (%lf %%, %lld receives); between parts %lf s",
+                                          &wall, &cov, &idles, &left, &part, &ppct, &parts, &wait, &wpct, &recvs, &gap);
+            CHECK_EQ(got_n, 11);
+            CHECK(parts > 0);
+            CHECK(recvs > 0);   /* the leader's X2 every tail; the follower's X1 every pass (h = 0: the embedding) */
+            CHECK(wait >= 0 && wait <= part + 0.05);
+            CHECK(part >= 0 && gap >= 0 && part + gap <= cov + 0.15 && cov <= wall + 0.05);
+            CHECK_EQ(idles, 0);   /* one request, no pause */
+            CHECK(line.find("events dropped 0, unread 0") != std::string::npos);
+            fprintf(stderr, "    W(%s) %s: tokens %s\n    %s\n", cut, who, got == ref ? "identical" : "DIFFERENT", line.c_str());
+        }
+    }
+}
+
 /* (review of S6) The prefix hit across the cut with the KV copy on (RADIANCE_LLAMA_PP_KVCOPY + RADIANCE_PP_KV_CHECK=1):
  * the second request's hit reuses blocks whose copied layer the follower wrote in the first request's steps, and every
  * check over the handed-out blocks finds the copy = the owner's; and RADIANCE_PP_PREFIX_CACHE=0 (S4's rule, both nodes):

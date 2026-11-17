@@ -308,11 +308,19 @@ int ref_stage_recv(const RadArgs* a, RadStream) {
     }
     const uint64_t want = __atomic_load_n(&r->taken[rank], __ATOMIC_ACQUIRE) + 1;
     const uint64_t t0 = mono_ms();
+    /* tp8 dev D8 (RadPpRing::wait_on, RADIANCE_PP_NODE_IDLE=1): rank 0's wait for the payload, ns (as r4d_stage.hip's ticks) */
+    const bool idle = !loop && rank == 0 && r->wait_on;
+    const uint64_t w0 = idle ? mono_ns() : 0;
     uint32_t spins = 0;
     while (__atomic_load_n(&r->landed, __ATOMIC_ACQUIRE) < want) {
         if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
         if (r->deadline_ms && mono_ms() - t0 > r->deadline_ms) return RAD_E_IO;
         if (++spins > 64) std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+    if (idle) {
+        r->wait_tpms = 1000000;
+        __atomic_store_n(&r->wait_ticks, r->wait_ticks + (mono_ns() - w0), __ATOMIC_RELEASE);
+        __atomic_store_n(&r->waits, r->waits + 1, __ATOMIC_RELEASE);
     }
     /* The sender's rows and layout must be this step's: a mismatch is a schedule bug (the two
      * nodes are not running the same step), never something to copy past. */

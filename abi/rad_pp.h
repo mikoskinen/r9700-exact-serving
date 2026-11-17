@@ -98,7 +98,15 @@ typedef struct RadPpRing {
     uint64_t          pad0[5];
     volatile uint64_t landed;         /* receive ring: payloads the link has written in full */
     volatile uint64_t taken_ns;       /* receive ring: when rank 0 took the last payload */
-    uint64_t          pad1[6];
+    /* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1, a receive ring only; 0 from an engine before it): with `wait_on` set by the core,
+     * rank 0's stage_recv adds the ticks its first block waited for the payload to land to `wait_ticks` and counts the
+     * receive in `waits` (one writer: rank 0's stream, in order); `wait_tpms` = ticks a ms (the card's wall clock; 1e6 on the
+     * host backend's ns clock), set by the op. Read by the core's node-idle line. */
+    volatile uint64_t wait_ticks;
+    volatile uint64_t waits;
+    volatile uint64_t wait_tpms;
+    uint64_t          wait_on;
+    uint64_t          pad1[2];
     volatile uint64_t abort;          /* nonzero: the link is down; stage_recv fails the pass. A stage
                                        * op that gives up stores 2 (abort seen), 3 (its deadline), 4 (a
                                        * payload of another step's shape), 5 (a stale payload: its
