@@ -274,6 +274,17 @@ int Engine::pp_check() {
 int Engine::pp_connect() {
     if (!pp_on() || cfg_.debug_graph) return RAD_OK;
     net::LinkOpts o = net::LinkOpts::from_env();
+    /* tp8 dev 1a: RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t) -- the follower looks the embedding up itself, the leader sends
+     * no X1 (the plugins; at h > 0 X1 is a layer's residual and stays) */
+    const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
+    const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
+    o.no_x1 = fe_on;
+    if (fe && !std::strcmp(fe, "1"))
+        RAD_INFO("two-node pipeline: RADIANCE_PP_FOLLOWER_EMBED=1 %s", fe_on
+                     ? "-- the follower looks the step's embedding up itself; the leader's head part issues no lookup "
+                       "and no X1 (tp8 dev 1a)"
+                     : fmt("is not taken at W(%d,%d): X1 is the residual after layer %d (it applies at W(0, t) only)",
+                           cfg_.pp_cut_h, cfg_.pp_cut_t, cfg_.pp_cut_h - 1).c_str());
     std::string err;
     if (pp_follower()) {
         /* Robustness 4: listen where the leader reaches this node (the address the route to
@@ -298,6 +309,7 @@ int Engine::pp_connect() {
     f.add("role", role(cfg_.pp_rank));
     f.add("cut", fmt("%d,%d", cfg_.pp_cut_h, cfg_.pp_cut_t));
     f.add("link", cfg_.node_link ? "verbs" : "tcp");
+    if (fe_on) f.add("follower embed", "on");   /* tp8 dev 1a: only when on, so the flags-off facts are as before */
     f.add("binary", net::file_identity("/proc/self/exe"));
     for (const std::string& p : net::loaded_plugin_identities()) {
         const size_t eq = p.find('=');

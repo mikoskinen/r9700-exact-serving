@@ -689,6 +689,11 @@ struct Model {
     ds41layers::Binds pp_binds{};
     rad_op pp_cp_lat = 0, pp_cp_idx = 0;  /* the receiver's copy stores (the crossing into this node) */
     bool pp_unsplit_cand = false;
+    /* tp8 dev 1a (RADIANCE_PP_FOLLOWER_EMBED=1 on both nodes, W(0, t) only; unset: nothing here): the follower looks the
+     * step's embedding up itself -- the same table and op as the leader's, the vocab-sharded rows completed by the same
+     * exact all-reduce, into xcol, where it took X1 -- and the leader's head part issues neither the lookup nor X1. A
+     * pipeline node serves no pictures (lr_check), so xcol is the lookup alone on both. */
+    bool pp_fe = false;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -4154,6 +4159,10 @@ static int lr_read(Model& m, const RadBuildCtx* ctx) {
         m.pp_rank = pp.rank;
         m.pp_h = pp.cut_h;
         m.pp_t = pp.cut_t;
+        {
+            const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
+            m.pp_fe = fe && !std::strcmp(fe, "1") && m.pp_h == 0;
+        }
         if (m.lr.leader != (pp.rank == 0)) return RAD_E_STATE;
     } else if (ds41layers::parse(std::getenv("RADIANCE_DS41_LAYERS"), std::getenv("RADIANCE_DS41_LAYERS_MODE"), (int)m.c.n_layer,
                           &m.lr, &err) < 0) {
@@ -4453,7 +4462,9 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
                   "%lld and its pinned pool slots are 0 (--host-pool-mib 0)%s%s",
                   m.lr.text.c_str(), m.lr.strict ? "strict: this node's part only, declare only" : "proxy: the stage alone",
                   m.lr.n_own, (long long)c.n_layer, m.lr.leader ? "the leader" : "a follower",
-                  m.lr.leader ? "held (the leader's)" : lr_shell(m) ? "declared as the proxy's shell (the leader's)" : "not declared",
+                  m.lr.leader ? "held (the leader's)" : lr_shell(m) ? "declared as the proxy's shell (the leader's)"
+                  : m.pp_fe ? "not declared but the embedding (RADIANCE_PP_FOLLOWER_EMBED=1: this node looks it up, tp8 dev 1a)"
+                            : "not declared",
                   m.dsp.on ? "declared" : "not declared", eng, own_src.c_str(), cps.empty() ? "" : "; copies of foreign sources ",
                   cps.c_str(), (long long)trunk, moe, (long long)per, (long long)draft, (long long)(trunk + draft),
                   (long long)(trunk + draft), m.lr_deps.empty() ? "" : "; reads from another node: ",
@@ -4622,14 +4633,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* The vocabulary is split over the ranks (shard_extent): the lookup gives zeros outside this
      * rank's rows and an all-reduce completes it; the head's logits stay sharded for the sampler. */
     const int64_t v0 = g.vocab_off, v1 = g.vocab_off + g.n_vocab;
-    /* tp8 S3: the embedding, the head and the final norm's gain where lr_shell() (not on a strict follower) */
-    if (lr_shell(m)) {
+    /* tp8 S3: the embedding, the head and the final norm's gain where lr_shell() (not on a strict follower); tp8 dev 1a:
+     * the embedding alone on a follower under pp_fe */
+    const bool shell = lr_shell(m);
+    if (shell || m.pp_fe) {
         m.token = lw(b, m, nm.f("token_embd.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1,
                      false, RAD_ACCESS_VOCAB);
-        m.head = lw(b, m, nm.f("output.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1, false,
-                    RAD_ACCESS_VOCAB);
-        if (!m.token || !m.head) return RAD_E_INVAL;
-        m.final_gain = wt(b, nm.f("output_norm.weight"), RAD_F32, { D }, grp_model());
+        if (shell)
+            m.head = lw(b, m, nm.f("output.weight"), g.n_vocab, D, grp_model(), RAD_SHARD_ROW, v0, v1, false,
+                        RAD_ACCESS_VOCAB);
+        if (!m.token || (shell && !m.head)) return RAD_E_INVAL;
+        if (shell) m.final_gain = wt(b, nm.f("output_norm.weight"), RAD_F32, { D }, grp_model());
         /* A GGUF's table in llama.cpp's blocks is gathered from them (embed_lookup_ggml). */
         const auto tt = m.wty.find(m.token);
         const auto ts = m.wsc.find(m.token);
@@ -4658,7 +4672,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                          { m.token }, {}, { m.xcol });
         /* Pictures: the encoder's rows over the lookup, before the vocabulary all-reduce completes it (rank 0 holds the
          * rows, every other rank zeros: RadBatch::mm_embd). */
-        if (m.media) DS_TRY(m.mrows.declare(b, T, D, m.xcol));
+        if (m.media && shell) DS_TRY(m.mrows.declare(b, T, D, m.xcol));
         if (g.world > 1)
             m.embed_ar = op(b, "all_reduce",
                             { RAD_INT("world_size", g.world), RAD_RANGE("numel", D, T * D),
@@ -6293,12 +6307,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     /* the step's head ops: as step() (per-token, over the step); tp8 S6: on a pipeline node as step() does them -- the
      * leader's lookup, X1 at W(0, t), the streams where the node's first layer is layer 0's successor of the lookup */
     media_route(m, batch);
-    if ((!m.pp || m.pp_rank == 0) && run_head) {
+    /* tp8 dev 1a: under pp_fe the follower's lookup in place of X1, the leader's none */
+    if (((!m.pp || m.pp_rank == 0) && run_head && !m.pp_fe) || (m.pp_fe && m.pp_rank == 1)) {
         RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
         m.mrows.step(x, batch, m.xcol, T);
         if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     }
-    if (m.pp && m.pp_h == 0 && run_head && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
+    if (m.pp && m.pp_h == 0 && run_head && !m.pp_fe && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
     if (part == RAD_PP_PART_HEAD && m.pp_h == 0) return;   /* tp8 S5: at W(0, t) the head part ends with X1's send */
     if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
         for (int64_t i = 0; i < c.hc; ++i)
@@ -7194,14 +7209,15 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const int part = pp_part(m);
     const bool run_head = part != RAD_PP_PART_TAIL;
     media_route(m, batch);
-    if ((!m.pp || m.pp_rank == 0) && run_head) {
+    /* tp8 dev 1a: under pp_fe the follower's lookup in place of X1, the leader's none */
+    if (((!m.pp || m.pp_rank == 0) && run_head && !m.pp_fe) || (m.pp_fe && m.pp_rank == 1)) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
     m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     }
     /* X1 at W(0, t): the leader's lookup out, the follower's in, where one process's lookup was (tp8 S6: at h > 0 X1 is
      * the residual after layer h - 1, below, and the follower's layer h starts from it: no streams of its own here) */
-    if (m.pp && m.pp_h == 0 && run_head && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
+    if (m.pp && m.pp_h == 0 && run_head && !m.pp_fe && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
     if (part == RAD_PP_PART_HEAD && m.pp_h == 0) return;   /* tp8 S5: at W(0, t) the head part ends with X1's send */
     if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
     for (int64_t i = 0; i < c.hc; ++i)

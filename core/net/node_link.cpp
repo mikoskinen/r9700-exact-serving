@@ -865,7 +865,9 @@ void NodeLink::stage_watch() {
             if (send_[ix + RAD_PP_X2]) done += __atomic_load_n(&send_[ix + RAD_PP_X2]->ready, __ATOMIC_ACQUIRE);
         }
         what = "X2 for an X1 that landed";
-    } else if (send_[RAD_PP_X1]) {
+    } else if (send_[RAD_PP_X1] && !o_.no_x1) {
+        /* tp8 dev 1a: under RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t) the leader sends no X1 (the follower looks the
+         * embedding up itself), so a released step owes none (LinkOpts::no_x1) */
         due = released_.load(std::memory_order_acquire);
         for (int ix = 0; ix + 1 < n_ix_; ix += RAD_PP_N_RINGS)
             if (send_[ix + RAD_PP_X1]) done += __atomic_load_n(&send_[ix + RAD_PP_X1]->ready, __ATOMIC_ACQUIRE);
