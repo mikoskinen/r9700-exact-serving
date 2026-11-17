@@ -2979,9 +2979,17 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             L.k_gemm = linear(b, m, rows, L.ik_w, c.idim, hd, m.lat, m.ik);
             L.k_f = norm_rope_rt(b, m, rows, L.ik_norm, c.idim, 32, "fp4_e2m1", "ue8m0", m.ik, m.ikn,
                                  m.cs_b);
+            /* tp8 S4 hw (layer ranges / a pipeline node only): k_f / l_f / k_rope / l_rope are issued with comp_bpos
+             * (the entries' positions) but declare only cs_b; with every layer a later layer's c_work / c_tab keeps
+             * comp_bpos alive, on a node whose last compressing layer is this one the plan ended its life at this
+             * c_tab and the step refused (M gpu03 17.11. s3hw-B-3, RADIANCE_DS41_LAYERS=0:20: "operand 4 names buffer
+             * 'comp_bpos' ... ops 123..891 and this is op 893"; the S3 hardware agent's bpos patch, applied here for
+             * the W(0,20) follower). Unset: nothing declared here (the published plan). */
+            if (m.lr.on && L.k_f && rw(b, L.k_f, { m.bpos }, {}) == 0) return RAD_E_INVAL;
             if (!L.k_f) {
                 L.k_norm = rmsnorm(b, m, rows, L.ik_norm, c.idim, m.ik, m.ikn);
                 L.k_rope = rope_rows(b, m, rows, 1, c.idim, 0, m.ikn, m.cs_b);
+                if (m.lr.on && L.k_rope && rw(b, L.k_rope, { m.bpos }, {}) == 0) return RAD_E_INVAL;
                 L.k_q = roundtrip(b, rows, c.idim, 32, "fp4_e2m1", "ue8m0", m.ikn);
             }
             if (!m.index.count(r) && !(m.index[r] = full_group(b, m, "kv_index_r%lld", index_slots(m), r))) return RAD_E_INVAL;
@@ -2989,8 +2997,10 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
             if (rad_kv_block_size(b, m.index[r]) != r) return RAD_E_INVAL;
             DS_TRY(rad_bind_layer_kv(b, l, m.index[r]));
             L.l_f = rope_rt(b, m, rows, 1, hd, 0, 16, "fp4_e2m1", "e4m3", m.lat, m.cs_b);
+            if (m.lr.on && L.l_f && rw(b, L.l_f, { m.bpos }, {}) == 0) return RAD_E_INVAL;   /* tp8 S4 hw: as k_f */
             if (!L.l_f) {
                 L.l_rope = rope_rows(b, m, rows, 1, hd, 0, m.lat, m.cs_b);
+                if (m.lr.on && L.l_rope && rw(b, L.l_rope, { m.bpos }, {}) == 0) return RAD_E_INVAL;
                 L.l_q = roundtrip(b, rows, hd, 16, "fp4_e2m1", "e4m3", m.lat);
             }
             if (!m.comp.count(r) && !(m.comp[r] = full_group(b, m, "kv_compressed_r%lld", latent_slots(m, hd), r))) return RAD_E_INVAL;
