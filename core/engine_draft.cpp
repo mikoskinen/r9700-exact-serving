@@ -61,6 +61,14 @@ int Engine::step_state_init() {
      * pinned staging beside them. A program without them is refused rather than served
      * uncoupled. */
     mtp_couple_ = cfg_.draft_coupling;
+    /* tp8 S4: a two-node pipeline's follower drafts nothing -- the drafter, its walk and the
+     * coupled verify are the leader's, which serves with the same --draft-coupling (the rendezvous
+     * compares it). Without this the follower, which declares no head, refused its start here (the
+     * S3 hardware run's arm B hit the same line, 17.11.). */
+    if (mtp_couple_ && pp_follower()) {
+        RAD_INFO("--draft-coupling on: a pipeline follower declares no drafter; the coupling is the leader's");
+        mtp_couple_ = false;
+    }
     if (mtp_couple_) {
         /* Coupling is defined on a linear chain of drafts: a serial head's rounds, or a block
          * drafter whose walk samples each position in turn (DFlash2, dflash_couple_propose), its
