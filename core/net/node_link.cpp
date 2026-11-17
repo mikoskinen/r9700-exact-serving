@@ -350,9 +350,14 @@ NodeLink::~NodeLink() {
 }
 
 void NodeLink::attach(RadPpRing* const send[RAD_PP_N_RINGS], RadPpRing* const recv[RAD_PP_N_RINGS]) {
-    for (int i = 0; i < RAD_PP_N_RINGS; ++i) {
-        send_[i] = send ? send[i] : nullptr;
-        recv_[i] = recv ? recv[i] : nullptr;
+    attach_n(send, recv, RAD_PP_N_RINGS);
+}
+
+void NodeLink::attach_n(RadPpRing* const* send, RadPpRing* const* recv, int n) {
+    n_ix_ = std::max((int)RAD_PP_N_RINGS, std::min(n, (int)RAD_PP_MAX_RING_IX));
+    for (int i = 0; i < RAD_PP_MAX_RING_IX; ++i) {
+        send_[i] = send && i < n ? send[i] : nullptr;
+        recv_[i] = recv && i < n ? recv[i] : nullptr;
         sent_[i] = send_[i] ? send_[i]->ready : 0;
     }
 }
@@ -365,7 +370,7 @@ void NodeLink::start() {
     rx_ = std::thread([this] { rx_loop(); });
     hb_ = std::thread([this] { hb_loop(); });
     bool any = false;
-    for (int i = 0; i < RAD_PP_N_RINGS; ++i) any = any || send_[i];
+    for (int i = 0; i < RAD_PP_MAX_RING_IX; ++i) any = any || send_[i];
     if (any) proxy_ = std::thread([this] { proxy_loop(); });
 }
 
@@ -386,7 +391,7 @@ void NodeLink::fail(const std::string& why, bool from_peer) {
         why_ = why;
     }
     down_.store(true, std::memory_order_release);
-    for (int i = 0; i < RAD_PP_N_RINGS; ++i) {
+    for (int i = 0; i < RAD_PP_MAX_RING_IX; ++i) {
         if (send_[i]) __atomic_store_n(&send_[i]->abort, 1ull, __ATOMIC_RELEASE);
         if (recv_[i]) __atomic_store_n(&recv_[i]->abort, 1ull, __ATOMIC_RELEASE);
     }
@@ -413,7 +418,7 @@ void NodeLink::close(const char* reason) {
             if (why_.empty()) why_ = reason;
         }
         down_.store(true, std::memory_order_release);
-        for (int i = 0; i < RAD_PP_N_RINGS; ++i) {
+        for (int i = 0; i < RAD_PP_MAX_RING_IX; ++i) {
             if (send_[i]) __atomic_store_n(&send_[i]->abort, 1ull, __ATOMIC_RELEASE);
             if (recv_[i]) __atomic_store_n(&recv_[i]->abort, 1ull, __ATOMIC_RELEASE);
         }
@@ -770,7 +775,7 @@ void NodeLink::proxy_loop() {
     while (!stopping_.load(std::memory_order_acquire) && alive()) {
         stage_watch();
         bool moved = false;
-        for (int id = 0; id < RAD_PP_N_RINGS; ++id) {
+        for (int id = 0; id < n_ix_; ++id) {
             RadPpRing* r = send_[id];
             if (!r) continue;
             const uint64_t rd = __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE);
@@ -784,7 +789,7 @@ void NodeLink::proxy_loop() {
             /* A stage op on this node that gave up (its deadline, a payload not of its step) set
              * its ring's abort word before this payload was published, in stream order: the pass
              * computed nothing to send, so the link goes down instead. */
-            for (int k = 0; k < RAD_PP_N_RINGS; ++k)
+            for (int k = 0; k < n_ix_; ++k)
                 for (RadPpRing* q : { send_[k], recv_[k] })
                     if (q && __atomic_load_n(&q->abort, __ATOMIC_ACQUIRE)) {
                         fail(fmt("crossing %d's stage op on this node gave up (abort word %llu: 3 a "
@@ -852,13 +857,17 @@ void NodeLink::stage_watch() {
     watch_ns_ = t;
     uint64_t due = 0, done = 0;
     const char* what = nullptr;
+    /* tp8 S5: summed over the lanes' rings -- each lane step owes one payload of each crossing */
     if (send_[RAD_PP_X2] && recv_[RAD_PP_X1]) {
-        due = __atomic_load_n(&recv_[RAD_PP_X1]->landed, __ATOMIC_ACQUIRE);
-        done = __atomic_load_n(&send_[RAD_PP_X2]->ready, __ATOMIC_ACQUIRE);
+        for (int ix = 0; ix + 1 < n_ix_; ix += RAD_PP_N_RINGS) {
+            if (recv_[ix + RAD_PP_X1]) due += __atomic_load_n(&recv_[ix + RAD_PP_X1]->landed, __ATOMIC_ACQUIRE);
+            if (send_[ix + RAD_PP_X2]) done += __atomic_load_n(&send_[ix + RAD_PP_X2]->ready, __ATOMIC_ACQUIRE);
+        }
         what = "X2 for an X1 that landed";
     } else if (send_[RAD_PP_X1]) {
         due = released_.load(std::memory_order_acquire);
-        done = __atomic_load_n(&send_[RAD_PP_X1]->ready, __ATOMIC_ACQUIRE);
+        for (int ix = 0; ix + 1 < n_ix_; ix += RAD_PP_N_RINGS)
+            if (send_[ix + RAD_PP_X1]) done += __atomic_load_n(&send_[ix + RAD_PP_X1]->ready, __ATOMIC_ACQUIRE);
         what = "X1 for a step it released";
     } else {
         return;

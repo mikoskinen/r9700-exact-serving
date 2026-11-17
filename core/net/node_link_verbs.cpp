@@ -59,6 +59,12 @@ std::unique_ptr<DataPath> verbs_open(NodeLink&, const std::string&, const std::s
            "use --node-link tcp";
     return nullptr;
 }
+std::unique_ptr<DataPath> verbs_open_n(NodeLink&, const std::string&, const std::string&, int,
+                                       RadPpRing* const*, RadPpRing* const*, int, std::string* err) {
+    *err = "this build has no RDMA verbs path (rdma-core's headers were not found at configure time); "
+           "use --node-link tcp";
+    return nullptr;
+}
 
 #else
 
@@ -161,9 +167,10 @@ struct Endpoint {
     uint8_t  gid[16] = {};
     uint32_t mtu = 0;
     uint32_t pad = 0;
-    uint64_t ring_addr[RAD_PP_N_RINGS] = {};   /* this side's receive rings */
-    uint32_t ring_rkey[RAD_PP_N_RINGS] = {};
-    uint64_t ring_cap[RAD_PP_N_RINGS] = {};
+    /* this side's receive rings, by ring index (tp8 S5: lane * RAD_PP_N_RINGS + crossing) */
+    uint64_t ring_addr[RAD_PP_MAX_RING_IX] = {};
+    uint32_t ring_rkey[RAD_PP_MAX_RING_IX] = {};
+    uint64_t ring_cap[RAD_PP_MAX_RING_IX] = {};
 };
 
 constexpr uint64_t kMailboxOff = RAD_PP_RING_HDR - 64;
@@ -175,8 +182,8 @@ public:
     ~Verbs() override { stop(); teardown(); }
 
     int open(const std::string& devname, const std::string& local_ip, int gid_index,
-             RadPpRing* const send[RAD_PP_N_RINGS], RadPpRing* const recv[RAD_PP_N_RINGS],
-             std::string* err) {
+             RadPpRing* const* send, RadPpRing* const* recv, int n_ix, std::string* err) {
+        n_ix_ = std::max<int>(RAD_PP_N_RINGS, std::min<int>(n_ix, RAD_PP_MAX_RING_IX));
         Ibv& F = ibv();
         if (!F.load()) { *err = F.err; return RAD_E_UNSUPPORTED; }
         int nd = 0;
@@ -218,7 +225,7 @@ public:
         if (!pd_) { *err = fmt("ibv_alloc_pd: %s", strerror(errno)); return RAD_E_DEVICE; }
         /* Every ring, send and receive, whole (header + payload). The send side's lkey covers the
          * payload the NIC reads; the receive side's rkey the mailbox and payload it writes. */
-        for (int i = 0; i < RAD_PP_N_RINGS; ++i) {
+        for (int i = 0; i < n_ix_; ++i) {
             for (int side = 0; side < 2; ++side) {
                 RadPpRing* r = side == 0 ? send[i] : recv[i];
                 if (!r) continue;
@@ -257,7 +264,7 @@ public:
         me.psn = 0x3000u + (uint32_t)(getpid() & 0xfff);
         std::memcpy(me.gid, g.raw, 16);
         me.mtu = (uint32_t)mtu_;
-        for (int i = 0; i < RAD_PP_N_RINGS; ++i)
+        for (int i = 0; i < n_ix_; ++i)
             if (rmr_[i]) {
                 me.ring_addr[i] = (uint64_t)(uintptr_t)recv_[i];
                 me.ring_rkey[i] = rmr_[i]->rkey;
@@ -274,7 +281,7 @@ public:
             return RAD_E_IO;
         }
         std::memcpy(&peer_, m.body.data(), sizeof peer_);
-        for (int i = 0; i < RAD_PP_N_RINGS; ++i)
+        for (int i = 0; i < n_ix_; ++i)
             if (send_[i] && (!peer_.ring_addr[i] || peer_.ring_cap[i] < send_[i]->cap)) {
                 *err = fmt("crossing %d: the peer's receive ring holds %llu bytes, this node sends up to %llu",
                            i, (unsigned long long)peer_.ring_cap[i], (unsigned long long)send_[i]->cap);
@@ -335,7 +342,7 @@ public:
     int post(int id, const RadPpRing* r, uint64_t seq, uint64_t rows, uint64_t bytes,
              uint64_t parts) override {
         if (stop_.load(std::memory_order_acquire)) return RAD_E_IO;
-        if (id < 0 || id >= RAD_PP_N_RINGS || !smr_[id] || r != send_[id]) return RAD_E_STATE;
+        if (id < 0 || id >= n_ix_ || !smr_[id] || r != send_[id]) return RAD_E_STATE;
         std::lock_guard<std::mutex> lk(post_mu_);
         uint64_t mb[4] = { seq, rows, bytes, parts };
         ibv_sge ms{ (uint64_t)(uintptr_t)mb, (uint32_t)sizeof mb, 0 };
@@ -444,9 +451,9 @@ private:
                     return;
                 }
                 /* Robustness 7 / review F6: the NIC wrote this payload over the last one; every local
-                 * reader must have taken that one already (the one-lane schedule guarantees it). A
-                 * reader still behind means a torn payload: loud, never silent. S5's lanes need a real
-                 * receive credit instead. */
+                 * reader must have taken that one already (the schedule guarantees it: tp8 S5 gives
+                 * every lane its own rings and at most one step in flight, so the one-lane argument
+                 * holds ring by ring). A reader still behind means a torn payload: loud, never silent. */
                 for (uint64_t k = 0; k < r->n_ranks && k < RAD_PP_MAX_RANKS; ++k)
                     if (__atomic_load_n(&r->taken[k], __ATOMIC_ACQUIRE) < landed) {
                         link_.fail(fmt("verbs: crossing %d: payload %llu landed while local rank %llu had not taken "
@@ -466,7 +473,7 @@ private:
         if (qp_) F.destroy_qp(qp_);
         if (scq_) F.destroy_cq(scq_);
         if (rcq_) F.destroy_cq(rcq_);
-        for (int i = 0; i < RAD_PP_N_RINGS; ++i) {
+        for (int i = 0; i < RAD_PP_MAX_RING_IX; ++i) {
             if (smr_[i]) F.dereg_mr(smr_[i]);
             if (rmr_[i]) F.dereg_mr(rmr_[i]);
         }
@@ -484,10 +491,11 @@ private:
     ibv_cq*       scq_ = nullptr;
     ibv_cq*       rcq_ = nullptr;
     ibv_qp*       qp_ = nullptr;
-    ibv_mr*       smr_[RAD_PP_N_RINGS] = {};
-    ibv_mr*       rmr_[RAD_PP_N_RINGS] = {};
-    RadPpRing*    send_[RAD_PP_N_RINGS] = {};
-    RadPpRing*    recv_[RAD_PP_N_RINGS] = {};
+    ibv_mr*       smr_[RAD_PP_MAX_RING_IX] = {};
+    ibv_mr*       rmr_[RAD_PP_MAX_RING_IX] = {};
+    RadPpRing*    send_[RAD_PP_MAX_RING_IX] = {};
+    RadPpRing*    recv_[RAD_PP_MAX_RING_IX] = {};
+    int           n_ix_ = RAD_PP_N_RINGS;
     int           gidx_ = -1;
     int           mtu_ = 0;
     std::string   gid_str_, desc_;
@@ -510,8 +518,14 @@ bool verbs_loadable(std::string* why) {
 std::unique_ptr<DataPath> verbs_open(NodeLink& link, const std::string& dev, const std::string& local_ip,
                                      int gid_index, RadPpRing* const send[RAD_PP_N_RINGS],
                                      RadPpRing* const recv[RAD_PP_N_RINGS], std::string* err) {
+    return verbs_open_n(link, dev, local_ip, gid_index, send, recv, RAD_PP_N_RINGS, err);
+}
+
+std::unique_ptr<DataPath> verbs_open_n(NodeLink& link, const std::string& dev, const std::string& local_ip,
+                                       int gid_index, RadPpRing* const* send, RadPpRing* const* recv, int n,
+                                       std::string* err) {
     auto v = std::make_unique<Verbs>(link);
-    if (v->open(dev, local_ip, gid_index, send, recv, err) < 0) return nullptr;
+    if (v->open(dev, local_ip, gid_index, send, recv, n, err) < 0) return nullptr;
     return v;
 }
 

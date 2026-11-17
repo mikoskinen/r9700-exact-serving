@@ -138,6 +138,9 @@ public:
      * land in, indexed by ring id (RAD_PP_X1 / RAD_PP_X2). Before start(). A null entry is a ring
      * this node does not hold in that role. */
     void attach(RadPpRing* const send[RAD_PP_N_RINGS], RadPpRing* const recv[RAD_PP_N_RINGS]);
+    /* tp8 S5: the rings of `n` ring indices (lane * RAD_PP_N_RINGS + crossing, abi/rad_pp.h), at most
+     * RAD_PP_MAX_RING_IX. attach() is attach_n(.., RAD_PP_N_RINGS): one lane. */
+    void attach_n(RadPpRing* const* send, RadPpRing* const* recv, int n);
 
     /* The verbs data path replaces the socket for kData frames (node_link_verbs.cpp). Before
      * start(), after attach(). */
@@ -187,8 +190,9 @@ public:
     /* The data path's hand-off: a payload of ring `id` written in full by the NIC (verbs) or the
      * receive thread (TCP); publishes it to the local consumers. Checks order and overrun. */
     int land(int id, uint64_t seq, uint64_t rows, uint64_t bytes, uint64_t parts);
-    RadPpRing* recv_ring(int id) const { return id >= 0 && id < RAD_PP_N_RINGS ? recv_[id] : nullptr; }
-    RadPpRing* send_ring(int id) const { return id >= 0 && id < RAD_PP_N_RINGS ? send_[id] : nullptr; }
+    /* By ring index (lane * RAD_PP_N_RINGS + crossing). */
+    RadPpRing* recv_ring(int id) const { return id >= 0 && id < RAD_PP_MAX_RING_IX ? recv_[id] : nullptr; }
+    RadPpRing* send_ring(int id) const { return id >= 0 && id < RAD_PP_MAX_RING_IX ? send_[id] : nullptr; }
     int fd() const { return fd_; }
     const LinkOpts& opts() const { return o_; }
 
@@ -210,9 +214,10 @@ private:
 
     int      fd_ = -1;
     LinkOpts o_;
-    RadPpRing* send_[RAD_PP_N_RINGS] = {};
-    RadPpRing* recv_[RAD_PP_N_RINGS] = {};
-    uint64_t   sent_[RAD_PP_N_RINGS] = {};
+    RadPpRing* send_[RAD_PP_MAX_RING_IX] = {};
+    RadPpRing* recv_[RAD_PP_MAX_RING_IX] = {};
+    uint64_t   sent_[RAD_PP_MAX_RING_IX] = {};
+    int        n_ix_ = RAD_PP_N_RINGS;   /* ring indices attached: RAD_PP_N_RINGS a lane */
     std::unique_ptr<DataPath> dp_;
 
     std::mutex              tx_mu_;
@@ -262,6 +267,11 @@ std::unique_ptr<DataPath> verbs_open(NodeLink& link, const std::string& dev,
                                      const std::string& local_ip, int gid_index,
                                      RadPpRing* const send[RAD_PP_N_RINGS],
                                      RadPpRing* const recv[RAD_PP_N_RINGS], std::string* err);
+/* tp8 S5: the same over `n` ring indices (lane * RAD_PP_N_RINGS + crossing), at most RAD_PP_MAX_RING_IX. */
+std::unique_ptr<DataPath> verbs_open_n(NodeLink& link, const std::string& dev,
+                                       const std::string& local_ip, int gid_index,
+                                       RadPpRing* const* send, RadPpRing* const* recv, int n,
+                                       std::string* err);
 /* Whether this build carries the verbs path, and whether libibverbs loads here. */
 bool verbs_built();
 bool verbs_loadable(std::string* why);
