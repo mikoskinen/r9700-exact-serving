@@ -13508,3 +13508,83 @@ TEST(lanes_dst_cuts_a_newcomer_beside_decode_rows_on_its_grid_while_the_other_la
         }
     }
 }
+
+/* tp8 loop P6 (cards lq12: lent 2048-row chunks every ~282 ms, the two stages overlapping ~15 %): a chunk another lane lent
+ * carries its home request's lever PSK plan (design 2's next target less the chunk end), the value one lane plans for that
+ * chunk -- not "no plan", under which the plugin runs design 1's cone over every lent chunk's end. ds41_psk 2 / K 2 on the
+ * DS line's exact geometry (interval 2048, 4160, span 2), 1 / 2 / 3 lanes, a 20,000-token prompt. */
+TEST(lanes_a_lent_chunk_carries_its_home_requests_psk_plan) {
+    std::map<int, int64_t> ref;
+    for (int lanes : { 1, 2, 3 }) {
+        Lanes L;
+        L.grid = 2048;
+        L.cfg.prefill_span = 2;
+        L.cfg.pp_plan_prefix = true;
+        L.max_tok = 4160;
+        L.max_ctx = 30000;
+        L.stage_rows = 1024;
+        L.seqs = 6;
+        REQUIRE_EQ(L.start(lanes), RAD_OK);
+        for (int l = 0; l < lanes; ++l) {
+            L.at(l).set_psk_k(2);
+            L.at(l).set_psk_mode(2);
+        }
+        const uint64_t s = L.submit(0, 20000, 2);
+        REQUIRE(s != 0);
+        std::map<int, int64_t> got;
+        int lent = 0, noplan = 0;
+        std::vector<int> fifo;
+        std::vector<char> busy((size_t)lanes, 0);
+        int next = 0;
+        for (int round = 0; round < 400; ++round) {
+            const Request* r0 = L.req(0, s);
+            if (!r0 || !r0->output.empty() || r0->state == ReqState::Failed || r0->state == ReqState::Finished) break;
+            std::vector<int> todo;
+            for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+            for (size_t at = 0; at < todo.size(); ++at) {
+                const int l = todo[at];
+                if (busy[(size_t)l]) continue;
+                std::vector<int> order, idle_after;
+                for (int j = 1; j < lanes; ++j)
+                    if (!busy[(size_t)((l + j) % lanes)]) { order.push_back((l + j) % lanes); idle_after.push_back((l + j) % lanes); }
+                for (int f : fifo) order.push_back(f);
+                const RadBatch* b = L.plan(l, order);
+                if (!b) continue;
+                std::vector<int32_t> ahead, rows;
+                int64_t dec = 0;
+                const bool planned = L.at(l).psk_plan(b->step, &ahead, &rows, &dec);
+                size_t k = 0;
+                for (const StepEntry& e : L.at(l).plan().e) {
+                    if (!e.is_prefill) continue;
+                    if (e.seq == s) {
+                        const int64_t a = planned && k < ahead.size() ? ahead[k] : (int64_t)Scheduler::kPskNoPlan;
+                        got[e.ctx_len] = a;
+                        lent += e.home >= 0;
+                        noplan += a == (int64_t)Scheduler::kPskNoPlan;
+                    }
+                    ++k;
+                }
+                busy[(size_t)l] = 1;
+                fifo.push_back(l);
+                next = (l + 1) % lanes;
+                todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+            }
+            if (fifo.empty()) break;
+            const int l = fifo.front();
+            fifo.erase(fifo.begin());
+            CHECK_OK(L.commit(l, 5));
+            busy[(size_t)l] = 0;
+        }
+        REQUIRE(L.req(0, s) != nullptr);
+        CHECK_EQ(L.req(0, s)->n_computed, (int64_t)20000);
+        CHECK_EQ(noplan, 0);
+        if (lanes == 1) ref = got;
+        else {
+            CHECK(lent > 0);
+            CHECK(got == ref);
+            fprintf(stderr, "    %d lanes: %zu chunks, %d lent, every chunk's PSK plan = one lane's: %s\n", lanes, got.size(), lent,
+                    got == ref ? "yes" : "NO");
+        }
+    }
+}
+

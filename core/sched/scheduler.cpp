@@ -3840,6 +3840,16 @@ const RadBatch* Scheduler::step() {
         for (const StepEntry& e : plan_.e) {
             if (!e.is_prefill) { psk_dec_ += e.n_tokens; continue; }
             const SchedReq* sr = e.slot >= 0 && (size_t)e.slot < reqs_.size() ? reqs_[(size_t)e.slot].get() : nullptr;
+            /* tp8 loop P6: a chunk another lane lent this one (StepEntry::home, slot -1) is planned by its home's request
+             * -- its latched PSK targets. Without it the lent chunk had no plan and the plugin ran design 1's cone there
+             * (layers 21..39 over its own end's 2,464 .. 160 rows, which design 2 skips in a body chunk): every lent chunk
+             * of a cold prompt cost a cone on top of its body (cards lq12: 2048-row chunks every ~282 ms, the stages
+             * overlapping ~15 %). Design 1 computes a superset of design 2's rows, so the answers were the same. */
+            if (!sr && e.home >= 0 && lanes_)
+                if (const Scheduler* h = lanes_->lane(e.home)) {
+                    auto it = h->by_id_.find(e.seq);
+                    if (it != h->by_id_.end() && (size_t)it->second < h->reqs_.size()) sr = h->reqs_[(size_t)it->second].get();
+                }
             int32_t a = kPskNoPlan, fl = 0;
             if (sr && sr->req && sr->psk_k > 0) {
                 const int64_t from = e.ctx_len, end = from + e.n_tokens;
