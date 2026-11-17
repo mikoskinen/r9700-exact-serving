@@ -2198,6 +2198,8 @@ void Scheduler::psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt) {
 bool Scheduler::lane_span_cut(int64_t n_computed, int64_t n_target) const {
     if (!lanes_ || n_lanes_ <= 1) return false;
     if (!lanes_->span_on()) return true;
+    /* tp8 loop P7 (RADIANCE_PP_SPAN_SHORT=N): every piece of a prompt of at most N rows */
+    if (const int64_t sh = lanes_->span_short(); sh > 0 && n_target <= sh) return true;
     /* tp8 loop P7 (RADIANCE_PP_SPAN_TAIL=X): only a piece that starts within the prompt's last X rows */
     const int64_t x = lanes_->span_tail();
     return x > 0 && n_target - n_computed <= x;
