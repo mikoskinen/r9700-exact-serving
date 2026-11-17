@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <new>
 #include <string>
 
@@ -12980,6 +12981,108 @@ TEST(lanes_a_failed_build_takes_back_the_pieces_its_split_lent) {
     CHECK_OK(L.commit(0, 7));
     CHECK_OK(L.commit(1, 7));
     CHECK_EQ(L.req(0, x)->n_computed, (int64_t)(e1->ctx_len + e1->n_tokens));
+}
+
+/* tp8 S5 review: the lanes share one KV pool but each preempts only its own requests. A lane whose
+ * only running request cannot grow because another lane holds the pool must not fail it as "the KV
+ * pool cannot hold it": one lane would preempt the request behind it. It is preempted by recompute
+ * and waits for the other lane's requests, as the back of one lane's running set does, and finishes. */
+TEST(lanes_a_request_another_lane_crowds_out_is_preempted_not_failed) {
+    Lanes L;
+    REQUIRE_EQ(L.start(2), RAD_OK);
+    L.set.set_split(false, 16);
+    L.kv.setup(L.prog.kv_groups, L.cfg.max_ctx, 12, 64);   /* 12 blocks of 16: 192 tokens for both lanes */
+    const uint64_t a = L.submit(0, 90, 60);
+    const uint64_t b = L.submit(1, 90, 60, 3000);
+    REQUIRE(a != 0 && b != 0);
+    int failed = 0;
+    for (int round = 0; round < 400; ++round) {
+        bool any = false;
+        for (int l = 0; l < 2; ++l) {
+            if (!L.plan(l, { 1 - l })) continue;
+            any = true;
+            CHECK_OK(L.commit(l, 7));
+        }
+        for (uint64_t id : { a, b }) {
+            const Request* r = L.req(id == a ? 0 : 1, id);
+            if (r && r->state == ReqState::Failed) ++failed;
+        }
+        if (!any || failed) break;
+    }
+    CHECK_EQ(failed, 0);
+    for (uint64_t id : { a, b }) {
+        const Request* r = L.req(id == a ? 0 : 1, id);
+        REQUIRE(r != nullptr);
+        CHECK(r->state == ReqState::Finished);
+        CHECK_EQ((int64_t)r->output.size(), (int64_t)60);
+        if (r->state != ReqState::Finished)
+            fprintf(stderr, "    request %llu: %s, %zu tokens\n", (unsigned long long)id, r->finish_reason.c_str(),
+                    r->output.size());
+    }
+}
+
+/* tp8 S5 review: under a full pool the back of a lane's running set may be a newcomer whose piece
+ * runs in another lane, which preempt_back refuses; the request that wanted its blocks then waits a
+ * step and the plan moves past it. Before the fix the loop re-tried the same refused ensure forever
+ * with the step lock held (the engine hung). Pool sizes are swept so some step meets that state; every
+ * request finishes, none fails, the pieces commit in position order. */
+TEST(lanes_a_refused_preemption_moves_the_plan_on) {
+    int met = 0;
+    for (int64_t pool = 14; pool <= 36; ++pool) {   /* x alone needs 13 blocks, all three 33 */
+        Lanes L;
+        REQUIRE_EQ(L.start(2), RAD_OK);
+        L.set.set_split(false, 16);
+        L.kv.setup(L.prog.kv_groups, L.cfg.max_ctx, pool, 64);
+        const uint64_t a = L.submit(0, 32, 120);
+        const uint64_t b = L.submit(1, 32, 120, 3000);
+        uint64_t x = 0;
+        bool bad = false;
+        /* the engine's order (engine_lanes.cpp): every idle lane plans (its planners: the idle lanes
+         * after it, then those in flight, oldest first), then the oldest lane in flight commits */
+        std::deque<int> fifo;
+        bool busy[2] = { false, false };
+        for (int round = 0; round < 4000 && !bad; ++round) {
+            if (round == 6) {
+                x = L.submit(0, 200, 4, 7000);
+                L.set.set_split(true, 16);
+            }
+            for (int l = 0; l < 2; ++l) {
+                if (busy[l]) continue;
+                std::vector<int> order;
+                if (!busy[1 - l]) order.push_back(1 - l);
+                for (int f : fifo) order.push_back(f);
+                if (!L.plan(l, order)) continue;
+                busy[l] = true;
+                fifo.push_back(l);
+                /* a request the plan stepped past: running with blocks, not in this step */
+                if (l == 0 && x) {
+                    const Request* ra = L.req(0, a);
+                    if (ra && ra->state == ReqState::Running && !L.entry_of(0, a) && L.entry_of(0, x)) ++met;
+                }
+            }
+            if (fifo.empty()) {
+                if (round > 6) break;
+                continue;
+            }
+            const int l = fifo.front();
+            fifo.pop_front();
+            CHECK_OK(L.commit(l, 7));
+            busy[l] = false;
+            for (uint64_t id : { a, b, x }) {
+                if (!id) continue;
+                const Request* r = L.req(id == b ? 1 : 0, id);
+                if (r && r->state == ReqState::Failed) bad = true;
+            }
+        }
+        CHECK(!bad);
+        CHECK(L.set.broken().empty());
+        for (uint64_t id : { a, b, x }) {
+            const Request* r = L.req(id == b ? 1 : 0, id);
+            REQUIRE(r != nullptr);
+            CHECK(r->state == ReqState::Finished);
+        }
+    }
+    fprintf(stderr, "    %d step(s) planned past a request whose preemption was refused\n", met);
 }
 
 /* tp8 S5 review: a step carrying another lane's piece is a shared step, and a step wider than the

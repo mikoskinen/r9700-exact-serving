@@ -192,6 +192,19 @@ void Scheduler::lane_plan_end() {
     lane_out_.clear();
 }
 
+/* Whether KV blocks this lane cannot preempt are held by running requests: another lane's, or this
+ * lane's own left out of this step's plan (lane_plan_begin: pieces of them run elsewhere). Never on
+ * one lane. The lock is held. */
+bool Scheduler::lane_others_hold() const {
+    if (!lanes_ || n_lanes_ <= 1) return false;
+    if (!lane_out_.empty()) return true;
+    for (int l = 0; l < lanes_->n(); ++l) {
+        const Scheduler* o = lanes_->lane(l);
+        if (o && o != this && !o->running_.empty()) return true;
+    }
+    return false;
+}
+
 /* The budget this lane's own plan may take: the pieces lent to it run in this step whatever it
  * plans, so they come first; a step carrying another lane's piece is a shared step (no span). */
 int64_t Scheduler::lane_reserve(int64_t budget) {
