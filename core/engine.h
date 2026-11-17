@@ -691,6 +691,7 @@ private:
      * the switches as applied, and the ranks place_hb acts on (RADIANCE_PLACE_HB_RANKS, a bit a rank; all unset). */
     bool             sa_capable_ = false, hb_capable_ = false;
     std::atomic<int> stage_short_{0}, stage_pick_{0}, place_hb_{0};
+    std::atomic<int> stage_lone_{0};   /* lever SAL (ds41-pf2, fn4 stage_lone) */
     /* Lever SP (ds41-int9; fn4 stage_full_min / stage_full_pick): whether it can act (a prefill stager on every rank,
      * Engine::sahb_setup), the switches as applied (read by arena_step). */
     bool             sp_capable_ = false;
@@ -710,6 +711,10 @@ private:
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
      * (stager.h); 0 without one. */
     int64_t  arena_span_rows_ = 0;
+    /* Lever TI (ds41-pf2): a plugin serves a CONV window at a row inside a step (fn4::ckpt_conv_src), and the snapshots
+     * saved inside a step so far (save_checkpoints). */
+    bool     ti_capable_ = false;
+    uint64_t ti_saves_ = 0;
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;

@@ -1264,9 +1264,22 @@ static constexpr int64_t kBiMoe = 16;
  * step) is gather + all-reduce byte for byte (lever D3) -- so a row's bytes are its per-pass all-reduce's, i.e. ds41_bi
  * 3 / 4's, i.e. its alone bytes. Taken only where the block reduces its gathered delta in one collective (no moe /
  * shared all-reduce, combine or add; no consumer taking the all-reduce, no gather folded into it). */
-static bool bi_pieces(int v) { return v == 2 || v == 4 || v == 6; }
+/* 7 (lever PMM, ds41-pf2 17.11.2026) = 6 + the routed MoE of consecutive prefill segments as ONE pass: a segmented step's
+ * prefill segments of at least kPmmMin rows each, whose rows follow one another (every uncut layer; a cut layer where a
+ * later segment lies wholly in its cone), take one MoE pass over their rows together instead of a pass each -- so a host-
+ * resident expert two prompts both route crosses the link once a layer, not once a prompt (s8mix: a MIXED step with a
+ * second prefill segment read 6.6-8.4 GB a rank from host against 3.0-4.4 GB with one). Exact: every op of the pass at
+ * prefill height writes a row's bytes whatever the pass's other rows -- the router chain's forms (FUSE-R: "every form writes
+ * the separate ops' bytes at any row count"), the shared arm's dense GGUF GEMMs under ds41_wmk (one part order at every row
+ * count), the EXL3 experts' prefill band above kBiMoe rows (a prompt's rows read the same bytes in any chunking: lever TI's
+ * cold texts and turn-2 resumes IDENTICAL), the gather per row, the exact wire's all-reduce per element -- and each segment
+ * alone is above every row band (kPmmMin >= kBiBand, kBiMoe). The decode segment keeps its pieces. */
+static constexpr int64_t kPmmMin = 128;
+static bool bi_pieces(int v) { return v == 2 || v == 4 || v == 6 || v == 7; }
 static bool bi_cheap(int v) { return v >= 3; }
 static bool bi_onear(int v) { return v >= 5; }
+static bool bi_pmm(int v) { return v == 7; }
+static std::atomic<long long> g_pmm_steps{0}, g_pmm_merged{0};   /* lever PMM: steps with a merged pass; passes saved (layer 0) */
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
 
@@ -1449,6 +1462,18 @@ static bool psk_cr_flag(const PskPlan* p, size_t i) {
  * WMMA (> 48), rmsnorm's fixed partition, per-row rope / round trip / window store). Target output never reads a draft,
  * so the target is exact by construction; the drafter's readable window is byte-for-byte today's. 0 = every row (today).
  * RADIANCE_DS41_DSPARK_PFCTX=0 / 1 sets the start value (unset: 0). `_ok`: a declare has the context pass's ops. */
+/* Lever TI (ds41-pf2, fn4 sched_tail_inner): each rank's mapped Engram ids of the trunk step it issued last (m.ctok, one i32
+ * a row in the batch's row order: token_map's output, media rows written over it) and the Engram window's ids (ngram - 1),
+ * for the engine's snapshot inside a step (rad_ckpt_conv_src below). */
+static constexpr int kTiRanks = 16;
+static std::atomic<const void*> g_ti_ctok[kTiRanks];
+static std::atomic<int> g_ti_ctx{0};
+static void ti_note(RadCtx* x, const Model& m) {
+    const int rk = rad_rank(x);
+    if (!m.ctok || rk < 0 || rk >= kTiRanks) return;
+    g_ti_ctok[rk].store(rad_buf_ptr(x, m.ctok), std::memory_order_release);
+    g_ti_ctx.store((int)m.c.ngram - 1, std::memory_order_release);
+}
 static std::atomic<int> g_sw_pfctx{0}, g_sw_pfctx_ok{0}, g_sw_pfctx_env{-2};   /* env: -2 unread, -1 unset */
 /* Live counters (rank 0's; /stats "dspark_pfctx"): context passes cut, their rows not run, the rows they ran. */
 static std::atomic<long long> g_pfctx_passes{0}, g_pfctx_skipped{0}, g_pfctx_run{0};
@@ -1815,15 +1840,15 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (const int r = idx_fn4_accepts(name, value)) return r;
     if (!std::strcmp(name, "ds41_argather"))
         return value >= 0 && value <= g_sw_gar_decl.load(std::memory_order_relaxed) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_shexp_lane"))
-        return value == 0 || (value == 1 && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_shexp_lane"))   /* 2: lever F4P (ds41-pf2), prefill-height passes only */
+        return value == 0 || ((value == 1 || value == 2) && g_sw_shexp_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (const K1Switch* k = k1_switch(name))
         return value == 0 || (value >= 1 && value <= k->max && k->ok->load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step) */
-        return value == 0 || (value >= 1 && value <= 6 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
+        return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
         return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ||
                ((value == 2 || value == 3 || value == 4) && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
@@ -5628,6 +5653,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     if (m.tok_map)
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap), brows(m.ctok, T));
     media_tokens(x, m, batch, T);
+    ti_note(x, m);   /* lever TI */
     for (auto& L : m.layers) {
         if (!L.e_ids) continue;
         const int l = L.l;
@@ -6238,9 +6264,29 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 /* the passes (first row, rows) in the order 1 .. 4 issue them */
                 static thread_local std::vector<std::pair<int64_t, int64_t>> passes;
                 passes.clear();
+                /* lever PMM (ds41_bi 7): a prefill segment of >= kPmmMin rows right after the previous one (also of
+                 * >= kPmmMin rows) joins its pass */
+                const bool pmm = bi_pmm(biv);
+                bool prev_pf = false;
+                int64_t merged = 0;
                 for (const BiSeg& s : sg) {
+                    const bool pf = !s.dec && s.n >= kPmmMin;
+                    if (pmm && pf && prev_pf && passes.back().first + passes.back().second == s.r0) {
+                        passes.back().second += s.n;
+                        ++merged;
+                        continue;
+                    }
+                    prev_pf = pf;
                     if (!s.dec || s.n <= piece) { passes.emplace_back(s.r0, s.n); continue; }
                     for (int64_t a = 0; a < s.n; a += piece) passes.emplace_back(s.r0 + a, std::min(piece, s.n - a));
+                }
+                if (merged > 0 && l == 0 && rad_rank(x) == 0) {
+                    const long long n = g_pmm_steps.fetch_add(1, std::memory_order_relaxed) + 1;
+                    g_pmm_merged.fetch_add(merged, std::memory_order_relaxed);
+                    if (n == 1 || n % 256 == 0)
+                        fprintf(stderr, "radiance: deepseek41: lever PMM (ds41_bi 7): %lld segmented steps ran their consecutive "
+                                        "prefill segments' MoE as one pass at layer 0 (%lld passes fewer; this one %lld)\n",
+                                n, g_pmm_merged.load(std::memory_order_relaxed), (long long)merged);
                 }
                 /* one all-reduce over the step's rows: only where the block reduces its gathered delta in ONE collective
                  * over h.x (issue_ar), nothing takes it downstream, and the gather is the block's own; a PSK-cut layer
@@ -6420,6 +6466,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap),
                     brows(m.ctok, T));
     media_tokens(x, m, batch, T);
+    ti_note(x, m);   /* lever TI */
 
     /* The Engram's row ids are a function of the batch's tokens alone (token_map, each Engram
      * layer's token history), never of an activation, so every Engram layer's ngram_ids is issued
@@ -7161,6 +7208,24 @@ extern "C" int rad_dspark_pfctx_stats(long long* out, int n) {
     out[2] = g_pfctx_skipped.load(std::memory_order_relaxed);
     out[3] = g_pfctx_run.load(std::memory_order_relaxed);
     return 4;
+}
+
+/* Lever TI (ds41-pf2, fn4 sched_tail_inner): the source of the Engram CONV window at a row inside a trunk step, for a
+ * snapshot the engine saves there (Engine::save_checkpoints). rank -1 is the engine's probe: 1 = a snapshot inside a step
+ * is whole here -- the compressor tails (the LINEAR groups, kv_comp_tail_r*) at lever G's tail grid are never read by the
+ * chunk a resume starts there (the grid is a multiple of every compress ratio: the chunk from there compresses its own
+ * rows only, as lever PSK-CR's replay relies on), and the Engram window (kv_engram_tokens, CONV: ngram_ids leaves a
+ * prefill's last ngram - 1 mapped ids at offset zero) is read back from the step's mapped ids. rank >= 0: that rank's
+ * mapped ids of its last issued trunk step (device, one i32 a row) and the window's ids; 0 when none is known. */
+extern "C" int rad_ckpt_conv_src(int rank, const void** ids, int* ctx) {
+    using namespace deepseek41;
+    if (ids) *ids = nullptr;
+    if (ctx) *ctx = 0;
+    if (rank < 0) return 1;
+    if (rank >= kTiRanks || !ids || !ctx) return 0;
+    *ids = g_ti_ctok[rank].load(std::memory_order_acquire);
+    *ctx = g_ti_ctx.load(std::memory_order_acquire);
+    return *ids && *ctx > 0 ? 1 : 0;
 }
 
 RAD_ARCH_PROBE(deepseek41)
