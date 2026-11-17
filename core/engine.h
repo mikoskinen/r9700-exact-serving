@@ -417,6 +417,15 @@ private:
     /* The step frame of build `b`: header + PSK plan + clears + wire in `out`, the span (the
      * builder's until its next build) in `span` / `span_n`. */
     int  pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n);
+    /* tp8 S6: the step's checkpoint restores (before the pass) and saves (after it) for the follower's
+     * own state groups (the prefix cache's snapshots), and the KV-copy check (RADIANCE_PP_KV_CHECK). */
+    int  pp_ck_list(std::vector<int32_t>* out);
+    int  pp_ck_apply(const int32_t* q, int32_t n, bool save);
+    void pp_kv_check_send();
+    int  pp_kv_check_recv(const std::vector<uint8_t>& body, uint64_t step);
+    int  pp_kv_crc(int32_t group, int32_t slot, int64_t top, uint32_t* crc, int64_t* bytes);
+    int  pp_kv_check_every_ = 0;
+    int64_t pp_kv_checks_ = 0, pp_kv_bad_ = 0;
     /* Robustness 5: SIGTERM / SIGINT reached a follower (serve() installs the handler there). */
     bool pp_stop_requested() const;
     bool pp_on() const { return cfg_.pp_nodes == 2; }

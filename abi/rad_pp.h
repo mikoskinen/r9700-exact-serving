@@ -119,6 +119,22 @@ __attribute__((weak))
 #endif
 void rad_pp_crossing(int ring, int64_t row_bytes, int parts);
 
+/* tp8 S6: the plugin names, at declare (rank 0's real declare; repeats are ignored), each KV cache
+ * layer both nodes hold of one source -- the owner its own, the receiver the copy a crossing fills:
+ * `group` (the rad_kvgroup), `slot` (the layer's place among the group's bound layers on THIS node, in
+ * ascending layer order: the builder sorts them)
+ * and `layer` (the model layer, which names it on both). RADIANCE_PP_KV_CHECK=N then has the two
+ * nodes compare a CRC-32C of that layer's blocks every N trunk steps (debug). Weak, like
+ * rad_pp_info. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_kv_copy(int32_t group, int32_t slot, int32_t layer);
+
+static inline void rad_pp_declare_kv_copy(int32_t group, int32_t slot, int32_t layer) {
+    if (rad_pp_kv_copy) rad_pp_kv_copy(group, slot, layer);
+}
+
 /* The node's pipeline as the plugin should act on it: nodes 1 when the engine has no pipeline or
  * predates it. */
 static inline RadPpInfo rad_pp_query(void) {

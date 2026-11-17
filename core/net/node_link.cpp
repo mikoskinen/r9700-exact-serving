@@ -104,6 +104,7 @@ const char* frame_name(uint16_t k) {
         case kFn4Ask: return "fn4-ask";
         case kFn4Ans: return "fn4-answer";
         case kFn4State: return "fn4-state";
+        case kKvCheck: return "kv-check";
         default: return k >= kUser ? "user" : "unknown";
     }
 }
