@@ -334,7 +334,13 @@ int Engine::lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint
     /* The drafter's passes behind the tail cross nothing: a whole pass of the lane. */
     pp_set_pass(lane, RAD_PP_PART_WHOLE);
     if (t_on) phase_mark(PH_RANKS);
-    for (uint64_t id : cancel) lsched().cancel(id);
+    /* tp8 S5 review: a row the sampler refused may be another lane's (a newcomer's last piece, which
+     * samples its first token here): the cancel goes to the lane holding the request, or the request
+     * would commit a token its sampler never staged. */
+    for (uint64_t id : cancel) {
+        Scheduler* o = lanes_.owner(id);
+        (o ? *o : lsched()).cancel(id);
+    }
     cancel.clear();
     if (bst < 0) return bst;
     int st = step_status_.load(std::memory_order_acquire);
