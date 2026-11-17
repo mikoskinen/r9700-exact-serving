@@ -283,6 +283,23 @@ int ctxskip_env() {
     }();
     return v;
 }
+/* tp8 dev D4: RADIANCE_PP_CTXSKIP_LANES=1 -- the skip under lanes, the ring one region a lane (a leader with lanes only) */
+bool ctxskip_lanes_env() {
+    static const bool v = [] {
+        const char* e = std::getenv("RADIANCE_PP_CTXSKIP_LANES");
+        return e && !std::strcmp(e, "1");
+    }();
+    return v;
+}
+int ctxskip_lanes(const Config& c) {
+    return ctxskip_lanes_env() && c.pp_nodes == 2 && c.pp_rank == 0 && c.pp_lanes_now() > 1 ? c.pp_lanes_now() : 1;
+}
+int64_t ctxskip_lane_rows(const Config& c) {
+    const int64_t seqs = c.max_seqs > 0 ? c.max_seqs : 1;
+    const int n = ctxskip_lanes(c);
+    return n > 1 ? (seqs + n - 1) / n : seqs;
+}
+int64_t ctxskip_ring_rows(const Config& c) { return ctxskip_lanes(c) * ctxskip_lane_rows(c); }
 int64_t dtype_bytes(int32_t dt) {
     switch (dt) {
         case RAD_BF16: case RAD_F16: return 2;
@@ -311,8 +328,7 @@ int64_t Engine::ctxskip_bytes(const Program& p, rad_buf* src, int64_t* pitch, in
         if (src) *src = (rad_buf)i;
         if (pitch) *pitch = pb;
         if (slots) *slots = sl;
-        const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
-        return (int64_t)(sl + 1) * seqs * pb;
+        return (int64_t)(sl + 1) * ctxskip_ring_rows(cfg_) * pb;
     }
     return 0;
 }
@@ -351,7 +367,11 @@ int Engine::ctxskip_setup() {
         return RAD_OK;
     }
     const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
-    ctxs_.ring_bytes = (int64_t)(ctxs_.slots + 1) * seqs * ctxs_.pitch;
+    ctxs_.lanes = ctxskip_lanes(cfg_);
+    ctxs_.lane_rows = ctxskip_lane_rows(cfg_);
+    ctxs_.ring_rows = ctxskip_ring_rows(cfg_);
+    ctxs_.used_l.assign((size_t)ctxs_.lanes, 0);
+    ctxs_.ring_bytes = (int64_t)(ctxs_.slots + 1) * ctxs_.ring_rows * ctxs_.pitch;
     for (size_t r = 0; r < ranks_.size(); ++r) {
         if (!ctxs_.src[r]) continue;
         RAD_TRY(rad_dev_set(ranks_[r]->device));
@@ -374,8 +394,24 @@ int Engine::ctxskip_setup() {
              "refilled from them before the head runs", ev, ctxs_.slots, (long long)seqs,
              humanb(ctxs_.pitch).c_str(), humanb(ctxs_.ring_bytes).c_str(), taps, ranks_.size(),
              (int)drafter_.window);
+    if (ctxs_.lanes > 1)
+        RAD_INFO("draft context skip under %d lanes (RADIANCE_PP_CTXSKIP_LANES=1, tp8 dev D4): the ring is one region of %lld "
+                 "rows a lane in every step slot, each lane keeping and refilling its own steps", ctxs_.lanes,
+                 (long long)ctxs_.lane_rows);
     ctx_note();
     return RAD_OK;
+}
+
+/* tp8 dev D4: the current lane's slot count and region (lane 0's = the whole ring without the lanes' regions) */
+int& Engine::ctx_used() {
+    if (ctxs_.lanes <= 1) return ctxs_.used;
+    const int l = lsched().lane();
+    return ctxs_.used_l[(size_t)(l >= 0 && l < ctxs_.lanes ? l : 0)];
+}
+int64_t Engine::ctx_row0() const {
+    if (ctxs_.lanes <= 1) return 0;
+    const int l = lsched().lane();
+    return (int64_t)(l >= 0 && l < ctxs_.lanes ? l : 0) * ctxs_.lane_rows;
 }
 
 void Engine::ctxskip_fini() {
@@ -404,7 +440,7 @@ int Engine::ctx_limit() const {
  * checkpoint carrying the drafter's window); such a step needs the rung the refill passes are cut to. */
 bool Engine::ctx_refill_due() {
     if (!ctxs_.ready || !ctxs_.on || lsched().ctx_pending() == 0) return false;
-    if (ctxs_.used >= ctx_limit()) return true;
+    if (ctx_used() >= ctx_limit()) return true;
     if (drafter_snap_)
         for (const StepEntry& e : lsched().plan().e)
             if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) return true;
@@ -415,14 +451,15 @@ bool Engine::ctx_refill_due() {
  * on its stream: behind the trunk step that wrote them, ahead of the next pass that reads them. */
 int Engine::ctx_copy_rows(int slot, int64_t rows, bool to_ring) {
     if (rows <= 0) return RAD_OK;
-    const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
-    if (slot < 0 || slot > ctxs_.slots || rows > seqs) return RAD_E_STATE;
+    /* tp8 dev D4: a lane's rows go to its region (ring_rows = max_seqs and row 0 without the lanes' regions) */
+    const int64_t seqs = ctxs_.ring_rows, row0 = ctx_row0(), cap = ctxs_.lanes > 1 ? ctxs_.lane_rows : seqs;
+    if (slot < 0 || slot > ctxs_.slots || rows > cap) return RAD_E_STATE;
     const int64_t bytes = rows * ctxs_.pitch;
     for (size_t r = 0; r < ranks_.size(); ++r) {
         if (!ctxs_.src[r]) continue;
         Rank& rk = *ranks_[r];
         char* sp = static_cast<char*>(rk.ctx.buf_ptr(ctxs_.src[r]));
-        char* rp = ctxs_.ring[r] + (int64_t)slot * seqs * ctxs_.pitch;
+        char* rp = ctxs_.ring[r] + ((int64_t)slot * seqs + row0) * ctxs_.pitch;
         if (!sp || !rp) return RAD_E_STATE;
         RAD_TRY(to_ring ? rad_memcpy_async(rp, sp, bytes, rk.ctx.stream())
                         : rad_memcpy_async(sp, rp, bytes, rk.ctx.stream()));
@@ -432,7 +469,8 @@ int Engine::ctx_copy_rows(int slot, int64_t rows, bool to_ring) {
 
 /* Refill passes until no kept row is left, each at most the active arena level's rows. */
 int Engine::ctx_refill_all(int step) {
-    const int64_t seqs = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
+    /* tp8 dev D4: a lane refills from its region */
+    const int64_t seqs = ctxs_.ring_rows, row0 = ctx_row0(), rcap = ctxs_.lanes > 1 ? ctxs_.lane_rows : seqs;
     int64_t cap = cfg_.max_tok;
     if (!ranks_.empty()) {
         const int lvl = ranks_[0]->ctx.level();
@@ -451,10 +489,10 @@ int Engine::ctx_refill_all(int step) {
             char* sp = static_cast<char*>(rk.ctx.buf_ptr(ctxs_.src[r]));
             if (!sp) return RAD_E_STATE;
             for (const Scheduler::CtxRun& u : ctxs_.runs) {
-                if (u.slot < 0 || u.slot + u.n > ctxs_.slots || u.row < 0 || u.row >= seqs || u.dst < 0 ||
+                if (u.slot < 0 || u.slot + u.n > ctxs_.slots || u.row < 0 || u.row >= rcap || u.dst < 0 ||
                     u.dst + u.n > nr)
                     return RAD_E_STATE;
-                const char* from = ctxs_.ring[r] + ((int64_t)u.slot * seqs + u.row) * ctxs_.pitch;
+                const char* from = ctxs_.ring[r] + ((int64_t)u.slot * seqs + row0 + u.row) * ctxs_.pitch;
                 RAD_TRY(rad_memcpy_2d_async(sp + (int64_t)u.dst * ctxs_.pitch, ctxs_.pitch, from,
                                             seqs * ctxs_.pitch, ctxs_.pitch, u.n, rk.ctx.stream()));
             }
@@ -463,7 +501,7 @@ int Engine::ctx_refill_all(int step) {
         ++ctxs_.refills;
         ctxs_.refill_rows += nr;
     }
-    ctxs_.used = 0;
+    ctx_used() = 0;
     return RAD_OK;
 }
 
@@ -484,17 +522,20 @@ int Engine::block_context_pass(int step) {
         for (const StepEntry& e : lsched().plan().e)
             if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { snap = true; break; }
     int64_t rows = 0, live = 0;
-    const bool keepable = lsched().ctx_keepable(&rows, &live) && rows <= (cfg_.max_seqs > 0 ? cfg_.max_seqs : 1);
+    /* tp8 dev D4: a lane's step keeps at most its region's rows */
+    const int64_t kcap = ctxs_.lanes > 1 ? ctxs_.lane_rows : (cfg_.max_seqs > 0 ? cfg_.max_seqs : 1);
+    const bool keepable = lsched().ctx_keepable(&rows, &live) && rows <= kcap;
+    int& used = ctx_used();
     if (ctxs_.on && !head && !snap && keepable) {
         if (live == 0) {   /* every row a finished sequence's placeholder: the pass would store nothing */
             ++ctxs_.skipped;
             ctx_note();
             return RAD_OK;
         }
-        if (ctxs_.used < ctx_limit()) {
-            RAD_TRY(ctx_copy_rows(ctxs_.used, rows, true));
-            (void)lsched().ctx_keep(ctxs_.used);
-            ++ctxs_.used;
+        if (used < ctx_limit()) {
+            RAD_TRY(ctx_copy_rows(used, rows, true));
+            (void)lsched().ctx_keep(used);
+            ++used;
             ++ctxs_.skipped;
             ctx_note();
             return RAD_OK;
@@ -502,7 +543,7 @@ int Engine::block_context_pass(int step) {
         ++ctxs_.ring_full;   /* refilled below; this step's rows get their context pass */
     }
     if (lsched().ctx_pending() == 0) {
-        ctxs_.used = 0;
+        used = 0;
         return ctx_pass();
     }
     if (head && keepable) {

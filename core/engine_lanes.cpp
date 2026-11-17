@@ -85,7 +85,8 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     lanes_.set_head_state(cfg_.pp_cut_h > 0);
     /* tp8 S5 review: draft_ctxskip=1 refused by name under lanes (fn4), not accepted and left off: a run kit
      * that reads its switches back drops it instead of stopping on a value that differs */
-    fn4::ctxskip_refuse_lanes();
+    /* tp8 dev D4: under RADIANCE_PP_CTXSKIP_LANES=1 the ring is one region a lane (ctxskip_setup), so the skip is taken */
+    if (!(ctxs_.ready && ctxs_.lanes > 1)) fn4::ctxskip_refuse_lanes();
     /* Every lane's batch is its own set of recordings (Ctx::pass_key reads its slab's pointers). */
     for (auto& rk : ranks_) rk->ctx.set_tape_lanes(n_lanes_);
     /* lane l holds cards [l * S / N, (l + 1) * S / N) (Scheduler::init) */
@@ -153,7 +154,7 @@ int Engine::step_loop_lanes() {
                 "two-node pipeline issues none", drafter_.name);
         return fail_loop(RAD_E_UNSUPPORTED);
     }
-    if (ctxs_.ready && ctxs_.on) {
+    if (ctxs_.ready && ctxs_.on && ctxs_.lanes <= 1) {
         RAD_WARN("two-node pipeline with %d lanes: the depth-0 context skip (draft_ctxskip) keeps consecutive "
                  "steps' rows in one ring; lanes interleave their steps, so it is off", n_lanes_);
         ctxs_.on = 0;

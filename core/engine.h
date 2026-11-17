@@ -729,7 +729,17 @@ private:
         std::vector<char*>   ring;
         int64_t skipped = 0, refills = 0, refill_rows = 0, dropped = 0, ring_full = 0;
         std::vector<Scheduler::CtxRun> runs;
+        /* tp8 dev D4 (RADIANCE_PP_CTXSKIP_LANES=1 on a leader with lanes; else 1 / max_seqs / unused): the ring cut into
+         * one region a lane -- rows [lane x lane_rows, (lane + 1) x lane_rows) of every step slot -- and a slot count a
+         * lane (used_l), so each lane keeps and refills its own consecutive steps */
+        int     lanes = 1;
+        int64_t lane_rows = 0;           /* rows a lane's region holds (a lane's cards) */
+        int64_t ring_rows = 0;           /* rows a step slot holds: max_seqs, or lanes x lane_rows */
+        std::vector<int> used_l;
     } ctxs_;
+    /* tp8 dev D4: the current lane's slot count, and its region's first ring row */
+    int&    ctx_used();
+    int64_t ctx_row0() const;
     /* The ring's bytes a rank for `p` (0 when the skip is not declared or `p` taps nothing for a
      * windowed block drafter); `src`, `pitch`, `slots` as found. */
     int64_t ctxskip_bytes(const Program& p, rad_buf* src = nullptr, int64_t* pitch = nullptr,
