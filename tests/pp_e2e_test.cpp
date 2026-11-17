@@ -38,6 +38,8 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <sstream>
+#include <algorithm>
 
 using json = nlohmann::json;
 
@@ -222,7 +224,7 @@ std::string record_single(const std::string& out, const std::vector<std::string>
 struct PipeRun { int leader = -1, follower = -1; std::string llog, flog; };
 PipeRun record_pipeline(const std::string& out, const std::string& cut,
                         const std::vector<std::string>& fenv = {}, const std::vector<std::string>& fextra = {},
-                        const std::vector<std::string>& lextra = {}) {
+                        const std::vector<std::string>& lextra = {}, const std::vector<std::string>& lenv = {}) {
     World& w = world();
     const int port = free_port();
     PipeRun pr;
@@ -234,7 +236,7 @@ PipeRun record_pipeline(const std::string& out, const std::string& cut,
     fol.wait_for("waiting on", 60);
     pr.leader = tiny::run(engine_argv(w.llama_rad, cat(cat(cat({ "--kld-record", out, "--kld-corpus", w.corpus }, shape()),
                                                            pp_args(0, port, cut)), lextra)),
-                          engine_env(), &pr.llog, 240);
+                          engine_env(lenv), &pr.llog, 240);
     pr.follower = fol.finish(60);
     pr.flog = fol.output();
     return pr;
@@ -301,17 +303,18 @@ std::vector<int32_t> prompt_ids(uint64_t seed, size_t n) {
 struct Serving {
     Proc fol, lead;
     int port = 0, pp_port = 0;
-    bool start(const std::string& cut, const std::vector<std::string>& extra = {}) {
+    bool start(const std::string& cut, const std::vector<std::string>& extra = {},
+               const std::vector<std::string>& env = {}) {
         World& w = world();
-        std::vector<std::string> a = cat({ "--host", "127.0.0.1", "--port", "0", "--http-threads", "4" }, shape());
+        std::vector<std::string> a = cat({ "--host", "127.0.0.1", "--port", "0", "--http-threads", "8" }, shape());
         a = cat(a, extra);
         if (!cut.empty()) {
             pp_port = free_port();
-            if (!fol.start(engine_argv(w.llama_rad, cat(a, pp_args(1, pp_port, cut))), engine_env())) return false;
+            if (!fol.start(engine_argv(w.llama_rad, cat(a, pp_args(1, pp_port, cut))), engine_env(env))) return false;
             if (!fol.wait_for("waiting on", 60)) return false;
             a = cat(a, pp_args(0, pp_port, cut));
         }
-        if (!lead.start(engine_argv(w.llama_rad, a), engine_env())) return false;
+        if (!lead.start(engine_argv(w.llama_rad, a), engine_env(env))) return false;
         static const std::string kTag = "listening on http://127.0.0.1:";
         if (!lead.wait_for(kTag, 120)) {
             fprintf(stderr, "    the leader did not start:\n%s\n    follower:\n%s\n", tail(lead.output()).c_str(),
@@ -552,6 +555,196 @@ TEST(a_stopped_follower_tells_the_leader_and_exits_cleanly) {
     const bool named = pp.lead.output().find("the follower was stopped") != std::string::npos;
     if (!named) fprintf(stderr, "    leader:\n%s\n", tail(pp.lead.output()).c_str());
     CHECK(named);
+}
+
+/* ================================================================== tp8 S5: lanes */
+/* The lanes' shape: six sequences (two cards a lane at three lanes), 64-token steps, so a 100-token
+ * prompt prefills in two chunks and each chunk is cut into one piece a lane (RADIANCE_PP_SPLIT_MIN=16:
+ * pieces of at least 16 rows on the quantum grid). */
+std::vector<std::string> lane_shape(int lanes) {
+    return { "--max-num-seqs", "6", "--pp-lanes", std::to_string(lanes) };
+}
+const std::vector<std::string> kSplitEnv = { "RADIANCE_PP_SPLIT_MIN=16" };
+
+/* Seven alone, then eight at once of different lengths: the lanes' steps then carry different
+ * sequences beside each other, and the newcomers' chunks are cut over the lanes. */
+std::vector<std::vector<int32_t>> lane_set(int port) {
+    std::vector<std::vector<int32_t>> out;
+    for (uint64_t s : { 3, 4, 5, 11, 12, 13, 14 }) out.push_back(complete(port, prompt_ids(s, 60 + 17 * s), 24));
+    std::vector<std::future<std::vector<int32_t>>> f;
+    for (uint64_t s : { 6, 7, 8, 9, 15, 16, 17, 18 })
+        f.push_back(std::async(std::launch::async, [port, s] { return complete(port, prompt_ids(s, 40 + 9 * s), 20 + (int)s); }));
+    for (auto& x : f) out.push_back(x.get());
+    return out;
+}
+
+long long log_count(const std::string& log, const std::string& tag) {
+    const size_t at = log.rfind(tag);
+    if (at == std::string::npos) return -1;
+    return std::atoll(log.c_str() + at + tag.size());
+}
+
+/* A sequence's tokens are the same at one lane, two and three, alone and beside other requests, as
+ * one process gives them: lanes and the pieces of a newcomer's chunk change only which rows share a
+ * step (step-composition invariance, on the host backend here; on cards the a1 / under-load identity
+ * runs, S5-LANES.md). */
+TEST(lanes_serve_the_greedy_tokens_one_process_serves) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", { "--max-num-seqs", "6" }));
+        ref = lane_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    for (int lanes : { 1, 2, 3 }) {
+        for (const char* cut : { "0,2", "1,3" }) {
+            Serving pp;
+            REQUIRE(pp.start(cut, lane_shape(lanes), kSplitEnv));
+            const std::vector<std::vector<int32_t>> got = lane_set(pp.port);
+            kill(pp.lead.child.pid, SIGTERM);
+            CHECK_EQ(pp.lead.finish(60), 0);
+            CHECK_EQ(pp.fol.finish(30), 0);
+            const std::string llog = pp.lead.output();
+            REQUIRE_EQ(ref.size(), got.size());
+            int differ = 0;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                CHECK(!ref[i].empty());
+                if (ref[i] != got[i]) ++differ;
+            }
+            const long long lent = log_count(llog, "newcomer split: ");
+            const long long both = log_count(llog, "lane steps, ");
+            const long long steps = [&] {
+                const size_t at = llog.rfind(" lane steps, ");
+                if (at == std::string::npos) return -1ll;
+                size_t b = llog.rfind(' ', at - 1);
+                return std::atoll(llog.c_str() + b + 1);
+            }();
+            fprintf(stderr, "    %d lane(s) W(%s): %d of %zu prompts differ; lane steps %lld, %lld with another lane in "
+                            "flight at their tail; pieces lent %lld\n", lanes, cut, differ, ref.size(), steps, both, lent);
+            CHECK_EQ(differ, 0);
+            if (lanes > 1) {
+                CHECK(llog.find(std::to_string(lanes) + " lanes, each a scheduler") != std::string::npos);
+                CHECK(lent > 0);    /* newcomers' chunks were cut over the lanes */
+                CHECK(both > 0);    /* and lane steps overlapped */
+            } else {
+                CHECK(llog.find("lanes, each a scheduler") == std::string::npos);
+            }
+            if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+        }
+    }
+}
+
+/* The KL recordings (every scored position's log-probabilities) at two and three lanes, the
+ * documents' chunks cut over the lanes (and not cut: RADIANCE_PP_SPLIT=0), are one process's. */
+TEST(lanes_record_what_one_process_records) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_lane_rec");
+    const std::string ref = record_single(d / "single", { "--max-num-seqs", "6" });
+    REQUIRE(!ref.empty());
+    struct Arm { int lanes; const char* cut; bool split; };
+    for (const Arm a : { Arm{ 2, "0,2", true }, Arm{ 3, "0,2", true }, Arm{ 2, "1,3", true }, Arm{ 3, "2,4", true },
+                         Arm{ 2, "0,2", false } }) {
+        const std::string out = d / ("pp-" + std::to_string(a.lanes) + "-" + a.cut + (a.split ? "" : "-nosplit"));
+        const std::vector<std::string> env = a.split ? kSplitEnv : std::vector<std::string>{ "RADIANCE_PP_SPLIT=0" };
+        const PipeRun pr = record_pipeline(out, a.cut, env, lane_shape(a.lanes), lane_shape(a.lanes), env);
+        if (pr.leader != 0 || pr.follower != 0)
+            fprintf(stderr, "    %d lanes W(%s): leader %d, follower %d\n    leader:\n%s\n    follower:\n%s\n", a.lanes,
+                    a.cut, pr.leader, pr.follower, tail(pr.llog).c_str(), tail(pr.flog).c_str());
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(ref, out, &why);
+        const long long pieces = log_count(pr.llog, "newcomer split: ");
+        fprintf(stderr, "    %d lanes W(%s) split %s: recording %s; pieces lent %lld\n", a.lanes, a.cut,
+                a.split ? "on" : "off", same ? "identical" : why.c_str(), pieces);
+        CHECK(same);
+        CHECK(pr.llog.find(std::to_string(a.lanes) + " lanes, each a scheduler") != std::string::npos);
+        if (a.split) CHECK(pieces > 0);
+        else CHECK_EQ(pieces, 0);
+    }
+}
+
+/* Stage busy stamps (RADIANCE_PP_STAMPS): each node's pass intervals, busy only while it computes (the
+ * leader's head up to X1's publish, its tail from X2's arrival; the follower's pass from X1's arrival to
+ * X2's publish -- the host backend's stage ops note those moments). */
+struct Busy { double leader = 0, follower = 0, both = 0, window_ms = 0; size_t n_l = 0, n_f = 0; };
+Busy busy_of(const std::string& prefix) {
+    using Iv = std::vector<std::pair<uint64_t, uint64_t>>;
+    auto load = [](const std::string& path, std::initializer_list<const char*> kinds) {
+        Iv iv;
+        std::istringstream in(tiny::read_text(path));
+        std::string kind;
+        int lane = 0, step = 0;
+        unsigned long long b = 0, e = 0;
+        while (in >> kind >> lane >> step >> b >> e) {
+            bool want = false;
+            for (const char* k : kinds) want = want || kind == k;
+            if (want && e > b) iv.push_back({ b, e });
+        }
+        std::sort(iv.begin(), iv.end());
+        Iv u;
+        for (const auto& x : iv) {
+            if (!u.empty() && x.first <= u.back().second) u.back().second = std::max(u.back().second, x.second);
+            else u.push_back(x);
+        }
+        return u;
+    };
+    const Iv L = load(prefix + ".leader", { "head", "tail" }), F = load(prefix + ".follower", { "mid" });
+    Busy r;
+    r.n_l = L.size();
+    r.n_f = F.size();
+    if (L.empty() || F.empty()) return r;
+    const uint64_t w0 = std::min(L.front().first, F.front().first), w1 = std::max(L.back().second, F.back().second);
+    const double W = (double)(w1 - w0);
+    auto len = [](const Iv& v) { uint64_t t = 0; for (const auto& x : v) t += x.second - x.first; return (double)t; };
+    uint64_t both = 0;
+    for (size_t i = 0, j = 0; i < L.size() && j < F.size();) {
+        const uint64_t lo = std::max(L[i].first, F[j].first), hi = std::min(L[i].second, F[j].second);
+        if (hi > lo) both += hi - lo;
+        if (L[i].second < F[j].second) ++i; else ++j;
+    }
+    r.leader = len(L) / W;
+    r.follower = len(F) / W;
+    r.both = (double)both / W;
+    r.window_ms = W / 1e6;
+    return r;
+}
+
+/* The point of lanes: with one lane the two nodes work in turn (never both at once); with two, both
+ * compute at once for much of the run, and the same requests finish sooner. Host backend, the tiny
+ * model: the fractions are this machine's, the claim is their order. */
+TEST(lanes_keep_both_stages_busy_at_once) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_lane_busy");
+    double tps[3] = {};
+    Busy got[3];
+    for (int lanes : { 1, 2 }) {
+        const std::string prefix = d / ("st" + std::to_string(lanes));
+        Serving pp;
+        REQUIRE(pp.start("0,2", lane_shape(lanes), { "RADIANCE_PP_SPLIT_MIN=16", "RADIANCE_PP_STAMPS=" + prefix }));
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::future<std::vector<int32_t>>> f;
+        for (uint64_t s = 0; s < 12; ++s)
+            f.push_back(std::async(std::launch::async, [&pp, s] { return complete(pp.port, prompt_ids(40 + s, 40 + 7 * s), 48); }));
+        size_t tok = 0;
+        for (auto& x : f) tok += x.get().size();
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        tps[lanes] = (double)tok / sec;
+        got[lanes] = busy_of(prefix);
+        fprintf(stderr, "    %d lane(s): %zu tokens in %.2f s = %.1f tok/s; window %.0f ms: leader busy %.3f, follower busy "
+                        "%.3f, both at once %.3f (%zu / %zu intervals)\n", lanes, tok, sec, tps[lanes], got[lanes].window_ms,
+                got[lanes].leader, got[lanes].follower, got[lanes].both, got[lanes].n_l, got[lanes].n_f);
+        CHECK(got[lanes].n_l > 0 && got[lanes].n_f > 0);
+    }
+    CHECK(got[1].both < 0.02);          /* one lane: the nodes take turns */
+    CHECK(got[2].both > 0.25);          /* two: both busy at once */
+    CHECK(got[2].both > got[1].both + 0.2);
+    CHECK(tps[2] > tps[1]);
 }
 
 }  /* namespace */
