@@ -564,7 +564,8 @@ TEST(a_stopped_follower_tells_the_leader_and_exits_cleanly) {
 std::vector<std::string> lane_shape(int lanes) {
     return { "--max-num-seqs", "6", "--pp-lanes", std::to_string(lanes) };
 }
-const std::vector<std::string> kSplitEnv = { "RADIANCE_PP_SPLIT_MIN=16" };
+/* RADIANCE_PP_PICK=rr: the prompts sent one at a time go to lane 0, 1, 2, ... in turn, so every lane serves alone too */
+const std::vector<std::string> kSplitEnv = { "RADIANCE_PP_SPLIT_MIN=16", "RADIANCE_PP_PICK=rr" };
 
 /* Seven alone, then eight at once of different lengths: the lanes' steps then carry different
  * sequences beside each other, and the newcomers' chunks are cut over the lanes. */
@@ -584,7 +585,7 @@ long long log_count(const std::string& log, const std::string& tag) {
     return std::atoll(log.c_str() + at + tag.size());
 }
 
-/* A sequence's tokens are the same at one lane, two and three, alone and beside other requests, as
+/* A sequence's tokens are the same at one lane, two and three, alone (each lane in turn) and beside other requests, as
  * one process gives them: lanes and the pieces of a newcomer's chunk change only which rows share a
  * step (step-composition invariance, on the host backend here; on cards the a1 / under-load identity
  * runs, S5-LANES.md). */

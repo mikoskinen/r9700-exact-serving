@@ -12821,6 +12821,17 @@ TEST(the_lane_set_routes_to_the_least_loaded_lane) {
     CHECK(L.set.owner(b) == &L.at(1));
     CHECK(L.set.owner(c) == &L.at(2));
     CHECK(L.set.owner(999) == nullptr);
+    /* RADIANCE_PP_PICK=rr: equally loaded lanes in turn */
+    Lanes R;
+    REQUIRE_EQ(R.start(3), RAD_OK);
+    R.set.set_pick_rr(true);
+    CHECK_EQ(R.set.pick(), 0);
+    CHECK_EQ(R.set.pick(), 1);
+    CHECK_EQ(R.set.pick(), 2);
+    CHECK_EQ(R.set.pick(), 0);
+    (void)R.submit(1, 8, 4);
+    const int p1 = R.set.pick(), p2 = R.set.pick();
+    CHECK(p1 != 1 && p2 != 1 && p1 != p2);   /* lane 1 holds a request: the other two in turn */
 }
 
 /* The newcomer split: a 100-token prompt planned by lane 0 in 64-token steps is cut into one piece

@@ -25,6 +25,8 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     mu_ = lanes_.empty() ? nullptr : &lanes_[0]->mu_;
     inbox_.assign(lanes_.size(), {});
     order_.clear();
+    const char* rr = std::getenv("RADIANCE_PP_PICK");
+    pick_rr_ = rr && !std::strcmp(rr, "rr");
     const char* on = std::getenv("RADIANCE_PP_SPLIT");
     split_on_ = !(on && !std::strcmp(on, "0"));
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
@@ -36,21 +38,32 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
 int LaneSet::pick() const {
     if (lanes_.size() <= 1) return 0;
     std::lock_guard<std::mutex> lk(*mu_);
-    int best = 0;
-    int64_t bl = INT64_MAX, bd = INT64_MAX, bf = -1;
+    struct Load { int64_t live = 0, drafted = 0, free_cards = 0; };
+    std::vector<Load> ld(lanes_.size());
     for (size_t l = 0; l < lanes_.size(); ++l) {
         const Scheduler& s = *lanes_[l];
-        const int64_t live = (int64_t)s.running_.size() + (int64_t)s.waiting_.size();
-        int64_t drafted = 0;
-        for (int32_t slot : s.running_) {
-            const SchedReq& q = *s.reqs_[(size_t)slot];
-            drafted += q.n_draft;
-        }
-        const int64_t free_cards = (int64_t)s.free_cards_.size();
-        const bool better = live < bl || (live == bl && (drafted < bd || (drafted == bd && free_cards > bf)));
-        if (better) { best = (int)l; bl = live; bd = drafted; bf = free_cards; }
+        ld[l].live = (int64_t)s.running_.size() + (int64_t)s.waiting_.size();
+        for (int32_t slot : s.running_) ld[l].drafted += s.reqs_[(size_t)slot]->n_draft;
+        ld[l].free_cards = (int64_t)s.free_cards_.size();
     }
-    return best;
+    auto better = [&](size_t a, size_t b) {   /* a strictly better than b */
+        if (ld[a].live != ld[b].live) return ld[a].live < ld[b].live;
+        if (ld[a].drafted != ld[b].drafted) return ld[a].drafted < ld[b].drafted;
+        return ld[a].free_cards > ld[b].free_cards;
+    };
+    size_t best = 0;
+    for (size_t l = 1; l < lanes_.size(); ++l)
+        if (better(l, best)) best = l;
+    /* RADIANCE_PP_PICK=rr: equally loaded lanes take new requests in turn (a request alone on an idle
+     * engine goes to lane 0, 1, 2, ... in turn), so an identity run of requests one at a time covers
+     * every lane. Default: the lowest index. */
+    if (pick_rr_) {
+        std::vector<size_t> tie;
+        for (size_t l = 0; l < lanes_.size(); ++l)
+            if (!better(best, l) && !better(l, best)) tie.push_back(l);
+        best = tie[(size_t)(rr_.fetch_add(1, std::memory_order_relaxed) % (uint64_t)tie.size())];
+    }
+    return (int)best;
 }
 
 Scheduler* LaneSet::owner(uint64_t id) const {

@@ -34,6 +34,7 @@
 #include "batch.h"
 #include "scheduler.h"
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -50,8 +51,10 @@ public:
 
     /* ---- requests (HTTP threads) */
     /* The lane a new request goes to: the fewest live requests (running + waiting), then the fewest
-     * drafted rows, then the free cards, then the lowest index. */
+     * drafted rows, then the most free cards, then the lowest index (RADIANCE_PP_PICK=rr: equally
+     * loaded lanes in turn). */
     int  pick() const;
+    void set_pick_rr(bool on) { pick_rr_ = on; }
     /* The lane holding request `id`, or null. */
     Scheduler* owner(uint64_t id) const;
     /* Every lane's published copy (Scheduler::observed_metrics), summed: counters, queues and rates
@@ -110,6 +113,8 @@ private:
     std::mutex* mu_ = nullptr;
     std::vector<int> order_;
     std::vector<std::vector<Piece>> inbox_;
+    bool    pick_rr_ = false;               /* RADIANCE_PP_PICK=rr (pick) */
+    mutable std::atomic<uint64_t> rr_{ 0 };
     bool    split_on_ = true;
     int64_t split_min_ = 128;
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0;
