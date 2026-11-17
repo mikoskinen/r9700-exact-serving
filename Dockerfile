@@ -144,10 +144,13 @@ ARG JOBS=
 # AV1 decoder, WebP encoder and H.264 encoder; busybox-static goes into the runtime image.
 # libopenblas-dev: libquant's GPTQ factorises its Hessians through LAPACK where it finds OpenBLAS
 # (libquant/CMakeLists.txt); without it rad-convert's gptq rule runs single-threaded loops.
+# libibverbs-dev, ibverbs-providers: the two-node pipeline's RDMA data path (core/net/node_link_verbs.cpp,
+# tp8 S4) compiles against rdma-core's headers; libibverbs and the mlx5 provider are opened at run
+# time, so the rootfs stage copies them by name below (ldd does not see a dlopen).
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       cmake ninja-build pkg-config g++-14 gawk libdav1d7 libwebp7 libopenh264-7 busybox-static \
-      libopenblas-dev \
+      libopenblas-dev libibverbs-dev ibverbs-providers \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
@@ -270,10 +273,16 @@ RUN set -e; R=/rootfs; L=$R/usr/lib/x86_64-linux-gnu; \
       case "$lib" in */ld-linux-x86-64.so.2) cp -L "$lib" $R/lib64/ ;; *) cp -L "$lib" $L/ ;; esac; \
     done; \
     cp -L /opt/rocm/lib/libamd_comgr.so.3 $L/; \
+    rdma="libibverbs.so.1 libmlx5.so.1 libnl-3.so.200 libnl-route-3.so.200"; \
+    for f in $rdma; do cp -L /usr/lib/x86_64-linux-gnu/$f $L/; done; \
+    mkdir -p $L/libibverbs $R/etc/libibverbs.d; \
+    ln -s ../libmlx5.so.1 $L/libibverbs/libmlx5-rdmav34.so; \
+    cp /etc/libibverbs.d/mlx5.driver $R/etc/libibverbs.d/; \
     cp /bin/busybox $R/usr/bin/busybox; ln -s /usr/bin/busybox $R/bin/sh; \
     cp /usr/bin/curl /usr/bin/jq $R/usr/bin/; \
     cp /etc/ssl/certs/ca-certificates.crt $R/etc/ssl/certs/; \
-    sh /src/docker/licenses.sh $R $libs /opt/rocm/lib/libamd_comgr.so.3 /bin/busybox \
+    sh /src/docker/licenses.sh $R $libs /opt/rocm/lib/libamd_comgr.so.3 \
+      $(for f in $rdma; do echo /usr/lib/x86_64-linux-gnu/$f; done) /bin/busybox \
       /usr/bin/curl /usr/bin/jq /usr/share/ca-certificates/mozilla; \
     for f in $(cd $R && find opt/radiance usr/lib -type f -exec sh -c 'head -c4 "$1" | grep -q ELF' _ {} \; -print) \
              usr/bin/curl usr/bin/jq; do \
