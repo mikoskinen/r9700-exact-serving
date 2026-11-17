@@ -76,6 +76,18 @@ Scheduler* LaneSet::owner(uint64_t id) const {
     return nullptr;
 }
 
+bool LaneSet::prefill_pending(int l) const {
+    if (l < 0 || l >= (int)lanes_.size()) return false;
+    std::lock_guard<std::mutex> lk(*mu_);
+    const Scheduler& s = *lanes_[(size_t)l];
+    if (!s.waiting_.empty()) return true;
+    for (int32_t slot : s.running_) {
+        const SchedReq* q = slot >= 0 && (size_t)slot < s.reqs_.size() ? s.reqs_[(size_t)slot].get() : nullptr;
+        if (q && q->req && q->req->n_computed + q->lent < (int64_t)q->req->prompt.size()) return true;
+    }
+    return false;
+}
+
 SchedMetrics LaneSet::observed_metrics() const {
     SchedMetrics m = lanes_.empty() ? SchedMetrics{} : lanes_[0]->observed_metrics();
     for (size_t l = 1; l < lanes_.size(); ++l) {

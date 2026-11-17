@@ -50,6 +50,7 @@
 #include "runtime/fn4_switch.h"
 #include "util/stallwatch.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -183,6 +184,23 @@ int Engine::step_loop_lanes() {
                      : "is not taken: it needs RADIANCE_PP_FOLLOWER_EMBED=1 at a cut W(0, t) (the leader's head part then "
                        "issues nothing the follower waits on)");
     }
+    /* tp8 dev D7: RADIANCE_PP_DECODE_FIRST=1 (both nodes; the follower does nothing with it) -- in each planning round the
+     * lanes with only decode rows to plan go before those with prompt rows (LaneSet::prefill_pending), round-robin kept
+     * within each group: a decode lane's step then runs on the follower ahead of a newcomer's long MIXED pass and its tail on
+     * the leader while the follower runs that pass, instead of queueing behind it on both nodes (PROFILE 20:58). Only the
+     * order of the heads changes: step composition and step numbers, not a row's bytes; a lender still lends to the lanes
+     * that plan right behind it. */
+    bool decode_first = false;
+    if (const char* df = std::getenv("RADIANCE_PP_DECODE_FIRST"); df && !std::strcmp(df, "1")) {
+        decode_first = true;
+        RAD_INFO("two-node pipeline: RADIANCE_PP_DECODE_FIRST=1 -- each round plans the lanes with decode rows alone before "
+                 "those with prompt rows to plan (tp8 dev D7)");
+    }
+    int64_t reordered = 0, held = 0;
+    /* tp8 dev D7: a lane with prompt rows to plan waits ONE round while another lane's decode step is in flight (and nothing
+     * was lent to it), so that lane's next step goes to the follower ahead of the long MIXED pass: the follower then runs it
+     * before the MIXED pass and the leader its tail during it (one more decode step a newcomer than without). */
+    std::vector<char> held_once((size_t)n_lanes_, 0);
     /* tp8 dev 1b: per lane, whether its step in flight has its model part / its sampler part released */
     std::vector<char> m_out((size_t)n_lanes_, 0), s_out((size_t)n_lanes_, 0);
     rad::StallWatch step_watch("step", 20000);
@@ -224,11 +242,28 @@ int Engine::step_loop_lanes() {
             kv_check_at = pp_steps_shipped_;
         }
         std::vector<int> todo;
-        if (!(kv_due && !fifo.empty()))
+        if (!(kv_due && !fifo.empty())) {
             for (int k = 0; k < n_lanes_; ++k) todo.push_back((next + k) % n_lanes_);
+            if (decode_first) {
+                const std::vector<int> was = todo;
+                /* idle lanes with decode rows alone first (a busy lane is skipped below wherever it stands), so a change of
+                 * order is a decode lane put ahead of a lane with prompt rows */
+                std::stable_partition(todo.begin(), todo.end(), [&](int l) { return !busy[(size_t)l] && !lanes_.prefill_pending(l); });
+                if (todo != was) ++reordered;
+            }
+        }
         for (size_t at = 0; at < todo.size(); ++at) {
             const int l = todo[at];
             if (busy[(size_t)l]) continue;
+            if (decode_first && !held_once[(size_t)l] && lanes_.prefill_pending(l) && lanes_.inbox_n(l) == 0) {
+                bool decode_in_flight = false;
+                for (const auto& f : fifo) decode_in_flight = decode_in_flight || !lanes_.prefill_pending(f.first);
+                if (decode_in_flight) {
+                    held_once[(size_t)l] = 1;
+                    ++held;
+                    continue;
+                }
+            }
             std::vector<int> idle_after;
             {
                 std::vector<int> order;
@@ -249,6 +284,7 @@ int Engine::step_loop_lanes() {
             if (t_on) phase_mark(PH_PLAN);
             if (const int hs = lane_head(l, b); hs < 0) return fail_loop(hs);
             busy[(size_t)l] = 1;
+            held_once[(size_t)l] = 0;
             fifo.emplace_back(l, b);
             next = (l + 1) % n_lanes_;
             /* the idle lanes it may have lent to plan next, in its order */
@@ -300,6 +336,10 @@ int Engine::step_loop_lanes() {
     if (tail_ahead_)
         RAD_INFO("two-node pipeline: %lld lane steps' model parts were issued ahead of the lane before them's collect "
                  "(RADIANCE_PP_TAIL_AHEAD=1)", (long long)tail_ahead_n_);
+    if (decode_first)
+        RAD_INFO("two-node pipeline: %lld planning rounds put a decode lane before a lane with prompt rows, %lld times a lane "
+                 "with prompt rows waited a round behind a decode lane in flight (RADIANCE_PP_DECODE_FIRST=1)",
+                 (long long)reordered, (long long)held);
     return RAD_OK;
 }
 
