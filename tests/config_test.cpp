@@ -549,7 +549,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--pp-nodes", { "1" } }, { "--pp-rank", { "1" } }, { "--pp-peer", { "10.200.0.3:29517" } },
-        { "--pp-cut", { "0,20" } }, { "--node-link", { "verbs" } },
+        { "--pp-cut", { "0,20" } }, { "--node-link", { "verbs" } }, { "--pp-lanes", { "3" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--long-prefill-token-threshold", { "1024" } },
         { "--prefill-room-gate", { "off" } },
@@ -866,6 +866,8 @@ TEST(the_two_node_options_parse_and_default_to_one_machine) {
     CHECK_EQ(d.pp_cut_h, 0);
     CHECK_EQ(d.pp_cut_t, 0);
     CHECK_EQ(d.node_link, 0);
+    CHECK_EQ(d.pp_lanes, 0);
+    CHECK_EQ(d.pp_lanes_now(), 1);   /* tp8 S5: one machine runs one lane */
     Config c;
     CHECK_EQ(parse({ "--pp-nodes", "2", "--pp-rank", "1", "--pp-peer", "10.200.0.2:30001",
                      "--pp-cut", "10,32", "--node-link", "verbs" }, &c), RAD_OK);
@@ -876,6 +878,15 @@ TEST(the_two_node_options_parse_and_default_to_one_machine) {
     CHECK_EQ(c.pp_cut_h, 10);
     CHECK_EQ(c.pp_cut_t, 32);
     CHECK_EQ(c.node_link, 1);
+    CHECK_EQ(c.pp_lanes_now(), 2);   /* tp8 S5: a two-node pipeline's default */
+    Config l;
+    CHECK_EQ(parse({ "--pp-nodes", "2", "--pp-lanes", "1" }, &l), RAD_OK);
+    CHECK_EQ(l.pp_lanes_now(), 1);
+    CHECK_EQ(parse({ "--pp-nodes", "2", "--pp-lanes", "4" }, &l), RAD_OK);
+    CHECK_EQ(l.pp_lanes_now(), 4);
+    Config l1;
+    CHECK_EQ(parse({ "--pp-lanes", "3" }, &l1), RAD_OK);
+    CHECK_EQ(l1.pp_lanes_now(), 1);   /* lanes without --pp-nodes 2: one machine, one lane */
     Config t;
     CHECK_EQ(parse({ "--pp-cut", "20", "--pp-peer", "gpu03" }, &t), RAD_OK);
     CHECK_EQ(t.pp_cut_h, 0);
@@ -898,6 +909,8 @@ TEST(the_two_node_options_parse_and_default_to_one_machine) {
     CHECK_EQ(parse({ "--pp-peer", "gpu03:0" }, &x), RAD_E_INVAL);
     CHECK_EQ(parse({ "--pp-peer", ":29517" }, &x), RAD_E_INVAL);
     CHECK_EQ(parse({ "--node-link", "rdma" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-lanes", "0" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-lanes", "5" }, &x), RAD_E_INVAL);
 }
 
 TEST(the_state_cache_dtype_is_f32_or_f16) {

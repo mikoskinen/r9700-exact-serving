@@ -917,6 +917,10 @@ struct Config {
      * a chunk plan moves a near-tie's bits (the prompt's last row alone in a decode-shaped step is not the
      * same arithmetic as inside its chunk), so the pipeline's answers are the one-machine start's. tp8 S4 hw. */
     bool  pp_plan_prefix = false;
+    /* tp8 S5: --pp-lanes N (1..4 = RAD_PP_MAX_LANES; 0 = the default, 2 on a two-node pipeline): the
+     * leader's independent step streams. 1 is tp8 S4's one step in flight. Read only when pp_nodes == 2. */
+    int   pp_lanes = 0;
+    int   pp_lanes_now() const { return pp_nodes == 2 ? (pp_lanes > 0 ? pp_lanes : 2) : 1; }
     int64_t max_tok = 2048;            /* --max-num-batched-tokens */
     /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
      * pending in it (decode rows, another prefill, a request waiting for admission). -1 = auto:

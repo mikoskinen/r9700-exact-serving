@@ -82,6 +82,11 @@ static const Flag g_flags[] = {
                                         "connects to it" },
     { "--pp-cut",             "CUT",    "H,T: the follower's layers [H, T) of a two-node pipeline\n"
                                         "(T alone is 0,T); both nodes give the same cut" },
+    { "--pp-lanes",           "N",      "1-4: the step streams of a two-node pipeline (tp8 S5;\n"
+                                        "default 2). A sequence stays in one lane; each lane has one\n"
+                                        "step in flight, so both nodes work at once on different\n"
+                                        "lanes. 1 runs one step at a time (tp8 S4); both nodes give\n"
+                                        "the same value" },
     { "--node-link",          "MODE",   "tcp (default) | verbs: how a two-node pipeline's crossings\n"
                                         "travel; verbs is RDMA between pinned host rings\n"
                                         "(RADIANCE_PP_DEV, RADIANCE_PP_GID pick the device and GID)" },
@@ -624,6 +629,7 @@ int config_parse(int argc, char** argv, Config* c) {
             c->pp_cut_h = h;
             c->pp_cut_t = t;
         }
+        else if (S("--pp-lanes"))              { if (!num(1, 4 /* RAD_PP_MAX_LANES */, &c->pp_lanes)) return RAD_E_INVAL; }
         else if (S("--node-link")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "tcp"))   c->node_link = 0;
@@ -1440,6 +1446,9 @@ const ShowRow kShow[] = {
           return c.pp_cut_t > 0 ? fmt("%d,%d (the follower's layers [%d, %d))", c.pp_cut_h, c.pp_cut_t,
                                       c.pp_cut_h, c.pp_cut_t)
                                 : std::string("none"); } },
+    { "--pp-lanes",           [](const Config& c) {
+          /* the lanes in force, not how they were given: the rendezvous compares this row */
+          return c.pp_nodes == 2 ? fmt("%d", c.pp_lanes_now()) : std::string("n/a"); } },
     { "--node-link",          [](const Config& c) { return std::string(c.node_link ? "verbs" : "tcp"); } },
     { "--max-num-batched-tokens", [](const Config& c) { return num(c.max_tok); } },
     { "--busy-prefill-chunk", [](const Config& c) {
