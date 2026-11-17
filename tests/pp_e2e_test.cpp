@@ -1080,4 +1080,84 @@ TEST(a_prefix_hit_with_the_kv_copy_and_the_cache_off_switch) {
     }
 }
 
+/* ------------------------------------------------------------------ tp8 dev 1a */
+/* RADIANCE_PP_FOLLOWER_EMBED=1: at W(0, t) the follower looks the step's embedding up itself (the same op over the same
+ * table) and the leader's head part issues neither the lookup nor X1. Tokens at one, two and three lanes, alone and
+ * beside other requests, and the KL recordings at two and three lanes, are one process's; the follower never takes an
+ * X1 (no "mid" stamp: those start at X1's arrival); at W(1,3) X1 is layer 0's residual and the setting is not taken. */
+TEST(the_followers_own_embedding_serves_and_records_what_one_process_does) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_fe");
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", { "--max-num-seqs", "6" }));
+        ref = lane_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; };
+    for (const Arm a : { Arm{ 1, "0,2" }, Arm{ 2, "0,2" }, Arm{ 3, "0,2" }, Arm{ 2, "0,3" }, Arm{ 2, "1,3" } }) {
+        const std::string prefix = d / ("st-" + std::to_string(a.lanes) + "-" + a.cut);
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_FOLLOWER_EMBED=1");
+        env.push_back("RADIANCE_PP_STAMPS=" + prefix);
+        Serving pp;
+        REQUIRE(pp.start(a.cut, lane_shape(a.lanes), env));
+        const std::vector<std::vector<int32_t>> got = lane_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        const bool h0 = a.cut[0] == '0';
+        size_t mids = 0, heads = 0;
+        {
+            std::istringstream in(tiny::read_text(prefix + ".follower"));
+            std::string line;
+            while (std::getline(in, line)) mids += line.rfind("mid ", 0) == 0;
+            std::istringstream il(tiny::read_text(prefix + ".leader"));
+            while (std::getline(il, line)) heads += line.rfind("head ", 0) == 0;
+        }
+        fprintf(stderr, "    follower embeds, %d lane(s) W(%s): %d of %zu prompts differ; leader head parts %zu, follower "
+                        "passes from an X1 %zu; pieces lent %lld\n", a.lanes, a.cut, differ, ref.size(), heads, mids,
+                log_count(llog, "newcomer split: "));
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n", tail(llog, 30).c_str());
+        if (h0) {
+            CHECK(llog.find("RADIANCE_PP_FOLLOWER_EMBED=1 -- the follower looks") != std::string::npos);
+            CHECK(flog.find("RADIANCE_PP_FOLLOWER_EMBED=1 -- the follower looks") != std::string::npos);
+            CHECK_EQ(mids, (size_t)0);     /* the follower never started from an X1 */
+            if (a.lanes > 1) CHECK(heads > 0);
+        } else {
+            CHECK(llog.find("RADIANCE_PP_FOLLOWER_EMBED=1 is not taken at W(1,3)") != std::string::npos);
+            CHECK(mids > 0);
+        }
+    }
+    /* the KL recordings (every scored position's log-probabilities) */
+    const std::string rec = record_single(d / "single", { "--max-num-seqs", "6" });
+    REQUIRE(!rec.empty());
+    for (const int lanes : { 1, 2, 3 }) {
+        const std::string out = d / ("pp-" + std::to_string(lanes));
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back("RADIANCE_PP_FOLLOWER_EMBED=1");
+        const PipeRun pr = record_pipeline(out, "0,2", env, lane_shape(lanes), lane_shape(lanes), env);
+        if (pr.leader != 0 || pr.follower != 0)
+            fprintf(stderr, "    %d lanes: leader %d, follower %d\n    leader:\n%s\n    follower:\n%s\n", lanes, pr.leader,
+                    pr.follower, tail(pr.llog).c_str(), tail(pr.flog).c_str());
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(rec, out, &why);
+        fprintf(stderr, "    follower embeds, %d lane(s) W(0,2): recording %s; pieces lent %lld\n", lanes,
+                same ? "identical" : why.c_str(), log_count(pr.llog, "newcomer split: "));
+        CHECK(same);
+    }
+}
+
 RAD_TEST_MAIN()
