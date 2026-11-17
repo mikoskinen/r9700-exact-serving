@@ -13517,7 +13517,7 @@ TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_e
     struct Arm { int mixed; int64_t len; };
     for (const Arm a : { Arm{ 576, 1100 }, Arm{ 576, 2266 }, Arm{ 576, 5000 }, Arm{ 2112, 5000 } }) {
         std::vector<int64_t> ref;
-        for (int lanes : { 1, 2 }) {
+        for (int lanes : { 1, 2, 3 }) {
             DstSwitches restore;
             Lanes L;
             L.grid = 2048;
@@ -13530,9 +13530,9 @@ TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_e
             L.set.set_lend_mixed(true);
             CHECK(DstSwitches::set("sched_bi_chunk", 3));
             CHECK(DstSwitches::set("sched_mixed_tok", a.mixed));
-            std::vector<uint64_t> dec[2];
+            std::vector<uint64_t> dec[3];
             for (int i = 0; i < 8; ++i) {
-                const int l = lanes == 1 ? 0 : i % 2;
+                const int l = lanes == 1 ? 0 : i % lanes;
                 dec[l].push_back(L.submit(l, 100, 4000, 2000 + 100 * i));
             }
             uint64_t p = 0;
@@ -13558,9 +13558,9 @@ TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_e
                     for (const StepEntry& e : L.at(l).plan().e)
                         if (p && e.seq == p && e.is_prefill) {
                             ends.push_back((int64_t)e.ctx_len + e.n_tokens);
-                            if (l == 1 && e.home == 0) ++lent_in_1;
+                            if (l != 0 && e.home == 0) ++lent_in_1;
                         }
-                    if (lanes == 2 && p && rp && rp->n_computed < a.len) {
+                    if (lanes >= 2 && p && rp && rp->n_computed < a.len) {
                         int rows = 0;
                         for (const StepEntry& e : L.at(l).plan().e)
                             for (uint64_t d : dec[l]) rows += e.seq == d && !e.is_prefill;
@@ -13585,15 +13585,20 @@ TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_e
                 ref = ends;
                 fprintf(stderr, "    mixed %d, a %lld-token newcomer, 1 lane: ends%s\n", a.mixed, (long long)a.len, t.c_str());
             } else {
-                if (ends != ref) fprintf(stderr, "    2 lanes ends:%s\n", t.c_str());
-                CHECK(ends == ref);
+                /* 2 lanes: one lane's ends to the row. 3 lanes: every end one of one lane's (a long newcomer's alone-piece
+                 * boundary can be reached by the cold-prompt lend of an idle engine's chunk, which then skips a D cut inside
+                 * it: that path's, with RADIANCE_PP_LEND_MIXED off too) */
+                bool sub = !ends.empty() && ends.back() == ref.back();
+                for (int64_t x : ends) sub = sub && std::find(ref.begin(), ref.end(), x) != ref.end();
+                if (lanes == 2 ? ends != ref : !sub) fprintf(stderr, "    %d lanes ends:%s\n", lanes, t.c_str());
+                CHECK(lanes == 2 ? ends == ref : sub);
                 CHECK(L.set.counts().pieces > 0);
                 CHECK(L.set.counts().dpieces > 0);
                 CHECK(lent_in_1 > 0);
                 CHECK_EQ(short_steps, 0);
-                fprintf(stderr, "    mixed %d, a %lld-token newcomer, 2 lanes: the same %zu ends; %lld pieces lent (%d carried by lane 1, "
-                                "%lld from option-D steps), every step with all its lane's decoders: %s\n", a.mixed,
-                        (long long)a.len, ends.size(), (long long)L.set.counts().pieces, lent_in_1,
+                fprintf(stderr, "    mixed %d, a %lld-token newcomer, %d lanes: %zu ends of one lane's; %lld pieces lent (%d carried by other "
+                                "lanes, %lld from option-D steps), every step with all its lane's decoders: %s\n", a.mixed,
+                        (long long)a.len, lanes, ends.size(), (long long)L.set.counts().pieces, lent_in_1,
                         (long long)L.set.counts().dpieces, short_steps == 0 ? "yes" : "NO");
             }
         }
