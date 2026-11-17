@@ -494,6 +494,9 @@ private:
      * stops (0) or the link fails (negative). */
     int  follower_loop();
     void pp_close(const char* why);
+    /* tp8 loop P8: RADIANCE_PP_SEND_SPLIT's mode (0 / 1 / 2) and, at close, mode 2's check of the shares */
+    static int pp_send_split();
+    void pp_split_note();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy
      * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */
