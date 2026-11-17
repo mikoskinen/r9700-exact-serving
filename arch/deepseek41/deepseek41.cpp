@@ -6880,14 +6880,26 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * from there, and attn_sparse_sink recovers the base from it (docs/OPS.md). */
     const RadOperand wused = praw(wb->seqused, RAD_I32, S);
 
-    /* tp8 S4: a crossing's issue: the core's ring, then its parts over the step's rows */
+    /* tp8 S5: the pass's lane (its rings) and, on the leader, its part (abi/rad_pp.h): a lane step's
+     * leader pass is issued as its head -- the lookup and X1's send -- and its tail -- the rest of
+     * the prologue, X2's receive at layer t and everything after -- with other lanes' passes between
+     * them. The tail re-runs the prologue's other ops (expand, the mixes, the rope tables, the token
+     * map) from the batch: what they write is a function of the batch, and the head's xcol / h0 /
+     * pre_f are overwritten at layer t by X2 and its boundary op before any read, as in the whole
+     * pass. One lane, the follower: the whole pass. */
+    RadPpInfo ppi{};
+    if (m.pp) ppi = rad_pp_query();
+    const int part = m.pp && m.pp_rank == 0 ? ppi.part : RAD_PP_PART_WHOLE;
+    const bool run_head = part != RAD_PP_PART_TAIL, run_tail = part != RAD_PP_PART_HEAD;
+    /* tp8 S4: a crossing's issue: the core's ring, then its parts over the step's rows; the ring is the
+     * pass's lane's, read at every issue (tp8 S5) */
     const auto cross = [&](rad_op op_, int ring) -> bool {
-        if (!m.pp_ring[ring]) m.pp_ring[ring] = rad_pp_query().ring[ring];
-        if (!m.pp_ring[ring] || !op_) {
+        RadPpRing* rp = ppi.ring[ring];
+        if (!rp || !op_) {
             rad_step_fail(x, "deepseek41: two-node pipeline: the core set up no ring for a crossing");
             return false;
         }
-        const RadOperand rg = praw(m.pp_ring[ring], RAD_U8, 1);
+        const RadOperand rg = praw(rp, RAD_U8, 1);
         if (ring == RAD_PP_X1) RAD_ISSUE_N(x, op_, T, rg, brows(m.xcol, T));
         else
             RAD_ISSUE_N(x, op_, T, rg, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T), brows(m.comb, T),
@@ -6895,13 +6907,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
         return true;
     };
     media_route(m, batch);
-    if (!m.pp || m.pp_rank == 0) {
+    if ((!m.pp || m.pp_rank == 0) && run_head) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
     m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     }
     /* X1: the leader's lookup out, the follower's in, where one process's lookup was */
-    if (m.pp && !cross(m.pp_x1, RAD_PP_X1)) return;
+    if (m.pp && run_head && !cross(m.pp_x1, RAD_PP_X1)) return;
+    if (!run_tail) return;   /* tp8 S5: the leader's head part ends with X1's send */
     for (int64_t i = 0; i < c.hc; ++i)
         RAD_ISSUE_N(x, m.expand, T, brows(m.xcol, T), bcol(m.h0, i * D, D, T));
     RAD_ISSUE_N(x, m.pre0, T, brows(m.pre_f, T));

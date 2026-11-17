@@ -633,22 +633,27 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     const int64_t T = batch->n_tok;
-    /* tp8 S4: a crossing's issue: the core's ring, then the stream and, folded, the delta. */
+    /* tp8 S5: the pass's lane (its rings) and, on the leader, its part: a lane step's leader pass is
+     * issued as its head (up to and including X1's send) and its tail (from X2's receive), with
+     * other lanes' passes between them (abi/rad_pp.h). One lane, the follower: the whole pass. */
+    RadPpInfo ppi{};
+    if (m.pp) ppi = rad_pp_query();
+    const int part = m.pp && m.pp_rank == 0 ? ppi.part : RAD_PP_PART_WHOLE;
+    const bool run_head = part != RAD_PP_PART_TAIL, run_tail = part != RAD_PP_PART_HEAD;
+    /* tp8 S4: a crossing's issue: the core's ring, then the stream and, folded, the delta. The ring
+     * is the pass's lane's (tp8 S5), read at every issue. */
     auto cross = [&](rad_op op, int ring, int parts) {
-        if (!m.ring[ring]) {
-            const RadPpInfo pp = rad_pp_query();
-            m.ring[ring] = pp.ring[ring];
-        }
-        if (!m.ring[ring]) {
+        RadPpRing* rg = ppi.ring[ring];
+        if (!rg) {
             rad_step_fail(c, "two-node pipeline: the core set up no ring for this crossing");
             return;
         }
         if (parts == 2)
-            RAD_ISSUE(c, op, praw(m.ring[ring], RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T));
+            RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T));
         else
-            RAD_ISSUE(c, op, praw(m.ring[ring], RAD_U8, 1), brows(m.b_x, T));
+            RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_x, T));
     };
-    if (!m.pp || m.pp_rank == 0) {
+    if ((!m.pp || m.pp_rank == 0) && run_head) {
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
               brows(m.b_x, batch->n_tok));
@@ -664,10 +669,13 @@ static void step(RadCtx* c, const RadBatch* batch) {
             /* The leader hands over before layer h and takes the follower's result back at t; the
              * follower's last layer hands its result back. */
             if (m.pp_rank == 0 && (int64_t)li == m.pp_h) {
-                cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+                if (run_head) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+                if (!run_tail) return;   /* tp8 S5: the head part ends with X1's send */
                 cross(m.op_x2, RAD_PP_X2, m.parts_x2);
             }
             if (!m.held[li]) continue;
+            /* tp8 S5: the tail part starts at X2; the head part ran the layers before h */
+            if (m.pp_rank == 0 && !run_head && (int64_t)li < m.pp_h) continue;
         }
         m.layers[li].attn.step(c, batch);
         m.layers[li].mlp.step(c, batch);
@@ -686,7 +694,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
     /* A cut at the last layer: the leader's X2 arrives after the loop. */
     if (m.pp && m.pp_rank == 0 && m.pp_h >= (int)m.layers.size()) {
-        cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+        if (run_head) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+        if (!run_tail) return;
         cross(m.op_x2, RAD_PP_X2, m.parts_x2);
     }
     RAD_ISSUE(c, m.op_final_norm,
