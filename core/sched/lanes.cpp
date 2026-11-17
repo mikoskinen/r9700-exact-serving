@@ -31,6 +31,8 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     split_on_ = !(on && !std::strcmp(on, "0"));
     const char* sp = std::getenv("RADIANCE_PP_SPAN");
     span_on_ = !(sp && !std::strcmp(sp, "0"));
+    const char* lb = std::getenv("RADIANCE_PP_LEND_BUSY");
+    lend_busy_ = !(lb && !std::strcmp(lb, "0"));
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
@@ -390,6 +392,10 @@ void Scheduler::lane_split_own() {
             const int64_t n = lane_alone_chunk(s, r, target, p, &ck);
             if (n <= 0) break;
             const Scheduler* b = lanes_->lane(to);
+            if (!lanes_->lend_busy() && (!b || !b->running_.empty() || !b->waiting_.empty())) {
+                why = LaneSet::kBusy;
+                break;
+            }
             const bool wide = geo_.shared_tok > 0 && n > geo_.shared_tok;
             if (wide && (!b || !b->running_.empty() || !b->waiting_.empty() || lanes_->inbox_n_locked(to) > 0)) {
                 why = LaneSet::kWideBusy;

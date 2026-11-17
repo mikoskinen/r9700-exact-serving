@@ -1022,6 +1022,13 @@ TEST(a_cold_prompt_at_two_lanes_is_one_processes_tokens_and_chunk_plan) {
             CHECK(got == ref);
             CHECK(lent > 0);
             CHECK(llog.find("(lane 0's)") != std::string::npos);   /* a chunk ran in the other lane */
+            /* tp8 prefill P0 / M2: the prompt's lanes line and the run's stall line, for the test side's one-run reading */
+            const size_t pl = llog.find("lanes: request ");
+            const size_t gl = llog.find("lane-step stalls over the run");
+            CHECK(pl != std::string::npos);
+            CHECK(gl != std::string::npos);
+            if (pl != std::string::npos) fprintf(stderr, "    %s\n", llog.substr(pl, llog.find('\n', pl) - pl).c_str());
+            if (gl != std::string::npos) fprintf(stderr, "    %s\n", llog.substr(gl, llog.find('\n', gl) - gl).c_str());
         }
     }
 }

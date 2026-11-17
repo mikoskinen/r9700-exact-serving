@@ -175,7 +175,7 @@ struct SchedReq {
      * waited; t0_us its first chunk's plan (0: no line due). Reset at admission. */
     struct LaneStats {
         int32_t home = 0, lent = 0;
-        int32_t why[8] = {};
+        int32_t why[9] = {};
         int64_t t0_us = 0;
     } lst;
     /* Lever PSK design 2 (fn4 ds41_psk 2 / 3, ds41-psk2): latched when the request is admitted (Scheduler::psk_latch) and

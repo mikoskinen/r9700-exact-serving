@@ -98,6 +98,9 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
              (long long)per, (long long)least, (long long)per, lanes_.split_on() ? "on" : "off",
              cfg_.pp_cut_h > 0 ? "; a chunk that takes a snapshot is followed by its next chunk only after its commit "
                                  "(the head part writes layers [0, h)'s state)" : "");
+    if (!lanes_.lend_busy())
+        RAD_INFO("two-node pipeline: a newcomer's chunk is lent only to a lane with no request of its own "
+                 "(RADIANCE_PP_LEND_BUSY=0): a decoding lane never carries another lane's chunk");
     if (!lanes_.span_on())
         RAD_INFO("two-node pipeline: a lone prefill plans one checkpoint interval a chunk, not --prefill-span %d's span "
                  "(RADIANCE_PP_SPAN=0): the lanes run two of its chunks at once", cfg_.prefill_span);
@@ -207,6 +210,51 @@ int Engine::step_loop_lanes() {
     /* The lanes with a head issued, oldest first; their tails go in this order (the order of their
      * X2 on the follower's stream). */
     std::deque<std::pair<int, const RadBatch*>> fifo;
+    /* tp8 loop M2 (the PROFILE of 20:58: 320-430 ms with no lane step issued after every MIXED step): the time between two
+     * lane-step heads while a step was in flight; a gap over 100 ms is a stall, named with the tail committed last before
+     * it (its lane, phase and rows). One line a minute while lane steps run, and the run's at stop. */
+    struct Gaps {
+        struct Win { uint64_t t0 = 0; int64_t steps0 = 0, n = 0; double ms = 0, max_ms = 0; std::string worst; };
+        Win win, run;
+        uint64_t last = 0;
+        int tl = -1, tphase = -1;
+        int64_t ttok = 0;
+        static void add(Win& w, double g, const std::string& why) {
+            ++w.n;
+            w.ms += g;
+            if (g > w.max_ms) { w.max_ms = g; w.worst = why; }
+        }
+        void head(bool none_in_flight, int64_t steps) {
+            const uint64_t now = rad_mono_ns();
+            for (Win* w : { &win, &run }) if (!w->t0) { w->t0 = now; w->steps0 = steps; }
+            if (last && !none_in_flight) {
+                const double g = (double)(now - last) / 1e6;
+                if (g > 100.0) {
+                    const std::string why = fmt("%.0f ms after lane %d's %s step of %lld rows", g, tl,
+                                                tphase == RAD_PHASE_PREFILL ? "prefill"
+                                                : tphase == RAD_PHASE_DECODE ? "decode" : "MIXED", (long long)ttok);
+                    add(win, g, why);
+                    add(run, g, why);
+                }
+            }
+            last = now;
+        }
+        void tail(int lane, const RadBatch* b) { tl = lane; tphase = b->phase; ttok = b->n_tok; }
+        static void note(const Win& w, const char* what, int64_t steps) {
+            if (!w.t0) return;
+            const double wall = (double)(rad_mono_ns() - w.t0) / 1e9;
+            RAD_INFO("two-node pipeline: lane-step stalls over %s (%.1f s, %lld lane steps): %lld head gaps > 100 ms with a "
+                     "step in flight, %.0f ms in all (%.1f %% of the wall)%s%s", what, wall, (long long)(steps - w.steps0),
+                     (long long)w.n, w.ms, wall > 0 ? w.ms / 10.0 / wall : 0.0, w.worst.empty() ? "" : "; the longest ",
+                     w.worst.c_str());
+        }
+        void minute(int64_t steps) {
+            if (!win.t0 || rad_mono_ns() - win.t0 < 60ull * 1000000000ull) return;
+            note(win, "the last minute", steps);
+            win = Win{};
+        }
+        void end(int64_t steps) const { note(run, "the run", steps); }
+    } gaps;
     std::vector<char> busy((size_t)n_lanes_, 0);
     int next = 0;   /* the lane planned first on the next round */
     int64_t lane_steps = 0, rounds_two = 0;
@@ -283,6 +331,7 @@ int Engine::step_loop_lanes() {
             if (!b) continue;
             if (t_on) phase_mark(PH_PLAN);
             if (const int hs = lane_head(l, b); hs < 0) return fail_loop(hs);
+            gaps.head(fifo.empty(), lane_steps);
             busy[(size_t)l] = 1;
             held_once[(size_t)l] = 0;
             fifo.emplace_back(l, b);
@@ -330,9 +379,12 @@ int Engine::step_loop_lanes() {
             m_out[(size_t)lane] = s_out[(size_t)lane] = 0;
         }
         busy[(size_t)lane] = 0;
+        gaps.tail(lane, b);
         if (++lane_steps == 1 || lane_steps % 4096 == 0) lanes_note(lane_steps, rounds_two);
+        gaps.minute(lane_steps);
     }
     lanes_note(lane_steps, rounds_two);
+    gaps.end(lane_steps);
     if (tail_ahead_)
         RAD_INFO("two-node pipeline: %lld lane steps' model parts were issued ahead of the lane before them's collect "
                  "(RADIANCE_PP_TAIL_AHEAD=1)", (long long)tail_ahead_n_);
