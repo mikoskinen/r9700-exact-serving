@@ -231,6 +231,12 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     if (!lanes_.lend_busy())
         RAD_INFO("two-node pipeline: a newcomer's chunk is lent only to a lane with no request of its own "
                  "(RADIANCE_PP_LEND_BUSY=0): a decoding lane never carries another lane's chunk");
+    if (lanes_.bg_lane() >= 0)
+        RAD_INFO("two-node pipeline: lane %d is a background prefill lane (RADIANCE_PP_BG_LANE=1, tp8 dev M8): it holds no sequence "
+                 "(the other %d lane(s) split the %lld cards), and a newcomer planned whole beside decode rows is lent whole to it, "
+                 "its first token there, so the home lane's step carries its decode rows alone; cold prompts' chunks keep to lanes "
+                 "0-%d%s", lanes_.bg_lane(), n_lanes_ - 1, (long long)cfg_.max_seqs, n_lanes_ - 2,
+                 lanes_.lend_split() || lanes_.lend_mixed() ? " (before RADIANCE_PP_LEND_MIXED, which takes what it leaves)" : "");
     if (lanes_.lend_split())
         RAD_INFO("two-node pipeline: a newcomer planned whole beside decode rows is cut at the 512-grid point nearest its middle and "
                  "its rest lent to one lane with an empty inbox and nothing waiting, its first token there (RADIANCE_PP_LEND_MIXED=2, "
@@ -332,6 +338,11 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
                                        "dev M5)", (long long)c.dpieces).c_str()
              : lanes_.lend_split() ? fmt("; %lld newcomers split on the 512 grid beside decode rows (RADIANCE_PP_LEND_MIXED=2, tp8 "
                                          "dev M5b)", (long long)c.dpieces).c_str() : "");
+    if (lanes_.bg_lane() >= 0)
+        RAD_INFO("two-node pipeline: BG lane %d (RADIANCE_PP_BG_LANE=1, tp8 dev M8): %lld newcomers lent whole beside decode rows "
+                 "(%lld rows); kept home: a prefix restore %lld, the BG lane's room %lld, not a planner %lld", lanes_.bg_lane(),
+                 (long long)c.bg, (long long)c.bg_rows, (long long)c.bg_skip[LaneSet::kBgRestore],
+                 (long long)c.bg_skip[LaneSet::kBgRoom], (long long)c.bg_skip[LaneSet::kBgOrder]);
 }
 
 int Engine::step_loop_lanes() {

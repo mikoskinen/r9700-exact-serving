@@ -121,6 +121,21 @@ public:
      * waiting -- else the entry stays whole. */
     bool lend_split() const { return lend_mixed_ == 2; }
     void set_lend_split(bool on) { lend_mixed_ = on ? 2 : 0; }
+    /* tp8 dev M8 (RADIANCE_PP_BG_LANE=1, at --pp-lanes >= 2): the LAST lane is a background prefill lane. It holds no sequence
+     * (pick() and Scheduler::init's card split skip it: the other lanes split --max-num-seqs), and a newcomer that a lane plans
+     * whole beside its decoders (a MIXED step's prompt entry that produces its first token, no prefix restore) is lent WHOLE to
+     * it (Scheduler::lane_split_bg): its chunk is the home's own plan -- no new cut -- and the home's step goes out with its
+     * decode rows alone. Cold prompts' chunks keep to the other lanes. The follower runs the BG lane's passes in layer segments
+     * (RADIANCE_PP_SEG_LAYERS, without RADIANCE_PP_SEG_PREFILL) with the decode lanes' passes between them; the leader's
+     * RADIANCE_PP_READY_FIRST=1 lets decode tails go before it. Default off. */
+    static bool bg_env();
+    int  bg_lane() const { return bg_ && lanes_.size() >= 2 ? (int)lanes_.size() - 1 : -1; }
+    void set_bg(bool on) { bg_ = on; }
+    /* M8's counts: newcomers lent whole to the BG lane, their rows, and why one stayed home (a prefix restore, the BG lane's
+     * room, the BG lane not among this plan's planners) */
+    enum { kBgRestore, kBgRoom, kBgOrder, kBgWhyN };
+    void note_bg_locked(int64_t rows) { ++bg_lent_; bg_rows_ += rows; }
+    void note_bg_skip_locked(int k) { if (k >= 0 && k < kBgWhyN) ++bg_skip_[k]; }
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
     void set_split(bool on, int64_t min_rows) { split_on_ = on; split_min_ = min_rows > 0 ? min_rows : split_min_; }
@@ -166,7 +181,10 @@ public:
     void note_why_locked(int k) { if (k >= 0 && k < kWhyN) ++why_[k]; }
 
     /* Counters (any thread, under the lock): pieces lent, pieces committed, rows lent. */
-    struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; int64_t why[kWhyN] = {}; int64_t dpieces = 0; };
+    struct Counts {
+        int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; int64_t why[kWhyN] = {}; int64_t dpieces = 0;
+        int64_t bg = 0, bg_rows = 0, bg_skip[kBgWhyN] = {};   /* tp8 dev M8 */
+    };
     Counts counts() const {
         std::lock_guard<std::mutex> lk(*mu_);
         Counts c;
@@ -176,6 +194,9 @@ public:
         c.token_pieces = tok_;
         c.dpieces = dpiece_;
         for (int k = 0; k < kWhyN; ++k) c.why[k] = why_[k];
+        c.bg = bg_lent_;
+        c.bg_rows = bg_rows_;
+        for (int k = 0; k < kBgWhyN; ++k) c.bg_skip[k] = bg_skip_[k];
         return c;
     }
     void note_lent_locked(int64_t rows, bool tok) { rows_ += rows; if (tok) ++tok_; }
@@ -203,6 +224,8 @@ private:
     int64_t span_short_ = 0;                /* RADIANCE_PP_SPAN_SHORT (span_short) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
     int     lend_mixed_ = 0;                /* RADIANCE_PP_LEND_MIXED 1 (lend_mixed, tp8 dev M5) / 2 (lend_split, M5b) */
+    bool    bg_ = false;                    /* RADIANCE_PP_BG_LANE=1 (bg_lane, tp8 dev M8) */
+    int64_t bg_lent_ = 0, bg_rows_ = 0, bg_skip_[kBgWhyN] = {};
     int64_t split_min_ = 128;
     bool    head_state_ = false;
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0, dpiece_ = 0;
