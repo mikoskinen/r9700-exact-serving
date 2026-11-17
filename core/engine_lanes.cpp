@@ -132,10 +132,14 @@ int Engine::lane_head(int lane, const RadBatch* b) {
 
 void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
     const LaneSet::Counts c = lanes_.counts();
+    /* tp8 prefill P0: why chunks were not lent / sequences waited (LaneSet::kWhyN), summed over the run */
+    std::string why;
+    for (int k = 0; k < LaneSet::kWhyN; ++k)
+        why += fmt("%s%s %lld", k ? ", " : "", LaneSet::why_name(k), (long long)c.why[k]);
     RAD_INFO("two-node pipeline: %lld lane steps, %lld of them with another lane's step in flight at their tail; "
-             "newcomer split: %lld pieces lent (%lld rows, %lld carrying a first token), %lld committed",
-             (long long)lane_steps, (long long)rounds_two, (long long)c.pieces, (long long)c.rows,
-             (long long)c.token_pieces, (long long)c.done);
+             "newcomer split: %lld pieces lent (%lld rows, %lld carrying a first token), %lld committed; not lent / "
+             "waited: %s", (long long)lane_steps, (long long)rounds_two, (long long)c.pieces, (long long)c.rows,
+             (long long)c.token_pieces, (long long)c.done, why.c_str());
 }
 
 int Engine::step_loop_lanes() {

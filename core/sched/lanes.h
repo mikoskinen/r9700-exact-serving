@@ -96,8 +96,27 @@ public:
     bool    unlend_locked(int to, int home, uint64_t seq, int32_t ctx_len);
     void    unnote_lent_locked(int64_t rows, bool tok) { rows_ -= rows; if (tok) --tok_; }
 
+    /* tp8 prefill P0: why a newcomer's chunk was not lent, or its sequence waited (Counts::why, the leader's lanes
+     * line and each prompt's own line at its first token, Scheduler::lane_prompt_note):
+     *   kOffGrid   its home chunk is not the one an idle engine plans there (other rows cut it): not lent at all;
+     *   kSnap      a chunk taking a snapshot at a cut W(h > 0, t) (the head writes state): not lent, or lent last;
+     *   kWideBusy  a span-wide chunk and the next planner is busy (wide chunks go only to an idle lane);
+     *   kRoom      the next planner's inbox / cards are full;
+     *   kKv        its KV (the window group from the keep floor) was refused (lends never preempt);
+     *   kNoLane    every lane that plans before the home plans again has a chunk of it already;
+     *   kHold      a plan that left the sequence out, waiting for a lent snapshot's commit (lent_hold);
+     *   kWinWait   a plan in which its next home chunk waited for its lent chunks (KV refused while they hold it). */
+    enum { kOffGrid, kSnap, kWideBusy, kRoom, kKv, kNoLane, kHold, kWinWait, kWhyN };
+    static const char* why_name(int k) {
+        static const char* const n[kWhyN] = { "off the one-process grid", "a snapshot at h > 0", "wide vs a busy lane",
+                                              "borrower room", "KV refused", "no lane left", "held for a snapshot's commit",
+                                              "waited for its lent chunks' window" };
+        return k >= 0 && k < kWhyN ? n[k] : "?";
+    }
+    void note_why_locked(int k) { if (k >= 0 && k < kWhyN) ++why_[k]; }
+
     /* Counters (any thread, under the lock): pieces lent, pieces committed, rows lent. */
-    struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; };
+    struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; int64_t why[kWhyN] = {}; };
     Counts counts() const {
         std::lock_guard<std::mutex> lk(*mu_);
         Counts c;
@@ -105,6 +124,7 @@ public:
         c.done = done_;
         c.rows = rows_;
         c.token_pieces = tok_;
+        for (int k = 0; k < kWhyN; ++k) c.why[k] = why_[k];
         return c;
     }
     void note_lent_locked(int64_t rows, bool tok) { rows_ += rows; if (tok) ++tok_; }
@@ -128,6 +148,7 @@ private:
     int64_t split_min_ = 128;
     bool    head_state_ = false;
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0;
+    int64_t why_[kWhyN] = {};
     std::string broken_;
 };
 

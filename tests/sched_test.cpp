@@ -12726,6 +12726,10 @@ struct Lanes {
     /* tp8 S5 review: a linear state group as well, so chunks end on a checkpoint-interval grid of
      * `grid` tokens as DeepSeek's do (a lent chunk then sits beside other rows of its home's step) */
     int64_t grid = 0;
+    /* tp8 prefill P0: a fixed WINDOW group of `win` tokens as DeepSeek's kv_window, sliding as KVManager's (FakeKV
+     * slide), its pool `win_pool` blocks (0: the fake's default); `seqs` the cards (--max-num-seqs) */
+    int64_t win = 0, win_pool = 0, seqs = 6;
+    int win_g = -1;
     ~Lanes() { for (auto& s : more) s->fini(); s0.fini(); }
     Scheduler& at(int l) { return l == 0 ? s0 : *more[(size_t)(l - 1)]; }
     int start(int n, int64_t split_min = 16) {
@@ -12746,13 +12750,26 @@ struct Lanes {
             prog.kv_groups.push_back(lin);
             cfg.checkpoint_interval = grid;
         }
+        if (win > 0) {
+            KVGroupInfo w;
+            w.name = "win";
+            w.decl.kind = RAD_KV_WINDOW;
+            w.decl.window = win;
+            w.block_size = 16;
+            win_g = (int)prog.kv_groups.size();
+            prog.kv_groups.push_back(w);
+        }
         cfg.max_tok = 64;
-        cfg.max_seqs = 6;
+        cfg.max_seqs = seqs;
         cfg.max_ctx = 1024;
         cfg.prefix_cache = false;
         cfg.prefill_room_gate = false;
         cfg.n_spec = 0;
         kv.setup(prog.kv_groups, cfg.max_ctx, 4096, 64);
+        if (win > 0) {
+            kv.slide = true;
+            if (win_pool > 0) kv.resize_group(win_g, win_pool);
+        }
         pc.kv = &kv;
         std::vector<BatchBuilder::RankIO> rio;
         rio.push_back({ 0, nullptr, &prog });
@@ -12799,7 +12816,81 @@ struct Lanes {
         return nullptr;
     }
     const Request* req(int l, uint64_t id) { return at(l).find(id); }
+    /* tp8 prefill P0: every query of lane l's last build reads, through the staged window row (the kernel's mapping,
+     * libr4d r4d_ds41_sparse.hip: first = the row's last position + 1 - seqused, key j at row[(j - first) / block]),
+     * the block the manager holds position j in, for each of its window's keys j in [p - win + 1, p]. Returns the
+     * keys read wrong or missing. */
+    int64_t window_misses(int l, const RadBatch* b) {
+        if (!b || win_g < 0) return 0;
+        const RadKVGroupBatch& g = b->kv[win_g];
+        const int64_t bs = 16;
+        int64_t bad = 0;
+        const StepPlan& p = at(l).plan();
+        for (size_t i = 0; i < p.e.size(); ++i) {
+            const StepEntry& e = p.e[i];
+            if (e.n_tokens <= 0) continue;
+            const int32_t* row = g.block_table + (int64_t)i * g.block_table_pitch;
+            const int64_t last = (int64_t)e.ctx_len + e.n_tokens - 1;
+            const int64_t first = last + 1 - g.seqused_h[i];
+            const std::vector<int32_t>& bt = kv.block_table(e.seq, win_g);
+            const int64_t f0 = kv.first_block_pos(e.seq, win_g);
+            for (int64_t q = e.ctx_len; q <= last; ++q)
+                for (int64_t j = std::max<int64_t>(0, q - win + 1); j <= q; ++j) {
+                    const int64_t r = j - first, m = j - f0;
+                    const bool held = m >= 0 && m / bs < (int64_t)bt.size();
+                    const bool seen = r >= 0 && r / bs < g.block_table_pitch;
+                    if (!held || !seen || row[r / bs] != bt[(size_t)(m / bs)]) ++bad;
+                }
+        }
+        return bad;
+    }
 };
+
+/* tp8 prefill P0: a cold prompt through the engine's lane loop (Engine::step_loop_lanes: every lane with no step in
+ * flight plans, the idle lanes after it right behind it, then the oldest tail commits). Returns the chunks of `s` in
+ * the order they ran; `misses` the window keys any build mapped wrong (Lanes::window_misses). */
+static std::vector<std::pair<int, int>> run_cold(Lanes& L, int lanes, uint64_t s, int64_t* misses, int* failed) {
+    std::vector<std::pair<int, int>> got;
+    std::vector<int> fifo;
+    std::vector<char> busy((size_t)lanes, 0);
+    int next = 0;
+    *misses = 0;
+    *failed = 0;
+    for (int round = 0; round < 400; ++round) {
+        const Request* r0 = L.req(0, s);
+        if (!r0 || r0->state == ReqState::Failed || r0->state == ReqState::Finished || !r0->output.empty()) break;
+        std::vector<int> todo;
+        for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+        for (size_t at = 0; at < todo.size(); ++at) {
+            const int l = todo[at];
+            if (busy[(size_t)l]) continue;
+            std::vector<int> order, idle_after;
+            for (int j = 1; j < lanes; ++j)
+                if (!busy[(size_t)((l + j) % lanes)]) {
+                    order.push_back((l + j) % lanes);
+                    idle_after.push_back((l + j) % lanes);
+                }
+            for (int f : fifo) order.push_back(f);
+            const RadBatch* b = L.plan(l, order);
+            if (!b) continue;
+            *misses += L.window_misses(l, b);
+            for (const StepEntry& e : L.at(l).plan().e)
+                if (e.seq == s && e.is_prefill) got.emplace_back(e.ctx_len, e.ctx_len + e.n_tokens);
+            busy[(size_t)l] = 1;
+            fifo.push_back(l);
+            next = (l + 1) % lanes;
+            todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+        }
+        if (fifo.empty()) break;
+        const int l = fifo.front();
+        fifo.erase(fifo.begin());
+        if (L.commit(l, 5) < 0) ++*failed;
+        busy[(size_t)l] = 0;
+    }
+    const Request* r = L.req(0, s);
+    if (!r || r->state == ReqState::Failed) ++*failed;
+    return got;
+}
 
 }  /* namespace */
 
@@ -13183,4 +13274,82 @@ TEST(lanes_an_inbox_stays_within_the_shared_budget) {
     if (!(L.at(2).plan().n_tok <= 32 || nseq == 1))
         fprintf(stderr, "    lane 2: %lld rows of %d sequences in a shared step\n", (long long)L.at(2).plan().n_tok, nseq);
     CHECK(L.set.broken().empty());
+}
+
+/* tp8 prefill P0 (tp8/loop FINDINGS F1): a lone cold prompt over two lanes with DeepSeek's fixed window group. The home
+ * lane lends its next chunk (keep floor at the committed end), then plans the chunk after it behind the lent one. With
+ * the floor left at the lend's committed end the sequence held the window group's blocks over three chunks and the
+ * request failed ("the KV pool cannot hold 10240 tokens and nothing else is left to preempt": 640 of 612 blocks); the
+ * floor now follows the committed end, and a home chunk that still does not fit waits for its lent chunks. Every
+ * query's window keys are read through its staged row from the block the manager holds them in (a row staged from the
+ * table's start was cut at its max_blocks: the last queries of a lent chunk read no keys). Pool = KVManager's
+ * window_pool_cap: max_seqs x (window_blocks + 1) + one step's blocks. The chunks = one lane's. */
+TEST(lanes_a_lone_cold_prompt_fits_the_window_pool_and_reads_its_window) {
+    for (int64_t seqs : { 2, 3, 6 })
+        for (int n_prompt : { 100, 200, 333, 700 }) {
+            std::vector<std::pair<int, int>> ref;
+            for (int lanes : { 1, 2, 3 }) {
+                if (seqs < lanes) continue;
+                Lanes L;
+                L.win = 16;
+                L.seqs = seqs;
+                const int64_t wb = (16 + 15) / 16 + 1;
+                L.win_pool = seqs * (wb + 1) + 64 / 16;
+                REQUIRE_EQ(L.start(lanes), RAD_OK);
+                const uint64_t s = L.submit(0, n_prompt, 2);
+                REQUIRE(s != 0);
+                int64_t misses = 0;
+                int failed = 0;
+                const std::vector<std::pair<int, int>> got = run_cold(L, lanes, s, &misses, &failed);
+                CHECK_EQ(failed, 0);
+                CHECK_EQ(misses, (int64_t)0);
+                CHECK(L.set.broken().empty());
+                REQUIRE(L.req(0, s) != nullptr);
+                CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
+                CHECK_EQ(L.req(0, s)->output.size(), (size_t)1);
+                if (lanes == 1) ref = got;
+                else CHECK(got == ref);
+                const LaneSet::Counts c = L.set.counts();
+                if (lanes >= 2 && n_prompt > 64) CHECK(c.pieces > 0);
+                if (failed || misses || (lanes > 1 && got != ref))
+                    fprintf(stderr, "    %lld cards, %d tokens, %d lanes: %d failed, %lld window keys missed, %zu chunks "
+                                    "(one lane %zu), %lld lent, %lld window waits\n", (long long)seqs, n_prompt, lanes,
+                            failed, (long long)misses, got.size(), ref.size(), (long long)c.pieces,
+                            (long long)c.why[LaneSet::kWinWait]);
+            }
+        }
+}
+
+/* tp8 prefill P0: a window pool too small for the home's next chunk beside its lent one (8 blocks: the lend of
+ * [64, 128) fits, the next home chunk [128, 192) from the keep floor at 64 needs 9): the home chunk waits a plan for its
+ * lent chunk's commit instead of failing the request, then runs; the prompt's chunks are one lane's, every window key
+ * read right. */
+TEST(lanes_a_home_chunk_waits_for_its_lent_chunk_when_the_window_pool_is_short) {
+    std::vector<std::pair<int, int>> ref;
+    for (int lanes : { 1, 2 }) {
+        Lanes L;
+        L.win = 16;
+        L.seqs = 2;
+        L.win_pool = 8;
+        REQUIRE_EQ(L.start(lanes), RAD_OK);
+        const uint64_t s = L.submit(0, 200, 2);
+        REQUIRE(s != 0);
+        int64_t misses = 0;
+        int failed = 0;
+        const std::vector<std::pair<int, int>> got = run_cold(L, lanes, s, &misses, &failed);
+        CHECK_EQ(failed, 0);
+        CHECK_EQ(misses, (int64_t)0);
+        REQUIRE(L.req(0, s) != nullptr);
+        CHECK_EQ(L.req(0, s)->n_computed, (int64_t)200);
+        if (lanes == 1) ref = got;
+        else {
+            CHECK(got == ref);
+            const LaneSet::Counts c = L.set.counts();
+            CHECK(c.pieces > 0);
+            CHECK(c.why[LaneSet::kWinWait] > 0);
+            fprintf(stderr, "    2 lanes, window pool 8 blocks: %lld chunk(s) lent, %lld plan(s) waited for a lent chunk's "
+                            "window, %lld lend(s) refused for KV\n", (long long)c.pieces,
+                    (long long)c.why[LaneSet::kWinWait], (long long)c.why[LaneSet::kKv]);
+        }
+    }
 }

@@ -172,6 +172,7 @@ void Scheduler::lane_plan_begin() {
         const int32_t slot = running_[i];
         SchedReq& s = *reqs_[(size_t)slot];
         if (s.req && (s.lent_pending > 0 || s.lent_tok || s.lent_hold)) {
+            if (s.lent_hold) lane_why(s, LaneSet::kHold);
             lane_out_.push_back(slot);
             running_.erase(running_.begin() + (ptrdiff_t)i);
             continue;
@@ -324,16 +325,29 @@ void Scheduler::lane_split_own() {
     const int64_t rows_cap = cfg_.prefill_span > 1 && geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok)
                                                                          : cfg_.max_tok;
     for (StepEntry& e : plan_.e) {
+        /* tp8 prefill P0: every chunk a lane plans of its own prompts, counted for the prompt's line */
+        if (e.home < 0 && e.is_prefill && e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] &&
+            reqs_[(size_t)e.slot]->req) {
+            SchedReq& c = *reqs_[(size_t)e.slot];
+            ++c.lst.home;
+            if (!c.lst.t0_us) c.lst.t0_us = mono_us();
+        }
         if (e.home >= 0 || !e.is_prefill || e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
         if (e.cr_replay || e.n_spec != 0) continue;
-        if (hold && e.ckpt_slot >= 0 && e.ckpt_tok >= 0) continue;
+        if (hold && e.ckpt_slot >= 0 && e.ckpt_tok >= 0) {
+            if (reqs_[(size_t)e.slot]) lane_why(*reqs_[(size_t)e.slot], LaneSet::kSnap);
+            continue;
+        }
         SchedReq& s = *reqs_[(size_t)e.slot];
         if (!s.req) continue;
         Request& r = *s.req;
         if (r.embed || r.media || r.token_scores || r.n_draft != 0 || s.lent_hold) continue;
         const int64_t target = s.seq_len();
         /* only an entry on the one-process grid: its own chunk is the one an idle engine plans from its start */
-        if (lane_alone_chunk(s, r, target, e.ctx_len, nullptr) != e.n_tokens) continue;
+        if (lane_alone_chunk(s, r, target, e.ctx_len, nullptr) != e.n_tokens) {
+            lane_why(s, LaneSet::kOffGrid);
+            continue;
+        }
         /* The committed end, below which no piece in flight reads: this step's bump undone. */
         int64_t real = r.n_computed;
         for (const auto& [slot, rows] : lane_bump_)
@@ -355,19 +369,29 @@ void Scheduler::lane_split_own() {
         undo.lent_tok = s.lent_tok;
         undo.lent_next = s.lent_next;
         undo.lent_hold = s.lent_hold;
-        for (size_t j = 0; j < order.size() && p < target; ++j) {
+        int why = -1;   /* tp8 prefill P0: why the walk stopped short of the prompt's end */
+        size_t j = 0;
+        for (; j < order.size() && p < target; ++j) {
             const int to = order[j];
             int64_t ck = -1;
             const int64_t n = lane_alone_chunk(s, r, target, p, &ck);
             if (n <= 0) break;
             const Scheduler* b = lanes_->lane(to);
             const bool wide = geo_.shared_tok > 0 && n > geo_.shared_tok;
-            if (wide && (!b || !b->running_.empty() || !b->waiting_.empty() || lanes_->inbox_n_locked(to) > 0)) break;
+            if (wide && (!b || !b->running_.empty() || !b->waiting_.empty() || lanes_->inbox_n_locked(to) > 0)) {
+                why = LaneSet::kWideBusy;
+                break;
+            }
             /* the borrower's entries: its own cards' beside the inbox (the S5 review's rule) */
             if (lanes_->inbox_rows_locked(to) + n > (wide ? cfg_.max_tok : rows_cap) ||
-                (int64_t)lanes_->inbox_n_locked(to) + 1 + (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_ > cfg_.max_seqs)
+                (int64_t)lanes_->inbox_n_locked(to) + 1 + (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_ > cfg_.max_seqs) {
+                why = LaneSet::kRoom;
                 break;
-            if (kv_->ensure_from(r.id, p + n, p) < 0) break;   /* never preempt for a lent chunk */
+            }
+            if (kv_->ensure_from(r.id, p + n, p) < 0) {   /* never preempt for a lent chunk */
+                why = LaneSet::kKv;
+                break;
+            }
             LaneSet::Piece pc;
             pc.home = lane_;
             pc.e = e;
@@ -389,8 +413,11 @@ void Scheduler::lane_split_own() {
             any = true;
             p += n;
             if (pc.e.produces_token) { tok = true; break; }
-            if (hold && pc.e.ckpt_slot >= 0) { s.lent_hold = true; break; }
+            if (hold && pc.e.ckpt_slot >= 0) { s.lent_hold = true; why = LaneSet::kSnap; break; }
         }
+        if (why < 0 && !tok && p < target && j >= order.size()) why = LaneSet::kNoLane;
+        if (why >= 0) lane_why(s, why);
+        s.lst.lent += (int32_t)undo.to.size();
         if (!any) {
             if (fresh_floor) kv_->set_keep_floor(r.id, -1);
             continue;
@@ -464,6 +491,7 @@ void Scheduler::lane_piece_done(const StepEntry& e, int i, const StepResult& res
     bool overflowed = false, lp_failed = false;
     const bool eos = res.eos && res.eos[i] && !r.ignore_eos;
     if (!s.first_tok_us) s.first_tok_us = mono_us();
+    lane_prompt_note(s);
     r.output.push_back(res.token[i]);
     const TokenLogprobs* lp = res.lp && res.first_row && res.first_row[i] >= 0 && r.sp.n_probs >= 0
                                   ? &res.lp[res.first_row[i]] : nullptr;
@@ -483,6 +511,34 @@ void Scheduler::lane_piece_done(const StepEntry& e, int i, const StepResult& res
     } else if (ctx_limit_ > 0 && s.seq_len() >= ctx_limit_) close_request(s, ReqState::Finished, "length", false);
     else if (eos) close_request(s, ReqState::Finished, "stop", false);
     sweep_deferred();
+}
+
+/* tp8 prefill P0: LaneSet::kWhyN reasons, in the set (the lanes line) and in the request's own line. */
+static_assert(LaneSet::kWhyN == (int)(sizeof(SchedReq::LaneStats::why) / sizeof(int32_t)),
+              "SchedReq::LaneStats::why holds one count a LaneSet reason");
+
+void Scheduler::lane_why(SchedReq& s, int k) {
+    if (!lanes_ || n_lanes_ <= 1 || k < 0 || k >= LaneSet::kWhyN) return;
+    lanes_->note_why_locked(k);
+    ++s.lst.why[k];
+}
+
+/* One leader line a prompt whose chunks went over the lanes (or were refused), at its first token: what the test side
+ * reads from one cold-prompt run. The lock is held. */
+void Scheduler::lane_prompt_note(SchedReq& s) {
+    if (!lanes_ || n_lanes_ <= 1 || !s.req || !s.lst.t0_us) return;
+    int32_t refused = 0;
+    for (int k = 0; k < LaneSet::kWhyN; ++k) refused += s.lst.why[k];
+    if (s.lst.lent == 0 && refused == 0) { s.lst.t0_us = 0; return; }
+    std::string why;
+    for (int k = 0; k < LaneSet::kWhyN; ++k)
+        if (s.lst.why[k]) why += fmt("%s%s %d", why.empty() ? "" : ", ", LaneSet::why_name(k), (int)s.lst.why[k]);
+    RAD_INFO("lanes: request %llu's prompt of %lld tokens: %d chunk(s) planned by its lane %d, %d lent to other lanes; "
+             "%s; first chunk's plan to its first token %.1f ms", (unsigned long long)s.req->id,
+             (long long)s.req->prompt.size(), (int)s.lst.home, lane_, (int)s.lst.lent,
+             why.empty() ? "every chunk after a home chunk lent" : why.c_str(),
+             (double)(mono_us() - s.lst.t0_us) / 1000.0);
+    s.lst.t0_us = 0;
 }
 
 }  /* namespace rad */

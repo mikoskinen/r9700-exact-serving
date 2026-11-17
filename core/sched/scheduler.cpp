@@ -581,6 +581,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     draft_est_.reserve((size_t)cfg.max_seqs);
 
     RAD_TRY(builder_.init(prog, cfg, geo_, kvgeom_, ranks));
+    /* tp8 prefill P0: a lane's window rows from their own window (BatchBuilder::win_row) */
+    builder_.set_lanes_rebase(n_lanes_ > 1);
     /* The builder's bound, not a second derivation: the block tables were sized for it. */
     ctx_limit_ = builder_.max_ctx();
     /* The pool's own bound on one sequence, searched once (can_ever_fit is monotonic in the
@@ -747,6 +749,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.cbh_arr_us = cbh_now();   /* lever CBH: the hold's clock (the same monotonic clock unless a test set its own) */
     s.cbh_free = false;
     s.first_tok_us = 0;
+    s.lst = SchedReq::LaneStats{};   /* tp8 prefill P0 */
     s.preempted_us = 0;
     /* A recycled slot keeps its struct, and the prefill figure is computed from admitted_us
      * whenever it is non-zero: left standing, it would date this request's first token to the
@@ -3346,6 +3349,16 @@ const RadBatch* Scheduler::step() {
             if (++evict_rounds <= kEvictRounds && pc_ && cfg_.prefix_cache &&
                 pc_->evict(kEvictBlocks) > 0)
                 continue;
+            /* tp8 prefill P0: chunks of this prompt run in other lanes (SchedReq::lent) and hold its window from its
+             * committed end (the keep floor) to their end: its next chunk waits for their commit, which frees them,
+             * rather than fail the request or preempt another for blocks only its own pieces in flight hold (F1:
+             * "the KV pool cannot hold 10240 tokens and nothing else is left to preempt"). Never on one lane. */
+            if (s.lent > 0) {
+                lane_why(s, LaneSet::kWinWait);
+                yielded = true;
+                stays = true;
+                break;
+            }
             const bool last = running_.size() - 1 <= i;
             /* tp8 S5 review: under lanes the pool is shared but a lane preempts only its own requests;
              * the request alone in its lane's running set is crowded out by another lane's (or by its
@@ -4241,6 +4254,11 @@ int Scheduler::commit(StepResult& res) {
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
+            /* tp8 prefill P0: chunks of this prompt still in flight in other lanes (SchedReq::lent) start at the
+             * committed end (pieces commit in position order), so the keep floor follows it: left at the lend's
+             * committed end it kept this chunk's window too, and the home lane's next chunk behind the lent one then
+             * needed the window group's blocks over three chunks (F1: 10,240 tokens of a 9,792-token pool). */
+            if (s.lent > 0) kv_->set_keep_floor(r.id, r.n_computed);
             /* The chunk is committed: a window group returns its blocks below the window now,
              * not at this sequence's next ensure(), which may be steps away. */
             kv_->trim_window(r.id, r.n_computed);
@@ -4261,6 +4279,7 @@ int Scheduler::commit(StepResult& res) {
                 if (!s.first_tok_us) s.first_tok_us = mono_us();
             } else if (e.produces_token && res.token) {
                 if (!s.first_tok_us) s.first_tok_us = mono_us();
+                lane_prompt_note(s);   /* tp8 prefill P0: the prompt's lanes line (one lane: nothing) */
                 r.output.push_back(res.token[i]);
                 const TokenLogprobs* lp =
                     res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
