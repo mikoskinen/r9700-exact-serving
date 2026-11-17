@@ -257,9 +257,25 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
     for (BtMirror& m : bt_mirror_) {
         m.seq.assign((size_t)max_seqs_, 0);
         m.len.assign((size_t)max_seqs_, -1);
+        m.base.assign((size_t)max_seqs_, -1);
     }
     ranges_.clear();
     return RAD_OK;
+}
+
+/* tp8 prefill P0: see batch.h (lanes_rebase_). The first query at e.ctx_len reads keys down to ctx_len - window + 1,
+ * which lies in block ctx_len / block - ceil(window / block) or later (KVManager::recycle_window's target, the block
+ * one process's table starts at); the row's last query is at ctx_len + n_tokens - 1. */
+BatchBuilder::WinRow BatchBuilder::win_row(const KVGeom::G& L, const StepEntry& e, int64_t first, int64_t bt_len) const {
+    WinRow w;
+    w.n = bt_len;
+    if (!lanes_rebase_ || L.kind != RAD_KV_WINDOW || L.window <= 0 || L.block_size <= 0) return w;
+    const int64_t bs = L.block_size, fb = first / bs;
+    const int64_t want = std::max<int64_t>(0, (int64_t)e.ctx_len / bs - (L.window + bs - 1) / bs);
+    w.skip = std::min<int64_t>(std::max<int64_t>(0, want - fb), bt_len);
+    const int64_t end = ((int64_t)e.ctx_len + e.n_tokens + bs - 1) / bs - fb;   /* table entries up to the row's end */
+    w.n = std::max<int64_t>(0, std::min<int64_t>(bt_len, end) - w.skip);
+    return w;
 }
 
 void BatchBuilder::forget_tables() {
@@ -748,19 +764,31 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                         : has_win ? kvgeom_.slot_ring((int)gi, bt, first, pos, win)
                                   : kvgeom_.slot((int)gi, bt, first, pos);
                 }
+                /* tp8 prefill P0: under lanes a fixed window row from its first query's window (win_row); the slots
+                 * above are the manager's table's, the row and its `first` below the rebased view of the same blocks */
+                const WinRow wr = has_win ? WinRow{ 0, bt_len } : win_row(L, e, first, bt_len);
+                const bool rebased = lanes_rebase_ && !has_win && L.kind == RAD_KV_WINDOW && L.window > 0;
+                const int32_t* const bt_row = bt.empty() ? nullptr : bt.data() + wr.skip;
+                const int64_t row_base = rebased ? first / L.block_size + wr.skip : -1;
+                if (rebased) first += wr.skip * L.block_size;
                 /* Restage relative to what the card holds (BtMirror). The same sequence in the
                  * same row keeps entries below the first changed one and below the end of both
                  * old and new tables, so a decode step stages nothing or one appended block. A
                  * new or moved sequence restages the whole row, and its copies in other rows go
                  * unknown. Change marks are taken for every row. */
-                const int64_t nb = std::min<int64_t>((int64_t)bt.size(), pitch);
+                const int64_t nb = std::min<int64_t>(rebased ? wr.n : (int64_t)bt.size(), pitch);
+                if (rebased && wr.n > pitch)
+                    RAD_ERR("kv group %d: sequence %llu's window row needs %lld blocks from position %lld, past the "
+                            "row's %lld: its last queries would miss keys", (int)gi, (unsigned long long)e.seq,
+                            (long long)wr.n, (long long)first, (long long)pitch);
                 /* tp8 S5: a piece of another lane's sequence (StepEntry::home) is restaged whole and
                  * leaves the change marks to its home lane's builder, whose slab tracks the sequence:
                  * taken here, that builder would keep a stale row. The row is unknown afterwards. */
                 const bool foreign = e.home >= 0;
-                const int64_t chg = foreign ? 0 : kv.take_table_changes(e.seq, (int32_t)gi);
+                int64_t chg = foreign ? 0 : kv.take_table_changes(e.seq, (int32_t)gi);
+                if (rebased) chg = chg >= wr.skip ? chg - wr.skip : 0;   /* the row's index of the first change */
                 int64_t lo = 0, hi = pitch;
-                if (!foreign && m.len[(size_t)i] >= 0 && m.seq[(size_t)i] == e.seq) {
+                if (!foreign && m.len[(size_t)i] >= 0 && m.seq[(size_t)i] == e.seq && m.base[(size_t)i] == row_base) {
                     lo = std::min(std::min(chg, m.len[(size_t)i]), nb);
                     hi = std::max(nb, m.len[(size_t)i]);
                 } else {
@@ -772,13 +800,14 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                     const int64_t nc = nb > lo ? nb - lo : 0;
                     /* Guarded: an empty table's data() may be null, and memcpy's source must
                      * not be, even for zero bytes. */
-                    if (nc > 0) std::memcpy(w, bt.data() + lo, (size_t)nc * sizeof(int32_t));
+                    if (nc > 0) std::memcpy(w, bt_row + lo, (size_t)nc * sizeof(int32_t));
                     std::fill(w + nc, w + (hi - lo), -1);
                     stage(g.bt_fix + i * pitch + lo, np, hi - lo);
                     np += hi - lo;
                 }
                 m.seq[(size_t)i] = e.seq;
                 m.len[(size_t)i] = foreign ? -1 : nb;
+                m.base[(size_t)i] = row_base;
             } else {
                 /* A linear or conv group has one state slot per sequence; every token maps to it
                  * and the block-table row is that slot, so table-reading kernels need no second
@@ -919,7 +948,11 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         if (kvgeom_.g[gi].paged) {
             int64_t need = 1;
             for (int64_t i = 0; i < n_seq; ++i) {
-                const int64_t n = (int64_t)kv.block_table(plan.e[(size_t)i].seq, (int32_t)gi).size();
+                const StepEntry& e = plan.e[(size_t)i];
+                int64_t n = (int64_t)kv.block_table(e.seq, (int32_t)gi).size();
+                /* tp8 prefill P0: a lane's window row is its own window's span (win_row) */
+                if (lanes_rebase_ && kvgeom_.g[gi].kind == RAD_KV_WINDOW && !kv.runtime_window(e.seq, (int32_t)gi, nullptr))
+                    n = win_row(kvgeom_.g[gi], e, kv.first_block_pos(e.seq, (int32_t)gi), n).n;
                 if (n > need) need = n;
             }
             const int64_t bs = kvgeom_.g[gi].block_size > 0 ? kvgeom_.g[gi].block_size : 1;

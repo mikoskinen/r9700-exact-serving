@@ -170,6 +170,14 @@ struct SchedReq {
     /* The first position of the next piece another lane must take from its inbox: pieces are taken
      * (and so issued) in position order, which LaneSet checks loudly (-1: none waiting). */
     int64_t  lent_next = -1;
+    /* tp8 prefill P0: what the lanes did with this prompt (Scheduler::lane_prompt_note, one leader line at its first
+     * token): chunks planned at home, chunks lent, and LaneSet::kWhyN reasons a chunk was not lent / the sequence
+     * waited; t0_us its first chunk's plan (0: no line due). Reset at admission. */
+    struct LaneStats {
+        int32_t home = 0, lent = 0;
+        int32_t why[8] = {};
+        int64_t t0_us = 0;
+    } lst;
     /* Lever PSK design 2 (fn4 ds41_psk 2 / 3, ds41-psk2): latched when the request is admitted (Scheduler::psk_latch) and
      * fixed while it is prefilled, so every chunk of its prompt computes the same targets -- the anchor stride K over the
      * periodic checkpoint positions (0: not planned, every chunk runs as before) and the first one at or past 32768. */
@@ -1147,6 +1155,10 @@ private:
     std::vector<int32_t> lane_out_;
     /* preempt_back() left the back alone: a piece of its prompt is in flight in another lane */
     bool     lane_preempt_refused_ = false;
+    /* tp8 prefill P0: one counted reason (LaneSet::kWhyN) for request `s`, in the set and in its own line */
+    void lane_why(SchedReq& s, int k);
+    /* tp8 prefill P0: the leader's line for a prompt whose chunks went over the lanes, at its first token */
+    void lane_prompt_note(SchedReq& s);
     int64_t  lane_reserved_ = 0;   /* the inbox rows lane_reserve set aside this step */
     void    lane_plan_begin();
     void    lane_plan_end();
@@ -1156,6 +1168,8 @@ private:
     /* The chunk an idle engine (one process, this prompt alone) plans from position `n` of `r`, and the snapshot its
      * end takes (as bi_chunk_plan's alone piece; lever PSK design 2's targets applied): the one-process grid */
     int64_t lane_alone_chunk(const SchedReq& s, Request& r, int64_t target, int64_t n, int64_t* ckpt);
+    /* tp8 prefill P1: whether r's alone piece spans (--prefill-span; none under lanes with RADIANCE_PP_SPAN=0) */
+    bool alone_spans(const Request& r, int64_t target) const;
     void    lane_return_pieces();
     /* What lane_split_own lent this step, so a step whose build fails takes it back (lane_unsplit_own):
      * nothing of that step ran, so a piece left in another lane would run past rows never computed. */

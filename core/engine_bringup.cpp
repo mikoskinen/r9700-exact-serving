@@ -1906,7 +1906,8 @@ static void debug_vram_report(const Program& P, const std::vector<ArenaLevel>& l
         const KVGroupInfo& gi = P.kv_groups[g];
         if (gi.decl.kind != RAD_KV_WINDOW || gi.block_size <= 0 || gi.decl.window <= 0) continue;
         const int64_t bs = gi.block_size, wbl = (gi.decl.window + bs - 1) / bs + 1;
-        const int64_t cap = (cfg.max_seqs > 0 ? cfg.max_seqs : 1) * (wbl + 1) + (cfg.max_tok > 0 ? (cfg.max_tok + bs - 1) / bs : 0);
+        const int64_t cap = (cfg.max_seqs > 0 ? cfg.max_seqs : 1) * (wbl + 1) +
+                            KVManager::window_steps(cfg) * (cfg.max_tok > 0 ? (cfg.max_tok + bs - 1) / bs : 0);
         const int64_t slot = gi.layers.empty() ? 0 : gi.bytes_per_block / bs / (int64_t)gi.layers.size();
         RAD_INFO("vram (RADIANCE_DEBUG_VRAM) kvwin: group '%s' %zu layer(s), %lld B a key and layer, %lld B a block of %lld; "
                  "pool cap %lld blocks = %lld B a card%s; %lld B of window a checkpoint slot",

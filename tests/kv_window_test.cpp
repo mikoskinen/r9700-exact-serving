@@ -659,3 +659,68 @@ TEST(a_lend_time_ensure_keeps_the_home_chunk_window_under_the_keep_floor) {
         kv.free_sequence(1);
     }
 }
+
+/* tp8 prefill P0 (tp8/loop FINDINGS F1), on the real manager: a lane lends its newcomer's next chunk [256, 512) while its
+ * own [0, 256) runs (keep floor 0, the committed end), commits its chunk, and plans [512, 768) behind the lent one. With
+ * the floor still at 0 the window group must hold [0, 768): more than its pool (max_seqs x (window_blocks + 1) + one
+ * step = 4 x 6 + 16 = 40 blocks; 48 needed) -> RAD_E_FULL, the "cannot hold 10240 tokens" of the cards. With the floor
+ * at the committed end (256: the lent chunk's start, Scheduler::commit) it holds [192, 768) = 36 blocks and the lent
+ * chunk's window stays (its first query at 256 reads from 193). */
+TEST(the_keep_floor_at_the_committed_end_holds_the_next_chunk_behind_a_lent_one) {
+    const KVGroupInfo grp = window_group(16, 64);
+    const std::vector<KVGroupInfo> g = groups_of(grp);
+    Config cfg = window_config();
+    cfg.max_tok = 256;
+    for (int follow = 0; follow < 2; ++follow) {
+        Pools pools;
+        CHECK_OK(configure_pools(pools, cfg));
+        KVManager kv;
+        CHECK_OK(kv.configure(g, cfg, pools.kv()));
+        CHECK_EQ(kv.total_blocks(G_WIN), (int64_t)(4 * (64 / 16 + 1 + 1) + 256 / 16));
+        CHECK_OK(kv.add_sequence(1));
+        CHECK_OK(kv.ensure(1, 256, 0));                 /* the home's [0, 256) */
+        kv.set_keep_floor(1, 0);                        /* lane_split_own: the committed end, before the lend */
+        CHECK_OK(kv.ensure(1, 512, 256));               /* the lent [256, 512) */
+        if (follow) kv.set_keep_floor(1, 256);          /* the home's commit: the floor follows the committed end */
+        kv.trim_window(1, 256);
+        const int st = kv.ensure(1, 768, 512);          /* the home's next chunk [512, 768), planned behind the lent one */
+        fprintf(stderr, "    floor %s: the next home chunk's ensure -> %s, table from %lld, %lld blocks held of %lld\n",
+                follow ? "at the committed end" : "left at the lend's", rad_strerror(st),
+                (long long)kv.first_block_pos(1, G_WIN), (long long)kv.block_table(1, G_WIN).size(),
+                (long long)kv.total_blocks(G_WIN));
+        if (follow) {
+            CHECK_OK(st);
+            CHECK(kv.first_block_pos(1, G_WIN) <= 256 - 64 + 1);   /* the lent chunk's first query's window is held */
+        } else {
+            CHECK_EQ(st, RAD_E_FULL);
+        }
+        kv.free_sequence(1);
+    }
+}
+
+/* tp8 prefill P0: RADIANCE_PP_WIN_STEPS=k sizes a window group's pool for k steps' tokens beside the windows (KVManager::
+ * window_pool_cap), on a pipeline of N lanes only, k in 1 .. 2N - 1; unset, out of range or one machine: one step. */
+TEST(the_window_pool_holds_the_lanes_steps_radiance_pp_win_steps_names) {
+    const KVGroupInfo grp = window_group(16, 64);
+    const std::vector<KVGroupInfo> g = groups_of(grp);
+    struct Arm { int nodes, lanes; const char* env; int64_t steps; };
+    const Arm arms[] = { { 1, 0, nullptr, 1 }, { 1, 0, "3", 1 }, { 2, 2, nullptr, 1 }, { 2, 2, "2", 2 }, { 2, 2, "3", 3 },
+                         { 2, 2, "4", 1 }, { 2, 2, "0", 1 }, { 2, 2, "x", 1 }, { 2, 3, "5", 5 }, { 2, 1, "2", 1 } };
+    for (const Arm& a : arms) {
+        if (a.env) setenv("RADIANCE_PP_WIN_STEPS", a.env, 1);
+        else unsetenv("RADIANCE_PP_WIN_STEPS");
+        Config cfg = window_config();
+        cfg.max_tok = 256;
+        cfg.pp_nodes = a.nodes;
+        cfg.pp_lanes = a.lanes;
+        Pools pools;
+        CHECK_OK(configure_pools(pools, cfg));
+        KVManager kv;
+        CHECK_OK(kv.configure(g, cfg, pools.kv()));
+        CHECK_EQ(KVManager::window_steps(cfg), a.steps);
+        CHECK_EQ(kv.total_blocks(G_WIN), (int64_t)(4 * (64 / 16 + 1 + 1) + a.steps * (256 / 16)));
+    }
+    unsetenv("RADIANCE_PP_WIN_STEPS");
+}
+
+/* RAD_TEST_MAIN() is above: these cases register at static initialisation like the others. */

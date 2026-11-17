@@ -388,7 +388,21 @@ private:
         int64_t pitch = -1;
         std::vector<uint64_t> seq;
         std::vector<int64_t>  len;
+        /* tp8 prefill P0: a lane row's table base (win_row), -1 for a row staged from the table's start */
+        std::vector<int64_t>  base;
     };
+    /* tp8 prefill P0 (pipeline lanes): a fixed window group's row is staged from the block of its first query's
+     * window, not from the manager's table start. Under lanes the manager holds a sequence's window from its keep
+     * floor (its committed end) to the end of its chunks in flight in other lanes, which can pass the row's
+     * max_blocks: staged from the start, the row would be cut at the pitch and the kernel would miss the keys of
+     * its last queries. `skip` = the table entries no query of the row reads, `n` = the entries the row reaches. */
+    bool lanes_rebase_ = false;
+public:
+    /* Set by a lane scheduler (Scheduler::init with n_lanes > 1), before its first build. */
+    void set_lanes_rebase(bool on) { lanes_rebase_ = on; }
+private:
+    struct WinRow { int64_t skip = 0, n = 0; };
+    WinRow win_row(const KVGeom::G& L, const StepEntry& e, int64_t first, int64_t bt_len) const;
     std::vector<BtMirror> bt_mirror_;
     /* This build's upload ranges, host-side, until build() writes them behind the payload. */
     std::vector<RadCopyRange> ranges_;

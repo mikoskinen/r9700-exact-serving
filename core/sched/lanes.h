@@ -72,6 +72,13 @@ public:
         order_ = std::move(order);
     }
     bool split_on() const { return split_on_; }
+    /* tp8 prefill P1 (RADIANCE_PP_SPAN=0): a lone prefill under lanes plans one checkpoint interval a chunk instead of
+     * --prefill-span's span (the published host-staged build's own grid: its cold 16k is 2048 x 7 + 1441), so the lanes
+     * keep two of its chunks in flight where a span chunk (4,096 rows) went only to an idle lane and filled the window
+     * pool at three. Default on (1): a lone prefill spans as on one machine. Every chunk boundary stays an interval
+     * boundary, the plan the one-process grid's (Scheduler::alone_spans). */
+    bool span_on() const { return span_on_; }
+    void set_span(bool on) { span_on_ = on; }
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
     void set_split(bool on, int64_t min_rows) { split_on_ = on; split_min_ = min_rows > 0 ? min_rows : split_min_; }
@@ -96,8 +103,27 @@ public:
     bool    unlend_locked(int to, int home, uint64_t seq, int32_t ctx_len);
     void    unnote_lent_locked(int64_t rows, bool tok) { rows_ -= rows; if (tok) --tok_; }
 
+    /* tp8 prefill P0: why a newcomer's chunk was not lent, or its sequence waited (Counts::why, the leader's lanes
+     * line and each prompt's own line at its first token, Scheduler::lane_prompt_note):
+     *   kOffGrid   its home chunk is not the one an idle engine plans there (other rows cut it): not lent at all;
+     *   kSnap      a chunk taking a snapshot at a cut W(h > 0, t) (the head writes state): not lent, or lent last;
+     *   kWideBusy  a span-wide chunk and the next planner is busy (wide chunks go only to an idle lane);
+     *   kRoom      the next planner's inbox / cards are full;
+     *   kKv        its KV (the window group from the keep floor) was refused (lends never preempt);
+     *   kNoLane    every lane that plans before the home plans again has a chunk of it already;
+     *   kHold      a plan that left the sequence out, waiting for a lent snapshot's commit (lent_hold);
+     *   kWinWait   a plan in which its next home chunk waited for its lent chunks (KV refused while they hold it). */
+    enum { kOffGrid, kSnap, kWideBusy, kRoom, kKv, kNoLane, kHold, kWinWait, kWhyN };
+    static const char* why_name(int k) {
+        static const char* const n[kWhyN] = { "off the one-process grid", "a snapshot at h > 0", "wide vs a busy lane",
+                                              "borrower room", "KV refused", "no lane left", "held for a snapshot's commit",
+                                              "waited for its lent chunks' window" };
+        return k >= 0 && k < kWhyN ? n[k] : "?";
+    }
+    void note_why_locked(int k) { if (k >= 0 && k < kWhyN) ++why_[k]; }
+
     /* Counters (any thread, under the lock): pieces lent, pieces committed, rows lent. */
-    struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; };
+    struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; int64_t why[kWhyN] = {}; };
     Counts counts() const {
         std::lock_guard<std::mutex> lk(*mu_);
         Counts c;
@@ -105,6 +131,7 @@ public:
         c.done = done_;
         c.rows = rows_;
         c.token_pieces = tok_;
+        for (int k = 0; k < kWhyN; ++k) c.why[k] = why_[k];
         return c;
     }
     void note_lent_locked(int64_t rows, bool tok) { rows_ += rows; if (tok) ++tok_; }
@@ -125,9 +152,11 @@ private:
     bool    pick_rr_ = false;               /* RADIANCE_PP_PICK=rr (pick) */
     mutable std::atomic<uint64_t> rr_{ 0 };
     bool    split_on_ = true;
+    bool    span_on_ = true;                /* RADIANCE_PP_SPAN (span_on) */
     int64_t split_min_ = 128;
     bool    head_state_ = false;
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0;
+    int64_t why_[kWhyN] = {};
     std::string broken_;
 };
 
