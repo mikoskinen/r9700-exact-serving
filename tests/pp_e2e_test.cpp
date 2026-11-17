@@ -1364,4 +1364,99 @@ TEST(decode_lanes_first_serve_and_record_what_one_process_does) {
     }
 }
 
+/* ------------------------------------------------------------------ tp8 dev M4 */
+/* RADIANCE_PP_SEG_LAYERS=1 (the follower's passes of >= RADIANCE_PP_SEG_ROWS rows in one-layer segments, each boundary's stream
+ * saved and restored on its rank through the stage ops' loop mode, other lanes' passes between the segments) with
+ * RADIANCE_PP_READY_FIRST=1 (the leader takes a later lane's landed tail before a long pass's): tokens at two and three lanes
+ * and the KL recordings are one process's; the follower counts its split passes and the passes it ran between segments
+ * (RADIANCE_PP_SEG_TEST_WAIT_MS holds each gap open long enough for another lane's frame to arrive on the host backend). */
+TEST(follower_segments_serve_and_record_what_one_process_does) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_seg");
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", { "--max-num-seqs", "6" }));
+        ref = lane_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    const std::vector<std::string> seg_env = { "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" };
+    /* the follower's last "N passes ran in M segments, K other passes between their segments, H held" line */
+    auto seg_count = [](const std::string& log, const char* what) {
+        const size_t at = log.rfind(" passes ran in ");
+        if (at == std::string::npos) return -1ll;
+        const size_t b = log.rfind("follower: ", at);
+        if (b == std::string::npos) return -1ll;
+        long long p = -1, n = -1, k = -1, h = -1;
+        if (std::sscanf(log.c_str() + b, "follower: %lld passes ran in %lld segments, %lld other passes between their "
+                                         "segments, %lld held", &p, &n, &k, &h) != 4) return -1ll;
+        const std::string w(what);
+        return w == "passes" ? p : w == " segments" ? n : w == " other passes between" ? k : h;
+    };
+    auto rf_taken = [](const std::string& log) {
+        const size_t at = log.rfind(" lane steps' tails went before an older long pass");
+        if (at == std::string::npos) return -1ll;
+        const size_t b = log.rfind("two-node pipeline: ", at);
+        return b == std::string::npos ? -1ll : std::atoll(log.c_str() + b + 19);
+    };
+    struct Arm { int lanes; const char* cut; bool fe; };
+    long long between_all = 0;
+    for (const Arm a : { Arm{ 2, "0,2", false }, Arm{ 3, "0,3", false }, Arm{ 2, "1,3", false }, Arm{ 2, "0,2", true },
+                         Arm{ 3, "1,3", true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.insert(env.end(), seg_env.begin(), seg_env.end());
+        if (a.fe) env.push_back("RADIANCE_PP_FOLLOWER_EMBED=1");
+        Serving pp;
+        REQUIRE(pp.start(a.cut, lane_shape(a.lanes), env));
+        const std::vector<std::vector<int32_t>> got = lane_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        const long long passes = seg_count(flog, "passes"), parts = seg_count(flog, " segments"),
+                        between = seg_count(flog, " other passes between");
+        between_all += std::max(0ll, between);
+        fprintf(stderr, "    segments, %d lane(s) W(%s)%s: %d of %zu prompts differ; %lld passes in %lld segments, %lld passes "
+                        "between; ready-first %lld; pieces lent %lld\n", a.lanes, a.cut, a.fe ? " + follower embeds" : "",
+                differ, ref.size(), passes, parts, between, rf_taken(llog),
+                log_count(llog, "newcomer split: "));
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(flog.find("run in layer segments at the boundaries") != std::string::npos);
+        CHECK(passes > 0);
+        CHECK(parts >= 2 * passes);
+        CHECK(llog.find("RADIANCE_PP_READY_FIRST=1 -- a later lane step's tail") != std::string::npos);
+        CHECK(llog.find("waits for a first X2 (RADIANCE_PP_READY_FIRST=1)") != std::string::npos);
+    }
+    CHECK(between_all > 0);
+    const std::string rec = record_single(d / "single", { "--max-num-seqs", "6" });
+    REQUIRE(!rec.empty());
+    for (const Arm a : { Arm{ 2, "0,2", false }, Arm{ 3, "0,3", false }, Arm{ 2, "1,3", false } }) {
+        const std::string out = d / ("pp-" + std::to_string(a.lanes) + "-" + std::string(a.cut).replace(1, 1, "-"));
+        std::vector<std::string> env = kSplitEnv;
+        env.insert(env.end(), seg_env.begin(), seg_env.end());
+        const PipeRun pr = record_pipeline(out, a.cut, env, lane_shape(a.lanes), lane_shape(a.lanes), env);
+        if (pr.leader != 0 || pr.follower != 0)
+            fprintf(stderr, "    leader %d, follower %d\n    leader:\n%s\n    follower:\n%s\n", pr.leader, pr.follower,
+                    tail(pr.llog).c_str(), tail(pr.flog).c_str());
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(rec, out, &why);
+        fprintf(stderr, "    segments, %d lane(s) W(%s): recording %s; follower passes in segments %lld, between %lld\n",
+                a.lanes, a.cut, same ? "identical" : why.c_str(), seg_count(pr.flog, "passes"),
+                seg_count(pr.flog, " other passes between"));
+        CHECK(same);
+        CHECK(seg_count(pr.flog, "passes") > 0);
+    }
+}
+
 RAD_TEST_MAIN()

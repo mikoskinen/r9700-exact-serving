@@ -17,6 +17,7 @@
 namespace rad {
 /* tp8 S5 (core/engine_node.cpp): the part of a pipeline leader's pass being issued, 0 for a whole pass. */
 int pp_pass_part();
+int pp_pass_seg();
 }  /* namespace rad */
 
 namespace rad {
@@ -1123,6 +1124,8 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
      * (abi/rad_pp.h RAD_PP_PART_*): each part is its own recording. The whole pass (one machine, one
      * lane, the follower) mixes nothing: every key is the one this function gave before. */
     if (const int pp = pp_pass_part()) mix(0x7070000ull + (uint64_t)pp);
+    /* tp8 dev M4: a follower segment's layers (RAD_PP_PART_SEG): each its own recording */
+    if (pp_pass_part() == 3 /* RAD_PP_PART_SEG */) mix(0x7071000ull + (uint64_t)pp_pass_seg());
     return h | 1;
 }
 

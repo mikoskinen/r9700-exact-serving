@@ -71,12 +71,20 @@ bool dense(const RadTensor& t) {
 
 }  /* namespace */
 
+/* tp8 dev M4: `loop` 1 -- a segment boundary on one node (abi/rad_pp.h RAD_PP_PART_SEG): the ring operand is a buffer of
+ * this rank (the plugin's), every rank sends its own parts into its own and takes them back with the receive; the send
+ * publishes the payload to itself (a fresh header: number 1, landed and sent with ready), so the buffer needs no setup. */
+bool loop_of(const RadArgs* a) { return rad_param_geti(a->p, a->n_p, "loop", 0) == 1; }
+uint64_t loop_cap(const RadTensor& t) { return (uint64_t)rad_dtype_bytes(t.dtype, rad_tensor_numel(&t)); }
+
 int ref_stage_send(const RadArgs* a, RadStream) {
     if (!a || a->n_t < 2) return RAD_E_INVAL;
     RadPpRing* r = static_cast<RadPpRing*>(a->t[0].data);
-    if (!r || r->magic != RAD_PP_RING_MAGIC) return RAD_E_STATE;
+    const bool loop = loop_of(a);
+    if (!r || (!loop && r->magic != RAD_PP_RING_MAGIC)) return RAD_E_STATE;
+    if (loop && loop_cap(a->t[0]) < RAD_PP_RING_HDR) return RAD_E_FULL;
     const int sender = (int)rad_param_geti(a->p, a->n_p, "sender", 0);
-    if (a->rank != sender) return RAD_OK;
+    if (!loop && a->rank != sender) return RAD_OK;
     int n = 0;
     int64_t rows = 0;
     uint64_t bytes[RAD_PP_MAX_PARTS] = {};
@@ -86,7 +94,16 @@ int ref_stage_send(const RadArgs* a, RadStream) {
         if (!dense(a->t[1 + i])) return RAD_E_STRIDE;
         total += rad_pp_align(bytes[i]);
     }
-    if (total + RAD_PP_TRAILER > r->cap) return RAD_E_FULL;
+    if (total + RAD_PP_TRAILER > (loop ? loop_cap(a->t[0]) - RAD_PP_RING_HDR : r->cap)) return RAD_E_FULL;
+    if (loop) {   /* tp8 dev M4: a fresh header; the receive on this rank takes payload 1 */
+        r->abort = 0;
+        r->ready = 0;
+        r->sent = 0;
+        r->landed = 0;
+        r->taken[a->rank] = 0;
+        r->n_ranks = RAD_PP_MAX_RANKS;
+        r->deadline_ms = 0;
+    }
     /* The last payload must be off the ring (the link sets `sent`). */
     const uint64_t t0 = mono_ms();
     while (__atomic_load_n(&r->sent, __ATOMIC_ACQUIRE) < r->ready) {
@@ -110,15 +127,20 @@ int ref_stage_send(const RadArgs* a, RadStream) {
     r->rows = (uint64_t)rows;
     r->parts = (uint64_t)n;
     r->bytes = total + RAD_PP_TRAILER;
+    if (loop) {   /* tp8 dev M4: to itself: landed and off the ring at once */
+        __atomic_store_n(&r->sent, seq, __ATOMIC_RELEASE);
+        __atomic_store_n(&r->landed, seq, __ATOMIC_RELEASE);
+    }
     __atomic_store_n(&r->ready, seq, __ATOMIC_RELEASE);
-    r->ready_ns = mono_ns();   /* tp8 S5: the stage busy stamps (read after the pass) */
+    if (!loop) r->ready_ns = mono_ns();   /* tp8 S5: the stage busy stamps (read after the pass) */
     return RAD_OK;
 }
 
 int ref_stage_recv(const RadArgs* a, RadStream) {
     if (!a || a->n_t < 2) return RAD_E_INVAL;
     RadPpRing* r = static_cast<RadPpRing*>(a->t[0].data);
-    if (!r || r->magic != RAD_PP_RING_MAGIC) return RAD_E_STATE;
+    const bool loop = loop_of(a);
+    if (!r || (!loop && r->magic != RAD_PP_RING_MAGIC)) return RAD_E_STATE;
     const int rank = a->rank;
     if (rank < 0 || rank >= RAD_PP_MAX_RANKS || (uint64_t)rank >= r->n_ranks) return RAD_E_STATE;
     int n = 0;
@@ -153,7 +175,7 @@ int ref_stage_recv(const RadArgs* a, RadStream) {
         off += rad_pp_align(bytes[i]);
     }
     __atomic_store_n(&r->taken[rank], want, __ATOMIC_RELEASE);
-    if (rank == 0) r->taken_ns = mono_ns();   /* tp8 S5: the stage busy stamps */
+    if (rank == 0 && !loop) r->taken_ns = mono_ns();   /* tp8 S5: the stage busy stamps */
     return RAD_OK;
 }
 

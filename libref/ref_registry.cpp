@@ -1213,7 +1213,7 @@ static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
  * `ring` is the core's ring for this crossing on this node (RadPpInfo::ring), a raw pointer the
  * plugin passes; x0..x11 / y0..y11 are the parts, each [rows, ...] at its own dtype, packed verbatim
  * (tp8 S6: a part's rows are its own; part 0's are the header's). */
-static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender") };
+static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender"), P_INTO("loop") };
 static const RadOperandSpec oStageSend[] = { OPD("ring"), OPD("x0"), OPD_O("x1"), OPD_O("x2"),
                                              OPD_O("x3"), OPD_O("x4"), OPD_O("x5"), OPD_O("x6"),
                                              OPD_O("x7"), OPD_O("x8"), OPD_O("x9"), OPD_O("x10"),
@@ -1979,7 +1979,8 @@ static const RadOpSchema kSchemas[] = {
   "at its own dtype and dense, packed verbatim into `ring` (part i at the 256-byte-aligned sum of "
   "the parts before it), then published (`ready`). Only rank `sender` (default 0) writes; on the "
   "other ranks the launch does nothing. Waits for the core's link to have taken the last payload "
-  "off the ring; fails on the ring's abort word." },
+  "off the ring; fails on the ring's abort word. `loop` 1 (tp8 dev M4, a segment boundary on one node): `ring` is a "
+  "buffer of this rank, every rank writes its own parts into its own and publishes them to itself." },
 { "stage_recv", ARR(pStage), ARR(oStageRecv),
   "The two-node pipeline's crossing into this node: waits until the other node's payload has "
   "landed in `ring` (`landed` past this rank's `taken`), checks its rows, parts and bytes against "

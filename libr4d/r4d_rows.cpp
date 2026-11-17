@@ -2222,7 +2222,7 @@ static const RadOperandSpec oGather[] = {
  * r4d_plugin.h, which every unit includes. */
 extern "C" int r4d_rad_stage_send(const RadArgs*, RadStream);
 extern "C" int r4d_rad_stage_recv(const RadArgs*, RadStream);
-static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender") };
+static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender"), P_INTO("loop") };
 static const RadOperandSpec oStageSend[] = {
     { "ring", RAD_OPD_IN, 0 }, { "x0", RAD_OPD_IN, 0 }, { "x1", RAD_OPD_IN, 1 }, { "x2", RAD_OPD_IN, 1 },
     { "x3", RAD_OPD_IN, 1 }, { "x4", RAD_OPD_IN, 1 }, { "x5", RAD_OPD_IN, 1 }, { "x6", RAD_OPD_IN, 1 },

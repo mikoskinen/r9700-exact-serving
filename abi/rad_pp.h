@@ -73,7 +73,19 @@ enum { RAD_PP_X1 = 0, RAD_PP_X2 = 1, RAD_PP_N_RINGS = 2 };
  *   RAD_PP_PART_HEAD   the leader's part up to and including stage_send X1
  *   RAD_PP_PART_TAIL   the leader's part from stage_recv X2 on (the head and sampler follow it)
  * A plugin reads it at issue (RadPpInfo::part); the core keys recorded passes by it. */
-enum { RAD_PP_PART_WHOLE = 0, RAD_PP_PART_HEAD = 1, RAD_PP_PART_TAIL = 2 };
+enum { RAD_PP_PART_WHOLE = 0, RAD_PP_PART_HEAD = 1, RAD_PP_PART_TAIL = 2, RAD_PP_PART_SEG = 3 };
+
+/* tp8 dev M4 (RADIANCE_PP_SEG_LAYERS=k on the follower; unset: nothing here): a follower pass of many rows is issued in
+ * layer segments [seg_l0, seg_l1) of its [h, t), with other lanes' whole passes between them on the same stream
+ *   RAD_PP_PART_SEG  layers [seg_l0, seg_l1) only: from X1 (seg_l0 == h) or from the segment boundary's restore, to X2
+ *                    (seg_l1 == t) or to the next boundary's save
+ * A boundary s is a cut on one node: the segment before it saves what a cut W(s, t) would carry into the follower's layer s
+ * (the boundary op's inputs, the selections, the keep words; no kv entries: the node owns its caches) and the segment
+ * from it restores those bytes, each rank its own, through the stage ops in loop mode (`loop` 1: the ring operand is a
+ * buffer of this rank, the plugin's, which the send fills and publishes to itself and the receive copies back: no link,
+ * no peer, no host memory). The plugin names its boundaries at declare with rad_pp_segments; an engine that has none
+ * never issues RAD_PP_PART_SEG. */
+#define RAD_PP_MAX_SEGS 16
 
 /* One crossing's ring on one node. `ready` is the sender's, `landed` and `taken` the receiver's;
  * a node holds each ring in one role. Every counter is the count of payloads, starting at 0. */
@@ -119,7 +131,10 @@ typedef struct RadPpInfo {
     int32_t lanes;        /* --pp-lanes: the leader's step streams (1 = one step in flight) */
     int32_t lane;         /* the lane of the pass being issued now (every rank of a node issues one at a time) */
     int32_t part;         /* RAD_PP_PART_*: which part of the leader's pass is being issued */
-    int32_t reserved[8];
+    /* tp8 dev M4 (zero from an engine before segments): RAD_PP_PART_SEG's layers [seg_l0, seg_l1) */
+    int32_t seg_l0;
+    int32_t seg_l1;
+    int32_t reserved[6];
     /* This node's ring of each crossing (its send ring or its receive ring) for the lane of the pass
      * being issued, null until the core has allocated them, which is after declare and before the
      * first step. A plugin reads it at every issue: each lane has its own rings. */
@@ -143,6 +158,17 @@ int rad_pp_info(RadPpInfo* out);
 __attribute__((weak))
 #endif
 void rad_pp_crossing(int ring, int64_t row_bytes, int parts);
+
+/* tp8 dev M4: the plugin names, at declare (every rank, every declare; the last wins), the segment boundaries it declared
+ * on this node (layers s, ascending, inside the follower's (h, t); n 0: none). Weak, like rad_pp_info. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_segments(const int32_t* bounds, int n);
+
+static inline void rad_pp_declare_segments(const int32_t* bounds, int n) {
+    if (rad_pp_segments) rad_pp_segments(bounds, n);
+}
 
 /* tp8 S6: the plugin names, at declare (rank 0's real declare; repeats are ignored), each KV cache
  * layer both nodes hold of one source -- the owner its own, the receiver the copy a crossing fills:

@@ -463,7 +463,7 @@ private:
     int  pp_ship(const RadBatch* b, bool run, int lane = 0);
     void pp_on_build(const RadBatch* b, int lane);
     /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
-    void pp_set_pass(int lane, int part);
+    void pp_set_pass(int lane, int part, int seg_l0 = 0, int seg_l1 = 0);
     /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);

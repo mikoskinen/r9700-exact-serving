@@ -41,7 +41,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <deque>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -56,6 +60,10 @@ struct PpGlobal {
      * lane and part of the pass the ranks issue now (Engine::pp_set_pass, with every rank parked). */
     std::atomic<RadPpRing*> ring[RAD_PP_MAX_RING_IX] = {};
     std::atomic<int>     lanes{ 1 }, lane{ 0 }, part{ RAD_PP_PART_WHOLE };
+    /* tp8 dev M4: RAD_PP_PART_SEG's layers, and the segment boundaries the plugin declared on this node (rad_pp_segments) */
+    std::atomic<int>     seg_l0{ 0 }, seg_l1{ 0 };
+    std::mutex seg_mu;
+    std::vector<int32_t> segs;
     /* tp8 S6: the KV layers both nodes hold of one source (rad_pp_kv_copy): group, slot here, model layer */
     std::mutex kv_mu;
     std::vector<std::array<int32_t, 3>> kv_copies;
@@ -84,14 +92,34 @@ extern "C" int rad_pp_info(RadPpInfo* out) {
     const int lane = std::min(std::max(g.lane.load(), 0), RAD_PP_MAX_LANES - 1);
     out->lane = lane;
     out->part = g.part.load();
+    out->seg_l0 = g.seg_l0.load();
+    out->seg_l1 = g.seg_l1.load();
     for (int i = 0; i < RAD_PP_N_RINGS; ++i) out->ring[i] = g.ring[lane * RAD_PP_N_RINGS + i].load();
     return 0;
+}
+
+extern "C" void rad_pp_segments(const int32_t* bounds, int n) {
+    PpGlobal& g = pp_g();
+    std::lock_guard<std::mutex> lk(g.seg_mu);
+    g.segs.clear();
+    for (int i = 0; bounds && i < n && i < RAD_PP_MAX_SEGS; ++i) g.segs.push_back(bounds[i]);
 }
 
 namespace rad {
 /* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
  * head and tail share their batch). RAD_PP_PART_WHOLE on one machine and on one lane. */
 int pp_pass_part() { return pp_g().part.load(std::memory_order_relaxed); }
+/* tp8 dev M4: a segment part's layers, for its key (each segment is its own recording) */
+int pp_pass_seg() {
+    const PpGlobal& g = pp_g();
+    return g.seg_l0.load(std::memory_order_relaxed) * 256 + g.seg_l1.load(std::memory_order_relaxed);
+}
+/* ... and the boundaries the plugin declared on this node */
+std::vector<int32_t> pp_segments() {
+    PpGlobal& g = pp_g();
+    std::lock_guard<std::mutex> lk(g.seg_mu);
+    return g.segs;
+}
 }  /* namespace rad */
 
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
@@ -124,6 +152,11 @@ struct StepHdr {
     int32_t  n_clears = 0;      /* (group, slot) pairs after the PSK plan: state slots to zero first */
     int32_t  lane = 0;          /* tp8 S5: the lane whose builder and rings the step is (0 on one lane) */
     int32_t  n_ck = 0;          /* tp8 S6: int32 words of checkpoint restores / saves after the clears (pp_ck_list) */
+    /* tp8 dev M4: bit 0 -- the step keeps its place on the follower: it has prompt rows (a chunk may read the KV of an
+     * earlier chunk of its prompt still in flight in another lane: a lent chunk, or a home chunk planned behind one) or a
+     * piece of another lane's sequence (StepEntry::home >= 0); 0 -- a decode step of this lane's own sequences, which reads
+     * only committed KV and may run between another step's segments */
+    int32_t  flags = 0;
     /* Review F2 / F3: the leader's switch REQUESTS (fn4::requests), not its applied values: a lever
      * the leader does not declare reads 0 there and must not turn the follower's off. */
     uint32_t fn4_n[kMaxFn4] = {};
@@ -676,10 +709,12 @@ void Engine::pp_on_build(const RadBatch* b, int lane) {
     pp_draft_q_.emplace_back(b->step, lane, std::move(fr));
 }
 
-void Engine::pp_set_pass(int lane, int part) {
+void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1) {
     PpGlobal& g = pp_g();
     g.lane.store(lane, std::memory_order_relaxed);
     g.part.store(part, std::memory_order_relaxed);
+    g.seg_l0.store(part == RAD_PP_PART_SEG ? seg_l0 : 0, std::memory_order_relaxed);
+    g.seg_l1.store(part == RAD_PP_PART_SEG ? seg_l1 : 0, std::memory_order_relaxed);
 }
 
 int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n,
@@ -694,6 +729,9 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
     h.run = run ? 1 : 0;
     h.step = b->step;
     h.lane = lane;
+    if (sched_of(lane).plan().phase != RAD_PHASE_DECODE) h.flags |= 1;
+    for (const StepEntry& e : sched_of(lane).plan().e)
+        if (e.home >= 0) h.flags |= 1;
     if (run) {
         h.n_fn4 = fn4::kSwitches;
         fn4::requests(h.fn4_n, h.fn4_v);
@@ -1036,32 +1074,34 @@ int Engine::follower_loop() {
     int64_t steps = 0, builds = 0;
     std::vector<int32_t> ahead, rows, flags, clears, ckw;
     pp_send_fn4_state();
-    while (!stopping_.load(std::memory_order_acquire)) {
-        watch.progress();
-        if (pp_stop_requested()) {
-            RAD_INFO("follower: stopping on a signal after %lld steps: the leader is told (kBye) and goes down "
-                     "with it", (long long)steps);
-            loop_status_.store(RAD_OK, std::memory_order_release);
-            stopping_.store(true, std::memory_order_release);
-            if (barrier_) barrier_->abort();
-            pp_close("the follower was stopped (SIGTERM / SIGINT)");
-            return RAD_OK;
-        }
-        net::Msg m;
-        int st = pp_link_->recv(&m, 200);
-        if (st == RAD_E_NOTFOUND) continue;
-        if (st < 0) {
-            if (pp_link_->peer_stopped()) {
-                RAD_INFO("follower: the leader stopped (%s) after %lld steps; this node stops too",
-                         pp_link_->why().c_str(), (long long)steps);
-                loop_status_.store(RAD_OK, std::memory_order_release);
-                stopping_.store(true, std::memory_order_release);
-                if (barrier_) barrier_->abort();
-                return RAD_OK;
+    /* tp8 dev M4 (RADIANCE_PP_SEG_LAYERS=k, read by the plugin, which declares the boundaries; RADIANCE_PP_SEG_ROWS=n, default
+     * 512): a pass of >= n rows is issued in layer segments at the declared boundaries, and between two segments every step
+     * frame of another lane that has arrived and carries no lent piece runs its whole pass (the frames behind a held one wait
+     * with it, in order). The segment boundary saves and restores the pass's live set on each rank (the stage ops' loop
+     * mode), so a pass between segments may use the arena freely. RADIANCE_PP_SEG_AHEAD (default 1): segments queued on the
+     * card ahead of the running one; RADIANCE_PP_SEG_TEST_WAIT_MS (host tests): wait that long for a frame at each gap. */
+    const std::vector<int32_t> segs = pp_segments();
+    int64_t seg_rows = 512, seg_ahead = 1, seg_wait_ms = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_SEG_ROWS"); v && *v) seg_rows = std::max<int64_t>(1, std::atoll(v));
+    if (const char* v = std::getenv("RADIANCE_PP_SEG_AHEAD"); v && *v) seg_ahead = std::min<int64_t>(1, std::max<int64_t>(0, std::atoll(v)));
+    if (const char* v = std::getenv("RADIANCE_PP_SEG_TEST_WAIT_MS"); v && *v) seg_wait_ms = std::max<int64_t>(0, std::atoll(v));
+    RadEvent seg_ev[2] = {};
+    if (!segs.empty()) {
+        std::string b;
+        for (int32_t x : segs) b += fmt("%s%d", b.empty() ? "" : ", ", (int)x);
+        for (RadEvent& e : seg_ev)
+            if (rad_event_create(&e) < 0) {
+                RAD_ERR("follower: could not create the segment events");
+                return fail_loop(RAD_E_DEVICE);
             }
-            RAD_ERR("follower: the link to the leader is down: %s", pp_link_->why().c_str());
-            return fail_loop(RAD_E_IO);
-        }
+        RAD_INFO("follower: passes of >= %lld rows run in layer segments at the boundaries %s of W(%d,%d), other lanes' "
+                 "passes between them (tp8 dev M4; %lld segment(s) queued ahead)", (long long)seg_rows, b.c_str(),
+                 cfg_.pp_cut_h, cfg_.pp_cut_t, (long long)seg_ahead);
+    }
+    int64_t seg_passes = 0, seg_parts = 0, seg_between = 0, seg_held = 0;
+    std::deque<net::Msg> held;   /* frames that wait for the split pass to end (and every frame behind them) */
+    /* A frame other than a step's: the leader's switch ask, its KV-copy check. */
+    auto other_frame = [&](net::Msg& m) -> int {
         if (m.h.kind == net::kFn4Ask) {
             /* The leader's ask (fn4::set_peer_check): this node's own verdict, with its reason. */
             const std::string body(m.body.begin(), m.body.end());
@@ -1072,16 +1112,19 @@ int Engine::follower_loop() {
             else verdict = fn4::check_node(body.substr(0, tab), std::atoi(body.c_str() + tab + 1), &err);
             if (pp_link_->send(net::kFn4Ans, m.h.seq, (uint64_t)(int64_t)verdict, err.data(), (int64_t)err.size()) < 0)
                 return fail_loop(RAD_E_IO);
-            continue;
+            return RAD_OK;
         }
         if (m.h.kind == net::kKvCheck) {   /* tp8 S6 (debug): the leader's CRCs after its last trunk step */
             if (pp_kv_check_recv(m.body, m.h.seq) < 0) return fail_loop(RAD_E_STATE);
-            continue;
+            return RAD_OK;
         }
-        if (m.h.kind != net::kStep) {
-            pp_link_->fail(fmt("the follower got a %s frame while serving", net::frame_name(m.h.kind)));
-            return fail_loop(RAD_E_IO);
-        }
+        pp_link_->fail(fmt("the follower got a %s frame while serving", net::frame_name(m.h.kind)));
+        return fail_loop(RAD_E_IO);
+    };
+    /* A step frame: replay its build into its lane's builder and, with `run`, issue its pass -- whole, or (`may_split`, a
+     * pass of >= seg_rows rows, boundaries declared) in segments with other lanes' passes between them. */
+    std::function<int(net::Msg&, bool)> step_frame = [&](net::Msg& m, bool may_split) -> int {
+        int st = RAD_OK;
         StepHdr h;
         BatchBuilder::Wire w;
         if (m.body.size() < sizeof h) { pp_link_->fail("a step frame shorter than its header"); return fail_loop(RAD_E_IO); }
@@ -1123,7 +1166,7 @@ int Engine::follower_loop() {
             return fail_loop(RAD_E_STATE);
         }
         ++builds;
-        if (!h.run) continue;
+        if (!h.run) return RAD_OK;
         /* Review F4: the state slots the leader zeroed before this step (a fresh sequence's), zeroed
          * here on this node's own groups, as Engine::clear_fresh_states does on the leader. */
         for (int k = 0; k < h.n_clears; ++k) {
@@ -1145,9 +1188,9 @@ int Engine::follower_loop() {
             std::vector<std::string> skipped;
             const int asked = fn4::follow(h.fn4_n, h.fn4_v, std::min(h.n_fn4, (int)fn4::kSwitches), pp_fn4_taken_,
                                           &skipped);
-            for (const std::string& s : skipped)
+            for (const std::string& sk : skipped)
                 RAD_WARN("follower: the leader's switch request %s -- not taken on this node, which keeps its "
-                         "own value; the pipeline goes on", s.c_str());
+                         "own value; the pipeline goes on", sk.c_str());
             if (asked > 0) {
                 int sw[fn4::kSwitches];
                 if (fn4::apply_pending(h.step, sw)) fn4_apply_changes(sw);
@@ -1167,35 +1210,159 @@ int Engine::follower_loop() {
             pp_link_->fail(fmt("the follower could not restore step %d's checkpoints: %s", h.step, rad_strerror(st)));
             return fail_loop(st);
         }
-        issue_sched_.store(&ls, std::memory_order_release);
-        pp_set_pass(h.lane, RAD_PP_PART_WHOLE);
-        issue_what_.store(kIssueFollower, std::memory_order_release);
-        step_batch_.store(b, std::memory_order_release);
-        barrier_->arrive_and_wait();      /* release the ranks */
-        barrier_->arrive_and_wait();      /* and wait for them */
+        /* the saves behind the pass need the frame's words after a pass between segments reused the scratch */
+        const std::vector<int32_t> ck_keep = h.n_ck > 0 ? ckw : std::vector<int32_t>{};
+        /* tp8 dev M4: the pass's parts -- [h, t) whole, or its segments at the declared boundaries */
+        std::vector<std::pair<int, int>> parts;
+        const bool split = may_split && !segs.empty() && b->n_tok >= seg_rows;
+        if (split) {
+            int a = cfg_.pp_cut_h;
+            for (int32_t x : segs) {
+                if (x <= a || x >= cfg_.pp_cut_t) continue;
+                parts.emplace_back(a, x);
+                a = x;
+            }
+            parts.emplace_back(a, cfg_.pp_cut_t);
+        } else {
+            parts.emplace_back(cfg_.pp_cut_h, cfg_.pp_cut_t);
+        }
+        const int lane = h.lane, sstep = h.step;
+        /* between two segments: the frames that have arrived (no wait on a card past the segment's run; a host test's
+         * RADIANCE_PP_SEG_TEST_WAIT_MS) */
+        auto between = [&](RadEvent done_ev) -> int {
+            const uint64_t t0 = rad_mono_ns();
+            for (;;) {
+                const bool dev_done = !done_ev || rad_event_query(done_ev) != 0;
+                const bool waited = (rad_mono_ns() - t0) / 1000000ull >= (uint64_t)seg_wait_ms;
+                net::Msg m2;
+                const int rs = pp_link_->recv(&m2, 0);
+                if (rs == RAD_E_NOTFOUND) {
+                    if (dev_done && waited) return RAD_OK;
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    continue;
+                }
+                if (rs < 0) {
+                    RAD_ERR("follower: the link to the leader is down: %s", pp_link_->why().c_str());
+                    return fail_loop(RAD_E_IO);
+                }
+                if (m2.h.kind != net::kStep) {
+                    if (const int os = other_frame(m2); os < 0) return os;
+                    continue;
+                }
+                StepHdr h2;
+                if (m2.body.size() >= sizeof h2) std::memcpy(&h2, m2.body.data(), sizeof h2);
+                /* a step that keeps its place (prompt rows, a lent piece) and every frame behind it wait for the split pass;
+                 * a decode step runs its whole pass now; a build without a pass is replayed here */
+                if (!held.empty() || m2.body.size() < sizeof h2 || ((h2.flags & 1) && h2.run) || h2.lane == lane) {
+                    if (h2.run) ++seg_held;
+                    held.push_back(std::move(m2));
+                    continue;
+                }
+                if (const int fs = step_frame(m2, false); fs < 0) return fs;
+                if (h2.run) { ++seg_between; ++steps; }
+            }
+        };
+        for (size_t k = 0; k < parts.size(); ++k) {
+            if (k > 0) {
+                /* the segment k - 1 - ahead must have run before segment k goes out (ahead 1: one queued behind the
+                 * running one), the other lanes' frames issued meanwhile */
+                const int64_t back = (int64_t)k - 1 - seg_ahead;
+                if (const int bs = between(back >= 0 ? seg_ev[back & 1] : nullptr); bs < 0) return bs;
+                /* the pass between may have changed what this pass's issue reads */
+                for (auto& r : ranks_) r->stager.set_layer_end(end);
+            }
+            issue_sched_.store(&ls, std::memory_order_release);
+            if (split) pp_set_pass(lane, RAD_PP_PART_SEG, parts[k].first, parts[k].second);
+            else pp_set_pass(lane, RAD_PP_PART_WHOLE);
+            issue_what_.store(kIssueFollower, std::memory_order_release);
+            step_batch_.store(b, std::memory_order_release);
+            barrier_->arrive_and_wait();      /* release the ranks */
+            barrier_->arrive_and_wait();      /* and wait for them */
+            if (split) {
+                ++seg_parts;
+                if (rad_event_record(seg_ev[k & 1], ranks_[0]->ctx.stream()) < 0) {
+                    RAD_ERR("follower: could not record step %d's segment event", sstep);
+                    return fail_loop(RAD_E_DEVICE);
+                }
+            }
+            st = step_status_.load(std::memory_order_acquire);
+            if (st < 0) break;
+        }
+        pp_set_pass(lane, RAD_PP_PART_WHOLE);
+        if (split) ++seg_passes;
         /* tp8 S5: busy from X1's arrival (rank 0 took it) to X2's publish (the host backend notes both) */
         if (pp_stamps_) {
-            const RadPpRing* x1 = pp_recv_[h.lane * RAD_PP_N_RINGS + RAD_PP_X1];
-            const RadPpRing* x2 = pp_send_[h.lane * RAD_PP_N_RINGS + RAD_PP_X2];
-            if (x1 && x2 && x1->taken_ns && x2->ready_ns) pp_stamp("mid", h.lane, h.step, x1->taken_ns, x2->ready_ns);
+            const RadPpRing* x1 = pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X1];
+            const RadPpRing* x2 = pp_send_[lane * RAD_PP_N_RINGS + RAD_PP_X2];
+            if (x1 && x2 && x1->taken_ns && x2->ready_ns) pp_stamp("mid", lane, sstep, x1->taken_ns, x2->ready_ns);
         }
         st = step_status_.load(std::memory_order_acquire);
         if (st < 0) {
-            RAD_ERR("follower step %d failed: %s -- the pipeline cannot continue", h.step, rad_strerror(st));
-            pp_link_->fail(fmt("the follower's step %d failed: %s", h.step, rad_strerror(st)));
+            RAD_ERR("follower step %d failed: %s -- the pipeline cannot continue", sstep, rad_strerror(st));
+            pp_link_->fail(fmt("the follower's step %d failed: %s", sstep, rad_strerror(st)));
             return fail_loop(st);
         }
         /* tp8 S6: the step's checkpoint saves, behind its pass on every rank's stream (save_checkpoints) */
-        if (h.n_ck > 0 && (st = pp_ck_apply(ckw.data(), h.n_ck, true)) < 0) {
-            pp_link_->fail(fmt("the follower could not save step %d's checkpoints: %s", h.step, rad_strerror(st)));
+        if (!ck_keep.empty() && (st = pp_ck_apply(ck_keep.data(), (int32_t)ck_keep.size(), true)) < 0) {
+            pp_link_->fail(fmt("the follower could not save step %d's checkpoints: %s", sstep, rad_strerror(st)));
             return fail_loop(st);
         }
+        return RAD_OK;
+    };
+    while (!stopping_.load(std::memory_order_acquire)) {
+        watch.progress();
+        if (pp_stop_requested()) {
+            RAD_INFO("follower: stopping on a signal after %lld steps: the leader is told (kBye) and goes down "
+                     "with it", (long long)steps);
+            loop_status_.store(RAD_OK, std::memory_order_release);
+            stopping_.store(true, std::memory_order_release);
+            if (barrier_) barrier_->abort();
+            pp_close("the follower was stopped (SIGTERM / SIGINT)");
+            return RAD_OK;
+        }
+        net::Msg m;
+        if (!held.empty()) {   /* tp8 dev M4: the frames that waited for a split pass, in their order */
+            m = std::move(held.front());
+            held.pop_front();
+        } else {
+            int st = pp_link_->recv(&m, 200);
+            if (st == RAD_E_NOTFOUND) continue;
+            if (st < 0) {
+                if (pp_link_->peer_stopped()) {
+                    RAD_INFO("follower: the leader stopped (%s) after %lld steps; this node stops too",
+                             pp_link_->why().c_str(), (long long)steps);
+                    loop_status_.store(RAD_OK, std::memory_order_release);
+                    stopping_.store(true, std::memory_order_release);
+                    if (barrier_) barrier_->abort();
+                    if (!segs.empty())
+                        RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, "
+                                 "%lld held in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts,
+                                 (long long)seg_between, (long long)seg_held);
+                    return RAD_OK;
+                }
+                RAD_ERR("follower: the link to the leader is down: %s", pp_link_->why().c_str());
+                return fail_loop(RAD_E_IO);
+            }
+        }
+        if (m.h.kind != net::kStep) {
+            if (const int os = other_frame(m); os < 0) return os;
+            continue;
+        }
+        StepHdr h0;
+        const bool run = m.body.size() >= sizeof h0 && (std::memcpy(&h0, m.body.data(), sizeof h0), h0.run != 0);
+        if (const int fs = step_frame(m, true); fs < 0) return fs;
+        if (!run) continue;
         /* The host backend runs every launch on this thread's rank; a card's stream is drained by the
          * next step's waits. Nothing else is read back here: the follower samples nothing. */
         ++steps;
         if (steps == 1 || steps % 1024 == 0)
             RAD_INFO("follower: %lld steps run, %lld builds replayed", (long long)steps, (long long)builds);
+        if (!segs.empty() && seg_passes > 0 && (seg_passes == 1 || seg_passes % 256 == 0) && steps % 64 == 0)
+            RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, %lld held "
+                     "in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts, (long long)seg_between,
+                     (long long)seg_held);
     }
+    for (RadEvent& e : seg_ev) if (e) rad_event_destroy(e);
     return RAD_OK;
 }
 

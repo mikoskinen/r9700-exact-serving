@@ -695,6 +695,16 @@ struct Model {
      * the prologue's expand reads at every part, as before). A pipeline node serves no pictures (lr_check), so xcol is the
      * lookup alone on both. */
     bool pp_fe = false;
+    /* tp8 dev M4 (RADIANCE_PP_SEG_LAYERS=k on the follower, --pp-lanes > 1; unset: nothing here): the follower's [h, t) in
+     * segments of k layers. A boundary s is a cut on this node: the segment before it saves what X1 of W(s, t) would carry
+     * into layer s -- the boundary op's inputs, the selections, the keep words; no kv entries, the node holds its caches and
+     * copies -- into this rank's ring buffer (the stage ops' loop mode: each rank its own bytes back), and the segment from s
+     * takes them back and issues the boundary op as a receiving node does. `seg_cx`: X1 of W(s, t) without its source. */
+    std::vector<int32_t> seg_b;
+    std::vector<ds41layers::Crossing> seg_cx;
+    std::vector<rad_op> seg_send, seg_recv, seg_post;
+    rad_buf seg_ring = 0;
+    int64_t seg_ring_bytes = 0;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -4211,6 +4221,24 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         }
         const ds41layers::Crossing& in = m.pp_cx[m.pp_rank == 1 ? RAD_PP_X1 : RAD_PP_X2];
         m.pp_binds = ds41layers::binds(lr_geo(m), m.lr, &in);
+        /* tp8 dev M4: the follower's segment boundaries -- every k-th layer after h whose cut W(s, t) the geometry allows */
+        if (const char* sk = std::getenv("RADIANCE_PP_SEG_LAYERS"); sk && *sk && m.pp_rank == 1 && rad_pp_query().lanes > 1) {
+            const int k = std::atoi(sk);
+            for (int x = m.pp_h + std::max(k, 1); k > 0 && x < m.pp_t && (int)m.seg_b.size() < RAD_PP_MAX_SEGS - 1; x += k) {
+                ds41layers::Crossing cx2[2];
+                std::string e2;
+                if (ds41layers::crossings(lr_geo(m), x, m.pp_t, cx2, &e2) < 0) {
+                    fprintf(stderr, "radiance: deepseek41: RADIANCE_PP_SEG_LAYERS=%d: no segment boundary at layer %d (%s)\n", k,
+                            x, e2.c_str());
+                    continue;
+                }
+                ds41layers::Crossing sc = cx2[RAD_PP_X1];
+                sc.src = -1;
+                sc.latent = sc.index = false;
+                m.seg_b.push_back(x);
+                m.seg_cx.push_back(sc);
+            }
+        }
         /* the candidate layer's keep words cross: it is this node's, and its indexer runs unsplit here (every rank then
          * holds every row's keep, so rank 0's crossing carries them all; the split is exact either way) */
         for (const ds41layers::Crossing& cx : m.pp_cx)
@@ -4369,11 +4397,14 @@ static int pp_dspark_zero(RadBuilder* b, Model& m) {
  * which rows a part has at issue: the step's (or, under BI / PSK, the boundary's live rows [lo, T)), or the work rows. */
 enum class CutRows { Step, Live, Work };
 struct CutPart { rad_buf b; const char* name; int64_t row_bytes; CutRows rows; int64_t pitch; /* elements a row */ };
-static std::vector<CutPart> ds41_cut_liveset(const Model& m, int ring) {
+static std::vector<CutPart> ds41_cut_liveset_cx(const Model& m, const ds41layers::Crossing& cx);
+static std::vector<CutPart> ds41_cut_liveset(const Model& m, int ring) { return ds41_cut_liveset_cx(m, m.pp_cx[ring]); }
+/* tp8 dev M4: the rings of a segment boundary k in pp_recv_at / pp_send_after / pp_cross (the core's are 0 and 1) */
+static constexpr int kSegRecv = 100, kSegSend = 200;
+static std::vector<CutPart> ds41_cut_liveset_cx(const Model& m, const ds41layers::Crossing& cx) {
     const auto& c = m.c;
     const int64_t D = c.n_embd, H = c.hc;
     std::vector<CutPart> v;
-    const ds41layers::Crossing& cx = m.pp_cx[ring];
     if (!cx.residual) v.push_back({ m.xcol, "xcol", D * 2, CutRows::Step, D });
     else
         v = { { m.act.x, "act.x", D * 2, CutRows::Live, D }, { m.h1, "h1", H * D * 2, CutRows::Live, H * D },
@@ -4411,6 +4442,21 @@ static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring) {
     const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
     rad_op h = op(b, sends ? "stage_send" : "stage_recv",
                   { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()) }, {}, {}, {});
+    if (!h) return h;
+    std::vector<rad_buf> bufs;
+    for (const CutPart& p : v) bufs.push_back(p.b);
+    if (sends) rad_op_reads(b, h, bufs.data(), (int)bufs.size());
+    else       rad_op_writes(b, h, bufs.data(), (int)bufs.size());
+    return h;
+}
+
+/* tp8 dev M4: segment boundary k's save (`sends`, after layer s - 1) or restore (before layer s): the stage op in loop mode
+ * over this rank's ring buffer */
+static rad_op pp_seg_stage_op(RadBuilder* b, const Model& m, size_t k, bool sends) {
+    const std::vector<CutPart> v = ds41_cut_liveset_cx(m, m.seg_cx[k]);
+    rad_op h = op(b, sends ? "stage_send" : "stage_recv",
+                  { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", 2), RAD_INT("parts", (int64_t)v.size()), RAD_INT("loop", 1) },
+                  {}, {}, {});
     if (!h) return h;
     std::vector<rad_buf> bufs;
     for (const CutPart& p : v) bufs.push_back(p.b);
@@ -4505,6 +4551,22 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
                           m.pp_rank == 1 && m.pp_dsp.on ? "; the leader's drafter KV group zeroed here" : "", cp.c_str());
         rad_note(b, "%s", line);
         if (ctx->rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: deepseek41: %s\n", line);
+        /* tp8 dev M4: the follower's segment boundaries (RADIANCE_PP_SEG_LAYERS) */
+        if (!m.seg_b.empty()) {
+            std::string sb;
+            for (size_t k = 0; k < m.seg_b.size(); ++k) {
+                std::string ps;
+                for (const CutPart& p : ds41_cut_liveset_cx(m, m.seg_cx[k])) ps += fmt_s("%s%s", ps.empty() ? "" : "+", p.name);
+                sb += fmt_s("%s%d (%s)", sb.empty() ? "" : ", ", (int)m.seg_b[k], ps.c_str());
+            }
+            std::snprintf(line, sizeof line,
+                          "two-node pipeline (tp8 dev M4, RADIANCE_PP_SEG_LAYERS): the follower's passes may run in segments at "
+                          "layers %s, each boundary's live set saved and restored on this rank (a %lld-byte ring buffer a card)",
+                          sb.c_str(), (long long)m.seg_ring_bytes);
+            rad_note(b, "%s", line);
+            if (ctx->rank == 0 && !ctx->shape_probe) fprintf(stderr, "radiance: deepseek41: %s\n", line);
+            rad_pp_declare_segments(m.seg_b.data(), (int)m.seg_b.size());
+        }
         /* tp8 S6: the copied sources' layers both nodes hold, for the core's KV-copy check (RADIANCE_PP_KV_CHECK): the
          * group, the layer's place among this node's bound layers of it (ascending: the held sources and the copy), the
          * layer */
@@ -4793,7 +4855,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     /* tp8 S3: only the layers this node holds (every layer when RADIANCE_DS41_LAYERS is unset); strict, a copy of a
      * foreign kv source's caches at its layer (lr_copy_layer) */
+    /* tp8 dev M4: this rank's segment ring buffer: the header, every boundary's widest live set at max_tok rows, the trailer */
+    if (!m.seg_b.empty()) {
+        int64_t widest = 0;
+        for (const ds41layers::Crossing& cx : m.seg_cx) {
+            int64_t n = 0;
+            for (const CutPart& p : ds41_cut_liveset_cx(m, cx)) n += rad_pp_align((uint64_t)(T * p.row_bytes));
+            widest = std::max(widest, n);
+        }
+        m.seg_ring_bytes = RAD_PP_RING_HDR + widest + RAD_PP_TRAILER;
+        m.seg_ring = decl_b(b, m.nm.f("pp_segring"), RAD_U8, { m.seg_ring_bytes }, RAD_BUF_PERSIST);
+        m.seg_send.assign(m.seg_b.size(), 0);
+        m.seg_recv.assign(m.seg_b.size(), 0);
+        m.seg_post.assign(m.seg_b.size(), 0);
+    }
     for (int l = 0; l < c.n_layer; ++l) {
+        /* tp8 dev M4: a segment boundary at l: the restore and its mhc_post before layer l (as a receiving node's) */
+        for (size_t k = 0; k < m.seg_b.size(); ++k) {
+            if (m.seg_b[k] != l) continue;
+            if (!(m.seg_recv[k] = pp_seg_stage_op(b, m, k, false))) return RAD_E_INVAL;
+            m.seg_post[k] = op(b, "mhc_post", { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_INT("hc", c.hc), RAD_STR("dtype", "bf16") },
+                               {}, { m.act.x, m.h1, m.post, m.comb }, { m.h0 });
+            if (!m.seg_post[k]) return RAD_E_INVAL;
+        }
         /* tp8 S4 / S6: a node takes its crossing in before its first layer after the cut -- the leader X2 before layer t,
          * the follower X1 before layer h (h > 0) -- then stores the copied source's entries into its copy and, where the
          * boundary layer has no fused pcn_a (an Engram layer, or no library serves it), issues the previous layer's
@@ -4812,6 +4896,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         if (m.lr.held(l)) DS_TRY(layer(b, m, m.layers[(size_t)l], l));
         else DS_TRY(lr_copy_layer(b, m, m.layers[(size_t)l], l));
         if (m.pp && m.pp_rank == 1 && l == m.pp_t - 1 && !(m.pp_x2 = pp_stage_op(b, m, RAD_PP_X2))) return RAD_E_INVAL;
+        for (size_t k = 0; k < m.seg_b.size(); ++k)   /* tp8 dev M4: the save after layer s - 1 */
+            if (m.seg_b[k] == l + 1 && !(m.seg_send[k] = pp_seg_stage_op(b, m, k, true))) return RAD_E_INVAL;
         if (m.pp && m.pp_rank == 0 && m.pp_h > 0 && l == m.pp_h - 1 && !(m.pp_x1 = pp_stage_op(b, m, RAD_PP_X1)))
             return RAD_E_INVAL;
     }
@@ -6060,6 +6146,28 @@ static void media_engram(RadCtx* x, Model& m, const Layer& L, const RadBatch* ba
  * word checks it). */
 static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64_t lo, int64_t hi) {
     const int64_t T = batch->n_tok, S = batch->n_seq;
+    if (ring >= kSegRecv) {   /* tp8 dev M4: a segment boundary's save / restore, this rank's ring buffer, the live rows */
+        const bool send = ring >= kSegSend;
+        const size_t k = (size_t)(ring - (send ? kSegSend : kSegRecv));
+        if (k >= m.seg_b.size() || !(send ? m.seg_send[k] : m.seg_recv[k])) {
+            rad_step_fail(x, "deepseek41: a segment boundary the follower did not declare");
+            return false;
+        }
+        if (hi > T || hi <= lo) {
+            lo = std::max<int64_t>(0, std::min(lo, T - 1));
+            hi = lo + 1;
+        }
+        lo = std::max<int64_t>(0, lo);
+        static thread_local std::vector<RadOperand> so;
+        so.clear();
+        so.push_back(brows(m.seg_ring, m.seg_ring_bytes));
+        for (const CutPart& p : ds41_cut_liveset_cx(m, m.seg_cx[k])) {
+            if (p.rows == CutRows::Step) so.push_back(brows(p.b, T));
+            else so.push_back(lo == 0 ? brows(p.b, hi) : brow_slice(p.b, lo, hi - lo, p.pitch));
+        }
+        rad_issue(x, send ? m.seg_send[k] : m.seg_recv[k], so.data(), (int)so.size(), T);
+        return true;
+    }
     const rad_op op_ = ring == RAD_PP_X1 ? m.pp_x1 : m.pp_x2;
     /* the ring read at every issue (tp8 S5: each lane has its own) */
     m.pp_ring[ring] = rad_pp_query().ring[ring];
@@ -6089,6 +6197,7 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
  * the same pages (ratio > 1: the shipped tail pages; ratio 1: the batch's slot mapping), into this node's copy. `store`:
  * the owner stored this pass (step_bi: not an all-replay pass, lever PSK-CR). */
 static bool pp_copy_issue(RadCtx* x, Model& m, const RadBatch* batch, int ring, bool store) {
+    if (ring >= kSegRecv) return true;   /* tp8 dev M4: a segment boundary carries no kv entries */
     const ds41layers::Crossing& cx = m.pp_cx[ring];
     if (cx.src < 0 || !store) return true;
     const int64_t T = batch->n_tok, S = batch->n_seq, r = m.c.ratio[(size_t)cx.src];
@@ -6107,15 +6216,33 @@ static bool pp_copy_issue(RadCtx* x, Model& m, const RadBatch* batch, int ring, 
     return true;
 }
 /* This node's crossing in at layer l (the leader X2 at t, the follower X1 at h > 0), or -1 */
+/* tp8 dev M4: the follower segment this rank's thread issues (pp_part sets it at a pass's start): [t_seg0, t_seg1) */
+static thread_local bool t_seg = false;
+static thread_local int t_seg0 = 0, t_seg1 = 0;
+static int seg_index(const Model& m, int s) {
+    for (size_t k = 0; k < m.seg_b.size(); ++k)
+        if (m.seg_b[k] == s) return (int)k;
+    return -1;
+}
+/* ... whether this pass issues the follower's first layers (X1, the lookup): the whole pass, or its first segment */
+static bool pp_seg_first(const Model& m) { return !t_seg || t_seg0 == m.pp_h; }
 static int pp_recv_at(const Model& m, int l) {
     if (!m.pp) return -1;
     if (m.pp_rank == 0 && l == m.pp_t) return RAD_PP_X2;
+    if (t_seg && m.pp_rank == 1 && l == t_seg0 && t_seg0 > m.pp_h) {   /* tp8 dev M4: a segment from boundary s */
+        const int k = seg_index(m, l);
+        return k >= 0 ? kSegRecv + k : -1;
+    }
     if (m.pp_rank == 1 && m.pp_h > 0 && l == m.pp_h) return RAD_PP_X1;
     return -1;
 }
 /* ... and out after layer l (the follower X2 after t - 1, the leader X1 after h - 1 when h > 0), or -1 */
 static int pp_send_after(const Model& m, int l) {
     if (!m.pp) return -1;
+    if (t_seg && m.pp_rank == 1 && l == t_seg1 - 1 && t_seg1 < m.pp_t) {   /* tp8 dev M4: a segment to boundary s */
+        const int k = seg_index(m, t_seg1);
+        return k >= 0 ? kSegSend + k : -1;
+    }
     if (m.pp_rank == 1 && l == m.pp_t - 1) return RAD_PP_X2;
     if (m.pp_rank == 0 && m.pp_h > 0 && l == m.pp_h - 1) return RAD_PP_X1;
     return -1;
@@ -6128,12 +6255,28 @@ static int pp_send_after(const Model& m, int l) {
  * paged per sequence; the selections / keep words its layers >= t read are never the head's (lanes_head_tail_reads,
  * checked at declare). Whole: one machine, one lane, the follower. */
 static int pp_part(const Model& m) {
-    if (!m.pp || m.pp_rank != 0) return RAD_PP_PART_WHOLE;
-    return rad_pp_query().part;
+    t_seg = false;
+    if (!m.pp) return RAD_PP_PART_WHOLE;
+    const RadPpInfo p = rad_pp_query();
+    if (m.pp_rank != 0) {
+        /* tp8 dev M4: a follower segment [seg_l0, seg_l1) at the boundaries this node declared */
+        if (p.part != RAD_PP_PART_SEG || m.seg_b.empty()) return RAD_PP_PART_WHOLE;
+        t_seg = true;
+        t_seg0 = p.seg_l0;
+        t_seg1 = p.seg_l1;
+        return RAD_PP_PART_SEG;
+    }
+    return p.part;
 }
-/* ... and whether the part issues layer l (the head [0, h), the tail [t, n); the whole pass every held layer) */
+/* ... and whether the part issues layer l (the head [0, h), the tail [t, n), a follower segment its layers; the whole pass
+ * every held layer) */
 static bool pp_part_layer(const Model& m, int part, int l) {
+    if (part == RAD_PP_PART_SEG) return l >= t_seg0 && l < t_seg1;
     return part == RAD_PP_PART_HEAD ? l < m.pp_h : part == RAD_PP_PART_TAIL ? l >= m.pp_t : true;
+}
+/* The receive's boundary op where the layer has no fused pcn_a: X1 / X2's, or a segment boundary's (tp8 dev M4) */
+static rad_op pp_post_op(const Model& m, int ring) {
+    return ring >= kSegRecv && ring < kSegSend ? m.seg_post[(size_t)(ring - kSegRecv)] : m.pp_post;
 }
 
 /* `psk_only`: a one-prefill-sequence step step() hands over for lever PSK alone (no BI segmenting; the BI stats skip it) */
@@ -6311,12 +6454,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     /* tp8 dev 1a: under pp_fe the follower's own lookup in place of X1; the leader keeps its own (a few dispatches, 0.06-0.10
      * ms a lane step on cards) so its xcol holds what it held before -- the prologue's expand reads it at every part -- and
      * only X1's send goes */
-    if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1)) {
+    if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
         RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
         m.mrows.step(x, batch, m.xcol, T);
         if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     }
-    if (m.pp && m.pp_h == 0 && run_head && !m.pp_fe && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
+    if (m.pp && m.pp_h == 0 && run_head && !m.pp_fe && pp_seg_first(m) && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
     if (part == RAD_PP_PART_HEAD && m.pp_h == 0) return;   /* tp8 S5: at W(0, t) the head part ends with X1's send */
     if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
         for (int64_t i = 0; i < c.hc; ++i)
@@ -6426,7 +6569,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 });
             } else {
                 whole([&](int64_t r0, int64_t n) {
-                    RAD_ISSUE_N(x, m.pp_post, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                    RAD_ISSUE_N(x, pp_post_op(m, ring), n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
                                 R(m.h0, r0, n));
                 });
             }
@@ -6494,7 +6637,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * receiver's layers run none either, and the copied source's entries cross all the same) */
             if (const int ring = held ? pp_send_after(m, l) : -1; ring >= 0) {
                 if (!pp_cross(x, m, batch, ring, T, 0)) return;
-                if (ring == RAD_PP_X2 || part == RAD_PP_PART_HEAD) {   /* tp8 S5: the head part ends with X1's send */
+                if (ring != RAD_PP_X1 || part == RAD_PP_PART_HEAD) {   /* tp8 S5: the head part ends with X1's send (tp8 dev M4: a
+                                                                       * segment with its boundary's save) */
                     bt_flush(x, m, batch);
                     return;
                 }
@@ -7214,14 +7358,14 @@ static void step(RadCtx* x, const RadBatch* batch) {
     media_route(m, batch);
     /* tp8 dev 1a: under pp_fe the follower's own lookup in place of X1; the leader keeps its own (its xcol as before) and
      * only X1's send goes */
-    if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1)) {
+    if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
     m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     }
     /* X1 at W(0, t): the leader's lookup out, the follower's in, where one process's lookup was (tp8 S6: at h > 0 X1 is
      * the residual after layer h - 1, below, and the follower's layer h starts from it: no streams of its own here) */
-    if (m.pp && m.pp_h == 0 && run_head && !m.pp_fe && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
+    if (m.pp && m.pp_h == 0 && run_head && !m.pp_fe && pp_seg_first(m) && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
     if (part == RAD_PP_PART_HEAD && m.pp_h == 0) return;   /* tp8 S5: at W(0, t) the head part ends with X1's send */
     if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
     for (int64_t i = 0; i < c.hc; ++i)
@@ -7303,7 +7447,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
                                 RAD_W(L.attn_norm), brows(m.xn, T));
                 }
             } else {
-                RAD_ISSUE_N(x, m.pp_post, T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
+                RAD_ISSUE_N(x, pp_post_op(m, ring), T, brows(m.act.x, T), brows(m.h1, T), brows(m.post, T),
                             brows(m.comb, T), brows(m.h0, T));
             }
         }

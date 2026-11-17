@@ -364,6 +364,36 @@ int Engine::step_loop_lanes() {
                  "those with prompt rows to plan (tp8 dev D7)");
     }
     int64_t reordered = 0, held = 0;
+    /* tp8 dev M4: RADIANCE_PP_READY_FIRST=1 (both nodes; the follower does nothing with it; not with TAIL_AHEAD) -- when the
+     * oldest lane step in flight is a long pass (>= RADIANCE_PP_SEG_ROWS rows, default 512) whose X2 has not landed, the
+     * tail of a later lane step whose X2 has landed goes first (a decode step of its own sequences: its rows read only
+     * committed KV, none the long pass writes); the host waits for the first X2 to land instead of queueing the long pass's
+     * tail on the stream, where every other lane's tail would wait behind it. With the follower's segments (the follower
+     * runs other lanes' passes between the long pass's segments) the other lanes' steps then complete during the long
+     * pass. Only the order of the tails changes, never a step's composition. */
+    bool ready_first = false;
+    int64_t rf_rows = 512, rf_taken = 0, rf_waits = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_SEG_ROWS"); v && *v) rf_rows = std::max<int64_t>(1, std::atoll(v));
+    if (const char* rf = std::getenv("RADIANCE_PP_READY_FIRST"); rf && !std::strcmp(rf, "1")) {
+        ready_first = !tail_ahead_;
+        RAD_INFO("two-node pipeline: RADIANCE_PP_READY_FIRST=1 %s", ready_first
+                     ? fmt("-- a later lane step's tail goes before a pass of >= %lld rows whose X2 has not landed (tp8 dev "
+                           "M4)", (long long)rf_rows).c_str()
+                     : "is not taken with RADIANCE_PP_TAIL_AHEAD=1");
+    }
+    auto x2_landed = [&](int l) {
+        const RadPpRing* x2 = pp_recv_[l * RAD_PP_N_RINGS + RAD_PP_X2];
+        return x2 && __atomic_load_n(&x2->landed, __ATOMIC_ACQUIRE) > __atomic_load_n(&x2->taken[0], __ATOMIC_ACQUIRE);
+    };
+    /* a lane step that may go before an older one: decode rows of its own sequences only (they read committed KV; a prompt's
+     * chunk may read an earlier chunk's still in flight, a lent piece its home's), and no piece lent to its lane waiting in
+     * its inbox (a home lends to the lanes in flight in their commit order, and each takes its piece at its next plan) */
+    auto carries_lent = [&](int l) {
+        if (sched_of(l).plan().phase != RAD_PHASE_DECODE || lanes_.inbox_n(l) > 0) return true;
+        for (const StepEntry& e : sched_of(l).plan().e)
+            if (e.home >= 0) return true;
+        return false;
+    };
     /* tp8 dev D7: a lane with prompt rows to plan waits ONE round while another lane's decode step is in flight (and nothing
      * was lent to it), so that lane's next step goes to the follower ahead of the long MIXED pass: the follower then runs it
      * before the MIXED pass and the leader its tail during it (one more decode step a newcomer than without). */
@@ -564,10 +594,24 @@ int Engine::step_loop_lanes() {
         }
         idle = 0;
         if (fifo.size() >= 2) ++rounds_two;
-        /* 2. the oldest lane step's tail, its drafter, its commit */
-        const auto [lane, b] = fifo.front();
-        fifo.pop_front();
-        const uint64_t tt0 = rad_mono_ns();
+        /* 2. the oldest lane step's tail, its drafter, its commit (tp8 dev M4 ready-first: or a later one's, above) */
+        size_t pick = 0;
+        if (ready_first && fifo.size() >= 2 && fifo.front().second->n_tok >= rf_rows && !x2_landed(fifo.front().first)) {
+            bool waited = false;
+            for (;;) {
+                if (x2_landed(fifo.front().first)) break;
+                for (size_t i = 1; i < fifo.size() && !pick; ++i)
+                    if (x2_landed(fifo[i].first) && !carries_lent(fifo[i].first)) pick = i;
+                if (pick || stopping_.load(std::memory_order_acquire) || (pp_link_ && !pp_link_->alive())) break;
+                waited = true;
+                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            }
+            if (waited) ++rf_waits;
+            if (pick) ++rf_taken;
+        }
+        const auto [lane, b] = fifo[pick];
+        fifo.erase(fifo.begin() + (ptrdiff_t)pick);
+        const uint64_t tt0 = rad_mono_ns();   /* tp8 loop P6: the tail's host time (after a ready-first wait) */
         if (!tail_ahead_) {
             if (const int ts = lane_tail(lane, b, so, cancel, t_on); ts < 0) return fail_loop(ts);
         } else {
@@ -598,6 +642,9 @@ int Engine::step_loop_lanes() {
         RAD_INFO("two-node pipeline: %lld planning rounds put a decode lane before a lane with prompt rows, %lld times a lane "
                  "with prompt rows waited a round behind a decode lane in flight (RADIANCE_PP_DECODE_FIRST=1)",
                  (long long)reordered, (long long)held);
+    if (ready_first)
+        RAD_INFO("two-node pipeline: %lld lane steps' tails went before an older long pass whose X2 had not landed, %lld "
+                 "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
     return RAD_OK;
 }
 
