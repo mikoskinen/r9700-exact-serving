@@ -691,8 +691,9 @@ struct Model {
     bool pp_unsplit_cand = false;
     /* tp8 dev 1a (RADIANCE_PP_FOLLOWER_EMBED=1 on both nodes, W(0, t) only; unset: nothing here): the follower looks the
      * step's embedding up itself -- the same table and op as the leader's, the vocab-sharded rows completed by the same
-     * exact all-reduce, into xcol, where it took X1 -- and the leader's head part issues neither the lookup nor X1. A
-     * pipeline node serves no pictures (lr_check), so xcol is the lookup alone on both. */
+     * exact all-reduce, into xcol, where it took X1 -- and the leader sends no X1 (its own lookup stays: its xcol is what
+     * the prologue's expand reads at every part, as before). A pipeline node serves no pictures (lr_check), so xcol is the
+     * lookup alone on both. */
     bool pp_fe = false;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
@@ -6307,8 +6308,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     /* the step's head ops: as step() (per-token, over the step); tp8 S6: on a pipeline node as step() does them -- the
      * leader's lookup, X1 at W(0, t), the streams where the node's first layer is layer 0's successor of the lookup */
     media_route(m, batch);
-    /* tp8 dev 1a: under pp_fe the follower's lookup in place of X1, the leader's none */
-    if (((!m.pp || m.pp_rank == 0) && run_head && !m.pp_fe) || (m.pp_fe && m.pp_rank == 1)) {
+    /* tp8 dev 1a: under pp_fe the follower's own lookup in place of X1; the leader keeps its own (a few dispatches, 0.06-0.10
+     * ms a lane step on cards) so its xcol holds what it held before -- the prologue's expand reads it at every part -- and
+     * only X1's send goes */
+    if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1)) {
         RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
         m.mrows.step(x, batch, m.xcol, T);
         if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
@@ -7209,8 +7212,9 @@ static void step(RadCtx* x, const RadBatch* batch) {
     const int part = pp_part(m);
     const bool run_head = part != RAD_PP_PART_TAIL;
     media_route(m, batch);
-    /* tp8 dev 1a: under pp_fe the follower's lookup in place of X1, the leader's none */
-    if (((!m.pp || m.pp_rank == 0) && run_head && !m.pp_fe) || (m.pp_fe && m.pp_rank == 1)) {
+    /* tp8 dev 1a: under pp_fe the follower's own lookup in place of X1; the leader keeps its own (its xcol as before) and
+     * only X1's send goes */
+    if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1)) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
     m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
