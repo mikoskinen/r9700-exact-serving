@@ -43,6 +43,16 @@ public:
      * count; the caller asks again for the rest. -1 when full. */
     int32_t alloc_run(int32_t want, int32_t* got);
     void    free(int32_t slot);
+    /* tp8 F2: marks slot `slot` in use (no-op if it is), for a store that mirrors another's ids -- a pipeline
+     * follower's snapshot store, indexed by the leader's slot ids. False when the slot is outside the store. */
+    bool    take(int32_t slot) {
+        if (!base_ || slot < 0 || slot >= cap_slots_) return false;
+        if (!is_used(slot)) {
+            bits_[(size_t)(slot >> 6)] |= 1ull << (slot & 63);
+            ++used_;
+        }
+        return true;
+    }
     bool    in_use(int32_t slot) const { return slot >= 0 && slot < cap_slots_ && is_used(slot); }
     void*   at(int32_t slot) const;
 

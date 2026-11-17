@@ -886,6 +886,15 @@ int Engine::pp_ck_apply(const int32_t* q, int32_t n, bool save) {
         const int32_t kind = q[i], ck = q[i + 1], ns = q[i + 2], nw = q[i + 3], first = q[i + 4];
         if (ns < 0 || nw < 0 || (int64_t)i + H + ns + nw > n) return RAD_E_STATE;
         if ((kind == 1) == save) {
+            /* tp8 F2: the slot ids are the leader's (its store hands them out and gives them back); this node's store
+             * mirrors them, so a save takes the leader's id here (it is never handed out on this node) and a restore
+             * finds what the save behind an earlier pass wrote. A give-back is not mirrored: a slot the leader reuses
+             * is simply written again. */
+            if (save && ck_store_.enabled() && !ck_store_.in_use(ck) && !ck_store_.take(ck)) {
+                RAD_ERR("follower: the leader's checkpoint slot %d is outside this node's store of %lld slots (start both "
+                        "nodes with the same --checkpoint-slots)", (int)ck, (long long)ck_store_.capacity());
+                return RAD_E_STATE;
+            }
             win.assign(q + i + H + ns, q + i + H + ns + nw);
             for (auto& rk : ranks_) {
                 if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
