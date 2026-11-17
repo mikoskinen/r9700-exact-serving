@@ -970,6 +970,11 @@ int Engine::prepare_release(const RadBatch* b) {
                 stage_pick_.store(std::max(0, sw[fn4::kStagePick]), std::memory_order_relaxed);
                 fn4::note_sched(fn4::kStagePick, stage_pick_.load(std::memory_order_relaxed));
             }
+            /* Lever SAL (ds41-pf2): stage_short only on a step with no decode rows; read by the next arena_step. */
+            if (sw[fn4::kStageLone] != fn4::kNoChange) {
+                stage_lone_.store(sw[fn4::kStageLone] == 1 ? 1 : 0, std::memory_order_relaxed);
+                fn4::note_sched(fn4::kStageLone, stage_lone_.load(std::memory_order_relaxed));
+            }
             /* Lever SP (ds41-int9): read by the next arena_step (fn4 refuses either > 0 unless set up). */
             if (sw[fn4::kStageFullMin] != fn4::kNoChange) {
                 stage_full_min_.store(sp_capable_ ? std::max(0, sw[fn4::kStageFullMin]) : 0, std::memory_order_relaxed);
@@ -2302,8 +2307,10 @@ int Engine::arena_step(const RadBatch* b) {
      * level arms the stager with its ring at lever SA's place (sahb_arms); the step's loan stops below it
      * (arena_lent_sa), and arena_tick lends it again after the step. 0: today's rule exactly. */
     const int ssh = stage_short_.load(std::memory_order_relaxed);
-    const bool sa = sahb_arms(ssh, sa_capable_, b->enc != 0, b->phase != RAD_PHASE_DECODE, b->n_tok, level,
-                              arena_last_, arena_span_rows_, mixed_ok);
+    /* Lever SAL (fn4 stage_lone 1): only a step with no decode rows (lone) arms through stage_short. */
+    const bool sal_ok = stage_lone_.load(std::memory_order_relaxed) == 0 || lone;
+    const bool sa = sal_ok && sahb_arms(ssh, sa_capable_, b->enc != 0, b->phase != RAD_PHASE_DECODE, b->n_tok, level,
+                                        arena_last_, arena_span_rows_, mixed_ok);
     const int spick = stage_pick_.load(std::memory_order_relaxed);
     /* Lever SP (ds41-int9, fn4 stage_full_min N / stage_full_pick K): a full-plan step of fewer than N tokens gets no
      * ring (sp_full_streams: its pooled experts are read in place, as at every other level); an armed full-plan step

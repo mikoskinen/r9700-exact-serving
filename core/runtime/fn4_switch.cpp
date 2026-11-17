@@ -37,7 +37,7 @@ const char* const kNames[kSwitches] = { "draft_adaptive", "gg_gemv", "aql_acq", 
                                         "exl3_x3d", "ar_xpush", "gg_gemv_m16", "place_swap_lent", "heat_min_gain_x100",
                                         "heat_hyst_x100", "ds41_rfuse", "ds41_mix_fin", "route_copy_ov",
                                         "ds41_wmk", "ds41_moe1", "sched_tail_grid", "draft_dcap", "draft_dcap_n", "exl3_dng", "ds41_f32dec",
-                                        "exl3_xr", "sched_tail_inner" };
+                                        "exl3_xr", "sched_tail_inner", "stage_lone" };
 /* Switches a plugin serves (the rest are the core's own). */
 bool plugin_switch(int i) {
     return i == kGgGemv || i == kDs41Argather || i == kDs41ShexpLane || i == kDs41KvFold || i == kDs41OFold ||
@@ -345,8 +345,8 @@ int reported(State& s, int i) {
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : s.mixed_start.load(std::memory_order_acquire);
     }
-    if (i == kStageShort || i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick) {
-        /* lever SA / HB / SP: set, else 0 (off) */
+    if (i == kStageShort || i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick || i == kStageLone) {
+        /* lever SA / HB / SP / SAL: set, else 0 (off) */
         const int v = s.val[i].load(std::memory_order_acquire);
         return v > 0 ? v : 0;
     }
@@ -378,7 +378,8 @@ bool sched_switch(int i) {
            i == kDraftOcc || i == kDraftOccK || i == kPlaceLf || i == kDs41PskK || i == kStageShort ||
            i == kStagePick || i == kPlaceHb || i == kStageFullMin || i == kStageFullPick ||
            i == kPlaceSwapLent || i == kHeatMinGainX100 || i == kHeatHystX100 ||   /* ds41-swl: the engine's, as place_lf */
-           i == kDraftDcap || i == kDraftDcapN;   /* SPB */
+           i == kDraftDcap || i == kDraftDcapN ||   /* SPB */
+           i == kStageLone;                         /* SAL (ds41-pf2): the engine's, as stage_short */
 }
 
 const char* switch_name(int i) { return i >= 0 && i < kSwitches ? kNames[i] : "?"; }
@@ -846,7 +847,7 @@ bool check(const std::string& name, int v, std::string* err) {
                         "ds41_psk_cr, ds41_engdd, sched_noa, stage_short, stage_pick, place_hb, stage_full_min, "
                         "stage_full_pick, mhc_fuse, ix_lds, ix_ni, ds41_arcoded, sched_row_cap, ds41_mix_wv, ds41_gq, ds41_e2, "
                         "sched_cb_hold_ms, sched_cb_hold_k, exl3_x3d, ar_xpush, gg_gemv_m16, place_swap_lent, heat_min_gain_x100, "
-                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, epoch_bump)";
+                        "heat_hyst_x100, ds41_rfuse, ds41_mix_fin, route_copy_ov, ds41_wmk, ds41_moe1, sched_tail_grid, draft_dcap, draft_dcap_n, exl3_dng, ds41_f32dec, exl3_xr, sched_tail_inner, stage_lone, epoch_bump)";
         return false;
     }
     State& s = st();
@@ -951,6 +952,13 @@ bool check(const std::string& name, int v, std::string* err) {
                 *err = std::string(kNames[i]) + "=" + std::to_string(v) + " refused: " +
                        (cap < 0 ? "no engine has registered its placement"
                                 : "placement is static here (no heat engine on every rank): no heat promotion to steer");
+            return false;
+        }
+        return true;
+    }
+    if (i == kStageLone) {         /* lever SAL (ds41-pf2) */
+        if (v != 0 && v != 1) {
+            if (err) *err = "stage_lone takes 0 (stage_short arms any step it admits) or 1 (only a step with no decode rows)";
             return false;
         }
         return true;
@@ -1406,7 +1414,8 @@ bool apply_pending(int step, int* sched) {
         if (reported(s, i) == v) {
             if (i == kAqlAcq || i == kRouteCopyOv || i == kSchedTailGrid || i == kSchedTailInner || i == kSchedBiChunk || i == kSchedInterleave || i == kSchedMixedTok || i == kSchedShortBypass ||
                 i == kSchedBypassTotal || i == kSchedNoa || i == kStageShort || i == kStagePick || i == kPlaceHb ||
-                i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK)
+                i == kStageFullMin || i == kStageFullPick || i == kSchedRowCap || i == kSchedCbHoldMs || i == kSchedCbHoldK ||
+                i == kStageLone)
                 s.val[i].store(v, std::memory_order_release);   /* pinned, the same */
             continue;
         }
