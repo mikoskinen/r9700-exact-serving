@@ -80,13 +80,17 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
         lane_sched_.push_back(std::move(s));
     }
     lanes_.init(all);
+    /* tp8 M56: at W(h > 0, t) the leader's head part runs layers [0, h) and writes their state (lanes.h) */
+    lanes_.set_head_state(cfg_.pp_cut_h > 0);
     /* Every lane's batch is its own set of recordings (Ctx::pass_key reads its slab's pointers). */
     for (auto& rk : ranks_) rk->ctx.set_tape_lanes(n_lanes_);
     const int64_t per = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_;
     RAD_INFO("two-node pipeline: %d lanes, each a scheduler with its own step slab on every card and at most %lld "
-             "sequences (cards %lld a lane); the newcomer split %s (pieces of at least %lld rows on the %lld-row "
-             "grid; RADIANCE_PP_SPLIT, RADIANCE_PP_SPLIT_MIN)", n_lanes_, (long long)per, (long long)per,
-             lanes_.split_on() ? "on" : "off", (long long)lanes_.split_min(), (long long)std::max<int64_t>(geo_.quantum, 1));
+             "sequences (cards %lld a lane); the newcomer's chunks over the lanes %s (whole chunks of the one-process "
+             "grid: the chunks an idle engine plans, one a lane in turn; RADIANCE_PP_SPLIT=0 off)%s", n_lanes_,
+             (long long)per, (long long)per, lanes_.split_on() ? "on" : "off",
+             cfg_.pp_cut_h > 0 ? "; a chunk that takes a snapshot is followed by its next chunk only after its commit "
+                                 "(the head part writes layers [0, h)'s state)" : "");
     return RAD_OK;
 }
 
