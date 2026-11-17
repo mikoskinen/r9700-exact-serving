@@ -50,6 +50,7 @@
 #include "runtime/fn4_switch.h"
 #include "util/stallwatch.h"
 #include "device/device.h"   /* tp8 loop P7: card-local events (rad_event_create_local) */
+#include "pp_nodeidle.h"     /* tp8 dev D8 */
 
 #include <algorithm>
 #include <chrono>
@@ -297,8 +298,10 @@ int Engine::lane_head(int lane, const RadBatch* b) {
         pfp->rel += (double)(pf1 - pf0) / 1e6;
         pf_tl_->mark(PfTimeline::kA, pfe->seq, pf_ci);
     }
+    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
     barrier_->arrive_and_wait();      /* release the ranks */
     barrier_->arrive_and_wait();      /* and wait for them */
+    if (pp_ni_) pp_ni_->end();
     if (pfp) {
         pf_tl_->mark(PfTimeline::kB, pfe->seq, pf_ci);
         pfp->issue += (double)(rad_mono_ns() - pf1) / 1e6;
@@ -417,6 +420,10 @@ int Engine::step_loop_lanes() {
     /* tp8 dev 1b: per lane, whether its step in flight has its model part / its sampler part released */
     std::vector<char> m_out((size_t)n_lanes_, 0), s_out((size_t)n_lanes_, 0);
     rad::StallWatch step_watch("step", 20000);
+    /* tp8 dev D8: RADIANCE_PP_NODE_IDLE=1 (either node) */
+    std::unique_ptr<PpNodeIdle> ni_own;
+    struct NiReset { Engine* e; ~NiReset() { e->pp_ni_ = nullptr; } } ni_reset{ this };
+    pp_node_idle_open(&ni_own);
     /* tp8 loop P7: RADIANCE_PP_PF_TIMELINE=1 (the leader; the follower ignores it) */
     std::unique_ptr<PfTimeline> pf_own;
     struct PfReset { Engine* e; ~PfReset() { e->pf_tl_ = nullptr; } } pf_reset{ this };
@@ -648,9 +655,11 @@ int Engine::step_loop_lanes() {
         gaps.tail(lane, b);
         if (++lane_steps == 1 || lane_steps % 4096 == 0) lanes_note(lane_steps, rounds_two);
         gaps.minute(lane_steps);
+        if (pp_ni_) pp_ni_->minute();
     }
     lanes_note(lane_steps, rounds_two);
     gaps.end(lane_steps);
+    if (pp_ni_) pp_ni_->stop();
     if (tail_ahead_)
         RAD_INFO("two-node pipeline: %lld lane steps' model parts were issued ahead of the lane before them's collect "
                  "(RADIANCE_PP_TAIL_AHEAD=1)", (long long)tail_ahead_n_);
@@ -682,8 +691,10 @@ int Engine::lane_tail_model(int lane, const RadBatch* b) {
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
+    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8 */
     barrier_->arrive_and_wait();      /* release the ranks */
     barrier_->arrive_and_wait();      /* and wait for them */
+    if (pp_ni_) pp_ni_->end();
     if (pp_stamps_) {
         const RadPpRing* x2 = pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X2];
         const uint64_t t1 = rad_mono_ns();
@@ -802,6 +813,7 @@ int Engine::lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vecto
     step_batch_.store(b, std::memory_order_release);
     const uint64_t t0 = pp_stamps_ ? rad_mono_ns() : 0;
     if (pfp) pf_tl_->mark(PfTimeline::kC, pf_seq, pf_ci);
+    if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8: the tail, its drafter and its step end */
     barrier_->arrive_and_wait();      /* release the ranks */
     int bst = RAD_OK;
     {
@@ -851,6 +863,7 @@ int Engine::lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vecto
     /* tp8 dev 1b: the scored rows' copies here, before another lane's model part can follow on the stream (a no-op
      * outside --kld-record; with nothing between, the copies sit where collect's score_rows put them) */
     if (cfg_.kld()) RAD_TRY(score_rows_issue(b, so));
+    if (pp_ni_) pp_ni_->end();
     return RAD_OK;
 }
 

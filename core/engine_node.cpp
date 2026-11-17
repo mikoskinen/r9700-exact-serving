@@ -31,6 +31,7 @@
 #include "runtime/fn4_switch.h"
 #include "util/stallwatch.h"
 #include "device/device.h"
+#include "pp_nodeidle.h"   /* tp8 dev D8 */
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1299,10 +1300,35 @@ void Engine::pp_send_fn4_state() {
     (void)pp_link_->send(net::kFn4State, 0, 0, v, (int64_t)sizeof v);
 }
 
+/* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1, either node): rank 0's card time in parts, between them and in its receives' waits
+ * (core/pp_nodeidle.h); 1 when on (`*own` holds it, pp_ni_ points at it), 0 when off. */
+int Engine::pp_node_idle_open(std::unique_ptr<PpNodeIdle>* own) {
+    pp_ni_ = nullptr;
+    const char* v = std::getenv("RADIANCE_PP_NODE_IDLE");
+    if (!v || std::strcmp(v, "1") || ranks_.empty()) return 0;
+    *own = std::make_unique<PpNodeIdle>();
+    PpNodeIdle& ni = **own;
+    const bool lead = !pp_follower();
+    ni.node = lead ? "leader" : "follower";
+    ni.crossing = lead ? "X2" : "X1";
+    ni.s = ranks_[0]->ctx.stream();
+    for (int l = 0; l < n_lanes_; ++l)
+        if (RadPpRing* r = pp_recv_[l * RAD_PP_N_RINGS + (lead ? RAD_PP_X2 : RAD_PP_X1)]) ni.rings.push_back(r);
+    ni.arm();
+    pp_ni_ = own->get();
+    RAD_INFO("two-node pipeline: RADIANCE_PP_NODE_IDLE=1 -- rank 0's card time in parts, between parts and waiting on the "
+             "card for the %s's %s (%zu ring(s)), a line a minute and the run's at stop (tp8 dev D8)",
+             lead ? "follower" : "leader", ni.crossing, ni.rings.size());
+    return 1;
+}
+
 int Engine::follower_loop() {
     if (rad_dev_set(ranks_[0]->device) < 0) RAD_ERR("follower loop: could not bind rank 0's device");
     rad::StallWatch watch("follower", 20000);
     int64_t steps = 0, builds = 0;
+    std::unique_ptr<PpNodeIdle> ni_own;   /* tp8 dev D8 */
+    struct NiReset { Engine* e; ~NiReset() { e->pp_ni_ = nullptr; } } ni_reset{ this };
+    pp_node_idle_open(&ni_own);
     std::vector<int32_t> ahead, rows, flags, clears, ckw;
     pp_send_fn4_state();
     /* tp8 dev M4 (RADIANCE_PP_SEG_LAYERS=k, read by the plugin, which declares the boundaries; RADIANCE_PP_SEG_ROWS=n, default
@@ -1514,8 +1540,10 @@ int Engine::follower_loop() {
             else pp_set_pass(lane, RAD_PP_PART_WHOLE);
             issue_what_.store(kIssueFollower, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
+            if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8: the ranks are parked, rank 0's stream is this thread's */
             barrier_->arrive_and_wait();      /* release the ranks */
             barrier_->arrive_and_wait();      /* and wait for them */
+            if (pp_ni_) pp_ni_->end();
             if (split) {
                 ++seg_parts;
                 if (rad_event_record(seg_ev[k & 1], ranks_[0]->ctx.stream()) < 0) {
@@ -1552,6 +1580,7 @@ int Engine::follower_loop() {
         if (pp_stop_requested()) {
             RAD_INFO("follower: stopping on a signal after %lld steps: the leader is told (kBye) and goes down "
                      "with it", (long long)steps);
+            if (pp_ni_) pp_ni_->stop();
             loop_status_.store(RAD_OK, std::memory_order_release);
             stopping_.store(true, std::memory_order_release);
             if (barrier_) barrier_->abort();
@@ -1569,6 +1598,7 @@ int Engine::follower_loop() {
                 if (pp_link_->peer_stopped()) {
                     RAD_INFO("follower: the leader stopped (%s) after %lld steps; this node stops too",
                              pp_link_->why().c_str(), (long long)steps);
+                    if (pp_ni_) pp_ni_->stop();
                     loop_status_.store(RAD_OK, std::memory_order_release);
                     stopping_.store(true, std::memory_order_release);
                     if (barrier_) barrier_->abort();
@@ -1591,6 +1621,7 @@ int Engine::follower_loop() {
         const int fs = step_frame(m, true);
         if (fs < 0) return fs;
         if (fs == 1) {   /* tp8 dev M4: the leader stopped while a split pass waited between its segments */
+            if (pp_ni_) pp_ni_->stop();
             RAD_INFO("follower: the leader stopped (%s) after %lld steps, during a pass's segments; this node stops too",
                      pp_link_->why().c_str(), (long long)steps);
             loop_status_.store(RAD_OK, std::memory_order_release);
@@ -1604,6 +1635,7 @@ int Engine::follower_loop() {
         ++steps;
         if (steps == 1 || steps % 1024 == 0)
             RAD_INFO("follower: %lld steps run, %lld builds replayed", (long long)steps, (long long)builds);
+        if (pp_ni_) pp_ni_->minute();
         if (!segs.empty() && seg_passes > 0 && (seg_passes == 1 || seg_passes % 256 == 0) && steps % 64 == 0)
             RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, %lld held "
                      "in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts, (long long)seg_between,

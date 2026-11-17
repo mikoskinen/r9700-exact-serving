@@ -67,6 +67,7 @@ struct Parts {
     int32_t  nr;                       /* the node's ranks */
     uint64_t lo, hi;                   /* this rank's share of the payload in bytes, 256-byte aligned */
     uint64_t cmp;                      /* (2) 4-byte words of the parts inside [lo, hi) */
+    int32_t  idle;                     /* tp8 dev D8: 1 = rank 0's receive adds its wait to the ring (RadPpRing::wait_on) */
 };
 
 __device__ inline uint64_t ld_sys(const volatile uint64_t* p) {
@@ -272,7 +273,15 @@ __global__ void __launch_bounds__(kThreads) stage_recv_kernel(RadPpRing* r, Part
     __shared__ int ok;
     if (threadIdx.x == 0) {
         const uint64_t want = ld_sys(&r->taken[P.rank]) + 1;
+        const uint64_t w0 = P.idle ? wall_clock64() : 0;
         ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->landed) >= want; }) ? 1 : 0;
+        /* tp8 dev D8 (RADIANCE_PP_NODE_IDLE=1): the card's wait for the other node, block 0 of rank 0 (one writer, in stream
+         * order); two host-memory round trips a receive, only when asked */
+        if (P.idle && blockIdx.x == 0) {
+            const uint64_t dt = wall_clock64() - w0;
+            st_sys(&r->wait_ticks, ld_sys(&r->wait_ticks) + dt);
+            st_sys(&r->waits, ld_sys(&r->waits) + 1);
+        }
         /* This step's payload, or the nodes are out of step. */
         if (ok && (r->rows != P.rows || r->parts != (uint64_t)P.n || r->bytes != P.total + RAD_PP_TRAILER)) {
             st_sys(&r->abort, 4ull);
@@ -512,6 +521,11 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     if (hipGetDevice(&dev) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
     P.rank = a->rank;
     P.ticks = loop ? 0 : r->deadline_ms ? r->deadline_ms * ticks_per_ms(dev) : 0;
+    /* tp8 dev D8: rank 0's receive times its wait when the core asked (RadPpRing::wait_on) */
+    if (!send && !loop && a->rank == 0 && r->wait_on) {
+        P.idle = 1;
+        r->wait_tpms = ticks_per_ms(dev);
+    }
     uint32_t* counter = counter_for(dev, r, send ? 0 : 1);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
     if (split) {
