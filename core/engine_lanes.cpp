@@ -72,6 +72,9 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
         lane_sched_.push_back(std::move(s));
     }
     lanes_.init(all);
+    /* tp8 S5 review: draft_ctxskip=1 refused by name under lanes (fn4), not accepted and left off: a run kit
+     * that reads its switches back drops it instead of stopping on a value that differs */
+    fn4::ctxskip_refuse_lanes();
     /* Every lane's batch is its own set of recordings (Ctx::pass_key reads its slab's pointers). */
     for (auto& rk : ranks_) rk->ctx.set_tape_lanes(n_lanes_);
     /* lane l holds cards [l * S / N, (l + 1) * S / N) (Scheduler::init) */
