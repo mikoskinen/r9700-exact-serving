@@ -13514,8 +13514,10 @@ TEST(lanes_dst_cuts_a_newcomer_beside_decode_rows_on_its_grid_while_the_other_la
  * home step's piece to the other lane, whose decoders keep running beside it: the newcomer's piece ends are one lane's to
  * the row (the one-process plan), pieces are lent at two lanes, and both lanes' decoders are in every step. */
 TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_ends) {
-    struct Arm { int mixed; int64_t len; };
-    for (const Arm a : { Arm{ 576, 1100 }, Arm{ 576, 2266 }, Arm{ 576, 5000 }, Arm{ 2112, 5000 } }) {
+    struct Arm { int mixed; int64_t len; bool head; };
+    /* `head`: a cut W(h > 0, t), whose leader head part writes layers [0, h)'s state (LaneSet::head_state) */
+    for (const Arm a : { Arm{ 576, 1100, false }, Arm{ 576, 2266, false }, Arm{ 576, 5000, false }, Arm{ 2112, 5000, false },
+                         Arm{ 576, 1100, true }, Arm{ 576, 5000, true } }) {
         std::vector<int64_t> ref;
         for (int lanes : { 1, 2, 3 }) {
             DstSwitches restore;
@@ -13528,6 +13530,7 @@ TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_e
             L.seqs = 12;
             REQUIRE_EQ(L.start(lanes), RAD_OK);
             L.set.set_lend_mixed(true);
+            L.set.set_head_state(a.head);
             CHECK(DstSwitches::set("sched_bi_chunk", 3));
             CHECK(DstSwitches::set("sched_mixed_tok", a.mixed));
             std::vector<uint64_t> dec[3];
@@ -13583,7 +13586,8 @@ TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_e
             for (size_t i = 0; i < ends.size(); ++i) t += fmt(" %lld", (long long)ends[i]);
             if (lanes == 1) {
                 ref = ends;
-                fprintf(stderr, "    mixed %d, a %lld-token newcomer, 1 lane: ends%s\n", a.mixed, (long long)a.len, t.c_str());
+                fprintf(stderr, "    mixed %d, a %lld-token newcomer%s, 1 lane: ends%s\n", a.mixed, (long long)a.len,
+                        a.head ? " (head state)" : "", t.c_str());
             } else {
                 /* 2 lanes: one lane's ends to the row. 3 lanes: every end one of one lane's (a long newcomer's alone-piece
                  * boundary can be reached by the cold-prompt lend of an idle engine's chunk, which then skips a D cut inside
