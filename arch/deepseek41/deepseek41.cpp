@@ -1557,6 +1557,10 @@ static bool psk_cr_flag(const PskPlan* p, size_t i) {
 static constexpr int kTiRanks = 16;
 static std::atomic<const void*> g_ti_ctok[kTiRanks];
 static std::atomic<int> g_ti_ctx{0};
+/* tp8 S6: a node with layer ranges that holds no Engram layer keeps the Engram tokens' CONV group (every group of the
+ * published declare) but no mapped ids: it cannot patch a snapshot taken inside a step, so it answers not capable and
+ * the leader's scheduler takes lever TI's switch as 0 there (exact either way: TI places snapshots only). */
+static std::atomic<int> g_ti_nocap{0};
 static void ti_note(RadCtx* x, const Model& m) {
     const int rk = rad_rank(x);
     if (!m.ctok || rk < 0 || rk >= kTiRanks) return;
@@ -4998,6 +5002,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     DS_TRY(bt_declare(b, m, ctx));
     DS_TRY(kvr_declare(b, m, ctx));
     lr_note(b, m, ctx);   /* tp8 S3: the node's line (nothing when RADIANCE_DS41_LAYERS is unset) */
+    if (m.lr.on && !c.ple.empty() && !lr_engram(m) && !ctx->shape_probe) g_ti_nocap.store(1, std::memory_order_release);
     return RAD_OK;
 }
 
@@ -7956,7 +7961,7 @@ extern "C" int rad_ckpt_conv_src(int rank, const void** ids, int* ctx) {
     using namespace deepseek41;
     if (ids) *ids = nullptr;
     if (ctx) *ctx = 0;
-    if (rank < 0) return 1;
+    if (rank < 0) return g_ti_nocap.load(std::memory_order_acquire) ? 0 : 1;
     if (rank >= kTiRanks || !ids || !ctx) return 0;
     *ids = g_ti_ctok[rank].load(std::memory_order_acquire);
     *ctx = g_ti_ctx.load(std::memory_order_acquire);
