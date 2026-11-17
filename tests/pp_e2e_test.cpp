@@ -1383,6 +1383,7 @@ TEST(follower_segments_serve_and_record_what_one_process_does) {
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         CHECK(flog.find("run in layer segments at the boundaries") != std::string::npos);
+        CHECK(flog.find("rows with decode rows (MIXED; RADIANCE_PP_SEG_PREFILL=1") != std::string::npos);
         CHECK(passes > 0);
         CHECK(parts >= 2 * passes);
         CHECK(llog.find("RADIANCE_PP_READY_FIRST=1 -- a later lane step's tail") != std::string::npos);
@@ -1395,6 +1396,7 @@ TEST(follower_segments_serve_and_record_what_one_process_does) {
         const std::string out = d / ("pp-" + std::to_string(a.lanes) + "-" + std::string(a.cut).replace(1, 1, "-"));
         std::vector<std::string> env = kSplitEnv;
         env.insert(env.end(), seg_env.begin(), seg_env.end());
+        env.push_back("RADIANCE_PP_SEG_PREFILL=1");   /* the corpus runs alone: its lone prefill chunks in segments too */
         const PipeRun pr = record_pipeline(out, a.cut, env, lane_shape(a.lanes), lane_shape(a.lanes), env);
         if (pr.leader != 0 || pr.follower != 0)
             fprintf(stderr, "    leader %d, follower %d\n    leader:\n%s\n    follower:\n%s\n", pr.leader, pr.follower,
