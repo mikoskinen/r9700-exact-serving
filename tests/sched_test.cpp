@@ -6,6 +6,7 @@
 #include "mm/processor.h"
 #include "sched/mtp_couple_bind.h"
 #include "sched/scheduler.h"
+#include "sched/lanes.h"
 #include "runtime/fn4_switch.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -12705,4 +12706,234 @@ TEST(lever_sal_the_switch_takes_0_and_1_and_starts_off) {
     CHECK_EQ(fn4::switch_index("stage_lone"), (int)fn4::kStageLone);
     CHECK(fn4::sched_switch(fn4::kStageLone));
     CHECK(fn4::state_json().find("\"stage_lone\": 0") != std::string::npos);
+}
+
+/* ================================================================== tp8 S5: lanes (core/sched/lanes.h) */
+namespace {
+
+/* N lane schedulers over one program, one fake KV pool and no prefix cache, as a two-node pipeline's
+ * leader runs them: full attention in 16-token blocks (the quantum), 64-token steps, six sequences. */
+struct Lanes {
+    Program prog;
+    Config  cfg;
+    FakeKV  kv;
+    FakePC  pc;
+    Scheduler s0;
+    std::vector<std::unique_ptr<Scheduler>> more;
+    LaneSet set;
+    uint64_t next_id = 1;
+    ~Lanes() { for (auto& s : more) s->fini(); s0.fini(); }
+    Scheduler& at(int l) { return l == 0 ? s0 : *more[(size_t)(l - 1)]; }
+    int start(int n, int64_t split_min = 16) {
+        prog.meta.n_ctx_train = 4096;
+        prog.meta.n_vocab = 65536;
+        prog.ops.emplace_back();
+        prog.buffers.emplace_back();
+        KVGroupInfo attn;
+        attn.name = "attn";
+        attn.decl.kind = RAD_KV_FULL;
+        attn.block_size = 16;
+        prog.kv_groups.push_back(attn);
+        cfg.max_tok = 64;
+        cfg.max_seqs = 6;
+        cfg.max_ctx = 1024;
+        cfg.prefix_cache = false;
+        cfg.prefill_room_gate = false;
+        cfg.n_spec = 0;
+        kv.setup(prog.kv_groups, cfg.max_ctx, 4096, 64);
+        pc.kv = &kv;
+        std::vector<BatchBuilder::RankIO> rio;
+        rio.push_back({ 0, nullptr, &prog });
+        s0.set_lanes(n, &set);
+        RAD_TRY(s0.init(prog, cfg, &kv, &pc, rio));
+        std::vector<Scheduler*> all{ &s0 };
+        for (int l = 1; l < n; ++l) {
+            more.push_back(std::make_unique<Scheduler>(s0, l, n, &set));
+            RAD_TRY(more.back()->init(prog, cfg, &kv, &pc, rio));
+            all.push_back(more.back().get());
+        }
+        set.init(all);
+        set.set_split(true, split_min);
+        return RAD_OK;
+    }
+    uint64_t submit(int lane, int n_prompt, int max_tokens, int base = 1000) {
+        auto r = std::make_unique<Request>();
+        r->id = next_id++;
+        r->max_tokens = max_tokens;
+        r->ignore_eos = true;
+        r->prompt.resize((size_t)n_prompt);
+        for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = base + i;
+        const uint64_t id = r->id;
+        return at(lane).add(std::move(r)) < 0 ? 0 : id;
+    }
+    /* Lane `l` plans with `planners` named as the lanes that plan before it plans again. */
+    const RadBatch* plan(int l, std::vector<int> planners) {
+        set.set_planners(std::move(planners));
+        return at(l).step();
+    }
+    int commit(int l, int32_t token) {
+        const StepPlan& p = at(l).plan();
+        std::vector<int32_t> a(p.e.size(), 0), t(p.e.size(), token);
+        std::vector<uint8_t> e(p.e.size(), 0);
+        Scheduler::StepResult r;
+        r.n_seq = (int)p.e.size();
+        r.n_accepted = a.data();
+        r.token = t.data();
+        r.eos = e.data();
+        return at(l).commit(r);
+    }
+    const StepEntry* entry_of(int l, uint64_t id) {
+        for (const StepEntry& e : at(l).plan().e) if (e.seq == id) return &e;
+        return nullptr;
+    }
+    const Request* req(int l, uint64_t id) { return at(l).find(id); }
+};
+
+}  /* namespace */
+
+/* Each lane holds its own run of the cards (the StepSlots), so two lanes' sequences never share a
+ * slot, and a lane admits at most that many. */
+TEST(lanes_take_their_own_cards) {
+    Lanes L;
+    REQUIRE_EQ(L.start(2), RAD_OK);
+    for (int i = 0; i < 4; ++i) CHECK(L.submit(0, 8, 4) != 0);
+    for (int i = 0; i < 4; ++i) CHECK(L.submit(1, 8, 4) != 0);
+    REQUIRE(L.plan(0, { 1 }) != nullptr);
+    REQUIRE(L.plan(1, { 0 }) != nullptr);
+    CHECK_EQ((int)L.at(0).plan().e.size(), 3);   /* 3 cards a lane of 6 */
+    CHECK_EQ((int)L.at(1).plan().e.size(), 3);
+    for (const StepEntry& e : L.at(0).plan().e) CHECK(e.card >= 0 && e.card < 3);
+    for (const StepEntry& e : L.at(1).plan().e) CHECK(e.card >= 3 && e.card < 6);
+}
+
+/* A new request goes to the lane with the fewest live requests; a request is found in its lane. */
+TEST(the_lane_set_routes_to_the_least_loaded_lane) {
+    Lanes L;
+    REQUIRE_EQ(L.start(3), RAD_OK);
+    CHECK_EQ(L.set.pick(), 0);
+    const uint64_t a = L.submit(0, 8, 4);
+    CHECK_EQ(L.set.pick(), 1);
+    const uint64_t b = L.submit(1, 8, 4);
+    CHECK_EQ(L.set.pick(), 2);
+    const uint64_t c = L.submit(2, 8, 4);
+    CHECK_EQ(L.set.pick(), 0);
+    CHECK(L.set.owner(a) == &L.at(0));
+    CHECK(L.set.owner(b) == &L.at(1));
+    CHECK(L.set.owner(c) == &L.at(2));
+    CHECK(L.set.owner(999) == nullptr);
+}
+
+/* The newcomer split: a 100-token prompt planned by lane 0 in 64-token steps is cut into one piece
+ * a lane, the second run by lane 1, which plans it first; the home lane plans the next chunk behind
+ * the piece in flight, the last piece (lent) carries the first token, and every commit lands in
+ * position order on the home lane's request. */
+TEST(a_newcomer_chunk_is_cut_over_the_lanes_and_committed_in_position_order) {
+    Lanes L;
+    REQUIRE_EQ(L.start(2), RAD_OK);
+    const uint64_t s = L.submit(0, 100, 3);
+    REQUIRE(s != 0);
+    /* lane 0, step 1: [0, 64) -> its own [0, 32), lane 1's [32, 64) */
+    REQUIRE(L.plan(0, { 1 }) != nullptr);
+    const StepEntry* e0 = L.entry_of(0, s);
+    REQUIRE(e0 != nullptr);
+    CHECK_EQ(e0->ctx_len, 0);
+    CHECK_EQ(e0->n_tokens, 32);
+    CHECK(!e0->produces_token);
+    CHECK_EQ(L.at(0).plan().n_tok, 32);
+    /* lane 1 plans next: the piece, first, as lane 0's */
+    REQUIRE(L.plan(1, { 0 }) != nullptr);
+    const StepEntry* e1 = L.entry_of(1, s);
+    REQUIRE(e1 != nullptr);
+    CHECK_EQ(e1->home, 0);
+    CHECK_EQ(e1->slot, -1);
+    CHECK_EQ(e1->ctx_len, 32);
+    CHECK_EQ(e1->n_tokens, 32);
+    /* lane 0 commits first (its step went first), then plans behind lane 1's piece: [64, 100) cut
+     * into its own [64, 80) and lane 1's [80, 100), which produces the first token */
+    CHECK_OK(L.commit(0, 7));
+    CHECK_EQ(L.req(0, s)->n_computed, 32);
+    REQUIRE(L.plan(0, { 1 }) != nullptr);
+    e0 = L.entry_of(0, s);
+    REQUIRE(e0 != nullptr);
+    CHECK_EQ(e0->ctx_len, 64);
+    CHECK_EQ(e0->n_tokens, 16);
+    CHECK(!e0->produces_token);
+    CHECK_EQ(L.req(0, s)->n_computed, 32);   /* the planning view is undone after step() */
+    CHECK_OK(L.commit(1, 7));                /* lane 1's piece [32, 64) */
+    CHECK_EQ(L.req(0, s)->n_computed, 64);
+    REQUIRE(L.plan(1, { 0 }) != nullptr);
+    e1 = L.entry_of(1, s);
+    REQUIRE(e1 != nullptr);
+    CHECK_EQ(e1->ctx_len, 80);
+    CHECK_EQ(e1->n_tokens, 20);
+    CHECK(e1->produces_token);
+    CHECK_OK(L.commit(0, 7));                /* lane 0's [64, 80) */
+    CHECK_EQ(L.req(0, s)->n_computed, 80);
+    CHECK(L.req(0, s)->output.empty());
+    /* the home lane leaves the sequence out while its first token is to come from lane 1 */
+    CHECK(L.plan(0, { 1 }) == nullptr);
+    CHECK_OK(L.commit(1, 42));               /* lane 1's [80, 100): the first token */
+    CHECK_EQ(L.req(0, s)->n_computed, 100);
+    REQUIRE_EQ(L.req(0, s)->output.size(), (size_t)1);
+    CHECK_EQ(L.req(0, s)->output[0], 42);
+    /* and decodes it at home */
+    REQUIRE(L.plan(0, { 1 }) != nullptr);
+    e0 = L.entry_of(0, s);
+    REQUIRE(e0 != nullptr);
+    CHECK(!e0->is_prefill);
+    CHECK_EQ(e0->ctx_len, 100);
+    CHECK_EQ(e0->n_tokens, 1);
+    const LaneSet::Counts c = L.set.counts();
+    CHECK_EQ(c.pieces, 2);
+    CHECK_EQ(c.done, 2);
+    CHECK_EQ(c.rows, 52);
+    CHECK_EQ(c.token_pieces, 1);
+    CHECK(L.set.broken().empty());
+}
+
+/* A lane plans the pieces lent to it first, within its step: its own chunk takes what is left. */
+TEST(a_borrower_plans_its_inbox_first_within_its_budget) {
+    Lanes L;
+    REQUIRE_EQ(L.start(2), RAD_OK);
+    const uint64_t a = L.submit(0, 200, 2);
+    const uint64_t b = L.submit(1, 200, 2, 3000);
+    REQUIRE(L.plan(0, { 1 }) != nullptr);           /* a: [0, 32) here, [32, 64) to lane 1 */
+    REQUIRE(L.plan(1, { 0 }) != nullptr);
+    int64_t own = 0, lent = 0;
+    for (const StepEntry& e : L.at(1).plan().e) (e.home >= 0 ? lent : own) += e.n_tokens;
+    CHECK_EQ(lent, 32);
+    CHECK(own > 0);
+    CHECK(L.at(1).plan().n_tok <= L.cfg.max_tok);
+    CHECK_EQ(L.at(1).plan().n_tok, own + lent);
+    CHECK(L.entry_of(1, a) != nullptr && L.entry_of(1, b) != nullptr);
+}
+
+/* The engine names the lanes in the order they plan; a piece taken out of that order (piece two
+ * before piece one) would run out of position order, and the set names it. */
+TEST(a_piece_taken_out_of_position_order_is_named) {
+    Lanes L;
+    REQUIRE_EQ(L.start(3), RAD_OK);
+    const uint64_t s = L.submit(0, 200, 2);
+    REQUIRE(s != 0);
+    REQUIRE(L.plan(0, { 1, 2 }) != nullptr);        /* [0, 64) in three: [0,16) here, [16,32) to 1, [32,64) to 2 */
+    CHECK_EQ(L.entry_of(0, s)->n_tokens, 16);
+    CHECK(L.set.broken().empty());
+    REQUIRE(L.plan(2, { 1, 0 }) != nullptr);        /* lane 2 before lane 1: out of order */
+    CHECK(!L.set.broken().empty());
+    if (!L.set.broken().empty()) fprintf(stderr, "    %s\n", L.set.broken().c_str());
+}
+
+/* A request cancelled while a piece of its prompt runs in another lane keeps its blocks until that
+ * lane commits the piece (in_step), then gives them back. */
+TEST(a_cancel_while_a_piece_runs_elsewhere_waits_for_it) {
+    Lanes L;
+    REQUIRE_EQ(L.start(2), RAD_OK);
+    const uint64_t s = L.submit(0, 100, 3);
+    REQUIRE(L.plan(0, { 1 }) != nullptr);
+    REQUIRE(L.plan(1, { 0 }) != nullptr);
+    CHECK_OK(L.commit(0, 7));
+    CHECK_OK(L.at(0).cancel(s));
+    CHECK(L.kv.has_sequence(s));                    /* lane 1's piece still writes its blocks */
+    CHECK_OK(L.commit(1, 7));
+    CHECK(!L.kv.has_sequence(s));                   /* returned once it committed */
 }
