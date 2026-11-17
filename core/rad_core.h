@@ -901,6 +901,17 @@ struct Config {
      * slower. `on` forces P2P and stops startup naming the refused pairs instead of falling
      * back. */
     int   p2p = RAD_P2P_AUTO;         /* --p2p auto|on|off */
+    /* tp8 S4: the two-node pipeline (abi/rad_pp.h, core/net/node_link.h). One engine on two
+     * machines, each a --tp group of its own: the leader (rank 0) holds the scheduler, sampler,
+     * embedding and head and layers [0, h) and [t, n); the follower (rank 1) layers [h, t). The
+     * defaults are one machine, the published engine: nothing below is read unless pp_nodes == 2. */
+    int   pp_nodes = 1;               /* --pp-nodes 1|2 */
+    int   pp_rank = 0;                /* --pp-rank 0 (leader) | 1 (follower) */
+    std::string pp_peer;              /* --pp-peer HOST[:PORT]: the other node's address */
+    int   pp_port = 29517;            /* the PORT of --pp-peer; the follower listens on it */
+    int   pp_cut_h = 0;               /* --pp-cut H,T or T (= 0,T): the follower's layers [H, T) */
+    int   pp_cut_t = 0;
+    int   node_link = 0;              /* --node-link tcp (0) | verbs (1) */
     int64_t max_tok = 2048;            /* --max-num-batched-tokens */
     /* --busy-prefill-chunk: how much of a step a prefill chunk may take when other work is
      * pending in it (decode rows, another prefill, a request waiting for admission). -1 = auto:

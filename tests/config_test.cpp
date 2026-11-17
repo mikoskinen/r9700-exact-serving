@@ -548,6 +548,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--tp", { "2" } }, { "--tp-wire", { "wht6" } }, { "--tp-wire-min-kb", { "64" } },
         { "--tp-attn-split", { "rows" } }, { "--weight-prefetch", { "off" } },
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
+        { "--pp-nodes", { "1" } }, { "--pp-rank", { "1" } }, { "--pp-peer", { "10.200.0.3:29517" } },
+        { "--pp-cut", { "0,20" } }, { "--node-link", { "verbs" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--long-prefill-token-threshold", { "1024" } },
         { "--prefill-room-gate", { "off" } },
@@ -850,6 +852,52 @@ TEST(the_p2p_mode_is_one_of_three_names) {
     CHECK_EQ(parse({ "--p2p", "yes" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--p2p", "" }, &c), RAD_E_INVAL);
     CHECK_EQ(parse({ "--p2p", "OFF" }, &c), RAD_E_INVAL);
+}
+
+/* tp8 S4: the two-node pipeline's options. The defaults are one machine; each option parses on
+ * its own (the combination is checked at startup, Engine::pp_check). */
+TEST(the_two_node_options_parse_and_default_to_one_machine) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.pp_nodes, 1);
+    CHECK_EQ(d.pp_rank, 0);
+    CHECK(d.pp_peer.empty());
+    CHECK_EQ(d.pp_port, 29517);
+    CHECK_EQ(d.pp_cut_h, 0);
+    CHECK_EQ(d.pp_cut_t, 0);
+    CHECK_EQ(d.node_link, 0);
+    Config c;
+    CHECK_EQ(parse({ "--pp-nodes", "2", "--pp-rank", "1", "--pp-peer", "10.200.0.2:30001",
+                     "--pp-cut", "10,32", "--node-link", "verbs" }, &c), RAD_OK);
+    CHECK_EQ(c.pp_nodes, 2);
+    CHECK_EQ(c.pp_rank, 1);
+    CHECK_EQ(c.pp_peer, std::string("10.200.0.2"));
+    CHECK_EQ(c.pp_port, 30001);
+    CHECK_EQ(c.pp_cut_h, 10);
+    CHECK_EQ(c.pp_cut_t, 32);
+    CHECK_EQ(c.node_link, 1);
+    Config t;
+    CHECK_EQ(parse({ "--pp-cut", "20", "--pp-peer", "gpu03" }, &t), RAD_OK);
+    CHECK_EQ(t.pp_cut_h, 0);
+    CHECK_EQ(t.pp_cut_t, 20);
+    CHECK_EQ(t.pp_peer, std::string("gpu03"));
+    CHECK_EQ(t.pp_port, 29517);
+    Config v6;
+    CHECK_EQ(parse({ "--pp-peer", "[fe80::1]:2000" }, &v6), RAD_OK);
+    CHECK_EQ(v6.pp_peer, std::string("fe80::1"));
+    CHECK_EQ(v6.pp_port, 2000);
+    CHECK_EQ(parse({ "--pp-peer", "fe80::1" }, &v6), RAD_OK);
+    CHECK_EQ(v6.pp_peer, std::string("fe80::1"));
+    Config x;
+    CHECK_EQ(parse({ "--pp-nodes", "3" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-rank", "2" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-cut", "20,10" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-cut", "20,20" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-cut", "-1,20" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-cut", "0:20" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-peer", "gpu03:0" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--pp-peer", ":29517" }, &x), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--node-link", "rdma" }, &x), RAD_E_INVAL);
 }
 
 TEST(the_state_cache_dtype_is_f32_or_f16) {

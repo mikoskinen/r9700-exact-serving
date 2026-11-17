@@ -71,6 +71,20 @@ static const Flag g_flags[] = {
     { "--p2p",                "MODE",   "how the collectives reach the other cards: auto (default)\n"
                                         "asks the driver, on requires peer access and stops without\n"
                                         "it, off exchanges through pinned host memory" },
+    { "--pp-nodes",           "N",      "1 (default): one machine. 2: one engine on two machines, a\n"
+                                        "pipeline of two --tp groups (tp8 S4): the leader keeps the\n"
+                                        "scheduler, embedding, head and the layers outside --pp-cut,\n"
+                                        "the follower the layers inside it" },
+    { "--pp-rank",            "K",      "this node in a two-node pipeline: 0 the leader (serves\n"
+                                        "HTTP), 1 the follower (serves only the leader)" },
+    { "--pp-peer",            "ADDR",   "HOST[:PORT], the other node of a two-node pipeline; the\n"
+                                        "follower listens on PORT (29517 unless given), the leader\n"
+                                        "connects to it" },
+    { "--pp-cut",             "CUT",    "H,T: the follower's layers [H, T) of a two-node pipeline\n"
+                                        "(T alone is 0,T); both nodes give the same cut" },
+    { "--node-link",          "MODE",   "tcp (default) | verbs: how a two-node pipeline's crossings\n"
+                                        "travel; verbs is RDMA between pinned host rings\n"
+                                        "(RADIANCE_PP_DEV, RADIANCE_PP_GID pick the device and GID)" },
     { "--max-num-batched-tokens", "N",  "the largest token count one step may carry" },
     { "--busy-prefill-chunk", "MODE",   "a prefill chunk's share of a step that has other work: auto\n"
                                         "(default) leaves decode rows and new requests their room,\n"
@@ -575,6 +589,47 @@ int config_parse(int argc, char** argv, Config* c) {
             else { RAD_ERR("--p2p takes auto, on or off, not '%s'", v); return RAD_E_INVAL; }
         }
         else if (S("--tp-wire-min-kb"))        { if (!num(0, INT64_MAX, &c->tp_wire_min_kb)) return RAD_E_INVAL; }
+        else if (S("--pp-nodes"))              { if (!num(1, 2, &c->pp_nodes)) return RAD_E_INVAL; }
+        else if (S("--pp-rank"))               { if (!num(0, 1, &c->pp_rank)) return RAD_E_INVAL; }
+        else if (S("--pp-peer")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            std::string h = v;
+            int port = c->pp_port;
+            /* HOST:PORT, [V6]:PORT, or a bare host (an IPv6 literal without brackets has no port). */
+            const size_t rb = h.rfind(']');
+            const size_t col = h.rfind(':');
+            const bool has_port = col != std::string::npos &&
+                                  (rb != std::string::npos ? col > rb : h.find(':') == col);
+            if (has_port) {
+                int64_t pn = 0;
+                if (!parse_int(a.c_str(), h.c_str() + col + 1, 1, 65535, &pn)) return RAD_E_INVAL;
+                port = (int)pn;
+                h = h.substr(0, col);
+            }
+            if (h.size() > 2 && h.front() == '[' && h.back() == ']') h = h.substr(1, h.size() - 2);
+            if (h.empty()) { RAD_ERR("--pp-peer takes HOST[:PORT], not '%s'", v); return RAD_E_INVAL; }
+            c->pp_peer = h;
+            c->pp_port = port;
+        }
+        else if (S("--pp-cut")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int h = 0, t = 0, used = 0;
+            if (std::sscanf(v, "%d,%d%n", &h, &t, &used) == 2 && v[used] == '\0') {
+            } else if (h = 0, used = 0, std::sscanf(v, "%d%n", &t, &used) == 1 && v[used] == '\0') {
+            } else {
+                RAD_ERR("--pp-cut takes H,T or T (0 <= H < T), not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            if (h < 0 || t <= h) { RAD_ERR("--pp-cut takes H,T with 0 <= H < T, not '%s'", v); return RAD_E_INVAL; }
+            c->pp_cut_h = h;
+            c->pp_cut_t = t;
+        }
+        else if (S("--node-link")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "tcp"))   c->node_link = 0;
+            else if (!std::strcmp(v, "verbs")) c->node_link = 1;
+            else { RAD_ERR("--node-link takes tcp or verbs, not '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--max-num-batched-tokens")){ if (!num(1, INT64_MAX, &c->max_tok)) return RAD_E_INVAL; }
         else if (S("--busy-prefill-chunk")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1374,6 +1429,18 @@ const ShowRow kShow[] = {
     { "--tp-wire-min-kb",     [](const Config& c) { return num(c.tp_wire_min_kb); } },
     { "--p2p",                [](const Config& c) {
           return std::string(c.p2p == RAD_P2P_ON ? "on" : c.p2p == RAD_P2P_OFF ? "off" : "auto"); } },
+    { "--pp-nodes",           [](const Config& c) {
+          return c.pp_nodes == 2 ? std::string("2 (a two-node pipeline)") : std::string("1 (one machine)"); } },
+    { "--pp-rank",            [](const Config& c) {
+          return c.pp_nodes == 2 ? std::string(c.pp_rank == 0 ? "0 (the leader)" : "1 (the follower)")
+                                 : std::string("n/a"); } },
+    { "--pp-peer",            [](const Config& c) {
+          return c.pp_peer.empty() ? std::string("none") : c.pp_peer + ":" + std::to_string(c.pp_port); } },
+    { "--pp-cut",             [](const Config& c) {
+          return c.pp_cut_t > 0 ? fmt("%d,%d (the follower's layers [%d, %d))", c.pp_cut_h, c.pp_cut_t,
+                                      c.pp_cut_h, c.pp_cut_t)
+                                : std::string("none"); } },
+    { "--node-link",          [](const Config& c) { return std::string(c.node_link ? "verbs" : "tcp"); } },
     { "--max-num-batched-tokens", [](const Config& c) { return num(c.max_tok); } },
     { "--busy-prefill-chunk", [](const Config& c) {
           return c.busy_prefill_chunk < 0 ? std::string("auto")
