@@ -58,6 +58,7 @@ struct Parts {
     int32_t  rank;
     uint64_t rows;
     uint64_t ticks;                    /* the deadline in wall-clock ticks, 0 none */
+    int32_t  loop;                     /* tp8 dev M4: 1 = a segment boundary on one node (the ring is this rank's buffer) */
 };
 
 __device__ inline uint64_t ld_sys(const volatile uint64_t* p) {
@@ -106,8 +107,12 @@ __device__ inline void copy_part(const char* src, char* dst, uint64_t bytes, uin
 __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Parts P, uint32_t* counter) {
     __shared__ int ok;
     if (threadIdx.x == 0) {
-        const uint64_t rd = ld_sys(&r->ready);
-        ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= rd; }) ? 1 : 0;
+        if (P.loop) {
+            ok = 1;   /* tp8 dev M4: its own buffer, written behind this rank's last receive on the same stream */
+        } else {
+            const uint64_t rd = ld_sys(&r->ready);
+            ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= rd; }) ? 1 : 0;
+        }
     }
     __syncthreads();
     if (ok) {
@@ -123,7 +128,15 @@ __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Part
         if (done == gridDim.x) {
             *counter = 0u;
             if (ok) {
-                /* review F6: the payload's number in its trailer, before `ready` */
+                /* review F6: the payload's number in its trailer, before `ready`; tp8 dev M4 loop: a fresh header, number 1,
+                 * this rank's receive the only reader */
+                if (P.loop) {
+                    st_sys(&r->abort, 0ull);
+                    st_sys(&r->taken[P.rank], 0ull);
+                    st_sys(&r->ready, 0ull);
+                    r->n_ranks = RAD_PP_MAX_RANKS;
+                    r->deadline_ms = 0;
+                }
                 const uint64_t seq = ld_sys(&r->ready) + 1;
                 st_sys(reinterpret_cast<volatile uint64_t*>(reinterpret_cast<char*>(r) + RAD_PP_RING_HDR + P.total + 8),
                        P.layout);   /* tp8 S6: the layout word, before the number */
@@ -133,6 +146,10 @@ __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Part
                 for (int k = 0; k < P.n; ++k) r->part_bytes[k] = P.bytes[k];
                 r->bytes = P.total + RAD_PP_TRAILER;
                 __threadfence_system();
+                if (P.loop) {
+                    st_sys(&r->sent, seq);
+                    st_sys(&r->landed, seq);
+                }
                 st_sys(&r->ready, seq);
             }
         }
@@ -215,7 +232,7 @@ uint64_t ticks_per_ms(int dev) {
 }
 
 /* The parts after the ring, as the kernel takes them. */
-int collect(const RadArgs* a, const RadPpRing* r, Parts* P) {
+int collect(const RadArgs* a, const RadPpRing* r, uint64_t ring_bytes, Parts* P) {
     P->n = 0;
     P->total = 0;
     P->w16 = 0;
@@ -236,7 +253,9 @@ int collect(const RadArgs* a, const RadPpRing* r, Parts* P) {
     }
     if (P->n == 0 || rows < 0) return RAD_E_SHAPE;
     P->layout = rad_pp_layout(P->bytes, P->n);
-    if (P->total + RAD_PP_TRAILER > r->cap) return RAD_E_FULL;
+    /* tp8 dev M4 loop: the ring is this rank's buffer in card memory, its extent the capacity (never read here) */
+    const uint64_t cap = P->loop ? ring_bytes - RAD_PP_RING_HDR : r->cap;
+    if (P->total + RAD_PP_TRAILER > cap) return RAD_E_FULL;
     P->rows = (uint64_t)rows;
     return RAD_OK;
 }
@@ -244,17 +263,23 @@ int collect(const RadArgs* a, const RadPpRing* r, Parts* P) {
 int launch(const RadArgs* a, RadStream stream, bool send) {
     const RadTensor* rt = r4d_opt(a, 0);
     RadPpRing* r = rt ? static_cast<RadPpRing*>(rt->data) : nullptr;
-    if (!r || r->magic != RAD_PP_RING_MAGIC) return R4D_NO(RAD_E_STATE);
-    if (send && a->rank != (int)r4d_geti_or(a, "sender", 0)) return RAD_OK;
-    if (!send && (a->rank < 0 || a->rank >= RAD_PP_MAX_RANKS || (uint64_t)a->rank >= r->n_ranks))
+    /* tp8 dev M4: `loop` 1 -- the ring is a buffer of this rank in card memory (a segment boundary on one node): its header
+     * is never read on the host, every rank sends into its own */
+    const bool loop = r4d_geti_or(a, "loop", 0) == 1;
+    const uint64_t ring_bytes = loop && rt ? (uint64_t)rad_dtype_bytes(rt->dtype, r4d_numel(rt)) : 0;
+    if (!r || (!loop && r->magic != RAD_PP_RING_MAGIC)) return R4D_NO(RAD_E_STATE);
+    if (loop && ring_bytes < RAD_PP_RING_HDR + RAD_PP_TRAILER) return R4D_NO(RAD_E_FULL);
+    if (send && !loop && a->rank != (int)r4d_geti_or(a, "sender", 0)) return RAD_OK;
+    if (!send && (a->rank < 0 || a->rank >= RAD_PP_MAX_RANKS || (!loop && (uint64_t)a->rank >= r->n_ranks)))
         return R4D_NO(RAD_E_STATE);
     Parts P{};
-    const int st = collect(a, r, &P);
+    P.loop = loop ? 1 : 0;
+    const int st = collect(a, r, ring_bytes, &P);
     if (st < 0) return R4D_NO(st);
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
     P.rank = a->rank;
-    P.ticks = r->deadline_ms ? r->deadline_ms * ticks_per_ms(dev) : 0;
+    P.ticks = loop ? 0 : r->deadline_ms ? r->deadline_ms * ticks_per_ms(dev) : 0;
     uint32_t* counter = counter_for(dev, r, send ? 0 : 1);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
     const uint64_t words = P.total / (P.w16 == (1u << P.n) - 1u ? 16 : 4);
