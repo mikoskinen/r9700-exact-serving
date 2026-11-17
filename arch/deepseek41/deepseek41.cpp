@@ -1264,9 +1264,22 @@ static constexpr int64_t kBiMoe = 16;
  * step) is gather + all-reduce byte for byte (lever D3) -- so a row's bytes are its per-pass all-reduce's, i.e. ds41_bi
  * 3 / 4's, i.e. its alone bytes. Taken only where the block reduces its gathered delta in one collective (no moe /
  * shared all-reduce, combine or add; no consumer taking the all-reduce, no gather folded into it). */
-static bool bi_pieces(int v) { return v == 2 || v == 4 || v == 6; }
+/* 7 (lever PMM, ds41-pf2 17.11.2026) = 6 + the routed MoE of consecutive prefill segments as ONE pass: a segmented step's
+ * prefill segments of at least kPmmMin rows each, whose rows follow one another (every uncut layer; a cut layer where a
+ * later segment lies wholly in its cone), take one MoE pass over their rows together instead of a pass each -- so a host-
+ * resident expert two prompts both route crosses the link once a layer, not once a prompt (s8mix: a MIXED step with a
+ * second prefill segment read 6.6-8.4 GB a rank from host against 3.0-4.4 GB with one). Exact: every op of the pass at
+ * prefill height writes a row's bytes whatever the pass's other rows -- the router chain's forms (FUSE-R: "every form writes
+ * the separate ops' bytes at any row count"), the shared arm's dense GGUF GEMMs under ds41_wmk (one part order at every row
+ * count), the EXL3 experts' prefill band above kBiMoe rows (a prompt's rows read the same bytes in any chunking: lever TI's
+ * cold texts and turn-2 resumes IDENTICAL), the gather per row, the exact wire's all-reduce per element -- and each segment
+ * alone is above every row band (kPmmMin >= kBiBand, kBiMoe). The decode segment keeps its pieces. */
+static constexpr int64_t kPmmMin = 128;
+static bool bi_pieces(int v) { return v == 2 || v == 4 || v == 6 || v == 7; }
 static bool bi_cheap(int v) { return v >= 3; }
 static bool bi_onear(int v) { return v >= 5; }
+static bool bi_pmm(int v) { return v == 7; }
+static std::atomic<long long> g_pmm_steps{0}, g_pmm_merged{0};   /* lever PMM: steps with a merged pass; passes saved (layer 0) */
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
 
@@ -1834,8 +1847,8 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step) */
-        return value == 0 || (value >= 1 && value <= 6 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
+    if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
+        return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
         return value == 0 || (value == 1 && g_sw_psk_ok.load(std::memory_order_relaxed)) ||
                ((value == 2 || value == 3 || value == 4) && g_sw_psk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
@@ -6251,9 +6264,29 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 /* the passes (first row, rows) in the order 1 .. 4 issue them */
                 static thread_local std::vector<std::pair<int64_t, int64_t>> passes;
                 passes.clear();
+                /* lever PMM (ds41_bi 7): a prefill segment of >= kPmmMin rows right after the previous one (also of
+                 * >= kPmmMin rows) joins its pass */
+                const bool pmm = bi_pmm(biv);
+                bool prev_pf = false;
+                int64_t merged = 0;
                 for (const BiSeg& s : sg) {
+                    const bool pf = !s.dec && s.n >= kPmmMin;
+                    if (pmm && pf && prev_pf && passes.back().first + passes.back().second == s.r0) {
+                        passes.back().second += s.n;
+                        ++merged;
+                        continue;
+                    }
+                    prev_pf = pf;
                     if (!s.dec || s.n <= piece) { passes.emplace_back(s.r0, s.n); continue; }
                     for (int64_t a = 0; a < s.n; a += piece) passes.emplace_back(s.r0 + a, std::min(piece, s.n - a));
+                }
+                if (merged > 0 && l == 0 && rad_rank(x) == 0) {
+                    const long long n = g_pmm_steps.fetch_add(1, std::memory_order_relaxed) + 1;
+                    g_pmm_merged.fetch_add(merged, std::memory_order_relaxed);
+                    if (n == 1 || n % 256 == 0)
+                        fprintf(stderr, "radiance: deepseek41: lever PMM (ds41_bi 7): %lld segmented steps ran their consecutive "
+                                        "prefill segments' MoE as one pass at layer 0 (%lld passes fewer; this one %lld)\n",
+                                n, g_pmm_merged.load(std::memory_order_relaxed), (long long)merged);
                 }
                 /* one all-reduce over the step's rows: only where the block reduces its gathered delta in ONE collective
                  * over h.x (issue_ar), nothing takes it downstream, and the gather is the block's own; a PSK-cut layer
