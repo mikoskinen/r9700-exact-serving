@@ -1137,6 +1137,10 @@ int Engine::follower_loop() {
      * card ahead of the running one; RADIANCE_PP_SEG_TEST_WAIT_MS (host tests): wait that long for a frame at each gap. */
     const std::vector<int32_t> segs = pp_segments();
     int64_t seg_rows = 512, seg_ahead = 1, seg_wait_ms = 0;
+    /* only passes with decode rows beside their prompt rows (a newcomer's MIXED step: another lane decodes) unless
+     * RADIANCE_PP_SEG_PREFILL=1 (a lone prefill chunk too: its segments cost a boundary each and nothing decodes beside it) */
+    bool seg_prefill = false;
+    if (const char* v = std::getenv("RADIANCE_PP_SEG_PREFILL"); v && !std::strcmp(v, "1")) seg_prefill = true;
     if (const char* v = std::getenv("RADIANCE_PP_SEG_ROWS"); v && *v) seg_rows = std::max<int64_t>(1, std::atoll(v));
     if (const char* v = std::getenv("RADIANCE_PP_SEG_AHEAD"); v && *v) seg_ahead = std::min<int64_t>(1, std::max<int64_t>(0, std::atoll(v)));
     if (const char* v = std::getenv("RADIANCE_PP_SEG_TEST_WAIT_MS"); v && *v) seg_wait_ms = std::max<int64_t>(0, std::atoll(v));
@@ -1149,8 +1153,9 @@ int Engine::follower_loop() {
                 RAD_ERR("follower: could not create the segment events");
                 return fail_loop(RAD_E_DEVICE);
             }
-        RAD_INFO("follower: passes of >= %lld rows run in layer segments at the boundaries %s of W(%d,%d), other lanes' "
-                 "passes between them (tp8 dev M4; %lld segment(s) queued ahead)", (long long)seg_rows, b.c_str(),
+        RAD_INFO("follower: passes of >= %lld rows%s run in layer segments at the boundaries %s of W(%d,%d), other lanes' "
+                 "passes between them (tp8 dev M4; %lld segment(s) queued ahead)", (long long)seg_rows,
+                 seg_prefill ? "" : " with decode rows (MIXED; RADIANCE_PP_SEG_PREFILL=1: lone prefill chunks too)", b.c_str(),
                  cfg_.pp_cut_h, cfg_.pp_cut_t, (long long)seg_ahead);
     }
     int64_t seg_passes = 0, seg_parts = 0, seg_between = 0, seg_held = 0;
@@ -1269,7 +1274,8 @@ int Engine::follower_loop() {
         const std::vector<int32_t> ck_keep = h.n_ck > 0 ? ckw : std::vector<int32_t>{};
         /* tp8 dev M4: the pass's parts -- [h, t) whole, or its segments at the declared boundaries */
         std::vector<std::pair<int, int>> parts;
-        const bool split = may_split && !segs.empty() && b->n_tok >= seg_rows;
+        const bool split = may_split && !segs.empty() && b->n_tok >= seg_rows &&
+                           (seg_prefill || b->phase == RAD_PHASE_MIXED || b->n_tok_decode > 0);
         if (split) {
             int a = cfg_.pp_cut_h;
             for (int32_t x : segs) {
@@ -1297,6 +1303,7 @@ int Engine::follower_loop() {
                     continue;
                 }
                 if (rs < 0) {
+                    if (pp_link_->peer_stopped()) return 1;   /* the leader stopped: the main loop's clean stop */
                     RAD_ERR("follower: the link to the leader is down: %s", pp_link_->why().c_str());
                     return fail_loop(RAD_E_IO);
                 }
@@ -1322,7 +1329,7 @@ int Engine::follower_loop() {
                 /* the segment k - 1 - ahead must have run before segment k goes out (ahead 1: one queued behind the
                  * running one), the other lanes' frames issued meanwhile */
                 const int64_t back = (int64_t)k - 1 - seg_ahead;
-                if (const int bs = between(back >= 0 ? seg_ev[back & 1] : nullptr); bs < 0) return bs;
+                if (const int bs = between(back >= 0 ? seg_ev[back & 1] : nullptr); bs != 0) return bs;   /* < 0 failed, 1 stop */
                 /* the pass between may have changed what this pass's issue reads */
                 for (auto& r : ranks_) r->stager.set_layer_end(end);
             }
@@ -1405,7 +1412,16 @@ int Engine::follower_loop() {
         }
         StepHdr h0;
         const bool run = m.body.size() >= sizeof h0 && (std::memcpy(&h0, m.body.data(), sizeof h0), h0.run != 0);
-        if (const int fs = step_frame(m, true); fs < 0) return fs;
+        const int fs = step_frame(m, true);
+        if (fs < 0) return fs;
+        if (fs == 1) {   /* tp8 dev M4: the leader stopped while a split pass waited between its segments */
+            RAD_INFO("follower: the leader stopped (%s) after %lld steps, during a pass's segments; this node stops too",
+                     pp_link_->why().c_str(), (long long)steps);
+            loop_status_.store(RAD_OK, std::memory_order_release);
+            stopping_.store(true, std::memory_order_release);
+            if (barrier_) barrier_->abort();
+            return RAD_OK;
+        }
         if (!run) continue;
         /* The host backend runs every launch on this thread's rank; a card's stream is drained by the
          * next step's waits. Nothing else is read back here: the follower samples nothing. */
