@@ -15,6 +15,11 @@
 #include <string>
 
 namespace rad {
+/* tp8 S5 (core/engine_node.cpp): the part of a pipeline leader's pass being issued, 0 for a whole pass. */
+int pp_pass_part();
+}  /* namespace rad */
+
+namespace rad {
 
 namespace {
 /* The acquire rule's line sets (haz_mark): sorted, disjoint [first, second) intervals of cache lines. */
@@ -1114,6 +1119,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     ptr(arena_.base());
     mix((lane1_ ? 1u : 0u) | (host_touch_pending_[0] ? 2u : 0u) | (host_touch_pending_[1] ? 4u : 0u) |
         (scratch_open_[0] ? 8u : 0u) | (scratch_open_[1] ? 16u : 0u));
+    /* tp8 S5: a two-node pipeline leader issues a lane step's pass in two parts on one batch
+     * (abi/rad_pp.h RAD_PP_PART_*): each part is its own recording. The whole pass (one machine, one
+     * lane, the follower) mixes nothing: every key is the one this function gave before. */
+    if (const int pp = pp_pass_part()) mix(0x7070000ull + (uint64_t)pp);
     return h | 1;
 }
 

@@ -2215,6 +2215,10 @@ int Engine::plan() {
                       : r->program.is_shape_generator() ? gen::ShapeDriver::device_bytes(r->program)
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
+            /* tp8 S5: every lane of a two-node pipeline has a builder (a slab) of its own */
+            if (pp_on() && cfg_.pp_lanes_now() > 1 && !r->program.is_generator() && !r->program.is_audio_generator() &&
+                !r->program.is_video_generator() && !r->program.is_shape_generator())
+                f.staging *= cfg_.pp_lanes_now();
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
             /* The depth-0 context skip's ring (RADIANCE_DRAFT_CTXSKIP): allocated at start beside the step
              * state (ctxskip_setup), so in the budget and not kept for later. 0 when unset. */

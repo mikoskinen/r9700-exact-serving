@@ -33,7 +33,7 @@ int Engine::step_state_init() {
     std::sort(eog.begin(), eog.end());
     eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
     /* Scheduler::ends_every_request reads the same ids. */
-    sched_.set_eog(eog);
+    lsched().set_eog(eog);
     const int64_t n_slot = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
     const int64_t slot_bytes = n_slot * (int64_t)sizeof(StepSlot);
     for (auto& rk : ranks_) {
@@ -391,7 +391,7 @@ void Engine::ctxskip_fini() {
 void Engine::ctx_note() const {
     if (!ctxs_.ready) return;
     fn4::note_ctxskip(ctxs_.skipped, ctxs_.refills, ctxs_.refill_rows, ctxs_.dropped, ctxs_.ring_full,
-                      sched_.ctx_pending(), ctxs_.slots, ctxs_.ring_bytes >> 20);
+                      lsched().ctx_pending(), ctxs_.slots, ctxs_.ring_bytes >> 20);
 }
 
 /* Lever Z0-A: the step slots kept before a refill -- today's kCtxSlots (or fewer: the ring), the whole ring under fn4
@@ -403,10 +403,10 @@ int Engine::ctx_limit() const {
 /* Lever Z0-A: whether block_context_pass will refill in the step about to be released (the ring at its limit, or a
  * checkpoint carrying the drafter's window); such a step needs the rung the refill passes are cut to. */
 bool Engine::ctx_refill_due() {
-    if (!ctxs_.ready || !ctxs_.on || sched_.ctx_pending() == 0) return false;
+    if (!ctxs_.ready || !ctxs_.on || lsched().ctx_pending() == 0) return false;
     if (ctxs_.used >= ctx_limit()) return true;
     if (drafter_snap_)
-        for (const StepEntry& e : sched_.plan().e)
+        for (const StepEntry& e : lsched().plan().e)
             if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) return true;
     return false;
 }
@@ -442,7 +442,7 @@ int Engine::ctx_refill_all(int step) {
     if (cap <= 0) return RAD_E_STATE;
     for (;;) {
         int64_t nr = 0, nd = 0;
-        const RadBatch* rb = sched_.ctx_refill(step, cap, (int64_t)drafter_.window, &ctxs_.runs, &nr, &nd);
+        const RadBatch* rb = lsched().ctx_refill(step, cap, (int64_t)drafter_.window, &ctxs_.runs, &nr, &nd);
         ctxs_.dropped += nd;
         if (!rb) break;
         for (size_t r = 0; r < ranks_.size(); ++r) {
@@ -471,20 +471,20 @@ int Engine::ctx_refill_all(int step) {
  * a refill around the context pass (the top of this section). */
 int Engine::block_context_pass(int step) {
     const auto ctx_pass = [&]() -> int {
-        if (const RadBatch* cb = sched_.block_context(step)) {
+        if (const RadBatch* cb = lsched().block_context(step)) {
             if (tree_) RAD_TRY(advance_all(ADV_CTXTREE, 0, false));
             RAD_TRY(block_pass(cb, "context", step));
         }
         return RAD_OK;
     };
     if (!ctxs_.ready) return ctx_pass();
-    const bool head = sched_.block_head_runs();
+    const bool head = lsched().block_head_runs();
     bool snap = false;
     if (drafter_snap_)
-        for (const StepEntry& e : sched_.plan().e)
+        for (const StepEntry& e : lsched().plan().e)
             if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { snap = true; break; }
     int64_t rows = 0, live = 0;
-    const bool keepable = sched_.ctx_keepable(&rows, &live) && rows <= (cfg_.max_seqs > 0 ? cfg_.max_seqs : 1);
+    const bool keepable = lsched().ctx_keepable(&rows, &live) && rows <= (cfg_.max_seqs > 0 ? cfg_.max_seqs : 1);
     if (ctxs_.on && !head && !snap && keepable) {
         if (live == 0) {   /* every row a finished sequence's placeholder: the pass would store nothing */
             ++ctxs_.skipped;
@@ -493,7 +493,7 @@ int Engine::block_context_pass(int step) {
         }
         if (ctxs_.used < ctx_limit()) {
             RAD_TRY(ctx_copy_rows(ctxs_.used, rows, true));
-            (void)sched_.ctx_keep(ctxs_.used);
+            (void)lsched().ctx_keep(ctxs_.used);
             ++ctxs_.used;
             ++ctxs_.skipped;
             ctx_note();
@@ -501,7 +501,7 @@ int Engine::block_context_pass(int step) {
         }
         ++ctxs_.ring_full;   /* refilled below; this step's rows get their context pass */
     }
-    if (sched_.ctx_pending() == 0) {
+    if (lsched().ctx_pending() == 0) {
         ctxs_.used = 0;
         return ctx_pass();
     }
@@ -544,7 +544,7 @@ bool Engine::serial_drafting() const {
 int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
-        AdvanceArgs a = sched_.advance_args((int)i);
+        AdvanceArgs a = lsched().advance_args((int)i);
         if (rows >= 0 && rows < a.n_seq) a.n_seq = rows;
         a.mode  = mode;
         a.round = round;
@@ -587,7 +587,7 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 int Engine::tree_compact(int rows) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
-        AdvanceArgs a = sched_.advance_args((int)i);
+        AdvanceArgs a = lsched().advance_args((int)i);
         if (rows >= 0 && rows < a.n_seq) a.n_seq = rows;
         a.mode = 0;
         a.st   = rk.step_slots;
@@ -647,7 +647,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_row_.resize((size_t)cfg_.max_seqs);
     /* `n` counts rows that can draft. It can be zero while the history pass still has work (a
      * mid-prompt sequence has hidden states the head needs but no token to propose from). */
-    const int n = sched_.serial_begin(&rounds, serial_row_.data(), (int)serial_row_.size());
+    const int n = lsched().serial_begin(&rounds, serial_row_.data(), (int)serial_row_.size());
     if (rounds <= 0) return RAD_OK;
     serial_rounds_ = rounds;
     serial_rows_   = n;
@@ -665,7 +665,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     for (int rd = 0; rd <= rounds; rd += rd == 0 ? 2 : 1) {
         if (rd > 0 && n <= 0) break;
         const auto tA = std::chrono::steady_clock::now();
-        const RadBatch* db = sched_.serial_batch(rd, step);
+        const RadBatch* db = lsched().serial_batch(rd, step);
         if (!db) { if (rd == 0) continue; break; }
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
@@ -743,7 +743,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
  * so a disagreement is a defect and the step is refused. */
 int Engine::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
         for (size_t i = 0; i < plan.e.size(); ++i) {
             const StepEntry& e = plan.e[i];
@@ -758,7 +758,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
             }
         }
     }
-    sched_.serial_end(serial_done_);
+    lsched().serial_end(serial_done_);
     if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;
 
     Rank& r0 = *ranks_[0];
@@ -774,7 +774,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
         if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
-        const int rc = sched_.set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        const int rc = lsched().set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
     }
@@ -794,7 +794,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
  * reap() may already have freed (sched/mtp_couple_bind.h). */
 int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card) {
     MtpCoupleBindPoint bp;
-    bp.found = sched_.committed_seq(seq, &bp.n_out, &bp.live);
+    bp.found = lsched().committed_seq(seq, &bp.n_out, &bp.live);
     if (!bp.found)
         RAD_WARN("coupled draft: row for sequence %llu is not in the committed step; clearing its "
                  "coupling", (unsigned long long)seq);
@@ -848,7 +848,7 @@ void Engine::couple_verify_evidence(int step) {
     const rad_op op = smp.staged_couple_op();
     const MtpCoupleEvidence ev = mtp_couple_evidence(
         smp.couple_build(), step, ranks_[0]->ctx.op_domain(op),
-        [this](uint64_t seq) { return sched_.running(seq); });
+        [this](uint64_t seq) { return lsched().running(seq); });
     if (ev.rows <= 0 || smp.staged_couple_issued_step() != step) return;
     const char* kernel = ranks_[0]->ctx.ip_kernel_name(op);
     if (ev.device) {
@@ -872,7 +872,7 @@ void Engine::couple_verify_evidence(int step) {
 template <class Row>
 int Engine::stage_couple_draws(const Row* rows, int n) {
     std::string why;
-    const int stg = mtp_couple_plan_stage(sched_.plan(),
+    const int stg = mtp_couple_plan_stage(lsched().plan(),
                                           (int)(cfg_.max_seqs > 0 ? cfg_.max_seqs : 1),
                                           rows, n, &couple_by_card_, couple_draw_stage_, &why);
     if (stg < 0) {
@@ -895,7 +895,7 @@ int Engine::stage_couple_draws(const Row* rows, int n) {
     if (!couple_qt_rank_.empty()) {
         const int v = fn4::get(fn4::kDraftSample);
         const double scale = v >= 2 && v <= 200 ? v / 100.0 : 1.0;
-        const StepPlan& plan = sched_.plan();
+        const StepPlan& plan = lsched().plan();
         for (int i = 0; i < n; ++i) {
             float t = 1.0f;
             for (const StepEntry& e : plan.e)
@@ -983,7 +983,7 @@ void Engine::block_shape(int* block, int* steps) {
      * fewer proposals as rows. The load is the step just run's, which the next step, the one these
      * proposals are for, mostly repeats (Scheduler::short_block_on). */
     if (drafter_short_ <= 0) return;
-    short_on_ = Scheduler::short_block_on(short_on_, sched_.decoded_seqs(), short_from_);
+    short_on_ = Scheduler::short_block_on(short_on_, lsched().decoded_seqs(), short_from_);
     if (short_on_) {
         /* A tree (rad_drafter_tree) grows a tree of its own over the shorter pass, at most its
          * draft positions of nodes (DFlash2 attends across its block, so the short pass is not the
@@ -1002,7 +1002,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     dconf_step_ = step;
     if (!block_drafting()) return RAD_OK;
     /* The gate's counts belong to the proposal they cut: a new drafter cycle forgets them. */
-    if (conf_buf_ || conf_dbg_) sched_.draft_conf_begin();
+    if (conf_buf_ || conf_dbg_) lsched().draft_conf_begin();
 
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     /* A tree's accepted path into place in the trunk's cache, against the same build (the step
@@ -1021,7 +1021,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     /* The head reads the block's draft rows. A tree (rad_drafter_tree; DFlash2's convention, the
      * anchor predicts nothing) reads all block - 1 of them whatever its node count. */
     const int head = tree_ ? block - 1 : steps;
-    const int n = sched_.block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
+    const int n = lsched().block_begin(block, head, (int)drafter_.window, drafter_.mask_token,
                                      block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
 
     /* --draft-coupling: the draws before the query pass reads them (stage_couple_draws). Lever SD: only while
@@ -1040,7 +1040,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
      * and before the query pass and the step issued ahead (save_checkpoints). */
     if (drafter_snap_) RAD_TRY(save_checkpoints());
     if (n <= 0) return RAD_OK;
-    const RadBatch* qb = sched_.block_query(step);
+    const RadBatch* qb = lsched().block_query(step);
     if (!qb) return RAD_OK;
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
@@ -1065,7 +1065,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
      * waits for nothing, as dspark_conf 0 (the head the plugin issued is left unread). */
     if (conf_val_) {
         const int cap = fn4::get(fn4::kDsparkConfRows);
-        const bool gated = cap > 0 && sched_.decoded_seqs() > cap;
+        const bool gated = cap > 0 && lsched().decoded_seqs() > cap;
         dconf::tracker().load_gate(cap > 0, gated);
         if (gated) conf_val_ = 0;
     }
@@ -1108,7 +1108,7 @@ int Engine::conf_gate() {
     for (int i = 0; i < block_rows_; ++i) {
         const int k = dconf::prefix_len(conf_host_ + (int64_t)i * conf_pitch_, block_steps_, p);
         conf_cut_[(size_t)i] = k;
-        sched_.set_draft_conf(block_row_[(size_t)i].seq, k, p.replace);
+        lsched().set_draft_conf(block_row_[(size_t)i].seq, k, p.replace);
     }
     return RAD_OK;
 }
@@ -1137,7 +1137,7 @@ void Engine::dconf_commit(const StepPlan& plan, const StepOut& so, int step) {
 int Engine::finish_block_drafter(const StepOut& so) {
     if (!block_drafting()) return RAD_OK;
     if (block_rows_ > 0) {
-        const StepPlan& plan = sched_.plan();
+        const StepPlan& plan = lsched().plan();
         for (size_t i = 0; i < plan.e.size(); ++i) {
             const StepEntry& e = plan.e[i];
             if (so.first_row[i] < 0) continue;
@@ -1147,12 +1147,12 @@ int Engine::finish_block_drafter(const StepOut& so) {
                         "sequence %llu and the host %d ending in %d; the query pass ran from the "
                         "card's", drafter_.name, S.acc, S.tok[0], (unsigned long long)e.seq,
                         so.accepted[i], so.token[i]);
-                sched_.block_end();
+                lsched().block_end();
                 return RAD_E_STATE;
             }
         }
     }
-    sched_.block_end();
+    lsched().block_end();
     if (block_rows_ <= 0) return RAD_OK;
     /* The gate, where no step was issued ahead to apply it (the planes landed with the slots). */
     RAD_TRY(conf_gate());
@@ -1186,7 +1186,7 @@ int Engine::finish_block_drafter(const StepOut& so) {
         /* ds41-acc: the confidence gate's count, as the step issued ahead was built with it. */
         const int cut = i < (int)conf_cut_.size() ? conf_cut_[(size_t)i] : -1;
         const int n_pub = cut >= 0 ? std::min(steps, cut) : steps;
-        const int rc = sched_.set_draft(seq, d, n_pub, tree_ ? S.par : nullptr);
+        const int rc = lsched().set_draft(seq, d, n_pub, tree_ ? S.par : nullptr);
         if (conf_val_ || alt_on_)
             dconf::tracker().proposed(seq, dconf_step_,
                                       conf_val_ ? conf_host_ + (int64_t)i * conf_pitch_ : nullptr, steps,

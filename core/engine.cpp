@@ -812,7 +812,9 @@ void Engine::rank_loop(int index) {
         if (b) {
             /* This rank's view of the step, pointing at this card's staging. Its upload was issued
              * on this rank's stream, so no cross-rank fence is needed. */
-            const RadBatch* mine = gen_ ? gen_->batch_for(index) : sched_.batch_for(index);
+            /* tp8 S5: the lane whose batch this release issues (sched_ on one lane) */
+            const RadBatch* mine = gen_ ? gen_->batch_for(index)
+                                        : issue_sched_.load(std::memory_order_acquire)->batch_for(index);
             if (!mine) {
                 RAD_ERR("rank %d: the builder has no batch for this rank", index);
                 step_status_.store(RAD_E_STATE, std::memory_order_release);
@@ -873,11 +875,12 @@ void Engine::rank_loop(int index) {
 }
 
 /* ------------------------------------------------------------------ the scheduler thread */
-int Engine::prepare_release(const RadBatch* b) {
+int Engine::prepare_release(const RadBatch* b, bool switches) {
     /* fn4: runtime switch changes (POST /admin/fn4) land here, with every rank thread parked, so
      * every rank issues this step under one setting (runtime/fn4_switch.h). Nothing queued: one
-     * atomic load, no lock. */
-    {
+     * atomic load, no lock. tp8 S5: a lane step's tail release (switches false) takes none, so its
+     * two leader passes run under the setting its head ran (and shipped to the follower) under. */
+    if (switches) {
         int sw[fn4::kSwitches];
         const bool fn4_changed = fn4::apply_pending(b ? b->step : -1, sw);
         if (fn4_changed) fn4_apply_changes(sw);
@@ -888,13 +891,17 @@ int Engine::prepare_release(const RadBatch* b) {
             sched_.set_psk_mode(fn4::value(fn4::kDs41Psk));
             /* lever PSK-CR (ds41-pskcr): the plugin's ds41_psk_cr and the replay's reach, read with the mode */
             sched_.set_psk_cr(fn4::value(fn4::kDs41PskCr), fn4::psk_cr_reach());
+            for (auto& ls : lane_sched_) {   /* tp8 S5: every lane's scheduler (none on one lane) */
+                ls->set_psk_mode(fn4::value(fn4::kDs41Psk));
+                ls->set_psk_cr(fn4::value(fn4::kDs41PskCr), fn4::psk_cr_reach());
+            }
         }
     }
     psk_release(b);
     /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
      * own balance(), behind the step's trunk pass); and the report. Nothing when undeclared. */
     if (dl_capable_) {
-        const bool want = sched_.draft_lend_wanted();
+        const bool want = lsched().draft_lend_wanted();
         for (auto& r : ranks_) r->mover.set_draft_lend(want);
         uint64_t ch = 0;
         const int state = draft_lend_state(&ch);
@@ -922,7 +929,7 @@ int Engine::prepare_release(const RadBatch* b) {
     /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
      * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
      * parked, so no allocation races the read. */
-    kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
+    kvstream_step_runs(ranks_[0]->kv, b, lsched().step_seqs(b), &stage_runs_);
     for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
     return RAD_OK;
 }
@@ -931,39 +938,46 @@ int Engine::prepare_release(const RadBatch* b) {
  * scheduler's setters, the engine's own levers, every rank's mover and heat engine. Every rank thread
  * is parked. A pipeline's follower runs the same (tp8 S4: its placement levers). */
 void Engine::fn4_apply_changes(const int* sw) {
+    /* tp8 S5: a scheduler switch reaches every lane's scheduler; the value noted is lane 0's (each
+     * lane runs the same setter on the same value). One lane: the call below is sched_'s alone. */
+    const auto each_lane = [this](const auto& set) {
+        auto v = set(sched_);
+        for (auto& ls : lane_sched_) (void)set(*ls);
+        return v;
+    };
     {
         {
             /* Lever PSK design 2: the scheduler's anchor stride */
             if (sw[fn4::kDs41PskK] != fn4::kNoChange)
-                fn4::note_sched(fn4::kDs41PskK, sched_.set_psk_k(sw[fn4::kDs41PskK]));
+                fn4::note_sched(fn4::kDs41PskK, each_lane([&](Scheduler& q) { return q.set_psk_k(sw[fn4::kDs41PskK]); }));
             if (sw[fn4::kDraftAdaptive] != fn4::kNoChange)
-                fn4::note_draft_adaptive(sched_.set_draft_adaptive(sw[fn4::kDraftAdaptive]));
+                fn4::note_draft_adaptive(each_lane([&](Scheduler& q) { return q.set_draft_adaptive(sw[fn4::kDraftAdaptive]); }));
             if (sw[fn4::kDraftDepth0] != fn4::kNoChange)
-                fn4::note_sched(fn4::kDraftDepth0, sched_.set_draft_depth0(sw[fn4::kDraftDepth0]));
+                fn4::note_sched(fn4::kDraftDepth0, each_lane([&](Scheduler& q) { return q.set_draft_depth0(sw[fn4::kDraftDepth0]); }));
             if (sw[fn4::kDraftProbe] != fn4::kNoChange)
-                fn4::note_sched(fn4::kDraftProbe, sched_.set_draft_probe(sw[fn4::kDraftProbe]));
+                fn4::note_sched(fn4::kDraftProbe, each_lane([&](Scheduler& q) { return q.set_draft_probe(sw[fn4::kDraftProbe]); }));
             if (sw[fn4::kDraftHybrid] != fn4::kNoChange)
-                fn4::note_sched(fn4::kDraftHybrid, sched_.set_draft_hybrid(sw[fn4::kDraftHybrid]));
+                fn4::note_sched(fn4::kDraftHybrid, each_lane([&](Scheduler& q) { return q.set_draft_hybrid(sw[fn4::kDraftHybrid]); }));
             if (sw[fn4::kDraftHybridMatch] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftHybridMatch,
-                                sched_.set_draft_hybrid_match(sw[fn4::kDraftHybridMatch]));
+                                each_lane([&](Scheduler& q) { return q.set_draft_hybrid_match(sw[fn4::kDraftHybridMatch]); }));
             if (sw[fn4::kDraftProbeBackoff] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDraftProbeBackoff,
-                                sched_.set_draft_probe_backoff(sw[fn4::kDraftProbeBackoff]));
+                                each_lane([&](Scheduler& q) { return q.set_draft_probe_backoff(sw[fn4::kDraftProbeBackoff]); }));
             if (sw[fn4::kDraftLend] != fn4::kNoChange)
-                fn4::note_sched(fn4::kDraftLend, sched_.set_draft_lend(sw[fn4::kDraftLend]));
+                fn4::note_sched(fn4::kDraftLend, each_lane([&](Scheduler& q) { return q.set_draft_lend(sw[fn4::kDraftLend]); }));
             if (sw[fn4::kDraftLendBorrow] != fn4::kNoChange)
-                fn4::note_sched(fn4::kDraftLendBorrow, sched_.set_draft_lend_borrow(sw[fn4::kDraftLendBorrow]));
+                fn4::note_sched(fn4::kDraftLendBorrow, each_lane([&](Scheduler& q) { return q.set_draft_lend_borrow(sw[fn4::kDraftLendBorrow]); }));
             if (sw[fn4::kDraftLendHyst] != fn4::kNoChange)   /* lever Z0-H */
-                fn4::note_sched(fn4::kDraftLendHyst, sched_.set_draft_lend_hyst(sw[fn4::kDraftLendHyst]));
+                fn4::note_sched(fn4::kDraftLendHyst, each_lane([&](Scheduler& q) { return q.set_draft_lend_hyst(sw[fn4::kDraftLendHyst]); }));
             if (sw[fn4::kDraftOcc] != fn4::kNoChange)        /* lever Z0-O */
-                fn4::note_sched(fn4::kDraftOcc, sched_.set_draft_occ(sw[fn4::kDraftOcc]));
+                fn4::note_sched(fn4::kDraftOcc, each_lane([&](Scheduler& q) { return q.set_draft_occ(sw[fn4::kDraftOcc]); }));
             if (sw[fn4::kDraftOccK] != fn4::kNoChange)
-                fn4::note_sched(fn4::kDraftOccK, sched_.set_draft_occ_k(sw[fn4::kDraftOccK]));
+                fn4::note_sched(fn4::kDraftOccK, each_lane([&](Scheduler& q) { return q.set_draft_occ_k(sw[fn4::kDraftOccK]); }));
             if (sw[fn4::kDraftDcap] != fn4::kNoChange)       /* SPB */
-                fn4::note_sched(fn4::kDraftDcap, sched_.set_draft_dcap(sw[fn4::kDraftDcap]));
+                fn4::note_sched(fn4::kDraftDcap, each_lane([&](Scheduler& q) { return q.set_draft_dcap(sw[fn4::kDraftDcap]); }));
             if (sw[fn4::kDraftDcapN] != fn4::kNoChange)
-                fn4::note_sched(fn4::kDraftDcapN, sched_.set_draft_dcap_n(sw[fn4::kDraftDcapN]));
+                fn4::note_sched(fn4::kDraftDcapN, each_lane([&](Scheduler& q) { return q.set_draft_dcap_n(sw[fn4::kDraftDcapN]); }));
             /* The depth-0 context skip: the engine's own (block_context_pass); 1 only where set up (fn4 refuses
              * it otherwise). */
             if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {
@@ -1053,7 +1067,7 @@ void Engine::psk_release(const RadBatch* b) {
     int32_t end = INT32_MAX;
     int64_t dec = 0;
     psk_last_valid_ = false;
-    if (b && b->draft_pass == 0 && sched_.psk_plan(b->step, &psk_ahead_, &psk_rows_, &dec, &psk_flags_)) {
+    if (b && b->draft_pass == 0 && lsched().psk_plan(b->step, &psk_ahead_, &psk_rows_, &dec, &psk_flags_)) {
         /* tp8 S4: the follower of a two-node pipeline hands its plugin the same plan. */
         psk_last_valid_ = true;
         psk_last_dec_ = dec;
@@ -1147,11 +1161,14 @@ int Engine::fail_loop(int st) {
     stopping_.store(true, std::memory_order_release);
     if (barrier_) barrier_->abort();
     sched_.shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
+    for (auto& ls : lane_sched_) ls->shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
     loop_status_.store(st < 0 ? st : RAD_E_STATE, std::memory_order_release);
     return st;
 }
 
 int Engine::step_loop() {
+    /* tp8 S5: a two-node pipeline's leader with lanes runs their loop (engine_lanes.cpp) */
+    if (pp_leader() && n_lanes_ > 1) return step_loop_lanes();
     /* The batch is built on rank 0's stream into rank 0's memory, so this thread binds rank 0's
      * device; the backend's current device is thread-local and starts at device 0. */
     if (rad_dev_set(ranks_[0]->device) < 0)
@@ -1410,16 +1427,18 @@ int Engine::step_loop() {
             if (const int ps = prepare_release(b); ps < 0) return fail_loop(ps);
             /* tp8 S4: the follower runs this step's other layers from the same staging. */
             if (pp_link_) {
-                if (!pp_trunk_pending_) {
+                if (!pp_trunk_pending_[0]) {
                     RAD_ERR("two-node pipeline: step %d was released without its build", b->step);
                     return fail_loop(RAD_E_STATE);
                 }
-                pp_trunk_pending_ = false;
+                pp_trunk_pending_[0] = false;
                 if (const int ss = pp_ship(b, true); ss < 0) return fail_loop(ss);
             }
             /* An embedding program has no sampler to issue behind its pass. */
             issue_what_.store(embedding_ ? kIssueModel : kIssueAll, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
+            /* tp8 S5: the stage busy stamps (RADIANCE_PP_STAMPS on a pipeline node; null otherwise) */
+            const uint64_t pp_t0 = pp_stamps_ ? rad_mono_ns() : 0;
             barrier_->arrive_and_wait();      /* release the ranks */
             {
                 /* Stage the sampler while the ranks enqueue and the device runs the pass. */
@@ -1432,6 +1451,14 @@ int Engine::step_loop() {
                 build_cv_.notify_all();
             }
             barrier_->arrive_and_wait();      /* wait for them */
+            if (pp_stamps_) {
+                /* one lane: the pass is the head (to X1's publish) and the tail (from X2's arrival) */
+                const uint64_t t1 = rad_mono_ns();
+                const RadPpRing* x1 = pp_send_[RAD_PP_X1];
+                const RadPpRing* x2 = pp_recv_[RAD_PP_X2];
+                pp_stamp("head", 0, b->step, pp_t0, x1 && x1->ready_ns ? x1->ready_ns : t1);
+                pp_stamp("tail", 0, b->step, x2 && x2->taken_ns > pp_t0 ? x2->taken_ns : pp_t0, t1);
+            }
         } else {
             /* The forward pass was issued ahead and the previous step has now committed, so the
              * sampler is staged from the correct state and its chain queued behind the running
@@ -1753,7 +1780,7 @@ int Engine::stream_probe_take(const RadBatch* b, bool prefill_done, bool request
         stream_prev_[i] = r;
     }
     if (overflowed) {
-        (void)sched_.fail_prefilling(overflow_why.c_str());
+        (void)lsched().fail_prefilling(overflow_why.c_str());
         for (size_t i = 0; i < n; ++i) {
             const RadKVStream* sv = b->kv[i].stream;
             if (sv && sv->ctl) (void)rad_memset_async(sv->ctl + 3, 0, 4, st);
@@ -1800,7 +1827,7 @@ int Engine::collect_pooled_issue(const RadBatch* b, StepOut& /*so*/) {
 /* Hand each sequence's vector to its sink, and set eos for every sequence so the commit finishes
  * it: an embedding request is one step long. The token is never emitted (Request::embed). */
 int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 1);
@@ -1834,12 +1861,12 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
  * snapshot (drafter_snap_) is saved behind the drafter's context pass (issue_block_drafter),
  * which writes only the drafter's groups. */
 int Engine::save_checkpoints() {
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     bool any_save = false;
     for (const StepEntry& e : plan.e)
         if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0) { any_save = true; break; }
     if (any_save) {
-        const int ss = sched_.locked([&]() -> int {
+        const int ss = lsched().locked([&]() -> int {
             for (const StepEntry& e : plan.e) {
                 if (e.ckpt_slot < 0 || e.ckpt_tok < 0) continue;
                 if (!state_slots_of(e.seq, &ckpt_slots_)) continue;
@@ -1942,7 +1969,7 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
 
     /* A scored step reads back the hidden rows and the candidates' table rows instead of whole
      * logits rows (BatchBuilder set the flag on the same facts). */
-    const RadBatch* b0 = sched_.batch_for(0);
+    const RadBatch* b0 = lsched().batch_for(0);
     score_only_ = b0 && b0->score_only;
     if (score_only_) {
         const Program& p = ranks_[0]->program;
@@ -2082,7 +2109,7 @@ int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token, int32_t at) {
 /* Wait for the sampled ids and build the scheduler's per-sequence arrays. The step path's only
  * host synchronisation: the host needs the tokens to commit and stream them (spec §5.4). */
 int Engine::collect_step(const RadBatch* b, StepOut& so) {
-    const StepPlan& plan = sched_.plan();
+    const StepPlan& plan = lsched().plan();
     so.token.assign(plan.e.size(), 0);
     so.accepted.assign(plan.e.size(), 0);
     so.eos.assign(plan.e.size(), 0);
@@ -2329,7 +2356,7 @@ int Engine::arena_step(const RadBatch* b) {
      * fewer rows of the same buffers. */
     if (!b->enc && arena_dec_max_ > 0) {
         const bool d0 = arena_d0_.load(std::memory_order_relaxed) == 1;
-        if (d0 && b->phase == RAD_PHASE_DECODE && b->n_tok == b->n_seq && !sched_.draft().head_runs() &&
+        if (d0 && b->phase == RAD_PHASE_DECODE && b->n_tok == b->n_seq && !lsched().draft().head_runs() &&
             !ctx_refill_due())
             need = b->n_tok;
         else   /* every other step, under either value, at least today's rung: the head never runs below it */
@@ -2342,13 +2369,13 @@ int Engine::arena_step(const RadBatch* b) {
     /* Whether the next step continues a prompt, so the stager stages its first layers at this
      * step's end. Never for a step issued ahead (a decode step whose plan the scheduler does not
      * hold). */
-    const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
+    const bool more = b->phase != RAD_PHASE_DECODE && lsched().prefill_continues();
     /* A mixed step (decode rows [0, n_tok_decode)) is staged only where RADIANCE_STAGE_MIXED allows
      * (stage_mixed_mode). */
     const int smode = stage_mixed_mode();
     const bool lone = b->phase == RAD_PHASE_PREFILL || (b->phase != RAD_PHASE_DECODE && b->n_tok_decode == 0);
     const bool mixed_ok = smode == 1 || lone ||
-                          (smode == 2 && b->phase != RAD_PHASE_DECODE && sched_.prefill_has_more());
+                          (smode == 2 && b->phase != RAD_PHASE_DECODE && lsched().prefill_has_more());
     /* Lever SA (ds41-sahb, fn4 stage_short N): a step with prefill rows and at least N tokens at the span's shared
      * level arms the stager with its ring at lever SA's place (sahb_arms); the step's loan stops below it
      * (arena_lent_sa), and arena_tick lends it again after the step. 0: today's rule exactly. */
@@ -2412,8 +2439,8 @@ int Engine::arena_level(int64_t rows) const { return arena_level_for(arena_rows_
  * pays for the slab, at the steps D7 already leaves unsampled under the lend. */
 int Engine::draft_w_step() {
     if (!dw_capable_) return RAD_OK;
-    const bool want = dw_on_.load(std::memory_order_relaxed) == 1 && sched_.draft_lend_wanted() &&
-                      !sched_.draft().head_runs();
+    const bool want = dw_on_.load(std::memory_order_relaxed) == 1 && lsched().draft_lend_wanted() &&
+                      !lsched().draft().head_runs();
     if (want == dw_lent_) {
         const Mover& m0 = ranks_[0]->mover;
         fn4::note_lend_w(dw_lent_ ? 1 : 0, (int64_t)m0.draft_w_lends(), (int64_t)m0.draft_w_reclaims(),
@@ -2612,6 +2639,11 @@ void Engine::drain_completed() {
      * is seen exactly once. */
     sched_.take_completed(&done_);
     for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+    /* tp8 S5: every lane's (none on one lane) */
+    for (auto& ls : lane_sched_) {
+        ls->take_completed(&done_);
+        for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+    }
 }
 
 /* Zero freshly assigned recurrent slots before the step that reads them. The manager records the
@@ -2877,7 +2909,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else {
+    /* tp8 S5: lane 0 takes its share of the cards before init */
+    if (pp_on() && n_lanes_ > 1) sched_.set_lanes(n_lanes_, &lanes_);
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+    /* tp8 S5: the other lanes' schedulers (engine_lanes.cpp) */
+    if (pp_on() && n_lanes_ > 1) RAD_TRY(lanes_init(rio));
     /* tp8 S4: the rings, the second rendezvous and the link's threads. */
     if (pp_on()) {
         if (embedding_ || generator) {
@@ -2899,6 +2935,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         for (auto& rk : ranks_)
             if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->stager.min_rows());
         sched_.set_stage_rows(stage_rows);
+        for (auto& ls : lane_sched_) ls->set_stage_rows(stage_rows);   /* tp8 S5 */
         /* The shortest prompt a span pays for where routed experts are read from host memory: a
          * spanned step runs at the full plan, which lends the expert slab nothing, while every
          * other step runs at the span's shared level and lends it the span's extra rows. On
@@ -2907,6 +2944,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
          * the card there is no such cost and every lone prefill spans. */
         sched_.set_span_min(stage_rows > 0 && arena_span_rows_ > 0
                                 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0) : 0);
+        for (auto& ls : lane_sched_)   /* tp8 S5 */
+            ls->set_span_min(stage_rows > 0 && arena_span_rows_ > 0 ? 8 * std::max<int64_t>(geo_.checkpoint_interval, 0)
+                                                                     : 0);
     }
     /* Lever TI (ds41-pf2): a plugin serving rad_ckpt_conv_src declares that a snapshot inside a step can be saved whole --
      * its LINEAR states at lever G's tail grid are never read by the chunk a resume starts there, and its CONV window is
@@ -3253,6 +3293,8 @@ int Engine::run_server() {
      * hold the session table the sessions view reads. */
     server::SchedulerBridge sched_bridge(&sched_, ranks_.empty() ? nullptr : &ranks_[0]->sampler,
                                         ranks_.empty() ? nullptr : &ranks_[0]->tiers);
+    /* tp8 S5: a pipeline leader with lanes routes requests over them (core/sched/lanes.h) */
+    if (!lane_sched_.empty()) sched_bridge.set_lanes(&lanes_);
     server::TokenizerBridge tok_bridge(vocab_);
     server::ChatTemplateBridge chat_bridge;
     server::GrammarBridge grammar_bridge(vocab_view_.get());

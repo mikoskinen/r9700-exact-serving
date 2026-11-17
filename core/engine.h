@@ -30,6 +30,7 @@
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
+#include "sched/lanes.h"   /* tp8 S5 */
 #include "sample/vocab_view.h"
 #include "runtime/rank_barrier.h"
 #include "text/tokenizer.h"
@@ -324,6 +325,20 @@ private:
 
     /* One scheduler for every rank: one decision per step, one batch, shared by pointer. */
     Scheduler                     sched_;
+    /* tp8 S5: a two-node pipeline's lanes (core/sched/lanes.h, engine_lanes.cpp): lane 0 is sched_,
+     * lanes 1.. these, each with its own builder and slab; empty on one lane. `lsched()` is the lane
+     * the step loop is working on (the trunk step, its drafter passes, its commit), `issue_sched_`
+     * the lane whose batch the ranks issue (rank_loop's batch_for). Both are sched_ on one lane. */
+    std::vector<std::unique_ptr<Scheduler>> lane_sched_;
+    LaneSet                       lanes_;
+    int                           n_lanes_ = 1;
+    Scheduler*                    cur_sched_ = &sched_;
+    std::atomic<Scheduler*>       issue_sched_{ &sched_ };
+    Scheduler& lsched() { return *cur_sched_; }
+    const Scheduler& lsched() const { return *cur_sched_; }
+    Scheduler& sched_of(int lane) { return lane <= 0 ? sched_ : *lane_sched_[(size_t)(lane - 1)]; }
+    /* The step loop works on lane `l` (lsched, the plugin's view of the pass: rad_pp_info). */
+    void lane_select(int l);
     std::unique_ptr<IKVManager>   kv_iface_;
     std::unique_ptr<IPrefixCache> pc_iface_;
 
@@ -387,12 +402,13 @@ private:
     /* ---- tp8 S4: the two-node pipeline (engine_node.cpp, abi/rad_pp.h). Unused on one machine
      * (Config::pp_nodes 1): every member is null or zero and no line below runs. */
     std::unique_ptr<net::NodeLink> pp_link_;
-    RadPpRing* pp_send_[RAD_PP_N_RINGS] = {};   /* this node's rings, by crossing and role */
-    RadPpRing* pp_recv_[RAD_PP_N_RINGS] = {};
-    int64_t    pp_ring_cap_[RAD_PP_N_RINGS] = {};
+    /* this node's rings, by ring index (lane * RAD_PP_N_RINGS + crossing; tp8 S5) and role */
+    RadPpRing* pp_send_[RAD_PP_MAX_RING_IX] = {};
+    RadPpRing* pp_recv_[RAD_PP_MAX_RING_IX] = {};
+    int64_t    pp_ring_cap_[RAD_PP_MAX_RING_IX] = {};
     /* The leader: a trunk build made and not yet shipped (it crosses at its release, with the
-     * switches and the PSK plan prepare_release applied). */
-    bool       pp_trunk_pending_ = false;
+     * switches and the PSK plan prepare_release applied). One a lane (tp8 S5); [0] on one lane. */
+    bool       pp_trunk_pending_[RAD_PP_MAX_LANES] = {};
     int64_t    pp_steps_shipped_ = 0, pp_builds_shipped_ = 0;
     bool       pp_closed_ = false;
     /* The PSK plan psk_release handed the plugin for the step being released, for the follower. */
@@ -413,10 +429,11 @@ private:
     std::vector<std::pair<int32_t, int32_t>> pp_clears_;
     /* Review robustness 1(e): the drafter builds made since the last trunk ship, as their frames,
      * sent from the step loop before the next trunk (outside the scheduler's lock). */
-    std::vector<std::pair<int32_t, std::vector<uint8_t>>> pp_draft_q_;
+    std::vector<std::tuple<int32_t, int32_t, std::vector<uint8_t>>> pp_draft_q_;   /* (step, lane, frame) */
     /* The step frame of build `b`: header + PSK plan + clears + wire in `out`, the span (the
      * builder's until its next build) in `span` / `span_n`. */
-    int  pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n);
+    int  pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n,
+                  int lane = 0);
     /* Robustness 5: SIGTERM / SIGINT reached a follower (serve() installs the handler there). */
     bool pp_stop_requested() const;
     bool pp_on() const { return cfg_.pp_nodes == 2; }
@@ -434,8 +451,22 @@ private:
     int  pp_serve_setup();
     /* The leader: every build crosses (BatchBuilder::Wire); a trunk step with `run`, at its
      * release. */
-    int  pp_ship(const RadBatch* b, bool run);
-    void pp_on_build(const RadBatch* b);
+    int  pp_ship(const RadBatch* b, bool run, int lane = 0);
+    void pp_on_build(const RadBatch* b, int lane);
+    /* tp8 S5: the plugin's view of the pass the ranks issue next (rad_pp_info): its lane and part. */
+    void pp_set_pass(int lane, int part);
+    /* tp8 S5: the leader's step loop over lanes (engine_lanes.cpp), and its pieces. */
+    int  step_loop_lanes();
+    int  lane_head(int lane, const RadBatch* b);
+    int  lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on);
+    int  lanes_init(const std::vector<BatchBuilder::RankIO>& rio);
+    void lanes_note(int64_t lane_steps, int64_t rounds_two);
+    /* Stage busy stamps (RADIANCE_PP_STAMPS=path): every pass's host issue-to-done interval on this
+     * node, for the throughput check (both stages busy at once). Host backend only: there a pass runs
+     * on its rank threads, so issue..join is its run. */
+    FILE* pp_stamps_ = nullptr;
+    uint64_t pp_stamp_n_ = 0;
+    void  pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_t t1);
     /* The follower's step loop: replay the leader's builds, run the trunk steps, until the leader
      * stops (0) or the link fails (negative). */
     int  follower_loop();
@@ -534,7 +565,7 @@ private:
      * wants this step committed first. See Scheduler::step_next. */
     int  issue_ahead(const RadBatch** out);
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
-    int  prepare_release(const RadBatch* b);
+    int  prepare_release(const RadBatch* b, bool switches = true);
     /* The fn4 values apply_pending handed over, to their owners (prepare_release; a pipeline's
      * follower after it applied the leader's requests). */
     void fn4_apply_changes(const int* sw);

@@ -24,6 +24,7 @@
 #include "sample/grammar.h"
 #include "sample/sampler.h"
 #include "sched/scheduler.h"
+#include "sched/lanes.h"   /* tp8 S5 */
 #include "rad_builder.h"
 #include "text/chat.h"
 #include "text/chatfmt.h"
@@ -178,6 +179,10 @@ public:
     explicit SchedulerBridge(Scheduler* s, const Sampler* sampler = nullptr,
                              const IdleTiers* tiers = nullptr)
         : s_(s), sampler_(sampler), tiers_(tiers) {}
+    /* tp8 S5: a two-node pipeline's lanes (core/sched/lanes.h): a request goes to the lane
+     * LaneSet::pick names, a cancel or reap to the lane holding it, and the published copies are
+     * every lane's. Null: one scheduler, s_ (the published path). */
+    void set_lanes(const LaneSet* lanes) { lanes_ = lanes && lanes->n() > 1 ? lanes : nullptr; }
 
     int admit(const SamplingParams& sp, std::string* why) const override {
         if (!sampler_) return RAD_OK;
@@ -208,7 +213,10 @@ public:
             (*ids)[i] = ps[i]->id;
             sinks[i] = ps[i]->sink;
         }
-        s_->add_all(ps.data(), n, rc.data());
+        /* tp8 S5: one API request's sequences go to one lane together, admitted before a step of
+         * that lane can see any of them */
+        Scheduler* to = lanes_ ? lanes_->lane(lanes_->pick()) : s_;
+        to->add_all(ps.data(), n, rc.data());
         for (size_t i = 0; i < n; ++i) {
             if (rc[i] >= 0) continue;
             RAD_WARN("server: scheduler refused request %llu: %s",
@@ -220,8 +228,8 @@ public:
         }
     }
 
-    void cancel(uint64_t id) override { s_->cancel(id); }
-    void reap(uint64_t id) override { s_->reap(id); }
+    void cancel(uint64_t id) override { at(id)->cancel(id); }
+    void reap(uint64_t id) override { at(id)->reap(id); }
 
     int64_t reset_prefix_cache() override { return s_->reset_prefix_cache(); }
 
@@ -296,7 +304,8 @@ public:
      * running request whose prompt is not yet all in the KV. The table reports it separately. */
     int requests(std::vector<RequestStat>* out) const override {
         std::vector<Scheduler::ReqStat> raw(256);
-        const int n = s_->observed_requests(raw.data(), (int)raw.size());
+        const int n = lanes_ ? lanes_->observed_requests(raw.data(), (int)raw.size())
+                             : s_->observed_requests(raw.data(), (int)raw.size());
         out->clear();
         out->reserve((size_t)n);
         for (int i = 0; i < n; ++i) {
@@ -333,12 +342,19 @@ public:
     /* Both read the copy the engine thread publishes (Scheduler::publish), never the
      * scheduler's live state: every caller is an observer. */
     SchedMetrics metrics() const override {
-        return bridge_metrics(s_->observed_metrics());
+        return bridge_metrics(lanes_ ? lanes_->observed_metrics() : s_->observed_metrics());
     }
 
 private:
+    /* The lane holding `id` (tp8 S5), else s_. */
+    Scheduler* at(uint64_t id) const {
+        if (!lanes_) return s_;
+        Scheduler* o = lanes_->owner(id);
+        return o ? o : s_;
+    }
     /* Declared in the constructor's initialiser order (-Wreorder). */
     Scheduler*            s_;
+    const LaneSet*        lanes_ = nullptr;
     const Sampler*        sampler_ = nullptr;
     const IdleTiers*      tiers_ = nullptr;
     /* Ids start at 1: zero is the "no request" value the sink and the metrics use. */

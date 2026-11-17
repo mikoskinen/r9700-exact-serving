@@ -50,7 +50,10 @@ struct PpGlobal {
     std::atomic<int>     nodes{ 1 }, rank{ 0 }, cut_h{ 0 }, cut_t{ 0 }, link{ 0 };
     std::atomic<int64_t> row_bytes[RAD_PP_N_RINGS] = {};
     std::atomic<int>     parts[RAD_PP_N_RINGS] = {};
-    std::atomic<RadPpRing*> ring[RAD_PP_N_RINGS] = {};
+    /* tp8 S5: every lane's rings (ring index lane * RAD_PP_N_RINGS + crossing), the lanes, and the
+     * lane and part of the pass the ranks issue now (Engine::pp_set_pass, with every rank parked). */
+    std::atomic<RadPpRing*> ring[RAD_PP_MAX_RING_IX] = {};
+    std::atomic<int>     lanes{ 1 }, lane{ 0 }, part{ RAD_PP_PART_WHOLE };
 };
 PpGlobal& pp_g() { static PpGlobal g; return g; }
 }  /* namespace */
@@ -64,9 +67,19 @@ extern "C" int rad_pp_info(RadPpInfo* out) {
     out->cut_h = g.cut_h.load();
     out->cut_t = g.cut_t.load();
     out->link = g.link.load();
-    for (int i = 0; i < RAD_PP_N_RINGS; ++i) out->ring[i] = g.ring[i].load();
+    out->lanes = g.lanes.load();
+    const int lane = std::min(std::max(g.lane.load(), 0), RAD_PP_MAX_LANES - 1);
+    out->lane = lane;
+    out->part = g.part.load();
+    for (int i = 0; i < RAD_PP_N_RINGS; ++i) out->ring[i] = g.ring[lane * RAD_PP_N_RINGS + i].load();
     return 0;
 }
+
+namespace rad {
+/* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
+ * head and tail share their batch). RAD_PP_PART_WHOLE on one machine and on one lane. */
+int pp_pass_part() { return pp_g().part.load(std::memory_order_relaxed); }
+}  /* namespace rad */
 
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
     if (ring < 0 || ring >= RAD_PP_N_RINGS || row_bytes < 0) return;
@@ -96,7 +109,7 @@ struct StepHdr {
     int32_t  psk_n = 0;
     int64_t  psk_dec = 0;
     int32_t  n_clears = 0;      /* (group, slot) pairs after the PSK plan: state slots to zero first */
-    int32_t  pad = 0;
+    int32_t  lane = 0;          /* tp8 S5: the lane whose builder and rings the step is (0 on one lane) */
     /* Review F2 / F3: the leader's switch REQUESTS (fn4::requests), not its applied values: a lever
      * the leader does not declare reads 0 there and must not turn the follower's off. */
     uint32_t fn4_n[kMaxFn4] = {};
@@ -203,10 +216,28 @@ int Engine::pp_check() {
     g.cut_h = cfg_.pp_cut_h;
     g.cut_t = cfg_.pp_cut_t;
     g.link = cfg_.node_link;
-    decide("two-node pipeline", fmt("%s of W(%d,%d), link %s", role(cfg_.pp_rank), cfg_.pp_cut_h,
-                                    cfg_.pp_cut_t, cfg_.node_link ? "verbs" : "tcp"),
+    /* tp8 S5: lanes (core/sched/lanes.h) */
+    n_lanes_ = cfg_.pp_lanes_now();
+    if (n_lanes_ > 1) {
+        if (cfg_.max_seqs < n_lanes_) {
+            RAD_ERR("--pp-lanes %d needs at least as many sequences (--max-num-seqs %lld): every lane holds its own",
+                    n_lanes_, (long long)cfg_.max_seqs);
+            return RAD_E_INVAL;
+        }
+        if (!cfg_.expert_stats.empty()) {
+            RAD_ERR("two-node pipeline (tp8 S5): --expert-stats counts a lane step's two leader passes as two steps; "
+                    "start it with --pp-lanes 1");
+            return RAD_E_UNSUPPORTED;
+        }
+    }
+    g.lanes = n_lanes_;
+    decide("two-node pipeline", fmt("%s of W(%d,%d), link %s, %d lane%s", role(cfg_.pp_rank), cfg_.pp_cut_h,
+                                    cfg_.pp_cut_t, cfg_.node_link ? "verbs" : "tcp", n_lanes_, n_lanes_ == 1 ? "" : "s"),
            fmt("the follower holds layers [%d, %d), the leader every other layer, the embedding and "
-               "the head; a step crosses twice", cfg_.pp_cut_h, cfg_.pp_cut_t));
+               "the head; a step crosses twice%s", cfg_.pp_cut_h, cfg_.pp_cut_t,
+               n_lanes_ > 1 ? fmt("; %d lanes, each a scheduler with one step in flight, so both nodes work at "
+                                  "once on different lanes (tp8 S5)", n_lanes_).c_str()
+                            : "; one step in flight (--pp-lanes 1)"));
     return RAD_OK;
 }
 
@@ -348,7 +379,8 @@ int Engine::pp_serve_setup() {
         return RAD_E_UNSUPPORTED;
     }
     PpGlobal& g = pp_g();
-    /* ---- the rings: this node's ring of each crossing, sized for the plugin's rows */
+    /* ---- the rings: this node's ring of each crossing, sized for the plugin's rows; one pair a lane
+     * (tp8 S5), so each ring has at most one payload in flight as with one lane */
     for (int id = 0; id < RAD_PP_N_RINGS; ++id) {
         const int64_t rb = g.row_bytes[id].load();
         const int parts = std::max(1, g.parts[id].load());
@@ -359,19 +391,22 @@ int Engine::pp_serve_setup() {
         }
         /* + each part's alignment + the payload's trailer (review F6) */
         const int64_t cap = rb * cfg_.max_tok + (int64_t)parts * RAD_PP_PART_ALIGN + RAD_PP_TRAILER;
-        pp_ring_cap_[id] = cap;
-        void* mem = rad_dev_alloc(RAD_PP_RING_HDR + cap, RAD_MEM_HOST_PINNED);
-        if (!mem) {
-            RAD_ERR("two-node pipeline: no pinned host memory for crossing X%d's ring (%s)", id + 1,
-                    humanb(RAD_PP_RING_HDR + cap).c_str());
-            return RAD_E_NOMEM;
+        for (int lane = 0; lane < n_lanes_; ++lane) {
+            const int ix = lane * RAD_PP_N_RINGS + id;
+            pp_ring_cap_[ix] = cap;
+            void* mem = rad_dev_alloc(RAD_PP_RING_HDR + cap, RAD_MEM_HOST_PINNED);
+            if (!mem) {
+                RAD_ERR("two-node pipeline: no pinned host memory for crossing X%d's ring of lane %d (%s)", id + 1,
+                        lane, humanb(RAD_PP_RING_HDR + cap).c_str());
+                return RAD_E_NOMEM;
+            }
+            RadPpRing* r = static_cast<RadPpRing*>(mem);
+            /* X1 goes leader -> follower, X2 follower -> leader. */
+            const bool sends = (id == RAD_PP_X1) == pp_leader();
+            net::ring_init(r, id, (uint64_t)cap, sends ? 0 : cfg_.tp,
+                           (uint64_t)env_ms("RADIANCE_PP_RECV_DEADLINE_MS", 600000));
+            (sends ? pp_send_ : pp_recv_)[ix] = r;
         }
-        RadPpRing* r = static_cast<RadPpRing*>(mem);
-        /* X1 goes leader -> follower, X2 follower -> leader. */
-        const bool sends = (id == RAD_PP_X1) == pp_leader();
-        net::ring_init(r, id, (uint64_t)cap, sends ? 0 : cfg_.tp,
-                       (uint64_t)env_ms("RADIANCE_PP_RECV_DEADLINE_MS", 600000));
-        (sends ? pp_send_ : pp_recv_)[id] = r;
     }
     /* ---- rendezvous 2: what both carved and laid out */
     net::Facts f;
@@ -395,6 +430,7 @@ int Engine::pp_serve_setup() {
         f.add("kv tokens", std::to_string(tokens));
     }
     f.add("step batch layout", fmt("%016llx", (unsigned long long)sched_.wire_layout()));
+    f.add("lanes", std::to_string(n_lanes_));
     for (int id = 0; id < RAD_PP_N_RINGS; ++id)
         f.add(fmt("crossing X%d", id + 1), fmt("%lld bytes a row in %d part(s)", (long long)g.row_bytes[id].load(),
                                                g.parts[id].load()));
@@ -457,6 +493,7 @@ int Engine::pp_serve_setup() {
                 ids[(size_t)p.index] = slots[(size_t)p.index] = p.n_states;
             }
         }
+        for (int lane = 1; lane < n_lanes_; ++lane) sched_of(lane).set_wire_limits(ids, slots);
         sched_.set_wire_limits(std::move(ids), std::move(slots));
     }
     /* ---- the verbs data path, then the link's threads */
@@ -469,8 +506,8 @@ int Engine::pp_serve_setup() {
         const char* dev = std::getenv("RADIANCE_PP_DEV");
         const char* gid = std::getenv("RADIANCE_PP_GID");
         std::unique_ptr<net::DataPath> dp =
-            net::verbs_open(*pp_link_, dev ? dev : "auto", ip, gid ? std::atoi(gid) : -1, pp_send_,
-                            pp_recv_, &err);
+            net::verbs_open_n(*pp_link_, dev ? dev : "auto", ip, gid ? std::atoi(gid) : -1, pp_send_,
+                              pp_recv_, n_lanes_ * RAD_PP_N_RINGS, &err);
         if (!dp) {
             RAD_ERR("two-node pipeline: --node-link verbs: %s", err.c_str());
             return RAD_E_UNSUPPORTED;
@@ -478,7 +515,7 @@ int Engine::pp_serve_setup() {
         RAD_INFO("two-node pipeline: %s", dp->describe().c_str());
         pp_link_->set_data_path(std::move(dp));
     }
-    pp_link_->attach(pp_send_, pp_recv_);
+    pp_link_->attach_n(pp_send_, pp_recv_, n_lanes_ * RAD_PP_N_RINGS);
     /* Review F2 / F3: the follower's answers to the leader's switch asks and its applied values are
      * taken off the leader's receive thread (nothing else reads the leader's control frames while it
      * serves). */
@@ -501,8 +538,15 @@ int Engine::pp_serve_setup() {
             return false;
         };
     pp_link_->start();
-    for (int id = 0; id < RAD_PP_N_RINGS; ++id)
-        g.ring[id] = pp_send_[id] ? pp_send_[id] : pp_recv_[id];
+    /* tp8 S5: RADIANCE_PP_STAMPS=PATH -- every stage pass's busy interval on this node into
+     * PATH.leader / PATH.follower (Engine::pp_stamp), for the host backend's throughput check */
+    if (const char* sp = std::getenv("RADIANCE_PP_STAMPS"); sp && *sp) {
+        const std::string path = fmt("%s.%s", sp, pp_leader() ? "leader" : "follower");
+        pp_stamps_ = std::fopen(path.c_str(), "w");
+        if (pp_stamps_) RAD_INFO("two-node pipeline: stage busy stamps into %s", path.c_str());
+    }
+    for (int ix = 0; ix < n_lanes_ * RAD_PP_N_RINGS; ++ix)
+        g.ring[ix] = pp_send_[ix] ? pp_send_[ix] : pp_recv_[ix];
     /* Ready on both sides before the leader serves. */
     if (pp_link_->send(net::kReady, 0, 0, role(cfg_.pp_rank), (int64_t)std::strlen(role(cfg_.pp_rank))) < 0) {
         RAD_ERR("two-node pipeline: %s", pp_link_->why().c_str());
@@ -514,28 +558,30 @@ int Engine::pp_serve_setup() {
         return RAD_E_IO;
     }
     if (pp_leader()) {
-        sched_.set_build_hook([this](const RadBatch* b) { pp_on_build(b); });
+        for (int lane = 0; lane < n_lanes_; ++lane)
+            sched_of(lane).set_build_hook([this, lane](const RadBatch* b) { pp_on_build(b, lane); });
         /* A switch request names a lever of the whole pipeline: one the leader does not declare (its
          * layers are the follower's) is taken when the follower takes it (fn4::check). */
         fn4::set_peer_check([this](const std::string& n, int v, std::string* why) { return pp_peer_check(n, v, why); });
     }
     RAD_INFO("two-node pipeline: the %s of W(%d,%d) is ready; link %s:%d (%s), crossings X1 %lld / X2 %lld "
-             "bytes a row (rings %s / %s), KV %lld tokens here, %lld on the peer",
+             "bytes a row (rings %s / %s, %d lane%s), KV %lld tokens here, %lld on the peer",
              role(cfg_.pp_rank), cfg_.pp_cut_h, cfg_.pp_cut_t, cfg_.pp_peer.c_str(), cfg_.pp_port,
              cfg_.node_link ? "verbs" : "tcp", (long long)g.row_bytes[0].load(), (long long)g.row_bytes[1].load(),
-             humanb(pp_ring_cap_[0]).c_str(), humanb(pp_ring_cap_[1]).c_str(), (long long)mine, (long long)peer);
+             humanb(pp_ring_cap_[0]).c_str(), humanb(pp_ring_cap_[1]).c_str(), n_lanes_, n_lanes_ == 1 ? "" : "s",
+             (long long)mine, (long long)peer);
     return RAD_OK;
 }
 
 /* ================================================================== the leader */
-void Engine::pp_on_build(const RadBatch* b) {
+void Engine::pp_on_build(const RadBatch* b, int lane) {
     if (!pp_link_ || !b) return;
-    if (pp_trunk_pending_) {
-        pp_link_->fail("the leader built a pass before its trunk step was released (a schedule this "
-                       "build does not ship)");
+    if (pp_trunk_pending_[lane]) {
+        pp_link_->fail(fmt("lane %d: the leader built a pass before its trunk step was released (a schedule this "
+                           "build does not ship)", lane));
         return;
     }
-    if (b->draft_pass == 0 && b->enc == 0) { pp_trunk_pending_ = true; return; }
+    if (b->draft_pass == 0 && b->enc == 0) { pp_trunk_pending_[lane] = true; return; }
     /* A drafter's pass: its uploads, not its pass, on the follower. Its frame is made here -- the
      * span is the builder's until the next build -- and sent by the step loop before the next trunk
      * step (pp_ship), so no socket write runs inside the scheduler's lock, which every drafter build
@@ -543,23 +589,31 @@ void Engine::pp_on_build(const RadBatch* b) {
     std::vector<uint8_t> fr;
     const char* span = nullptr;
     int64_t n = 0;
-    if (pp_frame(b, false, &fr, &span, &n) < 0) return;
+    if (pp_frame(b, false, &fr, &span, &n, lane) < 0) return;
     const size_t at = fr.size();
     fr.resize(at + (size_t)n);
     if (n > 0) std::memcpy(fr.data() + at, span, (size_t)n);
-    pp_draft_q_.emplace_back(b->step, std::move(fr));
+    pp_draft_q_.emplace_back(b->step, lane, std::move(fr));
 }
 
-int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n) {
+void Engine::pp_set_pass(int lane, int part) {
+    PpGlobal& g = pp_g();
+    g.lane.store(lane, std::memory_order_relaxed);
+    g.part.store(part, std::memory_order_relaxed);
+}
+
+int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n,
+                     int lane) {
     BatchBuilder::Wire w;
     const char* sp = nullptr;
-    if (!sched_.wire_last(&w, &sp) || w.step != b->step || w.draft_pass != b->draft_pass) {
+    if (!sched_of(lane).wire_last(&w, &sp) || w.step != b->step || w.draft_pass != b->draft_pass) {
         pp_link_->fail(fmt("step %d: the build to ship is not the batch's", b->step));
         return RAD_E_STATE;
     }
     StepHdr h;
     h.run = run ? 1 : 0;
     h.step = b->step;
+    h.lane = lane;
     if (run) {
         h.n_fn4 = fn4::kSwitches;
         fn4::requests(h.fn4_n, h.fn4_v);
@@ -598,10 +652,12 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
     return RAD_OK;
 }
 
-int Engine::pp_ship(const RadBatch* b, bool run) {
+int Engine::pp_ship(const RadBatch* b, bool run, int lane) {
     if (!pp_link_) return RAD_OK;
-    /* The drafter builds since the last trunk step, in their order, before this one. */
-    for (auto& [step, fr] : pp_draft_q_) {
+    /* The drafter builds since the last trunk step, in their order, before this one (each names its
+     * lane in its header: the follower replays it into that lane's builder). */
+    for (auto& [step, dlane, fr] : pp_draft_q_) {
+        (void)dlane;
         if (const int st = pp_link_->send(net::kStep, (uint64_t)step, 0, fr.data(), (int64_t)fr.size()); st < 0) {
             pp_draft_q_.clear();
             return st;
@@ -612,7 +668,7 @@ int Engine::pp_ship(const RadBatch* b, bool run) {
     std::vector<uint8_t> head;
     const char* span = nullptr;
     int64_t n = 0;
-    RAD_TRY(pp_frame(b, run, &head, &span, &n));
+    RAD_TRY(pp_frame(b, run, &head, &span, &n, lane));
     const int st = pp_link_->send2(net::kStep, (uint64_t)b->step, run ? 1 : 0, head.data(), (int64_t)head.size(),
                                    span, n);
     if (st < 0) return st;
@@ -659,6 +715,7 @@ int Engine::pp_peer_check(const std::string& name, int v, std::string* why) {
 }
 
 void Engine::pp_close(const char* why) {
+    if (pp_stamps_) { std::fclose(pp_stamps_); pp_stamps_ = nullptr; }
     if (!pp_link_ || pp_closed_) return;
     pp_closed_ = true;
     if (pp_leader()) fn4::set_peer_check(nullptr);
@@ -749,7 +806,13 @@ int Engine::follower_loop() {
         std::memcpy(&w, q, sizeof w);
         q += sizeof w;
         const int64_t span_bytes = (int64_t)(m.body.size() - (size_t)(q - m.body.data()));
-        const RadBatch* b = sched_.wire_replay(w, (const char*)q, span_bytes, h.run != 0);
+        if (h.lane < 0 || h.lane >= n_lanes_) {
+            pp_link_->fail(fmt("step frame %llu names lane %d of %d", (unsigned long long)m.h.seq, h.lane, n_lanes_));
+            return fail_loop(RAD_E_IO);
+        }
+        /* tp8 S5: the lane's own builder and slab; its rings for the pass */
+        Scheduler& ls = sched_of(h.lane);
+        const RadBatch* b = ls.wire_replay(w, (const char*)q, span_bytes, h.run != 0);
         if (!b) {
             pp_link_->fail(fmt("the follower could not replay step %d", h.step));
             return fail_loop(RAD_E_STATE);
@@ -793,10 +856,18 @@ int Engine::follower_loop() {
             if (l >= 0) end = l;
         }
         for (auto& r : ranks_) r->stager.set_layer_end(end);
+        issue_sched_.store(&ls, std::memory_order_release);
+        pp_set_pass(h.lane, RAD_PP_PART_WHOLE);
         issue_what_.store(kIssueFollower, std::memory_order_release);
         step_batch_.store(b, std::memory_order_release);
         barrier_->arrive_and_wait();      /* release the ranks */
         barrier_->arrive_and_wait();      /* and wait for them */
+        /* tp8 S5: busy from X1's arrival (rank 0 took it) to X2's publish (the host backend notes both) */
+        if (pp_stamps_) {
+            const RadPpRing* x1 = pp_recv_[h.lane * RAD_PP_N_RINGS + RAD_PP_X1];
+            const RadPpRing* x2 = pp_send_[h.lane * RAD_PP_N_RINGS + RAD_PP_X2];
+            if (x1 && x2 && x1->taken_ns && x2->ready_ns) pp_stamp("mid", h.lane, h.step, x1->taken_ns, x2->ready_ns);
+        }
         st = step_status_.load(std::memory_order_acquire);
         if (st < 0) {
             RAD_ERR("follower step %d failed: %s -- the pipeline cannot continue", h.step, rad_strerror(st));
