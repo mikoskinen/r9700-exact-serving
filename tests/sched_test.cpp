@@ -13509,6 +13509,97 @@ TEST(lanes_dst_cuts_a_newcomer_beside_decode_rows_on_its_grid_while_the_other_la
     }
 }
 
+/* tp8 dev M5 (RADIANCE_PP_LEND_MIXED=1): a newcomer that option D cuts beside decode rows (sched_bi_chunk 3, lever DST's
+ * sched_mixed_tok 576 -> the 512 grid; and the 2048 grid at the published 2112) lends the pieces one process cuts after its
+ * home step's piece to the other lane, whose decoders keep running beside it: the newcomer's piece ends are one lane's to
+ * the row (the one-process plan), pieces are lent at two lanes, and both lanes' decoders are in every step. */
+TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_ends) {
+    struct Arm { int mixed; int64_t len; };
+    for (const Arm a : { Arm{ 576, 1100 }, Arm{ 576, 2266 }, Arm{ 576, 5000 }, Arm{ 2112, 5000 } }) {
+        std::vector<int64_t> ref;
+        for (int lanes : { 1, 2 }) {
+            DstSwitches restore;
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
+            L.max_tok = 4160;
+            L.max_ctx = 60000;
+            L.stage_rows = 1024;
+            L.seqs = 12;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            L.set.set_lend_mixed(true);
+            CHECK(DstSwitches::set("sched_bi_chunk", 3));
+            CHECK(DstSwitches::set("sched_mixed_tok", a.mixed));
+            std::vector<uint64_t> dec[2];
+            for (int i = 0; i < 8; ++i) {
+                const int l = lanes == 1 ? 0 : i % 2;
+                dec[l].push_back(L.submit(l, 100, 4000, 2000 + 100 * i));
+            }
+            uint64_t p = 0;
+            std::vector<int64_t> ends;
+            int short_steps = 0, lent_in_1 = 0;
+            std::vector<int> fifo;
+            std::vector<char> busy((size_t)lanes, 0);
+            int next = 0;
+            for (int round = 0; round < 3000; ++round) {
+                if (round == 4) p = L.submit(0, a.len, 4);
+                const Request* rp = p ? L.req(0, p) : nullptr;
+                if (rp && rp->n_computed >= a.len) break;
+                std::vector<int> todo;
+                for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+                for (size_t at = 0; at < todo.size(); ++at) {
+                    const int l = todo[at];
+                    if (busy[(size_t)l]) continue;
+                    std::vector<int> order;
+                    for (int j = 1; j < lanes; ++j)
+                        if (!busy[(size_t)((l + j) % lanes)]) order.push_back((l + j) % lanes);
+                    for (int f : fifo) order.push_back(f);
+                    if (!L.plan(l, order)) continue;
+                    for (const StepEntry& e : L.at(l).plan().e)
+                        if (p && e.seq == p && e.is_prefill) {
+                            ends.push_back((int64_t)e.ctx_len + e.n_tokens);
+                            if (l == 1 && e.home == 0) ++lent_in_1;
+                        }
+                    if (lanes == 2 && p && rp && rp->n_computed < a.len) {
+                        int rows = 0;
+                        for (const StepEntry& e : L.at(l).plan().e)
+                            for (uint64_t d : dec[l]) rows += e.seq == d && !e.is_prefill;
+                        short_steps += rows != (int)dec[l].size();
+                    }
+                    busy[(size_t)l] = 1;
+                    fifo.push_back(l);
+                    next = (l + 1) % lanes;
+                }
+                if (fifo.empty()) break;
+                const int l = fifo.front();
+                fifo.erase(fifo.begin());
+                CHECK_OK(L.commit(l, 5));
+                busy[(size_t)l] = 0;
+            }
+            REQUIRE(p != 0);
+            REQUIRE(L.req(0, p) != nullptr);
+            CHECK_EQ(L.req(0, p)->n_computed, a.len);
+            std::string t;
+            for (size_t i = 0; i < ends.size(); ++i) t += fmt(" %lld", (long long)ends[i]);
+            if (lanes == 1) {
+                ref = ends;
+                fprintf(stderr, "    mixed %d, a %lld-token newcomer, 1 lane: ends%s\n", a.mixed, (long long)a.len, t.c_str());
+            } else {
+                if (ends != ref) fprintf(stderr, "    2 lanes ends:%s\n", t.c_str());
+                CHECK(ends == ref);
+                CHECK(L.set.counts().pieces > 0);
+                CHECK(L.set.counts().dpieces > 0);
+                CHECK(lent_in_1 > 0);
+                CHECK_EQ(short_steps, 0);
+                fprintf(stderr, "    mixed %d, a %lld-token newcomer, 2 lanes: the same %zu ends; %lld pieces lent (%d carried by lane 1, "
+                                "%lld from option-D steps), every step with all its lane's decoders: %s\n", a.mixed,
+                        (long long)a.len, ends.size(), (long long)L.set.counts().pieces, lent_in_1,
+                        (long long)L.set.counts().dpieces, short_steps == 0 ? "yes" : "NO");
+            }
+        }
+    }
+}
+
 /* tp8 loop P6 (cards lq12: lent 2048-row chunks every ~282 ms, the two stages overlapping ~15 %): a chunk another lane lent
  * carries its home request's lever PSK plan (design 2's next target less the chunk end), the value one lane plans for that
  * chunk -- not "no plan", under which the plugin runs design 1's cone over every lent chunk's end. ds41_psk 2 / K 2 on the
