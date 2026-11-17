@@ -80,11 +80,11 @@ public:
         order_ = std::move(order);
     }
     bool split_on() const { return split_on_; }
-    /* tp8 prefill P1 (RADIANCE_PP_SPAN=0): a lone prefill under lanes plans one checkpoint interval a chunk instead of
-     * --prefill-span's span (the published host-staged build's own grid: its cold 16k is 2048 x 7 + 1441), so the lanes
-     * keep two of its chunks in flight where a span chunk (4,096 rows) went only to an idle lane and filled the window
-     * pool at three. Default on (1): a lone prefill spans as on one machine. Every chunk boundary stays an interval
-     * boundary, the plan the one-process grid's (Scheduler::alone_spans). */
+    /* tp8 prefill P1 (RADIANCE_PP_SPAN=0): a lone prefill under lanes plans --prefill-span's span pieces and cuts each at
+     * its interior checkpoint-interval boundaries that leave >= 128 rows a side (Scheduler::plan_chunk, lane_span_cut):
+     * every boundary of the span plan stays, the pieces between are whole intervals, so the lanes keep two of its chunks
+     * in flight where a span chunk (4,096 rows) went only to an idle lane and filled the window pool at three. (Before
+     * FINDINGS F3 21:38 it dropped the span: 64k's tail became 512 + 114 rows, its text moved.) Default on (1): spans. */
     bool span_on() const { return span_on_; }
     void set_span(bool on) { span_on_ = on; }
     /* tp8 loop M2 (RADIANCE_PP_LEND_BUSY=0): a chunk is lent only to a lane with no request of its own running or

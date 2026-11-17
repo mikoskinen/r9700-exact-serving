@@ -1168,8 +1168,10 @@ private:
     /* The chunk an idle engine (one process, this prompt alone) plans from position `n` of `r`, and the snapshot its
      * end takes (as bi_chunk_plan's alone piece; lever PSK design 2's targets applied): the one-process grid */
     int64_t lane_alone_chunk(const SchedReq& s, Request& r, int64_t target, int64_t n, int64_t* ckpt);
-    /* tp8 prefill P1: whether r's alone piece spans (--prefill-span; none under lanes with RADIANCE_PP_SPAN=0) */
+    /* tp8 prefill P1: whether r's alone piece spans (--prefill-span's rule) */
     bool alone_spans(const Request& r, int64_t target) const;
+    /* tp8 prefill P1: RADIANCE_PP_SPAN=0 under lanes -- plan_chunk cuts a span piece at an interior interval boundary */
+    bool lane_span_cut() const;
     void    lane_return_pieces();
     /* What lane_split_own lent this step, so a step whose build fails takes it back (lane_unsplit_own):
      * nothing of that step ran, so a piece left in another lane would run past rows never computed. */
