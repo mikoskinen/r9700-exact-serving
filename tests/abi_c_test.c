@@ -18,6 +18,7 @@
 #include "rad_spechub.h"
 #include "rad_types.h"
 #include "rad_yarn.h"
+#include "rad_pp.h"
 
 #include "abi_layout.h"
 
