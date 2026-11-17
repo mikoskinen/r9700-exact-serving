@@ -18,8 +18,8 @@
  *               `taken[rank]` + 1 (release) and resets the counter.
  *
  * Failure. A wait that sees `abort`, or runs past the ring's deadline (wall_clock64 against the
- * card's wall clock rate), or a header that is not this step's, stores `abort` = 2 / 3 / 4 into the
- * ring and copies nothing; the core checks the abort words after the step's readback (the leader)
+ * card's wall clock rate), or a header that is not this step's, or a trailer that is not the payload
+ * waited for (review F6), stores `abort` = 2 / 3 / 4 / 5 into the ring and copies nothing; the core checks the abort words after the step's readback (the leader)
  * and before sending a payload (the link's proxy), so a step that crossed nothing is never read as
  * a result. Counters are read at run time, so a recorded pass replays.
  *
@@ -38,7 +38,9 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <map>
 #include <mutex>
+#include <tuple>
 
 namespace {
 
@@ -107,12 +109,15 @@ __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Part
         if (done == gridDim.x) {
             *counter = 0u;
             if (ok) {
+                /* review F6: the payload's number in its trailer, before `ready` */
+                const uint64_t seq = ld_sys(&r->ready) + 1;
+                st_sys(reinterpret_cast<volatile uint64_t*>(reinterpret_cast<char*>(r) + RAD_PP_RING_HDR + P.total), seq);
                 r->rows = P.rows;
                 r->parts = (uint64_t)P.n;
                 for (int k = 0; k < P.n; ++k) r->part_bytes[k] = P.bytes[k];
-                r->bytes = P.total;
+                r->bytes = P.total + RAD_PP_TRAILER;
                 __threadfence_system();
-                st_sys(&r->ready, ld_sys(&r->ready) + 1);
+                st_sys(&r->ready, seq);
             }
         }
     }
@@ -124,8 +129,15 @@ __global__ void __launch_bounds__(kThreads) stage_recv_kernel(RadPpRing* r, Part
         const uint64_t want = ld_sys(&r->taken[P.rank]) + 1;
         ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->landed) >= want; }) ? 1 : 0;
         /* This step's payload, or the nodes are out of step. */
-        if (ok && (r->rows != P.rows || r->parts != (uint64_t)P.n || r->bytes != P.total)) {
+        if (ok && (r->rows != P.rows || r->parts != (uint64_t)P.n || r->bytes != P.total + RAD_PP_TRAILER)) {
             st_sys(&r->abort, 4ull);
+            ok = 0;
+        }
+        /* review F6: the payload waited for, not a stale one of the same shape (its trailer, one
+         * system-scope load after the acquire of `landed`) */
+        if (ok && ld_sys(reinterpret_cast<const volatile uint64_t*>(reinterpret_cast<const char*>(r) + RAD_PP_RING_HDR +
+                                                                     P.total)) != want) {
+            st_sys(&r->abort, 5ull);
             ok = 0;
         }
     }
@@ -152,21 +164,24 @@ __global__ void __launch_bounds__(kThreads) stage_recv_kernel(RadPpRing* r, Part
     }
 }
 
-/* One 4-byte counter a (device, op): the blocks of a launch count themselves in it and the last
- * resets it, so consecutive launches on one stream share it. Allocated once a card, never freed
- * (a few bytes for the process's life). */
-uint32_t* counter_for(int dev, int which) {
+/* One 4-byte counter a (device, ring, op): the blocks of a launch count themselves in it and the last
+ * resets it, so consecutive launches on one ring share it. Keyed by the ring too (review robustness
+ * 7): two rings' stage ops in flight on one card at once (S5's lanes, each with its own rings, on
+ * their own streams) never count into one counter, so no launch can see another's blocks as its own.
+ * Allocated once a (card, ring), never freed (a few bytes for the process's life). */
+uint32_t* counter_for(int dev, const void* ring, int which) {
     static std::mutex mu;
-    static uint32_t* c[64][2] = {};
-    if (dev < 0 || dev >= 64) return nullptr;
+    static std::map<std::tuple<int, const void*, int>, uint32_t*> c;
+    if (dev < 0) return nullptr;
     std::lock_guard<std::mutex> lk(mu);
-    if (!c[dev][which]) {
+    uint32_t*& slot = c[std::make_tuple(dev, ring, which)];
+    if (!slot) {
         void* p = nullptr;
         if (hipMalloc(&p, 64) != hipSuccess) return nullptr;
         if (hipMemset(p, 0, 64) != hipSuccess) return nullptr;
-        c[dev][which] = static_cast<uint32_t*>(p);
+        slot = static_cast<uint32_t*>(p);
     }
-    return c[dev][which];
+    return slot;
 }
 
 uint64_t ticks_per_ms(int dev) {
@@ -201,7 +216,7 @@ int collect(const RadArgs* a, const RadPpRing* r, Parts* P) {
         ++P->n;
     }
     if (P->n == 0 || rows < 0) return RAD_E_SHAPE;
-    if (P->total > r->cap) return RAD_E_FULL;
+    if (P->total + RAD_PP_TRAILER > r->cap) return RAD_E_FULL;
     P->rows = (uint64_t)rows;
     return RAD_OK;
 }
@@ -220,7 +235,7 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     if (hipGetDevice(&dev) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
     P.rank = a->rank;
     P.ticks = r->deadline_ms ? r->deadline_ms * ticks_per_ms(dev) : 0;
-    uint32_t* counter = counter_for(dev, send ? 0 : 1);
+    uint32_t* counter = counter_for(dev, r, send ? 0 : 1);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
     const uint64_t words = P.total / 16;
     uint32_t blocks = (uint32_t)((words + kThreads * 4 - 1) / (kThreads * 4));

@@ -77,7 +77,7 @@ int ref_stage_send(const RadArgs* a, RadStream) {
         if (!dense(a->t[1 + i])) return RAD_E_STRIDE;
         total += rad_pp_align(bytes[i]);
     }
-    if (total > r->cap) return RAD_E_FULL;
+    if (total + RAD_PP_TRAILER > r->cap) return RAD_E_FULL;
     /* The last payload must be off the ring (the link sets `sent`). */
     const uint64_t t0 = mono_ms();
     while (__atomic_load_n(&r->sent, __ATOMIC_ACQUIRE) < r->ready) {
@@ -93,10 +93,14 @@ int ref_stage_send(const RadArgs* a, RadStream) {
         r->part_bytes[i] = bytes[i];
         off += rad_pp_align(bytes[i]);
     }
+    /* review F6: the payload's number in its trailer */
+    const uint64_t seq = r->ready + 1;
+    std::memset(dst + total, 0, RAD_PP_TRAILER);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(dst + total), seq, __ATOMIC_RELEASE);
     r->rows = (uint64_t)rows;
     r->parts = (uint64_t)n;
-    r->bytes = total;
-    __atomic_store_n(&r->ready, r->ready + 1, __ATOMIC_RELEASE);
+    r->bytes = total + RAD_PP_TRAILER;
+    __atomic_store_n(&r->ready, seq, __ATOMIC_RELEASE);
     return RAD_OK;
 }
 
@@ -125,8 +129,10 @@ int ref_stage_recv(const RadArgs* a, RadStream) {
     }
     /* The sender's rows and layout must be this step's: a mismatch is a schedule bug (the two
      * nodes are not running the same step), never something to copy past. */
-    if (r->rows != (uint64_t)rows || r->bytes != total || r->parts != (uint64_t)n) return RAD_E_SHAPE;
+    if (r->rows != (uint64_t)rows || r->bytes != total + RAD_PP_TRAILER || r->parts != (uint64_t)n) return RAD_E_SHAPE;
     const char* src = reinterpret_cast<const char*>(r) + RAD_PP_RING_HDR;
+    /* review F6: the payload waited for, not a stale one of the same shape */
+    if (__atomic_load_n(reinterpret_cast<const uint64_t*>(src + total), __ATOMIC_ACQUIRE) != want) return RAD_E_STATE;
     uint64_t off = 0;
     for (int i = 0; i < n; ++i) {
         std::memcpy(a->t[1 + i].data, src + off, (size_t)bytes[i]);

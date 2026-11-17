@@ -2812,9 +2812,14 @@ number).
   the last one off (`sent`). Only rank `sender` (default 0) writes; the residual stream is
   replicated over the tensor-parallel ranks (spec §9), so one copy crosses.
 - `stage_recv` waits until the other node's payload has `landed`, checks that its rows, parts and
-  bytes are this step's (a mismatch is two nodes out of step, a failure, never a copy), copies it
-  out and counts the rank in `taken`. Every rank receives. It fails on the ring's `abort` word, which
-  the link sets when the peer is gone, and past the ring's deadline.
+  bytes are this step's (a mismatch is two nodes out of step, a failure, never a copy) and that its
+  trailer holds the number of the payload it waits for (a stale or overwritten payload of the same
+  shape, a failure), copies it out and counts the rank in `taken`. Every rank receives. It fails on
+  the ring's `abort` word, which the link sets when the peer is gone, and past the ring's deadline.
+- A payload ends in a `RAD_PP_TRAILER` (64-byte) trailer at the aligned end of its parts, whose
+  first word is the payload's number (`ready` + 1); the ring's `bytes` counts it. A card that gives
+  up stores `abort` 2 (the abort seen), 3 (the deadline), 4 (another step's shape) or 5 (a stale
+  trailer).
 
 The counters are read and written by the kernels themselves at run time, so a recorded pass
 replays. Neither op has a cold form (its ring belongs to a running core): the shape hooks answer

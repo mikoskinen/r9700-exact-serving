@@ -38,6 +38,11 @@ extern "C" {
 #define RAD_PP_MAX_PARTS  8
 /* Each part of a payload starts on this boundary. */
 #define RAD_PP_PART_ALIGN 256
+/* A payload ends in a trailer of this many bytes at the aligned end of its parts: its first word is
+ * the payload's number (the sender's `ready` + 1), which the receiver compares with the payload it
+ * waits for, so a stale or torn payload whose header happens to match is refused (review F6).
+ * `bytes` counts it; a ring holds it (the core sizes rings for it). */
+#define RAD_PP_TRAILER    64
 
 enum { RAD_PP_X1 = 0, RAD_PP_X2 = 1, RAD_PP_N_RINGS = 2 };
 
@@ -49,7 +54,10 @@ typedef struct RadPpRing {
     uint64_t          pad0[6];
     volatile uint64_t landed;         /* receive ring: payloads the link has written in full */
     uint64_t          pad1[7];
-    volatile uint64_t abort;          /* nonzero: the link is down; stage_recv fails the pass */
+    volatile uint64_t abort;          /* nonzero: the link is down; stage_recv fails the pass. A stage
+                                       * op that gives up stores 2 (abort seen), 3 (its deadline), 4 (a
+                                       * payload of another step's shape), 5 (a stale payload: its
+                                       * trailer is not the number waited for) */
     uint64_t          pad2[7];
     volatile uint64_t taken[RAD_PP_MAX_RANKS]; /* receive ring: payloads rank r has copied out */
     uint64_t magic;                   /* RAD_PP_RING_MAGIC once the core has set the ring up */
