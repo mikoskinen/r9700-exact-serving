@@ -683,6 +683,10 @@ public:
      * step takes is room the experts lose for it, which on a short prompt costs more than the span
      * saves (Engine::serve). */
     void    set_span_min(int64_t tokens);
+    /* Lever TI (ds41-pf2, fn4 sched_tail_inner): set once by the engine after init when the snapshot of a row inside a
+     * step can be saved whole (Engine::save_checkpoints: no CONV group, or a plugin serving its window,
+     * fn4::ckpt_conv_src); without it the switch acts as 0. */
+    void    set_tail_inner_capable(bool ok);
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
      * to prefill, so the next step most likely carries a chunk the stager arms for. */
     bool    prefill_continues() const;
@@ -766,6 +770,13 @@ private:
      * declined. */
     int           tail_grid_sw_ = 0;
     mutable int64_t tg_n_[8] = {};
+    /* Lever TI (fn4 sched_tail_inner, read at every step planned): the switch in force (0 unless capable), whether the
+     * engine can save a snapshot inside a step, and the rows a chunk may run whole to take lever G's tail inside it (the
+     * room of the step being planned, set around bi_chunk_plan / bypass_piece's plan_chunk; unbounded elsewhere, where
+     * plan_chunk's own budget is the room). */
+    int           tail_inner_sw_ = 0;
+    bool          tail_inner_ok_ = false;
+    int64_t       ti_limit_ = INT64_MAX;
     /* A request has latched the lever in this process: snapshots off the resume grid may exist (admit_one's short-resume
      * rule and plan_chunk's off-grid start act only then, so the switch at 0 from start is today's scheduler). */
     bool          tg_seen_ = false;

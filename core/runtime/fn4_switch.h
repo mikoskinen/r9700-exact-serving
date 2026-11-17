@@ -602,7 +602,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -696,6 +696,20 @@ static constexpr int kTailGridCounts = 8;
 inline bool tail_grid_ok(int v) { return v == 0 || v == 256 || v == 512 || v == 1024 || v == 2048; }
 int  sched_tail_grid();
 void note_sched_tail_grid(const int64_t* v);
+/* Lever TI (ds41-pf2, sched_tail_inner; 79 here, after exl3_xr): 1 takes lever G's fine tail snapshot INSIDE the prompt's
+ * last chunk instead of cutting the chunk there (Scheduler::plan_chunk), where the engine can save the snapshot's state at
+ * that row (Engine::save_checkpoints: the window pages are held through the chunk; a CONV group's window is patched from
+ * the plugin's rad_ckpt_conv_src; a LINEAR state is the chunk end's, which a resume at a multiple of every ratio never
+ * reads -- deepseek41's compressor tails). 0 = today (the cut). RADIANCE_SCHED_TAIL_INNER=1 at start. */
+int  sched_tail_inner();
+/* Lever TI: the plugin's source of a CONV group's window at a row inside a step (rad_ckpt_conv_src): for rank `rank`, the
+ * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
+ * (conv_width - 1). 1 when a plugin serves it, else 0. */
+int  ckpt_conv_src(int rank, const void** ids, int* ctx);
+/* Lever SAL (ds41-pf2, stage_lone; 80 here, after sched_tail_inner): 1 = lever SA's stage_short arms the prefill stager only on a
+ * step with no decode rows (a lone prefill's chunk at the span's shared level: a prompt shorter than the span's minimum, a long
+ * prompt's first interval, a turn's tail), never beside decoding sequences; 0 = stage_short as built (any step it admits). The
+ * engine's (handed over at a step release, as stage_short). */
 static constexpr int kNoaCounts = 10;   /* admitted, pieces, rows, displaced, waited, steps, pf_steps_1 .. 4plus */
 void note_sched_noa(const int64_t* v);
 /* Lever CAP48 (sched_row_cap): the switch once set, else RADIANCE_DECODE_ROW_CAP (0 .. 4096) at start, else 0 (off). The

@@ -8579,3 +8579,98 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
     CHECK(!kvstream_op_gated(ctx, "kv_store"));
     CHECK(!kvstream_op_gated(ctx, "attn_paged"));
 }
+
+/* Lever TI (ds41-pf2): a snapshot taken at a row inside the step that wrote the state. checkpoint_patch_conv overwrites the
+ * first ctx 4-byte ids of every layer row of each CONV group in the slot (the window a prefill leaves at offset zero) with
+ * the given ids, behind the save on the same stream; the rest of each row, and every LINEAR row, stay the save's. Refused:
+ * no ids, ctx 0, more ids than a row holds, a slot the store does not hold, CONV rows that are not 4-byte ids. */
+static std::vector<KVGroupInfo> engram_conv_groups() {
+    std::vector<KVGroupInfo> g = hybrid_groups();
+    KVGroupInfo cv;
+    cv.name = "engram_tokens";
+    cv.decl.kind = RAD_KV_CONV;
+    cv.decl.dtype = RAD_I32;
+    cv.decl.n_head_kv = 1;
+    cv.decl.head_dim = 1;
+    cv.decl.conv_width = 3;
+    cv.layers = { 5, 6 };
+    g.push_back(cv);
+    return g;
+}
+
+TEST(lever_ti_a_patch_writes_the_conv_window_of_a_row_inside_the_step) {
+    if (!host_backend_or_skip("the conv patch")) return;
+    Fixture f;
+    f.cfg.n_spec = 2;
+    f.cfg.checkpoint_slots = 4;
+    REQUIRE_EQ(f.build_groups(engram_conv_groups()), RAD_OK);
+    const KVGroupPlan* lin = f.kv.plan(G_GDN);
+    const KVGroupPlan* cv = f.kv.plan(G_CV);
+    REQUIRE(lin && cv);
+    REQUIRE_EQ(cv->n_layers, (int64_t)2);
+    REQUIRE_EQ(cv->conv_slots, (int64_t)4);                       /* conv_width - 1 + n_spec */
+    CHECK(f.kv.has_conv_state());
+    CHECK_OK(f.kv.add_sequence(1));
+    CHECK_OK(f.kv.ensure(1, 16));
+    const std::vector<int32_t> a = slots_of(f.kv, 1);
+    fill_states(f.kv, 0);
+    int32_t ck = -1;
+    REQUIRE_EQ(f.kv.alloc_checkpoint(&ck), RAD_OK);
+    unsigned char* blob = (unsigned char*)f.kv.checkpoint_ptr(ck);
+    std::memset(blob, 0xA5, (size_t)f.kv.checkpoint_bytes());
+    RadStream st = nullptr;
+    REQUIRE_EQ(rad_stream_create(&st, 0), RAD_OK);
+    CHECK_OK(f.kv.checkpoint_save(a.data(), (int)a.size(), ck, st));
+    const int32_t ids[2] = { 123456, -7 };
+    CHECK_OK(f.kv.checkpoint_patch_conv(ck, ids, 2, st));
+    CHECK_OK(rad_stream_sync(st));
+    int64_t off = 0, wrong = 0, patched = 0;
+    for (int32_t g : { (int32_t)G_GDN, (int32_t)G_CV }) {
+        const KVGroupPlan* p = f.kv.plan(g);
+        const int64_t lb = p->bytes_per_state / p->n_layers;
+        for (int64_t l = 0; l < p->n_layers; ++l, off += lb)
+            for (int64_t i = 0; i < lb; ++i) {
+                if (g == G_CV && i < 8) {
+                    const unsigned char* w = (const unsigned char*)ids;
+                    wrong += blob[off + i] != w[i];
+                    ++patched;
+                } else {
+                    wrong += blob[off + i] != pat(0, g * 16 + l, a[(size_t)g], i);
+                }
+            }
+    }
+    CHECK_EQ(off, f.kv.checkpoint_bytes());
+    CHECK_EQ(patched, (int64_t)16);
+    CHECK_EQ(wrong, 0ll);
+    /* refusals change nothing */
+    std::vector<unsigned char> keep(blob, blob + f.kv.checkpoint_bytes());
+    CHECK_EQ(f.kv.checkpoint_patch_conv(ck, nullptr, 2, st), RAD_E_INVAL);
+    CHECK_EQ(f.kv.checkpoint_patch_conv(ck, ids, 0, st), RAD_E_INVAL);
+    CHECK_EQ(f.kv.checkpoint_patch_conv(ck, ids, 5, st), RAD_E_INVAL);
+    int32_t gone = -1;
+    REQUIRE_EQ(f.kv.alloc_checkpoint(&gone), RAD_OK);
+    f.kv.free_checkpoint(gone);
+    CHECK_EQ(f.kv.checkpoint_patch_conv(gone, ids, 2, st), RAD_E_INVAL);
+    CHECK_OK(rad_stream_sync(st));
+    CHECK(std::memcmp(keep.data(), blob, keep.size()) == 0);
+    /* a bf16 conv window (a hybrid model's conv1d state) is no id window: refused */
+    Fixture h;
+    h.cfg.n_spec = 2;
+    h.cfg.checkpoint_slots = 4;
+    REQUIRE_EQ(h.build_groups(hybrid_conv_groups()), RAD_OK);
+    CHECK_OK(h.kv.add_sequence(1));
+    CHECK_OK(h.kv.ensure(1, 16));
+    int32_t hk = -1;
+    REQUIRE_EQ(h.kv.alloc_checkpoint(&hk), RAD_OK);
+    CHECK_EQ(h.kv.checkpoint_patch_conv(hk, ids, 2, st), RAD_E_INVAL);
+    /* no conv group: nothing to patch */
+    Fixture n;
+    n.cfg.checkpoint_slots = 4;
+    REQUIRE_EQ(n.build_groups(hybrid_groups()), RAD_OK);
+    CHECK(!n.kv.has_conv_state());
+    int32_t nk = -1;
+    REQUIRE_EQ(n.kv.alloc_checkpoint(&nk), RAD_OK);
+    CHECK_OK(n.kv.checkpoint_patch_conv(nk, ids, 2, st));
+    CHECK_OK(rad_stream_sync(st));
+    rad_stream_destroy(st);
+}

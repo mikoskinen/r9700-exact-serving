@@ -1458,7 +1458,10 @@ int64_t Scheduler::bypass_piece(SchedReq& s, const Request& r, int64_t target, i
         const bool keep = span_now_;
         span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
                     (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+        /* lever TI: only a piece the bypass takes whole (below) */
+        ti_limit_ = std::min<int64_t>(bypass_now_ > 0 ? bypass_now_ : cfg_.max_tok, room);
         const int64_t full = plan_chunk(n, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
+        ti_limit_ = INT64_MAX;
         span_now_ = keep;
         if (full <= 0) return 0;
         pe = n + full;
@@ -1506,7 +1509,11 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
         const bool keep = span_now_;
         span_now_ = bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
                     (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
+        /* lever TI: a tail taken inside the piece only where the whole piece fits this step's room (whole() below), so a
+         * piece cut further keeps its snapshot at an end (bi_ckpt is a piece end); option 4's give is never taken from it */
+        ti_limit_ = (bi_chunk_ == 4 && share) ? 0 : room;
         const int64_t full = plan_chunk(n, chunk_end(r, target), cfg_.max_tok, &ck, r.checkpoint_at, &r);
+        ti_limit_ = INT64_MAX;
         span_now_ = keep;
         if (full <= 0) return 0;
         pe = n + full;
@@ -1782,7 +1789,21 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
         else if (off_grid && n_computed + want < far && n_computed + want > next && n_computed + want < n_target)
             want = (n_computed + want) / I * I - n_computed;   /* a budget cut inside the piece: the last boundary */
         const int64_t tail = tail_checkpoint(n_target, fine);
-        if (tail > n_computed && n_computed + want >= tail) {
+        /* Lever TI (fn4 sched_tail_inner): lever G's fine tail inside the prompt's last chunk, when that chunk reaches the
+         * prompt's end in this plan and fits the step's room (ti_limit_), is taken inside it -- the state after its row
+         * tail - 1 (StepEntry::ckpt_tok), as nearest's window tail is (below) -- and the chunk runs whole instead of in
+         * two steps. Its rows are those of the two pieces (option D's premise: no kernel form depends on a piece's rows
+         * from kBiMinPiece on); the snapshot is the same state (Engine::save_checkpoints: the window rows are held
+         * through the chunk, a CONV window is patched from the plugin's mapped ids at that row, a LINEAR state is the
+         * chunk end's, which a resume at a multiple of every compress ratio never reads -- deepseek41's tails). */
+        /* (beside a spanned lone prefill at any size its plan takes; else at most the span's shared level, so the joined
+         * chunk never takes the full plan -- an arena recall -- that its two pieces would not) */
+        const bool ti = fine > 0 && tail_inner_sw_ > 0 && tail > n_computed && tail < n_target &&
+                        n_computed + want == n_target && n_target - n_computed <= ti_limit_ && !geo_.on_grid(tail) &&
+                        (span_now_ || geo_.shared_tok <= 0 || n_target - n_computed <= geo_.shared_tok);
+        if (ti) {
+            if (checkpoint_pos) *checkpoint_pos = tail;
+        } else if (tail > n_computed && n_computed + want >= tail) {
             want = tail - n_computed;
             if (checkpoint_pos) *checkpoint_pos = tail;
         } else if (periodic && (n_computed + want) % I == 0 && geo_.on_grid(n_computed + want)) {
@@ -2113,6 +2134,13 @@ void Scheduler::set_span_min(int64_t tokens) {
         RAD_INFO("scheduler: --prefill-span: a prefill spans when it is %lld tokens or longer -- "
                  "routed experts are read from host memory, and the arena a spanned step takes is "
                  "room they lose for it", (long long)span_min_);
+}
+
+void Scheduler::set_tail_inner_capable(bool ok) {
+    tail_inner_ok_ = ok;
+    RAD_INFO("scheduler: lever TI (fn4 sched_tail_inner, RADIANCE_SCHED_TAIL_INNER) %s", ok
+             ? "available: lever G's fine tail snapshot can be taken inside the prompt's last chunk, which then runs whole"
+             : "not available here (a CONV window and no plugin serving it at a row inside a step): the switch acts as 0");
 }
 
 void Scheduler::set_stage_rows(int64_t rows) {
@@ -3008,6 +3036,7 @@ const RadBatch* Scheduler::step() {
         bypass_total_ = bypass_now_ > 0 ? fn4::sched_bypass_total() : 0;
         noa_mode_ = fn4::sched_noa();   /* lever NOA */
         tail_grid_sw_ = fn4::sched_tail_grid();   /* lever G: latched by the requests this step admits */
+        tail_inner_sw_ = tail_inner_ok_ ? fn4::sched_tail_inner() : 0;   /* lever TI */
     }
     /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
      * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
@@ -3388,6 +3417,8 @@ const RadBatch* Scheduler::step() {
                 if (noa_pieces_now_ == 0) { ++noa_n_[4]; s.noa_starved = true; }
                 continue;
             }
+            /* lever PSK-CR: no piece crosses a replay's end, as the running loop's (chunk_end stops them there; a guard) */
+            if (r.cr_end > r.n_computed && r.n_computed + want > r.cr_end) want = r.cr_end - r.n_computed;
             int rounds = 0;
             bool got = true;
             while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
@@ -3414,6 +3445,12 @@ const RadBatch* Scheduler::step() {
             e.draft = s.draft;
             e.n_draft = s.n_draft;
             e.is_prefill = true;
+            /* lever PSK-CR: a NOA piece of a cone replay is a replay chunk, as the running loop's and the admission's are --
+             * the batch maps its full-group and linear-state slots to -1 and the plugin cuts it to the replay end's cone. Unset,
+             * the piece ran as an ordinary chunk: it wrote its recomputed global KV and compressor tail over the cached rows
+             * of the sequence and ran uncut, so a replay that took a NOA piece beside another prefill answered differently
+             * from the same request alone (etp/PREFILL-LOADFIX.md: the first differing tensor its layer-2 index selection). */
+            e.cr_replay = r.cr_end > r.n_computed;
             e.ngram = false;
             e.draft_parent = nullptr;
             r.draft_parent = nullptr;
