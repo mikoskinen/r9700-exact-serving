@@ -99,6 +99,10 @@ SchedMetrics LaneSet::observed_metrics() const {
         m.step_ns_decode += o.step_ns_decode;
         m.prompt_tokens += o.prompt_tokens;
         m.checkpoints_written += o.checkpoints_written;
+        /* tp8 M56: the prefix cache's hits are counted by the lane that admitted the request (the cache's own
+         * counts -- evictions, expiries -- are the one cache's, lane 0's copy) */
+        m.attn_cached_tokens += o.attn_cached_tokens;
+        m.linear_cached_tokens += o.linear_cached_tokens;
         m.prefill_tokens += o.prefill_tokens;
         m.decode_tokens += o.decode_tokens;
         m.prefill_tps += o.prefill_tps;

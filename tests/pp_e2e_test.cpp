@@ -872,4 +872,158 @@ TEST(a_prefix_hit_across_the_cut_serves_one_process_tokens) {
     }
 }
 
+/* ------------------------------------------------------------------ tp8 M56: lanes x a general cut */
+namespace {
+const std::vector<std::string> kLanes2 = { "--max-num-seqs", "6", "--pp-lanes", "2" };
+
+/* Every prefill entry ([ctx, ctx + q) with q > 1) of a RADIANCE_LOG_STEPS log, in position order: one process's
+ * "step N prefill ...  [0] slot=s q=Q ctx=C", a lane leader's "lane L step N ...". One request runs, so every one is
+ * its prompt's. */
+std::vector<std::pair<int, int>> chunks_of(const std::string& log) {
+    std::vector<std::pair<int, int>> v;
+    size_t at = 0;
+    while ((at = log.find(" q=", at)) != std::string::npos) {
+        const int q = std::atoi(log.c_str() + at + 3);
+        const size_t c = log.find(" ctx=", at);
+        if (c == std::string::npos) break;
+        const int ctx = std::atoi(log.c_str() + c + 5);
+        if (q > 1) v.emplace_back(ctx, ctx + q);
+        at = c;
+    }
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
+}
+}  /* namespace */
+
+/* Two lanes at the wrap-around cuts W(1,3) and W(2,4), the KV copy on (the follower's copy of the leader's layer
+ * h - 1, written from X1) and checked: the recordings are one process's, every check finds the copy byte-equal, and the
+ * documents' chunks went over both lanes. */
+TEST(two_lanes_at_a_wrap_around_cut_record_one_process_and_keep_the_kv_copy) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("pp_m56_kvc");
+    const std::string ref = record_single(d / "single", { "--max-num-seqs", "6" });
+    REQUIRE(!ref.empty());
+    for (const char* cut : { "1,3", "2,4" }) {
+        const std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        const std::string out = d / (std::string("l2-") + cut);
+        const PipeRun pr = record_pipeline(out, cut, env, kLanes2, kLanes2, env);
+        if (pr.leader != 0 || pr.follower != 0)
+            fprintf(stderr, "    W(%s): leader %d, follower %d\n    leader:\n%s\n    follower:\n%s\n", cut, pr.leader,
+                    pr.follower, tail(pr.llog).c_str(), tail(pr.flog).c_str());
+        CHECK_EQ(pr.leader, 0);
+        CHECK_EQ(pr.follower, 0);
+        std::string why;
+        const bool same = pr.leader == 0 && same_recording(ref, out, &why);
+        size_t eq = 0, at = 0;
+        while ((at = pr.flog.find("on both nodes (", at)) != std::string::npos) { ++eq; ++at; }
+        const long long pieces = log_count(pr.llog, "newcomer split: ");
+        fprintf(stderr, "    2 lanes W(%s): recording %s; %zu KV-copy checks equal; chunks lent %lld\n", cut,
+                same ? "identical" : why.c_str(), eq, pieces);
+        CHECK(same);
+        CHECK(pr.llog.find("2 lanes, each a scheduler") != std::string::npos);
+        CHECK(pieces > 0);
+        CHECK(eq >= 2);
+        CHECK(pr.flog.find("NOT the owner's bytes") == std::string::npos);
+    }
+}
+
+/* A prefix hit with two lanes: requests alone go to lane 0, 1, 0 in turn (RADIANCE_PP_PICK=rr), so the hits are on
+ * blocks another lane's request wrote; the attention-cached counter after them is one process's. Then three at once
+ * (which of them hit then depends on when each lane admits: tokens only). Every greedy token is one process's, at W(0,2)
+ * and the wrap-around W(1,3) with its KV copy and check. */
+TEST(a_prefix_hit_with_two_lanes_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> base = prompt_ids(31, 300);
+    std::vector<int32_t> longer = base;
+    const std::vector<int32_t> more = prompt_ids(32, 40);
+    longer.insert(longer.end(), more.begin(), more.end());
+    const std::vector<int32_t> other = prompt_ids(33, 200);
+    auto run = [&](int port, double* hit_alone) {
+        std::vector<std::vector<int32_t>> out;
+        out.push_back(complete(port, base, 16));
+        out.push_back(complete(port, longer, 16));
+        out.push_back(complete(port, base, 8));
+        *hit_alone = metric(get(port, "/metrics"), "radiance:attn_cached_tokens_total");
+        std::vector<std::future<std::vector<int32_t>>> f;
+        for (const std::vector<int32_t>* p : std::vector<const std::vector<int32_t>*>{ &longer, &other, &base })
+            f.push_back(std::async(std::launch::async, [port, p] { return complete(port, *p, 12); }));
+        for (auto& x : f) out.push_back(x.get());
+        return out;
+    };
+    std::vector<std::vector<int32_t>> ref;
+    double hit_ref = -1;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }));
+        ref = run(sv.port, &hit_ref);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+    }
+    CHECK(hit_ref > 0);
+    for (const char* cut : { "0,2", "1,3" }) {
+        Serving sv;
+        const std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LLAMA_PP_KVCOPY=1", "RADIANCE_PP_KV_CHECK=1" });
+        REQUIRE(sv.start(cut, kLanes2, env));
+        double hit = -1;
+        const std::vector<std::vector<int32_t>> got = run(sv.port, &hit);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        const std::string flog = sv.fol.output();
+        int differ = 0;
+        REQUIRE_EQ(ref.size(), got.size());
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        fprintf(stderr, "    2 lanes W(%s): attention-cached prompt tokens alone %.0f (one process %.0f); %d of %zu requests "
+                        "differ\n", cut, hit, hit_ref, differ, ref.size());
+        CHECK_EQ(hit, hit_ref);
+        CHECK_EQ(differ, 0);
+        CHECK(sv.lead.output().find("2 lanes, each a scheduler") != std::string::npos);
+        CHECK(flog.find("NOT the owner's bytes") == std::string::npos);
+    }
+}
+
+/* A cold multi-chunk prompt at two lanes: one process's greedy tokens AND one process's chunk plan -- every chunk the
+ * leader's lanes ran of it is one an idle one-process engine runs (RADIANCE_LOG_STEPS), and the chunks went over both
+ * lanes (tp8 S4 hardware: pieces cut inside one process's chunks moved the cold texts). */
+TEST(a_cold_prompt_at_two_lanes_is_one_processes_tokens_and_chunk_plan) {
+    REQUIRE(world().ok);
+    for (size_t n : { 700, 1000 }) {
+        const std::vector<int32_t> p = prompt_ids(41 + n, n);
+        std::vector<int32_t> ref, got;
+        std::vector<std::pair<int, int>> ref_plan, got_plan;
+        {
+            Serving sv;
+            REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+            ref = complete(sv.port, p, 24);
+            kill(sv.lead.child.pid, SIGTERM);
+            CHECK_EQ(sv.lead.finish(60), 0);
+            ref_plan = chunks_of(sv.lead.output());
+        }
+        for (const char* cut : { "0,2", "1,3" }) {
+            Serving sv;
+            REQUIRE(sv.start(cut, kLanes2, cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1" })));
+            got = complete(sv.port, p, 24);
+            kill(sv.lead.child.pid, SIGTERM);
+            CHECK_EQ(sv.lead.finish(60), 0);
+            CHECK_EQ(sv.fol.finish(30), 0);
+            const std::string llog = sv.lead.output();
+            got_plan = chunks_of(llog);
+            const long long lent = log_count(llog, "newcomer split: ");
+            fprintf(stderr, "    %zu-token prompt, 2 lanes W(%s): %zu chunks (one process %zu), plan %s, tokens %s, chunks "
+                            "lent %lld\n", p.size(), cut, got_plan.size(), ref_plan.size(),
+                    got_plan == ref_plan ? "identical" : "DIFFERENT", got == ref ? "identical" : "DIFFERENT", lent);
+            CHECK(ref_plan.size() >= 4);
+            CHECK(got_plan == ref_plan);
+            CHECK(!ref.empty());
+            CHECK(got == ref);
+            CHECK(lent > 0);
+            CHECK(llog.find("(lane 0's)") != std::string::npos);   /* a chunk ran in the other lane */
+        }
+    }
+}
+
 RAD_TEST_MAIN()
