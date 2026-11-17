@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 /* ================================================================== the plugin's view (rad_pp.h) */
@@ -373,12 +374,14 @@ int Engine::pp_serve_setup() {
         const KVManager& kv = ranks_[0]->kv;
         int64_t tokens = 0;
         for (const KVGroupPlan& p : kv.plans()) {
-            /* Block and state counts too (review F1): an id the leader hands out must exist on
-             * both nodes, zeroed groups included (pp_kv_agree capped both before the carve). */
             f.add(fmt("kv group %d", p.index),
-                  fmt("%s kind %d block %lld window_blocks %lld states %lld blocks %lld", p.name.c_str(),
-                      p.kind, (long long)p.block_size, (long long)p.window_blocks, (long long)p.n_states,
-                      (long long)(p.paged() ? p.n_blocks : 0)));
+                  fmt("%s kind %d block %lld window_blocks %lld states %lld", p.name.c_str(), p.kind,
+                      (long long)p.block_size, (long long)p.window_blocks, (long long)p.n_states));
+            /* Review F1: each group's carve -- block (or state) count and whether this node holds it
+             * -- checked below: an id the leader hands out must exist wherever the follower holds the
+             * group (pp_kv_agree capped both before the carve, so the counts come out equal). */
+            f.add(fmt("kv blocks %d", p.index),
+                  fmt("%lld %d", (long long)(p.paged() ? p.n_blocks : p.n_states), p.zero ? 1 : 0));
             if (p.kind == RAD_KV_FULL && p.block_size > 0 && !p.zero) {
                 const int64_t t = p.n_blocks * p.block_size;
                 if (tokens == 0 || t < tokens) tokens = t;
@@ -396,7 +399,33 @@ int Engine::pp_serve_setup() {
         RAD_ERR("two-node pipeline: the second rendezvous failed: %s", err.c_str());
         return RAD_E_IO;
     }
-    std::vector<std::string> diff = net::differences(f, theirs, { "kv tokens" });
+    std::vector<std::string> own2 = { "kv tokens" };
+    for (const KVGroupPlan& p : ranks_[0]->kv.plans()) own2.push_back(fmt("kv blocks %d", p.index));
+    std::vector<std::string> diff = net::differences(f, theirs, own2);
+    /* The carve rule (review F1), the same verdict on both nodes: wherever the follower holds a
+     * group, the leader's count of it may not exceed the follower's. A group the follower zeroes
+     * (the leader's own sources, the drafter's) it never reads or writes, so its count there is free. */
+    for (const KVGroupPlan& p : ranks_[0]->kv.plans()) {
+        const std::string k = fmt("kv blocks %d", p.index);
+        const std::string* a = f.find(k);
+        const std::string* t = theirs.find(k);
+        long long n_me = -1, n_peer = -1;
+        int z_me = 0, z_peer = 0;
+        if (!a || !t || std::sscanf(a->c_str(), "%lld %d", &n_me, &z_me) != 2 ||
+            std::sscanf(t->c_str(), "%lld %d", &n_peer, &z_peer) != 2) {
+            diff.push_back(fmt("%s: this node '%s', the peer '%s'", k.c_str(), a ? a->c_str() : "none",
+                               t ? t->c_str() : "none"));
+            continue;
+        }
+        const long long lead_n = pp_leader() ? n_me : n_peer, fol_n = pp_leader() ? n_peer : n_me;
+        const bool fol_holds = !(pp_leader() ? z_peer : z_me);
+        if (fol_holds && lead_n > fol_n)
+            diff.push_back(fmt("KV group '%s': the leader can hand out %lld blocks, the follower holds %lld: ids past "
+                               "the follower's carve", p.name.c_str(), lead_n, fol_n));
+        else if (lead_n != fol_n)
+            RAD_INFO("two-node pipeline: KV group '%s' holds %lld blocks on the leader, %lld on the follower, which "
+                     "%s", p.name.c_str(), lead_n, fol_n, fol_holds ? "holds it (more than enough)" : "zeroes it");
+    }
     if (!diff.empty()) {
         for (const std::string& d : diff) RAD_ERR("two-node pipeline: the nodes differ: %s", d.c_str());
         RAD_ERR("two-node pipeline: %zu difference(s) after the KV carve: both refuse to serve", diff.size());
@@ -415,6 +444,7 @@ int Engine::pp_serve_setup() {
         for (const KVGroupPlan& p : ranks_[0]->kv.plans()) {
             if (p.index < 0) continue;
             if ((size_t)p.index >= ids.size()) { ids.resize((size_t)p.index + 1, -1); slots.resize((size_t)p.index + 1, -1); }
+            if (p.zero) continue;   /* nothing carved here, nothing written: no limit */
             if (p.paged() && p.n_blocks > 0 && p.block_size > 0) {
                 ids[(size_t)p.index] = p.n_blocks;
                 slots[(size_t)p.index] = p.n_blocks * p.block_size;
