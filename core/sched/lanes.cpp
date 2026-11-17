@@ -44,7 +44,7 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     const char* lb = std::getenv("RADIANCE_PP_LEND_BUSY");
     lend_busy_ = !(lb && !std::strcmp(lb, "0"));
     const char* lm = std::getenv("RADIANCE_PP_LEND_MIXED");
-    lend_mixed_ = lm && !std::strcmp(lm, "1");
+    lend_mixed_ = lm && !std::strcmp(lm, "1") ? 1 : lm && !std::strcmp(lm, "2") ? 2 : 0;
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
@@ -363,6 +363,13 @@ void Scheduler::lane_split_own() {
             ++c.lst.home;
             if (!c.lst.t0_us) c.lst.t0_us = mono_us();
         }
+        /* tp8 dev M5b (RADIANCE_PP_LEND_MIXED=2): a newcomer's whole rest beside decode rows, cut on the 512 grid */
+        if (lanes_->lend_split() && plan_.phase == RAD_PHASE_MIXED && e.home < 0 && e.is_prefill && e.produces_token &&
+            e.slot >= 0 && (size_t)e.slot < reqs_.size() && reqs_[(size_t)e.slot] && reqs_[(size_t)e.slot]->req &&
+            !e.cr_replay && e.n_spec == 0 && e.ckpt_slot < 0 && e.ckpt_restore < 0) {
+            lane_split_mixed(e);
+            continue;
+        }
         if (e.home >= 0 || !e.is_prefill || e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
         if (e.cr_replay || e.n_spec != 0) continue;
         if (hold && e.ckpt_slot >= 0 && e.ckpt_tok >= 0) {
@@ -473,6 +480,83 @@ void Scheduler::lane_split_own() {
         s.lent_next = (int64_t)e.ctx_len + e.n_tokens;
         kv_->set_keep_floor(r.id, real);
     }
+}
+
+/* tp8 dev M5b: the home's whole-prompt MIXED entry e cut at the 512-grid point nearest its middle with >= 128 rows a side, the
+ * rest lent to the first planner whose inbox is empty and that has no request waiting (a borrower carries one piece and
+ * plans its own work beside it at the published budget); none such, or no grid point: e stays whole (today's plan). The
+ * entry shrinks before the step's rows and the build are counted (Scheduler::step after lane_split_own). */
+void Scheduler::lane_split_mixed(StepEntry& e) {
+    SchedReq& s = *reqs_[(size_t)e.slot];
+    Request& r = *s.req;
+    if (r.embed || r.media || r.token_scores || r.n_draft != 0 || s.lent_hold || s.lent_pending > 0) return;
+    constexpr int64_t G = 512, kMin = 128;
+    const int64_t c = e.ctx_len, end = c + e.n_tokens;
+    int64_t x = 0;
+    for (int64_t g = (c + kMin + G - 1) / G * G; g <= end - kMin; g += G)
+        if (!x || std::llabs(g - (c + end) / 2) < std::llabs(x - (c + end) / 2)) x = g;
+    if (!x) return;
+    const std::vector<int>& order = lanes_->planners_locked();
+    int to = -1;
+    for (int l : order) {
+        const Scheduler* b = lanes_->lane(l);
+        if (b && b->waiting_.empty() && lanes_->inbox_n_locked(l) == 0) { to = l; break; }
+    }
+    if (to < 0) {
+        lane_why(s, LaneSet::kNoLane);
+        return;
+    }
+    const int64_t n = end - x;
+    if (lanes_->inbox_rows_locked(to) + n > (geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok)) {
+        lane_why(s, LaneSet::kRoom);
+        return;
+    }
+    int64_t real = r.n_computed;
+    for (const auto& [slot, rows] : lane_bump_)
+        if (slot == e.slot) real -= rows;
+    const bool fresh_floor = s.lent == 0;
+    if (fresh_floor) kv_->set_keep_floor(r.id, real);
+    if (kv_->ensure_from(r.id, end, x) < 0) {
+        if (fresh_floor) kv_->set_keep_floor(r.id, -1);
+        lane_why(s, LaneSet::kKv);
+        return;
+    }
+    LaneLent undo;
+    undo.slot = e.slot;
+    undo.seq = e.seq;
+    undo.lent = s.lent;
+    undo.lent_pending = s.lent_pending;
+    undo.lent_tok = s.lent_tok;
+    undo.lent_next = s.lent_next;
+    undo.lent_hold = s.lent_hold;
+    LaneSet::Piece pc;
+    pc.home = lane_;
+    pc.e = e;
+    pc.e.ctx_len = (int32_t)x;
+    pc.e.n_tokens = (int32_t)n;
+    pc.e.produces_token = true;
+    pc.e.dev = false;
+    pc.e.ckpt_restore = -1;
+    pc.e.ckpt_slot = -1;
+    pc.e.ckpt_tok = -1;
+    pc.e.n_accepted = 1;
+    lanes_->lend_locked(to, pc);
+    undo.to.emplace_back(to, pc.e.ctx_len);
+    s.lent += (int32_t)n;
+    ++s.lent_pending;
+    undo.rows = n;
+    undo.tok = true;
+    lane_lent_now_.push_back(std::move(undo));
+    lanes_->note_lent_locked(n, true);
+    lanes_->note_dpiece_locked();
+    ++s.lst.lent;
+    s.lent_tok = true;
+    s.lent_next = x;
+    kv_->set_keep_floor(r.id, real);
+    /* the home keeps [c, x): no token this step */
+    e.n_tokens = (int32_t)(x - c);
+    e.produces_token = false;
+    plan_.n_tok -= n;
 }
 
 /* A build that failed after lane_split_own lent this lane's newcomers' next chunks: nothing of the step ran, so the

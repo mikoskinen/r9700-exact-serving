@@ -230,6 +230,10 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     if (!lanes_.lend_busy())
         RAD_INFO("two-node pipeline: a newcomer's chunk is lent only to a lane with no request of its own "
                  "(RADIANCE_PP_LEND_BUSY=0): a decoding lane never carries another lane's chunk");
+    if (lanes_.lend_split())
+        RAD_INFO("two-node pipeline: a newcomer planned whole beside decode rows is cut at the 512-grid point nearest its middle and "
+                 "its rest lent to one lane with an empty inbox and nothing waiting, its first token there (RADIANCE_PP_LEND_MIXED=2, "
+                 "tp8 dev M5b)");
     if (lanes_.lend_mixed())
         RAD_INFO("two-node pipeline: a newcomer that lever BI's option D cuts beside decode rows lends the pieces one process "
                  "cuts next to the lanes that plan next, its first token in the last (RADIANCE_PP_LEND_MIXED=1, tp8 dev M5)%s",
@@ -322,7 +326,9 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
              "waited: %s%s", (long long)lane_steps, (long long)rounds_two, (long long)c.pieces, (long long)c.rows,
              (long long)c.token_pieces, (long long)c.done, why.c_str(),
              lanes_.lend_mixed() ? fmt("; %lld lends from newcomers option D cut beside decode rows (RADIANCE_PP_LEND_MIXED=1, tp8 "
-                                       "dev M5)", (long long)c.dpieces).c_str() : "");
+                                       "dev M5)", (long long)c.dpieces).c_str()
+             : lanes_.lend_split() ? fmt("; %lld newcomers split on the 512 grid beside decode rows (RADIANCE_PP_LEND_MIXED=2, tp8 "
+                                         "dev M5b)", (long long)c.dpieces).c_str() : "");
 }
 
 int Engine::step_loop_lanes() {

@@ -13713,6 +13713,103 @@ TEST(lanes_lend_mixed_lends_a_newcomers_option_d_pieces_and_keeps_its_one_lane_e
     }
 }
 
+/* tp8 dev M5b (RADIANCE_PP_LEND_MIXED=2): the published admission (sched_mixed_tok 2112: a ~1.1k newcomer planned whole beside
+ * decode rows) and, at two / three lanes, the home's entry cut at the 512-grid point nearest its middle (>= 128 rows a side) with
+ * the rest lent to one free lane: every piece end on the 512 grid or the prompt's end, the newcomer admitted in the same round
+ * as one lane admits it, one piece a borrower, both lanes' decoders in every step; with a head-state cut too. */
+TEST(lanes_lend_split_cuts_a_whole_mixed_newcomer_on_the_512_grid_and_lends_its_rest) {
+    struct Arm { int64_t len; bool head; };
+    for (const Arm a : { Arm{ 1100, false }, Arm{ 2266, false }, Arm{ 700, false }, Arm{ 1100, true } }) {
+        int first_round_1 = -1;
+        for (int lanes : { 1, 2, 3 }) {
+            DstSwitches restore;
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
+            L.max_tok = 4160;
+            L.max_ctx = 60000;
+            L.stage_rows = 1024;
+            L.seqs = 12;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            L.set.set_lend_split(lanes > 1);
+            L.set.set_head_state(a.head);
+            CHECK(DstSwitches::set("sched_bi_chunk", 3));
+            std::vector<uint64_t> dec[3];
+            for (int i = 0; i < 8; ++i) {
+                const int l = lanes == 1 ? 0 : i % lanes;
+                dec[l].push_back(L.submit(l, 100, 4000, 2000 + 100 * i));
+            }
+            uint64_t p = 0;
+            std::vector<int64_t> ends;
+            int short_steps = 0, first_round = -1, max_inbox_pieces = 0;
+            std::vector<int> fifo;
+            std::vector<char> busy((size_t)lanes, 0);
+            int next = 0;
+            for (int round = 0; round < 3000; ++round) {
+                if (round == 4) p = L.submit(0, a.len, 4);
+                const Request* rp = p ? L.req(0, p) : nullptr;
+                if (rp && rp->n_computed >= a.len) break;
+                std::vector<int> todo;
+                for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+                for (size_t at = 0; at < todo.size(); ++at) {
+                    const int l = todo[at];
+                    if (busy[(size_t)l]) continue;
+                    std::vector<int> order;
+                    for (int j = 1; j < lanes; ++j)
+                        if (!busy[(size_t)((l + j) % lanes)]) order.push_back((l + j) % lanes);
+                    for (int f : fifo) order.push_back(f);
+                    if (!L.plan(l, order)) continue;
+                    int pieces = 0;
+                    for (const StepEntry& e : L.at(l).plan().e)
+                        if (p && e.seq == p && e.is_prefill) {
+                            ends.push_back((int64_t)e.ctx_len + e.n_tokens);
+                            if (first_round < 0) first_round = round;
+                            if (e.home >= 0) ++pieces;
+                        }
+                    max_inbox_pieces = std::max(max_inbox_pieces, pieces);
+                    if (p && rp && rp->n_computed < a.len) {
+                        int rows = 0;
+                        for (const StepEntry& e : L.at(l).plan().e)
+                            for (uint64_t d : dec[l]) rows += e.seq == d && !e.is_prefill;
+                        short_steps += rows != (int)dec[l].size();
+                    }
+                    busy[(size_t)l] = 1;
+                    fifo.push_back(l);
+                    next = (l + 1) % lanes;
+                }
+                if (fifo.empty()) break;
+                const int l = fifo.front();
+                fifo.erase(fifo.begin());
+                CHECK_OK(L.commit(l, 5));
+                busy[(size_t)l] = 0;
+            }
+            REQUIRE(p != 0);
+            REQUIRE(L.req(0, p) != nullptr);
+            CHECK_EQ(L.req(0, p)->n_computed, a.len);
+            std::string t;
+            for (size_t i = 0; i < ends.size(); ++i) t += fmt(" %lld", (long long)ends[i]);
+            int off = 0;
+            for (int64_t x : ends) off += x != a.len && x % 512 != 0;
+            CHECK_EQ(off, 0);
+            if (lanes == 1) {
+                first_round_1 = first_round;
+                CHECK_EQ(L.set.counts().dpieces, 0ll);
+            } else {
+                /* admitted whole at the published budget, as one lane admits it (the round its lane is free); a newcomer of
+                 * more than one D piece is the existing lend's (2266: D cuts at 2048, the cold-prompt path lends the rest) */
+                CHECK(first_round >= first_round_1 && first_round <= first_round_1 + 1);
+                CHECK(max_inbox_pieces <= 1);
+                if (a.len <= 2048) CHECK(L.set.counts().dpieces > 0);
+                if (a.len <= 2048) CHECK_EQ((int)ends.size(), 2);
+            }
+            CHECK_EQ(short_steps, 0);
+            fprintf(stderr, "    lend split, a %lld-token newcomer%s, %d lane(s): ends%s; admitted round %d; %lld split, %lld pieces lent; "
+                            "decoders in every step: %s\n", (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
+                    first_round, (long long)L.set.counts().dpieces, (long long)L.set.counts().pieces, short_steps ? "NO" : "yes");
+        }
+    }
+}
+
 /* tp8 loop P6 (cards lq12: lent 2048-row chunks every ~282 ms, the two stages overlapping ~15 %): a chunk another lane lent
  * carries its home request's lever PSK plan (design 2's next target less the chunk end), the value one lane plans for that
  * chunk -- not "no plan", under which the plugin runs design 1's cone over every lent chunk's end. ds41_psk 2 / K 2 on the
