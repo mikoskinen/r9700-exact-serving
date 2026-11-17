@@ -241,7 +241,11 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     if (!lanes_.span_on())
         RAD_INFO("two-node pipeline: a lone prefill plans one checkpoint interval a chunk, not --prefill-span %d's span "
                  "(RADIANCE_PP_SPAN=0): the lanes run two of its chunks at once", cfg_.prefill_span);
-    else if (lanes_.span_tail() > 0)
+    if (lanes_.span_on() && lanes_.span_short() > 0)
+        RAD_INFO("two-node pipeline: a lone prefill of at most %lld rows plans one checkpoint interval a chunk "
+                 "(RADIANCE_PP_SPAN_SHORT, tp8 loop P7); a longer one --prefill-span %d's span chunks%s",
+                 (long long)lanes_.span_short(), cfg_.prefill_span, lanes_.span_tail() > 0 ? " (and RADIANCE_PP_SPAN_TAIL below)" : "");
+    if (lanes_.span_on() && lanes_.span_tail() > 0)
         RAD_INFO("two-node pipeline: a lone prefill plans --prefill-span %d's span chunks, and one checkpoint interval a "
                  "chunk in its last %lld rows (RADIANCE_PP_SPAN_TAIL, tp8 loop P7): a shorter drain at the prompt's end",
                  cfg_.prefill_span, (long long)lanes_.span_tail());

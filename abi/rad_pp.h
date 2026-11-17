@@ -127,6 +127,18 @@ typedef struct RadPpRing {
     volatile uint64_t staged;                  /* (2) payloads rank `sender` has copied in full, not yet published */
     volatile uint64_t diff_words[RAD_PP_MAX_RANKS]; /* (2) 4-byte words of rank r's share that differed, summed */
     volatile uint64_t cmp_words[RAD_PP_MAX_RANKS];  /* (2) 4-byte words rank r compared, summed */
+    volatile uint64_t diff_part[RAD_PP_MAX_RANKS][RAD_PP_MAX_PARTS]; /* (2) rank r's differing words by part, summed */
+    /* tp8 loop P10 (RADIANCE_PP_SEND_ASYNC=N, a send ring only; 0 from an engine before it): a payload of at least
+     * `async_rows` rows (part 0's) is packed by rank `sender` into `stage_dev` (a buffer of `stage_cap` bytes on that
+     * rank's card, one a node, the core's) on the pass's stream, and copied from there into the ring + published on a
+     * side stream of the card, so the pass's stream goes on with the next pass while the payload crosses PCIe. The
+     * ring's bytes are the same words in the same places (the parts' bytes, packed at the payload's offsets). The core
+     * issues every pass of >= async_rows rows live (never recorded), so a side-stream launch is never left out of a
+     * tape. 0 = every payload on the pass's stream (as before). */
+    uint64_t async_rows;
+    uint64_t stage_dev;
+    uint64_t stage_cap;
+    volatile uint64_t async_sends;             /* payloads sent the async way (the sender's host thread counts) */
 } RadPpRing;
 
 #if defined(__cplusplus)

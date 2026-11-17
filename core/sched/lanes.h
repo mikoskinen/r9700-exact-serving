@@ -95,6 +95,13 @@ public:
      * as RADIANCE_PP_SPAN=0's (cold texts identical at 16k / 64k / 128k, lq19). Default 0: today's plan. */
     int64_t span_tail() const { return span_tail_; }
     void set_span_tail(int64_t rows) { span_tail_ = rows > 0 ? rows : 0; }
+    /* tp8 loop P7 (RADIANCE_PP_SPAN_SHORT=N rows, 0 = off): RADIANCE_PP_SPAN=0's cut for every span piece of a prompt of at
+     * most N rows. On the cards the span plan's step from a 2,048- to a 4,096-row chunk leaves the follower idle ~one
+     * 2,048-row chunk's time once (lq18 / lq25 16k 1.97-1.98 s), which interval chunks avoid (lq19 / lq20 C' 1.84-1.87 s)
+     * at a fixed ~13-23 ms a chunk more on the leader -- the better trade for a short prompt, the worse for a long one
+     * (C' 64k / 128k +2.4 / +1.2 %). Every boundary is the span plan's or an interval boundary. Default 0: today's plan. */
+    int64_t span_short() const { return span_short_; }
+    void set_span_short(int64_t rows) { span_short_ = rows > 0 ? rows : 0; }
     /* tp8 loop M2 (RADIANCE_PP_LEND_BUSY=0): a chunk is lent only to a lane with no request of its own running or
      * waiting. Lent into a lane that decodes, a whole chunk is planned first in that lane's step (lane_reserve) and its
      * decoders ride a MIXED step of up to 2,048 rows: the stall the 20:58 PROFILE measured, now in the lane that had
@@ -193,6 +200,7 @@ private:
     bool    split_on_ = true;
     bool    span_on_ = true;                /* RADIANCE_PP_SPAN (span_on) */
     int64_t span_tail_ = 0;                 /* RADIANCE_PP_SPAN_TAIL (span_tail) */
+    int64_t span_short_ = 0;                /* RADIANCE_PP_SPAN_SHORT (span_short) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
     int     lend_mixed_ = 0;                /* RADIANCE_PP_LEND_MIXED 1 (lend_mixed, tp8 dev M5) / 2 (lend_split, M5b) */
     int64_t split_min_ = 128;

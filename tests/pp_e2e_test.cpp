@@ -1524,3 +1524,106 @@ TEST(lend_split_newcomers_serve_one_process_tokens) {
 }
 
 RAD_TEST_MAIN()
+
+/* tp8 loop P10 (RADIANCE_PP_SEND_ASYNC=N, both nodes): a payload of >= N rows is packed into the node's staging buffer
+ * on the pass's stream and published from the side stream (the host backend: a helper thread, so the head's pass ends
+ * before its X1 is in the ring and the next pass starts at once); passes of >= N rows are issued live. A cold
+ * multi-chunk prompt at 2 / 3 lanes serves one process's tokens and chunk plan, the mixed lane set (newcomers beside
+ * decoders) one process's tokens, at W(0,2) / W(1,3); the stop lines count the side-stream payloads on both nodes; with
+ * the switch off nothing is said. (The tiny model's chunks are ~64 rows: N = 32 here; the cards take N = 2048.) */
+TEST(async_crossings_serve_one_process_tokens_and_plan) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(1313, 1000);
+    std::vector<int32_t> ref;
+    std::vector<std::pair<int, int>> ref_plan;
+    std::vector<std::vector<int32_t>> ref_set;
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }, { "RADIANCE_LOG_STEPS=1" }));
+        ref = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        ref_plan = chunks_of(sv.lead.output());
+    }
+    {
+        Serving sv;
+        REQUIRE(sv.start("", { "--max-num-seqs", "6" }));
+        ref_set = lane_set(sv.port);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+    }
+    CHECK(ref_plan.size() >= 4);
+    /* "RADIANCE_PP_SEND_ASYNC=32 -- A of this node's B X1 payloads crossed from the side stream" */
+    auto async_of = [](const std::string& log, long long* all) {
+        const size_t at = log.rfind("payloads crossed from the side stream");
+        if (at == std::string::npos) return -1ll;
+        const size_t b = log.rfind(" -- ", at);
+        long long a = -1, n = -1;
+        if (b == std::string::npos || std::sscanf(log.c_str() + b, " -- %lld of this node's %lld", &a, &n) != 2) return -1ll;
+        if (all) *all = n;
+        return a;
+    };
+    const std::vector<std::string> env = cat(kSplitEnv, { "RADIANCE_LOG_STEPS=1", "RADIANCE_PP_SEND_ASYNC=32" });
+    struct Arm { const char* lanes; const char* cut; };
+    for (const Arm a : { Arm{ "2", "0,2" }, Arm{ "2", "1,3" }, Arm{ "3", "1,3" } }) {
+        const std::vector<std::string> shape = { "--max-num-seqs", "6", "--pp-lanes", a.lanes };
+        std::vector<int32_t> got;
+        long long lall = 0, fall = 0, la = -1, fa = -1;
+        bool plan_ok = false;
+        {
+            Serving sv;
+            REQUIRE(sv.start(a.cut, shape, env));
+            got = complete(sv.port, p, 24);
+            kill(sv.lead.child.pid, SIGTERM);
+            CHECK_EQ(sv.lead.finish(60), 0);
+            CHECK_EQ(sv.fol.finish(30), 0);
+            const std::string llog = sv.lead.output(), flog = sv.fol.output();
+            plan_ok = chunks_of(llog) == ref_plan;
+            la = async_of(llog, &lall);
+            fa = async_of(flog, &fall);
+            CHECK(llog.find("RADIANCE_PP_SEND_ASYNC=32 -- a X1 payload of >= 32 rows") != std::string::npos);
+            CHECK(flog.find("RADIANCE_PP_SEND_ASYNC=32 -- a X2 payload of >= 32 rows") != std::string::npos);
+            if (got != ref || !plan_ok) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(),
+                                                tail(flog, 30).c_str());
+        }
+        int differ = -1;
+        long long sla = -1, slall = 0;
+        {
+            Serving sv;
+            REQUIRE(sv.start(a.cut, shape, env));
+            const std::vector<std::vector<int32_t>> got_set = lane_set(sv.port);
+            kill(sv.lead.child.pid, SIGTERM);
+            CHECK_EQ(sv.lead.finish(60), 0);
+            CHECK_EQ(sv.fol.finish(30), 0);
+            REQUIRE_EQ(ref_set.size(), got_set.size());
+            differ = 0;
+            for (size_t i = 0; i < ref_set.size(); ++i) {
+                CHECK(!ref_set[i].empty());
+                if (ref_set[i] != got_set[i]) ++differ;
+            }
+            sla = async_of(sv.lead.output(), &slall);
+        }
+        fprintf(stderr, "    async crossings, %s lanes W(%s): cold tokens %s, plan %s (%zu chunks); leader X1 %lld of %lld "
+                        "from the side stream, follower X2 %lld of %lld; lane set %d of %zu differ, X1 %lld of %lld async\n",
+                a.lanes, a.cut, got == ref ? "identical" : "DIFFERENT", plan_ok ? "identical" : "DIFFERENT", ref_plan.size(),
+                la, lall, fa, fall, differ, ref_set.size(), sla, slall);
+        CHECK(!ref.empty());
+        CHECK(got == ref);
+        CHECK(plan_ok);
+        CHECK_EQ(differ, 0);
+        CHECK(la > 0);          /* the cold prompt's chunks of >= 32 rows */
+        CHECK(la < lall);       /* the decode steps' small payloads on the pass's stream */
+        CHECK(fa >= 0);
+        CHECK(sla > 0);
+    }
+    {   /* off: no line, nothing from a side stream */
+        Serving sv;
+        REQUIRE(sv.start("1,3", kLanes2, kSplitEnv));
+        const std::vector<int32_t> got = complete(sv.port, p, 24);
+        kill(sv.lead.child.pid, SIGTERM);
+        CHECK_EQ(sv.lead.finish(60), 0);
+        CHECK_EQ(sv.fol.finish(30), 0);
+        CHECK(got == ref);
+        CHECK(sv.lead.output().find("RADIANCE_PP_SEND_ASYNC") == std::string::npos);
+    }
+}

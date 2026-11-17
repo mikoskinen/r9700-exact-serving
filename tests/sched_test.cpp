@@ -13476,6 +13476,48 @@ TEST(lanes_span_tail_cuts_only_the_span_pieces_in_a_prompts_last_rows) {
     }
 }
 
+/* tp8 loop P7 (RADIANCE_PP_SPAN_SHORT=N, LaneSet::set_span_short): a prompt of at most N rows plans RADIANCE_PP_SPAN=0's cut
+ * span plan (interval chunks), a longer one the span plan (or SPAN_TAIL's), at 2 and 3 lanes, the window keys read right. */
+TEST(lanes_span_short_cuts_a_short_prompts_span_pieces_and_leaves_a_long_ones) {
+    for (int ex : { 0, 1 })
+    for (int n_prompt : { 15777, 65650 })
+    for (int lanes : { 2, 3 }) {
+        std::vector<std::pair<int, int>> ref_s, ref_cut;
+        for (int arm = 0; arm < 3; ++arm) {
+            /* 0: one lane (the span plan); 1: `lanes` lanes, SPAN=0 (the cut plan); 2: `lanes` lanes, SPAN_SHORT 24576 */
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
+            L.cfg.pp_plan_prefix = ex == 1;
+            L.max_tok = 4160;
+            L.max_ctx = 70000;
+            L.kv_blocks = 8192;
+            L.stage_rows = 1024;
+            L.win = 16;
+            L.seqs = 6;
+            const int nl = arm == 0 ? 1 : lanes;
+            REQUIRE_EQ(L.start(nl), RAD_OK);
+            if (arm == 1) L.set.set_span(false);
+            if (arm == 2) L.set.set_span_short(24576);
+            const uint64_t s = L.submit(0, n_prompt, 2);
+            REQUIRE(s != 0);
+            int64_t misses = 0;
+            int failed = 0;
+            const std::vector<std::pair<int, int>> got = run_cold(L, nl, s, &misses, &failed);
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(misses, (int64_t)0);
+            REQUIRE(L.req(0, s) != nullptr);
+            CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
+            if (arm == 0) { ref_s = got; continue; }
+            if (arm == 1) { ref_cut = got; continue; }
+            CHECK(got == (n_prompt <= 24576 ? ref_cut : ref_s));
+            fprintf(stderr, "    %s%d tokens, %d lanes, SPAN_SHORT 24576: %zu chunks (%s)\n", ex ? "exact, " : "", n_prompt, lanes,
+                    got.size(), got == (n_prompt <= 24576 ? ref_cut : ref_s) ? (n_prompt <= 24576 ? "= the cut plan" : "= the span plan")
+                                                                         : "DIFFERENT");
+        }
+    }
+}
+
 /* tp8 loop M2 (the 20:58 PROFILE: no lane step for 320-430 ms after every MIXED step): lever DST under lanes. A newcomer
  * that joins a lane beside decode rows is cut by option D on sched_mixed_tok's grid (576 -> 512-row pieces), one piece a
  * home-lane step, the same boundaries one lane plans (the plan is a function of the switches, not of the decode rows

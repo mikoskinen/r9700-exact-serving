@@ -38,6 +38,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -139,7 +140,6 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
         else                     ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->staged) >= d + 1; }) ? 1 : 0;
     }
     __syncthreads();
-    uint32_t bad = 0;
     if (ok) {
         char* ring = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
         const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
@@ -150,11 +150,14 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
             const uint64_t e = hi < P.off[k] + P.bytes[k] ? hi : P.off[k] + P.bytes[k];
             if (a >= e) continue;
             const char* src = reinterpret_cast<const char*>(P.p[k]) + (a - P.off[k]);
-            if (P.split == 2 && !pub) bad += cmp_part(src, ring + a, e - a, stride);
-            else copy_part(src, ring + a, e - a, (P.w16 >> k) & 1u, stride);
+            if (P.split == 2 && !pub) {
+                const uint32_t bad = cmp_part(src, ring + a, e - a, stride);
+                if (bad) atomicAdd(diff + k, bad);   /* one counter a part (counter_for's 64 bytes: 16 words) */
+            } else {
+                copy_part(src, ring + a, e - a, (P.w16 >> k) & 1u, stride);
+            }
         }
     }
-    if (bad) atomicAdd(diff, bad);
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -163,7 +166,12 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
             *counter = 0u;
             if (ok && !pub) {
                 if (P.split == 2) {
-                    const uint32_t dw = atomicExch(diff, 0u);
+                    uint64_t dw = 0;
+                    for (int k = 0; k < P.n; ++k) {
+                        const uint32_t d = atomicExch(diff + k, 0u);
+                        dw += d;
+                        if (d) st_sys(&r->diff_part[P.rank][k], ld_sys(&r->diff_part[P.rank][k]) + d);
+                    }
                     st_sys(&r->diff_words[P.rank], ld_sys(&r->diff_words[P.rank]) + dw);
                     st_sys(&r->cmp_words[P.rank], ld_sys(&r->cmp_words[P.rank]) + P.cmp);
                 }
@@ -242,6 +250,14 @@ __global__ void __launch_bounds__(kThreads) stage_send_kernel(RadPpRing* r, Part
             }
         }
     }
+}
+
+/* tp8 loop P10 (RadPpRing::async_rows): the parts packed into the node's card staging buffer at their payload offsets,
+ * on the pass's stream; stage_send_kernel then copies the staging buffer's parts into the ring from a side stream. */
+__global__ void __launch_bounds__(kThreads) stage_pack_kernel(Parts P, char* stage) {
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    for (int k = 0; k < P.n; ++k)
+        copy_part(reinterpret_cast<const char*>(P.p[k]), stage + P.off[k], P.bytes[k], (P.w16 >> k) & 1u, stride);
 }
 
 __global__ void __launch_bounds__(kThreads) stage_recv_kernel(RadPpRing* r, Parts P, uint32_t* counter) {
@@ -348,6 +364,75 @@ int collect(const RadArgs* a, const RadPpRing* r, uint64_t ring_bytes, Parts* P)
     return RAD_OK;
 }
 
+/* tp8 loop P10 (RadPpRing::async_rows; the core issues such passes live, so nothing here is recorded): a card's side
+ * stream and its two events -- `packed` (the pack on the pass's stream is done: the side stream may read the staging
+ * buffer) and `copied` (the side stream's copy into the ring is done: the next pack may write it). One staging buffer a
+ * node, so consecutive async payloads of either lane take turns on it. */
+struct AsyncCard {
+    hipStream_t side = nullptr;
+    hipEvent_t packed = nullptr, copied = nullptr;
+    bool copied_once = false;
+};
+
+AsyncCard* async_card(int dev) {
+    static std::mutex mu;
+    static std::map<int, AsyncCard> cards;
+    std::lock_guard<std::mutex> lk(mu);
+    AsyncCard& c = cards[dev];
+    if (!c.side) {
+        if (hipStreamCreateWithFlags(&c.side, hipStreamNonBlocking) != hipSuccess) { c.side = nullptr; return nullptr; }
+        if (hipEventCreateWithFlags(&c.packed, hipEventDisableTiming) != hipSuccess ||
+            hipEventCreateWithFlags(&c.copied, hipEventDisableTiming) != hipSuccess)
+            return nullptr;
+    }
+    return &c;
+}
+
+/* Side-stream blocks: the copy is PCIe-bound (~27 GB/s a card), so a few blocks keep up with it and leave the CUs to the
+ * next pass (RADIANCE_PP_SEND_ASYNC_BLOCKS, default 64). */
+uint32_t async_blocks() {
+    static const uint32_t b = [] {
+        const char* v = std::getenv("RADIANCE_PP_SEND_ASYNC_BLOCKS");
+        const long n = v && *v ? std::strtol(v, nullptr, 10) : 64;
+        return (uint32_t)(n >= 1 && n <= kMaxBlocks ? n : 64);
+    }();
+    return b;
+}
+
+int send_async(RadPpRing* r, const Parts& P, int dev, RadStream stream) {
+    AsyncCard* c = async_card(dev);
+    if (!c) return R4D_NO(RAD_E_DEVICE);
+    char* stage = reinterpret_cast<char*>((uintptr_t)r->stage_dev);
+    uint32_t* counter = counter_for(dev, r, 3);   /* the side stream's own: never shared with a launch on the pass's */
+    if (!counter) return R4D_NO(RAD_E_NOMEM);
+    hipStream_t s = (hipStream_t)stream;
+    /* the staging buffer is free once the last async copy on this card is done */
+    if (c->copied_once && hipStreamWaitEvent(s, c->copied, 0) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    const uint64_t words = P.total / (P.w16 == (1u << P.n) - 1u ? 16 : 4);
+    uint32_t blocks = (uint32_t)((words + kThreads * 4 - 1) / (kThreads * 4));
+    if (blocks < 1) blocks = 1;
+    if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+    int rc = R4D_EMIT(stream, stage_pack_kernel, dim3(blocks), dim3(kThreads), 0, P, stage);
+    if (rc < 0) return rc;
+    if (hipEventRecord(c->packed, s) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    if (hipStreamWaitEvent(c->side, c->packed, 0) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    /* the same send, its parts now the staging buffer's (256-byte aligned offsets: 16-byte words where the bytes are) */
+    Parts Q = P;
+    Q.w16 = 0;
+    for (int k = 0; k < Q.n; ++k) {
+        Q.p[k] = (uint64_t)(uintptr_t)(stage + P.off[k]);
+        if (Q.bytes[k] % 16 == 0) Q.w16 |= 1u << k;
+    }
+    uint32_t sb = async_blocks();
+    if (sb > blocks) sb = blocks;
+    rc = R4D_EMIT((RadStream)c->side, stage_send_kernel, dim3(sb), dim3(kThreads), 0, r, Q, counter);
+    if (rc < 0) return rc;
+    if (hipEventRecord(c->copied, c->side) != hipSuccess) return R4D_NO(RAD_E_DEVICE);
+    c->copied_once = true;
+    r->async_sends = r->async_sends + 1;   /* host memory, this rank's thread only */
+    return RAD_OK;
+}
+
 int launch(const RadArgs* a, RadStream stream, bool send) {
     const RadTensor* rt = r4d_opt(a, 0);
     RadPpRing* r = rt ? static_cast<RadPpRing*>(rt->data) : nullptr;
@@ -397,6 +482,9 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
         if (blocks > kMaxBlocks) blocks = kMaxBlocks;
         return R4D_EMIT(stream, stage_send_split_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter, diff);
     }
+    /* tp8 loop P10: a large payload crosses from a side stream through the node's card staging buffer */
+    if (send && !loop && r->async_rows && r->stage_dev && P.rows >= r->async_rows && P.total <= r->stage_cap)
+        return send_async(r, P, dev, stream);
     const uint64_t words = P.total / (P.w16 == (1u << P.n) - 1u ? 16 : 4);
     uint32_t blocks = (uint32_t)((words + kThreads * 4 - 1) / (kThreads * 4));
     if (blocks < 1) blocks = 1;
