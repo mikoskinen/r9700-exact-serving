@@ -339,8 +339,11 @@ struct ArPieces {
      * lane behind the previous block's piece), so a block with its own norm takes the piece path
      * as one with an external input does and skips that norm. */
     bool in_ready = false;
+    /* fn4 PF-ORDER (qwen/prefill): the most pieces the block hands; the caller issues the rest's reductions itself (a
+     * piece not handed is one the caller's `handed` count says it must issue) */
+    int64_t max_hand = (int64_t)1 << 62;
     bool cuts(int64_t T) const { return done && rows > 0 && T > rows; }
-    void hand(int64_t r0, int64_t n) { done(u, r0, n); ++handed; }
+    void hand(int64_t r0, int64_t n) { if (handed >= max_hand) return; done(u, r0, n); ++handed; }
 };
 
 /* Whether a MoE block's gather is folded into the following reduction (ar_gather_hc_write).

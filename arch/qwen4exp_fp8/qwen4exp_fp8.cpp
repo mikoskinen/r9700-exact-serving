@@ -2275,6 +2275,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     const bool pmk = (fn4_sproute_flag().load(std::memory_order_relaxed) & 8) != 0;
     /* fn4 SPO-tail (sp_route bit 16): the hc_sp 2 order also where only the last piece is partial */
     const bool spo_tail = spo && (fn4_sproute_flag().load(std::memory_order_relaxed) & 16) != 0;
+    /* fn4 PF-ORDER (sp_route bit 32): see the layer loop */
+    const bool pford = (fn4_sproute_flag().load(std::memory_order_relaxed) & 32) != 0;
     /* fn4 SP-hc on the exact wire: only a FULL piece (rn == R) takes SP, its quarter's reads through op_read_sp (the K split
      * pinned to R, byte-identical to the piece read whole); a shorter last piece reads whole as today. */
     /* fn4 SP-PLE (switch sp_ple): the layers before the PLE's run without SP (lsp), so the PLE reads the whole stream on
@@ -2371,6 +2373,10 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         if (pmk_l) { ms.mk = &mk; ms.rows = R; }
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
+        /* fn4 PF-ORDER (sp_route bit 32, with the marks): a delta-net layer hands only piece 0's reduction; the step issues
+         * the others beside the pieces' connections (ar_mix below), so the second lane takes piece 0's gather before
+         * piece 1's and 2's mixer reductions instead of after them (the delta net hands every piece at its very end) */
+        if (pmk_l && pford && !l.full) pc.max_hand = 1;
         if (l.full) { l.qsa.step(c, l.attn.w.h, batch, pcu); l.attn.step(c, batch, false, &pc); }
         else        l.gdn.step(c, batch, false, &pc);
         bt_blk(c, m, l, T, (int)li);   /* lane 0's buffers; lane 1 reduces only `x` */
@@ -3238,7 +3244,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "sp_route") == 0) {   /* fn4 SP-route (qwen/prefill; RADIANCE_FN4_SP_ROUTE declares bit 1); bits 2 / 4: PF probes */
-        if (value < 0 || value > 31) return -1;   /* bit 16: SPO-tail */
+        if (value < 0 || value > 63) return -1;   /* bit 16: SPO-tail, 32: PF-ORDER */
         if ((value & 1) && !qwen4exp_fp8::fn4_env_on("RADIANCE_FN4_SP_ROUTE")) return -1;
         qwen4exp_fp8::fn4_sproute_flag().store(value, std::memory_order_relaxed);
         return 1;
