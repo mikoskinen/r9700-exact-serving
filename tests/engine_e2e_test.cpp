@@ -3917,7 +3917,7 @@ TEST(lever_g_a_turn_resumed_at_a_fine_tail_returns_what_a_cold_run_does) {
         CHECK(same);
         CHECK_EQ(s.stop(), 0);
         if (F) CHECK(s.log.find("lever G (fn4 sched_tail_grid 256") != std::string::npos);
-        else   CHECK(s.log.find("lever G") == std::string::npos);
+        else   CHECK(s.log.find("lever G (fn4 sched_tail_grid") == std::string::npos);   /* lever TI's start line names lever G whatever the grid */
     }
 }
 
