@@ -23,6 +23,10 @@
 #include "rad_plugin.h"
 
 #include <algorithm>
+#include <vector>
+#include <mutex>
+#include <map>
+#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <cstring>
@@ -76,6 +80,70 @@ bool dense(const RadTensor& t) {
  * this rank (the plugin's), every rank sends its own parts into its own and takes them back with the receive; the send
  * publishes the payload to itself (a fresh header: number 1, landed and sent with ready), so the buffer needs no setup. */
 bool loop_of(const RadArgs* a) { return rad_param_geti(a->p, a->n_p, "loop", 0) == 1; }
+
+/* tp8 loop P10 (RadPpRing::async_rows), as r4d_stage.hip's send_async on a card: the parts packed into the node's staging
+ * buffer on the rank's thread (the pass's stream), then the ring copy + publish on a helper thread (the side stream), which
+ * the next async payload of the node waits for before it packs (the `copied` event). The ring's bytes are the same. */
+namespace {
+struct AsyncStage {
+    std::atomic<bool> busy{ false };
+};
+AsyncStage& async_stage(uint64_t stage) {
+    static std::mutex mu;
+    static std::map<uint64_t, AsyncStage> st;
+    std::lock_guard<std::mutex> lk(mu);
+    return st[stage];
+}
+}  /* namespace */
+
+static void publish_from(RadPpRing* r, const char* stage, int n, const uint64_t* bytes, uint64_t total, int64_t rows) {
+    const uint64_t t0 = mono_ms();
+    while (__atomic_load_n(&r->sent, __ATOMIC_ACQUIRE) < r->ready) {
+        if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return;
+        if (r->deadline_ms && mono_ms() - t0 > r->deadline_ms) {   /* as the card's wait: its deadline into the ring */
+            __atomic_store_n(&r->abort, (uint64_t)3, __ATOMIC_RELEASE);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return;
+    char* dst = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
+    std::memcpy(dst, stage, (size_t)total);
+    for (int i = 0; i < n; ++i) r->part_bytes[i] = bytes[i];
+    const uint64_t seq = r->ready + 1;
+    std::memset(dst + total, 0, RAD_PP_TRAILER);
+    *reinterpret_cast<uint64_t*>(dst + total + 8) = rad_pp_layout(bytes, n);
+    __atomic_store_n(reinterpret_cast<uint64_t*>(dst + total), seq, __ATOMIC_RELEASE);
+    r->rows = (uint64_t)rows;
+    r->parts = (uint64_t)n;
+    r->bytes = total + RAD_PP_TRAILER;
+    __atomic_store_n(&r->ready, seq, __ATOMIC_RELEASE);
+    r->ready_ns = mono_ns();
+}
+
+static int send_async(const RadArgs* a, RadPpRing* r, int n, const uint64_t* bytes, uint64_t total, int64_t rows) {
+    char* stage = reinterpret_cast<char*>((uintptr_t)r->stage_dev);
+    AsyncStage& st = async_stage(r->stage_dev);
+    /* the staging buffer is free once the node's last async copy is done */
+    while (st.busy.load(std::memory_order_acquire)) {
+        if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+    uint64_t off = 0;
+    for (int i = 0; i < n; ++i) {
+        std::memcpy(stage + off, a->t[1 + i].data, (size_t)bytes[i]);
+        if (rad_pp_align(bytes[i]) > bytes[i]) std::memset(stage + off + bytes[i], 0, (size_t)(rad_pp_align(bytes[i]) - bytes[i]));
+        off += rad_pp_align(bytes[i]);
+    }
+    std::vector<uint64_t> b(bytes, bytes + n);
+    st.busy.store(true, std::memory_order_release);
+    r->async_sends = r->async_sends + 1;
+    std::thread([r, stage, n, b, total, rows, &st] {
+        publish_from(r, stage, n, b.data(), total, rows);
+        st.busy.store(false, std::memory_order_release);
+    }).detach();
+    return RAD_OK;
+}
 uint64_t loop_cap(const RadTensor& t) { return (uint64_t)rad_dtype_bytes(t.dtype, rad_tensor_numel(&t)); }
 
 /* tp8 loop P8 (RADIANCE_PP_SEND_SPLIT=1 / 2), as r4d_stage.hip's stage_send_split_kernel on a rank's thread: wait for the
@@ -176,6 +244,11 @@ int ref_stage_send(const RadArgs* a, RadStream) {
     }
     if (total + RAD_PP_TRAILER > (loop ? loop_cap(a->t[0]) - RAD_PP_RING_HDR : r->cap)) return RAD_E_FULL;
     if (split) return send_split(a, r, split, sender, n, bytes, total, rows);
+    /* tp8 loop P10: a large payload through the node's staging buffer, published from a helper (the card's side stream) */
+    if (!loop && r->async_rows && r->stage_dev && (uint64_t)rows >= r->async_rows && total <= r->stage_cap) {
+        if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;
+        return send_async(a, r, n, bytes, total, rows);
+    }
     if (loop) {   /* tp8 dev M4: a fresh header; the receive on this rank takes payload 1 */
         r->abort = 0;
         r->ready = 0;
