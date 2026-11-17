@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
 
 namespace rad {
 
@@ -104,6 +105,11 @@ int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config&
     max_seqs_ = cfg.max_seqs > 0 ? cfg.max_seqs : 1;
     max_ctx_  = cfg.max_ctx > 0 ? cfg.max_ctx : 0;
     max_tok_  = cfg.max_tok > 0 ? cfg.max_tok : 0;
+    win_steps_ = window_steps(cfg);
+    if (win_steps_ > 1)
+        RAD_INFO("KV manager: a window group's pool holds %lld steps' tokens beside the %lld windows "
+                 "(RADIANCE_PP_WIN_STEPS, %d lanes): a newcomer's chunks over the lanes from its keep floor",
+                 (long long)win_steps_, (long long)max_seqs_, cfg.pp_lanes_now());
 
     if (groups.empty()) {
         RAD_ERR("KV manager: no KV groups were declared; the architecture plugin declares at "
@@ -1338,7 +1344,22 @@ int64_t KVManager::window_seq_cap(const KVGroupPlan& p) const {
 }
 
 int64_t KVManager::window_pool_cap(const KVGroupPlan& p) const {
-    return max_seqs_ * (p.window_blocks + 1) + step_blocks(p);
+    return max_seqs_ * (p.window_blocks + 1) + win_steps_ * step_blocks(p);
+}
+
+int64_t KVManager::window_steps(const Config& cfg) {
+    const int n = cfg.pp_lanes_now();
+    if (n <= 1) return 1;
+    const char* v = std::getenv("RADIANCE_PP_WIN_STEPS");
+    if (!v || !*v) return 1;
+    char* end = nullptr;
+    const long long k = std::strtoll(v, &end, 10);
+    if (!end || *end || k < 1 || k > 2 * n - 1) {
+        RAD_WARN("RADIANCE_PP_WIN_STEPS=%s: not a count from 1 to %d (2 x %d lanes - 1): the window pool holds 1 "
+                 "step's tokens beside the windows", v, 2 * n - 1, n);
+        return 1;
+    }
+    return (int64_t)k;
 }
 
 int64_t KVManager::step_blocks(const KVGroupPlan& p) const {

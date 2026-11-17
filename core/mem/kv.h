@@ -317,6 +317,14 @@ public:
     int64_t window_pool_cap(const KVGroupPlan& p) const;
     /* ceil(max_tok / block): the blocks one step's tokens can fill. */
     int64_t step_blocks(const KVGroupPlan& p) const;
+    /* tp8 prefill P0: the steps' tokens a WINDOW group's pool holds beside the max_seqs windows (window_pool_cap: k x
+     * step_blocks). One machine and --pp-lanes 1: 1. A pipeline of N lanes holds up to 2N - 1 steps' rows of one prompt
+     * uncommitted -- N lanes' steps in flight and N - 1 inboxes with a lent chunk -- each from the keep floor, so the
+     * newcomer's chunks run back to back over the lanes only when the pool holds them (a lend the pool refuses is not
+     * made: the walk stops, never preempts). RADIANCE_PP_WIN_STEPS=k (1 .. 2N - 1, both nodes the same) sets it;
+     * default 1, today's pool. */
+    static int64_t window_steps(const Config& cfg);
+    int64_t win_steps() const { return win_steps_; }
 
     /* Recycles a committed chunk's window blocks. ensure() keeps a chunk's blocks beside the
      * window and only the next ensure() recycles them, so a prefill waiting for its next chunk
@@ -708,6 +716,7 @@ private:
     int64_t   max_seqs_ = 0;
     int64_t   max_ctx_ = 0;
     int64_t   max_tok_ = 0;      /* --max-num-batched-tokens; the buffer floor is one of these */
+    int64_t   win_steps_ = 1;    /* tp8 prefill P0: window_steps(cfg) */
     bool    snap_drafter_ = false;   /* set_drafter_window_snapshot */
     /* plan_groups() computes these; carve() spends against them and ceiling() reports on them. */
     int64_t   fixed_ = 0;      /* the non-negotiable floor: states, conv slots, padding */
