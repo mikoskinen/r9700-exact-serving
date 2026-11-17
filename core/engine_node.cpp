@@ -740,8 +740,9 @@ void Engine::pp_close(const char* why) {
 
 /* ================================================================== tp8 S6: checkpoints, the KV-copy check */
 /* The step's checkpoint restores (kind 0: before the pass) and saves (kind 1: behind it), as the leader's step
- * loop and save_checkpoints run them: each [kind, checkpoint slot, n state slots, n window rows, the sequence's
- * state slots (per stateful group, plans() order), the window block ids], from the leader's tables. The follower's
+ * loop and save_checkpoints run them: each [kind, checkpoint slot, n state slots, n window rows, lever TI's first
+ * row (-1: none), the sequence's state slots (per stateful group, plans() order), the window block ids], from the
+ * leader's tables. The follower's
  * groups are the leader's in the same order, so the ids address its own pools and checkpoint store. */
 int Engine::pp_ck_list(std::vector<int32_t>* out) {
     out->clear();
@@ -767,10 +768,22 @@ int Engine::pp_ck_list(std::vector<int32_t>* out) {
                 if (!state_slots_of(e.seq, &slots)) continue;
                 win.clear();
                 if (ranks_[0]->kv.has_window_snapshot() && !ranks_[0]->kv.window_rows(e.seq, pos, &win)) return RAD_E_STATE;
+                /* lever TI (save_checkpoints): a snapshot inside the entry's chunk patches the CONV window with the
+                 * plugin's mapped ids of the rows ending at it -- the step row after the snapshot, or -1 */
+                int32_t first = -1;
+                if (kind == 1 && e.ckpt_tok < e.n_tokens - 1) {
+                    int64_t row0 = 0;
+                    for (const StepEntry& o : plan.e) {
+                        if (&o == &e) break;
+                        row0 += o.n_tokens;
+                    }
+                    first = (int32_t)(row0 + e.ckpt_tok + 1);
+                }
                 out->push_back(kind);
                 out->push_back(ck);
                 out->push_back((int32_t)slots.size());
                 out->push_back((int32_t)win.size());
+                out->push_back(first);
                 out->insert(out->end(), slots.begin(), slots.end());
                 out->insert(out->end(), win.begin(), win.end());
             }
@@ -781,15 +794,29 @@ int Engine::pp_ck_list(std::vector<int32_t>* out) {
 int Engine::pp_ck_apply(const int32_t* q, int32_t n, bool save) {
     int32_t i = 0;
     std::vector<int32_t> win;
-    while (i + 4 <= n) {
-        const int32_t kind = q[i], ck = q[i + 1], ns = q[i + 2], nw = q[i + 3];
-        if (ns < 0 || nw < 0 || (int64_t)i + 4 + ns + nw > n) return RAD_E_STATE;
+    constexpr int32_t H = 5;   /* kind, slot, n state slots, n window rows, the TI patch's first row */
+    while (i + H <= n) {
+        const int32_t kind = q[i], ck = q[i + 1], ns = q[i + 2], nw = q[i + 3], first = q[i + 4];
+        if (ns < 0 || nw < 0 || (int64_t)i + H + ns + nw > n) return RAD_E_STATE;
         if ((kind == 1) == save) {
-            win.assign(q + i + 4 + ns, q + i + 4 + ns + nw);
+            win.assign(q + i + H + ns, q + i + H + ns + nw);
             for (auto& rk : ranks_) {
                 if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
-                const int st = save ? rk->kv.checkpoint_save(q + i + 4, ns, ck, rk->ctx.stream(), &win)
-                                    : rk->kv.checkpoint_restore(q + i + 4, ns, ck, rk->ctx.stream(), &win);
+                int st = save ? rk->kv.checkpoint_save(q + i + H, ns, ck, rk->ctx.stream(), &win)
+                              : rk->kv.checkpoint_restore(q + i + H, ns, ck, rk->ctx.stream(), &win);
+                /* lever TI: the CONV window of a snapshot inside the chunk, from this node's mapped ids */
+                if (st >= 0 && save && first >= 0 && rk->kv.has_conv_state()) {
+                    const void* ids = nullptr;
+                    int ctx = 0;
+                    if (fn4::ckpt_conv_src(rk->index, &ids, &ctx) <= 0 || !ids || ctx <= 0 || first < ctx) {
+                        RAD_ERR("follower: rank %d has no source of the CONV window at row %d for a snapshot inside "
+                                "the chunk", rk->index, (int)first);
+                        st = RAD_E_STATE;
+                    } else {
+                        st = rk->kv.checkpoint_patch_conv(ck, (const char*)ids + (int64_t)(first - ctx) * 4, ctx,
+                                                          rk->ctx.stream());
+                    }
+                }
                 if (st < 0) {
                     RAD_ERR("follower: rank %d could not %s checkpoint slot %d: %s", rk->index,
                             save ? "save into" : "restore from", (int)ck, rad_strerror(st));
@@ -799,7 +826,7 @@ int Engine::pp_ck_apply(const int32_t* q, int32_t n, bool save) {
             }
             if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
         }
-        i += 4 + ns + nw;
+        i += H + ns + nw;
     }
     return i == n ? RAD_OK : RAD_E_STATE;
 }

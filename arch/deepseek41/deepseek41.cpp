@@ -6019,7 +6019,8 @@ static void media_engram(RadCtx* x, Model& m, const Layer& L, const RadBatch* ba
 static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64_t lo, int64_t hi) {
     const int64_t T = batch->n_tok, S = batch->n_seq;
     const rad_op op_ = ring == RAD_PP_X1 ? m.pp_x1 : m.pp_x2;
-    if (!m.pp_ring[ring]) m.pp_ring[ring] = rad_pp_query().ring[ring];
+    /* the ring read at every issue (tp8 S5: each lane has its own) */
+    m.pp_ring[ring] = rad_pp_query().ring[ring];
     if (!m.pp_ring[ring] || !op_) {
         rad_step_fail(x, "deepseek41: two-node pipeline: the core set up no ring for a crossing");
         return false;
