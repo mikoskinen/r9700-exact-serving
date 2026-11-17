@@ -1168,6 +1168,13 @@ private:
     /* The chunk an idle engine (one process, this prompt alone) plans from position `n` of `r`, and the snapshot its
      * end takes (as bi_chunk_plan's alone piece; lever PSK design 2's targets applied): the one-process grid */
     int64_t lane_alone_chunk(const SchedReq& s, Request& r, int64_t target, int64_t n, int64_t* ckpt);
+    /* tp8 dev M5: the piece one process (option D, sched_bi_chunk 3) cuts next from `p` inside s's alone piece [bi_beg,
+     * bi_end) beside decode rows -- the largest grid end within the room one process plans a mixed piece at (the budget in
+     * force less its decode room), else the first end with >= kBiMinPiece rows a side, else the piece's rest -- and the
+     * snapshot it carries (the alone piece's, at its end) */
+    int64_t lane_d_piece(const SchedReq& s, int64_t p, int64_t* ckpt) const;
+    /* tp8 dev M5: the decode room a borrower keeps beside a lent newcomer piece (lever DST's kDstDecodeRoom) */
+    int64_t lane_decode_room() const;
     /* tp8 prefill P1: whether r's alone piece spans (--prefill-span's rule) */
     bool alone_spans(const Request& r, int64_t target) const;
     /* tp8 prefill P1: RADIANCE_PP_SPAN=0 under lanes -- plan_chunk cuts a span piece at an interior interval boundary */

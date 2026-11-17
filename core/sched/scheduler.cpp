@@ -1593,6 +1593,30 @@ int64_t Scheduler::bi_chunk_plan(SchedReq& s, const Request& r, int64_t target, 
     return emin - n;
 }
 
+int64_t Scheduler::lane_decode_room() const { return kDstDecodeRoom; }
+
+int64_t Scheduler::lane_d_piece(const SchedReq& s, int64_t p, int64_t* ckpt) const {
+    if (ckpt) *ckpt = -1;
+    const int64_t pe = s.bi_end;
+    if (p >= pe || bi_chunk_ != 3) return 0;
+    int64_t G = geo_.checkpoint_interval;
+    if (const int64_t gm = dst_grid(); gm > 0 && (G <= 0 || gm < G)) G = gm;
+    const int64_t budget = mixed_now_ > 0 ? mixed_now_ : (geo_.shared_tok > 0 ? geo_.shared_tok : cfg_.max_tok);
+    const int64_t room = std::max<int64_t>(budget - kDstDecodeRoom, 0);
+    int64_t e = 0;
+    if (pe - p <= room) {
+        e = pe;
+    } else if (G > 0) {
+        for (int64_t x = (p + room) / G * G; x > p && !e; x -= G)
+            if (x < pe && x - p >= kBiMinPiece && pe - x >= kBiMinPiece) e = x;
+        for (int64_t x = (p / G + 1) * G; x < pe && !e; x += G)
+            if (x - p >= kBiMinPiece && pe - x >= kBiMinPiece) e = x;
+    }
+    if (!e) e = pe;
+    if (e == pe && ckpt) *ckpt = s.bi_ckpt;
+    return e - p;
+}
+
 /* Lever NOA (fn4 sched_noa): the room a prefill D turned away may take over the shared budget -- the step's max_tok less
  * every row planned (decode and draft rows, other prefills) -- once another prefill holds the step; 0 when NOA does not act
  * on this step, no prefill is planned yet (the first prefill is D's own: the shared budget, D's over-budget rule), or under

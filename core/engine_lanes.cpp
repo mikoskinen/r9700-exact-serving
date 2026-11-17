@@ -230,6 +230,10 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     if (!lanes_.lend_busy())
         RAD_INFO("two-node pipeline: a newcomer's chunk is lent only to a lane with no request of its own "
                  "(RADIANCE_PP_LEND_BUSY=0): a decoding lane never carries another lane's chunk");
+    if (lanes_.lend_mixed())
+        RAD_INFO("two-node pipeline: a newcomer that lever BI's option D cuts beside decode rows lends the pieces one process "
+                 "cuts next to the lanes that plan next, its first token in the last (RADIANCE_PP_LEND_MIXED=1, tp8 dev M5)%s",
+                 fn4::sched_bi_chunk() == 3 ? "" : " -- inactive until fn4 sched_bi_chunk is 3");
     if (!lanes_.span_on())
         RAD_INFO("two-node pipeline: a lone prefill plans one checkpoint interval a chunk, not --prefill-span %d's span "
                  "(RADIANCE_PP_SPAN=0): the lanes run two of its chunks at once", cfg_.prefill_span);
@@ -311,8 +315,10 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
         why += fmt("%s%s %lld", k ? ", " : "", LaneSet::why_name(k), (long long)c.why[k]);
     RAD_INFO("two-node pipeline: %lld lane steps, %lld of them with another lane's step in flight at their tail; "
              "newcomer split: %lld pieces lent (%lld rows, %lld carrying a first token), %lld committed; not lent / "
-             "waited: %s", (long long)lane_steps, (long long)rounds_two, (long long)c.pieces, (long long)c.rows,
-             (long long)c.token_pieces, (long long)c.done, why.c_str());
+             "waited: %s%s", (long long)lane_steps, (long long)rounds_two, (long long)c.pieces, (long long)c.rows,
+             (long long)c.token_pieces, (long long)c.done, why.c_str(),
+             lanes_.lend_mixed() ? fmt("; %lld lends from newcomers option D cut beside decode rows (RADIANCE_PP_LEND_MIXED=1, tp8 "
+                                       "dev M5)", (long long)c.dpieces).c_str() : "");
 }
 
 int Engine::step_loop_lanes() {
