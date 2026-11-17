@@ -255,6 +255,92 @@ TEST(layers_s6_cuts_the_geometry_refuses) {
     CHECK_EQ(ok, 37 * 38 / 2);   /* t = 1 .. 37, h = 0 .. t - 1 */
 }
 
+/* (review of S6) Every allowed cut: each crossing carries exactly what the receiving node's layers read of the sending node
+ * (every need of the receiver is the crossing's source / selection / keep, and each part it carries is read), and what it
+ * carries is the sending node's LAST writer of that plane below the boundary -- the latent / index-key / page planes hold
+ * the last kv source the sender computed, the selection plane its last index layer's, so a crossing of an earlier one would
+ * ship another layer's bytes. */
+TEST(layers_s6_every_cut_crosses_the_senders_last_writer) {
+    const Geo g = flash1017();
+    int cuts = 0, with_src = 0, with_sel = 0, with_keep = 0;
+    for (int h = 0; h < 40; ++h)
+        for (int t = h + 1; t <= 37; ++t) {
+            Crossing x[2];
+            std::string err;
+            if (crossings(g, h, t, x, &err) != 0) {
+                std::fprintf(stderr, "  W(%d,%d): %s\n", h, t, err.c_str());
+                CHECK(false);
+                continue;
+            }
+            ++cuts;
+            const std::string fs = std::to_string(h) + ":" + std::to_string(t);
+            const std::string ls = (h > 0 ? "0:" + std::to_string(h) + "," : std::string()) + std::to_string(t) + ":40";
+            const Spec fol = spec(fs.c_str(), "strict"), lead = spec(ls.c_str(), "strict");
+            for (int k = 0; k < 2; ++k) {
+                const Crossing& c = x[k];
+                const Spec& snd = k == 0 ? lead : fol;
+                const Spec& rcv = k == 0 ? fol : lead;
+                const std::vector<Dep> nd = needs(g, rcv, k == 1);
+                bool src_read = false, lat_read = false, idx_read = false, sel_read = false, keep_read = false;
+                for (const Dep& d : nd) {
+                    CHECK(snd.held(d.from));   /* a need of the receiver is the sender's layer */
+                    if (d.kind == Need::Latent) { CHECK_EQ(d.from, c.src); src_read = lat_read = true; }
+                    if (d.kind == Need::IndexKeys) { CHECK_EQ(d.from, c.src); src_read = idx_read = true; }
+                    if (d.kind == Need::Sel) { CHECK_EQ(d.from, c.sel); sel_read = true; }
+                    if (d.kind == Need::Keep) { CHECK_EQ(d.from, c.keep); keep_read = true; }
+                    CHECK(d.kind != Need::Tap);
+                }
+                CHECK_EQ(c.src >= 0, src_read);
+                CHECK_EQ(c.latent, lat_read);
+                CHECK_EQ(c.index, idx_read);
+                CHECK_EQ(c.sel >= 0, sel_read);
+                CHECK_EQ(c.keep >= 0, keep_read);
+                const int lo = k == 0 ? 0 : h;   /* the sender's layers below the boundary c.at */
+                if (c.src >= 0) {
+                    ++with_src;
+                    CHECK(snd.held(c.src) && g.is_src[(size_t)c.src]);
+                    for (int l = std::max(lo, c.src + 1); l < c.at; ++l) CHECK(!(snd.held(l) && g.is_src[(size_t)l]));
+                }
+                if (c.sel >= 0) {
+                    ++with_sel;
+                    CHECK(snd.held(c.sel) && g.is_idx[(size_t)c.sel]);
+                    for (int l = std::max(lo, c.sel + 1); l < c.at; ++l) CHECK(!(snd.held(l) && g.is_idx[(size_t)l]));
+                }
+                if (c.keep >= 0) {
+                    ++with_keep;
+                    CHECK_EQ(c.keep, g.cand);
+                    CHECK(snd.held(c.keep));
+                }
+            }
+        }
+    CHECK_EQ(cuts, 37 * 38 / 2);
+    std::fprintf(stderr, "  %d cuts: %d crossings carry a kv source's entries, %d selections, %d keep words\n", cuts, with_src,
+                 with_sel, with_keep);
+    CHECK(with_src > 0 && with_sel > 0 && with_keep > 0);
+}
+
+/* (review of S6) A geometry where the sender computes another kv source between the one that crosses and the boundary (two
+ * ratios interleaved: layer 1 a ratio-2 source, layer 2 a ratio-4 source, layers 3..6 ratio 2, 7..9 ratio 4): W(3,7)'s X1
+ * would ship source 2's entries as source 1's -- refused by name. W(2,7) (source 2 on the follower) and W(3,8) are allowed
+ * or refused by the other rules only. */
+TEST(layers_s6_a_crossing_behind_another_source_is_refused) {
+    Geo g;
+    g.n_layer = 10;
+    g.ratio = { 0, 2, 4, 2, 2, 2, 2, 4, 4, 4 };
+    g.is_src = { 0, 1, 1, 0, 0, 0, 0, 0, 0, 0 };
+    g.is_idx.assign(10, 0);
+    g.src_of = { -1, 1, 2, 1, 1, 1, 1, 2, 2, 2 };
+    g.idx_of.assign(10, -1);
+    Crossing x[2];
+    std::string err;
+    CHECK(crossings(g, 3, 7, x, &err) < 0);
+    std::fprintf(stderr, "  W(3,7): %s\n", err.c_str());
+    CHECK(err.find("computes kv source 2 after it") != std::string::npos);
+    err.clear();
+    CHECK_EQ(crossings(g, 2, 7, x, &err), 0);   /* the leader's last source is 1; source 2 is the follower's own */
+    CHECK_EQ(x[0].src, 1);
+}
+
 TEST(layers_s6_binds_hold_or_copy) {
     const Geo g = flash1017();
     Crossing x[2];

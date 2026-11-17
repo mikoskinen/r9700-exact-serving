@@ -220,6 +220,20 @@ int Engine::pp_check() {
      * pp_plan_prefix (defect 3: a cache turned off moved the plan and a near tie's bits) still
      * records the start's value and plans the same. */
     cfg_.pp_plan_prefix = cfg_.prefix_cache;
+    /* (review of S6) RADIANCE_PP_PREFIX_CACHE=0: S4's rule for a like-for-like card run -- the cache
+     * off on both nodes (no hit, no snapshot, nothing mirrored), the chunk plan still the cache's
+     * (pp_plan_prefix, defect 3). The rendezvous compares RADIANCE_* values, so both nodes take it. */
+    if (const char* pc = std::getenv("RADIANCE_PP_PREFIX_CACHE"); pc && !std::strcmp(pc, "0") &&
+        (cfg_.prefix_cache || cfg_.prefix_cache_mib > 0)) {
+        cfg_.prefix_cache = false;
+        cfg_.prefix_cache_mib = 0;
+        decide("--no-prefix-cache", "prefix caching off",
+               "a two-node pipeline node with RADIANCE_PP_PREFIX_CACHE=0 (tp8 S4's rule): no prefix hit "
+               "or snapshot on either node; its prefill chunks are planned as the cache's (--prefix-resume "
+               "exact grid), so a cold prompt is cut as on one machine");
+        RAD_INFO("two-node pipeline: RADIANCE_PP_PREFIX_CACHE=0: prefix caching off on this node (tp8 S4's rule), the "
+                 "prefill chunks planned as the cache's");
+    }
     if (cfg_.prefix_cache_mib > 0) {
         cfg_.prefix_cache_mib = 0;
         decide("--prefix-cache-mib 0", "the prefix cache's host KV tier off",
