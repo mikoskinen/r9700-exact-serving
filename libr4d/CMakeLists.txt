@@ -248,6 +248,8 @@ set(R4D_UNITS
   "r4d_ds41_walk|"
   # Lever SD: sampled drafting on that walk (dspark_walk_sample_step: x ~ Q over the eight best keys, the coupled state).
   "r4d_ds41_wsamp|"
+  # tp8 S4: the two-node pipeline's crossings (stage_send / stage_recv through the core's host rings).
+  "r4d_stage|"
 )
 
 set(R4D_SRC "")

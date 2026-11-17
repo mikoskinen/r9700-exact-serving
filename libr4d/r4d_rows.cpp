@@ -2218,6 +2218,22 @@ static const RadOperandSpec oGather[] = {
     { "y",   RAD_OPD_OUT, 0 },
 };
 
+/* tp8 S4, the two-node pipeline's crossings (r4d_stage.hip; libref's schema, positionally). Declared here rather than in
+ * r4d_plugin.h, which every unit includes. */
+extern "C" int r4d_rad_stage_send(const RadArgs*, RadStream);
+extern "C" int r4d_rad_stage_recv(const RadArgs*, RadStream);
+static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender") };
+static const RadOperandSpec oStageSend[] = {
+    { "ring", RAD_OPD_IN, 0 }, { "x0", RAD_OPD_IN, 0 }, { "x1", RAD_OPD_IN, 1 }, { "x2", RAD_OPD_IN, 1 },
+    { "x3", RAD_OPD_IN, 1 }, { "x4", RAD_OPD_IN, 1 }, { "x5", RAD_OPD_IN, 1 }, { "x6", RAD_OPD_IN, 1 },
+    { "x7", RAD_OPD_IN, 1 },
+};
+static const RadOperandSpec oStageRecv[] = {
+    { "ring", RAD_OPD_IN, 0 }, { "y0", RAD_OPD_OUT, 0 }, { "y1", RAD_OPD_OUT, 1 }, { "y2", RAD_OPD_OUT, 1 },
+    { "y3", RAD_OPD_OUT, 1 }, { "y4", RAD_OPD_OUT, 1 }, { "y5", RAD_OPD_OUT, 1 }, { "y6", RAD_OPD_OUT, 1 },
+    { "y7", RAD_OPD_OUT, 1 },
+};
+
 static const RadOperandSpec oScatterRows[] = {
     { "v",   RAD_OPD_IN,    0 },
     { "idx", RAD_OPD_IN,    0 },
@@ -3692,6 +3708,12 @@ static const RadOpSchema kSchemas[] = {
            "The DSpark walk's n_alt next-best first proposals (dflash_select's row-0 scores, the walk's "
            "own first proposal and invalid ids left out, ties to the lower index), each continued "
            "greedily over rows 1..steps-1: alt[s, a*steps + l]; -1 for a branch with no candidate."),
+    SCHEMA("stage_send", pStage, oStageSend,
+           "The two-node pipeline's crossing out of this node (abi/rad_pp.h): the parts packed "
+           "verbatim into the core's ring and published; rank `sender` only. See docs/OPS.md."),
+    SCHEMA("stage_recv", pStage, oStageRecv,
+           "The two-node pipeline's crossing into this node: wait for the other node's payload, "
+           "check it is this step's, copy it out verbatim; every rank. See docs/OPS.md."),
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
            "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
@@ -6338,6 +6360,24 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cNgramIds), NOTUNE,
   nullptr, nullptr, r4d_rad_ngram_ids },
+
+/* tp8 S4: the two-node pipeline's crossings (r4d_stage.hip). Any dtype: the parts move as bytes,
+ * 16 a word, so each part's rows must be a multiple of 16 bytes and 16-byte aligned (refused by name
+ * otherwise). Compiled, never launched in the round that wrote it (no card). */
+{ "stage_send_host_ring", "stage_send", "stage",
+  "a crossing's parts, device -> the core's pinned host ring, then `ready` (system scope)",
+  "any; parts of whole 16-byte words",
+  "any (bytes)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_stage_send },
+{ "stage_recv_host_ring", "stage_recv", "stage",
+  "a crossing's parts, the core's pinned host ring -> device once `landed`, then `taken`",
+  "any; parts of whole 16-byte words",
+  "any (bytes)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_stage_recv },
 
 { "gather_rows_bf16", "gather_rows", "elem",
   "y[i, :] = x[idx[i], :], one workgroup a row",
