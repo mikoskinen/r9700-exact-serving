@@ -11322,6 +11322,69 @@ TEST(noa_psk_design_2_latches_and_plans_every_noa_piece) {
     CHECK(noa_same_at_n(on.pieces[on.p], z.pieces[z.p]));
 }
 
+/* A lever-NOA piece of a lever PSK-CR cone replay is a replay chunk (17.11.2026): beside decoders and a long cold prompt that
+ * holds the step's shared budget, a follow-up whose hit has no snapshot at its grid point replays to it, and the pieces the
+ * running walk turns away come from NOA's pass. Each piece up to the replay's end must be flagged (StepEntry::cr_replay),
+ * its full-group slots -1 and its PSK plan the replay's (flag 1, the replay's end its target), as the walk's own pieces are;
+ * unflagged, the piece wrote its recomputed global KV over the cached rows and ran uncut. */
+TEST(noa_a_piece_of_a_cone_replay_is_a_replay_chunk) {
+    DstSwitches restore;
+    Fixture f;
+    cr_fixture(f);
+    f.cfg.prefill_interleave = 8;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1024);
+    f.sch.set_span_min(16384);
+    f.sch.set_psk_mode(2);
+    f.sch.set_psk_k(4);
+    CHECK_EQ(f.sch.set_psk_cr(1, 5152), 1);
+    CHECK(DstSwitches::set("sched_bi_chunk", 3));
+    CHECK(DstSwitches::set("sched_noa", 2));
+    for (int d = 0; d < 4; ++d) f.submit(100, 4000);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t L = f.submit(40000, 2);
+    for (int k = 0; k < 2; ++k)
+        if (f.sch.step()) f.commit_plain(11);
+    f.pc.seed(26000);
+    f.pc.lin = 14336;
+    f.pc.src = 5;
+    const uint64_t a = f.submit(32000, 1);
+    int pieces = 0, beside = 0;
+    for (int s = 0; s < 400 && f.sch.find(a) && f.sch.find(a)->n_computed < 22528; ++s) {
+        const RadBatch* b = f.sch.step();
+        if (!b) break;
+        const StepPlan& pl = f.sch.plan();
+        int ia = -1, npf = 0, kpf = -1;
+        int64_t row = 0;
+        for (size_t i = 0; i < pl.e.size(); ++i) {
+            if (pl.e[i].seq == a) { ia = (int)i; kpf = npf; }
+            if (pl.e[i].is_prefill) ++npf;
+            if (ia < 0) row += pl.e[i].n_tokens;
+        }
+        if (ia >= 0 && pl.e[(size_t)ia].is_prefill && pl.e[(size_t)ia].ctx_len < 22528) {
+            const StepEntry& e = pl.e[(size_t)ia];
+            ++pieces;
+            if (npf > 1) ++beside;
+            CHECK(e.cr_replay);
+            CHECK(e.ctx_len + e.n_tokens <= 22528);
+            int neg = 0;
+            for (int64_t t = 0; t < e.n_tokens; ++t) neg += b->kv[0].slot_mapping[row + t] < 0;
+            CHECK_EQ(neg, (int)e.n_tokens);
+            std::vector<int32_t> ahead, rows, flags;
+            int64_t dec = 0;
+            REQUIRE(f.sch.psk_plan(b->step, &ahead, &rows, &dec, &flags));
+            REQUIRE(kpf >= 0 && (size_t)kpf < flags.size());
+            CHECK_EQ(flags[(size_t)kpf], 1);
+            CHECK_EQ((int64_t)ahead[(size_t)kpf], (int64_t)(22528 - (e.ctx_len + e.n_tokens)));
+        }
+        f.commit_plain(11);
+    }
+    CHECK(pieces >= 2);
+    CHECK(beside >= 1);   /* at least one replay piece shared its step with L's chunk: NOA's */
+    (void)L;
+}
+
 /* With the bypass (sched_short_bypass 1280, sched_bypass_total 4096; held steps): the 1100-token newcomer is bypassed on
  * the first held step, the 1330 (over N, one alone piece) and the 4419 (over T) are turned away and NOA runs them in L's
  * next chunk steps, all on alone's pieces; L's chunks as with the bypass alone. */
