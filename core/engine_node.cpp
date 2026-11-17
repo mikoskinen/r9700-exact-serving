@@ -281,8 +281,7 @@ int Engine::pp_connect() {
     o.no_x1 = fe_on;
     if (fe && !std::strcmp(fe, "1"))
         RAD_INFO("two-node pipeline: RADIANCE_PP_FOLLOWER_EMBED=1 %s", fe_on
-                     ? "-- the follower looks the step's embedding up itself; the leader's head part issues no lookup "
-                       "and no X1 (tp8 dev 1a)"
+                     ? "-- the follower looks the step's embedding up itself; the leader sends no X1 (tp8 dev 1a)"
                      : fmt("is not taken at W(%d,%d): X1 is the residual after layer %d (it applies at W(0, t) only)",
                            cfg_.pp_cut_h, cfg_.pp_cut_t, cfg_.pp_cut_h - 1).c_str());
     std::string err;
