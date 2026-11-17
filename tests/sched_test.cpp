@@ -12731,12 +12731,12 @@ struct Lanes {
     int64_t win = 0, win_pool = 0, seqs = 6;
     int win_g = -1;
     /* tp8 loop M2: the step budget, context and stager floor (the DS line's 4160 / 1024 for lever DST's cases) */
-    int64_t max_tok = 64, max_ctx = 1024, stage_rows = 0;
+    int64_t max_tok = 64, max_ctx = 1024, stage_rows = 0, kv_blocks = 4096;
     ~Lanes() { for (auto& s : more) s->fini(); s0.fini(); }
     Scheduler& at(int l) { return l == 0 ? s0 : *more[(size_t)(l - 1)]; }
     int start(int n, int64_t split_min = 16) {
-        prog.meta.n_ctx_train = 4096;
-        prog.meta.n_vocab = 65536;
+        prog.meta.n_ctx_train = std::max<int64_t>(4096, max_ctx);
+        prog.meta.n_vocab = std::max<int64_t>(65536, max_ctx + 2000);   /* tp8 prefill P1: prompt ids base + i */
         prog.ops.emplace_back();
         prog.buffers.emplace_back();
         KVGroupInfo attn;
@@ -12767,7 +12767,7 @@ struct Lanes {
         cfg.prefix_cache = false;
         cfg.prefill_room_gate = false;
         cfg.n_spec = 0;
-        kv.setup(prog.kv_groups, cfg.max_ctx, 4096, 64);
+        kv.setup(prog.kv_groups, cfg.max_ctx, kv_blocks, 64);
         if (win > 0) {
             kv.slide = true;
             if (win_pool > 0) kv.resize_group(win_g, win_pool);
@@ -13358,28 +13358,31 @@ TEST(lanes_a_home_chunk_waits_for_its_lent_chunk_when_the_window_pool_is_short) 
     }
 }
 
-/* tp8 prefill P1 (RADIANCE_PP_SPAN=0, LaneSet::set_span): under lanes a lone cold prompt plans one checkpoint interval a
- * chunk instead of --prefill-span 2's span -- exactly the plan one lane makes at --prefill-span 1 (every boundary an
- * interval boundary, the published host-staged build's grid) -- and its chunks alternate over the lanes with two in
- * flight, the window keys read right; with the span on the lanes run one lane's span plan, as before. */
-TEST(lanes_span_off_runs_a_lone_prompt_in_interval_chunks_over_the_lanes) {
-    /* ex 1: --prefix-resume exact's chunk geometry, as a pipeline node plans it (Config::pp_plan_prefix, cc7edd8; the
-     * cards run the prefix cache on): plan_chunk's exact path, resume grid span x interval */
+/* tp8 prefill P1 (RADIANCE_PP_SPAN=0, LaneSet::set_span; FINDINGS F3 21:38): under lanes a lone cold prompt plans the span
+ * plan's pieces and cuts each at its interior interval boundaries that leave >= 128 rows a side -- every boundary of the
+ * span plan stays (the 64k prompt's tail: 1536 + 626, never 512 + 114, whose 114-row last piece moved the near tie on the
+ * cards), the pieces between are whole intervals -- and the chunks alternate over the lanes; with the span on the lanes
+ * run one lane's span plan, as before. The DS line's geometry (interval 2048, 4160, span 2, stager 1024), both the
+ * nearest and --prefix-resume exact's chunk geometry (Config::pp_plan_prefix: the cards' path), a window group. */
+TEST(lanes_span_off_cuts_the_span_plan_only_at_interior_interval_boundaries) {
     for (int ex : { 0, 1 })
-    for (int n_prompt : { 100, 200, 333 }) {
-        std::vector<std::pair<int, int>> ref_i, ref_s;
-        for (int arm = 0; arm < 6; ++arm) {
-            /* 0: one lane span 1 (the interval plan), 1: one lane span 2 (the span plan), 2 / 3: 2 / 3 lanes span 2 with
-             * the span off under lanes, 4: 2 lanes span 2 with it on, 5: 2 lanes span 1 */
-            const int lanes = arm == 2 || arm == 4 || arm == 5 ? 2 : arm == 3 ? 3 : 1;
+    for (int n_prompt : { 8500, 15777, 20000, 65650 }) {
+        std::vector<std::pair<int, int>> ref_s;
+        for (int arm = 0; arm < 3; ++arm) {
+            /* 0: one lane (the span plan), 1: 2 lanes span off, 2: 2 lanes span on */
+            const int lanes = arm == 0 ? 1 : 2;
             Lanes L;
-            L.cfg.prefill_span = arm == 0 || arm == 5 ? 1 : 2;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
             L.cfg.pp_plan_prefix = ex == 1;
-            L.grid = 32;                             /* a linear group: chunks on a 32-token interval grid */
+            L.max_tok = 4160;
+            L.max_ctx = 70000;
+            L.kv_blocks = 8192;
+            L.stage_rows = 1024;
             L.win = 16;
             L.seqs = 6;
             REQUIRE_EQ(L.start(lanes), RAD_OK);
-            if (arm == 2 || arm == 3) L.set.set_span(false);
+            if (arm == 1) L.set.set_span(false);
             const uint64_t s = L.submit(0, n_prompt, 2);
             REQUIRE(s != 0);
             int64_t misses = 0;
@@ -13389,18 +13392,25 @@ TEST(lanes_span_off_runs_a_lone_prompt_in_interval_chunks_over_the_lanes) {
             CHECK_EQ(misses, (int64_t)0);
             REQUIRE(L.req(0, s) != nullptr);
             CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
-            for (size_t i = 0; i + 1 < got.size(); ++i) CHECK_EQ(got[i].second % 32, 0);   /* interval boundaries */
-            if (arm == 0) ref_i = got;
-            else if (arm == 1) ref_s = got;
-            else if (arm == 4) CHECK(got == ref_s);
-            else CHECK(got == ref_i);
-            const LaneSet::Counts c = L.set.counts();
-            if (lanes > 1) CHECK(c.pieces > 0);
-            if (arm == 2) fprintf(stderr, "    %s%d tokens: span plan %zu chunks, interval plan %zu; 2 lanes span off: %zu chunks, "
-                                          "%lld lent\n", ex ? "exact geometry, " : "", n_prompt, ref_s.size(), ref_i.size(),
-                                  got.size(), (long long)c.pieces);
+            if (arm == 0) { ref_s = got; continue; }
+            if (arm == 2) { CHECK(got == ref_s); continue; }
+            /* the span plan with each piece cut at interior interval boundaries, >= 128 rows a side */
+            std::vector<std::pair<int, int>> want;
+            for (const auto& [a, b] : ref_s) {
+                int at = a;
+                for (int e = (at / 2048 + 1) * 2048; e < b; e += 2048)
+                    if (e - at >= 128 && b - e >= 128) { want.emplace_back(at, e); at = e; }
+                want.emplace_back(at, b);
+            }
+            CHECK(got == want);
+            CHECK(L.set.counts().pieces > 0);
+            std::string t;
+            for (size_t k = got.size() >= 3 ? got.size() - 3 : 0; k < got.size(); ++k)
+                t += fmt(" [%d, %d)", got[k].first, got[k].second);
+            fprintf(stderr, "    %s%d tokens: span plan %zu chunks, span off at 2 lanes %zu (%s), tail%s, %lld lent\n",
+                    ex ? "exact, " : "", n_prompt, ref_s.size(), got.size(), got == want ? "= the cut span plan" : "DIFFERENT",
+                    t.c_str(), (long long)L.set.counts().pieces);
         }
-        CHECK(ref_i.size() > ref_s.size());
     }
 }
 

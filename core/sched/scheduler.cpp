@@ -1904,6 +1904,26 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
         }
     }
 
+    /* tp8 prefill P1 (RADIANCE_PP_SPAN=0 under lanes; FINDINGS F3 21:38): a lone prefill's span piece is cut at its first
+     * interior checkpoint-interval boundary leaving >= kBiMinPiece rows on both sides. Every boundary of the span plan
+     * stays (its tail pieces to the row: 64k's 1536 + 626, never the interval walk's 512 + 114, whose 114-row last piece
+     * moved S4's near tie), and the pieces between are whole intervals (exact: S4 hw's tracer, 2048- vs 4096-row chunks
+     * row-identical), so two lanes carry two of its intervals at once. A chunk with a snapshot inside it (lever TI) is not
+     * cut; the cut chunk's own snapshot is the one a chunk ending there takes (a periodic one on the resume grid). */
+    if (span_now_ && lane_span_cut() && geo_.checkpoints() && geo_.checkpoint_interval > 0 &&
+        !(checkpoint_pos && *checkpoint_pos > n_computed && *checkpoint_pos < n_computed + want)) {
+        const int64_t I = geo_.checkpoint_interval, end = n_computed + want;
+        for (int64_t e = (n_computed / I + 1) * I; e < end; e += I)
+            if (e - n_computed >= kBiMinPiece && end - e >= kBiMinPiece) {
+                want = e - n_computed;
+                if (checkpoint_pos) {
+                    const bool periodic = !geo_.window_ckpt || geo_.window_periodic;
+                    *checkpoint_pos = periodic && (!geo_.exact || geo_.on_grid(e)) ? e : -1;
+                }
+                break;
+            }
+    }
+
     if (want < remaining) {
         /* A non-final chunk must end on a quantum boundary measured from the sequence origin,
          * or the next chunk hands the linear kernel a partial tile and attention a partial
@@ -2148,10 +2168,12 @@ void Scheduler::psk_ckpt(const SchedReq& s, int64_t n, int64_t* ckpt) {
 }
 
 /* ------------------------------------------------------------------ a prefill sharing a step */
-/* Whether the chunk an idle engine plans for r (the alone piece) spans: --prefill-span's rule for a lone prefill, and
- * under lanes RADIANCE_PP_SPAN=0 (LaneSet::span_on) none -- the same rule step() takes for its lone prefill. */
+/* Whether the chunk an idle engine plans for r (the alone piece) spans: --prefill-span's rule for a lone prefill (the
+ * same rule step() takes for its lone prefill). Under lanes RADIANCE_PP_SPAN=0 a span piece is still planned as the span
+ * and then cut at its interior interval boundaries (plan_chunk, lane_span_cut). */
+bool Scheduler::lane_span_cut() const { return lanes_ && n_lanes_ > 1 && !lanes_->span_on(); }
+
 bool Scheduler::alone_spans(const Request& r, int64_t target) const {
-    if (lanes_ && n_lanes_ > 1 && !lanes_->span_on()) return false;
     return bi_chunk_ != 2 && cfg_.prefill_span > 1 &&
            (span_min_ == 0 || std::max<int64_t>((int64_t)r.prompt.size(), target) >= span_min_);
 }
@@ -3120,9 +3142,6 @@ const RadBatch* Scheduler::step() {
             lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
         }
         span_now_ = bi_chunk_ == 2 ? false : lone;
-        /* tp8 prefill P1 (RADIANCE_PP_SPAN=0, LaneSet::span_on): under lanes a lone prefill plans one interval a chunk;
-         * its budget stays the lone step's */
-        if (span_now_ && lanes_ && n_lanes_ > 1 && !lanes_->span_on()) span_now_ = false;
         /* lever DST: the shared budget in force (sched_mixed_tok); B (2) keeps whole intervals on the geometry's own */
         if (!lone && bi_chunk_ != 1) budget = bi_chunk_ == 2 ? geo_.shared_tok : mixed_now_;
     }
