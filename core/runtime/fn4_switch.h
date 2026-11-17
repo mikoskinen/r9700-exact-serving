@@ -600,7 +600,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kSchedRowCap, kDs41MixWv, kDs41Gq, kDs41E2, kSchedCbHoldMs, kSchedCbHoldK, kExl3X3d,
               kArXpush, kGgGemvM16, kPlaceSwapLent, kHeatMinGainX100, kHeatHystX100, kDs41Rfuse, kDs41MixFin,
               kRouteCopyOv, kDs41Wmk, kDs41Moe1, kSchedTailGrid, kDraftDcap, kDraftDcapN, kExl3Dng, kDs41F32Dec,
-              kExl3Xr, kSchedTailInner, kSwitches };
+              kExl3Xr, kSchedTailInner, kStageLone, kSwitches };
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
  * runs (note_sched). */
 bool sched_switch(int i);
@@ -704,6 +704,10 @@ int  sched_tail_inner();
  * device address of the step's mapped token ids (one i32 a row, in the batch's row order) and the window's ids `ctx`
  * (conv_width - 1). 1 when a plugin serves it, else 0. */
 int  ckpt_conv_src(int rank, const void** ids, int* ctx);
+/* Lever SAL (ds41-pf2, stage_lone; 80 here, after sched_tail_inner): 1 = lever SA's stage_short arms the prefill stager only on a
+ * step with no decode rows (a lone prefill's chunk at the span's shared level: a prompt shorter than the span's minimum, a long
+ * prompt's first interval, a turn's tail), never beside decoding sequences; 0 = stage_short as built (any step it admits). The
+ * engine's (handed over at a step release, as stage_short). */
 static constexpr int kNoaCounts = 10;   /* admitted, pieces, rows, displaced, waited, steps, pf_steps_1 .. 4plus */
 void note_sched_noa(const int64_t* v);
 /* Lever CAP48 (sched_row_cap): the switch once set, else RADIANCE_DECODE_ROW_CAP (0 .. 4096) at start, else 0 (off). The
