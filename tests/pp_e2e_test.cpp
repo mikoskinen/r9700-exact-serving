@@ -466,11 +466,92 @@ TEST(a_follower_with_a_smaller_cache_caps_the_leaders_and_the_recording_holds) {
     const PipeRun pr = record_pipeline(d / "pp", "0,2", { "RADIANCE_HOST_VRAM_MIB=120" }, big, big);
     CHECK_EQ(pr.leader, 0);
     CHECK_EQ(pr.follower, 0);
-    const bool capped = pr.llog.find("KV capped at the follower's") != std::string::npos;
-    if (!capped) fprintf(stderr, "    leader:\n%s\n", tail(pr.llog, 30).c_str());
+    /* Review F1: both cap before the carve, at the follower's count, and rendezvous 2 found every
+     * group's block count equal (it refuses otherwise). */
+    const bool capped = pr.llog.find("KV capped on both nodes before the carve") != std::string::npos &&
+                        pr.flog.find("KV capped on both nodes before the carve") != std::string::npos;
+    if (!capped) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(pr.llog, 30).c_str(), tail(pr.flog, 30).c_str());
     CHECK(capped);
+    const std::string tag = "KV capped on both nodes before the carve at ";
+    const size_t at_l = pr.llog.find(tag), at_f = pr.flog.find(tag);
+    if (at_l != std::string::npos && at_f != std::string::npos) {
+        const long long nl = std::atoll(pr.llog.c_str() + at_l + tag.size());
+        const long long nf = std::atoll(pr.flog.c_str() + at_f + tag.size());
+        fprintf(stderr, "    both nodes capped at %lld / %lld tokens\n", nl, nf);
+        CHECK_EQ(nl, nf);
+        CHECK(pr.llog.find("pages " + std::to_string(nl) + ",") == std::string::npos);   /* the leader paged more */
+    }
     std::string why;
     CHECK(same_recording(ref, d / "pp", &why));
+}
+
+/* Review F2 / F3: a switch POSTed to the leader reaches the follower when it acts on the follower's
+ * passes (aql_acq), stays the leader's when it is the scheduler's (sched_row_cap), and a value neither
+ * node takes is refused naming both -- the leader asked the follower -- while the pair serves on with
+ * the tokens one process serves. GET reports the follower's values ("peer"). */
+TEST(a_switch_request_reaches_the_follower_and_the_pair_serves_on) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(31, 50);
+    std::vector<int32_t> ref;
+    {
+        Serving one;
+        REQUIRE(one.start(""));
+        ref = complete(one.port, p, 16);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    Serving pp;
+    REQUIRE(pp.start("0,2"));
+    CHECK(complete(pp.port, p, 16) == ref);
+    std::string out;
+    Call c;
+    int st = c.send(pp.port, "/admin/fn4", json{ { "aql_acq", 1 }, { "sched_row_cap", 48 } }.dump()) ? c.read(&out) : -1;
+    CHECK_EQ(st, 200);
+    CHECK(complete(pp.port, p, 16) == ref);   /* the step that applies them, and its follower step */
+    Call c2;
+    st = c2.send(pp.port, "/admin/fn4", json{ { "gg_gemv", 7 } }.dump()) ? c2.read(&out) : -1;
+    CHECK_EQ(st, 400);
+    const bool both = out.find("the pipeline's other node refuses it too") != std::string::npos;
+    if (!both) fprintf(stderr, "    POST gg_gemv 7: %d %s\n", st, out.c_str());
+    CHECK(both);
+    CHECK(complete(pp.port, p, 16) == ref);
+    /* GET: the leader's values and the follower's. */
+    Call g;
+    bool got = false;
+    if (g.send(pp.port, "/admin/fn4", "")) {
+        st = g.read(&out);
+        const json j = json::parse(out, nullptr, false);
+        got = st == 200 && j.is_object() && j.contains("peer") && j["peer"].contains("switches") &&
+              j["peer"]["switches"].value("aql_acq", -9) == 1 && !j["peer"]["switches"].contains("sched_row_cap") &&
+              j["switches"].value("sched_row_cap", -9) == 48;
+        if (!got) fprintf(stderr, "    GET /admin/fn4: %d %s\n", st, out.substr(0, 600).c_str());
+    }
+    CHECK(got);
+    kill(pp.lead.child.pid, SIGTERM);
+    CHECK_EQ(pp.lead.finish(60), 0);
+    CHECK_EQ(pp.fol.finish(30), 0);
+    const std::string flog = pp.fol.output();
+    CHECK(flog.find("aql_acq=1") != std::string::npos);
+    CHECK(flog.find("sched_row_cap") == std::string::npos);
+    CHECK(flog.find("cannot take the leader's switch") == std::string::npos);
+}
+
+/* Robustness 5: a stopped follower (docker stop = SIGTERM) tells the leader why before it goes:
+ * the leader fails its requests naming the stop, the follower exits 0. */
+TEST(a_stopped_follower_tells_the_leader_and_exits_cleanly) {
+    REQUIRE(world().ok);
+    Serving pp;
+    REQUIRE(pp.start("0,2"));
+    CHECK(!complete(pp.port, prompt_ids(41, 40), 8).empty());
+    kill(pp.fol.child.pid, SIGTERM);
+    const int fs = pp.fol.finish(30);
+    const int ls = pp.lead.finish(30);
+    fprintf(stderr, "    follower exit %d, leader exit %d\n", fs, ls);
+    CHECK_EQ(fs, 0);
+    CHECK(ls != 0 && ls != 124);
+    const bool named = pp.lead.output().find("the follower was stopped") != std::string::npos;
+    if (!named) fprintf(stderr, "    leader:\n%s\n", tail(pp.lead.output()).c_str());
+    CHECK(named);
 }
 
 }  /* namespace */

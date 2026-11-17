@@ -880,7 +880,59 @@ int Engine::prepare_release(const RadBatch* b) {
     {
         int sw[fn4::kSwitches];
         const bool fn4_changed = fn4::apply_pending(b ? b->step : -1, sw);
-        if (fn4_changed) {
+        if (fn4_changed) fn4_apply_changes(sw);
+        /* Lever PSK design 2: the plugin's ds41_psk as the scheduler plans by it (2 / 3 anchors), read once and after
+         * every change (a request takes it at admission) */
+        if (fn4_changed || !psk_mode_read_) {
+            psk_mode_read_ = true;
+            sched_.set_psk_mode(fn4::value(fn4::kDs41Psk));
+            /* lever PSK-CR (ds41-pskcr): the plugin's ds41_psk_cr and the replay's reach, read with the mode */
+            sched_.set_psk_cr(fn4::value(fn4::kDs41PskCr), fn4::psk_cr_reach());
+        }
+    }
+    psk_release(b);
+    /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
+     * own balance(), behind the step's trunk pass); and the report. Nothing when undeclared. */
+    if (dl_capable_) {
+        const bool want = sched_.draft_lend_wanted();
+        for (auto& r : ranks_) r->mover.set_draft_lend(want);
+        uint64_t ch = 0;
+        const int state = draft_lend_state(&ch);
+        const Mover& m0 = ranks_[0]->mover;
+        fn4::note_lend_engine(state, (int64_t)m0.draft_lends(), (int64_t)m0.draft_reclaims(), m0.draft_lent_units(),
+                              m0.draft_resident(), m0.draft_units(), m0.draft_slab_bytes() >> 20);
+    }
+    /* Lever Z0-W: the drafter's query-pass weights lent while the slab's lend is wanted and this step runs no
+     * head; recalled (and copied back) before a step whose head runs. Every rank thread is parked. */
+    if (const int ws = draft_w_step(); ws < 0) return ws;
+    /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
+     * parked, so the level can change and a recall can drain both streams. */
+    if (const int as = arena_step(b); as < 0) return as;
+    sahb_note();
+    /* Grow the followers' pools to match rank 0's before the step's block table is used:
+     * admission grew rank 0's cache and the new ids are already in the table. Done here, not on
+     * the 100 ms arbiter tick, because the step is about to run; safe because every rank thread is
+     * parked. */
+    for (size_t i = 1; i < ranks_.size(); ++i) {
+        if (rad_dev_set(ranks_[i]->device) < 0) continue;
+        if (ranks_[i]->kv.follow(ranks_[0]->kv) < 0)
+            step_status_.store(RAD_E_NOMEM, std::memory_order_release);
+    }
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
+     * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
+     * parked, so no allocation races the read. */
+    kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
+    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
+    return RAD_OK;
+}
+
+/* fn4: the switch values apply_pending handed over (kNoChange where none), to their owners -- the
+ * scheduler's setters, the engine's own levers, every rank's mover and heat engine. Every rank thread
+ * is parked. A pipeline's follower runs the same (tp8 S4: its placement levers). */
+void Engine::fn4_apply_changes(const int* sw) {
+    {
+        {
             /* Lever PSK design 2: the scheduler's anchor stride */
             if (sw[fn4::kDs41PskK] != fn4::kNoChange)
                 fn4::note_sched(fn4::kDs41PskK, sched_.set_psk_k(sw[fn4::kDs41PskK]));
@@ -989,50 +1041,7 @@ int Engine::prepare_release(const RadBatch* b) {
                 fn4::note_sched(fn4::kPlaceHb, R);
             }
         }
-        /* Lever PSK design 2: the plugin's ds41_psk as the scheduler plans by it (2 / 3 anchors), read once and after
-         * every change (a request takes it at admission) */
-        if (fn4_changed || !psk_mode_read_) {
-            psk_mode_read_ = true;
-            sched_.set_psk_mode(fn4::value(fn4::kDs41Psk));
-            /* lever PSK-CR (ds41-pskcr): the plugin's ds41_psk_cr and the replay's reach, read with the mode */
-            sched_.set_psk_cr(fn4::value(fn4::kDs41PskCr), fn4::psk_cr_reach());
-        }
     }
-    psk_release(b);
-    /* Lever DL: the lend's target for this step, to every rank's mover (each moves its slab in its
-     * own balance(), behind the step's trunk pass); and the report. Nothing when undeclared. */
-    if (dl_capable_) {
-        const bool want = sched_.draft_lend_wanted();
-        for (auto& r : ranks_) r->mover.set_draft_lend(want);
-        uint64_t ch = 0;
-        const int state = draft_lend_state(&ch);
-        const Mover& m0 = ranks_[0]->mover;
-        fn4::note_lend_engine(state, (int64_t)m0.draft_lends(), (int64_t)m0.draft_reclaims(), m0.draft_lent_units(),
-                              m0.draft_resident(), m0.draft_units(), m0.draft_slab_bytes() >> 20);
-    }
-    /* Lever Z0-W: the drafter's query-pass weights lent while the slab's lend is wanted and this step runs no
-     * head; recalled (and copied back) before a step whose head runs. Every rank thread is parked. */
-    if (const int ws = draft_w_step(); ws < 0) return ws;
-    /* The arena level, recalling lent arena memory if this step needs it. Every rank thread is
-     * parked, so the level can change and a recall can drain both streams. */
-    if (const int as = arena_step(b); as < 0) return as;
-    sahb_note();
-    /* Grow the followers' pools to match rank 0's before the step's block table is used:
-     * admission grew rank 0's cache and the new ids are already in the table. Done here, not on
-     * the 100 ms arbiter tick, because the step is about to run; safe because every rank thread is
-     * parked. */
-    for (size_t i = 1; i < ranks_.size(); ++i) {
-        if (rad_dev_set(ranks_[i]->device) < 0) continue;
-        if (ranks_[i]->kv.follow(ranks_[0]->kv) < 0)
-            step_status_.store(RAD_E_NOMEM, std::memory_order_release);
-    }
-    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-    /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
-     * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
-     * parked, so no allocation races the read. */
-    kvstream_step_runs(ranks_[0]->kv, b, sched_.step_seqs(b), &stage_runs_);
-    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
-    return RAD_OK;
 }
 
 void Engine::psk_release(const RadBatch* b) {
@@ -2568,6 +2577,9 @@ void Engine::drain_completed() {
  * remainder_place). */
 void Engine::clear_fresh_states() {
     for (const StateClear& c : ranks_[0]->kv.state_clears()) {
+        /* tp8 S4 (review F4): a pipeline's follower zeroes the same slots of its own groups before the
+         * step (shipped with it); nothing on one machine. */
+        if (pp_link_) pp_clears_.emplace_back(c.group, c.slot);
         for (auto& rk : ranks_) {
             const KVGroupPlan* gp = rk->kv.plan(c.group);
             if (!gp || !gp->stateful()) continue;
@@ -2579,6 +2591,8 @@ void Engine::clear_fresh_states() {
     }
     ranks_[0]->kv.clear_state_clears();
 }
+
+namespace { void install_follower_stop_signals(); }
 
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
@@ -2864,6 +2878,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
+    /* tp8 S4 (robustness 5): a pipeline's follower serves no HTTP, so run_server's handler is not
+     * installed there; a stop signal ends its loop and tells the leader (kBye). */
+    if (pp_follower()) install_follower_stop_signals();
     std::thread stepper([this] {
         if (gen_) gen_loop();
         else if (pp_follower()) (void)follower_loop();
@@ -3040,6 +3057,18 @@ std::string Engine::engine_info() const {
 namespace {
 std::atomic<bool> g_signalled{false};
 void on_signal(int) { g_signalled.store(true, std::memory_order_relaxed); }
+/* tp8 S4: the same handler on a pipeline's follower (Engine::follower_loop polls it). */
+void install_follower_stop_signals() {
+    struct sigaction sa {};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+}  /* namespace */
+bool Engine::pp_stop_requested() const { return g_signalled.load(std::memory_order_relaxed); }
+namespace {
 
 /* ================================================================== sampling defaults */
 /* The sampler for a request that sends no sampler settings. Parsing and range checks live in

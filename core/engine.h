@@ -394,9 +394,31 @@ private:
      * switches and the PSK plan prepare_release applied). */
     bool       pp_trunk_pending_ = false;
     int64_t    pp_steps_shipped_ = 0, pp_builds_shipped_ = 0;
+    bool       pp_closed_ = false;
     /* The PSK plan psk_release handed the plugin for the step being released, for the follower. */
     bool       psk_last_valid_ = false;
     int64_t    psk_last_dec_ = 0;
+    /* Review F2 / F3: the follower's count of the leader's switch requests it took (fn4::follow);
+     * the leader's ask of the follower (fn4::set_peer_check), one at a time. */
+    uint32_t   pp_fn4_taken_[256] = {};
+    std::mutex pp_ask_mu_, pp_ans_mu_;
+    std::condition_variable pp_ans_cv_;
+    uint64_t   pp_ask_seq_ = 0, pp_ans_seq_ = 0;
+    int        pp_ans_verdict_ = 0;
+    std::string pp_ans_why_;
+    int  pp_peer_check(const std::string& name, int v, std::string* why);
+    void pp_send_fn4_state();
+    /* Review F4: the state slots the leader zeroed since its last trunk ship (group, slot); the
+     * follower zeroes the same before the pass. */
+    std::vector<std::pair<int32_t, int32_t>> pp_clears_;
+    /* Review robustness 1(e): the drafter builds made since the last trunk ship, as their frames,
+     * sent from the step loop before the next trunk (outside the scheduler's lock). */
+    std::vector<std::pair<int32_t, std::vector<uint8_t>>> pp_draft_q_;
+    /* The step frame of build `b`: header + PSK plan + clears + wire in `out`, the span (the
+     * builder's until its next build) in `span` / `span_n`. */
+    int  pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, const char** span, int64_t* span_n);
+    /* Robustness 5: SIGTERM / SIGINT reached a follower (serve() installs the handler there). */
+    bool pp_stop_requested() const;
     bool pp_on() const { return cfg_.pp_nodes == 2; }
     bool pp_leader() const { return cfg_.pp_nodes == 2 && cfg_.pp_rank == 0; }
     bool pp_follower() const { return cfg_.pp_nodes == 2 && cfg_.pp_rank == 1; }
@@ -404,6 +426,9 @@ private:
     int  pp_check();
     /* The link and the first rendezvous, after the plugins load and before declare. */
     int  pp_connect();
+    /* configure_kv, before any rank carves (review F1): both nodes send the tokens their ranks can
+     * page and cap at the least, so every KV group holds the same block count on both. */
+    int  pp_kv_agree(int64_t* least);
     /* After the scheduler's init in serve(): the rings, the second rendezvous (KV, the step
      * batch's layout, the crossings), the verbs path, the link's threads, the leader's build hook. */
     int  pp_serve_setup();
@@ -510,6 +535,9 @@ private:
     int  issue_ahead(const RadBatch** out);
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
+    /* The fn4 values apply_pending handed over, to their owners (prepare_release; a pipeline's
+     * follower after it applied the leader's requests). */
+    void fn4_apply_changes(const int* sw);
     /* Lever PSK design 2 (ds41-psk2), at a step's release with every rank parked: the scheduler's plan for the step's
      * trunk pass to the plugin (fn4::psk_plan), and the pass's layer end to every rank's stager (INT32_MAX: every
      * layer, the default and every pass without a plan). */

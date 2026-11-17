@@ -4047,6 +4047,11 @@ int Engine::configure_kv() {
         if (t == KVManager::kUnboundedTokens) continue;   /* holds no cache; limits nobody */
         if (least < 0 || t < least) least = t;
     }
+    /* tp8 S4 (review F1): one block table serves both nodes of a two-node pipeline, so both cap
+     * at the smaller node's tokens before either carves -- every group, a zeroed one included,
+     * then holds the same block count on both (rendezvous 2 compares them). Nothing on one
+     * machine (no link). */
+    if (pp_link_) RAD_TRY(pp_kv_agree(&least));
     /* The mirrors are checked once, before any rank pins one, against the host tiers still to be
      * pinned after them: the prefix cache's, the activation arenas and, when sized already, the
      * checkpoint store. */
@@ -4066,7 +4071,7 @@ int Engine::configure_kv() {
     for (auto& r : ranks_) {
         LogRank lr(r->index);
         RAD_TRY(rad_dev_set(r->device));   /* allocates on the current device; see plan() */
-        if (ranks_.size() > 1) {
+        if (ranks_.size() > 1 || pp_link_) {
             const int64_t own = r->kv.paged_tokens(r->pools.kv().avail());
             if (own > least && own != KVManager::kUnboundedTokens)
                 RAD_INFO("kv: rank %d could page %lld tokens and carves %lld, the least rank's, so "
