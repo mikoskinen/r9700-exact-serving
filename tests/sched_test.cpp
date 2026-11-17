@@ -13363,6 +13363,9 @@ TEST(lanes_a_home_chunk_waits_for_its_lent_chunk_when_the_window_pool_is_short) 
  * interval boundary, the published host-staged build's grid) -- and its chunks alternate over the lanes with two in
  * flight, the window keys read right; with the span on the lanes run one lane's span plan, as before. */
 TEST(lanes_span_off_runs_a_lone_prompt_in_interval_chunks_over_the_lanes) {
+    /* ex 1: --prefix-resume exact's chunk geometry, as a pipeline node plans it (Config::pp_plan_prefix, cc7edd8; the
+     * cards run the prefix cache on): plan_chunk's exact path, resume grid span x interval */
+    for (int ex : { 0, 1 })
     for (int n_prompt : { 100, 200, 333 }) {
         std::vector<std::pair<int, int>> ref_i, ref_s;
         for (int arm = 0; arm < 6; ++arm) {
@@ -13371,6 +13374,7 @@ TEST(lanes_span_off_runs_a_lone_prompt_in_interval_chunks_over_the_lanes) {
             const int lanes = arm == 2 || arm == 4 || arm == 5 ? 2 : arm == 3 ? 3 : 1;
             Lanes L;
             L.cfg.prefill_span = arm == 0 || arm == 5 ? 1 : 2;
+            L.cfg.pp_plan_prefix = ex == 1;
             L.grid = 32;                             /* a linear group: chunks on a 32-token interval grid */
             L.win = 16;
             L.seqs = 6;
@@ -13392,8 +13396,9 @@ TEST(lanes_span_off_runs_a_lone_prompt_in_interval_chunks_over_the_lanes) {
             else CHECK(got == ref_i);
             const LaneSet::Counts c = L.set.counts();
             if (lanes > 1) CHECK(c.pieces > 0);
-            if (arm == 2) fprintf(stderr, "    %d tokens: span plan %zu chunks, interval plan %zu; 2 lanes span off: %zu chunks, "
-                                          "%lld lent\n", n_prompt, ref_s.size(), ref_i.size(), got.size(), (long long)c.pieces);
+            if (arm == 2) fprintf(stderr, "    %s%d tokens: span plan %zu chunks, interval plan %zu; 2 lanes span off: %zu chunks, "
+                                          "%lld lent\n", ex ? "exact geometry, " : "", n_prompt, ref_s.size(), ref_i.size(),
+                                  got.size(), (long long)c.pieces);
         }
         CHECK(ref_i.size() > ref_s.size());
     }
