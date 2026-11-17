@@ -106,8 +106,14 @@ public:
      * lends the pieces one process cuts after this step's piece (its grid, >= 128 rows a side, the room one process plans
      * them at) one a lane to the lanes that plan next, as a cold prompt's chunks go: piece k's follower pass then runs beside
      * piece k - 1's leader tail, and the borrower's decoders keep a decode room beside the piece. Default off. */
-    bool lend_mixed() const { return lend_mixed_; }
-    void set_lend_mixed(bool on) { lend_mixed_ = on; }
+    bool lend_mixed() const { return lend_mixed_ == 1; }
+    void set_lend_mixed(bool on) { lend_mixed_ = on ? 1 : 0; }
+    /* tp8 dev M5b (RADIANCE_PP_LEND_MIXED=2): the published admission (the newcomer planned whole beside decode rows, as one
+     * process plans it) and, at the split, the home's whole-prompt MIXED entry cut on the 512 grid near its middle (>= 128
+     * rows a side; the grid lq21's loadid found answer-neutral), its rest lent to ONE lane with an empty inbox and no request
+     * waiting -- else the entry stays whole. */
+    bool lend_split() const { return lend_mixed_ == 2; }
+    void set_lend_split(bool on) { lend_mixed_ = on ? 2 : 0; }
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
     void set_split(bool on, int64_t min_rows) { split_on_ = on; split_min_ = min_rows > 0 ? min_rows : split_min_; }
@@ -188,7 +194,7 @@ private:
     bool    span_on_ = true;                /* RADIANCE_PP_SPAN (span_on) */
     int64_t span_tail_ = 0;                 /* RADIANCE_PP_SPAN_TAIL (span_tail) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
-    bool    lend_mixed_ = false;            /* RADIANCE_PP_LEND_MIXED (lend_mixed, tp8 dev M5) */
+    int     lend_mixed_ = 0;                /* RADIANCE_PP_LEND_MIXED 1 (lend_mixed, tp8 dev M5) / 2 (lend_split, M5b) */
     int64_t split_min_ = 128;
     bool    head_state_ = false;
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0, dpiece_ = 0;

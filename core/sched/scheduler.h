@@ -1165,6 +1165,7 @@ private:
     int64_t lane_reserve(int64_t budget);
     void    lane_take_inbox();
     void    lane_split_own();
+    void    lane_split_mixed(StepEntry& e);   /* tp8 dev M5b */
     /* The chunk an idle engine (one process, this prompt alone) plans from position `n` of `r`, and the snapshot its
      * end takes (as bi_chunk_plan's alone piece; lever PSK design 2's targets applied): the one-process grid */
     int64_t lane_alone_chunk(const SchedReq& s, Request& r, int64_t target, int64_t n, int64_t* ckpt);
