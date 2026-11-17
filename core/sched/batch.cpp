@@ -754,9 +754,13 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                  * new or moved sequence restages the whole row, and its copies in other rows go
                  * unknown. Change marks are taken for every row. */
                 const int64_t nb = std::min<int64_t>((int64_t)bt.size(), pitch);
-                const int64_t chg = kv.take_table_changes(e.seq, (int32_t)gi);
+                /* tp8 S5: a piece of another lane's sequence (StepEntry::home) is restaged whole and
+                 * leaves the change marks to its home lane's builder, whose slab tracks the sequence:
+                 * taken here, that builder would keep a stale row. The row is unknown afterwards. */
+                const bool foreign = e.home >= 0;
+                const int64_t chg = foreign ? 0 : kv.take_table_changes(e.seq, (int32_t)gi);
                 int64_t lo = 0, hi = pitch;
-                if (m.len[(size_t)i] >= 0 && m.seq[(size_t)i] == e.seq) {
+                if (!foreign && m.len[(size_t)i] >= 0 && m.seq[(size_t)i] == e.seq) {
                     lo = std::min(std::min(chg, m.len[(size_t)i]), nb);
                     hi = std::max(nb, m.len[(size_t)i]);
                 } else {
@@ -774,7 +778,7 @@ int BatchBuilder::build_groups(const StepPlan& plan, const IKVManager& kv, Set& 
                     np += hi - lo;
                 }
                 m.seq[(size_t)i] = e.seq;
-                m.len[(size_t)i] = nb;
+                m.len[(size_t)i] = foreign ? -1 : nb;
             } else {
                 /* A linear or conv group has one state slot per sequence; every token maps to it
                  * and the block-table row is that slot, so table-reading kernels need no second

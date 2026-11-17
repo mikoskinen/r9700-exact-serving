@@ -44,6 +44,10 @@ struct IKVManager {
     /* After a committed step, a window group frees what no later query can read
      * (KVManager::trim_window). */
     virtual void trim_window(uint64_t seq, int64_t keep_from) { (void)seq; (void)keep_from; }
+    /* tp8 S5 (KVManager::set_keep_floor): no window recycle of `seq` past `pos` while a piece of its
+     * prompt is in flight in another lane's step; -1 lifts it. A manager with no window group
+     * ignores it. */
+    virtual void set_keep_floor(uint64_t seq, int64_t pos) { (void)seq; (void)pos; }
     /* R-SWA (KVManager::declare_runtime_window): the W this group arms a sequence with, 0 when it
      * carries no runtime windows. The scheduler arms every sequence it admits with
      * set_window(seq, prompt length, W); a manager with no runtime window refuses it and the
@@ -335,6 +339,7 @@ struct KVBinding final : IKVManager {
     int  ensure(uint64_t s, int64_t n) override     { return m->ensure(s, n); }
     int  ensure_from(uint64_t s, int64_t n, int64_t k) override { return m->ensure(s, n, k); }
     void trim_window(uint64_t s, int64_t k) override { m->trim_window(s, k); }
+    void set_keep_floor(uint64_t s, int64_t p) override { m->set_keep_floor(s, p); }
     int64_t runtime_window_tokens(int32_t g) const override { return m->runtime_window_tokens(g); }
     int  set_window(uint64_t s, int64_t lo, int64_t w) override { return m->set_window(s, lo, w); }
     bool runtime_window(uint64_t s, int32_t g, SeqWindow* o) const override {

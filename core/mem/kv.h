@@ -326,6 +326,10 @@ public:
      * A sequence with a runtime window retains its reference and rewrites its ring in place, so
      * nothing below the floor may be recycled and this is a no-op for it. */
     void trim_window(uint64_t seq, int64_t keep_from);
+    /* tp8 S5: a two-node pipeline's lanes run pieces of one prompt in several steps at once. While
+     * any is in flight its first query `pos` reads keys down to pos - window + 1, so no recycle of
+     * this sequence's window groups (ensure, trim_window) may pass `pos`. -1 lifts it. */
+    void set_keep_floor(uint64_t seq, int64_t pos);
 
     /* ---------------- the runtime window (R-SWA; see SeqWindow) ---------------- */
     /* Mark a WINDOW group as carrying per-sequence runtime windows of `window_tokens`. Call before
@@ -661,6 +665,10 @@ private:
          * sequence. An append or truncation lowers it to where it touched; a shift lowers it to
          * zero; kNoDirty is unchanged. Mutable because take_table_changes() clears it. */
         mutable std::vector<int64_t> dirty_from;
+        /* tp8 S5 (set_keep_floor): the lowest position a query still in flight elsewhere reads from
+         * (a piece of the prompt in another lane's step); a window group keeps what it reads. -1:
+         * none, always on one lane. */
+        int64_t keep_floor = -1;
     };
 
     int  grab_block(int32_t g, int32_t* out);

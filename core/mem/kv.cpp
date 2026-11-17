@@ -1354,6 +1354,8 @@ int64_t KVManager::step_blocks(const KVGroupPlan& p) const {
  * the table is below a sliding floor to recycle; the ring's blocks are rewritten in place and
  * the table never moves (SeqWindow). */
 void KVManager::recycle_window(Seq* s, int64_t keep_from) {
+    /* tp8 S5: a piece of this prompt still in flight in another lane's step reads from here */
+    if (s->keep_floor >= 0 && keep_from > s->keep_floor) keep_from = s->keep_floor;
     for (size_t g = 0; g < plans_.size(); ++g) {
         const auto& p = plans_[g];
         if (p.kind != RAD_KV_WINDOW || s->win[g].set) continue;
@@ -1369,6 +1371,10 @@ void KVManager::recycle_window(Seq* s, int64_t keep_from) {
         if (s->blocks[g].empty()) first = target;   /* nothing held: rebase to the window */
         s->first_block_pos[g] = first * p.block_size;
     }
+}
+
+void KVManager::set_keep_floor(uint64_t id, int64_t pos) {
+    if (Seq* s = find(id)) s->keep_floor = pos < 0 ? -1 : pos;
 }
 
 void KVManager::trim_window(uint64_t id, int64_t keep_from) {

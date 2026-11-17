@@ -78,6 +78,10 @@ struct StepEntry {
     int32_t dev_tok = 0;
     int32_t dev_out = -1;
     int32_t dev_aux = 0;
+    /* tp8 S5 (lanes.h): a piece of another lane's sequence riding in this lane's step: that lane's
+     * index (the scheduler that owns the request, and commits it); -1 for this scheduler's own entry,
+     * always on one lane. Its `slot` is -1: the request is in the home lane's table. */
+    int8_t  home = -1;
 };
 
 struct StepPlan {
