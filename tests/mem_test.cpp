@@ -7149,6 +7149,49 @@ TEST(each_rank_restores_its_own_shard_of_a_shared_checkpoint) {
     rad_stream_destroy(st);
 }
 
+/* tp8 F2: a two-node pipeline's follower has a snapshot store of its own, and the ids are the leader's (its store hands
+ * them out). Untaken there, the leader's id is refused ("the store does not hold that slot"); the follower takes it
+ * (HostArena::take, as Engine::pp_ck_apply does at a save) and the save / restore round trip is then the leader's. */
+TEST(a_follower_store_takes_the_leaders_checkpoint_ids) {
+    if (!host_backend_or_skip("the checkpoint round trip")) return;
+    Fixture lead, fol;
+    lead.cfg.checkpoint_slots = fol.cfg.checkpoint_slots = 0;
+    REQUIRE_EQ(lead.build_groups(hybrid_conv_groups()), RAD_OK);
+    REQUIRE_EQ(fol.build_groups(hybrid_conv_groups()), RAD_OK);
+    const int64_t bytes = lead.kv.checkpoint_bytes();
+    HostArena ls, fs;   /* each node its own store, the same slot count */
+    REQUIRE_EQ(ls.open(bytes, bytes * 4), RAD_OK);
+    REQUIRE_EQ(fs.open(bytes, bytes * 4), RAD_OK);
+    lead.kv.set_checkpoint_store(&ls, 0);
+    fol.kv.set_checkpoint_store(&fs, 0);
+    for (Fixture* x : { &lead, &fol }) {
+        CHECK_OK(x->kv.add_sequence(1));
+        CHECK_OK(x->kv.add_sequence(2));
+        CHECK_OK(x->kv.ensure(1, 16));
+        CHECK_OK(x->kv.ensure(2, 16));
+    }
+    fill_states(fol.kv, 1);
+    int32_t ck = -1, skip = -1;
+    REQUIRE_EQ(lead.kv.alloc_checkpoint(&skip), RAD_OK);   /* the leader's second id: 1 */
+    REQUIRE_EQ(lead.kv.alloc_checkpoint(&ck), RAD_OK);
+    CHECK_EQ(ck, 1);
+    RadStream st = nullptr;
+    REQUIRE_EQ(rad_stream_create(&st, 0), RAD_OK);
+    const std::vector<int32_t> a = slots_of(fol.kv, 1), b = slots_of(fol.kv, 2);
+    CHECK_EQ(fol.kv.checkpoint_save(a.data(), (int)a.size(), ck, st), RAD_E_INVAL);   /* F2 as on cards */
+    CHECK_EQ(fs.used_slots(), 0ll);
+    CHECK(fs.take(ck));
+    CHECK(fs.take(ck));                      /* again: no second count */
+    CHECK_EQ(fs.used_slots(), 1ll);
+    CHECK(!fs.take(4));                      /* outside the store */
+    CHECK(!fs.take(-1));
+    CHECK_OK(fol.kv.checkpoint_save(a.data(), (int)a.size(), ck, st));
+    CHECK_OK(fol.kv.checkpoint_restore(b.data(), (int)b.size(), ck, st));
+    CHECK_OK(rad_stream_sync(st));
+    CHECK_EQ(states_wrong(fol.kv, 1, b, a), 0ll);
+    rad_stream_destroy(st);
+}
+
 /* A model with a sliding window and no linear state snapshots the window behind a checkpoint:
  * window_blocks pages per group, page j at position j, each page every layer's row of one block.
  * A -1 row is a page below position zero: nothing is copied for it either way. A resumed sequence
