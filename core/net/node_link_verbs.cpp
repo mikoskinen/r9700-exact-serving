@@ -327,7 +327,7 @@ public:
         inet_ntop(AF_INET6, peer_.gid, gs, sizeof gs);
         desc_ = fmt("verbs %s gid[%d] %s, QP 0x%x -> 0x%x (%s), mtu %d, RC timeout 14 retry 7",
                     F.get_device_name(dev_), gidx_, gid_str_.c_str(), me.qpn, peer_.qpn, gs,
-                    128 << (int)at.path_mtu);
+                    128 << (int)std::min<uint32_t>(me.mtu, peer_.mtu));   /* the RTR's path_mtu (`at` holds the RTS attributes now) */
         cq_ = std::thread([this] { cq_loop(); });
         return RAD_OK;
     }
