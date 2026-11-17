@@ -1628,7 +1628,7 @@ int Ctx::run_pass(const RadBatch* b) {
     PassTape nt;
     if (!record_pass(b, key, &nt)) return RAD_OK;
     nt.used = ++tape_clock_;
-    if (tapes_.size() < kTapes) {
+    if (tapes_.size() < tape_cap_) {
         tapes_.push_back(std::move(nt));
     } else {
         PassTape* lru = &tapes_[0];

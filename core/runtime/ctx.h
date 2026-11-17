@@ -606,6 +606,13 @@ private:
     bool haz_dump_ = false;   /* haz_mark lists this recording's dispatches (tape_dump_) */
 
     static constexpr size_t  kTapes      = 24;     /* recorded passes kept, least recently used out */
+    /* tp8 S5: a two-node pipeline node with lanes keeps kTapes a lane (each lane's batch is its own set
+     * of recordings, and the leader's lane step two: its head, a few dispatches, and its tail); kTapes
+     * everywhere else. */
+    size_t                   tape_cap_   = kTapes;
+public:
+    void set_tape_lanes(int lanes) { tape_cap_ = kTapes * (size_t)(lanes > 1 ? lanes : 1); }
+private:
     static constexpr int64_t kAuditPlays = 1024;
 
     std::vector<PassTape> tapes_;

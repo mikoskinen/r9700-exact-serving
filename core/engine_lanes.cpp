@@ -72,6 +72,8 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
         lane_sched_.push_back(std::move(s));
     }
     lanes_.init(all);
+    /* Every lane's batch is its own set of recordings (Ctx::pass_key reads its slab's pointers). */
+    for (auto& rk : ranks_) rk->ctx.set_tape_lanes(n_lanes_);
     const int64_t per = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_;
     RAD_INFO("two-node pipeline: %d lanes, each a scheduler with its own step slab on every card and at most %lld "
              "sequences (cards %lld a lane); the newcomer split %s (pieces of at least %lld rows on the %lld-row "
