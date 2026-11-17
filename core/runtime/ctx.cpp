@@ -18,6 +18,8 @@ namespace rad {
 /* tp8 S5 (core/engine_node.cpp): the part of a pipeline leader's pass being issued, 0 for a whole pass. */
 int pp_pass_part();
 int pp_pass_seg();
+/* tp8 loop P10 (core/engine_node.cpp): passes of at least this many rows are issued live (0 = no such rule) */
+int64_t pp_live_rows();
 }  /* namespace rad */
 
 namespace rad {
@@ -1073,6 +1075,9 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A generator pass is shaped by what RadBatch::gen_b, agen_b, vgen_b or sgen_b carries, which
      * no key below reads. */
     if (b->gen) return 0;
+    /* tp8 loop P10 (RADIANCE_PP_SEND_ASYNC): a pass this node's send ring may cross from a side stream (its payload's rows
+     * are at most the pass's) is issued live, so no tape leaves the side stream's launches out */
+    if (const int64_t live = pp_live_rows(); live > 0 && b->n_tok >= live) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);

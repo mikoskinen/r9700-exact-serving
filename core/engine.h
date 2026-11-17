@@ -496,6 +496,11 @@ private:
     void pp_close(const char* why);
     /* tp8 loop P8: RADIANCE_PP_SEND_SPLIT's mode (0 / 1 / 2) and, at close, mode 2's check of the shares */
     static int pp_send_split();
+    /* tp8 loop P10 (RADIANCE_PP_SEND_ASYNC): the row floor of a payload that crosses from a side stream (0 = off), and
+     * the card staging buffer it needs on this node's sending rank (0 when off) */
+    static int64_t pp_send_async_rows();
+    int64_t pp_send_async_bytes() const;
+    void* pp_stage_dev_ = nullptr;
     void pp_split_note();
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy

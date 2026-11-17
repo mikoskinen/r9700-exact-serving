@@ -2221,6 +2221,9 @@ int Engine::plan() {
                 !r->program.is_video_generator() && !r->program.is_shape_generator())
                 f.staging *= cfg_.pp_lanes_now();
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
+            /* tp8 loop P10: RADIANCE_PP_SEND_ASYNC's card staging buffer, on the sending rank only (pp_serve_setup
+             * allocates it after the carve, so the check below keeps it for later there). 0 when unset. */
+            if (r->index == 0) f.staging += pp_send_async_bytes();
             /* The depth-0 context skip's ring (RADIANCE_DRAFT_CTXSKIP): allocated at start beside the step
              * state (ctxskip_setup), so in the budget and not kept for later. 0 when unset. */
             f.staging += ctxskip_bytes(r->program);
@@ -4955,7 +4958,7 @@ int Engine::start() {
 
         /* Both the headroom and the later allocations are still free here: serve() allocates
          * the step staging; the KV tiers' staging and a second lane are built on first use. */
-        const int64_t late = late_step_bytes_ + late_lazy_bytes_;
+        const int64_t late = late_step_bytes_ + late_lazy_bytes_ + (r->index == 0 ? pp_send_async_bytes() : 0);
         const int64_t want = headroom + late;
         const int64_t got  = props.vram_free;
         const int64_t room = got - late;

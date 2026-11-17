@@ -109,6 +109,10 @@ namespace rad {
 /* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
  * head and tail share their batch). RAD_PP_PART_WHOLE on one machine and on one lane. */
 int pp_pass_part() { return pp_g().part.load(std::memory_order_relaxed); }
+/* tp8 loop P10: passes of at least this many rows are issued live, never recorded (RADIANCE_PP_SEND_ASYNC on this node's
+ * send ring: a payload of that many rows crosses from a side stream no tape would hold); 0 = no such rule */
+std::atomic<int64_t> g_pp_live_rows{ 0 };
+int64_t pp_live_rows() { return g_pp_live_rows.load(std::memory_order_relaxed); }
 /* tp8 dev M4: a segment part's layers, for its key (each segment is its own recording) */
 int pp_pass_seg() {
     const PpGlobal& g = pp_g();
@@ -486,6 +490,39 @@ int Engine::pp_serve_setup() {
             }
             (sends ? pp_send_ : pp_recv_)[ix] = r;
         }
+    }
+    /* ---- tp8 loop P10: RADIANCE_PP_SEND_ASYNC -- one card staging buffer on the sending rank (rank 0, `sender` of the
+     * plugin's stage_send), kept by the budget beside the step staging; every send ring names it */
+    if (const int64_t arows = pp_send_async_rows(); arows > 0) {
+        const int64_t sb = pp_send_async_bytes();
+        if (sb <= 0) {
+            RAD_ERR("two-node pipeline: RADIANCE_PP_SEND_ASYNC=%lld but this node's crossing has no row bytes",
+                    (long long)arows);
+            return RAD_E_STATE;
+        }
+        RAD_TRY(rad_dev_set(ranks_[0]->device));
+        pp_stage_dev_ = rad_dev_alloc(sb, RAD_MEM_DEVICE);
+        if (!pp_stage_dev_) {
+            RAD_ERR("two-node pipeline: RADIANCE_PP_SEND_ASYNC: no device memory for the %s staging buffer on card %d "
+                    "(raise --gpu-headroom-mib by %lld, or unset the switch)", humanb(sb).c_str(), ranks_[0]->device,
+                    (long long)((sb + (1 << 20) - 1) >> 20));
+            return RAD_E_NOMEM;
+        }
+        int rings = 0;
+        for (int ix = 0; ix < RAD_PP_MAX_RING_IX; ++ix) {
+            RadPpRing* r = pp_send_[ix];
+            if (!r) continue;
+            r->stage_dev = (uint64_t)(uintptr_t)pp_stage_dev_;
+            r->stage_cap = (uint64_t)sb;
+            r->async_rows = (uint64_t)arows;
+            ++rings;
+        }
+        g_pp_live_rows.store(arows, std::memory_order_relaxed);
+        RAD_INFO("two-node pipeline: RADIANCE_PP_SEND_ASYNC=%lld -- a %s payload of >= %lld rows is packed into a %s "
+                 "staging buffer on card %d on the pass's stream and crosses into the send ring from a side stream of that "
+                 "card, so the next pass starts at once (%d send ring(s)); passes of >= %lld rows are issued live, never "
+                 "recorded (tp8 loop P10)", (long long)arows, pp_leader() ? "X1" : "X2", (long long)arows,
+                 humanb(sb).c_str(), ranks_[0]->device, rings, (long long)arows);
     }
     /* ---- rendezvous 2: what both carved and laid out */
     net::Facts f;
@@ -878,8 +915,52 @@ int Engine::pp_send_split() {
     return mode;
 }
 
+/* tp8 loop P10: RADIANCE_PP_SEND_ASYNC=N (rows; unset / 0 = off): a payload of >= N rows is packed into a
+ * card staging buffer on the pass's stream and crosses PCIe from a side stream (abi/rad_pp.h RadPpRing::async_rows);
+ * every pass of >= N rows is issued live. Read once. */
+int64_t Engine::pp_send_async_rows() {
+    static const int64_t rows = [] {
+        const char* v = std::getenv("RADIANCE_PP_SEND_ASYNC");
+        if (!v || !*v) return (int64_t)0;
+        char* end = nullptr;
+        const long long n = std::strtoll(v, &end, 10);
+        if (!end || *end || n < 0) {
+            RAD_WARN("two-node pipeline: RADIANCE_PP_SEND_ASYNC=%s is not a row count: every payload on the pass's stream", v);
+            return (int64_t)0;
+        }
+        return (int64_t)n;
+    }();
+    return rows;
+}
+
+/* The staging buffer RADIANCE_PP_SEND_ASYNC needs on this node's sending card: the largest send ring's capacity (one
+ * payload a node in flight on the side stream), 0 when off or before the crossings are declared. The budget keeps it
+ * beside the step staging on rank 0 (engine_bringup.cpp), pp_serve_setup allocates it. */
+int64_t Engine::pp_send_async_bytes() const {
+    if (!pp_on() || pp_send_async_rows() <= 0) return 0;
+    const PpGlobal& g = pp_g();
+    const int id = pp_leader() ? RAD_PP_X1 : RAD_PP_X2;
+    const int64_t rb = g.row_bytes[id].load();
+    const int parts = std::max(1, g.parts[id].load());
+    if (rb <= 0) return 0;
+    return rb * cfg_.max_tok + (int64_t)parts * RAD_PP_PART_ALIGN + RAD_PP_TRAILER;
+}
+
 /* tp8 loop P8: what RADIANCE_PP_SEND_SPLIT=2's other ranks compared, summed over the lanes' send rings, a line a crossing. */
 void Engine::pp_split_note() {
+    /* tp8 loop P10: how many payloads crossed from the side stream */
+    if (pp_send_async_rows() > 0) {
+        uint64_t all = 0, async = 0;
+        for (int ix = 0; ix < RAD_PP_MAX_RING_IX; ++ix) {
+            const RadPpRing* r = pp_send_[ix];
+            if (!r) continue;
+            all += __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE);
+            async += __atomic_load_n(&r->async_sends, __ATOMIC_ACQUIRE);
+        }
+        RAD_INFO("two-node pipeline: RADIANCE_PP_SEND_ASYNC=%lld -- %llu of this node's %llu %s payloads crossed from the "
+                 "side stream (tp8 loop P10)", (long long)pp_send_async_rows(), (unsigned long long)async,
+                 (unsigned long long)all, pp_leader() ? "X1" : "X2");
+    }
     for (int id = 0; id < RAD_PP_N_RINGS; ++id) {
         uint64_t payloads = 0, cmp = 0, diff = 0, mode = 0, by[RAD_PP_MAX_RANKS] = {}, part[RAD_PP_MAX_PARTS] = {};
         uint64_t pbytes[RAD_PP_MAX_PARTS] = {}, nparts = 0;
