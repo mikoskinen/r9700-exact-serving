@@ -982,7 +982,8 @@ void Engine::fn4_apply_changes(const int* sw) {
              * it otherwise). */
             if (sw[fn4::kDraftCtxSkip] != fn4::kNoChange) {
                 /* tp8 S5: not under lanes, which interleave the steps its ring keeps (engine_lanes.cpp) */
-                if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 && lane_sched_.empty() ? 1 : 0;
+                /* tp8 dev D4: taken under lanes when the ring is one region a lane (RADIANCE_PP_CTXSKIP_LANES=1) */
+                if (ctxs_.ready) ctxs_.on = sw[fn4::kDraftCtxSkip] == 1 && (lane_sched_.empty() || ctxs_.lanes > 1) ? 1 : 0;
                 fn4::note_sched(fn4::kDraftCtxSkip, ctxs_.ready ? ctxs_.on : 0);
             }
             /* Lever Z0-W: the engine's own, acted on at the next release (draft_w_step; fn4 refuses 1 unless set up). */

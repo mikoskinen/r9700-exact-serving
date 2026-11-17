@@ -301,6 +301,14 @@ int Engine::run_calib() {
  * checks the count. Each rank copies on its own stream behind the step; KL mode does not
  * pipeline, so the next step waits for this. */
 int Engine::score_rows(const RadBatch* b, const StepOut& so) {
+    RAD_TRY(score_rows_issue(b, so));
+    return score_rows_take(b, so);
+}
+
+/* tp8 dev 1b: score_rows in two: the scored rows' copies, on every rank's stream at this point of it (a lane step whose
+ * model part another lane's follows on the stream copies them before that part rewrites the logits), then the wait and
+ * the scoring. */
+int Engine::score_rows_issue(const RadBatch* b, const StepOut& so) {
     const int64_t n = b->n_out - so.n_rows;
     if (n <= 0) return RAD_OK;
     const StepPlan& plan = lsched().plan();
@@ -323,6 +331,21 @@ int Engine::score_rows(const RadBatch* b, const StepOut& so) {
         if (!src) return RAD_E_STATE;
         RAD_TRY(rad_memcpy_async(kld_host_[r], src + (int64_t)so.n_rows * kld_width_[r],
                                  n * kld_width_[r] * (int64_t)sizeof(float), rk.ctx.stream()));
+    }
+    RAD_TRY(rad_dev_set(ranks_[0]->device));
+    return RAD_OK;
+}
+
+int Engine::score_rows_take(const RadBatch* b, const StepOut& so) {
+    const int64_t n = b->n_out - so.n_rows;
+    if (n <= 0) return RAD_OK;
+    const StepPlan& plan = lsched().plan();
+    std::vector<KldSpan> spans;
+    int64_t row = 0;
+    for (const StepEntry& e : plan.e) {
+        if (!(e.req && e.req->score && e.is_prefill && e.hidden_row < 0)) continue;
+        spans.push_back({ e.req->id, (int64_t)e.ctx_len, (int64_t)e.n_tokens, row });
+        row += e.n_tokens;
     }
     for (size_t r = 0; r < kld_width_.size(); ++r) {
         RAD_TRY(rad_dev_set(ranks_[r]->device));

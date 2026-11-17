@@ -274,6 +274,17 @@ int Engine::pp_check() {
 int Engine::pp_connect() {
     if (!pp_on() || cfg_.debug_graph) return RAD_OK;
     net::LinkOpts o = net::LinkOpts::from_env();
+    /* tp8 dev 1a: RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t) -- the follower looks the embedding up itself, the leader sends
+     * no X1 (the plugins; at h > 0 X1 is a layer's residual and stays) */
+    const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
+    const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
+    o.no_x1 = fe_on;
+    if (fe && !std::strcmp(fe, "1"))
+        RAD_INFO("two-node pipeline: RADIANCE_PP_FOLLOWER_EMBED=1 %s", fe_on
+                     ? "-- the follower looks the step's embedding up itself; the leader's head part issues no lookup "
+                       "and no X1 (tp8 dev 1a)"
+                     : fmt("is not taken at W(%d,%d): X1 is the residual after layer %d (it applies at W(0, t) only)",
+                           cfg_.pp_cut_h, cfg_.pp_cut_t, cfg_.pp_cut_h - 1).c_str());
     std::string err;
     if (pp_follower()) {
         /* Robustness 4: listen where the leader reaches this node (the address the route to
@@ -298,6 +309,7 @@ int Engine::pp_connect() {
     f.add("role", role(cfg_.pp_rank));
     f.add("cut", fmt("%d,%d", cfg_.pp_cut_h, cfg_.pp_cut_t));
     f.add("link", cfg_.node_link ? "verbs" : "tcp");
+    if (fe_on) f.add("follower embed", "on");   /* tp8 dev 1a: only when on, so the flags-off facts are as before */
     f.add("binary", net::file_identity("/proc/self/exe"));
     for (const std::string& p : net::loaded_plugin_identities()) {
         const size_t eq = p.find('=');
@@ -874,6 +886,15 @@ int Engine::pp_ck_apply(const int32_t* q, int32_t n, bool save) {
         const int32_t kind = q[i], ck = q[i + 1], ns = q[i + 2], nw = q[i + 3], first = q[i + 4];
         if (ns < 0 || nw < 0 || (int64_t)i + H + ns + nw > n) return RAD_E_STATE;
         if ((kind == 1) == save) {
+            /* tp8 F2: the slot ids are the leader's (its store hands them out and gives them back); this node's store
+             * mirrors them, so a save takes the leader's id here (it is never handed out on this node) and a restore
+             * finds what the save behind an earlier pass wrote. A give-back is not mirrored: a slot the leader reuses
+             * is simply written again. */
+            if (save && ck_store_.enabled() && !ck_store_.in_use(ck) && !ck_store_.take(ck)) {
+                RAD_ERR("follower: the leader's checkpoint slot %d is outside this node's store of %lld slots (start both "
+                        "nodes with the same --checkpoint-slots)", (int)ck, (long long)ck_store_.capacity());
+                return RAD_E_STATE;
+            }
             win.assign(q + i + H + ns, q + i + H + ns + nw);
             for (auto& rk : ranks_) {
                 if (ranks_.size() > 1) (void)rad_dev_set(rk->device);

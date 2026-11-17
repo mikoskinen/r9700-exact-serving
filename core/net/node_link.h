@@ -110,6 +110,9 @@ struct LinkOpts {
      * before the link goes down naming the stuck stage. 0 = no limit (the rings' device deadline,
      * RADIANCE_PP_RECV_DEADLINE_MS, alone). RADIANCE_PP_STAGE_MS. */
     int  stage_ms      = 180000;
+    /* tp8 dev 1a: the leader sends no X1 (RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t): the follower looks the embedding up
+     * itself), so its stage watch has no X1 to wait for. Set by the engine, not from the environment. */
+    bool no_x1         = false;
     /* The environment's settings over the defaults (RADIANCE_PP_DEAD_MS, _HEARTBEAT_MS,
      * _CRC_DATA, _POLL_US, _STAGE_MS). */
     static LinkOpts from_env();

@@ -468,6 +468,16 @@ private:
     int  step_loop_lanes();
     int  lane_head(int lane, const RadBatch* b);
     int  lane_tail(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on);
+    /* tp8 dev 1b (RADIANCE_PP_TAIL_AHEAD=1 with RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t)): a lane step's tail in three
+     * releases -- its model part (X2's receive .. the head's logits, kIssueModel), issued while the lane before it is
+     * still being collected; its sampler + drafter + step end (kIssueSampler once the model went ahead); its collect,
+     * commit and drafter finish. lane_tail is the issue and the finish back to back, as before. */
+    int  lane_tail_model(int lane, const RadBatch* b);
+    int  lane_tail_issue(int lane, const RadBatch* b, StepOut& so, std::vector<uint64_t>& cancel, bool t_on,
+                         bool model_done);
+    int  lane_tail_finish(int lane, const RadBatch* b, StepOut& so, bool t_on);
+    bool tail_ahead_ = false;
+    int64_t tail_ahead_n_ = 0;   /* model parts issued ahead */
     int  lanes_init(const std::vector<BatchBuilder::RankIO>& rio);
     void lanes_note(int64_t lane_steps, int64_t rounds_two);
     /* Stage busy stamps (RADIANCE_PP_STAMPS=path): every pass's host issue-to-done interval on this
@@ -719,7 +729,17 @@ private:
         std::vector<char*>   ring;
         int64_t skipped = 0, refills = 0, refill_rows = 0, dropped = 0, ring_full = 0;
         std::vector<Scheduler::CtxRun> runs;
+        /* tp8 dev D4 (RADIANCE_PP_CTXSKIP_LANES=1 on a leader with lanes; else 1 / max_seqs / unused): the ring cut into
+         * one region a lane -- rows [lane x lane_rows, (lane + 1) x lane_rows) of every step slot -- and a slot count a
+         * lane (used_l), so each lane keeps and refills its own consecutive steps */
+        int     lanes = 1;
+        int64_t lane_rows = 0;           /* rows a lane's region holds (a lane's cards) */
+        int64_t ring_rows = 0;           /* rows a step slot holds: max_seqs, or lanes x lane_rows */
+        std::vector<int> used_l;
     } ctxs_;
+    /* tp8 dev D4: the current lane's slot count, and its region's first ring row */
+    int&    ctx_used();
+    int64_t ctx_row0() const;
     /* The ring's bytes a rank for `p` (0 when the skip is not declared or `p` taps nothing for a
      * windowed block drafter); `src`, `pitch`, `slots` as found. */
     int64_t ctxskip_bytes(const Program& p, rad_buf* src = nullptr, int64_t* pitch = nullptr,
@@ -843,6 +863,8 @@ private:
                   const char* tag, int every_s,
                   const std::function<void(size_t, double)>& progress, int* bad);
     int  score_rows(const RadBatch* b, const StepOut& so);
+    int  score_rows_issue(const RadBatch* b, const StepOut& so);   /* tp8 dev 1b: score_rows' copies ... */
+    int  score_rows_take(const RadBatch* b, const StepOut& so);    /* ... and its wait + scoring */
     std::unique_ptr<Kld> kld_;
     std::vector<float*>  kld_host_;
     std::vector<int64_t> kld_vocab0_, kld_width_;   /* per rank read: its logits columns */

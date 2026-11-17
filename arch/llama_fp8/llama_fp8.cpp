@@ -122,6 +122,11 @@ struct Model {
     bool     kvcopy = false;
     rad_op   op_kvcopy = 0;
     int64_t  kvcopy_skip = -1, kvcopy_pass = 0;
+    /* tp8 dev 1a (RADIANCE_PP_FOLLOWER_EMBED=1 on both nodes, W(0, t) only; unset: nothing here): the follower looks up
+     * the step's embedding itself (the same op over the same table, the vocab-sharded rows completed by the same
+     * all-reduce) where it took X1, and the leader's head part issues neither the lookup nor X1: the follower starts a
+     * lane step from its build, never from the leader's stream. */
+    bool     fe = false;
 };
 
 static Model g_model[MAX_RANKS];
@@ -377,6 +382,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 "holds at least one\n", m.pp_h, m.pp_t, m.pp_rank == 0 ? "leader" : "follower");
                 return RAD_E_UNSUPPORTED;
             }
+            const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
+            m.fe = fe && !std::strcmp(fe, "1") && m.pp_h == 0;
         }
     }
 
@@ -454,6 +461,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         return RAD_E_UNSUPPORTED;
     }
     const bool shell = !m.pp || m.pp_rank == 0;   /* embedding, head and logits: the leader's */
+    /* tp8 dev 1a: the follower's own lookup -- the table, the op and its all-reduce, declared where one process
+     * declares them (before the layers), nothing of the head */
+    if (!shell && m.fe) {
+    RAD_ARCH_TRY(map_copy(b, nm.f("token_embd.weight"), nm.ckpt("model.embed_tokens.weight")));
+    m.w_tok = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
+                     RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+    m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
+                        RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
+                                   RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                                   RAD_INT("vocab_offset", g.vocab_off)),
+                        RAD_WEIGHTS(m.w_tok)),
+                    {}, {m.b_x});
+    if (g.world > 1)
+        m.op_embed_ar = rw(b, RAD_OP(b, "all_reduce",
+                               RAD_PARAMS(RAD_INT("world_size", g.world),
+                                          RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                          RAD_STR("dtype", g.dtype), RAD_INT("exact", 1)),
+                               RAD_NOWEIGHTS),
+                           {m.b_x}, {m.b_x});
+    }
     if (shell) {
     m.b_logits = decl_b(b, nm.f("logits"),   RAD_F32,     {g.max_logit_rows, g.n_vocab});
     RAD_ARCH_TRY(rad_declare_logits(b, m.b_logits));
@@ -580,6 +607,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     "X2 %d part(s) of [rows, %lld] %s", lead ? "leader" : "follower", m.pp_h, m.pp_t,
                  lead ? "outside the cut, the embedding and the head" : "inside the cut", m.parts_x1,
                  m.parts_x2, (long long)g.n_embd, g.dtype);
+        if (m.fe)
+            rad_note(b, "two-node pipeline (tp8 dev 1a, RADIANCE_PP_FOLLOWER_EMBED=1): the follower looks the step's "
+                        "embedding up itself; X1 is declared and never issued, the leader's head part issues no lookup");
     }
 
     if (shell) {
@@ -691,7 +721,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         else
             RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_x, T));
     };
-    if ((!m.pp || m.pp_rank == 0) && run_head) {
+    /* tp8 dev 1a: under m.fe the follower's lookup, the leader's none */
+    if (((!m.pp || m.pp_rank == 0) && run_head && !m.fe) || (m.fe && m.pp_rank == 1)) {
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
               brows(m.b_x, batch->n_tok));
@@ -702,7 +733,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
     /* The follower starts at its first layer from the leader's X1 (tp8 S6 test: then stores layer h - 1's k / v
      * into its copy, as the leader's layer stored them, at the same slots). */
     if (m.pp && m.pp_rank == 1) {
-        cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+        if (!m.fe) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
         if (m.op_kvcopy && m.kvcopy_pass++ != m.kvcopy_skip) {
             const RadKVGroupBatch* kvb = kv_batch(batch, m.kv_full);
             const int64_t q_dim = m.g.q_dim(), kv_dim = m.g.kv_dim();
@@ -716,7 +747,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
             /* The leader hands over before layer h and takes the follower's result back at t; the
              * follower's last layer hands its result back. */
             if (m.pp_rank == 0 && (int64_t)li == m.pp_h) {
-                if (run_head) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+                if (run_head && !m.fe) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
                 if (!run_tail) return;   /* tp8 S5: the head part ends with X1's send */
                 cross(m.op_x2, RAD_PP_X2, m.parts_x2);
             }
