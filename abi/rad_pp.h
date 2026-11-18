@@ -241,6 +241,18 @@ static inline void rad_pp_declare_x1_ids(int on) {
     if (rad_pp_x1_ids) rad_pp_x1_ids(on);
 }
 
+/* tp8 loop P28 (the newcomer's own cut; unset: never called): the plugin names, at declare (every rank; the last wins), the
+ * band k it declared on this node -- a BAND pass runs the leader's head over [0, h + k) and the follower from h + k. The
+ * engine marks a pass a band pass in RadPpInfo.reserved[0] (= k; 0 every other pass) on both nodes. k 0: none. Weak. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void rad_pp_band(int k);
+
+static inline void rad_pp_declare_band(int k) {
+    if (rad_pp_band) rad_pp_band(k);
+}
+
 /* tp8 S6: the plugin names, at declare (rank 0's real declare; repeats are ignored), each KV cache
  * layer both nodes hold of one source -- the owner its own, the receiver the copy a crossing fills:
  * `group` (the rad_kvgroup), `slot` (the layer's place among the group's bound layers on THIS node, in

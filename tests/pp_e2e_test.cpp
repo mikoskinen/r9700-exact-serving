@@ -1997,6 +1997,74 @@ TEST(lead_seg_ship_serves_one_process_tokens) {
     CHECK(late_all > 0);   /* the reorder the switch makes did happen, and the tokens stayed one process's */
 }
 
+/* tp8 loop P28: RADIANCE_PP_BAND=1 (the leader) with the plugin's band (the llama stand-in RADIANCE_LLAMA_PP_BAND=1, a band of
+ * one layer) -- a BG lane's step of fresh prompts runs as a band pass: the leader's head over [0, h + 1), its frame marked, the
+ * follower from h + 1 after storing layer h's k / v from the band X1 into its own cache; every other pass is W(h, t)'s, and the
+ * follower decodes layer h from that cache afterwards. Every request's tokens are one process's at 3 lanes W(1,3) BG 1 (whole and
+ * with the follower's one-layer segments), 4 lanes W(1,3) BG 2, and + the leader's segments (LEAD_SEG: a band head runs whole). */
+TEST(band_passes_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; int k; bool fseg; bool lseg; };
+    long long band_all = 0;
+    for (const Arm a : { Arm{ 3, 1, false, false }, Arm{ 3, 1, true, false }, Arm{ 4, 2, true, false }, Arm{ 3, 1, true, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back("RADIANCE_LLAMA_PP_BAND=1");
+        env.push_back("RADIANCE_PP_BAND=1");
+        env.push_back("RADIANCE_PP_READY_FIRST=1");
+        if (a.fseg)
+            for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15" })
+                env.push_back(v);
+        if (a.lseg) { env.push_back("RADIANCE_PP_LEAD_SEG=1"); env.push_back("RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15"); }
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start("1,3", ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port), got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        for (size_t i = 0; i < ref_b.size(); ++i) {
+            CHECK(!ref_b[i].empty());
+            if (ref_b[i] != got_b[i]) ++differ;
+        }
+        long long band = -1;
+        const char* key = " lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28)";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                band = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+        fprintf(stderr, "    BAND (llama stand-in, one layer), %d lanes BG %d W(1,3)%s%s: %d of %zu requests differ; %lld lane steps ran as "
+                        "band passes\n", a.lanes, a.k, a.fseg ? " + follower segments" : "", a.lseg ? " + LEAD_SEG" : "", differ,
+                ref.size() + ref_b.size(), band);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(llog.find("RADIANCE_PP_BAND=1 -- a BG lane's step of fresh prompts runs as a band pass") != std::string::npos);
+        CHECK(band > 0);
+        band_all += std::max(0LL, band);
+    }
+    fprintf(stderr, "    band passes, all arms: %lld\n", band_all);
+    CHECK(band_all > 0);
+}
+
 /* tp8 dev D11: RADIANCE_PP_BG_HOLD_MS=N -- a newcomer the BG lanes have no room for is held out of its home's step (that step
  * runs its decoders alone) until a BG lane takes it whole, or runs at home as a MIXED step once N ms ran out. burst_set's four
  * newcomers arrive together beside four decoders at 700 rows a step (a BG lane's inbox holds one of them): every request's tokens
