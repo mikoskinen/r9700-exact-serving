@@ -1580,6 +1580,18 @@ int Engine::follower_loop() {
             pp_link_->fail(fmt("the follower could not save step %d's checkpoints: %s", sstep, rad_strerror(st)));
             return fail_loop(st);
         }
+        /* tp8 dev D9 (loop FINDINGS F15 answer 02:24): --profile-ops prints here during the run too, at the leader's step numbers
+         * (every RADIANCE_PROFILE_EVERY, default 32: the same steps as the leader's lane loop), so the follower's table can be cut
+         * to decode-only intervals as the leader's; it printed only at exit. The ranks are parked: the counters are host-side. */
+        static const int prof_every = [] {
+            const char* v = std::getenv("RADIANCE_PROFILE_EVERY");
+            const int k = (v && *v) ? (int)std::strtol(v, nullptr, 10) : 32;
+            return k > 0 ? k : 32;
+        }();
+        if (cfg_.profile_ops && sstep > 0 && (sstep % prof_every) == 0) {
+            RAD_INFO("follower: --profile-ops tables after step %d (lane %d; RADIANCE_PROFILE_EVERY=%d, tp8 dev D9)", sstep, lane, prof_every);
+            for (auto& rk : ranks_) rk->ctx.dump_profile();
+        }
         return RAD_OK;
     };
     while (!stopping_.load(std::memory_order_acquire)) {
