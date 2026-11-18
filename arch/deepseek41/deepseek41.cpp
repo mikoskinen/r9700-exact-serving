@@ -1881,10 +1881,32 @@ static bool rf_declared() { return g_sw_rf_env.load(std::memory_order_relaxed) >
  * whose library does not serve the ops. RADIANCE_DS41_MOE1=0 / off declares the ops beside every trunk layer's EXL3
  * pair and starts at 0, 1 / on at 1; unset declares nothing (1 refused; the program and the issue are today's). */
 static constexpr int64_t kMoe1Max = 48;
+/* tp8 loop D21 (18.11.2026): RADIANCE_DS41_MOE1_MAX=N (49 .. 64; read with RADIANCE_DS41_MOE1 at the first declare) raises
+ * lever P's ceiling from kMoe1Max to N rows -- the dk pair declared over 17 .. N, a decode step of up to N rows one MoE pass.
+ * For depth-3 drafting at lanes of 16 (16 x 4 = 64 rows) with fn4 sched_row_cap N, which otherwise runs four 16-row pieces a
+ * layer. Needs an exl3r4d whose _dk rows serve N (built with EXL3R4D_DK_MAX >= N: the constraint is the only change, the
+ * kernels take a run 16 rows a pass at any height); with the published library the 49 .. N band has no kernel and the start
+ * stops at its declare. The rows' bytes are the pieces' as at <= 48 (exl3r4d rows.c's lever P note; tools/dkcheck on a card at
+ * 49 .. N). The dense and attention ops of such a step stay in <= kBiBand-row launches (BI's rows(kBiBand)) and its gather +
+ * all-reduce goes unfused above RADIANCE_DS41_ARGATHER_MAX: both the decode band's bytes. Unset, 48 or anything else: 48
+ * (the published declare). */
+static std::atomic<int64_t> g_p1_max{kMoe1Max};
+static int64_t moe1_max() { return g_p1_max.load(std::memory_order_relaxed); }
 static std::atomic<int> g_sw_p1{0}, g_sw_p1_ok{0}, g_sw_p1_env{-2}, g_p1_noted{0};
 static std::atomic<long long> g_p1_steps{0}, g_p1_rows{0};
 static void p1_read_env() {
     int unread = -2;
+    if (g_sw_p1_env.load(std::memory_order_relaxed) == -2) {   /* first declare: the ceiling with the switch's own env */
+        const char* mx = std::getenv("RADIANCE_DS41_MOE1_MAX");
+        if (mx && *mx) {
+            char* end = nullptr;
+            const long long v = std::strtoll(mx, &end, 10);
+            if (end && !*end && v >= 49 && v <= 64) g_p1_max.store(v, std::memory_order_relaxed);
+            else if (!(end && !*end && v == kMoe1Max))
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_MOE1_MAX=%s is not 49 .. 64: lever P stays at %lld rows\n", mx,
+                        (long long)kMoe1Max);
+        }
+    }
     const char* e = std::getenv("RADIANCE_DS41_MOE1");
     const int v = !e ? -1 : (!std::strcmp(e, "1") || !std::strcmp(e, "on")) ? 1
                           : (!std::strcmp(e, "0") || !std::strcmp(e, "off")) ? 0 : -1;
@@ -3578,7 +3600,7 @@ static int layer(RadBuilder* b, Model& m, Layer& L, int l) {
     /* Lever FUSE-R: the router chain's fused forms beside the separate ops (RADIANCE_DS41_RFUSE set) */
     s.cfg.rfuse_decl = rf_declared() ? 1 : 0;
     /* Lever P: the decode-band-bytes EXL3 pair over 17 .. kMoe1Max rows beside gate_up / down (RADIANCE_DS41_MOE1 set) */
-    s.cfg.exl3_dk_rows = p1_declared() ? kMoe1Max : 0;
+    s.cfg.exl3_dk_rows = p1_declared() ? moe1_max() : 0;
     if (m.sized_against) {   /* a sizing declare: the pair exactly where the real declare's layer has it (also at an 8-row level) */
         const Model& full = *m.sized_against;
         s.cfg.exl3_dk_rows = (size_t)l < full.layers.size() ? full.layers[(size_t)l].moe.dk_asked : 0;
@@ -8424,7 +8446,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * one-pass decode step does */
             const bool p1 = g_sw_p1.load(std::memory_order_relaxed) > 0 && g_sw_p1_ok.load(std::memory_order_relaxed) &&
                             sg.size() == 1 && sg[0].dec && sg[0].r0 == 0 && sg[0].n == T && sg[0].n > piece &&
-                            sg[0].n <= kMoe1Max && !cut && L.moe.dk_takes(sg[0].n);
+                            sg[0].n <= moe1_max() && !cut && L.moe.dk_takes(sg[0].n);
             if (p1) {
                 L.moe.pass(x, T, 0, T, true, bsp, true);
                 if (l == 0) {
@@ -8435,7 +8457,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         if (n == 1 || n % 256 == 0)   /* a c24 block is ~500 such steps: two lines a block show it engaged */
                             fprintf(stderr, "radiance: deepseek41: lever P (ds41_moe1 1): %lld decode steps of 17 .. %lld "
                                             "rows issued their MoE as ONE pass (%lld rows in all; this one %lld rows)\n",
-                                    n, (long long)kMoe1Max, g_p1_rows.load(std::memory_order_relaxed), (long long)T);
+                                    n, (long long)moe1_max(), g_p1_rows.load(std::memory_order_relaxed), (long long)T);
                     }
                 }
             } else if (!bi_onear(biv)) {   /* ds41_bi 1 .. 4: int12's issue, unchanged */
