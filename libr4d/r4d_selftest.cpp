@@ -31743,6 +31743,8 @@ struct SpRowsT {
     int64_t wide_rows = 0, wide_bad = -1, mix_ar_bad = -1, mix_rs_bad = -1;
     void* inst_wide = nullptr;
     int64_t narrow_bad = -1;   /* tp8 loop P26: the 1280 / 512-row gathers on that instance (-1: not run or failed) */
+    const RadKernelInfo* agf = nullptr;   /* tp8 loop P26b: the f32 row sp_ag_rows_4rank_f32 (absent: skipped) */
+    int64_t f32_bad = -1;
 };
 static void sp_rows_worker_t(SpRowsT* t) {
     if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; return; }
@@ -31874,6 +31876,43 @@ static void sp_rows_worker_t(SpRowsT* t) {
                 }
                 if (rn != RAD_OK) { t->narrow_bad = -1; if (rc == RAD_OK) rc = rn; }
             }
+            /* tp8 loop P26b: an f32 payload (deepseek41's compressor output, rows of 2 x 512 f32) through the f32 row on the
+             * same instance (its `bound` in f32 elements = half the bf16 bound), the words checked */
+            if (t->agf && t->narrow_bad >= 0) {
+                const int64_t nr = most / t->row, frow = 1024, fn = nr * frow, fq = (nr + t->world - 1) / t->world;
+                std::vector<RadParam> pf = { PI("world_size", t->world), PI("numel", fn), PS("dtype", "f32"), PI("row", frow),
+                                             PI("raw", 1), PI("bound", most / 2) };
+                void* inst_f = nullptr;
+                int rf = t->agf->init(pf.data(), (int)pf.size(), t->rank, t->world, &inst_f);
+                if (rf == RAD_OK) {
+                    std::vector<uint32_t> hf((size_t)fn);
+                    auto fv = [](int owner, int64_t i) {   /* any 32-bit pattern, NaN / denormal words included */
+                        uint64_t h = (uint64_t)i * 0x9E3779B97F4A7C15ull ^ ((uint64_t)owner + 3) * 0xC2B2AE3D27D4EB4Full;
+                        h ^= h >> 31; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 29;
+                        return (uint32_t)h;
+                    };
+                    for (int64_t i = 0; i < fn; ++i) {
+                        const int owner = (int)((i / frow) / fq);
+                        hf[(size_t)i] = fv(owner == t->rank ? owner : 13 + t->rank, i);
+                    }
+                    st_memcpy(buf, hf.data(), (size_t)fn * 4, hipMemcpyHostToDevice);
+                    RadTensor tf[1] = { T(buf, RAD_F32, { fn }) };
+                    RadArgs a3;
+                    std::memset(&a3, 0, sizeof(a3));
+                    a3.t = tf; a3.n_t = 1; a3.p = pf.data(); a3.n_p = (int)pf.size();
+                    a3.instance = inst_f; a3.rank = t->rank; a3.world_size = t->world;
+                    rf = t->agf->launch(&a3, nullptr);
+                    st_stream_sync(nullptr);
+                    if (rf == RAD_LINK_ENDED) rf = RAD_OK;
+                    std::vector<uint32_t> gf((size_t)fn);
+                    st_memcpy(gf.data(), buf, (size_t)fn * 4, hipMemcpyDeviceToHost);
+                    t->f32_bad = 0;
+                    for (int64_t i = 0; i < fn; ++i)
+                        if (gf[(size_t)i] != fv((int)((i / frow) / fq), i)) ++t->f32_bad;
+                    if (t->agf->fini) t->agf->fini(inst_f);
+                }
+                if (rf != RAD_OK) { t->f32_bad = -1; if (rc == RAD_OK) rc = rf; }
+            }
         }
         if (wbuf) st_free(wbuf);
         if (rc != RAD_OK && t->rc == RAD_OK) t->rc = rc;
@@ -31926,6 +31965,7 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
         for (int r = 0; r < world; ++r) {
             SpRowsT& x = t[(size_t)r];
             x.rs = rs; x.ag = ag; x.ar = ar; x.rank = r; x.dev = devs[(size_t)r]; x.row = row; x.rows = rows; x.bar = &bar; x.bad = &bad;
+            x.agf = find(pl, "sp_ag_rows_4rank_f32");
             th.emplace_back(sp_rows_worker_t, &x);
         }
         for (std::thread& x : th) x.join();
@@ -31978,6 +32018,14 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
                 ok((w + ": then narrow all-gathers (rows of 1280 / 512, deepseek41's qr / kv under RADIANCE_DS41_SPHC_ATTN) "
                         "move every owner's words to every rank").c_str(),
                    nall && nb == 0, std::to_string(nb) + " elements wrong");
+                if (t[0].agf) {
+                    int64_t fb = 0;
+                    bool fall = true;
+                    for (const SpRowsT& x : t) { fall = fall && x.f32_bad >= 0; fb += std::max<int64_t>(x.f32_bad, 0); }
+                    ok((w + ": then an f32 all-gather (rows of 1024 f32 through sp_ag_rows_4rank_f32, deepseek41's compressor "
+                            "output under RADIANCE_DS41_SPHC_ATTN=2) moves every owner's words").c_str(),
+                       fall && fb == 0, std::to_string(fb) + " words wrong");
+                }
             }
             const int64_t tr[2] = { 2048, 4096 };
             for (size_t k = 0; k < t[0].us_rs.size() && k < 2; ++k) {

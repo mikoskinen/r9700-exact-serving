@@ -5043,6 +5043,10 @@ static const RadConstraint cArTi8Ts4[] = {
 static const RadConstraint cSpRows4[] = {
     C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16"), C_DIV("row", 32), C_P2P,
 };
+/* tp8 loop P26b: the raw all-gather of f32 rows (2 x row bf16 words on the bf16 instance) */
+static const RadConstraint cSpRows4F32[] = {
+    C_EQ("world_size", 4), C_IN("dtype", "f32 fp32"), C_DIV("row", 16), C_EQ("raw", 1), C_P2P,
+};
 /* The same at `overlap` 1 (tArTs4Lane). */
 static const RadConstraint cArTi8Ts4Lane[] = {
     C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
@@ -8782,6 +8786,14 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
   ROW(cSpRows4), ROW(tAr), nullptr,
   r4d_rad_sp_rows_init, r4d_rad_ar_fini, r4d_rad_ar_ag_rows_4rank, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+{ "sp_ag_rows_4rank_f32", "all_gather_rows", "ar",
+  "tp8 loop P26b all-gather over whole-row shards of an f32 payload: raw words only (the bf16 kernel at 2 x row words)",
+  "exactly 4 ranks, all peer-accessible; row a multiple of 16, at least 4 rows; raw 1; in place; rides the bf16 instance of 2 x bound",
+  "f32 payload moved as its words (exact)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT,
+  ROW(cSpRows4F32), ROW(tAr), nullptr,
+  r4d_rad_sp_rows_f32_init, r4d_rad_ar_fini, r4d_rad_ar_ag_rows_4rank_f32, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 { "ar_twoshot_4rank_ti8", "all_reduce", "ar",
   "all-reduce (sum), reduce-scatter + all-gather; both hops ride the tiered-int8 wire (double "
