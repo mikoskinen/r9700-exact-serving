@@ -167,6 +167,13 @@ public:
      * when a BG lane may take it whole; after N ms of holding it runs at home as today's MIXED step. A held newcomer has no
      * prefix restore planned (those stay home, kBgRestore). 0 (unset): off, today's MIXED step at once. */
     int64_t bg_hold_ms() const { return bg_lane() >= 0 ? bg_hold_ms_ : 0; }
+    /* tp8 dev D12 (RADIANCE_PP_BG_PIECES=N, 256 .. 65536; with BG lanes, not where RADIANCE_PP_BG_SPLIT takes two BG lanes): a
+     * newcomer lent to a BG lane whose entry has >= N rows is cut at the 512-grid point nearest its middle (>= 128 rows a side,
+     * BG_SPLIT's rule); its first piece goes to a BG lane now and the rest stays with its home, which plans it once that piece
+     * committed (and lends it whole then): BG_SPLIT's two pieces in turn on one BG lane. 0 (unset): whole, as today. */
+    int64_t bg_pieces() const { return bg_lane() >= 0 ? bg_pieces_ : 0; }
+    void set_bg_pieces(int64_t rows) { bg_pieces_ = rows > 0 ? rows : 0; }
+    void note_bg_piece_locked() { ++bg_piece_n_; }
     void set_bg_hold_ms(int64_t ms) { bg_hold_ms_ = ms > 0 ? ms : 0; }
     /* its counts: steps a newcomer was held out of, newcomers held, of them lent to a BG lane later / run at home after the
      * hold ran out, and the held time (first hold to its lend or home step) in all and the longest */
@@ -226,6 +233,7 @@ public:
         int64_t bg = 0, bg_rows = 0, bg_skip[kBgWhyN] = {}, bg_split = 0;   /* tp8 dev M8 */
         int64_t bg_floor = 0;   /* tp8 loop F22: requests whose drafter range a lent piece's commit opened */
         int64_t hold_steps = 0, hold_reqs = 0, hold_lent = 0, hold_home = 0, hold_us = 0, hold_max_us = 0;   /* tp8 dev D11 */
+        int64_t bg_pieces = 0;   /* tp8 dev D12: newcomers whose first piece went to a BG lane ahead of the rest */
     };
     Counts counts() const {
         std::lock_guard<std::mutex> lk(*mu_);
@@ -247,6 +255,7 @@ public:
         c.hold_home = hold_home_;
         c.hold_us = hold_us_;
         c.hold_max_us = hold_max_us_;
+        c.bg_pieces = bg_piece_n_;
         return c;
     }
     void note_lent_locked(int64_t rows, bool tok) { rows_ += rows; if (tok) ++tok_; }
@@ -281,6 +290,7 @@ private:
     bool    bg_floor_ = true;               /* RADIANCE_PP_BG_DRAFT_FLOOR (bg_draft_floor, tp8 loop F22) */
     int64_t bg_floor_n_ = 0;
     int64_t bg_hold_ms_ = 0;                /* RADIANCE_PP_BG_HOLD_MS (bg_hold_ms, tp8 dev D11) */
+    int64_t bg_pieces_ = 0, bg_piece_n_ = 0; /* RADIANCE_PP_BG_PIECES (bg_pieces, tp8 dev D12) */
     int64_t hold_steps_ = 0, hold_reqs_ = 0, hold_lent_ = 0, hold_home_ = 0, hold_us_ = 0, hold_max_us_ = 0;
     int64_t split_min_ = 128;
     bool    head_state_ = false;
