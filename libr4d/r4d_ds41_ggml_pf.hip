@@ -73,6 +73,15 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
     constexpr int XE = BM * kWmXP;                                  /* bf16 a staged slab */
     constexpr int XGE = W::XG > 0 ? kWmS / W::XG * BM : 0;          /* floats a slab's group sums */
     constexpr bool NOCI = (ABL & 1) != 0, NODEC = (ABL & 2) != 0, NOFMA = (ABL & 4) != 0;
+    /* FI bit 1 (CR, tp8 loop A5b, 18.11.2026): the chain-init ring -- a one-step-chain type staged with group sums (Q6_K: CINIT,
+     * SPG 1, decoded in its own step) loads row tile mt's chain init for step J + 1 right after tile mt's step-J WMMAs, into a
+     * register a tile (step 0's at the slab start, after the barrier that publishes the slab's sums), instead of just before
+     * its WMMAs: the same values into the same WMMAs, a K step of the wave's own work ahead of their use instead of one fold.
+     * Only the load timing changes, so every output's operations and bytes are FI 1's (= the stock kernel's). */
+    constexpr bool CR = (FI & 2) != 0 && W::CINIT && !W::PIPE && W::SPG == 1 && !NOCI && !NOFMA;
+    /* FI bit 2 with CR (CR2): a ring of TWO registers instead of one a row tile -- the init of the slab's tile t + 2 (t = NM J + mt, the
+     * tiles in issue order) goes into tile t's register once tile t's WMMAs read it: 16 VGPRs instead of 8 NM, ~1.5 tiles ahead. */
+    constexpr bool CR2 = CR && (FI & 4) != 0;
 #ifdef R4D_EMU_HOST   /* tests/r4d_emu: the launch's dynamic LDS */
     uint8_t* const gg_smem = (uint8_t*)emu_dyn_lds();
 #else
@@ -148,6 +157,7 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
         constexpr int NM = decltype(nmc)::value;
         auto live = [&](int mt) { return !W::GUARD || mt < nmt; };
         gg_v8f acc[NM][NT];
+        gg_v8f cr[CR ? (CR2 ? 2 : NM) : 1];   /* CR: the row tiles' chain inits of the next K step (CR2: of tiles t, t + 1) */
 #pragma unroll
         for (int i = 0; i < NM; ++i)
 #pragma unroll
@@ -240,6 +250,15 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
                     }
                 }
             }
+            if constexpr (CR2) {   /* tiles 0 and 1 of the slab (t = NM J + mt): this slab's staged sums, published by its barrier */
+#pragma unroll
+                for (int u = 0; u < 2 && u < 8 * NM; ++u)
+                    cr[u] = *(const gg_v8f*)(const void*)(xg + ((u / NM) * 16 / W::XG) * BM + (u % NM) * 16);
+            } else if constexpr (CR) {   /* step 0's chain inits: this slab's staged sums, published by the barrier before this slab */
+#pragma unroll
+                for (int mt = 0; mt < NM; ++mt)
+                    if (live(mt)) cr[mt] = *(const gg_v8f*)(const void*)(xg + mt * 16);
+            }
             gg_for<8>([&](auto jc) {
                 constexpr int J = decltype(jc)::value, C = J & 1;
                 /* (a) */
@@ -327,9 +346,17 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
                         } else if constexpr (J % W::SPG == 0) {
                             gg_v8f c0 = (gg_v8f)(0.0f);
                             if constexpr (W::CINIT && W::PIPE) c0 = ci[mt];
+                            else if constexpr (CR2) c0 = cr[(NM * J + mt) & 1];
+                            else if constexpr (CR) c0 = cr[mt];
                             else if constexpr (W::CINIT && !NOCI) c0 = *(const gg_v8f*)(const void*)(xg + (J * 16 / W::XG) * BM + mt * 16);
 #pragma unroll
                             for (int nt = 0; nt < NT; ++nt) P[mt][nt] = gg_wmma(af[C][mt], bf[C][nt], c0);
+                            if constexpr (CR2) {   /* tile t + 2's init into tile t's register, if it is in this slab */
+                                const int u = NM * J + mt + 2;
+                                if (u < 8 * NM) cr[(NM * J + mt) & 1] = *(const gg_v8f*)(const void*)(xg + ((u / NM) * 16 / W::XG) * BM + (u % NM) * 16);
+                            } else if constexpr (CR && J < 7) {   /* step J + 1's init for this tile, a step ahead (same slab, same buffer) */
+                                cr[mt] = *(const gg_v8f*)(const void*)(xg + ((J + 1) * 16 / W::XG) * BM + mt * 16);
+                            }
                         } else {
 #pragma unroll
                             for (int nt = 0; nt < NT; ++nt) P[mt][nt] = gg_wmma(af[C][mt], bf[C][nt], P[mt][nt]);
@@ -477,10 +504,13 @@ constexpr unsigned pf_lds(int mt) {
 }
 
 /* ---- the forms built: (MT, NT, WN, FI) for every type, and the ablations on the stock geometry. A form's code is
- * 100 MT + 10 NT + WN / 4 + 4 FI (322 = the stock geometry and order, 326 the same with the folds interleaved), plus
+ * 100 MT + 10 NT + WN / 4 + 4 FI (322 = the stock geometry and order, 326 the same with the folds interleaved, 334 that with
+ * the chain-init ring), plus
  * 1000 ABL for an ablation. (6.11 compile: MT 4 NT 2 WN 4, MT 2 NT 4 WN 4 and MT 3 NT 4 WN 4 spill 9-480 registers in
  * the stock order; not built.) */
-#define PF_FORMS(X) X(3, 2, 8, 0) X(4, 2, 8, 0) X(2, 2, 8, 0) X(3, 2, 4, 0) X(2, 4, 8, 0) X(3, 2, 8, 1) X(4, 2, 8, 1) X(2, 4, 8, 1)
+#define PF_FORMS(X) X(3, 2, 8, 0) X(4, 2, 8, 0) X(2, 2, 8, 0) X(3, 2, 4, 0) X(2, 4, 8, 0) X(3, 2, 8, 1) X(4, 2, 8, 1) X(2, 4, 8, 1) \
+    X(3, 2, 8, 3) X(3, 2, 8, 7)   /* FI 3 = FI 1 + the chain-init ring (CR, Q6_K; the other types run FI 1): 334; FI 7 its two-register
+    form (CR2): 350 (a code no geometry has: NT 5 is not built). MT 4 (434) spilled 29-32 VGPRs. */
 #define PF_ABLS(X) X(1) X(2) X(4)
 
 constexpr int pf_code(int mt, int nt, int wn, int fi, int abl) { return 1000 * abl + 100 * mt + 10 * nt + wn / 4 + 4 * fi; }

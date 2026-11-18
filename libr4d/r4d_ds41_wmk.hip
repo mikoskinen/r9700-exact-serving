@@ -1584,7 +1584,9 @@ bool wq_known(int code) {
  * geometry moves time, never bytes (each output's operations are the part order's in every form). */
 namespace {
 #define WKPF_FORMS(X) X(3, 2, 8, 0) X(4, 2, 8, 0) X(4, 2, 8, 1) X(3, 2, 8, 1) X(3, 2, 4, 0) X(2, 2, 8, 0) \
-    X(4, 1, 16, 0) X(4, 1, 16, 1) X(2, 1, 16, 0)   /* one column tile a wave, 16 waves: half the accumulators a lane (the fold's total fits) */
+    X(4, 1, 16, 0) X(4, 1, 16, 1) X(2, 1, 16, 0)   /* one column tile a wave, 16 waves: half the accumulators a lane (the fold's total fits) */ \
+    X(3, 2, 8, 3) X(3, 2, 8, 7)   /* tp8 loop A5b: 326 + the chain-init ring (gg_pf_kernel CR, Q6_K): 334 (11 VGPRs spill at the part fold;
+    434 spilled 176) and its two-register ring CR2: 350; bench pin only */
 /* The running total in registers (measured 14.11., --perfwkpf, one card: the scratch-held total TS costs +30..110 % a launch,
  * more than the registers' spills). g_wkpf_ts (bench pin r4d_gg_wkpf_ts): 0 / 1 registers, 2 scratch.
  * The form: 322 (the stock geometry; the fastest part-order form at most dense shapes, 14.11.), whatever gg_pf picks; the bench
