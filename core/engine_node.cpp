@@ -197,6 +197,9 @@ const std::vector<std::string>& node_own_options() {
         "-v", "-vv", "--live", "--http-threads", "--api-key", "--api-key-env", "--served-model-name",
         "--log-requests", "--kld-record", "--kld-ref", "--kld-out", "--kld-corpus", "--expert-stats",
         "--profile-ops",
+        /* tp8 loop D20 (loop FINDINGS F57): the block drafter's short block runs on the leader only (the follower declares
+         * no drafter: deepseek41 lr_settle), so its pick is the leader's own */
+        "--draft-short-from",
     };
     return v;
 }
@@ -208,6 +211,11 @@ bool node_own_env(const std::string& k) {
                                  "RADIANCE_PROFILE" };
     for (const char* o : own)
         if (k.rfind(o, 0) == 0) return true;
+    /* tp8 loop D20 (loop FINDINGS F57): the leader's drafter knobs, whole keys (the follower declares no drafter: deepseek41
+     * lr_settle; its engine runs no query pass) -- D18's short block, D19's tiers */
+    static const char* own_key[] = { "RADIANCE_DS41_DSPARK_SHORT", "RADIANCE_DRAFT_SHORT_TIERS" };
+    for (const char* o : own_key)
+        if (k == o) return true;
     return false;
 }
 

@@ -480,6 +480,14 @@ TEST(nodes_whose_options_differ_both_refuse_to_start) {
     const PipeRun pc = record_pipeline(d / "rec2", "0,2", {}, { "--pp-cut", "0,3" });
     CHECK(pc.leader != 0 && pc.follower != 0);
     CHECK(pc.llog.find("cut: this node '0,2', the peer '0,3'") != std::string::npos);
+    /* tp8 loop D20 (loop FINDINGS F57): the leader's own drafter knobs -- D18's short block (plugin env + --draft-short-from)
+     * and D19's tiers -- are each node's own: a pair with them on the leader only starts and serves (here no drafter: the
+     * tiny model's engine warns and keeps its block) */
+    const PipeRun po = record_pipeline(d / "rec3", "0,2", {}, {}, { "--draft-short-from", "12" },
+                                       { "RADIANCE_DS41_DSPARK_SHORT=1", "RADIANCE_DRAFT_SHORT_TIERS=12:1,6:3" });
+    const bool started = po.leader == 0 && po.follower == 0 && po.llog.find("the nodes differ") == std::string::npos;
+    if (!started) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(po.llog).c_str(), tail(po.flog).c_str());
+    CHECK(started);
 }
 
 /* --node-link verbs on a host without an RDMA device (or without libibverbs): both nodes refuse at the second rendezvous's
