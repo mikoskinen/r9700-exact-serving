@@ -459,7 +459,9 @@ int main(int argc, char** argv) {
     double live_sum = 0;
     // --routing FILE (P10-K5): the engine's own routings, recorded by an EXL3R4D_ROUTEDUMP build ({n_expert, rows,
     // off[0 .. n_expert]} records of 520 ints). Records with n_expert == E and rows == M * top_k are used in file order,
-    // layer l taking record l % count; each expert's rows go to tokens round-robin, so every token has top_k rows and no
+    // layer l taking record l x count / layers (tp8 X7: a stride over the whole file -- the first `layers` records of a capture are
+    // its earliest launches, not its mix: lq121's first 48 16-row records had 41.2 live experts against the file's 61.3; with fewer
+    // records than layers, record l % count as before); each expert's rows go to tokens round-robin, so every token has top_k rows and no
     // expert sees a token twice (which token a row is matters only for the x row the prep reads).
     std::vector<std::vector<int32_t>> recs;
     if (o.route_half >= 0 && o.routing.empty()) die("--route-half needs --routing");
@@ -519,7 +521,8 @@ int main(int argc, char** argv) {
     for (int l = 0; l < o.layers; ++l) {
         if (recs.empty()) route.push_back(draw(o.M, o.E, o.topk));
         else {
-            const std::vector<int32_t>& rc = recs[(size_t)l % recs.size()];
+            const size_t pick = recs.size() > (size_t)o.layers ? (size_t)((int64_t)l * (int64_t)recs.size() / o.layers) : (size_t)l % recs.size();
+            const std::vector<int32_t>& rc = recs[pick];
             const int32_t Tr = (int32_t)(o.M * o.topk);
             auto cl = [&](int32_t v) { return v < 0 ? 0 : v > Tr ? Tr : v; };
             Route r;
