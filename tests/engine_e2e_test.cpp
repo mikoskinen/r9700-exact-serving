@@ -3807,6 +3807,26 @@ TEST(lever_dlw_weight_sidecar) {
                                 "blk.0.attn_qkv.weight=rtn:codes=i8,group=128,scale=bf16" }, engine_env(), &slog);
     CHECK(st2 != 0);
     CHECK(has(slog, "not a quantised one again"));
+    /* tp8 loop P30 (b): under --requant the same entry (E4M3 codes, a bf16 scale a 128x128 block: affine planes) is decoded and
+     * quantised again by the rule -- here the rule it was converted with, so the sidecar holds the container's own codes and scales
+     * and the engine serves llama.rad's numbers exactly (a decode -> re-encode round trip at the same grid) */
+    const int st2r = tiny::run({ RAD_E2E_SIDECAR, w.llama_rad, "-o", d / "requant.rad", "--requant", "--quant",
+                                 "blk.0.attn_qkv.weight=rtn:codes=fp8_e4m3,block=128x128,scale=bf16" }, engine_env(), &slog);
+    if (st2r != 0) fprintf(stderr, "    rad-sidecar --requant exited %d:\n%s\n", st2r, tail(slog).c_str());
+    CHECK_EQ(st2r, 0);
+    CHECK(has(slog, "1 entries of llama.rad"));
+    a[1] = d / "s1r";
+    Ran s1r = radiance(w.llama_rad, a, { "RADIANCE_WEIGHT_SIDECAR=" + (d / "requant.rad") });
+    REQUIRE_RAN(s1r);
+    CHECK(has(s1r.log, "weight sidecar: 1 entries"));
+    {
+        const std::string refq = w.reference(w.llama_rad, w.corpus_short, &rlog);
+        REQUIRE(!refq.empty());
+        std::string whyq;
+        const bool sameq = same_recording(refq, d / "s1r", &whyq);
+        if (!sameq) fprintf(stderr, "    --requant round trip vs llama.rad: %s\n", whyq.c_str());
+        CHECK(sameq);
+    }
     /* a sidecar written from another container (llama_mxfp4.rad's plain head) */
     const int st3 = tiny::run({ RAD_E2E_SIDECAR, w.llama_mxfp4, "-o", d / "other.rad", "--quant", rule }, engine_env(),
                               &slog);
