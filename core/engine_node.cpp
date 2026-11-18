@@ -65,6 +65,8 @@ struct PpGlobal {
     std::atomic<int>     seg_l0{ 0 }, seg_l1{ 0 };
     std::mutex seg_mu;
     std::vector<int32_t> segs;
+    /* tp8 dev D10 round 2: X1 carries the step's token ids and the receiver takes them before any read (rad_pp_x1_ids) */
+    std::atomic<int>     x1_ids{ 0 };
     /* tp8 S6: the KV layers both nodes hold of one source (rad_pp_kv_copy): group, slot here, model layer */
     std::mutex kv_mu;
     std::vector<std::array<int32_t, 3>> kv_copies;
@@ -106,6 +108,8 @@ extern "C" void rad_pp_segments(const int32_t* bounds, int n) {
     for (int i = 0; bounds && i < n && i < RAD_PP_MAX_SEGS; ++i) g.segs.push_back(bounds[i]);
 }
 
+extern "C" void rad_pp_x1_ids(int on) { pp_g().x1_ids.store(on ? 1 : 0, std::memory_order_relaxed); }
+
 namespace rad {
 /* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
  * head and tail share their batch). RAD_PP_PART_WHOLE on one machine and on one lane. */
@@ -125,6 +129,8 @@ std::vector<int32_t> pp_segments() {
     std::lock_guard<std::mutex> lk(g.seg_mu);
     return g.segs;
 }
+/* tp8 dev D10 round 2: the plugin declared X1's token-ids part (rad_pp_x1_ids) */
+bool pp_x1_ids() { return pp_g().x1_ids.load(std::memory_order_relaxed) != 0; }
 }  /* namespace rad */
 
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
@@ -316,7 +322,10 @@ int Engine::pp_connect() {
      * no X1 (the plugins; at h > 0 X1 is a layer's residual and stays) */
     const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
     const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
-    o.no_x1 = fe_on;
+    /* tp8 dev D10 round 2: with RADIANCE_PP_ISSUE_AHEAD=1 at W(0, t) the plugins' X1 carries the step's token ids, so the
+     * leader sends X1 beside the follower's own lookup (read before declare: the plugins decide it from the same switch) */
+    const char* iav = std::getenv("RADIANCE_PP_ISSUE_AHEAD");
+    o.no_x1 = fe_on && !(iav && !std::strcmp(iav, "1"));
     if (fe && !std::strcmp(fe, "1"))
         RAD_INFO("two-node pipeline: RADIANCE_PP_FOLLOWER_EMBED=1 %s", fe_on
                      ? "-- the follower looks the step's embedding up itself; the leader sends no X1 (tp8 dev 1a)"
@@ -1342,7 +1351,15 @@ int Engine::follower_loop() {
                 break;
             }
         const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
-        if (fe && !std::strcmp(fe, "1")) {
+        const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
+        /* tp8 dev D10 round 2: the plugin's X1 carries the step's token ids (the leader's card's) and this node's pass takes
+         * them first, into its own batch: then it may embed / hash them whatever the frame's host ids were */
+        if (pp_x1_ids()) {
+            RAD_INFO("follower: RADIANCE_PP_ISSUE_AHEAD=1 -- this node's pass takes the step's token ids from X1 (the leader's "
+                     "card's) before it reads any%s%s; the leader may ship a lane's next step before its collect (tp8 dev D10 "
+                     "round 2)", fe_on ? " (it embeds them: RADIANCE_PP_FOLLOWER_EMBED=1)" : "",
+                     why.empty() ? "" : " (an Engram layer here hashes them)");
+        } else if (fe && !std::strcmp(fe, "1")) {
             /* the leader does not take it beside the follower's embedding (engine_lanes.cpp): nothing is shipped early */
             RAD_INFO("follower: RADIANCE_PP_ISSUE_AHEAD=1 is not taken with RADIANCE_PP_FOLLOWER_EMBED=1 (this node embeds the "
                      "step's token ids; the leader issues nothing ahead) (tp8 dev D10)");

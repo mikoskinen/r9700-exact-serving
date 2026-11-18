@@ -63,6 +63,8 @@
 
 namespace rad {
 
+bool pp_x1_ids();   /* engine_node.cpp: the plugin declared X1's token-ids part (tp8 dev D10 round 2) */
+
 /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1; FINDINGS F6 22:37): where a lone cold prompt's time goes on the leader. The
  * leader's chunk rhythm on the cards fits rows x 0.078-0.081 ms + a fixed 13-23 ms a chunk (lq18 / lq19), and a prefill
  * pass is unrecorded, so RADIANCE_AQL_STAMP does not see it. Here card-local events go onto rank 0's stream around every
@@ -453,13 +455,17 @@ int Engine::step_loop_lanes() {
     if (const char* v = std::getenv("RADIANCE_PP_ISSUE_AHEAD"); v && !std::strcmp(v, "1")) {
         const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
         const bool fe_on = fe && !std::strcmp(fe, "1");
-        ia = !tail_ahead_ && !fe_on && !embedding_;
-        RAD_INFO("two-node pipeline: RADIANCE_PP_ISSUE_AHEAD=1 %s", ia
+        /* tp8 dev D10 round 2: beside the follower's own embedding when the plugin's X1 carries the step's token ids (the
+         * leader's card's, sent by the head part after ADV_TRUNK) and the follower takes them before its lookup */
+        const bool ids = pp_x1_ids();
+        ia = !tail_ahead_ && (!fe_on || ids) && !embedding_;
+        RAD_INFO("two-node pipeline: RADIANCE_PP_ISSUE_AHEAD=1 %s%s", ia
                      ? "-- an undrafted decode lane's next step is planned, its head part released and its frame shipped before "
                        "this step's collect (tp8 dev D10)"
-                     : fe_on ? "is not taken with RADIANCE_PP_FOLLOWER_EMBED=1 (the follower would embed token ids it does not "
-                               "have yet)"
-                             : "is not taken with RADIANCE_PP_TAIL_AHEAD=1");
+                     : fe_on && !ids ? "is not taken with RADIANCE_PP_FOLLOWER_EMBED=1 (the follower would embed token ids it "
+                                       "does not have yet)"
+                                     : "is not taken with RADIANCE_PP_TAIL_AHEAD=1",
+                 ia && ids ? "; X1 carries the step's token ids, which the follower takes before it reads any (round 2)" : "");
     }
     auto ia_ok = [&](int l, const RadBatch* bb, bool kv_due_now) {
         if (!ia || kv_due_now || lanes_.is_bg(l) || lanes_.inbox_n(l) > 0 || bb->phase != RAD_PHASE_DECODE) return false;
