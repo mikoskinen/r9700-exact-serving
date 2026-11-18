@@ -834,7 +834,7 @@ static const RadParamSpec pAllGather[] = { P_INT("world_size"), P_INT("numel"), 
 static const RadOperandSpec oAllGather[] = { OPD("x"), OUT("y") };
 /* tp8 loop P20: the two-shot's halves over whole-row shards, in place (docs/OPS.md) */
 static const RadParamSpec pRowsColl[] = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"), P_INT("row"),
-                                          P_INTO("raw"), P_INTO("overlap") };
+                                          P_INTO("raw"), P_INTO("overlap"), P_INTO("bound") };   /* bound: libr4d's instance */
 static const RadOperandSpec oRowsColl[] = { INOUT("x"), OUT_O("y") };
 
 /* ---- vocabulary edges --------------------------------------------------------------------- */
@@ -1217,7 +1217,8 @@ static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
  * `ring` is the core's ring for this crossing on this node (RadPpInfo::ring), a raw pointer the
  * plugin passes; x0..x11 / y0..y11 are the parts, each [rows, ...] at its own dtype, packed verbatim
  * (tp8 S6: a part's rows are its own; part 0's are the header's). */
-static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender"), P_INTO("loop") };
+/* `shard` (tp8 loop P20 round 3, stage_send): a mask of the parts every rank sends its rows of (the others rank `sender`) */
+static const RadParamSpec pStage[] = { P_INT("M"), P_INT("ring"), P_INT("parts"), P_INTO("sender"), P_INTO("loop"), P_INTO("shard") };
 static const RadOperandSpec oStageSend[] = { OPD("ring"), OPD("x0"), OPD_O("x1"), OPD_O("x2"),
                                              OPD_O("x3"), OPD_O("x4"), OPD_O("x5"), OPD_O("x6"),
                                              OPD_O("x7"), OPD_O("x8"), OPD_O("x9"), OPD_O("x10"),

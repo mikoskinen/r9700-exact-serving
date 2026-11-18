@@ -69,8 +69,21 @@ struct Parts {
     int32_t  nr;                       /* the node's ranks */
     uint64_t lo, hi;                   /* this rank's share of the payload in bytes, 256-byte aligned */
     uint64_t cmp;                      /* (2) 4-byte words of the parts inside [lo, hi) */
+    /* tp8 loop P20 round 3 (split 3, the op's `shard` mask): each rank copies the ROWS it owns of every masked part -- rows
+     * [srow0, srow1) of the masked parts' `srows` rows (r q .. (r + 1) q, q = ceil(srows / nr), the rows collectives' cut;
+     * every masked part has srows rows, a part's row bytes = its bytes / srows) -- and, sending, rank `sender` the other parts
+     * whole (receiving: every rank the other parts whole). Kept to three words: every stage kernel takes Parts BY VALUE and
+     * the engine's AQL backend holds 768 bytes of kernel arguments a launch (FINDINGS F37: per-part arrays here broke them). */
+    uint32_t smask;
+    uint64_t srows, srow0, srow1;
     int32_t  idle;                     /* tp8 dev D8: 1 = rank 0's receive adds its wait to the ring (RadPpRing::wait_on) */
 };
+
+/* FINDINGS F37: Parts goes BY VALUE into every stage kernel beside at most three pointers, and the code object adds its hidden
+ * arguments; the engine's AQL backend holds 768 bytes of kernel arguments a launch. Measured (llvm-readelf --notes of this
+ * object's gfx1201 code): .kernarg_segment_size 680-696 bytes for the five stage kernels with this Parts (round 3's per-part
+ * arrays made it 848: lq81 down at step 0). The guard keeps 128 bytes for the hidden arguments. */
+static_assert(sizeof(Parts) + 3 * sizeof(void*) + 128 <= 768, "the stage kernels' arguments fit the AQL backend's kernarg slot");
 
 __device__ inline uint64_t ld_sys(const volatile uint64_t* p) {
     return __hip_atomic_load((uint64_t*)p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -139,7 +152,7 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
     if (threadIdx.x == 0) {
         const uint64_t d = ld_sys(&r->done[P.rank]);
         mine = d + 1;
-        if (P.split == 1 || pub) ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= d; }) ? 1 : 0;
+        if (P.split != 2 || pub) ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= d; }) ? 1 : 0;
         else                     ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->staged) >= d + 1; }) ? 1 : 0;
     }
     __syncthreads();
@@ -149,8 +162,18 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
         const bool all = P.split == 2 && pub;
         const uint64_t lo = all ? 0 : P.lo, hi = all ? P.total : P.hi;
         for (int k = 0; k < P.n; ++k) {
-            const uint64_t a = lo > P.off[k] ? lo : P.off[k];
-            const uint64_t e = hi < P.off[k] + P.bytes[k] ? hi : P.off[k] + P.bytes[k];
+            uint64_t a = lo > P.off[k] ? lo : P.off[k];
+            uint64_t e = hi < P.off[k] + P.bytes[k] ? hi : P.off[k] + P.bytes[k];
+            if (P.split == 3) {   /* tp8 loop P20 round 3: this rank's rows of a masked part, or a whole part of `sender` */
+                if ((P.smask >> k) & 1u) {
+                    const uint64_t rb = P.bytes[k] / P.srows;
+                    a = P.off[k] + P.srow0 * rb;
+                    e = P.off[k] + P.srow1 * rb;
+                } else {
+                    a = pub ? P.off[k] : 0;
+                    e = pub ? P.off[k] + P.bytes[k] : 0;
+                }
+            }
             if (a >= e) continue;
             const char* src = reinterpret_cast<const char*>(P.p[k]) + (a - P.off[k]);
             if (P.split == 2 && !pub) {
@@ -308,8 +331,14 @@ __global__ void __launch_bounds__(kThreads) stage_recv_kernel(RadPpRing* r, Part
     if (ok) {
         const char* src = reinterpret_cast<const char*>(r) + RAD_PP_RING_HDR;
         const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
-        for (int k = 0; k < P.n; ++k) copy_part(src + P.off[k], reinterpret_cast<char*>(P.p[k]), P.bytes[k],
-                                                (P.w16 >> k) & 1u, stride);
+        for (int k = 0; k < P.n; ++k) {
+            if (P.split == 3 && ((P.smask >> k) & 1u)) {   /* tp8 loop P20 round 4: this rank's rows of a masked part */
+                const uint64_t rb = P.bytes[k] / P.srows, a = P.srow0 * rb, e = P.srow1 * rb;
+                if (e > a) copy_part(src + P.off[k] + a, reinterpret_cast<char*>(P.p[k]) + a, e - a, (P.w16 >> k) & 1u, stride);
+                continue;
+            }
+            copy_part(src + P.off[k], reinterpret_cast<char*>(P.p[k]), P.bytes[k], (P.w16 >> k) & 1u, stride);
+        }
     }
     __threadfence();
     __syncthreads();
@@ -523,6 +552,29 @@ int recv_async(RadPpRing* r, const Parts& P, int dev, RadStream stream, int rank
     return RAD_OK;
 }
 
+/* tp8 loop P20 rounds 3 + 4: the row range of rank a->rank over the masked parts (every one srows rows, each row a multiple
+ * of 4 bytes; a masked part whose rows are not 16-byte words takes the 4-byte path) */
+int shard_rows(const RadArgs* a, uint32_t mask, uint64_t nr, Parts* P) {
+    uint64_t rows = 0;
+    for (int k = 0; k < P->n; ++k) {
+        if (!((mask >> k) & 1u)) continue;
+        const RadTensor* t = r4d_opt(a, 1 + k);
+        const uint64_t r = t ? (uint64_t)t->shape[0] : 0;
+        if (r == 0 || (rows && r != rows) || P->bytes[k] % r) return RAD_E_SHAPE;
+        rows = r;
+        const uint64_t rb = P->bytes[k] / r;
+        if (rb % 4) return RAD_E_ALIGN;
+        if (rb % 16) P->w16 &= ~(1u << k);
+    }
+    if (rows == 0 || nr == 0) return RAD_E_SHAPE;
+    const uint64_t q = (rows + nr - 1) / nr;
+    P->smask = mask;
+    P->srows = rows;
+    P->srow0 = (uint64_t)a->rank * q < rows ? (uint64_t)a->rank * q : rows;
+    P->srow1 = P->srow0 + q < rows ? P->srow0 + q : rows;
+    return RAD_OK;
+}
+
 int launch(const RadArgs* a, RadStream stream, bool send) {
     const RadTensor* rt = r4d_opt(a, 0);
     RadPpRing* r = rt ? static_cast<RadPpRing*>(rt->data) : nullptr;
@@ -534,9 +586,14 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     if (loop && ring_bytes < RAD_PP_RING_HDR + RAD_PP_TRAILER) return R4D_NO(RAD_E_FULL);
     /* tp8 loop P8: RADIANCE_PP_SEND_SPLIT (the core sets the send ring's send_split / send_ranks at start; never in loop) */
     const int sender = (int)r4d_geti_or(a, "sender", 0);
-    const int split = send && !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 &&
+    /* tp8 loop P20 round 3: `shard` (a mask of parts) -- every rank of the sending node copies its rows of those parts
+     * (split 3), whatever RADIANCE_PP_SEND_SPLIT says */
+    const uint32_t shard = send && !loop ? (uint32_t)r4d_geti_or(a, "shard", 0) : 0u;
+    const int split = shard && r->send_ranks >= 2 && sender >= 0 && (uint64_t)sender < r->send_ranks ? 3
+                    : send && !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 &&
                               sender >= 0 && (uint64_t)sender < r->send_ranks
                           ? (int)r->send_split : 0;
+    if (shard && !split) return R4D_NO(RAD_E_STATE);   /* a sharded payload needs every rank of the node in the ring */
     if (split && (a->rank < 0 || (uint64_t)a->rank >= r->send_ranks)) return R4D_NO(RAD_E_STATE);
     if (send && !loop && !split && a->rank != sender) return RAD_OK;
     if (!send && (a->rank < 0 || a->rank >= RAD_PP_MAX_RANKS || (!loop && (uint64_t)a->rank >= r->n_ranks)))
@@ -556,6 +613,22 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     }
     uint32_t* counter = counter_for(dev, r, send ? 0 : 1);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
+    if (split == 3) {
+        P.split = 3;
+        P.sender = sender;
+        P.nr = (int32_t)r->send_ranks;
+        const int st = shard_rows(a, shard, (uint64_t)P.nr, &P);
+        if (st < 0) return R4D_NO(st);
+        uint64_t share = 0;
+        for (int k = 0; k < P.n; ++k)
+            share += ((shard >> k) & 1u) ? (P.srow1 - P.srow0) * (P.bytes[k] / P.srows) : a->rank == sender ? P.bytes[k] : 0;
+        uint32_t* diff = counter_for(dev, r, 2);
+        if (!diff) return R4D_NO(RAD_E_NOMEM);
+        uint32_t blocks = (uint32_t)((share / 16 + kThreads * 4 - 1) / (kThreads * 4));
+        if (blocks < 1) blocks = 1;
+        if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+        return R4D_EMIT(stream, stage_send_split_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter, diff);
+    }
     if (split) {
         P.split = split;
         P.sender = sender;
@@ -576,6 +649,22 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
         if (blocks < 1) blocks = 1;
         if (blocks > kMaxBlocks) blocks = kMaxBlocks;
         return R4D_EMIT(stream, stage_send_split_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter, diff);
+    }
+    /* tp8 loop P20 round 4: a receive with `shard` copies this rank's rows of the masked parts, the others whole (never
+     * through the staging buffer: P10b's path keeps whole parts) */
+    if (!send && !loop) {
+        const uint32_t rsh = (uint32_t)r4d_geti_or(a, "shard", 0);
+        if (rsh) {
+            const uint64_t nr = r->n_ranks > 0 ? r->n_ranks : 1;
+            P.split = 3;
+            const int st = shard_rows(a, rsh, nr, &P);
+            if (st < 0) return R4D_NO(st);
+            const uint64_t words = P.total / (P.w16 == (1u << P.n) - 1u ? 16 : 4);
+            uint32_t blocks = (uint32_t)((words + kThreads * 4 - 1) / (kThreads * 4));
+            if (blocks < 1) blocks = 1;
+            if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+            return R4D_EMIT(stream, stage_recv_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter);
+        }
     }
     /* tp8 loop P10b: a large payload lands through this rank's card staging buffer from a side stream */
     if (!send && !loop && r->recv_rows && P.rows >= r->recv_rows && a->rank >= 0 && a->rank < RAD_PP_MAX_RANKS &&
