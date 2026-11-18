@@ -35,6 +35,8 @@
 // (`form` 1, lever W1b): the block's rows come through LDS as whole 128-byte lines, the same chain a thread.
 #include <hip/hip_runtime.h>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include "r4d_gdn_args.h"
 #include "r4d_dflash_conv_body.h"   // r4d_bf2f, r4d_u16, r4d_u32x4, R4dV8
@@ -44,7 +46,7 @@ namespace {
 
 constexpr int kWalkThreads = 128;
 constexpr int kWalkWaves = kWalkThreads / 32;
-constexpr int kWalkSeqs = 8;          // sequences a pass
+constexpr int kWalkSeqs = 8;          // sequences a pass (SEQS 16 only as a bench pin)
 constexpr int kWalkMaxRank = 512;
 
 __device__ __forceinline__ unsigned walk_ord(unsigned b) {
@@ -84,24 +86,24 @@ constexpr int kStagePitch = kStageElems / 2 + 1;      // dwords a row in LDS (33
 constexpr int kStagePieces = kWalkThreads * kStageElems / 8 / kWalkThreads;   // 16-byte pieces a thread a chunk (8)
 constexpr int kStageMaxRank = 256;                    // form 1's predecessor rows in LDS (8 KB): more LDS, fewer waves
 
-template <bool STAGED>
+template <bool STAGED, int SEQS = kWalkSeqs>
 __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
     const float* __restrict__ logits, long lpitch, const int* __restrict__ anchor, long astride,
     const unsigned long long* __restrict__ prev, long ppitch, int world,
     const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
     unsigned long long* __restrict__ keys, long kpitch, int* __restrict__ tokens, long tpitch,
     int S, int step, int steps, int R, int V, int N, int voff) {
-    __shared__ float su[kWalkSeqs * (STAGED ? kStageMaxRank : kWalkMaxRank)];
-    __shared__ int sprev[kWalkSeqs];
-    __shared__ unsigned long long sbest[kWalkSeqs * kWalkWaves];
+    __shared__ float su[SEQS * (STAGED ? kStageMaxRank : kWalkMaxRank)];
+    __shared__ int sprev[SEQS];
+    __shared__ unsigned long long sbest[SEQS * kWalkWaves];
     __shared__ unsigned sw[STAGED ? kWalkThreads * kStagePitch : 1];
     const int tid = threadIdx.x;
     const int lane = tid & 31, wave = tid >> 5;
     const int j = blockIdx.x * kWalkThreads + tid;
     const bool live = step < steps && j < N;
 
-    for (int g0 = 0; g0 < S; g0 += kWalkSeqs) {
-        const int ng = S - g0 < kWalkSeqs ? S - g0 : kWalkSeqs;
+    for (int g0 = 0; g0 < S; g0 += SEQS) {
+        const int ng = S - g0 < SEQS ? S - g0 : SEQS;
         if (tid < ng) {
             const int s = g0 + tid;
             int p;
@@ -124,9 +126,9 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
         }
         __syncthreads();
 
-        float acc[kWalkSeqs];
+        float acc[SEQS];
 #pragma unroll
-        for (int sl = 0; sl < kWalkSeqs; ++sl) acc[sl] = 0.0f;
+        for (int sl = 0; sl < SEQS; ++sl) acc[sl] = 0.0f;
         if constexpr (STAGED) {
             const int base = blockIdx.x * kWalkThreads;
             const int nrows = N - base < kWalkThreads ? N - base : kWalkThreads;
@@ -164,7 +166,7 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
                         const float w0 = r4d_bf2f((r4d_u16)(w2 & 0xffffu)), w1 = r4d_bf2f((r4d_u16)(w2 >> 16));
                         const int r = c * kStageElems + 2 * dd;
 #pragma unroll
-                        for (int sl = 0; sl < kWalkSeqs; ++sl) {
+                        for (int sl = 0; sl < SEQS; ++sl) {
                             if (sl < ng) {
                                 acc[sl] = __fmaf_rn(su[sl * R + r], w0, acc[sl]);
                                 acc[sl] = __fmaf_rn(su[sl * R + r + 1], w1, acc[sl]);
@@ -184,7 +186,7 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
 #pragma unroll
                 for (int q = 0; q < 8; ++q) wf[q] = r4d_bf2f(v.h[q]);
 #pragma unroll
-                for (int sl = 0; sl < kWalkSeqs; ++sl) {
+                for (int sl = 0; sl < SEQS; ++sl) {
                     if (sl < ng) {
                         const float* u = su + sl * R + r0;
 #pragma unroll
@@ -194,7 +196,7 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
             }
         }
 #pragma unroll
-        for (int sl = 0; sl < kWalkSeqs; ++sl) {
+        for (int sl = 0; sl < SEQS; ++sl) {
             if (sl < ng) {
                 unsigned long long k = 0ull;
                 if (live) k = walk_key(logits[(long)((g0 + sl) * steps + step) * lpitch + j] + acc[sl], voff + j);
@@ -212,9 +214,117 @@ __global__ __launch_bounds__(kWalkThreads) void dspark_walk_step_kernel(
     }
 }
 
+/* DRAFTER track 18.11.2026 (RADIANCE_DS41_WALK_WM=1 at load, rule B): the walk's scores as a WMMA product. The fma chains
+ * (S x N x R per step, each with an LDS read of the predecessor value) bound form 0 at S 16 (~135-150 us a step, the shard's
+ * succ rows are 16.5 MB = ~27 us). Here a wave takes 16 vocabulary columns at a time: A = the sequences' predecessor rows
+ * (16 rows, bf16 as stored), B = the columns' succ rows, C = 16 x 16 dot products by v_wmma_f32_16x16x16_bf16 over R = 256
+ * in 16 K-steps; lane half h holds r = 128 h + 8 j .. + 7 of K-step j in both operands (any order both agree on), so a lane
+ * reads its succ row half as 256 contiguous bytes. score = logits + C (one f32 add), the key as walk_key. Not form 0's chain
+ * order: rule B (deterministic; a sequence's scores depend only on its own predecessor row, so batch-invariant). */
+typedef __bf16 walk_v8bf __attribute__((ext_vector_type(8)));
+typedef float walk_v8f __attribute__((ext_vector_type(8)));
+
+constexpr int kWmR = 256;
+__global__ __launch_bounds__(kWalkThreads) void dspark_walk_wm_kernel(
+    const float* __restrict__ logits, long lpitch, const int* __restrict__ anchor, long astride,
+    const unsigned long long* __restrict__ prev, long ppitch, int world,
+    const r4d_u16* __restrict__ pred, const r4d_u16* __restrict__ succ,
+    unsigned long long* __restrict__ keys, long kpitch, int* __restrict__ tokens, long tpitch,
+    int S, int step, int steps, int V, int N, int voff) {
+    __shared__ int sprev[16];
+    __shared__ unsigned long long sbest[16 * kWalkWaves];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, nl = lane & 15, h = lane >> 4;
+    const int ntile = (N + 15) >> 4;
+    for (int g0 = 0; g0 < S; g0 += 16) {
+        const int ng = S - g0 < 16 ? S - g0 : 16;
+        if (tid < ng) {
+            const int s = g0 + tid;
+            int p;
+            if (step == 0) {
+                p = anchor[(long)s * astride];
+            } else {
+                unsigned long long k = 0ull;
+                for (int w = 0; w < world; ++w) k = walk_umax(k, prev[(long)s * ppitch + 2 * w]);
+                p = walk_token(k);
+                if (blockIdx.x == 0) tokens[(long)s * tpitch + step - 1] = p;
+            }
+            sprev[tid] = p;
+        }
+        if (step == steps) continue;
+        __syncthreads();
+        /* A: this lane's sequence row (nl), its half h, all 16 K-steps */
+        r4d_u32x4 af[16];
+        {
+            const int p = nl < ng ? sprev[nl] : -1;
+            const bool ok = p >= 0 && p < V;
+            const r4d_u16* pr = pred + (long)(ok ? p : 0) * kWmR + 128 * h;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                r4d_u32x4 z = { 0u, 0u, 0u, 0u };
+                if (ok) z = *(const r4d_u32x4*)(pr + 8 * j);
+                af[j] = z;
+            }
+        }
+        unsigned long long best[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) best[i] = 0ull;
+        for (int t = blockIdx.x * kWalkWaves + wave; t < ntile; t += gridDim.x * kWalkWaves) {
+            const int v = t * 16 + nl;
+            const bool vl = v < N;
+            const r4d_u16* sr = succ + (long)(voff + (vl ? v : 0)) * kWmR + 128 * h;
+            r4d_u32x4 bf[16];
+#pragma unroll
+            for (int j = 0; j < 16; ++j) bf[j] = *(const r4d_u32x4*)(sr + 8 * j);
+            walk_v8f c = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(walk_v8bf, af[j]), __builtin_bit_cast(walk_v8bf, bf[j]), c);
+            /* D lane L: column (vocabulary) L % 16, rows (sequences) 8 (L / 16) + i */
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int sl = 8 * h + i;
+                if (vl && sl < ng) {
+                    const float sc = logits[(long)((g0 + sl) * steps + step) * lpitch + v] + c[i];
+                    best[i] = walk_umax(best[i], walk_key(sc, voff + v));
+                }
+            }
+        }
+        /* each sequence's max over the half-wave's 16 columns, then the waves, then the block's atomicMax */
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            unsigned long long k = best[i];
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) {
+                const unsigned hi = __shfl_xor((unsigned)(k >> 32), o, 32);
+                const unsigned lo = __shfl_xor((unsigned)(k & 0xffffffffull), o, 32);
+                k = walk_umax(k, ((unsigned long long)hi << 32) | lo);
+            }
+            if (nl == 0) sbest[(8 * h + i) * kWalkWaves + wave] = k;
+        }
+        __syncthreads();
+        if (tid < ng) {
+            unsigned long long k = 0ull;
+            for (int w = 0; w < kWalkWaves; ++w) k = walk_umax(k, sbest[tid * kWalkWaves + w]);
+            if (k) atomicMax(&keys[(long)(g0 + tid) * kpitch], k);
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 
 /* ------------------------------------------------------------------ plugin entry */
+static int g_walk_seqs = 0;   /* bench hook (DRAFTER track): 0 the rule, 8 / 16 pinned */
+extern "C" void r4d_walk_seqs(int n) { g_walk_seqs = n == 8 || n == 16 ? n : 0; }
+/* RADIANCE_DS41_WALK_WM=1 (DRAFTER track, rule B): form 0 calls at R 256 take dspark_walk_wm_kernel; bench hook r4d_walk_wm. */
+static int walk_wm_env() {
+    const char* v = std::getenv("RADIANCE_DS41_WALK_WM");
+    const int on = v && *v == '1' && !v[1];
+    if (on) std::fprintf(stderr, "radiance: libr4d: dspark_walk_step takes the WMMA form at R 256 (RADIANCE_DS41_WALK_WM=1: rule B, the drafter's own reference)\n");
+    return on;
+}
+static int g_walk_wm = walk_wm_env();
+extern "C" void r4d_walk_wm(int on) { g_walk_wm = on ? 1 : 0; }
 enum { WK_LOGITS = 0, WK_ANCHOR, WK_PREV, WK_PRED, WK_SUCC, WK_KEYS, WK_TOKENS };
 
 /* An f32 [rows, 2 * width] plane read as [rows, width] u64 (a key slot is two of them): its row pitch in u64,
@@ -270,6 +380,32 @@ extern "C" int r4d_rad_dspark_walk_step(const RadArgs* a, RadStream stream) {
     const float* lg = (const float*)logits->data;
     const unsigned long long* pv = step > 0 ? (const unsigned long long*)prev->data : nullptr;
     unsigned long long* ks = step < steps ? (unsigned long long*)keys->data : nullptr;
+    /* DRAFTER track 18.11.2026: passes of 16 sequences (bench hook r4d_walk_seqs pins 8 / 16; each sequence's chain is the same,
+     * so the same bits); the rule keeps 8 */
+    if (g_walk_wm && form == 0 && R == kWmR) {
+        const unsigned wb = step < steps && N > 0 ? (unsigned)(((N + 15) / 16 + kWalkWaves * 4 - 1) / (kWalkWaves * 4)) : 1u;
+        hipLaunchKernelGGL(dspark_walk_wm_kernel, dim3(wb), dim3(kWalkThreads), 0, (hipStream_t)stream,
+                           lg, (long)lpitch, (const int*)anchor->data, (long)astride, pv, (long)ppitch, (int)world,
+                           (const r4d_u16*)pred->data, (const r4d_u16*)succ->data, ks, (long)kpitch,
+                           (int*)tokens->data, (long)tpitch, (int)S, (int)step, (int)steps, (int)V, (int)N, (int)voff);
+        return R4D_RAW((int)hipGetLastError());
+    }
+    const int seqs = g_walk_seqs > 0 ? g_walk_seqs : kWalkSeqs;   /* passes of 16: -10 % at S 16, +32 % at S 32 (wbench): pin only */
+    if (seqs == 16) {
+        if (form == 1 && R <= kStageMaxRank)
+            hipLaunchKernelGGL((dspark_walk_step_kernel<true, 16>), dim3(blocks), dim3(kWalkThreads), 0, (hipStream_t)stream,
+                               lg, (long)lpitch, (const int*)anchor->data, (long)astride, pv, (long)ppitch, (int)world,
+                               (const r4d_u16*)pred->data, (const r4d_u16*)succ->data, ks, (long)kpitch,
+                               (int*)tokens->data, (long)tpitch, (int)S, (int)step, (int)steps, (int)R, (int)V, (int)N,
+                               (int)voff);
+        else
+            hipLaunchKernelGGL((dspark_walk_step_kernel<false, 16>), dim3(blocks), dim3(kWalkThreads), 0, (hipStream_t)stream,
+                               lg, (long)lpitch, (const int*)anchor->data, (long)astride, pv, (long)ppitch, (int)world,
+                               (const r4d_u16*)pred->data, (const r4d_u16*)succ->data, ks, (long)kpitch,
+                               (int*)tokens->data, (long)tpitch, (int)S, (int)step, (int)steps, (int)R, (int)V, (int)N,
+                               (int)voff);
+        return R4D_RAW((int)hipGetLastError());
+    }
     /* form 1 holds the predecessor rows of a rank up to 256 (DeepSeek-V4.1's); past it form 0 runs, the same bits */
     if (form == 1 && R <= kStageMaxRank)
         hipLaunchKernelGGL(dspark_walk_step_kernel<true>, dim3(blocks), dim3(kWalkThreads), 0, (hipStream_t)stream,
