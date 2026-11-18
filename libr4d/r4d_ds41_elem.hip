@@ -365,22 +365,16 @@ bool mat_s(const RadTensor& t, uint32_t dt, long rows, long cols) {
 }
 long last_stride(const RadTensor& t) { return t.rank ? (long)t.stride[t.rank - 1] : 1; }
 unsigned grid_rows(long rows) { return (unsigned)(rows < 65535 ? rows : 65535); }
-/* Lever WQ (DRAFTER track, 18.11.2026 round 5): the R9700's dispatch window. A launch whose waves end within ~32 below a
- * multiple of 2048 (the card's wave slots: 32 WGPs x 64) or on it -- 253-256 / 510-512 / 1021-1024 workgroups of 256
- * threads -- takes ~+19-20 us whatever it does (tools/dbench/wgq, xeon w1-w5: a 2-byte touch kernel 24.5-26.3 us at
- * 253-256 / 510-512 / 1024 workgroups, 5.4-6.4 at 252 / 257 / 258 / 508 / 513; both xeon cards; on gpu02 in serving
- * (lq145) the trunk's rope_rt_kernel<32> runs 16-22 us on ~24 % of its calls, 1-6 us on the rest, and the drafter's
- * o_q quant_group 19-23 us at [16, 8192] = 512 workgroups). For a row-looped kernel (`for (r = blockIdx.y; r < rows;
- * r += gridDim.y)`) extra y blocks do nothing, so ds_dodge_gy returns the least gy' >= gy outside the window: the
- * same work, the same bits. */
-std::atomic<int> g_wq_pin{-1};   /* bench pin (abench): 0 = no dodge */
+/* Lever WQ (DRAFTER track, 18.11.2026 round 5): r4d_common.h's full-card cliff (r4d_cliff_rows, dffec0b: a launch whose
+ * waves fall in the last 32 before a multiple of 2048 runs ~5x slower) for the row-looped launches that did not step past it:
+ * quant_roundtrip, rope_rows_roundtrip, ds41_rope_rows (`for (r = blockIdx.y; r < rows; r += gridDim.y)`: extra y blocks do
+ * nothing -- the same work, the same bits). Measured where it was missed: the drafter's o_q quant_group at [16, 8192] = 512
+ * workgroups 19-23 us a stage in serving (lq145), 18.6 -> 4.6 us on the xeon (abench a9); the trunk's rope_rt_kernel<32> ran
+ * 16-22 us on ~24 % of its lq145 calls; tools/dbench/wgq re-measured the cliff on both xeon cards (24.5-26.3 vs 5.4-6.4 us). */
+std::atomic<int> g_wq_pin{-1};   /* bench pin (abench): 0 = no step past the cliff */
 unsigned ds_dodge_gy(unsigned gx, unsigned gy, unsigned waves_per_wg) {
     if (g_wq_pin.load(std::memory_order_relaxed) == 0) return gy;
-    for (unsigned g = gy; g < gy + 64u && g < 65535u; ++g) {
-        const unsigned long w = (unsigned long)gx * g * waves_per_wg, r = w % 2048ul;
-        if (r != 0ul && r <= 2048ul - 40ul) return g;
-    }
-    return gy;
+    return r4d_cliff_rows(gy, gx, waves_per_wg);
 }
 
 /* ==================================================================== token_map */
