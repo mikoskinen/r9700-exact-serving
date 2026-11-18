@@ -22,6 +22,7 @@
 #include "rad_sample.h"
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
+#include "rad_pp.h"        /* tp8 loop P20 round 3: the send ring */
 #include "rad_planes.h"
 
 #include <algorithm>
@@ -6267,6 +6268,84 @@ TEST(op_collectives_world2) {
  * over whole-row shards (q = ceil(rows / 4); 9 and 5 rows leave an uneven or empty-ish last shard); after the
  * reduce-scatter alone each rank's own rows are all_reduce's and the others its input. bf16 and f32 values whose
  * exponents span 2^-12..2^12, so only the ascending-rank f32 fold from 0 gives all_reduce's bits. */
+/* tp8 loop P20 round 3: stage_send's `shard` mask -- every rank of the node writes ITS rows of the masked parts (rows
+ * [r q, (r + 1) q), q = ceil(rows / 4)) and rank `sender` the other parts whole, into one send ring; the payload must be the
+ * whole parts' bytes, as rank 0 alone sends today from replicated buffers. Each rank's buffers hold its own rows right and
+ * every other row wrong (a rank's own junk), the unmasked part right only on the sender; a control without `shard` (rank 0
+ * alone) carries rank 0's junk rows. Parts: 9 rows of 8 f32 (16-byte rows), 9 rows of 10 bf16 (20-byte rows: the 4-byte
+ * path), 5 rows of 3 i32 (unmasked). */
+TEST(op_stage_send_row_shards_world4) {
+    const int W = 4;
+    const int64_t R0 = 9, R2 = 5;
+    auto good = [](int part, int64_t i) { return (float)(part * 1000 + i) * 0.25f; };
+    auto junk = [](int rank, int part, int64_t i) { return -(float)(rank * 100000 + part * 1000 + i) - 0.5f; };
+    for (int shard : { 3, 0 }) {
+        std::vector<uint8_t> ring((size_t)RAD_PP_RING_HDR + 65536, 0);
+        RadPpRing* r = reinterpret_cast<RadPpRing*>(ring.data());
+        r->magic = RAD_PP_RING_MAGIC;
+        r->cap = 65536 - RAD_PP_TRAILER;
+        r->send_ranks = W;
+        r->n_ranks = W;
+        r->deadline_ms = 20000;
+        std::vector<std::vector<T>> parts((size_t)W);
+        const int64_t q = (R0 + W - 1) / W;
+        for (int rk = 0; rk < W; ++rk) {
+            parts[(size_t)rk].reserve(3);   /* T's data points into its own mem: no reallocation */
+            parts[(size_t)rk].emplace_back(RAD_F32, std::vector<int64_t>{ R0, 8 });
+            parts[(size_t)rk].emplace_back(RAD_BF16, std::vector<int64_t>{ R0, 10 });
+            parts[(size_t)rk].emplace_back(RAD_I32, std::vector<int64_t>{ R2, 3 });
+            for (int k = 0; k < 2; ++k) {
+                const int64_t rb = k == 0 ? 8 : 10;
+                for (int64_t i = 0; i < R0 * rb; ++i) {
+                    const bool mine = (i / rb) / q == rk;
+                    parts[(size_t)rk][(size_t)k].set(i, mine ? good(k, i) : junk(rk, k, i));
+                }
+            }
+            for (int64_t i = 0; i < R2 * 3; ++i)
+                st_int(RAD_I32, parts[(size_t)rk][2].t.data, i, rk == 0 ? (int64_t)(7000 + i) : (int64_t)(-1 - i - 100 * rk));
+        }
+        T ringt(RAD_U8, { (int64_t)ring.size() });
+        ringt.t.data = ring.data();
+        int st[W] = { 0, 0, 0, 0 };
+        auto body = [&](int rk) {
+            A a;
+            a.t(ringt).t(parts[(size_t)rk][0]).t(parts[(size_t)rk][1]).t(parts[(size_t)rk][2])
+                .i("M", R0).i("ring", 0).i("parts", 3).i("sender", 0);
+            if (shard) a.i("shard", shard);
+            st[rk] = run("stage_send", a, rk, W);
+        };
+        std::vector<std::thread> th;
+        for (int rk = 0; rk < W; ++rk) th.emplace_back(body, rk);
+        for (std::thread& x : th) x.join();
+        for (int rk = 0; rk < W; ++rk) CHECK_OK(st[rk]);
+        CHECK_EQ((long long)r->ready, 1LL);
+        /* the payload against the whole parts' bytes */
+        const uint64_t b0 = (uint64_t)R0 * 8 * 4, b1 = (uint64_t)R0 * 10 * 2, b2 = (uint64_t)R2 * 3 * 4;
+        const uint64_t o1 = rad_pp_align(b0), o2 = o1 + rad_pp_align(b1);
+        const uint8_t* pay = ring.data() + RAD_PP_RING_HDR;
+        T want0(RAD_F32, { R0, 8 }), want1(RAD_BF16, { R0, 10 });
+        for (int64_t i = 0; i < R0 * 8; ++i) want0.set(i, good(0, i));
+        for (int64_t i = 0; i < R0 * 10; ++i) want1.set(i, good(1, i));
+        std::vector<int32_t> want2((size_t)(R2 * 3));
+        for (int64_t i = 0; i < R2 * 3; ++i) want2[(size_t)i] = (int32_t)(7000 + i);
+        const bool p0 = std::memcmp(pay, want0.mem.data(), b0) == 0, p1 = std::memcmp(pay + o1, want1.mem.data(), b1) == 0;
+        const bool p2 = std::memcmp(pay + o2, want2.data(), b2) == 0;
+        if (shard) {
+            CHECK(p0);
+            CHECK(p1);
+            CHECK(p2);
+            uint64_t bytes[3] = { b0, b1, b2 };
+            uint64_t lay = 0;
+            std::memcpy(&lay, pay + o2 + rad_pp_align(b2) + 8, 8);
+            CHECK_EQ((unsigned long long)lay, (unsigned long long)rad_pp_layout(bytes, 3));
+        } else {
+            CHECK(!p0);   /* the control: rank 0's junk rows */
+            CHECK(!p1);
+            CHECK(p2);
+        }
+    }
+}
+
 TEST(op_rows_collectives_world4) {
     for (uint32_t dt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F32 })
         for (int64_t rows : { (int64_t)8, (int64_t)9, (int64_t)5, (int64_t)4 }) {

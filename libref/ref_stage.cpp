@@ -160,12 +160,29 @@ static int wait_for(RadPpRing* r, const volatile uint64_t* w, uint64_t at_least)
     return __atomic_load_n(&r->abort, __ATOMIC_ACQUIRE) ? RAD_E_IO : RAD_OK;
 }
 
+/* tp8 loop P20 round 3 (split 3, the op's `shard` mask): this rank's byte range [lo, hi) of part i -- its rows [r q, (r + 1) q)
+ * of a masked part (q = ceil(rows / ranks), the rows collectives' cut), a whole unmasked part on `sender`, else none */
+static void shard_range(const RadArgs* a, const RadPpRing* r, uint32_t shard, int sender, int i, uint64_t off, uint64_t bytes,
+                        uint64_t* lo, uint64_t* hi) {
+    *lo = *hi = 0;
+    if ((shard >> i) & 1u) {
+        const uint64_t rows = (uint64_t)a->t[1 + i].shape[0], nr = r->send_ranks;
+        if (rows == 0 || bytes % rows) return;
+        const uint64_t rb = bytes / rows, q = (rows + nr - 1) / nr;
+        const uint64_t r0 = std::min<uint64_t>((uint64_t)a->rank * q, rows), r1 = std::min<uint64_t>(r0 + q, rows);
+        *lo = off + r0 * rb;
+        *hi = off + r1 * rb;
+    } else if (a->rank == sender) {
+        *lo = off;
+        *hi = off + bytes;
+    }
+}
 static int send_split(const RadArgs* a, RadPpRing* r, int split, int sender, int n, const uint64_t* bytes, uint64_t total,
-                      int64_t rows) {
+                      int64_t rows, uint32_t shard = 0) {
     const int rank = a->rank;
     const bool pub = rank == sender;
     const uint64_t d = __atomic_load_n(&r->done[rank], __ATOMIC_ACQUIRE), mine = d + 1;
-    RAD_REF_TRY(split == 1 || pub ? wait_for(r, &r->sent, d) : wait_for(r, &r->staged, mine));
+    RAD_REF_TRY(split != 2 || pub ? wait_for(r, &r->sent, d) : wait_for(r, &r->staged, mine));
     const uint64_t nr = r->send_ranks, U = total / RAD_PP_PART_ALIGN;
     const bool all = split == 2 && pub;
     const uint64_t lo = all ? 0 : (uint64_t)rank * U / nr * RAD_PP_PART_ALIGN;
@@ -173,7 +190,8 @@ static int send_split(const RadArgs* a, RadPpRing* r, int split, int sender, int
     char* ring = reinterpret_cast<char*>(r) + RAD_PP_RING_HDR;
     uint64_t off = 0, bad = 0, cmp = 0;
     for (int i = 0; i < n; ++i) {
-        const uint64_t s = std::max(lo, off), e = std::min(hi, off + bytes[i]);
+        uint64_t s = std::max(lo, off), e = std::min(hi, off + bytes[i]);
+        if (split == 3) shard_range(a, r, shard, sender, i, off, bytes[i], &s, &e);
         if (s < e) {
             const char* src = static_cast<const char*>(a->t[1 + i].data) + (s - off);
             if (split == 2 && !pub) {
@@ -228,9 +246,13 @@ int ref_stage_send(const RadArgs* a, RadStream) {
     if (loop && loop_cap(a->t[0]) < RAD_PP_RING_HDR) return RAD_E_FULL;
     const int sender = (int)rad_param_geti(a->p, a->n_p, "sender", 0);
     /* tp8 loop P8 (RadPpRing::send_split): every rank of the node takes part (1 its share, 2 a check of it) */
-    const int split = !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 && sender >= 0 &&
+    /* tp8 loop P20 round 3: `shard` -- every rank its rows of the masked parts (split 3), whatever send_split says */
+    const uint32_t shard = !loop ? (uint32_t)rad_param_geti(a->p, a->n_p, "shard", 0) : 0u;
+    const int split = shard && r->send_ranks >= 2 && sender >= 0 && (uint64_t)sender < r->send_ranks ? 3
+                    : !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 && sender >= 0 &&
                               (uint64_t)sender < r->send_ranks
                           ? (int)r->send_split : 0;
+    if (shard && !split) return RAD_E_STATE;
     if (split && (a->rank < 0 || (uint64_t)a->rank >= r->send_ranks)) return RAD_E_STATE;
     if (!loop && !split && a->rank != sender) return RAD_OK;
     int n = 0;
@@ -243,7 +265,7 @@ int ref_stage_send(const RadArgs* a, RadStream) {
         total += rad_pp_align(bytes[i]);
     }
     if (total + RAD_PP_TRAILER > (loop ? loop_cap(a->t[0]) - RAD_PP_RING_HDR : r->cap)) return RAD_E_FULL;
-    if (split) return send_split(a, r, split, sender, n, bytes, total, rows);
+    if (split) return send_split(a, r, split, sender, n, bytes, total, rows, shard);
     /* tp8 loop P10: a large payload through the node's staging buffer, published from a helper (the card's side stream) */
     if (!loop && r->async_rows && r->stage_dev && (uint64_t)rows >= r->async_rows && total <= r->stage_cap) {
         if (__atomic_load_n(&r->abort, __ATOMIC_ACQUIRE)) return RAD_E_IO;

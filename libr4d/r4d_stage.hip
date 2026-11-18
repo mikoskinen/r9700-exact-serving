@@ -69,6 +69,10 @@ struct Parts {
     int32_t  nr;                       /* the node's ranks */
     uint64_t lo, hi;                   /* this rank's share of the payload in bytes, 256-byte aligned */
     uint64_t cmp;                      /* (2) 4-byte words of the parts inside [lo, hi) */
+    /* tp8 loop P20 round 3 (split 3, the op's `shard` mask): each rank copies the ROWS it owns of every masked part -- rows
+     * [r q, (r + 1) q) of the part's rows, q = ceil(rows / nr), the rows collectives' cut -- and rank `sender` the other
+     * parts whole: each part k's payload byte range [plo[k], phi[k]) for this rank (empty: plo == phi) */
+    uint64_t plo[RAD_PP_MAX_PARTS], phi[RAD_PP_MAX_PARTS];
     int32_t  idle;                     /* tp8 dev D8: 1 = rank 0's receive adds its wait to the ring (RadPpRing::wait_on) */
 };
 
@@ -139,7 +143,7 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
     if (threadIdx.x == 0) {
         const uint64_t d = ld_sys(&r->done[P.rank]);
         mine = d + 1;
-        if (P.split == 1 || pub) ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= d; }) ? 1 : 0;
+        if (P.split != 2 || pub) ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= d; }) ? 1 : 0;
         else                     ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->staged) >= d + 1; }) ? 1 : 0;
     }
     __syncthreads();
@@ -149,8 +153,12 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
         const bool all = P.split == 2 && pub;
         const uint64_t lo = all ? 0 : P.lo, hi = all ? P.total : P.hi;
         for (int k = 0; k < P.n; ++k) {
-            const uint64_t a = lo > P.off[k] ? lo : P.off[k];
-            const uint64_t e = hi < P.off[k] + P.bytes[k] ? hi : P.off[k] + P.bytes[k];
+            uint64_t a = lo > P.off[k] ? lo : P.off[k];
+            uint64_t e = hi < P.off[k] + P.bytes[k] ? hi : P.off[k] + P.bytes[k];
+            if (P.split == 3) {   /* tp8 loop P20 round 3: this rank's rows of a masked part, or a whole part of `sender` */
+                a = P.plo[k];
+                e = P.phi[k];
+            }
             if (a >= e) continue;
             const char* src = reinterpret_cast<const char*>(P.p[k]) + (a - P.off[k]);
             if (P.split == 2 && !pub) {
@@ -534,9 +542,14 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     if (loop && ring_bytes < RAD_PP_RING_HDR + RAD_PP_TRAILER) return R4D_NO(RAD_E_FULL);
     /* tp8 loop P8: RADIANCE_PP_SEND_SPLIT (the core sets the send ring's send_split / send_ranks at start; never in loop) */
     const int sender = (int)r4d_geti_or(a, "sender", 0);
-    const int split = send && !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 &&
+    /* tp8 loop P20 round 3: `shard` (a mask of parts) -- every rank of the sending node copies its rows of those parts
+     * (split 3), whatever RADIANCE_PP_SEND_SPLIT says */
+    const uint32_t shard = send && !loop ? (uint32_t)r4d_geti_or(a, "shard", 0) : 0u;
+    const int split = shard && r->send_ranks >= 2 && sender >= 0 && (uint64_t)sender < r->send_ranks ? 3
+                    : send && !loop && (r->send_split == 1 || r->send_split == 2) && r->send_ranks >= 2 &&
                               sender >= 0 && (uint64_t)sender < r->send_ranks
                           ? (int)r->send_split : 0;
+    if (shard && !split) return R4D_NO(RAD_E_STATE);   /* a sharded payload needs every rank of the node in the ring */
     if (split && (a->rank < 0 || (uint64_t)a->rank >= r->send_ranks)) return R4D_NO(RAD_E_STATE);
     if (send && !loop && !split && a->rank != sender) return RAD_OK;
     if (!send && (a->rank < 0 || a->rank >= RAD_PP_MAX_RANKS || (!loop && (uint64_t)a->rank >= r->n_ranks)))
@@ -556,6 +569,37 @@ int launch(const RadArgs* a, RadStream stream, bool send) {
     }
     uint32_t* counter = counter_for(dev, r, send ? 0 : 1);
     if (!counter) return R4D_NO(RAD_E_NOMEM);
+    if (split == 3) {
+        P.split = 3;
+        P.sender = sender;
+        P.nr = (int32_t)r->send_ranks;
+        uint64_t share = 0;
+        for (int k = 0; k < P.n; ++k) {
+            P.plo[k] = P.phi[k] = 0;
+            if ((shard >> k) & 1u) {
+                const RadTensor* t = r4d_opt(a, 1 + k);
+                const uint64_t rows = t ? (uint64_t)t->shape[0] : 0;
+                if (rows == 0 || P.bytes[k] % rows) return R4D_NO(RAD_E_SHAPE);
+                const uint64_t rb = P.bytes[k] / rows, q = (rows + (uint64_t)P.nr - 1) / (uint64_t)P.nr;
+                if (rb % 4) return R4D_NO(RAD_E_ALIGN);
+                const uint64_t r0 = (uint64_t)a->rank * q < rows ? (uint64_t)a->rank * q : rows;
+                const uint64_t r1 = r0 + q < rows ? r0 + q : rows;
+                P.plo[k] = P.off[k] + r0 * rb;
+                P.phi[k] = P.off[k] + r1 * rb;
+                if (rb % 16) P.w16 &= ~(1u << k);   /* a row range of 4-byte words */
+            } else if (a->rank == sender) {
+                P.plo[k] = P.off[k];
+                P.phi[k] = P.off[k] + P.bytes[k];
+            }
+            share += P.phi[k] - P.plo[k];
+        }
+        uint32_t* diff = counter_for(dev, r, 2);
+        if (!diff) return R4D_NO(RAD_E_NOMEM);
+        uint32_t blocks = (uint32_t)((share / 16 + kThreads * 4 - 1) / (kThreads * 4));
+        if (blocks < 1) blocks = 1;
+        if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+        return R4D_EMIT(stream, stage_send_split_kernel, dim3(blocks), dim3(kThreads), 0, r, P, counter, diff);
+    }
     if (split) {
         P.split = split;
         P.sender = sender;
