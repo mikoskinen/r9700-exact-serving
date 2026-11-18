@@ -671,6 +671,9 @@ struct Model {
     /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN=1, with pipe2): the same layers' attention all-reduce in the two pieces too,
      * piece 0's on the second lane beside piece 1's output projection (step_bi) */
     bool pipe2_attn = false;
+    /* tp8 loop P13c (RADIANCE_DS41_PIPE2_CONE=1, with pipe2): PSK's cut (cone) layers too, where the layer's rows are one prefill
+     * segment of >= pipe2 rows (the drain's last chunks: the cone rows of layers 21 .. ~32 at pipe2 1024); not the split layer */
+    bool pipe2_cone = false;
     /* tp8 S3 (ds41_layers.h): this node's layer ranges (RADIANCE_DS41_LAYERS, _MODE); lr.on false = every layer, the
      * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
     ds41layers::Spec lr{};
@@ -2409,6 +2412,10 @@ static std::atomic<long long> g_pipe2_attn{0};   /* P13b: layer-passes whose att
  * behind lane 1, piece 1's all-reduce; then post / collapse / norm over the step as today. The same ops over row
  * ranges of the same operands (gemm_nt_ggml's 128-row WMMA tiles over the whole K above 48 rows: per row), the exact
  * wire's fold per element. Anything else: off. */
+static bool pipe2_cone_env() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_PIPE2_CONE"); return e && e[0] == '1' && !e[1]; }();
+    return on;
+}
 static bool pipe2_attn_env() {
     static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_PIPE2_ATTN"); return e && e[0] == '1' && !e[1]; }();
     return on;
@@ -4716,6 +4723,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         : g.max_tok < pipe2_env() ? "--max-num-batched-tokens is below its rows" : nullptr;
         m.pipe2 = why ? 0 : pipe2_env();
         m.pipe2_attn = m.pipe2 > 0 && pipe2_attn_env();
+        m.pipe2_cone = m.pipe2 > 0 && pipe2_cone_env();
         if (ctx->rank == 0) {
             if (why)
                 fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2=%lld off (tp8 loop P13): %s\n",
@@ -4726,6 +4734,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 "%lld rows), piece 0's all-reduce on the second lane beside piece 1's MoE; the same ops and "
                                 "bytes as the whole pass\n",
                         (long long)pipe2_env(), (long long)m.pipe2, (long long)kPipe2Align, (long long)kPipe2Piece);
+            if (!why && m.pipe2_cone)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2_CONE=1 (tp8 loop P13c): lever PSK's cut layers too, where "
+                                "a layer's rows are one prefill segment of >= %lld rows (not the split layer)\n",
+                        (long long)m.pipe2);
             if (!why && m.pipe2_attn)
                 fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2_ATTN=1 (tp8 loop P13b): those layers' attention "
                                 "all-reduce in the two pieces too, piece 0's on the second lane beside piece 1's output "
@@ -4749,6 +4761,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.qmax = full.qmax;
         m.pipe2 = full.pipe2;   /* tp8 loop P13: the same overlap all-reduces and concurrent buffer as the real declare */
         m.pipe2_attn = full.pipe2_attn;
+        m.pipe2_cone = full.pipe2_cone;
         /* Lever Z0-A (ds41-z0): the DSpark head's query rows Q (max_seqs x block, capped by max_tok: dsp_config) size
          * FIXED parameters -- the candidates' all_gather numel Q x R x 2, the walk's wseqs = Q / block and its gather --
          * so a level below Q (the 8-row rung at NST 5: Q 8 instead of 40, numel 512 instead of 2560) declared a different
@@ -6752,16 +6765,20 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         /* tp8 loop P13b (RADIANCE_DS41_PIPE2_ATTN): the attention all-reduce of an uncut layer of a lone prefill pass in
          * the pieces [0, pa) [pa, T) (pa as the MoE's cut below), piece 0's on lane 1 beside piece 1's output projection;
          * decided from the batch and the declare alone, so every rank issues the same collectives */
+        /* P13c (RADIANCE_DS41_PIPE2_CONE): a cut layer's one prefill segment [p0, p0 + pn) as well (not the split layer);
+         * uncut, the segment is the step's [0, T) */
+        const bool p2_layer = m.pipe2 > 0 && (!cut || (m.pipe2_cone && !l20)) && sg.size() == 1 && !sg[0].dec &&
+                              sg[0].n >= m.pipe2 && (cut || (sg[0].r0 == 0 && sg[0].n == T));
+        const int64_t p0 = p2_layer ? sg[0].r0 : 0, pn = p2_layer ? sg[0].n : T;
         int64_t pa = 0;
-        if (m.pipe2 > 0 && m.pipe2_attn && L.ar_attn && L.ar_attn_ov && !cut && T >= m.pipe2 && sg.size() == 1 &&
-            !sg[0].dec && sg[0].r0 == 0 && sg[0].n == T) {
-            pa = (T / 2 + kPipe2Align - 1) / kPipe2Align * kPipe2Align;
-            if (pa < kPipe2Piece || T - pa < kPipe2Piece) pa = 0;
+        if (p2_layer && m.pipe2_attn && L.ar_attn && L.ar_attn_ov) {
+            pa = (pn / 2 + kPipe2Align - 1) / kPipe2Align * kPipe2Align;
+            if (pa < kPipe2Piece || pn - pa < kPipe2Piece) pa = 0;
         }
         const auto ar_a_piece0 = [&] {   /* lane 1 behind everything lane 0 issued (piece 0's rows of attn_out written) */
             rad_lane_join(x, 0, 1);
             rad_lane(x, 1);
-            RAD_ISSUE_N(x, L.ar_attn_ov, pa * D, R(m.attn_out, 0, pa), RAD_NONE);
+            RAD_ISSUE_N(x, L.ar_attn_ov, pa * D, R(m.attn_out, p0, pa), RAD_NONE);
             rad_lane(x, 0);
         };
         if (L.e_ids) {
@@ -7166,12 +7183,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                  * o_b, its all-reduce on lane 1, then piece 1's projections on lane 0 beside it (no collective in them; a
                  * lone prefill segment is one launch of each in dense(), so these are its launches over the two row
                  * ranges) */
-                oa_fn(0, pa);
+                oa_fn(p0, pa);
                 if (late) mix_a();
-                ob_fn(0, pa);
+                ob_fn(p0, pa);
                 ar_a_piece0();
-                oa_fn(pa, T - pa);
-                ob_fn(pa, T - pa);
+                oa_fn(p0 + pa, pn - pa);
+                ob_fn(p0 + pa, pn - pa);
                 bt_pt(x, m, m.oa, T, "oa", l);
             } else {
                 dense(oa_gg, false, oa_fn);
@@ -7188,7 +7205,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
              * so every rank issues the same collectives in the same order; lane 0 behind lane 1, piece 1's */
             if (m.zero) ar_a_piece0();
             rad_lane_join(x, 1, 0);
-            RAD_ISSUE_N(x, L.ar_attn, (T - pa) * D, R(m.attn_out, pa, T - pa), RAD_NONE);
+            RAD_ISSUE_N(x, L.ar_attn, (pn - pa) * D, R(m.attn_out, p0 + pa, pn - pa), RAD_NONE);
             if (rad_rank(x) == 0) g_pipe2_attn.fetch_add(1, std::memory_order_relaxed);
         } else if (L.ar_attn)
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.ar_attn, n * D, R(m.attn_out, r0, n), RAD_NONE); });
@@ -7252,41 +7269,41 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
          * first (lane 0, nothing on lane 1), pass 0, its all-reduce on lane 1 behind lane 0 and beside pass 1 (no
          * collective inside: projected, own_ar false), then lane 0 joins lane 1 and issues pass 1's all-reduce. */
         int64_t pc = 0;
-        if (m.pipe2 > 0 && !cut && T >= m.pipe2 && sg.size() == 1 && !sg[0].dec && sg[0].r0 == 0 && sg[0].n == T) {
-            pc = (T / 2 + kPipe2Align - 1) / kPipe2Align * kPipe2Align;
+        if (p2_layer) {
+            pc = (pn / 2 + kPipe2Align - 1) / kPipe2Align * kPipe2Align;
             const MoeFP8& mo = L.moe;
-            if (pc < kPipe2Piece || T - pc < kPipe2Piece || mo.c.calib || mo.op_moe_ar || mo.op_shared_ar ||
-                mo.op_combine || mo.op_add || !mo.op_ar_ov || !mo.issues_ar(T, T) || !mo.issues_ar(T, pc) ||
-                !mo.issues_ar(T, T - pc))
+            if (pc < kPipe2Piece || pn - pc < kPipe2Piece || mo.c.calib || mo.op_moe_ar || mo.op_shared_ar ||
+                mo.op_combine || mo.op_add || !mo.op_ar_ov || !mo.issues_ar(T, pn) || !mo.issues_ar(T, pc) ||
+                !mo.issues_ar(T, pn - pc))
                 pc = 0;
             if (pc == 0 && rad_rank(x) == 0) g_pipe2_serial.fetch_add(1, std::memory_order_relaxed);
         }
         if (pc > 0) {
-            const int64_t n1 = T - pc;
+            const int64_t n1 = pn - pc, q1 = p0 + pc;
             const bool pr0 = L.moe.route_splits(pc), pr1 = L.moe.route_splits(n1);
             if (pr0) {
-                L.moe.route_part(x, 0, pc);
-                L.moe.route_gather(x, 0, pc);
+                L.moe.route_part(x, p0, pc);
+                L.moe.route_gather(x, p0, pc);
             }
             if (pr1) {
-                L.moe.route_part(x, pc, n1);
-                L.moe.route_gather(x, pc, n1);
+                L.moe.route_part(x, q1, n1);
+                L.moe.route_gather(x, q1, n1);
             }
-            L.moe.pass(x, T, 0, pc, false, bsp, false, pr0, true);
-            rad_lane_join(x, 0, 1);   /* lane 1 behind everything lane 0 issued: pass 0's gather wrote rows [0, pc) */
+            L.moe.pass(x, T, p0, pc, false, bsp, false, pr0, true);
+            rad_lane_join(x, 0, 1);   /* lane 1 behind everything lane 0 issued: pass 0's gather wrote rows [p0, q1) */
             rad_lane(x, 1);
-            L.moe.issue_ar(x, 0, pc, true);   /* the overlap instance, beside pass 1 */
+            L.moe.issue_ar(x, p0, pc, true);   /* the overlap instance, beside pass 1 */
             rad_lane(x, 0);
-            L.moe.pass(x, T, pc, n1, false, nullptr, false, pr1, true);
+            L.moe.pass(x, T, q1, n1, false, nullptr, false, pr1, true);
             rad_lane_join(x, 1, 0);   /* lane 0 behind piece 0's all-reduce (and a lane-1 shared arm) */
-            L.moe.issue_ar(x, pc, n1, false);
+            L.moe.issue_ar(x, q1, n1, false);
             if (l == 0) g_bi_moe.fetch_add(2, std::memory_order_relaxed);
             if (rad_rank(x) == 0) {
                 static thread_local int t_p2_step = -1;
                 g_pipe2_layers.fetch_add(1, std::memory_order_relaxed);
                 if (batch->step != t_p2_step) {
                     t_p2_step = batch->step;
-                    g_pipe2_rows.fetch_add(T, std::memory_order_relaxed);
+                    g_pipe2_rows.fetch_add(pn, std::memory_order_relaxed);
                     const long long n = g_pipe2_passes.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (n == 1 || n % 64 == 0)
                         fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2 (tp8 loop P13): %lld prefill passes ran "
@@ -7295,7 +7312,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                         "%lld layer-passes of lone prefills ran whole (a piece below %lld rows or a reducing "
                                         "block); attention all-reduces in the pieces (RADIANCE_DS41_PIPE2_ATTN) %lld\n",
                                 n, g_pipe2_layers.load(std::memory_order_relaxed), g_pipe2_rows.load(std::memory_order_relaxed),
-                                (long long)T, (long long)pc, (long long)n1, l, g_pipe2_serial.load(std::memory_order_relaxed),
+                                (long long)pn, (long long)pc, (long long)n1, l, g_pipe2_serial.load(std::memory_order_relaxed),
                                 (long long)kPipe2Piece, g_pipe2_attn.load(std::memory_order_relaxed));
                 }
             }
