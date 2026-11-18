@@ -610,7 +610,9 @@ void rank_main(Ctx* cp) {
     std::vector<Pool> pools;
     for (int q = 0; q < 2 * o.pools; ++q) pools.push_back(make_pool(c, Rg, Cg, Rd, Cd, nec));
     beat("setup: pools");
-    // the all-reduce instances rendezvous across ranks inside init: build them in the same order on every rank
+    // the all-reduce instances rendezvous across ranks inside init (libr4d: arrival order, a 60-s timeout): every rank enters
+    // them together, after its pools, in the same order
+    g_bar.wait();
     std::map<std::string, Call> inst;
     Work A = make_work(c, "A", o.MA, o.LA, c.pl->ra, pools, 0, inst);
     std::map<int64_t, Work> B;
@@ -755,6 +757,7 @@ void print_plan(const Opt& o) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);   // line-buffered into the run's file: a crash keeps the lines before it
     Opt o;
     auto list = [](const char* s) { std::vector<std::string> v; std::string x = s; size_t p = 0;
         while (p <= x.size()) { size_t q = x.find(',', p); if (q == std::string::npos) q = x.size(); if (q > p) v.push_back(x.substr(p, q - p)); p = q + 1; }
