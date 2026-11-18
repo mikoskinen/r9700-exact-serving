@@ -1896,6 +1896,107 @@ TEST(lead_segments_serve_one_process_tokens) {
     CHECK(msteps_all > 0);
 }
 
+/* tp8 loop P27: RADIANCE_PP_LEAD_SEG_SHIP=1 (with LEAD_SEG) -- a segmented head's frame goes to the follower once its last segment
+ * has run on rank 0's card, not with that segment's issue; with RADIANCE_PP_LEAD_SEG_SHIP_TEST_WAIT_MS it is held that long past
+ * the last issue too, so the frames the leader issues meanwhile (other lanes' heads) reach the follower AHEAD of it. Every
+ * request's tokens are one process's at 3 lanes W(2,3) BG 1 (+ LEAD_SEG_AHEAD, + LEAD_SEG_MIXED: a decode lane's MIXED newcomer
+ * step's frame held the same way), 4 lanes W(2,3) BG 2 (two BG lanes: two held frames at once), beside the follower's own
+ * segments and D15's frame order; at W(1,2) (no head boundary) the switch is refused by name and the run is LEAD_SEG's. */
+TEST(lead_seg_ship_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "8", "--max-num-batched-tokens", "700", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref, ref_b;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        ref_b = burst_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; bool ahead; bool mixed; const char* order; const char* wait; };
+    long long shipped_all = 0, late_all = 0;
+    for (const Arm a : { Arm{ 3, "2,3", 1, false, false, nullptr, "40" }, Arm{ 3, "2,3", 1, true, false, nullptr, "40" },
+                         Arm{ 3, "2,3", 1, true, true, nullptr, "40" }, Arm{ 4, "2,3", 2, true, false, "3", "40" },
+                         Arm{ 3, "2,3", 1, true, false, "7", nullptr }, Arm{ 3, "1,2", 1, true, false, nullptr, "40" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back("RADIANCE_PP_LEAD_SEG=1");
+        env.push_back("RADIANCE_PP_LEAD_SEG_SHIP=1");
+        if (a.ahead) env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1");
+        if (a.mixed) env.push_back("RADIANCE_PP_LEAD_SEG_MIXED=1");
+        if (a.order) env.push_back(std::string("RADIANCE_PP_FOL_ORDER=") + a.order);
+        if (a.wait) env.push_back(std::string("RADIANCE_PP_LEAD_SEG_SHIP_TEST_WAIT_MS=") + a.wait);
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port), got_b = burst_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        REQUIRE_EQ(ref_b.size(), got_b.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        for (size_t i = 0; i < ref_b.size(); ++i) {
+            CHECK(!ref_b[i].empty());
+            if (ref_b[i] != got_b[i]) ++differ;
+        }
+        long long steps = -1, parts = -1;
+        if (const size_t at = llog.rfind(" BG steps ran their leader parts in "); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos)
+                (void)std::sscanf(llog.c_str() + b, "two-node pipeline: %lld BG steps ran their leader parts in %lld segments", &steps,
+                                  &parts);
+        long long shipped = -1, ahead = -1, late = -1;
+        double avg = -1, mx = -1;
+        const char* key = " segmented heads' frames shipped after their last segment ran (RADIANCE_PP_LEAD_SEG_SHIP=1, tp8 loop P27): ";
+        if (const size_t at = llog.rfind(key); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos) {
+                shipped = std::atoll(llog.c_str() + b + std::strlen("two-node pipeline: "));
+                (void)std::sscanf(llog.c_str() + at + std::strlen(key),
+                                  "held past the last segment's issue %lf ms on average, the longest %lf; %lld other frames went "
+                                  "ahead of them since their first segment, %lld of them", &avg, &mx, &ahead, &late);
+            }
+        const bool refused = std::strcmp(a.cut, "1,2") == 0;
+        fprintf(stderr, "    SHIP%s%s%s%s, BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld BG steps in %lld segments; %lld frames "
+                        "shipped after the run (held %.2f ms avg, %.2f max past the last issue), %lld frames ahead since the first "
+                        "segment, %lld after the last issue%s\n",
+                a.ahead ? " + AHEAD" : "", a.mixed ? " + MIXED" : "", a.order ? (std::string(" + FOL_ORDER=") + a.order).c_str() : "",
+                a.wait ? (std::string(" + TEST_WAIT ") + a.wait).c_str() : "", a.k, a.lanes, a.cut, differ, ref.size() + ref_b.size(),
+                steps, parts, shipped, avg, mx, ahead, late, refused ? " (refused: no head boundary)" : "");
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        if (refused) {
+            CHECK(llog.find("RADIANCE_PP_LEAD_SEG_SHIP=1 is not taken: no head boundary") != std::string::npos);
+            CHECK_EQ(shipped, -1LL);
+            continue;
+        }
+        CHECK(llog.find("RADIANCE_PP_LEAD_SEG_SHIP=1 -- a segmented head's frame goes") != std::string::npos);
+        CHECK(steps > 0);
+        CHECK(shipped > 0);
+        CHECK(shipped <= steps);
+        CHECK(late >= 0);
+        CHECK(ahead >= late);
+        if (a.wait) CHECK(mx >= 40.0);
+        shipped_all += std::max(0LL, shipped);
+        late_all += std::max(0LL, late);
+    }
+    fprintf(stderr, "    frames shipped after their head ran, all arms: %lld; other frames ahead of them after the last issue: %lld\n",
+            shipped_all, late_all);
+    CHECK(shipped_all > 0);
+    CHECK(late_all > 0);   /* the reorder the switch makes did happen, and the tokens stayed one process's */
+}
+
 /* tp8 dev D11: RADIANCE_PP_BG_HOLD_MS=N -- a newcomer the BG lanes have no room for is held out of its home's step (that step
  * runs its decoders alone) until a BG lane takes it whole, or runs at home as a MIXED step once N ms ran out. burst_set's four
  * newcomers arrive together beside four decoders at 700 rows a step (a BG lane's inbox holds one of them): every request's tokens
