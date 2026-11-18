@@ -4348,7 +4348,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
             d.poff_lo = op(b, "iota", { RAD_RANGE("M", 1, Q), RAD_INT("start", SB - 1), RAD_INT("step", -1),
                                         RAD_INT("period", SB) },
                            {}, {}, { d.poff });
-            if (!d.poff_lo) sbwhy = "iota refused";
+            if (!d.poff_lo || !rad_op_resolved(b, d.poff_lo)) sbwhy = "no kernel serves iota at the short block";
         }
         /* each stage's attention: the window's context keys before the anchor plus the short block's own SB keys */
         for (size_t i = 0; !sbwhy && i < d.st.size(); ++i) {
@@ -4362,7 +4362,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                                           RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
             if (m.w8d) dap.push_back(RAD_STR("window_format", "fp8_e4m3"));
             const rad_op a = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
-            if (!a) sbwhy = "attn_sparse_sink refused at the short block's window";
+            if (!a || !rad_op_resolved(b, a)) sbwhy = "no kernel serves attn_sparse_sink at the short block's window";
             d.attn_lo.push_back(a);
         }
         if (!sbwhy) {
@@ -4371,7 +4371,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                                RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", SB),
                                RAD_STR("dtype", "bf16") },
                              { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens });
-            if (!d.select_lo) sbwhy = "dflash_select refused";
+            if (!d.select_lo || !rad_op_resolved(b, d.select_lo)) sbwhy = "no kernel serves dflash_select at the short block";
         }
         /* W1 at SB steps on the same planes (step l's rows [l * wseqs, ...), SB * wseqs <= block * wseqs) */
         if (!sbwhy && d.wfill) {
@@ -4416,7 +4416,7 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                              RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", SB),
                              RAD_F64("bias", d.cbias), RAD_STR("dtype", "bf16") },
                            { d.mk1 }, { d.x, d.tokens, d.cwb }, { d.conf });
-            if (!d.conf_lo) sbwhy = "dspark_conf refused";
+            if (!d.conf_lo || !rad_op_resolved(b, d.conf_lo)) sbwhy = "no kernel serves dspark_conf at the short block";
         }
         if (!sbwhy && !rad_drafter_short_block) sbwhy = "this host has no rad_drafter_short_block (ABI 27)";
         if (sbwhy) {
