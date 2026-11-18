@@ -1026,20 +1026,44 @@ void Engine::block_shape(int* block, int* steps) {
      * fewer proposals as rows. The load is the step just run's, which the next step, the one these
      * proposals are for, mostly repeats (Scheduler::short_block_on). */
     if (drafter_short_ <= 0) return;
-    short_on_ = Scheduler::short_block_on(short_on_, lsched().decoded_seqs(), short_from_);
-    if (short_on_) {
+    int64_t sb = 0;
+    if (!short_tiers_.empty()) {
+        /* tp8 loop D19: the tier of the highest load this step reaches */
+        bool on[4] = {};
+        int64_t from[4] = {};
+        const int n = (int)std::min<size_t>(short_tiers_.size(), 4);
+        for (int i = 0; i < n; ++i) { on[i] = short_tiers_[(size_t)i].on; from[i] = short_tiers_[(size_t)i].from; }
+        const int k = Scheduler::short_tier_pick(on, from, n, lsched().decoded_seqs());
+        for (int i = 0; i < n; ++i) short_tiers_[(size_t)i].on = on[i];
+        if (k >= 0) sb = short_tiers_[(size_t)k].block;
+    } else {
+        short_on_ = Scheduler::short_block_on(short_on_, lsched().decoded_seqs(), short_from_);
+        if (short_on_) sb = drafter_short_;
+    }
+    if (sb > 0) {
         /* A tree (rad_drafter_tree) grows a tree of its own over the shorter pass, at most its
          * draft positions of nodes (DFlash2 attends across its block, so the short pass is not the
          * full pass's prefix); the verify takes that many. */
-        if (tree_) *steps = std::min(*steps, (int)drafter_short_ - 1);
-        else       *steps -= *block - (int)drafter_short_;
-        *block  = (int)drafter_short_;
+        if (tree_) *steps = std::min(*steps, (int)sb - 1);
+        else       *steps -= *block - (int)sb;
+        *block  = (int)sb;
     }
 }
 
 /* tp8 loop D18: the short block's share of the query passes so far (only while one is served). */
 void Engine::short_block_line(const char* when) const {
     if (drafter_short_ <= 0) return;
+    if (!short_tiers_.empty()) {   /* tp8 loop D19: one part a tier */
+        std::string t;
+        for (const ShortTier& z : short_tiers_)
+            t += fmt("%lld at its short block of %lld row(s) a sequence from %lld decoding sequences (%lld rows, %.2f a pass), ",
+                     (long long)z.q_n, (long long)z.block, (long long)z.from, (long long)z.q_rows,
+                     z.q_n ? (double)z.q_rows / (double)z.q_n : 0.0);
+        RAD_INFO("speculation%s: '%s''s query passes by tier: %s%lld at its own block of %lld (%lld rows) -- "
+                 "RADIANCE_DRAFT_SHORT_TIERS (tp8 loop D19)", when, drafter_name_.c_str(), t.c_str(), (long long)long_q_n_,
+                 (long long)(drafter_.block > 0 ? drafter_.block : drafter_.depth + 1), (long long)long_q_rows_);
+        return;
+    }
     RAD_INFO("speculation%s: %lld query passes ran '%s''s short block of %lld row(s) a sequence (%lld rows, %.2f a pass), "
              "%lld its own block of %lld (%lld rows) -- --draft-short-from %lld (tp8 loop D18)", when, (long long)short_q_n_,
              drafter_name_.c_str(), (long long)drafter_short_, (long long)short_q_rows_,
@@ -1098,9 +1122,13 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     if (!qb) return RAD_OK;
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
-    if (drafter_short_ > 0) {   /* tp8 loop D18: which block this query pass ran */
-        if (block == (int)drafter_short_) { ++short_q_n_; short_q_rows_ += qb->n_tok; }
-        else                              { ++long_q_n_;  long_q_rows_  += qb->n_tok; }
+    if (drafter_short_ > 0) {   /* tp8 loop D18: which block this query pass ran (D19: which tier's) */
+        bool tier = false;
+        for (ShortTier& t : short_tiers_)
+            if (block == (int)t.block) { ++t.q_n; t.q_rows += qb->n_tok; tier = true; break; }
+        if (tier) {
+        } else if (short_tiers_.empty() && block == (int)drafter_short_) { ++short_q_n_; short_q_rows_ += qb->n_tok; }
+        else                                                             { ++long_q_n_;  long_q_rows_  += qb->n_tok; }
     }
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
     Rank& r0 = *ranks_[0];

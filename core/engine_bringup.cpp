@@ -1774,6 +1774,47 @@ int Engine::declare() {
                  (long long)(drafter_short_ - ((drafter_.block > 0 ? drafter_.block
                                                                    : drafter_.depth + 1) -
                                                drafter_.depth)));
+    /* tp8 loop D19: RADIANCE_DRAFT_SHORT_TIERS=N:S[,N:S...] -- several short blocks, picked by load (Engine::block_shape):
+     * each S one the drafter declared (rad_drafter_short_block, once a length); a chain block drafter only. It replaces
+     * --draft-short-from's one tier; unset, nothing here changes. */
+    short_tiers_.clear();
+    if (const char* v = std::getenv("RADIANCE_DRAFT_SHORT_TIERS"); v && *v) {
+        std::vector<std::pair<int64_t, int64_t>> tv;
+        std::string why;
+        if (drafter_.kind != RAD_DRAFT_BLOCK || tree_) {
+            RAD_WARN("RADIANCE_DRAFT_SHORT_TIERS=%s: '%s' is not a chain block drafter; ignored (tp8 loop D19)", v,
+                     drafter_name_.c_str());
+        } else if (Scheduler::parse_short_tiers(v, &tv, &why) < 0) {
+            RAD_WARN("RADIANCE_DRAFT_SHORT_TIERS=%s: %s; ignored (tp8 loop D19)", v, why.c_str());
+        } else {
+            std::string s;
+            for (const auto& t : tv) {
+                const auto& dl = p0.drafter_short_blocks;
+                if (std::find(dl.begin(), dl.end(), t.second) == dl.end()) {
+                    RAD_WARN("RADIANCE_DRAFT_SHORT_TIERS: '%s' declares no short block of %lld row(s); the tier from %lld "
+                             "decoding sequences is dropped (tp8 loop D19)", drafter_name_.c_str(), (long long)t.second,
+                             (long long)t.first);
+                    continue;
+                }
+                ShortTier z;
+                z.from = t.first;
+                z.block = t.second;
+                short_tiers_.push_back(z);
+                s += fmt("%s%lld row(s) = %lld token(s) from %lld decoding sequences", s.empty() ? "" : ", ",
+                         (long long)z.block,
+                         (long long)(z.block - ((drafter_.block > 0 ? drafter_.block : drafter_.depth + 1) - drafter_.depth)),
+                         (long long)z.from);
+            }
+            if (!short_tiers_.empty()) {
+                drafter_short_ = short_tiers_.front().block;
+                RAD_INFO("speculation: short block tiers (RADIANCE_DRAFT_SHORT_TIERS, tp8 loop D19): '%s' runs %s; below "
+                         "them its own block of %lld (--draft-short-from is not read)", drafter_name_.c_str(), s.c_str(),
+                         (long long)(drafter_.block > 0 ? drafter_.block : drafter_.depth + 1));
+            } else {
+                RAD_WARN("RADIANCE_DRAFT_SHORT_TIERS=%s: no tier left; --draft-short-from serves as before (tp8 loop D19)", v);
+            }
+        }
+    }
     if (tree_)
         RAD_INFO("speculation: '%s' proposes a tree of %d node(s); each verify follows the deepest "
                  "path the target agrees with, and that path's K and V move into place",
