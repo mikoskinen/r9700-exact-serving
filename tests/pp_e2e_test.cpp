@@ -2014,11 +2014,11 @@ TEST(band_passes_serve_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { int lanes; int k; bool fseg; bool lseg; bool skip = false; };
-    long long band_all = 0;
+    struct Arm { int lanes; int k; bool fseg; bool lseg; bool skip = false; const char* min_seqs = nullptr; };
+    long long band_all = 0, low_all = 0;
     int skip_differ = 0;
     for (const Arm a : { Arm{ 3, 1, false, false }, Arm{ 3, 1, true, false }, Arm{ 4, 2, true, false }, Arm{ 3, 1, true, true },
-                         Arm{ 3, 1, false, false, true } }) {
+                         Arm{ 3, 1, false, false, true }, Arm{ 3, 1, true, false, false, "1000" } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         env.push_back("RADIANCE_LLAMA_PP_BAND=1");
@@ -2029,6 +2029,7 @@ TEST(band_passes_serve_one_process_tokens) {
                 env.push_back(v);
         if (a.lseg) { env.push_back("RADIANCE_PP_LEAD_SEG=1"); env.push_back("RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15"); }
         if (a.skip) env.push_back("RADIANCE_PP_TEST_BAND_SKIP=1");   /* negative control: the follower leaves the band's KV out */
+        if (a.min_seqs) env.push_back(std::string("RADIANCE_PP_BAND_MIN_SEQS=") + a.min_seqs);   /* never reached here: no band pass */
         std::vector<std::string> ex = ext;
         ex.push_back("--pp-lanes");
         ex.push_back(std::to_string(a.lanes));
@@ -2064,6 +2065,17 @@ TEST(band_passes_serve_one_process_tokens) {
             continue;
         }
         CHECK_EQ(differ, 0);
+        if (a.min_seqs) {   /* RADIANCE_PP_BAND_MIN_SEQS above the load: every fresh BG step stays W(h, t)'s, and is counted */
+            long long low = -1;
+            const char* lk = " fresh BG steps ran W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=";
+            if (const size_t at = llog.rfind(lk); at != std::string::npos)
+                if (const size_t b = llog.rfind("; ", at); b != std::string::npos) low = std::atoll(llog.c_str() + b + 2);
+            fprintf(stderr, "    + RADIANCE_PP_BAND_MIN_SEQS=%s: %lld band passes, %lld fresh BG steps kept W(1,3)'s\n", a.min_seqs, band, low);
+            CHECK_EQ(band, 0LL);
+            CHECK(low > 0);
+            low_all += std::max(0LL, low);
+            continue;
+        }
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         CHECK(llog.find("RADIANCE_PP_BAND=1 -- a BG lane's step of fresh prompts runs as a band pass") != std::string::npos);
         CHECK(band > 0);

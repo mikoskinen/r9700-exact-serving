@@ -319,12 +319,22 @@ static const StepEntry* pf_entry(const RadBatch* b, const StepPlan& plan) {
     return &plan.e[0];
 }
 
+/* tp8 loop P28: RADIANCE_PP_BAND_MIN_SEQS=N (default 0: always) -- band passes only while the decode lanes' last steps decoded
+ * >= N sequences together: the c32 direction moves newcomer work to the leader, which is the bound node at low load (c16: its
+ * drafter), so a load-chosen band leaves those cells W(h, t)'s. Read with RADIANCE_PP_BAND; counts at the run's end. */
+static int64_t g_band_min_seqs = 0, g_band_low = 0;
 /* tp8 loop P28: a lane step's band k (0: not a band pass) -- a BG lane's step whose prompts are all fresh (no context, no
  * snapshot restore: the leader holds no band layer's prefix) */
 int Engine::pp_band_step(int lane, const RadBatch* b) {
     if (!pp_band_on_ || !b || !lanes_.is_bg(lane) || b->n_tok > pp_band_max_rows_) return 0;
     const int k = pp_band_k();
     if (k <= 0) return 0;
+    if (g_band_min_seqs > 0) {
+        int64_t dec = 0;
+        for (int l = 0; l < n_lanes_; ++l)
+            if (!lanes_.is_bg(l)) dec += sched_of(l).decoded_seqs();
+        if (dec < g_band_min_seqs) { ++g_band_low; return 0; }
+    }
     const StepPlan& p = sched_of(lane).plan();
     if (p.e.empty()) return 0;
     for (const StepEntry& e : p.e)
@@ -633,6 +643,12 @@ int Engine::step_loop_lanes() {
             /* a newcomer's step, not a cold prompt's chunk (those are the cold cells' and run SP: RADIANCE_DS41_SPHC) */
             pp_band_max_rows_ = 2047;
             if (const char* mr = std::getenv("RADIANCE_PP_BAND_MAX_ROWS"); mr && *mr) pp_band_max_rows_ = std::max<int64_t>(1, std::atoll(mr));
+            g_band_min_seqs = 0;
+            g_band_low = 0;
+            if (const char* ms = std::getenv("RADIANCE_PP_BAND_MIN_SEQS"); ms && *ms) g_band_min_seqs = std::max<int64_t>(0, std::atoll(ms));
+            if (g_band_min_seqs > 0)
+                RAD_INFO("two-node pipeline: RADIANCE_PP_BAND_MIN_SEQS=%lld -- band passes only while the decode lanes' last steps "
+                         "decoded >= %lld sequences together (tp8 loop P28)", (long long)g_band_min_seqs, (long long)g_band_min_seqs);
             RAD_INFO("two-node pipeline: RADIANCE_PP_BAND=1 -- a BG lane's step of fresh prompts runs as a band pass: the head over "
                      "[0, %d), the follower from %d (the plugin's band %d; steps of <= %lld rows, RADIANCE_PP_BAND_MAX_ROWS; tp8 loop P28)",
                      cfg_.pp_cut_h + pp_band_k(), cfg_.pp_cut_h + pp_band_k(), pp_band_k(), (long long)pp_band_max_rows_);
@@ -1214,7 +1230,9 @@ int Engine::step_loop_lanes() {
         RAD_INFO("two-node pipeline: %lld lane steps' tails went before an older long pass whose X2 had not landed, %lld "
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
     if (lseg) lseg_line("");
-    if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28)", (long long)pp_band_n_);
+    if (pp_band_on_) RAD_INFO("two-node pipeline: %lld lane steps ran as band passes (RADIANCE_PP_BAND=1, tp8 loop P28); %lld fresh BG steps ran "
+                              "W(h, t)'s under RADIANCE_PP_BAND_MIN_SEQS=%lld", (long long)pp_band_n_, (long long)g_band_low,
+                              (long long)g_band_min_seqs);
     if (lanes_.bg_room() > 0) bgst_line(" over the run");
     if (ia) ia_line(" over the run");
     return RAD_OK;
