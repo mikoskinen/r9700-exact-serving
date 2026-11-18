@@ -70,6 +70,8 @@ struct PpGlobal {
     std::vector<int32_t> segs;
     /* tp8 dev D10 round 2: X1 carries the step's token ids and the receiver takes them before any read (rad_pp_x1_ids) */
     std::atomic<int>     x1_ids{ 0 };
+    /* tp8 loop P28: the band the plugin declared (rad_pp_band) and the pass being issued's band word (0: not a band pass) */
+    std::atomic<int>     band_k{ 0 }, band{ 0 };
     /* tp8 S6: the KV layers both nodes hold of one source (rad_pp_kv_copy): group, slot here, model layer */
     std::mutex kv_mu;
     std::vector<std::array<int32_t, 3>> kv_copies;
@@ -100,6 +102,7 @@ extern "C" int rad_pp_info(RadPpInfo* out) {
     out->part = g.part.load();
     out->seg_l0 = g.seg_l0.load();
     out->seg_l1 = g.seg_l1.load();
+    out->reserved[0] = g.band.load();   /* tp8 loop P28: the pass's band k (abi/rad_pp.h rad_pp_band) */
     for (int i = 0; i < RAD_PP_N_RINGS; ++i) out->ring[i] = g.ring[lane * RAD_PP_N_RINGS + i].load();
     return 0;
 }
@@ -112,6 +115,7 @@ extern "C" void rad_pp_segments(const int32_t* bounds, int n) {
 }
 
 extern "C" void rad_pp_x1_ids(int on) { pp_g().x1_ids.store(on ? 1 : 0, std::memory_order_relaxed); }
+extern "C" void rad_pp_band(int k) { pp_g().band_k.store(k > 0 ? k : 0, std::memory_order_relaxed); }
 
 namespace rad {
 /* The part of the leader's pass being issued (Ctx::pass_key keys recorded passes by it: a lane step's
@@ -134,6 +138,8 @@ std::vector<int32_t> pp_segments() {
 }
 /* tp8 dev D10 round 2: the plugin declared X1's token-ids part (rad_pp_x1_ids) */
 bool pp_x1_ids() { return pp_g().x1_ids.load(std::memory_order_relaxed) != 0; }
+/* tp8 loop P28: the band the plugin declared on this node (rad_pp_band), 0 none */
+int pp_band_k() { return pp_g().band_k.load(std::memory_order_relaxed); }
 }  /* namespace rad */
 
 extern "C" void rad_pp_crossing(int ring, int64_t row_bytes, int parts) {
@@ -817,10 +823,11 @@ void Engine::pp_on_build(const RadBatch* b, int lane) {
     pp_draft_q_.emplace_back(b->step, lane, std::move(fr));
 }
 
-void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1) {
+void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1, int band) {
     PpGlobal& g = pp_g();
     g.lane.store(lane, std::memory_order_relaxed);
     g.part.store(part, std::memory_order_relaxed);
+    g.band.store(band, std::memory_order_relaxed);   /* tp8 loop P28: every other pass resets it */
     /* tp8 dev M9: a leader's head / tail part names its segment too (seg_l1 > 0); 0 = the whole part, as before */
     const bool seg = part == RAD_PP_PART_SEG || ((part == RAD_PP_PART_HEAD || part == RAD_PP_PART_TAIL) && seg_l1 > 0);
     g.seg_l0.store(seg ? seg_l0 : 0, std::memory_order_relaxed);
@@ -843,6 +850,7 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
     for (const StepEntry& e : sched_of(lane).plan().e)
         if (e.home >= 0) h.flags |= 1;
     if (run && pp_ship_ahead_) h.flags |= 2;   /* tp8 dev D10 round 2 */
+    if (run && pp_ship_band_) h.flags |= 4;    /* tp8 loop P28: a band pass (the follower's parts start at h + k) */
     if (run) {
         h.n_fn4 = fn4::kSwitches;
         fn4::requests(h.fn4_n, h.fn4_v);
@@ -1679,12 +1687,20 @@ int Engine::follower_loop() {
         }
         /* the saves behind the pass need the frame's words after a pass between segments reused the scratch */
         const std::vector<int32_t> ck_keep = h.n_ck > 0 ? ckw : std::vector<int32_t>{};
+        /* tp8 loop P28: a band pass (frame flags bit 2) starts at h + k on this node */
+        const int band = (h.flags & 4) ? pp_band_k() : 0;
+        if ((h.flags & 4) && band <= 0) {
+            pp_link_->fail(fmt("step %d: the leader ran a band pass, but this node's plugin declared no band "
+                               "(RADIANCE_DS41_PP_BAND on both nodes)", h.step));
+            return fail_loop(RAD_E_STATE);
+        }
+        const int pass_h = cfg_.pp_cut_h + band;
         /* tp8 dev M4: the pass's parts -- [h, t) whole, or its segments at the declared boundaries */
         std::vector<std::pair<int, int>> parts;
         const bool split = may_split && !segs.empty() && b->n_tok >= seg_rows &&
                            (seg_prefill || b->phase == RAD_PHASE_MIXED || b->n_tok_decode > 0 || (seg_bg >= 0 && h.lane >= seg_bg));
         if (split) {
-            int a = cfg_.pp_cut_h;
+            int a = pass_h;
             for (int32_t x : segs) {
                 if (x <= a || x >= cfg_.pp_cut_t) continue;
                 parts.emplace_back(a, x);
@@ -1692,7 +1708,7 @@ int Engine::follower_loop() {
             }
             parts.emplace_back(a, cfg_.pp_cut_t);
         } else {
-            parts.emplace_back(cfg_.pp_cut_h, cfg_.pp_cut_t);
+            parts.emplace_back(pass_h, cfg_.pp_cut_t);
         }
         const int lane = h.lane, sstep = h.step;
         /* between two segments: the frames that have arrived (no wait on a card past the segment's run; a host test's
@@ -1854,8 +1870,8 @@ int Engine::follower_loop() {
                 for (auto& r : ranks_) r->stager.set_layer_end(end);
             }
             issue_sched_.store(&ls, std::memory_order_release);
-            if (split) pp_set_pass(lane, RAD_PP_PART_SEG, parts[k].first, parts[k].second);
-            else pp_set_pass(lane, RAD_PP_PART_WHOLE);
+            if (split) pp_set_pass(lane, RAD_PP_PART_SEG, parts[k].first, parts[k].second, band);
+            else pp_set_pass(lane, RAD_PP_PART_WHOLE, 0, 0, band);
             issue_what_.store(kIssueFollower, std::memory_order_release);
             step_batch_.store(b, std::memory_order_release);
             if (pp_ni_) pp_ni_->begin();      /* tp8 dev D8: the ranks are parked, rank 0's stream is this thread's */
