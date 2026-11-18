@@ -1268,7 +1268,8 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
     for (const MrTy& ty : kMrTypes) {
         if (!mr_in(want.c_str(), ty.name)) continue;
         for (const MrShape& sh : kMrShapes) {
-            if (sh.logits || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
+            /* the head (logits_gemm_ggml, f32 out) only when the type list names "head" (DRAFTER track 18.11.2026) */
+            if ((sh.logits && !std::strstr(want.c_str(), "head")) || !mr_in(sh.types, ty.name) || sh.K % ty.qk) continue;
             const int64_t rb = sh.K / ty.qk * ty.bb, wbytes = sh.N * rb;
             std::vector<uint8_t> hw;
             mr_weights(hw, ty, sh.N, sh.K, 0x51ED2701ull ^ (uint64_t)(sh.N * 7 + sh.K));
@@ -1278,7 +1279,7 @@ static void wkpf_perf(const Plugin& pl, const char* mlist, int iters, const char
                 dfree_all();
                 std::vector<uint16_t> hx;
                 gp_acts(hx, M, sh.K, 0xABCDEFull ^ (uint64_t)M);
-                const size_t mb = (size_t)(M * sh.N) * 2;
+                const size_t mb = (size_t)(M * sh.N) * (sh.logits ? 4 : 2);
                 void* d_x = dalloc((size_t)(M * sh.K) * 2);
                 void* d_w = dalloc((size_t)wbytes * (size_t)copies);
                 void* d_y = dalloc(mb);
