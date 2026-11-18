@@ -554,4 +554,68 @@ TEST(layers_m9_lead_segment_boundaries_keep_what_the_part_reads) {
     CHECK(lead_segment_crossing(g, 10, 0, 32, &c, &err) < 0);
 }
 
+/* tp8 loop P28: a band pass of W(10,32) at k = 1..4 -- the leader's head over [0, 10 + k), the follower's from 10 + k. Its X1
+ * carries the follower's copy of source 8's latent (layers 10..13 attend over it in every later decode pass), the band
+ * layers' window keys, and what [10 + k, 32) reads below 10 + k: index 8's selections and source 8's latent while 10 + k <= 13
+ * (the same source as the copy: one plane), the residual alone at 14 (layer 14 is its own source and index layer). X2 is
+ * W(10,32)'s. k = 5 holds layer 14 (Engram + kv source): refused, as is every band that is not 1 <= k < t - h, one with a
+ * source, a tap, or one whose X2 would change; on every cut of the model each accepted band's X1 crosses the sender's last
+ * writers (crossings()' rule) and its window list is exactly the band. */
+TEST(layers_p28_band_passes_of_w10_32) {
+    const Geo g = flash1017();
+    for (int k = 1; k <= 4; ++k) {
+        Band b;
+        std::string err;
+        CHECK_EQ(band_crossing(g, 10, k, 32, &b, &err), 0);
+        if (!err.empty()) std::fprintf(stderr, "  band k %d: %s\n", k, err.c_str());
+        CHECK_EQ(b.at, 10 + k);
+        CHECK_EQ(b.copy_src, 8);
+        CHECK(b.copy_latent);
+        CHECK(!b.copy_index);
+        CHECK_EQ((int)b.window.size(), k);
+        CHECK_EQ(b.window.front(), 10);
+        CHECK_EQ(b.window.back(), 10 + k - 1);
+        CHECK(b.x1.residual);
+        if (k < 4) {
+            CHECK_EQ(b.x1.src, 8);
+            CHECK(b.x1.latent);
+            CHECK_EQ(b.x1.sel, 8);
+        } else {
+            CHECK_EQ(b.x1.src, -1);
+            CHECK_EQ(b.x1.sel, -1);
+            CHECK_EQ(b.x1.keep, -1);
+        }
+    }
+    Band b;
+    std::string err;
+    CHECK(band_crossing(g, 10, 5, 32, &b, &err) < 0);          /* layer 14: Engram + kv source */
+    CHECK(err.find("layer 14") != std::string::npos);
+    CHECK(band_crossing(g, 10, 0, 32, &b, &err) < 0);
+    CHECK(band_crossing(g, 10, 22, 32, &b, &err) < 0);         /* the follower would keep no layer */
+    CHECK_EQ(band_crossing(g, 0, 1, 20, &b, &err), 0);         /* W(0,20)'s band [0, 1): the embedding's layer, X1 the residual at 1 */
+    CHECK_EQ(b.copy_src, -1);
+    CHECK(band_crossing(g, 0, 2, 20, &b, &err) < 0);           /* layer 1 is Engram */
+    CHECK(band_crossing(g, 34, 2, 38, &b, &err) < 0);          /* 37 is a tap (and t >= the first tap is crossings()' refusal) */
+    int accepted = 0, refused_n = 0;
+    for (int h = 0; h < 39; ++h)
+        for (int t = h + 2; t < 40; ++t)
+            for (int k = 1; h + k < t; ++k) {
+                Band x;
+                std::string e;
+                if (band_crossing(g, h, k, t, &x, &e) < 0) { ++refused_n; CHECK(!e.empty()); continue; }
+                ++accepted;
+                for (int l = h; l < h + k; ++l) {
+                    CHECK(!(g.is_src[(size_t)l] && g.ratio[(size_t)l] > 0));
+                    CHECK(l != 1 && l != 14 && l < 37);
+                }
+                CHECK_EQ((int)x.window.size(), k);
+                Crossing c2[2];
+                CHECK_EQ(crossings(g, h, t, c2, &e), 0);
+                CHECK_EQ(x.copy_src, c2[0].src);
+                CHECK(x.x1.src < 0 || x.x1.src == x.copy_src || x.copy_src < 0);
+            }
+    std::fprintf(stderr, "  band passes over every cut: %d accepted, %d refused\n", accepted, refused_n);
+    CHECK(accepted > 0 && refused_n > 0);
+}
+
 RAD_TEST_MAIN()

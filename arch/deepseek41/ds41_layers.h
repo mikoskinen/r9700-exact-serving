@@ -411,6 +411,75 @@ inline int lead_segment_crossing(const Geo& g, int h, int s, int t, Crossing* ou
     return 0;
 }
 
+/* tp8 loop P28 (the newcomer's own cut, the c32 direction): W(h, t) decodes as always, but a BAND pass -- a fresh prompt's
+ * BG pass -- runs the leader's head over [0, h + k): the band [h, h + k) is held on both nodes (its decode owner stays the
+ * follower), the follower runs [h + k, t), the leader's tail [t, n). The band pass's X1 enters layer h + k and carries
+ *   - what X1 of a cut W(h + k, t) carries (`x1`: the residual, the selections / keep words / a source's new entries that
+ *     [h + k, t) reads of the layers below h + k);
+ *   - the source entries X1 of W(h, t) carries for the follower's copy (`copy_*`: W(10,32): source 8's latent), which the
+ *     band layers' later decode passes on the follower attend over;
+ *   - every band layer's new window keys (`window`), which the follower, their decode owner, would have stored.
+ * Refused (this round's form): k < 1 or h + k >= t; an Engram layer or a DSpark tap in the band; a kv source in the band (its
+ * compressed latent, index keys and compressor tail would cross too: a later round); two sources' entries in one crossing
+ * (the latent planes hold the last source the sender computed); a band pass whose X2 would differ from W(h, t)'s (the tail
+ * must read what it reads after a decode pass). 0 with *out, or -1 with the reason. */
+struct Band {
+    int h = -1, k = 0, at = -1, t = -1;   /* the band [h, h + k); its X1 enters `at` = h + k */
+    Crossing x1;                          /* X1 of W(h + k, t) */
+    int copy_src = -1;                    /* X1 of W(h, t)'s source for the follower's copy, -1 none */
+    bool copy_latent = false, copy_index = false;
+    std::vector<int> window;              /* the band layers whose window keys cross, ascending */
+};
+inline int band_crossing(const Geo& g, int h, int k, int t, Band* out, std::string* err) {
+    const int n = g.n_layer;
+    if (k < 1 || h < 0 || h + k >= t || t >= n) {
+        *err = "a band of " + std::to_string(k) + " layer(s) over W(" + std::to_string(h) + "," + std::to_string(t) +
+               ") is not 1 <= k < t - h (the follower must keep at least one layer of a band pass)";
+        return -1;
+    }
+    const int a = h + k;
+    for (int l = h; l < a; ++l) {
+        const char* why = nullptr;
+        for (int p : g.ple) if (p == l) why = "an Engram layer (its tables and token state would be held on both nodes)";
+        for (int tp : g.taps) if (tp == l) why = "a DSpark tap (the drafter is the leader's)";
+        if (g.is_src[(size_t)l] && g.ratio[(size_t)l] > 0)
+            why = "a kv source (its compressed latent, index keys and compressor tail would cross too: not this round's form)";
+        if (why) {
+            *err = "band [" + std::to_string(h) + ", " + std::to_string(a) + ") of W(" + std::to_string(h) + "," +
+                   std::to_string(t) + ") holds layer " + std::to_string(l) + ", " + why;
+            return -1;
+        }
+    }
+    Crossing base[2], at_a[2];
+    if (crossings(g, h, t, base, err) < 0 || crossings(g, a, t, at_a, err) < 0) return -1;
+    Band b;
+    b.h = h;
+    b.k = k;
+    b.at = a;
+    b.t = t;
+    b.x1 = at_a[0];
+    if (base[0].src >= 0) {
+        b.copy_src = base[0].src;
+        b.copy_latent = base[0].latent;
+        b.copy_index = base[0].index;
+        if (b.x1.src >= 0 && b.x1.src != b.copy_src) {
+            *err = "a band pass's X1 at " + std::to_string(a) + " would carry kv source " + std::to_string(b.x1.src) +
+                   "'s entries and the follower's copy of source " + std::to_string(b.copy_src) + "'s";
+            return -1;
+        }
+    }
+    const Crossing& x2b = at_a[1];
+    const Crossing& x2 = base[1];
+    if (x2b.src != x2.src || x2b.latent != x2.latent || x2b.index != x2.index || x2b.sel != x2.sel || x2b.keep != x2.keep) {
+        *err = "a band pass's X2 of W(" + std::to_string(a) + "," + std::to_string(t) + ") differs from W(" + std::to_string(h) +
+               "," + std::to_string(t) + ")'s (the leader's tail would read another form)";
+        return -1;
+    }
+    for (int l = h; l < a; ++l) b.window.push_back(l);
+    *out = b;
+    return 0;
+}
+
 /* tp8 S5 + S6: with lanes the leader issues a lane step's pass in two parts -- its head (layers [0, h), X1) and its tail
  * (X2, layers [t, n)) -- with other lanes' parts between them, which rewrite the step's activations. What its tail reads
  * of its head must then be kv / state (paged per sequence) or cross in X2: a layer >= t that reads the selections of an
