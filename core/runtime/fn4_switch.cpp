@@ -302,7 +302,7 @@ int env_rco() {
     return env;
 }
 
-/* Lever G (ds41-tailgrid): RADIANCE_SCHED_TAIL_GRID=256 / 512 / 1024 / 2048 at start (anything else, or unset, is 0). */
+/* Lever G (ds41-tailgrid): RADIANCE_SCHED_TAIL_GRID=128 / 256 / 512 / 1024 / 2048 at start (anything else, or unset, is 0). */
 int env_tail_grid() {
     static const int env = [] {
         const char* e = std::getenv("RADIANCE_SCHED_TAIL_GRID");
@@ -1266,7 +1266,7 @@ static bool check_here(const std::string& name, int v, std::string* err) {
     if (i == kSchedTailGrid) {     /* lever G (ds41-tailgrid): the scheduler's, latched by a request at its admission */
         if (!tail_grid_ok(v)) {
             if (err) *err = "sched_tail_grid takes 0 (off: a prompt's tail snapshot on the resume grid, where its last chunk "
-                            "starts) or 256 / 512 / 1024 / 2048 (the tail snapshot at the deepest multiple of it that leaves "
+                            "starts) or 128 / 256 / 512 / 1024 / 2048 (the tail snapshot at the deepest multiple of it that leaves "
                             "the prompt's last piece at least 128 rows, under --prefix-resume exact)";
             return false;
         }

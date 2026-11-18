@@ -956,7 +956,7 @@ TgConv tg_conv(const std::vector<int64_t>& lens, int64_t F, bool l20, bool mixed
 
 TEST(tail_grid_conversations_resume_whole_at_the_fine_tail) {
     const std::vector<int64_t> fixed = { 52000, 52600, 57000, 57300, 61500, 61700, 66000 };
-    for (int64_t F : { 256, 512, 1024, 2048 })
+    for (int64_t F : { 128, 256, 512, 1024, 2048 })
         for (int l20 = 0; l20 < 2; ++l20)
             for (int mixed = 0; mixed < 2; ++mixed) {
                 const TgConv c = tg_conv(fixed, F, l20 != 0, mixed != 0);
@@ -970,7 +970,7 @@ TEST(tail_grid_conversations_resume_whole_at_the_fine_tail) {
     for (int conv = 0; conv < 40; ++conv) {
         std::vector<int64_t> lens = { 2200 + (int64_t)(rng() % 60000u) };
         for (int k = 0; k < 6; ++k) lens.push_back(lens.back() + 70 + (int64_t)(rng() % 5500u));
-        const int64_t F = (int64_t[]){ 256, 512, 1024, 2048 }[conv % 4];
+        const int64_t F = (int64_t[]){ 128, 256, 512, 1024, 2048 }[conv % 5];
         const TgConv c = tg_conv(lens, F, (conv / 4) % 2 != 0, (conv / 8) % 2 != 0);
         if (!c.err.empty()) std::fprintf(stderr, "conv %d F %lld: %s\n", conv, (long long)F, c.err.c_str());
         CHECK_EQ(c.err, std::string(""));

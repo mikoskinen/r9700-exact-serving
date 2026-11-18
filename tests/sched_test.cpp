@@ -12297,7 +12297,7 @@ TEST(cbh_off_plans_as_unset) {
 }
 
 /* ================================================================== lever G: the tail grid (ds41-tailgrid) */
-/* fn4 sched_tail_grid F (0 off = today; 256 / 512 / 1024 / 2048) under --prefix-resume exact on the DS41 line's geometry
+/* fn4 sched_tail_grid F (0 off = today; 128 / 256 / 512 / 1024 / 2048) under --prefix-resume exact on the DS41 line's geometry
  * (interval 2048, span 2 from 16384 tokens, MNBT 4160: the resume grid 2048 + k x 4096; ds41_psk 4 + ds41_psk_cr 1 as the
  * line's pin: tail-only anchors). A plain prompt's tail snapshot moves from the grid point under its end to the deepest
  * multiple of F at or below N - 128, cutting the prompt's last cold chunk in two pieces of >= 128 rows; the next turn
@@ -12345,8 +12345,8 @@ int64_t tg_json(const char* key) {
 
 TEST(lever_g_the_switch_takes_its_grids_and_starts_off) {
     std::string err;
-    for (int v : { 0, 256, 512, 1024, 2048 }) CHECK(fn4::check("sched_tail_grid", v, &err));
-    for (int v : { -1, 1, 16, 128, 100, 384, 768, 4096 }) {
+    for (int v : { 0, 128, 256, 512, 1024, 2048 }) CHECK(fn4::check("sched_tail_grid", v, &err));
+    for (int v : { -1, 1, 16, 64, 100, 384, 768, 4096 }) {
         CHECK(!fn4::check("sched_tail_grid", v, &err));
         CHECK(err.find("sched_tail_grid takes 0") != std::string::npos);
     }
@@ -12377,7 +12377,7 @@ TEST(lever_g_the_tail_is_the_deepest_grid_multiple_that_leaves_128_rows) {
     for (int64_t N = 100; N <= 30000; N += 61) {
         const int64_t base = f.sch.tail_checkpoint(N);
         CHECK_EQ(f.sch.tail_checkpoint(N, 0), base);
-        for (int64_t F : { 256, 512, 1024, 2048 }) {
+        for (int64_t F : { 128, 256, 512, 1024, 2048 }) {
             const int64_t t = f.sch.tail_checkpoint(N, F);
             if (t == base) {
                 /* nothing deeper is admissible: no multiple of F in (base, N - 128] past the first interval */
@@ -12426,7 +12426,7 @@ TEST(lever_g_a_conversation_resumes_at_its_fine_tail_inside_the_cold_runs_pieces
         }
         CHECK_EQ(tail_off[0], (int64_t)51200);
     }
-    for (int F : { 256, 512, 1024, 2048 }) {
+    for (int F : { 128, 256, 512, 1024, 2048 }) {
         TgSwitch on(F);
         /* the cold text under the lever: the same pieces but the last, cut at the fine tail */
         const CrTurn c0 = cr_turn('T', cold, 0, {});
@@ -12482,7 +12482,7 @@ TEST(lever_g_random_conversations_keep_the_cold_runs_pieces) {
     auto rnd = [&](int lo, int hi) { rng = rng * 1664525u + 1013904223u; return lo + (int)((rng >> 8) % (uint32_t)(hi - lo + 1)); };
     int turns_checked = 0;
     for (int conv = 0; conv < 10; ++conv) {
-        const int F = (int[]){ 256, 512, 1024, 2048 }[conv % 4];
+        const int F = (int[]){ 128, 256, 512, 1024, 2048 }[conv % 5];
         int64_t N = rnd(3000, 30000);   /* (the fixture's prompts end below 64536 tokens) */
         std::vector<int64_t> lens = { N };
         for (int k = 0; k < 5; ++k) { N += rnd(50, 3000) + rnd(20, 2500); lens.push_back(N); }
@@ -12644,7 +12644,7 @@ TEST(lever_ti_a_conversation_takes_its_fine_tails_inside_one_last_chunk) {
         cold_off.push_back(tg_pieces(cr_turn('T', cold, 0, {})));
         for (const auto& tn : turns) cold_off.push_back(tg_pieces(cr_turn('T', tn.first, 0, {})));
     }
-    for (int F : { 256, 512, 1024, 2048 }) {
+    for (int F : { 128, 256, 512, 1024, 2048 }) {
         TgSwitch g(F);
         TiSwitch on(1);
         std::vector<int64_t> avail_g, avail_t;
@@ -13667,7 +13667,7 @@ TEST(lanes_span_inner_leaves_the_span_two_cold_plans_and_cuts_only_a_two_interva
     }
 }
 
-/* tp8 loop P21 (fn4 sched_tail_grid 256 beside sched_tail_inner 1 and lever PSK-CR's tail-only anchors, ds41_psk 4): the
+/* tp8 loop P21 (fn4 sched_tail_grid 256 / 128 beside sched_tail_inner 1 and lever PSK-CR's tail-only anchors, ds41_psk 4): the
  * BEST start's cold plans at 2 and 3 lanes (span 2, SPAN_TAIL 8192, SPAN_SHORT 24576) for the three cold cells. The chunk
  * plan is F 512's (the published grid's) to the row; lever G's fine tail -- the deepest multiple of F at or below N - 128 --
  * sits inside the last chunk (one snapshot there, TI) and is every chunk's next PSK target, so each chunk's `ahead` is that
@@ -13683,10 +13683,10 @@ TEST(lanes_a_finer_tail_grid_keeps_the_cold_plans_and_shrinks_the_drains_cone) {
     struct Chunk { int64_t a, b, ahead; int ck; };
     for (int lanes : { 2, 3 })
     for (int64_t n_prompt : { (int64_t)15777, (int64_t)65650, (int64_t)131137 }) {
-        std::vector<Chunk> got[2];
-        int64_t fol[2] = { 0, 0 }, lead[2] = { 0, 0 };
-        for (int gi = 0; gi < 2; ++gi) {
-            const int F = gi == 0 ? 512 : 256;
+        std::vector<Chunk> got[3];
+        int64_t fol[3] = { 0, 0, 0 }, lead[3] = { 0, 0, 0 };
+        for (int gi = 0; gi < 3; ++gi) {
+            const int F = gi == 0 ? 512 : gi == 1 ? 256 : 128;
             TgSwitch tg(F);
             TiSwitch ti(1);
             Lanes L;
@@ -13773,17 +13773,21 @@ TEST(lanes_a_finer_tail_grid_keeps_the_cold_plans_and_shrinks_the_drains_cone) {
             /* lever TI: the snapshot inside the last chunk, the state after its row tail - 1 */
             CHECK_EQ(last.a + (int64_t)last.ck + 1, tail);
         }
-        REQUIRE_EQ(got[0].size(), got[1].size());
         bool same = true;
-        for (size_t i = 0; i < got[0].size(); ++i) same = same && got[0][i].a == got[1][i].a && got[0][i].b == got[1][i].b;
+        for (int gi = 1; gi < 3; ++gi) {
+            REQUIRE_EQ(got[0].size(), got[gi].size());
+            for (size_t i = 0; i < got[0].size(); ++i) same = same && got[0][i].a == got[gi][i].a && got[0][i].b == got[gi][i].b;
+        }
         CHECK(same);
         CHECK(fol[1] < fol[0]);
         CHECK(lead[1] < lead[0]);
-        fprintf(stderr, "    %lld tokens, %d lanes: %zu chunks, the plan %s; fine tail F 512 %lld / F 256 %lld; cone row-layers "
-                        "follower 20-31 %lld -> %lld, leader 32-39 %lld -> %lld\n", (long long)n_prompt, lanes, got[0].size(),
-                same ? "identical" : "DIFFERENT", (long long)((n_prompt - 128) / 512 * 512),
-                (long long)((n_prompt - 128) / 256 * 256), (long long)fol[0], (long long)fol[1], (long long)lead[0],
-                (long long)lead[1]);
+        CHECK(fol[2] <= fol[1]);   /* 16k: 128's tail is 256's (15616) */
+        CHECK(lead[2] <= lead[1]);
+        fprintf(stderr, "    %lld tokens, %d lanes: %zu chunks, the plan %s; fine tail F 512 / 256 / 128 %lld / %lld / %lld; cone "
+                        "row-layers follower 20-31 %lld / %lld / %lld, leader 32-39 %lld / %lld / %lld\n", (long long)n_prompt, lanes,
+                got[0].size(), same ? "identical" : "DIFFERENT", (long long)((n_prompt - 128) / 512 * 512),
+                (long long)((n_prompt - 128) / 256 * 256), (long long)((n_prompt - 128) / 128 * 128), (long long)fol[0],
+                (long long)fol[1], (long long)fol[2], (long long)lead[0], (long long)lead[1], (long long)lead[2]);
     }
 }
 

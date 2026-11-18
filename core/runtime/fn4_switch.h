@@ -438,7 +438,7 @@
  *   sched_tail_grid scheduler (lever G, ds41-tailgrid; 73 here, after ds41_moe1; Scheduler::tail_checkpoint): 0 off (today:
  *                   under --prefix-resume exact a prompt's tail snapshot is where its last chunk starts on the resume
  *                   grid -- every 4096 tokens from 2048 on the DS line -- so a follow-up turn re-prefills up to one grid
- *                   step of rows the cache already holds); F = 256 / 512 / 1024 / 2048: the tail snapshot of a plain
+ *                   step of rows the cache already holds); F = 128 / 256 / 512 / 1024 / 2048: the tail snapshot of a plain
  *                   prompt of N tokens is at the deepest multiple of F at or below N - 128, when that lies past the grid
  *                   point (so the prompt's last chunk is cut there, each part >= 128 rows: the row count above which no
  *                   kernel form of the line depends on a piece's rows, option D's floor, sched_bi_chunk 3 / 4), and the
@@ -693,7 +693,9 @@ int  sched_noa();
  * scheduler reads it when it admits a request (Request::tail_grid) and reports its counts every step (GET "tailgrid",
  * kTailGridCounts values: latched, tails, tail_rows, resumes, resume_rows_saved, rejoins, inert, declined). */
 static constexpr int kTailGridCounts = 8;
-inline bool tail_grid_ok(int v) { return v == 0 || v == 256 || v == 512 || v == 1024 || v == 2048; }
+/* tp8 loop P21 (b): 128 too -- kTailMinPiece, a multiple of the quantum and of every compressor ratio (DeepSeek's 4 / 128),
+ * dividing the interval and the resume grid: the 64k / 128k cold cells' fine tails 242 / 193 rows before the end, not 370 / 321 */
+inline bool tail_grid_ok(int v) { return v == 0 || v == 128 || v == 256 || v == 512 || v == 1024 || v == 2048; }
 int  sched_tail_grid();
 void note_sched_tail_grid(const int64_t* v);
 /* Lever TI (ds41-pf2, sched_tail_inner; 79 here, after exl3_xr): 1 takes lever G's fine tail snapshot INSIDE the prompt's

@@ -3921,4 +3921,58 @@ TEST(lever_g_a_turn_resumed_at_a_fine_tail_returns_what_a_cold_run_does) {
     }
 }
 
+/* tp8 loop P21 (b): sched_tail_grid 128 on the same tiny hybrid and geometry as above. The prompts are cut so that the fine
+ * tails are ODD multiples of 128 (no 256 grid holds them): 2,100 -> 1,920 and 3,100 -> 2,944 rows (F 256: 1,792 / 2,816), both
+ * past their resume grid points (1,536 / 2,560). A cold text, its extension and that again: every reply and every probability
+ * equals a cold run's (a server without a prefix cache), and each turn resumes at the previous prompt's fine tail -- the
+ * linear, conv and attention state a snapshot at a 128 multiple restores. */
+TEST(lever_g_at_128_resumes_at_an_odd_multiple_and_returns_what_a_cold_run_does) {
+    REQUIRE(world().ok);
+    std::vector<int32_t> a = prompt_ids(71, 2100);   /* (words -> byte ids: cut to the lengths the tails are about) */
+    REQUIRE(a.size() >= 2100);
+    a.resize(2100);
+    std::vector<int32_t> b = a;
+    for (int32_t t : prompt_ids(72, 1000)) b.push_back(t);
+    REQUIRE(b.size() >= 3100);
+    b.resize(3100);
+    const std::vector<std::string> geo = { "--num-speculative-tokens", "0", "--checkpoint-interval", "512",
+                                           "--prefill-span", "2", "--max-num-batched-tokens", "1088",
+                                           "--max-num-seqs", "2" };
+    const int64_t ta = ((int64_t)a.size() - 128) / 128 * 128, tb = ((int64_t)b.size() - 128) / 128 * 128;
+    REQUIRE_EQ(ta, (int64_t)1920);
+    REQUIRE_EQ(tb, (int64_t)2944);
+    REQUIRE((ta / 128) % 2 == 1 && (tb / 128) % 2 == 1);
+    std::vector<json> cold;
+    for (const std::vector<int32_t>* p : { &a, &b }) {
+        Server s;
+        std::vector<std::string> args = geo;
+        args.push_back("--no-prefix-cache");
+        REQUIRE(s.start(world().qwen35, args));
+        cold.push_back(post(s.port, "/completion", completion(*p, 24, 0.0, 0, 3)));
+        CHECK_EQ(s.stop(), 0);
+        REQUIRE(cold.back().contains("completion_probabilities"));
+        CHECK_EQ(tokens_of(cold.back()).size(), (size_t)24);
+    }
+    Server s;
+    REQUIRE(s.start(world().qwen35, geo, std::vector<std::string>{ "RADIANCE_SCHED_TAIL_GRID=128" }));
+    const json ra = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+    const json rb = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+    const json again = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+    const int64_t ca = timing(ra, "cache_n"), cb = timing(rb, "cache_n"), c2 = timing(again, "cache_n");
+    const bool same = tokens_of(ra) == tokens_of(cold[0]) && tokens_of(rb) == tokens_of(cold[1]) &&
+                      tokens_of(again) == tokens_of(cold[1]) &&
+                      ra["completion_probabilities"] == cold[0]["completion_probabilities"] &&
+                      rb["completion_probabilities"] == cold[1]["completion_probabilities"] &&
+                      again["completion_probabilities"] == cold[1]["completion_probabilities"];
+    fprintf(stderr, "    sched_tail_grid 128: prompts %zu / %zu, cached %lld / %lld / %lld (want 0 / %lld / %lld), %s a cold run's\n",
+            a.size(), b.size(), (long long)ca, (long long)cb, (long long)c2, (long long)ta, (long long)tb,
+            same ? "equal to" : "NOT equal to");
+    CHECK(ca <= 0);
+    CHECK_EQ(cb, ta);
+    CHECK_EQ(c2, tb);
+    CHECK(same);
+    CHECK_EQ(s.stop(), 0);
+    CHECK(s.log.find("lever G (fn4 sched_tail_grid 128") != std::string::npos);
+}
+
 RAD_TEST_MAIN()
