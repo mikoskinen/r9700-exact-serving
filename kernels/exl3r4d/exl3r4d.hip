@@ -71,6 +71,19 @@
 #ifndef EXL3R4D_ABLATE_ALOAD   // 1: delete the activation fragment loads (a register value that varies by step)
 #define EXL3R4D_ABLATE_ALOAD 0
 #endif
+// X4 (tp8 DECODE track, 18.11.2026, FINDINGS F40; reading builds only, never shipped, wrong bytes on purpose): the decode
+// band's X3D-F / K25U K loops (the DeepSeek 2.25 gate_up / down kernels) without one part, so a one-card perfmoe at the
+// pipeline's shape names what a live expert's ~5.7 us a call is spent on.
+//   EXL3R4D_ABLATE_MMA 1: every v_wmma of those loops replaced by five v_xor folding the decoded fragment and the
+//                         activation fragment into the accumulator (both stay live, the decode and the loads stay).
+//   EXL3R4D_ABLATE_DEC 1: the trellis decode of those loops deleted (the loaded words are the fragment; the WMMA stays).
+// (EXL3R4D_ABLATE_CBFMA, exl3r4d_common.hip.h: the codebook's v_pk_fma deleted from both decodes.)
+#ifndef EXL3R4D_ABLATE_MMA
+#define EXL3R4D_ABLATE_MMA 0
+#endif
+#ifndef EXL3R4D_ABLATE_DEC
+#define EXL3R4D_ABLATE_DEC 0
+#endif
 // EXL3R4D_DLY_{GU,DN,PG,GD} (reading builds only, never shipped; 0 = off): a fixed delay of that many microseconds
 // injected into ONE decode op -- gate_up's GEMM, down's GEMM, the prep kernels, the fused gate_up_down -- so an engine
 // pass's step time against the plain build reads how much of that op is on the step's critical path (a causal
@@ -672,11 +685,33 @@ static __device__ __forceinline__ void decode_frags_k25(const unsigned (&R0)[NPW
     const int slot[4] = {0, 2, 1, 3};
 #pragma unroll
     for (int q = 0; q < 4; q++)
-      x8.u[slot[q]] = __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, sm[j][q]),
+      x8.u[slot[q]] = EXL3R4D_ABLATE_CBFMA ? sm[j][q]   // X4 reading build: the codebook's fma deleted (wrong bytes)
+                    : __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, sm[j][q]),
                                                                             (v2h){kinv, kinv}, (v2h){kbias, kbias}));
     out[j] = x8.f;
   }
 }
+// X4 reading helpers (EXL3R4D_ABLATE_MMA / _DEC above; off = mma() and the decodes exactly as before).
+template <int NPW>
+static __device__ __forceinline__ void x4_raw_frags(const unsigned (&a)[NPW], const unsigned (&b)[NPW], v8h (&out)[NPW]) {
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    union { unsigned u[4]; v8h f; } x;
+    x.u[0] = a[j]; x.u[1] = b[j]; x.u[2] = a[j] ^ 0x3C003C00u; x.u[3] = b[j] ^ 0x3C003C00u;
+    out[j] = x.f;
+  }
+}
+static __device__ __forceinline__ v8f x4_mma(v8h wf, v8h af, v8f c) {
+#if EXL3R4D_ABLATE_MMA
+  union { v8h f; unsigned u[4]; } w, a;
+  w.f = wf; a.f = af;
+  c[0] = __builtin_bit_cast(float, __builtin_bit_cast(unsigned, c[0]) ^ w.u[0] ^ w.u[1] ^ w.u[2] ^ w.u[3] ^ a.u[0]);
+  return c;
+#else
+  return mma(wf, af, c);
+#endif
+}
+
 // P10-TP4S L1: one unit's two K slices meet. Each slice dumps its accumulators (every thread's registers, after the
 // LDS split-K reduction) to p.raw [unit][slice][thread][NPW x 8], releases, and counts in at p.ctr[unit]; the second to
 // arrive acquires, adds the other's dump -- p0 + p1, an IEEE sum's operands commute, so the bits do not depend on which
@@ -1071,16 +1106,18 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       unsigned x0_[NPW], x1_[NPW];                                                   \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) { x0_[j] = W_[j][1][0]; x1_[j] = W_[j][1][1]; } \
       v8h wfs_[NPW];                                                                 \
-      decode_frags_x3d<NPW>(x0_, x1_, x3d_sx, wfs_);                                 \
-      _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = mma(wfs_[j], A_, acc[j]); \
+      if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(x0_, x1_, wfs_);           \
+      else decode_frags_x3d<NPW>(x0_, x1_, x3d_sx, wfs_);                            \
+      _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
       break;                                                                         \
     }                                                                                \
     if constexpr (K25 != K25_OFF) { /* K25U: the tiles' windows, their unpacked decode phase by phase, the WMMAs */ \
       unsigned r0_[NPW], r1_[NPW];                                                   \
       k25_windows<K25, NPW, kB96H>(W_, plan.shift, b96w, b96p, r0_, r1_);            \
       v8h wfs_[NPW];                                                                 \
-      decode_frags_k25<NPW>(r0_, r1_, wfs_);                                         \
-      _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = mma(wfs_[j], A_, acc[j]); \
+      if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(r0_, r1_, wfs_);           \
+      else decode_frags_k25<NPW>(r0_, r1_, wfs_);                                    \
+      _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
       break;                                                                         \
     }                                                                                \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                \

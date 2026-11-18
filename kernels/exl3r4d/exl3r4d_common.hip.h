@@ -69,6 +69,9 @@ static __host__ __device__ __forceinline__ int32_t exl3r4d_max4(int32_t a, int32
 #ifndef EXL3R4D_ABLATE_PREP    // 1: skip the input rotation (fused prep copies x into LDS unrotated)
 #define EXL3R4D_ABLATE_PREP 0
 #endif
+#ifndef EXL3R4D_ABLATE_CBFMA   // 1 (X4 reading builds, exl3r4d.hip): the X3D-F / K25U decodes without the codebook fma
+#define EXL3R4D_ABLATE_CBFMA 0
+#endif
 #ifndef EXL3R4D_ABLATE_DECODE  // 1: skip the trellis decode (the raw words are the fragment)
 #define EXL3R4D_ABLATE_DECODE 0
 #endif
@@ -517,7 +520,8 @@ static __device__ __forceinline__ void decode_frags_x3d(const unsigned (&w0)[NPW
     const int slot[4] = {0, 2, 1, 3};
 #pragma unroll
     for (int q = 0; q < 4; q++)
-      x.u[slot[q]] = __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, sm[j][q]),
+      x.u[slot[q]] = EXL3R4D_ABLATE_CBFMA ? sm[j][q]   // X4 reading build: the codebook's fma deleted (wrong bytes)
+                   : __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, sm[j][q]),
                                                                            (v2h){kinv, kinv}, (v2h){kbias, kbias}));
     out[j] = x.f;
   }
