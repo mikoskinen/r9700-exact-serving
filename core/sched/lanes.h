@@ -154,13 +154,14 @@ public:
     bool bg_split() const { return bg_split_; }
     void set_bg_split(bool on) { bg_split_ = on; }
     void note_bg_split_locked() { ++bg_split_n_; }
-    /* tp8 loop F22 (with BG lanes; RADIANCE_PP_BG_DRAFT_FLOOR=0 turns it off): a lent piece's commit records the block
+    /* tp8 loop F22 (with BG lanes): a lent piece's commit records the block
      * drafter's range in its home's request as the home's own Scheduler::block_end would have (the lane that ran the piece
      * ran the drafter's context pass over its rows: block_begin mirrors every entry, the drafter's KV is the sequence's in
      * the one pool). A newcomer lent WHOLE to a BG lane otherwise reached its home's first block_begin with no range, so
      * draft_floor() was its prompt's end (hit_holes_draft_) and it drafted nothing for its first window of tokens (lq46:
-     * 1,582 undrafted decode rows in the c16 window, 13 newcomers x ~128). On by default where BG lanes are on. */
-    bool bg_draft_floor() const { return bg_lane() >= 0 && bg_floor_; }
+     * 1,582 undrafted decode rows in the c16 window, 13 newcomers x ~128). Always on where BG lanes are on (its opt-out
+     * RADIANCE_PP_BG_DRAFT_FLOOR=0 was removed 18.11., tp8 loop REPORT rule 7). */
+    bool bg_draft_floor() const { return bg_lane() >= 0; }
     void note_bg_floor_locked() { ++bg_floor_n_; }
     void note_bg_skip_locked(int k) { if (k >= 0 && k < kBgWhyN) ++bg_skip_[k]; }
     /* tp8 dev D11 (RADIANCE_PP_BG_HOLD_MS=N, 1 .. 60000; with BG lanes): a newcomer the BG lanes have no room for (kBgRoom) is
@@ -353,7 +354,6 @@ private:
     int     bg_ = 0;                        /* RADIANCE_PP_BG_LANE=k (bg_lane, tp8 dev M8) */
     int64_t bg_lent_ = 0, bg_rows_ = 0, bg_skip_[kBgWhyN] = {}, bg_split_n_ = 0;
     bool    bg_split_ = false;              /* RADIANCE_PP_BG_SPLIT=1 (bg_split, tp8 dev M8) */
-    bool    bg_floor_ = true;               /* RADIANCE_PP_BG_DRAFT_FLOOR (bg_draft_floor, tp8 loop F22) */
     int64_t bg_floor_n_ = 0;
     int64_t bg_hold_ms_ = 0;                /* RADIANCE_PP_BG_HOLD_MS (bg_hold_ms, tp8 dev D11) */
     int64_t bg_pieces_ = 0, bg_piece_n_ = 0; /* RADIANCE_PP_BG_PIECES (bg_pieces, tp8 dev D12) */

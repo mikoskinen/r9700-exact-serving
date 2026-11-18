@@ -52,8 +52,6 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     bg_ = bg_env();
     const char* bs = std::getenv("RADIANCE_PP_BG_SPLIT");
     bg_split_ = bs && !std::strcmp(bs, "1");
-    const char* bf = std::getenv("RADIANCE_PP_BG_DRAFT_FLOOR");
-    bg_floor_ = !(bf && !std::strcmp(bf, "0"));
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); bh && *bh) {
         char* end = nullptr;
         const long long v = std::strtoll(bh, &end, 10);
