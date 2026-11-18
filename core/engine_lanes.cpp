@@ -519,8 +519,14 @@ int Engine::step_loop_lanes() {
      * last one ran on rank 0's card; the frame goes to the follower with the head's last segment. One BG step in segments at a
      * time (the boundary ring buffer is one a rank). Only the order of issue changes, never a step's composition: a segment
      * boundary saves and restores the pass's live set on each rank, as the follower's do (tp8 dev M4). */
-    enum { kLsNone = 0, kLsHead, kLsHeadDone, kLsTail };
-    struct LSeg { int st = kLsNone; const RadBatch* b = nullptr; std::vector<std::pair<int, int>> parts; size_t k = 0; bool mixed = false; };
+    /* kLsHeadShip (tp8 loop P27, RADIANCE_PP_LEAD_SEG_SHIP=1): the head's last segment is issued, its frame still held until
+     * that segment has run on rank 0's card (lship_ev[lane]); then kLsHeadDone */
+    enum { kLsNone = 0, kLsHead, kLsHeadDone, kLsTail, kLsHeadShip };
+    struct LSeg {
+        int st = kLsNone; const RadBatch* b = nullptr; std::vector<std::pair<int, int>> parts; size_t k = 0; bool mixed = false;
+        uint64_t ship_ns = 0;       /* P27: the last head segment's issue */
+        int64_t ship_s0 = 0, ship_s1 = 0;   /* P27: frames shipped by then since the first segment / at the last one's issue */
+    };
     std::vector<LSeg> lsg((size_t)n_lanes_);
     std::vector<int32_t> lseg_hb, lseg_tb;
     bool lseg = false;
@@ -542,6 +548,20 @@ int Engine::step_loop_lanes() {
     struct EvReset { RadEvent* e; ~EvReset() { for (int i = 0; i < 2; ++i) if (e[i]) rad_event_destroy(e[i]); } } lseg_ev_reset{ lseg_ev };
     int lseg_ahead = 0;
     if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG_AHEAD"); v && !std::strcmp(v, "1")) lseg_ahead = 1;
+    /* tp8 loop P27 (RADIANCE_PP_LEAD_SEG_SHIP=1, with LEAD_SEG; default 0 = the frame goes out with the last head segment's
+     * issue, as M9 built it): the frame goes once that segment has RUN on rank 0's card -- its X1 is then sent, so the
+     * follower's card does not sit in the BG pass's X1 receive (loop FINDINGS F47 item 4: p50 85-95 ms a BG newcomer, 4.5 % of
+     * the c32 follower) while the leader finishes the head, and the decode frames issued between the head's segments reach
+     * the follower ahead of it. Only when each frame goes changes, never a pass: the held frame is the one made at the first
+     * segment (its release's PSK plan, clears, checkpoint words and switch table), as M9 holds it today between the first
+     * and the last segment. Host tests: RADIANCE_PP_LEAD_SEG_SHIP_TEST_WAIT_MS holds it that long past the last issue too. */
+    std::vector<RadEvent> lship_ev;
+    struct EvVecReset { std::vector<RadEvent>* v; ~EvVecReset() { for (RadEvent e : *v) if (e) rad_event_destroy(e); } } lship_ev_reset{ &lship_ev };
+    uint64_t lship_wait_ns = 0;
+    int64_t lship_n = 0, lship_ahead = 0, lship_late = 0;
+    uint64_t lship_ns_sum = 0, lship_ns_max = 0;
+    lseg_ship_ = false;
+    struct ShipReset { Engine* e; ~ShipReset() { e->lseg_ship_ = false; } } lship_reset{ this };
     if (const char* v = std::getenv("RADIANCE_PP_LEAD_SEG"); v && *v && std::atoi(v) > 0) {
         for (int32_t x : pp_segments()) {
             if (x > 0 && x < cfg_.pp_cut_h) lseg_hb.push_back(x);
@@ -551,6 +571,20 @@ int Engine::step_loop_lanes() {
         if (lseg && (rad_event_create(&lseg_ev[0]) < 0 || rad_event_create(&lseg_ev[1]) < 0)) {
             RAD_ERR("two-node pipeline: could not create the leader's segment event");
             return fail_loop(RAD_E_DEVICE);
+        }
+        if (const char* sv = std::getenv("RADIANCE_PP_LEAD_SEG_SHIP"); lseg && !lseg_hb.empty() && sv && !std::strcmp(sv, "1")) {
+            lship_ev.assign((size_t)n_lanes_, nullptr);
+            for (RadEvent& e : lship_ev)
+                if (rad_event_create(&e) < 0) {
+                    RAD_ERR("two-node pipeline: could not create the leader's ship events (RADIANCE_PP_LEAD_SEG_SHIP)");
+                    return fail_loop(RAD_E_DEVICE);
+                }
+            lseg_ship_ = true;
+            if (const char* w = std::getenv("RADIANCE_PP_LEAD_SEG_SHIP_TEST_WAIT_MS"); w && *w)
+                lship_wait_ns = (uint64_t)std::max<int64_t>(0, std::atoll(w)) * 1000000ull;
+        } else if (sv && !std::strcmp(sv, "1")) {
+            RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG_SHIP=1 is not taken: %s (tp8 loop P27)",
+                     !lseg ? "it needs RADIANCE_PP_LEAD_SEG taken" : "no head boundary is declared on this node");
         }
         std::string hs, ts;
         for (int32_t x : lseg_hb) hs += fmt("%s%d", hs.empty() ? "" : ", ", (int)x);
@@ -562,11 +596,19 @@ int Engine::step_loop_lanes() {
                      (long long)rf_rows, hs.empty() ? "none: whole" : hs.c_str(), ts.empty() ? "none: whole" : ts.c_str(),
                      cfg_.pp_cut_h, cfg_.pp_cut_t,
                      lseg_ahead ? "; a segment goes out once the one before the last ran (RADIANCE_PP_LEAD_SEG_AHEAD=1)" : "");
-        else
+        if (lseg_ship_)
+            RAD_INFO("two-node pipeline: RADIANCE_PP_LEAD_SEG_SHIP=1 -- a segmented head's frame goes to the follower once its last "
+                     "segment has run on rank 0's card (its X1 sent), the frames issued meanwhile ahead of it (tp8 loop P27)%s",
+                     lship_wait_ns ? fmt("; held >= %llu ms past the last issue (RADIANCE_PP_LEAD_SEG_SHIP_TEST_WAIT_MS)",
+                                         (unsigned long long)(lship_wait_ns / 1000000ull)).c_str() : "");
+        if (!lseg)
             RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG=%s is not taken: %s (tp8 dev M9)", v,
                      lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : tail_ahead_ ? "not with RADIANCE_PP_TAIL_AHEAD=1"
                                                                                     : "the plugin declared no boundary on this node");
     }
+    if (const char* sv = std::getenv("RADIANCE_PP_LEAD_SEG_SHIP"); !lseg_ship_ && sv && !std::strcmp(sv, "1") &&
+        !(std::getenv("RADIANCE_PP_LEAD_SEG") && std::atoi(std::getenv("RADIANCE_PP_LEAD_SEG")) > 0))
+        RAD_WARN("two-node pipeline: RADIANCE_PP_LEAD_SEG_SHIP=1 is not taken: it needs RADIANCE_PP_LEAD_SEG (tp8 loop P27)");
     uint64_t lseg_line_ns = rad_mono_ns();
     /* tp8 dev D11: RADIANCE_PP_BG_HOLD_MS's counts (run so far) once a minute, so a cell's window is the difference of two lines */
     uint64_t hold_line_ns = rad_mono_ns();
@@ -603,6 +645,12 @@ int Engine::step_loop_lanes() {
                  (long long)lseg_inside, (long long)lseg_polls,
                  lseg_mixed ? fmt("; %lld MIXED newcomer steps of decode lanes among them (RADIANCE_PP_LEAD_SEG_MIXED=1, M9b)",
                                   (long long)lseg_msteps).c_str() : "", when);
+        if (lseg_ship_)
+            RAD_INFO("two-node pipeline: %lld segmented heads' frames shipped after their last segment ran (RADIANCE_PP_LEAD_SEG_SHIP=1, "
+                     "tp8 loop P27)%s: held past the last segment's issue %.2f ms on average, the longest %.2f; %lld other frames went "
+                     "ahead of them since their first segment, %lld of them after the last segment's issue", (long long)lship_n, when,
+                     lship_n ? (double)lship_ns_sum / 1e6 / (double)lship_n : 0.0, (double)lship_ns_max / 1e6,
+                     (long long)lship_ahead, (long long)lship_late);
     };
     /* the boundary ring is held while a pass's head or tail segments are in flight */
     auto lseg_ring_busy = [&]() {
@@ -858,6 +906,7 @@ int Engine::step_loop_lanes() {
                     if (const int hs = lane_head_seg(l, b, s.parts[0].first, s.parts[0].second, true, false); hs < 0)
                         return fail_loop(hs);
                     if (rad_event_record(lseg_ev[0], ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
+                    s.ship_s0 = pp_steps_shipped_;   /* tp8 loop P27 */
                     s.k = 1;
                     s.st = kLsHead;
                     ++lseg_parts;
@@ -919,7 +968,15 @@ int Engine::step_loop_lanes() {
                     ++lseg_parts;
                     lseg_last_ns = rad_mono_ns();
                     ++adv;
-                    if (last) {
+                    if (last && lseg_ship_) {
+                        /* tp8 loop P27: the frame waits for this segment's run (its X1 sent) */
+                        if (rad_event_record(lship_ev[(size_t)l], ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
+                        s.st = kLsHeadShip;
+                        s.ship_ns = rad_mono_ns();
+                        s.ship_s1 = pp_steps_shipped_;
+                        s.parts.clear();
+                        s.k = 0;
+                    } else if (last) {
                         s.st = kLsHeadDone;
                         s.parts.clear();
                         s.k = 0;
@@ -927,6 +984,22 @@ int Engine::step_loop_lanes() {
                         if (rad_event_record(lseg_ev[s.k & 1], ranks_[0]->ctx.stream()) < 0) return fail_loop(RAD_E_DEVICE);
                         ++s.k;
                     }
+                } else if (s.st == kLsHeadShip) {
+                    /* tp8 loop P27: ship the held frame once the head's last segment has run */
+                    const uint64_t now = rad_mono_ns();
+                    if (lship_wait_ns && now - s.ship_ns < lship_wait_ns) continue;
+                    const int q = rad_event_query(lship_ev[(size_t)l]);
+                    if (q < 0) return fail_loop(RAD_E_DEVICE);
+                    if (q == 0) continue;
+                    if (const int rs = pp_ship_release(l); rs < 0) return fail_loop(rs);
+                    const uint64_t d = now - s.ship_ns;
+                    ++lship_n;
+                    lship_ns_sum += d;
+                    lship_ns_max = std::max(lship_ns_max, d);
+                    lship_ahead += pp_steps_shipped_ - 1 - s.ship_s0;
+                    lship_late += pp_steps_shipped_ - 1 - s.ship_s1;
+                    s.st = kLsHeadDone;
+                    ++adv;
                 } else if (s.st == kLsHeadDone && !lseg_tb.empty() && x2_landed(l) && !lseg_ring_busy()) {
                     int a = cfg_.pp_cut_t;
                     for (int32_t x : lseg_tb) { s.parts.emplace_back(a, (int)x); a = x; }
@@ -1162,7 +1235,7 @@ int Engine::lane_head_seg(int lane, const RadBatch* b, int s0, int s1, bool firs
     } else if (const int ps = prepare_release(b, /*switches=*/false); ps < 0) {
         return ps;
     }
-    if (last) RAD_TRY(pp_ship_release(lane));
+    if (last && !lseg_ship_) RAD_TRY(pp_ship_release(lane));   /* tp8 loop P27: else the lane loop ships it after the run */
     pp_set_pass(lane, RAD_PP_PART_HEAD, s0, s1);
     issue_what_.store(kIssueModel, std::memory_order_release);
     step_batch_.store(b, std::memory_order_release);

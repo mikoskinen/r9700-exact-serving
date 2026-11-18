@@ -490,6 +490,10 @@ private:
      * PSK plan and clears), sent at its last head segment */
     struct PpHeld { bool on = false; int32_t step = 0; std::vector<uint8_t> head, span; };
     PpHeld pp_held_[RAD_PP_MAX_LANES];
+    /* tp8 loop P27 (RADIANCE_PP_LEAD_SEG_SHIP=1, with LEAD_SEG): the last head segment does not ship the held frame; the lane
+     * loop ships it once that segment has run on rank 0's card (its X1 sent), so the follower never issues the pass into an X1
+     * that is not sent yet and the decode frames issued between the head's segments reach it first */
+    bool lseg_ship_ = false;
     int  pp_ship_hold(const RadBatch* b, int lane);
     int  pp_ship_release(int lane);
     bool tail_ahead_ = false;
