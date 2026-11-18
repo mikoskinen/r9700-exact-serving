@@ -46,7 +46,9 @@
 #include <chrono>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <cstdlib>
 #include <cstdio>
@@ -1490,11 +1492,74 @@ int Engine::follower_loop() {
     std::deque<net::Msg> ia_pend;
     int64_t x1_runs[RAD_PP_MAX_LANES] = {};
     int64_t ia_deferred = 0;
+    /* tp8 loop D15 (RADIANCE_PP_FOL_ORDER=bits, this node; unset / 0 = the order above, every frame behind a held one held):
+     * the follower's card spins in a pass's X1 receive whenever the leader's stream has not sent that X1 yet (a BG / MIXED
+     * head or tail ahead of it there), while a split pass's next segments wait behind the spin (loop FINDINGS F44 14:05 /
+     * PROFILE 07:00: X1 wait 13-17 % of this card at c32, the follower's largest idle item). Between a split pass's segments:
+     * bit 1 -- every decode frame of another lane waits here until its X1 payload has landed (not only one the leader issued
+     * ahead), and the waiting frames go in the order their X1s land, each lane's own in its order (a frame with a switch
+     * request is a barrier) -- the card runs the split pass's segments meanwhile; bit 2 -- a frame that keeps its place
+     * (prompt rows, a lent piece, the split pass's lane: StepHdr bit 0) holds only the frames of ITS lane behind it, not every
+     * frame: a decode frame of a lane with nothing held (and no switch request, clears or checkpoint words, none held before it
+     * with a switch request) runs between the segments as if nothing were held. Only the order of different lanes' passes on
+     * this node changes, never a pass: a decode step reads only committed KV (bit 0's rule), its own lane's frames keep their
+     * order. Bit 1 is not taken where this node's pass takes no X1 (RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t) without the D10
+     * ids). Bit 4 (with bit 1, which it sets): the next segment waits up to RADIANCE_PP_FOL_X1_GRACE_MS (default 10) after a
+     * waiting frame arrived for its X1 -- one whose leader head runs now lands within ~a head's time and goes first, as today;
+     * one whose head is queued behind the leader's BG / MIXED work lets the segments run. */
+    int fol_order = 0;
+    if (const char* v = std::getenv("RADIANCE_PP_FOL_ORDER"); v && *v) fol_order = std::atoi(v) & 7;
+    if (fol_order & 4) fol_order |= 1;
+    uint64_t fo_grace_ns = 10ull * 1000000ull;
+    if (const char* v = std::getenv("RADIANCE_PP_FOL_X1_GRACE_MS"); v && *v)
+        fo_grace_ns = (uint64_t)std::max(0LL, std::atoll(v)) * 1000000ull;
+    {
+        const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
+        const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
+        if ((fol_order & 1) && fe_on && !pp_x1_ids()) {
+            RAD_WARN("follower: RADIANCE_PP_FOL_ORDER bit 1 is not taken here: this node's pass takes no X1 "
+                     "(RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t)); bit 2 stays (tp8 loop D15)");
+            fol_order &= ~5;
+        }
+        if (fol_order)
+            RAD_INFO("follower: RADIANCE_PP_FOL_ORDER=%d -- between a split pass's segments %s%s%s (tp8 loop D15)", fol_order,
+                     (fol_order & 1) ? "another lane's decode frame goes once its X1 has landed, in the order the X1s land"
+                                     : "",
+                     (fol_order & 3) == 3 ? "; " : "",
+                     (fol_order & 2) ? "a held frame holds only its own lane's frames behind it" : "");
+        if (fol_order & 4)
+            RAD_INFO("follower: RADIANCE_PP_FOL_ORDER bit 4 -- a segment waits up to %llu ms after a waiting frame arrived for its "
+                     "X1 (RADIANCE_PP_FOL_X1_GRACE_MS, tp8 loop D15)", (unsigned long long)(fo_grace_ns / 1000000ull));
+    }
+    int64_t fo_waited = 0, fo_jumped = 0, fo_passed = 0;
+    /* D15: every run frame carries the leader's whole switch-request table; a frame whose table differs from the one that
+     * arrived before it changes a switch here (fn4::follow) and so keeps its place, and nothing passes it (its lane, step) */
+    std::vector<uint8_t> fo_req;
+    std::set<int64_t> fo_chg;
+    std::map<int64_t, uint64_t> fo_arr;   /* bit 4: a run frame's arrival time (its lane, step) */
+    int64_t fo_graced = 0;
+    auto fo_key = [](const StepHdr& hh) -> int64_t { return ((int64_t)hh.lane << 32) | (uint32_t)hh.step; };
+    auto note_arrival = [&](const net::Msg& mm) {
+        if (!fol_order || mm.h.kind != net::kStep) return;
+        StepHdr hh;
+        if (mm.body.size() < sizeof hh) return;
+        std::memcpy(&hh, mm.body.data(), sizeof hh);
+        if (!hh.run) return;
+        const size_t nb = sizeof hh.fn4_n + sizeof hh.fn4_v;
+        std::vector<uint8_t> t(nb);
+        std::memcpy(t.data(), hh.fn4_n, sizeof hh.fn4_n);
+        std::memcpy(t.data() + sizeof hh.fn4_n, hh.fn4_v, sizeof hh.fn4_v);
+        if (fo_req.empty() || fo_req != t) fo_chg.insert(fo_key(hh));
+        fo_req.swap(t);
+        if (fol_order & 4) fo_arr[fo_key(hh)] = rad_mono_ns();
+    };
+    auto is_chg = [&](const StepHdr& hh) -> bool { return hh.run && fo_chg.count(fo_key(hh)) != 0; };
     auto x1_landed = [&](const net::Msg& mm) -> bool {
         StepHdr hh;
         if (mm.body.size() < sizeof hh) return true;
         std::memcpy(&hh, mm.body.data(), sizeof hh);
-        if (!(hh.flags & 2) || !hh.run || hh.lane < 0 || hh.lane >= n_lanes_ || hh.lane >= RAD_PP_MAX_LANES) return true;
+        if (!((hh.flags & 2) || (fol_order & 1)) || !hh.run || hh.lane < 0 || hh.lane >= n_lanes_ || hh.lane >= RAD_PP_MAX_LANES)
+            return true;
         const RadPpRing* x1 = pp_recv_[hh.lane * RAD_PP_N_RINGS + RAD_PP_X1];
         return !x1 || (int64_t)__atomic_load_n(&x1->landed, __ATOMIC_ACQUIRE) > x1_runs[hh.lane];
     };
@@ -1566,6 +1631,8 @@ int Engine::follower_loop() {
         }
         ++builds;
         if (!h.run) return RAD_OK;
+        if (!fo_chg.empty()) fo_chg.erase(fo_key(h));   /* tp8 loop D15: a switch change is applied below */
+        if (!fo_arr.empty()) fo_arr.erase(fo_key(h));
         if (h.lane < RAD_PP_MAX_LANES) ++x1_runs[h.lane];   /* tp8 dev D10 round 2: this pass takes its lane's next X1 */
         /* Review F4: the state slots the leader zeroed before this step (a fresh sequence's), zeroed
          * here on this node's own groups, as Engine::clear_fresh_states does on the leader. */
@@ -1632,22 +1699,94 @@ int Engine::follower_loop() {
          * RADIANCE_PP_SEG_TEST_WAIT_MS) */
         auto between = [&](RadEvent done_ev) -> int {
             const uint64_t t0 = rad_mono_ns();
-            for (;;) {
-                /* tp8 dev D10 round 2: the frames issued ahead whose X1 has landed (and the decode frames behind them) */
-                while (!ia_pend.empty() && x1_landed(ia_pend.front())) {
-                    net::Msg mp = std::move(ia_pend.front());
-                    ia_pend.pop_front();
-                    StepHdr hp;
-                    std::memcpy(&hp, mp.body.data(), sizeof hp);
-                    if (const int fs = step_frame(mp, false); fs < 0) return fs;
-                    if (hp.run) { ++seg_between; ++steps; }
+            /* tp8 loop D15 bit 2: the lanes with a frame held (its lane's later frames stay behind it) and whether a held
+             * frame carries a switch request (then every later frame stays behind it); a frame held before this pass's
+             * segments that may pass now (a decode frame of a lane with nothing held before it) waits for its X1 below */
+            uint32_t held_lanes = 0;
+            bool held_fn4 = false;
+            bool fo_in_grace = false;   /* bit 4: this gap is held back for a frame's X1 (counted once) */
+            auto lane_bit = [](const StepHdr& hh) -> uint32_t {
+                return hh.lane >= 0 && hh.lane < 32 ? 1u << hh.lane : ~0u;
+            };
+            auto note_held = [&](const net::Msg& mm) {
+                StepHdr hh;
+                if (mm.body.size() < sizeof hh) { held_fn4 = true; return; }
+                std::memcpy(&hh, mm.body.data(), sizeof hh);
+                held_lanes |= lane_bit(hh);
+                if (is_chg(hh)) held_fn4 = true;
+            };
+            /* bit 2: may a frame that is not a keeper pass the held ones */
+            auto may_pass = [&](const StepHdr& hh) -> bool {
+                return !(held_lanes & lane_bit(hh)) && !held_fn4 && !is_chg(hh) && hh.n_clears == 0 && hh.n_ck == 0;
+            };
+            /* D15: with the switch on, a frame that changes a switch keeps its place too (the frames waiting for their
+             * X1 that came before it run before it, every later one after it) */
+            auto keeps_place = [&](const net::Msg& mm, const StepHdr& hh) -> bool {
+                return mm.body.size() < sizeof hh || ((hh.flags & 1) && hh.run) || hh.lane == lane ||
+                       (fol_order && is_chg(hh));
+            };
+            if (fol_order & 2) {
+                for (size_t i = 0; i < held.size();) {
+                    StepHdr hh;
+                    const bool hdr = held[i].body.size() >= sizeof hh;
+                    if (hdr) std::memcpy(&hh, held[i].body.data(), sizeof hh);
+                    if (hdr && !keeps_place(held[i], hh) && may_pass(hh)) {
+                        if (hh.run) ++fo_passed;
+                        ia_pend.push_back(std::move(held[i]));
+                        held.erase(held.begin() + (std::ptrdiff_t)i);
+                        continue;
+                    }
+                    note_held(held[i]);
+                    ++i;
                 }
+            }
+            /* the frames waiting for their X1: D10's in their order; bit 1 -- each once its X1 has landed, a lane's own in
+             * their order, none past a waiting switch request */
+            auto issue_pend = [&]() -> int {
+                uint32_t blocked = 0;
+                for (size_t i = 0; i < ia_pend.size();) {
+                    StepHdr hp;
+                    if (ia_pend[i].body.size() < sizeof hp) break;
+                    std::memcpy(&hp, ia_pend[i].body.data(), sizeof hp);
+                    const uint32_t lb = lane_bit(hp);
+                    if (i > 0 && (!(fol_order & 1) || is_chg(hp))) break;
+                    if (!(blocked & lb) && x1_landed(ia_pend[i])) {
+                        if (i > 0) ++fo_jumped;
+                        net::Msg mp = std::move(ia_pend[i]);
+                        ia_pend.erase(ia_pend.begin() + (std::ptrdiff_t)i);
+                        if (const int fs = step_frame(mp, false); fs < 0) return fs;
+                        if (hp.run) { ++seg_between; ++steps; }
+                        continue;
+                    }
+                    blocked |= lb;
+                    if (is_chg(hp) || !(fol_order & 1)) break;
+                    ++i;
+                }
+                return RAD_OK;
+            };
+            for (;;) {
+                /* tp8 dev D10 round 2: the frames issued ahead whose X1 has landed (and the decode frames behind them);
+                 * tp8 loop D15 bit 1: every waiting frame whose X1 has landed */
+                if (const int ps = issue_pend(); ps < 0) return ps;
                 const bool dev_done = !done_ev || rad_event_query(done_ev) != 0;
                 const bool waited = (rad_mono_ns() - t0) / 1000000ull >= (uint64_t)seg_wait_ms;
                 net::Msg m2;
                 const int rs = pp_link_->recv(&m2, 0);
                 if (rs == RAD_E_NOTFOUND) {
-                    if (dev_done && waited) return RAD_OK;
+                    /* tp8 loop D15 bit 4: a waiting frame that arrived less than the grace ago keeps the next segment back */
+                    bool grace = false;
+                    if ((fol_order & 4) && dev_done && waited && !ia_pend.empty()) {
+                        const uint64_t now = rad_mono_ns();
+                        for (const net::Msg& mp : ia_pend) {
+                            StepHdr hp;
+                            if (mp.body.size() < sizeof hp) continue;
+                            std::memcpy(&hp, mp.body.data(), sizeof hp);
+                            const auto it = fo_arr.find(fo_key(hp));
+                            if (hp.run && it != fo_arr.end() && now - it->second < fo_grace_ns) { grace = true; break; }
+                        }
+                        if (grace && !fo_in_grace) { fo_in_grace = true; ++fo_graced; }
+                    }
+                    if (dev_done && waited && !grace) { fo_in_grace = false; return RAD_OK; }
                     std::this_thread::sleep_for(std::chrono::microseconds(50));
                     continue;
                 }
@@ -1660,17 +1799,40 @@ int Engine::follower_loop() {
                     if (const int os = other_frame(m2); os < 0) return os;
                     continue;
                 }
+                note_arrival(m2);
                 StepHdr h2;
                 if (m2.body.size() >= sizeof h2) std::memcpy(&h2, m2.body.data(), sizeof h2);
                 /* a step that keeps its place (prompt rows, a lent piece) and every frame behind it wait for the split pass;
-                 * a decode step runs its whole pass now; a build without a pass is replayed here */
-                if (!held.empty() || m2.body.size() < sizeof h2 || ((h2.flags & 1) && h2.run) || h2.lane == lane) {
+                 * a decode step runs its whole pass now; a build without a pass is replayed here (tp8 loop D15 bit 2: a
+                 * decode frame passes the held ones when nothing of its lane is held) */
+                const bool keeps = keeps_place(m2, h2);
+                bool hold = keeps || !held.empty();
+                if (hold && !keeps && (fol_order & 2) && may_pass(h2)) {
+                    hold = false;
+                    if (h2.run) ++fo_passed;
+                }
+                if (hold) {
                     if (h2.run) ++seg_held;
+                    if (fol_order & 2) note_held(m2);
                     held.push_back(std::move(m2));
                     continue;
                 }
-                if (!ia_pend.empty() || !x1_landed(m2)) {   /* tp8 dev D10 round 2: its X1 is not here yet */
-                    if (ia_pend.empty()) ++ia_deferred;
+                bool wait = !x1_landed(m2);   /* tp8 dev D10 round 2: its X1 is not here yet */
+                if (fol_order & 1) {
+                    /* tp8 loop D15 bit 1: behind a waiting frame of its lane or a waiting switch request too */
+                    for (const net::Msg& mp : ia_pend) {
+                        StepHdr hp;
+                        if (mp.body.size() < sizeof hp) { wait = true; break; }
+                        std::memcpy(&hp, mp.body.data(), sizeof hp);
+                        if (hp.lane == h2.lane || is_chg(hp)) { wait = true; break; }
+                    }
+                    if (is_chg(h2) && !ia_pend.empty()) wait = true;
+                } else if (!ia_pend.empty()) {
+                    wait = true;
+                }
+                if (wait) {
+                    if (h2.flags & 2) { if (ia_pend.empty()) ++ia_deferred; }
+                    else if ((fol_order & 1) && h2.run) ++fo_waited;
                     ia_pend.push_back(std::move(m2));
                     continue;
                 }
@@ -1786,11 +1948,17 @@ int Engine::follower_loop() {
                     if (ia_deferred > 0)
                         RAD_INFO("follower: %lld frames issued ahead waited between a split pass's segments for their X1 "
                                  "(tp8 dev D10 round 2)", (long long)ia_deferred);
+                    if (fol_order && !segs.empty())
+                        RAD_INFO("follower: frame order over the run (RADIANCE_PP_FOL_ORDER=%d, tp8 loop D15): %lld decode "
+                                 "frames waited between segments for their X1, %lld went before an older waiting frame, %lld "
+                                 "passed a held frame, %lld segment gaps held back for an X1 within the grace", fol_order,
+                                 (long long)fo_waited, (long long)fo_jumped, (long long)fo_passed, (long long)fo_graced);
                     return RAD_OK;
                 }
                 RAD_ERR("follower: the link to the leader is down: %s", pp_link_->why().c_str());
                 return fail_loop(RAD_E_IO);
             }
+            note_arrival(m);   /* tp8 loop D15: a frame from the link (not one that waited) */
         }
         if (m.h.kind != net::kStep) {
             if (const int os = other_frame(m); os < 0) return os;
@@ -1821,6 +1989,21 @@ int Engine::follower_loop() {
             RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, %lld held "
                      "in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts, (long long)seg_between,
                      (long long)seg_held);
+        /* tp8 loop D15: the frame-order counts a minute (a cell's window = two lines' difference) */
+        if (fol_order && !segs.empty()) {
+            static uint64_t fo_line_ns = 0;
+            const uint64_t now = rad_mono_ns();
+            if (fo_line_ns == 0) fo_line_ns = now;
+            if (now - fo_line_ns >= 60ull * 1000000000ull) {
+                fo_line_ns = now;
+                RAD_INFO("follower: frame order so far (RADIANCE_PP_FOL_ORDER=%d, tp8 loop D15): %lld decode frames waited "
+                         "between segments for their X1, %lld went before an older waiting frame, %lld passed a held frame, "
+                         "%lld segment gaps held back for an X1 within the grace; %lld passes in %lld segments, %lld other "
+                         "passes between them, %lld held", fol_order, (long long)fo_waited, (long long)fo_jumped,
+                         (long long)fo_passed, (long long)fo_graced, (long long)seg_passes,
+                         (long long)seg_parts, (long long)seg_between, (long long)seg_held);
+            }
+        }
     }
     for (RadEvent& e : seg_ev) if (e) rad_event_destroy(e);
     return RAD_OK;
