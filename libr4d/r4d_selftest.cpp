@@ -31963,7 +31963,7 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
 }
 
 /* tp8 loop P20 rounds 3 + 4: --case stage_shard -- stage_send / stage_recv with `shard` (split 3) at four ranks over ONE pinned
- * host ring (hipHostMalloc portable + mapped, as the engine's pinned ring): parts p0 [R][8] f32 (32-byte rows, the 16-byte path),
+ * host ring (hipHostMalloc coherent + mapped + portable, as libr4d's own host mailboxes): parts p0 [R][8] f32 (32-byte rows, the 16-byte path),
  * p1 [R][10] bf16 (20-byte rows, the 4-byte path), p2 [5][4] i32 (unmasked); each rank's device buffers right only on ITS rows
  * (rows [r q, (r + 1) q), q = ceil(R / 4)) and rank-specific junk elsewhere, p2 right only on rank 0. Send with shard 3: the ring
  * holds the whole parts' bytes, the layout word and `ready` 1; a control without shard (rank 0 alone) carries rank 0's junk. Then
@@ -32038,7 +32038,7 @@ static void stage_shard(const Plugin& pl, const std::vector<int>& devs) {
         const uint64_t o1 = rad_pp_align(b0), o2 = o1 + rad_pp_align(b1), total = o2 + rad_pp_align(b2);
         const uint64_t cap = total + RAD_PP_TRAILER + 4096, bytes = RAD_PP_RING_HDR + cap;
         void* ring = nullptr;
-        if (hipHostMalloc(&ring, bytes, hipHostMallocPortable | hipHostMallocMapped) != hipSuccess) {
+        if (hipHostMalloc(&ring, bytes, hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable) != hipSuccess) {
             ok(nm, false, "hipHostMalloc of the ring");
             return;
         }
