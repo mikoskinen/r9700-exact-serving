@@ -162,9 +162,9 @@ int Scheduler::set_draft_dcap(int v) {   /* SPB */
     return draft_.dcap();
 }
 
-int Scheduler::set_draft_dcap_n(int v) {   /* SPB */
+int Scheduler::set_draft_dcap_n(int v) {   /* SPB (tp8 loop D20: 101 .. 164 holds the depth at the cap from v - 100 rows) */
     std::lock_guard<std::mutex> lk(mu_);
-    if (v >= 1 && v <= 64) draft_.set_dcap_n(v);
+    if ((v >= 1 && v <= 64) || (v >= 101 && v <= 164)) draft_.set_dcap_n(v);
     return draft_.dcap_n();
 }
 

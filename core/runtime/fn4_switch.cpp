@@ -898,8 +898,9 @@ static bool check_here(const std::string& name, int v, std::string* err) {
             if (err) *err = "draft_dcap takes 0 (off) .. 64 (the most head depth from draft_dcap_n decode rows)";
             return false;
         }
-        if (i == kDraftDcapN && (v < 1 || v > 64)) {
-            if (err) *err = "draft_dcap_n takes 1 .. 64 (decode rows from which draft_dcap holds)";
+        if (i == kDraftDcapN && !((v >= 1 && v <= 64) || (v >= 101 && v <= 164))) {
+            if (err) *err = "draft_dcap_n takes 1 .. 64 (decode rows from which draft_dcap caps the head depth) or 101 .. 164 "
+                            "(from n - 100 rows the depth is HELD at draft_dcap, tp8 loop D20)";
             return false;
         }
         const int cap = s.draft_capable.load(std::memory_order_acquire);

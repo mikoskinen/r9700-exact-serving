@@ -378,9 +378,19 @@ int DraftController::plan_step(DraftAdapt* const* seq, int n_seq, int n_rows) {
         if (g > best_g) { best_g = g; best = d; }
     }
 
+    /* tp8 loop D20: the hold (draft_dcap_n 100 + N) -- from its N rows the depth is the cap, at once, no yield choice */
+    const bool held = dcap_hold_ && dcap_d_ > 0 && n_rows >= dcap_n_;
     /* Move only after kHold steps and only for kHyst more yield than the current depth. The
      * first drafting step takes the best outright. */
-    if (step_d_ <= 0) {
+    if (held) {
+        const int hd = std::max(dcap_d_, (int32_t)kMinDepth);
+        if (step_d_ != hd)
+            RAD_DEBUG("draft window: head depth %d -> %d held at the cap over %d drafting of %d rows (draft_dcap %d from %d rows, "
+                      "held)", step_d_, hd, n_seq, n_rows, dcap_d_, dcap_n_);
+        step_d_ = hd;
+        step_held_ = 0;
+        ++n_dhold_;
+    } else if (step_d_ <= 0) {
         step_d_ = best;
         step_held_ = 0;
     } else if (capped && step_d_ > lim) {

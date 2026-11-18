@@ -5460,6 +5460,50 @@ TEST(the_depth_cap_holds_the_head_depth_from_its_rows_and_hands_back_below_them)
     CHECK_EQ(cap.dcap_cycles(), (int64_t)21);
 }
 
+/* tp8 loop D20 (loop FINDINGS F56 item 7): draft_dcap_n 100 + N HOLDS the head depth at draft_dcap from N decode rows.
+ * Eight sequences at 0.9 / 0.7 a position, step times that make depth 2 the best yield (30 / 31 / 60 / 70 / 80 ms at depths
+ * 1-5): the cap (draft_dcap 3 from 8 rows) lets the yield choose 2, the hold verifies 3 every cycle from 8 rows; under them
+ * the yield's choice comes back past kHold; 8 again releases the hold. */
+TEST(the_depth_hold_sets_the_cap_from_its_rows_where_the_yield_would_choose_less) {
+    DraftController a = adaptive_controller(5);
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    for (int i = 0; i < 8; ++i) { u[i] = estimate(a, 0.9, 0.7); uf[i] = &u[i]; }
+    const double ms[6] = { 0.0, 30.0, 31.0, 60.0, 70.0, 80.0 };
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) {
+            a.step_time(d, 8, ms[d]);
+            a.step_time(d, 6, ms[d]);
+        }
+    DraftController cap = a, hold = a;
+    cap.set_dcap(3);
+    cap.set_dcap_n(8);
+    hold.set_dcap(3);
+    hold.set_dcap_n(108);
+    CHECK(hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 108);   /* reads back as set (fn4 note) */
+    CHECK(!cap.dcap_hold());
+    for (int t = 0; t < 20; ++t) {
+        CHECK_EQ(cap.plan_step(uf, 8, 8), 2);
+        CHECK_EQ(hold.plan_step(uf, 8, 8), 3);
+    }
+    CHECK_EQ(hold.dcap_held_cycles(), (int64_t)20);
+    CHECK_EQ(cap.dcap_held_cycles(), (int64_t)0);
+    int at2 = 0;
+    for (int t = 0; t < DraftController::kHold + 4; ++t) at2 += hold.plan_step(uf, 6, 6) == 2 ? 1 : 0;
+    CHECK(at2 > 0);
+    CHECK_EQ(hold.plan_step(uf, 8, 8), 3);   /* back at 8 rows: held at once */
+    hold.set_dcap_n(8);
+    CHECK(!hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 8);
+    int at2b = 0;
+    for (int t = 0; t < DraftController::kHold + 4; ++t) at2b += hold.plan_step(uf, 8, 8) == 2 ? 1 : 0;
+    CHECK(at2b > 0);
+    hold.set_dcap_n(164);
+    CHECK(hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 164);
+}
+
 TEST(the_borrow_prices_a_class_never_lent_with_its_nearest_neighbours_lent_ratio) {
     DraftAdapt u[8];
     DraftAdapt* uf[8];
