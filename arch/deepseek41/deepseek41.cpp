@@ -674,6 +674,10 @@ struct Model {
     /* tp8 loop P13c (RADIANCE_DS41_PIPE2_CONE=1, with pipe2): PSK's cut (cone) layers too, where the layer's rows are one prefill
      * segment of >= pipe2 rows (the drain's last chunks: the cone rows of layers 21 .. ~32 at pipe2 1024); not the split layer */
     bool pipe2_cone = false;
+    /* tp8 loop P15 (RADIANCE_DS41_PIPE2_TBO=1 / 2 / 3, with pipe2 + pipe2_attn, every rank attending): the other two piece
+     * all-reduces of a pipelined layer on the second lane too -- bit 1 piece 1's attention all-reduce beside MoE pass 0,
+     * bit 2 piece 1's MoE all-reduce beside the next layer's piece-0 per-row work (step_bi, tbo_*); 0 = off */
+    int pipe2_tbo = 0;
     /* tp8 S3 (ds41_layers.h): this node's layer ranges (RADIANCE_DS41_LAYERS, _MODE); lr.on false = every layer, the
      * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
     ds41layers::Spec lr{};
@@ -2420,6 +2424,42 @@ static bool pipe2_attn_env() {
     static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_PIPE2_ATTN"); return e && e[0] == '1' && !e[1]; }();
     return on;
 }
+/* tp8 loop P15 -- RADIANCE_DS41_PIPE2_TBO=1 / 2 / 3 (read at declare, only with RADIANCE_DS41_PIPE2 + _ATTN on and every
+ * rank attending; anything else = 0, the P13 issue byte for byte): the two piece all-reduces P13a / P13b leave serial on
+ * lane 0 go to the second lane as well, each beside work of the OTHER piece (the two-micro-batch overlap inside a node):
+ *   bit 1 (attention side): after piece 1's o_a + o_b, lane 0 joins piece 0's attention all-reduce, issues piece 0's
+ *     post / collapse / norm (+ mix) and its router projection + all_gather; then piece 1's attention all-reduce on lane 1
+ *     BESIDE MoE pass 0; lane 0 joins it, issues piece 1's post / collapse / norm and router; piece 0's MoE all-reduce on
+ *     lane 1 beside MoE pass 1 (as P13a), lane 0 joins it;
+ *   bit 2 (layer boundary): piece 1's MoE all-reduce on lane 1 BESIDE the next layer's post / collapse / norm (+ mix) of
+ *     piece 0 and that layer's per-row attention inputs over piece 0 (q_a, kv, the indexer's projections, q_b, the window
+ *     key's norm / rope / store, the ropes); lane 0 then joins it and issues the same over piece 1, and the compressor
+ *     chain, the indexer and the attention as today over the step -- only between two adjacent uncut layers this node
+ *     issues in the same pass, with no crossing between them and no Engram block / tap / receive in the second.
+ * EXACT by construction: every op is the one P13a / P13b (or the whole pass) issues, over the same row ranges of the same
+ * operands (per-row ops: the fused mhc forms work in 8-row groups and a piece starts at a multiple of 256); the collectives
+ * are the same messages, each behind a join on its lane, so they stay totally ordered on every rank (never two in
+ * flight); the buffers a reordered op reads or writes after the other piece's ops are kept out of the sharing pool
+ * (rad_buf_concurrent: h0 + pre_attn for bit 1, streams_next + pre_ffn + collapsed for bit 2). */
+/* bit 4 (P16, after the cards' lq50: P13a's two MoE passes cost a 4,096-row head +15 ms, more than its lane-1 all-reduce
+ * hid): the MoE of such a layer runs WHOLE (one pass, its rows' experts read once), only its all-reduce in the two halves
+ * -- half 0 on lane 0, half 1 on lane 0 too or, with bit 2, on lane 1 beside the next layer's piece-0 inputs; bit 1 is
+ * not taken with bit 4 (it needs MoE pass 0). TBO=4: P13b's attention pieces with the MoE whole; TBO=6: + bit 2. */
+static int pipe2_tbo_env() {
+    static const int v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_PIPE2_TBO");
+        if (!e || !e[0] || e[1] || e[0] < '1' || e[0] > '7') return 0;
+        return e[0] - '0';
+    }();
+    return v;
+}
+/* P15's counters (rank 0): layer-passes with bit 1's order, layer boundaries with bit 2's, fallbacks (a deferral the next
+ * layer could not take, finished at once) */
+static std::atomic<long long> g_tbo_attn{0}, g_tbo_xl{0}, g_tbo_flush{0}, g_tbo_whole{0};   /* + bit 4: layer-passes whose MoE ran whole */
+/* P15 bit 2: the layer whose piece 0 the previous layer prepared (its pcn_mix over [p0, p0 + pa)), piece 1's MoE all-reduce
+ * still on lane 1; -1 = none. Per rank thread, reset at every pass's start. */
+struct TboDefer { int l = -1; int64_t p0 = 0, pa = 0, pn = 0; };
+static thread_local TboDefer t_tbo;
 
 /* RADIANCE_DS41_ROUTER_BF16=1 (lever VA "bf16"; read at declare): the f32 weights whose checkpoint is
  * BF16 -- every MoE router projection (trunk and DSpark, [n_expert, n_embd]) and the ratio > 1
@@ -4724,6 +4764,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.pipe2 = why ? 0 : pipe2_env();
         m.pipe2_attn = m.pipe2 > 0 && pipe2_attn_env();
         m.pipe2_cone = m.pipe2 > 0 && pipe2_cone_env();
+        /* P15: every rank attends (no attention-zero rank: the same per-rank ops order everywhere) */
+        m.pipe2_tbo = m.pipe2 > 0 && m.pipe2_attn && m.aw == g.world ? pipe2_tbo_env() : 0;
         if (ctx->rank == 0) {
             if (why)
                 fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2=%lld off (tp8 loop P13): %s\n",
@@ -4742,6 +4784,23 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2_ATTN=1 (tp8 loop P13b): those layers' attention "
                                 "all-reduce in the two pieces too, piece 0's on the second lane beside piece 1's output "
                                 "projection\n");
+            if (!why && pipe2_tbo_env() > 0) {
+                if (m.pipe2_tbo > 0)
+                    fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2_TBO=%d (tp8 loop P15 / P16):%s%s%s; the same ops and "
+                                    "bytes, the collectives in one order\n",
+                            m.pipe2_tbo,
+                            (m.pipe2_tbo & 4) ? " the MoE of a pipelined layer WHOLE (one pass), its all-reduce in the two halves"
+                                              : "",
+                            (m.pipe2_tbo & 1) && !(m.pipe2_tbo & 4) ? " piece 1's attention all-reduce on the second lane beside "
+                                                                      "MoE pass 0"
+                                                                    : "",
+                            (m.pipe2_tbo & 2) ? ", piece 1's MoE all-reduce on the second lane beside the next layer's piece-0 "
+                                                "inputs"
+                                              : "");
+                else
+                    fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2_TBO=%d off (tp8 loop P15): %s\n", pipe2_tbo_env(),
+                            !m.pipe2_attn ? "it needs RADIANCE_DS41_PIPE2_ATTN=1" : "an attention-zero rank");
+            }
         }
     }
     if (ctx->shape_probe) {
@@ -4762,6 +4821,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.pipe2 = full.pipe2;   /* tp8 loop P13: the same overlap all-reduces and concurrent buffer as the real declare */
         m.pipe2_attn = full.pipe2_attn;
         m.pipe2_cone = full.pipe2_cone;
+        m.pipe2_tbo = full.pipe2_tbo;   /* P15: the same concurrent buffers as the real declare */
         /* Lever Z0-A (ds41-z0): the DSpark head's query rows Q (max_seqs x block, capped by max_tok: dsp_config) size
          * FIXED parameters -- the candidates' all_gather numel Q x R x 2, the walk's wseqs = Q / block and its gather --
          * so a level below Q (the 8-row rung at NST 5: Q 8 instead of 40, numel 512 instead of 2560) declared a different
@@ -4778,6 +4838,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * output rows, act.x) stays out of the sharing pool (Ctx::lane1_ rule 3) */
     if (m.pipe2 > 0) DS_TRY(rad_buf_concurrent(b, m.act.x));
     if (m.pipe2 > 0 && m.pipe2_attn) DS_TRY(rad_buf_concurrent(b, m.attn_out));   /* P13b's lane-1 attention all-reduce */
+    /* P15 (tp8 loop): what a piece-1 op reads or writes after the other piece's ops ran in between, out of the sharing pool --
+     * bit 1: piece 1's post / collapse / norm (pcn_f) after MoE pass 0 reads h0 + pre_attn (dead after pcn_f in the declared
+     * order, so the MoE's transients could share their bytes); bit 2: the next layer's pcn_mix over piece 1 after that layer's
+     * piece-0 attention inputs reads streams_next + pre_ffn and writes collapsed (dead around pcn_mix in the declared order,
+     * so q_lora / window_kv / ... could share their bytes) */
+    if ((m.pipe2_tbo & 1) && !(m.pipe2_tbo & 4)) {
+        DS_TRY(rad_buf_concurrent(b, m.h0));
+        DS_TRY(rad_buf_concurrent(b, m.pre_a));
+    }
+    if (m.pipe2_tbo & 2) {
+        DS_TRY(rad_buf_concurrent(b, m.h1));
+        DS_TRY(rad_buf_concurrent(b, m.pre_f));
+        DS_TRY(rad_buf_concurrent(b, m.xcol));
+    }
     /* Pictures: the container's tower with an encoder budget (rad_block_ds41_vision.h; Model::media). Not on a node with
      * layer ranges (tp8 S3: the tower is the leader's, and its rows' Engram masks are another node's layers). */
     m.media = Ds41Vision::present(meta) && ctx->max_enc_patches > 0 && !m.lr.on;
@@ -6648,6 +6722,59 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             *hi = std::max(*hi, s.r0 + s.n);
         }
     };
+    /* tp8 loop P15 (RADIANCE_DS41_PIPE2_TBO, m.pipe2_tbo): `fn` over the rows [r0, r0 + n) of the layer's one prefill
+     * segment only -- `cur` / `runs` name that piece while fn issues (the rows() / whole() / dense() above then launch over
+     * it as they launch over the segment), then the layer's own again */
+    static thread_local std::vector<BiSeg> tbo_sg;
+    const auto with_rows = [&](int64_t r0, int64_t n, const auto& fn) {
+        const std::vector<BiSeg>* keep = cur;
+        BiSeg s = cur->empty() ? BiSeg{} : cur->front();
+        s.r0 = r0;
+        s.n = n;
+        tbo_sg.assign(1, s);
+        cur = &tbo_sg;
+        set_runs();
+        fn();
+        cur = keep;
+        set_runs();
+    };
+    /* P15: layer N's post / collapse / norm (+ its attention mix: lever M1) over the rows `cur` names -- the end-of-layer
+     * issue below for the next layer (nx->pcn_a), as one function so bit 2 issues it over piece 0 there and piece 1 at N */
+    const auto pcn_next = [&](const Layer& N, bool clear) {
+        const int64_t fmin = N.pcn_mix ? mhc_fuse_min() : 0;
+        if (clear) {
+            t_mhc_a.clear();
+            t_mhc_a_l = N.l;
+        }
+        rows(kBiNorm, [&](int64_t r0, int64_t n) {
+            if (fmin > 0 && n >= fmin) {
+                RAD_ISSUE_N(x, N.pcn_mix, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                            R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(N.attn_norm), R(m.xn, r0, n),
+                            RAD_W(N.hc_a_fn), RAD_W(N.hc_a_scale), RAD_W(N.hc_a_base), R(m.pre_a, r0, n));
+                t_mhc_a.push_back({ r0, n });
+                mhc_note(x, n);
+                return;
+            }
+            if (fmin > 0 && rad_rank(x) == 0) g_mhc_small.fetch_add(1, std::memory_order_relaxed);
+            RAD_ISSUE_N(x, N.pcn_a, n, R(m.act.x, r0, n), R(m.h1, r0, n), R(m.post, r0, n), R(m.comb, r0, n),
+                        R(m.h0, r0, n), R(m.pre_f, r0, n), R(m.xcol, r0, n), RAD_W(N.attn_norm), R(m.xn, r0, n));
+        });
+    };
+    /* P15 bit 2: finish a deferral the layer it named cannot take in its order (a core / plan surprise; never by design):
+     * lane 0 behind piece 1's MoE all-reduce, then that layer's pcn over piece 1 -- every row's bytes as ever, the overlap
+     * lost; counted and said once */
+    t_tbo = TboDefer{};
+    const auto tbo_flush = [&] {
+        if (t_tbo.l < 0) return;
+        const TboDefer d = t_tbo;
+        t_tbo.l = -1;
+        rad_lane_join(x, 1, 0);
+        with_rows(d.p0 + d.pa, d.pn - d.pa, [&] { pcn_next(m.layers[(size_t)d.l], false); });
+        if (rad_rank(x) == 0 && g_tbo_flush.fetch_add(1, std::memory_order_relaxed) == 0)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_PIPE2_TBO (tp8 loop P15): VIRHE step %d: layer %d could not "
+                            "take its piece-0 start in order -- finished at once (the same bytes, no overlap); counted in the "
+                            "P13 stats line\n", batch->step, d.l);
+    };
     for (auto& L : m.layers) {
         /* tp8 S3 / S6: another node's layer issues nothing, but its cut is computed below (the rows a crossing at the
          * next held layer carries are the previous layer's) */
@@ -6781,6 +6908,21 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             RAD_ISSUE_N(x, L.ar_attn_ov, pa * D, R(m.attn_out, p0, pa), RAD_NONE);
             rad_lane(x, 0);
         };
+        /* tp8 loop P13's MoE cut of this layer (the MoE section below decides it the same way; 0 = the MoE runs whole) */
+        const auto moe_pc = [&]() -> int64_t {
+            if (!p2_layer) return 0;
+            const int64_t q = (pn / 2 + kPipe2Align - 1) / kPipe2Align * kPipe2Align;
+            const MoeFP8& mo = L.moe;
+            if (q < kPipe2Piece || pn - q < kPipe2Piece || mo.c.calib || mo.op_moe_ar || mo.op_shared_ar || mo.op_combine ||
+                mo.op_add || !mo.op_ar_ov || !mo.issues_ar(T, pn) || !mo.issues_ar(T, q) || !mo.issues_ar(T, pn - q))
+                return 0;
+            return q;
+        };
+        /* tp8 loop P15 bit 1 (RADIANCE_DS41_PIPE2_TBO): this layer's attention + MoE pieces are the same rows ([p0, p0 + pa),
+         * the rest), so piece 1's attention all-reduce can go beside MoE pass 0; decided from the batch and the declare */
+        const bool tbo_a = (m.pipe2_tbo & 1) && !(m.pipe2_tbo & 4) && pa > 0 && L.pcn_f && !m.bt.on && moe_pc() == pa;
+        /* P15 bit 2: a deferral for another layer, or one this layer cannot take in its order (never by design) */
+        if (t_tbo.l >= 0 && (t_tbo.l != l || cut || !p2_layer || p0 != t_tbo.p0 || pn != t_tbo.pn)) tbo_flush();
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
             /* lever E1: the lookup, copy and GEMM over the unique id rows of the launches below that are wider than the
@@ -6890,7 +7032,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 else
                     kvn(s.r0, s.n);
             };
-            if (cheap) {   /* C: op by op across the segments; the never-flipping per-row ops once over the step */
+            /* C: op by op across the segments; the never-flipping per-row ops once over the step (over `cur` / `runs`: P15
+             * issues it over one piece at a time) */
+            const auto a1_cheap = [&] {
                 /* lever WMK (dense(), ds41_wmk 1): the dense GGUF linears once over a mixed run; off: by segment, as before */
                 const bool qkv_gg = gguf_dense(m, L.wq_a) && gguf_dense(m, L.wkv);
                 dense(qkv_gg, true, [&](int64_t r0, int64_t n) {   /* lever 1U-GQ: q_a + kv_g as one launch where the switch takes them */
@@ -6915,7 +7059,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         RAD_ISSUE_N(x, L.q_an, n, R(m.qr, r0, n), RAD_W(L.q_norm), R(m.qrn, r0, n));
                     });
                 if (kvfold || L.kv_f)
-                    for (const BiSeg& s : sg) kvn_seg(s);
+                    for (const BiSeg& s : *cur) kvn_seg(s);   /* = the layer's segments (sg), or P15's piece */
                 else
                     whole([&](int64_t r0, int64_t n) {
                         RAD_ISSUE_N(x, L.kv_n, n, R(m.kv, r0, n), RAD_W(L.kv_norm), R(m.kvn, r0, n));
@@ -6946,6 +7090,24 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                         P(wb->slot_mapping, r0, n), kv_cache(m.win, l));
                     }
                 });
+            };
+            if (cheap && t_tbo.l == l) {
+                /* tp8 loop P15 bit 2: the previous layer issued this layer's pcn over piece 0 beside its piece-1 MoE
+                 * all-reduce (lane 1, in flight): piece 0's attention inputs beside it too, then lane 0 behind it, this
+                 * layer's pcn over piece 1 and piece 1's inputs; the compressor chain, the indexer and the attention
+                 * below over the step as ever */
+                const TboDefer d = t_tbo;
+                t_tbo.l = -1;
+                with_rows(d.p0, d.pa, a1_cheap);
+                rad_lane_join(x, 1, 0);
+                with_rows(d.p0 + d.pa, d.pn - d.pa, [&] { pcn_next(L, false); });
+                with_rows(d.p0 + d.pa, d.pn - d.pa, a1_cheap);
+                if (rad_rank(x) == 0) g_tbo_xl.fetch_add(1, std::memory_order_relaxed);
+            } else if (cheap) {
+                tbo_flush();   /* (nothing pending: a no-op) */
+                a1_cheap();
+            } else {
+                tbo_flush();
             }
             for (const BiSeg& s : sg) {
                 if (cheap) break;
@@ -7200,7 +7362,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         /* the attention's all-reduce over the step (exact: 0 + r0 + .. + r3 a value), then post / collapse / norm (a
          * fused norm) by segment; ar_pcn_f (the all-reduce with it, RADIANCE_DS41_AR_PCN) is not taken under ds41_bi */
-        if (L.ar_attn && pa > 0) {
+        if (L.ar_attn && pa > 0 && tbo_a) {
+            /* tp8 loop P15 bit 1: lane 0 behind piece 0's all-reduce (lane 1) for piece 0's pcn below; piece 1's
+             * all-reduce goes to lane 1 in the MoE section, beside MoE pass 0 (no attention-zero rank under P15) */
+            rad_lane_join(x, 1, 0);
+            if (rad_rank(x) == 0) {
+                g_pipe2_attn.fetch_add(1, std::memory_order_relaxed);
+                g_tbo_attn.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (L.ar_attn && pa > 0) {
             /* tp8 loop P13b: an attention-zero rank (its attn_out zeros, no projection) issues piece 0's all-reduce here,
              * so every rank issues the same collectives in the same order; lane 0 behind lane 1, piece 1's */
             if (m.zero) ar_a_piece0();
@@ -7210,6 +7380,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         } else if (L.ar_attn)
             whole([&](int64_t r0, int64_t n) { RAD_ISSUE_N(x, L.ar_attn, n * D, R(m.attn_out, r0, n), RAD_NONE); });
         t_mhc_f.clear();
+        /* post / collapse / norm (+ the ffn mix: lever M1) over the rows `cur` names (P15 bit 1: one piece at a time) */
+        const auto pcn_f_issue = [&] {
         if (L.pcn_f) {
             /* lever M1: a launch of >= mhc_fuse_min() rows as pcn_f + mix_f in one op (its rows' mix_f then not issued) */
             const int64_t fmin = L.pcn_mix_f ? mhc_fuse_min() : 0;
@@ -7244,6 +7416,9 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 RAD_ISSUE_N(x, L.norm_f, n, R(m.xcol, r0, n), RAD_W(L.ffn_norm), R(m.act.x, r0, n));
             });
         }
+        };
+        if (tbo_a) with_rows(p0, pa, pcn_f_issue);   /* P15 bit 1: piece 0 now, piece 1 after MoE pass 0 (below) */
+        else pcn_f_issue();
         bt_pt(x, m, m.h1, T, "h1", l);
         bt_pt(x, m, m.act.x, T, "ffn_in", l);
         /* the MoE: one pass a segment (the router, the experts at the segment's rows, the shared arm, the gather and
@@ -7254,13 +7429,18 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         bs.arg = &mb;
         /* lever PSK: a cut layer's ffn mix over its runs, here (the block issues a beside only in a pass from row 0) */
         const MoeFP8::Beside* bsp = &bs;
-        if (cut) {
+        const auto mix_f_rest = [&] {
             whole([&](int64_t r0w, int64_t nw) {
                 mhc_rest(t_mhc_f, r0w, nw, [&](int64_t r0, int64_t n) {   /* lever M1: the rows not mixed in pcn_f */
                     RAD_ISSUE_N(x, L.mix_f, n, R(m.h1, r0, n), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
                                 R(m.pre_f, r0, n), R(m.post, r0, n), R(m.comb, r0, n));
                 });
             });
+        };
+        if (tbo_a) {
+            bsp = nullptr;   /* P15 bit 1: the ffn mix's rest after piece 1's pcn (MoE section), cut or not */
+        } else if (cut) {
+            mix_f_rest();
             bsp = nullptr;
         }
         /* tp8 loop P13 (RADIANCE_DS41_PIPE2, pipe2_env): an uncut layer of a lone prefill pass of >= m.pipe2 rows -- the
@@ -7281,6 +7461,42 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (pc > 0) {
             const int64_t n1 = pn - pc, q1 = p0 + pc;
             const bool pr0 = L.moe.route_splits(pc), pr1 = L.moe.route_splits(n1);
+            if (m.pipe2_tbo & 4) {
+                /* tp8 loop P16 (RADIANCE_DS41_PIPE2_TBO bit 4): the MoE pass whole -- the ops the published pass issues
+                 * (router, experts, shared arm on its lane, gather, the ffn mix beside), without its all-reduce -- then
+                 * the all-reduce over [p0, q1) here on lane 0 and over [q1, p0 + pn) below (lane 1 with bit 2) */
+                L.moe.pass(x, T, p0, pn, false, bsp);
+                L.moe.issue_ar(x, p0, pc, false);
+                if (rad_rank(x) == 0) g_tbo_whole.fetch_add(1, std::memory_order_relaxed);
+            } else if (tbo_a && pc == pa) {
+                /* tp8 loop P15 bit 1: piece 0's router (projection + all_gather; lane 1 idle: piece 0's attention
+                 * all-reduce was joined above), then lane 1 behind lane 0 (piece 1's o_b rows and the gather) and piece
+                 * 1's attention all-reduce there, BESIDE MoE pass 0 (no collective inside: projected, own_ar false); lane
+                 * 0 behind it for piece 1's pcn, the ffn mix's rest and piece 1's router; then P13a's order: piece 0's
+                 * MoE all-reduce on lane 1 beside MoE pass 1, lane 0 behind it */
+                if (pr0) {
+                    L.moe.route_part(x, p0, pc);
+                    L.moe.route_gather(x, p0, pc);
+                }
+                rad_lane_join(x, 0, 1);
+                rad_lane(x, 1);
+                RAD_ISSUE_N(x, L.ar_attn_ov, n1 * D, R(m.attn_out, q1, n1), RAD_NONE);
+                rad_lane(x, 0);
+                L.moe.pass(x, T, p0, pc, false, nullptr, false, pr0, true);
+                rad_lane_join(x, 1, 0);
+                with_rows(q1, n1, pcn_f_issue);
+                mix_f_rest();
+                if (pr1) {
+                    L.moe.route_part(x, q1, n1);
+                    L.moe.route_gather(x, q1, n1);
+                }
+                rad_lane_join(x, 0, 1);   /* lane 1 behind everything lane 0 issued: pass 0's gather wrote rows [p0, q1) */
+                rad_lane(x, 1);
+                L.moe.issue_ar(x, p0, pc, true);   /* the overlap instance, beside pass 1 */
+                rad_lane(x, 0);
+                L.moe.pass(x, T, q1, n1, false, nullptr, false, pr1, true);
+                rad_lane_join(x, 1, 0);   /* lane 0 behind piece 0's all-reduce (and a lane-1 shared arm) */
+            } else {
             if (pr0) {
                 L.moe.route_part(x, p0, pc);
                 L.moe.route_gather(x, p0, pc);
@@ -7296,7 +7512,26 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             rad_lane(x, 0);
             L.moe.pass(x, T, q1, n1, false, nullptr, false, pr1, true);
             rad_lane_join(x, 1, 0);   /* lane 0 behind piece 0's all-reduce (and a lane-1 shared arm) */
-            L.moe.issue_ar(x, q1, n1, false);
+            }
+            /* piece 1's MoE all-reduce: tp8 loop P15 bit 2 -- on lane 1 beside the next layer's piece-0 pcn and attention
+             * inputs, where that layer is the adjacent uncut one this node issues in this pass with nothing between (no
+             * crossing, no receive, no Engram block / tap, its pcn fused) and the attention inputs take the per-segment
+             * (cheap) form; else on lane 0 here (P13a) */
+            const Layer* tnx = next_layer(m, L.l);
+            const bool nx_cut = psk && (L.l + 1 >= m.psk_first || (l20_on && L.l + 1 == m.psk_l20 && !cr_all) || cr_any);
+            const bool tbo_x = (m.pipe2_tbo & 2) && !cut && !m.bt.on && p0 == 0 && pn == T &&
+                               bi_cheap(g_sw_bi.load(std::memory_order_relaxed)) && pp_send_after(m, L.l) < 0 && tnx &&
+                               tnx->l == L.l + 1 && pp_part_layer(m, part, tnx->l) && pp_recv_at(m, tnx->l) < 0 &&
+                               tnx->pcn_a && tnx->pcn_mix && !tnx->e_ids && !tnx->tap && !nx_cut && !m.media;
+            if (tbo_x) {
+                rad_lane_join(x, 0, 1);   /* lane 1 behind pass 1's gather (rows [q1, p0 + pn)) */
+                rad_lane(x, 1);
+                L.moe.issue_ar(x, q1, n1, true);   /* the overlap instance, beside the next layer's piece 0 */
+                rad_lane(x, 0);
+                t_tbo = TboDefer{ tnx->l, p0, pc, pn };
+            } else {
+                L.moe.issue_ar(x, q1, n1, false);
+            }
             if (l == 0) g_bi_moe.fetch_add(2, std::memory_order_relaxed);
             if (rad_rank(x) == 0) {
                 static thread_local int t_p2_step = -1;
@@ -7310,10 +7545,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                         "their uncut layers' MoE in two pieces with piece 0's all-reduce on the second lane "
                                         "(%lld layer-passes, %lld rows; this one %lld rows as %lld + %lld from layer %d); "
                                         "%lld layer-passes of lone prefills ran whole (a piece below %lld rows or a reducing "
-                                        "block); attention all-reduces in the pieces (RADIANCE_DS41_PIPE2_ATTN) %lld\n",
+                                        "block); attention all-reduces in the pieces (RADIANCE_DS41_PIPE2_ATTN) %lld; "
+                                        "RADIANCE_DS41_PIPE2_TBO (P15): piece 1's attention all-reduce beside MoE pass 0 %lld, "
+                                        "piece 1's MoE all-reduce beside the next layer's piece 0 %lld, finished at once %lld; of the layer-passes "
+                                        "above, the MoE ran WHOLE with its all-reduce in two halves (bit 4) %lld\n",
                                 n, g_pipe2_layers.load(std::memory_order_relaxed), g_pipe2_rows.load(std::memory_order_relaxed),
                                 (long long)pn, (long long)pc, (long long)n1, l, g_pipe2_serial.load(std::memory_order_relaxed),
-                                (long long)kPipe2Piece, g_pipe2_attn.load(std::memory_order_relaxed));
+                                (long long)kPipe2Piece, g_pipe2_attn.load(std::memory_order_relaxed),
+                                g_tbo_attn.load(std::memory_order_relaxed), g_tbo_xl.load(std::memory_order_relaxed),
+                                g_tbo_flush.load(std::memory_order_relaxed), g_tbo_whole.load(std::memory_order_relaxed));
                 }
             }
         } else
@@ -7417,7 +7657,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         }
         /* post_f, or post_f with the next collapse + norm (a fused norm, by segment); never the AR_PCN forms here */
         const Layer* nx = next_layer(m, L.l);   /* tp8 S3: the next layer this node holds (a gap passes the streams on) */
-        if (nx && nx->pcn_a) {
+        if (nx && t_tbo.l >= 0 && t_tbo.l == nx->l) {
+            /* tp8 loop P15 bit 2 (set in the MoE section above): the next layer's pcn over piece 0 only, beside piece 1's
+             * MoE all-reduce on lane 1; that layer issues piece 1's after joining it */
+            const TboDefer d = t_tbo;
+            with_rows(d.p0, d.pa, [&] { pcn_next(*nx, true); });
+        } else if (nx && nx->pcn_a) {
             /* lever M1: a launch of >= mhc_fuse_min() rows as pcn_a + the next layer's mix_a in one op */
             const int64_t fmin = nx->pcn_mix ? mhc_fuse_min() : 0;
             t_mhc_a.clear();
@@ -7447,6 +7692,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                             R(m.h0, r0, n));
             });
     }
+    tbo_flush();   /* tp8 loop P15: nothing pending after the last layer by design (a deferral names an adjacent layer) */
     if (psk && cur != &sg && rad_rank(x) == 0) {   /* lever PSK: a cut step (stats; the first one's cut rows) */
         g_psk_cut_passes.fetch_add(1, std::memory_order_relaxed);
         const long long n = g_psk_steps.fetch_add(1, std::memory_order_relaxed) + 1;
