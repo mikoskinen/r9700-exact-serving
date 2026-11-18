@@ -38628,8 +38628,9 @@ static void usage(void) {
                 "             run it under libr4d/isa/trace.sh for its launches.\n"
                 "  --mxcheck / --bfcheck:  ds41-drk: the drafter's MXFP4 grouped GEMM (drafter_mx) / bf16\n"
                 "             skinny GEMM (drafter_bf) forms vs the stock kernels, byte for byte.\n"
-                "  --perfmx [tokens] [iters] / --perfbf [Ms] [iters]:  their timing at the drafter's shapes.\n"
-                "  --mx-routing FILE:  --perfmx replays an R4D_MXDUMP capture (up to 8 records a token count; any token\n"
+                "  --perfdmx [tokens] [iters] / --perfbf [Ms] [iters]:  their timing at the drafter's shapes\n"
+                "             (--perfmx is this form too after --mx-routing, bare, or with a token list a,b,...).\n"
+                "  --mx-routing FILE:  --perfdmx replays an R4D_MXDUMP capture (up to 8 records a token count; any token\n"
                 "             count, the stock row alone above 48) instead of its own draw (tp8 DECODE D17)\n"
                 "  --bicheck [classes] [Ms]:  lever BI: per op, a row alone (M = 1) vs the same row inside\n"
                 "             an M-row launch, byte for byte, DeepSeek-V4.1's TP4 shapes (classes gg,f32,bf16,\n"
@@ -38826,6 +38827,12 @@ int main(int argc, char** argv) {
     int mf_it = 200;
     long long kda_m = 0, proj_m = 0;
     int kda_it = 50, proj_it = 100;
+    /* `--perfmx` names two benches: GLM's MXFP4 expert GEMM (--perfmx M ...) and ds41-drk's drafter form (--perfmx [tokens]
+     * [iters]); GLM's branch came first and took every --perfmx (tp8 loop FINDINGS F50: D17's bench ran GLM's). The drafter's
+     * form is --perfdmx, or --perfmx after --mx-routing, with no argument, or with a token LIST (a comma). */
+    auto drk_mx_form = [&](int i) {
+        return g_mx_routing != nullptr || i + 1 >= argc || argv[i + 1][0] == 0x2d || std::strchr(argv[i + 1], ',') != nullptr;
+    };
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--real")) {
             if (i + 5 >= argc) { usage(); return 2; }
@@ -39037,7 +39044,7 @@ int main(int argc, char** argv) {
             (kda ? kda_m : proj_m) = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d)
                 (kda ? kda_it : proj_it) = (int)std::strtol(argv[++i], nullptr, 0);
-        } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfmxf8")) {
+        } else if ((!std::strcmp(argv[i], "--perfmx") && !drk_mx_form(i)) || !std::strcmp(argv[i], "--perfmxf8")) {
             mx_f8 = !std::strcmp(argv[i], "--perfmxf8");
             /* An expert GEMM at GLM's TP8 slices over an M-token chunk: MXFP4, or with
              * --perfmxf8 the FP8 experts with f32 block scales. */
@@ -39051,8 +39058,8 @@ int main(int argc, char** argv) {
             mxc = true;   /* drafter_mx's forms vs the stock MXFP4 grouped GEMM (ds_mx_check) */
         } else if (!std::strcmp(argv[i], "--bfcheck")) {
             bfc = true;   /* drafter_bf's form vs the stock skinny bf16 GEMM (ds_bf_check) */
-        } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfbf")) {
-            (argv[i][6] == 'm' ? mxp : bfp) = true;
+        } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfdmx") || !std::strcmp(argv[i], "--perfbf")) {
+            (std::strcmp(argv[i], "--perfbf") ? mxp : bfp) = true;
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) drk_l = argv[++i];
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) drk_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--bicheck")) {
