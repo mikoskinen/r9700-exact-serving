@@ -472,4 +472,86 @@ TEST(layers_m4_segment_boundaries_keep_what_x2_ships) {
     CHECK(segment_crossing(g, 10, 32, 32, &c, &err) < 0);
 }
 
+/* tp8 dev M9: a leader segment boundary s of W(h, t) -- in its head (0 < s < h) or its tail (t < s <= the first tap) -- saves
+ * what the part's layers from s read below s (the residual, the selections, the keep words; no kv source: the leader's caches
+ * and copies) and, in the head, what X1 ships that a layer below s computed (its source's entries, its selections / keep
+ * words). The card cut first (W(10,32): head boundaries 1 .. 9, tail 33 .. 37), then every cut and boundary against the plane
+ * rule; a tail boundary past the first tap and boundaries outside the parts are refused. */
+TEST(layers_m9_lead_segment_boundaries_keep_what_the_part_reads) {
+    const Geo g = flash1017();
+    for (int s = 1; s < 10; ++s) {
+        Crossing c;
+        std::string err;
+        CHECK_EQ(lead_segment_crossing(g, 10, s, 32, &c, &err), 0);
+        CHECK(c.residual);
+        CHECK_EQ(c.src, s > 8 ? 8 : -1);           /* X1 ships source 8's latent: saved past layer 8 */
+        CHECK_EQ(c.latent, s > 8);
+        CHECK(!c.index);
+        CHECK_EQ(c.sel, s >= 3 && s <= 7 ? 2 : s == 9 ? 8 : -1);   /* layers s..7 read index 2's; 9 reads 8's (X1's too) */
+        CHECK_EQ(c.keep, -1);
+    }
+    for (int s = 33; s <= 37; ++s) {
+        Crossing c;
+        std::string err;
+        CHECK_EQ(lead_segment_crossing(g, 10, s, 32, &c, &err), 0);
+        CHECK(c.residual);
+        CHECK_EQ(c.src, -1);
+        CHECK_EQ(c.sel, s <= 35 ? 32 : s == 37 ? 36 : -1);   /* 33..35 read index 32's, 37..39 index 36's */
+        CHECK_EQ(c.keep, s <= 36 ? 20 : -1);               /* index layer 36 reads candidate 20's keep words (X2's) */
+    }
+    int pairs = 0, x1_src = 0, x1_sel = 0;
+    for (int t = 2; t <= 37; ++t)
+        for (int h = 0; h < t; ++h) {
+            Crossing whole[2];
+            std::string err;
+            REQUIRE(crossings(g, h, t, whole, &err) == 0);
+            const Crossing& x1 = whole[0];
+            std::vector<int> bs;
+            for (int s = 1; s < h; ++s) bs.push_back(s);
+            for (int s = t + 1; s <= 37; ++s) bs.push_back(s);
+            for (int s : bs) {
+                const bool head = s < h;
+                Crossing c;
+                REQUIRE(lead_segment_crossing(g, h, s, t, &c, &err) == 0);
+                ++pairs;
+                CHECK(c.residual);
+                CHECK_EQ(c.at, s);
+                if (head && x1.src >= 0 && x1.src < s) {
+                    ++x1_src;
+                    CHECK_EQ(c.src, x1.src);
+                    CHECK_EQ(c.latent, x1.latent);
+                    CHECK_EQ(c.index, x1.index);
+                    for (int l = s; l < h; ++l) CHECK(!g.is_src[(size_t)l]);   /* the planes keep it from the save to X1 */
+                } else {
+                    CHECK_EQ(c.src, -1);
+                    CHECK(!c.latent && !c.index);
+                }
+                if (head && x1.sel >= 0 && x1.sel < s) { ++x1_sel; CHECK_EQ(c.sel, x1.sel); }
+                if (head && x1.keep >= 0 && x1.keep < s) CHECK_EQ(c.keep, x1.keep);
+                /* every read at or after s, inside the part, of a plane a layer below s wrote is saved -- and nothing else */
+                int want_sel = head && x1.sel >= 0 && x1.sel < s ? x1.sel : -1, want_keep = head && x1.keep >= 0 && x1.keep < s ? x1.keep : -1;
+                for (int l = s; l < (head ? h : 40); ++l) {
+                    if (g.ratio[(size_t)l] <= 0) continue;
+                    const int ix = g.idx_of[(size_t)l];
+                    if (!g.is_idx[(size_t)l] && ix >= 0 && ix < s) { CHECK_EQ(c.sel, ix); want_sel = ix; }
+                    if (g.is_idx[(size_t)l] && g.cand >= 0 && g.cand < s && g.cand < l && g.ratio[(size_t)g.cand] == g.ratio[(size_t)l]) {
+                        CHECK_EQ(c.keep, g.cand);
+                        want_keep = g.cand;
+                    }
+                }
+                CHECK_EQ(c.sel, want_sel);
+                CHECK_EQ(c.keep, want_keep);
+            }
+        }
+    std::fprintf(stderr, "  %d (cut, leader boundary) pairs: X1's source entries saved at %d, its selections at %d\n", pairs,
+                 x1_src, x1_sel);
+    CHECK(pairs > 0 && x1_src > 0 && x1_sel > 0);
+    Crossing c;
+    std::string err;
+    CHECK(lead_segment_crossing(g, 10, 38, 32, &c, &err) < 0);   /* past the first tap (37) */
+    CHECK(lead_segment_crossing(g, 10, 10, 32, &c, &err) < 0);   /* X1's own layer */
+    CHECK(lead_segment_crossing(g, 10, 20, 32, &c, &err) < 0);   /* the follower's */
+    CHECK(lead_segment_crossing(g, 10, 0, 32, &c, &err) < 0);
+}
+
 RAD_TEST_MAIN()

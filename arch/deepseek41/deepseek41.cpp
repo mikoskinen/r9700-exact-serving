@@ -734,6 +734,9 @@ struct Model {
     std::vector<rad_op> seg_send, seg_recv, seg_post;
     rad_buf seg_ring = 0;
     int64_t seg_ring_bytes = 0;
+    /* tp8 dev M9 (RADIANCE_PP_LEAD_SEG=k on the leader): seg_b / seg_cx are the leader's -- head boundaries in (0, h), tail
+     * ones in (t, n) (ds41layers::lead_segment_crossing) -- and a head / tail part with seg_l1 > 0 issues one segment */
+    bool seg_lead = false;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 /* The model whose name map is being declared (declare() on this thread). */
@@ -4367,6 +4370,36 @@ static int lr_settle(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
                 m.seg_cx.push_back(sc);
             }
         }
+        /* tp8 dev M9: the leader's boundaries -- every k-th layer of its head [0, h) and of its tail [t, n) (none past the
+         * first DSpark tap) the geometry allows; not beside lever AR_PCN (a MoE all-reduce left to the next layer's fused
+         * collapse would cross a boundary unreduced) */
+        if (const char* lk = std::getenv("RADIANCE_PP_LEAD_SEG"); lk && *lk && m.pp_rank == 0 && rad_pp_query().lanes > 1) {
+            const int k = std::atoi(lk);
+            if (k > 0 && ds41_ar_pcn_moe()) {
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_PP_LEAD_SEG=%d is not taken beside RADIANCE_DS41_AR_PCN=2 (tp8 dev "
+                                "M9)\n", k);
+            } else if (k > 0) {
+                const ds41layers::Geo geo = lr_geo(m);
+                int top = (int)m.c.n_layer - 1;
+                for (int tp : geo.taps) top = std::min(top, tp);
+                std::vector<int> xs;
+                for (int x = k; x < m.pp_h; x += k) xs.push_back(x);
+                for (int x = m.pp_t + k; x <= top; x += k) xs.push_back(x);
+                for (int x : xs) {
+                    if ((int)m.seg_b.size() >= RAD_PP_MAX_SEGS - 1) break;
+                    ds41layers::Crossing sc;
+                    std::string e2;
+                    if (ds41layers::lead_segment_crossing(geo, m.pp_h, x, m.pp_t, &sc, &e2) < 0) {
+                        fprintf(stderr, "radiance: deepseek41: RADIANCE_PP_LEAD_SEG=%d: no leader boundary at layer %d (%s)\n", k,
+                                x, e2.c_str());
+                        continue;
+                    }
+                    m.seg_b.push_back(x);
+                    m.seg_cx.push_back(sc);
+                }
+                m.seg_lead = !m.seg_b.empty();
+            }
+        }
         /* the candidate layer's keep words cross: it is this node's, and its indexer runs unsplit here (every rank then
          * holds every row's keep, so rank 0's crossing carries them all; the split is exact either way) */
         for (const ds41layers::Crossing& cx : m.pp_cx)
@@ -4697,6 +4730,12 @@ static void lr_note(RadBuilder* b, const Model& m, const RadBuildCtx* ctx) {
                 for (const CutPart& p : ds41_cut_liveset_cx(m, m.seg_cx[k])) ps += fmt_s("%s%s", ps.empty() ? "" : "+", p.name);
                 sb += fmt_s("%s%d (%s)", sb.empty() ? "" : ", ", (int)m.seg_b[k], ps.c_str());
             }
+            if (m.seg_lead)
+                std::snprintf(line, sizeof line,
+                              "two-node pipeline (tp8 dev M9, RADIANCE_PP_LEAD_SEG): a BG lane's leader head / tail parts may run in "
+                              "segments at layers %s, each boundary's live set saved and restored on this rank (a %lld-byte ring "
+                              "buffer a card)", sb.c_str(), (long long)m.seg_ring_bytes);
+            else
             std::snprintf(line, sizeof line,
                           "two-node pipeline (tp8 dev M4, RADIANCE_PP_SEG_LAYERS): the follower's passes may run in segments at "
                           "layers %s, each boundary's live set saved and restored on this rank (a %lld-byte ring buffer a card)",
@@ -6445,10 +6484,19 @@ static bool pp_seg_first(const Model& m) { return !t_seg || t_seg0 == m.pp_h; }
 /* tp8 dev D10 round 2: the follower at h > 0 under pp_ids issues its token-id ops after X1 at layer h (in the pass's first
  * segment; a later segment's prologue issues them as before: X1 is in its batch by then) */
 static bool pp_ids_late(const Model& m) { return m.pp && m.pp_ids && m.pp_rank == 1 && m.pp_h > 0 && pp_seg_first(m); }
+/* tp8 dev M9: a leader segment's boundary at its start / end: not the part's own ends (layer 0 / X1 at h; X2 at t / the
+ * final norm at n) */
+static bool pp_lead_bound(const Model& m, int s) {
+    return s > 0 && s != m.pp_h && s != m.pp_t && s < (int)m.c.n_layer;
+}
 static int pp_recv_at(const Model& m, int l) {
     if (!m.pp) return -1;
-    if (m.pp_rank == 0 && l == m.pp_t) return RAD_PP_X2;
+    if (m.pp_rank == 0 && l == m.pp_t && !(t_seg && t_seg0 != m.pp_t)) return RAD_PP_X2;   /* tp8 dev M9: a later tail segment restores */
     if (t_seg && m.pp_rank == 1 && l == t_seg0 && t_seg0 > m.pp_h) {   /* tp8 dev M4: a segment from boundary s */
+        const int k = seg_index(m, l);
+        return k >= 0 ? kSegRecv + k : -1;
+    }
+    if (t_seg && m.pp_rank == 0 && l == t_seg0 && pp_lead_bound(m, t_seg0)) {   /* tp8 dev M9: a leader segment from s */
         const int k = seg_index(m, l);
         return k >= 0 ? kSegRecv + k : -1;
     }
@@ -6459,6 +6507,10 @@ static int pp_recv_at(const Model& m, int l) {
 static int pp_send_after(const Model& m, int l) {
     if (!m.pp) return -1;
     if (t_seg && m.pp_rank == 1 && l == t_seg1 - 1 && t_seg1 < m.pp_t) {   /* tp8 dev M4: a segment to boundary s */
+        const int k = seg_index(m, t_seg1);
+        return k >= 0 ? kSegSend + k : -1;
+    }
+    if (t_seg && m.pp_rank == 0 && l == t_seg1 - 1 && pp_lead_bound(m, t_seg1)) {   /* tp8 dev M9: a leader segment to s */
         const int k = seg_index(m, t_seg1);
         return k >= 0 ? kSegSend + k : -1;
     }
@@ -6485,14 +6537,23 @@ static int pp_part(const Model& m) {
         t_seg1 = p.seg_l1;
         return RAD_PP_PART_SEG;
     }
+    /* tp8 dev M9: a leader head / tail segment [seg_l0, seg_l1) at the boundaries this node declared (RAD_PP_SEG_END: n) */
+    if ((p.part == RAD_PP_PART_HEAD || p.part == RAD_PP_PART_TAIL) && p.seg_l1 > 0 && m.seg_lead) {
+        t_seg = true;
+        t_seg0 = p.seg_l0;
+        t_seg1 = std::min<int>(p.seg_l1, (int)m.c.n_layer);
+    }
     return p.part;
 }
 /* ... and whether the part issues layer l (the head [0, h), the tail [t, n), a follower segment its layers; the whole pass
- * every held layer) */
+ * every held layer; tp8 dev M9: a leader segment its layers of its part) */
 static bool pp_part_layer(const Model& m, int part, int l) {
     if (part == RAD_PP_PART_SEG) return l >= t_seg0 && l < t_seg1;
+    if (t_seg && (part == RAD_PP_PART_HEAD || part == RAD_PP_PART_TAIL) && (l < t_seg0 || l >= t_seg1)) return false;
     return part == RAD_PP_PART_HEAD ? l < m.pp_h : part == RAD_PP_PART_TAIL ? l >= m.pp_t : true;
 }
+/* tp8 dev M9: whether this leader part issues the head's first layers (the lookup): not a head segment from a boundary */
+static bool pp_lead_first(const Model& m) { return !(t_seg && m.pp_rank == 0 && t_seg0 > 0); }
 /* The receive's boundary op where the layer has no fused pcn_a: X1 / X2's, or a segment boundary's (tp8 dev M4) */
 static rad_op pp_post_op(const Model& m, int ring) {
     return ring >= kSegRecv && ring < kSegSend ? m.seg_post[(size_t)(ring - kSegRecv)] : m.pp_post;
@@ -6677,7 +6738,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
      * lookup and its token_map read them; the leader sends it after its own lookup, under pp_fe too (the ids alone) */
     const bool x1_top = m.pp && m.pp_ids && m.pp_h == 0 && m.pp_rank == 1 && pp_seg_first(m);
     if (x1_top && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
-    if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
+    if (((!m.pp || m.pp_rank == 0) && run_head && pp_lead_first(m)) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
         RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
         m.mrows.step(x, batch, m.xcol, T);
         if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
@@ -7860,7 +7921,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * lookup and its token_map read them; the leader sends it after its own lookup, under pp_fe too (the ids alone) */
     const bool x1_top = m.pp && m.pp_ids && m.pp_h == 0 && m.pp_rank == 1 && pp_seg_first(m);
     if (x1_top && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
-    if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
+    if (((!m.pp || m.pp_rank == 0) && run_head && pp_lead_first(m)) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
     m.mrows.step(x, batch, m.xcol, T);
     if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
