@@ -7,7 +7,16 @@
  * passes arrives (its first decode step, the next prompt) and every event of it has completed -- the leader ships that frame
  * only after the prompt's last tail, which waited for this node's last X2, so by then the passes have run. Events come from a
  * pool (at most kCap) and are read with rad_event_query: nothing waits on them. One prompt at a time: two cold prompts whose
- * chunks interleave are read as one. */
+ * chunks interleave are read as one.
+ *
+ * tp8 loop P22b: a SPLIT lone prefill pass (a BG newcomer's body in layer segments, RADIANCE_PP_SEG_LAYERS, with other lanes'
+ * decode passes run between them) cannot be read that way -- one A / B pair around it holds those passes too, and a decode frame
+ * run between its segments (or the next BG lane's newcomer) closed the open prompt before its events were in (M lq151: '0 read,
+ * unread 126'). Such a pass gets its own record: events around EVERY segment (A_k before its release, B_k after its join: on
+ * the in-order stream B_k - A_k is segment k's card time, B_k .. A_k+1 the passes run between), its own lane's X1 ring counter
+ * (the receive is segment 0's first op; read once segment 0 has run and before the lane's next pass is out), and one line once
+ * every event has completed, in P22's form (kit p27read.py reads it: "passes" = the segments' own ms) with the segments, the
+ * passes between and the span; a summary line a minute and the run's at stop (rows, own ms, X1 wait a newcomer). */
 #pragma once
 
 #include "rad_internal.h"   /* RAD_INFO, fmt, rad_device.h */
@@ -40,10 +49,40 @@ struct PfFolTimeline {
     int64_t at = 0;                  /* the open prompt's rows so far: the next pass's context */
     int64_t dropped = 0, unread = 0, prompts = 0;
 
+    /* tp8 loop P22b: a split lone prefill pass's record */
+    struct SegRec {
+        int64_t rows = 0;
+        bool first = false;              /* at context 0 */
+        int lane = -1;
+        int32_t ahead = INT32_MIN;
+        std::vector<RadEvent> a, b;      /* around each segment */
+        RadPpRing* ring = nullptr;       /* its lane's X1 receive ring */
+        uint64_t w0 = 0, n0 = 0, w1 = 0, n1 = 0, tpms = 0;
+        bool x1 = false;                 /* w1 / n1 read */
+        int64_t between = 0, gen = 0;    /* passes run between its segments; its lane's pass count at its begin */
+        bool issued = false;
+    };
+    struct SegStat { double own, x1, s0, btw, span; int64_t rows, between; };
+    std::deque<SegRec> sq;
+    bool seg_open = false;               /* a split pass's segments are going out (a pass between them is not one) */
+    std::vector<int64_t> lane_gen;       /* passes begun a lane (P22's and P22b's) */
+    std::vector<SegStat> win, all;       /* read records: this minute's, the run's */
+    uint64_t win_t0 = 0;
+    int64_t seg_unread_ev = 0, seg_unread_x1 = 0;
+
     ~PfFolTimeline() {
         for (RadEvent e : pool) rad_event_destroy(e);
         for (Pass& p : ps) { if (p.a) rad_event_destroy(p.a); if (p.b) rad_event_destroy(p.b); }
         if (prev_b) rad_event_destroy(prev_b);
+        for (SegRec& r : sq) {
+            for (RadEvent e : r.a) if (e) rad_event_destroy(e);
+            for (RadEvent e : r.b) if (e) rad_event_destroy(e);
+        }
+    }
+    int64_t& gen_of(int lane) {
+        const size_t i = lane < 0 ? 0 : (size_t)lane;
+        if (lane_gen.size() <= i) lane_gen.resize(i + 1, 0);
+        return lane_gen[i];
     }
     void waits(uint64_t* ticks, uint64_t* n, uint64_t* tpms) const {
         *ticks = *n = *tpms = 0;
@@ -89,6 +128,130 @@ struct PfFolTimeline {
         p.ahead = ahead;
         p.a = mark();
         ps.push_back(p);
+        ++gen_of(lane);
+    }
+    /* tp8 loop P22b: a split lone prefill pass begins (rank 0's thread parked; its segments follow) */
+    void seg_begin(int64_t rows, bool first, int lane, int32_t ahead, RadPpRing* ring) {
+        SegRec r;
+        r.rows = rows;
+        r.first = first;
+        r.lane = lane;
+        r.ahead = ahead;
+        r.ring = ring;
+        if (ring) {
+            r.w0 = __atomic_load_n(&ring->wait_ticks, __ATOMIC_ACQUIRE);
+            r.n0 = __atomic_load_n(&ring->waits, __ATOMIC_ACQUIRE);
+        }
+        r.gen = ++gen_of(lane);
+        sq.push_back(std::move(r));
+        seg_open = true;
+    }
+    /* before segment k's release / after its join */
+    void seg_a() { if (seg_open && !sq.empty()) sq.back().a.push_back(mark()); }
+    void seg_b() { if (seg_open && !sq.empty()) sq.back().b.push_back(mark()); }
+    /* every segment is out: `between` other passes ran between them */
+    void seg_end(int64_t between) {
+        if (!seg_open || sq.empty()) return;
+        seg_open = false;
+        SegRec& r = sq.back();
+        r.issued = true;
+        r.between = between;
+        seg_x1(r);
+        seg_flush(false);
+    }
+    /* the lane's X1 counter once segment 0 (its receive) has run, and only while no later pass of the lane is out */
+    void seg_x1(SegRec& r) {
+        if (r.x1 || !r.ring || r.b.empty() || !r.b[0] || rad_event_query(r.b[0]) != 1 || gen_of(r.lane) != r.gen) return;
+        r.w1 = __atomic_load_n(&r.ring->wait_ticks, __ATOMIC_ACQUIRE);
+        r.n1 = __atomic_load_n(&r.ring->waits, __ATOMIC_ACQUIRE);
+        r.tpms = r.ring->wait_tpms;
+        r.x1 = true;
+    }
+    static double p50(std::vector<double> v) {
+        if (v.empty()) return -1.0;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    }
+    void seg_summary(const std::vector<SegStat>& v, const char* what) {
+        if (v.empty()) return;
+        std::vector<double> own, x1, s0, btw, span, rows, between;
+        double own_sum = 0, x1_sum = 0;
+        int64_t rsum = 0, nx1 = 0;
+        for (const SegStat& s : v) {
+            own.push_back(s.own); own_sum += s.own; s0.push_back(s.s0); btw.push_back(s.btw); span.push_back(s.span);
+            rows.push_back((double)s.rows); between.push_back((double)s.between); rsum += s.rows;
+            if (s.x1 >= 0) { x1.push_back(s.x1); x1_sum += s.x1; ++nx1; }
+        }
+        RAD_INFO("follower BG bodies (RADIANCE_PP_PF_TIMELINE=1, tp8 loop P22b) %s: %zu newcomers, %lld rows (p50 %.0f); rank 0's "
+                 "card a newcomer: its own segments p50 %.1f / mean %.1f ms (%.2f ms a 1k rows), of which waiting for X1 p50 %.1f / "
+                 "mean %.1f ms (%lld read), segment 0 p50 %.1f ms; other passes between its segments p50 %.0f, the card between "
+                 "them p50 %.1f ms; span p50 %.1f ms; events unread %lld, X1 unread %lld",
+                 what, v.size(), (long long)rsum, p50(rows), p50(own), own_sum / (double)v.size(),
+                 rsum > 0 ? own_sum * 1000.0 / (double)rsum : 0.0, p50(x1), nx1 ? x1_sum / (double)nx1 : -1.0, (long long)nx1,
+                 p50(s0), p50(between), p50(btw), p50(span), (long long)seg_unread_ev, (long long)seg_unread_x1);
+    }
+    /* read the completed split passes in issue order (`force`: now, whatever is unread -- the stop) */
+    void seg_flush(bool force) {
+        while (!sq.empty()) {
+            SegRec& r = sq.front();
+            if (!r.issued) break;
+            seg_x1(r);
+            RadEvent last = nullptr;
+            for (RadEvent e : r.b) if (e) last = e;
+            if (!force && last && rad_event_query(last) != 1) break;
+            auto ok = [](RadEvent e) { return e && rad_event_query(e) == 1; };
+            const size_t n = std::min(r.a.size(), r.b.size());
+            double own = 0, btw = 0, s0 = -1, span = -1;
+            int nread = 0;
+            float ms = 0.0f;
+            for (size_t k = 0; k < n; ++k) {
+                if (ok(r.a[k]) && ok(r.b[k]) && rad_event_elapsed_ms(r.a[k], r.b[k], &ms) == 0) {
+                    own += ms;
+                    ++nread;
+                    if (k == 0) s0 = ms;
+                } else {
+                    ++seg_unread_ev;
+                }
+                if (k + 1 < n && ok(r.b[k]) && ok(r.a[k + 1]) && rad_event_elapsed_ms(r.b[k], r.a[k + 1], &ms) == 0) btw += ms;
+            }
+            if (n > 0 && ok(r.a[0]) && ok(r.b[n - 1]) && rad_event_elapsed_ms(r.a[0], r.b[n - 1], &ms) == 0) span = ms;
+            double x1 = -1.0;
+            if (r.x1 && r.tpms) x1 = (double)(r.w1 - r.w0) / (double)r.tpms;
+            else ++seg_unread_x1;
+            ++prompts;
+            RAD_INFO("follower prefill timeline (RADIANCE_PP_PF_TIMELINE=1, tp8 loop P22b): prompt %lld, 1 passes, %lld rows (%s) in "
+                     "%zu segments, lane %d, ahead %s; rank 0's card: passes %.1f ms (%d read; %.2f ms a 1k rows) = its own segments, "
+                     "of which waiting for X1 %.1f ms (%lld receives on the rings) and segment 0 (the receive + its first layer) "
+                     "%.1f ms; %lld other passes ran between its segments, the card %.1f ms between them; span %.1f ms; events "
+                     "dropped %lld", (long long)prompts, (long long)r.rows, r.first ? "context 0" : "a resumed prompt", n, r.lane,
+                     r.ahead == INT32_MIN ? "-" : std::to_string(r.ahead).c_str(), own, nread,
+                     r.rows > 0 ? own * 1000.0 / (double)r.rows : 0.0, x1, r.x1 ? (long long)(r.n1 - r.n0) : -1LL, s0,
+                     (long long)r.between, btw, span, (long long)dropped);
+            if (nread == (int)n && n > 0) {
+                const SegStat s{ own, x1, s0, btw, span, r.rows, r.between };
+                if (win.empty()) win_t0 = rad_mono_ns();
+                win.push_back(s);
+                all.push_back(s);
+            }
+            for (RadEvent e : r.a) if (e) pool.push_back(e);
+            for (RadEvent e : r.b) if (e) pool.push_back(e);
+            sq.pop_front();
+        }
+        if (!win.empty() && rad_mono_ns() - win_t0 >= 60ull * 1000000000ull) {
+            seg_summary(win, fmt("in the last %.0f s", (double)(rad_mono_ns() - win_t0) / 1e9).c_str());
+            win.clear();
+        }
+    }
+    /* the run's end: whatever is open is read now, the minute's and the run's summaries */
+    void stop() {
+        close();
+        flush(true);
+        seg_open = false;
+        for (SegRec& r : sq) r.issued = true;
+        seg_flush(true);
+        if (!win.empty()) seg_summary(win, fmt("in the last %.0f s", (double)(rad_mono_ns() - win_t0) / 1e9).c_str());
+        win.clear();
+        seg_summary(all, "over the run");
     }
     /* after the pass's join */
     void end() {
@@ -104,6 +267,7 @@ struct PfFolTimeline {
     /* read the completed events in stream order; print the prompt once it is closing and every pass is read (`force`: now,
      * whatever is unread -- a new prompt or the stop) */
     void flush(bool force) {
+        seg_flush(false);   /* tp8 loop P22b: the split passes read on their own (never forced by a cold prompt) */
         while (next < ps.size()) {
             Pass& p = ps[next];
             if (!p.b || !p.a) { ++unread; ++next; continue; }

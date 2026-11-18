@@ -1797,6 +1797,97 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
     }
 }
 
+/* tp8 loop P22b (RADIANCE_PP_PF_TIMELINE=1 on the follower): a BG newcomer's body in one-layer segments with decode passes
+ * between them is read on its own record -- one line a newcomer, every segment read ("(S read;" = its segments), its own
+ * lane's X1 wait read, the passes between its segments counted -- and the follower prints the run's BG-body summary at stop
+ * with every newcomer of those lines; no split pass reaches P22's prompt lines (none of them unread). Tokens are one
+ * process's at 3 lanes BG 1 W(0,2) / W(1,3) and 4 lanes BG 2 at SEG_AHEAD 0 and 1. */
+TEST(the_follower_times_a_bg_newcomers_segments_on_its_own_line_and_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; const char* ahead; };
+    for (const Arm a : { Arm{ 3, "0,2", 1, "1" }, Arm{ 3, "1,3", 1, "0" }, Arm{ 4, "0,2", 2, "0" }, Arm{ 4, "1,3", 2, "1" } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        env.push_back(std::string("RADIANCE_PP_SEG_AHEAD=") + a.ahead);
+        for (const char* v : { "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16", "RADIANCE_PP_SEG_TEST_WAIT_MS=15",
+                               "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_PF_TIMELINE=1", "RADIANCE_PP_NODE_IDLE=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        CHECK_EQ(differ, 0);
+        /* the newcomers' own lines */
+        int lines = 0, whole = 0, x1_read = 0, between = 0, segs_min = 1 << 30;
+        double own_sum = 0;
+        for (size_t at = flog.find("tp8 loop P22b): prompt "); at != std::string::npos;
+             at = flog.find("tp8 loop P22b): prompt ", at + 1)) {
+            const std::string line = flog.substr(at, flog.find('\n', at) - at);
+            ++lines;
+            unsigned long segs = 0;
+            int nread = -1;
+            double own = -1, x1 = -2;
+            long long btw = -1;
+            if (const size_t s = line.find(" in "); s != std::string::npos) segs = std::strtoul(line.c_str() + s + 4, nullptr, 10);
+            if (const size_t c = line.find("rank 0's card: passes "); c != std::string::npos)
+                (void)std::sscanf(line.c_str() + c, "rank 0's card: passes %lf ms (%d read;", &own, &nread);
+            if (const size_t s = line.find("waiting for X1 "); s != std::string::npos) x1 = std::atof(line.c_str() + s + 15);
+            if (const size_t s = line.find("; ", line.find("segment 0 (")); s != std::string::npos) btw = std::atoll(line.c_str() + s + 2);
+            if (segs >= 2 && nread == (int)segs && own >= 0) ++whole;
+            if (x1 >= 0) ++x1_read;
+            if (btw > 0) ++between;
+            if ((int)segs < segs_min) segs_min = (int)segs;
+            own_sum += own;
+            if (lines == 1) fprintf(stderr, "    %s\n", line.c_str());
+        }
+        long long run_n = -1, x1_unread = -1;
+        if (const size_t at = flog.rfind("tp8 loop P22b) over the run: "); at != std::string::npos) {
+            run_n = std::atoll(flog.c_str() + at + std::strlen("tp8 loop P22b) over the run: "));
+            if (const size_t u = flog.find("X1 unread ", at); u != std::string::npos) x1_unread = std::atoll(flog.c_str() + u + 10);
+        }
+        /* P22's prompt lines (the decode lanes' lone passes): none unread now that no split pass is one of them */
+        int p22 = 0, p22_unread = 0;
+        for (size_t at = flog.find("tp8 loop P22): prompt "); at != std::string::npos; at = flog.find("tp8 loop P22): prompt ", at + 1)) {
+            const std::string line = flog.substr(at, flog.find('\n', at) - at);
+            ++p22;
+            if (line.find(", unread 0") == std::string::npos) ++p22_unread;
+        }
+        fprintf(stderr, "    %d lanes BG %d W(%s) SEG_AHEAD %s: %d of %zu requests differ; %d BG-body lines (%d with every segment "
+                        "read, >= %d segments, X1 read %d, passes between %d, own %.1f ms in all), run summary %lld newcomers, X1 "
+                        "unread %lld; P22 prompt lines %d (%d not all read)\n", a.lanes, a.k, a.cut, a.ahead, differ, ref.size(),
+                lines, whole, segs_min, x1_read, between, own_sum, run_n, x1_unread, p22, p22_unread);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(lines > 0);
+        CHECK_EQ(whole, lines);
+        CHECK_EQ(x1_read, lines);
+        CHECK(between > 0);          /* decode passes ran between some newcomer's segments */
+        CHECK_EQ(run_n, (long long)lines);
+        CHECK_EQ(x1_unread, 0LL);
+        CHECK_EQ(p22_unread, 0);
+    }
+}
+
 /* tp8 dev M9: RADIANCE_PP_LEAD_SEG=1 -- a BG lane's step runs its leader head [0, h) and tail [t, n) in one-layer segments with
  * the other lanes' parts between them, its frame shipped with the head's last segment. Every request's tokens are one process's
  * at 3 lanes (BG 1) and 4 lanes (BG 1 / BG 2), at cuts with a head boundary (W(2,3): 1), a tail boundary (W(1,2): 3; W(0,2): 3,
