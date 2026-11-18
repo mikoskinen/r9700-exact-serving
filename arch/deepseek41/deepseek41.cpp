@@ -1515,13 +1515,16 @@ static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 10
  * today's issue (a decode segment above the band in one attention launch and one indexer run). */
 static std::atomic<int> g_bi_dband{-1};   /* -1 unread, 0 off, 1 on (RADIANCE_DS41_BI_DBAND=1) */
 static std::atomic<long long> g_dband_steps{0}, g_dband_pieces{0}, g_dband_runs{0}, g_dband_sync{0}, g_dband_over{0};
+/* 2 = 1, and a pass whose decode sequences carry different row counts is recorded too, keyed by its pieces (rows and
+ * sequences of each: rad_arch_pass_key); at 1 such a pass is issued live (only the uniform layout records). */
+static std::atomic<long long> g_dband_live{0}, g_dband_keyed{0};
 static bool bi_dband_env() {
     int v = g_bi_dband.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_BI_DBAND");
-        const int w = e && e[0] == '1' && !e[1] ? 1 : 0;
+        const int w = e && (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
         if (e && !w && std::strcmp(e, "0"))
-            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_BI_DBAND=%s is not 1: the decode band pieces are not declared\n", e);
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_BI_DBAND=%s is not 1 or 2: the decode band pieces are not declared\n", e);
         int unread = -1;
         g_bi_dband.compare_exchange_strong(unread, w);
         v = g_bi_dband.load(std::memory_order_relaxed);
@@ -7455,9 +7458,14 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     if (m.bi_dsub && !psk_only && !sg.empty() && sg[0].dec && sg[0].n > kBiBand && sg[0].r0 == 0 && sg[0].s0 == 0) {
         const int64_t dn = sg[0].s1 - sg[0].s0, dt = sg[0].n, q = batch->max_q_len_decode;
         dst.clear();
-        if (q > 0 && dn * q == dt)
+        const bool uni = q > 0 && dn * q == dt;
+        const bool pos_ok = !uni && ds41_dec_starts(batch->positions_h, dt, dn, dst);
+        if (!uni && rad_rank(x) == 0)   /* rad_arch_pass_key's verdict on this layout: recorded by its pieces, or live */
+            (g_bi_dband.load(std::memory_order_relaxed) >= 2 && pos_ok ? g_dband_keyed : g_dband_live)
+                .fetch_add(1, std::memory_order_relaxed);
+        if (uni)
             for (int64_t s = 0; s < dn; ++s) dst.push_back(s * q);
-        else if (!ds41_dec_starts(batch->positions_h, dt, dn, dst)) {
+        else if (!pos_ok) {
             std::vector<int32_t> cuh((size_t)dn + 1);
             rad_memcpy_async(cuh.data(), batch->cu_seqlens, (dn + 1) * 4, rad_stream(x));
             rad_stream_sync(rad_stream(x));
@@ -7480,12 +7488,15 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const long long n = g_dband_steps.fetch_add(1, std::memory_order_relaxed) + 1;
             g_dband_pieces.fetch_add((long long)dap.size(), std::memory_order_relaxed);
             if (n == 1 || n % 4096 == 0)
-                fprintf(stderr, "radiance: deepseek41: tp8 loop F58 (RADIANCE_DS41_BI_DBAND=1): %lld decode segments above %lld "
+                fprintf(stderr, "radiance: deepseek41: tp8 loop F58 (RADIANCE_DS41_BI_DBAND=%d): %lld decode segments above %lld "
                                 "rows in band pieces (%lld pieces, %lld indexer runs a layer-op summed; %lld cu read-backs, %lld "
-                                "left whole); this one %lld rows of %lld sequences in %zu pieces\n",
-                        n, (long long)kBiBand, g_dband_pieces.load(std::memory_order_relaxed),
-                        g_dband_runs.load(std::memory_order_relaxed), g_dband_sync.load(std::memory_order_relaxed),
-                        g_dband_over.load(std::memory_order_relaxed), (long long)dt, (long long)dn, dap.size());
+                                "left whole; uneven layouts %lld issued live, %lld recorded by their pieces); this one %lld rows of "
+                                "%lld sequences in %zu pieces\n",
+                        g_bi_dband.load(std::memory_order_relaxed), n, (long long)kBiBand,
+                        g_dband_pieces.load(std::memory_order_relaxed), g_dband_runs.load(std::memory_order_relaxed),
+                        g_dband_sync.load(std::memory_order_relaxed), g_dband_over.load(std::memory_order_relaxed),
+                        g_dband_live.load(std::memory_order_relaxed), g_dband_keyed.load(std::memory_order_relaxed),
+                        (long long)dt, (long long)dn, dap.size());
         }
     }
     auto dcu = [&](size_t j) {
@@ -9586,6 +9597,7 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return rad::arch:
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_t* kv_used_max_h) {
     (void)c;
     (void)kv_used_max_h;
+    uint64_t geo = 1;   /* the pass's geometry beyond the core's key: a constant, or (tp8 loop F58) its band pieces */
     /* Lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is shaped by its targets, which no key holds: not
      * recorded */
     if (deepseek41::psk_hint(b)) return 0;
@@ -9598,9 +9610,18 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
         /* tp8 loop F58 (RADIANCE_DS41_BI_DBAND=1): a decode segment above the band issues its attention in pieces of whole
          * sequences, shaped by their row counts -- recorded only where every decode sequence has max_q_len_decode rows
          * (the key above holds that layout); any other layout is issued live */
-        if (deepseek41::g_bi_dband.load(std::memory_order_relaxed) > 0 && DT > deepseek41::kBiBand &&
-            (int64_t)b->max_q_len_decode * Dn != DT)
-            return 0;
+        const int dband = deepseek41::g_bi_dband.load(std::memory_order_relaxed);
+        if (dband > 0 && DT > deepseek41::kBiBand && (int64_t)b->max_q_len_decode * Dn != DT) {
+            /* RADIANCE_DS41_BI_DBAND=2: keyed by the pieces step_bi issues (the same host positions, the same packing);
+             * positions that do not give the layout (step_bi reads cu back) stay live */
+            if (dband < 2) return 0;
+            static thread_local std::vector<int64_t> st;
+            static thread_local std::vector<Ds41DecPiece> pc;
+            if (!ds41_dec_starts(b->positions_h, DT, Dn, st) || ds41_dec_pieces(st, DT, deepseek41::kBiBand, pc) != 0 ||
+                pc.empty())
+                return 0;
+            geo = ds41_dec_pieces_key(pc);
+        }
     }
     /* Lever PSK-DS (dspark_pfctx 1): a context pass cut to its entries' readable rows is shaped by their lengths, which
      * the key does not hold: not recorded. A pass it leaves whole issues as today and keys as today. */
@@ -9609,7 +9630,7 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
         int64_t kept = 0;
         if (deepseek41::pfctx_plan(b, deepseek41::g_pfctx_window.load(std::memory_order_relaxed), &ru, &kept)) return 0;
     }
-    return 1;
+    return geo;
 }
 
 /* Lever PSK design 2 (ds41-psk2): the core, at a step's release with every rank thread parked (Engine::psk_release), hands

@@ -182,6 +182,38 @@ TEST(dense_band_cuts_cover_the_run_within_the_band) {
         }
 }
 
+TEST(dband2_key_tells_every_piece_layout_apart) {
+    /* RADIANCE_DS41_BI_DBAND=2: uneven layouts recorded by their pieces. Over every layout of 16 sequences of 3 or 4 rows
+     * (2^16): the same pieces give the same key, different pieces different keys, never 0 */
+    std::vector<std::pair<uint64_t, std::vector<int64_t>>> seen;
+    std::vector<Ds41DecPiece> p;
+    int layouts = 0;
+    for (uint32_t bits = 0; bits < (1u << 16); ++bits) {
+        std::vector<int64_t> rows;
+        for (int s = 0; s < 16; ++s) rows.push_back(bits >> s & 1 ? 4 : 3);
+        const Layout L = layout(rows);
+        if (L.dt <= kBand) continue;
+        ++layouts;
+        ds41_dec_pieces(L.st, L.dt, kBand, p);
+        std::vector<int64_t> sig{ L.dt };
+        for (const Ds41DecPiece& q : p) { sig.push_back(q.r0); sig.push_back(q.s0); }
+        const uint64_t k = ds41_dec_pieces_key(p);
+        CHECK(k != 0);
+        bool dup = false;
+        for (const auto& e : seen)
+            if (e.second == sig) { dup = true; CHECK(e.first == k); break; }
+        if (!dup) seen.push_back({ k, sig });
+    }
+    CHECK(layouts > 60000);
+    /* distinct piece layouts at the same row count never share a key */
+    int clash = 0;
+    for (size_t i = 0; i < seen.size(); ++i)
+        for (size_t j = i + 1; j < seen.size(); ++j)
+            clash += seen[i].second[0] == seen[j].second[0] && seen[i].first == seen[j].first;
+    CHECK_EQ(clash, 0);
+    CHECK(seen.size() >= 10);
+}
+
 TEST(control_todays_issue_leaves_the_band_and_absolute_cu_misplaces_rows) {
     /* today: the attention once a segment, the indexer at irows (>= 96) -- one launch of 64 rows each */
     const Layout L = layout(std::vector<int64_t>(16, 4));

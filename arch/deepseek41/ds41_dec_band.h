@@ -95,4 +95,16 @@ inline int64_t ds41_band_cuts(int64_t n, int64_t band, std::vector<std::pair<int
     return (int64_t)out.size();
 }
 
+/* RADIANCE_DS41_BI_DBAND=2: a recorded pass's key for its pieces (rad_arch_pass_key) -- a function of each piece's first
+ * row and first sequence (with the core's key, which holds the step's rows and sequences, that is the whole issue the
+ * pieces shape); never 0 (0 = not recorded). */
+inline uint64_t ds41_dec_pieces_key(const std::vector<Ds41DecPiece>& pc) {
+    uint64_t h = 0xf58d0a7c3b1e2d4full;
+    for (const Ds41DecPiece& p : pc) {
+        h ^= (uint64_t)p.r0 + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h ^= (uint64_t)p.s0 * 0xbf58476d1ce4e5b9ull + (h << 6) + (h >> 2);
+    }
+    return h | 2;
+}
+
 #endif
