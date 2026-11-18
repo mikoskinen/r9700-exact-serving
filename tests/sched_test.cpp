@@ -12732,6 +12732,8 @@ struct Lanes {
     int win_g = -1;
     /* tp8 loop M2: the step budget, context and stager floor (the DS line's 4160 / 1024 for lever DST's cases) */
     int64_t max_tok = 64, max_ctx = 1024, stage_rows = 0, kv_blocks = 4096;
+    /* tp8 loop F22: --num-speculative-tokens (0: no drafter; with prog.drafter set before start(), a drafting deployment) */
+    int n_spec = 0;
     ~Lanes() { for (auto& s : more) s->fini(); s0.fini(); }
     Scheduler& at(int l) { return l == 0 ? s0 : *more[(size_t)(l - 1)]; }
     int start(int n, int64_t split_min = 16) {
@@ -12766,7 +12768,7 @@ struct Lanes {
         cfg.max_ctx = max_ctx;
         cfg.prefix_cache = false;
         cfg.prefill_room_gate = false;
-        cfg.n_spec = 0;
+        cfg.n_spec = n_spec;
         kv.setup(prog.kv_groups, cfg.max_ctx, kv_blocks, 64);
         if (win > 0) {
             kv.slide = true;
@@ -14088,6 +14090,111 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                     (long long)c.bg, (long long)c.bg_rows, bg_steps, home_mixed_with_p, short_steps ? "NO" : "yes", p_decoded);
         }
     }
+}
+
+/* tp8 loop F22 (cards lq46-m8B: M8's decode lanes drafted less; /stats rows_unspec 1,582 in the c16 window vs 0-16 elsewhere): a
+ * newcomer the BG lane runs WHOLE has its prompt's drafter context written there (the BG step's context pass mirrors every
+ * entry), but its home lane never ran a chunk of it, so before the fix the home's first block_begin found no drafter range and
+ * took draft_floor() = the prompt's end (hit_holes_draft_: no group of the drafter's is prefix-cached) -- the newcomer could
+ * not propose until it had decoded the drafter's window of tokens. Now the piece's commit (lane_piece_done) records the range
+ * as the home's own block_end would. The engine's order: plan, commit, then the drafter's block_begin over the plan just
+ * committed (on_card false: the host form), block_end. DS geometry (interval 2048, MNBT 4160, span 2), a block drafter of
+ * window 32, 8 decoders, an 1,100-token newcomer: one lane (the reference: it proposes from its prompt's step), BG at 3 lanes
+ * with the fix (from its first home decode step), and RADIANCE_PP_BG_DRAFT_FLOOR=0 (lq46's: not before ~window - 1 steps). */
+TEST(lanes_a_newcomer_the_bg_lane_ran_whole_drafts_from_its_first_home_decode_step) {
+    struct Env {
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_DRAFT_FLOOR"); }
+    } env;
+    const int W = 32;
+    struct Out { int prefill_offered = -1, first_decode_offer = -1, home_decodes = 0, bg_steps = 0; int64_t floors = 0; };
+    auto run = [&](int lanes, bool floor_on) -> Out {
+        Out o;
+        setenv("RADIANCE_PP_BG_LANE", "1", 1);
+        if (floor_on) unsetenv("RADIANCE_PP_BG_DRAFT_FLOOR"); else setenv("RADIANCE_PP_BG_DRAFT_FLOOR", "0", 1);
+        DstSwitches restore;
+        Lanes L;
+        L.grid = 2048;
+        L.cfg.prefill_span = 2;
+        L.max_tok = 4160;
+        L.max_ctx = 60000;
+        L.stage_rows = 1024;
+        L.seqs = 12;
+        L.n_spec = 7;
+        L.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        L.prog.drafter.window = W;
+        const int sr = L.start(lanes);
+        CHECK_EQ(sr, RAD_OK);
+        if (sr != RAD_OK) return o;
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        const int nd = lanes - L.set.bg_n();
+        for (int i = 0; i < 8; ++i) L.submit(i % nd, 100, 4000, 2000 + 100 * i);
+        uint64_t p = 0;
+        std::vector<int> fifo;
+        std::vector<char> busy((size_t)lanes, 0);
+        int next = 0;
+        Scheduler::BlockRow rows[12];
+        for (int round = 0; round < 3000; ++round) {
+            if (round == 4) p = L.submit(0, 1100, 4 * W);
+            const Request* rp = p ? L.req(0, p) : nullptr;
+            if (rp && (int)rp->output.size() >= 2 * W) break;
+            std::vector<int> todo;
+            for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+            for (size_t at = 0; at < todo.size(); ++at) {
+                const int l = todo[at];
+                if (busy[(size_t)l]) continue;
+                std::vector<int> order, idle_after;
+                for (int j = 1; j < lanes; ++j)
+                    if (!busy[(size_t)((l + j) % lanes)]) { order.push_back((l + j) % lanes); idle_after.push_back((l + j) % lanes); }
+                for (int f : fifo) order.push_back(f);
+                if (!L.plan(l, order)) continue;
+                busy[(size_t)l] = 1;
+                fifo.push_back(l);
+                next = (l + 1) % lanes;
+                todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+            }
+            if (fifo.empty()) break;
+            const int l = fifo.front();
+            fifo.erase(fifo.begin());
+            bool p_prefill = false, p_decode = false;
+            for (const StepEntry& e : L.at(l).plan().e)
+                if (p && e.seq == p) (e.is_prefill ? p_prefill : p_decode) = true;
+            if (L.set.is_bg(l)) ++o.bg_steps;
+            CHECK_OK(L.commit(l, 5));
+            busy[(size_t)l] = 0;
+            /* the drafter over the step just committed, in the lane that ran it */
+            const int n = L.at(l).block_begin(8, 7, W, 99, rows, 12, /*on_card=*/false);
+            bool offered = false;
+            for (int k = 0; k < n; ++k) offered |= p && rows[k].seq == p;
+            L.at(l).block_end();
+            if (p_prefill && l == 0) o.prefill_offered = offered ? 1 : 0;
+            if (p_decode && l == 0) {
+                if (offered && o.first_decode_offer < 0) o.first_decode_offer = o.home_decodes;
+                ++o.home_decodes;
+            }
+        }
+        o.floors = L.set.counts().bg_floor;
+        CHECK(p != 0 && L.req(0, p) && (int)L.req(0, p)->output.size() >= 2 * W);
+        return o;
+    };
+    const Out one = run(1, true), bg = run(3, true), old = run(3, false);
+    /* one lane: the newcomer's MIXED step is its home's, and its drafter proposes behind it */
+    CHECK_EQ(one.prefill_offered, 1);
+    CHECK_EQ(one.first_decode_offer, 0);
+    CHECK_EQ(one.floors, 0ll);
+    /* BG with the fix: the BG lane ran the prompt; the home offers a drafting row from its first decode step */
+    CHECK(bg.bg_steps > 0);
+    CHECK_EQ(bg.prefill_offered, -1);
+    CHECK_EQ(bg.first_decode_offer, 0);
+    CHECK_EQ(bg.floors, 1ll);
+    /* RADIANCE_PP_BG_DRAFT_FLOOR=0 (lq46): no drafting row until the window has slid past the prompt's end */
+    CHECK(old.bg_steps > 0);
+    CHECK_EQ(old.prefill_offered, -1);
+    CHECK(old.first_decode_offer >= W - 2);
+    CHECK_EQ(old.floors, 0ll);
+    fprintf(stderr, "    a newcomer of 1,100 tokens, drafter window %d: one lane offers it a drafting row at its prompt's step (%d) and "
+                    "home decode step %d; BG lane (fix on) at home decode step %d of %d (%lld range opened, %d BG steps); "
+                    "RADIANCE_PP_BG_DRAFT_FLOOR=0 at %d of %d\n", W, one.prefill_offered, one.first_decode_offer,
+            bg.first_decode_offer, bg.home_decodes, (long long)bg.floors, bg.bg_steps, old.first_decode_offer, old.home_decodes);
 }
 
 /* tp8 loop P6 (cards lq12: lent 2048-row chunks every ~282 ms, the two stages overlapping ~15 %): a chunk another lane lent

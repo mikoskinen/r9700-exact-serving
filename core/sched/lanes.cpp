@@ -50,6 +50,8 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     bg_ = bg_env();
     const char* bs = std::getenv("RADIANCE_PP_BG_SPLIT");
     bg_split_ = bs && !std::strcmp(bs, "1");
+    const char* bf = std::getenv("RADIANCE_PP_BG_DRAFT_FLOOR");
+    bg_floor_ = !(bf && !std::strcmp(bf, "0"));
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
@@ -766,6 +768,17 @@ void Scheduler::lane_piece_done(const StepEntry& e, int i, const StepResult& res
         return;
     }
     r.n_computed += e.n_tokens;
+    /* tp8 loop F22 (LaneSet::bg_draft_floor): the drafter's range as this lane's block_end records it for a chunk it ran --
+     * the borrower's context pass wrote the piece's drafter rows (the same rows one lane writes: lever PSK-DS's last
+     * window + 1 of the entry). Without it a newcomer lent whole has no range at its first block_begin here. */
+    if (lanes_ && lanes_->bg_draft_floor()) {
+        if (s.draft_hi == 0 && s.draft_lo == 0) {
+            s.draft_lo = draft_floor(s, e.ctx_len);
+            lanes_->note_bg_floor_locked();
+        }
+        const int64_t hi = (int64_t)e.ctx_len + e.n_tokens;
+        if (hi > s.draft_hi) s.draft_hi = hi;
+    }
     kv_->set_keep_floor(r.id, s.lent > 0 ? r.n_computed : -1);
     kv_->trim_window(r.id, r.n_computed);
     server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
