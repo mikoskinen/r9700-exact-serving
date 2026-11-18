@@ -22888,9 +22888,13 @@ static void ds_mx_check(const Plugin& pl) {
     struct P { int on, h, r, mt, wn, grid; };
     const P pins[] = { { -1, 0, 0, 0, 0, 0 }, { 1, 4, 1, 2, 0, 0 }, { 1, 4, 1, 4, 0, 0 }, { 1, 4, 1, 8, 0, 0 }, { 1, 4, 1, 16, 0, 0 },
                        { 1, 4, 2, 4, 0, 0 }, { 1, 4, 2, 8, 4, 0 }, { 1, 2, 1, 4, 0, 0 }, { 1, 2, 1, 8, 2, 7 }, { 1, 4, 1, 4, 1, 3 } };
+    /* DRAFTER track 18.11.2026: + the EX forms (h 1: each segment's chains over its own rows only) and the calls past 48
+     * tokens the forms now take (kXmMaxTokens 512: a 16-sequence lane's 80, 24 sequences' 120, ...) */
     const P spins[] = { { -1, 0, 0, 0, 0, 0 }, { 1, 0, 1, 2, 0, 0 }, { 1, 0, 1, 4, 0, 0 }, { 1, 0, 1, 8, 0, 0 }, { 1, 0, 2, 2, 0, 0 },
-                        { 1, 0, 2, 4, 8, 0 }, { 1, 0, 2, 8, 0, 0 }, { 1, 0, 1, 4, 1, 5 } };
-    const int64_t toks[] = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 17, 20, 24, 25, 30, 32, 40, 45, 48 };
+                        { 1, 0, 2, 4, 8, 0 }, { 1, 0, 2, 8, 0, 0 }, { 1, 0, 1, 4, 1, 5 },
+                        { 1, 1, 1, 4, 0, 0 }, { 1, 1, 1, 8, 0, 0 }, { 1, 1, 1, 16, 0, 0 }, { 1, 1, 2, 4, 0, 0 }, { 1, 1, 1, 4, 8, 3 },
+                        { 1, 1, 1, 4, 0, 1024 } };
+    const int64_t toks[] = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 17, 20, 24, 25, 30, 32, 40, 45, 48, 50, 60, 64, 79, 80, 96, 120, 160, 240 };
     long long launches = 0, diffs = 0, cases = 0;
     std::printf("drafter_mx byte check: moe_gemm_ggml type=mxfp4, the multi-row forms vs the stock kernels\n");
     for (const MxCase& c : kMxCases) {

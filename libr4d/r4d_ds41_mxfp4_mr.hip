@@ -53,7 +53,9 @@
 namespace {
 
 constexpr int kXmThreads = 256;          /* WN <= 8 waves a block */
-constexpr int kXmMaxTokens = 48;         /* the forms serve the decode band's row counts */
+/* The forms serve the drafter's query passes: 5 rows a drafting sequence (DSpark's whole block), so up to ~100 sequences
+ * (DRAFTER track 18.11.2026: was 48 tokens, which sent a 16-sequence lane's 80-token calls to the stock tiled kernel). */
+constexpr int kXmMaxTokens = 512;
 
 struct MxMrArgs {
     const uint16_t* x;
@@ -337,12 +339,13 @@ __global__ __launch_bounds__(kXmThreads) void xm_gemv_kernel(MxMrArgs A) {
 /* ------------------------------------------------------------------ the tiled kernel's order */
 /* Blocks [b0, b1) of the segment's MT rows into the slab, [block][row][32] f32 in K order (zeros past mc and for a
  * dead slot): every lane reads the same values, LDS broadcasts. */
-template <int MT>
+template <int MT, int EX = 0>
 __device__ __forceinline__ void xm_stage_s(const MxMrArgs& A, float* xs, int r0, int mc, int b0, int b1) {
     const int np = (b1 - b0) * MT * 4;
     for (int idx = (int)threadIdx.x; idx < np; idx += (int)blockDim.x) {
         const int q = idx & 3, rest = idx >> 2;
         const int m = rest % MT, bb = rest / MT;
+        if (EX && m >= mc) continue;   /* EX reads rows < mc only */
         const int k = (b0 + bb) * 32 + 8 * q;
         const int tok = m < mc ? mx_moe_tok(A.sorted, r0 + m, A.top_k, A.a_sorted, A.AR) : -1;
         float v[8];
@@ -358,7 +361,7 @@ __device__ __forceinline__ void xm_stage_s(const MxMrArgs& A, float* xs, int r0,
     }
 }
 
-template <int T, int R, int MT>
+template <int T, int R, int MT, int EX>
 __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
     using Q = Mx<T>;
     constexpr int PD = MT * R >= 16 ? 2 : 4;
@@ -382,6 +385,9 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
             xm_zero(A, r0, mc, n0);
             continue;
         }
+        /* EX (DRAFTER track 18.11.2026): the chains run over the segment's mc rows only (block-uniform, read into an
+         * SGPR), not MT: rows past mc are never written, so the outputs are the same operations as before. */
+        const int mcu = EX ? __builtin_amdgcn_readfirstlane(mc) : MT;
         const uint8_t* wb = A.wtab ? A.wtab[e] : A.w + (long long)e * A.w_es;
         const int nb = n0 + wave * 32 * R + lane;          /* rows nb + 32 r */
         const uint8_t* wr[R];
@@ -405,14 +411,28 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
         auto block = [&](int b, const float* xb, uint32_t (&rw)[R][Q::NR]) {
             float w[R][32];
 #pragma unroll
-            for (int r = 0; r < R; ++r)
-                mx_for<4>([&](auto gi) {
-                    constexpr int G = decltype(gi)::value;
-                    Q::template dec<G>(rw[r], tab, &w[r][8 * G]);
-                });
+            for (int r = 0; r < R; ++r) {
+                if constexpr ((EX & 4) != 0) {   /* bench ablation: no decode (the raw words as values; output differs) */
+#pragma unroll
+                    for (int t = 0; t < 32; ++t) w[r][t] = __uint_as_float(rw[r][t % 5] ^ (uint32_t)t);
+                } else {
+                    mx_for<4>([&](auto gi) {
+                        constexpr int G = decltype(gi)::value;
+                        Q::template dec<G>(rw[r], tab, &w[r][8 * G]);
+                    });
+                }
+            }
             load(b + PD, rw);
+            if constexpr ((EX & 2) != 0) {   /* bench ablation: no products (one add a value; output differs) */
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int t = 0; t < 32; ++t) acc[r][0] += w[r][t];
+                return;
+            }
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
+                if (EX && m >= mcu) break;
                 const float* xp = xb + m * 32;
 #pragma unroll
                 for (int h = 0; h < 8; ++h) {
@@ -428,7 +448,7 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
         for (int b0 = 0; b0 < A.UK; b0 += A.SS) {
             const int b1 = min(b0 + A.SS, A.UK);
             lds_barrier();
-            xm_stage_s<MT>(A, xs, r0, mc, b0, b1);
+            xm_stage_s<MT, EX>(A, xs, r0, mc, b0, b1);
             lds_barrier();
 #pragma unroll 1
             for (int bb = b0 - b0 % PD; bb < b1; bb += PD) {
@@ -451,7 +471,8 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
 /* ------------------------------------------------------------------ forms */
 /* gemv band: (H, R, MT); tiled order: (R, MT). */
 #define XM_GFORMS(X) X(4, 1, 2) X(4, 1, 4) X(4, 1, 8) X(4, 1, 16) X(4, 2, 2) X(4, 2, 4) X(4, 2, 8) X(2, 1, 4) X(2, 1, 8)
-#define XM_SFORMS(X) X(1, 2) X(1, 4) X(1, 8) X(2, 2) X(2, 4) X(2, 8)
+#define XM_SFORMS(X) X(1, 2, 0) X(1, 4, 0) X(1, 8, 0) X(2, 2, 0) X(2, 4, 0) X(2, 8, 0) \
+    X(1, 4, 1) X(1, 8, 1) X(1, 16, 1) X(2, 4, 1) X(2, 8, 1) X(2, 16, 1) X(1, 4, 3) X(1, 4, 5) X(1, 4, 7)
 
 int xm_launch_g(RadStream s, int H, int R, int MT, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
 #define XM_G(h, r, mt) \
@@ -460,9 +481,9 @@ int xm_launch_g(RadStream s, int H, int R, int MT, const MxMrArgs& A, unsigned g
 #undef XM_G
     return R4D_MX_MR_DECLINE;
 }
-int xm_launch_s(RadStream s, int R, int MT, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
-#define XM_S(r, mt) \
-    if (R == r && MT == mt) return R4D_EMIT(s, (xm_seq_kernel<MX_FP4, r, mt>), dim3(grid), dim3(thr), lds, A);
+int xm_launch_s(RadStream s, int R, int MT, int EX, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
+#define XM_S(r, mt, ex) \
+    if (R == r && MT == mt && EX == ex) return R4D_EMIT(s, (xm_seq_kernel<MX_FP4, r, mt, ex>), dim3(grid), dim3(thr), lds, A);
     XM_SFORMS(XM_S)
 #undef XM_S
     return R4D_MX_MR_DECLINE;
@@ -473,8 +494,8 @@ bool xm_has_g(int H, int R, int MT) {
 #undef XM_GH
     return false;
 }
-bool xm_has_s(int R, int MT) {
-#define XM_SH(r, mt) if (R == r && MT == mt) return true;
+bool xm_has_s(int R, int MT, int EX) {
+#define XM_SH(r, mt, ex) if (R == r && MT == mt && EX == ex) return true;
     XM_SFORMS(XM_SH)
 #undef XM_SH
     return false;
@@ -510,6 +531,7 @@ int env_drafter_mx() {
 int g_xm_on = env_drafter_mx();
 int g_xm_pin = 0;                         /* 0 none, -1 the rule forced, 1 a pinned form */
 int g_xm_pin_h = 4, g_xm_pin_r = 1, g_xm_pin_mt = 4, g_xm_pin_wn = 0, g_xm_pin_grid = 0;
+int g_xm_cap = kXmMaxTokens;              /* the forms' token bound (bench hook r4d_mx_mr_cap) */
 char g_xm_last[160];
 
 }  // namespace
@@ -518,16 +540,22 @@ int r4d_mx_mr_on() { return g_xm_pin != 0 ? 1 : g_xm_on; }
 void r4d_mx_mr_set(int on) { g_xm_on = on ? 1 : 0; }
 int r4d_mx_mr_get() { return g_xm_on; }
 
-/* The rule: MT from the call's tokens (an expert's rows in a decode step are few: 4 to 8 tokens' worth), the gemv
- * band's form H 4 x R 1 in 8-wave blocks (32 weight rows a block), the tiled order's R 1 in 4-wave blocks (128
- * rows), slabs of 16 KiB; a grid of two blocks a CU or fewer when the live work is smaller. */
+/* The rule: the gemv band (<= 16 tokens): MT from the call's tokens (an expert's rows in a decode step are few: 4 to 8
+ * tokens' worth), H 4 x R 1 in 8-wave blocks (32 weight rows a block), a grid of four blocks a WGP or fewer when the live
+ * work is smaller. The tiled order (DRAFTER track 18.11.2026, tools/dbench on one R9700, the drafter's 3 stages x
+ * (gate_up + down), synthetic routing): R 1 x MT 4 with EX (each segment's chains over its own rows only) in 4-wave blocks
+ * (128 rows), slabs of 16 KiB, a grid of 32 blocks a WGP: 80 tokens 4.14 ms a pass vs the stock tiled kernel's 18.66 (x4.51),
+ * 40 tokens 2.91 vs the previous rule's (MT 8, no EX, 4 blocks a WGP) 5.99; the same bytes (the stock chain order). */
 int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
-    if (c.tokens < 1 || c.tokens > kXmMaxTokens || c.T < 1 || c.N < 1 || c.K < 32 || c.K % 32 || c.n_expert < 1)
+    if (c.tokens < 1 || c.tokens > g_xm_cap || c.T < 1 || c.N < 1 || c.K < 32 || c.K % 32 || c.n_expert < 1)
         return R4D_MX_MR_DECLINE;
     const bool pinned = g_xm_pin > 0;
     int H = 4, R = 1, MT = c.tokens <= 2 ? 2 : (c.tokens <= 8 ? 4 : 8), WN = 0;
     if (pinned) { H = g_xm_pin_h; R = g_xm_pin_r; MT = g_xm_pin_mt; WN = g_xm_pin_wn; }
-    if (c.gemv ? !xm_has_g(H, R, MT) : !xm_has_s(R, MT)) return R4D_MX_MR_DECLINE;
+    /* a seq pin's h: 1 = EX (the segment's rows only) */
+    int EX = pinned && !c.gemv ? (g_xm_pin_h & 1 ? g_xm_pin_h : 0) : 0;   /* 3 / 5 / 7: bench ablations */
+    if (!pinned && !c.gemv) { MT = 4; EX = 1; }
+    if (c.gemv ? !xm_has_g(H, R, MT) : !xm_has_s(R, MT, EX)) return R4D_MX_MR_DECLINE;
     if (WN <= 0) WN = c.gemv ? 8 : 4;
     if (WN != 1 && WN != 2 && WN != 4 && WN != 8) return R4D_MX_MR_DECLINE;
     MxMrArgs A{};
@@ -560,13 +588,13 @@ int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
     if (lds > 65536) return R4D_MX_MR_DECLINE;
     /* items: at most min(n_expert, T) experts live, each one segment or more */
     const long long est = (long long)A.live_cap * A.nrg;
-    long long grid = g_xm_pin_grid > 0 && pinned ? g_xm_pin_grid : 4LL * xm_cu_count();
+    long long grid = g_xm_pin_grid > 0 && pinned ? g_xm_pin_grid : (c.gemv ? 4LL : 32LL) * xm_cu_count();
     if (grid > est) grid = est;
     if (grid < 1) grid = 1;
-    std::snprintf(g_xm_last, sizeof g_xm_last, "%s H%d R%d MT%d WN%d SS%d RB%d grid %lld lds %lld", c.gemv ? "gemv" : "seq",
-                  c.gemv ? H : 32, R, MT, WN, A.SS, A.RB, grid, lds);
+    std::snprintf(g_xm_last, sizeof g_xm_last, "%s H%d R%d MT%d%s WN%d SS%d RB%d grid %lld lds %lld", c.gemv ? "gemv" : "seq",
+                  c.gemv ? H : 32, R, MT, EX ? " EX" : "", WN, A.SS, A.RB, grid, lds);
     return c.gemv ? xm_launch_g(s, H, R, MT, A, (unsigned)grid, 32u * WN, (unsigned)lds)
-                  : xm_launch_s(s, R, MT, A, (unsigned)grid, 32u * WN, (unsigned)lds);
+                  : xm_launch_s(s, R, MT, EX, A, (unsigned)grid, 32u * WN, (unsigned)lds);
 }
 
 /* r4d_mx_mr_pin (bench / test hook, r4d_selftest --mxcheck / --perfmx): on 0 clears the pin (the switch decides),
@@ -577,6 +605,8 @@ extern "C" void r4d_mx_mr_pin(int on, int h, int r, int mt, int wn, int grid) {
     g_xm_pin_grid = grid > 0 ? grid : 0;
 }
 extern "C" const char* r4d_mx_mr_last() { return g_xm_last; }
+/* r4d_mx_mr_cap (bench hook, DRAFTER track): the forms' token bound (<= 0: the shipped kXmMaxTokens). */
+extern "C" void r4d_mx_mr_cap(int tokens) { g_xm_cap = tokens > 0 ? tokens : kXmMaxTokens; }
 
 #ifdef R4D_EMU_HOST
 /* tests/r4d_emu (ds41mx): the stock grouped GEMM's launches as mx_moe issues them (gemv band or tiled), from this
