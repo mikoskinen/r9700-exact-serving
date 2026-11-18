@@ -722,7 +722,10 @@ int Engine::step_loop_lanes() {
                 if (nb) {
                     /* its rows' token ids, positions and slots on the card behind this step's sampler (and drafter) */
                     if (const int as = advance_all(ADV_TRUNK, 0, false); as < 0) return fail_loop(as);
-                    if (const int hs = lane_head(lane, nb); hs < 0) return fail_loop(hs);
+                    pp_ship_ahead_ = true;   /* round 2: the frame says so (the follower waits for its X1 off the card) */
+                    const int hs = lane_head(lane, nb);
+                    pp_ship_ahead_ = false;
+                    if (hs < 0) return fail_loop(hs);
                 }
             }
             if (!nb) ++ia_skip;

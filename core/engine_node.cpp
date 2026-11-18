@@ -166,7 +166,9 @@ struct StepHdr {
     /* tp8 dev M4: bit 0 -- the step keeps its place on the follower: it has prompt rows (a chunk may read the KV of an
      * earlier chunk of its prompt still in flight in another lane: a lent chunk, or a home chunk planned behind one) or a
      * piece of another lane's sequence (StepEntry::home >= 0); 0 -- a decode step of this lane's own sequences, which reads
-     * only committed KV and may run between another step's segments */
+     * only committed KV and may run between another step's segments; tp8 dev D10 round 2: bit 1 -- the leader issued the
+     * step ahead of its lane's collect (RADIANCE_PP_ISSUE_AHEAD=1): its X1 lands only after the leader's tail of the step
+     * before it */
     int32_t  flags = 0;
     /* Review F2 / F3: the leader's switch REQUESTS (fn4::requests), not its applied values: a lever
      * the leader does not declare reads 0 there and must not turn the follower's off. */
@@ -827,6 +829,7 @@ int Engine::pp_frame(const RadBatch* b, bool run, std::vector<uint8_t>* out, con
     if (sched_of(lane).plan().phase != RAD_PHASE_DECODE) h.flags |= 1;
     for (const StepEntry& e : sched_of(lane).plan().e)
         if (e.home >= 0) h.flags |= 1;
+    if (run && pp_ship_ahead_) h.flags |= 2;   /* tp8 dev D10 round 2 */
     if (run) {
         h.n_fn4 = fn4::kSwitches;
         fn4::requests(h.fn4_n, h.fn4_v);
@@ -1412,6 +1415,21 @@ int Engine::follower_loop() {
                  seg_bg >= 0 ? fmt("; and every pass of the BG lane(s) %d-%d (RADIANCE_PP_BG_LANE, tp8 dev M8)", seg_bg, n_lanes_ - 1).c_str() : "");
     }
     int64_t seg_passes = 0, seg_parts = 0, seg_between = 0, seg_held = 0;
+    /* tp8 dev D10 round 2: a frame the leader issued ahead of its lane's collect (flags bit 1) arrives about a leader tail
+     * before its X1; between a split pass's segments it waits here, in arrival order with the decode frames behind it, until
+     * its X1 has landed -- so the card runs the split pass's next segments instead of spinning in its X1 receive. `x1_runs`:
+     * the passes issued a lane (each takes one X1 payload), so a frame's payload is number x1_runs + 1 of its lane's ring. */
+    std::deque<net::Msg> ia_pend;
+    int64_t x1_runs[RAD_PP_MAX_LANES] = {};
+    int64_t ia_deferred = 0;
+    auto x1_landed = [&](const net::Msg& mm) -> bool {
+        StepHdr hh;
+        if (mm.body.size() < sizeof hh) return true;
+        std::memcpy(&hh, mm.body.data(), sizeof hh);
+        if (!(hh.flags & 2) || !hh.run || hh.lane < 0 || hh.lane >= n_lanes_ || hh.lane >= RAD_PP_MAX_LANES) return true;
+        const RadPpRing* x1 = pp_recv_[hh.lane * RAD_PP_N_RINGS + RAD_PP_X1];
+        return !x1 || (int64_t)__atomic_load_n(&x1->landed, __ATOMIC_ACQUIRE) > x1_runs[hh.lane];
+    };
     std::deque<net::Msg> held;   /* frames that wait for the split pass to end (and every frame behind them) */
     /* A frame other than a step's: the leader's switch ask, its KV-copy check. */
     auto other_frame = [&](net::Msg& m) -> int {
@@ -1480,6 +1498,7 @@ int Engine::follower_loop() {
         }
         ++builds;
         if (!h.run) return RAD_OK;
+        if (h.lane < RAD_PP_MAX_LANES) ++x1_runs[h.lane];   /* tp8 dev D10 round 2: this pass takes its lane's next X1 */
         /* Review F4: the state slots the leader zeroed before this step (a fresh sequence's), zeroed
          * here on this node's own groups, as Engine::clear_fresh_states does on the leader. */
         for (int k = 0; k < h.n_clears; ++k) {
@@ -1546,6 +1565,15 @@ int Engine::follower_loop() {
         auto between = [&](RadEvent done_ev) -> int {
             const uint64_t t0 = rad_mono_ns();
             for (;;) {
+                /* tp8 dev D10 round 2: the frames issued ahead whose X1 has landed (and the decode frames behind them) */
+                while (!ia_pend.empty() && x1_landed(ia_pend.front())) {
+                    net::Msg mp = std::move(ia_pend.front());
+                    ia_pend.pop_front();
+                    StepHdr hp;
+                    std::memcpy(&hp, mp.body.data(), sizeof hp);
+                    if (const int fs = step_frame(mp, false); fs < 0) return fs;
+                    if (hp.run) { ++seg_between; ++steps; }
+                }
                 const bool dev_done = !done_ev || rad_event_query(done_ev) != 0;
                 const bool waited = (rad_mono_ns() - t0) / 1000000ull >= (uint64_t)seg_wait_ms;
                 net::Msg m2;
@@ -1571,6 +1599,11 @@ int Engine::follower_loop() {
                 if (!held.empty() || m2.body.size() < sizeof h2 || ((h2.flags & 1) && h2.run) || h2.lane == lane) {
                     if (h2.run) ++seg_held;
                     held.push_back(std::move(m2));
+                    continue;
+                }
+                if (!ia_pend.empty() || !x1_landed(m2)) {   /* tp8 dev D10 round 2: its X1 is not here yet */
+                    if (ia_pend.empty()) ++ia_deferred;
+                    ia_pend.push_back(std::move(m2));
                     continue;
                 }
                 if (const int fs = step_frame(m2, false); fs < 0) return fs;
@@ -1607,6 +1640,11 @@ int Engine::follower_loop() {
         }
         pp_set_pass(lane, RAD_PP_PART_WHOLE);
         if (split) ++seg_passes;
+        /* tp8 dev D10 round 2: frames still waiting for their X1 go first after the split pass (they came before any held) */
+        if (split && !ia_pend.empty()) {
+            held.insert(held.begin(), std::make_move_iterator(ia_pend.begin()), std::make_move_iterator(ia_pend.end()));
+            ia_pend.clear();
+        }
         /* tp8 S5: busy from X1's arrival (rank 0 took it) to X2's publish (the host backend notes both) */
         if (pp_stamps_) {
             const RadPpRing* x1 = pp_recv_[lane * RAD_PP_N_RINGS + RAD_PP_X1];
@@ -1669,6 +1707,9 @@ int Engine::follower_loop() {
                         RAD_INFO("follower: %lld passes ran in %lld segments, %lld other passes between their segments, "
                                  "%lld held in their place (tp8 dev M4)", (long long)seg_passes, (long long)seg_parts,
                                  (long long)seg_between, (long long)seg_held);
+                    if (ia_deferred > 0)
+                        RAD_INFO("follower: %lld frames issued ahead waited between a split pass's segments for their X1 "
+                                 "(tp8 dev D10 round 2)", (long long)ia_deferred);
                     return RAD_OK;
                 }
                 RAD_ERR("follower: the link to the leader is down: %s", pp_link_->why().c_str());
