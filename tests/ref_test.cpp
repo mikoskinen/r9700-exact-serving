@@ -2148,7 +2148,7 @@ TEST(op_vocabulary) {
         "row_topk_merge", "pair_argmax", "logit_rerank",
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
-        "all_reduce", "all_gather",
+        "all_reduce", "all_gather", "reduce_scatter_rows", "all_gather_rows",   /* the last two: tp8 loop P20 */
         "embed_lookup", "logits_gemm",
         "sample_penalties", "sample_dry", "sample_ngram_ban", "sample_temp", "sample_topk",
         "sample_topp", "sample_minp", "sample_typical", "sample_xtc", "sample_mask", "sample_pick",
@@ -6261,6 +6261,61 @@ TEST(op_collectives_world2) {
     /* After the reduce both ranks hold the same values, so the gather is four copies of them. */
     CHECK_EQ(g0.at(0), 11.0f); CHECK_EQ(g0.at(2), 11.0f);
     CHECK_EQ(g1.at(1), 22.0f); CHECK_EQ(g1.at(3), 22.0f);
+}
+
+/* tp8 loop P20: reduce_scatter_rows then all_gather_rows at four ranks hold all_reduce's bytes on every rank, in place
+ * over whole-row shards (q = ceil(rows / 4); 9 and 5 rows leave an uneven or empty-ish last shard); after the
+ * reduce-scatter alone each rank's own rows are all_reduce's and the others its input. bf16 and f32 values whose
+ * exponents span 2^-12..2^12, so only the ascending-rank f32 fold from 0 gives all_reduce's bits. */
+TEST(op_rows_collectives_world4) {
+    for (uint32_t dt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F32 })
+        for (int64_t rows : { (int64_t)8, (int64_t)9, (int64_t)5, (int64_t)4 }) {
+            const int W = 4;
+            const int64_t row = 6, n = rows * row, q = (rows + W - 1) / W;
+            auto val = [](int r, int64_t i) {
+                uint64_t h = (uint64_t)i * 0x9E3779B97F4A7C15ull ^ ((uint64_t)r + 1) * 0xC2B2AE3D27D4EB4Full;
+                h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+                const float m = (float)(128 + (int)(h & 127)) / 128.0f;
+                return ((h >> 12) & 1 ? -1.0f : 1.0f) * std::ldexp(m, (int)((h >> 7) % 25) - 12);
+            };
+            std::vector<T> xa, xs, mid;
+            for (int r = 0; r < W; ++r) {
+                xa.emplace_back(dt, std::vector<int64_t>{ rows, row });
+                xs.emplace_back(dt, std::vector<int64_t>{ rows, row });
+                mid.emplace_back(dt, std::vector<int64_t>{ rows, row });
+                for (int64_t i = 0; i < n; ++i) { xa[(size_t)r].set(i, val(r, i)); xs[(size_t)r].set(i, val(r, i)); }
+            }
+            int st[W] = { 0, 0, 0, 0 };
+            auto body = [&](int r) {
+                A a; a.t(xa[(size_t)r]).i("world_size", W).i("numel", n).s("dtype", dt == RAD_BF16 ? "bf16" : "f32").i("exact", 1);
+                a.scr(n);
+                int s = run("all_reduce", a, r, W);
+                A b; b.t(xs[(size_t)r]).i("world_size", W).i("numel", n).s("dtype", dt == RAD_BF16 ? "bf16" : "f32")
+                     .i("row", row).i("raw", 1);
+                b.scr(n);
+                const int s2 = run("reduce_scatter_rows", b, r, W);
+                std::memcpy(mid[(size_t)r].mem.data(), xs[(size_t)r].mem.data(), xs[(size_t)r].mem.size());
+                const int s3 = run("all_gather_rows", b, r, W);
+                st[r] = s < 0 ? s : s2 < 0 ? s2 : s3;
+            };
+            std::vector<std::thread> th;
+            for (int r = 0; r < W; ++r) th.emplace_back(body, r);
+            for (std::thread& x : th) x.join();
+            for (int r = 0; r < W; ++r) CHECK_OK(st[r]);
+            const size_t bytes = (size_t)dt_bytes(dt, n);
+            for (int r = 0; r < W; ++r) {
+                CHECK(std::memcmp(xs[(size_t)r].mem.data(), xa[(size_t)r].mem.data(), bytes) == 0);
+                for (int64_t i = 0; i < n; ++i) {
+                    if ((i / row) / q == r) {
+                        CHECK_EQ(mid[(size_t)r].at(i), xa[(size_t)r].at(i));   /* its own rows: all_reduce's */
+                    } else {
+                        T one(dt, { 1 });                                       /* the others: its input */
+                        one.set(0, val(r, i));
+                        CHECK_EQ(mid[(size_t)r].at(i), one.at(0));
+                    }
+                }
+            }
+        }
 }
 
 /* ================================================================== sampling */
@@ -11422,6 +11477,9 @@ std::vector<Geo> geometries() {
         G("all_reduce", "numel", 16, a.i("world_size", 1).i("numel", R).s("dtype", "f32")
                                      .i("exact", 1)),
         G("all_gather", "numel", 16, a.i("world_size", 1).i("numel", R).s("dtype", "f32")),
+        /* tp8 loop P20: rows of 16 elements, the band in whole rows */
+        G("reduce_scatter_rows", "numel", 16, a.i("world_size", 1).i("numel", R * 16).s("dtype", "f32").i("row", 16)),
+        G("all_gather_rows", "numel", 16, a.i("world_size", 1).i("numel", R * 16).s("dtype", "f32").i("row", 16)),
         G("embed_lookup", "M", 3, a.i("M", R).i("n_embd", 8).i("n_vocab", 20).s("dtype", "f32")),
         G("embed_lookup_q", "M", 3, a.i("M", R).i("n_embd", 8).i("n_vocab", 20)
                                     .s("dtype", "fp8_e4m3")),

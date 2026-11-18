@@ -347,6 +347,9 @@ int ref_gdn_gated_rmsnorm  (const RadArgs*, RadStream);
 int     ref_all_reduce     (const RadArgs*, RadStream);
 int     ref_all_gather     (const RadArgs*, RadStream);
 int64_t ref_all_reduce_scratch(const RadArgs*);
+int     ref_reduce_scatter_rows(const RadArgs*, RadStream);   /* tp8 loop P20 */
+int     ref_all_gather_rows    (const RadArgs*, RadStream);   /* tp8 loop P20 */
+int64_t ref_reduce_scatter_rows_scratch(const RadArgs*);
 int     ref_collective_init(const RadParam*, int, int, int, void**);
 void    ref_collective_fini(void*);
 
@@ -640,6 +643,8 @@ REF_SHAPE_FN(ref_gdn_gated_rmsnorm);
 
 REF_SHAPE_FN(ref_all_reduce);
 REF_SHAPE_FN(ref_all_gather);
+REF_SHAPE_FN(ref_reduce_scatter_rows);
+REF_SHAPE_FN(ref_all_gather_rows);
 
 REF_SHAPE_FN(ref_sample_penalties);
 REF_SHAPE_FN(ref_sample_dry);

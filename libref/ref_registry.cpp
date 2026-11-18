@@ -832,6 +832,10 @@ static const RadOperandSpec oAllReduce[] = { INOUT("x"), OUT_O("y") };
 static const RadParamSpec pAllGather[] = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"),
                                            P_INTO("row") };
 static const RadOperandSpec oAllGather[] = { OPD("x"), OUT("y") };
+/* tp8 loop P20: the two-shot's halves over whole-row shards, in place (docs/OPS.md) */
+static const RadParamSpec pRowsColl[] = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"), P_INT("row"),
+                                          P_INTO("raw"), P_INTO("overlap") };
+static const RadOperandSpec oRowsColl[] = { INOUT("x"), OUT_O("y") };
 
 /* ---- vocabulary edges --------------------------------------------------------------------- */
 /* `vocab_offset` makes the embedding vocab-parallel, like lm_head. Absent (or 0 with an unsharded
@@ -1999,6 +2003,14 @@ static const RadOpSchema kSchemas[] = {
   "[rows][row] and y is [rows][world_size][row], so one row of y carries every rank's words for "
   "that row. The vocab-parallel candidate merge reads exactly that." },
 
+{ "reduce_scatter_rows", ARR(pRowsColl), ARR(oRowsColl),
+  "tp8 loop P20: x [rows][row] summed over the ranks IN ASCENDING RANK ORDER (f32), rank r keeping the sum of its whole "
+  "rows [r q, (r + 1) q), q = ceil(rows / world_size), in place; the other rows as they were. all_reduce's walk over those "
+  "rows: a reduce-scatter then all_gather_rows hold all_reduce's bytes. raw 0 is served exactly (no wire on the host)." },
+{ "all_gather_rows", ARR(pRowsColl), ARR(oRowsColl),
+  "tp8 loop P20: every rank's shard rows of x [rows][row] (as reduce_scatter_rows cuts them) into every other rank's x, "
+  "word for word, in place." },
+
 { "embed_lookup", ARR(pEmbedM), ARR(oEmbed),
   "A gather from wte[n_vocab, n_embd]. A negative token id writes a zero row (padding); an id at "
   "or above n_vocab fails the launch. `mult`, when given, multiplies every gathered row and the "
@@ -2937,6 +2949,11 @@ ROW("ref_all_reduce", "all_reduce", "ar", "sum across ranks, f32, ascending rank
     nullptr, 0, ref_collective_init, ref_collective_fini, ref_all_reduce, ref_all_reduce_scratch),
 ROW("ref_all_gather", "all_gather", "ar", "gather every rank's shard", DT_FLOAT,
     nullptr, 0, ref_collective_init, ref_collective_fini, ref_all_gather, nullptr),
+ROW("ref_reduce_scatter_rows", "reduce_scatter_rows", "ar", "reduce-scatter over whole-row shards, f32, ascending rank order",
+    DT_FLOAT, nullptr, 0, ref_collective_init, ref_collective_fini, ref_reduce_scatter_rows,
+    ref_reduce_scatter_rows_scratch),
+ROW("ref_all_gather_rows", "all_gather_rows", "ar", "all-gather over whole-row shards, word for word", DT_FLOAT,
+    nullptr, 0, ref_collective_init, ref_collective_fini, ref_all_gather_rows, nullptr),
 
 SIMPLE("ref_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT,
        ref_embed_lookup),
