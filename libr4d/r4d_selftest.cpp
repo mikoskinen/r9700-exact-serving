@@ -35,6 +35,7 @@
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_args.h"
+#include "rad_pp.h"   /* tp8 loop P20 rounds 3 + 4: --case stage_shard's ring */
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
 #include "r4d_hc_fp8.h"
@@ -31961,6 +31962,179 @@ static void sp_rows_exact(const Plugin& pl, const std::vector<int>& devs) {
     if (sw) sw("ar_xpush", 0);
 }
 
+/* tp8 loop P20 rounds 3 + 4: --case stage_shard -- stage_send / stage_recv with `shard` (split 3) at four ranks over ONE pinned
+ * host ring (hipHostMalloc portable + mapped, as the engine's pinned ring): parts p0 [R][8] f32 (32-byte rows, the 16-byte path),
+ * p1 [R][10] bf16 (20-byte rows, the 4-byte path), p2 [5][4] i32 (unmasked); each rank's device buffers right only on ITS rows
+ * (rows [r q, (r + 1) q), q = ceil(R / 4)) and rank-specific junk elsewhere, p2 right only on rank 0. Send with shard 3: the ring
+ * holds the whole parts' bytes, the layout word and `ready` 1; a control without shard (rank 0 alone) carries rank 0's junk. Then
+ * receive with shard 3 into sentinel-filled buffers: each rank's own rows right, the others keep the sentinel, p2 whole, `taken`
+ * 1 a rank; and without shard: every row. R = R4D_SELFTEST_STROWS (default 4096; also 1441: an uneven last shard). */
+struct StShardT {
+    const RadKernelInfo* snd = nullptr;
+    const RadKernelInfo* rcv = nullptr;
+    int rank = 0, dev = 0;
+    void* ring = nullptr;
+    uint64_t ring_bytes = 0;
+    int64_t R = 0;
+    int shard = 0;
+    bool recv = false;
+    void* p[3] = { nullptr, nullptr, nullptr };
+    std::vector<uint8_t> got[3];
+    int rc = RAD_OK;
+};
+static float st_good(int k, int64_t i) { return (float)((k * 7919 + i) % 65536) * 0.25f; }
+static float st_junk(int rank, int k, int64_t i) { return -(float)((rank * 104729 + k * 7919 + i) % 65536) - 0.5f; }
+static void stage_shard_worker(StShardT* t) {
+    if (st_set_device(t->dev) != hipSuccess) { t->rc = RAD_E_DEVICE; return; }
+    const int64_t R = t->R, q = (R + 3) / 4, cols[3] = { 8, 10, 4 }, rows[3] = { R, R, 5 };
+    const uint32_t dts[3] = { RAD_F32, RAD_BF16, RAD_I32 };
+    const int64_t esz[3] = { 4, 2, 4 };
+    for (int k = 0; k < 3; ++k) {
+        const int64_t n = rows[k] * cols[k];
+        if (!t->p[k] && hipMalloc(&t->p[k], (size_t)(n * esz[k])) != hipSuccess) { t->rc = RAD_E_NOMEM; return; }
+        std::vector<uint8_t> h((size_t)(n * esz[k]));
+        for (int64_t i = 0; i < n; ++i) {
+            if (t->recv) {   /* the receive's sentinel */
+                if (k == 2) { const int32_t v = -7; std::memcpy(&h[(size_t)(i * 4)], &v, 4); }
+                else if (k == 0) { const float v = -7.0f; std::memcpy(&h[(size_t)(i * 4)], &v, 4); }
+                else { const uint16_t v = h_to_bf16(-7.0f); std::memcpy(&h[(size_t)(i * 2)], &v, 2); }
+                continue;
+            }
+            const bool mine = k == 2 ? t->rank == 0 : (i / cols[k]) / q == t->rank;
+            const float v = mine ? st_good(k, i) : st_junk(t->rank, k, i);
+            if (k == 2) { const int32_t w = (int32_t)v; std::memcpy(&h[(size_t)(i * 4)], &w, 4); }
+            else if (k == 0) std::memcpy(&h[(size_t)(i * 4)], &v, 4);
+            else { const uint16_t w = h_to_bf16(v); std::memcpy(&h[(size_t)(i * 2)], &w, 2); }
+        }
+        st_memcpy(t->p[k], h.data(), h.size(), hipMemcpyHostToDevice);
+    }
+    RadTensor ts[4] = { T(t->ring, RAD_U8, { (int64_t)t->ring_bytes }), T(t->p[0], dts[0], { rows[0], cols[0] }),
+                        T(t->p[1], dts[1], { rows[1], cols[1] }), T(t->p[2], dts[2], { rows[2], cols[2] }) };
+    std::vector<RadParam> ps = { PI("M", R), PI("ring", 0), PI("parts", 3), PI("sender", 0) };
+    if (t->shard) ps.push_back(PI("shard", t->shard));
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts; a.n_t = 4; a.p = ps.data(); a.n_p = (int)ps.size(); a.rank = t->rank; a.world_size = 4;
+    const RadKernelInfo* k = t->recv ? t->rcv : t->snd;
+    const int rc = k->launch(&a, nullptr);
+    st_stream_sync(nullptr);
+    if (rc != RAD_OK) { t->rc = rc; return; }
+    if (t->recv)
+        for (int j = 0; j < 3; ++j) {
+            t->got[j].resize((size_t)(rows[j] * cols[j] * esz[j]));
+            st_memcpy(t->got[j].data(), t->p[j], t->got[j].size(), hipMemcpyDeviceToHost);
+        }
+}
+static void stage_shard(const Plugin& pl, const std::vector<int>& devs) {
+    const char* nm = "stage_shard";
+    const RadKernelInfo* snd = find(pl, "stage_send_host_ring");
+    const RadKernelInfo* rcv = find(pl, "stage_recv_host_ring");
+    if (!snd || !rcv) { ok(nm, false, "row stage_send_host_ring / stage_recv_host_ring absent"); return; }
+    if ((int)devs.size() < 4 || devs[0] == devs[3]) { skip(nm, "needs four distinct gfx1201 cards"); return; }
+    std::vector<int64_t> Rs = { 4096, 1441 };
+    if (const char* e = std::getenv("R4D_SELFTEST_STROWS")) Rs = { (int64_t)std::max(8LL, std::atoll(e)) };
+    for (int64_t R : Rs) {
+        const uint64_t b0 = (uint64_t)R * 8 * 4, b1 = (uint64_t)R * 10 * 2, b2 = 5 * 4 * 4;
+        const uint64_t o1 = rad_pp_align(b0), o2 = o1 + rad_pp_align(b1), total = o2 + rad_pp_align(b2);
+        const uint64_t cap = total + RAD_PP_TRAILER + 4096, bytes = RAD_PP_RING_HDR + cap;
+        void* ring = nullptr;
+        if (hipHostMalloc(&ring, bytes, hipHostMallocPortable | hipHostMallocMapped) != hipSuccess) {
+            ok(nm, false, "hipHostMalloc of the ring");
+            return;
+        }
+        std::vector<StShardT> t(4);
+        for (int shard : { 3, 0 }) {
+            std::memset(ring, 0, bytes);
+            RadPpRing* r = static_cast<RadPpRing*>(ring);
+            r->magic = RAD_PP_RING_MAGIC;
+            r->cap = cap;
+            r->send_ranks = 4;
+            r->n_ranks = 4;
+            r->deadline_ms = 10000;
+            /* the send */
+            {
+                std::vector<std::thread> th;
+                for (int k = 0; k < 4; ++k) {
+                    StShardT& x = t[(size_t)k];
+                    x.snd = snd; x.rcv = rcv; x.rank = k; x.dev = devs[(size_t)k]; x.ring = ring; x.ring_bytes = bytes; x.R = R;
+                    x.shard = shard; x.recv = false; x.rc = RAD_OK;
+                    th.emplace_back(stage_shard_worker, &x);
+                }
+                for (std::thread& x : th) x.join();
+            }
+            std::string rcs;
+            bool good = true;
+            for (const StShardT& x : t) { good = good && x.rc == RAD_OK; rcs += std::to_string(x.rc) + " "; }
+            const std::string w = fmt("stage_shard rows %lld, send %s", (long long)R, shard ? "shard 3" : "rank 0 alone (control)");
+            ok((w + ": launches").c_str(), good && r->ready == 1, "rc " + rcs + " ready " + std::to_string((long long)r->ready));
+            if (!good) break;
+            const uint8_t* pay = static_cast<const uint8_t*>(ring) + RAD_PP_RING_HDR;
+            int64_t bad0 = 0, bad1 = 0, bad2 = 0;
+            for (int64_t i = 0; i < R * 8; ++i) { float v; std::memcpy(&v, pay + i * 4, 4); bad0 += v != st_good(0, i); }
+            for (int64_t i = 0; i < R * 10; ++i) { uint16_t v; std::memcpy(&v, pay + o1 + i * 2, 2); bad1 += v != h_to_bf16(st_good(1, i)); }
+            for (int64_t i = 0; i < 20; ++i) { int32_t v; std::memcpy(&v, pay + o2 + i * 4, 4); bad2 += v != (int32_t)st_good(2, i); }
+            uint64_t lay = 0, seq = 0;
+            std::memcpy(&seq, pay + total, 8);
+            std::memcpy(&lay, pay + total + 8, 8);
+            const uint64_t pb[3] = { b0, b1, b2 };
+            if (shard) {
+                ok((w + ": the ring holds every part's whole bytes (16-byte rows, 4-byte rows, the unmasked part)").c_str(),
+                   bad0 == 0 && bad1 == 0 && bad2 == 0,
+                   fmt("%lld / %lld / %lld words wrong", (long long)bad0, (long long)bad1, (long long)bad2));
+                ok((w + ": the trailer (seq 1, the layout word)").c_str(), seq == 1 && lay == rad_pp_layout(pb, 3),
+                   fmt("seq %llu", (unsigned long long)seq));
+            } else {
+                ok((w + ": the control carries rank 0's junk rows").c_str(), bad0 > 0 && bad1 > 0 && bad2 == 0,
+                   fmt("%lld / %lld / %lld words wrong", (long long)bad0, (long long)bad1, (long long)bad2));
+            }
+            /* the receive of that payload (the shard 3 send's), with and without shard */
+            if (!shard) continue;
+            for (int rsh : { 3, 0 }) {
+                r->landed = 1;
+                for (int k = 0; k < 4; ++k) r->taken[k] = 0;
+                std::vector<std::thread> th;
+                for (int k = 0; k < 4; ++k) {
+                    StShardT& x = t[(size_t)k];
+                    x.shard = rsh; x.recv = true; x.rc = RAD_OK;
+                    th.emplace_back(stage_shard_worker, &x);
+                }
+                for (std::thread& x : th) x.join();
+                const std::string rw = fmt("stage_shard rows %lld, receive %s", (long long)R, rsh ? "shard 3" : "whole");
+                int64_t bad = 0, taken = 0;
+                bool rgood = true;
+                const int64_t q = (R + 3) / 4;
+                for (int k = 0; k < 4; ++k) {
+                    const StShardT& x = t[(size_t)k];
+                    rgood = rgood && x.rc == RAD_OK;
+                    if (x.rc != RAD_OK) continue;
+                    taken += r->taken[k] == 1 ? 1 : 0;
+                    for (int64_t i = 0; i < R * 8; ++i) {
+                        float v; std::memcpy(&v, x.got[0].data() + i * 4, 4);
+                        const bool mine = !rsh || (i / 8) / q == k;
+                        bad += v != (mine ? st_good(0, i) : -7.0f);
+                    }
+                    for (int64_t i = 0; i < R * 10; ++i) {
+                        uint16_t v; std::memcpy(&v, x.got[1].data() + i * 2, 2);
+                        const bool mine = !rsh || (i / 10) / q == k;
+                        bad += v != h_to_bf16(mine ? st_good(1, i) : -7.0f);
+                    }
+                    for (int64_t i = 0; i < 20; ++i) {
+                        int32_t v; std::memcpy(&v, x.got[2].data() + i * 4, 4);
+                        bad += v != (int32_t)st_good(2, i);
+                    }
+                }
+                ok((rw + ": each rank's rows (or every row) right, the rest untouched, the unmasked part whole, taken 1 a rank").c_str(),
+                   rgood && bad == 0 && taken == 4, fmt("%lld words wrong, %lld ranks took it", (long long)bad, (long long)taken));
+            }
+        }
+        for (StShardT& x : t) {
+            st_set_device(x.dev);
+            for (void*& q : x.p) if (q) { st_free(q); q = nullptr; }
+        }
+        hipHostFree(ring);
+    }
+}
+
 static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name,
                             int world) {
     const RadKernelInfo* row = find(pl, name);
@@ -38097,6 +38271,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("ar_xpush_perf")) {
         if (!g_case) std::printf("\ncross-rank, XPUSH timed (ar_xpush 0 / 1)\n");
         ar_xpush_perf(pl, devs);
+    }
+    /* tp8 loop P20 rounds 3 + 4: --case stage_shard -- the row-sharded send / receive (split 3) over one pinned host ring */
+    if (sel("stage_shard")) {
+        if (!g_case) std::printf("\ncross-rank, stage_send / stage_recv `shard` over one pinned host ring\n");
+        stage_shard(pl, devs);
     }
     /* tp8 loop P20: --case sp_rows_exact -- reduce_scatter_rows + all_gather_rows raw vs the fold, timed vs the all-reduce */
     if (sel("sp_rows_exact") || sel("sp_rs_rows_4rank_ti8") || sel("sp_ag_rows_4rank")) {
