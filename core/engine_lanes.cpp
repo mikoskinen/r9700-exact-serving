@@ -452,6 +452,13 @@ int Engine::step_loop_lanes() {
      * Only the order of issue changes, never a row's step: the step issued ahead is the one step() would plan there. */
     bool ia = false;
     int64_t ia_n = 0, ia_skip = 0;
+    /* tp8 dev D10 round 2: why a tail went without (loop RESULTS lq60: 1,122 ahead vs 1,732 without at W(15,35)), so the next
+     * round knows which rule costs the most -- 0 KV check due, 1 a BG lane, 2 lent pieces waiting in its inbox, 3 not a decode
+     * step (MIXED / prefill), 4 its drafter proposing (block / serial rows this cycle), 5 a row lent / prefill / drafted / not
+     * producing, 6 Scheduler::step_next declined (a request waiting to be admitted, a row ending, the pool, the hybrid) */
+    enum { kIaKv, kIaBg, kIaInbox, kIaPhase, kIaDraft, kIaRow, kIaNext, kIaWhy };
+    int64_t ia_why[kIaWhy] = {};
+    uint64_t ia_line_ns = 0;
     if (const char* v = std::getenv("RADIANCE_PP_ISSUE_AHEAD"); v && !std::strcmp(v, "1")) {
         const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
         const bool fe_on = fe && !std::strcmp(fe, "1");
@@ -468,11 +475,22 @@ int Engine::step_loop_lanes() {
                  ia && ids ? "; X1 carries the step's token ids, which the follower takes before it reads any (round 2)" : "");
     }
     auto ia_ok = [&](int l, const RadBatch* bb, bool kv_due_now) {
-        if (!ia || kv_due_now || lanes_.is_bg(l) || lanes_.inbox_n(l) > 0 || bb->phase != RAD_PHASE_DECODE) return false;
-        if (block_rows_ > 0 || (serial_drafting() && serial_rows_ > 0)) return false;
+        if (!ia) return false;
+        const int why = kv_due_now ? kIaKv : lanes_.is_bg(l) ? kIaBg : lanes_.inbox_n(l) > 0 ? kIaInbox
+                        : bb->phase != RAD_PHASE_DECODE ? kIaPhase
+                        : (block_rows_ > 0 || (serial_drafting() && serial_rows_ > 0)) ? kIaDraft : -1;
+        if (why >= 0) { ++ia_why[why]; return false; }
         for (const StepEntry& e : sched_of(l).plan().e)
-            if (e.home >= 0 || e.is_prefill || e.n_spec > 0 || !e.produces_token) return false;
+            if (e.home >= 0 || e.is_prefill || e.n_spec > 0 || !e.produces_token) { ++ia_why[kIaRow]; return false; }
         return true;
+    };
+    auto ia_line = [&](const char* when) {
+        RAD_INFO("two-node pipeline: %lld lane steps issued ahead of the collect before them, %lld tails without "
+                 "(RADIANCE_PP_ISSUE_AHEAD=1, tp8 dev D10)%s -- without: KV check due %lld, a BG lane %lld, lent pieces in its "
+                 "inbox %lld, a MIXED / prefill step %lld, its drafter proposing %lld, a row lent / prefill / drafted %lld, "
+                 "step_next declined %lld", (long long)ia_n, (long long)ia_skip, when, (long long)ia_why[kIaKv],
+                 (long long)ia_why[kIaBg], (long long)ia_why[kIaInbox], (long long)ia_why[kIaPhase],
+                 (long long)ia_why[kIaDraft], (long long)ia_why[kIaRow], (long long)ia_why[kIaNext]);
     };
     auto x2_landed = [&](int l) {
         const RadPpRing* x2 = pp_recv_[l * RAD_PP_N_RINGS + RAD_PP_X2];
@@ -719,6 +737,7 @@ int Engine::step_loop_lanes() {
                 if (!block_drafting() && !serial_drafting() && !pipelining_)
                     if (const int ac = advance_all(ADV_ACCEPT, 0, false); ac < 0) return fail_loop(ac);
                 nb = lsched().step_next();
+                if (!nb) ++ia_why[kIaNext];
                 if (nb) {
                     /* its rows' token ids, positions and slots on the card behind this step's sampler (and drafter) */
                     if (const int as = advance_all(ADV_TRUNK, 0, false); as < 0) return fail_loop(as);
@@ -755,11 +774,14 @@ int Engine::step_loop_lanes() {
         busy[(size_t)lane] = nb ? 1 : 0;
         gaps.host_tail(b, tt0, rad_mono_ns());
         gaps.tail(lane, b);
-        if (++lane_steps == 1 || lane_steps % 4096 == 0) {
-            lanes_note(lane_steps, rounds_two);
-            if (ia)
-                RAD_INFO("two-node pipeline: %lld lane steps issued ahead of the collect before them, %lld tails without "
-                         "(RADIANCE_PP_ISSUE_AHEAD=1, tp8 dev D10)", (long long)ia_n, (long long)ia_skip);
+        if (++lane_steps == 1 || lane_steps % 4096 == 0) lanes_note(lane_steps, rounds_two);
+        /* tp8 dev D10 round 2: the counts (run so far) once a minute, so a cell's window is the difference of two lines */
+        if (ia) {
+            const uint64_t now = rad_mono_ns();
+            if (lane_steps == 1 || now - ia_line_ns >= 60000000000ull) {
+                ia_line(lane_steps == 1 ? "" : " over the run so far");
+                ia_line_ns = now;
+            }
         }
         gaps.minute(lane_steps);
         if (pp_ni_) pp_ni_->minute();
@@ -777,9 +799,7 @@ int Engine::step_loop_lanes() {
     if (ready_first)
         RAD_INFO("two-node pipeline: %lld lane steps' tails went before an older long pass whose X2 had not landed, %lld "
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
-    if (ia)
-        RAD_INFO("two-node pipeline: %lld lane steps issued ahead of the collect before them, %lld tails without "
-                 "(RADIANCE_PP_ISSUE_AHEAD=1, tp8 dev D10)", (long long)ia_n, (long long)ia_skip);
+    if (ia) ia_line(" over the run");
     return RAD_OK;
 }
 
