@@ -4930,7 +4930,9 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
     block_len_ = 0;
     block_depth_ = 0;
     block_may_draft_ = false;
-    if (block < 2 || depth <= 0 || depth > block || !out || max <= 0) return 0;
+    /* tp8 loop D18: a block of one row is a drafter whose every row proposes (block = depth, DSpark's convention):
+     * its anchor alone proposes the next token. A drafter whose anchor predicts nothing has block = depth + 1 >= 2. */
+    if (block < 1 || depth <= 0 || depth > block || !out || max <= 0) return 0;
     block_len_   = (int32_t)block;
     block_depth_ = (int32_t)depth;
     block_mask_.assign((size_t)(block - 1), mask);
@@ -5105,7 +5107,7 @@ const RadBatch* Scheduler::block_context(int step) {
  * plugin states which. */
 const RadBatch* Scheduler::block_query(int step) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (block_.empty() || block_len_ < 2 || block_depth_ <= 0) return nullptr;
+    if (block_.empty() || block_len_ < 1 || block_depth_ <= 0) return nullptr;   /* tp8 loop D18: one row (block_begin) */
     const int32_t block = block_len_, steps = block - 1, depth = block_depth_;
 
     block_plan_.reset();

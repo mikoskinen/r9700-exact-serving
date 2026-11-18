@@ -62,6 +62,7 @@ extern "C" int rad_fn4_get(const char* name, int* value) __attribute__((weak));
  * rad-convert or rad-kbench of an older image) still loads this plugin, and a serve there declares no extras. */
 extern "C" int rad_drafter_confidence(RadBuilder* b, rad_buf conf, int64_t pitch) __attribute__((weak));
 extern "C" int rad_drafter_alternatives(RadBuilder* b, rad_buf alt, int64_t n_alt, int64_t pitch) __attribute__((weak));
+extern "C" int rad_drafter_short_block(RadBuilder* b, int64_t block) __attribute__((weak));   /* tp8 loop D18 */
 static int ds41_switch(const char* name) {
     int v = 0;
     return rad_fn4_get && rad_fn4_get(name, &v) > 0 ? v : 0;
@@ -482,6 +483,14 @@ struct Dsp {
     rad_buf cwb = 0, conf = 0, alt = 0;
     rad_op conf_op = 0, alt_op = 0;
     bool cw_up = false;
+    /* tp8 loop D18, the short block (RADIANCE_DS41_DSPARK_SHORT=S, rad_drafter_short_block; --draft-short-from picks it
+     * per step): S rows a drafting sequence, the anchor first, each row proposing the token after it (S proposals, the
+     * front of each proposal row). The ops whose shape names the block, declared again at S: the rows' offsets to the
+     * block's last position, each stage's window attention (window + S keys), the walks (top-K, W1, SD), the confidence
+     * head; every other op of the query pass is per row. sblk 0: the drafter serves its own block only. */
+    int64_t sblk = 0;
+    rad_op poff_lo = 0, select_lo = 0, wmarkov_lo = 0, conf_lo = 0;
+    std::vector<rad_op> attn_lo, wstep_lo, sstep_lo;
 };
 
 /* A dense linear's int8 activation pair, keyed by the GEMM op a linear() declared: the quantiser
@@ -3699,6 +3708,19 @@ static int dsp_config(RadBuilder* b, Model& m, const RadModelMeta* meta, const R
         }
         d.n_alt = v;
     }
+    /* tp8 loop D18: the short block's rows (every rank: the walks' collectives run on all). */
+    d.sblk = 0;
+    if (const char* e = std::getenv("RADIANCE_DS41_DSPARK_SHORT"); e && *e && std::strcmp(e, "0") != 0) {
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (!end || *end || v < 1 || v >= blk) {
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_SHORT=%s: the DSpark short block takes 1 .. %lld "
+                            "rows (the drafter's own block is %lld; 0 or unset: none)\n", e, (long long)(blk - 1),
+                    (long long)blk);
+            return RAD_E_INVAL;
+        }
+        d.sblk = v;
+    }
     d.taps = gl(meta, "dspark.target_layers");
     std::sort(d.taps.begin(), d.taps.end());
     bool ok = !d.taps.empty() && d.noise >= 0 && d.noise < c.n_vocab && d.rank > 0 && d.rank % 32 == 0 &&
@@ -4316,6 +4338,96 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
         if (!d.alt_op) return RAD_E_INVAL;
     }
 
+    /* tp8 loop D18: the short block's ops (declared after every other DSpark op: what they read stays live to here). */
+    const char* sbwhy = nullptr;
+    if (d.sblk > 0) {
+        const int64_t SB = d.sblk;
+        if (d.n_alt > 0) sbwhy = "not with RADIANCE_DS41_DSPARK_ALT (its branches walk the drafter's own block)";
+        if (!sbwhy) {
+            /* apos = position + (SB - 1 - row % SB): each row at its short block's last position */
+            d.poff_lo = op(b, "iota", { RAD_RANGE("M", 1, Q), RAD_INT("start", SB - 1), RAD_INT("step", -1),
+                                        RAD_INT("period", SB) },
+                           {}, {}, { d.poff });
+            if (!d.poff_lo || !rad_op_resolved(b, d.poff_lo)) sbwhy = "no kernel serves iota at the short block";
+        }
+        /* each stage's attention: the window's context keys before the anchor plus the short block's own SB keys */
+        for (size_t i = 0; !sbwhy && i < d.st.size(); ++i) {
+            const Layer& L = d.st[i];
+            if (m.zero) {
+                d.attn_lo.push_back(0);   /* attn_fill in its place, as the drafter's own block */
+                continue;
+            }
+            std::vector<RadParam> dap = { RAD_RANGE("M", 1, Q), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
+                                          RAD_INT("window", c.window + SB), RAD_INT("ratio", 0), RAD_INT("topk", 0),
+                                          RAD_F64("scale", 1.0 / std::sqrt((double)hd)), RAD_STR("dtype", "bf16") };
+            if (m.w8d) dap.push_back(RAD_STR("window_format", "fp8_e4m3"));
+            const rad_op a = op(b, "attn_sparse_sink", dap, { L.sinks }, { d.q, d.apos }, { d.o });
+            if (!a || !rad_op_resolved(b, a)) sbwhy = "no kernel serves attn_sparse_sink at the short block's window";
+            d.attn_lo.push_back(a);
+        }
+        if (!sbwhy) {
+            d.select_lo = op(b, "dflash_select",
+                             { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", SB), RAD_INT("top_k", R),
+                               RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", SB),
+                               RAD_STR("dtype", "bf16") },
+                             { d.mk1, d.mk2 }, { d.cand_, d.unary }, { d.tokens });
+            if (!d.select_lo || !rad_op_resolved(b, d.select_lo)) sbwhy = "no kernel serves dflash_select at the short block";
+        }
+        /* W1 at SB steps on the same planes (step l's rows [l * wseqs, ...), SB * wseqs <= block * wseqs) */
+        if (!sbwhy && d.wfill) {
+            for (int64_t l = 0; l <= SB && !sbwhy; ++l) {
+                const rad_op w = op(b, "dspark_walk_step",
+                                    { RAD_RANGE("M", 1, d.wseqs), RAD_INT("step", l), RAD_INT("steps", SB),
+                                      RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("N", g.n_vocab),
+                                      RAD_INT("vocab_off", g.vocab_off), RAD_INT("world", g.world),
+                                      RAD_INT("anchor_stride", SB), RAD_STR("dtype", "f32") },
+                                    { d.mk1, d.mk2 }, { d.logits, d.wgath, d.wkeys }, { d.wkeys, d.tokens });
+                if (!w || !rad_op_resolved(b, w)) sbwhy = "dspark_walk_step at the short block: no kernel serves it";
+                d.wstep_lo.push_back(w);
+            }
+        } else if (!sbwhy && d.wmarkov) {
+            d.wmarkov_lo = op(b, "dflash_markov_greedy_f32",
+                              { RAD_RANGE("M", 1, d.wseqs), RAD_INT("steps", SB), RAD_INT("rank", d.rank),
+                                RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", SB), RAD_STR("dtype", "bf16") },
+                              { d.mk1, d.mk2 }, { d.logits }, { d.wts, d.wtt, d.tokens });
+            if (!d.wmarkov_lo || !rad_op_resolved(b, d.wmarkov_lo)) sbwhy = "dflash_markov_greedy_f32 at the short block";
+        }
+        /* SD at SB steps on the same planes (keys [l * sseqs, ...), the state's first SB rounds, the counter's first SB rows) */
+        if (!sbwhy && !d.sstep.empty()) {
+            const rad_weight ws[2] = { d.mk1, d.mk2 };
+            for (int64_t l = 0; l <= SB && !sbwhy; ++l) {
+                const RadParam ps[] = { RAD_RANGE("M", 1, d.sseqs), RAD_INT("step", l), RAD_INT("steps", SB),
+                                        RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("N", g.n_vocab),
+                                        RAD_INT("vocab_off", g.vocab_off), RAD_INT("world", g.world),
+                                        RAD_INT("anchor_stride", SB), RAD_STR("dtype", "f32") };
+                const rad_op w = rad_decl_op(b, "dspark_walk_sample_step", ps, (int)(sizeof ps / sizeof ps[0]), ws, 2);
+                if (!w || !rad_op_resolved(b, w)) {
+                    sbwhy = "dspark_walk_sample_step at the short block: no kernel serves it";
+                } else {
+                    rw(b, w, { d.logits, d.sgath, d.skeys, d.sscr, d.scnt, d.sdraw, d.sqt, d.sstate },
+                       { d.skeys, d.tokens, d.sscr, d.scnt, d.sstate });
+                }
+                d.sstep_lo.push_back(w);
+            }
+        }
+        if (!sbwhy && d.conf_op) {
+            d.conf_lo = op(b, "dspark_conf",
+                           { RAD_RANGE("M", 1, g.max_seqs), RAD_INT("steps", SB), RAD_INT("n_embd", D),
+                             RAD_INT("rank", d.rank), RAD_INT("n_vocab", c.n_vocab), RAD_INT("anchor_stride", SB),
+                             RAD_F64("bias", d.cbias), RAD_STR("dtype", "bf16") },
+                           { d.mk1 }, { d.x, d.tokens, d.cwb }, { d.conf });
+            if (!d.conf_lo || !rad_op_resolved(b, d.conf_lo)) sbwhy = "no kernel serves dspark_conf at the short block";
+        }
+        if (!sbwhy && !rad_drafter_short_block) sbwhy = "this host has no rad_drafter_short_block (ABI 27)";
+        if (sbwhy) {
+            d.sblk = 0;
+            d.poff_lo = d.select_lo = d.wmarkov_lo = d.conf_lo = 0;
+            d.attn_lo.clear();
+            d.wstep_lo.clear();
+            d.sstep_lo.clear();
+        }
+    }
+
     RadDrafterDecl drf{};
     drf.name = "dspark";
     drf.kind = RAD_DRAFT_BLOCK;
@@ -4329,6 +4441,24 @@ static int dsp_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     DS_TRY(rad_declare_drafter(b, &drf));
     if (d.conf) DS_TRY(rad_drafter_confidence(b, d.conf, d.block));
     if (d.alt) DS_TRY(rad_drafter_alternatives(b, d.alt, d.n_alt, d.block));
+    /* tp8 loop D18 */
+    if (d.sblk > 0) {
+        DS_TRY(rad_drafter_short_block(b, d.sblk));
+        rad_note(b, "DSpark short block (tp8 loop D18, RADIANCE_DS41_DSPARK_SHORT=%lld): [anchor, noise x %lld] proposes %lld "
+                    "token(s); attention over %lld context keys + its own %lld; walks / confidence head at %lld steps; the "
+                    "engine's --draft-short-from picks it per step", (long long)d.sblk, (long long)(d.sblk - 1),
+                 (long long)d.sblk, (long long)c.window, (long long)d.sblk, (long long)d.sblk);
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: DSpark short block (tp8 loop D18): %lld row(s) a sequence = %lld proposal(s) "
+                            "(the drafter's own block %lld), its query pass at %lld rows a sequence whenever the engine's "
+                            "--draft-short-from picks it (RADIANCE_DS41_DSPARK_SHORT=%lld)\n",
+                    (long long)d.sblk, (long long)d.sblk, (long long)d.block, (long long)d.sblk, (long long)d.sblk);
+    } else if (sbwhy) {
+        rad_note(b, "DSpark short block (tp8 loop D18) NOT declared: %s", sbwhy);
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DSPARK_SHORT is set but the short block is NOT declared: %s\n",
+                    sbwhy);
+    }
     if (d.conf || d.alt)
         rad_note(b, "DSpark extras (ds41-acc): %s%s%s", d.conf ? "the confidence head (sidecar " : "",
                  d.conf ? d.conf_path.c_str() : "", d.conf ? ", dspark_conf)" : "");
@@ -6274,7 +6404,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     const int64_t T = batch->n_tok, S = batch->n_seq, D = c.n_embd;
     const int64_t HD = g.n_head * c.head_dim, hd = c.head_dim;
     if (T <= 0 || S <= 0) return;
-    if (T != S * d.block || T > d.Q) {
+    /* tp8 loop D18: the pass's block, the drafter's own or its short one (every drafting sequence carries the same) */
+    const bool lo = d.sblk > 0 && d.sblk != d.block && T == S * d.sblk;
+    const int64_t blk = lo ? d.sblk : d.block;
+    if ((!lo && T != S * d.block) || T > d.Q) {
         rad_step_fail(x, "deepseek41: a DSpark query pass staged at a block this drafter has no ops for");
         return;
     }
@@ -6292,10 +6425,11 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     RAD_ISSUE_N(x, d.pre0, T, brows(d.pre_f, T));
     RAD_ISSUE_N(x, d.pre1, T, bcol(d.pre_f, 0, 1, T));
     RAD_ISSUE_N(x, d.q_tab, T, pos, brows(m.cs_a, g.max_ctx));
-    RAD_ISSUE_N(x, d.poff_op, T, brows(d.poff, T));
+    RAD_ISSUE_N(x, lo ? d.poff_lo : d.poff_op, T, brows(d.poff, T));
     RAD_ISSUE_N(x, d.apos_op, T, pos, brows(d.poff, T), brows(d.apos, T));
 
     for (const auto& L : d.st) {
+        const size_t si = (size_t)(&L - d.st.data());   /* tp8 loop D18: the stage's short-block attention */
         RAD_ISSUE_N(x, L.mix_a, T, brows(d.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base),
                     brows(d.pre_a, T), brows(d.post, T), brows(d.comb, T));
         RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
@@ -6319,7 +6453,7 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             else
                 RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
                             praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
-            RAD_ISSUE_N(x, L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
+            RAD_ISSUE_N(x, lo ? d.attn_lo[si] : L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
                         praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
                         RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
             RAD_ISSUE_N(x, L.o_rope, T, brows(d.o, T), brows(m.cs_a, g.max_ctx), pos);
@@ -6362,39 +6496,44 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     /* Lever SD: the sampled walk while the engine's draft_sample is >= 1 (declared under --draft-coupling on). It
      * replaces whichever walk dspark_walk names (a greedy row drafts W1's token); the engine stages the draws and the
      * q_temp column before this pass and reads the states back behind it. */
-    const bool sampled = !d.sstep.empty() && ds41_switch("draft_sample") >= 1 && N == S * d.block && S <= d.sseqs;
-    const bool walked = sampled || ((d.wfill || d.wmarkov) && wsw >= 1 && N == S * d.block && S <= d.wseqs);
+    /* tp8 loop D18: at the short block every walk is its own op set at blk steps, on the same planes */
+    const std::vector<rad_op>& sst = lo ? d.sstep_lo : d.sstep;
+    const bool wdecl = lo ? (!d.wstep_lo.empty() || d.wmarkov_lo) : (d.wfill || d.wmarkov);
+    const bool sampled = !sst.empty() && ds41_switch("draft_sample") >= 1 && N == S * blk && S <= d.sseqs;
+    const bool walked = sampled || (wdecl && wsw >= 1 && N == S * blk && S <= d.wseqs);
     if (sampled) {
         const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
         const int64_t SS = d.sseqs, SR = 16, GW = SR * g.world;
-        RAD_ISSUE_N(x, d.sfill, d.block, brows(d.scnt, d.block));
-        for (int64_t l = 0; l <= d.block; ++l) {
-            const bool last = l == d.block;
-            RAD_ISSUE_N(x, d.sstep[(size_t)l], S, brows(d.logits, N), anchor,
+        RAD_ISSUE_N(x, d.sfill, blk, brows(d.scnt, blk));
+        for (int64_t l = 0; l <= blk; ++l) {
+            const bool last = l == blk;
+            RAD_ISSUE_N(x, sst[(size_t)l], S, brows(d.logits, N), anchor,
                         l ? brow_slice(d.sgath, (l - 1) * SS, S, GW) : RAD_NONE, RAD_W(d.mk1), RAD_W(d.mk2),
                         last ? RAD_NONE : brow_slice(d.skeys, l * SS, S, SR), brows(d.tokens, S),
                         last ? RAD_NONE : brows(d.sscr, S * d.snblk), last ? RAD_NONE : brow_slice(d.scnt, l, 1, 4),
                         praw(batch->seq_ids, RAD_I32, S), brows(d.sdraw, S), brows(d.sqt, S), RAD_B(d.sstate));
             if (!last) RAD_ISSUE(x, d.sag, brow_slice(d.skeys, l * SS, S, SR), brow_slice(d.sgath, l * SS, S, GW));
         }
-    } else if (walked && d.wmarkov) {
+    } else if (walked && (lo ? d.wmarkov_lo : d.wmarkov)) {
         const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
-        RAD_ISSUE_N(x, d.wmarkov, S, brows(d.logits, N), anchor, RAD_W(d.mk1), RAD_W(d.mk2), brows(d.wts, S),
-                    brows(d.wtt, S), brows(d.tokens, S));
+        RAD_ISSUE_N(x, lo ? d.wmarkov_lo : d.wmarkov, S, brows(d.logits, N), anchor, RAD_W(d.mk1), RAD_W(d.mk2),
+                    brows(d.wts, S), brows(d.wtt, S), brows(d.tokens, S));
     } else if (walked) {
         const RadOperand anchor = praw(batch->token_ids, RAD_I32, T);
         const int64_t WS = d.wseqs, KC = ds41walk::keys_cols(), GW = ds41walk::gath_cols(g.world);
-        const int64_t KR = ds41walk::plane_rows(d.block, WS);
+        const int64_t KR = ds41walk::plane_rows(blk, WS);
+        /* the scoring steps: W1b's form 1 while dspark_walk is 2 at the drafter's own block; the short block's form 0 */
+        const std::vector<rad_op>& wst = lo ? d.wstep_lo : (wsw == 2 && !d.wstep2.empty() ? d.wstep2 : d.wstep);
         RAD_ISSUE_N(x, d.wfill, KR, brows(d.wkeys, KR));
-        for (int64_t l = 0; l < d.block; ++l) {
+        for (int64_t l = 0; l < blk; ++l) {
             const int64_t r0 = ds41walk::step_row(l, WS);
-            RAD_ISSUE_N(x, (wsw == 2 && !d.wstep2.empty() ? d.wstep2 : d.wstep)[(size_t)l], S, brows(d.logits, N), anchor,
+            RAD_ISSUE_N(x, wst[(size_t)l], S, brows(d.logits, N), anchor,
                         l ? brow_slice(d.wgath, ds41walk::step_row(l - 1, WS), S, GW) : RAD_NONE, RAD_W(d.mk1),
                         RAD_W(d.mk2), brow_slice(d.wkeys, r0, S, KC), brows(d.tokens, S));
             RAD_ISSUE(x, d.wag, brow_slice(d.wkeys, r0, S, KC), brow_slice(d.wgath, r0, S, GW));
         }
-        RAD_ISSUE_N(x, d.wstep[(size_t)d.block], S, brows(d.logits, N), anchor,
-                    brow_slice(d.wgath, ds41walk::step_row(d.block - 1, WS), S, GW), RAD_W(d.mk1), RAD_W(d.mk2),
+        RAD_ISSUE_N(x, (lo ? d.wstep_lo : d.wstep)[(size_t)blk], S, brows(d.logits, N), anchor,
+                    brow_slice(d.wgath, ds41walk::step_row(blk - 1, WS), S, GW), RAD_W(d.mk1), RAD_W(d.mk2),
                     RAD_NONE, brows(d.tokens, S));
     } else {
         if (d.merge) {
@@ -6404,12 +6543,12 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         } else {
             RAD_ISSUE_N(x, d.topk, N, brows(d.logits, N), brows(d.cand_, N), brows(d.unary, N), RAD_NONE);
         }
-        RAD_ISSUE_N(x, d.select, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE, praw(batch->token_ids, RAD_I32, T),
-                    RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
+        RAD_ISSUE_N(x, lo ? d.select_lo : d.select, S, brows(d.cand_, N), brows(d.unary, N), RAD_NONE,
+                    praw(batch->token_ids, RAD_I32, T), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.tokens, S));
     }
     /* The DSpark extras (ds41-acc, rank 0), each only while its switch is on: the switches move at a
      * step release with a new epoch, so a pass recorded without them is never played with them. */
-    if (d.conf_op && ds41_switch("dspark_conf") > 0) {
+    if ((lo ? d.conf_lo : d.conf_op) && ds41_switch("dspark_conf") > 0) {
         if (!d.cw_up) {   /* the sidecar's weights, once, landed before the head is issued */
             void* p = rad_buf_ptr(x, d.cwb);
             if (!p || rad_memcpy_async(p, d.cw.data(), (int64_t)d.cw.size() * 4, rad_stream(x)) < 0 ||
@@ -6419,10 +6558,10 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             }
             d.cw_up = true;
         }
-        RAD_ISSUE_N(x, d.conf_op, S, brows(d.x, T), praw(batch->token_ids, RAD_I32, T), brows(d.tokens, S),
-                    RAD_W(d.mk1), brows(d.cwb, 1), brows(d.conf, S));
+        RAD_ISSUE_N(x, lo ? d.conf_lo : d.conf_op, S, brows(d.x, T), praw(batch->token_ids, RAD_I32, T),
+                    brows(d.tokens, S), RAD_W(d.mk1), brows(d.cwb, 1), brows(d.conf, S));
     }
-    if (d.alt_op && !walked && ds41_switch("dspark_alt") > 0)
+    if (d.alt_op && !lo && !walked && ds41_switch("dspark_alt") > 0)
         RAD_ISSUE_N(x, d.alt_op, S, brows(d.cand_, N), brows(d.unary, N), praw(batch->token_ids, RAD_I32, T),
                     brows(d.tokens, S), RAD_W(d.mk1), RAD_W(d.mk2), brows(d.alt, S));
 }

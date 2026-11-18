@@ -266,6 +266,17 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* ---- tp8 loop D18: DSpark's short block (deepseek41 RADIANCE_DS41_DSPARK_SHORT=1 / 2): the walk at 1 / 2 steps, the
+     * anchors at stride 1 / 2 (each sequence's block of that many rows), the tokens at a wider pitch (the proposal row's) */
+    for (const int st : { 1, 2 })
+        for (const Rnd& c : rnd) {
+            Walk w;
+            w.V = c.V; w.R = c.R; w.S = c.S; w.steps = st; w.astride = st;
+            std::vector<uint16_t> w1, w2;
+            fill_random(w, w1, w2, rng, c.ts, c.ls, c.bad);
+            check(st == 1 ? "short block of 1 row (one step)" : "short block of 2 rows (two steps)", w, { 1, 2, 3, 4 });
+        }
+
     /* ---- forced ties */
     {
         Walk w;

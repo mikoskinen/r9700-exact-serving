@@ -667,6 +667,7 @@ int Engine::step_loop_lanes() {
     /* tp8 loop P23: the BG lanes' steps (run so far) once a minute under RADIANCE_PP_BG_ROOM, so a cell's window is the difference
      * of two lines: steps, newcomers, steps with >= 2 newcomers (batched) and their newcomers / rows, >= 3, the widest step */
     uint64_t bgst_line_ns = rad_mono_ns();
+    uint64_t sb_line_ns = bgst_line_ns;   /* tp8 loop D18: the short block's minute line */
     auto bgst_line = [&](const char* when) {
         const LaneSet::Counts c = lanes_.counts();
         RAD_INFO("two-node pipeline: BG steps%s (RADIANCE_PP_BG_ROOM=%lld, tp8 loop P23): %lld steps with %lld newcomers; %lld steps "
@@ -1215,6 +1216,13 @@ int Engine::step_loop_lanes() {
         }
         gaps.minute(lane_steps);
         if (pp_ni_) pp_ni_->minute();
+        if (drafter_short_ > 0) {   /* tp8 loop D18: once a minute */
+            const uint64_t now = rad_mono_ns();
+            if (now - sb_line_ns >= 60000000000ull) {
+                short_block_line(" so far");
+                sb_line_ns = now;
+            }
+        }
     }
     lanes_note(lane_steps, rounds_two);
     gaps.end(lane_steps);
@@ -1235,6 +1243,7 @@ int Engine::step_loop_lanes() {
                               (long long)g_band_min_seqs);
     if (lanes_.bg_room() > 0) bgst_line(" over the run");
     if (ia) ia_line(" over the run");
+    short_block_line(" over the run");   /* tp8 loop D18 */
     return RAD_OK;
 }
 

@@ -1037,6 +1037,17 @@ void Engine::block_shape(int* block, int* steps) {
     }
 }
 
+/* tp8 loop D18: the short block's share of the query passes so far (only while one is served). */
+void Engine::short_block_line(const char* when) const {
+    if (drafter_short_ <= 0) return;
+    RAD_INFO("speculation%s: %lld query passes ran '%s''s short block of %lld row(s) a sequence (%lld rows, %.2f a pass), "
+             "%lld its own block of %lld (%lld rows) -- --draft-short-from %lld (tp8 loop D18)", when, (long long)short_q_n_,
+             drafter_name_.c_str(), (long long)drafter_short_, (long long)short_q_rows_,
+             short_q_n_ ? (double)short_q_rows_ / (double)short_q_n_ : 0.0, (long long)long_q_n_,
+             (long long)(drafter_.block > 0 ? drafter_.block : drafter_.depth + 1), (long long)long_q_rows_,
+             (long long)short_from_);
+}
+
 int Engine::issue_block_drafter(int step, StepOut& so) {
     block_rows_ = 0;
     conf_val_ = 0;
@@ -1087,6 +1098,10 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     if (!qb) return RAD_OK;
     RAD_TRY(advance_all(ADV_BLOCK, 0, false));
     RAD_TRY(block_pass(qb, "query", step));
+    if (drafter_short_ > 0) {   /* tp8 loop D18: which block this query pass ran */
+        if (block == (int)drafter_short_) { ++short_q_n_; short_q_rows_ += qb->n_tok; }
+        else                              { ++long_q_n_;  long_q_rows_  += qb->n_tok; }
+    }
     RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
     Rank& r0 = *ranks_[0];
     if (couple_cycle_) {

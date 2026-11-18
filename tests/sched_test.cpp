@@ -8084,6 +8084,47 @@ TEST(a_block_drafters_short_block_on_the_card_runs_the_passes_the_hosts_driver_r
     CHECK(a.out == b.out);
 }
 
+/* tp8 loop D18: DSpark's short block (block = depth: every row proposes, the anchor included), 2 rows and ONE row a
+ * sequence -- the depth-capped lanes' form (deepseek41 RADIANCE_DS41_DSPARK_SHORT + --draft-short-from). The scheduler
+ * refused blocks under 2 rows; one row is the anchor alone at the committed end, proposing the next token. The card's
+ * driver runs the host's passes at each, and a 1-row query pass is one row a drafting sequence. */
+TEST(a_dspark_short_block_of_one_or_two_rows_runs_the_passes_the_hosts_driver_runs) {
+    const int T = 24;
+    for (const int blk : { 5, 2, 1 }) {
+        const BlockRun a = block_reference(T, blk, blk);
+        const BlockRun b = block_pipelined(T, blk, blk);
+        CHECK_EQ(b.ahead, T);
+        CHECK_EQ(b.card_host_disagree, 0);
+        REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
+        REQUIRE_EQ(a.trunk.size(), b.trunk.size());
+        REQUIRE_EQ(a.context.size(), b.context.size());
+        REQUIRE_EQ(a.query.size(), b.query.size());
+        int diff = 0;
+        for (size_t t = 0; t < a.trunk.size(); ++t) {
+            diff += !(a.trunk[t] == b.trunk[t]);
+            CHECK_EQ(b.trunk[t].bad_slots, 0);
+        }
+        for (size_t t = 0; t < a.context.size(); ++t) {
+            BatchRows ca = a.context[t], cb = b.context[t];
+            ca.tok.clear();
+            cb.tok.clear();
+            diff += !(ca == cb) + !(a.query[t] == b.query[t]);
+            CHECK_EQ(a.query[t].bad_slots, 0);
+            CHECK_EQ(b.query[t].bad_slots, 0);
+            /* the query pass: three drafting sequences, `blk` rows each, the anchor first at the committed end */
+            REQUIRE_EQ(b.query[t].q.size(), (size_t)3);
+            for (const int32_t q : b.query[t].q) CHECK_EQ(q, blk);
+            CHECK_EQ(b.query[t].tok.size(), (size_t)(3 * blk));
+            if (blk == 1)
+                for (const int32_t tok : b.query[t].tok) CHECK(tok != kBlkMask);   /* anchors only, no mask row */
+        }
+        CHECK_EQ(diff, 0);
+        CHECK(a.out == b.out);
+        std::fprintf(stderr, "    DSpark block %d (depth %d): %zu trunk steps, %d issued ahead, %d differ\n", blk, blk,
+                     b.trunk.size(), b.ahead, diff);
+    }
+}
+
 /* ================================================================== the token budget per token */
 /* A verify step emits up to 1 + n_spec tokens at once. The budget (max_tokens, and the context)
  * is applied token by token before each reaches the sink: trimming `output` afterwards would leave

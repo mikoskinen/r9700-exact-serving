@@ -585,6 +585,10 @@ private:
     bool                 short_on_ = false;     /* the short block runs now (block_shape) */
     /* --draft-short-from resolved at bring-up (auto: 0 for a chain, 2 for a tree). */
     int64_t              short_from_ = 0;
+    /* tp8 loop D18: query passes (and their rows) at the short block and at the drafter's own, counted while a short block
+     * is served (drafter_short_ > 0); the two-node pipeline's minute and stop lines print them. */
+    int64_t              short_q_n_ = 0, short_q_rows_ = 0, long_q_n_ = 0, long_q_rows_ = 0;
+    void                 short_block_line(const char* when) const;
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */
