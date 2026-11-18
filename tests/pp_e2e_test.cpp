@@ -2156,7 +2156,7 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
  * one process (the same flags) at 4 lanes W(1,3) / W(0,2) BG 2 and 3 lanes W(0,2) / W(1,3) BG 1, bits 1 / 2 / 3, and with the
  * follower's own embedding (W(0,2) + RADIANCE_PP_FOLLOWER_EMBED=1: bit 1 is not taken there), and bit 4 (a segment held back
  * up to the 10 ms grace for a frame's X1) at 7 / 5; the follower counts the frames that waited for their X1 / went before an
- * older one / passed a held one. */
+ * older one / passed a held one; + beside the leader's BG segments (M9 LEAD_SEG=1 + AHEAD) at 4 lanes W(1,3) BG 2, =3 / =7. */
 TEST(follower_frame_order_serves_one_process_tokens) {
     REQUIRE(world().ok);
     const std::vector<std::string> ext_r = { "--max-num-seqs", "10", "--max-num-batched-tokens", "2112", "--max-model-len", "2048",
@@ -2178,17 +2178,23 @@ TEST(follower_frame_order_serves_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { bool room; int lanes; const char* cut; const char* bg; const char* order; bool fe = false; };
+    struct Arm { bool room; int lanes; const char* cut; const char* bg; const char* order; bool fe = false; bool lseg = false; };
     long long waited_all = 0, jumped_all = 0, passed_all = 0;
     for (const Arm a : { Arm{ true, 4, "1,3", "2", "3" }, Arm{ true, 4, "0,2", "2", "3" }, Arm{ true, 4, "1,3", "2", "1" },
                          Arm{ true, 4, "1,3", "2", "2" }, Arm{ false, 3, "0,2", "1", "3" }, Arm{ false, 3, "1,3", "1", "3" },
                          Arm{ false, 4, "1,3", "2", "3" }, Arm{ false, 3, "0,2", "1", "3", true },
-                         Arm{ true, 4, "1,3", "2", "7" }, Arm{ false, 3, "1,3", "1", "5" } }) {
+                         Arm{ true, 4, "1,3", "2", "7" }, Arm{ false, 3, "1,3", "1", "5" },
+                         Arm{ true, 4, "1,3", "2", "3", false, true }, Arm{ false, 4, "1,3", "2", "7", false, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(std::string("RADIANCE_PP_BG_LANE=") + a.bg);
         env.push_back(std::string("RADIANCE_PP_FOL_ORDER=") + a.order);
         if (a.room) env.push_back("RADIANCE_PP_BG_ROOM=2112");
         if (a.fe) env.push_back("RADIANCE_PP_FOLLOWER_EMBED=1");
+        if (a.lseg) {   /* + the leader's BG segments (M9): both nodes fill their waits with BG segments */
+            env.push_back("RADIANCE_PP_LEAD_SEG=1");
+            env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1");
+            env.push_back("RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15");
+        }
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
@@ -2234,7 +2240,7 @@ TEST(follower_frame_order_serves_one_process_tokens) {
         passed_all += std::max(0LL, passed);
         fprintf(stderr, "    FOL_ORDER=%s%s, BG lanes %s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to BG lanes; "
                         "follower %lld passes in %lld segments, %lld passes between, %lld held; %lld waited for X1, %lld went "
-                        "before an older one, %lld passed a held frame\n", a.order, a.fe ? " + FE" : "", a.bg,
+                        "before an older one, %lld passed a held frame\n", a.order, a.fe ? " + FE" : a.lseg ? " + LEAD_SEG=1 + AHEAD" : "", a.bg,
                 a.room ? " + BG_ROOM=2112" : "", a.lanes, a.cut, differ, ref.size(), bg, passes, parts, between, held, waited,
                 jumped, passed);
         CHECK_EQ(differ, 0);
