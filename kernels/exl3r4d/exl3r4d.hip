@@ -157,6 +157,9 @@ static __device__ __forceinline__ void inject_delay(bool here) {
 #ifndef EXL3R4D_SGB  // pin the gather loop's per-k-step schedule with sched_group_barrier (VMEM, VALU, WMMA)
 #define EXL3R4D_SGB 0
 #endif
+#ifndef EXL3R4D_X6_SGB  // X6 S1 probes (tp8 DECODE, QUEUE X6): the X3D K loop's per-k-step schedule pinned three ways; 0 = the compiler's
+#define EXL3R4D_X6_SGB 0
+#endif
 #ifndef EXL3R4D_TOKL  // P1h: the in-GEMM rotation takes each row's flat index from the pass's own tok registers
 #define EXL3R4D_TOKL 0
 #endif
@@ -1124,6 +1127,23 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
       else if constexpr (FOLD) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
+      if constexpr (EXL3R4D_X6_SGB == 1) { /* X6 S1 probe: the step's loads, its decode, its WMMAs, in that order */ \
+        __builtin_amdgcn_sched_group_barrier(0x020, 2 * NPW + 2, 0);                \
+        __builtin_amdgcn_sched_group_barrier(0x002, 32 * NPW, 0);                   \
+        __builtin_amdgcn_sched_group_barrier(0x008, NPW, 0);                        \
+      } else if constexpr (EXL3R4D_X6_SGB == 2) { /* X6 S1 probe: loads, then each tile's decode and its WMMA */ \
+        __builtin_amdgcn_sched_group_barrier(0x020, 2 * NPW + 2, 0);                \
+        _Pragma("unroll") for (int j = 0; j < NPW; j++) {                            \
+          __builtin_amdgcn_sched_group_barrier(0x002, 32, 0);                         \
+          __builtin_amdgcn_sched_group_barrier(0x008, 1, 0);                          \
+        }                                                                            \
+      } else if constexpr (EXL3R4D_X6_SGB == 3) { /* X6 S1 probe: the decode in quarters with a load between */ \
+        _Pragma("unroll") for (int q = 0; q < 4; q++) {                              \
+          __builtin_amdgcn_sched_group_barrier(0x020, 1, 0);                          \
+          __builtin_amdgcn_sched_group_barrier(0x002, 8 * NPW, 0);                    \
+        }                                                                            \
+        __builtin_amdgcn_sched_group_barrier(0x008, NPW, 0);                        \
+      }                                                                              \
       break;                                                                         \
     }                                                                                \
     if constexpr (K25 != K25_OFF) { /* K25U: the tiles' windows, their unpacked decode phase by phase, the WMMAs */ \
