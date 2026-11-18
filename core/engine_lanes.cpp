@@ -238,6 +238,12 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  "0-%d%s", lanes_.bg_lane(), n_lanes_ - 1, lanes_.bg_n(), n_lanes_ - lanes_.bg_n(), (long long)cfg_.max_seqs,
                  lanes_.bg_lane() - 1,
                  lanes_.lend_split() || lanes_.lend_mixed() ? " (before RADIANCE_PP_LEND_MIXED, which takes what it leaves)" : "");
+    if (lanes_.bg_lane() == 1)
+        RAD_WARN("two-node pipeline: RADIANCE_PP_BG_LANE leaves ONE decode lane at --pp-lanes %d: decode steps no longer overlap on "
+                 "the two nodes (use --pp-lanes %d)", n_lanes_, n_lanes_ + 1);
+    if (const char* rf = std::getenv("RADIANCE_PP_READY_FIRST"); lanes_.bg_lane() >= 0 && !(rf && !std::strcmp(rf, "1")))
+        RAD_WARN("two-node pipeline: RADIANCE_PP_BG_LANE without RADIANCE_PP_READY_FIRST=1: a decode lane's tail waits behind a BG "
+                 "step's in the leader's order (tp8 dev M8)");
     if (lanes_.lend_split())
         RAD_INFO("two-node pipeline: a newcomer planned whole beside decode rows is cut at the 512-grid point nearest its middle and "
                  "its rest lent to one lane with an empty inbox and nothing waiting, its first token there (RADIANCE_PP_LEND_MIXED=2, "

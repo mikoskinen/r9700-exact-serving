@@ -1350,6 +1350,9 @@ int Engine::follower_loop() {
     if (const char* v = std::getenv("RADIANCE_PP_SEG_AHEAD"); v && *v) seg_ahead = std::min<int64_t>(1, std::max<int64_t>(0, std::atoll(v)));
     if (const char* v = std::getenv("RADIANCE_PP_SEG_TEST_WAIT_MS"); v && *v) seg_wait_ms = std::max<int64_t>(0, std::atoll(v));
     RadEvent seg_ev[2] = {};
+    if (seg_bg >= 0 && segs.empty())
+        RAD_WARN("follower: RADIANCE_PP_BG_LANE is set but no layer segments are declared (RADIANCE_PP_SEG_LAYERS on this node): the "
+                 "BG lanes' passes run whole and every decode pass queues behind them, as a MIXED step's did (tp8 dev M8)");
     if (!segs.empty()) {
         std::string b;
         for (int32_t x : segs) b += fmt("%s%d", b.empty() ? "" : ", ", (int)x);
