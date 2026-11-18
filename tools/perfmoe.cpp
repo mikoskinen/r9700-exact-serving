@@ -68,6 +68,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <map>
 #include <vector>
 
 namespace {
@@ -467,11 +468,13 @@ int main(int argc, char** argv) {
         FILE* f = std::fopen(o.routing.c_str(), "rb");
         if (!f) die("cannot read " + o.routing);
         std::vector<int32_t> rec(520);
+        std::map<int64_t, int64_t> rows_seen;   // tp8 X7: (n_expert, rows) of every record, named when none matches
         // tp8 X7: --route-half H -- the records are the whole model's (2 E experts, M x rtk rows); the half's experts, in their
         // order, become a record of E experts; only a half with exactly M x top_k rows is kept (counted: the rest are named)
         const int64_t rtk = o.route_topk > 0 ? o.route_topk : 2 * o.topk;
         int64_t seen = 0, kept_rows_off = 0, half_rows_sum = 0, half_live_sum = 0;
         while (std::fread(rec.data(), 4, 520, f) == 520) {
+            if (rec[0] > 0) ++rows_seen[((int64_t)rec[0] << 32) | (uint32_t)rec[1]];
             if (o.route_half < 0) {
                 if (rec[0] == (int32_t)o.E && rec[1] == (int32_t)(o.M * o.topk)) recs.push_back(rec);
                 continue;
@@ -502,7 +505,14 @@ int main(int argc, char** argv) {
                         o.route_place.c_str(), (long long)seen, (long long)(2 * o.E), (long long)(o.M * rtk),
                         seen ? (double)half_rows_sum / seen : 0.0, seen ? (double)half_live_sum / seen : 0.0, recs.size(),
                         (long long)(o.M * o.topk), (long long)kept_rows_off);
-        if (recs.empty()) die("--routing: no record with n_expert " + std::to_string(o.E) + " and rows " + std::to_string(o.M * o.topk));
+        if (recs.empty()) {   // tp8 X7: the file's most frequent (n_expert, rows) pairs, so the next run can pick its M
+            std::vector<std::pair<int64_t, int64_t>> top(rows_seen.begin(), rows_seen.end());
+            std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+            for (size_t i = 0; i < top.size() && i < 12; ++i)
+                std::printf("perfmoe: --routing file: %lld records of n_expert %lld, rows %lld\n", (long long)top[i].second,
+                            (long long)(top[i].first >> 32), (long long)(uint32_t)top[i].first);
+            die("--routing: no record with n_expert " + std::to_string(o.E) + " and rows " + std::to_string(o.M * o.topk));
+        }
         std::printf("perfmoe: --routing %zu engine routings (n_expert %lld, rows %lld)\n", recs.size(), (long long)o.E,
                     (long long)(o.M * o.topk));
     }
