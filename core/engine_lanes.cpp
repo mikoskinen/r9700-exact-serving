@@ -520,6 +520,13 @@ int Engine::step_loop_lanes() {
                      lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : tail_ahead_ ? "not with RADIANCE_PP_TAIL_AHEAD=1"
                                                                                     : "the plugin declared no boundary on this node");
     }
+    uint64_t lseg_line_ns = rad_mono_ns();
+    auto lseg_line = [&](const char* when) {
+        RAD_INFO("two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld other lanes' tails while one "
+                 "was in flight (%lld of them between two of its segments), %lld polls with nothing to issue "
+                 "(RADIANCE_PP_LEAD_SEG, tp8 dev M9)%s", (long long)lseg_steps, (long long)lseg_parts, (long long)lseg_between,
+                 (long long)lseg_inside, (long long)lseg_polls, when);
+    };
     auto lseg_busy = [&]() {
         for (const LSeg& s : lsg)
             if (s.st != kLsNone) return true;
@@ -940,6 +947,14 @@ int Engine::step_loop_lanes() {
                 ia_line_ns = now;
             }
         }
+        /* tp8 dev M9: the counts (run so far) once a minute, as D10's */
+        if (lseg) {
+            const uint64_t now = rad_mono_ns();
+            if (now - lseg_line_ns >= 60000000000ull) {
+                lseg_line(" so far");
+                lseg_line_ns = now;
+            }
+        }
         gaps.minute(lane_steps);
         if (pp_ni_) pp_ni_->minute();
     }
@@ -956,11 +971,7 @@ int Engine::step_loop_lanes() {
     if (ready_first)
         RAD_INFO("two-node pipeline: %lld lane steps' tails went before an older long pass whose X2 had not landed, %lld "
                  "waits for a first X2 (RADIANCE_PP_READY_FIRST=1)", (long long)rf_taken, (long long)rf_waits);
-    if (lseg)
-        RAD_INFO("two-node pipeline: %lld BG steps ran their leader parts in %lld segments, %lld other lanes' tails while one "
-                 "was in flight (%lld of them between two of its segments), %lld polls with nothing to issue "
-                 "(RADIANCE_PP_LEAD_SEG, tp8 dev M9)", (long long)lseg_steps, (long long)lseg_parts, (long long)lseg_between,
-                 (long long)lseg_inside, (long long)lseg_polls);
+    if (lseg) lseg_line("");
     if (ia) ia_line(" over the run");
     return RAD_OK;
 }
