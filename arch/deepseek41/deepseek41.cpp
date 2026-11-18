@@ -6467,6 +6467,21 @@ static void dsp_context(RadCtx* x, Model& m, const RadBatch* batch) {
     }
 }
 
+/* Lever DMR: a stage's ffn mix beside its MoE's routed gate_up (the trunk's MixBeside on the drafter's buffers). */
+struct DspMixBeside {
+    const Layer* L;
+    const Dsp* d;
+    int64_t T;
+};
+static void dsp_mix_f_beside(RadCtx* x, void* a) {
+    const DspMixBeside& p = *(const DspMixBeside*)a;
+    const Layer& L = *p.L;
+    const Dsp& d = *p.d;
+    const int64_t T = p.T;
+    RAD_ISSUE_N(x, L.mix_f, T, brows(d.h1, T), RAD_W(L.hc_f_fn), RAD_W(L.hc_f_scale), RAD_W(L.hc_f_base),
+                brows(d.pre_f, T), brows(d.post, T), brows(d.comb, T));
+}
+
 /* The drafter's query pass (draft_pass > 0): `block` rows a drafting sequence, the anchor first. */
 static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     auto& d = m.dsp;   /* cw_up moves once (the confidence head's weights) */
@@ -6558,8 +6573,16 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
         if (!dmr) mix_f();
         RAD_ISSUE_N(x, L.col_f, T, brows(d.h1, T), brows(d.pre_a, T), brows(d.x, T));
         RAD_ISSUE_N(x, L.norm_f, T, brows(d.x, T), RAD_W(L.ffn_norm), brows(d.act.x, T));
-        if (dmr) mix_f();
-        L.moe.step(x, batch);
+        if (dmr) {
+            /* the trunk's own order (step(): col_f, norm_f, then the MoE with mix_f beside its routed gate_up) */
+            DspMixBeside mb{ &L, &d, T };
+            MoeFP8::Beside bs;
+            bs.fn = dsp_mix_f_beside;
+            bs.arg = &mb;
+            L.moe.step(x, batch, bs);
+        } else {
+            L.moe.step(x, batch);
+        }
         RAD_ISSUE_N(x, L.post_f, T, brows(d.act.x, T), brows(d.h1, T), brows(d.post, T), brows(d.comb, T),
                     brows(d.h0, T));
     }
