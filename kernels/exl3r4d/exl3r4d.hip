@@ -653,7 +653,7 @@ static __device__ __forceinline__ void k25_windows(const unsigned (&W)[NPW][2][2
 // (hash_pair's ha form on each state's own register), the byte sums, the fmas. State k = 8 j + 4 r + i: tile j, run r,
 // position i of the run. Element order as decode_frag: u[0] run 0 (0, 1), u[2] run 0 (2, 3), u[1] run 1 (0, 1), u[3]
 // run 1 (2, 3).
-template <int NPW>
+template <int NPW, bool FOLD = false>   // FOLD: X5's codebook fold (decode_frags_x3d's note): the integer codes S, no fma
 static __device__ __forceinline__ void decode_frags_k25(const unsigned (&R0)[NPW], const unsigned (&R1)[NPW],
                                                         v8h (&out)[NPW]) {
   constexpr int N = 8 * NPW;
@@ -685,7 +685,7 @@ static __device__ __forceinline__ void decode_frags_k25(const unsigned (&R0)[NPW
     const int slot[4] = {0, 2, 1, 3};
 #pragma unroll
     for (int q = 0; q < 4; q++)
-      x8.u[slot[q]] = EXL3R4D_ABLATE_CBFMA ? sm[j][q]   // X4 reading build: the codebook's fma deleted (wrong bytes)
+      x8.u[slot[q]] = (EXL3R4D_ABLATE_CBFMA || FOLD) ? sm[j][q]   // X4 reading build (wrong bytes) / X5's fold (S)
                     : __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(v2h, sm[j][q]),
                                                                             (v2h){kinv, kinv}, (v2h){kbias, kbias}));
     out[j] = x8.f;
@@ -977,7 +977,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   v8f acc[NPW];
 #pragma unroll
   for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
-  static_assert(!FOLD || (X3D && !RAW && !APREP && STAGED == 0 && !XSM), "X5: the fold is built for the X3D K loop only");
+  static_assert(!FOLD || ((X3D || K25 != K25_OFF) && !RAW && !APREP && STAGED == 0 && !XSM),
+                "X5: the fold is built for the X3D / K25U K loops only");
   [[maybe_unused]] v8f accx = (v8f)(0.f);   // X5 (FOLD): every row's sum of this split's activations, in each column
   [[maybe_unused]] float accs = 0.f;        // X5 (FOLD, EXL3R4D_X5_SUM 2): this lane's half of its row's sum
   [[maybe_unused]] v8h svp[epi_opw<NPW, MATS>()][MATS];
@@ -1125,8 +1126,10 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       k25_windows<K25, NPW, kB96H>(W_, plan.shift, b96w, b96p, r0_, r1_);            \
       v8h wfs_[NPW];                                                                 \
       if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(r0_, r1_, wfs_);           \
-      else decode_frags_k25<NPW>(r0_, r1_, wfs_);                                    \
+      else decode_frags_k25<NPW, FOLD>(r0_, r1_, wfs_);                              \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
+      if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
+      else if constexpr (FOLD) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
       break;                                                                         \
     }                                                                                \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                \
@@ -1452,7 +1455,7 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_x3d_
 // exactly (prep kernel rows, no DNW, EXL3R4D_DNG 1) except moe_pass's K25 mode (gate_up K25_G3 / K25_G2D / K25_UB96, down
 // K25_U4). exl3r4d_launch_gemm takes them only when the argument block's x3d is 2 .. 4 (fill(): bits 2.5 and the fn4
 // switch exl3_x3d at 2 / 3 / 4), so with the switch at 0 or 1 no launch reaches them.
-template <int MATS, int MODE, int G = 1>   // G: SPB-G (above exl3r4d_gemm_x3d_kernel), the down only
+template <int MATS, int MODE, int G = 1, bool FOLD = false>   // G: SPB-G (above exl3r4d_gemm_x3d_kernel), the down only; FOLD: X5
 __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_kernel(Exl3r4dGemm p) {
   static_assert(EXL3R4D_DNG == 1 || MATS == 2, "K25U: down's E2 grouping is not ported");
   static_assert(G == 1 || MATS == 1, "SPB-G: the down's column grouping only");
@@ -1483,8 +1486,8 @@ __global__ void __launch_bounds__(EXL3R4D_LB) EXL3R4D_WPE_ATTR exl3r4d_gemm_k25_
       continue;
     }
     for (int rc = run.r0; rc < run.r1; rc += EXL3_BLOCK)
-      moe_pass<EXL3R4D_K25, 2, MATS, false, false, 0, false, 0, false, false, MODE>(p, w, rc, run.r1, lds, tk0,
-                                                                                   G == 1 ? -1 : cb);
+      moe_pass<EXL3R4D_K25, 2, MATS, false, false, 0, false, 0, false, false, MODE, FOLD>(p, w, rc, run.r1, lds, tk0,
+                                                                                         G == 1 ? -1 : cb);
   }
 }
 
@@ -3984,6 +3987,14 @@ extern "C" int exl3r4d_launch_gemm(const Exl3r4dGemm* a, int gate_up, int bits, 
          : sg == 2 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 2>
          : sg == 4 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 4>
          : sg == 8 ? (const void*)exl3r4d_gemm_x3d_kernel<1, 8> : (const void*)exl3r4d_gemm_x3d_kernel<1>;
+      if (!gate_up && sg > 1) gks.x = (unsigned)((a->y_cols / 128 + sg - 1) / sg);
+    }
+    if (bits == EXL3R4D_K25 && a->x3d == 6 && !gscr && dngk == 1) {  // X5 at K = 2.5 (fn4 exl3_x3d 5): K25U G3 / U4 + the fold
+      kf = !gate_up ? (sg == 2 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 2, true>
+                     : sg == 4 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 4, true>
+                     : sg == 8 ? (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 8, true>
+                               : (const void*)exl3r4d_gemm_k25_kernel<1, K25_U4, 1, true>)
+                    : (const void*)exl3r4d_gemm_k25_kernel<2, K25_G3, 1, true>;
       if (!gate_up && sg > 1) gks.x = (unsigned)((a->y_cols / 128 + sg - 1) / sg);
     }
     if (bits == EXL3R4D_K25 && a->x3d >= 2 && a->x3d <= 4 && !gscr && dngk == 1) {  // K25U (fn4 exl3_x3d 2 / 3 / 4)

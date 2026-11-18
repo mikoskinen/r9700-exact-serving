@@ -26,7 +26,7 @@
  * 0 / 1 are what they were (no K = 2.5 launch changes).
  * X5 (tp8 loop QUEUE X5, 18.11.2026): 5 = 2 with K = 2's CODEBOOK FOLD in the decode band (exl3r4d.hip moe_pass FOLD: the
  * integer codes into the WMMA, the affine map on the f32 sums) -- its own reference (rule B): K = 2's decode-band outputs
- * move by about each weight's f16 rounding; K = 2.5 as at 2; the M > 48 band (prefill) as at 2. */
+ * move by about each weight's f16 rounding; K = 2.5 the same (K25U G3 / U4 + the fold); the M > 48 band (prefill) as at 2. */
 static volatile int g_fn4_x3d = 0;
 int exl3r4d_fn4_x3d(void) { return g_fn4_x3d; }
 /* SPB-G (ds41-etp-spb-plug, 14.11.2026): fn4 switch "exl3_dng" 0 / 2 / 4 / 8 -- the K = 2 (X3D-F) and K = 2.5 (K25U) down
