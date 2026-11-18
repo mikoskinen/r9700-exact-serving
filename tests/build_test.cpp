@@ -1279,6 +1279,30 @@ TEST(a_block_drafters_short_block_is_shorter_and_still_proposes) {
     }
 }
 
+/* tp8 loop D19: a block drafter may declare several short blocks, one call a length (DSpark at 1 and 3 rows of its 5,
+ * every row proposing: block = depth); the first stays drafter_short_block (one call is served as before), the list holds
+ * each once, and a refused length leaves it as it was. */
+TEST(a_block_drafter_declares_several_short_blocks) {
+    Registry reg;
+    Builder b(reg, make_meta(), make_ctx());
+    RadBufDecl bd{};
+    bd.dtype = RAD_I32; bd.rank = 2; bd.shape[0] = 256; bd.shape[1] = 5;
+    const rad_buf prop = rad_decl_buffer(&b, "prop", &bd);
+    RadDrafterDecl d{};
+    d.kind = RAD_DRAFT_BLOCK; d.name = "dspark"; d.depth = 5; d.block = 5; d.mask_token = 5;
+    d.proposal = prop; d.proposal_pitch = 5;
+    CHECK_OK(rad_declare_drafter(&b, &d));
+    CHECK(b.program().drafter_short_blocks.empty());
+    CHECK_OK(rad_drafter_short_block(&b, 1));
+    CHECK_OK(rad_drafter_short_block(&b, 3));
+    CHECK_OK(rad_drafter_short_block(&b, 1));                  /* again: listed once */
+    CHECK_EQ(rad_drafter_short_block(&b, 5), RAD_E_INVAL);    /* not shorter */
+    CHECK_EQ(b.program().drafter_short_block, 1);
+    REQUIRE_EQ(b.program().drafter_short_blocks.size(), (size_t)2);
+    CHECK_EQ(b.program().drafter_short_blocks[0], 1);
+    CHECK_EQ(b.program().drafter_short_blocks[1], 3);
+}
+
 /* A tree drafter (rad_drafter_tree) takes a short block too: a block-16 tree of 15 nodes declares
  * one of 8 rows, over which the drafter grows a tree of its own of up to 7 nodes; and a tree of 7
  * nodes over the same block, where a chain's rule (rows past the 9 that propose nothing) would refuse
