@@ -169,13 +169,6 @@ public:
      * when a BG lane may take it whole; after N ms of holding it runs at home as today's MIXED step. A held newcomer has no
      * prefix restore planned (those stay home, kBgRestore). 0 (unset): off, today's MIXED step at once. */
     int64_t bg_hold_ms() const { return bg_lane() >= 0 ? bg_hold_ms_ : 0; }
-    /* tp8 dev D12 (RADIANCE_PP_BG_PIECES=N, 256 .. 65536; with BG lanes, not where RADIANCE_PP_BG_SPLIT takes two BG lanes): a
-     * newcomer lent to a BG lane whose entry has >= N rows is cut at the 512-grid point nearest its middle (>= 128 rows a side,
-     * BG_SPLIT's rule); its first piece goes to a BG lane now and the rest stays with its home, which plans it once that piece
-     * committed (and lends it whole then): BG_SPLIT's two pieces in turn on one BG lane. 0 (unset): whole, as today. */
-    int64_t bg_pieces() const { return bg_lane() >= 0 ? bg_pieces_ : 0; }
-    void set_bg_pieces(int64_t rows) { bg_pieces_ = rows > 0 ? rows : 0; }
-    void note_bg_piece_locked() { ++bg_piece_n_; }
     void set_bg_hold_ms(int64_t ms) { bg_hold_ms_ = ms > 0 ? ms : 0; }
     /* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N, 256 .. 65536 rows; with BG lanes): a BG lane's inbox -- and so its step -- may hold up to
      * N rows of lent newcomers (capped at --max-num-batched-tokens) instead of the shared budget (min(MNBT, ChunkGeometry::
@@ -284,7 +277,6 @@ public:
         int64_t bg = 0, bg_rows = 0, bg_skip[kBgWhyN] = {}, bg_split = 0;   /* tp8 dev M8 */
         int64_t bg_floor = 0;   /* tp8 loop F22: requests whose drafter range a lent piece's commit opened */
         int64_t hold_steps = 0, hold_reqs = 0, hold_lent = 0, hold_home = 0, hold_us = 0, hold_max_us = 0;   /* tp8 dev D11 */
-        int64_t bg_pieces = 0;   /* tp8 dev D12: newcomers whose first piece went to a BG lane ahead of the rest */
         /* tp8 loop P23: BG lane steps with lent pieces, their newcomers, steps with >= 2 / >= 3 newcomers (+ the >= 2 ones'
          * newcomers and rows), the widest BG step */
         int64_t bgst_n = 0, bgst_newc = 0, bgst_b2 = 0, bgst_b3 = 0, bgst_b2_newc = 0, bgst_b2_rows = 0, bgst_max_rows = 0;
@@ -312,7 +304,6 @@ public:
         c.hold_home = hold_home_;
         c.hold_us = hold_us_;
         c.hold_max_us = hold_max_us_;
-        c.bg_pieces = bg_piece_n_;
         c.bgst_n = bgst_n_;
         c.bgst_newc = bgst_newc_;
         c.bgst_b2 = bgst_b2_;
@@ -356,7 +347,6 @@ private:
     bool    bg_split_ = false;              /* RADIANCE_PP_BG_SPLIT=1 (bg_split, tp8 dev M8) */
     int64_t bg_floor_n_ = 0;
     int64_t bg_hold_ms_ = 0;                /* RADIANCE_PP_BG_HOLD_MS (bg_hold_ms, tp8 dev D11) */
-    int64_t bg_pieces_ = 0, bg_piece_n_ = 0; /* RADIANCE_PP_BG_PIECES (bg_pieces, tp8 dev D12) */
     int64_t bg_room_ = 0;                   /* RADIANCE_PP_BG_ROOM (bg_room, tp8 loop P23) */
     int64_t bg_join_ms_ = 0;                /* RADIANCE_PP_BG_JOIN_MS (bg_join_ms, tp8 loop P23b) */
     std::vector<int64_t> bgt0_, bgrows_;    /* a BG lane's step in flight: when it took its inbox, its rows */

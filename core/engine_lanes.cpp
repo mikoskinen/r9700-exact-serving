@@ -255,15 +255,8 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  "home's step (the step goes out with its decode rows alone) and planned again at the home's next step, for a BG "
                  "lane to take whole; after %lld ms of holding it runs at home as today's MIXED step (tp8 dev D11)",
                  (long long)lanes_.bg_hold_ms(), (long long)lanes_.bg_hold_ms());
-    if (lanes_.bg_pieces() > 0)
-        RAD_INFO("two-node pipeline: RADIANCE_PP_BG_PIECES=%lld -- a newcomer lent to a BG lane whose entry has >= %lld rows is cut at "
-                 "the 512-grid point nearest its middle (>= 128 rows a side); its first piece goes to a BG lane at once, the rest "
-                 "with its first token after that piece's commit (tp8 dev D12)%s", (long long)lanes_.bg_pieces(),
-                 (long long)lanes_.bg_pieces(),
-                 lanes_.bg_split() && lanes_.bg_n() >= 2 ? "; not where RADIANCE_PP_BG_SPLIT=1 has two BG lanes: that split first" : "");
-    else if (const char* bp = std::getenv("RADIANCE_PP_BG_PIECES"); bp && *bp)
-        RAD_WARN("two-node pipeline: RADIANCE_PP_BG_PIECES=%s is not taken: %s (tp8 dev D12)", bp,
-                 lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not 256 .. 65536 rows");
+    if (const char* bp = std::getenv("RADIANCE_PP_BG_PIECES"); bp && *bp)
+        RAD_WARN("two-node pipeline: RADIANCE_PP_BG_PIECES=%s is ignored: the switch was removed 18.11. (tp8 dev D12, never on cards)", bp);
     if (lanes_.bg_room() > 0)
         RAD_INFO("two-node pipeline: RADIANCE_PP_BG_ROOM=%lld -- a BG lane's inbox (its next step) takes lent newcomers up to %lld "
                  "rows (the shared budget %lld otherwise), so the newcomers that arrive while a BG step runs go to the next one "
@@ -400,13 +393,10 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
         RAD_INFO("two-node pipeline: BG lane(s) from %d (RADIANCE_PP_BG_LANE, tp8 dev M8): %lld newcomers lent whole beside decode "
                  "rows (%lld rows; %lld of them in two pieces on the 512 grid, RADIANCE_PP_BG_SPLIT; %lld whole for want of two "
                  "lanes' room); kept home: a prefix restore %lld, the BG lanes' room %lld, not a planner %lld; drafter ranges opened "
-                 "by a lent piece's commit %lld (on, tp8 loop F22)%s%s", lanes_.bg_lane(),
+                 "by a lent piece's commit %lld (on, tp8 loop F22)%s", lanes_.bg_lane(),
                  (long long)c.bg, (long long)c.bg_rows, (long long)c.bg_split, (long long)c.bg_skip[LaneSet::kBgSplitRoom],
                  (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
                  (long long)c.bg_skip[LaneSet::kBgOrder], (long long)c.bg_floor,
-                 (lanes_.bg_pieces() > 0 ? fmt("; %lld newcomers' first piece lent ahead of the rest (RADIANCE_PP_BG_PIECES=%lld, tp8 "
-                                               "dev D12)", (long long)c.bg_pieces, (long long)lanes_.bg_pieces())
-                                         : std::string()).c_str(),
                  lanes_.bg_hold_ms() > 0
                      ? fmt("; held for the BG lanes' room (RADIANCE_PP_BG_HOLD_MS=%lld, tp8 dev D11): %lld newcomers over %lld "
                            "steps, %lld then lent to a BG lane, %lld ran at home after the hold ran out, held %.1f ms each on "

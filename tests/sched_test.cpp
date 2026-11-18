@@ -14092,19 +14092,17 @@ TEST(lanes_lend_split_cuts_a_whole_mixed_newcomer_on_the_512_grid_and_lends_its_
  * (each lane's idle followers planned right behind it). */
 TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
     struct Env {
-        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_SPLIT"); unsetenv("RADIANCE_PP_BG_PIECES"); }
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_SPLIT"); }
     } env;
     struct Arm { int64_t len; bool head; };
-    /* 3 = two BG lanes with RADIANCE_PP_BG_SPLIT=1; 4 = one BG lane with RADIANCE_PP_BG_PIECES=1024 (tp8 dev D12: the same cut, the
-     * two pieces in turn on the one BG lane) */
-    for (const int k : { 1, 2, 3, 4 })
+    /* 3 = two BG lanes with RADIANCE_PP_BG_SPLIT=1 (tp8 dev D12's one-BG-lane form, RADIANCE_PP_BG_PIECES, was removed 18.11.) */
+    for (const int k : { 1, 2, 3 })
     for (const Arm a : { Arm{ 1100, false }, Arm{ 700, false }, Arm{ 2266, false }, Arm{ 1100, true } }) {
-        const bool split = k == 3, pieces = k == 4;
-        setenv("RADIANCE_PP_BG_LANE", k == 1 || k == 4 ? "1" : "2", 1);
+        const bool split = k == 3;
+        setenv("RADIANCE_PP_BG_LANE", k == 1 ? "1" : "2", 1);
         if (split) setenv("RADIANCE_PP_BG_SPLIT", "1", 1); else unsetenv("RADIANCE_PP_BG_SPLIT");
-        if (pieces) setenv("RADIANCE_PP_BG_PIECES", "1024", 1); else unsetenv("RADIANCE_PP_BG_PIECES");
         std::vector<int64_t> ends_1;
-        const int nbg = split ? 2 : pieces ? 1 : k;
+        const int nbg = split ? 2 : k;
         for (int lanes : { 1, nbg + 1, nbg + 2 }) {
             DstSwitches restore;
             Lanes L;
@@ -14196,19 +14194,10 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
                     CHECK(c.bg > 0);
                 }
                 /* a one-piece newcomer: the one-lane plan's chunk, run by the BG lane; never a MIXED home step with its token */
-                if (a.len <= 2048 && !split && !(pieces && a.len >= 1024)) {
+                if (a.len <= 2048 && !split) {
                     CHECK(ends == ends_1);
                     CHECK_EQ(home_mixed_with_p, 0);
                 }
-                /* RADIANCE_PP_BG_PIECES (one BG lane): 512 + the rest, both run by the BG lane, the first one first */
-                if (a.len <= 2048 && pieces && a.len >= 1024) {
-                    CHECK(ends == std::vector<int64_t>({ 512, a.len }));
-                    CHECK_EQ((int)p_lanes.size(), 2);
-                    if (p_lanes.size() == 2) CHECK(p_lanes[0] == bg && p_lanes[1] == bg);
-                    CHECK(c.bg_pieces > 0);
-                    CHECK_EQ(home_mixed_with_p, 0);
-                }
-                if (pieces && a.len < 1024) CHECK_EQ(c.bg_pieces, 0ll);
                 /* RADIANCE_PP_BG_SPLIT: 512 + the rest, in two BG lanes, the first piece's lane first */
                 if (a.len <= 2048 && split) {
                     CHECK(ends == std::vector<int64_t>({ 512, a.len }));
@@ -14222,7 +14211,7 @@ TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
             CHECK_EQ(short_steps, 0);
             fprintf(stderr, "    BG lanes %d%s, a %lld-token newcomer%s, %d lane(s): ends%s (one lane:%s); %lld lent to BG lanes "
                             "(%lld rows), BG steps %d; home MIXED steps with its token %d; decoders in every step: %s; decoded %d\n",
-                    nbg, split ? " + split" : pieces ? " + pieces" : "", (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
+                    nbg, split ? " + split" : "", (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
                     [&] { std::string s; for (int64_t x : ends_1) s += fmt(" %lld", (long long)x); return s; }().c_str(),
                     (long long)c.bg, (long long)c.bg_rows, bg_steps, home_mixed_with_p, short_steps ? "NO" : "yes", p_decoded);
         }
