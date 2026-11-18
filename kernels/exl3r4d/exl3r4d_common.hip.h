@@ -536,6 +536,21 @@ static __device__ __forceinline__ void decode_frags_x3d(const unsigned (&w0)[NPW
 // fragment whose WMMA against a k-step's activations gives every row's sum of them in each of its 16 columns.
 static __device__ __forceinline__ float x5_kinv() { return (float)__builtin_bit_cast(_Float16, (unsigned short)0x1EEE); }
 static __device__ __forceinline__ float x5_kbias() { return (float)__builtin_bit_cast(_Float16, (unsigned short)0xC931); }
+// EXL3R4D_X5_SUM: how the fold's row sums are made -- 1 (default) one WMMA a k-step against ones (accx, every column);
+// 2 four v_dot2_f32_f16 a k-step on the lane's own 8 activations (k 4h..4h+3, 8+4h..8+4h+3 of the step) into one f32,
+// the two half-lanes' sums joined once at the end (swap16). Both deterministic and per row; they are two different
+// references (the sums round differently) -- the bench picks one.
+#ifndef EXL3R4D_X5_SUM
+#define EXL3R4D_X5_SUM 1
+#endif
+static __device__ __forceinline__ float x5_dot8(v8h a, float c) {   // c + the 8 halves of a, in f32 (four dot2 against ones)
+  union { v8h f; v2h h[4]; } x;
+  x.f = a;
+  const v2h one = (v2h){(_Float16)1.0f, (_Float16)1.0f};
+#pragma unroll
+  for (int q = 0; q < 4; q++) c = __builtin_amdgcn_fdot2(x.h[q], one, c, false);
+  return c;
+}
 static __device__ __forceinline__ v8h x5_ones() {
   union { unsigned u[4]; v8h f; } x;
   x.u[0] = x.u[1] = x.u[2] = x.u[3] = 0x3C003C00u;   // 1.0 in both halves

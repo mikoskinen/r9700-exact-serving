@@ -979,6 +979,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
   static_assert(!FOLD || (X3D && !RAW && !APREP && STAGED == 0 && !XSM), "X5: the fold is built for the X3D K loop only");
   [[maybe_unused]] v8f accx = (v8f)(0.f);   // X5 (FOLD): every row's sum of this split's activations, in each column
+  [[maybe_unused]] float accs = 0.f;        // X5 (FOLD, EXL3R4D_X5_SUM 2): this lane's half of its row's sum
   [[maybe_unused]] v8h svp[epi_opw<NPW, MATS>()][MATS];
   if constexpr (EXL3R4D_SVH_EARLY && !RAW) svh_early<NPW, MATS>(w, col_local, lane, cb, svp);
 
@@ -1115,7 +1116,8 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       if constexpr (EXL3R4D_ABLATE_DEC) x4_raw_frags<NPW>(x0_, x1_, wfs_);           \
       else decode_frags_x3d<NPW, FOLD>(x0_, x1_, x3d_sx, wfs_);                      \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
-      if constexpr (FOLD) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
+      if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
+      else if constexpr (FOLD) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
       break;                                                                         \
     }                                                                                \
     if constexpr (K25 != K25_OFF) { /* K25U: the tiles' windows, their unpacked decode phase by phase, the WMMAs */ \
@@ -1193,10 +1195,19 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   if constexpr (EXL3R4D_TSTAMP) tsC = __builtin_readsteadycounter();
   if constexpr (FOLD) {   // X5: sum_k (S kinv + kbias) x_k = kinv (sum_k S x_k) + kbias (sum_k x_k), this split's k-steps
     const float ki = x5_kinv(), kb = x5_kbias();
+    if constexpr (EXL3R4D_X5_SUM == 2) {   // the two half-lanes of the row (k 4h.. of every step) joined, h 0's first
+      const float o = swap16(accs);
+      const float xs = (lane >> 4) ? o + accs : accs + o;
 #pragma unroll
-    for (int j = 0; j < NPW; j++)
+      for (int j = 0; j < NPW; j++)
 #pragma unroll
-      for (int e = 0; e < 8; e++) acc[j][e] = __builtin_fmaf(acc[j][e], ki, kb * accx[e]);
+        for (int e = 0; e < 8; e++) acc[j][e] = __builtin_fmaf(acc[j][e], ki, kb * xs);
+    } else {
+#pragma unroll
+      for (int j = 0; j < NPW; j++)
+#pragma unroll
+        for (int e = 0; e < 8; e++) acc[j][e] = __builtin_fmaf(acc[j][e], ki, kb * accx[e]);
+    }
   }
   if (SK > 1) splitk_reduce<NPW>(acc, lds, col_local, ksplit, SK, lane);
   if constexpr (XSM) {
