@@ -7066,6 +7066,34 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         ds41sp::plan(spl, spv);
     }
     bool h_sh = false, xn_sh = false;
+    /* tp8 loop P20: the SP line at the pass's every exit (a pipeline part returns at its crossing out, before the loop's end:
+     * lq82 showed no line on either node) -- rank 0, the first and every 64th SP pass */
+    const auto sp_report = [&] {
+            if (!(sp_pass && rad_rank(x) == 0)) return;
+            static thread_local int t_sp_step = -1;
+            const long long lone = g_sp_lone.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (sp_n > 0 && batch->step != t_sp_step) {
+                t_sp_step = batch->step;
+                g_sp_layers.fetch_add(sp_n, std::memory_order_relaxed);
+                g_sp_rows.fetch_add(T, std::memory_order_relaxed);
+                g_sp_gathers.fetch_add(sp_ga, std::memory_order_relaxed);
+                g_sp_eng.fetch_add(sp_en, std::memory_order_relaxed);
+                const long long n = g_sp_passes.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n == 1 || n % 64 == 0)
+                    fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC (tp8 loop P20): %lld prefill passes ran %lld "
+                                    "layer-passes sequence-parallel (%lld rows, the streams gathered %lld times, %lld Engram "
+                                    "layer-passes over the quarter) of %lld lone prefill passes of >= %lld rows, %lld X1s row-sharded; "
+                                    "this one %lld rows, layers %d..%d SP (%d), %d gathers of the streams, part %d\n",
+                            n, g_sp_layers.load(std::memory_order_relaxed), g_sp_rows.load(std::memory_order_relaxed),
+                            g_sp_gathers.load(std::memory_order_relaxed), g_sp_eng.load(std::memory_order_relaxed), lone,
+                            (long long)m.sphc, g_sp_x1.load(std::memory_order_relaxed), (long long)T, sp_lo, sp_hi, sp_n, sp_ga,
+                            part);
+            }
+    };
+    struct SpEnd {
+        const decltype(sp_report)& f;
+        ~SpEnd() { f(); }
+    } sp_end{ sp_report };
     const auto sp_gather_h = [&] {   /* the streams whole again on every rank; the next mix over every row */
         RAD_ISSUE_N(x, m.sp_ag_h, T * c.hc * D, brows(m.h0, T), RAD_NONE);
         t_mhc_a.clear();
@@ -8114,27 +8142,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     /* tp8 loop P20: what an SP pass left sharded is read by nothing after it (spv's rule; the split layer with no cone row
      * reads xn alone) -- xn here would be a defect of the plan, gathered so no reader can see a quarter */
     sp_gather_x();
-    if (sp_pass && rad_rank(x) == 0) {
-        static thread_local int t_sp_step = -1;
-        const long long lone = g_sp_lone.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (sp_n > 0 && batch->step != t_sp_step) {
-            t_sp_step = batch->step;
-            g_sp_layers.fetch_add(sp_n, std::memory_order_relaxed);
-            g_sp_rows.fetch_add(T, std::memory_order_relaxed);
-            g_sp_gathers.fetch_add(sp_ga, std::memory_order_relaxed);
-            g_sp_eng.fetch_add(sp_en, std::memory_order_relaxed);
-            const long long n = g_sp_passes.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (n == 1 || n % 64 == 0)
-                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC (tp8 loop P20): %lld prefill passes ran %lld "
-                                "layer-passes sequence-parallel (%lld rows, the streams gathered %lld times, %lld Engram "
-                                "layer-passes over the quarter) of %lld lone prefill passes of >= %lld rows, %lld X1s row-sharded; "
-                                "this one %lld rows, layers %d..%d SP (%d), %d gathers of the streams, part %d\n",
-                        n, g_sp_layers.load(std::memory_order_relaxed), g_sp_rows.load(std::memory_order_relaxed),
-                        g_sp_gathers.load(std::memory_order_relaxed), g_sp_eng.load(std::memory_order_relaxed), lone,
-                        (long long)m.sphc, g_sp_x1.load(std::memory_order_relaxed), (long long)T, sp_lo, sp_hi, sp_n, sp_ga,
-                        part);
-        }
-    }
+    /* (the SP line: sp_end, at every exit of the pass -- a pipeline part returns at its crossing out) */
     if (psk && cur != &sg && rad_rank(x) == 0) {   /* lever PSK: a cut step (stats; the first one's cut rows) */
         g_psk_cut_passes.fetch_add(1, std::memory_order_relaxed);
         const long long n = g_psk_steps.fetch_add(1, std::memory_order_relaxed) + 1;
