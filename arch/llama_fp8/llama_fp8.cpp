@@ -127,6 +127,11 @@ struct Model {
      * all-reduce) where it took X1, and the leader's head part issues neither the lookup nor X1: the follower starts a
      * lane step from its build, never from the leader's stream. */
     bool     fe = false;
+    /* tp8 dev D10 round 2 (RADIANCE_PP_ISSUE_AHEAD=1 with fe; unset: nothing here): X1 is declared as the step's token ids
+     * alone (the leader's batch token ids on its card, ADV_TRUNK's for a step issued ahead of its collect), the leader's head
+     * part sends it and the follower takes it into its own batch's token ids before its lookup, so a step the leader ships
+     * before it knows the ids (its frame's are the host's) embeds the card's. */
+    bool     x1_ids = false;
     /* tp8 dev M4 (RADIANCE_PP_SEG_LAYERS=k on the follower, --pp-lanes > 1; unset: nothing here): the follower's [h, t) in
      * segments of k layers; at each boundary s the segment before it saves the stream (and the pending delta where layer s
      * folds it) into this rank's ring buffer and the segment from s takes them back (the stage ops' loop mode), so other
@@ -393,6 +398,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             }
             const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
             m.fe = fe && !std::strcmp(fe, "1") && m.pp_h == 0;
+            /* tp8 dev D10 round 2: beside the follower's own lookup, X1 is the step's token ids (the follower reads them) */
+            const char* ia = std::getenv("RADIANCE_PP_ISSUE_AHEAD");
+            m.x1_ids = m.fe && ia && !std::strcmp(ia, "1");
             const char* sk = std::getenv("RADIANCE_PP_SEG_LAYERS");
             const int k = sk && *sk ? std::atoi(sk) : 0;
             if (m.pp_rank == 1 && k > 0 && pp.lanes > 1)
@@ -612,18 +620,26 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.kvcopy = kc && !std::strcmp(kc, "1") && m.pp_h > 0;
         const int64_t row = g.n_embd * (int64_t)rad_dtype_bytes(rad_dtype_parse(g.dtype), 1);
         const int64_t qkv_row = (g.q_dim() + 2 * g.kv_dim()) * (int64_t)rad_dtype_bytes(g.act_dtype, 1);
+        if (m.x1_ids) {   /* tp8 dev D10 round 2: the ids alone, 4 B a row */
+            m.parts_x1 = 1;
+            rad_pp_declare_crossing(RAD_PP_X1, 4, 1);
+            rad_pp_declare_x1_ids(1);
+        } else {
         rad_pp_declare_crossing(RAD_PP_X1, row * m.parts_x1 + (m.kvcopy ? qkv_row : 0), m.parts_x1 + (m.kvcopy ? 1 : 0));
+        }
         rad_pp_declare_crossing(RAD_PP_X2, row * m.parts_x2, m.parts_x2);
         auto stage = [&](const char* op, int ring, int parts, bool send) {
             const bool kv = ring == RAD_PP_X1 && m.kvcopy;
             std::vector<rad_buf> pb = { m.b_x };
             if (parts == 2) pb.push_back(m.a_h.x);
             if (kv) pb.push_back(m.b_qkv);   /* tp8 S6 test: layer h - 1's q|k|v rows */
-            const int np = (int)pb.size();
+            const bool ids = ring == RAD_PP_X1 && m.x1_ids;   /* tp8 dev D10 round 2: the batch's ids, no buffer */
+            if (ids) pb.clear();
+            const int np = ids ? 1 : (int)pb.size();
             rad_op h = RAD_OP(b, op, RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("ring", ring),
                                                 RAD_INT("parts", np)),
                               RAD_NOWEIGHTS);
-            if (h == RAD_NULL_HANDLE) return h;
+            if (h == RAD_NULL_HANDLE || ids) return h;
             if (send) rad_op_reads(b, h, pb.data(), np);
             else      rad_op_writes(b, h, pb.data(), np);
             return h;
@@ -653,7 +669,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                     "X2 %d part(s) of [rows, %lld] %s", lead ? "leader" : "follower", m.pp_h, m.pp_t,
                  lead ? "outside the cut, the embedding and the head" : "inside the cut", m.parts_x1,
                  m.parts_x2, (long long)g.n_embd, g.dtype);
-        if (m.fe)
+        if (m.fe && m.x1_ids)
+            rad_note(b, "two-node pipeline (tp8 dev 1a + D10 round 2, RADIANCE_PP_FOLLOWER_EMBED=1 + RADIANCE_PP_ISSUE_AHEAD=1): "
+                        "the follower looks the step's embedding up itself from the token ids X1 carries (the leader's card's), "
+                        "which it takes first; the leader's head part issues no lookup, only X1");
+        else if (m.fe)
             rad_note(b, "two-node pipeline (tp8 dev 1a, RADIANCE_PP_FOLLOWER_EMBED=1): the follower looks the step's "
                         "embedding up itself; X1 is declared and never issued, the leader's head part issues no lookup");
         if (!m.seg_b.empty()) {
@@ -784,7 +804,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
             return;
         }
         const bool kv = ring == RAD_PP_X1 && m.kvcopy;   /* tp8 S6 test: + layer h - 1's q|k|v rows */
-        if (parts == 2 && kv)
+        if (ring == RAD_PP_X1 && m.x1_ids)   /* tp8 dev D10 round 2: the step's token ids alone */
+            RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), praw(batch->token_ids, RAD_I32, batch->n_tok));
+        else if (parts == 2 && kv)
             RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T), brows(m.b_qkv, T));
         else if (parts == 2)
             RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_x, T), brows(m.a_h.x, T));
@@ -793,6 +815,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         else
             RAD_ISSUE(c, op, praw(rg, RAD_U8, 1), brows(m.b_x, T));
     };
+    /* tp8 dev D10 round 2: the follower takes X1 (the step's token ids) into its batch before its lookup reads them */
+    if (m.x1_ids && m.pp_rank == 1 && seg_first) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
     /* tp8 dev 1a: under m.fe the follower's lookup, the leader's none */
     if (((!m.pp || m.pp_rank == 0) && run_head && !m.fe) || (m.fe && m.pp_rank == 1 && seg_first)) {
     RAD_ISSUE(c, m.op_embed,
@@ -819,7 +843,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
             /* The leader hands over before layer h and takes the follower's result back at t; the
              * follower's last layer hands its result back. */
             if (m.pp_rank == 0 && (int64_t)li == m.pp_h) {
-                if (run_head && !m.fe) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
+                if (run_head && (!m.fe || m.x1_ids)) cross(m.op_x1, RAD_PP_X1, m.parts_x1);
                 if (!run_tail) return;   /* tp8 S5: the head part ends with X1's send */
                 cross(m.op_x2, RAD_PP_X2, m.parts_x2);
             }
