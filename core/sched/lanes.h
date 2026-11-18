@@ -196,6 +196,35 @@ public:
         if (newc >= 3) ++bgst_b3_;
         if (rows > bgst_max_rows_) bgst_max_rows_ = rows;
     }
+    /* tp8 loop P23b (RADIANCE_PP_BG_JOIN_MS=N, 1 .. 60000; with RADIANCE_PP_BG_ROOM): a newcomer that the shared budget's room
+     * would keep home (today's MIXED step at once) joins a BUSY BG lane's inbox past that room only when the BG lane's step in
+     * flight is predicted to commit within N ms -- its rows x the BG steps' measured us a row (plan to commit, a running mean) --
+     * else it runs at home as today, so a batch never makes a newcomer wait out a long BG step. No measurement yet, or no step in
+     * flight: it joins (P23's rule). 0 (unset): P23 as it is. */
+    int64_t bg_join_ms() const { return bg_room() > 0 ? bg_join_ms_ : 0; }
+    void set_bg_join_ms(int64_t ms) { bg_join_ms_ = ms > 0 ? ms : 0; }
+    /* a BG lane took its inbox (`rows`) into a step at `now_us` / committed that step */
+    void note_bg_take_locked(int lane, int64_t rows, int64_t now_us) {
+        if (lane < 0 || (size_t)lane >= bgt0_.size()) return;
+        bgt0_[(size_t)lane] = now_us > 0 ? now_us : 1;
+        bgrows_[(size_t)lane] = rows;
+    }
+    void note_bg_commit_locked(int lane, int64_t now_us) {
+        if (lane < 0 || (size_t)lane >= bgt0_.size() || bgt0_[(size_t)lane] <= 0) return;
+        const int64_t rows = bgrows_[(size_t)lane], us = now_us - bgt0_[(size_t)lane];
+        bgt0_[(size_t)lane] = 0;
+        if (rows <= 0 || us <= 0) return;
+        const double r = (double)us / (double)rows;
+        bg_us_row_ = bg_us_row_n_ == 0 ? r : 0.8 * bg_us_row_ + 0.2 * r;   /* a running mean that follows the load */
+        ++bg_us_row_n_;
+    }
+    /* us until lane's BG step in flight is predicted to commit: 0 with none in flight, -1 with no measurement yet */
+    int64_t bg_remaining_us_locked(int lane, int64_t now_us) const {
+        if (lane < 0 || (size_t)lane >= bgt0_.size() || bgt0_[(size_t)lane] <= 0) return 0;
+        if (bg_us_row_n_ == 0) return -1;
+        return std::max<int64_t>(0, bgt0_[(size_t)lane] + (int64_t)(bg_us_row_ * (double)bgrows_[(size_t)lane]) - now_us);
+    }
+    void note_bg_join_locked(bool joined) { ++(joined ? bg_join_yes_ : bg_join_no_); }
     /* its counts: steps a newcomer was held out of, newcomers held, of them lent to a BG lane later / run at home after the
      * hold ran out, and the held time (first hold to its lend or home step) in all and the longest */
     void note_hold_locked(bool first) { ++hold_steps_; if (first) ++hold_reqs_; }
@@ -258,6 +287,9 @@ public:
         /* tp8 loop P23: BG lane steps with lent pieces, their newcomers, steps with >= 2 / >= 3 newcomers (+ the >= 2 ones'
          * newcomers and rows), the widest BG step */
         int64_t bgst_n = 0, bgst_newc = 0, bgst_b2 = 0, bgst_b3 = 0, bgst_b2_newc = 0, bgst_b2_rows = 0, bgst_max_rows = 0;
+        /* tp8 loop P23b: newcomers past the shared room that joined a busy BG lane / were sent home by RADIANCE_PP_BG_JOIN_MS, the
+         * BG steps' measured us a row (x 100) */
+        int64_t bg_join_yes = 0, bg_join_no = 0, bg_us_row_x100 = 0;
     };
     Counts counts() const {
         std::lock_guard<std::mutex> lk(*mu_);
@@ -287,6 +319,9 @@ public:
         c.bgst_b2_newc = bgst_b2_newc_;
         c.bgst_b2_rows = bgst_b2_rows_;
         c.bgst_max_rows = bgst_max_rows_;
+        c.bg_join_yes = bg_join_yes_;
+        c.bg_join_no = bg_join_no_;
+        c.bg_us_row_x100 = (int64_t)(bg_us_row_ * 100.0);
         return c;
     }
     void note_lent_locked(int64_t rows, bool tok) { rows_ += rows; if (tok) ++tok_; }
@@ -323,6 +358,10 @@ private:
     int64_t bg_hold_ms_ = 0;                /* RADIANCE_PP_BG_HOLD_MS (bg_hold_ms, tp8 dev D11) */
     int64_t bg_pieces_ = 0, bg_piece_n_ = 0; /* RADIANCE_PP_BG_PIECES (bg_pieces, tp8 dev D12) */
     int64_t bg_room_ = 0;                   /* RADIANCE_PP_BG_ROOM (bg_room, tp8 loop P23) */
+    int64_t bg_join_ms_ = 0;                /* RADIANCE_PP_BG_JOIN_MS (bg_join_ms, tp8 loop P23b) */
+    std::vector<int64_t> bgt0_, bgrows_;    /* a BG lane's step in flight: when it took its inbox, its rows */
+    double  bg_us_row_ = 0.0;
+    int64_t bg_us_row_n_ = 0, bg_join_yes_ = 0, bg_join_no_ = 0;
     int64_t bgst_n_ = 0, bgst_newc_ = 0, bgst_b2_ = 0, bgst_b3_ = 0, bgst_b2_newc_ = 0, bgst_b2_rows_ = 0, bgst_max_rows_ = 0;
     int64_t hold_steps_ = 0, hold_reqs_ = 0, hold_lent_ = 0, hold_home_ = 0, hold_us_ = 0, hold_max_us_ = 0;
     int64_t split_min_ = 128;
