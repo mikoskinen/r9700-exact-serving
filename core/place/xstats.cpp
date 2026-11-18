@@ -124,6 +124,7 @@ void XsTally::init(const XsMap* map, int rank) {
         passes_[k].assign(L, 0);
         tok_[k].assign(L, 0);
         sel_[k].assign(L, 0);
+        uniq_[k].assign(L, 0);
         steps_[k] = tokens_[k] = 0;
     }
     top_k_.assign(L, 0);
@@ -182,7 +183,7 @@ void XsTally::credit(int layer, int step, const int32_t* counts, int64_t n, int 
     const std::vector<int32_t>& g = map_->gid[(size_t)rank_][(size_t)layer];
     const int64_t m = std::min<int64_t>(n, (int64_t)g.size());
     uint64_t* const plane = counts_[kind].data() + off_[(size_t)layer];
-    uint64_t sel = 0;
+    uint64_t sel = 0, uniq = 0;
     for (int64_t e = 0; e < m; ++e) {
         const int32_t c = counts[e];
         if (c <= 0) continue;
@@ -190,6 +191,7 @@ void XsTally::credit(int layer, int step, const int32_t* counts, int64_t n, int 
         if (gi >= 0) {
             plane[gi] += (uint64_t)c;
             sel += (uint64_t)c;
+            ++uniq;
         } else if (gi == XsMap::kUnknown) {
             unmapped_ += (uint64_t)c;
         }
@@ -201,6 +203,7 @@ void XsTally::credit(int layer, int step, const int32_t* counts, int64_t n, int 
     passes_[kind][(size_t)layer] += (uint64_t)std::max(reports, 1);
     tok_[kind][(size_t)layer] += (uint64_t)std::max<int64_t>(toks, 0);
     sel_[kind][(size_t)layer] += sel;
+    uniq_[kind][(size_t)layer] += uniq;
     if (top_k > top_k_[(size_t)layer]) top_k_[(size_t)layer] = (int32_t)top_k;
     ++credited_;
 }
@@ -214,6 +217,7 @@ void XsTally::snapshot_into(XsSnapshot* s, const std::vector<int32_t>& token_ran
             const uint64_t* src = counts_[k].data() + off_[l];
             for (size_t e = 0; e < row.size(); ++e) row[e] += src[e];
             s->selections[k][l] += sel_[k][l];
+            s->distinct[k][l] += uniq_[k][l];   /* each expert is counted on one rank: the ranks' sums add up */
             if (l < token_rank.size() && token_rank[l] == rank_) {
                 s->histograms[k][l] = hist_[k][l];
                 s->passes[k][l] = passes_[k][l];
@@ -322,6 +326,7 @@ std::string xs_json(const XsSnapshot& s) {
     per_layer("passes", s.passes);
     per_layer("observed_tokens", s.obs_tokens);
     per_layer("selections", s.selections);
+    per_layer("distinct", s.distinct);
     o += ",\n  \"ranks\": {\"credited\": ";
     put_u64s(o, s.rank_credited);
     o += ", \"unmapped\": ";
@@ -417,6 +422,7 @@ XsSnapshot ExpertStats::snapshot() {
         s.passes[k].assign(L, 0);
         s.obs_tokens[k].assign(L, 0);
         s.selections[k].assign(L, 0);
+        s.distinct[k].assign(L, 0);
         s.counts[k].assign(L, {});
         for (size_t l = 0; l < L; ++l) s.counts[k][l].assign((size_t)map_.n_expert[l], 0);
     }
@@ -447,6 +453,16 @@ int ExpertStats::write(bool final_) {
                  (unsigned long long)s.tokens[kXsPrefill], (unsigned long long)s.tokens[kXsDecode],
                  (unsigned long long)s.tokens[kXsMixed], (unsigned long long)s.draft_passes,
                  path_.c_str());
+        /* tp8 dev F35: the decode kind's mean distinct experts a layer-pass and tokens a pass, over the layers this node routes */
+        uint64_t dh = 0, dd = 0, dt = 0;
+        for (size_t l = 0; l < s.distinct[kXsDecode].size(); ++l) {
+            dh += s.histograms[kXsDecode][l];
+            dd += s.distinct[kXsDecode][l];
+            dt += s.obs_tokens[kXsDecode][l];
+        }
+        if (dh > 0)
+            RAD_INFO("expert stats: decode layer-passes %llu: %.2f distinct experts a layer-pass at %.2f tokens a pass (tp8 dev F35)",
+                     (unsigned long long)dh, (double)dd / (double)dh, (double)dt / (double)dh);
     }
     return st;
 }

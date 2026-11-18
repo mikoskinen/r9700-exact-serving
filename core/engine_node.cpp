@@ -300,9 +300,17 @@ int Engine::pp_check() {
                     n_lanes_, (long long)cfg_.max_seqs);
             return RAD_E_INVAL;
         }
-        if (!cfg_.expert_stats.empty()) {
+        /* tp8 dev F35: RADIANCE_PP_XSTATS=1 takes it anyway, for the per-layer histograms (selections, distinct experts a
+         * layer-pass): each pass reports only its own layers, so those are right; the file's issued step / token counts are not
+         * (a lane step's head and tail count twice) */
+        const char* xv = std::getenv("RADIANCE_PP_XSTATS");
+        if (!cfg_.expert_stats.empty() && xv && !std::strcmp(xv, "1")) {
+            RAD_WARN("two-node pipeline: --expert-stats with --pp-lanes %d (RADIANCE_PP_XSTATS=1, tp8 dev F35): the per-layer histograms, "
+                     "selections and distinct experts a layer-pass are each pass's; the issued steps / tokens count a lane step's "
+                     "two leader passes twice", n_lanes_);
+        } else if (!cfg_.expert_stats.empty()) {
             RAD_ERR("two-node pipeline (tp8 S5): --expert-stats counts a lane step's two leader passes as two steps; "
-                    "start it with --pp-lanes 1");
+                    "start it with --pp-lanes 1 (or RADIANCE_PP_XSTATS=1 for the per-layer histograms alone)");
             return RAD_E_UNSUPPORTED;
         }
     }
