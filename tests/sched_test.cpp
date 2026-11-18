@@ -13529,8 +13529,15 @@ TEST(lanes_span_four_plans_eight_k_bodies_as_one_lane_does) {
     for (int ex : { 0, 1 })
     for (int n_prompt : { 15777, 65650, 131137 }) {
         std::vector<std::pair<int, int>> ref_s;
-        for (int arm = 0; arm < 4; ++arm) {
-            /* 0: one lane; 1 / 2: 2 / 3 lanes; 3: 2 lanes + SPAN_TAIL 8192 + SPAN_SHORT 24576 */
+        for (int arm = 0; arm < 7; ++arm) {
+            /* 0: one lane; 1 / 2: 2 / 3 lanes; 3: 2 lanes + SPAN_TAIL 8192 + SPAN_SHORT 24576; 4: 3 + SPAN_INNER (tp8 loop P14);
+             * 5: 3 + the cards' lever G 512 + TI 1 (the last chunk carries its tail snapshot inside: lq41's end); 6: 5 + INNER */
+            std::unique_ptr<TgSwitch> tg;
+            std::unique_ptr<TiSwitch> ti;
+            if (arm >= 5) {
+                tg = std::make_unique<TgSwitch>(512);
+                ti = std::make_unique<TiSwitch>(1);
+            }
             const int lanes = arm == 0 ? 1 : arm == 2 ? 3 : 2;
             Lanes L;
             L.grid = 2048;
@@ -13543,7 +13550,10 @@ TEST(lanes_span_four_plans_eight_k_bodies_as_one_lane_does) {
             L.win = 16;
             L.seqs = 6;
             REQUIRE_EQ(L.start(lanes), RAD_OK);
-            if (arm == 3) { L.set.set_span_tail(8192); L.set.set_span_short(24576); }
+            if (arm >= 3) { L.set.set_span_tail(8192); L.set.set_span_short(24576); }
+            if (arm == 4 || arm == 6) L.set.set_span_inner(true);
+            if (arm >= 5)
+                for (int l = 0; l < lanes; ++l) L.at(l).set_tail_inner_capable(true);
             const uint64_t s = L.submit(0, n_prompt, 2);
             REQUIRE(s != 0);
             int64_t misses = 0;
@@ -13572,16 +13582,85 @@ TEST(lanes_span_four_plans_eight_k_bodies_as_one_lane_does) {
                 /* SPAN_TAIL 8192: no piece starting in the last 8,192 rows spans an interval boundary; SHORT: 15,777 all intervals */
                 for (const auto& [a, b] : got)
                     if (ex && (n_prompt - a <= 8192 || n_prompt <= 24576)) CHECK(b - a <= 2048 + 128 || b == n_prompt);
+                /* + SPAN_INNER (tp8 loop P14): the last chunk too, cut before its tail snapshot -- it is the interval plan's
+                 * last chunk, from the last interval boundary at least 128 rows short of the end (1,441 / 2,162 / 2,113),
+                 * and the body stays in 8,192-row spans */
+                if ((arm == 4 || arm == 6) && ex) {
+                    REQUIRE(!got.empty());
+                    const int last_iv = (n_prompt - 128) / 2048 * 2048;
+                    CHECK_EQ(got.back().first, last_iv);
+                    CHECK_EQ(got.back().second, n_prompt);
+                    for (const auto& [a, b] : got)
+                        if (n_prompt - a <= 8192 || n_prompt <= 24576) CHECK(b - a <= 2048 + 128);
+                    if (n_prompt > 24576) CHECK(big > 0);
+                }
             }
             std::string t;
             for (size_t k = 0; k < got.size() && k < 3; ++k) t += fmt(" [%d, %d)", got[k].first, got[k].second);
             t += " ..";
             for (size_t k = got.size() >= 3 ? got.size() - 3 : 0; k < got.size(); ++k) t += fmt(" [%d, %d)", got[k].first, got[k].second);
             fprintf(stderr, "    %sspan 4, %d tokens, %d lanes%s: %zu chunks (%d of 8192 rows)%s, %lld lent:%s\n", ex ? "exact, " : "",
-                    n_prompt, lanes, arm == 3 ? " + SPAN_TAIL 8192 + SHORT 24576" : "", got.size(), big,
+                    n_prompt, lanes, arm == 6 ? " + SPAN_TAIL 8192 + SHORT 24576 + G 512 + TI + INNER" : arm == 5 ? " + SPAN_TAIL 8192 + SHORT 24576 + G 512 + TI" : arm == 4 ? " + SPAN_TAIL 8192 + SHORT 24576 + INNER" : arm == 3 ? " + SPAN_TAIL 8192 + SHORT 24576" : "", got.size(), big,
                     arm == 1 || arm == 2 ? (got == ref_s ? " = one lane's" : " DIFFERENT") : "", (long long)L.set.counts().pieces,
                     t.c_str());
         }
+    }
+}
+
+/* tp8 loop P14 (RADIANCE_PP_SPAN_INNER=1): at the published --prefill-span 2 with the BEST start's settings (SPAN_TAIL 8192,
+ * SPAN_SHORT 24576, the cards' lever G 512 + TI 1) a cold prompt's last chunk spans one interval + its tail, which holds no
+ * interior interval boundary >= 128 rows from the end: the plan with INNER is the plan without it, at 2 and 3 lanes, for
+ * the cards' 16k / 64k / 128k and a prompt whose last chunk does span two intervals (66,536: cut before its snapshot). */
+TEST(lanes_span_inner_leaves_the_span_two_cold_plans_and_cuts_only_a_two_interval_last_chunk) {
+    TgSwitch tg(512);
+    TiSwitch ti(1);
+    for (int lanes : { 2, 3 })
+    for (int n_prompt : { 15777, 65650, 131137, 66536 }) {
+        std::vector<std::pair<int, int>> plan[2];
+        for (int inner = 0; inner < 2; ++inner) {
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
+            L.cfg.pp_plan_prefix = true;
+            L.max_tok = 4160;
+            L.max_ctx = 140000;
+            L.kv_blocks = 16384;
+            L.stage_rows = 1024;
+            L.win = 16;
+            L.seqs = 6;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            L.set.set_span_tail(8192);
+            L.set.set_span_short(24576);
+            L.set.set_span_inner(inner == 1);
+            for (int l = 0; l < lanes; ++l) L.at(l).set_tail_inner_capable(true);
+            const uint64_t s = L.submit(0, n_prompt, 2);
+            REQUIRE(s != 0);
+            int64_t misses = 0;
+            int failed = 0;
+            plan[inner] = run_cold(L, lanes, s, &misses, &failed);
+            CHECK_EQ(failed, 0);
+            CHECK_EQ(misses, (int64_t)0);
+            REQUIRE(L.req(0, s) != nullptr);
+            CHECK_EQ(L.req(0, s)->n_computed, (int64_t)n_prompt);
+            for (const auto& [a, b] : plan[inner]) {
+                CHECK(b % 2048 == 0 || b == n_prompt);
+                CHECK(b - a >= 128);
+            }
+        }
+        REQUIRE(!plan[0].empty() && !plan[1].empty());
+        if (n_prompt != 66536) {
+            CHECK(plan[1] == plan[0]);
+        } else {
+            /* the last chunk [63488, 66536) carries the tail snapshot: INNER cuts it at 65536 */
+            CHECK_EQ(plan[0].back().first, 63488);
+            CHECK_EQ(plan[1].back().first, 65536);
+            using Plan = std::vector<std::pair<int, int>>;
+            const Plan head1(plan[1].begin(), plan[1].end() - 2), head0(plan[0].begin(), plan[0].end() - 1);
+            CHECK(head1 == head0);
+        }
+        fprintf(stderr, "    span 2, %d tokens, %d lanes, G 512 + TI + SPAN_TAIL / SHORT: last chunk [%d, %d) -> with INNER "
+                        "[%d, %d)%s\n", n_prompt, lanes, plan[0].back().first, plan[0].back().second, plan[1].back().first,
+                plan[1].back().second, plan[1] == plan[0] ? " (the same plan)" : "");
     }
 }
 
