@@ -624,8 +624,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         /* tp8 S5 review: an even split (lane l takes [l * S / N, (l + 1) * S / N)), so every lane has a card
          * whenever --max-num-seqs >= --pp-lanes, as pp_check promises; ceil(S / N) a lane left the last
          * lanes none at e.g. 6 sequences over 4 lanes, refused at start with a misleading reason. */
-        const int64_t lo = (int64_t)lane_ * cfg.max_seqs / n_lanes_, hi = ((int64_t)lane_ + 1) * cfg.max_seqs / n_lanes_;
-        if (lo >= hi) {
+        /* tp8 dev M8 (RADIANCE_PP_BG_LANE=k): the last k lanes hold no sequence; the others split the cards */
+        const int k = LaneSet::bg_env() < n_lanes_ ? LaneSet::bg_env() : 0;
+        const int64_t nd = n_lanes_ - k;
+        const bool bgl = k > 0 && lane_ >= nd;
+        const int64_t lo = bgl ? 0 : (int64_t)lane_ * cfg.max_seqs / nd, hi = bgl ? 0 : ((int64_t)lane_ + 1) * cfg.max_seqs / nd;
+        if (lo >= hi && !bgl) {
             RAD_ERR("scheduler: lane %d of %d has no card: --max-num-seqs %lld is below --pp-lanes", lane_, n_lanes_,
                     (long long)cfg.max_seqs);
             return RAD_E_INVAL;

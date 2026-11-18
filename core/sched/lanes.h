@@ -121,6 +121,30 @@ public:
      * waiting -- else the entry stays whole. */
     bool lend_split() const { return lend_mixed_ == 2; }
     void set_lend_split(bool on) { lend_mixed_ = on ? 2 : 0; }
+    /* tp8 dev M8 (RADIANCE_PP_BG_LANE=k, 1 <= k < --pp-lanes): the LAST k lanes are background prefill lanes. They hold no
+     * sequence (pick() and Scheduler::init's card split skip them: the other lanes split --max-num-seqs), and a newcomer that a
+     * lane plans whole beside its decoders (a MIXED step's prompt entry that produces its first token, no prefix restore) is
+     * lent WHOLE to one of them (Scheduler::lane_split_bg: the first in the planning order with room): its chunk is the home's
+     * own plan -- no new cut -- and the home's step goes out with its decode rows alone. With k = 2 two newcomers are in flight
+     * at once (one's leader tail beside the next one's follower segments). Cold prompts' chunks keep to the other lanes. The
+     * follower runs the BG lanes' passes in layer segments (RADIANCE_PP_SEG_LAYERS, without RADIANCE_PP_SEG_PREFILL) with the
+     * decode lanes' passes between them; the leader's RADIANCE_PP_READY_FIRST=1 lets decode tails go before them. Default 0. */
+    static int bg_env();   /* k from the environment (0: off) */
+    /* the first BG lane, or -1 */
+    int  bg_lane() const { return bg_ > 0 && (int)lanes_.size() > bg_ ? (int)lanes_.size() - bg_ : -1; }
+    int  bg_n() const { return bg_lane() >= 0 ? bg_ : 0; }
+    bool is_bg(int l) const { return bg_lane() >= 0 && l >= bg_lane() && l < (int)lanes_.size(); }
+    void set_bg(int k) { bg_ = k > 0 ? k : 0; }
+    /* M8's counts: newcomers lent whole to the BG lane, their rows, and why one stayed home (a prefix restore, the BG lane's
+     * room, the BG lane not among this plan's planners) */
+    enum { kBgRestore, kBgRoom, kBgOrder, kBgSplitRoom, kBgWhyN };
+    void note_bg_locked(int64_t rows) { ++bg_lent_; bg_rows_ += rows; }
+    /* RADIANCE_PP_BG_SPLIT=1 (with two BG lanes or more): a newcomer cut on the 512 grid near its middle, its two pieces to two
+     * BG lanes in the planning order (Scheduler::lane_split_bg) */
+    bool bg_split() const { return bg_split_; }
+    void set_bg_split(bool on) { bg_split_ = on; }
+    void note_bg_split_locked() { ++bg_split_n_; }
+    void note_bg_skip_locked(int k) { if (k >= 0 && k < kBgWhyN) ++bg_skip_[k]; }
     int64_t split_min() const { return split_min_; }
     /* Overrides the environment's (tests). */
     void set_split(bool on, int64_t min_rows) { split_on_ = on; split_min_ = min_rows > 0 ? min_rows : split_min_; }
@@ -166,7 +190,10 @@ public:
     void note_why_locked(int k) { if (k >= 0 && k < kWhyN) ++why_[k]; }
 
     /* Counters (any thread, under the lock): pieces lent, pieces committed, rows lent. */
-    struct Counts { int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; int64_t why[kWhyN] = {}; int64_t dpieces = 0; };
+    struct Counts {
+        int64_t pieces = 0, done = 0, rows = 0, token_pieces = 0; int64_t why[kWhyN] = {}; int64_t dpieces = 0;
+        int64_t bg = 0, bg_rows = 0, bg_skip[kBgWhyN] = {}, bg_split = 0;   /* tp8 dev M8 */
+    };
     Counts counts() const {
         std::lock_guard<std::mutex> lk(*mu_);
         Counts c;
@@ -176,6 +203,10 @@ public:
         c.token_pieces = tok_;
         c.dpieces = dpiece_;
         for (int k = 0; k < kWhyN; ++k) c.why[k] = why_[k];
+        c.bg = bg_lent_;
+        c.bg_rows = bg_rows_;
+        for (int k = 0; k < kBgWhyN; ++k) c.bg_skip[k] = bg_skip_[k];
+        c.bg_split = bg_split_n_;
         return c;
     }
     void note_lent_locked(int64_t rows, bool tok) { rows_ += rows; if (tok) ++tok_; }
@@ -203,6 +234,9 @@ private:
     int64_t span_short_ = 0;                /* RADIANCE_PP_SPAN_SHORT (span_short) */
     bool    lend_busy_ = true;              /* RADIANCE_PP_LEND_BUSY (lend_busy) */
     int     lend_mixed_ = 0;                /* RADIANCE_PP_LEND_MIXED 1 (lend_mixed, tp8 dev M5) / 2 (lend_split, M5b) */
+    int     bg_ = 0;                        /* RADIANCE_PP_BG_LANE=k (bg_lane, tp8 dev M8) */
+    int64_t bg_lent_ = 0, bg_rows_ = 0, bg_skip_[kBgWhyN] = {}, bg_split_n_ = 0;
+    bool    bg_split_ = false;              /* RADIANCE_PP_BG_SPLIT=1 (bg_split, tp8 dev M8) */
     int64_t split_min_ = 128;
     bool    head_state_ = false;
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0, dpiece_ = 0;

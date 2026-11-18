@@ -297,7 +297,9 @@ int ctxskip_lanes(const Config& c) {
 int64_t ctxskip_lane_rows(const Config& c) {
     const int64_t seqs = c.max_seqs > 0 ? c.max_seqs : 1;
     const int n = ctxskip_lanes(c);
-    return n > 1 ? (seqs + n - 1) / n : seqs;
+    /* tp8 dev M8: with BG lanes (RADIANCE_PP_BG_LANE=k) the other lanes hold the cards, so a region is their share */
+    const int nd = n > 1 && LaneSet::bg_env() > 0 && LaneSet::bg_env() < n ? n - LaneSet::bg_env() : n;
+    return n > 1 ? (seqs + nd - 1) / nd : seqs;
 }
 int64_t ctxskip_ring_rows(const Config& c) { return ctxskip_lanes(c) * ctxskip_lane_rows(c); }
 int64_t dtype_bytes(int32_t dt) {

@@ -13877,6 +13877,140 @@ TEST(lanes_lend_split_cuts_a_whole_mixed_newcomer_on_the_512_grid_and_lends_its_
     }
 }
 
+/* tp8 dev M8 (RADIANCE_PP_BG_LANE=1): the last lane holds no sequence (pick() never names it) and a newcomer planned whole beside
+ * decode rows goes to it WHOLE: its chunk is the home's own plan (one entry, the prompt's end, the same rows as one lane plans),
+ * the home's step goes out as a DECODE step with all its decoders, the BG lane's step is a lone PREFILL step of other lanes'
+ * pieces, and the newcomer decodes in its home lane afterwards. A newcomer of more than one D piece keeps D's first piece home
+ * (2266: 2048 there, the 218-row rest to the BG lane or by the cold path to a decode lane, never the BG lane's by that path).
+ * DS geometry (interval 2048, MNBT 4160, span 2), 1 / 2 / 3 lanes, with a head-state cut too; the engine's planning order
+ * (each lane's idle followers planned right behind it). */
+TEST(lanes_bg_lane_takes_whole_mixed_newcomers_and_holds_no_sequence) {
+    struct Env {
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_SPLIT"); }
+    } env;
+    struct Arm { int64_t len; bool head; };
+    for (const int k : { 1, 2, 3 })   /* 3 = two BG lanes with RADIANCE_PP_BG_SPLIT=1 */
+    for (const Arm a : { Arm{ 1100, false }, Arm{ 700, false }, Arm{ 2266, false }, Arm{ 1100, true } }) {
+        const bool split = k == 3;
+        setenv("RADIANCE_PP_BG_LANE", k == 1 ? "1" : "2", 1);
+        if (split) setenv("RADIANCE_PP_BG_SPLIT", "1", 1); else unsetenv("RADIANCE_PP_BG_SPLIT");
+        std::vector<int64_t> ends_1;
+        const int nbg = split ? 2 : k;
+        for (int lanes : { 1, nbg + 1, nbg + 2 }) {
+            DstSwitches restore;
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
+            L.max_tok = 4160;
+            L.max_ctx = 60000;
+            L.stage_rows = 1024;
+            L.seqs = 12;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            L.set.set_head_state(a.head);
+            CHECK(DstSwitches::set("sched_bi_chunk", 3));
+            const int bg = L.set.bg_lane(), nd = lanes - L.set.bg_n();
+            CHECK_EQ(bg, lanes > nbg ? lanes - nbg : -1);
+            std::vector<int> p_lanes;   /* the BG lanes that ran a piece of the newcomer, in run order */
+            for (int q = 0; q < 8; ++q) CHECK(!L.set.is_bg(L.set.pick()));
+            std::vector<uint64_t> dec[3];
+            for (int i = 0; i < 8; ++i) {
+                const int l = i % nd;
+                dec[l].push_back(L.submit(l, 100, 4000, 2000 + 100 * i));
+            }
+            uint64_t p = 0;
+            std::vector<int64_t> ends;
+            int short_steps = 0, bg_steps = 0, bg_not_prefill = 0, home_mixed_with_p = 0, p_decoded = 0, bg_own = 0;
+            std::vector<int> fifo;
+            std::vector<char> busy((size_t)lanes, 0);
+            int next = 0;
+            for (int round = 0; round < 3000; ++round) {
+                if (round == 4) p = L.submit(0, a.len, 4);
+                const Request* rp = p ? L.req(0, p) : nullptr;
+                if (rp && rp->n_computed >= a.len && !rp->output.empty() && rp->output.size() >= 3) break;
+                std::vector<int> todo;
+                for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+                for (size_t at = 0; at < todo.size(); ++at) {
+                    const int l = todo[at];
+                    if (busy[(size_t)l]) continue;
+                    std::vector<int> order, idle_after;
+                    for (int j = 1; j < lanes; ++j)
+                        if (!busy[(size_t)((l + j) % lanes)]) { order.push_back((l + j) % lanes); idle_after.push_back((l + j) % lanes); }
+                    for (int f : fifo) order.push_back(f);
+                    if (!L.plan(l, order)) continue;
+                    const StepPlan& pl = L.at(l).plan();
+                    for (const StepEntry& e : pl.e) {
+                        if (p && e.seq == p && e.is_prefill) {
+                            ends.push_back((int64_t)e.ctx_len + e.n_tokens);
+                            if (L.set.is_bg(l)) p_lanes.push_back(l);
+                            if (!L.set.is_bg(l) && pl.phase == RAD_PHASE_MIXED && e.produces_token) ++home_mixed_with_p;
+                        }
+                        if (p && e.seq == p && !e.is_prefill && l == 0) ++p_decoded;
+                        if (L.set.is_bg(l) && e.home < 0) ++bg_own;
+                    }
+                    if (L.set.is_bg(l)) {
+                        ++bg_steps;
+                        bg_not_prefill += pl.phase != RAD_PHASE_PREFILL;
+                    } else if (p && rp && rp->n_computed < a.len) {
+                        int rows = 0;
+                        for (const StepEntry& e : pl.e)
+                            for (uint64_t d : dec[l]) rows += e.seq == d && !e.is_prefill;
+                        short_steps += rows != (int)dec[l].size();
+                    }
+                    busy[(size_t)l] = 1;
+                    fifo.push_back(l);
+                    next = (l + 1) % lanes;
+                    todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+                }
+                if (fifo.empty()) break;
+                const int l = fifo.front();
+                fifo.erase(fifo.begin());
+                CHECK_OK(L.commit(l, 5));
+                busy[(size_t)l] = 0;
+            }
+            REQUIRE(p != 0);
+            REQUIRE(L.req(0, p) != nullptr);
+            CHECK(L.req(0, p)->n_computed >= a.len);   /* its prompt, then the decoded tokens */
+            CHECK(p_decoded > 0);
+            std::string t;
+            for (size_t i = 0; i < ends.size(); ++i) t += fmt(" %lld", (long long)ends[i]);
+            const LaneSet::Counts c = L.set.counts();
+            if (lanes == 1) {
+                ends_1 = ends;
+                CHECK_EQ(c.bg, 0ll);
+            } else {
+                /* the BG lane's steps are lone prefill steps of lent pieces only; its own requests: none */
+                CHECK_EQ(bg_not_prefill, 0);
+                CHECK_EQ(bg_own, 0);
+                /* (2266 beside a second decode lane: the cold path lends its 218-row rest to it in D's 2048 step) */
+                if (a.len <= 2048 || nd == 1) {
+                    CHECK(bg_steps > 0);
+                    CHECK(c.bg > 0);
+                }
+                /* a one-piece newcomer: the one-lane plan's chunk, run by the BG lane; never a MIXED home step with its token */
+                if (a.len <= 2048 && !split) {
+                    CHECK(ends == ends_1);
+                    CHECK_EQ(home_mixed_with_p, 0);
+                }
+                /* RADIANCE_PP_BG_SPLIT: 512 + the rest, in two BG lanes, the first piece's lane first */
+                if (a.len <= 2048 && split) {
+                    CHECK(ends == std::vector<int64_t>({ 512, a.len }));
+                    CHECK_EQ((int)p_lanes.size(), 2);
+                    if (p_lanes.size() == 2) CHECK(p_lanes[0] != p_lanes[1]);
+                    CHECK(c.bg_split > 0);
+                    CHECK_EQ(home_mixed_with_p, 0);
+                }
+                CHECK(L.set.broken().empty());
+            }
+            CHECK_EQ(short_steps, 0);
+            fprintf(stderr, "    BG lanes %d%s, a %lld-token newcomer%s, %d lane(s): ends%s (one lane:%s); %lld lent to BG lanes "
+                            "(%lld rows), BG steps %d; home MIXED steps with its token %d; decoders in every step: %s; decoded %d\n",
+                    nbg, split ? " + split" : "", (long long)a.len, a.head ? " (head state)" : "", lanes, t.c_str(),
+                    [&] { std::string s; for (int64_t x : ends_1) s += fmt(" %lld", (long long)x); return s; }().c_str(),
+                    (long long)c.bg, (long long)c.bg_rows, bg_steps, home_mixed_with_p, short_steps ? "NO" : "yes", p_decoded);
+        }
+    }
+}
+
 /* tp8 loop P6 (cards lq12: lent 2048-row chunks every ~282 ms, the two stages overlapping ~15 %): a chunk another lane lent
  * carries its home request's lever PSK plan (design 2's next target less the chunk end), the value one lane plans for that
  * chunk -- not "no plan", under which the plugin runs design 1's cone over every lent chunk's end. ds41_psk 2 / K 2 on the

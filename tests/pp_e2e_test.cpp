@@ -1703,3 +1703,68 @@ TEST(async_crossings_serve_one_process_tokens_and_plan) {
         CHECK(sv.lead.output().find("RADIANCE_PP_SEND_ASYNC") == std::string::npos);
     }
 }
+
+/* ------------------------------------------------------------------ tp8 dev M8 */
+/* RADIANCE_PP_BG_LANE=1 (the last lane holds no sequence; a newcomer planned whole beside decoders is lent whole to it) with
+ * the follower's segments for that lane's passes (RADIANCE_PP_SEG_LAYERS=1, no RADIANCE_PP_SEG_PREFILL) and ready-first tails:
+ * every request's tokens are one process's at 2 / 3 lanes, W(0,2) and W(1,3) (a head-state cut), and the leader counts the
+ * newcomers it lent whole, the follower the BG passes it split. */
+TEST(bg_lane_newcomers_serve_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; bool split; };
+    for (const Arm a : { Arm{ 3, "0,2", 1, false }, Arm{ 2, "0,2", 1, false }, Arm{ 3, "1,3", 1, false }, Arm{ 4, "0,2", 2, false },
+                         Arm{ 4, "1,3", 2, false }, Arm{ 4, "0,2", 2, true }, Arm{ 4, "1,3", 2, true } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        if (a.split) env.push_back("RADIANCE_PP_BG_SPLIT=1");
+        for (const char* v : { "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long bg = -1, passes = -1, parts = -1, between = -1, held = -1;
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE, tp8 dev M8): "));
+        if (const size_t at = flog.rfind(" passes ran in "); at != std::string::npos)
+            if (const size_t b = flog.rfind("follower: ", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "follower: %lld passes ran in %lld segments, %lld other passes between their "
+                                                    "segments, %lld held", &passes, &parts, &between, &held);
+        long long split = -1;
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            if (const size_t r = llog.find(" rows; ", at); r != std::string::npos) split = std::atoll(llog.c_str() + r + 7);
+        fprintf(stderr, "    BG lanes %d%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to BG lanes (%lld split); follower %lld "
+                        "passes in %lld segments, %lld passes between; pieces lent %lld\n", a.k, a.split ? " + split" : "", a.lanes, a.cut,
+                differ, ref.size(), bg, split, passes,
+                parts, between, log_count(llog, "newcomer split: "));
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(llog.find("are background prefill lanes (RADIANCE_PP_BG_LANE=") != std::string::npos);
+        CHECK(flog.find("and every pass of the BG lane(s)") != std::string::npos);
+        CHECK(bg > 0);
+        CHECK(passes > 0);
+        if (a.split) CHECK(split > 0);
+    }
+}

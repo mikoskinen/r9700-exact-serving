@@ -1343,10 +1343,16 @@ int Engine::follower_loop() {
      * RADIANCE_PP_SEG_PREFILL=1 (a lone prefill chunk too: its segments cost a boundary each and nothing decodes beside it) */
     bool seg_prefill = false;
     if (const char* v = std::getenv("RADIANCE_PP_SEG_PREFILL"); v && !std::strcmp(v, "1")) seg_prefill = true;
+    /* tp8 dev M8 (RADIANCE_PP_BG_LANE=k on this node too): the BG lanes' passes -- newcomers lent whole, no decode rows -- run in
+     * segments with the decode lanes' passes between them; other lone prefill passes (a cold prompt's) stay whole */
+    const int seg_bg = LaneSet::bg_env() > 0 && LaneSet::bg_env() < n_lanes_ ? n_lanes_ - LaneSet::bg_env() : -1;
     if (const char* v = std::getenv("RADIANCE_PP_SEG_ROWS"); v && *v) seg_rows = std::max<int64_t>(1, std::atoll(v));
     if (const char* v = std::getenv("RADIANCE_PP_SEG_AHEAD"); v && *v) seg_ahead = std::min<int64_t>(1, std::max<int64_t>(0, std::atoll(v)));
     if (const char* v = std::getenv("RADIANCE_PP_SEG_TEST_WAIT_MS"); v && *v) seg_wait_ms = std::max<int64_t>(0, std::atoll(v));
     RadEvent seg_ev[2] = {};
+    if (seg_bg >= 0 && segs.empty())
+        RAD_WARN("follower: RADIANCE_PP_BG_LANE is set but no layer segments are declared (RADIANCE_PP_SEG_LAYERS on this node): the "
+                 "BG lanes' passes run whole and every decode pass queues behind them, as a MIXED step's did (tp8 dev M8)");
     if (!segs.empty()) {
         std::string b;
         for (int32_t x : segs) b += fmt("%s%d", b.empty() ? "" : ", ", (int)x);
@@ -1356,9 +1362,10 @@ int Engine::follower_loop() {
                 return fail_loop(RAD_E_DEVICE);
             }
         RAD_INFO("follower: passes of >= %lld rows%s run in layer segments at the boundaries %s of W(%d,%d), other lanes' "
-                 "passes between them (tp8 dev M4; %lld segment(s) queued ahead)", (long long)seg_rows,
+                 "passes between them (tp8 dev M4; %lld segment(s) queued ahead)%s", (long long)seg_rows,
                  seg_prefill ? "" : " with decode rows (MIXED; RADIANCE_PP_SEG_PREFILL=1: lone prefill chunks too)", b.c_str(),
-                 cfg_.pp_cut_h, cfg_.pp_cut_t, (long long)seg_ahead);
+                 cfg_.pp_cut_h, cfg_.pp_cut_t, (long long)seg_ahead,
+                 seg_bg >= 0 ? fmt("; and every pass of the BG lane(s) %d-%d (RADIANCE_PP_BG_LANE, tp8 dev M8)", seg_bg, n_lanes_ - 1).c_str() : "");
     }
     int64_t seg_passes = 0, seg_parts = 0, seg_between = 0, seg_held = 0;
     std::deque<net::Msg> held;   /* frames that wait for the split pass to end (and every frame behind them) */
@@ -1477,7 +1484,7 @@ int Engine::follower_loop() {
         /* tp8 dev M4: the pass's parts -- [h, t) whole, or its segments at the declared boundaries */
         std::vector<std::pair<int, int>> parts;
         const bool split = may_split && !segs.empty() && b->n_tok >= seg_rows &&
-                           (seg_prefill || b->phase == RAD_PHASE_MIXED || b->n_tok_decode > 0);
+                           (seg_prefill || b->phase == RAD_PHASE_MIXED || b->n_tok_decode > 0 || (seg_bg >= 0 && h.lane >= seg_bg));
         if (split) {
             int a = cfg_.pp_cut_h;
             for (int32_t x : segs) {
