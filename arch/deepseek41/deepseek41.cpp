@@ -28,6 +28,7 @@
 #include <arch/rad_block_vit.h>   /* MediaRows */
 #include <arch/rad_deepseek41_chat.h>
 
+#include "ds41_dec_band.h"   /* tp8 loop F58: a decode segment above the band, in band pieces */
 #include "ds41_engram_dedup.h"
 #include "ds41_index_split.h"
 #include "ds41_layers.h"
@@ -667,6 +668,10 @@ struct Model {
      * the row pitch of every buffer step_bi slices. */
     rad_buf bi_cu = 0;
     rad_op bi_sub = 0;
+    /* tp8 loop F58 (RADIANCE_DS41_BI_DBAND=1): a decode band piece's cu, cu[s0 .. s1] - cu[s0] (row j = piece j, at most
+     * kBiBand + 1 words), and its sub_i32; 0 unless declared */
+    rad_buf bi_dcu = 0;
+    rad_op bi_dsub = 0;
     /* A sizing declare (RadBuildCtx::shape_probe): the real declare's model of this rank; null in the real declare. */
     const Model* sized_against = nullptr;
     std::map<rad_buf, int64_t> bp;
@@ -1508,6 +1513,33 @@ static bool bi_pmm(int v) { return v == 7; }
 static std::atomic<long long> g_pmm_steps{0}, g_pmm_merged{0};   /* lever PMM: steps with a merged pass; passes saved (layer 0) */
 static constexpr int64_t kBiBand = 48;   /* gemm_nt_ggml / attn_sparse_sink / index_score: the decode band's top */
 static constexpr int64_t kBiNorm = 32;   /* the fused norms: r4d_act_threads' 1024-thread width up to this many rows */
+/* tp8 loop F58 (19.11.2026): RADIANCE_DS41_BI_DBAND=1 (read with RADIANCE_DS41_BI at the first declare; both nodes) -- a
+ * decode segment of more than kBiBand rows (depth-3 drafting at lanes of 16: 16 x 4 = 64 rows under fn4 sched_row_cap
+ * 64) runs its attention in pieces of whole decode sequences of at most kBiBand rows (ds41_dec_band.h: as few as greedy
+ * packing gives, as even as that count allows) and its indexer in runs of at most kBiBand rows (ds41_idx_runs at that
+ * height), so both stay in libr4d's scalar decode kernels (libref's bits) instead of the WMMA forms above 48 rows, which
+ * are NOT those bits (r4d_ds41_sparse.hip head note) -- lq150 loadid c32 9 / 20 DIFFERENT at sched_row_cap 64 (F58). A
+ * piece past the first reads its sequences' cu relative to its first row: `bi_dcu` row j = cu[s0 .. s1] - cu[s0], one
+ * sub_i32 a piece at the step's start (bi_dsub, beside lever BI's bi_sub). Unset or anything but 1: nothing declared,
+ * today's issue (a decode segment above the band in one attention launch and one indexer run). */
+static std::atomic<int> g_bi_dband{-1};   /* -1 unread, 0 off, 1 on (RADIANCE_DS41_BI_DBAND=1) */
+static std::atomic<long long> g_dband_steps{0}, g_dband_pieces{0}, g_dband_runs{0}, g_dband_sync{0}, g_dband_over{0};
+/* 2 = 1, and a pass whose decode sequences carry different row counts is recorded too, keyed by its pieces (rows and
+ * sequences of each: rad_arch_pass_key); at 1 such a pass is issued live (only the uniform layout records). */
+static std::atomic<long long> g_dband_live{0}, g_dband_keyed{0};
+static bool bi_dband_env() {
+    int v = g_bi_dband.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_DS41_BI_DBAND");
+        const int w = e && (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
+        if (e && !w && std::strcmp(e, "0"))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_BI_DBAND=%s is not 1 or 2: the decode band pieces are not declared\n", e);
+        int unread = -1;
+        g_bi_dband.compare_exchange_strong(unread, w);
+        v = g_bi_dband.load(std::memory_order_relaxed);
+    }
+    return v > 0;
+}
 
 /* Lever PSK (prefill skip above the last cache source, ds41-psk 11.11.2026). A layer past the last kv source (the
  * largest of attention.kv_source_layers: 20 of the 1017's 40) writes nothing a later token reads but its own window keys
@@ -6029,6 +6061,17 @@ static int bi_declare(RadBuilder* b, Model& m, const RadBuildCtx* ctx) {
     if (!m.bi_cu) return RAD_E_INVAL;
     m.bi_sub = op(b, "sub_i32", { RAD_RANGE("M", 1, 2) }, {}, {}, { m.bi_cu });
     if (!m.bi_sub) return RAD_E_UNSUPPORTED;
+    if (bi_dband_env()) {   /* tp8 loop F58: a decode band piece's cu a row */
+        m.bi_dcu = decl_b(b, m.nm.f("bi_dcu"), RAD_I32, { std::max<int64_t>(1, m.g.max_seqs), kBiBand + 1 }, RAD_BUF_PERSIST);
+        if (!m.bi_dcu) return RAD_E_INVAL;
+        m.bi_dsub = op(b, "sub_i32", { RAD_RANGE("M", 1, kBiBand + 1) }, {}, {}, { m.bi_dcu });
+        if (!m.bi_dsub) return RAD_E_UNSUPPORTED;
+        if (ctx->rank == 0 && !ctx->shape_probe)
+            fprintf(stderr, "radiance: deepseek41: tp8 loop F58 (RADIANCE_DS41_BI_DBAND=1): a decode segment above %lld rows "
+                            "runs its attention in pieces of whole sequences of <= %lld rows and its indexer in runs of <= "
+                            "%lld rows (the decode kernels' bytes)\n",
+                    (long long)kBiBand, (long long)kBiBand, (long long)kBiBand);
+    }
     if (!ctx->shape_probe) g_sw_bi_ok.store(1, std::memory_order_relaxed);
     if (ctx->rank == 0 && !ctx->shape_probe)
         fprintf(stderr, "radiance: deepseek41: lever BI declared (RADIANCE_DS41_BI, fn4 ds41_bi, now %d): a step of more "
@@ -6811,6 +6854,28 @@ static std::atomic<long long> g_bi_onear{0};   /* lever A9: segmented steps whos
  * flip of the switch bumps the epoch, so recorded passes re-record. Off (or libr4d without the switch): today's issue. */
 static std::atomic<long long> g_wmkw_steps{0}, g_wmkw_runs{0}, g_wmkw_rows{0};
 static bool wmk_whole_on() { return ds41_switch("ds41_wmk") >= 1; }   /* 1, or F7's A/B codes 2 / 3 (the same bytes) */
+/* tp8 loop D22 (19.11.2026; the 64-row decode step's dense, the DRAFTER's lq150 lanecmp item 2): RADIANCE_DS41_DENSE_BAND=N
+ * (49 .. 64, read once; unset or anything else: kBiBand, today) -- under lever WMK (ds41_wmk >= 1: every dense GGUF GEMM one
+ * part order at every row count, so a launch's height does not move a row's bytes) a decode-only run of up to N rows issues
+ * each dense GGUF GEMM through dense() (wo_a, wo_b, the Engram GEMM: today rows of 48 + the rest; q_a / kv / iproj / q_b /
+ * iq_w go whole a segment already) and the logits head as ONE launch instead of 48 + the rest, each weight read once a
+ * pass. It pays only with a libr4d whose decode-band G2 (gg_wk3) serves N rows (4 row tiles = 64 rows; today it declines
+ * above 3 and gemm_nt_ggml takes the slower prefill form gg_pf at 49 .. 64: the same bytes). Off WMK: kBiBand. */
+static int64_t dense_band_env() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DENSE_BAND");
+        if (!e || !*e) return kBiBand;
+        char* end = nullptr;
+        const long long n = std::strtoll(e, &end, 10);
+        if (end && !*end && n >= kBiBand + 1 && n <= 64) return (int64_t)n;
+        if (!(end && !*end && n == kBiBand))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DENSE_BAND=%s is not 49 .. 64: the dense decode band stays "
+                            "%lld rows\n", e, (long long)kBiBand);
+        return kBiBand;
+    }();
+    return v;
+}
+static std::atomic<long long> g_dband64_runs{0};   /* D22: decode-only dense runs above kBiBand issued as one launch (rank 0) */
 /* the weight is a GGUF block weight served by gemm_nt_ggml (not IQR, not bf16 gemm_nt) */
 static bool gguf_dense(const Model& m, rad_weight w) { return m.wty.count(w) && !m.wsc.count(w); }
 /* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
@@ -7338,6 +7403,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     n, g_bi_moe.load(std::memory_order_relaxed),
                     (double)g_bi_moe.load(std::memory_order_relaxed) / (double)n, g_bi_sync.load(std::memory_order_relaxed),
                     g_bi_wide.load(std::memory_order_relaxed), g_sw_bi.load(std::memory_order_relaxed));
+        /* tp8 loop D22: its own line beside, once a decode-only dense run above the band went as one launch */
+        if (n > 0 && n % 512 == 0 && rad_rank(x) == 0 && g_dband64_runs.load(std::memory_order_relaxed) > 0)
+            fprintf(stderr, "radiance: deepseek41: tp8 loop D22 (RADIANCE_DS41_DENSE_BAND=%lld): %lld decode-only dense GGUF runs above "
+                            "%lld rows issued as one launch (layer-ops summed)\n", (long long)dense_band_env(),
+                    g_dband64_runs.load(std::memory_order_relaxed), (long long)kBiBand);
         /* lever A9 (ds41_bi 5 / 6): its own line beside, once a step took it (the line above stays int12's) */
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0 && g_bi_onear.load(std::memory_order_relaxed) > 0)
             fprintf(stderr, "radiance: deepseek41: lever A9 stats: %lld of %lld segmented steps with one MoE all-reduce; "
@@ -7400,12 +7470,21 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
      * ONE launch (the decode rows ride it), a decode-only run as rows(kBiBand); off: rows(kBiBand) (`wmkw` false) or the caller's
      * own by-segment issue. `seg`: the caller's per-segment form (q_a / kv / q_b / the indexer's linears: by segment, uncut). */
     const bool wmkw = wmk_whole_on();
+    /* tp8 loop D22 (RADIANCE_DS41_DENSE_BAND): a decode-only run's dense GGUF GEMM band under WMK (kBiBand otherwise) */
+    const int64_t dband = wmkw ? dense_band_env() : kBiBand;
     auto dense = [&](bool gg, bool seg, const auto& fn) {
+        const int64_t band = gg ? dband : kBiBand;
         const auto by_seg = [&](int64_t a0, int64_t a1) {
             for (const BiSeg& s : *cur) {
                 if (s.r0 < a0 || s.r0 >= a1) continue;
-                if (seg || !s.dec || s.n <= kBiBand) { fn(s.r0, s.n); continue; }
-                for (int64_t a = 0; a < s.n; a += kBiBand) fn(s.r0 + a, std::min(kBiBand, s.n - a));
+                if (seg || !s.dec || s.n <= band) {
+                    if (!seg && s.dec && s.n > kBiBand && rad_rank(x) == 0) g_dband64_runs.fetch_add(1, std::memory_order_relaxed);
+                    fn(s.r0, s.n);
+                    continue;
+                }
+                static thread_local std::vector<std::pair<int64_t, int64_t>> bc;
+                ds41_band_cuts(s.n, band, bc);
+                for (const auto& c : bc) fn(s.r0 + c.first, c.second);
             }
         };
         if (!wmkw || !gg) { by_seg(0, T); return; }
@@ -7450,6 +7529,63 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (s.k >= 0)
             RAD_ISSUE_N(x, m.bi_sub, 2, praw(batch->cu_seqlens + s.s0, RAD_I32, 2),
                         praw(batch->cu_seqlens + s.s0, RAD_I32, 1), brow_slice(m.bi_cu, s.k, 1, 2));
+    /* tp8 loop F58 (RADIANCE_DS41_BI_DBAND=1, m.bi_dsub): the decode segment's band pieces when it is above kBiBand rows
+     * (`dap`, empty otherwise: today's issue), and piece j's cu view (dcu): piece 0 starts at row 0, so the batch's own
+     * cu[0 .. s1] is its view; a later piece reads bi_dcu row j = cu[s0 .. s1] - cu[s0], written here once a step. The
+     * sequences' first rows: every decode sequence at max_q_len_decode rows (the recorded passes: rad_arch_pass_key keys
+     * only that layout), else the host positions' jumps, else cu read back (a sync, as bi_segments' prefill rule). */
+    static thread_local std::vector<Ds41DecPiece> dap;
+    static thread_local std::vector<int64_t> dst;
+    dap.clear();
+    if (m.bi_dsub && !psk_only && !sg.empty() && sg[0].dec && sg[0].n > kBiBand && sg[0].r0 == 0 && sg[0].s0 == 0) {
+        const int64_t dn = sg[0].s1 - sg[0].s0, dt = sg[0].n, q = batch->max_q_len_decode;
+        dst.clear();
+        const bool uni = q > 0 && dn * q == dt;
+        const bool pos_ok = !uni && ds41_dec_starts(batch->positions_h, dt, dn, dst);
+        if (!uni && rad_rank(x) == 0)   /* rad_arch_pass_key's verdict on this layout: recorded by its pieces, or live */
+            (g_bi_dband.load(std::memory_order_relaxed) >= 2 && pos_ok ? g_dband_keyed : g_dband_live)
+                .fetch_add(1, std::memory_order_relaxed);
+        if (uni)
+            for (int64_t s = 0; s < dn; ++s) dst.push_back(s * q);
+        else if (!pos_ok) {
+            std::vector<int32_t> cuh((size_t)dn + 1);
+            rad_memcpy_async(cuh.data(), batch->cu_seqlens, (dn + 1) * 4, rad_stream(x));
+            rad_stream_sync(rad_stream(x));
+            for (int64_t s = 0; s < dn; ++s) dst.push_back(cuh[(size_t)s]);
+            if (rad_rank(x) == 0) g_dband_sync.fetch_add(1, std::memory_order_relaxed);
+        }
+        const int64_t over = ds41_dec_pieces(dst, dt, kBiBand, dap);
+        bool fits = over == 0 && (int64_t)dap.size() <= std::max<int64_t>(1, m.g.max_seqs);
+        for (const Ds41DecPiece& p : dap) fits = fits && p.s1 - p.s0 + 1 <= kBiBand + 1;
+        if (!fits) {
+            if (rad_rank(x) == 0) g_dband_over.fetch_add(1, std::memory_order_relaxed);
+            dap.clear();
+        }
+        for (size_t j = 1; j < dap.size(); ++j) {
+            const int64_t ns = dap[j].s1 - dap[j].s0;
+            RAD_ISSUE_N(x, m.bi_dsub, ns + 1, praw(batch->cu_seqlens + dap[j].s0, RAD_I32, ns + 1),
+                        praw(batch->cu_seqlens + dap[j].s0, RAD_I32, 1), bcol_at(m.bi_dcu, (int64_t)j, kBiBand + 1, 0, ns + 1, 1));
+        }
+        if (!dap.empty() && rad_rank(x) == 0) {
+            const long long n = g_dband_steps.fetch_add(1, std::memory_order_relaxed) + 1;
+            g_dband_pieces.fetch_add((long long)dap.size(), std::memory_order_relaxed);
+            if (n == 1 || n % 4096 == 0)
+                fprintf(stderr, "radiance: deepseek41: tp8 loop F58 (RADIANCE_DS41_BI_DBAND=%d): %lld decode segments above %lld "
+                                "rows in band pieces (%lld pieces, %lld indexer runs a layer-op summed; %lld cu read-backs, %lld "
+                                "left whole; uneven layouts %lld issued live, %lld recorded by their pieces); this one %lld rows of "
+                                "%lld sequences in %zu pieces\n",
+                        g_bi_dband.load(std::memory_order_relaxed), n, (long long)kBiBand,
+                        g_dband_pieces.load(std::memory_order_relaxed), g_dband_runs.load(std::memory_order_relaxed),
+                        g_dband_sync.load(std::memory_order_relaxed), g_dband_over.load(std::memory_order_relaxed),
+                        g_dband_live.load(std::memory_order_relaxed), g_dband_keyed.load(std::memory_order_relaxed),
+                        (long long)dt, (long long)dn, dap.size());
+        }
+    }
+    auto dcu = [&](size_t j) {
+        const int64_t ns = dap[j].s1 - dap[j].s0;
+        if (j == 0) return praw(batch->cu_seqlens, RAD_I32, ns + 1);
+        return bcol_at(m.bi_dcu, (int64_t)j, kBiBand + 1, 0, ns + 1, 1);
+    };
 
     /* the step's head ops: as step() (per-token, over the step); tp8 S6: on a pipeline node as step() does them -- the
      * leader's lookup, X1 at W(0, t), the streams where the node's first layer is layer 0's successor of the lookup */
@@ -8294,8 +8430,16 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     while (sj < sg_step.size() && !(sg_step[sj].s0 == sg[si].s0 && sg_step[sj].dec == sg[si].dec)) ++sj;
                     const BiSeg& s = sj < sg_step.size() ? sg_step[sj] : sg[si];
                     const int64_t cut0 = sg[si].r0;
-                    const Ds41IdxRuns ru = ds41_idx_runs(s.n, m.irows, live, m.aw, m.ar, split && !s.dec, m.split_min_live,
-                                                         split && !s.dec && idx_balance(), (int64_t)L.i_runs.size());
+                    Ds41IdxRuns ru = ds41_idx_runs(s.n, m.irows, live, m.aw, m.ar, split && !s.dec, m.split_min_live,
+                                                   split && !s.dec && idx_balance(), (int64_t)L.i_runs.size());
+                    /* tp8 loop F58: the decode segment above the band in runs of <= kBiBand rows (the decode kernel) */
+                    if (s.dec && !dap.empty() && ru.R > kBiBand) {
+                        const Ds41IdxRuns rd = ds41_idx_runs(s.n, kBiBand, live, m.aw, m.ar, false);
+                        if (rd.n <= (int64_t)L.i_runs.size()) {
+                            ru = rd;
+                            if (rad_rank(x) == 0) g_dband_runs.fetch_add(rd.n, std::memory_order_relaxed);
+                        }
+                    }
                     for (int64_t p = ru.p0; p < ru.p1; ++p) {
                         const int64_t q0 = p * ru.R, qn = std::min(ru.R, s.n - q0);
                         if (s.r0 + q0 + qn <= cut0) continue;
@@ -8332,7 +8476,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             const bool ofold = L.attn_rt && g_sw_of.load(std::memory_order_relaxed) > 0;
             const rad_op ah = ofold ? L.attn_rt : L.attn;
             const RadOperand acs = ofold ? brows(cs, g.max_ctx) : RAD_NONE;
-            for (const BiSeg& s : sg) {
+            /* tp8 loop F58: one segment (or decode band piece) with its cu view `cuv` */
+            const auto attn_one = [&](const BiSeg& s, const RadOperand cuv) {
                 const int64_t ns = s.s1 - s.s0;
                 const RadOperand wbt = praw2(wb->block_table + s.s0 * wb->block_table_pitch, RAD_I32, ns, wb->block_table_pitch);
                 const RadOperand wused = praw(wb->seqused + s.s0, RAD_I32, ns);
@@ -8354,27 +8499,35 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                                 }
                         std::vector<RadOperand> da = { R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused,
                                                        kv_cache(m.comp[r], src), cbt, R(m.sel, s.r0, s.n),
-                                                       P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks),
+                                                       P(batch->positions, s.r0, s.n), cuv, RAD_W(L.sinks),
                                                        R(m.o, s.r0, s.n) };
                         if (ofold) da.push_back(acs);
                         const int64_t lp = batch->positions_h && s.n > 0 ? (int64_t)batch->positions_h[s.r0 + s.n - 1] : -1;
-                        if (dkv_attn(x, m, L, ofold, s.dec, s.s0, s.s1, s.n, hr0, hn, std::move(da), lp)) continue;
+                        if (dkv_attn(x, m, L, ofold, s.dec, s.s0, s.s1, s.n, hr0, hn, std::move(da), lp)) return;
                     }
                     if (ofold)
                         RAD_ISSUE_N(x, ah, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused, kv_cache(m.comp[r], src),
-                                    cbt, R(m.sel, s.r0, s.n), P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks),
+                                    cbt, R(m.sel, s.r0, s.n), P(batch->positions, s.r0, s.n), cuv, RAD_W(L.sinks),
                                     R(m.o, s.r0, s.n), acs);
                     else
                         RAD_ISSUE_N(x, L.attn, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused,
                                     kv_cache(m.comp[r], src), cbt, R(m.sel, s.r0, s.n), P(batch->positions, s.r0, s.n),
-                                    segcu(s), RAD_W(L.sinks), R(m.o, s.r0, s.n));
+                                    cuv, RAD_W(L.sinks), R(m.o, s.r0, s.n));
                 } else if (ofold) {
                     RAD_ISSUE_N(x, ah, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused, RAD_NONE, RAD_NONE, RAD_NONE,
-                                P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks), R(m.o, s.r0, s.n), acs);
+                                P(batch->positions, s.r0, s.n), cuv, RAD_W(L.sinks), R(m.o, s.r0, s.n), acs);
                 } else {
                     RAD_ISSUE_N(x, L.attn, s.n, R(m.q, s.r0, s.n), kv_cache(m.win, l), wbt, wused, RAD_NONE, RAD_NONE,
-                                RAD_NONE, P(batch->positions, s.r0, s.n), segcu(s), RAD_W(L.sinks), R(m.o, s.r0, s.n));
+                                RAD_NONE, P(batch->positions, s.r0, s.n), cuv, RAD_W(L.sinks), R(m.o, s.r0, s.n));
                 }
+            };
+            for (const BiSeg& s : sg) {
+                if (!(s.dec && !dap.empty())) {
+                    attn_one(s, segcu(s));
+                    continue;
+                }
+                /* tp8 loop F58: the decode segment above the band in its pieces, each in the decode kernels */
+                for (size_t j = 0; j < dap.size(); ++j) attn_one(BiSeg{ dap[j].r0, dap[j].n, dap[j].s0, dap[j].s1, true, -1 }, dcu(j));
             }
             if (ofold) {
             } else if (L.o_f) {
@@ -8855,9 +9008,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     if (batch->n_out > 0) {
         RAD_ISSUE_N(x, m.gather, batch->n_out, brows(m.final_hidden, T),
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
-        /* the head (logits_gemm_ggml, banded): the sampled rows in launches within the decode band */
-        for (int64_t a = 0; a < batch->n_out; a += kBiBand) {
-            const int64_t n = std::min(kBiBand, batch->n_out - a);
+        /* the head (logits_gemm_ggml, banded): the sampled rows in launches within the decode band (tp8 loop D22: the
+         * dense band RADIANCE_DS41_DENSE_BAND under WMK for a GGUF head) */
+        const int64_t hb = wmkw && gguf_dense(m, m.head) ? dband : kBiBand;
+        static thread_local std::vector<std::pair<int64_t, int64_t>> hc;
+        ds41_band_cuts(batch->n_out, hb, hc);
+        for (const auto& c : hc) {
+            const int64_t a = c.first, n = c.second;
             RAD_ISSUE_N(x, m.head_op, n, a ? brow_slice(m.logit_input, a, n, D) : brows(m.logit_input, n), RAD_W(m.head),
                         a ? brow_slice(m.logits, a, n, g.n_vocab) : brows(m.logits, n));
         }
@@ -9573,6 +9730,7 @@ static const RadChatFormat* chat_format(const RadModelMeta*) { return rad::arch:
 extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_t* kv_used_max_h) {
     (void)c;
     (void)kv_used_max_h;
+    uint64_t geo = 1;   /* the pass's geometry beyond the core's key: a constant, or (tp8 loop F58) its band pieces */
     /* Lever PSK design 2: a pass the scheduler planned (rad_psk_plan) is shaped by its targets, which no key holds: not
      * recorded */
     if (deepseek41::psk_hint(b)) return 0;
@@ -9582,6 +9740,21 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
         int64_t Dn = 0, DT = 0;
         rad::arch::batch_split(b, &Dn, &DT);
         if (b->n_seq - Dn >= 2) return 0;
+        /* tp8 loop F58 (RADIANCE_DS41_BI_DBAND=1): a decode segment above the band issues its attention in pieces of whole
+         * sequences, shaped by their row counts -- recorded only where every decode sequence has max_q_len_decode rows
+         * (the key above holds that layout); any other layout is issued live */
+        const int dband = deepseek41::g_bi_dband.load(std::memory_order_relaxed);
+        if (dband > 0 && DT > deepseek41::kBiBand && (int64_t)b->max_q_len_decode * Dn != DT) {
+            /* RADIANCE_DS41_BI_DBAND=2: keyed by the pieces step_bi issues (the same host positions, the same packing);
+             * positions that do not give the layout (step_bi reads cu back) stay live */
+            if (dband < 2) return 0;
+            static thread_local std::vector<int64_t> st;
+            static thread_local std::vector<Ds41DecPiece> pc;
+            if (!ds41_dec_starts(b->positions_h, DT, Dn, st) || ds41_dec_pieces(st, DT, deepseek41::kBiBand, pc) != 0 ||
+                pc.empty())
+                return 0;
+            geo = ds41_dec_pieces_key(pc);
+        }
     }
     /* Lever PSK-DS (dspark_pfctx 1): a context pass cut to its entries' readable rows is shaped by their lengths, which
      * the key does not hold: not recorded. A pass it leaves whole issues as today and keys as today. */
@@ -9590,7 +9763,7 @@ extern "C" uint64_t rad_arch_pass_key(RadCtx* c, const RadBatch* b, const int32_
         int64_t kept = 0;
         if (deepseek41::pfctx_plan(b, deepseek41::g_pfctx_window.load(std::memory_order_relaxed), &ru, &kept)) return 0;
     }
-    return 1;
+    return geo;
 }
 
 /* Lever PSK design 2 (ds41-psk2): the core, at a step's release with every rank thread parked (Engine::psk_release), hands
