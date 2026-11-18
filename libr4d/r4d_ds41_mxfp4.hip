@@ -598,6 +598,55 @@ __global__ __launch_bounds__(kMxThreads) void mx_tiled_kernel(MxTiledArgs A) {
 
 /* ================================================================== host side */
 constexpr long long kQK = 32, kBB = 17;
+
+/* R4D_MXDUMP (tp8 DECODE D17, READING ONLY, never shipped; exl3r4d's EXL3R4D_ROUTEDUMP form): every moe_gemm_ggml mxfp4 call
+ * on device R4D_MXDUMP_DEV (default 0: rank 0 under TP) copies {n_expert, tokens, T, off[0 .. n_expert]} into a pinned host
+ * ring of R4D_MXDUMP_MAX records of 40 ints (a device counter picks the slot, so a replayed pass dumps too), written to
+ * $R4D_MXDUMP_OUT at exit: the drafter's own routing for r4d_selftest --perfmx-routing. A call over 36 experts is skipped. */
+#if R4D_MXDUMP
+#ifndef R4D_MXDUMP_MAX
+#define R4D_MXDUMP_MAX 262144
+#endif
+#ifndef R4D_MXDUMP_DEV
+#define R4D_MXDUMP_DEV 0
+#endif
+constexpr unsigned kMdStride = 40, kMdMax = R4D_MXDUMP_MAX;
+int* g_md = nullptr;
+unsigned* g_md_ctr = nullptr;
+__global__ void mx_dump_kernel(int* ring, unsigned* ctr, const int* off, int n, int tokens, int T) {
+    __shared__ unsigned slot;
+    if (threadIdx.x == 0) slot = atomicAdd(ctr, 1u) % kMdMax;
+    __syncthreads();
+    int* r = ring + (size_t)slot * kMdStride;
+    for (int i = (int)threadIdx.x; i <= n && i < (int)kMdStride - 3; i += (int)blockDim.x) r[3 + i] = off[i];
+    if (threadIdx.x == 0) { r[1] = tokens; r[2] = T; __threadfence_system(); r[0] = n; }
+    __threadfence_system();
+}
+void mx_dump_write() {
+    const char* f = std::getenv("R4D_MXDUMP_OUT");
+    if (!f || !g_md) return;
+    if (FILE* o = std::fopen(f, "wb")) {
+        std::fwrite(g_md, sizeof(int) * kMdStride, kMdMax, o);
+        std::fclose(o);
+    }
+}
+void mx_dump(const void* off, int n, int tokens, int T, RadStream s) {
+    if (n <= 0 || n > (int)kMdStride - 4) return;
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess || dev != R4D_MXDUMP_DEV) return;
+    if (!g_md) {
+        if (hipHostMalloc((void**)&g_md, sizeof(int) * kMdStride * kMdMax, hipHostMallocDefault) != hipSuccess) { g_md = nullptr; return; }
+        std::memset(g_md, 0, sizeof(int) * kMdStride * kMdMax);
+        if (hipMalloc((void**)&g_md_ctr, 64) != hipSuccess || hipMemset(g_md_ctr, 0, 64) != hipSuccess) return;
+        std::atexit(mx_dump_write);
+    }
+    int* r = g_md;
+    unsigned* c = g_md_ctr;
+    const int* o = (const int*)off;
+    void* args[] = { &r, &c, &o, &n, &tokens, &T };
+    (void)hipLaunchKernel((const void*)mx_dump_kernel, dim3(1), dim3(64), args, 0, (hipStream_t)s);
+}
+#endif
 long long mx_r16(long long v) { return (v + 15) / 16 * 16; }
 int mx_tab_bytes(int ty) { return ty == MX_FP4 ? Mx<MX_FP4>::TB : 0; }
 
@@ -767,6 +816,9 @@ int mx_moe(const RadArgs* a, RadStream s, bool gemv) {
     const long long tb = mx_r16(mx_tab_bytes(ty));
     const long long tokens = a_sorted ? (T + top_k - 1) / top_k : AR;
     const long long L = ne < T ? ne : T;       /* experts that can have rows */
+#if R4D_MXDUMP
+    mx_dump(of->data, (int)ne, (int)tokens, (int)T, s);
+#endif
     /* drafter_mx (r4d_ds41_mxfp4_mr.hip): the multi-row forms when switched on, in the summation order of the
      * stock path this call would run (the gemv band's lane partials, else the tiled kernel's one chain an
      * output); the same bits. What they decline runs the stock kernels below. */
