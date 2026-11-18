@@ -238,6 +238,12 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  "0-%d%s", lanes_.bg_lane(), n_lanes_ - 1, lanes_.bg_n(), n_lanes_ - lanes_.bg_n(), (long long)cfg_.max_seqs,
                  lanes_.bg_lane() - 1,
                  lanes_.lend_split() || lanes_.lend_mixed() ? " (before RADIANCE_PP_LEND_MIXED, which takes what it leaves)" : "");
+    if (lanes_.bg_lane() >= 0)
+        RAD_INFO("two-node pipeline: %s", lanes_.bg_draft_floor()
+                     ? "a lent piece's commit opens its home request's drafter range as the home's own chunk would, so a newcomer "
+                       "the BG lane ran whole drafts from its second token on (tp8 loop F22; RADIANCE_PP_BG_DRAFT_FLOOR=0 off)"
+                     : "RADIANCE_PP_BG_DRAFT_FLOOR=0 -- a newcomer the BG lane ran whole drafts only once its home has run the "
+                       "drafter's window of its tokens (lq46's behaviour, tp8 loop F22)");
     if (lanes_.bg_lane() >= 0 && lanes_.bg_split())
         RAD_INFO("two-node pipeline: RADIANCE_PP_BG_SPLIT=1 -- %s", lanes_.bg_n() >= 2
                      ? "a BG newcomer is cut at the 512-grid point nearest its middle (>= 128 rows a side) and its two pieces go to two "
@@ -358,10 +364,12 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
     if (lanes_.bg_lane() >= 0)
         RAD_INFO("two-node pipeline: BG lane(s) from %d (RADIANCE_PP_BG_LANE, tp8 dev M8): %lld newcomers lent whole beside decode "
                  "rows (%lld rows; %lld of them in two pieces on the 512 grid, RADIANCE_PP_BG_SPLIT; %lld whole for want of two "
-                 "lanes' room); kept home: a prefix restore %lld, the BG lanes' room %lld, not a planner %lld", lanes_.bg_lane(),
+                 "lanes' room); kept home: a prefix restore %lld, the BG lanes' room %lld, not a planner %lld; drafter ranges opened "
+                 "by a lent piece's commit %lld (%s, tp8 loop F22)", lanes_.bg_lane(),
                  (long long)c.bg, (long long)c.bg_rows, (long long)c.bg_split, (long long)c.bg_skip[LaneSet::kBgSplitRoom],
                  (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
-                 (long long)c.bg_skip[LaneSet::kBgOrder]);
+                 (long long)c.bg_skip[LaneSet::kBgOrder], (long long)c.bg_floor,
+                 lanes_.bg_draft_floor() ? "on" : "off: RADIANCE_PP_BG_DRAFT_FLOOR=0");
 }
 
 int Engine::step_loop_lanes() {
