@@ -984,6 +984,29 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
                 "X5: the fold is built for the X3D / K25U K loops only");
   [[maybe_unused]] v8f accx = (v8f)(0.f);   // X5 (FOLD): every row's sum of this split's activations, in each column
   [[maybe_unused]] float accs = 0.f;        // X5 (FOLD, EXL3R4D_X5_SUM 2): this lane's half of its row's sum
+  // X6 S2 (FOLD, EXL3R4D_X5_SUM 3): the rows' sums BEFORE the K loop and at the cost of the LIVE rows only -- the wave sums
+  // each of this pass's rows over exactly the k range its K loop reads (xr[row][mat cols + ks0 16 ..], kps 16 halfs), all 32
+  // lanes on one row at a time (8 B a lane a step, two v_dot2 against ones), then a butterfly sum (every lane the same bits:
+  // a + b = b + a); lane nl keeps its row's. A dropped row's xr is zeros (the prep's), a lane past the rows keeps 0 (never
+  // stored). Per row and per the launch's split only, as the in-loop forms.
+  [[maybe_unused]] float xsum = 0.f;
+  if constexpr (FOLD && EXL3R4D_X5_SUM == 3) {
+    const int nrows = min(chunk, r1 - rc), nk = kps * 16;
+    const v2h one = (v2h){(_Float16)1.0f, (_Float16)1.0f};
+    for (int i = 0; i < nrows; ++i) {   // wave-uniform
+      const _Float16* xp = (const _Float16*)p.xr + (size_t)(rc + i) * p.xr_pitch + (size_t)mat * w.cols + (size_t)ks0 * 16;
+      float sr = 0.f;
+      for (int k = 4 * lane; k < nk; k += 4 * WAVE32) {
+        union { v2u u; v2h h[2]; } q;
+        q.u = *(const v2u*)(xp + k);
+        sr = __builtin_amdgcn_fdot2(q.h[0], one, sr, false);
+        sr = __builtin_amdgcn_fdot2(q.h[1], one, sr, false);
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) sr += __shfl_xor(sr, o, 32);
+      if (nl == i) xsum = sr;
+    }
+  }
   [[maybe_unused]] v8h svp[epi_opw<NPW, MATS>()][MATS];
   if constexpr (EXL3R4D_SVH_EARLY && !RAW) svh_early<NPW, MATS>(w, col_local, lane, cb, svp);
 
@@ -1126,7 +1149,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else decode_frags_x3d<NPW, FOLD>(x0_, x1_, x3d_sx, wfs_);                      \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
-      else if constexpr (FOLD) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
+      else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
       if constexpr (EXL3R4D_X6_SGB == 1) { /* X6 S1 probe: the step's loads, its decode, its WMMAs, in that order */ \
         __builtin_amdgcn_sched_group_barrier(0x020, 2 * NPW + 2, 0);                \
         __builtin_amdgcn_sched_group_barrier(0x002, 32 * NPW, 0);                   \
@@ -1154,7 +1177,7 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
       else decode_frags_k25<NPW, FOLD>(r0_, r1_, wfs_);                              \
       _Pragma("unroll") for (int j = 0; j < NPW; j++) acc[j] = x4_mma(wfs_[j], A_, acc[j]); \
       if constexpr (FOLD && EXL3R4D_X5_SUM == 2) accs = x5_dot8(A_, accs); /* X5: the row's sum */ \
-      else if constexpr (FOLD) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
+      else if constexpr (FOLD && EXL3R4D_X5_SUM == 1) accx = x4_mma(x5_ones(), A_, accx); /* X5: the rows' sums */ \
       break;                                                                         \
     }                                                                                \
     _Pragma("unroll") for (int j = 0; j < NPW; j++) {                                \
@@ -1223,7 +1246,12 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
   if constexpr (EXL3R4D_TSTAMP) tsC = __builtin_readsteadycounter();
   if constexpr (FOLD) {   // X5: sum_k (S kinv + kbias) x_k = kinv (sum_k S x_k) + kbias (sum_k x_k), this split's k-steps
     const float ki = x5_kinv(), kb = x5_kbias();
-    if constexpr (EXL3R4D_X5_SUM == 2) {   // the two half-lanes of the row (k 4h.. of every step) joined, h 0's first
+    if constexpr (EXL3R4D_X5_SUM == 3) {   // X6 S2: the pre-pass's sum of this lane's row
+#pragma unroll
+      for (int j = 0; j < NPW; j++)
+#pragma unroll
+        for (int e = 0; e < 8; e++) acc[j][e] = __builtin_fmaf(acc[j][e], ki, kb * xsum);
+    } else if constexpr (EXL3R4D_X5_SUM == 2) {   // the two half-lanes of the row (k 4h.. of every step) joined, h 0's first
       const float o = swap16(accs);
       const float xs = (lane >> 4) ? o + accs : accs + o;
 #pragma unroll
