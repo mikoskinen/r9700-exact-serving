@@ -1807,16 +1807,17 @@ TEST(lead_segments_serve_one_process_tokens) {
         CHECK_EQ(one.lead.finish(60), 0);
     }
     /* tp8 dev M9b: + RADIANCE_PP_LEAD_SEG_MIXED=1 -- a decode lane's MIXED newcomer step in segments too (one pass on the ring) */
-    struct Arm { int lanes; const char* cut; int k; const char* lead_seg; bool mixed; };
+    struct Arm { int lanes; const char* cut; int k; const char* lead_seg; bool mixed; bool ahead = false; };
     long long between_all = 0, msteps_all = 0;
     for (const Arm a : { Arm{ 3, "2,3", 1, "1", false }, Arm{ 3, "1,2", 1, "1", false }, Arm{ 3, "0,2", 1, "1", false },
                          Arm{ 4, "2,3", 1, "1", false }, Arm{ 4, "1,2", 2, "1", false }, Arm{ 3, "2,3", 1, "2", false },
                          Arm{ 3, "2,3", 1, "1", true }, Arm{ 3, "1,2", 1, "1", true }, Arm{ 4, "2,3", 1, "1", true },
-                         Arm{ 2, "2,3", 1, "1", true } }) {
+                         Arm{ 2, "2,3", 1, "1", true }, Arm{ 3, "2,3", 1, "1", true, true }, Arm{ 3, "1,2", 1, "1", false, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         env.push_back(std::string("RADIANCE_PP_LEAD_SEG=") + a.lead_seg);
         if (a.mixed) env.push_back("RADIANCE_PP_LEAD_SEG_MIXED=1");
+        if (a.ahead) env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1");   /* one segment queued behind the running one */
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_LEAD_SEG_TEST_WAIT_MS=15",
                                "RADIANCE_PP_READY_FIRST=1" })
