@@ -181,8 +181,24 @@ static int send_split(const RadArgs* a, RadPpRing* r, int split, int sender, int
                       int64_t rows, uint32_t shard = 0) {
     const int rank = a->rank;
     const bool pub = rank == sender;
-    const uint64_t d = __atomic_load_n(&r->done[rank], __ATOMIC_ACQUIRE), mine = d + 1;
-    RAD_REF_TRY(split != 2 || pub ? wait_for(r, &r->sent, d) : wait_for(r, &r->staged, mine));
+    uint64_t d = __atomic_load_n(&r->done[rank], __ATOMIC_ACQUIRE), mine = d + 1;
+    if (split == 3) {
+        /* tp8 loop FINDINGS F38: a sharded payload sits between plain ones (rank `sender` alone, which move no `done`), so its
+         * number is the ring's, not a rank's count: `sender` waits for the link to have taken the ring's last payload (its
+         * `ready`) and opens the next one in `staged`; every other rank waits for an open payload past its own last share
+         * and takes its number from there. (1 / 2 send every payload of the ring split, so their `done` counts it.) */
+        if (pub) {
+            d = __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE);
+            mine = d + 1;
+            RAD_REF_TRY(wait_for(r, &r->sent, d));
+            __atomic_store_n(&r->staged, mine, __ATOMIC_RELEASE);
+        } else {
+            RAD_REF_TRY(wait_for(r, &r->staged, d + 1));
+            mine = __atomic_load_n(&r->staged, __ATOMIC_ACQUIRE);
+        }
+    } else {
+        RAD_REF_TRY(split != 2 || pub ? wait_for(r, &r->sent, d) : wait_for(r, &r->staged, mine));
+    }
     const uint64_t nr = r->send_ranks, U = total / RAD_PP_PART_ALIGN;
     const bool all = split == 2 && pub;
     const uint64_t lo = all ? 0 : (uint64_t)rank * U / nr * RAD_PP_PART_ALIGN;

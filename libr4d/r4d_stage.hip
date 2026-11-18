@@ -152,8 +152,26 @@ __global__ void __launch_bounds__(kThreads) stage_send_split_kernel(RadPpRing* r
     if (threadIdx.x == 0) {
         const uint64_t d = ld_sys(&r->done[P.rank]);
         mine = d + 1;
-        if (P.split != 2 || pub) ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= d; }) ? 1 : 0;
-        else                     ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->staged) >= d + 1; }) ? 1 : 0;
+        if (P.split == 3) {
+            /* tp8 loop FINDINGS F38 (lq85: 'published payload 1 after 502'): a sharded payload sits between plain ones (rank
+             * `sender` alone, which move no `done`), so its number is the ring's: `sender` waits for the link to have taken the
+             * ring's last payload (`ready`, never moved before this kernel's last block publishes) and opens the next one in
+             * `staged`; every other rank waits for an open payload past its own last share and takes its number from it.
+             * (Splits 1 / 2 send every payload of the ring split: their `done` counts every one.) */
+            if (pub) {
+                const uint64_t rd = ld_sys(&r->ready);
+                mine = rd + 1;
+                ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= rd; }) ? 1 : 0;
+                if (ok) st_sys(&r->staged, rd + 1);
+            } else {
+                ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->staged) >= d + 1; }) ? 1 : 0;
+                mine = ld_sys(&r->staged);
+            }
+        } else if (P.split != 2 || pub) {
+            ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->sent) >= d; }) ? 1 : 0;
+        } else {
+            ok = wait_ring(r, P.ticks, [&] { return ld_sys(&r->staged) >= d + 1; }) ? 1 : 0;
+        }
     }
     __syncthreads();
     if (ok) {

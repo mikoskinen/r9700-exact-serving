@@ -6388,6 +6388,75 @@ TEST(op_stage_send_row_shards_world4) {
     }
 }
 
+/* tp8 loop FINDINGS F38 (lq85, ds41-devpf-7dc03498: 'stage_send published payload 1 after 502'): on the engine's rings a
+ * sharded payload (split 3, every rank its rows) sits between plain ones (rank `sender` alone). The ring's number must run on
+ * through both kinds: plain, plain, sharded, plain, sharded, sharded -> ready 1 .. 6, each payload's trailer its own number,
+ * the sharded ones' bytes the whole parts' -- with the link (here this thread) taking each payload only 30 ms after it is
+ * published, so a sharded send's ranks wait for the ring to be free before any of them copies. */
+TEST(op_stage_send_row_shards_between_plain_payloads_world4) {
+    const int W = 4;
+    const int64_t R0 = 9;
+    std::vector<uint8_t> ring((size_t)RAD_PP_RING_HDR + 65536, 0);
+    RadPpRing* r = reinterpret_cast<RadPpRing*>(ring.data());
+    r->magic = RAD_PP_RING_MAGIC;
+    r->cap = 65536 - RAD_PP_TRAILER;
+    r->send_ranks = W;
+    r->n_ranks = W;
+    r->deadline_ms = 20000;
+    T ringt(RAD_U8, { (int64_t)ring.size() });
+    ringt.t.data = ring.data();
+    const int64_t q = (R0 + W - 1) / W;
+    const uint64_t b0 = (uint64_t)R0 * 8 * 4;
+    const uint8_t* pay = ring.data() + RAD_PP_RING_HDR;
+    int seq = 0;
+    for (const char* kind : { "plain", "plain", "shard", "plain", "shard", "shard" }) {
+        ++seq;
+        const bool shard = !std::strcmp(kind, "shard");
+        const float base = (float)(seq * 1000);
+        std::vector<T> parts;
+        parts.reserve((size_t)W);
+        for (int rk = 0; rk < W; ++rk) {
+            parts.emplace_back(RAD_F32, std::vector<int64_t>{ R0, 8 });
+            for (int64_t i = 0; i < R0 * 8; ++i) {
+                const bool mine = shard ? (i / 8) / q == rk : rk == 0;
+                parts[(size_t)rk].set(i, mine ? base + (float)i : -1.0f - (float)rk);
+            }
+        }
+        /* the link: takes the payload 30 ms after it is published */
+        std::thread link([&] {   /* (at most 10 s: before the F38 fix payload 3 was published as 1 and never reached 3) */
+            for (int w = 0; w < 200000 && __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE) < (uint64_t)seq; ++w)
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            __atomic_store_n(&r->sent, __atomic_load_n(&r->ready, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+        });
+        int st[W] = { 0, 0, 0, 0 };
+        auto body = [&](int rk) {
+            A a;
+            a.t(ringt).t(parts[(size_t)rk]).i("M", R0).i("ring", 0).i("parts", 1).i("sender", 0);
+            if (shard) a.i("shard", 1);
+            st[rk] = run("stage_send", a, rk, W);
+        };
+        std::vector<std::thread> th;
+        for (int rk = 0; rk < W; ++rk) th.emplace_back(body, rk);
+        for (std::thread& x : th) x.join();
+        link.join();
+        for (int rk = 0; rk < W; ++rk) CHECK_OK(st[rk]);
+        uint64_t trailer = 0;
+        std::memcpy(&trailer, pay + rad_pp_align(b0), 8);
+        int64_t bad = 0;
+        for (int64_t i = 0; i < R0 * 8; ++i) {
+            float v;
+            std::memcpy(&v, pay + 4 * i, 4);
+            bad += v != base + (float)i;
+        }
+        fprintf(stderr, "    payload %d (%s): ready %llu, trailer %llu, %lld wrong words\n", seq, kind,
+                (unsigned long long)r->ready, (unsigned long long)trailer, (long long)bad);
+        CHECK_EQ((long long)r->ready, (long long)seq);
+        CHECK_EQ((long long)trailer, (long long)seq);
+        CHECK_EQ(bad, (int64_t)0);
+    }
+}
+
 TEST(op_rows_collectives_world4) {
     for (uint32_t dt : { (uint32_t)RAD_BF16, (uint32_t)RAD_F32 })
         for (int64_t rows : { (int64_t)8, (int64_t)9, (int64_t)5, (int64_t)4 }) {

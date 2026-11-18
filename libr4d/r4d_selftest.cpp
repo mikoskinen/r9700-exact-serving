@@ -32127,6 +32127,49 @@ static void stage_shard(const Plugin& pl, const std::vector<int>& devs) {
                    rgood && bad == 0 && taken == 4, fmt("%lld words wrong, %lld ranks took it", (long long)bad, (long long)taken));
             }
         }
+        /* tp8 loop FINDINGS F38 (lq85: 'stage_send published payload 1 after 502'): on the engine's rings a sharded payload sits
+         * between plain ones (rank 0 alone); the ring's number must run on through both kinds -- plain, plain, shard 3, plain,
+         * shard 3, shard 3: `ready` and the trailer 1 .. 6, the sharded payloads' bytes the whole parts' (this thread is the link:
+         * it takes each payload before the next send) */
+        {
+            std::memset(ring, 0, bytes);
+            RadPpRing* r = static_cast<RadPpRing*>(ring);
+            r->magic = RAD_PP_RING_MAGIC;
+            r->cap = cap;
+            r->send_ranks = 4;
+            r->n_ranks = 4;
+            r->deadline_ms = 10000;
+            const int kinds[6] = { 0, 0, 3, 0, 3, 3 };
+            std::string got;
+            bool seq_ok = true;
+            int64_t wrong = 0;
+            for (int i = 0; i < 6; ++i) {
+                std::vector<std::thread> th;
+                for (int k = 0; k < 4; ++k) {
+                    StShardT& x = t[(size_t)k];
+                    x.snd = snd; x.rcv = rcv; x.rank = k; x.dev = devs[(size_t)k]; x.ring = ring; x.ring_bytes = bytes; x.R = R;
+                    x.shard = kinds[i]; x.recv = false; x.rc = RAD_OK;
+                    th.emplace_back(stage_shard_worker, &x);
+                }
+                for (std::thread& x : th) x.join();
+                bool good = true;
+                for (const StShardT& x : t) good = good && x.rc == RAD_OK;
+                const uint8_t* pay = static_cast<const uint8_t*>(ring) + RAD_PP_RING_HDR;
+                uint64_t seq = 0;
+                std::memcpy(&seq, pay + total, 8);
+                got += fmt("%s%s %llu/%llu", i ? ", " : "", kinds[i] ? "shard" : "plain", (unsigned long long)r->ready,
+                           (unsigned long long)seq);
+                seq_ok = seq_ok && good && r->ready == (uint64_t)(i + 1) && seq == (uint64_t)(i + 1);
+                if (kinds[i]) {
+                    for (int64_t j = 0; j < R * 8; ++j) { float v; std::memcpy(&v, pay + j * 4, 4); wrong += v != st_good(0, j); }
+                    for (int64_t j = 0; j < R * 10; ++j) { uint16_t v; std::memcpy(&v, pay + o1 + j * 2, 2); wrong += v != h_to_bf16(st_good(1, j)); }
+                }
+                if (!good) break;
+                __atomic_store_n(&r->sent, r->ready, __ATOMIC_RELEASE);   /* the link took it */
+            }
+            ok(fmt("stage_shard rows %lld, sharded payloads between plain ones (ready / trailer: %s)", (long long)R,
+                   got.c_str()).c_str(), seq_ok && wrong == 0, fmt("%lld words of the sharded payloads wrong", (long long)wrong));
+        }
         for (StShardT& x : t) {
             st_set_device(x.dev);
             for (void*& q : x.p) if (q) { st_free(q); q = nullptr; }
