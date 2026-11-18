@@ -3695,10 +3695,33 @@ std::atomic<int> g_wmk{-1};
  * (bench pin r4d_gg_wmk_whg) = 70724 at every head call as before. */
 int g_wmk_whg = 1;
 extern "C" void r4d_gg_wmk_whg(int on) { g_wmk_whg = on ? 1 : 0; }
+/* DRAFTER track 19.11.2026 round 7 (lever DQ8): under mode 2 the DSpark drafter's q8_0 dense linears at 17..48 rows take G2
+ * (bit 21) with one column tile a wave (bit 22, NT 1), where it measured faster. q8_0 at these shapes is the drafter's alone (the
+ * trunk's attention is q5_K / q6_K; its q8_0 is the shared expert, K 5120 x N 1536 / 1024 and K 768 / 512, not touched here).
+ * xeon r4d_selftest --perfwmg q8_0 (dq8-r7a: rotated copies past 256 MiB, two passes A..I A..I, us a call at M 24 / 32 / 40 / 48;
+ * the engine path 1048577 = 70724 reproduces lq151's served stage linears 29.2 / 28.3 / 24.9 / 33.8 us at 32 rows):
+ *   q_a + kv pair (1792 x 5120)   70724 29.1 / 29.3 / 42.7 / 42.6 -> G2 NT 1 26.8 / 27.0 / 30.7 / 31.0
+ *   q_b (8192 x 1280; P 2: KP 1) 30.2 / 31.5 / 43.0 / 42.9 -> G2 NT 1 28.4 / 28.7 / 30.7 / 30.9
+ *   o_a pair (2048 x 4096)        33..48 rows 36.0 / 34.9 -> G2 NT 1 29.5 / 28.4 (17..32 rows: <= 1 % apart, left)
+ *   o_b (5120 x 2048)             17..32 rows 32.9 / 33.1 -> G2 KP 1 NT 1 29.4 / 29.8 (33..48 rows: 70724 the best, left)
+ *   main_proj (5120 x 15360; the context pass, every lane step) 205.3 / 207.9 / 228.6 / 232.9 -> G2 NT 1 148.4 / 149.6 / 176.2 / 181.0
+ * Every code computes the part order: the same bytes (--wmgcheck q8_0 WMKCROSS). Pin r4d_gg_wmk_dq8 0 = 70724 as before. */
+int g_wmk_dq8 = 1;
+extern "C" void r4d_gg_wmk_dq8(int on) { g_wmk_dq8 = on ? 1 : 0; }
+static int wmk_dq8(int ty, long long Ntot, long long K, long long M) {
+    constexpr int G2NT1 = kWmkCode | 2097152 | 4194304, G2KP1NT1 = G2NT1 | 16777216;
+    if (ty != GG_Q8_0 || M <= 16 || M > 48) return 0;
+    if ((K == 5120 && Ntot == 1792) || (K == 1280 && Ntot == 8192) || (K == 15360 && Ntot == 5120)) return G2NT1;
+    if (K == 4096 && Ntot == 2048 && M > 32) return G2NT1;
+    if (K == 2048 && Ntot == 5120 && M <= 32) return G2KP1NT1;
+    return 0;
+}
 int wmk_code(int ty, long long Ntot, long long K, long long M, bool f32out) {
     const int mode = g_wmk.load(std::memory_order_relaxed);
     const bool head = f32out && Ntot >= 16384;
     if (mode == 2 && g_wmk_whg && head && M > 16 && M <= 48) return kWmkCode | 2097152 | 16777216;
+    if (mode == 2 && g_wmk_dq8 && !f32out)
+        if (const int c = wmk_dq8(ty, Ntot, K, M)) return c;
     if (!g_wmk_tab || mode == 2) return kWmkCode;
     if (M <= 16) {
         if (head) return 332872;

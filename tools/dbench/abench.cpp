@@ -70,7 +70,7 @@ struct Call { std::vector<RadTensor> t; std::vector<RadParam> p; RadArgs a; void
 static std::vector<int> ints(const char* s) { std::vector<int> v; while (s && *s) { v.push_back(std::atoi(s)); s = std::strchr(s, ','); if (s) ++s; } return v; }
 
 int main(int argc, char** argv) {
-    int rows = 16, bpr = 1, ctx = 3000, bs = 64, iters = 300, coldmb = 0;
+    int rows = 16, bpr = 1, ctx = 3000, bs = 64, iters = 300, coldmb = 0, kis = 20;
     std::vector<int> forms = { 0, 1, 2, 3, 4, 5, 6 };
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
@@ -82,6 +82,7 @@ int main(int argc, char** argv) {
         else if (k == "--iters") iters = std::atoi(nx());
         else if (k == "--cold") coldmb = std::atoi(nx());
         else if (k == "--forms") forms = ints(nx());
+        else if (k == "--k") kis = std::atoi(nx());   /* round 7: issues between the two events (1 + --cold: one cold issue, as a served pass meets it) */
         else { std::fprintf(stderr, "unknown %s\n", k.c_str()); return 1; }
     }
     const int H = 16, D = 512, ROT = 64, OFF = D - ROT, HD = H * D, win = 128 + bpr;
@@ -191,7 +192,7 @@ int main(int argc, char** argv) {
      * (each launch waits for the one before: the dependent-launch gap is in the time), median over `iters` repeats. */
     hipEvent_t e0, e1; CK(hipEventCreate(&e0)); CK(hipEventCreate(&e1));
     auto cold = [&]() { if (dcold) CK(hipMemsetAsync(dcold, (int)(g_rs & 0xff), (size_t)coldmb << 20, st)); };
-    const int K = 20;
+    const int K = kis > 0 ? kis : 20;
     auto timed = [&](const char* name, int pin, auto body) {
         std::vector<float> v;
         r4d_attn_dec_pin(pin);

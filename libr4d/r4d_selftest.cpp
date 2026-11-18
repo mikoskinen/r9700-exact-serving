@@ -21816,6 +21816,7 @@ static const MrShape kMrShapes[] = {
     { "shexp_down", 5120, 768, "q6_K,q8_0", false },      { "shexp_gate_up_w512", 1024, 5120, "q6_K,q8_0", false },
     { "shexp_down_w512", 5120, 512, "q6_K,q8_0", false }, { "engram_kv", 25600, 6144, "q6_K", false },
     { "head", 32320, 5120, "q6_K", true },
+    { "dsp_main_proj", 5120, 15360, "q8_0", false },   /* the DSpark context pass's main_proj (DRAFTER track 19.11.) */
 };
 struct MrTy { const char* name; int qk, bb; };
 static const MrTy kMrTypes[] = { { "q5_K", 256, 176 }, { "q6_K", 256, 210 }, { "q8_0", 32, 34 } };

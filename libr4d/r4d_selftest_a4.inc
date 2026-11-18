@@ -59,6 +59,13 @@ static const Shape kShapes[] = {
     { "shexp_down_w512(fold e)", 5120, 0, 512, "q6_K,q8_0", false, 0, 0 },
     { "engram_kv_e2", 6400, 0, 6144, "q6_K", false, 2, 0 },
     { "head", 32320, 0, 5120, "q6_K", true, 1, 0 },
+    /* DRAFTER track 19.11. round 7 (bench): the DSpark drafter's q8_0 stage linears (each stage: the q_a + kv pair, q_b, the
+     * o_a pair, o_b; 3 stages a query pass) and the context pass's main_proj (5120 x 15360, one call every lane step) */
+    { "dsp_q_a+kv(pair)", 1280, 512, 5120, "q8_0", false, 0, 0 },
+    { "dsp_q_b", 8192, 0, 1280, "q8_0", false, 0, 0 },
+    { "dsp_o_a g0+g1(pair)", 1024, 1024, 4096, "q8_0", false, 0, 0 },
+    { "dsp_o_b", 5120, 0, 2048, "q8_0", false, 0, 0 },
+    { "dsp_main_proj", 5120, 0, 15360, "q8_0", false, 0, 0 },
 };
 
 /* --mrcheck16's pair part: gemm_nt_ggml_pair under every A4 pin and the switch vs the two stock launches (gg_gemv 0). */
