@@ -14374,6 +14374,152 @@ TEST(lanes_bg_hold_waits_for_the_bg_lane_instead_of_a_home_mixed_step) {
     }
 }
 
+/* tp8 loop P23 (RADIANCE_PP_BG_ROOM=N with RADIANCE_PP_BG_LANE=1): D11's three newcomers (1000 / 1100 / 1050 rows; 0 keeps the BG
+ * lane busy, 1 and 2 are planned beside decode rows in one round while it runs). Without the switch the BG lane's room (the
+ * shared budget 2112 of the DS geometry) takes 1 and keeps 2 home as a MIXED step (today); with BG_ROOM=4160 (and 3000) both go to
+ * the BG lane's inbox and its next step carries them TOGETHER (2150 rows > the shared 2112, two sequences: the step lever NOA
+ * plans on one machine); 1100 + 1050 > 2112 is what BG_ROOM=2112 still refuses. Every newcomer runs as ONE chunk, its whole
+ * prompt (the home's own plan, no new cut), and decodes in its home afterwards; every decode step carries all its decoders.
+ * 3 lanes (2 decode + BG), 4 decoders a decode lane, the engine's planning order. */
+TEST(lanes_bg_room_lets_the_bg_lane_take_two_newcomers_in_one_step) {
+    struct Env {
+        ~Env() { unsetenv("RADIANCE_PP_BG_LANE"); unsetenv("RADIANCE_PP_BG_ROOM"); }
+    } env;
+    for (const char* room : { (const char*)nullptr, "4160", "3000", "2112", "100" }) {
+        setenv("RADIANCE_PP_BG_LANE", "1", 1);
+        if (room) setenv("RADIANCE_PP_BG_ROOM", room, 1); else unsetenv("RADIANCE_PP_BG_ROOM");
+        /* 100 is out of range (256 .. 65536): not taken, today's room */
+        const bool wide = room && std::atoll(room) >= 2150;
+        DstSwitches restore;
+        Lanes L;
+        L.grid = 2048;
+        L.cfg.prefill_span = 2;
+        L.max_tok = 4160;
+        L.max_ctx = 60000;
+        L.stage_rows = 1024;
+        L.seqs = 12;
+        const int lanes = 3;
+        REQUIRE_EQ(L.start(lanes), RAD_OK);
+        CHECK(DstSwitches::set("sched_bi_chunk", 3));
+        REQUIRE_EQ(L.set.bg_lane(), 2);
+        CHECK_EQ(L.set.bg_room(), room && std::atoll(room) >= 256 ? (int64_t)std::atoll(room) : 0ll);
+        std::vector<uint64_t> dec[2];
+        for (int i = 0; i < 8; ++i) dec[i % 2].push_back(L.submit(i % 2, 100, 4000, 2000 + 100 * i));
+        constexpr int NC = 3;
+        const int64_t len[NC] = { 1000, 1100, 1050 };
+        const int home[NC] = { 0, 0, 1 }, at_round[NC] = { 4, 6, 6 };
+        uint64_t nc[NC] = {};
+        std::vector<int64_t> ends[NC];
+        int home_mixed[NC] = {}, on_bg[NC] = {}, decoded[NC] = {}, short_steps = 0, bg_two = 0;
+        int64_t bg_rows_max = 0;
+        std::vector<int> fifo;
+        std::vector<char> busy((size_t)lanes, 0);
+        int next = 0;
+        for (int round = 0; round < 3000; ++round) {
+            for (int j = 0; j < NC; ++j)
+                if (round == at_round[j]) nc[j] = L.submit(home[j], (int)len[j], 4, 50000 + 2000 * j);
+            bool done = true;
+            for (int j = 0; j < NC && done; ++j) {
+                const Request* r = nc[j] ? L.req(home[j], nc[j]) : nullptr;
+                done = r && r->n_computed >= len[j] && r->output.size() >= 3;
+            }
+            if (done) break;
+            std::vector<int> todo;
+            for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+            for (size_t at = 0; at < todo.size(); ++at) {
+                const int l = todo[at];
+                if (busy[(size_t)l]) continue;
+                std::vector<int> order, idle_after;
+                for (int j = 1; j < lanes; ++j)
+                    if (!busy[(size_t)((l + j) % lanes)]) { order.push_back((l + j) % lanes); idle_after.push_back((l + j) % lanes); }
+                for (int f : fifo) order.push_back(f);
+                if (!L.plan(l, order)) continue;
+                const StepPlan& pl = L.at(l).plan();
+                int newc_here = 0;
+                for (const StepEntry& e : pl.e)
+                    for (int j = 0; j < NC; ++j) {
+                        if (!nc[j] || e.seq != nc[j]) continue;
+                        if (e.is_prefill) {
+                            ends[j].push_back((int64_t)e.ctx_len + e.n_tokens);
+                            if (L.set.is_bg(l)) { ++on_bg[j]; ++newc_here; }
+                            else if (pl.phase == RAD_PHASE_MIXED && e.produces_token) ++home_mixed[j];
+                        } else if (!L.set.is_bg(l)) {
+                            ++decoded[j];
+                        }
+                    }
+                if (L.set.is_bg(l)) {
+                    CHECK(pl.phase == RAD_PHASE_PREFILL);
+                    CHECK(pl.n_tok <= L.max_tok);
+                    bg_two += newc_here >= 2;
+                    bg_rows_max = std::max<int64_t>(bg_rows_max, pl.n_tok);
+                }
+                if (!L.set.is_bg(l) && l < 2) {
+                    bool pf = false;
+                    for (int j = 0; j < NC; ++j) {
+                        const Request* r = nc[j] && home[j] == l ? L.req(home[j], nc[j]) : nullptr;
+                        pf = pf || (r && r->n_computed < len[j]);
+                    }
+                    if (pf) {
+                        int rows = 0;
+                        for (const StepEntry& e : pl.e)
+                            for (uint64_t d : dec[l]) rows += e.seq == d && !e.is_prefill;
+                        short_steps += rows != (int)dec[l].size();
+                    }
+                }
+                busy[(size_t)l] = 1;
+                fifo.push_back(l);
+                next = (l + 1) % lanes;
+                todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+            }
+            if (fifo.empty()) break;
+            const int l = fifo.front();
+            fifo.erase(fifo.begin());
+            CHECK_OK(L.commit(l, 5));
+            busy[(size_t)l] = 0;
+        }
+        const LaneSet::Counts c = L.set.counts();
+        for (int j = 0; j < NC; ++j) {
+            REQUIRE(nc[j] != 0);
+            REQUIRE(L.req(home[j], nc[j]) != nullptr);
+            CHECK(L.req(home[j], nc[j])->n_computed >= len[j]);
+            CHECK(decoded[j] > 0);
+            CHECK(ends[j] == std::vector<int64_t>({ len[j] }));   /* one chunk, its whole prompt, wherever it ran */
+            CHECK_EQ(on_bg[j] + home_mixed[j], 1);
+        }
+        CHECK(L.set.broken().empty());
+        const int kept = home_mixed[0] + home_mixed[1] + home_mixed[2];
+        if (!wide) {
+            /* today's room: one newcomer kept home as a MIXED step; no BG step of two */
+            CHECK_EQ(kept, 1);
+            CHECK(c.bg_skip[LaneSet::kBgRoom] > 0);
+            CHECK_EQ(bg_two, 0);
+            CHECK_EQ(c.bgst_b2, 0ll);
+            CHECK(bg_rows_max <= 2112);
+        } else {
+            /* the room raised: all three on the BG lane, 1 and 2 in ONE BG step (2150 rows, over the shared budget) */
+            CHECK_EQ(kept, 0);
+            CHECK_EQ(on_bg[0] + on_bg[1] + on_bg[2], NC);
+            CHECK_EQ(bg_two, 1);
+            CHECK_EQ(c.bgst_b2, 1ll);
+            CHECK_EQ(c.bgst_b2_newc, 2ll);
+            CHECK_EQ(c.bgst_b2_rows, 2150ll);
+            CHECK_EQ(bg_rows_max, 2150);
+            CHECK_EQ(c.bgst_max_rows, 2150ll);
+            CHECK_EQ(c.bg_skip[LaneSet::kBgRoom], 0ll);
+        }
+        CHECK_EQ(c.bgst_newc, (int64_t)(on_bg[0] + on_bg[1] + on_bg[2]));
+        CHECK_EQ(short_steps, 0);
+        fprintf(stderr, "    BG room %s: ends %lld | %lld | %lld, on the BG lane %d / %d / %d, home MIXED %d / %d / %d, short decode "
+                        "steps %d; BG steps %lld with %lld newcomers, %lld with >= 2 (%lld rows), the widest %lld rows; kept home for "
+                        "room %lld\n",
+                room ? room : "off", ends[0].empty() ? -1ll : (long long)ends[0].back(),
+                ends[1].empty() ? -1ll : (long long)ends[1].back(), ends[2].empty() ? -1ll : (long long)ends[2].back(),
+                on_bg[0], on_bg[1], on_bg[2], home_mixed[0], home_mixed[1], home_mixed[2], short_steps, (long long)c.bgst_n,
+                (long long)c.bgst_newc, (long long)c.bgst_b2, (long long)c.bgst_b2_rows, (long long)c.bgst_max_rows,
+                (long long)c.bg_skip[LaneSet::kBgRoom]);
+    }
+}
+
 /* tp8 dev D10 (RADIANCE_PP_ISSUE_AHEAD=1): a lane's step issued ahead (step_next, before its step's commit) takes its number from
  * the lanes' one counter when it is built -- other lanes plan before it is promoted, and a step number names one build on both
  * nodes -- and promote_next takes no other; the step issued ahead is the one step() plans there (the same rows at the same
