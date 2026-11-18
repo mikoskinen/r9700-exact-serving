@@ -1770,6 +1770,72 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
     }
 }
 
+/* tp8 dev D10 round 2: steps issued ahead beside the BG lanes' split passes, the best c32 start's form (W(0, t), the follower's
+ * own lookup from X1's token ids, BG lanes in one-layer segments, ready-first tails): a frame the leader issued ahead arrives
+ * about a leader tail before its X1 and waits between the BG pass's segments until X1 has landed. Tokens = one process at
+ * 3 lanes (BG 1) and 4 lanes (BG 2), W(0,2) and W(0,3); steps were issued ahead, newcomers went to the BG lanes. */
+TEST(issued_ahead_beside_bg_lanes_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+    }
+    struct Arm { int lanes; const char* cut; int k; };
+    long long deferred_all = 0;
+    for (const Arm a : { Arm{ 3, "0,2", 1 }, Arm{ 4, "0,2", 2 }, Arm{ 4, "0,3", 2 } }) {
+        std::vector<std::string> env = kSplitEnv;
+        env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
+        for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
+                               "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1", "RADIANCE_PP_FOLLOWER_EMBED=1",
+                               "RADIANCE_PP_ISSUE_AHEAD=1" })
+            env.push_back(v);
+        std::vector<std::string> ex = ext;
+        ex.push_back("--pp-lanes");
+        ex.push_back(std::to_string(a.lanes));
+        Serving pp;
+        REQUIRE(pp.start(a.cut, ex, env));
+        const std::vector<std::vector<int32_t>> got = split_set(pp.port);
+        kill(pp.lead.child.pid, SIGTERM);
+        CHECK_EQ(pp.lead.finish(60), 0);
+        CHECK_EQ(pp.fol.finish(30), 0);
+        const std::string llog = pp.lead.output(), flog = pp.fol.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] != got[i]) ++differ;
+        }
+        long long bg = -1, n_ahead = -1, deferred = 0, passes = -1, parts = -1, between = -1, held = -1;
+        if (const size_t at = llog.rfind("(RADIANCE_PP_BG_LANE, tp8 dev M8): "); at != std::string::npos)
+            bg = std::atoll(llog.c_str() + at + std::strlen("(RADIANCE_PP_BG_LANE, tp8 dev M8): "));
+        if (const size_t at = llog.rfind(" lane steps issued ahead of the collect"); at != std::string::npos)
+            if (const size_t b = llog.rfind("two-node pipeline: ", at); b != std::string::npos) n_ahead = std::atoll(llog.c_str() + b + 19);
+        if (const size_t at = flog.rfind(" frames issued ahead waited between"); at != std::string::npos)
+            if (const size_t b = flog.rfind("follower: ", at); b != std::string::npos) deferred = std::atoll(flog.c_str() + b + 10);
+        if (const size_t at = flog.rfind(" passes ran in "); at != std::string::npos)
+            if (const size_t b = flog.rfind("follower: ", at); b != std::string::npos)
+                (void)std::sscanf(flog.c_str() + b, "follower: %lld passes ran in %lld segments, %lld other passes between their "
+                                                    "segments, %lld held", &passes, &parts, &between, &held);
+        deferred_all += deferred;
+        fprintf(stderr, "    issue ahead + FE + BG lanes %d, %d lanes W(%s): %d of %zu requests differ; %lld lane steps issued ahead, "
+                        "%lld waited for their X1 between segments; %lld newcomers to BG lanes; follower %lld passes in %lld segments, "
+                        "%lld passes between, %lld held\n", a.k, a.lanes, a.cut, differ, ref.size(), n_ahead, deferred, bg, passes,
+                parts, between, held);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
+        CHECK(n_ahead > 0);
+        CHECK(bg > 0);
+        CHECK(passes > 0);
+        CHECK(flog.find("this node's pass takes the step's token ids from X1") != std::string::npos);
+    }
+    fprintf(stderr, "    frames issued ahead that waited between segments, all arms: %lld\n", deferred_all);
+}
+
 /* ------------------------------------------------------------------ tp8 dev D10 */
 /* RADIANCE_PP_ISSUE_AHEAD=1 (both nodes): an undrafted decode lane's next step is planned, its head part released and its frame
  * shipped before the step's collect (Scheduler::step_next + ADV_TRUNK on the leader; the follower reads no token id). Tokens at
