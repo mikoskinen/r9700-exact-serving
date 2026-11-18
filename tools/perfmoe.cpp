@@ -163,6 +163,9 @@ struct Opts {
     std::string chain_band = "_m16";   // --chain-band SUFFIX: the exl3r4d rows the chain takes (_m16 decode, _pf M > 16)
     std::string dump_y;       // --dump-y FILE (with --chain): layer 0's exl3r4d chain y after the timed passes, raw bytes --
                               // two builds' files compared byte for byte (same seed: same routing and data)
+    std::string cmp_y;        // --cmp-y FILE (with --chain; X5, tp8 loop): layer 0's y against another build's --dump-y file,
+                              // as bf16 numbers -- elements differing, by more than 1 / 2 bf16 ulps, max and rms difference
+                              // against the reference's rms (a build of its own reference, e.g. the codebook fold)
     std::string routing;      // --routing FILE: EXL3R4D_ROUTEDUMP records replayed as the layers' routings (P10-K5)
     std::string wgstamps;     // --wgstamps FILE: an EXL3R4D_WGSTAMP build's workgroup timeline of the last layer, CSV
     std::string pfstamps;     // --pfstamps FILE: an EXL3R4D_PF_WGSTAMP build's _pf GEMM workgroups of the last layer, CSV
@@ -341,6 +344,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-ids") o.no_ids = true;
         else if (a == "--pfstamps") o.pfstamps = nx();
         else if (a == "--dump-y") o.dump_y = nx();
+        else if (a == "--cmp-y") o.cmp_y = nx();
         else if (a == "--chain-band") o.chain_band = nx();
         else if (a == "--wgstamps-lib") o.wgstamps_lib = std::atoi(nx());
         else if (a == "--overlap") o.overlap = true;
@@ -1218,6 +1222,39 @@ int main(int argc, char** argv) {
             FILE* f = std::fopen(o.dump_y.c_str(), "wb");
             if (!f || std::fwrite(y1.data(), 1, y1.size(), f) != y1.size()) die("cannot write " + o.dump_y);
             std::fclose(f);
+        }
+        if (!o.cmp_y.empty()) {   // X5: as bf16 numbers against another build's dump
+            std::vector<char> r(g_fu_yb);
+            FILE* f = std::fopen(o.cmp_y.c_str(), "rb");
+            if (!f || std::fread(r.data(), 1, r.size(), f) != r.size()) die("cannot read " + o.cmp_y + " (its size must be y's)");
+            std::fclose(f);
+            auto bf = [](const char* p, size_t i) {
+                uint16_t h;
+                std::memcpy(&h, p + 2 * i, 2);
+                const uint32_t u = (uint32_t)h << 16;
+                float x;
+                std::memcpy(&x, &u, 4);
+                return x;
+            };
+            const size_t n = g_fu_yb / 2;
+            size_t nd = 0, n1 = 0, n2 = 0, nbad = 0;
+            double se = 0, sr = 0, mx = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const float a = bf(r.data(), i), b = bf(y1.data(), i);
+                if (!std::isfinite(a) || !std::isfinite(b)) { ++nbad; continue; }
+                const double d = std::fabs((double)a - (double)b);
+                const double ulp = std::ldexp(1.0, std::ilogb(a == 0.f ? 1e-30f : a) - 7);   // bf16: 8 bits of mantissa
+                nd += d > 0;
+                n1 += d > 1.01 * ulp;
+                n2 += d > 2.01 * ulp;
+                se += d * d;
+                sr += (double)a * a;
+                mx = d > mx ? d : mx;
+            }
+            std::printf("CMPY %s vs %s: %zu bf16 elements, %zu differ (%zu by > 1 ulp, %zu by > 2 ulps), max |d| %.4g, rms d %.4g, "
+                        "rms y_ref %.4g (rms d / rms y_ref %.3g), %zu non-finite\n", libs[0].name, o.cmp_y.c_str(), n, nd, n1, n2,
+                        mx, std::sqrt(se / (double)(n ? n : 1)), std::sqrt(sr / (double)(n ? n : 1)),
+                        sr > 0 ? std::sqrt(se / sr) : 0.0, nbad);
         }
         size_t dg = 0;
         if (o.gd && g_gd_y && libs.size() > 1) {   // the v5 row, warm, against the serial chain's (warm) y
