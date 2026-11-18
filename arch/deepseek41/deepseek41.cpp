@@ -712,6 +712,12 @@ struct Model {
      * the prologue's expand reads at every part, as before). A pipeline node serves no pictures (lr_check), so xcol is the
      * lookup alone on both. */
     bool pp_fe = false;
+    /* tp8 dev D10 round 2 (RADIANCE_PP_ISSUE_AHEAD=1 on both nodes, W(0, t) only; unset: nothing here): X1 carries the step's
+     * token ids as its last part (the sender's batch token ids on its card: for a step the leader issued ahead of its collect,
+     * ADV_TRUNK's, behind the sampler), and the follower takes X1 at the top of its pass, into its own batch's token ids,
+     * before its lookup (pp_fe) and its Engram layers' token_map read them -- its frame's ids are the host's, which a step
+     * issued ahead does not know yet. Under pp_fe X1 is the ids alone (4 B a row), else the lookup + the ids. */
+    bool pp_ids = false;
     /* tp8 dev M4 (RADIANCE_PP_SEG_LAYERS=k on the follower, --pp-lanes > 1; unset: nothing here): the follower's [h, t) in
      * segments of k layers. A boundary s is a cut on this node: the segment before it saves what X1 of W(s, t) would carry
      * into layer s -- the boundary op's inputs, the selections, the keep words; no kv entries, the node holds its caches and
@@ -4287,6 +4293,8 @@ static int lr_read(Model& m, const RadBuildCtx* ctx) {
         {
             const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
             m.pp_fe = fe && !std::strcmp(fe, "1") && m.pp_h == 0;
+            const char* ia = std::getenv("RADIANCE_PP_ISSUE_AHEAD");
+            m.pp_ids = ia && !std::strcmp(ia, "1") && m.pp_h == 0;   /* tp8 dev D10 round 2 */
         }
         if (m.lr.leader != (pp.rank == 0)) return RAD_E_STATE;
     } else if (ds41layers::parse(std::getenv("RADIANCE_DS41_LAYERS"), std::getenv("RADIANCE_DS41_LAYERS_MODE"), (int)m.c.n_layer,
@@ -4508,10 +4516,18 @@ static int pp_dspark_zero(RadBuilder* b, Model& m) {
  * stores at the batch's slot mapping, which both nodes have). The receiver issues the same entry_store into its copy of
  * that source's cache at the same pages, so the copy is the owner's bytes (ds41_layers.h crossings()). `kind` says
  * which rows a part has at issue: the step's (or, under BI / PSK, the boundary's live rows [lo, T)), or the work rows. */
-enum class CutRows { Step, Live, Work };
+/* tp8 dev D10 round 2: `Ids` = the step's token ids (the batch's, no buffer of the plugin's: b 0), X1's last part under
+ * m.pp_ids -- under pp_fe X1's only one. */
+enum class CutRows { Step, Live, Work, Ids };
 struct CutPart { rad_buf b; const char* name; int64_t row_bytes; CutRows rows; int64_t pitch; /* elements a row */ };
 static std::vector<CutPart> ds41_cut_liveset_cx(const Model& m, const ds41layers::Crossing& cx);
-static std::vector<CutPart> ds41_cut_liveset(const Model& m, int ring) { return ds41_cut_liveset_cx(m, m.pp_cx[ring]); }
+static std::vector<CutPart> ds41_cut_liveset(const Model& m, int ring) {
+    if (ring != RAD_PP_X1 || !m.pp_ids) return ds41_cut_liveset_cx(m, m.pp_cx[ring]);
+    std::vector<CutPart> v;
+    if (!m.pp_fe) v = ds41_cut_liveset_cx(m, m.pp_cx[ring]);
+    v.push_back({ 0, "ids", 4, CutRows::Ids, 1 });
+    return v;
+}
 /* tp8 dev M4: the rings of a segment boundary k in pp_recv_at / pp_send_after / pp_cross (the core's are 0 and 1) */
 static constexpr int kSegRecv = 100, kSegSend = 200;
 static std::vector<CutPart> ds41_cut_liveset_cx(const Model& m, const ds41layers::Crossing& cx) {
@@ -4557,7 +4573,9 @@ static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring) {
                   { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()) }, {}, {}, {});
     if (!h) return h;
     std::vector<rad_buf> bufs;
-    for (const CutPart& p : v) bufs.push_back(p.b);
+    for (const CutPart& p : v)
+        if (p.b) bufs.push_back(p.b);   /* tp8 dev D10 round 2: the token ids are the batch's, not a buffer */
+    if (bufs.empty()) return h;
     if (sends) rad_op_reads(b, h, bufs.data(), (int)bufs.size());
     else       rad_op_writes(b, h, bufs.data(), (int)bufs.size());
     return h;
@@ -4934,6 +4952,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
             rad_pp_declare_crossing(ring, cut_row_bytes(m, v, ring), (int)v.size());
         }
+        if (m.pp_ids) rad_pp_declare_x1_ids(1);   /* tp8 dev D10 round 2: X1's token ids, taken first by the follower */
     }
     m.expand = op(b, "cast",
                   { RAD_RANGE("M", 1, T), RAD_INT("n", D), RAD_STR("from", "bf16"),
@@ -6375,7 +6394,8 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
     o.clear();
     o.push_back(praw(m.pp_ring[ring], RAD_U8, 1));
     for (const CutPart& p : ds41_cut_liveset(m, ring)) {
-        if (p.rows == CutRows::Step) o.push_back(brows(p.b, T));
+        if (p.rows == CutRows::Ids) o.push_back(praw(batch->token_ids, RAD_I32, T));   /* tp8 dev D10 round 2 */
+        else if (p.rows == CutRows::Step) o.push_back(brows(p.b, T));
         else if (p.rows == CutRows::Work) o.push_back(brows(p.b, wr));
         else o.push_back(lo == 0 ? brows(p.b, hi) : brow_slice(p.b, lo, hi - lo, p.pitch));
     }
@@ -6643,12 +6663,18 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     /* tp8 dev 1a: under pp_fe the follower's own lookup in place of X1; the leader keeps its own (a few dispatches, 0.06-0.10
      * ms a lane step on cards) so its xcol holds what it held before -- the prologue's expand reads it at every part -- and
      * only X1's send goes */
+    /* tp8 dev D10 round 2 (m.pp_ids): the follower takes X1 -- with the step's token ids, into its batch's -- before its
+     * lookup and its token_map read them; the leader sends it after its own lookup, under pp_fe too (the ids alone) */
+    const bool x1_top = m.pp && m.pp_ids && m.pp_rank == 1 && pp_seg_first(m);
+    if (x1_top && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
     if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
         RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
         m.mrows.step(x, batch, m.xcol, T);
         if (m.embed_ar) RAD_ISSUE_N(x, m.embed_ar, T * D, brows(m.xcol, T), RAD_NONE);
     }
-    if (m.pp && m.pp_h == 0 && run_head && !m.pp_fe && pp_seg_first(m) && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
+    if (m.pp && m.pp_h == 0 && run_head && (!m.pp_fe || m.pp_ids) && !x1_top && pp_seg_first(m) &&
+        !pp_cross(x, m, batch, RAD_PP_X1, 0, T))
+        return;
     if (part == RAD_PP_PART_HEAD && m.pp_h == 0) return;   /* tp8 S5: at W(0, t) the head part ends with X1's send */
     if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
         for (int64_t i = 0; i < c.hc; ++i)
@@ -7815,6 +7841,10 @@ static void step(RadCtx* x, const RadBatch* batch) {
     media_route(m, batch);
     /* tp8 dev 1a: under pp_fe the follower's own lookup in place of X1; the leader keeps its own (its xcol as before) and
      * only X1's send goes */
+    /* tp8 dev D10 round 2 (m.pp_ids): the follower takes X1 -- with the step's token ids, into its batch's -- before its
+     * lookup and its token_map read them; the leader sends it after its own lookup, under pp_fe too (the ids alone) */
+    const bool x1_top = m.pp && m.pp_ids && m.pp_rank == 1 && pp_seg_first(m);
+    if (x1_top && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
     if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
     m.mrows.step(x, batch, m.xcol, T);
@@ -7822,7 +7852,9 @@ static void step(RadCtx* x, const RadBatch* batch) {
     }
     /* X1 at W(0, t): the leader's lookup out, the follower's in, where one process's lookup was (tp8 S6: at h > 0 X1 is
      * the residual after layer h - 1, below, and the follower's layer h starts from it: no streams of its own here) */
-    if (m.pp && m.pp_h == 0 && run_head && !m.pp_fe && pp_seg_first(m) && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
+    if (m.pp && m.pp_h == 0 && run_head && (!m.pp_fe || m.pp_ids) && !x1_top && pp_seg_first(m) &&
+        !pp_cross(x, m, batch, RAD_PP_X1, 0, T))
+        return;
     if (part == RAD_PP_PART_HEAD && m.pp_h == 0) return;   /* tp8 S5: at W(0, t) the head part ends with X1's send */
     if (!(m.pp && m.pp_rank == 1 && m.pp_h > 0)) {
     for (int64_t i = 0; i < c.hc; ++i)
