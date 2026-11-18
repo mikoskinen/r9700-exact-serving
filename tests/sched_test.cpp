@@ -13666,6 +13666,126 @@ TEST(lanes_span_inner_leaves_the_span_two_cold_plans_and_cuts_only_a_two_interva
     }
 }
 
+/* tp8 loop P21 (fn4 sched_tail_grid 256 beside sched_tail_inner 1 and lever PSK-CR's tail-only anchors, ds41_psk 4): the
+ * BEST start's cold plans at 2 and 3 lanes (span 2, SPAN_TAIL 8192, SPAN_SHORT 24576) for the three cold cells. The chunk
+ * plan is F 512's (the published grid's) to the row; lever G's fine tail -- the deepest multiple of F at or below N - 128 --
+ * sits inside the last chunk (one snapshot there, TI) and is every chunk's next PSK target, so each chunk's `ahead` is that
+ * tail less its end. deepseek41 then runs layer l over [tail - C_l, end) of each chunk (C_l = 160 + (39 - l) x 128,
+ * psk_rows), so F 256's cone of the drain is smaller on both nodes: the stake printed below in row-layers (follower 20-31,
+ * leader 32-39 at W(10,32)). */
+TEST(lanes_a_finer_tail_grid_keeps_the_cold_plans_and_shrinks_the_drains_cone) {
+    const auto C = [](int64_t l) { return (int64_t)160 + (39 - l) * 128; };
+    const auto psk_rows = [](int64_t c, int64_t ahead, int64_t n) -> int64_t {
+        if (ahead >= c) return 0;
+        return std::min(n, std::max(c - ahead, (int64_t)160));
+    };
+    struct Chunk { int64_t a, b, ahead; int ck; };
+    for (int lanes : { 2, 3 })
+    for (int64_t n_prompt : { (int64_t)15777, (int64_t)65650, (int64_t)131137 }) {
+        std::vector<Chunk> got[2];
+        int64_t fol[2] = { 0, 0 }, lead[2] = { 0, 0 };
+        for (int gi = 0; gi < 2; ++gi) {
+            const int F = gi == 0 ? 512 : 256;
+            TgSwitch tg(F);
+            TiSwitch ti(1);
+            Lanes L;
+            L.grid = 2048;
+            L.cfg.prefill_span = 2;
+            L.cfg.pp_plan_prefix = true;
+            L.max_tok = 4160;
+            L.max_ctx = 140000;
+            L.kv_blocks = 16384;
+            L.stage_rows = 1024;
+            L.win = 16;
+            L.seqs = 6;
+            REQUIRE_EQ(L.start(lanes), RAD_OK);
+            L.set.set_span_tail(8192);
+            L.set.set_span_short(24576);
+            for (int l = 0; l < lanes; ++l) {
+                L.at(l).set_tail_inner_capable(true);
+                L.at(l).set_psk_mode(4);
+                L.at(l).set_psk_cr(1, 5152);
+                L.at(l).set_psk_k(8);
+            }
+            const uint64_t s = L.submit(0, (int)n_prompt, 2);
+            REQUIRE(s != 0);
+            std::vector<int> fifo;
+            std::vector<char> busy((size_t)lanes, 0);
+            int next = 0, failed = 0;
+            for (int round = 0; round < 400; ++round) {
+                const Request* r0 = L.req(0, s);
+                if (!r0 || r0->state == ReqState::Failed || r0->state == ReqState::Finished || !r0->output.empty()) break;
+                std::vector<int> todo;
+                for (int k = 0; k < lanes; ++k) todo.push_back((next + k) % lanes);
+                for (size_t at = 0; at < todo.size(); ++at) {
+                    const int l = todo[at];
+                    if (busy[(size_t)l]) continue;
+                    std::vector<int> order, idle_after;
+                    for (int j = 1; j < lanes; ++j)
+                        if (!busy[(size_t)((l + j) % lanes)]) {
+                            order.push_back((l + j) % lanes);
+                            idle_after.push_back((l + j) % lanes);
+                        }
+                    for (int f : fifo) order.push_back(f);
+                    const RadBatch* b = L.plan(l, order);
+                    if (!b) continue;
+                    std::vector<int32_t> ahead, rows;
+                    int64_t dec = 0;
+                    const bool planned = L.at(l).psk_plan(b->step, &ahead, &rows, &dec);
+                    size_t k = 0;
+                    for (const StepEntry& e : L.at(l).plan().e) {
+                        if (!e.is_prefill) continue;
+                        if (e.seq == s)
+                            got[gi].push_back({ e.ctx_len, e.ctx_len + e.n_tokens,
+                                                planned && k < ahead.size() ? (int64_t)ahead[k] : (int64_t)Scheduler::kPskNoPlan,
+                                                e.ckpt_tok });
+                        ++k;
+                    }
+                    busy[(size_t)l] = 1;
+                    fifo.push_back(l);
+                    next = (l + 1) % lanes;
+                    todo.insert(todo.begin() + (ptrdiff_t)at + 1, idle_after.begin(), idle_after.end());
+                }
+                if (fifo.empty()) break;
+                const int l = fifo.front();
+                fifo.erase(fifo.begin());
+                if (L.commit(l, 5) < 0) ++failed;
+                busy[(size_t)l] = 0;
+            }
+            CHECK_EQ(failed, 0);
+            REQUIRE(L.req(0, s) != nullptr);
+            CHECK_EQ(L.req(0, s)->n_computed, n_prompt);
+            REQUIRE(!got[gi].empty());
+            std::sort(got[gi].begin(), got[gi].end(), [](const Chunk& x, const Chunk& y) { return x.a < y.a; });
+            const int64_t tail = (n_prompt - 128) / F * F;
+            const Chunk& last = got[gi].back();
+            CHECK_EQ(last.b, n_prompt);
+            CHECK(last.a < tail);
+            for (const Chunk& c : got[gi]) {
+                CHECK(c.ahead != (int64_t)Scheduler::kPskNoPlan);
+                CHECK_EQ(c.ahead, tail - c.b);   /* the fine tail is every chunk's next target, inside the last */
+                for (int64_t l = 20; l < 40; ++l) {
+                    const int64_t r = psk_rows(C(l), c.ahead, c.b - c.a);
+                    (l < 32 ? fol : lead)[gi] += r;
+                }
+            }
+            /* lever TI: the snapshot inside the last chunk, the state after its row tail - 1 */
+            CHECK_EQ(last.a + (int64_t)last.ck + 1, tail);
+        }
+        REQUIRE_EQ(got[0].size(), got[1].size());
+        bool same = true;
+        for (size_t i = 0; i < got[0].size(); ++i) same = same && got[0][i].a == got[1][i].a && got[0][i].b == got[1][i].b;
+        CHECK(same);
+        CHECK(fol[1] < fol[0]);
+        CHECK(lead[1] < lead[0]);
+        fprintf(stderr, "    %lld tokens, %d lanes: %zu chunks, the plan %s; fine tail F 512 %lld / F 256 %lld; cone row-layers "
+                        "follower 20-31 %lld -> %lld, leader 32-39 %lld -> %lld\n", (long long)n_prompt, lanes, got[0].size(),
+                same ? "identical" : "DIFFERENT", (long long)((n_prompt - 128) / 512 * 512),
+                (long long)((n_prompt - 128) / 256 * 256), (long long)fol[0], (long long)fol[1], (long long)lead[0],
+                (long long)lead[1]);
+    }
+}
+
 /* tp8 loop M2 (the 20:58 PROFILE: no lane step for 320-430 ms after every MIXED step): lever DST under lanes. A newcomer
  * that joins a lane beside decode rows is cut by option D on sched_mixed_tok's grid (576 -> 512-row pieces), one piece a
  * home-lane step, the same boundaries one lane plans (the plan is a function of the switches, not of the decode rows
