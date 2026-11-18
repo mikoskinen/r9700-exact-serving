@@ -689,6 +689,10 @@ struct Model {
     int64_t sphc = 0;
     bool sphc_eng = false;
     rad_op sp_rs_a = 0, sp_rs_f = 0, sp_ag_x = 0, sp_ag_f = 0, sp_ag_h = 0;
+    /* tp8 loop P20 round 3 (RADIANCE_DS41_SPHC_X1=1, with sphc, the leader at h > 0): X1's stage_send with its residual parts
+     * row-sharded (`shard`: every rank writes its quarter rows, rank 0 the rest) -- the leader's last head layer then SP too,
+     * no gather of the streams before X1 */
+    rad_op pp_x1_sh = 0;
     /* tp8 S3 (ds41_layers.h): this node's layer ranges (RADIANCE_DS41_LAYERS, _MODE); lr.on false = every layer, the
      * published engine. `lr_deps`: what its layers read that another node computes (strict mode: the copies declared). */
     ds41layers::Spec lr{};
@@ -2465,6 +2469,16 @@ static bool sphc_eng_env() {
     return on;
 }
 static std::atomic<long long> g_sp_passes{0}, g_sp_layers{0}, g_sp_rows{0}, g_sp_gathers{0}, g_sp_eng{0}, g_sp_lone{0};
+/* tp8 loop P20 round 3 -- RADIANCE_DS41_SPHC_X1=1 (with RADIANCE_DS41_SPHC, read at declare; default 0 = round 2's X1): an SP
+ * pass's X1 leaves the leader row-sharded -- each rank writes its quarter rows of the residual parts (act.x, h1, post, comb,
+ * pre_ffn) into the send ring, rank 0 the selections / keep words / kv entries whole (stage_send `shard`, split 3); the
+ * payload's bytes are the replicated send's (every row's value is the one every rank would hold after the gather), so the
+ * follower's receive is unchanged. The leader's layer h - 1 is then an SP layer and the streams' gather before it goes. */
+static bool sphc_x1_env() {
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_DS41_SPHC_X1"); return e && e[0] == '1' && !e[1]; }();
+    return on;
+}
+static std::atomic<long long> g_sp_x1{0};
 /* tp8 loop P13b -- RADIANCE_DS41_PIPE2_ATTN=1 (read at declare, only with RADIANCE_DS41_PIPE2 on): a pipelined layer's
  * attention output too: the first group projections and the attention mix as today, o_b of piece 0, piece 0's
  * attention all-reduce on the second lane behind lane 0 and beside piece 1's o_a + o_b (no collective), lane 0
@@ -4649,11 +4663,26 @@ static int64_t cut_row_bytes(const Model& m, const std::vector<CutPart>& v, int 
 }
 /* The stage op of crossing `ring` on this node, its liveness against the parts (declared where it is issued: the sender
  * after its last layer before the crossing, the receiver before its first layer after it). */
-static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring) {
+static rad_op pp_stage_op(RadBuilder* b, const Model& m, int ring, bool shard = false) {
     const bool sends = (ring == RAD_PP_X1) == (m.pp_rank == 0);
     const std::vector<CutPart> v = ds41_cut_liveset(m, ring);
-    rad_op h = op(b, sends ? "stage_send" : "stage_recv",
-                  { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()) }, {}, {}, {});
+    rad_op h = 0;
+    if (shard) {
+        /* tp8 loop P20 round 3: the residual parts (the Live rows of act.x / h1 / post / comb / pre_ffn) row-sharded */
+        int64_t mask = 0;
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i].rows == CutRows::Live && (v[i].b == m.act.x || v[i].b == m.h1 || v[i].b == m.post || v[i].b == m.comb ||
+                                               v[i].b == m.pre_f))
+                mask |= (int64_t)1 << i;
+        if (!sends || mask == 0) return 0;
+        const RadParam ps[] = { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()),
+                                RAD_INT("shard", mask) };
+        h = rad_op_declared(b, "stage_send") ? rad_decl_op(b, "stage_send", ps, 4, nullptr, 0) : 0;
+        if (!h || !rad_op_resolved(b, h)) return 0;
+    } else {
+        h = op(b, sends ? "stage_send" : "stage_recv",
+               { RAD_RANGE("M", 1, m.g.max_tok), RAD_INT("ring", ring), RAD_INT("parts", (int64_t)v.size()) }, {}, {}, {});
+    }
     if (!h) return h;
     std::vector<rad_buf> bufs;
     for (const CutPart& p : v)
@@ -5247,6 +5276,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (m.seg_b[k] == l + 1 && !(m.seg_send[k] = pp_seg_stage_op(b, m, k, true))) return RAD_E_INVAL;
         if (m.pp && m.pp_rank == 0 && m.pp_h > 0 && l == m.pp_h - 1 && !(m.pp_x1 = pp_stage_op(b, m, RAD_PP_X1)))
             return RAD_E_INVAL;
+        /* tp8 loop P20 round 3: its row-sharded twin (RADIANCE_DS41_SPHC_X1), for an SP pass's X1 */
+        if (m.pp && m.pp_rank == 0 && m.pp_h > 0 && l == m.pp_h - 1 && m.sphc > 0 && sphc_x1_env()) {
+            m.pp_x1_sh = pp_stage_op(b, m, RAD_PP_X1, true);
+            if (ctx->rank == 0 && !ctx->shape_probe)
+                fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC_X1=1 (tp8 loop P20 round 3): %s\n",
+                        m.pp_x1_sh ? "an SP pass's X1 leaves row-sharded (each rank its quarter rows of act.x / h1 / post / "
+                                     "comb / pre_ffn, rank 0 the rest); the leader's layer before X1 runs SP, no streams' gather"
+                                   : "off -- the row-sharded stage_send does not resolve here");
+        }
     }
     /* tp8 S3: the final norm, the gather and the head where lr_shell() (after the node's last layer: the leader's, or the
      * proxy's shell); none on a strict follower, whose last layer's output is the boundary */
@@ -6491,7 +6529,7 @@ static void media_engram(RadCtx* x, Model& m, const Layer& L, const RadBatch* ba
  * boundary layer's segments, which every layer after it runs a subset of), the copied source's entries over its work
  * rows. Both nodes compute lo / hi and the work rows from the same batch, so the two ops agree (the trailer's layout
  * word checks it). */
-static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64_t lo, int64_t hi) {
+static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64_t lo, int64_t hi, bool sh = false) {
     const int64_t T = batch->n_tok, S = batch->n_seq;
     if (ring >= kSegRecv) {   /* tp8 dev M4: a segment boundary's save / restore, this rank's ring buffer, the live rows */
         const bool send = ring >= kSegSend;
@@ -6519,7 +6557,7 @@ static bool pp_cross(RadCtx* x, Model& m, const RadBatch* batch, int ring, int64
         rad_issue(x, send ? m.seg_send[k] : m.seg_recv[k], so.data(), (int)so.size(), T);
         return true;
     }
-    const rad_op op_ = ring == RAD_PP_X1 ? m.pp_x1 : m.pp_x2;
+    const rad_op op_ = ring == RAD_PP_X1 ? (sh && m.pp_x1_sh ? m.pp_x1_sh : m.pp_x1) : m.pp_x2;   /* P20 r3: `sh` */
     /* the ring read at every issue (tp8 S5: each lane has its own) */
     m.pp_ring[ring] = rad_pp_query().ring[ring];
     if (!m.pp_ring[ring] || !op_) {
@@ -7008,7 +7046,10 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                 d.next_pcn_a = nx->pcn_a != 0;
             }
             const MoeFP8& mo = L.moe;
-            d.self_ok = L.ar_attn && !L.tap && pp_send_after(m, L.l) < 0 && !may_cut(L.l) && !mo.c.calib && !mo.op_moe_ar &&
+            /* tp8 loop P20 round 3: the leader's layer before X1 where X1 can leave row-sharded */
+            const int so = pp_send_after(m, L.l);
+            d.out_sharded = so == RAD_PP_X1 && m.pp_x1_sh != 0;
+            d.self_ok = L.ar_attn && !L.tap && (so < 0 || d.out_sharded) && !may_cut(L.l) && !mo.c.calib && !mo.op_moe_ar &&
                         !mo.op_shared_ar && !mo.op_combine && !mo.op_add && mo.issues_ar(T, T);
         }
         ds41sp::plan(spl, spv);
@@ -7986,7 +8027,22 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
         if (const int ring = pp_send_after(m, L.l); ring >= 0) {
             int64_t lo = 0, hi = 0;
             live_span(&lo, &hi);
-            if (!pp_cross(x, m, batch, ring, lo, hi)) return;
+            /* tp8 loop P20 round 3: an SP layer's X1 leaves row-sharded (its rows are the pass's [0, T): the shard's rows) */
+            const bool x1_sh = sp_l && ring == RAD_PP_X1 && m.pp_x1_sh;
+            if (x1_sh && (lo != 0 || hi != T)) {
+                rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC_X1: an SP pass's X1 rows are not the pass's (a plan defect)");
+                return;
+            }
+            if (sp_l && !x1_sh) {
+                rad_step_fail(x, "deepseek41: RADIANCE_DS41_SPHC: an SP layer before a whole crossing (a plan defect)");
+                return;
+            }
+            if (!pp_cross(x, m, batch, ring, lo, hi, x1_sh)) return;
+            if (x1_sh) {
+                h_sh = false;   /* nothing on this node reads the residual parts after X1 (the head part ends; a whole pass
+                                 * continues at layer t from X2) */
+                if (rad_rank(x) == 0) g_sp_x1.fetch_add(1, std::memory_order_relaxed);
+            }
             if (ring == RAD_PP_X1 && part != RAD_PP_PART_HEAD) continue;   /* tp8 S5: the head part ends here */
             bt_flush(x, m, batch);
             return;
@@ -8056,11 +8112,12 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             if (n == 1 || n % 64 == 0)
                 fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_SPHC (tp8 loop P20): %lld prefill passes ran %lld "
                                 "layer-passes sequence-parallel (%lld rows, the streams gathered %lld times, %lld Engram "
-                                "layer-passes over the quarter) of %lld lone prefill passes of >= %lld rows; this one %lld rows, "
-                                "layers %d..%d SP (%d), %d gathers of the streams, part %d\n",
+                                "layer-passes over the quarter) of %lld lone prefill passes of >= %lld rows, %lld X1s row-sharded; "
+                                "this one %lld rows, layers %d..%d SP (%d), %d gathers of the streams, part %d\n",
                         n, g_sp_layers.load(std::memory_order_relaxed), g_sp_rows.load(std::memory_order_relaxed),
                         g_sp_gathers.load(std::memory_order_relaxed), g_sp_eng.load(std::memory_order_relaxed), lone,
-                        (long long)m.sphc, (long long)T, sp_lo, sp_hi, sp_n, sp_ga, part);
+                        (long long)m.sphc, g_sp_x1.load(std::memory_order_relaxed), (long long)T, sp_lo, sp_hi, sp_n, sp_ga,
+                        part);
         }
     }
     if (psk && cur != &sg && rad_rank(x) == 0) {   /* lever PSK: a cut step (stats; the first one's cut rows) */

@@ -22,6 +22,7 @@ struct Layer {
                                  no PSK cut can reach it, its MoE reduces its delta in one all-reduce the plugin may take */
     int next = -1;            /* the next layer this part issues (-1: none) */
     bool next_pcn_a = false;  /* that layer's attention collapse is issued at this layer's end (pcn_a) */
+    bool out_sharded = false; /* tp8 loop P20 round 3: the crossing out after it takes each rank's rows (X1 row-sharded) */
 };
 
 /* spv[i] = 1 where layer i is SP (index = layer) */
@@ -29,7 +30,12 @@ inline void plan(const std::vector<Layer>& L, std::vector<uint8_t>& spv) {
     spv.assign(L.size(), 0);
     for (int i = (int)L.size() - 1; i >= 0; --i) {
         const Layer& a = L[(size_t)i];
-        if (!a.issued || !a.self_ok || a.next < 0 || a.next >= (int)L.size()) continue;
+        if (!a.issued || !a.self_ok) continue;
+        if (a.out_sharded) {   /* its outputs leave through the row-sharded crossing: nothing on this node reads them */
+            spv[(size_t)i] = 1;
+            continue;
+        }
+        if (a.next < 0 || a.next >= (int)L.size()) continue;
         spv[(size_t)i] = (a.next_pcn_a || spv[(size_t)a.next]) ? 1 : 0;
     }
 }

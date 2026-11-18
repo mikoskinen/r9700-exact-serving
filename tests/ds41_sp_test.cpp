@@ -35,6 +35,7 @@ struct Pass {
     bool x2 = false;            /* X2 out after hi - 1 (the follower) */
     bool psk = false;           /* lever PSK cuts this pass */
     bool cone = false;          /* ... and the pass holds the prompt's end (cone rows from layer 20) */
+    bool x1_sh = false;         /* tp8 loop P20 round 3: X1 leaves row-sharded (each rank its rows of the live set) */
 };
 
 bool engram(int l) { return l == 1 || l == 14; }
@@ -57,7 +58,8 @@ std::vector<uint8_t> plan_of(const Pass& p, bool engram_rule = true) {
             d.next_pcn_a = pcn_a(i + 1) || !engram_rule;
         }
         const bool send_after = (p.send || p.x2) && i == p.hi - 1;
-        d.self_ok = !tap(i) && !send_after && !(p.psk && i >= kL20);
+        d.out_sharded = p.send && p.x1_sh && i == p.hi - 1;
+        d.self_ok = !tap(i) && !(send_after && !d.out_sharded) && !(p.psk && i >= kL20);
     }
     std::vector<uint8_t> spv;
     ds41sp::plan(L, spv);
@@ -134,9 +136,10 @@ std::string run(const Pass& p, const std::vector<uint8_t>& spv, bool lazy_gather
         s.mix = s.pre_f = sp ? kQ : kAll;
         need(s.act, false, "MoE input", l);
         s.act = sp ? kQ : kAll;   /* its delta reduce-scattered, or all-reduced */
-        if (l == p.hi - 1 && p.send) {   /* X1: the live set whole from rank 0 */
-            need(s.act, false, "X1 act.x", l); need(s.h1, false, "X1 h1", l);
-            need(s.mix, false, "X1 post / comb", l); need(s.pre_f, false, "X1 pre_ffn", l);
+        if (l == p.hi - 1 && p.send) {   /* X1: the live set whole from rank 0, or each rank its rows (row-sharded) */
+            const bool q = p.x1_sh && sp;
+            need(s.act, q, "X1 act.x", l); need(s.h1, q, "X1 h1", l);
+            need(s.mix, q, "X1 post / comb", l); need(s.pre_f, q, "X1 pre_ffn", l);
             return err;
         }
         if (l == p.hi - 1 && p.x2) {   /* X2 at a cone pass: the cone rows' live set whole */
@@ -189,6 +192,9 @@ std::vector<Pass> shapes() {
     Pass t;   /* the leader's tail at W(10,32): X2 in at 32, layers 32-39 (cone rows) */
     t.lo = 32; t.recv = true; t.psk = true; t.cone = true;
     v.push_back(t);
+    Pass hs = h;   /* the leader's head at W(10,32) with X1 row-sharded (round 3) */
+    hs.x1_sh = true;
+    v.push_back(hs);
     Pass f15;   /* W(15,35)'s follower: no Engram layer, X1 in at 15 */
     f15.lo = 15; f15.hi = 35; f15.recv = true; f15.x2 = true; f15.psk = true; f15.cone = true;
     v.push_back(f15);
@@ -222,8 +228,10 @@ TEST(plan_takes_the_layers_it_should) {
     CHECK_EQ(count(plan_of(v[6])), 19);
     /* the leader's tail: cone layers, none */
     CHECK_EQ(count(plan_of(v[7])), 0);
+    /* the leader's head with X1 row-sharded: 0..9 (no gather before X1) */
+    CHECK_EQ(count(plan_of(v[8])), 10);
     /* W(15,35)'s follower: 15..19 */
-    CHECK_EQ(count(plan_of(v[8])), 5);
+    CHECK_EQ(count(plan_of(v[9])), 5);
 }
 
 TEST(plan_control_without_the_engram_rule_fails) {
