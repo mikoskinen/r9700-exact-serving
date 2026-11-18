@@ -716,7 +716,10 @@ struct Model {
      * token ids as its last part (the sender's batch token ids on its card: for a step the leader issued ahead of its collect,
      * ADV_TRUNK's, behind the sampler), and the follower takes X1 at the top of its pass, into its own batch's token ids,
      * before its lookup (pp_fe) and its Engram layers' token_map read them -- its frame's ids are the host's, which a step
-     * issued ahead does not know yet. Under pp_fe X1 is the ids alone (4 B a row), else the lookup + the ids. */
+     * issued ahead does not know yet. Under pp_fe X1 is the ids alone (4 B a row), else the lookup + the ids. At h > 0 (only
+     * where the follower holds an Engram layer) X1 stays where it is, at layer h, with the ids as its last part, and the
+     * follower's token-id ops (token_map, its Engram layers' ngram_ids, lever E1's mark) are issued right after it instead
+     * of in the prologue (pp_ids_late): the same ops on the same inputs, later on the same stream, inside ctok's live range. */
     bool pp_ids = false;
     /* tp8 dev M4 (RADIANCE_PP_SEG_LAYERS=k on the follower, --pp-lanes > 1; unset: nothing here): the follower's [h, t) in
      * segments of k layers. A boundary s is a cut on this node: the segment before it saves what X1 of W(s, t) would carry
@@ -4294,7 +4297,11 @@ static int lr_read(Model& m, const RadBuildCtx* ctx) {
             const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
             m.pp_fe = fe && !std::strcmp(fe, "1") && m.pp_h == 0;
             const char* ia = std::getenv("RADIANCE_PP_ISSUE_AHEAD");
-            m.pp_ids = ia && !std::strcmp(ia, "1") && m.pp_h == 0;   /* tp8 dev D10 round 2 */
+            /* tp8 dev D10 round 2: at W(0, t), and at h > 0 where the follower holds an Engram layer (W(10,32): 14) -- both
+             * nodes know it from the cut and the model; W(15,35)'s follower reads no id and keeps round 1's X1 */
+            bool fol_engram = false;
+            for (int l = m.pp_h; l < m.pp_t; ++l) fol_engram = fol_engram || m.c.ple_index(l) >= 0;
+            m.pp_ids = ia && !std::strcmp(ia, "1") && (m.pp_h == 0 || fol_engram);
         }
         if (m.lr.leader != (pp.rank == 0)) return RAD_E_STATE;
     } else if (ds41layers::parse(std::getenv("RADIANCE_DS41_LAYERS"), std::getenv("RADIANCE_DS41_LAYERS_MODE"), (int)m.c.n_layer,
@@ -6435,6 +6442,9 @@ static int seg_index(const Model& m, int s) {
 }
 /* ... whether this pass issues the follower's first layers (X1, the lookup): the whole pass, or its first segment */
 static bool pp_seg_first(const Model& m) { return !t_seg || t_seg0 == m.pp_h; }
+/* tp8 dev D10 round 2: the follower at h > 0 under pp_ids issues its token-id ops after X1 at layer h (in the pass's first
+ * segment; a later segment's prologue issues them as before: X1 is in its batch by then) */
+static bool pp_ids_late(const Model& m) { return m.pp && m.pp_ids && m.pp_rank == 1 && m.pp_h > 0 && pp_seg_first(m); }
 static int pp_recv_at(const Model& m, int l) {
     if (!m.pp) return -1;
     if (m.pp_rank == 0 && l == m.pp_t) return RAD_PP_X2;
@@ -6665,7 +6675,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
      * only X1's send goes */
     /* tp8 dev D10 round 2 (m.pp_ids): the follower takes X1 -- with the step's token ids, into its batch's -- before its
      * lookup and its token_map read them; the leader sends it after its own lookup, under pp_fe too (the ids alone) */
-    const bool x1_top = m.pp && m.pp_ids && m.pp_rank == 1 && pp_seg_first(m);
+    const bool x1_top = m.pp && m.pp_ids && m.pp_h == 0 && m.pp_rank == 1 && pp_seg_first(m);
     if (x1_top && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
     if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
         RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
@@ -6685,6 +6695,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     if (m.sone && g_sw_one.load(std::memory_order_relaxed) > 0) RAD_ISSUE_N(x, m.sone, T, brows(m.mw.sgate, T));
     RAD_ISSUE_N(x, m.rope_a, T, pos, brows(m.cs_a, g.max_ctx));
     RAD_ISSUE_N(x, m.rope_b_step, T, pos, brows(m.cs_b, g.max_ctx));
+    /* tp8 dev D10 round 2: the token-id ops -- here, or after X1 at layer h on the follower at h > 0 under pp_ids */
+    auto tok_ops = [&]() {
     if (m.tok_map)
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap), brows(m.ctok, T));
     media_tokens(x, m, batch, T);
@@ -6713,6 +6725,8 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                         RAD_NONE);
     }
     engdd_mark(x, m, batch);   /* lever E1: the ids' event (a pass it may act on) */
+    };
+    if (!pp_ids_late(m)) tok_ops();
 
     /* lever PSK-L20: the split layer's all-row part (its collapse + norm) over the STEP's segments / runs, as rows() /
      * whole() issue it in an uncut pass */
@@ -6818,6 +6832,7 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
             live_span(&lo, &hi);
             if (!pp_cross(x, m, batch, ring, lo, hi)) return;
             if (!pp_copy_issue(x, m, batch, ring, !cr_all)) return;
+            if (ring == RAD_PP_X1 && pp_ids_late(m)) tok_ops();   /* tp8 dev D10 round 2: X1's ids are in the batch now */
             if (L.pcn_a) {
                 const int64_t fmin = L.pcn_mix ? mhc_fuse_min() : 0;
                 t_mhc_a.clear();
@@ -7843,7 +7858,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
      * only X1's send goes */
     /* tp8 dev D10 round 2 (m.pp_ids): the follower takes X1 -- with the step's token ids, into its batch's -- before its
      * lookup and its token_map read them; the leader sends it after its own lookup, under pp_fe too (the ids alone) */
-    const bool x1_top = m.pp && m.pp_ids && m.pp_rank == 1 && pp_seg_first(m);
+    const bool x1_top = m.pp && m.pp_ids && m.pp_h == 0 && m.pp_rank == 1 && pp_seg_first(m);
     if (x1_top && !pp_cross(x, m, batch, RAD_PP_X1, 0, T)) return;
     if (((!m.pp || m.pp_rank == 0) && run_head) || (m.pp_fe && m.pp_rank == 1 && pp_seg_first(m))) {
     RAD_ISSUE_N(x, m.embed, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.token), brows(m.xcol, T));
@@ -7865,6 +7880,8 @@ static void step(RadCtx* x, const RadBatch* batch) {
     if (m.sone && g_sw_one.load(std::memory_order_relaxed) > 0) RAD_ISSUE_N(x, m.sone, T, brows(m.mw.sgate, T));
     RAD_ISSUE_N(x, m.rope_a, T, pos, brows(m.cs_a, g.max_ctx));
     RAD_ISSUE_N(x, m.rope_b_step, T, pos, brows(m.cs_b, g.max_ctx));
+    /* tp8 dev D10 round 2: the token-id ops -- here, or after X1 at layer h on the follower at h > 0 under pp_ids */
+    auto tok_ops = [&]() {
     if (m.tok_map)
         RAD_ISSUE_N(x, m.tok_map, T, praw(batch->token_ids, RAD_I32, T), RAD_W(m.tmap),
                     brows(m.ctok, T));
@@ -7903,6 +7920,8 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         RAD_NONE);
     }
     engdd_mark(x, m, batch);   /* lever E1: the ids' event (a pass it may act on) */
+    };
+    if (!pp_ids_late(m)) tok_ops();
     t_mhc_a.clear();           /* lever M1: nothing fused yet this step */
     t_mhc_a_l = -1;
 
@@ -7918,6 +7937,7 @@ static void step(RadCtx* x, const RadBatch* batch) {
         if (const int ring = pp_recv_at(m, l); ring >= 0) {
             if (!pp_cross(x, m, batch, ring, 0, T)) return;
             if (!pp_copy_issue(x, m, batch, ring, true)) return;
+            if (ring == RAD_PP_X1 && pp_ids_late(m)) tok_ops();   /* tp8 dev D10 round 2: X1's ids are in the batch now */
             if (L.pcn_a) {
                 const int64_t fmin = L.pcn_mix ? mhc_fuse_min() : 0;
                 t_mhc_a.clear();
