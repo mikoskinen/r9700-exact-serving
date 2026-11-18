@@ -46,6 +46,7 @@
 #include <chrono>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -1503,29 +1504,40 @@ int Engine::follower_loop() {
      * with a switch request) runs between the segments as if nothing were held. Only the order of different lanes' passes on
      * this node changes, never a pass: a decode step reads only committed KV (bit 0's rule), its own lane's frames keep their
      * order. Bit 1 is not taken where this node's pass takes no X1 (RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t) without the D10
-     * ids). */
+     * ids). Bit 4 (with bit 1, which it sets): the next segment waits up to RADIANCE_PP_FOL_X1_GRACE_MS (default 10) after a
+     * waiting frame arrived for its X1 -- one whose leader head runs now lands within ~a head's time and goes first, as today;
+     * one whose head is queued behind the leader's BG / MIXED work lets the segments run. */
     int fol_order = 0;
-    if (const char* v = std::getenv("RADIANCE_PP_FOL_ORDER"); v && *v) fol_order = std::atoi(v) & 3;
+    if (const char* v = std::getenv("RADIANCE_PP_FOL_ORDER"); v && *v) fol_order = std::atoi(v) & 7;
+    if (fol_order & 4) fol_order |= 1;
+    uint64_t fo_grace_ns = 10ull * 1000000ull;
+    if (const char* v = std::getenv("RADIANCE_PP_FOL_X1_GRACE_MS"); v && *v)
+        fo_grace_ns = (uint64_t)std::max(0LL, std::atoll(v)) * 1000000ull;
     {
         const char* fe = std::getenv("RADIANCE_PP_FOLLOWER_EMBED");
         const bool fe_on = fe && !std::strcmp(fe, "1") && cfg_.pp_cut_h == 0;
         if ((fol_order & 1) && fe_on && !pp_x1_ids()) {
             RAD_WARN("follower: RADIANCE_PP_FOL_ORDER bit 1 is not taken here: this node's pass takes no X1 "
                      "(RADIANCE_PP_FOLLOWER_EMBED=1 at W(0, t)); bit 2 stays (tp8 loop D15)");
-            fol_order &= ~1;
+            fol_order &= ~5;
         }
         if (fol_order)
             RAD_INFO("follower: RADIANCE_PP_FOL_ORDER=%d -- between a split pass's segments %s%s%s (tp8 loop D15)", fol_order,
                      (fol_order & 1) ? "another lane's decode frame goes once its X1 has landed, in the order the X1s land"
                                      : "",
-                     fol_order == 3 ? "; " : "",
+                     (fol_order & 3) == 3 ? "; " : "",
                      (fol_order & 2) ? "a held frame holds only its own lane's frames behind it" : "");
+        if (fol_order & 4)
+            RAD_INFO("follower: RADIANCE_PP_FOL_ORDER bit 4 -- a segment waits up to %llu ms after a waiting frame arrived for its "
+                     "X1 (RADIANCE_PP_FOL_X1_GRACE_MS, tp8 loop D15)", (unsigned long long)(fo_grace_ns / 1000000ull));
     }
     int64_t fo_waited = 0, fo_jumped = 0, fo_passed = 0;
     /* D15: every run frame carries the leader's whole switch-request table; a frame whose table differs from the one that
      * arrived before it changes a switch here (fn4::follow) and so keeps its place, and nothing passes it (its lane, step) */
     std::vector<uint8_t> fo_req;
     std::set<int64_t> fo_chg;
+    std::map<int64_t, uint64_t> fo_arr;   /* bit 4: a run frame's arrival time (its lane, step) */
+    int64_t fo_graced = 0;
     auto fo_key = [](const StepHdr& hh) -> int64_t { return ((int64_t)hh.lane << 32) | (uint32_t)hh.step; };
     auto note_arrival = [&](const net::Msg& mm) {
         if (!fol_order || mm.h.kind != net::kStep) return;
@@ -1539,6 +1551,7 @@ int Engine::follower_loop() {
         std::memcpy(t.data() + sizeof hh.fn4_n, hh.fn4_v, sizeof hh.fn4_v);
         if (fo_req.empty() || fo_req != t) fo_chg.insert(fo_key(hh));
         fo_req.swap(t);
+        if (fol_order & 4) fo_arr[fo_key(hh)] = rad_mono_ns();
     };
     auto is_chg = [&](const StepHdr& hh) -> bool { return hh.run && fo_chg.count(fo_key(hh)) != 0; };
     auto x1_landed = [&](const net::Msg& mm) -> bool {
@@ -1619,6 +1632,7 @@ int Engine::follower_loop() {
         ++builds;
         if (!h.run) return RAD_OK;
         if (!fo_chg.empty()) fo_chg.erase(fo_key(h));   /* tp8 loop D15: a switch change is applied below */
+        if (!fo_arr.empty()) fo_arr.erase(fo_key(h));
         if (h.lane < RAD_PP_MAX_LANES) ++x1_runs[h.lane];   /* tp8 dev D10 round 2: this pass takes its lane's next X1 */
         /* Review F4: the state slots the leader zeroed before this step (a fresh sequence's), zeroed
          * here on this node's own groups, as Engine::clear_fresh_states does on the leader. */
@@ -1690,6 +1704,7 @@ int Engine::follower_loop() {
              * segments that may pass now (a decode frame of a lane with nothing held before it) waits for its X1 below */
             uint32_t held_lanes = 0;
             bool held_fn4 = false;
+            bool fo_in_grace = false;   /* bit 4: this gap is held back for a frame's X1 (counted once) */
             auto lane_bit = [](const StepHdr& hh) -> uint32_t {
                 return hh.lane >= 0 && hh.lane < 32 ? 1u << hh.lane : ~0u;
             };
@@ -1758,7 +1773,20 @@ int Engine::follower_loop() {
                 net::Msg m2;
                 const int rs = pp_link_->recv(&m2, 0);
                 if (rs == RAD_E_NOTFOUND) {
-                    if (dev_done && waited) return RAD_OK;
+                    /* tp8 loop D15 bit 4: a waiting frame that arrived less than the grace ago keeps the next segment back */
+                    bool grace = false;
+                    if ((fol_order & 4) && dev_done && waited && !ia_pend.empty()) {
+                        const uint64_t now = rad_mono_ns();
+                        for (const net::Msg& mp : ia_pend) {
+                            StepHdr hp;
+                            if (mp.body.size() < sizeof hp) continue;
+                            std::memcpy(&hp, mp.body.data(), sizeof hp);
+                            const auto it = fo_arr.find(fo_key(hp));
+                            if (hp.run && it != fo_arr.end() && now - it->second < fo_grace_ns) { grace = true; break; }
+                        }
+                        if (grace && !fo_in_grace) { fo_in_grace = true; ++fo_graced; }
+                    }
+                    if (dev_done && waited && !grace) { fo_in_grace = false; return RAD_OK; }
                     std::this_thread::sleep_for(std::chrono::microseconds(50));
                     continue;
                 }
@@ -1923,8 +1951,8 @@ int Engine::follower_loop() {
                     if (fol_order && !segs.empty())
                         RAD_INFO("follower: frame order over the run (RADIANCE_PP_FOL_ORDER=%d, tp8 loop D15): %lld decode "
                                  "frames waited between segments for their X1, %lld went before an older waiting frame, %lld "
-                                 "passed a held frame", fol_order, (long long)fo_waited, (long long)fo_jumped,
-                                 (long long)fo_passed);
+                                 "passed a held frame, %lld segment gaps held back for an X1 within the grace", fol_order,
+                                 (long long)fo_waited, (long long)fo_jumped, (long long)fo_passed, (long long)fo_graced);
                     return RAD_OK;
                 }
                 RAD_ERR("follower: the link to the leader is down: %s", pp_link_->why().c_str());
@@ -1969,9 +1997,10 @@ int Engine::follower_loop() {
             if (now - fo_line_ns >= 60ull * 1000000000ull) {
                 fo_line_ns = now;
                 RAD_INFO("follower: frame order so far (RADIANCE_PP_FOL_ORDER=%d, tp8 loop D15): %lld decode frames waited "
-                         "between segments for their X1, %lld went before an older waiting frame, %lld passed a held frame; "
-                         "%lld passes in %lld segments, %lld other passes between them, %lld held", fol_order,
-                         (long long)fo_waited, (long long)fo_jumped, (long long)fo_passed, (long long)seg_passes,
+                         "between segments for their X1, %lld went before an older waiting frame, %lld passed a held frame, "
+                         "%lld segment gaps held back for an X1 within the grace; %lld passes in %lld segments, %lld other "
+                         "passes between them, %lld held", fol_order, (long long)fo_waited, (long long)fo_jumped,
+                         (long long)fo_passed, (long long)fo_graced, (long long)seg_passes,
                          (long long)seg_parts, (long long)seg_between, (long long)seg_held);
             }
         }
