@@ -1070,8 +1070,13 @@ static __device__ __forceinline__ void moe_pass(const Exl3r4dGemm& p, const Plan
           const auto t_ = __builtin_amdgcn_raw_buffer_load_b96(wrs, b96o + j * WORDS * 4, so_, kAux); \
           W_[j][0][0] = t_[0]; W_[j][0][1] = t_[1]; W_[j][1][0] = t_[2];            \
         } else if constexpr (X3D) { /* K = 2: both runs read run 1's two words */    \
+          if constexpr (EXL3R4D_ABLATE_WLOAD) { /* X6 reading (TIMING ONLY): no weight stream, the decode on lane words */ \
+            W_[j][1][0] = (unsigned)(ks) * 0x9E3779B1u + wvo[1][0] + j;                \
+            W_[j][1][1] = W_[j][1][0] * 0x85EBCA6Bu + wvo[1][1];                       \
+          } else {                                                                   \
           W_[j][1][0] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[1][0] + j * WORDS * 4, so_, kAux); \
           W_[j][1][1] = __builtin_amdgcn_raw_buffer_load_b32(wrs, wvo[1][1] + j * WORDS * 4, so_, kAux); \
+          }                                                                          \
           W_[j][0][0] = W_[j][1][0]; W_[j][0][1] = W_[j][1][1];                      \
         } else {                                                                     \
           _Pragma("unroll") for (int r = 0; r < 2; r++)                              \
