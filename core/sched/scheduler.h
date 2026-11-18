@@ -1073,6 +1073,7 @@ private:
     StepPlan plan_;
     StepPlan plan_next_;
     bool     next_open_ = false;
+    bool     next_numbered_ = false;   /* tp8 dev D10: step_next took its number (lanes) */
     /* Is a step the card may still be running holding this request? */
     bool in_step(const SchedReq& s) const {
         /* tp8 S5: or a piece of its prompt rides in another lane's step (SchedReq::lent; 0 on one lane) */
