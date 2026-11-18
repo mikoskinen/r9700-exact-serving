@@ -1372,14 +1372,16 @@ static std::atomic<int> g_sw_walk{0}, g_sw_walk_ok{0}, g_sw_walk2_ok{0}, g_sw_wa
  * the attention / the MoE -- is no longer on the path to q_a / the router (lq146 c16ak, 8 sequences: mix_split +
  * mix_finish + their launch gaps ~28 us a connection on the critical path, 6 a pass). The same ops on the same
  * operands (col_a reads pre_f and h0, mix_a writes pre_a / post / comb; col_f reads pre_a and h1, mix_f writes pre_f /
- * post / comb: no buffer one writes is one the other reads), so the same bytes. Read at issue (a flip re-records). */
+ * post / comb: no buffer one writes is one the other reads), so the same bytes. Read at issue (a flip re-records).
+ * 2 = 1 + each stage's window key (kv_n, kv_rope, kv_q, kv_st: four launches on the path to the attention) as the trunk's
+ * lever K1 fold c, rmsnorm_rope_roundtrip_kv_store (each row at its own position, as kv_rope; the same bytes and slot). */
 static std::atomic<int> g_sw_dmr{-1};
 static int dmr_now() {
     int v = g_sw_dmr.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_DS41_DSPARK_MHR");
         int unread = -1;
-        g_sw_dmr.compare_exchange_strong(unread, e && !std::strcmp(e, "1") ? 1 : 0);
+        g_sw_dmr.compare_exchange_strong(unread, e && (!std::strcmp(e, "1") || !std::strcmp(e, "2")) ? e[0] - '0' : 0);
         v = g_sw_dmr.load(std::memory_order_relaxed);
     }
     return v;
@@ -2033,7 +2035,7 @@ extern "C" int rad_fn4_accepts(const char* name, int value) {
     if (!std::strcmp(name, "dspark_walk"))
         return value == 0 || (value == 1 && g_sw_walk_ok.load(std::memory_order_relaxed)) ||
                (value == 2 && g_sw_walk2_ok.load(std::memory_order_relaxed)) ? 1 : -1;
-    if (!std::strcmp(name, "dspark_mhr")) return value == 0 || value == 1 ? 1 : -1;   /* lever DMR */
+    if (!std::strcmp(name, "dspark_mhr")) return value >= 0 && value <= 2 ? 1 : -1;   /* lever DMR (2: + the key's fold c) */
     if (!std::strcmp(name, "ds41_bi"))   /* 5 / 6: lever A9 (one MoE all-reduce a segmented step); 7: lever PMM */
         return value == 0 || (value >= 1 && value <= 7 && g_sw_bi_ok.load(std::memory_order_relaxed)) ? 1 : -1;
     if (!std::strcmp(name, "ds41_psk"))   /* 4 (lever PSK-CR): tail-only anchors, design 2 here */
@@ -3815,6 +3817,16 @@ static int dsp_stage_ops(RadBuilder* b, Model& m, Layer& L) {
                              { RAD_RANGE("M", 1, Q), RAD_INT("head_dim", hd / 2), RAD_INT("n_head_kv", 1),
                                RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", "bf16") },
                              {}, { d.kvn }, {});
+        /* lever DMR 2 (dspark_mhr 2): the window key's norm, rope, round trip and store as ONE op -- the trunk's lever K1
+         * fold c (rmsnorm_rope_roundtrip_kv_store, served at ds41_kvfold 1 on the trunk's own window: the same row
+         * positions, the same cache layout and kv_dtype), declared beside the four ops; 0 where no library serves it. */
+        L.kv_fs = fused(b, "rmsnorm_rope_roundtrip_kv_store",
+                        { RAD_RANGE("M", 1, Q), RAD_INT("n", hd), RAD_F64("eps", c.eps), RAD_INT("n_head", 1),
+                          RAD_INT("head_dim", hd), RAD_INT("rot", c.rope), RAD_INT("off", hd - c.rope),
+                          RAD_STR("mode", "gptj"), RAD_INT("inverse", 0), RAD_INT("block", 32),
+                          RAD_STR("format", "fp8_e4m3"), RAD_STR("scale", "ue8m0"), RAD_STR("dtype", "bf16"),
+                          RAD_INT("block_size", d.kv_bs), RAD_STR("kv_dtype", m.w8d ? "fp8_e4m3" : "bf16") },
+                        { L.kv_norm }, { d.kv_, m.cs_a }, { d.kvn });
         /* The window of `c.window` context keys before the anchor plus the block's own `block` keys,
          * for every row: each row is placed at its block's last position (apos). */
         std::vector<RadParam> dap = { RAD_RANGE("M", 1, Q), RAD_INT("heads", g.n_head), RAD_INT("dim", hd),
@@ -6155,13 +6167,15 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
     RAD_ISSUE_N(x, d.apos_op, T, pos, brows(d.poff, T), brows(d.apos, T));
 
     /* lever DMR (dmr_now): collapse + norm ahead of the connection's mix; the attention-zero rank keeps today's order */
-    const bool dmr = dmr_now() == 1 && !m.zero;
+    const int dmrv = m.zero ? 0 : dmr_now();
+    const bool dmr = dmrv >= 1;
     for (const auto& L : d.st) {
         const auto mix_a = [&] {
             RAD_ISSUE_N(x, L.mix_a, T, brows(d.h0, T), RAD_W(L.hc_a_fn), RAD_W(L.hc_a_scale), RAD_W(L.hc_a_base),
                         brows(d.pre_a, T), brows(d.post, T), brows(d.comb, T));
         };
         if (!dmr) mix_a();
+        const bool kvfold = dmrv == 2 && L.kv_fs;   /* lever DMR 2: the window key as the trunk's fold c */
         RAD_ISSUE_N(x, L.col_a, T, brows(d.h0, T), brows(d.pre_f, T), brows(d.x, T));
         if (m.zero) {
             RAD_ISSUE_N(x, L.attn_fill, T, brows(d.attn_out, T));
@@ -6175,15 +6189,20 @@ static void dsp_query(RadCtx* x, Model& m, const RadBatch* batch) {
             lin_issue(x, m, L.q_b, T, brows(d.qrn, T), L.wq_b, brows(d.q, T));
             RAD_ISSUE_N(x, L.q_rope, T, brows(d.q, T), brows(m.cs_a, g.max_ctx), pos);
             if (!gqp) lin_issue(x, m, L.kv_g, T, brows(d.xn, T), L.wkv, brows(d.kv_, T));
-            RAD_ISSUE_N(x, L.kv_n, T, brows(d.kv_, T), RAD_W(L.kv_norm), brows(d.kvn, T));
-            RAD_ISSUE_N(x, L.kv_rope, T, brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos);
-            if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(d.kvn, T));
-            /* The block's keys past the committed end; the next context pass overwrites them. */
-            if (m.w8d)
-                RAD_ISSUE_N(x, L.kv_st, T, brows(d.kvn, T), praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
-            else
-                RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
+            if (kvfold) {   /* lever DMR 2: kv_n + kv_rope + kv_q + kv_st as the trunk's fold c, one launch */
+                RAD_ISSUE_N(x, L.kv_fs, T, brows(d.kv_, T), RAD_W(L.kv_norm), brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos,
                             praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+            } else {
+                RAD_ISSUE_N(x, L.kv_n, T, brows(d.kv_, T), RAD_W(L.kv_norm), brows(d.kvn, T));
+                RAD_ISSUE_N(x, L.kv_rope, T, brows(d.kvn, T), brows(m.cs_a, g.max_ctx), pos);
+                if (L.kv_q) RAD_ISSUE_N(x, L.kv_q, T, brows(d.kvn, T));
+                /* The block's keys past the committed end; the next context pass overwrites them. */
+                if (m.w8d)
+                    RAD_ISSUE_N(x, L.kv_st, T, brows(d.kvn, T), praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+                else
+                    RAD_ISSUE_N(x, L.kv_st, T, bcol(d.kvn, 0, hd / 2, T), bcol(d.kvn, hd / 2, hd / 2, T),
+                                praw(kb->slot_mapping, RAD_I32, T), kv_cache(d.kv, L.l));
+            }
             RAD_ISSUE_N(x, L.attn, T, brows(d.q, T), kv_cache(d.kv, L.l),
                         praw2(kb->block_table, RAD_I32, S, kb->block_table_pitch), praw(kb->seqused, RAD_I32, S),
                         RAD_NONE, RAD_NONE, RAD_NONE, brows(d.apos, T), cu, RAD_W(L.sinks), brows(d.o, T));
