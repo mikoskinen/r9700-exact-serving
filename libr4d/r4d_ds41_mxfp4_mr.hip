@@ -409,6 +409,36 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
         for (int k = 0; k < PD; ++k) load(k, raw[k]);
         /* one block: its 32 values once, then each row's chain over them in K order */
         auto block = [&](int b, const float* xb, uint32_t (&rw)[R][Q::NR]) {
+            if constexpr ((EX & 8) != 0) {
+                /* EX 9 (DRAFTER track): the block's raw words copied out and the next load issued first, then group by
+                 * group (8 values decoded at a time) each row's chain over the group's values: a row's chain still runs
+                 * the block's 32 values in K order, with 8 decoded weights a row live instead of 32. */
+                uint32_t cur[R][Q::NR];
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+#pragma unroll
+                    for (int i = 0; i < Q::NR; ++i) cur[r][i] = rw[r][i];
+                load(b + PD, rw);
+                mx_for<4>([&](auto gi) {
+                    constexpr int G = decltype(gi)::value;
+                    float w8[R][8];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) Q::template dec<G>(cur[r], tab, w8[r]);
+#pragma unroll
+                    for (int m = 0; m < MT; ++m) {
+                        if (m >= mcu) break;
+                        const float* xp = xb + m * 32 + 8 * G;
+                        const float4 a = *(const float4*)xp;
+                        const float4 c = *(const float4*)(xp + 4);
+                        const float xv[8] = { a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w };
+#pragma unroll
+                        for (int r = 0; r < R; ++r)
+#pragma unroll
+                            for (int t = 0; t < 8; ++t) acc[r][m] += xv[t] * w8[r][t];
+                    }
+                });
+                return;
+            }
             float w[R][32];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
@@ -472,7 +502,8 @@ __global__ __launch_bounds__(kXmThreads) void xm_seq_kernel(MxMrArgs A) {
 /* gemv band: (H, R, MT); tiled order: (R, MT). */
 #define XM_GFORMS(X) X(4, 1, 2) X(4, 1, 4) X(4, 1, 8) X(4, 1, 16) X(4, 2, 2) X(4, 2, 4) X(4, 2, 8) X(2, 1, 4) X(2, 1, 8)
 #define XM_SFORMS(X) X(1, 2, 0) X(1, 4, 0) X(1, 8, 0) X(2, 2, 0) X(2, 4, 0) X(2, 8, 0) \
-    X(1, 4, 1) X(1, 8, 1) X(1, 16, 1) X(2, 4, 1) X(2, 8, 1) X(2, 16, 1) X(1, 4, 3) X(1, 4, 5) X(1, 4, 7)
+    X(1, 4, 1) X(1, 8, 1) X(1, 16, 1) X(2, 4, 1) X(2, 8, 1) X(2, 16, 1) X(1, 4, 3) X(1, 4, 5) X(1, 4, 7) \
+    X(1, 4, 9) X(1, 8, 9) X(1, 16, 9) X(2, 8, 9)
 
 int xm_launch_g(RadStream s, int H, int R, int MT, const MxMrArgs& A, unsigned grid, unsigned thr, unsigned lds) {
 #define XM_G(h, r, mt) \
@@ -543,9 +574,11 @@ int r4d_mx_mr_get() { return g_xm_on; }
 /* The rule: the gemv band (<= 16 tokens): MT from the call's tokens (an expert's rows in a decode step are few: 4 to 8
  * tokens' worth), H 4 x R 1 in 8-wave blocks (32 weight rows a block), a grid of four blocks a WGP or fewer when the live
  * work is smaller. The tiled order (DRAFTER track 18.11.2026, tools/dbench on one R9700, the drafter's 3 stages x
- * (gate_up + down), synthetic routing): R 1 x MT 4 with EX (each segment's chains over its own rows only) in 4-wave blocks
- * (128 rows), slabs of 16 KiB, a grid of 32 blocks a WGP: 80 tokens 4.14 ms a pass vs the stock tiled kernel's 18.66 (x4.51),
- * 40 tokens 2.91 vs the previous rule's (MT 8, no EX, 4 blocks a WGP) 5.99; the same bytes (the stock chain order). */
+ * (gate_up + down)): R 1 x MT 8 with EX 9 (each segment's chains over its own rows only, decoded a group of 8 values at a
+ * time) in 4-wave blocks (128 rows), slabs of 16 KiB, a grid of 32 blocks a WGP. Synthetic routing (pool 6, 7 in 10): 80
+ * tokens 4.18 ms a pass vs the stock tiled kernel's 18.62 (x4.46), 40 tokens 2.94 vs the previous rule's (MT 8, no EX, 4
+ * blocks a WGP) 5.99; routing where a sequence's 5 rows share 3 experts (pool 3, all picks; its stock time 11.56 ms is
+ * within 8 % of the served 12.48): 80 tokens 3.15 vs 11.56, 40 tokens 2.18 vs 6.91. The same bytes (the stock chain order). */
 int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
     if (c.tokens < 1 || c.tokens > g_xm_cap || c.T < 1 || c.N < 1 || c.K < 32 || c.K % 32 || c.n_expert < 1)
         return R4D_MX_MR_DECLINE;
@@ -554,7 +587,7 @@ int r4d_mx_mr_moe(RadStream s, const R4dMxMrCall& c) {
     if (pinned) { H = g_xm_pin_h; R = g_xm_pin_r; MT = g_xm_pin_mt; WN = g_xm_pin_wn; }
     /* a seq pin's h: 1 = EX (the segment's rows only) */
     int EX = pinned && !c.gemv ? (g_xm_pin_h & 1 ? g_xm_pin_h : 0) : 0;   /* 3 / 5 / 7: bench ablations */
-    if (!pinned && !c.gemv) { MT = 4; EX = 1; }
+    if (!pinned && !c.gemv) { MT = 8; EX = 9; }
     if (c.gemv ? !xm_has_g(H, R, MT) : !xm_has_s(R, MT, EX)) return R4D_MX_MR_DECLINE;
     if (WN <= 0) WN = c.gemv ? 8 : 4;
     if (WN != 1 && WN != 2 && WN != 4 && WN != 8) return R4D_MX_MR_DECLINE;

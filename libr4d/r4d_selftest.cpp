@@ -21808,9 +21808,11 @@ static void ds_gg_perf(const Plugin& pl, const char* mlist, int iters, const cha
  * the other two types at every dense shape. */
 struct MrShape { const char* name; int64_t N, K; const char* types; bool logits; };
 static const MrShape kMrShapes[] = {
-    { "attn_q_b", 8192, 1280, "q5_K,q6_K", false },       { "attn_output_b", 5120, 2048, "q5_K,q6_K", false },
-    { "attn_q_a", 1280, 5120, "q5_K,q6_K", false },       { "attn_output_a", 1024, 4096, "q5_K,q6_K", false },
-    { "attn_kv", 512, 5120, "q5_K,q6_K", false },         { "shexp_gate_up", 1536, 5120, "q6_K,q8_0", false },
+    /* q8_0 on the attention shapes too: the DSpark drafter's dense linears at the same TP4 widths (the DLW sidecar,
+     * dspark-dlw-q8_0; DRAFTER track 18.11.2026) */
+    { "attn_q_b", 8192, 1280, "q5_K,q6_K,q8_0", false },  { "attn_output_b", 5120, 2048, "q5_K,q6_K,q8_0", false },
+    { "attn_q_a", 1280, 5120, "q5_K,q6_K,q8_0", false },  { "attn_output_a", 1024, 4096, "q5_K,q6_K,q8_0", false },
+    { "attn_kv", 512, 5120, "q5_K,q6_K,q8_0", false },    { "shexp_gate_up", 1536, 5120, "q6_K,q8_0", false },
     { "shexp_down", 5120, 768, "q6_K,q8_0", false },      { "shexp_gate_up_w512", 1024, 5120, "q6_K,q8_0", false },
     { "shexp_down_w512", 5120, 512, "q6_K,q8_0", false }, { "engram_kv", 25600, 6144, "q6_K", false },
     { "head", 32320, 5120, "q6_K", true },
@@ -22893,7 +22895,8 @@ static void ds_mx_check(const Plugin& pl) {
     const P spins[] = { { -1, 0, 0, 0, 0, 0 }, { 1, 0, 1, 2, 0, 0 }, { 1, 0, 1, 4, 0, 0 }, { 1, 0, 1, 8, 0, 0 }, { 1, 0, 2, 2, 0, 0 },
                         { 1, 0, 2, 4, 8, 0 }, { 1, 0, 2, 8, 0, 0 }, { 1, 0, 1, 4, 1, 5 },
                         { 1, 1, 1, 4, 0, 0 }, { 1, 1, 1, 8, 0, 0 }, { 1, 1, 1, 16, 0, 0 }, { 1, 1, 2, 4, 0, 0 }, { 1, 1, 1, 4, 8, 3 },
-                        { 1, 1, 1, 4, 0, 1024 } };
+                        { 1, 1, 1, 4, 0, 1024 }, { 1, 9, 1, 4, 0, 0 }, { 1, 9, 1, 8, 0, 0 }, { 1, 9, 1, 16, 0, 0 },
+                        { 1, 9, 2, 8, 0, 0 }, { 1, 9, 1, 8, 2, 7 } };
     const int64_t toks[] = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 17, 20, 24, 25, 30, 32, 40, 45, 48, 50, 60, 64, 79, 80, 96, 120, 160, 240 };
     long long launches = 0, diffs = 0, cases = 0;
     std::printf("drafter_mx byte check: moe_gemm_ggml type=mxfp4, the multi-row forms vs the stock kernels\n");

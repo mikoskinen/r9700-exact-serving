@@ -62,18 +62,19 @@ static RadParam PS(const char* k, const char* v) { RadParam p; std::memset(&p, 0
 struct Route { std::vector<int32_t> sorted, off; int64_t live = 0, experts = 0, rmax = 0; };
 static constexpr int64_t kEG = 128, kE = 32, kTopK = 3;
 
+static int g_pool = 6, g_pin10 = 7;   /* --pool / --pin10: a sequence's expert pool and the tenths of picks drawn from it */
 static Route route_synth(int64_t tokens, int rank, uint64_t seed) {
     uint64_t rs = seed;
     auto rnd = [&]() { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; };
     std::vector<std::vector<int32_t>> by((size_t)kEG);
-    std::vector<int32_t> pool(6);
+    std::vector<int32_t> pool((size_t)g_pool);
     for (int64_t t = 0; t < tokens; ++t) {
         if (t % 5 == 0)
             for (auto& p : pool) p = (int32_t)(rnd() % kEG);
         int32_t pick[3] = { -1, -1, -1 };
         for (int j = 0; j < kTopK; ++j) {
             int32_t e; int guard = 0;
-            do { e = (rnd() % 10 < 7) ? pool[(size_t)(rnd() % pool.size())] : (int32_t)(rnd() % kEG); }
+            do { e = ((int)(rnd() % 10) < g_pin10) ? pool[(size_t)(rnd() % pool.size())] : (int32_t)(rnd() % kEG); }
             while ((e == pick[0] || e == pick[1] || e == pick[2]) && ++guard < 64);
             pick[j] = e;
             by[(size_t)e].push_back((int32_t)(t * kTopK + j));
@@ -109,6 +110,7 @@ static Route route_counts(const std::vector<int32_t>& off, int64_t tokens) {
     return r;
 }
 
+static int g_rec_start = 0;   /* --rec-start: the first matching record taken (then every `stride`-th) */
 static std::vector<std::vector<int32_t>> read_records(const char* path, int64_t tokens, int want, int stride) {
     std::vector<std::vector<int32_t>> out;
     FILE* f = std::fopen(path, "rb");
@@ -117,7 +119,8 @@ static std::vector<std::vector<int32_t>> read_records(const char* path, int64_t 
     long long idx = 0;
     while (std::fread(r, 4, 40, f) == 40 && (int)out.size() < want) {
         if (r[0] == (int32_t)kE && r[1] == tokens) {
-            if (idx++ % stride == 0) out.emplace_back(r + 3, r + 3 + kE + 1);
+            if (idx >= g_rec_start && (idx - g_rec_start) % stride == 0) out.emplace_back(r + 3, r + 3 + kE + 1);
+            ++idx;
         }
     }
     std::fclose(f);
@@ -194,7 +197,7 @@ static void apply_form(const Form& f) {
 
 int main(int argc, char** argv) {
     std::string toks = "40,80", forms = "stock,rule", route = "synth";
-    int iters = 30, rec_stride = 97, stages = 3, cap = 0, gemv_order = 0;
+    int iters = 30, rec_stride = 2, stages = 3, cap = 0, gemv_order = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto nx = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -206,6 +209,9 @@ int main(int argc, char** argv) {
         else if (a == "--stages") stages = std::atoi(nx().c_str());
         else if (a == "--cap") cap = std::atoi(nx().c_str());
         else if (a == "--gemv-order") gemv_order = 1;
+        else if (a == "--pool") g_pool = std::atoi(nx().c_str());
+        else if (a == "--rec-start") g_rec_start = std::atoi(nx().c_str());
+        else if (a == "--pin10") g_pin10 = std::atoi(nx().c_str());
         else { std::fprintf(stderr, "unknown %s\n", a.c_str()); return 2; }
     }
     std::vector<Form> fl;
@@ -215,6 +221,7 @@ int main(int argc, char** argv) {
     r4d_mx_gemv_order(gemv_order);   /* 1: every call in the gemv band's order (stock = mx_gemv_kernel at any tokens) */
     if (gemv_order) std::printf("gemv order at every token count: the reference is the stock gemv kernel\n");
     hipDeviceProp_t pr; CK(hipGetDeviceProperties(&pr, 0));
+    std::printf("synth routing: pool %d, %d/10 of picks from it\n", g_pool, g_pin10);
     std::printf("dbench: %s, %d WGPs, %d MHz, mem %d MHz x %d bit; route %s; iters %d; stages %d; forms' token cap %d\n", pr.gcnArchName,
                 pr.multiProcessorCount, pr.clockRate / 1000, pr.memoryClockRate / 1000, pr.memoryBusWidth, route.c_str(), iters, stages, cap > 0 ? cap : 48);
     hipStream_t s; CK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
