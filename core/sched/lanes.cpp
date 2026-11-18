@@ -46,6 +46,8 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     const char* lm = std::getenv("RADIANCE_PP_LEND_MIXED");
     lend_mixed_ = lm && !std::strcmp(lm, "1") ? 1 : lm && !std::strcmp(lm, "2") ? 2 : 0;
     bg_ = bg_env();
+    const char* bs = std::getenv("RADIANCE_PP_BG_SPLIT");
+    bg_split_ = bs && !std::strcmp(bs, "1");
     if (const char* m = std::getenv("RADIANCE_PP_SPLIT_MIN"); m && *m) {
         const long long v = std::strtoll(m, nullptr, 10);
         if (v > 0) split_min_ = (int64_t)v;
@@ -523,15 +525,40 @@ bool Scheduler::lane_split_bg(StepEntry& e) {
     const std::vector<int>& order = lanes_->planners_locked();
     const int64_t n = e.n_tokens;
     const int64_t cap = geo_.shared_tok > 0 ? std::min<int64_t>(cfg_.max_tok, geo_.shared_tok) : cfg_.max_tok;
-    int to = -1;
-    bool any = false;
-    for (int l : order) {
-        if (!lanes_->is_bg(l)) continue;
-        any = true;
-        if (lanes_->inbox_rows_locked(l) + n <= cap && (int64_t)lanes_->inbox_n_locked(l) + 1 <= cfg_.max_seqs) { to = l; break; }
+    auto room = [&](int l, int64_t rows) {
+        return lanes_->inbox_rows_locked(l) + rows <= cap && (int64_t)lanes_->inbox_n_locked(l) + 1 <= cfg_.max_seqs;
+    };
+    /* the BG lanes in this plan's planning order (the order they take their inboxes in) */
+    std::vector<int> bgo;
+    for (int l : order)
+        if (lanes_->is_bg(l)) bgo.push_back(l);
+    /* tp8 dev M8 (RADIANCE_PP_BG_SPLIT=1, two BG lanes or more): the entry cut at the 512-grid point nearest its middle (>= 128
+     * rows a side: M5b's cut, answer-neutral by the cards' lq21 lid576), the first piece to the first BG lane in the order with
+     * room, the rest (its first token, the snapshot when it lies there) to a later one: piece 1's leader tail runs beside piece
+     * 2's follower segments, and each segment is half a whole one's. Else: whole, to one BG lane. */
+    int64_t x = 0;
+    int to = -1, to2 = -1;
+    if (lanes_->bg_split() && bgo.size() >= 2) {
+        constexpr int64_t G = 512, kMin = 128;
+        const int64_t c0 = e.ctx_len, end = c0 + n;
+        for (int64_t g = (c0 + kMin + G - 1) / G * G; g <= end - kMin; g += G)
+            if (!x || std::llabs(g - (c0 + end) / 2) < std::llabs(x - (c0 + end) / 2)) x = g;
+        /* a snapshot inside the first piece keeps the entry whole (its next piece would wait for its commit at h > 0) */
+        if (x && e.ckpt_slot >= 0 && c0 + e.ckpt_tok + 1 <= x) x = 0;
+        if (x) {
+            size_t k = 0;
+            for (; k < bgo.size() && to < 0; ++k)
+                if (room(bgo[k], x - c0)) to = bgo[k];
+            for (; k < bgo.size() && to2 < 0; ++k)
+                if (room(bgo[k], end - x)) to2 = bgo[k];
+            if (to < 0 || to2 < 0) { x = 0; to = to2 = -1; lanes_->note_bg_skip_locked(LaneSet::kBgSplitRoom); }
+        }
     }
+    if (!x)
+        for (int l : bgo)
+            if (room(l, n)) { to = l; break; }
     if (to < 0) {
-        lanes_->note_bg_skip_locked(any ? LaneSet::kBgRoom : LaneSet::kBgOrder);
+        lanes_->note_bg_skip_locked(!bgo.empty() ? LaneSet::kBgRoom : LaneSet::kBgOrder);
         return false;
     }
     /* The committed end, below which nothing in flight reads (this step's bump undone): the keep floor, as a lend's */
@@ -553,6 +580,21 @@ bool Scheduler::lane_split_bg(StepEntry& e) {
     pc.e.dev = false;
     pc.e.ckpt_restore = -1;
     pc.e.n_accepted = 1;
+    if (x) {   /* RADIANCE_PP_BG_SPLIT: [c, x) without a token or a snapshot, then [x, end) with both */
+        LaneSet::Piece p1 = pc;
+        p1.e.n_tokens = (int32_t)(x - e.ctx_len);
+        p1.e.produces_token = false;
+        p1.e.ckpt_slot = -1;
+        p1.e.ckpt_tok = -1;
+        lanes_->lend_locked(to, p1);
+        undo.to.emplace_back(to, p1.e.ctx_len);
+        ++s.lent_pending;
+        pc.e.ctx_len = (int32_t)x;
+        pc.e.n_tokens = (int32_t)(e.ctx_len + n - x);
+        if (pc.e.ckpt_slot >= 0) pc.e.ckpt_tok = (int32_t)(e.ckpt_tok - (x - e.ctx_len));
+        to = to2;
+        lanes_->note_bg_split_locked();
+    }
     lanes_->lend_locked(to, pc);
     undo.to.emplace_back(to, pc.e.ctx_len);
     s.lent += (int32_t)n;

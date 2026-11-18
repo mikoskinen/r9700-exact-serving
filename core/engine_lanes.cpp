@@ -238,6 +238,11 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  "0-%d%s", lanes_.bg_lane(), n_lanes_ - 1, lanes_.bg_n(), n_lanes_ - lanes_.bg_n(), (long long)cfg_.max_seqs,
                  lanes_.bg_lane() - 1,
                  lanes_.lend_split() || lanes_.lend_mixed() ? " (before RADIANCE_PP_LEND_MIXED, which takes what it leaves)" : "");
+    if (lanes_.bg_lane() >= 0 && lanes_.bg_split())
+        RAD_INFO("two-node pipeline: RADIANCE_PP_BG_SPLIT=1 -- %s", lanes_.bg_n() >= 2
+                     ? "a BG newcomer is cut at the 512-grid point nearest its middle (>= 128 rows a side) and its two pieces go to two "
+                       "BG lanes in the planning order (tp8 dev M8)"
+                     : "not taken: it needs RADIANCE_PP_BG_LANE=2 or more");
     if (lanes_.bg_lane() == 1)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_LANE leaves ONE decode lane at --pp-lanes %d: decode steps no longer overlap on "
                  "the two nodes (use --pp-lanes %d)", n_lanes_, n_lanes_ + 1);
@@ -347,9 +352,11 @@ void Engine::lanes_note(int64_t lane_steps, int64_t rounds_two) {
                                          "dev M5b)", (long long)c.dpieces).c_str() : "");
     if (lanes_.bg_lane() >= 0)
         RAD_INFO("two-node pipeline: BG lane(s) from %d (RADIANCE_PP_BG_LANE, tp8 dev M8): %lld newcomers lent whole beside decode "
-                 "rows (%lld rows); kept home: a prefix restore %lld, the BG lanes' room %lld, not a planner %lld", lanes_.bg_lane(),
-                 (long long)c.bg, (long long)c.bg_rows, (long long)c.bg_skip[LaneSet::kBgRestore],
-                 (long long)c.bg_skip[LaneSet::kBgRoom], (long long)c.bg_skip[LaneSet::kBgOrder]);
+                 "rows (%lld rows; %lld of them in two pieces on the 512 grid, RADIANCE_PP_BG_SPLIT; %lld whole for want of two "
+                 "lanes' room); kept home: a prefix restore %lld, the BG lanes' room %lld, not a planner %lld", lanes_.bg_lane(),
+                 (long long)c.bg, (long long)c.bg_rows, (long long)c.bg_split, (long long)c.bg_skip[LaneSet::kBgSplitRoom],
+                 (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
+                 (long long)c.bg_skip[LaneSet::kBgOrder]);
 }
 
 int Engine::step_loop_lanes() {
