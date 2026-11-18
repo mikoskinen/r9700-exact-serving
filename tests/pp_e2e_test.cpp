@@ -2055,7 +2055,8 @@ TEST(bg_pieces_serve_one_process_tokens) {
  * step runs go to its next step together. Four decoders, then five newcomers of 600-800 rows 40 ms apart, at 2112 rows a step
  * under --prefill-span 2 --checkpoint-interval 1024 (shared budget 1088: one newcomer a BG step without the switch); the BG pass
  * slowed by its one-layer segments' test wait. Tokens = one process (the same flags) at 3 lanes W(2,3) / W(0,2) and 4 lanes W(1,3)
- * (two BG lanes) with BG_ROOM=2112, and at W(2,3) without it; the leader counts the BG steps that carried >= 2 newcomers. */
+ * (two BG lanes) with BG_ROOM=2112, at W(2,3) without it, and at W(2,3) with the leader's BG segments (LEAD_SEG + AHEAD) / the BG
+ * hold; the leader counts the BG steps that carried >= 2 newcomers. */
 std::vector<std::vector<int32_t>> bg_room_set(int port) {
     std::vector<std::future<std::vector<int32_t>>> f;
     for (uint64_t s : { 91, 92, 93, 94 })
@@ -2082,13 +2083,17 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
         kill(one.lead.child.pid, SIGTERM);
         CHECK_EQ(one.lead.finish(60), 0);
     }
-    struct Arm { int lanes; const char* cut; const char* bg; const char* room; };
+    /* + two forms the cards may stack on it: the leader's BG segments (M9: LEAD_SEG + AHEAD) and the BG hold (D11) */
+    struct Arm { int lanes; const char* cut; const char* bg; const char* room; bool lead_seg = false; bool hold = false; };
     long long b2_all = 0;
     for (const Arm a : { Arm{ 3, "2,3", "1", "2112" }, Arm{ 3, "0,2", "1", "2112" }, Arm{ 4, "1,3", "2", "2112" },
-                         Arm{ 3, "2,3", "1", nullptr } }) {
+                         Arm{ 3, "2,3", "1", nullptr }, Arm{ 3, "2,3", "1", "2112", true, false },
+                         Arm{ 3, "2,3", "1", "2112", false, true } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(std::string("RADIANCE_PP_BG_LANE=") + a.bg);
         if (a.room) env.push_back(std::string("RADIANCE_PP_BG_ROOM=") + a.room);
+        if (a.lead_seg) { env.push_back("RADIANCE_PP_LEAD_SEG=1"); env.push_back("RADIANCE_PP_LEAD_SEG_AHEAD=1"); }
+        if (a.hold) env.push_back("RADIANCE_PP_BG_HOLD_MS=60000");
         for (const char* v : { "RADIANCE_PP_SEG_AHEAD=0", "RADIANCE_PP_SEG_LAYERS=1", "RADIANCE_PP_SEG_ROWS=16",
                                "RADIANCE_PP_SEG_TEST_WAIT_MS=15", "RADIANCE_PP_READY_FIRST=1" })
             env.push_back(v);
@@ -2120,9 +2125,10 @@ TEST(bg_room_batches_newcomers_and_serves_one_process_tokens) {
                 if (const char* w = std::strstr(q, "the widest ")) widest = std::atoll(w + std::strlen("the widest "));
             }
         if (a.room) b2_all += std::max(0LL, b2);
-        fprintf(stderr, "    BG_LANE=%s BG_ROOM=%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lanes; BG steps %lld, "
-                        "%lld with >= 2 newcomers, the widest %lld rows\n", a.bg, a.room ? a.room : "off", a.lanes, a.cut, differ,
-                ref.size(), bg, steps, b2, widest);
+        fprintf(stderr, "    BG_LANE=%s BG_ROOM=%s%s%s, %d lanes W(%s): %d of %zu requests differ; %lld newcomers to the BG lanes; BG steps "
+                        "%lld, %lld with >= 2 newcomers, the widest %lld rows\n", a.bg, a.room ? a.room : "off",
+                a.lead_seg ? " + LEAD_SEG=1 + AHEAD" : "", a.hold ? " + HOLD" : "", a.lanes, a.cut, differ, ref.size(), bg, steps, b2,
+                widest);
         CHECK_EQ(differ, 0);
         if (differ) fprintf(stderr, "    leader:\n%s\n    follower:\n%s\n", tail(llog, 30).c_str(), tail(flog, 30).c_str());
         CHECK(bg > 0);
