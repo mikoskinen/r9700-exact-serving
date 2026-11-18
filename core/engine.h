@@ -589,6 +589,14 @@ private:
      * is served (drafter_short_ > 0); the two-node pipeline's minute and stop lines print them. */
     int64_t              short_q_n_ = 0, short_q_rows_ = 0, long_q_n_ = 0, long_q_rows_ = 0;
     void                 short_block_line(const char* when) const;
+    /* tp8 loop D19: the short block tiers (RADIANCE_DRAFT_SHORT_TIERS=N:S,..., leader env), from the highest load down: a
+     * step that decoded >= `from` sequences (short_block_on's hysteresis, a state a tier) runs `block`; empty without the
+     * env (then drafter_short_ / short_from_ / short_on_ serve as before). drafter_short_ is the first tier's block. */
+    struct ShortTier {
+        int64_t from = 0, block = 0, q_n = 0, q_rows = 0;
+        bool    on = false;
+    };
+    std::vector<ShortTier> short_tiers_;
 
     /* Serial driver (spec §10): `depth` dependent passes after the step commits, each embedding
      * the previous proposal. MTP, EAGLE and Medusa-serial have this shape. */

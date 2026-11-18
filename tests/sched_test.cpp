@@ -3341,6 +3341,42 @@ TEST(the_short_block_switches_off_at_one_sequence) {
     CHECK(!Scheduler::short_block_on(true, 0, 1));
 }
 
+/* tp8 loop D19: short block tiers (RADIANCE_DRAFT_SHORT_TIERS=12:1,6:3 -- c32's lanes of 16 the 1-row block, c16's lanes
+ * of 8 the 3-row one): the tier of the highest load a step reaches, each tier with the one-tier switch's hysteresis, and
+ * the drafter's own block below them. The parser sorts the tiers from the highest load down and refuses malformed ones. */
+TEST(short_block_tiers_pick_the_highest_load_tier_with_each_ones_hysteresis) {
+    bool on[2] = {};
+    const int64_t from[2] = { 12, 6 };
+    struct { int64_t dec; int want; } seq[] = {
+        { 16, 0 }, { 11, 0 }, { 10, 1 }, { 11, 1 }, { 12, 0 }, { 8, 1 }, { 5, 1 }, { 4, -1 }, { 5, -1 }, { 6, 1 },
+        { 1, -1 }, { 2, -1 }, { 32, 0 }, { 0, -1 },
+    };
+    int bad = 0;
+    for (const auto& s : seq) {
+        const int k = Scheduler::short_tier_pick(on, from, 2, s.dec);
+        if (k != s.want) { ++bad; std::fprintf(stderr, "    decoded %lld: tier %d, want %d\n", (long long)s.dec, k, s.want); }
+    }
+    CHECK_EQ(bad, 0);
+    /* one tier = the one-tier switch */
+    bool o1 = false, o2 = false;
+    for (const int64_t d : { 2, 8, 7, 6, 7, 9, 1 }) {
+        o1 = Scheduler::short_block_on(o1, d, 8);
+        CHECK_EQ(Scheduler::short_tier_pick(&o2, from, 0, d), -1);
+        const int64_t f8 = 8;
+        CHECK_EQ(Scheduler::short_tier_pick(&o2, &f8, 1, d), o1 ? 0 : -1);
+    }
+    std::vector<std::pair<int64_t, int64_t>> t;
+    std::string why;
+    CHECK_OK(Scheduler::parse_short_tiers("6:3,12:1", &t, &why));
+    REQUIRE_EQ(t.size(), (size_t)2);
+    CHECK_EQ(t[0].first, (int64_t)12); CHECK_EQ(t[0].second, (int64_t)1);
+    CHECK_EQ(t[1].first, (int64_t)6);  CHECK_EQ(t[1].second, (int64_t)3);
+    CHECK_OK(Scheduler::parse_short_tiers("12:1", &t, &why));
+    CHECK_EQ(t.size(), (size_t)1);
+    for (const char* b : { "", "12", "12:", ":1", "12:1,", "12:1,12:3", "1:1", "12:0", "12:1;6:3", "a:1", "2:1,3:1,4:1,5:1,6:1" })
+        CHECK_EQ(Scheduler::parse_short_tiers(b, &t, &why), RAD_E_INVAL);
+}
+
 TEST(no_prefix_hit_gives_nothing_back) {
     const RefillRun r = refill_run(1100, 0);
     CHECK_EQ(r.m.draft_refills, (int64_t)0);
@@ -5422,6 +5458,50 @@ TEST(the_depth_cap_holds_the_head_depth_from_its_rows_and_hands_back_below_them)
     for (int t = 0; t < 40; ++t) at5 += cap.plan_step(uf, 8, 8) == 5 ? 1 : 0;
     CHECK(at5 > 0);
     CHECK_EQ(cap.dcap_cycles(), (int64_t)21);
+}
+
+/* tp8 loop D20 (loop FINDINGS F56 item 7): draft_dcap_n 100 + N HOLDS the head depth at draft_dcap from N decode rows.
+ * Eight sequences at 0.9 / 0.7 a position, step times that make depth 2 the best yield (30 / 31 / 60 / 70 / 80 ms at depths
+ * 1-5): the cap (draft_dcap 3 from 8 rows) lets the yield choose 2, the hold verifies 3 every cycle from 8 rows; under them
+ * the yield's choice comes back past kHold; 8 again releases the hold. */
+TEST(the_depth_hold_sets_the_cap_from_its_rows_where_the_yield_would_choose_less) {
+    DraftController a = adaptive_controller(5);
+    DraftAdapt u[8];
+    DraftAdapt* uf[8];
+    for (int i = 0; i < 8; ++i) { u[i] = estimate(a, 0.9, 0.7); uf[i] = &u[i]; }
+    const double ms[6] = { 0.0, 30.0, 31.0, 60.0, 70.0, 80.0 };
+    for (int d = 1; d <= 5; ++d)
+        for (int k = 0; k < 4; ++k) {
+            a.step_time(d, 8, ms[d]);
+            a.step_time(d, 6, ms[d]);
+        }
+    DraftController cap = a, hold = a;
+    cap.set_dcap(3);
+    cap.set_dcap_n(8);
+    hold.set_dcap(3);
+    hold.set_dcap_n(108);
+    CHECK(hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 108);   /* reads back as set (fn4 note) */
+    CHECK(!cap.dcap_hold());
+    for (int t = 0; t < 20; ++t) {
+        CHECK_EQ(cap.plan_step(uf, 8, 8), 2);
+        CHECK_EQ(hold.plan_step(uf, 8, 8), 3);
+    }
+    CHECK_EQ(hold.dcap_held_cycles(), (int64_t)20);
+    CHECK_EQ(cap.dcap_held_cycles(), (int64_t)0);
+    int at2 = 0;
+    for (int t = 0; t < DraftController::kHold + 4; ++t) at2 += hold.plan_step(uf, 6, 6) == 2 ? 1 : 0;
+    CHECK(at2 > 0);
+    CHECK_EQ(hold.plan_step(uf, 8, 8), 3);   /* back at 8 rows: held at once */
+    hold.set_dcap_n(8);
+    CHECK(!hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 8);
+    int at2b = 0;
+    for (int t = 0; t < DraftController::kHold + 4; ++t) at2b += hold.plan_step(uf, 8, 8) == 2 ? 1 : 0;
+    CHECK(at2b > 0);
+    hold.set_dcap_n(164);
+    CHECK(hold.dcap_hold());
+    CHECK_EQ(hold.dcap_n(), 164);
 }
 
 TEST(the_borrow_prices_a_class_never_lent_with_its_nearest_neighbours_lent_ratio) {

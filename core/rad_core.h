@@ -434,6 +434,9 @@ public:
     int32_t        drafter_pos_offset = 0;
     /* A block drafter's shorter block (rad_drafter_short_block), 0 when it serves only its own. */
     int64_t        drafter_short_block = 0;
+    /* tp8 loop D19: every short block it declared, in order (a plugin may call rad_drafter_short_block once a length); the
+     * first is drafter_short_block. Empty when it serves only its own. */
+    std::vector<int64_t> drafter_short_blocks;
     /* A block drafter that proposes a tree (rad_drafter_tree): `drafter_parents` holds each
      * proposal's parent node, at the proposal's pitch. False and 0 for a chain drafter. */
     bool           drafter_tree = false;

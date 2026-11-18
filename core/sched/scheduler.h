@@ -630,6 +630,20 @@ public:
         if (decoded <= 1 || decoded + 2 <= from) return false;
         return was_on;
     }
+    /* tp8 loop D19, short block tiers (RADIANCE_DRAFT_SHORT_TIERS=N:S,...): `from` sorted from the highest load down, each
+     * tier's `on` kept by short_block_on; returns the first tier that is on (the one for the highest load this step
+     * reaches), -1 for the drafter's own block. Every tier's state moves each step, as one tier's does. */
+    static int short_tier_pick(bool* on, const int64_t* from, int n, int64_t decoded) {
+        int pick = -1;
+        for (int i = 0; i < n; ++i) {
+            on[i] = short_block_on(on[i], decoded, from[i]);
+            if (on[i] && pick < 0) pick = i;
+        }
+        return pick;
+    }
+    /* tp8 loop D19: "N:S[,N:S...]" -> (from N >= 2, block S >= 1) pairs sorted by N from the highest down, at most 4,
+     * distinct N; RAD_E_INVAL with `why` on anything else. */
+    static int parse_short_tiers(const char* s, std::vector<std::pair<int64_t, int64_t>>* out, std::string* why);
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();

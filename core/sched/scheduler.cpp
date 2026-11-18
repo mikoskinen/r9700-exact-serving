@@ -162,9 +162,9 @@ int Scheduler::set_draft_dcap(int v) {   /* SPB */
     return draft_.dcap();
 }
 
-int Scheduler::set_draft_dcap_n(int v) {   /* SPB */
+int Scheduler::set_draft_dcap_n(int v) {   /* SPB (tp8 loop D20: 101 .. 164 holds the depth at the cap from v - 100 rows) */
     std::lock_guard<std::mutex> lk(mu_);
-    if (v >= 1 && v <= 64) draft_.set_dcap_n(v);
+    if ((v >= 1 && v <= 64) || (v >= 101 && v <= 164)) draft_.set_dcap_n(v);
     return draft_.dcap_n();
 }
 
@@ -5047,6 +5047,32 @@ int Scheduler::decoded_seqs() const {
         if (s.req && s.req->state == ReqState::Running && s.running) ++n;
     }
     return n;
+}
+
+/* tp8 loop D19 (scheduler.h) */
+int Scheduler::parse_short_tiers(const char* s, std::vector<std::pair<int64_t, int64_t>>* out, std::string* why) {
+    out->clear();
+    if (!s || !*s) { if (why) *why = "empty"; return RAD_E_INVAL; }
+    const char* p = s;
+    while (*p) {
+        char* e = nullptr;
+        const long long n = std::strtoll(p, &e, 10);
+        if (e == p || *e != ':') { if (why) *why = "each tier is N:S (decoding sequences : short block rows)"; return RAD_E_INVAL; }
+        p = e + 1;
+        const long long b = std::strtoll(p, &e, 10);
+        if (e == p || (*e && *e != ',')) { if (why) *why = "each tier is N:S (decoding sequences : short block rows)"; return RAD_E_INVAL; }
+        if (n < 2 || b < 1) { if (why) *why = "a tier needs N >= 2 decoding sequences and S >= 1 rows"; return RAD_E_INVAL; }
+        for (const auto& t : *out)
+            if (t.first == n) { if (why) *why = "two tiers at the same N"; return RAD_E_INVAL; }
+        out->emplace_back((int64_t)n, (int64_t)b);
+        if (out->size() > 4) { if (why) *why = "at most 4 tiers"; return RAD_E_INVAL; }
+        p = *e ? e + 1 : e;
+        if (*e && !*p) { if (why) *why = "a trailing comma"; return RAD_E_INVAL; }
+    }
+    std::sort(out->begin(), out->end(), [](const std::pair<int64_t, int64_t>& x, const std::pair<int64_t, int64_t>& y) {
+        return x.first > y.first;
+    });
+    return RAD_OK;
 }
 
 const Request* Scheduler::block_req(const BlockSeq& d) const { return live_req(d.slot, d.seq); }
