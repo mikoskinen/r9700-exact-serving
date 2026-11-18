@@ -32,6 +32,7 @@
 #include "util/stallwatch.h"
 #include "device/device.h"
 #include "pp_nodeidle.h"   /* tp8 dev D8 */
+#include "pp_pftl_fol.h"  /* tp8 loop P22 */
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1395,6 +1396,19 @@ int Engine::follower_loop() {
     std::unique_ptr<PpNodeIdle> ni_own;   /* tp8 dev D8 */
     struct NiReset { Engine* e; ~NiReset() { e->pp_ni_ = nullptr; } } ni_reset{ this };
     pp_node_idle_open(&ni_own);
+    /* tp8 loop P22 (RADIANCE_PP_PF_TIMELINE=1, the leader's switch, on this node too): the follower's side of a lone cold
+     * prompt's timeline (core/pp_pftl_fol.h) */
+    std::unique_ptr<PfFolTimeline> pff;
+    if (const char* v = std::getenv("RADIANCE_PP_PF_TIMELINE"); v && !std::strcmp(v, "1") && !ranks_.empty()) {
+        pff = std::make_unique<PfFolTimeline>();
+        pff->s = ranks_[0]->ctx.stream();
+        for (int l = 0; l < n_lanes_; ++l)
+            if (RadPpRing* r = pp_recv_[l * RAD_PP_N_RINGS + RAD_PP_X1]) pff->rings.push_back(r);
+        pff->arm();
+        RAD_INFO("follower: RADIANCE_PP_PF_TIMELINE=1 -- a lone prefill's passes are timed on rank 0's card (with their X1 waits, "
+                 "%zu ring(s)), a line a prompt once its first decode step or the next prompt arrives (tp8 loop P22)",
+                 pff->rings.size());
+    }
     std::vector<int32_t> ahead, rows, flags, clears, ckw;
     /* tp8 dev D10 (RADIANCE_PP_ISSUE_AHEAD=1): the leader ships an undrafted lane's next step before it has that step's token
      * ids (its card writes them behind the sampler), so this node must read none: refused where its pass computes n-gram ids
@@ -1664,6 +1678,10 @@ int Engine::follower_loop() {
                 if (h2.run) { ++seg_between; ++steps; }
             }
         };
+        /* tp8 loop P22: a lone prefill pass is timed (its parts together); any other run pass ends the open prompt */
+        const bool pfl = pff && b->phase == RAD_PHASE_PREFILL && b->n_seq == 1;
+        if (pff && !pfl) pff->close();
+        if (pfl) pff->begin(b->n_tok, b->max_ctx_len == 0, lane, h.psk_valid && h.psk_n > 0 ? ahead[0] : INT32_MIN);
         for (size_t k = 0; k < parts.size(); ++k) {
             if (k > 0) {
                 /* the segment k - 1 - ahead must have run before segment k goes out (ahead 1: one queued behind the
@@ -1694,6 +1712,8 @@ int Engine::follower_loop() {
         }
         pp_set_pass(lane, RAD_PP_PART_WHOLE);
         if (split) ++seg_passes;
+        if (pfl) pff->end();
+        else if (pff) pff->flush(false);
         /* tp8 dev D10 round 2: frames still waiting for their X1 go first after the split pass (they came before any held) */
         if (split && !ia_pend.empty()) {
             held.insert(held.begin(), std::make_move_iterator(ia_pend.begin()), std::make_move_iterator(ia_pend.end()));
@@ -1736,6 +1756,7 @@ int Engine::follower_loop() {
             RAD_INFO("follower: stopping on a signal after %lld steps: the leader is told (kBye) and goes down "
                      "with it", (long long)steps);
             if (pp_ni_) pp_ni_->stop();
+            if (pff) { pff->close(); pff->flush(true); }
             loop_status_.store(RAD_OK, std::memory_order_release);
             stopping_.store(true, std::memory_order_release);
             if (barrier_) barrier_->abort();
@@ -1754,6 +1775,7 @@ int Engine::follower_loop() {
                     RAD_INFO("follower: the leader stopped (%s) after %lld steps; this node stops too",
                              pp_link_->why().c_str(), (long long)steps);
                     if (pp_ni_) pp_ni_->stop();
+                    if (pff) { pff->close(); pff->flush(true); }
                     loop_status_.store(RAD_OK, std::memory_order_release);
                     stopping_.store(true, std::memory_order_release);
                     if (barrier_) barrier_->abort();
@@ -1780,6 +1802,7 @@ int Engine::follower_loop() {
         if (fs < 0) return fs;
         if (fs == 1) {   /* tp8 dev M4: the leader stopped while a split pass waited between its segments */
             if (pp_ni_) pp_ni_->stop();
+            if (pff) { pff->close(); pff->flush(true); }
             RAD_INFO("follower: the leader stopped (%s) after %lld steps, during a pass's segments; this node stops too",
                      pp_link_->why().c_str(), (long long)steps);
             loop_status_.store(RAD_OK, std::memory_order_release);

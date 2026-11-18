@@ -1036,7 +1036,8 @@ TEST(a_cold_prompt_at_two_lanes_is_one_processes_tokens_and_chunk_plan) {
 /* tp8 loop P7 (RADIANCE_PP_PF_TIMELINE=1 on the leader): a cold multi-chunk prompt at 2 and 3 lanes with the prefill
  * timeline on serves one process's tokens and plan, and the leader prints the prompt's timeline line once its first
  * token is in -- as many chunks as the plan has, every head after the first read from its events (the host backend's
- * events carry host stamps), nothing dropped -- and its per-chunk lines. */
+ * events carry host stamps), nothing dropped -- and its per-chunk lines. tp8 loop P22: the follower, with the same switch,
+ * prints its side -- the prompt's passes (as many as the chunks, every one read), their rows and X1 waits. */
 TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tokens) {
     REQUIRE(world().ok);
     const std::vector<int32_t> p = prompt_ids(977, 1000);
@@ -1078,6 +1079,22 @@ TEST(the_prefill_timeline_names_a_cold_prompts_chunks_and_serves_one_process_tok
         CHECK(llog.find("prefill timeline request ") != std::string::npos);   /* the per-chunk lines */
         fprintf(stderr, "    %s lanes W(%s): tokens %s, plan %s\n    %s\n", lanes, cut, got == ref ? "identical" : "DIFFERENT",
                 chunks_of(llog) == ref_plan ? "identical" : "DIFFERENT", line.c_str());
+        /* tp8 loop P22: the follower's side -- the same switch there times the prompt's lone prefill passes (as many as the
+         * plan's chunks, every one read, its rows), printed once the prompt's first decode step arrived */
+        const std::string flog = sv.fol.output();
+        CHECK(flog.find("follower: RADIANCE_PP_PF_TIMELINE=1 -- a lone prefill's passes are timed") != std::string::npos);
+        const size_t ft = flog.find("follower prefill timeline (RADIANCE_PP_PF_TIMELINE=1");
+        CHECK(ft != std::string::npos);
+        if (ft == std::string::npos) continue;
+        const std::string fline = flog.substr(ft, flog.find('\n', ft) - ft);
+        char fwant[96], fread[48];
+        std::snprintf(fwant, sizeof fwant, "prompt 1, %zu passes, %zu rows (context 0 .. %zu)", ref_plan.size(), p.size(), p.size());
+        std::snprintf(fread, sizeof fread, "(%zu read;", ref_plan.size());
+        CHECK(fline.find(fwant) != std::string::npos);
+        CHECK(fline.find(fread) != std::string::npos);
+        CHECK(fline.find("events dropped 0, unread 0") != std::string::npos);
+        CHECK(flog.find("follower prefill timeline prompt 1 passes 0-") != std::string::npos);
+        fprintf(stderr, "    %s\n", fline.c_str());
     }
 }
 
