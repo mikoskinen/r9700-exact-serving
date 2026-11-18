@@ -507,6 +507,8 @@ static void cross_check(const Plugin& pl) {
 /* ================================================================== the device phase */
 /* --cold MIB: bytes read through the caches before every timed launch; see st_time_us. */
 static int64_t g_cold = 0;
+/* --mx-routing FILE (tp8 DECODE D17): --perfmx replays an R4D_MXDUMP capture's records instead of mx_route's draw. */
+static const char* g_mx_routing = nullptr;
 /* --timeline: --perfar8 also records the two-shot's per-block stamps (r4d.h) and prints where each
  * rank's time goes. */
 static bool g_timeline = false;
@@ -22841,6 +22843,43 @@ static MxRoute mx_route(int64_t tokens, int rank, bool tail, uint64_t seed) {
     return r;
 }
 
+/* tp8 DECODE D17: the records of an R4D_MXDUMP capture (40 ints: n_expert, tokens, T, off[0 .. n_expert]) for `tokens`,
+ * up to `want` of them at a stride over the file, as MxRoutes: an expert's rows go to tokens round-robin (top-3 distinct a
+ * token, as perfmoe replays exl3r4d's), the other slots up to T dropped (-1). Empty when the file has none. */
+static std::vector<MxRoute> mx_routes_file(const char* path, int64_t tokens, int want) {
+    std::vector<std::vector<int32_t>> hit;
+    if (FILE* f = std::fopen(path, "rb")) {
+        std::vector<int32_t> r(40);
+        while (std::fread(r.data(), 4, 40, f) == 40)
+            if (r[0] == 32 && r[1] == (int32_t)tokens && r[2] >= r[3 + 32] && r[2] <= 3 * tokens) hit.push_back(r);
+        std::fclose(f);
+    }
+    std::vector<MxRoute> out;
+    const size_t n = hit.size(), k = n < (size_t)want ? n : (size_t)want;
+    for (size_t i = 0; i < k; ++i) {
+        const std::vector<int32_t>& r = hit[i * n / k];
+        MxRoute m;
+        m.off.assign(33, 0);
+        std::vector<int32_t> used((size_t)tokens, 0);
+        int64_t tok = 0;
+        for (int e = 0; e < 32; ++e) {
+            const int32_t rows = std::max(0, r[(size_t)(3 + e + 1)] - r[(size_t)(3 + e)]);
+            m.off[(size_t)(e + 1)] = m.off[(size_t)e] + rows;
+            for (int32_t j = 0; j < rows; ++j, ++tok) {
+                int64_t t = tok % tokens, guard = 0;
+                while (used[(size_t)t] >= 3 && guard++ < tokens) t = (t + 1) % tokens;
+                m.sorted.push_back((int32_t)(t * 3 + used[(size_t)t]++));
+            }
+            m.experts += rows > 0;
+            m.rmax = std::max<int64_t>(m.rmax, rows);
+        }
+        m.live = (int64_t)m.sorted.size();
+        m.sorted.resize((size_t)r[2], -1);
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+
 /* Random MXFP4 blocks (17 bytes: e8m0 then 16 code bytes) with exponents near 127, so products stay finite. */
 static void mx_blocks(std::vector<uint8_t>& w, int64_t rows, int64_t K, uint64_t seed) {
     uint64_t rs = seed;
@@ -23011,8 +23050,19 @@ static void ds_mx_perf(const Plugin& pl, const char* tlist, int iters) {
             st_memcpy(d_tab[k], ptrs.data(), E * sizeof(void*), hipMemcpyHostToDevice);
         }
         for (int64_t tk : toks) {
-            if (tk < 1 || tk > 48) continue;
-            const MxRoute rt = mx_route(tk, 0, true, 0xD5A2Cull + (uint64_t)tk);
+            if (tk < 1 || (tk > 48 && !g_mx_routing)) continue;
+            /* tp8 DECODE D17: --mx-routing replays up to 8 captured records a token count (one MXPERF / MXSUM line each, "rec i/n");
+             * above 48 tokens drafter_mx declines, so its forms time the stock row again */
+            std::vector<MxRoute> rts;
+            if (g_mx_routing) {
+                rts = mx_routes_file(g_mx_routing, tk, 8);
+                if (rts.empty()) { std::printf("MXPERF %s tokens %lld: no record of 32 experts and %lld tokens in %s\n", c.name, (long long)tk, (long long)tk, g_mx_routing); continue; }
+            } else {
+                rts.push_back(mx_route(tk, 0, true, 0xD5A2Cull + (uint64_t)tk));
+            }
+            for (size_t ri = 0; ri < rts.size(); ++ri) {
+            const MxRoute& rt = rts[ri];
+            const std::string rtag = g_mx_routing ? fmt(" rec %zu/%zu", ri + 1, rts.size()) : std::string();
             const int64_t T = (int64_t)rt.sorted.size(), AR = c.sorted_rows ? T : tk;
             std::vector<uint16_t> hx((size_t)(AR * c.K));
             uint64_t rs = 0x777ull + (uint64_t)tk;
@@ -23045,8 +23095,8 @@ static void ds_mx_perf(const Plugin& pl, const char* tlist, int iters) {
             h.mx_pin(0, 0, 0, 0, 0, 0);
             bool s0 = true; std::string f0;
             const double st = timeit("stock", s0, f0);
-            std::string line = fmt("MXPERF %s %lldx%lld tokens %lld (%lld slots on the rank, %lld experts, a run up to %lld) %s: stock %.1f;",
-                                   c.name, (long long)c.N, (long long)c.K, (long long)tk, (long long)rt.live, (long long)rt.experts,
+            std::string line = fmt("MXPERF %s %lldx%lld tokens %lld%s (%lld slots on the rank, %lld experts, a run up to %lld) %s: stock %.1f;",
+                                   c.name, (long long)c.N, (long long)c.K, (long long)tk, rtag.c_str(), (long long)rt.live, (long long)rt.experts,
                                    (long long)rt.rmax, mode, st);
             double best = -1, rule = -1; std::string bestn, bestf; bool alls = true;
             const P* plist = gemv ? gp : sp;
@@ -23066,12 +23116,13 @@ static void ds_mx_perf(const Plugin& pl, const char* tlist, int iters) {
             if (!alls) { ++ndiff; ++g_fail; }
             if (st > 0 && best > 0) {
                 const double mb = (double)rt.experts * (double)ebytes / 1048576.0;
-                std::printf("MXSUM %s tokens %lld %s: stock %.1f us | rule %.1f | best %s %.1f [%s] | x%.2f vs stock | %.0f MiB of live experts, %.0f GB/s | bytes %s\n",
-                            c.name, (long long)tk, mode, st, rule, bestn.c_str(), best, bestf.c_str(), st / best, mb,
+                std::printf("MXSUM %s tokens %lld%s %s: stock %.1f us | rule %.1f | best %s %.1f [%s] | x%.2f vs stock | %.0f MiB of live experts, %.0f GB/s | bytes %s\n",
+                            c.name, (long long)tk, rtag.c_str(), mode, st, rule, bestn.c_str(), best, bestf.c_str(), st / best, mb,
                             mb * 1.048576e6 / (best * 1e3), alls ? "identical" : "DIFFER");
                 lsum += std::log(st / best); ++n;
             }
             std::fflush(stdout);
+            }
         }
     }
     dfree_all();
@@ -38578,6 +38629,8 @@ static void usage(void) {
                 "  --mxcheck / --bfcheck:  ds41-drk: the drafter's MXFP4 grouped GEMM (drafter_mx) / bf16\n"
                 "             skinny GEMM (drafter_bf) forms vs the stock kernels, byte for byte.\n"
                 "  --perfmx [tokens] [iters] / --perfbf [Ms] [iters]:  their timing at the drafter's shapes.\n"
+                "  --mx-routing FILE:  --perfmx replays an R4D_MXDUMP capture (up to 8 records a token count; any token\n"
+                "             count, the stock row alone above 48) instead of its own draw (tp8 DECODE D17)\n"
                 "  --bicheck [classes] [Ms]:  lever BI: per op, a row alone (M = 1) vs the same row inside\n"
                 "             an M-row launch, byte for byte, DeepSeek-V4.1's TP4 shapes (classes gg,f32,bf16,\n"
                 "             norm,mhc,rope,elem,router or all; Ms a comma list, default 1..64 and 65..4160).\n"
@@ -38893,6 +38946,9 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--cold")) {
             if (i + 1 >= argc) { usage(); return 2; }
             g_cold = std::strtoll(argv[++i], nullptr, 0) << 20;
+        } else if (!std::strcmp(argv[i], "--mx-routing")) {
+            if (i + 1 >= argc) { usage(); return 2; }
+            g_mx_routing = argv[++i];
         } else if (!std::strcmp(argv[i], "--timeline")) {
             g_timeline = true;
         } else if (!std::strcmp(argv[i], "--perfhyv3moe")) {
