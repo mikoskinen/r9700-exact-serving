@@ -1721,8 +1721,10 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
         CHECK_EQ(one.lead.finish(60), 0);
     }
     struct Arm { int lanes; const char* cut; int k; bool split; };
+    /* tp8 dev round 6: + three decode lanes beside one BG lane (--pp-lanes 4, BG_LANE=1: READY 05:57's settings arm) */
     for (const Arm a : { Arm{ 3, "0,2", 1, false }, Arm{ 2, "0,2", 1, false }, Arm{ 3, "1,3", 1, false }, Arm{ 4, "0,2", 2, false },
-                         Arm{ 4, "1,3", 2, false }, Arm{ 4, "0,2", 2, true }, Arm{ 4, "1,3", 2, true } }) {
+                         Arm{ 4, "1,3", 2, false }, Arm{ 4, "0,2", 2, true }, Arm{ 4, "1,3", 2, true }, Arm{ 4, "0,2", 1, false },
+                         Arm{ 4, "1,3", 1, false } }) {
         std::vector<std::string> env = kSplitEnv;
         env.push_back(a.k == 1 ? "RADIANCE_PP_BG_LANE=1" : "RADIANCE_PP_BG_LANE=2");
         if (a.split) env.push_back("RADIANCE_PP_BG_SPLIT=1");
