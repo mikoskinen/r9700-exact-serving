@@ -4,7 +4,7 @@
 //
 //   q2bench --exl3 <exl3r4d.so> --r4d <libr4d.so> [--fn4x NAME=V ...] [--fn4r NAME=V ...] [--MA 1100] [--LA 22]
 //           [--MB 16,32] [--LB 22] [--experts 384] [--topk 6] [--hidden 5120] [--widths 640,512] [--bits 2] [--h-rot 1]
-//           [--pools 2] [--reps 3] [--warm-ms 600] [--dense 0|1] [--arms n16,h16,n32,h32,l16] [--plan]
+//           [--pools 2] [--reps 3] [--warm-ms 600] [--dense 0|1] [--arms n16,h16,n32,h32,l16,x16] [--plan] [--check]
 //
 // WHAT RUNS. Four host threads, one a card (HIP devices 0..3), each its rank of a TP4 node. Every card has four streams:
 // qa (normal priority), qal (the lowest), qb (normal), qbh (the highest). A "layer" is the launches a deepseek41 layer issues
@@ -22,7 +22,8 @@
 //
 // THE MEASUREMENT (every rank, in lockstep; rank 0's device clock reported, the others' spread printed):
 //   T_A   = an A body alone on qa;  T_B(m) = a B pass alone on qb (median of 6 back to back).
-//   overlap arm X (n16 = B16 on qb beside A on qa; h16 = B16 on qbh (high); l16 = A on qal (low) beside B16 on qb; n32 / h32):
+//   overlap arm X (n16 = B16 on qb beside A on qa; h16 = B16 on qbh (high); l16 = A on qal (low) beside B16 on qb; x16 = A low +
+//   B16 high; n32 / h32 the same at 32 rows):
 //     A's body is enqueued on its queue, then ceil(3 T_A / T_B) + 2 B passes on the other, at most three in flight (the same
 //     count on every rank, so every all-reduce has its peers). A' = A's body time under overlap; nB = the B passes inside A's
 //     window (fractional at its ends, device timestamps); B' = the p50 B pass inside the window.
@@ -31,7 +32,8 @@
 //   leader at c16. F13 (two PROCESSES, 5-layer proxy, no dense): S 1.10 / 1.08 with the decode step x3.2.
 //   OVCHECK: A's last-layer outputs (dense y, expert y) after an overlapped body are compared byte for byte with an A body
 //   alone (a pass's arithmetic must not see what runs beside it: M6's exactness premise, here at kernel level).
-//   Q2K: this process's KFD queues a card (/sys/class/kfd/kfd/proc/<pid>/queues), read after the first overlap arm.
+//   Q2K: every KFD process's queues by gpu id (/sys/class/kfd/kfd/proc/*/queues; in a container getpid() is not KFD's pid, so
+//   all are listed: ours is the one with >= 4 a card when the node runs nothing else), read during the first overlap arm's run.
 // --plan: host only (no HIP call): the configuration, launches a layer, bytes a card. --check: host only, the window / S
 // arithmetic on made-up timelines (serial, perfect overlap, time-sliced, passes straddling the window's ends).
 //
@@ -152,7 +154,7 @@ struct Opt {
     std::vector<int64_t> widths = { 640, 512 };
     float warm_ms = 600;
     bool dense = true, plan = false;
-    std::vector<std::string> arms = { "n16", "h16", "n32", "h32", "l16" };
+    std::vector<std::string> arms = { "n16", "h16", "n32", "h32", "l16", "x16" };
 };
 
 // The dense shapes a layer (rank 0 of TP4; tools: r4d_selftest ds_gg_perf's list), q6_K, in issue order; the attention
@@ -507,24 +509,34 @@ void run_work(Ctx& c, Work& W, hipStream_t s) {
         for (auto& k : L) launch(c, k, s);
 }
 
-std::string kfd_queues() {   // this process's KFD queues, counted by gpu id
-    const std::string dir = "/sys/class/kfd/kfd/proc/" + std::to_string((long)getpid()) + "/queues";
-    DIR* d = opendir(dir.c_str());
-    if (!d) return "unreadable (" + dir + ")";
-    std::map<std::string, int> by;
-    int n = 0;
-    while (dirent* e = readdir(d)) {
-        if (e->d_name[0] == '.') continue;
-        FILE* f = std::fopen((dir + "/" + e->d_name + "/gpuid").c_str(), "r");
-        char g[64] = "?";
-        if (f) { if (!std::fgets(g, sizeof g, f)) std::strcpy(g, "?"); std::fclose(f); }
-        g[std::strcspn(g, "\n")] = 0;
-        ++by[g]; ++n;
+std::string kfd_queues() {   // every KFD process's queues, by gpu id (inside a container getpid() is not KFD's host pid, so all are listed)
+    const std::string root = "/sys/class/kfd/kfd/proc";
+    DIR* pd = opendir(root.c_str());
+    if (!pd) return "unreadable (" + root + ")";
+    std::string s;
+    int procs = 0;
+    while (dirent* p = readdir(pd)) {
+        if (p->d_name[0] == '.') continue;
+        const std::string dir = root + "/" + p->d_name + "/queues";
+        DIR* d = opendir(dir.c_str());
+        if (!d) continue;
+        std::map<std::string, int> by;
+        int n = 0;
+        while (dirent* e = readdir(d)) {
+            if (e->d_name[0] == '.') continue;
+            FILE* f = std::fopen((dir + "/" + e->d_name + "/gpuid").c_str(), "r");
+            char g[64] = "?";
+            if (f) { if (!std::fgets(g, sizeof g, f)) std::strcpy(g, "?"); std::fclose(f); }
+            g[std::strcspn(g, "\n")] = 0;
+            ++by[g]; ++n;
+        }
+        closedir(d);
+        ++procs;
+        s += std::string(s.empty() ? "" : "; ") + "pid " + p->d_name + " " + std::to_string(n) + " queues:";
+        for (auto& kv : by) s += " gpu " + kv.first + " x" + std::to_string(kv.second);
     }
-    closedir(d);
-    std::string s = std::to_string(n) + " queues:";
-    for (auto& kv : by) s += " gpu " + kv.first + " x" + std::to_string(kv.second);
-    return s;
+    closedir(pd);
+    return std::to_string(procs) + " KFD process(es): " + s;
 }
 
 // The B passes inside A's window [0, a1] (ms from A's start event): a pass counts by the share of its own span inside the
@@ -667,7 +679,7 @@ void rank_main(Ctx* cp) {
             const char kind = arm[0];
             const int64_t m = std::atoll(arm.c_str() + 1);
             Work& Bw = B.at(m);
-            hipStream_t sa = kind == 'l' ? qal : qa, sb = kind == 'h' ? qbh : qb;
+            hipStream_t sa = kind == 'l' || kind == 'x' ? qal : qa, sb = kind == 'h' || kind == 'x' ? qbh : qb;
             g_bar.wait();
             if (c.rank == 0) {
                 const double ta = out.ta.back(), tb = out.tb.at(m).back();
@@ -700,7 +712,7 @@ void rank_main(Ctx* cp) {
             r.s = s_of(out.ta.back(), r.a_us, r.nb, out.tb.at(m).back());
             out.arm[arm].push_back(r);
             if (rep == 0 && &arm == &o.arms[0]) {
-                out.queues = kfd_queues();
+                if (c.rank == 0) out.queues = kfd_queues();
                 std::vector<char> d, y;
                 snap(d, y);
                 out.ovcheck = (d == ref_d ? std::string("dense y equal") : std::string("dense y DIFFERS")) + ", " +
@@ -736,8 +748,8 @@ void print_plan(const Opt& o) {
                     exl3_band(m), ar_row(m * o.hidden), (long long)(m * o.hidden),
                     m <= 16 ? "gemm_nt_ggml_qk256_gemv" : "gemm_nt_ggml_qk256_tiled");
     for (const std::string& a : o.arms)
-        std::printf("PLAN arm %s: A on %s, B%s on %s\n", a.c_str(), a[0] == 'l' ? "qal (lowest)" : "qa (normal)", a.c_str() + 1,
-                    a[0] == 'h' ? "qbh (highest)" : "qb (normal)");
+        std::printf("PLAN arm %s: A on %s, B%s on %s\n", a.c_str(), a[0] == 'l' || a[0] == 'x' ? "qal (lowest)" : "qa (normal)", a.c_str() + 1,
+                    a[0] == 'h' || a[0] == 'x' ? "qbh (highest)" : "qb (normal)");
 }
 
 }  // namespace
@@ -803,7 +815,7 @@ int main(int argc, char** argv) {
     if (o.MA <= 0 || o.LA <= 0 || o.LB <= 0 || o.pools < 1 || o.reps < 1 || o.topk < 1 || o.topk > o.E) die("sizes must be positive (topk <= experts)");
     if (o.hidden % 256) die("--hidden is a multiple of 256");
     for (const std::string& a : o.arms) {
-        if (a.size() < 2 || (a[0] != 'n' && a[0] != 'h' && a[0] != 'l')) die("an arm is n|h|l followed by a B row count: " + a);
+        if (a.size() < 2 || (a[0] != 'n' && a[0] != 'h' && a[0] != 'l' && a[0] != 'x')) die("an arm is n|h|l|x followed by a B row count: " + a);
         const int64_t m = std::atoll(a.c_str() + 1);
         if (std::find(o.MB.begin(), o.MB.end(), m) == o.MB.end()) die("arm " + a + " names a B row count not in --MB");
     }
@@ -899,8 +911,9 @@ int main(int argc, char** argv) {
     // REPORT: rank 0's clock; the ranks' spread of A alone as a sanity line
     const RankOut& r0 = g_out[0];
     for (int r = 0; r < kWorld; ++r)
-        std::printf("Q2RANK %d: A alone median %.1f us, %.2f GiB on the card, OVCHECK %s, KFD %s\n", r, med(g_out[(size_t)r].ta),
-                    g_out[(size_t)r].dev_bytes / 1073741824.0, g_out[(size_t)r].ovcheck.c_str(), g_out[(size_t)r].queues.c_str());
+        std::printf("Q2RANK %d: A alone median %.1f us, %.2f GiB on the card, OVCHECK %s\n", r, med(g_out[(size_t)r].ta),
+                    g_out[(size_t)r].dev_bytes / 1073741824.0, g_out[(size_t)r].ovcheck.c_str());
+    std::printf("Q2K %s\n", r0.queues.c_str());
     std::printf("Q2A A (%lld rows x %d layers) alone: median %.1f us over %d reps [", (long long)o.MA, o.LA, med(r0.ta), o.reps);
     for (double x : r0.ta) std::printf(" %.1f", x);
     std::printf(" ]\n");
