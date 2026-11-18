@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 struct Ds41DecPiece {
@@ -82,6 +83,16 @@ inline int64_t ds41_dec_pieces(const std::vector<int64_t>& st, int64_t dt, int64
     int64_t over = 0;
     for (const Ds41DecPiece& p : out) over += p.n > cap ? 1 : 0;
     return over;
+}
+
+/* tp8 loop D22: a run of n rows in launches of at most `band` rows, in order ([0, band), [band, 2 band), ..., the last
+ * shorter) -- step_bi's dense() and logits head issue a decode-only run by it (band kBiBand = 48, or
+ * RADIANCE_DS41_DENSE_BAND under lever WMK). Returns the number of launches. */
+inline int64_t ds41_band_cuts(int64_t n, int64_t band, std::vector<std::pair<int64_t, int64_t>>& out) {
+    out.clear();
+    if (n < 1 || band < 1) return 0;
+    for (int64_t a = 0; a < n; a += band) out.push_back({ a, std::min(band, n - a) });
+    return (int64_t)out.size();
 }
 
 #endif

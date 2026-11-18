@@ -6778,6 +6778,28 @@ static std::atomic<long long> g_bi_onear{0};   /* lever A9: segmented steps whos
  * flip of the switch bumps the epoch, so recorded passes re-record. Off (or libr4d without the switch): today's issue. */
 static std::atomic<long long> g_wmkw_steps{0}, g_wmkw_runs{0}, g_wmkw_rows{0};
 static bool wmk_whole_on() { return ds41_switch("ds41_wmk") >= 1; }   /* 1, or F7's A/B codes 2 / 3 (the same bytes) */
+/* tp8 loop D22 (19.11.2026; the 64-row decode step's dense, the DRAFTER's lq150 lanecmp item 2): RADIANCE_DS41_DENSE_BAND=N
+ * (49 .. 64, read once; unset or anything else: kBiBand, today) -- under lever WMK (ds41_wmk >= 1: every dense GGUF GEMM one
+ * part order at every row count, so a launch's height does not move a row's bytes) a decode-only run of up to N rows issues
+ * each dense GGUF GEMM through dense() (wo_a, wo_b, the Engram GEMM: today rows of 48 + the rest; q_a / kv / iproj / q_b /
+ * iq_w go whole a segment already) and the logits head as ONE launch instead of 48 + the rest, each weight read once a
+ * pass. It pays only with a libr4d whose decode-band G2 (gg_wk3) serves N rows (4 row tiles = 64 rows; today it declines
+ * above 3 and gemm_nt_ggml takes the slower prefill form gg_pf at 49 .. 64: the same bytes). Off WMK: kBiBand. */
+static int64_t dense_band_env() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("RADIANCE_DS41_DENSE_BAND");
+        if (!e || !*e) return kBiBand;
+        char* end = nullptr;
+        const long long n = std::strtoll(e, &end, 10);
+        if (end && !*end && n >= kBiBand + 1 && n <= 64) return (int64_t)n;
+        if (!(end && !*end && n == kBiBand))
+            fprintf(stderr, "radiance: deepseek41: RADIANCE_DS41_DENSE_BAND=%s is not 49 .. 64: the dense decode band stays "
+                            "%lld rows\n", e, (long long)kBiBand);
+        return kBiBand;
+    }();
+    return v;
+}
+static std::atomic<long long> g_dband64_runs{0};   /* D22: decode-only dense runs above kBiBand issued as one launch (rank 0) */
 /* the weight is a GGUF block weight served by gemm_nt_ggml (not IQR, not bf16 gemm_nt) */
 static bool gguf_dense(const Model& m, rad_weight w) { return m.wty.count(w) && !m.wsc.count(w); }
 /* The step's segments under ds41_bi; false when one launch over the step is the per-sequence arithmetic already (one
@@ -7296,6 +7318,11 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
                     n, g_bi_moe.load(std::memory_order_relaxed),
                     (double)g_bi_moe.load(std::memory_order_relaxed) / (double)n, g_bi_sync.load(std::memory_order_relaxed),
                     g_bi_wide.load(std::memory_order_relaxed), g_sw_bi.load(std::memory_order_relaxed));
+        /* tp8 loop D22: its own line beside, once a decode-only dense run above the band went as one launch */
+        if (n > 0 && n % 512 == 0 && rad_rank(x) == 0 && g_dband64_runs.load(std::memory_order_relaxed) > 0)
+            fprintf(stderr, "radiance: deepseek41: tp8 loop D22 (RADIANCE_DS41_DENSE_BAND=%lld): %lld decode-only dense GGUF runs above "
+                            "%lld rows issued as one launch (layer-ops summed)\n", (long long)dense_band_env(),
+                    g_dband64_runs.load(std::memory_order_relaxed), (long long)kBiBand);
         /* lever A9 (ds41_bi 5 / 6): its own line beside, once a step took it (the line above stays int12's) */
         if (n > 0 && n % 512 == 0 && rad_rank(x) == 0 && g_bi_onear.load(std::memory_order_relaxed) > 0)
             fprintf(stderr, "radiance: deepseek41: lever A9 stats: %lld of %lld segmented steps with one MoE all-reduce; "
@@ -7358,12 +7385,21 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
      * ONE launch (the decode rows ride it), a decode-only run as rows(kBiBand); off: rows(kBiBand) (`wmkw` false) or the caller's
      * own by-segment issue. `seg`: the caller's per-segment form (q_a / kv / q_b / the indexer's linears: by segment, uncut). */
     const bool wmkw = wmk_whole_on();
+    /* tp8 loop D22 (RADIANCE_DS41_DENSE_BAND): a decode-only run's dense GGUF GEMM band under WMK (kBiBand otherwise) */
+    const int64_t dband = wmkw ? dense_band_env() : kBiBand;
     auto dense = [&](bool gg, bool seg, const auto& fn) {
+        const int64_t band = gg ? dband : kBiBand;
         const auto by_seg = [&](int64_t a0, int64_t a1) {
             for (const BiSeg& s : *cur) {
                 if (s.r0 < a0 || s.r0 >= a1) continue;
-                if (seg || !s.dec || s.n <= kBiBand) { fn(s.r0, s.n); continue; }
-                for (int64_t a = 0; a < s.n; a += kBiBand) fn(s.r0 + a, std::min(kBiBand, s.n - a));
+                if (seg || !s.dec || s.n <= band) {
+                    if (!seg && s.dec && s.n > kBiBand && rad_rank(x) == 0) g_dband64_runs.fetch_add(1, std::memory_order_relaxed);
+                    fn(s.r0, s.n);
+                    continue;
+                }
+                static thread_local std::vector<std::pair<int64_t, int64_t>> bc;
+                ds41_band_cuts(s.n, band, bc);
+                for (const auto& c : bc) fn(s.r0 + c.first, c.second);
             }
         };
         if (!wmkw || !gg) { by_seg(0, T); return; }
@@ -8828,9 +8864,13 @@ static void step_bi(RadCtx* x, Model& m, const RadBatch* batch, const std::vecto
     if (batch->n_out > 0) {
         RAD_ISSUE_N(x, m.gather, batch->n_out, brows(m.final_hidden, T),
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
-        /* the head (logits_gemm_ggml, banded): the sampled rows in launches within the decode band */
-        for (int64_t a = 0; a < batch->n_out; a += kBiBand) {
-            const int64_t n = std::min(kBiBand, batch->n_out - a);
+        /* the head (logits_gemm_ggml, banded): the sampled rows in launches within the decode band (tp8 loop D22: the
+         * dense band RADIANCE_DS41_DENSE_BAND under WMK for a GGUF head) */
+        const int64_t hb = wmkw && gguf_dense(m, m.head) ? dband : kBiBand;
+        static thread_local std::vector<std::pair<int64_t, int64_t>> hc;
+        ds41_band_cuts(batch->n_out, hb, hc);
+        for (const auto& c : hc) {
+            const int64_t a = c.first, n = c.second;
             RAD_ISSUE_N(x, m.head_op, n, a ? brow_slice(m.logit_input, a, n, D) : brows(m.logit_input, n), RAD_W(m.head),
                         a ? brow_slice(m.logits, a, n, g.n_vocab) : brows(m.logits, n));
         }

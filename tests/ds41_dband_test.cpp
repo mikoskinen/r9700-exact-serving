@@ -159,6 +159,29 @@ TEST(indexer_runs_at_the_band_stay_in_the_decode_form) {
     }
 }
 
+TEST(dense_band_cuts_cover_the_run_within_the_band) {
+    /* tp8 loop D22: a decode-only dense run in launches of <= band rows; band 48 is today's issue, 64 the WMK dense band */
+    std::vector<std::pair<int64_t, int64_t>> c;
+    CHECK_EQ(ds41_band_cuts(64, 48, c), 2);
+    CHECK(c[0] == std::make_pair((int64_t)0, (int64_t)48) && c[1] == std::make_pair((int64_t)48, (int64_t)16));
+    CHECK_EQ(ds41_band_cuts(64, 64, c), 1);
+    CHECK(c[0] == std::make_pair((int64_t)0, (int64_t)64));
+    CHECK_EQ(ds41_band_cuts(48, 64, c), 1);
+    CHECK_EQ(ds41_band_cuts(0, 64, c), 0);
+    for (int64_t band = 48; band <= 64; ++band)
+        for (int64_t n = 1; n <= 300; ++n) {
+            ds41_band_cuts(n, band, c);
+            int64_t r = 0;
+            bool ok = true;
+            for (const auto& p : c) {
+                ok = ok && p.first == r && p.second >= 1 && p.second <= band;
+                r += p.second;
+            }
+            CHECK(ok && r == n);
+            CHECK_EQ((int64_t)c.size(), (n + band - 1) / band);
+        }
+}
+
 TEST(control_todays_issue_leaves_the_band_and_absolute_cu_misplaces_rows) {
     /* today: the attention once a segment, the indexer at irows (>= 96) -- one launch of 64 rows each */
     const Layout L = layout(std::vector<int64_t>(16, 4));
