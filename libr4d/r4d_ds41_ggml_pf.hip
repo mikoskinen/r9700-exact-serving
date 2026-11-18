@@ -167,14 +167,19 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
          * registers, or (ABL bit 8, TS) in the lane's private scratch -- touched only at a part's end, so the K loop keeps
          * the stock registers */
         constexpr bool TS = (ABL & 8) != 0;
+        /* FI bit 3 (TL, tp8 loop A5b): the last column tile's running total in the wave's own LDS (MT x 8 floats a lane, after the
+         * staging), touched once a part -- the registers it frees (8 NM) are what CR's ring needs; total + part is the same f32 add */
+        constexpr bool TL = (FI & 8) != 0 && !TS && NT > 1;
+        constexpr int NTR = TL ? NT - 1 : NT;   /* column tiles whose running total stays in registers */
         const int SPP = S / (S % 8 == 0 ? 8 : S % 4 == 0 ? 4 : S % 2 == 0 ? 2 : 1);
-        gg_v8f tot[TS ? 1 : NM][NT];
+        gg_v8f tot[TS ? 1 : NM][NTR];
         volatile float tots[TS ? NM * NT * 8 : 1];
+        float* const tlp = TL ? (float*)(void*)(gg_smem + W::TB + 2 * XE * 2 + 2 * XGE * 4) + (size_t)wave * (MT * 8 * 32) + lane : nullptr;
         if constexpr (!TS) {
 #pragma unroll
             for (int i = 0; i < NM; ++i)
 #pragma unroll
-                for (int j = 0; j < NT; ++j) tot[i][j] = (gg_v8f)(0.0f);
+                for (int j = 0; j < NTR; ++j) tot[i][j] = (gg_v8f)(0.0f);
         }
 #endif
         uint32_t rE[2][NT][W::RAW], rR[NT][W::RAW];
@@ -448,10 +453,17 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
                                 const int i = (mt * NT + nt) * 8 + q;
                                 tots[i] = first ? acc[mt][nt][q] : tots[i] + acc[mt][nt][q];
                             }
-                        } else {
+                        } else if (TL && nt == NT - 1) {
 #pragma unroll
-                            for (int q = 0; q < 8; ++q) tot[mt][nt][q] = first ? acc[mt][nt][q] : tot[mt][nt][q] + acc[mt][nt][q];
-                            gg_pin8(tot[mt][nt]);
+                            for (int q = 0; q < 8; ++q) {
+                                float* const t = tlp + (mt * 8 + q) * 32;
+                                *t = first ? acc[mt][nt][q] : *t + acc[mt][nt][q];
+                            }
+                        } else {
+                            const int nr = nt < NTR ? nt : 0;
+#pragma unroll
+                            for (int q = 0; q < 8; ++q) tot[mt][nr][q] = first ? acc[mt][nt][q] : tot[mt][nr][q] + acc[mt][nt][q];
+                            gg_pin8(tot[mt][nr]);
                         }
                         acc[mt][nt] = (gg_v8f)(0.0f);
                     }
@@ -477,7 +489,8 @@ __global__ __launch_bounds__(WN * 32) void gg_pf_kernel(GgTiledArgs A) {
 #ifdef R4D_GG_PF_PARTFOLD
                     if constexpr (mt < NM) {
                         if constexpr (TS) v = tots[(mt * NT + nt) * 8 + q];
-                        else v = tot[mt][nt][q];
+                        else if (TL && nt == NT - 1) v = tlp[(mt * 8 + q) * 32];
+                        else v = tot[mt][nt < NTR ? nt : 0][q];
                     }
 #else
                     if constexpr (mt < NM) v = acc[mt][nt][q];
